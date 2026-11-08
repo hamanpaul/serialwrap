@@ -248,7 +248,10 @@ fn guard_rpc_timeout_refuses() {
 fn guard_ping_timeout_refuses() {
     // health.ping 連線成功但逾時、且 ProcScan 找不到 serialwrapd：健康不明，不得視為「確認不存在」。
     let ep = TestEnv::win_endpoint();
-    let t = base(Entry::Rollback).with_rpc_recv_timeout(ep, "health.ping");
+    // stubd 在線（已配置其他 method，`FakeRpcConnector` 才接受連線），只有 health.ping recv 逾時。
+    let t = base(Entry::Rollback)
+        .with_rpc_ok(ep, "mcu.status", "{\"ok\":true,\"flashing\":false}")
+        .with_rpc_recv_timeout(ep, "health.ping");
     let (rc, j, _) = run(&t, Entry::Rollback, false);
     assert_eq!(rc, 2, "{j:?}");
     assert_eq!(

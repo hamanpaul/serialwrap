@@ -119,6 +119,20 @@ pub struct FenceState {
     /// False，`_push_tx_gate()`（`:778-785`）以此發布 bridge 的 `_gate_quiet`——故只豁免 `Command` 的
     /// quiet／reconfirm；`quiet_active`／`reconfirm_pending` 與 reboot arming 照記，其他類別與共同拒絕不受影響。
     pub bridge_passthrough: bool,
+    /// P8 Task 14：SC-11 交接停止的 TX 凍結（Python `UARTBridge.freeze_tx`）。與 drain 的 `frozen` 分開記錄：交接
+    /// 未成立（TX fence 逾時）時只撤銷本旗標，不動 shutdown／drain 建立的 `frozen`。
+    pub handoff_frozen: bool,
+}
+
+/// P8 Task 14：[`Fence::freeze_for_handoff`] 的結果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandoffFreeze {
+    /// 旗標已設、無在途寫入段：此 fence 之後零 TX。
+    Converged,
+    /// 旗標已設，但已經 gate 提交的寫入段未在期限內結束（須撤銷旗標）。
+    InFlight,
+    /// OS 提交持 fence 鎖直到期限，旗標未設（不需撤銷）。
+    Locked,
 }
 
 /// 撤銷 op 的 tombstone 上限（Python `uart_io._TX_ACCOUNT_MAX`；parity-amendments-2026-10-26 #38）。
@@ -205,7 +219,42 @@ impl Fence {
             reboot_arm_op: None,
             flash_critical: false,
             bridge_passthrough: false,
+            handoff_frozen: false,
         })))
+    }
+
+    /// P8 Task 14：交接凍結（Python `UARTBridge.freeze_tx`）：取得 fence 鎖時設 `handoff_frozen`（此後任何來源的新 TX
+    /// 一律 `Frozen`），再等已經 gate 提交、仍在途的寫入段（`in_flight`）結束。不啟動 drain、不動 `frozen`。
+    ///
+    /// 回 [`HandoffFreeze::Converged`] 才可回報交接成立；`InFlight`（旗標已設、在途段未在 `deadline` 前結束）須由
+    /// [`Fence::thaw_handoff`] 撤銷；`Locked`（OS 提交持 fence 鎖直到 `deadline`，旗標未設）不需撤銷。
+    pub fn freeze_for_handoff(&self, deadline: std::time::Instant) -> HandoffFreeze {
+        let pause = std::time::Duration::from_millis(1);
+        loop {
+            // OS 提交在 fence 鎖內（`FenceSubmitGate`）：取得鎖即表示沒有進行中的提交，之後的提交重驗時被拒。
+            if self.try_with(|st| st.handoff_frozen = true).is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return HandoffFreeze::Locked;
+            }
+            std::thread::sleep(pause);
+        }
+        loop {
+            // 已設旗標：之後的提交重驗即被拒、只短暫持鎖，此處 `try_with` 不會長時間等待。
+            if self.try_with(|st| st.in_flight.is_none()) == Some(true) {
+                return HandoffFreeze::Converged;
+            }
+            if std::time::Instant::now() >= deadline {
+                return HandoffFreeze::InFlight;
+            }
+            std::thread::sleep(pause);
+        }
+    }
+
+    /// P8 Task 14：撤銷尚未成立的交接凍結（只清 `handoff_frozen`；drain／shutdown 的 `frozen` 保留，Python `thaw_tx`）。
+    pub fn thaw_handoff(&self) {
+        self.with(|st| st.handoff_frozen = false);
     }
 
     /// 撤銷 op（Python `UARTBridge.revoke_ops`）：之後以這些 op 提交的 TX 一律 `Cancelled`、零 TX；
@@ -227,7 +276,7 @@ impl Fence {
     }
 
     pub fn admit(st: &FenceState, p: &TxPermit) -> Result<(), FenceReject> {
-        if st.frozen {
+        if st.frozen || st.handoff_frozen {
             return Err(FenceReject::Frozen);
         }
         if st.active_epoch != Some(p.epoch) {

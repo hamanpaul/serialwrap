@@ -36,6 +36,11 @@ pub trait RpcHandler: Send + Sync {
     }
 }
 
+/// P8 Task 14：`daemon.handoff_stop` 成功回覆後的有界排空窗口（Python `sw_core/daemon.py` `HANDOFF_DRAIN_GRACE_S`＝3.0）。
+/// 窗口內監聽保留：有副作用的請求回 `FLUSHED_BY_SHUTDOWN`＋`reason:"handoff_frozen"`、`health.ping` 仍回應；窗口結束才
+/// 進入與 `daemon.stop` 相同的停止序。須明顯小於 CLI `wait_handoff_gone` 的 10 秒等待上限。
+pub const HANDOFF_DRAIN_GRACE: Duration = Duration::from_secs(3);
+
 /// 請求行上限（內容不含 `\n`；超過斷線不回應，RPC-H-02；`contracts/golden/rpc/line_limit.json` 的 `max_ok_bytes`）。
 pub const MAX_LINE_BYTES: usize = 65_536;
 
@@ -262,6 +267,28 @@ fn handle_line(
         Some(PyValue::Dict(p)) => p.clone(),
         _ => PyDict::new(),
     };
+    if method == "daemon.handoff_stop" {
+        // P8 Task 14（arch §6.2 第 7 步）：與 daemon.stop 同層攔截。回應不經 Service::rpc 的 version 補欄；交接成立
+        // （`ok:true`）時寫出回應後排程排空窗口結束的停止（Python `_rpc_after_write` 在 finally：寫失敗也排程）。
+        stop.set_method(Some(&method));
+        let result = match catch_unwind(AssertUnwindSafe(|| handler.handoff_stop(&params))) {
+            Ok(Ok(d)) => d,
+            Ok(Err(e)) => exception_result(e.message),
+            Err(payload) => exception_result(panic_message(payload.as_ref())),
+        };
+        let granted = result.get("ok") == Some(&PyValue::Bool(true));
+        resp.update(&result);
+        let written = write_line(stream, &wire(&resp), stop);
+        stop.set_method(None);
+        if granted {
+            handler.request_stop_after(HANDOFF_DRAIN_GRACE);
+        }
+        return if written {
+            LineOutcome::Continue
+        } else {
+            LineOutcome::Close
+        };
+    }
     stop.set_method(Some(&method));
     let result = match catch_unwind(AssertUnwindSafe(|| handler.call(&method, &params))) {
         Ok(Ok(d)) => d,

@@ -828,6 +828,28 @@ impl FlashCoordinator {
         self.admission.set(gate).is_ok()
     }
 
+    /// P8 Task 14：sync-probe 的 admission（`flash.sync_probe`，COM 尚未認線故為 `None`）。`Ok(None)`＝未掛 admission
+    /// （不經 gate）；`Err(())`＝已凍結被拒（計數並由端點沉默）。
+    pub(crate) fn admit_sync_probe(&self) -> Result<Option<crate::admission::Ticket>, ()> {
+        let Some(gate) = self.admission.get() else {
+            return Ok(None);
+        };
+        match gate.admit("flash.sync_probe", None) {
+            Some(ticket) => Ok(Some(ticket)),
+            None => {
+                self.admission_refusals.fetch_add(1, Ordering::SeqCst);
+                Err(())
+            }
+        }
+    }
+
+    /// P8 Task 14：`on_flash_open` 返回（detection／pump 結束）後歸還 sync-probe 的 ticket。
+    pub(crate) fn admission_done(&self, ticket: Option<crate::admission::Ticket>) {
+        if let (Some(gate), Some(ticket)) = (self.admission.get(), ticket) {
+            gate.done(ticket);
+        }
+    }
+
     /// 只供測試：sync-probe 因凍結被 admission 拒絕的次數。
     #[cfg(feature = "test-fakes")]
     pub fn admission_refusals_for_test(&self) -> u64 {

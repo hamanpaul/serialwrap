@@ -948,6 +948,13 @@ impl RpcHandler for HookedHandler {
     fn request_stop(&self) {
         self.inner.request_stop();
     }
+    fn handoff_stop(&self, params: &sw_proto::pyjson::PyDict) -> Result<sw_proto::pyjson::PyDict, sw_proto::pycompat::PyErr> {
+        (self.hook)("daemon.handoff_stop");
+        self.inner.handoff_stop(params)
+    }
+    fn request_stop_after(&self, delay: std::time::Duration) {
+        self.inner.request_stop_after(delay);
+    }
 }
 
 impl Hooks {
@@ -1253,6 +1260,8 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
     }));
     svc.attach_engine(engine.clone());
     svc.attach_flash(flash.0.clone());
+    // P8 Task 14：flash sync-probe 與 RPC 分派共用 Service 的 admission 邊界（T9 裁決：sync-probe 的 ticket 屬本 Task）。
+    flash_coord.set_admission(svc.admission().clone());
     let listener = match p.rpc_listen.bind(&ep, &listen_options(&*p.env)) {
         Ok(l) => l,
         Err(e) => {
@@ -1288,6 +1297,9 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
     // P8 Task 12 停止序（arch §6.1 的 1～7）：任一步逾時或失敗都不跳過後續步驟，只累積到 `incomplete`。
     let mut incomplete: Vec<String> = Vec::new();
     svc.set_running(false);
+    // P8 Task 14：admission 凍結（Python `service.stop()` 的 `admission.freeze()`）：停止序開始後新操作一律 handoff_frozen；
+    // 之後交接回滾不得撤銷此凍結。
+    svc.shutdown_freeze();
     server.stop_accept(); // 1 只停 accept，不等進行中的 handler（避免 600 s file.push 卡死停止序）
     hooks.trace(Stage::ServerStopAccept);
     manager.begin_shutdown(); // 1a stopping gate（R1-F2）：之後熱插／bootstrap／recover／SC-32 延後 reconcile 不再 open

@@ -9,7 +9,10 @@
 //! - `freeze_if_idle(reason)`：無 ticket 且無旗標時凍結並發 32 hex token；否則回忙碌、不凍結。
 //! - `thaw(token)`：只撤銷由 `freeze_if_idle` **新建立**且 token 相符的凍結（TX fence 逾時、交接未成立）。
 
+use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{BuildHasher, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// 一項尚未完成的有副作用操作（Python `Ticket(kind, com, seq)`）。只能經 [`AdmissionGate::done`] 歸還。
@@ -111,41 +114,132 @@ impl AdmissionGate {
 
     /// 是否已凍結（shutdown 或交接）。
     pub fn frozen(&self) -> bool {
-        todo!("P8-T14")
+        self.lock().frozen
     }
 
     /// 取得 ticket；已凍結回 `None`（呼叫端回 `FLUSHED_BY_SHUTDOWN`＋`reason:"handoff_frozen"`，零副作用）。
-    pub fn admit(&self, _kind: &str, _com: Option<&str>) -> Option<Ticket> {
-        todo!("P8-T14")
+    pub fn admit(&self, kind: &str, com: Option<&str>) -> Option<Ticket> {
+        let mut g = self.lock();
+        if g.frozen {
+            return None;
+        }
+        g.next_seq += 1;
+        let seq = g.next_seq;
+        g.tickets.insert(seq, (kind.to_string(), com.map(str::to_string)));
+        Some(Ticket {
+            kind: kind.to_string(),
+            com: com.map(str::to_string),
+            seq,
+        })
     }
 
     /// 歸還 ticket（操作已到終態）。
-    pub fn done(&self, _ticket: Ticket) {
-        todo!("P8-T14")
+    pub fn done(&self, ticket: Ticket) {
+        self.lock().tickets.remove(&ticket.seq);
     }
 
     /// 發布 COM 的狀態旗標（Python `set_flag(com, flag, on)`）。
-    pub fn set_flag(&self, _com: &str, _flag: AdmissionFlag, _on: bool) {
-        todo!("P8-T14")
+    pub fn set_flag(&self, com: &str, flag: AdmissionFlag, on: bool) {
+        let mut g = self.lock();
+        let flags = g.flags.entry(com.to_string()).or_default();
+        if on {
+            flags.insert(flag);
+        } else {
+            flags.remove(&flag);
+        }
+        if flags.is_empty() {
+            g.flags.remove(com);
+        }
     }
 
     /// daemon 一般關機的凍結：停止接受新操作，不做 busy 判定；接手後交接失敗的 `thaw` 不得解除。
     pub fn freeze(&self) {
-        todo!("P8-T14")
+        let mut g = self.lock();
+        g.frozen = true;
+        // shutdown 凍結接手後，handoff 的失敗路徑不得再以先前 token 撤銷它。
+        g.idle_token = None;
+        if g.token.is_none() {
+            g.token = Some(new_token());
+        }
     }
 
     /// 撤銷由 `freeze_if_idle` 新建立、token 相符的凍結；其餘情形不動作並回 false。
-    pub fn thaw(&self, _token: &str) -> bool {
-        todo!("P8-T14")
+    pub fn thaw(&self, token: &str) -> bool {
+        let mut g = self.lock();
+        if !g.frozen || g.token.as_deref() != Some(token) || g.idle_token.as_deref() != Some(token) {
+            return false;
+        }
+        g.frozen = false;
+        g.token = None;
+        g.idle_token = None;
+        true
     }
 
     /// 閒置（無 ticket、無旗標）時凍結並發 token；已凍結回既有 token（`created=false`）；否則回忙碌、不凍結。
     pub fn freeze_if_idle(&self, _reason: &str) -> FreezeOutcome {
-        todo!("P8-T14")
+        let mut g = self.lock();
+        if g.frozen {
+            // 已凍結：本次呼叫不是建立者，之後的 thaw 不得撤銷該凍結。
+            g.idle_token = None;
+            let token = g.token.get_or_insert_with(new_token).clone();
+            return FreezeOutcome::Frozen { token, created: false };
+        }
+        let mut by_com: BTreeMap<String, (BTreeSet<String>, BTreeSet<AdmissionFlag>)> = BTreeMap::new();
+        let mut flashing = false;
+        for (kind, com) in g.tickets.values() {
+            let key = com.clone().unwrap_or_else(|| "*".to_string());
+            by_com.entry(key).or_default().0.insert(kind.clone());
+            flashing |= kind.starts_with("flash.");
+        }
+        for (com, flags) in &g.flags {
+            let row = by_com.entry(com.clone()).or_default();
+            row.1.extend(flags.iter().copied());
+            flashing |= flags.contains(&AdmissionFlag::Flashing);
+        }
+        if !by_com.is_empty() {
+            return FreezeOutcome::Busy(Busy {
+                by_com: by_com
+                    .into_iter()
+                    .map(|(com, (ops, flags))| {
+                        (
+                            com,
+                            BusyCom {
+                                ops: ops.into_iter().collect(),
+                                flags: flags.into_iter().collect(),
+                            },
+                        )
+                    })
+                    .collect(),
+                flashing,
+            });
+        }
+        let token = new_token();
+        g.frozen = true;
+        g.token = Some(token.clone());
+        g.idle_token = Some(token.clone());
+        FreezeOutcome::Frozen { token, created: true }
     }
 
     /// 目前未歸還的 ticket 數（觀測用）。
     pub fn live_tickets(&self) -> usize {
-        todo!("P8-T14")
+        self.lock().tickets.len()
     }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, GateInner> {
+        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// `uuid.uuid4().hex`（32 hex）。熵源與 `session_manager` 的 nonce 相同（`RandomState` 雜湊＋單調計數），不需平台 RNG。
+fn new_token() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut fill = |buf: &mut [u8]| {
+        for chunk in buf.chunks_mut(8) {
+            let mut h = RandomState::new().build_hasher();
+            h.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+            let bytes = h.finish().to_le_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+    };
+    sw_proto::pycompat::uuid4_hex(&mut fill)
 }

@@ -10,12 +10,13 @@
 //! PROFILE_NOT_COMMAND_CAPABLE／READY_UNCONFIRMED／AUTOBOOT_QUIET gate）在 Rust 由 `SessionCore::submit` 承接，
 //! 本層只做 selector 解析（查無 → `SESSION_NOT_FOUND`＋原 selector）與參數轉型。
 
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use sw_core::admission::AdmissionGate;
+use sw_core::admission::{AdmissionFlag, AdmissionGate, Busy, BusyCom, FreezeOutcome, Ticket};
 use sw_core::arbiter::{CommandRegistry, SubmitOrigin, SubmitReq, expect_reboot_rejection};
 use sw_core::event_engine::registry::UpsertError;
 use sw_core::event_engine::schema::RuleError;
@@ -42,6 +43,76 @@ use crate::framing::RpcHandler;
 const ROUTE_TIMEOUT: Duration = Duration::from_secs(60);
 /// `session.recover`／`session.attach`／`session.self_test` 的等待上限（含登入／probe）。
 const LONG_ROUTE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// P8 Task 14：有副作用、須先取得 admission ticket 的 RPC 方法（`contracts/rpc_schema.json` 中 `side_effects` 非空且
+/// `retryable_readonly==false` 者，排除 framing 攔截的 `daemon.stop`／`daemon.handoff_stop`；Python `_ADMISSION_METHODS`
+/// 加上 arbiter 自行 admit 的 `command.submit`）。凍結後回 `FLUSHED_BY_SHUTDOWN`＋`reason:"handoff_frozen"`，零副作用。
+const ADMISSION_METHODS: &[&str] = &[
+    "alias.assign",
+    "alias.set",
+    "alias.unassign",
+    "command.cancel",
+    "command.result_tail",
+    "command.submit",
+    "device.attach",
+    "device.release",
+    "event.com_disable",
+    "event.com_enable",
+    "event.reload",
+    "event.reset",
+    "event.rule_delete",
+    "event.rule_set",
+    "file.pull",
+    "file.push",
+    "result.tail",
+    "session.attach",
+    "session.bind",
+    "session.clear",
+    "session.console_attach",
+    "session.console_detach",
+    "session.interactive_close",
+    "session.interactive_open",
+    "session.interactive_send",
+    "session.interactive_status",
+    "session.log_start",
+    "session.log_stop",
+    "session.pin",
+    "session.recover",
+    "session.self_test",
+    "session.unpin",
+    "wal.reset",
+];
+
+/// P8 Task 14：交接凍結時每個 TX fence 的收斂期限（Python `freeze_tx` 的 `DRAIN_FENCE_ACQUIRE_S`＝0.05 s）。
+const HANDOFF_TX_FENCE_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// admission ticket 的 RAII 守衛：分派結束（含 `Err`／panic unwind）即歸還，除非以 `take` 移交給持有到終態的表。
+struct TicketGuard<'a> {
+    gate: &'a AdmissionGate,
+    ticket: Option<Ticket>,
+}
+
+impl TicketGuard<'_> {
+    fn take(mut self) -> Option<Ticket> {
+        self.ticket.take()
+    }
+}
+
+impl Drop for TicketGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.ticket.take() {
+            self.gate.done(ticket);
+        }
+    }
+}
+
+fn handoff_frozen_response() -> PyDict {
+    pydict! { "ok" => false, "error_code" => "FLUSHED_BY_SHUTDOWN", "reason" => "handoff_frozen" }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// OD-11 測試 allowlist（Task 19 Produces；`resolve_test_allowlist` 的輸出，`enabled` 為 false 時不注入 service）。
 /// `source`：`env`｜`config`｜`none`；`rejected_reason`：env／config 值非法時的拒絕原因（P1 T13 規格）。
@@ -73,6 +144,14 @@ pub struct Service {
     flash: std::sync::OnceLock<Arc<FlashState>>,
     /// P8 Task 14：所有新操作的共同 admission 邊界（arch §6.2 第 7 步）。
     admission: Arc<AdmissionGate>,
+    /// P8 Task 14：`command.submit` 的 ticket 持有到命令紀錄終態（cmd_id → ticket；Python arbiter `_admission_tickets`）。
+    /// 每次 submit 前與交接前回收已終結者，大小以 per-session pending 上限為界。
+    cmd_tickets: Mutex<HashMap<String, Ticket>>,
+    /// P8 Task 14：`session.interactive_open` 的 ticket 持有到 lease 關閉／到期（interactive_id → ticket；Python
+    /// `_interactive_admission_tickets`）。每次 open／close 與交接前回收已不存在的 lease。
+    lease_tickets: Mutex<HashMap<String, Ticket>>,
+    /// P8 Task 14：交接判定串行化（Python 在 manager lock 內完成整個判定）；內容為上次發布過旗標的 COM（下次先清除）。
+    handoff: Mutex<BTreeSet<String>>,
 }
 
 /// P8 Task 10：`mcu.status` 的 flash 真值來源（Python `_flash_endpoint.is_flashing()`、`_flash_active_com`、
@@ -278,6 +357,9 @@ impl Service {
             engine: std::sync::OnceLock::new(),
             flash: std::sync::OnceLock::new(),
             admission: Arc::new(AdmissionGate::new()),
+            cmd_tickets: Mutex::new(HashMap::new()),
+            lease_tickets: Mutex::new(HashMap::new()),
+            handoff: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -286,14 +368,199 @@ impl Service {
         &self.admission
     }
 
-    /// P8 Task 14：SC-11 交接停止（Python `SerialwrapService.handoff_stop`）。
-    pub fn handoff_stop(&self, _params: &PyDict) -> PyDict {
-        todo!("P8-T14")
+    /// P8 Task 14：SC-11 交接停止（Python `SerialwrapService.handoff_stop`；arch §6.2 第 7 步）。
+    ///
+    /// 1. 回收已終結的命令／lease ticket，依當下 session 發布 `recovering`／`flashing`／`lease` 旗標；
+    /// 2. `freeze_if_idle`：有 ticket 或旗標 → `FLASHING_BUSY`（flash 優先）／`SESSION_BUSY`＋`busy[]`，不凍結、不停止；
+    /// 3. 新凍結成立後重查 session：manager 沒有 Python 那把同時涵蓋狀態轉移與判定的全域鎖，快照到凍結之間發生的
+    ///    RECOVERING／FLASHING／lease 轉移於此擋下（撤銷本次凍結、回忙碌）；
+    /// 4. 凍結背景來源與既有 bridge 的新 TX（`SessionManager::freeze_for_handoff`）；TX fence 逾時 → `SESSION_BUSY`
+    ///    （`ops:["tx.in_flight"]`），只撤銷本次新建的凍結；
+    /// 5. 成立 → `{"ok":true,"stopping":true,"handoff_token":<32 hex>}`（無 version；排空窗口與停止由 framing 排程）。
+    pub fn handoff_stop(&self, params: &PyDict) -> PyDict {
+        let mut published = lock(&self.handoff);
+        let p = Params::new(params);
+        let reason = match first_str(&p, &["reason"]) {
+            r if r.is_empty() => "update".to_string(),
+            r => r,
+        };
+        self.reconcile_cmd_tickets();
+        let sessions = self.manager.list_sessions();
+        self.reconcile_lease_tickets(&sessions);
+        self.publish_flags(&sessions, &mut published);
+        let (token, created) = match self.admission.freeze_if_idle(&reason) {
+            FreezeOutcome::Busy(busy) => return handoff_busy(&busy, &sessions),
+            FreezeOutcome::Frozen { token, created } => (token, created),
+        };
+        if created {
+            let fresh = self.manager.list_sessions();
+            let busy = self.flag_busy(&fresh);
+            if !busy.by_com.is_empty() {
+                self.admission.thaw(&token);
+                self.publish_flags(&fresh, &mut published);
+                return handoff_busy(&busy, &fresh);
+            }
+        }
+        let unconverged = self.manager.freeze_for_handoff(HANDOFF_TX_FENCE_TIMEOUT);
+        if !unconverged.is_empty() {
+            // fail-closed：仍有已通過提交檢查的寫入段在進行中，交接不得成立。只撤銷本次新建的 admission 凍結；
+            // shutdown 或先前交接建立的凍結（created=false）不在此撤銷。
+            if created {
+                self.admission.thaw(&token);
+            }
+            return tx_in_flight_busy(&unconverged, &sessions);
+        }
+        pydict! { "ok" => true, "stopping" => true, "handoff_token" => token }
     }
 
     /// P8 Task 14：daemon 一般關機的 admission 凍結（Python `service.stop()` 的 `admission.freeze()`）。
     pub fn shutdown_freeze(&self) {
-        todo!("P8-T14")
+        self.admission.freeze();
+    }
+
+    /// session 公開欄位 → 交接旗標（Python `handoff_stop` 的 `set_flag`：RECOVERING、FLASHING 或 flash-critical、lease）。
+    fn session_flags(&self, session: &PyDict) -> Vec<AdmissionFlag> {
+        let com = session.get("com").and_then(PyValue::as_str).unwrap_or_default();
+        let state = session.get("state").and_then(PyValue::as_str).unwrap_or_default();
+        let mut flags = Vec::new();
+        if state == "FLASHING" || (!com.is_empty() && self.manager.flash_critical(com)) {
+            flags.push(AdmissionFlag::Flashing);
+        }
+        if session.get("interactive_session_id").is_some_and(|v| !v.is_null()) {
+            flags.push(AdmissionFlag::Lease);
+        }
+        if state == "RECOVERING" {
+            flags.push(AdmissionFlag::Recovering);
+        }
+        flags
+    }
+
+    /// 依快照重新發布旗標：先清除上次發布、本次已不存在的 COM。
+    fn publish_flags(&self, sessions: &[PyDict], published: &mut BTreeSet<String>) {
+        const ALL: [AdmissionFlag; 3] = [AdmissionFlag::Flashing, AdmissionFlag::Lease, AdmissionFlag::Recovering];
+        let mut now: BTreeSet<String> = BTreeSet::new();
+        for session in sessions {
+            let Some(com) = session.get("com").and_then(PyValue::as_str) else { continue };
+            let flags = self.session_flags(session);
+            for flag in ALL {
+                self.admission.set_flag(com, flag, flags.contains(&flag));
+            }
+            now.insert(com.to_string());
+        }
+        for stale in published.difference(&now) {
+            for flag in ALL {
+                self.admission.set_flag(stale, flag, false);
+            }
+        }
+        *published = now;
+    }
+
+    /// 凍結後重查：只看旗標（凍結後 admit 一律被拒，不會再有新 ticket）。
+    fn flag_busy(&self, sessions: &[PyDict]) -> Busy {
+        let mut busy = Busy::default();
+        for session in sessions {
+            let Some(com) = session.get("com").and_then(PyValue::as_str) else { continue };
+            let flags = self.session_flags(session);
+            if flags.is_empty() {
+                continue;
+            }
+            busy.flashing |= flags.contains(&AdmissionFlag::Flashing);
+            busy.by_com.insert(com.to_string(), BusyCom { ops: Vec::new(), flags });
+        }
+        busy
+    }
+
+    /// ticket 的 COM 歸屬（Python `_admission_com`）：selector 鏈 → interactive_id → device_by_id／by_id；查無為 `None`。
+    fn admission_com(&self, params: &PyDict) -> Option<String> {
+        let p = Params::new(params);
+        let selector = first_str(&p, &["selector", "session_id", "com", "alias"]);
+        if !selector.is_empty() {
+            if let Some(com) = self.manager.com_of(&selector) {
+                return Some(com);
+            }
+        }
+        let interactive_id = first_str(&p, &["interactive_id"]);
+        if !interactive_id.is_empty() {
+            if let Some(com) = self.manager.interactive_com(&interactive_id) {
+                return Some(com);
+            }
+        }
+        let by_id = first_str(&p, &["device_by_id", "by_id"]);
+        if !by_id.is_empty() {
+            return self.manager.com_for_by_id(&by_id);
+        }
+        None
+    }
+
+    /// 回收已到終態的命令 ticket（Python `_finish_admission_locked`）。
+    fn reconcile_cmd_tickets(&self) {
+        let done: Vec<Ticket> = {
+            let mut map = lock(&self.cmd_tickets);
+            let finished: Vec<String> = map
+                .keys()
+                .filter(|cmd_id| !self.registry.is_outstanding(cmd_id))
+                .cloned()
+                .collect();
+            finished.into_iter().filter_map(|cmd_id| map.remove(&cmd_id)).collect()
+        };
+        for ticket in done {
+            self.admission.done(ticket);
+        }
+    }
+
+    /// 回收已不存在之 lease 的 ticket（Python `_reconcile_interactive_admission_tickets`）。
+    fn reconcile_lease_tickets(&self, sessions: &[PyDict]) {
+        let active: HashSet<&str> = sessions
+            .iter()
+            .filter_map(|s| s.get("interactive_session_id").and_then(PyValue::as_str))
+            .collect();
+        let done: Vec<Ticket> = {
+            let mut map = lock(&self.lease_tickets);
+            let gone: Vec<String> = map.keys().filter(|iid| !active.contains(iid.as_str())).cloned().collect();
+            gone.into_iter().filter_map(|iid| map.remove(&iid)).collect()
+        };
+        for ticket in done {
+            self.admission.done(ticket);
+        }
+    }
+
+    /// 分派成功後把需持有到終態的 ticket 移交（command.submit → 命令紀錄、interactive_open → lease）；其餘於守衛 drop 歸還。
+    fn retain_ticket(&self, method: &str, params: &PyDict, result: &PyDict, guard: TicketGuard<'_>) {
+        if !is_ok(result) {
+            return;
+        }
+        match method {
+            "command.submit" => {
+                if let Some(cmd_id) = result.get("cmd_id").and_then(PyValue::as_str).filter(|c| !c.is_empty()) {
+                    if let Some(ticket) = guard.take() {
+                        if let Some(old) = lock(&self.cmd_tickets).insert(cmd_id.to_string(), ticket) {
+                            self.admission.done(old);
+                        }
+                    }
+                }
+            }
+            "session.interactive_open" => {
+                let iid = result
+                    .get("interactive_id")
+                    .or_else(|| result.get("interactive_session_id"))
+                    .and_then(PyValue::as_str)
+                    .filter(|i| !i.is_empty());
+                if let Some(iid) = iid {
+                    if let Some(ticket) = guard.take() {
+                        if let Some(old) = lock(&self.lease_tickets).insert(iid.to_string(), ticket) {
+                            self.admission.done(old);
+                        }
+                    }
+                }
+            }
+            "session.interactive_close" => {
+                let iid = Params::new(params).str_or("interactive_id", "").unwrap_or_default();
+                if let Some(old) = lock(&self.lease_tickets).remove(&iid) {
+                    self.admission.done(old);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// 掛上 flash 端點狀態（只可一次；回 `false` 表示已掛上）。
@@ -396,8 +663,36 @@ impl Service {
     }
 
     /// dispatch＋`setdefault("version")`。
+    ///
+    /// P8 Task 14：`daemon.handoff_stop` 直接回 [`Service::handoff_stop`]（Python `service.rpc`，不補 version）；
+    /// [`ADMISSION_METHODS`] 在任何副作用前取得 admission ticket，已凍結回 `FLUSHED_BY_SHUTDOWN`＋`reason:"handoff_frozen"`。
     pub fn rpc(&self, method: &str, params: &PyDict) -> Result<PyDict, PyErr> {
+        if method == "daemon.handoff_stop" {
+            return Ok(self.handoff_stop(params));
+        }
+        let guard = if ADMISSION_METHODS.contains(&method) {
+            match method {
+                "command.submit" => self.reconcile_cmd_tickets(),
+                "session.interactive_open" | "session.interactive_close" => {
+                    self.reconcile_lease_tickets(&self.manager.list_sessions())
+                }
+                _ => {}
+            }
+            match self.admission.admit(method, self.admission_com(params).as_deref()) {
+                Some(ticket) => Some(TicketGuard { gate: &self.admission, ticket: Some(ticket) }),
+                None => {
+                    let mut frozen = handoff_frozen_response();
+                    frozen.setdefault("version", PyValue::from(self.version.clone()));
+                    return Ok(frozen);
+                }
+            }
+        } else {
+            None
+        };
         let mut result = self.dispatch(method, params)?;
+        if let Some(guard) = guard {
+            self.retain_ticket(method, params, &result, guard);
+        }
         result.setdefault("version", PyValue::from(self.version.clone()));
         Ok(result)
     }
@@ -994,15 +1289,77 @@ impl Service {
     }
 }
 
+/// 交接忙碌列（Python `handoff_stop` 的 `rows`：鍵序 com／state／foreground_busy／outstanding_commands／
+/// interactive_session_id／recovering／ops）。查無 session 的 COM（`"*"`：ticket 未帶 COM）以預設值呈現。
+fn busy_row(com: &str, public: Option<&PyDict>, recovering_flag: bool, ops: Vec<String>) -> PyValue {
+    let field = |k: &str| public.and_then(|p| p.get(k));
+    let state = field("state").and_then(PyValue::as_str).unwrap_or("UNKNOWN").to_string();
+    let foreground_busy = field("foreground_busy").is_some_and(py_truthy);
+    let outstanding = field("outstanding_commands").and_then(PyValue::as_i64).unwrap_or(0);
+    let interactive = field("interactive_session_id").cloned().unwrap_or(PyValue::Null);
+    let recovering = field("recovering").is_some_and(py_truthy) || recovering_flag;
+    PyValue::Dict(pydict! {
+        "com" => com,
+        "state" => state,
+        "foreground_busy" => foreground_busy,
+        "outstanding_commands" => int(i128::from(outstanding)),
+        "interactive_session_id" => interactive,
+        "recovering" => recovering,
+        "ops" => PyValue::List(ops.into_iter().map(PyValue::Str).collect()),
+    })
+}
+
+fn public_by_com(sessions: &[PyDict]) -> BTreeMap<&str, &PyDict> {
+    sessions
+        .iter()
+        .filter_map(|s| s.get("com").and_then(PyValue::as_str).map(|com| (com, s)))
+        .collect()
+}
+
+/// `freeze_if_idle` 忙碌 → `{"ok":false,"error_code":FLASHING_BUSY|SESSION_BUSY,"busy":[…]}`（flash 優先）。
+fn handoff_busy(busy: &Busy, sessions: &[PyDict]) -> PyDict {
+    let by_com = public_by_com(sessions);
+    let rows: Vec<PyValue> = busy
+        .by_com
+        .iter()
+        .map(|(com, row)| {
+            let mut ops = row.ops.clone();
+            if row.flags.contains(&AdmissionFlag::Lease) && !ops.iter().any(|o| o == "session.interactive_open") {
+                ops.push("session.interactive_open".to_string());
+            }
+            ops.sort();
+            busy_row(com, by_com.get(com.as_str()).copied(), row.flags.contains(&AdmissionFlag::Recovering), ops)
+        })
+        .collect();
+    let code = if busy.flashing { "FLASHING_BUSY" } else { "SESSION_BUSY" };
+    pydict! { "ok" => false, "error_code" => code, "busy" => PyValue::List(rows) }
+}
+
+/// TX fence 未收斂 → `SESSION_BUSY`，每筆 `ops:["tx.in_flight"]`（Python `tx_rows`）。
+fn tx_in_flight_busy(unconverged: &[String], sessions: &[PyDict]) -> PyDict {
+    let by_com = public_by_com(sessions);
+    let rows: Vec<PyValue> = unconverged
+        .iter()
+        .map(|com| busy_row(com, by_com.get(com.as_str()).copied(), false, vec!["tx.in_flight".to_string()]))
+        .collect();
+    pydict! { "ok" => false, "error_code" => "SESSION_BUSY", "busy" => PyValue::List(rows) }
+}
+
 /// `RpcHandler` 實作：分派到 `Service::rpc`，`daemon.stop` 經 `stop` channel 通知 daemon main。
 pub struct ServiceHandler {
     svc: Arc<Service>,
     stop: crossbeam_channel::Sender<()>,
+    /// P8 Task 14：交接排空窗口的停止計時已排程（只排一次）。
+    drain_armed: AtomicBool,
 }
 
 impl ServiceHandler {
     pub fn new(svc: Arc<Service>, stop: crossbeam_channel::Sender<()>) -> ServiceHandler {
-        ServiceHandler { svc, stop }
+        ServiceHandler {
+            svc,
+            stop,
+            drain_armed: AtomicBool::new(false),
+        }
     }
 }
 
@@ -1012,5 +1369,25 @@ impl RpcHandler for ServiceHandler {
     }
     fn request_stop(&self) {
         let _ = self.stop.try_send(());
+    }
+    fn handoff_stop(&self, params: &PyDict) -> Result<PyDict, PyErr> {
+        Ok(self.svc.handoff_stop(params))
+    }
+    /// 交接成立後的有界排空窗口（Python `call_later(HANDOFF_DRAIN_GRACE_S, stop_event.set)`）：窗口內監聽保留，
+    /// 有副作用請求由凍結的 admission 回 `handoff_frozen`；窗口結束才送停止。只排程一次；計時 thread 無法建立時立即停止。
+    fn request_stop_after(&self, delay: Duration) {
+        if self.drain_armed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let stop = self.stop.clone();
+        let spawned = std::thread::Builder::new()
+            .name("serialwrap-handoff-drain".into())
+            .spawn(move || {
+                std::thread::sleep(delay);
+                let _ = stop.try_send(());
+            });
+        if spawned.is_err() {
+            let _ = self.stop.try_send(());
+        }
     }
 }

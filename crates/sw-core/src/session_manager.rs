@@ -53,7 +53,7 @@ use crate::session_core::{CoreDeps, Effect, ManagerNote, OpGrant, SessionCore, S
 use crate::state_store::{
     lone_surrogate_encode_error, serialize_state, LoadedState, ReleasedRow, StateDelta, StateModel, StateStore,
 };
-use crate::tx_writer::{Fence, OpId, TxClass, TxJob, TxPermit, TxWriterHandle, spawn_tx_writer};
+use crate::tx_writer::{Fence, HandoffFreeze, OpId, TxClass, TxJob, TxPermit, TxWriterHandle, spawn_tx_writer};
 use crate::self_test::SelfTestProbes;
 use crate::uart_bridge::{IoWorker, IoWorkerArgs, RxShared};
 use crate::wal::{WalAppendReq, WalHealthFanout, WalWriter};
@@ -223,6 +223,19 @@ struct Inner {
     probe_paths: HashMap<String, String>,
     /// P8 Task 8：flash-critical 的 COM（Python `_flash_critical_coms`；#83 RACE-2 final）。
     flash_critical: HashSet<String>,
+    /// P8 Task 14：SC-11 交接凍結成立中（Python `_handoff_frozen`）：新建 session 的 fence 承接交接凍結。
+    handoff_frozen: bool,
+    /// P8 Task 14：`begin_shutdown` 已呼叫（交接回滾只還原自己設的 stopping gate，不撤銷 shutdown 的）。
+    shutdown_started: bool,
+}
+
+/// P8 Task 14：偵測 PROBE 的 fence（每次 `probe_send` 新建）與交接凍結旗標，同一把鎖內登記與讀取：
+/// probe 要嘛在凍結前登記（由 `freeze_for_handoff` 凍結並等收斂），要嘛在凍結後建立即帶凍結。上限＝同時在途的
+/// attach worker 數（每個 worker 一次只送一筆 PROBE）。
+#[derive(Default)]
+struct HandoffProbes {
+    frozen: bool,
+    live: Vec<Arc<Fence>>,
 }
 
 impl Inner {
@@ -289,6 +302,8 @@ struct Shared {
     persist_observer: Mutex<Option<Arc<dyn PersistObserver>>>,
     /// 只供測試（test-fakes）：偵測 PROBE 的 Fence 以 frozen 建立（驗證 PROBE TX 經 Fence 時零 TX）。
     probe_tx_frozen: AtomicBool,
+    /// P8 Task 14：在途 PROBE fence 與交接凍結旗標（見 [`HandoffProbes`]）。
+    handoff_probes: Mutex<HandoffProbes>,
     /// P7 Task 16-wire：RX 觀察者（Python `add_rx_observer`）；每個 session bridge 的 reader 建立時取快照。
     rx_observers: Mutex<Vec<Arc<dyn crate::uart_bridge::RxObserver>>>,
     /// P6（sol 補審 #2）：human line mode basename 的路徑風格（`caps.path_flavor`）。
@@ -675,7 +690,12 @@ impl Shared {
         let fence = Fence::new();
         // P8 Task 8：重建的 session 承接該 COM 既有的 flash-critical 標記。
         let flash_critical = inner.flash_critical.contains(&profile.com);
-        fence.with(|f| f.flash_critical = flash_critical);
+        // P8 Task 14：交接凍結期間新建的 session（在途 attach 越過 gate 後才建立）同樣零 TX。
+        let handoff_frozen = inner.handoff_frozen;
+        fence.with(|f| {
+            f.flash_critical = flash_critical;
+            f.handoff_frozen = handoff_frozen;
+        });
         self.fanout.register(fence.clone());
         let rx = RxShared::new(RX_WINDOW_MAX_CHARS, self.clock.mono_ns());
         let clock = self.clock.clone();
@@ -1278,6 +1298,15 @@ impl Shared {
             f.frozen = frozen;
             f.wal_unhealthy = wal_unhealthy;
         });
+        // P8 Task 14：登記與讀取交接凍結在同一把鎖內（見 `HandoffProbes`）。
+        {
+            let mut probes = lock(&self.handoff_probes);
+            probes.live.push(fence.clone());
+            if probes.frozen {
+                fence.with(|f| f.handoff_frozen = true);
+            }
+        }
+        let registered = fence.clone();
         // sol-backfill p5 #6：比照 session fence 向全域 fanout 註冊——快照讀取之後才發布的 unhealthy 也會送達；
         // 註冊協定與通知串行化，取得的必為最新狀態（Python 於送出時才讀共用 WAL unhealthy）。
         self.fanout.register(fence.clone());
@@ -1324,6 +1353,7 @@ impl Shared {
         if let Ok((writer, _ledger)) = join.join() {
             parts.writer = writer;
         }
+        lock(&self.handoff_probes).live.retain(|f| !Arc::ptr_eq(f, &registered));
         sent
     }
 
@@ -2481,6 +2511,7 @@ impl SessionManager {
             closed: AtomicBool::new(false),
             persist_observer: Mutex::new(None),
             probe_tx_frozen: AtomicBool::new(false),
+            handoff_probes: Mutex::new(HandoffProbes::default()),
             rx_observers: Mutex::new(Vec::new()),
             path_flavor: caps.path_flavor,
             #[cfg(feature = "test-fakes")]
@@ -3354,7 +3385,92 @@ impl SessionManager {
     }
 
     pub fn begin_shutdown(&self) {
-        lock(&self.shared.inner).stopping = true;
+        let mut inner = lock(&self.shared.inner);
+        inner.stopping = true;
+        inner.shutdown_started = true;
+    }
+
+    /// P8 Task 14：交接停止成立前凍結背景來源與既有 bridge 的新 TX（Python `SessionManager.freeze_for_handoff`）。
+    ///
+    /// 1. stopping gate：熱插、re-attach、bootstrap 不再開 UART、不建 worker（`stopping`）；交接凍結期間新建的
+    ///    session fence 承接凍結（`handoff_frozen`）。
+    /// 2. 所有 session fence 與在途 PROBE fence 設 `handoff_frozen`：之後任何來源（重探、login、human raw、console 行、
+    ///    flash）的新 TX 一律被拒（零 TX）；已經 gate 提交的寫入段須在 `per_fence` 內收斂。
+    ///
+    /// 回傳未收斂的 COM（空＝凍結成立）。未收斂且本次為新凍結時，撤銷本次建立的凍結（fence 的 `handoff_frozen`、
+    /// stopping gate 還原為 shutdown 是否已開始）；shutdown／drain 的 `frozen` 不動。已凍結者保持凍結（冪等）。
+    /// reader 與埠保持開啟；實際排空仍由停止序的 drain 完成。
+    pub fn freeze_for_handoff(&self, per_fence: Duration) -> Vec<String> {
+        let (was_frozen, fences) = {
+            let mut inner = lock(&self.shared.inner);
+            let was = inner.handoff_frozen;
+            inner.handoff_frozen = true;
+            inner.stopping = true;
+            let fences: Vec<(String, Arc<Fence>)> = inner
+                .sessions
+                .values()
+                .map(|e| (e.profile.com.clone(), e.fence.clone()))
+                .collect();
+            (was, fences)
+        };
+        let probes: Vec<Arc<Fence>> = {
+            let mut probes = lock(&self.shared.handoff_probes);
+            probes.frozen = true;
+            probes.live.clone()
+        };
+        let mut unconverged: Vec<String> = Vec::new();
+        // 旗標已設者（撤銷時須清除）；`Locked` 者旗標未設，撤銷時不取其 fence 鎖（OS 提交仍持鎖，避免交接回覆被拖住）。
+        let mut flagged: Vec<&Arc<Fence>> = Vec::new();
+        let mut locked: Vec<&Arc<Fence>> = Vec::new();
+        let targets = fences
+            .iter()
+            .map(|(com, fence)| (com.as_str(), fence))
+            .chain(probes.iter().map(|fence| (PROBE_COM, fence)));
+        for (com, fence) in targets {
+            match fence.freeze_for_handoff(Instant::now() + per_fence) {
+                HandoffFreeze::Converged => flagged.push(fence),
+                HandoffFreeze::InFlight => {
+                    flagged.push(fence);
+                    unconverged.push(com.to_string());
+                }
+                HandoffFreeze::Locked => {
+                    locked.push(fence);
+                    unconverged.push(com.to_string());
+                }
+            }
+        }
+        if was_frozen {
+            // 已凍結者保持凍結：先前交接已成立，持鎖中的提交結束後也必須帶上旗標（等待以 OS 提交本身為界）。
+            for fence in locked {
+                fence.with(|st| st.handoff_frozen = true);
+            }
+        } else if !unconverged.is_empty() {
+            // 交接未成立：撤銷本次新建立的凍結（SC-11：忙碌不凍結、不停止）。
+            {
+                let mut inner = lock(&self.shared.inner);
+                inner.handoff_frozen = false;
+                inner.stopping = inner.shutdown_started;
+            }
+            lock(&self.shared.handoff_probes).frozen = false;
+            for fence in flagged {
+                fence.thaw_handoff();
+            }
+        }
+        unconverged.sort();
+        unconverged.dedup();
+        unconverged
+    }
+
+    /// P8 Task 14：selector（session_id／COM／alias）對應的 COM（admission ticket 的 COM 歸屬）。
+    pub fn com_of(&self, selector: &str) -> Option<String> {
+        lock(&self.shared.inner).resolve(selector).map(|e| e.profile.com.clone())
+    }
+
+    /// P8 Task 14：interactive_id 對應 session 的 COM（admission ticket 的 COM 歸屬；查無回 `None`）。
+    pub fn interactive_com(&self, interactive_id: &str) -> Option<String> {
+        let inner = lock(&self.shared.inner);
+        let sid = inner.interactive.get(interactive_id)?;
+        inner.sessions.get(sid).map(|e| e.profile.com.clone())
     }
 
     /// 先隱含呼叫 `begin_shutdown`；回傳每個 drain 目標是否在 `budget` 內收斂。

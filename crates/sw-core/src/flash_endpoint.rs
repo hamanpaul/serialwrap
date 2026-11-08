@@ -192,12 +192,19 @@ fn endpoint_loop(
             _ => Vec::new(),
         };
         if !active.load(Ordering::SeqCst) {
+            // P8 Task 14（T9 裁決）：sync-probe 寫第一個 byte 前取得 admission ticket；凍結（交接或停止）後被拒 →
+            // 端點沉默、不進 FLASHING、MCU 零 TX（Python `FlashEndpoint._loop` 的 `admit("flash.sync_probe", None)`）。
+            let ticket = match coord.admit_sync_probe() {
+                Ok(ticket) => ticket,
+                Err(()) => continue,
+            };
             active.store(true, Ordering::SeqCst);
             // on_flash_open（偵測／pump）的任何 panic 都不得殺死端點 thread；收斂後繼續服務後續 open（C1）。
             if catch_unwind(AssertUnwindSafe(|| coord.on_flash_open(&mut io, &first))).is_err() {
                 coord.warn("serialwrap: /dev/ttyMCU 端點 on_flash_open 發生 panic，已收斂並繼續服務".to_string());
             }
             active.store(false, Ordering::SeqCst);
+            coord.admission_done(ticket);
         }
     }
     io.master.close();

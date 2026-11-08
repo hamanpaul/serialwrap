@@ -26,7 +26,9 @@ use std::time::{Duration, Instant};
 use support::*;
 use sw_core::file_transfer::templates as t;
 use sw_core::session_core::SessionState;
+use sw_core::tx_writer::{OpId, TxClass, TxJob, TxPermit, TxReport};
 use sw_pal::fakes::serial::{FakeDevice, FakeWriteStep};
+use sw_pal::TxOutcome;
 use sw_pal::traits::DeviceInfo;
 use sw_proto::pycompat::a2b_base64_lenient;
 use sw_proto::pydict;
@@ -380,43 +382,93 @@ fn handoff_service_push_ticket_blocks_until_done() {
     assert_granted(&r.svc.handoff_stop(&reason("update")), "push 完成後交接");
 }
 
-/// 開 console、讓 human raw 按鍵的 TX 停在 fence 內（FakeSerial `BlockForever`：已經 gate 提交、in_flight 未清）。
-fn console_rig_with_inflight_key() -> (ServiceRig, sw_pal::fakes::console::FakeConsoleRef) {
-    let r = ServiceRig::with_console_backend("pty");
-    let attach = r.call("session.console_attach", r#"{"selector":"COM0"}"#);
-    assert_eq!(attach.get("ok"), Some(&PyValue::Bool(true)), "{}", wire(&attach));
-    let (_, io) = r.console.as_ref().unwrap().created()[1].clone();
+/// 背景 TX（不經 admission、不持 lease；Python `bridge.send_bytes(b"probe\n", source="system:probe")` 的對應）：
+/// 經 COM 目前 bridge 的 TxWriter 以 `SelfTestProbe` 類別送出（epoch 取 Fence 的 `active_epoch`，permit 由 Fence 重驗）。
+/// 回傳 TxWriter 的回條通道。
+fn inject_background_tx(r: &ServiceRig, payload: &[u8], op: u64) -> crossbeam_channel::Receiver<TxReport> {
+    let handle = r.mgr.tx_for("COM0").expect("COM0 有 TxWriter");
+    let epoch = r
+        .mgr
+        .fence_for_test("COM0")
+        .and_then(|f| f.with(|st| st.active_epoch))
+        .expect("COM0 有 active epoch");
+    let (reply, report) = crossbeam_channel::bounded(1);
+    let job = TxJob {
+        permit: TxPermit {
+            op_id: OpId(0x7414_0000_0000 | op),
+            epoch,
+            owner_gen: 0,
+            fsm_gen: 0,
+            class: TxClass::SelfTestProbe,
+            source: "system:probe".to_string(),
+            cmd_id: None,
+            log: true,
+            input_epoch: None,
+            replay_hold: None,
+            probe_id: None,
+        },
+        payload: payload.to_vec(),
+        reply,
+        aggregate: None,
+    };
+    handle.jobs.send(job).expect("送出背景 TX job");
+    report
+}
+
+fn confirmed(report: &crossbeam_channel::Receiver<TxReport>) -> usize {
+    let r = report.recv_timeout(SHORT).expect("TxWriter 回條");
+    match r.result.outcome {
+        TxOutcome::Completed(n) => n,
+        TxOutcome::Unknown { confirmed, .. } => confirmed,
+        _ => 0,
+    }
+}
+
+/// READY shell（無 console、無 lease），一筆背景 TX 已通過提交檢查並停在 TX fence 內：`inside_submit` 時停在 `os_submit`
+/// 閉包內（持 fence 鎖、bytes 尚未落地，對應 Python `_GuardHeldPort`），否則已交 OS、在 gate 外阻塞（in_flight 未清）。
+fn rig_with_inflight_background_tx(inside_submit: bool) -> (ServiceRig, crossbeam_channel::Receiver<TxReport>) {
+    let r = ServiceRig::ready_shell();
     let dev = r.device(REAL_A).clone();
     let _ = dev.take_tx();
-    dev.script_write(vec![FakeWriteStep::BlockForever]);
-    io.push_input(b"k");
-    dev.wait_blocked();
-    (r, io)
+    let step = if inside_submit { FakeWriteStep::PauseInsideSubmit } else { FakeWriteStep::BlockForever };
+    dev.script_write(vec![step]);
+    let report = inject_background_tx(&r, b"probe\n", 1);
+    if inside_submit {
+        assert!(dev.wait_paused(SHORT), "背景寫入未進入 TX fence");
+    } else {
+        dev.wait_blocked();
+    }
+    (r, report)
+}
+
+fn release_inflight(dev: &FakeDevice, inside_submit: bool) {
+    if inside_submit {
+        dev.release_pause();
+    } else {
+        dev.release_block();
+    }
 }
 
 /// 已通過提交檢查的背景 TX 停在 fence 內超過交接收斂期限：`SESSION_BUSY`（`ops` 含 `tx.in_flight`），交接未成立、
-/// admission／bridge 回到未凍結；放行原 TX 後新按鍵照常寫出，之後再交接成立且成功回覆後零 TX
+/// admission／bridge 回到未凍結；放行原 TX 後新的背景 TX 照常寫出，之後再交接成立且成功回覆後零 TX
 /// （Python `test_handoff_refused_when_background_write_holds_tx_fence`）。
 #[test]
 fn handoff_tx_fence_timeout_thaws_without_stop() {
-    let (r, io) = console_rig_with_inflight_key();
+    let (r, inflight) = rig_with_inflight_background_tx(true);
     let dev = r.device(REAL_A).clone();
     let busy = r.svc.handoff_stop(&reason("update"));
     let rows = assert_refused(&busy, "SESSION_BUSY", "TX fence 未收斂");
     assert!(ops(row_for(&rows, "COM0")).contains(&"tx.in_flight".to_string()), "{}", wire(&busy));
-    assert!(!dev.take_tx().contains(&b'k'), "回覆當下在途按鍵尚未落地");
+    assert!(dev.take_tx().is_empty(), "回覆當下在途 TX 尚未落地");
     assert!(!r.svc.admission().frozen(), "撤銷本次凍結：admission 恢復受理");
-    dev.release_block();
-    let mut seen = Vec::new();
-    wait_for("在途按鍵放行後寫出", SHORT, || {
-        seen.extend(dev.take_tx());
-        seen.contains(&b'k')
-    });
-    io.push_input(b"z");
-    wait_for("交接未成立：bridge 未凍結、新按鍵照常寫出", SHORT, || {
-        seen.extend(dev.take_tx());
-        seen.contains(&b'z')
-    });
+    release_inflight(&dev, true);
+    assert_eq!(confirmed(&inflight), b"probe\n".len(), "交接未成立，已通過提交檢查的寫入照常完成");
+    assert_eq!(dev.take_tx(), b"probe\n");
+    let next = inject_background_tx(&r, b"after\n", 2);
+    assert_eq!(confirmed(&next), b"after\n".len(), "交接未成立：bridge 未凍結、新的背景 TX 照常寫出");
+    assert_eq!(dev.take_tx(), b"after\n");
+    // 假 DUT 對 `echo after` 回輸出與 prompt（`install_shell_replies` 的 `\n` 應答為一次性）。
+    dev.on_tx_match(r"echo after", Box::new(|_line: &[u8]| b"after\r\nroot@t:/# ".to_vec()));
     let sub = r.call("command.submit", r#"{"selector":"COM0","command":"echo after"}"#);
     assert!(!flushed_frozen(&sub), "{}", wire(&sub));
     r.settle();
@@ -425,16 +477,18 @@ fn handoff_tx_fence_timeout_thaws_without_stop() {
     });
     assert_granted(&r.svc.handoff_stop(&reason("update")), "放行後再交接");
     let at_reply = dev.tx_len();
-    io.push_input(b"q");
-    thread::sleep(Duration::from_millis(300));
-    assert_eq!(dev.tx_len(), at_reply, "交接成功回覆後 console 按鍵零 TX");
+    let late = inject_background_tx(&r, b"late\n", 3);
+    assert_eq!(confirmed(&late), 0, "交接成功回覆後背景 TX 被 fence 拒絕");
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(dev.tx_len(), at_reply, "交接成功回覆後零 TX");
 }
 
 /// shutdown 凍結（admission `freeze()`、stopping gate、bridge fence frozen）已建立時，交接遇 TX fence 未收斂：
-/// 回滾只能保留 shutdown 凍結——admission 與 bridge 仍凍結、新按鍵零 TX，原在途 TX 可完成；不得 thaw。
+/// 回滾只能保留 shutdown 凍結——admission 與 bridge 仍凍結、新的背景 TX 零寫出，原在途 TX 可完成；不得 thaw。
 #[test]
 fn handoff_rollback_preserves_shutdown_freeze() {
-    let (r, io) = console_rig_with_inflight_key();
+    // 在途段已交 OS（gate 外阻塞）：測試需在途期間取 fence 鎖建立 shutdown 的 bridge 凍結。
+    let (r, inflight) = rig_with_inflight_background_tx(false);
     let dev = r.device(REAL_A).clone();
     r.svc.shutdown_freeze();
     r.mgr.begin_shutdown();
@@ -447,16 +501,13 @@ fn handoff_rollback_preserves_shutdown_freeze() {
     assert!(fence.with(|f| f.frozen), "bridge 的 shutdown 凍結不得被撤銷");
     let sub = r.call("command.submit", r#"{"selector":"COM0","command":"echo x"}"#);
     assert!(flushed_frozen(&sub), "admission 仍凍結：{}", wire(&sub));
-    dev.release_block();
-    let mut seen = Vec::new();
-    wait_for("原在途 TX 可完成", SHORT, || {
-        seen.extend(dev.take_tx());
-        seen.contains(&b'k')
-    });
-    io.push_input(b"z");
-    thread::sleep(Duration::from_millis(300));
-    seen.extend(dev.take_tx());
-    assert!(!seen.contains(&b'z'), "bridge 仍拒絕新 TX：{seen:?}");
+    release_inflight(&dev, false);
+    assert_eq!(confirmed(&inflight), b"probe\n".len(), "原在途 TX 可完成");
+    assert_eq!(dev.take_tx(), b"probe\n");
+    let next = inject_background_tx(&r, b"z\n", 2);
+    assert_eq!(confirmed(&next), 0, "bridge 仍拒絕新 TX");
+    thread::sleep(Duration::from_millis(100));
+    assert!(dev.take_tx().is_empty(), "bridge 仍拒絕新 TX");
 }
 
 /// flash rig：COM0 shell READY、COM1 passthrough MCU（ATTACHED，sync→ACK）；admission 已接到 coordinator。
@@ -863,3 +914,4 @@ fn handoff_then_successor_never_double_held() {
     assert_eq!(seen, vec![old_pid, new_pid], "持有者依序為舊 → 新：{seen:?}");
     drop(new);
 }
+

@@ -502,6 +502,18 @@ impl CommandRegistry {
             .len()
     }
 
+    /// P8 Task 14：命令是否仍未到終態（未結束，或已取消但 worker 尚在執行）。紀錄已淘汰視為已終結。
+    /// admission ticket 持有到此為 false（Python `CommandArbiter._finish_admission_locked` 的時點）。
+    pub fn is_outstanding(&self, cmd_id: &str) -> bool {
+        let inner = self.inner.lock().expect("命令登錄表鎖 poisoned");
+        match inner.records.get(cmd_id) {
+            None => false,
+            Some(record) => {
+                !record.get_truthy("done_at") || inner.in_flight.values().any(|active| active == cmd_id)
+            }
+        }
+    }
+
     /// 該 session 的 pending 數，包含已取消但 worker 尚未收尾的命令。
     pub fn pending(&self, session_id: &str) -> usize {
         let inner = self.inner.lock().expect("命令登錄表鎖 poisoned");
