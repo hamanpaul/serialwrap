@@ -434,6 +434,8 @@ pub struct SessionCore {
     quiet: QuietState,
     /// 進行中的登入 run（StartLogin 已發出、LoginFinished 未到）。
     login_run: Option<LoginRun>,
+    /// 暫時交接凍結期間完成的自動重探；交接回滾後回填，成立後丟棄。
+    deferred_auto_reprobe: Option<DeferredAutoReprobe>,
     /// 前景命令為 reboot 類且尚未因 TX 結算 arm quiet（parity-amendments-2026-10-26 #55）。
     foreground_reboot: bool,
     drain_stalled: bool,
@@ -607,6 +609,12 @@ struct RetiredStop {
     aborted_op: Option<(OpId, String)>,
 }
 
+struct DeferredAutoReprobe {
+    epoch: u64,
+    fsm_gen: u64,
+    result: crate::login_fsm::LoginOutcome,
+}
+
 impl SessionCore {
     pub fn new(profile: SessionProfile, profile_source: &str, deps: CoreDeps) -> SessionCore {
         let sid = format!("{}:{}", profile.template.profile_name, profile.com);
@@ -658,6 +666,7 @@ impl SessionCore {
             quiet_since: None,
             quiet: QuietState::default(),
             login_run: None,
+            deferred_auto_reprobe: None,
             foreground_reboot: false,
             drain_stalled: false,
             drain_timeout_epoch: None,
@@ -3298,14 +3307,57 @@ impl SessionCore {
         }
     }
 
+    fn handoff_freeze_state(&self) -> crate::admission::HandoffFreezeState {
+        use crate::admission::HandoffFreezeState;
+
+        let admission = self.deps.registry.admission_gate();
+        let mut state = admission.handoff_freeze_state();
+        if state == HandoffFreezeState::Open && self.deps.fence.with(|fence| fence.handoff_frozen) {
+            state = admission.handoff_freeze_state();
+            if state == HandoffFreezeState::Open {
+                state = HandoffFreezeState::Permanent;
+            }
+        }
+        state
+    }
+
     fn handoff_frozen(&self) -> bool {
-        self.deps.registry.admission_gate().frozen()
-            || self.deps.fence.with(|state| state.handoff_frozen)
+        self.handoff_freeze_state() != crate::admission::HandoffFreezeState::Open
+    }
+
+    fn discard_handoff_auto_reprobe(&mut self, now: Mono) -> Vec<Effect> {
+        self.deferred_auto_reprobe = None;
+        let waiters = self
+            .login_run
+            .take()
+            .map(|run| run.waiters)
+            .unwrap_or_default();
+        self.reprobe.inflight = false;
+        let response = pydict! {
+            "ok" => false,
+            "error_code" => "FLUSHED_BY_SHUTDOWN",
+            "reason" => "handoff_frozen",
+            "session" => self.session_value(now),
+        };
+        waiters
+            .into_iter()
+            .map(|(reply, _kind)| Effect::Reply(reply, Ok(response.clone())))
+            .collect()
     }
 
     fn tick(&mut self, now: Mono) -> Vec<Effect> {
-        if self.handoff_frozen() {
-            return Vec::new();
+        match self.handoff_freeze_state() {
+            crate::admission::HandoffFreezeState::Pending => return Vec::new(),
+            crate::admission::HandoffFreezeState::Permanent => {
+                if self.deferred_auto_reprobe.is_some() {
+                    return self.discard_handoff_auto_reprobe(now);
+                }
+                return Vec::new();
+            }
+            crate::admission::HandoffFreezeState::Open => {}
+        }
+        if let Some(deferred) = self.deferred_auto_reprobe.take() {
+            return self.auto_reprobe_finished(deferred.epoch, deferred.fsm_gen, deferred.result, now);
         }
         let mut effects = Vec::new();
         self.expire_reconfirm(now);
@@ -3510,23 +3562,19 @@ impl SessionCore {
         {
             return Vec::new();
         }
-        if self.handoff_frozen() {
-            let waiters = self
-                .login_run
-                .take()
-                .map(|run| run.waiters)
-                .unwrap_or_default();
-            self.reprobe.inflight = false;
-            let response = pydict! {
-                "ok" => false,
-                "error_code" => "FLUSHED_BY_SHUTDOWN",
-                "reason" => "handoff_frozen",
-                "session" => self.session_value(now),
-            };
-            return waiters
-                .into_iter()
-                .map(|(reply, _kind)| Effect::Reply(reply, Ok(response.clone())))
-                .collect();
+        match self.handoff_freeze_state() {
+            crate::admission::HandoffFreezeState::Pending => {
+                self.deferred_auto_reprobe = Some(DeferredAutoReprobe {
+                    epoch,
+                    fsm_gen,
+                    result,
+                });
+                return Vec::new();
+            }
+            crate::admission::HandoffFreezeState::Permanent => {
+                return self.discard_handoff_auto_reprobe(now);
+            }
+            crate::admission::HandoffFreezeState::Open => {}
         }
         // 結果一律回填（不得丟棄，否則 run／inflight 永久殘留、等待者永不回覆；審查 c11aa89_92e0223 H-1）。
         // Python `_probe_existing_bridge` 只依 probe 實際結果收斂、不看 login_gen：probe 期間 banner 才 arm 仍可回 ok → READY

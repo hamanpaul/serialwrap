@@ -453,6 +453,9 @@ impl Service {
             }
             return tx_in_flight_busy(&unconverged, &sessions);
         }
+        if created {
+            self.admission.commit_handoff(&token);
+        }
         pydict! { "ok" => true, "stopping" => true, "handoff_token" => token }
     }
 

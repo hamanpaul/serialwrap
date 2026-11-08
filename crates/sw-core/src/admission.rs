@@ -113,6 +113,14 @@ pub enum FreezeOutcome {
     Busy(Busy),
 }
 
+/// 交接 admission 凍結的生命週期；`Pending` 可由 TX fence 失敗回滾，`Permanent` 不可撤銷。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandoffFreezeState {
+    Open,
+    Pending,
+    Permanent,
+}
+
 #[derive(Default)]
 struct GateInner {
     tickets: BTreeMap<u64, (String, Option<String>)>,
@@ -201,6 +209,28 @@ impl AdmissionGate {
         }
         g.frozen = false;
         g.token = None;
+        g.idle_token = None;
+        true
+    }
+
+    /// 凍結是否仍是尚未成立的交接嘗試；查詢與 token 狀態共用同一把 gate lock。
+    pub fn handoff_freeze_state(&self) -> HandoffFreezeState {
+        let g = self.lock();
+        if !g.frozen {
+            HandoffFreezeState::Open
+        } else if g.idle_token.is_some() {
+            HandoffFreezeState::Pending
+        } else {
+            HandoffFreezeState::Permanent
+        }
+    }
+
+    /// 將成功完成 TX fence 的交接凍結轉為永久；之後 `thaw` 不得撤銷。
+    pub fn commit_handoff(&self, token: &str) -> bool {
+        let mut g = self.lock();
+        if !g.frozen || g.token.as_deref() != Some(token) || g.idle_token.as_deref() != Some(token) {
+            return false;
+        }
         g.idle_token = None;
         true
     }
