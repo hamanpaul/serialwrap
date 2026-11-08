@@ -29544,6 +29544,7 @@
           "cargo:sw-core::file_transfer_engine::push_move_timeout_no_cleanup",
           "cargo:sw-core::file_transfer_engine::push_probe_shell_error",
           "cargo:sw-core::file_transfer_engine::push_probe_timeout",
+          "cargo:sw-core::file_transfer_engine::push_prompt_timeout_and_cleanup_rejection_match_python_response_keys",
           "cargo:sw-core::file_transfer_engine::push_rejection_on_cancel_during_echo_stall_propagates",
           "cargo:sw-core::file_transfer_engine::push_roundtrip_ok",
           "cargo:sw-core::file_transfer_engine::push_roundtrip_openssl_decoder",

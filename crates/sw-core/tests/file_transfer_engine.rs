@@ -266,6 +266,33 @@ fn push_chunk_timeout() {
 }
 
 #[test]
+fn push_prompt_timeout_and_cleanup_rejection_match_python_response_keys() {
+    // Python push_file 在 chunk 已送出但 prompt 逾時時回傳進度（origin/main:sw_core/file_transfer.py:260-267）。
+    let mut timeout_caps = ShellCaps::busybox_base64();
+    timeout_caps.drop_prompt_on = Some("-0");
+    let (timeout, _) = run_push(timeout_caps, &data_n(100), |_| {});
+    assert_eq!(
+        j(timeout.unwrap()),
+        r#"{"ok":false,"error_code":"TRANSFER_TIMEOUT","chunks_sent":0,"chunks_total":1}"#
+    );
+
+    // Python 的 cleanup TxIncompleteError 在 _file_tx_rejected_result 前未附 chunk 進度：
+    // cleanup 呼叫位於 chunk send 的 TxIncompleteError handler 之外（file_transfer.py:252-267、
+    // session_manager.py:8216-8238）。Rust cleanup 被拒不得沿用被清理 chunk 的進度。
+    let mut cleanup_caps = ShellCaps::busybox_base64();
+    cleanup_caps.drop_prompt_on = Some("-0");
+    cleanup_caps.reject_on_send_n = Some((3, rej(RejectReason::Other, 0)));
+    let (cleanup, sh) = run_push(cleanup_caps, &data_n(100), |_| {});
+    let Err(TransferAbort::TxRejected { rej: got, chunks, .. }) = cleanup else {
+        panic!("cleanup TX 被拒時應上拋 TxRejected")
+    };
+    assert_eq!(got, rej(RejectReason::Other, 0));
+    assert_eq!(sh.send_attempts(), 3, "decoder probe、chunk、被拒的 cleanup");
+    let response = sw_core::op_runner::file_error_with_progress("TRANSFER_TIMEOUT", chunks);
+    assert_eq!(j(response), r#"{"ok":false,"error_code":"TRANSFER_TIMEOUT"}"#);
+}
+
+#[test]
 fn push_decoder_failed() {
     let mut caps = ShellCaps::busybox_base64();
     caps.decoder_fails_chunk = Some(0);
