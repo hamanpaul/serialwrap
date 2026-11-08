@@ -464,6 +464,8 @@ pub struct SessionCore {
     capture_env: CaptureEnv,
     /// reboot 後自動恢復（`_spawn_reboot_recovery` 的 actor 驅動版）。
     reboot_recovery: Option<RebootRecovery>,
+    /// file.* 的 admission ticket 保留至完成回放的 HumanTx 結算（P8 Task 14 handoff busy）。
+    replay_admission: Option<Arc<AdmissionTicket>>,
     /// force recover（clear＋reattach＋等待 READY 10 s）的等待者。
     /// force recover 的等待者（每個呼叫各自 10 次 × 1 s 輪詢，Python 各 thread 獨立 `_force_recover`）。
     force_recover: Vec<ForceRecover>,
@@ -680,6 +682,7 @@ impl SessionCore {
             capture_observer: crate::capture::CaptureObserver::new(),
             capture_env: CaptureEnv::default(),
             reboot_recovery: None,
+            replay_admission: None,
             force_recover: Vec::new(),
             next_force_id: 0,
             force_poll_after_clear: Vec::new(),
@@ -790,34 +793,27 @@ impl SessionCore {
         matches!(
             ev,
             MailboxItem::Control(
-                ControlEvent::BridgeOpened { .. }
+                ControlEvent::DeviceDetached { .. }
+                    | ControlEvent::EvictCapture { .. }
+                    | ControlEvent::ConsoleCountChanged { .. }
+                    | ControlEvent::BridgeOpened { .. }
                     | ControlEvent::UartIoError { .. }
                     | ControlEvent::UartTxCompleted { .. }
                     | ControlEvent::DrainDataBarrier { .. }
                     | ControlEvent::WorkerStopped(_)
                     | ControlEvent::WorkerDrainTimeout { .. }
                     | ControlEvent::OpFinished { .. }
+                    | ControlEvent::LoginFinished { .. }
+                    | ControlEvent::Timer(_)
                     | ControlEvent::StateCommitted { .. }
                     | ControlEvent::HumanTxCompleted { .. }
                     | ControlEvent::FlashSyncProbeStart { .. }
                     | ControlEvent::FlashProbeReleased { .. }
                     | ControlEvent::FlashSyncMatched { .. }
                     | ControlEvent::FlashHolderGone { .. }
-                    | ControlEvent::Timer(crate::mailbox::TimerEvent::DrainTimeout { .. })
             )
+                | MailboxItem::Data(DataEvent::ConsoleDisconnected { .. })
         )
-    }
-
-    fn is_matching_auto_reprobe_result(&self, ev: &MailboxItem) -> bool {
-        let MailboxItem::Control(ControlEvent::LoginFinished {
-            epoch, fsm_gen, ..
-        }) = ev
-        else {
-            return false;
-        };
-        self.login_run.as_ref().is_some_and(|run| {
-            run.kind == LoginRunKind::AutoReprobe && run.epoch == *epoch && run.fsm_gen == *fsm_gen
-        })
     }
 
     fn defer_handoff_event(&mut self, ev: MailboxItem, now: Mono) -> Effects {
@@ -854,18 +850,30 @@ impl SessionCore {
     fn discard_handoff_events_permanent(&mut self, now: Mono) -> Effects {
         let mut effects = Effects(Vec::new());
         while let Some(ev) = self.deferred_handoff_events.pop_front() {
-            if self.is_matching_auto_reprobe_result(&ev) || Self::is_handoff_lifecycle_event(&ev) {
+            if Self::is_handoff_lifecycle_event(&ev) {
                 effects.0.extend(self.dispatch_event(ev, now, false).0);
             }
         }
         effects
     }
 
+    /// 已受理操作的收尾不得因永久凍結而失聯。Mailbox 全量分類（Python 對照位置見本項回報）：
+    /// (a) 抑制會開啟或推進新工作：Control::{Request, DeviceAttached, DeviceMissing, Tick, ConsoleConnected,
+    ///     ConsoleScan}、Data::ConsoleInputBytes。Request 仍分派，但只能回唯讀資料或 admission 拒絕；不啟動新副作用。
+    ///     Python 凍結 readiness／attach／lease／human TX：session_manager.py:1127-1137, 2488-2504, 2572-2579。
+    /// (b) 保留已受理操作的完成、逾時與收尾：Control::{Shutdown, DeviceDetached, EvictCapture,
+    ///     ConsoleCountChanged, BridgeOpened, UartIoError, UartTxCompleted, DrainDataBarrier, WorkerStopped,
+    ///     WorkerDrainTimeout, OpFinished, LoginFinished, StateCommitted, HumanTxCompleted, FlashSyncProbeStart,
+    ///     FlashProbeReleased, FlashSyncMatched, FlashHolderGone}、Timer::{BootQuietExpired, LeaseExpiry,
+    ///     DrainTimeout, ForceRecoverPoll}、Data::ConsoleDisconnected。BridgeOpened／LoginFinished 僅結算凍結前已
+    ///     接受的開啟／探測，不在凍結後繼續 readiness。Python 收尾對照：session_manager.py:1734-1792, 4443-4462,
+    ///     8042-8064, 8067-8088；console close：uart_io.py:1505-1525。
+    /// (c) Data::UartRxChunk 依 rulings/s2.md「P8X-9e51abd-1 降為 Low」維持現況，不在本項改 RX 記帳
+    ///     （Python 對照：session_manager.py:4622-4670）。
     fn dispatch_handoff_permanent(&mut self, ev: MailboxItem, now: Mono) -> Effects {
         let mut effects = self.discard_handoff_events_permanent(now);
         if Self::is_handoff_bypass_event(&ev)
             || Self::is_handoff_lifecycle_event(&ev)
-            || self.is_matching_auto_reprobe_result(&ev)
         {
             effects.0.extend(self.dispatch_event(ev, now, false).0);
         }
@@ -2859,6 +2867,13 @@ impl SessionCore {
             self.set_state(SessionState::Attached, now);
             return effects;
         }
+        if self.handoff_freeze_state() == crate::admission::HandoffFreezeState::Permanent {
+            // bridge open 是凍結前已受理工作的完成；接上 worker 並回到 ATTACHED，但不啟動新的 login/readiness TX。
+            self.set_last_error(None, None);
+            self.adopt_bridge(now);
+            self.set_state(SessionState::Attached, now);
+            return effects;
+        }
         let quiet_blocks = boot_quiet_blocks_probe(&self.quiet, &self.profile, now);
         let (plan, synthesized) = self.choose_plan(quiet_blocks, self.pending_auto_login);
         match plan {
@@ -3017,6 +3032,9 @@ impl SessionCore {
             .is_some_and(|run| run.epoch == epoch && run.fsm_gen == fsm_gen)
         {
             return Vec::new();
+        }
+        if self.handoff_freeze_state() == crate::admission::HandoffFreezeState::Permanent {
+            return self.discard_handoff_login_run(now);
         }
         if self
             .login_run
@@ -3464,20 +3482,29 @@ impl SessionCore {
         self.handoff_freeze_state() != crate::admission::HandoffFreezeState::Open
     }
 
-    fn discard_handoff_auto_reprobe(&mut self, now: Mono) -> Vec<Effect> {
-        let waiters = self
-            .login_run
-            .take()
-            .map(|run| run.waiters)
-            .unwrap_or_default();
-        self.reprobe.inflight = false;
+    fn discard_handoff_login_run(&mut self, now: Mono) -> Vec<Effect> {
+        let Some(run) = self.login_run.take() else {
+            return Vec::new();
+        };
+        match run.kind {
+            LoginRunKind::AutoReprobe => self.reprobe.inflight = false,
+            LoginRunKind::RebootRecovery => {
+                self.reboot_recovery = None;
+                self.recovering = false;
+            }
+            LoginRunKind::Attach if self.state == SessionState::Attaching => {
+                self.adopt_bridge(now);
+                self.set_state(SessionState::Attached, now);
+            }
+            LoginRunKind::Attach | LoginRunKind::Reprobe => {}
+        }
         let response = pydict! {
             "ok" => false,
             "error_code" => "FLUSHED_BY_SHUTDOWN",
             "reason" => "handoff_frozen",
             "session" => self.session_value(now),
         };
-        waiters
+        run.waiters
             .into_iter()
             .map(|(reply, _kind)| Effect::Reply(reply, Ok(response.clone())))
             .collect()
@@ -3693,7 +3720,7 @@ impl SessionCore {
             return Vec::new();
         }
         if self.handoff_freeze_state() == crate::admission::HandoffFreezeState::Permanent {
-            return self.discard_handoff_auto_reprobe(now);
+            return self.discard_handoff_login_run(now);
         }
         // 結果一律回填（不得丟棄，否則 run／inflight 永久殘留、等待者永不回覆；審查 c11aa89_92e0223 H-1）。
         // Python `_probe_existing_bridge` 只依 probe 實際結果收斂、不看 login_gen：probe 期間 banner 才 arm 仍可回 ok → READY
@@ -5091,7 +5118,13 @@ impl SessionCore {
                 // Python `finally`：resume human → `_finish_foreground_operation`（admission 開、回放）後才回應。
                 let result = self.file_transfer_result(outcome, now);
                 self.command_fg_finish(&mut effects);
-                drop(admission);
+                if self.human.replay_hold.as_ref().is_some_and(|hold| !hold.revoked) {
+                    // file.push／pull 的 admission busy 涵蓋 command_fg_finish 建立的非同步回放；
+                    // 最後一筆 HumanTxCompleted 結算 hold 時才歸還，對齊 Python 同步回放的票據生命週期。
+                    self.replay_admission = admission;
+                } else {
+                    drop(admission);
+                }
                 effects.push(Effect::Reply(reply, result));
             }
             Some(other) => effects.extend(self.answer_op(other, outcome, now, true)),

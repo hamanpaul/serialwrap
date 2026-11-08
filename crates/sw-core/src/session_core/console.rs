@@ -304,6 +304,7 @@ impl SessionCore {
         }
         let (id, revoked) = (hold.hold_id, hold.revoked);
         self.human.replay_hold = None;
+        self.replay_admission = None;
         if self.tick_close_hold == Some(id) {
             self.tick_close_hold = None;
         }
@@ -969,6 +970,8 @@ impl SessionCore {
         self.revoke_replay();
         self.deps.fence.with(|f| f.replay_auth = None);
         self.human.replay_hold = None;
+        // drain 已終止所有回放；不讓尚未完成的 handoff ticket 阻塞後續停止收尾。
+        self.replay_admission = None;
         self.human.replay_after_revoked = false;
         self.tick_close_hold = None;
         self.tick_close_interactive.clear();
