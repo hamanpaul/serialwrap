@@ -26,6 +26,14 @@ use sw_proto::pyjson::{self, JsonError, PyDict, PyValue, RPC_EARLY, RPC_WIRE};
 pub trait RpcHandler: Send + Sync {
     fn call(&self, method: &str, params: &PyDict) -> Result<PyDict, PyErr>;
     fn request_stop(&self);
+    /// P8 Task 14：SC-11 交接停止（`daemon.handoff_stop` 與 `daemon.stop` 同層攔截）；預設與一般 method 相同分派。
+    fn handoff_stop(&self, params: &PyDict) -> Result<PyDict, PyErr> {
+        self.call("daemon.handoff_stop", params)
+    }
+    /// P8 Task 14：交接成立後於排空窗口結束時停止（預設立即停止）。
+    fn request_stop_after(&self, _delay: Duration) {
+        self.request_stop();
+    }
 }
 
 /// 請求行上限（內容不含 `\n`；超過斷線不回應，RPC-H-02；`contracts/golden/rpc/line_limit.json` 的 `max_ok_bytes`）。

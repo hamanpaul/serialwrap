@@ -648,6 +648,8 @@ pub fn chmod(path: &Path, mode: &str) {
 pub enum Fixture {
     /// 無額外腳本（只需裝置掃描）。
     None,
+    /// READY 的 shell 目標（COM0），無寫入腳本、無夾具驅動 thread（P8 Task 14：測試自行驅動交接）。
+    ReadyShell,
     /// READY 的 shell 目標；前景命令 BlockUntilCancel，另有排隊命令。
     ReadyShellBlockingWithQueue,
     /// READY 的 shell 目標；session writer 以 BlockForever 卡住（drain 收斂不了）。

@@ -807,6 +807,8 @@ impl ServiceRig {
         }));
         let state = sw_daemon::service::FlashState::new(coord.clone(), endpoint);
         assert!(svc.attach_flash(state.clone()), "attach_flash 第一次應成功");
+        // P8 Task 14：flash sync-probe 與 RPC 分派共用 Service 的 admission 邊界（同 daemon_main 組裝）。
+        assert!(coord.set_admission(svc.admission().clone()), "set_admission 第一次應成功");
         let rig = ServiceRig {
             svc,
             mgr,

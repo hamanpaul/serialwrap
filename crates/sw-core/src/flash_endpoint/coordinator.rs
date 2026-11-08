@@ -302,6 +302,10 @@ pub struct FlashCoordinator {
     /// join 逾時的 thread 名稱（`FlashEndpoint::stop` 併入 `EndpointStopReceipt.stalled_threads`）。
     stalled: Mutex<Vec<&'static str>>,
     phase: AtomicU8,
+    /// P8 Task 14：共同 admission 邊界（daemon 組裝點於 Service 建立後以 [`FlashCoordinator::set_admission`] 掛上）。
+    admission: std::sync::OnceLock<Arc<crate::admission::AdmissionGate>>,
+    /// P8 Task 14：sync-probe 因凍結被 admission 拒絕的次數（觀測用）。
+    admission_refusals: AtomicU64,
     #[cfg(feature = "test-fakes")]
     test: TestHooks,
 }
@@ -416,6 +420,8 @@ impl FlashCoordinator {
             next_op: AtomicU64::new(0),
             stalled: Mutex::new(Vec::new()),
             phase: AtomicU8::new(PHASE_IDLE),
+            admission: std::sync::OnceLock::new(),
+            admission_refusals: AtomicU64::new(0),
             #[cfg(feature = "test-fakes")]
             test: TestHooks::default(),
         });
@@ -815,6 +821,17 @@ impl FlashCoordinator {
     #[cfg(feature = "test-fakes")]
     pub fn opens_completed_for_test(&self) -> u64 {
         self.test.opens_completed.load(Ordering::SeqCst)
+    }
+
+    /// P8 Task 14：掛上共同 admission 邊界（只可一次；回 `false` 表示已掛上）。
+    pub fn set_admission(&self, gate: Arc<crate::admission::AdmissionGate>) -> bool {
+        self.admission.set(gate).is_ok()
+    }
+
+    /// 只供測試：sync-probe 因凍結被 admission 拒絕的次數。
+    #[cfg(feature = "test-fakes")]
+    pub fn admission_refusals_for_test(&self) -> u64 {
+        self.admission_refusals.load(Ordering::SeqCst)
     }
 }
 

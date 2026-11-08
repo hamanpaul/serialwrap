@@ -2797,10 +2797,19 @@ fn unknown_method_not_found() {
             r.version
         )
     );
-    // daemon.stop／daemon.handoff_stop 不經 Service（framing 攔截；handoff 屬 2.4）。
+    // daemon.stop 不經 Service（framing 攔截）。daemon.handoff_stop 自 P8 Task 14 起由 Service 承接（計畫 09 Task 14
+    // 「Rust daemon 承接 SC-11 交接停止」；Python `service.rpc` 直接回 `handoff_stop(params)`，不補 version）：
+    // 閒置時回完整的成功形狀 {"ok":true,"stopping":true,"handoff_token":<32 hex>}。
+    let h = r.call("daemon.handoff_stop", "{}");
+    let token = h.get("handoff_token").and_then(PyValue::as_str).unwrap_or_default().to_string();
+    assert!(
+        token.len() == 32 && token.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "handoff_token 須為 32 hex：{}",
+        j(&h)
+    );
     assert_eq!(
-        s(&r.call("daemon.handoff_stop", "{}"), "error_code"),
-        "METHOD_NOT_FOUND"
+        j(&h),
+        format!("{{\"ok\":true,\"stopping\":true,\"handoff_token\":\"{token}\"}}")
     );
 }
 

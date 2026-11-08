@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use sw_core::admission::AdmissionGate;
 use sw_core::arbiter::{CommandRegistry, SubmitOrigin, SubmitReq, expect_reboot_rejection};
 use sw_core::event_engine::registry::UpsertError;
 use sw_core::event_engine::schema::RuleError;
@@ -70,6 +71,8 @@ pub struct Service {
     engine: std::sync::OnceLock<Arc<EventEngine>>,
     /// P8 Task 10：flash 端點狀態（組裝點以 `attach_flash` 掛上；未掛上時 `mcu.status` 視同無端點）。
     flash: std::sync::OnceLock<Arc<FlashState>>,
+    /// P8 Task 14：所有新操作的共同 admission 邊界（arch §6.2 第 7 步）。
+    admission: Arc<AdmissionGate>,
 }
 
 /// P8 Task 10：`mcu.status` 的 flash 真值來源（Python `_flash_endpoint.is_flashing()`、`_flash_active_com`、
@@ -274,7 +277,23 @@ impl Service {
             running: AtomicBool::new(true),
             engine: std::sync::OnceLock::new(),
             flash: std::sync::OnceLock::new(),
+            admission: Arc::new(AdmissionGate::new()),
         }
+    }
+
+    /// P8 Task 14：共同 admission 邊界（flash 端點的 sync-probe 與 RPC 分派共用同一個 gate）。
+    pub fn admission(&self) -> &Arc<AdmissionGate> {
+        &self.admission
+    }
+
+    /// P8 Task 14：SC-11 交接停止（Python `SerialwrapService.handoff_stop`）。
+    pub fn handoff_stop(&self, _params: &PyDict) -> PyDict {
+        todo!("P8-T14")
+    }
+
+    /// P8 Task 14：daemon 一般關機的 admission 凍結（Python `service.stop()` 的 `admission.freeze()`）。
+    pub fn shutdown_freeze(&self) {
+        todo!("P8-T14")
     }
 
     /// 掛上 flash 端點狀態（只可一次；回 `false` 表示已掛上）。
