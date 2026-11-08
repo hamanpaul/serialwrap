@@ -684,6 +684,20 @@ impl Shared {
         Some(s)
     }
 
+    fn session_public_checked(&self, sid: &str) -> Result<PyDict, PyErr> {
+        self.send_console_scan(sid);
+        let actor = self
+            .actor_of(sid)
+            .ok_or_else(|| PyErr::value_error(format!("session actor unavailable: {sid}")))?;
+        let r = actor.request(SessionRequest::GetState, self.query_timeout())?;
+        let mut s = session_of(&r)
+            .ok_or_else(|| PyErr::value_error(format!("session state unavailable: {sid}")))?;
+        if let Some(e) = lock(&self.inner).sessions.get(sid) {
+            s.insert("alias", PyValue::from(e.profile.alias.clone()));
+        }
+        Ok(s)
+    }
+
     fn session_state(&self, sid: &str) -> Option<String> {
         self.session_public(sid).and_then(|s| str_of(&s, "state"))
     }
@@ -2677,6 +2691,28 @@ impl SessionManager {
         }
     }
 
+    /// 傳檔 RPC 路由；ticket 由 pending op 持有至傳輸實際終態，actor reply timeout 不會提早解除交接 admission。
+    pub fn file_transfer_with_admission(
+        &self,
+        req: crate::file_transfer::FileTransferRequest,
+        admission: Option<Arc<crate::admission::AdmissionTicket>>,
+    ) -> Result<PyDict, PyErr> {
+        match self.resolve(&req.selector) {
+            Some(sid) => {
+                let request = match admission {
+                    Some(admission) => SessionRequest::FileTransferAdmitted { req, admission },
+                    None => SessionRequest::FileTransfer(req),
+                };
+                self.route(&sid, request, self.shared.file_transfer_reply_timeout())
+            }
+            None => Ok(pydict! {
+                "ok" => false,
+                "error_code" => "SESSION_NOT_FOUND",
+                "selector" => req.selector,
+            }),
+        }
+    }
+
     /// 將 session 請求路由到對應 actor 並等待回覆。
     pub fn route(
         &self,
@@ -2717,6 +2753,7 @@ impl SessionManager {
                 | SessionRequest::Activity
                 | SessionRequest::InteractiveOpen { .. }
                 | SessionRequest::FileTransfer(_)
+                | SessionRequest::FileTransferAdmitted { .. }
         ) {
             // 07 D-09：session 摘要與 interactive_open（Python `_refresh_interactive_locked` 即時掃 peer）前先更新 console peer 判定。
             // P8 Task 6：file.* 的 manager 層同樣先 `_refresh_interactive_locked`（human lease 的 peer 判定）。
@@ -2773,6 +2810,20 @@ impl SessionManager {
         sids.sort();
         sids.iter()
             .filter_map(|sid| self.shared.session_public(sid))
+            .collect()
+    }
+
+    /// 交接專用完整 session 快照；任何 actor 查詢失敗都回傳該 session 的 COM，呼叫端必須 fail closed。
+    pub fn list_sessions_checked(&self) -> Result<Vec<PyDict>, String> {
+        let mut sessions: Vec<(String, String)> = lock(&self.shared.inner)
+            .sessions
+            .values()
+            .map(|entry| (entry.sid.clone(), entry.profile.com.clone()))
+            .collect();
+        sessions.sort_by(|a, b| a.0.cmp(&b.0));
+        sessions
+            .into_iter()
+            .map(|(sid, com)| self.shared.session_public_checked(&sid).map_err(|_| com))
             .collect()
     }
 

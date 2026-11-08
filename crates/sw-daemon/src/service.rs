@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use sw_core::admission::{AdmissionFlag, AdmissionGate, Busy, BusyCom, FreezeOutcome, Ticket};
+use sw_core::admission::{AdmissionFlag, AdmissionGate, AdmissionTicket, Busy, BusyCom, FreezeOutcome, Ticket};
 use sw_core::arbiter::{CommandRegistry, SubmitOrigin, SubmitReq, expect_reboot_rejection};
 use sw_core::event_engine::registry::UpsertError;
 use sw_core::event_engine::schema::RuleError;
@@ -87,18 +87,24 @@ const ADMISSION_METHODS: &[&str] = &[
 const HANDOFF_TX_FENCE_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// admission ticket 的 RAII 守衛：分派結束（含 `Err`／panic unwind）即歸還，除非以 `take` 移交給持有到終態的表。
-struct TicketGuard<'a> {
-    gate: &'a AdmissionGate,
+struct TicketGuard {
+    gate: Arc<AdmissionGate>,
     ticket: Option<Ticket>,
 }
 
-impl TicketGuard<'_> {
+impl TicketGuard {
     fn take(mut self) -> Option<Ticket> {
         self.ticket.take()
     }
+
+    fn into_async_ticket(&mut self) -> Option<Arc<AdmissionTicket>> {
+        self.ticket
+            .take()
+            .map(|ticket| Arc::new(AdmissionTicket::new(Arc::clone(&self.gate), ticket)))
+    }
 }
 
-impl Drop for TicketGuard<'_> {
+impl Drop for TicketGuard {
     fn drop(&mut self) {
         if let Some(ticket) = self.ticket.take() {
             self.gate.done(ticket);
@@ -395,7 +401,10 @@ impl Service {
             r => r,
         };
         self.registry.reconcile_admission();
-        let sessions = self.manager.list_sessions();
+        let sessions = match self.manager.list_sessions_checked() {
+            Ok(sessions) => sessions,
+            Err(com) => return self.handoff_query_incomplete(&com),
+        };
         self.reconcile_lease_tickets(&sessions);
         self.publish_flags(&sessions, &mut published);
         let (token, created) = match self.admission.freeze_if_idle(&reason) {
@@ -403,7 +412,13 @@ impl Service {
             FreezeOutcome::Frozen { token, created } => (token, created),
         };
         if created {
-            let fresh = self.manager.list_sessions();
+            let fresh = match self.manager.list_sessions_checked() {
+                Ok(sessions) => sessions,
+                Err(com) => {
+                    self.admission.thaw(&token);
+                    return self.handoff_query_incomplete(&com);
+                }
+            };
             let busy = self.flag_busy(&fresh);
             if !busy.by_com.is_empty() {
                 self.admission.thaw(&token);
@@ -421,6 +436,14 @@ impl Service {
             return tx_in_flight_busy(&unconverged, &sessions);
         }
         pydict! { "ok" => true, "stopping" => true, "handoff_token" => token }
+    }
+
+    fn handoff_query_incomplete(&self, com: &str) -> PyDict {
+        let interactive_id = lock(&self.lease_tickets)
+            .iter()
+            .find(|(_, ticket)| ticket.com() == Some(com))
+            .map(|(interactive_id, _)| interactive_id.clone());
+        handoff_query_incomplete(com, interactive_id)
     }
 
     /// P8 Task 14：daemon 一般關機的 admission 凍結（Python `service.stop()` 的 `admission.freeze()`）。
@@ -519,7 +542,7 @@ impl Service {
     }
 
     /// 分派成功後把需持有到終態的 ticket 移交（interactive_open → lease）；其餘於守衛 drop 歸還。
-    fn retain_ticket(&self, method: &str, params: &PyDict, result: &PyDict, guard: TicketGuard<'_>) {
+    fn retain_ticket(&self, method: &str, params: &PyDict, result: &PyDict, guard: TicketGuard) {
         if !is_ok(result) {
             return;
         }
@@ -655,12 +678,14 @@ impl Service {
         if method == "daemon.handoff_stop" {
             return Ok(self.handoff_stop(params));
         }
-        let guard = if ADMISSION_METHODS.contains(&method) {
+        let mut guard = if ADMISSION_METHODS.contains(&method) {
             if matches!(method, "session.interactive_open" | "session.interactive_close") {
-                self.reconcile_lease_tickets(&self.manager.list_sessions());
+                if let Ok(sessions) = self.manager.list_sessions_checked() {
+                    self.reconcile_lease_tickets(&sessions);
+                }
             }
             match self.admission.admit(method, self.admission_com(params).as_deref()) {
-                Some(ticket) => Some(TicketGuard { gate: &self.admission, ticket: Some(ticket) }),
+                Some(ticket) => Some(TicketGuard { gate: Arc::clone(&self.admission), ticket: Some(ticket) }),
                 None => {
                     let mut frozen = handoff_frozen_response();
                     frozen.setdefault("version", PyValue::from(self.version.clone()));
@@ -670,7 +695,19 @@ impl Service {
         } else {
             None
         };
-        let mut result = self.dispatch(method, params)?;
+        let mut result = match method {
+            "file.push" => self.file_transfer_rpc(
+                FileTransferKind::Push,
+                params,
+                guard.as_mut().and_then(TicketGuard::into_async_ticket),
+            )?,
+            "file.pull" => self.file_transfer_rpc(
+                FileTransferKind::Pull,
+                params,
+                guard.as_mut().and_then(TicketGuard::into_async_ticket),
+            )?,
+            _ => self.dispatch(method, params)?,
+        };
         if let Some(guard) = guard {
             self.retain_ticket(method, params, &result, guard);
         }
@@ -749,13 +786,18 @@ impl Service {
 
     /// P8 Task 6：`file.push`／`file.pull`（`service.py` 1426～1500）：轉型失敗與 `SOURCE_RESERVED` 直接回；
     /// 通過者交 `SessionManager::file_transfer`，成功回應依 `_annotate_source` 標註正規化來源。
-    fn file_transfer_rpc(&self, kind: FileTransferKind, params: &PyDict) -> Result<PyDict, PyErr> {
+    fn file_transfer_rpc(
+        &self,
+        kind: FileTransferKind,
+        params: &PyDict,
+        admission_ticket: Option<Arc<AdmissionTicket>>,
+    ) -> Result<PyDict, PyErr> {
         let (req, source_check) = match FileTransferRequest::from_rpc(kind, params)? {
             Ok(parsed) => parsed,
             Err(response) => return Ok(response),
         };
         self.manager
-            .file_transfer(req)
+            .file_transfer_with_admission(req, admission_ticket)
             .map(|result| annotate_source(result, &source_check, false))
     }
 
@@ -1019,8 +1061,8 @@ impl Service {
             }
 
             // P8 Task 6：file.* 的參數轉型逐行照 `service.py`（`FileTransferRequest::from_rpc`），session 閘門在 actor 內。
-            "file.push" => self.file_transfer_rpc(FileTransferKind::Push, params),
-            "file.pull" => self.file_transfer_rpc(FileTransferKind::Pull, params),
+            "file.push" => self.file_transfer_rpc(FileTransferKind::Push, params, None),
+            "file.pull" => self.file_transfer_rpc(FileTransferKind::Pull, params, None),
 
             "command.submit" => {
                 // completion_regex 驗證在 selector 解析之前（Python 順序）。
@@ -1324,6 +1366,23 @@ fn tx_in_flight_busy(unconverged: &[String], sessions: &[PyDict]) -> PyDict {
         .map(|com| busy_row(com, by_com.get(com.as_str()).copied(), false, vec!["tx.in_flight".to_string()]))
         .collect();
     pydict! { "ok" => false, "error_code" => "SESSION_BUSY", "busy" => PyValue::List(rows) }
+}
+
+/// session 公開查詢不完整時 fail closed；未知狀態不能作為 lease ticket 回收依據。
+fn handoff_query_incomplete(com: &str, interactive_id: Option<String>) -> PyDict {
+    let mut row = match busy_row(com, None, false, vec!["session.get_state".to_string()]) {
+        PyValue::Dict(row) => row,
+        _ => unreachable!("busy_row 恆為 dict"),
+    };
+    row.insert(
+        "interactive_session_id",
+        interactive_id.map(PyValue::from).unwrap_or(PyValue::Null),
+    );
+    pydict! {
+        "ok" => false,
+        "error_code" => "SESSION_BUSY",
+        "busy" => PyValue::List(vec![PyValue::Dict(row)]),
+    }
 }
 
 /// `RpcHandler` 實作：分派到 `Service::rpc`，`daemon.stop` 經 `stop` channel 通知 daemon main。

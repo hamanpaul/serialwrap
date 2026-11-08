@@ -17,6 +17,7 @@ use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 use sw_proto::pyre::valid_completion_regex;
 
 use crate::Mono;
+use crate::admission::AdmissionTicket;
 use crate::arbiter::{
     CmdOutcome, CommandRegistry, QueuedCommand, RunDecision, SessionQueue, SubmitOrigin, SubmitReq,
 };
@@ -244,6 +245,11 @@ pub enum SessionRequest {
     },
     /// P8 Task 6：`file.push`／`file.pull`（RPC 層已轉型；閘門、lease、前景槽在 actor 內原子判定）。
     FileTransfer(FileTransferRequest),
+    /// P8 Task 14：RPC 等待逾時後，仍由實際傳輸 pending op 持有 admission ticket。
+    FileTransferAdmitted {
+        req: FileTransferRequest,
+        admission: Arc<AdmissionTicket>,
+    },
     /// 只供測試（test-fakes）：直接設定狀態（FLASHING／RECOVERING 等無法由 RPC 到達者；Task 16 `force_session_state`）。
     #[cfg(feature = "test-fakes")]
     ForceStateForTest(SessionState),
@@ -1959,7 +1965,10 @@ impl SessionCore {
                 effects.extend(opened);
                 effects
             }
-            SessionRequest::FileTransfer(req) => self.file_transfer_request(req, reply, now),
+            SessionRequest::FileTransfer(req) => self.file_transfer_request(req, None, reply, now),
+            SessionRequest::FileTransferAdmitted { req, admission } => {
+                self.file_transfer_request(req, Some(admission), reply, now)
+            }
             SessionRequest::MarkAttachStalled { epoch } => {
                 self.set_state(SessionState::Recovering, now);
                 self.drain_stalled = true;
@@ -3289,7 +3298,15 @@ impl SessionCore {
         }
     }
 
+    fn handoff_frozen(&self) -> bool {
+        self.deps.registry.admission_gate().frozen()
+            || self.deps.fence.with(|state| state.handoff_frozen)
+    }
+
     fn tick(&mut self, now: Mono) -> Vec<Effect> {
+        if self.handoff_frozen() {
+            return Vec::new();
+        }
         let mut effects = Vec::new();
         self.expire_reconfirm(now);
         // SC-13：1 s tick 主動收回到期的 agent lease（`_expire_interactive_leases_tick`，留 tombstone）。
@@ -3492,6 +3509,24 @@ impl SessionCore {
                 .is_some_and(|run| run.epoch == epoch && run.fsm_gen == fsm_gen)
         {
             return Vec::new();
+        }
+        if self.handoff_frozen() {
+            let waiters = self
+                .login_run
+                .take()
+                .map(|run| run.waiters)
+                .unwrap_or_default();
+            self.reprobe.inflight = false;
+            let response = pydict! {
+                "ok" => false,
+                "error_code" => "FLUSHED_BY_SHUTDOWN",
+                "reason" => "handoff_frozen",
+                "session" => self.session_value(now),
+            };
+            return waiters
+                .into_iter()
+                .map(|(reply, _kind)| Effect::Reply(reply, Ok(response.clone())))
+                .collect();
         }
         // 結果一律回填（不得丟棄，否則 run／inflight 永久殘留、等待者永不回覆；審查 c11aa89_92e0223 H-1）。
         // Python `_probe_existing_bridge` 只依 probe 實際結果收斂、不看 login_gen：probe 期間 banner 才 arm 仍可回 ok → READY
@@ -4885,10 +4920,11 @@ impl SessionCore {
             Some(PendingOp::Recover { reply }) => {
                 effects.extend(self.finish_recover(reply, outcome, now));
             }
-            Some(PendingOp::FileTransfer { reply }) => {
+            Some(PendingOp::FileTransfer { reply, admission }) => {
                 // Python `finally`：resume human → `_finish_foreground_operation`（admission 開、回放）後才回應。
                 let result = self.file_transfer_result(outcome, now);
                 self.command_fg_finish(&mut effects);
+                drop(admission);
                 effects.push(Effect::Reply(reply, result));
             }
             Some(other) => effects.extend(self.answer_op(other, outcome, now, true)),
@@ -5014,7 +5050,11 @@ impl SessionCore {
             }
             PendingOp::Recover { reply } => vec![Effect::Reply(reply, Ok(prompt_timeout_none()))],
             // P8 Task 6：drain／重連已清掉前景（stale）時只回覆，不再套用 session 副作用（ownership 已由 Phase 1 重設）。
-            PendingOp::FileTransfer { reply } => vec![Effect::Reply(reply, self.file_transfer_result(outcome, now))],
+            PendingOp::FileTransfer { reply, admission } => {
+                let result = self.file_transfer_result(outcome, now);
+                drop(admission);
+                vec![Effect::Reply(reply, result)]
+            }
             PendingOp::Command { .. } | PendingOp::InteractiveCmd { .. } => Vec::new(),
         }
     }
@@ -5982,6 +6022,7 @@ enum PendingOp {
     /// P8 Task 6：`file.push`／`file.pull`（Python 前景 operation `kind="file"`：計入 `foreground_busy`）。
     FileTransfer {
         reply: Reply,
+        admission: Option<Arc<AdmissionTicket>>,
     },
 }
 

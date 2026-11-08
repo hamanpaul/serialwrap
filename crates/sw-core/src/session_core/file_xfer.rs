@@ -39,6 +39,7 @@ impl SessionCore {
     pub(super) fn file_transfer_request(
         &mut self,
         req: FileTransferRequest,
+        admission: Option<Arc<crate::admission::AdmissionTicket>>,
         reply: Reply,
         now: Mono,
     ) -> Vec<Effect> {
@@ -50,8 +51,10 @@ impl SessionCore {
         // RPC 路徑 `trusted_human=False`，一律比照 agent（DF-02、OD-74）。
         self.command_fg_begin(&SubmitOrigin::Rpc, false);
         let grant = self.new_grant(None);
-        self.pending_ops
-            .insert(grant.op_id, PendingOp::FileTransfer { reply });
+        self.pending_ops.insert(
+            grant.op_id,
+            PendingOp::FileTransfer { reply, admission },
+        );
         self.foreground = Some(grant.clone());
         vec![Effect::StartOp {
             grant,

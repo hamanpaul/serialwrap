@@ -13,7 +13,7 @@ use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// 一項尚未完成的有副作用操作（Python `Ticket(kind, com, seq)`）。只能經 [`AdmissionGate::done`] 歸還。
 #[derive(Debug, PartialEq, Eq)]
@@ -37,6 +37,36 @@ impl Ticket {
     /// 取得順序（同一 gate 內單調遞增）。
     pub fn seq(&self) -> u64 {
         self.seq
+    }
+}
+
+/// 跨 actor request timeout 仍代表執行中操作的 ticket 所有權。
+///
+/// RPC 等待者離開後，此物件由 actor 的 pending operation 繼續持有；操作到達終態或被終止時，最後一個 owner drop 才歸還票據。
+pub struct AdmissionTicket {
+    gate: Arc<AdmissionGate>,
+    ticket: Option<Ticket>,
+}
+
+impl std::fmt::Debug for AdmissionTicket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmissionTicket")
+            .field("ticket", &self.ticket)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AdmissionTicket {
+    pub fn new(gate: Arc<AdmissionGate>, ticket: Ticket) -> AdmissionTicket {
+        AdmissionTicket { gate, ticket: Some(ticket) }
+    }
+}
+
+impl Drop for AdmissionTicket {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.ticket.take() {
+            self.gate.done(ticket);
+        }
     }
 }
 
