@@ -305,6 +305,18 @@ pub fn boot_quiet_blocks_probe(q: &QuietState, sp: &SessionProfile, now: Mono) -
             .is_some_and(|v| !v.is_empty())
 }
 
+/// `_probe_existing_bridge` 的單點 gate（`session_manager.py:4746`）：
+/// `_boot_quiet_blocks_probe(current) or current.boot_evidence_wait_active()`。
+///
+/// 非 passthrough 時採「證據等待有效 OR 原 quiet 條件」；`console_unlock_env` 只豁免原 quiet，不豁免等待；
+/// passthrough 恆 false（SC-35，不送 probe 也不另設 gate）。`boot_quiet_blocks_probe` 維持 Python
+/// `_boot_quiet_blocks_probe`（`:1888-1890`）的只看 quiet 語意：其餘呼叫點（reprobe 的 `ready_reconfirm`、
+/// fence 豁免旗標、attach plan、reboot recovery）在 Python 都不看等待，不得改用本函式。
+pub fn existing_bridge_probe_blocked(q: &QuietState, sp: &SessionProfile, now: Mono) -> bool {
+    sp.template.platform != "passthrough"
+        && (q.boot_evidence_wait_active(now) || boot_quiet_blocks_probe(q, sp, now))
+}
+
 impl QuietState {
     /// 先 `expire(now, false)`，再 `quiet_active || pending`（`SessionRuntime.agent_gate_active`；passthrough 由呼叫端排除）。
     pub fn agent_gate_active(&mut self, now: Mono) -> bool {

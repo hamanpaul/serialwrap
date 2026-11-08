@@ -36,8 +36,8 @@ use crate::mailbox::{
 };
 use crate::op_runner::{OpOutcome, OpSpec, encode_interactive_payload, reject_reason};
 use crate::quiet_gate::{
-    boot_quiet_blocks_probe, is_reboot_command, matches_any_bootloader_prompt, QuietState,
-    QuietTransition,
+    boot_quiet_blocks_probe, existing_bridge_probe_blocked, is_reboot_command,
+    matches_any_bootloader_prompt, QuietState, QuietTransition,
 };
 use crate::self_test::{NeedProbe, SelfTestBase, SelfTestCtx, SelfTestProbes};
 use crate::session_auth::resolve_session_auth;
@@ -2985,8 +2985,9 @@ impl SessionCore {
         if self.is_passthrough() || !self.profile.template.command_capable() {
             return self.reprobe_reply(reply, kind, now);
         }
-        let quiet_blocks = boot_quiet_blocks_probe(&self.quiet, &self.profile, now);
-        if quiet_blocks {
+        // `_probe_existing_bridge`（`session_manager.py:4746`）：quiet 或非同步 reboot 的證據等待（G8，#243）有效時
+        // 走同一零 TX 返回；不開新登入世代、不排 backoff、不加 attempts。
+        if existing_bridge_probe_blocked(&self.quiet, &self.profile, now) {
             // #130 Finding 2／#162：不送 probe TX；READY 不以合成碼覆寫 last_error。
             if self.state != SessionState::Ready {
                 self.set_last_error(Some("PROMPT_UNAVAILABLE".into()), None);
@@ -5786,7 +5787,9 @@ impl SessionCore {
             Self::extend_pairs(&mut out, lease_ctx.clone());
             return Ok(out);
         }
-        if self.quiet.quiet_active(now) {
+        // `session_manager.py:7816`：`boot_quiet_active() or boot_evidence_wait_active()`——quiet 不看 console unlock
+        // （self-test gate 不豁免），非同步 reboot 的證據等待（G8，#243）同樣不送 nonce probe。
+        if self.quiet.quiet_active(now) || self.quiet.boot_evidence_wait_active(now) {
             return Ok(simple("AUTOBOOT_QUIET", "wait", Vec::new()));
         }
         Err(NeedProbe {

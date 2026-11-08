@@ -429,3 +429,117 @@ fn wp56_banner_releases_wait_without_extending_reconfirm() {
     assert_eq!(q.boot_evidence_wait_until, t(1060.0));
     assert_wait(&q, 1010.0, true, Some(50.0), "passthrough banner");
 }
+
+#[test] // 新增（RED）：`_probe_existing_bridge` 的 gate＝`_boot_quiet_blocks_probe(current) or boot_evidence_wait_active()`
+fn wp56_existing_bridge_gate_combines_wait_with_quiet() {
+    // WP5-6 第 4 項（G8，#243）：`origin/main:sw_core/session_manager.py:4746`——等待不受 console unlock 豁免、
+    // passthrough 維持 SC-35。Python `_boot_quiet_blocks_probe`（`:1888-1890`）本身只表示 quiet，故
+    // `boot_quiet_blocks_probe` 維持只看 quiet，合併判定由 `existing_bridge_probe_blocked` 承擔。
+    let sp = prpl();
+    let mut unlock = sp.clone();
+    unlock.template.console_unlock_env = Some("SMART4R_CONSOLE_UNLOCK".into());
+    let mut pt = sp.clone();
+    pt.template.platform = "passthrough".into();
+
+    // 非同步 reboot 後：quiet 已清、等待由 1001.5 起算 60 s。
+    let mut q = QuietState::default();
+    q.arm(t(1000.0));
+    q.clear_quiet();
+    q.begin_boot_evidence_wait(t(1001.5));
+    for (name, p) in [("prpl", &sp), ("unlock", &unlock)] {
+        assert!(existing_bridge_probe_blocked(&q, p, t(1010.0)), "{name}：等待中擋 probe");
+        assert!(
+            existing_bridge_probe_blocked(&q, p, t(1061.5) - 1),
+            "{name}：到期前 1 ns 仍擋"
+        );
+        assert!(
+            !existing_bridge_probe_blocked(&q, p, t(1061.5)),
+            "{name}：恰好到期（now >= until）解除"
+        );
+        assert!(
+            !boot_quiet_blocks_probe(&q, p, t(1010.0)),
+            "{name}：共用 helper 只表示 quiet（Python `_boot_quiet_blocks_probe`）"
+        );
+    }
+
+    // passthrough：等待與 quiet 同時存在也不擋（SC-35，passthrough 不送 probe 也不另設 gate）。
+    let mut both = q.clone();
+    both.boot_quiet_until = t(1180.0);
+    assert!(!existing_bridge_probe_blocked(&both, &pt, t(1010.0)));
+    assert!(!existing_bridge_probe_blocked(&q, &pt, t(1010.0)));
+
+    // banner：先 note 解除等待、再 arm quiet（`:4560-4564`）；unlock 恢復原 quiet 豁免，一般 profile 改由 quiet 擋。
+    for (name, p, blocked) in [("prpl", &sp, true), ("unlock", &unlock, false)] {
+        let mut q2 = q.clone();
+        assert_eq!(
+            q2.on_rx_text("U-Boot 2024.04\r\n", p, t(1020.0)),
+            QuietTransition::Armed
+        );
+        assert!(!q2.boot_evidence_wait_active(t(1020.0)), "{name}：banner 解除等待");
+        assert!(q2.quiet_active(t(1020.0)), "{name}：banner 重臂 quiet");
+        assert_eq!(
+            existing_bridge_probe_blocked(&q2, p, t(1020.0)),
+            blocked,
+            "{name}：banner 後只剩原 quiet 條件"
+        );
+        assert_eq!(boot_quiet_blocks_probe(&q2, p, t(1020.0)), blocked, "{name}");
+    }
+
+    // 未設等待時與共用 helper 逐點一致（quiet 期間、到期、unlock、passthrough、空字串 env）。
+    let mut empty_env = sp.clone();
+    empty_env.template.console_unlock_env = Some(String::new());
+    let mut q3 = QuietState::default();
+    q3.arm(t(0.0));
+    for (name, p) in [
+        ("prpl", &sp),
+        ("unlock", &unlock),
+        ("passthrough", &pt),
+        ("empty env", &empty_env),
+    ] {
+        for now in [t(1.0), t(180.0) - 1, t(180.0), t(181.0)] {
+            assert_eq!(
+                existing_bridge_probe_blocked(&q3, p, now),
+                boot_quiet_blocks_probe(&q3, p, now),
+                "{name} @ {}",
+                secs(now)
+            );
+        }
+    }
+}
+
+#[test] // 回歸鎖定：reprobe 規劃的 `ready_reconfirm` 只看 quiet（`session_manager.py:2189-2208`），等待不得延後 exhausted 終態
+fn wp56_ready_reconfirm_exhaustion_is_not_held_by_wait() {
+    // READY＋pending＋reprobe exhausted：Python 以 quiet-only 的 `_boot_quiet_blocks_probe` 算 `ready_reconfirm`，
+    // 等待中仍進 exhausted 分支 `expire_ready_reconfirm(now, force=True)` 落 READY_UNCONFIRMED 終態（`:759` 同時清等待）；
+    // 等待守衛（`:2222`）在其後。若把等待併入共用 helper，此終態會被延到寬限到期之後——本測試鎖定呼叫點語意。
+    use sw_core::reprobe::{prepare, ReprobeInput, ReprobeState};
+    let sp = prpl();
+    let mut q = QuietState::default();
+    q.arm(t(1000.0));
+    q.clear_quiet();
+    q.begin_boot_evidence_wait(t(1001.5));
+    let mut r = ReprobeState {
+        attempts: 10,
+        next_reprobe_at: None,
+        exhausted: true,
+        inflight: false,
+    };
+    let inp = ReprobeInput {
+        state: "READY",
+        by_id: "/dev/serial/by-id/fake",
+        released: false,
+        device_present: true,
+        last_error: None,
+        last_rx_mono: Some(t(1005.0)),
+        human_active: false,
+        has_bridge: true,
+        profile: &sp,
+    };
+    assert!(q.boot_evidence_wait_active(t(1010.0)));
+    assert_eq!(prepare(&mut r, &mut q, &inp, t(1010.0)), None);
+    assert!(q.failed, "等待中仍落 READY_UNCONFIRMED 終態");
+    assert!(!q.pending);
+    assert_eq!(q.boot_evidence_wait_until, 0, "真正翻入 failed 才清等待（`:759`）");
+    assert!(r.exhausted);
+    assert_eq!(r.next_reprobe_at, None);
+}

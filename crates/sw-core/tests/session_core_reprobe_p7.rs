@@ -338,3 +338,211 @@ fn wp56_reprobe_tick_holds_confirm_probe_during_boot_evidence_wait() {
     assert_eq!(h.public()["boot_evidence_wait_remaining_s"], PyValue::Null);
     assert_eq!(h.core.quiet_for_test().deadline, deadline);
 }
+
+const WP56_UNLOCK_PROFILE: &str = "profiles:\n  c:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    console_unlock_env: SW_T_UNLOCK\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: c, act_no: 1, alias: c+1, device_by_id: /s/by-id/usb-A}\n";
+const WP56_PASSTHROUGH_PROFILE: &str = "profiles:\n  u:\n    platform: passthrough\n    prompt_regex: '=> '\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: u, act_no: 1, alias: u+1, device_by_id: /s/by-id/usb-A}\n";
+const WP56_GRACE_NS: u64 = 60_000_000_000;
+
+fn wp56_self_test() -> sw_core::session_core::SessionRequest {
+    sw_core::session_core::SessionRequest::SelfTest {
+        timeout_s: 2.0,
+        strict_human_lock: false,
+    }
+}
+
+fn wp56_has_self_test_probe(effs: &[Effect]) -> bool {
+    effs.iter().any(|e| {
+        matches!(
+            e,
+            Effect::StartOp {
+                spec: sw_core::op_runner::OpSpec::SelfTestProbe { .. },
+                ..
+            }
+        )
+    })
+}
+
+fn wp56_has_start_op(effs: &[Effect]) -> bool {
+    effs.iter().any(|e| matches!(e, Effect::StartOp { .. }))
+}
+
+/// 以 test-fakes hook 建立自「現在」起算 60 s 的證據等待（reboot 路徑的 `begin` 屬後續子項），回傳期限。
+fn wp56_begin_wait(h: &mut CoreHarness) -> u64 {
+    let until = h.clock.mono_ns() + WP56_GRACE_NS;
+    h.core.set_boot_evidence_wait_until_for_test(until);
+    until
+}
+
+#[test]
+fn wp56_probe_existing_bridge_is_noop_during_wait() {
+    // WP5-6 第 4 項（G8，#243）：`origin/main:sw_core/session_manager.py:4746-4753`——`_probe_existing_bridge`
+    // 於 quiet 或證據等待有效時不送 probe TX、不開新登入世代；非 READY 誠實回報 PROMPT_UNAVAILABLE。
+    // 手動 attach（`:3952`）與非 force recover（`:7998`）兩個 ATTACHED 入口共用此 gate。
+    use sw_core::session_core::SessionRequest;
+    let recover = || SessionRequest::Recover {
+        timeout_s: 2.0,
+        force: false,
+    };
+
+    // 對照組：同一輸入未進等待時，手動 attach／recover 都會起 probe（證明下方的零 probe 來自等待守衛）。
+    for (name, req) in [("attach", SessionRequest::SessionAttach), ("recover", recover())] {
+        let mut h = CoreHarness::new(PRPL_PROFILE);
+        h.to_attached(Some("READY_NONCE_TIMEOUT"));
+        let (_reply, fx) = h.rpc_deferred(req);
+        assert!(start_login(&fx).is_some(), "{name}：未等待時照常 probe");
+    }
+
+    for (name, req) in [("attach", SessionRequest::SessionAttach), ("recover", recover())] {
+        let mut h = CoreHarness::new(PRPL_PROFILE);
+        h.to_attached(Some("READY_NONCE_TIMEOUT"));
+        let until = wp56_begin_wait(&mut h);
+        let gen_before = h.core.generations().fsm_gen;
+        let (reply, fx) = h.rpc_deferred(req);
+        assert!(start_login(&fx).is_none(), "{name}：等待中不得起 probe");
+        assert!(!wp56_has_start_op(&fx), "{name}：等待中不得有任何 TX op");
+        let resp = reply
+            .try_recv()
+            .unwrap_or_else(|e| panic!("{name}：零 probe 時同步回覆：{e:?}"))
+            .expect("ok");
+        assert_eq!(
+            h.core.generations().fsm_gen,
+            gen_before,
+            "{name}：不開新登入世代（`_begin_login_run_locked` 未執行）"
+        );
+        let p = h.public();
+        assert_eq!(p["state"], PyValue::from("ATTACHED"));
+        assert_eq!(p["last_error"], PyValue::from("PROMPT_UNAVAILABLE"), "{name}");
+        assert_eq!(p["boot_evidence_wait_remaining_s"], PyValue::Float(60.0));
+        assert_eq!(p["reprobe_attempts"], PyValue::from(0), "{name}：不加 attempts");
+        assert_eq!(p["next_reprobe_at"], PyValue::Null, "{name}：不排 backoff");
+        assert_eq!(resp["error_code"], PyValue::from("SESSION_NOT_READY"));
+        assert_eq!(resp["last_error"], PyValue::from("PROMPT_UNAVAILABLE"));
+        if name == "recover" {
+            assert_eq!(resp["action"], PyValue::from("REPROBE"));
+            assert_eq!(resp["recovered"], PyValue::Bool(false));
+        }
+        assert_eq!(h.core.quiet_for_test().boot_evidence_wait_until, until, "{name}：等待不被消耗");
+
+        // 寬限恰好到期（`now >= until`）：同一入口恢復 probe。
+        h.clock.advance(Duration::from_nanos(WP56_GRACE_NS));
+        assert_eq!(h.clock.mono_ns(), until);
+        let req = if name == "attach" {
+            SessionRequest::SessionAttach
+        } else {
+            recover()
+        };
+        let (_reply, fx) = h.rpc_deferred(req);
+        assert!(start_login(&fx).is_some(), "{name}：寬限到期後恢復 probe");
+    }
+}
+
+#[test]
+fn wp56_self_test_during_wait_returns_autoboot_quiet() {
+    // WP5-6 第 4 項（G8，#243）：`origin/main:sw_core/session_manager.py:7816`——READY 且 quiet 或等待有效 →
+    // `AUTOBOOT_QUIET`／`wait`，不送 nonce probe；分類優先序不變（PASSTHROUGH 與 ATTACHED 分支在前）。
+    // 健康 READY bridge，banner＋prompt 後 quiet 已清、pending 保留（非同步 reboot 後的過渡態）。
+    let setup = |h: &mut CoreHarness| {
+        h.to_ready();
+        h.rx(b"\r\nU-Boot 2024.04\r\n");
+        h.rx(b"root@prplOS:~# ");
+        assert!(!h.core.quiet_for_test().quiet_active(h.clock.mono_ns()));
+        assert_eq!(h.public()["ready_reconfirm_pending"], PyValue::Bool(true));
+    };
+
+    // 對照組：同一狀態未進等待時，self-test 送 nonce probe。
+    let mut h = CoreHarness::new(PRPL_PROFILE);
+    setup(&mut h);
+    let (_reply, fx) = h.rpc_deferred(wp56_self_test());
+    assert!(wp56_has_self_test_probe(&fx), "未等待時照常送 self-test probe");
+
+    let mut h = CoreHarness::new(PRPL_PROFILE);
+    setup(&mut h);
+    wp56_begin_wait(&mut h);
+    let (reply, fx) = h.rpc_deferred(wp56_self_test());
+    assert!(!wp56_has_self_test_probe(&fx), "等待中不得送 self-test probe");
+    assert!(!wp56_has_start_op(&fx));
+    let r = reply
+        .try_recv()
+        .expect("零 probe 時同步回覆")
+        .expect("ok");
+    assert_eq!(r["classification"], PyValue::from("AUTOBOOT_QUIET"));
+    assert_eq!(r["recommended_action"], PyValue::from("wait"));
+    assert_eq!(
+        r.0.keys().cloned().collect::<Vec<_>>(),
+        [
+            "ok",
+            "classification",
+            "session",
+            "recommended_action",
+            "interactive_owner",
+            "human_attached",
+            "human_active",
+            "recovery_mode",
+            "command_capable"
+        ],
+        "與 quiet 分支同一形狀（Python 同一個 dict 字面量）"
+    );
+    let session = match &r["session"] {
+        PyValue::Dict(d) => d.clone(),
+        other => panic!("session 不是 object：{other:?}"),
+    };
+    assert_eq!(session["state"], PyValue::from("READY"));
+    assert_eq!(session["boot_quiet_remaining_s"], PyValue::Null, "quiet 已清，分類來自等待");
+    assert_eq!(session["boot_evidence_wait_remaining_s"], PyValue::Float(60.0));
+    let p = h.public();
+    assert_eq!(p["state"], PyValue::from("READY"));
+    assert_eq!(p["last_error"], PyValue::Null);
+    assert_eq!(p["ready_reconfirm_pending"], PyValue::Bool(true));
+
+    // 寬限恰好到期：恢復 nonce probe。
+    h.clock.advance(Duration::from_nanos(WP56_GRACE_NS));
+    let (_reply, fx) = h.rpc_deferred(wp56_self_test());
+    assert!(wp56_has_self_test_probe(&fx), "寬限到期後恢復 self-test probe");
+
+    // passthrough 反向斷言（SC-35）：READY＋等待仍回 PASSTHROUGH／none，零 probe（不另設 gate）。
+    let mut h = CoreHarness::new(WP56_PASSTHROUGH_PROFILE);
+    h.to_attached(None);
+    assert_eq!(h.core.state(), SessionState::Attached);
+    advance_collect(&mut h, 31);
+    assert_eq!(h.core.state(), SessionState::Ready, "passthrough 安靜 30 s 升 READY");
+    wp56_begin_wait(&mut h);
+    let (resp, fx) = h.rpc_full(wp56_self_test());
+    let r = resp.expect("ok");
+    assert_eq!(r["classification"], PyValue::from("PASSTHROUGH"));
+    assert_eq!(r["recommended_action"], PyValue::from("none"));
+    assert!(!wp56_has_start_op(&fx));
+}
+
+#[test]
+fn wp56_unlock_profile_wait_is_not_exempt() {
+    // WP5-6 第 4 項（G8，#243）：`origin/main:sw_core/session_manager.py:4746`——console unlock 只豁免 quiet
+    // （`_boot_quiet_blocks_probe` `:1888-1890`），`boot_evidence_wait_active()` 另以 `or` 判定、不受豁免。
+    // banner 先 note 解除等待、再 arm quiet（`:4560-4564`）：之後只剩 quiet 條件，unlock 恢復豁免。
+    use sw_core::session_core::SessionRequest;
+    let mut h = CoreHarness::new(WP56_UNLOCK_PROFILE);
+    h.set_env("SW_T_UNLOCK", "k");
+    h.to_attached(Some("PROMPT_UNAVAILABLE"));
+
+    wp56_begin_wait(&mut h);
+    let gen_before = h.core.generations().fsm_gen;
+    let (reply, fx) = h.rpc_deferred(SessionRequest::SessionAttach);
+    assert!(start_login(&fx).is_none(), "unlock profile 等待中仍不得起 probe");
+    assert!(!wp56_has_start_op(&fx));
+    reply
+        .try_recv()
+        .expect("零 probe 時同步回覆")
+        .expect("ok");
+    assert_eq!(h.core.generations().fsm_gen, gen_before);
+    assert_eq!(h.public()["last_error"], PyValue::from("PROMPT_UNAVAILABLE"));
+
+    // banner：等待解除、quiet 重臂；unlock 對 quiet 的豁免恢復 → 手動 attach 起 unlock 登入 probe。
+    h.rx(b"\r\nU-Boot 2024.04\r\n");
+    let p = h.public();
+    assert_eq!(p["boot_evidence_wait_remaining_s"], PyValue::Null, "banner 解除等待");
+    assert_eq!(p["boot_quiet_remaining_s"], PyValue::Float(180.0), "banner 重臂 quiet");
+    let (_reply, fx) = h.rpc_deferred(SessionRequest::SessionAttach);
+    assert!(
+        start_login(&fx).is_some(),
+        "banner 後只剩 quiet 條件：unlock profile 照原豁免起 probe"
+    );
+}
