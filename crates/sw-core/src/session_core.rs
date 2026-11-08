@@ -60,6 +60,9 @@ mod file_xfer;
 /// P8 Task 8：flash 認線 probe 的身分（FlashCoordinator 單調遞增配號；`TxPermit.probe_id` 與 `FlashMode::Probe` 共用）。
 pub type ProbeId = u64;
 
+/// 交接嘗試期間的 actor 事件暫存上限；滿載時回壓至 admission 凍結結束。
+const HANDOFF_DEFERRED_EVENTS_MAX: usize = 1024;
+
 /// P8 Task 8：`FlashSyncProbeStart`／`FlashSyncMatched` 的拒絕原因（09 計畫 Task 8 狀態轉移表）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlashReject {
@@ -434,8 +437,8 @@ pub struct SessionCore {
     quiet: QuietState,
     /// 進行中的登入 run（StartLogin 已發出、LoginFinished 未到）。
     login_run: Option<LoginRun>,
-    /// 暫時交接凍結期間完成的自動重探；交接回滾後回填，成立後丟棄。
-    deferred_auto_reprobe: Option<DeferredAutoReprobe>,
+    /// 暫時交接凍結期間收到的背景事件，回滾後依 actor 收到順序重播。
+    deferred_handoff_events: VecDeque<MailboxItem>,
     /// 前景命令為 reboot 類且尚未因 TX 結算 arm quiet（parity-amendments-2026-10-26 #55）。
     foreground_reboot: bool,
     drain_stalled: bool,
@@ -609,12 +612,6 @@ struct RetiredStop {
     aborted_op: Option<(OpId, String)>,
 }
 
-struct DeferredAutoReprobe {
-    epoch: u64,
-    fsm_gen: u64,
-    result: crate::login_fsm::LoginOutcome,
-}
-
 impl SessionCore {
     pub fn new(profile: SessionProfile, profile_source: &str, deps: CoreDeps) -> SessionCore {
         let sid = format!("{}:{}", profile.template.profile_name, profile.com);
@@ -666,7 +663,7 @@ impl SessionCore {
             quiet_since: None,
             quiet: QuietState::default(),
             login_run: None,
-            deferred_auto_reprobe: None,
+            deferred_handoff_events: VecDeque::new(),
             foreground_reboot: false,
             drain_stalled: false,
             drain_timeout_epoch: None,
@@ -737,16 +734,145 @@ impl SessionCore {
             panic!("測試注入的 session actor panic");
         }
 
-        if self.handoff_freeze_state() == crate::admission::HandoffFreezeState::Pending
-            && !matches!(
-                &ev,
-                MailboxItem::Control(ControlEvent::Request { .. })
-                    | MailboxItem::Control(ControlEvent::Shutdown { .. })
-            )
-        {
-            return self.defer_handoff_event(ev);
-        }
+        self.dispatch_with_handoff(ev, now)
+    }
 
+    fn dispatch_with_handoff(&mut self, ev: MailboxItem, now: Mono) -> Effects {
+        match self.handoff_freeze_state() {
+            crate::admission::HandoffFreezeState::Pending => {
+                if Self::is_handoff_bypass_event(&ev) {
+                    self.dispatch_event(ev, now, false)
+                } else {
+                    self.defer_handoff_event(ev, now)
+                }
+            }
+            crate::admission::HandoffFreezeState::Permanent => {
+                self.dispatch_handoff_permanent(ev, now)
+            }
+            crate::admission::HandoffFreezeState::Open => {
+                let mut effects = self.replay_handoff_events(now);
+                match self.handoff_freeze_state() {
+                    crate::admission::HandoffFreezeState::Open => {
+                        effects.0.extend(self.dispatch_event(ev, now, true).0);
+                    }
+                    crate::admission::HandoffFreezeState::Pending => {
+                        if Self::is_handoff_bypass_event(&ev) {
+                            effects.0.extend(self.dispatch_event(ev, now, false).0);
+                        } else {
+                            effects.0.extend(self.defer_handoff_event(ev, now).0);
+                        }
+                    }
+                    crate::admission::HandoffFreezeState::Permanent => {
+                        effects
+                            .0
+                            .extend(self.dispatch_handoff_permanent(ev, now).0);
+                    }
+                }
+                effects
+            }
+        }
+    }
+
+    fn is_handoff_bypass_event(ev: &MailboxItem) -> bool {
+        matches!(
+            ev,
+            MailboxItem::Control(ControlEvent::Request { .. })
+                | MailboxItem::Control(ControlEvent::Shutdown { .. })
+                | MailboxItem::Control(ControlEvent::FlashSyncProbeStart { .. })
+                | MailboxItem::Control(ControlEvent::FlashProbeReleased { .. })
+                | MailboxItem::Control(ControlEvent::FlashSyncMatched { .. })
+                | MailboxItem::Control(ControlEvent::FlashHolderGone { .. })
+        )
+    }
+
+    /// 已成立的凍結仍須讓既有工作與 drain 協定收斂；這些是完成回條／生命週期控制，不是背景狀態輸入。
+    fn is_handoff_lifecycle_event(ev: &MailboxItem) -> bool {
+        matches!(
+            ev,
+            MailboxItem::Control(
+                ControlEvent::BridgeOpened { .. }
+                    | ControlEvent::UartIoError { .. }
+                    | ControlEvent::UartTxCompleted { .. }
+                    | ControlEvent::DrainDataBarrier { .. }
+                    | ControlEvent::WorkerStopped(_)
+                    | ControlEvent::WorkerDrainTimeout { .. }
+                    | ControlEvent::OpFinished { .. }
+                    | ControlEvent::StateCommitted { .. }
+                    | ControlEvent::HumanTxCompleted { .. }
+                    | ControlEvent::FlashSyncProbeStart { .. }
+                    | ControlEvent::FlashProbeReleased { .. }
+                    | ControlEvent::FlashSyncMatched { .. }
+                    | ControlEvent::FlashHolderGone { .. }
+                    | ControlEvent::Timer(crate::mailbox::TimerEvent::DrainTimeout { .. })
+            )
+        )
+    }
+
+    fn is_matching_auto_reprobe_result(&self, ev: &MailboxItem) -> bool {
+        let MailboxItem::Control(ControlEvent::LoginFinished {
+            epoch, fsm_gen, ..
+        }) = ev
+        else {
+            return false;
+        };
+        self.login_run.as_ref().is_some_and(|run| {
+            run.kind == LoginRunKind::AutoReprobe && run.epoch == *epoch && run.fsm_gen == *fsm_gen
+        })
+    }
+
+    fn defer_handoff_event(&mut self, ev: MailboxItem, now: Mono) -> Effects {
+        if self.deferred_handoff_events.len() >= HANDOFF_DEFERRED_EVENTS_MAX {
+            self.deps.registry.admission_gate().wait_handoff_settled();
+            return self.dispatch_with_handoff(ev, now);
+        }
+        self.deferred_handoff_events.push_back(ev);
+        Effects(Vec::new())
+    }
+
+    fn replay_handoff_events(&mut self, now: Mono) -> Effects {
+        let mut effects = Effects(Vec::new());
+        loop {
+            match self.handoff_freeze_state() {
+                crate::admission::HandoffFreezeState::Open => {
+                    let Some(ev) = self.deferred_handoff_events.pop_front() else {
+                        break;
+                    };
+                    effects.0.extend(self.dispatch_event(ev, now, true).0);
+                }
+                crate::admission::HandoffFreezeState::Pending => break,
+                crate::admission::HandoffFreezeState::Permanent => {
+                    effects
+                        .0
+                        .extend(self.discard_handoff_events_permanent(now).0);
+                    break;
+                }
+            }
+        }
+        effects
+    }
+
+    fn discard_handoff_events_permanent(&mut self, now: Mono) -> Effects {
+        let mut effects = Effects(Vec::new());
+        while let Some(ev) = self.deferred_handoff_events.pop_front() {
+            if self.is_matching_auto_reprobe_result(&ev) || Self::is_handoff_lifecycle_event(&ev) {
+                effects.0.extend(self.dispatch_event(ev, now, false).0);
+            }
+        }
+        effects
+    }
+
+    fn dispatch_handoff_permanent(&mut self, ev: MailboxItem, now: Mono) -> Effects {
+        let mut effects = self.discard_handoff_events_permanent(now);
+        if Self::is_handoff_bypass_event(&ev)
+            || Self::is_handoff_lifecycle_event(&ev)
+            || self.is_matching_auto_reprobe_result(&ev)
+        {
+            effects.0.extend(self.dispatch_event(ev, now, false).0);
+        }
+        effects
+    }
+
+    fn dispatch_event(&mut self, ev: MailboxItem, now: Mono, finalize: bool) -> Effects {
         self.now_cache = now;
         let mut effects = Effects(Vec::new());
         match ev {
@@ -940,6 +1066,9 @@ impl SessionCore {
                 effects.0.extend(self.flash_holder_gone(probe_id, reply, now));
             }
         }
+        if !finalize {
+            return effects;
+        }
         if std::mem::take(&mut self.hold_release_kick) && !self.fg_slot_busy() {
             effects.0.extend(self.start_next(now));
         }
@@ -956,10 +1085,6 @@ impl SessionCore {
             self.deps.fence.with(|f| f.foreground_busy = busy);
         }
         effects
-    }
-
-    fn defer_handoff_event(&mut self, _ev: MailboxItem) -> Effects {
-        todo!("P8-T14")
     }
 
     /// `to_public_dict()` 的 capture 子 dict。計數由 reader 端 `CaptureObserver` 即時累加（Python `_on_bridge_rx` 寫
@@ -3340,7 +3465,6 @@ impl SessionCore {
     }
 
     fn discard_handoff_auto_reprobe(&mut self, now: Mono) -> Vec<Effect> {
-        self.deferred_auto_reprobe = None;
         let waiters = self
             .login_run
             .take()
@@ -3362,16 +3486,8 @@ impl SessionCore {
     fn tick(&mut self, now: Mono) -> Vec<Effect> {
         match self.handoff_freeze_state() {
             crate::admission::HandoffFreezeState::Pending => return Vec::new(),
-            crate::admission::HandoffFreezeState::Permanent => {
-                if self.deferred_auto_reprobe.is_some() {
-                    return self.discard_handoff_auto_reprobe(now);
-                }
-                return Vec::new();
-            }
+            crate::admission::HandoffFreezeState::Permanent => return Vec::new(),
             crate::admission::HandoffFreezeState::Open => {}
-        }
-        if let Some(deferred) = self.deferred_auto_reprobe.take() {
-            return self.auto_reprobe_finished(deferred.epoch, deferred.fsm_gen, deferred.result, now);
         }
         let mut effects = Vec::new();
         self.expire_reconfirm(now);
@@ -3576,19 +3692,8 @@ impl SessionCore {
         {
             return Vec::new();
         }
-        match self.handoff_freeze_state() {
-            crate::admission::HandoffFreezeState::Pending => {
-                self.deferred_auto_reprobe = Some(DeferredAutoReprobe {
-                    epoch,
-                    fsm_gen,
-                    result,
-                });
-                return Vec::new();
-            }
-            crate::admission::HandoffFreezeState::Permanent => {
-                return self.discard_handoff_auto_reprobe(now);
-            }
-            crate::admission::HandoffFreezeState::Open => {}
+        if self.handoff_freeze_state() == crate::admission::HandoffFreezeState::Permanent {
+            return self.discard_handoff_auto_reprobe(now);
         }
         // 結果一律回填（不得丟棄，否則 run／inflight 永久殘留、等待者永不回覆；審查 c11aa89_92e0223 H-1）。
         // Python `_probe_existing_bridge` 只依 probe 實際結果收斂、不看 login_gen：probe 期間 banner 才 arm 仍可回 ok → READY

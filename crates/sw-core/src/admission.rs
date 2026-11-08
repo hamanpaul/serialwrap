@@ -13,7 +13,7 @@ use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 /// 一項尚未完成的有副作用操作（Python `Ticket(kind, com, seq)`）。只能經 [`AdmissionGate::done`] 歸還。
 #[derive(Debug, PartialEq, Eq)]
@@ -135,6 +135,7 @@ struct GateInner {
 /// 共同 admission 邊界（見模組說明）。
 pub struct AdmissionGate {
     inner: Mutex<GateInner>,
+    handoff_settled: Condvar,
 }
 
 impl Default for AdmissionGate {
@@ -147,6 +148,7 @@ impl AdmissionGate {
     pub fn new() -> AdmissionGate {
         AdmissionGate {
             inner: Mutex::new(GateInner::default()),
+            handoff_settled: Condvar::new(),
         }
     }
 
@@ -199,6 +201,7 @@ impl AdmissionGate {
         if g.token.is_none() {
             g.token = Some(new_token());
         }
+        self.handoff_settled.notify_all();
     }
 
     /// 撤銷由 `freeze_if_idle` 新建立、token 相符的凍結；其餘情形不動作並回 false。
@@ -210,19 +213,24 @@ impl AdmissionGate {
         g.frozen = false;
         g.token = None;
         g.idle_token = None;
+        self.handoff_settled.notify_all();
         true
     }
 
     /// 凍結是否仍是尚未成立的交接嘗試；查詢與 token 狀態共用同一把 gate lock。
     pub fn handoff_freeze_state(&self) -> HandoffFreezeState {
         let g = self.lock();
-        if !g.frozen {
-            HandoffFreezeState::Open
-        } else if g.idle_token.is_some() {
-            HandoffFreezeState::Pending
-        } else {
-            HandoffFreezeState::Permanent
-        }
+        handoff_state(&g)
+    }
+
+    /// 等待可撤銷的交接嘗試結束；供有界的 actor 暫存佇列滿載時回壓。
+    pub fn wait_handoff_settled(&self) -> HandoffFreezeState {
+        let g = self.lock();
+        let g = self
+            .handoff_settled
+            .wait_while(g, |state| state.frozen && state.idle_token.is_some())
+            .unwrap_or_else(|error| error.into_inner());
+        handoff_state(&g)
     }
 
     /// 將成功完成 TX fence 的交接凍結轉為永久；之後 `thaw` 不得撤銷。
@@ -232,6 +240,7 @@ impl AdmissionGate {
             return false;
         }
         g.idle_token = None;
+        self.handoff_settled.notify_all();
         true
     }
 
@@ -241,6 +250,7 @@ impl AdmissionGate {
         if g.frozen {
             // 已凍結：本次呼叫不是建立者，之後的 thaw 不得撤銷該凍結。
             g.idle_token = None;
+            self.handoff_settled.notify_all();
             let token = g.token.get_or_insert_with(new_token).clone();
             return FreezeOutcome::Frozen { token, created: false };
         }
@@ -287,6 +297,16 @@ impl AdmissionGate {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, GateInner> {
         self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+fn handoff_state(g: &GateInner) -> HandoffFreezeState {
+    if !g.frozen {
+        HandoffFreezeState::Open
+    } else if g.idle_token.is_some() {
+        HandoffFreezeState::Pending
+    } else {
+        HandoffFreezeState::Permanent
     }
 }
 
