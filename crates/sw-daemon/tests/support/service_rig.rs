@@ -275,6 +275,18 @@ impl ServiceRig {
         ServiceRig::build_with_console(spec, None)
     }
 
+    /// 以指定的載入狀態建構 rig；不需在 `RigSpec` 增加跨既有測試的必填欄位。
+    pub fn build_with_loaded_state(spec: RigSpec, loaded: LoadedState) -> ServiceRig {
+        ServiceRig::build_with_code_identity(
+            spec,
+            None,
+            None,
+            Some("/fake/bundle".to_string()),
+            None,
+            loaded,
+        )
+    }
+
     /// P6 Task 10：單一 shell target（COM0）已 READY，console 後端為 `kind`（`"pty"`｜`"tcp"`）的替身工廠。
     pub fn with_console_backend(kind: &str) -> ServiceRig {
         let kind = match kind {
@@ -305,6 +317,7 @@ impl ServiceRig {
             None,
             Some("/fake/bundle".to_string()),
             None,
+            LoadedState::default(),
         )
     }
 
@@ -319,6 +332,7 @@ impl ServiceRig {
             None,
             Some("/fake/bundle".to_string()),
             serial_backend,
+            LoadedState::default(),
         )
     }
 
@@ -328,6 +342,7 @@ impl ServiceRig {
         code_fingerprint: Option<String>,
         code_path: Option<String>,
         serial_backend: Option<Arc<dyn SerialBackend>>,
+        loaded: LoadedState,
     ) -> ServiceRig {
         let serial = FakeSerialBackend::new();
         let mut devices = BTreeMap::new();
@@ -372,7 +387,7 @@ impl ServiceRig {
             wal: wal.clone(),
             registry: registry.clone(),
             state: StateStore::spawn(PathBuf::from(STATE_PATH), fs.clone()),
-            loaded: LoadedState::default(),
+            loaded,
             load,
             clock: clock.clone(),
             env: Arc::new(FakeEnv::default()),
@@ -444,6 +459,7 @@ impl ServiceRig {
             code_fingerprint.map(str::to_string),
             code_path.map(str::to_string),
             None,
+            LoadedState::default(),
         )
     }
 

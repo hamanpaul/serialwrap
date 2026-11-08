@@ -2716,6 +2716,35 @@ impl SessionManager {
         if by_id.is_empty() {
             return Ok(pydict! { "ok" => false, "error_code" => "INVALID_ARGS" });
         }
+
+        // OD-63：佔位在任何 pump、FLASHING／在途 op／stopping／衝突檢查與持久化前早退。
+        let (sid, released_placeholder) = {
+            let inner = lock(&self.shared.inner);
+            let Some(e) = inner.resolve(selector) else {
+                return Ok(pydict! {
+                    "ok" => false,
+                    "error_code" => "SESSION_NOT_FOUND",
+                    "selector" => selector.to_string()
+                });
+            };
+            (e.sid.clone(), e.released_placeholder)
+        };
+        if released_placeholder {
+            let Some(public) = self.shared.session_public(&sid) else {
+                return Ok(pydict! {
+                    "ok" => false,
+                    "error_code" => "SESSION_NOT_FOUND",
+                    "selector" => selector.to_string()
+                });
+            };
+            return Ok(pydict! {
+                "ok" => true,
+                "released" => true,
+                "recommended_action" => "device_attach",
+                "session" => public
+            });
+        }
+
         self.pump();
         let deadline = Instant::now() + ATTACH_OP_WAIT;
         if let Some(sid) = self.resolve(selector) {
@@ -3281,6 +3310,33 @@ impl SessionManager {
         lock(&self.shared.inner)
             .resolve(selector)
             .map(|e| e.released_placeholder)
+    }
+
+    /// 只供測試（test-fakes）：注入可觀察的在途 attach 標記，驗證早退不取消也不等待。
+    #[cfg(feature = "test-fakes")]
+    pub fn insert_inflight_attach_for_test(&self, by_id: &str) -> Arc<AtomicBool> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        lock(&self.shared.inner).inflight.insert(
+            by_id.to_string(),
+            AttachOp {
+                cancelled: Arc::clone(&cancelled),
+                after_clear: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        cancelled
+    }
+
+    /// 只供測試（test-fakes）：移除測試注入的在途 attach 標記並喚醒等待者。
+    #[cfg(feature = "test-fakes")]
+    pub fn remove_inflight_attach_for_test(&self, by_id: &str) {
+        lock(&self.shared.inner).inflight.remove(by_id);
+        self.shared.cv.notify_all();
+    }
+
+    /// 只供測試（test-fakes）：檢查指定 by_id 的在途 attach 標記仍存在。
+    #[cfg(feature = "test-fakes")]
+    pub fn has_inflight_attach_for_test(&self, by_id: &str) -> bool {
+        lock(&self.shared.inner).inflight.contains_key(by_id)
     }
 
     /// 只供測試（test-fakes）：移除 selector 對應的持久化 RELEASED 阻擋，保留佔位標記。

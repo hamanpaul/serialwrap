@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use support::{BY_ID_A, BY_ID_B, REAL_A, REAL_B, RIG_PID, RigSpec, ServiceRig, wait_until};
+use sw_core::state_store::{LoadedState, ReleasedRow};
 use sw_pal::proc_scan::{DaemonProc, ProcIdentity};
 use sw_pal::traits::{HolderReport, HolderScanStatus, UartExclusive};
 use sw_proto::pyjson::{PyDict, PyValue, RPC_WIRE, dumps};
@@ -4739,4 +4740,249 @@ fn wp58_rpc_device_attach_during_release_returns_session_recovering() {
     assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&released));
     r.wait_state("COM0", "RELEASED");
     assert_eq!(s(&wp55_wait_done(&r, &cmd_id), "status"), "error");
+}
+
+const WP510_PLACEHOLDER_SID: &str = "gone-template:COM3";
+const WP510_PLACEHOLDER_BY_ID: &str = "/s/by-id/usb-G";
+const WP510_FREE_BY_ID: &str = "/s/by-id/usb-C";
+const WP510_REAL_G: &str = "/fake/tty-G";
+const WP510_REAL_C: &str = "/fake/tty-C";
+
+/// 建立有缺失 template 佔位、另一個在線未綁定裝置與已綁定裝置的 RPC rig。
+/// 2 個 YAML session 加 14 個 RELEASED 佔位達 max_sessions，故 usb-C 在線但不會被背景偵測搶先實體化。
+fn wp510_b_placeholder_rig() -> ServiceRig {
+    let mut loaded = LoadedState::default();
+    loaded.bindings.insert(
+        WP510_PLACEHOLDER_SID.to_string(),
+        WP510_PLACEHOLDER_BY_ID.to_string(),
+    );
+    let mut alias_row = PyDict::new();
+    alias_row.insert("session_id", PyValue::from(WP510_PLACEHOLDER_SID));
+    alias_row.insert("updated_at", PyValue::from("2026-11-09T00:00:00"));
+    loaded.aliases.insert("gone-template+4".to_string(), alias_row);
+    loaded.released.insert(
+        WP510_PLACEHOLDER_SID.to_string(),
+        ReleasedRow {
+            by_id: PyValue::from(WP510_PLACEHOLDER_BY_ID),
+            released_by: PyValue::from("agent"),
+            released_at: PyValue::from("2026-11-08T12:34:56"),
+            reason: PyValue::from("manual"),
+        },
+    );
+    for index in 0..13 {
+        let sid = format!("missing-template-{index}:COM{}", 100 + index);
+        loaded.released.insert(
+            sid,
+            ReleasedRow {
+                by_id: PyValue::from(format!("/s/by-id/offline-{index}")),
+                released_by: PyValue::from("agent"),
+                released_at: PyValue::from("2026-11-08T12:34:56"),
+                reason: PyValue::from("manual"),
+            },
+        );
+    }
+
+    ServiceRig::build_with_loaded_state(
+        RigSpec {
+            yaml: format!(
+                "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\ntargets:\n  - {{com: COM0, profile: t, device_by_id: {BY_ID_A}}}\n  - {{com: COM1, profile: t, device_by_id: {BY_ID_B}}}\n"
+            ),
+            devices: vec![
+                (BY_ID_A.to_string(), REAL_A.to_string()),
+                (BY_ID_B.to_string(), REAL_B.to_string()),
+                (WP510_PLACEHOLDER_BY_ID.to_string(), WP510_REAL_G.to_string()),
+                (WP510_FREE_BY_ID.to_string(), WP510_REAL_C.to_string()),
+            ],
+            explicit_target_count: 2,
+            allowlist: None,
+            wait_ready: vec!["COM0".to_string(), "COM1".to_string()],
+        },
+        loaded,
+    )
+}
+
+fn wp510_b_assert_placeholder_bind_is_early_and_side_effect_free(r: &ServiceRig, by_id: &str) {
+    assert_eq!(
+        r.mgr.released_placeholder(WP510_PLACEHOLDER_SID),
+        Some(true),
+        "測試前置必須是 OD-63 佔位"
+    );
+    let before_session = r
+        .session(WP510_PLACEHOLDER_SID)
+        .expect("session_id selector 應找到佔位");
+    assert_eq!(s(&before_session, "device_by_id"), WP510_PLACEHOLDER_BY_ID);
+    assert_eq!(s(&before_session, "alias"), "gone-template+4");
+    for field in ["released_by", "released_at", "released_reason"] {
+        assert!(before_session.get(field).is_some(), "佔位缺少 {field}");
+    }
+
+    let state_bytes = r.fs.bytes(support::STATE_PATH);
+    let state_writes = r.fs.writes();
+    let wal_seq = r.wal.current_seq();
+    let wal_path = std::path::Path::new("/fake/wal/raw.wal.ndjson");
+    let mirror_path = std::path::Path::new("/fake/wal/raw.mirror.log");
+    let wal_bytes = r.wfs.contents(wal_path);
+    let mirror_bytes = r.wfs.contents(mirror_path);
+    let serial: Vec<_> = r
+        .devices
+        .iter()
+        .map(|(real, dev)| {
+            (
+                real.clone(),
+                dev.open_count(),
+                dev.write_calls(),
+                dev.tx_len(),
+            )
+        })
+        .collect();
+
+    let response = r.call(
+        "session.bind",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}","device_by_id":"{by_id}"}}"#),
+    );
+    assert_eq!(
+        keys(&response),
+        ["ok", "released", "recommended_action", "session", "version"],
+        "佔位回應 payload 鍵序須符合 Python dict 插入順序，Service 再附 version：{}",
+        j(&response)
+    );
+    assert_eq!(
+        j(&response),
+        format!(
+            "{{\"ok\":true,\"released\":true,\"recommended_action\":\"device_attach\",\"session\":{},\"version\":\"{}\"}}",
+            j(&before_session),
+            r.version
+        ),
+        "佔位 bind 必須完整早退：{}",
+        j(&response)
+    );
+    assert_eq!(
+        r.mgr.released_placeholder(WP510_PLACEHOLDER_SID),
+        Some(true),
+        "bind 不得解除佔位"
+    );
+    let after_session = r
+        .session(WP510_PLACEHOLDER_SID)
+        .expect("bind 後佔位仍存在");
+    assert_eq!(j(&after_session), j(&before_session), "binding／alias／released metadata 不得變動");
+    assert_eq!(r.fs.bytes(support::STATE_PATH), state_bytes, "state.json bytes 不得改變");
+    assert_eq!(r.fs.writes(), state_writes, "不得寫 state.json");
+    assert_eq!(r.wal.current_seq(), wal_seq, "不得追加 WAL");
+    assert_eq!(r.wfs.contents(wal_path), wal_bytes, "WAL bytes 不得改變");
+    assert_eq!(r.wfs.contents(mirror_path), mirror_bytes, "WAL mirror bytes 不得改變");
+    assert_eq!(
+        r.devices
+            .iter()
+            .map(|(real, dev)| (real.clone(), dev.open_count(), dev.write_calls(), dev.tx_len()))
+            .collect::<Vec<_>>(),
+        serial,
+        "bind 不得開埠或送 UART TX"
+    );
+}
+
+#[test]
+fn wp510_b_bind_placeholder_has_no_side_effects() {
+    for by_id in [WP510_PLACEHOLDER_BY_ID, WP510_FREE_BY_ID, BY_ID_B] {
+        let rig = wp510_b_placeholder_rig();
+        assert!(
+            rig.mgr
+                .list_devices()
+                .iter()
+                .any(|device| device.get("by_id") == Some(&PyValue::from(by_id))),
+            "{by_id} 必須在線"
+        );
+        let owners: Vec<String> = rig
+            .mgr
+            .list_sessions()
+            .iter()
+            .filter(|session| session.get("device_by_id") == Some(&PyValue::from(by_id)))
+            .filter_map(|session| {
+                session
+                    .get("session_id")
+                    .and_then(PyValue::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        match by_id {
+            WP510_PLACEHOLDER_BY_ID => assert_eq!(owners, [WP510_PLACEHOLDER_SID]),
+            WP510_FREE_BY_ID => assert!(owners.is_empty(), "usb-C 應在線但未綁定"),
+            BY_ID_B => assert!(
+                owners.iter().any(|sid| sid != WP510_PLACEHOLDER_SID),
+                "usb-B 應由其他 session 使用"
+            ),
+            _ => unreachable!(),
+        }
+        wp510_b_assert_placeholder_bind_is_early_and_side_effect_free(&rig, by_id);
+    }
+}
+
+#[test]
+fn wp510_b_bind_placeholder_precedes_inflight_cancellation() {
+    let rig = Arc::new(wp510_b_placeholder_rig());
+    let cancelled = rig
+        .mgr
+        .insert_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID);
+    let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+    let bind_rig = Arc::clone(&rig);
+    let bind_thread = std::thread::spawn(move || {
+        let reply = bind_rig.call(
+            "session.bind",
+            &format!(
+                r#"{{"selector":"{WP510_PLACEHOLDER_SID}","device_by_id":"{WP510_FREE_BY_ID}"}}"#
+            ),
+        );
+        let _ = reply_tx.send(reply);
+    });
+
+    let immediate_reply = reply_rx.recv_timeout(Duration::from_millis(500));
+    let waited_for_attach = immediate_reply.is_err();
+    if waited_for_attach {
+        // 舊路徑會取消後等 attach；移除測試 op 以有限時間收束並取得實際錯誤回應。
+        rig.mgr
+            .remove_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID);
+    }
+    let response = match immediate_reply {
+        Ok(reply) => reply,
+        Err(_) => reply_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("解除測試在途 op 後 bind 應有限時間結束"),
+    };
+    bind_thread.join().expect("bind RPC thread");
+
+    assert!(
+        !waited_for_attach,
+        "佔位 bind 不得等待在途 attach"
+    );
+    assert!(
+        !cancelled.load(Ordering::SeqCst),
+        "佔位 bind 不得取消在途 attach"
+    );
+    assert!(
+        rig.mgr
+            .has_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID),
+        "佔位 bind 不得移除在途 op"
+    );
+    assert_eq!(
+        keys(&response),
+        ["ok", "released", "recommended_action", "session", "version"]
+    );
+    assert_eq!(
+        s(&response, "recommended_action"),
+        "device_attach",
+        "佔位 bind 應立即回早退結果：{}",
+        j(&response)
+    );
+    let session = rig
+        .session(WP510_PLACEHOLDER_SID)
+        .expect("早退後佔位仍存在");
+    assert_eq!(
+        j(&response),
+        format!(
+            "{{\"ok\":true,\"released\":true,\"recommended_action\":\"device_attach\",\"session\":{},\"version\":\"{}\"}}",
+            j(&session),
+            rig.version
+        )
+    );
+    rig.mgr
+        .remove_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID);
 }
