@@ -3348,6 +3348,237 @@ fn interactive_mode_command_unknown_send_maps_aborted_in_flight_unknown() {
 }
 
 // ---------------------------------------------------------------------------
+// WP5-8 第 1 項（G11，S1X-a-1）：interactive 命令未完整送出時，只關閉本命令開啟的 lease。
+// 基準 `origin/main:sw_core/session_manager.py:6790-6822`：送出拋例外或被拒時，僅在
+// `session.interactive_session_id == lease.interactive_id` 時 `_close_interactive_locked`（非 expired、無 tombstone），
+// 期間被換掉的 lease 不動；Python 回歸 `tests/test_s1x_a1_interactive_permit.py:130`、`:150`。
+// ---------------------------------------------------------------------------
+
+/// 本 session 目前的 `interactive_session_id`（`null` → `None`）。
+fn wp58_lease_of(h: &ActorRig) -> Option<String> {
+    h.get_state()["interactive_session_id"]
+        .as_str()
+        .map(str::to_string)
+}
+
+/// lease 已收回：後續 line 命令不得被遺留 lease 擋成 `SESSION_INTERACTIVE_BUSY`，interactive 命令照常送出。
+fn wp58_assert_session_usable_after_failure(h: &ActorRig) {
+    h.dev.on_tx_reply(b"echo ok\n", b"echo ok\r\nok\r\nroot@t:/# ");
+    let line = h.submit_ok("echo ok");
+    let rec = h.wait_done(&line);
+    assert_ne!(
+        rec.get("error_code"),
+        Some(&PyValue::from("SESSION_INTERACTIVE_BUSY")),
+        "遺留 lease 擋住後續命令：{rec:?}"
+    );
+    assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    let tx_before = h.dev.tx_len();
+    let next = h.submit_with("top", |r| r.mode = "interactive".into());
+    let rec = h.wait_done(&next);
+    assert_eq!(rec["status"], PyValue::from("interactive"), "{rec:?}");
+    assert_eq!(h.dev.tx_since(tx_before), b"top\n".to_vec());
+    assert_eq!(
+        wp58_lease_of(h),
+        rec["interactive_session_id"].as_str().map(str::to_string),
+        "新 interactive 命令的 lease 應為目前 lease"
+    );
+}
+
+#[test]
+fn wp58_g11_rejected_interactive_send_closes_opened_lease() {
+    // Python `test_rejected_interactive_send_closes_opened_lease`：drain fence（`bridge._tx_frozen = True`）在提交點拒絕。
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let tx_before = h.dev.tx_len();
+    let rows_before = interactive_tx_rows(&h).len();
+    h.fence.with(|f| f.frozen = true);
+    let id = h.submit_with("top", |r| r.mode = "interactive".into());
+    let rec = h.wait_done(&id);
+    // 錯誤碼沿用既有 `lease_refused_command_code(Frozen)` 映射（本項不改）。
+    assert_eq!(rec["error_code"], PyValue::from("FLUSHED_BY_RECOVERY"), "{rec:?}");
+    assert_eq!(h.dev.tx_len(), tx_before, "被拒的 interactive 命令不得寫 UART");
+    assert_eq!(interactive_tx_rows(&h).len(), rows_before, "被拒的 interactive 命令不得寫 TX WAL");
+    assert_eq!(wp58_lease_of(&h), None, "送出被拒後不得遺留本命令開的 lease");
+    h.fence.with(|f| f.frozen = false);
+    wp58_assert_session_usable_after_failure(&h);
+}
+
+#[test]
+fn wp58_g11_partial_interactive_send_closes_opened_lease() {
+    // 部分寫入：錯誤碼與 META 沿用 `interactive_mode_command_partial_send_maps_aborted_in_flight`；lease 同樣收回
+    // （Python `bridge.send_command` 拋 TxIncomplete → `except BaseException` 關 lease 後交 `_map_aborted_result`）。
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.script_write(vec![FakeWriteStep::AcceptThenError(
+        4,
+        PalError::io(5, "[Errno 5] Input/output error"),
+    )]);
+    let id = h.submit_with("echo x", |r| r.mode = "interactive".into());
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["error_code"], PyValue::from("COMMAND_ABORTED_IN_FLIGHT"), "{rec:?}");
+    let meta = h
+        .wal_meta_events()
+        .into_iter()
+        .find(|m| m.get("event") == Some(&PyValue::from("command_aborted_in_flight")))
+        .expect("應寫 command_aborted_in_flight META");
+    assert_eq!(meta.get("confirmed_tx_bytes"), Some(&PyValue::from(4)));
+    assert_eq!(meta.get("tx_outcome"), Some(&PyValue::from("partial")));
+    assert_eq!(wp58_lease_of(&h), None, "部分寫入後不得遺留本命令開的 lease");
+    wp58_assert_session_usable_after_failure(&h);
+}
+
+#[test]
+fn wp58_g11_unknown_interactive_send_closes_opened_lease() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.script_write(vec![FakeWriteStep::Unknown {
+        confirmed: 2,
+        error: PalError::io(5, "[Errno 5] Input/output error"),
+    }]);
+    let id = h.submit_with("echo x", |r| r.mode = "interactive".into());
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["error_code"], PyValue::from("COMMAND_ABORTED_IN_FLIGHT"), "{rec:?}");
+    let meta = h
+        .wal_meta_events()
+        .into_iter()
+        .find(|m| m.get("event") == Some(&PyValue::from("command_aborted_in_flight")))
+        .expect("應寫 command_aborted_in_flight META");
+    assert_eq!(meta.get("tx_outcome"), Some(&PyValue::from("unknown")));
+    assert_eq!(wp58_lease_of(&h), None, "結果不明時不得遺留本命令開的 lease");
+    wp58_assert_session_usable_after_failure(&h);
+}
+
+/// CoreHarness：出列一條非空 interactive 命令，回 `(cmd_id, InteractiveOpenCmd 的 grant, 本命令開的 lease id)`。
+fn wp58_start_interactive(h: &mut CoreHarness, cmd: &str) -> (String, sw_core::session_core::OpGrant, String) {
+    use sw_core::op_runner::OpSpec;
+    let mut req = agent_submit(cmd);
+    req.mode = "interactive".into();
+    let (resp, fx) = h.rpc_full(SessionRequest::Submit(req));
+    let resp = resp.expect("interactive 命令 admission 應成功");
+    let cmd_id = resp["cmd_id"].as_str().expect("cmd_id").to_string();
+    let grant = fx
+        .iter()
+        .find_map(|e| match e {
+            Effect::StartOp {
+                grant,
+                spec: OpSpec::InteractiveOpenCmd { command, .. },
+            } if command == cmd => Some(grant.clone()),
+            _ => None,
+        })
+        .expect("非空 interactive 命令應產生 StartOp(InteractiveOpenCmd)");
+    let lease = h.public()["interactive_session_id"]
+        .as_str()
+        .expect("送出前 lease 已開")
+        .to_string();
+    (cmd_id, grant, lease)
+}
+
+fn wp58_finish(h: &mut CoreHarness, grant: &sw_core::session_core::OpGrant, outcome: OpOutcome) -> Vec<Effect> {
+    let epoch = h.epoch();
+    h.feed(ControlEvent::OpFinished {
+        op_id: grant.op_id,
+        epoch,
+        outcome,
+        after_rx_seq: None,
+    })
+}
+
+fn wp58_removed(ops: &[sw_core::session_core::LeaseIndexOp], id: &str) -> bool {
+    ops.iter().any(|op| {
+        matches!(op, sw_core::session_core::LeaseIndexOp::Remove { interactive_id } if interactive_id == id)
+    })
+}
+
+#[test]
+fn wp58_g11_rejected_send_preserves_replacement_lease() {
+    // Python `test_rejected_send_does_not_close_lease_replaced_meanwhile`：送出失敗通知抵達前 lease 已被換掉，
+    // 結算原命令時不得誤關現行 lease。換 lease 沿用既有流程：agent `interactive_close` 原 lease → human console
+    // 接入開出 `human:c1` lease（`console.rs` 的 open-or-refresh）。
+    use sw_core::tx_writer::FenceReject;
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let (cmd_id, grant, original) = wp58_start_interactive(&mut h, "top");
+    let closed = h
+        .rpc(SessionRequest::InteractiveClose {
+            interactive_id: original.clone(),
+        })
+        .expect("interactive_close");
+    assert_eq!(closed["ok"], PyValue::Bool(true), "{closed:?}");
+    h.attach_pty_console("c1", true);
+    let replacement = h.public()["interactive_session_id"]
+        .as_str()
+        .expect("human console 應開出新 lease")
+        .to_string();
+    assert_ne!(replacement, original);
+    let ops_before = h.lease_index_ops().len();
+    wp58_finish(&mut h, &grant, OpOutcome::SendRefused(FenceReject::Frozen));
+    let rec = h.reg.get(&cmd_id).expect("命令紀錄");
+    assert_eq!(rec["error_code"], PyValue::from("FLUSHED_BY_RECOVERY"), "{rec:?}");
+    assert_eq!(
+        h.public()["interactive_session_id"],
+        PyValue::from(replacement.clone()),
+        "期間換入的 lease 必須保留"
+    );
+    assert!(
+        !wp58_removed(&h.lease_index_ops()[ops_before..], &replacement),
+        "不得自 LeaseIndex 移除現行 lease"
+    );
+}
+
+#[test]
+fn wp58_g11_non_sent_outcomes_close_only_own_lease() {
+    // `SendRefused`／`SendFailed`／失敗的 `CommandResult` 皆關閉本命令開的 lease 並自 LeaseIndex 移除；`Sent` 保留。
+    use sw_core::tx_writer::FenceReject;
+    type MakeOutcome = fn() -> OpOutcome;
+    let cases: [(&str, MakeOutcome, Option<&str>); 4] = [
+        ("SendRefused", || OpOutcome::SendRefused(FenceReject::Frozen), Some("FLUSHED_BY_RECOVERY")),
+        ("SendFailed", || OpOutcome::SendFailed, None),
+        (
+            "CommandResult",
+            || {
+                OpOutcome::CommandResult(sw_proto::pydict! {
+                    "ok" => false,
+                    "error_code" => "COMMAND_ABORTED_IN_FLIGHT",
+                })
+            },
+            Some("COMMAND_ABORTED_IN_FLIGHT"),
+        ),
+        ("Sent", || OpOutcome::Sent { bytes: 4 }, None),
+    ];
+    for (case, outcome, code) in cases {
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.to_ready();
+        let (cmd_id, grant, lease) = wp58_start_interactive(&mut h, "top");
+        let ops_before = h.lease_index_ops().len();
+        wp58_finish(&mut h, &grant, outcome());
+        let rec = h.reg.get(&cmd_id).expect("命令紀錄");
+        let removed = wp58_removed(&h.lease_index_ops()[ops_before..], &lease);
+        if case == "Sent" {
+            assert_eq!(rec["status"], PyValue::from("interactive"), "{case}：{rec:?}");
+            assert_eq!(h.public()["interactive_session_id"], PyValue::from(lease.clone()), "{case}：lease 應保留");
+            assert!(!removed, "{case}：不得移除 LeaseIndex");
+            continue;
+        }
+        assert_ne!(rec["status"], PyValue::from("interactive"), "{case}：{rec:?}");
+        if let Some(code) = code {
+            assert_eq!(rec["error_code"], PyValue::from(code), "{case}：{rec:?}");
+        }
+        assert!(h.public()["interactive_session_id"].is_null(), "{case}：不得遺留本命令開的 lease");
+        assert!(removed, "{case}：應自 LeaseIndex 移除本命令開的 lease");
+        // 後續 line 命令照常出列（不被遺留 lease 擋成 SESSION_INTERACTIVE_BUSY）。
+        let (resp, fx) = h.rpc_full(SessionRequest::Submit(agent_submit("echo ok")));
+        let next = resp.expect("line 命令 admission").get("cmd_id").and_then(PyValue::as_str).expect("cmd_id").to_string();
+        let next_rec = h.reg.get(&next).expect("line 命令紀錄");
+        assert_ne!(
+            next_rec.get("error_code"),
+            Some(&PyValue::from("SESSION_INTERACTIVE_BUSY")),
+            "{case}：{next_rec:?}"
+        );
+        assert!(
+            fx.iter().any(|e| matches!(e, Effect::StartOp { grant, .. } if grant.cmd_id.as_deref() == Some(next.as_str()))),
+            "{case}：line 命令應進入執行"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PR 237 承接（修正後語意，origin/fix/wrapped-echo-false-positive 34c3a84b）：長命令回顯被終端折行拆開時的剝除。
 // 只接受「命令原文＋折行插入字元」：命令每個字元（含空白）依序出現，只有換行或多出的一個空白可跳過，
 // 插入點彼此至少相隔 20 字元（第一個插入點以第一行欄位計、含殘留 prompt），第一個命令字元前不得插入，

@@ -4024,3 +4024,67 @@ fn wp56_rpc_async_reboot_evidence_wait() {
     );
     assert_eq!(String::from_utf8_lossy(&dev.tx_since(tx_mark)), "echo hi\n");
 }
+
+// ---------------------------------------------------------------------------
+// WP5-8 第 1 項（G11，S1X-a-1）：interactive 命令未完整送出時收回本命令開的 lease（RPC 端到端）。
+// 基準 `origin/main:sw_core/session_manager.py:6790-6822`（`except BaseException` 內僅在
+// `session.interactive_session_id == lease.interactive_id` 時 `_close_interactive_locked`）。呼叫路徑：
+// `Service::rpc(command.submit {mode:"interactive"})` → `SessionCore::submit` → `start_next` interactive 分支
+// （`open_lease`＋`PendingOp::InteractiveCmd { lease_id }`）→ `OpRunner` `OpSpec::InteractiveOpenCmd` → `lease_send`
+// → `TxWriter` 寫 FakeDevice（I/O 錯誤）→ `OpFinished` → `on_op_finished` 比對 lease id 後 `close_lease(false)`
+// （`LeaseIndex(Remove)` 交 `SessionManager`）→ `command.get`／`session.get_state`／下一筆 `command.submit`。
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wp58_g11_rpc_failed_interactive_submit_releases_lease() {
+    use sw_pal::fakes::FakeWriteStep;
+    use sw_pal::traits::PalError;
+    let r = ServiceRig::ready_shell();
+    let dev = r.device(REAL_A);
+    r.settle();
+    dev.script_write(vec![FakeWriteStep::AcceptThenError(
+        3,
+        PalError::io(5, "[Errno 5] Input/output error"),
+    )]);
+    let response = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"top","mode":"interactive"}"#,
+    );
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&response));
+    let record = wp55_wait_done(&r, s(&response, "cmd_id"));
+    // 錯誤碼沿用既有部分寫入映射（`interactive_mode_command_partial_send_maps_aborted_in_flight`）。
+    assert_eq!(s(&record, "error_code"), "COMMAND_ABORTED_IN_FLIGHT", "{}", j(&record));
+    r.settle();
+    let session = r.session("COM0").expect("COM0 session");
+    assert_eq!(
+        session.get("interactive_session_id"),
+        Some(&PyValue::Null),
+        "未完整送出後不得遺留本命令開的 lease：{}",
+        j(&session)
+    );
+
+    // 後續 line 命令不被遺留 lease 擋成 SESSION_INTERACTIVE_BUSY，經 RPC 真正寫到 UART 並完成。
+    dev.on_tx_reply(b"ls\n", b"ls\r\nroot@t:/# ");
+    let tx_mark = dev.tx_len();
+    let response = r.call("command.submit", r#"{"selector":"COM0","cmd":"ls","timeout_s":10}"#);
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&response));
+    let record = wp55_wait_done(&r, s(&response, "cmd_id"));
+    assert_eq!(s(&record, "status"), "done", "{}", j(&record));
+    assert_eq!(String::from_utf8_lossy(&dev.tx_since(tx_mark)), "ls\n");
+
+    // 下一條 interactive 命令照常送出，其 lease 可經全域 LeaseIndex 以 interactive_id 查到。
+    let tx_mark = dev.tx_len();
+    let response = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"top","mode":"interactive"}"#,
+    );
+    let record = wp55_wait_done(&r, s(&response, "cmd_id"));
+    assert_eq!(s(&record, "status"), "interactive", "{}", j(&record));
+    assert_eq!(String::from_utf8_lossy(&dev.tx_since(tx_mark)), "top\n");
+    let lease = s(&record, "interactive_session_id").to_string();
+    let status = r.call(
+        "session.interactive_status",
+        &format!(r#"{{"interactive_id":"{lease}"}}"#),
+    );
+    assert_eq!(status.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&status));
+}

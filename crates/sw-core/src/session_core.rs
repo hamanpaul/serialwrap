@@ -4376,6 +4376,7 @@ impl SessionCore {
                     PendingOp::InteractiveCmd {
                         cmd_id: command.cmd_id.clone(),
                         result,
+                        lease_id,
                     },
                 );
                 self.foreground = Some(grant.clone());
@@ -4809,7 +4810,23 @@ impl SessionCore {
                 mode,
                 reboot,
             }) => effects.extend(self.finish_command(&cmd_id, &mode, reboot, outcome, now)),
-            Some(PendingOp::InteractiveCmd { cmd_id, result }) => {
+            Some(PendingOp::InteractiveCmd {
+                cmd_id,
+                result,
+                lease_id,
+            }) => {
+                // G11（S1X-a-1，`origin/main:sw_core/session_manager.py:6807-6820`）：未完整送出時關閉本命令開的 lease，
+                // 免得遺留 lease 讓後續命令吃 SESSION_INTERACTIVE_BUSY 到逾時；先關 lease 再結算命令（Python 於
+                // `except` 內關閉後才 `raise` 交 `execute_command` 映射）。只在目前 lease 仍是本命令所開時關閉——期間
+                // 被收回或換掉者不動。非 expired 關閉（無 tombstone），LeaseIndex 隨 `close_lease` 移除。
+                if !matches!(outcome, OpOutcome::Sent { .. })
+                    && self
+                        .lease
+                        .as_ref()
+                        .is_some_and(|lease| lease.interactive_id == lease_id)
+                {
+                    self.close_lease(false);
+                }
                 let outcome = match outcome {
                     OpOutcome::Sent { .. } => CmdOutcome::Result(result),
                     // 未完整送出：OpRunner 已依命令帳結算（`map_send_failure`；sol-backfill p5 #1）。
@@ -5897,6 +5914,8 @@ enum PendingOp {
     InteractiveCmd {
         cmd_id: String,
         result: PyDict,
+        /// 本命令開啟的 lease（G11：未完整送出時只關閉仍是此 id 的 lease）。
+        lease_id: String,
     },
     Recover {
         reply: Reply,
