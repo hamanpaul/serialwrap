@@ -4088,3 +4088,42 @@ fn wp58_g11_rpc_failed_interactive_submit_releases_lease() {
     );
     assert_eq!(status.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&status));
 }
+
+/// WP5-8 第 2 項（G13，S1X-a-3）：RPC `device.attach`（`Service::rpc` → manager 路由 → `SessionCore::attach_request`）
+/// 遇一般 attach 登入途中再呼叫一次，回 `{"ok":true,"session"}`（＋RPC 層 `version`），沒有 `error_code`、沒有
+/// `already_attached`，也不再開一次埠（Python `tests/test_s1x_a3_attach_inflight.py::
+/// test_second_attach_during_login_returns_ok_session`；`origin/main:sw_core/session_manager.py:3428-3443`）。
+/// release 後重新 attach：`\n` 的一次性 prompt 應答已在啟動登入時用掉，登入停在等 prompt（FakeClock 不前進不逾時）。
+#[test]
+fn wp58_g13_rpc_device_attach_during_login_returns_ok_session() {
+    let r = ServiceRig::ready_shell();
+    let dev = r.device(REAL_A);
+    let released = r.call("device.release", r#"{"selector":"COM0"}"#);
+    assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&released));
+    r.settle();
+    let opens = dev.open_count();
+    let tx_mark = dev.tx_len();
+
+    let first = r.call("device.attach", r#"{"selector":"COM0"}"#);
+    assert_eq!(first.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&first));
+    assert_eq!(s(&sub(&first, "session"), "state"), "ATTACHING", "{}", j(&first));
+    wait_until("attach 登入 probe 已送出", || dev.tx_since(tx_mark).contains(&b'\n'));
+    assert_eq!(dev.open_count(), opens + 1);
+    assert_eq!(s(&r.session("COM0").expect("COM0"), "state"), "ATTACHING");
+
+    let second = r.call("device.attach", r#"{"selector":"COM0"}"#);
+    assert_eq!(keys(&second), vec!["ok", "session", "version"], "{}", j(&second));
+    assert_eq!(second.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&second));
+    let session = sub(&second, "session");
+    assert_eq!(s(&session, "state"), "ATTACHING", "{}", j(&second));
+    assert_eq!(s(&session, "com"), "COM0");
+    // 回應的 session 即同一時點的公開欄位（session.get_state），逐位元組一致。
+    let state = r.session("COM0").expect("COM0");
+    assert_eq!(j(&session), j(&state));
+    assert_eq!(dev.open_count(), opens + 1, "第二次 attach 不得再開埠");
+
+    // 第一次 attach 的登入照常完成：補上 prompt → ready_probe 應答 → READY。
+    dev.push_rx(b"root@t:/# ");
+    r.wait_state("COM0", "READY");
+    assert_eq!(dev.open_count(), opens + 1);
+}

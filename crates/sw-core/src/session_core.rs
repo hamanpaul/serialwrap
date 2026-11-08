@@ -2125,16 +2125,31 @@ impl SessionCore {
         // `{"ok":false,"error_code":"SESSION_RECOVERING","session"}`（P7 Task 17 `attach_state_result_mapping`）。
         let recovering_with_bridge =
             session_attach && self.state == SessionState::Recovering && self.generations.conn_epoch.is_some();
+        // drain／release 進行中與 release 持久化：一律 SESSION_RECOVERING（SC-04）。
         if self.drain_in_progress()
-            || self.pending_attach.is_some()
-            || self.open_real_path.is_some()
             || (self.state == SessionState::Recovering && !recovering_with_bridge)
-            || (self.state == SessionState::Attaching && self.generations.conn_epoch.is_none())
-            || matches!(
-                &self.pending_commit,
-                Some(PendingCommit::Release { .. } | PendingCommit::Attach { .. })
-            )
+            || matches!(&self.pending_commit, Some(PendingCommit::Release { .. }))
         {
+            return vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))];
+        }
+        // bridge 尚未接上的 attach 在途（Python 在途表 `_attach_ops`／`_preopened_ports`／`_active_attach_ops`）：
+        // 待開埠（clear 後等 manager 再解析）、開埠中、已開埠等 unreleased 落盤。
+        let attach_inflight = self.pending_attach.is_some()
+            || self.open_real_path.is_some()
+            || (self.state == SessionState::Attaching && self.generations.conn_epoch.is_none())
+            || matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }));
+        if attach_inflight {
+            // S1X-a-3（G13）：`device.attach` 遇單純 attach 進行中回 `{"ok":true,"session"}`
+            // （`origin/main:sw_core/session_manager.py:3428-3443`、`:3457-3467`）。`_attach_inflight_draining_locked`
+            // （`:3384-3398`）的 drain 與在途 release 已由上方分支擋下；剩下 RELEASED（含自 RELEASED 開埠後 unreleased
+            // 尚未落盤，Rust state 仍為 RELEASED）與 RELEASED 持久化未完成，仍屬 release 進行中。
+            // `session.attach` 不在此分流，維持原行為。
+            if !session_attach
+                && self.state != SessionState::Released
+                && !self.release_persist_pending
+            {
+                return vec![Effect::Reply(reply, Ok(self.ok_session(now)))];
+            }
             return vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))];
         }
         if self.generations.conn_epoch.is_some() {
@@ -2150,6 +2165,12 @@ impl SessionCore {
                     return vec![Effect::Reply(reply, Ok(self.ok_session(now)))];
                 }
                 return vec![Effect::Reply(reply, Ok(self.attach_state_result(now)))];
+            }
+            if self.state == SessionState::Attaching {
+                // S1X-a-3（G13）：bridge 已開但 attach 登入未完成（Python `_attach_bridges`）。Python 此時
+                // `session.bridge` 仍為 None（`session_manager.py:4996-5000` 只設 `attach_bridge`），不走 `:3421` 的
+                // `already_attached`，而是在途表分支回 `{"ok":true,"session"}`（`:3436-3437`）。
+                return vec![Effect::Reply(reply, Ok(self.ok_session(now)))];
             }
             let mut response = self.ok_session(now);
             response.insert("already_attached", PyValue::Bool(true));

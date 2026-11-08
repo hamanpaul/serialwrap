@@ -1038,6 +1038,372 @@ fn device_attach_dedup_same_by_id_inflight() {
     assert_eq!(h.fake_device.open_count(), opens);
 }
 
+// ---- WP5-8 第 2 項（G13，S1X-a-3）：`device.attach` 遇一般 attach 在途回 ok＋session ----
+//
+// Python 基線（`origin/main:sw_core/session_manager.py`）：
+// - `:3384-3398` `_attach_inflight_draining_locked`：在途表命中時，只有 pending drain、by_id 正在 drain、在途 op
+//   帶 release 請求或已取消、或 session 已 RELEASED 才算 drain／release 進行中。
+// - `:3428-3443`、`:3457-3467`：其餘（probe／login 進行中的一般 attach）回 `{"ok":true,"session"}`；drain／release
+//   進行中仍回 `SESSION_RECOVERING`＋`drain_stalled`＋`drain_timeout_epoch`＋`session`（SC-04）。
+// - 一般 attach 的 probe／login 期間 `session.bridge` 仍為 None（bridge 只在 `_attach_bridges`／`attach_bridge`，
+//   `:4996-5000`），所以不走 `:3421` 的 `already_attached` 分支。
+// 對應 Python 測試 `tests/test_s1x_a3_attach_inflight.py:52-144`；回應形狀 `contracts/rpc_schema.json` device.attach。
+
+fn g13_wire(response: &PyDict) -> String {
+    sw_proto::pyjson::dumps_dict(response, &sw_proto::pyjson::RPC_WIRE)
+}
+
+/// Python `{"ok": True, "session": session.to_public_dict()}`（`session_manager.py:3437`）。
+fn g13_ok_session(h: &CoreHarness) -> String {
+    let mut expected = PyDict::new();
+    expected.insert("ok", PyValue::Bool(true));
+    expected.insert("session", PyValue::Dict(h.public()));
+    g13_wire(&expected)
+}
+
+/// Python drain／release 在途回應（`session_manager.py:3438-3444`），鍵序 ok／error_code／drain_stalled／
+/// drain_timeout_epoch／session。
+fn g13_recovering(h: &CoreHarness) -> String {
+    let public = h.public();
+    let mut expected = PyDict::new();
+    expected.insert("ok", PyValue::Bool(false));
+    expected.insert("error_code", PyValue::from("SESSION_RECOVERING"));
+    expected.insert("drain_stalled", public["drain_stalled"].clone());
+    expected.insert("drain_timeout_epoch", public["drain_timeout_epoch"].clone());
+    expected.insert("session", PyValue::Dict(public));
+    g13_wire(&expected)
+}
+
+/// 第二次 attach 不得再開埠、再登入、再落盤或再交 manager 解析。
+fn g13_attach_side_effects(effects: &[Effect]) -> usize {
+    effects
+        .iter()
+        .filter(|effect| {
+            matches!(
+                effect,
+                Effect::OpenBridge { .. }
+                    | Effect::StartLogin { .. }
+                    | Effect::Persist { .. }
+                    | Effect::Reattach { .. }
+            )
+        })
+        .count()
+}
+
+/// 對應 Python `_detached` fixture：DETACHED、裝置在場、沒有 bridge（自動開埠失敗後停 DETACHED）。
+fn g13_detached_with_device() -> CoreHarness {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.attach_device();
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Err(OpenFailure::Other(PalError::io(5, "open failed"))),
+    });
+    assert_eq!(h.public()["state"], PyValue::from("DETACHED"));
+    assert_eq!(h.core.generations().conn_epoch, None);
+    h
+}
+
+/// 停在一般 attach 的登入途中（bridge 已開、`StartLogin` 已發、`LoginFinished` 未到）。
+fn g13_login_in_progress() -> CoreHarness {
+    let mut h = g13_detached_with_device();
+    let (first_rx, first_effects) = h.rpc_deferred(SessionRequest::DeviceAttach { force: false });
+    assert!(first_effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::OpenBridge { .. })));
+    let effects = h.bridge_ok();
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::StartLogin { .. })),
+        "第一次 attach 應進入登入"
+    );
+    let first = first_rx
+        .try_recv()
+        .expect("bridge 開啟且 unreleased 落盤後回覆第一次 attach")
+        .unwrap();
+    assert_eq!(first.get("ok"), Some(&PyValue::Bool(true)));
+    assert_eq!(nested_session_state(&first), PyValue::from("ATTACHING"));
+    assert_eq!(h.public()["state"], PyValue::from("ATTACHING"));
+    assert!(h.core.generations().conn_epoch.is_some());
+    h
+}
+
+#[test]
+fn wp58_g13_second_attach_during_login_returns_ok_session() {
+    // Python `test_second_attach_during_login_returns_ok_session`：第一次 attach 回 ATTACHING 後、probe／login
+    // 進行中再呼叫一次 → ok＋session（state=ATTACHING），非 SESSION_RECOVERING，也沒有 `already_attached`。
+    let mut h = g13_login_in_progress();
+    let opens = h.fake_device.open_count();
+    let epoch = h.core.generations().conn_epoch;
+
+    let (second, effects) = h.rpc_full(SessionRequest::DeviceAttach { force: false });
+    let second = second.unwrap();
+    assert_eq!(second.get("error_code"), None, "{}", g13_wire(&second));
+    assert_eq!(second.get("already_attached"), None, "{}", g13_wire(&second));
+    assert_eq!(g13_wire(&second), g13_ok_session(&h));
+    match second.get("session") {
+        Some(PyValue::Dict(session)) => {
+            assert_eq!(session.get("state"), Some(&PyValue::from("ATTACHING")));
+            assert_eq!(session.get("com"), Some(&PyValue::from("COM0")));
+        }
+        other => panic!("回應缺少 session dict：{other:?}"),
+    }
+    assert_eq!(g13_attach_side_effects(&effects), 0);
+    assert_eq!(h.fake_device.open_count(), opens);
+    assert_eq!(h.core.generations().conn_epoch, epoch);
+
+    // 第一次 attach 的登入照常完成。
+    let (epoch, fsm_gen) = (h.epoch(), h.core.generations().fsm_gen);
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    assert_eq!(h.public()["state"], PyValue::from("READY"));
+}
+
+/// Python `test_inflight_attach_tables_without_drain_return_ok` 的四表參數化，對應 Rust 的五個在途階段。
+mod wp58_g13_plain_attach_inflight_returns_ok {
+    use super::*;
+
+    /// 對 `force` 兩值各呼叫一次（Python 在途判斷位於 holder 檢查之前，`force` 不影響）：回應逐位元組等於
+    /// `{"ok":true,"session"}`，且不新增 `OpenBridge`／`StartLogin`／`Persist`／`Reattach`、不改 state 與 epoch。
+    fn assert_plain_inflight_ok(h: &mut CoreHarness, phase: &str) {
+        for force in [false, true] {
+            let opens = h.fake_device.open_count();
+            let epoch = h.core.generations().conn_epoch;
+            let state = h.public()["state"].clone();
+            let (response, effects) = h.rpc_full(SessionRequest::DeviceAttach { force });
+            let response = response.unwrap();
+            assert_eq!(
+                g13_wire(&response),
+                g13_ok_session(h),
+                "{phase}（force={force}）應回 ok＋session"
+            );
+            assert_eq!(
+                g13_attach_side_effects(&effects),
+                0,
+                "{phase}（force={force}）不得重複開埠或登入"
+            );
+            assert_eq!(h.fake_device.open_count(), opens, "{phase}（force={force}）");
+            assert_eq!(h.core.generations().conn_epoch, epoch, "{phase}（force={force}）");
+            assert_eq!(h.public()["state"], state, "{phase}（force={force}）");
+        }
+    }
+
+    #[test]
+    fn reattach_pending() {
+        // 待開埠：clear 收尾後交 manager 再解析（`Effect::Reattach`），ATTACHING、尚未送 `OpenBridge`。
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.to_ready();
+        let (_clear_rx, _) = h.rpc_deferred(SessionRequest::Clear);
+        let (epoch, stop) = h.pending_stop();
+        let effects = h.receipt(epoch, stop).feed();
+        assert!(effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Reattach { .. })));
+        assert_eq!(h.public()["state"], PyValue::from("ATTACHING"));
+        assert_eq!(h.core.generations().conn_epoch, None);
+        assert_plain_inflight_ok(&mut h, "待開埠");
+
+        // 原流程照常：manager 再解析後只開一次埠。
+        let effects = h.feed(ControlEvent::DeviceAttached {
+            by_id: DEVICE_BY_ID.into(),
+            real_path: REAL_PATH.into(),
+        });
+        let opens = effects
+            .iter()
+            .filter(|effect| matches!(effect, Effect::OpenBridge { .. }))
+            .count();
+        assert_eq!(opens, 1);
+    }
+
+    #[test]
+    fn hotplug_opening() {
+        // 開埠中（自動 attach）：`DeviceAttached` 已送 `OpenBridge`、`BridgeOpened` 未到。
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        let effects = h.feed(ControlEvent::DeviceAttached {
+            by_id: DEVICE_BY_ID.into(),
+            real_path: REAL_PATH.into(),
+        });
+        assert!(effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::OpenBridge { .. })));
+        assert_eq!(h.public()["state"], PyValue::from("ATTACHING"));
+        assert_plain_inflight_ok(&mut h, "自動 attach 開埠中");
+
+        let effects = h.bridge_ok();
+        assert!(effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::StartLogin { .. })));
+    }
+
+    #[test]
+    fn manual_opening() {
+        // 開埠中（`device.attach` 發起）：對應 Python `_attach_ops`；Python 此時 state 仍為 DETACHED
+        // （`:3599` 開埠成功後才設 ATTACHING），Rust 同樣維持原 state。
+        let mut h = g13_detached_with_device();
+        let (first_rx, first_effects) = h.rpc_deferred(SessionRequest::DeviceAttach { force: false });
+        assert!(first_effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::OpenBridge { .. })));
+        assert!(first_rx.try_recv().is_err(), "開埠完成前不回覆第一次 attach");
+        assert_plain_inflight_ok(&mut h, "device.attach 開埠中");
+
+        h.bridge_ok();
+        let first = first_rx.try_recv().unwrap().unwrap();
+        assert_eq!(first.get("ok"), Some(&PyValue::Bool(true)));
+        assert_eq!(nested_session_state(&first), PyValue::from("ATTACHING"));
+    }
+
+    #[test]
+    fn opened_commit_pending() {
+        // 已開埠、等 unreleased 落盤：對應 Python `_preopened_ports`（開埠成功後、`_save_state` 與 attach thread 接手前）。
+        let mut h = g13_detached_with_device();
+        h.defer_state_commits();
+        let (first_rx, _) = h.rpc_deferred(SessionRequest::DeviceAttach { force: false });
+        h.bridge_ok();
+        let commits = h.pending_state_commit_ids();
+        assert_eq!(commits.len(), 1, "開埠後應先落盤 unreleased");
+        assert!(first_rx.try_recv().is_err());
+        assert_plain_inflight_ok(&mut h, "已開埠等落盤");
+        assert_eq!(h.pending_state_commit_ids(), commits, "第二次 attach 不得再落盤");
+
+        let effects = h.complete_state_commit(commits[0]);
+        assert!(effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::StartLogin { .. })));
+        let first = first_rx.try_recv().unwrap().unwrap();
+        assert_eq!(first.get("ok"), Some(&PyValue::Bool(true)));
+    }
+
+    #[test]
+    fn login_in_progress() {
+        // bridge 已開但登入未完成：對應 Python `_attach_bridges`（`session.bridge` 仍為 None）。
+        let mut h = g13_login_in_progress();
+        assert_plain_inflight_ok(&mut h, "登入中");
+
+        let (epoch, fsm_gen) = (h.epoch(), h.core.generations().fsm_gen);
+        h.feed(ControlEvent::LoginFinished {
+            epoch,
+            fsm_gen,
+            result: LoginOutcome::Ready,
+            after_rx_seq: None,
+        });
+        assert_eq!(h.public()["state"], PyValue::from("READY"));
+    }
+}
+
+/// Python `test_inflight_attach_with_release_request_keeps_recovering`：release 進行中（或 session 仍 RELEASED）時，
+/// attach 在途仍回 SESSION_RECOVERING（SC-04）。
+mod wp58_g13_release_inflight_keeps_recovering {
+    use super::*;
+
+    fn assert_recovering(h: &mut CoreHarness, phase: &str) {
+        let opens = h.fake_device.open_count();
+        let (response, effects) = h.rpc_full(SessionRequest::DeviceAttach { force: false });
+        let response = response.unwrap();
+        assert_eq!(g13_wire(&response), g13_recovering(h), "{phase}");
+        assert_eq!(g13_attach_side_effects(&effects), 0, "{phase}");
+        assert_eq!(h.fake_device.open_count(), opens, "{phase}");
+    }
+
+    #[test]
+    fn release_during_manual_open() {
+        // 對應 Python 在途 op 帶 `release_request`：device.attach 開埠途中收到 release。
+        let mut h = g13_detached_with_device();
+        let (attach_rx, _) = h.rpc_deferred(SessionRequest::DeviceAttach { force: false });
+        let (_release_rx, _) = h.rpc_deferred(release());
+        session_error(&attach_rx.try_recv().unwrap().unwrap(), "SESSION_RECOVERING");
+        assert!(h.core.drain_in_progress());
+        assert_recovering(&mut h, "device.attach 開埠途中 release");
+    }
+
+    #[test]
+    fn release_during_login() {
+        let mut h = g13_login_in_progress();
+        let (_release_rx, _) = h.rpc_deferred(release());
+        assert!(h.core.drain_in_progress());
+        assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
+        assert_recovering(&mut h, "登入途中 release");
+    }
+
+    #[test]
+    fn released_attach_opening() {
+        // 對應 Python `session.state == "RELEASED"`：自 RELEASED 發起的 attach 仍在開埠。
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.to_ready();
+        let (_rx, _) = h.rpc_deferred(release());
+        let (epoch, stop) = h.pending_stop();
+        h.receipt(epoch, stop).feed();
+        let (_first, _) = h.rpc_deferred(SessionRequest::DeviceAttach { force: false });
+        assert_eq!(h.public()["state"], PyValue::from("RELEASED"));
+        assert_recovering(&mut h, "RELEASED 開埠中");
+    }
+
+    #[test]
+    fn released_attach_commit_pending() {
+        // 自 RELEASED 開埠成功、unreleased 尚未落盤：Rust state 仍為 RELEASED（落盤失敗會退回 RELEASED），
+        // 依 Python `_attach_inflight_draining_locked` 的 RELEASED 判斷仍屬 release 進行中。
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.to_ready();
+        let (_rx, _) = h.rpc_deferred(release());
+        let (epoch, stop) = h.pending_stop();
+        h.receipt(epoch, stop).feed();
+        h.defer_state_commits();
+        let (_first, _) = h.rpc_deferred(SessionRequest::DeviceAttach { force: false });
+        h.bridge_ok();
+        assert_eq!(h.pending_state_commit_ids().len(), 1);
+        assert_eq!(h.public()["state"], PyValue::from("RELEASED"));
+        assert_recovering(&mut h, "RELEASED 開埠後等落盤");
+    }
+}
+
+/// Python `test_inflight_attach_while_draining_keeps_recovering`：by_id 正在 drain 時仍回 SESSION_RECOVERING，
+/// 並完整帶出 `drain_stalled`、`drain_timeout_epoch`、`session`。
+mod wp58_g13_inflight_attach_while_draining_keeps_recovering {
+    use super::*;
+
+    #[test]
+    fn clear_drain_during_open() {
+        // 開埠途中 clear：pending open stop（drain 在途、bridge 尚未接上）。
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.attach_device();
+        let (_clear_rx, _) = h.rpc_deferred(SessionRequest::Clear);
+        assert!(h.core.drain_in_progress());
+        let opens = h.fake_device.open_count();
+        let (response, effects) = h.rpc_full(SessionRequest::DeviceAttach { force: false });
+        let response = response.unwrap();
+        assert_eq!(g13_wire(&response), g13_recovering(&h));
+        assert_eq!(response.get("drain_stalled"), Some(&PyValue::Bool(false)));
+        assert_eq!(g13_attach_side_effects(&effects), 0);
+        assert_eq!(h.fake_device.open_count(), opens);
+    }
+
+    #[test]
+    fn stalled_clear_drain_during_login() {
+        // 登入途中 clear 且 drain 逾時：`drain_stalled=true`、`drain_timeout_epoch` 前進，兩欄與 session 原樣帶出。
+        let mut h = g13_login_in_progress();
+        let (_clear_rx, _) = h.rpc_deferred(SessionRequest::Clear);
+        assert!(h.core.drain_in_progress());
+        h.advance(Duration::from_millis(3001));
+        assert_eq!(h.public()["drain_stalled"], PyValue::Bool(true));
+        assert_ne!(h.public()["drain_timeout_epoch"], PyValue::Null);
+        let opens = h.fake_device.open_count();
+        let (response, effects) = h.rpc_full(SessionRequest::DeviceAttach { force: false });
+        let response = response.unwrap();
+        assert_eq!(g13_wire(&response), g13_recovering(&h));
+        assert_eq!(response.get("drain_stalled"), Some(&PyValue::Bool(true)));
+        assert_eq!(
+            response.get("drain_timeout_epoch"),
+            Some(&h.public()["drain_timeout_epoch"])
+        );
+        assert_eq!(g13_attach_side_effects(&effects), 0);
+        assert_eq!(h.fake_device.open_count(), opens);
+    }
+}
+
 #[test]
 fn stale_bridge_opened_after_real_path_change_closed() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
