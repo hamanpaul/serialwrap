@@ -25,6 +25,8 @@ import types
 from pathlib import Path
 from typing import Any
 
+import re
+
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
@@ -32,7 +34,9 @@ RUN_UPGRADE = REPO / "scripts" / "docker" / "run-upgrade.sh"
 DOCKERFILE = REPO / "tools" / "docker" / "upgrade.Dockerfile"
 SYSTEMD_DOCKERFILE = REPO / "tools" / "docker" / "systemd.Dockerfile"
 UPGRADE_CONTAINER = REPO / "scripts" / "docker" / "run_upgrade_container.py"
-# 升級驗證的新版候選即目前版本：run-upgrade.sh 與容器 driver 的 NEW_VERSION 都必須等於 VERSION。
+# 升級驗證的新版候選即目前版本：run-upgrade.sh 直接讀 VERSION（dry-run 測試以 `--version-override` 驗證輸出，
+# test_run_upgrade_reads_new_version_from_version_file 防止寫死）；容器 driver 在容器內執行、讀不到 VERSION，
+# 保留常數，由 test_upgrade_driver_new_version_matches_version_file 驗證等於 VERSION。
 NEW_VERSION = (REPO / "VERSION").read_text(encoding="utf-8").strip()
 
 sys.path.insert(0, str(REPO))
@@ -898,6 +902,14 @@ def _docker_available() -> bool:
         return False
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_run_upgrade_reads_new_version_from_version_file():
+    text = RUN_UPGRADE.read_text(encoding="utf-8")
+    assert re.search(r"^NEW_VERSION=[0-9]", text, re.M) is None, "run-upgrade.sh 不得寫死 NEW_VERSION"
+    assert '"$REPO_ROOT/VERSION"' in text
+
+
 # POSIX-only：bash runner 需 POSIX bash、git 與 python3。
 @pytest.mark.posix_only
 @pytest.mark.process_rpc
@@ -954,6 +966,8 @@ def _runner_repo(tmp_path: Path, script: Path) -> tuple[Path, Path]:
     entry = repo / script.relative_to(REPO)
     entry.parent.mkdir(parents=True)
     shutil.copy2(script, entry)
+    # run-upgrade.sh 由 VERSION 讀新版候選，fixture 要帶同一份 VERSION。
+    shutil.copy2(REPO / "VERSION", repo / "VERSION")
     (repo / "input.txt").write_text("原始輸入\n", encoding="utf-8")
     (repo / ".gitignore").write_text("/target/\n", encoding="utf-8")
     for args in (["init", "-q"], ["add", "."],

@@ -16,7 +16,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DOCKERFILE="$REPO_ROOT/tools/docker/upgrade.Dockerfile"
 OLD_TAG=v0.3.2
 OLD_VERSION=0.3.2
-NEW_VERSION=0.4.1
+# 新版候選即目前版本，直接讀 VERSION，避免每次發版要同步多處。
+NEW_VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION")"
+[[ "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "VERSION 格式不符：$NEW_VERSION" >&2; exit 2; }
 # SW_UPGRADE_SYSTEM_PYTHON 只供測試模擬主機缺件；實體不在 /usr/bin 或版本不符 contracts/cli_help/_meta.json 一律拒絕。
 SYSTEM_PYTHON="${SW_UPGRADE_SYSTEM_PYTHON:-/usr/bin/python3.12}"
 # 與 release workflow 的 build venv 同一釘版
