@@ -27,6 +27,10 @@ use sw_core::mcu_patterns::McuPatternRegistry;
 use sw_core::session_manager::{ManagerDeps, PersistObserver, SessionManager};
 use sw_core::state_store::{load_state_with_warn, StateStore};
 use sw_core::wal::{WalConfig, WalWriter};
+#[cfg(feature = "test-fakes")]
+use sw_core::wal::WalAppendReq;
+#[cfg(feature = "test-fakes")]
+use sw_pal::traits::FsRead;
 use sw_pal::traits::{EndpointSpec, FsOps, InstanceLockError, IoWaker, ListenOptions, PalError, PalResult, SysEnv};
 use sw_pal::{
     BackendKind, Capabilities, ConsoleKind, DeviceBackendKind, DeviceSelection, DeviceWatcher,
@@ -52,6 +56,12 @@ const DESCRIPTION: &str = "serialwrap daemon";
 const ISOLATION_ENV_VARS: [&str; 3] = ["SERIALWRAP_STATE_DIR", "SERIALWRAP_RUN_DIR", "SERIALWRAP_CONFIG_DIR"];
 /// OD-11 測試裝置 allowlist 的 env。
 const ENV_TEST_DEVICE_ALLOWLIST: &str = "SERIALWRAP_TEST_DEVICE_ALLOWLIST";
+/// T13 staging 專用 WAL 紀錄注入（只存在於 test-fakes build）。
+#[cfg(feature = "test-fakes")]
+pub const ENV_TEST_T13_WAL_RECORD: &str = "SERIALWRAP_TEST_T13_WAL_RECORD";
+/// T13 staging 專用 WAL payload；記錄掛在不存在的 COM250 上，不會開啟 UART。
+#[cfg(feature = "test-fakes")]
+pub const T13_WAL_TEST_PAYLOAD: &[u8] = b"serialwrap T13 isolated staging WAL evidence\n";
 /// `test_allowlist.INVALID_CONFIG_REASON`。
 const INVALID_CONFIG_REASON: &str = "invalid windows.test_device_allowlist";
 /// Stage 0 測試鉤子（#3）：release 持久化落盤後、回覆前 `exit(137)`。
@@ -519,6 +529,45 @@ fn resolve_allowlist_with_caps(
 /// 路徑風格以 `defaults` 的分隔字元推斷（含 `\` → Windows，否則 POSIX）。
 pub fn resolve_test_allowlist(env: &dyn SysEnv, cfg: &RuntimeConfig, defaults: &RuntimePaths) -> TestAllowlist {
     resolve_allowlist_with_caps(env, &caps_for_defaults(defaults), Some(cfg), defaults)
+}
+
+/// test-fakes staging 專用：以不存在的 allowlist COM 寫入可辨認的 WAL 紀錄，不建立 session、不呼叫序列埠後端。
+/// 正式 build 不含此函式；要求必須同時指定 staging 開關及精確的 COM250 env allowlist。
+#[cfg(feature = "test-fakes")]
+pub fn append_t13_staging_wal_record(
+    env: &dyn SysEnv,
+    fs: &dyn FsRead,
+    wal: &WalWriter,
+    allow: &TestAllowlist,
+) -> Result<bool, String> {
+    match env.var(ENV_TEST_T13_WAL_RECORD).as_deref() {
+        None => return Ok(false),
+        Some(path) if !path.trim().is_empty() => {
+            let marker = fs
+                .read(Path::new(path))
+                .map_err(|error| format!("讀取 T13 WAL marker 失敗：{}", error.py_message))?;
+            if marker != T13_WAL_TEST_PAYLOAD {
+                return Err("T13 WAL marker 內容不符".into());
+            }
+        }
+        Some(_) => return Err(format!("{ENV_TEST_T13_WAL_RECORD} 不得為空")),
+    }
+    if !allow.enabled || allow.source != "env" || allow.coms.as_slice() != ["COM250"] {
+        return Err("T13 WAL 記錄要求啟用來源為 env 且唯一 allowlist 為 COM250".into());
+    }
+    let result = wal.append(WalAppendReq {
+        com: "COM250",
+        dir: "RX",
+        source: "test",
+        payload: T13_WAL_TEST_PAYLOAD,
+        cmd_id: None,
+        loss_flag: false,
+        meta: None,
+    });
+    if !result.ok || result.loss_flag {
+        return Err(format!("T13 staging WAL 記錄寫入失敗：{result:?}"));
+    }
+    Ok(true)
 }
 
 fn caps_for_defaults(defaults: &RuntimePaths) -> Capabilities {
@@ -1106,6 +1155,13 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
         p.wal_fs.clone(),
         p.clock.clone(),
     ));
+    #[cfg(feature = "test-fakes")]
+    if let Err(reason) = append_t13_staging_wal_record(&*p.env, &*p.fs, &wal, &allow) {
+        eprintln!("{PROG}: T13 staging WAL 記錄失敗：{reason}");
+        let _ = wal.shutdown();
+        lock.release();
+        return 1;
+    }
     let registry = CommandRegistry::new();
     let explicit_targets = load.profiles.len();
     let stage0 = Arc::new(Stage0Hooks {

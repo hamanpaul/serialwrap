@@ -26825,6 +26825,7 @@
           "cargo:sw-pal::wintask_staging::support_wal_tail_detects_torn_and_crc_mismatch",
           "cargo:sw-pal::wintask_staging::support_xml_parser_reads_task_xml_by_element_path",
           "cargo:sw-pal::wintask_staging::task_name_guard_only_accepts_test_names",
+          "cargo:sw-pal::wintask_staging::wal_test_record_evidence_requires_the_staging_daemon_record",
           "cargo:sw-pal::wintask_staging::wal_without_records_is_insufficient_evidence",
           "cargo:sw-pal::wintask_staging::win_runner_forwards_schtasks_authorization"
         ],
@@ -26838,6 +26839,29 @@
             "sw-pal",
             "--test",
             "wintask_staging",
+            "--features",
+            "test-fakes"
+          ],
+          "markexpr": "",
+          "paths": []
+        }
+      }
+    },
+    "s2_p8_t13:t13b-wal-hook": {
+      "linux": {
+        "nodeids": [
+          "cargo:sw-daemon::wintask_staging_isolation::every_isolation_var_comes_from_the_batch",
+          "cargo:sw-daemon::wintask_staging_isolation::staging_batch_env_makes_daemon_isolation_hold_and_allowlist_effective",
+          "cargo:sw-daemon::wintask_staging_isolation::staging_config_parsed_by_daemon_excludes_registry_coms",
+          "cargo:sw-daemon::wintask_staging_isolation::t13_staging_wal_hook_writes_verifiable_record_without_uart",
+          "cargo:sw-daemon::wintask_staging_isolation::without_staging_batch_daemon_rejects_allowlist"
+        ],
+        "selector": {
+          "argv": [
+            "--package",
+            "sw-daemon",
+            "--test",
+            "wintask_staging_isolation",
             "--features",
             "test-fakes"
           ],

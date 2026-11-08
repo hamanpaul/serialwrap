@@ -25,7 +25,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sw_pal::device_source::windows_model::RegistryView;
-use sw_pal::proc_scan::ProcScan;
 use sw_pal::service_ctl::{ServiceCtl, SupervisionMode, TaskQuery};
 use sw_pal::traits::SysEnv;
 
@@ -37,6 +36,9 @@ pub const PRODUCTION_TASK: &str = "serialwrap";
 pub const PRODUCTION_PORT: u16 = 48700;
 /// 不存在的 COM port（防線 1）。
 pub const ALLOWLIST_COM: &str = "COM250";
+/// test-fakes daemon 專用：寫入一筆可辨認 WAL 紀錄，不會開啟 UART。
+pub const TEST_WAL_RECORD_ENV: &str = "SERIALWRAP_TEST_T13_WAL_RECORD";
+pub const TEST_WAL_PAYLOAD: &[u8] = b"serialwrap T13 isolated staging WAL evidence\n";
 /// `reg query` 讀取的 registry 鍵（防線 2）。
 pub const SERIALCOMM_KEY: &str = r"HKLM\HARDWARE\DEVICEMAP\SERIALCOMM";
 /// 批次檔第一步：清掉所有繼承的 `SERIALWRAP_*`（使用者全域 env 不得穿透隔離）。
@@ -209,6 +211,9 @@ impl StagingSpec {
     pub fn wal_dir(&self) -> String {
         win_join(&self.root, &["wal"])
     }
+    pub fn wal_test_record_path(&self) -> String {
+        win_join(&self.root, &["wal", "t13-record.seed"])
+    }
     pub fn lock_path(&self) -> String {
         win_join(&self.root, &["run", "serialwrapd.lock"])
     }
@@ -217,20 +222,36 @@ impl StagingSpec {
     }
     /// harness（正式 `serialwrap service stop`）讀取的 CLI config（`SERIALWRAP_CONFIG`）。
     pub fn cli_config_path(&self) -> String {
-        todo!("P8-T13: StagingSpec::cli_config_path")
+        win_join(&self.root, &["config", "cli-config.yaml"])
     }
     /// CLI config 內容（[`CLI_CONFIG`]）。
     pub fn render_cli_config(&self) -> String {
-        todo!("P8-T13: StagingSpec::render_cli_config")
+        CLI_CONFIG.to_string()
     }
     /// harness 的 `--var`：daemon 的 staging 目錄（不含 daemon 專用的 allowlist）＋ `SERIALWRAP_CONFIG`；
     /// 埠由 harness 依 `--port` 自行設定，不在此列。
     pub fn harness_vars(&self) -> Vec<(String, String)> {
-        todo!("P8-T13: StagingSpec::harness_vars")
+        [
+            ("SERIALWRAP_CONFIG", self.cli_config_path()),
+            ("SERIALWRAP_CONFIG_DIR", self.config_dir()),
+            ("SERIALWRAP_STATE_DIR", self.state_dir()),
+            ("SERIALWRAP_RUN_DIR", self.run_dir()),
+            ("SERIALWRAP_WAL_DIR", self.wal_dir()),
+            ("SERIALWRAP_LOG_DIR", win_join(&self.root, &["blog"])),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect()
     }
     /// harness 命令列：`<harness> --task <task> --port <port> --var K=V …`（只允許測試工作名稱）。
     pub fn harness_argv(&self, harness: &str, task: &str) -> Vec<String> {
-        todo!("P8-T13: StagingSpec::harness_argv {harness} {task}")
+        assert_test_task_name(task);
+        let mut args = argv(&[harness, "--task", task, "--port", &self.port.to_string()]);
+        for (key, value) in self.harness_vars() {
+            args.push("--var".into());
+            args.push(format!("{key}={value}"));
+        }
+        args
     }
 
     /// 批次檔設定的完整 env（清掉繼承的 `SERIALWRAP_*` 之後依序設定）。
@@ -257,6 +278,7 @@ impl StagingSpec {
                 win_join(r, &["system-config", "config.yaml"]),
             ),
             ("SERIALWRAP_TEST_DEVICE_ALLOWLIST", ALLOWLIST_COM.to_string()),
+            (TEST_WAL_RECORD_ENV, self.wal_test_record_path()),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
@@ -332,6 +354,10 @@ impl StagingSpec {
             .map_err(|e| format!("write {}: {e}", self.batch_path()))?;
         std::fs::write(self.config_yaml(), self.render_config())
             .map_err(|e| format!("write {}: {e}", self.config_yaml()))?;
+        std::fs::write(self.cli_config_path(), self.render_cli_config())
+            .map_err(|e| format!("write {}: {e}", self.cli_config_path()))?;
+        std::fs::write(self.wal_test_record_path(), TEST_WAL_PAYLOAD)
+            .map_err(|e| format!("write {}: {e}", self.wal_test_record_path()))?;
         std::fs::copy(daemon_src, self.daemon_exe())
             .map_err(|e| format!("copy {} → {}: {e}", daemon_src.display(), self.daemon_exe()))?;
         Ok(())
@@ -899,19 +925,6 @@ pub fn kill_staging_daemons(env: &dyn SysEnv, exe: &str) -> Vec<String> {
 // 排程工作：有序停止（P4 graceful_stop 的具名對應）與收尾
 // ---------------------------------------------------------------------------
 
-/// [`graceful_stop_for_test`] 的結果。
-#[derive(Debug, Clone, Default)]
-pub struct TestStopReport {
-    pub ok: bool,
-    /// 是否執行了 `/End`。
-    pub ran_end: bool,
-    /// `daemon.stop` 是否送達（connect 成功）。
-    pub reachable: bool,
-    /// 依序執行的監管命令（argv＋rc）。
-    pub ran: Vec<(Vec<String>, i32)>,
-    pub detail: String,
-}
-
 /// 等到工作不在執行中（`NotRunning`）；`QueryFailed` 不視為已停止。
 pub fn wait_task_not_running(ctl: &dyn ServiceCtl, name: &str, timeout: Duration) -> bool {
     assert_test_task_name(name);
@@ -925,85 +938,6 @@ pub fn wait_task_not_running(ctl: &dyn ServiceCtl, name: &str, timeout: Duration
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-}
-
-fn daemon_gone(procs: &dyn ProcScan, port: u16, pid: u32) -> bool {
-    rpc_call(port, "health.ping", "{}", Duration::from_millis(500)).is_err() && !procs.pid_alive(pid)
-}
-
-fn wait_daemon_gone(procs: &dyn ProcScan, port: u16, pid: u32, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if daemon_gone(procs, port, pid) {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-}
-
-/// P4 `graceful_stop`（windows-task，`StopRpc::Plain`，`keep_disabled=false`）的具名對應：
-/// `/Change /TN <name> /DISABLE`（PAL `hold_autostart_named`）→ RPC `daemon.stop`（2 s）→ 等待 ≤10 s →
-/// 只有逾時，或 RPC 不可達且工作仍 Running 時才 `/End /TN <name>` → `/Change /TN <name> /ENABLE`（PAL `release_autostart`）。
-/// sw-cli 的 `graceful_stop` 固定操作正式 `serialwrap` 工作，實跑不得呼叫；其序列由 `crates/sw-cli/tests/service_wintask.rs` 驗證。
-pub fn graceful_stop_for_test(
-    ctl: &dyn ServiceCtl,
-    env: &dyn SysEnv,
-    procs: &dyn ProcScan,
-    name: &str,
-    port: u16,
-    pid: u32,
-) -> TestStopReport {
-    assert_test_task_name(name);
-    let w = SupervisionMode::WindowsTask;
-    let mut report = TestStopReport::default();
-    let hold = match ctl.hold_autostart_named(&w, name, false) {
-        Ok(hold) => hold,
-        Err(failure) => {
-            report.detail = format!("停用工作失敗：{failure:?}");
-            return report;
-        }
-    };
-    report.ran.extend(hold.ran.iter().map(|c| (c.argv.clone(), c.rc)));
-    report.reachable = !matches!(rpc_call(port, "daemon.stop", "{}", RPC_TIMEOUT), Err(RpcError::Connect(_)));
-    let gone = wait_daemon_gone(procs, port, pid, Duration::from_secs(10));
-    let need_end = if !gone {
-        true
-    } else if !report.reachable {
-        match ctl.query_named(&w, name) {
-            TaskQuery::Running => true,
-            TaskQuery::NotRunning(_) | TaskQuery::NotFound => false,
-            TaskQuery::QueryFailed(detail) => {
-                report.detail = format!("RPC 不可達且工作狀態查詢失敗：{detail}");
-                let _ = ctl.release_autostart(&hold, Some(true), false);
-                return report;
-            }
-        }
-    } else {
-        false
-    };
-    let mut ok = true;
-    if need_end {
-        report.ran_end = true;
-        let end = argv(&["schtasks", "/End", "/TN", name]);
-        let rc = env.run(&end, Some(CMD_TIMEOUT)).map(|o| o.rc).unwrap_or(-1);
-        report.ran.push((end, rc));
-        ok = rc == 0 && wait_daemon_gone(procs, port, pid, Duration::from_secs(5));
-        if !ok {
-            report.detail = format!("/End rc={rc} 或 /End 後 daemon 仍在");
-        }
-    }
-    match ctl.release_autostart(&hold, Some(true), false) {
-        Ok(ran) => report.ran.extend(ran.iter().map(|c| (c.argv.clone(), c.rc))),
-        Err(failure) => {
-            ok = false;
-            report.detail.push_str(&format!("；重新啟用失敗：{failure:?}"));
-        }
-    }
-    report.ok = ok;
-    report
 }
 
 /// harness（正式 `serialwrap service stop`）的結果。
@@ -1031,17 +965,118 @@ pub struct FormalStopReport {
 
 /// 解析 harness stdout 的最後一行 JSON（sw-cli `ScopedStopReport::to_json`）。
 pub fn parse_harness_output(stdout: &str) -> Result<FormalStopReport, String> {
-    todo!("P8-T13: parse_harness_output {stdout}")
+    let line = stdout
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| "harness stdout 為空".to_string())?;
+    let value = parse_json(line).map_err(|error| format!("harness JSON 無效：{error}"))?;
+    if !matches!(&value, Json::Obj(_)) {
+        return Err("harness JSON 根節點必須是物件".into());
+    }
+    let string = |value: &Json, key: &str| {
+        value
+            .get(key)
+            .and_then(Json::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| format!("harness JSON 缺字串欄位 {key}"))
+    };
+    let integer = |value: &Json, key: &str| match value.get(key) {
+        Some(Json::Num(number)) if number.fract() == 0.0 && *number >= f64::from(i32::MIN) && *number <= f64::from(i32::MAX) => Ok(*number as i32),
+        _ => Err(format!("harness JSON 缺合法整數欄位 {key}")),
+    };
+    let strings = |value: &Json, key: &str| -> Result<Vec<String>, String> {
+        value
+            .get(key)
+            .and_then(Json::as_arr)
+            .ok_or_else(|| format!("harness JSON 缺陣列欄位 {key}"))?
+            .iter()
+            .map(|value| value.as_str().map(str::to_string).ok_or_else(|| format!("harness 欄位 {key} 必須只含字串")))
+            .collect()
+    };
+    let rc = integer(&value, "rc")?;
+    let stdout = string(&value, "stdout")?;
+    let stderr = string(&value, "stderr")?;
+    let refused = strings(&value, "refused")?;
+    let rpc = strings(&value, "rpc")?;
+    let ran_values = value
+        .get("ran")
+        .and_then(Json::as_arr)
+        .ok_or_else(|| "harness JSON 缺陣列欄位 ran".to_string())?;
+    let mut ran = Vec::new();
+    for value in ran_values {
+        if !matches!(value, Json::Obj(_)) {
+            return Err("harness ran 項目必須是物件".into());
+        }
+        let argv = strings(value, "argv")?;
+        if argv.is_empty() {
+            return Err("harness ran.argv 不得為空".into());
+        }
+        ran.push((argv, integer(value, "rc")?));
+    }
+    let cli_value = parse_json(stdout.trim())
+        .map_err(|error| format!("正式 CLI stdout JSON 無效：{error}"))?;
+    if !matches!(&cli_value, Json::Obj(_)) {
+        return Err("正式 CLI stdout JSON 根節點必須是物件".into());
+    }
+    let cli_ok = cli_value.get("ok").and_then(Json::as_bool) == Some(true);
+    let graceful = match cli_value.get("graceful") {
+        Some(Json::Bool(value)) => Some(*value),
+        None => None,
+        _ => return Err("正式 CLI graceful 欄位必須是布林".into()),
+    };
+    let ran_end = ran.iter().any(|(argv, _)| {
+        argv.len() >= 2 && argv[0].eq_ignore_ascii_case("schtasks") && argv[1].to_ascii_lowercase() == "/end"
+    });
+    let sent_stop = rpc.iter().any(|method| method == "daemon.stop");
+    Ok(FormalStopReport {
+        cli_rc: rc,
+        cli_stdout: stdout,
+        cli_stderr: stderr,
+        ok: rc == 0 && cli_ok && refused.is_empty(),
+        graceful,
+        ran,
+        rpc,
+        refused,
+        ran_end,
+        sent_stop,
+    })
 }
 
 /// 實跑測試執行檔旁的 harness（win-runner 把 `SW_WIN_EXTRA_FILES` 複製到測試執行檔所在目錄）；缺檔 → `Err`（證據不足）。
 pub fn locate_harness() -> Result<PathBuf, String> {
-    todo!("P8-T13: locate_harness")
+    let executable = std::env::current_exe().map_err(|error| format!("取得測試執行檔路徑失敗：{error}"))?;
+    let harness = executable.with_file_name(HARNESS_EXE);
+    if harness.is_file() {
+        Ok(harness)
+    } else {
+        Err(format!("正式停止 harness 不存在（證據不足）：{}", harness.display()))
+    }
 }
 
 /// 以 harness 執行正式 `serialwrap service stop`（P4 `graceful_stop`），只操作測試工作 `task` 與 staging 埠。
 pub fn formal_service_stop(env: &dyn SysEnv, harness: &Path, spec: &StagingSpec, task: &str) -> Result<FormalStopReport, String> {
-    todo!("P8-T13: formal_service_stop {} {} {task} {}", harness.display(), spec.port, env.pid())
+    if !harness.is_file() {
+        return Err(format!("正式停止 harness 不存在：{}", harness.display()));
+    }
+    if spec.port == 0 || spec.port == PRODUCTION_PORT {
+        return Err(format!("測試 RPC 埠不得為 0 或正式埠 {PRODUCTION_PORT}"));
+    }
+    assert_test_task_name(task);
+    let argv = spec.harness_argv(&harness.to_string_lossy(), task);
+    let output = env
+        .run(&argv, Some(CMD_TIMEOUT))
+        .map_err(|error| format!("執行正式停止 harness 失敗：{}", error.py_message))?;
+    if output.rc != 0 {
+        return Err(format!(
+            "正式停止 harness rc={} stderr={} stdout={}",
+            output.rc,
+            output.stderr.trim(),
+            output.stdout.trim()
+        ));
+    }
+    parse_harness_output(&output.stdout)
 }
 
 /// 測試工作與 staging daemon 的收尾守衛：成功或 panic 都會執行（`Drop`）；`finish` 另檢查無殘留。
@@ -1067,8 +1102,6 @@ impl TaskGuard {
 
     fn cleanup(&self) -> Vec<String> {
         let mut errors = Vec::new();
-        let end = argv(&["schtasks", "/End", "/TN", &self.name]);
-        let _ = self.env.run(&end, Some(CMD_TIMEOUT));
         for record in self.ctl.uninstall_named(&SupervisionMode::WindowsTask, &self.name, false) {
             if record.rc != 0 && !matches!(self.ctl.query_named(&SupervisionMode::WindowsTask, &self.name), TaskQuery::NotFound) {
                 errors.push(format!("{:?} rc={}", record.argv, record.rc));
@@ -1115,7 +1148,7 @@ impl Drop for TaskGuard {
 // WAL：最後一筆完整（`raw.wal.ndjson` 最後一行以 \n 結尾、可解析、crc32 相符）
 // ---------------------------------------------------------------------------
 
-/// WAL 尾端狀態。零 session（擁有者防線要求不開任何 COM）時 daemon 不寫任何紀錄，結果為 `Absent`／`Empty`。
+/// WAL 尾端狀態。T13 test-fakes staging hook 以 COM250 寫入可辨認紀錄，不開啟任何 UART。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalTail {
     Absent,
@@ -1170,12 +1203,47 @@ pub fn wal_tail_state(dir: &Path) -> WalTail {
 /// 停止後 WAL 最後一筆完整的證據：只接受至少一筆紀錄且最後一筆可解析、CRC 相符（`Complete`），回傳（筆數, 最後 seq）。
 /// 沒有 WAL 或 WAL 為空 → `Err`（證據不足，不得計為 PASS）；最後一筆不完整 → `Err`（失敗）。
 pub fn wal_evidence(dir: &Path) -> Result<(usize, u64), String> {
-    todo!("P8-T13: wal_evidence {}", dir.display())
+    match wal_tail_state(dir) {
+        WalTail::Complete { records, last_seq } if records > 0 => Ok((records, last_seq)),
+        WalTail::Absent => Err(format!("證據不足：{} 不存在", dir.join("raw.wal.ndjson").display())),
+        WalTail::Empty => Err(format!("證據不足：{} 為空", dir.join("raw.wal.ndjson").display())),
+        WalTail::Complete { .. } => Err("證據不足：WAL 沒有紀錄".into()),
+        WalTail::Torn(reason) => Err(format!("WAL 尾端不完整：{reason}")),
+    }
 }
 
-/// plan API：最後一筆完整（`Torn` 以外皆為 true；零紀錄時沒有可截斷的紀錄）。
+/// 只有至少一筆紀錄且最後一筆 CRC 完整時回 true。
 pub fn wal_last_line_crc_ok(dir: &Path) -> bool {
-    !matches!(wal_tail_state(dir), WalTail::Torn(_))
+    matches!(wal_tail_state(dir), WalTail::Complete { records, .. } if records > 0)
+}
+
+/// 除了完整 WAL tail，也要求最後一筆是 staging daemon 的指定 test-fakes 紀錄。
+pub fn wal_test_record_evidence(dir: &Path) -> Result<(usize, u64), String> {
+    let evidence = wal_evidence(dir)?;
+    let path = dir.join("raw.wal.ndjson");
+    let bytes = std::fs::read(&path).map_err(|error| format!("讀取 {} 失敗：{error}", path.display()))?;
+    let text = std::str::from_utf8(&bytes).map_err(|error| format!("WAL 不是 UTF-8：{error}"))?;
+    let line = text
+        .split('\n')
+        .rev()
+        .map(|line| line.trim_end_matches('\r'))
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| "證據不足：WAL 沒有紀錄".to_string())?;
+    let record = parse_json(line).map_err(|error| format!("最後一筆 WAL JSON 無效：{error}"))?;
+    let valid = record.get("com").and_then(Json::as_str) == Some(ALLOWLIST_COM)
+        && record.get("dir").and_then(Json::as_str) == Some("RX")
+        && record.get("source").and_then(Json::as_str) == Some("test")
+        && record
+            .get("payload_b64")
+            .and_then(Json::as_str)
+            .and_then(b64_decode)
+            .as_deref()
+            == Some(TEST_WAL_PAYLOAD);
+    if valid {
+        Ok(evidence)
+    } else {
+        Err("最後一筆 WAL 不是 T13 staging daemon 的指定測試紀錄".into())
+    }
 }
 
 /// CRC-32（IEEE 802.3，與 `crc32fast`／zlib 相同）。

@@ -89,10 +89,10 @@ fn base() -> TestEnv {
 
 /// staging 變數：`SERIALWRAP_CONFIG` 指向 windows-task 的 CLI config，目錄沿用 TestEnv 的隔離暫存目錄。
 fn request(t: &TestEnv) -> ScopedStopRequest {
-    let state = t.state_dir();
-    std::fs::create_dir_all(&state).expect("state dir");
+    std::fs::create_dir_all(t.config_dir()).expect("config dir");
+    std::fs::create_dir_all(t.state_dir()).expect("state dir");
     std::fs::create_dir_all(t.run_dir()).expect("run dir");
-    let cfg = state.join("cli-config.yaml");
+    let cfg = t.config_dir().join("cli-config.yaml");
     std::fs::write(&cfg, "supervision_mode: windows-task\n").expect("cli config");
     let path = |p: std::path::PathBuf| p.display().to_string();
     ScopedStopRequest {

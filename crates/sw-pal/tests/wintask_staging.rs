@@ -341,6 +341,25 @@ fn wal_without_records_is_insufficient_evidence() {
     assert!(!wal_last_line_crc_ok(dir.path()));
 }
 
+#[test]
+fn wal_test_record_evidence_requires_the_staging_daemon_record() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wal = dir.path().join("raw.wal.ndjson");
+    let crc = crc32(TEST_WAL_PAYLOAD);
+    let row = |source: &str| {
+        format!(
+            r#"{{"seq":4,"com":"COM250","dir":"RX","source":"{source}","payload_b64":"{}","crc32":"{crc:08x}"}}"#,
+            b64(TEST_WAL_PAYLOAD)
+        )
+    };
+    std::fs::write(&wal, format!("{}\n", row("test"))).unwrap();
+    assert_eq!(wal_test_record_evidence(dir.path()), Ok((1, 4)));
+
+    std::fs::write(&wal, format!("{}\n", row("uart"))).unwrap();
+    let wrong_source = wal_test_record_evidence(dir.path()).expect_err("一般 UART 紀錄不能代替 staging hook 證據");
+    assert!(wrong_source.contains("指定測試紀錄"), "{wrong_source}");
+}
+
 /// sw-cli `ScopedStopReport::to_json` 的實際輸出（`crates/sw-cli/tests/wintask_scoped_stop.rs` 以同一字串驗證產生端）。
 const REPORT_JSON: &str = r#"{"ran":[{"argv":["schtasks","/Change","/TN","sw-p8-test-4242","/DISABLE"],"rc":0},{"argv":["schtasks","/Change","/TN","sw-p8-test-4242","/ENABLE"],"rc":0}],"rc":0,"refused":[],"rpc":["health.status","daemon.stop","health.ping"],"stderr":"","stdout":"{\"action\":\"stop\",\"graceful\":true,\"mode\":\"windows-task\",\"ok\":true}\n"}"#;
 

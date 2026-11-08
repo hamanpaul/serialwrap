@@ -15,9 +15,15 @@
 #[allow(dead_code)]
 mod wintask;
 
+use std::path::PathBuf;
+
+use sw_core::wal::{WalConfig, WalWriter};
 use sw_daemon::daemon_main::resolve_test_allowlist;
 use sw_daemon::service::TestAllowlist;
 use sw_pal::fakes::env::FakeEnv;
+use sw_pal::fakes::clock::FakeClock;
+use sw_pal::fakes::sysenv::FakeSysEnv;
+use sw_pal::fakes::wal_fs::FakeWalFs;
 use sw_proto::config_types::RuntimeConfig;
 use sw_proto::pypath::{HomeLookup, PathFlavor};
 use sw_proto::runtime_paths::{EnvSnapshot, NativeTraits, RuntimePaths};
@@ -160,4 +166,59 @@ fn every_isolation_var_comes_from_the_batch() {
         let reason = decide(env, &s).rejected_reason.unwrap_or_else(|| panic!("缺 {var} 必須拒絕"));
         assert!(reason.contains(var), "{var}: {reason}");
     }
+}
+
+/// test-fakes daemon hook 寫入可辨認的 WAL 紀錄；hook 沒有序列埠後端參數，不會開啟 COM。
+#[test]
+fn t13_staging_wal_hook_writes_verifiable_record_without_uart() {
+    let marker_path = PathBuf::from("/stage/wal/t13-record.seed");
+    let env = FakeSysEnv::builder()
+        .var(
+            sw_daemon::daemon_main::ENV_TEST_T13_WAL_RECORD,
+            &marker_path.to_string_lossy(),
+        )
+        .build();
+    let fs = sw_pal::fakes::fs::MemFs::default();
+    fs.files
+        .lock()
+        .unwrap()
+        .insert(marker_path, Ok(sw_daemon::daemon_main::T13_WAL_TEST_PAYLOAD.to_vec()));
+    let wal_fs = FakeWalFs::new();
+    let wal_dir = PathBuf::from("/stage/wal");
+    let wal = WalWriter::open(
+        WalConfig {
+            dir: wal_dir.clone(),
+            rotate_bytes: sw_proto::constants::DEFAULT_WAL_ROTATE_BYTES,
+        },
+        wal_fs.clone(),
+        FakeClock::new(),
+    );
+    let allow = TestAllowlist {
+        enabled: true,
+        coms: vec![ALLOWLIST_COM.into()],
+        source: "env",
+        rejected_reason: None,
+    };
+
+    assert_eq!(
+        sw_daemon::daemon_main::append_t13_staging_wal_record(&*env, &fs, &wal, &allow),
+        Ok(true)
+    );
+    let bytes = wal_fs
+        .contents(&wal_dir.join("raw.wal.ndjson"))
+        .expect("daemon hook 必須 append WAL 紀錄");
+    assert!(bytes.ends_with(b"\n"), "WAL 紀錄必須以換行結尾");
+    let line = std::str::from_utf8(&bytes).expect("WAL 為 UTF-8").trim_end();
+    let value = sw_proto::pyjson::loads(line).expect("WAL 紀錄必須是合法 JSON");
+    assert_eq!(value.get("com").and_then(|v| v.as_str()), Some(ALLOWLIST_COM));
+    assert_eq!(value.get("dir").and_then(|v| v.as_str()), Some("RX"));
+    assert_eq!(value.get("source").and_then(|v| v.as_str()), Some("test"));
+    assert_eq!(
+        value
+            .get("payload_b64")
+            .and_then(|v| v.as_str())
+            .and_then(wintask::b64_decode),
+        Some(sw_daemon::daemon_main::T13_WAL_TEST_PAYLOAD.to_vec())
+    );
+    wal.shutdown().expect("WAL 收尾");
 }
