@@ -1030,6 +1030,322 @@ fn wp53_rpc_passthrough_flag_followup_tx_not_gated() {
     );
 }
 
+// WP5-3 第 5 項：`command_expect_reboot` WAL META 與 RPC→UART 端到端（G3；Python
+// `origin/main:sw_core/session_manager.py:6840-6868`、契約 `contracts/wal_meta_events.schema.json:63-85`）。
+// 呼叫路徑：`Service::rpc(command.submit)` → `SubmitReq{expect_reboot}` → `SessionRequest::Submit` →
+// `SessionCore::submit` → queue → `start_next` → `OpSpec::Command` → `OpRunner::execute` → `run_command`
+// （先寫 `command_expect_reboot` META，再分流 `run_reboot`）→ `TxWriter` → FakeDevice＋WAL → `op_finished` →
+// registry → `command.get`。
+
+/// `command.get` 的命令紀錄鍵（Python `origin/main:sw_core/arbiter.py:237-259` 的 rec 順序）。
+const WP53_RECORD_KEYS: [&str; 22] = [
+    "cmd_id",
+    "session_id",
+    "command",
+    "source",
+    "mode",
+    "execution_mode",
+    "timeout_s",
+    "expected_duration_s",
+    "completion_regex",
+    "expect_reboot",
+    "priority",
+    "status",
+    "created_at",
+    "accepted_at",
+    "started_at",
+    "done_at",
+    "error_code",
+    "stdout",
+    "partial",
+    "background_capture_id",
+    "interactive_session_id",
+    "recovery_action",
+];
+
+/// 每次執行都不同的紀錄欄位：ID 與時間戳取實測值，其餘欄位必須等於呼叫端給的字面值。
+const WP53_RECORD_DYNAMIC: [&str; 5] =
+    ["cmd_id", "created_at", "accepted_at", "started_at", "done_at"];
+
+/// `command.get` 的完整預期回應：動態欄位取實測值（且必須非 null），其餘依 `fixed`；
+/// `session_id` 由 manager 解析，`source_class` 依 `_annotate_source` 接在最後。
+fn wp53_expected_get(r: &ServiceRig, measured: &PyDict, fixed: &PyDict) -> String {
+    let mut record = PyDict::new();
+    for key in WP53_RECORD_KEYS {
+        let value = if WP53_RECORD_DYNAMIC.contains(&key) {
+            let value = measured
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| panic!("實測紀錄缺 {key}：{}", j(measured)));
+            assert!(!value.is_null(), "{key} 應已填值：{}", j(measured));
+            value
+        } else if key == "session_id" {
+            PyValue::from(r.mgr.resolve("COM0").expect("COM0 session"))
+        } else {
+            fixed
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| panic!("預期缺 {key}"))
+        };
+        record.insert(key, value);
+    }
+    record.insert("source_class", PyValue::from("agent"));
+    j(&sw_proto::pydict! {
+        "ok" => true,
+        "command" => PyValue::Dict(record),
+        "version" => r.version.clone(),
+    })
+}
+
+/// WAL 內屬於 `cmd_id` 的全部紀錄（任何 dir），依寫入順序。
+fn wp53_wal_rows(r: &ServiceRig, cmd_id: &str) -> Vec<PyDict> {
+    let bytes = r.wfs.contents(WP55_WAL.as_ref()).unwrap_or_default();
+    String::from_utf8(bytes)
+        .expect("WAL 應為 UTF-8")
+        .lines()
+        .filter_map(|line| {
+            let PyValue::Dict(record) = sw_proto::pyjson::loads(line).expect("WAL 行應為 JSON")
+            else {
+                panic!("WAL 行應為 object：{line}");
+            };
+            (record.get("cmd_id") == Some(&PyValue::from(cmd_id))).then_some(record)
+        })
+        .collect()
+}
+
+/// 去除 `seq`／`mono_ts_ns`／`wall_ts` 後的 WAL 紀錄（WAL 落盤為 sort_keys，載回順序即落盤順序）。
+fn wp53_wal_static(row: &PyDict) -> String {
+    let pairs = row
+        .0
+        .iter()
+        .filter(|(k, _)| !["seq", "mono_ts_ns", "wall_ts"].contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    j(&PyDict::from_pairs(pairs))
+}
+
+/// 旗標命令本 cmd_id 的 WAL 恰為 [`command_expect_reboot` META, 命令 TX]，META 外層形狀符合契約、seq 較小；
+/// `wal_tx` 為 TX 的 (source, 原始 bytes)。
+fn assert_wp53_wal_meta_then_tx(r: &ServiceRig, case: &str, cmd_id: &str, wal_tx: (&str, &[u8])) {
+    let rows = wp53_wal_rows(r, cmd_id);
+    assert_eq!(rows.len(), 2, "{case}：本 cmd_id 恰 META＋TX 兩筆：{rows:?}");
+    assert_eq!(
+        wp53_wal_static(&rows[0]),
+        format!(
+            "{{\"cmd_id\":\"{cmd_id}\",\"com\":\"COM0\",\"crc32\":\"00000000\",\"dir\":\"META\",\"len\":0,\
+             \"loss_flag\":false,\"meta\":{{\"event\":\"command_expect_reboot\",\"expect_reboot\":true}},\
+             \"payload_b64\":\"\",\"source\":\"system\"}}"
+        ),
+        "{case}：第一筆為契約形狀的 command_expect_reboot META"
+    );
+    assert_eq!(s(&rows[1], "dir"), "TX", "{case}：{}", j(&rows[1]));
+    assert_eq!(s(&rows[1], "source"), wal_tx.0, "{case}");
+    assert_eq!(
+        s(&rows[1], "payload_b64"),
+        wp55_b64(wal_tx.1),
+        "{case}：WAL TX 為本命令完整一行"
+    );
+    let seq = |row: &PyDict| row.get("seq").and_then(PyValue::as_i64).expect("seq");
+    assert!(
+        seq(&rows[0]) < seq(&rows[1]),
+        "{case}：META seq {} 須小於 TX seq {}",
+        seq(&rows[0]),
+        seq(&rows[1])
+    );
+}
+
+/// 對照 `tests/test_expect_reboot.py::test_flag_routes_chained_command_to_reboot_handler`（META）、
+/// `::test_chained_command_prompt_after_pre_segment_is_not_treated_as_recovery`（3 s 後 prompt 仍成功）與
+/// `::test_flag_does_not_bypass_autoboot_quiet_gate`（後續 agent 命令被 gate）：RPC 提交旗標串接命令
+/// （`timeout_s:1`、`expected_duration_s:5`），submit 回聲逐位元組；UART 恰送出本命令一行；3 s 內不結算，
+/// 3 s 後注入 prompt → `command.get` 完整等於正常完成；WAL 為 [META, TX]；下一筆 shell agent 命令以 pending-only
+/// `AUTOBOOT_QUIET` 拒絕，UART／WAL／registry／queue 前後不變（零 TX）。
+#[test]
+fn wp53_rpc_flag_route_wal_and_followup_gate() {
+    let r = ServiceRig::ready_shell();
+    let dev = r.device(REAL_A);
+    r.settle();
+    let tx_mark = dev.tx_len();
+    let response = r.call(
+        "command.submit",
+        &format!(
+            r#"{{"selector":"COM0","cmd":"{WP53_CHAINED}","timeout_s":1,"expected_duration_s":5,"expect_reboot":true}}"#
+        ),
+    );
+    let cmd_id = s(&response, "cmd_id").to_string();
+    assert_eq!(j(&response), wp52_submit_echo(&r, &cmd_id, true), "submit 回聲");
+    let line = format!("{WP53_CHAINED}\n");
+    wait_until("UART 送出本命令", || {
+        dev.tx_since(tx_mark).starts_with(line.as_bytes())
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    let start = r.clock.elapsed();
+    while (r.clock.elapsed() - start).as_secs_f64() < 3.0 {
+        let record = sub(
+            &r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#)),
+            "command",
+        );
+        assert_eq!(
+            record.get("done_at"),
+            Some(&PyValue::Null),
+            "期限 max(1, 5) = 5 s，3 s 內不得結算：{}",
+            j(&record)
+        );
+        r.clock.advance(Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(80));
+    }
+    dev.push_rx(b"\r\nroot@t:/# ");
+    let measured = wp55_wait_done(&r, &cmd_id);
+    let get = r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+    let fixed = sw_proto::pydict! {
+        "command" => WP53_CHAINED,
+        "source" => "agent",
+        "mode" => "line",
+        "execution_mode" => "line",
+        "timeout_s" => 1.0,
+        "expected_duration_s" => 5.0,
+        "completion_regex" => PyValue::Null,
+        "expect_reboot" => true,
+        "priority" => 10,
+        "status" => "done",
+        "error_code" => PyValue::Null,
+        "stdout" => "",
+        "partial" => false,
+        "background_capture_id" => PyValue::Null,
+        "interactive_session_id" => PyValue::Null,
+        "recovery_action" => PyValue::Null,
+    };
+    assert_eq!(
+        j(&get),
+        wp53_expected_get(&r, &measured, &fixed),
+        "command.get 終態"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&dev.tx_since(tx_mark)),
+        line,
+        "UART 恰送出本命令一行（無救援鍵）"
+    );
+    r.settle();
+    assert_wp53_wal_meta_then_tx(&r, "shell 串接", &cmd_id, ("agent", line.as_bytes()));
+
+    let session = r.session("COM0").expect("COM0 session");
+    assert_eq!(session.get("state"), Some(&PyValue::from("READY")), "{}", j(&session));
+    assert_eq!(
+        session.get("ready_reconfirm_pending"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&session)
+    );
+    let expected = sw_proto::pydict! {
+        "ok" => false,
+        "error_code" => "AUTOBOOT_QUIET",
+        "retry_after_s" => 5.0,
+        "hint" => WP53_RECONFIRM_HINT,
+        "session" => PyValue::Dict(session.clone()),
+        "version" => r.version.clone(),
+    };
+    assert_wp52_rpc_rejected_without_side_effects(
+        &r,
+        r#"{"selector":"COM0","cmd":"ls","timeout_s":10}"#,
+        &j(&expected),
+    );
+}
+
+/// passthrough（裁決 s2 D2）：RPC 提交旗標 `reset`，submit 回聲逐位元組；UART 恰送出 `reset\n`；`command.get`
+/// 完整等於正常完成；WAL 為 [META, TX]（passthrough 也寫 META）；完成後下一筆合法 agent 命令經 RPC 真正送上 UART、
+/// WAL 有其 TX、`command.get` 完整等於 `done`。
+#[test]
+fn wp53_rpc_passthrough_flag_route_and_followup_tx() {
+    let r = wp53_passthrough_ready();
+    let dev = r.device(REAL_A);
+    dev.on_tx_reply(b"reset\n", b"reset\r\nresetting ...\r\n=> ");
+    let tx_mark = dev.tx_len();
+    let response = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"reset","timeout_s":6,"expect_reboot":true}"#,
+    );
+    let cmd_id = s(&response, "cmd_id").to_string();
+    assert_eq!(j(&response), wp52_submit_echo(&r, &cmd_id, true), "submit 回聲");
+    let measured = wp55_wait_done(&r, &cmd_id);
+    let get = r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+    let fixed = sw_proto::pydict! {
+        "command" => "reset",
+        "source" => "agent",
+        "mode" => "line",
+        "execution_mode" => "line",
+        "timeout_s" => 6.0,
+        "expected_duration_s" => PyValue::Null,
+        "completion_regex" => PyValue::Null,
+        "expect_reboot" => true,
+        "priority" => 10,
+        "status" => "done",
+        "error_code" => PyValue::Null,
+        "stdout" => "resetting ...",
+        "partial" => false,
+        "background_capture_id" => PyValue::Null,
+        "interactive_session_id" => PyValue::Null,
+        "recovery_action" => PyValue::Null,
+    };
+    assert_eq!(
+        j(&get),
+        wp53_expected_get(&r, &measured, &fixed),
+        "command.get 終態"
+    );
+    assert_eq!(String::from_utf8_lossy(&dev.tx_since(tx_mark)), "reset\n");
+    r.settle();
+    assert_wp53_wal_meta_then_tx(&r, "passthrough reset", &cmd_id, ("agent", b"reset\n"));
+
+    dev.on_tx_reply(b"printenv\n", b"printenv\r\nbootcmd=x\r\n=> ");
+    let tx_mark = dev.tx_len();
+    let response = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"printenv","timeout_s":10}"#,
+    );
+    let next_id = s(&response, "cmd_id").to_string();
+    assert_eq!(j(&response), wp52_submit_echo(&r, &next_id, false), "後續命令 submit 回聲");
+    let measured = wp55_wait_done(&r, &next_id);
+    let get = r.call("command.get", &format!(r#"{{"cmd_id":"{next_id}"}}"#));
+    let fixed = sw_proto::pydict! {
+        "command" => "printenv",
+        "source" => "agent",
+        "mode" => "line",
+        "execution_mode" => "line",
+        "timeout_s" => 10.0,
+        "expected_duration_s" => PyValue::Null,
+        "completion_regex" => PyValue::Null,
+        "expect_reboot" => false,
+        "priority" => 10,
+        "status" => "done",
+        "error_code" => PyValue::Null,
+        "stdout" => "bootcmd=x",
+        "partial" => false,
+        "background_capture_id" => PyValue::Null,
+        "interactive_session_id" => PyValue::Null,
+        "recovery_action" => PyValue::Null,
+    };
+    assert_eq!(
+        j(&get),
+        wp53_expected_get(&r, &measured, &fixed),
+        "後續命令 command.get 終態"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&dev.tx_since(tx_mark)),
+        "printenv\n",
+        "UART 實際寫出後續命令"
+    );
+    assert_eq!(
+        wp55_wal_tx(&r, &next_id),
+        vec![("agent".to_string(), wp55_b64(b"printenv\n"))],
+        "WAL 須有後續命令的完整 TX"
+    );
+    assert!(
+        wp53_wal_rows(&r, &next_id)
+            .iter()
+            .all(|row| row.get("dir") != Some(&PyValue::from("META"))),
+        "無旗標後續命令不寫 META"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // WP5-5 第 3 項：可信 human 命令的 TX gate 端到端（G7a、G7b、OD-74、rulings s2 D5）
 //
