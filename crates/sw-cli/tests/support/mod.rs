@@ -1873,6 +1873,11 @@ impl TestEnv {
         self.env.calls()
     }
 
+    /// 本 TestEnv 的 `SysEnv` 替身（P8 Task 13：存活模型需觀察 `/End` 是否已執行時使用）。
+    pub fn sysenv(&self) -> Arc<FakeSysEnv> {
+        Arc::clone(&self.env)
+    }
+
     pub fn rpc(&self) -> &Arc<FakeRpcConnector> {
         &self.rpc
     }
