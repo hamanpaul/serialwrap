@@ -182,10 +182,15 @@ struct RetiredPlaceholder {
     previous_interactive: Vec<(String, String)>,
 }
 
-/// 進行中的 attach worker（per by_id 去重；`cancelled` 由裝置變更／bind／shutdown 設定）。
+static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// 進行中的 attach worker（per by_id 去重；`cancelled` 由裝置變更／bind／shutdown／release 設定）。
 #[derive(Clone)]
 struct AttachOp {
+    token: u64,
     cancelled: Arc<AtomicBool>,
+    /// `device.release` 專用：在途佔位開埠由 release 撤銷，收尾需清除對應 actor stall。
+    release_requested: Arc<AtomicBool>,
     /// clear 收尾的再 attach（`Effect::Reattach`）：session 已是 ATTACHING 但未開埠，仍須再解析（審查 F62）。
     /// 在途 op 與 clear 重疊時由 `spawn_attach_with` OR 進來，避免該次再解析遺失（審查 F98）。
     after_clear: Arc<AtomicBool>,
@@ -198,7 +203,9 @@ struct AttachOp {
 impl AttachOp {
     fn new(after_clear: bool, dynamic_only: bool, preopened: Option<Preopened>) -> AttachOp {
         AttachOp {
+            token: NEXT_ATTACH_OP_TOKEN.fetch_add(1, Ordering::Relaxed),
             cancelled: Arc::new(AtomicBool::new(false)),
+            release_requested: Arc::new(AtomicBool::new(false)),
             after_clear: Arc::new(AtomicBool::new(after_clear)),
             dynamic_only,
             preopened: Arc::new(Mutex::new(preopened)),
@@ -305,6 +312,9 @@ struct Shared {
     /// WAL unhealthy」的競態；sol-backfill p5 #6）。
     #[cfg(feature = "test-fakes")]
     probe_pre_submit_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// 只供測試（test-fakes）：佔位 release 取得在途 op 後、取消標記前的競態暫停點。
+    #[cfg(feature = "test-fakes")]
+    placeholder_release_cancel_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// 載入的 state.json 含孤立 surrogate（`LoadedState::lone_surrogates`；啟動存檔前檢查）。
     lone_surrogates: bool,
     /// 啟動存檔重現的 Python 未捕捉例外末行（`_save_state` 的 `UnicodeEncodeError`）；daemon 據此 exit 1。
@@ -566,6 +576,43 @@ fn str_of(d: &PyDict, key: &str) -> Option<String> {
 
 fn is_ok(d: &PyDict) -> bool {
     d.get("ok") == Some(&PyValue::Bool(true))
+}
+
+/// 持有 manager lock 時只把 safety request 排入 actor mailbox；回覆須於解鎖後等待。
+fn enqueue_safety_request(
+    actor: &ActorHandle,
+    req: SessionRequest,
+    timeout: Duration,
+) -> Result<Receiver<Result<PyDict, PyErr>>, PyErr> {
+    let (reply, rx) = crossbeam_channel::bounded(1);
+    actor
+        .safety
+        .send_timeout(ControlEvent::Request { req, reply }, timeout)
+        .map_err(|error| match error {
+            crossbeam_channel::SendTimeoutError::Timeout(_) => {
+                PyErr::value_error("internal timeout")
+            }
+            crossbeam_channel::SendTimeoutError::Disconnected(_) => {
+                PyErr::value_error("session actor stopped")
+            }
+        })?;
+    Ok(rx)
+}
+
+/// 等待先前已排入 actor mailbox 的 request 回覆。
+fn await_actor_reply(
+    rx: Receiver<Result<PyDict, PyErr>>,
+    timeout: Duration,
+) -> Result<PyDict, PyErr> {
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+            Err(PyErr::value_error("internal timeout"))
+        }
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+            Err(PyErr::value_error("session actor stopped"))
+        }
+    }
 }
 
 impl Shared {
@@ -1452,6 +1499,25 @@ impl Shared {
             .get(by_id)
             .is_some_and(|current| Arc::ptr_eq(&current.cancelled, &op.cancelled))
         {
+            if op.release_requested.load(Ordering::SeqCst) {
+                if let Some(actor) = inner
+                    .session_by_id(by_id)
+                    .map(|entry| entry.actor.clone())
+                {
+                    if let Err(error) = enqueue_safety_request(
+                        &actor,
+                        SessionRequest::PlaceholderAttachSettled { token: op.token },
+                        QUERY_TIMEOUT,
+                    ) {
+                        // actor 無法確認清除時保留 inflight，讓後續操作維持 recovering 阻擋。
+                        self.warn(format!(
+                            "placeholder attach 收尾通知失敗（by_id={by_id} token={}）：{}",
+                            op.token, error.message
+                        ));
+                        return;
+                    }
+                }
+            }
             inner.inflight.remove(by_id);
         }
         drop(inner);
@@ -2952,6 +3018,8 @@ impl SessionManager {
             path_flavor: caps.path_flavor,
             #[cfg(feature = "test-fakes")]
             probe_pre_submit_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            placeholder_release_cancel_hook: Mutex::new(None),
         });
         shared.bootstrap_sessions(&load.profiles);
         let mgr = Arc::new(SessionManager {
@@ -3190,44 +3258,61 @@ impl SessionManager {
             let Some(op) = inner.inflight.get(&by_id).cloned() else {
                 return Ok(None);
             };
+            // 與 `retire_released_placeholder_locked` 共用 manager lock：若 release 已取得 op，
+            // 後續的 attach 收尾就不能先通過退休檢查。
+            op.cancelled.store(true, Ordering::SeqCst);
+            op.release_requested.store(true, Ordering::SeqCst);
+            #[cfg(feature = "test-fakes")]
+            if let Some(hook) = lock(&self.shared.placeholder_release_cancel_hook).as_ref() {
+                hook();
+            }
             (by_id, op)
         };
 
-        op.cancelled.store(true, Ordering::SeqCst);
+        let epoch = self
+            .shared
+            .session_public(sid)
+            .and_then(|session| session.get("bridge_generation").and_then(PyValue::as_i64))
+            .unwrap_or(0)
+            .max(0) as u64;
         let deadline = Instant::now() + ATTACH_OP_WAIT;
-        let mut inner = lock(&self.shared.inner);
-        loop {
-            let same_op = inner
-                .inflight
-                .get(&by_id)
-                .is_some_and(|current| Arc::ptr_eq(&current.cancelled, &op.cancelled));
-            if !same_op {
-                return Ok(None);
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                drop(inner);
-                let epoch = self
+        let stalled_reply = {
+            let mut inner = lock(&self.shared.inner);
+            loop {
+                let same_op = inner
+                    .inflight
+                    .get(&by_id)
+                    .is_some_and(|current| Arc::ptr_eq(&current.cancelled, &op.cancelled));
+                if !same_op {
+                    return Ok(None);
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    let Some(actor) = inner.sessions.get(sid).map(|entry| entry.actor.clone())
+                    else {
+                        return Ok(None);
+                    };
+                    // 與完成收尾共用 manager lock，先排入 timeout 再允許 worker 排入同 token 的 settled。
+                    break enqueue_safety_request(
+                        &actor,
+                        SessionRequest::PlaceholderAttachStalled {
+                            token: op.token,
+                            epoch,
+                        },
+                        QUERY_TIMEOUT,
+                    )?;
+                }
+                let (next, _) = self
                     .shared
-                    .session_public(sid)
-                    .and_then(|session| session.get("bridge_generation").and_then(PyValue::as_i64))
-                    .unwrap_or(0)
-                    .max(0) as u64;
-                let mut response = self.shared.request(
-                    sid,
-                    SessionRequest::MarkAttachStalled { epoch },
-                    QUERY_TIMEOUT,
-                )?;
-                response.insert("error_code", PyValue::from("DRAIN_STALLED"));
-                return Ok(Some(response));
+                    .cv
+                    .wait_timeout(inner, deadline - now)
+                    .unwrap_or_else(|e| e.into_inner());
+                inner = next;
             }
-            let (next, _) = self
-                .shared
-                .cv
-                .wait_timeout(inner, deadline - now)
-                .unwrap_or_else(|e| e.into_inner());
-            inner = next;
-        }
+        };
+        let mut response = await_actor_reply(stalled_reply, QUERY_TIMEOUT)?;
+        response.insert("error_code", PyValue::from("DRAIN_STALLED"));
+        Ok(Some(response))
     }
 
     /// `clear_session`：RELEASED 早退；stopping → `Err("daemon stopping")`；否則 drain(CLEARED) 後重新 attach。
@@ -3790,6 +3875,12 @@ impl SessionManager {
     #[cfg(feature = "test-fakes")]
     pub fn set_probe_pre_submit_hook_for_test(&self, hook: Box<dyn Fn() + Send + Sync>) {
         *lock(&self.shared.probe_pre_submit_hook) = Some(hook);
+    }
+
+    /// 只供測試（test-fakes）：設定佔位 release 取消前暫停點。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_placeholder_release_cancel_hook_for_test(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        *lock(&self.shared.placeholder_release_cancel_hook) = Some(hook);
     }
 
     /// 設定 state.json 持久化觀察者（P5-T19 #3／#4／#68；daemon 組裝點於 `new()` 之後、任何 attach 之前呼叫）。

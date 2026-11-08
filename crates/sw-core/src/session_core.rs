@@ -196,6 +196,15 @@ pub enum SessionRequest {
     MarkAttachStalled {
         epoch: u64,
     },
+    /// OD-63：placeholder release 的開埠逾時；`token` 讓遲到收尾只清除同一個 op 的 stall。
+    PlaceholderAttachStalled {
+        token: u64,
+        epoch: u64,
+    },
+    /// OD-63：該 token 的開埠 handle 已安全關閉，清除先前由 placeholder release 設定的 stall 欄位。
+    PlaceholderAttachSettled {
+        token: u64,
+    },
     /// 同 `ControlEvent::DeviceAttached`，但經請求通道並回覆套用後的活 session（bind 改綁到在線裝置時，
     /// Python 於回覆前即 ATTACHING＋`last_error=None`；審查 F70）。
     DeviceOnline {
@@ -390,6 +399,7 @@ pub struct SessionCore {
     foreground_reboot: bool,
     drain_stalled: bool,
     drain_timeout_epoch: Option<u64>,
+    placeholder_attach_stall_token: Option<u64>,
     released_by: Option<String>,
     released_at: Option<String>,
     /// Python `released_reason`：RPC `device.release` 的 `reason` 原樣（任意 JSON；未帶為 null）。
@@ -607,6 +617,7 @@ impl SessionCore {
             foreground_reboot: false,
             drain_stalled: false,
             drain_timeout_epoch: None,
+            placeholder_attach_stall_token: None,
             released_by: None,
             released_at: None,
             released_reason: PyValue::Null,
@@ -1917,9 +1928,29 @@ impl SessionCore {
                 }
                 self.drain_stalled = true;
                 self.drain_timeout_epoch = Some(epoch);
+                self.placeholder_attach_stall_token = None;
                 let mut response = self.drain_stalled_reply(now);
                 response.insert("error_code", PyValue::from("SESSION_RECOVERING"));
                 vec![Effect::Reply(reply, Ok(response))]
+            }
+            SessionRequest::PlaceholderAttachStalled { token, epoch } => {
+                if self.state != SessionState::Released {
+                    self.set_state(SessionState::Recovering, now);
+                }
+                self.drain_stalled = true;
+                self.drain_timeout_epoch = Some(epoch);
+                self.placeholder_attach_stall_token = Some(token);
+                let mut response = self.drain_stalled_reply(now);
+                response.insert("error_code", PyValue::from("SESSION_RECOVERING"));
+                vec![Effect::Reply(reply, Ok(response))]
+            }
+            SessionRequest::PlaceholderAttachSettled { token } => {
+                if self.placeholder_attach_stall_token == Some(token) {
+                    self.drain_stalled = false;
+                    self.drain_timeout_epoch = None;
+                    self.placeholder_attach_stall_token = None;
+                }
+                vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
             }
             #[cfg(feature = "test-fakes")]
             SessionRequest::QueueLensForTest => vec![Effect::Reply(
@@ -2500,6 +2531,7 @@ impl SessionCore {
 
     fn finish_pending_open_stop(&mut self, pending: PendingOpenStop, now: Mono) -> Vec<Effect> {
         self.drain_stalled = false;
+        self.placeholder_attach_stall_token = None;
         if pending.kind == StopKind::Release {
             if pending.already_released {
                 self.set_state(SessionState::Released, now);
@@ -3619,6 +3651,7 @@ impl SessionCore {
                 stop.stalled = true;
                 self.drain_stalled = true;
                 self.drain_timeout_epoch = Some(stalled_epoch);
+                self.placeholder_attach_stall_token = None;
                 if stop.kind == StopKind::Release {
                     let waiters: Vec<_> = stop.waiters.drain(..).collect();
                     let response = self.drain_stalled_reply(now);
@@ -3635,6 +3668,7 @@ impl SessionCore {
                 pending.stalled = true;
                 self.drain_stalled = true;
                 self.drain_timeout_epoch = Some(stalled_epoch);
+                self.placeholder_attach_stall_token = None;
                 if pending.kind == StopKind::Release {
                     let waiters: Vec<_> = pending.waiters.drain(..).collect();
                     let response = self.drain_stalled_reply(now);
@@ -3677,6 +3711,7 @@ impl SessionCore {
             }
             self.drain_stalled = true;
             self.drain_timeout_epoch = Some(self.generations.bridge_generation);
+            self.placeholder_attach_stall_token = None;
             append_receipt_warnings(&receipt, &mut effects, &self.profile.com);
             if let Some(error) = receipt.close_error.as_ref() {
                 effects.push(Effect::Warn(format!(
@@ -3734,6 +3769,7 @@ impl SessionCore {
         }));
 
         self.drain_stalled = false;
+        self.placeholder_attach_stall_token = None;
         self.recovering = false;
         let kind = if stop.kind == StopKind::Release {
             StopKind::Release

@@ -1651,6 +1651,174 @@ fn wp510_b_concurrent_placeholder_attach_returns_session_recovering() {
 }
 
 #[test]
+fn wp510_review_release_cancels_placeholder_attach_before_retirement() {
+    const SID: &str = "gone-template:COM3";
+    const REAL: &str = "/dev/ttyG";
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    let device = m.device(REAL);
+    m.mgr.update_devices(&m.snapshot());
+    m.serial.block_open(REAL);
+
+    let (pause_tx, pause_rx) = crossbeam_channel::bounded::<()>(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded::<()>(1);
+    m.mgr.set_placeholder_release_cancel_hook_for_test(Box::new(move || {
+        let _ = pause_tx.send(());
+        let _ = resume_rx.recv_timeout(Duration::from_secs(10));
+    }));
+
+    let attach_manager = m.mgr.clone();
+    let attach_sid = sid.clone();
+    let (attach_tx, attach_rx) = crossbeam_channel::bounded(1);
+    let attach = std::thread::spawn(move || {
+        let _ = attach_tx.send(attach_manager.attach_released_placeholder(&attach_sid, false));
+    });
+    wait_until("佔位 attach 停在 open_exclusive", || {
+        m.serial.open_attempts(REAL) == 1
+    });
+
+    let release_manager = m.mgr.clone();
+    let release_sid = sid.clone();
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let release = std::thread::spawn(move || {
+        let _ = release_tx.send(release_manager.route(
+            &release_sid,
+            SessionRequest::Release {
+                source: "agent".to_string(),
+                reason: PyValue::Null,
+            },
+            Duration::from_secs(10),
+        ));
+    });
+    pause_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("release 已取得佔位 attach op");
+    m.serial.release_open(REAL);
+    let attach_before_release_resumes = attach_rx.recv_timeout(Duration::from_millis(250)).ok();
+    let attach_returned_early = attach_before_release_resumes.is_some();
+
+    let _ = resume_tx.send(());
+    let attach_result = attach_before_release_resumes
+        .or_else(|| attach_rx.recv_timeout(Duration::from_secs(5)).ok())
+        .expect("佔位 attach 應完成");
+    let release_result = release_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("release 應完成");
+    attach.join().expect("attach thread 不應 panic");
+    release.join().expect("release thread 不應 panic");
+
+    assert!(
+        !attach_returned_early,
+        "release 尚未完成取消時 attach 不得先退休佔位：{attach_result:?}"
+    );
+    let attach_reply = rpc(attach_result);
+    assert_eq!(
+        code_of(&attach_reply).as_deref(),
+        Some("SESSION_RECOVERING")
+    );
+    let release_reply = rpc(release_result);
+    assert!(
+        is_ok(&release_reply),
+        "release 應完成佔位交接取消：{release_reply:?}"
+    );
+    assert_eq!(m.mgr.resolve(SID), Some(sid.clone()));
+    assert_eq!(m.mgr.released_placeholder(&sid), Some(true));
+    assert!(m
+        .mgr
+        .list_sessions()
+        .iter()
+        .all(|session| { s_of(session, "session_id").as_deref() != Some("others-template:COM0") }));
+    assert!(device.take_tx().is_empty(), "取消後不得啟動動態偵測 TX");
+}
+
+#[test]
+fn wp510_review_late_placeholder_attach_completion_clears_drain_stall() {
+    const SID: &str = "gone-template:COM3";
+    const REAL: &str = "/dev/ttyG";
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    m.mgr.update_devices(&m.snapshot());
+    m.serial.block_open(REAL);
+
+    let attach_manager = m.mgr.clone();
+    let attach_sid = sid.clone();
+    let (attach_tx, attach_rx) = crossbeam_channel::bounded(1);
+    let attach = std::thread::spawn(move || {
+        let _ = attach_tx.send(attach_manager.attach_released_placeholder(&attach_sid, false));
+    });
+    wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(REAL) == 1);
+
+    let release_manager = m.mgr.clone();
+    let release_sid = sid.clone();
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let release = std::thread::spawn(move || {
+        let _ = release_tx.send(release_manager.route(
+            &release_sid,
+            SessionRequest::Release {
+                source: "agent".to_string(),
+                reason: PyValue::Null,
+            },
+            Duration::from_secs(10),
+        ));
+    });
+    let stalled = release_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("release 排空期限內應回覆")
+        .expect("release RPC 回應");
+    assert_eq!(
+        code_of(&stalled).as_deref(),
+        Some("DRAIN_STALLED"),
+        "{stalled:?}"
+    );
+    assert_eq!(stalled.get("drain_stalled"), Some(&PyValue::Bool(true)));
+    assert!(matches!(
+        stalled.get("drain_timeout_epoch"),
+        Some(PyValue::Int(_))
+    ));
+
+    m.serial.release_open(REAL);
+    let attach_reply = rpc(
+        attach_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("取消的佔位 attach 應在開埠返回後完成"),
+    );
+    attach.join().expect("attach thread 不應 panic");
+    release.join().expect("release thread 不應 panic");
+    assert_eq!(
+        code_of(&attach_reply).as_deref(),
+        Some("SESSION_RECOVERING")
+    );
+
+    let listed = m
+        .mgr
+        .list_sessions()
+        .into_iter()
+        .find(|session| s_of(session, "session_id").as_deref() == Some(SID))
+        .expect("RELEASED 佔位仍在 session.list");
+    assert_eq!(listed.get("drain_stalled"), Some(&PyValue::Bool(false)));
+    assert_eq!(listed.get("drain_timeout_epoch"), Some(&PyValue::Null));
+
+    let repeated = rpc(m.mgr.route(
+        &sid,
+        SessionRequest::Release {
+            source: "agent".to_string(),
+            reason: PyValue::Null,
+        },
+        RPC,
+    ));
+    assert_eq!(repeated.get("already_released"), Some(&PyValue::Bool(true)));
+    let repeated_session = session_field(&repeated);
+    assert_eq!(
+        repeated_session.get("drain_stalled"),
+        Some(&PyValue::Bool(false))
+    );
+    assert_eq!(
+        repeated_session.get("drain_timeout_epoch"),
+        Some(&PyValue::Null)
+    );
+}
+
+#[test]
 fn wp510_b_retirement_persist_enospc_keeps_placeholder_and_stops_handoff() {
     const SID: &str = "gone-template:COM3";
     const REAL: &str = "/dev/ttyG";

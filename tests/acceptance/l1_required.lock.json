@@ -20897,6 +20897,8 @@
           "cargo:sw-core::session_manager::wp510_b_open_error_with_fallback_stays_reattachable",
           "cargo:sw-core::session_manager::wp510_b_open_error_without_fallback_reserves_com_until_unplug",
           "cargo:sw-core::session_manager::wp510_b_retirement_persist_enospc_keeps_placeholder_and_stops_handoff",
+          "cargo:sw-core::session_manager::wp510_review_late_placeholder_attach_completion_clears_drain_stall",
+          "cargo:sw-core::session_manager::wp510_review_release_cancels_placeholder_attach_before_retirement",
           "cargo:sw-core::slice21_prereqs::prereq_symbols_exist",
           "cargo:sw-core::state_store::alias_list_sorted_with_alias_key",
           "cargo:sw-core::state_store::alias_set_overwrites_in_place",
