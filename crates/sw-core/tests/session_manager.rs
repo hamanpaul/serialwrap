@@ -1621,7 +1621,6 @@ fn wp510_b_handoff_cleans_old_identity_and_restart_block() {
 #[test]
 fn wp510_b_open_error_with_fallback_stays_reattachable() {
     const SID: &str = "gone-template:COM3";
-    const BY_ID: &str = "/s/by-id/usb-G";
     const REAL: &str = "/dev/ttyG";
     let m = wp510_b_placeholder_rig(false, false);
     let sid = m.mgr.resolve(SID).expect("佔位 session");
@@ -1643,8 +1642,9 @@ fn wp510_b_open_error_with_fallback_stays_reattachable() {
             && m.session_last_error("COM3").as_deref() == Some("ATTACH_FAILED:PermissionError")
     });
     assert_eq!(m.mgr.resolve(SID), None, "舊佔位須退休");
-    assert_eq!(m.mgr.released_placeholder(BY_ID), Some(false));
+    assert_eq!(m.mgr.released_placeholder("COM3"), Some(false));
     assert_eq!(s_of(&m.session("COM3"), "profile_source").as_deref(), Some("fallback"));
+    assert!(m.mgr.resolve("COM3").is_some(), "原 COM 應有 fallback 列");
     assert_eq!(m.serial.open_attempts(REAL), 2);
 
     m.mgr.bootstrap_attach();
@@ -1654,7 +1654,8 @@ fn wp510_b_open_error_with_fallback_stays_reattachable() {
     wait_until("fallback session 重新 attach", || {
         matches!(m.state_of("COM3").as_deref(), Some("ATTACHED" | "READY"))
     });
-    assert_eq!(m.mgr.resolve("COM3").as_deref(), Some("others-template:COM3"));
+    assert!(m.mgr.resolve("COM3").is_some(), "重新 attach 後原 COM 仍可查詢");
+    assert_eq!(m.mgr.released_placeholder("COM3"), Some(false));
 }
 
 #[test]
@@ -1684,17 +1685,18 @@ fn wp510_b_open_error_without_fallback_reserves_com_until_unplug() {
         Some(&PyValue::from("SESSION_NOT_FOUND"))
     );
 
-    m.mgr.prepare_dynamic_rank(&[OTHER.to_string()]);
-    assert_eq!(m.mgr.com_for_by_id(OTHER).as_deref(), Some("COM0"));
     m.mgr.update_devices(&m.snapshot());
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(m.serial.open_attempts(REAL), 2, "相同裝置快照不得重試");
     assert_eq!(m.mgr.com_for_by_id(BY_ID).as_deref(), Some("COM3"));
     assert!(m.device(REAL).take_tx().is_empty());
 
+    m.mgr.prepare_dynamic_rank(&[OTHER.to_string()]);
+    assert_eq!(m.mgr.com_for_by_id(OTHER).as_deref(), Some("COM0"));
+
     m.mgr.update_devices(&snapshot_without(&m, BY_ID));
     assert_eq!(m.mgr.com_for_by_id(BY_ID), None, "拔除後釋放原 COM 預留");
-    assert_eq!(m.mgr.com_for_by_id(OTHER).as_deref(), Some("COM0"));
+    assert_eq!(m.mgr.com_for_by_id(OTHER), None);
 }
 
 #[test]

@@ -1325,8 +1325,46 @@ impl Shared {
                 return Ok(device_not_present_reply(&selector, &by_id));
             }
             Err(OpenError::Other(error)) => {
-                self.finish_attach_op(&by_id, &op);
-                return Err(PyErr::value_error(error.py_message));
+                let retired = {
+                    let mut inner = lock(&self.inner);
+                    Self::retire_released_placeholder_locked(
+                        &mut inner,
+                        sid,
+                        &by_id,
+                        &real,
+                        &op,
+                        None,
+                    )
+                };
+                let Some(retired) = retired else {
+                    self.finish_attach_op(&by_id, &op);
+                    let inner = lock(&self.inner);
+                    if inner.device_path(&by_id) != Some(real.as_str()) {
+                        return Ok(device_not_present_reply(&selector, &by_id));
+                    }
+                    return Ok(pydict! {
+                        "ok" => false,
+                        "error_code" => "SESSION_RECOVERING",
+                        "session" => public
+                    });
+                };
+
+                public.insert("state", PyValue::from("DETACHED"));
+                public.insert(
+                    "last_error",
+                    PyValue::from(format!("ATTACH_FAILED:{}", error.py_exc_name())),
+                );
+                public.insert("detached_at", PyValue::from(self.now_iso()));
+                public.insert("released_by", PyValue::Null);
+                public.insert("released_at", PyValue::Null);
+                public.insert("released_reason", PyValue::Null);
+
+                self.persist_placeholder_retirement(sid);
+                self.stop_retired_placeholder_actor(sid, &retired);
+                // Python `_spawn_attach(by_id, dynamic_only=True)` 會以原 COM 重試 dynamic。
+                // 保留目前 inflight op，避免 watcher 在退休與重試之間搶先建立一般 attach。
+                self.spawn_attach_worker(&by_id, op);
+                return Ok(pydict! { "ok" => true, "session" => public });
             }
         };
         let mut parts = Some(HandleParts::split(handle));
@@ -1338,7 +1376,7 @@ impl Shared {
                 &by_id,
                 &real,
                 &op,
-                &mut parts,
+                Some(&mut parts),
             )
         };
         let Some(retired) = retired else {
@@ -1391,7 +1429,7 @@ impl Shared {
         by_id: &str,
         real: &str,
         op: &AttachOp,
-        parts: &mut Option<HandleParts>,
+        parts: Option<&mut Option<HandleParts>>,
     ) -> Option<Entry> {
         let valid = !inner.stopping
             && !op.cancelled.load(Ordering::SeqCst)
@@ -1413,10 +1451,12 @@ impl Shared {
             .insert(by_id.to_string(), entry.profile.com.clone());
         inner.probe_paths.remove(sid);
         inner.interactive.retain(|_, owner| owner != sid);
-        *lock(&op.preopened) = Some(Preopened {
-            real_path: real.to_string(),
-            parts: parts.take().expect("成功開埠後須交付預開 handle"),
-        });
+        if let Some(parts) = parts {
+            *lock(&op.preopened) = Some(Preopened {
+                real_path: real.to_string(),
+                parts: parts.take().expect("成功開埠後須交付預開 handle"),
+            });
+        }
         Some(entry)
     }
 
