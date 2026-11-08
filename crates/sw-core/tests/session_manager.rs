@@ -13,7 +13,8 @@ use sw_core::session_core::{SessionRequest, SessionState};
 use sw_core::state_store::{LoadedState, ReleasedRow};
 use sw_pal::fakes::serial::FakeWriteStep;
 use sw_pal::traits::{
-    DeviceInfo, DevicePath, OpenError, PalError, SerialBackend, SerialConfig, WatcherEvent,
+    DeviceInfo, DevicePath, HolderReport, HolderScanStatus, OpenError, PalError, PalErrorKind,
+    SerialBackend, SerialConfig, WatcherEvent,
 };
 use sw_proto::pycompat::PyErr;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
@@ -1474,6 +1475,31 @@ fn wp510_b_placeholder_rig(with_slot: bool, keep_profile_records: bool) -> Manag
     m
 }
 
+fn wp510_b_no_fallback_placeholder_rig() -> ManagerRig {
+    const SID: &str = "gone-template:COM3";
+    const BY_ID: &str = "/s/by-id/usb-G";
+    let mut loaded = LoadedState::default();
+    loaded.released.insert(SID.to_string(), released_row(BY_ID));
+    let yaml = "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\n";
+    let m = ManagerRig::with(yaml, loaded, None);
+    m.add_device_at(BY_ID, "/dev/ttyG");
+    install_shell_replies(&m.device("/dev/ttyG"));
+    m
+}
+
+fn wp510_b_permission_error() -> OpenError {
+    OpenError::Other(PalError::plain(
+        PalErrorKind::PermissionDenied,
+        "Permission denied",
+    ))
+}
+
+fn wp510_b_assert_placeholder_retained(m: &ManagerRig, sid: &str) {
+    assert_eq!(m.mgr.released_placeholder(sid), Some(true));
+    assert_eq!(m.state_of(sid).as_deref(), Some("RELEASED"));
+    assert!(m.mgr.resolve(sid).is_some(), "拒絕交接後佔位須保留");
+}
+
 #[test]
 fn wp510_b_handoff_reuses_preopened_handle() {
     let m = wp510_b_placeholder_rig(false, false);
@@ -1590,6 +1616,213 @@ fn wp510_b_handoff_cleans_old_identity_and_restart_block() {
     assert!(restarted.mgr.resolve(SID).is_none(), "重啟不得復活舊佔位");
     assert!(!restarted.load_state_now().released.contains_key(SID));
     assert_eq!(restarted.mgr.released_placeholder(BY_ID), None);
+}
+
+#[test]
+fn wp510_b_open_error_with_fallback_stays_reattachable() {
+    const SID: &str = "gone-template:COM3";
+    const BY_ID: &str = "/s/by-id/usb-G";
+    const REAL: &str = "/dev/ttyG";
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    m.serial.fail_next_open(REAL, wp510_b_permission_error());
+    m.serial.fail_next_open(REAL, wp510_b_permission_error());
+    m.mgr.update_devices(&m.snapshot());
+
+    let response = rpc(m.mgr.attach_released_placeholder(&sid, false));
+
+    assert!(is_ok(&response), "一般開埠錯誤應交給 dynamic：{response:?}");
+    let old_snapshot = session_field(&response);
+    assert_eq!(s_of(&old_snapshot, "state").as_deref(), Some("DETACHED"));
+    assert_eq!(s_of(&old_snapshot, "last_error").as_deref(), Some("ATTACH_FAILED:PermissionError"));
+    wait_until("佔位 handoff 的第二次 dynamic 開埠", || {
+        m.serial.open_attempts(REAL) == 2 && m.mgr.resolve("COM3").is_some()
+    });
+    wait_until("fallback session DETACHED", || {
+        m.state_of("COM3").as_deref() == Some("DETACHED")
+            && m.session_last_error("COM3").as_deref() == Some("ATTACH_FAILED:PermissionError")
+    });
+    assert_eq!(m.mgr.resolve(SID), None, "舊佔位須退休");
+    assert_eq!(m.mgr.released_placeholder(BY_ID), Some(false));
+    assert_eq!(s_of(&m.session("COM3"), "profile_source").as_deref(), Some("fallback"));
+    assert_eq!(m.serial.open_attempts(REAL), 2);
+
+    m.mgr.bootstrap_attach();
+    wait_until("fallback DETACHED session 再次開埠", || {
+        m.serial.open_attempts(REAL) == 3
+    });
+    wait_until("fallback session 重新 attach", || {
+        matches!(m.state_of("COM3").as_deref(), Some("ATTACHED" | "READY"))
+    });
+    assert_eq!(m.mgr.resolve("COM3").as_deref(), Some("others-template:COM3"));
+}
+
+#[test]
+fn wp510_b_open_error_without_fallback_reserves_com_until_unplug() {
+    const SID: &str = "gone-template:COM3";
+    const BY_ID: &str = "/s/by-id/usb-G";
+    const REAL: &str = "/dev/ttyG";
+    const OTHER: &str = "/s/by-id/usb-next";
+    let m = wp510_b_no_fallback_placeholder_rig();
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    m.serial.fail_next_open(REAL, wp510_b_permission_error());
+    m.serial.fail_next_open(REAL, wp510_b_permission_error());
+    m.mgr.update_devices(&m.snapshot());
+
+    let response = rpc(m.mgr.attach_released_placeholder(&sid, false));
+
+    assert!(is_ok(&response), "一般開埠錯誤應交給 dynamic：{response:?}");
+    let old_snapshot = session_field(&response);
+    assert_eq!(s_of(&old_snapshot, "state").as_deref(), Some("DETACHED"));
+    assert_eq!(s_of(&old_snapshot, "last_error").as_deref(), Some("ATTACH_FAILED:PermissionError"));
+    wait_until("無 fallback 時 dynamic 第二次開埠", || m.serial.open_attempts(REAL) == 2);
+    assert_eq!(m.mgr.resolve(SID), None);
+    assert_eq!(m.mgr.resolve("COM3"), None);
+    assert_eq!(m.mgr.com_for_by_id(BY_ID).as_deref(), Some("COM3"));
+    assert_eq!(
+        m.mgr.attach_released_placeholder(SID, false).unwrap().get("error_code"),
+        Some(&PyValue::from("SESSION_NOT_FOUND"))
+    );
+
+    m.mgr.prepare_dynamic_rank(&[OTHER.to_string()]);
+    assert_eq!(m.mgr.com_for_by_id(OTHER).as_deref(), Some("COM0"));
+    m.mgr.update_devices(&m.snapshot());
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(m.serial.open_attempts(REAL), 2, "相同裝置快照不得重試");
+    assert_eq!(m.mgr.com_for_by_id(BY_ID).as_deref(), Some("COM3"));
+    assert!(m.device(REAL).take_tx().is_empty());
+
+    m.mgr.update_devices(&snapshot_without(&m, BY_ID));
+    assert_eq!(m.mgr.com_for_by_id(BY_ID), None, "拔除後釋放原 COM 預留");
+    assert_eq!(m.mgr.com_for_by_id(OTHER).as_deref(), Some("COM0"));
+}
+
+#[test]
+fn wp510_b_missing_or_held_keeps_placeholder() {
+    const SID: &str = "gone-template:COM3";
+    const BY_ID: &str = "/s/by-id/usb-G";
+    const REAL: &str = "/dev/ttyG";
+
+    let offline = wp510_b_placeholder_rig(false, false);
+    let sid = offline.mgr.resolve(SID).expect("佔位 session");
+    offline.mgr.update_devices(&snapshot_without(&offline, BY_ID));
+    let response = rpc(offline.mgr.attach_released_placeholder(&sid, false));
+    assert_eq!(code_of(&response).as_deref(), Some("DEVICE_NOT_PRESENT"));
+    assert_eq!(s_of(&response, "selector").as_deref(), Some("COM3"));
+    assert_eq!(s_of(&response, "device_by_id").as_deref(), Some(BY_ID));
+    wp510_b_assert_placeholder_retained(&offline, SID);
+    assert_eq!(offline.serial.open_attempts(REAL), 0);
+    assert!(offline.device(REAL).take_tx().is_empty());
+
+    let prescan = wp510_b_placeholder_rig(false, false);
+    let sid = prescan.mgr.resolve(SID).expect("佔位 session");
+    prescan.serial.set_probe_holders(REAL, HolderReport {
+        pids: vec![771],
+        holder_unknown: false,
+        status: HolderScanStatus::Ok,
+    });
+    prescan.mgr.update_devices(&prescan.snapshot());
+    let response = rpc(prescan.mgr.attach_released_placeholder(&sid, false));
+    assert_eq!(code_of(&response).as_deref(), Some("DEVICE_STILL_HELD"));
+    assert_eq!(response.get("pids"), Some(&PyValue::List(vec![PyValue::Int(PyInt::Small(771))])));
+    assert_eq!(response.get("holder_unknown"), Some(&PyValue::Bool(false)));
+    wp510_b_assert_placeholder_retained(&prescan, SID);
+    assert_eq!(prescan.serial.open_attempts(REAL), 0);
+    assert!(prescan.device(REAL).take_tx().is_empty());
+
+    for variant in [0, 1, 2] {
+        let m = wp510_b_placeholder_rig(false, false);
+        let sid = m.mgr.resolve(SID).expect("佔位 session");
+        let (error, expected_code, expected_pids, expected_unknown) = match variant {
+            0 => (
+                OpenError::Held(HolderReport {
+                    pids: vec![772],
+                    holder_unknown: false,
+                    status: HolderScanStatus::Ok,
+                }),
+                "DEVICE_STILL_HELD",
+                Some(vec![PyValue::Int(PyInt::Small(772))]),
+                Some(false),
+            ),
+            1 => (
+                OpenError::AccessDenied {
+                    os: PalError::plain(PalErrorKind::AccessDenied, "Access denied"),
+                    holder: HolderReport {
+                        pids: Vec::new(),
+                        holder_unknown: true,
+                        status: HolderScanStatus::Unknown,
+                    },
+                },
+                "DEVICE_STILL_HELD",
+                Some(Vec::new()),
+                Some(true),
+            ),
+            _ => (
+                OpenError::NotFound(PalError::plain(PalErrorKind::NotFound, "No such device")),
+                "DEVICE_NOT_PRESENT",
+                None,
+                None,
+            ),
+        };
+        m.serial.fail_next_open(REAL, error);
+        m.mgr.update_devices(&m.snapshot());
+        let response = rpc(m.mgr.attach_released_placeholder(&sid, false));
+        assert_eq!(code_of(&response).as_deref(), Some(expected_code));
+        if let Some(pids) = expected_pids {
+            assert_eq!(response.get("pids"), Some(&PyValue::List(pids)));
+        }
+        if let Some(unknown) = expected_unknown {
+            assert_eq!(response.get("holder_unknown"), Some(&PyValue::Bool(unknown)));
+        }
+        wp510_b_assert_placeholder_retained(&m, SID);
+        assert_eq!(m.serial.open_attempts(REAL), 1);
+        assert!(m.device(REAL).take_tx().is_empty());
+    }
+}
+
+#[test]
+fn wp510_b_handoff_invalidated_during_open_closes_handle() {
+    const SID: &str = "gone-template:COM3";
+    const BY_ID: &str = "/s/by-id/usb-G";
+    const REAL: &str = "/dev/ttyG";
+    const CHANGED: &str = "/dev/ttyG-rebound";
+
+    for invalidation in ["unplug", "rebind", "shutdown"] {
+        let m = wp510_b_placeholder_rig(false, false);
+        let sid = m.mgr.resolve(SID).expect("佔位 session");
+        let old_device = m.device(REAL);
+        m.mgr.update_devices(&m.snapshot());
+        m.serial.block_open(REAL);
+        let manager = m.mgr.clone();
+        let attach_sid = sid.clone();
+        let attach = std::thread::spawn(move || manager.attach_released_placeholder(&attach_sid, false));
+        wait_until("佔位 handoff 開埠進入阻塞鉤子", || m.serial.open_attempts(REAL) == 1);
+
+        match invalidation {
+            "unplug" => m.mgr.update_devices(&snapshot_without(&m, BY_ID)),
+            "rebind" => {
+                m.serial.add_device(CHANGED);
+                m.mgr.update_devices(&[(BY_ID.to_string(), DeviceInfo {
+                    by_id: BY_ID.to_string(),
+                    real_path: CHANGED.to_string(),
+                })]);
+            }
+            "shutdown" => m.mgr.begin_shutdown(),
+            _ => unreachable!(),
+        }
+        m.serial.release_open(REAL);
+        let response = rpc(attach.join().expect("handoff worker 不應 panic"));
+        match invalidation {
+            "unplug" | "rebind" => assert_eq!(code_of(&response).as_deref(), Some("DEVICE_NOT_PRESENT")),
+            "shutdown" => assert_eq!(code_of(&response).as_deref(), Some("SESSION_RECOVERING")),
+            _ => unreachable!(),
+        }
+        assert_eq!(old_device.close_count(), 1, "{invalidation} 後 handle 須關閉");
+        assert_eq!(m.mgr.resolve("COM3"), Some(sid.clone()));
+        assert_eq!(m.mgr.resolve("t:COM3"), None);
+        assert_eq!(m.mgr.released_placeholder(&sid), Some(true));
+        assert!(old_device.take_tx().is_empty());
+    }
 }
 
 /// 拔除 by_id 後的快照（ManagerRig 的登錄不變，供之後重插）。

@@ -1808,7 +1808,7 @@ impl ActorRig {
 // - UART 獨占診斷與 console 工廠：固定回傳無持有者（測試只需要 PTY 形式）。
 // ===========================================================================
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::Condvar;
 
@@ -1980,16 +1980,31 @@ impl FsOps for RigFs {
     }
 }
 
-/// 無持有者的獨占診斷（測試只需要 PTY 形式）。
-pub struct RigExcl;
+/// 可注入掃描結果的獨占診斷（測試只需要 PTY 形式）。
+pub struct RigExcl {
+    reports: Arc<Mutex<BTreeMap<String, HolderReport>>>,
+}
+
+impl RigExcl {
+    fn for_serial(serial: &RigSerial) -> Self {
+        Self {
+            reports: serial.probe_holders.clone(),
+        }
+    }
+}
 
 impl UartExclusive for RigExcl {
-    fn probe_holders(&self, _real_path: &str) -> HolderReport {
-        HolderReport {
-            pids: Vec::new(),
-            holder_unknown: false,
-            status: HolderScanStatus::Ok,
-        }
+    fn probe_holders(&self, real_path: &str) -> HolderReport {
+        self.reports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(real_path)
+            .cloned()
+            .unwrap_or(HolderReport {
+                pids: Vec::new(),
+                holder_unknown: false,
+                status: HolderScanStatus::Ok,
+            })
     }
 }
 
@@ -2112,6 +2127,8 @@ pub struct RigSerial {
     inner: Arc<FakeSerialBackend>,
     log: Arc<Mutex<Vec<String>>>,
     attempts: Mutex<BTreeMap<String, usize>>,
+    next_open_errors: Mutex<BTreeMap<String, VecDeque<OpenError>>>,
+    probe_holders: Arc<Mutex<BTreeMap<String, HolderReport>>>,
     gates: Mutex<BTreeSet<String>>,
     gate_cv: Condvar,
     excl_fail: Arc<Mutex<BTreeSet<String>>>,
@@ -2125,6 +2142,8 @@ impl RigSerial {
             inner: FakeSerialBackend::new(),
             log: Arc::new(Mutex::new(Vec::new())),
             attempts: Mutex::new(BTreeMap::new()),
+            next_open_errors: Mutex::new(BTreeMap::new()),
+            probe_holders: Arc::new(Mutex::new(BTreeMap::new())),
             gates: Mutex::new(BTreeSet::new()),
             gate_cv: Condvar::new(),
             excl_fail: Arc::new(Mutex::new(BTreeSet::new())),
@@ -2180,6 +2199,24 @@ impl RigSerial {
             .unwrap_or(0)
     }
 
+    /// 依序注入該路徑後續開埠結果；用盡後回到 FakeSerialBackend。
+    pub fn fail_next_open(&self, real_path: &str, error: OpenError) {
+        self.next_open_errors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(real_path.to_string())
+            .or_default()
+            .push_back(error);
+    }
+
+    /// 注入 `device.attach` 開埠前的 holder 預掃結果。
+    pub fn set_probe_holders(&self, real_path: &str, report: HolderReport) {
+        self.probe_holders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(real_path.to_string(), report);
+    }
+
     /// 之後該路徑的 close 回報 `excl_cleared:false`，且下一次 open 得 `Held`（plan probe 變體）。
     pub fn fail_excl_clear(&self, real_path: &str) {
         self.excl_fail
@@ -2212,6 +2249,15 @@ impl SerialBackend for RigSerial {
             while gates.contains(&key) {
                 gates = self.gate_cv.wait(gates).unwrap_or_else(|e| e.into_inner());
             }
+        }
+        if let Some(error) = self
+            .next_open_errors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&key)
+            .and_then(VecDeque::pop_front)
+        {
+            return Err(error);
         }
         let held_once = self
             .held
@@ -2270,7 +2316,7 @@ fn assemble_manager(
     let registry = CommandRegistry::new();
     let deps = ManagerDeps {
         serial: serial.clone(),
-        uart_excl: Arc::new(RigExcl),
+        uart_excl: Arc::new(RigExcl::for_serial(&serial)),
         console,
         caps: sw_pal::fakes::posix_caps(),
         wal: wal.clone(),
