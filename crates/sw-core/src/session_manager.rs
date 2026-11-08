@@ -1005,8 +1005,6 @@ impl Shared {
         drop(inner);
         let me = self.clone();
         let key = by_id.to_string();
-        #[cfg(feature = "test-fakes")]
-        self.spawned_workers.fetch_add(1, Ordering::SeqCst);
         let spawned = std::thread::Builder::new()
             .name(format!("serialwrap-attach-{by_id}"))
             .spawn(move || {
@@ -1014,7 +1012,11 @@ impl Shared {
                 lock(&me.inner).inflight.remove(&key);
                 me.cv.notify_all();
             });
-        if spawned.is_err() {
+        if spawned.is_ok() {
+            // 只計實際啟動的 attach worker；spawn 失敗不計（審查 P8X-8b5cbe4-2）。
+            #[cfg(feature = "test-fakes")]
+            self.spawned_workers.fetch_add(1, Ordering::SeqCst);
+        } else {
             lock(&self.inner).inflight.remove(by_id);
             self.cv.notify_all();
         }
