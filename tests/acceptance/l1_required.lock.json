@@ -527,6 +527,7 @@
           "cargo:sw-pal::wintask_staging::registry_query_failure_is_fail_closed",
           "cargo:sw-pal::wintask_staging::runtime_test_only_uses_named_task_apis",
           "cargo:sw-pal::wintask_staging::simulated_batch_env_drops_inherited_serialwrap_vars",
+          "cargo:sw-pal::wintask_staging::staging_pid_match_uses_full_exe_path_only",
           "cargo:sw-pal::wintask_staging::staging_refuses_production_port",
           "cargo:sw-pal::wintask_staging::support_json_parser_reads_health_status",
           "cargo:sw-pal::wintask_staging::support_wal_tail_detects_torn_and_crc_mismatch",

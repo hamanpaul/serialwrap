@@ -805,15 +805,33 @@ pub fn query_xml(env: &dyn SysEnv, task: &str) -> XmlTree {
 // 行程：只以 staging 執行檔完整路徑辨識（不以映像名稱比對，避免碰到正式 daemon）
 // ---------------------------------------------------------------------------
 
-fn ps_quote(s: &str) -> String {
-    s.replace('\'', "''")
+/// 執行檔路徑的比對鍵：能解析時取 canonical 長路徑（處理 8.3 短檔名、`\\?\` 前綴），再統一 `\` 與小寫。
+pub fn normalize_exe_path(path: &str) -> String {
+    let canon = std::fs::canonicalize(path)
+        .map(|c| c.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string());
+    canon.trim_start_matches(r"\\?\").replace('/', "\\").to_lowercase()
 }
 
-/// 執行檔完整路徑等於 `exe` 的 `serialwrapd.exe` 行程 pid。
+/// 解析 `<pid>|<ExecutablePath>` 行，回傳執行檔與 `exe` 相同者的 pid（路徑讀不到的行程一律不匹配）。
+pub fn matching_exe_pids(listing: &str, exe: &str) -> Result<Vec<u32>, String> {
+    let want = normalize_exe_path(exe);
+    let mut pids = Vec::new();
+    for line in listing.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let (pid, path) = line.split_once('|').ok_or_else(|| format!("無法解析行程列：{line:?}"))?;
+        let pid = pid.trim().parse::<u32>().map_err(|_| format!("無法解析 pid：{line:?}"))?;
+        let path = path.trim();
+        if !path.is_empty() && normalize_exe_path(path) == want {
+            pids.push(pid);
+        }
+    }
+    Ok(pids)
+}
+
+/// 執行檔完整路徑等於 `exe` 的 `serialwrapd.exe` 行程 pid（比對在 Rust 端進行，不以映像名稱判定）。
 pub fn staging_exe_pids(env: &dyn SysEnv, exe: &str) -> Result<Vec<u32>, String> {
     let script = format!(
-        "Get-CimInstance Win32_Process -Filter \"Name='{DAEMON_EXE}'\" | Where-Object {{ $_.ExecutablePath -ieq '{}' }} | ForEach-Object {{ $_.ProcessId }}",
-        ps_quote(exe)
+        "Get-CimInstance Win32_Process -Filter \"Name='{DAEMON_EXE}'\" | ForEach-Object {{ \"$($_.ProcessId)|$($_.ExecutablePath)\" }}"
     );
     let argv = argv(&["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", &script]);
     let out = env
@@ -822,12 +840,7 @@ pub fn staging_exe_pids(env: &dyn SysEnv, exe: &str) -> Result<Vec<u32>, String>
     if out.rc != 0 {
         return Err(format!("列舉 staging daemon rc={} stderr={}", out.rc, out.stderr.trim()));
     }
-    out.stdout
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(|l| l.parse::<u32>().map_err(|_| format!("無法解析 pid：{l:?}")))
-        .collect()
+    matching_exe_pids(&out.stdout, exe)
 }
 
 /// plan API：強制終止 staging daemon（`taskkill /F /PID`）；pid 不屬於 staging 執行檔即 panic、不終止。

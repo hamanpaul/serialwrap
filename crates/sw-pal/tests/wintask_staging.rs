@@ -332,3 +332,16 @@ fn win_runner_forwards_schtasks_authorization() {
     assert!(line.split_whitespace().any(|w| w == "SW_TEST_ALLOW_SCHTASKS"), "{line}");
     assert!(!runner.contains("SW_TEST_ALLOW_SCHTASKS=1"), "runner 不得自行授權");
 }
+
+#[test]
+fn staging_pid_match_uses_full_exe_path_only() {
+    // 正式 daemon 與其他使用者（ExecutablePath 讀不到）的行程絕不匹配；比對不分大小寫與 `/`、`\`。
+    let listing = "4242|C:\\Users\\tester\\AppData\\Local\\Temp\\sw-p8-test-4242\\bin\\serialwrapd.exe\r\n\
+                   77|C:\\Users\\tester\\.local\\share\\serialwrap\\bin\\serialwrapd.exe\r\n\
+                   88|\r\n\
+                   99|c:/users/TESTER/appdata/local/temp/sw-p8-test-4242/BIN/serialwrapd.exe\r\n";
+    let exe = format!(r"{ROOT}\bin\serialwrapd.exe");
+    assert_eq!(matching_exe_pids(listing, &exe), Ok(vec![4242, 99]));
+    assert_eq!(matching_exe_pids("", &exe), Ok(vec![]));
+    assert!(matching_exe_pids("not-a-row\r\n", &exe).is_err(), "無法解析的列必須拒絕，不得當成無殘留");
+}
