@@ -10,9 +10,12 @@
 - `test_rollback_force_refuses_while_push`／`test_rollback_force_refuses_while_flashing`：同上帶 `--force`，並以
   `setup --force`（bundle 更新）各再跑一次：`--force` 只記 `force_ignored:true`，拒絕結果不變；
 - `test_rollback_refuses_while_interactive_send`：interactive lease 開啟、`interactive_send` 進行中 → `SESSION_BUSY`，
-  DUT 收到完整 payload。
+  DUT 收到完整 payload；
+- `test_supervision_set_force_refuses_while_push`（計畫 `supervision_set_force_refuses_rust_daemon_pushing`，SC-22／R1-F3）：
+  file push 進行中 `supervision-mode set systemd-user --force`（PATH 前置 stub `systemctl`／`loginctl`／`sudo`）→ `SESSION_BUSY`、
+  `phase:"supervision_set_safety_check"`、`force_ignored:true`；stub `systemctl` 未收到停止／停用、`config.yaml` 位元組不變。
 
-每個拒絕都斷言：exit 2、`phase:"update_safety_check"`、daemon pid 不變且 `health.ping` 仍 ok、WAL 無停止紀錄、
+每個拒絕都斷言：exit 2、`phase:"update_safety_check"`（`supervision-mode set` 為 `supervision_set_safety_check`）、daemon pid 不變且 `health.ping` 仍 ok、WAL 無停止紀錄、
 `current-release.json` 位元組不變、被拒的操作照常完成（DUT 端內容／md5 為外部 oracle），並以 `HolderSampler(slave, 0.01)`
 連續取樣證明全程只有受測 daemon 持有 UART（`max_concurrent()<=1`，no_reopen_before_handoff）。
 
@@ -357,3 +360,73 @@ def test_rollback_refuses_while_interactive_send(sw_env, shell_target, tmp_path)
     closed = sw_env.rpc("session.interactive_close", {"interactive_id": iid})
     assert closed.get("ok") is True, closed
 
+
+
+# ---------------------------------------------------------------------------
+# supervision-mode set（SC-22，R1-F3）
+# ---------------------------------------------------------------------------
+
+def _host_tool_stubs(tmp_path: Path, env: dict[str, str]) -> Path:
+    """PATH 前置記錄 argv 的 stub `systemctl`／`loginctl`／`sudo`（exit 0，不執行任何東西）；回傳記錄檔路徑。
+
+    拒絕路徑不得呼叫任何停止／停用；若 CLI 迴歸而誤入切換（reconcile），stub 也擋住宿主的 user systemd、linger 與 sudo。"""
+    stub_bin = tmp_path / "stub-bin"
+    stub_bin.mkdir(parents=True, exist_ok=True)
+    log = tmp_path / "host-tools.log"
+    for tool in ("systemctl", "loginctl", "sudo"):
+        stub = stub_bin / tool
+        stub.write_text(f"#!/bin/sh\nprintf '{tool} %s\\n' \"$*\" >> \"$SW_T14_HOST_TOOL_LOG\"\nexit 0\n",
+                        encoding="utf-8")
+        stub.chmod(0o755)
+    env["PATH"] = f"{stub_bin}{os.pathsep}{env.get('PATH', '')}"
+    env["SW_T14_HOST_TOOL_LOG"] = str(log)
+    return log
+
+
+def _last_json(stdout: str):
+    for line in reversed(stdout.splitlines()):
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+@pytest.mark.posix_pty
+@pytest.mark.process_rpc
+def test_supervision_set_force_refuses_while_push(sw_env, shell_target, tmp_path):
+    """計畫 `supervision_set_force_refuses_rust_daemon_pushing`：舊模式 on-demand、file push 進行中，
+    `supervision-mode set systemd-user --force` 由 safety_check 拒絕（`--force` 只記 `force_ignored:true`）：
+    不 hold／停用監管、不送停止、不寫 config；push 照常完成、daemon pid 不變、全程只有受測 daemon 持有 UART。"""
+    pid = _ready(sw_env, shell_target)
+    inst = Installed(tmp_path, sw_env, previous=False)
+    env = dict(inst.env)
+    tool_log = _host_tool_stubs(tmp_path, env)
+    config = Path(env["SERIALWRAP_CONFIG_DIR"]) / "config.yaml"
+    what = "supervision-mode set systemd-user --force while push"
+    with HolderSampler(shell_target.slave_path, 0.01, exclude=(os.getpid(),)) as sampler:
+        push = HeldPush(sw_env, shell_target, tmp_path, "supervision")
+        config_before = config.read_bytes()
+        r = subprocess.run([str(inst.cli_path), "supervision-mode", "set", "systemd-user", "--force"], env=env,
+                           capture_output=True, text=True, timeout=120, check=False)
+        data = _last_json(r.stdout)
+        assert r.returncode == 2, f"{what}：{r.stdout}\n{r.stderr}"
+        assert data is not None, f"{what}：{r.stdout}"
+        assert (data.get("ok"), data.get("error_code"), data.get("phase")) == \
+            (False, "SESSION_BUSY", "supervision_set_safety_check"), f"{what}：{data}"
+        assert data.get("force_ignored") is True, f"{what}：--force 只記 force_ignored：{data}"
+        assert data.get("previous_mode") == "on-demand", f"{what}：{data}"
+        busy = data.get("busy") or []
+        assert any(row.get("com") == "COM0" and row.get("foreground_busy") is True for row in busy), f"{what}：{data}"
+        calls = tool_log.read_text(encoding="utf-8").splitlines() if tool_log.exists() else []
+        stops = [c for c in calls if c.startswith("systemctl ")
+                 and any(w in c.split() for w in ("stop", "disable", "kill", "mask", "restart"))]
+        assert not stops, f"{what}：stub systemctl 不得收到停止／停用：{calls}"
+        assert not [c for c in calls if c.startswith(("loginctl ", "sudo "))], f"{what}：拒絕不得進入切換：{calls}"
+        assert config.read_bytes() == config_before, f"{what}：config.yaml 位元組不得改變"
+        inst.assert_unchanged()
+        _assert_daemon_untouched(sw_env, pid, what)
+        push.release_and_check(what)
+        _assert_single_holder(sampler, pid, what)
