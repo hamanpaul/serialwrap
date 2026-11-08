@@ -58,6 +58,8 @@ pub struct Service {
     pub(crate) registry: Arc<CommandRegistry>,
     pub(crate) procs: Arc<dyn ProcScan>,
     pub(crate) version: String,
+    pub(crate) code_fingerprint: Option<String>,
+    pub(crate) code_path: Option<String>,
     pub(crate) started_at: String,
     /// Python `_profile_count`：只計 explicit YAML target（RPC-H-17）。
     pub(crate) profile_count: usize,
@@ -76,6 +78,8 @@ pub struct ServiceDeps {
     pub registry: Arc<CommandRegistry>,
     pub procs: Arc<dyn ProcScan>,
     pub version: String,
+    pub code_fingerprint: Option<String>,
+    pub code_path: Option<String>,
     pub started_at: String,
     pub explicit_target_count: usize,
     /// Task 19：enabled 時才有值。
@@ -224,6 +228,8 @@ impl Service {
             registry: deps.registry,
             procs: deps.procs,
             version: deps.version,
+            code_fingerprint: deps.code_fingerprint,
+            code_path: deps.code_path,
             started_at: deps.started_at,
             profile_count: deps.explicit_target_count,
             allowlist: deps.test_device_allowlist.filter(|a| a.enabled),
@@ -300,10 +306,13 @@ impl Service {
         self.running.load(Ordering::SeqCst)
     }
 
-    /// dispatch＋`setdefault("version")`。
+    /// dispatch＋`setdefault("version")`／可用時的 `setdefault("code_fingerprint")`。
     pub fn rpc(&self, method: &str, params: &PyDict) -> Result<PyDict, PyErr> {
         let mut result = self.dispatch(method, params)?;
         result.setdefault("version", PyValue::from(self.version.clone()));
+        if let Some(fingerprint) = &self.code_fingerprint {
+            result.setdefault("code_fingerprint", PyValue::from(fingerprint.clone()));
+        }
         Ok(result)
     }
 

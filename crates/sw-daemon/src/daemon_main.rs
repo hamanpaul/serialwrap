@@ -32,8 +32,10 @@ use sw_proto::endpoint::Endpoint;
 use sw_proto::pycompat::{decode_utf8_strict, py_strip, PyOsError};
 use sw_proto::pyfmt::py_repr_str;
 use sw_proto::pypath::{self, HomeLookup, PathFlavor};
+use sw_proto::release_manifest::parse_current_release;
 use sw_proto::runtime_paths::{resolve_daemon_dirs, DaemonDirs, EnvSnapshot, NativeTraits, PathsError, RuntimePaths};
 
+use crate::code_identity::{capture as capture_code_identity, CodeIdentity};
 use crate::framing::RpcServer;
 use crate::service::{Service, ServiceDeps, ServiceHandler};
 
@@ -403,6 +405,95 @@ fn resolve_paths(p: &Platform) -> Result<RuntimePaths, String> {
             format!("serialwrap: invalid SERIALWRAP_TCP_PORT: {}\n", py_repr_str(&raw))
         }
     })
+}
+
+fn existing_manifest(p: &Platform, path: PathBuf) -> Option<PathBuf> {
+    (p.fs.exists(&path) && !p.fs.is_dir(&path)).then_some(path)
+}
+
+/// `sw-cli::install_layout::locate_manifest` 的 daemon 啟動期等價路徑。
+fn locate_code_manifest(
+    p: &Platform,
+    env: &EnvSnapshot,
+    paths: &RuntimePaths,
+    executable: Option<&Path>,
+) -> Option<PathBuf> {
+    let flavor = flavor_of(&p.caps);
+    let home = SysEnvHome(&*p.env);
+    if let Some(raw) = env
+        .get("SERIALWRAP_RELEASE_MANIFEST")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let expanded = pypath::expanduser(flavor, raw, env, &home);
+        let path = PathBuf::from(pypath::normpath(flavor, &expanded));
+        if let Some(path) = existing_manifest(p, path) {
+            return Some(path);
+        }
+    }
+
+    let bundle_root = executable.and_then(|path| path.parent()?.parent());
+    if let Some(root) = bundle_root {
+        if let Some(path) = existing_manifest(p, root.join("release-manifest.json")) {
+            return Some(path);
+        }
+    }
+
+    if flavor != PathFlavor::Windows {
+        return None;
+    }
+
+    let install_root = env
+        .get("SERIALWRAP_INSTALL_ROOT")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|raw| {
+            let expanded = pypath::expanduser(flavor, raw, env, &home);
+            PathBuf::from(expanded)
+        })
+        .unwrap_or_else(|| {
+            p.env.local_appdata()
+                .unwrap_or_else(|| PathBuf::from(&paths.data_dir))
+                .join("Programs")
+                .join("serialwrap")
+        });
+    let current_path = install_root.join("bin").join("current-release.json");
+    let current = p
+        .fs
+        .read(&current_path)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| parse_current_release(&text).ok())?;
+    let version_dir = if pypath::isabs(flavor, &current.dir) {
+        PathBuf::from(current.dir)
+    } else {
+        install_root.join(current.dir)
+    };
+    existing_manifest(p, version_dir.join("release-manifest.json"))
+}
+
+/// daemon 起動時只捕捉一次 manifest 指紋；讀取或解析失敗時不嘗試其他指紋來源。
+fn load_code_identity(p: &Platform, env: &EnvSnapshot, paths: &RuntimePaths) -> CodeIdentity {
+    let executable = p.env.current_exe().ok().map(|path| {
+        let real = p.env.realpath(&path).unwrap_or(path);
+        without_verbatim_prefix(&real)
+    });
+    let manifest = locate_code_manifest(p, env, paths, executable.as_deref());
+    capture_code_identity(executable.as_deref(), manifest.as_deref(), |path| {
+        p.fs.read(path).ok()
+    })
+}
+
+/// 對齊 CLI resolver，移除 Windows `realpath` 加入的 verbatim prefix。
+fn without_verbatim_prefix(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(unc) = text.strip_prefix("\\\\?\\UNC\\") {
+        PathBuf::from(format!("\\\\{unc}"))
+    } else if let Some(rest) = text.strip_prefix("\\\\?\\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
 }
 
 /// `default_isolation_paths()`：移除三個隔離變數後解析的預設路徑（HOME／XDG 照舊，每次重新讀取）。
@@ -1160,12 +1251,15 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
     manager.bootstrap_attach(); // P1 DF-14：bootstrap 在 watcher.start 之前
     hooks.trace(Stage::WatcherStart);
     let watcher = DeviceWatcher::start_with_baseline(src, WATCHER_POLL, manager.watcher_sender(), p.clock.clone(), initial);
+    let code_identity = load_code_identity(&p, &env, &paths);
     let svc = Arc::new(Service::new(ServiceDeps {
         manager: manager.clone(),
         wal: wal.clone(),
         registry: registry.clone(),
         procs: p.procs.clone(),
         version: sw_proto::version::version().to_string(),
+        code_fingerprint: code_identity.code_fingerprint,
+        code_path: code_identity.code_path,
         started_at: manager.now_iso(),
         explicit_target_count: explicit_targets,
         test_device_allowlist: allow.enabled.then(|| allow.clone()),

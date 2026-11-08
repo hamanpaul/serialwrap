@@ -299,6 +299,15 @@ impl ServiceRig {
     }
 
     fn build_with_console(spec: RigSpec, console: Option<Arc<RigPtyFactory>>) -> ServiceRig {
+        ServiceRig::build_with_code_identity(spec, console, None, Some("/fake/bundle".to_string()))
+    }
+
+    fn build_with_code_identity(
+        spec: RigSpec,
+        console: Option<Arc<RigPtyFactory>>,
+        code_fingerprint: Option<String>,
+        code_path: Option<String>,
+    ) -> ServiceRig {
         let serial = FakeSerialBackend::new();
         let mut devices = BTreeMap::new();
         let mut snapshot = Vec::new();
@@ -356,6 +365,8 @@ impl ServiceRig {
             registry: registry.clone(),
             procs: procs.clone(),
             version: RIG_VERSION.to_string(),
+            code_fingerprint,
+            code_path: code_path.or_else(|| Some("/fake/bundle".to_string())),
             started_at: RIG_STARTED_AT.to_string(),
             explicit_target_count: spec.explicit_target_count,
             test_device_allowlist: spec.allowlist,
@@ -391,6 +402,25 @@ impl ServiceRig {
             allowlist: None,
             wait_ready: vec!["COM0".into()],
         })
+    }
+
+    /// 指定 daemon 啟動快照的指紋與 bundle root，供健康狀態與一般 RPC 對齊測試使用。
+    pub fn ready_shell_with_code_identity(
+        code_fingerprint: Option<&str>,
+        code_path: Option<&str>,
+    ) -> ServiceRig {
+        ServiceRig::build_with_code_identity(
+            RigSpec {
+                yaml: format!("{TEMPLATES}targets:\n{}", target_line("COM0", BY_ID_A)),
+                devices: vec![(BY_ID_A.into(), REAL_A.into())],
+                explicit_target_count: 1,
+                allowlist: None,
+                wait_ready: vec!["COM0".into()],
+            },
+            None,
+            code_fingerprint.map(str::to_string),
+            code_path.map(str::to_string),
+        )
     }
 
     /// 兩個 shell target（COM0＝usb-A、COM1＝usb-B），裝置快照刻意以 usb-B 先列舉。

@@ -113,6 +113,8 @@ fn health_status_key_order_and_limits() {
             "ok",
             "pid",
             "version",
+            "code_fingerprint",
+            "code_path",
             "running",
             "started_at",
             "sessions",
@@ -2994,6 +2996,63 @@ fn health_status_templates_only_with_device_warns_no_profiles() {
     let w = k.iter().position(|x| *x == "warnings").unwrap();
     assert_eq!(k[w - 1], "limits");
     assert_eq!(k[w + 1], "multi_open");
+}
+
+#[test]
+fn wp57_status_carries_fingerprint_and_code_path() {
+    let r = ServiceRig::ready_shell_with_code_identity(
+        Some("0123456789ab"),
+        Some("/opt/serialwrap"),
+    );
+    let resp = r.call("health.status", "{}");
+    assert_eq!(
+        resp.get("code_fingerprint"),
+        Some(&PyValue::from("0123456789ab")),
+        "health.status 應帶 manifest 指紋：{}",
+        j(&resp)
+    );
+    assert_eq!(resp.get("code_path"), Some(&PyValue::from("/opt/serialwrap")));
+    let k = keys(&resp);
+    let version = k.iter().position(|key| *key == "version").unwrap();
+    assert_eq!(&k[version..version + 3], ["version", "code_fingerprint", "code_path"]);
+}
+
+#[test]
+fn wp57_every_rpc_response_carries_available_fingerprint() {
+    let r = ServiceRig::ready_shell_with_code_identity(Some("0123456789ab"), Some("/opt/serialwrap"));
+    for (method, params) in [("health.ping", "{}"), ("no.such.method", "{}")] {
+        let resp = r.call(method, params);
+        assert_eq!(
+            resp.get("code_fingerprint"),
+            Some(&PyValue::from("0123456789ab")),
+            "{method} 應帶啟動指紋：{}",
+            j(&resp)
+        );
+        assert_eq!(keys(&resp).last(), Some(&"code_fingerprint"));
+    }
+}
+
+#[test]
+fn wp57_rpc_reuses_startup_fingerprint_without_recomputing() {
+    let r = ServiceRig::ready_shell_with_code_identity(Some("startupfp001"), Some("/opt/serialwrap"));
+    for _ in 0..3 {
+        let ping = r.call("health.ping", "{}");
+        let unknown = r.call("no.such.method", "{}");
+        assert_eq!(ping.get("code_fingerprint"), Some(&PyValue::from("startupfp001")));
+        assert_eq!(unknown.get("code_fingerprint"), Some(&PyValue::from("startupfp001")));
+    }
+}
+
+#[test]
+fn wp57_unknown_fingerprint_is_null_in_status_and_omitted_from_rpc() {
+    let r = ServiceRig::ready_shell();
+    let status = r.call("health.status", "{}");
+    assert_eq!(status.get("code_fingerprint"), Some(&PyValue::Null));
+    assert_eq!(status.get("code_path"), Some(&PyValue::from("/fake/bundle")));
+    for method in ["health.ping", "no.such.method"] {
+        let resp = r.call(method, "{}");
+        assert_eq!(resp.get("code_fingerprint"), None, "{method}: {}", j(&resp));
+    }
 }
 
 #[test]

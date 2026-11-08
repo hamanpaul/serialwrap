@@ -6,3 +6,4 @@ pub mod framing;
 pub mod health;
 pub mod launcher;
 pub mod service;
+mod code_identity;

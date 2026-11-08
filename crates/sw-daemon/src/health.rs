@@ -1,7 +1,7 @@
 //! `health.ping`／`health.status` 回應組裝（arch §6.3、02 §7.1 key 順序；P5-T18）。
 //!
 //! 對照 Python `SerialwrapService.health()`：
-//! `ok, pid, version, running, started_at, sessions, devices, commands, wal_path, mirror_path, wal, limits,
+//! `ok, pid, version, code_fingerprint, code_path, running, started_at, sessions, devices, commands, wal_path, mirror_path, wal, limits,
 //! [warnings], multi_open, foreign_holders, multi_open_detail, [test_device_allowlist]`。
 //! `multi_open` 系列對照 `multi_open.detect_multi_open`（#101）與 `serial_port.unknown_holder_devices()`（#11）。
 
@@ -88,6 +88,16 @@ pub fn health(svc: &Service) -> PyDict {
         "ok" => true,
         "pid" => i64::from(svc.pid),
         "version" => svc.version.clone(),
+        "code_fingerprint" => svc
+            .code_fingerprint
+            .clone()
+            .map(PyValue::from)
+            .unwrap_or(PyValue::Null),
+        "code_path" => svc
+            .code_path
+            .clone()
+            .map(PyValue::from)
+            .unwrap_or(PyValue::Null),
         "running" => svc.is_running(),
         "started_at" => svc.started_at.clone(),
         "sessions" => int(sessions.len() as i128),

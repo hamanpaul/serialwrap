@@ -49,6 +49,8 @@ fn health_status_vanished_tty_holders_status_ok_like_detect_multi_open() {
         registry: rig.registry.clone(),
         procs: Arc::new(PosixProcScan::with_root(proc_root.path())),
         version: rig.version.clone(),
+        code_fingerprint: None,
+        code_path: Some("/fake/bundle".to_string()),
         started_at: "2026-10-29T00:00:00+00:00".to_string(),
         explicit_target_count: 1,
         test_device_allowlist: None,
