@@ -4161,3 +4161,65 @@ fn wp58_g14_rpc_clear_ready_with_device_returns_null_last_error() {
     assert_eq!(state.get("last_error"), Some(&PyValue::Null), "{}", j(&state));
     assert_ne!(state.get("bridge_generation").cloned(), gen0, "以新 bridge 重建");
 }
+
+/// WP5-8 第 4 項（G15，S1X-a-7）：RPC `device.release` 的 drain 收尾更新 `detached_at` 並重置 reprobe 進度
+/// （`origin/main:sw_core/session_manager.py:2920-2927`、`reset_reprobe_progress` `:651-654`；Python
+/// `tests/test_s1x_a7_drain_fields.py::test_release_refreshes_detached_at_and_resets_reprobe`）。
+/// 前置以真實 tick 累積進度：release 後重新 attach，一次性 `\n` 應答已用掉 → 登入停在 ATTACHED＋
+/// `PROMPT_UNAVAILABLE`，自動重探逐次失敗（attempts 遞增、`next_reprobe_at` 非 null）；`reprobe_exhausted` 由
+/// 非 false 歸零的路徑見 sw-core `drain_release.rs` 的 `wp58_g15_*`（CoreHarness 以 bootloader 尾行累積）。呼叫路徑：`Service::rpc("device.release")` →
+/// `route(SessionRequest::Release)` → `SessionCore` release 請求 → `begin_stop(Release)`（`BeginDrain`）→ IoWorker
+/// 停止後 `WorkerStopped` 回條 → `worker_stopped` Release 分支 → `finish_release`（`detached_at`＋`reprobe::reset`）
+/// → `persist_release` 落盤後回覆 waiter；之後 `session.get_state` 讀到同一組欄位。
+#[test]
+fn wp58_g15_rpc_release_refreshes_detached_at_and_resets_reprobe() {
+    use sw_pal::traits::Clock;
+    let r = ServiceRig::ready_shell();
+    let released = r.call("device.release", r#"{"selector":"COM0"}"#);
+    assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&released));
+    r.settle();
+    let attached = r.call("device.attach", r#"{"selector":"COM0"}"#);
+    assert_eq!(attached.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&attached));
+
+    let mut session = r.session("COM0").expect("COM0");
+    for _ in 0..30 {
+        if session.get("reprobe_attempts") != Some(&PyValue::from(0)) {
+            break;
+        }
+        wp56_advance_secs(&r, 1);
+        session = r.session("COM0").expect("COM0");
+    }
+    assert_eq!(s(&session, "state"), "ATTACHED", "{}", j(&session));
+    assert_ne!(session.get("reprobe_attempts"), Some(&PyValue::from(0)), "前置：attempts 非零：{}", j(&session));
+    assert!(
+        matches!(session.get("next_reprobe_at"), Some(PyValue::Float(_))),
+        "前置：next_reprobe_at 非 null：{}",
+        j(&session)
+    );
+    assert_eq!(s(&session, "last_error"), "PROMPT_UNAVAILABLE", "{}", j(&session));
+    // 舊值為首次 release 收尾的時間戳（修正前該處不寫入，為 null）；兩者都必須被本次收尾取代。
+    let old_detached_at = session.get("detached_at").cloned();
+
+    // 推進 wall，讓收尾寫入的時間戳可與舊值區分。
+    r.clock.set_wall_us(r.clock.wall_unix_us() + 3_600_000_000);
+    wp56_advance_secs(&r, 1);
+    let response = r.call("device.release", r#"{"selector":"COM0"}"#);
+    assert_eq!(
+        keys(&response),
+        vec!["ok", "session", "closed_consoles", "aborted_cmd", "version"],
+        "{}",
+        j(&response)
+    );
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&response));
+    let session = sub(&response, "session");
+    assert_eq!(s(&session, "state"), "RELEASED", "{}", j(&response));
+    assert_eq!(s(&session, "last_error"), "RELEASED", "{}", j(&response));
+    assert_ne!(session.get("detached_at").cloned(), old_detached_at, "detached_at 須更新：{}", j(&response));
+    assert_eq!(session.get("detached_at"), session.get("released_at"), "detached_at＝收尾時刻：{}", j(&response));
+    assert_eq!(session.get("reprobe_attempts"), Some(&PyValue::from(0)), "{}", j(&response));
+    assert_eq!(session.get("reprobe_exhausted"), Some(&PyValue::Bool(false)), "{}", j(&response));
+    assert_eq!(session.get("next_reprobe_at"), Some(&PyValue::Null), "{}", j(&response));
+    // 回應的 session 即同一時點的公開欄位（session.get_state），逐位元組一致。
+    let state = r.session("COM0").expect("COM0");
+    assert_eq!(j(&session), j(&state));
+}

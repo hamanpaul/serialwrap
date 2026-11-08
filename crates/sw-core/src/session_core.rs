@@ -1382,7 +1382,14 @@ impl SessionCore {
             self.clear_interactive();
             self.detach_captures();
             match &kind {
-                StopKind::Clear => self.set_last_error(Some("CLEARED".into()), None),
+                StopKind::Clear => {
+                    self.set_last_error(Some("CLEARED".into()), None);
+                    // S1X-a-7（G15）：Python `clear_session` 無 bridge 分支（`session_manager.py:3059-3064`）經
+                    // `_detach_session_locked`（`:2705-2707`）無條件寫 `detached_at`（原本已是 DETACHED 也寫；
+                    // `set_state` 同狀態不寫）並重置 reprobe 進度，回覆前再 reset 一次。
+                    self.detached_at = Some(self.wall_iso());
+                    crate::reprobe::reset(&mut self.reprobe);
+                }
                 StopKind::Removed => {
                     self.device_present = false;
                     self.known_real_path = None;
@@ -3796,7 +3803,12 @@ impl SessionCore {
             StopKind::IoError | StopKind::Recover | StopKind::Clear | StopKind::LoginFailed => {
                 match kind {
                     StopKind::IoError => self.set_last_error(None, None),
-                    StopKind::Clear => self.set_last_error(Some("CLEARED".into()), None),
+                    StopKind::Clear => {
+                        self.set_last_error(Some("CLEARED".into()), None);
+                        // S1X-a-7（G15）：`_complete_drain` clear 收尾（`session_manager.py:2936-2949`）DETACHED＋
+                        // `detached_at`（下方 `set_state` 自 RECOVERING 轉入時寫入）並重置 reprobe 進度。
+                        crate::reprobe::reset(&mut self.reprobe);
+                    }
                     StopKind::LoginFailed => {}
                     _ => {}
                 }
@@ -3944,6 +3956,12 @@ impl SessionCore {
         self.released_at = Some(self.wall_iso());
         self.released_reason = reason;
         self.set_last_error(Some("RELEASED".into()), None);
+        // S1X-a-7（G15）：比照 0.3.2 release 更新 `detached_at` 並重置 reprobe 進度——drain 收尾
+        // `_complete_drain` `session_manager.py:2925-2927`；無 bridge／開埠在途經 `_detach_session_locked`
+        // `:2705-2707`。`set_state` 只在轉入 DETACHED 時寫 `detached_at`，RELEASED 須在此收尾寫入。呼叫端皆為
+        // 非 RELEASED 的首次 release；已 RELEASED 的冪等 release 不經此處，不刷新 provenance。
+        self.detached_at = Some(self.wall_iso());
+        crate::reprobe::reset(&mut self.reprobe);
         self.set_state(SessionState::Released, now);
     }
 

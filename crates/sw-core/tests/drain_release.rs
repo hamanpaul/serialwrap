@@ -1540,7 +1540,7 @@ mod wp58_g13_inflight_attach_after_removal_returns_not_present {
 //   `state="ATTACHING"`、`last_error=None`，再 `_spawn_attach`；`clear_session` `:3065-3082` 於 `_await_drain` 後
 //   組回應，所以回應與即時狀態都是 ATTACHING＋null，不必等新的 `DeviceAttached`（裁決 D6，取代審查 F97）。
 // - 無 bridge：`clear_session` `:3059-3064`，裝置在場 ATTACHING＋None，不在場 DETACHED＋`CLEARED`。
-// 對應 Python `tests/test_s1x_a7_drain_fields.py:64-93`；該檔要求的 reprobe 歸零由 WP5-8 第 4 項承接。
+// 對應 Python `tests/test_s1x_a7_drain_fields.py:64-93`；該檔要求的 detached_at 更新與 reprobe 歸零見下方 G15 段。
 
 /// clear 回應＝Python `{"ok": True, "session": session.to_public_dict()}`（同一時點逐位元組相同），並核對即時狀態。
 fn g14_assert_clear(reply: &PyDict, h: &CoreHarness, state: &str, last_error: PyValue) {
@@ -1632,6 +1632,316 @@ fn wp58_g14_clear_absent_without_worker_keeps_cleared() {
     assert!(!g14_has_reattach(&effects) && !g14_has_open_bridge(&effects), "裝置不在不得再 attach");
     let reply = rx.try_recv().expect("無 bridge 立即回覆").expect("ok");
     g14_assert_clear(&reply, &h, "DETACHED", PyValue::from("CLEARED"));
+}
+
+// ---- WP5-8 第 4 項（G15，S1X-a-7）：release／clear 收尾更新 `detached_at` 並重置 reprobe 進度 ----
+//
+// Python 基線（`origin/main:sw_core/session_manager.py`）：
+// - 有 bridge（drain）：`_complete_drain` release 分支 `:2920-2927` 設 RELEASED＋`released_*`，並比照 0.3.2
+//   `detached_at = now_iso()`＋`_reset_reprobe_progress_locked`；clear 分支 `:2936-2953` 設 DETACHED＋
+//   `detached_at = now_iso()`＋reset，裝置在場再改 ATTACHING＋`last_error=None`。
+// - 無 bridge：release `:3176-3183` 與 clear `:3059-3064` 經 `_detach_session_locked` `:2702-2707`
+//   （`detached_at`＋reset）。
+// - reset＝`SessionRuntime.reset_reprobe_progress` `:651-654`：attempts=0、`next_reprobe_at=None`、exhausted=False。
+// - 已 RELEASED 的冪等 release（`:3139-3141`；開埠在途 `_finish_attach_op` `:4343-4348` 只在非 RELEASED 才
+//   detach）不更新 `detached_at`、`released_at`、`released_by`、`released_reason`。
+// 對應 Python `tests/test_s1x_a7_drain_fields.py:49-93`；fixture 以真實 tick／登入結果事件累積 reprobe 進度，
+// 不以預設為零的新 session 代替。
+
+/// 第一個 `StartLogin` 的 `(epoch, fsm_gen)`。
+fn g15_start_login(effects: &[Effect]) -> Option<(u64, u64)> {
+    effects.iter().find_map(|effect| match effect {
+        Effect::StartLogin { epoch, fsm_gen, .. } => Some((*epoch, *fsm_gen)),
+        _ => None,
+    })
+}
+
+/// 逐秒推進 FakeClock 並收集 Tick 效果。
+fn g15_advance(h: &mut CoreHarness, secs: u64) -> Vec<Effect> {
+    let mut all = Vec::new();
+    for _ in 0..secs {
+        all.extend(h.advance(Duration::from_secs(1)));
+    }
+    all
+}
+
+/// 對應 Python `_ready` fixture 的舊欄位：`detached_at` 為舊時間戳、`reprobe_attempts=2`、`reprobe_exhausted=True`。
+/// 1. 自動開埠失敗 → DETACHED（`set_state` 寫入舊 `detached_at`）。
+/// 2. 手動 attach → 登入未就緒 → ATTACHED＋`PROMPT_UNAVAILABLE`（不經 DETACHED，`detached_at` 維持舊值）。
+/// 3. 第一次自動重探失敗 → attempts=1；第二次 RX 尾行為 bootloader → attempts=2＋exhausted＋`BOOTLOADER_STUCK`。
+///
+/// 回傳舊 `detached_at`；bridge 仍在（release／clear 走 drain）。
+fn g15_attached_with_reprobe_history() -> (CoreHarness, PyValue) {
+    let mut h = g13_detached_with_device();
+    let old_detached_at = h.public()["detached_at"].clone();
+    assert!(
+        matches!(old_detached_at, PyValue::Str(_)),
+        "前置：開埠失敗後 detached_at 已寫入：{old_detached_at:?}"
+    );
+    let (attach_rx, _) = h.rpc_deferred(SessionRequest::DeviceAttach { force: false });
+    let effects = h.bridge_ok();
+    let (epoch, fsm_gen) = g15_start_login(&effects).expect("手動 attach 進入登入");
+    assert_eq!(attach_rx.try_recv().unwrap().unwrap()["ok"], PyValue::Bool(true));
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: LoginOutcome::NotReady("PROMPT_UNAVAILABLE".into()),
+        after_rx_seq: None,
+    });
+    assert_eq!(h.public()["state"], PyValue::from("ATTACHED"));
+
+    let (epoch, fsm_gen) =
+        g15_start_login(&g15_advance(&mut h, 4)).expect("ATTACHED＋PROMPT_UNAVAILABLE 自動重探");
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: LoginOutcome::NotReady("PROMPT_UNAVAILABLE".into()),
+        after_rx_seq: None,
+    });
+    assert_eq!(h.public()["reprobe_attempts"], PyValue::from(1));
+
+    let (epoch, fsm_gen) = g15_start_login(&g15_advance(&mut h, 3)).expect("退避後第二次自動重探");
+    let now = sw_pal::traits::Clock::mono_ns(&*h.clock);
+    h.rx.append(b"\r\n=> ", now, epoch, 9_999);
+    h.rx(b"\r\n=> ");
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: LoginOutcome::NotReady("SHELL_PROMPT_TIMEOUT".into()),
+        after_rx_seq: None,
+    });
+    let public = h.public();
+    assert_eq!(public["state"], PyValue::from("ATTACHED"));
+    assert_eq!(public["last_error"], PyValue::from("BOOTLOADER_STUCK"));
+    assert_eq!(public["reprobe_attempts"], PyValue::from(2), "前置：attempts 非零");
+    assert_eq!(public["reprobe_exhausted"], PyValue::Bool(true), "前置：exhausted");
+    assert_eq!(public["detached_at"], old_detached_at, "前置：ATTACHED 期間 detached_at 未變");
+    assert!(h.core.generations().conn_epoch.is_some(), "前置：bridge 仍在");
+    (h, old_detached_at)
+}
+
+/// 無 bridge 版：DETACHED、裝置在場、attempts=1 且 `next_reprobe_at` 非 null。
+/// 1. 開埠成功 → 登入 `SHELL_PROMPT_TIMEOUT` 終態 → drain → DETACHED（`detached_at` 寫入）。
+/// 2. tick：DETACHED＋逾時類錯誤 → `_prepare_reprobe_locked` attach 分支記一次 attempt（設 `next_reprobe_at`）並開埠。
+/// 3. 開埠失敗 → DETACHED（`detached_at` 再寫一次，即本 fixture 的舊值），沒有 bridge。
+fn g15_detached_with_reprobe_history() -> (CoreHarness, PyValue) {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.attach_device();
+    h.bridge_ok();
+    let (epoch, fsm_gen) = (h.epoch(), h.core.generations().fsm_gen);
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: LoginOutcome::Failed("SHELL_PROMPT_TIMEOUT".into()),
+        after_rx_seq: None,
+    });
+    let (stop_epoch, stop) = h.pending_stop();
+    h.receipt(stop_epoch, stop).feed();
+    assert_eq!(h.public()["state"], PyValue::from("DETACHED"));
+    let effects = g15_advance(&mut h, 4);
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::OpenBridge { .. })),
+        "DETACHED＋逾時類錯誤 → 自動 attach"
+    );
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Err(OpenFailure::Other(PalError::io(5, "open failed"))),
+    });
+    let public = h.public();
+    assert_eq!(public["state"], PyValue::from("DETACHED"));
+    assert_eq!(public["reprobe_attempts"], PyValue::from(1), "前置：attempts 非零");
+    assert!(
+        matches!(public["next_reprobe_at"], PyValue::Float(_)),
+        "前置：next_reprobe_at 非 null：{:?}",
+        public["next_reprobe_at"]
+    );
+    assert!(matches!(public["detached_at"], PyValue::Str(_)));
+    assert_eq!(h.core.generations().conn_epoch, None, "前置：沒有 bridge");
+    assert!(!h.core.drain_in_progress(), "前置：沒有開埠在途");
+    (h, public["detached_at"].clone())
+}
+
+/// 推進 FakeClock 與 wall，讓收尾寫入的時間戳可與舊值區分。
+fn g15_move_time(h: &mut CoreHarness) {
+    g15_advance(h, 1);
+    h.jump_wall_us(5_000_000);
+}
+
+fn g15_now_iso(h: &CoreHarness) -> PyValue {
+    PyValue::from(format!("wall-us-{}", h.wall_us()))
+}
+
+/// reprobe 三欄已歸零（Python `reset_reprobe_progress`）。
+fn g15_assert_reprobe_reset(public: &PyDict, case: &str) {
+    assert_eq!(public["reprobe_attempts"], PyValue::from(0), "{case}：{}", g13_wire(public));
+    assert_eq!(public["reprobe_exhausted"], PyValue::Bool(false), "{case}：{}", g13_wire(public));
+    assert_eq!(public["next_reprobe_at"], PyValue::Null, "{case}：{}", g13_wire(public));
+}
+
+fn g15_assert_released(reply: &PyDict, h: &CoreHarness, old_detached_at: &PyValue, case: &str) {
+    assert_eq!(reply["ok"], PyValue::Bool(true), "{case}：{}", g13_wire(reply));
+    let public = h.public();
+    assert_eq!(reply["session"], PyValue::Dict(public.clone()), "{case}：回應 session＝即時公開欄位");
+    assert_eq!(public["state"], PyValue::from("RELEASED"), "{case}");
+    assert_eq!(public["last_error"], PyValue::from("RELEASED"), "{case}");
+    assert_ne!(&public["detached_at"], old_detached_at, "{case}：detached_at 須更新");
+    assert_eq!(public["detached_at"], g15_now_iso(h), "{case}：detached_at＝收尾時刻");
+    assert_eq!(public["released_at"], g15_now_iso(h), "{case}：released_at＝收尾時刻");
+    g15_assert_reprobe_reset(&public, case);
+    assert!(
+        h.state_store.last_released().contains_key("t:COM0"),
+        "{case}：release 已落盤"
+    );
+}
+
+#[test]
+fn wp58_g15_release_refreshes_detached_at_and_resets_reprobe() {
+    // Python `test_release_refreshes_detached_at_and_resets_reprobe`：有 bridge 的 release 走 drain，
+    // receipt 與落盤完成後 RELEASED、detached_at 更新、reprobe 歸零、last_error=RELEASED。
+    let (mut h, old_detached_at) = g15_attached_with_reprobe_history();
+    g15_move_time(&mut h);
+    let (rx, _) = h.rpc_deferred(release());
+    assert!(rx.try_recv().is_err(), "drain 回條前不得回覆 release");
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).handle_closed(true).feed();
+    let reply = rx.try_recv().expect("drain 收尾後回覆 release").expect("ok");
+    g15_assert_released(&reply, &h, &old_detached_at, "drain release");
+}
+
+#[test]
+fn wp58_g15_release_without_worker_refreshes_detached_at_and_resets_reprobe() {
+    // 無 bridge 對照（Python `release_device` `:3176-3183` → `_detach_session_locked`）。
+    let (mut h, old_detached_at) = g15_detached_with_reprobe_history();
+    g15_move_time(&mut h);
+    let (rx, _) = h.rpc_deferred(release());
+    let reply = rx.try_recv().expect("無 bridge 立即回覆 release").expect("ok");
+    g15_assert_released(&reply, &h, &old_detached_at, "無 worker release");
+}
+
+#[test]
+fn wp58_g15_clear_present_refreshes_detached_at_and_resets_reprobe() {
+    // Python `test_clear_with_device_present_clears_last_error`：state=ATTACHING、last_error=None、
+    // detached_at 更新、reprobe_attempts=0（另核對 exhausted／next_reprobe_at 也歸零）。
+    let (mut h, old_detached_at) = g15_attached_with_reprobe_history();
+    g15_move_time(&mut h);
+    let (rx, _) = h.rpc_deferred(SessionRequest::Clear);
+    assert!(rx.try_recv().is_err(), "drain 回條前不得回覆 clear");
+    let (epoch, stop) = h.pending_stop();
+    let effects = h.receipt(epoch, stop).feed();
+    assert!(g14_has_reattach(&effects), "裝置在場需交 manager 再解析後 attach");
+    let reply = rx.try_recv().expect("drain 收尾後回覆 clear").expect("ok");
+    g14_assert_clear(&reply, &h, "ATTACHING", PyValue::Null);
+    let public = h.public();
+    assert_ne!(public["detached_at"], old_detached_at, "detached_at 須更新");
+    assert_eq!(public["detached_at"], g15_now_iso(&h), "detached_at＝收尾時刻");
+    g15_assert_reprobe_reset(&public, "drain clear（裝置在場）");
+}
+
+#[test]
+fn wp58_g15_clear_absent_keeps_cleared_and_resets_reprobe() {
+    // Python `test_clear_without_device_keeps_cleared`：state=DETACHED、last_error=CLEARED；`_complete_drain`
+    // `:2936-2949` 同樣更新 detached_at 並 reset（不論裝置是否在場）。
+    let (mut h, old_detached_at) = g15_attached_with_reprobe_history();
+    h.feed(ControlEvent::DeviceMissing);
+    g15_move_time(&mut h);
+    let (rx, _) = h.rpc_deferred(SessionRequest::Clear);
+    let (epoch, stop) = h.pending_stop();
+    let effects = h.receipt(epoch, stop).feed();
+    assert!(!g14_has_reattach(&effects) && !g14_has_open_bridge(&effects), "裝置不在不得再 attach");
+    let reply = rx.try_recv().expect("drain 收尾後回覆 clear").expect("ok");
+    g14_assert_clear(&reply, &h, "DETACHED", PyValue::from("CLEARED"));
+    let public = h.public();
+    assert_ne!(public["detached_at"], old_detached_at, "detached_at 須更新");
+    assert_eq!(public["detached_at"], g15_now_iso(&h), "detached_at＝收尾時刻");
+    g15_assert_reprobe_reset(&public, "drain clear（裝置不在）");
+}
+
+#[test]
+fn wp58_g15_clear_without_worker_refreshes_detached_at_and_resets_reprobe() {
+    // 無 bridge 對照（Python `clear_session` `:3059-3064`：`_detach_session_locked` `:2702-2707` 無條件寫
+    // `detached_at`＋reset 後再 reset）：裝置在場 ATTACHING＋None、不在場 DETACHED＋CLEARED，兩路 detached_at
+    // 皆更新（即使原本已是 DETACHED）、reprobe 皆歸零。
+    let (mut h, old_detached_at) = g15_detached_with_reprobe_history();
+    g15_move_time(&mut h);
+    let (rx, effects) = h.rpc_deferred(SessionRequest::Clear);
+    assert!(g14_has_reattach(&effects), "裝置在場需交 manager 再解析後 attach");
+    let reply = rx.try_recv().expect("無 bridge 立即回覆").expect("ok");
+    g14_assert_clear(&reply, &h, "ATTACHING", PyValue::Null);
+    let public = h.public();
+    assert_ne!(public["detached_at"], old_detached_at, "裝置在場：detached_at 須更新");
+    assert_eq!(public["detached_at"], g15_now_iso(&h), "裝置在場：detached_at＝收尾時刻");
+    g15_assert_reprobe_reset(&public, "無 worker clear（裝置在場）");
+
+    let (mut h, old_detached_at) = g15_detached_with_reprobe_history();
+    h.feed(ControlEvent::DeviceMissing);
+    g15_move_time(&mut h);
+    let (rx, effects) = h.rpc_deferred(SessionRequest::Clear);
+    assert!(!g14_has_reattach(&effects) && !g14_has_open_bridge(&effects), "裝置不在不得再 attach");
+    let reply = rx.try_recv().expect("無 bridge 立即回覆").expect("ok");
+    g14_assert_clear(&reply, &h, "DETACHED", PyValue::from("CLEARED"));
+    let public = h.public();
+    assert_ne!(public["detached_at"], old_detached_at, "裝置不在：detached_at 須更新");
+    assert_eq!(public["detached_at"], g15_now_iso(&h), "裝置不在：detached_at＝收尾時刻");
+    g15_assert_reprobe_reset(&public, "無 worker clear（裝置不在）");
+}
+
+/// release 的 provenance 欄位（重複 release 不得改寫）。
+fn g15_provenance(h: &CoreHarness) -> Vec<(&'static str, PyValue)> {
+    let public = h.public();
+    ["released_by", "released_at", "released_reason", "detached_at", "last_error", "state"]
+        .into_iter()
+        .map(|key| (key, public[key].clone()))
+        .collect()
+}
+
+#[test]
+fn wp58_g15_repeat_release_keeps_provenance() {
+    // 已 RELEASED 的冪等 release（Python `release_device` `:3139-3141` → `already_released`）不 detach：
+    // 第二次 release 不刷新 detached_at／released_*。
+    let (mut h, _) = g15_attached_with_reprobe_history();
+    let (rx, _) = h.rpc_deferred(release());
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).feed();
+    assert_eq!(rx.try_recv().unwrap().unwrap()["ok"], PyValue::Bool(true));
+    let first = g15_provenance(&h);
+    g15_move_time(&mut h);
+    let again = h.rpc(release()).unwrap();
+    assert_eq!(again["already_released"], PyValue::Bool(true));
+    assert_eq!(g15_provenance(&h), first, "冪等 release 不得刷新 provenance");
+}
+
+#[test]
+fn wp58_g15_repeat_release_during_released_attach_keeps_provenance() {
+    // 自 RELEASED 發起 attach、開埠在途時再 release（Python `_finish_attach_op` `:4343-4348` 只在非 RELEASED
+    // 才 detach、`released_at = released_at or now_iso()`）：開埠完成後 drain 收尾，provenance 與 detached_at 不變。
+    let (mut h, _) = g15_attached_with_reprobe_history();
+    let (rx, _) = h.rpc_deferred(release());
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).feed();
+    assert_eq!(rx.try_recv().unwrap().unwrap()["ok"], PyValue::Bool(true));
+    let first = g15_provenance(&h);
+    g15_move_time(&mut h);
+    let (_attach_rx, _) = h.rpc_deferred(SessionRequest::DeviceAttach { force: false });
+    let (again_rx, _) = h.rpc_deferred(release());
+    let opened = h.opened_bridge(REAL_PATH);
+    let late_epoch = opened.epoch;
+    let drain = h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Ok(opened),
+    });
+    let stop_id = drain
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::BeginDrain { stop_id, epoch } if *epoch == late_epoch => Some(*stop_id),
+            _ => None,
+        })
+        .expect("晚到的 bridge 須 drain");
+    h.receipt(late_epoch, stop_id).feed();
+    let again = again_rx.try_recv().expect("drain 收尾後回覆").expect("ok");
+    assert_eq!(again["already_released"], PyValue::Bool(true), "{}", g13_wire(&again));
+    assert_eq!(g15_provenance(&h), first, "冪等 release 不得刷新 provenance");
 }
 
 #[test]
