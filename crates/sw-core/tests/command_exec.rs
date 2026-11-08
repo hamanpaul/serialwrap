@@ -1583,6 +1583,270 @@ fn wp53_passthrough_adopt_publishes_bridge_flag() {
 }
 
 // ---------------------------------------------------------------------------
+// WP5-3 第 5 項：`command_expect_reboot` WAL META（G3；Python `origin/main:sw_core/session_manager.py:6842-6851`、
+// 契約 `contracts/wal_meta_events.schema.json:63-85`）。只在旗標 true 時寫，位置在 reboot 分流與命令 UART TX 之前；
+// 不分命令文字是否猜中、也不排除 passthrough（裁決 s2 D2）。
+// ---------------------------------------------------------------------------
+
+/// WAL 紀錄中隨時間變動的欄位（`seq`／`mono_ts_ns`／`wall_ts`）；其餘欄位逐位元組比對。
+const WP53_DYNAMIC_WAL_KEYS: [&str; 3] = ["seq", "mono_ts_ns", "wall_ts"];
+
+fn wp53_seq(row: &PyDict) -> i64 {
+    row.get("seq")
+        .and_then(PyValue::as_i64)
+        .unwrap_or_else(|| panic!("WAL 紀錄缺 seq：{row:?}"))
+}
+
+/// 去除動態欄位後以 RPC_WIRE 序列化（WAL 落盤為 sort_keys，載回的鍵順序即落盤順序）。
+fn wp53_static_row(row: &PyDict) -> String {
+    let pairs = row
+        .0
+        .iter()
+        .filter(|(k, _)| !WP53_DYNAMIC_WAL_KEYS.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    sw_proto::pyjson::dumps(
+        &PyValue::Dict(PyDict::from_pairs(pairs)),
+        &sw_proto::pyjson::RPC_WIRE,
+    )
+}
+
+/// 契約 `command_expect_reboot` 的完整外層紀錄（去除動態欄位）：`dir=META`、`source=system`、非 null `cmd_id`、
+/// 空 payload（`len=0`、空 payload 的 CRC32 `00000000`）、`meta={"event":"command_expect_reboot","expect_reboot":true}`。
+fn wp53_expected_meta_row(cmd_id: &str) -> String {
+    format!(
+        "{{\"cmd_id\":\"{cmd_id}\",\"com\":\"COM0\",\"crc32\":\"00000000\",\"dir\":\"META\",\"len\":0,\
+         \"loss_flag\":false,\"meta\":{{\"event\":\"command_expect_reboot\",\"expect_reboot\":true}},\
+         \"payload_b64\":\"\",\"source\":\"system\"}}"
+    )
+}
+
+fn wp53_meta_event(row: &PyDict) -> Option<String> {
+    match row.get("meta") {
+        Some(PyValue::Dict(m)) => m.get("event").and_then(PyValue::as_str).map(str::to_string),
+        _ => None,
+    }
+}
+
+/// WAL 內 `event == command_expect_reboot` 的 META 紀錄（整筆外層紀錄）。
+fn wp53_expect_reboot_rows(h: &ActorRig) -> Vec<PyDict> {
+    h.wal_all_rows()
+        .into_iter()
+        .filter(|r| r.get("dir").and_then(PyValue::as_str) == Some("META"))
+        .filter(|r| wp53_meta_event(r).as_deref() == Some("command_expect_reboot"))
+        .collect()
+}
+
+/// WAL 內屬於 `cmd_id` 的紀錄（任何 dir），依寫入順序。
+fn wp53_cmd_rows(h: &ActorRig, cmd_id: &str) -> Vec<PyDict> {
+    h.wal_all_rows()
+        .into_iter()
+        .filter(|r| r.get("cmd_id").and_then(PyValue::as_str) == Some(cmd_id))
+        .collect()
+}
+
+/// 旗標命令恰有一筆契約形狀的 `command_expect_reboot` META，且它是本 cmd_id 的第一筆 WAL 紀錄，
+/// seq 小於本命令 TX 的 seq（送 UART 前寫入）。
+fn assert_wp53_meta_before_tx(h: &ActorRig, case: &str, cmd_id: &str, tx: &[u8]) {
+    let metas = wp53_expect_reboot_rows(h);
+    assert_eq!(metas.len(), 1, "{case}：旗標命令恰一筆 META：{metas:?}");
+    assert_eq!(
+        wp53_static_row(&metas[0]),
+        wp53_expected_meta_row(cmd_id),
+        "{case}：META 外層紀錄須符合契約"
+    );
+    let rows = wp53_cmd_rows(h, cmd_id);
+    let tx_rows: Vec<&PyDict> = rows
+        .iter()
+        .filter(|r| r.get("dir").and_then(PyValue::as_str) == Some("TX") && b64(r) == tx)
+        .collect();
+    assert_eq!(tx_rows.len(), 1, "{case}：本命令 TX 恰一筆：{rows:?}");
+    assert!(
+        wp53_seq(&metas[0]) < wp53_seq(tx_rows[0]),
+        "{case}：META seq {} 須小於命令 TX seq {}",
+        wp53_seq(&metas[0]),
+        wp53_seq(tx_rows[0])
+    );
+    assert_eq!(
+        wp53_seq(&rows[0]),
+        wp53_seq(&metas[0]),
+        "{case}：META 為本 cmd_id 的第一筆 WAL 紀錄：{rows:?}"
+    );
+}
+
+/// 對照 `tests/test_expect_reboot.py::test_flag_routes_chained_command_to_reboot_handler` 的
+/// `any(event == "command_expect_reboot")`：Python 於 `if expect_reboot or guessed_reboot` 分流之前寫 META，
+/// 不看命令文字是否猜中，也不排除 passthrough。三個獨立 rig：串接命令、單獨 `reboot`（猜中＋旗標）、
+/// passthrough 的 `reset`。
+#[test]
+fn wp53_meta_before_command_tx() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let id = h.submit_with(WP53_CHAINED, |r| {
+        r.timeout_s = 1.0;
+        r.expect_reboot = true;
+    });
+    wait_tx(&h, b"echo a && reboot\n");
+    advance_until(&h, Duration::from_millis(100), "串接旗標命令收尾", |h| {
+        is_done(h, &id)
+    });
+    assert_eq!(
+        h.command_get(&id)["recovery_action"],
+        PyValue::from("EXPECT_REBOOT")
+    );
+    assert_wp53_meta_before_tx(&h, "串接命令", &id, b"echo a && reboot\n");
+
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let id = h.submit_with("reboot", |r| {
+        r.timeout_s = 10.0;
+        r.expect_reboot = true;
+    });
+    wait_tx(&h, b"reboot\n");
+    advance_until(&h, Duration::from_millis(100), "單獨 reboot 旗標命令收尾", |h| {
+        is_done(h, &id)
+    });
+    assert_wp53_meta_before_tx(&h, "單獨 reboot", &id, b"reboot\n");
+
+    let h = passthrough_ready(UBOOT_PASSTHROUGH_PROFILE);
+    h.dev
+        .on_tx_reply(b"reset\n", b"reset\r\nresetting ...\r\n=> ");
+    let id = h.submit_with("reset", |r| {
+        r.timeout_s = 6.0;
+        r.expect_reboot = true;
+    });
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["partial"], PyValue::Bool(false), "{rec:?}");
+    assert_wp53_meta_before_tx(&h, "passthrough reset", &id, b"reset\n");
+}
+
+/// 對照 `tests/test_expect_reboot.py::test_flag_wins_over_completion_regex`：旗標＋合法 `completion_regex` 時
+/// 只寫 `command_expect_reboot`，不得寫 `command_completion`（Python 的 completion META 在 reboot 分流之後）。
+#[test]
+fn wp53_meta_flag_suppresses_completion_meta() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev
+        .on_tx_reply(b"echo a && reboot\n", b"echo a && reboot\r\na\r\nDONE\r\n");
+    let id = h.submit_with(WP53_CHAINED, |r| {
+        r.timeout_s = 1.0;
+        r.expect_reboot = true;
+        r.completion_regex = Some("(?m)^DONE\\r?$".into());
+    });
+    wait_tx(&h, b"echo a && reboot\n");
+    advance_until(&h, Duration::from_millis(100), "旗標命令收尾", |h| {
+        is_done(h, &id)
+    });
+    let events: Vec<Option<String>> = wp53_cmd_rows(&h, &id)
+        .iter()
+        .filter(|r| r.get("dir").and_then(PyValue::as_str) == Some("META"))
+        .map(wp53_meta_event)
+        .collect();
+    assert_eq!(
+        events,
+        vec![Some("command_expect_reboot".to_string())],
+        "本 cmd_id 的 META 只有 command_expect_reboot"
+    );
+    assert_wp53_meta_before_tx(&h, "旗標＋completion_regex", &id, b"echo a && reboot\n");
+}
+
+/// 無旗標對照（`tests/test_expect_reboot.py::test_without_flag_chained_command_keeps_old_behaviour`、
+/// `::test_plain_reboot_without_flag_is_unchanged`）：串接命令與猜中的單獨 `reboot` 都不寫 expect-reboot META；
+/// 一般 completion 命令維持原本恰一筆 `command_completion` META（鍵與值不變）。
+#[test]
+fn wp53_meta_absent_without_flag() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let id = h.submit_with(WP53_CHAINED, |r| r.timeout_s = 1.0);
+    wait_tx(&h, b"echo a && reboot\n");
+    advance_until(&h, Duration::from_millis(100), "無旗標串接命令收尾", |h| {
+        is_done(h, &id)
+    });
+    assert_eq!(h.command_get(&id)["recovery_action"], PyValue::from("CTRL_C"));
+    assert!(
+        wp53_expect_reboot_rows(&h).is_empty(),
+        "無旗標串接命令不寫 META：{:?}",
+        wp53_expect_reboot_rows(&h)
+    );
+
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let id = h.submit_with("reboot", |r| r.timeout_s = 10.0);
+    wait_tx(&h, b"reboot\n");
+    advance_until(&h, Duration::from_millis(100), "無旗標 reboot 收尾", |h| {
+        is_done(h, &id)
+    });
+    assert_eq!(
+        h.command_get(&id)["recovery_action"],
+        PyValue::from("EXPECT_REBOOT"),
+        "猜中的單獨 reboot 仍走 reboot 分支"
+    );
+    assert!(
+        wp53_expect_reboot_rows(&h).is_empty(),
+        "無旗標 reboot 不寫 META：{:?}",
+        wp53_expect_reboot_rows(&h)
+    );
+
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev
+        .on_tx_reply(b"runit\n", b"runit\r\nout\r\nRC=0\r\nroot@t:/# ");
+    let id = h.submit_with("runit", |r| {
+        r.completion_regex = Some("(?m)^RC=0\\r?$".into())
+    });
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["stdout"], PyValue::from("out\nRC=0"), "{rec:?}");
+    let metas: Vec<PyDict> = wp53_cmd_rows(&h, &id)
+        .into_iter()
+        .filter(|r| r.get("dir").and_then(PyValue::as_str) == Some("META"))
+        .collect();
+    assert_eq!(metas.len(), 1, "{metas:?}");
+    assert_eq!(
+        wp53_static_row(&metas[0]),
+        format!(
+            "{{\"cmd_id\":\"{id}\",\"com\":\"COM0\",\"crc32\":\"00000000\",\"dir\":\"META\",\"len\":0,\
+             \"loss_flag\":false,\"meta\":{{\"completion_regex\":\"(?m)^RC=0\\\\r?$\",\"event\":\"command_completion\"}},\
+             \"payload_b64\":\"\",\"source\":\"system\"}}"
+        ),
+        "一般 completion META 不變"
+    );
+    assert!(wp53_expect_reboot_rows(&h).is_empty());
+}
+
+/// 被 submit-time gate（尚未 READY）或 execute-time gate（agent interactive lease）拒絕的旗標命令不寫 META，且零 TX
+/// （Python META 位於 `execute_command` 的 gate（`session_manager.py:6561-6592`）與 `_execute_command_inner` 的
+/// operation 檢查之後）。
+#[test]
+fn wp53_meta_not_written_when_gated() {
+    // 假 DUT 不回 prompt：登入 probe 卡住，session 停在 READY 之前（ATTACHING／ATTACHED 皆回 SESSION_NOT_READY）。
+    let h = ActorRig::new(SHELL_PROFILE).attach();
+    let mut req = agent_submit(WP53_CHAINED);
+    req.expect_reboot = true;
+    let resp = h.request(SessionRequest::Submit(req));
+    assert_eq!(resp["error_code"], PyValue::from("SESSION_NOT_READY"), "{resp:?}");
+    assert!(wp53_expect_reboot_rows(&h).is_empty(), "submit-time 拒絕不寫 META");
+    assert!(!wal_tx_has(&h, b"echo a && reboot\n"), "submit-time 拒絕零 TX");
+
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let open = h.request(SessionRequest::InteractiveOpen {
+        owner: "agent:wp53".into(),
+        timeout_s: 20.0,
+        command: String::new(),
+        allow_attached: false,
+    });
+    let iid = open["interactive_id"].as_str().unwrap().to_string();
+    let id = h.submit_with(WP53_CHAINED, |r| r.expect_reboot = true);
+    let rec = h.wait_done(&id);
+    assert_eq!(
+        rec["error_code"],
+        PyValue::from("SESSION_INTERACTIVE_BUSY"),
+        "{rec:?}"
+    );
+    assert!(wp53_expect_reboot_rows(&h).is_empty(), "execute-time 拒絕不寫 META");
+    assert!(wp53_cmd_rows(&h, &id).is_empty(), "execute-time 拒絕零 WAL 紀錄");
+    assert!(!wal_tx_has(&h, b"echo a && reboot\n"), "execute-time 拒絕零 TX");
+    let close = h.request(SessionRequest::InteractiveClose {
+        interactive_id: iid,
+    });
+    assert_eq!(close["ok"], PyValue::Bool(true));
+}
+
+// ---------------------------------------------------------------------------
 // recover
 // ---------------------------------------------------------------------------
 

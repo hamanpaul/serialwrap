@@ -555,6 +555,22 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     // 一律走 reboot 分支；命令文字猜法只對非 passthrough 生效。分流先於 completion pattern 與
     // `command_completion` META，故旗標優先於 `completion_regex`。
     let guessed_reboot = !passthrough && is_reboot_command(command);
+    if q.req.expect_reboot {
+        // Python `session_manager.py:6842-6851`：旗標 true 即於分流與命令 TX 之前寫稽核 META（不看是否猜中、
+        // 不排除 passthrough）；契約 `contracts/wal_meta_events.schema.json` 的 `command_expect_reboot`。
+        let mut meta = PyDict::new();
+        meta.insert("event", PyValue::from("command_expect_reboot"));
+        meta.insert("expect_reboot", PyValue::Bool(true));
+        let _ = ctx.wal.append(WalAppendReq {
+            com: &ctx.com,
+            dir: "META",
+            source: "system",
+            payload: b"",
+            cmd_id: Some(cmd_id),
+            loss_flag: false,
+            meta: Some(meta),
+        });
+    }
     if q.req.expect_reboot || guessed_reboot {
         // Python `session_manager.py:6860-6864`：旗標且非猜中（串接命令、passthrough）→ prompt 何時回來由
         // `--cmd-timeout`／`--expected-duration` 界定；猜中的單獨 reboot 傳 `None`，維持 `min(timeout, 2 s)`。
