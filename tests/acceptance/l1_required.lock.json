@@ -2106,6 +2106,8 @@
           "cargo:sw-daemon::dispatch::wp58_g13_rpc_device_attach_during_login_returns_ok_session",
           "cargo:sw-daemon::dispatch::wp58_g14_rpc_clear_ready_with_device_returns_null_last_error",
           "cargo:sw-daemon::dispatch::wp58_g15_rpc_release_refreshes_detached_at_and_resets_reprobe",
+          "cargo:sw-daemon::dispatch::wp58_rpc_device_attach_during_clear_drain_returns_session_recovering",
+          "cargo:sw-daemon::dispatch::wp58_rpc_device_attach_during_release_returns_session_recovering",
           "cargo:sw-daemon::event_lifecycle::bridge_queries_reflect_manager_state",
           "cargo:sw-daemon::event_lifecycle::engine_started_before_bootstrap_attach",
           "cargo:sw-daemon::event_lifecycle::shutdown_aborts_long_handler_within_budget",

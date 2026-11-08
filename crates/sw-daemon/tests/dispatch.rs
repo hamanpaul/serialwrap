@@ -4303,8 +4303,13 @@ fn wp58_g11_rpc_failed_interactive_submit_releases_lease() {
         "command.submit",
         r#"{"selector":"COM0","cmd":"top","mode":"interactive"}"#,
     );
-    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&response));
-    let record = wp55_wait_done(&r, s(&response, "cmd_id"));
+    let cmd_id = s(&response, "cmd_id").to_string();
+    assert_eq!(
+        j(&response),
+        wp51_submit_success_response(&r, &cmd_id, None, None, "agent"),
+        "interactive submit 的完整 RPC 回應"
+    );
+    let record = wp55_wait_done(&r, &cmd_id);
     // 錯誤碼沿用既有部分寫入映射（`interactive_mode_command_partial_send_maps_aborted_in_flight`）。
     assert_eq!(s(&record, "error_code"), "COMMAND_ABORTED_IN_FLIGHT", "{}", j(&record));
     r.settle();
@@ -4370,6 +4375,12 @@ fn wp58_g13_rpc_device_attach_during_login_returns_ok_session() {
     let session = sub(&second, "session");
     assert_eq!(s(&session, "state"), "ATTACHING", "{}", j(&second));
     assert_eq!(s(&session, "com"), "COM0");
+    let expected = sw_proto::pydict! {
+        "ok" => true,
+        "session" => PyValue::Dict(session.clone()),
+        "version" => r.version.clone(),
+    };
+    assert_eq!(j(&second), j(&expected), "在途 attach 的完整 RPC 回應");
     // 回應的 session 即同一時點的公開欄位（session.get_state），逐位元組一致。
     let state = r.session("COM0").expect("COM0");
     assert_eq!(j(&session), j(&state));
@@ -4404,6 +4415,12 @@ fn wp58_g14_rpc_clear_ready_with_device_returns_null_last_error() {
     assert_eq!(s(&session, "com"), "COM0");
     assert_eq!(s(&session, "state"), "ATTACHING", "{}", j(&cleared));
     assert_eq!(session.get("last_error"), Some(&PyValue::Null), "{}", j(&cleared));
+    let expected = sw_proto::pydict! {
+        "ok" => true,
+        "session" => PyValue::Dict(session.clone()),
+        "version" => r.version.clone(),
+    };
+    assert_eq!(j(&cleared), j(&expected), "clear 回應的完整 wire 形狀");
 
     // 再解析後重新開埠並登入：一次性 `\n` 應答已在啟動登入時用掉，等登入 probe 送出後補 prompt。
     wait_until("clear 後重新開埠", || dev.open_count() > opens);
@@ -4472,7 +4489,129 @@ fn wp58_g15_rpc_release_refreshes_detached_at_and_resets_reprobe() {
     assert_eq!(session.get("reprobe_attempts"), Some(&PyValue::from(0)), "{}", j(&response));
     assert_eq!(session.get("reprobe_exhausted"), Some(&PyValue::Bool(false)), "{}", j(&response));
     assert_eq!(session.get("next_reprobe_at"), Some(&PyValue::Null), "{}", j(&response));
+    let expected = sw_proto::pydict! {
+        "ok" => true,
+        "session" => PyValue::Dict(session.clone()),
+        "closed_consoles" => 0,
+        "aborted_cmd" => false,
+        "version" => r.version.clone(),
+    };
+    assert_eq!(j(&response), j(&expected), "release 回應的完整 wire 形狀");
     // 回應的 session 即同一時點的公開欄位（session.get_state），逐位元組一致。
     let state = r.session("COM0").expect("COM0");
     assert_eq!(j(&session), j(&state));
+}
+
+/// 以 ServiceRig 的 RPC session 快照組成完整 SESSION_RECOVERING 預期；session 動態欄位沿用同一 fixture，
+/// 外層鍵與值則逐位元組核對 `RPC_WIRE`，對應 Python `device.attach` 的 drain／release 在途回應。
+fn wp58_assert_device_attach_recovering(r: &ServiceRig, response: &PyDict) {
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(false)), "{}", j(response));
+    assert_eq!(s(response, "error_code"), "SESSION_RECOVERING", "{}", j(response));
+    assert_eq!(response.get("drain_stalled"), Some(&PyValue::Bool(false)), "{}", j(response));
+    assert_eq!(response.get("drain_timeout_epoch"), Some(&PyValue::Null), "{}", j(response));
+    let session = sub(response, "session");
+    assert_eq!(s(&session, "state"), "RECOVERING", "{}", j(response));
+    assert_eq!(j(&session), j(&r.session("COM0").expect("COM0 session")),
+        "RPC 回應的 session 必須等於同一時點的 session.get_state");
+    let expected = sw_proto::pydict! {
+        "ok" => false,
+        "error_code" => "SESSION_RECOVERING",
+        "drain_stalled" => false,
+        "drain_timeout_epoch" => PyValue::Null,
+        "session" => PyValue::Dict(session),
+        "version" => r.version.clone(),
+    };
+    assert_eq!(j(response), j(&expected), "SESSION_RECOVERING 完整 RPC 回應");
+}
+
+/// 正式 RPC 接線：`device.attach` 遇 `session.clear` drain 等待已提交 UART write 收尾時，仍回完整
+/// `SESSION_RECOVERING`；放開 FakeDevice 後 clear 完成並重新回 READY。這與 G13 的一般登入在途成功分流互補。
+#[test]
+fn wp58_rpc_device_attach_during_clear_drain_returns_session_recovering() {
+    use std::sync::Arc;
+    use sw_pal::fakes::FakeWriteStep;
+
+    let r = Arc::new(ServiceRig::ready_shell());
+    let dev = r.device(REAL_A);
+    let tx_mark = dev.tx_len();
+    dev.script_write(vec![FakeWriteStep::BlockForever]);
+    let submitted = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"echo wp58-drain","timeout_s":10}"#,
+    );
+    let cmd_id = s(&submitted, "cmd_id").to_string();
+    assert_eq!(j(&submitted), wp51_submit_success_response(&r, &cmd_id, None, None, "agent"),
+        "被 drain 的命令 submit 完整 RPC 回應");
+    dev.wait_blocked();
+    assert_eq!(String::from_utf8_lossy(&dev.tx_since(tx_mark)), "echo wp58-drain\n");
+    let opens_before_clear = dev.open_count();
+    let reattach_tx_mark = dev.tx_len();
+
+    let clear_rig = Arc::clone(&r);
+    let clear = std::thread::spawn(move || clear_rig.call("session.clear", r#"{"selector":"COM0"}"#));
+    wait_until("clear drain 進入 RECOVERING", || {
+        r.session("COM0")
+            .and_then(|session| session.get("state").and_then(PyValue::as_str).map(str::to_string))
+            .as_deref()
+            == Some("RECOVERING")
+    });
+
+    let attach = r.call("device.attach", r#"{"selector":"COM0"}"#);
+    wp58_assert_device_attach_recovering(&r, &attach);
+    assert_eq!(String::from_utf8_lossy(&dev.tx_since(tx_mark)), "echo wp58-drain\n", "在途 attach 零額外 TX");
+
+    dev.release_block();
+    let clear_response = clear.join().expect("clear RPC thread");
+    assert_eq!(clear_response.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&clear_response));
+    wait_until("clear drain 重開 UART", || dev.open_count() > opens_before_clear);
+    wait_until("clear drain 重開後送登入 probe", || dev.tx_since(reattach_tx_mark).contains(&b'\n'));
+    dev.push_rx(b"root@t:/# ");
+    wait_until("clear 後重掛回 READY", || {
+        r.session("COM0")
+            .and_then(|session| session.get("state").and_then(PyValue::as_str).map(str::to_string))
+            .as_deref()
+            == Some("READY")
+    });
+    assert_eq!(s(&wp55_wait_done(&r, &cmd_id), "status"), "error");
+}
+
+/// 正式 RPC 接線：`device.attach` 遇 `device.release` 尚在等待 worker 關閉時仍回完整
+/// `SESSION_RECOVERING`；放開 FakeDevice 後 release 成功並停在 RELEASED。
+#[test]
+fn wp58_rpc_device_attach_during_release_returns_session_recovering() {
+    use std::sync::Arc;
+    use sw_pal::fakes::FakeWriteStep;
+
+    let r = Arc::new(ServiceRig::ready_shell());
+    let dev = r.device(REAL_A);
+    let tx_mark = dev.tx_len();
+    dev.script_write(vec![FakeWriteStep::BlockForever]);
+    let submitted = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"echo wp58-release","timeout_s":10}"#,
+    );
+    let cmd_id = s(&submitted, "cmd_id").to_string();
+    assert_eq!(j(&submitted), wp51_submit_success_response(&r, &cmd_id, None, None, "agent"),
+        "被 release 的命令 submit 完整 RPC 回應");
+    dev.wait_blocked();
+    assert_eq!(String::from_utf8_lossy(&dev.tx_since(tx_mark)), "echo wp58-release\n");
+
+    let release_rig = Arc::clone(&r);
+    let release = std::thread::spawn(move || release_rig.call("device.release", r#"{"selector":"COM0"}"#));
+    wait_until("release drain 進入 RECOVERING", || {
+        r.session("COM0")
+            .and_then(|session| session.get("state").and_then(PyValue::as_str).map(str::to_string))
+            .as_deref()
+            == Some("RECOVERING")
+    });
+
+    let attach = r.call("device.attach", r#"{"selector":"COM0"}"#);
+    wp58_assert_device_attach_recovering(&r, &attach);
+    assert_eq!(String::from_utf8_lossy(&dev.tx_since(tx_mark)), "echo wp58-release\n", "在途 attach 零額外 TX");
+
+    dev.release_block();
+    let released = release.join().expect("release RPC thread");
+    assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&released));
+    r.wait_state("COM0", "RELEASED");
+    assert_eq!(s(&wp55_wait_done(&r, &cmd_id), "status"), "error");
 }
