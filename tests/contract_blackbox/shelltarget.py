@@ -20,6 +20,10 @@
 - `half_prompt`：收到含此子字串的輸入行後，shell 下一個 prompt 只回前半段，之後完全靜默。
 - `slow_reader_bps`：以 `bps/10` bytes/s 限速讀取 master A（8N1），對 daemon 形成寫入背壓。
 
+讀取暫停（`hold_read_on(marker)`／`read_held()`／`release_read()`）：master A 讀到 `marker`（可跨兩次 read）後即停止讀取
+master A（該次 read 的 bytes 照常記錄、轉送與回顯），shell 輸出照常回傳。daemon 之後寫入的 bytes 留在 kernel PTY 緩衝，
+緩衝滿後 daemon 的寫入在 `release_read()` 之前無法完成——以「寫入量大於緩衝」而非等待時間製造確定性寫入背壓。
+
 POSIX 限定（pty／termios；需要 util-linux `setsid`）。stdlib only，不得 import sw_core／serialwrap／serialwrapd。
 """
 from __future__ import annotations
@@ -115,6 +119,9 @@ class ShellTarget:
         self._b: int | None = None
         self._wake_r: int | None = None
         self._wake_w: int | None = None
+        self._hold_marker: bytes | None = None
+        self._hold_tail = b""
+        self._read_held = False
         self.arm(echo_stall_after=echo_stall_after, silent_after=silent_after, half_prompt=half_prompt)
 
     # ------------------------------------------------------------------ 控制
@@ -138,6 +145,27 @@ class ShellTarget:
             self._line_buf = bytearray()
             self._line_len = 0
             self._carry = bytearray()
+
+    def hold_read_on(self, marker: bytes) -> None:
+        """自此刻起，master A 讀到 `marker` 後停止讀取 master A，直到 `release_read()`（見模組說明「讀取暫停」）。"""
+        if not marker:
+            raise ValueError("marker 不得為空")
+        with self._lock:
+            self._hold_marker = bytes(marker)
+            self._hold_tail = b""
+            self._read_held = False
+
+    def read_held(self) -> bool:
+        """已讀到 `hold_read_on()` 的 marker、目前停止讀取 master A。"""
+        with self._lock:
+            return self._read_held
+
+    def release_read(self) -> None:
+        """解除讀取暫停並取消尚未觸發的 marker（relay 於下一輪 select（≤0.2 s）恢復讀取）。"""
+        with self._lock:
+            self._hold_marker = None
+            self._hold_tail = b""
+            self._read_held = False
 
     def start(self) -> "ShellTarget":
         if os.name != "posix":
@@ -227,6 +255,15 @@ class ShellTarget:
     def _process_input(self, data: bytes, to_shell: bytearray, to_dut: bytearray) -> None:
         """daemon → DUT 的 bytes：記錄、套用故障注入、轉送給 shell 並產生回顯（持鎖呼叫）。"""
         self._rx += data
+        marker = self._hold_marker
+        if marker is not None:
+            seen = self._hold_tail + data
+            if marker in seen:
+                self._read_held = True
+                self._hold_marker = None
+                self._hold_tail = b""
+            else:
+                self._hold_tail = seen[len(seen) - (len(marker) - 1):] if len(marker) > 1 else b""
         for i in range(len(data)):
             byte = data[i:i + 1]
             self._in_count += 1
@@ -291,7 +328,8 @@ class ShellTarget:
                 tokens = min(tokens + (now - last) * rate, max(1.0, rate / 10.0))
             last = now
             rlist = [wake]
-            can_read_a = rate is None or tokens >= 1.0
+            held = self._read_held
+            can_read_a = not held and (rate is None or tokens >= 1.0)
             if can_read_a:
                 rlist.append(a)
             if not shell_dead:
@@ -301,7 +339,7 @@ class ShellTarget:
                 wlist.append(b)
             if to_dut and slave_open:
                 wlist.append(a)
-            timeout = 0.2 if can_read_a else max(0.001, (1.0 - tokens) / rate)
+            timeout = 0.2 if (can_read_a or held or rate is None) else max(0.001, (1.0 - tokens) / rate)
             try:
                 rr, ww, _ = select.select(rlist, wlist, [], timeout)
             except (OSError, ValueError):

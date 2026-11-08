@@ -3,7 +3,7 @@
 (a) `sw_env.start`＋`shell_target` 到 READY，DUT 端 `rx_log()` 含 ready probe，READY 期間 slave 只有 daemon 持有；
     `sw_env.stop()` 後 daemon 行程、socket 與 tty 持有皆消失（對 Python 基線；Rust artifact 以同一檔再跑）；
 (b) ShellTarget 單獨運作：HOME／TMPDIR／cwd 指向案例暫存目錄、`hide_tools`、`echo_stall_after`、`line_limit`、
-    `silent_after`、`half_prompt`、`slow_reader_bps`；
+    `silent_after`、`half_prompt`、`slow_reader_bps`、`hold_read_on`（讀到 marker 停讀／`release_read`）；
 (c) `HolderSampler` 在 `ExternalHolder` 存活期間 `max_concurrent()==1`、結束後為 0，且只有該單一 pid 持有；
     flock 衝突、TIOCEXCL（EBUSY）與不存在路徑一律 `ExternalHolderOpenError`；
 (d) `fake_mcu` 收到 `55 55` 回 `00 cc`、之後每個封包回 `00 cc`；`FakeFlasher` 的 baud 反映在 `current_speed()`。
@@ -249,6 +249,46 @@ def test_shell_target_slow_reader(make_shell):
     time.sleep(0.3)
     assert len(st.rx_log()) - base < len(payload), "2400 bps（240 B/s）下 0.3 s 內不得讀完 201 bytes"
     deadline = time.monotonic() + 10
+    while len(st.rx_log()) - base < len(payload) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert st.rx_log()[base:] == payload
+
+
+@pytest.mark.posix_pty
+@pytest.mark.process_rpc
+def test_shell_target_hold_read_on_marker(make_shell):
+    """`hold_read_on`：讀到 marker 後停讀，寫入方塞滿 kernel 緩衝即 EAGAIN、DUT 端不再增加；`release_read` 後全數送達。"""
+    st, peer = make_shell()
+    base = len(st.rx_log())
+    st.hold_read_on(b"#hold-mark")
+    assert not st.read_held()
+    payload = b"#hold-mark" + b"." * 89 + b"\n" + (b"#" + b"y" * 98 + b"\n") * 2000  # shell 註解行
+    os.set_blocking(peer.fd, False)
+    sent = 0
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            sent += os.write(peer.fd, payload[sent:])
+        except BlockingIOError:
+            if st.read_held():
+                break
+            time.sleep(0.01)
+    assert st.read_held(), "讀到 marker 後應停讀"
+    assert sent < len(payload), "停讀後寫入方無法寫完（kernel 緩衝有限）"
+    held_rx = len(st.rx_log())
+    assert held_rx - base < len(payload)
+    time.sleep(0.3)  # 觀察窗（證明停讀期間不再讀取），不作同步點
+    assert len(st.rx_log()) == held_rx
+    with pytest.raises(BlockingIOError):
+        os.write(peer.fd, payload[sent:])
+    st.release_read()
+    assert not st.read_held()
+    deadline = time.monotonic() + 10
+    while sent < len(payload) and time.monotonic() < deadline:
+        try:
+            sent += os.write(peer.fd, payload[sent:])
+        except BlockingIOError:
+            time.sleep(0.01)
     while len(st.rx_log()) - base < len(payload) and time.monotonic() < deadline:
         time.sleep(0.05)
     assert st.rx_log()[base:] == payload
