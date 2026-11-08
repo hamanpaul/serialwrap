@@ -2085,9 +2085,13 @@ impl SessionCore {
         }
 
         if !self.is_passthrough() {
-            // `service._resolve_session_id` 的 gate 段（RPC 的 `human:` source 一律視同 agent，DF-02）。
+            // `service._resolve_session_id` 的 gate 段：有界化終態照 `get_session_state` 先評估（不論來源），
+            // 三個拒絕分支只對非可信者生效（`if not trusted_human`，`service.py:800`）。可信＝RPC 依原始 source
+            // 判定的 `trusted_human` OR HumanConsole（OD-74、rulings s2 D5）；永不看 `source` 字首（DF-02）。
             self.expire_reconfirm(now);
-            if self.quiet.failed || self.quiet.quiet_active(now) || self.quiet.pending {
+            if !req.is_trusted_human()
+                && (self.quiet.failed || self.quiet.quiet_active(now) || self.quiet.pending)
+            {
                 let public = self.public(now, &self.public_ctx());
                 if let Some(result) = crate::quiet_gate::submit_gate_reject(&public, &req.source) {
                     return vec![Effect::Reply(reply, Ok(result))];
@@ -2657,6 +2661,7 @@ impl SessionCore {
         let quiet_active = self.quiet.quiet_active(now);
         let blocks_probe = boot_quiet_blocks_probe(&self.quiet, &self.profile, now);
         let reconfirm_pending = self.quiet.pending;
+        let passthrough = self.is_passthrough();
         self.deps.fence.with(|f| {
             f.active_epoch = Some(epoch);
             f.fsm_gen = self.generations.fsm_gen;
@@ -2666,6 +2671,9 @@ impl SessionCore {
             f.quiet_active = quiet_active;
             f.probe_quiet_exempt = quiet_active && !blocks_probe;
             f.reconfirm_pending = reconfirm_pending;
+            // WP5-3 第 4 項：每次 adopt 明確覆寫 bridge 的 passthrough 屬性（Python `_push_tx_gate` 以
+            // `agent_gate_active()` 發布 `_gate_quiet`，passthrough 固定 False）；profile 只在無 bridge 時可換。
+            f.bridge_passthrough = passthrough;
         });
         let mut effects = vec![Effect::AdoptBridge {
             epoch,
@@ -4284,8 +4292,10 @@ impl SessionCore {
         if self.state != SessionState::Ready || self.generations.conn_epoch.is_none() {
             return Some(pydict! { "ok" => false, "error_code" => "SESSION_NOT_READY" });
         }
-        // 07 D-10（DF-02）：只有 line editor 產生的 HumanConsole 視為 human；RPC 的 `human:` source 一律以 agent 對待。
-        let human = matches!(command.req.origin, SubmitOrigin::HumanConsole { .. });
+        // DF-02／OD-74（rulings s2 D5）：可信 human＝RPC 依原始 source 判定的 `trusted_human` OR line editor 的
+        // HumanConsole；永不看 `source` 字首（Python `session_manager.py:6549`，RPC 一律帶明確布林）。
+        // quiet gate 與下方 lease 判斷共用此結果（`:6573-6588`）。
+        let human = command.req.is_trusted_human();
         if !human && !self.is_passthrough() {
             // `_agent_gate_reject_locked`＋SC-03（execute 層）；expire 翻轉時同步 fence。
             let was_failed = self.quiet.failed;
@@ -4307,7 +4317,9 @@ impl SessionCore {
     /// execute-time 順序的 lease 段（`_refresh_interactive_locked` → 非 interactive 遇 lease：agent 遇 human lease 放行）。
     fn execute_time_lease_reject(&mut self, command: &QueuedCommand, now: Mono) -> Option<PyDict> {
         let mode = normalized_mode(&command.req.mode);
-        let human = matches!(command.req.origin, SubmitOrigin::HumanConsole { .. });
+        // 與 `execute_time_gate_reject` 共用可信 human 判定（OD-74、rulings s2 D5；Python `session_manager.py:6573-6588`
+        // 的 quiet gate 與 lease 判斷同一個 `human`）：RPC 的 `trusted_human` OR HumanConsole，永不看 `source` 字首。
+        let human = command.req.is_trusted_human();
         self.refresh_lease(now);
         if let Some(lease) = self.lease.as_ref() {
             if mode != "interactive" && !(!human && lease.is_human()) {
@@ -4444,7 +4456,12 @@ impl SessionCore {
                 self.create_background_capture(&command.cmd_id, now);
                 self.background_cmd_ids.push(command.cmd_id.clone());
             }
-            let reboot = !self.is_passthrough() && is_reboot_command(&command.req.command);
+            // G3（Python `session_manager.py:6840-6868`）：與 `OpRunner::run_command` 相同的 reboot 判定——
+            // `expect_reboot` 不看命令文字、不排除 passthrough；命令文字猜法只對非 passthrough 生效。此值一致流入
+            // 送出前的 deferred 失效、`PendingOp::Command.reboot`（完成後只清 quiet）、`foreground_reboot`
+            // （TX 結算 arm）與 TxWriter 的 `reboot_arm_op`（Python `_handle_reboot_command` 不分旗標或猜中）。
+            let reboot = command.req.expect_reboot
+                || (!self.is_passthrough() && is_reboot_command(&command.req.command));
             self.command_fg_begin(&command.req.origin, false);
             self.fg_cmd_timeout_s = command.req.timeout_s;
             if reboot {

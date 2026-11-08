@@ -902,6 +902,951 @@ fn reboot_flushes_commands_queued_behind_it() {
 }
 
 // ---------------------------------------------------------------------------
+// WP5-3 第 1 項：`expect_reboot` 執行路由（G3；Python `origin/main:sw_core/session_manager.py:6840-6868`）
+// ---------------------------------------------------------------------------
+
+/// 串接式重開命令：`is_reboot_command()` 不猜中（不擴大猜法），只能靠 `expect_reboot` 旗標分流。
+const WP53_CHAINED: &str = "echo a && reboot";
+
+/// 是否送出過救援鍵（`_recover_after_failure` 的 CTRL_C／CTRL_D；WAL 與 PAL 兩端都查）。
+fn wp53_recover_keys_sent(h: &ActorRig) -> bool {
+    let wal = tx_rows(h).iter().any(|row| {
+        row.get("source").and_then(PyValue::as_str) == Some("system:recover")
+            || matches!(b64(row).as_slice(), b"\x03" | b"\x04")
+    });
+    wal || h.dev.take_tx().iter().any(|b| matches!(b, 0x03 | 0x04))
+}
+
+/// WAL 內帶 `completion_regex` 欄位的 META（Python `test_flag_wins_over_completion_regex` 斷言其不存在）。
+fn wp53_completion_metas(h: &ActorRig) -> Vec<PyDict> {
+    h.wal_meta_events()
+        .into_iter()
+        .filter(|meta| meta.get("completion_regex").is_some())
+        .collect()
+}
+
+/// 對照 `tests/test_expect_reboot.py::test_flag_routes_chained_command_to_reboot_handler`：Python
+/// `if expect_reboot or guessed_reboot: return self._handle_reboot_command(...)`——旗標不受命令文字限制。
+/// 短 timeout、DUT 不回 prompt → reboot 分支結算為 `EXPECT_REBOOT`（partial），不得走一般逾時救援送 Ctrl-C／Ctrl-D。
+#[test]
+fn wp53_route_flag_uses_reboot_handler() {
+    assert!(
+        !sw_core::quiet_gate::is_reboot_command(WP53_CHAINED),
+        "串接命令不得被猜中（不擴大猜法）"
+    );
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let id = h.submit_with(WP53_CHAINED, |r| {
+        r.timeout_s = 1.0;
+        r.expect_reboot = true;
+    });
+    wait_tx(&h, b"echo a && reboot\n");
+    advance_until(&h, Duration::from_millis(100), "旗標命令收尾", |h| {
+        is_done(h, &id)
+    });
+    let rec = h.command_get(&id);
+    assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    assert_eq!(rec["execution_mode"], PyValue::from("line"), "{rec:?}");
+    assert_eq!(rec["stdout"], PyValue::from(""), "{rec:?}");
+    assert_eq!(rec["partial"], PyValue::Bool(true), "{rec:?}");
+    assert_eq!(
+        rec["recovery_action"],
+        PyValue::from("EXPECT_REBOOT"),
+        "{rec:?}"
+    );
+    assert_eq!(rec["error_code"], PyValue::Null, "{rec:?}");
+    assert_eq!(rec["expect_reboot"], PyValue::Bool(true), "{rec:?}");
+    assert!(
+        !wp53_recover_keys_sent(&h),
+        "旗標命令走 reboot 分支，不得送救援鍵"
+    );
+}
+
+/// 對照 `tests/test_expect_reboot.py::test_flag_wins_over_completion_regex`：reboot 分流位於 completion pattern
+/// 與 `command_completion` META 之前。假 DUT 只回 `DONE`、不回 prompt：不得因 `DONE` 正常完成，
+/// 也不得寫出帶 `completion_regex` 的 META，結算為 reboot recovery。
+#[test]
+fn wp53_route_flag_wins_over_completion_regex() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev
+        .on_tx_reply(b"echo a && reboot\n", b"echo a && reboot\r\na\r\nDONE\r\n");
+    let id = h.submit_with(WP53_CHAINED, |r| {
+        r.timeout_s = 1.0;
+        r.expect_reboot = true;
+        r.completion_regex = Some("(?m)^DONE\\r?$".into());
+    });
+    wait_tx(&h, b"echo a && reboot\n");
+    advance_until(&h, Duration::from_millis(100), "旗標命令收尾", |h| {
+        is_done(h, &id)
+    });
+    let rec = h.command_get(&id);
+    assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    assert_eq!(
+        rec["partial"],
+        PyValue::Bool(true),
+        "不得依 completion_regex 正常完成：{rec:?}"
+    );
+    assert_eq!(
+        rec["recovery_action"],
+        PyValue::from("EXPECT_REBOOT"),
+        "{rec:?}"
+    );
+    assert_eq!(rec["stdout"], PyValue::from(""), "{rec:?}");
+    assert!(
+        wp53_completion_metas(&h).is_empty(),
+        "reboot 分流先於 command_completion META：{:?}",
+        wp53_completion_metas(&h)
+    );
+    assert!(!wp53_recover_keys_sent(&h), "不得送救援鍵");
+}
+
+/// 無旗標對照（`tests/test_expect_reboot.py::test_without_flag_chained_command_keeps_old_behaviour`）：
+/// 串接命令不被猜中 → 維持一般命令路徑；逾時走 `_recover_after_failure` 送 CTRL_C。
+#[test]
+fn wp53_route_without_flag_keeps_timeout_recovery() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let id = h.submit_with(WP53_CHAINED, |r| r.timeout_s = 1.0);
+    wait_tx(&h, b"echo a && reboot\n");
+    advance_until(&h, Duration::from_millis(100), "逾時救援收尾", |h| {
+        is_done(h, &id)
+    });
+    let rec = h.command_get(&id);
+    assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    assert_eq!(rec["partial"], PyValue::Bool(true), "{rec:?}");
+    assert_eq!(rec["recovery_action"], PyValue::from("CTRL_C"), "{rec:?}");
+    assert_eq!(rec["expect_reboot"], PyValue::Bool(false), "{rec:?}");
+    assert!(wal_tx_has(&h, b"\x03"), "一般路徑逾時送 CTRL_C");
+    assert_eq!(state_of(&h), "READY");
+}
+
+/// 無旗標對照：串接命令帶 `completion_regex` 時仍依 regex 正常完成，並寫出 `command_completion` META。
+#[test]
+fn wp53_route_without_flag_completion_regex_completes() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev
+        .on_tx_reply(b"echo a && reboot\n", b"echo a && reboot\r\na\r\nDONE\r\n");
+    let id = h.submit_with(WP53_CHAINED, |r| {
+        r.timeout_s = 1.0;
+        r.completion_regex = Some("(?m)^DONE\\r?$".into());
+    });
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    assert_eq!(rec["partial"], PyValue::Bool(false), "{rec:?}");
+    assert_eq!(rec["recovery_action"], PyValue::Null, "{rec:?}");
+    assert_eq!(rec["stdout"], PyValue::from("a\nDONE"), "{rec:?}");
+    let metas = wp53_completion_metas(&h);
+    assert_eq!(metas.len(), 1, "{metas:?}");
+    assert_eq!(metas[0]["event"], PyValue::from("command_completion"));
+    assert!(!wp53_recover_keys_sent(&h));
+    assert_eq!(state_of(&h), "READY");
+}
+
+// ---------------------------------------------------------------------------
+// WP5-3 第 2 項：reboot prompt 等待時間（G3；Python `origin/main:sw_core/session_manager.py:6394`、
+// `:6448-6449`、`:6860-6864`）。旗標且非猜中 → `max(timeout_s, expected_duration_s or 0.0)`；
+// 其餘（猜中的單獨 reboot）→ `min(timeout_s, 2.0)`。
+// ---------------------------------------------------------------------------
+
+const WP53_PROMPT: &[u8] = b"\r\nroot@t:/# ";
+
+/// 送出命令後讓 OpRunner 進入 prompt 等待（期限以 FakeClock 起算，此期間時鐘不動），回傳等待起點。
+fn wp53_wait_started(h: &ActorRig, tx: &[u8]) -> Duration {
+    wait_tx(h, tx);
+    std::thread::sleep(Duration::from_millis(150));
+    h.clock.elapsed()
+}
+
+/// 以 250 ms FakeClock 步進（每步讓出 80 ms 實時，長於 RX 等待的 50 ms 時鐘切片，確保 OpRunner 觀察到每一步），
+/// 直到 `cond` 成立或自 `start` 起推進滿 `limit_s`；回傳成立時距 `start` 的 FakeClock 秒數（未成立為 `None`）。
+fn wp53_step_until(
+    h: &ActorRig,
+    start: Duration,
+    limit_s: f64,
+    mut cond: impl FnMut(&ActorRig) -> bool,
+) -> Option<f64> {
+    loop {
+        let waited = (h.clock.elapsed() - start).as_secs_f64();
+        if cond(h) {
+            return Some(waited);
+        }
+        if waited >= limit_s {
+            return None;
+        }
+        h.clock.advance(Duration::from_millis(250));
+        h.send_control(ControlEvent::Tick);
+        std::thread::sleep(Duration::from_millis(80));
+    }
+}
+
+/// 旗標串接命令：前段 3 s 後 prompt 才回來（`timeout_s`／`expected_duration_s` 依參數）→ 正常完成。
+fn wp53_assert_chained_prompt_at_three_seconds(timeout_s: f64, expected_duration_s: Option<f64>) {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev
+        .on_tx_reply(b"echo a && reboot\n", b"echo a && reboot\r\na\r\n");
+    let id = h.submit_with(WP53_CHAINED, |r| {
+        r.timeout_s = timeout_s;
+        r.expected_duration_s = expected_duration_s;
+        r.expect_reboot = true;
+    });
+    let start = wp53_wait_started(&h, b"echo a && reboot\n");
+    let early = wp53_step_until(&h, start, 3.0, |h| is_done(h, &id));
+    assert_eq!(
+        early,
+        None,
+        "prompt 等待期限應為 max(timeout {timeout_s}, expected {expected_duration_s:?})，不得在 3 s 前結算：{:?}",
+        h.command_get(&id)
+    );
+    h.inject_rx(WP53_PROMPT);
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    assert_eq!(rec["partial"], PyValue::Bool(false), "{rec:?}");
+    assert_eq!(
+        rec["recovery_action"],
+        PyValue::Null,
+        "不得進 EXPECT_REBOOT：{rec:?}"
+    );
+    assert_eq!(rec["error_code"], PyValue::Null, "{rec:?}");
+    assert_eq!(rec["stdout"], PyValue::from("a"), "{rec:?}");
+    assert_eq!(rec["expect_reboot"], PyValue::Bool(true), "{rec:?}");
+    let s = h.get_state();
+    assert_eq!(
+        s["state"],
+        PyValue::from("READY"),
+        "不得進 RECOVERING：{s:?}"
+    );
+    assert_eq!(s["recovering"], PyValue::Bool(false), "{s:?}");
+    assert!(!wp53_recover_keys_sent(&h), "不得送救援鍵");
+}
+
+/// 對照 `tests/test_expect_reboot.py::test_chained_command_prompt_after_pre_segment_is_not_treated_as_recovery`
+/// 與 `::test_pty_chained_reboot_with_flag`：timeout 6 s、prompt 3 s 後回來（> 舊的固定 2 s）仍判成功。
+#[test]
+fn wp53_wait_chained_prompt_after_three_seconds() {
+    wp53_assert_chained_prompt_at_three_seconds(6.0, None);
+}
+
+/// `max(timeout_s, expected_duration_s)`：timeout 1 s、expected 5 s → 期限 5 s，3 s 回 prompt 仍成功
+/// （對照 `::test_flag_routes_chained_command_to_reboot_handler` 的 `prompt_wait_s == 30.0`）。
+#[test]
+fn wp53_wait_expected_duration_extends_timeout() {
+    wp53_assert_chained_prompt_at_three_seconds(1.0, Some(5.0));
+}
+
+/// `max(timeout_s, expected_duration_s)`：timeout 5 s、expected 1 s → timeout 為下限，3 s 回 prompt 仍成功。
+#[test]
+fn wp53_wait_timeout_remains_lower_bound() {
+    wp53_assert_chained_prompt_at_three_seconds(5.0, Some(1.0));
+}
+
+/// 超出 `Duration` 範圍的期限（RPC `float(expected_duration_s)` 不設上限）：Python `deadline = monotonic() + 1e300`
+/// 實質無限等待、不拋例外（`uart_io.py:2635-2648`）。Rust 須飽和而非 panic；prompt 回來即正常完成。
+#[test]
+fn wp53_wait_huge_expected_duration_saturates() {
+    for expected in [1e300, f64::INFINITY] {
+        let h = ActorRig::new(SHELL_PROFILE).ready();
+        let id = h.submit_with(WP53_CHAINED, |r| {
+            r.timeout_s = 1.0;
+            r.expected_duration_s = Some(expected);
+            r.expect_reboot = true;
+        });
+        let start = wp53_wait_started(&h, b"echo a && reboot\n");
+        assert_eq!(
+            wp53_step_until(&h, start, 3.0, |h| is_done(h, &id)),
+            None,
+            "expected {expected}：期限飽和為無限，不得提早結算：{:?}",
+            h.command_get(&id)
+        );
+        h.inject_rx(WP53_PROMPT);
+        let rec = h.wait_done(&id);
+        assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+        assert_eq!(rec["partial"], PyValue::Bool(false), "{rec:?}");
+        assert_eq!(rec["recovery_action"], PyValue::Null, "{rec:?}");
+        assert_eq!(state_of(&h), "READY");
+    }
+}
+
+/// 單獨 `reboot` 帶旗標、DUT 不回 prompt：等待時間（自 prompt 等待起點起算的 FakeClock 秒數）與結算紀錄。
+fn wp53_plain_reboot_flag_settle_s(timeout_s: f64) -> f64 {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let id = h.submit_with("reboot", |r| {
+        r.timeout_s = timeout_s;
+        r.expected_duration_s = Some(30.0);
+        r.expect_reboot = true;
+    });
+    let start = wp53_wait_started(&h, b"reboot\n");
+    let settled = wp53_step_until(&h, start, 10.0, |h| is_done(h, &id))
+        .expect("單獨 reboot 應在 10 s 內結算");
+    let rec = h.command_get(&id);
+    assert_eq!(rec["partial"], PyValue::Bool(true), "{rec:?}");
+    assert_eq!(
+        rec["recovery_action"],
+        PyValue::from("EXPECT_REBOOT"),
+        "{rec:?}"
+    );
+    assert_eq!(state_of(&h), "RECOVERING");
+    settled
+}
+
+/// 對照 `tests/test_expect_reboot.py::test_flag_with_plain_reboot_keeps_two_second_prompt_wait`：猜中的單獨 reboot
+/// 帶旗標時 `prompt_wait_s is None` → `min(timeout_s, 2.0)`；timeout 10 s、expected 30 s 仍約 2 s 進 recovery。
+#[test]
+fn wp53_wait_plain_reboot_flag_keeps_two_seconds() {
+    let settled = wp53_plain_reboot_flag_settle_s(10.0);
+    assert!(
+        (2.0..3.0).contains(&settled),
+        "單獨 reboot 維持 min(timeout, 2 s)，實際 {settled}"
+    );
+}
+
+/// 同上，timeout 小於 2 s 時取 timeout（`min(1.0, 2.0)`），不受 expected 30 s 影響。
+#[test]
+fn wp53_wait_plain_reboot_flag_short_timeout_uses_timeout() {
+    let settled = wp53_plain_reboot_flag_settle_s(1.0);
+    assert!(
+        (1.0..2.0).contains(&settled),
+        "timeout < 2 s 時取 timeout，實際 {settled}"
+    );
+}
+
+/// 對照 `tests/test_expect_reboot.py::test_chained_command_without_prompt_still_falls_to_recovery`：旗標串接命令
+/// 一直沒有 prompt → 等滿 `timeout_s`（3 s，`bridge.waits == [3.0]`）才回 `EXPECT_REBOOT`，不送救援鍵。
+#[test]
+fn wp53_wait_chained_without_prompt_waits_full_deadline() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let id = h.submit_with(WP53_CHAINED, |r| {
+        r.timeout_s = 3.0;
+        r.expect_reboot = true;
+    });
+    let start = wp53_wait_started(&h, b"echo a && reboot\n");
+    let settled = wp53_step_until(&h, start, 10.0, |h| is_done(h, &id))
+        .expect("旗標串接命令應在 10 s 內結算");
+    assert!(
+        (3.0..4.0).contains(&settled),
+        "旗標串接命令應等滿 timeout 3 s，實際 {settled}"
+    );
+    let rec = h.command_get(&id);
+    assert_eq!(rec["partial"], PyValue::Bool(true), "{rec:?}");
+    assert_eq!(
+        rec["recovery_action"],
+        PyValue::from("EXPECT_REBOOT"),
+        "{rec:?}"
+    );
+    assert_eq!(state_of(&h), "RECOVERING");
+    assert!(!wp53_recover_keys_sent(&h), "reboot 分支不得送救援鍵");
+}
+
+/// 無旗標對照：串接命令不被猜中 → 一般命令路徑，依一般 timeout（3 s，silence 上限 min(3, 30)）送 CTRL_C，
+/// 不得誤套固定兩秒的 reboot 等待。
+#[test]
+fn wp53_wait_chained_without_flag_uses_command_timeout() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let id = h.submit_with(WP53_CHAINED, |r| r.timeout_s = 3.0);
+    let start = wp53_wait_started(&h, b"echo a && reboot\n");
+    let rescued = wp53_step_until(&h, start, 10.0, |h| wal_tx_has(h, b"\x03"))
+        .expect("應在 10 s 內送出 CTRL_C");
+    assert!(
+        (3.0..4.0).contains(&rescued),
+        "無旗標串接命令依一般 timeout 3 s 救援，實際 {rescued}"
+    );
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["recovery_action"], PyValue::from("CTRL_C"), "{rec:?}");
+    assert_eq!(rec["expect_reboot"], PyValue::Bool(false), "{rec:?}");
+    assert_eq!(state_of(&h), "READY");
+}
+
+/// 裁決 s2 D2：passthrough 1:1 沿用 Python——`guessed_reboot = not passthrough and _is_reboot_command(...)`，
+/// 故 passthrough 的 `reboot` 文字帶旗標屬「旗標且非猜中」，使用完整期限 `max(timeout_s, expected or 0)`（4 s），
+/// 不是單獨 reboot 的兩秒。
+#[test]
+fn wp53_wait_passthrough_reboot_flag_uses_full_deadline() {
+    let h = passthrough_ready(UBOOT_PASSTHROUGH_PROFILE);
+    let id = h.submit_with("reboot", |r| {
+        r.timeout_s = 4.0;
+        r.expect_reboot = true;
+    });
+    let start = wp53_wait_started(&h, b"reboot\n");
+    let settled = wp53_step_until(&h, start, 10.0, |h| is_done(h, &id))
+        .expect("passthrough 旗標 reboot 應在 10 s 內結算");
+    assert!(
+        (4.0..5.0).contains(&settled),
+        "passthrough 旗標 reboot 應等滿 timeout 4 s，實際 {settled}"
+    );
+    let rec = h.command_get(&id);
+    assert_eq!(rec["partial"], PyValue::Bool(true), "{rec:?}");
+    assert_eq!(
+        rec["recovery_action"],
+        PyValue::from("EXPECT_REBOOT"),
+        "{rec:?}"
+    );
+    assert!(!wp53_recover_keys_sent(&h), "passthrough 不送救援鍵");
+}
+
+// ---------------------------------------------------------------------------
+// WP5-3 第 3 項：旗標命令取得 actor reboot arming 與完成後 gate（G3；Python
+// `origin/main:sw_core/session_manager.py:6412-6447`、`:6462-6473`）。`_handle_reboot_command` 不分旗標或猜中：
+// 送出前 `invalidate_deferred("reboot")`；TX 已提交（confirmed > 0 或 unknown）後於同一寫入鎖內 `arm_boot_quiet()`；
+// prompt 回來只 `clear_boot_quiet()`，不 confirm ready（#162）。
+// ---------------------------------------------------------------------------
+
+/// 旗標串接命令的 TX 停在提交前：quiet／reconfirm 不得提前 arm；放行並實際提交後兩者都成立（fence 與公開狀態）。
+#[test]
+fn wp53_arm_flag_after_tx_submission() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+    let id = h.submit_with(WP53_CHAINED, |r| {
+        r.timeout_s = 1.0;
+        r.expect_reboot = true;
+    });
+    assert!(
+        h.dev.wait_paused(Duration::from_secs(2)),
+        "旗標命令 TX 應進入 PAL"
+    );
+    let s = h.get_state();
+    assert_eq!(
+        s["boot_quiet_remaining_s"],
+        PyValue::Null,
+        "TX 提交前不得 arm quiet：{s:?}"
+    );
+    assert_eq!(
+        s["ready_reconfirm_pending"],
+        PyValue::Bool(false),
+        "TX 提交前不得 arm reconfirm：{s:?}"
+    );
+    assert!(!h.fence.with(|f| f.quiet_active || f.reconfirm_pending));
+    h.dev.release_pause();
+    // 審查 F14：fence 由 TxWriter 於提交的同一次 Fence 臨界區設定，actor 隨後同步 QuietState——兩者都要等到。
+    h.wait_for("旗標命令 TX 提交後 arm quiet 與 reconfirm", |h| {
+        let s = h.get_state();
+        h.fence.with(|f| f.quiet_active && f.reconfirm_pending)
+            && s["boot_quiet_remaining_s"] != PyValue::Null
+            && s["ready_reconfirm_pending"] == PyValue::Bool(true)
+    });
+    assert!(wal_tx_has(&h, b"echo a && reboot\n"));
+    advance_until(&h, Duration::from_millis(100), "旗標命令收尾", |h| {
+        is_done(h, &id)
+    });
+    let rec = h.command_get(&id);
+    assert_eq!(
+        rec["recovery_action"],
+        PyValue::from("EXPECT_REBOOT"),
+        "{rec:?}"
+    );
+    assert_eq!(state_of(&h), "RECOVERING");
+}
+
+/// 對照 `tests/test_expect_reboot.py::test_chained_command_prompt_after_pre_segment_is_not_treated_as_recovery`：
+/// 旗標串接命令 3 s 後 prompt 回來 → 正常完成，但只清 TX 靜默維度、`ready_reconfirm_pending` 保留（#162）；
+/// 下一筆 shell agent 命令被 gate 擋為 `AUTOBOOT_QUIET`（retry 5.0），零新增 UART TX。
+#[test]
+fn wp53_arm_flag_prompt_keeps_reconfirm() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev
+        .on_tx_reply(b"echo a && reboot\n", b"echo a && reboot\r\na\r\n");
+    let id = h.submit_with(WP53_CHAINED, |r| {
+        r.timeout_s = 6.0;
+        r.expect_reboot = true;
+    });
+    let start = wp53_wait_started(&h, b"echo a && reboot\n");
+    let early = wp53_step_until(&h, start, 3.0, |h| is_done(h, &id));
+    assert_eq!(early, None, "prompt 未回不得結算：{:?}", h.command_get(&id));
+    h.inject_rx(WP53_PROMPT);
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    assert_eq!(rec["partial"], PyValue::Bool(false), "{rec:?}");
+    assert_eq!(rec["recovery_action"], PyValue::Null, "{rec:?}");
+    let s = h.get_state();
+    assert_eq!(s["state"], PyValue::from("READY"), "{s:?}");
+    assert_eq!(s["boot_quiet_remaining_s"], PyValue::Null, "quiet 清除：{s:?}");
+    assert_eq!(
+        s["ready_reconfirm_pending"],
+        PyValue::Bool(true),
+        "#162：prompt 回來不是 READY 再確認證據，pending 保留：{s:?}"
+    );
+    assert!(!h.fence.with(|f| f.quiet_active), "TX 靜默維度清除");
+    assert!(h.fence.with(|f| f.reconfirm_pending), "fence reconfirm 保留");
+
+    let submits = h.dev.os_submits();
+    let _ = h.dev.take_tx();
+    let next = h.request(SessionRequest::Submit(agent_submit("ls")));
+    assert_eq!(next["error_code"], PyValue::from("AUTOBOOT_QUIET"), "{next:?}");
+    assert_eq!(next["retry_after_s"], PyValue::from(5.0), "{next:?}");
+    assert!(next.get("cmd_id").is_none(), "{next:?}");
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(h.dev.os_submits(), submits, "被 gate 擋下：零新增 OS 提交");
+    assert!(h.dev.take_tx().is_empty(), "被 gate 擋下：零新增 UART TX");
+    assert!(!wal_tx_has(&h, b"ls\n"));
+}
+
+/// 對照（`reboot_not_submitted_does_not_arm_quiet_e2e` 的旗標版）：旗標串接命令的 TX 在提交點被撤銷、零 OS 提交 →
+/// 不 arm quiet／reconfirm、不進 RECOVERING（Python 只在 `confirmed > 0 or outcome == "unknown"` 時 arm）。
+#[test]
+fn wp53_arm_flag_not_submitted_does_not_arm() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+    let id = h.submit_with(WP53_CHAINED, |r| {
+        r.timeout_s = 1.0;
+        r.expect_reboot = true;
+    });
+    assert!(h.dev.wait_paused(Duration::from_secs(2)));
+    let submits = h.dev.os_submits();
+    h.fence.with(|f| {
+        // tombstone 上限 512、FIFO 淘汰（#38）：撤銷全部 rig 內可能的 op id（皆 < 512）。
+        for n in 0..sw_core::tx_writer::CANCELLED_OPS_MAX as u64 {
+            f.cancelled.insert(OpId(n));
+        }
+    });
+    h.dev.release_pause();
+    let rec = h.wait_done(&id);
+    h.fence.with(|f| f.cancelled.clear());
+    assert_eq!(rec["error_code"], PyValue::from("FLUSHED_BY_RECOVERY"), "{rec:?}");
+    assert_eq!(h.dev.os_submits(), submits, "提交點被拒：零 OS 提交");
+    let s = h.get_state();
+    assert_eq!(s["state"], PyValue::from("READY"), "{s:?}");
+    assert_eq!(s["boot_quiet_remaining_s"], PyValue::Null, "{s:?}");
+    assert_eq!(s["ready_reconfirm_pending"], PyValue::Bool(false), "{s:?}");
+    assert!(!h.fence.with(|f| f.quiet_active || f.reconfirm_pending));
+    assert!(!wal_tx_has(&h, b"echo a && reboot\n"));
+}
+
+/// 出列決策（sans-IO）：旗標串接命令與猜中的 `reboot` 同樣在送出前失效 deferred 輸入（BC-02 `RebootCommand`）、
+/// 登記 `reboot_arm_op`，TX 結算後再失效一次（`QuietRearm`），reboot 在途的 human 按鍵不得回放；
+/// 無旗標的同一命令三者皆不發生。
+#[test]
+fn wp53_arm_flag_invalidates_deferred_and_registers_arm_op() {
+    use sw_core::op_runner::OpSpec;
+
+    for flag in [true, false] {
+        let case = format!("expect_reboot={flag}");
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.to_ready();
+        h.attach_pty_console("c1", true);
+        let e0 = h.core.generations().input_epoch;
+        let mut req = agent_submit(WP53_CHAINED);
+        req.expect_reboot = flag;
+        let (resp, effects) = h.rpc_full(SessionRequest::Submit(req));
+        assert_eq!(resp.expect("submit")["ok"], PyValue::Bool(true), "{case}");
+        let op_id = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::StartOp {
+                    grant,
+                    spec: OpSpec::Command(_),
+                } => Some(grant.op_id),
+                _ => None,
+            })
+            .expect("READY 空佇列應立即出列");
+        let bumped = u64::from(flag);
+        assert_eq!(
+            h.core.generations().input_epoch,
+            e0 + bumped,
+            "{case}：送出前失效（RebootCommand）"
+        );
+        assert_eq!(
+            h.fence.with(|f| f.reboot_arm_op),
+            flag.then_some(op_id),
+            "{case}：TxWriter 提交點 arming 登記"
+        );
+        h.input("c1", b"k");
+        assert_eq!(h.deferred_len("c1"), 1, "{case}：agent 命令期間按鍵進 deferred");
+        let epoch = h.epoch();
+        h.feed(ControlEvent::UartTxCompleted {
+            epoch,
+            op_id,
+            confirmed_bytes: WP53_CHAINED.len() + 1,
+            unknown: false,
+        });
+        assert_eq!(
+            h.core.generations().input_epoch,
+            e0 + 2 * bumped,
+            "{case}：TX 結算 arm quiet 為第二個失效點"
+        );
+        assert_eq!(
+            h.deferred_len("c1"),
+            if flag { 0 } else { 1 },
+            "{case}：reboot 在途期間的按鍵被清掉"
+        );
+        assert_eq!(
+            h.public()["ready_reconfirm_pending"],
+            PyValue::Bool(flag),
+            "{case}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WP5-3 第 4 項：passthrough 旗標命令與 SC-35 的底層 TX gate（G3；裁決 s2 D2）。Python
+// `origin/main:sw_core/session_manager.py:814-826` 的 `agent_gate_active()` 對 passthrough 固定回 False，
+// `_push_tx_gate()`（`:778-785`）以此值發布 bridge 的 `_gate_quiet`（`uart_io.py:640` 只擋 `agent`）：
+// 旗標命令照常走 `_handle_reboot_command` 並 `arm_boot_quiet()`（quiet／`ready_reconfirm_pending` 照記），
+// 但 quiet／pending 不擋 passthrough 後續合法 agent TX。
+// ---------------------------------------------------------------------------
+
+/// U-Boot 的重開命令（`reset`）帶旗標：回 `=> ` 完成後，reboot 的 reconfirm 記錄仍保留（fence 與公開狀態，
+/// 不以清空假裝完成 SC-35）；下一筆合法 agent 命令必須真正寫入 UART 並成功，不只是 submit accepted。
+#[test]
+fn wp53_passthrough_flag_followup_tx_not_gated() {
+    let h = passthrough_ready(UBOOT_PASSTHROUGH_PROFILE);
+    h.dev
+        .on_tx_reply(b"reset\n", b"reset\r\nresetting ...\r\n=> ");
+    let id = h.submit_with("reset", |r| {
+        r.timeout_s = 6.0;
+        r.expect_reboot = true;
+    });
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    assert_eq!(rec["partial"], PyValue::Bool(false), "{rec:?}");
+    assert_eq!(rec["recovery_action"], PyValue::Null, "{rec:?}");
+    assert!(wal_tx_has(&h, b"reset\n"), "旗標命令本身已寫出");
+    // Python `arm_boot_quiet()` 不分 platform：pending 由 False 翻 True；prompt 回來只 `clear_boot_quiet()`。
+    assert!(
+        h.fence.with(|f| f.reconfirm_pending),
+        "fence 保留 reboot 的 reconfirm 記錄"
+    );
+    let s = h.get_state();
+    assert_eq!(s["state"], PyValue::from("READY"), "{s:?}");
+    assert_eq!(s["ready_reconfirm_pending"], PyValue::Bool(true), "{s:?}");
+
+    let submits = h.dev.os_submits();
+    let _ = h.dev.take_tx();
+    h.dev
+        .on_tx_reply(b"printenv\n", b"printenv\r\nbootcmd=x\r\n=> ");
+    let next = h.submit_ok("printenv");
+    let rec = h.wait_done(&next);
+    assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    assert_eq!(rec["error_code"], PyValue::Null, "{rec:?}");
+    assert_eq!(rec["partial"], PyValue::Bool(false), "{rec:?}");
+    assert_eq!(rec["stdout"], PyValue::from("bootcmd=x"), "{rec:?}");
+    assert!(
+        h.dev.os_submits() > submits,
+        "後續 agent 命令必須真正提交到 OS"
+    );
+    assert_eq!(
+        h.dev.take_tx(),
+        b"printenv\n".to_vec(),
+        "UART 實際寫出後續命令"
+    );
+    assert!(wal_tx_has(&h, b"printenv\n"), "WAL 記錄後續命令 TX");
+    assert!(!wp53_recover_keys_sent(&h), "passthrough 不送救援鍵");
+    assert_eq!(state_of(&h), "READY");
+}
+
+/// 文字為 `reboot` 的旗標命令在 passthrough 不屬「猜中」（`guessed_reboot = not passthrough and ...`），
+/// 等待期限為 `max(timeout_s, expected or 0)` = 6 s：prompt 3 s 後才回來仍正常完成，不得套兩秒規則。
+#[test]
+fn wp53_passthrough_plain_reboot_flag_uses_full_wait() {
+    let h = passthrough_ready(UBOOT_PASSTHROUGH_PROFILE);
+    h.dev.on_tx_reply(b"reboot\n", b"reboot\r\n");
+    let id = h.submit_with("reboot", |r| {
+        r.timeout_s = 6.0;
+        r.expect_reboot = true;
+    });
+    let start = wp53_wait_started(&h, b"reboot\n");
+    let early = wp53_step_until(&h, start, 3.0, |h| is_done(h, &id));
+    assert_eq!(
+        early,
+        None,
+        "prompt 未回不得結算（兩秒規則不適用 passthrough）：{:?}",
+        h.command_get(&id)
+    );
+    h.inject_rx(b"\r\n=> ");
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    assert_eq!(rec["error_code"], PyValue::Null, "{rec:?}");
+    assert_eq!(rec["partial"], PyValue::Bool(false), "{rec:?}");
+    assert_eq!(rec["recovery_action"], PyValue::Null, "{rec:?}");
+    assert!(!wp53_recover_keys_sent(&h), "passthrough 不送救援鍵");
+    assert_eq!(state_of(&h), "READY");
+}
+
+/// `adopt_opened_bridge` 每次 adopt 都以目前 profile 明確覆寫 fence 的 `bridge_passthrough`（Python
+/// `_push_tx_gate` 每次發布都重算 `agent_gate_active()`）：passthrough 為 true；shell 即使 fence 殘留 true 也覆寫為 false。
+#[test]
+fn wp53_passthrough_adopt_publishes_bridge_flag() {
+    let mut h = CoreHarness::new(UBOOT_PASSTHROUGH_PROFILE);
+    assert!(!h.fence.with(|f| f.bridge_passthrough), "預設 false");
+    h.attach_device();
+    h.bridge_ok();
+    assert!(
+        h.fence.with(|f| f.bridge_passthrough),
+        "passthrough adopt 發布 true"
+    );
+
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.fence.with(|f| f.bridge_passthrough = true);
+    h.attach_device();
+    h.bridge_ok();
+    assert!(
+        !h.fence.with(|f| f.bridge_passthrough),
+        "shell adopt 明確覆寫為 false"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WP5-3 第 5 項：`command_expect_reboot` WAL META（G3；Python `origin/main:sw_core/session_manager.py:6842-6851`、
+// 契約 `contracts/wal_meta_events.schema.json:63-85`）。只在旗標 true 時寫，位置在 reboot 分流與命令 UART TX 之前；
+// 不分命令文字是否猜中、也不排除 passthrough（裁決 s2 D2）。
+// ---------------------------------------------------------------------------
+
+/// WAL 紀錄中隨時間變動的欄位（`seq`／`mono_ts_ns`／`wall_ts`）；其餘欄位逐位元組比對。
+const WP53_DYNAMIC_WAL_KEYS: [&str; 3] = ["seq", "mono_ts_ns", "wall_ts"];
+
+fn wp53_seq(row: &PyDict) -> i64 {
+    row.get("seq")
+        .and_then(PyValue::as_i64)
+        .unwrap_or_else(|| panic!("WAL 紀錄缺 seq：{row:?}"))
+}
+
+/// 去除動態欄位後以 RPC_WIRE 序列化（WAL 落盤為 sort_keys，載回的鍵順序即落盤順序）。
+fn wp53_static_row(row: &PyDict) -> String {
+    let pairs = row
+        .0
+        .iter()
+        .filter(|(k, _)| !WP53_DYNAMIC_WAL_KEYS.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    sw_proto::pyjson::dumps(
+        &PyValue::Dict(PyDict::from_pairs(pairs)),
+        &sw_proto::pyjson::RPC_WIRE,
+    )
+}
+
+/// 契約 `command_expect_reboot` 的完整外層紀錄（去除動態欄位）：`dir=META`、`source=system`、非 null `cmd_id`、
+/// 空 payload（`len=0`、空 payload 的 CRC32 `00000000`）、`meta={"event":"command_expect_reboot","expect_reboot":true}`。
+fn wp53_expected_meta_row(cmd_id: &str) -> String {
+    format!(
+        "{{\"cmd_id\":\"{cmd_id}\",\"com\":\"COM0\",\"crc32\":\"00000000\",\"dir\":\"META\",\"len\":0,\
+         \"loss_flag\":false,\"meta\":{{\"event\":\"command_expect_reboot\",\"expect_reboot\":true}},\
+         \"payload_b64\":\"\",\"source\":\"system\"}}"
+    )
+}
+
+fn wp53_meta_event(row: &PyDict) -> Option<String> {
+    match row.get("meta") {
+        Some(PyValue::Dict(m)) => m.get("event").and_then(PyValue::as_str).map(str::to_string),
+        _ => None,
+    }
+}
+
+/// WAL 內 `event == command_expect_reboot` 的 META 紀錄（整筆外層紀錄）。
+fn wp53_expect_reboot_rows(h: &ActorRig) -> Vec<PyDict> {
+    h.wal_all_rows()
+        .into_iter()
+        .filter(|r| r.get("dir").and_then(PyValue::as_str) == Some("META"))
+        .filter(|r| wp53_meta_event(r).as_deref() == Some("command_expect_reboot"))
+        .collect()
+}
+
+/// WAL 內屬於 `cmd_id` 的紀錄（任何 dir），依寫入順序。
+fn wp53_cmd_rows(h: &ActorRig, cmd_id: &str) -> Vec<PyDict> {
+    h.wal_all_rows()
+        .into_iter()
+        .filter(|r| r.get("cmd_id").and_then(PyValue::as_str) == Some(cmd_id))
+        .collect()
+}
+
+/// 旗標命令恰有一筆契約形狀的 `command_expect_reboot` META，且它是本 cmd_id 的第一筆 WAL 紀錄，
+/// seq 小於本命令 TX 的 seq（送 UART 前寫入）。
+fn assert_wp53_meta_before_tx(h: &ActorRig, case: &str, cmd_id: &str, tx: &[u8]) {
+    let metas = wp53_expect_reboot_rows(h);
+    assert_eq!(metas.len(), 1, "{case}：旗標命令恰一筆 META：{metas:?}");
+    assert_eq!(
+        wp53_static_row(&metas[0]),
+        wp53_expected_meta_row(cmd_id),
+        "{case}：META 外層紀錄須符合契約"
+    );
+    let rows = wp53_cmd_rows(h, cmd_id);
+    let tx_rows: Vec<&PyDict> = rows
+        .iter()
+        .filter(|r| r.get("dir").and_then(PyValue::as_str) == Some("TX") && b64(r) == tx)
+        .collect();
+    assert_eq!(tx_rows.len(), 1, "{case}：本命令 TX 恰一筆：{rows:?}");
+    assert!(
+        wp53_seq(&metas[0]) < wp53_seq(tx_rows[0]),
+        "{case}：META seq {} 須小於命令 TX seq {}",
+        wp53_seq(&metas[0]),
+        wp53_seq(tx_rows[0])
+    );
+    assert_eq!(
+        wp53_seq(&rows[0]),
+        wp53_seq(&metas[0]),
+        "{case}：META 為本 cmd_id 的第一筆 WAL 紀錄：{rows:?}"
+    );
+}
+
+/// 對照 `tests/test_expect_reboot.py::test_flag_routes_chained_command_to_reboot_handler` 的
+/// `any(event == "command_expect_reboot")`：Python 於 `if expect_reboot or guessed_reboot` 分流之前寫 META，
+/// 不看命令文字是否猜中，也不排除 passthrough。三個獨立 rig：串接命令、單獨 `reboot`（猜中＋旗標）、
+/// passthrough 的 `reset`。
+#[test]
+fn wp53_meta_before_command_tx() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let id = h.submit_with(WP53_CHAINED, |r| {
+        r.timeout_s = 1.0;
+        r.expect_reboot = true;
+    });
+    wait_tx(&h, b"echo a && reboot\n");
+    advance_until(&h, Duration::from_millis(100), "串接旗標命令收尾", |h| {
+        is_done(h, &id)
+    });
+    assert_eq!(
+        h.command_get(&id)["recovery_action"],
+        PyValue::from("EXPECT_REBOOT")
+    );
+    assert_wp53_meta_before_tx(&h, "串接命令", &id, b"echo a && reboot\n");
+
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let id = h.submit_with("reboot", |r| {
+        r.timeout_s = 10.0;
+        r.expect_reboot = true;
+    });
+    wait_tx(&h, b"reboot\n");
+    advance_until(&h, Duration::from_millis(100), "單獨 reboot 旗標命令收尾", |h| {
+        is_done(h, &id)
+    });
+    assert_wp53_meta_before_tx(&h, "單獨 reboot", &id, b"reboot\n");
+
+    let h = passthrough_ready(UBOOT_PASSTHROUGH_PROFILE);
+    h.dev
+        .on_tx_reply(b"reset\n", b"reset\r\nresetting ...\r\n=> ");
+    let id = h.submit_with("reset", |r| {
+        r.timeout_s = 6.0;
+        r.expect_reboot = true;
+    });
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["partial"], PyValue::Bool(false), "{rec:?}");
+    assert_wp53_meta_before_tx(&h, "passthrough reset", &id, b"reset\n");
+}
+
+/// 對照 `tests/test_expect_reboot.py::test_flag_wins_over_completion_regex`：旗標＋合法 `completion_regex` 時
+/// 只寫 `command_expect_reboot`，不得寫 `command_completion`（Python 的 completion META 在 reboot 分流之後）。
+#[test]
+fn wp53_meta_flag_suppresses_completion_meta() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev
+        .on_tx_reply(b"echo a && reboot\n", b"echo a && reboot\r\na\r\nDONE\r\n");
+    let id = h.submit_with(WP53_CHAINED, |r| {
+        r.timeout_s = 1.0;
+        r.expect_reboot = true;
+        r.completion_regex = Some("(?m)^DONE\\r?$".into());
+    });
+    wait_tx(&h, b"echo a && reboot\n");
+    advance_until(&h, Duration::from_millis(100), "旗標命令收尾", |h| {
+        is_done(h, &id)
+    });
+    let events: Vec<Option<String>> = wp53_cmd_rows(&h, &id)
+        .iter()
+        .filter(|r| r.get("dir").and_then(PyValue::as_str) == Some("META"))
+        .map(wp53_meta_event)
+        .collect();
+    assert_eq!(
+        events,
+        vec![Some("command_expect_reboot".to_string())],
+        "本 cmd_id 的 META 只有 command_expect_reboot"
+    );
+    assert_wp53_meta_before_tx(&h, "旗標＋completion_regex", &id, b"echo a && reboot\n");
+}
+
+/// 無旗標對照（`tests/test_expect_reboot.py::test_without_flag_chained_command_keeps_old_behaviour`、
+/// `::test_plain_reboot_without_flag_is_unchanged`）：串接命令與猜中的單獨 `reboot` 都不寫 expect-reboot META；
+/// 一般 completion 命令維持原本恰一筆 `command_completion` META（鍵與值不變）。
+#[test]
+fn wp53_meta_absent_without_flag() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let id = h.submit_with(WP53_CHAINED, |r| r.timeout_s = 1.0);
+    wait_tx(&h, b"echo a && reboot\n");
+    advance_until(&h, Duration::from_millis(100), "無旗標串接命令收尾", |h| {
+        is_done(h, &id)
+    });
+    assert_eq!(h.command_get(&id)["recovery_action"], PyValue::from("CTRL_C"));
+    assert!(
+        wp53_expect_reboot_rows(&h).is_empty(),
+        "無旗標串接命令不寫 META：{:?}",
+        wp53_expect_reboot_rows(&h)
+    );
+
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let id = h.submit_with("reboot", |r| r.timeout_s = 10.0);
+    wait_tx(&h, b"reboot\n");
+    advance_until(&h, Duration::from_millis(100), "無旗標 reboot 收尾", |h| {
+        is_done(h, &id)
+    });
+    assert_eq!(
+        h.command_get(&id)["recovery_action"],
+        PyValue::from("EXPECT_REBOOT"),
+        "猜中的單獨 reboot 仍走 reboot 分支"
+    );
+    assert!(
+        wp53_expect_reboot_rows(&h).is_empty(),
+        "無旗標 reboot 不寫 META：{:?}",
+        wp53_expect_reboot_rows(&h)
+    );
+
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev
+        .on_tx_reply(b"runit\n", b"runit\r\nout\r\nRC=0\r\nroot@t:/# ");
+    let id = h.submit_with("runit", |r| {
+        r.completion_regex = Some("(?m)^RC=0\\r?$".into())
+    });
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["stdout"], PyValue::from("out\nRC=0"), "{rec:?}");
+    let metas: Vec<PyDict> = wp53_cmd_rows(&h, &id)
+        .into_iter()
+        .filter(|r| r.get("dir").and_then(PyValue::as_str) == Some("META"))
+        .collect();
+    assert_eq!(metas.len(), 1, "{metas:?}");
+    assert_eq!(
+        wp53_static_row(&metas[0]),
+        format!(
+            "{{\"cmd_id\":\"{id}\",\"com\":\"COM0\",\"crc32\":\"00000000\",\"dir\":\"META\",\"len\":0,\
+             \"loss_flag\":false,\"meta\":{{\"completion_regex\":\"(?m)^RC=0\\\\r?$\",\"event\":\"command_completion\"}},\
+             \"payload_b64\":\"\",\"source\":\"system\"}}"
+        ),
+        "一般 completion META 不變"
+    );
+    assert!(wp53_expect_reboot_rows(&h).is_empty());
+}
+
+/// 被 submit-time gate（尚未 READY）或 execute-time gate（agent interactive lease）拒絕的旗標命令不寫 META，且零 TX
+/// （Python META 位於 `execute_command` 的 gate（`session_manager.py:6561-6592`）與 `_execute_command_inner` 的
+/// operation 檢查之後）。
+#[test]
+fn wp53_meta_not_written_when_gated() {
+    // 假 DUT 不回 prompt：登入 probe 卡住，session 停在 READY 之前（ATTACHING／ATTACHED 皆回 SESSION_NOT_READY）。
+    let h = ActorRig::new(SHELL_PROFILE).attach();
+    let mut req = agent_submit(WP53_CHAINED);
+    req.expect_reboot = true;
+    let resp = h.request(SessionRequest::Submit(req));
+    assert_eq!(resp["error_code"], PyValue::from("SESSION_NOT_READY"), "{resp:?}");
+    assert!(wp53_expect_reboot_rows(&h).is_empty(), "submit-time 拒絕不寫 META");
+    assert!(!wal_tx_has(&h, b"echo a && reboot\n"), "submit-time 拒絕零 TX");
+
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let open = h.request(SessionRequest::InteractiveOpen {
+        owner: "agent:wp53".into(),
+        timeout_s: 20.0,
+        command: String::new(),
+        allow_attached: false,
+    });
+    let iid = open["interactive_id"].as_str().unwrap().to_string();
+    let id = h.submit_with(WP53_CHAINED, |r| r.expect_reboot = true);
+    let rec = h.wait_done(&id);
+    assert_eq!(
+        rec["error_code"],
+        PyValue::from("SESSION_INTERACTIVE_BUSY"),
+        "{rec:?}"
+    );
+    assert!(wp53_expect_reboot_rows(&h).is_empty(), "execute-time 拒絕不寫 META");
+    assert!(wp53_cmd_rows(&h, &id).is_empty(), "execute-time 拒絕零 WAL 紀錄");
+    assert!(!wal_tx_has(&h, b"echo a && reboot\n"), "execute-time 拒絕零 TX");
+    let close = h.request(SessionRequest::InteractiveClose {
+        interactive_id: iid,
+    });
+    assert_eq!(close["ok"], PyValue::Bool(true));
+}
+
+// ---------------------------------------------------------------------------
 // recover
 // ---------------------------------------------------------------------------
 
@@ -1954,4 +2899,567 @@ fn wrapped_echo_busybox_newline_replacing_command_space_is_kept() {
     assert_eq!(&c[55..56], " ");
     let raw = format!("{}\r\r\n{}\r\nOUT\r\n{WRAP_PROMPT}", &c[..55], &c[56..]);
     assert_eq!(wrap_extract(&raw, &c), format!("{}\n{}\nOUT", &c[..55], &c[56..]));
+}
+
+// ---------------------------------------------------------------------------
+// WP5-2 第 5 項：`expect_reboot`／`trusted_human` 經佇列送進 `OpSpec::Command`，且不繞過 gate
+// ---------------------------------------------------------------------------
+
+/// Python `tests/test_expect_reboot.py` 的 `CHAINED`。
+const WP52_CHAINED: &str = "firstboot -y && reboot";
+
+/// 出列的 `Effect::StartOp { spec: OpSpec::Command(..) }` 保留兩個提交旗標，`is_trusted_human()` 為明示欄位與
+/// `HumanConsole` 來源取 OR（ITEM 1；Python `arbiter.py:411-416` 只在旗標成立時把 `expect_reboot`／`trusted_human`
+/// 交給 `execute_command`）。只驗資料抵達執行入口；reboot 分支與 G7b 消費端屬後續工作包。
+#[test]
+fn wp52_start_op_command_keeps_submit_flags() {
+    use sw_core::arbiter::SubmitOrigin;
+    use sw_core::op_runner::OpSpec;
+
+    let console = || SubmitOrigin::HumanConsole {
+        client_id: "c1".into(),
+    };
+    for (expect_reboot, trusted_human, origin, source, trusted) in [
+        (false, false, SubmitOrigin::Rpc, "agent", false),
+        (true, false, SubmitOrigin::Rpc, "agent", false),
+        (false, true, SubmitOrigin::Rpc, "human:cli", true),
+        (true, true, SubmitOrigin::Rpc, "human:cli", true),
+        (true, false, console(), "human:c1", true),
+        (false, true, console(), "human:c1", true),
+    ] {
+        let case = format!(
+            "expect_reboot={expect_reboot} trusted_human={trusted_human} origin={origin:?}"
+        );
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.to_ready();
+        let mut req = agent_submit("echo wp52");
+        req.source = source.into();
+        req.expect_reboot = expect_reboot;
+        req.trusted_human = trusted_human;
+        req.origin = origin.clone();
+        let (resp, effects) = h.rpc_full(SessionRequest::Submit(req));
+        let resp = resp.expect("submit");
+        assert_eq!(resp["ok"], PyValue::Bool(true), "{case}：{resp:?}");
+        assert_eq!(
+            resp.get("expect_reboot").cloned(),
+            expect_reboot.then_some(PyValue::Bool(true)),
+            "{case}：回聲"
+        );
+        let cmd_id = resp["cmd_id"].as_str().expect("cmd_id").to_string();
+        let started: Vec<_> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::StartOp {
+                    spec: OpSpec::Command(queued),
+                    ..
+                } => Some(queued),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started.len(), 1, "{case}：READY 空佇列應立即出列一次");
+        let queued = started[0];
+        assert_eq!(queued.cmd_id, cmd_id, "{case}");
+        assert_eq!(queued.req.command, "echo wp52", "{case}");
+        assert_eq!(queued.req.expect_reboot, expect_reboot, "{case}");
+        assert_eq!(queued.req.trusted_human, trusted_human, "{case}");
+        assert_eq!(queued.req.origin, origin, "{case}");
+        assert_eq!(
+            queued.req.is_trusted_human(),
+            trusted,
+            "{case}：可信來源 OR 判定"
+        );
+        assert_eq!(
+            h.reg.get(&cmd_id).expect("registry").get("expect_reboot"),
+            Some(&PyValue::Bool(expect_reboot)),
+            "{case}：record 旗標"
+        );
+    }
+}
+
+/// 對照 `tests/test_expect_reboot.py::test_flag_does_not_bypass_autoboot_quiet_gate`：命令已入列（hold 佔住前景）
+/// 後 banner 才武裝 quiet；agent＋true 的鏈式命令出列時仍被 execute-time gate 擋為 AUTOBOOT_QUIET，零 TX、
+/// record 保留 true；提交時 gate 對帶旗標與不帶旗標的請求回應相同（同 `execute_time_gate_has_retry_after_sc03`）。
+#[test]
+fn wp52_flag_does_not_bypass_gates() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let hold = h.submit_with("sleep 60", |r| r.timeout_s = 120.0);
+    h.wait_running(&hold);
+    let queued = h.submit_with(WP52_CHAINED, |r| {
+        r.source = "agent:t".into();
+        r.expect_reboot = true;
+    });
+    h.inject_rx(BANNER);
+    // hold 以 prompt 正常完成（只清 TX 靜默維度、reconfirm pending 保留，#162），queued 出列時仍被 gate 擋下。
+    h.inject_rx(b"root@t:/# ");
+    let _ = h.wait_done(&hold);
+    let done = h.wait_done(&queued);
+    // Python `arbiter.py:465-467`：結果 ok:false → status "error"＋error_code。
+    assert_eq!(done["status"], PyValue::from("error"), "{done:?}");
+    assert_eq!(
+        done["error_code"],
+        PyValue::from("AUTOBOOT_QUIET"),
+        "{done:?}"
+    );
+    assert_eq!(done["expect_reboot"], PyValue::Bool(true));
+    let tx = String::from_utf8_lossy(&h.dev.take_tx()).into_owned();
+    assert!(
+        !tx.contains(WP52_CHAINED),
+        "被 gate 擋下的旗標命令不得寫出 TX：{tx:?}"
+    );
+    assert!(!wal_tx_has(&h, WP52_CHAINED.as_bytes()));
+
+    let flagged = SessionRequest::Submit({
+        let mut req = agent_submit(WP52_CHAINED);
+        req.expect_reboot = true;
+        req
+    });
+    let direct = h.request(flagged);
+    let plain = h.request(SessionRequest::Submit(agent_submit(WP52_CHAINED)));
+    assert_eq!(pget(&direct, "error_code"), PyValue::from("AUTOBOOT_QUIET"));
+    assert_eq!(direct, plain, "旗標不改變提交時 gate 的回應");
+    assert!(direct.get("cmd_id").is_none());
+    assert!(h.dev.take_tx().is_empty(), "提交時拒絕零 TX");
+}
+
+// ---------------------------------------------------------------------------
+// WP5-5 第 1 項：execute-time 可信來源判定（G7a、OD-74、rulings s2 D5）
+// ---------------------------------------------------------------------------
+
+/// 效果中是否含指定命令的 `Effect::StartOp { spec: OpSpec::Command(..) }`（命令實際進入執行）。
+fn wp55_started(effects: &[Effect], cmd_id: &str) -> bool {
+    use sw_core::op_runner::OpSpec;
+    effects.iter().any(|effect| {
+        matches!(
+            effect,
+            Effect::StartOp { spec: OpSpec::Command(queued), .. } if queued.cmd_id == cmd_id
+        )
+    })
+}
+
+/// 出列決策只看 `SubmitReq::is_trusted_human()`（`trusted_human` 旗標 OR `HumanConsole` 來源），永不看 `source` 字首。
+///
+/// 對照 Python `origin/main:sw_core/session_manager.py:6549`：`human = source.startswith("human:") if trusted_human is
+/// None else trusted_human`，RPC 路徑一律帶明確布林（`arbiter.py:411-416` 只在旗標成立時傳 `trusted_human=True`，
+/// 否則 `service.py` 的 `_send_cb` 帶 False），故 RPC 的 `human:` 字首不授權豁免；`:6573-6588` 的 quiet gate 與
+/// lease 判斷共用同一個 `human`。
+///
+/// (A) quiet：前景佔住時命令入列，banner 才武裝 quiet，前景以正式 `OpFinished` 結束後待測命令出列——
+///     可信者取得 `StartOp`；非可信者被 execute-time gate 以 `AUTOBOOT_QUIET` 終結且無 `StartOp`。
+/// (B) quiet 關閉、已有 human lease：可信者回 `SESSION_INTERACTIVE_BUSY`；非可信者沿用 agent 判斷（Python
+///     `suspend_human_interactive`），照常出列。
+#[test]
+fn wp55_execute_time_trust_matrix() {
+    use sw_core::arbiter::SubmitOrigin;
+
+    let console = || SubmitOrigin::HumanConsole {
+        client_id: "c1".into(),
+    };
+    // (source, trusted_human, origin, 預期可信)
+    let matrix = [
+        // OD-74：RPC 依原始 source 判定的可信 human（`trusted_human=true`）。
+        ("human:cli", true, SubmitOrigin::Rpc, true),
+        // G7a：明寫 `human:` 字首、非可信的 RPC 一律以 agent 對待。
+        ("human:cli", false, SubmitOrigin::Rpc, false),
+        ("agent:x", false, SubmitOrigin::Rpc, false),
+        // D5：HumanConsole 來源即使旗標為 false 仍可信（OR 語意）。
+        ("human:c1", false, console(), true),
+    ];
+
+    for (source, trusted_human, origin, trusted) in matrix.clone() {
+        let case =
+            format!("(A) quiet source={source} trusted_human={trusted_human} origin={origin:?}");
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.to_ready();
+        let hold = h.start_foreground_command("sleep 9");
+        let mut req = agent_submit("echo wp55");
+        req.source = source.into();
+        req.trusted_human = trusted_human;
+        req.origin = origin.clone();
+        let (resp, effects) = h.rpc_full(SessionRequest::Submit(req));
+        let resp = resp.expect("submit");
+        assert_eq!(
+            resp["ok"],
+            PyValue::Bool(true),
+            "{case}：quiet 前提交應通過：{resp:?}"
+        );
+        let cmd_id = resp["cmd_id"].as_str().expect("cmd_id").to_string();
+        assert!(
+            !wp55_started(&effects, &cmd_id),
+            "{case}：前景佔用中不得出列"
+        );
+        assert_eq!(
+            h.reg.get(&cmd_id).expect("registry")["status"],
+            PyValue::from("accepted"),
+            "{case}：命令應已入列"
+        );
+
+        h.rx(BANNER);
+        assert!(
+            h.fence.with(|f| f.quiet_active),
+            "{case}：banner 應於命令入列後武裝 quiet"
+        );
+        assert_ne!(
+            pget(&h.public(), "boot_quiet_remaining_s"),
+            PyValue::Null,
+            "{case}"
+        );
+
+        let epoch = h.epoch();
+        let effects = h.feed(ControlEvent::OpFinished {
+            op_id: hold.op_id,
+            epoch,
+            outcome: OpOutcome::CommandResult(sw_proto::pydict! {
+                "ok" => true, "stdout" => "", "partial" => false,
+            }),
+            after_rx_seq: None,
+        });
+        assert_eq!(
+            h.reg.get(&hold.cmd_id).expect("hold")["status"],
+            PyValue::from("done"),
+            "{case}：前景以正式 OpFinished 結束"
+        );
+        let rec = h.reg.get(&cmd_id).expect("registry");
+        if trusted {
+            assert!(
+                wp55_started(&effects, &cmd_id),
+                "{case}：可信 human 出列時應略過 quiet gate 並取得 StartOp：{rec:?}"
+            );
+            assert_eq!(rec["status"], PyValue::from("running"), "{case}：{rec:?}");
+            assert_eq!(
+                rec.get("error_code"),
+                Some(&PyValue::Null),
+                "{case}：{rec:?}"
+            );
+            assert_eq!(rec.get("done_at"), Some(&PyValue::Null), "{case}：{rec:?}");
+        } else {
+            assert!(
+                !wp55_started(&effects, &cmd_id),
+                "{case}：非可信命令不得取得 StartOp"
+            );
+            // Python `arbiter.py:465-467`：ok:false → status "error"＋error_code；`retry_after_s` 不在
+            // `arbiter.py:455-462` 的複製清單，command.get 不含（同 `execute_time_gate_has_retry_after_sc03`）。
+            assert_eq!(rec["status"], PyValue::from("error"), "{case}：{rec:?}");
+            assert_eq!(
+                rec["error_code"],
+                PyValue::from("AUTOBOOT_QUIET"),
+                "{case}：{rec:?}"
+            );
+            assert!(rec.get("retry_after_s").is_none(), "{case}：{rec:?}");
+            // 同 source 直接提交：gate 回應本身帶 `retry_after_s`（SC-03），提交時拒絕不產生命令。
+            let mut again = agent_submit("echo wp55");
+            again.source = source.into();
+            again.trusted_human = trusted_human;
+            again.origin = origin.clone();
+            let (direct, effects) = h.rpc_full(SessionRequest::Submit(again));
+            let direct = direct.expect("submit");
+            assert_eq!(
+                pget(&direct, "error_code"),
+                PyValue::from("AUTOBOOT_QUIET"),
+                "{case}：{direct:?}"
+            );
+            assert!(
+                matches!(pget(&direct, "retry_after_s"), PyValue::Float(_)),
+                "{case}：{direct:?}"
+            );
+            assert!(direct.get("cmd_id").is_none(), "{case}");
+            assert!(
+                !effects.iter().any(|e| matches!(e, Effect::StartOp { .. })),
+                "{case}：提交時拒絕不得出列"
+            );
+        }
+    }
+
+    for (source, trusted_human, origin, trusted) in matrix {
+        let case = format!(
+            "(B) human lease source={source} trusted_human={trusted_human} origin={origin:?}"
+        );
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.to_ready();
+        let open = h
+            .rpc(SessionRequest::InteractiveOpen {
+                owner: "human:operator".into(),
+                timeout_s: 60.0,
+                command: String::new(),
+                allow_attached: false,
+            })
+            .expect("RPC");
+        assert_eq!(pget(&open, "ok"), PyValue::Bool(true), "{case}：{open:?}");
+        let iid = pget(&open, "interactive_id");
+        assert!(!h.fence.with(|f| f.quiet_active), "{case}：quiet 關閉");
+        let mut req = agent_submit("echo wp55");
+        req.source = source.into();
+        req.trusted_human = trusted_human;
+        req.origin = origin.clone();
+        let (resp, effects) = h.rpc_full(SessionRequest::Submit(req));
+        let resp = resp.expect("submit");
+        assert_eq!(resp["ok"], PyValue::Bool(true), "{case}：{resp:?}");
+        let cmd_id = resp["cmd_id"].as_str().expect("cmd_id").to_string();
+        let rec = h.reg.get(&cmd_id).expect("registry");
+        if trusted {
+            // Python `session_manager.py:6584-6588`：human 且 lease 存在 → SESSION_INTERACTIVE_BUSY，
+            // `interactive_session_id` 在 `arbiter.py:455-462` 複製清單內。
+            assert!(
+                !wp55_started(&effects, &cmd_id),
+                "{case}：可信 human 遇 human lease 不得出列執行"
+            );
+            assert_eq!(rec["status"], PyValue::from("error"), "{case}：{rec:?}");
+            assert_eq!(
+                rec["error_code"],
+                PyValue::from("SESSION_INTERACTIVE_BUSY"),
+                "{case}：{rec:?}"
+            );
+            assert_eq!(rec["interactive_session_id"], iid, "{case}：{rec:?}");
+        } else {
+            // Python `:6582-6583`：非 human 遇 human lease → suspend_human_interactive，照常執行。
+            assert!(
+                wp55_started(&effects, &cmd_id),
+                "{case}：非可信命令沿用 agent 判斷照常出列：{rec:?}"
+            );
+            assert_eq!(rec["status"], PyValue::from("running"), "{case}：{rec:?}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WP5-5 第 2 項：submit-time 可信來源判定（G7b、OD-74、rulings s2 D5）
+// ---------------------------------------------------------------------------
+
+/// submit-time gate 的三種武裝狀態（Python `service._resolve_session_id` 的三個拒絕分支）。
+#[derive(Clone, Copy, Debug)]
+enum Wp55Gate {
+    /// banner 武裝 boot quiet（`boot_quiet_remaining_s` 非 None）。
+    Quiet,
+    /// prompt 清掉 quiet 但 READY 尚未經 nonce probe 再確認（`ready_reconfirm_pending`）。
+    ReconfirmPending,
+    /// 逾 `READY_RECONFIRM_MAX_S` 落有界化終態（`ready_reconfirm_failed`）。
+    ReconfirmFailed,
+}
+
+/// 以前景命令佔住 worker 後建立指定 gate 狀態；回傳佔用命令的 cmd_id。
+fn wp55_arm_gate(h: &mut CoreHarness, gate: Wp55Gate) -> String {
+    h.to_ready();
+    let hold = h.start_foreground_command("sleep 9");
+    h.rx(BANNER);
+    assert!(
+        h.fence.with(|f| f.quiet_active),
+        "{gate:?}：banner 應武裝 quiet"
+    );
+    match gate {
+        Wp55Gate::Quiet => {}
+        Wp55Gate::ReconfirmPending => {
+            h.rx(b"\r\nroot@t:~# ");
+        }
+        Wp55Gate::ReconfirmFailed => {
+            // 推到逾時前 1 秒（timer／Tick 照常投遞），最後 1 秒只推時鐘、不投 Tick：終態翻轉必定發生在
+            // submit 的 `expire_reconfirm`（Python `get_session_state` 於 gate 前先 `expire_ready_reconfirm`）。
+            h.advance(Duration::from_secs(299));
+            h.clock.advance(Duration::from_secs(1));
+        }
+    }
+    let p = h.public();
+    assert_eq!(p["state"], PyValue::from("READY"), "{gate:?}：{p:?}");
+    assert_eq!(
+        p["boot_quiet_remaining_s"] != PyValue::Null,
+        matches!(gate, Wp55Gate::Quiet),
+        "{gate:?}：{p:?}"
+    );
+    // 三態武裝當下皆為 pending、尚未落終態（ReconfirmFailed 的翻轉留給 submit，由呼叫端於提交後斷言）。
+    assert_eq!(
+        p["ready_reconfirm_pending"],
+        PyValue::Bool(true),
+        "{gate:?}：{p:?}"
+    );
+    assert_eq!(
+        p["ready_reconfirm_failed"],
+        PyValue::Bool(false),
+        "{gate:?}：{p:?}"
+    );
+    assert_eq!(
+        h.reg.get(&hold.cmd_id).expect("hold")["status"],
+        PyValue::from("running"),
+        "{gate:?}：佔用命令仍在前景執行"
+    );
+    hold.cmd_id
+}
+
+/// 提交時的 quiet／reconfirm gate 只對非可信者生效：`SubmitReq::is_trusted_human()`（`trusted_human` 旗標 OR
+/// `HumanConsole` 來源），永不看 `source` 字首，也不改 `quiet_gate::submit_gate_reject` 的輸出契約。
+///
+/// 對照 Python `origin/main:sw_core/service.py:1234-1250`（`trusted_human = source_check.is_bare_human` 傳入
+/// `_resolve_session_id`）與 `:800-839`（`if not trusted_human and platform != "passthrough"` 才進三個拒絕分支）；
+/// `tests/test_stage0_gate_codes.py:123-155`：bare `human` 於 reconfirm pending 時 `ok` 為 True，明寫
+/// `human:cli`／`human:spoof` 回 `AUTOBOOT_QUIET`。
+///
+/// (A) 三種 gate 狀態 × 四種來源：可信者 admission 成功、取得 cmd_id 並以 `accepted` 入列（前景佔用中，不宣稱 TX
+///     已放行）；非可信者回應逐鍵等於 Python 分支字面量，且沒有新命令紀錄、沒有入列、沒有 `StartOp`。
+/// (B) 既有前置檢查（非 READY、ATTACHED、RECOVERING、FLASHING）不因可信標記而繞過：可信與非可信回應完全相同。
+#[test]
+fn wp55_submit_time_trust_matrix() {
+    use sw_core::arbiter::SubmitOrigin;
+    use sw_core::quiet_gate::READY_UNCONFIRMED_HINT;
+    use sw_core::session_core::SessionState;
+
+    let console = || SubmitOrigin::HumanConsole {
+        client_id: "c1".into(),
+    };
+    // (source, trusted_human, origin, 預期可信)
+    let matrix = [
+        // OD-74：RPC 原始值 bare `human` 經 `check_source` 正規化為 `human:cli` 並帶 `trusted_human=true`。
+        ("human:cli", true, SubmitOrigin::Rpc, true),
+        // 明寫 `human:cli`（含 DF-02 的 `human:` 偽造字首）非可信，一律以 agent 對待。
+        ("human:cli", false, SubmitOrigin::Rpc, false),
+        ("agent:x", false, SubmitOrigin::Rpc, false),
+        // D5：HumanConsole 來源即使旗標為 false 仍可信（OR 語意）。
+        ("human:c1", false, console(), true),
+    ];
+    let submit = |source: &str, trusted_human: bool, origin: &SubmitOrigin| {
+        let mut req = agent_submit("echo wp55");
+        req.source = source.into();
+        req.trusted_human = trusted_human;
+        req.origin = origin.clone();
+        SessionRequest::Submit(req)
+    };
+
+    for gate in [
+        Wp55Gate::Quiet,
+        Wp55Gate::ReconfirmPending,
+        Wp55Gate::ReconfirmFailed,
+    ] {
+        for (source, trusted_human, origin, trusted) in matrix.clone() {
+            let case = format!(
+                "(A) {gate:?} source={source} trusted_human={trusted_human} origin={origin:?}"
+            );
+            let mut h = CoreHarness::new(SHELL_PROFILE);
+            let hold = wp55_arm_gate(&mut h, gate);
+            let records_before = h.reg.len();
+            let pending_before = h.reg.pending(h.core.session_id());
+            let (resp, effects) = h.rpc_full(submit(source, trusted_human, &origin));
+            let resp = resp.expect("submit");
+            // 拒絕回應的 `session` 為提交當下（含 `expire_reconfirm` 翻轉後）的 public session 原樣。
+            let public = h.public();
+            assert!(
+                !effects.iter().any(|e| matches!(e, Effect::StartOp { .. })),
+                "{case}：前景佔用中不得出列"
+            );
+            if trusted {
+                assert_eq!(resp["ok"], PyValue::Bool(true), "{case}：{resp:?}");
+                let cmd_id = resp["cmd_id"].as_str().expect("cmd_id").to_string();
+                assert_ne!(cmd_id, hold, "{case}");
+                assert_eq!(h.reg.len(), records_before + 1, "{case}：應新增命令紀錄");
+                assert_eq!(
+                    h.reg.pending(h.core.session_id()),
+                    pending_before + 1,
+                    "{case}：應入列"
+                );
+                let rec = h.reg.get(&cmd_id).expect("registry");
+                assert_eq!(rec["status"], PyValue::from("accepted"), "{case}：{rec:?}");
+                assert_eq!(rec["source"], PyValue::from(source), "{case}：{rec:?}");
+            } else {
+                let (code, retry, hint) = match gate {
+                    Wp55Gate::Quiet => (
+                        "AUTOBOOT_QUIET",
+                        Some(pget(&public, "boot_quiet_remaining_s")),
+                        "boot quiet window 進行中（疑似板卡自發重開機）；等 session 重新確認 READY 後重送",
+                    ),
+                    Wp55Gate::ReconfirmPending => (
+                        "AUTOBOOT_QUIET",
+                        Some(PyValue::Float(5.0)),
+                        "boot quiet window 已結束但 READY 尚未重新確認；等 daemon 重新確認 READY 後重送",
+                    ),
+                    Wp55Gate::ReconfirmFailed => ("READY_UNCONFIRMED", None, READY_UNCONFIRMED_HINT),
+                };
+                let mut expected = sw_proto::pydict! { "ok" => false, "error_code" => code };
+                match retry {
+                    Some(retry) => {
+                        assert!(matches!(retry, PyValue::Float(_)), "{case}：{retry:?}");
+                        expected.insert("retry_after_s", retry);
+                        expected.insert("hint", PyValue::from(hint));
+                    }
+                    None => {
+                        expected.insert("hint", PyValue::from(hint));
+                        expected.insert("recommended_action", PyValue::from("self_test"));
+                    }
+                }
+                expected.insert("session", PyValue::Dict(public.clone()));
+                assert_eq!(keys(&resp), keys(&expected), "{case}：鍵序");
+                assert_eq!(resp, expected, "{case}");
+                assert_eq!(h.reg.len(), records_before, "{case}：不得新增命令紀錄");
+                assert_eq!(
+                    h.reg.pending(h.core.session_id()),
+                    pending_before,
+                    "{case}：不得入列"
+                );
+            }
+            if matches!(gate, Wp55Gate::ReconfirmFailed) {
+                assert_eq!(
+                    public["ready_reconfirm_failed"],
+                    PyValue::Bool(true),
+                    "{case}：submit 時的 expire_reconfirm 不因可信而略過，須落有界化終態：{public:?}"
+                );
+            }
+        }
+    }
+
+    // (B) 前置檢查不因可信標記而繞過。
+    #[derive(Debug)]
+    enum Pre {
+        Detached,
+        Attached,
+        NotCommandCapable,
+        Recovering,
+        Flashing,
+    }
+    for (pre, code) in [
+        (Pre::Detached, "SESSION_NOT_READY"),
+        (Pre::Attached, "SESSION_NOT_READY"),
+        (Pre::NotCommandCapable, "PROFILE_NOT_COMMAND_CAPABLE"),
+        (Pre::Recovering, "SESSION_RECOVERING"),
+        (Pre::Flashing, "FLASHING_BUSY"),
+    ] {
+        let mut h = CoreHarness::new(match pre {
+            Pre::NotCommandCapable => SHELL_NO_PROBE_PROFILE,
+            _ => SHELL_PROFILE,
+        });
+        match pre {
+            Pre::Detached => {}
+            Pre::Attached | Pre::NotCommandCapable => {
+                h.to_attached(None);
+            }
+            Pre::Recovering => {
+                h.to_ready();
+                h.force_state(SessionState::Recovering);
+            }
+            Pre::Flashing => {
+                h.to_ready();
+                h.force_state(SessionState::Flashing);
+            }
+        }
+        let records_before = h.reg.len();
+        let (baseline, _) = h.rpc_full(submit("agent:x", false, &SubmitOrigin::Rpc));
+        let baseline = baseline.expect("submit");
+        assert_eq!(
+            pget(&baseline, "error_code"),
+            PyValue::from(code),
+            "{pre:?}：{baseline:?}"
+        );
+        for (source, trusted_human, origin, _) in matrix.clone() {
+            let case = format!(
+                "(B) {pre:?} source={source} trusted_human={trusted_human} origin={origin:?}"
+            );
+            let (resp, effects) = h.rpc_full(submit(source, trusted_human, &origin));
+            let resp = resp.expect("submit");
+            assert_eq!(keys(&resp), keys(&baseline), "{case}：鍵序");
+            assert_eq!(resp, baseline, "{case}：可信標記不得改變前置檢查回應");
+            assert!(resp.get("cmd_id").is_none(), "{case}");
+            assert!(
+                !effects.iter().any(|e| matches!(e, Effect::StartOp { .. })),
+                "{case}"
+            );
+        }
+        assert_eq!(
+            h.reg.len(),
+            records_before,
+            "{pre:?}：前置檢查拒絕不得新增命令紀錄"
+        );
+    }
 }

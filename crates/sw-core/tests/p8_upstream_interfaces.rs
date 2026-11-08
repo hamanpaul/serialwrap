@@ -70,7 +70,8 @@ fn pycompat_signatures() {
     let _: fn(&[u8]) -> String = decode_utf8_replace;
 }
 
-/// P5 06 T9：TxClass 12 個 variant（P8 只消費 Flash／FlashProbe／FileTransfer，不新增）。
+/// P5 06 T9：TxClass 13 個 variant（P8 只消費 Flash／FlashProbe／FileTransfer，不新增；`HumanLine` 由整合線
+/// WP5-5 對齊包新增，OD-74／DF-02）。
 fn tx_class_variants(c: TxClass) -> &'static str {
     match c {
         TxClass::Flash => "flash",
@@ -81,6 +82,7 @@ fn tx_class_variants(c: TxClass) -> &'static str {
         TxClass::LoginProbe => "login_probe",
         TxClass::ReadyReconfirm => "ready_reconfirm",
         TxClass::Command => "command",
+        TxClass::HumanLine => "human_line",
         TxClass::FileTransfer => "file_transfer",
         TxClass::SystemRecoverKey => "system_recover_key",
         TxClass::SelfTestProbe => "self_test_probe",

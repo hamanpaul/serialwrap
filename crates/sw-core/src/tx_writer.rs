@@ -41,6 +41,9 @@ pub enum TxClass {
     LoginProbe,
     ReadyReconfirm,
     Command,
+    /// 可信 human 的命令行（Python `human_line`，OD-74／DF-02）：只由 `SubmitReq::is_trusted_human()` 選用；
+    /// 不受 quiet／reconfirm 擋，frozen、epoch、cancelled、flash 等共同檢查照常（`uart_io.py:621-670`）。
+    HumanLine,
     FileTransfer,
     SystemRecoverKey,
     SelfTestProbe,
@@ -111,6 +114,11 @@ pub struct FenceState {
     /// `admit`；actor 據此在 probe 前的臨界窗口也擋 destructive 操作、不讓 passthrough 安靜升 READY（Python
     /// `_flash_busy_locked`）。只由 manager 在其 `Inner` 鎖內寫入。
     pub flash_critical: bool,
+    /// 目前 bridge 的 profile 是否為 passthrough（WP5-3 第 4 項；SC-35、裁決 s2 D2）：`adopt_opened_bridge` 每次
+    /// adopt 明確覆寫，預設 false。Python `agent_gate_active()`（`session_manager.py:814-826`）對 passthrough 固定回
+    /// False，`_push_tx_gate()`（`:778-785`）以此發布 bridge 的 `_gate_quiet`——故只豁免 `Command` 的
+    /// quiet／reconfirm；`quiet_active`／`reconfirm_pending` 與 reboot arming 照記，其他類別與共同拒絕不受影響。
+    pub bridge_passthrough: bool,
 }
 
 /// 撤銷 op 的 tombstone 上限（Python `uart_io._TX_ACCOUNT_MAX`；parity-amendments-2026-10-26 #38）。
@@ -196,6 +204,7 @@ impl Fence {
             foreground_busy: false,
             reboot_arm_op: None,
             flash_critical: false,
+            bridge_passthrough: false,
         })))
     }
 
@@ -239,6 +248,9 @@ impl Fence {
         }
 
         match p.class {
+            // SC-35／裁決 s2 D2：passthrough 的 agent 命令不受 quiet／reconfirm 擋（Python `_gate_quiet` 發布 False）；
+            // 上方 frozen／epoch／cancelled／flash 與下方共同檢查照舊。`FileTransfer` 不取得此豁免。
+            TxClass::Command if st.bridge_passthrough => {}
             TxClass::Command | TxClass::FileTransfer => {
                 if st.quiet_active {
                     return Err(FenceReject::Quiet);
@@ -247,6 +259,8 @@ impl Fence {
                     return Err(FenceReject::ReconfirmPending);
                 }
             }
+            // Python `_tx_reject_reason`（`uart_io.py:640`）的 quiet 只擋 `agent`；`human_line` 僅受上方共同檢查。
+            TxClass::HumanLine => {}
             TxClass::LoginProbe | TxClass::ReadyReconfirm => {
                 // P7 Task 4／7：auto_probe_blocked（console unlock 的 quiet 不擋自身登入 run）。
                 if st.quiet_active && !st.probe_quiet_exempt {
@@ -802,8 +816,9 @@ impl TxWriter {
                         {
                             state.in_flight = None;
                         }
+                        // Python `_handle_reboot_command` 的 arm 不分 `human_line`／`agent`（session_manager.py:6430-6446）。
                         if submitted
-                            && job.permit.class == TxClass::Command
+                            && matches!(job.permit.class, TxClass::Command | TxClass::HumanLine)
                             && state.reboot_arm_op == Some(job.permit.op_id)
                         {
                             state.reboot_arm_op = None;

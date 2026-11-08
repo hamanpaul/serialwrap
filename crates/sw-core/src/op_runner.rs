@@ -655,6 +655,16 @@ fn passthrough_completion_pattern(t: &ProfileTemplate, completion: Option<&str>)
         .then(|| t.prompt_regex.clone())
 }
 
+/// 命令 TX 類別（Python `session_manager.py:6603-6607`、`:6414-6419` 的 `"human_line" if human else "agent"`）：
+/// 只看 `SubmitReq::is_trusted_human()`（RPC 依原始 source 判定的 `trusted_human` OR `HumanConsole`），永不看 source 字首。
+fn command_tx_class(q: &QueuedCommand) -> TxClass {
+    if q.req.is_trusted_human() {
+        TxClass::HumanLine
+    } else {
+        TxClass::Command
+    }
+}
+
 fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     let t = &ctx.profile.template;
     let mode = normalized_mode(&q.req.mode).to_string();
@@ -663,8 +673,39 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     let timeout_s = q.req.timeout_s;
     let completion_regex = q.req.completion_regex.as_deref();
     let passthrough = t.platform == "passthrough";
-    if !passthrough && is_reboot_command(command) {
-        return run_reboot(ctx, grant, q, &mode);
+    // G3（Python `session_manager.py:6840-6868`）：`expect_reboot` 不看命令文字、也不排除 passthrough，
+    // 一律走 reboot 分支；命令文字猜法只對非 passthrough 生效。分流先於 completion pattern 與
+    // `command_completion` META，故旗標優先於 `completion_regex`。
+    let guessed_reboot = !passthrough && is_reboot_command(command);
+    if q.req.expect_reboot {
+        // Python `session_manager.py:6842-6851`：旗標 true 即於分流與命令 TX 之前寫稽核 META（不看是否猜中、
+        // 不排除 passthrough）；契約 `contracts/wal_meta_events.schema.json` 的 `command_expect_reboot`。
+        let mut meta = PyDict::new();
+        meta.insert("event", PyValue::from("command_expect_reboot"));
+        meta.insert("expect_reboot", PyValue::Bool(true));
+        let _ = ctx.wal.append(WalAppendReq {
+            com: &ctx.com,
+            dir: "META",
+            source: "system",
+            payload: b"",
+            cmd_id: Some(cmd_id),
+            loss_flag: false,
+            meta: Some(meta),
+        });
+    }
+    if q.req.expect_reboot || guessed_reboot {
+        // Python `session_manager.py:6860-6864`：旗標且非猜中（串接命令、passthrough）→ prompt 何時回來由
+        // `--cmd-timeout`／`--expected-duration` 界定；猜中的單獨 reboot 傳 `None`，維持 `min(timeout, 2 s)`。
+        // `max(timeout_s, expected_duration_s or 0.0)` 依 Python `max` 語意：後者嚴格較大才取後者（NaN 不勝出）。
+        let prompt_wait_s = (q.req.expect_reboot && !guessed_reboot).then(|| {
+            let expected = q.req.expected_duration_s.unwrap_or(0.0);
+            if expected > timeout_s {
+                expected
+            } else {
+                timeout_s
+            }
+        });
+        return run_reboot(ctx, grant, q, &mode, prompt_wait_s);
     }
     let completion_pattern = if passthrough {
         passthrough_completion_pattern(t, completion_regex)
@@ -691,7 +732,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
         ctx,
         grant,
         &payload,
-        TxClass::Command,
+        command_tx_class(q),
         &q.req.source,
         Some(cmd_id),
         true,
@@ -778,8 +819,16 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
 }
 
 /// `_handle_reboot_command`（agent 分支）：送出後 quiet 由 actor 於 TX 結算時 arm（#55）；
-/// `min(timeout, 2 s)` 內 prompt 回來 → ok／partial:false（actor 只清 TX 靜默維度，#162）；否則 `RebootExpected`。
-fn run_reboot(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand, mode: &str) -> OpOutcome {
+/// prompt 等待期限內 prompt 回來 → ok／partial:false（actor 只清 TX 靜默維度，#162）；否則 `RebootExpected`。
+/// 期限（Python `:6394`、`:6448`）：`prompt_wait_s` 為 `None`（猜中的單獨 reboot）時取 `min(timeout, 2 s)`，
+/// 否則取呼叫端給的值（旗標且非猜中：`max(timeout_s, expected_duration_s or 0)`）。
+fn run_reboot(
+    ctx: &OpCtx,
+    grant: &OpGrant,
+    q: &QueuedCommand,
+    mode: &str,
+    prompt_wait_s: Option<f64>,
+) -> OpOutcome {
     let t = &ctx.profile.template;
     let command = q.req.command.as_str();
     let pre_offset = ctx.rx.snapshot_len();
@@ -788,7 +837,7 @@ fn run_reboot(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand, mode: &str) -> Op
         ctx,
         grant,
         &payload,
-        TxClass::Command,
+        command_tx_class(q),
         &q.req.source,
         Some(&q.cmd_id),
         true,
@@ -802,7 +851,15 @@ fn run_reboot(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand, mode: &str) -> Op
         ));
     }
     let prompt_re = compile_or_never(&t.prompt_regex);
-    if wait_regex_from(ctx, &prompt_re, pre_offset, q.req.timeout_s.min(2.0)) {
+    let prompt_wait = prompt_wait_s.unwrap_or(q.req.timeout_s.min(2.0));
+    // Python `deadline = monotonic() + prompt_wait`（`uart_io.py:2635-2648`）不會溢位：超出 `Duration` 範圍的期限
+    // （`expected_duration_s` 為 1e300／inf）飽和為無限等待，不得 panic；NaN／負值 → 0（Python 立即逾時）。
+    let prompt_wait = Duration::try_from_secs_f64(prompt_wait.max(0.0)).unwrap_or(Duration::MAX);
+    if ctx
+        .rx
+        .wait_for_regex_from(&prompt_re, pre_offset, prompt_wait, &*ctx.clock)
+        .is_some()
+    {
         let raw = ctx.rx.text_from(pre_offset);
         let stdout = extract_command_stdout(&raw, command, &prompt_re, None);
         return OpOutcome::CommandResult(pydict! {

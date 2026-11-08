@@ -4,7 +4,10 @@
 //! 逐列展開 `docs/rust-refactor/plans/06-slice21-daemon-core.md` Task 8 的 Step 1 程式碼案例與表格。
 //! 實作前每個測試應於執行期因 `not implemented: slice21 T8 ...` 失敗（缺行為，非編譯錯誤）。
 
-use sw_core::arbiter::{AbortClass, CmdOutcome, CommandRegistry, RunDecision, SessionQueue, SubmitOrigin, SubmitReq};
+use sw_core::arbiter::{
+    expect_reboot_rejection, AbortClass, CmdOutcome, CommandRegistry, RunDecision, SessionQueue,
+    SubmitOrigin, SubmitReq,
+};
 use sw_proto::pyjson::{dumps, dumps_dict, PyDict, PyValue, RPC_WIRE};
 
 const T: &str = "2026-10-15T03:06:17.663778+00:00";
@@ -149,6 +152,7 @@ fn record_key_order_matches_python() {
             "timeout_s",
             "expected_duration_s",
             "completion_regex",
+            "expect_reboot",
             "priority",
             "status",
             "created_at",
@@ -165,6 +169,80 @@ fn record_key_order_matches_python() {
     );
 }
 
+#[test]
+fn wp52_record_expect_reboot_always_present() {
+    let registry = CommandRegistry::new();
+
+    for (id, expected) in [("wp52-record-false", false), ("wp52-record-true", true)] {
+        let mut request = req("reboot");
+        request.expect_reboot = expected;
+        registry
+            .admit(request, true, id.into(), T)
+            .expect("命令應通過 admission");
+
+        let accepted = rec(&registry, id);
+        assert_eq!(
+            field(&accepted, "expect_reboot"),
+            PyValue::from(expected),
+            "accepted record 必須保留布林旗標"
+        );
+        assert!(accepted.get("trusted_human").is_none());
+
+        assert!(matches!(registry.mark_running(id, T), RunDecision::Run));
+        registry.complete(id, CmdOutcome::SendFailed, T);
+
+        let completed = rec(&registry, id);
+        assert_eq!(
+            field(&completed, "expect_reboot"),
+            PyValue::from(expected),
+            "命令完成後 record 仍必須保留布林旗標"
+        );
+        assert_eq!(field(&completed, "status"), PyValue::from("error"));
+    }
+}
+
+#[test]
+fn wp52_submit_expect_reboot_echo_order() {
+    let warning = "{\"code\":\"CMD_LENGTH_WARNING\",\"cmd_length\":4097,\"soft_limit\":4096,\"hint\":\"Command exceeds 4 KB soft limit. Long commands may cause UART buffer overflow or prompt timeout.\"}";
+
+    for (id, expect_reboot) in [("wp52-echo-false", false), ("wp52-echo-true", true)] {
+        let registry = CommandRegistry::new();
+        let mut request = req(&"a".repeat(4097));
+        request.expect_reboot = expect_reboot;
+        let response = registry
+            .admit(request, true, id.into(), T)
+            .expect("長命令應接受並附帶 warning")
+            .response;
+
+        let keys: Vec<&str> = response.0.keys().map(String::as_str).collect();
+        let expected_keys = if expect_reboot {
+            vec![
+                "ok",
+                "cmd_id",
+                "status",
+                "session_id",
+                "expect_reboot",
+                "warning",
+            ]
+        } else {
+            vec!["ok", "cmd_id", "status", "session_id", "warning"]
+        };
+        assert_eq!(keys, expected_keys);
+        assert!(response.get("trusted_human").is_none());
+
+        let expected = if expect_reboot {
+            format!(
+                "{{\"ok\":true,\"cmd_id\":\"{id}\",\"status\":\"accepted\",\"session_id\":\"{SID}\",\"expect_reboot\":true,\"warning\":{warning}}}"
+            )
+        } else {
+            format!(
+                "{{\"ok\":true,\"cmd_id\":\"{id}\",\"status\":\"accepted\",\"session_id\":\"{SID}\",\"warning\":{warning}}}"
+            )
+        };
+        assert_eq!(dumps_dict(&response, &RPC_WIRE), expected);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // admission
 // ---------------------------------------------------------------------------
@@ -179,6 +257,115 @@ fn invalid_completion_regex_first() {
         dumps_dict(&e, &RPC_WIRE),
         "{\"ok\":false,\"error_code\":\"INVALID_COMPLETION_REGEX\"}"
     );
+}
+
+#[test]
+fn wp52_expect_reboot_raw_validation() {
+    let invalid_values = [
+        PyValue::from("false"),
+        PyValue::from("true"),
+        PyValue::from(""),
+        PyValue::from(0_i64),
+        PyValue::from(1_i64),
+        PyValue::from(1.5_f64),
+        PyValue::List(Vec::new()),
+        PyValue::Dict(PyDict::new()),
+    ];
+    for value in invalid_values {
+        let rejection =
+            expect_reboot_rejection(Some(&value), "interactive").expect("非 bool 型別必須拒絕");
+        assert_eq!(
+            dumps_dict(&rejection, &RPC_WIRE),
+            "{\"ok\":false,\"error_code\":\"INVALID_EXPECT_REBOOT\"}"
+        );
+    }
+
+    assert!(
+        expect_reboot_rejection(None, "line").is_none(),
+        "缺省值應放行"
+    );
+    for value in [PyValue::Null, PyValue::from(false), PyValue::from(true)] {
+        assert!(
+            expect_reboot_rejection(Some(&value), "line").is_none(),
+            "None／bool 在 line 模式應放行"
+        );
+    }
+    assert!(
+        expect_reboot_rejection(Some(&PyValue::from(false)), "interactive").is_none(),
+        "false 的 interactive 模式應放行"
+    );
+    assert_eq!(
+        dumps_dict(
+            &expect_reboot_rejection(Some(&PyValue::from(true)), "interactive")
+                .expect("interactive + true 必須拒絕"),
+            &RPC_WIRE,
+        ),
+        "{\"ok\":false,\"error_code\":\"EXPECT_REBOOT_MODE_UNSUPPORTED\",\"hint\":\"--expect-reboot 只適用 line／background 模式；interactive 是 lease 按鍵通道，不走 reboot 路徑。\"}"
+    );
+}
+
+#[test]
+fn wp52_expect_reboot_admit_order() {
+    let registry = CommandRegistry::new();
+    let mut command = "x".repeat(16_385);
+    command.push('\n');
+    let mut request = req(&command);
+    request.mode = "interactive".into();
+    request.expect_reboot = true;
+
+    let rejection = registry
+        .admit(request.clone(), true, "wp52-reboot-order".into(), T)
+        .err()
+        .expect("interactive + true 必須先於長度與換行檢查拒絕");
+    assert_eq!(
+        dumps_dict(&rejection, &RPC_WIRE),
+        "{\"ok\":false,\"error_code\":\"EXPECT_REBOOT_MODE_UNSUPPORTED\",\"hint\":\"--expect-reboot 只適用 line／background 模式；interactive 是 lease 按鍵通道，不走 reboot 路徑。\"}"
+    );
+    assert_eq!(registry.len(), 0, "拒絕不得建立命令紀錄");
+    assert_eq!(registry.pending(SID), 0, "拒絕不得增加 pending");
+
+    request.completion_regex = Some(String::new());
+    let rejection = registry
+        .admit(request, true, "wp52-reboot-order-invalid-regex".into(), T)
+        .err()
+        .expect("無效 completion regex 必須優先於 expect_reboot");
+    assert_eq!(
+        dumps_dict(&rejection, &RPC_WIRE),
+        "{\"ok\":false,\"error_code\":\"INVALID_COMPLETION_REGEX\"}"
+    );
+    assert_eq!(registry.len(), 0, "拒絕不得建立命令紀錄");
+    assert_eq!(registry.pending(SID), 0, "拒絕不得增加 pending");
+}
+
+#[test]
+fn wp52_expect_reboot_mode_aliases() {
+    let registry = CommandRegistry::new();
+    for (mode, id, execution_mode) in [
+        ("fg", "wp52-reboot-fg", "line"),
+        ("bg", "wp52-reboot-bg", "background"),
+    ] {
+        let mut request = req("reboot");
+        request.mode = mode.into();
+        request.expect_reboot = true;
+        registry
+            .admit(request, true, id.into(), T)
+            .expect("fg／bg 正規化後應允許 expect_reboot");
+        let record = rec(&registry, id);
+        assert_eq!(field(&record, "mode"), PyValue::from(mode));
+        assert_eq!(
+            field(&record, "execution_mode"),
+            PyValue::from(execution_mode)
+        );
+    }
+
+    let mut interactive = req("press-key");
+    interactive.mode = "interactive".into();
+    interactive.expect_reboot = false;
+    registry
+        .admit(interactive, true, "wp52-reboot-interactive-false".into(), T)
+        .expect("interactive + false 應放行");
+    assert_eq!(registry.len(), 3);
+    assert_eq!(registry.pending(SID), 3);
 }
 
 #[test]

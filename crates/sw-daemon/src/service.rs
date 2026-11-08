@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use sw_core::arbiter::{CommandRegistry, SubmitOrigin, SubmitReq};
+use sw_core::arbiter::{CommandRegistry, SubmitOrigin, SubmitReq, expect_reboot_rejection};
 use sw_core::event_engine::registry::UpsertError;
 use sw_core::event_engine::schema::RuleError;
 use sw_core::event_engine::EventEngine;
@@ -741,9 +741,17 @@ impl Service {
                     return Ok(source_error);
                 }
                 let source = source_check.source.clone();
+                let mode = p.str_or("mode", "line")?;
+                let raw_expect_reboot = p.raw("expect_reboot");
+                if let Some(rejection) = expect_reboot_rejection(raw_expect_reboot, &mode) {
+                    return Ok(rejection);
+                }
+                // Python `expect_reboot=expect_reboot is True`：只有原始值為 bool true 才啟用（null／缺省／false 皆 false）。
+                let expect_reboot = matches!(raw_expect_reboot, Some(PyValue::Bool(true)));
+                // Python `trusted_human = source_check.is_bare_human`：只認外部原始輸入的空名 human。
+                let trusted_human = source_check.is_bare_human();
                 let selector = first_str(&p, &["selector", "com", "alias"]);
                 let command = first_str(&p, &["cmd", "command"]);
-                let mode = p.str_or("mode", "line")?;
                 let timeout_s = p.float_or("timeout_s", 10.0)?;
                 let priority = p.int_or("priority", 10)?;
                 // `float(raw_ed) if raw_ed is not None else None`：0 → 0.0（非 None）。
@@ -766,9 +774,10 @@ impl Service {
                     priority,
                     expected_duration_s,
                     completion_regex,
-                    expect_reboot: false,
-                    trusted_human: false,
-                    // D-10（DF-02）：RPC 來源一律以 agent 對待，即使 source 以 `human:` 開頭。
+                    expect_reboot,
+                    trusted_human,
+                    // D-10（DF-02）：RPC 來源一律以 agent 對待，即使 source 以 `human:` 開頭；
+                    // 空名 human 的可信判定只經 `trusted_human` 傳遞（D5：與 origin 取 OR）。
                     origin: SubmitOrigin::Rpc,
                 };
                 self.manager
