@@ -1912,7 +1912,9 @@ impl SessionCore {
                 effects
             }
             SessionRequest::MarkAttachStalled { epoch } => {
-                self.set_state(SessionState::Recovering, now);
+                if self.state != SessionState::Released {
+                    self.set_state(SessionState::Recovering, now);
+                }
                 self.drain_stalled = true;
                 self.drain_timeout_epoch = Some(epoch);
                 let mut response = self.drain_stalled_reply(now);

@@ -173,6 +173,15 @@ struct Entry {
     history: Arc<Mutex<Vec<String>>>,
 }
 
+/// 尚未完成持久化的 placeholder 退休資料；commit 失敗時原樣放回 manager。
+struct RetiredPlaceholder {
+    entry: Entry,
+    index: usize,
+    previous_pending_com: Option<String>,
+    previous_probe_path: Option<String>,
+    previous_interactive: Vec<(String, String)>,
+}
+
 /// 進行中的 attach worker（per by_id 去重；`cancelled` 由裝置變更／bind／shutdown 設定）。
 #[derive(Clone)]
 struct AttachOp {
@@ -451,6 +460,25 @@ fn device_still_held_reply(selector: &str, pids: Vec<u32>) -> PyDict {
         "pids" => PyValue::List(pids.into_iter().map(|pid| PyValue::Int(PyInt::Small(pid as i128))).collect()),
         "holder_unknown" => holder_unknown,
         "selector" => selector.to_string()
+    }
+}
+
+/// Python attach 在途分支的完整回應；頂層 drain 欄位取自同一份 session 快照。
+fn session_recovering_reply(session: PyDict) -> PyDict {
+    let drain_stalled = session
+        .get("drain_stalled")
+        .cloned()
+        .unwrap_or(PyValue::Bool(false));
+    let drain_timeout_epoch = session
+        .get("drain_timeout_epoch")
+        .cloned()
+        .unwrap_or(PyValue::Null);
+    pydict! {
+        "ok" => false,
+        "error_code" => "SESSION_RECOVERING",
+        "drain_stalled" => drain_stalled,
+        "drain_timeout_epoch" => drain_timeout_epoch,
+        "session" => session
     }
 }
 
@@ -1279,7 +1307,7 @@ impl Shared {
             });
         };
         if already_inflight {
-            return Ok(pydict! { "ok" => true, "session" => public });
+            return Ok(session_recovering_reply(public));
         }
 
         if !force {
@@ -1306,7 +1334,7 @@ impl Shared {
                 });
             }
             if inner.inflight.contains_key(&by_id) {
-                return Ok(pydict! { "ok" => true, "session" => public });
+                return Ok(session_recovering_reply(public));
             }
             if inner.device_path(&by_id) != Some(real.as_str()) {
                 return Ok(device_not_present_reply(&selector, &by_id));
@@ -1345,11 +1373,9 @@ impl Shared {
                     if inner.device_path(&by_id) != Some(real.as_str()) {
                         return Ok(device_not_present_reply(&selector, &by_id));
                     }
-                    return Ok(pydict! {
-                        "ok" => false,
-                        "error_code" => "SESSION_RECOVERING",
-                        "session" => public
-                    });
+                    drop(inner);
+                    let current = self.session_public(sid).unwrap_or(public);
+                    return Ok(session_recovering_reply(current));
                 };
 
                 public.insert("state", PyValue::from("DETACHED"));
@@ -1362,8 +1388,12 @@ impl Shared {
                 public.insert("released_at", PyValue::Null);
                 public.insert("released_reason", PyValue::Null);
 
-                self.persist_placeholder_retirement(sid);
-                self.stop_retired_placeholder_actor(sid, &retired);
+                if let Err(error) = self.persist_placeholder_retirement(sid) {
+                    self.restore_released_placeholder(sid, &by_id, retired);
+                    self.finish_attach_op(&by_id, &op);
+                    return Err(error);
+                }
+                self.stop_retired_placeholder_actor(sid, &retired.entry);
                 // Python `_spawn_attach(by_id, dynamic_only=True)` 會以原 COM 重試 dynamic。
                 // 保留目前 inflight op，避免 watcher 在退休與重試之間搶先建立一般 attach。
                 self.spawn_attach_worker(&by_id, op);
@@ -1391,11 +1421,9 @@ impl Shared {
             if inner.device_path(&by_id) != Some(real.as_str()) {
                 return Ok(device_not_present_reply(&selector, &by_id));
             }
-            return Ok(pydict! {
-                "ok" => false,
-                "error_code" => "SESSION_RECOVERING",
-                "session" => public
-            });
+            drop(inner);
+            let current = self.session_public(sid).unwrap_or(public);
+            return Ok(session_recovering_reply(current));
         };
 
         public.insert("state", PyValue::from("ATTACHING"));
@@ -1404,8 +1432,13 @@ impl Shared {
         public.insert("released_at", PyValue::Null);
         public.insert("released_reason", PyValue::Null);
 
-        self.persist_placeholder_retirement(sid);
-        self.stop_retired_placeholder_actor(sid, &retired);
+        if let Err(error) = self.persist_placeholder_retirement(sid) {
+            self.restore_released_placeholder(sid, &by_id, retired);
+            op.close_preopened();
+            self.finish_attach_op(&by_id, &op);
+            return Err(error);
+        }
+        self.stop_retired_placeholder_actor(sid, &retired.entry);
 
         self.spawn_attach_worker(&by_id, op);
         Ok(pydict! { "ok" => true, "session" => public })
@@ -1433,7 +1466,7 @@ impl Shared {
         real: &str,
         op: &AttachOp,
         parts: Option<&mut Option<HandleParts>>,
-    ) -> Option<Entry> {
+    ) -> Option<RetiredPlaceholder> {
         let valid = !inner.stopping
             && !op.cancelled.load(Ordering::SeqCst)
             && inner.device_path(by_id) == Some(real)
@@ -1448,11 +1481,18 @@ impl Shared {
             return None;
         }
 
+        let index = inner.sessions.get_index_of(sid).expect("已驗證佔位 entry 索引");
         let entry = inner.sessions.shift_remove(sid).expect("已驗證佔位 entry");
-        inner
+        let previous_pending_com = inner
             .pending_com
             .insert(by_id.to_string(), entry.profile.com.clone());
-        inner.probe_paths.remove(sid);
+        let previous_probe_path = inner.probe_paths.remove(sid);
+        let previous_interactive: Vec<(String, String)> = inner
+            .interactive
+            .iter()
+            .filter(|(_, owner)| owner.as_str() == sid)
+            .map(|(id, owner)| (id.clone(), owner.clone()))
+            .collect();
         inner.interactive.retain(|_, owner| owner != sid);
         if let Some(parts) = parts {
             *lock(&op.preopened) = Some(Preopened {
@@ -1460,13 +1500,43 @@ impl Shared {
                 parts: parts.take().expect("成功開埠後須交付預開 handle"),
             });
         }
-        Some(entry)
+        Some(RetiredPlaceholder {
+            entry,
+            index,
+            previous_pending_com,
+            previous_probe_path,
+            previous_interactive,
+        })
+    }
+
+    /// state.json commit 失敗時恢復原佔位索引與其 COM 預留，並保持舊 actor 存活。
+    fn restore_released_placeholder(&self, sid: &str, by_id: &str, retired: RetiredPlaceholder) {
+        let mut inner = lock(&self.inner);
+        match retired.previous_pending_com {
+            Some(com) => {
+                inner.pending_com.insert(by_id.to_string(), com);
+            }
+            None => {
+                inner.pending_com.remove(by_id);
+            }
+        }
+        if let Some(path) = retired.previous_probe_path {
+            inner.probe_paths.insert(sid.to_string(), path);
+        }
+        for (interactive_id, owner) in retired.previous_interactive {
+            inner.interactive.insert(interactive_id, owner);
+        }
+        let index = retired.index.min(inner.sessions.len());
+        inner.sessions.shift_insert(index, sid.to_string(), retired.entry);
     }
 
     /// 持久化移除舊佔位的 released、binding 與 aliases，保留 pin／detected。
-    fn persist_placeholder_retirement(&self, sid: &str) {
+    fn persist_placeholder_retirement(&self, sid: &str) -> Result<(), PyErr> {
         let old_sid = sid.to_string();
-        if let Err(error) = self.commit_sync(|model| {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let mut model = lock(&self.model);
+        let previous = model.clone();
+        {
             model.apply(StateDelta::Unreleased {
                 sid: old_sid.clone(),
             });
@@ -1486,11 +1556,19 @@ impl Shared {
             for alias in old_aliases {
                 model.apply(StateDelta::AliasSet { alias, row: None });
             }
-        }) {
-            self.warn(format!(
-                "state.json 寫入失敗（retire RELEASED placeholder {sid}）：{error:?}"
-            ));
         }
+        self.store.commit(model.snapshot(), tx);
+        let result = rx.recv().unwrap_or_else(|_| {
+            Err(PalError::plain(
+                PalErrorKind::BrokenPipe,
+                "state store 已停止",
+            ))
+        });
+        if let Err(error) = result {
+            *model = previous;
+            return Err(commit_error(&error));
+        }
+        Ok(())
     }
 
     /// 舊 actor 已自 manager 索引退休；只在 manager 鎖外通知並等待它退出。
@@ -3042,6 +3120,11 @@ impl SessionManager {
                     .attach_released_placeholder(sid, *force, request_selector);
             }
         }
+        if matches!(&req, SessionRequest::Release { .. }) {
+            if let Some(response) = self.cancel_placeholder_attach_for_release(sid)? {
+                return Ok(response);
+            }
+        }
         let stopping = lock(&self.shared.inner).stopping;
         match &req {
             SessionRequest::Bind { by_id } => return self.bind(sid, by_id),
@@ -3087,6 +3170,64 @@ impl SessionManager {
             lock(&self.shared.inner).interactive.retain(|_, v| v != sid);
         }
         Ok(result)
+    }
+
+    /// Python `release_session` 會找到、取消並排空 RELEASED placeholder 的 manager 開埠作業。
+    fn cancel_placeholder_attach_for_release(
+        &self,
+        sid: &str,
+    ) -> Result<Option<PyDict>, PyErr> {
+        let (by_id, op) = {
+            let inner = lock(&self.shared.inner);
+            let Some(entry) = inner
+                .sessions
+                .get(sid)
+                .filter(|entry| entry.released_placeholder)
+            else {
+                return Ok(None);
+            };
+            let by_id = entry.profile.device_by_id.clone();
+            let Some(op) = inner.inflight.get(&by_id).cloned() else {
+                return Ok(None);
+            };
+            (by_id, op)
+        };
+
+        op.cancelled.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + ATTACH_OP_WAIT;
+        let mut inner = lock(&self.shared.inner);
+        loop {
+            let same_op = inner
+                .inflight
+                .get(&by_id)
+                .is_some_and(|current| Arc::ptr_eq(&current.cancelled, &op.cancelled));
+            if !same_op {
+                return Ok(None);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                drop(inner);
+                let epoch = self
+                    .shared
+                    .session_public(sid)
+                    .and_then(|session| session.get("bridge_generation").and_then(PyValue::as_i64))
+                    .unwrap_or(0)
+                    .max(0) as u64;
+                let mut response = self.shared.request(
+                    sid,
+                    SessionRequest::MarkAttachStalled { epoch },
+                    QUERY_TIMEOUT,
+                )?;
+                response.insert("error_code", PyValue::from("DRAIN_STALLED"));
+                return Ok(Some(response));
+            }
+            let (next, _) = self
+                .shared
+                .cv
+                .wait_timeout(inner, deadline - now)
+                .unwrap_or_else(|e| e.into_inner());
+            inner = next;
+        }
     }
 
     /// `clear_session`：RELEASED 早退；stopping → `Err("daemon stopping")`；否則 drain(CLEARED) 後重新 attach。
