@@ -287,6 +287,22 @@ impl ServiceRig {
         )
     }
 
+    /// 以載入狀態與自訂 serial 替身建構 rig，供 dispatch 測試注入開埠錯誤。
+    pub fn build_with_loaded_state_and_serial_backend(
+        spec: RigSpec,
+        loaded: LoadedState,
+        serial_backend: Arc<dyn SerialBackend>,
+    ) -> ServiceRig {
+        ServiceRig::build_with_code_identity(
+            spec,
+            None,
+            None,
+            Some("/fake/bundle".to_string()),
+            Some(serial_backend),
+            loaded,
+        )
+    }
+
     /// P6 Task 10：單一 shell target（COM0）已 READY，console 後端為 `kind`（`"pty"`｜`"tcp"`）的替身工廠。
     pub fn with_console_backend(kind: &str) -> ServiceRig {
         let kind = match kind {

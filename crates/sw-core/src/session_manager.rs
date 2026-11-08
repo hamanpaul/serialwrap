@@ -3006,6 +3006,16 @@ impl SessionManager {
         timeout: Duration,
     ) -> Result<PyDict, PyErr> {
         self.pump();
+        if let SessionRequest::DeviceAttach { force } = &req {
+            let is_placeholder = lock(&self.shared.inner)
+                .sessions
+                .get(sid)
+                .is_some_and(|entry| entry.released_placeholder);
+            if is_placeholder {
+                // OD-63：只讓 RELEASED 佔位的 device.attach 走專用交接；一般 session 仍經 actor 與下方 stopping gate。
+                return self.shared.attach_released_placeholder(sid, *force);
+            }
+        }
         let stopping = lock(&self.shared.inner).stopping;
         match &req {
             SessionRequest::Bind { by_id } => return self.bind(sid, by_id),

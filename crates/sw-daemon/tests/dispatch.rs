@@ -10,8 +10,13 @@ use std::time::Duration;
 
 use support::{BY_ID_A, BY_ID_B, REAL_A, REAL_B, RIG_PID, RigSpec, ServiceRig, wait_until};
 use sw_core::state_store::{LoadedState, ReleasedRow};
+use sw_pal::fakes::{FakeDevice, FakeSerialBackend};
 use sw_pal::proc_scan::{DaemonProc, ProcIdentity};
-use sw_pal::traits::{HolderReport, HolderScanStatus, UartExclusive};
+use sw_pal::traits::{
+    Clock, DeviceInfo, DevicePath, HolderReport, HolderScanStatus, OpenError, PalError,
+    PalErrorKind, SerialBackend, SerialConfig, SerialHandle, UartExclusive,
+};
+use sw_proto::pycompat::iso_utc_now;
 use sw_proto::pyjson::{PyDict, PyValue, RPC_WIRE, dumps};
 
 /// `foreign_holders` 會讀取行程內共用的 holder_unknown 登錄（#11）；登錄／精確比對 foreign_holders 的測試彼此序列化。
@@ -4748,9 +4753,76 @@ const WP510_FREE_BY_ID: &str = "/s/by-id/usb-C";
 const WP510_REAL_G: &str = "/fake/tty-G";
 const WP510_REAL_C: &str = "/fake/tty-C";
 
+struct Wp510GeneralOpenErrorBackend {
+    delegate: Arc<FakeSerialBackend>,
+    remaining: AtomicUsize,
+    failed: AtomicUsize,
+}
+
+fn wp510_install_shell_replies(dev: &FakeDevice) {
+    dev.on_tx_reply(b"\n", b"root@t:/# ");
+    dev.on_tx_match(
+        r"__READY__[0-9a-f]+",
+        Box::new(|line: &[u8]| {
+            let text = String::from_utf8_lossy(line).into_owned();
+            let token = text
+                .split("__READY__")
+                .nth(1)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            format!("__READY__{token}\r\nroot@t:/# ").into_bytes()
+        }),
+    );
+}
+
+impl SerialBackend for Wp510GeneralOpenErrorBackend {
+    fn open_exclusive(
+        &self,
+        dev: &DevicePath,
+        cfg: &SerialConfig,
+    ) -> Result<Box<dyn SerialHandle>, OpenError> {
+        if dev.0 == WP510_REAL_G
+            && self
+                .remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        {
+            self.failed.fetch_add(1, Ordering::SeqCst);
+            return Err(OpenError::Other(PalError::plain(
+                PalErrorKind::PermissionDenied,
+                "Permission denied",
+            )));
+        }
+        self.delegate.open_exclusive(dev, cfg)
+    }
+}
+
+fn wp510_rpc_open_error_rig(
+    with_fallback: bool,
+) -> (ServiceRig, Arc<Wp510GeneralOpenErrorBackend>, FakeDevice) {
+    let delegate = FakeSerialBackend::new();
+    for path in [REAL_A, REAL_B, WP510_REAL_G, WP510_REAL_C] {
+        wp510_install_shell_replies(&delegate.add_device(path));
+    }
+    let placeholder_device = delegate.add_device(WP510_REAL_G);
+    let backend = Arc::new(Wp510GeneralOpenErrorBackend {
+        delegate,
+        remaining: AtomicUsize::new(2),
+        failed: AtomicUsize::new(0),
+    });
+    let serial: Arc<dyn SerialBackend> = backend.clone();
+    let rig = ServiceRig::build_with_loaded_state_and_serial_backend(
+        wp510_b_placeholder_spec(with_fallback),
+        wp510_b_placeholder_loaded_state(),
+        serial,
+    );
+    (rig, backend, placeholder_device)
+}
+
 /// 建立有缺失 template 佔位、另一個在線未綁定裝置與已綁定裝置的 RPC rig。
 /// 2 個 YAML session 加 14 個 RELEASED 佔位達 max_sessions，故 usb-C 在線但不會被背景偵測搶先實體化。
-fn wp510_b_placeholder_rig() -> ServiceRig {
+fn wp510_b_placeholder_loaded_state() -> LoadedState {
     let mut loaded = LoadedState::default();
     loaded.bindings.insert(
         WP510_PLACEHOLDER_SID.to_string(),
@@ -4782,22 +4854,35 @@ fn wp510_b_placeholder_rig() -> ServiceRig {
         );
     }
 
+    loaded
+}
+
+fn wp510_b_placeholder_spec(with_fallback: bool) -> RigSpec {
+    let fallback = if with_fallback {
+        "  passthrough:\n    platform: passthrough\n    prompt_regex: '.*'\n    ready_probe: ''\n"
+    } else {
+        ""
+    };
+    RigSpec {
+        yaml: format!(
+            "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\n{fallback}targets:\n  - {{com: COM0, profile: t, device_by_id: {BY_ID_A}}}\n  - {{com: COM1, profile: t, device_by_id: {BY_ID_B}}}\n"
+        ),
+        devices: vec![
+            (BY_ID_A.to_string(), REAL_A.to_string()),
+            (BY_ID_B.to_string(), REAL_B.to_string()),
+            (WP510_PLACEHOLDER_BY_ID.to_string(), WP510_REAL_G.to_string()),
+            (WP510_FREE_BY_ID.to_string(), WP510_REAL_C.to_string()),
+        ],
+        explicit_target_count: 2,
+        allowlist: None,
+        wait_ready: vec!["COM0".to_string(), "COM1".to_string()],
+    }
+}
+
+fn wp510_b_placeholder_rig() -> ServiceRig {
     ServiceRig::build_with_loaded_state(
-        RigSpec {
-            yaml: format!(
-                "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\ntargets:\n  - {{com: COM0, profile: t, device_by_id: {BY_ID_A}}}\n  - {{com: COM1, profile: t, device_by_id: {BY_ID_B}}}\n"
-            ),
-            devices: vec![
-                (BY_ID_A.to_string(), REAL_A.to_string()),
-                (BY_ID_B.to_string(), REAL_B.to_string()),
-                (WP510_PLACEHOLDER_BY_ID.to_string(), WP510_REAL_G.to_string()),
-                (WP510_FREE_BY_ID.to_string(), WP510_REAL_C.to_string()),
-            ],
-            explicit_target_count: 2,
-            allowlist: None,
-            wait_ready: vec!["COM0".to_string(), "COM1".to_string()],
-        },
-        loaded,
+        wp510_b_placeholder_spec(false),
+        wp510_b_placeholder_loaded_state(),
     )
 }
 
@@ -4985,4 +5070,260 @@ fn wp510_b_bind_placeholder_precedes_inflight_cancellation() {
     );
     rig.mgr
         .remove_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID);
+}
+
+/// 正式 RPC 經 bind 早退後接 device.attach：佔位身份退休、原 COM 建立 template session，並能送命令與寫 WAL。
+#[test]
+fn wp510_rpc_bind_then_device_attach_replaces_placeholder() {
+    let r = wp510_b_placeholder_rig();
+    let dev = r.device(WP510_REAL_G);
+    // ServiceRig 的預設空行回覆是一次性；交接先用 PROBE 消耗它，正式 bridge 仍需 shell prompt。
+    dev.on_tx_match("^$", Box::new(|_| b"root@t:/# ".to_vec()));
+    let tx_mark = dev.tx_len();
+    let open_mark = dev.open_count();
+    assert_eq!(
+        r.mgr.resolve(WP510_PLACEHOLDER_SID).as_deref(),
+        Some(WP510_PLACEHOLDER_SID)
+    );
+    assert_eq!(
+        s(
+            &r.session(WP510_PLACEHOLDER_SID).expect("placeholder"),
+            "state"
+        ),
+        "RELEASED"
+    );
+    assert_eq!(open_mark, 0, "啟動時的佔位不得開埠");
+
+    wp510_b_assert_placeholder_bind_is_early_and_side_effect_free(&r, WP510_FREE_BY_ID);
+    let before_attach = r
+        .session(WP510_PLACEHOLDER_SID)
+        .expect("bind 早退後佔位仍存在");
+    let mut handoff_snapshot = before_attach.clone();
+    handoff_snapshot.insert("state", PyValue::from("ATTACHING"));
+    handoff_snapshot.insert("last_error", PyValue::Null);
+    handoff_snapshot.insert("released_by", PyValue::Null);
+    handoff_snapshot.insert("released_at", PyValue::Null);
+    handoff_snapshot.insert("released_reason", PyValue::Null);
+
+    let attached = r.call(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    let expected = sw_proto::pydict! {
+        "ok" => true,
+        "session" => PyValue::Dict(handoff_snapshot),
+        "version" => r.version.clone(),
+    };
+    assert_eq!(j(&attached), j(&expected), "device.attach RPC bytes");
+
+    assert!(
+        r.mgr.resolve(WP510_PLACEHOLDER_SID).is_none(),
+        "交接後舊 placeholder 身份必須消失"
+    );
+    let attach_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while r.mgr.resolve("t:COM3").as_deref() != Some("t:COM3")
+        && std::time::Instant::now() < attach_deadline
+    {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+        r.mgr.resolve("t:COM3").as_deref(),
+        Some("t:COM3"),
+        "交接後應由 dynamic worker 以原 COM 建立 template session；sessions={:?}, open_count={}, tx={:?}, response={}",
+        r.mgr.list_sessions().iter().map(j).collect::<Vec<_>>(),
+        dev.open_count(),
+        String::from_utf8_lossy(&dev.tx_since(tx_mark)),
+        j(&attached)
+    );
+    let ready_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while r
+        .session("COM3")
+        .and_then(|s| s.get("state").and_then(PyValue::as_str).map(str::to_string))
+        .as_deref()
+        != Some("READY")
+        && std::time::Instant::now() < ready_deadline
+    {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let formal = r.session("COM3").expect("正式 session 狀態");
+    assert_eq!(
+        s(&formal, "state"),
+        "READY",
+        "正式 session 應 ready：{}；TX={:?}",
+        j(&formal),
+        String::from_utf8_lossy(&dev.tx_since(tx_mark))
+    );
+    assert_eq!(s(&formal, "session_id"), "t:COM3");
+    assert_eq!(s(&formal, "com"), "COM3");
+    assert_eq!(s(&formal, "profile"), "t");
+    assert_eq!(s(&formal, "profile_source"), "detected");
+    assert_eq!(dev.open_count(), open_mark + 1, "預開 handle 應只開埠一次");
+
+    let line = b"echo wp510-handoff\n";
+    let command_tx_mark = dev.tx_len();
+    let submitted = r.call(
+        "command.submit",
+        r#"{"selector":"COM3","cmd":"echo wp510-handoff","timeout_s":10}"#,
+    );
+    let cmd_id = s(&submitted, "cmd_id").to_string();
+    assert_eq!(
+        j(&submitted),
+        format!(
+            "{{\"ok\":true,\"cmd_id\":\"{cmd_id}\",\"status\":\"accepted\",\"session_id\":\"t:COM3\",\"source_class\":\"agent\",\"version\":\"{}\"}}",
+            r.version
+        ),
+        "正式 session command.submit RPC bytes"
+    );
+    wait_until("正式 session 命令 TX", || {
+        dev.tx_since(command_tx_mark).starts_with(line)
+    });
+    assert_eq!(
+        dev.tx_since(command_tx_mark),
+        line,
+        "UART 應只送正式命令的一行"
+    );
+    dev.push_rx(b"\r\nroot@t:/# ");
+    let record = wp55_wait_done(&r, &cmd_id);
+    assert_eq!(
+        s(&record, "status"),
+        "done",
+        "命令應由正式 bridge 執行：{}",
+        j(&record)
+    );
+    assert_eq!(
+        wp55_wal_tx(&r, &cmd_id),
+        vec![("agent".to_string(), wp55_b64(line))],
+        "正式 session 命令 TX 必須寫入 WAL"
+    );
+}
+
+#[test]
+fn wp510_rpc_placeholder_offline_and_held_remain_blocked() {
+    let offline = wp510_b_placeholder_rig();
+    let snapshot: Vec<_> = offline
+        .mgr
+        .list_devices()
+        .into_iter()
+        .filter_map(|row| {
+            let by_id = s(&row, "by_id").to_string();
+            (by_id != WP510_PLACEHOLDER_BY_ID).then(|| {
+                let real_path = s(&row, "real_path").to_string();
+                (by_id.clone(), DeviceInfo { by_id, real_path })
+            })
+        })
+        .collect();
+    offline.mgr.update_devices(&snapshot);
+    let offline_response = offline.call(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    let offline_expected = sw_proto::pydict! {
+        "ok" => false,
+        "error_code" => "DEVICE_NOT_PRESENT",
+        "selector" => "COM3",
+        "device_by_id" => WP510_PLACEHOLDER_BY_ID,
+        "version" => offline.version.clone(),
+    };
+    assert_eq!(
+        j(&offline_response),
+        j(&offline_expected),
+        "離線 device.attach RPC bytes"
+    );
+    assert_eq!(
+        offline.mgr.released_placeholder(WP510_PLACEHOLDER_SID),
+        Some(true),
+        "離線裝置必須保留佔位"
+    );
+    assert_eq!(offline.device(WP510_REAL_G).open_count(), 0);
+
+    let held = wp510_b_placeholder_rig();
+    held.excl.hold(WP510_REAL_G, vec![771]);
+    let held_response = held.call(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    let held_expected = sw_proto::pydict! {
+        "ok" => false,
+        "error_code" => "DEVICE_STILL_HELD",
+        "pids" => PyValue::List(vec![PyValue::from(771)]),
+        "holder_unknown" => false,
+        "selector" => "COM3",
+        "version" => held.version.clone(),
+    };
+    assert_eq!(
+        j(&held_response),
+        j(&held_expected),
+        "holder device.attach RPC bytes"
+    );
+    assert_eq!(
+        held.mgr.released_placeholder(WP510_PLACEHOLDER_SID),
+        Some(true),
+        "holder 衝突必須保留佔位"
+    );
+    assert_eq!(held.device(WP510_REAL_G).open_count(), 0);
+}
+
+#[test]
+fn wp510_rpc_general_oserror_handoff_with_and_without_fallback() {
+    for with_fallback in [false, true] {
+        let (r, backend, dev) = wp510_rpc_open_error_rig(with_fallback);
+        let before = r
+            .session(WP510_PLACEHOLDER_SID)
+            .expect("OSError 測試前置佔位");
+        let response = r.call(
+            "device.attach",
+            &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+        );
+        let mut detached = before;
+        detached.insert("state", PyValue::from("DETACHED"));
+        detached.insert("last_error", PyValue::from("ATTACH_FAILED:PermissionError"));
+        detached.insert(
+            "detached_at",
+            PyValue::from(iso_utc_now(r.clock.wall_unix_us())),
+        );
+        detached.insert("released_by", PyValue::Null);
+        detached.insert("released_at", PyValue::Null);
+        detached.insert("released_reason", PyValue::Null);
+        let expected = sw_proto::pydict! {
+            "ok" => true,
+            "session" => PyValue::Dict(detached),
+            "version" => r.version.clone(),
+        };
+        assert_eq!(
+            j(&response),
+            j(&expected),
+            "一般 OSError 時 device.attach RPC bytes（fallback={with_fallback}）"
+        );
+        wait_until("dynamic worker 的第二次一般 OSError", || {
+            backend.failed.load(Ordering::SeqCst) == 2
+        });
+        assert!(
+            r.mgr.resolve(WP510_PLACEHOLDER_SID).is_none(),
+            "一般 OSError 仍需退休舊佔位（fallback={with_fallback}）"
+        );
+        assert_eq!(
+            r.mgr.com_for_by_id(WP510_PLACEHOLDER_BY_ID).as_deref(),
+            Some("COM3")
+        );
+        assert_eq!(dev.open_count(), 0, "兩次一般 OSError 都不得建立 handle");
+        assert!(
+            dev.tx_since(0).is_empty(),
+            "兩次一般 OSError 都不得送 UART TX"
+        );
+
+        if with_fallback {
+            wait_until("passthrough fallback session", || r.session("COM3").is_some());
+            let fallback = r.session("COM3").expect("有 fallback 時保留 COM3 session");
+            assert_eq!(s(&fallback, "session_id"), "passthrough:COM3");
+            assert_eq!(s(&fallback, "profile_source"), "fallback");
+            assert_eq!(s(&fallback, "state"), "DETACHED");
+            assert_eq!(s(&fallback, "last_error"), "ATTACH_FAILED:PermissionError");
+            assert_eq!(fallback.get("command_capable"), Some(&PyValue::Bool(false)));
+        } else {
+            assert!(
+                r.session("COM3").is_none(),
+                "沒有 passthrough fallback 時只保留 COM 預留，不建立 session"
+            );
+        }
+    }
 }
