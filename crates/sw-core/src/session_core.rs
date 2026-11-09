@@ -201,9 +201,12 @@ pub enum SessionRequest {
         token: u64,
         epoch: u64,
     },
-    /// OD-63：該 token 的開埠 handle 已安全關閉，清除先前由 placeholder release 設定的 stall 欄位。
+    /// OD-63：該 token 的開埠 handle 已安全關閉，清除先前由 placeholder release 設定的 stall 欄位，
+    /// 並依 Python `_finish_attach_op` 的 release 收尾（`session_manager.py:4341-4363`）以第一個 release 請求的
+    /// `release_source` 補齊 `released_by`／`released_at` 後持久化。
     PlaceholderAttachSettled {
         token: u64,
+        release_source: String,
     },
     /// 同 `ControlEvent::DeviceAttached`，但經請求通道並回覆套用後的活 session（bind 改綁到在線裝置時，
     /// Python 於回覆前即 ATTACHING＋`last_error=None`；審查 F70）。
@@ -1479,18 +1482,13 @@ impl SessionCore {
         let owner = waiters.next();
         let waiters = waiters.collect();
         let id = self.next_commit();
-        let release = self.pending_release.as_ref();
+        // Python `_save_state` 的 released 列直接取 session 欄位（`origin/main:sw_core/session_manager.py:1453-1461`）；
+        // 首次 release 已由 `finish_release` 寫入，已 RELEASED（含佔位）的重試沿用既有或補齊後的值。
         let row = ReleasedRow {
             by_id: PyValue::from(self.profile.device_by_id.clone()),
-            released_by: PyValue::from(
-                release
-                    .map(|value| value.source.clone())
-                    .unwrap_or_else(|| "cli".into()),
-            ),
-            released_at: PyValue::from(self.released_at.clone().unwrap_or_else(|| self.wall_iso())),
-            reason: release
-                .map(|value| value.reason.clone())
-                .unwrap_or(PyValue::Null),
+            released_by: option_string(self.released_by.as_deref()),
+            released_at: option_string(self.released_at.as_deref()),
+            reason: self.released_reason.clone(),
         };
         self.pending_commit = Some(PendingCommit::Release {
             id,
@@ -1551,15 +1549,18 @@ impl SessionCore {
                 }
                 Err(error) => {
                     self.release_persist_pending = true;
-                    let mut effects: Vec<_> = owner
-                        .into_iter()
-                        .map(|(reply, _)| {
-                            Effect::Reply(
-                                reply,
-                                Err(PyErr::value_error(error.py_message.clone())),
-                            )
-                        })
-                        .collect();
+                    let mut effects: Vec<_> = Vec::new();
+                    if owner.is_none() {
+                        // 無 RPC 呼叫端可承接例外（如佔位 attach 收尾的持久化）：比照 Python `_finish_attach_op`
+                        // 記錄錯誤後保持 RELEASED 阻擋（`origin/main:sw_core/session_manager.py:4354-4362`）。
+                        effects.push(Effect::Warn(format!(
+                            "release 持久化失敗（session={}）：{}",
+                            self.sid, error.py_message
+                        )));
+                    }
+                    effects.extend(owner.into_iter().map(|(reply, _)| {
+                        Effect::Reply(reply, Err(PyErr::value_error(error.py_message.clone())))
+                    }));
                     let mut waiters = waiters.into_iter();
                     if let Some(next_owner) = waiters.next() {
                         effects.extend(self.persist_release(
@@ -1944,13 +1945,33 @@ impl SessionCore {
                 response.insert("error_code", PyValue::from("SESSION_RECOVERING"));
                 vec![Effect::Reply(reply, Ok(response))]
             }
-            SessionRequest::PlaceholderAttachSettled { token } => {
+            SessionRequest::PlaceholderAttachSettled {
+                token,
+                release_source,
+            } => {
                 if self.placeholder_attach_stall_token == Some(token) {
                     self.drain_stalled = false;
                     self.drain_timeout_epoch = None;
                     self.placeholder_attach_stall_token = None;
                 }
-                vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
+                let mut effects = Vec::new();
+                if self.state == SessionState::Released {
+                    // Python `_finish_attach_op`（`origin/main:sw_core/session_manager.py:4341-4363`）：
+                    // `released_by = session.released_by or source`（`:3117-3122`）、
+                    // `released_at = session.released_at or now_iso()`，reason 沿用 session 既有值；
+                    // 標記 `_release_persist_pending` 後持久化，失敗只告警（見 `state_committed`），
+                    // 留給 release 呼叫端重試（`:3206-3209`）。
+                    if self.released_by.as_deref().is_none_or(str::is_empty) {
+                        self.released_by = Some(release_source);
+                    }
+                    if self.released_at.as_deref().is_none_or(str::is_empty) {
+                        self.released_at = Some(self.wall_iso());
+                    }
+                    self.release_persist_pending = true;
+                    effects.extend(self.persist_release(Vec::new()));
+                }
+                effects.insert(0, Effect::Reply(reply, Ok(self.ok_session(now))));
+                effects
             }
             #[cfg(feature = "test-fakes")]
             SessionRequest::QueueLensForTest => vec![Effect::Reply(

@@ -1830,6 +1830,204 @@ fn wp510_review_late_placeholder_attach_completion_clears_drain_stall() {
     );
 }
 
+/// wp510 第四次整包審查：`released_by`／`released_at` 為 null（reason 保留）的缺失 template 佔位。
+fn wp510_review4_null_metadata_rig() -> ManagerRig {
+    const SID: &str = "gone-template:COM3";
+    const BY_ID: &str = "/s/by-id/usb-G";
+    let mut loaded = LoadedState::default();
+    loaded.released.insert(
+        SID.to_string(),
+        ReleasedRow {
+            by_id: PyValue::Str(BY_ID.to_string()),
+            released_by: PyValue::Null,
+            released_at: PyValue::Null,
+            reason: PyValue::Str("manual".to_string()),
+        },
+    );
+    let m = ManagerRig::with(&manager_yaml(&[]), loaded, None);
+    m.add_device_at(BY_ID, "/dev/ttyG");
+    install_shell_replies(&m.device("/dev/ttyG"));
+    m
+}
+
+/// 佔位 attach 停在 `open_exclusive` 時送出 `release(source, reason)`；release 取得在途作業後才放行開埠。
+/// 回傳 `(attach 結果, release 結果)`。
+fn wp510_review4_release_during_placeholder_open(
+    m: &ManagerRig,
+    sid: &str,
+    real: &str,
+    source: &str,
+    reason: PyValue,
+) -> (Result<PyDict, PyErr>, Result<PyDict, PyErr>) {
+    m.serial.block_open(real);
+    let (cancel_tx, cancel_rx) = crossbeam_channel::bounded::<()>(1);
+    m.mgr.set_placeholder_release_cancel_hook_for_test(Box::new(move || {
+        let _ = cancel_tx.try_send(());
+    }));
+    let attach_manager = m.mgr.clone();
+    let attach_sid = sid.to_string();
+    let attach = std::thread::spawn(move || {
+        attach_manager.attach_released_placeholder(&attach_sid, false)
+    });
+    wait_until("佔位 attach 停在 open_exclusive", || {
+        m.serial.open_attempts(real) == 1
+    });
+    let release_manager = m.mgr.clone();
+    let release_sid = sid.to_string();
+    let source = source.to_string();
+    let release = std::thread::spawn(move || {
+        release_manager.route(
+            &release_sid,
+            SessionRequest::Release { source, reason },
+            Duration::from_secs(10),
+        )
+    });
+    cancel_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("release 應取得在途佔位 attach 作業");
+    m.serial.release_open(real);
+    let attach_result = attach.join().expect("attach thread 不應 panic");
+    let release_result = release.join().expect("release thread 不應 panic");
+    (attach_result, release_result)
+}
+
+/// wp510 第四次整包審查 Medium 1：null 來源與時間的佔位在開埠途中被 `release(source="cli")` 撤銷；handle
+/// 安全關閉後，Python `_finish_attach_op` 以 `released_by or source`、`released_at or now_iso()` 補齊、reason 沿用
+/// session 既有值並持久化，release 回 `already_released`。Python 對照：`origin/main:sw_core/session_manager.py:3117-3122`
+/// （第一個 release 請求的 source／reason）、`:4341-4363`（收尾補齊與 `_persist_release_state`）、`:3206-3209`。
+#[test]
+fn wp510_review4_release_cancel_fills_null_release_metadata_and_persists() {
+    const SID: &str = "gone-template:COM3";
+    const REAL: &str = "/dev/ttyG";
+    const WALL_US: i64 = 1_762_646_400_000_000;
+    let m = wp510_review4_null_metadata_rig();
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    m.mgr.update_devices(&m.snapshot());
+    let before = m.session(SID);
+    assert_eq!(before.get("released_by"), Some(&PyValue::Null), "前置：released_by 為 null");
+    assert_eq!(before.get("released_at"), Some(&PyValue::Null), "前置：released_at 為 null");
+    m.clock.set_wall_us(WALL_US);
+    let writes_before = m.state_writes();
+
+    let (attach, release) = wp510_review4_release_during_placeholder_open(
+        &m,
+        &sid,
+        REAL,
+        "cli",
+        PyValue::from("ignored-reason"),
+    );
+    let attach = rpc(attach);
+    let release = rpc(release);
+    let expected_at = sw_proto::pycompat::iso_utc_now(WALL_US);
+
+    assert_eq!(code_of(&attach).as_deref(), Some("SESSION_RECOVERING"));
+    assert_eq!(release.get("ok"), Some(&PyValue::Bool(true)), "{release:?}");
+    assert_eq!(
+        release.get("already_released"),
+        Some(&PyValue::Bool(true)),
+        "{release:?}"
+    );
+    let session = session_field(&release);
+    assert_eq!(s_of(&session, "state").as_deref(), Some("RELEASED"));
+    assert_eq!(
+        s_of(&session, "released_by").as_deref(),
+        Some("cli"),
+        "Python `released_by or source`"
+    );
+    assert_eq!(
+        s_of(&session, "released_at").as_deref(),
+        Some(expected_at.as_str()),
+        "Python `released_at or now_iso()`"
+    );
+    assert_eq!(
+        s_of(&session, "released_reason").as_deref(),
+        Some("manual"),
+        "已 RELEASED 的佔位沿用既有 reason，不取本次 release 的 reason"
+    );
+    assert_eq!(session.get("drain_stalled"), Some(&PyValue::Bool(false)));
+    assert!(
+        m.state_writes() > writes_before,
+        "release 收尾必須寫入 state.json"
+    );
+    let row = m
+        .load_state_now()
+        .released
+        .get(SID)
+        .cloned()
+        .expect("RELEASED 佔位列仍在 state.json");
+    assert_eq!(row.released_by, PyValue::from("cli"));
+    assert_eq!(row.released_at, PyValue::from(expected_at.as_str()));
+    assert_eq!(row.reason, PyValue::from("manual"));
+    assert_eq!(m.mgr.released_placeholder(&sid), Some(true));
+    assert!(m.mgr.resolve("t:COM3").is_none(), "release 成功後不得交接 dynamic");
+}
+
+/// wp510 第四次整包審查 Medium 1（持久化失敗）：同一情境下 state.json 持續 ENOSPC。Python 收尾的
+/// `_persist_release_state` 失敗只記錄錯誤（`origin/main:sw_core/session_manager.py:4354-4362`），release 隨後重試
+/// （`:3206-3207`）仍失敗即拋出，RPC 不得回成功；佔位維持 RELEASED 阻擋，磁碟恢復後下一次 release 寫入補齊值。
+#[test]
+fn wp510_review4_release_cancel_persist_enospc_fails_release_then_retries() {
+    const SID: &str = "gone-template:COM3";
+    const REAL: &str = "/dev/ttyG";
+    const WALL_US: i64 = 1_762_646_400_000_000;
+    let m = wp510_review4_null_metadata_rig();
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    m.mgr.update_devices(&m.snapshot());
+    m.clock.set_wall_us(WALL_US);
+    m.fs.fail_next_atomic_writes(PalError::io(28, "[Errno 28] No space left on device"), 2);
+
+    let (attach, release) =
+        wp510_review4_release_during_placeholder_open(&m, &sid, REAL, "cli", PyValue::Null);
+    let attach = rpc(attach);
+    let expected_at = sw_proto::pycompat::iso_utc_now(WALL_US);
+
+    assert_eq!(code_of(&attach).as_deref(), Some("SESSION_RECOVERING"));
+    let error = match release {
+        Ok(response) => panic!("持續 ENOSPC 時 release 不得回成功：{response:?}"),
+        Err(error) => error,
+    };
+    assert!(
+        error.message.contains("No space left on device"),
+        "release 必須沿 Python 例外路徑回報 ENOSPC：{}",
+        error.message
+    );
+    let warnings = m.warnings();
+    assert!(
+        warnings.iter().any(|w| {
+            w.contains("release 持久化失敗（session=gone-template:COM3）")
+                && w.contains("No space left on device")
+        }),
+        "收尾持久化失敗必須留下 session 與錯誤告警：{warnings:?}"
+    );
+    assert_eq!(m.mgr.released_placeholder(&sid), Some(true));
+    let listed = m.session(SID);
+    assert_eq!(s_of(&listed, "state").as_deref(), Some("RELEASED"));
+    assert_eq!(s_of(&listed, "released_by").as_deref(), Some("cli"));
+    assert_eq!(
+        m.load_state_now().released.get(SID).map(|row| row.released_by.clone()),
+        Some(PyValue::Null),
+        "落盤失敗時 state.json 仍是舊列"
+    );
+
+    let retry = rpc(wp510_release(&m.mgr, &sid));
+    assert_eq!(retry.get("already_released"), Some(&PyValue::Bool(true)), "{retry:?}");
+    let retried = session_field(&retry);
+    assert_eq!(
+        s_of(&retried, "released_by").as_deref(),
+        Some("cli"),
+        "重試沿用收尾補齊的來源，不改成重試請求的 source"
+    );
+    let row = m
+        .load_state_now()
+        .released
+        .get(SID)
+        .cloned()
+        .expect("RELEASED 佔位列仍在 state.json");
+    assert_eq!(row.released_by, PyValue::from("cli"));
+    assert_eq!(row.released_at, PyValue::from(expected_at.as_str()));
+    assert_eq!(row.reason, PyValue::from("manual"));
+}
+
 #[test]
 fn wp510_lifecycle_shutdown_cancel_fail_close_keeps_placeholder_blocked() {
     const SID: &str = "gone-template:COM3";
@@ -1933,6 +2131,166 @@ fn wp510_lifecycle_device_path_change_cancel_fail_close_keeps_placeholder_blocke
     assert!(still_blocked, "裝置改指取消的 close:false 必須保留 inflight");
     assert_eq!(code_of(&release_reply).as_deref(), Some("DRAIN_STALLED"));
     assert!(release_elapsed >= Duration::from_millis(2500));
+}
+
+/// 等待 daemon stderr 告警出現（最多 `RIG_RPC_TIMEOUT`）；回傳當下全部告警供斷言訊息使用。
+fn wp510_review4_wait_warning(m: &ManagerRig, needle: &str) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let warnings = m.warnings();
+        if warnings.iter().any(|w| w.contains(needle)) || Instant::now() >= deadline {
+            return warnings;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Python `_finish_attach_op` 的關閉失敗告警（`origin/main:sw_core/session_manager.py:4326-4331`）。
+const WP510_REVIEW4_CLOSE_WARNING: &str =
+    "預開 UART handle 關閉失敗（by_id=/s/by-id/usb-G）：[Errno 5] Input/output error";
+
+/// wp510 第四次整包審查 Medium 2：佔位已退休、dynamic PROBE 遭裝置改指取消，預開 handle 的關閉回條為
+/// `closed:false`。舊 session 已消失、新 session 尚未建立；Python `_finish_attach_op`
+/// （`origin/main:sw_core/session_manager.py:4322-4332`）先以 by_id 與關閉例外告警再保留阻擋，操作者才能由
+/// daemon stderr 找到永久阻擋的原因。
+#[test]
+fn wp510_review4_failed_preopened_close_warns_with_by_id_and_error() {
+    const SID: &str = "gone-template:COM3";
+    const BY_ID: &str = "/s/by-id/usb-G";
+    const REAL: &str = "/dev/ttyG";
+    const CHANGED: &str = "/dev/ttyG-rebound";
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    let device = m.device(REAL);
+    m.mgr.update_devices(&m.snapshot());
+    m.serial.add_device(CHANGED);
+    let changed = vec![(
+        BY_ID.to_string(),
+        DeviceInfo {
+            by_id: BY_ID.to_string(),
+            real_path: CHANGED.to_string(),
+        },
+    )];
+
+    let weak = std::sync::Arc::downgrade(&m.mgr);
+    let hook_device = device.clone();
+    let (hook_tx, hook_rx) = crossbeam_channel::bounded(4);
+    m.mgr.set_probe_pre_submit_hook_for_test(Box::new(move || {
+        if let Some(manager) = weak.upgrade() {
+            // 交接後的 PROBE 已越過 `still_valid()`：裝置改指取消作業，接著令關閉失敗。
+            manager.update_devices(&changed);
+            hook_device.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
+            let _ = hook_tx.send(());
+        }
+    }));
+
+    let response = rpc(m.mgr.attach_released_placeholder(&sid, false));
+    assert!(is_ok(&response), "device.attach 應接受在線佔位：{response:?}");
+    hook_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("交接後的 PROBE 應在提交前觸發裝置改指");
+    wait_until("被取消的預開 handle 嘗試關閉", || device.close_count() == 1);
+    let warnings = wp510_review4_wait_warning(&m, WP510_REVIEW4_CLOSE_WARNING);
+
+    assert!(
+        warnings.iter().any(|w| w == WP510_REVIEW4_CLOSE_WARNING),
+        "關閉失敗必須以 by_id 與 CloseReceipt.error 告警：{warnings:?}"
+    );
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|w| w.contains("預開 UART handle 關閉失敗"))
+            .count(),
+        1,
+        "同一次失敗的關閉只告警一次：{warnings:?}"
+    );
+    assert!(device.is_open(), "closed:false 表示 handle 仍開啟");
+    assert!(
+        m.mgr.has_inflight_attach_for_test(BY_ID),
+        "關閉失敗後仍須保留阻擋"
+    );
+    assert!(m.mgr.resolve(SID).is_none(), "舊佔位已於交接時退休");
+    assert!(m.mgr.resolve("t:COM3").is_none(), "被取消的交接不得建立正式 session");
+}
+
+/// wp510 第四次整包審查 Medium 2（退休前）：佔位開埠途中裝置改指，`attach_released_placeholder` 收尾關閉晚到
+/// handle 失敗。Python `attach_device` 的 `invalid_reason == "device"` 分支同樣經 `_finish_attach_op` 告警
+/// （`origin/main:sw_core/session_manager.py:3614-3616`、`:4322-4332`）。
+#[test]
+fn wp510_review4_failed_late_handle_close_before_retirement_warns() {
+    const SID: &str = "gone-template:COM3";
+    const BY_ID: &str = "/s/by-id/usb-G";
+    const REAL: &str = "/dev/ttyG";
+    const CHANGED: &str = "/dev/ttyG-rebound";
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    let device = m.device(REAL);
+    m.mgr.update_devices(&m.snapshot());
+    m.serial.block_open(REAL);
+
+    let attach_manager = m.mgr.clone();
+    let attach_sid = sid.clone();
+    let attach = std::thread::spawn(move || attach_manager.attach_released_placeholder(&attach_sid, false));
+    wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(REAL) == 1);
+    m.serial.add_device(CHANGED);
+    m.mgr.update_devices(&[(
+        BY_ID.to_string(),
+        DeviceInfo {
+            by_id: BY_ID.to_string(),
+            real_path: CHANGED.to_string(),
+        },
+    )]);
+    device.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
+    m.serial.release_open(REAL);
+    let attach_reply = rpc(attach.join().expect("attach thread 不應 panic"));
+    let warnings = m.warnings();
+
+    assert_eq!(code_of(&attach_reply).as_deref(), Some("DEVICE_NOT_PRESENT"));
+    assert!(
+        warnings.iter().any(|w| w == WP510_REVIEW4_CLOSE_WARNING),
+        "晚到 handle 關閉失敗必須以 by_id 與錯誤告警：{warnings:?}"
+    );
+    assert!(m.mgr.has_inflight_attach_for_test(BY_ID), "關閉失敗後仍須保留阻擋");
+    assert_eq!(m.mgr.released_placeholder(&sid), Some(true));
+}
+
+/// wp510 第四次整包審查盤點二：交接完成後預開 handle 已交給正式 session、正式 bridge 尚未接手時 shutdown，
+/// `open_bridge` 關閉它失敗。Python 的預開 handle 在正式 bridge 接手前仍屬 `_preopened_ports` 作業，停機丟棄同樣
+/// 經 `_finish_attach_op` 告警（`origin/main:sw_core/session_manager.py:1175-1193`、`:4322-4332`）。
+#[test]
+fn wp510_review4_failed_session_preopened_close_on_shutdown_warns() {
+    const SID: &str = "gone-template:COM3";
+    const REAL: &str = "/dev/ttyG";
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    let device = m.device(REAL);
+    m.mgr.update_devices(&m.snapshot());
+
+    let weak = std::sync::Arc::downgrade(&m.mgr);
+    let hook_device = device.clone();
+    let (hook_tx, hook_rx) = crossbeam_channel::bounded(1);
+    m.mgr.set_open_bridge_pre_take_hook_for_test(Box::new(move || {
+        if let Some(manager) = weak.upgrade() {
+            hook_device.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
+            let drained = manager.shutdown(Duration::from_millis(50));
+            let _ = hook_tx.send(drained);
+        }
+    }));
+
+    let response = rpc(m.mgr.attach_released_placeholder(&sid, false));
+    assert!(is_ok(&response), "device.attach 應接受在線佔位：{response:?}");
+    hook_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("正式 session 的 open_bridge 應觸發停機");
+    wait_until("預開 handle 嘗試關閉", || device.close_count() == 1);
+    let warnings = wp510_review4_wait_warning(&m, WP510_REVIEW4_CLOSE_WARNING);
+
+    assert!(
+        warnings.iter().any(|w| w == WP510_REVIEW4_CLOSE_WARNING),
+        "session 預開 handle 關閉失敗必須以 by_id 與錯誤告警：{warnings:?}"
+    );
+    assert_eq!(device.open_count(), 1, "停機後不得重新開埠");
+    assert!(device.take_tx().iter().all(|b| *b == b'\n'), "停機後只允許交接 PROBE 的 \\n");
 }
 
 /// PROBE TX 的 WAL 列數（`com=PROBE`、`dir=TX`）。

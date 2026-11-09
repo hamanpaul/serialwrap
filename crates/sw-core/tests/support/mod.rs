@@ -1894,6 +1894,8 @@ pub struct RigFs {
     files: Mutex<BTreeMap<PathBuf, Vec<u8>>>,
     writes: Mutex<BTreeMap<PathBuf, usize>>,
     fail_next: Mutex<Option<PalError>>,
+    /// 接續 `fail_next` 之後的連續失敗（錯誤、剩餘次數）；模擬持續 ENOSPC。
+    fail_repeat: Mutex<Option<(PalError, usize)>>,
 }
 
 impl RigFs {
@@ -1923,6 +1925,11 @@ impl RigFs {
     /// 下一次 `atomic_write` 失敗（一次性；state.json commit 失敗替身）。
     pub fn fail_next_atomic_write(&self, err: PalError) {
         *self.fail_next.lock().unwrap_or_else(|e| e.into_inner()) = Some(err);
+    }
+
+    /// 接下來連續 `n` 次 `atomic_write` 都以 `err` 失敗（持續 ENOSPC 替身）。
+    pub fn fail_next_atomic_writes(&self, err: PalError, n: usize) {
+        *self.fail_repeat.lock().unwrap_or_else(|e| e.into_inner()) = (n > 0).then_some((err, n));
     }
 }
 
@@ -1965,6 +1972,17 @@ impl FsOps for RigFs {
             .take()
         {
             return Err(err);
+        }
+        {
+            let mut repeat = self.fail_repeat.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((err, remaining)) = repeat.as_mut() {
+                let err = err.clone();
+                *remaining -= 1;
+                if *remaining == 0 {
+                    *repeat = None;
+                }
+                return Err(err);
+            }
         }
         self.files
             .lock()

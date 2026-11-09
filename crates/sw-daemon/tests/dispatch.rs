@@ -4880,6 +4880,18 @@ fn wp510_b_placeholder_blocking_rig_with_open_error(
     crossbeam_channel::Receiver<()>,
     FakeDevice,
 ) {
+    wp510_b_placeholder_blocking_rig_with(wp510_b_placeholder_loaded_state(), error_after_gate)
+}
+
+fn wp510_b_placeholder_blocking_rig_with(
+    loaded: LoadedState,
+    error_after_gate: Option<OpenError>,
+) -> (
+    ServiceRig,
+    Arc<Wp510BlockingOpenBackend>,
+    crossbeam_channel::Receiver<()>,
+    FakeDevice,
+) {
     let delegate = FakeSerialBackend::new();
     for path in [REAL_A, REAL_B, WP510_REAL_G, WP510_REAL_C] {
         wp510_install_shell_replies(&delegate.add_device(path));
@@ -4896,7 +4908,7 @@ fn wp510_b_placeholder_blocking_rig_with_open_error(
     let serial: Arc<dyn SerialBackend> = backend.clone();
     let rig = ServiceRig::build_with_loaded_state_and_serial_backend(
         wp510_b_placeholder_spec(false),
-        wp510_b_placeholder_loaded_state(),
+        loaded,
         serial,
     );
     (rig, backend, entered_rx, placeholder_device)
@@ -5888,4 +5900,162 @@ fn wp510_rpc_placeholder_retirement_enospc_stops_handoff() {
     assert_eq!(dev.open_count(), 1);
     assert_eq!(dev.close_count(), 1, "落盤失敗後須關閉預開 handle");
     assert!(dev.tx_len() == 0, "落盤失敗不得啟動 dynamic 偵測 TX");
+}
+
+/// wp510 第四次整包審查：佔位列的 `released_by`／`released_at` 為 null（reason 保留）。
+fn wp510_review4_null_metadata_loaded_state() -> LoadedState {
+    let mut loaded = wp510_b_placeholder_loaded_state();
+    loaded.released.insert(
+        WP510_PLACEHOLDER_SID.to_string(),
+        ReleasedRow {
+            by_id: PyValue::from(WP510_PLACEHOLDER_BY_ID),
+            released_by: PyValue::Null,
+            released_at: PyValue::Null,
+            reason: PyValue::from("manual"),
+        },
+    );
+    loaded
+}
+
+/// state.json 中指定 sid 的 released 列（不存在 panic）。
+fn wp510_review4_released_row(r: &ServiceRig, sid: &str) -> PyDict {
+    let text = String::from_utf8(r.fs.bytes(support::STATE_PATH)).expect("state.json 應為 UTF-8");
+    let value = sw_proto::pyjson::loads(&text).expect("state.json 應可解析");
+    let PyValue::Dict(state) = value else {
+        panic!("state.json 頂層應為 dict：{text}");
+    };
+    let released = sub(&state, "released");
+    sub(&released, sid)
+}
+
+/// 佔位 device.attach 停在開埠時送 device.release（RPC 預設 source=cli）；release 取得在途作業後才放行開埠。
+/// 回傳 `(attach 回應, release 結果)`。
+fn wp510_review4_rpc_release_during_placeholder_open(
+    r: &Arc<ServiceRig>,
+    backend: &Wp510BlockingOpenBackend,
+    entered: &crossbeam_channel::Receiver<()>,
+) -> (PyDict, Result<PyDict, sw_proto::pycompat::PyErr>) {
+    let (cancel_tx, cancel_rx) = crossbeam_channel::bounded::<()>(1);
+    r.mgr.set_placeholder_release_cancel_hook_for_test(Box::new(move || {
+        let _ = cancel_tx.try_send(());
+    }));
+    let attach_rig = Arc::clone(r);
+    let attach = std::thread::spawn(move || {
+        attach_rig.call(
+            "device.attach",
+            &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+        )
+    });
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("placeholder open_exclusive 必須進入阻塞點");
+    let release_rig = Arc::clone(r);
+    let release = std::thread::spawn(move || {
+        release_rig.call_raw(
+            "device.release",
+            &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+        )
+    });
+    cancel_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("device.release 應取得在途佔位 attach 作業");
+    backend.release();
+    let attached = attach.join().expect("attach RPC thread");
+    let released = release.join().expect("release RPC thread");
+    (attached, released)
+}
+
+/// wp510 第四次整包審查 Medium 1（RPC）：null 來源與時間的佔位開埠在途時 `device.release`（預設 source=cli）撤銷作業；
+/// handle 安全關閉後 release 回 `already_released`，補齊 `released_by`／`released_at` 並寫入 state.json。Python 對照：
+/// `origin/main:sw_core/session_manager.py:3117-3122`、`:4341-4363`、`:3206-3209`。呼叫路徑：`Service::rpc("device.release")`
+/// → `SessionManager::route_with_selector` → `cancel_placeholder_attach_for_release`（記錄 source）→ attach worker
+/// `finish_attach_op` → `SessionRequest::PlaceholderAttachSettled` → `SessionCore::persist_release` → `Effect::Persist`。
+#[test]
+fn wp510_review4_rpc_release_cancel_fills_null_release_metadata_and_persists() {
+    let (r, backend, entered, dev) =
+        wp510_b_placeholder_blocking_rig_with(wp510_review4_null_metadata_loaded_state(), None);
+    let r = Arc::new(r);
+    let before = r
+        .session(WP510_PLACEHOLDER_SID)
+        .expect("release 測試前置佔位");
+    assert_eq!(before.get("released_by"), Some(&PyValue::Null), "前置：released_by 為 null");
+    assert_eq!(before.get("released_at"), Some(&PyValue::Null), "前置：released_at 為 null");
+    r.clock.set_wall_us(r.clock.wall_unix_us() + 5_000_000);
+    let filled_at = iso_utc_now(r.clock.wall_unix_us());
+    let tx_mark = dev.tx_len();
+
+    let (attached, released) = wp510_review4_rpc_release_during_placeholder_open(&r, &backend, &entered);
+    let released = released.unwrap_or_else(|e| panic!("device.release 不應回 Err：{}", e.message));
+
+    let mut expected_session = before.clone();
+    expected_session.insert("released_by", PyValue::from("cli"));
+    expected_session.insert("released_at", PyValue::from(filled_at.as_str()));
+    assert_eq!(s(&attached, "error_code"), "SESSION_RECOVERING", "{}", j(&attached));
+    assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&released));
+    assert_eq!(released.get("already_released"), Some(&PyValue::Bool(true)), "{}", j(&released));
+    assert_eq!(
+        j(&sub(&released, "session")),
+        j(&expected_session),
+        "release 回應的 session 須補齊來源與時間，其餘欄位不變"
+    );
+    let row = wp510_review4_released_row(&r, WP510_PLACEHOLDER_SID);
+    assert_eq!(
+        j(&row),
+        j(&sw_proto::pydict! {
+            "by_id" => WP510_PLACEHOLDER_BY_ID,
+            "reason" => "manual",
+            "released_at" => filled_at.as_str(),
+            "released_by" => "cli",
+        }),
+        "state.json 的 released 列須寫入補齊值"
+    );
+    assert_eq!(r.mgr.released_placeholder(WP510_PLACEHOLDER_SID), Some(true));
+    assert!(r.mgr.resolve("t:COM3").is_none(), "release 成功後不得建立 dynamic session");
+    assert!(dev.tx_since(tx_mark).is_empty(), "release 成功後不得送 UART TX");
+}
+
+/// wp510 第四次整包審查 Medium 1（RPC 持久化失敗）：同一情境下 state.json 持續 ENOSPC，Python 收尾持久化失敗只記錄
+/// （`:4354-4362`），release 重試（`:3206-3207`）仍失敗即拋出；`device.release` 必須走 RPC 錯誤路徑而非回成功，
+/// 磁碟恢復後下一次 `device.release` 寫入補齊值。
+#[test]
+fn wp510_review4_rpc_release_cancel_persist_enospc_returns_error_then_retries() {
+    let (r, backend, entered, _dev) =
+        wp510_b_placeholder_blocking_rig_with(wp510_review4_null_metadata_loaded_state(), None);
+    let r = Arc::new(r);
+    r.clock.set_wall_us(r.clock.wall_unix_us() + 5_000_000);
+    let filled_at = iso_utc_now(r.clock.wall_unix_us());
+    r.fs.fail_next_atomic_writes(
+        PalError::io(28, "[Errno 28] No space left on device"),
+        2,
+    );
+
+    let (attached, released) = wp510_review4_rpc_release_during_placeholder_open(&r, &backend, &entered);
+    assert_eq!(s(&attached, "error_code"), "SESSION_RECOVERING", "{}", j(&attached));
+    let error = match released {
+        Ok(response) => panic!("持續 ENOSPC 時 device.release 不得回成功：{}", j(&response)),
+        Err(error) => error,
+    };
+    assert!(
+        error.message.contains("No space left on device"),
+        "ENOSPC 必須沿 RPC error 路徑傳回：{}",
+        error.message
+    );
+    assert_eq!(r.mgr.released_placeholder(WP510_PLACEHOLDER_SID), Some(true));
+    assert_eq!(
+        wp510_review4_released_row(&r, WP510_PLACEHOLDER_SID).get("released_by"),
+        Some(&PyValue::Null),
+        "落盤失敗時 state.json 仍是舊列"
+    );
+
+    let retry = r.call(
+        "device.release",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}","source":"agent"}}"#),
+    );
+    assert_eq!(retry.get("already_released"), Some(&PyValue::Bool(true)), "{}", j(&retry));
+    let retry_session = sub(&retry, "session");
+    assert_eq!(s(&retry_session, "released_by"), "cli", "重試沿用收尾補齊的來源");
+    let row = wp510_review4_released_row(&r, WP510_PLACEHOLDER_SID);
+    assert_eq!(s(&row, "released_by"), "cli");
+    assert_eq!(s(&row, "released_at"), filled_at);
+    assert_eq!(s(&row, "reason"), "manual");
 }

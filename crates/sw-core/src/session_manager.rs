@@ -122,6 +122,20 @@ impl HandleParts {
     }
 }
 
+/// `CloseReceipt` 失敗時的錯誤文字（Python `_finish_attach_op` 告警中的 `exc`，`session_manager.py:4326-4331`）。
+fn close_error_text(receipt: &CloseReceipt) -> String {
+    receipt
+        .error
+        .as_ref()
+        .map(|error| error.py_message.clone())
+        .unwrap_or_else(|| "close 回條為 closed:false 且未附錯誤".to_string())
+}
+
+/// Python `_finish_attach_op` 的預開 handle 關閉失敗告警（`session_manager.py:4326-4331`）。
+fn preopened_close_warning(by_id: &str, error: &str) -> String {
+    format!("預開 UART handle 關閉失敗（by_id={by_id}）：{error}")
+}
+
 /// 重組的 handle：`split()` 直接交回原四件組（PROBE 與正式 bridge 共用同一預開 port，#51）。
 struct ReassembledHandle(HandleParts);
 
@@ -193,9 +207,9 @@ static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// | `cancelled`；裝置改指 `:4031-4043`、bind `:3683-3691`、shutdown `:1175-1190`、release `:3117-3125` | 共用原子取消旗標；各取消者都阻止晚到 handle 交接，並由同一 close 回條決定是否可清除 op。 | `wp510_b_handoff_invalidated_during_open_closes_handle`; `shutdown_includes_inflight_attach`; `wp510_review_release_cancels_placeholder_attach_before_retirement`; `bind_with_inflight_attach_op_cancels_waits_3000ms` |
 /// | `done`；交接完成 `:4374-4383`、作業收尾 `:4320-4365`，release 等待 `:3192-3204` | 沒有獨立 done 欄位；`inflight` 項目存活代表未完成，條件變數喚醒等待者。close 成功後移除 op，close 失敗不會誤報完成。 | `wp510_review_late_placeholder_attach_completion_clears_drain_stall`; `wp510_rpc_failed_close_keeps_placeholder_drain_stalled` |
 /// | `probe_bridge`；註冊 `:4367-4372`，取消排空：shutdown `:1186-1193`、release `:3126-3131`、bind `:3686-3691`、裝置改指 `:4039-4043` | 不另建 PROBE bridge；`attach_dynamic`／`reattach_existing` 以同一預開 handle 偵測。PROBE 的 TX gate 是作業持有的 `probe_fence`／`probe_cancel`：所有取消者經 `AttachOp::cancel()` 在 fence 鎖內凍結並取消（`uart_io.py:908-918`），已越過 `still_valid()` 的 PROBE 於提交點重驗即拒絕（`:623-627`）、零 TX。 | `wp510_rpc_bind_then_device_attach_replaces_placeholder`; `wp510_tx_shutdown_after_still_valid_before_placeholder_probe_submit_sends_zero_tx`; `wp510_tx_device_path_change_before_hotplug_probe_submit_sends_zero_tx`; `wp510_rpc_shutdown_before_placeholder_probe_submit_sends_zero_tx` |
-/// | `release_request/release_deadline`；開始計時 `:3084-3086`、第一次設定及重用 `:3117-3125`，等待與逾期處理 `:3192-3204` | 已是 RELEASED 的佔位保留既有 source/reason，Rust 無需另存 request；進 manager lock 前記錄候選期限，第一個取得 op 的 release 寫入共享欄位。重複／並行 release 重用第一次期限，逾期即回 stalled。 | `wp510_review_release_cancels_placeholder_attach_before_retirement`; `wp510_lifecycle_repeated_release_uses_expired_attach_deadline`; `wp510_lifecycle_concurrent_releases_share_first_attach_deadline` |
+/// | `release_request/release_deadline`；開始計時 `:3084-3086`、第一次設定及重用 `:3117-3125`，等待與逾期處理 `:3192-3204` | 第一個取得 op 的 release 把 source 寫入 `release_source`（佔位已是 RELEASED，reason 沿用 session 既有值）；進 manager lock 前記錄候選期限，第一個取得 op 的 release 寫入共享欄位。重複／並行 release 重用第一次期限，逾期即回 stalled。 | `wp510_review_release_cancels_placeholder_attach_before_retirement`; `wp510_lifecycle_repeated_release_uses_expired_attach_deadline`; `wp510_lifecycle_concurrent_releases_share_first_attach_deadline`; `wp510_review4_release_cancel_fills_null_release_metadata_and_persists` |
 /// | `bind_requested`；設定與等待 `:3683-3697` | 無獨立欄位；一般 bind 以取消旗標和共用 inflight 排空。OD-63 佔位 bind 依裁決早退，不能取消或改動作業。 | `bind_with_inflight_attach_op_cancels_waits_3000ms`; `wp510_b_bind_placeholder_precedes_inflight_cancellation` |
-/// | close 成功／失敗；`_finish_attach_op` `:4320-4365` | close 成功才移除 inflight；任一取消原因的 `closed:false` 都保留阻擋，release 後續維持 `DRAIN_STALLED`。 | `wp510_review_late_placeholder_attach_completion_clears_drain_stall`; `wp510_rpc_failed_close_keeps_placeholder_drain_stalled`; `wp510_lifecycle_shutdown_cancel_fail_close_keeps_placeholder_blocked`; `wp510_lifecycle_device_path_change_cancel_fail_close_keeps_placeholder_blocked` |
+/// | close 成功／失敗；`_finish_attach_op` `:4320-4365` | close 成功才移除 inflight；任一取消原因的 `closed:false` 都保留阻擋並以 by_id 與 `CloseReceipt.error` 告警（`:4322-4332`），release 後續維持 `DRAIN_STALLED`。release 收尾由 actor 的 `PlaceholderAttachSettled` 補齊 `released_by`／`released_at` 並持久化（`:4341-4363`），失敗告警後由 release 重試（`:3206-3209`）。 | `wp510_review_late_placeholder_attach_completion_clears_drain_stall`; `wp510_rpc_failed_close_keeps_placeholder_drain_stalled`; `wp510_lifecycle_shutdown_cancel_fail_close_keeps_placeholder_blocked`; `wp510_lifecycle_device_path_change_cancel_fail_close_keeps_placeholder_blocked`; `wp510_review4_failed_preopened_close_warns_with_by_id_and_error`; `wp510_review4_release_cancel_persist_enospc_fails_release_then_retries` |
 /// | shutdown 取消及排空 `:1175-1239` | shutdown 取消作業並等待 `Inner::inflight` 清除；仍有 close:false 的作業回報未 drained。 | `shutdown_includes_inflight_attach`; `wp510_lifecycle_shutdown_cancel_fail_close_keeps_placeholder_blocked` |
 ///
 /// 生命週期：建立 → 開埠完成並交接，或取消後晚到並關閉；關閉成功才移除作業，`closed:false` 一律保留作業。release 找到同一作業後取消並等待首次 deadline；期限到期回 `DRAIN_STALLED`。shutdown 取消並排空同一 inflight 集合。
@@ -219,8 +233,14 @@ struct AttachOp {
     release_requested: Arc<AtomicBool>,
     /// 同一 op 的重複／並行 release 共用首次排空期限（Python `_AttachOp.release_deadline`）。
     release_deadline: Arc<Mutex<Option<Instant>>>,
+    /// 第一個取得 op 的 release 來源（Python `_AttachOp.release_request` 的 source，`session_manager.py:3117-3122`）；
+    /// 收尾時交 actor 以 `released_by or source` 補齊（`:4341-4363`）。
+    release_source: Arc<Mutex<Option<String>>>,
     /// `close()` 的失敗回條必須跨 worker 收尾保留，不能因取消原因不同而移除 inflight。
     close_failed: Arc<AtomicBool>,
+    /// 尚未告警的關閉錯誤（`CloseReceipt.error`）；`finish_attach_op` 以 by_id 告警後清除（Python
+    /// `_finish_attach_op` `session_manager.py:4322-4332`）。
+    close_error: Arc<Mutex<Option<String>>>,
     /// clear 收尾的再 attach（`Effect::Reattach`）：session 已是 ATTACHING 但未開埠，仍須再解析（審查 F62）。
     /// 在途 op 與 clear 重疊時由 `spawn_attach_with` OR 進來，避免該次再解析遺失（審查 F98）。
     after_clear: Arc<AtomicBool>,
@@ -243,7 +263,9 @@ impl AttachOp {
             cancelled: Arc::new(AtomicBool::new(false)),
             release_requested: Arc::new(AtomicBool::new(false)),
             release_deadline: Arc::new(Mutex::new(None)),
+            release_source: Arc::new(Mutex::new(None)),
             close_failed: Arc::new(AtomicBool::new(false)),
+            close_error: Arc::new(Mutex::new(None)),
             after_clear: Arc::new(AtomicBool::new(after_clear)),
             dynamic_only,
             preopened: Arc::new(Mutex::new(preopened)),
@@ -273,6 +295,7 @@ impl AttachOp {
     fn close_parts(&self, parts: HandleParts) -> CloseReceipt {
         let receipt = parts.close();
         if !receipt.closed {
+            *lock(&self.close_error) = Some(close_error_text(&receipt));
             self.close_failed.store(true, Ordering::SeqCst);
         }
         receipt
@@ -374,6 +397,10 @@ struct Shared {
     /// 只供測試（test-fakes）：`alias.set` 已更新 actor、尚未持久化前的競態暫停點（佔位退休交錯）。
     #[cfg(feature = "test-fakes")]
     alias_pre_commit_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// 只供測試（test-fakes）：`open_bridge` 取 session 預開 handle 之前的一次性暫停點（重現預開 handle 交給
+    /// session 後、正式 bridge 接手前的 shutdown 交錯）。
+    #[cfg(feature = "test-fakes")]
+    open_bridge_pre_take_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// 載入的 state.json 含孤立 surrogate（`LoadedState::lone_surrogates`；啟動存檔前檢查）。
     lone_surrogates: bool,
     /// 啟動存檔重現的 Python 未捕捉例外末行（`_save_state` 的 `UnicodeEncodeError`）；daemon 據此 exit 1。
@@ -681,6 +708,15 @@ impl Shared {
 
     fn warn(&self, msg: String) {
         (self.warn)(msg);
+    }
+
+    /// 關閉已交給 session、尚未由正式 bridge 接手的預開 handle；`closed:false` 時比照 Python `_finish_attach_op`
+    /// （`origin/main:sw_core/session_manager.py:4322-4332`）以 by_id 與 `CloseReceipt.error` 告警。
+    fn close_session_preopened(&self, by_id: &str, pre: Preopened) {
+        let receipt = pre.parts.close();
+        if !receipt.closed {
+            self.warn(preopened_close_warning(by_id, &close_error_text(&receipt)));
+        }
     }
 
     fn template_by_name(&self, name: &str) -> Option<ProfileTemplate> {
@@ -1091,7 +1127,7 @@ impl Shared {
             return;
         };
         if let Some(pre) = lock(&io.preopened).take() {
-            let _ = pre.parts.close();
+            self.close_session_preopened(by_id, pre);
         }
         self.send_control(
             &sid,
@@ -1534,6 +1570,19 @@ impl Shared {
 
     /// 結束指定 attach op；不會移除同一 by_id 後續登錄的新 op。
     fn finish_attach_op(&self, by_id: &str, op: &AttachOp, close_receipt: Option<CloseReceipt>) {
+        if let Some(receipt) = close_receipt.as_ref().filter(|receipt| !receipt.closed) {
+            // 呼叫端直接帶入的失敗回條（未經 `close_parts`）同樣留下錯誤內容。
+            lock(&op.close_error).get_or_insert_with(|| close_error_text(receipt));
+            op.close_failed.store(true, Ordering::SeqCst);
+        }
+        let close_failed = op.close_failed.load(Ordering::SeqCst);
+        if close_failed {
+            // Python `_finish_attach_op`（`session_manager.py:4322-4332`）：關閉失敗先以 by_id 與例外告警，
+            // 再保留阻擋；每次失敗的關閉只告警一次（Rust 的 handle 只關閉一次）。
+            if let Some(error) = lock(&op.close_error).take() {
+                self.warn(preopened_close_warning(by_id, &error));
+            }
+        }
         let mut inner = lock(&self.inner);
         if inner
             .inflight
@@ -1542,16 +1591,21 @@ impl Shared {
         {
             // Python `_finish_attach_op` 對任何取消原因都在 close 失敗時保留作業；不能只在 release
             // 分支檢查，否則 shutdown／裝置改指會遺失仍可能持有 UART 的阻擋。
-            if op.close_failed.load(Ordering::SeqCst)
-                || close_receipt.as_ref().is_some_and(|receipt| !receipt.closed)
-            {
+            if close_failed {
                 return;
             }
             if op.release_requested.load(Ordering::SeqCst) {
                 if let Some(actor) = inner.session_by_id(by_id).map(|entry| entry.actor.clone()) {
+                    // Python `_finish_attach_op` 的 release 收尾（`:4341-4363`）：source 取第一個 release 請求。
+                    let release_source = lock(&op.release_source)
+                        .clone()
+                        .unwrap_or_else(|| "cli".to_string());
                     if let Err(error) = enqueue_safety_request(
                         &actor,
-                        SessionRequest::PlaceholderAttachSettled { token: op.token },
+                        SessionRequest::PlaceholderAttachSettled {
+                            token: op.token,
+                            release_source,
+                        },
                         QUERY_TIMEOUT,
                     ) {
                         // actor 無法確認清除時保留 inflight，讓後續操作維持 recovering 阻擋。
@@ -2561,9 +2615,14 @@ impl OpenCtx {
         control: &Sender<ControlEvent>,
     ) -> Result<OpenedBridge, OpenFailure> {
         let stopped = || OpenFailure::Other(PalError::plain(PalErrorKind::Io, "daemon stopping"));
+        #[cfg(feature = "test-fakes")]
+        if let Some(hook) = lock(&self.shared.open_bridge_pre_take_hook).take() {
+            hook();
+        }
+        let by_id = lock(&self.io.profile).device_by_id.clone();
         if lock(&self.shared.inner).stopping {
             if let Some(pre) = lock(&self.io.preopened).take() {
-                let _ = pre.parts.close();
+                self.shared.close_session_preopened(&by_id, pre);
             }
             return Err(stopped());
         }
@@ -2576,7 +2635,7 @@ impl OpenCtx {
                     Ok(()) => {}
                     Err(error) if error.kind == PalErrorKind::Unsupported => {}
                     Err(error) => {
-                        let _ = pre.parts.close();
+                        self.shared.close_session_preopened(&by_id, pre);
                         return Err(OpenFailure::Other(error));
                     }
                 }
@@ -2584,7 +2643,7 @@ impl OpenCtx {
             }
             other => {
                 if let Some(pre) = other {
-                    let _ = pre.parts.close();
+                    self.shared.close_session_preopened(&by_id, pre);
                 }
                 if precheck_holders {
                     let report = self.shared.uart_excl.probe_holders(&dev.0);
@@ -3080,6 +3139,8 @@ impl SessionManager {
             placeholder_release_cancel_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             alias_pre_commit_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            open_bridge_pre_take_hook: Mutex::new(None),
         });
         shared.bootstrap_sessions(&load.profiles);
         let mgr = Arc::new(SessionManager {
@@ -3248,8 +3309,8 @@ impl SessionManager {
                     .attach_released_placeholder(sid, *force, request_selector);
             }
         }
-        if matches!(&req, SessionRequest::Release { .. }) {
-            if let Some(response) = self.cancel_placeholder_attach_for_release(sid)? {
+        if let SessionRequest::Release { source, .. } = &req {
+            if let Some(response) = self.cancel_placeholder_attach_for_release(sid, source)? {
                 return Ok(response);
             }
         }
@@ -3304,6 +3365,7 @@ impl SessionManager {
     fn cancel_placeholder_attach_for_release(
         &self,
         sid: &str,
+        source: &str,
     ) -> Result<Option<PyDict>, PyErr> {
         // 與 Python `release_device` 一樣，在取得 manager lock 前開始本次期限計時。
         let candidate_release_deadline = Instant::now() + ATTACH_OP_WAIT;
@@ -3324,6 +3386,8 @@ impl SessionManager {
             // 後續的 attach 收尾就不能先通過退休檢查。
             op.cancel();
             op.release_requested.store(true, Ordering::SeqCst);
+            // Python `release_device` 只在第一個 release 請求寫入 `release_request`（`session_manager.py:3117-3122`）。
+            lock(&op.release_source).get_or_insert_with(|| source.to_string());
             let deadline = {
                 let mut stored = lock(&op.release_deadline);
                 *stored.get_or_insert(candidate_release_deadline)
@@ -3540,7 +3604,8 @@ impl SessionManager {
         }
         // 未交給正式 bridge 的預開 handle（舊 by_id）關閉。
         if let Some(pre) = lock(&io.preopened).take() {
-            let _ = pre.parts.close();
+            let old_by_id = lock(&io.profile).device_by_id.clone();
+            self.shared.close_session_preopened(&old_by_id, pre);
         }
         let has_device = {
             let mut inner = lock(&self.shared.inner);
@@ -3974,6 +4039,12 @@ impl SessionManager {
     #[cfg(feature = "test-fakes")]
     pub fn set_placeholder_release_cancel_hook_for_test(&self, hook: Box<dyn Fn() + Send + Sync>) {
         *lock(&self.shared.placeholder_release_cancel_hook) = Some(hook);
+    }
+
+    /// 只供測試（test-fakes）：設定 `open_bridge` 取 session 預開 handle 前的一次性暫停點。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_open_bridge_pre_take_hook_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
+        *lock(&self.shared.open_bridge_pre_take_hook) = Some(hook);
     }
 
     /// 只供測試（test-fakes）：設定 `alias.set` 持久化前暫停點（見 `alias_pre_commit_hook`）。
