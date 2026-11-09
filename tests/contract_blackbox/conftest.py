@@ -40,8 +40,12 @@ from bb_harness import (  # noqa: E402
 )  # isolated_env 登記的隔離根與 session 防線
 import config_digest as _config_digest  # noqa: E402
 
-# 只有 gate runner 指定結果目錄時才載入契約覆蓋 hook；不新增 marker 或改變一般測試行為。
-if os.environ.get("SERIALWRAP_COVERAGE_RUN_DIR"):
+# 只有 gate runner 指定結果目錄時才載入契約覆蓋 plugin；不新增 marker 或改變一般測試行為。
+# 以具名 plugin 註冊（見 pytest_configure）：子目錄 conftest 的 hook 只看得到本目錄測項，
+# 根 conftest 若已載入則重用同一 module 物件（P8X-24c6b39-6）。
+# plugin 載入時會清除覆蓋環境變數（防巢狀 pytest 汙染），故先以 sys.modules 判斷根 conftest 是否已載入。
+_coverage_module = sys.modules.get("sw_contract_coverage_plugin")
+if _coverage_module is None and os.environ.get("SERIALWRAP_COVERAGE_RUN_DIR"):
     import importlib.util
 
     _coverage_path = Path(__file__).with_name("coverage_plugin.py")
@@ -51,8 +55,6 @@ if os.environ.get("SERIALWRAP_COVERAGE_RUN_DIR"):
     _coverage_module = importlib.util.module_from_spec(_coverage_spec)
     sys.modules["sw_contract_coverage_plugin"] = _coverage_module
     _coverage_spec.loader.exec_module(_coverage_module)
-    pytest_collection_finish = _coverage_module.pytest_collection_finish
-    pytest_runtest_logreport = _coverage_module.pytest_runtest_logreport
 
 _RUST_SESSION: bool | None = None
 _USER_UNIT_PATH: Path | None = None
@@ -82,6 +84,8 @@ _BLACKBOX_MARKERS = {
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    if _coverage_module is not None:
+        _coverage_module.register(config)
     for name, desc in _BLACKBOX_MARKERS.items():
         config.addinivalue_line("markers", f"{name}: {desc}")
     for name, desc in _STANDARD_MARKERS.items():
@@ -322,5 +326,3 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
                 f"sw_core leaked into blackbox test process: {[m for m in sys.modules if m.startswith('sw_core')]}"
             )
 
-    if "_coverage_module" in globals():
-        _coverage_module.pytest_sessionfinish(session, int(session.exitstatus))

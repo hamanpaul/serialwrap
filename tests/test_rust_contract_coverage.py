@@ -969,3 +969,19 @@ def test_p8_mcu_contracts_are_mapped_to_formal_call_paths():
             assert call in functions[name], (contract_id, nodeid)
             mapped.add(nodeid)
     assert case_nodes <= mapped
+
+
+def test_nested_pytest_does_not_write_into_outer_coverage_run(tmp_path):
+    """P8X-24c6b39-6 附帶：受測項內的巢狀 pytest（會收集並執行子測項）不得把自身結果併入外層 run。"""
+    run = tmp_path / "run"
+    nodeid = "tests/test_rust_p4_conftest.py::test_ab_label_survives_root_conftest"
+    env = {**os.environ, "SERIALWRAP_COVERAGE_RUN_DIR": str(run), "SERIALWRAP_COVERAGE_LABEL": "python-linux"}
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", nodeid],
+        cwd=ROOT, env=env, capture_output=True, text=True, timeout=600,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    document = json.loads((run / "results-python-linux.json").read_text(encoding="utf-8"))
+    assert document["collected"] == [nodeid], document["collected"][:5]
+    assert document["finished"] is True and not document.get("identity_errors")
+    assert [row["phase"] for row in document["results"]] == ["setup", "call", "teardown"]
