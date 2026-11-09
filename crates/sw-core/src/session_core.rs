@@ -201,12 +201,14 @@ pub enum SessionRequest {
         token: u64,
         epoch: u64,
     },
-    /// OD-63：該 token 的開埠 handle 已安全關閉，清除先前由 placeholder release 設定的 stall 欄位，
-    /// 並依 Python `_finish_attach_op` 的 release 收尾（`session_manager.py:4341-4363`）以第一個 release 請求的
-    /// `release_source` 補齊 `released_by`／`released_at` 後持久化。
+    /// 該 token 的 attach 作業已安全關閉 handle（release 請求過的作業收尾），清除先前由 release 逾時設定的 stall 欄位，
+    /// 並依 Python `_finish_attach_op` 的 release 收尾（`session_manager.py:4340-4363`）處理第一個 release 請求
+    /// `(release_source, release_reason)`：已 RELEASED（OD-63 佔位）補齊 `released_by`／`released_at` 後持久化；一般
+    /// session 於 release 逾時（同 token 的 `PlaceholderAttachStalled`）之後才收尾時，完成 RELEASED 並持久化。
     PlaceholderAttachSettled {
         token: u64,
         release_source: String,
+        release_reason: PyValue,
     },
     /// 同 `ControlEvent::DeviceAttached`，但經請求通道並回覆套用後的活 session（bind 改綁到在線裝置時，
     /// Python 於回覆前即 ATTACHING＋`last_error=None`；審查 F70）。
@@ -2002,14 +2004,32 @@ impl SessionCore {
             SessionRequest::PlaceholderAttachSettled {
                 token,
                 release_source,
+                release_reason,
             } => {
-                if self.placeholder_attach_stall_token == Some(token) {
+                // 同 token 的 stall 存在＝release RPC 已於期限回 DRAIN_STALLED、不再等待本作業（遲到收尾）。
+                let late = self.placeholder_attach_stall_token == Some(token);
+                if late {
                     self.drain_stalled = false;
                     self.drain_timeout_epoch = None;
                     self.placeholder_attach_stall_token = None;
                 }
                 let mut effects = Vec::new();
-                if self.state == SessionState::Released {
+                if self.state != SessionState::Released && late {
+                    // wp510 第八次整包審查 High（P8-e25b69c-2）：Python `_finish_attach_op` 對 release 請求過、查得到
+                    // session 的作業一律完成 release（`origin/main:sw_core/session_manager.py:4340-4363`）：非 RELEASED 先
+                    // `_detach_session_locked(reason="RELEASED", drop_consoles=True)`（`:4344-4345`，`:2679-2707`），再設
+                    // RELEASED、`released_by`／`released_reason` 取第一個 release 請求、`released_at` 補現在、清
+                    // `drain_stalled`／`drain_timeout_epoch` 並持久化（`:4346-4363`）。期限內收尾者由 release RPC 接著交
+                    // actor 的 `Release` 完成（`late` 為假）；逾時後 RPC 已返回，由此補完同一流程（無等待者）。
+                    self.pending_release = Some(PendingRelease {
+                        source: release_source,
+                        reason: release_reason,
+                        closed_consoles: (self.console_count + self.human.consoles.len()) as i128,
+                        aborted_cmd: self.foreground_busy(),
+                    });
+                    self.console_count = 0;
+                    effects.extend(self.begin_stop(StopKind::Release, None, now).0);
+                } else if self.state == SessionState::Released {
                     // Python `_finish_attach_op`（`origin/main:sw_core/session_manager.py:4341-4363`）：
                     // `released_by = session.released_by or source`（`:3117-3122`）、
                     // `released_at = session.released_at or now_iso()`，reason 沿用 session 既有值；

@@ -3342,6 +3342,52 @@ fn wp510_review9_release_during_existing_session_redetect_cancels_and_waits() {
     assert!(!m.mgr.has_inflight_attach_for_test("/s/by-id/usb-D"));
 }
 
+/// wp510 第八次整包審查 High（P8-e25b69c-2）：同上再偵測卡在 open 超過 release 期限。Python `release_device` 期限到回
+/// DRAIN_STALLED（`origin/main:sw_core/session_manager.py:3192-3204`）；開埠遲到返回見取消即關閉並 `_finish_attach_op`
+/// （`:4216-4245`），`release_request` 為第一個 release 的 `(source, reason)`、作業的 `session_id` 即該 session
+/// （`:4185-4186`），故轉 RELEASED、清 stall 欄位並持久化（`:4340-4363`）。
+#[test]
+fn wp510_review10_late_redetect_finish_after_release_timeout_completes_release() {
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    let real = fallback_session_then_unplug(&m, "/s/by-id/usb-D");
+    m.serial.block_open(&real);
+    m.mgr.update_devices(&m.snapshot());
+    wait_until("再偵測卡在 open", || m.serial.open_attempts(&real) == 2);
+    let closes_before = m.device(&real).close_count();
+    let tx_before = m.device(&real).tx_len();
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+
+    let started = Instant::now();
+    let reply = m.mgr.route(
+        &sid,
+        SessionRequest::Release {
+            source: "agent".to_string(),
+            reason: PyValue::from("flash"),
+        },
+        RPC,
+    );
+    let waited = started.elapsed();
+    m.serial.release_open(&real);
+    let reply = rpc(reply);
+
+    assert!(waited >= Duration::from_millis(2500), "release 須等待作業至期限：{waited:?}");
+    assert_eq!(code_of(&reply).as_deref(), Some("DRAIN_STALLED"), "{reply:?}");
+    assert_eq!(reply.get("drain_stalled"), Some(&PyValue::Bool(true)));
+    m.wait_state("COM0", "RELEASED");
+    wait_until("作業收尾", || !m.mgr.has_inflight_attach_for_test("/s/by-id/usb-D"));
+    let session = m.session("COM0");
+    assert_eq!(s_of(&session, "released_by").as_deref(), Some("agent"), "{session:?}");
+    assert_eq!(s_of(&session, "released_reason").as_deref(), Some("flash"), "{session:?}");
+    assert_eq!(session.get("drain_stalled"), Some(&PyValue::Bool(false)), "{session:?}");
+    assert_eq!(session.get("drain_timeout_epoch"), Some(&PyValue::Null), "{session:?}");
+    wait_until("RELEASED 落盤", || {
+        m.state_text().contains("\"released\"") && m.state_text().contains("/s/by-id/usb-D")
+    });
+    assert_eq!(m.device(&real).close_count(), closes_before + 1);
+    assert!(!m.device(&real).is_open());
+    assert_eq!(m.device(&real).tx_len(), tx_before, "取消後不得送 PROBE");
+}
+
 #[test]
 fn hotplug_invalidates_pending_attach_op_and_closes_unused_port() {
     // #27：attach op 進行中裝置被拔除 → op 失效；之後拿到的 port 未被消費即關閉（零 TX、不建立 bridge）。

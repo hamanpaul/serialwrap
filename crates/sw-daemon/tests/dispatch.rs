@@ -6486,6 +6486,150 @@ fn wp510_review9_rpc_release_before_bridge_takes_dynamic_handoff_closes_without_
     r.wait_state("t:COM3", "RELEASED");
 }
 
+/// `state.json` 的 `released` 是否有指定 by_id 的列（Python `_persist_release_state` 寫入的 released 段）。
+fn wp510_review10_state_has_released_by_id(r: &ServiceRig, by_id: &str) -> bool {
+    let bytes = r.fs.bytes(support::STATE_PATH);
+    let Ok(PyValue::Dict(state)) = sw_proto::pyjson::loads(&String::from_utf8_lossy(&bytes)) else {
+        return false;
+    };
+    match state.get("released") {
+        Some(PyValue::Dict(rows)) => rows.0.values().any(|row| match row {
+            PyValue::Dict(row) => row.get("by_id").and_then(PyValue::as_str) == Some(by_id),
+            _ => false,
+        }),
+        _ => false,
+    }
+}
+
+const WP510_R10_BY_ID_D: &str = "/s/by-id/usb-r10-D";
+const WP510_R10_REAL_D: &str = "/dev/ttyR10D";
+
+/// 可切換阻塞的開埠後端：`block()` 之後對指定路徑的開埠停在閘門，`unblock()` 放行。
+struct Wp510ToggleOpenBackend {
+    delegate: Arc<FakeSerialBackend>,
+    path: String,
+    blocked: Mutex<bool>,
+    cv: Condvar,
+    attempts: AtomicUsize,
+}
+
+impl Wp510ToggleOpenBackend {
+    fn block(&self) {
+        *self.blocked.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    }
+
+    fn unblock(&self) {
+        *self.blocked.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        self.cv.notify_all();
+    }
+
+    fn attempts(&self) -> usize {
+        self.attempts.load(Ordering::SeqCst)
+    }
+}
+
+impl SerialBackend for Wp510ToggleOpenBackend {
+    fn open_exclusive(
+        &self,
+        dev: &DevicePath,
+        cfg: &SerialConfig,
+    ) -> Result<Box<dyn SerialHandle>, OpenError> {
+        if dev.0 == self.path {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            let mut blocked = self.blocked.lock().unwrap_or_else(|e| e.into_inner());
+            while *blocked {
+                blocked = self.cv.wait(blocked).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        self.delegate.open_exclusive(dev, cfg)
+    }
+}
+
+/// 失敗時放行阻塞的開埠，避免殘留 worker 卡住 rig 收尾。
+struct Wp510UnblockOnDrop(Arc<Wp510ToggleOpenBackend>);
+
+impl Drop for Wp510UnblockOnDrop {
+    fn drop(&mut self) {
+        self.0.unblock();
+    }
+}
+
+/// wp510 第八次整包審查 High（P8-e25b69c-2）：既有 fallback session 重插後的 #181 再偵測卡在開埠（作業在
+/// `_attach_ops`，`origin/main:sw_core/session_manager.py:4191`，`session_id` 為該 session `:4185-4186`）時
+/// `device.release`：期限到回 DRAIN_STALLED＋`drain_stalled:true`、state RECOVERING（`:3192-3204`）。開埠遲到返回後
+/// 見取消即關閉並 `_finish_attach_op`（`:4216-4245`）：`release_request` 存在且查得到 session，故轉 RELEASED、
+/// `released_by` 取第一個 release 的 source、`released_reason` 取其 reason、清 `drain_stalled`／`drain_timeout_epoch`
+/// 並持久化（`:4340-4363`）；之後的 release 回 `already_released`（`:3142-3144`）。
+#[test]
+fn wp510_review10_rpc_release_timeout_then_late_redetect_finish_completes_release() {
+    let delegate = FakeSerialBackend::new();
+    // 不安裝 shell 應答：動態偵測無 template 命中，以 passthrough fallback 建 session。
+    let dev = delegate.add_device(WP510_R10_REAL_D);
+    let backend = Arc::new(Wp510ToggleOpenBackend {
+        delegate,
+        path: WP510_R10_REAL_D.to_string(),
+        blocked: Mutex::new(false),
+        cv: Condvar::new(),
+        attempts: AtomicUsize::new(0),
+    });
+    let _unblock = Wp510UnblockOnDrop(Arc::clone(&backend));
+    let serial: Arc<dyn SerialBackend> = backend.clone();
+    let spec = RigSpec {
+        yaml: "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\n  others-template:\n    platform: passthrough\n    prompt_regex: '.*'\n    login_regex: '$^'\n    password_regex: '$^'\n    ready_probe: ''\n".to_string(),
+        devices: vec![(WP510_R10_BY_ID_D.to_string(), WP510_R10_REAL_D.to_string())],
+        explicit_target_count: 0,
+        allowlist: None,
+        wait_ready: Vec::new(),
+    };
+    let r = ServiceRig::build_with_loaded_state_and_serial_backend(spec, LoadedState::default(), serial);
+    r.wait_state("COM0", "ATTACHED");
+    let attached = r.session("COM0").expect("COM0 session");
+    assert_eq!(s(&attached, "profile_source"), "fallback", "{}", j(&attached));
+    let snapshot = vec![(
+        WP510_R10_BY_ID_D.to_string(),
+        DeviceInfo {
+            by_id: WP510_R10_BY_ID_D.to_string(),
+            real_path: WP510_R10_REAL_D.to_string(),
+        },
+    )];
+    r.mgr.update_devices(&[]);
+    r.wait_state("COM0", "DETACHED");
+    backend.block();
+    let attempts_before = backend.attempts();
+    r.mgr.update_devices(&snapshot);
+    wait_until("再偵測卡在開埠", || backend.attempts() > attempts_before);
+    let closes_before = dev.close_count();
+    let tx_before = dev.tx_len();
+
+    let started = std::time::Instant::now();
+    let released = r.call("device.release", r#"{"selector":"COM0"}"#);
+    let elapsed = started.elapsed();
+    assert_eq!(s(&released, "error_code"), "DRAIN_STALLED", "{}", j(&released));
+    assert_eq!(released.get("drain_stalled"), Some(&PyValue::Bool(true)), "{}", j(&released));
+    assert_eq!(s(&sub(&released, "session"), "state"), "RECOVERING", "{}", j(&released));
+    assert!(elapsed >= Duration::from_millis(2500), "release 須等待作業至期限：{elapsed:?}");
+    assert!(r.mgr.has_inflight_attach_for_test(WP510_R10_BY_ID_D));
+
+    backend.unblock();
+    r.wait_state("COM0", "RELEASED");
+    wait_until("作業收尾", || !r.mgr.has_inflight_attach_for_test(WP510_R10_BY_ID_D));
+    wait_until("RELEASED 落盤", || wp510_review10_state_has_released_by_id(&r, WP510_R10_BY_ID_D));
+    let session = r.session("COM0").expect("COM0 session");
+    assert_eq!(s(&session, "released_by"), "cli", "{}", j(&session));
+    assert_eq!(session.get("released_reason"), Some(&PyValue::Null), "{}", j(&session));
+    assert!(session.get("released_at").and_then(PyValue::as_str).is_some(), "{}", j(&session));
+    assert_eq!(session.get("drain_stalled"), Some(&PyValue::Bool(false)), "{}", j(&session));
+    assert_eq!(session.get("drain_timeout_epoch"), Some(&PyValue::Null), "{}", j(&session));
+    assert_eq!(s(&session, "last_error"), "RELEASED", "{}", j(&session));
+    assert_eq!(dev.close_count(), closes_before + 1, "取消的作業關閉遲到的 handle");
+    assert!(!dev.is_open());
+    assert_eq!(dev.tx_len(), tx_before, "取消後不得送 PROBE");
+
+    let again = r.call("device.release", r#"{"selector":"COM0"}"#);
+    assert_eq!(again.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&again));
+    assert_eq!(again.get("already_released"), Some(&PyValue::Bool(true)), "{}", j(&again));
+}
+
 /// 落盤失敗後再次 `_spawn_attach`（bootstrap）：`_attach_by_id` 取走 `_preopened_ports` 的作業，dynamic 偵測沿用同一
 /// handle，於保留的原 COM 建立正式 session（`origin/main:sw_core/session_manager.py:4852-4854`、`:4886-4888`）。
 #[test]

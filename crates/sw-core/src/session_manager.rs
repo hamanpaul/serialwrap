@@ -217,7 +217,7 @@ static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// | `cancelled`；裝置改指 `:4031-4043`、bind `:3683-3691`、shutdown `:1175-1190`、release `:3117-3125` | 共用原子取消旗標；各取消者都阻止晚到 handle 交接，並由同一 close 回條決定是否可清除 op。 | `wp510_b_handoff_invalidated_during_open_closes_handle`; `shutdown_includes_inflight_attach`; `wp510_review_release_cancels_placeholder_attach_before_retirement`; `bind_with_inflight_attach_op_cancels_waits_3000ms` |
 /// | `done`；交接完成 `:4374-4383`、作業收尾 `:4320-4365`，release 等待 `:3192-3204` | 沒有獨立 done 欄位；`inflight` 項目存活代表未完成，條件變數喚醒等待者。close 成功後移除 op，close 失敗不會誤報完成。 | `wp510_review_late_placeholder_attach_completion_clears_drain_stall`; `wp510_rpc_failed_close_keeps_placeholder_drain_stalled` |
 /// | `probe_bridge`；註冊 `:4367-4372`，取消排空：shutdown `:1186-1193`、release `:3126-3131`、bind `:3686-3691`、裝置改指 `:4039-4043` | 不另建 PROBE bridge；`attach_dynamic`／`reattach_existing` 以同一預開 handle 偵測。PROBE 的 TX gate 是作業持有的 `probe_fence`／`probe_cancel`：所有取消者經 `AttachOp::cancel()` 在 fence 鎖內凍結並取消（`uart_io.py:908-918`），已越過 `still_valid()` 的 PROBE 於提交點重驗即拒絕（`:623-627`）、零 TX。 | `wp510_rpc_bind_then_device_attach_replaces_placeholder`; `wp510_tx_shutdown_after_still_valid_before_placeholder_probe_submit_sends_zero_tx`; `wp510_tx_device_path_change_before_hotplug_probe_submit_sends_zero_tx`; `wp510_rpc_shutdown_before_placeholder_probe_submit_sends_zero_tx` |
-/// | `release_request/release_deadline`；開始計時 `:3084-3086`、第一次設定及重用 `:3117-3125`，等待與逾期處理 `:3192-3204` | 第一個取得 op 的 release 把 source 寫入 `release_source`（佔位已是 RELEASED，reason 沿用 session 既有值）；進 manager lock 前記錄候選期限，第一個取得 op 的 release 寫入共享欄位。重複／並行 release 重用第一次期限，逾期即回 stalled。 | `wp510_review_release_cancels_placeholder_attach_before_retirement`; `wp510_lifecycle_repeated_release_uses_expired_attach_deadline`; `wp510_lifecycle_concurrent_releases_share_first_attach_deadline`; `wp510_review4_release_cancel_fills_null_release_metadata_and_persists` |
+/// | `release_request/release_deadline`；開始計時 `:3084-3086`、第一次設定及重用 `:3117-3125`，等待與逾期處理 `:3192-3204` | 第一個取得 op 的 release 把 `(source, reason)` 寫入 `release_request`（佔位已是 RELEASED，reason 沿用 session 既有值）；進 manager lock 前記錄候選期限，第一個取得 op 的 release 寫入共享欄位。重複／並行 release 重用第一次期限，逾期即回 stalled。 | `wp510_review_release_cancels_placeholder_attach_before_retirement`; `wp510_lifecycle_repeated_release_uses_expired_attach_deadline`; `wp510_lifecycle_concurrent_releases_share_first_attach_deadline`; `wp510_review4_release_cancel_fills_null_release_metadata_and_persists` |
 /// | `bind_requested`；設定與等待 `:3683-3697` | 無獨立欄位；一般 bind 以取消旗標和共用 inflight 排空。OD-63 佔位 bind 依裁決早退，不能取消或改動作業。 | `bind_with_inflight_attach_op_cancels_waits_3000ms`; `wp510_b_bind_placeholder_precedes_inflight_cancellation` |
 /// | close 成功／失敗；`_finish_attach_op` `:4320-4365` | close 成功才移除 inflight；任一取消原因的 `closed:false` 都保留阻擋並以 by_id 與 `CloseReceipt.error` 告警（`:4322-4332`），release 後續維持 `DRAIN_STALLED`。release 收尾由 actor 的 `PlaceholderAttachSettled` 補齊 `released_by`／`released_at` 並持久化（`:4341-4363`），失敗告警後由 release 重試（`:3206-3209`）。 | `wp510_review_late_placeholder_attach_completion_clears_drain_stall`; `wp510_rpc_failed_close_keeps_placeholder_drain_stalled`; `wp510_lifecycle_shutdown_cancel_fail_close_keeps_placeholder_blocked`; `wp510_lifecycle_device_path_change_cancel_fail_close_keeps_placeholder_blocked`; `wp510_review4_failed_preopened_close_warns_with_by_id_and_error`; `wp510_review4_release_cancel_persist_enospc_fails_release_then_retries` |
 /// | shutdown 取消及排空 `:1175-1239` | shutdown 取消作業並等待 `Inner::inflight` 清除；仍有 close:false 的作業回報未 drained。末段比照 `:1231-1239` 重新收集排空期間才保留的作業。 | `shutdown_includes_inflight_attach`; `wp510_lifecycle_shutdown_cancel_fail_close_keeps_placeholder_blocked`; `wp510_review5_shutdown_before_bridge_takes_preopened_fail_close_reports_stalled` |
@@ -330,9 +330,10 @@ struct AttachOp {
     release_requested: Arc<AtomicBool>,
     /// 同一 op 的重複／並行 release 共用首次排空期限（Python `_AttachOp.release_deadline`）。
     release_deadline: Arc<Mutex<Option<Instant>>>,
-    /// 第一個取得 op 的 release 來源（Python `_AttachOp.release_request` 的 source，`session_manager.py:3117-3122`）；
-    /// 收尾時交 actor 以 `released_by or source` 補齊（`:4341-4363`）。
-    release_source: Arc<Mutex<Option<String>>>,
+    /// 第一個取得 op 的 release 請求 `(source, reason)`（Python `_AttachOp.release_request`，`session_manager.py:3117-3122`）；
+    /// 收尾時交 actor：已 RELEASED（佔位）以 `released_by or source` 補齊，一般 session 於 release 逾時後的遲到收尾以此
+    /// 完成 RELEASED（`:4340-4363`）。
+    release_request: Arc<Mutex<Option<(String, PyValue)>>>,
     /// `close()` 的失敗回條必須跨 worker 收尾保留，不能因取消原因不同而移除 inflight。
     close_failed: Arc<AtomicBool>,
     /// 尚未告警的關閉錯誤（`CloseReceipt.error`）；`finish_attach_op` 以 by_id 告警後清除（Python
@@ -374,7 +375,7 @@ impl AttachOp {
             cancelled: Arc::new(AtomicBool::new(false)),
             release_requested: Arc::new(AtomicBool::new(false)),
             release_deadline: Arc::new(Mutex::new(None)),
-            release_source: Arc::new(Mutex::new(None)),
+            release_request: Arc::new(Mutex::new(None)),
             close_failed: Arc::new(AtomicBool::new(false)),
             close_error: Arc::new(Mutex::new(None)),
             after_clear: Arc::new(AtomicBool::new(after_clear)),
@@ -2129,15 +2130,16 @@ impl Shared {
             }
             if op.release_requested.load(Ordering::SeqCst) {
                 if let Some(actor) = inner.session_by_id(by_id).map(|entry| entry.actor.clone()) {
-                    // Python `_finish_attach_op` 的 release 收尾（`:4341-4363`）：source 取第一個 release 請求。
-                    let release_source = lock(&op.release_source)
+                    // Python `_finish_attach_op` 的 release 收尾（`:4340-4363`）：source／reason 取第一個 release 請求。
+                    let (release_source, release_reason) = lock(&op.release_request)
                         .clone()
-                        .unwrap_or_else(|| "cli".to_string());
+                        .unwrap_or_else(|| ("cli".to_string(), PyValue::Null));
                     if let Err(error) = enqueue_safety_request(
                         &actor,
                         SessionRequest::PlaceholderAttachSettled {
                             token: op.token,
                             release_source,
+                            release_reason,
                         },
                         QUERY_TIMEOUT,
                     ) {
@@ -3873,8 +3875,8 @@ impl SessionManager {
             }
         }
         let mut revoked_handoff: Option<(String, u64)> = None;
-        if let SessionRequest::Release { source, .. } = &req {
-            let settled = self.release_attach_handles(sid, source, &mut revoked_handoff);
+        if let SessionRequest::Release { source, reason } = &req {
+            let settled = self.release_attach_handles(sid, source, reason, &mut revoked_handoff);
             if !matches!(settled, Ok(None)) {
                 if let Some((by_id, token)) = revoked_handoff.take() {
                     self.shared.clear_revoked_handoff(&by_id, token);
@@ -3958,6 +3960,7 @@ impl SessionManager {
         &self,
         sid: &str,
         source: &str,
+        reason: &PyValue,
         revoked_handoff: &mut Option<(String, u64)>,
     ) -> Result<Option<PyDict>, PyErr> {
         // 與 Python `release_device` 一樣，在取得 manager lock 前開始本次期限計時。
@@ -4002,7 +4005,8 @@ impl SessionManager {
                         op.cancel();
                         op.release_requested.store(true, Ordering::SeqCst);
                         // Python `release_device` 只在第一個 release 請求寫入 `release_request`（`:3117-3122`）。
-                        lock(&op.release_source).get_or_insert_with(|| source.to_string());
+                        lock(&op.release_request)
+                            .get_or_insert_with(|| (source.to_string(), reason.clone()));
                         let deadline = {
                             let mut stored = lock(&op.release_deadline);
                             *stored.get_or_insert(candidate_release_deadline)
