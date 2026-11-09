@@ -65,6 +65,8 @@
 | SC-29 | OD-01 選配 com0com Serial console：config.yaml windows.serial_console，兩端埠自動排除於裝置列舉 | §7.3、§7.4、OD-01 | Rust-only |
 | SC-30 | 自動 login／probe／ready-reconfirm／reboot-recovery 進行中偵測到 boot banner 且 `boot_quiet_blocks_probe` 為真時，Rust 立即取消該 run（Fence 以 fsm_gen 拒絕舊 permit、RX 等待以 Cancelled 結束）；收斂 ATTACHED＋`PROMPT_UNAVAILABLE`／READY 不變／reboot recovery 回等待迴圈；console unlock 不取消（08 §0.5） | §5.2.1、§5.3、§11.3 | Rust-only |
 | SC-31 | Console 失效上下文與資源上限：無 active epoch 時丟棄輸入；lease close／expire 未還原 stash 時不回放該 client；Control 超過 64 KiB 關閉 console；Telnet console 達 32 暫停 accept | §5.3、§11.3、§5.4 | Rust-only |
+| SC-32 | Probe／FLASHING 期間 bridge 真正 I/O 失敗（`UartIoError`）進 Two-Phase Drain Phase 1 並轉 `RECOVERING`（handoff 回條前不重開 UART）；`DeviceDetached` 在 Probe／FLASHING 期間延後到 exit flashing 後再 reconcile（等價 Python `_handle_bridge_down`／`_detach_by_id` 於 flash busy 時直接略過，#83 RACE-2：BSL／reset 期間 by-id 常短暫消失）；所有 flash 結束路徑無條件清 `Fence.flash_mode` 與 P6 `OwnershipState.flash_mode`。Python 基線在 I/O 失敗時停在 `FLASHING`，不修改（Stage 1 退守 artifact 不變，09 Global Constraints）；案例 `s24-flash-ioerror-recovering`（P8 Task 1 登記，Task 8 實作） | §5.3、§5.2.3、§5.2.5 | Rust-only |
+| SC-33 | **已撤回（擁有者 OD-79，2026-11-06，`reviews/rulings/s2.md`）**：09 §0.4 原以「Python 只在開始前擋、傳輸中不中斷」為前提，登記 Quiet／Reconfirm 期間 FileTransfer 中途拒絕為 Rust-only；main 的 Python（S1X-a-4）已由 `_file_tx_rejected_result` 在傳輸中被拒時回 `AUTOBOOT_QUIET`＋`retry_after_s`（被拒那筆零寫出）或 `COMMAND_ABORTED_IN_FLIGHT`（已寫出），前提不成立。不登記於 `behavior_changes.yaml`、不新增 pending owner item 8；原列 SC-33 的案例 `s24-xfer-session-gates` 改列 SC-03 | §5.2.2、§5.3 | —（撤回） |
 | SC-34 | `session.attach`／`session.recover` 的 `error_code` 不再放 `last_error` 值（含 `CREDENTIALS_UNRESOLVED`）：attach 於 command-capable 且 state ∉ {READY, ATTACHING, FLASHING, RECOVERING} 時（含 human lease 分支、bridge 存在的其他分支與同步 probe 之後）回 `{"ok":false,"error_code":"SESSION_NOT_READY","last_error":<str\|null>,"last_error_detail":<str\|null>,"session":…}`（原 `last_error or "NOT_READY"` 一併取代，`NOT_READY` 改 `reachable:false`）；recover 的 REPROBE 未恢復時回 `{"ok":true,"recovering":false,"action":"REPROBE","recovered":false,"session":…,"error_code":"SESSION_NOT_READY","last_error":…,"last_error_detail":…}`，其後照舊可附 `classification`／`recommended_action`／`matched_prompt`（BOOTLOADER 判定改看 `last_error == "BOOTLOADER_STUCK"`）。`error_codes.yaml` 的 `last_error_passthrough` meta 項與 `code_extraction.yaml` 的對應抽取規則移除；`session_last_errors.yaml` 的 `promoted_via` 改指「出現在該方法回應頂層 `last_error` 欄位」 | §9.3、§15.2「不新增為 RPC error_code」、OD-14 #1 | 雙邊（P1-OC T2；Rust P5、P7） |
 | SC-35 | `platform=passthrough` 啟用送命令：attach 不跑 Login FSM、不送 ready_probe、不做 boot quiet gate，bridge 起來即 `ATTACHED`、零 TX；`ATTACHED` 連續 `PASSTHROUGH_READY_QUIET_S = 30` 秒無 RX（`quiet_since = max(進入 ATTACHED, 最後 RX)`，任何 RX 重新起算，TX 不算；1 s tick 判定；drain／flash 臨界／RELEASED 時不升）即自動轉 `READY`，之後依一般 `READY` 流程進 Arbiter（DF-02 照樣適用）；passthrough 不 arm boot-banner quiet、不跑 READY reconfirm。`ATTACHED` 時 `command.submit` 回 `SESSION_NOT_READY`＋`passthrough_ready_in_s`（不再回 `PROFILE_NOT_COMMAND_CAPABLE`）；`file.push`／`file.pull` 對 passthrough 任何狀態回 `PROFILE_NOT_COMMAND_CAPABLE`。line／background 完成條件：有 `completion_regex` → #230 producer 完成；否則 profile `prompt_regex` 符合 `valid_completion_regex`（可編譯、非空、不匹配空串）→ 既有 prompt 完成；否則（如 others-template 的 `.*`）沿用既有等待迴圈後回 `{"ok":false,"error_code":"PROMPT_TIMEOUT","partial":true,"recovery_action":"NONE"}`。passthrough 未命中時不送 CTRL_C／CTRL_D、不轉 `ATTACHED`、不 force recover；reboot 命令不套特例。self-test 永不 TX（READY → `PASSTHROUGH`＋`recommended_action:"none"`；ATTACHED 加 `passthrough_ready_in_s`）；recover 的 REPROBE 不 probe。斷線等 drain 路徑走一般恢復（ATTACHING → ATTACHED → 重新累計 30 s）。`command_capable` 定義不變（flash 偵測候選依賴它）。不新增錯誤碼與 WAL META | §5.3、§5.2.1「核准的例外」、OD-14 #2 | 雙邊（P1-OC T5／T6；Rust P5 核心、P7 登入／Quiet 排除、P8 file.* 與 flash 交互） |
 | SC-36 | Windows 安裝的 com0com 選用元件（OD-15 新增範圍）：release bundle 附 `optional/com0com/`（簽章 driver 3.0.0.0、`LICENSE-GPLv2.txt`、`SOURCE.md` 原始碼取得方式、`PROVENANCE.json`）；manifest `components.com0com{optional:true, default_selected:false, requires_elevation:true, experimental}`；基本安裝維持使用者身分（`%LOCALAPPDATA%`）不需管理員，只有新增的 `setup --with-com0com`／`--remove-com0com` 以 `runas` 啟動 helper 提權；UAC 拒絕或 helper 失敗時基本安裝仍 `ok:true`、`optional_components.com0com.installed:false`＋`reason`；本體移除／回滾不移除 driver；Spike 1 剩餘項在 HVCI 開啟機台通過前 `experimental:true`；不新增錯誤碼 | OD-15 (1)、OD-01、OD-08 | Rust-only（P4 Task 19；P8 整合） |
@@ -447,9 +449,11 @@ P1 T02～T05 原定交付 `contracts/golden/wal/*.json`，但該計畫未產生�
 | EVT-D-F1 | `chunk_size` 為 0 或負數時的強制轉型 | — | KEEP | 基線 | P8 | no |
 | EVT-D-F2 | file 類 CLI 預設 timeout 5 s（#123） | — | KEEP | 已知缺口 | P3 | no |
 | EVT-D-F3 | MOVE 失敗不清理暫存檔 | — | KEEP | 基線 | P8 | no |
-| EVT-D-F4 | pull 受 131072 字元 RX 視窗限制 | — | KEEP | 基線 | P8 | no |
+| EVT-D-F4 | pull 受 131072 字元 RX 視窗限制（F7 `f7-larger-file-not-truncated` 的 1 MB pull 因此 `PULL_PARSE_FAILED`） | §11.6 | FIX（OD-80；原 KEEP） | 擁有者 2026-11-06 裁決（OD-80，`reviews/rulings/s2.md`）：登記 DF，讓 pull 不依賴 131072 字元視窗，不採 XFAIL；編號 DF-26 保留給本列（編排者 2026-11-07 裁決），登記與 Python 側修正不在 P8 Task 1；Rust 引擎 P8 Task 4 已分段讀取（`file_transfer_engine.rs::pull_over_rx_window_succeeds_od80`） | P8 | yes（已裁決 OD-80，2026-11-06） |
 | EVT-D-F5 | 非 strict base64 解碼 | — | KEEP | `a2b_base64_lenient` | P8 | no |
 | EVT-D-F6 | file transfer 不排隊，直接回 `SESSION_BUSY` | §5.2.1 | KEEP | 基線 | P8 | no |
+| XFER-ABORT-01 | release／recover／shutdown 中止進行中的 file transfer：0.3.2 依時序回 `TRANSFER_TIMEOUT`、`MOVE_TIMEOUT`、`CHECKSUM_VERIFY_FAILED`、`TARGET_DECODER_FAILED` 或例外；S1X-a-4 起 Python 以 `_file_tx_rejected_result` 映射傳輸中被拒的 TX | §5.3「Recovery 清除未執行命令／中止已確認部分 TX」 | KEEP（OD-62 已裁決：比照 BC-03） | 擁有者 2026-10-29 裁決 (a)（OD-62，`reviews/rulings/s1.md`）：drain、世代過期或取消且尚未寫出任何 byte → `FLUSHED_BY_RECOVERY`；已寫出至少 1 byte → `COMMAND_ABORTED_IN_FLIGHT`（push 附 `chunks_sent`／`chunks_total`），並比照一般命令寫 WAL META `command_aborted_in_flight`（`cmd_id` 為傳輸前綴 `ft-<8hex>`、`confirmed_tx_bytes` 為整段累計；s1 rulings 第 41、43 列）；結果不明等其餘情形維持傳輸自身結束碼；一律不自動重送。main 的 Python 基線已實作，Rust 逐字承接；09 §0.4 原稿「Rust 一律回 framing `EXCEPTION`」作廢。契約已記於 BC-03／SC-04 的 compatibility_impact，本列不另登記；案例 `s24-xfer-abort-on-release` | S1X-a/P8 | yes（已裁決 OD-62，2026-10-29） |
+| MCU-STATUS-01 | `mcu.status.flashing` 在 probe／偵測期間即為 `true`（`FlashEndpoint._flash_active` 於端點首讀後設定），此時 `flashing_com` 仍為 null | — | KEEP | 基線；Rust `FlashEndpoint::is_flashing()` 逐字承接（09 Task 10，案例 `s24-mcu-rpc-shapes`） | P8 | no |
 | EVT-D-L1 | 前景執行期間 capture 不寫 log | — | KEEP | 基線 | P5 | no |
 | EVT-D-L2 | `result.tail` 回 `EXCEPTION` 而 `log` 回 `INVALID_ARGS` | — | KEEP | 基線 | P5 | no |
 | EVT-D-K1 | 有定義但未使用的常數 | — | IMPL | — | — | no |
@@ -507,6 +511,16 @@ P1 T02～T05 原定交付 `contracts/golden/wal/*.json`，但該計畫未產生�
 | 6 | EVT-D-S6／SC-26 | Windows event handler | `shell` 走 `cmd.exe /d /s /c`；Job Object 處理 timeout；env 白名單加 `SYSTEMROOT`、`COMSPEC`、`PATHEXT`、`TEMP`、`TMP`、`USERPROFILE` | **已裁決：確認原預設** | SC-26（Rust-only；P1-OC T1 改 `confirmed`）；P7 Task 14 |
 | 7 | SC-27 | BC-05 的 Windows remote 是否涵蓋 `connect`／`benches` | 涵蓋，移除兩者在 Windows 上的 `REMOTE_NOT_SUPPORTED` | **已裁決：確認原預設（涵蓋）** | SC-27（P1 T14 已實作；P1-OC T1 改 `confirmed`）；P4 Task 9 |
 
+### 3.1 P8 Task 1 追加（2026-11-08；皆已由擁有者裁決，不新增 pending 佇列項）
+
+09 §0.4 原列三項 needs-owner，開工前均已裁決，故 `pending_owner_confirmations` 不新增 item（原保留給 SC-33 的 item 8 隨 OD-79 撤回）：
+
+| 項 | ID | 議題 | 原預設（09 §0.4） | 裁決 | 登記與承接 |
+|---|---|---|---|---|---|
+| P8-a | SC-33 | Quiet／Reconfirm 期間 FileTransfer 中途拒絕 | Rust-only 中途拒絕、Python 不中斷 | **OD-79 撤回**：Python 已於傳輸中被拒時回 `AUTOBOOT_QUIET`／`COMMAND_ABORTED_IN_FLIGHT`，前提不成立 | 不登記；案例改列 SC-03（`s24-xfer-session-gates`，P8 Task 6） |
+| P8-b | XFER-ABORT-01／BC-03 | file transfer 被中止是否納入 BC-03 | 不納入；Rust 回 framing `EXCEPTION` | **OD-62 比照 BC-03**：`FLUSHED_BY_RECOVERY`／`COMMAND_ABORTED_IN_FLIGHT`＋WAL META `command_aborted_in_flight` | BC-03／SC-04 compatibility_impact（S1X-a-4）；案例 `s24-xfer-abort-on-release`（P8 Task 6） |
+| P8-c | EVT-D-F4／F7 | 1 MB pull 受 RX 視窗限制，與 §11.6 F7 出口衝突 | (b) `f7-larger-file-not-truncated` 標 XFAIL＋sentinel | **OD-80 登記 DF**：pull 不依賴視窗，不採 XFAIL | DF-26 保留（登記不在 P8 Task 1）；Rust 引擎已於 P8 Task 4 分段讀取 |
+
 ## 4. 保留的已知缺陷（KEEP；建議另開 issue，不在本次重構範圍）
 
 | ID | 缺陷 |
@@ -524,19 +538,19 @@ Rust 依基線逐字承接以上行為。要修正時另開 issue，並登記新
 
 ## 5. 統計
 
-第 2 節共 302 列（ID 不重複），依「裁決」欄的第一個代號歸類：
+第 2 節共 304 列（ID 不重複），依「裁決」欄的第一個代號歸類：
 
 | 裁決 | 列數 |
 |---|---|
-| KEEP（保留基線並凍結；含 KEEP＋DOC 等以保留為主者） | 151 |
+| KEEP（保留基線並凍結；含 KEEP＋DOC 等以保留為主者） | 152 |
 | SPEC（依定稿規格變更，SC） | 35 |
 | NEW（規格要求的新功能，SC） | 14 |
-| FIX（缺陷／安全修正，DF） | 26 |
+| FIX（缺陷／安全修正，DF） | 27 |
 | BC（既有核准的 BC-01～05） | 19 |
 | DOC（只修文件或勘誤） | 26 |
 | TEST（修測試資產） | 12 |
 | IMPL（內部實作差異） | 19 |
-| **合計** | **302** |
+| **合計** | **304** |
 
 登記項目：SC-01～SC-27 扣除已撤回的 SC-08，加上 OD-14 新增的 SC-34、SC-35（共 28 項；SC-28～SC-33 由 P6～P8 另行登記，OD-15 的 SC-36 由 P4 Task 19 登記；P6 已登記 SC-28、SC-29、SC-31，P7 Task 0 登記 SC-30）、DF-01～DF-17 與 DF-19（18 項；DF-18 由 P7 Task 0 登記，`08` §0.5），另有既有核准的 BC-01～05。7 列標為需擁有者確認，對應第 3 節的 7 項（第 1 項含 3 列交叉引用），已全數由 OD-14 裁決。
 
@@ -545,6 +559,8 @@ OD-14 對上表的影響（2026-10-16）：RPC-D-02、ERR-7.2-b、ERR-7.3-1、SE
 P6 Task 0 對上表的影響（2026-10-24）：§2.6 新增 KEEP＋DOC 三列 CON-EVT-01（07 D-14）、CON-LINE-01（07 D-21）、CON-REPLAY-01（07 D-22），KEEP 由 148 列增為 151 列，合計 302 列。
 
 P7 Task 0 對本節的影響（2026-10-26）：§1.1 新增 SC-30、§1.2 新增 DF-18（皆為登記項，非 §2 調和列），上表列數不變（合計 302 列）；SC-11 列補 Event Engine 停止序細化一句。
+
+P8 Task 1 對本節的影響（2026-11-08）：§2.9 新增 KEEP 列 XFER-ABORT-01（OD-62）與 MCU-STATUS-01；EVT-D-F4 依 OD-80 由 KEEP 改 FIX（DF-26 保留、尚未登記）。上表已依此重算：KEEP 由 151 列變為 152 列、FIX 由 26 列增為 27 列，合計 304 列。§1.1 新增 SC-32（登記項，Rust-only）與 SC-33 撤回註記（OD-79），皆非 §2 調和列；§3.1 記錄 09 §0.4 三項 needs-owner 的裁決。
 
 ## 6. P3 登記：Rust-only 非契約差異（arch §0.7）
 

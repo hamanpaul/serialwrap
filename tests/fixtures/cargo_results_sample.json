@@ -1,0 +1,21 @@
+{
+  "exit_code": 0,
+  "finished": true,
+  "targets": [
+    {
+      "crate": "sw-core",
+      "test_file": "file_transfer_session",
+      "tests": [
+        {
+          "name": "file_transfer_rejects_unsupported_echo_ack",
+          "outcome": "passed"
+        },
+        {
+          "name": "cap_posix_pty__endpoint_reopen_after_flasher_set_excl_recorded",
+          "outcome": "skipped",
+          "skip_reason": "capability evidence is owner gated"
+        }
+      ]
+    }
+  ]
+}

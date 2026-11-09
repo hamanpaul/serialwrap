@@ -1710,7 +1710,7 @@ fn shutdown_at_second_flash_start() {
 | `rx_observer_non_blocking` | master writer `try_write` 回 `Ok(0)` | reader thread 不阻塞、不重試 |
 | `rx_observer_only_active_com` | COM1 RX | 不寫 master |
 | `second_open_while_active_ignored` | flash 中 flasher 再寫 | 不重入 `on_flash_open` |
-| `cap_posix_pty__endpoint_slave_never_exclusive`（`crates/sw-pal/tests/flash_pty.rs`，`posix_pty`；R0-F3 延伸） | `FlashEndpoint::start` 後、完成一次 matched→pump→`FlashHolderGone` 循環後，各以一般 open 開 `ttyMCU` 並 `ioctl(TIOCGEXCL)` | 兩次讀回皆為 `0`（daemon 從未對端點設 TIOCEXCL）；第二次 flasher open 成功、送 `55 55` 仍得 `00 cc` 回放 |
+| `cap_posix_pty__endpoint_slave_never_exclusive`（`crates/sw-core/tests/flash_coordinator.rs`，`posix_pty`；R0-F3 延伸；需 sw-core 的 `FlashEndpoint`，依編排者 T9 裁決自 sw-pal `flash_pty.rs` 移入，由 T13 承接） | `FlashEndpoint::start` 後、完成一次 matched→pump→`FlashHolderGone` 循環後，各以一般 open 開 `ttyMCU` 並 `ioctl(TIOCGEXCL)` | 兩次讀回皆為 `0`（daemon 從未對端點設 TIOCEXCL）；第二次 flasher open 成功、送 `55 55` 仍得 `00 cc` 回放 |
 | `endpoint_reopen_after_flasher_set_excl_recorded`（黑箱，只記錄、不判 PASS／FAIL） | `FakeFlasher(excl=True)` 開端點後設 `TIOCEXCL`、完成 flash、不清除即關閉 → 第二個 `FakeFlasher` 開 link | 記錄第二次 open 的 errno（預期 Python 與 Rust 皆為 `EBUSY`）與 `mcu.status`；結果寫入 gate 報告「待裁決」欄（DF 候選：端點於 `FlashHolderGone` 後以 keepalive fd `TIOCNXCL`） |
 | `endpoint_thread_survives_on_flash_open_panic` | coordinator panic | thread 繼續服務下一次 open（C1） |
 | `windows_caps_no_endpoint` | `caps.flash_endpoint=false` | `FlashEndpoint::start` 回 `Ok(None)`，無 thread |
@@ -2105,6 +2105,8 @@ def test_restart_on_failure_keeps_released_and_wal_seq(sw_env, shell_target, tra
 
 P4 已在 Stage 1 實作共用 `graceful_stop`（P4 Global Constraints：先停用拉起能力 → RPC `daemon.stop` 2.0 s → 等待結束 ≤10 s → 逾時才硬終止；P4 §0.5 註明 SC-24-S 由 P4 實作、P8 只補 Rust daemon 側驗證）。本 Task **不**新增 `TaskSchedulerCtl`、不重寫 stop 序；只 (a) 修正 P4 契約內 `service stop`／`restart` 仍直接 `/End` 的不一致，使其經 `graceful_stop`；(b) 以 Rust daemon 驗證整條序列。
 
+**OD-83（擁有者，2026-11-09）**：Windows 原生實跑確認，`taskkill /F` 後 daemon action 以 exit 1 結束時，Task Scheduler 將工作記為完成，`RestartOnFailure` 不會自動重新啟動。0.5.0 採 A：本案例驗證強制終止後 90 s 內沒有新 daemon pid、工作不是 Running，再由正式 `service start` 於 20 s 內恢復；三道 COM 防線、有序停止與 WAL 證據維持。這是 0.5.0 已知限制，長期需讓 Windows 崩潰自動重啟對齊 Linux systemd `Restart=on-failure`；工作 XML 維持現狀。
+
 **Test author model:** haiku-xhigh　**Implementer model:** codex-gpt-6-luna-max
 
 **Files:**
@@ -2149,9 +2151,14 @@ fn cap_supervisor_runtime__task_pt0s_restart_and_graceful_stop() {
     assert!(ctl.action_named(&SupervisionMode::WindowsTask, &name, ServiceAction::Start, false).ok);
     let pid0 = wait_daemon_pid(Duration::from_secs(20));
     taskkill_force(pid0);
-    let t0 = Instant::now();
-    let pid1 = wait_new_daemon_pid(pid0, Duration::from_secs(150));
-    assert!(t0.elapsed() <= Duration::from_secs(150) && pid1 != pid0);
+    assert!(wait_task_not_running(&ctl, &name, Duration::from_secs(10)));
+    let observed = observe_no_task_restart(&p.env, &ctl, port, &name, &daemon_exe, pid0, Duration::from_secs(90));
+    assert!(matches!(observed.final_task_state, TaskQuery::NotRunning(_))
+            && observed.final_process_pids.is_empty(),
+        "OD-83：0.5.0 已知限制；長期須對齊 Linux 崩潰自動重啟");
+    assert!(ctl.action_named(&w, &name, ServiceAction::Start, false).ok);
+    let pid1 = wait_new_daemon_pid(pid0, Duration::from_secs(20));
+    assert_ne!(pid1, pid0);
     let r = graceful_stop_for_test(&ctl, &name);               // 呼叫 P4 graceful_stop
     assert!(r.ok, "{r:?}");
     assert!(!r.ran_end, "daemon 正常結束時不得執行 /End");
@@ -2299,7 +2306,7 @@ P3～P7 的黑箱與 Rust 測試沒有 `contract` marker，故 ID↔測試的對
   ID 規則：`error_code:<CODE>`（`reachable:true`）、`last_error:<VALUE>`（`reachable:true`）、`rpc_method:<name>`（`rpc_schema.json` 的 `x-methods` 鍵，55 個＝54 基線＋P1 T08 併入的 SC-11 `daemon.handoff_stop`，R1-F1）、`cli_cmd:<group> <sub>`（`cli_schema.json` 的 `/commands[*].path`）、`bc:<ID>`（`behavior_changes.yaml` 的 `changes[*].id`，含 SC-32、SC-33）、`schema:wal_record`、`schema:state_file`、`case:<case_id>`（`cases.lock.json` 的 `sets["slice_2.4"]`）。`EXTRACTORS` 的路徑與 P0 實際檔案不同時，於本 Task 同 PR 調整並由 `test_extractors_match_real_contracts` 把關。
 
   判定規則：
-  1. **身分**：同一 run_dir 內所有結果檔的 `contract_revision`、`cases_yaml_sha256`、`cases_lock_sha256` 必須一致；`rust-*` 結果檔的 `cli_sha256`／`daemon_sha256` 必須彼此一致且等於當輪 artifact 的實際 sha256；`evidence[*].sha256` 必須與檔案相符。不一致 → `identity_errors`，不得跨候選版本或跨輪合併。
+  1. **身分**：同一 run_dir 內所有結果檔的 `contract_revision`、`cases_yaml_sha256`、`cases_lock_sha256` 必須一致；**同平台**的 `rust-*` 結果檔的 `cli_sha256`／`daemon_sha256` 必須彼此一致且等於該平台當輪 artifact 的實際 sha256（Linux 對照本輪 build 快照的 `--expect-platform linux --expect-*-sha256`；Windows 對照其原生 runner 的 `SHA256SUMS`，匯入時存於 `<run_dir>/artifacts/windows/SHA256SUMS`）；Linux ELF 與 Windows PE 本為不同檔案，跨平台不要求雜湊相同（2026-11-09 依 T15 第 2 輪審查 P8X-24c6b39-5 釐清）；`evidence[*].sha256` 必須與檔案相符。不一致 → `identity_errors`，不得跨候選版本或跨輪合併。
   2. **平台矩陣**：依 ID 的 `platforms` 展開必要證據——含 `linux` 者需 `rust-linux` 的 `passed`；含 `windows` 者需 `rust-windows` 的 `passed`，否則必須列 `blocked_owner` 並附能力原因（`windows_com`／`supervisor_runtime`／`interactive_desktop`）；Windows-only ID 不要求 Linux 證據。
   3. **A/B**：非 `rust_only` 的 ID，對應 nodeid 在同平台 `python-*` 亦須 `passed`（同一 nodeid 結果不一致 → `ab_mismatch`）；`l1_only`（只有 Rust L1 nodeid，如 `ECHO_ACK_UNSUPPORTED`）不做 A/B 比對，以 `cargo:` 結果滿足。
   4. **案例**：`case:` 屬 L2／L3／manual 或 capabilities 含 `physical_uart`／`windows_com`／`interactive_desktop`／`supervisor_runtime`／`longrun_bench` 者，只能列 `blocked_owner`，**不得**計入 covered，直到匯入有效實機證據。
@@ -2460,7 +2467,7 @@ def test_cargo_results_import_roundtrip(tmp_path):
 5. `SERIALWRAP_CLI_EXE=$RUST_CLI SERIALWRAP_DAEMON_EXE=$RUST_DAEMON SERIALWRAP_AB_LABEL=rust-linux SERIALWRAP_COVERAGE_RUN_DIR=$RUN_DIR python3 -m pytest -q tests/contract_blackbox tests/test_multiagent_e2e.py tests/test_human_agent_coexist.py`
 6. `func-test` 外部模式（P2）以 Rust artifact 執行 13 個既有 case＋§15.7.1 的 11 個情境，結果匯入 `$RUN_DIR`
 7. Windows 正式 gate（arch §1.1、規格 §11.5）：讀取擁有者 Windows 自架 runner 以**原生 build/link** 產生的 artifact 與其 `results-rust-windows.json`（路徑由 `--windows-run <dir>` 傳入，sha256 須與 runner 產出的 `SHA256SUMS` 相符）；未提供 → 該平台 ID 全列 BLOCKED-OWNER
-8. 長跑證據匯入（規格 §11.6、§15.11）：`--longrun <dir>`，內容須含 pinned bundle sha256、對應 Python 48h baseline、停用自動重啟的紀錄、bench lock 紀錄、P2 `realhw/acceptance/gate.py` 的 `release-gate.json`（Windows 另須 `excl/probes.ndjson`＋`excl/handoff.ndjson` 原生 COM 獨占證據，P2 Task 15「Windows 獨占證據契約」，R1-F7；`holder_unknown` 只作診斷，不是雙重持有判定依據）；未提供 → `lr-mixed` 列 BLOCKED-OWNER
+8. 長跑證據匯入（規格 §11.6、§15.11）：`--longrun <dir>`，內容須含 pinned bundle sha256、對應 Python 48h baseline、停用自動重啟的紀錄、bench lock 紀錄、P2 `realhw/acceptance/gate.py` 的 `release-gate.json`（Windows 另須 `excl/probes.ndjson`＋`excl/handoff.ndjson` 原生 COM 獨占證據，P2 Task 15「Windows 獨占證據契約」，R1-F7；`holder_unknown` 只作診斷，不是雙重持有判定依據）；未提供 → `lr-mixed` 列 BLOCKED-OWNER。目錄結構（P8X-24c6b39-1）：`longrun-manifest.json`（`schema_version: slice24-longrun.v1`、`case_id: lr-mixed`、各平台 `bundle_tree_sha256`＝pinned bundle）＋`<platform>/release-gate.json`（candidate）、`baseline-release-gate.json`（Python 48 h baseline）、`supervision-attest.json`（停用自動重啟）、`bench-lock.json`（`path`／`acquired_at_utc`／`released_at_utc` 須涵蓋整個長跑區間）與 gate `evidence_hashes`／`excl_evidence_hashes` 所列檔案；由 `contract_coverage.py --import-longrun` 逐項驗證（雜湊、pinned bundle、contracts 樹／cases.yaml／門檻檔身分、48 h、前提檢查與彙總一致性；candidate 與 baseline 的 `checks` 必須恰為正式 P2 gate 在該平台／模式產出的完整檢查集合——ID 唯一、無缺無多、`group` 相同、`NOT_APPLICABLE_BASELINE` 只出現在正式 gate 判 NA 的位置，集合由正式判定器推導、不另抄清單，`release_gate_result`／`baseline_result` 以正式 gate 彙總規則重算比對，P8X-e038dda-2）後複製進 `<run_dir>/longrun/`，判定時重新驗證副本；判定時另須綁定本輪候選（P8X-e038dda-1）：長跑的 pinned bundle、CLI 與 daemon 映像必須等於 `<run_dir>/artifacts/<platform>/candidate-bundle.json` 記錄的本輪候選 bundle （Linux 由 `slice24_exit.sh --candidate-bundle <dir>` 記錄並以該 bundle 的 CLI／daemon 為受測 artifact，bundle `git_revision` 須等於 worktree HEAD；Windows 由 runner 附 `bundle/` 版本目錄），且候選 bundle 的 `bin/` CLI／daemon 等於同輪 rust-<platform> 實際受測 artifact；未記錄候選 bundle（例如本輪只測 debug build）即無法綁定、維持 BLOCKED-OWNER；全部平台成立且 `release_gate_result=PASS` 才解除阻擋，有效證據判 FAIL 即案例 FAIL，其餘一律維持 BLOCKED-OWNER
 9. `python3 scripts/rust/contract_coverage.py --run-dir $RUN_DIR --expect-cli-sha256 $(sha256sum $RUST_CLI|cut -d' ' -f1) --expect-daemon-sha256 $(sha256sum $RUST_DAEMON|cut -d' ' -f1) --json $RUN_DIR/slice24.json`
 10. `python3 scripts/rust/slice_breaker.py --freeze tests/acceptance/breaker/slice_2.4.json --snapshots tests/acceptance/breaker/slice_2.4.snapshots.ndjson --today $(date -u +%F)`（tripped 或 `od02_resubmit` → exit 1 並印退守指示）
 11. `python3 -m policy_check --repo .`

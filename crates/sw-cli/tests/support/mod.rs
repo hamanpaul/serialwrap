@@ -849,6 +849,14 @@ impl TestEnv {
         self
     }
 
+    /// 將交接後確認舊 daemon 已退出時的拒絕探測標記為 handoff gone 事件。
+    pub fn with_gone_handoff_event(self) -> Self {
+        if let Some(endpoint) = self.active_daemon_endpoint.as_deref() {
+            self.rpc.refused_connect_as(endpoint, "daemon.handoff_stop");
+        }
+        self
+    }
+
     /// 設定更新後 daemon 的版本回應；若舊 daemon 正在同一 endpoint 運作，保留舊回應直到 handoff 與 spawn。
     pub fn with_new_daemon_reporting_version(mut self, v: &str) -> Self {
         let endpoint = if self.windows { Self::win_endpoint().to_string() } else { self.default_socket() };
@@ -1871,6 +1879,11 @@ impl TestEnv {
     /// 依呼叫順序的 `run`／`run_raw` argv（`SysEnv` 替身）。
     pub fn calls(&self) -> Vec<Vec<String>> {
         self.env.calls()
+    }
+
+    /// 本 TestEnv 的 `SysEnv` 替身（P8 Task 13：存活模型需觀察 `/End` 是否已執行時使用）。
+    pub fn sysenv(&self) -> Arc<FakeSysEnv> {
+        Arc::clone(&self.env)
     }
 
     pub fn rpc(&self) -> &Arc<FakeRpcConnector> {

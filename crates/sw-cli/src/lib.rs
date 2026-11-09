@@ -30,6 +30,9 @@ pub mod state_migrate;
 pub mod supervisor_defs;
 mod tree_digest;
 pub mod wslconf;
+/// P8 Task 13：windows-task 實跑測試的正式停止路徑 harness（只在 `test-fakes` 建置）。
+#[cfg(feature = "test-fakes")]
+pub mod wintask_harness;
 
 use std::any::Any;
 use std::cell::Cell;

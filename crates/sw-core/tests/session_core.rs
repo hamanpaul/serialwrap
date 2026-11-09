@@ -18,7 +18,7 @@ use sw_core::mailbox::{ControlEvent, DataEvent, DetachReason, Mailbox, OpenFailu
 use sw_core::op_runner::{OpOutcome, OpSpec};
 use sw_core::session_core::{Effect, ManagerNote, SessionRequest, SessionState};
 use sw_core::tx_writer::{Fence, FenceReject, OpId, TxClass, TxOpLedger, TxPermit};
-use sw_pal::traits::{Clock, HolderReport};
+use sw_pal::traits::{Clock, HolderReport, TxOutcome};
 use sw_proto::pyjson::{PyDict, PyValue};
 
 // ---------------------------------------------------------------------------
@@ -365,6 +365,410 @@ fn passthrough_quiet_tick_ready_at_30s() {
     assert!(!has_start_op(&all), "零 TX：不得送命令");
     let r = h.rpc(submit("ls")).expect("READY 後 submit 應回 ok");
     assert_eq!(pget(&r, "ok"), PyValue::Bool(true));
+}
+
+#[test]
+fn passthrough_quiet_tick_does_not_advance_after_handoff_freeze() {
+    let mut h = CoreHarness::new(PASSTHROUGH_PROFILE);
+    h.to_attached(None);
+    h.advance(Duration::from_secs(29));
+    h.reg.admission_gate().freeze();
+    let effects = h.advance(Duration::from_secs(3));
+    assert_eq!(h.core.state(), SessionState::Attached, "交接凍結期間不得升 READY");
+    assert!(!has_session_ready(&effects), "凍結後不得發布 SessionReady");
+}
+
+#[test]
+fn auto_reprobe_ready_result_survives_temporary_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_attached(Some("PROMPT_UNAVAILABLE"));
+    let (epoch, fsm_gen) = h
+        .advance(Duration::from_secs(1))
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartLogin {
+                epoch,
+                fsm_gen,
+                plan: sw_core::login_fsm::LoginPlan::Probe,
+            } => Some((*epoch, *fsm_gen)),
+            _ => None,
+        })
+        .expect("ATTACHED/PROMPT_UNAVAILABLE 應啟動自動重探");
+
+    let token = match h.reg.admission_gate().freeze_if_idle("update") {
+        sw_core::admission::FreezeOutcome::Frozen { token, created: true } => token,
+        outcome => panic!("交接應建立暫時 admission 凍結：{outcome:?}"),
+    };
+    h.fence.with(|fence| fence.handoff_frozen = true);
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    assert_eq!(h.core.state(), SessionState::Attached, "凍結期間不得推進 session 狀態");
+    assert_eq!(pget(&h.public(), "last_error"), PyValue::from("PROMPT_UNAVAILABLE"));
+
+    // 模擬另一個 session 的 TX fence 超時：交接撤銷 fence 與 admission 凍結。
+    h.fence.with(|fence| fence.handoff_frozen = false);
+    assert!(h.reg.admission_gate().thaw(&token), "交接失敗後應撤銷暫時凍結");
+    let effects = h.advance(Duration::from_secs(1));
+    assert_eq!(h.core.state(), SessionState::Ready, "凍結撤銷後應套用已成功的 probe 結果");
+    assert_eq!(pget(&h.public(), "last_error"), PyValue::Null);
+    assert!(has_session_ready(&effects), "probe 結果套用後應發布 SessionReady");
+}
+
+#[test]
+fn force_recover_poll_replies_after_permanent_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_attached(Some("SHELL_PROMPT_TIMEOUT"));
+    let (reply, _) = h.rpc_deferred(SessionRequest::Recover {
+        timeout_s: 2.0,
+        force: true,
+    });
+
+    h.advance(Duration::from_millis(12_900));
+    assert!(reply.try_recv().is_err(), "第十次輪詢尚未到期");
+    h.reg.admission_gate().freeze();
+    h.advance(Duration::from_millis(100));
+
+    let result = reply.try_recv().expect("永久凍結期間仍須結算 recover 等待者").expect("回覆字典");
+    assert_eq!(result.get("error_code"), Some(&PyValue::from("FORCE_RECOVER_TIMEOUT")));
+    assert_eq!(result.get("recovered"), Some(&PyValue::Bool(false)));
+}
+
+#[test]
+fn manual_reprobe_result_replies_flushed_after_permanent_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_attached(Some("PROMPT_UNAVAILABLE"));
+    let (reply, effects) = h.rpc_deferred(SessionRequest::Recover {
+        timeout_s: 2.0,
+        force: false,
+    });
+    let (epoch, fsm_gen) = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartLogin { epoch, fsm_gen, .. } => Some((*epoch, *fsm_gen)),
+            _ => None,
+        })
+        .expect("手動 recover 應啟動既有 bridge probe");
+
+    h.reg.admission_gate().freeze();
+    let effects = h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+
+    let result = reply.try_recv().expect("手動 recover 等待者必須收到終態回覆").expect("回覆字典");
+    assert_eq!(result.get("error_code"), Some(&PyValue::from("FLUSHED_BY_SHUTDOWN")));
+    assert_eq!(result.get("reason"), Some(&PyValue::from("handoff_frozen")));
+    assert_eq!(h.core.state(), SessionState::Attached, "凍結後 probe 不得升 READY");
+    assert!(!has_session_ready(&effects), "凍結後不得發布 READY 通知");
+}
+
+#[test]
+fn boot_quiet_deadline_expires_after_permanent_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.rx(b"U-Boot 2024.01\\r\\n");
+    assert!(h.fence.with(|fence| fence.quiet_active), "banner 應啟動 quiet fence");
+
+    h.advance(Duration::from_secs(179));
+    h.reg.admission_gate().freeze();
+    h.advance(Duration::from_secs(2));
+
+    assert!(!h.fence.with(|fence| fence.quiet_active), "已排程 deadline 在永久凍結後仍須到期");
+}
+
+#[test]
+fn lease_expiry_completes_after_permanent_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let opened = h
+        .rpc(SessionRequest::InteractiveOpen {
+            owner: "agent:t14".into(),
+            timeout_s: 1.0,
+            command: String::new(),
+            allow_attached: false,
+        })
+        .expect("interactive_open 回覆");
+    assert!(matches!(opened.get("interactive_id"), Some(PyValue::Str(_))));
+    assert!(matches!(h.public().get("interactive_session_id"), Some(PyValue::Str(_))));
+
+    h.reg.admission_gate().freeze();
+    h.advance(Duration::from_secs(2));
+
+    assert_eq!(h.public().get("interactive_session_id"), Some(&PyValue::Null), "到期 lease 必須收回");
+}
+
+#[test]
+fn console_disconnect_settles_replay_hold_after_permanent_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.attach_pty_console("c1", true);
+    let started = h.start_foreground_command("sleep 9");
+    h.input("c1", b"k");
+    h.set_auto_complete_human_tx(false);
+    let epoch = h.epoch();
+    let effects = h.feed(ControlEvent::OpFinished {
+        op_id: started.op_id,
+        epoch,
+        outcome: OpOutcome::Sent { bytes: 3 },
+        after_rx_seq: None,
+    });
+    assert!(effects.iter().any(|effect| matches!(effect, Effect::HumanTx { payload, .. } if payload == b"k")));
+    assert_eq!(h.public().get("foreground_busy"), Some(&PyValue::Bool(true)), "回放 hold 應維持忙碌");
+    h.input("c1", b"q");
+
+    h.reg.admission_gate().freeze();
+    h.disconnect("c1");
+    assert_eq!(h.public().get("foreground_busy"), Some(&PyValue::Bool(true)), "斷線只移除 backlog，不可取消已受理的在途 HumanTx");
+
+    let effects = h.complete_human_tx(TxOutcome::Completed(1), None);
+    assert!(!effects.iter().any(|effect| matches!(effect, Effect::HumanTx { .. })), "斷線已移除尚未送出的 backlog，不得再排 TX");
+    assert_eq!(h.public().get("foreground_busy"), Some(&PyValue::Bool(false)), "在途 HumanTx 完成後須結算 replay hold");
+}
+
+#[test]
+fn background_bridge_open_does_not_advance_after_permanent_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.attach_device();
+    assert_eq!(h.core.state(), SessionState::Attaching);
+    h.reg.admission_gate().freeze();
+
+    let effects = h.bridge_ok();
+
+    assert!(!has_start_login(&effects), "背景 bridge 開啟完成不得在凍結後啟動 readiness probe");
+    assert!(!has_start_op(&effects), "凍結後不得排 TX");
+    assert_ne!(h.core.state(), SessionState::Ready, "凍結後不得推進至 READY");
+}
+
+#[test]
+fn attach_login_finished_settles_after_permanent_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.attach_device();
+    let effects = h.bridge_ok();
+    let (epoch, fsm_gen) = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartLogin { epoch, fsm_gen, .. } => Some((*epoch, *fsm_gen)),
+            _ => None,
+        })
+        .expect("attach bridge open 應啟動 login");
+    h.reg.admission_gate().freeze();
+
+    let effects = h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+
+    assert_eq!(h.core.state(), SessionState::Attached, "凍結前接受的 login 完成只結算至 ATTACHED");
+    assert!(!has_session_ready(&effects), "永久凍結後不得發布 READY 通知");
+    assert!(!has_start_op(&effects), "永久凍結後不得排 probe TX");
+}
+
+#[test]
+fn bridge_opened_is_adopted_without_readiness_after_permanent_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.attach_device();
+    h.reg.admission_gate().freeze();
+
+    let effects = h.bridge_ok();
+
+    assert_eq!(h.core.state(), SessionState::Attached, "已受理的 bridge open 必須結算並接手 handle");
+    assert!(h.core.generations().conn_epoch.is_some(), "完成開啟後須記錄 bridge epoch");
+    assert!(!has_start_login(&effects), "永久凍結後不得啟動 readiness probe");
+    assert!(!has_start_op(&effects), "永久凍結後不得排 probe TX");
+}
+
+#[test]
+fn device_detached_drains_after_permanent_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.reg.admission_gate().freeze();
+
+    let effects = h.feed(ControlEvent::DeviceDetached {
+        by_id: DEVICE_BY_ID.into(),
+        reason: DetachReason::Removed,
+    });
+
+    assert!(effects.iter().any(|effect| matches!(effect, Effect::BeginDrain { .. })),
+        "凍結後的已受理裝置移除仍須啟動 drain 收尾");
+    assert_eq!(h.core.state(), SessionState::Recovering, "移除事件須收斂 session 狀態");
+}
+
+#[test]
+fn evict_capture_is_applied_after_permanent_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let mut request = agent_submit("dmesg");
+    request.mode = "background".into();
+    let (accepted, effects) = h.rpc_full(SessionRequest::Submit(request));
+    let cmd_id = accepted
+        .expect("背景命令應受理")
+        .get("cmd_id")
+        .and_then(PyValue::as_str)
+        .expect("受理回覆含 cmd_id")
+        .to_string();
+    let op_id = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp { grant, .. } => Some(grant.op_id),
+            _ => None,
+        })
+        .expect("背景命令應啟動 op");
+    let epoch = h.epoch();
+    h.feed(ControlEvent::OpFinished {
+        op_id,
+        epoch,
+        outcome: OpOutcome::CommandResult(sw_proto::pydict! { "ok" => true, "stdout" => "line1" }),
+        after_rx_seq: None,
+    });
+    assert_eq!(
+        h.rpc(SessionRequest::BackgroundResult {
+            cmd_id: cmd_id.clone(),
+            from_chunk: 0,
+            limit: 200,
+        })
+        .expect("完成 capture 可讀")["ok"],
+        PyValue::Bool(true)
+    );
+
+    h.reg.admission_gate().freeze();
+    h.feed(ControlEvent::EvictCapture { cmd_id: cmd_id.clone() });
+    let result = h
+        .rpc(SessionRequest::BackgroundResult {
+            cmd_id,
+            from_chunk: 0,
+            limit: 200,
+        })
+        .expect("淘汰後 capture 查詢回覆");
+    assert_eq!(result.get("error_code"), Some(&PyValue::from("CMD_NOT_FOUND")));
+}
+
+#[test]
+fn console_count_changed_is_applied_after_permanent_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.reg.admission_gate().freeze();
+
+    h.feed(ControlEvent::ConsoleCountChanged { count: 2 });
+
+    let response = h.rpc(SessionRequest::GetState).expect("GetState 回覆");
+    let session = response.get("session").expect("session 快照");
+    assert_eq!(session.get("console_count"), Some(&PyValue::from(2i64)));
+}
+
+fn start_tentative_handoff(h: &mut CoreHarness) -> String {
+    let token = match h.reg.admission_gate().freeze_if_idle("update") {
+        sw_core::admission::FreezeOutcome::Frozen { token, created: true } => token,
+        outcome => panic!("交接應建立暫時 admission 凍結：{outcome:?}"),
+    };
+    h.fence.with(|fence| fence.handoff_frozen = true);
+    token
+}
+
+fn rollback_tentative_handoff(h: &mut CoreHarness, token: &str) -> Vec<Effect> {
+    h.fence.with(|fence| fence.handoff_frozen = false);
+    assert!(h.reg.admission_gate().thaw(token), "TX fence 失敗後應撤銷暫時凍結");
+    h.feed(ControlEvent::Tick)
+}
+
+fn start_auto_reprobe(h: &mut CoreHarness) -> (u64, u64) {
+    h.to_attached(Some("PROMPT_UNAVAILABLE"));
+    h.advance(Duration::from_secs(1))
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartLogin {
+                epoch,
+                fsm_gen,
+                plan: sw_core::login_fsm::LoginPlan::Probe,
+            } => Some((*epoch, *fsm_gen)),
+            _ => None,
+        })
+        .expect("ATTACHED/PROMPT_UNAVAILABLE 應啟動自動重探")
+}
+
+#[test]
+fn tentative_handoff_replays_banner_before_old_ready_result() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (epoch, fsm_gen) = start_auto_reprobe(&mut h);
+    let token = start_tentative_handoff(&mut h);
+
+    let effects = h.rx(b"\r\nU-Boot 2024.04\r\n");
+    assert!(effects.is_empty(), "Pending 期間 banner 應排隊而不執行");
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    let pending = h.public();
+    assert_eq!(h.core.state(), SessionState::Attached);
+    assert_eq!(pget(&pending, "boot_quiet_remaining_s"), PyValue::Null);
+    assert_eq!(pget(&pending, "ready_reconfirm_pending"), PyValue::Bool(false));
+
+    let effects = rollback_tentative_handoff(&mut h, &token);
+    let after = h.public();
+    assert_eq!(h.core.state(), SessionState::Attached, "banner 取消後不可被舊 Ready 推進");
+    assert_ne!(pget(&after, "boot_quiet_remaining_s"), PyValue::Null);
+    assert_eq!(pget(&after, "ready_reconfirm_pending"), PyValue::Bool(true));
+    assert!(!has_session_ready(&effects), "取消後不得發布 SessionReady");
+    assert!(!has_start_op(&effects), "回放不得送出 agent 命令");
+}
+
+#[test]
+fn tentative_handoff_replays_old_ready_before_later_banner() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (epoch, fsm_gen) = start_auto_reprobe(&mut h);
+    let token = start_tentative_handoff(&mut h);
+
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    let effects = h.rx(b"\r\nU-Boot 2024.04\r\n");
+    assert!(effects.is_empty(), "Pending 期間 banner 應排隊而不執行");
+    let pending = h.public();
+    assert_eq!(h.core.state(), SessionState::Attached);
+    assert_eq!(pget(&pending, "boot_quiet_remaining_s"), PyValue::Null);
+    assert_eq!(pget(&pending, "ready_reconfirm_pending"), PyValue::Bool(false));
+
+    let effects = rollback_tentative_handoff(&mut h, &token);
+    let after = h.public();
+    assert_eq!(h.core.state(), SessionState::Ready, "先完成的 Ready 依序生效");
+    assert_ne!(pget(&after, "boot_quiet_remaining_s"), PyValue::Null);
+    assert_eq!(pget(&after, "ready_reconfirm_pending"), PyValue::Bool(true));
+    assert!(has_session_ready(&effects), "banner 前完成 Ready 應發布 SessionReady");
+    assert!(!has_start_op(&effects), "回放不得送出 agent 命令");
+}
+
+#[test]
+fn established_handoff_discards_tentative_banner_without_tx() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let token = start_tentative_handoff(&mut h);
+
+    let effects = h.rx(b"\r\nU-Boot 2024.04\r\n");
+    assert!(effects.is_empty(), "Pending 期間 banner 應排隊而不執行");
+    let pending = h.public();
+    assert_eq!(pget(&pending, "boot_quiet_remaining_s"), PyValue::Null);
+    assert_eq!(pget(&pending, "ready_reconfirm_pending"), PyValue::Bool(false));
+
+    assert!(h.reg.admission_gate().commit_handoff(&token), "交接凍結應成立");
+    let effects = h.feed(ControlEvent::Tick);
+    let after = h.public();
+    assert_eq!(h.core.state(), SessionState::Ready);
+    assert_eq!(pget(&after, "boot_quiet_remaining_s"), PyValue::Null);
+    assert_eq!(pget(&after, "ready_reconfirm_pending"), PyValue::Bool(false));
+    assert!(!has_start_login(&effects), "凍結成立後不得啟動登入 TX");
+    assert!(!has_start_op(&effects), "凍結成立後不得啟動命令 TX");
 }
 
 #[test]
@@ -1276,6 +1680,7 @@ fn boot_banner_invalidates_old_fsm_and_owner_generations() {
                 log: false,
                 input_epoch: None,
                 replay_hold: None,
+                probe_id: None,
             }
         )),
         Err(FenceReject::OwnerMismatch)

@@ -135,6 +135,9 @@ pub struct RuntimePaths {
     pub log_dir: String,
     /// `os.path.join(CONFIG_DIR, "config.yaml")`。
     pub config_yaml: String,
+    /// `TTYMCU_PATH`＝`_env_path("SERIALWRAP_TTYMCU_PATH", os.path.join(RUN_DIR, "dev", "ttyMCU"))`（P8 Task 10；
+    /// Windows flavor 亦產生值但 daemon 不使用——`caps.flash_endpoint=false` 時不建端點）。
+    pub ttymcu_path: String,
 }
 
 /// 路徑解析錯誤。
@@ -278,6 +281,14 @@ impl RuntimePaths {
             &pypath::join(f, &user_home, &["b-log"]),
         );
         let config_yaml = pypath::join(f, &config_dir, &["config.yaml"]);
+        // constants.py：`TTYMCU_PATH = _env_path("SERIALWRAP_TTYMCU_PATH", os.path.join(RUN_DIR, "dev", "ttyMCU"))`。
+        let ttymcu_path = env_path(
+            env,
+            f,
+            home,
+            "SERIALWRAP_TTYMCU_PATH",
+            &pypath::join(f, &run_dir, &["dev", "ttyMCU"]),
+        );
 
         Ok(RuntimePaths {
             config_dir,
@@ -292,6 +303,7 @@ impl RuntimePaths {
             wal_dir,
             log_dir,
             config_yaml,
+            ttymcu_path,
         })
     }
 }

@@ -590,3 +590,85 @@ fn rpc_accept_paused_at_128_connections() {
     drop(extra);
     assert!(server.stop(Duration::from_secs(5)));
 }
+
+// ---------------------------------------------------------------------------
+// P8 Task 12：`RpcServer::stop` 拆為 `stop_accept`（停止 accept、不等 handler）與 `join_handlers`（有界 join）
+// ---------------------------------------------------------------------------
+
+/// `file.push` 卡住直到 `release()`（上限 10 s，避免測試失敗時外洩 thread）；其餘方法立即回 ok。
+struct Stall {
+    entered: AtomicUsize,
+    released: std::sync::atomic::AtomicBool,
+}
+impl Stall {
+    fn new() -> Arc<Stall> {
+        Arc::new(Stall { entered: AtomicUsize::new(0), released: std::sync::atomic::AtomicBool::new(false) })
+    }
+    fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+    }
+    fn wait_entered(&self, n: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.entered.load(Ordering::SeqCst) < n {
+            assert!(Instant::now() < deadline, "handler 未被呼叫");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+impl RpcHandler for Stall {
+    fn call(&self, m: &str, _p: &PyDict) -> Result<PyDict, sw_proto::pycompat::PyErr> {
+        if m == "file.push" {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !self.released.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let mut d = PyDict::new();
+        d.insert("ok", PyValue::Bool(true));
+        Ok(d)
+    }
+    fn request_stop(&self) {}
+}
+
+#[test]
+fn stop_accept_does_not_wait_for_handlers() {
+    let h = Stall::new();
+    let (server, port) = tcp_server(h.clone());
+    let mut c = connect(port);
+    c.write_all(b"{\"id\":1,\"method\":\"file.push\"}\n").unwrap();
+    h.wait_entered(1);
+    let t0 = Instant::now();
+    server.stop_accept();
+    assert!(t0.elapsed() < Duration::from_millis(500), "stop_accept 不得等待進行中的 handler：{:?}", t0.elapsed());
+    // listener 已關閉：新連線被拒。
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        assert!(Instant::now() < deadline, "stop_accept 後仍接受新連線");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // handler 收斂後 join 回空清單，且該筆回應照常寫出。
+    h.release();
+    assert_eq!(server.join_handlers(Instant::now() + Duration::from_secs(5)), Vec::<String>::new());
+    assert_eq!(read_line(&mut c).unwrap(), "{\"id\":1,\"ok\":true}\n");
+}
+
+#[test]
+fn join_handlers_returns_running_methods_at_deadline() {
+    let h = Stall::new();
+    let (server, port) = tcp_server(h.clone());
+    let mut busy = connect(port);
+    busy.write_all(b"{\"id\":1,\"method\":\"file.push\"}\n").unwrap();
+    let mut idle = connect(port);
+    idle.write_all(b"{\"id\":2,\"method\":\"ping\"}\n").unwrap();
+    assert_eq!(read_line(&mut idle).unwrap(), "{\"id\":2,\"ok\":true}\n");
+    h.wait_entered(1);
+    server.stop_accept();
+    let t0 = Instant::now();
+    let pending = server.join_handlers(t0 + Duration::from_millis(300));
+    let took = t0.elapsed();
+    h.release();
+    assert_eq!(pending, vec!["file.push".to_string()], "逾時回仍在執行的 method 清單（閒置連線不列入）");
+    assert!(took >= Duration::from_millis(300), "不得提前放棄：{took:?}");
+    assert!(took < Duration::from_millis(1500), "不得無界等待：{took:?}");
+}

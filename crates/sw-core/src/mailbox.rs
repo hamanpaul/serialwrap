@@ -19,7 +19,7 @@ use crate::human_console::human_tx::HumanTxTag;
 use crate::human_console::{ConsoleScanSnapshot, ConsoleTransportKind, ScanSource};
 use crate::login_fsm::LoginOutcome;
 use crate::op_runner::OpOutcome;
-use crate::session_core::SessionRequest;
+use crate::session_core::{FlashReject, FlashReply, ProbeGrant, ProbeId, SessionRequest};
 use crate::tx_writer::{OpId, TxReport};
 use crate::uart_bridge::{IoWorker, RxShared};
 use crate::Mono;
@@ -129,6 +129,14 @@ pub enum ControlEvent {
     ConsoleScan { scan: ConsoleScanSnapshot, source: ScanSource },
     /// P6 增補 #8（07 D-15(5)）：human TX pump 的結算。
     HumanTxCompleted { tag: HumanTxTag, report: TxReport },
+    /// P8 Task 8：FlashCoordinator 以 `probe_id` 要求進入認線 probe 窗口（fence `Probe(probe_id)`、human 輸入丟棄）。
+    FlashSyncProbeStart { probe_id: ProbeId, reply: FlashReply<Result<ProbeGrant, FlashReject>> },
+    /// P8 Task 8：未匹配（逾時、取消、未命中）時解除**同一** probe 的窗口；其他 probe 的事件忽略。
+    FlashProbeReleased { probe_id: ProbeId },
+    /// P8 Task 8：同一 probe 命中 → FLASHING（同 handle 模式切換：不換 bridge、不 drain）。
+    FlashSyncMatched { probe_id: ProbeId, reply: FlashReply<Result<(), FlashReject>> },
+    /// P8 Task 8：flasher 離開（holder 歸零）→ exit flashing；舊 probe 的遲到事件只回覆、不改狀態。
+    FlashHolderGone { probe_id: ProbeId, reply: FlashReply<()> },
 }
 
 /// 到期 timer（`Effect::Schedule` 的內容）。

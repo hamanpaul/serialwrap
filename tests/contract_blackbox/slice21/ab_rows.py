@@ -13,11 +13,9 @@ import pytest
 
 from bb_harness import ab_label, is_rust
 
-PY_NOT_APPLICABLE: dict[str, str] = {
-    "test_reject_paths_zero_tx[METHOD_NOT_FOUND]":
-        "OD-38：Python 已實作 file.push（Slice 2.4），缺參數回 INVALID_ARGS；METHOD_NOT_FOUND 只對 Rust Slice 2.1 範圍成立。"
-        "P8 實作 file.push 後本列改要求與 Python 一致的 INVALID_ARGS",
-}
+# P8 Task 6：Rust 已承接 file.push，`test_reject_paths_zero_tx[METHOD_NOT_FOUND]` 依原註記改要求與 Python 一致的
+# INVALID_ARGS，Python 輪不再標 not_applicable（兩邊同判定）。
+PY_NOT_APPLICABLE: dict[str, str] = {}
 PY_DF_DIFFERENCE: dict[str, str] = {
     "test_recovery_flushes_queue":
         "DF-21（OD-37）：Python 0.4.0 現行 recover flush 有 q0 仍被送出的競態；Rust 原子 flush（全部 FLUSHED_BY_RECOVERY、零 TX）",

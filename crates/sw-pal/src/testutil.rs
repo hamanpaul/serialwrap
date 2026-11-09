@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::console_mux::MuxHandleInner;
 use crate::console_pty::{ConsoleIo, ConsoleListener, PtyPair};
 use crate::traits::{PalError, PalResult};
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 use crate::traits::PalErrorKind;
 
 /// `tcgetattr` 的可比較摘要（raw 模式斷言用）。
@@ -250,4 +250,111 @@ pub fn comm_api_calls(_io: &dyn ConsoleIo) -> CommApiCalls {
 /// 對 peer 端（COMb）改 baud 並切換 DTR／RTS。LOCAL-WINDOWS-TODO（P6 Task 8）。
 pub fn toggle_peer_modem_lines(_port: &str) {
     todo!("P6 Task 8")
+}
+
+/// P8 Task 13（編排者 T9 裁決）：以「一般 open」扮演 flasher 的 tty 用戶端——`O_RDWR|O_NOCTTY|O_NONBLOCK`，
+/// 不設 `TIOCEXCL`（與 `ocp-mcu-upgrade` 等外部工具相同）。供 sw-core 的 `/dev/ttyMCU` 真 PTY 測試使用，
+/// 使其不需自行分支平台。非 Linux 平台一律回 `Unsupported`。
+pub struct PlainTty {
+    #[cfg(unix)]
+    file: std::fs::File,
+}
+
+impl PlainTty {
+    /// 一般 open（不設 TIOCEXCL）；tty 已被設為 exclusive 時一般使用者會得到 `EBUSY`。
+    pub fn open(path: &Path) -> PalResult<PlainTty> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+                .open(path)
+                .map_err(crate::traits::posix_io_error)?;
+            Ok(PlainTty { file })
+        }
+        #[cfg(not(unix))]
+        {
+            Err(PalError::plain(PalErrorKind::Unsupported, format!("PlainTty 在此平台不支援：{}", path.display())))
+        }
+    }
+
+    /// `ioctl(TIOCGEXCL)`：tty 目前是否為 exclusive 模式（Linux）。
+    pub fn exclusive(&self) -> PalResult<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let mut value: libc::c_int = 0;
+            // SAFETY: value 為 TIOCGEXCL 的輸出位置，fd 在 self.file 存活期間有效。
+            if unsafe { libc::ioctl(self.file.as_raw_fd(), libc::TIOCGEXCL, &mut value) } != 0 {
+                return Err(PalError::from_errno(crate::console_mux::posix::errno()));
+            }
+            Ok(value != 0)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(PalError::plain(PalErrorKind::Unsupported, "TIOCGEXCL 只在 Linux 支援"))
+        }
+    }
+
+    /// 寫完全部 bytes（非阻塞 fd：`EAGAIN` 時短暫等待，上限 5 s）。
+    pub fn write_all(&mut self, data: &[u8]) -> PalResult<()> {
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut off = 0usize;
+            while off < data.len() {
+                match self.file.write(&data[off..]) {
+                    Ok(n) => off += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(e) => return Err(crate::traits::posix_io_error(e)),
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = data;
+            Err(PalError::plain(PalErrorKind::Unsupported, "PlainTty 在此平台不支援"))
+        }
+    }
+
+    /// 讀到 `n` bytes 或 `timeout` 到期（實時）為止，回傳已讀到的 bytes（可能不足 `n`；讀到 EOF 亦提前返回）。
+    pub fn read_within(&mut self, n: usize, timeout: Duration) -> PalResult<Vec<u8>> {
+        #[cfg(unix)]
+        {
+            use std::io::Read;
+            let deadline = Instant::now() + timeout;
+            let mut out = Vec::with_capacity(n);
+            let mut buf = vec![0u8; n.max(1)];
+            while out.len() < n {
+                match self.file.read(&mut buf[..n - out.len()]) {
+                    Ok(0) => break,
+                    Ok(k) => out.extend_from_slice(&buf[..k]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(e) => return Err(crate::traits::posix_io_error(e)),
+                }
+            }
+            Ok(out)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (n, timeout);
+            Err(PalError::plain(PalErrorKind::Unsupported, "PlainTty 在此平台不支援"))
+        }
+    }
+}
+
+/// 一般 open `path` 後立刻讀 `TIOCGEXCL` 再關閉（tty 為 exclusive 時一般使用者的 open 會先以 `EBUSY` 失敗）。
+pub fn tty_exclusive(path: &Path) -> PalResult<bool> {
+    PlainTty::open(path)?.exclusive()
 }

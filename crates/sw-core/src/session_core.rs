@@ -17,6 +17,7 @@ use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 use sw_proto::pyre::valid_completion_regex;
 
 use crate::Mono;
+use crate::admission::AdmissionTicket;
 use crate::arbiter::{
     CmdOutcome, CommandRegistry, QueuedCommand, RunDecision, SessionQueue, SubmitOrigin, SubmitReq,
 };
@@ -25,6 +26,7 @@ use crate::capture::{
 };
 use crate::deferred::InvalidateReason;
 use crate::drain::{StopId, StopKind, StopOp, WorkerStoppedReceipt};
+use crate::file_transfer::FileTransferRequest;
 use crate::generations::{EpochAllocator, Generations};
 use crate::human_console::human_tx::HumanTxTag;
 use crate::human_console::out_ring::OutItem;
@@ -48,8 +50,50 @@ use crate::wal::WalWriter;
 
 /// P6 Task 6：human console 狀態機（分檔，見 `session_core/console.rs`）。
 mod console;
+/// P8 Task 8：FLASHING 仲裁（分檔，見 `session_core/flash.rs`）。
+mod flash;
 /// P6 Task 7：interactive lease 差量（分檔，見 `session_core/lease_p6.rs`）。
 mod lease_p6;
+/// P8 Task 6：`file.push`／`file.pull` 的閘門、前景槽與結果收斂（分檔，見 `session_core/file_xfer.rs`）。
+mod file_xfer;
+
+/// P8 Task 8：flash 認線 probe 的身分（FlashCoordinator 單調遞增配號；`TxPermit.probe_id` 與 `FlashMode::Probe` 共用）。
+pub type ProbeId = u64;
+
+/// 交接嘗試期間的 actor 事件暫存上限；滿載時回壓至 admission 凍結結束。
+const HANDOFF_DEFERRED_EVENTS_MAX: usize = 1024;
+
+/// P8 Task 8：`FlashSyncProbeStart`／`FlashSyncMatched` 的拒絕原因（09 計畫 Task 8 狀態轉移表）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlashReject {
+    /// profile 為 command_capable（非 flash 候選）。
+    CommandCapable,
+    /// 狀態不在 {READY, ATTACHED}。
+    BadState(SessionState),
+    /// RELEASED 轉移中的競態（release 已登記但尚未離開候選態）。
+    Released,
+    /// recovering 旗標為真。
+    Recovering,
+    /// Two-Phase Drain 進行中。
+    DrainInProgress,
+    /// 前景槽占用（SC-14）。
+    ForegroundBusy,
+    /// 已有 probe 或 FLASHING（fence `flash_mode != Off`）。
+    FlashAlreadyActive,
+    /// `FlashSyncMatched` 的 probe_id 與目前 `Probe(id)` 不符。
+    ProbeMismatch,
+}
+
+/// P8 Task 8：probe 授權（`epoch`＝授權當下的 `active_epoch`，TX permit 須帶同一 epoch）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeGrant {
+    pub epoch: u64,
+    pub probe_id: ProbeId,
+}
+
+/// P8 Task 8：flash 事件的回覆通道（P5 `Reply` 固定為 `Result<PyDict, PyErr>`，故另立；容量由呼叫端決定，actor 以
+/// `try_send` 回覆、永不阻塞）。
+pub type FlashReply<T> = crossbeam_channel::Sender<T>;
 
 /// daemon stderr／state.json 相關通知（Task 0 骨架型別）。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -228,6 +272,13 @@ pub enum SessionRequest {
     DeviceOnline {
         by_id: String,
         real_path: String,
+    },
+    /// P8 Task 6：`file.push`／`file.pull`（RPC 層已轉型；閘門、lease、前景槽在 actor 內原子判定）。
+    FileTransfer(FileTransferRequest),
+    /// P8 Task 14：RPC 等待逾時後，仍由實際傳輸 pending op 持有 admission ticket。
+    FileTransferAdmitted {
+        req: FileTransferRequest,
+        admission: Arc<AdmissionTicket>,
     },
     /// 只供測試（test-fakes）：直接設定狀態（FLASHING／RECOVERING 等無法由 RPC 到達者；Task 16 `force_session_state`）。
     #[cfg(feature = "test-fakes")]
@@ -468,6 +519,8 @@ pub struct SessionCore {
     quiet: QuietState,
     /// 進行中的登入 run（StartLogin 已發出、LoginFinished 未到）。
     login_run: Option<LoginRun>,
+    /// 暫時交接凍結期間收到的背景事件，回滾後依 actor 收到順序重播。
+    deferred_handoff_events: VecDeque<MailboxItem>,
     /// 前景命令為 reboot 類且尚未因 TX 結算 arm quiet（parity-amendments-2026-10-26 #55）。
     foreground_reboot: bool,
     drain_stalled: bool,
@@ -494,6 +547,8 @@ pub struct SessionCore {
     capture_env: CaptureEnv,
     /// reboot 後自動恢復（`_spawn_reboot_recovery` 的 actor 驅動版）。
     reboot_recovery: Option<RebootRecovery>,
+    /// file.* 的 admission ticket 保留至完成回放的 HumanTx 結算（P8 Task 14 handoff busy）。
+    replay_admission: Option<Arc<AdmissionTicket>>,
     /// force recover（clear＋reattach＋等待 READY 10 s）的等待者。
     /// force recover 的等待者（每個呼叫各自 10 次 × 1 s 輪詢，Python 各 thread 獨立 `_force_recover`）。
     force_recover: Vec<ForceRecover>,
@@ -551,6 +606,12 @@ pub struct SessionCore {
     /// 只供測試（test-fakes）：`last_error` 每次變更為非 None 時的觀察者（Task 16 `last_error_history`）。
     #[cfg(feature = "test-fakes")]
     last_error_observer: Option<Box<dyn Fn(&str) + Send>>,
+    /// P8 Task 8：目前授權的 flash probe（`FlashSyncProbeStart` 設定；同一 probe 的 Released／HolderGone 清除）。
+    flash_probe_id: Option<ProbeId>,
+    /// P8 Task 8：進 FLASHING 前的狀態（Python `flash_prev_state`；HolderGone 還原，I/O error／停止清除）。
+    flash_prev_state: Option<SessionState>,
+    /// P8 Task 8（SC-32）：Probe／FLASHING 期間延後的 `DeviceDetached` 原因（flash 結束後 reconcile）。
+    pending_detach: Option<DetachReason>,
 }
 
 struct PendingOpenStop {
@@ -702,6 +763,7 @@ impl SessionCore {
             quiet_since: None,
             quiet: QuietState::default(),
             login_run: None,
+            deferred_handoff_events: VecDeque::new(),
             foreground_reboot: false,
             drain_stalled: false,
             drain_timeout_epoch: None,
@@ -719,6 +781,7 @@ impl SessionCore {
             capture_observer: crate::capture::CaptureObserver::new(),
             capture_env: CaptureEnv::default(),
             reboot_recovery: None,
+            replay_admission: None,
             force_recover: Vec::new(),
             next_force_id: 0,
             force_poll_after_clear: Vec::new(),
@@ -749,6 +812,9 @@ impl SessionCore {
             fg_origin: None,
             #[cfg(feature = "test-fakes")]
             last_error_observer: None,
+            flash_probe_id: None,
+            flash_prev_state: None,
+            pending_detach: None,
         }
     }
 
@@ -770,6 +836,150 @@ impl SessionCore {
             panic!("測試注入的 session actor panic");
         }
 
+        self.dispatch_with_handoff(ev, now)
+    }
+
+    fn dispatch_with_handoff(&mut self, ev: MailboxItem, now: Mono) -> Effects {
+        match self.handoff_freeze_state() {
+            crate::admission::HandoffFreezeState::Pending => {
+                if Self::is_handoff_bypass_event(&ev) {
+                    self.dispatch_event(ev, now, false)
+                } else {
+                    self.defer_handoff_event(ev, now)
+                }
+            }
+            crate::admission::HandoffFreezeState::Permanent => {
+                self.dispatch_handoff_permanent(ev, now)
+            }
+            crate::admission::HandoffFreezeState::Open => {
+                let mut effects = self.replay_handoff_events(now);
+                match self.handoff_freeze_state() {
+                    crate::admission::HandoffFreezeState::Open => {
+                        effects.0.extend(self.dispatch_event(ev, now, true).0);
+                    }
+                    crate::admission::HandoffFreezeState::Pending => {
+                        if Self::is_handoff_bypass_event(&ev) {
+                            effects.0.extend(self.dispatch_event(ev, now, false).0);
+                        } else {
+                            effects.0.extend(self.defer_handoff_event(ev, now).0);
+                        }
+                    }
+                    crate::admission::HandoffFreezeState::Permanent => {
+                        effects
+                            .0
+                            .extend(self.dispatch_handoff_permanent(ev, now).0);
+                    }
+                }
+                effects
+            }
+        }
+    }
+
+    fn is_handoff_bypass_event(ev: &MailboxItem) -> bool {
+        matches!(
+            ev,
+            MailboxItem::Control(ControlEvent::Request { .. })
+                | MailboxItem::Control(ControlEvent::Shutdown { .. })
+                | MailboxItem::Control(ControlEvent::FlashSyncProbeStart { .. })
+                | MailboxItem::Control(ControlEvent::FlashProbeReleased { .. })
+                | MailboxItem::Control(ControlEvent::FlashSyncMatched { .. })
+                | MailboxItem::Control(ControlEvent::FlashHolderGone { .. })
+        )
+    }
+
+    /// 已成立的凍結仍須讓既有工作與 drain 協定收斂；這些是完成回條／生命週期控制，不是背景狀態輸入。
+    fn is_handoff_lifecycle_event(ev: &MailboxItem) -> bool {
+        matches!(
+            ev,
+            MailboxItem::Control(
+                ControlEvent::DeviceDetached { .. }
+                    | ControlEvent::EvictCapture { .. }
+                    | ControlEvent::ConsoleCountChanged { .. }
+                    | ControlEvent::BridgeOpened { .. }
+                    | ControlEvent::UartIoError { .. }
+                    | ControlEvent::UartTxCompleted { .. }
+                    | ControlEvent::DrainDataBarrier { .. }
+                    | ControlEvent::WorkerStopped(_)
+                    | ControlEvent::WorkerDrainTimeout { .. }
+                    | ControlEvent::OpFinished { .. }
+                    | ControlEvent::LoginFinished { .. }
+                    | ControlEvent::Timer(_)
+                    | ControlEvent::StateCommitted { .. }
+                    | ControlEvent::HumanTxCompleted { .. }
+                    | ControlEvent::FlashSyncProbeStart { .. }
+                    | ControlEvent::FlashProbeReleased { .. }
+                    | ControlEvent::FlashSyncMatched { .. }
+                    | ControlEvent::FlashHolderGone { .. }
+            )
+                | MailboxItem::Data(DataEvent::ConsoleDisconnected { .. })
+        )
+    }
+
+    fn defer_handoff_event(&mut self, ev: MailboxItem, now: Mono) -> Effects {
+        if self.deferred_handoff_events.len() >= HANDOFF_DEFERRED_EVENTS_MAX {
+            self.deps.registry.admission_gate().wait_handoff_settled();
+            return self.dispatch_with_handoff(ev, now);
+        }
+        self.deferred_handoff_events.push_back(ev);
+        Effects(Vec::new())
+    }
+
+    fn replay_handoff_events(&mut self, now: Mono) -> Effects {
+        let mut effects = Effects(Vec::new());
+        loop {
+            match self.handoff_freeze_state() {
+                crate::admission::HandoffFreezeState::Open => {
+                    let Some(ev) = self.deferred_handoff_events.pop_front() else {
+                        break;
+                    };
+                    effects.0.extend(self.dispatch_event(ev, now, true).0);
+                }
+                crate::admission::HandoffFreezeState::Pending => break,
+                crate::admission::HandoffFreezeState::Permanent => {
+                    effects
+                        .0
+                        .extend(self.discard_handoff_events_permanent(now).0);
+                    break;
+                }
+            }
+        }
+        effects
+    }
+
+    fn discard_handoff_events_permanent(&mut self, now: Mono) -> Effects {
+        let mut effects = Effects(Vec::new());
+        while let Some(ev) = self.deferred_handoff_events.pop_front() {
+            if Self::is_handoff_lifecycle_event(&ev) {
+                effects.0.extend(self.dispatch_event(ev, now, false).0);
+            }
+        }
+        effects
+    }
+
+    /// 已受理操作的收尾不得因永久凍結而失聯。Mailbox 全量分類（Python 對照位置見本項回報）：
+    /// (a) 抑制會開啟或推進新工作：Control::{Request, DeviceAttached, DeviceMissing, Tick, ConsoleConnected,
+    ///     ConsoleScan}、Data::ConsoleInputBytes。Request 仍分派，但只能回唯讀資料或 admission 拒絕；不啟動新副作用。
+    ///     Python 凍結 readiness／attach／lease／human TX：session_manager.py:1127-1137, 2488-2504, 2572-2579。
+    /// (b) 保留已受理操作的完成、逾時與收尾：Control::{Shutdown, DeviceDetached, EvictCapture,
+    ///     ConsoleCountChanged, BridgeOpened, UartIoError, UartTxCompleted, DrainDataBarrier, WorkerStopped,
+    ///     WorkerDrainTimeout, OpFinished, LoginFinished, StateCommitted, HumanTxCompleted, FlashSyncProbeStart,
+    ///     FlashProbeReleased, FlashSyncMatched, FlashHolderGone}、Timer::{BootQuietExpired, LeaseExpiry,
+    ///     DrainTimeout, ForceRecoverPoll}、Data::ConsoleDisconnected。BridgeOpened／LoginFinished 僅結算凍結前已
+    ///     接受的開啟／探測，不在凍結後繼續 readiness。Python 收尾對照：session_manager.py:1734-1792, 4443-4462,
+    ///     8042-8064, 8067-8088；console close：uart_io.py:1505-1525。
+    /// (c) Data::UartRxChunk 依 rulings/s2.md「P8X-9e51abd-1 降為 Low」維持現況，不在本項改 RX 記帳
+    ///     （Python 對照：session_manager.py:4622-4670）。
+    fn dispatch_handoff_permanent(&mut self, ev: MailboxItem, now: Mono) -> Effects {
+        let mut effects = self.discard_handoff_events_permanent(now);
+        if Self::is_handoff_bypass_event(&ev)
+            || Self::is_handoff_lifecycle_event(&ev)
+        {
+            effects.0.extend(self.dispatch_event(ev, now, false).0);
+        }
+        effects
+    }
+
+    fn dispatch_event(&mut self, ev: MailboxItem, now: Mono, finalize: bool) -> Effects {
         self.now_cache = now;
         let mut effects = Effects(Vec::new());
         match ev {
@@ -791,19 +1001,12 @@ impl SessionCore {
                     self.device_present = false;
                     self.known_real_path = None;
                 }
-                if by_id == self.profile.device_by_id
-                    && self.state != SessionState::Released
-                    && self.state != SessionState::Detached
-                {
-                    let (kind, error) = match reason {
-                        DetachReason::Removed if self.state == SessionState::Attaching => {
-                            (StopKind::Removed, "DEVICE_REMOVED_DURING_ATTACH")
-                        }
-                        DetachReason::Removed => (StopKind::Removed, "DEVICE_REMOVED"),
-                        DetachReason::Rebound => (StopKind::Rebound, "DEVICE_REBOUND_REQUIRED"),
-                    };
-                    self.set_last_error(Some(error.to_string()), None);
-                    effects.0.extend(self.begin_stop(kind, None, now).0);
+                // P8 Task 9（編排者裁決 2026-11-08）：manager 已標 flash-critical、ProbeStart 尚未到時對齊 Python 略過。
+                // P8 Task 8（SC-32）：Probe／FLASHING 期間延後到 flash 結束後再 reconcile（#83 RACE-2）。
+                let own = by_id == self.profile.device_by_id;
+                let skipped = own && self.flash_critical_skips_detach();
+                if !skipped && (!own || !self.flash_defer_detach(reason)) {
+                    effects.0.extend(self.device_detached(&by_id, reason, now));
                 }
             }
             MailboxItem::Control(ControlEvent::DeviceMissing) => {
@@ -840,6 +1043,8 @@ impl SessionCore {
                     effects
                         .0
                         .extend(self.begin_stop(StopKind::IoError, None, now).0);
+                    // P8 Task 8（SC-32）：begin_stop 已清 flash_mode；Probe／FLASHING 期間延後的 detach 併入本次 drain。
+                    effects.0.extend(self.flash_reconcile_detach(now));
                 }
             }
             MailboxItem::Control(ControlEvent::UartTxCompleted {
@@ -960,6 +1165,22 @@ impl SessionCore {
             MailboxItem::Control(ControlEvent::HumanTxCompleted { tag, report }) => {
                 effects.0.extend(self.human_tx_completed(tag, report, now));
             }
+            // P8 Task 8 FLASHING 仲裁（`session_core/flash.rs`）。
+            MailboxItem::Control(ControlEvent::FlashSyncProbeStart { probe_id, reply }) => {
+                effects.0.extend(self.flash_probe_start(probe_id, reply, now));
+            }
+            MailboxItem::Control(ControlEvent::FlashProbeReleased { probe_id }) => {
+                effects.0.extend(self.flash_probe_released(probe_id, now));
+            }
+            MailboxItem::Control(ControlEvent::FlashSyncMatched { probe_id, reply }) => {
+                effects.0.extend(self.flash_sync_matched(probe_id, reply, now));
+            }
+            MailboxItem::Control(ControlEvent::FlashHolderGone { probe_id, reply }) => {
+                effects.0.extend(self.flash_holder_gone(probe_id, reply, now));
+            }
+        }
+        if !finalize {
+            return effects;
         }
         if std::mem::take(&mut self.hold_release_kick) && !self.fg_slot_busy() {
             effects.0.extend(self.start_next(now));
@@ -1265,6 +1486,8 @@ impl SessionCore {
     /// Two-Phase Drain 第一階段的發起點（Task 12；SC-04、arch §5.5）：`kind` 與 `waiter` 凍結簽章（P6 07 計畫依此呼叫）。
     pub fn begin_stop(&mut self, kind: StopKind, waiter: Option<Reply>, now: Mono) -> Effects {
         let mut effects = Effects(Vec::new());
+        // P8 Task 8（SC-32）：停止是 flash 結束路徑之一，無條件清 Fence／Ownership 的 flash_mode。
+        self.flash_end_for_stop();
         // 再探進行中被 drain 搶進：等待者照 Python `attach_session` 的 pending drain 分支回 SESSION_RECOVERING。
         if let Some(run) = self.login_run.take() {
             for (waiter, _) in run.waiters {
@@ -1352,6 +1575,8 @@ impl SessionCore {
                     f.owner_gen = self.generations.owner_gen;
                     f.fsm_gen = self.generations.fsm_gen;
                 });
+                // P8 Task 5：與 fence 凍結同處喚醒檔案傳輸等待（不動 login run 的取消世代）。
+                self.deps.rx.cancel_transfer_runs();
                 if !already_released {
                     self.set_state(SessionState::Recovering, now);
                 }
@@ -1418,6 +1643,9 @@ impl SessionCore {
             f.owner_gen = self.generations.owner_gen;
             f.fsm_gen = self.generations.fsm_gen;
         });
+        // P8 Task 5（brief 不符 #1）：drain Phase 1 喚醒進行中的檔案傳輸等待（`RunCancel::watching_transfers`），
+        // 其 TX 已由上方凍結擋下；不呼叫 `cancel_login_runs`（P7 login 行為不變）。
+        self.deps.rx.cancel_transfer_runs();
         let code = if kind == StopKind::Shutdown {
             "FLUSHED_BY_SHUTDOWN"
         } else {
@@ -1791,6 +2019,25 @@ impl SessionCore {
         }
     }
 
+    /// `DeviceDetached` 的套用（Python `_detach_by_id`）：非 RELEASED／DETACHED 時設 last_error 並進 drain。
+    fn device_detached(&mut self, by_id: &str, reason: DetachReason, now: Mono) -> Vec<Effect> {
+        if by_id != self.profile.device_by_id
+            || self.state == SessionState::Released
+            || self.state == SessionState::Detached
+        {
+            return Vec::new();
+        }
+        let (kind, error) = match reason {
+            DetachReason::Removed if self.state == SessionState::Attaching => {
+                (StopKind::Removed, "DEVICE_REMOVED_DURING_ATTACH")
+            }
+            DetachReason::Removed => (StopKind::Removed, "DEVICE_REMOVED"),
+            DetachReason::Rebound => (StopKind::Rebound, "DEVICE_REBOUND_REQUIRED"),
+        };
+        self.set_last_error(Some(error.to_string()), None);
+        self.begin_stop(kind, None, now).0
+    }
+
     fn set_state(&mut self, state: SessionState, now: Mono) {
         if self.state != state {
             self.last_state_change_at = Some(self.wall_iso());
@@ -1929,10 +2176,9 @@ impl SessionCore {
                     result.insert("already_released", PyValue::from(true));
                     return vec![Effect::Reply(reply, Ok(result))];
                 }
-                if self.state == SessionState::Flashing {
-                    let mut result = self.error_session("FLASHING_BUSY", now);
-                    result.insert("selector", PyValue::from(self.profile.com.clone()));
-                    return vec![Effect::Reply(reply, Ok(result))];
+                if self.flash_busy() {
+                    // P8 Task 8：FLASHING 或 probe 窗口／flash-critical（Python `_flash_busy_locked`）。
+                    return vec![Effect::Reply(reply, Ok(self.flash_busy_reply(now)))];
                 }
                 let another_drain_is_active = self
                     .stop
@@ -1990,6 +2236,10 @@ impl SessionCore {
             SessionRequest::ConsoleList => {
                 vec![Effect::Reply(reply, Ok(self.console_list_request(now)))]
             }
+            // P8 Task 8：FLASHING 或 probe 窗口不得 detach bridge（Python `clear_session` 的 `_flash_busy_locked`）。
+            SessionRequest::Clear if self.flash_busy() => {
+                vec![Effect::Reply(reply, Ok(self.flash_busy_reply(now)))]
+            }
             SessionRequest::Clear => self.begin_stop(StopKind::Clear, Some(reply), now).0,
             SessionRequest::Recover { timeout_s, force } => {
                 self.recover_request(timeout_s, force, reply, now)
@@ -2031,6 +2281,10 @@ impl SessionCore {
                 let mut effects = vec![Effect::Reply(reply, Ok(self.ok_session(now)))];
                 effects.extend(opened);
                 effects
+            }
+            SessionRequest::FileTransfer(req) => self.file_transfer_request(req, None, reply, now),
+            SessionRequest::FileTransferAdmitted { req, admission } => {
+                self.file_transfer_request(req, Some(admission), reply, now)
             }
             SessionRequest::MarkAttachStalled { epoch } => {
                 if self.state != SessionState::Released {
@@ -2471,17 +2725,9 @@ impl SessionCore {
     /// P5-T16：`bind_session`（session 層）：同值冪等、有 bridge 先 `StopKind::Bind` drain、否則立即改綁。
     /// 改綁後一律 DETACHED＋`DEVICE_NOT_FOUND`；裝置在線時由 manager 隨後送 `DeviceAttached` 進 ATTACHING。
     fn bind_request(&mut self, by_id: String, reply: Reply, now: Mono) -> Vec<Effect> {
-        if self.state == SessionState::Flashing {
-            // Python `bind_session` 鍵序：ok／error_code／selector／session。
-            return vec![Effect::Reply(
-                reply,
-                Ok(pydict! {
-                    "ok" => false,
-                    "error_code" => "FLASHING_BUSY",
-                    "selector" => self.profile.com.clone(),
-                    "session" => self.public(now, &self.public_ctx())
-                }),
-            )];
+        if self.flash_busy() {
+            // Python `bind_session` 鍵序：ok／error_code／selector／session（P8 Task 8：含 probe 窗口）。
+            return vec![Effect::Reply(reply, Ok(self.flash_busy_reply(now)))];
         }
         if self.generations.conn_epoch.is_some()
             && self.profile.device_by_id == by_id
@@ -3085,6 +3331,13 @@ impl SessionCore {
             self.set_state(SessionState::Attached, now);
             return effects;
         }
+        if self.handoff_freeze_state() == crate::admission::HandoffFreezeState::Permanent {
+            // bridge open 是凍結前已受理工作的完成；接上 worker 並回到 ATTACHED，但不啟動新的 login/readiness TX。
+            self.set_last_error(None, None);
+            self.adopt_bridge(now);
+            self.set_state(SessionState::Attached, now);
+            return effects;
+        }
         let quiet_blocks = boot_quiet_blocks_probe(&self.quiet, &self.profile, now);
         let (plan, synthesized) = self.choose_plan(quiet_blocks, self.pending_auto_login);
         match plan {
@@ -3243,6 +3496,9 @@ impl SessionCore {
             .is_some_and(|run| run.epoch == epoch && run.fsm_gen == fsm_gen)
         {
             return Vec::new();
+        }
+        if self.handoff_freeze_state() == crate::admission::HandoffFreezeState::Permanent {
+            return self.discard_handoff_login_run(now);
         }
         if self
             .login_run
@@ -3673,7 +3929,58 @@ impl SessionCore {
         }
     }
 
+    fn handoff_freeze_state(&self) -> crate::admission::HandoffFreezeState {
+        use crate::admission::HandoffFreezeState;
+
+        let admission = self.deps.registry.admission_gate();
+        let mut state = admission.handoff_freeze_state();
+        if state == HandoffFreezeState::Open && self.deps.fence.with(|fence| fence.handoff_frozen) {
+            state = admission.handoff_freeze_state();
+            if state == HandoffFreezeState::Open {
+                state = HandoffFreezeState::Permanent;
+            }
+        }
+        state
+    }
+
+    fn handoff_frozen(&self) -> bool {
+        self.handoff_freeze_state() != crate::admission::HandoffFreezeState::Open
+    }
+
+    fn discard_handoff_login_run(&mut self, now: Mono) -> Vec<Effect> {
+        let Some(run) = self.login_run.take() else {
+            return Vec::new();
+        };
+        match run.kind {
+            LoginRunKind::AutoReprobe => self.reprobe.inflight = false,
+            LoginRunKind::RebootRecovery => {
+                self.reboot_recovery = None;
+                self.recovering = false;
+            }
+            LoginRunKind::Attach if self.state == SessionState::Attaching => {
+                self.adopt_bridge(now);
+                self.set_state(SessionState::Attached, now);
+            }
+            LoginRunKind::Attach | LoginRunKind::Reprobe => {}
+        }
+        let response = pydict! {
+            "ok" => false,
+            "error_code" => "FLUSHED_BY_SHUTDOWN",
+            "reason" => "handoff_frozen",
+            "session" => self.session_value(now),
+        };
+        run.waiters
+            .into_iter()
+            .map(|(reply, _kind)| Effect::Reply(reply, Ok(response.clone())))
+            .collect()
+    }
+
     fn tick(&mut self, now: Mono) -> Vec<Effect> {
+        match self.handoff_freeze_state() {
+            crate::admission::HandoffFreezeState::Pending => return Vec::new(),
+            crate::admission::HandoffFreezeState::Permanent => return Vec::new(),
+            crate::admission::HandoffFreezeState::Open => {}
+        }
         let mut effects = Vec::new();
         self.expire_reconfirm(now);
         // SC-13：1 s tick 主動收回到期的 agent lease（`_expire_interactive_leases_tick`，留 tombstone）。
@@ -3686,7 +3993,11 @@ impl SessionCore {
         }
         effects.extend(self.reboot_recovery_tick(now));
         effects.extend(self.reprobe_tick(now));
-        let flash_off = self.deps.fence.with(|f| f.flash_mode == FlashMode::Off);
+        // P8 Task 8（SC-35）：probe 窗口與 manager 標記的 flash-critical 期間都不升 READY（Python `_flash_busy_locked`）。
+        let flash_off = self
+            .deps
+            .fence
+            .with(|f| f.flash_mode == FlashMode::Off && !f.flash_critical);
         if self.is_passthrough()
             && self.state == SessionState::Attached
             && self.generations.conn_epoch.is_some()
@@ -3879,6 +4190,9 @@ impl SessionCore {
                 .is_some_and(|run| run.epoch == epoch && run.fsm_gen == fsm_gen)
         {
             return Vec::new();
+        }
+        if self.handoff_freeze_state() == crate::admission::HandoffFreezeState::Permanent {
+            return self.discard_handoff_login_run(now);
         }
         // 結果一律回填（不得丟棄，否則 run／inflight 永久殘留、等待者永不回覆；審查 c11aa89_92e0223 H-1）。
         // Python `_probe_existing_bridge` 只依 probe 實際結果收斂、不看 login_gen：probe 期間 banner 才 arm 仍可回 ok → READY
@@ -4645,6 +4959,9 @@ impl SessionCore {
             Ok(payload) => payload,
             Err(error) => return vec![Effect::Reply(reply, Err(error))],
         };
+        if let Some(result) = self.flash_silent_interactive_send(id, payload.len(), now) {
+            return vec![Effect::Reply(reply, Ok(result))];
+        }
         let owner = self
             .lease
             .as_ref()
@@ -4709,6 +5026,12 @@ impl SessionCore {
 
     /// 05 §5.1 execute-time 順序（completion regex → FLASHING → 非 READY → gate → recovering → lease）。
     fn execute_time_reject(&mut self, command: &QueuedCommand, now: Mono) -> Option<PyDict> {
+        self.execute_time_gate_reject(command, now)
+            .or_else(|| self.execute_time_lease_reject(command, now))
+    }
+
+    /// execute-time 順序前段（completion regex → FLASHING → 非 READY → gate → recovering）。
+    fn execute_time_gate_reject(&mut self, command: &QueuedCommand, now: Mono) -> Option<PyDict> {
         let completion = command
             .req
             .completion_regex
@@ -4717,7 +5040,6 @@ impl SessionCore {
         if !valid_completion_regex(completion.as_ref()) {
             return Some(pydict! { "ok" => false, "error_code" => "INVALID_COMPLETION_REGEX" });
         }
-        let mode = normalized_mode(&command.req.mode);
         if self.state == SessionState::Flashing {
             return Some(self.selector_error("FLASHING_BUSY"));
         }
@@ -4743,6 +5065,15 @@ impl SessionCore {
         if self.recovering {
             return Some(pydict! { "ok" => false, "error_code" => "SESSION_RECOVERING" });
         }
+        None
+    }
+
+    /// execute-time 順序的 lease 段（`_refresh_interactive_locked` → 非 interactive 遇 lease：agent 遇 human lease 放行）。
+    fn execute_time_lease_reject(&mut self, command: &QueuedCommand, now: Mono) -> Option<PyDict> {
+        let mode = normalized_mode(&command.req.mode);
+        // 與 `execute_time_gate_reject` 共用可信 human 判定（OD-74、rulings s2 D5；Python `session_manager.py:6573-6588`
+        // 的 quiet gate 與 lease 判斷同一個 `human`）：RPC 的 `trusted_human` OR HumanConsole，永不看 `source` 字首。
+        let human = command.req.is_trusted_human();
         self.refresh_lease(now);
         if let Some(lease) = self.lease.as_ref() {
             if mode != "interactive" && !(!human && lease.is_human()) {
@@ -4759,6 +5090,11 @@ impl SessionCore {
 
     fn start_next(&mut self, now: Mono) -> Vec<Effect> {
         let mut effects = Vec::new();
+        // P8 Task 6（審查 P8X-7af8adc-1）：file transfer 占用前景槽時照常出列並以 SESSION_BUSY 結束，不延後。
+        if self.state == SessionState::Ready && self.file_transfer_in_foreground() {
+            self.reject_queued_during_file_transfer(now);
+            return effects;
+        }
         // 增補 #26：回放保留（07 D-22）期間同樣不出列。
         if self.fg_slot_busy() || self.state != SessionState::Ready {
             return effects;
@@ -5323,6 +5659,19 @@ impl SessionCore {
             Some(PendingOp::Recover { reply }) => {
                 effects.extend(self.finish_recover(reply, outcome, now));
             }
+            Some(PendingOp::FileTransfer { reply, admission }) => {
+                // Python `finally`：resume human → `_finish_foreground_operation`（admission 開、回放）後才回應。
+                let result = self.file_transfer_result(outcome, now);
+                self.command_fg_finish(&mut effects);
+                if self.human.replay_hold.as_ref().is_some_and(|hold| !hold.revoked) {
+                    // file.push／pull 的 admission busy 涵蓋 command_fg_finish 建立的非同步回放；
+                    // 最後一筆 HumanTxCompleted 結算 hold 時才歸還，對齊 Python 同步回放的票據生命週期。
+                    self.replay_admission = admission;
+                } else {
+                    drop(admission);
+                }
+                effects.push(Effect::Reply(reply, result));
+            }
             Some(other) => effects.extend(self.answer_op(other, outcome, now, true)),
             None => {
                 if let Some(cmd_id) = grant.cmd_id {
@@ -5445,6 +5794,12 @@ impl SessionCore {
                 vec![Effect::Reply(reply, result)]
             }
             PendingOp::Recover { reply } => vec![Effect::Reply(reply, Ok(prompt_timeout_none()))],
+            // P8 Task 6：drain／重連已清掉前景（stale）時只回覆，不再套用 session 副作用（ownership 已由 Phase 1 重設）。
+            PendingOp::FileTransfer { reply, admission } => {
+                let result = self.file_transfer_result(outcome, now);
+                drop(admission);
+                vec![Effect::Reply(reply, result)]
+            }
             PendingOp::Command { .. } | PendingOp::InteractiveCmd { .. } => Vec::new(),
         }
     }
@@ -5579,8 +5934,7 @@ impl SessionCore {
 
     fn recover_request(&mut self, timeout_s: f64, force: bool, reply: Reply, now: Mono) -> Vec<Effect> {
         use crate::recover::{RecoverPlan, RecoverRequest, plan_recover, plan_resets_progress};
-        let flash_busy = self.state == SessionState::Flashing
-            || self.deps.fence.with(|f| f.flash_mode != FlashMode::Off);
+        let flash_busy = self.flash_busy();
         let plan = plan_recover(
             self.state.as_str(),
             self.generations.conn_epoch.is_some(),
@@ -6417,6 +6771,11 @@ enum PendingOp {
     InteractiveOpen {
         reply: Reply,
         result: PyDict,
+    },
+    /// P8 Task 6：`file.push`／`file.pull`（Python 前景 operation `kind="file"`：計入 `foreground_busy`）。
+    FileTransfer {
+        reply: Reply,
+        admission: Option<Arc<AdmissionTicket>>,
     },
 }
 

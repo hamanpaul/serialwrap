@@ -303,6 +303,8 @@ pub struct ServiceRig {
     pub version: String,
     /// P6 Task 10：`with_console_backend` 的 console 替身工廠（其餘建構子為 `None`）。
     pub console: Option<Arc<RigPtyFactory>>,
+    /// P8 Task 10：`with_flash` 的 flash 端點組件（其餘建構子為 `None`）。
+    pub flash: Option<FlashParts>,
 }
 
 /// `targets:` 一列。
@@ -479,6 +481,7 @@ impl ServiceRig {
             devices,
             version: RIG_VERSION.to_string(),
             console,
+            flash: None,
         };
         for com in &spec.wait_ready {
             rig.wait_state(com, "READY");
@@ -671,4 +674,326 @@ pub fn deferred_methods(yaml: &str) -> Vec<String> {
         out.push(name);
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// P8 Task 10：flash 端點 rig（`mcu_rpc.rs`；計畫 09 Task 10 的 `ServiceRig`＋fake 平台）
+// ---------------------------------------------------------------------------
+
+/// TI SBL 的 auto-baud sync 與 ACK（`tests/contract_blackbox/fakemcu.py`）。
+pub const MCU_SYNC: &[u8] = b"\x55\x55";
+pub const MCU_ACK: &[u8] = b"\x00\xcc";
+/// flash rig 的端點 symlink（記憶體替身；對應 `RUN_DIR/dev/ttyMCU`）。
+pub const FLASH_LINK: &str = "/fake/run/dev/ttyMCU";
+/// 不在裝置快照中的 by-id（該 target 停 DETACHED）。
+pub const BY_ID_C: &str = "/s/by-id/usb-C";
+
+/// shell 模板 `t`＋passthrough 模板 `m`（`m` 非 command_capable，為 flash 偵測候選）。
+pub const FLASH_TEMPLATES: &str = "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\n  m:\n    platform: passthrough\n    prompt_regex: '(?m)^MCU> '\n    ready_probe: ''\n";
+
+/// flash rig 裝置的假 DUT 行為。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DevKind {
+    /// shell 假 DUT（`install_shell_replies`）。
+    Shell,
+    /// MCU 線：已確認 TX 出現 [`MCU_SYNC`] 時回一次 [`MCU_ACK`]。
+    Mcu,
+    /// 不回任何 bytes。
+    Silent,
+}
+
+/// `ServiceRig::with_flash` 的組裝選項。
+pub struct FlashSetup {
+    /// profiles.yaml 全文（通常為 [`FLASH_TEMPLATES`]＋`targets:`）。
+    pub yaml: String,
+    /// 裝置快照（by_id, 實體路徑, 行為；依列舉順序）。
+    pub devices: Vec<(String, String, DevKind)>,
+    /// `Platform.caps.flash_endpoint`（false＝Windows／無端點：`FlashEndpoint::start` 回 `Ok(None)`）。
+    pub caps_flash: bool,
+    /// coordinator 的 Clock（manager 仍用 rig 的 FakeClock）。
+    pub coord_clock: Arc<dyn sw_pal::traits::Clock>,
+    /// 等待 (COM, state) 成立後才回傳。
+    pub wait_states: Vec<(String, String)>,
+}
+
+/// `FlashSetup.yaml` 的 `targets:` 一列。
+pub fn flash_target_line(com: &str, profile: &str, by_id: &str) -> String {
+    format!("  - {{com: {com}, profile: {profile}, device_by_id: {by_id}}}\n")
+}
+
+/// 端點 PTY 的 console 工廠替身：`create_pty` 的 master 為 `FakeConsoleIo`（測試端以 `FakeConsoleHandle` 扮演
+/// flasher：`push_rx`＝flasher 寫入、`take_tx`＝寫給 flasher 的 bytes），slave 路徑沿用 `FakeConsoleFactory` 的
+/// `/fake/pts/<n>`；`link`／`unlink` 記錄於記憶體表（`fail_link` 時 `link` 回錯）。其餘方法委派 `FakeConsoleFactory`。
+pub struct RigFlashConsole {
+    fake: sw_pal::fakes::console::FakeConsoleFactory,
+    masters: Mutex<Vec<sw_pal::fakes::console::FakeConsoleHandle>>,
+    links: Mutex<BTreeMap<PathBuf, String>>,
+    fail_link: std::sync::atomic::AtomicBool,
+    /// 每次 `link` 呼叫時的回呼（daemon 測試記錄啟動序用）。
+    on_link: Mutex<Option<Box<dyn Fn(&Path) + Send + Sync>>>,
+}
+
+impl RigFlashConsole {
+    pub fn new() -> Arc<RigFlashConsole> {
+        Arc::new(RigFlashConsole {
+            fake: sw_pal::fakes::console::FakeConsoleFactory::new(ConsoleKind::Pty),
+            masters: Mutex::new(Vec::new()),
+            links: Mutex::new(BTreeMap::new()),
+            fail_link: std::sync::atomic::AtomicBool::new(false),
+            on_link: Mutex::new(None),
+        })
+    }
+
+    /// 之後的 `link` 一律回 `[Errno 20] Not a directory`（模擬端點目錄不可建立）。
+    pub fn fail_link(&self) {
+        self.fail_link.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn set_on_link(&self, f: Box<dyn Fn(&Path) + Send + Sync>) {
+        *self.on_link.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+    }
+
+    /// 目前的 symlink 表（link 路徑 → slave 路徑）。
+    pub fn links(&self) -> BTreeMap<PathBuf, String> {
+        self.links.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// `create_pty` 次數。
+    pub fn pty_count(&self) -> usize {
+        self.masters.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// 最近一次 `create_pty` 的 master 對端（flasher 視角）。
+    pub fn flasher(&self) -> sw_pal::fakes::console::FakeConsoleHandle {
+        self.masters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last()
+            .cloned()
+            .expect("端點 PTY 尚未建立")
+    }
+}
+
+impl ConsoleTransportFactory for RigFlashConsole {
+    fn kind(&self) -> ConsoleKind {
+        ConsoleKind::Pty
+    }
+    fn create_pty(&self) -> PalResult<sw_pal::PtyPair> {
+        let mut pair = self.fake.pty_pair_from(sw_pal::fakes::console::FakeIo::unbounded());
+        let (master, handle) = sw_pal::fakes::console::FakeConsoleIo::new();
+        pair.master = Box::new(master);
+        self.masters.lock().unwrap_or_else(|e| e.into_inner()).push(handle);
+        Ok(pair)
+    }
+    fn bind_tcp_console(&self) -> PalResult<Box<dyn sw_pal::console_pty::ConsoleListener>> {
+        self.fake.bind_tcp_console()
+    }
+    fn held_slave_paths(&self) -> Option<std::collections::HashSet<String>> {
+        self.fake.held_slave_paths()
+    }
+    fn slave_path_exists(&self, path: &str) -> bool {
+        self.fake.slave_path_exists(path)
+    }
+    fn new_mux(&self) -> PalResult<Box<dyn sw_pal::console_mux::ConsoleMux>> {
+        self.fake.new_mux()
+    }
+    fn link(&self, slave_path: &str, link: &Path) -> PalResult<()> {
+        if self.fail_link.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(PalError::from_errno(20));
+        }
+        self.links
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(link.to_path_buf(), slave_path.to_string());
+        if let Some(f) = self.on_link.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            f(link);
+        }
+        Ok(())
+    }
+    fn unlink(&self, link: &Path) -> PalResult<()> {
+        self.links.lock().unwrap_or_else(|e| e.into_inner()).remove(link);
+        Ok(())
+    }
+    fn tty_setraw(&self, _slave: &sw_pal::console_pty::PtySlaveRef) -> PalResult<()> {
+        Ok(())
+    }
+    fn tcgetattr_speed(&self, _slave: &sw_pal::console_pty::PtySlaveRef) -> PalResult<sw_pal::console_pty::TermSpeed> {
+        Err(PalError::plain(PalErrorKind::Io, "tcgetattr failed"))
+    }
+}
+
+/// `with_flash` 的 flash 端點組件。
+pub struct FlashParts {
+    pub state: Arc<sw_daemon::service::FlashState>,
+    pub coord: Arc<sw_core::flash_endpoint::FlashCoordinator>,
+    pub console: Arc<RigFlashConsole>,
+}
+
+/// 不做任何事的喚醒器（`EndpointShutdown` 的初始 waker；端點 master 的 waker 由 `FlashEndpoint::start` 另登記）。
+struct NoWake;
+
+impl sw_pal::traits::IoWaker for NoWake {
+    fn wake(&self) {}
+}
+
+impl ServiceRig {
+    /// P8 Task 10：真 `SessionManager`＋真 `FlashCoordinator`＋真 `FlashEndpoint`（記憶體 PTY），以
+    /// `Service::attach_flash` 掛上（與 daemon_main 同序：coordinator 先於 bootstrap attach 建立——RX observer 於 bridge
+    /// 建立時取快照；端點於 bootstrap attach 之後才 start）。
+    pub fn with_flash(setup: FlashSetup) -> ServiceRig {
+        use sw_core::flash_endpoint::{EndpointShutdown, FlashCoordinator, FlashEndpoint, ENDPOINT_GRACE};
+        use sw_core::mcu_patterns::McuPatternRegistry;
+
+        let serial = FakeSerialBackend::new();
+        let mut devices = BTreeMap::new();
+        let mut snapshot = Vec::new();
+        for (by_id, real, kind) in &setup.devices {
+            let dev = serial.add_device(real);
+            match kind {
+                DevKind::Shell => install_shell_replies(&dev),
+                DevKind::Mcu => dev.on_tx_reply(MCU_SYNC, MCU_ACK),
+                DevKind::Silent => {}
+            }
+            devices.insert(real.clone(), dev);
+            snapshot.push((
+                by_id.clone(),
+                DeviceInfo {
+                    by_id: by_id.clone(),
+                    real_path: real.clone(),
+                },
+            ));
+        }
+        let load = load_profiles(PROFILE_DIR, &MemProfileFs { yaml: setup.yaml })
+            .expect("測試 YAML 應可載入");
+        let explicit_target_count = load.profiles.len();
+        let fs = Arc::new(RigFs::default());
+        let wfs = FakeWalFs::new();
+        let clock = FakeClock::new();
+        let wal = Arc::new(WalWriter::open(
+            WalConfig {
+                dir: PathBuf::from(WAL_DIR),
+                rotate_bytes: 67_108_864,
+            },
+            wfs.clone(),
+            clock.clone(),
+        ));
+        let registry = CommandRegistry::new();
+        let excl = Arc::new(RigExcl::default());
+        let mgr = SessionManager::new(ManagerDeps {
+            serial: serial.clone(),
+            uart_excl: excl.clone(),
+            console: Arc::new(RigConsole),
+            caps: sw_pal::fakes::posix_caps(),
+            wal: wal.clone(),
+            registry: registry.clone(),
+            state: StateStore::spawn(PathBuf::from(STATE_PATH), fs.clone()),
+            loaded: LoadedState::default(),
+            load,
+            clock: clock.clone(),
+            env: Arc::new(FakeEnv::default()),
+            fs: fs.clone(),
+            warn: Arc::new(|_msg: String| {}),
+        });
+        let console = RigFlashConsole::new();
+        let coord = FlashCoordinator::new(
+            mgr.clone(),
+            Arc::new(McuPatternRegistry::default_registry()),
+            setup.coord_clock.clone(),
+            excl.clone(),
+            console.clone(),
+            EndpointShutdown::new(Arc::new(NoWake)),
+        );
+        let procs = FakeProcScan::new(Vec::new());
+        mgr.update_devices(&snapshot);
+        mgr.bootstrap_attach();
+        for (com, state) in &setup.wait_states {
+            let m = mgr.clone();
+            wait_until(&format!("{com} state={state}"), || {
+                m.list_sessions().iter().any(|s| {
+                    s.get("com").and_then(PyValue::as_str) == Some(com.as_str())
+                        && s.get("state").and_then(PyValue::as_str) == Some(state.as_str())
+                })
+            });
+        }
+        let mut caps = sw_pal::fakes::posix_caps();
+        caps.flash_endpoint = setup.caps_flash;
+        let pal = sw_pal::fakes::platform().console(console.clone()).caps(caps).build();
+        let endpoint = FlashEndpoint::start(&pal, Path::new(FLASH_LINK), coord.clone(), ENDPOINT_GRACE)
+            .expect("FlashEndpoint::start");
+        let svc = Arc::new(Service::new(ServiceDeps {
+            manager: mgr.clone(),
+            wal: wal.clone(),
+            registry: registry.clone(),
+            procs: procs.clone(),
+            version: RIG_VERSION.to_string(),
+            // 與 `ServiceRig::build` 同一預設程式碼身分（無指紋、bundle root＝`/fake/bundle`）。
+            code_fingerprint: None,
+            code_path: Some("/fake/bundle".to_string()),
+            started_at: RIG_STARTED_AT.to_string(),
+            explicit_target_count,
+            test_device_allowlist: None,
+            pid: RIG_PID,
+        }));
+        let state = sw_daemon::service::FlashState::new(coord.clone(), endpoint);
+        assert!(svc.attach_flash(state.clone()), "attach_flash 第一次應成功");
+        // P8 Task 14：flash sync-probe 與 RPC 分派共用 Service 的 admission 邊界（同 daemon_main 組裝）。
+        assert!(coord.set_admission(svc.admission().clone()), "set_admission 第一次應成功");
+        let rig = ServiceRig {
+            svc,
+            mgr,
+            wal,
+            wfs,
+            fs,
+            clock,
+            procs,
+            excl,
+            registry,
+            devices,
+            version: RIG_VERSION.to_string(),
+            console: None,
+            flash: Some(FlashParts {
+                state,
+                coord,
+                console,
+            }),
+        };
+        rig.settle();
+        rig
+    }
+
+    fn flash_parts(&self) -> &FlashParts {
+        self.flash.as_ref().expect("此 rig 未以 with_flash 建立")
+    }
+
+    /// flasher 對 `/dev/ttyMCU` 寫入（端點 master 變可讀）。
+    pub fn flasher_write(&self, bytes: &[u8]) {
+        self.flash_parts().console.flasher().push_rx(bytes);
+    }
+
+    /// 端點寫給 flasher 的 bytes（讀走）。
+    pub fn flasher_take(&self) -> Vec<u8> {
+        self.flash_parts().console.flasher().take_tx()
+    }
+
+    /// coordinator 送出的 flash 事件種類（依序，`"FlashSyncProbeStart"` 等）與 COM。
+    pub fn flash_events(&self) -> Vec<(String, &'static str)> {
+        self.flash_parts()
+            .coord
+            .flash_events_for_test()
+            .into_iter()
+            .map(|e| (e.com, e.kind))
+            .collect()
+    }
+
+    /// 取出端點並 `stop`（join＋unlink）；無端點回 `None`。
+    pub fn stop_flash_endpoint(&self) -> Option<sw_core::flash_endpoint::EndpointStopReceipt> {
+        self.flash_parts().state.take_endpoint().map(|e| e.stop())
+    }
+
+    /// `rpc(method, {})` 的 RPC_WIRE 位元組（去 `version`；Python `json.dumps(…, separators=(",", ":"))` 插入序）。
+    pub fn wire_without_version(&self, method: &str) -> String {
+        let mut d = self.call(method, "{}");
+        d.0.shift_remove("version");
+        pyjson::dumps(&PyValue::Dict(d), &pyjson::RPC_WIRE)
+    }
 }

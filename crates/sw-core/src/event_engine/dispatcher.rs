@@ -6,7 +6,7 @@
 //! 逾時 abort 仍在跑者並再等 100 ms（Rust 細化；Python `shutdown(wait=True)` 無期限）。
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sw_pal::traits::{
@@ -146,7 +146,9 @@ struct State {
 
 struct Shared {
     state: Mutex<State>,
-    idle: Condvar,
+    /// `inflight` 歸零時喚醒 stop 的 deadline 等待。
+    idle_tx: crossbeam_channel::Sender<()>,
+    idle_rx: crossbeam_channel::Receiver<()>,
     spawner: Arc<dyn HandlerSpawner>,
     counters: Arc<CounterStore>,
     emit: FallibleEmit,
@@ -184,7 +186,7 @@ impl Shared {
         st.running.remove(rule_id);
         st.inflight = st.inflight.saturating_sub(1);
         if st.inflight == 0 {
-            self.idle.notify_all();
+            let _ = self.idle_tx.try_send(());
         }
     }
 
@@ -348,9 +350,11 @@ impl Dispatcher {
         clock: Arc<dyn Clock>,
     ) -> Self {
         let max = per_daemon_max.max(1);
+        let (idle_tx, idle_rx) = crossbeam_channel::bounded(1);
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
-            idle: Condvar::new(),
+            idle_tx,
+            idle_rx,
             spawner,
             counters,
             emit,
@@ -443,19 +447,30 @@ impl Dispatcher {
         self.jobs.lock().unwrap_or_else(|e| e.into_inner()).take();
         let shared = &self.shared;
         let wait_idle = |until: Instant| {
-            let mut st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-            while st.inflight > 0 {
-                let now = Instant::now();
-                if now >= until {
-                    break;
-                }
-                st = shared
-                    .idle
-                    .wait_timeout(st, until - now)
+            // 從 Instant 期限取剩餘時間，再映射至注入的單調 Clock；FakeClock 因而能確定性推進 deadline。
+            let remaining = until.saturating_duration_since(Instant::now());
+            let wait_ns = remaining.as_nanos().min(u64::MAX as u128) as u64;
+            let deadline_ns = shared.clock.mono_ns().saturating_add(wait_ns);
+            loop {
+                let inflight = shared
+                    .state
+                    .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .0;
+                    .inflight;
+                if inflight == 0 {
+                    return 0;
+                }
+                if shared
+                    .clock
+                    .wait_until_or_cancel(deadline_ns, &shared.idle_rx)
+                {
+                    return shared
+                        .state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .inflight;
+                }
             }
-            st.inflight
         };
         if wait_idle(deadline) == 0 {
             return DispatcherStopReport::default();

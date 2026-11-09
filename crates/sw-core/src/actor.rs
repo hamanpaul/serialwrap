@@ -199,6 +199,14 @@ fn probe_label(item: &MailboxItem) -> Option<&'static str> {
 }
 
 #[cfg(feature = "test-fakes")]
+fn probe_pause_label(item: &MailboxItem) -> Option<&'static str> {
+    match item {
+        MailboxItem::Control(ControlEvent::LoginFinished { .. }) => Some("LoginFinished"),
+        _ => probe_label(item),
+    }
+}
+
+#[cfg(feature = "test-fakes")]
 fn timer_label(ev: &TimerEvent) -> &'static str {
     match ev {
         TimerEvent::LeaseExpiry { .. } => "LeaseExpiry",
@@ -346,12 +354,17 @@ pub fn spawn_actor(
                 #[cfg(feature = "test-fakes")]
                 let label = probe_label(&item);
                 #[cfg(feature = "test-fakes")]
+                let pause_label = probe_pause_label(&item);
+                #[cfg(feature = "test-fakes")]
                 let data_started = clock.mono_ns();
                 #[cfg(feature = "test-fakes")]
                 if let Some(label) = label {
                     let witness = mailbox.take_control_witness().unwrap_or(0);
                     let pre = mailbox.take_control_pre_dependency_data().unwrap_or(0);
                     thread_probe.before_other(label, mailbox.data_backlog(), witness, pre);
+                }
+                #[cfg(feature = "test-fakes")]
+                if let Some(label) = pause_label {
                     thread_probe.pause_before_dispatch(label);
                 }
                 let data_mark = match &item {
@@ -444,6 +457,11 @@ fn dispatch(
         MailboxItem::Control(ControlEvent::Timer(_)) => (None, "Timer"),
         MailboxItem::Control(ControlEvent::StateCommitted { .. }) => (None, "StateCommitted"),
         MailboxItem::Control(ControlEvent::Tick) => (None, "Tick"),
+        // P8 Task 8：flash 事件的 `FlashReply` 隨事件移入 core；panic 時被丟棄，呼叫端以通道斷線收斂。
+        MailboxItem::Control(ControlEvent::FlashSyncProbeStart { .. }) => (None, "FlashSyncProbeStart"),
+        MailboxItem::Control(ControlEvent::FlashProbeReleased { .. }) => (None, "FlashProbeReleased"),
+        MailboxItem::Control(ControlEvent::FlashSyncMatched { .. }) => (None, "FlashSyncMatched"),
+        MailboxItem::Control(ControlEvent::FlashHolderGone { .. }) => (None, "FlashHolderGone"),
         MailboxItem::Data(_) => (None, "Data"),
     };
 

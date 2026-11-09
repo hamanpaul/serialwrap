@@ -1,10 +1,15 @@
 //! Slice 2.4 檔案傳輸（P8）：T3 提供板端命令樣板與 RX 判定 helper，T4 提供 `push_file`／`pull_file` 引擎。
 //!
-//! 引擎只依賴 [`TransferPort`]（T5 的 `OpTransferPort` 之後實作它），不直接碰 `OpCtx`／`TxWriter`；
+//! 引擎只依賴 [`TransferPort`]（T5 的 [`OpTransferPort`] 實作它），不直接碰 `OpCtx`／`TxWriter`；
 //! 也不自行判定 RPC 錯誤碼——只回傳 Python 相同鍵序的 `PyDict` 或 [`TransferAbort`]（OD-62）。
 
+pub mod op_port;
+pub mod request;
 pub mod rx_match;
 pub mod templates;
+
+pub use op_port::OpTransferPort;
+pub use request::{FileTransferKind, FileTransferRequest};
 
 use std::time::Duration;
 
@@ -404,7 +409,7 @@ pub fn push_file(
         let op = if idx == 0 { ">" } else { ">>" };
         let cmd = t::chunk_command(&t::b64encode(chunk), decoder, op, &tmp).expect("decoder 已探測");
         if t::line_budget_exceeded(&[cmd.as_str()], budget) {
-            sess.cleanup(&tmp, &prefix, prog)?;
+            sess.cleanup(&tmp, &prefix, None)?;
             return Ok(line_limit_error(budget));
         }
         let pre = sess.port.rx_snapshot_len();
@@ -426,11 +431,12 @@ pub fn push_file(
             sess.send(&cmd, &cmd_id, prog)?;
         }
         if !sess.wait(pre, prog)? {
-            sess.cleanup(&tmp, &prefix, prog)?;
+            // Python 這條 cleanup 拒絕路徑不在 chunk TX 的例外處理器內，不附 chunk 進度。
+            sess.cleanup(&tmp, &prefix, None)?;
             return Ok(err_progress("TRANSFER_TIMEOUT", idx, total));
         }
         if !m::runtime_sentinel_seen(&sess.port.rx_text_from(pre), t::CHUNK_SENTINEL, Some(&cmd)) {
-            sess.cleanup(&tmp, &prefix, prog)?;
+            sess.cleanup(&tmp, &prefix, None)?;
             return Ok(err_progress("TARGET_DECODER_FAILED", idx, total));
         }
     }

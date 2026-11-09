@@ -20,12 +20,16 @@ use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 use sw_proto::pyre::{PyFlags, PyRegex, compile, valid_completion_regex};
 
 use crate::arbiter::{QueuedCommand, SubmitOrigin};
+use crate::file_transfer::{
+    pull_file, push_file, OpTransferPort, PullParams, PushParams, RejectReason, StdLocalFiles, TransferAbort,
+    TransferIds, TxRejection,
+};
 use crate::login_fsm::LoginOutcome;
 use crate::mailbox::ControlEvent;
 use crate::quiet_gate::is_reboot_command;
 use crate::session_core::OpGrant;
 use crate::tx_writer::{FenceReject, TxClass, TxJob, TxPermit, TxReport, TxWriterHandle};
-use crate::uart_bridge::RxShared;
+use crate::uart_bridge::{RunCancel, RxShared};
 use crate::wal::{WalAppendReq, WalWriter};
 
 /// 前景 op 的種類（`Effect::StartOp` 內容）。
@@ -37,6 +41,16 @@ pub enum OpSpec {
     InteractiveSend { payload: Vec<u8>, owner: String },
     RebootRecovery { hard_timeout_s: f64 },
     DetectTemplate { templates: Vec<ProfileTemplate> },
+    /// P8 Task 6：前景檔案傳輸（`file.push`／`file.pull`）；走前景 lane（不是 [`OpSpec::runs_beside_foreground`]）。
+    FileTransfer(FileTransferPlan),
+}
+
+/// P8 Task 6：檔案傳輸 op 的參數。由 actor 依 RPC 請求與 session profile 組成（timeout 推導、`prompt_regex`、
+/// `max_console_line_chars`、`path_flavor` 皆已代入），OpRunner 原樣交給 `push_file`／`pull_file`。
+#[derive(Debug, Clone)]
+pub enum FileTransferPlan {
+    Push(PushParams),
+    Pull(PullParams),
 }
 
 /// op 完成結果（`ControlEvent::OpFinished` 內容）。
@@ -62,6 +76,10 @@ pub enum OpOutcome {
     SendRefused(FenceReject),
     /// Python 例外穿出 manager（framing `EXCEPTION`）。
     Error(PyErr),
+    /// P8 Task 6：檔案傳輸結果。`Ok` 為引擎回應或已依 OD-62 映射的錯誤回應（`COMMAND_ABORTED_IN_FLIGHT`／
+    /// `FLUSHED_BY_RECOVERY`／`TRANSFER_TIMEOUT`，META 已由 OpRunner 寫出）；`Err(TxRejected)` 只留給「quiet 且被拒
+    /// 那筆零寫出」（`retry_after_s` 需 actor 的 quiet 狀態），`Err(LocalIo|BadPromptRegex)` 由 actor 轉 framing `EXCEPTION`。
+    FileTransfer(Result<PyDict, TransferAbort>),
 }
 
 /// `OpRunner` 的依賴（Task 14 Produces）。
@@ -396,7 +414,109 @@ fn execute(ctx: &OpCtx, grant: &OpGrant, spec: OpSpec) -> OpOutcome {
             "reboot recovery 由 session actor 以登入 run 驅動（OpRunner 不承接）",
         )),
         OpSpec::DetectTemplate { .. } => OpOutcome::Detected(None),
+        OpSpec::FileTransfer(plan) => run_file_transfer(ctx, grant, plan),
     }
+}
+
+/// P8 Task 6：`TransferIds`（Python `uuid.uuid4().hex[:n]`）以 `OpCtx.rng` 產生。
+struct RngIds<'a> {
+    rng: &'a (dyn Fn(&mut [u8]) + Send + Sync),
+}
+
+impl TransferIds for RngIds<'_> {
+    fn hex(&mut self, n: usize) -> String {
+        let rng = self.rng;
+        let mut fill = |bytes: &mut [u8]| rng(bytes);
+        sw_proto::pycompat::uuid4_hex(&mut fill).chars().take(n).collect()
+    }
+}
+
+/// P8 Task 6：檔案傳輸執行體（`session_manager.py::file_push`／`file_pull` 的 I/O 段＋`_file_tx_rejected_result`）。
+///
+/// 引擎經 [`OpTransferPort`] 送出（同一 grant 的 TX operation、`TxClass::FileTransfer`）；等待監看 drain Phase 1 的
+/// 傳輸取消世代（T5），release／recover／shutdown 時盡快返回、不自動重送。傳輸中被拒依 OD-62 映射：
+/// - quiet 且被拒那筆零寫出 → 原樣交回 actor（`AUTOBOOT_QUIET` 的 `retry_after_s` 取 actor 的 quiet 狀態）；
+/// - quiet／cancelled／stale_generation／draining：整段已確認寫出 ≥1 byte → 寫 `command_aborted_in_flight` META
+///   （與 drain 回條以 `claim_abort_meta` 互斥）並回 `COMMAND_ABORTED_IN_FLIGHT`；否則 `FLUSHED_BY_RECOVERY`；
+/// - 其餘（flashing、WAL、owner、結果不明等）→ 傳輸自身的 `TRANSFER_TIMEOUT`。
+///
+/// push 在 chunk 迴圈內被拒時附 `chunks_sent`／`chunks_total`。
+fn run_file_transfer(ctx: &OpCtx, grant: &OpGrant, plan: FileTransferPlan) -> OpOutcome {
+    let cancel = RunCancel::new(&ctx.rx);
+    let mut port = OpTransferPort::new(ctx, grant, &cancel);
+    let mut ids = RngIds { rng: &*ctx.rng };
+    let result = match &plan {
+        FileTransferPlan::Push(p) => push_file(&mut port, &StdLocalFiles, &mut ids, p),
+        FileTransferPlan::Pull(p) => pull_file(&mut port, &StdLocalFiles, &mut ids, p),
+    };
+    let confirmed = port.confirmed_bytes();
+    OpOutcome::FileTransfer(match result {
+        Err(TransferAbort::TxRejected { rej, chunks, transfer_cmd_id }) => {
+            let cmd_id = if transfer_cmd_id.is_empty() {
+                format!("file:{}", grant.op_id.0)
+            } else {
+                transfer_cmd_id
+            };
+            map_file_tx_rejected(ctx, rej, chunks, cmd_id, confirmed)
+        }
+        other => other,
+    })
+}
+
+/// `_file_tx_rejected_result` 中不需 session 狀態的部分（見 [`run_file_transfer`]）。
+fn map_file_tx_rejected(
+    ctx: &OpCtx,
+    rej: TxRejection,
+    chunks: Option<(usize, usize)>,
+    transfer_cmd_id: String,
+    confirmed: usize,
+) -> Result<PyDict, TransferAbort> {
+    let code = match rej.reason {
+        RejectReason::Quiet if rej.rejected_confirmed == 0 => {
+            return Err(TransferAbort::TxRejected { rej, chunks, transfer_cmd_id });
+        }
+        RejectReason::Quiet | RejectReason::Cancelled | RejectReason::StaleGeneration | RejectReason::Draining => {
+            if confirmed > 0 {
+                append_transfer_aborted_meta(ctx, &transfer_cmd_id, confirmed, rej.unknown);
+                "COMMAND_ABORTED_IN_FLIGHT"
+            } else {
+                "FLUSHED_BY_RECOVERY"
+            }
+        }
+        RejectReason::Other => "TRANSFER_TIMEOUT",
+    };
+    Ok(file_error_with_progress(code, chunks))
+}
+
+/// `{"ok": False, "error_code": code, **progress}`（push chunk 迴圈內被拒時附 `chunks_sent`／`chunks_total`）。
+pub fn file_error_with_progress(code: &str, chunks: Option<(usize, usize)>) -> PyDict {
+    let mut d = pydict! { "ok" => false, "error_code" => code };
+    if let Some((sent, total)) = chunks {
+        d.insert("chunks_sent", py_int(sent as i128));
+        d.insert("chunks_total", py_int(total as i128));
+    }
+    d
+}
+
+/// Python `_append_aborted_in_flight_meta`（file.* 與一般命令共用欄位）：`cmd_id` 為傳輸前綴、`confirmed_tx_bytes`
+/// 為整段累計；被拒那筆結果不明 → `unknown`，否則該筆必未完整提交 → `partial`。只在取得 META 寫入權時寫一次。
+fn append_transfer_aborted_meta(ctx: &OpCtx, cmd_id: &str, confirmed: usize, unknown: bool) {
+    if !ctx.registry.claim_abort_meta(cmd_id) {
+        return;
+    }
+    let mut meta = PyDict::new();
+    meta.insert("event", PyValue::from("command_aborted_in_flight"));
+    meta.insert("confirmed_tx_bytes", py_int(confirmed as i128));
+    meta.insert("tx_outcome", PyValue::from(if unknown { "unknown" } else { "partial" }));
+    let _ = ctx.wal.append(WalAppendReq {
+        com: &ctx.com,
+        dir: "META",
+        source: "system",
+        payload: b"",
+        cmd_id: Some(cmd_id),
+        loss_flag: false,
+        meta: Some(meta),
+    });
 }
 
 fn command_payload(command: &str) -> Vec<u8> {
@@ -430,6 +550,7 @@ fn send(
         // 07 D-03：06 既有 permit 建構點一律 `None`。
         input_epoch: None,
         replay_hold: None,
+        probe_id: None,
     };
     let frozen = TxReport {
         op_id: grant.op_id,
@@ -445,6 +566,7 @@ fn send(
         permit,
         payload: payload.to_vec(),
         reply,
+        aggregate: None,
     };
     if ctx.tx.jobs.send(job).is_err() {
         return frozen;

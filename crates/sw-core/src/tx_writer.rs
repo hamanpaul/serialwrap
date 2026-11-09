@@ -64,6 +64,9 @@ pub struct TxPermit {
     pub input_epoch: Option<u64>,
     /// P6 增補 #3（07 D-22）：只有 HumanReplay 為 `Some(hold_id)`，其餘一律 `None`。
     pub replay_hold: Option<u64>,
+    /// P8 Task 8（09 計畫 Fence 規則表）：只有 `FlashProbe` 為 `Some(probe_id)`（認線 probe 的身分，不以 `op_id` 代替），
+    /// 其餘一律 `None`；`Fence::admit` 只在 `flash_mode == Probe(probe_id)` 時放行該 probe 的 TX。
+    pub probe_id: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,11 +110,29 @@ pub struct FenceState {
     /// `Fence::with` 內設 `quiet_active`／`reconfirm_pending` 並清除本欄——對齊 Python `_handle_reboot_command` 在
     /// `_write_lock` 內 arm，下一個 TX job 的出列檢查前 quiet 已生效（審查 F14）。actor 之後只同步 `QuietState`／世代。
     pub reboot_arm_op: Option<OpId>,
+    /// P8 Task 8：manager 的 flash-critical 標記（`collect_flash_candidates_and_mark`，#83 RACE-2 final）。不影響
+    /// `admit`；actor 據此在 probe 前的臨界窗口也擋 destructive 操作、不讓 passthrough 安靜升 READY（Python
+    /// `_flash_busy_locked`）。只由 manager 在其 `Inner` 鎖內寫入。
+    pub flash_critical: bool,
     /// 目前 bridge 的 profile 是否為 passthrough（WP5-3 第 4 項；SC-35、裁決 s2 D2）：`adopt_opened_bridge` 每次
     /// adopt 明確覆寫，預設 false。Python `agent_gate_active()`（`session_manager.py:814-826`）對 passthrough 固定回
     /// False，`_push_tx_gate()`（`:778-785`）以此發布 bridge 的 `_gate_quiet`——故只豁免 `Command` 的
     /// quiet／reconfirm；`quiet_active`／`reconfirm_pending` 與 reboot arming 照記，其他類別與共同拒絕不受影響。
     pub bridge_passthrough: bool,
+    /// P8 Task 14：SC-11 交接停止的 TX 凍結（Python `UARTBridge.freeze_tx`）。與 drain 的 `frozen` 分開記錄：交接
+    /// 未成立（TX fence 逾時）時只撤銷本旗標，不動 shutdown／drain 建立的 `frozen`。
+    pub handoff_frozen: bool,
+}
+
+/// P8 Task 14：[`Fence::freeze_for_handoff`] 的結果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandoffFreeze {
+    /// 旗標已設、無在途寫入段：此 fence 之後零 TX。
+    Converged,
+    /// 旗標已設，但已經 gate 提交的寫入段未在期限內結束（須撤銷旗標）。
+    InFlight,
+    /// OS 提交持 fence 鎖直到期限，旗標未設（不需撤銷）。
+    Locked,
 }
 
 /// 撤銷 op 的 tombstone 上限（Python `uart_io._TX_ACCOUNT_MAX`；parity-amendments-2026-10-26 #38）。
@@ -196,8 +217,44 @@ impl Fence {
             replay_auth: None,
             foreground_busy: false,
             reboot_arm_op: None,
+            flash_critical: false,
             bridge_passthrough: false,
+            handoff_frozen: false,
         })))
+    }
+
+    /// P8 Task 14：交接凍結（Python `UARTBridge.freeze_tx`）：取得 fence 鎖時設 `handoff_frozen`（此後任何來源的新 TX
+    /// 一律 `Frozen`），再等已經 gate 提交、仍在途的寫入段（`in_flight`）結束。不啟動 drain、不動 `frozen`。
+    ///
+    /// 回 [`HandoffFreeze::Converged`] 才可回報交接成立；`InFlight`（旗標已設、在途段未在 `deadline` 前結束）須由
+    /// [`Fence::thaw_handoff`] 撤銷；`Locked`（OS 提交持 fence 鎖直到 `deadline`，旗標未設）不需撤銷。
+    pub fn freeze_for_handoff(&self, deadline: std::time::Instant) -> HandoffFreeze {
+        let pause = std::time::Duration::from_millis(1);
+        loop {
+            // OS 提交在 fence 鎖內（`FenceSubmitGate`）：取得鎖即表示沒有進行中的提交，之後的提交重驗時被拒。
+            if self.try_with(|st| st.handoff_frozen = true).is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return HandoffFreeze::Locked;
+            }
+            std::thread::sleep(pause);
+        }
+        loop {
+            // 已設旗標：之後的提交重驗即被拒、只短暫持鎖，此處 `try_with` 不會長時間等待。
+            if self.try_with(|st| st.in_flight.is_none()) == Some(true) {
+                return HandoffFreeze::Converged;
+            }
+            if std::time::Instant::now() >= deadline {
+                return HandoffFreeze::InFlight;
+            }
+            std::thread::sleep(pause);
+        }
+    }
+
+    /// P8 Task 14：撤銷尚未成立的交接凍結（只清 `handoff_frozen`；drain／shutdown 的 `frozen` 保留，Python `thaw_tx`）。
+    pub fn thaw_handoff(&self) {
+        self.with(|st| st.handoff_frozen = false);
     }
 
     /// 撤銷 op（Python `UARTBridge.revoke_ops`）：之後以這些 op 提交的 TX 一律 `Cancelled`、零 TX；
@@ -219,7 +276,7 @@ impl Fence {
     }
 
     pub fn admit(st: &FenceState, p: &TxPermit) -> Result<(), FenceReject> {
-        if st.frozen {
+        if st.frozen || st.handoff_frozen {
             return Err(FenceReject::Frozen);
         }
         if st.active_epoch != Some(p.epoch) {
@@ -229,10 +286,11 @@ impl Fence {
             return Err(FenceReject::Cancelled);
         }
 
+        // P8 Task 8（09 計畫 Fence 規則表）：FlashProbe 只在同一 probe（`permit.probe_id == Some(id)`）的 `Probe(id)`
+        // 放行，probe 身分不以 op_id 代替；Flash 只在 Flashing 放行；其他 class 只在 Off 放行。
         match (p.class, st.flash_mode) {
+            (TxClass::FlashProbe, FlashMode::Probe(id)) if p.probe_id == Some(id) => {}
             (TxClass::Flash, FlashMode::Flashing) => {}
-            // TxPermit 尚無獨立 probe_id；Slice 2.1 暫不放行 FlashProbe，不能以 op_id 代替。
-            (TxClass::FlashProbe, FlashMode::Probe(_)) => return Err(FenceReject::Flash),
             (TxClass::Flash | TxClass::FlashProbe, _) => return Err(FenceReject::Flash),
             (_, FlashMode::Off) => {}
             (_, FlashMode::Probe(_) | FlashMode::Flashing) => return Err(FenceReject::Flash),
@@ -365,10 +423,38 @@ impl SubmitGate for FenceSubmitGate<'_> {
     }
 }
 
+/// 同一時間可未結的聚合緩衝上限（P8 Task 5）。每個 epoch 只有一個前景傳輸，超過即為程式錯誤，
+/// 新開的 `Append` 一律不提交（零 TX）。
+pub const TX_AGGREGATE_OPEN_MAX: usize = 8;
+
+/// echo-ACK 節流的 TX 證據聚合鍵（P8 Task 5）：同一行命令的各 slice 以同一個鍵累加。
+///
+/// `max_bytes` 是該行命令完整送出時的 byte 數（本文＋換行）；TxWriter 拒絕會讓緩衝超過它的 `Append`
+/// （程式錯誤，零 TX），使緩衝有界。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AggregateKey {
+    pub op_id: OpId,
+    pub source: String,
+    pub cmd_id: Option<String>,
+    pub max_bytes: usize,
+}
+
+/// `TxJob` 的聚合指示（P8 Task 5；Python `send_command_echo_paced` 的「一命令一筆 TX」）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AggregateOp {
+    /// 照常經 Fence 提交；OS 確認的 bytes 累加到該鍵的緩衝，不單獨落 TX WAL（結果不明仍照 SC-07 寫 META）。
+    Append(AggregateKey),
+    /// 不提交任何 bytes（`payload` 必須為空）；把緩衝以一筆 TX（source／cmd_id 取自鍵）寫入 WAL 後清除，
+    /// `TxReport.wal` 回該筆結果。緩衝為空時不寫。
+    Finish(AggregateKey),
+}
+
 pub struct TxJob {
     pub permit: TxPermit,
     pub payload: Vec<u8>,
     pub reply: crossbeam_channel::Sender<TxReport>,
+    /// P8 Task 5：只有 `OpTransferPort` 的 echo-ACK 節流為 `Some`；其餘建構點一律 `None`。
+    pub aggregate: Option<AggregateOp>,
 }
 
 #[derive(Debug, Clone)]
@@ -478,9 +564,17 @@ pub struct TxWriterHandle {
     pub jobs: Sender<TxJob>,
     settle: Sender<OpId>,
     gauge: Arc<LedgerGaugeCells>,
+    /// P8 Task 5：本 writer 的 Fence（只供 [`TxWriterHandle::fence_verdict`] 分類拒絕原因，不作授權）。
+    fence: Arc<Fence>,
 }
 
 impl TxWriterHandle {
+    /// P8 Task 5（brief 不符 #2）：以本 writer 的 Fence 做一次零 TX 的 `Fence::admit` 判定。等待被取消後用來
+    /// 分類「此刻送出會被拒的原因」；不是授權——真正的授權仍在每次 OS 提交的 gate 內重驗。
+    pub fn fence_verdict(&self, permit: &TxPermit) -> Result<(), FenceReject> {
+        self.fence.with(|state| Fence::admit(state, permit))
+    }
+
     /// 非阻塞（actor executor 呼叫）：try_send；Full 時回 false 並 settle_dropped+=1。
     pub fn settle(&self, op_id: OpId) -> bool {
         match self.settle.try_send(op_id) {
@@ -534,6 +628,16 @@ struct TxWriter {
     settle: Receiver<OpId>,
     stop: Receiver<()>,
     gauge: Arc<LedgerGaugeCells>,
+    /// P8 Task 5：echo-ACK 節流的未結聚合緩衝（插入序；≤ [`TX_AGGREGATE_OPEN_MAX`] 個鍵、每鍵 ≤ `max_bytes`）。
+    aggregates: IndexMap<AggregateKey, Vec<u8>>,
+}
+
+/// TxWriter 出列檢查的結果（P8 Task 5 加入聚合上限）。
+enum Precheck {
+    /// `Append` 會讓聚合緩衝超出界線（程式錯誤）：不提交、零 TX。
+    AggregateOverflow(PalError),
+    Refused(FenceReject),
+    Admitted,
 }
 
 /// 0 byte 即中止的寫入（`Completed(0)`、無 fence 拒絕原因，PAL 於提交前檢查到 cancel）重驗授權後的收斂：
@@ -573,6 +677,93 @@ impl TxWriter {
         })
     }
 
+    /// `Append` 會讓緩衝超出界線時回錯誤（程式錯誤，零 TX）：超過該行命令長度，或新開鍵時已達未結上限。
+    fn aggregate_overflow(&self, key: &AggregateKey, len: usize) -> Option<PalError> {
+        let buffered = self.aggregates.get(key).map(Vec::len);
+        let over_line = buffered.unwrap_or(0).saturating_add(len) > key.max_bytes;
+        let over_open = buffered.is_none() && self.aggregates.len() >= TX_AGGREGATE_OPEN_MAX;
+        (over_line || over_open).then(|| {
+            PalError::plain(
+                PalErrorKind::InvalidInput,
+                format!(
+                    "TX aggregate overflow（op={} buffered={} add={len} max={} open={}）",
+                    key.op_id.0,
+                    buffered.unwrap_or(0),
+                    key.max_bytes,
+                    self.aggregates.len()
+                ),
+            )
+        })
+    }
+
+    /// 把 `key` 的緩衝以一筆 TX 寫入 WAL 並清除；緩衝為空或不存在時不寫。寫入失敗記進該 op 的 `wal_gaps`
+    /// （op 已結算則進 `unresolved_gaps`），由 `IoWorker::finish_async` 併入回條的 `unrecorded`。
+    fn write_aggregate(&mut self, key: &AggregateKey, ledger: &mut TxLedger) -> Option<WalAppend> {
+        let buffer = self.aggregates.shift_remove(key)?;
+        if buffer.is_empty() {
+            return None;
+        }
+        let append = self.wal.append(WalAppendReq {
+            com: &self.com,
+            dir: "TX",
+            source: &key.source,
+            payload: &buffer,
+            cmd_id: key.cmd_id.as_deref(),
+            loss_flag: false,
+            meta: None,
+        });
+        let error = self.wal_append_error(&append);
+        match ledger.ops.get_mut(&key.op_id) {
+            Some(op) => op.record_wal_append(key.op_id, "TX", buffer.len(), &append, error),
+            None if append.loss_flag => ledger.push_unresolved(EvidenceGap {
+                op_id: Some(key.op_id),
+                dir: "TX",
+                len: buffer.len(),
+                error: error.unwrap_or_else(|| PalError::plain(PalErrorKind::Io, "WAL append failed")),
+            }),
+            None => {}
+        }
+        Some(append)
+    }
+
+    /// `AggregateOp::Finish`：不提交任何 bytes、不經 Fence（凍結後仍須能落已確認 slice 的證據）。
+    fn finish_aggregate(&mut self, job: TxJob, ledger: &mut TxLedger) {
+        let Some(AggregateOp::Finish(key)) = job.aggregate.as_ref() else {
+            return;
+        };
+        let error = (!job.payload.is_empty()).then(|| {
+            PalError::plain(PalErrorKind::InvalidInput, "TX aggregate Finish 不得帶 payload（未提交）")
+        });
+        let wal = self.write_aggregate(key, ledger);
+        let outcome = if error.is_some() {
+            TxOutcome::NotSubmitted
+        } else {
+            TxOutcome::Completed(0)
+        };
+        let report = TxReport {
+            op_id: job.permit.op_id,
+            epoch: self.epoch,
+            result: TxResult { outcome, error },
+            wal,
+            reject: None,
+        };
+        if job.reply.send(report).is_err() {
+            if let Some(op) = ledger.ops.get_mut(&job.permit.op_id) {
+                op.reply_lost = true;
+            }
+        }
+    }
+
+    /// P8 Task 5：writer 收尾（交回 `SerialWriter`、進而組 `WorkerStoppedReceipt`）之前，把每個未結緩衝寫成一筆
+    /// TX（§5.2.4／SC-07：回條必晚於已確認 TX 的證據；shutdown 時同理先於 WAL 關閉）。寫入失敗依
+    /// [`TxWriter::write_aggregate`] 記入帳本，成為回條的 `unrecorded`。
+    fn flush_open_aggregates(&mut self, ledger: &mut TxLedger) {
+        let keys: Vec<AggregateKey> = self.aggregates.keys().cloned().collect();
+        for key in keys {
+            let _ = self.write_aggregate(&key, ledger);
+        }
+    }
+
     fn run(mut self) -> (Box<dyn SerialWriter>, TxLedger) {
         let mut ledger = TxLedger {
             epoch: self.epoch,
@@ -594,6 +785,12 @@ impl TxWriter {
                     Err(_) => break,
                 },
             };
+
+            if matches!(job.aggregate, Some(AggregateOp::Finish(_))) {
+                self.finish_aggregate(job, &mut ledger);
+                self.publish_gauge(&ledger);
+                continue;
+            }
 
             if !ledger.ops.contains_key(&job.permit.op_id) && ledger.ops.len() >= TX_LEDGER_LIVE_MAX
             {
@@ -618,17 +815,37 @@ impl TxWriter {
                 continue;
             }
 
+            let append_key = match job.aggregate.as_ref() {
+                Some(AggregateOp::Append(key)) => Some(key.clone()),
+                _ => None,
+            };
+            let overflow = append_key
+                .as_ref()
+                .and_then(|key| self.aggregate_overflow(key, job.payload.len()));
             // 出列檢查用來快速拒絕；真正授權仍由每次 OS 提交的 gate 在 Fence 鎖內重驗。
-            let precheck = self.fence.with(|state| Fence::admit(state, &job.permit));
+            let precheck = match overflow {
+                Some(error) => Precheck::AggregateOverflow(error),
+                None => match self.fence.with(|state| Fence::admit(state, &job.permit)) {
+                    Err(reason) => Precheck::Refused(reason),
+                    Ok(()) => Precheck::Admitted,
+                },
+            };
             let (result, reject) = match precheck {
-                Err(reason) => (
+                Precheck::AggregateOverflow(error) => (
+                    TxResult {
+                        outcome: TxOutcome::NotSubmitted,
+                        error: Some(error),
+                    },
+                    None,
+                ),
+                Precheck::Refused(reason) => (
                     TxResult {
                         outcome: TxOutcome::NotSubmitted,
                         error: None,
                     },
                     Some(reason),
                 ),
-                Ok(()) => {
+                Precheck::Admitted => {
                     let gate = FenceSubmitGate {
                         fence: &self.fence,
                         permit: &job.permit,
@@ -663,7 +880,17 @@ impl TxWriter {
             };
 
             let confirmed = confirmed_bytes(&result.outcome);
-            let tx_wal = if job.permit.log && confirmed > 0 {
+            // P8 Task 5：`Append` 的確認 bytes 進聚合緩衝（`Finish`／收尾 flush 時一筆落 WAL），不單獨寫 TX。
+            if let Some(key) = append_key.as_ref() {
+                if confirmed > 0 {
+                    let confirmed_payload_len = confirmed.min(job.payload.len());
+                    self.aggregates
+                        .entry(key.clone())
+                        .or_default()
+                        .extend_from_slice(&job.payload[..confirmed_payload_len]);
+                }
+            }
+            let tx_wal = if job.permit.log && append_key.is_none() && confirmed > 0 {
                 let confirmed_payload_len = confirmed.min(job.payload.len());
                 Some(self.wal.append(WalAppendReq {
                     com: &self.com,
@@ -677,7 +904,8 @@ impl TxWriter {
             } else {
                 None
             };
-            let unknown_meta_wal = if job.permit.log {
+            // 結果不明的 META 照 SC-07 寫（`Append` 亦然：Python 節流在例外分支先寫 META、finally 再記 TX）。
+            let unknown_meta_wal = if job.permit.log || append_key.is_some() {
                 if let TxOutcome::Unknown { confirmed } = &result.outcome {
                     let requested = job.payload.len();
                     let confirmed = (*confirmed).min(requested);
@@ -768,7 +996,13 @@ impl TxWriter {
         }
         // P5-T14：先標記 closed，再收斂佇列；之後才送入的 job 由 `wait_report` 依 closed 旗標收尾。
         self.gauge.closed.store(true, Ordering::Release);
-        for job in self.jobs.try_iter() {
+        let queued: Vec<TxJob> = self.jobs.try_iter().collect();
+        for job in queued {
+            // P8 Task 5：佇列中的 Finish 照常落 WAL（它不提交 bytes）；Append 與其他 job 一樣以 Frozen 收斂。
+            if matches!(job.aggregate, Some(AggregateOp::Finish(_))) {
+                self.finish_aggregate(job, &mut ledger);
+                continue;
+            }
             let op_id = job.permit.op_id;
             let known = ledger.ops.contains_key(&op_id);
             if known || ledger.ops.len() < TX_LEDGER_LIVE_MAX {
@@ -793,6 +1027,7 @@ impl TxWriter {
                 }
             }
         }
+        self.flush_open_aggregates(&mut ledger);
         self.publish_gauge(&ledger);
         (self.writer, ledger)
     }
@@ -853,13 +1088,18 @@ impl TxLedger {
         self.settled_total = self.settled_total.saturating_add(1);
         self.gaps_overflow.absorb(&op.wal_gaps_overflow);
         for gap in op.wal_gaps {
-            if self.unresolved_gaps.len() == TX_LEDGER_UNRESOLVED_GAPS_MAX {
-                if let Some(removed) = self.unresolved_gaps.pop_front() {
-                    self.gaps_overflow.absorb_gap(&removed);
-                }
-            }
-            self.unresolved_gaps.push_back(gap);
+            self.push_unresolved(gap);
         }
+    }
+
+    /// 已結算 op 的證據缺口（FIFO，滿時最舊者合併進 `gaps_overflow`）。
+    fn push_unresolved(&mut self, gap: EvidenceGap) {
+        if self.unresolved_gaps.len() == TX_LEDGER_UNRESOLVED_GAPS_MAX {
+            if let Some(removed) = self.unresolved_gaps.pop_front() {
+                self.gaps_overflow.absorb_gap(&removed);
+            }
+        }
+        self.unresolved_gaps.push_back(gap);
     }
 }
 
@@ -920,6 +1160,7 @@ pub fn spawn_tx_writer(
         jobs: job_tx,
         settle: settle_tx,
         gauge: gauge.clone(),
+        fence: fence.clone(),
     };
     let stop = TxWriterStop(stop_tx);
     let worker = TxWriter {
@@ -934,6 +1175,7 @@ pub fn spawn_tx_writer(
         settle: settle_rx,
         stop: stop_rx,
         gauge,
+        aggregates: IndexMap::new(),
     };
     let join = std::thread::spawn(move || worker.run());
     (handle, stop, join)

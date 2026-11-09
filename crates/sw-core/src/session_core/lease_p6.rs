@@ -270,6 +270,14 @@ impl SessionCore {
         if !matches!(self.state, SessionState::Ready | SessionState::Attached) || self.lease.is_some() {
             return;
         }
+        let gate = self.deps.registry.admission_gate();
+        let Some(ticket) = gate.admit("session.interactive_open", Some(&self.profile.com)) else {
+            return;
+        };
+        let _admission = crate::admission::AdmissionTicket::new(gate, ticket);
+        if self.handoff_frozen() {
+            return;
+        }
         let owner = format!("human:{primary}");
         if !self.human.ownership.try_grant_if_idle(&owner) {
             return;

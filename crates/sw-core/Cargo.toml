@@ -24,3 +24,32 @@ tempfile = { workspace = true }
 [features]
 # 記憶體替身（arch §4）；僅供測試，不得在產品路徑啟用。
 test-fakes = ["sw-pal/test-fakes"]
+
+# P8 Task 8：FLASHING 仲裁（CoreHarness／ActorRig 皆需 test-fakes）。
+[[test]]
+name = "flash_session_core"
+path = "tests/flash_session_core.rs"
+required-features = ["test-fakes"]
+
+# P8 Task 9：/dev/ttyMCU 端點、認線協調、pump 與 holder-probe（FlashRig 需 test-fakes）。
+[[test]]
+name = "flash_coordinator"
+path = "tests/flash_coordinator.rs"
+required-features = ["test-fakes"]
+
+# P8 Task 5：OpTransferPort 的 echo-ACK 節流、TX 證據聚合與中止（PortRig 需 test-fakes）。
+[[test]]
+name = "echo_paced"
+path = "tests/echo_paced.rs"
+required-features = ["test-fakes"]
+
+[[test]]
+name = "file_transfer_session"
+path = "tests/file_transfer_session.rs"
+required-features = ["test-fakes"]
+
+# P8 Task 11：外部工具裝置交接 × file transfer／flash 的整合（ActorRig／XferRig 需 test-fakes）。
+[[test]]
+name = "handoff"
+path = "tests/handoff.rs"
+required-features = ["test-fakes"]

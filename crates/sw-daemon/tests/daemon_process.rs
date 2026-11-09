@@ -34,6 +34,7 @@ fn trace_hooks(sink: Arc<Mutex<Vec<TraceEvent>>>) -> DaemonHooks {
         before_state_commit: None,
         after_state_commit: None,
         trace: Some(Box::new(move |ev| sink.lock().unwrap().push(ev))),
+        ..DaemonHooks::default()
     }
 }
 
@@ -303,47 +304,71 @@ fn sigterm_graceful_exit_0_and_flushes_queue() {
     );
     let socket = env.socket.clone();
     let client = thread::spawn(move || {
+        // client thread 不得在送出 STOP 前 panic（daemon 會一直等停止要求）：輪詢逾時只回 false，斷言留到主執行緒。
+        let poll = |cond: &mut dyn FnMut() -> bool| {
+            let deadline = Instant::now() + LONG;
+            loop {
+                if cond() {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        };
+        let cmd_id = |r: &PyValue| r["cmd_id"].as_str().unwrap_or_default().to_string();
         wait_socket(&socket, SHORT);
-        // 前景命令 BlockUntilCancel：RPC 不回應，直到停機取消。
-        let s1 = socket.clone();
-        let fg = thread::spawn(move || submit(&s1, "COM0", "blk"));
-        thread::sleep(Duration::from_millis(300));
-        // 另排兩筆；先等 q2 admission 回覆，再送 q3，固定 flush trace 的 admission 順序。
-        let s2 = socket.clone();
-        let q2 = thread::spawn(move || submit(&s2, "COM0", "q2"));
-        let c2 = q2
-            .join()
-            .expect("q2")["cmd_id"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        let s3 = socket.clone();
-        let q3 = thread::spawn(move || submit(&s3, "COM0", "q3"));
-        let c3 = q3
-            .join()
-            .expect("q3")["cmd_id"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
+        // 先等 READY：socket bind 時 COM0 可能仍在 ATTACHING（全集並行負載下實測），此時送 blk 會被拒為
+        // SESSION_NOT_READY，q2 隨即成為執行中的前景命令而不在佇列（停機時被取消而非 FLUSHED_BY_SHUTDOWN）。
+        let ready = poll(&mut || get_state(&socket, "COM0")["state"] == "READY");
+        // 前景命令 BlockUntilCancel：writer 卡住直到停機取消（submit 於 admission 即回覆）。
+        let blk = submit(&socket, "COM0", "blk");
+        let c1 = cmd_id(&blk);
+        // 等 worker 撿起 blk（status running），q2／q3 才是排在它之後、未開始的排隊命令。
+        let running = !c1.is_empty() && poll(&mut || command_get(&socket, &c1)["status"] == "running");
+        // 先等 q2 admission 回覆，再送 q3，固定 flush trace 的 admission 順序。
+        let c2 = cmd_id(&submit(&socket, "COM0", "q2"));
+        let c3 = cmd_id(&submit(&socket, "COM0", "q3"));
         // 讓 BlockUntilCancel 前景命令確實進入 writer，再送停機；保留原測試的排程窗口。
         thread::sleep(Duration::from_millis(300));
+        // 停機前最後一次 command.get：排隊命令仍為 accepted（入列、未開始）。
+        let queued: Vec<PyValue> = [&c2, &c3]
+            .iter()
+            .map(|id| command_get(&socket, id)["status"].clone())
+            .collect();
         rpc_once(&socket, STOP);
-        let _ = fg.join();
-        (c2, c3)
+        (ready, blk, running, c2, c3, queued)
     });
     let code = run_with_hooks(vec!["serialwrapd".to_string()], platform, trace_hooks(sink.clone()));
-    let (c2, c3) = client.join().expect("client thread");
+    let (ready, blk, running, c2, c3, queued) = client.join().expect("client thread");
+    assert!(ready, "COM0 未在 {LONG:?} 內進入 READY");
+    assert_eq!(blk["ok"], true, "前景命令 blk 應被接受：{blk:?}");
+    assert!(running, "前景命令 blk 未在 {LONG:?} 內進入 running：{blk:?}");
+    assert!(!c2.is_empty() && !c3.is_empty(), "排隊命令應取得 cmd_id：{c2:?} {c3:?}");
+    for (id, status) in [&c2, &c3].iter().zip(&queued) {
+        assert_eq!(*status, "accepted", "STOP 前排隊命令 {id} 應尚未開始");
+    }
     assert_eq!(code, 0);
 
-    // 停機序列：server → stopping gate → watcher → drain（排隊命令 FLUSHED_BY_SHUTDOWN）→ WAL sync → 釋放鎖。
+    // 停機序列（P8 Task 12 停止序 1～7）：stop_accept → stopping gate → watcher → event intake → ttyMCU 端點 →
+    // drain Phase 1 → join handler → Phase 2 → FLUSHED_BY_SHUTDOWN 收尾（排隊命令）→ engine.stop → WAL sync → 釋放鎖。
     let t = sink.lock().unwrap().clone();
-    let tail = t.len().saturating_sub(6);
+    let tail = t.len().saturating_sub(12);
     assert_eq!(
         t[tail..].to_vec(),
         vec![
-            TraceEvent::ServerStopped,
+            TraceEvent::ServerStopAccept,
             TraceEvent::ShutdownGate,
             TraceEvent::WatcherStopped,
+            TraceEvent::EngineIntakeClosed,
+            TraceEvent::FlashStopped { joined: true, unlinked: true },
+            TraceEvent::DrainPhase1,
+            TraceEvent::HandlersJoined { pending: vec![] },
+            TraceEvent::DrainPhase2 {
+                stalled: vec![],
+                drained: vec![("t:COM0".to_string(), true)],
+            },
             TraceEvent::SessionsDrained {
                 flushed: vec![
                     (c2, "FLUSHED_BY_SHUTDOWN".to_string()),
@@ -351,6 +376,7 @@ fn sigterm_graceful_exit_0_and_flushes_queue() {
                 ],
                 stalled: vec![],
             },
+            TraceEvent::EngineStopped { unreaped: vec![] },
             TraceEvent::WalShutdown { ok: true },
             TraceEvent::LockReleased,
         ]
@@ -642,6 +668,8 @@ fn daemon_stop_from_second_connection_during_force_recover() {
     // 2/2 PASS，stop→exit 約 8.2 s）。本 rig 的假 DUT 為登入型：`\x04` 登出後 reattach 停在 login，handler 依
     // Python `_force_recover` 10 × 1 s 逾時（約 14 s）才回 FORCE_RECOVER_TIMEOUT——上限以 SERVER_STOP_BUDGET（20 s）
     // ＋drain 計，不以計畫假設的「約 10 s」。
+    // P8 Task 12 起 Rust 停止序改為 drain Phase 1 先取消 handler 再 join（共用 5 s 期限），不再先等 handler 自然
+    // 結束；本案斷言（exit 0、不報 shutdown incomplete、≤ 25 s、WAL 完整、socket 移除）不變。
     let mut env = isolated_env_with_pty_target();
     let mut d = DaemonProc::spawn(&env, &[]);
     wait_ready(&env, "COM0");
@@ -766,6 +794,7 @@ fn uncaught_panic_exit_1() {
                     panic!("slice21 T19 injected panic");
                 }
             })),
+            ..DaemonHooks::default()
         };
         let code = run_with_hooks(vec!["serialwrapd".to_string()], sw_pal::native(), hooks);
         std::process::exit(code);

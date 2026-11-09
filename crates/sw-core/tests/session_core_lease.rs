@@ -775,6 +775,19 @@ fn self_heal_regrants_after_owner_loss() {
 }
 
 #[test]
+fn self_heal_does_not_grant_human_lease_after_handoff_freeze() {
+    let mut h = ready();
+    let r = h.attach_pty_console("c1", true);
+    let id = sv(r.get("interactive_session_id").expect("interactive_session_id"));
+    h.rpc(close_req(&id)).unwrap();
+    assert_eq!(h.core.human_console().ownership.interactive_owner, None);
+    h.reg.admission_gate().freeze();
+    h.scan(Some(&["/dev/pts/101"]));
+    assert!(h.core.active_lease().is_none(), "交接凍結期間不得自動補授 human lease");
+    assert_eq!(h.core.human_console().ownership.interactive_owner, None);
+}
+
+#[test]
 fn self_heal_skips_during_agent_active() {
     let mut h = ready();
     let r = h.attach_pty_console("c1", true);

@@ -61,9 +61,11 @@ fn job(
                 log: true,
                 input_epoch: None,
                 replay_hold: None,
+                probe_id: None,
             },
             payload: bytes.to_vec(),
             reply,
+            aggregate: None,
         })
         .unwrap();
     report

@@ -48,3 +48,14 @@ py -3.12 -m pytest -q -m "core_portable or windows_native" tests\contract_blackb
 - `bb_faketarget.FakeTarget` 新增 keyword-only 參數 `login_steps`、`commands`（`overrides`）、`delay_ms`、`noise`、`console_lock`、`boot_on_start`，與方法 `emit`、`freeze_rx`／`thaw_rx`、`boot`、`rx_mark`／`rx_log_since`；全部未給時逐位元組維持 P3 行為（語意見模組 docstring）。
 - `bb_p7.py`：`p7_profile_dir(tmp, name, **subst)` 複製 `p7_profiles/<name>.yaml` 並代換 `${BY_ID}`、`${ENV_FILE}` 等大寫佔位（缺值 → `KeyError`）；`cli_json`、`wait_state`；fixture `p7` 回傳 `P7Rig`（`start(profile, targets)`、`cli(...)`、`wal_records(sel)`、`stop()`）。
 - 自測：`tests/contract_blackbox/test_bb_faketarget_p7_selftest.py`。
+
+## P8（Slice 2.4）測試工具
+
+建構於 P3 harness 之上（`bb_harness.run_cli`／`isolated_env`、`bb_daemon.PyDaemon`），不重寫 daemon 啟停；fixture 由 `conftest.py` 以 import 載入（非頂層 conftest 不得定義 `pytest_plugins`）。
+
+- `p8_fixtures.py`：`ANY`（與任何值相等）、`drop_version(d)`、`CliRun(exit, json, stdout, stderr)`；`SwEnv`（fixture `sw_env`）提供 `prepare`／`start`／`stop`／`restart`、`cli`（自動帶 `--socket`）、`rpc`／`rpc_async`／`rpc_ok`、`session`、`wait_state`／`wait_until`、`wal_tx`（只供關聯，不得當 oracle）、`holders`、`unplug`／`replug`；profile 支援 `shell`（`root@sw-sim:/# `）與 `passthrough`。fixture `shell_target`、`fake_mcu`，factory `throwaway_daemon(targets=…｜by_id=…)`（完全獨立的 RUN／STATE／WAL／BY_ID／BY_PATH／CONFIG 與 socket）。
+- `shelltarget.py`：`ShellTarget`——DUT 端 PTY pair（本程序只持有 master）與 `setsid -c /bin/sh -i`（HOME／TMPDIR／cwd 指向案例暫存目錄）之間轉送；回顯由 relay 產生；`rx_log()`／`commands()` 為 DUT 端外部 oracle。故障注入：`line_limit`、`hide_tools`、`echo_stall_after`、`silent_after`、`half_prompt`、`slow_reader_bps`（`arm()` 可自當下重新計數）。
+- `fakemcu.py`：`FakeMcu`（TI SBL 子集：`55 55` → `00 cc`，之後每封包回 `00 cc`；`rx_log()`、`current_speed()`）。`fakeflasher.py`：`FakeFlasher(link, baud=…, excl=…)`。
+- `extholder.py`：`ExternalHolder(path, flock=…)`（單一子行程持有 tty；開啟或 flock 失敗一律 `ExternalHolderOpenError(errno)`）。`holder_sampler.py`：`scan_holders(path)`、`HolderSampler(path, interval_s=0.01)`（連續取樣，`max_concurrent()`）。
+- 以上 PTY／`/proc` 能力皆為 POSIX 限定；模組可在 Windows import（不在模組層 import termios／pty／fcntl）。
+- 自測：`tests/contract_blackbox/test_p8_fixtures_selftest.py`；上游介面核對：`scripts/rust/check_p8_prereqs.py`（`tests/test_p8_prereqs.py`）與 `crates/sw-core/tests/p8_upstream_interfaces.rs`。

@@ -115,6 +115,9 @@ pub struct RxShared {
     /// P7 Task 7（SC-30）：login run 取消世代。`RunCancel` 建立時記下當時值，之後遞增即視為已取消
     /// （actor 在 quiet arm 的同一事件內呼叫 `cancel_login_runs`，不需新增 Effect 變體）。
     run_cancel_gen: AtomicU64,
+    /// P8 Task 5：檔案傳輸等待的取消世代。drain Phase 1（`SessionCore::begin_stop`，所有 `StopKind`）遞增；
+    /// 只影響以 [`RunCancel::watching_transfers`] 建立的取消旗標，login run（SC-30）不受影響。
+    transfer_cancel_gen: AtomicU64,
 }
 
 impl RxShared {
@@ -130,7 +133,15 @@ impl RxShared {
             stats_override: AtomicU64::new(u64::MAX),
             capture: Mutex::new(None),
             run_cancel_gen: AtomicU64::new(0),
+            transfer_cancel_gen: AtomicU64::new(0),
         })
+    }
+
+    /// P8 Task 5：取消本 bridge 上進行中的檔案傳輸等待（watching_transfers 的 `RunCancel` 轉真）並喚醒等待者。
+    /// 不動 login run 的取消世代（P7 SC-30 行為不變）。
+    pub fn cancel_transfer_runs(&self) {
+        self.transfer_cancel_gen.fetch_add(1, Ordering::AcqRel);
+        self.wake_all();
     }
 
     /// SC-30：取消本 bridge 上所有既存的 login run（其 `RunCancel::is_triggered` 轉真）並喚醒等待者。
@@ -649,6 +660,8 @@ pub struct IoWorker {
     wal: Arc<WalWriter>,
     epoch: u64,
     sentinel_keepalive: Option<sw_pal::traits::KeepAlive>,
+    /// P8 Task 9：序列線控制（`split` 前自 `SerialHandle::line_control()` 取得；`/dev/ttyMCU` 的 baud 鏡射）。
+    line_control: Arc<dyn sw_pal::traits::SerialLineControl>,
 }
 
 /// IoWorker 對外快照（P5-T12 parity-amendments #41）。
@@ -669,6 +682,8 @@ impl IoWorker {
         args: IoWorkerArgs,
         observers: Vec<Arc<dyn RxObserver>>,
     ) -> IoWorker {
+        // P8 Task 9：`split` 會消耗 handle，線控制必須先取出（split 後仍可持有並調整速率）。
+        let line_control = handle.line_control();
         let (reader, writer, waker, close) = handle.split();
         let cancel = CancelToken::new(waker.clone());
         let reader_stop = Arc::new(AtomicBool::new(false));
@@ -710,11 +725,17 @@ impl IoWorker {
             wal,
             epoch,
             sentinel_keepalive: args.sentinel_keepalive,
+            line_control,
         }
     }
 
     pub fn tx(&self) -> &TxWriterHandle {
         &self.tx
+    }
+
+    /// P8 Task 9：本 bridge 實體 UART 的線控制（`SessionManager::line_control_for` 的來源）。
+    pub fn line_control(&self) -> Arc<dyn sw_pal::traits::SerialLineControl> {
+        Arc::clone(&self.line_control)
     }
 
     /// reader stop flag＋TxWriterStop::send＋cancel.cancel()＋waker.wake()。
@@ -746,6 +767,7 @@ impl IoWorker {
             wal,
             epoch,
             sentinel_keepalive,
+            line_control: _,
         } = self;
         std::thread::Builder::new()
             .name(format!("serialwrap-drain-{}", stop_id.0))
@@ -836,6 +858,8 @@ pub struct RunCancel {
     rx: Arc<RxShared>,
     /// 建立當下的 `RxShared::run_cancel_gen`；之後 `cancel_login_runs` 使其不符即視為取消。
     start_gen: u64,
+    /// P8 Task 5：`Some(建立當下的 transfer_cancel_gen)` 表示另監看檔案傳輸取消（drain Phase 1）。
+    transfer_gen: Option<u64>,
 }
 
 impl RunCancel {
@@ -844,6 +868,20 @@ impl RunCancel {
             flag: Arc::new(AtomicBool::new(false)),
             rx: Arc::clone(rx),
             start_gen: rx.run_cancel_gen.load(Ordering::Acquire),
+            transfer_gen: None,
+        }
+    }
+
+    /// P8 Task 5：同一取消旗標與 login 世代，另監看 [`RxShared::cancel_transfer_runs`]（自呼叫當下起；本身已在監看時
+    /// 沿用原起點，不遮蔽已發生的取消）。
+    pub fn watching_transfers(&self) -> RunCancel {
+        RunCancel {
+            flag: Arc::clone(&self.flag),
+            rx: Arc::clone(&self.rx),
+            start_gen: self.start_gen,
+            transfer_gen: self
+                .transfer_gen
+                .or_else(|| Some(self.rx.transfer_cancel_gen.load(Ordering::Acquire))),
         }
     }
     /// 設旗標並喚醒等待中的 `wait_for_regex_cancellable`（P7 Task 3 先行；Task 7 由 `Effect::CancelLogin` 觸發）。
@@ -854,6 +892,9 @@ impl RunCancel {
     pub fn is_triggered(&self) -> bool {
         self.flag.load(Ordering::Acquire)
             || self.rx.run_cancel_gen.load(Ordering::Acquire) != self.start_gen
+            || self
+                .transfer_gen
+                .is_some_and(|start| self.rx.transfer_cancel_gen.load(Ordering::Acquire) != start)
     }
 }
 

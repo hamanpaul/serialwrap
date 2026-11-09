@@ -41,6 +41,11 @@ pub struct StopOp {
 }
 
 /// IoWorker 收尾回條（BC-03 映射的唯一來源；只含未結算 op）。
+///
+/// P8 Task 5（OD-69「送出前排空」、§5.2.4／SC-07）：TxWriter 在交回 writer 之前先把 echo-ACK 節流未結的聚合緩衝
+/// 各寫成一筆 TX（`tx_writer` 的 `flush_open_aggregates`），本回條在 join writer 之後才組裝，故必晚於這些 TX 紀錄；
+/// 寫入失敗記在 `ledger` 的 op `wal_gaps`（已結算者進 `unresolved_gaps`），併入 `unrecorded`。shutdown 時
+/// `SessionManager::shutdown` 等回條後 daemon 才關 WAL，同理先於 WAL 關閉。
 #[derive(Debug)]
 pub struct WorkerStoppedReceipt {
     pub epoch: u64,

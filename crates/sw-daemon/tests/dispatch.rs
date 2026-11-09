@@ -127,8 +127,9 @@ fn deferred_methods_return_method_not_found_without_side_effects() {
     let r = ServiceRig::ready_shell();
     let scope = std::fs::read_to_string(support::data_root().join("tests/acceptance/slice21_scope.yaml")).unwrap();
     let methods = support::deferred_methods(&scope, &["2.1", sw_core::SLICE]); // 增補 #24：已交付切片之後的延後 method
-    // P7←P6 合併 D4：console 已交付、event 已移入 served，只剩 file.push／file.pull。
-    assert_eq!(methods, ["file.push", "file.pull"]);
+    // P7←P6 合併 D4：console 已交付、event 已移入 served；P8 Task 6：file.push／file.pull 已移入 served，
+    // 已無延後 method（下方迴圈保留，日後新增延後列時仍檢查 METHOD_NOT_FOUND 與零副作用）。
+    assert!(methods.is_empty(), "{methods:?}");
     for m in methods {
         let before = r.side_effect_fingerprint();
         let resp = r.call(
@@ -3024,10 +3025,19 @@ fn unknown_method_not_found() {
             r.version
         )
     );
-    // daemon.stop／daemon.handoff_stop 不經 Service（framing 攔截；handoff 屬 2.4）。
+    // daemon.stop 不經 Service（framing 攔截）。daemon.handoff_stop 自 P8 Task 14 起由 Service 承接（計畫 09 Task 14
+    // 「Rust daemon 承接 SC-11 交接停止」；Python `service.rpc` 直接回 `handoff_stop(params)`，不補 version）：
+    // 閒置時回完整的成功形狀 {"ok":true,"stopping":true,"handoff_token":<32 hex>}。
+    let h = r.call("daemon.handoff_stop", "{}");
+    let token = h.get("handoff_token").and_then(PyValue::as_str).unwrap_or_default().to_string();
+    assert!(
+        token.len() == 32 && token.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "handoff_token 須為 32 hex：{}",
+        j(&h)
+    );
     assert_eq!(
-        s(&r.call("daemon.handoff_stop", "{}"), "error_code"),
-        "METHOD_NOT_FOUND"
+        j(&h),
+        format!("{{\"ok\":true,\"stopping\":true,\"handoff_token\":\"{token}\"}}")
     );
 }
 

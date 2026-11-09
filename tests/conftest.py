@@ -233,6 +233,22 @@ _MARKERS = {
 }
 
 
+def _load_coverage_plugin():
+    import importlib.util
+
+    module = sys.modules.get("sw_contract_coverage_plugin")
+    if module is not None:
+        return module
+    path = Path(__file__).with_name("contract_blackbox") / "coverage_plugin.py"
+    spec = importlib.util.spec_from_file_location("sw_contract_coverage_plugin", path)
+    if not (spec and spec.loader):
+        raise pytest.UsageError(f"無法載入契約覆蓋 plugin：{path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["sw_contract_coverage_plugin"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def pytest_configure(config):
     """POSIX 使用唯一短 pytest 暫存根，避免巢狀 Unix socket 超過 sun_path。"""
     global _SHORT_BASETEMP
@@ -247,6 +263,10 @@ def pytest_configure(config):
     # 報告 hook 的唯一宿主；同名只註冊一次（完整 pytest tests/ 與黑箱 conftest 可能同時載入）
     if not config.pluginmanager.has_plugin(_rrp.PLUGIN_NAME):
         config.pluginmanager.register(_rrp, _rrp.PLUGIN_NAME)
+    # Slice 2.4 契約覆蓋 plugin：gate runner 指定結果目錄時才註冊；在根層級註冊才能記錄
+    # tests/contract_blackbox 以外測項的各 phase 結果（P8X-24c6b39-6）。黑箱 conftest 重用同一 module。
+    if os.environ.get("SERIALWRAP_COVERAGE_RUN_DIR"):
+        _load_coverage_plugin().register(config)
 
 
 def pytest_ignore_collect(collection_path, config):

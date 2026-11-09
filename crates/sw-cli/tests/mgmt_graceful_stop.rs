@@ -137,6 +137,11 @@ fn windows_task_stop_sends_daemon_stop_before_end() {
             .any(|c| c.get(1).map(String::as_str) == Some("/End")),
         "已正常結束不得硬殺"
     );
+    // P8 Task 13：RPC 可達且 daemon 正常結束時不查排程工作狀態（/End 規則只看逾時或 RPC 不可達）。
+    assert!(!t
+        .calls()
+        .iter()
+        .any(|c| c.first().map(String::as_str) == Some("powershell.exe")));
     // 「gone」判定：最後一次 health.ping（連線被拒）必須位於 daemon.stop 之後、/ENABLE 之前。
     let pings = o.count_prefix("rpc:health.ping");
     let last_ping = o.index_of_nth("rpc:health.ping", pings - 1);
@@ -162,6 +167,14 @@ fn windows_task_restart_aborts_when_daemon_never_exits() {
             .any(|c| c.get(1).map(String::as_str) == Some("/End")),
         "逾時後才 /End"
     );
+    // P8 Task 13：/End 只在 daemon.stop 與 10 s 等待之後；RPC 可達的逾時路徑不查排程工作狀態。
+    let o = t.event_order();
+    assert!(o.index_of("rpc:daemon.stop") < o.index_of("run:schtasks /End /TN serialwrap"));
+    assert_eq!(o.count_prefix("run:schtasks /End"), 1, "/End 恰一次");
+    assert!(!t
+        .calls()
+        .iter()
+        .any(|c| c.first().map(String::as_str) == Some("powershell.exe")));
     assert!(!t
         .calls()
         .iter()

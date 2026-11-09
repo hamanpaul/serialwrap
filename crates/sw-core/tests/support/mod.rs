@@ -8,6 +8,16 @@
 #![allow(dead_code)]
 
 pub mod fake_shell;
+/// P8 Task 6：`file.push`／`file.pull` session 整合測試台（`XferRig`／`ShellPeer`）。
+pub mod file_transfer_session;
+/// P8 Task 8：FLASHING 仲裁測試 kit（`kit`＝CoreHarness、`bb`＝ActorRig 黑箱零 TX 證據）。
+pub mod flash_core;
+/// P8 Task 9：`/dev/ttyMCU` 端點與認線協調測試台（`FlashRig`／`Mcu`）。
+pub mod flash_rig;
+/// P8 Task 11：外部工具裝置交接整合測試台（release／attach × file transfer／flash）。
+pub mod handoff;
+/// P8 Task 5：`OpTransferPort` 測試台（`PortRig`／`FakeDut`）。
+pub mod transfer_port;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -1591,6 +1601,15 @@ impl ActorRig {
     /// Task 14：直接投遞 control 事件（例如另一路徑的 `DeviceAttached`）。
     pub fn send_control(&self, ev: ControlEvent) {
         let _ = self.actor.control.send(ev);
+    }
+
+    /// P8 Task 8：現行 bridge 的 TxWriter handle（模擬 FlashCoordinator 經 `tx_for` 送 FlashProbe／Flash TX）。
+    pub fn tx_handle(&self) -> TxWriterHandle {
+        self.current_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("尚未開出 bridge")
     }
 
     /// Task 14（R1-F8）：現行 worker 的 TX 帳本 gauge。
@@ -3253,6 +3272,7 @@ impl TxRig {
             log: true,
             input_epoch,
             replay_hold: None,
+            probe_id: None,
         }
     }
     /// class HumanReplay、`input_epoch` Some、`replay_hold` Some(hold)（07 D-22）。
@@ -3275,6 +3295,7 @@ impl TxRig {
                 permit: p,
                 payload: payload.to_vec(),
                 reply: tx,
+                aggregate: None,
             })
             .expect("TxWriter 接收 job");
         rx

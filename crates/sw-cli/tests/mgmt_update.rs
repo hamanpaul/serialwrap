@@ -1073,7 +1073,8 @@ fn update_systemd_exit1_after_handoff_not_relaunched() {
         .with_idle_daemon_default(4242)
         .with_restart_on_failure()
         .with_daemon_exit_code_after_handoff(1)
-        .with_new_daemon_reporting_version("0.4.1");
+        .with_new_daemon_reporting_version("0.4.1")
+        .with_gone_handoff_event();
     let (rc, out, _) = t.run_from_bundle(&["setup", "--user"]);
     assert_eq!(rc, 0, "{out}");
     assert_eq!(json(&out)["update"]["to_version"], "0.4.1");
@@ -1097,6 +1098,10 @@ fn update_systemd_exit1_after_handoff_not_relaunched() {
         o.index_of("service:release_autostart:true")
             < o.index_of("service:start"),
         "撤銷 hold 後才由 updater 自己啟動新版"
+    );
+    assert!(
+        o.index_of("rpc:daemon.handoff_stop#gone") < o.index_of("service:start"),
+        "正式 update 編排必須先確認舊 daemon 退出，才能啟動新版"
     );
     assert_eq!(
         o.count_prefix("service:relaunch:"),

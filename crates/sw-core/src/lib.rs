@@ -7,6 +7,7 @@ pub type Mono = u64;
 pub const SLICE: &str = "2.2";
 
 pub mod actor;
+pub mod admission;
 pub mod alias_registry;
 pub mod arbiter;
 pub mod capture;
@@ -14,6 +15,7 @@ pub mod drain;
 pub mod event_engine;
 pub mod deferred;
 pub mod file_transfer;
+pub mod flash_endpoint;
 pub mod generations;
 pub mod human_console;
 pub mod lease;

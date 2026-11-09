@@ -55,10 +55,35 @@ use crate::session_core::{
 use crate::state_store::{
     lone_surrogate_encode_error, serialize_state, LoadedState, ReleasedRow, StateDelta, StateModel, StateStore,
 };
-use crate::tx_writer::{Fence, OpId, TxClass, TxJob, TxPermit, spawn_tx_writer};
+use crate::tx_writer::{Fence, HandoffFreeze, OpId, TxClass, TxJob, TxPermit, TxWriterHandle, spawn_tx_writer};
 use crate::self_test::SelfTestProbes;
 use crate::uart_bridge::{IoWorker, IoWorkerArgs, RxShared};
 use crate::wal::{WalAppendReq, WalHealthFanout, WalWriter};
+
+/// P8 Task 6：`file.push`／`file.pull` 的回覆等待上限（arch §6.3 的 600 s）。shutdown 時 drain Phase 1 取消傳輸等待，
+/// 引擎盡快返回，不以此上限阻塞停止序。
+const FILE_TRANSFER_REPLY_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// P8 Task 9：`SessionManager::send_control` 對 control lane 的送出等待上限（lane 有界；滿時不無限阻塞 flash 路徑）。
+const FLASH_CONTROL_SEND_WAIT: Duration = Duration::from_secs(2);
+
+/// P8 Task 8：flash 偵測候選（`collect_flash_candidates_and_mark` 的輸出；Task 9 `detect_mcu_line` 消費）。
+/// 欄位對照 Python 候選 dict `{com, by_id, real_path, command_capable}`；`real_path` 查無裝置時為 `None`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlashCandidate {
+    pub com: String,
+    pub by_id: Option<String>,
+    pub real_path: Option<String>,
+    pub command_capable: bool,
+}
+
+/// P8 Task 12：drain Phase 1 已送出、等待回條的集合（[`SessionManager::shutdown_phase1`] 的結果，交給
+/// [`SessionManager::shutdown_phase2`]）；`deadline` 為步驟 3～5 共用的期限。
+pub struct ShutdownDrain {
+    deadline: Instant,
+    waits: Vec<(String, Option<Receiver<Result<PyDict, PyErr>>>)>,
+    inflight: Vec<String>,
+}
 
 /// `SessionManager::new` 的注入依賴（plan 06 Task 16 Produces）。
 pub struct ManagerDeps {
@@ -199,9 +224,11 @@ struct Entry {
     #[cfg_attr(not(feature = "test-fakes"), allow(dead_code))]
     released_placeholder: bool,
     actor: Arc<ActorHandle>,
-    #[cfg_attr(not(feature = "test-fakes"), allow(dead_code))]
+    /// 與 actor 共用的 Fence（P8 Task 8：manager 於 `Inner` 鎖內寫入 `flash_critical`）。
     fence: Arc<Fence>,
     io: Arc<SessionIo>,
+    /// 與 executor 共用的各 epoch IoWorker（P8 Task 9：`tx_for`／`line_control_for` 以 Fence 的 `active_epoch` 取值）。
+    workers: Arc<Mutex<HashMap<u64, IoWorker>>>,
     #[cfg(feature = "test-fakes")]
     history: Arc<Mutex<Vec<String>>>,
 }
@@ -523,6 +550,21 @@ struct Inner {
     interactive: HashMap<String, String>,
     /// 動態偵測當時的 real_path（sticky 的 TOCTOU 比對；#95 HIGH#2）。
     probe_paths: HashMap<String, String>,
+    /// P8 Task 8：flash-critical 的 COM（Python `_flash_critical_coms`；#83 RACE-2 final）。
+    flash_critical: HashSet<String>,
+    /// P8 Task 14：SC-11 交接凍結成立中（Python `_handoff_frozen`）：新建 session 的 fence 承接交接凍結。
+    handoff_frozen: bool,
+    /// P8 Task 14：`begin_shutdown` 已呼叫（交接回滾只還原自己設的 stopping gate，不撤銷 shutdown 的）。
+    shutdown_started: bool,
+}
+
+/// P8 Task 14：偵測 PROBE 的 fence（每次 `probe_send` 新建）與交接凍結旗標，同一把鎖內登記與讀取：
+/// probe 要嘛在凍結前登記（由 `freeze_for_handoff` 凍結並等收斂），要嘛在凍結後建立即帶凍結。上限＝同時在途的
+/// attach worker 數（每個 worker 一次只送一筆 PROBE）。
+#[derive(Default)]
+struct HandoffProbes {
+    frozen: bool,
+    live: Vec<Arc<Fence>>,
 }
 
 impl Inner {
@@ -591,6 +633,8 @@ struct Shared {
     persist_observer: Mutex<Option<Arc<dyn PersistObserver>>>,
     /// 只供測試（test-fakes）：偵測 PROBE 的 Fence 以 frozen 建立（驗證 PROBE TX 經 Fence 時零 TX）。
     probe_tx_frozen: AtomicBool,
+    /// P8 Task 14：在途 PROBE fence 與交接凍結旗標（見 [`HandoffProbes`]）。
+    handoff_probes: Mutex<HandoffProbes>,
     /// P7 Task 16-wire：RX 觀察者（Python `add_rx_observer`）；每個 session bridge 的 reader 建立時取快照。
     rx_observers: Mutex<Vec<Arc<dyn crate::uart_bridge::RxObserver>>>,
     /// P6（sol 補審 #2）：human line mode basename 的路徑風格（`caps.path_flavor`）。
@@ -624,6 +668,15 @@ struct Shared {
     /// 一次性暫停點（重現 actor 處理 `DeviceOnline` 前插入的 release／shutdown／bind；wp510 第七次整包審查 High）。
     #[cfg(feature = "test-fakes")]
     bind_pre_device_online_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// 只供測試（test-fakes）：累計啟動過的 session actor 與 attach worker thread 數（`spawned_worker_count`）。
+    #[cfg(feature = "test-fakes")]
+    spawned_workers: std::sync::atomic::AtomicUsize,
+    /// 只供測試（test-fakes）：覆寫 session 公開查詢期限，以可控期限重現 handoff 的 actor timeout。
+    #[cfg(feature = "test-fakes")]
+    query_timeout_override: Mutex<Option<Duration>>,
+    /// 只供測試（test-fakes）：覆寫傳檔 RPC 等待期限，驗證 actor timeout 後仍由操作持有 admission。
+    #[cfg(feature = "test-fakes")]
+    file_transfer_timeout_override: Mutex<Option<Duration>>,
     /// 載入的 state.json 含孤立 surrogate（`LoadedState::lone_surrogates`；啟動存檔前檢查）。
     lone_surrogates: bool,
     /// 啟動存檔重現的 Python 未捕捉例外末行（`_save_state` 的 `UnicodeEncodeError`）；daemon 據此 exit 1。
@@ -925,6 +978,22 @@ fn await_actor_reply(
 }
 
 impl Shared {
+    fn query_timeout(&self) -> Duration {
+        #[cfg(feature = "test-fakes")]
+        if let Some(timeout) = *lock(&self.query_timeout_override) {
+            return timeout;
+        }
+        QUERY_TIMEOUT
+    }
+
+    fn file_transfer_reply_timeout(&self) -> Duration {
+        #[cfg(feature = "test-fakes")]
+        if let Some(timeout) = *lock(&self.file_transfer_timeout_override) {
+            return timeout;
+        }
+        FILE_TRANSFER_REPLY_TIMEOUT
+    }
+
     fn now_iso(&self) -> String {
         iso_utc_now(self.clock.wall_unix_us())
     }
@@ -1257,7 +1326,7 @@ impl Shared {
         self.send_console_scan(sid);
         let actor = self.actor_of(sid)?;
         let r = actor
-            .request(SessionRequest::GetState, QUERY_TIMEOUT)
+            .request(SessionRequest::GetState, self.query_timeout())
             .ok()?;
         let mut s = session_of(&r)?;
         // alias 以 manager 鏡像為準（`alias.set` 只改 manager 側 profile；重啟後由 YAML／template 重算）。
@@ -1265,6 +1334,20 @@ impl Shared {
             s.insert("alias", PyValue::from(e.profile.alias.clone()));
         }
         Some(s)
+    }
+
+    fn session_public_checked(&self, sid: &str) -> Result<PyDict, PyErr> {
+        self.send_console_scan(sid);
+        let actor = self
+            .actor_of(sid)
+            .ok_or_else(|| PyErr::value_error(format!("session actor unavailable: {sid}")))?;
+        let r = actor.request(SessionRequest::GetState, self.query_timeout())?;
+        let mut s = session_of(&r)
+            .ok_or_else(|| PyErr::value_error(format!("session state unavailable: {sid}")))?;
+        if let Some(e) = lock(&self.inner).sessions.get(sid) {
+            s.insert("alias", PyValue::from(e.profile.alias.clone()));
+        }
+        Ok(s)
     }
 
     fn session_state(&self, sid: &str) -> Option<String> {
@@ -1294,6 +1377,14 @@ impl Shared {
             .map(str::to_string)
             .unwrap_or_else(|| format!("{}:{}", profile.template.profile_name, profile.com));
         let fence = Fence::new();
+        // P8 Task 8：重建的 session 承接該 COM 既有的 flash-critical 標記。
+        let flash_critical = inner.flash_critical.contains(&profile.com);
+        // P8 Task 14：交接凍結期間新建的 session（在途 attach 越過 gate 後才建立）同樣零 TX。
+        let handoff_frozen = inner.handoff_frozen;
+        fence.with(|f| {
+            f.flash_critical = flash_critical;
+            f.handoff_frozen = handoff_frozen;
+        });
         self.fanout.register(fence.clone());
         let rx = RxShared::new(RX_WINDOW_MAX_CHARS, self.clock.mono_ns());
         let clock = self.clock.clone();
@@ -1396,7 +1487,7 @@ impl Shared {
             rx,
             fence: fence.clone(),
             data: mailbox.data_sender(),
-            workers,
+            workers: workers.clone(),
             runners: HashMap::new(),
             hub,
             pumps: HashMap::new(),
@@ -1417,6 +1508,8 @@ impl Shared {
                 self.close_session_preopened(&profile.device_by_id, stale);
             }
         }
+        #[cfg(feature = "test-fakes")]
+        self.spawned_workers.fetch_add(1, Ordering::SeqCst);
         inner.sessions.insert(
             sid.clone(),
             Entry {
@@ -1427,6 +1520,7 @@ impl Shared {
                 actor: Arc::new(actor),
                 fence,
                 io,
+                workers,
                 #[cfg(feature = "test-fakes")]
                 history,
             },
@@ -1784,7 +1878,12 @@ impl Shared {
                 })
         };
         match spawned {
-            Ok(_) => Ok(PreparedAttachWorker { go }),
+            Ok(_) => {
+                // 只計實際建立的 attach worker 執行緒；建立失敗不計（審查 P8X-8b5cbe4-2）。
+                #[cfg(feature = "test-fakes")]
+                self.spawned_workers.fetch_add(1, Ordering::SeqCst);
+                Ok(PreparedAttachWorker { go })
+            }
             Err(error) => {
                 self.warn(format!("attach worker 建立失敗（by_id={by_id}）：{error}"));
                 Err(error)
@@ -2475,6 +2574,15 @@ impl Shared {
             f.frozen = f.frozen || frozen || op.cancelled.load(Ordering::SeqCst);
             f.wal_unhealthy = wal_unhealthy;
         });
+        // P8 Task 14：登記與讀取交接凍結在同一把鎖內（見 `HandoffProbes`）。
+        {
+            let mut probes = lock(&self.handoff_probes);
+            probes.live.push(fence.clone());
+            if probes.frozen {
+                fence.with(|f| f.handoff_frozen = true);
+            }
+        }
+        let registered = fence.clone();
         // sol-backfill p5 #6：比照 session fence 向全域 fanout 註冊——快照讀取之後才發布的 unhealthy 也會送達；
         // 註冊協定與通知串行化，取得的必為最新狀態（Python 於送出時才讀共用 WAL unhealthy）。
         self.fanout.register(fence.clone());
@@ -2515,9 +2623,11 @@ impl Shared {
                 log: true,
                 input_epoch: None,
                 replay_hold: None,
+                probe_id: None,
             },
             payload: payload.to_vec(),
             reply: reply_tx,
+            aggregate: None,
         };
         let sent = handle.jobs.send(job).is_ok()
             && handle.wait_report(&reply_rx).is_some_and(|report| {
@@ -2528,6 +2638,7 @@ impl Shared {
             parts.writer = writer;
         }
         *lock(&op.probe_cancel) = None;
+        lock(&self.handoff_probes).live.retain(|f| !Arc::ptr_eq(f, &registered));
         sent
     }
 
@@ -3776,6 +3887,7 @@ impl SessionManager {
             closed: AtomicBool::new(false),
             persist_observer: Mutex::new(None),
             probe_tx_frozen: AtomicBool::new(false),
+            handoff_probes: Mutex::new(HandoffProbes::default()),
             rx_observers: Mutex::new(Vec::new()),
             path_flavor: caps.path_flavor,
             #[cfg(feature = "test-fakes")]
@@ -3794,6 +3906,12 @@ impl SessionManager {
             fail_next_attach_spawn: AtomicBool::new(false),
             #[cfg(feature = "test-fakes")]
             bind_pre_device_online_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            spawned_workers: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "test-fakes")]
+            query_timeout_override: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            file_transfer_timeout_override: Mutex::new(None),
         });
         shared.bootstrap_sessions(&load.profiles);
         let mgr = Arc::new(SessionManager {
@@ -3921,6 +4039,41 @@ impl SessionManager {
         self.shared.attach_released_placeholder(sid, force, None)
     }
 
+    /// P8 Task 6：`file.push`／`file.pull` 的 session 路由（Python `_resolve_session_id(file_transfer=True)` 之後的
+    /// `file_push`／`file_pull`）。查無 → `SESSION_NOT_FOUND`＋原 selector；其餘閘門在 actor 內原子判定。
+    pub fn file_transfer(&self, req: crate::file_transfer::FileTransferRequest) -> Result<PyDict, PyErr> {
+        match self.resolve(&req.selector) {
+            Some(sid) => self.route(&sid, SessionRequest::FileTransfer(req), self.shared.file_transfer_reply_timeout()),
+            None => Ok(pydict! {
+                "ok" => false,
+                "error_code" => "SESSION_NOT_FOUND",
+                "selector" => req.selector,
+            }),
+        }
+    }
+
+    /// 傳檔 RPC 路由；ticket 由 pending op 持有至傳輸實際終態，actor reply timeout 不會提早解除交接 admission。
+    pub fn file_transfer_with_admission(
+        &self,
+        req: crate::file_transfer::FileTransferRequest,
+        admission: Option<Arc<crate::admission::AdmissionTicket>>,
+    ) -> Result<PyDict, PyErr> {
+        match self.resolve(&req.selector) {
+            Some(sid) => {
+                let request = match admission {
+                    Some(admission) => SessionRequest::FileTransferAdmitted { req, admission },
+                    None => SessionRequest::FileTransfer(req),
+                };
+                self.route(&sid, request, self.shared.file_transfer_reply_timeout())
+            }
+            None => Ok(pydict! {
+                "ok" => false,
+                "error_code" => "SESSION_NOT_FOUND",
+                "selector" => req.selector,
+            }),
+        }
+    }
+
     /// 將 session 請求路由到對應 actor 並等待回覆。
     pub fn route(
         &self,
@@ -4013,9 +4166,14 @@ impl SessionManager {
         let is_release = matches!(req, SessionRequest::Release { .. });
         if matches!(
             req,
-            SessionRequest::GetState | SessionRequest::Activity | SessionRequest::InteractiveOpen { .. }
+            SessionRequest::GetState
+                | SessionRequest::Activity
+                | SessionRequest::InteractiveOpen { .. }
+                | SessionRequest::FileTransfer(_)
+                | SessionRequest::FileTransferAdmitted { .. }
         ) {
             // 07 D-09：session 摘要與 interactive_open（Python `_refresh_interactive_locked` 即時掃 peer）前先更新 console peer 判定。
+            // P8 Task 6：file.* 的 manager 層同樣先 `_refresh_interactive_locked`（human lease 的 peer 判定）。
             self.shared.send_console_scan(sid);
         }
         let result = self.shared.request(sid, req, timeout)?;
@@ -4316,8 +4474,8 @@ impl SessionManager {
             return self.shared.request(sid, SessionRequest::Clear, timeout);
         };
         let by_id = str_of(&public, "device_by_id").unwrap_or_default();
-        if str_of(&public, "state").as_deref() == Some("FLASHING") {
-            // FLASHING 不得 detach bridge（#69 r5）；Python 鍵序 ok／error_code／selector／session。
+        if str_of(&public, "state").as_deref() == Some("FLASHING") || self.flash_critical_sid(sid) {
+            // FLASHING 或 flash probe 臨界區不得 detach bridge（#69 r5；#83 RACE-2 final）；Python 鍵序 ok／error_code／selector／session。
             return Ok(flashing_busy(public));
         }
         if str_of(&public, "state").as_deref() == Some("RELEASED")
@@ -4347,6 +4505,20 @@ impl SessionManager {
         sids.sort();
         sids.iter()
             .filter_map(|sid| self.shared.session_public(sid))
+            .collect()
+    }
+
+    /// 交接專用完整 session 快照；任何 actor 查詢失敗都回傳該 session 的 COM，呼叫端必須 fail closed。
+    pub fn list_sessions_checked(&self) -> Result<Vec<PyDict>, String> {
+        let mut sessions: Vec<(String, String)> = lock(&self.shared.inner)
+            .sessions
+            .values()
+            .map(|entry| (entry.sid.clone(), entry.profile.com.clone()))
+            .collect();
+        sessions.sort_by(|a, b| a.0.cmp(&b.0));
+        sessions
+            .into_iter()
+            .map(|(sid, com)| self.shared.session_public_checked(&sid).map_err(|_| com))
             .collect()
     }
 
@@ -4406,8 +4578,8 @@ impl SessionManager {
         if let Some(sid) = self.resolve(selector) {
             if !lock(&self.shared.inner).stopping {
                 if let Some(public) = self.shared.session_public(&sid) {
-                    if str_of(&public, "state").as_deref() == Some("FLASHING") {
-                        // FLASHING 不得 rebind（Python 於 DEVICE_ALREADY_BOUND 之前判定）。
+                    if str_of(&public, "state").as_deref() == Some("FLASHING") || self.flash_critical_sid(&sid) {
+                        // FLASHING 或 flash probe 臨界區不得 rebind（Python 於 DEVICE_ALREADY_BOUND 之前判定；#83 RACE-2 final）。
                         return Ok(flashing_busy(public));
                     }
                 }
@@ -4991,6 +5163,136 @@ impl SessionManager {
             .collect()
     }
 
+    /// P8 Task 8：**原子**收集 flash 偵測候選並標記 flash-critical（Python `collect_flash_candidates_and_mark`，
+    /// `session_manager.py:3265`；#83 RACE-2 final）。候選＝非 command_capable、state ∈ {READY, ATTACHED}、無前景操作。
+    ///
+    /// session 狀態由各自的 actor 持有，manager 無法與 Python 一樣在一把鎖內同時讀快照與標記；改為**先標記、後取
+    /// 快照**：每個非 command_capable 的 session 先在 `Inner` 鎖內標 flash-critical（同步寫入該 session 的 Fence），
+    /// 之後到達的 clear／release／bind／recover 一律 `FLASHING_BUSY`；再向 actor 取快照，不符候選條件者撤回本次新增
+    /// 的標記（既有標記屬其他偵測者，不動）。actor 的 `FlashSyncProbeStart` 仍會重驗全部條件（最終授權）。
+    pub fn collect_flash_candidates_and_mark(&self) -> Vec<FlashCandidate> {
+        self.pump();
+        let entries: Vec<(String, String)> = lock(&self.shared.inner)
+            .sessions
+            .values()
+            .filter(|e| !e.profile.template.command_capable())
+            .map(|e| (e.sid.clone(), e.profile.com.clone()))
+            .collect();
+        let mut out = Vec::new();
+        for (sid, com) in entries {
+            let newly = self.mark_flash_critical(&com);
+            let candidate = self.shared.session_public(&sid).filter(|s| {
+                s.get("command_capable") != Some(&PyValue::Bool(true))
+                    && matches!(str_of(s, "state").as_deref(), Some("READY" | "ATTACHED"))
+                    && s.get("foreground_busy") != Some(&PyValue::Bool(true))
+                    && s.get("drain_stalled") != Some(&PyValue::Bool(true))
+            });
+            match candidate {
+                Some(public) => {
+                    let by_id = str_of(&public, "device_by_id").filter(|b| !b.is_empty());
+                    let real_path = by_id.as_ref().and_then(|b| {
+                        lock(&self.shared.inner).devices.get(b).map(|d| d.real_path.clone())
+                    });
+                    out.push(FlashCandidate {
+                        com,
+                        by_id,
+                        real_path,
+                        command_capable: false,
+                    });
+                }
+                None if newly => self.unmark_flash_critical(&com),
+                None => {}
+            }
+        }
+        out
+    }
+
+    /// 標記 COM 為 flash-critical（Python `mark_flash_critical`）；回 true 表示本次新增。
+    fn mark_flash_critical(&self, com: &str) -> bool {
+        let mut inner = lock(&self.shared.inner);
+        let newly = inner.flash_critical.insert(com.to_string());
+        for e in inner.sessions.values().filter(|e| e.profile.com == com) {
+            e.fence.with(|f| f.flash_critical = true);
+        }
+        newly
+    }
+
+    /// P8 Task 8：解除 COM 的 flash-critical 標記（Python `unmark_flash_critical`）。
+    pub fn unmark_flash_critical(&self, com: &str) {
+        let mut inner = lock(&self.shared.inner);
+        inner.flash_critical.remove(com);
+        for e in inner.sessions.values().filter(|e| e.profile.com == com) {
+            e.fence.with(|f| f.flash_critical = false);
+        }
+    }
+
+    /// P8 Task 8：COM 是否在 flash-critical 臨界區（probe 窗口）。
+    pub fn flash_critical(&self, com: &str) -> bool {
+        lock(&self.shared.inner).flash_critical.contains(com)
+    }
+
+    /// P8 Task 9：COM 目前 bridge（Fence 的 `active_epoch`＝actor 的 `conn_epoch`）的 TxWriter；無 active epoch 或該
+    /// epoch 的 worker 已收尾 → `None`。FlashCoordinator 以此送 `FlashProbe`／`Flash` TX（permit 仍由 Fence 驗 epoch）。
+    pub fn tx_for(&self, com: &str) -> Option<TxWriterHandle> {
+        let (epoch, workers) = self.active_workers(com)?;
+        let w = lock(&workers);
+        w.get(&epoch).map(|worker| worker.tx().clone())
+    }
+
+    /// P8 Task 9：COM 目前 bridge 的序列線控制（`/dev/ttyMCU` baud 鏡射）；取值規則同 [`SessionManager::tx_for`]。
+    pub fn line_control_for(&self, com: &str) -> Option<Arc<dyn sw_pal::traits::SerialLineControl>> {
+        let (epoch, workers) = self.active_workers(com)?;
+        let w = lock(&workers);
+        w.get(&epoch).map(IoWorker::line_control)
+    }
+
+    /// P8 Task 9：把 control 事件送進 COM 的 actor（flash 事件）；查無 session 或送出失敗（含 control lane 滿到
+    /// `FLASH_CONTROL_SEND_WAIT` 仍送不進）回 false。不檢查 epoch：結束事件（Released／HolderGone）在 bridge 失效後仍須
+    /// 送達以清 flash 狀態，epoch／probe_id 由 actor 驗證。
+    pub fn send_control(&self, com: &str, ev: ControlEvent) -> bool {
+        let actor = lock(&self.shared.inner)
+            .sessions
+            .values()
+            .find(|e| e.profile.com == com)
+            .map(|e| e.actor.clone());
+        match actor {
+            Some(actor) => actor.control.send_timeout(ev, FLASH_CONTROL_SEND_WAIT).is_ok(),
+            None => false,
+        }
+    }
+
+    /// COM 的 Fence `active_epoch`（＝actor 的 `conn_epoch`）與 worker 表；無 active epoch 回 `None`。
+    fn active_workers(&self, com: &str) -> Option<(u64, Arc<Mutex<HashMap<u64, IoWorker>>>)> {
+        let inner = lock(&self.shared.inner);
+        let e = inner.sessions.values().find(|e| e.profile.com == com)?;
+        let epoch = e.fence.with(|f| f.active_epoch)?;
+        Some((epoch, e.workers.clone()))
+    }
+
+    /// P8 Task 9：經 manager 的 WARNING 出口寫一行（FlashCoordinator／FlashEndpoint 用）。
+    pub fn warn(&self, msg: String) {
+        self.shared.warn(msg);
+    }
+
+    /// 只供測試：COM 的 Fence（斷言 `flash_mode`、注入 freeze）。
+    #[cfg(feature = "test-fakes")]
+    pub fn fence_for_test(&self, com: &str) -> Option<Arc<Fence>> {
+        lock(&self.shared.inner)
+            .sessions
+            .values()
+            .find(|e| e.profile.com == com)
+            .map(|e| e.fence.clone())
+    }
+
+    /// session_id 對應的 COM 是否 flash-critical。
+    fn flash_critical_sid(&self, sid: &str) -> bool {
+        let inner = lock(&self.shared.inner);
+        inner
+            .sessions
+            .get(sid)
+            .is_some_and(|e| inner.flash_critical.contains(&e.profile.com))
+    }
+
     /// DeviceWatcher → manager 的事件送端（Delta 轉 `update_devices`、Tick 轉 `on_tick`）。
     pub fn watcher_sender(&self) -> Sender<WatcherEvent> {
         self.watcher_tx.clone()
@@ -5066,21 +5368,113 @@ impl SessionManager {
     }
 
     pub fn begin_shutdown(&self) {
-        lock(&self.shared.inner).stopping = true;
+        let mut inner = lock(&self.shared.inner);
+        inner.stopping = true;
+        inner.shutdown_started = true;
+    }
+
+    /// P8 Task 14：交接停止成立前凍結背景來源與既有 bridge 的新 TX（Python `SessionManager.freeze_for_handoff`）。
+    ///
+    /// 1. stopping gate：熱插、re-attach、bootstrap 不再開 UART、不建 worker（`stopping`）；交接凍結期間新建的
+    ///    session fence 承接凍結（`handoff_frozen`）。
+    /// 2. 所有 session fence 與在途 PROBE fence 設 `handoff_frozen`：之後任何來源（重探、login、human raw、console 行、
+    ///    flash）的新 TX 一律被拒（零 TX）；已經 gate 提交的寫入段須在 `per_fence` 內收斂。
+    ///
+    /// 回傳未收斂的 COM（空＝凍結成立）。未收斂且本次為新凍結時，撤銷本次建立的凍結（fence 的 `handoff_frozen`、
+    /// stopping gate 還原為 shutdown 是否已開始）；shutdown／drain 的 `frozen` 不動。已凍結者保持凍結（冪等）。
+    /// reader 與埠保持開啟；實際排空仍由停止序的 drain 完成。
+    pub fn freeze_for_handoff(&self, per_fence: Duration) -> Vec<String> {
+        let (was_frozen, fences) = {
+            let mut inner = lock(&self.shared.inner);
+            let was = inner.handoff_frozen;
+            inner.handoff_frozen = true;
+            inner.stopping = true;
+            let fences: Vec<(String, Arc<Fence>)> = inner
+                .sessions
+                .values()
+                .map(|e| (e.profile.com.clone(), e.fence.clone()))
+                .collect();
+            (was, fences)
+        };
+        let probes: Vec<Arc<Fence>> = {
+            let mut probes = lock(&self.shared.handoff_probes);
+            probes.frozen = true;
+            probes.live.clone()
+        };
+        let mut unconverged: Vec<String> = Vec::new();
+        // 旗標已設者（撤銷時須清除）；`Locked` 者旗標未設，撤銷時不取其 fence 鎖（OS 提交仍持鎖，避免交接回覆被拖住）。
+        let mut flagged: Vec<&Arc<Fence>> = Vec::new();
+        let mut locked: Vec<&Arc<Fence>> = Vec::new();
+        let targets = fences
+            .iter()
+            .map(|(com, fence)| (com.as_str(), fence))
+            .chain(probes.iter().map(|fence| (PROBE_COM, fence)));
+        for (com, fence) in targets {
+            match fence.freeze_for_handoff(Instant::now() + per_fence) {
+                HandoffFreeze::Converged => flagged.push(fence),
+                HandoffFreeze::InFlight => {
+                    flagged.push(fence);
+                    unconverged.push(com.to_string());
+                }
+                HandoffFreeze::Locked => {
+                    locked.push(fence);
+                    unconverged.push(com.to_string());
+                }
+            }
+        }
+        if was_frozen {
+            // 已凍結者保持凍結：先前交接已成立，持鎖中的提交結束後也必須帶上旗標（等待以 OS 提交本身為界）。
+            for fence in locked {
+                fence.with(|st| st.handoff_frozen = true);
+            }
+        } else if !unconverged.is_empty() {
+            // 交接未成立：撤銷本次新建立的凍結（SC-11：忙碌不凍結、不停止）。
+            {
+                let mut inner = lock(&self.shared.inner);
+                inner.handoff_frozen = false;
+                inner.stopping = inner.shutdown_started;
+            }
+            lock(&self.shared.handoff_probes).frozen = false;
+            for fence in flagged {
+                fence.thaw_handoff();
+            }
+        }
+        unconverged.sort();
+        unconverged.dedup();
+        unconverged
+    }
+
+    /// P8 Task 14：selector（session_id／COM／alias）對應的 COM（admission ticket 的 COM 歸屬）。
+    pub fn com_of(&self, selector: &str) -> Option<String> {
+        lock(&self.shared.inner).resolve(selector).map(|e| e.profile.com.clone())
+    }
+
+    /// P8 Task 14：interactive_id 對應 session 的 COM（admission ticket 的 COM 歸屬；查無回 `None`）。
+    pub fn interactive_com(&self, interactive_id: &str) -> Option<String> {
+        let inner = lock(&self.shared.inner);
+        let sid = inner.interactive.get(interactive_id)?;
+        inner.sessions.get(sid).map(|e| e.profile.com.clone())
     }
 
     /// 先隱含呼叫 `begin_shutdown`；回傳每個 drain 目標是否在 `budget` 內收斂。
     /// drain 集合＝有 bridge（或 attach／drain 進行中）的 session ∪ inflight attach worker（`attach:<by_id>`）。
+    /// 等同 [`SessionManager::shutdown_phase1`] 後立即 [`SessionManager::shutdown_phase2`]（daemon 停止序在兩者之間
+    /// join RPC handler，P8 Task 12）。
     pub fn shutdown(&self, budget: Duration) -> Vec<(String, bool)> {
+        let drain = self.shutdown_phase1(Instant::now() + budget);
+        self.shutdown_phase2(drain)
+    }
+
+    /// 停止序步驟 3（P8 Task 12，arch §6.1）：隱含 `begin_shutdown`、取消 inflight attach，對每個需 drain 的 session
+    /// 送出 Shutdown（actor 內同步執行 Phase 1：fence 凍結、取消進行中的檔案傳輸、排隊命令 `FLUSHED_BY_SHUTDOWN`），
+    /// 再以同一 control lane 的查詢作屏障，返回時 Phase 1 已在每個仍存活的 actor 執行過。等待回條屬 Phase 2。
+    pub fn shutdown_phase1(&self, deadline: Instant) -> ShutdownDrain {
         self.begin_shutdown();
-        let deadline = Instant::now() + budget;
         type ShutdownTargets = (
             Vec<(String, Arc<ActorHandle>)>,
             Vec<String>,
             Vec<(String, AttachOp)>,
         );
-        let mut handoff_close: Vec<(String, AttachOp)> = Vec::new();
-        let mut handoff_wait: Vec<String> = Vec::new();
         let (entries, inflight, unconsumed): ShutdownTargets = {
             let inner = lock(&self.shared.inner);
             for op in inner.inflight.values() {
@@ -5109,6 +5503,7 @@ impl SessionManager {
         }
 
         let mut waits: Vec<(String, Option<Receiver<Result<PyDict, PyErr>>>)> = Vec::new();
+        let mut barriers: Vec<Arc<ActorHandle>> = Vec::new();
         for (sid, actor) in entries {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let state = actor
@@ -5124,8 +5519,32 @@ impl SessionManager {
                 .control
                 .send_timeout(ControlEvent::Shutdown { reply }, remaining)
                 .is_ok();
+            if sent {
+                barriers.push(actor.clone());
+            }
             waits.push((sid, sent.then_some(rx)));
         }
+        // Phase 1 屏障：Shutdown 與查詢同走 control lane（FIFO），查詢有回應（或 actor 已結束）即表示 Phase 1 已執行。
+        for actor in barriers {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let _ = actor.request(SessionRequest::GetState, remaining.min(QUERY_TIMEOUT));
+        }
+        ShutdownDrain {
+            deadline,
+            waits,
+            inflight,
+        }
+    }
+
+    /// 停止序步驟 5（P8 Task 12）：在 Phase 1 的同一期限內等待每個 drain 目標的回條；回傳是否收斂。
+    pub fn shutdown_phase2(&self, drain: ShutdownDrain) -> Vec<(String, bool)> {
+        let ShutdownDrain {
+            deadline,
+            waits,
+            inflight,
+        } = drain;
+        let mut handoff_close: Vec<(String, AttachOp)> = Vec::new();
+        let mut handoff_wait: Vec<String> = Vec::new();
         let mut out = Vec::new();
         for (sid, rx) in waits {
             // 只有 `ok:true` 的收斂回覆算排空；同一 stop 的 DRAIN_STALLED 回覆（release 併入的等待者）不算。
@@ -5221,6 +5640,20 @@ impl SessionManager {
             out.push((format!("attach:{by_id}"), wait_attach(&by_id)));
         }
         out
+    }
+
+    /// 目前全部 session 的 id（排序；不查詢 actor，停機收尾時 actor 可能已結束）。
+    pub fn session_ids(&self) -> Vec<String> {
+        let mut sids: Vec<String> = lock(&self.shared.inner).sessions.keys().cloned().collect();
+        sids.sort();
+        sids
+    }
+
+    /// 只供測試（test-fakes）：manager 累計啟動過的 session actor 與 attach worker thread 數（P8 Task 12：
+    /// stopping gate 之後不得再增加，Phase 1 之後的熱插或延後 reconcile 不得新增未納入 drain 的 worker）。
+    #[cfg(feature = "test-fakes")]
+    pub fn spawned_worker_count(&self) -> usize {
+        self.shared.spawned_workers.load(Ordering::SeqCst)
     }
 
     /// 只供測試（test-fakes）：session 的 fence `wal_unhealthy`（`None`＝查無 session）。
@@ -5343,6 +5776,40 @@ impl SessionManager {
                 QUERY_TIMEOUT,
             );
         }
+    }
+
+    /// 只供測試（test-fakes）：覆寫 actor 公開查詢期限。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_query_timeout_for_test(&self, timeout: Duration) {
+        *lock(&self.shared.query_timeout_override) = Some(timeout);
+    }
+
+    /// 只供測試（test-fakes）：暫停下一筆 actor request，用來確定性重現 session 查詢逾時。
+    #[cfg(feature = "test-fakes")]
+    pub fn pause_next_request_for_test(
+        &self,
+        selector: &str,
+    ) -> Option<(crossbeam_channel::Receiver<()>, crossbeam_channel::Sender<()>)> {
+        let sid = self.resolve(selector)?;
+        let actor = self.shared.actor_of(&sid)?;
+        Some(actor.probe.pause_before_next("Request"))
+    }
+
+    /// 只供測試（test-fakes）：暫停下一個自動登入結果 dispatch，確定性安排交接凍結與結果回填的交錯。
+    #[cfg(feature = "test-fakes")]
+    pub fn pause_next_login_finished_for_test(
+        &self,
+        selector: &str,
+    ) -> Option<(crossbeam_channel::Receiver<()>, crossbeam_channel::Sender<()>)> {
+        let sid = self.resolve(selector)?;
+        let actor = self.shared.actor_of(&sid)?;
+        Some(actor.probe.pause_before_next("LoginFinished"))
+    }
+
+    /// 只供測試（test-fakes）：覆寫 file.push／file.pull actor 回覆期限。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_file_transfer_timeout_for_test(&self, timeout: Duration) {
+        *lock(&self.shared.file_transfer_timeout_override) = Some(timeout);
     }
 }
 

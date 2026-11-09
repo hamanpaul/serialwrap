@@ -129,6 +129,7 @@ fn event_params_and_dispatch_fail_until_implemented() {
         wal_dir: String::new(),
         log_dir: String::new(),
         config_yaml: String::new(),
+        ttymcu_path: String::new(),
     };
     let mut out = Vec::new();
     let mut err = Vec::new();

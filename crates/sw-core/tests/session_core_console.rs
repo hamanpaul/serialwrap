@@ -400,6 +400,71 @@ fn queued_command_waits_for_replay_settle() {
     );
 }
 
+/// 編排者更正（2026-11-08，rulings s2「OD-82 的前提不成立」；DF-28 作廢）：D-22 回放保留期間的 `file.push`／`file.pull`
+/// 與 Python 一致——`session_manager.py` 的 `_finish_foreground_operation` 在鎖外寫回放、寫完才清前景 token，期間
+/// `file_push`／`file_pull` 經 `_begin_foreground_operation_locked`（`foreground_busy or _foreground_operation is not None`）
+/// 立即回 `SESSION_BUSY`＋selector；不排隊（07 D-22(2)、09 EVT-D-F6）。回放照常寫出、結算後也不補執行傳檔。
+#[test]
+fn file_transfer_busy_during_replay_hold_not_queued() {
+    use support::file_transfer_session::{pull_req, push_req};
+
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.set_auto_complete_human_tx(false);
+    h.attach_pty_console("c1", true);
+    let a = h.start_foreground_command("echo a");
+    h.input("c1", b"x");
+    let epoch = h.epoch();
+    let fx = h.feed(ControlEvent::OpFinished {
+        op_id: a.op_id,
+        epoch,
+        outcome: OpOutcome::CommandResult(pydict! { "ok" => true, "stdout" => "a" }),
+        after_rx_seq: None,
+    });
+    assert_eq!(human_txs(&fx), vec![(TxClass::HumanReplay, "human:c1".to_string(), b"x".to_vec())]);
+    let hold = h.last_human_permit().unwrap().replay_hold.expect("回放帶 replay_hold");
+    assert_eq!(h.fence_replay_auth(), Some(hold));
+    assert!(h.foreground_busy(), "回放未結算：前景仍忙");
+    let file_ops = |effects: &[Effect]| {
+        effects
+            .iter()
+            .filter(|e| matches!(e, Effect::StartOp { spec: OpSpec::FileTransfer(_), .. }))
+            .count()
+    };
+    for req in [push_req("/l", "/r"), pull_req("/r", None)] {
+        let kind = req.kind;
+        let before = h.tx_effect_count();
+        let (r, fx) = h.rpc_full(SessionRequest::FileTransfer(req));
+        assert_eq!(
+            h.wire(&r.unwrap()),
+            r#"{"ok":false,"error_code":"SESSION_BUSY","selector":"COM0"}"#,
+            "{kind:?}：回放保留期間立即回 SESSION_BUSY"
+        );
+        assert!(start_ops(&fx).is_empty(), "{kind:?}：傳檔未啟動");
+        assert_eq!(h.tx_effect_count(), before, "{kind:?}：零 TX");
+        let still = h.replay_hold().expect("拒絕不動回放保留");
+        assert!(!still.revoked, "{kind:?}：回放未被撤銷");
+        assert_eq!(h.fence_replay_auth(), Some(hold));
+    }
+    let fx = h.complete_human_tx(TxOutcome::Completed(1), None);
+    assert_eq!(file_ops(&fx), 0, "回放結算後不補執行傳檔");
+    assert!(start_ops(&fx).is_empty());
+    assert_eq!(h.replay_hold(), None);
+    assert!(!h.foreground_busy());
+    let fx = h.advance_s(5.0);
+    assert_eq!(file_ops(&fx), 0, "之後也不延後執行");
+    assert_eq!(
+        h.effect_kinds().iter().filter(|k| **k == "StartOp").count(),
+        1,
+        "整段只有命令 A 的 StartOp"
+    );
+    assert_eq!(
+        h.tx_order(),
+        vec![(TxClass::Command, b"echo a\n".to_vec()), (TxClass::HumanReplay, b"x".to_vec())],
+        "UART 上只有命令與回放"
+    );
+}
+
 #[test]
 fn foreground_busy_tracks_foreground_without_hold() {
     let mut h = CoreHarness::new(SHELL_PROFILE);

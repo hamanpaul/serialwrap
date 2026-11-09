@@ -341,9 +341,11 @@ pub fn login_tx_sender(
                 log,
                 input_epoch: None,
                 replay_hold: None,
+                probe_id: None,
             },
             payload: payload.to_vec(),
             reply,
+            aggregate: None,
         };
         // TxWriter 已關閉（drain／shutdown）：等同 fence 凍結（Python `_tx_frozen` → `draining`）。
         let not_submitted = TxReport {

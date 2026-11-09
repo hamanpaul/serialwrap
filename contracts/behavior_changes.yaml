@@ -1,12 +1,13 @@
 # 行為變更登記（BC／SC／DF）。由 P0-T5 建立，對應 docs/rust-refactor/plans/01-stage0-contracts.md T5 與調和表 spec-reconciliation.md §1。
-# BC-01～BC-05 依 OD-04 核准；SC-01～SC-31（SC-08 已依 OD-14 #3 撤回）與 SC-34～SC-37（SC-37 依 OD-21）、SC-39（OD-48）、DF-01～DF-25 依定稿規格、調和表與相關 OD 推導；SC-30、DF-18 由 P7 Task 0 登記（08 §0.5）；DF-23 依 OD-57、DF-24 依 OD-73 由 P7 登記；DF-25 依 OD-77 登記。
+# BC-01～BC-05 依 OD-04 核准；SC-01～SC-32（SC-08 已依 OD-14 #3 撤回）與 SC-34～SC-37（SC-37 依 OD-21）、SC-39（OD-48）、DF-01～DF-25 依定稿規格、調和表與相關 OD 推導；SC-30、DF-18 由 P7 Task 0 登記（08 §0.5）；DF-23 依 OD-57、DF-24 依 OD-73 由 P7 登記；DF-25 依 OD-77 登記；SC-32 由 P8 Task 1 登記（09 §0.4，Rust-only）。
+# SC-33 依擁有者 OD-79 撤回、不登記（原列案例改列 SC-03），亦不新增 pending owner item 8；DF-26 保留給 OD-80（編排者 2026-11-07），SC-38 未佔用。
 # SC-08 依 OD-14 #3 撤回（UDS 維持 0660），編號保留不重用。
 # SC-11 交接排空窗口依 OD-16 (3) 擁有者接受（2026-10-22）：related_decisions、spec_refs、approval_conditions 已載明；owner_confirmation 維持 not_required、owner_item 不指派（擁有者佇列編號未定，見 spec-reconciliation SC-11 列），故不改動 pending 佇列與 tests/test_p1oc_catalog.py 釘定的 confirmed 清單。
 # 登錄時全部為 APPROVED（核准未實作）；實作後依狀態推進協定改為 IMPLEMENTED，VERIFIED 只由擁有者標記。
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 10
+revision: 11
 changes:
   - id: "BC-01"
     kind: "BC"
@@ -942,6 +943,32 @@ changes:
     compatibility_impact: "(a) 07 D-13：沒有 active `conn_epoch`（`DETACHED`／`RECOVERING`／`RELEASED`／drain 中，即 `fence.active_epoch == None`）時收到的 console 輸入一律丟棄，並寫 D-19 的限速 WARNING。Python（含 P1）會把這段輸入留在 kernel PTY buffer，等新 bridge 讀入後以新的 `_owner_gen` 處理，違反 §11.3「Recovery 不得回放失效上下文的輸入」。(b) 07 D-16：lease close 或 expire 時，若 stash 的 human lease 沒有還原（stash 已過期或 peer 不在），`PostClose.replay_allowed=false`：先刪除 stash client 的 deferred entry（WARNING reason `lease_dropped`），再 `resume()`，不回放該 client 的輸入；其他 client 的回放不受影響。(c) 07 D-05：Control 合計上限 `CONSOLE_CONTROL_MAX_BYTES=65536`，超過上限時 hub 關閉該 console（依一般斷線流程送 `ConsoleDisconnected`）並寫 WARNING，不靜默丟棄。(d) 07 D-18：`telnet_consoles_per_session` 32（pause_accept：達上限時 listener 不加入 mux 讀取，超過 backlog 8 由 OS 拒絕；console 數降下即恢復）。"
     approval_conditions: "依 07 D-13、D-16、D-05 Control 上限與 D-18 accept 上限：失效上下文的輸入一律丟棄並可診斷（§5.3）；lease 上下文未還原時不回放該 client；Control 溢位關閉 console 而非靜默丟棄；Telnet console 達 32 暫停 accept、數量降下即恢復。OD-04 核准的 BC-02 範圍未涵蓋以上情形，故另登記，不併入 BC-02。"
     related_decisions: ["OD-04"]
+  - id: "SC-32"
+    kind: "SC"
+    title: "Probe／FLASHING 期間 bridge I/O 失敗進 drain 轉 RECOVERING、裝置消失延後 reconcile（Rust-only）"
+    status: "APPROVED"
+    approval:
+      owner: "spec-final"
+      date: "2026-11-08"
+      decision_ref: "serialwrap-rust-spec-final.md §5.3"
+      basis: "spec_final"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "slice-2.4"
+    approved_at_revision: 11
+    spec_refs: ["§5.3", "§5.2.3", "§5.2.5"]
+    reconciliation_refs: ["SC-32", "SC-04"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P8"]
+    case_ids: ["s24-flash-ioerror-recovering"]
+    compatibility_impact: "09 §0.4（SC-04 適用面）：Python 基線 _handle_bridge_down 與 _detach_by_id 在 flash busy 時都直接略過（#83 RACE-2：BSL／reset 期間 by-id 常短暫消失），bridge 真正 I/O 失敗時 session 會停在 FLASHING。Rust 只有 UartIoError 在 Probe／FLASHING 期間進 Two-Phase Drain Phase 1 並轉 RECOVERING（依 §5.3「活躍態＋I/O error → RECOVERING」，handoff 回條前不重開 UART）；DeviceDetached 在 Probe／FLASHING 期間延後到 exit flashing 後再 reconcile（與 Python 略過等價）；所有 flash 結束路徑（Matched 後 HolderGone、未匹配釋放、I/O error、停止）無條件清 Fence.flash_mode 與 P6 OwnershipState.flash_mode。不新增錯誤碼與 WAL META。"
+    approval_conditions: "依定稿規格 §5.3 與 §5.2.3／§5.2.5：只對 UartIoError 改為 drain→RECOVERING，DeviceDetached 維持延後 reconcile；不修改 Python sw_core（Stage 1 退守 artifact 不變，09 Global Constraints），故為 Rust-only、只驗絕對契約、不參與 A/B 差分；由 P8 Task 8 實作並依狀態推進協定改 IMPLEMENTED。"
+    related_decisions: []
   - id: "SC-34"
     kind: "SC"
     title: "session.attach／recover 的 error_code 與 last_error 分離"
