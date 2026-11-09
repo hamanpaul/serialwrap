@@ -6,10 +6,11 @@
 
 mod support;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use support::*;
 use sw_core::session_core::{SessionRequest, SessionState};
+use sw_core::session_manager::SessionManager;
 use sw_core::state_store::{LoadedState, ReleasedRow};
 use sw_pal::fakes::serial::FakeWriteStep;
 use sw_pal::traits::{
@@ -28,6 +29,17 @@ fn rpc(r: Result<PyDict, PyErr>) -> PyDict {
         Ok(d) => d,
         Err(e) => panic!("RPC 不應回 Err：{}", e.message),
     }
+}
+
+fn wp510_release(manager: &SessionManager, sid: &str) -> Result<PyDict, PyErr> {
+    manager.route(
+        sid,
+        SessionRequest::Release {
+            source: "agent".to_string(),
+            reason: PyValue::Null,
+        },
+        RPC,
+    )
 }
 
 /// 回應 dict 的 `ok` 欄位是否為 true。
@@ -1815,6 +1827,216 @@ fn wp510_review_late_placeholder_attach_completion_clears_drain_stall() {
     assert_eq!(
         repeated_session.get("drain_timeout_epoch"),
         Some(&PyValue::Null)
+    );
+}
+
+#[test]
+fn wp510_lifecycle_shutdown_cancel_fail_close_keeps_placeholder_blocked() {
+    const SID: &str = "gone-template:COM3";
+    const BY_ID: &str = "/s/by-id/usb-G";
+    const REAL: &str = "/dev/ttyG";
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    let device = m.device(REAL);
+    m.mgr.update_devices(&m.snapshot());
+    m.serial.block_open(REAL);
+
+    let attach_manager = m.mgr.clone();
+    let attach_sid = sid.clone();
+    let (attach_tx, attach_rx) = crossbeam_channel::bounded(1);
+    let attach = std::thread::spawn(move || {
+        let _ = attach_tx.send(attach_manager.attach_released_placeholder(&attach_sid, false));
+    });
+    wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(REAL) == 1);
+
+    let shutdown = m.mgr.shutdown(Duration::from_millis(100));
+    device.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
+    m.serial.release_open(REAL);
+    let attach_reply = rpc(
+        attach_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("shutdown 取消的開埠應返回"),
+    );
+    attach.join().expect("attach worker 不應 panic");
+
+    let still_blocked = m.mgr.has_inflight_attach_for_test(BY_ID);
+    let second_shutdown = m.mgr.shutdown(Duration::from_millis(100));
+    let release_started = Instant::now();
+    let release_reply = rpc(wp510_release(&m.mgr, &sid));
+    let release_elapsed = release_started.elapsed();
+
+    assert!(
+        shutdown
+            .iter()
+            .any(|(target, drained)| target == &format!("attach:{BY_ID}") && !drained),
+        "首次 shutdown 不得把阻塞開埠列為已排空：{shutdown:?}"
+    );
+    assert_eq!(code_of(&attach_reply).as_deref(), Some("SESSION_RECOVERING"));
+    assert_eq!(device.close_count(), 1);
+    assert!(device.is_open(), "fail_close 後 handle 仍須保持 open");
+    assert!(still_blocked, "shutdown 取消的 close:false 必須保留 inflight");
+    assert!(
+        second_shutdown
+            .iter()
+            .any(|(target, drained)| target == &format!("attach:{BY_ID}") && !drained),
+        "後續 shutdown 不得把 close:false 作業列為已排空：{second_shutdown:?}"
+    );
+    assert_eq!(code_of(&release_reply).as_deref(), Some("DRAIN_STALLED"));
+    assert!(release_elapsed >= Duration::from_millis(2500));
+}
+
+#[test]
+fn wp510_lifecycle_device_path_change_cancel_fail_close_keeps_placeholder_blocked() {
+    const SID: &str = "gone-template:COM3";
+    const BY_ID: &str = "/s/by-id/usb-G";
+    const REAL: &str = "/dev/ttyG";
+    const CHANGED: &str = "/dev/ttyG-rebound";
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    let device = m.device(REAL);
+    m.mgr.update_devices(&m.snapshot());
+    m.serial.block_open(REAL);
+
+    let attach_manager = m.mgr.clone();
+    let attach_sid = sid.clone();
+    let (attach_tx, attach_rx) = crossbeam_channel::bounded(1);
+    let attach = std::thread::spawn(move || {
+        let _ = attach_tx.send(attach_manager.attach_released_placeholder(&attach_sid, false));
+    });
+    wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(REAL) == 1);
+
+    m.serial.add_device(CHANGED);
+    m.mgr.update_devices(&[(
+        BY_ID.to_string(),
+        DeviceInfo {
+            by_id: BY_ID.to_string(),
+            real_path: CHANGED.to_string(),
+        },
+    )]);
+    device.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
+    m.serial.release_open(REAL);
+    let attach_reply = rpc(
+        attach_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("裝置改指取消的開埠應返回"),
+    );
+    attach.join().expect("attach worker 不應 panic");
+
+    let still_blocked = m.mgr.has_inflight_attach_for_test(BY_ID);
+    let release_started = Instant::now();
+    let release_reply = rpc(wp510_release(&m.mgr, &sid));
+    let release_elapsed = release_started.elapsed();
+
+    assert_eq!(code_of(&attach_reply).as_deref(), Some("DEVICE_NOT_PRESENT"));
+    assert_eq!(device.close_count(), 1);
+    assert!(device.is_open(), "fail_close 後 handle 仍須保持 open");
+    assert!(still_blocked, "裝置改指取消的 close:false 必須保留 inflight");
+    assert_eq!(code_of(&release_reply).as_deref(), Some("DRAIN_STALLED"));
+    assert!(release_elapsed >= Duration::from_millis(2500));
+}
+
+#[test]
+fn wp510_lifecycle_repeated_release_uses_expired_attach_deadline() {
+    const SID: &str = "gone-template:COM3";
+    const REAL: &str = "/dev/ttyG";
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    m.mgr.update_devices(&m.snapshot());
+    m.serial.block_open(REAL);
+
+    let attach_manager = m.mgr.clone();
+    let attach_sid = sid.clone();
+    let (attach_tx, attach_rx) = crossbeam_channel::bounded(1);
+    let attach = std::thread::spawn(move || {
+        let _ = attach_tx.send(attach_manager.attach_released_placeholder(&attach_sid, false));
+    });
+    wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(REAL) == 1);
+
+    let first = rpc(wp510_release(&m.mgr, &sid));
+    assert_eq!(code_of(&first).as_deref(), Some("DRAIN_STALLED"));
+    let repeated_started = Instant::now();
+    let repeated = rpc(wp510_release(&m.mgr, &sid));
+    let repeated_elapsed = repeated_started.elapsed();
+
+    m.serial.release_open(REAL);
+    let _ = attach_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("取消後的佔位 attach 應完成");
+    attach.join().expect("attach worker 不應 panic");
+
+    assert_eq!(code_of(&repeated).as_deref(), Some("DRAIN_STALLED"));
+    assert!(
+        repeated_elapsed < Duration::from_millis(100),
+        "已過期的 release deadline 必須立即結束等待，實際等待 {repeated_elapsed:?}"
+    );
+}
+
+#[test]
+fn wp510_lifecycle_concurrent_releases_share_first_attach_deadline() {
+    const SID: &str = "gone-template:COM3";
+    const REAL: &str = "/dev/ttyG";
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    m.mgr.update_devices(&m.snapshot());
+    m.serial.block_open(REAL);
+
+    let (release_started_tx, release_started_rx) = crossbeam_channel::bounded(1);
+    m.mgr
+        .set_placeholder_release_cancel_hook_for_test(Box::new(move || {
+            let _ = release_started_tx.try_send(());
+        }));
+
+    let attach_manager = m.mgr.clone();
+    let attach_sid = sid.clone();
+    let (attach_tx, attach_rx) = crossbeam_channel::bounded(1);
+    let attach = std::thread::spawn(move || {
+        let _ = attach_tx.send(attach_manager.attach_released_placeholder(&attach_sid, false));
+    });
+    wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(REAL) == 1);
+
+    let first_manager = m.mgr.clone();
+    let first_sid = sid.clone();
+    let (first_tx, first_rx) = crossbeam_channel::bounded(1);
+    let first = std::thread::spawn(move || {
+        let started = Instant::now();
+        let response = wp510_release(&first_manager, &first_sid);
+        let _ = first_tx.send((response, started.elapsed()));
+    });
+    release_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("第一個 release 已找到並取消 attach op");
+
+    std::thread::sleep(Duration::from_millis(2200));
+    let second_manager = m.mgr.clone();
+    let second_sid = sid.clone();
+    let (second_tx, second_rx) = crossbeam_channel::bounded(1);
+    let second = std::thread::spawn(move || {
+        let started = Instant::now();
+        let response = wp510_release(&second_manager, &second_sid);
+        let _ = second_tx.send((response, started.elapsed()));
+    });
+
+    let first_result = first_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("第一個 release 應於其期限結束");
+    let second_result = second_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("並行 release 應共用第一個期限");
+
+    m.serial.release_open(REAL);
+    let _ = attach_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("取消後的佔位 attach 應完成");
+    attach.join().expect("attach worker 不應 panic");
+    first.join().expect("第一個 release thread 不應 panic");
+    second.join().expect("第二個 release thread 不應 panic");
+
+    assert_eq!(code_of(&rpc(first_result.0)).as_deref(), Some("DRAIN_STALLED"));
+    assert_eq!(code_of(&rpc(second_result.0)).as_deref(), Some("DRAIN_STALLED"));
+    assert!(
+        second_result.1 < Duration::from_millis(1500),
+        "並行 release 重設期限，多等了 {:?}",
+        second_result.1
     );
 }
 
