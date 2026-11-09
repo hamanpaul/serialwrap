@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import functools
 import hashlib
+import importlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -48,16 +52,34 @@ LONGRUN_RECORD = "longrun-evidence.json"
 DEFAULT_ACCEPTANCE = ROOT / "realhw/acceptance/longrun_acceptance.yaml"
 _LONGRUN_MIN_DURATION_S = 48 * 3600
 _GATE_SCHEMA = "release-gate.v1"
+_GATE_NA = "NOT_APPLICABLE_BASELINE"
 _GATE_VERDICTS = frozenset({"PASS", "FAIL", "INSUFFICIENT_EVIDENCE", "BLOCKED"})
-_GATE_CHECK_RESULTS = frozenset({"PASS", "FAIL", "INSUFFICIENT_EVIDENCE", "BLOCKED", "NOT_APPLICABLE_BASELINE"})
-_LONGRUN_REQUIRED_CHECKS = (
-    "pinned_cli", "engine_verdict", "fault_retention_attested", "baseline_compatible",
-    "continuous_duration", "safety_double_holder",
-)
+_GATE_CHECK_RESULTS = frozenset({"PASS", "FAIL", "INSUFFICIENT_EVIDENCE", "BLOCKED", _GATE_NA})
+# 必要檢查集合不在本工具另抄：由正式 P2 gate（realhw/acceptance/gate.py）推導（P8X-e038dda-2）。
 # 證據本身成立的前提：未通過時整份長跑證據拒收（不是行為 FAIL）。
 _LONGRUN_PRECONDITION_CHECKS = ("pinned_cli", "fault_retention_attested", "baseline_compatible")
 _LONGRUN_EVIDENCE_FILES = ("report.json", "events.ndjson", "snapshots.ndjson", "observer.ndjson")
 _WINDOWS_EXCL_FILES = ("probes.ndjson", "handoff.ndjson")
+
+# --- 本輪候選 bundle（P8X-e038dda-1）---
+# `<run_dir>/artifacts/<platform>/candidate-bundle.json` 由 `--record-candidate-bundle <platform>=<bundle 版本目錄>`
+# 寫入：{"schema_version","platform","bundle_tree_sha256","files":[[rel, sha256], ...]}。tree 雜湊與 realhw
+# deployed_content `tree_digests()[0]` 同算法；判定時由檔案清單重算，並要求 bin/ 內 CLI／daemon 等於本輪
+# rust-<platform> 實際受測 artifact，長跑的 pinned bundle、CLI、daemon 映像再逐項等於它才算綁定本輪候選。
+CANDIDATE_BUNDLE_SCHEMA = "slice24-candidate-bundle.v1"
+CANDIDATE_BUNDLE_RECORD = "candidate-bundle.json"
+_BUNDLE_BINARIES = {
+    "linux": ("bin/serialwrap", "bin/serialwrapd"),
+    "windows": ("bin/serialwrap.exe", "bin/serialwrapd.exe"),
+}
+
+
+def _repo_module(name: str) -> Any:
+    """匯入本 repo 的正式模組（realhw.*）；本檔以 script 執行時 sys.path[0] 為 scripts/rust。"""
+    root = str(ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    return importlib.import_module(name)
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -964,10 +986,18 @@ def evaluate(
                         failures.append(f"Python/Rust A/B 不一致：{python_failure}")
                 passed_all = False
                 continue
+            # ab_required 是雙邊完整必要參數聯集；每個節點兩側都要收集且通過，任一側不成立即阻擋。
             for nodeid in ab_required:
                 rust_ok, rust_reason = _nodeid_passes(rust_doc, nodeid)
                 python_ok, python_reason = _nodeid_passes(python_doc, nodeid)
-                if rust_ok and not python_ok:
+                if rust_ok and python_ok:
+                    continue
+                if not rust_ok and not python_ok:
+                    # 雙邊皆未通過（例如只在一側收集、另一側 SKIP）不得漏判（P8X-e038dda-3）。
+                    _classify_rust_detail(rust_reason, nodeid, failures, missing_reasons)
+                    missing_reasons.append(python_reason or f"Python 證據不足：{nodeid}")
+                    passed_all = False
+                elif rust_ok and not python_ok:
                     python_failure = _nodeid_failure(python_doc, nodeid)
                     if python_failure:
                         report["ab_mismatch"].append(contract_id)
@@ -1070,16 +1100,76 @@ def _contracts_tree(repo_root: Path) -> str | None:
     return value if proc.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", value) else None
 
 
-def _gate_summary(checks: Sequence[Mapping[str, Any]]) -> str:
-    """與 realhw gate `_summarize`（candidate）相同的彙總規則。"""
-    results = {check.get("result") for check in checks}
-    if "FAIL" in results:
-        return "FAIL"
-    if "INSUFFICIENT_EVIDENCE" in results:
-        return "INSUFFICIENT_EVIDENCE"
-    if "BLOCKED" in results:
-        return "BLOCKED"
-    return "PASS"
+@functools.lru_cache(maxsize=None)
+def _formal_gate_checks(acceptance_path: str, platform: str, mode: str) -> tuple[tuple[str, str, str], ...]:
+    """正式 P2 gate 在該平台／模式必定產出的檢查列 `(id, group, 空輸入結果)`。
+
+    `realhw/acceptance/gate.py` 的每個分支都輸出同一組檢查 ID（只有結果隨輸入改變），
+    NOT_APPLICABLE_BASELINE 也只依模式決定；以空輸入跑一次正式判定器即得完整必要集合與適用性，
+    不在本工具另抄一份清單，避免與正式 gate 漂移（P8X-e038dda-2）。
+    """
+    gate = _repo_module("realhw.acceptance.gate")
+    with tempfile.TemporaryDirectory(prefix="sw-formal-gate-") as tmp:
+        empty = Path(tmp)
+        result = gate.evaluate(gate.GateInputs(
+            report_dir=empty, case_dir=empty, acceptance_path=Path(acceptance_path),
+            platform=platform, mode=mode, observer_path=None, wal_dir=None, baseline_gate_path=None,
+        ))
+    return tuple((str(check["id"]), str(check["group"]), str(check["result"])) for check in result["checks"])
+
+
+def _formal_summary(checks: Sequence[Mapping[str, Any]], mode: str) -> str | None:
+    """以正式 gate 的彙總規則重算（candidate：`_summarize`；baseline：`_baseline_summary`）；無法重算回 None。"""
+    try:
+        gate = _repo_module("realhw.acceptance.gate")
+        return gate._summarize(list(checks), True) if mode == "candidate" else gate._baseline_summary(list(checks))
+    except Exception:  # noqa: BLE001 - 無法重算即不得接受彙總
+        return None
+
+
+def _gate_checks(doc: Mapping[str, Any], label: str, errors: list[str]) -> list[dict[str, Any]]:
+    checks = doc.get("checks")
+    if not isinstance(checks, list) or any(
+        not isinstance(check, dict) or not isinstance(check.get("id"), str)
+        or not isinstance(check.get("group"), str) or check.get("result") not in _GATE_CHECK_RESULTS
+        for check in checks
+    ):
+        errors.append(f"{label} checks 格式無效")
+        return []
+    return checks
+
+
+def _formal_check_errors(
+    label: str, checks: Sequence[Mapping[str, Any]], acceptance_path: Path, platform: str, mode: str,
+) -> list[str]:
+    """檢查列必須恰為正式 gate 的完整集合：ID 唯一、無缺無多、group 相同、NOT_APPLICABLE_BASELINE 適用性一致。"""
+    try:
+        formal = _formal_gate_checks(str(acceptance_path), platform, mode)
+    except Exception as exc:  # noqa: BLE001 - 正式判定器失敗即無法證明必要集合，證據不得成立
+        return [f"無法以正式 P2 gate 推導 {platform} {mode} 必要檢查集合：{type(exc).__name__}: {exc}"]
+    errors: list[str] = []
+    formal_by_id = {check_id: (group, result) for check_id, group, result in formal}
+    seen: set[str] = set()
+    for check in checks:
+        check_id = check["id"]
+        if check_id in seen:
+            errors.append(f"{label} 檢查 {check_id} 重複")
+            continue
+        seen.add(check_id)
+        if check_id not in formal_by_id:
+            errors.append(f"{label} 含正式 gate 未定義的檢查 {check_id}")
+            continue
+        group, formal_result = formal_by_id[check_id]
+        if check.get("group") != group:
+            errors.append(f"{label} 檢查 {check_id} group={check.get('group')!r} 與正式 gate（{group}）不同")
+        if formal_result == _GATE_NA and check.get("result") != _GATE_NA:
+            errors.append(f"{label} 檢查 {check_id}={check.get('result')}，正式 gate 在 {mode} 模式只判 {_GATE_NA}")
+        elif formal_result != _GATE_NA and check.get("result") == _GATE_NA:
+            errors.append(f"{label} 檢查 {check_id}={_GATE_NA} 不適用 {mode} 模式")
+    for check_id, _, _ in formal:
+        if check_id not in seen:
+            errors.append(f"{label} 缺少正式 gate 必要檢查 {check_id}")
+    return errors
 
 
 def _check_hashed_file(path: Path, expected: object, label: str, errors: list[str]) -> None:
@@ -1093,11 +1183,13 @@ def _check_hashed_file(path: Path, expected: object, label: str, errors: list[st
 
 def _validate_longrun_platform(
     root: Path, platform: str, pinned_bundle: object, expected: Mapping[str, str | None],
-) -> tuple[list[str], str | None]:
-    """驗證單一平台的長跑證據；回 (錯誤清單, release_gate_result)。"""
+    acceptance_path: Path = DEFAULT_ACCEPTANCE,
+) -> tuple[list[str], str | None, dict[str, Any]]:
+    """驗證單一平台的長跑證據；回 (錯誤清單, release_gate_result, 長跑受測身分)。"""
     errors: list[str] = []
+    identity: dict[str, Any] = {"bundle_tree_sha256": None, "cli_sha256": None, "daemon_sha256": []}
     if root.is_symlink() or not root.is_dir():
-        return [f"缺少 {platform}/ 長跑證據目錄"], None
+        return [f"缺少 {platform}/ 長跑證據目錄"], None, identity
     if not isinstance(pinned_bundle, str) or not _SHA256.fullmatch(pinned_bundle):
         errors.append(f"{LONGRUN_MANIFEST} 缺少 {platform} 的 pinned bundle_tree_sha256")
         pinned_bundle = None
@@ -1111,22 +1203,13 @@ def _validate_longrun_platform(
         if candidate.get("mode") != "candidate" or candidate.get("platform") != platform:
             errors.append(f"release-gate.json 不是 {platform} candidate 判定")
         verdict = candidate.get("release_gate_result") if isinstance(candidate.get("release_gate_result"), str) else None
-        checks = candidate.get("checks")
-        if not isinstance(checks, list) or any(
-            not isinstance(check, dict) or not isinstance(check.get("id"), str)
-            or check.get("result") not in _GATE_CHECK_RESULTS
-            for check in checks
-        ):
-            errors.append("release-gate.json checks 格式無效")
-            checks = []
+        checks = _gate_checks(candidate, "release-gate.json", errors)
+        errors.extend(_formal_check_errors("release-gate.json", checks, acceptance_path, platform, "candidate"))
         by_id = {check["id"]: check.get("result") for check in checks}
         if verdict not in _GATE_VERDICTS:
             errors.append(f"release-gate.json release_gate_result 無效：{verdict!r}")
-        elif _gate_summary(checks) != verdict:
+        elif _formal_summary(checks, "candidate") != verdict:
             errors.append("release-gate.json release_gate_result 與 checks 彙總不一致")
-        for check_id in _LONGRUN_REQUIRED_CHECKS:
-            if check_id not in by_id:
-                errors.append(f"release-gate.json 缺少必要檢查 {check_id}")
         for check_id in _LONGRUN_PRECONDITION_CHECKS:
             if check_id in by_id and by_id[check_id] != "PASS":
                 errors.append(f"release-gate.json 前提檢查 {check_id}={by_id[check_id]}（證據不成立）")
@@ -1147,6 +1230,9 @@ def _validate_longrun_platform(
         cli_sha = cli_identity.get("sha256")
         if cli_identity.get("pinned") is not True or not isinstance(cli_sha, str) or not _SHA256.fullmatch(cli_sha):
             errors.append("release-gate.json run.cli_identity 未證明 pinned CLI")
+        else:
+            identity["cli_sha256"] = cli_sha
+        identity["bundle_tree_sha256"] = pinned_bundle
         deployed = candidate_run.get("deployed_content") if isinstance(candidate_run.get("deployed_content"), dict) else {}
         for edge in ("start", "end"):
             snapshot = deployed.get(edge) if isinstance(deployed.get(edge), dict) else {}
@@ -1163,6 +1249,8 @@ def _validate_longrun_platform(
             for entry in live
         ):
             errors.append("release-gate.json deployed_content.daemon_live 未證明受測 daemon 位於 pinned bundle")
+        else:
+            identity["daemon_sha256"] = sorted({entry["image_sha256"] for entry in live})
         hashes = candidate.get("evidence_hashes") if isinstance(candidate.get("evidence_hashes"), dict) else {}
         for name in _LONGRUN_EVIDENCE_FILES:
             _check_hashed_file(root / name, hashes.get(name), name, errors)
@@ -1189,6 +1277,12 @@ def _validate_longrun_platform(
             errors.append(f"baseline-release-gate.json 不是 {platform} 的 Python baseline 判定")
         if baseline.get("baseline_result") != "PASS":
             errors.append(f"baseline-release-gate.json baseline_result={baseline.get('baseline_result')!r}")
+        base_checks = _gate_checks(baseline, "baseline-release-gate.json", errors)
+        errors.extend(_formal_check_errors(
+            "baseline-release-gate.json", base_checks, acceptance_path, platform, "baseline",
+        ))
+        if _formal_summary(base_checks, "baseline") != baseline.get("baseline_result"):
+            errors.append("baseline-release-gate.json baseline_result 與 checks 彙總不一致")
         base_duration = base_run.get("duration_s")
         if not isinstance(base_duration, (int, float)) or base_duration < _LONGRUN_MIN_DURATION_S:
             errors.append(f"baseline-release-gate.json run.duration_s 未達 48 小時：{base_duration!r}")
@@ -1224,15 +1318,16 @@ def _validate_longrun_platform(
             errors.append("bench-lock.json 或 candidate run 缺少可解析的 UTC 時間")
         elif not (acquired <= started and ended <= released):
             errors.append("bench-lock.json 持有區間未涵蓋整個長跑區間")
-    return list(dict.fromkeys(errors)), verdict
+    return list(dict.fromkeys(errors)), verdict, identity
 
 
 def validate_longrun(source: Path, *, platforms: Sequence[str] | None = None, repo_root: Path = ROOT) -> dict[str, Any]:
     """驗證長跑證據目錄；只有每個平台都通過全部檢查時 `accepted` 才為 true。"""
     if platforms is None:
         platforms = _longrun_platforms(repo_root / "tests/acceptance/cases.yaml")
+    acceptance_path = repo_root / "realhw/acceptance/longrun_acceptance.yaml"
     expected = {
-        "acceptance_sha256": _sha256(repo_root / "realhw/acceptance/longrun_acceptance.yaml"),
+        "acceptance_sha256": _sha256(acceptance_path),
         "cases_yaml_sha256": _sha256(repo_root / "tests/acceptance/cases.yaml"),
         "contract_revision": _contracts_tree(repo_root),
     }
@@ -1258,9 +1353,13 @@ def validate_longrun(source: Path, *, platforms: Sequence[str] | None = None, re
     for platform in platforms:
         entry = manifest_platforms.get(platform)
         bundle = entry.get("bundle_tree_sha256") if isinstance(entry, dict) else None
-        errors, verdict = _validate_longrun_platform(source / platform, platform, bundle, expected)
+        errors, verdict, identity = _validate_longrun_platform(
+            source / platform, platform, bundle, expected, acceptance_path,
+        )
         errors = [*record["errors"], *errors]
-        record["platforms"][platform] = {"accepted": not errors, "release_gate_result": verdict, "errors": errors}
+        record["platforms"][platform] = {
+            "accepted": not errors, "release_gate_result": verdict, "errors": errors, "identity": identity,
+        }
     record["accepted"] = not record["errors"] and bool(record["platforms"]) and all(
         entry["accepted"] for entry in record["platforms"].values()
     )
@@ -1316,8 +1415,140 @@ def import_longrun(source: Path, run_dir: Path) -> dict[str, Any]:
     return record
 
 
-def load_owner_evidence(run_dir: Path) -> dict[str, dict[str, Any]]:
-    """判定時重新驗證 run directory 內的擁有者證據副本；沒有副本時不提供任何解除。"""
+def _candidate_bundle_identity(
+    run_dir: Path, platform: str, results: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """讀本輪候選 bundle 紀錄並重算 tree 雜湊；bin/ 內 CLI／daemon 必須等於 rust-<platform> 實際受測 artifact。"""
+    errors: list[str] = []
+    label = f"artifacts/{platform}/{CANDIDATE_BUNDLE_RECORD}"
+    rust_doc = _label_for(results, "rust", platform)
+    if rust_doc is None:
+        errors.append(f"本輪缺少 rust-{platform} 受測結果，長跑無法綁定本輪候選 artifact")
+    record = _load_json_object(run_dir / "artifacts" / platform / CANDIDATE_BUNDLE_RECORD, errors, label)
+    if record is None:
+        errors.append(f"本輪未記錄 {platform} 候選 bundle（slice24_exit.sh --candidate-bundle／Windows runner bundle/）")
+        return None, errors
+    files = record.get("files")
+    entries: dict[str, str] = {}
+    lines = bytearray()
+    previous: bytes | None = None
+    valid = isinstance(files, list) and bool(files)
+    for entry in files if valid else []:
+        if not (
+            isinstance(entry, list) and len(entry) == 2 and isinstance(entry[0], str) and entry[0]
+            and isinstance(entry[1], str) and _SHA256.fullmatch(entry[1])
+        ):
+            valid = False
+            break
+        key = entry[0].encode("utf-8")
+        if previous is not None and key <= previous:
+            valid = False
+            break
+        previous = key
+        entries[entry[0]] = entry[1]
+        lines.extend(f"{entry[0]}\0{entry[1]}\n".encode("utf-8"))
+    if record.get("schema_version") != CANDIDATE_BUNDLE_SCHEMA or record.get("platform") != platform or not valid:
+        errors.append(f"{label} 格式無效")
+        return None, errors
+    tree = hashlib.sha256(bytes(lines)).hexdigest()
+    if record.get("bundle_tree_sha256") != tree:
+        errors.append(f"{label} bundle_tree_sha256 與檔案清單重算結果不同")
+        return None, errors
+    cli_name, daemon_name = _BUNDLE_BINARIES[platform]
+    identity = {"bundle_tree_sha256": tree, "cli_sha256": entries.get(cli_name), "daemon_sha256": entries.get(daemon_name)}
+    for key, name in (("cli_sha256", cli_name), ("daemon_sha256", daemon_name)):
+        if identity[key] is None:
+            errors.append(f"{label} 缺少 {name}")
+        elif rust_doc is not None and rust_doc.get(key) != identity[key]:
+            errors.append(f"本輪候選 bundle 的 {name} 與 rust-{platform} 實際受測 artifact 不同")
+    return identity, errors
+
+
+def bind_longrun_candidate(
+    record: dict[str, Any], run_dir: Path, results: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """判定時把長跑的 pinned bundle、CLI、daemon 映像與本輪候選交叉核對（P8X-e038dda-1）。
+
+    只比 contracts 樹／cases／門檻檔不足以證明是同一候選；任何一項不同或本輪缺少候選紀錄，該平台證據即不成立。
+    """
+    for platform, entry in record.get("platforms", {}).items():
+        if not isinstance(entry, dict):
+            continue
+        candidate, errors = _candidate_bundle_identity(run_dir, str(platform), results)
+        longrun = entry.get("identity") if isinstance(entry.get("identity"), dict) else {}
+        if candidate is not None:
+            if longrun.get("bundle_tree_sha256") != candidate["bundle_tree_sha256"]:
+                errors.append("長跑 pinned bundle_tree_sha256 與本輪候選 bundle 不同")
+            if candidate["cli_sha256"] is not None and longrun.get("cli_sha256") != candidate["cli_sha256"]:
+                errors.append("長跑 pinned CLI 與本輪候選 CLI 不同")
+            daemons = longrun.get("daemon_sha256") if isinstance(longrun.get("daemon_sha256"), list) else []
+            if candidate["daemon_sha256"] is not None and (
+                not daemons or any(digest != candidate["daemon_sha256"] for digest in daemons)
+            ):
+                errors.append("長跑受測 daemon 映像與本輪候選 daemon 不同")
+        entry["candidate"] = candidate
+        if errors:
+            entry["accepted"] = False
+            entry["errors"] = [*entry.get("errors", []), *errors]
+    record["accepted"] = record.get("accepted") is True and all(
+        isinstance(entry, dict) and entry.get("accepted") is True for entry in record.get("platforms", {}).values()
+    )
+    return record
+
+
+def record_candidate_bundle(platform: str, bundle_root: Path, run_dir: Path) -> dict[str, Any]:
+    """記錄本輪候選 bundle 版本目錄的檔案清單與 tree 雜湊；只收一般檔案，不覆寫既有紀錄。"""
+    if platform not in _BUNDLE_BINARIES:
+        raise ValueError(f"未知平台：{platform}")
+    destination = run_dir / "artifacts" / platform / CANDIDATE_BUNDLE_RECORD
+    if destination.exists():
+        raise ValueError(f"{destination} 已存在，拒絕覆寫")
+    if bundle_root.is_symlink() or not bundle_root.is_dir():
+        raise ValueError(f"候選 bundle 不是一般目錄：{bundle_root}")
+    root = bundle_root.resolve()
+    if not (root / "release-manifest.json").is_file():
+        raise ValueError(f"候選 bundle 缺少 release-manifest.json：{root}")
+    entries: list[tuple[str, str]] = []
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        current = Path(directory)
+        for name in [*dirnames, *filenames]:
+            path = current / name
+            rel = path.relative_to(root).as_posix()
+            mode = path.lstat().st_mode
+            if stat.S_ISDIR(mode):
+                continue
+            if not stat.S_ISREG(mode):
+                raise ValueError(f"候選 bundle 含非一般檔案：{rel}")
+            digest = _sha256(path)
+            if digest is None:
+                raise ValueError(f"候選 bundle 檔案無法讀取：{rel}")
+            entries.append((rel, digest))
+    entries.sort(key=lambda item: item[0].encode("utf-8"))
+    tree = hashlib.sha256(b"".join(f"{rel}\0{digest}\n".encode("utf-8") for rel, digest in entries)).hexdigest()
+    measured = _repo_module("realhw.deployed_content").tree_digests(root)[0]
+    if measured != tree:
+        raise ValueError("候選 bundle tree 雜湊與 realhw deployed_content 量測不一致")
+    names = {rel for rel, _ in entries}
+    for name in _BUNDLE_BINARIES[platform]:
+        if name not in names:
+            raise ValueError(f"候選 bundle 缺少 {name}")
+    record = {
+        "schema_version": CANDIDATE_BUNDLE_SCHEMA,
+        "platform": platform,
+        "bundle_tree_sha256": tree,
+        "files": [[rel, digest] for rel, digest in entries],
+    }
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8",
+    )
+    return record
+
+
+def load_owner_evidence(
+    run_dir: Path, results: Sequence[Mapping[str, Any]] = (),
+) -> dict[str, dict[str, Any]]:
+    """判定時重新驗證 run directory 內的擁有者證據副本並綁定本輪候選；沒有副本時不提供任何解除。"""
     destination = run_dir / LONGRUN_DIRNAME
     if not destination.exists():
         return {}
@@ -1333,7 +1564,7 @@ def load_owner_evidence(run_dir: Path) -> dict[str, dict[str, Any]]:
         for entry in record["platforms"].values():
             entry["accepted"] = False
             entry["errors"] = [*entry["errors"], f"{LONGRUN_RECORD} 缺少或匯入時未通過驗證"]
-    return {LONGRUN_CASE: record}
+    return {LONGRUN_CASE: bind_longrun_candidate(record, run_dir, results)}
 
 
 def _case_rows(cases_path: Path, lock_path: Path) -> list[dict[str, Any]]:
@@ -1516,7 +1747,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--import-longrun", type=Path,
         help="驗證長跑證據目錄並匯入 <run-dir>/longrun/；全部成立 exit 0，拒收 exit 1",
     )
+    parser.add_argument(
+        "--record-candidate-bundle", metavar="PLATFORM=DIR",
+        help="記錄本輪候選 bundle 版本目錄（含 release-manifest.json）到 <run-dir>/artifacts/<platform>/",
+    )
     args = parser.parse_args(argv)
+
+    if args.record_candidate_bundle is not None:
+        platform, _, bundle = args.record_candidate_bundle.partition("=")
+        try:
+            if not bundle:
+                raise ValueError("--record-candidate-bundle 需為 PLATFORM=DIR")
+            record = record_candidate_bundle(platform, Path(bundle), args.run_dir)
+        except (OSError, ValueError) as exc:
+            print(f"contract_coverage: 候選 bundle 記錄失敗：{type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
+        print(f"candidate-bundle {platform}: bundle_tree_sha256={record['bundle_tree_sha256']} files={len(record['files'])}")
+        return 0
 
     if args.import_longrun is not None:
         try:
@@ -1576,7 +1823,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_cases_yaml_sha256=expected_sources["cases_yaml_sha256"],
             expected_cases_lock_sha256=expected_sources["cases_lock_sha256"],
             expected_platform=args.expect_platform,
-            owner_evidence=load_owner_evidence(args.run_dir),
+            owner_evidence=load_owner_evidence(args.run_dir, result_rows),
         )
         report["run_dir"] = str(args.run_dir)
         body = json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"

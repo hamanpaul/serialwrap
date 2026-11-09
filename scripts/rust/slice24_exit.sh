@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Slice 2.4 Linux 證據收集與出口報告；Windows／真機／長跑項只匯入擁有者既有證據。
-# --windows-run DIR：擁有者 Windows 原生 runner 產物（SHA256SUMS＋results-rust-windows.json）。
+# --candidate-bundle DIR：本輪候選 Linux bundle（mkbundle --release-bundle 輸出或安裝根；版本目錄＝bin/serialwrap
+#   解析後的上兩層，須含 release-manifest.json 且 git_revision＝本 worktree HEAD）。指定後受測 CLI／daemon 取自該 bundle，
+#   並寫入 RUN_DIR/artifacts/linux/candidate-bundle.json；長跑證據只有與它相同的 bundle／CLI／daemon 才能解除阻擋。
+# --windows-run DIR：擁有者 Windows 原生 runner 產物（SHA256SUMS＋results-rust-windows.json；可附 bundle/ 版本目錄）。
 # --longrun DIR：長跑證據（longrun-manifest.json＋<platform>/release-gate.json、baseline-release-gate.json、
 #   supervision-attest.json、bench-lock.json、gate evidence_hashes 所列檔案；Windows 另含 excl/）。
 #   由 contract_coverage.py --import-longrun 驗證後複製進 RUN_DIR/longrun/，判定時再重新驗證副本。
@@ -13,6 +16,7 @@ RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-slice24"
 RUN_DIR="${SW_SLICE24_RUN_DIR:-target/contract-coverage/$RUN_ID}"
 WINDOWS_RUN=""
 LONGRUN_DIR=""
+CANDIDATE_BUNDLE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -29,9 +33,13 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { echo "slice24_exit.sh: --longrun 缺少值" >&2; exit 2; }
       LONGRUN_DIR="$2"
       shift 2 ;;
+    --candidate-bundle)
+      [[ $# -ge 2 ]] || { echo "slice24_exit.sh: --candidate-bundle 缺少值" >&2; exit 2; }
+      CANDIDATE_BUNDLE="$2"
+      shift 2 ;;
     -h|--help)
-      sed -n '2,6p' "$0"
-      echo "用法：$0 [--run-id ID] [--windows-run DIR] [--longrun DIR]"
+      sed -n '2,9p' "$0"
+      echo "用法：$0 [--run-id ID] [--candidate-bundle DIR] [--windows-run DIR] [--longrun DIR]"
       exit 0 ;;
     *) echo "slice24_exit.sh: 未知參數 $1" >&2; exit 2 ;;
   esac
@@ -88,9 +96,46 @@ run_logged() {
 
 # 先快照不帶 test-fakes 的 daemon/CLI；後續 Cargo 測試不得改寫本輪受測 artifact。
 run_logged build-linux-candidate cargo build --workspace --bins
+BUILD_RC="$LAST_RC"
 RUST_CLI="$RUN_DIR/artifacts/serialwrap"
 RUST_DAEMON="$RUN_DIR/artifacts/serialwrapd"
-if [[ "$LAST_RC" -eq 0 && -f "$CARGO_TARGET_DIR/debug/serialwrap" && -f "$CARGO_TARGET_DIR/debug/serialwrapd" ]]; then
+if [[ -n "$CANDIDATE_BUNDLE" ]]; then
+  # 本輪候選＝指定 bundle：受測 CLI／daemon 直接取自其版本目錄（與 realhw deployed_content.install_dir 同解析），
+  # 並記錄檔案清單與 tree 雜湊，供長跑 pinned bundle／CLI／daemon 交叉核對（P8X-e038dda-1）。
+  CANDIDATE_CLI_REAL="$(realpath -e "$CANDIDATE_BUNDLE/bin/serialwrap" 2>/dev/null || true)"
+  CANDIDATE_ROOT=""
+  [[ -n "$CANDIDATE_CLI_REAL" ]] && CANDIDATE_ROOT="$(dirname "$(dirname "$CANDIDATE_CLI_REAL")")"
+  if [[ -n "$CANDIDATE_ROOT" && -f "$CANDIDATE_ROOT/release-manifest.json" \
+        && -f "$CANDIDATE_ROOT/bin/serialwrap" && -f "$CANDIDATE_ROOT/bin/serialwrapd" ]]; then
+    # 候選 bundle 必須由本 worktree HEAD 建置，Cargo L1 結果才可歸屬同一候選（不同來源一律拒收）。
+    run_logged linux-candidate-source python3 - "$CANDIDATE_ROOT/release-manifest.json" "$(git rev-parse HEAD)" <<'PY'
+import json
+import sys
+
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+revision = manifest.get("git_revision") if isinstance(manifest, dict) else None
+if revision != sys.argv[2]:
+    print(f"候選 bundle git_revision={revision!r} 不等於本 worktree HEAD {sys.argv[2]}")
+    raise SystemExit(1)
+print(f"候選 bundle git_revision={revision}")
+PY
+    if [[ "$LAST_RC" -eq 0 ]]; then
+      RUST_CLI="$CANDIDATE_ROOT/bin/serialwrap"
+      RUST_DAEMON="$CANDIDATE_ROOT/bin/serialwrapd"
+      run_logged linux-candidate-bundle python3 scripts/rust/contract_coverage.py \
+        --run-dir "$RUN_DIR" --record-candidate-bundle "linux=$CANDIDATE_ROOT"
+    fi
+  else
+    printf 'linux-candidate-bundle\t1\n' >>"$DRIVER_TSV"
+    FAILURES=1
+    echo "slice24_exit.sh: --candidate-bundle 不是有效 bundle（需 bin/serialwrap 解析後的版本目錄含 release-manifest.json）" >&2
+  fi
+  if [[ ! -f "$RUN_DIR/artifacts/linux/candidate-bundle.json" ]]; then
+    RUST_CLI="$RUN_DIR/artifacts/missing-candidate-cli"
+    RUST_DAEMON="$RUN_DIR/artifacts/missing-candidate-daemon"
+    echo "slice24_exit.sh: 候選 bundle 未記錄，後續結果不得計 PASS" >&2
+  fi
+elif [[ "$BUILD_RC" -eq 0 && -f "$CARGO_TARGET_DIR/debug/serialwrap" && -f "$CARGO_TARGET_DIR/debug/serialwrapd" ]]; then
   cp -p "$CARGO_TARGET_DIR/debug/serialwrap" "$RUST_CLI"
   cp -p "$CARGO_TARGET_DIR/debug/serialwrapd" "$RUST_DAEMON"
 else
@@ -216,8 +261,24 @@ PY
   else
     printf 'windows-native\tEVIDENCE_MISSING\n' >>"$OWNER_TSV"
   fi
+  # Windows 候選 bundle（runner 附的 bundle/ 版本目錄）：判定時其 bin/*.exe 須等於 results-rust-windows 的受測 artifact。
+  if [[ -f "$WINDOWS_RUN/bundle/release-manifest.json" ]]; then
+    if python3 scripts/rust/contract_coverage.py --run-dir "$RUN_DIR" \
+        --record-candidate-bundle "windows=$WINDOWS_RUN/bundle" >"$RUN_DIR/logs/windows-candidate-bundle.log" 2>&1; then
+      printf 'windows-candidate-bundle\tRECORDED_PENDING_JUDGE\n' >>"$OWNER_TSV"
+    else
+      printf 'windows-candidate-bundle\tREJECTED（見 %s）\n' "$RUN_DIR/logs/windows-candidate-bundle.log" >>"$OWNER_TSV"
+    fi
+  else
+    printf 'windows-candidate-bundle\tEVIDENCE_MISSING\n' >>"$OWNER_TSV"
+  fi
 else
   printf 'windows-native\tEVIDENCE_MISSING\n' >>"$OWNER_TSV"
+  printf 'windows-candidate-bundle\tEVIDENCE_MISSING\n' >>"$OWNER_TSV"
+fi
+if [[ -z "$CANDIDATE_BUNDLE" ]]; then
+  # 未指定候選 bundle 時本輪受測的是 debug build，長跑（pinned release bundle）無法綁定本輪候選。
+  printf 'linux-candidate-bundle\tEVIDENCE_MISSING（未指定 --candidate-bundle；長跑無法綁定本輪候選）\n' >>"$OWNER_TSV"
 fi
 
 # 長跑證據（計畫 Task 15 步驟 8）：驗證全部成立才匯入並解除 lr-mixed 的擁有者阻擋；
