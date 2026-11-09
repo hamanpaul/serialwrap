@@ -184,13 +184,32 @@ struct RetiredPlaceholder {
 
 static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-/// 進行中的 attach worker（per by_id 去重；`cancelled` 由裝置變更／bind／shutdown／release 設定）。
+/// Python `sw_core/session_manager.py:412-429` 的 `_AttachOp` 對照：
+///
+/// | `token/session_id/by_id/bridge_generation/real_path`；建立 `:3495-3503` | `token` 在此；by_id 是 `Inner::inflight` 的鍵，session／generation／real path 由呼叫端與快照持有。`attach_released_placeholder` 登錄作業後才開埠。 | `wp510_b_concurrent_placeholder_attach_returns_session_recovering` |
+/// | `port/port_lock`；開埠與存入 op `:3504-3509` | `preopened` mutex／`HandleParts` 保存同步開埠的 handle；入口 `attach_released_placeholder` → `retire_released_placeholder_locked` → `spawn_attach_worker` → `attach_dynamic`。 | `wp510_rpc_bind_then_device_attach_replaces_placeholder` |
+/// | 開埠完成與 `port_transferred`；有效性檢查 `:3572-3615`、正式交接 `:4374-4383` | 開埠回來後重驗 stopping、取消、by_id 與 real path；有效則把 handle 移交動態 session，之後由正式 bridge 擁有。 | `wp510_rpc_bind_then_device_attach_replaces_placeholder` |
+/// | 晚到開埠；開埠返回後失效及 `_finish_attach_op` `:3572-3615`、`:4320-4333` | 取消／裝置改指／shutdown 後才返回的 handle 不送 TX，嘗試 close；成功才清 op，`closed:false` 留住 inflight。 | `wp510_b_handoff_invalidated_during_open_closes_handle`; `wp510_lifecycle_shutdown_cancel_fail_close_keeps_placeholder_blocked`; `wp510_lifecycle_device_path_change_cancel_fail_close_keeps_placeholder_blocked` |
+/// | `cancelled`；裝置改指 `:4031-4043`、bind `:3683-3691`、shutdown `:1175-1190`、release `:3117-3125` | 共用原子取消旗標；各取消者都阻止晚到 handle 交接，並由同一 close 回條決定是否可清除 op。 | `wp510_b_handoff_invalidated_during_open_closes_handle`; `shutdown_includes_inflight_attach`; `wp510_review_release_cancels_placeholder_attach_before_retirement`; `bind_with_inflight_attach_op_cancels_waits_3000ms` |
+/// | `done`；交接完成 `:4374-4383`、作業收尾 `:4320-4365`，release 等待 `:3192-3204` | 沒有獨立 done 欄位；`inflight` 項目存活代表未完成，條件變數喚醒等待者。close 成功後移除 op，close 失敗不會誤報完成。 | `wp510_review_late_placeholder_attach_completion_clears_drain_stall`; `wp510_rpc_failed_close_keeps_placeholder_drain_stalled` |
+/// | `probe_bridge`；註冊／取消排空 `:4367-4372`、`:3126-3131` | placeholder handoff 不建立獨立 probe bridge；`attach_dynamic` 以同一預開 handle 偵測，再交正式 session bridge。 | `wp510_rpc_bind_then_device_attach_replaces_placeholder` |
+/// | `release_request/release_deadline`；開始計時 `:3084-3086`、第一次設定及重用 `:3117-3125`，等待與逾期處理 `:3192-3204` | 已是 RELEASED 的佔位保留既有 source/reason，Rust 無需另存 request；進 manager lock 前記錄候選期限，第一個取得 op 的 release 寫入共享欄位。重複／並行 release 重用第一次期限，逾期即回 stalled。 | `wp510_review_release_cancels_placeholder_attach_before_retirement`; `wp510_lifecycle_repeated_release_uses_expired_attach_deadline`; `wp510_lifecycle_concurrent_releases_share_first_attach_deadline` |
+/// | `bind_requested`；設定與等待 `:3683-3697` | 無獨立欄位；一般 bind 以取消旗標和共用 inflight 排空。OD-63 佔位 bind 依裁決早退，不能取消或改動作業。 | `bind_with_inflight_attach_op_cancels_waits_3000ms`; `wp510_b_bind_placeholder_precedes_inflight_cancellation` |
+/// | close 成功／失敗；`_finish_attach_op` `:4320-4365` | close 成功才移除 inflight；任一取消原因的 `closed:false` 都保留阻擋，release 後續維持 `DRAIN_STALLED`。 | `wp510_review_late_placeholder_attach_completion_clears_drain_stall`; `wp510_rpc_failed_close_keeps_placeholder_drain_stalled`; `wp510_lifecycle_shutdown_cancel_fail_close_keeps_placeholder_blocked`; `wp510_lifecycle_device_path_change_cancel_fail_close_keeps_placeholder_blocked` |
+/// | shutdown 取消及排空 `:1175-1239` | shutdown 取消作業並等待 `Inner::inflight` 清除；仍有 close:false 的作業回報未 drained。 | `shutdown_includes_inflight_attach`; `wp510_lifecycle_shutdown_cancel_fail_close_keeps_placeholder_blocked` |
+///
+/// 生命週期：建立 → 開埠完成並交接，或取消後晚到並關閉；關閉成功才移除作業，`closed:false` 一律保留作業。release 找到同一作業後取消並等待首次 deadline；期限到期回 `DRAIN_STALLED`。shutdown 取消並排空同一 inflight 集合。
+/// Rust 用作業 token 與 actor 的 `PlaceholderAttachStalled/Settled` 保存 stall 診斷，對應 Python 在 manager lock 下設定 `drain_stalled` 與 `drain_timeout_epoch`。
 #[derive(Clone)]
 struct AttachOp {
     token: u64,
     cancelled: Arc<AtomicBool>,
     /// `device.release` 專用：在途佔位開埠由 release 撤銷，收尾需清除對應 actor stall。
     release_requested: Arc<AtomicBool>,
+    /// 同一 op 的重複／並行 release 共用首次排空期限（Python `_AttachOp.release_deadline`）。
+    release_deadline: Arc<Mutex<Option<Instant>>>,
+    /// `close()` 的失敗回條必須跨 worker 收尾保留，不能因取消原因不同而移除 inflight。
+    close_failed: Arc<AtomicBool>,
     /// clear 收尾的再 attach（`Effect::Reattach`）：session 已是 ATTACHING 但未開埠，仍須再解析（審查 F62）。
     /// 在途 op 與 clear 重疊時由 `spawn_attach_with` OR 進來，避免該次再解析遺失（審查 F98）。
     after_clear: Arc<AtomicBool>,
@@ -206,6 +225,8 @@ impl AttachOp {
             token: NEXT_ATTACH_OP_TOKEN.fetch_add(1, Ordering::Relaxed),
             cancelled: Arc::new(AtomicBool::new(false)),
             release_requested: Arc::new(AtomicBool::new(false)),
+            release_deadline: Arc::new(Mutex::new(None)),
+            close_failed: Arc::new(AtomicBool::new(false)),
             after_clear: Arc::new(AtomicBool::new(after_clear)),
             dynamic_only,
             preopened: Arc::new(Mutex::new(preopened)),
@@ -217,11 +238,15 @@ impl AttachOp {
     }
 
     fn close_preopened_with_receipt(&self) -> Option<CloseReceipt> {
-        self.take_preopened().map(|pre| pre.parts.close())
+        self.take_preopened().map(|pre| self.close_parts(pre.parts))
     }
 
-    fn close_preopened(&self) {
-        let _ = self.close_preopened_with_receipt();
+    fn close_parts(&self, parts: HandleParts) -> CloseReceipt {
+        let receipt = parts.close();
+        if !receipt.closed {
+            self.close_failed.store(true, Ordering::SeqCst);
+        }
+        receipt
     }
 }
 
@@ -1147,28 +1172,12 @@ impl Shared {
                 .name(format!("serialwrap-attach-{by_id}"))
                 .spawn(move || {
                     let _ = catch_unwind(AssertUnwindSafe(|| me.attach_worker(&key, &worker_op)));
-                    worker_op.close_preopened();
-                    let mut inner = lock(&me.inner);
-                    if inner.inflight.get(&key).is_some_and(|current| {
-                        Arc::ptr_eq(&current.cancelled, &worker_op.cancelled)
-                    }) {
-                        inner.inflight.remove(&key);
-                    }
-                    drop(inner);
-                    me.cv.notify_all();
+                    let close_receipt = worker_op.close_preopened_with_receipt();
+                    me.finish_attach_op(&key, &worker_op, close_receipt);
                 });
         if spawned.is_err() {
-            op.close_preopened();
-            let mut inner = lock(&self.inner);
-            if inner
-                .inflight
-                .get(by_id)
-                .is_some_and(|current| Arc::ptr_eq(&current.cancelled, &op.cancelled))
-            {
-                inner.inflight.remove(by_id);
-            }
-            drop(inner);
-            self.cv.notify_all();
+            let close_receipt = op.close_preopened_with_receipt();
+            self.finish_attach_op(by_id, &op, close_receipt);
         }
     }
 
@@ -1213,7 +1222,7 @@ impl Shared {
             }
         }
         if self.templates.is_empty() {
-            op.close_preopened();
+            let _ = op.close_preopened_with_receipt();
             return;
         }
         if lock(&self.inner).sessions.len() >= self.max_sessions {
@@ -1221,7 +1230,7 @@ impl Shared {
                 "已達 max_sessions={}，忽略裝置 {by_id}",
                 self.max_sessions
             ));
-            op.close_preopened();
+            let _ = op.close_preopened_with_receipt();
             return;
         }
         self.attach_dynamic(by_id, op);
@@ -1462,7 +1471,7 @@ impl Shared {
             )
         };
         let Some(retired) = retired else {
-            let close_receipt = parts.map(HandleParts::close);
+            let close_receipt = parts.map(|parts| op.close_parts(parts));
             self.finish_attach_op(&by_id, &op, close_receipt);
             let inner = lock(&self.inner);
             if inner.device_path(&by_id) != Some(real.as_str()) {
@@ -1499,12 +1508,14 @@ impl Shared {
             .get(by_id)
             .is_some_and(|current| Arc::ptr_eq(&current.cancelled, &op.cancelled))
         {
+            // Python `_finish_attach_op` 對任何取消原因都在 close 失敗時保留作業；不能只在 release
+            // 分支檢查，否則 shutdown／裝置改指會遺失仍可能持有 UART 的阻擋。
+            if op.close_failed.load(Ordering::SeqCst)
+                || close_receipt.as_ref().is_some_and(|receipt| !receipt.closed)
+            {
+                return;
+            }
             if op.release_requested.load(Ordering::SeqCst) {
-                // 佔位 attach 被 release 撤銷時，未取得 handle 可直接完成；已取得 handle 則必須有
-                // closed:true 回條。closed:false 保留阻擋與原 epoch 診斷。
-                if close_receipt.as_ref().is_some_and(|receipt| !receipt.closed) {
-                    return;
-                }
                 if let Some(actor) = inner.session_by_id(by_id).map(|entry| entry.actor.clone()) {
                     if let Err(error) = enqueue_safety_request(
                         &actor,
@@ -1682,7 +1693,7 @@ impl Shared {
         let mut parts = match op.take_preopened() {
             Some(pre) if pre.real_path == real => pre.parts,
             Some(pre) => {
-                let _ = pre.parts.close();
+                let _ = op.close_parts(pre.parts);
                 return;
             }
             None => {
@@ -1699,7 +1710,7 @@ impl Shared {
         };
         if !self.still_valid(by_id, &real, op) {
             // 已越過 gate、open 返回時已 stopping／取消：立即關閉（零 TX）。
-            let _ = parts.close();
+            let _ = op.close_parts(parts);
             return;
         }
         if tpl.is_none() {
@@ -1714,7 +1725,7 @@ impl Shared {
         }
         let Some(tpl) = tpl else {
             // 無任何可用模板：未交接的 PROBE handle 關閉（`_discard_preopened_port`）。
-            let _ = parts.close();
+            let _ = op.close_parts(parts);
             return;
         };
         let mut parts = Some(parts);
@@ -1739,7 +1750,7 @@ impl Shared {
             }
         };
         if let Some(parts) = parts {
-            let _ = parts.close();
+            let _ = op.close_parts(parts);
         }
         if let Some(actor) = actor {
             let _ = actor.control.send(ControlEvent::DeviceAttached {
@@ -1973,12 +1984,12 @@ impl Shared {
         };
         let mut parts = HandleParts::split(handle);
         if !self.still_valid(by_id, &real, op) {
-            let _ = parts.close();
+            let _ = op.close_parts(parts);
             return;
         }
         let detected = self.detect_template(&mut parts);
         if !self.still_valid(by_id, &real, op) {
-            let _ = parts.close();
+            let _ = op.close_parts(parts);
             return;
         }
         let mut sid_now = sid.to_string();
@@ -2003,7 +2014,7 @@ impl Shared {
                 self.send_attached(by_id);
             }
             None => {
-                let _ = parts.close();
+                let _ = op.close_parts(parts);
             }
         }
     }
@@ -3247,7 +3258,9 @@ impl SessionManager {
         &self,
         sid: &str,
     ) -> Result<Option<PyDict>, PyErr> {
-        let (by_id, op) = {
+        // 與 Python `release_device` 一樣，在取得 manager lock 前開始本次期限計時。
+        let candidate_release_deadline = Instant::now() + ATTACH_OP_WAIT;
+        let (by_id, op, deadline) = {
             let inner = lock(&self.shared.inner);
             let Some(entry) = inner
                 .sessions
@@ -3264,11 +3277,15 @@ impl SessionManager {
             // 後續的 attach 收尾就不能先通過退休檢查。
             op.cancelled.store(true, Ordering::SeqCst);
             op.release_requested.store(true, Ordering::SeqCst);
+            let deadline = {
+                let mut stored = lock(&op.release_deadline);
+                *stored.get_or_insert(candidate_release_deadline)
+            };
             #[cfg(feature = "test-fakes")]
             if let Some(hook) = lock(&self.shared.placeholder_release_cancel_hook).as_ref() {
                 hook();
             }
-            (by_id, op)
+            (by_id, op, deadline)
         };
 
         let epoch = self
@@ -3277,7 +3294,6 @@ impl SessionManager {
             .and_then(|session| session.get("bridge_generation").and_then(PyValue::as_i64))
             .unwrap_or(0)
             .max(0) as u64;
-        let deadline = Instant::now() + ATTACH_OP_WAIT;
         let stalled_reply = {
             let mut inner = lock(&self.shared.inner);
             loop {
