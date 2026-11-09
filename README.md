@@ -129,7 +129,7 @@ setup may select systemd and change supervision modes; see the
 # Managed install: download the release bundle, verify it against SHA256SUMS,
 # then run <bundle>/bin/serialwrap setup (extra arguments go to setup)
 ./install.sh                     # latest release
-./install.sh --version 0.4.0     # a specific release
+./install.sh --version 0.4.1     # a specific release
 serialwrap doctor
 
 # Check daemon and sessions
@@ -198,7 +198,7 @@ but the standard install no longer uses pipx.
 Offline install: copy the release tarball (verify it yourself with
 `sha256sum -c --ignore-missing SHA256SUMS`; `--bundle` does not download or
 check `SHA256SUMS`), then run
-`./install.sh --bundle serialwrap-0.4.0-linux-x86_64.tar.gz`. `--bundle` also
+`./install.sh --bundle serialwrap-0.4.1-linux-x86_64.tar.gz`. `--bundle` also
 accepts an unpacked bundle directory. For local development, build a bundle
 from the checkout and install it; a bare `./install.sh` installs the published
 release, not the checkout:
@@ -235,9 +235,9 @@ reports it. See [explicit reboot](docs/expect-reboot.md).
 
 **Upgrading, and telling which build the daemon runs.** The bundle installer
 runs `serialwrap setup`; after a manual package update, run setup again. The version string
-(`0.4.0`) is the same for a release, a branch build and `main`, so
+(`0.4.1`) is the same for a release, a branch build and `main`, so
 `serialwrap --version` also prints a code fingerprint, e.g.
-`serialwrap 0.4.0 (code 1a2b3c4d5e6f)` (a hash of the installed `sw_core/**/*.py`).
+`serialwrap 0.4.1 (code 1a2b3c4d5e6f)` (a hash of the installed `sw_core/**/*.py`).
 `serialwrap daemon status` reports the fingerprint of the code the running daemon
 loaded when it started (`code_fingerprint`) and where it loaded it from
 (`code_path`). If the two differ, the daemon is still running pre-upgrade code, and
@@ -1544,7 +1544,7 @@ serialwrap setup --with-com0com
 - **Supervision Management**: `supervision-mode set <MODE>` switches active supervision between `on-demand`, `systemd-user`, `systemd-system`, `windows-task`, and `windows-service` (on Windows, `windows-service` outputs `pending_sudo` instructions for operator execution). Switching performs fail-closed safety preflight and atomic handoff (`daemon.handoff_stop`): active flashing, file transfers, in-flight commands, active leases, or unconfirmed probes refuse the switch; `--force` does not override this safety guard (records `force_ignored: true`).
 - **Windows Task Supervision**: `windows-task` operates via Windows Task Scheduler (`schtasks`) with `ExecutionTimeLimit=PT0S`, enabling detached daemon persistence across user sessions with automatic start on user login and restart on failure.
 - **Rollback and Recovery**: `setup --rollback` atomically restores the previous bundle version, CLI binary, Python daemon runtime, and supervisor definitions using `install-journal.json`. The first install that replaces a pipx 0.3.2 install has no previous bundle, so `setup --rollback` cannot return to that pipx install: it returns `INVALID_ARGS` (`rollback_unavailable`) and does not change the installation. A manual return to 0.3.2 is not a supported downgrade.
-- **Upgrading from 0.3.x with the daemon running (OD-48, SC-39)**: a 0.3.x daemon does not support `daemon.handoff_stop`. When `setup` positively identifies it (version below 0.4.0, a pipx Python daemon process outside the bundle `versions/` directory), it refuses while flashing or busy, otherwise records the old process in `install-journal.legacy.json` and stops it with its own supervisor (`systemctl stop` when it is the unit's MainPID, else RPC `daemon.stop`; never a hard kill). It switches only after the old process tree has exited and no process of the same user holds the UART for 5 consecutive seconds (up to 330 s), then starts the new daemon. If a later step fails, the install is restored but the old daemon is **not** restarted; the response carries `legacy_daemon_stopped`, `restored`, and `restart_hint`. Pass your current supervision mode explicitly (`--user`, `--system --with-sudo`, `--on-demand`); without a flag `setup` picks one automatically exactly like 0.3.2.
+- **Upgrading from 0.3.x with the daemon running (OD-48, SC-39)**: a 0.3.x daemon does not support `daemon.handoff_stop`. When `setup` positively identifies it (version below 0.4.0, a pipx Python daemon process outside the bundle `versions/` directory), it refuses while flashing or busy, otherwise records the old process in `install-journal.legacy.json` and stops it with its own supervisor (`systemctl stop` when it is the unit's MainPID, else RPC `daemon.stop`; never a hard kill). It switches only after the old process tree has exited and no process of the same user holds the UART for 5 consecutive seconds (up to 330 s), then starts the new daemon. Same-user processes that cannot be inspected at all (their `/proc/<pid>/fd` is unreadable, or every fd entry is denied — on hosts with a systemd user session these are `(sd-pam)` and `systemd --user`) do not block the switch when every other same-user process is clear, provided they already existed when the stop was sent (matched by pid and start time), whether or not all four of their uids (real, effective, saved, fs) are yours — a resident setuid `fusermount3` is admitted too; they are listed in `legacy_stop.uninspectable_procs` (pid, start_ticks, comm, reason, plus `uid_match` — `all`, `partial` such as a setuid tool, or `unknown` — and `uids`) with `holders_status: "partial"`. An uninspectable process that appears after the stop (for example a non-dumpable `ssh-agent` or a setuid UART tool), whatever its uids, a failed pre-stop snapshot (then no uninspectable process is admitted), and any other scan failure still wait until the limit; a process exiting during the scan or the device being unplugged while waiting does not count as a failure. Known trade-off: a setuid tool that was already running before the stop and opens the UART during the wait is not caught. The timeout response reports the last poll's `holders_status`, `uninspectable_procs`, `before_stop_snapshot`, `daemon_scan`, and `last_unstable` (when and why the stability window last broke). 0.4.0 itself waits the full 330 s on such hosts; stop the 0.3.x daemon first when upgrading to 0.4.0. If a later step fails, the install is restored but the old daemon is **not** restarted; the response carries `legacy_daemon_stopped`, `restored`, and `restart_hint`. Pass your current supervision mode explicitly (`--user`, `--system --with-sudo`, `--on-demand`); without a flag `setup` picks one automatically exactly like 0.3.2.
 
 #### First-install and Update Error Handling
 
@@ -1905,7 +1905,7 @@ flowchart TD
 ```bash
 # 安裝（正式流程）：下載 release bundle、以 SHA256SUMS 驗證後執行 <bundle>/bin/serialwrap setup（額外參數轉給 setup）
 ./install.sh                     # 最新 release
-./install.sh --version 0.4.0     # 指定 release
+./install.sh --version 0.4.1     # 指定 release
 serialwrap doctor                # 驗證環境
 ```
 
@@ -1915,10 +1915,10 @@ serialwrap doctor                # 驗證環境
 - `install.sh` 位於 repo 根目錄（clone repo 或單獨下載該檔）。
 - 系統需求：x86_64、glibc >= 2.39（Ubuntu 24.04 以上）、`/usr/bin/python3.12`。`install.sh` 安裝前先檢查，任一項不符即 exit 2 且不改動任何東西。
 - `install.sh [--version X.Y.Z] [--bundle <目錄或 .tar.gz>] [--] [setup 參數...]`：未給 `--bundle` 時從 [GitHub releases](https://github.com/hamanpaul/serialwrap/releases) 下載 `serialwrap-<版本>-linux-x86_64.tar.gz` 與 `SHA256SUMS`（未給 `--version` 取最新 release），雜湊不符或 `SHA256SUMS` 缺列即失敗、不執行 setup；解到暫存目錄後執行 `bin/serialwrap setup`，回傳 setup 的 exit code。`--` 之後的參數（以及 `--user`、`--on-demand` 等未知選項）原樣轉給 setup。Python wheel 仍隨 release 發佈，但標準安裝流程不再使用 pipx。
-- 離線安裝：把 release tarball 帶到目標機（請自行以 `sha256sum -c --ignore-missing SHA256SUMS` 驗證；`--bundle` 不下載也不檢查 `SHA256SUMS`），執行 `./install.sh --bundle serialwrap-0.4.0-linux-x86_64.tar.gz`；`--bundle` 也接受已解開的 bundle 目錄。
+- 離線安裝：把 release tarball 帶到目標機（請自行以 `sha256sum -c --ignore-missing SHA256SUMS` 驗證；`--bundle` 不下載也不檢查 `SHA256SUMS`），執行 `./install.sh --bundle serialwrap-0.4.1-linux-x86_64.tar.gz`；`--bundle` 也接受已解開的 bundle 目錄。
 - 本機開發安裝：先由 checkout 建 bundle 再安裝——`scripts/rust/mkbundle.sh --release-bundle --profile release --out /tmp/sw-bundle && ./install.sh --bundle /tmp/sw-bundle`；單純 `./install.sh` 安裝的是已發佈的 release，不是 checkout。
 - 舊版 0.3.x（pipx）使用者升級：直接執行新的 `install.sh` 即可，不需 pipx 步驟。可在 0.3.x daemon 仍在執行時升級，並明確帶入目前的監管模式（`--user`、`--system --with-sudo`、`--on-demand`）。先以 `serialwrap daemon stop` 停止再升級亦可，但 setup 不會代為啟動原本已停止的 daemon：請以 `serialwrap service start`（systemd）或 `serialwrap daemon start`（on-demand）啟動後執行 `serialwrap doctor`。setup 會接管 `~/.local/bin/serialwrap` 與 `serialwrapd` 入口，保留 `config.yaml`、profiles 與 `state.json`。偵測到舊 pipx 安裝時，安裝程式會提示可執行 `pipx uninstall serialwrap`，不會自動移除。
-- **升級與確認 daemon 跑的是哪份程式碼**：bundle 安裝會執行 `serialwrap setup`；版本字串（例如 `0.4.0`）在 release 與分支 build 間相同，所以 `serialwrap --version` 另印程式碼指紋，例如 `serialwrap 0.4.0 (code 1a2b3c4d5e6f)`。`serialwrap daemon status` 的 `code_fingerprint` 與 `code_path` 說明 daemon 啟動時載入的程式碼及位置。指紋不一致時，CLI 於 stderr 警告，`doctor` 回報 advisory `daemon_code_current`。systemd 服務 active 且指紋不同時，setup 依狀態自動 restart，輸出 `daemon_code`；systemd-system 未帶 `--with-sudo` 時把指令列入 `pending_sudo`。`--no-restart`、flash、模式轉換、service inactive 與 on-demand 條件不會觸發自動 restart。細節見[規格 §8.7](docs/serialwrap-spec.md)。
+- **升級與確認 daemon 跑的是哪份程式碼**：bundle 安裝會執行 `serialwrap setup`；版本字串（例如 `0.4.1`）在 release 與分支 build 間相同，所以 `serialwrap --version` 另印程式碼指紋，例如 `serialwrap 0.4.1 (code 1a2b3c4d5e6f)`。`serialwrap daemon status` 的 `code_fingerprint` 與 `code_path` 說明 daemon 啟動時載入的程式碼及位置。指紋不一致時，CLI 於 stderr 警告，`doctor` 回報 advisory `daemon_code_current`。systemd 服務 active 且指紋不同時，setup 依狀態自動 restart，輸出 `daemon_code`；systemd-system 未帶 `--with-sudo` 時把指令列入 `pending_sudo`。`--no-restart`、flash、模式轉換、service inactive 與 on-demand 條件不會觸發自動 restart。細節見[規格 §8.7](docs/serialwrap-spec.md)。
 - 既有 on-demand TCP 客戶端請用 `serialwrap setup --on-demand` 或 `./install.sh --on-demand` 保存 endpoint；auto 安裝可能切換至 systemd，詳見[適用範圍與限制](docs/setup-tcp-endpoint.md)。
 - 設定讀取順序為 `SERIALWRAP_CONFIG` → `~/.config/serialwrap/config.yaml` → 存在時的 `/etc/serialwrap/config.yaml`；系統設定檔唯讀，寫入落在 `SERIALWRAP_CONFIG` 或使用者設定檔。
 - 新建執行期目錄權限依 process umask 決定；Unix socket 維持 `0660`，可設定 `SERIALWRAP_SOCKET_GROUP` 指定 socket 群組。
@@ -2856,7 +2856,7 @@ serialwrap setup --with-com0com
 - **監管模式切換**：`supervision-mode set <MODE>` 可在 `on-demand`、`systemd-user`、`systemd-system`、`windows-task` 與 `windows-service` 之間動態切換（Windows 上 `windows-service` 輸出 `pending_sudo` 指令由管理員執行）。切換前執行嚴格之安全預檢與原子交接（`daemon.handoff_stop`）：若有 Flash 燒錄、檔案傳輸、活躍操作或探測不明時一律拒絕切換，且此保護**不受 `--force` 影響**（`--force` 不覆寫交接護欄，只在輸出標記 `force_ignored:true`）。
 - **Windows Task 監管**：`windows-task` 透過 Windows Task Scheduler（`schtasks`）排程工作進行監管，設定 `ExecutionTimeLimit=PT0S`，常駐背景運行並於使用者登入時自動啟動，崩潰時自動重啟（`RestartOnFailure`）。
 - **版本回滾**：`setup --rollback` 透過 `install-journal.json` 原子回滾至上一有效版本之二進位檔、Python runtime 與監管排程設定。第一次從 pipx 的 0.3.2 換成 bundle 時沒有上一個 bundle 版本，因此 `setup --rollback` 不能回到該 pipx 安裝：命令回 `INVALID_ARGS`（`rollback_unavailable`），且不改動現場。手動回到 0.3.2 不是受支援的降級。
-- **0.3.x daemon 執行中直接升級（OD-48、SC-39）**：0.3.x daemon 不支援 `daemon.handoff_stop`。`setup` 正向辨識它（版本低於 0.4.0、為 bundle `versions/` 以外的 pipx Python daemon 行程）後，flash 或忙碌時拒絕；否則把舊行程資訊記進 `install-journal.legacy.json`，以原監管手段停止（為 unit 的 MainPID 時 `systemctl stop`，否則 RPC `daemon.stop`；不硬殺）。舊行程樹結束、且沒有同使用者行程持有 UART，連續 5 秒（上限 330 秒）才切換，之後啟動新 daemon。後續步驟失敗時還原安裝，但**不會**重啟舊 daemon；回應附 `legacy_daemon_stopped`、`restored` 與 `restart_hint`。升級時請明確指定目前的監管模式（`--user`、`--system --with-sudo`、`--on-demand`）；不加旗標時與 0.3.2 相同會自動選擇。
+- **0.3.x daemon 執行中直接升級（OD-48、SC-39）**：0.3.x daemon 不支援 `daemon.handoff_stop`。`setup` 正向辨識它（版本低於 0.4.0、為 bundle `versions/` 以外的 pipx Python daemon 行程）後，flash 或忙碌時拒絕；否則把舊行程資訊記進 `install-journal.legacy.json`，以原監管手段停止（為 unit 的 MainPID 時 `systemctl stop`，否則 RPC `daemon.stop`；不硬殺）。舊行程樹結束、且沒有同使用者行程持有 UART，連續 5 秒（上限 330 秒）才切換，之後啟動新 daemon。整個無法檢查的同使用者行程（`/proc/<pid>/fd` 讀不到，或 fd 條目全部被拒；有 systemd user session 的機器上即 `(sd-pam)` 與 `systemd --user`），只要送出 stop 時就已存在（以 pid 與啟動時間比對），不論四個 uid（real、effective、saved、fs）是否都是自己（常駐的 setuid `fusermount3` 也放行），在其餘同使用者行程都未持有 UART 時不擋切換，改列在 `legacy_stop.uninspectable_procs`（pid、start_ticks、comm、reason，以及 `uid_match`〔`all`；`partial`，例如 setuid 工具；`unknown`〕與 `uids`）並標註 `holders_status: "partial"`。stop 後才出現的無法檢查行程（例如 non-dumpable 的 `ssh-agent` 或 setuid UART 工具）不論 uid、停止前快照取得失敗（此時任何無法檢查的行程都不放行）與其他掃描失敗仍會等到上限；掃描中行程結束或等待中拔除裝置不算失敗。已知代價：停止前就已在執行的 setuid 工具若在等待期間才打開 UART，不會被擋。逾時回應附最後一次輪詢的 `holders_status`、`uninspectable_procs`、`before_stop_snapshot`、`daemon_scan`，以及 `last_unstable`（穩定窗最後一次被打斷的時間與原因）。0.4.0 本身在這類機器上會等滿 330 秒，升級到 0.4.0 時請先停止 0.3.x daemon。後續步驟失敗時還原安裝，但**不會**重啟舊 daemon；回應附 `legacy_daemon_stopped`、`restored` 與 `restart_hint`。升級時請明確指定目前的監管模式（`--user`、`--system --with-sudo`、`--on-demand`）；不加旗標時與 0.3.2 相同會自動選擇。
 
 #### 首次安裝與更新錯誤處置對照表
 
@@ -3476,7 +3476,7 @@ Windows（Rust daemon）上 handler 置於 Job Object 內，`shell` 規則以 `c
 ```bash
 # 安裝（正式流程）：下載 release bundle、以 SHA256SUMS 驗證後執行 <bundle>/bin/serialwrap setup（額外參數轉給 setup）
 ./install.sh                     # 最新 release
-./install.sh --version 0.4.0     # 指定 release
+./install.sh --version 0.4.1     # 指定 release
 serialwrap doctor                # 驗證環境
 ```
 

@@ -15,10 +15,11 @@ use sw_proto::pyjson::{PyDict, PyValue};
 use crate::service::{Service, int};
 
 /// `holders_status` 字串（Python 僅 `ok`／`permission`／`unknown`；`unsupported` 為 Windows PAL 專屬）。
+/// `Partial` 只由 OD-48 的 `uart_holders_same_uid` 產生（health 不呼叫），為窮舉起見與 PermissionDenied 同樣回 `permission`。
 fn status_str(s: HolderScanStatus) -> &'static str {
     match s {
         HolderScanStatus::Ok => "ok",
-        HolderScanStatus::PartialOtherUid => "permission",
+        HolderScanStatus::PartialOtherUid | HolderScanStatus::Partial => "permission",
         HolderScanStatus::Permission => "permission",
         HolderScanStatus::Unknown => "unknown",
         HolderScanStatus::Unsupported => "unsupported",
@@ -31,7 +32,7 @@ fn status_rank(s: HolderScanStatus) -> u8 {
         HolderScanStatus::Ok => 0,
         HolderScanStatus::Unknown => 1,
         HolderScanStatus::Unsupported => 2,
-        HolderScanStatus::PartialOtherUid => 3,
+        HolderScanStatus::PartialOtherUid | HolderScanStatus::Partial => 3,
         HolderScanStatus::Permission => 3,
     }
 }

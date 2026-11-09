@@ -32,7 +32,7 @@ pub struct TtyStat {
 }
 
 impl TtyStat {
-    fn from_metadata(meta: &fs::Metadata) -> TtyStat {
+    pub(crate) fn from_metadata(meta: &fs::Metadata) -> TtyStat {
         TtyStat {
             dev: meta.dev(),
             ino: meta.ino(),

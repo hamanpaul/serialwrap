@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use super::rpc::FakeRpcConnector;
 use crate::proc_scan::{
-    DaemonProc, HolderScanStatus, ProcDetails, ProcIdentity, ProcScan, ScanFailure,
+    DaemonProc, HolderScan, HolderScanStatus, ProcDetails, ProcIdentity, ProcScan, ScanFailure,
 };
 use crate::traits::{Clock, PalResult, SerialBackend, UartExclusive};
 #[cfg(not(unix))]
@@ -163,6 +163,7 @@ pub struct FakeProcScan {
     base: Mutex<Vec<DaemonProc>>,
     script: Mutex<Vec<Vec<DaemonProc>>>,
     failing: Mutex<bool>,
+    failing_while: Mutex<Option<AliveFn>>,
     alive: Mutex<BTreeMap<u32, Vec<bool>>>,
     gates: Mutex<BTreeMap<u32, ConnectGate>>,
     holders: Mutex<(Vec<u32>, Option<HolderScanStatus>)>,
@@ -174,7 +175,7 @@ pub struct FakeProcScan {
     details: Mutex<BTreeMap<u32, ProcDetails>>,
     alive_fns: Mutex<BTreeMap<u32, AliveFn>>,
     current_uid: Mutex<Option<u32>>,
-    uart_holders: Mutex<Option<Vec<(Vec<u32>, HolderScanStatus)>>>,
+    uart_holders: Mutex<Option<Vec<HolderScan>>>,
     cgroups: Mutex<BTreeMap<u32, String>>,
 }
 
@@ -199,6 +200,11 @@ impl FakeProcScan {
     /// 之後的 `serialwrapd_instances` 一律失敗。
     pub fn fail(&self) {
         *self.failing.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    }
+
+    /// `failing` 成立期間 `serialwrapd_instances` 失敗（例如只在舊 daemon 停止後失敗）。
+    pub fn fail_instances_while(&self, failing: Arc<dyn Fn() -> bool + Send + Sync>) {
+        *self.failing_while.lock().unwrap_or_else(|e| e.into_inner()) = Some(AliveFn(failing));
     }
 
     /// 將 RPC 監管模型新拉起的 PID 納入 process scan 快照。
@@ -303,6 +309,11 @@ impl FakeProcScan {
 
     /// OD-48 D5：`uart_holders_same_uid` 的腳本（依序；用盡後保持最後一筆）。未設定時沿用 serialwrapd holder 替身。
     pub fn uart_holders_script(&self, seq: Vec<(Vec<u32>, HolderScanStatus)>) {
+        self.uart_holder_scan_script(seq.into_iter().map(HolderScan::from_pair).collect());
+    }
+
+    /// OD-48 D5.2：同 `uart_holders_script`，但可帶 `Partial` 與無法檢查的行程清單。
+    pub fn uart_holder_scan_script(&self, seq: Vec<HolderScan>) {
         *self.uart_holders.lock().unwrap_or_else(|e| e.into_inner()) = Some(seq);
     }
 
@@ -385,6 +396,10 @@ impl ProcScan for FakeProcScan {
     fn serialwrapd_instances(&self) -> Result<Vec<DaemonProc>, ScanFailure> {
         self.apply_replacement();
         if *self.failing.lock().unwrap_or_else(|e| e.into_inner()) {
+            return Err(ScanFailure);
+        }
+        let failing_while = self.failing_while.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if failing_while.is_some_and(|failing| (failing.0)()) {
             return Err(ScanFailure);
         }
         let mut script = self.script.lock().unwrap_or_else(|e| e.into_inner());
@@ -499,14 +514,14 @@ impl ProcScan for FakeProcScan {
             .cloned()
     }
 
-    fn uart_holders_same_uid(&self, paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus) {
+    fn uart_holders_same_uid(&self, paths: &[PathBuf]) -> HolderScan {
         let mut guard = self.uart_holders.lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_mut() {
             Some(seq) if seq.len() > 1 => seq.remove(0),
             Some(seq) if !seq.is_empty() => seq[0].clone(),
             _ => {
                 drop(guard);
-                self.serialwrapd_tty_holders(paths)
+                HolderScan::from_pair(self.serialwrapd_tty_holders(paths))
             }
         }
     }

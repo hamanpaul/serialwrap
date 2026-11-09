@@ -1,4 +1,4 @@
-"""OD-33 R2(b)(c)：0.3.2 正式版 → 0.4.0 候選的升級驗證（Linux systemd docker 容器）。
+"""OD-33 R2(b)(c)：0.3.2 正式版 → 新版（`VERSION`）候選的升級驗證（Linux systemd docker 容器）。
 
 判定邏輯（`scripts/docker/upgrade_checks.py`）以純函式測試：daemon 行程辨識（不得把含 `serialwrapd` 字樣的
 shell 指令或 launcher→python 父子算成兩個 daemon）、雙 daemon（two-reader）重疊、設定／profiles 逐位元組保留、
@@ -25,6 +25,8 @@ import types
 from pathlib import Path
 from typing import Any
 
+import re
+
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
@@ -32,6 +34,10 @@ RUN_UPGRADE = REPO / "scripts" / "docker" / "run-upgrade.sh"
 DOCKERFILE = REPO / "tools" / "docker" / "upgrade.Dockerfile"
 SYSTEMD_DOCKERFILE = REPO / "tools" / "docker" / "systemd.Dockerfile"
 UPGRADE_CONTAINER = REPO / "scripts" / "docker" / "run_upgrade_container.py"
+# 升級驗證的新版候選即目前版本：run-upgrade.sh 直接讀 VERSION（dry-run 測試以 `--version-override` 驗證輸出，
+# test_run_upgrade_reads_new_version_from_version_file 防止寫死）；容器 driver 在容器內執行、讀不到 VERSION，
+# 保留常數，由 test_upgrade_driver_new_version_matches_version_file 驗證等於 VERSION。
+NEW_VERSION = (REPO / "VERSION").read_text(encoding="utf-8").strip()
 
 sys.path.insert(0, str(REPO))
 
@@ -198,7 +204,7 @@ def _load_driver():
 
 
 class _FakeContainer:
-    """容器內 0.3.2／0.4.0 行為的記憶體替身：假 /proc 與 socket；`daemon stop` 先刪 socket 並回應，舊行程延遲
+    """容器內 0.3.2／新版（`NEW_VERSION`）行為的記憶體替身：假 /proc 與 socket；`daemon stop` 先刪 socket 並回應，舊行程延遲
     `exit_delay` 秒才結束（None＝永不結束）。行程未結束前 `daemon start` 回 DAEMON_ALREADY_RUNNING_ELSEWHERE、
     setup／install.sh 回 DEVICE_STILL_HELD，與本機實測的 on-demand 預熱競態相同。"""
 
@@ -295,13 +301,13 @@ class _FakeContainer:
                 self.cli = "0.3.2"
             return self._done(argv, 0)
         if argv and argv[0].endswith("/bin/serialwrap") and argv[1:2] == ["setup"]:
-            self.cli = "0.4.0" if not self.old_alive() else self.cli
-            return self._guarded("0.4.0 setup", argv, {"ok": True, "install": {
-                "op": "install", "from_version": "0.3.2", "to_version": "0.4.0", "steps": []}})
+            self.cli = NEW_VERSION if not self.old_alive() else self.cli
+            return self._guarded(f"{NEW_VERSION} setup", argv, {"ok": True, "install": {
+                "op": "install", "from_version": "0.3.2", "to_version": NEW_VERSION, "steps": []}})
         if argv[:1] == ["bash"]:
-            self.cli = "0.4.0" if not self.old_alive() else self.cli
+            self.cli = NEW_VERSION if not self.old_alive() else self.cli
             return self._guarded("install.sh", argv, "可執行 `pipx uninstall serialwrap` 移除舊版\n" + json.dumps(
-                {"ok": True, "install": {"op": "install", "to_version": "0.4.0", "steps": []}}))
+                {"ok": True, "install": {"op": "install", "to_version": NEW_VERSION, "steps": []}}))
         return self._done(argv, 0)
 
     def close(self) -> None:
@@ -357,7 +363,7 @@ def _row(driver: Any, check_id: str) -> dict[str, Any]:
     ("phase_seed", "seed_user_data", "0.3.2"),
     ("phase_upgrade_after_stop", "upgrade_after_stop", "0.3.2"),
     ("phase_install_sh", "old_daemon_stopped", "0.3.2"),
-    ("phase_downgrade", "downgrade_manual", "0.4.0"),
+    ("phase_downgrade", "downgrade_manual", NEW_VERSION),
     ("phase_reupgrade", "reupgrade", "0.3.2"),
 ])
 def test_driver_waits_for_old_daemon_exit_before_next_start(fake_driver, phase, check_id, cli):
@@ -379,7 +385,7 @@ def test_driver_waits_for_old_daemon_exit_before_next_start(fake_driver, phase, 
 @pytest.mark.parametrize("phase,check_id,cli", [
     ("phase_seed", "seed_user_data", "0.3.2"),
     ("phase_reupgrade", "reupgrade", "0.3.2"),
-    ("phase_downgrade", "downgrade_manual", "0.4.0"),
+    ("phase_downgrade", "downgrade_manual", NEW_VERSION),
 ])
 def test_driver_stop_wait_timeout_fails_and_is_recorded(fake_driver, phase, check_id, cli):
     """舊 daemon 在有界逾時內未結束：該步驟判 FAIL，detail 記錄殘留行程；seed 不得在逾時後硬起新 daemon。"""
@@ -394,16 +400,16 @@ def test_driver_stop_wait_timeout_fails_and_is_recorded(fake_driver, phase, chec
 
 
 _BASELINE_FP = "347ea96fa479"
-_VERSION_WITH_FP = f"serialwrap 0.4.0 (code {_BASELINE_FP})"
+_VERSION_WITH_FP = f"serialwrap {NEW_VERSION} (code {_BASELINE_FP})"
 
 
 def _with_baseline_fingerprint(fake, driver):
-    """0.4.0 的 `--version` 改成 Python 基線整行；0.3.2 維持純版本。"""
+    """新版的 `--version` 改成 Python 基線整行；0.3.2 維持純版本。"""
     orig = fake.sw
 
     def sw(*args, **kwargs):
         proc = orig(*args, **kwargs)
-        if args == ("--version",) and proc.stdout.strip() == "serialwrap 0.4.0":
+        if args == ("--version",) and proc.stdout.strip() == f"serialwrap {NEW_VERSION}":
             return subprocess.CompletedProcess(proc.args, proc.returncode, _VERSION_WITH_FP + "\n", proc.stderr)
         return proc
 
@@ -414,7 +420,7 @@ def _with_baseline_fingerprint(fake, driver):
 @pytest.mark.posix_only
 @pytest.mark.memory_only
 def test_reupgrade_identifies_0_4_0_when_version_line_has_baseline_fingerprint(fake_driver):
-    """#241 之後 `--version` 為 `serialwrap 0.4.0 (code <12 hex>)`。重新升級仍須指認 0.4.0，
+    """#241 之後 `--version` 為 `serialwrap <新版> (code <12 hex>)`。重新升級仍須指認新版，
     不得把基線指紋後綴當成版本不符。"""
     driver, fake = fake_driver(cli_version="0.3.2")
     _with_baseline_fingerprint(fake, driver)
@@ -422,25 +428,25 @@ def test_reupgrade_identifies_0_4_0_when_version_line_has_baseline_fingerprint(f
     row = _row(driver, "reupgrade")
     assert row["verdict"] == "PASS", row
     assert row["detail"]["cli_version"] == _VERSION_WITH_FP
-    assert row["detail"]["daemon_version"] == "0.4.0"
+    assert row["detail"]["daemon_version"] == NEW_VERSION
 
 
 @pytest.mark.posix_only
 @pytest.mark.memory_only
 def test_entries_replaced_identifies_0_4_0_when_version_line_has_baseline_fingerprint(fake_driver, tmp_path, monkeypatch):
-    """入口已切到 0.4.0 版本目錄且備份記有舊 pipx 入口時，基線指紋版 `--version` 仍須 PASS。"""
-    driver, fake = fake_driver(cli_version="0.4.0")
+    """入口已切到新版版本目錄且備份記有舊 pipx 入口時，基線指紋版 `--version` 仍須 PASS。"""
+    driver, fake = fake_driver(cli_version=NEW_VERSION)
     # importlib 載入的 driver 模組不在 sys.modules；判定讀的是函式全域。
     globals_ = driver._judge_entries_and_config.__func__.__globals__
     versions = tmp_path / "versions"
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    target = versions / "0.4.0" / "bin"
+    target = versions / NEW_VERSION / "bin"
     target.mkdir(parents=True)
     for name in ("serialwrap", "serialwrapd"):
         (target / name).write_text("", encoding="utf-8")
         (bin_dir / name).symlink_to(target / name)
-    backups = tmp_path / "backups" / "20260101T000000Z-to-0.4.0-1"
+    backups = tmp_path / "backups" / f"20260101T000000Z-to-{NEW_VERSION}-1"
     backups.mkdir(parents=True)
     (backups / "entries.json").write_text(json.dumps([
         {"name": "serialwrap", "target": "/opt/old/pipx/venvs/serialwrap/bin/serialwrap"},
@@ -518,7 +524,7 @@ def test_rollback_accepts_baseline_fingerprint_but_not_other_version():
 @pytest.mark.memory_only
 def test_entries_replaced_still_fails_when_symlink_or_pipx_record_is_wrong(fake_driver, tmp_path, monkeypatch):
     """指紋行不得取代入口切換與舊 pipx 備份這兩項必要條件。"""
-    driver, fake = fake_driver(cli_version="0.4.0")
+    driver, fake = fake_driver(cli_version=NEW_VERSION)
     globals_ = driver._judge_entries_and_config.__func__.__globals__
     versions = tmp_path / "versions"
     bin_dir = tmp_path / "bin"
@@ -528,7 +534,7 @@ def test_entries_replaced_still_fails_when_symlink_or_pipx_record_is_wrong(fake_
     for name in ("serialwrap", "serialwrapd"):
         (wrong / name).write_text("", encoding="utf-8")
         (bin_dir / name).symlink_to(wrong / name)
-    backups = tmp_path / "backups" / "20260101T000000Z-to-0.4.0-1"
+    backups = tmp_path / "backups" / f"20260101T000000Z-to-{NEW_VERSION}-1"
     backups.mkdir(parents=True)
     (backups / "entries.json").write_text("[]", encoding="utf-8")
     home = tmp_path / "home"
@@ -896,6 +902,14 @@ def _docker_available() -> bool:
         return False
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_run_upgrade_reads_new_version_from_version_file():
+    text = RUN_UPGRADE.read_text(encoding="utf-8")
+    assert re.search(r"^NEW_VERSION=[0-9]", text, re.M) is None, "run-upgrade.sh 不得寫死 NEW_VERSION"
+    assert '"$REPO_ROOT/VERSION"' in text
+
+
 # POSIX-only：bash runner 需 POSIX bash、git 與 python3。
 @pytest.mark.posix_only
 @pytest.mark.process_rpc
@@ -905,7 +919,7 @@ def test_run_upgrade_dry_run_lists_both_modes_and_isolation(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     out = r.stdout
     assert "git archive v0.3.2" in out
-    assert "--release-bundle --profile release --version-override 0.4.0" in out
+    assert f"--release-bundle --profile release --version-override {NEW_VERSION}" in out
     assert "pip download --only-binary=:all:" in out
     assert "--network none" in out
     for mode in ("systemd-user", "on-demand"):
@@ -952,6 +966,8 @@ def _runner_repo(tmp_path: Path, script: Path) -> tuple[Path, Path]:
     entry = repo / script.relative_to(REPO)
     entry.parent.mkdir(parents=True)
     shutil.copy2(script, entry)
+    # run-upgrade.sh 由 VERSION 讀新版候選，fixture 要帶同一份 VERSION。
+    shutil.copy2(REPO / "VERSION", repo / "VERSION")
     (repo / "input.txt").write_text("原始輸入\n", encoding="utf-8")
     (repo / ".gitignore").write_text("/target/\n", encoding="utf-8")
     for args in (["init", "-q"], ["add", "."],
@@ -978,9 +994,9 @@ def test_wheel_download_targets_container_python_even_on_host313(tmp_path):
         encoding="utf-8",
     )
     fake.chmod(0o755)
-    vdir = tmp_path / "bundle" / "versions" / "0.4.0"
+    vdir = tmp_path / "bundle" / "versions" / NEW_VERSION
     (vdir / "py").mkdir(parents=True)
-    (vdir / "release-manifest.json").write_text('{"bundle_version":"0.4.0"}', encoding="utf-8")
+    (vdir / "release-manifest.json").write_text(json.dumps({"bundle_version": NEW_VERSION}), encoding="utf-8")
     (vdir / "py" / "pyvenv.cfg").write_text(
         "home = /usr/bin\ninclude-system-site-packages = false\n", encoding="utf-8")
     wheel = tmp_path / "serialwrap-0.3.2-py3-none-any.whl"
@@ -1033,6 +1049,13 @@ def test_evidence_entry_refuses_dirty_source_before_side_effects(tmp_path, scrip
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
+def test_upgrade_driver_new_version_matches_version_file():
+    """容器 driver 的 NEW_VERSION 是本次 release 候選，必須等於 VERSION；升版漏改時 Docker 證據會標錯版本。"""
+    assert _load_driver().NEW_VERSION == NEW_VERSION
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_upgrade_report_hashes_actual_container_driver(tmp_path, monkeypatch):
     """只替代執行 phase，仍走真正報告輸出，雜湊綁定實際載入的兩支 driver。"""
     drv = _load_driver()
@@ -1070,7 +1093,7 @@ def test_run_upgrade_dry_run_builds_bundle_with_system_python312_venv(tmp_path):
     assert "pyyaml==6.0.3" in pip and "jsonschema==4.10.3" in pip, pip
     mk = next(line for line in lines if "mkbundle.sh" in line)
     assert mk.startswith(f"+ env PATH={work}/build-venv/bin:"), mk
-    assert "--release-bundle --profile release --version-override 0.4.0" in mk
+    assert f"--release-bundle --profile release --version-override {NEW_VERSION}" in mk
     check = next(line for line in lines if "pyvenv.cfg" in line)
     assert "home = /usr/bin" in check and "include-system-site-packages = false" in check, check
     assert lines.index(check) > lines.index(mk)
@@ -1099,7 +1122,7 @@ def test_run_upgrade_fails_closed_without_system_python312(tmp_path, kind):
     assert r.returncode == 3, r.stdout + r.stderr
     assert "/usr/bin/python3.12" in r.stderr and "不回退" in r.stderr, r.stderr
     work = out_dir / "work"
-    assert not (work / "build-venv").exists() and not (work / "bundle-0.4.0").exists()
+    assert not (work / "build-venv").exists() and not (work / f"bundle-{NEW_VERSION}").exists()
     assert not list(work.glob("wheels/*.whl"))
     assert _docker_calls(log) == []
 
@@ -1117,9 +1140,9 @@ def test_run_upgrade_rejects_bundle_runtime_not_bound_to_usr_bin(tmp_path, cfg):
     """`--bundle` 提供的（或自建的）bundle runtime 的 pyvenv.cfg 不是 `home = /usr/bin`＋
     `include-system-site-packages = false`（或缺檔）→ 建映像之前 rc=3 fail-closed。"""
     bindir, log = _fake_docker(tmp_path)
-    vdir = tmp_path / "bundle" / "versions" / "0.4.0"
+    vdir = tmp_path / "bundle" / "versions" / NEW_VERSION
     (vdir / "py").mkdir(parents=True)
-    (vdir / "release-manifest.json").write_text(json.dumps({"bundle_version": "0.4.0"}), encoding="utf-8")
+    (vdir / "release-manifest.json").write_text(json.dumps({"bundle_version": NEW_VERSION}), encoding="utf-8")
     if cfg is not None:
         (vdir / "py" / "pyvenv.cfg").write_text(cfg, encoding="utf-8")
     wheel = tmp_path / "serialwrap-0.3.2-py3-none-any.whl"
@@ -1171,7 +1194,7 @@ def test_run_upgrade_refuses_existing_evidence(tmp_path):
 @pytest.mark.process_rpc
 @pytest.mark.supervisor_runtime
 def test_docker_upgrade_0_3_2_to_0_4_0(tmp_path):
-    """實跑：兩種監管模式各自完成 0.3.2 安裝→0.4.0 升級→降級回 0.3.2→重新升級，全部檢查 PASS。"""
+    """實跑：兩種監管模式各自完成 0.3.2 安裝→新版升級→降級回 0.3.2→重新升級，全部檢查 PASS。"""
     if not _docker_available():
         pytest.skip("cap_missing:docker：本機無可用 docker daemon（能力式 SKIP，證據不足，非 PASS）")
     if subprocess.run(["git", "rev-parse", "-q", "--verify", "refs/tags/v0.3.2"], cwd=REPO,
@@ -1191,7 +1214,7 @@ def test_docker_upgrade_0_3_2_to_0_4_0(tmp_path):
         assert rep is not None, f"{mode} 未產生 upgrade-report.json"
         assert rep["verdict"] == "PASS", diag
         assert rep["evidence_layer"] == "L1.5-docker"
-        assert rep["old_version"] == "0.3.2" and rep["new_version"] == "0.4.0"
+        assert rep["old_version"] == "0.3.2" and rep["new_version"] == NEW_VERSION
 
 
 # ---------- OD-50：install.sh 升級路徑（0.3.2 pipx、daemon 已停止 → install.sh --bundle） ----------
@@ -1220,6 +1243,86 @@ def test_install_sh_scenario_required_checks_and_verdict():
     assert uc.overall_verdict(rows) == "INSUFFICIENT"
     # 亦不足以讓 systemd-system（OD-48）情境 PASS：缺 legacy_handoff_direct_setup 等
     assert uc.overall_verdict(rows, required=uc.REQUIRED_CHECKS_SYSTEMD_SYSTEM) == "INSUFFICIENT"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_attached_legacy_scenario_required_checks_are_separate():
+    """attached-legacy 另列必要檢查，不影響既有 19／19／13 矩陣。"""
+    assert len(uc.REQUIRED_CHECKS) == 19
+    assert len(uc.REQUIRED_CHECKS_SYSTEMD_SYSTEM) == 13
+    required = uc.REQUIRED_ATTACHED_LEGACY_CHECKS
+    assert required == ("old_install_0_3_2", "attached_session_ready", "user_session_processes",
+                        "holder_scan_permission", "attached_legacy_setup")
+    assert not (set(required) - {"old_install_0_3_2"}) & set(uc.REQUIRED_CHECKS)
+    rows = [{"id": cid, "verdict": "PASS"} for cid in required]
+    assert uc.overall_verdict(rows, required=required) == "PASS"
+    assert uc.overall_verdict(rows[:-1], required=required) == "INSUFFICIENT"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+@pytest.mark.parametrize("kwargs, verdict", [
+    ({}, "PASS"),
+    # 現行 bug：等滿 330 秒回 TIMEOUT（legacy_stop_pending，rc=2）
+    ({"setup_rc": 2, "body": {"ok": False, "error_code": "TIMEOUT", "reason": "legacy_stop_pending"},
+      "elapsed_s": 331.0, "status_after": None, "old_alive_after": [101]}, "FAIL"),
+    ({"elapsed_s": 130.0}, "FAIL"),
+    ({"status_after": {"version": "0.3.2"}}, "FAIL"),
+    ({"old_alive_after": [101]}, "FAIL"),
+])
+def test_judge_attached_legacy_setup(kwargs, verdict):
+    base = dict(setup_rc=0, body={"ok": True}, elapsed_s=8.0, status_after={"version": "0.4.0"},
+                old_pids=[101], old_alive_after=[], new_version="0.4.0")
+    base.update(kwargs)
+    assert uc.judge_attached_legacy_setup("attached_legacy_setup", **base)["verdict"] == verdict
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+@pytest.mark.parametrize("key", ["install", "update"])
+def test_judge_attached_legacy_setup_reads_nested_diagnostics(key):
+    """失敗時 legacy_stop 只在 stop_supervisor 步驟、detail 只在報告內，診斷不得遺失。"""
+    legacy = {"holders_status": "partial", "waited_ms": 330150, "uninspectable_procs": [{"pid": 62}]}
+    report = {"steps": [{"step": "stop_supervisor", "detail": {"legacy_stop": legacy}}],
+              "detail": {"waited_ms": 330150, "alive_pids": []}}
+    body = {"ok": False, "error_code": "TIMEOUT", "reason": "legacy_stop_pending", key: report}
+    result = uc.judge_attached_legacy_setup(
+        "attached_legacy_setup", setup_rc=2, body=body, elapsed_s=331.0, status_after=None,
+        old_pids=[101], old_alive_after=[], new_version="0.4.0")
+    assert result["verdict"] == "FAIL"
+    assert result["detail"]["legacy_stop"] == legacy
+    assert result["detail"]["detail"] == report["detail"]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_judge_attached_legacy_setup_prefers_top_level_diagnostics():
+    top = {"holders_status": "partial", "waited_ms": 5118}
+    body = {"ok": True, "legacy_stop": top, "detail": {"note": "top"},
+            "install": {"steps": [{"step": "stop_supervisor", "detail": {"legacy_stop": {"waited_ms": 1}}}]}}
+    result = uc.judge_attached_legacy_setup(
+        "attached_legacy_setup", setup_rc=0, body=body, elapsed_s=6.9, status_after={"version": "0.4.0"},
+        old_pids=[101], old_alive_after=[], new_version="0.4.0")
+    assert result["verdict"] == "PASS"
+    assert result["detail"]["legacy_stop"] == top
+    assert result["detail"]["detail"] == {"note": "top"}
+
+
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+def test_run_upgrade_dry_run_attached_legacy_scenario(tmp_path):
+    r = subprocess.run(["bash", str(RUN_UPGRADE), "--dry-run", "--scenario", "attached-legacy", "--out", str(tmp_path / "ev")],
+                       cwd=REPO, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = r.stdout
+    assert "--network none" in out
+    assert out.count("--scenario attached-legacy") == 1, out
+    assert "--mode systemd-user" in out and "--mode on-demand" not in out
+    assert "/dev/ttyUSB" not in out and "--device" not in out
+    r = subprocess.run(["bash", str(RUN_UPGRADE), "--dry-run", "--scenario", "attached-legacy", "--mode", "on-demand",
+                        "--out", str(tmp_path / "ev2")], cwd=REPO, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 2, r.stdout + r.stderr
 
 
 def _install_body(**install):
@@ -1256,7 +1359,7 @@ def test_run_upgrade_dry_run_install_sh_scenario(tmp_path):
     out = r.stdout
     assert "--network none" in out
     assert "install.sh:/opt/sw-installer/install.sh:ro" in out
-    assert "serialwrap-0.4.0-linux-x86_64.tar.gz" in out
+    assert f"serialwrap-{NEW_VERSION}-linux-x86_64.tar.gz" in out
     for mode in ("systemd-user", "on-demand"):
         assert f"--mode {mode}" in out, out
     assert out.count("--scenario install-sh") == 2, out
@@ -1295,7 +1398,7 @@ def test_install_sh_scenario_rejects_systemd_system_mode(tmp_path):
 @pytest.mark.process_rpc
 @pytest.mark.supervisor_runtime
 def test_docker_install_sh_upgrade_from_0_3_2(tmp_path):
-    """實跑（OD-50）：兩種監管模式各自 0.3.2 pipx 安裝→停 daemon→`install.sh --bundle <0.4.0 tarball>`→升級成功。"""
+    """實跑（OD-50）：兩種監管模式各自 0.3.2 pipx 安裝→停 daemon→`install.sh --bundle <新版 tarball>`→升級成功。"""
     if not _docker_available():
         pytest.skip("cap_missing:docker：本機無可用 docker daemon（能力式 SKIP，證據不足，非 PASS）")
     if subprocess.run(["git", "rev-parse", "-q", "--verify", "refs/tags/v0.3.2"], cwd=REPO,

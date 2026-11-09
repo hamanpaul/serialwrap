@@ -281,3 +281,144 @@ Copilot 主張：`writer.py` 的 `_mark_progress` 與 `_wait_with_progress` 鎖�
 ---
 
 BRIDGE: APPROVE
+
+## 2026-11-07：收尾競態（control.ndjson 未開啟）
+
+CI 上 `P2 bridge exit=3: HARNESS_EVIDENCE_WRITE_FAILED control.ndjson 未開啟`：control 執行緒處理 shutdown 時，主執行緒 `_finish()` 先關閉 control 檔，`completed` 寫不進去。
+
+實作者與審查者分離。候選 revision tree `fa3c2b4b…`，審查相對 main（d453bbf0）的完整變更，共三輪：
+
+- 第一輪（47c883f0）：agy、grok 都 REJECT。High：gate 逾時未判失敗，`wait()` 可回 0、manifest 乾淨。Medium：關檔與寫入並行、收尾期間 pause／resume 宣稱成功、測試用 `rc == 0 or rc == 3` 放水。
+- 第二輪（b1d22eb9）：agy APPROVE；grok 第一次無判定行，重跑 REJECT，Medium：15 秒上限超過呼叫端 `process.wait(10)`，關檔取鎖無上限。
+- 第三輪（55957025）：兩位都 APPROVE。
+
+### gemini-3.8-flash-high
+
+### `uart_stdio_bridge` Revision 獨立審查報告
+
+審查範圍：`git diff d453bbf0 HEAD -- tools/uart_stdio_bridge changelog.d`（commits `47c883f0` ~ `55957025`）  
+審查角色：獨立審查者（只讀不寫，未變更任何檔案，未 commit）
+
+---
+
+### 逐項檢查結果
+
+#### 1. 時間預算分析
+- **結論**：檢查通過（無 High / Medium 發現）。在 gate 逾時的情境下，能夠在呼叫端 `process.wait(10)` 的 10 秒預算內順利寫出失敗 manifest。
+- **最壞耗時逐段拆解（`_finish` 被喚醒至寫出 manifest）**：
+  1. 停止事件與隊列關閉（`_finish_lock`、`_stop_event.set()`、`tx_q/rx_q.close()`、清除 pause）：`< 0.001 秒`
+  2. 端點關閉（`self.endpoint.close()`）：`< 0.005 秒`
+  3. DUT 終止（`self.dut.terminate(grace_s=0.5)`）：正常約 `0.01 秒`；最壞 DUT 不響應時 `proc.wait(timeout=0.5)` 到期後調用 `kill()`（SIGKILL），耗時約 `0.505 秒`
+  4. 既有 Worker 執行緒 join（`for thread in self._threads.values(): thread.join(timeout=2.0)`）：在 control action 卡住情境下，pump workers 在前述 stop/close 觸發後即刻正常終止退出，7 個執行緒 join 總和 `< 0.01 秒`
+  5. DUT 標準管線關閉（`close_pipes()`）：`< 0.001 秒`
+  6. **Control Gate 等待（`self._close_control_gate()`）**：本次設定上限 `_CONTROL_CLOSE_TIMEOUT_S = 7.0 秒`，逾時精確耗時 `7.000 秒`
+  7. **檔案關閉與取鎖（`_control_file`）**：本次設定取鎖上限 `_CONTROL_FILE_LOCK_TIMEOUT_S = 1.0 秒`，若寫入者卡住持鎖，等滿 `1.000 秒` 後跳過關檔；`_stderr_file` 關閉耗時 `< 0.01 秒`
+  8. 寫入器關閉與 flush（`self.writer.close()`）：隊列已排空，耗時 `< 0.01 秒`
+  9. Manifest 原子寫盤（`_write_manifest`）：讀取 `wire.ndjson` 並寫入 `bridge-manifest.json`，耗時 `< 0.02 秒`
+  - **加總最壞耗時**：`~0.51s + ~0.01s + 7.00s + 1.00s + ~0.04s ≈ 8.56 秒 < 10.0 秒`。
+- **既有 join 開銷評估**：若內部 pump worker 本身卡死在不可中斷的底層 I/O，7 個 worker 依序 join（最壞 `7 * 2.0s = 14s`）會使 10 秒預算超支；但該串列 join 邏輯在 `d453bbf0`（修改前 main）完全原樣存在，並非本次引入，屬既有行為。而在本次防範的「其他連線 control action 卡住」情境下，卡住的是 control RPC 連線執行緒，pump workers 正常退出，時間預算完全成立。
+
+#### 2. 取不到鎖的路徑
+- **結論**：檢查通過（無 High / Medium 發現）。
+- **分析**：
+  - 當 `lock.acquire(timeout=1.0)` 逾時時，程式調用 `self._fail("HARNESS_EVIDENCE_WRITE_FAILED", "control 檔仍被卡住的寫入占用")`，將 `_failure` 標記為失敗、`_return_code = 3`，並以 `continue` 跳過 `close()` 與 `setattr(self, attr, None)`。
+  - 後續的 `_write_manifest` 僅讀取 `wire.ndjson` 並寫入 `bridge-manifest.json`，完全不讀寫 `control.ndjson`，因此 manifest 能夠順利以 `closed_cleanly=False` 與 `failure="HARNESS_EVIDENCE_WRITE_FAILED"` 寫出。
+  - `self.writer.close()` 負責 `wire.ndjson`，物件與 stream 皆完全獨立，不受未關閉的 control stream 影響。
+  - 行程結束時由作業系統正常回收 fd，無並行 close / write 的雙重釋放或 core dump 風險。
+  - 若卡住的寫入者在行程結束前解除阻塞，由於 stream 未被關閉且其仍持 `_control_lock`，寫入者只會補齊該筆格式正確的 ndjson 行並釋放鎖，不會寫壞檔案；且此時 `_failure` 已被鎖定且不可逆，`_control_closed` 已擋下後續 action，絕無覆蓋失敗狀態或將失敗吞成成功的可能。
+
+#### 3. 正常路徑檢驗
+- **結論**：檢查通過（無 High / Medium 發現）。
+- **分析**：
+  - CI 上 `P2 bridge exit=3 ... control.ndjson 未開啟` 的收尾競態確定消失：`shutdown` action 在 `handle_action` 登記於 `_actions_inflight`，`_finish()` 在關閉 `_control_file` 之前必定進入 `_close_control_gate()`，於 `_action_cond` 上等待所有進行中的 action 完成。`shutdown` action 的 `phase="completed"` 記錄在 `finally` 遞減計數並 `notify_all` 前就已完成寫盤，主執行緒絕不會在 control 寫完 completed 前關檔。
+  - 乾淨的 shutdown 路徑在無 I/O 故障時，gate 立即放行（`drained=True`）、`_control_lock` 立即取得，保證 `_return_code = 0` 且 manifest `closed_cleanly = True`，無路徑誤判 rc=3。
+  - 收尾後才到達的遲到請求由 `_control_closed` 直接拒絕（`ok: False`），不寫入 control 檔也不影響 return code，不會產生缺漏或虛假證據。
+
+#### 4. 鎖順序與死結分析
+- **結論**：檢查通過（無 High / Medium 發現）。
+- **獲取順序圖（Lock Hierarchy）**：
+  1. `_finish_lock` -> `_state_lock`（短暫標記 `_finished` 與 `_closing` 即釋放）
+  2. `_action_lock` -> `_control_lock` -> `_state_lock`（`_handle_action` 呼叫 `_control_phase`，遇錯呼叫 `_fail`）
+  3. `_action_cond`：完全作為獨立短暫葉子鎖（Leaf Lock）使用。無論在 `handle_action` 進入/退出、或 `_close_control_gate` 等待時，持有 `_action_cond` 期間絕不呼叫任何業務邏輯，也絕不獲取 `_action_lock`、`_control_lock` 或 `_state_lock`。
+  4. `_state_lock`：純保護內部變數與 Condition，內部絕不反向獲取 `_control_lock` 或 `_action_lock`。
+- **結論**：全域維持嚴格偏序，不存在任何鎖相依環（No Lock Cycle），無死結風險。
+
+#### 5. 初始化失敗路徑、selftest 與跨平台相容性
+- **結論**：檢查通過（無 High / Medium 發現）。
+- **分析**：
+  - **初始化失敗路徑**：`Bridge.start()` 拋出例外時呼叫 `_fail` 與 `_finish`，此時 `_actions_inflight` 為空，`_close_control_gate()` 立即返回 True，未開啟的檔案安全略過，正確產出失敗 manifest。
+  - **selftest 路徑**：14 個標準自測（ST-01 ~ ST-14）實跑全部 PASS；`APPROVED_REVISION.json` 記載的 `tree_sha256`（`fa3c2b4b4e28...`）與當前源碼雜湊嚴格一致（`test_approved_revision_matches_tool_tree` 通過）。
+  - **Windows 行為**：`_control_phase` 捕捉例外擴大為 `(OSError, ValueError)`，徹底修復 Windows 上向已關閉 stream 寫入時拋出 `ValueError: I/O operation on closed file.` 導致例外逃逸的問題；關檔時持有 `_control_lock` 避免了 Windows 對檔案控制代碼（file handle）並行操作敏感的潛在崩潰風險。
+
+#### 6. 新增測試檢驗
+- **結論**：檢查通過（無 High / Medium 發現）。
+- **分析**：
+  - `test_finish_does_not_hang_when_control_write_holds_lock` 使用 `_Stuck` 包裝物件攔截 `fileno()`，在寫入者已確實取得 `_control_lock` 之後透過 `blocked.set()` 通知測試主執行緒，使測試主執行緒以 `wait()` 觸發 `_finish` 嘗試取鎖，確實驗證到持鎖超時跳過關檔且寫出非乾淨 manifest 的完整路徑。
+  - 所有新測試（包含逾時 fail-closed、收尾泵操作拒絕、ValueError 捕捉、關檔競態回歸）全部使用 `threading.Event` 交握同步，無依賴 `time.sleep` 賭時序的脆弱斷言。
+
+---
+
+BRIDGE: APPROVE
+
+### grok-4.7
+
+我以獨立審查者身份只讀候選 commit，對照 main 的完整 diff，逐項核對時間預算、鎖路徑與測試是否真的堵住競態。候選是 `55957025`，相對 `d453bbf0` 有三個 commit。我先把 `_finish`、鎖順序與呼叫端 10 秒等待對起來。差異已對上。接下來讀 `_finish` 全段、呼叫端 10 秒等待，以及鎖的取得順序。前幾輪的四項修正都在程式路徑裡，不只有註解。gate 逾時會呼叫 `_fail`，`wait()` 回 3，manifest 的 `closed_cleanly` 為 false。`_control_phase` 在 `_control_lock` 內取 stream，`_finish` 持同一把鎖關檔，`except` 接住 `(OSError, ValueError)`。收尾期間 `pause_pump`／`resume_pump` 回 `ok: false`。卡住的測試在放行前就檢查 rc 與 manifest。
+
+## 1. 時間預算
+
+從 `_done_event` 喚醒到寫出 manifest，分段上限如下。
+
+| 段 | 上限 | 出處 |
+|---|---|---|
+| `endpoint.close()` | 無上限（例外被吞掉） | `core.py:1193`，修改前就有 |
+| `dut.terminate(0.5)` | 0.5 秒，沒死再 `kill()` 的 `proc.wait(5)`；docker 另有 `docker kill` 10 秒 | `core.py:1197`、`dut_process.py:292-329`，修改前就有 |
+| worker `join` | 2 秒 × 最多 7 條（tx/rx reader、writer、stderr、dut_watch、peer_watch）= 14 秒 | `core.py:1204-1206`，修改前就有 |
+| gate | 7 秒 | `core.py:1210`，這次新增 |
+| 取 `_control_lock` | 1 秒，只有取不到才用滿 | `core.py:1220`，這次新增 |
+| 取得鎖之後的 flush／fsync | 無上限 | 修改前就有 |
+| `writer.close()` | 無進度 10 秒，持續有進度則絕對上限 300 秒 | `writer.py:50,720-777`，修改前就有 |
+| `_write_manifest` | 整份 wire 讀入再雜湊；Windows 另有 platform 查詢 | 修改前就有 |
+
+呼叫端的 10 秒要等 shutdown RPC 返回才開始。RPC 返回代表 shutdown 那條執行緒已寫完 `completed` 並離開 inflight。
+
+另一條連線的 action 卡在動作本體、沒有握住 `_control_lock` 時，RPC 會很快返回。worker 與 DUT 都及時結束的話，這段大約是 terminate 0.5 秒加 gate 7 秒，鎖不等待，合計約 8 秒，manifest 趕得上，大約剩 2 秒給 `writer.close()` 與雜湊。對方若卡在持鎖的 fsync，shutdown 的 `completed` 也在等這把鎖，RPC 還沒返回，10 秒窗還沒開始；7 秒加 1 秒落在 control client 的 30 秒裡，manifest 寫得出。
+
+既有的 `join` 最壞 14 秒、`kill()` 的 5 秒、`writer.close()` 的 10／300 秒，任何一段單獨就能超過 10 秒。那是修改前就有的。那種情況呼叫端 SIGTERM，退出碼不是 0；沒有 manifest 時比較器記 `HARNESS_TAMPER_DETECTED`（`wire_reader.py:234-239`），不會當成成功。DUT 已進入 `kill()` 的 5 秒再疊上這次的 7 秒 gate，會讓「先前還寫得出失敗 manifest」的複合路徑跨過 10 秒；後果仍是訊號死亡、退出碼非 0，同一類既有問題，不擋核准。
+
+- **Low** `core.py:1197`：DUT 沒在 0.5 秒內死掉時，`kill()` 最多再等 5 秒，後面才開始 7 秒 gate。另一條連線的 action 卡在動作本體（所以 shutdown RPC 已經返回），同時 DUT 扛過 SIGTERM，主執行緒可能在寫 manifest 前被 `process.wait(10)` SIGTERM。退出碼仍不是 0。
+
+## 2. 取不到鎖
+
+取不到鎖時不關 stream，先 `_fail`，再照樣 `writer.close()` 與 `_write_manifest`。stream 是 `buffering=0`，已經返回的 `write()` 在核心裡。卡住的執行緒醒來後只能繼續 append `control.ndjson`，或在行程結束時被殺掉（control client 是 daemon，`control.py:120`）。`_return_code = 0` 只有 `core.py:1080` 一處，而且要 `_failure is None`；此時 `_failure` 已經設上，不會改回 0。`_finished` 擋住第二次 `_finish`，manifest 不會被改寫成乾淨關閉。半行尾端配上 `closed_cleanly: false` 與 rc=3，比較器仍判失敗。
+
+結論：不會把失敗覆寫成成功，也不會靜默補成一份乾淨證據。
+
+## 3. 正常路徑
+
+CI 那個競態關掉了。`_finish` 在主執行緒，shutdown 在 control client 執行緒；gate 只略過自己的 ident，所以會等到 shutdown 的 `finally` 把 inflight 減掉。那一步在 `completed` 的 `_control_phase` 返回之後，write 與 fsync 已做完，鎖也已放掉，然後才持鎖關檔。
+
+乾淨 shutdown 要得到 rc=3，得有別條 inflight action，或 shutdown 自己在 timer 之後的 `_evidence_summary()` 加 `completed` fsync，於 gate 起算後超過 7 秒。7 秒以內會得到 rc=0，而且 `completed` 已在檔裡。超過 7 秒會 rc=3；修改前這段慢收尾會先被關檔，變成 `control.ndjson 未開啟` 的 rc=3。這次是把這段失敗從「join 一結束就發生」推到 7 秒之後。
+
+`_control_closed` 之後才到的 action 直接 `ok: false`，不寫證據、不改 rc。沒有路徑是 rc=0 卻缺 shutdown 的 `completed`。
+
+結論：原競態在正常收尾不會再出現，乾淨路徑不會無證據地報成功。
+
+## 4. 鎖順序
+
+沒有環。`_action_cond` 只在 `handle_action` 進出與 gate 使用，放出後才拿 `_action_lock`。action 本體再拿 `_state_lock` 或 `_control_lock`。唯一的嵌套是 `_control_phase` 持 `_control_lock` 時，`_fail` 再拿 `_state_lock`。沒有人持 `_state_lock` 或 `_action_lock` 去等 `_action_cond`，也沒有人持 `_state_lock` 去等 `_control_lock`。gate 的 `wait_for` 等待時會放開 `_action_cond`，7 秒到時返回；關檔取鎖 1 秒到時返回。
+
+結論：這四把鎖不會死結。
+
+## 5. 初始化、selftest、Windows
+
+`start()` 失敗時 control server 還沒啟動，inflight 是空的，gate 立刻返回，接著仍是關檔、`writer.close()`、寫 manifest。selftest 與單元測試是同步呼叫 `handle_action("shutdown")` 再 `wait()`，進 `wait()` 時 inflight 已是 0，gate 不等待。這次沒有新增 POSIX 專用呼叫；`Lock.acquire(timeout=)` 與 `ValueError`（已關閉檔案）在 Windows 同樣成立。`APPROVED_REVISION.json` 的 `tree_sha256` 與目前 `tool_tree_sha256()` 一致，都是 `fa3c2b4b…`。
+
+結論：這三條路徑沒有回歸。
+
+## 6. 測試
+
+`test_finish_does_not_hang_when_control_write_holds_lock` 在 `fsync` → `fileno()` 裡、鎖還握著時設下 `blocked`，測試先等到這個事件才呼叫 `wait()`。不是用 sleep 去猜時序。`test_shutdown_completed_written_before_control_file_closed` 的 1.5 秒是下界：檔若被提前關掉，測試會失敗。`test_stuck_action_times_out_and_stays_fail_closed` 卡的是 gate（尚未取鎖），放行前就要求 rc=3 且 manifest 非乾淨關閉。`test_close_budget_below_blackbox_sigterm_window` 只斷言 `7+1 < 10`，沒有把 join、DUT kill、`writer.close()` 算進去。
+
+結論：持鎖卡住有被測到，而且不是 sleep 賭時序。預算測試只鎖了常數和，沒有覆蓋第 1 項的既有開銷。
+
+BRIDGE: APPROVE

@@ -4,6 +4,38 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-08
+
+### Added
+- GitHub Release 開始附上 Windows 正式 bundle `serialwrap-<版本>-windows-x86_64.zip`（OD-78），隨 tag 由 release workflow 的 `publish-windows-bundle` job 在 GitHub hosted `windows-latest` 建置：內含 Rust CLI／launcher 與 Python daemon，runtime 為自帶的 CPython 3.12.3（含 PyYAML、pyserial），不需系統 Python；解開後 smoke 通過才把雜湊併入 `SHA256SUMS` 上傳。zip 不含 com0com、未做程式碼簽署；PyInstaller 的 `serialwrap.exe`／`serialwrapd.exe` 照發。安裝步驟見 README「Windows 發佈 zip」。
+  - release workflow 新增 `workflow_dispatch`（輸入 tag），可對既有 tag 補傳 Windows zip，不重發 wheel、exe 與 Linux bundle。
+  - 建置與 smoke 腳本：`scripts/rust/mkbundle-windows.ps1`、`scripts/rust/mkbundle_windows.py`、`scripts/rust/smoke-windows-bundle.ps1`；相依套件以雜湊釘版於 `scripts/rust/win-bundle-requirements.txt`。`tests/test_release_workflow.py` 由禁止 Windows bundle 改為驗證該 job。
+
+### Changed
+- skill 新增「CLI 效能比較」一節，附 Rust 與 Python CLI 的比較腳本與判讀注意事項。
+
+### Fixed
+- 修正 0.3.x daemon 仍在執行時直接升級，`setup` 在有 systemd user session 的 Linux（含 WSL）上一定等滿 330 秒，回 `TIMEOUT`（`legacy_stop_pending`）的問題（#257，即 0.4.0 已知問題「daemon 接著序列裝置時直接升級會失敗」）。`setup` 等舊 daemon 結束時，要確認沒有同使用者行程還持有 UART；但同使用者的 `(sd-pam)` 是 non-dumpable 行程，`/proc/<pid>/fd` 整個讀不到，`systemd --user` 的 fd 條目也全部被拒，整次掃描因此一律判為讀取失敗，「UART 已釋放」永遠不成立。
+  - 現在若只剩「整個無法檢查」、且送出 stop 前就已存在（以 pid＋start_ticks 快照比對）的行程，照原本的 5 秒穩定窗放行；不論這些行程的 real、effective、saved、fs 四個 uid 是否全同（例如常駐的 setuid `fusermount3`，`Uid: 1000 0 0 0`）。`legacy_stop` 以 `holders_status: "partial"` 與 `uninspectable_procs`（pid、start_ticks、comm、reason、四 uid 分類 `uid_match` 與 `uids`）列出它們。
+  - 以下情況維持原本的保守判定、不放行：stop 之後才出現的無法檢查行程（含 pid 重用）、停止前快照取得失敗、目標 tty 讀不到、同一行程只有部分 fd 讀不到、其他讀取失敗。已知代價：停止前就存在的 setuid 工具若在等待期間才打開 UART，不會被擋下。
+  - 掃描途中行程結束（fd 目錄 NotFound）與等待中拔除裝置（目標 tty 節點不存在）不再算讀取失敗，忙碌機器上的穩定窗不會因此一再重置。
+  - 逾時回應附最後一次輪詢的 `holders_status`、`uninspectable_procs`（標 `seen_before_stop`）、`before_stop_snapshot`（ok／failed）、`daemon_scan`，以及最後一次不穩定的 `last_unstable`（`waited_ms`、`reasons`）。
+  - 其他使用 holder 掃描的路徑（`serialwrapd_tty_holders`，即 `update_confirm_released`）判定不變。
+  - 新增 Docker 升級驗證情境 `scripts/docker/run-upgrade.sh --scenario attached-legacy`：0.3.2 daemon 以 PTY 假裝置 attach，容器內 uid 1000 有真實的 `systemd --user` 與 `(sd-pam)`；先確認 fd 掃描因這兩個行程回 Permission，再斷言新版 `setup` 在有限時間內成功切換。既有升級情境與必要檢查不變。另新增實機回歸 case `f8-legacy-attached-upgrade`。
+- 修正 interactive 命令 TX 完成後、執行器返回前取消時，連帶撤銷仍開著的 interactive lease，之後同一 lease 每次 interactive send 都回 `SESSION_BUSY` 直到 lease 逾時的競態（OD-77 B1，登記 DF-25；即 0.4.0 已知問題中的互動租約項）。取消現在只撤銷原命令的 op，提交前取消仍維持零 TX。另在契約補註 `session.bind` 對 release 佔位 session 的早退排在 `FLASHING_BUSY` 檢查之前（OD-77 B5，只補說明、不改行為）。
+- 修正 `uart_stdio_bridge` 收尾時 `control.ndjson` 已關閉的競態：`shutdown` action 觸發結束後，主執行緒 `_finish()` 可能在 control 執行緒寫入 `completed` 前就關閉 `control.ndjson`，造成 `HARNESS_EVIDENCE_WRITE_FAILED`（`control.ndjson 未開啟`）與 return code 3。
+  - `_finish()` 關檔前會有上限地等待進行中的 control action 寫完；之後才到的 action 直接回 `{"ok": false}`，不寫證據、不影響 return code。等待上限 7 秒，另加關閉 control 檔的取鎖上限 1 秒，總和小於黑箱的 SIGTERM 窗 10 秒；逾時或取不到鎖時判 `HARNESS_EVIDENCE_WRITE_FAILED`（rc 3、manifest 標為非乾淨關閉），manifest 仍會寫出。
+  - 另修 control 檔關閉與寫入並行時的 `ValueError` 逃逸，以及收尾期間 `pause_pump`／`resume_pump` 回報假狀態。
+- `uart_stdio_bridge` 證據 writer 的 close、flush 與背壓期限改依成功寫入的進度判斷是否停滯，bridge 失敗時 stderr 附上路徑細項；Windows 序列埠寫入在 timeout 設定耗時後，只要剩餘期限還夠再設定一次就重試，不再提前回 0。
+  - `uart_stdio_bridge` 核准 tree 依序更新為 `f79f330f…`（兩位非實作者審查皆 `BRIDGE: APPROVE`）與 `fa3c2b4b…`（收尾競態修正）。
+- GitHub Pages 排除 `rust-refactor/inventory` 與 `rust-refactor/plans`，修正其中的 `{%` 造成的建置失敗，並以 pytest 在合併前攔截。
+- release workflow 的測試環境對齊 Tests workflow，避免 tag 發布時才失敗。
+- 修正 Windows bundle 建置腳本在 GitHub hosted Windows runner 上印中文時丟 `UnicodeEncodeError`（runner 的 Python stdout 是 cp1252）；`mkbundle_windows.py` 與 `check_win_imports.py` 改為在入口把 stdout／stderr 設為 UTF-8。對 v0.4.0 預演補傳 Windows zip 時發現並修正，v0.4.0 Release 也已補上 Windows zip。
+- CI 與測試可攜性：
+  - hosted Windows pytest 修正測試替身、部署版面與 golden 產生器的可攜性，並補齊固定的 Rust 工具鏈；出口證據整合檢查仍由 driver 強制執行。WAL 測試先關閉常駐 writer 再清理暫存目錄，既有內容與輪替斷言不變。
+  - hosted Windows Cargo 測試不再假設語系與 ACP：以同機 Python 3.12 取得 Windows 系統訊息與 mbcs 解碼基線，仍比對完整字串與錯誤碼；固定 Rust 內嵌 Unicode 名稱表與安裝資產的 LF 檢出，並加入 autocrlf 位元組回歸測試。
+  - Rust Linux 黑箱測試補上獨立 conftest 的 Windows 原生平台防線，巢狀 A/B 改在唯讀根目錄、獨立 PID 與 runtime 的 bubblewrap 沙箱執行。CI 以與容器相同的系統 Python base 建 bundle，保留 A/B 與 systemd 診斷，L1.5 報告失敗時輸出完整原因；`INSUFFICIENT_EVIDENCE` 仍判失敗。沙箱自測在沒有 `target/` 的乾淨 checkout 也會建立成果目錄；明確要求 Docker 但缺少 Unix socket 時回 exit 3（證據不足）與診斷，不執行後續命令。CI 命令順序自測同步要求沙箱入口與 resource／JUnit 報告，並以負向測試拒絕改回直接執行黑箱的工作流程。
+
 ## [0.4.0] - 2026-11-06
 
 ### Added

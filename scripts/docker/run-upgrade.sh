@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# OD-33 R2(b)：0.3.2 正式版 → 0.4.0 候選升級驗證（Linux，OD-16 (5) ubuntu:24.04 systemd 容器）。
-# host 端：由 git tag v0.3.2 建 wheel、下載隔離安裝所需 PyYAML wheel、以 mkbundle.sh 建不含測試鉤子的 0.4.0 release bundle（或沿用 --wheel／--bundle）、
+# OD-33 R2(b)：0.3.2 正式版 → 新版（NEW_VERSION）候選升級驗證（Linux，OD-16 (5) ubuntu:24.04 systemd 容器）。
+# host 端：由 git tag v0.3.2 建 wheel、下載隔離安裝所需 PyYAML wheel、以 mkbundle.sh 建不含測試鉤子的新版 release bundle（或沿用 --wheel／--bundle）、
 # 建升級映像，每種監管模式起一個全新容器（--network none、不帶任何裝置），以唯讀 bind mount 提供 wheel、bundle 與
 # 容器內 driver，結果寫 <out>/<mode>/upgrade-report.json。不碰本機正式安裝、/dev/ttyUSB* 或其他容器。
 # `--scenario install-sh`（OD-50）：另將 bundle 打包成 release 同名 tarball，並唯讀掛載 repo 的 install.sh，
@@ -16,7 +16,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DOCKERFILE="$REPO_ROOT/tools/docker/upgrade.Dockerfile"
 OLD_TAG=v0.3.2
 OLD_VERSION=0.3.2
-NEW_VERSION=0.4.0
+# 新版候選即目前版本，直接讀 VERSION，避免每次發版要同步多處。
+NEW_VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION")"
+[[ "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "VERSION 格式不符：$NEW_VERSION" >&2; exit 2; }
 # SW_UPGRADE_SYSTEM_PYTHON 只供測試模擬主機缺件；實體不在 /usr/bin 或版本不符 contracts/cli_help/_meta.json 一律拒絕。
 SYSTEM_PYTHON="${SW_UPGRADE_SYSTEM_PYTHON:-/usr/bin/python3.12}"
 # 與 release workflow 的 build venv 同一釘版
@@ -47,14 +49,14 @@ while (($#)); do
         --scenario)
             (($# >= 2)) || { echo "--scenario 需要參數" >&2; exit 2; }
             case "$2" in
-                upgrade|install-sh) SCENARIO="$2" ;;
+                upgrade|install-sh|attached-legacy) SCENARIO="$2" ;;
                 *) echo "不支援的情境：$2" >&2; exit 2 ;;
             esac
             shift 2
             ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help)
-            echo "用法：$0 [--mode systemd-user|on-demand|systemd-system|all] [--scenario upgrade|install-sh] [--out DIR] [--wheel serialwrap-0.3.2-*.whl] [--bundle DIR] [--dry-run]"
+            echo "用法：$0 [--mode systemd-user|on-demand|systemd-system|all] [--scenario upgrade|install-sh|attached-legacy] [--out DIR] [--wheel serialwrap-0.3.2-*.whl] [--bundle DIR] [--dry-run]"
             exit 0
             ;;
         *) echo "不支援的參數：$1" >&2; exit 2 ;;
@@ -76,6 +78,13 @@ if [[ "$SCENARIO" == install-sh && " ${MODES[*]} " == *" systemd-system "* ]]; t
     echo "--scenario install-sh 不支援 systemd-system（該模式只驗 OD-48 直接 setup 成功路徑）" >&2
     exit 2
 fi
+if [[ "$SCENARIO" == attached-legacy && "${MODES[*]}" != "systemd-user" ]]; then
+    # 未明確指定 --mode 時（預設兩模式）改為只跑 systemd-user；明確指定其他模式則拒絕。
+    if [[ "${MODES[*]}" == "systemd-user on-demand" ]]; then MODES=(systemd-user); else
+        echo "--scenario attached-legacy 只支援 systemd-user（需真實 user session 的 systemd --user 與 (sd-pam)）" >&2
+        exit 2
+    fi
+fi
 WORK="$OUT/work"
 IMAGE="serialwrap-upgrade:$RUN_ID"
 TARBALL_NAME="serialwrap-$NEW_VERSION-linux-x86_64.tar.gz"
@@ -86,6 +95,10 @@ if [[ "$SCENARIO" == install-sh ]]; then
     EXTRA_MOUNTS=(-v "$REPO_ROOT/install.sh:/opt/sw-installer/install.sh:ro" -v "$WORK/dist:/opt/sw-dist:ro")
     EXTRA_DRIVER_ARGS=(--scenario install-sh --installer /opt/sw-installer/install.sh
         --bundle-tarball "/opt/sw-dist/$TARBALL_NAME")
+fi
+
+if [[ "$SCENARIO" == attached-legacy ]]; then
+    EXTRA_DRIVER_ARGS=(--scenario attached-legacy)
 fi
 
 print_command() {

@@ -284,7 +284,7 @@ dependencies = [
 
 [[package]]
 name = "sw-cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "indexmap",
  "sw-pal",
@@ -294,14 +294,14 @@ dependencies = [
 
 [[package]]
 name = "sw-com0com-helper"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "sw-pal",
 ]
 
 [[package]]
 name = "sw-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "crossbeam-channel",
  "indexmap",
@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "sw-daemon"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "crossbeam-channel",
  "sw-core",
@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "sw-pal"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "crossbeam-channel",
  "libc",
@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "sw-proto"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "crc32fast",
  "fancy-regex",

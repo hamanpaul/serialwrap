@@ -50,6 +50,17 @@ class BridgeConfig:
             raise ValueError("stderr_cap_bytes 不得為負數")
 
 
+# 收尾時等進行中 control action 的上限。逾時即 fail-closed（rc=3），不宜太短以免把「CI 慢」
+# 誤判成失敗（shutdown 的 _evidence_summary 會讀整份 wire 檔、fsync 也可能慢）。
+# 對 shutdown 自己，等待發生在 RPC 返回前，由 30 秒 control 逾時涵蓋；
+# 對其他連線的 action，等待發生在 shutdown RPC 返回之後，呼叫端只再等 process.wait(timeout=10)
+# （tests/contract_blackbox/bb_l15.py）即 SIGTERM，故「gate + 關 control 檔取鎖」上限
+# 之和必須小於 10 秒，留時間寫 manifest。
+_CONTROL_CLOSE_TIMEOUT_S = 7.0
+# 關閉 control 檔時取 _control_lock 的上限；對方卡在持鎖的 fsync 時不得讓 wait() 永不返回。
+_CONTROL_FILE_LOCK_TIMEOUT_S = 1.0
+
+
 class Bridge:
     """獨立維護 TX、RX、stderr 與控制通道，不解析 UART 文字內容。"""
 
@@ -75,6 +86,10 @@ class Bridge:
         self._state_changed = threading.Condition(self._state_lock)
         self._action_lock = threading.RLock()
         self._control_lock = threading.Lock()
+        # 追蹤進行中的 control action（含不取 _action_lock 者），供 _finish 關檔前有上限等待。
+        self._action_cond = threading.Condition(threading.Lock())
+        self._actions_inflight: dict[int, int] = {}
+        self._control_closed = False
         self._finish_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._done_event = threading.Event()
@@ -506,13 +521,13 @@ class Bridge:
         result: dict[str, Any] | None,
         error: str | None,
     ) -> None:
-        stream = self._control_file
-        if stream is None:
-            self._fail("HARNESS_EVIDENCE_WRITE_FAILED", "control.ndjson 未開啟")
-            return
         from uart_stdio_bridge.evidence.clock import clock_id
 
         with self._control_lock:
+            stream = self._control_file
+            if stream is None:
+                self._fail("HARNESS_EVIDENCE_WRITE_FAILED", "control.ndjson 未開啟")
+                return
             self._control_seq += 1
             rec = {
                 "schema_version": "control.v1",
@@ -540,8 +555,12 @@ class Bridge:
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
-            except OSError as exc:
-                code = "HARNESS_DISK_FULL" if exc.errno == errno.ENOSPC else "HARNESS_EVIDENCE_WRITE_FAILED"
+            except (OSError, ValueError) as exc:
+                code = (
+                    "HARNESS_DISK_FULL"
+                    if getattr(exc, "errno", None) == errno.ENOSPC
+                    else "HARNESS_EVIDENCE_WRITE_FAILED"
+                )
                 self._fail(code, exc)
 
     def _barrier(self, params: dict[str, Any], action_id: str) -> dict[str, Any]:
@@ -710,6 +729,9 @@ class Bridge:
         if action in {"pause_pump", "resume_pump"}:
             direction = str(params.get("dir", "")).upper()
             if direction not in {"TX", "RX"}:
+                return {"ok": False, "error": "HARNESS_CONTROL_PROTOCOL_ERROR"}
+            if self._closing or self._stop_event.is_set():
+                # 收尾期間泵已停，不得記下假的 paused/running 狀態。
                 return {"ok": False, "error": "HARNESS_CONTROL_PROTOCOL_ERROR"}
             if action == "pause_pump":
                 try:
@@ -1081,10 +1103,42 @@ class Bridge:
         if not isinstance(params, dict):
             params = {}
         action_id = action_id or uuid.uuid4().hex
-        if action in {"status", "pause_pump", "resume_pump"}:
-            return self._handle_action_recorded(action, params, action_id)
-        with self._action_lock:
-            return self._handle_action_recorded(action, params, action_id)
+        ident = threading.get_ident()
+        with self._action_cond:
+            if self._control_closed:
+                # control 已關閉：遲到請求不寫證據、不影響 return code。
+                return {"ok": False, "error": "HARNESS_CONTROL_PROTOCOL_ERROR"}
+            self._actions_inflight[ident] = self._actions_inflight.get(ident, 0) + 1
+        try:
+            if action in {"status", "pause_pump", "resume_pump"}:
+                return self._handle_action_recorded(action, params, action_id)
+            with self._action_lock:
+                return self._handle_action_recorded(action, params, action_id)
+        finally:
+            with self._action_cond:
+                left = self._actions_inflight.get(ident, 1) - 1
+                if left > 0:
+                    self._actions_inflight[ident] = left
+                else:
+                    self._actions_inflight.pop(ident, None)
+                self._action_cond.notify_all()
+
+    def _close_control_gate(self, timeout_s: float | None = None) -> bool:
+        """等進行中的 control action 寫完證據（有上限），再拒收之後的 action。
+
+        逾時不放行：control_file 關閉後卡住的 action 於 _control_phase 看到 None，仍 fail-closed。
+        在 control 執行緒上執行時不等自己所屬的 action。回傳 False 表示逾時（仍有 action 未結束）。
+        """
+        if timeout_s is None:
+            timeout_s = _CONTROL_CLOSE_TIMEOUT_S
+        me = threading.get_ident()
+        with self._action_cond:
+            drained = self._action_cond.wait_for(
+                lambda: not any(i != me for i in self._actions_inflight),
+                timeout=timeout_s,
+            )
+            self._control_closed = True
+        return bool(drained)
 
     def _handle_action_recorded(
         self, action: str, params: dict[str, Any], action_id: str
@@ -1153,19 +1207,40 @@ class Bridge:
         close_pipes = getattr(self.dut, "_close_pipes", None)
         if callable(close_pipes):
             close_pipes()
+        if not self._close_control_gate():
+            # 在 _action_cond 之外呼叫；讓 rc 與 manifest 在 wait() 返回前就判為失敗。
+            self._fail(
+                "HARNESS_EVIDENCE_WRITE_FAILED", "control action 未在收尾期限內結束"
+            )
         for attr in ("_control_file", "_stderr_file"):
-            stream = getattr(self, attr)
-            if stream is not None:
-                try:
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                except OSError:
-                    pass
-                try:
-                    stream.close()
-                except OSError:
-                    pass
-                setattr(self, attr, None)
+            # 關閉 control 檔須持 _control_lock，避免與 _control_phase 並行 close/write。
+            lock = self._control_lock if attr == "_control_file" else None
+            locked = False
+            if lock is not None:
+                locked = lock.acquire(timeout=_CONTROL_FILE_LOCK_TIMEOUT_S)
+                if not locked:
+                    # 寫入者卡在持鎖的 I/O：不動 stream（避免並行 close/write），判失敗後繼續寫 manifest。
+                    self._fail(
+                        "HARNESS_EVIDENCE_WRITE_FAILED",
+                        "control 檔仍被卡住的寫入占用",
+                    )
+                    continue
+            try:
+                stream = getattr(self, attr)
+                if stream is not None:
+                    try:
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    except OSError:
+                        pass
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+                    setattr(self, attr, None)
+            finally:
+                if locked:
+                    lock.release()
         try:
             summary = self.writer.close()
             if not isinstance(summary, dict):
