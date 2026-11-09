@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -23,6 +27,37 @@ _VALID_PHASES = frozenset({"setup", "call", "teardown"})
 _OWNER_CAPS = frozenset({
     "physical_uart", "windows_com", "supervisor_runtime", "interactive_desktop", "longrun_bench",
 })
+_CARGO_PREFIX = "cargo:"
+
+# --- 長跑證據（計畫 Task 15 步驟 8；`slice24_exit.sh --longrun <dir>` 匯入）---
+# 輸入目錄結構：
+#   longrun-manifest.json                      {"schema_version":"slice24-longrun.v1","case_id":"lr-mixed",
+#                                               "platforms":{"<p>":{"bundle_tree_sha256":"<pinned bundle>"}}}
+#   <p>/release-gate.json                      P2 realhw/acceptance/gate.py candidate 輸出
+#   <p>/baseline-release-gate.json             對應 Python 48 h baseline 的 gate 輸出（mode=baseline）
+#   <p>/supervision-attest.json                停用自動重啟的紀錄（observer --supervision-attest 同檔）
+#   <p>/bench-lock.json                        {"path","acquired_at_utc","released_at_utc"} bench lock 持有紀錄
+#   <p>/report.json、events.ndjson、snapshots.ndjson、observer.ndjson、wal/*   gate evidence_hashes 所列檔案
+#   windows/excl/probes.ndjson、windows/excl/handoff.ndjson                       Windows 原生 COM 獨占證據
+LONGRUN_CASE = "case:lr-mixed"
+LONGRUN_SCHEMA = "slice24-longrun.v1"
+LONGRUN_IMPORT_SCHEMA = "slice24-longrun-import.v1"
+LONGRUN_MANIFEST = "longrun-manifest.json"
+LONGRUN_DIRNAME = "longrun"
+LONGRUN_RECORD = "longrun-evidence.json"
+DEFAULT_ACCEPTANCE = ROOT / "realhw/acceptance/longrun_acceptance.yaml"
+_LONGRUN_MIN_DURATION_S = 48 * 3600
+_GATE_SCHEMA = "release-gate.v1"
+_GATE_VERDICTS = frozenset({"PASS", "FAIL", "INSUFFICIENT_EVIDENCE", "BLOCKED"})
+_GATE_CHECK_RESULTS = frozenset({"PASS", "FAIL", "INSUFFICIENT_EVIDENCE", "BLOCKED", "NOT_APPLICABLE_BASELINE"})
+_LONGRUN_REQUIRED_CHECKS = (
+    "pinned_cli", "engine_verdict", "fault_retention_attested", "baseline_compatible",
+    "continuous_duration", "safety_double_holder",
+)
+# 證據本身成立的前提：未通過時整份長跑證據拒收（不是行為 FAIL）。
+_LONGRUN_PRECONDITION_CHECKS = ("pinned_cli", "fault_retention_attested", "baseline_compatible")
+_LONGRUN_EVIDENCE_FILES = ("report.json", "events.ndjson", "snapshots.ndjson", "observer.ndjson")
+_WINDOWS_EXCL_FILES = ("probes.ndjson", "handoff.ndjson")
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -205,7 +240,28 @@ def _add(
         "blocked_caps": list(dict.fromkeys(blocked_caps)),
         "blocked_reason": blocked_reason,
         "status": status,
+        "parametrized": {},
     }
+
+
+def _parametrized_entries(value: Mapping[str, Any]) -> dict[str, list[str]]:
+    """coverage_map.yaml `parametrized`：參數化基底 nodeid → 必要參數 id 完整清單。"""
+    raw = value.get("parametrized") or {}
+    if not isinstance(raw, dict):
+        raise ValueError("coverage_map.yaml 的 parametrized 必須是 mapping")
+    output: dict[str, list[str]] = {}
+    for base, params in raw.items():
+        if not isinstance(base, str) or "::" not in base or "[" in base:
+            raise ValueError(f"parametrized 基底必須是不含參數的 pytest nodeid：{base!r}")
+        # pytest 允許空字串參數 id（nodeid 為 `base[]`），故只要求字串、清單非空且不重複。
+        if (
+            not isinstance(params, list) or not params
+            or any(not isinstance(param, str) for param in params)
+            or len(set(params)) != len(params)
+        ):
+            raise ValueError(f"parametrized 參數清單必須是非空且不重複的字串：{base}")
+        output[base] = list(params)
+    return output
 
 
 def _platforms_from_scope(value: object, default: Sequence[str] = ("linux", "windows")) -> list[str]:
@@ -246,6 +302,7 @@ def universe(contracts_dir: Path, cases: Path, lock: Path, cmap: Path) -> dict[s
     lock_doc = _read_json(lock)
     map_doc = _read_yaml(cmap) if cmap.exists() else {"entries": {}}
     map_entries = _mapping_entries(map_doc)
+    parametrized = _parametrized_entries(map_doc)
     source_paths = {
         "error_codes.yaml": contracts_dir / "error_codes.yaml",
         "session_last_errors.yaml": contracts_dir / "session_last_errors.yaml",
@@ -399,6 +456,7 @@ def universe(contracts_dir: Path, cases: Path, lock: Path, cmap: Path) -> dict[s
                 "blocked_caps": [],
                 "blocked_reason": None,
                 "status": None,
+                "parametrized": {},
             }
             output[contract_id] = current
         current["nodeids"] = list(dict.fromkeys([*current["nodeids"], *row.get("nodeids", [])]))
@@ -421,6 +479,10 @@ def universe(contracts_dir: Path, cases: Path, lock: Path, cmap: Path) -> dict[s
     unextracted = set(output) - extracted_ids
     if unextracted:
         raise ValueError(f"EXTRACTORS 未列出 universe ID：{', '.join(sorted(unextracted))}")
+
+    for item in output.values():
+        referenced = [*item["nodeids"], *item["python_nodeids"]]
+        item["parametrized"] = {nodeid: parametrized[nodeid] for nodeid in referenced if nodeid in parametrized}
 
     return output
 
@@ -452,11 +514,30 @@ def _resolve_path(value: object, run_dir: Path) -> Path | None:
     return ROOT / path
 
 
+def _read_sha256sums(path: Path) -> set[str] | None:
+    """runner `SHA256SUMS` 所列雜湊；檔案不存在或格式錯誤回 None。"""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    digests: set[str] = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        digest, _, name = line.partition(" ")
+        if not _SHA256.fullmatch(digest.lower()) or not name.strip(" *"):
+            return None
+        digests.add(digest.lower())
+    return digests
+
+
 def _identity_checks(
     results: Sequence[Mapping[str, Any]], run_dir: Path, expected_cli: str | None, expected_daemon: str | None,
     expected_contract_revision: str | None = None,
     expected_cases_yaml_sha256: str | None = None,
     expected_cases_lock_sha256: str | None = None,
+    expected_platform: str = "linux",
 ) -> list[str]:
     errors: list[str] = []
     usable = [row for row in results if not row.get("_load_error")]
@@ -478,16 +559,35 @@ def _identity_checks(
         "cases_yaml_sha256": expected_cases_yaml_sha256,
         "cases_lock_sha256": expected_cases_lock_sha256,
     }
-    rust_rows = [row for row in usable if str(row.get("label", "")).startswith("rust-")]
+    # 不同平台的 artifact 本來就是不同檔案（Linux ELF／Windows PE），只在同平台內要求一致；
+    # 預期雜湊只套用到指定平台，Windows 另對照其原生 runner 的 SHA256SUMS（P8X-24c6b39-5）。
+    rust_by_platform: dict[str, list[Mapping[str, Any]]] = {}
+    for row in usable:
+        if str(row.get("label", "")).startswith("rust-"):
+            rust_by_platform.setdefault(str(row.get("platform")), []).append(row)
+    for platform, rows in sorted(rust_by_platform.items()):
+        for field in ("cli_sha256", "daemon_sha256"):
+            values = {row.get(field) for row in rows if row.get(field) is not None}
+            if len(values) > 1:
+                errors.append(f"同平台（{platform}）rust 結果的 {field} 不一致")
     for field, expected in (("cli_sha256", expected_cli), ("daemon_sha256", expected_daemon)):
-        values = {row.get(field) for row in rust_rows if row.get(field) is not None}
-        if len(values) > 1:
-            errors.append(f"rust 結果的 {field} 不一致")
-        if expected is not None:
-            if not _SHA256.fullmatch(expected):
-                errors.append(f"預期 {field} 格式無效")
-            elif any(row.get(field) != expected for row in rust_rows):
-                errors.append(f"rust 結果的 {field} 與指定 artifact 不一致")
+        if expected is None:
+            continue
+        if not _SHA256.fullmatch(expected):
+            errors.append(f"預期 {field} 格式無效")
+        elif any(row.get(field) != expected for row in rust_by_platform.get(expected_platform, [])):
+            errors.append(f"{expected_platform} rust 結果的 {field} 與指定 artifact 不一致")
+    windows_rows = rust_by_platform.get("windows", [])
+    if windows_rows:
+        manifest_path = run_dir / "artifacts" / "windows" / "SHA256SUMS"
+        listed = _read_sha256sums(manifest_path)
+        if listed is None:
+            errors.append("rust-windows 結果缺少可讀的 runner SHA256SUMS（artifacts/windows/SHA256SUMS）")
+        else:
+            for row in windows_rows:
+                for field in ("cli_sha256", "daemon_sha256"):
+                    if row.get(field) not in listed:
+                        errors.append(f"{row.get('label', 'unknown')}: {field} 不在 runner SHA256SUMS")
     for row in usable:
         label = str(row.get("label", "unknown"))
         if not isinstance(row.get("finished"), bool) or not isinstance(row.get("exit_code"), int):
@@ -625,6 +725,83 @@ def _is_owner_blocked(item: Mapping[str, Any]) -> bool:
     return item.get("kind") == "case" and item.get("status") in {"L2", "L3", "manual"}
 
 
+_WINDOWS_NATIVE_MISSING = "缺少擁有者 Windows 原生 build/link 與實跑證據"
+
+
+def _collected_nodeids(doc: Mapping[str, Any]) -> list[str]:
+    values = doc.get("collected", [])
+    return [value for value in values if isinstance(value, str)] if isinstance(values, list) else []
+
+
+def _expand_nodeid(
+    nodeid: str, docs: Sequence[Mapping[str, Any]], declared: Mapping[str, Sequence[str]],
+) -> tuple[list[str], str | None]:
+    """把參數化基底展開成必要參數節點集合（P8X-24c6b39-3）。
+
+    必要集合＝coverage_map `parametrized` 宣告的完整參數 ∪ 任一受比對結果實際收集到的參數；
+    每個節點都要逐項收集並通過，不得只接受任一參數或縮小分母。實際收集到參數化節點、
+    卻沒有宣告必要集合時視為證據不足。
+    """
+    if nodeid.startswith(_CARGO_PREFIX) or "[" in nodeid:
+        return [nodeid], None
+    prefix = f"{nodeid}["
+    variants = sorted({
+        collected for doc in docs for collected in _collected_nodeids(doc)
+        if collected.startswith(prefix) and collected.endswith("]")
+    })
+    params = declared.get(nodeid)
+    if params is None:
+        if variants:
+            return [], f"parametrized nodeid lacks declared parameter set: {nodeid}"
+        return [nodeid], None
+    return list(dict.fromkeys([*(f"{nodeid}[{param}]" for param in params), *variants])), None
+
+
+def _split_nodeids(nodeids: Sequence[str]) -> tuple[list[str], list[str]]:
+    """(Rust L1 的 Cargo 節點, 雙邊黑箱 pytest 節點)；Cargo 節點不可能出現在 Python 結果（P8X-24c6b39-4）。"""
+    return (
+        [nodeid for nodeid in nodeids if nodeid.startswith(_CARGO_PREFIX)],
+        [nodeid for nodeid in nodeids if not nodeid.startswith(_CARGO_PREFIX)],
+    )
+
+
+def _owner_evidence_verdict(item: Mapping[str, Any], evidence: Mapping[str, Any]) -> tuple[str, str]:
+    """依已重新驗證的擁有者證據回 ("PASS"|"FAIL"|"BLOCKED-OWNER", 說明)。"""
+    platforms = evidence.get("platforms", {}) if isinstance(evidence, Mapping) else {}
+    platforms = platforms if isinstance(platforms, Mapping) else {}
+    failures: list[str] = []
+    blocked: list[str] = []
+    passed: list[str] = []
+    for platform in item.get("platforms", []):
+        entry = platforms.get(platform)
+        if not isinstance(entry, Mapping) or entry.get("accepted") is not True:
+            errors = entry.get("errors", []) if isinstance(entry, Mapping) else []
+            detail = "; ".join(str(error) for error in errors) if errors else "缺少長跑證據"
+            blocked.append(f"{platform}: {detail}")
+            continue
+        verdict = entry.get("release_gate_result")
+        if verdict == "FAIL":
+            failures.append(f"{platform}: release_gate_result=FAIL")
+        elif verdict == "PASS":
+            passed.append(platform)
+        else:
+            blocked.append(f"{platform}: release_gate_result={verdict}")
+    if failures:
+        return "FAIL", "長跑證據有效但 release gate 判 FAIL：" + "; ".join(failures)
+    if blocked:
+        return "BLOCKED-OWNER", "長跑證據未成立：" + "; ".join(blocked)
+    if not passed:
+        return "BLOCKED-OWNER", "長跑證據未涵蓋任何平台"
+    return "PASS", "長跑證據已驗證：" + ", ".join(f"{platform}=PASS" for platform in passed)
+
+
+def _classify_rust_detail(detail: str | None, nodeid: str, failures: list[str], missing: list[str]) -> None:
+    if detail and ("outcome is failed" in detail or "outcome is error" in detail or "setup/teardown" in detail):
+        failures.append(detail)
+    else:
+        missing.append(detail or f"Rust 證據不足：{nodeid}")
+
+
 def evaluate(
     contract_universe: dict[str, dict[str, Any]],
     results: list[dict[str, Any]],
@@ -635,8 +812,14 @@ def evaluate(
     expected_contract_revision: str | None = None,
     expected_cases_yaml_sha256: str | None = None,
     expected_cases_lock_sha256: str | None = None,
+    expected_platform: str = "linux",
+    owner_evidence: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """依平台逐 nodeid 判定；任何不完整、重複或 BLOCKED-OWNER 結果皆不能成為 PASS。"""
+    """依平台逐 nodeid 判定；任何不完整、重複或 BLOCKED-OWNER 結果皆不能成為 PASS。
+
+    擁有者阻擋的 ID 只有在 `owner_evidence` 經重新驗證、所有平台都成立時才解除；
+    有效證據判 FAIL 時照實為 FAIL，缺漏或拒收仍維持 BLOCKED-OWNER。
+    """
     run_root = run_dir or ROOT
     identity_errors = _identity_checks(
         results,
@@ -646,13 +829,14 @@ def evaluate(
         expected_contract_revision,
         expected_cases_yaml_sha256,
         expected_cases_lock_sha256,
+        expected_platform,
     )
     incomplete_runs = {
         str(row.get("label", "unknown")): _validate_run(row)
         for row in results
         if _validate_run(row)
     }
-    by_label = {str(row.get("label", "")): row for row in results if row.get("label")}
+    owner_evidence = owner_evidence or {}
     report: dict[str, Any] = {
         "covered": [],
         "missing": {},
@@ -664,33 +848,50 @@ def evaluate(
         "incomplete_runs": incomplete_runs,
         "case_verdicts": {},
         "windows_verdicts": {},
+        "owner_evidence": {},
     }
 
     for contract_id, item in sorted(contract_universe.items()):
-        reason: str | None = None
-        if _is_owner_blocked(item):
-            caps = ", ".join(item.get("blocked_caps", []))
-            report["blocked_owner"][contract_id] = item.get("blocked_reason") or f"擁有者證據待補：{caps or '外部資源'}"
-            reason = report["blocked_owner"][contract_id]
-
-        nodeids = [nodeid for nodeid in item.get("nodeids", []) if isinstance(nodeid, str) and nodeid.strip()]
         raw_nodes = item.get("nodeids", [])
-        if not nodeids:
-            if isinstance(raw_nodes, list) and any(isinstance(nodeid, str) and not nodeid.strip() for nodeid in raw_nodes):
-                reason = "coverage_map contains an empty nodeid"
-            else:
-                reason = reason or "coverage_map has no nodeid"
-        if reason and contract_id not in report["blocked_owner"]:
-            report["missing_reasons"][contract_id] = reason
+        nodeids = [nodeid for nodeid in raw_nodes if isinstance(nodeid, str) and nodeid.strip()] if isinstance(raw_nodes, list) else []
+        has_empty_node = isinstance(raw_nodes, list) and any(isinstance(nodeid, str) and not nodeid.strip() for nodeid in raw_nodes)
 
+        owner_verdict: str | None = None
         if _is_owner_blocked(item):
-            continue
+            owner_reason = None
+            if contract_id in owner_evidence:
+                owner_verdict, owner_reason = _owner_evidence_verdict(item, owner_evidence[contract_id])
+                report["owner_evidence"][contract_id] = {"verdict": owner_verdict, "reason": owner_reason}
+            if owner_verdict == "FAIL":
+                report["failed"].append(contract_id)
+                report["missing_reasons"][contract_id] = owner_reason
+                continue
+            if owner_verdict != "PASS":
+                caps = ", ".join(item.get("blocked_caps", []))
+                report["blocked_owner"][contract_id] = (
+                    owner_reason or item.get("blocked_reason") or f"擁有者證據待補：{caps or '外部資源'}"
+                )
+                continue
+
         if not nodeids:
+            if owner_verdict == "PASS":
+                if identity_errors:
+                    report["missing_reasons"][contract_id] = "run identity invalid"
+                else:
+                    report["covered"].append(contract_id)
+                continue
+            report["missing_reasons"][contract_id] = (
+                "coverage_map contains an empty nodeid" if has_empty_node else "coverage_map has no nodeid"
+            )
             continue
         if identity_errors:
             report["missing_reasons"][contract_id] = "run identity invalid"
             continue
 
+        declared = item.get("parametrized") or {}
+        _rust_l1_nodes, blackbox_nodes = _split_nodeids(nodeids)
+        python_nodes = [nodeid for nodeid in item.get("python_nodeids", []) if isinstance(nodeid, str) and nodeid.strip()]
+        needs_ab = not item.get("rust_only") and not item.get("l1_only")
         failures: list[str] = []
         missing_reasons: list[str] = []
         passed_all = True
@@ -699,82 +900,99 @@ def evaluate(
             rust_doc = _label_for(results, "rust", platform)
             if rust_doc is None:
                 if platform == "windows":
-                    report["blocked_owner"].setdefault(contract_id, "缺少擁有者 Windows 原生 build/link 與實跑證據")
-                    passed_all = False
-                    continue
-                missing_reasons.append(f"缺少 rust-{platform} 結果檔")
+                    report["blocked_owner"].setdefault(contract_id, _WINDOWS_NATIVE_MISSING)
+                else:
+                    missing_reasons.append(f"缺少 rust-{platform} 結果檔")
                 passed_all = False
                 continue
             if platform == "windows" and (
                 rust_doc.get("native_windows") is not True
                 or rust_doc.get("native_build_link") is not True
             ):
-                report["blocked_owner"].setdefault(
-                    contract_id,
-                    "缺少擁有者 Windows 原生 build/link 與實跑證據",
-                )
+                report["blocked_owner"].setdefault(contract_id, _WINDOWS_NATIVE_MISSING)
                 passed_all = False
                 continue
+
+            # Rust 側：Cargo L1 與雙邊黑箱節點都要在 rust-<platform> 逐項成立。
+            rust_required: list[str] = []
+            for nodeid in nodeids:
+                expanded, error = _expand_nodeid(nodeid, [rust_doc], declared)
+                if error:
+                    missing_reasons.append(error)
+                    passed_all = False
+                rust_required.extend(expanded)
             if str(rust_doc.get("label")) in incomplete_runs:
-                for nodeid in nodeids:
+                for nodeid in rust_required:
                     failure = _nodeid_failure(rust_doc, nodeid)
                     if failure:
                         failures.append(failure)
                 missing_reasons.append(f"rust-{platform} 結果不完整")
                 passed_all = False
                 continue
-            for nodeid in nodeids:
+            for nodeid in rust_required:
                 ok, detail = _nodeid_passes(rust_doc, nodeid)
-                if ok:
-                    continue
-                if detail and "outcome is failed" in detail:
-                    failures.append(detail)
-                elif detail and ("outcome is error" in detail or "setup/teardown" in detail):
-                    failures.append(detail)
-                else:
-                    missing_reasons.append(detail or f"Rust 證據不足：{nodeid}")
-                passed_all = False
+                if not ok:
+                    _classify_rust_detail(detail, nodeid, failures, missing_reasons)
+                    passed_all = False
 
-            python_nodes = [nodeid for nodeid in item.get("python_nodeids", []) if isinstance(nodeid, str) and nodeid.strip()]
+            if not needs_ab:
+                continue
+            # Python 側：雙邊黑箱節點做 A/B，contract_tests 只對 Python；Cargo 節點不在 pytest 結果內。
+            if not blackbox_nodes and not python_nodes:
+                missing_reasons.append(f"缺少 Python 側證據：沒有雙邊黑箱 nodeid 或 contract_tests（{platform}）")
+                passed_all = False
+                continue
             python_doc = _label_for(results, "python", platform)
-            if not item.get("rust_only") and not item.get("l1_only"):
-                if python_doc is None:
-                    missing_reasons.append(f"缺少 python-{platform} A/B 結果檔")
+            if python_doc is None:
+                missing_reasons.append(f"缺少 python-{platform} A/B 結果檔")
+                passed_all = False
+                continue
+            ab_required: list[str] = []
+            for nodeid in blackbox_nodes:
+                expanded, error = _expand_nodeid(nodeid, [rust_doc, python_doc], declared)
+                if error:
+                    missing_reasons.append(error)
                     passed_all = False
-                elif str(python_doc.get("label")) in incomplete_runs:
-                    missing_reasons.append(f"python-{platform} 結果不完整")
-                    for nodeid in nodeids:
-                        rust_ok, _ = _nodeid_passes(rust_doc, nodeid)
-                        python_failure = _nodeid_failure(python_doc, nodeid)
-                        if rust_ok and python_failure:
-                            report["ab_mismatch"].append(contract_id)
-                            failures.append(f"Python/Rust A/B 不一致：{python_failure}")
+                ab_required.extend(expanded)
+            if str(python_doc.get("label")) in incomplete_runs:
+                missing_reasons.append(f"python-{platform} 結果不完整")
+                for nodeid in ab_required:
+                    rust_ok, _ = _nodeid_passes(rust_doc, nodeid)
+                    python_failure = _nodeid_failure(python_doc, nodeid)
+                    if rust_ok and python_failure:
+                        report["ab_mismatch"].append(contract_id)
+                        failures.append(f"Python/Rust A/B 不一致：{python_failure}")
+                passed_all = False
+                continue
+            for nodeid in ab_required:
+                rust_ok, rust_reason = _nodeid_passes(rust_doc, nodeid)
+                python_ok, python_reason = _nodeid_passes(python_doc, nodeid)
+                if rust_ok and not python_ok:
+                    python_failure = _nodeid_failure(python_doc, nodeid)
+                    if python_failure:
+                        report["ab_mismatch"].append(contract_id)
+                        failures.append(f"Python/Rust A/B 不一致：{python_failure}")
+                    else:
+                        missing_reasons.append(python_reason or f"Python 證據不足：{nodeid}")
                     passed_all = False
-                else:
-                    for nodeid in nodeids:
-                        rust_ok, rust_reason = _nodeid_passes(rust_doc, nodeid)
-                        python_ok, python_reason = _nodeid_passes(python_doc, nodeid)
-                        if rust_ok and not python_ok:
-                            python_failure = _nodeid_failure(python_doc, nodeid)
-                            if python_failure:
-                                report["ab_mismatch"].append(contract_id)
-                                failures.append(f"Python/Rust A/B 不一致：{python_failure}")
-                            else:
-                                missing_reasons.append(python_reason or f"Python 證據不足：{nodeid}")
-                            passed_all = False
-                        elif python_ok and not rust_ok:
-                            rust_failure = _nodeid_failure(rust_doc, nodeid)
-                            if rust_failure:
-                                report["ab_mismatch"].append(contract_id)
-                                failures.append(f"Python/Rust A/B 不一致：{rust_failure}")
-                            else:
-                                missing_reasons.append(rust_reason or f"Rust 證據不足：{nodeid}")
-                            passed_all = False
-                    for nodeid in python_nodes:
-                        ok, detail = _nodeid_passes(python_doc, nodeid)
-                        if not ok:
-                            missing_reasons.append(detail or f"Python contract_test 未通過：{nodeid}")
-                            passed_all = False
+                elif python_ok and not rust_ok:
+                    rust_failure = _nodeid_failure(rust_doc, nodeid)
+                    if rust_failure:
+                        report["ab_mismatch"].append(contract_id)
+                        failures.append(f"Python/Rust A/B 不一致：{rust_failure}")
+                    else:
+                        missing_reasons.append(rust_reason or f"Rust 證據不足：{nodeid}")
+                    passed_all = False
+            for base in python_nodes:
+                expanded, error = _expand_nodeid(base, [python_doc], declared)
+                if error:
+                    missing_reasons.append(error)
+                    passed_all = False
+                for nodeid in expanded:
+                    ok, detail = _nodeid_passes(python_doc, nodeid)
+                    if not ok:
+                        missing_reasons.append(detail or f"Python contract_test 未通過：{nodeid}")
+                        passed_all = False
 
         if failures:
             report["failed"].append(contract_id)
@@ -796,28 +1014,326 @@ def evaluate(
     for contract_id, item in contract_universe.items():
         if item.get("kind") != "case":
             continue
-        if contract_id in report["blocked_owner"]:
-            verdict = "BLOCKED-OWNER"
-        elif contract_id in report["failed"]:
-            verdict = "FAIL"
-        elif contract_id in report["covered"]:
-            verdict = "PASS"
-        else:
-            verdict = "EVIDENCE_MISSING"
-        report["case_verdicts"][contract_id.removeprefix("case:")] = verdict
+        report["case_verdicts"][contract_id.removeprefix("case:")] = _verdict_for(report, contract_id)
     for contract_id, item in contract_universe.items():
         if "windows" not in item.get("platforms", []):
             continue
-        if contract_id in report["blocked_owner"]:
-            verdict = "BLOCKED-OWNER"
-        elif contract_id in report["failed"]:
-            verdict = "FAIL"
-        elif contract_id in report["covered"]:
-            verdict = "PASS"
-        else:
-            verdict = "EVIDENCE_MISSING"
-        report["windows_verdicts"][contract_id] = verdict
+        report["windows_verdicts"][contract_id] = _verdict_for(report, contract_id)
     return report
+
+
+def _verdict_for(report: Mapping[str, Any], contract_id: str) -> str:
+    if contract_id in report["blocked_owner"]:
+        return "BLOCKED-OWNER"
+    if contract_id in report["failed"]:
+        return "FAIL"
+    if contract_id in report["covered"]:
+        return "PASS"
+    return "EVIDENCE_MISSING"
+
+
+def _parse_utc(value: object) -> dt.datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=dt.timezone.utc)
+
+
+def _load_json_object(path: Path, errors: list[str], label: str) -> dict[str, Any] | None:
+    if path.is_symlink() or not path.is_file():
+        errors.append(f"{label} 缺少或不是一般檔案")
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        errors.append(f"{label} 無法解析：{type(exc).__name__}")
+        return None
+    if not isinstance(value, dict):
+        errors.append(f"{label} 根節點不是 object")
+        return None
+    return value
+
+
+def _contracts_tree(repo_root: Path) -> str | None:
+    """與 realhw `meta.contract_revision` 同源：`git rev-parse HEAD:contracts`。"""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD:contracts"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = (proc.stdout or "").strip()
+    return value if proc.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", value) else None
+
+
+def _gate_summary(checks: Sequence[Mapping[str, Any]]) -> str:
+    """與 realhw gate `_summarize`（candidate）相同的彙總規則。"""
+    results = {check.get("result") for check in checks}
+    if "FAIL" in results:
+        return "FAIL"
+    if "INSUFFICIENT_EVIDENCE" in results:
+        return "INSUFFICIENT_EVIDENCE"
+    if "BLOCKED" in results:
+        return "BLOCKED"
+    return "PASS"
+
+
+def _check_hashed_file(path: Path, expected: object, label: str, errors: list[str]) -> None:
+    if not isinstance(expected, str) or not _SHA256.fullmatch(expected):
+        errors.append(f"{label} 在 gate evidence 雜湊清單中缺少或格式無效")
+    elif path.is_symlink() or not path.is_file():
+        errors.append(f"{label} 缺檔")
+    elif _sha256(path) != expected:
+        errors.append(f"{label} 雜湊與 gate 記錄不符")
+
+
+def _validate_longrun_platform(
+    root: Path, platform: str, pinned_bundle: object, expected: Mapping[str, str | None],
+) -> tuple[list[str], str | None]:
+    """驗證單一平台的長跑證據；回 (錯誤清單, release_gate_result)。"""
+    errors: list[str] = []
+    if root.is_symlink() or not root.is_dir():
+        return [f"缺少 {platform}/ 長跑證據目錄"], None
+    if not isinstance(pinned_bundle, str) or not _SHA256.fullmatch(pinned_bundle):
+        errors.append(f"{LONGRUN_MANIFEST} 缺少 {platform} 的 pinned bundle_tree_sha256")
+        pinned_bundle = None
+
+    candidate = _load_json_object(root / "release-gate.json", errors, "release-gate.json")
+    verdict: str | None = None
+    candidate_run: Mapping[str, Any] = {}
+    if candidate is not None:
+        if candidate.get("schema_version") != _GATE_SCHEMA:
+            errors.append("release-gate.json schema_version 不是 release-gate.v1")
+        if candidate.get("mode") != "candidate" or candidate.get("platform") != platform:
+            errors.append(f"release-gate.json 不是 {platform} candidate 判定")
+        verdict = candidate.get("release_gate_result") if isinstance(candidate.get("release_gate_result"), str) else None
+        checks = candidate.get("checks")
+        if not isinstance(checks, list) or any(
+            not isinstance(check, dict) or not isinstance(check.get("id"), str)
+            or check.get("result") not in _GATE_CHECK_RESULTS
+            for check in checks
+        ):
+            errors.append("release-gate.json checks 格式無效")
+            checks = []
+        by_id = {check["id"]: check.get("result") for check in checks}
+        if verdict not in _GATE_VERDICTS:
+            errors.append(f"release-gate.json release_gate_result 無效：{verdict!r}")
+        elif _gate_summary(checks) != verdict:
+            errors.append("release-gate.json release_gate_result 與 checks 彙總不一致")
+        for check_id in _LONGRUN_REQUIRED_CHECKS:
+            if check_id not in by_id:
+                errors.append(f"release-gate.json 缺少必要檢查 {check_id}")
+        for check_id in _LONGRUN_PRECONDITION_CHECKS:
+            if check_id in by_id and by_id[check_id] != "PASS":
+                errors.append(f"release-gate.json 前提檢查 {check_id}={by_id[check_id]}（證據不成立）")
+        if not isinstance(candidate.get("engine_result"), dict):
+            errors.append("release-gate.json 缺少 engine_result")
+        acceptance = candidate.get("acceptance") if isinstance(candidate.get("acceptance"), dict) else {}
+        if acceptance.get("sha256") != expected.get("acceptance_sha256"):
+            errors.append("release-gate.json acceptance.sha256 與目前 longrun_acceptance.yaml 不同")
+        candidate_run = candidate.get("run") if isinstance(candidate.get("run"), dict) else {}
+        if expected.get("contract_revision") is None or candidate_run.get("contract_revision") != expected["contract_revision"]:
+            errors.append("release-gate.json run.contract_revision 與目前 contracts 樹不同（不得跨候選版本）")
+        if candidate_run.get("cases_yaml_sha256") != expected.get("cases_yaml_sha256"):
+            errors.append("release-gate.json run.cases_yaml_sha256 與目前 cases.yaml 不同")
+        duration = candidate_run.get("duration_s")
+        if not isinstance(duration, (int, float)) or duration < _LONGRUN_MIN_DURATION_S:
+            errors.append(f"release-gate.json run.duration_s 未達 48 小時：{duration!r}")
+        cli_identity = candidate_run.get("cli_identity") if isinstance(candidate_run.get("cli_identity"), dict) else {}
+        cli_sha = cli_identity.get("sha256")
+        if cli_identity.get("pinned") is not True or not isinstance(cli_sha, str) or not _SHA256.fullmatch(cli_sha):
+            errors.append("release-gate.json run.cli_identity 未證明 pinned CLI")
+        deployed = candidate_run.get("deployed_content") if isinstance(candidate_run.get("deployed_content"), dict) else {}
+        for edge in ("start", "end"):
+            snapshot = deployed.get(edge) if isinstance(deployed.get(edge), dict) else {}
+            if snapshot.get("error") is not None or not snapshot:
+                errors.append(f"release-gate.json deployed_content.{edge} 量測失敗或缺少")
+            elif snapshot.get("bundle_tree_sha256") != pinned_bundle:
+                errors.append(f"release-gate.json deployed_content.{edge}.bundle_tree_sha256 與 pinned bundle 不符")
+            elif snapshot.get("cli_sha256") != cli_sha:
+                errors.append(f"release-gate.json deployed_content.{edge}.cli_sha256 與 pinned CLI 不符")
+        live = deployed.get("daemon_live")
+        if not isinstance(live, list) or not live or any(
+            not isinstance(entry, dict) or entry.get("in_install") is not True or entry.get("error") is not None
+            or not isinstance(entry.get("image_sha256"), str) or not _SHA256.fullmatch(entry["image_sha256"])
+            for entry in live
+        ):
+            errors.append("release-gate.json deployed_content.daemon_live 未證明受測 daemon 位於 pinned bundle")
+        hashes = candidate.get("evidence_hashes") if isinstance(candidate.get("evidence_hashes"), dict) else {}
+        for name in _LONGRUN_EVIDENCE_FILES:
+            _check_hashed_file(root / name, hashes.get(name), name, errors)
+        wal = hashes.get("wal")
+        if not isinstance(wal, dict) or not wal:
+            errors.append("release-gate.json evidence_hashes.wal 缺少 WAL 雜湊")
+        else:
+            for name, digest in sorted(wal.items()):
+                if not isinstance(name, str) or Path(name).name != name:
+                    errors.append(f"wal/{name} 名稱無效")
+                    continue
+                _check_hashed_file(root / "wal" / name, digest, f"wal/{name}", errors)
+        if platform == "windows":
+            excl = candidate.get("excl_evidence_hashes") if isinstance(candidate.get("excl_evidence_hashes"), dict) else {}
+            for name in _WINDOWS_EXCL_FILES:
+                _check_hashed_file(root / "excl" / name, excl.get(name), f"excl/{name}", errors)
+
+    baseline = _load_json_object(root / "baseline-release-gate.json", errors, "baseline-release-gate.json")
+    if baseline is not None and candidate is not None:
+        base_run = baseline.get("run") if isinstance(baseline.get("run"), dict) else {}
+        base_acceptance = baseline.get("acceptance") if isinstance(baseline.get("acceptance"), dict) else {}
+        cand_acceptance = candidate.get("acceptance") if isinstance(candidate.get("acceptance"), dict) else {}
+        if baseline.get("schema_version") != _GATE_SCHEMA or baseline.get("mode") != "baseline" or baseline.get("platform") != platform:
+            errors.append(f"baseline-release-gate.json 不是 {platform} 的 Python baseline 判定")
+        if baseline.get("baseline_result") != "PASS":
+            errors.append(f"baseline-release-gate.json baseline_result={baseline.get('baseline_result')!r}")
+        base_duration = base_run.get("duration_s")
+        if not isinstance(base_duration, (int, float)) or base_duration < _LONGRUN_MIN_DURATION_S:
+            errors.append(f"baseline-release-gate.json run.duration_s 未達 48 小時：{base_duration!r}")
+        if base_acceptance.get("workload_contract_sha256") != cand_acceptance.get("workload_contract_sha256"):
+            errors.append("baseline-release-gate.json workload_contract_sha256 與 candidate 不同")
+        if base_run.get("engine_files_sha256") != candidate_run.get("engine_files_sha256"):
+            errors.append("baseline-release-gate.json engine_files_sha256 與 candidate 不同")
+
+    attest = _load_json_object(root / "supervision-attest.json", errors, "supervision-attest.json")
+    if attest is not None:
+        if attest.get("auto_restart_disabled") is not True:
+            errors.append("supervision-attest.json auto_restart_disabled 不是 true")
+        header: Any = None
+        try:
+            first = (root / "observer.ndjson").read_text(encoding="utf-8").splitlines()[:1]
+            header = json.loads(first[0]) if first else None
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            header = None
+        supervision = header.get("supervision") if isinstance(header, dict) and header.get("kind") == "header" else None
+        wanted = {key: attest.get(key) for key in ("mode", "auto_restart_disabled", "evidence")}
+        if not isinstance(supervision, dict) or {key: supervision.get(key) for key in wanted} != wanted:
+            errors.append("observer.ndjson header 的 supervision 與 supervision-attest.json 不符")
+
+    lock = _load_json_object(root / "bench-lock.json", errors, "bench-lock.json")
+    if lock is not None:
+        acquired = _parse_utc(lock.get("acquired_at_utc"))
+        released = _parse_utc(lock.get("released_at_utc"))
+        started = _parse_utc(candidate_run.get("started_at_utc"))
+        ended = _parse_utc(candidate_run.get("ended_at_utc"))
+        if not isinstance(lock.get("path"), str) or not lock["path"].strip():
+            errors.append("bench-lock.json 缺少 path")
+        if acquired is None or released is None or started is None or ended is None:
+            errors.append("bench-lock.json 或 candidate run 缺少可解析的 UTC 時間")
+        elif not (acquired <= started and ended <= released):
+            errors.append("bench-lock.json 持有區間未涵蓋整個長跑區間")
+    return list(dict.fromkeys(errors)), verdict
+
+
+def validate_longrun(source: Path, *, platforms: Sequence[str] | None = None, repo_root: Path = ROOT) -> dict[str, Any]:
+    """驗證長跑證據目錄；只有每個平台都通過全部檢查時 `accepted` 才為 true。"""
+    if platforms is None:
+        platforms = _longrun_platforms(repo_root / "tests/acceptance/cases.yaml")
+    expected = {
+        "acceptance_sha256": _sha256(repo_root / "realhw/acceptance/longrun_acceptance.yaml"),
+        "cases_yaml_sha256": _sha256(repo_root / "tests/acceptance/cases.yaml"),
+        "contract_revision": _contracts_tree(repo_root),
+    }
+    record: dict[str, Any] = {
+        "schema_version": LONGRUN_IMPORT_SCHEMA,
+        "case_id": LONGRUN_CASE.removeprefix("case:"),
+        "source": str(source),
+        "accepted": False,
+        "errors": [],
+        "platforms": {},
+    }
+    manifest = _load_json_object(source / LONGRUN_MANIFEST, record["errors"], LONGRUN_MANIFEST)
+    manifest_platforms: Mapping[str, Any] = {}
+    if manifest is not None:
+        if manifest.get("schema_version") != LONGRUN_SCHEMA:
+            record["errors"].append(f"{LONGRUN_MANIFEST} schema_version 不是 {LONGRUN_SCHEMA}")
+        if manifest.get("case_id") != record["case_id"]:
+            record["errors"].append(f"{LONGRUN_MANIFEST} case_id 不是 {record['case_id']}")
+        if isinstance(manifest.get("platforms"), dict):
+            manifest_platforms = manifest["platforms"]
+        else:
+            record["errors"].append(f"{LONGRUN_MANIFEST} platforms 必須是 mapping")
+    for platform in platforms:
+        entry = manifest_platforms.get(platform)
+        bundle = entry.get("bundle_tree_sha256") if isinstance(entry, dict) else None
+        errors, verdict = _validate_longrun_platform(source / platform, platform, bundle, expected)
+        errors = [*record["errors"], *errors]
+        record["platforms"][platform] = {"accepted": not errors, "release_gate_result": verdict, "errors": errors}
+    record["accepted"] = not record["errors"] and bool(record["platforms"]) and all(
+        entry["accepted"] for entry in record["platforms"].values()
+    )
+    return record
+
+
+def _longrun_platforms(cases_path: Path) -> list[str]:
+    for case in _read_yaml(cases_path).get("cases", []):
+        if isinstance(case, dict) and case.get("case_id") == LONGRUN_CASE.removeprefix("case:"):
+            return _platforms_from_scope(case.get("platforms"))
+    return ["linux", "windows"]
+
+
+def _copy_evidence_tree(source: Path, destination: Path) -> list[str]:
+    """只複製一般檔案；遇到 symlink 拒收，避免把目錄外內容帶進 run directory。"""
+    errors: list[str] = []
+    for directory, dirnames, filenames in os.walk(source, followlinks=False):
+        current = Path(directory)
+        for name in [*dirnames, *filenames]:
+            if (current / name).is_symlink():
+                errors.append(f"{(current / name).relative_to(source)} 是 symlink，拒絕匯入")
+        dirnames[:] = [name for name in dirnames if not (current / name).is_symlink()]
+        for name in filenames:
+            path = current / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            target = destination / path.relative_to(source)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, target)
+    return errors
+
+
+def import_longrun(source: Path, run_dir: Path) -> dict[str, Any]:
+    """把長跑證據複製進 run directory 後重新驗證副本，並寫入匯入紀錄。"""
+    destination = run_dir / LONGRUN_DIRNAME
+    if destination.exists() or (run_dir / LONGRUN_RECORD).exists():
+        raise ValueError(f"{destination} 或 {LONGRUN_RECORD} 已存在，拒絕混合不同輪次的長跑證據")
+    if source.is_symlink() or not source.is_dir():
+        raise ValueError(f"長跑證據目錄不存在：{source}")
+    destination.mkdir(parents=True)
+    copy_errors = _copy_evidence_tree(source, destination)
+    record = validate_longrun(destination)
+    record["source"] = str(source)
+    if copy_errors:
+        record["errors"] = [*record["errors"], *copy_errors]
+        record["accepted"] = False
+        for entry in record["platforms"].values():
+            entry["errors"] = [*entry["errors"], *copy_errors]
+            entry["accepted"] = False
+    (run_dir / LONGRUN_RECORD).write_text(
+        json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8",
+    )
+    return record
+
+
+def load_owner_evidence(run_dir: Path) -> dict[str, dict[str, Any]]:
+    """判定時重新驗證 run directory 內的擁有者證據副本；沒有副本時不提供任何解除。"""
+    destination = run_dir / LONGRUN_DIRNAME
+    if not destination.exists():
+        return {}
+    record = validate_longrun(destination)
+    imported = run_dir / LONGRUN_RECORD
+    try:
+        recorded = json.loads(imported.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        recorded = None
+    recorded_ok = isinstance(recorded, dict) and recorded.get("accepted") is True
+    if record["accepted"] and not recorded_ok:
+        record["accepted"] = False
+        for entry in record["platforms"].values():
+            entry["accepted"] = False
+            entry["errors"] = [*entry["errors"], f"{LONGRUN_RECORD} 缺少或匯入時未通過驗證"]
+    return {LONGRUN_CASE: record}
 
 
 def _case_rows(cases_path: Path, lock_path: Path) -> list[dict[str, Any]]:
@@ -854,6 +1370,14 @@ def _t9_result_rows(run_info: Mapping[str, Any]) -> list[str]:
             outcome = str(row.get("outcome", "unknown"))
             observations.append(f"{label} {phase}={outcome}")
     return sorted(set(observations))
+
+
+def _longrun_report_lines(report: Mapping[str, Any]) -> list[str]:
+    owner = report.get("owner_evidence", {})
+    entry = owner.get(LONGRUN_CASE) if isinstance(owner, Mapping) else None
+    if not isinstance(entry, Mapping):
+        return ["- 未匯入長跑證據（`slice24_exit.sh --longrun <dir>`）；`lr-mixed` 維持 **BLOCKED-OWNER**。"]
+    return [f"- 判定：**{entry.get('verdict')}**；{entry.get('reason')}。"]
 
 
 def render_gate_report(report: Mapping[str, Any], cases: Sequence[Mapping[str, Any]], run_info: Mapping[str, Any]) -> str:
@@ -930,6 +1454,10 @@ def render_gate_report(report: Mapping[str, Any], cases: Sequence[Mapping[str, A
         "| 項目 | 裁決狀態 | 結果記錄 | 說明 |",
         "|---|---|---|---|",
         "",
+        "## 長跑證據（lr-mixed）",
+        "",
+        *_longrun_report_lines(report),
+        "",
         "## 已知 Low",
         "",
         "- `P8X-9e51abd-1`：交接凍結後 RX 記帳與 Python 的差異列為已知 Low；於 Slice 2.4 出口再檢視是否更新 RX 記帳，不推進 readiness、不 TX。",
@@ -980,7 +1508,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--platforms", action="append", default=[], help="測試用平台覆寫：ID=linux,windows")
     parser.add_argument("--expect-cli-sha256")
     parser.add_argument("--expect-daemon-sha256")
+    parser.add_argument(
+        "--expect-platform", choices=("linux", "windows"), default="linux",
+        help="--expect-*-sha256 適用的平台；其他平台的 artifact 另以各自 runner manifest 核對",
+    )
+    parser.add_argument(
+        "--import-longrun", type=Path,
+        help="驗證長跑證據目錄並匯入 <run-dir>/longrun/；全部成立 exit 0，拒收 exit 1",
+    )
     args = parser.parse_args(argv)
+
+    if args.import_longrun is not None:
+        try:
+            args.run_dir.mkdir(parents=True, exist_ok=True)
+            record = import_longrun(args.import_longrun, args.run_dir)
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            print(f"contract_coverage: 長跑證據匯入失敗：{type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
+        for platform, entry in sorted(record["platforms"].items()):
+            state = "ACCEPTED" if entry["accepted"] else "REJECTED"
+            print(f"longrun {platform}: {state} release_gate_result={entry['release_gate_result']}")
+            for error in entry["errors"]:
+                print(f"  - {error}")
+        return 0 if record["accepted"] else 1
 
     try:
         all_ids = universe(args.contracts_dir, args.cases, args.cases_lock, args.map_file)
@@ -1025,6 +1575,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_contract_revision=expected_sources["contract_revision"],
             expected_cases_yaml_sha256=expected_sources["cases_yaml_sha256"],
             expected_cases_lock_sha256=expected_sources["cases_lock_sha256"],
+            expected_platform=args.expect_platform,
+            owner_evidence=load_owner_evidence(args.run_dir),
         )
         report["run_dir"] = str(args.run_dir)
         body = json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"

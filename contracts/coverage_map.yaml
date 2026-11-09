@@ -1444,11 +1444,13 @@ entries:
     nodeids: []
     owner_phase: P0
   cli_cmd:mcu patterns:
-    nodeids: []
-    owner_phase: P0
+    nodeids:
+    - tests/contract_blackbox/test_s24_mcu_rpc.py::test_patterns_exact_bytes
+    owner_phase: P8
   cli_cmd:mcu status:
-    nodeids: []
-    owner_phase: P0
+    nodeids:
+    - tests/contract_blackbox/test_s24_mcu_rpc.py::test_status_idle_no_sessions
+    owner_phase: P8
   cli_cmd:profile test:
     nodeids: []
     owner_phase: P3
@@ -2084,11 +2086,14 @@ entries:
     nodeids: []
     owner_phase: P0
   rpc_method:mcu.patterns:
-    nodeids: []
-    owner_phase: P0
+    nodeids:
+    - tests/contract_blackbox/test_s24_mcu_rpc.py::test_patterns_exact_bytes
+    owner_phase: P8
   rpc_method:mcu.status:
-    nodeids: []
-    owner_phase: P0
+    nodeids:
+    - tests/contract_blackbox/test_s24_mcu_rpc.py::test_status_idle_no_sessions
+    - tests/contract_blackbox/test_s24_mcu_rpc.py::test_status_candidates_and_ttymcu_lifecycle
+    owner_phase: P8
   rpc_method:result.tail:
     nodeids:
     - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
@@ -2205,3 +2210,127 @@ entries:
     nodeids: []
     owner_phase: P0
 schema_version: 1
+# 參數化基底 nodeid 的必要參數完整集合（P8X-24c6b39-3）：判定器把基底展開成全部參數節點，
+# 每個都要收集且通過；集合須與 pytest 實際收集一致（tests/test_rust_contract_coverage.py 把關）。
+parametrized:
+  tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet:
+  - quiet
+  - quiet_human_explicit
+  - quiet_human_bare
+  - rpc_args
+  - not_found
+  - passthrough
+  - agent_lease
+  - foreground_busy
+  - command_during_transfer
+  tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_force_refuses_while_flashing:
+  - rollback
+  - update
+  tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_force_refuses_while_push:
+  - rollback
+  - update
+  tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_refuses_while_push:
+  - before_probe
+  - after_probe
+  tests/test_bench_connect_cli.py::test_bench_missing_endpoint_returns_structured_error_for_direct_cli_paths:
+  - argv0
+  - argv1
+  - argv2
+  tests/test_bench_connect_cli.py::test_connect_close_rejects_conflicting_stateful_tunnel_without_closing_or_clearing_state:
+  - existing_tunnel0
+  - existing_tunnel1
+  tests/test_bench_connect_cli.py::test_connect_parse_errors_return_structured_invalid_args:
+  - argv0
+  - argv1
+  - argv2
+  - argv3
+  - argv4
+  - argv5
+  - argv6
+  - argv7
+  - argv8
+  - argv9
+  tests/test_bench_connect_cli.py::test_nonempty_corrupted_remembered_endpoint_returns_invalid_bench_state:
+  - 'tcp://127.0.0.1:notaport'
+  - 'tcp://192.0.2.10:7777'
+  - 'unix:///tmp/serialwrap/serialwrapd.sock'
+  tests/test_command_completion.py::test_invalid_regex_direct_execute_rejects_before_any_tx:
+  - syntax
+  - empty
+  - bytes
+  - unicode-bytes
+  - type
+  - matches-empty
+  - invalid-unicode
+  - parser-recursion
+  tests/test_p1oc_sc34_last_error.py::test_attach_state_result_separates_last_error:
+  - CREDENTIALS_UNRESOLVED-None
+  - 'READY_NONCE_TIMEOUT-tail\u2026'
+  - None-None
+  tests/test_remote_tunnel.py::test_parse_target_rejects_bad:
+  - nohost
+  - 'host:'
+  - 'host:abc'
+  - 'host:-1'
+  - ''
+  - 'a@b@c:1'
+  tests/test_stage0_defect_fixes.py::test_daemon_bad_yaml_fails_before_daemon_action:
+  - start
+  - stop
+  - restart
+  - status
+  tests/test_stage0_gate_codes.py::test_file_rpc_rechecks_spoofed_human_as_agent:
+  - file.push-file_push-params0
+  - file.pull-file_pull-params1
+  tests/test_stage0_gate_codes.py::test_interactive_open_state_codes:
+  - RECOVERING
+  - FLASHING
+  tests/test_stage0_gate_codes.py::test_manager_quiet_window_returns_remaining_retry_after:
+  - execute_command
+  - file_push
+  tests/test_stage0_gate_codes.py::test_submit_time_state_codes:
+  - RECOVERING
+  - FLASHING
+  tests/test_stage0_handoff_stop.py::test_every_mutating_method_rejected_after_freeze:
+  - alias.assign
+  - alias.set
+  - alias.unassign
+  - command.cancel
+  - command.result_tail
+  - command.submit
+  - device.attach
+  - device.release
+  - event.com_disable
+  - event.com_enable
+  - event.reload
+  - event.reset
+  - event.rule_delete
+  - event.rule_set
+  - file.pull
+  - file.push
+  - result.tail
+  - session.attach
+  - session.bind
+  - session.clear
+  - session.console_attach
+  - session.console_detach
+  - session.interactive_close
+  - session.interactive_open
+  - session.interactive_send
+  - session.interactive_status
+  - session.log_start
+  - session.log_stop
+  - session.pin
+  - session.recover
+  - session.self_test
+  - session.unpin
+  - wal.reset
+  tests/test_stage0_platform_mgmt.py::test_daemon_restart_rejects_nonlocal_target_before_stop:
+  - argv0
+  - argv1
+  tests/test_stage0_session_drain.py::test_bc03_abort_mapping:
+  - account0-COMMAND_ABORTED_IN_FLIGHT
+  - account1-COMMAND_ABORTED_IN_FLIGHT
+  - account2-COMMAND_ABORTED_IN_FLIGHT
+  - account3-SEND_FAILED
+  - account4-FLUSHED_BY_RECOVERY

@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 # Slice 2.4 Linux 證據收集與出口報告；Windows／真機／長跑項只匯入擁有者既有證據。
+# --windows-run DIR：擁有者 Windows 原生 runner 產物（SHA256SUMS＋results-rust-windows.json）。
+# --longrun DIR：長跑證據（longrun-manifest.json＋<platform>/release-gate.json、baseline-release-gate.json、
+#   supervision-attest.json、bench-lock.json、gate evidence_hashes 所列檔案；Windows 另含 excl/）。
+#   由 contract_coverage.py --import-longrun 驗證後複製進 RUN_DIR/longrun/，判定時再重新驗證副本。
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -26,7 +30,7 @@ while [[ $# -gt 0 ]]; do
       LONGRUN_DIR="$2"
       shift 2 ;;
     -h|--help)
-      sed -n '1,7p' "$0"
+      sed -n '2,6p' "$0"
       echo "用法：$0 [--run-id ID] [--windows-run DIR] [--longrun DIR]"
       exit 0 ;;
     *) echo "slice24_exit.sh: 未知參數 $1" >&2; exit 2 ;;
@@ -119,6 +123,15 @@ run_logged python-baseline env \
   SERIALWRAP_COVERAGE_LABEL=python-linux \
   python3 -m pytest -q tests/
 
+# Rust label 的 pytest 收集範圍：凡需 rust-linux 證據的 pytest nodeid（含 rust-l1 凍結案例的 pytest 節點），
+# 其檔案都要在此陣列內並與本輪 artifact 一起執行（P8X-24c6b39-6；tests/test_rust_contract_coverage.py 把關）。
+RUST_PYTEST_TARGETS=(
+  tests/contract_blackbox
+  tests/test_multiagent_e2e.py
+  tests/test_human_agent_coexist.py
+  tests/test_rust_contract_coverage.py
+  tests/test_transfer_golden_fresh.py
+)
 if [[ -f "$RUST_CLI" && -f "$RUST_DAEMON" ]]; then
   run_logged rust-blackbox env \
     SERIALWRAP_CLI_EXE="$RUST_CLI" \
@@ -126,7 +139,7 @@ if [[ -f "$RUST_CLI" && -f "$RUST_DAEMON" ]]; then
     SERIALWRAP_AB_LABEL=rust-linux \
     SERIALWRAP_COVERAGE_RUN_DIR="$RUN_DIR" \
     SERIALWRAP_COVERAGE_LABEL=rust-linux \
-    python3 -m pytest -q tests/contract_blackbox tests/test_multiagent_e2e.py tests/test_human_agent_coexist.py
+    python3 -m pytest -q "${RUST_PYTEST_TARGETS[@]}"
 else
   printf 'rust-blackbox\t1\n' >>"$DRIVER_TSV"
   FAILURES=1
@@ -177,6 +190,8 @@ try:
         raise ValueError("結果未證明 Windows 原生 build/link 與實跑")
     artifacts_dir = run_dir / "artifacts" / "windows"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
+    # 判定器以 runner 自己的 SHA256SUMS 核對 Windows artifact，不套用 Linux 預期雜湊（P8X-24c6b39-5）。
+    shutil.copyfile(manifest, artifacts_dir / "SHA256SUMS")
     for key in ("cli", "daemon"):
         digest = document.get(f"{key}_sha256")
         candidate = listed.get(digest)
@@ -205,13 +220,17 @@ else
   printf 'windows-native\tEVIDENCE_MISSING\n' >>"$OWNER_TSV"
 fi
 
-# 長跑、TestPilot、真機 COM 與 USB-UART 證據由擁有者另行執行；在此只記錄輸入來源。
+# 長跑證據（計畫 Task 15 步驟 8）：驗證全部成立才匯入並解除 lr-mixed 的擁有者阻擋；
+# 缺漏、竄改或拒收的證據照實記錄，lr-mixed 維持 BLOCKED-OWNER。TestPilot、真機 COM 與 USB-UART 由擁有者另行執行。
 if [[ -n "$LONGRUN_DIR" ]]; then
-  if [[ -d "$LONGRUN_DIR" ]]; then
-    printf 'longrun\tEVIDENCE_MISSING\n' >>"$OWNER_TSV"
-  else
-    printf 'longrun\tEVIDENCE_MISSING\n' >>"$OWNER_TSV"
-  fi
+  LONGRUN_LOG="$RUN_DIR/logs/longrun-import.log"
+  python3 scripts/rust/contract_coverage.py --run-dir "$RUN_DIR" --import-longrun "$LONGRUN_DIR" >"$LONGRUN_LOG" 2>&1
+  LONGRUN_RC=$?
+  case "$LONGRUN_RC" in
+    0) printf 'longrun\tIMPORTED_PENDING_JUDGE（%s）\n' "$(grep -E '^longrun ' "$LONGRUN_LOG" | tr '\n' ' ')" >>"$OWNER_TSV" ;;
+    1) printf 'longrun\tREJECTED（見 %s）\n' "$LONGRUN_LOG" >>"$OWNER_TSV" ;;
+    *) printf 'longrun\tEVIDENCE_MISSING（匯入失敗 exit=%s，見 %s）\n' "$LONGRUN_RC" "$LONGRUN_LOG" >>"$OWNER_TSV" ;;
+  esac
 else
   printf 'longrun\tBLOCKED-OWNER\n' >>"$OWNER_TSV"
 fi
@@ -228,8 +247,10 @@ run_logged policy-check python3 -m policy_check --repo .
 
 JSON_REPORT="$RUN_DIR/slice24.json"
 MD_REPORT="$RUN_DIR/slice24.md"
+# 預期雜湊只對 Linux 候選 artifact；Windows 結果以其 runner SHA256SUMS 核對。
 run_logged contract-coverage python3 scripts/rust/contract_coverage.py \
   --run-dir "$RUN_DIR" \
+  --expect-platform linux \
   --expect-cli-sha256 "$(sha256sum "$RUST_CLI" 2>/dev/null | cut -d' ' -f1)" \
   --expect-daemon-sha256 "$(sha256sum "$RUST_DAEMON" 2>/dev/null | cut -d' ' -f1)" \
   --json "$JSON_REPORT" \

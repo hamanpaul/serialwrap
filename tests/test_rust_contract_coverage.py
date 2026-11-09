@@ -481,7 +481,7 @@ def _longrun_source(base: Path, *, platforms=("linux", "windows"), results=None)
                 excl_hashes[name] = _sha_bytes((root / "excl" / name).read_bytes())
         (root / "supervision-attest.json").write_text(json.dumps(attest), encoding="utf-8")
         (root / "bench-lock.json").write_text(json.dumps({
-            "path": "/home/owner/.local/state/serialwrap/bench.lock",
+            "path": "~/.local/state/serialwrap/bench.lock",
             "acquired_at_utc": "2026-10-31T23:59:00+00:00",
             "released_at_utc": "2026-11-03T00:01:00+00:00",
         }), encoding="utf-8")
@@ -873,14 +873,15 @@ def test_platform_artifacts_are_checked_per_platform(tmp_path):
     _results(run, "python-windows", "windows", [_row("t::x")])
     result = _run(
         "--run-dir", str(run), "--json", str(tmp_path / "o.json"),
-        "--only", "error_code:SESSION_BUSY", "--map", "error_code:SESSION_BUSY=t::x",
+        "--only", "error_code:X_XPLAT", "--map", "error_code:X_XPLAT=t::x",
+        "--platforms", "error_code:X_XPLAT=linux,windows",
         "--expect-platform", "linux",
         "--expect-cli-sha256", linux_doc["cli_sha256"], "--expect-daemon-sha256", linux_doc["daemon_sha256"],
     )
     assert result.returncode == 0, result.stdout + result.stderr
     output = json.loads((tmp_path / "o.json").read_text(encoding="utf-8"))
     assert output["identity_errors"] == []
-    assert "error_code:SESSION_BUSY" in output["covered"]
+    assert "error_code:X_XPLAT" in output["covered"]
 
 
 def test_windows_artifact_must_be_listed_in_runner_manifest(tmp_path):
