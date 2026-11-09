@@ -6061,6 +6061,143 @@ fn wp510_review7_rpc_bind_after_retirement_enospc_adopts_preopened_handle() {
     );
 }
 
+/// 審查 P8-503c341-1 的前置：佔位退休落盤失敗留下未消費的預開作業（Python `_preopened_ports`），再把 COM1 改綁到
+/// 該 by_id 且存檔第二次 ENOSPC。Python `bind_session` 已在記憶體改綁（`origin/main:sw_core/session_manager.py:3775-3791`，
+/// 有 bridge 時由 `_complete_drain` `:2955-2967`），`_save_state()` 例外穿出（`:3810`、`:2981-2985`），其後的
+/// `_spawn_attach` 未執行，作業仍留在 `_preopened_ports`。`release_first` 為 true 時 COM1 先 `device.release`（無 bridge）。
+fn wp510_review8_double_enospc_bind_setup(r: &ServiceRig, release_first: bool) -> FakeDevice {
+    let dev = r.device(WP510_REAL_G).clone();
+    if release_first {
+        let released = r.call("device.release", r#"{"selector":"COM1"}"#);
+        assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&released));
+        r.wait_state("COM1", "RELEASED");
+    }
+    r.fs.fail_next_atomic_write(PalError::io(
+        28,
+        "[Errno 28] No space left on device",
+    ));
+    let _ = r.call_err(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    assert!(dev.is_open(), "前置：預開 handle 留在未消費的作業內");
+    assert!(r.mgr.has_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID));
+
+    r.fs.fail_next_atomic_write(PalError::io(
+        28,
+        "[Errno 28] No space left on device",
+    ));
+    let error = r.call_err(
+        "session.bind",
+        &format!(r#"{{"selector":"COM1","device_by_id":"{WP510_PLACEHOLDER_BY_ID}"}}"#),
+    );
+    assert!(error.message.contains("No space left on device"), "{}", error.message);
+    assert_eq!(dev.close_count(), 0, "前置：第二次落盤失敗未接手、也未關閉預開 handle");
+    assert!(dev.is_open());
+    dev
+}
+
+/// 重試改綁的期望（Python `bind_session` `origin/main:sw_core/session_manager.py:3680-3694`）：舊 by_id 已是 usb-G，
+/// `_preopened_ports.pop(old_by_id)` 取出未消費作業，`_finish_attach_op` 直接關閉 handle（`:4320-4332`）、自表移除
+/// （`:4335-4338`）後遞迴重試 bind（`:3727`）；改綁收尾設 ATTACHING＋last_error=None（`:3786-3791`），`_save_state()`
+/// 成功後 `_spawn_attach` 重新開埠（`:3810-3813`）。
+fn wp510_review8_assert_bind_retry_closes_parked_handle(r: &ServiceRig, dev: &FakeDevice) {
+    let attempts = dev.open_attempts();
+    let started = std::time::Instant::now();
+    let bound = r.call(
+        "session.bind",
+        &format!(r#"{{"selector":"COM1","device_by_id":"{WP510_PLACEHOLDER_BY_ID}"}}"#),
+    );
+    let elapsed = started.elapsed();
+
+    assert_eq!(bound.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&bound));
+    let session = match bound.get("session") {
+        Some(PyValue::Dict(session)) => session.clone(),
+        other => panic!("bind 回應須帶 session：{other:?}"),
+    };
+    assert_eq!(s(&session, "state"), "ATTACHING", "{}", j(&bound));
+    assert_eq!(session.get("last_error"), Some(&PyValue::Null), "{}", j(&bound));
+    assert_eq!(s(&session, "device_by_id"), WP510_PLACEHOLDER_BY_ID);
+    assert_eq!(session.get("drain_stalled"), Some(&PyValue::Bool(false)), "{}", j(&bound));
+    assert!(
+        elapsed < Duration::from_millis(2500),
+        "未消費作業直接收尾，不得等待 attach 作業期限：{elapsed:?}"
+    );
+    assert_eq!(dev.close_count(), 1, "未消費的預開 handle 關閉一次");
+    wait_until("重新排程 attach 重新開埠", || dev.open_attempts() > attempts);
+    r.wait_state("COM1", "READY");
+    assert!(!r.mgr.unconfirmed_close_for_test(WP510_PLACEHOLDER_BY_ID));
+}
+
+/// 審查 P8-503c341-1：COM1 已 RELEASED（無 bridge）時，連續兩次 ENOSPC 後重試同一 bind。
+#[test]
+fn wp510_review8_rpc_bind_retry_after_double_enospc_closes_parked_handle() {
+    let r = wp510_b_placeholder_rig();
+    let dev = wp510_review8_double_enospc_bind_setup(&r, true);
+    wp510_review8_assert_bind_retry_closes_parked_handle(&r, &dev);
+}
+
+/// 審查 P8-503c341-1：COM1 為 READY（有 bridge，改綁走 drain）時，連續兩次 ENOSPC 後重試同一 bind。
+#[test]
+fn wp510_review8_rpc_bind_retry_after_double_enospc_from_ready_closes_parked_handle() {
+    let r = wp510_b_placeholder_rig();
+    let dev = wp510_review8_double_enospc_bind_setup(&r, false);
+    wp510_review8_assert_bind_retry_closes_parked_handle(&r, &dev);
+}
+
+/// 審查 P8-503c341-1 的關閉未確認分支：重試 bind 關閉未消費的預開 handle 回 `closed:false`。Python 已先把作業自
+/// `_preopened_ports` 取出（`origin/main:sw_core/session_manager.py:3681`），`_finish_attach_op` 關閉失敗回 False
+/// （`:4322-4332`）；該作業的 `session_id` 為 `dynamic:<by_id>`（`:3608`），`_sessions` 查無，不走 RECOVERING 回覆
+/// （`:3697-3700`），release 亦未請求（`:3716-3719`），遞迴重試 bind（`:3727`）：回 ok＋ATTACHING、last_error=None
+/// （`:3786-3791`、`:3813`）。差異（wp510 第 13 項）：未確認關閉登記到全 daemon 的 by_id 阻擋集合，改綁收尾的再 attach
+/// 不開埠、不送 TX（Python `_spawn_attach` 見 `_draining_by_ids` 早退 `:4113-4114`，bind 已先設 ATTACHING），之後的
+/// bind／attach 仍被擋。
+#[test]
+fn wp510_review8_rpc_bind_retry_parked_close_unconfirmed_keeps_block() {
+    let r = wp510_b_placeholder_rig();
+    let dev = wp510_review8_double_enospc_bind_setup(&r, true);
+    dev.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
+    let attempts = dev.open_attempts();
+    let tx_before = dev.tx_len();
+
+    let started = std::time::Instant::now();
+    let bound = r.call(
+        "session.bind",
+        &format!(r#"{{"selector":"COM1","device_by_id":"{WP510_PLACEHOLDER_BY_ID}"}}"#),
+    );
+    let elapsed = started.elapsed();
+
+    assert_eq!(bound.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&bound));
+    let session = match bound.get("session") {
+        Some(PyValue::Dict(session)) => session.clone(),
+        other => panic!("bind 回應須帶 session：{other:?}"),
+    };
+    assert_eq!(s(&session, "state"), "ATTACHING", "{}", j(&bound));
+    assert_eq!(session.get("last_error"), Some(&PyValue::Null), "{}", j(&bound));
+    assert_eq!(s(&session, "device_by_id"), WP510_PLACEHOLDER_BY_ID);
+    assert!(
+        elapsed < Duration::from_millis(2500),
+        "關閉回條已到，不得等待 attach 作業期限：{elapsed:?}"
+    );
+    assert_eq!(dev.close_count(), 1, "已嘗試關閉未消費的預開 handle");
+    assert!(r.mgr.unconfirmed_close_for_test(WP510_PLACEHOLDER_BY_ID), "關閉未確認須登記阻擋");
+
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(dev.open_attempts(), attempts, "未確認關閉不得重新開埠");
+    assert_eq!(dev.tx_len(), tx_before, "未確認關閉不得送 TX");
+
+    let again = r.call(
+        "session.bind",
+        &format!(r#"{{"selector":"COM1","device_by_id":"{WP510_PLACEHOLDER_BY_ID}"}}"#),
+    );
+    assert_eq!(again.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&again));
+    let attached = r.call("device.attach", r#"{"selector":"COM1"}"#);
+    assert_eq!(s(&attached, "error_code"), "SESSION_RECOVERING", "{}", j(&attached));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(dev.open_attempts(), attempts, "之後的 bind／attach 仍不得重新開埠");
+    assert_eq!(dev.tx_len(), tx_before);
+}
+
 /// 落盤失敗後再次 `_spawn_attach`（bootstrap）：`_attach_by_id` 取走 `_preopened_ports` 的作業，dynamic 偵測沿用同一
 /// handle，於保留的原 COM 建立正式 session（`origin/main:sw_core/session_manager.py:4852-4854`、`:4886-4888`）。
 #[test]
