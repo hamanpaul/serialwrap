@@ -2579,7 +2579,7 @@ impl SessionCore {
         if let Some(pending) = &mut self.pending_open_stop {
             pending.stalled = true;
             if pending.kind == StopKind::Release {
-                reply_waiters.extend(pending.waiters.drain(..));
+                reply_waiters.append(&mut pending.waiters);
             }
         }
         self.drain_stalled = true;
