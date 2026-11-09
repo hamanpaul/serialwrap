@@ -136,6 +136,23 @@ fn preopened_close_warning(by_id: &str, error: &str) -> String {
     format!("預開 UART handle 關閉失敗（by_id={by_id}）：{error}")
 }
 
+/// 佔位交接回應以退休前快照改寫狀態時，比照 Python state setter（`origin/main:sw_core/session_manager.py:617-620`）：
+/// 狀態改變即寫入 `last_state_change_at`。
+fn set_public_state(public: &mut PyDict, state: &str, changed_at: String) {
+    if public.get("state").and_then(PyValue::as_str) != Some(state) {
+        public.insert("last_state_change_at", PyValue::from(changed_at));
+    }
+    public.insert("state", PyValue::from(state));
+}
+
+/// 同上，比照 Python last_error setter（`:603-610`）：值改變即清除 `last_error_detail`。
+fn set_public_last_error(public: &mut PyDict, value: PyValue) {
+    if public.get("last_error") != Some(&value) {
+        public.insert("last_error_detail", PyValue::Null);
+    }
+    public.insert("last_error", value);
+}
+
 /// 重組的 handle：`split()` 直接交回原四件組（PROBE 與正式 bridge 共用同一預開 port，#51）。
 struct ReassembledHandle(HandleParts);
 
@@ -1504,9 +1521,10 @@ impl Shared {
                     return Ok(session_recovering_reply(current));
                 };
 
-                public.insert("state", PyValue::from("DETACHED"));
-                public.insert(
-                    "last_error",
+                // Python `:3535-3537`：`session.state = "DETACHED"`（setter 寫入時間）→ last_error → detached_at。
+                set_public_state(&mut public, "DETACHED", self.now_iso());
+                set_public_last_error(
+                    &mut public,
                     PyValue::from(format!("ATTACH_FAILED:{}", error.py_exc_name())),
                 );
                 public.insert("detached_at", PyValue::from(self.now_iso()));
@@ -1550,8 +1568,9 @@ impl Shared {
             return Ok(session_recovering_reply(current));
         };
 
-        public.insert("state", PyValue::from("ATTACHING"));
-        public.insert("last_error", PyValue::Null);
+        // Python `:3596-3602`：清 released 欄位 → `session.state = "ATTACHING"`（`:3599`，setter 寫入時間）→ last_error。
+        set_public_state(&mut public, "ATTACHING", self.now_iso());
+        set_public_last_error(&mut public, PyValue::Null);
         public.insert("released_by", PyValue::Null);
         public.insert("released_at", PyValue::Null);
         public.insert("released_reason", PyValue::Null);

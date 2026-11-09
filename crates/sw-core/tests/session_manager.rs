@@ -2256,7 +2256,7 @@ fn wp510_review4_failed_late_handle_close_before_retirement_warns() {
 
 /// wp510 第四次整包審查盤點二：交接完成後預開 handle 已交給正式 session、正式 bridge 尚未接手時 shutdown，
 /// `open_bridge` 關閉它失敗。Python 的預開 handle 在正式 bridge 接手前仍屬 `_preopened_ports` 作業，停機丟棄同樣
-/// 經 `_finish_attach_op` 告警（`origin/main:sw_core/session_manager.py:1175-1193`、`:4322-4332`）。
+/// 經 `_finish_attach_op` 告警（`origin/main:sw_core/session_manager.py:1181-1187` 取消、`:1218-1226` 收尾、`:4322-4332` 告警）。
 #[test]
 fn wp510_review4_failed_session_preopened_close_on_shutdown_warns() {
     const SID: &str = "gone-template:COM3";
@@ -2291,6 +2291,68 @@ fn wp510_review4_failed_session_preopened_close_on_shutdown_warns() {
     );
     assert_eq!(device.open_count(), 1, "停機後不得重新開埠");
     assert!(device.take_tx().iter().all(|b| *b == b'\n'), "停機後只允許交接 PROBE 的 \\n");
+}
+
+/// wp510 第四次整包審查 Medium 3：佔位在 T0 啟動建立、T1 才 `device.attach`。Python 啟動還原以 setter 寫入 T0
+/// （`origin/main:sw_core/session_manager.py:1114-1115`、`:617-620`）；交接成功分支於 `:3599` 設 ATTACHING、
+/// `:3602` 才產生回應，`last_state_change_at` 為 T1，不可沿用退休前快照的 T0。
+#[test]
+fn wp510_review4_handoff_response_stamps_last_state_change_at() {
+    use sw_pal::traits::Clock;
+    const SID: &str = "gone-template:COM3";
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    let t0 = sw_proto::pycompat::iso_utc_now(m.clock.wall_unix_us());
+    assert_eq!(
+        s_of(&m.session(SID), "last_state_change_at").as_deref(),
+        Some(t0.as_str()),
+        "啟動還原 RELEASED 必須寫入狀態變更時間"
+    );
+    m.mgr.update_devices(&m.snapshot());
+    m.clock.set_wall_us(m.clock.wall_unix_us() + 5_000_000);
+    let t1 = sw_proto::pycompat::iso_utc_now(m.clock.wall_unix_us());
+
+    let response = rpc(m.mgr.attach_released_placeholder(&sid, false));
+    let session = session_field(&response);
+
+    assert!(is_ok(&response), "{response:?}");
+    assert_eq!(s_of(&session, "state").as_deref(), Some("ATTACHING"));
+    assert_eq!(
+        s_of(&session, "last_state_change_at").as_deref(),
+        Some(t1.as_str()),
+        "RELEASED→ATTACHING 的交接回應必須帶 T1"
+    );
+}
+
+/// wp510 第四次整包審查 Medium 3（一般 OSError）：同一情境下佔位開埠一般 OSError。Python `:3535` 設 DETACHED
+/// （setter 寫入時間）、`:3536-3537` 設 last_error 與 detached_at，`:3550` 才產生回應。
+#[test]
+fn wp510_review4_handoff_oserror_response_stamps_last_state_change_at() {
+    use sw_pal::traits::Clock;
+    const SID: &str = "gone-template:COM3";
+    const REAL: &str = "/dev/ttyG";
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    m.serial.fail_next_open(REAL, wp510_b_permission_error());
+    m.mgr.update_devices(&m.snapshot());
+    m.clock.set_wall_us(m.clock.wall_unix_us() + 5_000_000);
+    let t1 = sw_proto::pycompat::iso_utc_now(m.clock.wall_unix_us());
+
+    let response = rpc(m.mgr.attach_released_placeholder(&sid, false));
+    let session = session_field(&response);
+
+    assert!(is_ok(&response), "{response:?}");
+    assert_eq!(s_of(&session, "state").as_deref(), Some("DETACHED"));
+    assert_eq!(
+        s_of(&session, "last_error").as_deref(),
+        Some("ATTACH_FAILED:PermissionError")
+    );
+    assert_eq!(s_of(&session, "detached_at").as_deref(), Some(t1.as_str()));
+    assert_eq!(
+        s_of(&session, "last_state_change_at").as_deref(),
+        Some(t1.as_str()),
+        "RELEASED→DETACHED 的交接回應必須帶 T1"
+    );
 }
 
 /// PROBE TX 的 WAL 列數（`com=PROBE`、`dir=TX`）。

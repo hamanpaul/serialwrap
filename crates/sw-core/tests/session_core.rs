@@ -1921,3 +1921,130 @@ fn reprobe_plan_ignores_pending_auto_login() {
     );
     assert_ne!(pget(&h.public(), "last_error"), PyValue::from("CREDENTIALS_UNRESOLVED"));
 }
+
+// ---------------------------------------------------------------------------
+// wp510 第四次整包審查盤點一：狀態時間戳。Python `SessionRuntime.state` setter
+// （`origin/main:sw_core/session_manager.py:612-631`）在值改變時一律寫 `last_state_change_at = now_iso()`；
+// Rust 對應為 `SessionCore::set_state`，所有改變 `state` 的位置都須具同一語意。
+// ---------------------------------------------------------------------------
+
+/// CoreHarness 的 wall 文字（`wall-us-<N>`）。
+fn review4_wall(h: &CoreHarness) -> PyValue {
+    PyValue::from(format!("wall-us-{}", h.wall_us()))
+}
+
+/// 回應中的 `session` 子 dict。
+fn review4_session(response: &PyDict) -> PyDict {
+    match response.get("session") {
+        Some(PyValue::Dict(session)) => session.clone(),
+        other => panic!("回應應含 session dict，實際 {other:?}"),
+    }
+}
+
+/// 建立啟動還原的 RELEASED session（裝置在線），回到初始 wall 後推進 `delta_us`。
+fn review4_released_harness() -> CoreHarness {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.core.init_released(
+        Some("agent".into()),
+        Some("2026-10-21T00:00:00".into()),
+        PyValue::from("manual"),
+    );
+    h.attach_device();
+    h
+}
+
+/// 啟動還原 RELEASED：Python `__init__` 對新建 session（`_state` 預設 DETACHED，`:596`）執行
+/// `s.state = "RELEASED"`（`:1114-1115`），setter 寫入當下時間；CPython 3.12 實測非 null。
+#[test]
+fn wp510_review4_init_released_stamps_last_state_change_at() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.jump_wall_us(7_000_000);
+    h.core.init_released(None, None, PyValue::Null);
+    let public = h.public();
+    assert_eq!(pget(&public, "state"), PyValue::from("RELEASED"));
+    assert_eq!(
+        pget(&public, "last_state_change_at"),
+        review4_wall(&h),
+        "DETACHED→RELEASED 必須寫入狀態變更時間"
+    );
+}
+
+/// 動態開埠失敗保留的 DETACHED session：Python `_record_dynamic_open_failure` 對新建 session 設
+/// `session.state = "DETACHED"`（`:4436`），值未改變，setter 不寫時間（CPython 3.12 實測仍為 null）。
+#[test]
+fn wp510_review4_init_detached_error_keeps_unset_last_state_change_at() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.jump_wall_us(7_000_000);
+    h.core
+        .init_detached_error("ATTACH_FAILED:PermissionError".into(), "t-detached".into());
+    let public = h.public();
+    assert_eq!(pget(&public, "state"), PyValue::from("DETACHED"));
+    assert_eq!(pget(&public, "last_state_change_at"), PyValue::Null);
+}
+
+/// 自 RELEASED 的 `device.attach` 開埠成功、unreleased 落盤成功：Python `attach_device` 於 `:3599` 設 ATTACHING
+/// （setter 寫入當下時間），`:3602` 才產生回應的 public dict。
+#[test]
+fn wp510_review4_attach_from_released_commit_ok_stamps_last_state_change_at() {
+    let mut h = review4_released_harness();
+    let released_at = pget(&h.public(), "last_state_change_at");
+    h.jump_wall_us(5_000_000);
+    let (rx, _) = h.rpc_deferred(SessionRequest::DeviceAttach { force: true });
+    h.bridge_ok();
+    let response = rx
+        .try_recv()
+        .expect("落盤完成後應回覆")
+        .expect("device.attach 不應回 Err");
+    let session = review4_session(&response);
+
+    assert_eq!(pget(&session, "state"), PyValue::from("ATTACHING"), "{response:?}");
+    assert_ne!(pget(&session, "last_state_change_at"), released_at);
+    assert_eq!(
+        pget(&session, "last_state_change_at"),
+        review4_wall(&h),
+        "RELEASED→ATTACHING 必須寫入當下時間"
+    );
+}
+
+/// 自 RELEASED 的 `device.attach` 開埠 OSError 轉 DETACHED 後 unreleased 落盤失敗：Rust 依既有設計還原 previous
+/// state（Python 例外後停在 DETACHED，`:3557-3561`；狀態值分歧列回報既有碼待辦）。還原本身仍是狀態改變，
+/// 須比照 setter（`:617-620`）寫入還原當下的時間，不可留下 DETACHED 的時間戳。
+#[test]
+fn wp510_review4_attach_failed_commit_err_restore_stamps_last_state_change_at() {
+    let mut h = review4_released_harness();
+    h.defer_state_commits();
+    h.jump_wall_us(5_000_000);
+    let (rx, _) = h.rpc_deferred(SessionRequest::DeviceAttach { force: true });
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Err(OpenFailure::Other(sw_pal::traits::PalError::io(
+            13,
+            "[Errno 13] Permission denied",
+        ))),
+    });
+    let detached = h.public();
+    assert_eq!(pget(&detached, "state"), PyValue::from("DETACHED"));
+    assert_eq!(pget(&detached, "last_state_change_at"), review4_wall(&h));
+
+    h.jump_wall_us(5_000_000);
+    let commit = *h
+        .pending_state_commit_ids()
+        .first()
+        .expect("開埠失敗應有待完成的 unreleased commit");
+    h.state_store
+        .fail_next_commit(sw_pal::traits::PalError::io(28, "[Errno 28] No space left on device"));
+    h.complete_state_commit(commit);
+    let error = rx
+        .try_recv()
+        .expect("落盤失敗後應回覆")
+        .expect_err("落盤失敗須回 Err");
+    let restored = h.public();
+
+    assert!(error.message.contains("No space left on device"), "{}", error.message);
+    assert_eq!(pget(&restored, "state"), PyValue::from("RELEASED"));
+    assert_eq!(
+        pget(&restored, "last_state_change_at"),
+        review4_wall(&h),
+        "DETACHED→RELEASED 的還原必須寫入還原當下時間"
+    );
+}

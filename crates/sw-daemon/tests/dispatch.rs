@@ -5192,8 +5192,20 @@ fn wp510_rpc_bind_then_device_attach_replaces_placeholder() {
     let before_attach = r
         .session(WP510_PLACEHOLDER_SID)
         .expect("bind 早退後佔位仍存在");
+    // 佔位於 T0 建立、T1 才 device.attach：Python `attach_device` 於 `origin/main:sw_core/session_manager.py:3599`
+    // 設 ATTACHING，state setter（`:617-620`）寫入 T1 後 `:3602` 才產生回應（wp510 第四次整包審查 Medium 3）。
+    r.clock.set_wall_us(r.clock.wall_unix_us() + 5_000_000);
     let mut handoff_snapshot = before_attach.clone();
+    assert_ne!(
+        handoff_snapshot.get("last_state_change_at"),
+        Some(&PyValue::from(iso_utc_now(r.clock.wall_unix_us()))),
+        "前置：交接前快照不得已是 T1"
+    );
     handoff_snapshot.insert("state", PyValue::from("ATTACHING"));
+    handoff_snapshot.insert(
+        "last_state_change_at",
+        PyValue::from(iso_utc_now(r.clock.wall_unix_us())),
+    );
     handoff_snapshot.insert("last_error", PyValue::Null);
     handoff_snapshot.insert("released_by", PyValue::Null);
     handoff_snapshot.insert("released_at", PyValue::Null);
@@ -5361,12 +5373,24 @@ fn wp510_rpc_general_oserror_handoff_with_and_without_fallback() {
         let before = r
             .session(WP510_PLACEHOLDER_SID)
             .expect("OSError 測試前置佔位");
+        // 佔位於 T0 建立、T1 才 device.attach：Python `origin/main:sw_core/session_manager.py:3535` 設 DETACHED，
+        // state setter（`:617-620`）寫入 T1（wp510 第四次整包審查 Medium 3）。
+        r.clock.set_wall_us(r.clock.wall_unix_us() + 5_000_000);
         let response = r.call(
             "device.attach",
             &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
         );
         let mut detached = before;
+        assert_ne!(
+            detached.get("last_state_change_at"),
+            Some(&PyValue::from(iso_utc_now(r.clock.wall_unix_us()))),
+            "前置：交接前快照不得已是 T1"
+        );
         detached.insert("state", PyValue::from("DETACHED"));
+        detached.insert(
+            "last_state_change_at",
+            PyValue::from(iso_utc_now(r.clock.wall_unix_us())),
+        );
         detached.insert("last_error", PyValue::from("ATTACH_FAILED:PermissionError"));
         detached.insert(
             "detached_at",
@@ -6058,4 +6082,31 @@ fn wp510_review4_rpc_release_cancel_persist_enospc_returns_error_then_retries() 
     assert_eq!(s(&row, "released_by"), "cli");
     assert_eq!(s(&row, "released_at"), filled_at);
     assert_eq!(s(&row, "reason"), "manual");
+}
+
+/// wp510 第四次整包審查盤點一（RPC）：一般 session 於 T0 release、T1 `device.attach`；開埠成功且 unreleased 落盤後的
+/// 回應須帶 T1（Python `attach_device` `origin/main:sw_core/session_manager.py:3599` 設 ATTACHING，setter `:617-620`，
+/// `:3602` 產生回應）。呼叫路徑：`Service::rpc("device.attach")` → `SessionManager::route_with_selector` →
+/// `SessionCore::attach_request` → `Effect::OpenBridge` → `bridge_opened` → `Persist(Unreleased)` → `state_committed`。
+#[test]
+fn wp510_review4_rpc_attach_from_released_stamps_last_state_change_at() {
+    let r = ServiceRig::ready_shell();
+    let released = r.call("device.release", r#"{"selector":"COM0"}"#);
+    assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&released));
+    r.wait_state("COM0", "RELEASED");
+    let t0 = s(&r.session("COM0").expect("COM0"), "last_state_change_at").to_string();
+    r.clock.set_wall_us(r.clock.wall_unix_us() + 5_000_000);
+    let t1 = iso_utc_now(r.clock.wall_unix_us());
+
+    let attached = r.call("device.attach", r#"{"selector":"COM0"}"#);
+    let session = sub(&attached, "session");
+
+    assert_eq!(attached.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&attached));
+    assert_eq!(s(&session, "state"), "ATTACHING", "{}", j(&attached));
+    assert_ne!(t0, t1, "前置：release 與 attach 的 wall 不同");
+    assert_eq!(
+        s(&session, "last_state_change_at"),
+        t1,
+        "RELEASED→ATTACHING 的 device.attach 回應必須帶 T1"
+    );
 }

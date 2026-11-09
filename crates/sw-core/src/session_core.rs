@@ -1144,6 +1144,12 @@ impl SessionCore {
         released_at: Option<String>,
         reason: PyValue,
     ) {
+        // Python 啟動還原 `s.state = "RELEASED"`（`origin/main:sw_core/session_manager.py:1114-1115`）經 state setter
+        // （`:612-631`）：建構時 `_state` 預設 DETACHED（`:596`），值改變即寫入 `last_state_change_at`。
+        if self.state != SessionState::Released {
+            self.last_state_change_at = Some(self.wall_iso());
+        }
+        self.quiet_since = None;
         self.state = SessionState::Released;
         self.released_by = released_by;
         self.released_at = released_at;
@@ -1605,7 +1611,8 @@ impl SessionCore {
                     self.released_reason = PyValue::Null;
                     self.pending_release = None;
                     self.pending_attach = None;
-                    self.state = SessionState::Attaching;
+                    // Python `attach_device` 於 `:3599` 設 ATTACHING，setter 寫入當下時間（`:617-620`）後才產生回應（`:3602`）。
+                    self.set_state(SessionState::Attaching, now);
                     let mut effects = self.adopt_opened_bridge(opened, now);
                     let reply = Effect::Reply(reply, Ok(self.ok_session(now)));
                     let start_login = effects
@@ -1625,7 +1632,8 @@ impl SessionCore {
                         return effects;
                     }
                     self.pending_attach = None;
-                    self.state = previous_state;
+                    // 還原同樣經 setter 語意：狀態若在開埠期間改變，還原即為一次狀態變更（`:617-620`）。
+                    self.set_state(previous_state, now);
                     let mut effects = self.retire_opened_bridge(opened);
                     effects.push(Effect::Reply(
                         reply,
@@ -1649,7 +1657,8 @@ impl SessionCore {
                     vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
                 }
                 Err(error) => {
-                    self.state = previous_state;
+                    // 開埠失敗已轉 DETACHED，落盤失敗還原 previous_state 也是狀態變更，經 setter 寫入時間（`:617-620`）。
+                    self.set_state(previous_state, now);
                     vec![Effect::Reply(
                         reply,
                         Err(PyErr::value_error(error.py_message.clone())),
@@ -2640,7 +2649,7 @@ impl SessionCore {
     ) -> Vec<Effect> {
         match failure {
             OpenFailure::Held(holder) | OpenFailure::AccessDenied(holder) => {
-                self.state = pending.previous_state;
+                self.set_state(pending.previous_state, now);
                 let holder_unknown = holder.pids.is_empty();
                 let mut response = self.error_session("DEVICE_STILL_HELD", now);
                 response.insert(
@@ -2658,7 +2667,7 @@ impl SessionCore {
                 vec![Effect::Reply(pending.reply, Ok(response))]
             }
             OpenFailure::NotFound => {
-                self.state = pending.previous_state;
+                self.set_state(pending.previous_state, now);
                 let mut response = self.error_session("DEVICE_NOT_PRESENT", now);
                 response.insert("selector", PyValue::from(self.profile.com.clone()));
                 response.insert("device_by_id", PyValue::from(pending.by_id));
