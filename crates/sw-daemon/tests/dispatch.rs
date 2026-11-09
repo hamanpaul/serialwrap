@@ -5636,6 +5636,80 @@ fn wp510_rpc_failed_close_keeps_placeholder_drain_stalled() {
     assert!(dev.is_open(), "後續 RPC 不得掩蓋未關閉 handle");
 }
 
+/// WAL 中 `com=PROBE`、`dir=TX` 的列數。
+fn wp510_probe_tx_rows(r: &ServiceRig) -> usize {
+    let bytes = r.wfs.contents(WP55_WAL.as_ref()).unwrap_or_default();
+    String::from_utf8(bytes)
+        .expect("WAL 應為 UTF-8")
+        .lines()
+        .filter(|line| {
+            let PyValue::Dict(record) = sw_proto::pyjson::loads(line).expect("WAL 行應為 JSON")
+            else {
+                panic!("WAL 行應為 object：{line}");
+            };
+            record.get("com") == Some(&PyValue::from("PROBE"))
+                && record.get("dir") == Some(&PyValue::from("TX"))
+        })
+        .count()
+}
+
+/// wp510 第三次整包審查 High（RPC 端到端）：`device.attach` → `route_with_selector` → 佔位交接 →
+/// dynamic worker 的 PROBE 已越過 `still_valid()`、提交前 shutdown，提交點必須以同一 attach 作業的
+/// Fence 拒絕，裝置與 WAL 皆零 PROBE TX（Python `session_manager.py:1186-1193`、`uart_io.py:623-627`）。
+#[test]
+fn wp510_rpc_shutdown_before_placeholder_probe_submit_sends_zero_tx() {
+    let r = wp510_b_placeholder_rig();
+    let dev = r.device(WP510_REAL_G);
+    let tx_mark = dev.tx_len();
+    let weak = Arc::downgrade(&r.mgr);
+    let (hook_tx, hook_rx) = crossbeam_channel::bounded(4);
+    r.mgr.set_probe_pre_submit_hook_for_test(Box::new(move || {
+        if let Some(manager) = weak.upgrade() {
+            let drained = manager.shutdown(Duration::from_millis(50));
+            let _ = hook_tx.send(drained);
+        }
+    }));
+
+    let attached = r.call(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    assert_eq!(
+        attached.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "device.attach 應交接在線佔位：{}",
+        j(&attached)
+    );
+    let drained = hook_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("交接後的 PROBE 應在提交前觸發 shutdown");
+    assert!(
+        r.mgr
+            .wait_attach_idle_for_test(WP510_PLACEHOLDER_BY_ID, Duration::from_secs(5)),
+        "shutdown 取消的交接 worker 應收尾"
+    );
+
+    assert!(
+        drained.iter().any(|(target, ok)| {
+            target == &format!("attach:{WP510_PLACEHOLDER_BY_ID}") && !ok
+        }),
+        "PROBE 尚在 worker 內時 shutdown 不得把交接作業列為已排空：{drained:?}"
+    );
+    assert_eq!(dev.os_submits(), 0, "shutdown 後 PROBE 不得提交任何 bytes 給 OS");
+    assert!(
+        dev.tx_since(tx_mark).is_empty(),
+        "shutdown 後裝置不得收到 PROBE 的 \\n：{:?}",
+        String::from_utf8_lossy(&dev.tx_since(tx_mark))
+    );
+    assert_eq!(wp510_probe_tx_rows(&r), 0, "被撤銷的 PROBE TX 不得寫 WAL");
+    assert_eq!(dev.close_count(), 1, "未交接的預開 handle 應關閉一次");
+    assert!(!dev.is_open(), "shutdown 取消後不得保留預開 handle");
+    assert!(
+        r.mgr.resolve("t:COM3").is_none(),
+        "shutdown 取消後不得建立正式 session"
+    );
+}
+
 /// 正式 RPC 回歸：blocked placeholder open 在 release timeout 後回 Held（未取得 handle），應解除 stall 並可重試。
 #[test]
 fn wp510_rpc_open_error_after_release_settles_without_handle() {

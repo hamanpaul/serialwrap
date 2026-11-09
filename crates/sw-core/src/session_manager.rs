@@ -192,7 +192,7 @@ static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// | 晚到開埠；開埠返回後失效及 `_finish_attach_op` `:3572-3615`、`:4320-4333` | 取消／裝置改指／shutdown 後才返回的 handle 不送 TX，嘗試 close；成功才清 op，`closed:false` 留住 inflight。 | `wp510_b_handoff_invalidated_during_open_closes_handle`; `wp510_lifecycle_shutdown_cancel_fail_close_keeps_placeholder_blocked`; `wp510_lifecycle_device_path_change_cancel_fail_close_keeps_placeholder_blocked` |
 /// | `cancelled`；裝置改指 `:4031-4043`、bind `:3683-3691`、shutdown `:1175-1190`、release `:3117-3125` | 共用原子取消旗標；各取消者都阻止晚到 handle 交接，並由同一 close 回條決定是否可清除 op。 | `wp510_b_handoff_invalidated_during_open_closes_handle`; `shutdown_includes_inflight_attach`; `wp510_review_release_cancels_placeholder_attach_before_retirement`; `bind_with_inflight_attach_op_cancels_waits_3000ms` |
 /// | `done`；交接完成 `:4374-4383`、作業收尾 `:4320-4365`，release 等待 `:3192-3204` | 沒有獨立 done 欄位；`inflight` 項目存活代表未完成，條件變數喚醒等待者。close 成功後移除 op，close 失敗不會誤報完成。 | `wp510_review_late_placeholder_attach_completion_clears_drain_stall`; `wp510_rpc_failed_close_keeps_placeholder_drain_stalled` |
-/// | `probe_bridge`；註冊／取消排空 `:4367-4372`、`:3126-3131` | placeholder handoff 不建立獨立 probe bridge；`attach_dynamic` 以同一預開 handle 偵測，再交正式 session bridge。 | `wp510_rpc_bind_then_device_attach_replaces_placeholder` |
+/// | `probe_bridge`；註冊 `:4367-4372`，取消排空：shutdown `:1186-1193`、release `:3126-3131`、bind `:3686-3691`、裝置改指 `:4039-4043` | 不另建 PROBE bridge；`attach_dynamic`／`reattach_existing` 以同一預開 handle 偵測。PROBE 的 TX gate 是作業持有的 `probe_fence`／`probe_cancel`：所有取消者經 `AttachOp::cancel()` 在 fence 鎖內凍結並取消（`uart_io.py:908-918`），已越過 `still_valid()` 的 PROBE 於提交點重驗即拒絕（`:623-627`）、零 TX。 | `wp510_rpc_bind_then_device_attach_replaces_placeholder`; `wp510_tx_shutdown_after_still_valid_before_placeholder_probe_submit_sends_zero_tx`; `wp510_tx_device_path_change_before_hotplug_probe_submit_sends_zero_tx`; `wp510_rpc_shutdown_before_placeholder_probe_submit_sends_zero_tx` |
 /// | `release_request/release_deadline`；開始計時 `:3084-3086`、第一次設定及重用 `:3117-3125`，等待與逾期處理 `:3192-3204` | 已是 RELEASED 的佔位保留既有 source/reason，Rust 無需另存 request；進 manager lock 前記錄候選期限，第一個取得 op 的 release 寫入共享欄位。重複／並行 release 重用第一次期限，逾期即回 stalled。 | `wp510_review_release_cancels_placeholder_attach_before_retirement`; `wp510_lifecycle_repeated_release_uses_expired_attach_deadline`; `wp510_lifecycle_concurrent_releases_share_first_attach_deadline` |
 /// | `bind_requested`；設定與等待 `:3683-3697` | 無獨立欄位；一般 bind 以取消旗標和共用 inflight 排空。OD-63 佔位 bind 依裁決早退，不能取消或改動作業。 | `bind_with_inflight_attach_op_cancels_waits_3000ms`; `wp510_b_bind_placeholder_precedes_inflight_cancellation` |
 /// | close 成功／失敗；`_finish_attach_op` `:4320-4365` | close 成功才移除 inflight；任一取消原因的 `closed:false` 都保留阻擋，release 後續維持 `DRAIN_STALLED`。 | `wp510_review_late_placeholder_attach_completion_clears_drain_stall`; `wp510_rpc_failed_close_keeps_placeholder_drain_stalled`; `wp510_lifecycle_shutdown_cancel_fail_close_keeps_placeholder_blocked`; `wp510_lifecycle_device_path_change_cancel_fail_close_keeps_placeholder_blocked` |
@@ -200,6 +200,17 @@ static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 ///
 /// 生命週期：建立 → 開埠完成並交接，或取消後晚到並關閉；關閉成功才移除作業，`closed:false` 一律保留作業。release 找到同一作業後取消並等待首次 deadline；期限到期回 `DRAIN_STALLED`。shutdown 取消並排空同一 inflight 集合。
 /// Rust 用作業 token 與 actor 的 `PlaceholderAttachStalled/Settled` 保存 stall 診斷，對應 Python 在 manager lock 下設定 `drain_stalled` 與 `drain_timeout_epoch`。
+///
+/// TX 來源盤點（wp510 第三次整包審查 High）：佔位交接期間與交接後、進入正式 bridge 前，可能送出 TX 的來源與其取消權：
+///
+/// | TX 來源 | Fence／CancelToken 來源 | shutdown／release／bind／裝置改指時是否撤銷 |
+/// |---|---|---|
+/// | 動態偵測 PROBE 的 `\n`（`attach_dynamic` → `detect_template` → `probe_send`） | 作業的 `probe_fence`、`probe_cancel`（`AttachOp::new` 配置，`probe_send` 登錄 token） | 是：四個取消者皆呼叫 `AttachOp::cancel()`，凍結 fence 並取消 token；提交點以 `Frozen` 拒絕。 |
+/// | fallback 再解析 PROBE 的 `\n`（`reattach_existing` → `detect_template`） | 同上（同一 attach 作業） | 是（同上）。 |
+/// | ready probe／login／`post_login_cmd`（正式 bridge 的 `start_login`） | session `Entry.fence`（`create_session_locked`），TxWriter 的 cancel 屬 `IoWorker` | 正式 bridge 才有；`open_bridge` 在取預開 handle 前後各檢查 stopping，stopping 時關閉 handle、零 TX；開埠後由 actor 的 `Shutdown`／`DeviceDetached`／`Release` drain 凍結 session fence。不屬交接窗口。 |
+/// | human console 回放與按鍵（`human_tx`） | session `Entry.fence`；需該 epoch 的 IoWorker（`active_epoch`） | 正式 bridge 前沒有 worker，`human_tx` 回 `NotSubmitted`；之後同 session drain。 |
+/// | 事件引擎 | 不送 UART TX（`event_engine` 無 `TxJob` 提交點） | 不適用。 |
+/// | DETACHED-rebind（`rebind_detached` → `DeviceAttached`） | 經 actor 正式 bridge（session fence） | 佔位交接為 `dynamic_only`，不走此路徑。 |
 #[derive(Clone)]
 struct AttachOp {
     token: u64,
@@ -217,6 +228,12 @@ struct AttachOp {
     dynamic_only: bool,
     /// PROBE／device.attach 已獨占開啟的 handle；交給偵測後再由正式 bridge 接手。
     preopened: Arc<Mutex<Option<Preopened>>>,
+    /// PROBE 的提交 Fence（Python `_AttachOp.probe_bridge` 的 TX gate，`session_manager.py:4367-4372`）：作業建立即配置，
+    /// 取消者於 fence 鎖內凍結；已越過 `still_valid()` 的 PROBE 於提交點重驗即拒絕（`uart_io.py:623-627`）。
+    probe_fence: Arc<Fence>,
+    /// PROBE TxWriter 的 CancelToken（Python `begin_drain` 的 `_tx_cancel.set()`，`uart_io.py:908-918`）；
+    /// `probe_send` 登錄，取消者一併撤銷進行中的寫入。
+    probe_cancel: Arc<Mutex<Option<CancelToken>>>,
 }
 
 impl AttachOp {
@@ -230,6 +247,18 @@ impl AttachOp {
             after_clear: Arc::new(AtomicBool::new(after_clear)),
             dynamic_only,
             preopened: Arc::new(Mutex::new(preopened)),
+            probe_fence: Fence::new(),
+            probe_cancel: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// 撤銷作業（裝置改指、bind、shutdown、release 共用）：先發布取消旗標，再於 PROBE Fence 鎖內凍結、
+    /// 取消已登錄的 PROBE 寫入（Python 各取消者 `op.cancelled.set()` 後對 `op.probe_bridge.begin_drain()`）。
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.probe_fence.with(|f| f.frozen = true);
+        if let Some(token) = lock(&self.probe_cancel).as_ref() {
+            token.cancel();
         }
     }
 
@@ -998,7 +1027,7 @@ impl Shared {
                     (Some(_), None) => false,
                 };
                 if invalid {
-                    op.cancelled.store(true, Ordering::SeqCst);
+                    op.cancel();
                 }
             }
             // #100 M2/3a：離線裝置的預配 COM 釋出（#28）。
@@ -1714,7 +1743,7 @@ impl Shared {
             return;
         }
         if tpl.is_none() {
-            if let Some(t) = self.detect_template(&mut parts) {
+            if let Some(t) = self.detect_template(op, &mut parts) {
                 tpl = Some(t);
                 source = "detected";
             }
@@ -1801,13 +1830,17 @@ impl Shared {
     /// `com=PROBE` 寫入（Python PROBE bridge 的 send 同樣走 TX gate 與 WAL）。writer 於送出後原樣交回 `parts`，
     /// 維持 #51「PROBE 與正式 bridge 共用同一預開 handle」。自動 TX（`LoginProbe` 類）：WAL 不健康時由 Fence 拒絕、零 TX。
     /// 回傳是否完整送出（Python `send_command` 未拋例外；被拒或未完整時 `detect_template` 的呼叫端視為偵測失敗）。
-    fn probe_send(&self, parts: &mut HandleParts, payload: &[u8]) -> bool {
-        let fence = Fence::new();
+    ///
+    /// Fence 與 CancelToken 屬於所在 attach 作業（`AttachOp::probe_fence`／`probe_cancel`），shutdown、release、bind
+    /// 與裝置改指經 `AttachOp::cancel()` 撤銷；凍結只會由取消者設定，這裡不得解凍（wp510 第三次整包審查 High）。
+    fn probe_send(&self, op: &AttachOp, parts: &mut HandleParts, payload: &[u8]) -> bool {
+        let fence = op.probe_fence.clone();
         let frozen = self.probe_tx_frozen.load(Ordering::SeqCst);
         let wal_unhealthy = self.fanout.current();
         fence.with(|f| {
             f.active_epoch = Some(0);
-            f.frozen = frozen;
+            // Python `_register_probe_bridge` 拒絕已取消作業：取消旗標在 fence 鎖內再讀一次。
+            f.frozen = f.frozen || frozen || op.cancelled.load(Ordering::SeqCst);
             f.wal_unhealthy = wal_unhealthy;
         });
         // sol-backfill p5 #6：比照 session fence 向全域 fanout 註冊——快照讀取之後才發布的 unhealthy 也會送達；
@@ -1820,6 +1853,14 @@ impl Shared {
         let writer = std::mem::replace(&mut parts.writer, Box::new(DetachedWriter));
         let (control_tx, _control_rx) = crossbeam_channel::unbounded();
         let cancel = CancelToken::new(parts.waker.clone());
+        {
+            // 先登錄再重讀旗標：取消者若早於登錄，這裡自行取消；晚於登錄則由 `AttachOp::cancel()` 取消。
+            let mut slot = lock(&op.probe_cancel);
+            *slot = Some(cancel.clone());
+            if op.cancelled.load(Ordering::SeqCst) {
+                cancel.cancel();
+            }
+        }
         let (handle, stop, join) = spawn_tx_writer(
             PROBE_COM.to_string(),
             writer,
@@ -1854,16 +1895,17 @@ impl Shared {
         if let Ok((writer, _ledger)) = join.join() {
             parts.writer = writer;
         }
+        *lock(&op.probe_cancel) = None;
         sent
     }
 
     /// `detect_template`：送 `\n`、等待 3.0 s（Clock）、以 RX 快照依序比對候選模板的 prompt（再以 login regex 備選）。
     /// 候選排除 passthrough 與 `console_unlock_env`（Python `detect_template`）。RX／TX 以 `com=PROBE` 寫 WAL。
-    fn detect_template(&self, parts: &mut HandleParts) -> Option<ProfileTemplate> {
+    fn detect_template(&self, op: &AttachOp, parts: &mut HandleParts) -> Option<ProfileTemplate> {
         let mut buf = vec![0u8; 8192];
         // `clear_rx_buffer`：丟棄開埠後已到的舊資料（仍寫 WAL）。
         let _ = self.probe_drain(parts, &mut buf);
-        if !self.probe_send(parts, b"\n") {
+        if !self.probe_send(op, parts, b"\n") {
             // Python：`send_command("")` 拋例外 → 呼叫端 `except: detected = None`，不睡、不比對（審查 F71）。
             return None;
         }
@@ -1987,7 +2029,7 @@ impl Shared {
             let _ = op.close_parts(parts);
             return;
         }
-        let detected = self.detect_template(&mut parts);
+        let detected = self.detect_template(op, &mut parts);
         if !self.still_valid(by_id, &real, op) {
             let _ = op.close_parts(parts);
             return;
@@ -3275,7 +3317,7 @@ impl SessionManager {
             };
             // 與 `retire_released_placeholder_locked` 共用 manager lock：若 release 已取得 op，
             // 後續的 attach 收尾就不能先通過退休檢查。
-            op.cancelled.store(true, Ordering::SeqCst);
+            op.cancel();
             op.release_requested.store(true, Ordering::SeqCst);
             let deadline = {
                 let mut stored = lock(&op.release_deadline);
@@ -3450,7 +3492,7 @@ impl SessionManager {
             let io = e.io.clone();
             // #26：舊 by_id 的 attach op 進行中 → 取消並等待（上限 3000 ms）後重試；逾時 → SESSION_RECOVERING。
             if let Some(op) = inner.inflight.get(&old_by_id).cloned() {
-                op.cancelled.store(true, Ordering::SeqCst);
+                op.cancel();
                 let now = Instant::now();
                 if now >= deadline {
                     drop(inner);
@@ -3924,7 +3966,7 @@ impl SessionManager {
         let (entries, inflight): (Vec<(String, Arc<ActorHandle>)>, Vec<String>) = {
             let inner = lock(&self.shared.inner);
             for op in inner.inflight.values() {
-                op.cancelled.store(true, Ordering::SeqCst);
+                op.cancel();
             }
             (
                 inner

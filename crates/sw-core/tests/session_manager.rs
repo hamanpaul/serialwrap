@@ -1935,6 +1935,111 @@ fn wp510_lifecycle_device_path_change_cancel_fail_close_keeps_placeholder_blocke
     assert!(release_elapsed >= Duration::from_millis(2500));
 }
 
+/// PROBE TX 的 WAL 列數（`com=PROBE`、`dir=TX`）。
+fn wp510_probe_tx_rows(m: &ManagerRig) -> usize {
+    m.wal_rows()
+        .into_iter()
+        .filter(|r| {
+            s_of(r, "com").as_deref() == Some("PROBE") && s_of(r, "dir").as_deref() == Some("TX")
+        })
+        .count()
+}
+
+/// wp510 第三次整包審查 High：佔位交接後的 PROBE 已通過 `still_valid()`、尚未提交時執行 shutdown，
+/// 取消權必須落在同一 attach 作業的 PROBE Fence 上，提交點重驗即拒絕、零 TX。
+/// Python 對照：`origin/main:sw_core/session_manager.py:4367-4372` 登錄 probe bridge、`:1186-1193` shutdown
+/// 對它 `begin_drain()`；`sw_core/uart_io.py:908-918` 凍結並取消 TX、`:623-627` 於提交點以 `draining` 拒絕。
+#[test]
+fn wp510_tx_shutdown_after_still_valid_before_placeholder_probe_submit_sends_zero_tx() {
+    const SID: &str = "gone-template:COM3";
+    const BY_ID: &str = "/s/by-id/usb-G";
+    const REAL: &str = "/dev/ttyG";
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    let device = m.device(REAL);
+    m.mgr.update_devices(&m.snapshot());
+
+    let weak = std::sync::Arc::downgrade(&m.mgr);
+    let (hook_tx, hook_rx) = crossbeam_channel::bounded(4);
+    m.mgr.set_probe_pre_submit_hook_for_test(Box::new(move || {
+        if let Some(manager) = weak.upgrade() {
+            // 在 PROBE 已越過 `still_valid()`、TxWriter 提交前停機；不等待本 worker 收尾。
+            let drained = manager.shutdown(Duration::from_millis(50));
+            let _ = hook_tx.send(drained);
+        }
+    }));
+
+    let response = rpc(m.mgr.attach_released_placeholder(&sid, false));
+    assert!(is_ok(&response), "device.attach 應接受在線佔位：{response:?}");
+    let drained = hook_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("交接後的 PROBE 應在提交前觸發 shutdown");
+    assert!(
+        m.mgr.wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)),
+        "shutdown 取消的交接 worker 應收尾"
+    );
+
+    assert!(
+        drained
+            .iter()
+            .any(|(target, ok)| target == &format!("attach:{BY_ID}") && !ok),
+        "PROBE 尚在 worker 內時 shutdown 不得把交接作業列為已排空：{drained:?}"
+    );
+    assert_eq!(device.os_submits(), 0, "shutdown 後 PROBE 不得提交任何 bytes 給 OS");
+    assert!(device.take_tx().is_empty(), "shutdown 後裝置不得收到 PROBE 的 \\n");
+    assert_eq!(wp510_probe_tx_rows(&m), 0, "被撤銷的 PROBE TX 不得寫 WAL");
+    assert_eq!(device.close_count(), 1, "未交接的預開 handle 應關閉一次");
+    assert!(!device.is_open(), "shutdown 取消後不得保留預開 handle");
+    assert!(
+        m.mgr.resolve("t:COM3").is_none(),
+        "shutdown 取消後不得建立正式 session"
+    );
+}
+
+/// 同一缺陷的系統性盤點：一般熱插 dynamic attach 的 PROBE 亦須受同一作業取消。PROBE 已越過
+/// `still_valid()`、提交前裝置改指（`update_devices` 取消在途作業，Python `:4031-4043` 對 probe bridge
+/// `begin_drain()`），提交點必須拒絕、零 TX。
+#[test]
+fn wp510_tx_device_path_change_before_hotplug_probe_submit_sends_zero_tx() {
+    const BY_ID: &str = "/s/by-id/usb-F";
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    m.devices(&[BY_ID]);
+    let real = m.real_of(BY_ID);
+    m.reply_probe(&real, b"root@prpl:/# ");
+    let device = m.device(&real);
+    let changed = vec![(
+        BY_ID.to_string(),
+        DeviceInfo {
+            by_id: BY_ID.to_string(),
+            real_path: format!("{real}-rebound"),
+        },
+    )];
+
+    let weak = std::sync::Arc::downgrade(&m.mgr);
+    let (hook_tx, hook_rx) = crossbeam_channel::bounded(4);
+    m.mgr.set_probe_pre_submit_hook_for_test(Box::new(move || {
+        if let Some(manager) = weak.upgrade() {
+            manager.update_devices(&changed);
+            let _ = hook_tx.send(());
+        }
+    }));
+
+    m.mgr.update_devices(&m.snapshot());
+    hook_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("熱插的 PROBE 應在提交前觸發裝置改指");
+    assert!(
+        m.mgr.wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)),
+        "裝置改指取消的 attach worker 應收尾"
+    );
+
+    assert_eq!(device.os_submits(), 0, "裝置改指後 PROBE 不得提交任何 bytes 給 OS");
+    assert!(device.take_tx().is_empty(), "裝置改指後舊路徑不得收到 PROBE 的 \\n");
+    assert_eq!(wp510_probe_tx_rows(&m), 0, "被撤銷的 PROBE TX 不得寫 WAL");
+    assert_eq!(device.close_count(), 1, "取消後的 PROBE handle 應關閉一次");
+    assert!(!device.is_open(), "取消後不得保留舊路徑 handle");
+}
+
 #[test]
 fn wp510_lifecycle_repeated_release_uses_expired_attach_deadline() {
     const SID: &str = "gone-template:COM3";
