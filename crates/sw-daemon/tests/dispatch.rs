@@ -5893,12 +5893,16 @@ fn wp510_rpc_open_error_after_release_settles_without_handle() {
     wait_until("retry attach opens the device", || dev.open_count() == 1);
 }
 
-/// 正式 RPC 落盤回歸：退休 placeholder 的 state.json 寫入 ENOSPC 時回 EXCEPTION，關閉預開 handle，
-/// 保留 RELEASED placeholder，且不啟動 dynamic worker。
+/// 正式 RPC 落盤回歸：退休 placeholder 的 state.json 寫入 ENOSPC 時回 EXCEPTION（`_save_state` 例外穿出 RPC）。
+/// Python `attach_device` 已在 manager lock 內退休佔位（移除 session、binding、aliases，`_pending_com` 保留原 COM）
+/// 並把已開的 UART 作業留在 `_preopened_ports`（`origin/main:sw_core/session_manager.py:3590-3607`、`:3640-3653`），
+/// `_save_state()`（`:3633`）的例外不回滾記憶體、也不執行其後的 `_spawn_attach`（`:3634-3637`）：佔位不再存在、
+/// 預開 handle 不關閉、不啟動 dynamic 偵測。函式名沿用凍結鎖節點名（交接確實停止）。
 #[test]
 fn wp510_rpc_placeholder_retirement_enospc_stops_handoff() {
     let r = wp510_b_placeholder_rig();
     let dev = r.device(WP510_REAL_G);
+    let state_before = r.fs.bytes(support::STATE_PATH);
     r.fs.fail_next_atomic_write(PalError::io(
         28,
         "[Errno 28] No space left on device",
@@ -5915,15 +5919,252 @@ fn wp510_rpc_placeholder_retirement_enospc_stops_handoff() {
         "state.json ENOSPC 必須沿 RPC error 路徑傳回：{}",
         error.message
     );
-    assert_eq!(r.mgr.released_placeholder(WP510_PLACEHOLDER_SID), Some(true));
+    assert_eq!(r.mgr.released_placeholder(WP510_PLACEHOLDER_SID), None);
     assert_eq!(
-        r.mgr.resolve(WP510_PLACEHOLDER_SID).as_deref(),
-        Some(WP510_PLACEHOLDER_SID),
-        "落盤失敗後 placeholder 必須留在 manager"
+        r.mgr.resolve(WP510_PLACEHOLDER_SID),
+        None,
+        "落盤失敗不回滾：佔位已自 manager 退休"
     );
     assert_eq!(dev.open_count(), 1);
-    assert_eq!(dev.close_count(), 1, "落盤失敗後須關閉預開 handle");
+    assert_eq!(dev.close_count(), 0, "預開 handle 留在作業內，不關閉（Python `_preopened_ports`）");
+    assert!(dev.is_open(), "預開 handle 仍開啟");
     assert!(dev.tx_len() == 0, "落盤失敗不得啟動 dynamic 偵測 TX");
+    assert_eq!(r.fs.bytes(support::STATE_PATH), state_before, "寫入失敗不得改動 state.json");
+    wp510_review7_assert_retired_placeholder_queries(&r);
+}
+
+/// 落盤失敗後舊佔位的查詢、alias、bind 與 attach 結果（Python 佔位已自 `_sessions` 移除、alias 已 unassign，
+/// `origin/main:sw_core/session_manager.py:3640-3653`）：`get_session` 查無即 SESSION_NOT_FOUND
+/// （`attach_device` `:3405-3406`、`bind_session` `:3663-3665`），alias 表不再含舊 alias。
+fn wp510_review7_assert_retired_placeholder_queries(r: &ServiceRig) {
+    for selector in [WP510_PLACEHOLDER_SID, "COM3", WP510_PLACEHOLDER_ALIAS] {
+        let state = r.call(
+            "session.get_state",
+            &format!(r#"{{"selector":"{selector}"}}"#),
+        );
+        assert_eq!(s(&state, "error_code"), "SESSION_NOT_FOUND", "{selector}：{}", j(&state));
+        let bound = r.call(
+            "session.bind",
+            &format!(r#"{{"selector":"{selector}","device_by_id":"{WP510_FREE_BY_ID}"}}"#),
+        );
+        let expected_bind = sw_proto::pydict! {
+            "ok" => false,
+            "error_code" => "SESSION_NOT_FOUND",
+            "selector" => selector,
+            "version" => r.version.clone(),
+        };
+        assert_eq!(j(&bound), j(&expected_bind), "{selector}：session.bind bytes");
+        let attached = r.call("device.attach", &format!(r#"{{"selector":"{selector}"}}"#));
+        let expected_attach = sw_proto::pydict! {
+            "ok" => false,
+            "error_code" => "SESSION_NOT_FOUND",
+            "selector" => selector,
+            "version" => r.version.clone(),
+        };
+        assert_eq!(j(&attached), j(&expected_attach), "{selector}：device.attach bytes");
+    }
+    let listed = r.call("alias.list", "{}");
+    assert!(
+        !j(&listed).contains(WP510_PLACEHOLDER_ALIAS),
+        "退休後 alias 不得殘留：{}",
+        j(&listed)
+    );
+}
+
+/// 落盤失敗後下一次成功存檔寫入的是記憶體中已退休的狀態（Python `_save_state` 由記憶體重建 payload，
+/// `origin/main:sw_core/session_manager.py:1445-1471`）：舊佔位的 released、binding 與 alias 都不再出現。
+#[test]
+fn wp510_review7_rpc_retirement_enospc_next_save_persists_retirement() {
+    let r = wp510_b_placeholder_rig();
+    r.fs.fail_next_atomic_write(PalError::io(
+        28,
+        "[Errno 28] No space left on device",
+    ));
+    let _ = r.call_err(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    let before = String::from_utf8(r.fs.bytes(support::STATE_PATH)).expect("UTF-8");
+    assert!(before.contains(WP510_PLACEHOLDER_SID), "前置：磁碟仍是舊內容");
+
+    let set = r.call("alias.set", r#"{"session_id":"t:COM0","alias":"dut0"}"#);
+    assert_eq!(set.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&set));
+
+    let after = String::from_utf8(r.fs.bytes(support::STATE_PATH)).expect("UTF-8");
+    assert!(
+        !after.contains(WP510_PLACEHOLDER_SID),
+        "下一次存檔須寫入退休結果（不得復原佔位列）：{after}"
+    );
+    assert!(!after.contains(WP510_PLACEHOLDER_ALIAS), "{after}");
+    assert!(after.contains("dut0"), "{after}");
+}
+
+/// OSError 分支：佔位開埠回 OSError 後退休、`_finish_attach_op`，`_save_state()` 例外穿出 RPC，不回滾、不
+/// `_spawn_attach`（`origin/main:sw_core/session_manager.py:3529-3559`）。
+#[test]
+fn wp510_review7_rpc_oserror_handoff_retirement_enospc_does_not_roll_back() {
+    let (r, backend, _entered, dev) = wp510_b_placeholder_blocking_rig_with_open_error(Some(
+        OpenError::Other(PalError::io(5, "[Errno 5] Input/output error")),
+    ));
+    backend.release();
+    r.fs.fail_next_atomic_write(PalError::io(
+        28,
+        "[Errno 28] No space left on device",
+    ));
+
+    let error = r.call_err(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert!(error.message.contains("No space left on device"), "{}", error.message);
+    assert_eq!(r.mgr.resolve(WP510_PLACEHOLDER_SID), None, "落盤失敗不回滾");
+    assert_eq!(r.mgr.resolve("t:COM3"), None, "不得啟動 dynamic 重試");
+    assert_eq!(dev.open_attempts(), 0, "不得啟動 dynamic 重試開埠");
+    assert!(
+        !r.mgr.has_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID),
+        "OSError 分支的作業已收尾"
+    );
+    wp510_review7_assert_retired_placeholder_queries(&r);
+}
+
+/// 落盤失敗後把 COM1 改綁到該裝置：Python `bind_session` 收尾 `_spawn_attach`，`_attach_by_id` 取走
+/// `_preopened_ports` 的作業並以同一 handle 啟動 bridge（`origin/main:sw_core/session_manager.py:2955-2988`、
+/// `:4852-4854`、`:4982`、`:4996-4999`），不重新開埠。
+#[test]
+fn wp510_review7_rpc_bind_after_retirement_enospc_adopts_preopened_handle() {
+    let r = wp510_b_placeholder_rig();
+    let dev = r.device(WP510_REAL_G).clone();
+    r.fs.fail_next_atomic_write(PalError::io(
+        28,
+        "[Errno 28] No space left on device",
+    ));
+    let _ = r.call_err(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    let attempts = dev.open_attempts();
+
+    let bound = r.call(
+        "session.bind",
+        &format!(r#"{{"selector":"COM1","device_by_id":"{WP510_PLACEHOLDER_BY_ID}"}}"#),
+    );
+
+    assert_eq!(bound.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&bound));
+    r.wait_state("COM1", "READY");
+    assert_eq!(dev.open_attempts(), attempts, "沿用預開 handle，不重新開埠");
+    assert_eq!(dev.close_count(), 0);
+    assert!(
+        !r.mgr.has_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID),
+        "作業已交給正式 bridge"
+    );
+}
+
+/// 落盤失敗後再次 `_spawn_attach`（bootstrap）：`_attach_by_id` 取走 `_preopened_ports` 的作業，dynamic 偵測沿用同一
+/// handle，於保留的原 COM 建立正式 session（`origin/main:sw_core/session_manager.py:4852-4854`、`:4886-4888`）。
+#[test]
+fn wp510_review7_rpc_spawn_after_retirement_enospc_adopts_preopened_handle() {
+    let r = wp510_b_placeholder_rig();
+    let dev = r.device(WP510_REAL_G).clone();
+    // ServiceRig 的預設空行回覆是一次性；dynamic 偵測的 PROBE 會消耗它，正式 bridge 仍需 shell prompt。
+    dev.on_tx_match("^$", Box::new(|_| b"root@t:/# ".to_vec()));
+    r.fs.fail_next_atomic_write(PalError::io(
+        28,
+        "[Errno 28] No space left on device",
+    ));
+    let _ = r.call_err(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    // usb-C 亦在線且無 session：bootstrap 會與 usb-G 搶最後一個 max_sessions 名額（Python 同為依序 `_spawn_attach`）。
+    // 先把 usb-C 自快照移除，只觀察 usb-G 的接手；usb-G 的路徑不變，未消費的作業不受影響。
+    let without_free: Vec<(String, DeviceInfo)> = r
+        .mgr
+        .list_devices()
+        .into_iter()
+        .filter_map(|row| {
+            let by_id = s(&row, "by_id").to_string();
+            let real_path = s(&row, "real_path").to_string();
+            (by_id != WP510_FREE_BY_ID).then(|| (by_id.clone(), DeviceInfo { by_id, real_path }))
+        })
+        .collect();
+    r.mgr.update_devices(&without_free);
+    assert!(dev.is_open(), "usb-G 未變動，預開 handle 仍在作業內");
+    let attempts = dev.open_attempts();
+
+    r.mgr.bootstrap_attach();
+
+    r.wait_state("t:COM3", "READY");
+    assert_eq!(dev.open_attempts(), attempts, "沿用預開 handle，不重新開埠");
+    assert_eq!(dev.close_count(), 0);
+}
+
+/// 落盤失敗後裝置拔除：Python `update_devices` 取出未消費的 `_preopened_ports` 作業並關閉（`:4045-4063`）；插回後
+/// 照常 dynamic attach 重新開埠。
+#[test]
+fn wp510_review7_hotplug_after_retirement_enospc_closes_preopened_handle() {
+    let r = wp510_b_placeholder_rig();
+    let dev = r.device(WP510_REAL_G).clone();
+    r.fs.fail_next_atomic_write(PalError::io(
+        28,
+        "[Errno 28] No space left on device",
+    ));
+    let _ = r.call_err(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    let full: Vec<(String, DeviceInfo)> = r
+        .mgr
+        .list_devices()
+        .into_iter()
+        .map(|row| {
+            let by_id = s(&row, "by_id").to_string();
+            let real_path = s(&row, "real_path").to_string();
+            (by_id.clone(), DeviceInfo { by_id, real_path })
+        })
+        .collect();
+    let without: Vec<_> = full
+        .iter()
+        .filter(|(by_id, _)| by_id != WP510_PLACEHOLDER_BY_ID)
+        .cloned()
+        .collect();
+
+    r.mgr.update_devices(&without);
+
+    assert_eq!(dev.close_count(), 1, "拔除時關閉未消費的預開 handle");
+    assert!(!dev.is_open());
+    assert!(!r.mgr.has_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID));
+    let attempts = dev.open_attempts();
+    r.mgr.update_devices(&full);
+    wait_until("插回後重新開埠", || dev.open_attempts() > attempts);
+}
+
+/// 落盤失敗後 shutdown：Python `shutdown_drain` 對未消費的 `_preopened_ports` 作業執行 `_finish_attach_op` 關閉
+/// handle，關閉成功即完成、不列 stalled（`origin/main:sw_core/session_manager.py:1218-1227`）。
+#[test]
+fn wp510_review7_shutdown_after_retirement_enospc_closes_preopened_handle() {
+    let r = wp510_b_placeholder_rig();
+    let dev = r.device(WP510_REAL_G).clone();
+    r.fs.fail_next_atomic_write(PalError::io(
+        28,
+        "[Errno 28] No space left on device",
+    ));
+    let _ = r.call_err(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+
+    let drained = r.mgr.shutdown(Duration::from_millis(1500));
+
+    assert!(
+        drained
+            .iter()
+            .any(|(target, ok)| target == &format!("attach:{WP510_PLACEHOLDER_BY_ID}") && *ok),
+        "未消費的預開 handle 關閉後即排空：{drained:?}"
+    );
+    assert_eq!(dev.close_count(), 1);
+    assert!(!dev.is_open());
 }
 
 /// wp510 第四次整包審查：佔位列的 `released_by`／`released_at` 為 null（reason 保留）。

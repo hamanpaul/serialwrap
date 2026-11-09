@@ -206,15 +206,6 @@ struct Entry {
     history: Arc<Mutex<Vec<String>>>,
 }
 
-/// 尚未完成持久化的 placeholder 退休資料；commit 失敗時原樣放回 manager。
-struct RetiredPlaceholder {
-    entry: Entry,
-    index: usize,
-    previous_pending_com: Option<String>,
-    previous_probe_path: Option<String>,
-    previous_interactive: Vec<(String, String)>,
-}
-
 static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// Python `sw_core/session_manager.py:412-429` 的 `_AttachOp` 對照：
@@ -254,7 +245,7 @@ static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// | 持有位置 | `closed:false` 的處理 | shutdown 排空判定 | release 排空判定 |
 /// |---|---|---|---|
 /// | ① 佔位 `device.attach` 開埠在途（作業已登錄 `inflight`，`open_exclusive` 尚未返回） | 返回後失效：`AttachOp::close_parts` 記 `close_failed`，`finish_attach_op` 保留作業 | `attach:<by_id>` 為 false | 佔位 release 等同一作業至期限回 DRAIN_STALLED |
-/// | ② 退休後、worker 接手前（`AttachOp::preopened`） | 持久化失敗／worker 收尾經 `close_preopened_with_receipt` → `finish_attach_op` 保留 | 同上 | 舊佔位已退休、正式 session 尚未建立，無 release 對象；作業留在 `inflight` 擋後續 attach 與佔位交接 |
+/// | ② 退休後、worker 接手前（`AttachOp::preopened`） | worker 收尾經 `close_preopened_with_receipt` → `finish_attach_op` 保留；退休落盤失敗時作業以 `parked` 留著、不關閉（Python `_preopened_ports`），shutdown 收尾關閉並依回條保留 | 同上 | 舊佔位已退休、正式 session 尚未建立，無 release 對象；作業留在 `inflight`，parked 者由之後的 attach／bind 接手或拔除時關閉 |
 /// | ③ attach worker 偵測中（`attach_dynamic`／`reattach_existing` 的區域 `HandleParts`） | 一律經 `AttachOp::close_parts`，worker 結束時 `finish_attach_op` 保留 | 同上 | 一般 session 的 release 遇 `close_failed` 作業回 DRAIN_STALLED |
 /// | ④ 交給 session、正式 bridge 接手前（`SessionIo::preopened`），`open_bridge` 於 stopping、configure 失敗、路徑不符時關閉 | `close_before_bridge` 告警並 `retain_unconfirmed_close`（作業留在 `inflight`）；回 `OpenFailure::CloseUnconfirmed`，actor 的 pending stop 保持 stalled（`pending_open_close_unconfirmed`），不交 `finish_pending_open_stop` | 末段重收 `attach:<by_id>` 為 false；session 的 shutdown 等待者不回覆亦為 false | pending release 回 DRAIN_STALLED；之後的 release 經 `close_failed` 作業回 DRAIN_STALLED |
 /// | ⑤ `open_bridge` 開埠返回時已 stopping（重組的預開或新開 handle） | 同 ④ | 同 ④ | 同 ④ |
@@ -322,6 +313,11 @@ struct AttachOp {
     dynamic_only: bool,
     /// PROBE／device.attach 已獨占開啟的 handle；交給偵測後再由正式 bridge 接手。
     preopened: Arc<Mutex<Option<Preopened>>>,
+    /// 未消費的預開作業（Python 留在 `_preopened_ports`、沒有 worker）：佔位退休落盤失敗後 `_spawn_attach` 未執行
+    /// （`origin/main:sw_core/session_manager.py:3633-3637`）。之後由 `spawn_attach_with`／bind 取走 handle 接手
+    /// （`_attach_by_id` `:4852-4854`），裝置拔除或改指時關閉（`update_devices` `:4045-4063`），shutdown 收尾關閉
+    /// （`shutdown_drain` `:1218-1227`）。取用者以 `swap(false)` 認領，只會有一個。
+    parked: Arc<AtomicBool>,
     /// PROBE 的提交 Fence（Python `_AttachOp.probe_bridge` 的 TX gate，`session_manager.py:4367-4372`）：作業建立即配置，
     /// 取消者於 fence 鎖內凍結；已越過 `still_valid()` 的 PROBE 於提交點重驗即拒絕（`uart_io.py:623-627`）。
     probe_fence: Arc<Fence>,
@@ -351,6 +347,7 @@ impl AttachOp {
             after_clear: Arc::new(AtomicBool::new(after_clear)),
             dynamic_only,
             preopened: Arc::new(Mutex::new(preopened)),
+            parked: Arc::new(AtomicBool::new(false)),
             probe_fence: Fence::new(),
             probe_cancel: Arc::new(Mutex::new(None)),
         }
@@ -1195,6 +1192,7 @@ impl Shared {
 
     fn update_devices(self: &Arc<Self>, snapshot: &[(String, DeviceInfo)]) {
         let new: BTreeMap<String, DeviceInfo> = snapshot.iter().cloned().collect();
+        let mut unconsumed: Vec<(String, AttachOp)> = Vec::new();
         let prev = {
             let mut inner = lock(&self.inner);
             if inner.stopping {
@@ -1220,13 +1218,29 @@ impl Shared {
                 };
                 if invalid {
                     op.cancel();
+                    if op.parked.swap(false, Ordering::SeqCst) {
+                        unconsumed.push((by_id.clone(), op.clone()));
+                    }
                 }
+            }
+            // Python `update_devices` 先把未消費的 `_preopened_ports` 作業移出表、再關閉（關閉失敗只告警，不保留阻擋；
+            // `origin/main:sw_core/session_manager.py:4045-4063`）。
+            for (by_id, _) in &unconsumed {
+                inner.inflight.remove(by_id);
             }
             // #100 M2/3a：離線裝置的預配 COM 釋出（#28）。
             let online: HashSet<String> = inner.devices.keys().cloned().collect();
             inner.pending_com.retain(|b, _| online.contains(b));
             prev
         };
+        if !unconsumed.is_empty() {
+            for (by_id, op) in unconsumed {
+                if let Some(pre) = op.take_preopened() {
+                    self.close_session_preopened(&by_id, pre);
+                }
+            }
+            self.cv.notify_all();
+        }
         // Python `_mark_missing_devices_locked`（審查 F60）：與 Python 同在 detach／attach 之前標記。
         let missing: Vec<String> = {
             let inner = lock(&self.inner);
@@ -1302,7 +1316,7 @@ impl Shared {
         by_id: &str,
         after_clear: bool,
         dynamic_only: bool,
-        preopened: Option<Preopened>,
+        mut preopened: Option<Preopened>,
     ) {
         let released = self.released_by_ids();
         let pins = self.model_snapshot().profile_pins;
@@ -1342,6 +1356,19 @@ impl Shared {
             }
             return;
         }
+        if inner
+            .inflight
+            .get(by_id)
+            .is_some_and(|op| op.parked.swap(false, Ordering::SeqCst))
+        {
+            // 未消費的預開作業（佔位退休落盤失敗留下）：Python `_attach_by_id` 先自 `_preopened_ports` 取走作業，以同一
+            // handle 續行 attach（`origin/main:sw_core/session_manager.py:4852-4854`）。
+            let parked = inner.inflight.remove(by_id).and_then(|op| op.take_preopened());
+            if let Some(pre) = preopened.take() {
+                let _ = pre.parts.close();
+            }
+            preopened = parked;
+        }
         if let Some(op) = inner.inflight.get(by_id) {
             if after_clear {
                 op.after_clear.store(true, Ordering::SeqCst);
@@ -1366,11 +1393,18 @@ impl Shared {
                 .is_some_and(|t| t.profile_name != e.profile.template.profile_name);
             let needs_reresolve = e.profile_source != "yaml-target"
                 && (pin_differs || (e.profile_source == "fallback" && !self.templates.is_empty()));
-            if !needs_reresolve {
+            if !needs_reresolve || preopened.is_some() {
                 let actor = e.actor.clone();
+                let io = e.io.clone();
                 drop(inner);
                 if let Some(pre) = preopened {
-                    let _ = pre.parts.close();
+                    // 接手的預開 handle 交給 session 的正式 bridge（Python `_attach_by_id` 以 `preopened_op.port` 建
+                    // bridge，`:4982`）；路徑已改變者關閉。只有未消費的預開作業會帶 handle 進來。
+                    if pre.real_path == real {
+                        *lock(&io.preopened) = Some(pre);
+                    } else {
+                        self.close_session_preopened(by_id, pre);
+                    }
                 }
                 let _ = actor.control.send(ControlEvent::DeviceAttached {
                     by_id: by_id.to_string(),
@@ -1481,7 +1515,7 @@ impl Shared {
             detached.sort_by_key(|(_, act)| *act);
             if let Some((sid, _)) = detached.into_iter().next() {
                 if !op.cancelled.load(Ordering::SeqCst) {
-                    self.rebind_detached(&sid, by_id);
+                    self.rebind_detached(&sid, by_id, op);
                 }
                 return;
             }
@@ -1501,8 +1535,10 @@ impl Shared {
         self.attach_dynamic(by_id, op);
     }
 
-    /// DETACHED-rebind：改綁 session 到新 by_id，寫 binding override，然後 attach。
-    fn rebind_detached(self: &Arc<Self>, sid: &str, by_id: &str) {
+    /// DETACHED-rebind：改綁 session 到新 by_id，寫 binding override，然後 attach。作業帶有預開 handle（接手的未消費
+    /// 預開作業）時交給該 session 的正式 bridge（Python `_attach_by_id` 改綁後沿用 `preopened_op`，
+    /// `origin/main:sw_core/session_manager.py:4857-4866`、`:4982`）。
+    fn rebind_detached(self: &Arc<Self>, sid: &str, by_id: &str, op: &AttachOp) {
         let r = self.request(
             sid,
             SessionRequest::Bind {
@@ -1518,6 +1554,9 @@ impl Shared {
             if let Some(e) = inner.sessions.get_mut(sid) {
                 e.profile.device_by_id = by_id.to_string();
                 lock(&e.io.profile).device_by_id = by_id.to_string();
+                if let Some(pre) = op.take_preopened() {
+                    *lock(&e.io.preopened) = Some(pre);
+                }
             }
         }
         if let Err(e) = self.commit_sync(|m| {
@@ -1730,12 +1769,14 @@ impl Shared {
                 public.insert("released_at", PyValue::Null);
                 public.insert("released_reason", PyValue::Null);
 
-                if let Err(error) = self.persist_placeholder_retirement(sid) {
-                    self.restore_released_placeholder(sid, &by_id, retired);
+                // Python `:3554-3556`：先 `_finish_attach_op`，`_save_state()` 例外穿出 RPC；記憶體中的退休不回滾，
+                // 其後的 `_spawn_attach`（`:3557-3558`）不執行（未放行的 worker 於返回時 drop）。
+                let persisted = self.persist_placeholder_retirement(sid);
+                if persisted.is_err() {
                     self.finish_attach_op(&by_id, &op, None);
-                    return Err(error);
                 }
-                self.stop_retired_placeholder_actor(sid, &retired.entry);
+                self.stop_retired_placeholder_actor(sid, &retired);
+                persisted?;
                 // Python `_spawn_attach(by_id, dynamic_only=True)` 會以原 COM 重試 dynamic。
                 // 保留目前 inflight op，避免 watcher 在退休與重試之間搶先建立一般 attach。
                 worker.start();
@@ -1774,12 +1815,28 @@ impl Shared {
         public.insert("released_reason", PyValue::Null);
 
         if let Err(error) = self.persist_placeholder_retirement(sid) {
-            self.restore_released_placeholder(sid, &by_id, retired);
-            let close_receipt = op.close_preopened_with_receipt();
-            self.finish_attach_op(&by_id, &op, close_receipt);
+            // Python `:3633`：`_save_state()` 例外穿出 RPC，鎖內已完成的退休（`:3590-3607`）不回滾，已開的 UART 作業
+            // 留在 `_preopened_ports`、不執行 `_spawn_attach`（`:3634-3637`）。作業以 parked 留在 `inflight`；與
+            // shutdown／拔除同在 manager 鎖內判定，已 stopping、已取消或裝置已改變時照 Python 的收尾直接關閉
+            // （`shutdown_drain` `:1218-1227`、`update_devices` `:4045-4063`）。
+            let park = {
+                let inner = lock(&self.inner);
+                let park = !inner.stopping
+                    && !op.cancelled.load(Ordering::SeqCst)
+                    && inner.device_path(&by_id) == Some(real.as_str());
+                if park {
+                    op.parked.store(true, Ordering::SeqCst);
+                }
+                park
+            };
+            if !park {
+                let close_receipt = op.close_preopened_with_receipt();
+                self.finish_attach_op(&by_id, &op, close_receipt);
+            }
+            self.stop_retired_placeholder_actor(sid, &retired);
             return Err(error);
         }
-        self.stop_retired_placeholder_actor(sid, &retired.entry);
+        self.stop_retired_placeholder_actor(sid, &retired);
 
         worker.start();
         Ok(pydict! { "ok" => true, "session" => public })
@@ -1853,7 +1910,9 @@ impl Shared {
         self.cv.notify_all();
     }
 
-    /// 鎖內退休已獨占開埠的佔位，將同一 handle 留給 dynamic-only attach worker。
+    /// 鎖內退休已獨占開埠的佔位，將同一 handle 留給 dynamic-only attach worker；回傳已移出索引的佔位 entry。
+    /// Python `_retire_released_placeholder_locked`（`origin/main:sw_core/session_manager.py:3640-3653`）與
+    /// `_pending_com[by_id] = com`（`:3606`、`:3548`）：之後的存檔失敗不回滾（`:3633`、`:3556`）。
     fn retire_released_placeholder_locked(
         inner: &mut Inner,
         sid: &str,
@@ -1861,7 +1920,7 @@ impl Shared {
         real: &str,
         op: &AttachOp,
         parts: Option<&mut Option<HandleParts>>,
-    ) -> Option<RetiredPlaceholder> {
+    ) -> Option<Entry> {
         let valid = !inner.stopping
             && !op.cancelled.load(Ordering::SeqCst)
             && inner.device_path(by_id) == Some(real)
@@ -1876,18 +1935,11 @@ impl Shared {
             return None;
         }
 
-        let index = inner.sessions.get_index_of(sid).expect("已驗證佔位 entry 索引");
         let entry = inner.sessions.shift_remove(sid).expect("已驗證佔位 entry");
-        let previous_pending_com = inner
+        inner
             .pending_com
             .insert(by_id.to_string(), entry.profile.com.clone());
-        let previous_probe_path = inner.probe_paths.remove(sid);
-        let previous_interactive: Vec<(String, String)> = inner
-            .interactive
-            .iter()
-            .filter(|(_, owner)| owner.as_str() == sid)
-            .map(|(id, owner)| (id.clone(), owner.clone()))
-            .collect();
+        inner.probe_paths.remove(sid);
         inner.interactive.retain(|_, owner| owner != sid);
         if let Some(parts) = parts {
             *lock(&op.preopened) = Some(Preopened {
@@ -1895,42 +1947,16 @@ impl Shared {
                 parts: parts.take().expect("成功開埠後須交付預開 handle"),
             });
         }
-        Some(RetiredPlaceholder {
-            entry,
-            index,
-            previous_pending_com,
-            previous_probe_path,
-            previous_interactive,
-        })
+        Some(entry)
     }
 
-    /// state.json commit 失敗時恢復原佔位索引與其 COM 預留，並保持舊 actor 存活。
-    fn restore_released_placeholder(&self, sid: &str, by_id: &str, retired: RetiredPlaceholder) {
-        let mut inner = lock(&self.inner);
-        match retired.previous_pending_com {
-            Some(com) => {
-                inner.pending_com.insert(by_id.to_string(), com);
-            }
-            None => {
-                inner.pending_com.remove(by_id);
-            }
-        }
-        if let Some(path) = retired.previous_probe_path {
-            inner.probe_paths.insert(sid.to_string(), path);
-        }
-        for (interactive_id, owner) in retired.previous_interactive {
-            inner.interactive.insert(interactive_id, owner);
-        }
-        let index = retired.index.min(inner.sessions.len());
-        inner.sessions.shift_insert(index, sid.to_string(), retired.entry);
-    }
-
-    /// 持久化移除舊佔位的 released、binding 與 aliases，保留 pin／detected。
+    /// 持久化移除舊佔位的 released、binding 與 aliases，保留 pin／detected。記憶體 model 先套用再存檔；存檔失敗
+    /// 不還原（Python `_retire_released_placeholder_locked` 已改記憶體，`_save_state()` 例外不回滾，
+    /// `origin/main:sw_core/session_manager.py:3640-3653`、`:1445-1471`），下一次成功存檔即寫入退休結果。
     fn persist_placeholder_retirement(&self, sid: &str) -> Result<(), PyErr> {
         let old_sid = sid.to_string();
         let (tx, rx) = crossbeam_channel::bounded(1);
         let mut model = lock(&self.model);
-        let previous = model.clone();
         {
             model.apply(StateDelta::Unreleased {
                 sid: old_sid.clone(),
@@ -1959,11 +1985,7 @@ impl Shared {
                 "state store 已停止",
             ))
         });
-        if let Err(error) = result {
-            *model = previous;
-            return Err(commit_error(&error));
-        }
-        Ok(())
+        result.map_err(|error| commit_error(&error))
     }
 
     /// 舊 actor 已自 manager 索引退休；只在 manager 鎖外通知並等待它退出。
@@ -3895,6 +3917,28 @@ impl SessionManager {
             })
             .map_err(|e| commit_error(&e))?;
         if has_device {
+            // 改綁目標若有未消費的預開作業（佔位退休落盤失敗留下）：Python `bind_session` 收尾 `_spawn_attach`，
+            // `_attach_by_id` 取走 `_preopened_ports` 的作業並以同一 handle 建 bridge（`origin/main:sw_core/session_manager.py:4852-4854`、
+            // `:4982`），因此把 handle 交給本 session 的正式 bridge，不重新開埠。
+            let parked = {
+                let mut inner = lock(&self.shared.inner);
+                let claimed = inner
+                    .inflight
+                    .get(&by_id)
+                    .is_some_and(|op| op.parked.swap(false, Ordering::SeqCst));
+                let op = if claimed { inner.inflight.remove(&by_id) } else { None };
+                op.map(|op| (op, inner.device_path(&by_id).map(str::to_string)))
+            };
+            if let Some((op, current)) = parked {
+                if let Some(pre) = op.take_preopened() {
+                    if current.as_deref() == Some(pre.real_path.as_str()) {
+                        *lock(&io.preopened) = Some(pre);
+                    } else {
+                        self.shared.close_session_preopened(&by_id, pre);
+                    }
+                }
+                self.shared.cv.notify_all();
+            }
             // Python：裝置在線 → 回覆前活 session 即 ATTACHING、last_error None，再 spawn attach。
             // 經請求通道的 DeviceOnline 套用並回覆活 session（審查 F70：不得只改回應副本）。
             let real = lock(&self.shared.inner).device_path(&by_id).map(str::to_string);
@@ -4355,7 +4399,12 @@ impl SessionManager {
     pub fn shutdown(&self, budget: Duration) -> Vec<(String, bool)> {
         self.begin_shutdown();
         let deadline = Instant::now() + budget;
-        let (entries, inflight): (Vec<(String, Arc<ActorHandle>)>, Vec<String>) = {
+        type ShutdownTargets = (
+            Vec<(String, Arc<ActorHandle>)>,
+            Vec<String>,
+            Vec<(String, AttachOp)>,
+        );
+        let (entries, inflight, unconsumed): ShutdownTargets = {
             let inner = lock(&self.shared.inner);
             for op in inner.inflight.values() {
                 op.cancel();
@@ -4367,8 +4416,20 @@ impl SessionManager {
                     .map(|e| (e.sid.clone(), e.actor.clone()))
                     .collect(),
                 inner.inflight.keys().cloned().collect(),
+                inner
+                    .inflight
+                    .iter()
+                    .filter(|(_, op)| op.parked.swap(false, Ordering::SeqCst))
+                    .map(|(by_id, op)| (by_id.clone(), op.clone()))
+                    .collect(),
             )
         };
+        // Python `shutdown_drain` 對未消費的 `_preopened_ports` 作業直接 `_finish_attach_op`（關閉 handle；關閉失敗保留作業、
+        // 列為 stalled，`origin/main:sw_core/session_manager.py:1218-1227`、`:1231-1239`）。
+        for (by_id, op) in unconsumed {
+            let receipt = op.close_preopened_with_receipt();
+            self.shared.finish_attach_op(&by_id, &op, receipt);
+        }
         let mut waits: Vec<(String, Option<Receiver<Result<PyDict, PyErr>>>)> = Vec::new();
         for (sid, actor) in entries {
             let remaining = deadline.saturating_duration_since(Instant::now());

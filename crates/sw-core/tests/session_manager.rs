@@ -2775,6 +2775,10 @@ fn wp510_review_open_failure_after_release_clears_drain_stall() {
     }
 }
 
+/// 退休落盤 ENOSPC：Python `attach_device` 已在 manager lock 內退休佔位並把已開的 UART 作業留在 `_preopened_ports`
+/// （`origin/main:sw_core/session_manager.py:3590-3607`、`:3640-3653`），`_save_state()`（`:3633`）例外穿出、不回滾記憶體、
+/// 不 `_spawn_attach`（`:3634-3637`）：佔位不再存在（磁碟因寫入失敗仍是舊內容），預開 handle 不關閉、不偵測。
+/// 函式名沿用凍結鎖節點名（交接確實停止；「keeps_placeholder」指磁碟上的舊列）。
 #[test]
 fn wp510_b_retirement_persist_enospc_keeps_placeholder_and_stops_handoff() {
     const SID: &str = "gone-template:COM3";
@@ -2792,11 +2796,12 @@ fn wp510_b_retirement_persist_enospc_keeps_placeholder_and_stops_handoff() {
     std::thread::sleep(Duration::from_millis(100));
 
     assert!(response.is_err(), "退休落盤 ENOSPC 必須向上回錯：{response:?}");
-    assert_eq!(m.mgr.resolve(SID).as_deref(), Some(SID), "失敗後佔位仍須保留");
-    assert_eq!(m.mgr.released_placeholder(SID), Some(true));
-    assert!(m.load_state_now().released.contains_key(SID), "磁碟 RELEASED 阻擋必須保留");
+    assert_eq!(m.mgr.resolve(SID), None, "落盤失敗不回滾：佔位已退休");
+    assert_eq!(m.mgr.released_placeholder(SID), None);
+    assert!(m.load_state_now().released.contains_key(SID), "寫入失敗，磁碟仍是舊的 RELEASED 列");
     assert_eq!(m.serial.open_attempts(REAL), 1, "不得啟動 dynamic worker 重開埠");
-    assert_eq!(device.close_count(), 1, "落盤失敗後須關閉預開 handle");
+    assert_eq!(device.close_count(), 0, "預開 handle 留在作業內，不關閉");
+    assert!(device.is_open(), "預開 handle 仍開啟");
     assert!(device.take_tx().is_empty(), "落盤失敗不得啟動偵測 TX");
 }
 
