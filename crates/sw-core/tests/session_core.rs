@@ -418,6 +418,54 @@ fn auto_reprobe_ready_result_survives_temporary_handoff_freeze() {
     assert!(has_session_ready(&effects), "probe 結果套用後應發布 SessionReady");
 }
 
+/// P8-1533cb5-1：背景 TX 的 OS 提交持 TX fence 鎖（`FenceSubmitGate`）期間，actor 判定交接凍結狀態不得等待該鎖；
+/// admission 未凍結時 `GetState` 須立即回覆。Python 的 `_handoff_frozen` 由 manager 鎖保護、不經 bridge 的 TX fence
+/// （origin/main `sw_core/session_manager.py:1146-1172`），`handoff_stop` 的 session 查詢因此不被在途寫入拖住，
+/// 才能由有期限的 TX fence 收斂回 `ops:["tx.in_flight"]`（`tests/test_stage0_handoff_stop.py:372`）。
+#[test]
+fn get_state_does_not_wait_for_tx_fence_held_by_os_submit() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let fence = h.fence.clone();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    // 模擬 OS 提交：持 fence 鎖直到測試放行（最多 2 s，確保紅燈時不會永久卡住）。
+    let holder = std::thread::spawn(move || {
+        fence.with(|_| {
+            locked_tx.send(()).expect("通知已持 fence 鎖");
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        });
+    });
+    locked_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("模擬的 OS 提交應取得 fence 鎖");
+    let started = std::time::Instant::now();
+    let response = h.rpc(SessionRequest::GetState).expect("GetState 回覆");
+    let elapsed = started.elapsed();
+    let _ = release_tx.send(());
+    holder.join().expect("fence 持鎖 thread");
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "GetState 不得等待 OS 提交持有的 TX fence 鎖：耗時 {elapsed:?}"
+    );
+    let session = response.get("session").expect("session 快照");
+    assert_eq!(session.get("state"), Some(&PyValue::from("READY")));
+}
+
+/// P8-1533cb5-1 的語意保留：不取 fence 鎖讀取交接旗標後，fence 已帶 `handoff_frozen`、admission 未凍結者仍視為永久凍結
+/// （不排自動重探）；旗標撤銷後照常重探。
+#[test]
+fn fence_handoff_flag_without_admission_freeze_still_blocks_auto_reprobe() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_attached(Some("PROMPT_UNAVAILABLE"));
+    h.fence.with(|fence| fence.handoff_frozen = true);
+    let frozen = h.advance(Duration::from_secs(1));
+    assert!(!has_start_login(&frozen), "fence 交接凍結期間不得啟動自動重探");
+    h.fence.with(|fence| fence.handoff_frozen = false);
+    let thawed = h.advance(Duration::from_secs(1));
+    assert!(has_start_login(&thawed), "fence 交接凍結撤銷後應照常自動重探");
+}
+
 #[test]
 fn force_recover_poll_replies_after_permanent_handoff_freeze() {
     let mut h = CoreHarness::new(SHELL_PROFILE);

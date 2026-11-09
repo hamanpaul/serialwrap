@@ -196,7 +196,9 @@ impl FenceState {
     }
 }
 
-pub struct Fence(Mutex<FenceState>);
+/// TX fence：`0` 為 fence 狀態（OS 提交在其鎖內進行，見 [`FenceSubmitGate`]）；`1` 為 `handoff_frozen` 的不取鎖鏡像
+/// （每次 [`Fence::with`]／[`Fence::try_with`] 結束前於鎖內發布，見 [`Fence::handoff_frozen_published`]）。
+pub struct Fence(Mutex<FenceState>, AtomicBool);
 
 impl Fence {
     pub fn new() -> Arc<Fence> {
@@ -220,7 +222,20 @@ impl Fence {
             flash_critical: false,
             bridge_passthrough: false,
             handoff_frozen: false,
-        })))
+        }), AtomicBool::new(false)))
+    }
+
+    /// P8-1533cb5-1：不取 fence 鎖讀取 `handoff_frozen`（OS 提交持鎖期間也立即回傳）。
+    ///
+    /// 鏡像在每次 [`Fence::with`]／[`Fence::try_with`] 結束前、仍持鎖時發布，故等於最近一次釋放鎖時的欄位值；
+    /// [`FenceSubmitGate`] 持鎖期間不改此欄位。只供 actor 的交接生命週期判定（對齊 Python `_handoff_frozen` 由 manager
+    /// 鎖保護、不經 bridge TX fence）；TX 放行一律以鎖內的 [`Fence::admit`] 為準。
+    pub fn handoff_frozen_published(&self) -> bool {
+        self.1.load(Ordering::SeqCst)
+    }
+
+    fn publish_handoff_frozen(&self, state: &FenceState) {
+        self.1.store(state.handoff_frozen, Ordering::SeqCst);
     }
 
     /// P8 Task 14：交接凍結（Python `UARTBridge.freeze_tx`）：取得 fence 鎖時設 `handoff_frozen`（此後任何來源的新 TX
@@ -272,7 +287,9 @@ impl Fence {
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        f(&mut state)
+        let out = f(&mut state);
+        self.publish_handoff_frozen(&state);
+        out
     }
 
     pub fn admit(st: &FenceState, p: &TxPermit) -> Result<(), FenceReject> {
@@ -367,14 +384,14 @@ impl Fence {
 
     /// try_lock；鎖被持有時回 `None`（鎖持有斷言用）。
     pub fn try_with<R>(&self, f: impl FnOnce(&mut FenceState) -> R) -> Option<R> {
-        match self.0.try_lock() {
-            Ok(mut state) => Some(f(&mut state)),
-            Err(TryLockError::Poisoned(poisoned)) => {
-                let mut state = poisoned.into_inner();
-                Some(f(&mut state))
-            }
-            Err(TryLockError::WouldBlock) => None,
-        }
+        let mut state = match self.0.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return None,
+        };
+        let out = f(&mut state);
+        self.publish_handoff_frozen(&state);
+        Some(out)
     }
 }
 

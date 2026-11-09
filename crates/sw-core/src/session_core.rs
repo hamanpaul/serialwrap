@@ -3929,12 +3929,15 @@ impl SessionCore {
         }
     }
 
+    /// 交接凍結的生命週期（每個事件分派前判定）。fence 的 `handoff_frozen` 以不取鎖的鏡像讀取：背景 TX 的 OS 提交持
+    /// fence 鎖期間，actor 仍須回覆查詢，`handoff_stop` 才能由有期限的 TX fence 收斂判定在途寫入（P8-1533cb5-1；
+    /// Python `_handoff_frozen` 由 manager 鎖保護、不經 bridge TX fence）。
     fn handoff_freeze_state(&self) -> crate::admission::HandoffFreezeState {
         use crate::admission::HandoffFreezeState;
 
         let admission = self.deps.registry.admission_gate();
         let mut state = admission.handoff_freeze_state();
-        if state == HandoffFreezeState::Open && self.deps.fence.with(|fence| fence.handoff_frozen) {
+        if state == HandoffFreezeState::Open && self.deps.fence.handoff_frozen_published() {
             state = admission.handoff_freeze_state();
             if state == HandoffFreezeState::Open {
                 state = HandoffFreezeState::Permanent;
