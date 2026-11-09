@@ -795,11 +795,15 @@ pub fn observe_no_task_restart(
 
     let final_task_state = ctl.query_named(&SupervisionMode::WindowsTask, task);
     if !matches!(final_task_state, TaskQuery::NotRunning(_)) {
-        return Err(format!("90 秒觀察窗結束時排程工作狀態不是 NotRunning：{final_task_state:?}"));
+        return Err(format!(
+            "90 秒觀察窗結束時排程工作狀態不是 NotRunning：{final_task_state:?}"
+        ));
     }
     let final_process_pids = staging_exe_pids(env, exe)?;
     if !final_process_pids.is_empty() {
-        return Err(format!("90 秒觀察窗結束時仍有 staging daemon 行程：{final_process_pids:?}"));
+        return Err(format!(
+            "90 秒觀察窗結束時仍有 staging daemon 行程：{final_process_pids:?}"
+        ));
     }
 
     Ok(NoRestartObservation {

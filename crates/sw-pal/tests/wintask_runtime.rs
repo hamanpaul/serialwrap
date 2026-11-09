@@ -129,13 +129,12 @@ fn cap_supervisor_runtime__task_pt0s_restart_and_graceful_stop() {
 
     let started = ctl.action_named(&w, &name, ServiceAction::Start, false);
     assert!(started.ok, "正式 service start（/Run）失敗：{started:?}");
-    let pid1 =
-        try_wait_new_daemon_pid(spec.port, pid0, Duration::from_secs(20)).unwrap_or_else(|| {
-            panic!(
-                "正式 service start 後 20 s 內沒有新的 daemon pid（舊 pid {pid0}）\ndaemon.log：{}",
-                spec.log_tail(4000)
-            )
-        });
+    let pid1 = try_wait_new_daemon_pid(spec.port, pid0, Duration::from_secs(20)).unwrap_or_else(|| {
+        panic!(
+            "正式 service start 後 20 s 內沒有新的 daemon pid（舊 pid {pid0}）\ndaemon.log：{}",
+            spec.log_tail(4000)
+        )
+    });
     checked(pid1, "service start 恢復後");
 
     let r = formal_service_stop(&*p.env, &harness, &spec, &name)
