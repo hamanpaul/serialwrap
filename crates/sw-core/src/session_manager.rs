@@ -245,7 +245,7 @@ static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// | 持有位置 | `closed:false` 的處理 | shutdown 排空判定 | release 排空判定 |
 /// |---|---|---|---|
 /// | ① 佔位 `device.attach` 開埠在途（作業已登錄 `inflight`，`open_exclusive` 尚未返回） | 返回後失效：`AttachOp::close_parts` 記 `close_failed`，`finish_attach_op` 保留作業 | `attach:<by_id>` 為 false | 佔位 release 等同一作業至期限回 DRAIN_STALLED |
-/// | ② 退休後、worker 接手前（`AttachOp::preopened`） | worker 收尾經 `close_preopened_with_receipt` → `finish_attach_op` 保留；退休落盤失敗時作業以 `parked` 留著、不關閉（Python `_preopened_ports`），shutdown 收尾關閉並依回條保留 | 同上 | 舊佔位已退休、正式 session 尚未建立，無 release 對象；作業留在 `inflight`，parked 者由之後的 attach／bind 接手或拔除時關閉；以該 by_id 為舊綁定的 bind 重試時由 `close_parked_for_bind` 關閉（確認即移除；未確認則登記阻擋並移出 `inflight`，Python `bind_session` `:3680-3694`、`:3727`） |
+/// | ② 退休後、worker 接手前（`AttachOp::preopened`） | worker 收尾經 `close_preopened_with_receipt` → `finish_attach_op` 保留；退休落盤失敗時作業以 `parked` 留著、不關閉（Python `_preopened_ports`），shutdown 收尾關閉並依回條保留 | 同上 | 舊佔位已退休、正式 session 尚未建立，無 release 對象；作業留在 `inflight`，parked 者由之後的 attach／bind 接手或拔除時關閉；以該 by_id 為舊綁定的 bind 重試時由 `close_parked_for_bind` 關閉後移出 `inflight`；Python 已先取出作業（`bind_session` `:3681`），關閉未確認只告警、不登記阻擋（`:4322-4332`、`:3727`） |
 /// | ③ attach worker 偵測中（`attach_dynamic`／`reattach_existing` 的區域 `HandleParts`） | 一律經 `AttachOp::close_parts`，worker 結束時 `finish_attach_op` 保留 | 同上 | 一般 session 的 release 遇 `close_failed` 作業回 DRAIN_STALLED |
 /// | ④ 交給 session、正式 bridge 接手前（`SessionIo::preopened`），`open_bridge` 於 stopping、configure 失敗、路徑不符時關閉 | `close_before_bridge` 告警並 `retain_unconfirmed_close`（作業留在 `inflight`）；回 `OpenFailure::CloseUnconfirmed`，actor 的 pending stop 保持 stalled（`pending_open_close_unconfirmed`），不交 `finish_pending_open_stop` | 末段重收 `attach:<by_id>` 為 false；session 的 shutdown 等待者不回覆亦為 false | pending release 回 DRAIN_STALLED；之後的 release 經 `close_failed` 作業回 DRAIN_STALLED |
 /// | ⑤ `open_bridge` 開埠返回時已 stopping（重組的預開或新開 handle） | 同 ④ | 同 ④ | 同 ④ |
@@ -268,7 +268,7 @@ static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// | ①②③ attach 作業關閉未確認 | `AttachOp::mark_close_failed`（`close_parts`、`finish_attach_op` 帶入的回條） | `_finish_attach_op` 關閉失敗保留作業 `:4320-4332` |
 /// | ④⑤ 正式 bridge 接手前關閉未確認 | `close_before_bridge` → `retain_unconfirmed_close` | `bridge.start()` 失敗經 `_track_attach_bridge_stop` 納入 `_draining_by_ids` `:5185-5207`、`:1286-1324` |
 /// | ⑥ 正式 bridge 回條 `handle_closed:false` | actor `worker_stopped` | session drain 留在 `_draining_by_ids` `:2774-2775`、`:2918-2919` |
-/// | ⑦ 不登記：裝置改指／bind 取走的預開 handle | `close_session_preopened` 只告警 | 先移出表再關閉 `:4045-4063`、`:3778-3796` |
+/// | ⑦ 不登記：裝置改指／bind 取走的預開 handle、bind 重試關閉的 parked handle | `close_session_preopened` 只告警 | 先移出表再關閉 `:4045-4063`、`:3778-3796`、`:3680-3681` |
 ///
 /// 會開啟 UART 的入口與阻擋結果（皆為零開埠嘗試、零 TX）：
 ///
@@ -3975,19 +3975,15 @@ impl SessionManager {
     }
 
     /// bind 重試前收尾舊 by_id 已認領的未消費預開作業（Python `bind_session` 的 `pending_attach_unconsumed` 分支，
-    /// `origin/main:sw_core/session_manager.py:3680-3694`）。
+    /// `origin/main:sw_core/session_manager.py:3680-3694`）：Python 已先把作業自 `_preopened_ports` 取出（`:3681`），
+    /// `_finish_attach_op` 關閉失敗只告警並回 False（`:4322-4332`），不放回任何表、也不寫 `_draining_by_ids`（該表只由
+    /// bridge 排空寫入 `:1324`、`:2774-2775`）。作業的 `session_id` 為 `dynamic:<by_id>`（`:3608`）查無 session，不回
+    /// RECOVERING（`:3697-3700`）而遞迴重試（`:3727`），改綁照常 `_spawn_attach`（`:3810-3812`）。
     ///
-    /// - 關閉確認：`finish_attach_op` 移除作業（`_finish_attach_op` `:4335-4338`），呼叫端重試 bind。
-    /// - 關閉未確認：`close_parts` 已登記 by_id 的未確認關閉阻擋（wp510 第 13 項，所有重新開埠入口皆檢查），
-    ///   `finish_attach_op` 告警。Python 的作業已先移出 `_preopened_ports`（`:3681`）、關閉失敗不放回；其 `session_id`
-    ///   為 `dynamic:<by_id>`（`:3608`）查無 session，不回 RECOVERING（`:3697-3700`）而遞迴重試（`:3727`）。因此這裡把
-    ///   作業移出 `inflight`，讓重試的 bind 照常改綁（回 ok＋ATTACHING），開埠由阻擋集合擋下。
+    /// 作業在關閉期間留在 `inflight`（其他入口視同在途而不開埠），回條到後不論結果一律移除；關閉失敗只告警。
     fn close_parked_for_bind(&self, by_id: &str, op: &AttachOp) {
-        let receipt = op.close_preopened_with_receipt();
-        let closed = receipt.as_ref().is_none_or(|receipt| receipt.closed);
-        self.shared.finish_attach_op(by_id, op, receipt);
-        if closed {
-            return;
+        if let Some(pre) = op.take_preopened() {
+            self.shared.close_session_preopened(by_id, pre);
         }
         let mut inner = lock(&self.shared.inner);
         if inner

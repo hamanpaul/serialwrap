@@ -6146,12 +6146,17 @@ fn wp510_review8_rpc_bind_retry_after_double_enospc_from_ready_closes_parked_han
 }
 
 /// 審查 P8-503c341-1 的關閉未確認分支：重試 bind 關閉未消費的預開 handle 回 `closed:false`。Python 已先把作業自
-/// `_preopened_ports` 取出（`origin/main:sw_core/session_manager.py:3681`），`_finish_attach_op` 關閉失敗回 False
-/// （`:4322-4332`）；該作業的 `session_id` 為 `dynamic:<by_id>`（`:3608`），`_sessions` 查無，不走 RECOVERING 回覆
-/// （`:3697-3700`），release 亦未請求（`:3716-3719`），遞迴重試 bind（`:3727`）：回 ok＋ATTACHING、last_error=None
-/// （`:3786-3791`、`:3813`）。差異（wp510 第 13 項）：未確認關閉登記到全 daemon 的 by_id 阻擋集合，改綁收尾的再 attach
-/// 不開埠、不送 TX（Python `_spawn_attach` 見 `_draining_by_ids` 早退 `:4113-4114`，bind 已先設 ATTACHING），之後的
-/// bind／attach 仍被擋。
+/// `_preopened_ports` 取出（`origin/main:sw_core/session_manager.py:3681`），`_finish_attach_op` 關閉失敗只告警並回
+/// False（`:4322-4332`），不寫入 `_draining_by_ids`（該表只由 `_begin_attach_bridge_stop_locked` `:1324` 與
+/// `_begin_drain_locked` `:2774-2775` 寫入）；該作業的 `session_id` 為 `dynamic:<by_id>`（`:3608`），`_sessions` 查無，
+/// 不走 RECOVERING 回覆（`:3697-3700`），release 亦未請求（`:3716-3719`），遞迴重試 bind（`:3727`）：回 ok＋ATTACHING、
+/// last_error=None（`:3786-3791`、`:3813`），`_save_state()` 成功後 `_spawn_attach` 照常排程（`:3810-3812`）。
+/// 舊 handle 仍被持有，重新開埠由 `_preopen_auto_attach_port` 收尾為 DETACHED＋`ATTACH_FAILED:DeviceHeldError`
+/// （`:4194-4214`）；之後的 bind 同樣重新嘗試，`device.attach` 的開埠失敗回 DEVICE_STILL_HELD、`pids:[]`、
+/// `holder_unknown:true`（`:3510-3523`；holder 掃描排除自身 pid `:3370-3376`）。
+///
+/// wp510 第 14 項依 rulings/s2.md「對照 Python」例外改正第 13 項固定下來的差異（未確認關閉登記為永久阻擋、之後不再開埠）；
+/// 測試名稱已登記於 L1 凍結鎖，沿用不改。
 #[test]
 fn wp510_review8_rpc_bind_retry_parked_close_unconfirmed_keeps_block() {
     let r = wp510_b_placeholder_rig();
@@ -6180,22 +6185,43 @@ fn wp510_review8_rpc_bind_retry_parked_close_unconfirmed_keeps_block() {
         "關閉回條已到，不得等待 attach 作業期限：{elapsed:?}"
     );
     assert_eq!(dev.close_count(), 1, "已嘗試關閉未消費的預開 handle");
-    assert!(r.mgr.unconfirmed_close_for_test(WP510_PLACEHOLDER_BY_ID), "關閉未確認須登記阻擋");
+    assert!(dev.is_open(), "closed:false 表示 handle 仍開啟");
+    assert!(
+        !r.mgr.unconfirmed_close_for_test(WP510_PLACEHOLDER_BY_ID),
+        "Python 先取出作業再關閉，關閉失敗只告警，不登記 _draining_by_ids"
+    );
+    assert!(
+        !r.mgr.has_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID),
+        "已取出的作業不留在在途表"
+    );
 
-    std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(dev.open_attempts(), attempts, "未確認關閉不得重新開埠");
-    assert_eq!(dev.tx_len(), tx_before, "未確認關閉不得送 TX");
+    wait_until("改綁收尾照常重新開埠", || dev.open_attempts() > attempts);
+    r.wait_state("COM1", "DETACHED");
+    let detached = r.session("COM1").expect("COM1 session");
+    assert_eq!(
+        detached.get("last_error"),
+        Some(&PyValue::from("ATTACH_FAILED:DeviceHeldError")),
+        "{}",
+        j(&detached)
+    );
+    assert_eq!(dev.tx_len(), tx_before, "開埠失敗不得送 TX");
 
+    let reopen_attempts = dev.open_attempts();
     let again = r.call(
         "session.bind",
         &format!(r#"{{"selector":"COM1","device_by_id":"{WP510_PLACEHOLDER_BY_ID}"}}"#),
     );
     assert_eq!(again.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&again));
+    wait_until("之後的 bind 同樣重新開埠", || dev.open_attempts() > reopen_attempts);
+    r.wait_state("COM1", "DETACHED");
+    let attach_attempts = dev.open_attempts();
     let attached = r.call("device.attach", r#"{"selector":"COM1"}"#);
-    assert_eq!(s(&attached, "error_code"), "SESSION_RECOVERING", "{}", j(&attached));
-    std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(dev.open_attempts(), attempts, "之後的 bind／attach 仍不得重新開埠");
+    assert_eq!(s(&attached, "error_code"), "DEVICE_STILL_HELD", "{}", j(&attached));
+    assert_eq!(attached.get("pids"), Some(&PyValue::List(Vec::new())), "{}", j(&attached));
+    assert_eq!(attached.get("holder_unknown"), Some(&PyValue::Bool(true)), "{}", j(&attached));
+    assert!(dev.open_attempts() > attach_attempts, "device.attach 照常嘗試開埠");
     assert_eq!(dev.tx_len(), tx_before);
+    assert!(!r.mgr.unconfirmed_close_for_test(WP510_PLACEHOLDER_BY_ID));
 }
 
 /// 落盤失敗後再次 `_spawn_attach`（bootstrap）：`_attach_by_id` 取走 `_preopened_ports` 的作業，dynamic 偵測沿用同一
