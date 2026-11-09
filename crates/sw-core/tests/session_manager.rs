@@ -2040,6 +2040,83 @@ fn wp510_tx_device_path_change_before_hotplug_probe_submit_sends_zero_tx() {
     assert!(!device.is_open(), "取消後不得保留舊路徑 handle");
 }
 
+/// wp510 第三次整包審查 Medium：`alias.set` 已更新 actor、尚未持久化時佔位退休，不得把 alias 寫回已退休 sid，
+/// 也不得回 `ok:true`。Python 對照：`origin/main:sw_core/session_manager.py:2612-2620` 的檢查、更新與
+/// `_save_state()` 全在 manager lock 內；`:3640-3652` 退休清理持同一把鎖，故後到的 `alias.set` 只會看到
+/// session 已不存在並回 `SESSION_NOT_FOUND`。
+#[test]
+fn wp510_identity_alias_set_racing_placeholder_retirement_keeps_old_sid_retired() {
+    const SID: &str = "gone-template:COM3";
+    const LATE_ALIAS: &str = "late-alias";
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    m.mgr.update_devices(&m.snapshot());
+
+    let weak = std::sync::Arc::downgrade(&m.mgr);
+    let hook_sid = sid.clone();
+    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_fired = fired.clone();
+    let (hook_tx, hook_rx) = crossbeam_channel::bounded(1);
+    m.mgr.set_alias_pre_commit_hook_for_test(Box::new(move || {
+        if hook_fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        if let Some(manager) = weak.upgrade() {
+            let _ = hook_tx.send(manager.attach_released_placeholder(&hook_sid, false));
+        }
+    }));
+
+    let reply = rpc(m.mgr.alias_set(&sid, LATE_ALIAS));
+    let attach = rpc(
+        hook_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("佔位退休應發生在 alias 持久化前"),
+    );
+    assert!(is_ok(&attach), "device.attach 應完成佔位退休：{attach:?}");
+    wait_until("t:COM3 正式 session", || m.mgr.resolve("t:COM3").is_some());
+
+    assert_eq!(
+        sw_proto::pyjson::dumps_dict(&reply, &sw_proto::pyjson::RPC_WIRE),
+        format!(r#"{{"ok":false,"error_code":"SESSION_NOT_FOUND","session_id":"{SID}"}}"#),
+        "退休後才提交的 alias.set 應回 Python 的 SESSION_NOT_FOUND（逐位元組含鍵序）"
+    );
+    let listed = m.mgr.alias_list();
+    let rows: Vec<PyDict> = match listed.get("aliases") {
+        Some(PyValue::List(rows)) => rows
+            .iter()
+            .filter_map(|row| match row {
+                PyValue::Dict(row) => Some(row.clone()),
+                _ => None,
+            })
+            .collect(),
+        other => panic!("alias.list 應回 aliases 清單：{other:?}"),
+    };
+    assert!(
+        rows.iter()
+            .all(|row| s_of(row, "session_id").as_deref() != Some(SID)),
+        "alias.list 不得留下指向已退休 sid 的 alias：{rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .all(|row| s_of(row, "alias").as_deref() != Some(LATE_ALIAS)),
+        "退休後到的 alias 不得出現在 alias.list：{rows:?}"
+    );
+    let persisted = m.load_state_now();
+    assert!(
+        !persisted.aliases.contains_key(LATE_ALIAS),
+        "state.json 不得寫入退休後到的 alias：{:?}",
+        persisted.aliases
+    );
+    assert!(
+        persisted
+            .aliases
+            .values()
+            .all(|row| row.get("session_id").and_then(PyValue::as_str) != Some(SID)),
+        "state.json 不得保留指向已退休 sid 的 alias：{:?}",
+        persisted.aliases
+    );
+}
+
 #[test]
 fn wp510_lifecycle_repeated_release_uses_expired_attach_deadline() {
     const SID: &str = "gone-template:COM3";

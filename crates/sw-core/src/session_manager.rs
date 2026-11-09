@@ -371,6 +371,9 @@ struct Shared {
     /// 只供測試（test-fakes）：佔位 release 取得在途 op 後、取消標記前的競態暫停點。
     #[cfg(feature = "test-fakes")]
     placeholder_release_cancel_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// 只供測試（test-fakes）：`alias.set` 已更新 actor、尚未持久化前的競態暫停點（佔位退休交錯）。
+    #[cfg(feature = "test-fakes")]
+    alias_pre_commit_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// 載入的 state.json 含孤立 surrogate（`LoadedState::lone_surrogates`；啟動存檔前檢查）。
     lone_surrogates: bool,
     /// 啟動存檔重現的 Python 未捕捉例外末行（`_save_state` 的 `UnicodeEncodeError`）；daemon 據此 exit 1。
@@ -3075,6 +3078,8 @@ impl SessionManager {
             probe_pre_submit_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             placeholder_release_cancel_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            alias_pre_commit_hook: Mutex::new(None),
         });
         shared.bootstrap_sessions(&load.profiles);
         let mgr = Arc::new(SessionManager {
@@ -3691,40 +3696,68 @@ impl SessionManager {
     }
 
     /// `set_alias_for_session`：manager 側 profile alias 立即生效；重啟後依 YAML／template 重算（WAL-D15 KEEP）。
+    ///
+    /// Python `session_manager.py:2612-2620` 的存在檢查、更新與 `_save_state()` 全在 manager lock 內；OD-63 佔位退休
+    /// （`retire_released_placeholder_locked`，Python `:3640-3652`）同樣持 manager 鎖移除 entry。Rust 等 actor 確認時
+    /// 不能持鎖，故提交前於 manager 鎖內重驗同一 entry（同一 actor）仍在，並持鎖完成持久化；退休後到的 alias
+    /// 回 `SESSION_NOT_FOUND`，不寫回已退休 sid（wp510 第三次整包審查 Medium）。鎖序 inner → model，與
+    /// `session_from_template_locked` 相同。
     pub fn alias_set(&self, sid: &str, alias: &str) -> Result<PyDict, PyErr> {
-        {
+        let not_found = || {
+            pydict! {
+                "ok" => false,
+                "error_code" => "SESSION_NOT_FOUND",
+                "session_id" => sid.to_string()
+            }
+        };
+        let actor = {
             let mut inner = lock(&self.shared.inner);
             let Some(e) = inner.sessions.get_mut(sid) else {
-                return Ok(pydict! {
-                    "ok" => false,
-                    "error_code" => "SESSION_NOT_FOUND",
-                    "session_id" => sid.to_string()
-                });
+                return Ok(not_found());
             };
             e.profile.alias = alias.to_string();
             lock(&e.io.profile).alias = alias.to_string();
-        }
+            e.actor.clone()
+        };
+        let still_same_session = |inner: &Inner| {
+            inner
+                .sessions
+                .get(sid)
+                .is_some_and(|e| Arc::ptr_eq(&e.actor, &actor))
+        };
         // actor 持有的 profile 一併更新並等確認（GetState／submit 等回應中的 `session.alias`；sol-backfill p5 #3）。
-        let applied = self.shared.request(
-            sid,
+        let applied = match actor.request(
             SessionRequest::SetAlias {
                 alias: alias.to_string(),
             },
             QUERY_TIMEOUT,
-        )?;
+        ) {
+            Ok(applied) => applied,
+            // 確認前 session 已退休（actor 隨之停止）：Python 持鎖時只會看到 session 不存在。
+            Err(_) if !still_same_session(&lock(&self.shared.inner)) => return Ok(not_found()),
+            Err(error) => return Err(error),
+        };
         if !is_ok(&applied) {
             return Ok(applied);
         }
+        #[cfg(feature = "test-fakes")]
+        if let Some(hook) = lock(&self.shared.alias_pre_commit_hook).as_ref() {
+            hook();
+        }
+        let inner = lock(&self.shared.inner);
+        if !still_same_session(&inner) {
+            return Ok(not_found());
+        }
         let row = alias_row(sid, alias, &self.shared.now_iso());
         let name = alias.to_string();
-        self.shared
-            .commit_sync(move |m| {
-                m.apply(StateDelta::AliasSet {
-                    alias: name,
-                    row: Some(row),
-                })
+        let committed = self.shared.commit_sync(move |m| {
+            m.apply(StateDelta::AliasSet {
+                alias: name,
+                row: Some(row),
             })
-            .map_err(|e| commit_error(&e))?;
+        });
+        drop(inner);
+        committed.map_err(|e| commit_error(&e))?;
         Ok(pydict! { "ok" => true, "session_id" => sid.to_string(), "alias" => alias.to_string() })
     }
 
@@ -3941,6 +3974,12 @@ impl SessionManager {
     #[cfg(feature = "test-fakes")]
     pub fn set_placeholder_release_cancel_hook_for_test(&self, hook: Box<dyn Fn() + Send + Sync>) {
         *lock(&self.shared.placeholder_release_cancel_hook) = Some(hook);
+    }
+
+    /// 只供測試（test-fakes）：設定 `alias.set` 持久化前暫停點（見 `alias_pre_commit_hook`）。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_alias_pre_commit_hook_for_test(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        *lock(&self.shared.alias_pre_commit_hook) = Some(hook);
     }
 
     /// 設定 state.json 持久化觀察者（P5-T19 #3／#4／#68；daemon 組裝點於 `new()` 之後、任何 attach 之前呼叫）。

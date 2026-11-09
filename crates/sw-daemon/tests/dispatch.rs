@@ -5710,6 +5710,80 @@ fn wp510_rpc_shutdown_before_placeholder_probe_submit_sends_zero_tx() {
     );
 }
 
+/// wp510 第三次整包審查 Medium（RPC 端到端）：`alias.set` 已更新 actor、持久化前由 `device.attach` 退休佔位，
+/// 回應須為 Python `set_alias_for_session` 的 `SESSION_NOT_FOUND`（`session_manager.py:2612-2620` 全程持
+/// manager lock，`:3640-3652` 退休清理同鎖），且 `alias.list` 不得留下指向已退休 sid 的 alias。
+#[test]
+fn wp510_rpc_alias_set_racing_placeholder_retirement_returns_session_not_found() {
+    const LATE_ALIAS: &str = "late-alias";
+    let r = wp510_b_placeholder_rig();
+    let weak_svc = Arc::downgrade(&r.svc);
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_fired = fired.clone();
+    let (hook_tx, hook_rx) = crossbeam_channel::bounded(1);
+    r.mgr.set_alias_pre_commit_hook_for_test(Box::new(move || {
+        if hook_fired.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Some(svc) = weak_svc.upgrade() {
+            let PyValue::Dict(params) = sw_proto::pyjson::loads(&format!(
+                r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#
+            ))
+            .expect("params JSON") else {
+                unreachable!("params 應為 object");
+            };
+            let _ = hook_tx.send(svc.rpc("device.attach", &params));
+        }
+    }));
+
+    let reply = r.call(
+        "alias.set",
+        &format!(r#"{{"session_id":"{WP510_PLACEHOLDER_SID}","alias":"{LATE_ALIAS}"}}"#),
+    );
+    let attached = hook_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("佔位退休應發生在 alias 持久化前")
+        .unwrap_or_else(|e| panic!("device.attach 應回字典：{}", e.message));
+    assert_eq!(
+        attached.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "device.attach 應完成佔位退休：{}",
+        j(&attached)
+    );
+    assert_eq!(
+        j(&reply),
+        format!(
+            r#"{{"ok":false,"error_code":"SESSION_NOT_FOUND","session_id":"{WP510_PLACEHOLDER_SID}","version":"{}"}}"#,
+            r.version
+        ),
+        "alias.set RPC bytes"
+    );
+    wait_until("t:COM3 正式 session", || {
+        r.mgr.resolve("t:COM3").as_deref() == Some("t:COM3")
+    });
+    let listed = r.call("alias.list", "{}");
+    let PyValue::List(rows) = listed.get("aliases").cloned().expect("alias.list 應含 aliases") else {
+        panic!("aliases 應為 list：{}", j(&listed));
+    };
+    for row in &rows {
+        let PyValue::Dict(row) = row else {
+            panic!("alias 列應為 object：{}", j(&listed));
+        };
+        assert_ne!(
+            row.get("session_id"),
+            Some(&PyValue::from(WP510_PLACEHOLDER_SID)),
+            "alias.list 不得留下指向已退休 sid 的 alias：{}",
+            j(&listed)
+        );
+        assert_ne!(
+            row.get("alias"),
+            Some(&PyValue::from(LATE_ALIAS)),
+            "退休後到的 alias 不得寫入：{}",
+            j(&listed)
+        );
+    }
+}
+
 /// 正式 RPC 回歸：blocked placeholder open 在 release timeout 後回 Held（未取得 handle），應解除 stall 並可重試。
 #[test]
 fn wp510_rpc_open_error_after_release_settles_without_handle() {
