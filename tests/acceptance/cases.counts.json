@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "cases_revision": "2026-11-08.1",
+  "cases_revision": "2026-11-09.1",
   "total": 235,
   "by_suite": {
     "contract-blackbox": 97,

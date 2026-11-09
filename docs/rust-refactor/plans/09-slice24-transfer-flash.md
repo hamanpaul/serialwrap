@@ -2105,6 +2105,8 @@ def test_restart_on_failure_keeps_released_and_wal_seq(sw_env, shell_target, tra
 
 P4 已在 Stage 1 實作共用 `graceful_stop`（P4 Global Constraints：先停用拉起能力 → RPC `daemon.stop` 2.0 s → 等待結束 ≤10 s → 逾時才硬終止；P4 §0.5 註明 SC-24-S 由 P4 實作、P8 只補 Rust daemon 側驗證）。本 Task **不**新增 `TaskSchedulerCtl`、不重寫 stop 序；只 (a) 修正 P4 契約內 `service stop`／`restart` 仍直接 `/End` 的不一致，使其經 `graceful_stop`；(b) 以 Rust daemon 驗證整條序列。
 
+**OD-83（擁有者，2026-11-09）**：Windows 原生實跑確認，`taskkill /F` 後 daemon action 以 exit 1 結束時，Task Scheduler 將工作記為完成，`RestartOnFailure` 不會自動重新啟動。0.5.0 採 A：本案例驗證強制終止後 90 s 內沒有新 daemon pid、工作不是 Running，再由正式 `service start` 於 20 s 內恢復；三道 COM 防線、有序停止與 WAL 證據維持。這是 0.5.0 已知限制，長期需讓 Windows 崩潰自動重啟對齊 Linux systemd `Restart=on-failure`；工作 XML 維持現狀。
+
 **Test author model:** haiku-xhigh　**Implementer model:** codex-gpt-6-luna-max
 
 **Files:**
@@ -2149,9 +2151,14 @@ fn cap_supervisor_runtime__task_pt0s_restart_and_graceful_stop() {
     assert!(ctl.action_named(&SupervisionMode::WindowsTask, &name, ServiceAction::Start, false).ok);
     let pid0 = wait_daemon_pid(Duration::from_secs(20));
     taskkill_force(pid0);
-    let t0 = Instant::now();
-    let pid1 = wait_new_daemon_pid(pid0, Duration::from_secs(150));
-    assert!(t0.elapsed() <= Duration::from_secs(150) && pid1 != pid0);
+    assert!(wait_task_not_running(&ctl, &name, Duration::from_secs(10)));
+    let observed = observe_no_task_restart(&p.env, &ctl, port, &name, &daemon_exe, pid0, Duration::from_secs(90));
+    assert!(matches!(observed.final_task_state, TaskQuery::NotRunning(_))
+            && observed.final_process_pids.is_empty(),
+        "OD-83：0.5.0 已知限制；長期須對齊 Linux 崩潰自動重啟");
+    assert!(ctl.action_named(&w, &name, ServiceAction::Start, false).ok);
+    let pid1 = wait_new_daemon_pid(pid0, Duration::from_secs(20));
+    assert_ne!(pid1, pid0);
     let r = graceful_stop_for_test(&ctl, &name);               // 呼叫 P4 graceful_stop
     assert!(r.ok, "{r:?}");
     assert!(!r.ran_end, "daemon 正常結束時不得執行 /End");

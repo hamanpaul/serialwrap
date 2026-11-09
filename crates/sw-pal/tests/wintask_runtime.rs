@@ -136,7 +136,7 @@ fn cap_supervisor_runtime__task_pt0s_restart_and_graceful_stop() {
                 spec.log_tail(4000)
             )
         });
-    let pid1 = checked(pid1, "service start 恢復後");
+    checked(pid1, "service start 恢復後");
 
     let r = formal_service_stop(&*p.env, &harness, &spec, &name)
         .unwrap_or_else(|e| panic!("正式 service stop 失敗：{e}\ndaemon.log：{}", spec.log_tail(4000)));

@@ -634,11 +634,11 @@ L1.5 的同板多來源競爭案例不得使用測試端 per-board lock 替 brok
 | 平台 | 模式 | 條件 |
 |---|---|---|
 | Linux | `systemd-system`、`systemd-user`、`on-demand` | 驗證實際 unit、權限、啟停與唯一實例，不只檢查產生的文字 |
-| Windows | `windows-task` | 測試團隊工作站預設（OD-03 核准）；登入使用者身分、登入觸發、失敗重啟 |
+| Windows | `windows-task` | 測試團隊工作站預設（OD-03 核准）；登入使用者身分與登入觸發；0.5.0 不提供 daemon 崩潰自動重啟（OD-83） |
 | Windows | `windows-service` | 僅於 OD-12 信任模型符合時採用；帳號、ACL 與 Session 0 行為須實測，不預設必须使用 LocalSystem |
 | Windows | `on-demand` | 首次需求啟動；仍受實例鎖、Per-UART 鎖與版本配對約束 |
 
-採 `windows-task` 時設定 `ExecutionTimeLimit=PT0S`，並分別驗證設定、失敗重啟及實際運行超過 72 小時。Task Scheduler 的預設 72 小時限制與 `PT0S` 無限期語意，不可只用 48 小時長跑間接判定。[Microsoft Learn](https://learn.microsoft.com/en-us/windows/win32/taskschd/tasksettings-executiontimelimit)
+採 `windows-task` 時設定 `ExecutionTimeLimit=PT0S`，並分別驗證設定、OD-83 指定的崩潰後行為及實際運行超過 72 小時。`RestartOnFailure`（PT1M／999）仍保留在工作 XML；OD-83 的 2026-11-09 Windows 原生實跑確認，daemon 被強制終止後 action 以 exit 1 結束會被 Task Scheduler 記為完成，不會自動重新拉起。故 0.5.0 的 windows-task 提供登入自啟與有序停止，不提供崩潰自動重啟；依 OD-83，驗收須確認 90 s 內沒有新 pid、工作非 Running，再以正式 `service start` 恢復。長期須使崩潰自動重啟對齊 Linux systemd `Restart=on-failure`，實作後重新做 Windows 原生驗證。Task Scheduler 的預設 72 小時限制與 `PT0S` 無限期語意，不可只用 48 小時長跑間接判定。[Microsoft Learn](https://learn.microsoft.com/en-us/windows/win32/taskschd/tasksettings-executiontimelimit)
 
 L3 故障保留模式與監管重啟測試分開執行。`lr-mixed` 的隔離測試實例不得因外部監管器自動重啟而消除 daemon death 證據。生產 Canary 可啟用監管，但非預期重啟仍計為事故。
 
