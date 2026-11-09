@@ -9,11 +9,7 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = [
-    pytest.mark.core_portable,
-    pytest.mark.process_rpc,
-    pytest.mark.xfail(strict=True, reason="P8-T15 階段 A：契約覆蓋工具尚未實作"),
-]
+pytestmark = [pytest.mark.core_portable, pytest.mark.process_rpc]
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "scripts" / "rust" / "contract_coverage.py"
@@ -52,6 +48,8 @@ def _results(run: Path, label: str, platform: str, rows: list[dict], **over) -> 
         "cli_sha256": hashlib.sha256(cli.read_bytes()).hexdigest(),
         "daemon_exe": str(daemon),
         "daemon_sha256": hashlib.sha256(daemon.read_bytes()).hexdigest(),
+        "native_windows": label == "rust-windows",
+        "native_build_link": label == "rust-windows",
         **REV,
         "contract_revision": _module()._contract_revision(ROOT / "contracts"),
         "cases_yaml_sha256": hashlib.sha256((ROOT / "tests/acceptance/cases.yaml").read_bytes()).hexdigest(),
@@ -153,11 +151,65 @@ def test_extractors_match_real_contracts():
     assert "bc:SC-32" in universe
     assert "bc:SC-33" not in universe, "OD-79 已撤回 SC-33"
     assert "bc:SC-03" in universe
-    cases = _cc._read_yaml(ROOT / "tests/acceptance/cases.yaml")["cases"]
+    cases = cc._read_yaml(ROOT / "tests/acceptance/cases.yaml")["cases"]
     gates_case = next(case for case in cases if case["case_id"] == "s24-xfer-session-gates")
     assert "SC-03" in gates_case["behavior_changes"] and "SC-33" not in gates_case["behavior_changes"]
     assert "case:s24-flash-sync-replay" in universe
     assert universe["error_code:ECHO_ACK_UNSUPPORTED"]["l1_only"] is True
+    extracted = {
+        contract_id
+        for source_name, extractor in cc.EXTRACTORS.items()
+        for contract_id in extractor(
+            {
+                "error_codes.yaml": ROOT / "contracts/error_codes.yaml",
+                "session_last_errors.yaml": ROOT / "contracts/session_last_errors.yaml",
+                "rpc_schema.json": ROOT / "contracts/rpc_schema.json",
+                "cli_schema.json": ROOT / "contracts/cli_schema.json",
+                "behavior_changes.yaml": ROOT / "contracts/behavior_changes.yaml",
+                "wal_record.schema.json": ROOT / "contracts/wal_record.schema.json",
+                "state_file.schema.json": ROOT / "contracts/state_file.schema.json",
+                "cases.lock.json": ROOT / "tests/acceptance/cases.lock.json",
+                "coverage_map.yaml": ROOT / "contracts/coverage_map.yaml",
+            }[source_name]
+        )
+    }
+    assert extracted == set(universe)
+
+
+def test_empty_cross_phase_map_overrides_derived_case_evidence(tmp_path):
+    import yaml
+
+    cc = _module()
+    contracts = tmp_path / "contracts"
+    contracts.mkdir()
+    (contracts / "error_codes.yaml").write_text(
+        yaml.safe_dump({"codes": [{"code": "TEST", "reachable": True, "behavior_change": ["SC-03"], "scope": {}}]}),
+        encoding="utf-8",
+    )
+    (contracts / "session_last_errors.yaml").write_text(yaml.safe_dump({"values": []}), encoding="utf-8")
+    (contracts / "behavior_changes.yaml").write_text(
+        yaml.safe_dump({"changes": [{"id": "SC-03", "phases": ["P5"], "case_ids": ["source-case"]}]}),
+        encoding="utf-8",
+    )
+    (contracts / "rpc_schema.json").write_text(json.dumps({"x-methods": {}}), encoding="utf-8")
+    (contracts / "cli_schema.json").write_text(json.dumps({"x-groups": []}), encoding="utf-8")
+    (contracts / "wal_record.schema.json").write_text("{}", encoding="utf-8")
+    (contracts / "state_file.schema.json").write_text("{}", encoding="utf-8")
+    cases = tmp_path / "cases.yaml"
+    cases.write_text(
+        yaml.safe_dump({"cases": [{"case_id": "source-case", "behavior_changes": ["SC-03"], "evidence": ["test_source.py::test_old_phase"]}]}),
+        encoding="utf-8",
+    )
+    lock = tmp_path / "cases.lock.json"
+    lock.write_text(json.dumps({"sets": {"slice_2.4": []}}), encoding="utf-8")
+    coverage_map = contracts / "coverage_map.yaml"
+    coverage_map.write_text(
+        yaml.safe_dump({"entries": {"error_code:TEST": {"nodeids": [], "owner_phase": "P5"}}}),
+        encoding="utf-8",
+    )
+    universe = cc.universe(contracts, cases, lock, coverage_map)
+    assert universe["error_code:TEST"]["owner_phase"] == "P5"
+    assert universe["error_code:TEST"]["nodeids"] == []
 
 
 def test_skipped_and_teardown_error_never_count(tmp_path):
@@ -231,6 +283,23 @@ def test_windows_only_id_does_not_require_linux(tmp_path):
     assert result.returncode == 0 and "error_code:X_WIN_ONLY" in output["covered"]
 
 
+def test_windows_cross_build_is_not_native_evidence(tmp_path):
+    run = tmp_path / "run7-cross"
+    _results(run, "rust-windows", "windows", [_row("t::w")], native_windows=False, native_build_link=False)
+    _results(run, "python-windows", "windows", [_row("t::w")])
+    result = _run(
+        "--run-dir", str(run), "--json", str(tmp_path / "o.json"),
+        "--only", "error_code:X_WIN_ONLY",
+        "--map", "error_code:X_WIN_ONLY=t::w",
+        "--platforms", "error_code:X_WIN_ONLY=windows",
+    )
+    output = json.loads((tmp_path / "o.json").read_text())
+    assert result.returncode == 0
+    assert "error_code:X_WIN_ONLY" in output["blocked_owner"]
+    assert "error_code:X_WIN_ONLY" not in output["covered"]
+    assert output["windows_verdicts"]["error_code:X_WIN_ONLY"] == "BLOCKED-OWNER"
+
+
 def test_all_mapped_nodeids_required_not_any(tmp_path):
     run = tmp_path / "run8"
     _results(run, "rust-linux", "linux", [_row("t::g1"), _row("t::g2", "skipped")])
@@ -283,9 +352,66 @@ def test_cargo_results_import_roundtrip(tmp_path):
     assert set(document["collected"]) >= {row["nodeid"] for row in document["results"]}
 
 
+def test_cargo_capability_tests_require_explicit_opt_in(monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT / "scripts/rust"))
+    import import_cargo_results
+
+    assert import_cargo_results._capability("cap_physical_uart__opens_device") == "physical_uart"
+    assert import_cargo_results._should_execute("regular_unit_test", set())
+    assert not import_cargo_results._should_execute("cap_physical_uart__opens_device", set())
+    assert import_cargo_results._should_execute("cap_posix_pty__creates_pty", {"posix_pty"})
+
+
+def test_failed_case_is_reported_as_fail_in_incomplete_run(tmp_path):
+    run = tmp_path / "failed-run"
+    _results(run, "rust-linux", "linux", [_row("t::failed", "failed")], exit_code=1, finished=False)
+    _results(run, "python-linux", "linux", [_row("t::failed")])
+    result = _run(
+        "--run-dir", str(run), "--json", str(tmp_path / "o.json"),
+        "--only", "case:failed-case", "--map", "case:failed-case=t::failed",
+    )
+    output = json.loads((tmp_path / "o.json").read_text())
+    assert result.returncode == 1
+    assert output["case_verdicts"]["failed-case"] == "FAIL"
+    assert "case:failed-case" in output["failed"]
+
+
 def test_t9_and_known_low_are_present_in_gate_report():
     cc = _module()
-    report = cc.render_gate_report({"case_verdicts": {}}, [], {})
+    report = cc.render_gate_report(
+        {
+            "case_verdicts": {},
+            "windows_verdicts": {"rpc_method:service.status": "BLOCKED-OWNER"},
+            "blocked_owner": {"case:f7-binary-roundtrip-md5": "需要擁有者 TestPilot 實機證據"},
+        },
+        [],
+        {},
+    )
     assert "endpoint_reopen_after_flasher_set_excl_recorded" in report
+    assert "EVIDENCE_MISSING" in report
     assert "P8X-9e51abd-1" in report
+    assert "凍結分母外的 BLOCKED-OWNER 案例" in report
+    assert "f7-binary-roundtrip-md5" in report
+    assert "Windows 全部契約 ID" in report
+    assert "rpc_method:service.status" in report and "BLOCKED-OWNER" in report
+
+
+def test_t9_recorded_outcome_is_written_to_pending_column():
+    cc = _module()
+    report = cc.render_gate_report(
+        {"case_verdicts": {}},
+        [],
+        {
+            "results": [{
+                "label": "rust-linux",
+                "results": [{
+                    "nodeid": "cargo:sw-core::flash_coordinator::cap_posix_pty__endpoint_reopen_after_flasher_set_excl_recorded",
+                    "phase": "call",
+                    "outcome": "passed",
+                }],
+            }],
+        },
+    )
+    assert "待裁決" in report
+    assert "rust-linux" in report and "call=passed" in report
 

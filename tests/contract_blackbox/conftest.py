@@ -40,6 +40,20 @@ from bb_harness import (  # noqa: E402
 )  # isolated_env 登記的隔離根與 session 防線
 import config_digest as _config_digest  # noqa: E402
 
+# 只有 gate runner 指定結果目錄時才載入契約覆蓋 hook；不新增 marker 或改變一般測試行為。
+if os.environ.get("SERIALWRAP_COVERAGE_RUN_DIR"):
+    import importlib.util
+
+    _coverage_path = Path(__file__).with_name("coverage_plugin.py")
+    _coverage_spec = importlib.util.spec_from_file_location("sw_contract_coverage_plugin", _coverage_path)
+    if not (_coverage_spec and _coverage_spec.loader):
+        raise pytest.UsageError(f"無法載入契約覆蓋 plugin：{_coverage_path}")
+    _coverage_module = importlib.util.module_from_spec(_coverage_spec)
+    sys.modules["sw_contract_coverage_plugin"] = _coverage_module
+    _coverage_spec.loader.exec_module(_coverage_module)
+    pytest_collection_finish = _coverage_module.pytest_collection_finish
+    pytest_runtest_logreport = _coverage_module.pytest_runtest_logreport
+
 _RUST_SESSION: bool | None = None
 _USER_UNIT_PATH: Path | None = None
 _USER_UNIT_START: tuple[bool, int | None, str | None] | None = None
@@ -307,3 +321,6 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
             assert "sw_core" not in sys.modules, (
                 f"sw_core leaked into blackbox test process: {[m for m in sys.modules if m.startswith('sw_core')]}"
             )
+
+    if "_coverage_module" in globals():
+        _coverage_module.pytest_sessionfinish(session, int(session.exitstatus))
