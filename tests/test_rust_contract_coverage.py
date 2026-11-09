@@ -433,10 +433,83 @@ def test_t9_recorded_outcome_is_written_to_pending_column():
 # ---------------------------------------------------------------------------
 EXIT_SCRIPT = ROOT / "scripts" / "rust" / "slice24_exit.sh"
 LONGRUN_S = 172800
-_LONGRUN_REQUIRED_CHECKS = (
-    "pinned_cli", "engine_verdict", "fault_retention_attested", "baseline_compatible",
-    "continuous_duration", "safety_double_holder",
-)
+_NA = "NOT_APPLICABLE_BASELINE"
+_BUNDLE_BINARIES = {"linux": ("serialwrap", "serialwrapd"), "windows": ("serialwrap.exe", "serialwrapd.exe")}
+
+
+def _gate():
+    from realhw.acceptance import gate
+
+    return gate
+
+
+def _formal_checks(platform: str, mode: str) -> list[dict]:
+    """正式 P2 gate 在該平台／模式產出的完整檢查列（以空輸入跑正式判定器取得；ID 集合與輸入無關）。"""
+    import tempfile
+
+    gate = _gate()
+    with tempfile.TemporaryDirectory() as tmp:
+        result = gate.evaluate(gate.GateInputs(
+            report_dir=Path(tmp), case_dir=Path(tmp),
+            acceptance_path=ROOT / "realhw/acceptance/longrun_acceptance.yaml",
+            platform=platform, mode=mode, observer_path=None, wal_dir=None, baseline_gate_path=None,
+        ))
+    return [{"id": check["id"], "group": check["group"], "result": check["result"]} for check in result["checks"]]
+
+
+def _candidate_bundle(root: Path, platform: str, *, cli: bytes, daemon: bytes, extra: dict | None = None) -> Path:
+    """合成一份候選 bundle 版本目錄（release-manifest.json＋bin/ 內 CLI／daemon）。"""
+    cli_name, daemon_name = _BUNDLE_BINARIES[platform]
+    (root / "bin").mkdir(parents=True)
+    (root / "bin" / cli_name).write_bytes(cli)
+    (root / "bin" / daemon_name).write_bytes(daemon)
+    (root / "release-manifest.json").write_text('{"version":"0.0.0-test"}\n', encoding="utf-8")
+    for rel, data in (extra or {}).items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_bytes(data)
+    return root
+
+
+def _bundle_tree(bundle: Path) -> str:
+    from realhw import deployed_content
+
+    return deployed_content.tree_digests(bundle)[0]
+
+
+def _candidate_record(bundle: Path, platform: str) -> dict:
+    files = sorted(
+        (path.relative_to(bundle).as_posix(), _sha_bytes(path.read_bytes()))
+        for path in bundle.rglob("*") if path.is_file()
+    )
+    files.sort(key=lambda item: item[0].encode("utf-8"))
+    return {
+        "schema_version": "slice24-candidate-bundle.v1",
+        "platform": platform,
+        "bundle_tree_sha256": _bundle_tree(bundle),
+        "files": [list(item) for item in files],
+    }
+
+
+def _bind_bundle(run: Path, platform: str, bundle: Path, *, record: bool = True, results: bool = True) -> None:
+    """把本輪 rust-<platform> 受測 artifact 指向該 bundle 的 CLI／daemon，並寫入候選 bundle 紀錄。"""
+    cli_name, daemon_name = _BUNDLE_BINARIES[platform]
+    if results:
+        cli, daemon = bundle / "bin" / cli_name, bundle / "bin" / daemon_name
+        _results(
+            run, f"rust-{platform}", platform, [],
+            cli_exe=str(cli), cli_sha256=_sha_bytes(cli.read_bytes()),
+            daemon_exe=str(daemon), daemon_sha256=_sha_bytes(daemon.read_bytes()),
+        )
+    if record:
+        path = run / "artifacts" / platform / "candidate-bundle.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_candidate_record(bundle, platform)), encoding="utf-8")
+
+
+def _bind_candidate(run: Path, base: Path, platforms=("linux", "windows")) -> None:
+    """本輪候選＝_longrun_source 長跑所用的同一份 bundle。"""
+    for platform in platforms:
+        _bind_bundle(run, platform, base / "bundles" / platform)
 
 
 def _sha_bytes(data: bytes) -> str:
@@ -485,12 +558,17 @@ def _longrun_source(base: Path, *, platforms=("linux", "windows"), results=None)
             "acquired_at_utc": "2026-10-31T23:59:00+00:00",
             "released_at_utc": "2026-11-03T00:01:00+00:00",
         }), encoding="utf-8")
-        bundle = _sha_bytes(f"bundle-{platform}".encode())
+        candidate_bundle = base / "bundles" / platform
+        if not candidate_bundle.exists():
+            _candidate_bundle(
+                candidate_bundle, platform, cli=f"cli-{platform}".encode(), daemon=f"d-{platform}".encode(),
+            )
+        bundle = _bundle_tree(candidate_bundle)
         cli_sha = _sha_bytes(f"cli-{platform}".encode())
         verdict = results.get(platform, "PASS")
         checks = [
-            {"id": check_id, "group": "evidence", "status": "evaluated", "result": "PASS", "detail": {}}
-            for check_id in _LONGRUN_REQUIRED_CHECKS
+            {"id": check["id"], "group": check["group"], "status": "evaluated", "result": "PASS", "detail": {}}
+            for check in _formal_checks(platform, "candidate")
         ]
         if verdict != "PASS":
             checks[-1]["result"] = verdict
@@ -521,7 +599,11 @@ def _longrun_source(base: Path, *, platforms=("linux", "windows"), results=None)
             "acceptance": {"sha256": acceptance_sha, "workload_contract_sha256": workload},
             "run": {"duration_s": 172900, "engine_files_sha256": engine_files,
                     "started_at_utc": "2026-10-20T00:00:00+00:00", "ended_at_utc": "2026-10-22T00:01:40+00:00"},
-            "checks": [{"id": "engine_verdict", "group": "engine", "status": "evaluated", "result": "PASS", "detail": {}}],
+            "checks": [
+                {"id": check["id"], "group": check["group"], "status": "evaluated",
+                 "result": _NA if check["result"] == _NA else "PASS", "detail": {}}
+                for check in _formal_checks(platform, "baseline")
+            ],
         }
         (root / "release-gate.json").write_text(json.dumps(candidate), encoding="utf-8")
         (root / "baseline-release-gate.json").write_text(json.dumps(baseline), encoding="utf-8")
@@ -548,6 +630,7 @@ def test_longrun_valid_evidence_unblocks_lr_mixed(tmp_path):
     record = json.loads((run / "longrun-evidence.json").read_text(encoding="utf-8"))
     assert record["accepted"] is True
     assert {p: v["release_gate_result"] for p, v in record["platforms"].items()} == {"linux": "PASS", "windows": "PASS"}
+    _bind_candidate(run, tmp_path)
     result, output = _judge_lr_mixed(run, tmp_path / "o.json")
     assert output["case_verdicts"]["lr-mixed"] == "PASS"
     assert "case:lr-mixed" in output["covered"] and "case:lr-mixed" not in output["blocked_owner"]
@@ -623,6 +706,7 @@ def test_longrun_incomplete_or_tampered_evidence_is_rejected(tmp_path, mutate, p
     assert record["accepted"] is False
     assert record["platforms"][platform]["accepted"] is False
     assert any(needle in error for error in record["platforms"][platform]["errors"]), record
+    _bind_candidate(run, tmp_path)
     _, output = _judge_lr_mixed(run, tmp_path / "o.json")
     assert output["case_verdicts"]["lr-mixed"] == "BLOCKED-OWNER"
     assert "case:lr-mixed" not in output["covered"]
@@ -633,6 +717,7 @@ def test_longrun_valid_fail_verdict_is_reported_as_fail(tmp_path):
     run = tmp_path / "run"
     imported = _import_longrun(run, _longrun_source(tmp_path, results={"linux": "FAIL"}))
     assert imported.returncode == 0, imported.stdout + imported.stderr
+    _bind_candidate(run, tmp_path)
     result, output = _judge_lr_mixed(run, tmp_path / "o.json")
     assert output["case_verdicts"]["lr-mixed"] == "FAIL"
     assert "case:lr-mixed" in output["failed"] and result.returncode == 1
@@ -657,6 +742,7 @@ def test_longrun_copy_is_revalidated_at_judgement(tmp_path):
     assert imported.returncode == 0, imported.stdout + imported.stderr
     with (run / "longrun" / "linux" / "observer.ndjson").open("a", encoding="utf-8") as stream:
         stream.write('{"kind":"sample"}\n')
+    _bind_candidate(run, tmp_path)
     _, output = _judge_lr_mixed(run, tmp_path / "o.json")
     assert output["case_verdicts"]["lr-mixed"] == "BLOCKED-OWNER"
     assert "observer.ndjson" in output["blocked_owner"]["case:lr-mixed"]
@@ -986,3 +1072,223 @@ def test_nested_pytest_does_not_write_into_outer_coverage_run(tmp_path):
     assert document["collected"] == [nodeid], document["collected"][:5]
     assert document["finished"] is True and not document.get("identity_errors")
     assert [row["phase"] for row in document["results"]] == ["setup", "call", "teardown"]
+
+
+# ---------------------------------------------------------------------------
+# T15 第 3 輪審查（P8X-e038dda-1～3）回歸
+# ---------------------------------------------------------------------------
+def _judge_reason(run: Path, out: Path) -> tuple[str, str]:
+    _, output = _judge_lr_mixed(run, out)
+    return output["case_verdicts"]["lr-mixed"], str(output["blocked_owner"].get("case:lr-mixed", ""))
+
+
+def _other_candidate(base: Path) -> Path:
+    return _candidate_bundle(base / "candidate-b", "linux", cli=b"cli-linux-b", daemon=b"d-linux-b")
+
+
+def _same_bins_other_bundle(base: Path) -> Path:
+    return _candidate_bundle(
+        base / "candidate-c", "linux", cli=b"cli-linux", daemon=b"d-linux", extra={"py/extra.py": b"changed"},
+    )
+
+
+@pytest.mark.parametrize(
+    "scenario,needle",
+    [
+        ("other_candidate", "本輪候選"),
+        ("same_bins_other_bundle", "bundle"),
+        ("no_bundle_record", "candidate-bundle.json"),
+        ("no_rust_results", "rust-linux"),
+        ("record_not_tested_artifact", "受測"),
+    ],
+    ids=["other_candidate", "same_bins_other_bundle", "no_bundle_record", "no_rust_results", "record_not_tested_artifact"],
+)
+def test_longrun_must_bind_current_candidate(tmp_path, scenario, needle):
+    """P8X-e038dda-1：長跑的 bundle、CLI、daemon 必須等於本輪候選；舊候選的 PASS 不得替新候選解鎖。"""
+    run = tmp_path / "run"
+    imported = _import_longrun(run, _longrun_source(tmp_path))
+    assert imported.returncode == 0, imported.stdout + imported.stderr
+    _bind_candidate(run, tmp_path, platforms=("windows",))
+    same = tmp_path / "bundles" / "linux"
+    if scenario == "other_candidate":
+        _bind_bundle(run, "linux", _other_candidate(tmp_path))
+    elif scenario == "same_bins_other_bundle":
+        _bind_bundle(run, "linux", _same_bins_other_bundle(tmp_path))
+    elif scenario == "no_bundle_record":
+        _bind_bundle(run, "linux", same, record=False)
+    elif scenario == "no_rust_results":
+        _bind_bundle(run, "linux", same, results=False)
+    elif scenario == "record_not_tested_artifact":
+        # 候選 bundle 紀錄是 A，但本輪 rust-linux 實際受測的是另一份 artifact。
+        _results(run, "rust-linux", "linux", [])
+        _bind_bundle(run, "linux", same, results=False)
+    verdict, reason = _judge_reason(run, tmp_path / "o.json")
+    assert verdict == "BLOCKED-OWNER", reason
+    assert "linux" in reason and needle in reason, reason
+
+
+def test_record_candidate_bundle_matches_deployed_content_digest(tmp_path):
+    """P8X-e038dda-1：候選 bundle 紀錄的 tree 雜湊與 realhw deployed_content 量測同算法；不覆寫、拒收 symlink。"""
+    bundle = _candidate_bundle(tmp_path / "b", "linux", cli=b"cli-linux", daemon=b"d-linux")
+    run = tmp_path / "run"
+    result = _run("--run-dir", str(run), "--record-candidate-bundle", f"linux={bundle}")
+    assert result.returncode == 0, result.stdout + result.stderr
+    record = json.loads((run / "artifacts" / "linux" / "candidate-bundle.json").read_text(encoding="utf-8"))
+    assert record == _candidate_record(bundle, "linux")
+    assert record["bundle_tree_sha256"] == _bundle_tree(bundle)
+    again = _run("--run-dir", str(run), "--record-candidate-bundle", f"linux={bundle}")
+    assert again.returncode == 2, again.stdout + again.stderr
+
+    linked = _candidate_bundle(tmp_path / "linked", "linux", cli=b"cli-linux", daemon=b"d-linux")
+    (linked / "py").mkdir()
+    (linked / "py" / "link").symlink_to(bundle / "release-manifest.json")
+    rejected = _run("--run-dir", str(tmp_path / "run2"), "--record-candidate-bundle", f"linux={linked}")
+    assert rejected.returncode == 2, rejected.stdout + rejected.stderr
+    assert not (tmp_path / "run2" / "artifacts" / "linux" / "candidate-bundle.json").exists()
+
+
+def test_slice24_exit_binds_candidate_bundle():
+    """P8X-e038dda-1：出口腳本可指定候選 bundle，受測 artifact 取自該 bundle 並寫入候選 bundle 紀錄。"""
+    script = EXIT_SCRIPT.read_text(encoding="utf-8")
+    assert "--candidate-bundle)" in script
+    assert '--record-candidate-bundle "linux=$CANDIDATE_ROOT"' in script
+    assert 'RUST_CLI="$CANDIDATE_ROOT/bin/serialwrap"' in script
+    assert 'RUST_DAEMON="$CANDIDATE_ROOT/bin/serialwrapd"' in script
+    assert '--record-candidate-bundle "windows=$WINDOWS_RUN/bundle"' in script
+
+
+def _rewrite_gate(src: Path, platform: str, name: str, mutate) -> None:
+    path = src / platform / name
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    mutate(doc)
+    path.write_text(json.dumps(doc), encoding="utf-8")
+
+
+def _resummarize(doc: dict) -> None:
+    doc["release_gate_result"] = _gate()._summarize(doc["checks"], True)
+
+
+def _set_result(doc: dict, check_id: str, result: str) -> None:
+    for check in doc["checks"]:
+        if check["id"] == check_id:
+            check["result"] = result
+
+
+def _drop(doc: dict, check_id: str) -> None:
+    doc["checks"] = [check for check in doc["checks"] if check["id"] != check_id]
+
+
+def test_longrun_dropping_safety_fail_row_is_rejected(tmp_path):
+    """P8X-e038dda-2：安全檢查 FAIL 時照實為 FAIL；移除該列並重算彙總後證據必須拒收，不得 PASS。"""
+    def fail_safety(doc):
+        _set_result(doc, "safety_unauthorized_tx", "FAIL")
+        _resummarize(doc)
+
+    src = _longrun_source(tmp_path)
+    _rewrite_gate(src, "linux", "release-gate.json", fail_safety)
+    run = tmp_path / "run"
+    imported = _import_longrun(run, src)
+    assert imported.returncode == 0, imported.stdout + imported.stderr
+    _bind_candidate(run, tmp_path)
+    verdict, _ = _judge_reason(run, tmp_path / "o.json")
+    assert verdict == "FAIL"
+
+    def drop_row(doc):
+        _drop(doc, "safety_unauthorized_tx")
+        _resummarize(doc)
+
+    _rewrite_gate(src, "linux", "release-gate.json", drop_row)
+    run2 = tmp_path / "run2"
+    imported2 = _import_longrun(run2, src)
+    assert imported2.returncode == 1, imported2.stdout + imported2.stderr
+    record = json.loads((run2 / "longrun-evidence.json").read_text(encoding="utf-8"))
+    assert record["platforms"]["linux"]["accepted"] is False
+    assert any("safety_unauthorized_tx" in error for error in record["platforms"]["linux"]["errors"]), record
+    _bind_candidate(run2, tmp_path)
+    verdict2, reason2 = _judge_reason(run2, tmp_path / "o2.json")
+    assert verdict2 == "BLOCKED-OWNER", reason2
+
+
+def _cand(mutate):
+    def apply(src: Path) -> None:
+        def wrapped(doc):
+            mutate(doc)
+            _resummarize(doc)
+        _rewrite_gate(src, "linux", "release-gate.json", wrapped)
+    return apply
+
+
+def _base(mutate):
+    def apply(src: Path) -> None:
+        _rewrite_gate(src, "linux", "baseline-release-gate.json", mutate)
+    return apply
+
+
+def _duplicate(doc: dict, check_id: str) -> None:
+    doc["checks"].append(dict(next(check for check in doc["checks"] if check["id"] == check_id)))
+
+
+def _regroup(doc: dict, check_id: str, group: str) -> None:
+    for check in doc["checks"]:
+        if check["id"] == check_id:
+            check["group"] = group
+
+
+@pytest.mark.parametrize(
+    "mutate,needle",
+    [
+        (_cand(lambda doc: _drop(doc, "resources")), "resources"),
+        (_cand(lambda doc: _drop(doc, "liveness_daemon_exit")), "liveness_daemon_exit"),
+        (_cand(lambda doc: _drop(doc, "error_rate_relative")), "error_rate_relative"),
+        (_cand(lambda doc: _duplicate(doc, "safety_double_holder")), "重複"),
+        (_cand(lambda doc: doc["checks"].append(
+            {"id": "custom_extra", "group": "evidence", "status": "evaluated", "result": "PASS", "detail": {}})),
+         "custom_extra"),
+        (_cand(lambda doc: _set_result(doc, "error_rate_relative", _NA)), _NA),
+        (_cand(lambda doc: _regroup(doc, "liveness_restart", "evidence")), "group"),
+        (_base(lambda doc: _drop(doc, "safety_unauthorized_tx")), "baseline-release-gate.json"),
+        (_base(lambda doc: _set_result(doc, "safety_unauthorized_tx", "FAIL")), "baseline_result"),
+    ],
+    ids=[
+        "cand_drop_resources", "cand_drop_liveness_exit", "cand_drop_relative", "cand_duplicate_id",
+        "cand_extra_id", "cand_not_applicable", "cand_group_mismatch", "base_drop_safety", "base_result_mismatch",
+    ],
+)
+def test_longrun_requires_formal_gate_check_set(tmp_path, mutate, needle):
+    """P8X-e038dda-2：candidate 與 baseline 都須具備正式 P2 gate 的完整檢查集合、ID 唯一、group 與適用性一致。"""
+    src = _longrun_source(tmp_path)
+    mutate(src)
+    run = tmp_path / "run"
+    imported = _import_longrun(run, src)
+    assert imported.returncode == 1, imported.stdout + imported.stderr
+    record = json.loads((run / "longrun-evidence.json").read_text(encoding="utf-8"))
+    errors = record["platforms"]["linux"]["errors"]
+    assert record["platforms"]["linux"]["accepted"] is False
+    assert any(needle in error for error in errors), errors
+    _bind_candidate(run, tmp_path)
+    verdict, _ = _judge_reason(run, tmp_path / "o.json")
+    assert verdict == "BLOCKED-OWNER"
+
+
+def test_parametrized_union_requires_every_node_on_both_sides(tmp_path):
+    """P8X-e038dda-3：雙邊參數聯集的每個節點都要逐側收集且通過；雙邊皆未通過的節點不得漏判。"""
+    cc = _module()
+    base = "tests/t.py::test_gate"
+    item = _item(nodeids=[base], parametrized={base: ["quiet"]})
+    rust_rows = [_row(f"{base}[quiet]")]
+    python_rows = [_row(f"{base}[quiet]"), _row(f"{base}[extra]", outcome="skipped", phase="setup")]
+    run, docs = _rust_python_docs(tmp_path, rust_rows, python_rows)
+    report = cc.evaluate({"rpc_method:params": item}, docs, run_dir=run)
+    assert "rpc_method:params" not in report["covered"]
+    assert f"{base}[extra]" in report["missing_reasons"].get("rpc_method:params", ""), report["missing_reasons"]
+
+    both_skip = [_row(f"{base}[quiet]"), _row(f"{base}[extra]", outcome="skipped", phase="setup")]
+    run2, docs2 = _rust_python_docs(tmp_path / "skip", both_skip, both_skip)
+    report2 = cc.evaluate({"rpc_method:params": item}, docs2, run_dir=run2)
+    assert "rpc_method:params" not in report2["covered"]
+    assert f"{base}[extra]" in report2["missing_reasons"].get("rpc_method:params", ""), report2["missing_reasons"]
+
+    rust_fail = [_row(f"{base}[quiet]"), _row(f"{base}[extra]", outcome="failed")]
+    run3, docs3 = _rust_python_docs(tmp_path / "fail", rust_fail, python_rows)
+    report3 = cc.evaluate({"rpc_method:params": item}, docs3, run_dir=run3)
+    assert "rpc_method:params" in report3["failed"], report3
