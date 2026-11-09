@@ -714,6 +714,114 @@ pub fn try_wait_new_daemon_pid(port: u16, old: u32, timeout: Duration) -> Option
     wait_pid_where(port, timeout, |pid| pid != old)
 }
 
+/// 觀察 windows-task 崩潰後不會自動重新拉起：90 秒內不得出現新 pid，工作狀態須維持非執行中。
+///
+/// 每 250 ms 探測 staging RPC，每秒查詢具名排程工作，每 5 秒核對 staging 執行檔行程；任何查詢無法
+/// 證明安全條件或發現重啟即回傳錯誤。呼叫前應先等工作離開 Running，讓觀察窗只涵蓋崩潰後的靜止狀態。
+pub fn observe_no_task_restart(
+    env: &dyn SysEnv,
+    ctl: &dyn ServiceCtl,
+    port: u16,
+    task: &str,
+    exe: &str,
+    old_pid: u32,
+    timeout: Duration,
+) -> Result<NoRestartObservation, String> {
+    assert_test_task_name(task);
+    if timeout.is_zero() {
+        return Err("OD-83 觀察窗不得為零".into());
+    }
+
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let mut next_task_check = started;
+    let mut next_process_check = started;
+    let mut rpc_checks = 0usize;
+    let mut task_checks = 0usize;
+    let mut process_checks = 0usize;
+
+    loop {
+        rpc_checks += 1;
+        if let Ok(reply) = rpc_call(port, "health.status", "{}", Duration::from_millis(250)) {
+            if reply.get("ok").and_then(Json::as_bool) == Some(true) {
+                let pid = reply
+                    .get("pid")
+                    .and_then(Json::as_u32)
+                    .ok_or_else(|| format!("health.status 回應成功但沒有 pid：{reply:?}"))?;
+                if pid != old_pid {
+                    return Err(format!(
+                        "90 秒觀察窗內 health.status 出現新 daemon pid {pid}（舊 pid {old_pid}）"
+                    ));
+                }
+                return Err(format!(
+                    "taskkill_force 後舊 daemon pid {old_pid} 仍回應 health.status"
+                ));
+            }
+        }
+
+        let now = Instant::now();
+        if now >= next_task_check {
+            let state = ctl.query_named(&SupervisionMode::WindowsTask, task);
+            if !matches!(state, TaskQuery::NotRunning(_)) {
+                return Err(format!(
+                    "90 秒觀察窗內排程工作狀態不是 NotRunning：{state:?}"
+                ));
+            }
+            task_checks += 1;
+            next_task_check = now + Duration::from_secs(1);
+        }
+
+        if now >= next_process_check {
+            let pids = staging_exe_pids(env, exe)?;
+            if pids.contains(&old_pid) {
+                return Err(format!(
+                    "taskkill_force 後 staging daemon 舊 pid {old_pid} 仍存在"
+                ));
+            }
+            if let Some(pid) = pids.first() {
+                return Err(format!(
+                    "90 秒觀察窗內 staging daemon 出現新 pid {pid}（舊 pid {old_pid}）"
+                ));
+            }
+            process_checks += 1;
+            next_process_check = now + Duration::from_secs(5);
+        }
+
+        if now >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    let final_task_state = ctl.query_named(&SupervisionMode::WindowsTask, task);
+    if !matches!(final_task_state, TaskQuery::NotRunning(_)) {
+        return Err(format!("90 秒觀察窗結束時排程工作狀態不是 NotRunning：{final_task_state:?}"));
+    }
+    let final_process_pids = staging_exe_pids(env, exe)?;
+    if !final_process_pids.is_empty() {
+        return Err(format!("90 秒觀察窗結束時仍有 staging daemon 行程：{final_process_pids:?}"));
+    }
+
+    Ok(NoRestartObservation {
+        elapsed: started.elapsed(),
+        rpc_checks,
+        task_checks,
+        process_checks,
+        final_task_state,
+        final_process_pids,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct NoRestartObservation {
+    pub elapsed: Duration,
+    pub rpc_checks: usize,
+    pub task_checks: usize,
+    pub process_checks: usize,
+    pub final_task_state: TaskQuery,
+    pub final_process_pids: Vec<u32>,
+}
+
 fn wait_pid_where(port: u16, timeout: Duration, ok: impl Fn(u32) -> bool) -> Option<u32> {
     let deadline = Instant::now() + timeout;
     loop {

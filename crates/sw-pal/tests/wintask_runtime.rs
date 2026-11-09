@@ -26,13 +26,16 @@ mod support;
 #[cfg(windows)]
 #[test]
 #[ignore = "cap:supervisor_runtime"]
+// 函式名與 nodeid 已列入 L1 鎖；目前驗證 OD-83 的手動恢復路徑。
 fn cap_supervisor_runtime__task_pt0s_restart_and_graceful_stop() {
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use support::wintask::*;
-    use sw_pal::service_ctl::{ServiceAction, ServiceCtl, SupervisionMode, SupervisorDefinition, WindowsTaskCtl};
+    use sw_pal::service_ctl::{
+        ServiceAction, ServiceCtl, SupervisionMode, SupervisorDefinition, TaskQuery, WindowsTaskCtl,
+    };
 
     if !allowed() {
         panic!("需擁有者設定 SW_TEST_ALLOW_SCHTASKS=1 才可建立測試排程工作（未授權＝證據不足）");
@@ -97,15 +100,43 @@ fn cap_supervisor_runtime__task_pt0s_restart_and_graceful_stop() {
     let pid0 = checked(pid0, "首次啟動");
 
     taskkill_force(&*p.env, pid0, &spec.daemon_exe());
-    let t0 = Instant::now();
-    let pid1 = try_wait_new_daemon_pid(spec.port, pid0, Duration::from_secs(150)).unwrap_or_else(|| {
+    assert!(
+        wait_task_not_running(&*ctl, &name, Duration::from_secs(10)),
+        "taskkill_force 後排程工作應停止，才能開始 OD-83 觀察窗"
+    );
+    let crash_observation = observe_no_task_restart(
+        &*p.env,
+        &*ctl,
+        spec.port,
+        &name,
+        &spec.daemon_exe(),
+        pid0,
+        Duration::from_secs(90),
+    )
+    .unwrap_or_else(|e| {
         panic!(
-            "150 s 內排程未重新拉起 daemon（舊 pid {pid0}；BLOCKED-OWNER (3)：TerminateProcess 是否觸發 RestartOnFailure）\ndaemon.log：{}",
+            "OD-83：0.5.0 已知限制應為強制終止後 90 s 內沒有新 daemon pid、排程工作不是 Running；長期要對齊 Linux 自動重啟。{e}\ndaemon.log：{}",
             spec.log_tail(4000)
         )
     });
-    assert!(t0.elapsed() <= Duration::from_secs(150) && pid1 != pid0, "150 s 內須由 RestartOnFailure 重新拉起");
-    let pid1 = checked(pid1, "失敗重啟後");
+    assert!(
+        crash_observation.elapsed >= Duration::from_secs(90)
+            && matches!(crash_observation.final_task_state, TaskQuery::NotRunning(_))
+            && crash_observation.final_process_pids.is_empty(),
+        "OD-83：0.5.0 已知限制應為強制終止後 90 s 內沒有新 daemon pid、排程工作不是 Running；長期要對齊 Linux 自動重啟。觀察結果：{crash_observation:?}"
+    );
+    eprintln!("[wintask] OD-83 崩潰後不自動重啟觀察：{crash_observation:?}");
+
+    let started = ctl.action_named(&w, &name, ServiceAction::Start, false);
+    assert!(started.ok, "正式 service start（/Run）失敗：{started:?}");
+    let pid1 =
+        try_wait_new_daemon_pid(spec.port, pid0, Duration::from_secs(20)).unwrap_or_else(|| {
+            panic!(
+                "正式 service start 後 20 s 內沒有新的 daemon pid（舊 pid {pid0}）\ndaemon.log：{}",
+                spec.log_tail(4000)
+            )
+        });
+    let pid1 = checked(pid1, "service start 恢復後");
 
     let r = formal_service_stop(&*p.env, &harness, &spec, &name)
         .unwrap_or_else(|e| panic!("正式 service stop 失敗：{e}\ndaemon.log：{}", spec.log_tail(4000)));
