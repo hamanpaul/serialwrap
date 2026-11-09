@@ -4526,6 +4526,74 @@ fn wp510_review5_configure_failure_fail_close_keeps_handle_in_drain() {
     assert_eq!(device.open_count(), 1, "不得重新開埠");
 }
 
+/// wp510 第六輪增量審查 P8-fdc1413-1（High）：佔位交接的 attach worker 送出 `DeviceAttached` 後進入收尾，停在
+/// `finish_attach_op` 取得 manager 鎖之前；此時正式 session 的 `open_bridge` 套用 UART 設定失敗、關閉回條
+/// `closed:false`，`retain_unconfirmed_close` 把同一作業標為未確認關閉。worker 恢復後必須以鎖內的最新標記判定，
+/// 保留作業。Python `_finish_attach_op` 在作業鎖內判定 close 結果，失敗即保留作業、不設 `done`
+/// （`origin/main:sw_core/session_manager.py:4322-4332`）；release 等 `done` 逾期回 DRAIN_STALLED（`:3192-3204`），
+/// shutdown 把未完成作業列入 stalled（`:1231-1239`）。
+#[test]
+fn wp510_review6_finish_attach_op_rereads_close_failed_under_lock() {
+    const BY_ID: &str = "/s/by-id/usb-G";
+    const REAL: &str = "/dev/ttyG";
+    let m = wp510_b_placeholder_rig(false, false);
+    let device = m.device(REAL);
+    m.mgr.update_devices(&m.snapshot());
+    let (finish_entered_tx, finish_entered_rx) = crossbeam_channel::bounded(1);
+    let (finish_go_tx, finish_go_rx) = crossbeam_channel::bounded::<()>(1);
+    m.mgr.set_finish_attach_op_pre_lock_hook_for_test(
+        BY_ID,
+        Box::new(move || {
+            let _ = finish_entered_tx.send(());
+            let _ = finish_go_rx.recv_timeout(Duration::from_secs(10));
+        }),
+    );
+    device.fail_configure(PalError::io(5, "[Errno 5] Input/output error"));
+    device.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
+    let bridge_go = wp510_review5_pause_open_bridge(&m);
+    finish_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("attach worker 應停在 finish_attach_op 取鎖之前");
+
+    // open_bridge 在 worker 收尾取鎖前完成 configure 失敗與 closed:false 的關閉（retain 先於 BridgeOpened 回報）。
+    bridge_go.send(()).expect("放行 open_bridge");
+    wait_until("正式 session 開埠失敗", || {
+        m.state_of("t:COM3").as_deref() == Some("DETACHED")
+    });
+    finish_go_tx.send(()).expect("放行 attach worker 收尾");
+    // worker 恢復後只剩取鎖與判定；以有界等待觀察作業是否被移除（保留時於期限後回 false）。
+    let removed = m.mgr.wait_attach_idle_for_test(BY_ID, Duration::from_millis(500));
+
+    let inflight_kept = m.mgr.has_inflight_attach_for_test(BY_ID);
+    let release = rpc(wp510_release(&m.mgr, "t:COM3"));
+    let state_after_release = m.state_of("t:COM3");
+    let drained = m.mgr.shutdown(Duration::from_millis(100));
+    let attach_key = format!("attach:{BY_ID}");
+    let observed = format!(
+        "removed={removed} inflight={inflight_kept} release={release:?} state={state_after_release:?} shutdown={drained:?}"
+    );
+
+    assert!(inflight_kept, "未確認關閉的 handle 必須保留 inflight 阻擋：{observed}");
+    assert_eq!(code_of(&release).as_deref(), Some("DRAIN_STALLED"), "{observed}");
+    assert_eq!(wp510_review5_bool(&release, "drain_stalled"), Some(true), "{observed}");
+    assert_ne!(
+        state_after_release.as_deref(),
+        Some("RELEASED"),
+        "未確認關閉的 handle 不得完成 release：{observed}"
+    );
+    assert!(
+        drained.iter().any(|(key, ok)| key == &attach_key && !ok),
+        "未確認關閉的 handle 必須列入 shutdown stalled：{observed}"
+    );
+    assert!(
+        !m.load_state_now().released.contains_key("t:COM3"),
+        "release 未收斂不得持久化 RELEASED：{observed}"
+    );
+    assert!(device.is_open(), "closed:false 表示 handle 仍開啟");
+    assert_eq!(device.close_count(), 1, "handle 只關閉一次");
+    assert_eq!(device.open_count(), 1, "不得重新開埠");
+}
+
 /// wp510 第五次整包審查 Medium：佔位交接的 attach worker 建立失敗（`Builder::spawn()` 回錯）。Python
 /// `attach_device` 同步呼叫 `_spawn_attach`（`origin/main:sw_core/session_manager.py:3633-3638`），`worker.start()`
 /// 的例外穿出 RPC（`:4147-4150`），不會回成功；佔位與持久化阻擋須維持，不可新舊 session 皆不存在。

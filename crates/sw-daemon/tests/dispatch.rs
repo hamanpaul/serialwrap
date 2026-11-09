@@ -6209,3 +6209,95 @@ fn wp510_review5_rpc_shutdown_before_bridge_takes_preopened_fail_close_reports_s
     );
     assert_eq!(dev.open_count(), 1, "停機後不得重新開埠");
 }
+
+/// wp510 第六輪增量審查 P8-fdc1413-1（High，RPC 端到端）：`device.attach` 經 `Service::rpc` → `route_with_selector`
+/// → `attach_released_placeholder` 交接；attach worker 送出 `DeviceAttached` 後停在 `finish_attach_op` 取鎖之前，
+/// 正式 session 的 `open_bridge` 套用 UART 設定失敗且關閉回條 `closed:false`（`retain_unconfirmed_close` 標記同一作業）。
+/// worker 恢復後必須保留作業：Python `_finish_attach_op` 關閉失敗不設 `done`、保留作業
+/// （`origin/main:sw_core/session_manager.py:4322-4332`），`device.release` 等待逾期回 DRAIN_STALLED（`:3192-3204`），
+/// shutdown 列入 stalled（`:1231-1239`）。
+#[test]
+fn wp510_review6_rpc_finish_attach_op_race_keeps_unconfirmed_close_blocking() {
+    let r = wp510_b_placeholder_rig();
+    let dev = r.device(WP510_REAL_G);
+    let (finish_entered_tx, finish_entered_rx) = crossbeam_channel::bounded(1);
+    let (finish_go_tx, finish_go_rx) = crossbeam_channel::bounded::<()>(1);
+    r.mgr.set_finish_attach_op_pre_lock_hook_for_test(
+        WP510_PLACEHOLDER_BY_ID,
+        Box::new(move || {
+            let _ = finish_entered_tx.send(());
+            let _ = finish_go_rx.recv_timeout(Duration::from_secs(10));
+        }),
+    );
+    let (bridge_entered_tx, bridge_entered_rx) = crossbeam_channel::bounded(1);
+    let (bridge_go_tx, bridge_go_rx) = crossbeam_channel::bounded::<()>(1);
+    r.mgr.set_open_bridge_pre_take_hook_for_test(Box::new(move || {
+        let _ = bridge_entered_tx.send(());
+        let _ = bridge_go_rx.recv_timeout(Duration::from_secs(10));
+    }));
+    dev.fail_configure(PalError::io(5, "[Errno 5] Input/output error"));
+    dev.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
+
+    let attached = r.call(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    assert_eq!(
+        attached.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "device.attach 應交接在線佔位：{}",
+        j(&attached)
+    );
+    bridge_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("正式 session 的 open_bridge 應停在接手預開 handle 之前");
+    finish_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("attach worker 應停在 finish_attach_op 取鎖之前");
+    // 偵測 PROBE 已在 worker 收尾前送出；之後的設定失敗與收尾不得再有 TX。
+    let tx_before_bridge = dev.tx_len();
+    bridge_go_tx.send(()).expect("放行 open_bridge");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while r.session("t:COM3").map(|session| s(&session, "state").to_string()).as_deref()
+        != Some("DETACHED")
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+        r.session("t:COM3").map(|session| s(&session, "state").to_string()).as_deref(),
+        Some("DETACHED"),
+        "正式 session 的開埠失敗應先完成"
+    );
+    finish_go_tx.send(()).expect("放行 attach worker 收尾");
+    // worker 恢復後只剩取鎖與判定；以有界等待觀察作業是否被移除（保留時於期限後回 false）。
+    let removed = r
+        .mgr
+        .wait_attach_idle_for_test(WP510_PLACEHOLDER_BY_ID, Duration::from_millis(500));
+
+    let inflight_kept = r.mgr.has_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID);
+    let released = r.call("device.release", r#"{"selector":"t:COM3"}"#);
+    let drained = r.mgr.shutdown(Duration::from_millis(100));
+    let observed = format!(
+        "removed={removed} inflight={inflight_kept} release={} shutdown={drained:?}",
+        j(&released)
+    );
+
+    assert!(inflight_kept, "未確認關閉的 handle 必須保留 inflight 阻擋：{observed}");
+    assert_eq!(s(&released, "error_code"), "DRAIN_STALLED", "{observed}");
+    assert_eq!(released.get("drain_stalled"), Some(&PyValue::Bool(true)), "{observed}");
+    assert_ne!(
+        s(&sub(&released, "session"), "state"),
+        "RELEASED",
+        "未確認關閉的 handle 不得完成 release：{observed}"
+    );
+    assert!(
+        drained
+            .iter()
+            .any(|(target, ok)| target == &format!("attach:{WP510_PLACEHOLDER_BY_ID}") && !ok),
+        "未確認關閉的 handle 必須列入 shutdown stalled：{observed}"
+    );
+    assert!(dev.is_open(), "closed:false 表示 handle 仍開啟");
+    assert_eq!(dev.open_count(), 1, "不得重新開埠");
+    assert_eq!(dev.tx_len(), tx_before_bridge, "設定失敗的 handle 不得再送出任何 TX");
+}

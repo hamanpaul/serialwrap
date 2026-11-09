@@ -262,7 +262,9 @@ static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 ///
 /// 回歸：`wp510_review5_shutdown_before_bridge_takes_preopened_fail_close_reports_stalled`（④ shutdown）、
 /// `wp510_review5_release_waiting_bridge_open_fail_close_reports_drain_stalled`（④⑤ release）、
-/// `wp510_review5_configure_failure_fail_close_keeps_handle_in_drain`（④ configure 失敗，無 stop 在途）。
+/// `wp510_review5_configure_failure_fail_close_keeps_handle_in_drain`（④ configure 失敗，無 stop 在途）、
+/// `wp510_review6_finish_attach_op_rereads_close_failed_under_lock`（④ 與 attach worker 收尾交錯：`finish_attach_op`
+/// 於 manager 鎖內重讀 `close_failed`，不以取鎖前的快照移除已被 `retain_unconfirmed_close` 標記的作業）。
 #[derive(Clone)]
 struct AttachOp {
     token: u64,
@@ -339,6 +341,10 @@ impl AttachOp {
         receipt
     }
 }
+
+/// 只供測試（test-fakes）：綁定 by_id 的一次性暫停點。
+#[cfg(feature = "test-fakes")]
+type ByIdTestHook = (String, Box<dyn FnOnce() + Send>);
 
 /// 已建立、尚未放行的 attach worker 執行緒（`Shared::prepare_attach_worker`）。
 struct PreparedAttachWorker {
@@ -454,6 +460,10 @@ struct Shared {
     /// session 後、正式 bridge 接手前的 shutdown 交錯）。
     #[cfg(feature = "test-fakes")]
     open_bridge_pre_take_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// 只供測試（test-fakes）：指定 by_id 的下一次 `finish_attach_op` 取得 manager 鎖之前的一次性暫停點（重現 attach
+    /// worker 收尾與 `open_bridge` 的 `retain_unconfirmed_close` 交錯；wp510 P8-fdc1413-1）。
+    #[cfg(feature = "test-fakes")]
+    finish_attach_op_pre_lock_hook: Mutex<Option<ByIdTestHook>>,
     /// 只供測試（test-fakes）：下一次建立 attach worker 執行緒時模擬 `Builder::spawn()` 失敗（執行緒資源耗盡）。
     #[cfg(feature = "test-fakes")]
     fail_next_attach_spawn: AtomicBool,
@@ -1714,12 +1724,23 @@ impl Shared {
             lock(&op.close_error).get_or_insert_with(|| close_error_text(receipt));
             op.close_failed.store(true, Ordering::SeqCst);
         }
-        let close_failed = op.close_failed.load(Ordering::SeqCst);
-        if close_failed {
-            // Python `_finish_attach_op`（`session_manager.py:4322-4332`）：關閉失敗先以 by_id 與例外告警，
-            // 再保留阻擋；每次失敗的關閉只告警一次（Rust 的 handle 只關閉一次）。
-            if let Some(error) = lock(&op.close_error).take() {
-                self.warn(preopened_close_warning(by_id, &error));
+        // Python `_finish_attach_op`（`session_manager.py:4322-4332`）：關閉失敗先以 by_id 與例外告警，
+        // 再保留阻擋；每次失敗的關閉只告警一次（Rust 的 handle 只關閉一次）。`close_error` 只隨 `close_failed`
+        // 一起寫入，告警與否不影響下方的保留判定。
+        if let Some(error) = lock(&op.close_error).take() {
+            self.warn(preopened_close_warning(by_id, &error));
+        }
+        #[cfg(feature = "test-fakes")]
+        {
+            let hook = {
+                let mut slot = lock(&self.finish_attach_op_pre_lock_hook);
+                match slot.as_ref() {
+                    Some((key, _)) if key == by_id => slot.take().map(|(_, hook)| hook),
+                    _ => None,
+                }
+            };
+            if let Some(hook) = hook {
+                hook();
             }
         }
         let mut inner = lock(&self.inner);
@@ -1730,7 +1751,10 @@ impl Shared {
         {
             // Python `_finish_attach_op` 對任何取消原因都在 close 失敗時保留作業；不能只在 release
             // 分支檢查，否則 shutdown／裝置改指會遺失仍可能持有 UART 的阻擋。
-            if close_failed {
+            // 必須在 manager 鎖內重讀：`open_bridge` 的 `retain_unconfirmed_close` 於同一把鎖內把仍在表內的作業
+            // 標為未確認關閉；取鎖前的快照會漏掉該標記而移除作業（wp510 P8-fdc1413-1）。鎖內讀取使兩者線性化：
+            // 標記先發生則此處保留，移除先發生則 retain 另登錄新的阻擋作業。
+            if op.close_failed.load(Ordering::SeqCst) {
                 return;
             }
             if op.release_requested.load(Ordering::SeqCst) {
@@ -3295,6 +3319,8 @@ impl SessionManager {
             #[cfg(feature = "test-fakes")]
             open_bridge_pre_take_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
+            finish_attach_op_pre_lock_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
             fail_next_attach_spawn: AtomicBool::new(false),
         });
         shared.bootstrap_sessions(&load.profiles);
@@ -4203,6 +4229,16 @@ impl SessionManager {
     #[cfg(feature = "test-fakes")]
     pub fn set_open_bridge_pre_take_hook_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
         *lock(&self.shared.open_bridge_pre_take_hook) = Some(hook);
+    }
+
+    /// 只供測試（test-fakes）：設定 `by_id` 下一次 `finish_attach_op` 取得 manager 鎖之前的一次性暫停點。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_finish_attach_op_pre_lock_hook_for_test(
+        &self,
+        by_id: &str,
+        hook: Box<dyn FnOnce() + Send>,
+    ) {
+        *lock(&self.shared.finish_attach_op_pre_lock_hook) = Some((by_id.to_string(), hook));
     }
 
     /// 只供測試（test-fakes）：下一次建立 attach worker 執行緒時模擬 `Builder::spawn()` 回錯。
