@@ -2798,3 +2798,145 @@ fn wp510_review7_open_gate_close_blocked_maps_per_entry() {
         }
     }
 }
+
+/// wp510 第 15 項（第九次整包審查 High P8-8463b22-1）：交接 handle 由 release 認領、`ReleaseAttachPending` 已把 session
+/// 設為 RECOVERING（`origin/main:sw_core/session_manager.py:3133-3139`），release 於期限回 DRAIN_STALLED
+/// （`:3192-3204`）之後，在途開埠（actor 已發 `OpenBridge`）的結果才回報。`h` 停在遲到收尾前的狀態並回傳收尾所用的 token。
+fn wp510_review11_release_stalled_with_open_in_flight(h: &mut CoreHarness) -> u64 {
+    let effects = h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    assert!(
+        effects.iter().any(|effect| matches!(effect, Effect::OpenBridge { .. })),
+        "前置：actor 已發出 OpenBridge"
+    );
+    h.rpc(SessionRequest::ReleaseAttachPending {
+        by_id: DEVICE_BY_ID.into(),
+        handoff_token: 77,
+    })
+    .unwrap();
+    assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
+    let token = 4242;
+    let stalled = h
+        .rpc(SessionRequest::PlaceholderAttachStalled { token, epoch: 0 })
+        .unwrap();
+    assert_eq!(stalled.get("drain_stalled"), Some(&PyValue::Bool(true)));
+    token
+}
+
+/// 遲到的關閉收尾（Python `_finish_attach_op` 的 release 分支，`:4340-4363`）：不需第二次 release，即轉 RELEASED、
+/// `released_by`／`released_reason` 取第一個 release 請求、清 `drain_stalled`／`drain_timeout_epoch` 並落盤。
+fn wp510_review11_assert_late_settle_completes_release(h: &mut CoreHarness, token: u64) {
+    h.rpc(SessionRequest::PlaceholderAttachSettled {
+        token,
+        release_source: "cli".into(),
+        release_reason: PyValue::from("late-close"),
+    })
+    .unwrap();
+    let public = h.public();
+    assert_eq!(public["state"], PyValue::from("RELEASED"), "{public:?}");
+    assert_eq!(public["released_by"], PyValue::from("cli"));
+    assert_eq!(public["released_reason"], PyValue::from("late-close"));
+    assert_eq!(public["drain_stalled"], PyValue::Bool(false));
+    assert_eq!(public["drain_timeout_epoch"], PyValue::Null);
+    assert!(
+        h.state_store.last_released().contains_key("t:COM0"),
+        "RELEASED 必須落盤"
+    );
+}
+
+/// 被取消的開埠以一般開埠錯誤結束（審查實測：撤銷標記被清除後另開新 handle，因原 handle 仍開啟而失敗）：開埠已到終態，
+/// actor 不得再把它當成在途開埠，遲到的關閉收尾須完成 RELEASED。
+#[test]
+fn wp510_review11_open_failure_after_release_stalled_lets_late_settle_release() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let token = wp510_review11_release_stalled_with_open_in_flight(&mut h);
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Err(OpenFailure::Other(PalError::io(16, "Device or resource busy"))),
+    });
+    wp510_review11_assert_late_settle_completes_release(&mut h, token);
+}
+
+/// 同上，但遲到的開埠成功：actor 不接手（非 ATTACHING），退休 bridge 後開埠同樣已到終態，遲到收尾須完成 RELEASED。
+#[test]
+fn wp510_review11_open_success_after_release_stalled_lets_late_settle_release() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let token = wp510_review11_release_stalled_with_open_in_flight(&mut h);
+    let opened = h.opened_bridge(REAL_PATH);
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Ok(opened),
+    });
+    wp510_review11_assert_late_settle_completes_release(&mut h, token);
+}
+
+/// `Effect::ClearRevokedHandoff` 的 `(by_id, token)` 清單。
+fn wp510_review11_revoke_clears(effects: &[Effect]) -> Vec<(String, u64)> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::ClearRevokedHandoff { by_id, token } => Some((by_id.clone(), *token)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 撤銷標記的生命週期（wp510 第九次整包審查 High P8-8463b22-1）：開埠在途時 `ReleaseAttachPending` 不清除標記，
+/// 留到該開埠的 `BridgeOpened` 終態才清除（開埠 worker 撞到標記即不開埠；Python 取消旗標隨作業保留，
+/// `origin/main:sw_core/session_manager.py:3125`、`:4986-4996`），之後的開埠結果不再重複清除。
+#[test]
+fn wp510_review11_revoke_kept_until_in_flight_open_terminal() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    let (_, effects) = h.rpc_full(SessionRequest::ReleaseAttachPending {
+        by_id: DEVICE_BY_ID.into(),
+        handoff_token: 77,
+    });
+    assert!(
+        wp510_review11_revoke_clears(&effects).is_empty(),
+        "開埠在途時不得清除撤銷標記"
+    );
+    let effects = h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Err(OpenFailure::CloseBlocked),
+    });
+    assert_eq!(
+        wp510_review11_revoke_clears(&effects),
+        vec![(DEVICE_BY_ID.to_string(), 77)],
+        "在途開埠的終態清除撤銷標記"
+    );
+    let effects = h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Err(OpenFailure::CloseBlocked),
+    });
+    assert!(wp510_review11_revoke_clears(&effects).is_empty(), "只清除一次");
+}
+
+/// 無開埠在途：之後的 `DeviceAttached` 在 RECOVERING 不開埠（Python `_attach_by_id` 見取消中止），標記不會再被取用，
+/// `ReleaseAttachPending` 即清除。
+#[test]
+fn wp510_review11_revoke_cleared_when_no_open_in_flight() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (_, effects) = h.rpc_full(SessionRequest::ReleaseAttachPending {
+        by_id: DEVICE_BY_ID.into(),
+        handoff_token: 78,
+    });
+    assert_eq!(
+        wp510_review11_revoke_clears(&effects),
+        vec![(DEVICE_BY_ID.to_string(), 78)]
+    );
+    assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
+    let effects = h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    assert!(
+        !effects.iter().any(|effect| matches!(effect, Effect::OpenBridge { .. })),
+        "RECOVERING 的 DeviceAttached 不得開埠"
+    );
+}

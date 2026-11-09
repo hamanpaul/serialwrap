@@ -204,7 +204,16 @@ pub enum SessionRequest {
     /// release 取得交接 handle 的關閉中作業（`SessionManager` 的交接表認領）：Python `release_device` 找到作業即於鎖內
     /// 把非 RELEASED 的 session 設 RECOVERING，首次 release 請求清 `drain_stalled`／`drain_timeout_epoch`
     /// （`origin/main:sw_core/session_manager.py:3133-3139`）。
-    ReleaseAttachPending,
+    ///
+    /// `(by_id, handoff_token)` 是 release 撤銷的交接列（`SessionManager` 的撤銷標記）。標記的生命週期綁定被取消的開埠
+    /// 作業，不隨 release RPC 返回而移除（wp510 第九次整包審查 High P8-8463b22-1）：本請求處理時無開埠在途，之後的
+    /// `DeviceAttached` 在 RECOVERING／RELEASED 不再開埠，即以 `Effect::ClearRevokedHandoff` 清除；開埠在途時保留到
+    /// 該開埠的 `BridgeOpened` 終態（開埠 worker 撞到標記即不開埠，對應 Python 取消旗標隨作業保留、`_attach_by_id` 見
+    /// `cancelled` 中止，`:3125`、`:4933-4944`、`:4986-4996`）。
+    ReleaseAttachPending {
+        by_id: String,
+        handoff_token: u64,
+    },
     /// 該 token 的 attach 作業已安全關閉 handle（release 請求過的作業收尾），清除先前由 release 逾時設定的 stall 欄位，
     /// 並依 Python `_finish_attach_op` 的 release 收尾（`session_manager.py:4340-4363`）處理第一個 release 請求
     /// `(release_source, release_reason)`：已 RELEASED（OD-63 佔位）補齊 `released_by`／`released_at` 後持久化；一般
@@ -247,6 +256,12 @@ pub enum Effect {
     Reattach {
         by_id: String,
         real_path: String,
+    },
+    /// 被 release 撤銷的交接列已確定不會再被開埠取用（見 `SessionRequest::ReleaseAttachPending`）：executor 移除
+    /// manager 交接表中同 by_id、同 token 的撤銷標記（`token` 不同者不動）。
+    ClearRevokedHandoff {
+        by_id: String,
+        token: u64,
     },
     BeginDrain {
         stop_id: StopId,
@@ -413,6 +428,8 @@ pub struct SessionCore {
     pending_open_stop: Option<PendingOpenStop>,
     pending_attach: Option<PendingAttach>,
     open_real_path: Option<String>,
+    /// release 撤銷、等待在途開埠終態才清除的交接列 `(by_id, token)`（見 `SessionRequest::ReleaseAttachPending`）。
+    revoked_handoffs: Vec<(String, u64)>,
     /// clear 收尾後等 manager 再解析（Python `_spawn_attach` → `_reresolve_profile_on_reattach`）再送
     /// `DeviceAttached`：期間 state 為 ATTACHING、無開埠（審查 F61／F62）。
     reattach_pending: bool,
@@ -644,6 +661,7 @@ impl SessionCore {
             pending_open_stop: None,
             pending_attach: None,
             open_real_path: None,
+            revoked_handoffs: Vec::new(),
             reattach_pending: false,
             open_generation: 0,
             known_real_path: None,
@@ -782,6 +800,12 @@ impl SessionCore {
                 self.console_count = count;
             }
             MailboxItem::Control(ControlEvent::BridgeOpened { epoch_hint, result }) => {
+                // 開埠終態：等待本開埠的撤銷標記至此確定不會再被取用（開埠 worker 已撞到並移除，或路徑不同而未取用）。
+                effects.0.extend(
+                    std::mem::take(&mut self.revoked_handoffs)
+                        .into_iter()
+                        .map(|(by_id, token)| Effect::ClearRevokedHandoff { by_id, token }),
+                );
                 effects
                     .0
                     .extend(self.bridge_opened(epoch_hint, result, now));
@@ -2005,13 +2029,28 @@ impl SessionCore {
                 response.insert("error_code", PyValue::from("SESSION_RECOVERING"));
                 vec![Effect::Reply(reply, Ok(response))]
             }
-            SessionRequest::ReleaseAttachPending => {
+            SessionRequest::ReleaseAttachPending {
+                by_id,
+                handoff_token,
+            } => {
                 if self.state != SessionState::Released {
                     self.set_state(SessionState::Recovering, now);
                     self.drain_stalled = false;
                     self.drain_timeout_epoch = None;
                 }
-                vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
+                let mut effects = Vec::new();
+                if self.open_real_path.is_some() {
+                    // 開埠在途：可能正要取用該交接列，保留撤銷標記到其 `BridgeOpened` 終態。
+                    self.revoked_handoffs.push((by_id, handoff_token));
+                } else {
+                    // 無開埠在途，且 RECOVERING／RELEASED 的 `DeviceAttached` 不再開埠：標記不會再被取用。
+                    effects.push(Effect::ClearRevokedHandoff {
+                        by_id,
+                        token: handoff_token,
+                    });
+                }
+                effects.push(Effect::Reply(reply, Ok(self.ok_session(now))));
+                effects
             }
             SessionRequest::PlaceholderAttachSettled {
                 token,
@@ -2544,6 +2583,7 @@ impl SessionCore {
                     || !path_matches
                     || self.state != SessionState::Attaching && self.pending_attach.is_none()
                 {
+                    let opened_path = opened.real_path.clone();
                     let mut effects = self.retire_opened_bridge(opened);
                     if let Some(pending) = self.pending_attach.take() {
                         self.open_real_path = None;
@@ -2559,6 +2599,13 @@ impl SessionCore {
                         // 裝置於開啟途中改指 → 以目前 known_real_path 再送一次 OpenBridge；裝置已不在則 DETACHED。
                         self.open_real_path = None;
                         effects.extend(self.reopen_known_device(SessionState::Attaching, now));
+                    } else if self.state != SessionState::Attaching
+                        && self.open_real_path.as_deref() == Some(opened_path.as_str())
+                    {
+                        // wp510 第九次整包審查 High（P8-8463b22-1）：非 ATTACHING（release 已設 RECOVERING）時不接手，
+                        // 本次開埠已到終態；清除在途標記，遲到的 release 收尾（`PlaceholderAttachSettled`）才不會等待
+                        // 不再回報的開埠（Python `_finish_attach_op` 完成 RELEASED，`:4340-4363`）。
+                        self.open_real_path = None;
                     }
                     return effects;
                 }
@@ -2612,6 +2659,9 @@ impl SessionCore {
                     self.set_state(SessionState::Detached, now);
                     Vec::new()
                 } else {
+                    // wp510 第九次整包審查 High（P8-8463b22-1）：非 ATTACHING（release 已設 RECOVERING）時開埠失敗也是
+                    // 終態；清除在途標記，遲到的 release 收尾才能完成 RELEASED（`:4340-4363`）。
+                    self.open_real_path = None;
                     Vec::new()
                 }
             }

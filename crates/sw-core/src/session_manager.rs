@@ -306,7 +306,7 @@ static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// |---|---|---|---|---|
 /// | 開埠在途／worker 持有（`inflight`，非 parked） | 取消並等待作業收尾，期限到回 DRAIN_STALLED（`release_attach_handles`） | 取消並等待，未收尾列 stalled | 取消並等待，逾時 SESSION_RECOVERING | 取消；worker 收尾關閉 |
 /// | parked（`inflight`，`parked`） | 取出並關閉；未確認只告警、立即 DRAIN_STALLED | 不取出直接關閉；未確認保留並列 stalled | 取出並關閉（`close_parked_for_bind`）；未確認只告警，照常改綁 | 取出並關閉；未確認只告警 |
-/// | 交給 session、actor 尚未接手（`handoff`，未 `taken`） | 認領並留撤銷標記（排入的 `open_bridge` 回 `CloseBlocked`、不另開新 handle），handle 移入關閉中作業並寫入第一個 release 的請求與期限；鎖內排入 `ReleaseAttachPending`（Python 設 RECOVERING `:3133-3139`）；專用執行緒關閉，release 照在途作業等待：確認關閉後交 actor 完成 RELEASED，期限到回 DRAIN_STALLED、遲到的關閉由 `PlaceholderAttachSettled` 完成 RELEASED；未確認保留 | session 排空後認領並關閉；未確認保留並列 stalled | 認領並關閉後重試；未確認保留，逾時 SESSION_RECOVERING | 認領並關閉；未確認保留 |
+/// | 交給 session、actor 尚未接手（`handoff`，未 `taken`） | 認領並留撤銷標記（排入的 `open_bridge` 回 `CloseBlocked`、不另開新 handle；標記交 actor，無開埠在途即移除、開埠在途則於其 `BridgeOpened` 終態移除，不隨 release 返回或逾時移除），handle 移入關閉中作業並寫入第一個 release 的請求與期限；鎖內排入 `ReleaseAttachPending`（Python 設 RECOVERING `:3133-3139`）；專用執行緒關閉，release 照在途作業等待：確認關閉後交 actor 完成 RELEASED，期限到回 DRAIN_STALLED、遲到的關閉由 `PlaceholderAttachSettled` 完成 RELEASED；未確認保留 | session 排空後認領並關閉；未確認保留並列 stalled | 認領並關閉後重試；未確認保留，逾時 SESSION_RECOVERING | 認領並關閉；未確認保留 |
 /// | 交接列的關閉中作業（`inflight`，取消者正在關閉） | 取得同一作業、沿用首次期限等待（`:3104-3107`、`:3117-3125`），確認關閉前不回成功 | 等待，未收尾列 stalled | 等待，逾時 SESSION_RECOVERING | 已取消，由關閉者收尾 |
 /// | `open_bridge` 已取走（`handoff`，`taken`） | 交 actor（開埠在途的 pending stop） | 等待 `settle_handoff` | 等待 `settle_handoff`，逾時 SESSION_RECOVERING | 交 actor 的 `DeviceDetached` |
 ///
@@ -323,7 +323,10 @@ static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// `wp510_review10_rpc_releases_drain_stalled_while_handoff_close_blocked`（第八次審查 High P8-e25b69c-1）、
 /// `wp510_review10_rpc_release_after_revoked_bridge_open_reported_completes`（撤銷標記先於 `Release` 回報）、
 /// `wp510_review10_rpc_release_timeout_then_late_redetect_finish_completes_release`、
-/// `wp510_review10_late_redetect_finish_after_release_timeout_completes_release`（sw-core；第八次審查 High P8-e25b69c-2）。
+/// `wp510_review10_late_redetect_finish_after_release_timeout_completes_release`（sw-core；第八次審查 High P8-e25b69c-2）、
+/// `wp510_review11_rpc_release_timeout_keeps_revoke_until_bridge_open_reports`、
+/// `wp510_review11_open_failure_after_release_stalled_lets_late_settle_release`、
+/// `wp510_review11_open_success_after_release_stalled_lets_late_settle_release`（sw-core；第九次審查 High P8-8463b22-1）。
 #[derive(Clone)]
 struct AttachOp {
     token: u64,
@@ -443,7 +446,9 @@ struct HandoffEntry {
     /// `_finish_attach_op` 保留作業（作業未被取出，`:4322-4332`）。
     taken: bool,
     /// release 已取走並關閉 handle（Python 取消作業後 `_attach_by_id` 見 `cancelled` 中止、不開埠，`:4933-4944`、
-    /// `:4986-4996`）：同 session、同路徑的下一次 `open_bridge` 不開埠並移除本列；release 結束時亦移除。
+    /// `:4986-4996`）：同 session、同路徑的下一次 `open_bridge` 不開埠並移除本列。標記綁定被取消的開埠，不隨 release
+    /// RPC 返回而移除：actor 處理 `ReleaseAttachPending` 時無開埠在途即移除，開埠在途則於其 `BridgeOpened` 終態移除
+    /// （`Effect::ClearRevokedHandoff`）；沒有 actor 接手時於 release 結束移除。
     revoked: bool,
 }
 
@@ -1047,7 +1052,8 @@ impl Shared {
         self.finish_attach_op(by_id, op, None);
     }
 
-    /// release 結束：移除自己留下的撤銷標記（同 token 才移除）。
+    /// 移除 release 留下的撤銷標記（同 token 才移除）：actor 確定被取消的開埠不會再取用（`Effect::ClearRevokedHandoff`，
+    /// 見 `SessionRequest::ReleaseAttachPending`），或沒有 actor 接手時於 release 結束。
     fn clear_revoked_handoff(&self, by_id: &str, token: u64) {
         let mut inner = lock(&self.inner);
         if inner
@@ -3598,6 +3604,9 @@ impl EffectExecutor for ManagerExec {
             Effect::Reattach { by_id, .. } => {
                 self.shared.spawn_attach_with(&by_id, true, false, None)
             }
+            Effect::ClearRevokedHandoff { by_id, token } => {
+                self.shared.clear_revoked_handoff(&by_id, token)
+            }
             Effect::SettleTx { epoch, op_id } => {
                 if let Some(worker) = lock(&self.workers).get(&epoch) {
                     let _ = worker.tx().settle(op_id);
@@ -4012,9 +4021,11 @@ impl SessionManager {
     /// - 在途作業、parked（`_preopened_ports` 未消費者，`:3108-3111`）：取出作業並直接關閉 handle。作業已不在任何表內，
     ///   `closed:false` 只告警、不保留、不登記阻擋（`_finish_attach_op` `:4322-4332`），立即回 DRAIN_STALLED＋
     ///   `drain_stalled:true`（`done` 未設定，`:3192-3204`）。
-    /// - 交接列未取走（Python 作業仍在 `_active_attach_ops`，由 attach 持有）：認領交接列並留撤銷標記（`revoked_handoff`），
-    ///   令已排入的 `open_bridge` 不開埠（呼叫端在 release 結束時移除標記）；同一臨界區把 handle 移入關閉中作業、寫入本次
-    ///   release 請求與期限，並排入 `ReleaseAttachPending`（Python 設 RECOVERING，`:3133-3139`）。之後由專用執行緒關閉、
+    /// - 交接列未取走（Python 作業仍在 `_active_attach_ops`，由 attach 持有）：認領交接列並留撤銷標記，令已排入的
+    ///   `open_bridge` 不開埠；同一臨界區把 handle 移入關閉中作業、寫入本次 release 請求與期限，並排入帶撤銷標記 token 的
+    ///   `ReleaseAttachPending`（Python 設 RECOVERING，`:3133-3139`）。標記由 actor 於被取消的開埠確定不會取用後移除
+    ///   （Python 取消旗標隨作業保留，`:3125`），不隨本次 release 返回或逾時移除；沒有 actor 接手時才交呼叫端在 release
+    ///   結束時移除（`revoked_handoff`）。之後由專用執行緒關閉、
     ///   release 照在途作業等待（`:3188-3204`）：確認關閉才移出作業；重複的 release 取得同一作業、沿用首次期限；關閉
     ///   未確認時作業保留（`retain_unconfirmed_close`），期限到回 DRAIN_STALLED。
     /// - 交接列已取走者交 actor（開埠在途的 pending stop 收尾）。
@@ -4093,7 +4104,6 @@ impl SessionManager {
                         .claim_handoff_for_close_locked(&mut inner, &by_id, true)
                     {
                         HandoffCloseClaim::Unclaimed { closing, token } => {
-                            *revoked_handoff = Some((by_id.clone(), token));
                             // 關閉中作業與 release 請求在同一臨界區寫入：之後的 release 取得同一作業、沿用本次期限
                             // （Python `:3117-3125`），確認關閉前不會回成功。
                             let mut pending = None;
@@ -4105,10 +4115,16 @@ impl SessionManager {
                                 // Python `release_device` 找到作業即在同一把鎖內設 RECOVERING（`:3133-3139`）。於鎖內排入，
                                 // 先於開埠 worker 撞到撤銷標記後回報的 `BridgeOpened`：actor 不會停在無開埠在途的
                                 // ATTACHING，之後的 `Release` 也不會把它當成開埠在途而等待。
+                                // 撤銷標記一併交 actor：其生命週期綁定被取消的開埠，不隨 release RPC 返回（含逾時回
+                                // DRAIN_STALLED）而移除（wp510 第九次整包審查 High P8-8463b22-1；Python 取消旗標隨作業
+                                // 保留，`:3125`）。
                                 if let Some(actor) = inner.sessions.get(sid).map(|e| e.actor.clone()) {
                                     match enqueue_safety_request(
                                         &actor,
-                                        SessionRequest::ReleaseAttachPending,
+                                        SessionRequest::ReleaseAttachPending {
+                                            by_id: by_id.clone(),
+                                            handoff_token: token,
+                                        },
                                         QUERY_TIMEOUT,
                                     ) {
                                         Ok(rx) => pending = Some(rx),
@@ -4118,6 +4134,11 @@ impl SessionManager {
                                         )),
                                     }
                                 }
+                            }
+                            if pending.is_none() {
+                                // 沒有 actor 接手（無 handle、無 actor 或通知失敗）：不會有該 session 的開埠再取用標記，
+                                // 沿用 release 結束時移除。
+                                *revoked_handoff = Some((by_id.clone(), token));
                             }
                             Step::CloseHandoff {
                                 by_id,
