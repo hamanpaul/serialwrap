@@ -6501,6 +6501,192 @@ fn wp510_review10_state_has_released_by_id(r: &ServiceRig, by_id: &str) -> bool 
     }
 }
 
+/// wp510 第八次整包審查 High（P8-e25b69c-1）：bind 接手 parked 預開 handle、`DeviceOnline` 之前，第一個
+/// `device.release` 認領交接列後關閉 handle 的途中（關閉暫停），第二個 `device.release` 插入。Python 的作業此時仍在
+/// `_active_attach_ops`（`_attach_by_id` 自 `_preopened_ports` 取到 `origin/main:sw_core/session_manager.py:4852-4854`，
+/// 關閉由 `_finish_attach_op` 完成後才移出 `:4320-4338`）；第二個 release 取得同一作業（`:3104-3107`），沿用第一個
+/// release 的期限（`:3117-3125`）等待 `done`（`:3188-3191`），handle 確認關閉後才回 ok。
+#[test]
+fn wp510_review10_rpc_second_release_waits_handoff_close_in_progress() {
+    let r = Arc::new(wp510_b_placeholder_rig());
+    let (bind, go, dev) = wp510_review9_bind_paused_before_device_online(&r);
+    let attempts = dev.open_attempts();
+    let tx_before = dev.tx_len();
+    dev.pause_next_close();
+
+    let (first_tx, first_rx) = crossbeam_channel::bounded(1);
+    let first_rig = Arc::clone(&r);
+    let first_dev = dev.clone();
+    let first = std::thread::spawn(move || {
+        let reply = first_rig.call("device.release", r#"{"selector":"COM1"}"#);
+        let _ = first_tx.send((reply, first_dev.is_open()));
+    });
+    let paused = dev.wait_paused(Duration::from_secs(5));
+
+    let (second_tx, second_rx) = crossbeam_channel::bounded(1);
+    let second_rig = Arc::clone(&r);
+    let second_dev = dev.clone();
+    let second = std::thread::spawn(move || {
+        let reply = second_rig.call("device.release", r#"{"selector":"COM1"}"#);
+        let _ = second_tx.send((reply, second_dev.is_open()));
+    });
+    let second_early = second_rx.recv_timeout(Duration::from_millis(500)).ok();
+    let open_while_second_early = dev.is_open();
+    dev.release_pause();
+    let replied_early = second_early.is_some();
+    let (second_reply, open_at_second) = second_early
+        .or_else(|| second_rx.recv_timeout(Duration::from_secs(10)).ok())
+        .expect("第二個 release 應回覆");
+    let (first_reply, open_at_first) = first_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("第一個 release 應回覆");
+    second.join().expect("第二個 release thread 不應 panic");
+    first.join().expect("第一個 release thread 不應 panic");
+    go.send(()).expect("放行 bind");
+    let _ = bind.join().expect("bind thread 不應 panic");
+
+    assert!(paused, "第一個 release 應停在關閉交接 handle 的途中");
+    assert!(
+        !replied_early,
+        "關閉尚未完成（handle 仍開啟={open_while_second_early}），第二個 release 不得先回覆：{}",
+        j(&second_reply)
+    );
+    assert_eq!(second_reply.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&second_reply));
+    assert!(!open_at_second, "第二個 release 回 ok 時 handle 必須已關閉");
+    assert_eq!(first_reply.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&first_reply));
+    assert!(!open_at_first, "第一個 release 回 ok 時 handle 必須已關閉");
+    assert_eq!(dev.close_count(), 1, "交接 handle 只關閉一次");
+    r.wait_state("COM1", "RELEASED");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(dev.open_attempts(), attempts, "release 之後不得重新開埠");
+    assert_eq!(dev.tx_len(), tx_before, "release 之後不得送 TX");
+    assert!(!dev.is_open());
+    assert!(!r.mgr.has_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID));
+    assert!(!r.mgr.unconfirmed_close_for_test(WP510_PLACEHOLDER_BY_ID));
+    assert!(wp510_review10_state_has_released_by_id(&r, WP510_PLACEHOLDER_BY_ID));
+}
+
+/// 同上時點、關閉一直暫停到首次期限之後：Python 兩個 release 等的是同一作業與同一期限（`:3117-3125`），期限到都回
+/// DRAIN_STALLED＋`drain_stalled:true`、state RECOVERING（`:3192-3204`），回覆時 handle 仍開啟；之後放行的
+/// `DeviceOnline` 不開埠（`_attach_by_id` 見作業取消中止 `:4933-4944`）。關閉遲到完成後 handle 已關閉、不重新開埠、
+/// 零 TX，下一個 `device.release` 回 ok 並落盤 RELEASED。
+#[test]
+fn wp510_review10_rpc_releases_drain_stalled_while_handoff_close_blocked() {
+    let r = Arc::new(wp510_b_placeholder_rig());
+    let (bind, go, dev) = wp510_review9_bind_paused_before_device_online(&r);
+    let attempts = dev.open_attempts();
+    let tx_before = dev.tx_len();
+    dev.pause_next_close();
+
+    let (first_tx, first_rx) = crossbeam_channel::bounded(1);
+    let first_rig = Arc::clone(&r);
+    let first_dev = dev.clone();
+    let first = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let reply = first_rig.call("device.release", r#"{"selector":"COM1"}"#);
+        let _ = first_tx.send((reply, first_dev.is_open(), started.elapsed()));
+    });
+    let paused = dev.wait_paused(Duration::from_secs(5));
+    let second = r.call("device.release", r#"{"selector":"COM1"}"#);
+    let open_at_second = dev.is_open();
+    let first_reply = first_rx.recv_timeout(Duration::from_secs(6)).ok();
+    // 失敗時也要放行暫停中的關閉，避免殘留執行緒卡住 rig 收尾。
+    go.send(()).expect("放行 bind");
+    let _ = bind.join().expect("bind thread 不應 panic");
+    std::thread::sleep(Duration::from_millis(200));
+    let attempts_before_close = dev.open_attempts();
+    dev.release_pause();
+    let first_reply = first_reply.or_else(|| {
+        first_rx
+            .recv_timeout(Duration::from_secs(10))
+            .ok()
+            .map(|(reply, open, elapsed)| (reply, open, elapsed + Duration::from_secs(3600)))
+    });
+    first.join().expect("第一個 release thread 不應 panic");
+
+    assert!(paused, "第一個 release 應停在關閉交接 handle 的途中");
+    assert_eq!(s(&second, "error_code"), "DRAIN_STALLED", "{}", j(&second));
+    assert_eq!(second.get("drain_stalled"), Some(&PyValue::Bool(true)), "{}", j(&second));
+    assert_eq!(s(&sub(&second, "session"), "state"), "RECOVERING", "{}", j(&second));
+    assert!(open_at_second, "前置：第二個 release 回覆時關閉仍暫停");
+    let (first_reply, open_at_first, first_elapsed) = first_reply.expect("第一個 release 應回覆");
+    assert!(
+        first_elapsed < Duration::from_secs(6),
+        "第一個 release 須於首次期限回覆，不得等到關閉完成：{first_elapsed:?}"
+    );
+    assert_eq!(s(&first_reply, "error_code"), "DRAIN_STALLED", "{}", j(&first_reply));
+    assert_eq!(first_reply.get("drain_stalled"), Some(&PyValue::Bool(true)));
+    assert!(open_at_first, "第一個 release 回覆時關閉仍暫停");
+    assert_eq!(dev.open_attempts(), attempts_before_close, "關閉完成前 DeviceOnline 不得開埠");
+
+    wait_until("遲到的關閉完成", || !dev.is_open());
+    wait_until("作業收尾", || {
+        !r.mgr.has_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID)
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(dev.close_count(), 1, "交接 handle 只關閉一次");
+    assert_eq!(dev.open_attempts(), attempts, "關閉後不得重新開埠");
+    assert_eq!(dev.tx_len(), tx_before, "不得送 TX");
+    assert!(!r.mgr.unconfirmed_close_for_test(WP510_PLACEHOLDER_BY_ID));
+
+    let again = r.call("device.release", r#"{"selector":"COM1"}"#);
+    assert_eq!(again.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&again));
+    assert_eq!(s(&sub(&again, "session"), "state"), "RELEASED", "{}", j(&again));
+    assert!(wp510_review10_state_has_released_by_id(&r, WP510_PLACEHOLDER_BY_ID));
+    assert_eq!(dev.open_attempts(), attempts);
+    assert!(!dev.is_open());
+}
+
+/// 佔位交接的 dynamic session 已發出 `OpenBridge`、開埠 worker 停在取預開 handle 之前時 `device.release` 認領交接列；
+/// release 關閉 handle 的途中（關閉暫停）放行開埠 worker，使其先撞到撤銷標記回報 `CloseBlocked`，release 之後才交 actor。
+/// Python `release_device` 找到作業即於鎖內設 RECOVERING（`origin/main:sw_core/session_manager.py:3133-3139`），
+/// `_attach_by_id` 見取消中止（`:4986-4996`），`_finish_attach_op` 完成 RELEASED（`:4340-4363`），release 回 ok
+/// （`:3206-3215`）；不得把已結束的開埠當成在途而等待排空期限。
+#[test]
+fn wp510_review10_rpc_release_after_revoked_bridge_open_reported_completes() {
+    let r = Arc::new(wp510_b_placeholder_rig());
+    let dev = r.device(WP510_REAL_G).clone();
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (go_tx, go_rx) = crossbeam_channel::bounded::<()>(1);
+    r.mgr.set_open_bridge_pre_take_hook_for_test(Box::new(move || {
+        let _ = entered_tx.send(());
+        let _ = go_rx.recv_timeout(Duration::from_secs(10));
+    }));
+    let attached = r.call(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    assert_eq!(attached.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&attached));
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("正式 session 的 open_bridge 應停在接手預開 handle 之前");
+    let attempts = dev.open_attempts();
+    let tx_before = dev.tx_len();
+    dev.pause_next_close();
+
+    let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+    let release_rig = Arc::clone(&r);
+    let _release = std::thread::spawn(move || {
+        let _ = reply_tx.send(release_rig.call("device.release", r#"{"selector":"t:COM3"}"#));
+    });
+    let paused = dev.wait_paused(Duration::from_secs(5));
+    go_tx.send(()).expect("放行 open_bridge");
+    // 開埠 worker 撞到撤銷標記、actor 處理其 `BridgeOpened` 之後才完成關閉。
+    std::thread::sleep(Duration::from_millis(300));
+    dev.release_pause();
+    let released = reply_rx.recv_timeout(Duration::from_secs(10)).ok();
+
+    assert!(paused, "release 應停在關閉交接 handle 的途中");
+    let released = released.expect("release 不得等待已結束的開埠至逾時");
+    assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&released));
+    assert_eq!(s(&sub(&released, "session"), "state"), "RELEASED", "{}", j(&released));
+    assert!(!dev.is_open(), "release 回 ok 時 handle 已關閉");
+    assert_eq!(dev.close_count(), 1);
+    assert_eq!(dev.open_attempts(), attempts, "取消的交接不得另開新 handle");
+    assert_eq!(dev.tx_len(), tx_before, "release 之後不得送 TX");
+    assert!(!r.mgr.has_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID));
+}
+
 const WP510_R10_BY_ID_D: &str = "/s/by-id/usb-r10-D";
 const WP510_R10_REAL_D: &str = "/dev/ttyR10D";
 

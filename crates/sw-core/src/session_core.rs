@@ -201,6 +201,10 @@ pub enum SessionRequest {
         token: u64,
         epoch: u64,
     },
+    /// release 取得交接 handle 的關閉中作業（`SessionManager` 的交接表認領）：Python `release_device` 找到作業即於鎖內
+    /// 把非 RELEASED 的 session 設 RECOVERING，首次 release 請求清 `drain_stalled`／`drain_timeout_epoch`
+    /// （`origin/main:sw_core/session_manager.py:3133-3139`）。
+    ReleaseAttachPending,
     /// 該 token 的 attach 作業已安全關閉 handle（release 請求過的作業收尾），清除先前由 release 逾時設定的 stall 欄位，
     /// 並依 Python `_finish_attach_op` 的 release 收尾（`session_manager.py:4340-4363`）處理第一個 release 請求
     /// `(release_source, release_reason)`：已 RELEASED（OD-63 佔位）補齊 `released_by`／`released_at` 後持久化；一般
@@ -2000,6 +2004,14 @@ impl SessionCore {
                 let mut response = self.drain_stalled_reply(now);
                 response.insert("error_code", PyValue::from("SESSION_RECOVERING"));
                 vec![Effect::Reply(reply, Ok(response))]
+            }
+            SessionRequest::ReleaseAttachPending => {
+                if self.state != SessionState::Released {
+                    self.set_state(SessionState::Recovering, now);
+                    self.drain_stalled = false;
+                    self.drain_timeout_epoch = None;
+                }
+                vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
             }
             SessionRequest::PlaceholderAttachSettled {
                 token,
