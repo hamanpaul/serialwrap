@@ -14,7 +14,7 @@
 #   - s24-*（P8 Task 1）：suite 新增 rust-l1、family 新增 S24（schema 列舉只增不改）；SC-33 依 OD-79 撤回，原列 SC-33 的案例改列 SC-03；
 #     s24-xfer-abort-on-release 依 OD-62 比照 BC-03；source_ref／evidence 中尚未建立的節點由承接 Task 依此命名建立。
 schema_version: 1
-revision: 2026-11-08.1
+revision: 2026-11-09.1
 spec: docs/rust-refactor/serialwrap-rust-spec-final.md
 invariant_ids: [zero_tx_on_reject, no_forbidden_interleave, no_stale_context_replay, no_reopen_before_handoff, no_auto_resend, insufficient_evidence_not_pass]
 features:
@@ -6141,8 +6141,8 @@ cases:
   suite: rust-l1
   source_ref: crates/sw-pal/tests/wintask_runtime.rs::cap_supervisor_runtime__task_pt0s_restart_and_graceful_stop
   family: S24
-  title: windows-task 監管 Rust daemon：PT0S、失敗重啟與有序停止
-  contract: 'windows-task 排程工作（SC-24）安裝後 XML 為 ExecutionTimeLimit=PT0S、MultipleInstancesPolicy=IgnoreNew、RestartOnFailure PT1M／999；強制終止 daemon 後 150 s 內由排程重新拉起新 pid；P4 graceful_stop 正常結束時不執行 /End，停止後 WAL 最後一筆完整。需擁有者 Windows host 授權（SW_TEST_ALLOW_SCHTASKS=1）執行，cap:supervisor_runtime。'
+  title: windows-task 監管 Rust daemon：PT0S、崩潰後 service start 恢復與有序停止
+  contract: 'windows-task 排程工作（SC-24）安裝後 XML 為 ExecutionTimeLimit=PT0S、MultipleInstancesPolicy=IgnoreNew、RestartOnFailure PT1M／999；依 OD-83，0.5.0 強制終止 daemon 後 90 s 內不得自動重新拉起，排程工作狀態不是 Running（Task Scheduler 將 action exit 1 記為完成）；正式 service start（/Run）須在 20 s 內恢復新 pid，並重新驗證三道 COM 隔離防線；service stop 經 P4 graceful_stop 正常結束時不執行 /End，停止後 WAL 最後一筆完整。已知限制：0.5.0 不提供崩潰自動重啟，長期須對齊 Linux；需擁有者 Windows host 授權（SW_TEST_ALLOW_SCHTASKS=1）執行，cap:supervisor_runtime。'
   invariants: []
   layer: L1.5
   platforms: [windows]
