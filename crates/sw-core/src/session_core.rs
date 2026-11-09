@@ -457,6 +457,10 @@ pub struct SessionCore {
     pending_commit: Option<PendingCommit>,
     release_persist_pending: bool,
     retired_stops: VecDeque<RetiredStop>,
+    /// 開埠成功但 actor 不接手而退休的 bridge（`retire_opened_bridge`），其 handle 尚未確認關閉者。開埠終態（
+    /// `open_real_path`）與 handle 關閉終態分開追蹤：release 須等到配對且 `handle_closed:true` 的回條才完成 RELEASED
+    /// （wp510 第十次整包審查 High P8-14fe592-1；見 `retired_open_close_receipt`）。
+    retired_open_closes: Vec<RetiredOpenClose>,
     next_op_id: u64,
     next_uuid: u64,
     quiet_since: Option<Mono>,
@@ -634,6 +638,17 @@ struct RetiredStop {
     aborted_op: Option<(OpId, String)>,
 }
 
+/// 退休 bridge 的關閉中作業（見 `SessionCore::retired_open_closes`）。Python 對應：被取消的 attach 作業在
+/// `_finish_attach_op` 確認關閉 handle 前留在 `_active_attach_ops`、不設 `done`，release 等待 `done`
+/// （`origin/main:sw_core/session_manager.py:3104-3107`、`:3188-3204`、`:4320-4363`）。
+struct RetiredOpenClose {
+    epoch: u64,
+    id: StopId,
+    by_id: String,
+    /// 回條為 `handle_closed:false`：Python 作業保留在表內（`:4322-4332`），之後的 release 等到期限回 DRAIN_STALLED。
+    close_failed: bool,
+}
+
 impl SessionCore {
     pub fn new(profile: SessionProfile, profile_source: &str, deps: CoreDeps) -> SessionCore {
         let sid = format!("{}:{}", profile.template.profile_name, profile.com);
@@ -681,6 +696,7 @@ impl SessionCore {
             pending_commit: None,
             release_persist_pending: false,
             retired_stops: VecDeque::new(),
+            retired_open_closes: Vec::new(),
             next_op_id: 0,
             next_uuid: 0,
             quiet_since: None,
@@ -1310,6 +1326,9 @@ impl SessionCore {
             if self.state == SessionState::Attaching
                 || self.open_real_path.is_some()
                 || matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }))
+                // 退休 bridge 的 handle 尚未確認關閉：release 等其回條（`retired_open_close_receipt`），不得以無 bridge
+                // 直接完成 RELEASED（Python release 等待被取消作業的 `done`，`:3188-3204`）。
+                || kind == StopKind::Release && !self.retired_open_closes.is_empty()
             {
                 self.next_stop_id = self.next_stop_id.saturating_add(1);
                 let id = StopId(self.next_stop_id);
@@ -1894,6 +1913,12 @@ impl SessionCore {
                         }
                         effects.extend(self.begin_stop(StopKind::Release, Some(reply), now).0);
                         return effects;
+                    }
+                    if !self.retired_open_closes.is_empty() {
+                        // 退休 bridge 的 handle 尚未確認關閉（例如 RELEASED 上的 device.attach 落盤失敗而退休）：Python
+                        // release 找到作業即等待 `done` 再回 already_released（`origin/main:sw_core/session_manager.py:3104-3111`、
+                        // `:3188-3214`）。
+                        return self.begin_stop(StopKind::Release, Some(reply), now).0;
                     }
                     if self.release_persist_pending
                         || matches!(&self.pending_commit, Some(PendingCommit::Release { .. }))
@@ -2648,6 +2673,11 @@ impl SessionCore {
                 let failure_error = open_failure_last_error(&failure);
                 if let Some(pending) = self.pending_open_stop.take() {
                     self.open_real_path = None;
+                    if pending.kind == StopKind::Release && !self.retired_open_closes.is_empty() {
+                        // 開埠已到終態，但先前退休的 bridge 仍持有 handle：release 留到其關閉回條才完成。
+                        self.pending_open_stop = Some(pending);
+                        return Vec::new();
+                    }
                     self.finish_pending_open_stop(pending, now)
                 } else if let Some(pending) = self.pending_attach.take() {
                     self.open_real_path = None;
@@ -2843,6 +2873,60 @@ impl SessionCore {
         effects
     }
 
+    /// 退休 bridge 的排空回條（wp510 第十次整包審查 High P8-14fe592-1）。`handle_closed:true` 移除該關閉中作業；若 release
+    /// 正等待（`pending_open_stop` 為 release）且已無開埠在途、無其他未確認的 handle，即完成 RELEASED 並落盤（Python
+    /// `_finish_attach_op` 確認關閉後完成 release，`origin/main:sw_core/session_manager.py:4320-4363`；期限已過者為遲到
+    /// 收尾，無等待者）。`handle_closed:false` 保留作業並登記 by_id 為未確認關閉（Python 關閉失敗即回 False、保留作業且
+    /// 不設 `done`，`:4322-4332`），等待中的 release 回 DRAIN_STALLED（`:3192-3204`）。不配對的回條不動。
+    fn retired_open_close_receipt(
+        &mut self,
+        receipt: &WorkerStoppedReceipt,
+        now: Mono,
+    ) -> Vec<Effect> {
+        let Some(index) = self
+            .retired_open_closes
+            .iter()
+            .position(|entry| entry.epoch == receipt.epoch && entry.id == receipt.stop_id)
+        else {
+            return Vec::new();
+        };
+        let mut effects = Vec::new();
+        if receipt.handle_closed {
+            self.retired_open_closes.remove(index);
+        } else {
+            let entry = &mut self.retired_open_closes[index];
+            entry.close_failed = true;
+            self.deps.unconfirmed_closes.insert(&entry.by_id);
+            if let Some(error) = receipt.close_error.as_ref() {
+                effects.push(Effect::Warn(format!(
+                    "WARNING session {} 退休 bridge 的 UART handle 關閉失敗：{error:?}",
+                    self.profile.com
+                )));
+            }
+        }
+        let release_waiting = self
+            .pending_open_stop
+            .as_ref()
+            .is_some_and(|pending| pending.kind == StopKind::Release);
+        if !release_waiting {
+            return effects;
+        }
+        if !receipt.handle_closed {
+            effects.extend(self.pending_open_close_unconfirmed(now));
+            return effects;
+        }
+        let settled = self.retired_open_closes.is_empty()
+            && self.open_real_path.is_none()
+            && !matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }))
+            && !self.close_unconfirmed();
+        if settled {
+            if let Some(pending) = self.pending_open_stop.take() {
+                effects.extend(self.finish_pending_open_stop(pending, now));
+            }
+        }
+        effects
+    }
+
     fn retire_opened_bridge(&mut self, opened: OpenedBridge) -> Vec<Effect> {
         self.next_stop_id = self.next_stop_id.saturating_add(1);
         let stop_id = StopId(self.next_stop_id);
@@ -2855,6 +2939,14 @@ impl SessionCore {
         while self.retired_stops.len() > 32 {
             self.retired_stops.pop_front();
         }
+        // 開埠已到終態，但 handle 仍由該 worker 持有到排空回條：留下可供 release 等待的關閉中作業（wp510 第十次整包
+        // 審查 High P8-14fe592-1；Python 被取消的作業確認關閉前留在 `_active_attach_ops`，`:4320-4363`）。
+        self.retired_open_closes.push(RetiredOpenClose {
+            epoch,
+            id: stop_id,
+            by_id: self.profile.device_by_id.clone(),
+            close_failed: false,
+        });
         let mut fx = vec![
             Effect::AdoptBridge {
                 epoch,
@@ -3964,6 +4056,7 @@ impl SessionCore {
                 self.apply_aborted_receipt(stale.aborted_op.as_ref(), &receipt, &mut effects);
             }
             append_receipt_warnings(&receipt, &mut effects, &self.profile.com);
+            effects.extend(self.retired_open_close_receipt(&receipt, now));
             return effects;
         }
 
@@ -4042,6 +4135,24 @@ impl SessionCore {
         self.drain_stalled = false;
         self.placeholder_attach_stall_token = None;
         self.recovering = false;
+        if stop.kind == StopKind::Release && !self.retired_open_closes.is_empty() {
+            // 本 bridge 已確認關閉，但先前退休的 bridge 仍持有 handle（wp510 第十次整包審查 High P8-14fe592-1）：release
+            // 改等其關閉回條（`retired_open_close_receipt`），沿用同一 stop id 與已排定的期限（`mark_drain_timeout`）。
+            self.pending_open_stop = Some(PendingOpenStop {
+                id: stop.id,
+                generation: stop.epoch,
+                kind: StopKind::Release,
+                waiters: stop.waiters,
+                started: stop.started,
+                stalled: stop.stalled,
+                already_released: stop.already_released,
+                post_kind: None,
+            });
+            if self.retired_open_closes.iter().any(|entry| entry.close_failed) {
+                effects.extend(self.pending_open_close_unconfirmed(now));
+            }
+            return effects;
+        }
         let kind = if stop.kind == StopKind::Release {
             StopKind::Release
         } else {

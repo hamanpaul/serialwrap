@@ -2828,12 +2828,22 @@ fn wp510_review11_release_stalled_with_open_in_flight(h: &mut CoreHarness) -> u6
 /// 遲到的關閉收尾（Python `_finish_attach_op` 的 release 分支，`:4340-4363`）：不需第二次 release，即轉 RELEASED、
 /// `released_by`／`released_reason` 取第一個 release 請求、清 `drain_stalled`／`drain_timeout_epoch` 並落盤。
 fn wp510_review11_assert_late_settle_completes_release(h: &mut CoreHarness, token: u64) {
+    wp510_review11_late_settle(h, token);
+    wp510_review11_assert_release_completed(h);
+}
+
+/// 送出遲到的關閉收尾（`PlaceholderAttachSettled`，第一個 release 請求為 `cli`／`late-close`）。
+fn wp510_review11_late_settle(h: &mut CoreHarness, token: u64) {
     h.rpc(SessionRequest::PlaceholderAttachSettled {
         token,
         release_source: "cli".into(),
         release_reason: PyValue::from("late-close"),
     })
     .unwrap();
+}
+
+/// 遲到收尾完成 release 的斷言（見 `wp510_review11_assert_late_settle_completes_release`）。
+fn wp510_review11_assert_release_completed(h: &mut CoreHarness) {
     let public = h.public();
     assert_eq!(public["state"], PyValue::from("RELEASED"), "{public:?}");
     assert_eq!(public["released_by"], PyValue::from("cli"));
@@ -2860,16 +2870,32 @@ fn wp510_review11_open_failure_after_release_stalled_lets_late_settle_release() 
 }
 
 /// 同上，但遲到的開埠成功：actor 不接手（非 ATTACHING），退休 bridge 後開埠同樣已到終態，遲到收尾須完成 RELEASED。
+/// 退休 bridge 的 handle 仍由其 worker 持有到排空回條（wp510 第十次整包審查 High P8-14fe592-1）：收尾須等配對且
+/// `handle_closed:true` 的回條才完成 RELEASED 並落盤（Python `_finish_attach_op` 確認關閉後才完成，`:4320-4363`）。
 #[test]
 fn wp510_review11_open_success_after_release_stalled_lets_late_settle_release() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
     let token = wp510_review11_release_stalled_with_open_in_flight(&mut h);
     let opened = h.opened_bridge(REAL_PATH);
+    let retired_epoch = opened.epoch;
     h.feed(ControlEvent::BridgeOpened {
         epoch_hint: 0,
         result: Ok(opened),
     });
-    wp510_review11_assert_late_settle_completes_release(&mut h, token);
+    let (epoch, stop) = h.pending_stop();
+    assert_eq!(epoch, retired_epoch, "前置：退休 bridge 開始排空");
+    wp510_review11_late_settle(&mut h, token);
+    assert_eq!(
+        h.public()["state"],
+        PyValue::from("RECOVERING"),
+        "退休 bridge 的 handle 確認關閉前不得完成 RELEASED"
+    );
+    assert!(
+        !h.state_store.last_released().contains_key("t:COM0"),
+        "退休 bridge 的 handle 確認關閉前不得落盤"
+    );
+    h.receipt(epoch, stop).handle_closed(true).feed();
+    wp510_review11_assert_release_completed(&mut h);
 }
 
 /// `Effect::ClearRevokedHandoff` 的 `(by_id, token)` 清單。
@@ -2939,4 +2965,277 @@ fn wp510_review11_revoke_cleared_when_no_open_in_flight() {
         !effects.iter().any(|effect| matches!(effect, Effect::OpenBridge { .. })),
         "RECOVERING 的 DeviceAttached 不得開埠"
     );
+}
+
+/// wp510 第十次整包審查 High（P8-14fe592-1）：bind 等待已取走交接 handle 的開埠逾時（`attach_op_stalled_reply` →
+/// `MarkAttachStalled`，Python `bind_session` `origin/main:sw_core/session_manager.py:3697-3711`）把 session 設為
+/// RECOVERING，之後開埠成功但 actor 不接手而退休 bridge。`h` 停在退休 bridge 已開始排空、關閉回條尚未抵達的時點，
+/// 回傳該 bridge 的 `(epoch, stop_id)`。
+fn wp510_review12_retired_bridge_after_bind_stall(h: &mut CoreHarness) -> (u64, StopId) {
+    let effects = h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    assert!(
+        effects.iter().any(|effect| matches!(effect, Effect::OpenBridge { .. })),
+        "前置：actor 已發出 OpenBridge"
+    );
+    let stalled = h
+        .rpc(SessionRequest::MarkAttachStalled { epoch: 0 })
+        .unwrap();
+    assert_eq!(stalled.get("error_code"), Some(&PyValue::from("SESSION_RECOVERING")));
+    assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
+    let opened = h.opened_bridge(REAL_PATH);
+    let retired_epoch = opened.epoch;
+    let effects = h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Ok(opened),
+    });
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::BeginDrain { epoch, .. } if *epoch == retired_epoch
+        )),
+        "前置：非 ATTACHING 的開埠結果不接手、退休 bridge 並開始排空"
+    );
+    let (epoch, stop) = h.pending_stop();
+    assert_eq!(epoch, retired_epoch);
+    assert_eq!(h.core.generations().conn_epoch, None, "前置：退休 bridge 未被接手");
+    (epoch, stop)
+}
+
+/// 退休 bridge 的 handle 尚未確認關閉時，release 不得回成功、不得轉 RELEASED 或落盤；收到配對且 `handle_closed:true`
+/// 的回條後才完成 RELEASED 並落盤（Python release 等待被取消的作業 `done`，`_finish_attach_op` 確認關閉後才完成
+/// RELEASED，`origin/main:sw_core/session_manager.py:3188-3214`、`:4320-4363`）。
+#[test]
+fn wp510_review12_release_waits_retired_bridge_close_after_bind_stall() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (epoch, stop) = wp510_review12_retired_bridge_after_bind_stall(&mut h);
+    let commits_before = h.state_store.commits();
+    let (rx, _) = h.rpc_deferred(release());
+    assert!(
+        rx.try_recv().is_err(),
+        "退休 bridge 的 handle 關閉確認前不得回覆 release"
+    );
+    assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
+    assert_eq!(h.state_store.commits(), commits_before, "關閉確認前不得落盤");
+    assert!(!h.state_store.last_released().contains_key("t:COM0"));
+
+    // 不配對的回條（同 epoch、不同 stop_id）不得完成 release。
+    h.receipt(epoch, StopId(stop.0 + 1000)).handle_closed(true).feed();
+    assert!(rx.try_recv().is_err(), "不配對的回條不得完成 release");
+    assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
+
+    h.receipt(epoch, stop).handle_closed(true).feed();
+    let response = rx
+        .try_recv()
+        .expect("handle 確認關閉後 release 應回覆")
+        .unwrap();
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
+    assert_eq!(nested_session_state(&response), PyValue::from("RELEASED"));
+    let public = h.public();
+    assert_eq!(public["state"], PyValue::from("RELEASED"), "{public:?}");
+    assert_eq!(public["released_by"], PyValue::from("cli"));
+    assert_eq!(public["drain_stalled"], PyValue::Bool(false));
+    assert!(
+        h.state_store.last_released().contains_key("t:COM0"),
+        "RELEASED 必須落盤"
+    );
+    assert!(!h.unconfirmed.contains(DEVICE_BY_ID));
+}
+
+/// 同上，但退休 bridge 的 handle 關閉失敗（`handle_closed:false`）：release 回 DRAIN_STALLED，不轉 RELEASED、不落盤，
+/// by_id 登記為未確認關閉（Python `_finish_attach_op` 關閉失敗即回 False、保留作業且不設 `done`，release 回
+/// DRAIN_STALLED，`origin/main:sw_core/session_manager.py:4322-4332`、`:3192-3204`）；之後的 release 仍為 DRAIN_STALLED，
+/// 推進時間也不會轉 RELEASED。
+#[test]
+fn wp510_review12_retired_bridge_close_failure_keeps_release_stalled() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (epoch, stop) = wp510_review12_retired_bridge_after_bind_stall(&mut h);
+    let commits_before = h.state_store.commits();
+    let (rx, _) = h.rpc_deferred(release());
+    assert!(rx.try_recv().is_err(), "關閉回條前不得回覆 release");
+    h.receipt(epoch, stop).handle_closed(false).feed();
+    let response = rx
+        .try_recv()
+        .expect("關閉失敗應回覆 release")
+        .unwrap();
+    session_error(&response, "DRAIN_STALLED");
+    assert_eq!(response.get("drain_stalled"), Some(&PyValue::Bool(true)));
+    assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
+    assert_eq!(h.public()["drain_stalled"], PyValue::Bool(true));
+    assert!(
+        h.unconfirmed.contains(DEVICE_BY_ID),
+        "退休 bridge 的 handle 關閉未確認須登記阻擋"
+    );
+
+    let again = h.rpc(release()).unwrap();
+    session_error(&again, "DRAIN_STALLED");
+    h.advance(Duration::from_secs(4));
+    assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
+    assert_eq!(h.state_store.commits(), commits_before, "關閉未確認不得落盤");
+    assert!(!h.state_store.last_released().contains_key("t:COM0"));
+}
+
+/// 關閉回條先於 release 抵達但為 `handle_closed:false`：之後的 release 不得因無 bridge 而直接 RELEASED，期限到回
+/// DRAIN_STALLED（Python 作業保留在表內，release 找到作業後等待 `done` 至期限，`:3104-3107`、`:3188-3204`）。
+#[test]
+fn wp510_review12_release_after_retired_close_failure_reports_drain_stalled() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (epoch, stop) = wp510_review12_retired_bridge_after_bind_stall(&mut h);
+    h.receipt(epoch, stop).handle_closed(false).feed();
+    assert!(h.unconfirmed.contains(DEVICE_BY_ID));
+    let commits_before = h.state_store.commits();
+    let (rx, _) = h.rpc_deferred(release());
+    assert!(rx.try_recv().is_err(), "期限前不得回覆");
+    assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
+    h.advance(Duration::from_secs(4));
+    let response = rx.try_recv().expect("期限到應回覆").unwrap();
+    session_error(&response, "DRAIN_STALLED");
+    assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
+    assert_eq!(h.state_store.commits(), commits_before);
+    assert!(!h.state_store.last_released().contains_key("t:COM0"));
+}
+
+/// 開埠途中裝置改指（#50）：舊路徑的開埠結果不接手而退休，改以新路徑重開。release 等待新開埠時，新開埠即使失敗，
+/// 也要等退休 bridge 的 handle 確認關閉才完成 RELEASED（開埠終態與 handle 關閉終態分開追蹤）。
+#[test]
+fn wp510_review12_release_after_rebound_open_failure_waits_retired_close() {
+    const NEW_PATH: &str = "/fake/tty-A2";
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: NEW_PATH.into(),
+    });
+    let opened = h.opened_bridge(REAL_PATH);
+    let effects = h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Ok(opened),
+    });
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::OpenBridge { dev, .. } if dev.0 == NEW_PATH
+        )),
+        "前置：改以新路徑重開"
+    );
+    let (epoch, stop) = h.pending_stop();
+    let (rx, _) = h.rpc_deferred(release());
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Err(OpenFailure::Other(PalError::io(2, "No such file"))),
+    });
+    assert!(
+        rx.try_recv().is_err(),
+        "退休 bridge 的 handle 關閉確認前不得回覆 release"
+    );
+    assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
+    assert!(!h.state_store.last_released().contains_key("t:COM0"));
+    h.receipt(epoch, stop).handle_closed(true).feed();
+    let response = rx.try_recv().expect("確認關閉後應回覆").unwrap();
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
+    assert_eq!(h.public()["state"], PyValue::from("RELEASED"));
+    assert!(h.state_store.last_released().contains_key("t:COM0"));
+}
+
+/// 同上，但新開埠成功並由 release 的排空接手：新 bridge 確認關閉後，仍要等退休 bridge 的 handle 確認關閉才完成
+/// RELEASED。
+#[test]
+fn wp510_review12_release_after_rebound_open_success_waits_retired_close() {
+    const NEW_PATH: &str = "/fake/tty-A2";
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: NEW_PATH.into(),
+    });
+    let opened = h.opened_bridge(REAL_PATH);
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Ok(opened),
+    });
+    let (retired_epoch, retired_stop) = h.pending_stop();
+    let (rx, _) = h.rpc_deferred(release());
+    let opened = h.opened_bridge(NEW_PATH);
+    let new_epoch = opened.epoch;
+    let effects = h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Ok(opened),
+    });
+    let new_stop = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::BeginDrain { stop_id, epoch } if *epoch == new_epoch => Some(*stop_id),
+            _ => None,
+        })
+        .expect("前置：新 bridge 由 release 的排空接手");
+    h.receipt(new_epoch, new_stop).handle_closed(true).feed();
+    assert!(
+        rx.try_recv().is_err(),
+        "退休 bridge 的 handle 關閉確認前不得回覆 release"
+    );
+    assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
+    assert!(!h.state_store.last_released().contains_key("t:COM0"));
+    h.receipt(retired_epoch, retired_stop)
+        .handle_closed(true)
+        .feed();
+    let response = rx.try_recv().expect("確認關閉後應回覆").unwrap();
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
+    assert_eq!(h.public()["state"], PyValue::from("RELEASED"));
+    assert!(h.state_store.last_released().contains_key("t:COM0"));
+}
+
+/// RELEASED 上的 `device.attach` 開埠成功但 unreleased 落盤失敗：Rust 還原 RELEASED 並退休 bridge（Python 存檔失敗時
+/// 作業留在 `_preopened_ports`，`origin/main:sw_core/session_manager.py:3633-3637`）。之後的 release 須等退休 bridge 的
+/// handle 確認關閉才回 already_released（Python release 取出作業、`_finish_attach_op` 關閉後才回覆，`:3108-3111`、
+/// `:3188-3214`）。
+#[test]
+fn wp510_review12_released_release_waits_retired_bridge_after_attach_commit_failure() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let (rx, _) = h.rpc_deferred(release());
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).feed();
+    assert_eq!(
+        nested_session_state(&rx.try_recv().unwrap().unwrap()),
+        PyValue::from("RELEASED")
+    );
+    h.state_store
+        .fail_next_commit(PalError::io(28, "[Errno 28] No space left on device"));
+    let (attach_rx, effects) = h.rpc_deferred(SessionRequest::DeviceAttach { force: true });
+    assert!(
+        effects.iter().any(|effect| matches!(effect, Effect::OpenBridge { .. })),
+        "前置：device.attach 發出 OpenBridge"
+    );
+    let opened = h.opened_bridge(REAL_PATH);
+    let retired_epoch = opened.epoch;
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Ok(opened),
+    });
+    assert!(
+        attach_rx.try_recv().expect("落盤失敗應回覆").is_err(),
+        "前置：unreleased 落盤失敗"
+    );
+    assert_eq!(h.public()["state"], PyValue::from("RELEASED"));
+    let (r_epoch, r_stop) = h.pending_stop();
+    assert_eq!(r_epoch, retired_epoch, "前置：落盤失敗後退休 bridge");
+
+    let (rx, _) = h.rpc_deferred(release());
+    assert!(
+        rx.try_recv().is_err(),
+        "退休 bridge 的 handle 關閉確認前不得回覆 release"
+    );
+    h.receipt(r_epoch, r_stop).handle_closed(true).feed();
+    let response = rx.try_recv().expect("確認關閉後應回覆").unwrap();
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
+    assert_eq!(response.get("already_released"), Some(&PyValue::Bool(true)), "{response:?}");
+    assert_eq!(h.public()["state"], PyValue::from("RELEASED"));
 }

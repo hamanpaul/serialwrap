@@ -6851,6 +6851,136 @@ fn wp510_review11_rpc_release_timeout_late_close_before_bridge_open_keeps_revoke
     );
 }
 
+/// wp510 第十次整包審查 High（P8-14fe592-1）共用前置：佔位交接的正式 session（t:COM3）`open_bridge` 已取走預開 handle
+/// （交接列 `taken`）、開埠尚未返回時 `session.bind` 等待逾時，回 SESSION_RECOVERING 並把 session 設為 RECOVERING
+/// （Python `bind_session` `origin/main:sw_core/session_manager.py:3676-3711`）。之後放行開埠：actor 不接手、退休 bridge，
+/// 退休 bridge 的 handle 關閉停在暫停點（`pause_next_close`）。回傳 (rig, 裝置, 開埠次數, TX 長度, 關閉次數)。
+fn wp510_review12_retired_bridge_closing_after_bind_stall(
+) -> (Arc<ServiceRig>, FakeDevice, usize, usize, usize) {
+    let r = Arc::new(wp510_b_placeholder_rig());
+    let dev = r.device(WP510_REAL_G).clone();
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (go_tx, go_rx) = crossbeam_channel::bounded::<()>(1);
+    r.mgr.set_open_bridge_post_take_hook_for_test(Box::new(move || {
+        let _ = entered_tx.send(());
+        let _ = go_rx.recv_timeout(Duration::from_secs(20));
+    }));
+    let attached = r.call(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    assert_eq!(attached.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&attached));
+    let entered = entered_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+    let attempts = dev.open_attempts();
+    let tx_before = dev.tx_len();
+    let closes_before = dev.close_count();
+    let bind = r.call(
+        "session.bind",
+        &format!(r#"{{"selector":"t:COM3","device_by_id":"{WP510_FREE_BY_ID}"}}"#),
+    );
+    dev.pause_next_close();
+    // 失敗時也要放行 open_bridge，避免殘留執行緒卡住 rig 收尾。
+    let _ = go_tx.send(());
+    assert!(entered, "正式 session 的 open_bridge 應停在取走預開 handle 之後");
+    assert_eq!(s(&bind, "error_code"), "SESSION_RECOVERING", "{}", j(&bind));
+    assert_eq!(bind.get("drain_stalled"), Some(&PyValue::Bool(true)), "{}", j(&bind));
+    let paused = dev.wait_paused(Duration::from_secs(5));
+    if !paused {
+        dev.release_pause();
+    }
+    assert!(paused, "開埠成功後退休 bridge 的 handle 關閉應停在暫停點");
+    assert!(dev.is_open(), "前置：退休 bridge 的 handle 尚未關閉");
+    assert_eq!(dev.open_attempts(), attempts, "前置：沿用交接 handle，未另開");
+    (r, dev, attempts, tx_before, closes_before)
+}
+
+/// bind 逾時後開埠成功、actor 退休 bridge，關閉回條抵達前呼叫 `device.release`：release 不得在 handle 仍開啟時回成功、
+/// 轉 RELEASED 或落盤；handle 確認關閉後才回 ok 並完成 RELEASED 與落盤，不需第二次 release（Python release 等待被取消
+/// 作業的 `done`，`_finish_attach_op` 確認關閉後才完成 RELEASED，`origin/main:sw_core/session_manager.py:3188-3215`、
+/// `:4320-4363`）。
+#[test]
+fn wp510_review12_rpc_release_waits_retired_bridge_close_after_bind_stall() {
+    let (r, dev, attempts, tx_before, closes_before) =
+        wp510_review12_retired_bridge_closing_after_bind_stall();
+    let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+    let release_rig = Arc::clone(&r);
+    let release_dev = dev.clone();
+    let release = std::thread::spawn(move || {
+        let reply = release_rig.call("device.release", r#"{"selector":"t:COM3"}"#);
+        let _ = reply_tx.send((reply, release_dev.is_open()));
+    });
+    let early = reply_rx.recv_timeout(Duration::from_millis(500)).ok();
+    let state_while_open = r.session("t:COM3").map(|session| s(&session, "state").to_string());
+    let persisted_while_open = wp510_review10_state_has_released_by_id(&r, WP510_PLACEHOLDER_BY_ID);
+    dev.release_pause();
+    let reply = reply_rx.recv_timeout(Duration::from_secs(10)).ok().or(early.clone());
+    release.join().expect("release thread 不應 panic");
+
+    assert!(
+        early.is_none(),
+        "退休 bridge 的 handle 尚未關閉時 release 不得回覆：{:?}",
+        early.as_ref().map(|(reply, open)| (j(reply), *open))
+    );
+    assert_eq!(state_while_open.as_deref(), Some("RECOVERING"), "handle 關閉前不得轉 RELEASED");
+    assert!(!persisted_while_open, "handle 關閉前不得落盤 RELEASED");
+    let (reply, open_at_reply) = reply.expect("handle 確認關閉後 release 應回覆");
+    assert_eq!(reply.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&reply));
+    assert_eq!(s(&sub(&reply, "session"), "state"), "RELEASED", "{}", j(&reply));
+    assert!(!open_at_reply, "release 回 ok 時 handle 已關閉");
+    assert!(wp510_review10_state_has_released_by_id(&r, WP510_PLACEHOLDER_BY_ID), "RELEASED 必須落盤");
+    let session = r.session("t:COM3").expect("t:COM3 session");
+    assert_eq!(s(&session, "released_by"), "cli", "{}", j(&session));
+    assert_eq!(session.get("drain_stalled"), Some(&PyValue::Bool(false)), "{}", j(&session));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(dev.close_count(), closes_before + 1, "handle 只關閉一次");
+    assert!(!dev.is_open());
+    assert_eq!(dev.open_attempts(), attempts, "不得另開新 handle");
+    assert_eq!(dev.tx_len(), tx_before, "不得送 TX");
+    assert!(!r.mgr.unconfirmed_close_for_test(WP510_PLACEHOLDER_BY_ID));
+}
+
+/// 同上，但退休 bridge 的 handle 關閉失敗（`closed:false`）：release 回 DRAIN_STALLED，不轉 RELEASED、不落盤，by_id
+/// 登記為未確認關閉（Python `_finish_attach_op` 關閉失敗即回 False、保留作業且不設 `done`，release 回 DRAIN_STALLED，
+/// `origin/main:sw_core/session_manager.py:4322-4332`、`:3192-3204`）；之後的 release 仍為 DRAIN_STALLED。
+#[test]
+fn wp510_review12_rpc_release_retired_bridge_close_failure_reports_drain_stalled() {
+    let (r, dev, attempts, tx_before, _) = wp510_review12_retired_bridge_closing_after_bind_stall();
+    let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+    let release_rig = Arc::clone(&r);
+    let release = std::thread::spawn(move || {
+        let _ = reply_tx.send(release_rig.call("device.release", r#"{"selector":"t:COM3"}"#));
+    });
+    let early = reply_rx.recv_timeout(Duration::from_millis(500)).ok();
+    dev.fail_close(PalError::io(5, "injected close failure"));
+    dev.release_pause();
+    let reply = reply_rx.recv_timeout(Duration::from_secs(10)).ok().or(early.clone());
+    release.join().expect("release thread 不應 panic");
+
+    assert!(
+        early.is_none(),
+        "退休 bridge 的 handle 關閉回條前 release 不得回覆：{:?}",
+        early.as_ref().map(j)
+    );
+    let reply = reply.expect("關閉失敗後 release 應回覆");
+    assert_eq!(s(&reply, "error_code"), "DRAIN_STALLED", "{}", j(&reply));
+    assert_eq!(reply.get("drain_stalled"), Some(&PyValue::Bool(true)), "{}", j(&reply));
+    assert_eq!(s(&sub(&reply, "session"), "state"), "RECOVERING", "{}", j(&reply));
+    assert!(
+        r.mgr.unconfirmed_close_for_test(WP510_PLACEHOLDER_BY_ID),
+        "退休 bridge 的 handle 關閉未確認須登記阻擋"
+    );
+    let again = r.call("device.release", r#"{"selector":"t:COM3"}"#);
+    assert_eq!(s(&again, "error_code"), "DRAIN_STALLED", "{}", j(&again));
+    let session = r.session("t:COM3").expect("t:COM3 session");
+    assert_eq!(s(&session, "state"), "RECOVERING", "{}", j(&session));
+    assert!(
+        !wp510_review10_state_has_released_by_id(&r, WP510_PLACEHOLDER_BY_ID),
+        "關閉未確認不得落盤 RELEASED"
+    );
+    assert_eq!(dev.open_attempts(), attempts, "不得另開新 handle");
+    assert_eq!(dev.tx_len(), tx_before, "不得送 TX");
+}
+
 const WP510_R10_BY_ID_D: &str = "/s/by-id/usb-r10-D";
 const WP510_R10_REAL_D: &str = "/dev/ttyR10D";
 

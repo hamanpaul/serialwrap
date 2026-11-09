@@ -250,6 +250,7 @@ static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// | ④ 交給 session、正式 bridge 接手前（`SessionIo::preopened`，由交接表 `Inner::handoff` 追蹤），`open_bridge` 於 stopping、configure 失敗、路徑不符時關閉；取消者（release、bind、shutdown、裝置改指）在 actor 接手前認領交接列，handle 移入在途表的關閉中作業後代為關閉（`close_claimed_handoff`） | `close_before_bridge`／`close_claimed_handoff` 告警並 `retain_unconfirmed_close`（作業留在 `inflight`）；`open_bridge` 回 `OpenFailure::CloseUnconfirmed`，actor 的 pending stop 保持 stalled（`pending_open_close_unconfirmed`），不交 `finish_pending_open_stop` | 末段重收 `attach:<by_id>` 為 false；session 的 shutdown 等待者不回覆亦為 false | pending release 回 DRAIN_STALLED；release 代為關閉者等待保留作業至期限回 DRAIN_STALLED；之後的 release 經 `close_failed` 作業回 DRAIN_STALLED |
 /// | ⑤ `open_bridge` 開埠返回時已 stopping（重組的預開或新開 handle） | 同 ④ | 同 ④ | 同 ④ |
 /// | ⑥ 正式 bridge 接手後（`IoWorker` 擁有） | `WorkerStoppedReceipt.handle_closed:false` → stop 標 stalled（`worker_stopped`） | session 為 false | DRAIN_STALLED |
+/// | ⑥' 開埠成功但 actor 不接手而退休的 bridge（`retire_opened_bridge`；例如 bind 等待已取走的交接列逾時設 RECOVERING 之後開埠才成功） | 退休 bridge 的回條 `handle_closed:false` → 關閉中作業保留（`close_failed`）並登記未確認關閉（`retired_open_close_receipt`） | 不列入（同 ⑥ 以外的退休 epoch） | release 等配對且 `handle_closed:true` 的回條才完成 RELEASED；`false` 回 DRAIN_STALLED，之後的 release 至期限回 DRAIN_STALLED |
 /// | ⑦ parked 作業被拔除／改指（`update_devices`）、bind 收尾後的殘留 `SessionIo::preopened` | `close_session_preopened` 只告警：Python 先自 `_preopened_ports` 取出作業再關閉（`:4045-4063`、`:3776-3800`），失敗不保留 | 不列入（同 Python） | 不列入（同 Python） |
 /// | ⑧ PROBE bridge | Rust 不另建 PROBE bridge，PROBE 直接用 ③ 的同一 handle | 見 ③ | 見 ③ |
 ///
@@ -257,7 +258,10 @@ static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// `wp510_review5_release_waiting_bridge_open_fail_close_reports_drain_stalled`（④⑤ release）、
 /// `wp510_review5_configure_failure_fail_close_keeps_handle_in_drain`（④ configure 失敗，無 stop 在途）、
 /// `wp510_review6_finish_attach_op_rereads_close_failed_under_lock`（④ 與 attach worker 收尾交錯：`finish_attach_op`
-/// 於 manager 鎖內重讀 `close_failed`，不以取鎖前的快照移除已被 `retain_unconfirmed_close` 標記的作業）。
+/// 於 manager 鎖內重讀 `close_failed`，不以取鎖前的快照移除已被 `retain_unconfirmed_close` 標記的作業）、
+/// `wp510_review12_rpc_release_waits_retired_bridge_close_after_bind_stall`、
+/// `wp510_review12_rpc_release_retired_bridge_close_failure_reports_drain_stalled`（⑥'，sw-daemon；sw-core 另有
+/// `wp510_review12_*` 六案涵蓋關閉回條先到、裝置改指後新開埠失敗／成功、RELEASED 上 device.attach 落盤失敗）。
 ///
 /// 未確認關閉的全域阻擋（wp510 第 13 項）：上表各位置的 `closed:false` 一律登記到 `UnconfirmedCloses`（Python
 /// `_draining_by_ids`，`origin/main:sw_core/session_manager.py:1286-1348`；安全回條才移除 `:1346-1368`，Rust 無遲到回條，
@@ -268,6 +272,7 @@ static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// | ①②③ attach 作業關閉未確認 | `AttachOp::mark_close_failed`（`close_parts`、`finish_attach_op` 帶入的回條） | `_finish_attach_op` 關閉失敗保留作業 `:4320-4332` |
 /// | ④⑤ 正式 bridge 接手前關閉未確認（含取消者代為關閉交接列的 handle） | `close_before_bridge`／`close_claimed_handoff` → `retain_unconfirmed_close` | `bridge.start()` 失敗經 `_track_attach_bridge_stop` 納入 `_draining_by_ids` `:5185-5207`、`:1286-1324`；`_attach_by_id` 中止時 `_finish_attach_op` 關閉失敗，作業留在 `_active_attach_ops` `:4322-4332` |
 /// | ⑥ 正式 bridge 回條 `handle_closed:false` | actor `worker_stopped` | session drain 留在 `_draining_by_ids` `:2774-2775`、`:2918-2919` |
+/// | ⑥' 退休 bridge 回條 `handle_closed:false` | actor `retired_open_close_receipt` | 被取消的作業 `_finish_attach_op` 關閉失敗，留在 `_active_attach_ops` `:4322-4332` |
 /// | ⑦ 不登記：Python 已先自表取出的作業（parked 作業的 release／bind／拔除，bind 收尾殘留） | `close_session_preopened` 只告警 | 先移出表再關閉 `:3108-3111`、`:3680-3681`、`:3776-3800`、`:4045-4063`；`_finish_attach_op` 只告警 `:4322-4332` |
 ///
 /// 會開啟 UART 的入口與阻擋結果（皆為零開埠嘗試、零 TX）：
@@ -604,6 +609,10 @@ struct Shared {
     /// session 後、正式 bridge 接手前的 shutdown 交錯）。
     #[cfg(feature = "test-fakes")]
     open_bridge_pre_take_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// 只供測試（test-fakes）：`open_bridge` 已取走 session 預開 handle（交接列 `taken`）、開埠尚未返回時的一次性暫停點
+    /// （重現 bind 等待已取走的交接列逾時、之後開埠才成功的交錯；wp510 第十次整包審查 High P8-14fe592-1）。
+    #[cfg(feature = "test-fakes")]
+    open_bridge_post_take_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// 只供測試（test-fakes）：指定 by_id 的下一次 `finish_attach_op` 取得 manager 鎖之前的一次性暫停點（重現 attach
     /// worker 收尾與 `open_bridge` 的 `retain_unconfirmed_close` 交錯；wp510 P8-fdc1413-1）。
     #[cfg(feature = "test-fakes")]
@@ -3202,6 +3211,14 @@ impl OpenCtx {
             BridgeTake::Revoked => return Err(OpenFailure::CloseBlocked),
             BridgeTake::Handle(pre) => pre,
         };
+        #[cfg(feature = "test-fakes")]
+        {
+            // 先取出再執行，暫停期間不持有 hook 的鎖。
+            let hook = lock(&self.shared.open_bridge_post_take_hook).take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let result = self.open_bridge_with(dev, cfg, precheck_holders, control, pre);
         self.shared.settle_handoff(&self.io);
         result
@@ -3769,6 +3786,8 @@ impl SessionManager {
             alias_pre_commit_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             open_bridge_pre_take_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            open_bridge_post_take_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             finish_attach_op_pre_lock_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
@@ -4999,6 +5018,12 @@ impl SessionManager {
     #[cfg(feature = "test-fakes")]
     pub fn set_open_bridge_pre_take_hook_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
         *lock(&self.shared.open_bridge_pre_take_hook) = Some(hook);
+    }
+
+    /// 只供測試（test-fakes）：設定 `open_bridge` 已取走 session 預開 handle、開埠返回前的一次性暫停點。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_open_bridge_post_take_hook_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
+        *lock(&self.shared.open_bridge_post_take_hook) = Some(hook);
     }
 
     /// 只供測試（test-fakes）：設定 `by_id` 下一次 `finish_attach_op` 取得 manager 鎖之前的一次性暫停點。
