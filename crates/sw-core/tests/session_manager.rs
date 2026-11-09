@@ -4525,3 +4525,80 @@ fn wp510_review5_configure_failure_fail_close_keeps_handle_in_drain() {
     );
     assert_eq!(device.open_count(), 1, "不得重新開埠");
 }
+
+/// wp510 第五次整包審查 Medium：佔位交接的 attach worker 建立失敗（`Builder::spawn()` 回錯）。Python
+/// `attach_device` 同步呼叫 `_spawn_attach`（`origin/main:sw_core/session_manager.py:3633-3638`），`worker.start()`
+/// 的例外穿出 RPC（`:4147-4150`），不會回成功；佔位與持久化阻擋須維持，不可新舊 session 皆不存在。
+#[test]
+fn wp510_review5_handoff_worker_spawn_failure_returns_error_and_keeps_placeholder() {
+    const SID: &str = "gone-template:COM3";
+    const BY_ID: &str = "/s/by-id/usb-G";
+    const REAL: &str = "/dev/ttyG";
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    let device = m.device(REAL);
+    m.mgr.update_devices(&m.snapshot());
+    let persisted_before = m.load_state_now().released.contains_key(SID);
+    assert!(persisted_before, "前提：佔位的 RELEASED 阻擋已持久化");
+    m.mgr.fail_next_attach_spawn_for_test();
+
+    let error = m
+        .mgr
+        .attach_released_placeholder(&sid, false)
+        .expect_err("attach worker 建立失敗必須傳回 RPC 錯誤");
+
+    assert_eq!(error.message, "can't start new thread");
+    let warnings = m.warnings();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.starts_with("attach worker 建立失敗（by_id=/s/by-id/usb-G）")),
+        "建立失敗必須留下診斷：{warnings:?}"
+    );
+    wp510_b_assert_placeholder_retained(&m, SID);
+    assert_eq!(
+        m.load_state_now().released.contains_key(SID),
+        persisted_before,
+        "持久化阻擋不得因建立失敗改變"
+    );
+    assert!(m.mgr.resolve("t:COM3").is_none(), "未建立 worker 不得出現正式 session");
+    assert!(!device.is_open(), "未交接的 handle 必須關閉");
+    assert!(!m.mgr.has_inflight_attach_for_test(BY_ID), "確認關閉後不得殘留阻擋");
+
+    let retry = rpc(m.mgr.attach_released_placeholder(&sid, false));
+    assert!(is_ok(&retry), "建立失敗後佔位仍可重新交接：{retry:?}");
+    wait_until("t:COM3 正式 session", || m.mgr.resolve("t:COM3").is_some());
+}
+
+/// 同上（一般 OSError 分支）：佔位開埠回一般 OSError 時同樣先建立 worker；建立失敗須傳回 RPC 錯誤並保留佔位。
+#[test]
+fn wp510_review5_oserror_handoff_worker_spawn_failure_returns_error_and_keeps_placeholder() {
+    const SID: &str = "gone-template:COM3";
+    const BY_ID: &str = "/s/by-id/usb-G";
+    const REAL: &str = "/dev/ttyG";
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    m.serial.fail_next_open(REAL, wp510_b_permission_error());
+    m.mgr.update_devices(&m.snapshot());
+    let persisted_before = m.load_state_now().released.contains_key(SID);
+    assert!(persisted_before, "前提：佔位的 RELEASED 阻擋已持久化");
+    m.mgr.fail_next_attach_spawn_for_test();
+
+    let error = m
+        .mgr
+        .attach_released_placeholder(&sid, false)
+        .expect_err("attach worker 建立失敗必須傳回 RPC 錯誤");
+
+    assert_eq!(error.message, "can't start new thread");
+    assert!(
+        m.warnings()
+            .iter()
+            .any(|w| w.starts_with("attach worker 建立失敗（by_id=/s/by-id/usb-G）")),
+        "建立失敗必須留下診斷：{:?}",
+        m.warnings()
+    );
+    wp510_b_assert_placeholder_retained(&m, SID);
+    assert_eq!(m.load_state_now().released.contains_key(SID), persisted_before);
+    assert!(m.mgr.resolve("t:COM3").is_none(), "未建立 worker 不得出現正式 session");
+    assert!(!m.mgr.has_inflight_attach_for_test(BY_ID), "無 handle 的作業不得殘留阻擋");
+}

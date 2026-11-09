@@ -228,6 +228,7 @@ static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// | `bind_requested`；設定與等待 `:3683-3697` | 無獨立欄位；一般 bind 以取消旗標和共用 inflight 排空。OD-63 佔位 bind 依裁決早退，不能取消或改動作業。 | `bind_with_inflight_attach_op_cancels_waits_3000ms`; `wp510_b_bind_placeholder_precedes_inflight_cancellation` |
 /// | close 成功／失敗；`_finish_attach_op` `:4320-4365` | close 成功才移除 inflight；任一取消原因的 `closed:false` 都保留阻擋並以 by_id 與 `CloseReceipt.error` 告警（`:4322-4332`），release 後續維持 `DRAIN_STALLED`。release 收尾由 actor 的 `PlaceholderAttachSettled` 補齊 `released_by`／`released_at` 並持久化（`:4341-4363`），失敗告警後由 release 重試（`:3206-3209`）。 | `wp510_review_late_placeholder_attach_completion_clears_drain_stall`; `wp510_rpc_failed_close_keeps_placeholder_drain_stalled`; `wp510_lifecycle_shutdown_cancel_fail_close_keeps_placeholder_blocked`; `wp510_lifecycle_device_path_change_cancel_fail_close_keeps_placeholder_blocked`; `wp510_review4_failed_preopened_close_warns_with_by_id_and_error`; `wp510_review4_release_cancel_persist_enospc_fails_release_then_retries` |
 /// | shutdown 取消及排空 `:1175-1239` | shutdown 取消作業並等待 `Inner::inflight` 清除；仍有 close:false 的作業回報未 drained。末段比照 `:1231-1239` 重新收集排空期間才保留的作業。 | `shutdown_includes_inflight_attach`; `wp510_lifecycle_shutdown_cancel_fail_close_keeps_placeholder_blocked`; `wp510_review5_shutdown_before_bridge_takes_preopened_fail_close_reports_stalled` |
+/// | 執行緒建立；`_spawn_attach` `:4147-4150`，佔位交接同步呼叫 `:3633-3638` | `prepare_attach_worker` 先建立、放行前不碰作業；佔位交接在開埠與退休前取得 worker，`Builder::spawn()` 失敗即告警並回 RPC 錯誤（`can't start new thread`），佔位與持久化阻擋不變。自動 attach 無 RPC，告警後收尾作業。 | `wp510_review5_handoff_worker_spawn_failure_returns_error_and_keeps_placeholder`; `wp510_review5_oserror_handoff_worker_spawn_failure_returns_error_and_keeps_placeholder` |
 ///
 /// 生命週期：建立 → 開埠完成並交接，或取消後晚到並關閉；關閉成功才移除作業，`closed:false` 一律保留作業。release 找到同一作業後取消並等待首次 deadline；期限到期回 `DRAIN_STALLED`。shutdown 取消並排空同一 inflight 集合。
 /// Rust 用作業 token 與 actor 的 `PlaceholderAttachStalled/Settled` 保存 stall 診斷，對應 Python 在 manager lock 下設定 `drain_stalled` 與 `drain_timeout_epoch`。
@@ -339,6 +340,21 @@ impl AttachOp {
     }
 }
 
+/// 已建立、尚未放行的 attach worker 執行緒（`Shared::prepare_attach_worker`）。
+struct PreparedAttachWorker {
+    go: Sender<()>,
+}
+
+impl PreparedAttachWorker {
+    /// 放行 worker 執行 attach 本體並於結束時收尾作業。
+    fn start(self) {
+        let _ = self.go.send(());
+    }
+}
+
+/// Python `threading.Thread.start()` 無法建立執行緒時的 `RuntimeError` 訊息（RPC 邊界的 `str(exc)`）。
+const THREAD_START_FAILED: &str = "can't start new thread";
+
 #[derive(Default)]
 struct Inner {
     /// session_id → 鏡像（插入順序＝建立順序，selector 的 tiebreak 與 DETACHED-rebind 候選都依此）。
@@ -438,6 +454,9 @@ struct Shared {
     /// session 後、正式 bridge 接手前的 shutdown 交錯）。
     #[cfg(feature = "test-fakes")]
     open_bridge_pre_take_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// 只供測試（test-fakes）：下一次建立 attach worker 執行緒時模擬 `Builder::spawn()` 失敗（執行緒資源耗盡）。
+    #[cfg(feature = "test-fakes")]
+    fail_next_attach_spawn: AtomicBool,
     /// 載入的 state.json 含孤立 surrogate（`LoadedState::lone_surrogates`；啟動存檔前檢查）。
     lone_surrogates: bool,
     /// 啟動存檔重現的 Python 未捕捉例外末行（`_save_state` 的 `UnicodeEncodeError`）；daemon 據此 exit 1。
@@ -1301,22 +1320,55 @@ impl Shared {
         self.spawn_attach_worker(by_id, op);
     }
 
-    /// 啟動已登錄於 `inflight` 的 attach op；placeholder handoff 先同步開埠再呼叫。
+    /// 啟動已登錄於 `inflight` 的 attach op（自動 attach 路徑）。執行緒建立失敗沒有 RPC 可回報：告警留下診斷後
+    /// 關閉預開 handle 並收尾作業（關閉失敗仍保留阻擋）。
     fn spawn_attach_worker(self: &Arc<Self>, by_id: &str, op: AttachOp) {
+        match self.prepare_attach_worker(by_id, &op) {
+            Ok(worker) => worker.start(),
+            Err(_) => {
+                let close_receipt = op.close_preopened_with_receipt();
+                self.finish_attach_op(by_id, &op, close_receipt);
+            }
+        }
+    }
+
+    /// 先建立 attach worker 執行緒、放行（`PreparedAttachWorker::start`）前不執行 attach 本體也不碰作業；drop 未放行的
+    /// worker 即令執行緒直接結束。Python `_spawn_attach` 的 `worker.start()` 例外會穿出呼叫端（`device.attach` 經
+    /// `origin/main:sw_core/session_manager.py:3633-3638` 同步呼叫，例外見 `:4147-4150`），因此建立失敗以 by_id 與
+    /// OS 錯誤告警並回傳錯誤，由呼叫端決定 RPC 回應與還原。
+    fn prepare_attach_worker(
+        self: &Arc<Self>,
+        by_id: &str,
+        op: &AttachOp,
+    ) -> std::io::Result<PreparedAttachWorker> {
+        let (go, go_rx) = crossbeam_channel::bounded::<()>(1);
         let me = self.clone();
         let key = by_id.to_string();
         let worker_op = op.clone();
-        let spawned =
+        #[cfg(feature = "test-fakes")]
+        let injected = self.fail_next_attach_spawn.swap(false, Ordering::SeqCst);
+        #[cfg(not(feature = "test-fakes"))]
+        let injected = false;
+        let spawned = if injected {
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        } else {
             std::thread::Builder::new()
                 .name(format!("serialwrap-attach-{by_id}"))
                 .spawn(move || {
+                    if go_rx.recv().is_err() {
+                        return;
+                    }
                     let _ = catch_unwind(AssertUnwindSafe(|| me.attach_worker(&key, &worker_op)));
                     let close_receipt = worker_op.close_preopened_with_receipt();
                     me.finish_attach_op(&key, &worker_op, close_receipt);
-                });
-        if spawned.is_err() {
-            let close_receipt = op.close_preopened_with_receipt();
-            self.finish_attach_op(by_id, &op, close_receipt);
+                })
+        };
+        match spawned {
+            Ok(_) => Ok(PreparedAttachWorker { go }),
+            Err(error) => {
+                self.warn(format!("attach worker 建立失敗（by_id={by_id}）：{error}"));
+                Err(error)
+            }
         }
     }
 
@@ -1539,6 +1591,20 @@ impl Shared {
             inner.inflight.insert(by_id.clone(), op.clone());
         }
 
+        // wp510 第五次整包審查 Medium：交接用的 attach worker 先於開埠與退休建立。Python 在退休並存檔後才
+        // `_spawn_attach`，`worker.start()` 例外穿出 RPC（`origin/main:sw_core/session_manager.py:3633-3638`、
+        // `:4147-4150`）；這裡在任何副作用前取得執行緒，建立失敗即回 RPC 錯誤，佔位與持久化阻擋原樣保留，
+        // 不會出現新舊 session 皆不存在。未放行的 worker 於各提前返回路徑 drop 後自行結束。
+        let worker = match self.prepare_attach_worker(&by_id, &op) {
+            Ok(worker) => worker,
+            Err(_) => {
+                self.finish_attach_op(&by_id, &op, None);
+                return Err(PyErr {
+                    message: THREAD_START_FAILED.to_string(),
+                });
+            }
+        };
+
         let handle = match self
             .serial
             .open_exclusive(&DevicePath(real.clone()), &serial_config(&uart))
@@ -1594,7 +1660,7 @@ impl Shared {
                 self.stop_retired_placeholder_actor(sid, &retired.entry);
                 // Python `_spawn_attach(by_id, dynamic_only=True)` 會以原 COM 重試 dynamic。
                 // 保留目前 inflight op，避免 watcher 在退休與重試之間搶先建立一般 attach。
-                self.spawn_attach_worker(&by_id, op);
+                worker.start();
                 return Ok(pydict! { "ok" => true, "session" => public });
             }
         };
@@ -1637,7 +1703,7 @@ impl Shared {
         }
         self.stop_retired_placeholder_actor(sid, &retired.entry);
 
-        self.spawn_attach_worker(&by_id, op);
+        worker.start();
         Ok(pydict! { "ok" => true, "session" => public })
     }
 
@@ -3228,6 +3294,8 @@ impl SessionManager {
             alias_pre_commit_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             open_bridge_pre_take_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            fail_next_attach_spawn: AtomicBool::new(false),
         });
         shared.bootstrap_sessions(&load.profiles);
         let mgr = Arc::new(SessionManager {
@@ -4135,6 +4203,12 @@ impl SessionManager {
     #[cfg(feature = "test-fakes")]
     pub fn set_open_bridge_pre_take_hook_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
         *lock(&self.shared.open_bridge_pre_take_hook) = Some(hook);
+    }
+
+    /// 只供測試（test-fakes）：下一次建立 attach worker 執行緒時模擬 `Builder::spawn()` 回錯。
+    #[cfg(feature = "test-fakes")]
+    pub fn fail_next_attach_spawn_for_test(&self) {
+        self.shared.fail_next_attach_spawn.store(true, Ordering::SeqCst);
     }
 
     /// 只供測試（test-fakes）：設定 `alias.set` 持久化前暫停點（見 `alias_pre_commit_hook`）。

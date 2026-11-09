@@ -6111,6 +6111,47 @@ fn wp510_review4_rpc_attach_from_released_stamps_last_state_change_at() {
     );
 }
 
+/// wp510 第五次整包審查 Medium（RPC 端到端）：`device.attach` 經 `Service::rpc` → `route_with_selector` →
+/// `attach_released_placeholder`，交接 worker 的 `Builder::spawn()` 失敗。Python `attach_device` 同步
+/// `_spawn_attach`（`origin/main:sw_core/session_manager.py:3633-3638`），`worker.start()` 的 `RuntimeError`
+/// 穿出 RPC（`:4147-4150`）成為 EXCEPTION；佔位與持久化阻擋須保留，之後可重新交接。
+#[test]
+fn wp510_review5_rpc_handoff_worker_spawn_failure_returns_exception() {
+    let r = wp510_b_placeholder_rig();
+    let dev = r.device(WP510_REAL_G);
+    r.mgr.fail_next_attach_spawn_for_test();
+
+    let error = r.call_err(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+
+    assert_eq!(error.message, "can't start new thread");
+    assert_eq!(r.mgr.released_placeholder(WP510_PLACEHOLDER_SID), Some(true));
+    assert_eq!(
+        s(
+            &r.session(WP510_PLACEHOLDER_SID).expect("建立失敗後佔位仍存在"),
+            "state"
+        ),
+        "RELEASED"
+    );
+    assert!(r.mgr.resolve("t:COM3").is_none(), "未建立 worker 不得出現正式 session");
+    assert_eq!(dev.open_count(), 0, "worker 建立失敗前不得開埠");
+    assert_eq!(dev.tx_len(), 0, "worker 建立失敗不得送出任何 TX");
+    assert!(!r.mgr.has_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID));
+
+    let retry = r.call(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    assert_eq!(
+        retry.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "建立失敗後佔位仍可交接：{}",
+        j(&retry)
+    );
+}
+
 /// wp510 第五次整包審查 High（RPC 端到端）：`device.attach` 交接後、正式 bridge 的 `open_bridge` 接手預開 handle 前
 /// shutdown，關閉回條為 `closed:false`。Python 作業關閉失敗即保留（`origin/main:sw_core/session_manager.py:4322-4332`），
 /// `shutdown_drain` 末段列入 stalled（`:1231-1239`）；不得因 daemon stopping 的開埠錯誤回報已排空。
