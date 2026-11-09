@@ -2467,6 +2467,16 @@ impl SessionCore {
                 self.adopt_opened_bridge(opened, now)
             }
             Err(failure) => {
+                let close_unconfirmed = matches!(failure, OpenFailure::CloseUnconfirmed(_));
+                let failure = match failure {
+                    OpenFailure::CloseUnconfirmed(cause) => *cause,
+                    other => other,
+                };
+                if close_unconfirmed && self.pending_open_stop.is_some() {
+                    // wp510 第五次整包審查 High：handle 未確認關閉時不得以後續的一般開埠錯誤完成排空。
+                    self.open_real_path = None;
+                    return self.pending_open_close_unconfirmed(now);
+                }
                 let failure_error = open_failure_last_error(&failure);
                 if let Some(pending) = self.pending_open_stop.take() {
                     self.open_real_path = None;
@@ -2557,6 +2567,28 @@ impl SessionCore {
                 ev: TimerEvent::DrainTimeout { epoch, stop_id: id },
             },
         ]
+    }
+
+    /// 開埠在途的 stop 收到 `OpenFailure::CloseUnconfirmed`：正式 bridge 接手前的 handle 關閉回條為 `closed:false`。
+    /// Python `_finish_attach_op` 關閉失敗即回 False、保留作業且不設 `done`（`origin/main:sw_core/session_manager.py:4322-4332`），
+    /// release 因而回 DRAIN_STALLED（`:3192-3204`）、shutdown 列為 stalled（`:1231-1239`）。比照 `worker_stopped` 的
+    /// `handle_closed:false`：pending stop 標為 stalled 並保留（不清 `drain_stalled`、不寫 DETACHED／RELEASED），
+    /// release 等待者回 DRAIN_STALLED，其餘等待者（shutdown）不回覆，排空判定維持未收斂。
+    fn pending_open_close_unconfirmed(&mut self, now: Mono) -> Vec<Effect> {
+        let mut reply_waiters = Vec::new();
+        if let Some(pending) = &mut self.pending_open_stop {
+            pending.stalled = true;
+            if pending.kind == StopKind::Release {
+                reply_waiters.extend(pending.waiters.drain(..));
+            }
+        }
+        self.drain_stalled = true;
+        self.drain_timeout_epoch = Some(self.generations.bridge_generation);
+        self.placeholder_attach_stall_token = None;
+        reply_waiters
+            .into_iter()
+            .map(|waiter| Effect::Reply(waiter, Ok(self.drain_stalled_reply(now))))
+            .collect()
     }
 
     fn finish_pending_open_stop(&mut self, pending: PendingOpenStop, now: Mono) -> Vec<Effect> {
@@ -2673,7 +2705,7 @@ impl SessionCore {
                 response.insert("device_by_id", PyValue::from(pending.by_id));
                 vec![Effect::Reply(pending.reply, Ok(response))]
             }
-            OpenFailure::Other(_) => {
+            OpenFailure::Other(_) | OpenFailure::CloseUnconfirmed(_) => {
                 self.open_real_path = None;
                 self.attached_real_path = None;
                 self.set_last_error(Some(failure_error), None);
@@ -6251,6 +6283,7 @@ fn open_failure_last_error(failure: &OpenFailure) -> String {
         OpenFailure::AccessDenied(_) => "PermissionError",
         OpenFailure::NotFound => "FileNotFoundError",
         OpenFailure::Other(error) => error.py_exc_name(),
+        OpenFailure::CloseUnconfirmed(cause) => return open_failure_last_error(cause),
     };
     format!("ATTACH_FAILED:{class}")
 }

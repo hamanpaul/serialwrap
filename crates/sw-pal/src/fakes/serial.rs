@@ -314,6 +314,8 @@ pub(crate) struct FakeDeviceInner {
     /// 下一次 close 於暫停點（`wait_paused`／`release_pause`）停住（審查 F46）。
     pause_close: AtomicBool,
     close_err: Mutex<Option<PalError>>,
+    /// 下一次 `CloseToken::configure` 回此錯誤（一次性；正式 bridge 套用 template UART 設定失敗的替身）。
+    configure_err: Mutex<Option<PalError>>,
     removed: AtomicBool,
     external_hold: Mutex<Option<Vec<u32>>>,
     access_denied: AtomicBool,
@@ -352,6 +354,7 @@ impl FakeDeviceInner {
             loopback: Mutex::new(None),
             pause_close: AtomicBool::new(false),
             close_err: Mutex::new(None),
+            configure_err: Mutex::new(None),
             removed: AtomicBool::new(false),
             external_hold: Mutex::new(None),
             access_denied: AtomicBool::new(false),
@@ -704,6 +707,11 @@ impl FakeDevice {
         *self.inner.close_err.lock().unwrap_or_else(|e| e.into_inner()) = Some(err);
     }
 
+    /// 下一次 `CloseToken::configure` 回 `Err(err)`（一次性；不記入 `configs`）。
+    pub fn fail_configure(&self, err: PalError) {
+        *self.inner.configure_err.lock().unwrap_or_else(|e| e.into_inner()) = Some(err);
+    }
+
     pub fn open_count(&self) -> usize {
         self.inner.opens.load(Ordering::SeqCst)
     }
@@ -1011,6 +1019,15 @@ impl crate::traits::CloseImpl for FakeCloseImpl {
     }
 
     fn configure(&self, cfg: &SerialConfig) -> PalResult<()> {
+        if let Some(err) = self
+            .inner
+            .configure_err
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            return Err(err);
+        }
         self.inner
             .configs
             .lock()

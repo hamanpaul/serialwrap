@@ -6110,3 +6110,61 @@ fn wp510_review4_rpc_attach_from_released_stamps_last_state_change_at() {
         "RELEASED→ATTACHING 的 device.attach 回應必須帶 T1"
     );
 }
+
+/// wp510 第五次整包審查 High（RPC 端到端）：`device.attach` 交接後、正式 bridge 的 `open_bridge` 接手預開 handle 前
+/// shutdown，關閉回條為 `closed:false`。Python 作業關閉失敗即保留（`origin/main:sw_core/session_manager.py:4322-4332`），
+/// `shutdown_drain` 末段列入 stalled（`:1231-1239`）；不得因 daemon stopping 的開埠錯誤回報已排空。
+#[test]
+fn wp510_review5_rpc_shutdown_before_bridge_takes_preopened_fail_close_reports_stalled() {
+    let r = wp510_b_placeholder_rig();
+    let dev = r.device(WP510_REAL_G);
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (go_tx, go_rx) = crossbeam_channel::bounded::<()>(1);
+    r.mgr.set_open_bridge_pre_take_hook_for_test(Box::new(move || {
+        let _ = entered_tx.send(());
+        let _ = go_rx.recv_timeout(Duration::from_secs(10));
+    }));
+
+    let attached = r.call(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    assert_eq!(
+        attached.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "device.attach 應交接在線佔位：{}",
+        j(&attached)
+    );
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("正式 session 的 open_bridge 應停在接手預開 handle 之前");
+    dev.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
+    let manager = r.mgr.clone();
+    let shutdown = std::thread::spawn(move || manager.shutdown(Duration::from_millis(1500)));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while r.session("t:COM3").map(|session| s(&session, "state").to_string()).as_deref()
+        != Some("RECOVERING")
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    go_tx.send(()).expect("放行 open_bridge");
+    let drained = shutdown.join().expect("shutdown thread 不應 panic");
+
+    assert!(
+        drained
+            .iter()
+            .any(|(target, ok)| target == &format!("attach:{WP510_PLACEHOLDER_BY_ID}") && !ok),
+        "未確認關閉的預開 handle 必須列入 shutdown stalled：{drained:?}"
+    );
+    assert!(
+        drained.iter().any(|(target, ok)| target == "t:COM3" && !ok),
+        "daemon stopping 的開埠錯誤不得把正式 session 計為已排空：{drained:?}"
+    );
+    assert!(dev.is_open(), "closed:false 表示 handle 仍開啟");
+    assert!(
+        r.mgr.has_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID),
+        "未確認關閉的 handle 必須持續阻擋"
+    );
+    assert_eq!(dev.open_count(), 1, "停機後不得重新開埠");
+}

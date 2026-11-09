@@ -4374,3 +4374,154 @@ fn alias_set_reaches_actor_profile_for_get_state() {
     let listed = m.session("COM0");
     assert_eq!(s_of(&listed, "alias").as_deref(), Some("dut"), "{listed:?}");
 }
+
+/// wp510 第五次整包審查：佔位交接後正式 session 的 `open_bridge` 停在取預開 handle 之前；回傳放行送端。
+fn wp510_review5_pause_open_bridge(m: &ManagerRig) -> crossbeam_channel::Sender<()> {
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (go_tx, go_rx) = crossbeam_channel::bounded::<()>(1);
+    m.mgr.set_open_bridge_pre_take_hook_for_test(Box::new(move || {
+        let _ = entered_tx.send(());
+        let _ = go_rx.recv_timeout(Duration::from_secs(10));
+    }));
+    let sid = m.mgr.resolve("gone-template:COM3").expect("佔位 session");
+    let response = rpc(m.mgr.attach_released_placeholder(&sid, false));
+    assert!(is_ok(&response), "device.attach 應接受在線佔位：{response:?}");
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("正式 session 的 open_bridge 應停在接手預開 handle 之前");
+    go_tx
+}
+
+fn wp510_review5_bool(d: &PyDict, key: &str) -> Option<bool> {
+    match d.get(key) {
+        Some(PyValue::Bool(b)) => Some(*b),
+        _ => None,
+    }
+}
+
+/// wp510 第五次整包審查 High：佔位交接已建立正式 session、預開 handle 尚未由 `open_bridge` 接手時 shutdown，
+/// 關閉回條為 `closed:false`。Python 的預開 handle 在正式 bridge 接手前仍屬 attach 作業，`_finish_attach_op`
+/// 關閉失敗即保留作業（`origin/main:sw_core/session_manager.py:4322-4332`），`shutdown_drain` 末段把仍未完成的
+/// 作業列入 stalled（`:1231-1239`）。之後的一般開埠錯誤（daemon stopping）不得清除 stall 而回報排空成功，
+/// 阻擋亦須持續到確認關閉為止。
+#[test]
+fn wp510_review5_shutdown_before_bridge_takes_preopened_fail_close_reports_stalled() {
+    const BY_ID: &str = "/s/by-id/usb-G";
+    const REAL: &str = "/dev/ttyG";
+    let m = wp510_b_placeholder_rig(false, false);
+    let device = m.device(REAL);
+    m.mgr.update_devices(&m.snapshot());
+    let go = wp510_review5_pause_open_bridge(&m);
+    device.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
+
+    let manager = m.mgr.clone();
+    let shutdown = std::thread::spawn(move || manager.shutdown(Duration::from_millis(1500)));
+    wait_until("shutdown 已送達正式 session", || {
+        m.state_of("t:COM3").as_deref() == Some("RECOVERING")
+    });
+    go.send(()).expect("放行 open_bridge");
+    let drained = shutdown.join().expect("shutdown thread 不應 panic");
+
+    let attach_key = format!("attach:{BY_ID}");
+    assert!(
+        drained.iter().any(|(key, ok)| key == &attach_key && !ok),
+        "未確認關閉的預開 handle 必須列入 shutdown stalled：{drained:?}"
+    );
+    assert!(
+        drained.iter().any(|(key, ok)| key == "t:COM3" && !ok),
+        "daemon stopping 的開埠錯誤不得把正式 session 計為已排空：{drained:?}"
+    );
+    assert!(device.is_open(), "closed:false 表示 handle 仍開啟");
+    assert_eq!(device.close_count(), 1, "handle 只關閉一次");
+    assert!(
+        m.mgr.has_inflight_attach_for_test(BY_ID),
+        "未確認關閉的 handle 必須持續阻擋"
+    );
+    let session = m.session("t:COM3");
+    assert_eq!(wp510_review5_bool(&session, "drain_stalled"), Some(true), "{session:?}");
+    let again = m.mgr.shutdown(Duration::from_millis(50));
+    assert!(
+        again.iter().any(|(key, ok)| key == &attach_key && !ok),
+        "重複 shutdown 仍須回報未收斂：{again:?}"
+    );
+    assert_eq!(device.open_count(), 1, "停機後不得重新開埠");
+}
+
+/// wp510 第五次整包審查 High（release 排空）：同一窗口改由 release 等待開埠收斂，隨後 stopping 使 `open_bridge`
+/// 關閉預開 handle 失敗。Python release 以 attach 作業的 `done` 判定，關閉失敗不設 `done`，回 DRAIN_STALLED
+/// （`origin/main:sw_core/session_manager.py:3192-3204`、`:4322-4332`）；不得以後續一般開埠錯誤完成 release。
+#[test]
+fn wp510_review5_release_waiting_bridge_open_fail_close_reports_drain_stalled() {
+    const BY_ID: &str = "/s/by-id/usb-G";
+    const REAL: &str = "/dev/ttyG";
+    let m = wp510_b_placeholder_rig(false, false);
+    let device = m.device(REAL);
+    m.mgr.update_devices(&m.snapshot());
+    let go = wp510_review5_pause_open_bridge(&m);
+    device.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
+    let formal = m.mgr.resolve("t:COM3").expect("正式 session");
+
+    let manager = m.mgr.clone();
+    let release_sid = formal.clone();
+    let release = std::thread::spawn(move || wp510_release(&manager, &release_sid));
+    wait_until("release 已送達正式 session", || {
+        m.state_of("t:COM3").as_deref() == Some("RECOVERING")
+    });
+    m.mgr.begin_shutdown();
+    go.send(()).expect("放行 open_bridge");
+    let reply = rpc(release.join().expect("release thread 不應 panic"));
+
+    assert_eq!(code_of(&reply).as_deref(), Some("DRAIN_STALLED"), "{reply:?}");
+    assert_eq!(wp510_review5_bool(&reply, "drain_stalled"), Some(true), "{reply:?}");
+    assert_ne!(
+        m.state_of("t:COM3").as_deref(),
+        Some("RELEASED"),
+        "未確認關閉的 handle 不得完成 release"
+    );
+    assert!(device.is_open(), "closed:false 表示 handle 仍開啟");
+    assert!(
+        m.mgr.has_inflight_attach_for_test(BY_ID),
+        "未確認關閉的 handle 必須持續阻擋"
+    );
+    assert!(
+        !m.load_state_now().released.contains_key(&formal),
+        "release 未收斂不得持久化 RELEASED"
+    );
+}
+
+/// wp510 第五次整包審查 High（盤點：正式 bridge 套用 UART 設定失敗）：`open_bridge` 已取得預開 handle，configure
+/// 失敗且關閉回條為 `closed:false`，沒有 stop 在途。Python `_attach_by_id` 把預開作業移入 `_active_attach_ops`
+/// （`origin/main:sw_core/session_manager.py:4852-4854`）後，中止路徑經 `_finish_attach_op` 關閉，失敗即保留作業
+/// （`:4322-4332`）；後續 release 等待該作業至期限回 DRAIN_STALLED（`:3192-3204`），shutdown 列為 stalled（`:1231-1239`）。
+#[test]
+fn wp510_review5_configure_failure_fail_close_keeps_handle_in_drain() {
+    const BY_ID: &str = "/s/by-id/usb-G";
+    const REAL: &str = "/dev/ttyG";
+    let m = wp510_b_placeholder_rig(false, false);
+    let device = m.device(REAL);
+    m.mgr.update_devices(&m.snapshot());
+    let go = wp510_review5_pause_open_bridge(&m);
+    device.fail_configure(PalError::io(5, "[Errno 5] Input/output error"));
+    device.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
+    go.send(()).expect("放行 open_bridge");
+    wait_until("正式 session 開埠失敗", || {
+        m.state_of("t:COM3").as_deref() == Some("DETACHED")
+    });
+
+    assert!(device.is_open(), "closed:false 表示 handle 仍開啟");
+    assert!(
+        m.mgr.has_inflight_attach_for_test(BY_ID),
+        "未確認關閉的 handle 必須持續阻擋"
+    );
+    let started = Instant::now();
+    let reply = rpc(wp510_release(&m.mgr, "t:COM3"));
+    assert_eq!(code_of(&reply).as_deref(), Some("DRAIN_STALLED"), "{reply:?}");
+    assert!(started.elapsed() >= Duration::from_millis(2500), "release 等待作業至期限");
+    assert_ne!(m.state_of("t:COM3").as_deref(), Some("RELEASED"));
+    let drained = m.mgr.shutdown(Duration::from_millis(100));
+    assert!(
+        drained.iter().any(|(key, ok)| key == &format!("attach:{BY_ID}") && !ok),
+        "未確認關閉的 handle 必須列入 shutdown stalled：{drained:?}"
+    );
+    assert_eq!(device.open_count(), 1, "不得重新開埠");
+}

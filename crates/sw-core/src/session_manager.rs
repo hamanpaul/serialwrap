@@ -227,7 +227,7 @@ static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// | `release_request/release_deadline`；開始計時 `:3084-3086`、第一次設定及重用 `:3117-3125`，等待與逾期處理 `:3192-3204` | 第一個取得 op 的 release 把 source 寫入 `release_source`（佔位已是 RELEASED，reason 沿用 session 既有值）；進 manager lock 前記錄候選期限，第一個取得 op 的 release 寫入共享欄位。重複／並行 release 重用第一次期限，逾期即回 stalled。 | `wp510_review_release_cancels_placeholder_attach_before_retirement`; `wp510_lifecycle_repeated_release_uses_expired_attach_deadline`; `wp510_lifecycle_concurrent_releases_share_first_attach_deadline`; `wp510_review4_release_cancel_fills_null_release_metadata_and_persists` |
 /// | `bind_requested`；設定與等待 `:3683-3697` | 無獨立欄位；一般 bind 以取消旗標和共用 inflight 排空。OD-63 佔位 bind 依裁決早退，不能取消或改動作業。 | `bind_with_inflight_attach_op_cancels_waits_3000ms`; `wp510_b_bind_placeholder_precedes_inflight_cancellation` |
 /// | close 成功／失敗；`_finish_attach_op` `:4320-4365` | close 成功才移除 inflight；任一取消原因的 `closed:false` 都保留阻擋並以 by_id 與 `CloseReceipt.error` 告警（`:4322-4332`），release 後續維持 `DRAIN_STALLED`。release 收尾由 actor 的 `PlaceholderAttachSettled` 補齊 `released_by`／`released_at` 並持久化（`:4341-4363`），失敗告警後由 release 重試（`:3206-3209`）。 | `wp510_review_late_placeholder_attach_completion_clears_drain_stall`; `wp510_rpc_failed_close_keeps_placeholder_drain_stalled`; `wp510_lifecycle_shutdown_cancel_fail_close_keeps_placeholder_blocked`; `wp510_lifecycle_device_path_change_cancel_fail_close_keeps_placeholder_blocked`; `wp510_review4_failed_preopened_close_warns_with_by_id_and_error`; `wp510_review4_release_cancel_persist_enospc_fails_release_then_retries` |
-/// | shutdown 取消及排空 `:1175-1239` | shutdown 取消作業並等待 `Inner::inflight` 清除；仍有 close:false 的作業回報未 drained。 | `shutdown_includes_inflight_attach`; `wp510_lifecycle_shutdown_cancel_fail_close_keeps_placeholder_blocked` |
+/// | shutdown 取消及排空 `:1175-1239` | shutdown 取消作業並等待 `Inner::inflight` 清除；仍有 close:false 的作業回報未 drained。末段比照 `:1231-1239` 重新收集排空期間才保留的作業。 | `shutdown_includes_inflight_attach`; `wp510_lifecycle_shutdown_cancel_fail_close_keeps_placeholder_blocked`; `wp510_review5_shutdown_before_bridge_takes_preopened_fail_close_reports_stalled` |
 ///
 /// 生命週期：建立 → 開埠完成並交接，或取消後晚到並關閉；關閉成功才移除作業，`closed:false` 一律保留作業。release 找到同一作業後取消並等待首次 deadline；期限到期回 `DRAIN_STALLED`。shutdown 取消並排空同一 inflight 集合。
 /// Rust 用作業 token 與 actor 的 `PlaceholderAttachStalled/Settled` 保存 stall 診斷，對應 Python 在 manager lock 下設定 `drain_stalled` 與 `drain_timeout_epoch`。
@@ -242,6 +242,26 @@ static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// | human console 回放與按鍵（`human_tx`） | session `Entry.fence`；需該 epoch 的 IoWorker（`active_epoch`） | 正式 bridge 前沒有 worker，`human_tx` 回 `NotSubmitted`；之後同 session drain。 |
 /// | 事件引擎 | 不送 UART TX（`event_engine` 無 `TxJob` 提交點） | 不適用。 |
 /// | DETACHED-rebind（`rebind_detached` → `DeviceAttached`） | 經 actor 正式 bridge（session fence） | 佔位交接為 `dynamic_only`，不走此路徑。 |
+///
+/// UART handle 關閉回條盤點（wp510 第五次整包審查 High）：佔位 attach、交接到正式 bridge 接手之間，所有可能持有
+/// handle 的位置與 `closed:false` 的處理。原則比照 Python：作業仍在表內時 `_finish_attach_op` 關閉失敗即保留作業、
+/// 不設 `done`（`origin/main:sw_core/session_manager.py:4322-4332`），shutdown 列為 stalled（`:1231-1239`），release
+/// 等待 `done` 逾期回 DRAIN_STALLED（`:3192-3204`）；後續一般開埠錯誤不得清除 stall 而回成功。
+///
+/// | 持有位置 | `closed:false` 的處理 | shutdown 排空判定 | release 排空判定 |
+/// |---|---|---|---|
+/// | ① 佔位 `device.attach` 開埠在途（作業已登錄 `inflight`，`open_exclusive` 尚未返回） | 返回後失效：`AttachOp::close_parts` 記 `close_failed`，`finish_attach_op` 保留作業 | `attach:<by_id>` 為 false | 佔位 release 等同一作業至期限回 DRAIN_STALLED |
+/// | ② 退休後、worker 接手前（`AttachOp::preopened`） | 持久化失敗／worker 收尾經 `close_preopened_with_receipt` → `finish_attach_op` 保留 | 同上 | 舊佔位已退休、正式 session 尚未建立，無 release 對象；作業留在 `inflight` 擋後續 attach 與佔位交接 |
+/// | ③ attach worker 偵測中（`attach_dynamic`／`reattach_existing` 的區域 `HandleParts`） | 一律經 `AttachOp::close_parts`，worker 結束時 `finish_attach_op` 保留 | 同上 | 一般 session 的 release 遇 `close_failed` 作業回 DRAIN_STALLED |
+/// | ④ 交給 session、正式 bridge 接手前（`SessionIo::preopened`），`open_bridge` 於 stopping、configure 失敗、路徑不符時關閉 | `close_before_bridge` 告警並 `retain_unconfirmed_close`（作業留在 `inflight`）；回 `OpenFailure::CloseUnconfirmed`，actor 的 pending stop 保持 stalled（`pending_open_close_unconfirmed`），不交 `finish_pending_open_stop` | 末段重收 `attach:<by_id>` 為 false；session 的 shutdown 等待者不回覆亦為 false | pending release 回 DRAIN_STALLED；之後的 release 經 `close_failed` 作業回 DRAIN_STALLED |
+/// | ⑤ `open_bridge` 開埠返回時已 stopping（重組的預開或新開 handle） | 同 ④ | 同 ④ | 同 ④ |
+/// | ⑥ 正式 bridge 接手後（`IoWorker` 擁有） | `WorkerStoppedReceipt.handle_closed:false` → stop 標 stalled（`worker_stopped`） | session 為 false | DRAIN_STALLED |
+/// | ⑦ 裝置改指（`detach_by_id`）與 bind 取走 `SessionIo::preopened` | `close_session_preopened` 只告警：Python 先自 `_preopened_ports` 取出作業再關閉（`:4045-4063`、`:3778-3796`），失敗不保留 | 不列入（同 Python） | 不列入（同 Python） |
+/// | ⑧ PROBE bridge | Rust 不另建 PROBE bridge，PROBE 直接用 ③ 的同一 handle | 見 ③ | 見 ③ |
+///
+/// 回歸：`wp510_review5_shutdown_before_bridge_takes_preopened_fail_close_reports_stalled`（④ shutdown）、
+/// `wp510_review5_release_waiting_bridge_open_fail_close_reports_drain_stalled`（④⑤ release）、
+/// `wp510_review5_configure_failure_fail_close_keeps_handle_in_drain`（④ configure 失敗，無 stop 在途）。
 #[derive(Clone)]
 struct AttachOp {
     token: u64,
@@ -727,13 +747,47 @@ impl Shared {
         (self.warn)(msg);
     }
 
-    /// 關閉已交給 session、尚未由正式 bridge 接手的預開 handle；`closed:false` 時比照 Python `_finish_attach_op`
-    /// （`origin/main:sw_core/session_manager.py:4322-4332`）以 by_id 與 `CloseReceipt.error` 告警。
+    /// 裝置改指（`detach_by_id`）與 bind 關閉已交給 session、尚未由正式 bridge 接手的預開 handle；`closed:false` 時
+    /// 比照 Python `_finish_attach_op`（`origin/main:sw_core/session_manager.py:4322-4332`）以 by_id 與
+    /// `CloseReceipt.error` 告警。Python 這兩條路徑先把作業自 `_preopened_ports` 取出才關閉（裝置改指 `:4045-4063`、
+    /// bind `:3778-3796`），關閉失敗不保留作業，因此這裡只告警、不登記阻擋。
     fn close_session_preopened(&self, by_id: &str, pre: Preopened) {
         let receipt = pre.parts.close();
         if !receipt.closed {
             self.warn(preopened_close_warning(by_id, &close_error_text(&receipt)));
         }
+    }
+
+    /// `open_bridge` 在正式 bridge 接手前關閉 handle（預開或剛開啟者）；回傳是否確認關閉。對應 Python `_attach_by_id`
+    /// 的中止路徑：預開作業已移入 `_active_attach_ops`（`:4852-4854`），`_finish_attach_op` 關閉失敗即回 False 並保留
+    /// 作業（`:4322-4332`）。`closed:false` 時告警並經 `retain_unconfirmed_close` 讓該 by_id 持續參與排空判定與阻擋。
+    fn close_before_bridge(&self, by_id: &str, parts: HandleParts) -> bool {
+        let receipt = parts.close();
+        if receipt.closed {
+            return true;
+        }
+        self.warn(preopened_close_warning(by_id, &close_error_text(&receipt)));
+        self.retain_unconfirmed_close(by_id);
+        false
+    }
+
+    /// 未確認關閉的 handle 以 `close_failed` 作業留在 `inflight`（Python 作業留在 `_active_attach_ops`、不設 `done`）：
+    /// shutdown 末段列為 `attach:<by_id>` stalled（`:1231-1239`）、release 回 DRAIN_STALLED（`:3192-3204`），
+    /// 自動 attach、佔位交接與 bind 皆被同一 inflight 項目擋住。同一 by_id 已有作業時改標記該作業，令其收尾時保留。
+    /// Rust 的 handle 只關閉一次，阻擋持續到 daemon 結束。
+    fn retain_unconfirmed_close(&self, by_id: &str) {
+        let mut inner = lock(&self.inner);
+        match inner.inflight.get(by_id) {
+            Some(op) => op.close_failed.store(true, Ordering::SeqCst),
+            None => {
+                let op = AttachOp::new(false, false, None);
+                op.cancel();
+                op.close_failed.store(true, Ordering::SeqCst);
+                inner.inflight.insert(by_id.to_string(), op);
+            }
+        }
+        drop(inner);
+        self.cv.notify_all();
     }
 
     fn template_by_name(&self, name: &str) -> Option<ProfileTemplate> {
@@ -2639,9 +2693,18 @@ impl OpenCtx {
             hook();
         }
         let by_id = lock(&self.io.profile).device_by_id.clone();
+        // 接手前關閉 handle（見 `AttachOp` 的未確認關閉盤點）：`closed:false` 以 `CloseUnconfirmed` 包住原失敗交給 actor，
+        // manager 端由 `close_before_bridge` 保留阻擋作業。
+        let close_or_fail = |parts: HandleParts, failure: OpenFailure| {
+            if self.shared.close_before_bridge(&by_id, parts) {
+                failure
+            } else {
+                OpenFailure::CloseUnconfirmed(Box::new(failure))
+            }
+        };
         if lock(&self.shared.inner).stopping {
             if let Some(pre) = lock(&self.io.preopened).take() {
-                self.shared.close_session_preopened(&by_id, pre);
+                return Err(close_or_fail(pre.parts, stopped()));
             }
             return Err(stopped());
         }
@@ -2654,15 +2717,21 @@ impl OpenCtx {
                     Ok(()) => {}
                     Err(error) if error.kind == PalErrorKind::Unsupported => {}
                     Err(error) => {
-                        self.shared.close_session_preopened(&by_id, pre);
-                        return Err(OpenFailure::Other(error));
+                        return Err(close_or_fail(pre.parts, OpenFailure::Other(error)));
                     }
                 }
                 Box::new(ReassembledHandle(pre.parts))
             }
             other => {
                 if let Some(pre) = other {
-                    self.shared.close_session_preopened(&by_id, pre);
+                    // 舊 handle 未確認關閉時不另開新 handle（Python 作業取消即中止 attach 並經 `_finish_attach_op` 收尾，`:4939-4969`）。
+                    let failure = OpenFailure::Other(PalError::plain(
+                        PalErrorKind::Io,
+                        "預開 UART handle 未確認關閉",
+                    ));
+                    if let failure @ OpenFailure::CloseUnconfirmed(_) = close_or_fail(pre.parts, failure) {
+                        return Err(failure);
+                    }
                 }
                 if precheck_holders {
                     let report = self.shared.uart_excl.probe_holders(&dev.0);
@@ -2677,9 +2746,8 @@ impl OpenCtx {
             }
         };
         if lock(&self.shared.inner).stopping {
-            // open 返回時已進 stopping：不交給 actor（零 TX），立即關閉。
-            let _ = HandleParts::split(handle).close();
-            return Err(stopped());
+            // open 返回時已進 stopping：不交給 actor（零 TX），立即關閉；未確認關閉同樣保留阻擋。
+            return Err(close_or_fail(HandleParts::split(handle), stopped()));
         }
         let epoch = self.shared.epochs.next();
         let observers = lock(&self.shared.rx_observers).clone();
@@ -3380,7 +3448,8 @@ impl SessionManager {
         Ok(result)
     }
 
-    /// Python `release_session` 會找到、取消並排空 RELEASED placeholder 的 manager 開埠作業。
+    /// Python `release_session` 會找到、取消並排空 RELEASED placeholder 的 manager 開埠作業；一般 session 只處理未確認
+    /// 關閉而保留的作業（見 `AttachOp` 的關閉回條盤點）。
     fn cancel_placeholder_attach_for_release(
         &self,
         sid: &str,
@@ -3390,17 +3459,19 @@ impl SessionManager {
         let candidate_release_deadline = Instant::now() + ATTACH_OP_WAIT;
         let (by_id, op, deadline) = {
             let inner = lock(&self.shared.inner);
-            let Some(entry) = inner
-                .sessions
-                .get(sid)
-                .filter(|entry| entry.released_placeholder)
-            else {
+            let Some(entry) = inner.sessions.get(sid) else {
                 return Ok(None);
             };
             let by_id = entry.profile.device_by_id.clone();
             let Some(op) = inner.inflight.get(&by_id).cloned() else {
                 return Ok(None);
             };
+            // 一般 session 只處理未確認關閉而保留的作業（`retain_unconfirmed_close`）：Python `release_device` 對
+            // 仍在表內的作業等待 `done`（`origin/main:sw_core/session_manager.py:3104-3111`、`:3192-3204`），關閉失敗
+            // 不設 `done`，期限到即回 DRAIN_STALLED。其他在途 attach 仍走 actor 的 release 流程。
+            if !entry.released_placeholder && !op.close_failed.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
             // 與 `retire_released_placeholder_locked` 共用 manager lock：若 release 已取得 op，
             // 後續的 attach 收尾就不能先通過退休檢查。
             op.cancel();
@@ -4126,15 +4197,16 @@ impl SessionManager {
         }
         let mut out = Vec::new();
         for (sid, rx) in waits {
+            // 只有 `ok:true` 的收斂回覆算排空；同一 stop 的 DRAIN_STALLED 回覆（release 併入的等待者）不算。
             let drained = rx.is_some_and(|rx| {
                 rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                    .is_ok_and(|r| r.is_ok())
+                    .is_ok_and(|r| r.is_ok_and(|reply| is_ok(&reply)))
             });
             out.push((sid, drained));
         }
-        for by_id in inflight {
+        let wait_attach = |by_id: &str| -> bool {
             let mut inner = lock(&self.shared.inner);
-            while inner.inflight.contains_key(&by_id) {
+            while inner.inflight.contains_key(by_id) {
                 let now = Instant::now();
                 if now >= deadline {
                     break;
@@ -4146,8 +4218,24 @@ impl SessionManager {
                     .unwrap_or_else(|e| e.into_inner())
                     .0;
             }
-            let drained = !inner.inflight.contains_key(&by_id);
-            out.push((format!("attach:{by_id}"), drained));
+            !inner.inflight.contains_key(by_id)
+        };
+        let mut reported: HashSet<String> = HashSet::new();
+        for by_id in inflight {
+            out.push((format!("attach:{by_id}"), wait_attach(&by_id)));
+            reported.insert(by_id);
+        }
+        // Python `shutdown_drain` 末段（`origin/main:sw_core/session_manager.py:1231-1239`）重新收集仍未完成的作業：
+        // session 排空期間才登記者（正式 bridge 接手前關閉 handle 失敗而保留的作業，見 `close_before_bridge`）同樣列入。
+        let mut late: Vec<String> = lock(&self.shared.inner)
+            .inflight
+            .keys()
+            .filter(|by_id| !reported.contains(*by_id))
+            .cloned()
+            .collect();
+        late.sort();
+        for by_id in late {
+            out.push((format!("attach:{by_id}"), wait_attach(&by_id)));
         }
         out
     }

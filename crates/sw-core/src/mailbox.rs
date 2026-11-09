@@ -169,6 +169,9 @@ pub enum OpenFailure {
     AccessDenied(HolderReport),
     NotFound,
     Other(PalError),
+    /// 正式 bridge 接手前關閉 handle 的回條為 `closed:false`（Python `_finish_attach_op` 關閉失敗保留作業，
+    /// `origin/main:sw_core/session_manager.py:4322-4332`）；內含原本要回報的開埠失敗。
+    CloseUnconfirmed(Box<OpenFailure>),
 }
 
 /// `Mailbox::recv_next` 的輸出項目。
