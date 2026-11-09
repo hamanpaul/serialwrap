@@ -172,6 +172,9 @@ pub enum OpenFailure {
     /// 正式 bridge 接手前關閉 handle 的回條為 `closed:false`（Python `_finish_attach_op` 關閉失敗保留作業，
     /// `origin/main:sw_core/session_manager.py:4322-4332`）；內含原本要回報的開埠失敗。
     CloseUnconfirmed(Box<OpenFailure>),
+    /// 開埠 gate 發現 by_id 的關閉未確認（`session_core::UnconfirmedCloses`），未呼叫 `open_exclusive`（Python
+    /// `by_id in self._draining_by_ids` 時不開埠，`origin/main:sw_core/session_manager.py:3410-3417`、`:4847-4848`）。
+    CloseBlocked,
 }
 
 /// `Mailbox::recv_next` 的輸出項目。

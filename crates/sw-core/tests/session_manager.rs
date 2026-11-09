@@ -4670,3 +4670,47 @@ fn wp510_review5_oserror_handoff_worker_spawn_failure_returns_error_and_keeps_pl
     assert!(m.mgr.resolve("t:COM3").is_none(), "未建立 worker 不得出現正式 session");
     assert!(!m.mgr.has_inflight_attach_for_test(BY_ID), "無 handle 的作業不得殘留阻擋");
 }
+
+/// wp510 第 13 項（開埠 gate）：`device.attach` 已由 actor 發出 `OpenBridge`、`open_bridge` 取預開 handle 之前，by_id 才
+/// 登記為未確認關閉。gate 必須於 `open_exclusive` 之前拒絕（零開埠嘗試），回應照 Python `attach_device` 開埠後重驗
+/// `_draining_by_ids` 的分支回 SESSION_RECOVERING（`origin/main:sw_core/session_manager.py:3576-3588`、`:3614-3631`）。
+#[test]
+fn wp510_review7_open_bridge_gate_rejects_late_unconfirmed_close() {
+    const BY_ID: &str = "/s/by-id/usb-G";
+    const REAL: &str = "/dev/ttyG";
+    let m = wp510_b_placeholder_rig(false, false);
+    let device = m.device(REAL);
+    m.mgr.update_devices(&m.snapshot());
+    device.fail_configure(PalError::io(5, "[Errno 5] Input/output error"));
+    let sid = m.mgr.resolve("gone-template:COM3").expect("佔位 session");
+    assert!(is_ok(&rpc(m.mgr.attach_released_placeholder(&sid, false))));
+    wait_until("正式 session 套用設定失敗後退回 DETACHED", || {
+        m.state_of("t:COM3").as_deref() == Some("DETACHED")
+    });
+    assert!(m.mgr.wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)));
+    assert!(!m.mgr.unconfirmed_close_for_test(BY_ID), "closed:true 不登記阻擋");
+    let attempts = m.serial.open_attempts(REAL);
+
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (go_tx, go_rx) = crossbeam_channel::bounded::<()>(1);
+    m.mgr.set_open_bridge_pre_take_hook_for_test(Box::new(move || {
+        let _ = entered_tx.send(());
+        let _ = go_rx.recv_timeout(Duration::from_secs(10));
+    }));
+    let formal = m.mgr.resolve("t:COM3").expect("正式 session");
+    let manager = m.mgr.clone();
+    let attach = std::thread::spawn(move || {
+        manager.route(&formal, SessionRequest::DeviceAttach { force: true }, RPC)
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("device.attach 應進入 open_bridge");
+    m.mgr.mark_unconfirmed_close_for_test(BY_ID);
+    go_tx.send(()).expect("放行 open_bridge");
+    let reply = rpc(attach.join().expect("attach thread 不應 panic"));
+
+    assert_eq!(code_of(&reply).as_deref(), Some("SESSION_RECOVERING"), "{reply:?}");
+    assert_eq!(wp510_review5_bool(&reply, "drain_stalled"), Some(false), "{reply:?}");
+    assert_eq!(m.serial.open_attempts(REAL), attempts, "gate 必須在 open_exclusive 之前拒絕");
+    assert_eq!(m.state_of("t:COM3").as_deref(), Some("DETACHED"));
+}

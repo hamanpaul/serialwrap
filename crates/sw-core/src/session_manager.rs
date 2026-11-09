@@ -49,7 +49,9 @@ use crate::resources::{
 };
 #[cfg(feature = "test-fakes")]
 use crate::session_core::SessionState;
-use crate::session_core::{CoreDeps, Effect, ManagerNote, OpGrant, SessionCore, SessionRequest};
+use crate::session_core::{
+    CoreDeps, Effect, ManagerNote, OpGrant, SessionCore, SessionRequest, UnconfirmedCloses,
+};
 use crate::state_store::{
     lone_surrogate_encode_error, serialize_state, LoadedState, ReleasedRow, StateDelta, StateModel, StateStore,
 };
@@ -265,9 +267,41 @@ static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// `wp510_review5_configure_failure_fail_close_keeps_handle_in_drain`（④ configure 失敗，無 stop 在途）、
 /// `wp510_review6_finish_attach_op_rereads_close_failed_under_lock`（④ 與 attach worker 收尾交錯：`finish_attach_op`
 /// 於 manager 鎖內重讀 `close_failed`，不以取鎖前的快照移除已被 `retain_unconfirmed_close` 標記的作業）。
+///
+/// 未確認關閉的全域阻擋（wp510 第 13 項）：上表各位置的 `closed:false` 一律登記到 `UnconfirmedCloses`（Python
+/// `_draining_by_ids`，`origin/main:sw_core/session_manager.py:1286-1348`；安全回條才移除 `:1346-1368`，Rust 無遲到回條，
+/// 登記後持續到 daemon 結束）。登記來源：
+///
+/// | 來源 | Rust 登記點 | Python 對應 |
+/// |---|---|---|
+/// | ①②③ attach 作業關閉未確認 | `AttachOp::mark_close_failed`（`close_parts`、`finish_attach_op` 帶入的回條） | `_finish_attach_op` 關閉失敗保留作業 `:4320-4332` |
+/// | ④⑤ 正式 bridge 接手前關閉未確認 | `close_before_bridge` → `retain_unconfirmed_close` | `bridge.start()` 失敗經 `_track_attach_bridge_stop` 納入 `_draining_by_ids` `:5185-5207`、`:1286-1324` |
+/// | ⑥ 正式 bridge 回條 `handle_closed:false` | actor `worker_stopped` | session drain 留在 `_draining_by_ids` `:2774-2775`、`:2918-2919` |
+/// | ⑦ 不登記：裝置改指／bind 取走的預開 handle | `close_session_preopened` 只告警 | 先移出表再關閉 `:4045-4063`、`:3778-3796` |
+///
+/// 會開啟 UART 的入口與阻擋結果（皆為零開埠嘗試、零 TX）：
+///
+/// | 入口 | Rust 路徑與檢查點 | Python 對應 | 阻擋結果 | 回歸 |
+/// |---|---|---|---|---|
+/// | `device.attach`（一般 session） | `Service::rpc` → `route_with_selector` → actor `attach_request`（stopping 之後第一個分支） | `attach_device` `:3410-3417` | SESSION_RECOVERING＋`drain_stalled`／`drain_timeout_epoch`＋session | `wp510_review7_rpc_device_attach_after_unconfirmed_close_returns_session_recovering` |
+/// | `device.attach`（OD-63 佔位） | `route_inner` → `attach_released_placeholder`（inflight 或集合） | 同上 | SESSION_RECOVERING | `wp510_b_concurrent_placeholder_attach_returns_session_recovering` |
+/// | `session.attach` | actor `attach_request`（無 bridge 時，在途表分流之前） | `attach_session` `:3933-3944`、`:3999-4000` → `_spawn_attach` `:4113-4114` | `{"ok":true}`＋ATTACHING、last_error=None | `wp510_review7_rpc_session_attach_after_unconfirmed_close_does_not_reopen` |
+/// | `session.recover`（無 bridge） | actor `recover_request` 的 Reattach 計畫 | `recover_session` `:7970-7976` | REATTACH＋ATTACHING | `wp510_review7_rpc_session_recover_after_unconfirmed_close_does_not_reopen` |
+/// | `session.clear`（無 bridge） | actor `request_reattach` → `Effect::Reattach` → `spawn_attach_with` | `clear_session` `:3058-3082` | `{"ok":true}`＋ATTACHING | `wp510_review7_rpc_session_clear_after_unconfirmed_close_does_not_reopen` |
+/// | `session.bind`（改綁到該 by_id） | manager `bind` → `DeviceOnline` → actor `device_attached(bind_online)` | `bind_session` `:3789-3812`、`_complete_drain` `:2955-2988` | `{"ok":true}`＋ATTACHING、last_error=None | `wp510_review7_rpc_bind_to_unconfirmed_close_by_id_does_not_reopen` |
+/// | hotplug／watcher（added／changed）、bootstrap | `update_devices`／`bootstrap_attach` → `spawn_attach_with` | `update_devices` `:4081-4082`、`bootstrap_attach` → `_spawn_attach` `:4113-4114` | 早退、不改狀態 | `wp510_review7_hotplug_after_unconfirmed_close_does_not_reopen` |
+/// | `DeviceAttached`（watcher 對既有 session、`rebind_detached`、`reattach_existing` 的 `send_attached`） | actor `device_attached` | `_attach_by_id` `:4847-4848` | 早退、不改狀態 | `wp510_review7_device_attached_blocked_by_unconfirmed_close` |
+/// | attach worker 的 PROBE 開埠（`attach_dynamic`／`reattach_existing`） | `gated_open` 與開埠後的 `still_valid` | `_preopen_dynamic_attach_port` `:4258`、`:4299`；`_attach_by_id_dynamic` `:5523` | 不開埠；開埠後才登記者關閉 handle、不建 session | `wp510_review7_rpc_bind_to_unconfirmed_close_by_id_does_not_reopen`（交接 PROBE 被拔除後的保留） |
+/// | reprobe 自動 attach（DETACHED 逾時類） | actor `reprobe_tick` 的 Attach | `_prepare_reprobe_locked` `:2248-2252` → `reconcile_readiness` `:2513-2515` | ATTACHING＋last_error=None（已記 attempt） | `wp510_review7_detached_reprobe_attach_blocked_by_unconfirmed_close` |
+/// | drain 收尾再 attach（io_error、裝置改指、開埠中改指） | actor `reopen_known_device` | `_complete_drain` `:2936-2988`、`_spawn_attach` finally `:4126-4145` | io_error→ATTACHING；改指→DETACHED＋DEVICE_REBOUND_REQUIRED | `wp510_review7_io_error_reopen_blocked_by_unconfirmed_close`; `wp510_review7_rebound_reopen_blocked_by_unconfirmed_close` |
+/// | 開埠執行（actor 發出 `OpenBridge` 之後才登記） | `OpenCtx::open_bridge`：取預開 handle 前與開埠返回後各檢查一次 | `_attach_by_id` `:4933-4944`；`attach_device` 開埠後重驗 `:3576-3588`、`:3614-3631` | `OpenFailure::CloseBlocked`：device.attach→SESSION_RECOVERING、session.attach→ATTACHING、其餘維持已寫入狀態 | `wp510_review7_open_bridge_gate_rejects_late_unconfirmed_close`; `wp510_review7_open_gate_close_blocked_maps_per_entry` |
 #[derive(Clone)]
 struct AttachOp {
     token: u64,
+    /// 作業所屬 by_id；`close_parts` 關閉未確認時據此登記 `unconfirmed`。
+    by_id: String,
+    /// 全 daemon 共用的未確認關閉集合（`Shared::unconfirmed_closes`）。
+    unconfirmed: Arc<UnconfirmedCloses>,
     cancelled: Arc<AtomicBool>,
     /// `device.release` 專用：在途佔位開埠由 release 撤銷，收尾需清除對應 actor stall。
     release_requested: Arc<AtomicBool>,
@@ -297,9 +331,17 @@ struct AttachOp {
 }
 
 impl AttachOp {
-    fn new(after_clear: bool, dynamic_only: bool, preopened: Option<Preopened>) -> AttachOp {
+    fn new(
+        by_id: &str,
+        unconfirmed: &Arc<UnconfirmedCloses>,
+        after_clear: bool,
+        dynamic_only: bool,
+        preopened: Option<Preopened>,
+    ) -> AttachOp {
         AttachOp {
             token: NEXT_ATTACH_OP_TOKEN.fetch_add(1, Ordering::Relaxed),
+            by_id: by_id.to_string(),
+            unconfirmed: Arc::clone(unconfirmed),
             cancelled: Arc::new(AtomicBool::new(false)),
             release_requested: Arc::new(AtomicBool::new(false)),
             release_deadline: Arc::new(Mutex::new(None)),
@@ -335,10 +377,17 @@ impl AttachOp {
     fn close_parts(&self, parts: HandleParts) -> CloseReceipt {
         let receipt = parts.close();
         if !receipt.closed {
-            *lock(&self.close_error) = Some(close_error_text(&receipt));
-            self.close_failed.store(true, Ordering::SeqCst);
+            self.mark_close_failed(close_error_text(&receipt));
         }
         receipt
+    }
+
+    /// 關閉未確認：保留作業（`finish_attach_op`）並登記 by_id 的未確認關閉阻擋（Python `_finish_attach_op` 關閉失敗即回
+    /// False、作業留在表內，`origin/main:sw_core/session_manager.py:4320-4332`）。
+    fn mark_close_failed(&self, error: String) {
+        lock(&self.close_error).get_or_insert(error);
+        self.close_failed.store(true, Ordering::SeqCst);
+        self.unconfirmed.insert(&self.by_id);
     }
 }
 
@@ -437,6 +486,8 @@ struct Shared {
     note_tx: Sender<ManagerNote>,
     /// 全 daemon 共用的 background capture 索引（審查 F28）。
     bg_index: Arc<crate::capture::BackgroundIndex>,
+    /// 未確認關閉的 by_id 集合（Python `_draining_by_ids` 對照；manager 與各 actor 共用，見 `UnconfirmedCloses`）。
+    unconfirmed_closes: Arc<UnconfirmedCloses>,
     closed: AtomicBool,
     /// state.json 持久化觀察者（P5-T19 #3／#4／#68 的 Stage 0 測試鉤子；未設定時不動作）。
     persist_observer: Mutex<Option<Arc<dyn PersistObserver>>>,
@@ -806,10 +857,11 @@ impl Shared {
     /// Rust 的 handle 只關閉一次，阻擋持續到 daemon 結束。
     fn retain_unconfirmed_close(&self, by_id: &str) {
         let mut inner = lock(&self.inner);
+        self.unconfirmed_closes.insert(by_id);
         match inner.inflight.get(by_id) {
             Some(op) => op.close_failed.store(true, Ordering::SeqCst),
             None => {
-                let op = AttachOp::new(false, false, None);
+                let op = AttachOp::new(by_id, &self.unconfirmed_closes, false, false, None);
                 op.cancel();
                 op.close_failed.store(true, Ordering::SeqCst);
                 inner.inflight.insert(by_id.to_string(), op);
@@ -986,6 +1038,7 @@ impl Shared {
             // P6（07 D-02）：human console 擷取時讀的 input_epoch（與 ConsoleHub 共用）。
             input_epoch_pub: input_epoch_pub.clone(),
             bg_index: self.bg_index.clone(),
+            unconfirmed_closes: self.unconfirmed_closes.clone(),
         };
         let mut core = SessionCore::new(profile.clone(), profile_source, deps);
         core.set_path_flavor(self.path_flavor);
@@ -1262,6 +1315,15 @@ impl Shared {
             self.warn(format!("shutdown 中，略過 attach {by_id}"));
             return;
         }
+        // wp510 第 13 項：未確認關閉的 by_id 不再 attach（Python `_spawn_attach` 見 `_draining_by_ids` 即早退，
+        // `origin/main:sw_core/session_manager.py:4113-4114`）。
+        if self.unconfirmed_closes.contains(by_id) {
+            drop(inner);
+            if let Some(pre) = preopened {
+                let _ = pre.parts.close();
+            }
+            return;
+        }
         // OD-63：佔位標記是自動 attach 的權威防線；即使 state.json 的 RELEASED 列已遺失也不可重掛。
         if inner
             .session_by_id(by_id)
@@ -1318,6 +1380,8 @@ impl Shared {
             }
         }
         let op = AttachOp::new(
+            by_id,
+            &self.unconfirmed_closes,
             after_clear,
             dynamic_only,
             preopened.map(|pre| Preopened {
@@ -1509,11 +1573,14 @@ impl Shared {
         ))
     }
 
-    /// gate 條件：未 stopping、op 未取消、裝置仍在線且 real_path 未變。
+    /// gate 條件：未 stopping、op 未取消、by_id 無未確認關閉、裝置仍在線且 real_path 未變（Python
+    /// `_preopen_dynamic_attach_port`／`_attach_by_id_dynamic` 的 `_draining_by_ids` 檢查，
+    /// `origin/main:sw_core/session_manager.py:4258`、`:4299`、`:5523`）。
     fn still_valid(&self, by_id: &str, real: &str, op: &AttachOp) -> bool {
         let inner = lock(&self.inner);
         !inner.stopping
             && !op.cancelled.load(Ordering::SeqCst)
+            && !self.unconfirmed_closes.contains(by_id)
             && inner.device_path(by_id) == Some(real)
     }
 
@@ -1555,7 +1622,8 @@ impl Shared {
                 real,
                 selector,
                 entry.profile.template.uart.clone(),
-                inner.inflight.contains_key(&by_id),
+                // Python `attach_device` 先檢查 `_draining_by_ids`（`origin/main:sw_core/session_manager.py:3410-3417`）。
+                inner.inflight.contains_key(&by_id) || self.unconfirmed_closes.contains(&by_id),
             )
         };
         let Some(mut public) = self.session_public(sid) else {
@@ -1576,7 +1644,7 @@ impl Shared {
             }
         }
 
-        let op = AttachOp::new(false, true, None);
+        let op = AttachOp::new(&by_id, &self.unconfirmed_closes, false, true, None);
         {
             let mut inner = lock(&self.inner);
             if inner.stopping {
@@ -1592,7 +1660,7 @@ impl Shared {
                     "selector" => selector
                 });
             }
-            if inner.inflight.contains_key(&by_id) {
+            if inner.inflight.contains_key(&by_id) || self.unconfirmed_closes.contains(&by_id) {
                 return Ok(session_recovering_reply(public));
             }
             if inner.device_path(&by_id) != Some(real.as_str()) {
@@ -1720,9 +1788,8 @@ impl Shared {
     /// 結束指定 attach op；不會移除同一 by_id 後續登錄的新 op。
     fn finish_attach_op(&self, by_id: &str, op: &AttachOp, close_receipt: Option<CloseReceipt>) {
         if let Some(receipt) = close_receipt.as_ref().filter(|receipt| !receipt.closed) {
-            // 呼叫端直接帶入的失敗回條（未經 `close_parts`）同樣留下錯誤內容。
-            lock(&op.close_error).get_or_insert_with(|| close_error_text(receipt));
-            op.close_failed.store(true, Ordering::SeqCst);
+            // 呼叫端直接帶入的失敗回條（未經 `close_parts`）同樣留下錯誤內容並登記未確認關閉。
+            op.mark_close_failed(close_error_text(receipt));
         }
         // Python `_finish_attach_op`（`session_manager.py:4322-4332`）：關閉失敗先以 by_id 與例外告警，
         // 再保留阻擋；每次失敗的關閉只告警一次（Rust 的 handle 只關閉一次）。`close_error` 只隨 `close_failed`
@@ -2798,6 +2865,15 @@ impl OpenCtx {
             }
             return Err(stopped());
         }
+        // wp510 第 13 項：actor 發出 `OpenBridge` 之後 by_id 才登記為未確認關閉（各入口的 actor 端檢查之後）：不開埠，
+        // 未交接的預開 handle 一併關閉（Python `_attach_by_id` 開 bridge 前重驗 `_draining_by_ids` 即中止並經
+        // `_finish_attach_op` 關閉，`origin/main:sw_core/session_manager.py:4933-4944`）。
+        if self.shared.unconfirmed_closes.contains(&by_id) {
+            if let Some(pre) = lock(&self.io.preopened).take() {
+                return Err(close_or_fail(pre.parts, OpenFailure::CloseBlocked));
+            }
+            return Err(OpenFailure::CloseBlocked);
+        }
         let pre = lock(&self.io.preopened).take();
         let handle: Box<dyn SerialHandle> = match pre {
             Some(pre) if pre.real_path == dev.0 => {
@@ -2838,6 +2914,11 @@ impl OpenCtx {
         if lock(&self.shared.inner).stopping {
             // open 返回時已進 stopping：不交給 actor（零 TX），立即關閉；未確認關閉同樣保留阻擋。
             return Err(close_or_fail(HandleParts::split(handle), stopped()));
+        }
+        if self.shared.unconfirmed_closes.contains(&by_id) {
+            // 開埠期間 by_id 才登記為未確認關閉：Python `attach_device` 開埠後重驗 `_draining_by_ids`，以 `_finish_attach_op`
+            // 關閉剛開的 handle（`origin/main:sw_core/session_manager.py:3576-3588`、`:3614-3631`）；不交給 actor（零 TX）。
+            return Err(close_or_fail(HandleParts::split(handle), OpenFailure::CloseBlocked));
         }
         let epoch = self.shared.epochs.next();
         let observers = lock(&self.shared.rx_observers).clone();
@@ -3305,6 +3386,7 @@ impl SessionManager {
                 }));
                 index
             },
+            unconfirmed_closes: UnconfirmedCloses::new(),
             closed: AtomicBool::new(false),
             persist_observer: Mutex::new(None),
             probe_tx_frozen: AtomicBool::new(false),
@@ -4366,10 +4448,22 @@ impl SessionManager {
             .map(|e| e.released_placeholder)
     }
 
+    /// 只供測試（test-fakes）：直接登記 by_id 的未確認關閉（重現 actor 已發出 `OpenBridge` 之後才登記的交錯）。
+    #[cfg(feature = "test-fakes")]
+    pub fn mark_unconfirmed_close_for_test(&self, by_id: &str) {
+        self.shared.unconfirmed_closes.insert(by_id);
+    }
+
+    /// 只供測試（test-fakes）：by_id 是否登記為未確認關閉。
+    #[cfg(feature = "test-fakes")]
+    pub fn unconfirmed_close_for_test(&self, by_id: &str) -> bool {
+        self.shared.unconfirmed_closes.contains(by_id)
+    }
+
     /// 只供測試（test-fakes）：注入可觀察的在途 attach 標記，驗證早退不取消也不等待。
     #[cfg(feature = "test-fakes")]
     pub fn insert_inflight_attach_for_test(&self, by_id: &str) -> Arc<AtomicBool> {
-        let op = AttachOp::new(false, false, None);
+        let op = AttachOp::new(by_id, &self.shared.unconfirmed_closes, false, false, None);
         let cancelled = Arc::clone(&op.cancelled);
         lock(&self.shared.inner)
             .inflight

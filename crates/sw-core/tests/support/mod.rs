@@ -118,6 +118,8 @@ pub struct CoreHarness {
     pub epochs: Arc<EpochAllocator>,
     pub state_store: FakeStateStore,
     pub fake_device: FakeDevice,
+    /// core 的未確認關閉 by_id 集合（與 manager 共用的那一份；測試直接登記或檢查）。
+    pub unconfirmed: Arc<sw_core::session_core::UnconfirmedCloses>,
     serial: Arc<FakeSerialBackend>,
     credential_files: Arc<Mutex<BTreeMap<String, String>>>,
     wall_us: Arc<AtomicI64>,
@@ -216,6 +218,7 @@ impl CoreHarness {
 
         let wall_for_iso = Arc::clone(&wall_us);
         let input_epoch_pub = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let unconfirmed = sw_core::session_core::UnconfirmedCloses::new();
         let deps = CoreDeps {
             fence: fence.clone(),
             registry: reg.clone(),
@@ -239,6 +242,7 @@ impl CoreHarness {
             }),
             input_epoch_pub: input_epoch_pub.clone(),
             bg_index: sw_core::capture::BackgroundIndex::new(),
+            unconfirmed_closes: unconfirmed.clone(),
         };
         let core = SessionCore::new(profile, "yaml-target", deps);
 
@@ -254,6 +258,7 @@ impl CoreHarness {
             epochs,
             state_store,
             fake_device,
+            unconfirmed,
             serial,
             credential_files,
             wall_us,
@@ -1408,6 +1413,7 @@ impl ActorRig {
             }),
             input_epoch_pub: input_epoch_pub.clone(),
             bg_index,
+            unconfirmed_closes: sw_core::session_core::UnconfirmedCloses::new(),
         };
         let exec_profile = profile.clone();
         let mut core = SessionCore::new(profile, "yaml-target", deps);

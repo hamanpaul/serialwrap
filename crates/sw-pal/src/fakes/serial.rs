@@ -303,6 +303,8 @@ pub(crate) struct FakeDeviceInner {
     cond_mutex: Mutex<()>,
     open: AtomicBool,
     opens: AtomicUsize,
+    /// 每次 `open_exclusive` 找到本裝置即計一次（含因已占用、外部持有、拒絕存取而失敗者）。
+    open_attempts: AtomicUsize,
     closes: AtomicUsize,
     writes: AtomicUsize,
     os_submits: AtomicUsize,
@@ -346,6 +348,7 @@ impl FakeDeviceInner {
             cond_mutex: Mutex::new(()),
             open: AtomicBool::new(false),
             opens: AtomicUsize::new(0),
+            open_attempts: AtomicUsize::new(0),
             closes: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
             os_submits: AtomicUsize::new(0),
@@ -518,6 +521,7 @@ impl SerialBackend for FakeSerialBackend {
             }
         };
         drop(devs);
+        inner.open_attempts.fetch_add(1, Ordering::SeqCst);
 
         if inner.removed.load(Ordering::SeqCst) {
             return Err(OpenError::NotFound(PalError::not_found(
@@ -714,6 +718,11 @@ impl FakeDevice {
 
     pub fn open_count(&self) -> usize {
         self.inner.opens.load(Ordering::SeqCst)
+    }
+
+    /// `open_exclusive` 嘗試開啟本裝置的次數（成功與失敗皆計；「零開埠嘗試」斷言用）。
+    pub fn open_attempts(&self) -> usize {
+        self.inner.open_attempts.load(Ordering::SeqCst)
     }
 
     /// 依序套用過的 UART 設定（open 的 cfg 與之後的 `configure`）。

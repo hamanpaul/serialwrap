@@ -2665,3 +2665,136 @@ fn phase1_snapshot_sets_reason_and_clears_foreground() {
         }
     }
 }
+
+// wp510 第 13 項：未確認關閉的 by_id（`UnconfirmedCloses`，Python `_draining_by_ids`）擋下 actor 內部的再開埠入口。
+
+/// 正式 bridge 的關閉回條 `handle_closed:false`：by_id 登記為未確認關閉（Python session drain 未取得安全回條即留在
+/// `_draining_by_ids`，`origin/main:sw_core/session_manager.py:2774-2775`、`:2918-2919`）。
+#[test]
+fn wp510_review7_worker_close_unconfirmed_registers_by_id() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.feed(ControlEvent::UartIoError {
+        epoch: h.epoch(),
+        reason: "BRIDGE_DOWN:EIO".into(),
+    });
+    let (epoch, stop) = h.pending_stop();
+    assert!(!h.unconfirmed.contains(DEVICE_BY_ID), "回條前不得登記");
+    let effects = h.receipt(epoch, stop).handle_closed(false).feed();
+    assert!(h.unconfirmed.contains(DEVICE_BY_ID), "handle_closed:false 必須登記未確認關閉");
+    assert!(
+        !effects.iter().any(|effect| matches!(effect, Effect::OpenBridge { .. })),
+        "未確認關閉不得重新開埠"
+    );
+}
+
+/// io_error 收尾的再 attach（`reopen_known_device`）：Python `_complete_drain` 設 ATTACHING＋last_error=None 後
+/// `_spawn_attach`，因 `_draining_by_ids` 早退（`origin/main:sw_core/session_manager.py:2971-2988`、`:4113-4114`）。
+#[test]
+fn wp510_review7_io_error_reopen_blocked_by_unconfirmed_close() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.feed(ControlEvent::UartIoError {
+        epoch: h.epoch(),
+        reason: "TX_LEDGER_SATURATED".into(),
+    });
+    let (epoch, stop) = h.pending_stop();
+    h.unconfirmed.insert(DEVICE_BY_ID);
+    let effects = h.receipt(epoch, stop).feed();
+    assert!(
+        !effects.iter().any(|effect| matches!(effect, Effect::OpenBridge { .. })),
+        "未確認關閉的 by_id 不得重新開埠"
+    );
+    assert_eq!(h.public()["state"], PyValue::from("ATTACHING"));
+    assert_eq!(h.public()["last_error"], PyValue::Null);
+}
+
+/// 裝置改指收尾的再 attach：Python `recover` 類 drain 收尾維持 DETACHED＋DEVICE_REBOUND_REQUIRED，`_spawn_attach` 早退
+/// （`origin/main:sw_core/session_manager.py:2936-2948`、`:2969-2970`、`:4113-4114`）。
+#[test]
+fn wp510_review7_rebound_reopen_blocked_by_unconfirmed_close() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.feed(ControlEvent::DeviceDetached {
+        by_id: DEVICE_BY_ID.into(),
+        reason: DetachReason::Rebound,
+    });
+    let (epoch, stop) = h.pending_stop();
+    h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: "/fake/tty-B".into(),
+    });
+    h.unconfirmed.insert(DEVICE_BY_ID);
+    let effects = h.receipt(epoch, stop).feed();
+    assert!(
+        !effects.iter().any(|effect| matches!(effect, Effect::OpenBridge { .. })),
+        "未確認關閉的 by_id 不得重新開埠"
+    );
+    assert_eq!(h.public()["state"], PyValue::from("DETACHED"));
+    assert_eq!(
+        h.public()["last_error"],
+        PyValue::from("DEVICE_REBOUND_REQUIRED")
+    );
+}
+
+/// hotplug 的 `DeviceAttached`：Python `_spawn_attach`／`_attach_by_id` 早退、不改狀態
+/// （`origin/main:sw_core/session_manager.py:4113-4114`、`:4847-4848`）。
+#[test]
+fn wp510_review7_device_attached_blocked_by_unconfirmed_close() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.unconfirmed.insert(DEVICE_BY_ID);
+    let effects = h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    assert!(
+        !effects.iter().any(|effect| matches!(effect, Effect::OpenBridge { .. })),
+        "未確認關閉的 by_id 不得開埠"
+    );
+    assert_eq!(h.public()["state"], PyValue::from("DETACHED"));
+}
+
+/// 開埠 gate 於 `OpenBridge` 發出後才發現 by_id 未確認關閉（`OpenFailure::CloseBlocked`，未開埠）：`device.attach`
+/// 照 Python 開埠後重驗 drain 的分支回 SESSION_RECOVERING、狀態不變（`origin/main:sw_core/session_manager.py:3576-3588`、
+/// `:3614-3631`）；`session.attach` 照 `attach_session` 停在 ATTACHING 回成功（`:3933-3944`、`:3999-4000`）。
+#[test]
+fn wp510_review7_open_gate_close_blocked_maps_per_entry() {
+    for session_attach in [false, true] {
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.feed(ControlEvent::DeviceAttached {
+            by_id: DEVICE_BY_ID.into(),
+            real_path: REAL_PATH.into(),
+        });
+        h.feed(ControlEvent::BridgeOpened {
+            epoch_hint: 0,
+            result: Err(OpenFailure::Other(PalError::io(5, "open failed"))),
+        });
+        assert_eq!(h.public()["state"], PyValue::from("DETACHED"));
+        let request = if session_attach {
+            SessionRequest::SessionAttach
+        } else {
+            SessionRequest::DeviceAttach { force: false }
+        };
+        let (rx, effects) = h.rpc_deferred(request);
+        assert!(
+            effects.iter().any(|effect| matches!(effect, Effect::OpenBridge { .. })),
+            "前置：尚未登記時照常發出 OpenBridge"
+        );
+        h.unconfirmed.insert(DEVICE_BY_ID);
+        h.feed(ControlEvent::BridgeOpened {
+            epoch_hint: 0,
+            result: Err(OpenFailure::CloseBlocked),
+        });
+        let response = rx.try_recv().unwrap().unwrap();
+        if session_attach {
+            assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
+            assert_eq!(nested_session_state(&response), PyValue::from("ATTACHING"));
+            assert_eq!(h.public()["last_error"], PyValue::Null);
+        } else {
+            session_error(&response, "SESSION_RECOVERING");
+            assert_eq!(response.get("drain_stalled"), Some(&PyValue::Bool(false)));
+            assert_eq!(response.get("drain_timeout_epoch"), Some(&PyValue::Null));
+            assert_eq!(nested_session_state(&response), PyValue::from("DETACHED"));
+        }
+    }
+}

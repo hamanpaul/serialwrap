@@ -1341,6 +1341,7 @@ fn harness_counting_env_reads(yaml: &str) -> (CoreHarness, Arc<AtomicU64>) {
         }),
         input_epoch_pub: Arc::new(AtomicU64::new(0)),
         bg_index: sw_core::capture::BackgroundIndex::new(),
+        unconfirmed_closes: h.unconfirmed.clone(),
     };
     h.core = sw_core::session_core::SessionCore::new(profile, "yaml-target", deps);
     (h, reads)

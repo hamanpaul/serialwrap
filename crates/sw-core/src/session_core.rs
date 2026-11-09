@@ -310,6 +310,44 @@ pub struct OpGrant {
     pub cmd_id: Option<String>,
 }
 
+/// 未確認關閉的 UART by_id 集合：Python `_draining_by_ids` 的對照（attach 清理 `_track_attach_bridge_stop`
+/// `origin/main:sw_core/session_manager.py:1286-1348`；session drain 未取得安全回條同樣留在表內）。manager 與各
+/// session actor 共用；所有會開啟 UART 的入口在開埠前檢查（`attach_device` `:3410-3417`、`_spawn_attach` `:4113`、
+/// `_attach_by_id` `:4847`、`_preopen_*_attach_port` `:4171-4176`／`:4258`）。Python 只在安全回條時移除；Rust 的
+/// handle 只關閉一次、`closed:false` 之後沒有遲到回條，因此登記後持續到 daemon 結束。
+///
+/// 鎖序：葉節點鎖，持有期間不取其他鎖（manager 可在 `inner` 鎖內登記，actor 不持 manager 鎖讀取）。
+#[derive(Debug, Default)]
+pub struct UnconfirmedCloses {
+    by_ids: std::sync::Mutex<HashSet<String>>,
+}
+
+impl UnconfirmedCloses {
+    pub fn new() -> Arc<UnconfirmedCloses> {
+        Arc::new(UnconfirmedCloses::default())
+    }
+
+    /// 登記 by_id 的 handle 關閉未確認（空字串不登記）。
+    pub fn insert(&self, by_id: &str) {
+        if by_id.is_empty() {
+            return;
+        }
+        self.by_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(by_id.to_string());
+    }
+
+    pub fn contains(&self, by_id: &str) -> bool {
+        !by_id.is_empty()
+            && self
+                .by_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(by_id)
+    }
+}
+
 /// `SessionCore` 的注入依賴。
 pub struct CoreDeps {
     pub fence: Arc<Fence>,
@@ -327,6 +365,8 @@ pub struct CoreDeps {
     pub input_epoch_pub: Arc<AtomicU64>,
     /// 全 daemon 共用的 background capture 索引（`BG_CAPTURE_MAX_COUNT` 為全域上限，審查 F28）。
     pub bg_index: Arc<crate::capture::BackgroundIndex>,
+    /// 全 daemon 共用的未確認關閉 by_id 集合（見 `UnconfirmedCloses`）。
+    pub unconfirmed_closes: Arc<UnconfirmedCloses>,
 }
 
 /// `public()` 需要由 actor 外部提供的欄位（console 計數與 endpoint）。
@@ -539,6 +579,8 @@ struct PendingAttach {
     real_path: String,
     reply: Reply,
     previous_state: SessionState,
+    /// `session.attach`（true）或 `device.attach`（false）；開埠 gate 拒絕時依 Python 各自的回應收尾。
+    session_attach: bool,
 }
 
 enum PendingCommit {
@@ -699,7 +741,7 @@ impl SessionCore {
             MailboxItem::Control(ControlEvent::DeviceAttached { by_id, real_path }) => {
                 effects
                     .0
-                    .extend(self.device_attached(&by_id, &real_path, now));
+                    .extend(self.device_attached(&by_id, &real_path, false, now));
             }
             MailboxItem::Control(ControlEvent::DeviceDetached { by_id, reason }) => {
                 if by_id == self.profile.device_by_id {
@@ -1927,7 +1969,7 @@ impl SessionCore {
             }
             SessionRequest::DeviceOnline { by_id, real_path } => {
                 // 回覆先於 OpenBridge（executor 依序執行；開埠可能阻塞）。
-                let opened = self.device_attached(&by_id, &real_path, now);
+                let opened = self.device_attached(&by_id, &real_path, true, now);
                 let mut effects = vec![Effect::Reply(reply, Ok(self.ok_session(now)))];
                 effects.extend(opened);
                 effects
@@ -2155,6 +2197,11 @@ impl SessionCore {
                 Ok(self.session_recovering_reply(now)),
             )];
         }
+        // wp510 第 13 項：未確認關閉的 by_id（`UnconfirmedCloses`）。Python `attach_device` 在 stopping 檢查後、任何其他
+        // 分支前即回 SESSION_RECOVERING 並附 session 的 drain 欄位（`origin/main:sw_core/session_manager.py:3410-3417`）。
+        if !session_attach && self.close_unconfirmed() {
+            return vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))];
+        }
         // P5-T16：`attach_session` 的未綁定早退（Python 同樣只在 device_by_id 為空時；config 會丟棄無 by_id 的 target）。
         if session_attach && self.profile.device_by_id.is_empty() {
             return vec![Effect::Reply(
@@ -2201,6 +2248,26 @@ impl SessionCore {
             || matches!(&self.pending_commit, Some(PendingCommit::Release { .. }))
         {
             return vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))];
+        }
+        // wp510 第 13 項：`session.attach` 遇未確認關閉的 by_id。Python `attach_session` 對無 bridge 的 session：裝置不在
+        // → DETACHED＋DEVICE_NOT_FOUND；否則 ATTACHING、清 last_error、重置 reprobe 與帳密告警後 `_spawn_attach`，後者因
+        // by_id 在 `_draining_by_ids` 早退、不開埠（`origin/main:sw_core/session_manager.py:3933-3944`、`:3999-4000`、
+        // `:4113-4114`）；回 `{"ok":true,"session"}`。Python 此路徑沒有在途表分流，故置於 `attach_inflight` 之前。
+        if session_attach && self.generations.conn_epoch.is_none() && self.close_unconfirmed() {
+            if !self.device_present {
+                self.set_last_error(Some("DEVICE_NOT_FOUND".into()), None);
+                self.detached_at = Some(self.wall_iso());
+                self.set_state(SessionState::Detached, now);
+                return vec![Effect::Reply(
+                    reply,
+                    Ok(self.error_session("DEVICE_NOT_FOUND", now)),
+                )];
+            }
+            self.set_last_error(None, None);
+            crate::reprobe::reset(&mut self.reprobe);
+            self.credentials_warned = false;
+            self.set_state(SessionState::Attaching, now);
+            return vec![Effect::Reply(reply, Ok(self.ok_session(now)))];
         }
         // bridge 尚未接上的 attach 在途（Python 在途表 `_attach_ops`／`_preopened_ports`／`_active_attach_ops`）：
         // 待開埠（clear 後等 manager 再解析）、開埠中、已開埠等 unreleased 落盤。
@@ -2282,6 +2349,7 @@ impl SessionCore {
             real_path: real_path.clone(),
             reply,
             previous_state,
+            session_attach,
         });
         vec![Effect::OpenBridge {
             dev: DevicePath(real_path),
@@ -2371,7 +2439,10 @@ impl SessionCore {
         )
     }
 
-    fn device_attached(&mut self, by_id: &str, real_path: &str, now: Mono) -> Vec<Effect> {
+    /// 裝置在線通知：DETACHED（或 clear 收尾等待再 attach）時開埠。`bind_online` 為 `session.bind` 改綁後的
+    /// `DeviceOnline`（Python `bind_session` 在 RPC 內即設 ATTACHING＋last_error=None 再 `_spawn_attach`，
+    /// `origin/main:sw_core/session_manager.py:3789-3812`、`:2955-2967`）。
+    fn device_attached(&mut self, by_id: &str, real_path: &str, bind_online: bool, now: Mono) -> Vec<Effect> {
         if by_id != self.profile.device_by_id {
             return Vec::new();
         }
@@ -2385,6 +2456,15 @@ impl SessionCore {
         }
         let awaiting = self.reattach_pending && self.state == SessionState::Attaching;
         if self.state != SessionState::Detached && !awaiting {
+            return Vec::new();
+        }
+        if self.close_unconfirmed() {
+            // wp510 第 13 項：未確認關閉的 by_id 不開埠。Python `_spawn_attach`／`_attach_by_id` 早退、不改狀態
+            // （`origin/main:sw_core/session_manager.py:4113-4114`、`:4847-4848`）；bind 已先設 ATTACHING。
+            if bind_online {
+                self.set_last_error(None, None);
+                self.set_state(SessionState::Attaching, now);
+            }
             return Vec::new();
         }
         self.reattach_pending = false;
@@ -2443,7 +2523,7 @@ impl SessionCore {
                         // #50（P5-T16）：attach 收尾時仍需 attach（Python `_spawn_attach` finally 再 spawn）：
                         // 裝置於開啟途中改指 → 以目前 known_real_path 再送一次 OpenBridge；裝置已不在則 DETACHED。
                         self.open_real_path = None;
-                        effects.extend(self.reopen_known_device(now));
+                        effects.extend(self.reopen_known_device(SessionState::Attaching, now));
                     }
                     return effects;
                 }
@@ -2476,6 +2556,12 @@ impl SessionCore {
                     // wp510 第五次整包審查 High：handle 未確認關閉時不得以後續的一般開埠錯誤完成排空。
                     self.open_real_path = None;
                     return self.pending_open_close_unconfirmed(now);
+                }
+                if matches!(failure, OpenFailure::CloseBlocked) && self.pending_open_stop.is_none() {
+                    // wp510 第 13 項：開埠 gate 於執行時發現 by_id 的關閉未確認（actor 發出 `OpenBridge` 之後才登記），
+                    // 未開埠。比照 actor 端各入口的阻擋結果收尾。
+                    self.open_real_path = None;
+                    return self.open_blocked_by_unconfirmed_close(now);
                 }
                 let failure_error = open_failure_last_error(&failure);
                 if let Some(pending) = self.pending_open_stop.take() {
@@ -2567,6 +2653,32 @@ impl SessionCore {
                 ev: TimerEvent::DrainTimeout { epoch, stop_id: id },
             },
         ]
+    }
+
+    /// by_id 的關閉未確認（`UnconfirmedCloses`；Python `by_id in self._draining_by_ids`）。
+    fn close_unconfirmed(&self) -> bool {
+        self.deps
+            .unconfirmed_closes
+            .contains(&self.profile.device_by_id)
+    }
+
+    /// 開埠 gate 回 `OpenFailure::CloseBlocked`（未開埠）：`device.attach` 照 Python 開埠後重驗 drain 的分支回
+    /// SESSION_RECOVERING、狀態不變（`origin/main:sw_core/session_manager.py:3576-3588`、`:3614-3631`）；
+    /// `session.attach` 照 `attach_session` 停在 ATTACHING 回成功（`:3933-3944`、`:3999-4000`）；其餘（hotplug、recover、
+    /// clear、bind、reprobe 的再 attach）照 `_spawn_attach` 早退，維持已寫入的 ATTACHING（`:4113-4114`）。
+    fn open_blocked_by_unconfirmed_close(&mut self, now: Mono) -> Vec<Effect> {
+        let Some(pending) = self.pending_attach.take() else {
+            return Vec::new();
+        };
+        if pending.session_attach {
+            self.set_last_error(None, None);
+            crate::reprobe::reset(&mut self.reprobe);
+            self.credentials_warned = false;
+            self.set_state(SessionState::Attaching, now);
+            return vec![Effect::Reply(pending.reply, Ok(self.ok_session(now)))];
+        }
+        self.set_state(pending.previous_state, now);
+        vec![Effect::Reply(pending.reply, Ok(self.session_recovering_reply(now)))]
     }
 
     /// 開埠在途的 stop 收到 `OpenFailure::CloseUnconfirmed`：正式 bridge 接手前的 handle 關閉回條為 `closed:false`。
@@ -2705,7 +2817,7 @@ impl SessionCore {
                 response.insert("device_by_id", PyValue::from(pending.by_id));
                 vec![Effect::Reply(pending.reply, Ok(response))]
             }
-            OpenFailure::Other(_) | OpenFailure::CloseUnconfirmed(_) => {
+            OpenFailure::Other(_) | OpenFailure::CloseUnconfirmed(_) | OpenFailure::CloseBlocked => {
                 self.open_real_path = None;
                 self.attached_real_path = None;
                 self.set_last_error(Some(failure_error), None);
@@ -3485,6 +3597,13 @@ impl SessionCore {
                     return Vec::new();
                 };
                 self.set_last_error(None, None);
+                if self.close_unconfirmed() {
+                    // wp510 第 13 項：Python `_prepare_reprobe_locked` 已設 ATTACHING＋last_error=None 並記 attempt
+                    // （`origin/main:sw_core/session_manager.py:2248-2252`），`reconcile_readiness` 的 `_spawn_attach` 因
+                    // by_id 在 `_draining_by_ids` 早退（`:2513-2515`、`:4113-4114`）。
+                    self.set_state(SessionState::Attaching, now);
+                    return Vec::new();
+                }
                 self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
                 self.open_generation = self.generations.fsm_gen;
                 self.open_real_path = Some(real_path.clone());
@@ -3764,6 +3883,11 @@ impl SessionCore {
         }
 
         if !receipt.handle_closed {
+            // wp510 第 13 項：正式 bridge 的 handle 關閉未確認，by_id 登記為未確認關閉（Python session drain 未取得安全
+            // 回條即留在 `_draining_by_ids`，`origin/main:sw_core/session_manager.py:2775`、`:2918-2919`），所有開埠入口據此阻擋。
+            self.deps
+                .unconfirmed_closes
+                .insert(&self.profile.device_by_id);
             let mut reply_waiters = Vec::new();
             if let Some(stop) = &mut self.stop {
                 stop.stalled = true;
@@ -3884,7 +4008,7 @@ impl SessionCore {
                 self.set_last_error(Some("DEVICE_REBOUND_REQUIRED".into()), None);
                 self.set_state(SessionState::Detached, now);
                 let mut waiters = stop.waiters;
-                effects.extend(self.reopen_known_device(now));
+                effects.extend(self.reopen_known_device(SessionState::Detached, now));
                 for waiter in waiters.drain(..) {
                     effects.push(Effect::Reply(waiter, Ok(self.ok_session(now))));
                 }
@@ -3914,7 +4038,8 @@ impl SessionCore {
                 }
                 self.set_state(SessionState::Detached, now);
                 let open_effects = match kind {
-                    StopKind::IoError | StopKind::Recover => self.reopen_known_device(now),
+                    StopKind::IoError => self.reopen_known_device(SessionState::Attaching, now),
+                    StopKind::Recover => self.reopen_known_device(SessionState::Detached, now),
                     StopKind::Clear => self.request_reattach(now),
                     _ => Vec::new(),
                 };
@@ -4026,7 +4151,11 @@ impl SessionCore {
         vec![Effect::Reattach { by_id, real_path }]
     }
 
-    fn reopen_known_device(&mut self, now: Mono) -> Vec<Effect> {
+    /// 以已知路徑重新開埠（Python `_complete_drain`／`_spawn_attach` finally 的再 attach）。`blocked_state`：by_id 的
+    /// 關閉未確認時不開埠，session 停在 Python 於 `_spawn_attach` 前已寫入的狀態（`_spawn_attach` 早退，
+    /// `origin/main:sw_core/session_manager.py:4113-4114`；io_error 收尾為 ATTACHING、recover 收尾維持 DETACHED，
+    /// `:2936-2988`；attach worker finally 的重試不再 spawn，`:4126-4145`）。
+    fn reopen_known_device(&mut self, blocked_state: SessionState, now: Mono) -> Vec<Effect> {
         if self.shutdown_requested || !self.device_present {
             self.set_state(SessionState::Detached, now);
             return Vec::new();
@@ -4035,6 +4164,10 @@ impl SessionCore {
             self.set_state(SessionState::Detached, now);
             return Vec::new();
         };
+        if self.close_unconfirmed() {
+            self.set_state(blocked_state, now);
+            return Vec::new();
+        }
         self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
         self.open_generation = self.generations.fsm_gen;
         self.open_real_path = Some(real_path.clone());
@@ -5285,9 +5418,10 @@ impl SessionCore {
                         "session" => core.session_value(now),
                     }
                 };
-                if self.open_real_path.is_some() || self.pending_attach.is_some() {
+                if self.open_real_path.is_some() || self.pending_attach.is_some() || self.close_unconfirmed() {
                     // attach 已在進行（開檔中）：Python `_spawn_attach` 對 in-flight attach 直接返回，回應仍是
-                    // REATTACH；不重複發 `OpenBridge`（審查 F29）。
+                    // REATTACH；不重複發 `OpenBridge`（審查 F29）。wp510 第 13 項：未確認關閉的 by_id 同樣由
+                    // `_spawn_attach` 早退（`origin/main:sw_core/session_manager.py:7970-7976`、`:4113-4114`）。
                     self.set_last_error(None, None);
                     self.set_state(SessionState::Attaching, now);
                     return vec![Effect::Reply(reply, Ok(reattach_reply(self)))];
@@ -6284,6 +6418,7 @@ fn open_failure_last_error(failure: &OpenFailure) -> String {
         OpenFailure::NotFound => "FileNotFoundError",
         OpenFailure::Other(error) => error.py_exc_name(),
         OpenFailure::CloseUnconfirmed(cause) => return open_failure_last_error(cause),
+        OpenFailure::CloseBlocked => "OSError",
     };
     format!("ATTACH_FAILED:{class}")
 }

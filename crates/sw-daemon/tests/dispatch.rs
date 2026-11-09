@@ -6301,3 +6301,286 @@ fn wp510_review6_rpc_finish_attach_op_race_keeps_unconfirmed_close_blocking() {
     assert_eq!(dev.open_count(), 1, "不得重新開埠");
     assert_eq!(dev.tx_len(), tx_before_bridge, "設定失敗的 handle 不得再送出任何 TX");
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// wp510 第六次整包審查 High（第 13 項）：未確認關閉的 by_id 須擋下所有重新開埠入口。
+//
+// Python 在 `bridge.start()` 失敗時以 `_track_attach_bridge_stop` 把 attach 清理納入 `_draining_by_ids`
+// （`origin/main:sw_core/session_manager.py:5185-5207`、`:1286-1348`），只有安全回條能解除；`attach_device` 在任何
+// 再次開埠前回 `SESSION_RECOVERING`（`:3410-3417`），其餘入口經 `_spawn_attach`（`:4113`）／`_attach_by_id`
+// （`:4847`）早退、不開埠。各入口的回應形狀照 Python（`attach_session` `:3876-3999`、`recover_session`
+// `:7970-7976`、`clear_session` `:3024-3082`、`bind_session` `:3655-3812`）。
+// ---------------------------------------------------------------------------------------------------------------
+
+/// 佔位交接後正式 session `t:COM3` 的 `open_bridge` 套用 UART 設定失敗、關閉回條 `closed:false`：session 退回
+/// DETACHED（`ATTACH_FAILED:OSError`），by_id 的未確認關閉阻擋成立。回傳 rig 與開埠嘗試／TX 基準。
+fn wp510_review7_unconfirmed_close_rig() -> (ServiceRig, usize, usize) {
+    let r = wp510_b_placeholder_rig();
+    let dev = r.device(WP510_REAL_G).clone();
+    dev.fail_configure(PalError::io(5, "[Errno 5] Input/output error"));
+    dev.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
+    let attached = r.call(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    assert_eq!(attached.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&attached));
+    wait_until("正式 session 套用設定失敗後退回 DETACHED", || {
+        r.session("t:COM3").is_some_and(|session| {
+            s(&session, "state") == "DETACHED"
+                && session.get("last_error").and_then(PyValue::as_str) == Some("ATTACH_FAILED:OSError")
+        })
+    });
+    // 交接 worker 收尾後作業仍因 closed:false 保留（僅等待其收尾，保留時於期限後回 false）。
+    let _ = r
+        .mgr
+        .wait_attach_idle_for_test(WP510_PLACEHOLDER_BY_ID, Duration::from_millis(300));
+    assert!(dev.is_open(), "closed:false 表示 handle 仍開啟");
+    assert!(
+        r.mgr.has_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID),
+        "未確認關閉的 handle 必須保留阻擋"
+    );
+    let attempts = dev.open_attempts();
+    let tx = dev.tx_len();
+    (r, attempts, tx)
+}
+
+/// 呼叫入口後短暫等待（讓任何非同步開埠有機會發生），再斷言未再嘗試開埠、未送 TX。
+fn wp510_review7_assert_no_reopen(r: &ServiceRig, attempts: usize, tx: usize, entry: &str) {
+    std::thread::sleep(Duration::from_millis(200));
+    let dev = r.device(WP510_REAL_G);
+    assert_eq!(
+        dev.open_attempts(),
+        attempts,
+        "{entry}：未確認關閉的 by_id 不得再嘗試開埠"
+    );
+    assert_eq!(dev.tx_len(), tx, "{entry}：未確認關閉的 by_id 不得送出 TX");
+    assert!(
+        r.mgr.has_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID),
+        "{entry}：阻擋須持續"
+    );
+}
+
+/// 入口一：`device.attach`（`Service::rpc("device.attach")` → `route_with_selector` → actor `attach_request`）。
+/// Python `attach_device` 先檢查 `_draining_by_ids`，回 `SESSION_RECOVERING` 並附 session 的 drain 欄位
+/// （`origin/main:sw_core/session_manager.py:3410-3417`）。
+#[test]
+fn wp510_review7_rpc_device_attach_after_unconfirmed_close_returns_session_recovering() {
+    let (r, attempts, tx) = wp510_review7_unconfirmed_close_rig();
+    let before = r.session("t:COM3").expect("正式 session");
+
+    let response = r.call("device.attach", r#"{"selector":"t:COM3"}"#);
+
+    let expected = sw_proto::pydict! {
+        "ok" => false,
+        "error_code" => "SESSION_RECOVERING",
+        "drain_stalled" => false,
+        "drain_timeout_epoch" => PyValue::Null,
+        "session" => before,
+        "version" => r.version.clone(),
+    };
+    assert_eq!(j(&response), j(&expected), "device.attach 回應 bytes");
+    wp510_review7_assert_no_reopen(&r, attempts, tx, "device.attach");
+}
+
+/// 入口二：`session.attach`（`Service::rpc("session.attach")` → actor `attach_request`）。Python `attach_session`
+/// 對無 bridge、裝置在線的 session 設 ATTACHING、清 last_error 後 `_spawn_attach`，後者因 by_id 在
+/// `_draining_by_ids` 早退（`origin/main:sw_core/session_manager.py:3933-3944`、`:3999-4000`、`:4113-4114`）。
+#[test]
+fn wp510_review7_rpc_session_attach_after_unconfirmed_close_does_not_reopen() {
+    let (r, attempts, tx) = wp510_review7_unconfirmed_close_rig();
+
+    let response = r.call("session.attach", r#"{"selector":"t:COM3"}"#);
+
+    let after = r.session("t:COM3").expect("正式 session");
+    let expected = sw_proto::pydict! {
+        "ok" => true,
+        "session" => after.clone(),
+        "version" => r.version.clone(),
+    };
+    assert_eq!(j(&response), j(&expected), "session.attach 回應 bytes");
+    assert_eq!(s(&after, "state"), "ATTACHING");
+    assert_eq!(after.get("last_error"), Some(&PyValue::Null));
+    wp510_review7_assert_no_reopen(&r, attempts, tx, "session.attach");
+    assert_eq!(
+        r.session("t:COM3").map(|session| s(&session, "state").to_string()).as_deref(),
+        Some("ATTACHING"),
+        "被阻擋的 attach 停在 ATTACHING（Python `_spawn_attach` 早退不改狀態）"
+    );
+}
+
+/// 入口三：`session.recover`（`Service::rpc("session.recover")` → actor `recover_request` 的 Reattach 計畫）。
+/// Python `recover_session` 對無 bridge、裝置在線者設 ATTACHING 後 `_spawn_attach` 早退，回 REATTACH
+/// （`origin/main:sw_core/session_manager.py:7970-7976`、`:4113-4114`）。
+#[test]
+fn wp510_review7_rpc_session_recover_after_unconfirmed_close_does_not_reopen() {
+    let (r, attempts, tx) = wp510_review7_unconfirmed_close_rig();
+
+    let response = r.call("session.recover", r#"{"selector":"t:COM3"}"#);
+
+    let after = r.session("t:COM3").expect("正式 session");
+    let expected = sw_proto::pydict! {
+        "ok" => true,
+        "recovering" => false,
+        "action" => "REATTACH",
+        "session" => after.clone(),
+        "version" => r.version.clone(),
+    };
+    assert_eq!(j(&response), j(&expected), "session.recover 回應 bytes");
+    assert_eq!(s(&after, "state"), "ATTACHING");
+    wp510_review7_assert_no_reopen(&r, attempts, tx, "session.recover");
+}
+
+/// 入口四：`session.clear`（manager `clear` → actor Clear → `Effect::Reattach` → `spawn_attach_with`）。Python
+/// `clear_session` 對無 bridge 者設 ATTACHING 後 `_spawn_attach` 早退（`origin/main:sw_core/session_manager.py:3058-3082`、
+/// `:4113-4114`）。
+#[test]
+fn wp510_review7_rpc_session_clear_after_unconfirmed_close_does_not_reopen() {
+    let (r, attempts, tx) = wp510_review7_unconfirmed_close_rig();
+
+    let response = r.call("session.clear", r#"{"selector":"t:COM3"}"#);
+
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&response));
+    assert_eq!(s(&sub(&response, "session"), "state"), "ATTACHING", "{}", j(&response));
+    wp510_review7_assert_no_reopen(&r, attempts, tx, "session.clear");
+}
+
+/// 入口五：hotplug／watcher（`update_devices` 拔除再插回 → `spawn_attach`）。Python `update_devices` 對插回的
+/// by_id 呼叫 `_spawn_attach`，因 `_draining_by_ids` 早退（`origin/main:sw_core/session_manager.py:4081-4082`、
+/// `:4113-4114`）。
+#[test]
+fn wp510_review7_hotplug_after_unconfirmed_close_does_not_reopen() {
+    let (r, attempts, tx) = wp510_review7_unconfirmed_close_rig();
+    let full: Vec<(String, DeviceInfo)> = r
+        .mgr
+        .list_devices()
+        .into_iter()
+        .map(|row| {
+            let by_id = s(&row, "by_id").to_string();
+            let real_path = s(&row, "real_path").to_string();
+            (by_id.clone(), DeviceInfo { by_id, real_path })
+        })
+        .collect();
+    let without: Vec<_> = full
+        .iter()
+        .filter(|(by_id, _)| by_id != WP510_PLACEHOLDER_BY_ID)
+        .cloned()
+        .collect();
+
+    r.mgr.update_devices(&without);
+    r.mgr.update_devices(&full);
+
+    wp510_review7_assert_no_reopen(&r, attempts, tx, "hotplug");
+    assert_eq!(
+        r.session("t:COM3").map(|session| s(&session, "state").to_string()).as_deref(),
+        Some("DETACHED")
+    );
+}
+
+/// 入口六：`session.bind` 改綁到未確認關閉的 by_id（manager `bind` → actor Bind → `DeviceOnline`）。情境：佔位交接
+/// 的 dynamic 偵測 PROBE 提交前裝置拔除，作業取消後關閉回條 `closed:false`，by_id 無任何 session 但仍被阻擋；裝置插回後
+/// 把 COM1 改綁過去。Python 的作業關閉失敗即留在 `_active_attach_ops`（`origin/main:sw_core/session_manager.py:4320-4332`），
+/// `bind_session` 收尾設 ATTACHING 後 `_spawn_attach`，`_preopen_auto_attach_port` 見在途作業即不開埠
+/// （`:2955-2988`、`:4171-4176`）。
+#[test]
+fn wp510_review7_rpc_bind_to_unconfirmed_close_by_id_does_not_reopen() {
+    let r = wp510_b_placeholder_rig();
+    let dev = r.device(WP510_REAL_G).clone();
+    let full: Vec<(String, DeviceInfo)> = r
+        .mgr
+        .list_devices()
+        .into_iter()
+        .map(|row| {
+            let by_id = s(&row, "by_id").to_string();
+            let real_path = s(&row, "real_path").to_string();
+            (by_id.clone(), DeviceInfo { by_id, real_path })
+        })
+        .collect();
+    let without: Vec<_> = full
+        .iter()
+        .filter(|(by_id, _)| by_id != WP510_PLACEHOLDER_BY_ID)
+        .cloned()
+        .collect();
+    let weak = Arc::downgrade(&r.mgr);
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_fired = fired.clone();
+    let hook_dev = dev.clone();
+    r.mgr.set_probe_pre_submit_hook_for_test(Box::new(move || {
+        if hook_fired.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        hook_dev.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
+        if let Some(manager) = weak.upgrade() {
+            manager.update_devices(&without);
+        }
+    }));
+
+    let attached = r.call(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    assert_eq!(attached.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&attached));
+    wait_until("交接 PROBE 觸發拔除", || fired.load(Ordering::SeqCst));
+    let _ = r
+        .mgr
+        .wait_attach_idle_for_test(WP510_PLACEHOLDER_BY_ID, Duration::from_millis(500));
+    assert!(dev.is_open(), "closed:false 表示 handle 仍開啟");
+    assert!(
+        r.mgr.has_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID),
+        "未確認關閉的 handle 必須保留阻擋"
+    );
+    assert!(r.mgr.resolve("t:COM3").is_none(), "偵測被取消，不得建立正式 session");
+    r.mgr.update_devices(&full);
+    let attempts = dev.open_attempts();
+    let tx = dev.tx_len();
+
+    let response = r.call(
+        "session.bind",
+        &format!(r#"{{"selector":"COM1","device_by_id":"{WP510_PLACEHOLDER_BY_ID}"}}"#),
+    );
+
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&response));
+    let session = sub(&response, "session");
+    assert_eq!(s(&session, "device_by_id"), WP510_PLACEHOLDER_BY_ID, "{}", j(&response));
+    assert_eq!(s(&session, "state"), "ATTACHING", "{}", j(&response));
+    assert_eq!(session.get("last_error"), Some(&PyValue::Null), "{}", j(&response));
+    wp510_review7_assert_no_reopen(&r, attempts, tx, "session.bind");
+    assert_eq!(
+        r.session("COM1").map(|session| s(&session, "state").to_string()).as_deref(),
+        Some("ATTACHING")
+    );
+}
+
+/// 邊界對照：關閉回條 `closed:true` 時不登記阻擋，之後的 `device.attach` 照常重新開埠（Python 安全回條解除
+/// `_draining_by_ids`，`origin/main:sw_core/session_manager.py:1346-1368`）。
+#[test]
+fn wp510_review7_rpc_confirmed_close_allows_reopen() {
+    let r = wp510_b_placeholder_rig();
+    let dev = r.device(WP510_REAL_G).clone();
+    dev.fail_configure(PalError::io(5, "[Errno 5] Input/output error"));
+    let attached = r.call(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    assert_eq!(attached.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&attached));
+    wait_until("正式 session 套用設定失敗後退回 DETACHED", || {
+        r.session("t:COM3")
+            .is_some_and(|session| s(&session, "state") == "DETACHED")
+    });
+    assert!(
+        r.mgr
+            .wait_attach_idle_for_test(WP510_PLACEHOLDER_BY_ID, Duration::from_secs(5)),
+        "確認關閉後作業應收尾"
+    );
+    assert!(!dev.is_open(), "closed:true 後 handle 已關閉");
+    let attempts = dev.open_attempts();
+
+    let response = r.call("device.attach", r#"{"selector":"t:COM3"}"#);
+
+    assert_ne!(
+        response.get("error_code").and_then(PyValue::as_str),
+        Some("SESSION_RECOVERING"),
+        "{}",
+        j(&response)
+    );
+    wait_until("確認關閉後可再次開埠", || dev.open_attempts() > attempts);
+}

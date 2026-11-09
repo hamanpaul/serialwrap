@@ -546,3 +546,35 @@ fn wp56_unlock_profile_wait_is_not_exempt() {
         "banner 後只剩 quiet 條件：unlock profile 照原豁免起 probe"
     );
 }
+
+/// wp510 第 13 項：DETACHED 逾時類失敗的自動 attach 遇未確認關閉的 by_id。Python `_prepare_reprobe_locked` 已設
+/// ATTACHING＋last_error=None 並記 attempt（`origin/main:sw_core/session_manager.py:2248-2252`），`reconcile_readiness`
+/// 的 `_spawn_attach` 因 `_draining_by_ids` 早退、不開埠（`:2513-2515`、`:4113-4114`）。
+#[test]
+fn wp510_review7_detached_reprobe_attach_blocked_by_unconfirmed_close() {
+    let mut h = CoreHarness::new(PRPL_PROFILE);
+    h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    h.bridge_ok();
+    let (epoch, gen) = (h.epoch(), h.core.generations().fsm_gen);
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen: gen,
+        result: LoginOutcome::Failed("PRPL_PROMPT_TIMEOUT".into()),
+        after_rx_seq: None,
+    });
+    let (stop_epoch, stop) = h.pending_stop();
+    h.receipt(stop_epoch, stop).feed();
+    assert_eq!(h.public()["state"], PyValue::from("DETACHED"));
+    h.unconfirmed.insert(DEVICE_BY_ID);
+    let fx = advance_collect(&mut h, 4);
+    assert!(
+        !fx.iter().any(|e| matches!(e, Effect::OpenBridge { .. })),
+        "未確認關閉的 by_id 不得自動開埠"
+    );
+    assert_eq!(h.public()["state"], PyValue::from("ATTACHING"));
+    assert_eq!(h.public()["last_error"], PyValue::Null);
+    assert_eq!(h.public()["reprobe_attempts"], PyValue::from(1));
+}
