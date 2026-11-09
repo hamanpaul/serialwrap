@@ -245,12 +245,12 @@ static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// | 持有位置 | `closed:false` 的處理 | shutdown 排空判定 | release 排空判定 |
 /// |---|---|---|---|
 /// | ① 佔位 `device.attach` 開埠在途（作業已登錄 `inflight`，`open_exclusive` 尚未返回） | 返回後失效：`AttachOp::close_parts` 記 `close_failed`，`finish_attach_op` 保留作業 | `attach:<by_id>` 為 false | 佔位 release 等同一作業至期限回 DRAIN_STALLED |
-/// | ② 退休後、worker 接手前（`AttachOp::preopened`） | worker 收尾經 `close_preopened_with_receipt` → `finish_attach_op` 保留；退休落盤失敗時作業以 `parked` 留著、不關閉（Python `_preopened_ports`），shutdown 收尾關閉並依回條保留 | 同上 | 舊佔位已退休、正式 session 尚未建立，無 release 對象；作業留在 `inflight`，parked 者由之後的 attach／bind 接手或拔除時關閉；以該 by_id 為舊綁定的 bind 重試時由 `close_parked_for_bind` 關閉後移出 `inflight`；Python 已先取出作業（`bind_session` `:3681`），關閉未確認只告警、不登記阻擋（`:4322-4332`、`:3727`） |
+/// | ② 退休後、worker 接手前（`AttachOp::preopened`） | worker 收尾經 `close_preopened_with_receipt` → `finish_attach_op` 保留；退休落盤失敗時作業以 `parked` 留著、不關閉（Python `_preopened_ports`），shutdown 收尾關閉並依回條保留 | 同上 | 舊佔位已退休、正式 session 尚未建立；作業留在 `inflight`，parked 者由之後的 attach／bind 接手（於同一臨界區移入交接表）或拔除時關閉；已於記憶體改綁到該 by_id 的 session 經 release 取出並關閉（Python `:3108-3111`）；以該 by_id 為舊綁定的 bind 重試時由 `close_parked_for_bind` 關閉。這三處 Python 都先取出作業：關閉未確認只告警、不保留、不登記阻擋（wp510 第 14 項） |
 /// | ③ attach worker 偵測中（`attach_dynamic`／`reattach_existing` 的區域 `HandleParts`） | 一律經 `AttachOp::close_parts`，worker 結束時 `finish_attach_op` 保留 | 同上 | 一般 session 的 release 遇 `close_failed` 作業回 DRAIN_STALLED |
-/// | ④ 交給 session、正式 bridge 接手前（`SessionIo::preopened`），`open_bridge` 於 stopping、configure 失敗、路徑不符時關閉 | `close_before_bridge` 告警並 `retain_unconfirmed_close`（作業留在 `inflight`）；回 `OpenFailure::CloseUnconfirmed`，actor 的 pending stop 保持 stalled（`pending_open_close_unconfirmed`），不交 `finish_pending_open_stop` | 末段重收 `attach:<by_id>` 為 false；session 的 shutdown 等待者不回覆亦為 false | pending release 回 DRAIN_STALLED；之後的 release 經 `close_failed` 作業回 DRAIN_STALLED |
+/// | ④ 交給 session、正式 bridge 接手前（`SessionIo::preopened`，由交接表 `Inner::handoff` 追蹤），`open_bridge` 於 stopping、configure 失敗、路徑不符時關閉；取消者（release、bind、shutdown、裝置改指）在 actor 接手前代為關閉 | `close_before_bridge` 告警並 `retain_unconfirmed_close`（作業留在 `inflight`）；`open_bridge` 回 `OpenFailure::CloseUnconfirmed`，actor 的 pending stop 保持 stalled（`pending_open_close_unconfirmed`），不交 `finish_pending_open_stop` | 末段重收 `attach:<by_id>` 為 false；session 的 shutdown 等待者不回覆亦為 false | pending release 回 DRAIN_STALLED；release 代為關閉者等待保留作業至期限回 DRAIN_STALLED；之後的 release 經 `close_failed` 作業回 DRAIN_STALLED |
 /// | ⑤ `open_bridge` 開埠返回時已 stopping（重組的預開或新開 handle） | 同 ④ | 同 ④ | 同 ④ |
 /// | ⑥ 正式 bridge 接手後（`IoWorker` 擁有） | `WorkerStoppedReceipt.handle_closed:false` → stop 標 stalled（`worker_stopped`） | session 為 false | DRAIN_STALLED |
-/// | ⑦ 裝置改指（`detach_by_id`）與 bind 取走 `SessionIo::preopened` | `close_session_preopened` 只告警：Python 先自 `_preopened_ports` 取出作業再關閉（`:4045-4063`、`:3778-3796`），失敗不保留 | 不列入（同 Python） | 不列入（同 Python） |
+/// | ⑦ parked 作業被拔除／改指（`update_devices`）、bind 收尾後的殘留 `SessionIo::preopened` | `close_session_preopened` 只告警：Python 先自 `_preopened_ports` 取出作業再關閉（`:4045-4063`、`:3776-3800`），失敗不保留 | 不列入（同 Python） | 不列入（同 Python） |
 /// | ⑧ PROBE bridge | Rust 不另建 PROBE bridge，PROBE 直接用 ③ 的同一 handle | 見 ③ | 見 ③ |
 ///
 /// 回歸：`wp510_review5_shutdown_before_bridge_takes_preopened_fail_close_reports_stalled`（④ shutdown）、
@@ -266,9 +266,9 @@ static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// | 來源 | Rust 登記點 | Python 對應 |
 /// |---|---|---|
 /// | ①②③ attach 作業關閉未確認 | `AttachOp::mark_close_failed`（`close_parts`、`finish_attach_op` 帶入的回條） | `_finish_attach_op` 關閉失敗保留作業 `:4320-4332` |
-/// | ④⑤ 正式 bridge 接手前關閉未確認 | `close_before_bridge` → `retain_unconfirmed_close` | `bridge.start()` 失敗經 `_track_attach_bridge_stop` 納入 `_draining_by_ids` `:5185-5207`、`:1286-1324` |
+/// | ④⑤ 正式 bridge 接手前關閉未確認（含取消者代為關閉交接列的 handle） | `close_before_bridge` → `retain_unconfirmed_close` | `bridge.start()` 失敗經 `_track_attach_bridge_stop` 納入 `_draining_by_ids` `:5185-5207`、`:1286-1324`；`_attach_by_id` 中止時 `_finish_attach_op` 關閉失敗，作業留在 `_active_attach_ops` `:4322-4332` |
 /// | ⑥ 正式 bridge 回條 `handle_closed:false` | actor `worker_stopped` | session drain 留在 `_draining_by_ids` `:2774-2775`、`:2918-2919` |
-/// | ⑦ 不登記：裝置改指／bind 取走的預開 handle、bind 重試關閉的 parked handle | `close_session_preopened` 只告警 | 先移出表再關閉 `:4045-4063`、`:3778-3796`、`:3680-3681` |
+/// | ⑦ 不登記：Python 已先自表取出的作業（parked 作業的 release／bind／拔除，bind 收尾殘留） | `close_session_preopened` 只告警 | 先移出表再關閉 `:3108-3111`、`:3680-3681`、`:3776-3800`、`:4045-4063`；`_finish_attach_op` 只告警 `:4322-4332` |
 ///
 /// 會開啟 UART 的入口與阻擋結果（皆為零開埠嘗試、零 TX）：
 ///
@@ -286,6 +286,38 @@ static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// | reprobe 自動 attach（DETACHED 逾時類） | actor `reprobe_tick` 的 Attach | `_prepare_reprobe_locked` `:2248-2252` → `reconcile_readiness` `:2513-2515` | ATTACHING＋last_error=None（已記 attempt） | `wp510_review7_detached_reprobe_attach_blocked_by_unconfirmed_close` |
 /// | drain 收尾再 attach（io_error、裝置改指、開埠中改指） | actor `reopen_known_device` | `_complete_drain` `:2936-2988`、`_spawn_attach` finally `:4126-4145` | io_error→ATTACHING；改指→DETACHED＋DEVICE_REBOUND_REQUIRED | `wp510_review7_io_error_reopen_blocked_by_unconfirmed_close`; `wp510_review7_rebound_reopen_blocked_by_unconfirmed_close` |
 /// | 開埠執行（actor 發出 `OpenBridge` 之後才登記） | `OpenCtx::open_bridge`：取預開 handle 前與開埠返回後各檢查一次 | `_attach_by_id` `:4933-4944`；`attach_device` 開埠後重驗 `:3576-3588`、`:3614-3631` | `OpenFailure::CloseBlocked`：device.attach→SESSION_RECOVERING、session.attach→ATTACHING、其餘維持已寫入狀態 | `wp510_review7_open_bridge_gate_rejects_late_unconfirmed_close`; `wp510_review7_open_gate_close_blocked_maps_per_entry` |
+///
+/// ## 四張表對照（wp510 第 14 項；`origin/main:sw_core/session_manager.py`）
+///
+/// Python 以四張表追蹤每個預開 handle 從開啟、交接，到正式 bridge 接手或確認關閉的整段生命週期；Rust 以在途表
+/// `Inner::inflight`（含 `parked`）、交接表 `Inner::handoff` 與 `UnconfirmedCloses` 對應。handle 離開一張表時一定在
+/// 同一個 manager 臨界區內進入下一張表（或已確認關閉），release／shutdown／bind 在任何時點都查得到。
+///
+/// | Python 表 | 進入 | 移出 | 讀者 | Rust 對應 |
+/// |---|---|---|---|---|
+/// | `_attach_ops`（開埠在途） | `attach_device` `:3502`；`_preopen_auto_attach_port` `:4191`；`_preopen_dynamic_attach_port` `:4277` | OSError `:3532-3533`；轉 `_preopened_ports` `:3592-3593`；失效 `:3611-3612`；`:4202-4203`、`:4238-4239`、`:4244-4245`；`:4287-4288`、`:4306-4307`、`:4309-4310`；bind 無 bridge `:3777`；`_finish_attach_op` `:4336-4338` | freeze `:1156`；shutdown `:1181-1185`、`:1219-1239`；`_attach_inflight_draining_locked` `:3394`；`attach_device` `:3428-3432`、`:3459`；release `:3104-3107`；bind `:3676-3678`；`attach_session` `:3888-3891`、`:3959-3962`；`update_devices` `:4031-4034`；`:4168-4176`、`:4260-4263`；passthrough 升級 `:4510-4513` | `inflight` 的作業（`attach_released_placeholder` 登錄後開埠；worker 的 `gated_open`） |
+/// | `_preopened_ports`（已開埠、沒有 worker） | `attach_device` 成功 `:3592`（佔位交接 `:3608`）；存檔失敗時留著 `:3633-3637` | release `:3110`；bind `:3681`、`:3778`；`update_devices` `:4052`；`_attach_by_id` 轉 active `:4852-4854`；`_finish_attach_op` `:4336-4338` | shutdown 未消費者直接收尾 `:1219-1227`；`attach_device` `:3430`、`:3459`；`attach_session` `:3891`、`:3962`；`_attach_by_id` `:4913`；`:4168`、`:4260`；`:4513`、`:5535`、`:5674` | `inflight` 中 `parked` 的作業（佔位退休落盤失敗）；交給 worker 前的 `AttachOp::preopened` |
+/// | `_active_attach_ops`（attach 執行緒持有：偵測、建 bridge） | `_attach_by_id` `:4852-4854`；`:4238`；`:4306` | `_handoff_attach_op_locked` `:4381-4382`；`_finish_attach_op` `:4336-4338`（關閉失敗不移除 `:4322-4332`） | shutdown `:1181-1185`、`:1219-1239`；`:3394`；`attach_device` `:3431`；release `:3104-3107`（取消並等待 `:3117-3131`、`:3188-3204`）；bind `:3676-3697`；`attach_session` `:3889`、`:3960`；`update_devices` 取消 `:4035-4043`、`:4050`；`_register_probe_bridge` `:4369`；`:4511`、`:5433`、`:5535`、`:5674` | worker 持有期間：`inflight` 的作業；worker 把 handle 交給 session 後：交接表 `handoff`（`HandoffEntry`，actor 的 `OpenBridge` 是持有者；`open_bridge` 取走時 `taken`、收尾 `settle_handoff`） |
+/// | `_draining_by_ids`（bridge 排空未取得安全回條） | `_begin_attach_bridge_stop_locked` `:1324`；`_begin_drain_locked` `:2774-2775` | `_complete_attach_bridge_stop` `:1350`、`:1368`；`_complete_drain` `:2918-2919` | shutdown `:1195`、`:1260-1263`；`:3284`、`:3320`；`:3390`；`attach_device` `:3410`、`:3469`；`_spawn_attach` `:4113`、`:4137`；`:4174`、`:4258`、`:4299`；`:4416`、`:4505`；`_attach_by_id` `:4847`、`:4938`、`:4991`、`:5014` | `UnconfirmedCloses`：正式 bridge 回條 `handle_closed:false`（actor `worker_stopped`）與正式 bridge 接手前關閉未確認（`close_before_bridge`）；另含 Python 作業因關閉失敗而留在表內的情形（`mark_close_failed`；Rust actor 不讀 manager 表，以同一集合阻擋開埠入口） |
+///
+/// 消費者在各時點的行為：
+///
+/// | 時點（handle 在哪） | release | shutdown | bind（舊 by_id） | 裝置拔除／改指 |
+/// |---|---|---|---|---|
+/// | 開埠在途／worker 持有（`inflight`，非 parked） | 取消並等待作業收尾，期限到回 DRAIN_STALLED（`release_attach_handles`） | 取消並等待，未收尾列 stalled | 取消並等待，逾時 SESSION_RECOVERING | 取消；worker 收尾關閉 |
+/// | parked（`inflight`，`parked`） | 取出並關閉；未確認只告警、立即 DRAIN_STALLED | 不取出直接關閉；未確認保留並列 stalled | 取出並關閉（`close_parked_for_bind`）；未確認只告警，照常改綁 | 取出並關閉；未確認只告警 |
+/// | 交給 session、actor 尚未接手（`handoff`，未 `taken`） | 代為關閉並留撤銷標記（排入的 `open_bridge` 回 `CloseBlocked`、不另開新 handle）；未確認保留，等待至期限回 DRAIN_STALLED | session 排空後代為關閉；未確認保留並列 stalled | 代為關閉後重試；未確認保留，逾時 SESSION_RECOVERING | 代為關閉；未確認保留 |
+/// | `open_bridge` 已取走（`handoff`，`taken`） | 交 actor（開埠在途的 pending stop） | 等待 `settle_handoff` | 等待 `settle_handoff`，逾時 SESSION_RECOVERING | 交 actor 的 `DeviceDetached` |
+///
+/// 回歸：`wp510_review9_rpc_release_before_bind_device_online_closes_adopted_handle`（第七次審查 High）、
+/// `wp510_review9_rpc_release_before_bind_device_online_close_unconfirmed_drain_stalled`、
+/// `wp510_review9_rpc_shutdown_before_bind_device_online_closes_adopted_handle`、
+/// `wp510_review9_rpc_shutdown_before_bind_device_online_close_unconfirmed_reports_stalled`、
+/// `wp510_review9_rpc_rebind_before_bind_device_online_closes_adopted_handle`、
+/// `wp510_review9_rpc_release_with_parked_handle_of_bound_session_closes_it`、
+/// `wp510_review9_rpc_release_before_bridge_takes_dynamic_handoff_closes_without_reopen`、
+/// `wp510_review8_rpc_bind_retry_parked_close_unconfirmed_keeps_block`（第七次審查 Medium）、
+/// `wp510_review9_release_during_existing_session_redetect_cancels_and_waits`（sw-core）。
 #[derive(Clone)]
 struct AttachOp {
     token: u64,
@@ -389,6 +421,44 @@ impl AttachOp {
     }
 }
 
+/// 交接表（`Inner::handoff`）的一列：預開 handle 已自在途作業交給 session 的 `SessionIo::preopened`，等待 actor 的
+/// `OpenBridge` 由正式 bridge 接手（見 `AttachOp` 文件的四張表對照）。在途表移出與本列寫入在同一個 manager 臨界區
+/// 內完成，release／shutdown／bind／裝置改指在任何時點都查得到 handle。
+struct HandoffEntry {
+    token: u64,
+    io: Arc<SessionIo>,
+    /// handle 開啟時的實體路徑；`open_bridge` 只接手同路徑的 handle（路徑不同者留給改指處理）。
+    real_path: String,
+    /// `open_bridge` 已取走 handle、正交給正式 bridge 或關閉。不論是否取走，Python 的作業都在 `_active_attach_ops`，
+    /// 由 `_attach_by_id`／`_attach_by_id_dynamic` 持有至 `_handoff_attach_op_locked`（`:4374-4383`）或
+    /// `_finish_attach_op`（`:4320-4365`）；Rust 的「執行緒」是 actor 的 `OpenBridge`。未取走時 actor 可能已忽略
+    /// `DeviceAttached`，取消者（release、bind、shutdown、裝置改指）代替中止的 attach 直接關閉；關閉未確認時同
+    /// `_finish_attach_op` 保留作業（作業未被取出，`:4322-4332`）。
+    taken: bool,
+    /// release 已取走並關閉 handle（Python 取消作業後 `_attach_by_id` 見 `cancelled` 中止、不開埠，`:4933-4944`、
+    /// `:4986-4996`）：同 session、同路徑的下一次 `open_bridge` 不開埠並移除本列；release 結束時亦移除。
+    revoked: bool,
+}
+
+/// `Shared::claim_handoff_locked` 的結果。
+enum HandoffClaim {
+    /// 無交接列（或已被 release 撤銷）。
+    None,
+    /// `open_bridge` 已取走 handle，取消者須等待其收尾（`Shared::settle_handoff`）。
+    Taken,
+    /// actor 尚未接手：handle 已自 session 取出、交接列已處理，由取消者代替中止的 attach 在鎖外關閉
+    /// （`Shared::close_before_bridge`，關閉未確認即保留作業）。
+    Unclaimed { pre: Option<Preopened>, token: u64 },
+}
+
+/// `Shared::take_for_bridge` 的結果。
+enum BridgeTake {
+    /// 交接已被 release 撤銷：不開埠（`OpenFailure::CloseBlocked`）。
+    Revoked,
+    /// 取得的預開 handle（無則另行開埠）。
+    Handle(Option<Preopened>),
+}
+
 /// 只供測試（test-fakes）：綁定 by_id 的一次性暫停點。
 #[cfg(feature = "test-fakes")]
 type ByIdTestHook = (String, Box<dyn FnOnce() + Send>);
@@ -415,8 +485,10 @@ struct Inner {
     devices: BTreeMap<String, DeviceInfo>,
     /// startup 預配 COM（#100）：by_id → COM。
     pending_com: HashMap<String, String>,
-    /// by_id → 進行中的 attach worker。
+    /// by_id → 進行中的 attach 作業（Python `_attach_ops`／`_preopened_ports`（`parked`）／`_active_attach_ops`）。
     inflight: HashMap<String, AttachOp>,
+    /// by_id → 已交給 session、等待正式 bridge 接手的預開 handle（見 `HandoffEntry`）。
+    handoff: HashMap<String, HandoffEntry>,
     /// SC-11 stopping gate。
     stopping: bool,
     /// interactive_id → session_id。
@@ -516,6 +588,10 @@ struct Shared {
     /// 只供測試（test-fakes）：下一次建立 attach worker 執行緒時模擬 `Builder::spawn()` 失敗（執行緒資源耗盡）。
     #[cfg(feature = "test-fakes")]
     fail_next_attach_spawn: AtomicBool,
+    /// 只供測試（test-fakes）：`session.bind` 已把改綁目標的未消費預開 handle 交給 session、送出 `DeviceOnline` 之前的
+    /// 一次性暫停點（重現 actor 處理 `DeviceOnline` 前插入的 release／shutdown／bind；wp510 第七次整包審查 High）。
+    #[cfg(feature = "test-fakes")]
+    bind_pre_device_online_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// 載入的 state.json 含孤立 surrogate（`LoadedState::lone_surrogates`；啟動存檔前檢查）。
     lone_surrogates: bool,
     /// 啟動存檔重現的 Python 未捕捉例外末行（`_save_state` 的 `UnicodeEncodeError`）；daemon 據此 exit 1。
@@ -825,15 +901,145 @@ impl Shared {
         (self.warn)(msg);
     }
 
-    /// 裝置改指（`detach_by_id`）與 bind 關閉已交給 session、尚未由正式 bridge 接手的預開 handle；`closed:false` 時
-    /// 比照 Python `_finish_attach_op`（`origin/main:sw_core/session_manager.py:4322-4332`）以 by_id 與
-    /// `CloseReceipt.error` 告警。Python 這兩條路徑先把作業自 `_preopened_ports` 取出才關閉（裝置改指 `:4045-4063`、
-    /// bind `:3778-3796`），關閉失敗不保留作業，因此這裡只告警、不登記阻擋。
-    fn close_session_preopened(&self, by_id: &str, pre: Preopened) {
+    /// 關閉 Python 已先自表中取出的未消費預開 handle（release `:3108-3111`、bind `:3680-3681`／`:3776-3778`、裝置改指
+    /// `:4045-4063`），回傳是否確認關閉；`closed:false` 時比照 `_finish_attach_op`（`origin/main:sw_core/session_manager.py:4322-4332`）
+    /// 以 by_id 與 `CloseReceipt.error` 告警。作業已不在任何表內，關閉失敗不保留作業、不登記阻擋（`_draining_by_ids`
+    /// 只由 bridge 排空寫入 `:1324`、`:2774-2775`）。
+    fn close_session_preopened(&self, by_id: &str, pre: Preopened) -> bool {
         let receipt = pre.parts.close();
         if !receipt.closed {
             self.warn(preopened_close_warning(by_id, &close_error_text(&receipt)));
         }
+        receipt.closed
+    }
+
+    /// 鎖內把預開 handle 交給 session（`SessionIo::preopened`）並寫入交接表；呼叫端在把 handle 移出在途作業的同一
+    /// 臨界區內呼叫（Python `_attach_by_id` 於同一把鎖內 `_preopened_ports.pop` → `_active_attach_ops[by_id] = op`，
+    /// `origin/main:sw_core/session_manager.py:4852-4854`）。回傳被取代、需由呼叫端在鎖外關閉的舊 handle。
+    fn place_handoff_locked(
+        inner: &mut Inner,
+        by_id: &str,
+        io: &Arc<SessionIo>,
+        pre: Preopened,
+    ) -> Vec<Preopened> {
+        let real_path = pre.real_path.clone();
+        let mut displaced: Vec<Preopened> = lock(&io.preopened).replace(pre).into_iter().collect();
+        displaced.extend(Self::register_handoff_locked(inner, by_id, io, real_path));
+        displaced
+    }
+
+    /// 為已放進 `io.preopened` 的 handle 寫入交接表；同一 by_id 或同一 session 的舊列（未取走者）連同其 handle 一併取出。
+    fn register_handoff_locked(
+        inner: &mut Inner,
+        by_id: &str,
+        io: &Arc<SessionIo>,
+        real_path: String,
+    ) -> Vec<Preopened> {
+        let mut displaced = Vec::new();
+        let stale: Vec<String> = inner
+            .handoff
+            .iter()
+            .filter(|(key, entry)| {
+                !entry.taken && (key.as_str() == by_id || Arc::ptr_eq(&entry.io, io))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in stale {
+            if let Some(entry) = inner.handoff.remove(&key) {
+                if !entry.revoked && !Arc::ptr_eq(&entry.io, io) {
+                    displaced.extend(lock(&entry.io.preopened).take());
+                }
+            }
+        }
+        inner.handoff.insert(
+            by_id.to_string(),
+            HandoffEntry {
+                token: NEXT_ATTACH_OP_TOKEN.fetch_add(1, Ordering::Relaxed),
+                io: io.clone(),
+                real_path,
+                taken: false,
+                revoked: false,
+            },
+        );
+        displaced
+    }
+
+    /// 取消者認領 by_id 的交接列（release／bind／shutdown／裝置改指）。未取走者取出 handle 由呼叫端以
+    /// `close_before_bridge` 關閉；`revoke` 為真（release）時保留撤銷標記，令已排入的 `open_bridge` 不開埠，否則移除該列。
+    fn claim_handoff_locked(inner: &mut Inner, by_id: &str, revoke: bool) -> HandoffClaim {
+        let Some(entry) = inner.handoff.get_mut(by_id) else {
+            return HandoffClaim::None;
+        };
+        if entry.revoked {
+            return HandoffClaim::None;
+        }
+        if entry.taken {
+            return HandoffClaim::Taken;
+        }
+        let pre = lock(&entry.io.preopened).take();
+        let token = entry.token;
+        if revoke {
+            entry.revoked = true;
+        } else {
+            inner.handoff.remove(by_id);
+        }
+        HandoffClaim::Unclaimed { pre, token }
+    }
+
+    /// release 結束：移除自己留下的撤銷標記（同 token 才移除）。
+    fn clear_revoked_handoff(&self, by_id: &str, token: u64) {
+        let mut inner = lock(&self.inner);
+        if inner
+            .handoff
+            .get(by_id)
+            .is_some_and(|entry| entry.revoked && entry.token == token)
+        {
+            inner.handoff.remove(by_id);
+        }
+    }
+
+    /// `open_bridge` 取預開 handle：於 manager 鎖內查該 session 的交接列，同路徑者取走並標為 `taken`（Python 作業由
+    /// `_attach_by_id` 持有於 `_active_attach_ops`）；已被 release 撤銷者不開埠。查無交接列時沿用 `io.preopened`。
+    fn take_for_bridge(&self, io: &Arc<SessionIo>, dev: &str) -> BridgeTake {
+        let mut inner = lock(&self.inner);
+        let key = inner
+            .handoff
+            .iter()
+            .find(|(_, entry)| Arc::ptr_eq(&entry.io, io))
+            .map(|(key, _)| key.clone());
+        let Some(key) = key else {
+            return BridgeTake::Handle(lock(&io.preopened).take());
+        };
+        let entry = inner.handoff.get_mut(&key).expect("剛查到的交接列");
+        if entry.real_path != dev {
+            // 路徑不同（裝置改指或過期的開埠）：handle 留在交接表，由改指或取消者處理；本次另行開埠。
+            return BridgeTake::Handle(None);
+        }
+        if entry.revoked {
+            inner.handoff.remove(&key);
+            return BridgeTake::Revoked;
+        }
+        if entry.taken {
+            return BridgeTake::Handle(None);
+        }
+        let pre = lock(&io.preopened).take();
+        if pre.is_some() {
+            entry.taken = true;
+        } else {
+            inner.handoff.remove(&key);
+        }
+        BridgeTake::Handle(pre)
+    }
+
+    /// `open_bridge` 收尾：正式 bridge 已接手（Python `_handoff_attach_op_locked` `:4374-4383`）或 handle 已關閉
+    /// （關閉未確認者已由 `retain_unconfirmed_close` 先移入在途表），移除該 session 已取走的交接列並喚醒等待者。
+    fn settle_handoff(&self, io: &Arc<SessionIo>) {
+        let mut inner = lock(&self.inner);
+        inner
+            .handoff
+            .retain(|_, entry| !(entry.taken && Arc::ptr_eq(&entry.io, io)));
+        drop(inner);
+        self.cv.notify_all();
     }
 
     /// `open_bridge` 在正式 bridge 接手前關閉 handle（預開或剛開啟者）；回傳是否確認關閉。對應 Python `_attach_by_id`
@@ -1066,6 +1272,7 @@ impl Shared {
             core.set_last_error_observer(Box::new(move |v: &str| lock(&sink).push(v.to_string())));
             history
         };
+        let handoff_path = preopened.as_ref().map(|pre| pre.real_path.clone());
         let io = Arc::new(SessionIo {
             sid: Mutex::new(sid.clone()),
             profile: Mutex::new(profile.clone()),
@@ -1124,6 +1331,16 @@ impl Shared {
             opened_listener: Arc::new(Mutex::new(HashSet::new())),
         };
         let actor = spawn_actor(core, mailbox, Box::new(exec), self.clock.clone());
+        if let Some(real_path) = handoff_path {
+            // dynamic 偵測沿用的 PROBE handle 交給新 session：與 `attach_dynamic` 的作業同在本臨界區內寫入交接表
+            // （Python `_attach_by_id_dynamic` 改寫作業 `session_id` 後仍留在 `_active_attach_ops`，
+            // `origin/main:sw_core/session_manager.py:5644-5647`）。同一 by_id 的舊列（理論上不存在）就地關閉並告警。
+            for stale in
+                Self::register_handoff_locked(inner, &profile.device_by_id, &io, real_path)
+            {
+                self.close_session_preopened(&profile.device_by_id, stale);
+            }
+        }
         inner.sessions.insert(
             sid.clone(),
             Entry {
@@ -1283,14 +1500,25 @@ impl Shared {
         }
     }
 
-    /// `_detach_by_id`：未交給正式 bridge 的預開 handle 立即關閉（#27），並通知 actor drain。
+    /// `_detach_by_id`：未交給正式 bridge 的預開 handle 立即關閉（#27），並通知 actor drain。交接表的 handle 在 Python
+    /// 屬 `_active_attach_ops` 的作業：`update_devices` 取消（`origin/main:sw_core/session_manager.py:4035-4043`），由持有
+    /// 作業的 attach 中止並 `_finish_attach_op`，關閉未確認即保留（`:4322-4332`）；未取走者由此代為關閉，已取走者由開埠
+    /// 路徑與 actor 的 `DeviceDetached` 收尾。
     fn detach_by_id(&self, by_id: &str, reason: DetachReason) {
-        let target = {
-            let inner = lock(&self.inner);
-            inner
+        let (claimed, target) = {
+            let mut inner = lock(&self.inner);
+            let claimed = Self::claim_handoff_locked(&mut inner, by_id, false);
+            let target = inner
                 .session_by_id(by_id)
-                .map(|e| (e.sid.clone(), e.io.clone()))
+                .map(|e| (e.sid.clone(), e.io.clone()));
+            (claimed, target)
         };
+        if let HandoffClaim::Unclaimed { pre, .. } = claimed {
+            self.cv.notify_all();
+            if let Some(pre) = pre {
+                self.close_before_bridge(by_id, pre.parts);
+            }
+        }
         let Some((sid, io)) = target else {
             return;
         };
@@ -1363,7 +1591,8 @@ impl Shared {
             .is_some_and(|op| op.parked.swap(false, Ordering::SeqCst))
         {
             // 未消費的預開作業（佔位退休落盤失敗留下）：Python `_attach_by_id` 先自 `_preopened_ports` 取走作業，以同一
-            // handle 續行 attach（`origin/main:sw_core/session_manager.py:4852-4854`）。
+            // handle 續行 attach（`origin/main:sw_core/session_manager.py:4852-4854`）。handle 在本臨界區內交給新作業或
+            // session 的交接列，不離開 manager 的追蹤。
             let parked = inner.inflight.remove(by_id).and_then(|op| op.take_preopened());
             if let Some(pre) = preopened.take() {
                 let _ = pre.parts.close();
@@ -1397,16 +1626,22 @@ impl Shared {
             if !needs_reresolve || preopened.is_some() {
                 let actor = e.actor.clone();
                 let io = e.io.clone();
-                drop(inner);
+                let mut to_close = Vec::new();
                 if let Some(pre) = preopened {
                     // 接手的預開 handle 交給 session 的正式 bridge（Python `_attach_by_id` 以 `preopened_op.port` 建
-                    // bridge，`:4982`）；路徑已改變者關閉。只有未消費的預開作業會帶 handle 進來。
+                    // bridge，`:4982`）：移出在途表與寫入交接表在同一臨界區（`:4852-4854`）；路徑已改變者關閉。
+                    // 只有未消費的預開作業會帶 handle 進來。
                     if pre.real_path == real {
-                        *lock(&io.preopened) = Some(pre);
+                        to_close = Self::place_handoff_locked(&mut inner, by_id, &io, pre);
                     } else {
-                        self.close_session_preopened(by_id, pre);
+                        to_close.push(pre);
                     }
                 }
+                drop(inner);
+                for pre in to_close {
+                    self.close_session_preopened(by_id, pre);
+                }
+                self.cv.notify_all();
                 let _ = actor.control.send(ControlEvent::DeviceAttached {
                     by_id: by_id.to_string(),
                     real_path: real,
@@ -1550,15 +1785,25 @@ impl Shared {
         if !r.as_ref().is_ok_and(is_ok) {
             return;
         }
-        {
+        let displaced = {
             let mut inner = lock(&self.inner);
-            if let Some(e) = inner.sessions.get_mut(sid) {
+            let io = inner.sessions.get_mut(sid).map(|e| {
                 e.profile.device_by_id = by_id.to_string();
                 lock(&e.io.profile).device_by_id = by_id.to_string();
-                if let Some(pre) = op.take_preopened() {
-                    *lock(&e.io.preopened) = Some(pre);
-                }
+                e.io.clone()
+            });
+            match io {
+                // 作業仍在在途表（worker 收尾才移除），handle 於同一臨界區寫入交接表；已取消者留在作業內由 worker
+                // 收尾關閉（Python `_attach_by_id` 見 `cancelled` 中止並 `_finish_attach_op`，`:4933-4944`）。
+                Some(io) if !op.cancelled.load(Ordering::SeqCst) => match op.take_preopened() {
+                    Some(pre) => Self::place_handoff_locked(&mut inner, by_id, &io, pre),
+                    None => Vec::new(),
+                },
+                _ => Vec::new(),
             }
+        };
+        for pre in displaced {
+            self.close_session_preopened(by_id, pre);
         }
         if let Err(e) = self.commit_sync(|m| {
             m.apply(StateDelta::Binding {
@@ -2352,20 +2597,30 @@ impl Shared {
                 }
             }
         }
-        let io = lock(&self.inner)
-            .sessions
-            .get(&sid_now)
-            .map(|e| e.io.clone());
+        let mut inner = lock(&self.inner);
+        let io = inner.sessions.get(&sid_now).map(|e| e.io.clone());
         match io {
-            Some(io) => {
-                *lock(&io.preopened) = Some(Preopened {
-                    real_path: real.clone(),
-                    parts,
-                });
+            // 作業仍在在途表（worker 收尾才移除），handle 於同一臨界區寫入交接表；已取消者不交出（Python
+            // `_attach_by_id` 見 `cancelled` 中止並 `_finish_attach_op`，`origin/main:sw_core/session_manager.py:4933-4944`）。
+            Some(io) if !op.cancelled.load(Ordering::SeqCst) => {
+                let displaced = Self::place_handoff_locked(
+                    &mut inner,
+                    by_id,
+                    &io,
+                    Preopened {
+                        real_path: real.clone(),
+                        parts,
+                    },
+                );
+                drop(inner);
+                for pre in displaced {
+                    self.close_session_preopened(by_id, pre);
+                }
                 // Python `_attach_by_id` 的再偵測不寫 sticky（`_maybe_persist_sticky` 只在動態 attach；審查 F65）。
                 self.send_attached(by_id);
             }
-            None => {
+            _ => {
+                drop(inner);
                 let _ = op.close_parts(parts);
             }
         }
@@ -2860,6 +3115,8 @@ impl OpenCtx {
     }
 
     /// `OpenBridge`：stopping gate → 預開 handle（同路徑則原樣交接，#51）或 `open_exclusive` → IoWorker。
+    /// 預開 handle 經 `take_for_bridge` 於 manager 鎖內取得（交接列標為 `taken`），收尾一律 `settle_handoff`：
+    /// 正式 bridge 接手、確認關閉，或關閉未確認時已先移入在途表（`retain_unconfirmed_close`）。
     fn open_bridge(
         &self,
         dev: DevicePath,
@@ -2867,11 +3124,30 @@ impl OpenCtx {
         precheck_holders: bool,
         control: &Sender<ControlEvent>,
     ) -> Result<OpenedBridge, OpenFailure> {
-        let stopped = || OpenFailure::Other(PalError::plain(PalErrorKind::Io, "daemon stopping"));
         #[cfg(feature = "test-fakes")]
         if let Some(hook) = lock(&self.shared.open_bridge_pre_take_hook).take() {
             hook();
         }
+        let pre = match self.shared.take_for_bridge(&self.io, &dev.0) {
+            // release 已撤銷交給本 session 的 handle（Python 作業 `cancelled`，`_attach_by_id` 中止、不開埠，
+            // `origin/main:sw_core/session_manager.py:4933-4944`、`:4986-4996`）。
+            BridgeTake::Revoked => return Err(OpenFailure::CloseBlocked),
+            BridgeTake::Handle(pre) => pre,
+        };
+        let result = self.open_bridge_with(dev, cfg, precheck_holders, control, pre);
+        self.shared.settle_handoff(&self.io);
+        result
+    }
+
+    fn open_bridge_with(
+        &self,
+        dev: DevicePath,
+        cfg: SerialConfig,
+        precheck_holders: bool,
+        control: &Sender<ControlEvent>,
+        pre: Option<Preopened>,
+    ) -> Result<OpenedBridge, OpenFailure> {
+        let stopped = || OpenFailure::Other(PalError::plain(PalErrorKind::Io, "daemon stopping"));
         let by_id = lock(&self.io.profile).device_by_id.clone();
         // 接手前關閉 handle（見 `AttachOp` 的未確認關閉盤點）：`closed:false` 以 `CloseUnconfirmed` 包住原失敗交給 actor，
         // manager 端由 `close_before_bridge` 保留阻擋作業。
@@ -2883,7 +3159,7 @@ impl OpenCtx {
             }
         };
         if lock(&self.shared.inner).stopping {
-            if let Some(pre) = lock(&self.io.preopened).take() {
+            if let Some(pre) = pre {
                 return Err(close_or_fail(pre.parts, stopped()));
             }
             return Err(stopped());
@@ -2892,12 +3168,11 @@ impl OpenCtx {
         // 未交接的預開 handle 一併關閉（Python `_attach_by_id` 開 bridge 前重驗 `_draining_by_ids` 即中止並經
         // `_finish_attach_op` 關閉，`origin/main:sw_core/session_manager.py:4933-4944`）。
         if self.shared.unconfirmed_closes.contains(&by_id) {
-            if let Some(pre) = lock(&self.io.preopened).take() {
+            if let Some(pre) = pre {
                 return Err(close_or_fail(pre.parts, OpenFailure::CloseBlocked));
             }
             return Err(OpenFailure::CloseBlocked);
         }
-        let pre = lock(&self.io.preopened).take();
         let handle: Box<dyn SerialHandle> = match pre {
             Some(pre) if pre.real_path == dev.0 => {
                 // Python bridge 啟動時對預開 port 呼叫 `port.configure(self.profile)`：PROBE 以預設設定開啟，
@@ -3427,6 +3702,8 @@ impl SessionManager {
             finish_attach_op_pre_lock_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             fail_next_attach_spawn: AtomicBool::new(false),
+            #[cfg(feature = "test-fakes")]
+            bind_pre_device_online_hook: Mutex::new(None),
         });
         shared.bootstrap_sessions(&load.profiles);
         let mgr = Arc::new(SessionManager {
@@ -3595,11 +3872,29 @@ impl SessionManager {
                     .attach_released_placeholder(sid, *force, request_selector);
             }
         }
+        let mut revoked_handoff: Option<(String, u64)> = None;
         if let SessionRequest::Release { source, .. } = &req {
-            if let Some(response) = self.cancel_placeholder_attach_for_release(sid, source)? {
-                return Ok(response);
+            let settled = self.release_attach_handles(sid, source, &mut revoked_handoff);
+            if !matches!(settled, Ok(None)) {
+                if let Some((by_id, token)) = revoked_handoff.take() {
+                    self.shared.clear_revoked_handoff(&by_id, token);
+                }
+                return settled.map(|response| response.expect("非 None 的 release 收尾回應"));
             }
         }
+        let result = self.route_after_release_settle(sid, req, timeout);
+        if let Some((by_id, token)) = revoked_handoff {
+            self.shared.clear_revoked_handoff(&by_id, token);
+        }
+        result
+    }
+
+    fn route_after_release_settle(
+        &self,
+        sid: &str,
+        req: SessionRequest,
+        timeout: Duration,
+    ) -> Result<PyDict, PyErr> {
         let stopping = lock(&self.shared.inner).stopping;
         match &req {
             SessionRequest::Bind { by_id } => return self.bind(sid, by_id),
@@ -3647,47 +3942,129 @@ impl SessionManager {
         Ok(result)
     }
 
-    /// Python `release_session` 會找到、取消並排空 RELEASED placeholder 的 manager 開埠作業；一般 session 只處理未確認
-    /// 關閉而保留的作業（見 `AttachOp` 的關閉回條盤點）。
-    fn cancel_placeholder_attach_for_release(
+    /// Python `release_device` 的作業收尾（`origin/main:sw_core/session_manager.py:3104-3111`、`:3117-3131`、
+    /// `:3188-3204`）：依序查 by_id 的在途作業與交接列，直到兩者都查無才交給 actor 的 release 流程。
+    ///
+    /// - 在途作業、有 worker（`_active_attach_ops`／`_attach_ops`）：取消並記錄第一個 release 的來源與期限，等待作業
+    ///   收尾（worker 見取消即關閉 handle）；期限到仍未收尾回 DRAIN_STALLED（`:3192-3204`）。
+    /// - 在途作業、parked（`_preopened_ports` 未消費者，`:3108-3111`）：取出作業並直接關閉 handle。作業已不在任何表內，
+    ///   `closed:false` 只告警、不保留、不登記阻擋（`_finish_attach_op` `:4322-4332`），立即回 DRAIN_STALLED＋
+    ///   `drain_stalled:true`（`done` 未設定，`:3192-3204`）。
+    /// - 交接列未取走（Python 作業仍在 `_active_attach_ops`，由 attach 持有）：代替中止的 attach 取出 handle 關閉，並留
+    ///   撤銷標記（`revoked_handoff`），令已排入的 `open_bridge` 不開埠；呼叫端在 release 結束時移除標記。關閉未確認時
+    ///   作業保留（`close_before_bridge` → `retain_unconfirmed_close`），下一輪照在途作業等待至期限回 DRAIN_STALLED。
+    /// - 交接列已取走者交 actor（開埠在途的 pending stop 收尾）。
+    fn release_attach_handles(
         &self,
         sid: &str,
         source: &str,
+        revoked_handoff: &mut Option<(String, u64)>,
     ) -> Result<Option<PyDict>, PyErr> {
         // 與 Python `release_device` 一樣，在取得 manager lock 前開始本次期限計時。
         let candidate_release_deadline = Instant::now() + ATTACH_OP_WAIT;
-        let (by_id, op, deadline) = {
-            let inner = lock(&self.shared.inner);
-            let Some(entry) = inner.sessions.get(sid) else {
-                return Ok(None);
+        enum Step {
+            CloseParked {
+                by_id: String,
+                pre: Option<Preopened>,
+                token: u64,
+            },
+            CloseHandoff {
+                by_id: String,
+                pre: Option<Preopened>,
+            },
+            Wait {
+                by_id: String,
+                op: AttachOp,
+                deadline: Instant,
+            },
+        }
+        loop {
+            let step = {
+                let mut inner = lock(&self.shared.inner);
+                let Some(entry) = inner.sessions.get(sid) else {
+                    return Ok(None);
+                };
+                let by_id = entry.profile.device_by_id.clone();
+                if by_id.is_empty() {
+                    return Ok(None);
+                }
+                if let Some(op) = inner.inflight.get(&by_id).cloned() {
+                    if op.parked.swap(false, Ordering::SeqCst) {
+                        inner.inflight.remove(&by_id);
+                        Step::CloseParked {
+                            pre: op.take_preopened(),
+                            token: op.token,
+                            by_id,
+                        }
+                    } else {
+                        // 與 `retire_released_placeholder_locked` 共用 manager lock：若 release 已取得 op，
+                        // 後續的 attach 收尾就不能先通過退休檢查。
+                        op.cancel();
+                        op.release_requested.store(true, Ordering::SeqCst);
+                        // Python `release_device` 只在第一個 release 請求寫入 `release_request`（`:3117-3122`）。
+                        lock(&op.release_source).get_or_insert_with(|| source.to_string());
+                        let deadline = {
+                            let mut stored = lock(&op.release_deadline);
+                            *stored.get_or_insert(candidate_release_deadline)
+                        };
+                        #[cfg(feature = "test-fakes")]
+                        if let Some(hook) =
+                            lock(&self.shared.placeholder_release_cancel_hook).as_ref()
+                        {
+                            hook();
+                        }
+                        Step::Wait {
+                            by_id,
+                            op,
+                            deadline,
+                        }
+                    }
+                } else {
+                    match Shared::claim_handoff_locked(&mut inner, &by_id, true) {
+                        HandoffClaim::Unclaimed { pre, token } => {
+                            *revoked_handoff = Some((by_id.clone(), token));
+                            Step::CloseHandoff { by_id, pre }
+                        }
+                        HandoffClaim::Taken | HandoffClaim::None => return Ok(None),
+                    }
+                }
             };
-            let by_id = entry.profile.device_by_id.clone();
-            let Some(op) = inner.inflight.get(&by_id).cloned() else {
-                return Ok(None);
-            };
-            // 一般 session 只處理未確認關閉而保留的作業（`retain_unconfirmed_close`）：Python `release_device` 對
-            // 仍在表內的作業等待 `done`（`origin/main:sw_core/session_manager.py:3104-3111`、`:3192-3204`），關閉失敗
-            // 不設 `done`，期限到即回 DRAIN_STALLED。其他在途 attach 仍走 actor 的 release 流程。
-            if !entry.released_placeholder && !op.close_failed.load(Ordering::SeqCst) {
-                return Ok(None);
+            match step {
+                Step::CloseParked { by_id, pre, token } => {
+                    self.shared.cv.notify_all();
+                    let closed = pre.is_none_or(|pre| self.shared.close_session_preopened(&by_id, pre));
+                    if !closed {
+                        return self.release_close_unconfirmed_reply(sid, token);
+                    }
+                }
+                Step::CloseHandoff { by_id, pre } => {
+                    self.shared.cv.notify_all();
+                    if let Some(pre) = pre {
+                        // 關閉未確認者保留為在途作業，下一輪等待至期限。
+                        self.shared.close_before_bridge(&by_id, pre.parts);
+                    }
+                }
+                Step::Wait {
+                    by_id,
+                    op,
+                    deadline,
+                } => {
+                    if let Some(reply) = self.wait_attach_op_for_release(sid, &by_id, &op, deadline)? {
+                        return Ok(Some(reply));
+                    }
+                }
             }
-            // 與 `retire_released_placeholder_locked` 共用 manager lock：若 release 已取得 op，
-            // 後續的 attach 收尾就不能先通過退休檢查。
-            op.cancel();
-            op.release_requested.store(true, Ordering::SeqCst);
-            // Python `release_device` 只在第一個 release 請求寫入 `release_request`（`session_manager.py:3117-3122`）。
-            lock(&op.release_source).get_or_insert_with(|| source.to_string());
-            let deadline = {
-                let mut stored = lock(&op.release_deadline);
-                *stored.get_or_insert(candidate_release_deadline)
-            };
-            #[cfg(feature = "test-fakes")]
-            if let Some(hook) = lock(&self.shared.placeholder_release_cancel_hook).as_ref() {
-                hook();
-            }
-            (by_id, op, deadline)
-        };
+        }
+    }
 
+    /// 等待 release 已取消的在途作業收尾；作業移除回 `None`，期限到回 DRAIN_STALLED（Python `:3192-3204`）。
+    fn wait_attach_op_for_release(
+        &self,
+        sid: &str,
+        by_id: &str,
+        op: &AttachOp,
+        deadline: Instant,
+    ) -> Result<Option<PyDict>, PyErr> {
         let epoch = self
             .shared
             .session_public(sid)
@@ -3699,7 +4076,7 @@ impl SessionManager {
             loop {
                 let same_op = inner
                     .inflight
-                    .get(&by_id)
+                    .get(by_id)
                     .is_some_and(|current| Arc::ptr_eq(&current.cancelled, &op.cancelled));
                 if !same_op {
                     return Ok(None);
@@ -3729,6 +4106,28 @@ impl SessionManager {
             }
         };
         let mut response = await_actor_reply(stalled_reply, QUERY_TIMEOUT)?;
+        response.insert("error_code", PyValue::from("DRAIN_STALLED"));
+        Ok(Some(response))
+    }
+
+    /// release 直接關閉的 parked handle 回 `closed:false`：Python 設 `drain_stalled`、`drain_timeout_epoch` 與 RECOVERING
+    /// 後回 DRAIN_STALLED（`origin/main:sw_core/session_manager.py:3192-3204`）。
+    fn release_close_unconfirmed_reply(&self, sid: &str, token: u64) -> Result<Option<PyDict>, PyErr> {
+        let epoch = self
+            .shared
+            .session_public(sid)
+            .and_then(|session| session.get("bridge_generation").and_then(PyValue::as_i64))
+            .unwrap_or(0)
+            .max(0) as u64;
+        let Some(actor) = self.shared.actor_of(sid) else {
+            return Ok(None);
+        };
+        let reply = enqueue_safety_request(
+            &actor,
+            SessionRequest::PlaceholderAttachStalled { token, epoch },
+            QUERY_TIMEOUT,
+        )?;
+        let mut response = await_actor_reply(reply, QUERY_TIMEOUT)?;
         response.insert("error_code", PyValue::from("DRAIN_STALLED"));
         Ok(Some(response))
     }
@@ -3837,7 +4236,7 @@ impl SessionManager {
             }
         }
         let (sid, io) = loop {
-            let inner = lock(&self.shared.inner);
+            let mut inner = lock(&self.shared.inner);
             let Some(e) = inner.resolve(selector) else {
                 return Ok(pydict! {
                     "ok" => false,
@@ -3872,6 +4271,35 @@ impl SessionManager {
                 );
                 continue;
             }
+            // 舊 by_id 的 handle 已交給本 session、等待正式 bridge 接手（`HandoffEntry`；Python 作業在
+            // `_active_attach_ops`）：Python 取消並等待 `done`（`:3676-3693`），attach 中止後 `_finish_attach_op` 關閉
+            // 再遞迴重試（`:3727`）。未取走者由此代為關閉後重試；關閉未確認時作業保留，下一輪照在途作業等待至期限回
+            // SESSION_RECOVERING＋drain_stalled（`:3697-3711`）。已取走者（`open_bridge` 進行中）等待其收尾，上限同在途作業。
+            match Shared::claim_handoff_locked(&mut inner, &old_by_id, false) {
+                HandoffClaim::Unclaimed { pre, .. } => {
+                    drop(inner);
+                    self.shared.cv.notify_all();
+                    if let Some(pre) = pre {
+                        self.shared.close_before_bridge(&old_by_id, pre.parts);
+                    }
+                    continue;
+                }
+                HandoffClaim::Taken => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        drop(inner);
+                        return Ok(self.attach_op_stalled_reply(&sid));
+                    }
+                    drop(
+                        self.shared
+                            .cv
+                            .wait_timeout(inner, deadline - now)
+                            .unwrap_or_else(|e| e.into_inner()),
+                    );
+                    continue;
+                }
+                HandoffClaim::None => {}
+            }
             if inner.stopping {
                 return Err(stopping_error());
             }
@@ -3899,9 +4327,17 @@ impl SessionManager {
         if !is_ok(&result) || result.get("already_bound") == Some(&PyValue::Bool(true)) {
             return Ok(result);
         }
-        // 未交給正式 bridge 的預開 handle（舊 by_id）關閉。
+        // 未交給正式 bridge 的預開 handle（舊 by_id）關閉：Python 自 `_preopened_ports` 取出後關閉、例外忽略
+        // （`origin/main:sw_core/session_manager.py:3776-3778`、`:3796-3800`）。
+        let old_by_id = lock(&io.profile).device_by_id.clone();
+        let claimed = {
+            let mut inner = lock(&self.shared.inner);
+            Shared::claim_handoff_locked(&mut inner, &old_by_id, false)
+        };
+        if let HandoffClaim::Unclaimed { pre: Some(pre), .. } = claimed {
+            self.shared.close_session_preopened(&old_by_id, pre);
+        }
         if let Some(pre) = lock(&io.preopened).take() {
-            let old_by_id = lock(&io.profile).device_by_id.clone();
             self.shared.close_session_preopened(&old_by_id, pre);
         }
         let has_device = {
@@ -3929,6 +4365,7 @@ impl SessionManager {
             // 改綁目標若有未消費的預開作業（佔位退休落盤失敗留下）：Python `bind_session` 收尾 `_spawn_attach`，
             // `_attach_by_id` 取走 `_preopened_ports` 的作業並以同一 handle 建 bridge（`origin/main:sw_core/session_manager.py:4852-4854`、
             // `:4982`），因此把 handle 交給本 session 的正式 bridge，不重新開埠。
+            // 移出在途表與寫入交接表在同一臨界區（Python `:4852-4854`），release／shutdown／bind 在任何時點都查得到。
             let parked = {
                 let mut inner = lock(&self.shared.inner);
                 let claimed = inner
@@ -3936,17 +4373,30 @@ impl SessionManager {
                     .get(&by_id)
                     .is_some_and(|op| op.parked.swap(false, Ordering::SeqCst));
                 let op = if claimed { inner.inflight.remove(&by_id) } else { None };
-                op.map(|op| (op, inner.device_path(&by_id).map(str::to_string)))
-            };
-            if let Some((op, current)) = parked {
-                if let Some(pre) = op.take_preopened() {
-                    if current.as_deref() == Some(pre.real_path.as_str()) {
-                        *lock(&io.preopened) = Some(pre);
-                    } else {
-                        self.shared.close_session_preopened(&by_id, pre);
+                op.map(|op| {
+                    let current = inner.device_path(&by_id).map(str::to_string);
+                    match op.take_preopened() {
+                        Some(pre) if current.as_deref() == Some(pre.real_path.as_str()) => {
+                            Shared::place_handoff_locked(&mut inner, &by_id, &io, pre)
+                        }
+                        Some(pre) => vec![pre],
+                        None => Vec::new(),
                     }
+                })
+            };
+            if let Some(to_close) = parked {
+                for pre in to_close {
+                    self.shared.close_session_preopened(&by_id, pre);
                 }
                 self.shared.cv.notify_all();
+            }
+            #[cfg(feature = "test-fakes")]
+            {
+                // 先放開鎖再執行：暫停期間其他 bind 仍須能讀取（一次性）暫停點。
+                let hook = lock(&self.shared.bind_pre_device_online_hook).take();
+                if let Some(hook) = hook {
+                    hook();
+                }
             }
             // Python：裝置在線 → 回覆前活 session 即 ATTACHING、last_error None，再 spawn attach。
             // 經請求通道的 DeviceOnline 套用並回覆活 session（審查 F70：不得只改回應副本）。
@@ -4399,6 +4849,12 @@ impl SessionManager {
         *lock(&self.shared.finish_attach_op_pre_lock_hook) = Some((by_id.to_string(), hook));
     }
 
+    /// 只供測試（test-fakes）：設定 `session.bind` 送出 `DeviceOnline` 之前的一次性暫停點（見 `bind_pre_device_online_hook`）。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_bind_pre_device_online_hook_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
+        *lock(&self.shared.bind_pre_device_online_hook) = Some(hook);
+    }
+
     /// 只供測試（test-fakes）：下一次建立 attach worker 執行緒時模擬 `Builder::spawn()` 回錯。
     #[cfg(feature = "test-fakes")]
     pub fn fail_next_attach_spawn_for_test(&self) {
@@ -4436,6 +4892,8 @@ impl SessionManager {
             Vec<String>,
             Vec<(String, AttachOp)>,
         );
+        let mut handoff_close: Vec<(String, Preopened)> = Vec::new();
+        let mut handoff_wait: Vec<String> = Vec::new();
         let (entries, inflight, unconsumed): ShutdownTargets = {
             let inner = lock(&self.shared.inner);
             for op in inner.inflight.values() {
@@ -4462,6 +4920,7 @@ impl SessionManager {
             let receipt = op.close_preopened_with_receipt();
             self.shared.finish_attach_op(&by_id, &op, receipt);
         }
+
         let mut waits: Vec<(String, Option<Receiver<Result<PyDict, PyErr>>>)> = Vec::new();
         for (sid, actor) in entries {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -4509,6 +4968,53 @@ impl SessionManager {
         for by_id in inflight {
             out.push((format!("attach:{by_id}"), wait_attach(&by_id)));
             reported.insert(by_id);
+        }
+        // 交給 session、尚未由正式 bridge 接手的 handle（`HandoffEntry`；Python 作業在 `_active_attach_ops`）：session 的
+        // Shutdown 已讓排入的 `open_bridge` 收尾（stopping gate 關閉 handle）；仍未取走者（actor 已忽略 `DeviceAttached`，或
+        // session 為 DETACHED／RELEASED 而未送 Shutdown）代替中止的 attach 關閉，關閉未確認即保留並由末段列為 stalled
+        // （`origin/main:sw_core/session_manager.py:1175-1190`、`:1218-1239`、`_finish_attach_op` `:4322-4332`）；
+        // 已取走者等待開埠收尾。
+        {
+            let mut inner = lock(&self.shared.inner);
+            let mut keys: Vec<String> = inner.handoff.keys().cloned().collect();
+            keys.sort();
+            for by_id in keys {
+                match Shared::claim_handoff_locked(&mut inner, &by_id, false) {
+                    HandoffClaim::Unclaimed { pre: Some(pre), .. } => handoff_close.push((by_id, pre)),
+                    HandoffClaim::Taken => handoff_wait.push(by_id),
+                    HandoffClaim::Unclaimed { pre: None, .. } | HandoffClaim::None => {}
+                }
+            }
+        }
+        for (by_id, pre) in handoff_close {
+            self.shared.close_before_bridge(&by_id, pre.parts);
+        }
+        self.shared.cv.notify_all();
+        for by_id in handoff_wait {
+            if reported.contains(&by_id) {
+                continue;
+            }
+            let settled = {
+                let mut inner = lock(&self.shared.inner);
+                while inner.handoff.get(&by_id).is_some_and(|entry| entry.taken) {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    inner = self
+                        .shared
+                        .cv
+                        .wait_timeout(inner, deadline - now)
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
+                }
+                !inner.handoff.get(&by_id).is_some_and(|entry| entry.taken)
+            };
+            // 開埠收尾後若關閉未確認而保留作業，交由下方末段重收。
+            if !settled || !lock(&self.shared.inner).inflight.contains_key(&by_id) {
+                out.push((format!("attach:{by_id}"), settled));
+                reported.insert(by_id);
+            }
         }
         // Python `shutdown_drain` 末段（`origin/main:sw_core/session_manager.py:1231-1239`）重新收集仍未完成的作業：
         // session 排空期間才登記者（正式 bridge 接手前關閉 handle 失敗而保留的作業，見 `close_before_bridge`）同樣列入。
@@ -4569,6 +5075,12 @@ impl SessionManager {
     pub fn remove_inflight_attach_for_test(&self, by_id: &str) {
         lock(&self.shared.inner).inflight.remove(by_id);
         self.shared.cv.notify_all();
+    }
+
+    /// 只供測試（test-fakes）：指定 by_id 是否有交給 session、尚未由正式 bridge 接手的預開 handle（`HandoffEntry`）。
+    #[cfg(feature = "test-fakes")]
+    pub fn has_handoff_for_test(&self, by_id: &str) -> bool {
+        lock(&self.shared.inner).handoff.contains_key(by_id)
     }
 
     /// 只供測試（test-fakes）：檢查指定 by_id 的在途 attach 標記仍存在。

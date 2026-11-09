@@ -311,7 +311,10 @@ pub struct OpGrant {
 }
 
 /// 未確認關閉的 UART by_id 集合：Python `_draining_by_ids` 的對照（attach 清理 `_track_attach_bridge_stop`
-/// `origin/main:sw_core/session_manager.py:1286-1348`；session drain 未取得安全回條同樣留在表內）。manager 與各
+/// `origin/main:sw_core/session_manager.py:1286-1348`；session drain 未取得安全回條同樣留在表內），另含 Python 作業因
+/// `_finish_attach_op` 關閉失敗而留在 `_attach_ops`／`_preopened_ports`／`_active_attach_ops` 的情形（`:4322-4332`；
+/// actor 不讀 manager 的在途表，以此集合阻擋）。Python 已先自表取出的作業（release／bind／`update_devices` 取出的
+/// 未消費作業 `:3108-3111`、`:3680-3681`、`:4045-4063`）關閉失敗只告警，不登記。manager 與各
 /// session actor 共用；所有會開啟 UART 的入口在開埠前檢查（`attach_device` `:3410-3417`、`_spawn_attach` `:4113`、
 /// `_attach_by_id` `:4847`、`_preopen_*_attach_port` `:4171-4176`／`:4258`）。Python 只在安全回條時移除；Rust 的
 /// handle 只關閉一次、`closed:false` 之後沒有遲到回條，因此登記後持續到 daemon 結束。

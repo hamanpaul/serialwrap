@@ -3295,6 +3295,53 @@ fn bind_with_inflight_attach_op_cancels_waits_3000ms() {
     );
 }
 
+/// wp510 第 14 項：既有 fallback session 重插後的 #181 再偵測（attach worker 持有作業、卡在 open）期間 `release`。
+/// Python 作業在 `_attach_ops`（`_preopen_auto_attach_port` `origin/main:sw_core/session_manager.py:4191`）或
+/// `_active_attach_ops`（`:4238`），`release_device` 取得作業後取消並等待其完成（`:3104-3107`、`:3117-3125`、
+/// `:3188-3204`）；開埠返回見取消即關閉 handle（`:4216-4245`、`_finish_attach_op` `:4320-4365`），release 才回 ok
+/// 並完成 RELEASED。取消後不得送 PROBE、不得把 handle 交給 session。
+#[test]
+fn wp510_review9_release_during_existing_session_redetect_cancels_and_waits() {
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    let real = fallback_session_then_unplug(&m, "/s/by-id/usb-D");
+    m.serial.block_open(&real);
+    m.mgr.update_devices(&m.snapshot());
+    wait_until("再偵測卡在 open", || m.serial.open_attempts(&real) == 2);
+    let closes_before = m.device(&real).close_count();
+    let tx_before = m.device(&real).tx_len();
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+
+    let manager = m.mgr.clone();
+    let release_sid = sid.clone();
+    let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+    let release = std::thread::spawn(move || {
+        let _ = reply_tx.send(wp510_release(&manager, &release_sid));
+    });
+    let early = reply_rx.recv_timeout(Duration::from_millis(300)).ok();
+    let replied_before_open_returned = early.is_some();
+    m.serial.release_open(&real);
+    let reply = match early {
+        Some(reply) => Some(reply),
+        None => reply_rx.recv_timeout(RPC).ok(),
+    };
+    release.join().expect("release thread 不應 panic");
+
+    assert!(
+        !replied_before_open_returned,
+        "release 必須等待在途 attach 作業收尾才回覆"
+    );
+    let reply = rpc(reply.expect("release 應在作業收尾後回覆"));
+    assert!(is_ok(&reply), "{reply:?}");
+    wait_until("取消的作業關閉 handle", || {
+        m.device(&real).close_count() == closes_before + 1
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!m.device(&real).is_open(), "release 後不得留下開啟的 handle");
+    assert_eq!(m.device(&real).tx_len(), tx_before, "取消後不得送 PROBE");
+    assert_eq!(s_of(&m.session("COM0"), "state").as_deref(), Some("RELEASED"));
+    assert!(!m.mgr.has_inflight_attach_for_test("/s/by-id/usb-D"));
+}
+
 #[test]
 fn hotplug_invalidates_pending_attach_op_and_closes_unused_port() {
     // #27：attach op 進行中裝置被拔除 → op 失效；之後拿到的 port 未被消費即關閉（零 TX、不建立 bridge）。
