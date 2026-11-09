@@ -9,7 +9,11 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = [pytest.mark.core_portable, pytest.mark.process_rpc]
+pytestmark = [
+    pytest.mark.core_portable,
+    pytest.mark.process_rpc,
+    pytest.mark.xfail(strict=True, reason="P8-T15 階段 A：契約覆蓋工具尚未實作"),
+]
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "scripts" / "rust" / "contract_coverage.py"
@@ -37,14 +41,21 @@ def _run(*args):
 
 def _results(run: Path, label: str, platform: str, rows: list[dict], **over) -> Path:
     run.mkdir(parents=True, exist_ok=True)
+    cli = run / "cli-artifact"
+    daemon = run / "daemon-artifact"
+    cli.write_bytes(b"synthetic cli artifact")
+    daemon.write_bytes(b"synthetic daemon artifact")
     doc = {
         "label": label,
         "platform": platform,
-        "cli_exe": "x",
-        "cli_sha256": "0" * 64,
-        "daemon_exe": "y",
-        "daemon_sha256": "1" * 64,
+        "cli_exe": str(cli),
+        "cli_sha256": hashlib.sha256(cli.read_bytes()).hexdigest(),
+        "daemon_exe": str(daemon),
+        "daemon_sha256": hashlib.sha256(daemon.read_bytes()).hexdigest(),
         **REV,
+        "contract_revision": _module()._contract_revision(ROOT / "contracts"),
+        "cases_yaml_sha256": hashlib.sha256((ROOT / "tests/acceptance/cases.yaml").read_bytes()).hexdigest(),
+        "cases_lock_sha256": hashlib.sha256((ROOT / "tests/acceptance/cases.lock.json").read_bytes()).hexdigest(),
         "collected": sorted({row["nodeid"] for row in rows}),
         "exit_code": 0,
         "finished": True,
@@ -78,6 +89,17 @@ def test_unmapped_contract_id_is_reported():
     report = cc.evaluate({"rpc_method:unmapped": _item()}, [])
     assert "rpc_method:unmapped" in report["missing"].get("P8", [])
     assert report["missing_reasons"]["rpc_method:unmapped"] == "coverage_map has no nodeid"
+
+
+def test_missing_run_dir_is_rejected(tmp_path):
+    result = _run(
+        "--run-dir", str(tmp_path / "missing-run"),
+        "--only", "rpc_method:mcu.status",
+        "--json", str(tmp_path / "o.json"),
+    )
+    output = json.loads((tmp_path / "o.json").read_text(encoding="utf-8"))
+    assert result.returncode == 1
+    assert output["missing"], "沒有結果檔時不得產生空缺口的成功報告"
 
 
 def test_empty_nodeid_is_not_coverage():
@@ -128,7 +150,12 @@ def test_extractors_match_real_contracts():
     rpc_ids = [item for item in universe if item.startswith("rpc_method:")]
     assert len(rpc_ids) == 55 and "rpc_method:daemon.handoff_stop" in universe
     assert "rpc_method:mcu.status" in universe and "error_code:FLASHING_BUSY" in universe
-    assert "bc:SC-32" in universe and "bc:SC-33" in universe
+    assert "bc:SC-32" in universe
+    assert "bc:SC-33" not in universe, "OD-79 已撤回 SC-33"
+    assert "bc:SC-03" in universe
+    cases = _cc._read_yaml(ROOT / "tests/acceptance/cases.yaml")["cases"]
+    gates_case = next(case for case in cases if case["case_id"] == "s24-xfer-session-gates")
+    assert "SC-03" in gates_case["behavior_changes"] and "SC-33" not in gates_case["behavior_changes"]
     assert "case:s24-flash-sync-replay" in universe
     assert universe["error_code:ECHO_ACK_UNSUPPORTED"]["l1_only"] is True
 
