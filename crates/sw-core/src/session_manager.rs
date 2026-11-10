@@ -1015,13 +1015,29 @@ impl Shared {
     }
 
     /// 關閉 Python 已先自表中取出的未消費預開 handle（release `:3108-3111`、bind `:3680-3681`／`:3776-3778`、裝置改指
-    /// `:4045-4063`），回傳是否確認關閉；`closed:false` 時比照 `_finish_attach_op`（`origin/main:sw_core/session_manager.py:4322-4332`）
-    /// 以 by_id 與 `CloseReceipt.error` 告警。作業已不在任何表內，關閉失敗不保留作業、不登記阻擋（`_draining_by_ids`
-    /// 只由 bridge 排空寫入 `:1324`、`:2774-2775`）。
+    /// `:4045-4063`），回傳是否確認關閉；`closed:false` 時依 D1(iii) 登記永久阻擋。
     fn close_session_preopened(&self, by_id: &str, pre: Preopened) -> bool {
         let receipt = pre.parts.close();
         if !receipt.closed {
-            self.warn(preopened_close_warning(by_id, &close_error_text(&receipt)));
+            let error = close_error_text(&receipt);
+            self.warn(preopened_close_warning(by_id, &error));
+            self.unconfirmed_closes.insert(by_id);
+            let mut inner = lock(&self.inner);
+            if let Some(rec) = inner.custody.custody.get_mut(by_id) {
+                rec.phase = crate::custody::CustodyPhase::CloseFailed { error };
+            }
+        } else {
+            let mut inner = lock(&self.inner);
+            if let Some(rec) = inner.custody.custody.get(by_id) {
+                let token = rec.token;
+                inner.custody.settle_close(
+                    token,
+                    crate::custody::Terminal {
+                        handle: crate::custody::TerminalHandle::Closed,
+                        evidence: crate::custody::TerminalEvidence::Complete,
+                    },
+                );
+            }
         }
         receipt.closed
     }
@@ -1219,6 +1235,11 @@ impl Shared {
     fn retain_unconfirmed_close(&self, by_id: &str) {
         let mut inner = lock(&self.inner);
         self.unconfirmed_closes.insert(by_id);
+        if let Some(rec) = inner.custody.custody.get_mut(by_id) {
+            rec.phase = crate::custody::CustodyPhase::CloseFailed {
+                error: "close unconfirmed".into(),
+            };
+        }
         match inner.inflight.get(by_id) {
             Some(op) => op.close_failed.store(true, Ordering::SeqCst),
             None => {
@@ -2116,7 +2137,7 @@ impl Shared {
             }
         }
 
-        let op = AttachOp::new(&by_id, &self.unconfirmed_closes, false, true, None);
+        let mut op = AttachOp::new(&by_id, &self.unconfirmed_closes, false, true, None);
         {
             let mut inner = lock(&self.inner);
             if inner.stopping {
@@ -2137,6 +2158,20 @@ impl Shared {
             }
             if inner.device_path(&by_id) != Some(real.as_str()) {
                 return Ok(device_not_present_reply(&selector, &by_id));
+            }
+            if let Ok(token) = inner.custody.register(
+                &by_id,
+                &real,
+                crate::custody::CustodyOwner::Session {
+                    sid: sid.to_string(),
+                    inc: 0,
+                },
+                crate::custody::CustodyTaker::PlaceholderOpen {
+                    sid: sid.to_string(),
+                    gen: 0,
+                },
+            ) {
+                op.token = token;
             }
             inner.inflight.insert(by_id.clone(), op.clone());
         }
@@ -2253,12 +2288,16 @@ impl Shared {
             // shutdown／拔除同在 manager 鎖內判定，已 stopping、已取消或裝置已改變時照 Python 的收尾直接關閉
             // （`shutdown_drain` `:1218-1227`、`update_devices` `:4045-4063`）。
             let park = {
-                let inner = lock(&self.inner);
+                let mut inner = lock(&self.inner);
                 let park = !inner.stopping
                     && !op.cancelled.load(Ordering::SeqCst)
                     && inner.device_path(&by_id) == Some(real.as_str());
                 if park {
                     op.parked.store(true, Ordering::SeqCst);
+                    if let Some(rec) = inner.custody.custody.get_mut(&by_id) {
+                        rec.owner = crate::custody::CustodyOwner::Parked;
+                        rec.phase = crate::custody::CustodyPhase::Held { parts: None };
+                    }
                 }
                 park
             };
@@ -2301,19 +2340,19 @@ impl Shared {
             }
         }
         let mut inner = lock(&self.inner);
+        if op.close_failed.load(Ordering::SeqCst) {
+            self.unconfirmed_closes.insert(by_id);
+            if let Some(rec) = inner.custody.custody.get_mut(by_id) {
+                let err = lock(&op.close_error).clone().unwrap_or_else(|| "close unconfirmed".into());
+                rec.phase = crate::custody::CustodyPhase::CloseFailed { error: err };
+            }
+            return;
+        }
         if inner
             .inflight
             .get(by_id)
             .is_some_and(|current| Arc::ptr_eq(&current.cancelled, &op.cancelled))
         {
-            // Python `_finish_attach_op` 對任何取消原因都在 close 失敗時保留作業；不能只在 release
-            // 分支檢查，否則 shutdown／裝置改指會遺失仍可能持有 UART 的阻擋。
-            // 必須在 manager 鎖內重讀：`open_bridge` 的 `retain_unconfirmed_close` 於同一把鎖內把仍在表內的作業
-            // 標為未確認關閉；取鎖前的快照會漏掉該標記而移除作業（wp510 P8-fdc1413-1）。鎖內讀取使兩者線性化：
-            // 標記先發生則此處保留，移除先發生則 retain 另登錄新的阻擋作業。
-            if op.close_failed.load(Ordering::SeqCst) {
-                return;
-            }
             if op.release_requested.load(Ordering::SeqCst) {
                 if let Some(actor) = inner.session_by_id(by_id).map(|entry| entry.actor.clone()) {
                     // Python `_finish_attach_op` 的 release 收尾（`:4340-4363`）：source／reason 取第一個 release 請求。

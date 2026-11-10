@@ -1099,7 +1099,7 @@ fn test_handle_actor_exited_takes_resources_and_produces_close_jobs() {
     ).unwrap();
     {
         let rec = ledger.custody.get_mut("by-id-worker").unwrap();
-        rec.phase = CustodyPhase::Bridged { epoch: worker_epoch, worker: Some(real_worker) };
+        rec.phase = CustodyPhase::Bridged { epoch: worker_epoch, worker: Some(sw_core::custody::ReclaimWorker::Real(real_worker)) };
     }
 
     let mut jobs_worker = ledger.handle_actor_exited(sid, inc);
@@ -1315,3 +1315,395 @@ fn test_wait_for_rx_dispatch_distinguishes_disconnect_and_timeout() {
         err_timeout
     );
 }
+
+#[test]
+fn test_dr1_f_w3_prime_unconfirmed_bridge_handoff_reaper_drain() {
+    let unconfirmed = UnconfirmedCloses::new();
+    let mut ledger = CustodyLedger::new(unconfirmed.clone());
+
+    // 建立一個 Opening 紀錄並進入 Taken
+    let sid = "COM10";
+    let by_id = "by-id-dr1-f";
+    let real_path = "/dev/ttyUSB10";
+    let token = ledger.register(
+        by_id,
+        real_path,
+        CustodyOwner::Session { sid: sid.into(), inc: 1 },
+        CustodyTaker::OpenJob { sid: sid.into(), gen: 1 },
+    ).unwrap();
+
+    // 模擬開埠成功，進入 Bridged { epoch: 100, worker: None }
+    let mock_worker = MockWorker { epoch: 100 };
+    ledger.adopt_bridged_mock(token, 100, mock_worker).unwrap();
+    assert_eq!(
+        ledger.get_custody(by_id).unwrap().snapshot().phase,
+        CustodyPhaseSnapshot::Bridged { epoch: 100, worker_in_ledger: true }
+    );
+
+    // (f1) BridgeOpened send 回 Disconnected：開埠工作者在鎖內轉 BridgeDraining，owner 改 Reaper
+    let _ = ledger.mark_bridge_draining(token, 100, StopId(1)).unwrap();
+    assert_eq!(
+        ledger.get_custody(by_id).unwrap().snapshot().phase,
+        CustodyPhaseSnapshot::BridgeDraining { epoch: 100, stop_id: StopId(1) }
+    );
+
+    // 收到成功回條 handle_closed: true
+    let receipt = WorkerStoppedReceipt {
+        epoch: 100,
+        stop_id: StopId(1),
+        ledger: sw_core::drain::TxLedger::default(),
+        handle_closed: true,
+        close_error: None,
+        unrecorded: Vec::new(),
+        wal_error: None,
+    };
+    let term = ledger.settle_worker_stopped(token, receipt).unwrap();
+    assert_eq!(term.handle, TerminalHandle::Closed);
+    assert_eq!(term.evidence, TerminalEvidence::Complete);
+    assert!(ledger.get_custody(by_id).is_none(), "成功回條後紀錄必須移除");
+    assert!(!unconfirmed.contains(by_id), "成功回條後解除阻擋");
+}
+
+#[test]
+fn test_dr7_parked_handoff_and_deliverer_retry() {
+    let unconfirmed = UnconfirmedCloses::new();
+    let mut ledger = CustodyLedger::new(unconfirmed.clone());
+    let t0 = Instant::now();
+    let clock = FakeInstantClock::new(t0);
+    let gate = clock.gate();
+    let mut deliverer = Deliverer::new(gate);
+
+    let sid = "COM20";
+    let by_id = "by-id-dr7";
+    let real_path = "/dev/ttyUSB20";
+
+    // 1. 模擬退休 ENOSPC 留下 Held { owner: Parked }
+    let token = ledger.register(
+        by_id,
+        real_path,
+        CustodyOwner::Parked,
+        CustodyTaker::Retire { sid: sid.into() },
+    ).unwrap();
+    ledger.save_held_mock(token).unwrap();
+    assert_eq!(ledger.get_custody(by_id).unwrap().owner, CustodyOwner::Parked);
+
+    // 2. bind COM1 -> B3 成功，首次 DeviceOnline 送達失敗 (Full)，記送達義務
+    deliverer.add_obligation_at(sid, by_id, real_path, 1, 1, t0);
+    assert!(deliverer.obligations.contains_key(sid));
+
+    // 3. (k) 送達前 release COM1：取消送達義務
+    deliverer.cancel_obligation(sid, None);
+    assert!(!deliverer.obligations.contains_key(sid), "release 受理時必須取消送達義務");
+
+    // 4. (d) release 讓 Held{Parked} 轉為 Closing
+    let _parts_opt = ledger.claim_for_release(by_id, token).unwrap();
+    assert_eq!(ledger.get_custody(by_id).unwrap().owner, CustodyOwner::Reaper);
+}
+
+#[test]
+fn test_dr9_actor_spawn_failure_cleanup() {
+    let unconfirmed = UnconfirmedCloses::new();
+    let mut ledger = CustodyLedger::new(unconfirmed.clone());
+
+    let sid = "COM30";
+    let by_id = "by-id-dr9";
+    let real_path = "/dev/ttyUSB30";
+    let inc = ledger.alloc_session_inc(sid);
+
+    // W2 熱插 spawn_attach，帳本已有出生即接管的 PROBE handle（owner 為新 sid）
+    let token = ledger.register(
+        by_id,
+        real_path,
+        CustodyOwner::Session { sid: sid.into(), inc },
+        CustodyTaker::Worker("spawn_attach".into()),
+    ).unwrap();
+    ledger.save_held_mock(token).unwrap();
+
+    // 模擬 try_spawn_actor 回 Err，建構者持鎖清理 (C8)
+    let jobs = ledger.handle_spawn_failure(sid, inc);
+    assert_eq!(jobs.len(), 1, "建構失敗應產出關閉工作");
+    assert_eq!(jobs[0].token(), token);
+
+    // 關閉成功 -> terminal Closed
+    let term = jobs.into_iter().next().unwrap().execute_and_settle(&mut ledger, None).unwrap();
+    assert_eq!(term.unwrap().handle, TerminalHandle::Closed);
+    assert!(ledger.get_custody(by_id).is_none(), "關閉成功後紀錄移除");
+    assert!(!unconfirmed.contains(by_id), "未確認關閉集合不含該 by_id");
+}
+
+#[test]
+fn test_actor_repeated_panic_stops_and_settles_custody() {
+    let unconfirmed = UnconfirmedCloses::new();
+    let mut ledger = CustodyLedger::new(unconfirmed.clone());
+
+    let sid = "COM40";
+    let by_id = "by-id-panic-stop";
+    let real_path = "/dev/ttyUSB40";
+    let inc = ledger.alloc_session_inc(sid);
+
+    let token = ledger.register(
+        by_id,
+        real_path,
+        CustodyOwner::Session { sid: sid.into(), inc },
+        CustodyTaker::OpenJob { sid: sid.into(), gen: 1 },
+    ).unwrap();
+    ledger.save_held_mock(token).unwrap();
+
+    // actor 觸發 3 次同型 panic，呼叫 begin_stop(IoError)，停止機制依 ClaimForStop 收尾帳本紀錄
+    let jobs = ledger.claim_for_stop(sid, inc, CustodyCancel::Release);
+    assert_eq!(jobs.len(), 1);
+    let term = jobs.into_iter().next().unwrap().execute_and_settle(&mut ledger, None).unwrap();
+    assert_eq!(term.unwrap().handle, TerminalHandle::Closed);
+    assert!(ledger.get_custody(by_id).is_none());
+}
+
+#[test]
+fn test_dr1_f2_bridge_close_failure_close_failed_and_t1_stall() {
+    let unconfirmed = UnconfirmedCloses::new();
+    let mut ledger = CustodyLedger::new(unconfirmed.clone());
+
+    let sid = "COM12";
+    let by_id = "by-id-dr1-f2";
+    let real_path = "/dev/ttyUSB12";
+    let token = ledger.register(
+        by_id,
+        real_path,
+        CustodyOwner::Session { sid: sid.into(), inc: 1 },
+        CustodyTaker::OpenJob { sid: sid.into(), gen: 1 },
+    ).unwrap();
+
+    let _ = ledger.mark_bridge_draining(token, 100, StopId(2)).unwrap();
+
+    // (f2) 收到失敗回條 handle_closed: false
+    let receipt = WorkerStoppedReceipt {
+        epoch: 100,
+        stop_id: StopId(2),
+        ledger: sw_core::drain::TxLedger::default(),
+        handle_closed: false,
+        close_error: Some(PalError::plain(PalErrorKind::Io, "injected close error")),
+        unrecorded: Vec::new(),
+        wal_error: None,
+    };
+    let term = ledger.settle_worker_stopped(token, receipt).unwrap();
+    assert!(matches!(term.handle, TerminalHandle::Failed { .. }));
+    assert!(unconfirmed.contains(by_id), "D1 (iii): 失敗回條必須永久登記未確認關閉");
+    let custody = ledger.get_custody(by_id).expect("紀錄必須保留為 CloseFailed");
+    assert!(matches!(custody.snapshot().phase, CustodyPhaseSnapshot::CloseFailed { .. }));
+    assert!(ledger.is_open_blocked(by_id), "開埠一律被阻擋");
+
+    // T-1: 首次 release 取得或設立 3 秒期限
+    let t0 = Instant::now();
+    let dl1 = ledger.get_or_set_release_deadline(by_id, t0);
+    assert_eq!(dl1, t0 + Duration::from_millis(3000));
+    // 之後的 release 沿用同一期限
+    let dl2 = ledger.get_or_set_release_deadline(by_id, t0 + Duration::from_secs(5));
+    assert_eq!(dl2, dl1, "之後的 release 必須沿用首次期限");
+}
+
+#[test]
+fn test_dr1_f3_f4_actor_exited_before_adopt_bridge() {
+    let unconfirmed = UnconfirmedCloses::new();
+    let mut ledger = CustodyLedger::new(unconfirmed.clone());
+
+    let sid = "COM13";
+    let by_id = "by-id-dr1-f3";
+    let real_path = "/dev/ttyUSB13";
+    let inc = ledger.alloc_session_inc(sid);
+
+    let token = ledger.register(
+        by_id,
+        real_path,
+        CustodyOwner::Session { sid: sid.into(), inc },
+        CustodyTaker::OpenJob { sid: sid.into(), gen: 1 },
+    ).unwrap();
+
+    // 模擬已開埠成功，IoWorker 放在帳本中（Bridged），但 actor 在 AdoptBridge 前結束
+    let mock_worker = MockWorker { epoch: 101 };
+    ledger.adopt_bridged_mock(token, 101, mock_worker).unwrap();
+
+    // ActorExited 命令到達：回收者接手排空
+    let jobs = ledger.handle_actor_exited(sid, inc);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(
+        ledger.get_custody(by_id).unwrap().snapshot().phase,
+        CustodyPhaseSnapshot::BridgeDraining { epoch: 101, stop_id: StopId(0) }
+    );
+
+    // (f3) handle_closed: true 成功排空
+    let receipt = WorkerStoppedReceipt {
+        epoch: 101,
+        stop_id: StopId(0),
+        ledger: sw_core::drain::TxLedger::default(),
+        handle_closed: true,
+        close_error: None,
+        unrecorded: Vec::new(),
+        wal_error: None,
+    };
+    let term = ledger.settle_worker_stopped(token, receipt).unwrap();
+    assert_eq!(term.handle, TerminalHandle::Closed);
+    assert!(ledger.get_custody(by_id).is_none());
+}
+
+#[test]
+fn test_dr1_f5_reclaim_drain_after_adopt_bridge_claim_unwind() {
+    let unconfirmed = UnconfirmedCloses::new();
+    let mut ledger = CustodyLedger::new(unconfirmed.clone());
+
+    let sid = "COM15";
+    let by_id = "by-id-dr1-f5";
+    let real_path = "/dev/ttyUSB15";
+    let inc = ledger.alloc_session_inc(sid);
+
+    let token = ledger.register(
+        by_id,
+        real_path,
+        CustodyOwner::Session { sid: sid.into(), inc },
+        CustodyTaker::OpenJob { sid: sid.into(), gen: 1 },
+    ).unwrap();
+
+    // 放入 mock worker
+    ledger.adopt_bridged_mock(token, 102, MockWorker { epoch: 102 }).unwrap();
+
+    // AdoptBridge 取出後發生 unwind，Reclaim 守衛送出 reclaim 請求轉由回收者排空
+    let jobs = ledger.claim_for_stop(sid, inc, CustodyCancel::Release);
+    assert_eq!(jobs.len(), 1);
+    let (reaper_tx, _reaper_rx) = crossbeam_channel::unbounded();
+    let term_opt = jobs.into_iter().next().unwrap().execute_and_settle(&mut ledger, Some(&reaper_tx)).unwrap();
+    assert!(term_opt.is_none(), "DrainBridge 轉入 BridgeDraining，等待回條");
+    let receipt = WorkerStoppedReceipt {
+        epoch: 102,
+        stop_id: StopId(0),
+        ledger: sw_core::drain::TxLedger::default(),
+        handle_closed: true,
+        close_error: None,
+        unrecorded: Vec::new(),
+        wal_error: None,
+    };
+    let term = ledger.settle_worker_stopped(token, receipt).unwrap();
+    assert_eq!(term.handle, TerminalHandle::Closed);
+    assert!(ledger.get_custody(by_id).is_none());
+}
+
+#[test]
+fn test_dr1_f6_f7_f8_reaper_drain_evidence_gaps_and_wal_error() {
+    let unconfirmed = UnconfirmedCloses::new();
+    let mut ledger = CustodyLedger::new(unconfirmed.clone());
+
+    let sid = "COM16";
+    let by_id = "by-id-dr1-f6";
+    let real_path = "/dev/ttyUSB16";
+
+    let token = ledger.register(
+        by_id,
+        real_path,
+        CustodyOwner::Session { sid: sid.into(), inc: 1 },
+        CustodyTaker::OpenJob { sid: sid.into(), gen: 1 },
+    ).unwrap();
+
+    let _ = ledger.mark_bridge_draining(token, 103, StopId(3)).unwrap();
+
+    // (f6)(f7)(f8): handle_closed: true, 但有 RX 缺口和 wal_error
+    let gap = sw_core::drain::EvidenceGap {
+        op_id: None,
+        dir: "rx",
+        len: 0,
+        error: PalError::plain(PalErrorKind::Io, "RX drain barrier 未能送入回收者"),
+    };
+    let receipt = WorkerStoppedReceipt {
+        epoch: 103,
+        stop_id: StopId(3),
+        ledger: sw_core::drain::TxLedger::default(),
+        handle_closed: true,
+        close_error: None,
+        unrecorded: vec![gap],
+        wal_error: Some(PalError::plain(PalErrorKind::Io, "drain WAL 不健康")),
+    };
+    let term = ledger.settle_worker_stopped(token, receipt).unwrap();
+    assert_eq!(term.handle, TerminalHandle::Closed, "handle 成功關閉");
+    assert!(
+        matches!(term.evidence, TerminalEvidence::Incomplete { .. }),
+        "有缺口時 evidence 必須為 Incomplete"
+    );
+    assert!(ledger.get_custody(by_id).is_none(), "handle 成功關閉即解除帳本登記");
+    assert!(!unconfirmed.contains(by_id), "解除未確認關閉阻擋");
+}
+
+#[test]
+fn test_dr7_l_m_actor_exited_cancels_obligation_and_com2_independent() {
+    let unconfirmed = UnconfirmedCloses::new();
+    let mut ledger = CustodyLedger::new(unconfirmed.clone());
+    let t0 = Instant::now();
+    let clock = FakeInstantClock::new(t0);
+    let mut deliverer = Deliverer::new(clock.gate());
+
+    let sid1 = "COM1";
+    let by_id1 = "by-id-com1";
+    let sid2 = "COM2";
+    let by_id2 = "by-id-com2";
+
+    // COM1 登記送達義務
+    deliverer.add_obligation_at(sid1, by_id1, "/dev/ttyCOM1", 1, 1, t0);
+    assert!(deliverer.obligations.contains_key(sid1));
+
+    // (l) 送達前 COM1 actor 結束（世代號 1）：移除義務
+    deliverer.cancel_obligation(sid1, Some(1));
+    assert!(!deliverer.obligations.contains_key(sid1), "actor 結束必須清除送達義務");
+
+    // (m) COM2 的未接手 worker 交給回收者排空，不等 COM1
+    let token2 = ledger.register(
+        by_id2,
+        "/dev/ttyCOM2",
+        CustodyOwner::Session { sid: sid2.into(), inc: 1 },
+        CustodyTaker::OpenJob { sid: sid2.into(), gen: 1 },
+    ).unwrap();
+    let _ = ledger.mark_bridge_draining(token2, 200, StopId(20)).unwrap();
+    let receipt2 = WorkerStoppedReceipt {
+        epoch: 200,
+        stop_id: StopId(20),
+        ledger: sw_core::drain::TxLedger::default(),
+        handle_closed: true,
+        close_error: None,
+        unrecorded: Vec::new(),
+        wal_error: None,
+    };
+    let term2 = ledger.settle_worker_stopped(token2, receipt2).unwrap();
+    assert_eq!(term2.handle, TerminalHandle::Closed);
+    assert!(ledger.get_custody(by_id2).is_none());
+}
+
+#[test]
+fn test_dr9_b_c_spawn_failure_dynamic_and_yaml() {
+    let unconfirmed = UnconfirmedCloses::new();
+    let mut ledger = CustodyLedger::new(unconfirmed.clone());
+
+    // (b) 動態建立失敗
+    let sid_b = "COM51";
+    let inc_b = ledger.alloc_session_inc(sid_b);
+    let token_b = ledger.register(
+        "by-id-dyn",
+        "/dev/ttyDyn",
+        CustodyOwner::Session { sid: sid_b.into(), inc: inc_b },
+        CustodyTaker::Worker("dynamic_create".into()),
+    ).unwrap();
+    ledger.save_held_mock(token_b).unwrap();
+    let jobs_b = ledger.handle_spawn_failure(sid_b, inc_b);
+    assert_eq!(jobs_b.len(), 1);
+    let term_b = jobs_b.into_iter().next().unwrap().execute_and_settle(&mut ledger, None).unwrap();
+    assert_eq!(term_b.unwrap().handle, TerminalHandle::Closed);
+
+    // (c) 啟動 YAML target 失敗
+    let sid_c = "COM52";
+    let inc_c = ledger.alloc_session_inc(sid_c);
+    let token_c = ledger.register(
+        "by-id-yaml",
+        "/dev/ttyYaml",
+        CustodyOwner::Session { sid: sid_c.into(), inc: inc_c },
+        CustodyTaker::Worker("yaml_start".into()),
+    ).unwrap();
+    ledger.save_held_mock(token_c).unwrap();
+    let jobs_c = ledger.handle_spawn_failure(sid_c, inc_c);
+    assert_eq!(jobs_c.len(), 1);
+    let term_c = jobs_c.into_iter().next().unwrap().execute_and_settle(&mut ledger, None).unwrap();
+    assert_eq!(term_c.unwrap().handle, TerminalHandle::Closed);
+}
+

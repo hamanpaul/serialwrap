@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use support::*;
 use sw_core::session_core::{SessionRequest, SessionState};
 use sw_core::session_manager::SessionManager;
+use sw_core::custody::CustodyPhaseSnapshot;
 use sw_core::state_store::{LoadedState, ReleasedRow};
 use sw_pal::fakes::serial::FakeWriteStep;
 use sw_pal::traits::{
@@ -2057,7 +2058,9 @@ fn wp510_lifecycle_shutdown_cancel_fail_close_keeps_placeholder_blocked() {
     );
     attach.join().expect("attach worker 不應 panic");
 
-    let still_blocked = m.mgr.has_inflight_attach_for_test(BY_ID);
+    let custody = m.mgr.custody_for_test(BY_ID).expect("custody entry");
+    assert!(matches!(custody.phase, CustodyPhaseSnapshot::CloseFailed { .. }), "CloseFailed");
+    assert!(m.mgr.unconfirmed_close_for_test(BY_ID), "unconfirmed_close");
     let second_shutdown = m.mgr.shutdown(Duration::from_millis(100));
     let release_started = Instant::now();
     let release_reply = rpc(wp510_release(&m.mgr, &sid));
@@ -2072,7 +2075,6 @@ fn wp510_lifecycle_shutdown_cancel_fail_close_keeps_placeholder_blocked() {
     assert_eq!(code_of(&attach_reply).as_deref(), Some("SESSION_RECOVERING"));
     assert_eq!(device.close_count(), 1);
     assert!(device.is_open(), "fail_close 後 handle 仍須保持 open");
-    assert!(still_blocked, "shutdown 取消的 close:false 必須保留 inflight");
     assert!(
         second_shutdown
             .iter()
@@ -2120,7 +2122,9 @@ fn wp510_lifecycle_device_path_change_cancel_fail_close_keeps_placeholder_blocke
     );
     attach.join().expect("attach worker 不應 panic");
 
-    let still_blocked = m.mgr.has_inflight_attach_for_test(BY_ID);
+    let custody = m.mgr.custody_for_test(BY_ID).expect("custody entry");
+    assert!(matches!(custody.phase, CustodyPhaseSnapshot::CloseFailed { .. }), "CloseFailed");
+    assert!(m.mgr.unconfirmed_close_for_test(BY_ID), "unconfirmed_close");
     let release_started = Instant::now();
     let release_reply = rpc(wp510_release(&m.mgr, &sid));
     let release_elapsed = release_started.elapsed();
@@ -2128,7 +2132,6 @@ fn wp510_lifecycle_device_path_change_cancel_fail_close_keeps_placeholder_blocke
     assert_eq!(code_of(&attach_reply).as_deref(), Some("DEVICE_NOT_PRESENT"));
     assert_eq!(device.close_count(), 1);
     assert!(device.is_open(), "fail_close 後 handle 仍須保持 open");
-    assert!(still_blocked, "裝置改指取消的 close:false 必須保留 inflight");
     assert_eq!(code_of(&release_reply).as_deref(), Some("DRAIN_STALLED"));
     assert!(release_elapsed >= Duration::from_millis(2500));
 }
@@ -4577,10 +4580,9 @@ fn wp510_review5_release_waiting_bridge_open_fail_close_reports_drain_stalled() 
         "未確認關閉的 handle 不得完成 release"
     );
     assert!(device.is_open(), "closed:false 表示 handle 仍開啟");
-    assert!(
-        m.mgr.has_inflight_attach_for_test(BY_ID),
-        "未確認關閉的 handle 必須持續阻擋"
-    );
+    let custody = m.mgr.custody_for_test(BY_ID).expect("custody entry");
+    assert!(matches!(custody.phase, CustodyPhaseSnapshot::CloseFailed { .. }));
+    assert!(m.mgr.unconfirmed_close_for_test(BY_ID));
     assert!(
         !m.load_state_now().released.contains_key(&formal),
         "release 未收斂不得持久化 RELEASED"
@@ -4607,10 +4609,9 @@ fn wp510_review5_configure_failure_fail_close_keeps_handle_in_drain() {
     });
 
     assert!(device.is_open(), "closed:false 表示 handle 仍開啟");
-    assert!(
-        m.mgr.has_inflight_attach_for_test(BY_ID),
-        "未確認關閉的 handle 必須持續阻擋"
-    );
+    let custody = m.mgr.custody_for_test(BY_ID).expect("custody entry");
+    assert!(matches!(custody.phase, CustodyPhaseSnapshot::CloseFailed { .. }), "CloseFailed");
+    assert!(m.mgr.unconfirmed_close_for_test(BY_ID), "unconfirmed_close");
     let started = Instant::now();
     let reply = rpc(wp510_release(&m.mgr, "t:COM3"));
     assert_eq!(code_of(&reply).as_deref(), Some("DRAIN_STALLED"), "{reply:?}");

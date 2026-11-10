@@ -53,7 +53,7 @@ pub enum CustodyPhase {
     Opening { taker: CustodyTaker },
     Held { parts: Option<HandleParts> },
     Taken { taker: CustodyTaker },
-    Bridged { epoch: u64, worker: Option<IoWorker> },
+    Bridged { epoch: u64, worker: Option<ReclaimWorker> },
     BridgeDraining { epoch: u64, stop_id: StopId },
     Closing { job: String },
     CloseFailed { error: String },
@@ -189,7 +189,7 @@ pub enum ActorExitedJob {
         by_id: String,
         epoch: u64,
         stop_id: StopId,
-        worker: Option<IoWorker>,
+        worker: Option<ReclaimWorker>,
     },
 }
 
@@ -335,6 +335,13 @@ impl ReclaimWorker {
         match self {
             ReclaimWorker::Real(w) => w.epoch(),
             ReclaimWorker::Mock(w) => w.epoch,
+        }
+    }
+
+    pub fn finish_async(self, stop_id: StopId, control: Sender<ControlEvent>) {
+        match self {
+            ReclaimWorker::Real(w) => w.finish_async(stop_id, control),
+            ReclaimWorker::Mock(_) => {}
         }
     }
 }
@@ -554,6 +561,166 @@ impl CustodyLedger {
         Err("token not found")
     }
 
+    /// W3': adopt 提交時將 IoWorker 放入帳本。
+    pub fn adopt_bridged(&mut self, token: u64, epoch: u64, worker: IoWorker) -> Result<(), &'static str> {
+        for rec in self.custody.values_mut() {
+            if rec.token == token {
+                rec.phase = CustodyPhase::Bridged {
+                    epoch,
+                    worker: Some(ReclaimWorker::Real(worker)),
+                };
+                return Ok(());
+            }
+        }
+        Err("token not found")
+    }
+
+    /// 測試輔助：以 MockWorker 轉為 Bridged。
+    #[cfg(feature = "test-fakes")]
+    pub fn adopt_bridged_mock(&mut self, token: u64, epoch: u64, mock: MockWorker) -> Result<(), &'static str> {
+        for rec in self.custody.values_mut() {
+            if rec.token == token {
+                rec.phase = CustodyPhase::Bridged {
+                    epoch,
+                    worker: Some(ReclaimWorker::Mock(mock)),
+                };
+                return Ok(());
+            }
+        }
+        Err("token not found")
+    }
+
+    /// W3': AdoptBridge 在 actor 執行緒上自帳本取出 IoWorker。
+    pub fn claim_bridged_worker(&mut self, token: u64, epoch: u64) -> Result<IoWorker, &'static str> {
+        for rec in self.custody.values_mut() {
+            if rec.token == token {
+                match &mut rec.phase {
+                    CustodyPhase::Bridged { epoch: ep, worker } if *ep == epoch => {
+                        let w = worker.take().ok_or("worker already claimed")?;
+                        match w {
+                            ReclaimWorker::Real(real) => return Ok(real),
+                            ReclaimWorker::Mock(_) => return Err("mock worker cannot be converted to IoWorker"),
+                        }
+                    }
+                    _ => return Err("invalid phase or epoch mismatch"),
+                }
+            }
+        }
+        Err("token not found")
+    }
+
+    /// W3': 放入 actor 的 workers 後自帳本移除紀錄。
+    pub fn remove_bridged(&mut self, token: u64) {
+        let by_id_found = self.custody.iter().find_map(|(k, v)| (v.token == token).then(|| k.clone()));
+        if let Some(by_id) = by_id_found {
+            self.custody.remove(&by_id);
+            self.tombstones.insert(token);
+        }
+    }
+
+    /// D4 / DR-7: release 認領未消費的 parked 紀錄並轉 Closing 由關閉工作者關閉。
+    pub fn claim_for_release(&mut self, by_id: &str, token: u64) -> Result<Option<HandleParts>, &'static str> {
+        let rec = self.custody.get_mut(by_id).ok_or("not found")?;
+        if rec.token != token {
+            return Err("token mismatch");
+        }
+        rec.owner = CustodyOwner::Reaper;
+        rec.cancel = Some(CustodyCancel::Release);
+        match std::mem::replace(&mut rec.phase, CustodyPhase::Closing { job: "release".into() }) {
+            CustodyPhase::Held { parts } => Ok(parts),
+            other => {
+                rec.phase = other;
+                Err("not held")
+            }
+        }
+    }
+
+    /// C8 / DR-9: actor 建構失敗時清理並產出關閉工作。
+    pub fn handle_spawn_failure(&mut self, sid: &str, inc: u64) -> Vec<ActorExitedJob> {
+        self.handle_actor_exited(sid, inc)
+    }
+
+    /// session 停止機制（ClaimForStop / begin_stop）收尾帳本紀錄。
+    pub fn claim_for_stop(&mut self, sid: &str, inc: u64, cancel: CustodyCancel) -> Vec<ActorExitedJob> {
+        let current_inc = self.current_session_inc(sid);
+        if inc != current_inc {
+            return Vec::new();
+        }
+        let mut jobs = Vec::new();
+        for (by_id, rec) in self.custody.iter_mut() {
+            if let CustodyOwner::Session { sid: s, inc: i } = &rec.owner {
+                if s == sid && *i == inc {
+                    rec.cancel = Some(cancel);
+                    match &mut rec.phase {
+                        CustodyPhase::Held { parts } => {
+                            let parts_taken = parts.take();
+                            rec.phase = CustodyPhase::Closing { job: "stop".into() };
+                            rec.owner = CustodyOwner::Reaper;
+                            jobs.push(ActorExitedJob::CloseHeld {
+                                token: rec.token,
+                                by_id: by_id.clone(),
+                                parts: parts_taken,
+                            });
+                        }
+                        CustodyPhase::Bridged { epoch, worker } => {
+                            if let Some(w) = worker.take() {
+                                let ep = *epoch;
+                                let stop_id = StopId(0);
+                                rec.phase = CustodyPhase::BridgeDraining { epoch: ep, stop_id };
+                                rec.owner = CustodyOwner::Reaper;
+                                jobs.push(ActorExitedJob::DrainBridge {
+                                    token: rec.token,
+                                    by_id: by_id.clone(),
+                                    epoch: ep,
+                                    stop_id,
+                                    worker: Some(w),
+                                });
+                            }
+                            // 若 worker 為 None，表示已由 AdoptBridge 取出，在 Reclaim 守衛保護下，留給 Reclaim 命令處理（C8）
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        jobs
+    }
+
+    /// 取得或設定首次 release 期限（now + 3000 ms）。
+    pub fn get_or_set_release_deadline(&mut self, by_id: &str, now: Instant) -> Instant {
+        if let Some(rec) = self.custody.get_mut(by_id) {
+            if let Some(dl) = rec.release_deadline {
+                dl
+            } else {
+                let dl = now + Duration::from_millis(3000);
+                rec.release_deadline = Some(dl);
+                dl
+            }
+        } else {
+            now + Duration::from_millis(3000)
+        }
+    }
+
+    /// C1 by-id 閘門檢查。
+    pub fn is_open_blocked(&self, by_id: &str) -> bool {
+        if self.unconfirmed.contains(by_id) {
+            return true;
+        }
+        if let Some(rec) = self.custody.get(by_id) {
+            matches!(
+                rec.phase,
+                CustodyPhase::CloseFailed { .. }
+                    | CustodyPhase::Closing { .. }
+                    | CustodyPhase::BridgeDraining { .. }
+                    | CustodyPhase::Opening { .. }
+                    | CustodyPhase::Taken { .. }
+                    | CustodyPhase::Bridged { .. }
+            )
+        } else {
+            false
+        }
+    }
+
     pub fn get_custody(&self, by_id: &str) -> Option<&Custody> {
         self.custody.get(by_id)
     }
@@ -567,7 +734,7 @@ impl CustodyLedger {
         token: u64,
         epoch: u64,
         stop_id: StopId,
-    ) -> Result<Option<IoWorker>, &'static str> {
+    ) -> Result<Option<ReclaimWorker>, &'static str> {
         for rec in self.custody.values_mut() {
             if rec.token == token {
                 let worker = match &mut rec.phase {

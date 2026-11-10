@@ -3072,25 +3072,19 @@ impl SessionCore {
     }
 
     /// 開埠在途的 stop 收到 `OpenFailure::CloseUnconfirmed`：正式 bridge 接手前的 handle 關閉回條為 `closed:false`。
-    /// Python `_finish_attach_op` 關閉失敗即回 False、保留作業且不設 `done`（`origin/main:sw_core/session_manager.py:4322-4332`），
-    /// release 因而回 DRAIN_STALLED（`:3192-3204`）、shutdown 列為 stalled（`:1231-1239`）。比照 `worker_stopped` 的
-    /// `handle_closed:false`：pending stop 標為 stalled 並保留（不清 `drain_stalled`、不寫 DETACHED／RELEASED），
-    /// release 等待者回 DRAIN_STALLED，其餘等待者（shutdown）不回覆，排空判定維持未收斂。
-    fn pending_open_close_unconfirmed(&mut self, now: Mono) -> Vec<Effect> {
-        let mut reply_waiters = Vec::new();
+    /// Python `_finish_attach_op` 關閉失敗即回 False、保留作業且不設 `done`（`origin/main:sw_core/session_manager.py:4322-4332`）。
+    /// D1 + T-1: 處理失敗回條時只標記 stalled 並保留，不立即回覆 release waiter，也不改 session 的 drain 欄位；
+    /// 留由既有的期限計時器（`mark_drain_timeout`）回 DRAIN_STALLED，期限已過之後的 release 才立即回。
+    fn pending_open_close_unconfirmed(&mut self, _now: Mono) -> Vec<Effect> {
         if let Some(pending) = &mut self.pending_open_stop {
             pending.stalled = true;
-            if pending.kind == StopKind::Release {
-                reply_waiters.append(&mut pending.waiters);
+            if pending.kind != StopKind::Release {
+                self.drain_stalled = true;
+                self.drain_timeout_epoch = Some(self.generations.bridge_generation);
             }
         }
-        self.drain_stalled = true;
-        self.drain_timeout_epoch = Some(self.generations.bridge_generation);
         self.placeholder_attach_stall_token = None;
-        reply_waiters
-            .into_iter()
-            .map(|waiter| Effect::Reply(waiter, Ok(self.drain_stalled_reply(now))))
-            .collect()
+        Vec::new()
     }
 
     fn finish_pending_open_stop(&mut self, pending: PendingOpenStop, now: Mono) -> Vec<Effect> {
@@ -3187,7 +3181,22 @@ impl SessionCore {
             return effects;
         }
         if !receipt.handle_closed {
-            effects.extend(self.pending_open_close_unconfirmed(now));
+            // R2 過渡期：retired drain 維持現狀（等待期間收到失敗立即回覆，設計 §4、§3.1.6 第二處），R3 改為 T-1。
+            let mut reply_waiters = Vec::new();
+            if let Some(pending) = &mut self.pending_open_stop {
+                pending.stalled = true;
+                if pending.kind == StopKind::Release {
+                    reply_waiters.append(&mut pending.waiters);
+                }
+            }
+            self.drain_stalled = true;
+            self.drain_timeout_epoch = Some(self.generations.bridge_generation);
+            self.placeholder_attach_stall_token = None;
+            effects.extend(
+                reply_waiters
+                    .into_iter()
+                    .map(|waiter| Effect::Reply(waiter, Ok(self.drain_stalled_reply(now)))),
+            );
             return effects;
         }
         let settled = self.retired_open_closes.is_empty()
@@ -4368,18 +4377,20 @@ impl SessionCore {
             return Vec::new();
         }
         if let Some(pending) = &mut self.pending_open_stop {
-            if pending.generation == epoch && pending.id == stop_id && !pending.stalled {
+            if pending.generation == epoch && pending.id == stop_id {
                 pending.stalled = true;
                 self.drain_stalled = true;
                 self.drain_timeout_epoch = Some(stalled_epoch);
                 self.placeholder_attach_stall_token = None;
                 if pending.kind == StopKind::Release {
                     let waiters: Vec<_> = pending.waiters.drain(..).collect();
-                    let response = self.drain_stalled_reply(now);
-                    return waiters
-                        .into_iter()
-                        .map(|waiter| Effect::Reply(waiter, Ok(response.clone())))
-                        .collect();
+                    if !waiters.is_empty() {
+                        let response = self.drain_stalled_reply(now);
+                        return waiters
+                            .into_iter()
+                            .map(|waiter| Effect::Reply(waiter, Ok(response.clone())))
+                            .collect();
+                    }
                 }
             }
         }

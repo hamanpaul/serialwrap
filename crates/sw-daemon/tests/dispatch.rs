@@ -18,6 +18,7 @@ use sw_pal::traits::{
 };
 use sw_proto::pycompat::iso_utc_now;
 use sw_proto::pyjson::{PyDict, PyValue, RPC_WIRE, dumps};
+use sw_core::custody::CustodyPhaseSnapshot;
 
 /// `foreign_holders` 會讀取行程內共用的 holder_unknown 登錄（#11）；登錄／精確比對 foreign_holders 的測試彼此序列化。
 static HOLDER_REGISTRY: Mutex<()> = Mutex::new(());
@@ -6830,41 +6831,34 @@ fn wp510_review8_rpc_bind_retry_parked_close_unconfirmed_keeps_block() {
     assert_eq!(dev.close_count(), 1, "已嘗試關閉未消費的預開 handle");
     assert!(dev.is_open(), "closed:false 表示 handle 仍開啟");
     assert!(
-        !r.mgr.unconfirmed_close_for_test(WP510_PLACEHOLDER_BY_ID),
-        "Python 先取出作業再關閉，關閉失敗只告警，不登記 _draining_by_ids"
+        r.mgr.unconfirmed_close_for_test(WP510_PLACEHOLDER_BY_ID),
+        "D1: 關閉失敗必須登記未確認關閉阻擋"
     );
+    let custody = r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).expect("custody entry");
     assert!(
-        !r.mgr.has_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID),
-        "已取出的作業不留在在途表"
+        matches!(custody.phase, CustodyPhaseSnapshot::CloseFailed { .. }),
+        "D1: 帳本紀錄必須轉為 CloseFailed"
     );
 
-    wait_until("改綁收尾照常重新開埠", || dev.open_attempts() > attempts);
-    r.wait_state("COM1", "DETACHED");
-    let detached = r.session("COM1").expect("COM1 session");
-    assert_eq!(
-        detached.get("last_error"),
-        Some(&PyValue::from("ATTACH_FAILED:DeviceHeldError")),
-        "{}",
-        j(&detached)
-    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(dev.open_attempts(), attempts, "D1: 未確認關閉不得重新開埠");
+    let com1_session = r.session("COM1").expect("COM1 session");
+    assert_eq!(s(&com1_session, "state"), "ATTACHING");
     assert_eq!(dev.tx_len(), tx_before, "開埠失敗不得送 TX");
 
-    let reopen_attempts = dev.open_attempts();
     let again = r.call(
         "session.bind",
         &format!(r#"{{"selector":"COM1","device_by_id":"{WP510_PLACEHOLDER_BY_ID}"}}"#),
     );
     assert_eq!(again.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&again));
-    wait_until("之後的 bind 同樣重新開埠", || dev.open_attempts() > reopen_attempts);
-    r.wait_state("COM1", "DETACHED");
-    let attach_attempts = dev.open_attempts();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(dev.open_attempts(), attempts, "D1: 之後的 bind 同樣不得開埠");
+
     let attached = r.call("device.attach", r#"{"selector":"COM1"}"#);
-    assert_eq!(s(&attached, "error_code"), "DEVICE_STILL_HELD", "{}", j(&attached));
-    assert_eq!(attached.get("pids"), Some(&PyValue::List(Vec::new())), "{}", j(&attached));
-    assert_eq!(attached.get("holder_unknown"), Some(&PyValue::Bool(true)), "{}", j(&attached));
-    assert!(dev.open_attempts() > attach_attempts, "device.attach 照常嘗試開埠");
+    assert_eq!(s(&attached, "error_code"), "SESSION_RECOVERING", "{}", j(&attached));
+    assert_eq!(dev.open_attempts(), attempts, "device.attach 不得嘗試開埠");
     assert_eq!(dev.tx_len(), tx_before);
-    assert!(!r.mgr.unconfirmed_close_for_test(WP510_PLACEHOLDER_BY_ID));
+    assert!(r.mgr.unconfirmed_close_for_test(WP510_PLACEHOLDER_BY_ID));
 }
 
 /// wp510 第 14 項前置：佔位退休落盤失敗留下未消費的預開作業（Python `_preopened_ports`），COM1 先 `device.release`
@@ -6970,10 +6964,9 @@ fn wp510_review9_rpc_release_before_bind_device_online_close_unconfirmed_drain_s
     assert!(elapsed >= Duration::from_millis(2500), "release 須等待作業至期限：{elapsed:?}");
     assert_eq!(dev.close_count(), 1, "已嘗試關閉預開 handle");
     assert!(dev.is_open(), "closed:false 表示 handle 仍開啟");
-    assert!(
-        r.mgr.has_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID),
-        "作業未被取出，關閉失敗須保留"
-    );
+    let custody = r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).expect("custody entry");
+    assert!(matches!(custody.phase, CustodyPhaseSnapshot::CloseFailed { .. }));
+    assert!(r.mgr.unconfirmed_close_for_test(WP510_PLACEHOLDER_BY_ID));
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(dev.open_attempts(), attempts, "DRAIN_STALLED 之後不得重新開埠");
     assert_eq!(dev.tx_len(), tx_before);
