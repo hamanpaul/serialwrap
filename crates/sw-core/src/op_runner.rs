@@ -19,7 +19,7 @@ use sw_proto::pydict;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 use sw_proto::pyre::{PyFlags, PyRegex, compile, valid_completion_regex};
 
-use crate::arbiter::{QueuedCommand, SubmitOrigin};
+use crate::arbiter::QueuedCommand;
 use crate::file_transfer::{
     pull_file, push_file, OpTransferPort, PullParams, PushParams, RejectReason, StdLocalFiles, TransferAbort,
     TransferIds, TxRejection,
@@ -770,8 +770,11 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
         }
     }
     if !matched {
-        if matches!(q.req.origin, SubmitOrigin::HumanConsole { .. }) {
-            // `_recover_after_failure` human 分支（DF-02）：不送救援鍵；actor 依前景來源改開 human lease。
+        if q.req.is_trusted_human() {
+            // `_recover_after_failure` human 分支（DF-02／OD-74，Python `session_manager.py:6988-7012`）：可信 human
+            // ＝RPC 依原始 source 判定的 `trusted_human` OR line editor 的 `HumanConsole`（rulings s2 D5），永不看
+            // source 字首；不送救援鍵（CTRL_C／CTRL_D），actor 依前景快照改開 human lease。明寫 `human:<x>` 的
+            // RPC（`trusted_human=false`）照常進下方 agent 救援。
             return OpOutcome::PromptTimeout {
                 stdout: clean_text(&ctx.rx.text_from(pre_offset)),
             };
