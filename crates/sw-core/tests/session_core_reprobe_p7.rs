@@ -596,3 +596,216 @@ fn wp510_review7_detached_reprobe_attach_blocked_by_unconfirmed_close() {
     assert_eq!(h.public()["last_error"], PyValue::Null);
     assert_eq!(h.public()["reprobe_attempts"], PyValue::from(1));
 }
+
+// ── OD-81／DF-27（docs/rust-refactor/reviews/rulings/s2.md「OD-81」）：登入後命令逾時的完整重探生命週期。
+// Python 基線：attach 登入（`_attach_by_id` 的 ensure_ready）回 `POST_LOGIN_CMD_TIMEOUT`（`origin/main:sw_core/login_fsm.py:174`）
+// → 關 bridge、DETACHED；`_is_reprobe_prompt_error`（`origin/main:sw_core/session_manager.py:2112-2136`）不含此碼 → 永不重探。
+// 擁有者裁決 Rust 改為沿用既有退避重探（Python 依 OD-75 不改）：drain 收尾後才 DETACHED、tick 依 RX idle／backoff
+// 重新開橋（真正開橋才記一次 attempt，2／4／8／15 s 上限）、登入在途與 drain 未完成不重複開橋、最後成功回 READY 並重置進度；
+// 期間被拒的 agent 請求不得產生任何 TX。
+
+const DF27_PROFILE: &str = "profiles:\n  b:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    post_login_cmd: sh\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: b, act_no: 1, alias: b+1, device_by_id: /s/by-id/usb-A}\n";
+const DF27: &str = "POST_LOGIN_CMD_TIMEOUT";
+const SEC: u64 = 1_000_000_000;
+
+fn df27_open_count(effs: &[Effect]) -> usize {
+    effs.iter()
+        .filter(|e| matches!(e, Effect::OpenBridge { .. }))
+        .count()
+}
+
+/// 任何 TX 類效果（系統登入、前景／背景 op、human 轉送）。
+fn df27_has_tx(effs: &[Effect]) -> bool {
+    effs.iter().any(|e| {
+        matches!(
+            e,
+            Effect::StartLogin { .. } | Effect::StartOp { .. } | Effect::HumanTx { .. }
+        )
+    })
+}
+
+/// agent `command.submit`：非 READY 必須同步拒絕且零 TX。
+fn df27_assert_submit_rejected(h: &mut CoreHarness, ctx: &str) {
+    let (resp, fx) = h.rpc_full(sw_core::session_core::SessionRequest::Submit(agent_submit(
+        "echo df27-must-not-tx",
+    )));
+    let resp = resp.unwrap_or_else(|e| panic!("{ctx}：submit 不應拋例外：{e:?}"));
+    assert_eq!(resp["ok"], PyValue::Bool(false), "{ctx}：submit 必須被拒：{resp:?}");
+    assert!(!df27_has_tx(&fx), "{ctx}：被拒的 agent 請求不得產生 TX 效果");
+}
+
+/// 開橋成功 → attach 登入起跑 → 立即回 `Failed(POST_LOGIN_CMD_TIMEOUT)`；回傳 drain 的 (epoch, stop_id)。
+fn df27_open_and_fail(h: &mut CoreHarness, ctx: &str) -> (u64, sw_core::drain::StopId) {
+    let fx = h.bridge_ok();
+    let (epoch, gen) = start_login(&fx).unwrap_or_else(|| panic!("{ctx}：開橋後應起 attach 登入"));
+    let fx = h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen: gen,
+        result: LoginOutcome::Failed(DF27.into()),
+        after_rx_seq: None,
+    });
+    assert!(
+        fx.iter().any(|e| matches!(e, Effect::BeginDrain { .. })),
+        "{ctx}：attach 登入失敗須先 drain（不得直接 DETACHED／READY）"
+    );
+    assert_ne!(h.core.state(), SessionState::Ready, "{ctx}：失敗不得升 READY");
+    assert_ne!(h.core.state(), SessionState::Detached, "{ctx}：drain 未完成前不得 DETACHED");
+    assert_eq!(h.public()["last_error"], PyValue::from(DF27), "{ctx}");
+    h.pending_stop()
+}
+
+/// 推進至第一次 OpenBridge，回傳經過的秒數；`max_s` 內未開橋則 panic。開橋前每一秒都不得有 TX。
+fn df27_secs_until_open(h: &mut CoreHarness, max_s: u64, ctx: &str) -> u64 {
+    for s in 1..=max_s {
+        let fx = h.advance(Duration::from_secs(1));
+        assert!(
+            !fx.iter().any(|e| matches!(e, Effect::StartLogin { .. } | Effect::StartOp { .. })),
+            "{ctx}：DETACHED 等待重探期間不得 TX"
+        );
+        match df27_open_count(&fx) {
+            0 => continue,
+            1 => return s,
+            n => panic!("{ctx}：同一 tick 開橋 {n} 次"),
+        }
+    }
+    panic!("{ctx}：{max_s} s 內未重新開橋（DF-27：POST_LOGIN_CMD_TIMEOUT 應依退避重探）");
+}
+
+#[test]
+fn df27_failed_login_drains_then_retries_to_ready() {
+    let mut h = CoreHarness::new(DF27_PROFILE);
+    h.attach_device();
+    let fx = h.bridge_ok();
+    let (epoch, gen) = start_login(&fx).expect("首次 attach 起登入");
+    // 登入期間的 RX（post_login_cmd 的 echo）：reader 先寫共享視窗再投遞 data lane；RX idle 由此起算。
+    let t0 = h.clock.mono_ns();
+    h.rx.append(b"sh\r\n", t0, epoch, 9_001);
+    h.rx(b"sh\r\n");
+    let fx = h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen: gen,
+        result: LoginOutcome::Failed(DF27.into()),
+        after_rx_seq: None,
+    });
+    assert!(
+        fx.iter().any(|e| matches!(e, Effect::BeginDrain { .. })),
+        "attach 登入失敗 → 先 drain（`StopKind::LoginFailed`）"
+    );
+    assert_ne!(h.core.state(), SessionState::Detached, "stop receipt 前不得 DETACHED");
+    assert_ne!(h.core.state(), SessionState::Ready);
+    df27_assert_submit_rejected(&mut h, "首次失敗 drain 中");
+
+    // stop receipt 完成 → DETACHED，錯誤碼保留、尚未計任何 attempt。
+    let (stop_epoch, stop) = h.pending_stop();
+    h.receipt(stop_epoch, stop).feed();
+    let p = h.public();
+    assert_eq!(p["state"], PyValue::from("DETACHED"));
+    assert_eq!(p["last_error"], PyValue::from(DF27));
+    assert_eq!(p["reprobe_attempts"], PyValue::from(0));
+    assert_eq!(p["next_reprobe_at"], PyValue::Null);
+    df27_assert_submit_rejected(&mut h, "DETACHED");
+
+    // 首次重試：依既有 RX idle（≥3 s，`REPROBE_RX_IDLE_S`）語意，於最後一筆 RX 後第一個合格 tick 開橋，不多加固定等待。
+    let waited = df27_secs_until_open(&mut h, 30, "首次重試");
+    assert_eq!(h.clock.mono_ns(), t0 + 3 * SEC, "首次重試應落在 RX idle 3 s 的第一個 tick（等了 {waited} s）");
+    let p = h.public();
+    assert_eq!(p["state"], PyValue::from("ATTACHING"));
+    assert_eq!(p["last_error"], PyValue::Null, "重新 attach 時清 last_error（`_prepare_reprobe_locked`）");
+    assert_eq!(p["reprobe_attempts"], PyValue::from(1), "真正開橋一次才記一次 attempt");
+    df27_assert_submit_rejected(&mut h, "開橋在途");
+
+    // 開橋在途：tick 不得重複開橋。
+    let fx = advance_collect(&mut h, 5);
+    assert_eq!(df27_open_count(&fx), 0, "開橋在途不得重複開橋");
+    let a1 = h.clock.mono_ns() - 5 * SEC;
+
+    // 第 1 次重試失敗，drain 刻意延到退避期限（a1+2 s）之後：drain 未完成前不得開橋。
+    let (stop_epoch, stop) = df27_open_and_fail(&mut h, "第 1 次重試");
+    let fx = advance_collect(&mut h, 2);
+    assert_eq!(df27_open_count(&fx), 0, "drain 未完成不得重新開橋");
+    assert!(h.clock.mono_ns() >= a1 + 2 * SEC);
+    df27_assert_submit_rejected(&mut h, "第 1 次重試 drain 中");
+    h.receipt(stop_epoch, stop).feed();
+    assert_eq!(h.public()["state"], PyValue::from("DETACHED"));
+    assert_eq!(h.public()["reprobe_attempts"], PyValue::from(1), "drain 收尾不計 attempt");
+    // 期限已過且 RX 早已閒置 → 下一個 tick 開橋。
+    assert_eq!(df27_secs_until_open(&mut h, 30, "第 2 次重試"), 1);
+    assert_eq!(h.public()["reprobe_attempts"], PyValue::from(2));
+
+    // 第 2、3、4 次重試皆立即失敗並即時收尾：開橋間隔依序為 backoff 4／8／15 s（2 s 一段已於上方以期限驗證）。
+    for (attempt, gap) in [(3i64, 4u64), (4, 8), (5, 15)] {
+        let ctx = format!("第 {attempt} 次重試");
+        let (stop_epoch, stop) = df27_open_and_fail(&mut h, &ctx);
+        h.receipt(stop_epoch, stop).feed();
+        assert_eq!(h.public()["state"], PyValue::from("DETACHED"), "{ctx}");
+        assert_eq!(
+            df27_secs_until_open(&mut h, 30, &ctx),
+            gap,
+            "{ctx}：開橋間隔應為退避 {gap} s"
+        );
+        assert_eq!(h.public()["reprobe_attempts"], PyValue::from(attempt), "{ctx}");
+    }
+
+    // 最後一次：登入在途期間 tick 不得重開橋、不得起第二個登入；之後成功 → READY 並重置進度。
+    let fx = h.bridge_ok();
+    let (epoch, gen) = start_login(&fx).expect("最後一次開橋起登入");
+    let fx = advance_collect(&mut h, 20);
+    assert_eq!(df27_open_count(&fx), 0, "登入在途不得重複開橋");
+    assert!(start_login(&fx).is_none(), "登入在途不得另起登入");
+    df27_assert_submit_rejected(&mut h, "登入在途");
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen: gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    let p = h.public();
+    assert_eq!(p["state"], PyValue::from("READY"));
+    assert_eq!(p["last_error"], PyValue::Null);
+    assert_eq!(p["reprobe_attempts"], PyValue::from(0), "READY 後重置 attempts");
+    assert_eq!(p["next_reprobe_at"], PyValue::Null, "READY 後清 backoff");
+    assert_eq!(p["reprobe_exhausted"], PyValue::Bool(false));
+}
+
+#[test]
+fn df27_attached_post_login_timeout_reprobes_existing_bridge_to_ready() {
+    // DF-27 的 ATTACHED 路徑：既有 bridge 自動重探（`_probe_existing_bridge`）的登入回 `Failed(POST_LOGIN_CMD_TIMEOUT)`
+    // → 停 ATTACHED（不 drain）、`_finish_probe_reprobe` 記一次 attempt；之後依 backoff（2 s）與 RX idle 再排 probe，成功回 READY。
+    // Python 基線此時 `_is_reprobe_prompt_error("ATTACHED", "POST_LOGIN_CMD_TIMEOUT")` 為 False，不再重探。
+    let mut h = CoreHarness::new(DF27_PROFILE);
+    h.to_attached(Some("PROMPT_UNAVAILABLE"));
+    let fx = advance_collect(&mut h, 4);
+    let (epoch, gen) = start_login(&fx).expect("ATTACHED＋PROMPT_UNAVAILABLE → 自動重探");
+    let fx = h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen: gen,
+        result: LoginOutcome::Failed(DF27.into()),
+        after_rx_seq: None,
+    });
+    assert!(
+        !fx.iter().any(|e| matches!(e, Effect::BeginDrain { .. })),
+        "既有 bridge 重探失敗停 ATTACHED、不 drain"
+    );
+    let p = h.public();
+    assert_eq!(p["state"], PyValue::from("ATTACHED"));
+    assert_eq!(p["last_error"], PyValue::from(DF27));
+    assert_eq!(p["reprobe_attempts"], PyValue::from(1));
+    df27_assert_submit_rejected(&mut h, "ATTACHED＋DF-27");
+    // backoff(0)=2 s：1 s 後不排、2 s 時排下一次 probe（同一 bridge，不重新開橋）。
+    let fx = advance_collect(&mut h, 1);
+    assert!(start_login(&fx).is_none(), "未到退避期限不得 probe");
+    let fx = advance_collect(&mut h, 1);
+    assert_eq!(df27_open_count(&fx), 0, "ATTACHED 重探沿用既有 bridge");
+    let (epoch, gen) = start_login(&fx).expect("DF-27：ATTACHED＋POST_LOGIN_CMD_TIMEOUT 應依退避重探");
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen: gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    let p = h.public();
+    assert_eq!(p["state"], PyValue::from("READY"));
+    assert_eq!(p["last_error"], PyValue::Null);
+    assert_eq!(p["reprobe_attempts"], PyValue::from(0));
+    assert_eq!(p["next_reprobe_at"], PyValue::Null);
+}

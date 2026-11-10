@@ -352,6 +352,225 @@ fn reprobe_eligibility_attached_and_detached() {
     ));
 }
 
+// ── OD-81／DF-27（docs/rust-refactor/reviews/rulings/s2.md「OD-81」）：登入後命令逾時的重探資格。
+// Python 基線 `origin/main:sw_core/session_manager.py:2112-2136` 的 `_is_reprobe_prompt_error` 不含
+// `POST_LOGIN_CMD_TIMEOUT`（它不以 `_PROMPT_TIMEOUT` 結尾），session 停在 DETACHED 不再重探；擁有者裁決 Rust
+// 改為與其他可重探的登入錯誤同樣以退避重探（Python 依 OD-75 不改，差異登記 DF-27）。只精確納入此一碼，
+// 不泛化為「所有 `_TIMEOUT`」：`READY_NONCE_TIMEOUT` 等其餘碼維持 Python 的既有結果。
+
+const DF27: &str = "POST_LOGIN_CMD_TIMEOUT";
+
+#[test]
+fn df27_post_login_timeout_is_reprobe_eligible() {
+    // 兩種合法狀態：ATTACHED（既有 bridge 重探失敗停 ATTACHED）與 DETACHED（attach 登入失敗 drain 後）。
+    for state in ["ATTACHED", "DETACHED"] {
+        assert!(
+            is_reprobe_prompt_error(state, Some(DF27)),
+            "DF-27：{state}＋{DF27} 必須可重探"
+        );
+    }
+    // 其他狀態不因此碼取得資格（Python 對 READY／ATTACHING 等一律 False，`:2136`）。
+    for state in [
+        "READY",
+        "ATTACHING",
+        "RECOVERING",
+        "RELEASED",
+        "FLASHING",
+        "",
+    ] {
+        assert!(
+            !is_reprobe_prompt_error(state, Some(DF27)),
+            "DF-27：{state:?}＋{DF27} 不得可重探"
+        );
+    }
+    // 只精確比對此碼：大小寫、前後綴與包裝前綴（REPROBE_FAILED:／ATTACH_FAILED:）都不算。
+    for near in [
+        "post_login_cmd_timeout",
+        "POST_LOGIN_CMD_TIMEOUT_X",
+        "X_POST_LOGIN_CMD_TIMEOUT",
+        "REPROBE_FAILED:POST_LOGIN_CMD_TIMEOUT",
+        "ATTACH_FAILED:POST_LOGIN_CMD_TIMEOUT",
+    ] {
+        for state in ["ATTACHED", "DETACHED"] {
+            assert!(
+                !is_reprobe_prompt_error(state, Some(near)),
+                "DF-27 只精確納入 {DF27}：{state}＋{near:?} 不得可重探"
+            );
+        }
+    }
+    // 帳密終態與無關錯誤（含其他非 `_PROMPT_TIMEOUT` 結尾的 `_TIMEOUT`）維持 Python 既有結果：兩狀態皆不可重探。
+    for e in [
+        Some("CREDENTIALS_UNRESOLVED"),
+        Some("USER_ENV_MISSING"),
+        Some("PASS_ENV_REQUIRED"),
+        Some("PASS_ENV_MISSING"),
+        Some("LOGIN_USER_REQUIRED"),
+        Some("LOGIN_REQUIRED"),
+        Some("READY_NONCE_TIMEOUT"),
+        Some("RECOVERY_TIMEOUT"),
+        Some("CONSOLE_UNLOCK_IDLE_TIMEOUT"),
+        Some("BOOTLOADER_STUCK"),
+        Some("DEVICE_REMOVED"),
+        Some("CLEARED"),
+        Some("REBOUND"),
+        Some("ATTACH_FAILED:OSError"),
+        Some("REPROBE_FAILED:OSError"),
+        Some(""),
+        None,
+    ] {
+        for state in ["ATTACHED", "DETACHED"] {
+            assert!(
+                !is_reprobe_prompt_error(state, e),
+                "{state}＋{e:?} 維持不可重探"
+            );
+        }
+    }
+    // 既有可重探碼不受影響（`:2121-2135`）：DETACHED 不含 PROMPT_UNAVAILABLE。
+    for e in [
+        "PROMPT_TIMEOUT",
+        "SHELL_PROMPT_TIMEOUT",
+        "PRPL_PROMPT_TIMEOUT",
+        "LOGIN_PROMPT_TIMEOUT",
+        "CONSOLE_UNLOCK_PROMPT_TIMEOUT",
+        "RX_FLOOD",
+        "TRANSPORT_STALL",
+    ] {
+        for state in ["ATTACHED", "DETACHED"] {
+            assert!(is_reprobe_prompt_error(state, Some(e)), "{state}＋{e}");
+        }
+    }
+    assert!(is_reprobe_prompt_error("ATTACHED", Some("PROMPT_UNAVAILABLE")));
+    assert!(!is_reprobe_prompt_error("DETACHED", Some("PROMPT_UNAVAILABLE")));
+}
+
+#[test]
+fn df27_post_login_timeout_obeys_reprobe_guards() {
+    // 依 `wp56_wait_does_not_burn_reprobe_attempts` 的作法：非預設的既有進度（attempts=2、next_reprobe_at 已過）；
+    // 有資格的對照組必須照既有規劃排 Probe／Attach，各守衛成立時不排動作、不動 attempts／backoff／inflight 與 quiet。
+    let now = 1010.0;
+    let r0 = ReprobeState {
+        attempts: 2,
+        next_reprobe_at: Some(t(1005.0)),
+        exhausted: false,
+        inflight: false,
+    };
+    for (state, planned) in [
+        ("ATTACHED", ReprobeAction::Probe),
+        ("DETACHED", ReprobeAction::Attach),
+    ] {
+        // 對照組：證明下方各個 None 來自守衛本身。
+        {
+            let o = wp56_owned(state, Some(DF27), now);
+            let (mut r, mut q) = (r0.clone(), QuietState::default());
+            assert_eq!(
+                prepare(&mut r, &mut q, &o.input(), t(now)),
+                Some(planned),
+                "DF-27 {state}：守衛皆不成立時應照既有規劃"
+            );
+            match planned {
+                // Probe：只排下次時間（backoff(attempts=2)=8 s）與 single-flight，不記 attempt（`finish_probe` 才記）。
+                ReprobeAction::Probe => assert_eq!(
+                    r,
+                    ReprobeState {
+                        attempts: 2,
+                        next_reprobe_at: Some(t(now + 8.0)),
+                        exhausted: false,
+                        inflight: true,
+                    },
+                    "DF-27 {state}：Probe 規劃"
+                ),
+                // Attach：真正排一次重新 attach 才記一次 attempt（attempts 3 → next=now+backoff(2)=8 s）。
+                ReprobeAction::Attach => assert_eq!(
+                    r,
+                    ReprobeState {
+                        attempts: 3,
+                        next_reprobe_at: Some(t(now + 8.0)),
+                        exhausted: false,
+                        inflight: false,
+                    },
+                    "DF-27 {state}：Attach 規劃記一次 attempt"
+                ),
+            }
+        }
+
+        type Guard = fn(&mut Owned, &mut ReprobeState, &mut QuietState);
+        let guards: [(&str, Guard); 7] = [
+            ("boot quiet", |_, _, q| q.arm(t(1000.0))),
+            ("boot evidence wait", |_, _, q| {
+                q.begin_boot_evidence_wait(t(1001.0))
+            }),
+            ("未到退避期限", |_, r, _| {
+                r.next_reprobe_at = Some(t(1010.5))
+            }),
+            ("RX 未閒置 3 s", |o, _, _| o.last_rx_mono = Some(t(1008.0))),
+            ("裝置不在場", |o, _, _| o.device_present = false),
+            ("human active", |o, _, _| o.human_active = true),
+            ("by_id 已 release", |o, _, _| o.released = true),
+        ];
+        for (name, apply) in guards {
+            let mut o = wp56_owned(state, Some(DF27), now);
+            let mut r = r0.clone();
+            let mut q = QuietState::default();
+            apply(&mut o, &mut r, &mut q);
+            let (r_before, q_before) = (r.clone(), wp56_quiet_snapshot(&q));
+            assert_eq!(
+                prepare(&mut r, &mut q, &o.input(), t(now)),
+                None,
+                "DF-27 {state}／{name}：守衛成立時不得規劃 probe／attach"
+            );
+            assert_eq!(
+                r, r_before,
+                "DF-27 {state}／{name}：attempts／next_reprobe_at／exhausted／inflight 不得變動"
+            );
+            assert_eq!(
+                wp56_quiet_snapshot(&q),
+                q_before,
+                "DF-27 {state}／{name}：quiet 與證據等待不得變動"
+            );
+        }
+
+        // 已耗盡（10 次）不再規劃；只把 next_reprobe_at 清掉（既有 `prepare` 語意），attempts 不再增加。
+        let o = wp56_owned(state, Some(DF27), now);
+        let mut r = ReprobeState {
+            attempts: REPROBE_MAX_ATTEMPTS,
+            next_reprobe_at: None,
+            exhausted: true,
+            inflight: false,
+        };
+        let mut q = QuietState::default();
+        assert_eq!(prepare(&mut r, &mut q, &o.input(), t(now)), None, "{state}：exhausted");
+        assert_eq!(r.attempts, REPROBE_MAX_ATTEMPTS, "{state}：耗盡後不再計 attempt");
+    }
+
+    // ATTACHED 專屬：single-flight 與無 bridge 時不排 probe。
+    for (name, inflight, has_bridge) in [("inflight", true, true), ("無 bridge", false, false)] {
+        let mut o = wp56_owned("ATTACHED", Some(DF27), now);
+        o.has_bridge = has_bridge;
+        let mut r = ReprobeState {
+            inflight,
+            ..r0.clone()
+        };
+        let r_before = r.clone();
+        let mut q = QuietState::default();
+        assert_eq!(prepare(&mut r, &mut q, &o.input(), t(now)), None, "ATTACHED／{name}");
+        assert_eq!(r, r_before, "ATTACHED／{name}：進度不得變動");
+    }
+
+    // 最終驗證（`_reprobe_target_still_valid_locked`）：ATTACHED＋DF-27 通過；寫入前才成立的 quiet／等待仍擋下。
+    let o = wp56_owned("ATTACHED", Some(DF27), now);
+    let r = ReprobeState::default();
+    assert!(
+        target_still_valid(&r, &mut QuietState::default(), &o.valid(true), t(now)),
+        "DF-27 ATTACHED：最終驗證通過"
+    );
+    let mut q = QuietState::default();
+    q.arm(t(now));
+    assert!(!target_still_valid(&r, &mut q, &o.valid(true), t(now)), "quiet 中最終驗證擋下");
+    let mut q = QuietState::default();
+    q.begin_boot_evidence_wait(t(now));
+    assert!(!target_still_valid(&r, &mut q, &o.valid(true), t(now)), "證據等待中最終驗證擋下");
+}
+
 #[test]
 fn rx_not_idle_for_3s_and_single_flight() {
     let sp = session_profile_for("prpl-template");
