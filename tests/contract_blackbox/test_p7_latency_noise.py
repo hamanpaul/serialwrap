@@ -222,8 +222,7 @@ def assert_no_wal_tx_leak(wal_records: list[dict], marker: str | bytes) -> None:
         )
 
         all_stream.extend(raw)
-        src = str(rec.get("source", ""))
-        if "TX" in src.upper():
+        if rec.get("dir") == "TX":
             tx_stream.extend(raw)
 
     assert marker_bytes not in tx_stream, "命令標記外洩至 WAL TX 串接資料流"
@@ -378,13 +377,15 @@ def test_df27_rust_post_login_timeout_reprobes_ready(tmp_path):
             assert b"echo __READY__" in sent, "Rust 應完成新的 ready_probe nonce 確認"
 
 
-def test_df27_rust_artifact_selector_resolution(tmp_path):
-    """P8-a190a57-1 自測：驗證 resolve_rust_artifacts 與 _select_engine 解析路徑。
+def test_df27_rust_artifact_selector_resolution(tmp_path, monkeypatch):
+    """P8-a190a57-1 / P8-a81ff33-1 自測：驗證 resolve_rust_artifacts 與 _select_engine 解析路徑。
 
     1. 呼叫端明確指定且非 .py 之二進位時，優先保留該自訂路徑，不被覆寫。
     2. 未指定時，若給定 cargo_target_dir，則解析至該目錄下的 debug 二進位。
-    3. 未指定且無 cargo_target_dir 時，解析至工作樹 target/debug。
-    4. 呼叫端指定不存在之路徑時，明確拋出 AssertionError。
+    3. 未指定且無 cargo_target_dir 時，依假 repo_root 解析至 fake_repo/target/debug（monkeypatch 隔離 CARGO_TARGET_DIR）。
+    4. 設定環境變數 CARGO_TARGET_DIR 時，優先解析至該目錄下的二進位。
+    5. 呼叫端指定不存在之路徑時，明確拋出 AssertionError。
+    6. 搜尋目錄皆無二進位時，拋出明確之 AssertionError。
     """
     # 建立假二進位供自測
     custom_dir = tmp_path / "custom_bin"
@@ -423,15 +424,44 @@ def test_df27_rust_artifact_selector_resolution(tmp_path):
     assert d2 == ct_d
     assert cli2 == ct_cli
 
-    # 3. 預設解析至工作樹 target/debug
-    d3, cli3 = resolve_rust_artifacts()
-    assert d3 == ROOT / "target" / "debug" / "serialwrapd"
-    assert cli3 == ROOT / "target" / "debug" / "serialwrap"
+    # 3. 預設解析至假 repo_root 的 target/debug（隔離環境變數 CARGO_TARGET_DIR）
+    fake_repo = tmp_path / "fake_repo"
+    fake_target_debug = fake_repo / "target" / "debug"
+    fake_target_debug.mkdir(parents=True)
+    ft_d = fake_target_debug / "serialwrapd"
+    ft_cli = fake_target_debug / "serialwrap"
+    ft_d.touch(mode=0o755)
+    ft_cli.touch(mode=0o755)
 
-    # 4. 指定不存在的路徑時報錯
+    monkeypatch.delenv("CARGO_TARGET_DIR", raising=False)
+    d3, cli3 = resolve_rust_artifacts(repo_root=fake_repo)
+    assert d3 == ft_d
+    assert cli3 == ft_cli
+
+    # 4. 驗證環境變數 CARGO_TARGET_DIR 分支
+    env_target = tmp_path / "env_target"
+    (env_target / "debug").mkdir(parents=True)
+    et_d = env_target / "debug" / "serialwrapd"
+    et_cli = env_target / "debug" / "serialwrap"
+    et_d.touch(mode=0o755)
+    et_cli.touch(mode=0o755)
+
+    monkeypatch.setenv("CARGO_TARGET_DIR", str(env_target))
+    d_env, cli_env = resolve_rust_artifacts(repo_root=fake_repo)
+    assert d_env == et_d
+    assert cli_env == et_cli
+
+    # 5. 指定不存在的路徑時報錯
     non_existent = tmp_path / "non_existent"
     with pytest.raises(AssertionError, match="呼叫端指定的 Rust daemon 二進位不存在"):
         resolve_rust_artifacts(caller_daemon=str(non_existent), caller_cli=str(c_cli))
+
+    # 6. 搜尋目錄無二進位時報錯
+    empty_repo = tmp_path / "empty_repo"
+    empty_repo.mkdir()
+    monkeypatch.delenv("CARGO_TARGET_DIR", raising=False)
+    with pytest.raises(AssertionError, match="未找到 Rust 二進位檔"):
+        resolve_rust_artifacts(repo_root=empty_repo)
 
 
 def test_df27_wal_zero_tx_assertion_negative_test():
@@ -442,7 +472,8 @@ def test_df27_wal_zero_tx_assertion_negative_test():
     b64_payload = base64.b64encode(f"cmd: echo {marker}\n".encode("utf-8")).decode("ascii")
     leaked_record = {
         "seq": 10,
-        "source": "AGENT_TX",
+        "dir": "TX",
+        "source": "agent:test",
         "cmd_id": "c1",
         "payload_b64": b64_payload,
     }
@@ -455,11 +486,21 @@ def test_df27_wal_zero_tx_assertion_negative_test():
     with pytest.raises(AssertionError, match="命令標記外洩至單筆 WAL payload"):
         assert_no_wal_tx_leak([leaked_record], marker)
 
-    # 2. 跨記錄切分測試：前半段在 rec1、後半段在 rec2
+    # 2. 跨記錄切分測試：前半段在 rec1、後半段在 rec2（正式 WAL 欄位 dir=TX, source=agent:test）
     half1 = marker[:15]
     half2 = marker[15:]
-    rec1 = {"seq": 1, "source": "AGENT_TX", "payload_b64": base64.b64encode(half1.encode("utf-8")).decode("ascii")}
-    rec2 = {"seq": 2, "source": "AGENT_TX", "payload_b64": base64.b64encode(half2.encode("utf-8")).decode("ascii")}
+    rec1 = {
+        "seq": 1,
+        "dir": "TX",
+        "source": "agent:test",
+        "payload_b64": base64.b64encode(half1.encode("utf-8")).decode("ascii"),
+    }
+    rec2 = {
+        "seq": 2,
+        "dir": "TX",
+        "source": "agent:test",
+        "payload_b64": base64.b64encode(half2.encode("utf-8")).decode("ascii"),
+    }
 
     # 單筆檢查均不含完整 marker
     assert marker.encode("utf-8") not in base64.b64decode(rec1["payload_b64"])
@@ -469,8 +510,42 @@ def test_df27_wal_zero_tx_assertion_negative_test():
     with pytest.raises(AssertionError, match="命令標記外洩至 WAL TX 串接資料流"):
         assert_no_wal_tx_leak([rec1, rec2], marker)
 
-    # 3. 正常記錄通過檢查
-    clean_rec = {"seq": 3, "source": "SYS_TX", "payload_b64": base64.b64encode(b"normal probe\n").decode("ascii")}
+    # 3. 審查實測案例（P8-a190a57-2）：TX / RX / TX 交錯跨記錄切分
+    # 依序輸入三筆記錄：
+    # 1. dir=TX, source=agent:test：DF27_ZERO_
+    # 2. dir=RX, source=device：background noise\n
+    # 3. dir=TX, source=agent:test：TX_RUST_123
+    # 預期攔截完整 TX marker DF27_ZERO_TX_RUST_123。
+    # 舊 helper 以 source 含 TX 判定，因 source=agent:test 漏掉 TX 串接；且 all_stream 被 RX 雜訊切斷，因而漏判。
+    interleaved_marker = "DF27_ZERO_TX_RUST_123"
+    rec_tx1 = {
+        "seq": 11,
+        "dir": "TX",
+        "source": "agent:test",
+        "payload_b64": base64.b64encode(b"DF27_ZERO_").decode("ascii"),
+    }
+    rec_rx = {
+        "seq": 12,
+        "dir": "RX",
+        "source": "device",
+        "payload_b64": base64.b64encode(b"background noise\n").decode("ascii"),
+    }
+    rec_tx2 = {
+        "seq": 13,
+        "dir": "TX",
+        "source": "agent:test",
+        "payload_b64": base64.b64encode(b"TX_RUST_123").decode("ascii"),
+    }
+    with pytest.raises(AssertionError, match="命令標記外洩至 WAL TX 串接資料流"):
+        assert_no_wal_tx_leak([rec_tx1, rec_rx, rec_tx2], interleaved_marker)
+
+    # 4. 正常記錄通過檢查
+    clean_rec = {
+        "seq": 14,
+        "dir": "TX",
+        "source": "agent:test",
+        "payload_b64": base64.b64encode(b"normal probe\n").decode("ascii"),
+    }
     assert_no_wal_tx_leak([clean_rec], marker)
 
 
