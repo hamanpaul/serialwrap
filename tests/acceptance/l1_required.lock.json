@@ -2355,6 +2355,7 @@
           "cargo:sw-daemon::event_rpc::rule_set_invalid_schema_and_type_error",
           "cargo:sw-daemon::event_rpc::rule_set_response_spreads_raw_with_ok_first",
           "cargo:sw-daemon::file_transfer_rpc::file_push_and_pull_rpc_end_to_end",
+          "cargo:sw-daemon::file_transfer_rpc::file_rpc_rejected_during_boot_quiet_returns_autoboot_quiet_zero_tx",
           "cargo:sw-daemon::file_transfer_rpc::file_rpc_rejections_have_no_side_effects",
           "cargo:sw-daemon::framing::client_disconnect_does_not_cancel_handler",
           "cargo:sw-daemon::framing::connection_cap_128_pauses_accept",
