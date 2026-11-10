@@ -2422,6 +2422,27 @@ fn wp61_submit_timeout(
     source_class: &str,
     reply_on_ctrl_c: bool,
 ) -> Wp61TimeoutEvidence {
+    wp61_submit_timeout_with(
+        r,
+        raw_source,
+        "",
+        command,
+        annotation,
+        source_class,
+        reply_on_ctrl_c,
+    )
+}
+
+/// 同 `wp61_submit_timeout`，另把 `extra_params`（以逗號開頭的 JSON 片段）原樣接在 `command.submit` 參數尾端。
+fn wp61_submit_timeout_with(
+    r: &ServiceRig,
+    raw_source: &str,
+    extra_params: &str,
+    command: &str,
+    annotation: Option<(&str, &str)>,
+    source_class: &str,
+    reply_on_ctrl_c: bool,
+) -> Wp61TimeoutEvidence {
     let dev = r.device(REAL_A);
     r.settle();
     if reply_on_ctrl_c {
@@ -2429,8 +2450,9 @@ fn wp61_submit_timeout(
     }
     let tx_mark = dev.tx_len();
     let wal_seq = r.wal.current_seq();
-    let params =
-        format!(r#"{{"selector":"COM0","cmd":"{command}","source":"{raw_source}","timeout_s":1}}"#);
+    let params = format!(
+        r#"{{"selector":"COM0","cmd":"{command}","source":"{raw_source}","timeout_s":1{extra_params}}}"#
+    );
     let response = r.call("command.submit", &params);
     assert_eq!(
         response.get("ok"),
@@ -2625,6 +2647,48 @@ fn wp61_rpc_unknown_prefix_timeout_uses_agent_recovery() {
         r#"{"selector":"COM0","strict_human_lock":true}"#,
     );
     assert_wp61_ctrl_c_recovery(&evidence, &public, command, "agent");
+}
+
+/// WP6-1 第 4 項：RPC 參數夾帶 `trusted_human:true` 不得替明寫 `human:<x>` 授權。
+/// Python `command.submit` 只取 `source_check.is_bare_human`（`origin/main:sw_core/service.py:1235`），
+/// 從不讀 `params["trusted_human"]`；Rust `service.rs` 同樣只由原始 source 判定，夾帶欄位應被忽略：
+/// 成功回應逐位元組同未夾帶者、逾時走 CTRL-C 救援、不升格 lease，命令紀錄也不外洩該欄位。
+#[test]
+fn wp61_rpc_injected_trusted_human_param_cannot_authorize_explicit_human() {
+    for raw_source in ["human:cli", "human:x"] {
+        let r = ServiceRig::ready_shell();
+        let command = "printf 'broken";
+        let evidence = wp61_submit_timeout_with(
+            &r,
+            raw_source,
+            r#","trusted_human":true"#,
+            command,
+            None,
+            "human",
+            true,
+        );
+        let public = r.call(
+            "session.self_test",
+            r#"{"selector":"COM0","strict_human_lock":true}"#,
+        );
+        assert_wp61_ctrl_c_recovery(&evidence, &public, command, "human");
+        assert_eq!(
+            s(&evidence.record, "source"),
+            raw_source,
+            "{raw_source}：來源不得被改寫"
+        );
+        assert_eq!(
+            evidence.record.get("interactive_session_id"),
+            Some(&PyValue::Null),
+            "{raw_source}：不得開 lease：{}",
+            j(&evidence.record)
+        );
+        assert!(
+            evidence.record.get("trusted_human").is_none(),
+            "{raw_source}：命令紀錄不得出現 trusted_human：{}",
+            j(&evidence.record)
+        );
+    }
 }
 
 #[test]
