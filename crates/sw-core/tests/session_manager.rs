@@ -4936,3 +4936,140 @@ fn test_placeholder_attach_next_actor_spawn_failure_close_failed_enters_unconfir
     assert!(matches!(c.as_ref().map(|x| &x.phase), Some(sw_core::custody::CustodyPhaseSnapshot::CloseFailed { .. })), "關閉失敗帳本須為 CloseFailed：{c:?}");
     assert!(m.mgr.unconfirmed_close_for_test(BY_ID), "關閉失敗須進入未確認集合");
 }
+
+#[test]
+fn test_empty_manager_shutdown_drop_releases_dependencies() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let m = ManagerRig::templates_only();
+    let weak_serial = std::sync::Arc::downgrade(&m.serial);
+    let _ = m.mgr.shutdown(Duration::from_millis(100));
+    drop(m);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        weak_serial.upgrade().is_none(),
+        "manager drop 後 serial 依賴應被釋放，目前強引用未歸零"
+    );
+}
+
+#[test]
+fn test_placeholder_attach_bridge_opened_send_failure_close_failed_retains_block() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const BY_ID: &str = "/s/by-id/usb-G98";
+    const REAL: &str = "/dev/ttyG98";
+    const PLACEHOLDER_SID: &str = "gone-template:COM98";
+
+    let m = wp510_b_custom_placeholder_rig(PLACEHOLDER_SID, BY_ID, REAL);
+    let device = m.device(REAL);
+    m.mgr.update_devices(&m.snapshot());
+    device.fail_close(PalError::io(5, "close failed"));
+
+    let mgr = m.mgr.clone();
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded::<()>(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded::<()>(1);
+
+    mgr.set_open_bridge_post_take_hook_for_test(Box::new(move || {
+        let _ = entered_tx.send(());
+        let _ = resume_rx.recv();
+    }));
+
+    let res = m.mgr.attach_released_placeholder(PLACEHOLDER_SID, false).expect("attach_released_placeholder ok");
+    assert_eq!(res.get("ok"), Some(&PyValue::Bool(true)));
+
+    // 等待進入 post_take_hook
+    assert!(entered_rx.recv_timeout(Duration::from_secs(3)).is_ok());
+
+    // 此時 preopened 已被取出，正式 bridge 正準備開啟。
+    // 注入 executor 回呼 unwind，使 actor 在事件處理的 catch_unwind 外退出
+    let resolved_sid = m.mgr.resolve("COM98").expect("session 存在");
+    m.mgr.set_executor_unwind_hook_for_test(Box::new(|| {
+        panic!("測試注入的 executor unwind（catch_unwind 之外）");
+    }));
+    if let Some(ctrl) = m.mgr.actor_control_for_test(&resolved_sid) {
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let _ = ctrl.send(sw_core::mailbox::ControlEvent::Request {
+            req: sw_core::session_core::SessionRequest::GetState,
+            reply: tx,
+        });
+    }
+    std::thread::sleep(Duration::from_millis(100));
+
+    // 放行開埠工作，此時 actor 已退出，BridgeOpened 發送必失敗
+    let _ = resume_tx.send(());
+
+    // 等待關閉與收尾
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(3) {
+        if device.close_count() >= 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // 斷言：嘗試關閉 1 次，但 closed:false，進 unconfirmed 且帳本保留 CloseFailed，阻擋後續開埠
+    assert_eq!(device.close_count(), 1, "送達失敗時已開 handle 必須嘗試關閉 1 次");
+    assert!(device.is_open(), "關閉失敗後 handle 仍保持開啟");
+    let c = m.mgr.custody_for_test(BY_ID);
+    assert!(matches!(c.as_ref().map(|x| &x.phase), Some(sw_core::custody::CustodyPhaseSnapshot::CloseFailed { .. })), "送達失敗且關閉失敗時帳本須保留 CloseFailed：{c:?}");
+    assert!(m.mgr.unconfirmed_close_for_test(BY_ID), "關閉失敗須進入未確認集合阻擋開埠");
+}
+
+#[test]
+fn test_placeholder_attach_bridge_opened_send_failure_closed_settles() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const BY_ID: &str = "/s/by-id/usb-G97";
+    const REAL: &str = "/dev/ttyG97";
+    const PLACEHOLDER_SID: &str = "gone-template:COM97";
+
+    let m = wp510_b_custom_placeholder_rig(PLACEHOLDER_SID, BY_ID, REAL);
+    let device = m.device(REAL);
+    m.mgr.update_devices(&m.snapshot());
+
+    let mgr = m.mgr.clone();
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded::<()>(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded::<()>(1);
+
+    mgr.set_open_bridge_post_take_hook_for_test(Box::new(move || {
+        let _ = entered_tx.send(());
+        let _ = resume_rx.recv();
+    }));
+
+    let res = m.mgr.attach_released_placeholder(PLACEHOLDER_SID, false).expect("attach_released_placeholder ok");
+    assert_eq!(res.get("ok"), Some(&PyValue::Bool(true)));
+
+    // 等待進入 post_take_hook
+    assert!(entered_rx.recv_timeout(Duration::from_secs(3)).is_ok());
+
+    // 此時 preopened 已被取出，正式 bridge 正準備開啟。
+    // 注入 executor 回呼 unwind，使 actor 在事件處理的 catch_unwind 外退出
+    let resolved_sid = m.mgr.resolve("COM97").expect("session 存在");
+    m.mgr.set_executor_unwind_hook_for_test(Box::new(|| {
+        panic!("測試注入的 executor unwind（catch_unwind 之外）");
+    }));
+    if let Some(ctrl) = m.mgr.actor_control_for_test(&resolved_sid) {
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let _ = ctrl.send(sw_core::mailbox::ControlEvent::Request {
+            req: sw_core::session_core::SessionRequest::GetState,
+            reply: tx,
+        });
+    }
+    std::thread::sleep(Duration::from_millis(100));
+
+    // 放行開埠工作，此時 actor 已退出，BridgeOpened 發送必失敗
+    let _ = resume_tx.send(());
+
+    // 等待關閉與收尾
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(3) {
+        if device.close_count() >= 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // 斷言：嘗試關閉 1 次，closed:true，帳本紀錄結算並移除，未確認集合不含該 by_id
+    assert_eq!(device.close_count(), 1, "送達失敗時已開 handle 必須嘗試關閉 1 次");
+    assert!(!device.is_open(), "關閉成功後 handle 不得保持開啟");
+    let c = m.mgr.custody_for_test(BY_ID);
+    assert!(c.is_none(), "關閉成功後帳本紀錄須被結算移除，實際為：{c:?}");
+    assert!(!m.mgr.unconfirmed_close_for_test(BY_ID), "關閉成功不得進入未確認集合");
+}

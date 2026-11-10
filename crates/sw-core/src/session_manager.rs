@@ -575,6 +575,25 @@ struct HandoffProbes {
 }
 
 impl Inner {
+    fn new(unconfirmed: Arc<UnconfirmedCloses>) -> Self {
+        Self {
+            sessions: IndexMap::new(),
+            devices: BTreeMap::new(),
+            pending_com: HashMap::new(),
+            inflight: HashMap::new(),
+            handoff: HashMap::new(),
+            stopping: false,
+            interactive: HashMap::new(),
+            probe_paths: HashMap::new(),
+            flash_critical: HashSet::new(),
+            handoff_frozen: false,
+            shutdown_started: false,
+            custody: crate::custody::CustodyLedger::new(unconfirmed),
+            prepared: HashMap::new(),
+            deliverer: crate::custody::Deliverer::default(),
+        }
+    }
+
     fn session_by_id(&self, by_id: &str) -> Option<&Entry> {
         self.sessions
             .values()
@@ -684,6 +703,9 @@ struct Shared {
     /// 只供測試（test-fakes）：覆寫傳檔 RPC 等待期限，驗證 actor timeout 後仍由操作持有 admission。
     #[cfg(feature = "test-fakes")]
     file_transfer_timeout_override: Mutex<Option<Duration>>,
+    /// 只供測試（test-fakes）：executor 執行效果時的注入 unwind 鉤子（重現 actor 在 catch_unwind 之外崩潰）。
+    #[cfg(feature = "test-fakes")]
+    executor_unwind_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// 載入的 state.json 含孤立 surrogate（`LoadedState::lone_surrogates`；啟動存檔前檢查）。
     lone_surrogates: bool,
     /// 啟動存檔重現的 Python 未捕捉例外末行（`_save_state` 的 `UnicodeEncodeError`）；daemon 據此 exit 1。
@@ -691,10 +713,6 @@ struct Shared {
     /// S2-PAR-wp510r R1: 回收者命令通道與執行緒
     #[allow(dead_code)]
     pub reaper_cmd_tx: Sender<crate::custody::ReaperCmd>,
-    #[allow(dead_code)]
-    pub reaper: Mutex<Option<crate::custody::ReaperThread>>,
-    #[allow(dead_code)]
-    pub deliverer_thread: Mutex<Option<crate::custody::DelivererThread>>,
 }
 
 /// PROBE 的 writer 交給 TxWriter thread 期間留在 `HandleParts` 的占位（任何提交一律 NotSubmitted）。
@@ -730,6 +748,8 @@ pub struct SessionManager {
     watcher_rx: Receiver<WatcherEvent>,
     note_rx: Receiver<ManagerNote>,
     pump_lock: Arc<Mutex<()>>,
+    pub reaper: Mutex<Option<crate::custody::ReaperThread>>,
+    pub deliverer: Mutex<Option<crate::custody::DelivererThread>>,
     _console: Arc<dyn ConsoleTransportFactory>,
     _caps: Capabilities,
 }
@@ -1198,10 +1218,7 @@ impl Shared {
             .iter()
             .find(|(_, entry)| Arc::ptr_eq(&entry.io, io))
             .map(|(key, _)| key.clone());
-        let Some(key) = key else {
-            return BridgeTake::Handle(lock(&io.preopened).take());
-        };
-        {
+        if let Some(key) = key {
             let entry = inner.handoff.get(&key).expect("剛查到的交接列");
             if entry.real_path != dev {
                 // 路徑不同（裝置改指或過期的開埠）：handle 留在交接表，由改指或取消者處理；本次另行開埠。
@@ -1214,40 +1231,64 @@ impl Shared {
             if entry.taken {
                 return BridgeTake::Handle(None);
             }
-        }
-        let pre = lock(&io.preopened).take().or_else(|| {
-            inner.custody.custody.get_mut(&key).and_then(|rec| {
-                if rec.real_path == dev {
-                    match &mut rec.phase {
-                        crate::custody::CustodyPhase::Held { parts } => {
-                            parts.take().map(|p| {
-                                rec.phase = crate::custody::CustodyPhase::Taken {
-                                    taker: crate::custody::CustodyTaker::OpenJob {
-                                        sid: lock(&io.sid).clone(),
-                                        gen: 1,
-                                    },
-                                };
-                                Preopened {
-                                    real_path: dev.to_string(),
-                                    parts: p,
-                                }
-                            })
+            let pre = lock(&io.preopened).take().or_else(|| {
+                inner.custody.custody.get_mut(&key).and_then(|rec| {
+                    if rec.real_path == dev {
+                        match &mut rec.phase {
+                            crate::custody::CustodyPhase::Held { parts } => {
+                                parts.take().map(|p| {
+                                    rec.phase = crate::custody::CustodyPhase::Taken {
+                                        taker: crate::custody::CustodyTaker::OpenJob {
+                                            sid: lock(&io.sid).clone(),
+                                            gen: 1,
+                                        },
+                                    };
+                                    Preopened {
+                                        real_path: dev.to_string(),
+                                        parts: p,
+                                    }
+                                })
+                            }
+                            _ => None,
                         }
-                        _ => None,
+                    } else {
+                        None
                     }
-                } else {
-                    None
+                })
+            });
+            if pre.is_some() {
+                if let Some(entry) = inner.handoff.get_mut(&key) {
+                    entry.taken = true;
                 }
-            })
-        });
-        if pre.is_some() {
-            if let Some(entry) = inner.handoff.get_mut(&key) {
-                entry.taken = true;
+            } else {
+                inner.handoff.remove(&key);
             }
-        } else {
-            inner.handoff.remove(&key);
+            return BridgeTake::Handle(pre);
         }
-        BridgeTake::Handle(pre)
+
+        // handoff 查無交接列時：先看 io.preopened，再看 custody 是否有同 by_id 的 Parked handle (C1')
+        if let Some(pre) = lock(&io.preopened).take() {
+            return BridgeTake::Handle(Some(pre));
+        }
+
+        let by_id = lock(&io.profile).device_by_id.clone();
+        if let Ok((_token, parts)) = inner.custody.claim_parked(
+            &by_id,
+            dev,
+            crate::custody::CustodyTaker::OpenJob {
+                sid: lock(&io.sid).clone(),
+                gen: 1,
+            },
+        ) {
+            if let Some(parts) = parts {
+                return BridgeTake::Handle(Some(Preopened {
+                    real_path: dev.to_string(),
+                    parts,
+                }));
+            }
+        }
+
+        BridgeTake::Handle(None)
     }
 
     /// `open_bridge` 收尾：正式 bridge 已接手（Python `_handoff_attach_op_locked` `:4374-4383`）或 handle 已關閉
@@ -1902,11 +1943,24 @@ impl Shared {
             // 未消費的預開作業（佔位退休落盤失敗留下）：Python `_attach_by_id` 先自 `_preopened_ports` 取走作業，以同一
             // handle 續行 attach（`origin/main:sw_core/session_manager.py:4852-4854`）。handle 在本臨界區內交給新作業或
             // session 的交接列，不離開 manager 的追蹤。
-            let parked = inner.inflight.remove(by_id).and_then(|op| op.take_preopened());
+            let parked_op = inner.inflight.remove(by_id);
             if let Some(pre) = preopened.take() {
                 let _ = pre.parts.close();
             }
-            preopened = parked;
+            if let Some(op) = parked_op {
+                let current = inner.device_path(by_id).map(str::to_string);
+                let pre = inner
+                    .custody
+                    .claim_for_release(by_id, op.token)
+                    .ok()
+                    .flatten()
+                    .map(|parts| Preopened {
+                        real_path: current.clone().unwrap_or_default(),
+                        parts,
+                    })
+                    .or_else(|| op.take_preopened());
+                preopened = pre;
+            }
         }
         if let Some(op) = inner.inflight.get(by_id) {
             if after_clear {
@@ -1925,6 +1979,24 @@ impl Shared {
             }
             return;
         };
+        if preopened.is_none() {
+            if inner
+                .custody
+                .get_custody(by_id)
+                .is_some_and(|c| c.owner == crate::custody::CustodyOwner::Parked)
+            {
+                if let Ok((_token, Some(parts))) = inner.custody.claim_parked(
+                    by_id,
+                    &real,
+                    crate::custody::CustodyTaker::Worker("spawn_attach".into()),
+                ) {
+                    preopened = Some(Preopened {
+                        real_path: real.clone(),
+                        parts,
+                    });
+                }
+            }
+        }
         if let Some(e) = inner.session_by_id(by_id) {
             let pin_differs = pins
                 .get(by_id)
@@ -2616,7 +2688,14 @@ impl Shared {
         let from_ledger = {
             let mut inner = lock(&self.inner);
             inner.custody.custody.get_mut(by_id).and_then(|rec| match &mut rec.phase {
-                crate::custody::CustodyPhase::Held { parts } => parts.take(),
+                crate::custody::CustodyPhase::Held { parts } => {
+                    parts.take().map(|p| {
+                        rec.phase = crate::custody::CustodyPhase::Taken {
+                            taker: crate::custody::CustodyTaker::Worker("attach_dynamic".into()),
+                        };
+                        p
+                    })
+                }
                 _ => None,
             })
         };
@@ -3782,6 +3861,10 @@ impl ManagerExec {
 
 impl EffectExecutor for ManagerExec {
     fn execute(&mut self, e: Effect, tx: &Sender<ControlEvent>, safety: &Sender<ControlEvent>) {
+        #[cfg(feature = "test-fakes")]
+        if let Some(hook) = lock(&self.shared.executor_unwind_hook).take() {
+            hook();
+        }
         match e {
             Effect::Reply(reply, result) => {
                 let _ = reply.try_send(result);
@@ -3812,7 +3895,7 @@ impl EffectExecutor for ManagerExec {
                         epoch_hint: 0,
                         result,
                     });
-                    // actor 已結束（開埠期間 session 被移除）：沒有人會 adopt／drain，就地關閉以免 handle 懸置。
+                    // actor 已結束（開埠期間 session 被移除）：沒有人會 adopt／drain，送交回收者排空並依回條結算終態。
                     if let Err(crossbeam_channel::SendError(ControlEvent::BridgeOpened {
                         result: Ok(opened),
                         ..
@@ -3822,19 +3905,25 @@ impl EffectExecutor for ManagerExec {
                         lock(&opened_listener).remove(&opened.epoch);
                         let by_id = lock(&ctx.io.profile).device_by_id.clone();
                         let mut inner = lock(&ctx.shared.inner);
-                        let reclaimed = inner
+                        let token_and_worker = inner
                             .custody
                             .custody
                             .get(&by_id)
                             .map(|r| r.token)
                             .and_then(|token| {
                                 let w = inner.custody.claim_bridged_worker(token, opened.epoch).ok();
-                                inner.custody.remove_bridged(token);
-                                w
+                                w.map(|worker| (token, worker))
                             });
                         drop(inner);
-                        let worker_to_stop = reclaimed.unwrap_or(opened.worker);
-                        worker_to_stop.finish_async(crate::drain::StopId(0), control.clone());
+                        if let Some((token, worker)) = token_and_worker {
+                            let _ = ctx.shared.reaper_cmd_tx.send(crate::custody::ReaperCmd::Reclaim {
+                                token,
+                                epoch: opened.epoch,
+                                worker: Box::new(crate::custody::ReclaimWorker::Real(worker)),
+                            });
+                        } else {
+                            opened.worker.finish_async(crate::drain::StopId(0), control.clone());
+                        }
                     }
                 }));
                 if !submitted {
@@ -4144,6 +4233,32 @@ impl crate::custody::DelivererCallback for Shared {
     }
 }
 
+struct WeakSharedReaper(std::sync::Weak<Shared>);
+
+impl crate::custody::ReaperCallback for WeakSharedReaper {
+    fn handle_cmd(&self, cmd: crate::custody::ReaperCmd, event_tx: &crossbeam_channel::Sender<ControlEvent>) {
+        if let Some(shared) = self.0.upgrade() {
+            shared.handle_cmd(cmd, event_tx);
+        }
+    }
+
+    fn handle_worker_stopped(&self, receipt: crate::drain::WorkerStoppedReceipt) {
+        if let Some(shared) = self.0.upgrade() {
+            shared.handle_worker_stopped(receipt);
+        }
+    }
+}
+
+struct WeakSharedDeliverer(std::sync::Weak<Shared>);
+
+impl crate::custody::DelivererCallback for WeakSharedDeliverer {
+    fn step_delivery(&self) {
+        if let Some(shared) = self.0.upgrade() {
+            shared.step_delivery();
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SessionManager 公開介面
 // ---------------------------------------------------------------------------
@@ -4172,6 +4287,7 @@ impl SessionManager {
         let (reaper_cmd_tx, reaper_cmd_rx) = crossbeam_channel::unbounded();
         let (reaper_event_tx, reaper_event_rx) = crossbeam_channel::unbounded();
         let max_sessions = pyint_usize(&load.max_sessions, 16);
+        let unconfirmed_closes = UnconfirmedCloses::new();
         let shared = Arc::new(Shared {
             serial,
             uart_excl,
@@ -4190,7 +4306,7 @@ impl SessionManager {
             epochs: EpochAllocator::new(),
             templates: load.templates.clone(),
             max_sessions,
-            inner: Mutex::new(Inner::default()),
+            inner: Mutex::new(Inner::new(unconfirmed_closes.clone())),
             cv: Condvar::new(),
             note_tx: note_tx.clone(),
             bg_index: {
@@ -4205,7 +4321,7 @@ impl SessionManager {
                 }));
                 index
             },
-            unconfirmed_closes: UnconfirmedCloses::new(),
+            unconfirmed_closes,
             closed: AtomicBool::new(false),
             persist_observer: Mutex::new(None),
             probe_tx_frozen: AtomicBool::new(false),
@@ -4234,20 +4350,18 @@ impl SessionManager {
             query_timeout_override: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             file_transfer_timeout_override: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            executor_unwind_hook: Mutex::new(None),
             reaper_cmd_tx,
-            reaper: Mutex::new(None),
-            deliverer_thread: Mutex::new(None),
         });
         let reaper_thread = crate::custody::ReaperThread::start(
             reaper_cmd_rx,
             reaper_event_rx,
             reaper_event_tx,
-            shared.clone(),
+            Arc::new(WeakSharedReaper(Arc::downgrade(&shared))),
         );
-        *lock(&shared.reaper) = Some(reaper_thread);
 
-        let deliverer_thread = crate::custody::DelivererThread::start(shared.clone());
-        *lock(&shared.deliverer_thread) = Some(deliverer_thread);
+        let deliverer_thread = crate::custody::DelivererThread::start(Arc::new(WeakSharedDeliverer(Arc::downgrade(&shared))));
         shared.bootstrap_sessions(&load.profiles);
         let mgr = Arc::new(SessionManager {
             shared: shared.clone(),
@@ -4255,6 +4369,8 @@ impl SessionManager {
             watcher_rx: watcher_rx.clone(),
             note_rx: note_rx.clone(),
             pump_lock: Arc::new(Mutex::new(())),
+            reaper: Mutex::new(Some(reaper_thread)),
+            deliverer: Mutex::new(Some(deliverer_thread)),
             _console: console,
             _caps: caps,
         });
@@ -5752,6 +5868,96 @@ impl SessionManager {
         inner.sessions.get(sid).map(|e| e.actor.control.clone())
     }
 
+    /// 只供測試（test-fakes）：在帳本登記一筆以指定 session 為 owner 的 Held 紀錄。
+    #[cfg(feature = "test-fakes")]
+    pub fn custody_register_held_session_for_test(&self, sid: &str, by_id: &str, real_path: &str) -> u64 {
+        let mut inner = lock(&self.shared.inner);
+        let inc = inner.custody.current_session_inc(sid);
+        let token = inner
+            .custody
+            .register(
+                by_id,
+                real_path,
+                crate::custody::CustodyOwner::Session { sid: sid.to_string(), inc },
+                crate::custody::CustodyTaker::OpenJob {
+                    sid: sid.to_string(),
+                    gen: 1,
+                },
+            )
+            .expect("register ok");
+        inner.custody.save_held_mock(token).expect("save_held_mock ok");
+        token
+    }
+
+    /// 只供測試（test-fakes）：在帳本登記一筆 owner 為 Parked 的 Held 紀錄。
+    #[cfg(feature = "test-fakes")]
+    pub fn custody_register_parked_for_test(
+        &self,
+        by_id: &str,
+        real_path: &str,
+        parts: Option<HandleParts>,
+    ) -> u64 {
+        let mut inner = lock(&self.shared.inner);
+        inner.devices.insert(
+            by_id.to_string(),
+            DeviceInfo {
+                by_id: by_id.to_string(),
+                real_path: real_path.to_string(),
+            },
+        );
+        let token = inner
+            .custody
+            .register(
+                by_id,
+                real_path,
+                crate::custody::CustodyOwner::Parked,
+                crate::custody::CustodyTaker::OpenJob {
+                    sid: "parked".to_string(),
+                    gen: 1,
+                },
+            )
+            .expect("register ok");
+        if let Some(rec) = inner.custody.custody.get_mut(by_id) {
+            rec.owner = crate::custody::CustodyOwner::Parked;
+            rec.phase = crate::custody::CustodyPhase::Held { parts };
+        }
+        token
+    }
+
+    /// 只供測試（test-fakes）：取得回收者命令通道。
+    #[cfg(feature = "test-fakes")]
+    pub fn reaper_cmd_sender_for_test(&self) -> crossbeam_channel::Sender<crate::custody::ReaperCmd> {
+        self.shared.reaper_cmd_tx.clone()
+    }
+
+    /// 只供測試（test-fakes）：以真實 IoWorker 登錄帳本為 Bridged。
+    #[cfg(feature = "test-fakes")]
+    pub fn custody_register_bridged_worker_for_test(
+        &self,
+        sid: &str,
+        by_id: &str,
+        real_path: &str,
+        epoch: u64,
+        worker: crate::uart_bridge::IoWorker,
+    ) -> u64 {
+        let mut inner = lock(&self.shared.inner);
+        let inc = inner.custody.alloc_session_inc(sid);
+        let token = inner
+            .custody
+            .register(
+                by_id,
+                real_path,
+                crate::custody::CustodyOwner::Session { sid: sid.to_string(), inc },
+                crate::custody::CustodyTaker::OpenJob {
+                    sid: sid.to_string(),
+                    gen: 1,
+                },
+            )
+            .expect("register ok");
+        inner.custody.adopt_bridged(token, epoch, worker).expect("adopt_bridged ok");
+        token
+    }
+
     /// 只供測試（test-fakes）：查詢 session 已退休的 epoch 集合。
     #[cfg(feature = "test-fakes")]
     pub fn retired_drains_for_test(&self, sid: &str) -> Vec<u64> {
@@ -6100,6 +6306,7 @@ impl SessionManager {
         for by_id in late {
             out.push((format!("attach:{by_id}"), wait_attach(&by_id)));
         }
+        self.stop_background_threads();
         out
     }
 
@@ -6283,6 +6490,22 @@ impl SessionManager {
     pub fn set_file_transfer_timeout_for_test(&self, timeout: Duration) {
         *lock(&self.shared.file_transfer_timeout_override) = Some(timeout);
     }
+
+    /// 停止回收者與送達者背景執行緒（在不持有 manager 鎖的情況下停止並 join）。
+    pub fn stop_background_threads(&self) {
+        if let Some(mut r) = lock(&self.reaper).take() {
+            r.stop();
+        }
+        if let Some(mut d) = lock(&self.deliverer).take() {
+            d.stop();
+        }
+    }
+
+    /// 只供測試（test-fakes）：設定 executor unwind 鉤子（重現 actor 在 catch_unwind 之外崩潰）。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_executor_unwind_hook_for_test(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        *lock(&self.shared.executor_unwind_hook) = Some(hook);
+    }
 }
 
 /// 依序處理已排入的 watcher 事件與通知（呼叫端須持 `pump_lock`）；回傳是否處理過任何事件。
@@ -6310,6 +6533,7 @@ fn drain_events(
 impl Drop for SessionManager {
     fn drop(&mut self) {
         self.shared.closed.store(true, Ordering::SeqCst);
+        self.stop_background_threads();
     }
 }
 
