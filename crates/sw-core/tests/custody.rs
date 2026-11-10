@@ -12,17 +12,24 @@
 //! - 世代號防止舊命令處理新 actor 的紀錄
 //! - wait_for_rx_dispatch 區分斷線與逾時兩種缺口文字
 
+#![cfg(feature = "test-fakes")]
+
+mod support;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use crossbeam_channel::{bounded, unbounded};
+use support::*;
+use sw_core::actor::*;
 use sw_core::admission::{AdmissionGate, FreezeOutcome, HandoffFreezeState};
 use sw_core::custody::*;
 use sw_core::drain::{StopId, WorkerStoppedReceipt};
-use sw_core::mailbox::ControlEvent;
+use sw_core::mailbox::{ControlEvent, Mailbox};
 use sw_core::session_core::UnconfirmedCloses;
+use sw_core::session_manager::HandleParts;
 use sw_core::tx_writer::{EvidenceGap, TxLedger};
-use sw_pal::traits::{PalError, PalErrorKind};
+use sw_pal::traits::{Clock, PalError, PalErrorKind, SerialBackend};
 
 #[test]
 fn test_c1_c8_transitions_valid_and_invalid() {
@@ -178,7 +185,7 @@ fn test_reaper_worker_stopped_separate_handle_and_evidence() {
         close_error: None,
     };
 
-    let term = ledger.settle_worker_stopped(token, receipt_incomplete);
+    let term = ledger.settle_worker_stopped(token, receipt_incomplete).expect("settle worker stopped");
     assert_eq!(term.handle, TerminalHandle::Closed);
     assert!(matches!(term.evidence, TerminalEvidence::Incomplete { .. }));
     // handle 安全關閉 -> 紀錄移除，不進入 unconfirmed
@@ -204,7 +211,7 @@ fn test_reaper_worker_stopped_separate_handle_and_evidence() {
         close_error: Some(PalError::plain(PalErrorKind::Io, "close failed")),
     };
 
-    let term2 = ledger.settle_worker_stopped(token2, receipt_failed);
+    let term2 = ledger.settle_worker_stopped(token2, receipt_failed).expect("settle worker stopped failed handle");
     assert!(matches!(term2.handle, TerminalHandle::Failed { .. }));
     // handle 關閉失敗 -> 紀錄轉為 CloseFailed 並記入 unconfirmed
     let c = ledger.get_custody(by_id).expect("CloseFailed 紀錄保留");
@@ -258,36 +265,121 @@ fn test_panic_guard_reports_failed_unknown() {
 
 #[test]
 fn test_exit_reclaim_triggers_on_normal_exit_panic_and_unwind_but_not_spawn_failure() {
-    let (tx, rx) = unbounded();
-
-    // 1. 正常結束
+    // 1. 正常結束：經由 try_spawn_actor_with_reaper 啟動，發送 Shutdown，執行緒退出，reaper 收到恰好 1 筆 ActorExited
     {
-        let _guard = ExitReclaim::new("COM1".into(), 1, tx.clone());
-    }
-    match rx.try_recv() {
-        Ok(ReaperCmd::ActorExited { sid, inc }) => {
-            assert_eq!(sid, "COM1");
-            assert_eq!(inc, 1);
+        let (reaper_tx, reaper_rx) = unbounded();
+        let h = CoreHarness::new(SHELL_PROFILE);
+        let clock: Arc<dyn Clock> = h.clock.clone();
+        let core = h.core;
+        let expected_sid = core.session_id().to_string();
+        let mb = Mailbox::new(256, 1024);
+        let control = mb.control_sender();
+        let handle = try_spawn_actor_with_reaper(core, mb, Box::new(ReplyExec), clock, 1, Some(reaper_tx))
+            .expect("spawn actor 成功");
+
+        let (reply, _reply_rx) = bounded(1);
+        control.send(ControlEvent::Shutdown { reply }).unwrap();
+        handle.join.join().expect("actor thread 正常退出");
+
+        let cmd = reaper_rx.try_recv().expect("reaper 應收到 ActorExited");
+        match cmd {
+            ReaperCmd::ActorExited { sid, inc } => {
+                assert_eq!(sid, expected_sid);
+                assert_eq!(inc, 1);
+            }
+            _ => panic!("預期 ActorExited"),
         }
-        _ => panic!("預期 ActorExited"),
+        assert!(reaper_rx.try_recv().is_err(), "正常退出不應有多餘命令");
     }
 
-    // 2. unwind / panic 結束
-    let res = std::panic::catch_unwind(|| {
-        let _guard = ExitReclaim::new("COM2".into(), 2, tx.clone());
-        panic!("simulated actor panic");
-    });
-    assert!(res.is_err());
-    match rx.try_recv() {
-        Ok(ReaperCmd::ActorExited { sid, inc }) => {
-            assert_eq!(sid, "COM2");
-            assert_eq!(inc, 2);
+    // 2. unwind 退出：在 actor 執行緒 closure 內部 unwind，ExitReclaim 的 Drop 送出恰好 1 筆 ActorExited
+    {
+        let (reaper_tx, reaper_rx) = unbounded();
+        let h = CoreHarness::new(SHELL_PROFILE);
+        let clock: Arc<dyn Clock> = h.clock.clone();
+        let core = h.core;
+        let expected_sid = core.session_id().to_string();
+        let mb = Mailbox::new(256, 1024);
+
+        struct UnwindingExec;
+        impl EffectExecutor for UnwindingExec {
+            fn execute(
+                &mut self,
+                _effect: sw_core::session_core::Effect,
+                _control: &crossbeam_channel::Sender<ControlEvent>,
+                _safety: &crossbeam_channel::Sender<ControlEvent>,
+            ) {
+                panic!("unwind inside actor thread closure");
+            }
         }
-        _ => panic!("預期 ActorExited"),
+
+        let handle = try_spawn_actor_with_reaper(core, mb, Box::new(UnwindingExec), clock, 2, Some(reaper_tx))
+            .expect("spawn actor 成功");
+
+        // 發送一個會產生 Effect::Reply 的請求，觸發 executor panic unwind
+        let (reply, _reply_rx) = bounded(1);
+        let _ = handle.control.send(ControlEvent::Request {
+            req: sw_core::session_core::SessionRequest::GetState,
+            reply,
+        });
+
+        let join_res = handle.join.join();
+        assert!(join_res.is_err(), "actor thread 應 unwind");
+
+        let cmd = reaper_rx.try_recv().expect("unwind 時 reaper 應收到 ActorExited");
+        match cmd {
+            ReaperCmd::ActorExited { sid, inc } => {
+                assert_eq!(sid, expected_sid);
+                assert_eq!(inc, 2);
+            }
+            _ => panic!("預期 ActorExited"),
+        }
+        assert!(reaper_rx.try_recv().is_err(), "unwind 不應有多餘命令");
     }
 
-    // 3. spawn 失敗路徑：尚未進入執行緒 closure，ExitReclaim 不建立，通道應為空
-    assert!(rx.try_recv().is_err());
+    // 3. panic 超限退出：連續 panic 事件達到上限後退出
+    {
+        let (reaper_tx, reaper_rx) = unbounded();
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.core.arm_panic_on_next_events(3);
+        let clock: Arc<dyn Clock> = h.clock.clone();
+        let core = h.core;
+        let expected_sid = core.session_id().to_string();
+        let mb = Mailbox::new(256, 1024);
+        let handle = try_spawn_actor_with_reaper(core, mb, Box::new(ReplyExec), clock, 3, Some(reaper_tx))
+            .expect("spawn actor 成功");
+
+        for _ in 0..3 {
+            let _ = handle.request(sw_core::session_core::SessionRequest::GetState, Duration::from_secs(2));
+        }
+        let (reply, _reply_rx) = bounded(1);
+        let _ = handle.control.send(ControlEvent::Shutdown { reply });
+        let _ = handle.join.join();
+
+        let cmd = reaper_rx.try_recv().expect("panic 超限後退出 reaper 應收到 ActorExited");
+        match cmd {
+            ReaperCmd::ActorExited { sid, inc } => {
+                assert_eq!(sid, expected_sid);
+                assert_eq!(inc, 3);
+            }
+            _ => panic!("預期 ActorExited"),
+        }
+        assert!(reaper_rx.try_recv().is_err(), "panic 超限退出不應有多餘命令");
+    }
+
+    // 4. spawn 失敗路徑：注入失敗，try_spawn_actor_with_reaper 回傳 Err，未進入 closure，reaper 通道為空
+    {
+        let (reaper_tx, reaper_rx) = unbounded();
+        let h = CoreHarness::new(SHELL_PROFILE);
+        let clock: Arc<dyn Clock> = h.clock.clone();
+        let core = h.core;
+        let mb = Mailbox::new(256, 1024);
+
+        inject_actor_spawn_fail(1);
+        let res = try_spawn_actor_with_reaper(core, mb, Box::new(ReplyExec), clock, 4, Some(reaper_tx));
+        assert!(res.is_err(), "注入失敗時應回傳 Err");
+        assert!(reaper_rx.try_recv().is_err(), "spawn 失敗時不得送出任何命令");
+    }
 }
 
 #[test]
@@ -380,6 +472,225 @@ fn test_deliverer_backoff_cancellation_freeze_and_timeout() {
 }
 
 #[test]
+fn test_deliverer_pending_duration_excluded_from_30s_timeout() {
+    let gate = Arc::new(AdmissionGate::new());
+    let mut deliverer = Deliverer::new(gate.clone());
+    let (actor_tx, actor_rx) = bounded(1);
+
+    let sid = "COM1";
+    let by_id = "by-id-freeze";
+    let real_path = "/dev/ttyUSB0";
+
+    let t0 = Instant::now();
+    deliverer.add_obligation(sid, by_id, real_path, 1, 1);
+
+    // 讓 actor lane 滿
+    actor_tx.send(ControlEvent::Tick).unwrap();
+
+    // 在 Open 狀態經歷 29.9 秒重試
+    let t_29_9 = t0 + Duration::from_millis(29_900);
+    let outcome = deliverer.step_delivery(sid, &actor_tx, t_29_9);
+    assert_eq!(outcome, DeliveryStepResult::Backoff);
+
+    // 進入 Pending 狀態
+    let freeze_res = gate.freeze_if_idle("freeze-op");
+    let freeze_token = match freeze_res {
+        FreezeOutcome::Frozen { token, .. } => token,
+        _ => panic!("預期 Frozen"),
+    };
+    assert_eq!(gate.handoff_freeze_state(), HandoffFreezeState::Pending);
+
+    // 在 Pending 狀態度過 5 秒
+    let t_pending = t_29_9 + Duration::from_secs(5);
+    let outcome_p = deliverer.step_delivery(sid, &actor_tx, t_pending);
+    assert_eq!(outcome_p, DeliveryStepResult::PausedPending);
+
+    // 回復為 Open 狀態
+    assert!(gate.thaw(&freeze_token));
+    assert_eq!(gate.handoff_freeze_state(), HandoffFreezeState::Open);
+
+    // 釋放 actor 容量
+    let _ = actor_rx.try_recv();
+
+    // 在解凍後（自 t0 算起已過去 35 秒，但 Open 累積時間僅 29.9 秒）
+    // 應繼續投遞成功，不得被判定 TimedOut 丟棄！
+    let t_thawed = t_pending + Duration::from_millis(10);
+    let outcome_final = deliverer.step_delivery(sid, &actor_tx, t_thawed);
+    assert_ne!(outcome_final, DeliveryStepResult::TimedOut, "Pending 期間不得計入 30s 總時限");
+    assert_eq!(outcome_final, DeliveryStepResult::Delivered);
+    assert_eq!(deliverer.obligation_count(), 0);
+}
+
+#[test]
+fn test_handle_actor_exited_takes_resources_and_produces_close_jobs() {
+    let unconfirmed = UnconfirmedCloses::new();
+    let mut ledger = CustodyLedger::new(unconfirmed.clone());
+
+    // 1. Held { parts }：放入真實 HandleParts 替身
+    let backend = sw_pal::fakes::serial::FakeSerialBackend::new();
+    let _dev_entry = backend.add_device("/dev/ttyUSB0");
+    let dev = sw_pal::traits::DevicePath("/dev/ttyUSB0".into());
+    let cfg = sw_pal::traits::SerialConfig::from_uart_profile(115200, 8, "none", 1, "none", false);
+    let handle = backend.open_exclusive(&dev, &cfg).expect("open fake serial");
+    let parts = HandleParts::split(handle);
+
+    let sid = "COM1";
+    let inc = ledger.alloc_session_inc(sid);
+    let token = ledger.register(
+        "by-id-held",
+        "/dev/ttyUSB0",
+        CustodyOwner::Session { sid: sid.into(), inc },
+        CustodyTaker::OpenJob { sid: sid.into(), gen: 1 },
+    ).unwrap();
+
+    // 存入 parts
+    {
+        let rec = ledger.custody.get_mut("by-id-held").unwrap();
+        rec.phase = CustodyPhase::Held { parts: Some(parts) };
+    }
+
+    // 當同世代 actor 結束時，呼叫 handle_actor_exited
+    let mut jobs = ledger.handle_actor_exited(sid, inc);
+    assert_eq!(jobs.len(), 1, "應產出恰好一個關閉工作");
+    let job = jobs.pop().unwrap();
+    match &job {
+        ActorExitedJob::CloseHeld { token: t, by_id, parts } => {
+            assert_eq!(*t, token);
+            assert_eq!(by_id, "by-id-held");
+            assert!(parts.is_some(), "parts 必須被取出移交，不得被直接丟失");
+        }
+        _ => panic!("預期 CloseHeld"),
+    }
+
+    // 帳本狀態應轉為 Closing，owner 為 Reaper
+    let snap = ledger.get_custody("by-id-held").unwrap().snapshot();
+    assert_eq!(snap.owner, CustodyOwner::Reaper);
+    assert!(matches!(snap.phase, CustodyPhaseSnapshot::Closing { .. }));
+
+    // 執行工作者關閉，結算進帳本
+    let term = job.execute_and_settle(&mut ledger, None).unwrap();
+    assert_eq!(term.handle, TerminalHandle::Closed);
+    assert!(ledger.get_custody("by-id-held").is_none(), "關閉成功後紀錄應移除");
+
+    // 1b. Held { parts } 關閉失敗回條測試
+    let fake_dev_fail = backend.add_device("/dev/ttyUSB0_fail");
+    fake_dev_fail.fail_close(PalError::plain(PalErrorKind::Io, "injected close failure"));
+    let dev_fail = sw_pal::traits::DevicePath("/dev/ttyUSB0_fail".into());
+    let handle_fail = backend.open_exclusive(&dev_fail, &cfg).expect("open fake serial fail dev");
+    let parts_fail = HandleParts::split(handle_fail);
+
+    let _token_fail = ledger.register(
+        "by-id-held-fail",
+        "/dev/ttyUSB0_fail",
+        CustodyOwner::Session { sid: sid.into(), inc },
+        CustodyTaker::OpenJob { sid: sid.into(), gen: 3 },
+    ).unwrap();
+    {
+        let rec = ledger.custody.get_mut("by-id-held-fail").unwrap();
+        rec.phase = CustodyPhase::Held { parts: Some(parts_fail) };
+    }
+
+    let mut jobs_fail = ledger.handle_actor_exited(sid, inc);
+    assert_eq!(jobs_fail.len(), 1);
+    let term_fail = jobs_fail.pop().unwrap().execute_and_settle(&mut ledger, None).unwrap();
+    assert!(matches!(term_fail.handle, TerminalHandle::Failed { .. }));
+    // 關閉失敗：紀錄轉為 CloseFailed 並記入 unconfirmed
+    let snap_fail = ledger.get_custody("by-id-held-fail").unwrap().snapshot();
+    assert!(matches!(snap_fail.phase, CustodyPhaseSnapshot::CloseFailed { .. }));
+    assert!(unconfirmed.contains("by-id-held-fail"));
+
+    // 2. Bridged { worker: None }（已被 AdoptBridge 取出，受 Reclaim 守衛保護）
+    let _token2 = ledger.register(
+        "by-id-bridged-none",
+        "/dev/ttyUSB1",
+        CustodyOwner::Session { sid: sid.into(), inc },
+        CustodyTaker::OpenJob { sid: sid.into(), gen: 2 },
+    ).unwrap();
+    {
+        let rec = ledger.custody.get_mut("by-id-bridged-none").unwrap();
+        rec.phase = CustodyPhase::Bridged { epoch: 10, worker: None };
+    }
+    let jobs2 = ledger.handle_actor_exited(sid, inc);
+    assert!(jobs2.is_empty(), "Bridged{{worker: None}} 應留給 Reclaim 處理，不產出 job 也不覆寫");
+    let snap2 = ledger.get_custody("by-id-bridged-none").unwrap().snapshot();
+    assert!(matches!(snap2.phase, CustodyPhaseSnapshot::Bridged { epoch: 10, worker_in_ledger: false }));
+
+    // 3. mark_bridge_draining 能安全取出 worker
+    let token3 = ledger.register(
+        "by-id-drain",
+        "/dev/ttyUSB2",
+        CustodyOwner::Reaper,
+        CustodyTaker::Worker("w".into()),
+    ).unwrap();
+    {
+        let rec = ledger.custody.get_mut("by-id-drain").unwrap();
+        rec.phase = CustodyPhase::Bridged { epoch: 20, worker: None };
+    }
+    let worker_opt = ledger.mark_bridge_draining(token3, 20).unwrap();
+    assert!(worker_opt.is_none());
+    let snap3 = ledger.get_custody("by-id-drain").unwrap().snapshot();
+    assert!(matches!(snap3.phase, CustodyPhaseSnapshot::BridgeDraining { epoch: 20 }));
+}
+
+#[test]
+fn test_settle_worker_stopped_rejects_mismatched_epoch_and_stale_receipts() {
+    let unconfirmed = UnconfirmedCloses::new();
+    let mut ledger = CustodyLedger::new(unconfirmed.clone());
+
+    let by_id = "by-id-settle-repro";
+    let token = ledger.register(
+        by_id,
+        "/dev/ttyUSB0",
+        CustodyOwner::Reaper,
+        CustodyTaker::Worker("w".into()),
+    ).unwrap();
+
+    ledger.mark_bridge_draining(token, 2).unwrap();
+
+    // 1. 傳入過期回條 (epoch 1) 給處於 epoch 2 的 BridgeDraining
+    let receipt_stale = WorkerStoppedReceipt {
+        epoch: 1,
+        stop_id: StopId(1),
+        ledger: TxLedger::default(),
+        unrecorded: vec![],
+        wal_error: None,
+        handle_closed: true,
+        close_error: None,
+    };
+    let res = ledger.settle_worker_stopped(token, receipt_stale);
+    assert_eq!(
+        res,
+        Err(CustodySettleError::EpochMismatch { expected: 2, actual: 1 }),
+        "過期回條應被拒絕"
+    );
+    // 紀錄不得被移除，阻擋不得解除
+    let rec = ledger.get_custody(by_id).expect("紀錄必須保留");
+    assert!(matches!(rec.phase, CustodyPhase::BridgeDraining { epoch: 2 }));
+
+    // 2. 傳入未知 token
+    let make_receipt_ok = || WorkerStoppedReceipt {
+        epoch: 2,
+        stop_id: StopId(2),
+        ledger: TxLedger::default(),
+        unrecorded: vec![],
+        wal_error: None,
+        handle_closed: true,
+        close_error: None,
+    };
+    let res_unknown = ledger.settle_worker_stopped(99999, make_receipt_ok());
+    assert_eq!(res_unknown, Err(CustodySettleError::TokenNotFound));
+
+    // 3. 傳入相符的 epoch: 2 回條
+    let res_ok = ledger.settle_worker_stopped(token, make_receipt_ok());
+    assert!(res_ok.is_ok(), "正確回條應結算成功");
+    assert!(ledger.get_custody(by_id).is_none(), "成功關閉回條應移除紀錄並解除阻擋");
+
+    // 4. 重複結算同一 token 應被拒絕
+    let res_dup = ledger.settle_worker_stopped(token, make_receipt_ok());
+    assert_eq!(res_dup, Err(CustodySettleError::AlreadySettled), "重複回條應被拒絕");
+}
+
+#[test]
 fn test_generation_inc_prevents_stale_command() {
     let unconfirmed = UnconfirmedCloses::new();
     let mut ledger = CustodyLedger::new(unconfirmed);
@@ -400,8 +711,8 @@ fn test_generation_inc_prevents_stale_command() {
     assert_eq!(inc2, 2);
 
     // 舊世代 (inc=1) 的 ActorExited 命令到達
-    let stale_handled = ledger.handle_actor_exited(sid, inc1);
-    assert!(!stale_handled, "舊世代命令不應影響當前世代帳本紀錄");
+    let stale_jobs = ledger.handle_actor_exited(sid, inc1);
+    assert!(stale_jobs.is_empty(), "舊世代命令不應影響當前世代帳本紀錄");
 
     // 紀錄應維持原樣
     let c = ledger.get_custody("by-id-gen").unwrap();

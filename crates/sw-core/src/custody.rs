@@ -158,16 +158,97 @@ pub enum CustodyClaimParkedError {
     NotHeld,
 }
 
+/// 結算回收者排空終態失敗原因。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustodySettleError {
+    TokenNotFound,
+    AlreadySettled,
+    InvalidPhase,
+    EpochMismatch { expected: u64, actual: u64 },
+}
+
+/// actor 結束時由帳本產出的資源關閉／排空工作（具所有權）。
+pub enum ActorExitedJob {
+    CloseHeld {
+        token: u64,
+        by_id: String,
+        parts: Option<HandleParts>,
+    },
+    DrainBridge {
+        token: u64,
+        by_id: String,
+        epoch: u64,
+        worker: Option<IoWorker>,
+    },
+}
+
+impl ActorExitedJob {
+    pub fn token(&self) -> u64 {
+        match self {
+            ActorExitedJob::CloseHeld { token, .. } => *token,
+            ActorExitedJob::DrainBridge { token, .. } => *token,
+        }
+    }
+
+    pub fn by_id(&self) -> &str {
+        match self {
+            ActorExitedJob::CloseHeld { by_id, .. } => by_id,
+            ActorExitedJob::DrainBridge { by_id, .. } => by_id,
+        }
+    }
+
+    /// 執行關閉或啟動排空，並於 CloseHeld 時結算進帳本回傳 terminal。
+    pub fn execute_and_settle(
+        self,
+        ledger: &mut CustodyLedger,
+        reaper_tx: Option<&Sender<ControlEvent>>,
+    ) -> Option<Terminal> {
+        match self {
+            ActorExitedJob::CloseHeld { token, parts, .. } => {
+                let receipt = parts.map(|p| p.close());
+                let (handle_term, evidence_term) = match receipt {
+                    Some(r) if r.closed => (TerminalHandle::Closed, TerminalEvidence::Complete),
+                    Some(r) => (
+                        TerminalHandle::Failed {
+                            error: r
+                                .error
+                                .map(|e| e.py_message)
+                                .unwrap_or_else(|| "handle close failed".into()),
+                        },
+                        TerminalEvidence::Complete,
+                    ),
+                    None => (TerminalHandle::Closed, TerminalEvidence::Complete),
+                };
+                let term = Terminal {
+                    handle: handle_term,
+                    evidence: evidence_term,
+                };
+                ledger.settle_close(token, term.clone());
+                Some(term)
+            }
+            ActorExitedJob::DrainBridge { worker, .. } => {
+                if let Some(worker) = worker {
+                    if let Some(tx) = reaper_tx {
+                        worker.finish_async(crate::drain::StopId(0), tx.clone());
+                    }
+                }
+                None
+            }
+        }
+    }
+}
+
 /// DeviceAttached 送達義務。
 #[derive(Debug, Clone)]
 pub struct DeliveryObligation {
     pub event: DeviceAttachedEvent,
     pub bind_gen: u64,
     pub inc: u64,
-    pub first_at: Instant,
     pub next_at: Instant,
     pub backoff: Duration,
     pub attempts: usize,
+    pub open_elapsed: Duration,
+    pub last_open_at: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -420,22 +501,77 @@ impl CustodyLedger {
         self.custody.values().find(|c| c.token == token)
     }
 
-    pub fn mark_bridge_draining(&mut self, token: u64, epoch: u64) -> Result<(), &'static str> {
+    pub fn mark_bridge_draining(&mut self, token: u64, epoch: u64) -> Result<Option<IoWorker>, &'static str> {
         for rec in self.custody.values_mut() {
             if rec.token == token {
+                let worker = match &mut rec.phase {
+                    CustodyPhase::Bridged { worker, .. } => worker.take(),
+                    _ => None,
+                };
                 rec.phase = CustodyPhase::BridgeDraining { epoch };
-                return Ok(());
+                return Ok(worker);
             }
         }
         Err("token not found")
     }
 
-    /// 結算回收者排空終態（分開 handle 關閉與證據完整度）。
-    pub fn settle_worker_stopped(&mut self, token: u64, receipt: WorkerStoppedReceipt) -> Terminal {
+    /// 結算關閉終態（由關閉工作者回報）。
+    pub fn settle_close(&mut self, token: u64, terminal: Terminal) {
+        self.terminals.insert(token, terminal.clone());
+        let by_id_found = self.custody.iter().find_map(|(k, v)| (v.token == token).then(|| k.clone()));
+        if let Some(by_id) = by_id_found {
+            match &terminal.handle {
+                TerminalHandle::Closed | TerminalHandle::NoHandle => {
+                    self.custody.remove(&by_id);
+                    self.tombstones.insert(token);
+                }
+                TerminalHandle::Failed { error } => {
+                    if let Some(rec) = self.custody.get_mut(&by_id) {
+                        rec.phase = CustodyPhase::CloseFailed { error: error.clone() };
+                    }
+                    self.unconfirmed.insert(&by_id);
+                }
+            }
+        }
+    }
+
+    /// 結算回收者排空終態（分開 handle 關閉與證據完整度；驗證 token／epoch／phase 配對）。
+    pub fn settle_worker_stopped(
+        &mut self,
+        token: u64,
+        receipt: WorkerStoppedReceipt,
+    ) -> Result<Terminal, CustodySettleError> {
+        if self.terminals.contains_key(&token) || self.tombstones.contains(&token) {
+            return Err(CustodySettleError::AlreadySettled);
+        }
+
+        let (by_id, expected_epoch) = match self.custody.iter().find(|(_, v)| v.token == token) {
+            Some((k, v)) => match &v.phase {
+                CustodyPhase::BridgeDraining { epoch } => (k.clone(), Some(*epoch)),
+                CustodyPhase::Closing { .. } => (k.clone(), None),
+                _ => return Err(CustodySettleError::InvalidPhase),
+            },
+            None => return Err(CustodySettleError::TokenNotFound),
+        };
+
+        if let Some(expected) = expected_epoch {
+            if expected != receipt.epoch {
+                return Err(CustodySettleError::EpochMismatch {
+                    expected,
+                    actual: receipt.epoch,
+                });
+            }
+        }
+
         let handle_term = if receipt.handle_closed {
             TerminalHandle::Closed
         } else {
-            TerminalHandle::Failed { error: "handle_closed: false".into() }
+            TerminalHandle::Failed {
+                error: receipt
+                    .close_error
+                    .map(|e| e.py_message)
+                    .unwrap_or_else(|| "handle_closed: false".into()),
+            }
         };
 
         let evidence_term = if receipt.unrecorded.is_empty() && receipt.wal_error.is_none() {
@@ -455,25 +591,20 @@ impl CustodyLedger {
         self.terminals.insert(token, terminal.clone());
 
         // 依 C3 處置紀錄
-        let by_id_found = self.custody.iter().find_map(|(k, v)| (v.token == token).then(|| k.clone()));
-        if let Some(by_id) = by_id_found {
-            match &terminal.handle {
-                TerminalHandle::Closed => {
-                    self.custody.remove(&by_id);
+        match &terminal.handle {
+            TerminalHandle::Closed | TerminalHandle::NoHandle => {
+                self.custody.remove(&by_id);
+                self.tombstones.insert(token);
+            }
+            TerminalHandle::Failed { error } => {
+                if let Some(rec) = self.custody.get_mut(&by_id) {
+                    rec.phase = CustodyPhase::CloseFailed { error: error.clone() };
                 }
-                TerminalHandle::Failed { error } => {
-                    if let Some(rec) = self.custody.get_mut(&by_id) {
-                        rec.phase = CustodyPhase::CloseFailed { error: error.clone() };
-                    }
-                    self.unconfirmed.insert(&by_id);
-                }
-                TerminalHandle::NoHandle => {
-                    self.custody.remove(&by_id);
-                }
+                self.unconfirmed.insert(&by_id);
             }
         }
 
-        terminal
+        Ok(terminal)
     }
 
     /// panic 守衛結算終態。
@@ -493,33 +624,48 @@ impl CustodyLedger {
         terminal
     }
 
-    /// 處理同世代的 ActorExited；非同世代的命令不予理會。
-    pub fn handle_actor_exited(&mut self, sid: &str, inc: u64) -> bool {
+    /// 處理同世代的 ActorExited，鎖內取出受保管資源並產生具所有權的關閉／排空工作；非同世代的命令不予理會。
+    pub fn handle_actor_exited(&mut self, sid: &str, inc: u64) -> Vec<ActorExitedJob> {
         let current_inc = self.current_session_inc(sid);
         if inc != current_inc {
-            return false;
+            return Vec::new();
         }
 
-        let mut affected = false;
-        for rec in self.custody.values_mut() {
+        let mut jobs = Vec::new();
+        for (by_id, rec) in self.custody.iter_mut() {
             if let CustodyOwner::Session { sid: s, inc: i } = &rec.owner {
                 if s == sid && *i == inc {
-                    affected = true;
-                    match &rec.phase {
-                        CustodyPhase::Held { .. } => {
+                    match &mut rec.phase {
+                        CustodyPhase::Held { parts } => {
+                            let parts_taken = parts.take();
                             rec.phase = CustodyPhase::Closing { job: "actor_exited".into() };
                             rec.owner = CustodyOwner::Reaper;
+                            jobs.push(ActorExitedJob::CloseHeld {
+                                token: rec.token,
+                                by_id: by_id.clone(),
+                                parts: parts_taken,
+                            });
                         }
-                        CustodyPhase::Bridged { epoch, .. } => {
-                            rec.phase = CustodyPhase::BridgeDraining { epoch: *epoch };
-                            rec.owner = CustodyOwner::Reaper;
+                        CustodyPhase::Bridged { epoch, worker } => {
+                            if let Some(w) = worker.take() {
+                                let ep = *epoch;
+                                rec.phase = CustodyPhase::BridgeDraining { epoch: ep };
+                                rec.owner = CustodyOwner::Reaper;
+                                jobs.push(ActorExitedJob::DrainBridge {
+                                    token: rec.token,
+                                    by_id: by_id.clone(),
+                                    epoch: ep,
+                                    worker: Some(w),
+                                });
+                            }
+                            // 若 worker 為 None，表示已由 AdoptBridge 取出，在 Reclaim 守衛保護下，留給 Reclaim 命令處理（C8）
                         }
                         _ => {}
                     }
                 }
             }
         }
-        affected
+        jobs
     }
 }
 
@@ -571,10 +717,11 @@ impl Deliverer {
             },
             bind_gen,
             inc,
-            first_at: now,
             next_at: now,
             backoff: Duration::from_millis(10),
             attempts: 0,
+            open_elapsed: Duration::ZERO,
+            last_open_at: now,
         });
     }
 
@@ -606,6 +753,7 @@ impl Deliverer {
         match self.gate.handoff_freeze_state() {
             HandoffFreezeState::Pending => {
                 // Pending 時暫停嘗試、保留義務、不計總時限、attempts 不增
+                ob.last_open_at = now;
                 return DeliveryStepResult::PausedPending;
             }
             HandoffFreezeState::Permanent => {
@@ -613,11 +761,15 @@ impl Deliverer {
                 self.obligations.remove(sid);
                 return DeliveryStepResult::Cancelled;
             }
-            HandoffFreezeState::Open => {}
+            HandoffFreezeState::Open => {
+                let delta = now.saturating_duration_since(ob.last_open_at);
+                ob.open_elapsed += delta;
+                ob.last_open_at = now;
+            }
         }
 
-        // 檢查 30 秒總時限
-        if now.saturating_duration_since(ob.first_at) >= Duration::from_secs(30) {
+        // 檢查 30 秒總時限（只累計 Open 狀態度過的時間，Pending 期間不計入）
+        if ob.open_elapsed >= Duration::from_secs(30) {
             eprintln!("[serialwrap:WARNING] 送達義務超逾 30s 總時限，丟棄：sid={}, by_id={}", sid, ob.event.by_id);
             self.obligations.remove(sid);
             return DeliveryStepResult::TimedOut;

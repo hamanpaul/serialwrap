@@ -133,7 +133,7 @@ pub struct HandleParts {
 }
 
 impl HandleParts {
-    fn split(handle: Box<dyn SerialHandle>) -> HandleParts {
+    pub fn split(handle: Box<dyn SerialHandle>) -> HandleParts {
         let (reader, writer, waker, close) = handle.split();
         HandleParts {
             reader,
@@ -144,7 +144,7 @@ impl HandleParts {
     }
 
     /// 關閉（未交給正式 bridge 時；回條供呼叫端判斷）。
-    fn close(self) -> CloseReceipt {
+    pub fn close(self) -> CloseReceipt {
         self.close.close(self.reader, self.writer)
     }
 }
