@@ -603,6 +603,11 @@ pub struct SessionCore {
     now_cache: Mono,
     /// P6 Task 7：目前前景命令的來源（human reboot／逾時升格判定，D-10）。
     fg_origin: Option<SubmitOrigin>,
+    /// WP6-1（OD-74、rulings s2 D5）：目前前景命令請求的 `trusted_human` 快照（RPC 依原始 source 判定）；
+    /// 與 `fg_origin` 的 `HumanConsole` 取 OR 決定逾時／reboot 升格，永不由 `source` 字首或 `source_class` 推定。
+    fg_trusted_human: bool,
+    /// WP6-1：目前前景命令請求的（已正規化）`source` 快照；可信 RPC human 升格 lease 的 owner（Python `owner=source`）。
+    fg_source: Option<String>,
     /// 只供測試（test-fakes）：`last_error` 每次變更為非 None 時的觀察者（Task 16 `last_error_history`）。
     #[cfg(feature = "test-fakes")]
     last_error_observer: Option<Box<dyn Fn(&str) + Send>>,
@@ -810,6 +815,8 @@ impl SessionCore {
             fx_buf: Vec::new(),
             now_cache: 0,
             fg_origin: None,
+            fg_trusted_human: false,
+            fg_source: None,
             #[cfg(feature = "test-fakes")]
             last_error_observer: None,
             flash_probe_id: None,
@@ -5162,7 +5169,8 @@ impl SessionCore {
             if mode == "interactive" {
                 // Python 先 `_begin_foreground_operation_locked`（關 admission）再 `_open_interactive_locked`：
                 // admission 已關時 human owner 只記為 pending，不會搶走現有 raw owner。
-                self.command_fg_begin(&command.req.origin, true);
+                // WP6-1：同時保存請求的可信標記與來源快照（OD-74）。
+                self.command_fg_begin_req(&command.req, true);
                 let timeout = command
                     .req
                     .timeout_s
@@ -5220,7 +5228,8 @@ impl SessionCore {
             // （TX 結算 arm）與 TxWriter 的 `reboot_arm_op`（Python `_handle_reboot_command` 不分旗標或猜中）。
             let reboot = command.req.expect_reboot
                 || (!self.is_passthrough() && is_reboot_command(&command.req.command));
-            self.command_fg_begin(&command.req.origin, false);
+            // WP6-1：保存請求的可信標記與來源快照，結算時逾時／reboot 升格與 lease owner 依此判定（OD-74）。
+            self.command_fg_begin_req(&command.req, false);
             self.fg_cmd_timeout_s = command.req.timeout_s;
             if reboot {
                 // G8（#243，`origin/main:sw_core/session_manager.py:6409-6411`）：新一輪 reboot 不承接舊的非同步 reboot
@@ -5849,7 +5858,9 @@ impl SessionCore {
                     "recovery_action" => key,
                 })
             }
-            // DF-02：line editor 來源逾時走 `_recover_after_failure` 的 human 分支（不轉 ATTACHED、不寫 capture）。
+            // DF-02／OD-74：可信 human（line editor 的 HumanConsole，或 RPC 依原始 source 判定的 `trusted_human`）逾時走
+            // `_recover_after_failure` 的 human 分支（不轉 ATTACHED、不寫 capture，`session_manager.py:6988-7012`）；
+            // 明寫 `human:<x>` 的 RPC（`trusted_human=false`）比照 agent。
             OpOutcome::PromptTimeout { .. } if self.fg_origin_is_human() => {
                 CmdOutcome::Result(self.human_timeout_promote(self.fg_cmd_timeout_s, now))
             }
@@ -5860,7 +5871,8 @@ impl SessionCore {
                 }
                 CmdOutcome::Result(prompt_timeout_none())
             }
-            // P6 Task 7（D-10）：line editor 來源的 reboot 不進自動恢復，改開 human lease（`_execute_command_inner` human 分支）。
+            // P6 Task 7（D-10）／OD-74：可信 human 的 reboot 不進自動恢復，改開 human lease（`_execute_command_inner`
+            // human 分支，`session_manager.py:6476-6504`）；可信判定同上，不看 source 字首。
             OpOutcome::RebootExpected if self.fg_origin_is_human() => {
                 CmdOutcome::Result(self.human_reboot_promote(now))
             }

@@ -12,7 +12,7 @@ use sw_proto::pydict;
 use sw_proto::pyjson::PyValue;
 
 use super::*;
-use crate::arbiter::SubmitOrigin;
+use crate::arbiter::{SubmitOrigin, SubmitReq};
 use crate::deferred::{DeferOutcome, Replay};
 use crate::human_console::human_tx::{BacklogItem, BacklogKind, HumanTxTag, InFlightJob};
 use crate::human_console::line_mode::human_console_mode;
@@ -977,6 +977,9 @@ impl SessionCore {
         self.tick_close_interactive.clear();
         self.fg_adm = None;
         self.fg_origin = None;
+        // WP6-1：drain 結束在途前景命令，可信標記與來源快照一併清除，不讓下一筆命令承接。
+        self.fg_trusted_human = false;
+        self.fg_source = None;
         // ownership 於下方 reset_for_stop 歸零；在途 probe 的 suspend 旗標隨世代失效，完成時不再 resume。
         self.self_test_suspend_gen = self.self_test_suspend_gen.wrapping_add(1);
         let reason = if *kind == StopKind::Release {
@@ -1013,17 +1016,33 @@ impl SessionCore {
     }
 
     /// 06 命令出列時的前景 hook（D-10：只有 `SubmitOrigin::HumanConsole` 不 suspend）。
+    ///
+    /// 可信標記與來源快照一律先歸零：非命令前景（P8 file transfer）不承接上一筆命令的資格；
+    /// 命令請求改經 [`Self::command_fg_begin_req`] 於此之後寫入快照。
     pub(super) fn command_fg_begin(&mut self, origin: &SubmitOrigin, interactive_mode: bool) {
         self.fg_origin = Some(origin.clone());
+        self.fg_trusted_human = false;
+        self.fg_source = None;
         let source_is_agent = !matches!(origin, SubmitOrigin::HumanConsole { .. }) && !interactive_mode;
         let mut fx = Effects(Vec::new());
         let adm = self.fg_begin(source_is_agent, &mut fx);
         self.fg_adm = Some(adm);
     }
 
+    /// 命令請求出列時的前景 hook（WP6-1，OD-74）：沿用 [`Self::command_fg_begin`] 的 admission／suspend，
+    /// 另保存請求的 `trusted_human` 與正規化 `source`，供結算時的逾時／reboot 升格判定與 lease owner 使用
+    /// （Python `session_manager.py:6476-6504`、`:6988-7012`：`human` 取自 `trusted_human`、`owner=source`）。
+    pub(super) fn command_fg_begin_req(&mut self, req: &SubmitReq, interactive_mode: bool) {
+        self.command_fg_begin(&req.origin, interactive_mode);
+        self.fg_trusted_human = req.trusted_human;
+        self.fg_source = Some(req.source.clone());
+    }
+
     /// 06 命令結算時的前景 hook。
     pub(super) fn command_fg_finish(&mut self, fx: &mut Vec<Effect>) {
         self.fg_origin = None;
+        self.fg_trusted_human = false;
+        self.fg_source = None;
         if let Some(adm) = self.fg_adm.take() {
             let mut out = Effects(Vec::new());
             self.fg_finish(adm, &mut out);

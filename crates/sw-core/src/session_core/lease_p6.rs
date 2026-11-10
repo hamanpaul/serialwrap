@@ -488,8 +488,10 @@ impl SessionCore {
         }
     }
 
+    /// 目前前景命令是否為可信 human（OD-74、rulings s2 D5）：line editor 的 `HumanConsole` OR 請求的 `trusted_human`
+    /// 快照（與 `SubmitReq::is_trusted_human()` 同式）；永不由 `source` 字首或 `source_class` 推定。
     pub(super) fn fg_origin_is_human(&self) -> bool {
-        matches!(self.fg_origin, Some(SubmitOrigin::HumanConsole { .. }))
+        matches!(self.fg_origin, Some(SubmitOrigin::HumanConsole { .. })) || self.fg_trusted_human
     }
 
     /// human 來源 open-or-refresh lease（`_refresh_interactive_locked`＋`_open_interactive_locked`）；
@@ -500,8 +502,10 @@ impl SessionCore {
         }
         self.refresh_lease_p6(now);
         if self.lease.is_none() {
-            let source = match &self.fg_origin {
-                Some(SubmitOrigin::HumanConsole { client_id }) => format!("human:{client_id}"),
+            // Python `owner=source`：console 為 `human:<client_id>`；可信 RPC 為保存的正規化 source（bare human → `human:cli`）。
+            let source = match (&self.fg_origin, &self.fg_source) {
+                (Some(SubmitOrigin::HumanConsole { client_id }), _) => format!("human:{client_id}"),
+                (_, Some(source)) if self.fg_trusted_human => source.clone(),
                 _ => "human:".to_string(),
             };
             self.open_lease(&source, timeout_s, false, now);
