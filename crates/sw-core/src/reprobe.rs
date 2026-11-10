@@ -69,6 +69,10 @@ fn backoff(exp: u32) -> Mono {
 }
 
 /// `_is_reprobe_prompt_error`：ATTACHED 的 prompt 類失敗（含 RX_FLOOD／TRANSPORT_STALL）與 DETACHED 的逾時類失敗才可重探。
+///
+/// DF-27（OD-81）：另精確納入 `POST_LOGIN_CMD_TIMEOUT`（ATTACHED 與 DETACHED 皆可）。Python 基線
+/// （`origin/main:sw_core/session_manager.py:2112-2136`）不含此碼，登入後命令逾時即永久停在 DETACHED；擁有者裁決 Rust
+/// 以既有退避重探（Python 依 OD-75 不改）。只納入此一碼，不泛化為所有 `_TIMEOUT`（`READY_NONCE_TIMEOUT` 等照舊）。
 pub fn is_reprobe_prompt_error(state: &str, last_error: Option<&str>) -> bool {
     let Some(e) = last_error.filter(|e| !e.is_empty()) else {
         return false;
@@ -76,7 +80,8 @@ pub fn is_reprobe_prompt_error(state: &str, last_error: Option<&str>) -> bool {
     let timeout_like = e == "PROMPT_TIMEOUT"
         || e.ends_with("_PROMPT_TIMEOUT")
         || e == "RX_FLOOD"
-        || e == "TRANSPORT_STALL";
+        || e == "TRANSPORT_STALL"
+        || e == "POST_LOGIN_CMD_TIMEOUT";
     match state {
         "ATTACHED" => e == "PROMPT_UNAVAILABLE" || timeout_like,
         "DETACHED" => timeout_like,
