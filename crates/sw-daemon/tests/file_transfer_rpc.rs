@@ -200,3 +200,81 @@ fn file_rpc_rejections_have_no_side_effects() {
     }
     assert_eq!(rig.side_effect_fingerprint(), before, "拒絕路徑不得碰 WAL／state／UART");
 }
+
+#[test]
+fn file_rpc_rejected_during_boot_quiet_returns_autoboot_quiet_zero_tx() {
+    let rig = ServiceRig::ready_shell();
+    let dev = rig.device(REAL_A);
+    let _fs = install_xfer_shell(dev);
+    let tmp = Tmp::new();
+    let local = tmp.path("q.bin");
+    std::fs::write(&local, b"payload").unwrap();
+
+    // 自發重開機 banner 武裝 boot quiet
+    dev.push_rx(b"\r\nU-Boot 2022.04-rc1 (May 01 2022 - 00:00:00 +0000)\r\n");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if let Some(session) = rig.session("COM0") {
+            if let Some(v) = session.get("boot_quiet_remaining_s") {
+                if !v.is_null() {
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let before = rig.side_effect_fingerprint();
+    let v = &rig.version;
+
+    // file.push 於 boot quiet 期間被拒（SC-03，OD-79 撤回 SC-33）：回 AUTOBOOT_QUIET
+    let r_push = rig.call(
+        "file.push",
+        &format!(r#"{{"selector":"COM0","local_path":"{local}","remote_path":"/tmp/q.bin"}}"#),
+    );
+    assert_eq!(
+        keys(&r_push),
+        ["ok", "error_code", "retry_after_s", "hint", "session", "version"],
+        "push: {}",
+        wire(&r_push)
+    );
+    assert_eq!(r_push.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(r_push.get("error_code"), Some(&PyValue::from("AUTOBOOT_QUIET")));
+    match r_push.get("retry_after_s") {
+        Some(PyValue::Float(s)) => assert!(*s > 0.0 && *s <= 180.0, "retry_after_s 範圍：{s}"),
+        other => panic!("retry_after_s 應為浮點：{other:?}"),
+    }
+    assert_eq!(
+        r_push.get("hint"),
+        Some(&PyValue::from("boot quiet window 進行中（疑似板卡自發重開機）；等 session 重新確認 READY 後重送"))
+    );
+    let s_push = match r_push.get("session") {
+        Some(PyValue::Dict(d)) => d,
+        other => panic!("session 應為 dict：{other:?}"),
+    };
+    assert_eq!(s_push.get("com"), Some(&PyValue::from("COM0")));
+    assert_eq!(s_push.get("state"), Some(&PyValue::from("READY")));
+    assert_eq!(r_push.get("version"), Some(&PyValue::from(v.as_str())));
+
+    // file.pull 於 boot quiet 期間亦回 AUTOBOOT_QUIET
+    let r_pull = rig.call(
+        "file.pull",
+        r#"{"selector":"COM0","remote_path":"/tmp/q.bin"}"#,
+    );
+    assert_eq!(
+        keys(&r_pull),
+        ["ok", "error_code", "retry_after_s", "hint", "session", "version"],
+        "pull: {}",
+        wire(&r_pull)
+    );
+    assert_eq!(r_pull.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(r_pull.get("error_code"), Some(&PyValue::from("AUTOBOOT_QUIET")));
+    match r_pull.get("retry_after_s") {
+        Some(PyValue::Float(s)) => assert!(*s > 0.0 && *s <= 180.0, "retry_after_s 範圍：{s}"),
+        other => panic!("retry_after_s 應為浮點：{other:?}"),
+    }
+    assert_eq!(r_pull.get("version"), Some(&PyValue::from(v.as_str())));
+
+    // 零 TX、不碰 WAL／state
+    assert_eq!(rig.side_effect_fingerprint(), before, "boot quiet 拒絕路徑零 TX 且不碰 WAL／state");
+}
