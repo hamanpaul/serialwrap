@@ -1775,6 +1775,33 @@ changes:
     compatibility_impact: "互動租約開著時，取消若落在該次輸入已送出、命令尚未返回的瞬間，Python 0.4.0 現行行為會把 interactive:<id> 永久加入 revoke ledger，同一租約之後每次 interactive-send 都回 SESSION_BUSY，直到租約逾時。修正後取消只撤銷原命令的 op，lease 續用、後續 send 照常送達；提交前（開 lease 前、fence 提交前）的取消仍零 TX 並回 FLUSHED_BY_RECOVERY。"
     approval_conditions: "涵蓋 TX 完成後、執行器返回前的取消：lease 仍存活，後續兩次 interactive-send 皆 ok 並送達 UART；提交前取消維持零 TX 且不遺留 lease。Python 與 Rust 都須符合（OD-77 B1），Rust 補回歸測試。"
     related_decisions: ["OD-77"]
+  - id: "DF-27"
+    kind: "DF"
+    title: "登入後命令逾時後的退避重探（Python 維持 DETACHED、Rust 沿用退避重探回 READY）"
+    status: "APPROVED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-11-08"
+      decision_ref: "OD-81"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.1"
+      rust:
+        stage: "slice-2.3"
+    approved_at_revision: 11
+    spec_refs: ["§11.3"]
+    reconciliation_refs: []
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P7"]
+    case_ids: ["df27-python-post-login-timeout-stays-detached", "df27-rust-post-login-timeout-reprobes-ready"]
+    compatibility_impact: "Python 基線（sw_core/session_manager.py:2112-2136）：post_login_cmd 逾時回 POST_LOGIN_CMD_TIMEOUT 後，session 進入 DETACHED 且不重探（_is_reprobe_prompt_error() 不含此碼，負載高時 session 持續離線）；Rust daemon 依 OD-81 修正，將 POST_LOGIN_CMD_TIMEOUT 納入既有退避重探資格，與其他可重探登入錯誤相同走 2／4／8／15 s 間隔重探並推進回 READY。對外差異：同一逾時情境下 Python 維持 DETACHED、不重探，Rust 沿用退避重探並回 READY。證據位置：tests/contract_blackbox/test_p7_latency_noise.py、crates/sw-core/tests/reprobe.rs、crates/sw-core/tests/session_core_reprobe_p7.rs。"
+    approval_conditions: "登入後命令逾時後：Python 維持 DETACHED、錯誤碼 POST_LOGIN_CMD_TIMEOUT 不變且無新增重探 TX；Rust 依現有退避規則重探並回到 READY，清除 last_error 並完成 ready_probe nonce 確認；重探不消耗非預期 attempts、守衛 boot quiet／boot evidence，拒絕期間請求零 TX。"
+    related_decisions: ["OD-81"]
 pending_owner_confirmations: []
 safety_invariants:
   - id: zero_tx_on_reject

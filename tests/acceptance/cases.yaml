@@ -6262,3 +6262,54 @@ cases:
   evidence: ['tests/test_rust_contract_coverage.py::test_skipped_and_teardown_error_never_count', 'tests/test_rust_contract_coverage.py::test_blocked_owner_cases_are_reported_not_covered', 'tests/test_rust_contract_coverage.py::test_all_mapped_nodeids_required_not_any', 'tests/test_rust_contract_coverage.py::test_incomplete_run_cannot_satisfy', 'tests/test_rust_contract_coverage.py::test_duplicate_result_rows_not_best_of', 'tests/test_rust_contract_coverage.py::test_mapped_nodeid_not_collected_is_missing', 'tests/test_rust_contract_coverage.py::test_identity_mismatch_rejected']
   implemented_by: 09-slice24-transfer-flash.md
   cross_slice_reason: null
+# --- P8 DF-27 登入後命令逾時重探黑箱案例（OD-81；add-only；conditional 不改變切片凍結分母） ---
+- case_id: df27-python-post-login-timeout-stays-detached
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_latency_noise.py::test_df27_python_post_login_timeout_stays_detached
+  family: L15
+  title: 'DF-27（OD-81）：Python 基線 POST_LOGIN_CMD_TIMEOUT 後維持 DETACHED 且不自動重探'
+  contract: 'OD-81／DF-27：Python 基線在 post_login_cmd 逾時後 session 轉入 DETACHED，在 40 秒觀察窗內維持 DETACHED、last_error POST_LOGIN_CMD_TIMEOUT 不變，且無新增重探 TX；期間被拒請求零 TX。'
+  invariants: [zero_tx_on_reject]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [login_full]
+  necessity: conditional
+  issues: []
+  behavior_changes: [DF-27]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_latency_noise.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: df27-rust-post-login-timeout-reprobes-ready
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_latency_noise.py::test_df27_rust_post_login_timeout_reprobes_ready
+  family: L15
+  title: 'DF-27（OD-81）：Rust 重構 POST_LOGIN_CMD_TIMEOUT 後依退避規則自動重探回到 READY'
+  contract: 'OD-81／DF-27：Rust daemon 在 post_login_cmd 逾時後將 POST_LOGIN_CMD_TIMEOUT 視為可重探錯誤，依既有退避間隔自動重新探測並成功推進至 READY、清除錯誤碼並完成 nonce 確認；期間被拒請求零 TX。'
+  invariants: [zero_tx_on_reject]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [login_full]
+  necessity: conditional
+  issues: []
+  behavior_changes: [DF-27]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_latency_noise.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null

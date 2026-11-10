@@ -1387,8 +1387,8 @@ def test_bc_real_sc_df_ranges() -> None:
     assert "SC-33" not in sc_ids and "SC-08" not in sc_ids
     df_ids = {c.id for c in changes if c.kind == "DF"}
     # DF-19 由 P0 登記、P1 T20 實作（R5-F2）；DF-18 由 P7 Task 0 登記；DF-20～DF-22 依 OD-34～OD-44 登記；
-    # DF-23／DF-24 依 OD-57／OD-73（P7）登記；DF-25 依 OD-77 登記。
-    assert df_ids == {f"DF-{i:02d}" for i in range(1, 26)}
+    # DF-23／DF-24 依 OD-57／OD-73（P7）登記；DF-25 依 OD-77 登記；DF-27 依 OD-81 登記。
+    assert df_ids == {f"DF-{i:02d}" for i in range(1, 26)} | {"DF-27"}
 
     df19 = by_id["DF-19"]
     assert df19.scope == "both"
@@ -1434,6 +1434,21 @@ def test_bc_real_sc_df_ranges() -> None:
     assert df22.case_ids == ("df22-rx-window-merge-oldest",)
     assert "OD-43" in df22.related_decisions
     assert "merge_oldest" in df22.compatibility_impact and "不得低估" in df22.compatibility_impact
+
+    df27 = by_id["DF-27"]
+    assert df27.status == "APPROVED" and df27.scope == "both" and df27.applies_python_min == "0.4.1"
+    assert df27.applies_rust_stage == "slice-2.3" and df27.ab_participation == "diff"
+    assert list(df27.phases) == ["P7"]
+    assert df27.approval.decision_ref == "OD-81"
+    assert df27.approval.date == "2026-11-08"
+    assert "OD-81" in df27.related_decisions
+    assert "POST_LOGIN_CMD_TIMEOUT" in df27.compatibility_impact
+    assert "DETACHED" in df27.compatibility_impact and "READY" in df27.compatibility_impact
+    assert "Python" in df27.compatibility_impact and "Rust" in df27.compatibility_impact
+    assert df27.case_ids == (
+        "df27-python-post-login-timeout-stays-detached",
+        "df27-rust-post-login-timeout-reprobes-ready",
+    )
 
 
 def test_bc_real_rust_only_python_null() -> None:

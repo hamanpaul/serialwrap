@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
   "cases_revision": "2026-11-09.2",
-  "total": 236,
+  "total": 238,
   "by_suite": {
-    "contract-blackbox": 97,
+    "contract-blackbox": 99,
     "func-test": 14,
     "l15-scenario": 15,
     "manual-procedure": 1,
@@ -14,7 +14,7 @@
   },
   "by_layer": {
     "L1": 45,
-    "L1.5": 102,
+    "L1.5": 104,
     "L2": 46,
     "L3": 42,
     "manual": 1
@@ -22,7 +22,7 @@
   "by_slice": {
     "2.1": 48,
     "2.2": 49,
-    "2.3": 69,
+    "2.3": 71,
     "2.4": 35,
     "None": 35
   }
