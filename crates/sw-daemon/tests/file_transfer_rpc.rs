@@ -278,3 +278,58 @@ fn file_rpc_rejected_during_boot_quiet_returns_autoboot_quiet_zero_tx() {
     // 零 TX、不碰 WAL／state
     assert_eq!(rig.side_effect_fingerprint(), before, "boot quiet 拒絕路徑零 TX 且不碰 WAL／state");
 }
+
+#[test]
+fn file_pull_over_rx_window_succeeds_od80_df26() {
+    let rig = ServiceRig::ready_shell();
+    let dev = rig.device(REAL_A);
+    let fs: Fs = Arc::new(Mutex::new(BTreeMap::new()));
+    let f = Arc::clone(&fs);
+    let d = dev.clone();
+    dev.on_tx_match(
+        "SW_XFER_",
+        Box::new(move |line: &[u8]| {
+            let cmd = String::from_utf8_lossy(line).trim_end_matches(['\r', '\n']).to_string();
+            let w = words(&cmd);
+            if w.first().map(String::as_str) == Some("printf") && w.iter().any(|x| x == "<") {
+                // 大檔 pull：以背景 thread 分段送出模擬真實 UART 鮑率傳輸，驗證分段 pull（OD-80／DF-26）
+                let at = w.iter().position(|x| x == "<").expect("pull 命令含 <");
+                let data = f.lock().unwrap().get(&w[at + 1]).cloned().unwrap_or_default();
+                let b64 = t::b64encode(&data);
+                let body: String = b64
+                    .as_bytes()
+                    .chunks(76)
+                    .map(|c| format!("{}\r\n", String::from_utf8_lossy(c)))
+                    .collect();
+                let full = format!("{}\r\n{body}{}\r\nroot@t:/# ", t::SENTINEL_BEGIN, t::SENTINEL_END);
+                let full_bytes = full.into_bytes();
+                let dev_thread = d.clone();
+                std::thread::spawn(move || {
+                    for chunk in full_bytes.chunks(8192) {
+                        dev_thread.push_rx(chunk);
+                        std::thread::sleep(std::time::Duration::from_millis(15));
+                    }
+                });
+                return Vec::new();
+            }
+            format!("{}root@t:/# ", mini_shell(&f, &cmd)).into_bytes()
+        }),
+    );
+    let tmp = Tmp::new();
+    // 150 KiB 原始資料 → base64 約 204800 字元，超過 131072 字元 RX 視窗上限（OD-80／DF-26）
+    let data: Vec<u8> = (0..150 * 1024u32).map(|i| (i % 251) as u8).collect();
+    fs.lock().unwrap().insert("/tmp/large.bin".to_string(), data.clone());
+
+    let out = tmp.path("large_back.bin");
+    let r = rig.call(
+        "file.pull",
+        &format!(r#"{{"selector":"COM0","remote_path":"/tmp/large.bin","local_path":"{out}"}}"#),
+    );
+    assert_eq!(keys(&r), ["ok", "bytes", "md5", "local_path", "version"], "{}", wire(&r));
+    assert_eq!(r.get("ok"), Some(&PyValue::Bool(true)));
+    assert_eq!(r.get("bytes"), Some(&PyValue::Int(PyInt::Small(data.len() as i128))));
+    assert_eq!(r.get("md5"), Some(&PyValue::from(t::md5_hex(&data))));
+    assert_eq!(r.get("local_path"), Some(&PyValue::from(out.clone())));
+    assert_eq!(std::fs::read(&out).unwrap(), data);
+}
+
