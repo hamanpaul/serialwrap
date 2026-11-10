@@ -199,6 +199,252 @@ fn timeout_sends_ctrl_c_then_recovers_and_flushes_queue() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// WP6-1 第 3 項（G7b，OD-74、rulings s2 D5）：OpRunner 逾時分流的可信判定
+// ---------------------------------------------------------------------------
+//
+// Python `origin/main:sw_core/session_manager.py:6988-7012`（`_recover_after_failure`）：`human = trusted_human`
+// 成立即 open-or-refresh human lease（`owner=source`）並回 `PROMOTE_HUMAN_INTERACTIVE`，不送 CTRL_C／CTRL_D；
+// 否則才進 passthrough 判定與救援鍵迴圈（`:7014` 起）。RPC 的 `trusted_human` 依原始 source 判定：bare `human`
+// （及 `human:`）→ true 並正規化為 `human:cli`；明寫 `human:<x>`（含 `human:cli`）、其他前綴 → false（OD-74）。
+// line editor 的 `HumanConsole` 一律可信，與旗標取 OR（D5，`SubmitReq::is_trusted_human()`）。
+
+/// 裝置對救援鍵的應答：CTRL_C 即回 prompt，或只有 CTRL_D 回 prompt（證明兩階段救援仍在）。
+#[derive(Clone, Copy, Debug)]
+enum Wp61KeyReply {
+    CtrlC,
+    CtrlDOnly,
+}
+
+/// 逾時後的預期結局。
+#[derive(Clone, Copy, Debug)]
+enum Wp61Expect {
+    /// 升格 interactive lease，lease owner 為指定字串，零救援鍵。
+    Promote { owner: &'static str },
+    /// agent 救援：以指定鍵回 prompt。
+    Rescue { key: &'static str },
+}
+
+struct Wp61Case {
+    label: &'static str,
+    source: &'static str,
+    trusted_human: bool,
+    origin: sw_core::arbiter::SubmitOrigin,
+    reply: Wp61KeyReply,
+    expect: Wp61Expect,
+}
+
+/// 單一情境（獨立 rig）：送出不會回 prompt 的命令，推進到逾時結算，斷言 UART／WAL TX、紀錄終態、
+/// `recovery_action` 與 lease owner。
+fn wp61_runner_timeout_case(c: &Wp61Case) {
+    let label = c.label;
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    match c.reply {
+        Wp61KeyReply::CtrlC => h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# "),
+        Wp61KeyReply::CtrlDOnly => h.dev.on_tx_reply(b"\x04", b"\r\nroot@t:/# "),
+    }
+    let uart_from = h.dev.tx_len();
+    let wal_from = tx_rows(&h).len();
+    let id = h.submit_with("sleep 20", |r| {
+        r.timeout_s = 1.0;
+        r.source = c.source.into();
+        r.trusted_human = c.trusted_human;
+        r.origin = c.origin.clone();
+    });
+    wait_tx(&h, b"sleep 20\n");
+    advance_until(&h, Duration::from_millis(100), "逾時結算", |h| {
+        is_done(h, &id)
+    });
+    let rec = h.wait_done(&id);
+    let uart = h.dev.tx_since(uart_from);
+    let wal: Vec<(String, Vec<u8>)> = tx_rows(&h)
+        .into_iter()
+        .skip(wal_from)
+        .map(|r| {
+            let source = r
+                .get("source")
+                .and_then(PyValue::as_str)
+                .unwrap_or("")
+                .to_string();
+            (source, b64(&r))
+        })
+        .collect();
+    let wal_payloads: Vec<Vec<u8>> = wal.iter().map(|(_, p)| p.clone()).collect();
+    assert_eq!(
+        rec["source"],
+        PyValue::from(c.source),
+        "{label}：紀錄 source：{rec:?}"
+    );
+    assert_eq!(
+        rec["error_code"],
+        PyValue::Null,
+        "{label}：ok:true 的結算不入錯誤碼：{rec:?}"
+    );
+    assert_eq!(rec["partial"], PyValue::Bool(true), "{label}：{rec:?}");
+    assert_eq!(
+        state_of(&h),
+        "READY",
+        "{label}：逾時結算後維持 READY：{rec:?}"
+    );
+    match c.expect {
+        Wp61Expect::Promote { owner } => {
+            assert_eq!(
+                uart, b"sleep 20\n",
+                "{label}：UART TX 只有命令本身，零 CTRL_C／CTRL_D"
+            );
+            assert_eq!(
+                wal_payloads,
+                vec![b"sleep 20\n".to_vec()],
+                "{label}：WAL TX 只有命令本身，零 CTRL_C／CTRL_D：{wal:?}"
+            );
+            assert_eq!(
+                rec["status"],
+                PyValue::from("interactive"),
+                "{label}：{rec:?}"
+            );
+            assert_eq!(
+                rec["execution_mode"],
+                PyValue::from("interactive"),
+                "{label}：{rec:?}"
+            );
+            assert_eq!(
+                rec["recovery_action"],
+                PyValue::from("PROMOTE_HUMAN_INTERACTIVE"),
+                "{label}：{rec:?}"
+            );
+            assert_eq!(rec["stdout"], PyValue::from(""), "{label}：{rec:?}");
+            let iid = h.get_state()["interactive_session_id"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| panic!("{label}：升格後應持有 interactive lease：{rec:?}"));
+            assert_eq!(
+                rec["interactive_session_id"],
+                PyValue::from(iid.clone()),
+                "{label}：紀錄指向本次升格的 lease"
+            );
+            let status = h.request(SessionRequest::InteractiveStatus {
+                interactive_id: iid,
+                screen_chars: 0,
+            });
+            assert_eq!(status["ok"], PyValue::Bool(true), "{label}：{status:?}");
+            assert_eq!(
+                status["owner"],
+                PyValue::from(owner),
+                "{label}：lease owner（Python `owner=source`）"
+            );
+        }
+        Wp61Expect::Rescue { key } => {
+            let mut expected = b"sleep 20\n".to_vec();
+            let mut expected_wal = vec![(c.source.to_string(), b"sleep 20\n".to_vec())];
+            expected.push(0x03);
+            expected_wal.push(("system:recover".to_string(), b"\x03".to_vec()));
+            if key == "CTRL_D" {
+                expected.push(0x04);
+                expected_wal.push(("system:recover".to_string(), b"\x04".to_vec()));
+            }
+            assert_eq!(
+                uart, expected,
+                "{label}：UART TX 依序為命令、救援鍵（{key}）"
+            );
+            assert_eq!(
+                wal, expected_wal,
+                "{label}：WAL TX 依序為命令、system:recover 救援鍵（{key}）"
+            );
+            assert_eq!(rec["status"], PyValue::from("done"), "{label}：{rec:?}");
+            assert_eq!(
+                rec["execution_mode"],
+                PyValue::from("line"),
+                "{label}：{rec:?}"
+            );
+            assert_eq!(
+                rec["recovery_action"],
+                PyValue::from(key),
+                "{label}：{rec:?}"
+            );
+            assert!(
+                rec.get("interactive_session_id")
+                    .is_none_or(PyValue::is_null),
+                "{label}：agent 救援不開 lease：{rec:?}"
+            );
+            assert_eq!(
+                h.get_state()["interactive_session_id"],
+                PyValue::Null,
+                "{label}：agent 救援後無 lease"
+            );
+        }
+    }
+}
+
+#[test]
+fn wp61_runner_timeout_trust_matrix() {
+    use sw_core::arbiter::SubmitOrigin;
+    let cases = [
+        // OD-74：RPC bare `human` 經 service 正規化後的形狀（`trusted_human=true`、`source=human:cli`）。
+        Wp61Case {
+            label: "RPC trusted human:cli",
+            source: "human:cli",
+            trusted_human: true,
+            origin: SubmitOrigin::Rpc,
+            reply: Wp61KeyReply::CtrlC,
+            expect: Wp61Expect::Promote { owner: "human:cli" },
+        },
+        // OD-74：明寫 `human:cli`／`human:<x>` 與其他前綴一律比照 agent。
+        Wp61Case {
+            label: "RPC untrusted human:cli",
+            source: "human:cli",
+            trusted_human: false,
+            origin: SubmitOrigin::Rpc,
+            reply: Wp61KeyReply::CtrlC,
+            expect: Wp61Expect::Rescue { key: "CTRL_C" },
+        },
+        Wp61Case {
+            label: "RPC untrusted human:x",
+            source: "human:x",
+            trusted_human: false,
+            origin: SubmitOrigin::Rpc,
+            reply: Wp61KeyReply::CtrlC,
+            expect: Wp61Expect::Rescue { key: "CTRL_C" },
+        },
+        Wp61Case {
+            label: "RPC untrusted codex",
+            source: "codex",
+            trusted_human: false,
+            origin: SubmitOrigin::Rpc,
+            reply: Wp61KeyReply::CtrlC,
+            expect: Wp61Expect::Rescue { key: "CTRL_C" },
+        },
+        // 兩階段救援：CTRL_C 無回應 → CTRL_D 回 prompt（`:7030` 起的鍵序不變）。
+        Wp61Case {
+            label: "RPC untrusted human:x CTRL_D",
+            source: "human:x",
+            trusted_human: false,
+            origin: SubmitOrigin::Rpc,
+            reply: Wp61KeyReply::CtrlDOnly,
+            expect: Wp61Expect::Rescue { key: "CTRL_D" },
+        },
+        // D5：line editor 的 `HumanConsole` 即使 `trusted_human=false` 仍可信（OR），owner 為 `human:<client_id>`。
+        Wp61Case {
+            label: "HumanConsole untrusted flag",
+            source: "human:c1",
+            trusted_human: false,
+            origin: SubmitOrigin::HumanConsole {
+                client_id: "c1".into(),
+            },
+            reply: Wp61KeyReply::CtrlC,
+            expect: Wp61Expect::Promote { owner: "human:c1" },
+        },
+    ];
+    let failed: Vec<&str> = cases
+        .iter()
+        .filter(|c| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wp61_runner_timeout_case(c)))
+                .is_err()
+        })
+        .map(|c| c.label)
+        .collect();
+    assert!(failed.is_empty(), "失敗情境：{failed:?}");
+}
+
 #[test]
 fn submit_during_agent_lease_is_rejected_at_execute_time() {
     let h = ActorRig::new(SHELL_PROFILE).ready();
