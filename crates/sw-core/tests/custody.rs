@@ -890,6 +890,85 @@ fn test_deliverer_times_out_when_effective_open_exceeds_30s() {
 }
 
 #[test]
+fn test_deliverer_time_sample_before_freeze_thaw_interleave_times_out() {
+    let t0 = Instant::now();
+    let clock = FakeInstantClock::new(t0);
+    let gate = clock.gate();
+    let mut deliverer = Deliverer::new(gate.clone());
+    let (actor_tx, actor_rx) = bounded(1);
+
+    let sid = "COM50";
+    let by_id = "by-id-sample-interleave";
+    let real_path = "/dev/ttyUSB50";
+
+    // 1. t=0 建立義務
+    deliverer.add_obligation_at(sid, by_id, real_path, 1, 1, t0);
+
+    // 2. 送達執行緒於 t=30.1s 取得輪詢時間，隨後暫停
+    let t_poll = t0 + Duration::from_millis(30_100);
+
+    // 3. 另一執行緒於 t=30.2s 凍結，t=30.4s 解凍
+    let t_freeze = t0 + Duration::from_millis(30_200);
+    clock.set(t_freeze);
+    let token = match gate.freeze_if_idle("interleave-freeze") {
+        FreezeOutcome::Frozen { token, .. } => token,
+        _ => panic!("預期 Frozen"),
+    };
+
+    let t_thaw = t0 + Duration::from_millis(30_400);
+    clock.set(t_thaw);
+    assert!(gate.thaw(&token));
+
+    // 4. 送達執行緒恢復，以已取得的 now=30.1s 執行 step_delivery；channel 有空位
+    let outcome = deliverer.step_delivery(sid, &actor_tx, t_poll);
+    assert_eq!(outcome, DeliveryStepResult::TimedOut, "義務在凍結前經歷 30.1s > 30s Open，不得被未來凍結扣除而送達");
+    assert_eq!(deliverer.obligation_count(), 0, "逾時義務必須自 deliverer 移除");
+    assert_eq!(actor_rx.try_iter().count(), 0, "逾時義務不得送出任何事件");
+}
+
+#[test]
+fn test_deliverer_snapshot_before_freeze_thaw_interleave_times_out() {
+    let t0 = Instant::now();
+    let clock = FakeInstantClock::new(t0);
+    let gate = clock.gate();
+    let mut deliverer = Deliverer::new(gate.clone());
+    let (actor_tx, actor_rx) = bounded(1);
+
+    let sid = "COM51";
+    let by_id = "by-id-snapshot-interleave";
+    let real_path = "/dev/ttyUSB51";
+
+    // 1. t=0 建立義務
+    deliverer.add_obligation_at(sid, by_id, real_path, 1, 1, t0);
+
+    // 2. 送達執行緒於 t=30.1s 取得閘門快照，隨後暫停
+    let t_poll = t0 + Duration::from_millis(30_100);
+    clock.set(t_poll);
+    let snap = gate.snapshot();
+    assert_eq!(snap.now, t_poll);
+    assert_eq!(snap.freeze_state, HandoffFreezeState::Open);
+    assert_eq!(snap.frozen_total, Duration::ZERO);
+
+    // 3. 另一執行緒於 t=30.2s 凍結，t=30.4s 解凍
+    let t_freeze = t0 + Duration::from_millis(30_200);
+    clock.set(t_freeze);
+    let token = match gate.freeze_if_idle("interleave-freeze-snap") {
+        FreezeOutcome::Frozen { token, .. } => token,
+        _ => panic!("預期 Frozen"),
+    };
+
+    let t_thaw = t0 + Duration::from_millis(30_400);
+    clock.set(t_thaw);
+    assert!(gate.thaw(&token));
+
+    // 4. 送達執行緒恢復，使用先前取樣之快照呼叫 step_delivery_with_snapshot
+    let outcome = deliverer.step_delivery_with_snapshot(sid, &actor_tx, snap);
+    assert_eq!(outcome, DeliveryStepResult::TimedOut, "快照時刻已滿 30.1s > 30s Open，不得被後續凍結扣除而送達");
+    assert_eq!(deliverer.obligation_count(), 0, "逾時義務必須自 deliverer 移除");
+    assert_eq!(actor_rx.try_iter().count(), 0, "逾時義務不得送出任何事件");
+}
+
+#[test]
 fn test_handle_actor_exited_takes_resources_and_produces_close_jobs() {
     let unconfirmed = UnconfirmedCloses::new();
     let mut ledger = CustodyLedger::new(unconfirmed.clone());

@@ -264,6 +264,85 @@ fn tickets_carry_kind_com_and_increasing_seq() {
     assert_eq!(gate.live_tickets(), 0);
 }
 
+#[cfg(feature = "test-fakes")]
+#[test]
+fn test_gate_frozen_total_truncates_to_queried_time_precisely() {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    let t0 = Instant::now();
+    let current = Arc::new(Mutex::new(t0));
+    let current_cb = current.clone();
+    let gate = AdmissionGate::with_clock(move || *current_cb.lock().unwrap());
+
+    // t=0 ~ 10s: Open
+    assert_eq!(gate.frozen_total(t0), Duration::ZERO);
+    let snap0 = gate.snapshot();
+    assert_eq!(snap0.now, t0);
+    assert_eq!(snap0.frozen_total, Duration::ZERO);
+
+    // t=10s: 凍結
+    let t_10 = t0 + Duration::from_secs(10);
+    *current.lock().unwrap() = t_10;
+    let token1 = match gate.freeze_if_idle("f1") {
+        FreezeOutcome::Frozen { token, .. } => token,
+        _ => panic!("預期 Frozen"),
+    };
+
+    // t=15s (仍凍結中):
+    let t_15 = t0 + Duration::from_secs(15);
+    *current.lock().unwrap() = t_15;
+    // 查詢 t=5s (凍結前): 凍結累計應為 0
+    assert_eq!(gate.frozen_total(t0 + Duration::from_secs(5)), Duration::ZERO);
+    // 查詢 t=12s: 凍結累計應為 2s (12s - 10s)
+    assert_eq!(gate.frozen_total(t0 + Duration::from_secs(12)), Duration::from_secs(2));
+    // 查詢 t=15s: 凍結累計應為 5s (15s - 10s)
+    assert_eq!(gate.frozen_total(t_15), Duration::from_secs(5));
+
+    // t=20s: 解凍
+    let t_20 = t0 + Duration::from_secs(20);
+    *current.lock().unwrap() = t_20;
+    assert!(gate.thaw(&token1));
+
+    // 解凍後查詢過去各時刻：
+    // t=5s (凍結前) 仍為 0
+    assert_eq!(gate.frozen_total(t0 + Duration::from_secs(5)), Duration::ZERO);
+    // t=10s 為 0
+    assert_eq!(gate.frozen_total(t_10), Duration::ZERO);
+    // t=14s 為 4s
+    assert_eq!(gate.frozen_total(t0 + Duration::from_secs(14)), Duration::from_secs(4));
+    // t=20s 為 10s
+    assert_eq!(gate.frozen_total(t_20), Duration::from_secs(10));
+    // t=25s (解凍後) 為 10s
+    assert_eq!(gate.frozen_total(t0 + Duration::from_secs(25)), Duration::from_secs(10));
+
+    // 第二個凍結區間: t=30s ~ 40s
+    let t_30 = t0 + Duration::from_secs(30);
+    *current.lock().unwrap() = t_30;
+    let token2 = match gate.freeze_if_idle("f2") {
+        FreezeOutcome::Frozen { token, .. } => token,
+        _ => panic!("預期 Frozen"),
+    };
+    let t_40 = t0 + Duration::from_secs(40);
+    *current.lock().unwrap() = t_40;
+    assert!(gate.thaw(&token2));
+
+    // 檢查兩段凍結區間的累計截斷：
+    // t=25s: 10s
+    assert_eq!(gate.frozen_total(t0 + Duration::from_secs(25)), Duration::from_secs(10));
+    // t=30s: 10s
+    assert_eq!(gate.frozen_total(t_30), Duration::from_secs(10));
+    // t=35s: 10s + 5s = 15s
+    assert_eq!(gate.frozen_total(t0 + Duration::from_secs(35)), Duration::from_secs(15));
+    // t=45s: 10s + 10s = 20s
+    assert_eq!(gate.frozen_total(t0 + Duration::from_secs(45)), Duration::from_secs(20));
+
+    // 驗證快照與 snapshot_at
+    let snap_at_35 = gate.snapshot_at(t0 + Duration::from_secs(35));
+    assert_eq!(snap_at_35.now, t0 + Duration::from_secs(35));
+    assert_eq!(snap_at_35.frozen_total, Duration::from_secs(15));
+}
+
 // ---------------------------------------------------------------------------
 // 審查 P8X-ee2b64c-1：`command.submit` 的 admission 位於 `CommandRegistry::admit` 的命令驗證之後、入列之前
 // （Python `command.submit` 不在 `service._ADMISSION_METHODS`；ticket 於 `CommandArbiter.submit()` 的

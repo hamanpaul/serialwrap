@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 
-use crate::admission::{AdmissionGate, HandoffFreezeState};
+use crate::admission::{AdmissionGate, GateSnapshot, HandoffFreezeState};
 use crate::drain::{StopId, WorkerStoppedReceipt};
 use crate::mailbox::ControlEvent;
 use crate::session_core::UnconfirmedCloses;
@@ -782,7 +782,8 @@ impl Deliverer {
     }
 
     pub fn add_obligation(&mut self, sid: &str, by_id: &str, real_path: &str, bind_gen: u64, inc: u64) {
-        self.add_obligation_at(sid, by_id, real_path, bind_gen, inc, Instant::now());
+        let snap = self.gate.snapshot();
+        self.add_obligation_with_snapshot(sid, by_id, real_path, bind_gen, inc, snap);
     }
 
     pub fn add_obligation_at(
@@ -794,7 +795,20 @@ impl Deliverer {
         inc: u64,
         now: Instant,
     ) {
-        let frozen_at_create = self.gate.frozen_total(now);
+        let snap = self.gate.snapshot_at(now);
+        self.add_obligation_with_snapshot(sid, by_id, real_path, bind_gen, inc, snap);
+    }
+
+    /// 使用給定之閘門快照建立送達義務（保證時刻、凍結狀態與累積凍結時間一致）。
+    pub fn add_obligation_with_snapshot(
+        &mut self,
+        sid: &str,
+        by_id: &str,
+        real_path: &str,
+        bind_gen: u64,
+        inc: u64,
+        snap: GateSnapshot,
+    ) {
         self.obligations.insert(sid.to_string(), DeliveryObligation {
             event: DeviceAttachedEvent {
                 by_id: by_id.to_string(),
@@ -802,9 +816,9 @@ impl Deliverer {
             },
             bind_gen,
             inc,
-            created_at: now,
-            frozen_at_create,
-            next_at: now,
+            created_at: snap.now,
+            frozen_at_create: snap.frozen_total,
+            next_at: snap.now,
             backoff: Duration::from_millis(10),
             attempts: 0,
         });
@@ -828,12 +842,33 @@ impl Deliverer {
     /// 記錄解除凍結轉態通知（喚醒送達者，不再記帳）。
     pub fn notify_thaw(&mut self, _now: Instant) {}
 
-    /// 單步送達執行。
+    /// 單步送達執行（以指定時間取樣快照）。
     pub fn step_delivery(
         &mut self,
         sid: &str,
         actor_tx: &Sender<ControlEvent>,
         now: Instant,
+    ) -> DeliveryStepResult {
+        let snap = self.gate.snapshot_at(now);
+        self.step_delivery_with_snapshot(sid, actor_tx, snap)
+    }
+
+    /// 單步送達執行（使用當前時刻的一致快照）。
+    pub fn step_delivery_now(
+        &mut self,
+        sid: &str,
+        actor_tx: &Sender<ControlEvent>,
+    ) -> DeliveryStepResult {
+        let snap = self.gate.snapshot();
+        self.step_delivery_with_snapshot(sid, actor_tx, snap)
+    }
+
+    /// 單步送達執行（使用給定之一致快照，避免取樣時間差導致誤扣除未來凍結）。
+    pub fn step_delivery_with_snapshot(
+        &mut self,
+        sid: &str,
+        actor_tx: &Sender<ControlEvent>,
+        snap: GateSnapshot,
     ) -> DeliveryStepResult {
         let ob = match self.obligations.get_mut(sid) {
             Some(o) => o,
@@ -841,7 +876,7 @@ impl Deliverer {
         };
 
         // 依 T14 檢查凍結狀態
-        match self.gate.handoff_freeze_state() {
+        match snap.freeze_state {
             HandoffFreezeState::Pending => {
                 // Pending 時暫停嘗試、保留義務、不計總時限、attempts 不增
                 return DeliveryStepResult::PausedPending;
@@ -854,9 +889,9 @@ impl Deliverer {
             HandoffFreezeState::Open => {}
         }
 
-        // 檢查 30 秒總時限（扣除凍結區間）
-        let total_elapsed = now.saturating_duration_since(ob.created_at);
-        let frozen_elapsed = self.gate.frozen_total(now).saturating_sub(ob.frozen_at_create);
+        // 檢查 30 秒總時限（扣除截至取樣時刻之凍結區間）
+        let total_elapsed = snap.now.saturating_duration_since(ob.created_at);
+        let frozen_elapsed = snap.frozen_total.saturating_sub(ob.frozen_at_create);
         let effective_open = total_elapsed.saturating_sub(frozen_elapsed);
 
         if effective_open >= Duration::from_secs(30) {
@@ -876,7 +911,7 @@ impl Deliverer {
             }
             Err(TrySendError::Full(_)) => {
                 ob.attempts += 1;
-                ob.next_at = now + ob.backoff;
+                ob.next_at = snap.now + ob.backoff;
                 ob.backoff = (ob.backoff * 2).min(Duration::from_millis(500));
                 DeliveryStepResult::Backoff
             }

@@ -133,8 +133,21 @@ struct GateInner {
     idle_token: Option<String>,
     /// 凍結累計時間（已完成的凍結區間累計）。
     frozen_accum: Duration,
+    /// 凍結歷史區間（以 (start, end) 記錄已結算的凍結區間，保證可按任意時刻精確截斷）。
+    frozen_intervals: Vec<(Instant, Instant)>,
     /// 目前 Pending 凍結開始的時間點；非 Pending 時為 None。
     pending_since: Option<Instant>,
+}
+
+/// 凍結閘門的時間與狀態一致快照。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateSnapshot {
+    /// 取樣時刻。
+    pub now: Instant,
+    /// 取樣時的交接凍結狀態。
+    pub freeze_state: HandoffFreezeState,
+    /// 截至取樣時刻的累計凍結時間（含已結算與進行中區間，且精確截斷至該時刻）。
+    pub frozen_total: Duration,
 }
 
 #[cfg(feature = "test-fakes")]
@@ -246,7 +259,9 @@ impl AdmissionGate {
             // Pending -> Permanent：結算後清除
             if let Some(since) = g.pending_since.take() {
                 let now = self.now();
-                g.frozen_accum += now.saturating_duration_since(since);
+                let dur = now.saturating_duration_since(since);
+                g.frozen_accum += dur;
+                g.frozen_intervals.push((since, now));
             }
         }
         if g.token.is_none() {
@@ -267,7 +282,9 @@ impl AdmissionGate {
         // Pending -> Open：把 now - pending_since 加進 frozen_accum，清除 pending_since
         if let Some(since) = g.pending_since.take() {
             let now = self.now();
-            g.frozen_accum += now.saturating_duration_since(since);
+            let dur = now.saturating_duration_since(since);
+            g.frozen_accum += dur;
+            g.frozen_intervals.push((since, now));
         }
         self.handoff_settled.notify_all();
         true
@@ -299,7 +316,9 @@ impl AdmissionGate {
         // Pending -> Permanent：同樣結算後清除
         if let Some(since) = g.pending_since.take() {
             let now = self.now();
-            g.frozen_accum += now.saturating_duration_since(since);
+            let dur = now.saturating_duration_since(since);
+            g.frozen_accum += dur;
+            g.frozen_intervals.push((since, now));
         }
         self.handoff_settled.notify_all();
         true
@@ -316,7 +335,9 @@ impl AdmissionGate {
                 // Pending -> Permanent
                 if let Some(since) = g.pending_since.take() {
                     let now = self.now();
-                    g.frozen_accum += now.saturating_duration_since(since);
+                    let dur = now.saturating_duration_since(since);
+                    g.frozen_accum += dur;
+                    g.frozen_intervals.push((since, now));
                 }
             }
             self.handoff_settled.notify_all();
@@ -362,16 +383,53 @@ impl AdmissionGate {
         FreezeOutcome::Frozen { token, created: true }
     }
 
-    /// 取得截至指定時刻的總凍結時間（含已結算之累積時間，若目前仍在 Pending 則加上自 pending_since 起算之經過時間）。
+    fn frozen_total_locked(&self, g: &GateInner, now: Instant) -> Duration {
+        let mut total = Duration::ZERO;
+        for &(start, end) in &g.frozen_intervals {
+            if now <= start {
+                continue;
+            }
+            let effective_end = if now < end { now } else { end };
+            total = total.saturating_add(effective_end.saturating_duration_since(start));
+        }
+        if let Some(since) = g.pending_since {
+            if now > since {
+                total = total.saturating_add(now.saturating_duration_since(since));
+            }
+        }
+        total
+    }
+
+    /// 取得截至指定時刻的總凍結時間（含已結算之歷史區間與進行中 Pending 區間，精確截斷至指定時刻）。
     /// 結果保證單調不遞減。
     pub fn frozen_total(&self, now: Instant) -> Duration {
         let g = self.lock();
-        let current_pending = if let Some(since) = g.pending_since {
-            now.saturating_duration_since(since)
-        } else {
-            Duration::ZERO
-        };
-        g.frozen_accum.saturating_add(current_pending)
+        self.frozen_total_locked(&g, now)
+    }
+
+    /// 於鎖內取得當前時刻、交接凍結狀態與截至該時刻累計凍結時間的一致快照。
+    pub fn snapshot(&self) -> GateSnapshot {
+        let g = self.lock();
+        let now = self.now();
+        let freeze_state = handoff_state(&g);
+        let frozen_total = self.frozen_total_locked(&g, now);
+        GateSnapshot {
+            now,
+            freeze_state,
+            frozen_total,
+        }
+    }
+
+    /// 於鎖內取得指定時刻、當前交接凍結狀態與截至該指定時刻累計凍結時間的一致快照。
+    pub fn snapshot_at(&self, now: Instant) -> GateSnapshot {
+        let g = self.lock();
+        let freeze_state = handoff_state(&g);
+        let frozen_total = self.frozen_total_locked(&g, now);
+        GateSnapshot {
+            now,
+            freeze_state,
+            frozen_total,
+        }
     }
 
     /// 目前未歸還的 ticket 數（觀測用）。
