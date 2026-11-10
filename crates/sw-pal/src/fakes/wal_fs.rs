@@ -60,30 +60,23 @@ impl WalWritePauseState {
         }
     }
 
-    fn notify_paused_and_wait_release(&self, timeout: Duration) -> bool {
+    fn notify_paused_and_wait_release(&self) {
         {
             let mut p = self.paused.lock().unwrap_or_else(|e| e.into_inner());
             *p = true;
             self.paused_cond.notify_all();
         }
 
-        let start = std::time::Instant::now();
         let mut r = self.released.lock().unwrap_or_else(|e| e.into_inner());
         while !*r {
-            let elapsed = start.elapsed();
-            if elapsed >= timeout {
-                return false;
-            }
-            let (guard, res) = self
+            r = self
                 .released_cond
-                .wait_timeout(r, timeout - elapsed)
+                .wait(r)
                 .unwrap_or_else(|e| e.into_inner());
-            r = guard;
-            if res.timed_out() && !*r {
-                return false;
-            }
         }
-        true
+
+        let mut p = self.paused.lock().unwrap_or_else(|e| e.into_inner());
+        *p = false;
     }
 
     fn wait_paused(&self, timeout: Duration) -> bool {
@@ -429,7 +422,7 @@ impl WalFile for FakeWalFile {
                         .and_then(|q| q.pop_front())
                 };
                 if let Some(pause) = pause {
-                    pause.notify_paused_and_wait_release(Duration::from_secs(15));
+                    pause.notify_paused_and_wait_release();
                 }
 
                 Ok(())

@@ -462,6 +462,59 @@ fn wal_fs_pause_after_write_is_visible_and_one_shot() {
 }
 
 #[test]
+fn pause_must_not_succeed_without_release() {
+    let fs = FakeWalFs::new();
+    let p = Path::new(WAL);
+    let mut file = fs.open_append(p).unwrap();
+
+    let pause = fs.pause_after_next_write(p);
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let start = std::time::Instant::now();
+    let handle = std::thread::spawn(move || {
+        let res = file.write_all_flush(b"tx\n");
+        let _ = done_tx.send((res, start.elapsed()));
+        file
+    });
+
+    assert!(
+        pause.wait_paused(Duration::from_secs(2)),
+        "背景寫入應在寫完後停在暫停點"
+    );
+
+    // 確認超過原 15 秒期限（等待 15.5 秒），若未 release 且 handle 未 drop，背景寫入不得成功返回
+    let timeout = Duration::from_millis(15_500);
+    let wait_res = done_rx.recv_timeout(timeout);
+    assert!(
+        wait_res.is_err(),
+        "without release/drop: result={wait_res:?}, wait_paused={}",
+        pause.wait_paused(Duration::ZERO)
+    );
+
+    // 此時仍應處於暫停狀態
+    assert!(
+        pause.wait_paused(Duration::ZERO),
+        "放行前暫停狀態應持續保持"
+    );
+
+    // 明確 release 後才放行
+    pause.release();
+
+    let (res, _elapsed) = done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("release 後背景寫入應成功返回");
+    assert!(res.is_ok(), "背景寫入應成功: {res:?}");
+
+    let _ = handle.join().expect("執行緒結束");
+
+    // 放行後 pause 不得仍回報處於暫停中
+    assert!(
+        !pause.wait_paused(Duration::ZERO),
+        "放行後暫停狀態應清除為 false"
+    );
+}
+
+#[test]
 fn mem_stream_roundtrip() {
     use std::io::{Read, Write};
     let (mut a, mut b) = MemStream::pair();
