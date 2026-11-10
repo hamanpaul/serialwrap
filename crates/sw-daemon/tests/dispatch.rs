@@ -3731,6 +3731,99 @@ fn command_cancel_queued_command() {
     assert_eq!(again.get("ok"), Some(&PyValue::Bool(true)));
 }
 
+/// DF-25（OD-77 B1，`contracts/behavior_changes.yaml` DF-25）早段取消：對照
+/// `origin/main:tests/test_s1m_b1_interactive_cancel.py:53`（`test_cancel_before_interactive_tx_still_blocks_command`
+/// 的 `before_lease`）——只撤銷命令自己的 op，仍須擋下尚未出列的 interactive 命令：零 TX、不遺留 lease。
+/// RPC 路徑：前景由阻塞命令佔住時 `command.submit {mode:"interactive"}` 入列；`Service::rpc("command.cancel")` →
+/// `CommandRegistry::cancel`（紀錄 canceled）→ `route(SessionRequest::CancelQueued)` → `SessionCore`
+/// `queue.remove`（前景 grant 的 cmd_id 不符，不撤銷佔用命令的 op）；前景以 prompt 收尾後 `start_next` 不再出列
+/// 被取消者，故不開 lease、不發 `OpSpec::InteractiveOpenCmd`。
+#[test]
+fn df25_cancel_queued_interactive_zero_tx() {
+    let r = ServiceRig::ready_shell();
+    let dev = r.device(REAL_A);
+    r.settle();
+    let session_id = r.mgr.resolve("COM0").expect("COM0 session");
+    let tx_mark = dev.tx_len();
+    let os_mark = dev.os_submits();
+    let wal_mark = wp58_g12_wal_rows(&r).len();
+    let hold = submit_blocking(&r);
+    wait_until("佔用命令已送上 UART", || {
+        wp55_wal_tx(&r, &hold) == vec![("agent".to_string(), wp55_b64(b"sleep 100\n"))]
+    });
+
+    let submitted = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"top","mode":"interactive"}"#,
+    );
+    assert_eq!(submitted.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&submitted));
+    let cmd_id = s(&submitted, "cmd_id").to_string();
+    let queued = wp58_g12_get(&r, &cmd_id);
+    assert_eq!(s(&queued, "status"), "accepted", "前置：前景佔用中仍在佇列：{}", j(&queued));
+    assert_eq!(queued.get("started_at"), Some(&PyValue::Null), "前置：尚未出列");
+    let (len_before, physical_before) = r.mgr.session_queue_lens("COM0").expect("COM0 佇列");
+    assert_eq!(len_before, 1, "前置：interactive 命令在佇列中");
+    let session = r.session("COM0").expect("COM0 session");
+    assert_eq!(
+        session.get("interactive_session_id"),
+        Some(&PyValue::Null),
+        "前置：尚未開 lease：{}",
+        j(&session)
+    );
+
+    let canceled = r.call("command.cancel", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+    assert_eq!(j(&canceled), wp58_g12_cancel_reply(&r, &cmd_id));
+    let canceled_record = wp58_g12_get(&r, &cmd_id);
+    assert_eq!(s(&canceled_record, "status"), "canceled", "{}", j(&canceled_record));
+    assert_eq!(
+        canceled_record.get("started_at"),
+        Some(&PyValue::Null),
+        "排隊中取消，不得開始執行"
+    );
+    assert_eq!(
+        r.mgr.session_queue_lens("COM0"),
+        Some((len_before - 1, physical_before - 1)),
+        "cancel 後佇列 len／physical_len 皆應減 1"
+    );
+
+    // 前景以 prompt 正常收尾（取消不得撤銷佔用命令的 op），之後不得再出列被取消的 interactive 命令。
+    dev.push_rx(b"\r\nroot@t:/# ");
+    let held = wp55_wait_done(&r, &hold);
+    assert_eq!(s(&held, "status"), "done", "{}", j(&held));
+    wait_until("佇列與在途指標清空", || r.registry.pending(&session_id) == 0);
+    r.settle();
+
+    assert_eq!(dev.os_submits(), os_mark + 1, "只有佔用命令一次 OS submit");
+    assert_eq!(
+        String::from_utf8_lossy(&dev.tx_since(tx_mark)),
+        "sleep 100\n",
+        "被取消的 interactive 命令不得寫出任何 UART bytes"
+    );
+    assert_eq!(
+        wp58_g12_tx_rows_since(&r, wal_mark),
+        vec![(format!("\"{hold}\""), wp55_b64(b"sleep 100\n"))],
+        "TX WAL 恰為佔用命令一筆"
+    );
+    assert!(wp55_wal_tx(&r, &cmd_id).is_empty(), "被取消命令不得有 TX WAL");
+    assert_eq!(
+        j(&wp58_g12_get(&r, &cmd_id)),
+        j(&canceled_record),
+        "前景收尾不得覆寫已取消紀錄"
+    );
+    let session = r.session("COM0").expect("COM0 session");
+    assert_eq!(
+        session.get("interactive_session_id"),
+        Some(&PyValue::Null),
+        "被取消命令不得開 lease：{}",
+        j(&session)
+    );
+    assert_eq!(
+        r.mgr.session_queue_lens("COM0").map(|(len, _)| len),
+        Some(0),
+        "佇列已清空"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // WP5-8 第 5 項（G12，S1X-a-1 延伸；裁決 s2 D7）：原命令的取消必須在 TX fence 內擋下 interactive 命令的送出。
 //
@@ -3982,6 +4075,149 @@ fn wp58_g12_original_cancel_does_not_poison_lease_sends() {
         &format!(r#"{{"interactive_id":"{lease_id}"}}"#),
     );
     assert_eq!(closed.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&closed));
+}
+
+// ---------------------------------------------------------------------------
+// DF-25（OD-77 B1，`contracts/behavior_changes.yaml` DF-25）：interactive 命令 TX 完成後、執行器返回前取消，
+// 不得撤銷存活的 lease。
+//
+// 基準 `origin/main:sw_core/session_manager.py:4595`（`revoke_tx_op` 只撤銷 `[cmd_id]`，lease 本身仍可續用）與
+// `origin/main:tests/test_s1m_b1_interactive_cancel.py:16`
+// （`test_cancel_after_interactive_tx_before_executor_return_preserves_lease`）。Rust 的 lease 歸屬依實際
+// interactive id：`PendingOp::InteractiveCmd { lease_id }` 只在未完整送出（非 `OpOutcome::Sent`）且目前 lease
+// 仍是 `lease_id` 時關閉；取消撤銷的是原命令前景 grant 的 op，之後 `session.interactive_send` 各自
+// `new_grant(None)` 取新 op，不受撤銷影響。
+// 呼叫路徑：`Service::rpc("command.cancel")` → `CommandRegistry::cancel`（紀錄 canceled）→
+// `route(SessionRequest::CancelQueued)` → `SessionCore`：前景 grant 的 cmd_id 相符 → `Fence::revoke_ops([grant.op_id])`；
+// 放行後 TxWriter 回 `TxReport`（已確認 4 bytes）→ `lease_send` 判 `fully_sent` → `OpOutcome::Sent` →
+// `on_op_finished` 的 `PendingOp::InteractiveCmd` 分支保留 lease、`registry.complete` 不覆寫 canceled 紀錄。
+// 同步屏障為 FakeWalFs 的寫後暫停（DF-25 第 1 項）：TxWriter 在 TX WAL 行完整寫入後停在 `write_all_flush` 內，
+// `TxReport` 尚未回給 OpRunner、`lease_send` 尚未返回——與上方 `BlockForever`（已交 OS、OS write 未返回、
+// 尚無 TX WAL）是不同窗口。
+// ---------------------------------------------------------------------------
+
+/// 原命令 TX 已完整交 OS 並落 TX WAL、執行器尚未返回時經 RPC 取消：取消回應與紀錄語意不變（`canceled`、
+/// canceled-running 在收尾前仍占額度、收尾與後續 send 不覆寫），同一 lease 之後連送 `q`、`x` 皆成功，
+/// UART 與 TX WAL 恰為 `top\nqx`。
+#[test]
+fn df25_interactive_cancel_preserves_lease() {
+    let r = ServiceRig::ready_shell();
+    let dev = r.device(REAL_A);
+    r.settle();
+    let session_id = r.mgr.resolve("COM0").expect("COM0 session");
+    let tx_mark = dev.tx_len();
+    let os_mark = dev.os_submits();
+    let wal_mark = wp58_g12_wal_rows(&r).len();
+    let pause = r.wfs.pause_after_next_write(WP55_WAL.as_ref());
+
+    let submitted = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"top","mode":"interactive"}"#,
+    );
+    assert_eq!(submitted.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&submitted));
+    let cmd_id = s(&submitted, "cmd_id").to_string();
+    assert!(
+        pause.wait_paused(Duration::from_secs(5)),
+        "TxWriter 未抵達 TX WAL 寫後暫停點"
+    );
+    // 前置：TX 已完成（UART 恰為 `top\n`、對應 TX WAL 已落盤），執行器尚未返回（命令 running、lease 已建立）。
+    assert_eq!(dev.os_submits(), os_mark + 1, "前置：原命令 TX 已交 OS");
+    assert_eq!(String::from_utf8_lossy(&dev.tx_since(tx_mark)), "top\n");
+    assert_eq!(
+        wp58_g12_tx_rows_since(&r, wal_mark),
+        vec![(format!("\"{cmd_id}\""), wp55_b64(b"top\n"))],
+        "前置：原命令 TX WAL 已存在"
+    );
+    assert_eq!(s(&wp58_g12_get(&r, &cmd_id), "status"), "running");
+    let lease_id = wp58_g12_lease_id(&r);
+
+    let send = |data: &str| {
+        r.call(
+            "session.interactive_send",
+            &format!(r#"{{"interactive_id":"{lease_id}","data":"{data}","encoding":"plain"}}"#),
+        )
+    };
+    // 以取消前的 lease send 回 `SESSION_BUSY` 證明取消當下原命令 op 仍為前景（`CancelQueued` 會命中並撤銷其 op）。
+    assert_eq!(
+        j(&send("q")),
+        format!(
+            "{{\"ok\":false,\"error_code\":\"SESSION_BUSY\",\"interactive_id\":\"{lease_id}\",\"version\":\"{}\"}}",
+            r.version
+        ),
+        "前置：執行器尚未返回，原命令 op 仍為前景"
+    );
+    assert_eq!(dev.os_submits(), os_mark + 1, "SESSION_BUSY 不送出");
+
+    let canceled = r.call("command.cancel", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+    assert_eq!(j(&canceled), wp58_g12_cancel_reply(&r, &cmd_id));
+    let canceled_record = wp58_g12_get(&r, &cmd_id);
+    assert_eq!(s(&canceled_record, "status"), "canceled", "{}", j(&canceled_record));
+    assert_eq!(
+        r.registry.pending(&session_id),
+        1,
+        "canceled-running 在執行器收尾前仍占額度（Python `arbiter.py:314-333`）"
+    );
+
+    pause.release();
+    wait_until("執行器收尾（清除 canceled-running 在途指標）", || {
+        r.registry.pending(&session_id) == 0
+    });
+    assert_eq!(
+        wp58_g12_lease_id(&r),
+        lease_id,
+        "TX 已完整送出：取消不得撤銷存活 lease"
+    );
+    assert_eq!(
+        j(&wp58_g12_get(&r, &cmd_id)),
+        j(&canceled_record),
+        "執行器收尾不得覆寫已取消紀錄"
+    );
+
+    for data in ["q", "x"] {
+        assert_eq!(
+            j(&send(data)),
+            format!(
+                "{{\"ok\":true,\"interactive_id\":\"{lease_id}\",\"bytes\":1,\"version\":\"{}\"}}",
+                r.version
+            ),
+            "lease send {data} 必須送達"
+        );
+    }
+    r.settle();
+    assert_eq!(dev.os_submits(), os_mark + 3);
+    assert_eq!(String::from_utf8_lossy(&dev.tx_since(tx_mark)), "top\nqx");
+    assert_eq!(
+        wp58_g12_tx_rows_since(&r, wal_mark),
+        vec![
+            (format!("\"{cmd_id}\""), wp55_b64(b"top\n")),
+            ("null".to_string(), wp55_b64(b"q")),
+            ("null".to_string(), wp55_b64(b"x")),
+        ],
+        "TX WAL 恰為原命令一筆＋lease send 兩筆"
+    );
+    assert_eq!(
+        j(&wp58_g12_get(&r, &cmd_id)),
+        j(&canceled_record),
+        "後續 lease send 不得覆寫已取消紀錄"
+    );
+    let closed = r.call(
+        "session.interactive_close",
+        &format!(r#"{{"interactive_id":"{lease_id}"}}"#),
+    );
+    assert_eq!(
+        j(&closed),
+        format!(
+            "{{\"ok\":true,\"interactive_id\":\"{lease_id}\",\"version\":\"{}\"}}",
+            r.version
+        )
+    );
+    let session = r.session("COM0").expect("COM0 session");
+    assert_eq!(
+        session.get("interactive_session_id"),
+        Some(&PyValue::Null),
+        "lease 已關閉：{}",
+        j(&session)
+    );
 }
 
 #[test]
