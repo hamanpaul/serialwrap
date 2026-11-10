@@ -461,6 +461,32 @@ def test_conditional_cases_declare_capability():
 
 
 @pytest.mark.memory_only
+def test_df25_case_registration():
+    cases_data = _load_cases()
+    matches = [c for c in cases_data.get("cases", []) if c.get("case_id") == "df25-interactive-cancel-preserves-lease"]
+    assert len(matches) == 1, f"df25-interactive-cancel-preserves-lease 必須恰好存在一筆，實際找到 {len(matches)} 筆"
+    c = matches[0]
+    assert c.get("behavior_changes") == ["DF-25"], f"behavior_changes 必須為 ['DF-25']，實際為 {c.get('behavior_changes')}"
+    assert c.get("necessity") == "conditional", f"necessity 必須為 conditional，實際為 {c.get('necessity')}"
+    assert c.get("daemon_slice") == "2.2", f"daemon_slice 必須為 '2.2'，實際為 {c.get('daemon_slice')}"
+    assert c.get("source_ref") == "crates/sw-daemon/tests/dispatch.rs::df25_interactive_cancel_preserves_lease", (
+        f"source_ref 必須精確指向 Rust 黑箱節點，實際為 {c.get('source_ref')}"
+    )
+
+    l1_path = REPO / "tests/acceptance/l1_required.lock.json"
+    l1_data = json.loads(l1_path.read_text(encoding="utf-8"))
+    s22_nodes = set(
+        l1_data.get("sets", {}).get("s22_gate:cargo_workspace", {}).get("linux", {}).get("nodeids", [])
+    )
+    expected_nodes = {
+        "cargo:sw-daemon::dispatch::df25_cancel_queued_interactive_zero_tx",
+        "cargo:sw-daemon::dispatch::df25_interactive_cancel_preserves_lease",
+    }
+    missing = expected_nodes - s22_nodes
+    assert not missing, f"新增的 Rust 測試節點必須在 s22_gate:cargo_workspace.linux 集合內，缺少：{missing}"
+
+
+@pytest.mark.memory_only
 def test_invariants_from_spec_only():
     cases_data = _load_cases()
     invariant_ids = set(cases_data.get("invariant_ids") or [])

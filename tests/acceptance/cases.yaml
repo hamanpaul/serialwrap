@@ -14,7 +14,7 @@
 #   - s24-*（P8 Task 1）：suite 新增 rust-l1、family 新增 S24（schema 列舉只增不改）；SC-33 依 OD-79 撤回，原列 SC-33 的案例改列 SC-03；
 #     s24-xfer-abort-on-release 依 OD-62 比照 BC-03；source_ref／evidence 中尚未建立的節點由承接 Task 依此命名建立。
 schema_version: 1
-revision: 2026-11-10.1
+revision: 2026-11-10.2
 spec: docs/rust-refactor/serialwrap-rust-spec-final.md
 invariant_ids: [zero_tx_on_reject, no_forbidden_interleave, no_stale_context_replay, no_reopen_before_handoff, no_auto_resend, insufficient_evidence_not_pass]
 features:
@@ -6312,4 +6312,30 @@ cases:
   sentinel: null
   evidence: [tests/contract_blackbox/test_p7_latency_noise.py]
   implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+# --- P8 DF-25 interactive cancel 存活 lease 黑箱案例（OD-77 B1；add-only；conditional 不改變切片凍結分母） ---
+- case_id: df25-interactive-cancel-preserves-lease
+  suite: contract-blackbox
+  source_ref: crates/sw-daemon/tests/dispatch.rs::df25_interactive_cancel_preserves_lease
+  family: L15
+  title: 'DF-25（OD-77 B1）：interactive 命令 TX 完成後的取消不撤銷存活 lease，後續 send 正常送達'
+  contract: 'OD-77 B1／DF-25：interactive 命令 TX 完整交 OS 並落 TX WAL、執行器返回前經 RPC 取消，只撤銷原命令前景 grant 的 op，存活 lease 不被撤銷，同一 lease 後續 interactive_send 皆 ok 送達且不回 SESSION_BUSY；取消本身的 status 為 canceled、回應與紀錄不被收尾或後續 send 覆寫。對照 Python test_s1m_b1_interactive_cancel.py。'
+  invariants: [zero_tx_on_reject]
+  layer: L1
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [memory_only]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [lease]
+  necessity: conditional
+  issues: []
+  behavior_changes: [DF-25]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [crates/sw-daemon/tests/dispatch.rs]
+  implemented_by: 07-slice22-console.md
   cross_slice_reason: null

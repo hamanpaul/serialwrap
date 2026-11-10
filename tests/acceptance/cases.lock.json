@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "cases_revision": "2026-11-10.1",
+  "cases_revision": "2026-11-10.2",
   "sets": {
     "stage0": [
       "brcm-01-login-flow",
@@ -303,6 +303,7 @@
       "df18-event-replace-overwrite",
       "df20-recover-reboot-stale-interactive-id",
       "df20-release-reattach-stale-interactive-id",
+      "df25-interactive-cancel-preserves-lease",
       "df27-python-post-login-timeout-stays-detached",
       "df27-rust-post-login-timeout-reprobes-ready",
       "ev-01-spawn-handler",
@@ -1550,6 +1551,19 @@
       "stage0_required": false
     },
     "df20-release-reattach-stale-interactive-id": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "conditional",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "df25-interactive-cancel-preserves-lease": {
       "suite": "contract-blackbox",
       "layer": "L1",
       "platforms": [
