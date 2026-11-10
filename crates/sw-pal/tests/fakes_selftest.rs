@@ -378,6 +378,90 @@ fn wal_fs_partial_write_reports_sent_and_keeps_prefix() {
 }
 
 #[test]
+fn wal_fs_pause_after_write_is_visible_and_one_shot() {
+    let fs = FakeWalFs::new();
+    let p = Path::new(WAL);
+    let file = fs.open_append(p).unwrap();
+
+    let pause = fs.pause_after_next_write(p);
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn({
+        let mut file = file;
+        move || {
+            let res1 = file.write_all_flush(b"first\n");
+            let _ = done_tx.send(res1);
+            let res2 = file.write_all_flush(b"second\n");
+            (file, res2)
+        }
+    });
+
+    // 1. 等待背景寫入到達暫停點（有界等待，超時則失敗）
+    assert!(
+        pause.wait_paused(Duration::from_secs(2)),
+        "背景寫入應在寫完第一筆後停在暫停點"
+    );
+
+    // 2. 暫停期間，主執行緒仍可讀到第一筆完整內容（不發生死鎖）
+    assert_eq!(
+        fs.contents(p),
+        Some(b"first\n".to_vec()),
+        "暫停點時主執行緒應可立即可見已寫入內容"
+    );
+
+    // 3. 背景執行緒此時尚未完成第一筆寫入
+    assert!(
+        done_rx.try_recv().is_err(),
+        "放行前第一筆 write_all_flush 不應返回"
+    );
+
+    // 4. 主執行緒放行暫停點
+    pause.release();
+
+    // 5. 第一筆寫入成功返回
+    let res1 = done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("第一筆寫入在放行後應返回");
+    assert!(res1.is_ok(), "第一筆寫入應成功: {res1:?}");
+
+    // 6. 等待背景執行緒結束（第二次寫入不再暫停，順利完成）
+    let (file, res2) = handle.join().expect("背景寫入執行緒不應崩潰");
+    assert!(res2.is_ok(), "第二筆寫入應成功: {res2:?}");
+
+    // 7. 兩筆內容都完整寫入
+    assert_eq!(
+        fs.contents(p),
+        Some(b"first\nsecond\n".to_vec()),
+        "兩筆寫入內容應完整存在"
+    );
+
+    // 8. 驗證失敗清理：若 pause handle drop，暫停點應自動解除而不死鎖
+    {
+        let pause3 = fs.pause_after_next_write(p);
+        let mut file = file;
+        let (done_tx3, done_rx3) = std::sync::mpsc::channel();
+        let handle3 = std::thread::spawn(move || {
+            let res = file.write_all_flush(b"third\n");
+            let _ = done_tx3.send(res);
+            file
+        });
+
+        assert!(
+            pause3.wait_paused(Duration::from_secs(2)),
+            "第三筆寫入應停在暫停點"
+        );
+        // 不呼叫 pause3.release()，直接 drop(pause3) 模擬測試失敗清理
+        drop(pause3);
+
+        let res3 = done_rx3
+            .recv_timeout(Duration::from_secs(2))
+            .expect("drop(pause) 應解除暫停使背景寫入返回");
+        assert!(res3.is_ok(), "第三筆寫入應成功");
+        let _ = handle3.join().expect("執行緒結束");
+    }
+}
+
+#[test]
 fn mem_stream_roundtrip() {
     use std::io::{Read, Write};
     let (mut a, mut b) = MemStream::pair();

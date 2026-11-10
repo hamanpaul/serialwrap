@@ -43,7 +43,7 @@ pub use service::FakeServiceCtl;
 pub use sysenv::{FakeSysEnv, FakeSysEnvBuilder};
 pub use tunnel::FakeTunnel;
 pub use usb::FakeUsb;
-pub use wal_fs::{ExternalHandle, FakeWalFs};
+pub use wal_fs::{ExternalHandle, FakeWalFs, WalWritePause};
 
 static EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
 

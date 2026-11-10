@@ -3,7 +3,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use crate::traits::{FileIdentity, PalError, PalErrorKind, PalResult, WalFile, WalFs, WalWriteError};
 
@@ -39,6 +40,104 @@ struct FsInner {
     force_identity: HashMap<PathBuf, Option<FileIdentity>>,
     dir_writable: HashMap<PathBuf, bool>,
     dirs: HashSet<PathBuf>,
+    write_pauses: HashMap<PathBuf, VecDeque<Arc<WalWritePauseState>>>,
+}
+
+struct WalWritePauseState {
+    paused: Mutex<bool>,
+    paused_cond: Condvar,
+    released: Mutex<bool>,
+    released_cond: Condvar,
+}
+
+impl WalWritePauseState {
+    fn new() -> Self {
+        Self {
+            paused: Mutex::new(false),
+            paused_cond: Condvar::new(),
+            released: Mutex::new(false),
+            released_cond: Condvar::new(),
+        }
+    }
+
+    fn notify_paused_and_wait_release(&self, timeout: Duration) -> bool {
+        {
+            let mut p = self.paused.lock().unwrap_or_else(|e| e.into_inner());
+            *p = true;
+            self.paused_cond.notify_all();
+        }
+
+        let start = std::time::Instant::now();
+        let mut r = self.released.lock().unwrap_or_else(|e| e.into_inner());
+        while !*r {
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                return false;
+            }
+            let (guard, res) = self
+                .released_cond
+                .wait_timeout(r, timeout - elapsed)
+                .unwrap_or_else(|e| e.into_inner());
+            r = guard;
+            if res.timed_out() && !*r {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn wait_paused(&self, timeout: Duration) -> bool {
+        let start = std::time::Instant::now();
+        let mut p = self.paused.lock().unwrap_or_else(|e| e.into_inner());
+        while !*p {
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                return false;
+            }
+            let (guard, res) = self
+                .paused_cond
+                .wait_timeout(p, timeout - elapsed)
+                .unwrap_or_else(|e| e.into_inner());
+            p = guard;
+            if res.timed_out() && !*p {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn release(&self) {
+        let mut r = self.released.lock().unwrap_or_else(|e| e.into_inner());
+        *r = true;
+        self.released_cond.notify_all();
+    }
+}
+
+/// `FakeWalFs` 的一次性寫後暫停閘門。
+///
+/// 寫入端在成功追加完整資料並釋放所有檔案系統與檔案資料鎖後進入暫停；
+/// 呼叫端的 `wait_paused` 等待寫入端抵達該暫停點，`release` 放行寫入端。
+/// 若 handle 在放行前被 drop（例如測試斷言失敗或 panic），`Drop` 實作會自動放行，避免背景執行緒永久卡死。
+pub struct WalWritePause {
+    state: Arc<WalWritePauseState>,
+}
+
+impl WalWritePause {
+    /// 等待寫入端抵達暫停點。若在 `timeout` 內抵達回傳 `true`，逾時回傳 `false`。
+    pub fn wait_paused(&self, timeout: Duration) -> bool {
+        self.state.wait_paused(timeout)
+    }
+
+    /// 放行暫停的寫入端。
+    pub fn release(&self) {
+        self.state.release();
+    }
+}
+
+impl Drop for WalWritePause {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 /// 外部 reader 的 handle；Drop 時釋放 pending-delete（Windows 語意）。
@@ -268,6 +367,22 @@ impl FakeWalFs {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.dir_writable.insert(dir.to_path_buf(), writable);
     }
+
+    /// API 補充：在下一次對 `path` 的 `write_all_flush` 成功追加完整資料後暫停，供測試在執行器返回前做斷言或操作。
+    pub fn pause_after_next_write(&self, path: &Path) -> WalWritePause {
+        let pause = Arc::new(WalWritePauseState::new());
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner
+            .write_pauses
+            .entry(path.to_path_buf())
+            .or_default()
+            .push_back(Arc::clone(&pause));
+        WalWritePause { state: pause }
+    }
+
+    pub fn pause_after_write(&self, path: &Path) -> WalWritePause {
+        self.pause_after_next_write(path)
+    }
 }
 
 struct FakeWalFile {
@@ -304,6 +419,19 @@ impl WalFile for FakeWalFile {
             None => {
                 let mut data = self.node.bytes.lock().unwrap_or_else(|e| e.into_inner());
                 data.extend_from_slice(bytes);
+                drop(data);
+
+                let pause = {
+                    let mut inner = self.fs.lock().unwrap_or_else(|e| e.into_inner());
+                    inner
+                        .write_pauses
+                        .get_mut(&self.path)
+                        .and_then(|q| q.pop_front())
+                };
+                if let Some(pause) = pause {
+                    pause.notify_paused_and_wait_release(Duration::from_secs(15));
+                }
+
                 Ok(())
             }
         }
