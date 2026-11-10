@@ -16,6 +16,7 @@ stdlib＋PyYAML＋PTY，不得 import sw_core／serialwrap／serialwrapd。
 """
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import os
@@ -152,9 +153,86 @@ def _stop_run(tool, harness, root: Path, limit: float, flood_cfg: dict) -> dict:
     return _judged(tool, values, errors, problems, want=STOP_SAMPLES, limit=limit, before=before, monitor=monitor)
 
 
+def resolve_rust_artifacts(
+    *,
+    caller_daemon: str | None = None,
+    caller_cli: str | None = None,
+    cargo_target_dir: str | Path | None = None,
+    repo_root: Path = ROOT,
+) -> tuple[Path, Path]:
+    """解析受測 Rust CLI 與 daemon 執行檔路徑（OD-81／DF-27／P8-a190a57-1）。
+
+    優先順序：
+    1. 呼叫端明確指定且非 .py 的 caller_daemon 與 caller_cli。
+    2. 若未指定，依 cargo_target_dir（或環境變數 CARGO_TARGET_DIR，預設為 repo_root / "target"）
+       於 debug 或 release 子目錄尋找 serialwrapd 與 serialwrap。
+    若檔案不存在則拋出 AssertionError。
+    """
+    if caller_daemon and caller_cli and not str(caller_daemon).endswith(".py") and not str(caller_cli).endswith(".py"):
+        d_path = Path(caller_daemon)
+        cli_path = Path(caller_cli)
+        assert d_path.is_file(), f"呼叫端指定的 Rust daemon 二進位不存在：{d_path}"
+        assert cli_path.is_file(), f"呼叫端指定的 Rust CLI 二進位不存在：{cli_path}"
+        return d_path, cli_path
+
+    target_root = Path(cargo_target_dir or os.environ.get("CARGO_TARGET_DIR") or (repo_root / "target"))
+    candidates = [target_root / "debug", target_root / "release"]
+    for cand in candidates:
+        d = cand / "serialwrapd"
+        c = cand / "serialwrap"
+        if d.is_file() and c.is_file():
+            return d, c
+
+    searched = ", ".join(str(c) for c in candidates)
+    raise AssertionError(
+        f"未找到 Rust 二進位檔（已搜尋：{searched}）。"
+        f"請先 cargo build -p sw-daemon -p sw-cli，或明確指定 SERIALWRAP_DAEMON_EXE 與 SERIALWRAP_CLI_EXE。"
+    )
+
+
+def assert_no_wal_tx_leak(wal_records: list[dict], marker: str | bytes) -> None:
+    """斷言 WAL 記錄中未外洩禁止的命令 marker（OD-81／DF-27／P8-a190a57-2）。
+
+    同時檢查：
+    1. 各記錄之明文 metadata（排除 payload_b64）。
+    2. 解碼 payload_b64 之個別記錄內容。
+    3. 依序串接所有 TX 方向記錄的 payload（防止跨記錄切分）。
+    4. 依序串接全部記錄的 payload。
+    """
+    marker_bytes = marker.encode("utf-8") if isinstance(marker, str) else marker
+    marker_str = marker if isinstance(marker, str) else marker.decode("utf-8", errors="replace")
+
+    tx_stream = bytearray()
+    all_stream = bytearray()
+
+    for rec in wal_records:
+        rec_meta = {k: v for k, v in rec.items() if k != "payload_b64"}
+        assert marker_str not in str(rec_meta), f"命令標記外洩至 WAL metadata：{rec_meta}"
+
+        b64 = rec.get("payload_b64")
+        if not b64 or not isinstance(b64, str):
+            continue
+        try:
+            raw = base64.b64decode(b64)
+        except Exception:
+            continue
+
+        assert marker_bytes not in raw, (
+            f"命令標記外洩至單筆 WAL payload（seq={rec.get('seq')}, source={rec.get('source')}）"
+        )
+
+        all_stream.extend(raw)
+        src = str(rec.get("source", ""))
+        if "TX" in src.upper():
+            tx_stream.extend(raw)
+
+    assert marker_bytes not in tx_stream, "命令標記外洩至 WAL TX 串接資料流"
+    assert marker_bytes not in all_stream, "命令標記外洩至 WAL 全體串接資料流"
+
+
 @contextmanager
 def _select_engine(flavor: str):
-    """明確選擇受測 CLI／daemon 之 artifact，離開時完整還原（OD-81／DF-27）。"""
+    """明確選擇受測 CLI／daemon 之 artifact，離開時完整還原（OD-81／DF-27／P8-a190a57-1）。"""
     old_ab = dict(ab_env.AB_ENV)
     old_env = {k: os.environ.get(k) for k in ab_env.AB_KEYS}
     try:
@@ -164,20 +242,25 @@ def _select_engine(flavor: str):
                 os.environ.pop(k, None)
             ab_env.AB_ENV["SERIALWRAP_AB_LABEL"] = "python-baseline"
             os.environ["SERIALWRAP_AB_LABEL"] = "python-baseline"
+            expected_exe = ab_env.expected_daemon_exe()
+            yield expected_exe
         elif flavor == "rust":
-            rust_d = ROOT / "target" / "debug" / "serialwrapd"
-            rust_cli = ROOT / "target" / "debug" / "serialwrap"
-            assert rust_d.is_file(), f"Rust daemon 二進位不存在：{rust_d}（需先 cargo build -p sw-daemon）"
-            assert rust_cli.is_file(), f"Rust CLI 二進位不存在：{rust_cli}（需先 cargo build -p sw-cli）"
+            caller_d = old_ab.get("SERIALWRAP_DAEMON_EXE") or old_env.get("SERIALWRAP_DAEMON_EXE")
+            caller_cli = old_ab.get("SERIALWRAP_CLI_EXE") or old_env.get("SERIALWRAP_CLI_EXE")
+            rust_d, rust_cli = resolve_rust_artifacts(
+                caller_daemon=caller_d,
+                caller_cli=caller_cli,
+            )
             ab_env.AB_ENV["SERIALWRAP_DAEMON_EXE"] = str(rust_d)
             ab_env.AB_ENV["SERIALWRAP_CLI_EXE"] = str(rust_cli)
             ab_env.AB_ENV["SERIALWRAP_AB_LABEL"] = "rust-p8"
             os.environ["SERIALWRAP_DAEMON_EXE"] = str(rust_d)
             os.environ["SERIALWRAP_CLI_EXE"] = str(rust_cli)
             os.environ["SERIALWRAP_AB_LABEL"] = "rust-p8"
+            expected_exe = ab_env.expected_daemon_exe()
+            yield expected_exe
         else:
             raise ValueError(f"未知引擎規格：{flavor}")
-        yield
     finally:
         ab_env.AB_ENV.clear()
         ab_env.AB_ENV.update(old_ab)
@@ -189,7 +272,7 @@ def _select_engine(flavor: str):
 
 
 @contextmanager
-def _df27_post_login_timeout_scenario(flavor: str, tmp_path: Path):
+def _df27_post_login_timeout_scenario(flavor: str, tmp_path: Path, expected_daemon_exe: str | None = None):
     """DF-27 黑箱情境：登入後 post_login_cmd ('sh') 回應非 prompt 文字導致 POST_LOGIN_CMD_TIMEOUT。
 
     以短 timeout_s（2 s）觸發逾時進 DETACHED，拒絕期間送唯一 marker 之 cmd submit 驗證零 TX，
@@ -213,6 +296,11 @@ def _df27_post_login_timeout_scenario(flavor: str, tmp_path: Path):
         rig.start("bcm", [tgt], timeout_s=2)
         assert rig.daemon is not None and rig.daemon.proc is not None
         assert_daemon_artifact(rig.daemon.proc.pid)
+        if expected_daemon_exe:
+            actual_exe = os.path.realpath(os.readlink(f"/proc/{rig.daemon.proc.pid}/exe"))
+            assert actual_exe == os.path.realpath(expected_daemon_exe), (
+                f"受測 daemon 二進位與預期不符：期望 {expected_daemon_exe}，實際 {actual_exe}"
+            )
 
         # 1. 登入成功後送出 sh，假 target 回傳非 prompt 文字，等待 timeout_s 逾時
         s_detached = wait_state(rig.env, "COM0", "DETACHED", timeout_s=15.0)
@@ -236,7 +324,7 @@ def _df27_post_login_timeout_scenario(flavor: str, tmp_path: Path):
         dut_bytes = tgt.rx_log()
         assert marker.encode("utf-8") not in dut_bytes, "拒絕期間的命令文字外洩至 DUT RX log"
         wal_records = rig.wal_records("COM0")
-        assert not any(marker in str(rec) for rec in wal_records), "拒絕期間的命令文字外洩至 WAL"
+        assert_no_wal_tx_leak(wal_records, marker)
 
         yield rig, tgt, s_detached
     finally:
@@ -260,8 +348,8 @@ def test_df27_python_post_login_timeout_stays_detached(tmp_path):
 
     在涵蓋 RX idle 與既有多段退避的觀察窗內（40 秒），持續 DETACHED、錯誤不變、沒有新增自動登入 TX。
     """
-    with _select_engine("python"):
-        with _df27_post_login_timeout_scenario("python", tmp_path) as (rig, tgt, _):
+    with _select_engine("python") as exp_exe:
+        with _df27_post_login_timeout_scenario("python", tmp_path, expected_daemon_exe=exp_exe) as (rig, tgt, _):
             tx_before = tgt.rx_log()
             deadline = time.monotonic() + 40.0
             while time.monotonic() < deadline:
@@ -282,12 +370,108 @@ def test_df27_rust_post_login_timeout_reprobes_ready(tmp_path):
     重探完成後清除錯誤（last_error is None）並完成新的 ready_probe nonce 確認。
     未修 Rust 時因尚未納入 reprobe 錯誤碼，本測試預期在 wait_state(READY) 逾時而紅燈。
     """
-    with _select_engine("rust"):
-        with _df27_post_login_timeout_scenario("rust", tmp_path) as (rig, tgt, _):
+    with _select_engine("rust") as exp_exe:
+        with _df27_post_login_timeout_scenario("rust", tmp_path, expected_daemon_exe=exp_exe) as (rig, tgt, _):
             s_ready = wait_state(rig.env, "COM0", "READY", timeout_s=40.0)
             assert s_ready.get("last_error") is None, s_ready
             sent = tgt.rx_log()
             assert b"echo __READY__" in sent, "Rust 應完成新的 ready_probe nonce 確認"
+
+
+def test_df27_rust_artifact_selector_resolution(tmp_path):
+    """P8-a190a57-1 自測：驗證 resolve_rust_artifacts 與 _select_engine 解析路徑。
+
+    1. 呼叫端明確指定且非 .py 之二進位時，優先保留該自訂路徑，不被覆寫。
+    2. 未指定時，若給定 cargo_target_dir，則解析至該目錄下的 debug 二進位。
+    3. 未指定且無 cargo_target_dir 時，解析至工作樹 target/debug。
+    4. 呼叫端指定不存在之路徑時，明確拋出 AssertionError。
+    """
+    # 建立假二進位供自測
+    custom_dir = tmp_path / "custom_bin"
+    custom_dir.mkdir()
+    c_d = custom_dir / "custom_serialwrapd"
+    c_cli = custom_dir / "custom_serialwrap"
+    c_d.touch(mode=0o755)
+    c_cli.touch(mode=0o755)
+
+    # 1. 呼叫端明確指定存在且非 .py 之二進位
+    d, cli = resolve_rust_artifacts(caller_daemon=str(c_d), caller_cli=str(c_cli))
+    assert d == c_d
+    assert cli == c_cli
+
+    # 驗證 _select_engine("rust") 保留呼叫端指定路徑
+    old_ab = dict(ab_env.AB_ENV)
+    try:
+        ab_env.AB_ENV["SERIALWRAP_DAEMON_EXE"] = str(c_d)
+        ab_env.AB_ENV["SERIALWRAP_CLI_EXE"] = str(c_cli)
+        with _select_engine("rust") as exp:
+            assert exp == os.path.realpath(str(c_d))
+            assert ab_env.AB_ENV["SERIALWRAP_DAEMON_EXE"] == str(c_d)
+            assert ab_env.AB_ENV["SERIALWRAP_CLI_EXE"] == str(c_cli)
+    finally:
+        ab_env.AB_ENV.clear()
+        ab_env.AB_ENV.update(old_ab)
+
+    # 2. 依 cargo_target_dir 解析
+    cargo_target = tmp_path / "cargo_target"
+    (cargo_target / "debug").mkdir(parents=True)
+    ct_d = cargo_target / "debug" / "serialwrapd"
+    ct_cli = cargo_target / "debug" / "serialwrap"
+    ct_d.touch(mode=0o755)
+    ct_cli.touch(mode=0o755)
+    d2, cli2 = resolve_rust_artifacts(cargo_target_dir=cargo_target)
+    assert d2 == ct_d
+    assert cli2 == ct_cli
+
+    # 3. 預設解析至工作樹 target/debug
+    d3, cli3 = resolve_rust_artifacts()
+    assert d3 == ROOT / "target" / "debug" / "serialwrapd"
+    assert cli3 == ROOT / "target" / "debug" / "serialwrap"
+
+    # 4. 指定不存在的路徑時報錯
+    non_existent = tmp_path / "non_existent"
+    with pytest.raises(AssertionError, match="呼叫端指定的 Rust daemon 二進位不存在"):
+        resolve_rust_artifacts(caller_daemon=str(non_existent), caller_cli=str(c_cli))
+
+
+def test_df27_wal_zero_tx_assertion_negative_test():
+    """P8-a190a57-2 負向自測：驗證 assert_no_wal_tx_leak 能攔截 base64 編碼及跨記錄切分之 payload。"""
+    marker = "DF27_ZERO_TX_TEST_SECRET_98765"
+
+    # 1. 舊式 str(rec) 檢查會漏掉 base64 payload，但 assert_no_wal_tx_leak 必定攔截（拋出 AssertionError）
+    b64_payload = base64.b64encode(f"cmd: echo {marker}\n".encode("utf-8")).decode("ascii")
+    leaked_record = {
+        "seq": 10,
+        "source": "AGENT_TX",
+        "cmd_id": "c1",
+        "payload_b64": b64_payload,
+    }
+
+    # 證明舊式檢查在此負向樣本上會漏掉
+    old_check_missed = not any(marker in str(rec) for rec in [leaked_record])
+    assert old_check_missed, "證明舊式 str(rec) 檢查確實漏掉了 base64 編碼的禁止命令"
+
+    # 證明 assert_no_wal_tx_leak 必定攔截單筆 payload 外洩
+    with pytest.raises(AssertionError, match="命令標記外洩至單筆 WAL payload"):
+        assert_no_wal_tx_leak([leaked_record], marker)
+
+    # 2. 跨記錄切分測試：前半段在 rec1、後半段在 rec2
+    half1 = marker[:15]
+    half2 = marker[15:]
+    rec1 = {"seq": 1, "source": "AGENT_TX", "payload_b64": base64.b64encode(half1.encode("utf-8")).decode("ascii")}
+    rec2 = {"seq": 2, "source": "AGENT_TX", "payload_b64": base64.b64encode(half2.encode("utf-8")).decode("ascii")}
+
+    # 單筆檢查均不含完整 marker
+    assert marker.encode("utf-8") not in base64.b64decode(rec1["payload_b64"])
+    assert marker.encode("utf-8") not in base64.b64decode(rec2["payload_b64"])
+
+    # 證明串接檢查能攔截跨記錄切分
+    with pytest.raises(AssertionError, match="命令標記外洩至 WAL TX 串接資料流"):
+        assert_no_wal_tx_leak([rec1, rec2], marker)
+
+    # 3. 正常記錄通過檢查
+    clean_rec = {"seq": 3, "source": "SYS_TX", "payload_b64": base64.b64encode(b"normal probe\n").decode("ascii")}
+    assert_no_wal_tx_leak([clean_rec], marker)
 
 
 def test_login_with_delay_and_noise(p7, tmp_path):
