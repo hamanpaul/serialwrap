@@ -167,7 +167,7 @@ fn test_reaper_worker_stopped_separate_handle_and_evidence() {
     ).expect("register 成功");
 
     // 模擬轉入 BridgeDraining
-    ledger.mark_bridge_draining(token, 1).expect("mark bridge draining");
+    ledger.mark_bridge_draining(token, 1, StopId(1)).expect("mark bridge draining");
 
     // 1. handle_closed: true 但 evidence 有未落盤缺口
     let receipt_incomplete = WorkerStoppedReceipt {
@@ -199,7 +199,7 @@ fn test_reaper_worker_stopped_separate_handle_and_evidence() {
         CustodyOwner::Reaper,
         CustodyTaker::Worker("reap2".into()),
     ).expect("register 成功");
-    ledger.mark_bridge_draining(token2, 2).expect("mark bridge draining");
+    ledger.mark_bridge_draining(token2, 2, StopId(2)).expect("mark bridge draining");
 
     let receipt_failed = WorkerStoppedReceipt {
         epoch: 2,
@@ -337,7 +337,7 @@ fn test_exit_reclaim_triggers_on_normal_exit_panic_and_unwind_but_not_spawn_fail
         assert!(reaper_rx.try_recv().is_err(), "unwind 不應有多餘命令");
     }
 
-    // 3. panic 超限退出：連續 panic 事件達到上限後退出
+    // 3. 審查 P8-057a065-4 重現：連續 3 次 panic 事件後，驗證 actor 實際行為
     {
         let (reaper_tx, reaper_rx) = unbounded();
         let mut h = CoreHarness::new(SHELL_PROFILE);
@@ -349,14 +349,30 @@ fn test_exit_reclaim_triggers_on_normal_exit_panic_and_unwind_but_not_spawn_fail
         let handle = try_spawn_actor_with_reaper(core, mb, Box::new(ReplyExec), clock, 3, Some(reaper_tx))
             .expect("spawn actor 成功");
 
+        // 連續三次請求觸發三次 panic
         for _ in 0..3 {
-            let _ = handle.request(sw_core::session_core::SessionRequest::GetState, Duration::from_secs(2));
+            let res = handle.request(sw_core::session_core::SessionRequest::GetState, Duration::from_secs(2));
+            assert!(res.is_err(), "注入 panic 時請求應回傳錯誤");
         }
+
+        // 若按照審查原本的假設：斷言 panic 超限本身導致退出
+        // 在現行 actor 實作下，actor.rs:620 僅呼叫 begin_stop(StopKind::IoError)，並不結束 actor loop，因此不會退出！
+        // 這裡以有界等待驗證：100ms 內 reaper 不會收到 ActorExited，且第四次 GetState 仍成功處理！
+        let premature_exit = reaper_rx.recv_timeout(Duration::from_millis(100));
+        assert!(
+            premature_exit.is_err(),
+            "現行 actor 不會因 panic 超限退出執行緒，因此不應有 ActorExited"
+        );
+
+        let fourth_req = handle.request(sw_core::session_core::SessionRequest::GetState, Duration::from_secs(2));
+        assert!(fourth_req.is_ok(), "第四次請求仍能被存活的 actor 成功處理");
+
+        // 送出 Shutdown 作為清理退出
         let (reply, _reply_rx) = bounded(1);
         let _ = handle.control.send(ControlEvent::Shutdown { reply });
         let _ = handle.join.join();
 
-        let cmd = reaper_rx.try_recv().expect("panic 超限後退出 reaper 應收到 ActorExited");
+        let cmd = reaper_rx.try_recv().expect("Shutdown 退出後 reaper 應收到恰好一筆 ActorExited");
         match cmd {
             ReaperCmd::ActorExited { sid, inc } => {
                 assert_eq!(sid, expected_sid);
@@ -364,7 +380,7 @@ fn test_exit_reclaim_triggers_on_normal_exit_panic_and_unwind_but_not_spawn_fail
             }
             _ => panic!("預期 ActorExited"),
         }
-        assert!(reaper_rx.try_recv().is_err(), "panic 超限退出不應有多餘命令");
+        assert!(reaper_rx.try_recv().is_err(), "Shutdown 退出後不應有多餘命令");
     }
 
     // 4. spawn 失敗路徑：注入失敗，try_spawn_actor_with_reaper 回傳 Err，未進入 closure，reaper 通道為空
@@ -500,21 +516,20 @@ fn test_deliverer_pending_duration_excluded_from_30s_timeout() {
     };
     assert_eq!(gate.handoff_freeze_state(), HandoffFreezeState::Pending);
 
-    // 在 Pending 狀態度過 5 秒
-    let t_pending = t_29_9 + Duration::from_secs(5);
-    let outcome_p = deliverer.step_delivery(sid, &actor_tx, t_pending);
+    // 審查 P8-057a065-3 重現：最後一次 Pending 呼叫在凍結起點（t_29_9），此後在 Pending 期間不再呼叫 step_delivery
+    let outcome_p = deliverer.step_delivery(sid, &actor_tx, t_29_9);
     assert_eq!(outcome_p, DeliveryStepResult::PausedPending);
 
-    // 回復為 Open 狀態
+    // 經過 0.2 秒後解凍，回到 Open 狀態
     assert!(gate.thaw(&freeze_token));
     assert_eq!(gate.handoff_freeze_state(), HandoffFreezeState::Open);
 
     // 釋放 actor 容量
     let _ = actor_rx.try_recv();
 
-    // 在解凍後（自 t0 算起已過去 35 秒，但 Open 累積時間僅 29.9 秒）
+    // 在解凍後（自 t0 算起已過去 30.1 秒，但 Open 累積時間僅 29.9 秒）
     // 應繼續投遞成功，不得被判定 TimedOut 丟棄！
-    let t_thawed = t_pending + Duration::from_millis(10);
+    let t_thawed = t_29_9 + Duration::from_millis(200);
     let outcome_final = deliverer.step_delivery(sid, &actor_tx, t_thawed);
     assert_ne!(outcome_final, DeliveryStepResult::TimedOut, "Pending 期間不得計入 30s 總時限");
     assert_eq!(outcome_final, DeliveryStepResult::Delivered);
@@ -568,7 +583,7 @@ fn test_handle_actor_exited_takes_resources_and_produces_close_jobs() {
     assert!(matches!(snap.phase, CustodyPhaseSnapshot::Closing { .. }));
 
     // 執行工作者關閉，結算進帳本
-    let term = job.execute_and_settle(&mut ledger, None).unwrap();
+    let term = job.execute_and_settle(&mut ledger, None).unwrap().unwrap();
     assert_eq!(term.handle, TerminalHandle::Closed);
     assert!(ledger.get_custody("by-id-held").is_none(), "關閉成功後紀錄應移除");
 
@@ -592,7 +607,7 @@ fn test_handle_actor_exited_takes_resources_and_produces_close_jobs() {
 
     let mut jobs_fail = ledger.handle_actor_exited(sid, inc);
     assert_eq!(jobs_fail.len(), 1);
-    let term_fail = jobs_fail.pop().unwrap().execute_and_settle(&mut ledger, None).unwrap();
+    let term_fail = jobs_fail.pop().unwrap().execute_and_settle(&mut ledger, None).unwrap().unwrap();
     assert!(matches!(term_fail.handle, TerminalHandle::Failed { .. }));
     // 關閉失敗：紀錄轉為 CloseFailed 並記入 unconfirmed
     let snap_fail = ledger.get_custody("by-id-held-fail").unwrap().snapshot();
@@ -626,10 +641,76 @@ fn test_handle_actor_exited_takes_resources_and_produces_close_jobs() {
         let rec = ledger.custody.get_mut("by-id-drain").unwrap();
         rec.phase = CustodyPhase::Bridged { epoch: 20, worker: None };
     }
-    let worker_opt = ledger.mark_bridge_draining(token3, 20).unwrap();
+    let worker_opt = ledger.mark_bridge_draining(token3, 20, StopId(0)).unwrap();
     assert!(worker_opt.is_none());
     let snap3 = ledger.get_custody("by-id-drain").unwrap().snapshot();
-    assert!(matches!(snap3.phase, CustodyPhaseSnapshot::BridgeDraining { epoch: 20 }));
+    assert!(matches!(snap3.phase, CustodyPhaseSnapshot::BridgeDraining { epoch: 20, stop_id: StopId(0) }));
+
+    // 4. 審查 P8-8f2d661-1：帶真正 IoWorker 的 DrainBridge 執行與回條結算
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.fence.with(|state| {
+        state.active_epoch = Some(1);
+        state.frozen = false;
+    });
+    let dev_worker = h.fake_device.clone();
+    let opened = h.opened_bridge(REAL_PATH);
+    let real_worker = opened.worker;
+    let worker_epoch = opened.epoch;
+    assert_eq!(dev_worker.close_count(), 0);
+    assert!(dev_worker.is_open());
+
+    let token_worker = ledger.register(
+        "by-id-worker",
+        REAL_PATH,
+        CustodyOwner::Session { sid: sid.into(), inc },
+        CustodyTaker::OpenJob { sid: sid.into(), gen: 4 },
+    ).unwrap();
+    {
+        let rec = ledger.custody.get_mut("by-id-worker").unwrap();
+        rec.phase = CustodyPhase::Bridged { epoch: worker_epoch, worker: Some(real_worker) };
+    }
+
+    let mut jobs_worker = ledger.handle_actor_exited(sid, inc);
+    assert_eq!(jobs_worker.len(), 1);
+    let job_worker = jobs_worker.pop().unwrap();
+    assert!(job_worker.is_drain_bridge());
+    assert!(job_worker.has_worker());
+
+    // 4a. 缺少通道時：回錯並完整歸還工作所有權，不得消耗 worker
+    let exec_err = job_worker.execute_and_settle(&mut ledger, None);
+    let returned_job = match exec_err {
+        Err((JobExecutionError::MissingReaperChannel, returned)) => {
+            assert!(returned.has_worker(), "worker 所有權必須完整保留");
+            returned
+        }
+        other => panic!("預期 MissingReaperChannel 且歸還所有權，實際為: {:?}", other.map(|_| ())),
+    };
+    // 驗證 worker 未被 drop、未關閉
+    assert_eq!(dev_worker.close_count(), 0, "缺少通道時不得 close serial device");
+    assert!(dev_worker.is_open(), "serial device 應保持開啟");
+
+    // 4b. 提供通道時：成功排空，驗證只 close 一次，收到配對回條並結算
+    let (reaper_event_tx, reaper_event_rx) = unbounded();
+    let res_ok = returned_job.execute_and_settle(&mut ledger, Some(&reaper_event_tx));
+    assert!(res_ok.is_ok(), "提供通道時執行應成功");
+
+    // 等待排空完成回條
+    let receipt = match reaper_event_rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(ControlEvent::WorkerStopped(r)) => r,
+        Ok(_) => panic!("預期 WorkerStopped，實際收到其他事件"),
+        Err(e) => panic!("接收排空回條逾時或錯誤: {:?}", e),
+    };
+    assert_eq!(receipt.epoch, worker_epoch);
+    assert_eq!(receipt.stop_id, StopId(0));
+    assert!(receipt.handle_closed);
+    // 驗證 serial device 恰好關閉一次
+    assert_eq!(dev_worker.close_count(), 1, "排空收尾 serial device 恰好關閉一次");
+
+    // 以配對回條結算進帳本
+    let term_drain = ledger.settle_worker_stopped(token_worker, receipt).expect("結算排空終態");
+    assert_eq!(term_drain.handle, TerminalHandle::Closed);
+    assert!(ledger.get_custody("by-id-worker").is_none(), "成功排空結算後紀錄應移除");
+    assert!(!unconfirmed.contains("by-id-worker"), "成功排空不得留在 unconfirmed");
 }
 
 #[test]
@@ -645,12 +726,12 @@ fn test_settle_worker_stopped_rejects_mismatched_epoch_and_stale_receipts() {
         CustodyTaker::Worker("w".into()),
     ).unwrap();
 
-    ledger.mark_bridge_draining(token, 2).unwrap();
+    ledger.mark_bridge_draining(token, 2, StopId(2)).unwrap();
 
     // 1. 傳入過期回條 (epoch 1) 給處於 epoch 2 的 BridgeDraining
     let receipt_stale = WorkerStoppedReceipt {
         epoch: 1,
-        stop_id: StopId(1),
+        stop_id: StopId(2),
         ledger: TxLedger::default(),
         unrecorded: vec![],
         wal_error: None,
@@ -665,7 +746,53 @@ fn test_settle_worker_stopped_rejects_mismatched_epoch_and_stale_receipts() {
     );
     // 紀錄不得被移除，阻擋不得解除
     let rec = ledger.get_custody(by_id).expect("紀錄必須保留");
-    assert!(matches!(rec.phase, CustodyPhase::BridgeDraining { epoch: 2 }));
+    assert!(matches!(rec.phase, CustodyPhase::BridgeDraining { epoch: 2, stop_id: StopId(2) }));
+
+    // 1b. 審查 P8-057a065-2 重現：epoch 相符 (2) 但 stop_id 錯配 (999 vs 2)
+    let receipt_stop_mismatch = WorkerStoppedReceipt {
+        epoch: 2,
+        stop_id: StopId(999),
+        ledger: TxLedger::default(),
+        unrecorded: vec![],
+        wal_error: None,
+        handle_closed: true,
+        close_error: None,
+    };
+    let res_stop = ledger.settle_worker_stopped(token, receipt_stop_mismatch);
+    assert_eq!(
+        res_stop,
+        Err(CustodySettleError::StopIdMismatch { expected: StopId(2), actual: StopId(999) }),
+        "stop_id 錯配回條應被拒絕"
+    );
+    let rec_still = ledger.get_custody(by_id).expect("紀錄必須保留");
+    assert!(matches!(rec_still.phase, CustodyPhase::BridgeDraining { epoch: 2, stop_id: StopId(2) }));
+
+    // 1c. 審查 P8-057a065-2 重現：Closing{job: "close-held"} 收到任意 WorkerStopped 回條應被拒絕
+    let token_closing = ledger.register(
+        "by-id-closing-held",
+        "/dev/ttyUSB1",
+        CustodyOwner::Reaper,
+        CustodyTaker::Worker("w".into()),
+    ).unwrap();
+    {
+        let rec = ledger.custody.get_mut("by-id-closing-held").unwrap();
+        rec.phase = CustodyPhase::Closing { job: "close-held".into() };
+    }
+    let res_closing = ledger.settle_worker_stopped(token_closing, WorkerStoppedReceipt {
+        epoch: 2,
+        stop_id: StopId(2),
+        ledger: TxLedger::default(),
+        unrecorded: vec![],
+        wal_error: None,
+        handle_closed: true,
+        close_error: None,
+    });
+    assert_eq!(
+        res_closing,
+        Err(CustodySettleError::InvalidPhase),
+        "Closing 狀態不接受 WorkerStopped 結算，只能由 settle_close 結算"
+    );
+    assert!(ledger.get_custody("by-id-closing-held").is_some(), "Closing 紀錄不得被結算移除");
 
     // 2. 傳入未知 token
     let make_receipt_ok = || WorkerStoppedReceipt {

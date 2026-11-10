@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 
 use crate::admission::{AdmissionGate, HandoffFreezeState};
-use crate::drain::WorkerStoppedReceipt;
+use crate::drain::{StopId, WorkerStoppedReceipt};
 use crate::mailbox::ControlEvent;
 use crate::session_core::UnconfirmedCloses;
 use crate::session_manager::HandleParts;
@@ -54,7 +54,7 @@ pub enum CustodyPhase {
     Held { parts: Option<HandleParts> },
     Taken { taker: CustodyTaker },
     Bridged { epoch: u64, worker: Option<IoWorker> },
-    BridgeDraining { epoch: u64 },
+    BridgeDraining { epoch: u64, stop_id: StopId },
     Closing { job: String },
     CloseFailed { error: String },
 }
@@ -66,7 +66,7 @@ pub enum CustodyPhaseSnapshot {
     Held,
     Taken { taker: CustodyTaker },
     Bridged { epoch: u64, worker_in_ledger: bool },
-    BridgeDraining { epoch: u64 },
+    BridgeDraining { epoch: u64, stop_id: StopId },
     Closing { job: String },
     CloseFailed { error: String },
 }
@@ -96,7 +96,10 @@ impl Custody {
                     epoch: *epoch,
                     worker_in_ledger: worker.is_some(),
                 },
-                CustodyPhase::BridgeDraining { epoch } => CustodyPhaseSnapshot::BridgeDraining { epoch: *epoch },
+                CustodyPhase::BridgeDraining { epoch, stop_id } => CustodyPhaseSnapshot::BridgeDraining {
+                    epoch: *epoch,
+                    stop_id: *stop_id,
+                },
                 CustodyPhase::Closing { job } => CustodyPhaseSnapshot::Closing { job: job.clone() },
                 CustodyPhase::CloseFailed { error } => CustodyPhaseSnapshot::CloseFailed { error: error.clone() },
             },
@@ -165,6 +168,13 @@ pub enum CustodySettleError {
     AlreadySettled,
     InvalidPhase,
     EpochMismatch { expected: u64, actual: u64 },
+    StopIdMismatch { expected: StopId, actual: StopId },
+}
+
+/// 資源關閉／排空工作執行錯誤。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobExecutionError {
+    MissingReaperChannel,
 }
 
 /// actor 結束時由帳本產出的資源關閉／排空工作（具所有權）。
@@ -178,8 +188,30 @@ pub enum ActorExitedJob {
         token: u64,
         by_id: String,
         epoch: u64,
+        stop_id: StopId,
         worker: Option<IoWorker>,
     },
+}
+
+impl std::fmt::Debug for ActorExitedJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ActorExitedJob::CloseHeld { token, by_id, parts } => f
+                .debug_struct("CloseHeld")
+                .field("token", token)
+                .field("by_id", by_id)
+                .field("has_parts", &parts.is_some())
+                .finish(),
+            ActorExitedJob::DrainBridge { token, by_id, epoch, stop_id, worker } => f
+                .debug_struct("DrainBridge")
+                .field("token", token)
+                .field("by_id", by_id)
+                .field("epoch", epoch)
+                .field("stop_id", stop_id)
+                .field("has_worker", &worker.is_some())
+                .finish(),
+        }
+    }
 }
 
 impl ActorExitedJob {
@@ -197,12 +229,25 @@ impl ActorExitedJob {
         }
     }
 
+    pub fn is_drain_bridge(&self) -> bool {
+        matches!(self, ActorExitedJob::DrainBridge { .. })
+    }
+
+    pub fn has_worker(&self) -> bool {
+        match self {
+            ActorExitedJob::DrainBridge { worker, .. } => worker.is_some(),
+            _ => false,
+        }
+    }
+
     /// 執行關閉或啟動排空，並於 CloseHeld 時結算進帳本回傳 terminal。
+    /// 若為 DrainBridge 且缺少 reaper_tx，回傳錯誤並完整歸還原工作所有權，不得消耗 worker。
+    #[allow(clippy::result_large_err)]
     pub fn execute_and_settle(
         self,
         ledger: &mut CustodyLedger,
         reaper_tx: Option<&Sender<ControlEvent>>,
-    ) -> Option<Terminal> {
+    ) -> Result<Option<Terminal>, (JobExecutionError, Self)> {
         match self {
             ActorExitedJob::CloseHeld { token, parts, .. } => {
                 let receipt = parts.map(|p| p.close());
@@ -224,15 +269,31 @@ impl ActorExitedJob {
                     evidence: evidence_term,
                 };
                 ledger.settle_close(token, term.clone());
-                Some(term)
+                Ok(Some(term))
             }
-            ActorExitedJob::DrainBridge { worker, .. } => {
+            ActorExitedJob::DrainBridge {
+                token,
+                by_id,
+                epoch,
+                stop_id,
+                worker,
+            } => {
+                let Some(tx) = reaper_tx else {
+                    return Err((
+                        JobExecutionError::MissingReaperChannel,
+                        ActorExitedJob::DrainBridge {
+                            token,
+                            by_id,
+                            epoch,
+                            stop_id,
+                            worker,
+                        },
+                    ));
+                };
                 if let Some(worker) = worker {
-                    if let Some(tx) = reaper_tx {
-                        worker.finish_async(crate::drain::StopId(0), tx.clone());
-                    }
+                    worker.finish_async(stop_id, tx.clone());
                 }
-                None
+                Ok(None)
             }
         }
     }
@@ -249,6 +310,8 @@ pub struct DeliveryObligation {
     pub attempts: usize,
     pub open_elapsed: Duration,
     pub last_open_at: Instant,
+    pub pending_since: Option<Instant>,
+    pub last_state: HandoffFreezeState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -501,14 +564,19 @@ impl CustodyLedger {
         self.custody.values().find(|c| c.token == token)
     }
 
-    pub fn mark_bridge_draining(&mut self, token: u64, epoch: u64) -> Result<Option<IoWorker>, &'static str> {
+    pub fn mark_bridge_draining(
+        &mut self,
+        token: u64,
+        epoch: u64,
+        stop_id: StopId,
+    ) -> Result<Option<IoWorker>, &'static str> {
         for rec in self.custody.values_mut() {
             if rec.token == token {
                 let worker = match &mut rec.phase {
                     CustodyPhase::Bridged { worker, .. } => worker.take(),
                     _ => None,
                 };
-                rec.phase = CustodyPhase::BridgeDraining { epoch };
+                rec.phase = CustodyPhase::BridgeDraining { epoch, stop_id };
                 return Ok(worker);
             }
         }
@@ -535,7 +603,8 @@ impl CustodyLedger {
         }
     }
 
-    /// 結算回收者排空終態（分開 handle 關閉與證據完整度；驗證 token／epoch／phase 配對）。
+    /// 結算回收者排空終態（分開 handle 關閉與證據完整度；完整核對 token、epoch、stop_id 身分配對）。
+    /// 注意：Held 的關閉只能由 settle_close 結算，不接受 WorkerStopped（InvalidPhase）。
     pub fn settle_worker_stopped(
         &mut self,
         token: u64,
@@ -545,22 +614,26 @@ impl CustodyLedger {
             return Err(CustodySettleError::AlreadySettled);
         }
 
-        let (by_id, expected_epoch) = match self.custody.iter().find(|(_, v)| v.token == token) {
+        let (by_id, expected_epoch, expected_stop_id) = match self.custody.iter().find(|(_, v)| v.token == token) {
             Some((k, v)) => match &v.phase {
-                CustodyPhase::BridgeDraining { epoch } => (k.clone(), Some(*epoch)),
-                CustodyPhase::Closing { .. } => (k.clone(), None),
+                CustodyPhase::BridgeDraining { epoch, stop_id } => (k.clone(), *epoch, *stop_id),
                 _ => return Err(CustodySettleError::InvalidPhase),
             },
             None => return Err(CustodySettleError::TokenNotFound),
         };
 
-        if let Some(expected) = expected_epoch {
-            if expected != receipt.epoch {
-                return Err(CustodySettleError::EpochMismatch {
-                    expected,
-                    actual: receipt.epoch,
-                });
-            }
+        if expected_epoch != receipt.epoch {
+            return Err(CustodySettleError::EpochMismatch {
+                expected: expected_epoch,
+                actual: receipt.epoch,
+            });
+        }
+
+        if expected_stop_id != receipt.stop_id {
+            return Err(CustodySettleError::StopIdMismatch {
+                expected: expected_stop_id,
+                actual: receipt.stop_id,
+            });
         }
 
         let handle_term = if receipt.handle_closed {
@@ -649,12 +722,14 @@ impl CustodyLedger {
                         CustodyPhase::Bridged { epoch, worker } => {
                             if let Some(w) = worker.take() {
                                 let ep = *epoch;
-                                rec.phase = CustodyPhase::BridgeDraining { epoch: ep };
+                                let stop_id = StopId(0);
+                                rec.phase = CustodyPhase::BridgeDraining { epoch: ep, stop_id };
                                 rec.owner = CustodyOwner::Reaper;
                                 jobs.push(ActorExitedJob::DrainBridge {
                                     token: rec.token,
                                     by_id: by_id.clone(),
                                     epoch: ep,
+                                    stop_id,
                                     worker: Some(w),
                                 });
                             }
@@ -710,6 +785,12 @@ impl Deliverer {
 
     pub fn add_obligation(&mut self, sid: &str, by_id: &str, real_path: &str, bind_gen: u64, inc: u64) {
         let now = Instant::now();
+        let initial_state = self.gate.handoff_freeze_state();
+        let pending_since = if initial_state == HandoffFreezeState::Pending {
+            Some(now)
+        } else {
+            None
+        };
         self.obligations.insert(sid.to_string(), DeliveryObligation {
             event: DeviceAttachedEvent {
                 by_id: by_id.to_string(),
@@ -722,6 +803,8 @@ impl Deliverer {
             attempts: 0,
             open_elapsed: Duration::ZERO,
             last_open_at: now,
+            pending_since,
+            last_state: initial_state,
         });
     }
 
@@ -734,6 +817,26 @@ impl Deliverer {
             }
         } else {
             self.obligations.remove(sid);
+        }
+    }
+
+    /// 記錄進入凍結轉態（依轉態記錄暫停區間並扣除，不能只在輪詢時覆寫時間戳）。
+    pub fn notify_freeze(&mut self, now: Instant) {
+        for ob in self.obligations.values_mut() {
+            if ob.pending_since.is_none() {
+                ob.pending_since = Some(now);
+                ob.last_state = HandoffFreezeState::Pending;
+            }
+        }
+    }
+
+    /// 記錄解除凍結轉態（扣除暫停區間，重設 last_open_at 為回到 Open 的時點）。
+    pub fn notify_thaw(&mut self, now: Instant) {
+        for ob in self.obligations.values_mut() {
+            if ob.pending_since.take().is_some() || ob.last_state == HandoffFreezeState::Pending {
+                ob.last_open_at = now;
+                ob.last_state = HandoffFreezeState::Open;
+            }
         }
     }
 
@@ -753,7 +856,10 @@ impl Deliverer {
         match self.gate.handoff_freeze_state() {
             HandoffFreezeState::Pending => {
                 // Pending 時暫停嘗試、保留義務、不計總時限、attempts 不增
-                ob.last_open_at = now;
+                if ob.pending_since.is_none() {
+                    ob.pending_since = Some(now);
+                }
+                ob.last_state = HandoffFreezeState::Pending;
                 return DeliveryStepResult::PausedPending;
             }
             HandoffFreezeState::Permanent => {
@@ -762,9 +868,17 @@ impl Deliverer {
                 return DeliveryStepResult::Cancelled;
             }
             HandoffFreezeState::Open => {
-                let delta = now.saturating_duration_since(ob.last_open_at);
-                ob.open_elapsed += delta;
-                ob.last_open_at = now;
+                if ob.pending_since.take().is_some() || ob.last_state == HandoffFreezeState::Pending {
+                    // 從 Pending 解凍回到 Open 的轉態：
+                    // 此前經過的區間為 Pending 暫停期，不計入 open_elapsed，重設 last_open_at 為回到 Open 的時間點。
+                    ob.last_open_at = now;
+                    ob.last_state = HandoffFreezeState::Open;
+                } else {
+                    let delta = now.saturating_duration_since(ob.last_open_at);
+                    ob.open_elapsed += delta;
+                    ob.last_open_at = now;
+                    ob.last_state = HandoffFreezeState::Open;
+                }
             }
         }
 
