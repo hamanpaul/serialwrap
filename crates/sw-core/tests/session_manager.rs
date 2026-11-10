@@ -4862,3 +4862,77 @@ fn test_b1_placeholder_attach_handoff_and_release_settles_custody() {
     let custody_step3 = m.mgr.custody_for_test(BY_ID);
     assert!(custody_step3.is_none(), "成功 release 後帳本紀錄須被結算移除，實際為：{custody_step3:?}");
 }
+
+fn wp510_b_custom_placeholder_rig(sid: &str, by_id: &str, real: &str) -> ManagerRig {
+    let mut loaded = LoadedState::default();
+    loaded.released.insert(sid.to_string(), released_row(by_id));
+    loaded
+        .bindings
+        .insert(sid.to_string(), "/s/by-id/old-override".to_string());
+    let mut alias = PyDict::new();
+    alias.insert("session_id", PyValue::from(sid));
+    loaded.aliases.insert(format!("retired-alias-{sid}"), alias);
+    let yaml = manager_yaml(&[]);
+    let m = ManagerRig::with(&yaml, loaded, None);
+    m.add_device_at(by_id, real);
+    install_shell_replies(&m.device(real));
+    m
+}
+
+static SPAWN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn test_placeholder_attach_next_actor_spawn_failure_closes_handle_and_settles_custody() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const BY_ID: &str = "/s/by-id/usb-G98";
+    const REAL: &str = "/dev/ttyG98";
+    const PLACEHOLDER_SID: &str = "gone-template:COM98";
+
+    let m = wp510_b_custom_placeholder_rig(PLACEHOLDER_SID, BY_ID, REAL);
+    let device = m.device(REAL);
+    m.mgr.update_devices(&m.snapshot());
+
+    sw_core::actor::inject_actor_spawn_fail_for("t:COM98");
+    let res = m.mgr.attach_released_placeholder(PLACEHOLDER_SID, false).expect("attach_released_placeholder ok");
+    assert_eq!(res.get("ok"), Some(&PyValue::Bool(true)));
+
+    // 等待 attach 作業收尾
+    assert!(m.mgr.wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)));
+    sw_core::actor::inject_actor_spawn_fail_clear();
+
+    // 斷言：已開 handle 必須明確關閉，且只關閉 1 次
+    assert_eq!(device.close_count(), 1, "actor 建構失敗時已開 handle 必須明確關閉 1 次");
+    assert!(!device.is_open(), "關閉成功後 handle 不得保持開啟");
+    assert!(m.mgr.session_ids().is_empty(), "建構失敗不得留下 session");
+    let c = m.mgr.custody_for_test(BY_ID);
+    assert!(c.is_none(), "關閉成功後帳本紀錄須被結算移除，實際為：{c:?}");
+}
+
+#[test]
+fn test_placeholder_attach_next_actor_spawn_failure_close_failed_enters_unconfirmed() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const BY_ID: &str = "/s/by-id/usb-G99";
+    const REAL: &str = "/dev/ttyG99";
+    const PLACEHOLDER_SID: &str = "gone-template:COM99";
+
+    let m = wp510_b_custom_placeholder_rig(PLACEHOLDER_SID, BY_ID, REAL);
+    let device = m.device(REAL);
+    m.mgr.update_devices(&m.snapshot());
+    device.fail_close(PalError::io(5, "close failed"));
+
+    sw_core::actor::inject_actor_spawn_fail_for("t:COM99");
+    let res = m.mgr.attach_released_placeholder(PLACEHOLDER_SID, false).expect("attach_released_placeholder ok");
+    assert_eq!(res.get("ok"), Some(&PyValue::Bool(true)));
+
+    // 等待 attach 作業收尾
+    assert!(m.mgr.wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)));
+    sw_core::actor::inject_actor_spawn_fail_clear();
+
+    // 斷言：嘗試關閉 1 次，但 closed:false，進 unconfirmed 且帳本為 CloseFailed
+    assert_eq!(device.close_count(), 1, "actor 建構失敗時已開 handle 必須嘗試關閉 1 次");
+    assert!(device.is_open(), "關閉失敗後 handle 仍保持開啟");
+    assert!(m.mgr.session_ids().is_empty(), "建構失敗不得留下 session");
+    let c = m.mgr.custody_for_test(BY_ID);
+    assert!(matches!(c.as_ref().map(|x| &x.phase), Some(sw_core::custody::CustodyPhaseSnapshot::CloseFailed { .. })), "關閉失敗帳本須為 CloseFailed：{c:?}");
+    assert!(m.mgr.unconfirmed_close_for_test(BY_ID), "關閉失敗須進入未確認集合");
+}

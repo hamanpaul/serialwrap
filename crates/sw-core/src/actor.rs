@@ -194,6 +194,8 @@ fn probe_label(item: &MailboxItem) -> Option<&'static str> {
         // `at_most_pre_dependency_data_plus_one`（見 `ProbeEntry::pre_dependency_data`）。
         MailboxItem::Control(ControlEvent::Shutdown { .. }) => Some("Shutdown"),
         MailboxItem::Control(ControlEvent::WorkerStopped(_)) => Some("WorkerStopped"),
+        #[cfg(feature = "test-fakes")]
+        MailboxItem::Control(ControlEvent::ArmPanic { .. }) => Some("ArmPanic"),
         MailboxItem::Control(_) => Some("Control"),
     }
 }
@@ -283,10 +285,23 @@ impl std::error::Error for SpawnError {
 
 #[cfg(feature = "test-fakes")]
 static INJECT_ACTOR_SPAWN_FAIL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "test-fakes")]
+static INJECT_ACTOR_SPAWN_FAIL_TARGET: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 #[cfg(feature = "test-fakes")]
 pub fn inject_actor_spawn_fail(n: usize) {
     INJECT_ACTOR_SPAWN_FAIL_COUNT.store(n, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(feature = "test-fakes")]
+pub fn inject_actor_spawn_fail_for(sid: &str) {
+    *INJECT_ACTOR_SPAWN_FAIL_TARGET.lock().unwrap() = Some(sid.to_string());
+}
+
+#[cfg(feature = "test-fakes")]
+pub fn inject_actor_spawn_fail_clear() {
+    *INJECT_ACTOR_SPAWN_FAIL_TARGET.lock().unwrap() = None;
+    INJECT_ACTOR_SPAWN_FAIL_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// 嘗試啟動 actor thread（回傳 Result，呼叫端在 R2 全面切換）。
@@ -310,12 +325,22 @@ pub fn try_spawn_actor_with_reaper(
 ) -> Result<ActorHandle, SpawnError> {
     #[cfg(feature = "test-fakes")]
     {
-        let count = INJECT_ACTOR_SPAWN_FAIL_COUNT.load(std::sync::atomic::Ordering::SeqCst);
-        if count > 0 {
-            INJECT_ACTOR_SPAWN_FAIL_COUNT.store(count - 1, std::sync::atomic::Ordering::SeqCst);
-            return Err(SpawnError(std::io::Error::other(
-                "injected H-actor-spawn-fail",
-            )));
+        let target = INJECT_ACTOR_SPAWN_FAIL_TARGET.lock().unwrap().clone();
+        if let Some(target_sid) = target {
+            if core.session_id() == target_sid {
+                *INJECT_ACTOR_SPAWN_FAIL_TARGET.lock().unwrap() = None;
+                return Err(SpawnError(std::io::Error::other(
+                    "injected H-actor-spawn-fail",
+                )));
+            }
+        } else {
+            let count = INJECT_ACTOR_SPAWN_FAIL_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+            if count > 0 {
+                INJECT_ACTOR_SPAWN_FAIL_COUNT.store(count - 1, std::sync::atomic::Ordering::SeqCst);
+                return Err(SpawnError(std::io::Error::other(
+                    "injected H-actor-spawn-fail",
+                )));
+            }
         }
     }
 
@@ -445,6 +470,11 @@ pub fn try_spawn_actor_with_reaper(
                     continue;
                 };
                 #[cfg(feature = "test-fakes")]
+                if let MailboxItem::Control(ControlEvent::ArmPanic { count }) = &item {
+                    core.arm_panic_on_next_events(*count);
+                    continue;
+                }
+                #[cfg(feature = "test-fakes")]
                 let label = probe_label(&item);
                 #[cfg(feature = "test-fakes")]
                 let pause_label = probe_pause_label(&item);
@@ -568,6 +598,8 @@ fn dispatch(
         MailboxItem::Control(ControlEvent::FlashProbeReleased { .. }) => (None, "FlashProbeReleased"),
         MailboxItem::Control(ControlEvent::FlashSyncMatched { .. }) => (None, "FlashSyncMatched"),
         MailboxItem::Control(ControlEvent::FlashHolderGone { .. }) => (None, "FlashHolderGone"),
+        #[cfg(feature = "test-fakes")]
+        MailboxItem::Control(ControlEvent::ArmPanic { .. }) => (None, "ArmPanic"),
         MailboxItem::Data(_) => (None, "Data"),
     };
 

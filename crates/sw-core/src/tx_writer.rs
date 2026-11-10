@@ -540,7 +540,7 @@ pub struct TxLedgerGauge {
 }
 
 #[derive(Default)]
-struct LedgerGaugeCells {
+pub(crate) struct LedgerGaugeCells {
     live_ops: AtomicUsize,
     unresolved_gaps: AtomicUsize,
     gaps_overflow: AtomicU64,
@@ -586,6 +586,19 @@ pub struct TxWriterHandle {
 }
 
 impl TxWriterHandle {
+    pub(crate) fn new(
+        jobs: Sender<TxJob>,
+        settle: Sender<OpId>,
+        gauge: Arc<LedgerGaugeCells>,
+        fence: Arc<Fence>,
+    ) -> Self {
+        Self {
+            jobs,
+            settle,
+            gauge,
+            fence,
+        }
+    }
     /// P8 Task 5（brief 不符 #2）：以本 writer 的 Fence 做一次零 TX 的 `Fence::admit` 判定。等待被取消後用來
     /// 分類「此刻送出會被拒的原因」；不是授權——真正的授權仍在每次 OS 提交的 gate 內重驗。
     pub fn fence_verdict(&self, permit: &TxPermit) -> Result<(), FenceReject> {
@@ -625,7 +638,7 @@ impl TxWriterHandle {
 }
 
 /// 只有 IoWorker 持有；send 後 writer 不再接新 job。
-pub struct TxWriterStop(crossbeam_channel::Sender<()>);
+pub struct TxWriterStop(pub(crate) crossbeam_channel::Sender<()>);
 
 impl TxWriterStop {
     pub fn send(&self) {

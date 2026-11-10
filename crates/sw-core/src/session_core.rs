@@ -1203,6 +1203,10 @@ impl SessionCore {
             MailboxItem::Control(ControlEvent::FlashHolderGone { probe_id, reply }) => {
                 effects.0.extend(self.flash_holder_gone(probe_id, reply, now));
             }
+            #[cfg(feature = "test-fakes")]
+            MailboxItem::Control(ControlEvent::ArmPanic { count }) => {
+                self.arm_panic_on_next_events(count);
+            }
         }
         if !finalize {
             return effects;

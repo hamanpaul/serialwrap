@@ -483,7 +483,11 @@ impl CoreHarness {
         self.start_worker_at(epoch, REAL_PATH)
     }
 
-    fn start_worker_at(&self, epoch: u64, real_path: &str) -> IoWorker {
+    pub fn add_serial_device(&self, real_path: &str) -> FakeDevice {
+        self.serial.add_device(real_path)
+    }
+
+    pub fn start_worker_at(&self, epoch: u64, real_path: &str) -> IoWorker {
         let cfg = SerialConfig {
             baud: 115_200,
             data_bits: 8,

@@ -137,6 +137,9 @@ pub enum ControlEvent {
     FlashSyncMatched { probe_id: ProbeId, reply: FlashReply<Result<(), FlashReject>> },
     /// P8 Task 8：flasher 離開（holder 歸零）→ exit flashing；舊 probe 的遲到事件只回覆、不改狀態。
     FlashHolderGone { probe_id: ProbeId, reply: FlashReply<()> },
+    /// S2-PAR-wp510r: 測試注入 actor panic
+    #[cfg(feature = "test-fakes")]
+    ArmPanic { count: u8 },
 }
 
 /// 到期 timer（`Effect::Schedule` 的內容）。

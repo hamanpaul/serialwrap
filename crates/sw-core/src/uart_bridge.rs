@@ -733,6 +733,90 @@ impl IoWorker {
         }
     }
 
+    /// S2-PAR-wp510r W3': 當真實 IoWorker 已登記至帳本保管時，提供給過渡期 OpenedBridge 之佔位 worker。
+    pub fn dummy(epoch: u64, wal: Arc<WalWriter>, fence: Arc<Fence>) -> IoWorker {
+        struct DummyWaker;
+        impl sw_pal::traits::IoWaker for DummyWaker {
+            fn wake(&self) {}
+        }
+        struct DummyClose;
+        impl sw_pal::traits::CloseImpl for DummyClose {
+            fn is_alive(&self) -> bool {
+                false
+            }
+            fn configure(&self, _cfg: &sw_pal::traits::SerialConfig) -> sw_pal::traits::PalResult<()> {
+                Ok(())
+            }
+            fn close(self: Box<Self>) -> sw_pal::traits::CloseReceipt {
+                sw_pal::traits::CloseReceipt {
+                    closed: true,
+                    excl_cleared: true,
+                    error: None,
+                }
+            }
+        }
+        struct DummyReader;
+        impl sw_pal::traits::SerialReader for DummyReader {
+            fn read(
+                &mut self,
+                _buf: &mut [u8],
+                _timeout: Option<Duration>,
+            ) -> Result<sw_pal::traits::ReadOutcome, sw_pal::traits::ReadError> {
+                Ok(sw_pal::traits::ReadOutcome::Eof)
+            }
+        }
+        struct DummyWriter;
+        impl sw_pal::traits::SerialWriter for DummyWriter {
+            fn write_gated(
+                &mut self,
+                _data: &[u8],
+                _cancel: &CancelToken,
+                _gate: &dyn sw_pal::traits::SubmitGate,
+            ) -> sw_pal::traits::TxResult {
+                sw_pal::traits::TxResult {
+                    outcome: sw_pal::traits::TxOutcome::Completed(0),
+                    error: None,
+                }
+            }
+        }
+
+        let (job_tx, _) = crossbeam_channel::bounded(1);
+        let (settle_tx, _) = crossbeam_channel::bounded(1);
+        let (stop_tx, _) = crossbeam_channel::bounded(1);
+        let gauge = Arc::new(crate::tx_writer::LedgerGaugeCells::default());
+        let tx = crate::tx_writer::TxWriterHandle::new(job_tx, settle_tx, gauge, fence);
+        let tx_stop = crate::tx_writer::TxWriterStop(stop_tx);
+        let cancel = CancelToken::new(Arc::new(DummyWaker));
+        let reader_stop = Arc::new(AtomicBool::new(true));
+        let reader = std::thread::spawn(|| ReaderExit {
+            reader: Box::new(DummyReader),
+            sentinel: None,
+            error: None,
+            rx_seq: 0,
+            unrecorded: Vec::new(),
+        });
+        let writer = std::thread::spawn(|| {
+            (
+                Box::new(DummyWriter) as Box<dyn SerialWriter>,
+                crate::tx_writer::TxLedger::default(),
+            )
+        });
+        let close = CloseToken::new(Box::new(DummyClose));
+        IoWorker {
+            tx,
+            tx_stop,
+            reader_stop,
+            cancel,
+            reader,
+            writer,
+            close,
+            wal,
+            epoch,
+            sentinel_keepalive: None,
+            line_control: Arc::new(sw_pal::traits::UnsupportedLineControl),
+        }
+    }
+
     pub fn tx(&self) -> &TxWriterHandle {
         &self.tx
     }

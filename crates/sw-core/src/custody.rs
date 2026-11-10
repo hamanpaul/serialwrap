@@ -923,7 +923,7 @@ pub enum DeliveryStepResult {
 /// 送達者（Deliverer）：負責 DeviceAttached 投遞義務。
 pub struct Deliverer {
     pub obligations: HashMap<String, DeliveryObligation>,
-    gate: Arc<AdmissionGate>,
+    pub gate: Arc<AdmissionGate>,
 }
 
 impl Default for Deliverer {
@@ -1090,6 +1090,12 @@ impl Deliverer {
     }
 }
 
+/// 回收者命令與事件回呼介面。
+pub trait ReaperCallback: Send + Sync + 'static {
+    fn handle_cmd(&self, cmd: ReaperCmd, event_tx: &Sender<ControlEvent>);
+    fn handle_worker_stopped(&self, receipt: WorkerStoppedReceipt);
+}
+
 /// 回收者執行緒：專職消費 DrainDataBarrier 與 WorkerStopped。
 pub struct ReaperThread {
     stopped: Arc<AtomicBool>,
@@ -1098,8 +1104,10 @@ pub struct ReaperThread {
 
 impl ReaperThread {
     pub fn start(
-        _reaper_cmd_tx: Sender<ReaperCmd>,
+        reaper_cmd_rx: Receiver<ReaperCmd>,
         reaper_event_rx: Receiver<ControlEvent>,
+        reaper_event_tx: Sender<ControlEvent>,
+        callback: Arc<dyn ReaperCallback>,
     ) -> Self {
         let stopped = Arc::new(AtomicBool::new(false));
         let thread_stopped = stopped.clone();
@@ -1108,18 +1116,28 @@ impl ReaperThread {
             .name("serialwrap-reaper".into())
             .spawn(move || {
                 while !thread_stopped.load(Ordering::Relaxed) {
-                    match reaper_event_rx.recv_timeout(Duration::from_millis(50)) {
-                        Ok(ControlEvent::DrainDataBarrier { expired, reply, .. }) => {
-                            // 不確認：設 expired=true 並立即丟棄 reply
-                            expired.store(true, Ordering::Release);
-                            drop(reply);
+                    crossbeam_channel::select! {
+                        recv(reaper_cmd_rx) -> msg => {
+                            match msg {
+                                Ok(cmd) => callback.handle_cmd(cmd, &reaper_event_tx),
+                                Err(_) => break,
+                            }
                         }
-                        Ok(ControlEvent::WorkerStopped(_receipt)) => {
-                            // 收到 WorkerStopped，在完整整合線路中會呼叫 ledger 結算
+                        recv(reaper_event_rx) -> msg => {
+                            match msg {
+                                Ok(ControlEvent::DrainDataBarrier { expired, reply, .. }) => {
+                                    // 不確認：設 expired=true 並立即丟棄 reply
+                                    expired.store(true, Ordering::Release);
+                                    drop(reply);
+                                }
+                                Ok(ControlEvent::WorkerStopped(receipt)) => {
+                                    callback.handle_worker_stopped(receipt);
+                                }
+                                Ok(_) => {}
+                                Err(_) => break,
+                            }
                         }
-                        Ok(_) => {}
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                        default(Duration::from_millis(50)) => {}
                     }
                 }
             })
@@ -1131,10 +1149,62 @@ impl ReaperThread {
         }
     }
 
-    pub fn stop(mut self) {
+    pub fn stop(&mut self) {
         self.stopped.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+    }
+}
+
+impl Drop for ReaperThread {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// 送達者回呼介面。
+pub trait DelivererCallback: Send + Sync + 'static {
+    fn step_delivery(&self);
+}
+
+/// 送達者背景執行緒：定期以退避策略執行 DeviceAttached 送達義務。
+pub struct DelivererThread {
+    stopped: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DelivererThread {
+    pub fn start(callback: Arc<dyn DelivererCallback>) -> Self {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let thread_stopped = stopped.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("serialwrap-deliverer".into())
+            .spawn(move || {
+                while !thread_stopped.load(Ordering::Relaxed) {
+                    callback.step_delivery();
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })
+            .expect("建立 deliverer thread");
+
+        Self {
+            stopped,
+            handle: Some(handle),
+        }
+    }
+
+    pub fn stop(&mut self) {
+        self.stopped.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for DelivererThread {
+    fn drop(&mut self) {
+        self.stop();
     }
 }

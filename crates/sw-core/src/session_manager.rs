@@ -693,6 +693,8 @@ struct Shared {
     pub reaper_cmd_tx: Sender<crate::custody::ReaperCmd>,
     #[allow(dead_code)]
     pub reaper: Mutex<Option<crate::custody::ReaperThread>>,
+    #[allow(dead_code)]
+    pub deliverer_thread: Mutex<Option<crate::custody::DelivererThread>>,
 }
 
 /// PROBE 的 writer 交給 TxWriter thread 期間留在 `HandleParts` 的占位（任何提交一律 NotSubmitted）。
@@ -1105,7 +1107,23 @@ impl Shared {
         if entry.taken {
             return HandoffClaim::Taken;
         }
-        let pre = lock(&entry.io.preopened).take();
+        let pre = lock(&entry.io.preopened).take().or_else(|| {
+            inner.custody.custody.get_mut(by_id).and_then(|rec| {
+                match &mut rec.phase {
+                    crate::custody::CustodyPhase::Held { parts } => parts.take().map(|p| {
+                        rec.phase = crate::custody::CustodyPhase::Closing {
+                            job: "shutdown".into(),
+                        };
+                        rec.owner = crate::custody::CustodyOwner::Reaper;
+                        Preopened {
+                            real_path: rec.real_path.clone(),
+                            parts: p,
+                        }
+                    }),
+                    _ => None,
+                }
+            })
+        });
         let token = entry.token;
         if revoke {
             entry.revoked = true;
@@ -1183,21 +1201,49 @@ impl Shared {
         let Some(key) = key else {
             return BridgeTake::Handle(lock(&io.preopened).take());
         };
-        let entry = inner.handoff.get_mut(&key).expect("剛查到的交接列");
-        if entry.real_path != dev {
-            // 路徑不同（裝置改指或過期的開埠）：handle 留在交接表，由改指或取消者處理；本次另行開埠。
-            return BridgeTake::Handle(None);
+        {
+            let entry = inner.handoff.get(&key).expect("剛查到的交接列");
+            if entry.real_path != dev {
+                // 路徑不同（裝置改指或過期的開埠）：handle 留在交接表，由改指或取消者處理；本次另行開埠。
+                return BridgeTake::Handle(None);
+            }
+            if entry.revoked {
+                inner.handoff.remove(&key);
+                return BridgeTake::Revoked;
+            }
+            if entry.taken {
+                return BridgeTake::Handle(None);
+            }
         }
-        if entry.revoked {
-            inner.handoff.remove(&key);
-            return BridgeTake::Revoked;
-        }
-        if entry.taken {
-            return BridgeTake::Handle(None);
-        }
-        let pre = lock(&io.preopened).take();
+        let pre = lock(&io.preopened).take().or_else(|| {
+            inner.custody.custody.get_mut(&key).and_then(|rec| {
+                if rec.real_path == dev {
+                    match &mut rec.phase {
+                        crate::custody::CustodyPhase::Held { parts } => {
+                            parts.take().map(|p| {
+                                rec.phase = crate::custody::CustodyPhase::Taken {
+                                    taker: crate::custody::CustodyTaker::OpenJob {
+                                        sid: lock(&io.sid).clone(),
+                                        gen: 1,
+                                    },
+                                };
+                                Preopened {
+                                    real_path: dev.to_string(),
+                                    parts: p,
+                                }
+                            })
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
+        });
         if pre.is_some() {
-            entry.taken = true;
+            if let Some(entry) = inner.handoff.get_mut(&key) {
+                entry.taken = true;
+            }
         } else {
             inner.handoff.remove(&key);
         }
@@ -1405,7 +1451,7 @@ impl Shared {
         detached_error: Option<String>,
         preopened: Option<Preopened>,
         sid_override: Option<&str>,
-    ) -> String {
+    ) -> Option<String> {
         let sid = sid_override
             .map(str::to_string)
             .unwrap_or_else(|| format!("{}:{}", profile.template.profile_name, profile.com));
@@ -1472,7 +1518,31 @@ impl Shared {
             core.set_last_error_observer(Box::new(move |v: &str| lock(&sink).push(v.to_string())));
             history
         };
-        let handoff_path = preopened.as_ref().map(|pre| pre.real_path.clone());
+        let mut preopened = preopened;
+        let mut handoff_path = None;
+        let inc = inner.custody.alloc_session_inc(&sid);
+        if let Some(pre) = preopened.take() {
+            handoff_path = Some(pre.real_path.clone());
+            if let Some(rec) = inner.custody.custody.get_mut(&profile.device_by_id) {
+                rec.phase = crate::custody::CustodyPhase::Held { parts: Some(pre.parts) };
+                rec.owner = crate::custody::CustodyOwner::Session {
+                    sid: sid.clone(),
+                    inc,
+                };
+            } else {
+                preopened = Some(pre);
+            }
+        } else if let Some(rec) = inner.custody.custody.get_mut(&profile.device_by_id) {
+            rec.owner = crate::custody::CustodyOwner::Session {
+                sid: sid.clone(),
+                inc,
+            };
+            if let crate::custody::CustodyPhase::Held { parts } = &rec.phase {
+                if parts.is_some() {
+                    handoff_path = Some(rec.real_path.clone());
+                }
+            }
+        }
         let io = Arc::new(SessionIo {
             sid: Mutex::new(sid.clone()),
             profile: Mutex::new(profile.clone()),
@@ -1529,23 +1599,30 @@ impl Shared {
             persist_jobs: JobQueue::new("persist"),
             opened_rx: Arc::new(Mutex::new(HashMap::new())),
             opened_listener: Arc::new(Mutex::new(HashSet::new())),
+            inc,
         };
         let actor = match try_spawn_actor_with_reaper(
             core,
             mailbox,
             Box::new(exec),
             self.clock.clone(),
-            0,
+            inc,
             Some(self.reaper_cmd_tx.clone()),
         ) {
             Ok(actor) => actor,
             Err(e) => {
                 self.warn(format!("actor 建立失敗（sid={sid}）：{e}"));
-                let jobs = inner.custody.handle_spawn_failure(&sid, 0);
+                let jobs = inner.custody.handle_spawn_failure(&sid, inc);
                 for job in jobs {
-                    let _ = job.execute_and_settle(&mut inner.custody, None);
+                    let term = job.execute_and_settle(&mut inner.custody, None);
+                    if let Ok(Some(t)) = term {
+                        if matches!(t.handle, crate::custody::TerminalHandle::Failed { .. }) {
+                            self.unconfirmed_closes.insert(&profile.device_by_id);
+                        }
+                    }
                 }
-                return sid;
+                inner.pending_com.remove(&profile.device_by_id);
+                return None;
             }
         };
         if let Some(real_path) = handoff_path {
@@ -1575,16 +1652,7 @@ impl Shared {
                 history,
             },
         );
-        let by_id = inner.sessions.get(&sid).map(|e| e.profile.device_by_id.clone());
-        if let Some(by_id) = by_id {
-            if let Some(rec) = inner.custody.custody.get_mut(&by_id) {
-                rec.owner = crate::custody::CustodyOwner::Session {
-                    sid: sid.clone(),
-                    inc: 0,
-                };
-            }
-        }
-        sid
+        Some(sid)
     }
 
     /// `_session_from_template`：預配 COM（#100）優先，否則最小空號；act_no＝目前 session 數＋1。
@@ -1596,7 +1664,7 @@ impl Shared {
         source: &str,
         detached_error: Option<String>,
         preopened: Option<Preopened>,
-    ) -> String {
+    ) -> Option<String> {
         let com = inner
             .pending_com
             .remove(by_id)
@@ -1613,12 +1681,12 @@ impl Shared {
             detached_error,
             preopened,
             None,
-        );
+        )?;
         self.model_apply(StateDelta::AliasSet {
             alias: alias.clone(),
             row: Some(alias_row(&sid, &alias, &self.now_iso())),
         });
-        sid
+        Some(sid)
     }
 
     // -----------------------------------------------------------------------
@@ -1639,7 +1707,7 @@ impl Shared {
 
     fn update_devices(self: &Arc<Self>, snapshot: &[(String, DeviceInfo)]) {
         let new: BTreeMap<String, DeviceInfo> = snapshot.iter().cloned().collect();
-        let mut unconsumed: Vec<(String, AttachOp)> = Vec::new();
+        let mut unconsumed: Vec<(String, AttachOp, Option<Preopened>)> = Vec::new();
         let prev = {
             let mut inner = lock(&self.inner);
             if inner.stopping {
@@ -1657,22 +1725,29 @@ impl Shared {
             }
             let prev = std::mem::replace(&mut inner.devices, new.clone());
             // 裝置離線／改指：使進行中的 attach op 失效（#27）。
-            for (by_id, op) in &inner.inflight {
-                let invalid = match (inner.devices.get(by_id), prev.get(by_id)) {
+            let invalid_ops: Vec<(String, AttachOp)> = inner
+                .inflight
+                .iter()
+                .filter(|(by_id, _)| match (inner.devices.get(*by_id), prev.get(*by_id)) {
                     (Some(cur), Some(old)) => cur.real_path != old.real_path,
                     (None, _) => true,
                     (Some(_), None) => false,
-                };
-                if invalid {
-                    op.cancel();
-                    if op.parked.swap(false, Ordering::SeqCst) {
-                        unconsumed.push((by_id.clone(), op.clone()));
-                    }
+                })
+                .map(|(b, op)| (b.clone(), op.clone()))
+                .collect();
+            for (by_id, op) in invalid_ops {
+                op.cancel();
+                if op.parked.swap(false, Ordering::SeqCst) {
+                    let pre = inner.custody.claim_for_release(&by_id, op.token).ok().flatten().map(|parts| {
+                        let real_path = inner.device_path(&by_id).unwrap_or("").to_string();
+                        Preopened { real_path, parts }
+                    }).or_else(|| op.take_preopened());
+                    unconsumed.push((by_id, op, pre));
                 }
             }
             // Python `update_devices` 先把未消費的 `_preopened_ports` 作業移出表、再關閉（關閉失敗只告警，不保留阻擋；
             // `origin/main:sw_core/session_manager.py:4045-4063`）。
-            for (by_id, _) in &unconsumed {
+            for (by_id, _, _) in &unconsumed {
                 inner.inflight.remove(by_id);
             if let Some(rec) = inner.custody.custody.get(by_id) {
                 if matches!(rec.phase, crate::custody::CustodyPhase::Opening { .. }) {
@@ -1686,8 +1761,8 @@ impl Shared {
             prev
         };
         if !unconsumed.is_empty() {
-            for (by_id, op) in unconsumed {
-                if let Some(pre) = op.take_preopened() {
+            for (by_id, _op, pre) in unconsumed {
+                if let Some(pre) = pre {
                     self.close_session_preopened(&by_id, pre);
                 }
             }
@@ -2453,12 +2528,8 @@ impl Shared {
         inner.interactive.retain(|_, owner| owner != sid);
         if let Some(parts) = parts {
             let p = parts.take().expect("成功開埠後須交付預開 handle");
-            *lock(&op.preopened) = Some(Preopened {
-                real_path: real.to_string(),
-                parts: p,
-            });
             if let Some(rec) = inner.custody.custody.get_mut(by_id) {
-                rec.phase = crate::custody::CustodyPhase::Held { parts: None };
+                rec.phase = crate::custody::CustodyPhase::Held { parts: Some(p) };
             }
         }
         Some(entry)
@@ -2605,8 +2676,12 @@ impl Shared {
                 });
                 let sid = self
                     .session_from_template_locked(&mut inner, &tpl, by_id, source, None, preopened);
-                inner.probe_paths.insert(sid.clone(), real.clone());
-                inner.sessions.get(&sid).map(|e| e.actor.clone())
+                if let Some(sid) = sid {
+                    inner.probe_paths.insert(sid.clone(), real.clone());
+                    inner.sessions.get(&sid).map(|e| e.actor.clone())
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -3293,6 +3368,8 @@ struct ManagerExec {
     opened_rx: Arc<Mutex<HashMap<u64, Arc<RxShared>>>>,
     /// 開埠工作者已綁定 TCP console listener、尚待 `AdoptBridge` 接手的 epoch（P6：listener 與開埠同一工作）。
     opened_listener: Arc<Mutex<HashSet<u64>>>,
+    /// S2-PAR-wp510r R2: actor 世代號
+    inc: u64,
 }
 
 /// actor 外的單執行緒 FIFO 工作者（有界佇列；延遲建立，executor 卸除即結束）。
@@ -3541,9 +3618,20 @@ impl OpenCtx {
         );
         let sentinel = self.make_sentinel();
         let console_endpoint = self.bind_console_listener(epoch);
+        let token = {
+            let inner = lock(&self.shared.inner);
+            inner.custody.custody.get(&by_id).map(|r| r.token)
+        };
+        let worker_for_opened = if let Some(token) = token {
+            let mut inner = lock(&self.shared.inner);
+            let _ = inner.custody.adopt_bridged(token, epoch, worker);
+            IoWorker::dummy(epoch, self.shared.wal.clone(), self.fence.clone())
+        } else {
+            worker
+        };
         Ok(OpenedBridge {
             epoch,
-            worker,
+            worker: worker_for_opened,
             real_path: dev.0,
             sentinel,
             console_endpoint,
@@ -3732,9 +3820,21 @@ impl EffectExecutor for ManagerExec {
                     {
                         lock(&opened_rx).remove(&opened.epoch);
                         lock(&opened_listener).remove(&opened.epoch);
-                        opened
-                            .worker
-                            .finish_async(crate::drain::StopId(0), control.clone());
+                        let by_id = lock(&ctx.io.profile).device_by_id.clone();
+                        let mut inner = lock(&ctx.shared.inner);
+                        let reclaimed = inner
+                            .custody
+                            .custody
+                            .get(&by_id)
+                            .map(|r| r.token)
+                            .and_then(|token| {
+                                let w = inner.custody.claim_bridged_worker(token, opened.epoch).ok();
+                                inner.custody.remove_bridged(token);
+                                w
+                            });
+                        drop(inner);
+                        let worker_to_stop = reclaimed.unwrap_or(opened.worker);
+                        worker_to_stop.finish_async(crate::drain::StopId(0), control.clone());
                     }
                 }));
                 if !submitted {
@@ -3754,13 +3854,20 @@ impl EffectExecutor for ManagerExec {
                 if lock(&self.opened_listener).remove(&epoch) {
                     self.listener_epoch = Some(epoch);
                 }
-                lock(&self.workers).insert(epoch, worker);
                 let by_id = lock(&self.io.profile).device_by_id.clone();
                 let mut inner = lock(&self.shared.inner);
-                if let Some(rec) = inner.custody.custody.get(&by_id) {
-                    let token = rec.token;
-                    inner.custody.remove_bridged(token);
-                }
+                let real_worker = inner
+                    .custody
+                    .custody
+                    .get(&by_id)
+                    .map(|r| r.token)
+                    .and_then(|token| {
+                        let res = inner.custody.claim_bridged_worker(token, epoch).ok();
+                        inner.custody.remove_bridged(token);
+                        res
+                    })
+                    .unwrap_or(worker);
+                lock(&self.workers).insert(epoch, real_worker);
             }
             Effect::BeginDrain { stop_id, epoch } => {
                 lock(&self.opened_rx).remove(&epoch);
@@ -3772,13 +3879,13 @@ impl EffectExecutor for ManagerExec {
                 if let Some(pump) = self.pumps.remove(&epoch) {
                     pump.stop();
                 }
+                let sid = lock(&self.io.sid).clone();
                 let worker = lock(&self.workers).remove(&epoch);
                 if let Some(worker) = worker {
                     worker.finish_async(stop_id, safety.clone());
                 }
-                let sid = lock(&self.io.sid).clone();
                 let mut inner = lock(&self.shared.inner);
-                let jobs = inner.custody.claim_for_stop(&sid, 0, crate::custody::CustodyCancel::Release);
+                let jobs = inner.custody.claim_for_stop(&sid, self.inc, crate::custody::CustodyCancel::Release);
                 for job in jobs {
                     let _ = job.execute_and_settle(&mut inner.custody, Some(safety));
                 }
@@ -3940,6 +4047,103 @@ impl EffectExecutor for ManagerExec {
     }
 }
 
+impl crate::custody::ReaperCallback for Shared {
+    fn handle_cmd(&self, cmd: crate::custody::ReaperCmd, event_tx: &crossbeam_channel::Sender<ControlEvent>) {
+        match cmd {
+            crate::custody::ReaperCmd::ActorExited { sid, inc } => {
+                let jobs = {
+                    let mut inner = lock(&self.inner);
+                    inner.deliverer.cancel_obligation(&sid, None);
+                    inner.custody.handle_actor_exited(&sid, inc)
+                };
+                for job in jobs {
+                    match job {
+                        crate::custody::ActorExitedJob::CloseHeld { token, parts, by_id: _ } => {
+                            let receipt = parts.map(|p| p.close());
+                            let (handle_term, evidence_term) = match receipt {
+                                Some(r) if r.closed => (
+                                    crate::custody::TerminalHandle::Closed,
+                                    crate::custody::TerminalEvidence::Complete,
+                                ),
+                                Some(r) => (
+                                    crate::custody::TerminalHandle::Failed {
+                                        error: r
+                                            .error
+                                            .map(|e| e.py_message)
+                                            .unwrap_or_else(|| "handle close failed".into()),
+                                    },
+                                    crate::custody::TerminalEvidence::Complete,
+                                ),
+                                None => (
+                                    crate::custody::TerminalHandle::Closed,
+                                    crate::custody::TerminalEvidence::Complete,
+                                ),
+                            };
+                            let term = crate::custody::Terminal {
+                                handle: handle_term,
+                                evidence: evidence_term,
+                            };
+                            let mut inner = lock(&self.inner);
+                            inner.custody.settle_close(token, term);
+                        }
+                        crate::custody::ActorExitedJob::DrainBridge { worker, stop_id, .. } => {
+                            if let Some(worker) = worker {
+                                worker.finish_async(stop_id, event_tx.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            crate::custody::ReaperCmd::Reclaim { token, epoch, worker } => {
+                let mut inner = lock(&self.inner);
+                let _ = inner.custody.mark_bridge_draining(token, epoch, crate::drain::StopId(0));
+                drop(inner);
+                worker.finish_async(crate::drain::StopId(0), event_tx.clone());
+            }
+        }
+    }
+
+    fn handle_worker_stopped(&self, receipt: crate::drain::WorkerStoppedReceipt) {
+        let mut inner = lock(&self.inner);
+        let token_opt = inner.custody.custody.values().find_map(|v| match &v.phase {
+            crate::custody::CustodyPhase::BridgeDraining { epoch, stop_id }
+                if *epoch == receipt.epoch && *stop_id == receipt.stop_id =>
+            {
+                Some(v.token)
+            }
+            _ => None,
+        });
+        if let Some(token) = token_opt {
+            let res = inner.custody.settle_worker_stopped(token, receipt);
+            if let Ok(terminal) = res {
+                if let crate::custody::TerminalEvidence::Incomplete { gaps, wal_error } = &terminal.evidence {
+                    let mut parts = gaps.clone();
+                    if let Some(err) = wal_error {
+                        parts.push(format!("wal_error: {err}"));
+                    }
+                    (self.warn)(format!("worker 排空證據不完整（token={token}）：{}", parts.join(", ")));
+                }
+            }
+        }
+    }
+}
+
+impl crate::custody::DelivererCallback for Shared {
+    fn step_delivery(&self) {
+        let mut inner = lock(&self.inner);
+        let snap = inner.deliverer.gate.snapshot();
+        let sids: Vec<String> = inner.deliverer.obligations.keys().cloned().collect();
+        for sid in sids {
+            if let Some(entry) = inner.sessions.get(&sid) {
+                let control = entry.actor.control.clone();
+                inner.deliverer.step_delivery_with_snapshot(&sid, &control, snap);
+            } else {
+                inner.deliverer.obligations.remove(&sid);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SessionManager 公開介面
 // ---------------------------------------------------------------------------
@@ -3965,9 +4169,8 @@ impl SessionManager {
         wal.set_health_sink(fanout.clone());
         let (note_tx, note_rx) = crossbeam_channel::unbounded();
         let (watcher_tx, watcher_rx) = crossbeam_channel::unbounded();
-        let (reaper_cmd_tx, _reaper_cmd_rx) = crossbeam_channel::unbounded();
-        let (_reaper_event_tx, reaper_event_rx) = crossbeam_channel::unbounded();
-        let reaper_thread = crate::custody::ReaperThread::start(reaper_cmd_tx.clone(), reaper_event_rx);
+        let (reaper_cmd_tx, reaper_cmd_rx) = crossbeam_channel::unbounded();
+        let (reaper_event_tx, reaper_event_rx) = crossbeam_channel::unbounded();
         let max_sessions = pyint_usize(&load.max_sessions, 16);
         let shared = Arc::new(Shared {
             serial,
@@ -4032,8 +4235,19 @@ impl SessionManager {
             #[cfg(feature = "test-fakes")]
             file_transfer_timeout_override: Mutex::new(None),
             reaper_cmd_tx,
-            reaper: Mutex::new(Some(reaper_thread)),
+            reaper: Mutex::new(None),
+            deliverer_thread: Mutex::new(None),
         });
+        let reaper_thread = crate::custody::ReaperThread::start(
+            reaper_cmd_rx,
+            reaper_event_rx,
+            reaper_event_tx,
+            shared.clone(),
+        );
+        *lock(&shared.reaper) = Some(reaper_thread);
+
+        let deliverer_thread = crate::custody::DelivererThread::start(shared.clone());
+        *lock(&shared.deliverer_thread) = Some(deliverer_thread);
         shared.bootstrap_sessions(&load.profiles);
         let mgr = Arc::new(SessionManager {
             shared: shared.clone(),
@@ -4266,6 +4480,7 @@ impl SessionManager {
                     );
                 }
             }
+            inner.deliverer.cancel_obligation(sid, None);
         }
         result
     }
@@ -4384,8 +4599,12 @@ impl SessionManager {
                 if let Some(op) = inner.inflight.get(&by_id).cloned() {
                     if op.parked.swap(false, Ordering::SeqCst) {
                         inner.inflight.remove(&by_id);
+                        let pre = inner.custody.claim_for_release(&by_id, op.token).ok().flatten().map(|parts| {
+                            let real_path = inner.device_path(&by_id).unwrap_or("").to_string();
+                            Preopened { real_path, parts }
+                        }).or_else(|| op.take_preopened());
                         Step::CloseParked {
-                            pre: op.take_preopened(),
+                            pre,
                             token: op.token,
                             by_id,
                         }
@@ -4866,7 +5085,11 @@ impl SessionManager {
                 let op = if claimed { inner.inflight.remove(&by_id) } else { None };
                 op.map(|op| {
                     let current = inner.device_path(&by_id).map(str::to_string);
-                    match op.take_preopened() {
+                    let pre = inner.custody.claim_for_release(&by_id, op.token).ok().flatten().map(|parts| {
+                        let real_path = current.clone().unwrap_or_default();
+                        Preopened { real_path, parts }
+                    }).or_else(|| op.take_preopened());
+                    match pre {
                         Some(pre) if current.as_deref() == Some(pre.real_path.as_str()) => {
                             Shared::place_handoff_locked(&mut inner, &by_id, &io, pre)
                         }
@@ -4897,10 +5120,18 @@ impl SessionManager {
                     &sid,
                     SessionRequest::DeviceOnline {
                         by_id: by_id.clone(),
-                        real_path,
+                        real_path: real_path.clone(),
                     },
                     QUERY_TIMEOUT,
                 );
+                if applied.is_err() {
+                    let mut inner = lock(&self.shared.inner);
+                    let inc = inner.custody.current_session_inc(&sid);
+                    inner.deliverer.add_obligation(&sid, &by_id, &real_path, 1, inc);
+                } else {
+                    let mut inner = lock(&self.shared.inner);
+                    inner.deliverer.cancel_obligation(&sid, None);
+                }
                 if let Some(PyValue::Dict(mut live)) =
                     applied.ok().and_then(|r| r.get("session").cloned())
                 {
@@ -4923,7 +5154,14 @@ impl SessionManager {
     ///
     /// 作業在關閉期間留在 `inflight`（其他入口視同在途而不開埠），回條到後不論結果一律移除；關閉失敗只告警。
     fn close_parked_for_bind(&self, by_id: &str, op: &AttachOp) {
-        if let Some(pre) = op.take_preopened() {
+        let pre = {
+            let mut inner = lock(&self.shared.inner);
+            inner.custody.claim_for_release(by_id, op.token).ok().flatten().map(|parts| {
+                let real_path = inner.device_path(by_id).unwrap_or("").to_string();
+                Preopened { real_path, parts }
+            }).or_else(|| op.take_preopened())
+        };
+        if let Some(pre) = pre {
             self.shared.close_session_preopened(by_id, pre);
         }
         let mut inner = lock(&self.shared.inner);
@@ -5501,6 +5739,19 @@ impl SessionManager {
         lock(&self.shared.inner).deliverer.attempts(sid)
     }
 
+    /// 只供測試（test-fakes）：取得 deliverer 的 admission gate。
+    #[cfg(feature = "test-fakes")]
+    pub fn deliverer_gate_for_test(&self) -> Arc<crate::admission::AdmissionGate> {
+        lock(&self.shared.inner).deliverer.gate.clone()
+    }
+
+    /// 只供測試（test-fakes）：取得 session actor 的 control sender。
+    #[cfg(feature = "test-fakes")]
+    pub fn actor_control_for_test(&self, sid: &str) -> Option<crossbeam_channel::Sender<crate::mailbox::ControlEvent>> {
+        let inner = lock(&self.shared.inner);
+        inner.sessions.get(sid).map(|e| e.actor.control.clone())
+    }
+
     /// 只供測試（test-fakes）：查詢 session 已退休的 epoch 集合。
     #[cfg(feature = "test-fakes")]
     pub fn retired_drains_for_test(&self, sid: &str) -> Vec<u64> {
@@ -5669,13 +5920,29 @@ impl SessionManager {
         type ShutdownTargets = (
             Vec<(String, Arc<ActorHandle>)>,
             Vec<String>,
-            Vec<(String, AttachOp)>,
+            Vec<(String, AttachOp, Option<Preopened>)>,
         );
         let (entries, inflight, unconsumed): ShutdownTargets = {
-            let inner = lock(&self.shared.inner);
+            let mut inner = lock(&self.shared.inner);
             for op in inner.inflight.values() {
                 op.cancel();
             }
+            let to_claim: Vec<(String, u64, AttachOp)> = inner
+                .inflight
+                .iter()
+                .filter(|(_, op)| op.parked.swap(false, Ordering::SeqCst))
+                .map(|(by_id, op)| (by_id.clone(), op.token, op.clone()))
+                .collect();
+            let unconsumed_list = to_claim
+                .into_iter()
+                .map(|(by_id, token, op)| {
+                    let pre = inner.custody.claim_for_release(&by_id, token).ok().flatten().map(|parts| {
+                        let real_path = inner.device_path(&by_id).unwrap_or("").to_string();
+                        Preopened { real_path, parts }
+                    }).or_else(|| op.take_preopened());
+                    (by_id, op, pre)
+                })
+                .collect();
             (
                 inner
                     .sessions
@@ -5683,18 +5950,16 @@ impl SessionManager {
                     .map(|e| (e.sid.clone(), e.actor.clone()))
                     .collect(),
                 inner.inflight.keys().cloned().collect(),
-                inner
-                    .inflight
-                    .iter()
-                    .filter(|(_, op)| op.parked.swap(false, Ordering::SeqCst))
-                    .map(|(by_id, op)| (by_id.clone(), op.clone()))
-                    .collect(),
+                unconsumed_list,
             )
         };
         // Python `shutdown_drain` 對未消費的 `_preopened_ports` 作業直接 `_finish_attach_op`（關閉 handle；關閉失敗保留作業、
         // 列為 stalled，`origin/main:sw_core/session_manager.py:1218-1227`、`:1231-1239`）。
-        for (by_id, op) in unconsumed {
-            let receipt = op.close_preopened_with_receipt();
+        for (by_id, op, pre) in unconsumed {
+            let receipt = match pre {
+                Some(pre) => Some(op.close_parts(pre.parts)),
+                None => op.close_preopened_with_receipt(),
+            };
             self.shared.finish_attach_op(&by_id, &op, receipt);
         }
 
@@ -5878,6 +6143,17 @@ impl SessionManager {
     #[cfg(feature = "test-fakes")]
     pub fn unconfirmed_close_for_test(&self, by_id: &str) -> bool {
         self.shared.unconfirmed_closes.contains(by_id)
+    }
+
+    /// 只供測試（test-fakes）：對指定 session 的 actor 注入 panic 次數。
+    #[cfg(feature = "test-fakes")]
+    pub fn arm_actor_panic_for_test(&self, selector: &str, count: u8) -> bool {
+        let inner = lock(&self.shared.inner);
+        if let Some(entry) = inner.resolve(selector) {
+            entry.actor.control.send(ControlEvent::ArmPanic { count }).is_ok()
+        } else {
+            false
+        }
     }
 
     /// 只供測試（test-fakes）：注入可觀察的在途 attach 標記，驗證早退不取消也不等待。

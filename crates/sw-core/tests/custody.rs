@@ -30,6 +30,7 @@ use sw_core::session_core::UnconfirmedCloses;
 use sw_core::session_manager::HandleParts;
 use sw_core::tx_writer::{EvidenceGap, TxLedger};
 use sw_pal::traits::{Clock, PalError, PalErrorKind, SerialBackend};
+use sw_proto::pyjson::PyValue;
 
 static SPAWN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -245,10 +246,21 @@ fn test_reaper_worker_stopped_separate_handle_and_evidence() {
 
 #[test]
 fn test_reaper_drain_data_barrier_not_confirmed_and_expires() {
-    let (reaper_cmd_tx, _reaper_cmd_rx) = unbounded();
+    let (_reaper_cmd_tx, reaper_cmd_rx) = unbounded();
     let (reaper_event_tx, reaper_event_rx) = unbounded();
 
-    let reaper = ReaperThread::start(reaper_cmd_tx, reaper_event_rx);
+    struct DummyCb;
+    impl ReaperCallback for DummyCb {
+        fn handle_cmd(&self, _cmd: ReaperCmd, _event_tx: &crossbeam_channel::Sender<ControlEvent>) {}
+        fn handle_worker_stopped(&self, _receipt: WorkerStoppedReceipt) {}
+    }
+
+    let mut reaper = ReaperThread::start(
+        reaper_cmd_rx,
+        reaper_event_rx,
+        reaper_event_tx.clone(),
+        Arc::new(DummyCb),
+    );
 
     let (reply, ack) = bounded(1);
     let expired = Arc::new(AtomicBool::new(false));
@@ -289,7 +301,7 @@ fn test_panic_guard_reports_failed_unknown() {
 
 #[test]
 fn test_exit_reclaim_triggers_on_normal_exit_panic_and_unwind_but_not_spawn_failure() {
-    let _guard = SPAWN_TEST_LOCK.lock().unwrap();
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // 1. 正常結束：經由 try_spawn_actor_with_reaper 啟動，發送 Shutdown，執行緒退出，reaper 收到恰好 1 筆 ActorExited
     {
         let (reaper_tx, reaper_rx) = unbounded();
@@ -1436,48 +1448,242 @@ fn test_dr9_actor_spawn_failure_cleanup() {
 
 #[test]
 fn test_actor_repeated_panic_stops_and_settles_custody() {
-    let _guard = SPAWN_TEST_LOCK.lock().unwrap();
-    let unconfirmed = UnconfirmedCloses::new();
-    let mut ledger = CustodyLedger::new(unconfirmed.clone());
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let m = ManagerRig::single_target(SHELL_PROFILE).ready();
+    let by_id = "/s/by-id/usb-A";
+    let dev = m.dev.clone();
+    let full_sid = m.mgr.resolve("COM0").expect("session 存在");
 
-    let sid = "COM40";
-    let by_id = "by-id-panic-stop";
-    let real_path = "/dev/ttyUSB40";
-    let inc = ledger.alloc_session_inc(sid);
+    // 注入 3 次 panic
+    assert!(m.mgr.arm_actor_panic_for_test(&full_sid, 3));
 
-    let token = ledger.register(
-        by_id,
-        real_path,
-        CustodyOwner::Session { sid: sid.into(), inc },
-        CustodyTaker::OpenJob { sid: sid.into(), gen: 1 },
-    ).unwrap();
-    ledger.save_held_mock(token).unwrap();
-
-    // 建立真實 actor 並注入 3 次 panic
-    let (reaper_tx, _reaper_rx) = unbounded();
-    let mut h = CoreHarness::new(SHELL_PROFILE);
-    h.core.arm_panic_on_next_events(3);
-    let clock: Arc<dyn Clock> = h.clock.clone();
-    let core = h.core;
-    let mb = Mailbox::new(256, 1024);
-    let handle = try_spawn_actor_with_reaper(core, mb, Box::new(ReplyExec), clock, inc, Some(reaper_tx))
-        .expect("spawn actor 成功");
-
+    // 發送 3 次同型事件引發連續 3 次同型 panic
+    let control = m.mgr.actor_control_for_test(&full_sid).expect("control 存在");
     for _ in 0..3 {
-        let _ = handle.request(sw_core::session_core::SessionRequest::GetState, Duration::from_secs(2));
+        control.send(ControlEvent::DeviceMissing).unwrap();
     }
 
-    // 依編排者裁決（rulings/s2.md）：actor 在同型事件 panic 3 次時不結束，只走 begin_stop(IoError)。
-    // 帳本紀錄經停止機制收尾並配對回條：
-    let jobs = ledger.claim_for_stop(sid, inc, CustodyCancel::Release);
-    assert_eq!(jobs.len(), 1);
-    let term = jobs.into_iter().next().unwrap().execute_and_settle(&mut ledger, None).unwrap();
-    assert_eq!(term.unwrap().handle, TerminalHandle::Closed);
-    assert!(ledger.get_custody(by_id).is_none());
+    // 等待停止機制收尾與 handle 關閉
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(3) {
+        if dev.close_count() >= 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
-    let (reply, _reply_rx) = bounded(1);
-    let _ = handle.control.send(ControlEvent::Shutdown { reply });
-    let _ = handle.join.join();
+    // 斷言：句柄確實已被關閉
+    assert_eq!(dev.close_count(), 1, "停止機制須關閉 handle 恰好 1 次");
+
+    // 斷言：帳本紀錄由 BeginDrain 結算並移除（C3）
+    let custody = m.mgr.custody_for_test(by_id);
+    assert!(custody.is_none(), "BeginDrain 自動收尾後帳本紀錄須被結算移除，實際為：{custody:?}");
+}
+
+#[test]
+fn test_dr7_bind_device_online_full_queues_deliverer_and_retries() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let m = ManagerRig::single_target(SHELL_PROFILE).ready();
+    let sid = "COM0";
+    let full_sid = m.mgr.resolve(sid).expect("session 存在");
+
+    // 新增另一個目標裝置供 bind 切換
+    const NEW_BY_ID: &str = "/s/by-id/dr7-bind";
+    const NEW_REAL: &str = "/dev/ttyDR7";
+    let _new_dev = m.add_device_at(NEW_BY_ID, NEW_REAL);
+    m.mgr.update_devices(&m.snapshot());
+
+    // 設定在 bind 送出 DeviceOnline 之前，暫停 actor 的 Request 處理並縮短 timeout，確定性引發首次送達失敗
+    let resume_holder = Arc::new(Mutex::new(None));
+    let resume_holder_clone = resume_holder.clone();
+    let mgr_for_hook = m.mgr.clone();
+    let sid_for_hook = sid.to_string();
+
+    m.mgr.set_bind_pre_device_online_hook_for_test(Box::new(move || {
+        mgr_for_hook.set_query_timeout_for_test(Duration::from_millis(30));
+        let (_entered_rx, resume_tx) = mgr_for_hook.pause_next_request_for_test(&sid_for_hook).unwrap();
+        *resume_holder_clone.lock().unwrap() = Some(resume_tx);
+    }));
+
+    // 凍結 gate，送達者即使輪詢也不會逾時或誤投遞
+    let gate = m.mgr.deliverer_gate_for_test();
+    let freeze_token = match gate.freeze_if_idle("test-dr7") {
+        FreezeOutcome::Frozen { token, .. } => token,
+        _ => panic!("gate 應可凍結"),
+    };
+
+    // 執行 bind：因為 actor Request 暫停且 timeout 縮短，首次 DeviceOnline 發送失敗
+    let res = m.mgr.bind(&full_sid, NEW_BY_ID).expect("bind ok");
+    assert_eq!(res.get("ok"), Some(&PyValue::Bool(true)));
+
+    // 斷言：送達義務成功寫入 deliverer
+    assert!(m.mgr.delivery_obligation_for_test(&full_sid), "首次送達失敗必須登錄送達義務");
+
+    // 在 gate 凍結期間等待，驗證送達者背景執行緒不因凍結而丟棄義務
+    std::thread::sleep(Duration::from_millis(60));
+    assert!(m.mgr.delivery_obligation_for_test(&full_sid), "凍結期間義務保留");
+
+    // 解除 actor 暫停並恢復預設 query timeout
+    if let Some(resume_tx) = resume_holder.lock().unwrap().take() {
+        let _ = resume_tx.send(());
+    }
+    m.mgr.set_query_timeout_for_test(Duration::from_secs(2));
+
+    // 解凍 gate
+    assert!(gate.thaw(&freeze_token));
+
+    // 等待送達者背景執行緒重送成功並清除義務
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(3) {
+        if !m.mgr.delivery_obligation_for_test(&full_sid) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!m.mgr.delivery_obligation_for_test(&full_sid), "送達者重送成功後義務必須清除");
+}
+
+#[test]
+fn test_dr1_f1_to_f5_real_ioworker_reaper_drain() {
+    let unconfirmed = UnconfirmedCloses::new();
+    let ledger = CustodyLedger::new(unconfirmed.clone());
+
+    let (reaper_cmd_tx, reaper_cmd_rx) = unbounded();
+    let (reaper_event_tx, reaper_event_rx) = unbounded();
+
+    struct LedgerReaperCb {
+        ledger: Arc<Mutex<CustodyLedger>>,
+    }
+    impl ReaperCallback for LedgerReaperCb {
+        fn handle_cmd(&self, cmd: ReaperCmd, event_tx: &crossbeam_channel::Sender<ControlEvent>) {
+            match cmd {
+                ReaperCmd::ActorExited { sid, inc } => {
+                    let mut ledger = self.ledger.lock().unwrap();
+                    let jobs = ledger.handle_actor_exited(&sid, inc);
+                    for job in jobs {
+                        let _ = job.execute_and_settle(&mut ledger, Some(event_tx));
+                    }
+                }
+                ReaperCmd::Reclaim { token, epoch, worker } => {
+                    let mut ledger = self.ledger.lock().unwrap();
+                    let _ = ledger.mark_bridge_draining(token, epoch, StopId(0));
+                    drop(ledger);
+                    worker.finish_async(StopId(0), event_tx.clone());
+                }
+            }
+        }
+        fn handle_worker_stopped(&self, receipt: WorkerStoppedReceipt) {
+            let mut ledger = self.ledger.lock().unwrap();
+            let token_opt = ledger.custody.values().find_map(|v| match &v.phase {
+                CustodyPhase::BridgeDraining { epoch, stop_id }
+                    if *epoch == receipt.epoch && *stop_id == receipt.stop_id =>
+                {
+                    Some(v.token)
+                }
+                _ => None,
+            });
+            if let Some(token) = token_opt {
+                let _ = ledger.settle_worker_stopped(token, receipt);
+            }
+        }
+    }
+
+    let shared_ledger = Arc::new(Mutex::new(ledger));
+    let mut reaper = ReaperThread::start(
+        reaper_cmd_rx,
+        reaper_event_rx,
+        reaper_event_tx.clone(),
+        Arc::new(LedgerReaperCb { ledger: shared_ledger.clone() }),
+    );
+
+    // 1. (f1/f3) 真實 IoWorker + FakeSerial，進入 Bridged
+    let h = CoreHarness::new(SHELL_PROFILE);
+    let dev_path = "/dev/ttyUSB-real-drain";
+    let dev = h.add_serial_device(dev_path);
+    let epoch = 100;
+    let worker = h.start_worker_at(epoch, dev_path);
+
+    let sid = "COM50";
+    let by_id = "by-id-real-drain";
+    let token = {
+        let mut l = shared_ledger.lock().unwrap();
+        let inc = l.alloc_session_inc(sid);
+        let token = l.register(
+            by_id,
+            dev_path,
+            CustodyOwner::Session { sid: sid.into(), inc },
+            CustodyTaker::OpenJob { sid: sid.into(), gen: 1 },
+        ).unwrap();
+        l.adopt_bridged(token, epoch, worker).unwrap();
+        token
+    };
+
+    // 發送 ActorExited 命令觸發回收
+    reaper_cmd_tx.send(ReaperCmd::ActorExited { sid: sid.into(), inc: 1 }).unwrap();
+
+    // 等待回收者消費與結算
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(3) {
+        let l = shared_ledger.lock().unwrap();
+        if l.terminals.contains_key(&token) {
+            break;
+        }
+        drop(l);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let l = shared_ledger.lock().unwrap();
+    let term = l.terminals.get(&token).expect("回收者必須結算終態");
+    assert_eq!(term.handle, TerminalHandle::Closed, "正常關閉的真實 worker 結算為 Closed");
+    assert_eq!(term.evidence, TerminalEvidence::Complete, "證據完整");
+    assert!(l.get_custody(by_id).is_none(), "Closed 後帳本紀錄必須移除");
+    assert_eq!(dev.close_count(), 1, "真實 serial handle 必須被呼叫 close 恰好 1 次");
+    drop(l);
+
+    // 2. (f2) 失敗回條變體：fail_close
+    let dev_path_f2 = "/dev/ttyUSB-fail-close";
+    let dev_f2 = h.add_serial_device(dev_path_f2);
+    dev_f2.fail_close(PalError::io(5, "injected close failure"));
+    let epoch_f2 = 101;
+    let worker_f2 = h.start_worker_at(epoch_f2, dev_path_f2);
+
+    let sid_f2 = "COM51";
+    let by_id_f2 = "by-id-fail-close";
+    let token_f2 = {
+        let mut l = shared_ledger.lock().unwrap();
+        let inc = l.alloc_session_inc(sid_f2);
+        let token = l.register(
+            by_id_f2,
+            dev_path_f2,
+            CustodyOwner::Session { sid: sid_f2.into(), inc },
+            CustodyTaker::OpenJob { sid: sid_f2.into(), gen: 1 },
+        ).unwrap();
+        l.adopt_bridged(token, epoch_f2, worker_f2).unwrap();
+        token
+    };
+
+    reaper_cmd_tx.send(ReaperCmd::ActorExited { sid: sid_f2.into(), inc: 1 }).unwrap();
+
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(3) {
+        let l = shared_ledger.lock().unwrap();
+        if l.terminals.contains_key(&token_f2) {
+            break;
+        }
+        drop(l);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let l = shared_ledger.lock().unwrap();
+    let term_f2 = l.terminals.get(&token_f2).expect("回收者必須結算終態");
+    assert!(matches!(term_f2.handle, TerminalHandle::Failed { .. }), "關閉失敗結算為 Failed");
+    assert!(unconfirmed.contains(by_id_f2), "關閉失敗必須進入 unconfirmed");
+    let rec_f2 = l.get_custody(by_id_f2).expect("關閉失敗紀錄必須保留");
+    assert!(matches!(rec_f2.phase, CustodyPhase::CloseFailed { .. }), "紀錄 phase 必須為 CloseFailed");
+    assert_eq!(dev_f2.close_count(), 1, "真實 serial handle 必須嘗試 close 1 次");
+    drop(l);
+
+    reaper.stop();
 }
 
 #[test]
@@ -1796,7 +2002,7 @@ fn test_t1_dual_release_close_unconfirmed_waits_until_first_deadline() {
 /// DR-9: 經由 manager 正式路徑注入 H-actor-spawn-fail，驗證 actor 建構失敗時持鎖清理、鎖不中毒且帳本收尾。
 #[test]
 fn test_dr9_actor_spawn_failure_via_manager_path() {
-    let _guard = SPAWN_TEST_LOCK.lock().unwrap();
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     use sw_core::state_store::LoadedState;
     const BY_ID: &str = "/s/by-id/usb-spawn-fail";
 
