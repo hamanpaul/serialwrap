@@ -31,6 +31,8 @@ use sw_core::session_manager::HandleParts;
 use sw_core::tx_writer::{EvidenceGap, TxLedger};
 use sw_pal::traits::{Clock, PalError, PalErrorKind, SerialBackend};
 
+static SPAWN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Clone)]
 struct FakeInstantClock {
     now: Arc<Mutex<Instant>>,
@@ -287,6 +289,7 @@ fn test_panic_guard_reports_failed_unknown() {
 
 #[test]
 fn test_exit_reclaim_triggers_on_normal_exit_panic_and_unwind_but_not_spawn_failure() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap();
     // 1. 正常結束：經由 try_spawn_actor_with_reaper 啟動，發送 Shutdown，執行緒退出，reaper 收到恰好 1 筆 ActorExited
     {
         let (reaper_tx, reaper_rx) = unbounded();
@@ -1433,6 +1436,7 @@ fn test_dr9_actor_spawn_failure_cleanup() {
 
 #[test]
 fn test_actor_repeated_panic_stops_and_settles_custody() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap();
     let unconfirmed = UnconfirmedCloses::new();
     let mut ledger = CustodyLedger::new(unconfirmed.clone());
 
@@ -1449,12 +1453,31 @@ fn test_actor_repeated_panic_stops_and_settles_custody() {
     ).unwrap();
     ledger.save_held_mock(token).unwrap();
 
-    // actor 觸發 3 次同型 panic，呼叫 begin_stop(IoError)，停止機制依 ClaimForStop 收尾帳本紀錄
+    // 建立真實 actor 並注入 3 次 panic
+    let (reaper_tx, _reaper_rx) = unbounded();
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.core.arm_panic_on_next_events(3);
+    let clock: Arc<dyn Clock> = h.clock.clone();
+    let core = h.core;
+    let mb = Mailbox::new(256, 1024);
+    let handle = try_spawn_actor_with_reaper(core, mb, Box::new(ReplyExec), clock, inc, Some(reaper_tx))
+        .expect("spawn actor 成功");
+
+    for _ in 0..3 {
+        let _ = handle.request(sw_core::session_core::SessionRequest::GetState, Duration::from_secs(2));
+    }
+
+    // 依編排者裁決（rulings/s2.md）：actor 在同型事件 panic 3 次時不結束，只走 begin_stop(IoError)。
+    // 帳本紀錄經停止機制收尾並配對回條：
     let jobs = ledger.claim_for_stop(sid, inc, CustodyCancel::Release);
     assert_eq!(jobs.len(), 1);
     let term = jobs.into_iter().next().unwrap().execute_and_settle(&mut ledger, None).unwrap();
     assert_eq!(term.unwrap().handle, TerminalHandle::Closed);
     assert!(ledger.get_custody(by_id).is_none());
+
+    let (reply, _reply_rx) = bounded(1);
+    let _ = handle.control.send(ControlEvent::Shutdown { reply });
+    let _ = handle.join.join();
 }
 
 #[test]
@@ -1707,3 +1730,90 @@ fn test_dr9_b_c_spawn_failure_dynamic_and_yaml() {
     assert_eq!(term_c.unwrap().handle, TerminalHandle::Closed);
 }
 
+/// B-2: D1 + T-1 雙 release 與關閉失敗回條：
+/// 開埠在途遇關閉失敗不提前回覆第二次 release，兩者皆等到滿 3 秒首次期限才收到 DRAIN_STALLED，且欄位一致。
+#[test]
+fn test_t1_dual_release_close_unconfirmed_waits_until_first_deadline() {
+    use sw_core::mailbox::OpenFailure;
+    use sw_core::session_core::SessionRequest;
+    use sw_proto::pyjson::PyValue;
+
+    let release_req = || SessionRequest::Release {
+        source: "cli".into(),
+        reason: PyValue::Null,
+    };
+
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    // t = 0: 開埠在途，送第一次 release
+    let (rx1, _) = h.rpc_deferred(release_req());
+
+    // t = 100 ms: 送入 BridgeOpened(Err(CloseUnconfirmed(...)))
+    h.advance(Duration::from_millis(100));
+    let err = OpenFailure::CloseUnconfirmed(Box::new(OpenFailure::CloseBlocked));
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Err(err),
+    });
+
+    // 同時刻送第二次 release
+    let (rx2, _) = h.rpc_deferred(release_req());
+
+    // 驗證在 t = 100 ms 時，兩者皆未回覆！
+    assert!(rx1.try_recv().is_err(), "第一次 release 不得提前回覆");
+    assert!(rx2.try_recv().is_err(), "第二次 release 不得繞過 T-1 首次期限");
+
+    // 推進到 t = 3000 ms（距首次 release 滿 3000 ms）
+    h.advance(Duration::from_millis(2901));
+
+    // 兩者此時皆收到回覆，且欄位一致
+    let resp1 = rx1.try_recv().expect("首次期限到期 rx1 須收到回覆").expect("回傳 ok");
+    let resp2 = rx2.try_recv().expect("首次期限到期 rx2 須收到回覆").expect("回傳 ok");
+
+    assert_eq!(resp1.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(resp1.get("error_code"), Some(&PyValue::from("DRAIN_STALLED")));
+    assert_eq!(resp2.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(resp2.get("error_code"), Some(&PyValue::from("DRAIN_STALLED")));
+    assert_eq!(resp1["drain_stalled"], PyValue::Bool(true));
+    assert_eq!(resp2["drain_stalled"], PyValue::Bool(true));
+    assert_eq!(
+        h.public()["drain_stalled"],
+        PyValue::Bool(true),
+        "session 的 drain_stalled 須為 true"
+    );
+
+    // t = 3500 ms: 首次期限已過之後的第三次 release 立即回覆
+    h.advance(Duration::from_millis(500));
+    let resp3 = h.rpc(release_req()).expect("期限過後立即回覆");
+    assert_eq!(resp3.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(resp3.get("error_code"), Some(&PyValue::from("DRAIN_STALLED")));
+    assert_eq!(resp3["drain_stalled"], PyValue::Bool(true));
+}
+
+/// DR-9: 經由 manager 正式路徑注入 H-actor-spawn-fail，驗證 actor 建構失敗時持鎖清理、鎖不中毒且帳本收尾。
+#[test]
+fn test_dr9_actor_spawn_failure_via_manager_path() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap();
+    use sw_core::state_store::LoadedState;
+    const BY_ID: &str = "/s/by-id/usb-spawn-fail";
+
+    let target_yaml = format!(
+        "{{com: COM0, profile: t, act_no: 1, alias: t+1, device_by_id: {BY_ID}}}"
+    );
+    let yaml = manager_yaml(&[&target_yaml]);
+
+    inject_actor_spawn_fail(1);
+    let m = ManagerRig::with(&yaml, LoadedState::default(), None);
+    inject_actor_spawn_fail(0);
+
+    // 驗證 manager 鎖未中毒，查詢在 1s 內返回
+    assert!(m.mgr.resolve("COM0").is_none());
+    assert_eq!(m.mgr.session_ids().len(), 0);
+
+    // 驗證帳本中無殘留
+    let c = m.mgr.custody_for_test(BY_ID);
+    assert!(c.is_none(), "建構失敗清理後帳本不得殘留：{c:?}");
+}

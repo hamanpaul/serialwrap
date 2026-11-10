@@ -633,6 +633,7 @@ struct PendingOpenStop {
     waiters: Vec<Reply>,
     started: Mono,
     stalled: bool,
+    close_failed: bool,
     already_released: bool,
     post_kind: Option<StopKind>,
 }
@@ -1587,6 +1588,7 @@ impl SessionCore {
                     waiters: waiter.into_iter().collect(),
                     started: now,
                     stalled: false,
+                    close_failed: false,
                     already_released,
                     post_kind: None,
                 });
@@ -3077,7 +3079,7 @@ impl SessionCore {
     /// 留由既有的期限計時器（`mark_drain_timeout`）回 DRAIN_STALLED，期限已過之後的 release 才立即回。
     fn pending_open_close_unconfirmed(&mut self, _now: Mono) -> Vec<Effect> {
         if let Some(pending) = &mut self.pending_open_stop {
-            pending.stalled = true;
+            pending.close_failed = true;
             if pending.kind != StopKind::Release {
                 self.drain_stalled = true;
                 self.drain_timeout_epoch = Some(self.generations.bridge_generation);
@@ -4502,6 +4504,7 @@ impl SessionCore {
                 waiters: stop.waiters,
                 started: stop.started,
                 stalled: stop.stalled,
+                close_failed: false,
                 already_released: stop.already_released,
                 post_kind: None,
             });

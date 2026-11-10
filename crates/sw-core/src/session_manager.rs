@@ -38,7 +38,7 @@ use sw_proto::pydict;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 use sw_proto::pyre::{PyFlags, compile};
 
-use crate::actor::{ActorHandle, EffectExecutor, spawn_actor};
+use crate::actor::{try_spawn_actor_with_reaper, ActorHandle, EffectExecutor};
 use crate::alias_registry::AliasRegistry;
 use crate::arbiter::CommandRegistry;
 use crate::generations::EpochAllocator;
@@ -1530,7 +1530,24 @@ impl Shared {
             opened_rx: Arc::new(Mutex::new(HashMap::new())),
             opened_listener: Arc::new(Mutex::new(HashSet::new())),
         };
-        let actor = spawn_actor(core, mailbox, Box::new(exec), self.clock.clone());
+        let actor = match try_spawn_actor_with_reaper(
+            core,
+            mailbox,
+            Box::new(exec),
+            self.clock.clone(),
+            0,
+            Some(self.reaper_cmd_tx.clone()),
+        ) {
+            Ok(actor) => actor,
+            Err(e) => {
+                self.warn(format!("actor 建立失敗（sid={sid}）：{e}"));
+                let jobs = inner.custody.handle_spawn_failure(&sid, 0);
+                for job in jobs {
+                    let _ = job.execute_and_settle(&mut inner.custody, None);
+                }
+                return sid;
+            }
+        };
         if let Some(real_path) = handoff_path {
             // dynamic 偵測沿用的 PROBE handle 交給新 session：與 `attach_dynamic` 的作業同在本臨界區內寫入交接表
             // （Python `_attach_by_id_dynamic` 改寫作業 `session_id` 後仍留在 `_active_attach_ops`，
@@ -1558,6 +1575,15 @@ impl Shared {
                 history,
             },
         );
+        let by_id = inner.sessions.get(&sid).map(|e| e.profile.device_by_id.clone());
+        if let Some(by_id) = by_id {
+            if let Some(rec) = inner.custody.custody.get_mut(&by_id) {
+                rec.owner = crate::custody::CustodyOwner::Session {
+                    sid: sid.clone(),
+                    inc: 0,
+                };
+            }
+        }
         sid
     }
 
@@ -1648,6 +1674,11 @@ impl Shared {
             // `origin/main:sw_core/session_manager.py:4045-4063`）。
             for (by_id, _) in &unconsumed {
                 inner.inflight.remove(by_id);
+            if let Some(rec) = inner.custody.custody.get(by_id) {
+                if matches!(rec.phase, crate::custody::CustodyPhase::Opening { .. }) {
+                    inner.custody.custody.remove(by_id);
+                }
+            }
             }
             // #100 M2/3a：離線裝置的預配 COM 釋出（#28）。
             let online: HashSet<String> = inner.devices.keys().cloned().collect();
@@ -2159,7 +2190,7 @@ impl Shared {
             if inner.device_path(&by_id) != Some(real.as_str()) {
                 return Ok(device_not_present_reply(&selector, &by_id));
             }
-            if let Ok(token) = inner.custody.register(
+            let token = match inner.custody.register(
                 &by_id,
                 &real,
                 crate::custody::CustodyOwner::Session {
@@ -2171,8 +2202,10 @@ impl Shared {
                     gen: 0,
                 },
             ) {
-                op.token = token;
-            }
+                Ok(token) => token,
+                Err(_) => return Ok(session_recovering_reply(public)),
+            };
+            op.token = token;
             inner.inflight.insert(by_id.clone(), op.clone());
         }
 
@@ -2296,7 +2329,6 @@ impl Shared {
                     op.parked.store(true, Ordering::SeqCst);
                     if let Some(rec) = inner.custody.custody.get_mut(&by_id) {
                         rec.owner = crate::custody::CustodyOwner::Parked;
-                        rec.phase = crate::custody::CustodyPhase::Held { parts: None };
                     }
                 }
                 park
@@ -2378,6 +2410,11 @@ impl Shared {
                 }
             }
             inner.inflight.remove(by_id);
+            if let Some(rec) = inner.custody.custody.get(by_id) {
+                if matches!(rec.phase, crate::custody::CustodyPhase::Opening { .. }) {
+                    inner.custody.custody.remove(by_id);
+                }
+            }
         }
         drop(inner);
         self.cv.notify_all();
@@ -2415,10 +2452,14 @@ impl Shared {
         inner.probe_paths.remove(sid);
         inner.interactive.retain(|_, owner| owner != sid);
         if let Some(parts) = parts {
+            let p = parts.take().expect("成功開埠後須交付預開 handle");
             *lock(&op.preopened) = Some(Preopened {
                 real_path: real.to_string(),
-                parts: parts.take().expect("成功開埠後須交付預開 handle"),
+                parts: p,
             });
+            if let Some(rec) = inner.custody.custody.get_mut(by_id) {
+                rec.phase = crate::custody::CustodyPhase::Held { parts: None };
+            }
         }
         Some(entry)
     }
@@ -2501,23 +2542,33 @@ impl Shared {
                 source = "sticky";
             }
         }
-        let mut parts = match op.take_preopened() {
-            Some(pre) if pre.real_path == real => pre.parts,
-            Some(pre) => {
-                let _ = op.close_parts(pre.parts);
-                return;
-            }
-            None => {
-                let handle = match self.gated_open(by_id, &real, op) {
-                    None => return,
-                    Some(Ok(h)) => h,
-                    Some(Err(e)) => {
-                        self.record_dynamic_open_failure(by_id, &real, &e, tpl.as_ref(), source);
-                        return;
-                    }
-                };
-                HandleParts::split(handle)
-            }
+        let from_ledger = {
+            let mut inner = lock(&self.inner);
+            inner.custody.custody.get_mut(by_id).and_then(|rec| match &mut rec.phase {
+                crate::custody::CustodyPhase::Held { parts } => parts.take(),
+                _ => None,
+            })
+        };
+        let mut parts = match from_ledger {
+            Some(p) => p,
+            None => match op.take_preopened() {
+                Some(pre) if pre.real_path == real => pre.parts,
+                Some(pre) => {
+                    let _ = op.close_parts(pre.parts);
+                    return;
+                }
+                None => {
+                    let handle = match self.gated_open(by_id, &real, op) {
+                        None => return,
+                        Some(Ok(h)) => h,
+                        Some(Err(e)) => {
+                            self.record_dynamic_open_failure(by_id, &real, &e, tpl.as_ref(), source);
+                            return;
+                        }
+                    };
+                    HandleParts::split(handle)
+                }
+            },
         };
         if !self.still_valid(by_id, &real, op) {
             // 已越過 gate、open 返回時已 stopping／取消：立即關閉（零 TX）。
@@ -3704,6 +3755,12 @@ impl EffectExecutor for ManagerExec {
                     self.listener_epoch = Some(epoch);
                 }
                 lock(&self.workers).insert(epoch, worker);
+                let by_id = lock(&self.io.profile).device_by_id.clone();
+                let mut inner = lock(&self.shared.inner);
+                if let Some(rec) = inner.custody.custody.get(&by_id) {
+                    let token = rec.token;
+                    inner.custody.remove_bridged(token);
+                }
             }
             Effect::BeginDrain { stop_id, epoch } => {
                 lock(&self.opened_rx).remove(&epoch);
@@ -3718,6 +3775,12 @@ impl EffectExecutor for ManagerExec {
                 let worker = lock(&self.workers).remove(&epoch);
                 if let Some(worker) = worker {
                     worker.finish_async(stop_id, safety.clone());
+                }
+                let sid = lock(&self.io.sid).clone();
+                let mut inner = lock(&self.shared.inner);
+                let jobs = inner.custody.claim_for_stop(&sid, 0, crate::custody::CustodyCancel::Release);
+                for job in jobs {
+                    let _ = job.execute_and_settle(&mut inner.custody, Some(safety));
                 }
                 if self.listener_epoch == Some(epoch) {
                     self.listener_epoch = None;
@@ -4183,9 +4246,26 @@ impl SessionManager {
                 return settled.map(|response| response.expect("非 None 的 release 收尾回應"));
             }
         }
+        let is_release = matches!(req, SessionRequest::Release { .. });
         let result = self.route_after_release_settle(sid, req, timeout);
         if let Some((by_id, token)) = revoked_handoff {
             self.shared.clear_revoked_handoff(&by_id, token);
+        }
+        if is_release && result.as_ref().is_ok_and(is_ok) {
+            let mut inner = lock(&self.shared.inner);
+            let by_id = inner.sessions.get(sid).map(|e| e.profile.device_by_id.clone());
+            if let Some(by_id) = by_id {
+                if let Some(rec) = inner.custody.custody.get(&by_id) {
+                    let token = rec.token;
+                    inner.custody.settle_close(
+                        token,
+                        crate::custody::Terminal {
+                            handle: crate::custody::TerminalHandle::Closed,
+                            evidence: crate::custody::TerminalEvidence::Complete,
+                        },
+                    );
+                }
+            }
         }
         result
     }
@@ -4853,6 +4933,11 @@ impl SessionManager {
             .is_some_and(|current| Arc::ptr_eq(&current.cancelled, &op.cancelled))
         {
             inner.inflight.remove(by_id);
+            if let Some(rec) = inner.custody.custody.get(by_id) {
+                if matches!(rec.phase, crate::custody::CustodyPhase::Opening { .. }) {
+                    inner.custody.custody.remove(by_id);
+                }
+            }
         }
         drop(inner);
         self.shared.cv.notify_all();

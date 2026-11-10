@@ -4813,3 +4813,52 @@ fn wp510_review7_open_bridge_gate_rejects_late_unconfirmed_close() {
     assert_eq!(m.serial.open_attempts(REAL), attempts, "gate 必須在 open_exclusive 之前拒絕");
     assert_eq!(m.state_of("t:COM3").as_deref(), Some("DETACHED"));
 }
+
+/// B-1 獨立探針：佔位 attach 接手至正式 session 並到 READY，release 後帳本正確結算移除，不殘留 Opening。
+#[test]
+fn test_b1_placeholder_attach_handoff_and_release_settles_custody() {
+    const BY_ID: &str = "/s/by-id/usb-G";
+    const PLACEHOLDER_SID: &str = "gone-template:COM3";
+    const FORMAL_SID: &str = "t:COM3";
+
+    let m = wp510_b_placeholder_rig(false, false);
+    m.mgr.update_devices(&m.snapshot());
+
+    // 1. 對 gone-template:COM3 執行佔位 attach
+    let res = m.mgr.attach_released_placeholder(PLACEHOLDER_SID, false).expect("attach_released_placeholder ok");
+    assert_eq!(res.get("ok"), Some(&PyValue::Bool(true)));
+
+    // 2. 等待正式 t:COM3 到 ATTACHED / READY
+    wait_until("t:COM3 正式 session", || m.mgr.resolve(FORMAL_SID).is_some());
+    wait_until("COM3 正式 bridge", || {
+        matches!(m.state_of("COM3").as_deref(), Some("ATTACHED" | "READY"))
+    });
+
+    // 檢查步驟 2：正式 session 接手後，帳本不得殘留舊佔位的 Opening 紀錄
+    let custody_step2 = m.mgr.custody_for_test(BY_ID);
+    if let Some(c) = &custody_step2 {
+        assert_ne!(
+            c.owner,
+            sw_core::custody::CustodyOwner::Session {
+                sid: PLACEHOLDER_SID.to_string(),
+                inc: 0,
+            },
+            "正式 session 接手後帳本 owner 不得仍為舊佔位 session"
+        );
+    }
+
+    // 3. 執行 release
+    let rel_res = m.mgr.route(
+        FORMAL_SID,
+        SessionRequest::Release {
+            source: "cli".into(),
+            reason: PyValue::Null,
+        },
+        Duration::from_secs(5),
+    ).expect("release 成功");
+    assert_eq!(rel_res.get("ok"), Some(&PyValue::Bool(true)));
+
+    // 4. 驗證 release 成功後帳本完全收尾（C3）
+    let custody_step3 = m.mgr.custody_for_test(BY_ID);
+    assert!(custody_step3.is_none(), "成功 release 後帳本紀錄須被結算移除，實際為：{custody_step3:?}");
+}
