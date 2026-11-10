@@ -21,12 +21,23 @@ import json
 import os
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 from bb_faketarget import FakeTarget
-from bb_p7 import wait_state
+from bb_p7 import P7Rig, _session_row, wait_state
+
+try:
+    import ab_env
+    from ab_env import assert_daemon_artifact
+except ImportError:
+    tests_dir = str(Path(__file__).resolve().parents[2] / "tests")
+    if tests_dir not in sys.path:
+        sys.path.insert(0, tests_dir)
+    import ab_env
+    from ab_env import assert_daemon_artifact
 
 pytestmark = [pytest.mark.posix_only, pytest.mark.posix_pty, pytest.mark.process_rpc]
 
@@ -139,6 +150,144 @@ def _stop_run(tool, harness, root: Path, limit: float, flood_cfg: dict) -> dict:
                 rpc.close()
                 d.stop()
     return _judged(tool, values, errors, problems, want=STOP_SAMPLES, limit=limit, before=before, monitor=monitor)
+
+
+@contextmanager
+def _select_engine(flavor: str):
+    """明確選擇受測 CLI／daemon 之 artifact，離開時完整還原（OD-81／DF-27）。"""
+    old_ab = dict(ab_env.AB_ENV)
+    old_env = {k: os.environ.get(k) for k in ab_env.AB_KEYS}
+    try:
+        if flavor == "python":
+            for k in ("SERIALWRAP_DAEMON_EXE", "SERIALWRAP_CLI_EXE"):
+                ab_env.AB_ENV.pop(k, None)
+                os.environ.pop(k, None)
+            ab_env.AB_ENV["SERIALWRAP_AB_LABEL"] = "python-baseline"
+            os.environ["SERIALWRAP_AB_LABEL"] = "python-baseline"
+        elif flavor == "rust":
+            rust_d = ROOT / "target" / "debug" / "serialwrapd"
+            rust_cli = ROOT / "target" / "debug" / "serialwrap"
+            assert rust_d.is_file(), f"Rust daemon 二進位不存在：{rust_d}（需先 cargo build -p sw-daemon）"
+            assert rust_cli.is_file(), f"Rust CLI 二進位不存在：{rust_cli}（需先 cargo build -p sw-cli）"
+            ab_env.AB_ENV["SERIALWRAP_DAEMON_EXE"] = str(rust_d)
+            ab_env.AB_ENV["SERIALWRAP_CLI_EXE"] = str(rust_cli)
+            ab_env.AB_ENV["SERIALWRAP_AB_LABEL"] = "rust-p8"
+            os.environ["SERIALWRAP_DAEMON_EXE"] = str(rust_d)
+            os.environ["SERIALWRAP_CLI_EXE"] = str(rust_cli)
+            os.environ["SERIALWRAP_AB_LABEL"] = "rust-p8"
+        else:
+            raise ValueError(f"未知引擎規格：{flavor}")
+        yield
+    finally:
+        ab_env.AB_ENV.clear()
+        ab_env.AB_ENV.update(old_ab)
+        for k, v in old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+@contextmanager
+def _df27_post_login_timeout_scenario(flavor: str, tmp_path: Path):
+    """DF-27 黑箱情境：登入後 post_login_cmd ('sh') 回應非 prompt 文字導致 POST_LOGIN_CMD_TIMEOUT。
+
+    以短 timeout_s（2 s）觸發逾時進 DETACHED，拒絕期間送唯一 marker 之 cmd submit 驗證零 TX，
+    並於逾時後恢復 FakeTarget 之 sh 回應。
+    yield (rig, tgt, s_detached)。
+    """
+    tgt = FakeTarget(
+        tmp_path / "t0",
+        prompt="# ",
+        password="pw-df27",
+        delay_ms=0,
+        login_steps=[
+            {"expect": "", "respond": "\r\nLogin: "},
+            {"expect": "root", "respond": "\r\nPassword: "},
+            {"expect": "pw-df27", "respond": "\r\nCM> "},
+        ],
+        commands={"overrides": {"sh": {"response": "\r\n[subshell waiting]\r\n"}}},
+    )
+    rig = P7Rig(tmp_path / "p7")
+    try:
+        rig.start("bcm", [tgt], timeout_s=2)
+        assert rig.daemon is not None and rig.daemon.proc is not None
+        assert_daemon_artifact(rig.daemon.proc.pid)
+
+        # 1. 登入成功後送出 sh，假 target 回傳非 prompt 文字，等待 timeout_s 逾時
+        s_detached = wait_state(rig.env, "COM0", "DETACHED", timeout_s=15.0)
+        last_err = s_detached.get("last_error")
+        assert last_err == "POST_LOGIN_CMD_TIMEOUT", (
+            f"必須觀察到精確的 POST_LOGIN_CMD_TIMEOUT，實際為 {last_err!r}；"
+            f"若為 LOGIN_REQUIRED、TRANSPORT_STALL 或 RX_FLOOD 則判定 fixture 不成立"
+        )
+
+        # 2. 觀察到逾時後，讓假 target 後續 sh 恢復正常回應，不呼叫手動 attach／recover、不重新插拔
+        tgt.overrides["sh"] = {"response": "\r\n# "}
+
+        # 3. 拒絕期間送唯一識別字串的 command.submit（cmd submit）
+        marker = f"DF27_ZERO_TX_{flavor.upper()}_{int(time.time() * 1000)}"
+        rc, res = rig.cli("cmd", "submit", "--selector", "COM0", "--cmd", f"echo {marker}")
+        assert rc != 0, f"拒絕期間 cmd submit 應失敗，但 rc={rc}：{res}"
+        assert res is not None and res.get("ok") is False, res
+        assert res.get("error_code") == "SESSION_NOT_READY", res
+
+        # 4. 以假 DUT 收到的 bytes 及 WAL 證明該請求零 TX（不將系統登入/重探 TX 誤算為違規）
+        dut_bytes = tgt.rx_log()
+        assert marker.encode("utf-8") not in dut_bytes, "拒絕期間的命令文字外洩至 DUT RX log"
+        wal_records = rig.wal_records("COM0")
+        assert not any(marker in str(rec) for rec in wal_records), "拒絕期間的命令文字外洩至 WAL"
+
+        yield rig, tgt, s_detached
+    finally:
+        evidence_dir = ROOT / "target" / "s2-par" / "wp71" / "item2"
+        if evidence_dir.is_dir():
+            try:
+                dut_log = evidence_dir / f"{flavor}_dut_rx.log"
+                dut_log.write_bytes(bytes(tgt.rx_log()))
+                wal_file = evidence_dir / f"{flavor}_wal.json"
+                wal_file.write_text(
+                    json.dumps(rig.wal_records("COM0"), indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+        rig.stop()
+
+
+def test_df27_python_post_login_timeout_stays_detached(tmp_path):
+    """OD-81／DF-27 Python 基線：POST_LOGIN_CMD_TIMEOUT 後維持 DETACHED，不自動重探。
+
+    在涵蓋 RX idle 與既有多段退避的觀察窗內（40 秒），持續 DETACHED、錯誤不變、沒有新增自動登入 TX。
+    """
+    with _select_engine("python"):
+        with _df27_post_login_timeout_scenario("python", tmp_path) as (rig, tgt, _):
+            tx_before = tgt.rx_log()
+            deadline = time.monotonic() + 40.0
+            while time.monotonic() < deadline:
+                time.sleep(1.0)
+                curr = _session_row(rig.env, "COM0")
+                assert curr is not None, "session COM0 遺失"
+                assert curr.get("state") == "DETACHED", (
+                    f"Python 預期維持 DETACHED，但變更為 {curr.get('state')!r}"
+                )
+                assert curr.get("last_error") == "POST_LOGIN_CMD_TIMEOUT", curr.get("last_error")
+            tx_after = tgt.rx_log()
+            assert tx_after == tx_before, "Python 在觀察窗內不應有新增自動登入／重探 TX"
+
+
+def test_df27_rust_post_login_timeout_reprobes_ready(tmp_path):
+    """OD-81／DF-27 Rust 重構：POST_LOGIN_CMD_TIMEOUT 後依退避規則自動重探並回到 READY。
+
+    重探完成後清除錯誤（last_error is None）並完成新的 ready_probe nonce 確認。
+    未修 Rust 時因尚未納入 reprobe 錯誤碼，本測試預期在 wait_state(READY) 逾時而紅燈。
+    """
+    with _select_engine("rust"):
+        with _df27_post_login_timeout_scenario("rust", tmp_path) as (rig, tgt, _):
+            s_ready = wait_state(rig.env, "COM0", "READY", timeout_s=40.0)
+            assert s_ready.get("last_error") is None, s_ready
+            sent = tgt.rx_log()
+            assert b"echo __READY__" in sent, "Rust 應完成新的 ready_probe nonce 確認"
 
 
 def test_login_with_delay_and_noise(p7, tmp_path):
