@@ -498,7 +498,7 @@ fn test_deliverer_pending_duration_excluded_from_30s_timeout() {
     let real_path = "/dev/ttyUSB0";
 
     let t0 = Instant::now();
-    deliverer.add_obligation(sid, by_id, real_path, 1, 1);
+    deliverer.add_obligation_at(sid, by_id, real_path, 1, 1, t0);
 
     // 讓 actor lane 滿
     actor_tx.send(ControlEvent::Tick).unwrap();
@@ -534,6 +534,104 @@ fn test_deliverer_pending_duration_excluded_from_30s_timeout() {
     assert_ne!(outcome_final, DeliveryStepResult::TimedOut, "Pending 期間不得計入 30s 總時限");
     assert_eq!(outcome_final, DeliveryStepResult::Delivered);
     assert_eq!(deliverer.obligation_count(), 0);
+}
+
+#[test]
+fn test_deliverer_unaccounted_open_duration_before_freeze_leads_to_timeout() {
+    let gate = Arc::new(AdmissionGate::new());
+    let mut deliverer = Deliverer::new(gate.clone());
+    let (actor_tx, actor_rx) = bounded(1);
+
+    let sid = "COM1";
+    let by_id = "by-id-freeze-unaccounted";
+    let real_path = "/dev/ttyUSB0";
+
+    let t0 = Instant::now();
+    deliverer.add_obligation_at(sid, by_id, real_path, 1, 1, t0);
+
+    // 填滿 channel
+    actor_tx.send(ControlEvent::Tick).unwrap();
+
+    // 1. Open 至 t = 29.8s，投遞因 channel 滿回傳 Backoff
+    let t_29_8 = t0 + Duration::from_millis(29_800);
+    let outcome = deliverer.step_delivery(sid, &actor_tx, t_29_8);
+    assert_eq!(outcome, DeliveryStepResult::Backoff);
+
+    // 2. t = 30.0s 進入 Pending，呼叫一次 step_delivery
+    let freeze_res = gate.freeze_if_idle("freeze-op-2");
+    let freeze_token = match freeze_res {
+        FreezeOutcome::Frozen { token, .. } => token,
+        _ => panic!("預期 Frozen"),
+    };
+    assert_eq!(gate.handoff_freeze_state(), HandoffFreezeState::Pending);
+
+    let t_30_0 = t0 + Duration::from_millis(30_000);
+    let outcome_p = deliverer.step_delivery(sid, &actor_tx, t_30_0);
+    assert_eq!(outcome_p, DeliveryStepResult::PausedPending);
+
+    // 3. t = 30.2s 解凍；清空 channel
+    assert!(gate.thaw(&freeze_token));
+    assert_eq!(gate.handoff_freeze_state(), HandoffFreezeState::Open);
+    let t_30_2 = t0 + Duration::from_millis(30_200);
+    deliverer.notify_thaw(t_30_2);
+    let _ = actor_rx.try_recv();
+
+    // 4. t = 30.3s 再投遞
+    // 有效 Open 時間為：(29.8 - 0) + (30.0 - 29.8) + (30.3 - 30.2) = 29.8 + 0.2 + 0.1 = 30.1 秒
+    // 預期 TimedOut 且不送事件，義務移除
+    let t_30_3 = t0 + Duration::from_millis(30_300);
+    let outcome_final = deliverer.step_delivery(sid, &actor_tx, t_30_3);
+    assert_eq!(outcome_final, DeliveryStepResult::TimedOut, "有效 Open 時間已達 30.1s，應 TimedOut");
+    assert_eq!(deliverer.obligation_count(), 0);
+    assert!(actor_rx.try_recv().is_err(), "逾時後接收端不得取得任何事件");
+}
+
+#[test]
+fn test_deliverer_delayed_poll_after_thaw_leads_to_timeout() {
+    let gate = Arc::new(AdmissionGate::new());
+    let mut deliverer = Deliverer::new(gate.clone());
+    let (actor_tx, actor_rx) = bounded(1);
+
+    let sid = "COM2";
+    let by_id = "by-id-freeze-delayed-poll";
+    let real_path = "/dev/ttyUSB1";
+
+    let t0 = Instant::now();
+    deliverer.add_obligation_at(sid, by_id, real_path, 1, 1, t0);
+
+    // 填滿 channel
+    actor_tx.send(ControlEvent::Tick).unwrap();
+
+    // 1. Open 至 t = 29.7s，投遞因 channel 滿回傳 Backoff
+    let t_29_7 = t0 + Duration::from_millis(29_700);
+    let outcome = deliverer.step_delivery(sid, &actor_tx, t_29_7);
+    assert_eq!(outcome, DeliveryStepResult::Backoff);
+
+    // 2. t = 29.9s 進入 Pending，外部通知 freeze
+    let freeze_res = gate.freeze_if_idle("freeze-op-3");
+    let freeze_token = match freeze_res {
+        FreezeOutcome::Frozen { token, .. } => token,
+        _ => panic!("預期 Frozen"),
+    };
+    assert_eq!(gate.handoff_freeze_state(), HandoffFreezeState::Pending);
+    let t_29_9 = t0 + Duration::from_millis(29_900);
+    deliverer.notify_freeze(t_29_9);
+
+    // 3. t = 30.2s 解凍，外部通知 thaw，清空 channel
+    assert!(gate.thaw(&freeze_token));
+    assert_eq!(gate.handoff_freeze_state(), HandoffFreezeState::Open);
+    let t_30_2 = t0 + Duration::from_millis(30_200);
+    deliverer.notify_thaw(t_30_2);
+    let _ = actor_rx.try_recv();
+
+    // 4. t = 30.4s 解凍後延遲輪詢
+    // 有效 Open 時間為：(29.7 - 0) + (29.9 - 29.7) + (30.4 - 30.2) = 29.7 + 0.2 + 0.2 = 30.1 秒
+    // 預期 TimedOut 且不送事件，義務移除
+    let t_30_4 = t0 + Duration::from_millis(30_400);
+    let outcome_final = deliverer.step_delivery(sid, &actor_tx, t_30_4);
+    assert_eq!(outcome_final, DeliveryStepResult::TimedOut, "解凍後延遲輪詢計入有效 Open 時間達 30.1s，應 TimedOut");
+    assert_eq!(deliverer.obligation_count(), 0);
+    assert!(actor_rx.try_recv().is_err(), "逾時後接收端不得取得任何事件");
 }
 
 #[test]

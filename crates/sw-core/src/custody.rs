@@ -784,7 +784,18 @@ impl Deliverer {
     }
 
     pub fn add_obligation(&mut self, sid: &str, by_id: &str, real_path: &str, bind_gen: u64, inc: u64) {
-        let now = Instant::now();
+        self.add_obligation_at(sid, by_id, real_path, bind_gen, inc, Instant::now());
+    }
+
+    pub fn add_obligation_at(
+        &mut self,
+        sid: &str,
+        by_id: &str,
+        real_path: &str,
+        bind_gen: u64,
+        inc: u64,
+        now: Instant,
+    ) {
         let initial_state = self.gate.handoff_freeze_state();
         let pending_since = if initial_state == HandoffFreezeState::Pending {
             Some(now)
@@ -823,20 +834,25 @@ impl Deliverer {
     /// 記錄進入凍結轉態（依轉態記錄暫停區間並扣除，不能只在輪詢時覆寫時間戳）。
     pub fn notify_freeze(&mut self, now: Instant) {
         for ob in self.obligations.values_mut() {
+            // 進入 Pending 時先結算截至凍結時點的 Open 耗時
+            if ob.last_state == HandoffFreezeState::Open {
+                let delta = now.saturating_duration_since(ob.last_open_at);
+                ob.open_elapsed += delta;
+            }
             if ob.pending_since.is_none() {
                 ob.pending_since = Some(now);
-                ob.last_state = HandoffFreezeState::Pending;
             }
+            ob.last_state = HandoffFreezeState::Pending;
         }
     }
 
     /// 記錄解除凍結轉態（扣除暫停區間，重設 last_open_at 為回到 Open 的時點）。
     pub fn notify_thaw(&mut self, now: Instant) {
         for ob in self.obligations.values_mut() {
-            if ob.pending_since.take().is_some() || ob.last_state == HandoffFreezeState::Pending {
-                ob.last_open_at = now;
-                ob.last_state = HandoffFreezeState::Open;
-            }
+            // 解凍時記錄實際轉態時點，清除 pending_since，下一次投遞須計入解凍後耗時
+            ob.pending_since = None;
+            ob.last_open_at = now;
+            ob.last_state = HandoffFreezeState::Open;
         }
     }
 
@@ -855,7 +871,12 @@ impl Deliverer {
         // 依 T14 檢查凍結狀態
         match self.gate.handoff_freeze_state() {
             HandoffFreezeState::Pending => {
-                // Pending 時暫停嘗試、保留義務、不計總時限、attempts 不增
+                // Pending 時暫停嘗試、保留義務、不計總時限、attempts 不增；
+                // 進入 Pending 時先結算截至凍結時點 now 的 Open 耗時
+                if ob.last_state == HandoffFreezeState::Open {
+                    let delta = now.saturating_duration_since(ob.last_open_at);
+                    ob.open_elapsed += delta;
+                }
                 if ob.pending_since.is_none() {
                     ob.pending_since = Some(now);
                 }
@@ -868,9 +889,10 @@ impl Deliverer {
                 return DeliveryStepResult::Cancelled;
             }
             HandoffFreezeState::Open => {
-                if ob.pending_since.take().is_some() || ob.last_state == HandoffFreezeState::Pending {
-                    // 從 Pending 解凍回到 Open 的轉態：
-                    // 此前經過的區間為 Pending 暫停期，不計入 open_elapsed，重設 last_open_at 為回到 Open 的時間點。
+                if ob.last_state == HandoffFreezeState::Pending {
+                    // 若先前處於 Pending（未呼叫 notify_thaw 或首次在輪詢中偵測到解凍）：
+                    // 以 now 作為解凍進入 Open 的起點
+                    ob.pending_since = None;
                     ob.last_open_at = now;
                     ob.last_state = HandoffFreezeState::Open;
                 } else {
