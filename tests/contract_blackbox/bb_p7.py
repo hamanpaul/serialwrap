@@ -24,12 +24,18 @@ PROFILE_DIR = Path(__file__).resolve().parent / "p7_profiles"
 SOCKET_ENV = "SW_P7_SOCKET"
 # 只代換大寫佔位（`${BY_ID}`、`${ENV_FILE}`…）；`${nonce}` 屬 ready_probe 語法，原樣保留。
 _PLACEHOLDER = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
+_TIMEOUT_RE = re.compile(r"(?m)^([ \t]*timeout_s:[ \t]*)\d+(?:\.\d+)?")
 
 
-def p7_profile_dir(tmp: Path, name: str, **subst: str) -> Path:
-    """複製 ``p7_profiles/<name>.yaml`` 至 ``tmp``（建立目錄）並代換佔位；缺代換值 → ``KeyError``。"""
+def p7_profile_dir(tmp: Path, name: str, timeout_s: int | float | None = None, **subst: str) -> Path:
+    """複製 ``p7_profiles/<name>.yaml`` 至 ``tmp``（建立目錄）並代換佔位；缺代換值 → ``KeyError``。
+
+    可透過 ``timeout_s`` 覆寫 profile 內的 ``timeout_s`` 設定（單案覆寫，不改來源 YAML）。
+    """
     text = (PROFILE_DIR / f"{name}.yaml").read_text(encoding="utf-8")
     out = _PLACEHOLDER.sub(lambda m: str(subst[m.group(1)]), text)
+    if timeout_s is not None:
+        out = _TIMEOUT_RE.sub(rf"\g<1>{timeout_s}", out)
     tmp = Path(tmp)
     tmp.mkdir(parents=True, exist_ok=True)
     (tmp / f"{name}.yaml").write_text(out, encoding="utf-8")
@@ -81,12 +87,19 @@ class P7Rig:
         self.daemon: PyDaemon | None = None
         self.targets: list[FakeTarget] = []
 
-    def start(self, profile: str, targets: list[FakeTarget], extra_env: Mapping[str, str] = {}) -> None:
+    def start(
+        self,
+        profile: str,
+        targets: list[FakeTarget],
+        extra_env: Mapping[str, str] = {},
+        timeout_s: int | float | None = None,
+    ) -> None:
         """啟動各 target（by-id 置於隔離 env 的 ``SERIALWRAP_BY_ID_DIR``）、寫 env_file、代換 profile 並啟動 daemon。
 
         代換值：``BY_ID``＝第一個 target、``BY_ID_<i>``＝第 i 個、``ENV_FILE``＝帳密檔
         （``SW_P7_USER``／``SW_P7_PASS``＝第一個 target 的 user／password；有 console_lock 時另寫
         ``SW_P7_CONSOLE_UNLOCK``）。
+        可透過 ``timeout_s`` 指定 profile 的單案 timeout 覆寫（寫入暫存目錄）。
         """
         by_id_dir = Path(self.env["SERIALWRAP_BY_ID_DIR"])
         subst: dict[str, str] = {}
@@ -106,7 +119,7 @@ class P7Rig:
         env_file = self.tmp / "p7.env"
         env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
         subst["ENV_FILE"] = str(env_file)
-        pdir = p7_profile_dir(self.tmp / "profiles", profile, **subst)
+        pdir = p7_profile_dir(self.tmp / "profiles", profile, timeout_s=timeout_s, **subst)
         daemon_env = {**self.env, **dict(extra_env)}
         self.daemon = PyDaemon(daemon_env, profile_dir=pdir, socket=self.env[SOCKET_ENV], lock=self.tmp / "p7.lock")
         self.daemon.start()

@@ -214,3 +214,38 @@ def test_p7_profile_dir_substitutes_placeholders(tmp_path):
     assert "/dev/serial/by-id/usb-X" in text and "/tmp/OPI.env" in text
     with pytest.raises(KeyError):
         p7_profile_dir(tmp_path / "prof2", "shell", BY_ID="x")   # 缺 ENV_FILE 代換值
+
+
+@pytest.mark.memory_only
+def test_df27_profile_timeout_override_is_local(tmp_path):
+    from bb_p7 import PROFILE_DIR, p7_profile_dir
+
+    src_text_before = (PROFILE_DIR / "bcm.yaml").read_text(encoding="utf-8")
+    assert "timeout_s: 15" in src_text_before
+
+    # 1. 指定 timeout_s（例如 60）時，產生的 profile 使用指定 timeout
+    d_custom = p7_profile_dir(
+        tmp_path / "prof_custom",
+        "bcm",
+        timeout_s=60,
+        BY_ID="/dev/serial/by-id/usb-bcm",
+        ENV_FILE="/tmp/bcm.env",
+    )
+    custom_text = (d_custom / "bcm.yaml").read_text(encoding="utf-8")
+    assert "timeout_s: 60" in custom_text
+    assert "timeout_s: 15" not in custom_text
+
+    # 2. 未指定 timeout_s 時，產生的 profile 仍為 15 秒
+    d_default = p7_profile_dir(
+        tmp_path / "prof_default",
+        "bcm",
+        BY_ID="/dev/serial/by-id/usb-bcm",
+        ENV_FILE="/tmp/bcm.env",
+    )
+    default_text = (d_default / "bcm.yaml").read_text(encoding="utf-8")
+    assert "timeout_s: 15" in default_text
+
+    # 3. 來源 YAML 完全不變
+    src_text_after = (PROFILE_DIR / "bcm.yaml").read_text(encoding="utf-8")
+    assert src_text_after == src_text_before
+
