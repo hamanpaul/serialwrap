@@ -1015,6 +1015,203 @@ fn human_timeout_promoted_only_for_internal_origin() {
     assert!(h.core.active_lease().is_none());
 }
 
+// ---------------------------------------------------------------- WP6-1 第 2 項：可信 RPC human 的前景快照（OD-74）
+//
+// Python `origin/main:sw_core/session_manager.py:6476-6504`（reboot）與 `:6988-7012`（逾時）以 `trusted_human`
+// 判定 human 分支並以 `owner=source` 開 lease；RPC bare human 由 service 正規化為 `human:cli` 後傳入，故 lease
+// owner 為正規化後的 source。可信與否只看 `SubmitReq.trusted_human`／`HumanConsole`，不看 source 字首。
+
+/// RPC 可信 human 請求：bare `human` 經 service 正規化後的形狀（`source=human:cli`、`trusted_human=true`、`origin=Rpc`）。
+fn wp61_trusted_rpc(cmd: &str) -> sw_core::arbiter::SubmitReq {
+    let mut req = agent_submit(cmd);
+    req.source = "human:cli".into();
+    req.trusted_human = true;
+    req
+}
+
+/// RPC 明寫 `human:<x>`：source 帶 `human:` 字首但 `trusted_human=false`（OD-74：比照 agent）。
+fn wp61_untrusted_rpc(cmd: &str, source: &str) -> sw_core::arbiter::SubmitReq {
+    let mut req = agent_submit(cmd);
+    req.source = source.into();
+    req
+}
+
+/// 送出 `command.submit`，回傳 cmd_id 與同批的真實 `StartOp(Command)` grant（斷言 spec 帶原請求的來源與可信旗標）。
+fn wp61_submit_started(h: &mut CoreHarness, req: sw_core::arbiter::SubmitReq) -> (String, OpGrant) {
+    let (resp, fx) = h.rpc_full(SessionRequest::Submit(req.clone()));
+    let cmd_id = wp61_submitted_id(resp);
+    let (grant, queued) = fx
+        .iter()
+        .find_map(|e| match e {
+            Effect::StartOp { grant, spec: OpSpec::Command(q) } => Some((grant.clone(), q.clone())),
+            _ => None,
+        })
+        .expect("命令應立即出列並產生 StartOp(Command)");
+    wp61_assert_started(&grant, &queued, &cmd_id, &req);
+    (cmd_id, grant)
+}
+
+fn wp61_submitted_id(resp: Result<PyDict, sw_proto::pycompat::PyErr>) -> String {
+    let resp = resp.expect("submit 應同步回覆");
+    assert_eq!(resp.get("ok"), Some(&PyValue::Bool(true)), "{}", wire(&resp));
+    sv(resp.get("cmd_id").expect("cmd_id"))
+}
+
+fn wp61_assert_started(
+    grant: &OpGrant,
+    queued: &sw_core::arbiter::QueuedCommand,
+    cmd_id: &str,
+    req: &sw_core::arbiter::SubmitReq,
+) {
+    assert_eq!(grant.cmd_id.as_deref(), Some(cmd_id));
+    assert_eq!(queued.cmd_id, cmd_id);
+    assert_eq!(queued.req.source, req.source);
+    assert_eq!(queued.req.trusted_human, req.trusted_human);
+    assert_eq!(queued.req.origin, sw_core::arbiter::SubmitOrigin::Rpc);
+}
+
+/// 本次結算產生的命令 StartOp（下一筆出列）。
+fn wp61_next_started(fx: &[Effect]) -> Option<(OpGrant, sw_core::arbiter::QueuedCommand)> {
+    fx.iter().find_map(|e| match e {
+        Effect::StartOp { grant, spec: OpSpec::Command(q) } => Some((grant.clone(), q.clone())),
+        _ => None,
+    })
+}
+
+/// 升格紀錄的完整欄位（`_recover_after_failure`／`_execute_command_inner` human 分支回傳的字典）。
+fn wp61_assert_promoted_record(h: &CoreHarness, cmd_id: &str, lease_id: &str) {
+    let row = h.reg.get(cmd_id).expect("命令紀錄");
+    assert_eq!(row["status"], PyValue::from("interactive"), "{}", wire(&row));
+    assert_eq!(row["execution_mode"], PyValue::from("interactive"), "{}", wire(&row));
+    assert_eq!(row["stdout"], PyValue::from(""), "{}", wire(&row));
+    assert_eq!(row["partial"], PyValue::Bool(true), "{}", wire(&row));
+    assert_eq!(row["recovery_action"], PyValue::from("PROMOTE_HUMAN_INTERACTIVE"), "{}", wire(&row));
+    assert_eq!(row["interactive_session_id"], PyValue::from(lease_id), "{}", wire(&row));
+    assert_eq!(row["source"], PyValue::from("human:cli"), "{}", wire(&row));
+}
+
+/// agent 逾時結案（`prompt_timeout_none` → ATTACHED、無 lease）：明寫 `human:<x>` 的 RPC 必須落在這裡。
+fn wp61_assert_agent_timeout(h: &CoreHarness, cmd_id: &str, source: &str) {
+    assert_eq!(h.core.state(), SessionState::Attached, "{source}：agent 逾時轉 ATTACHED");
+    assert!(h.core.active_lease().is_none(), "{source}：不得承接可信資格開 lease");
+    let row = h.reg.get(cmd_id).expect("命令紀錄");
+    assert_eq!(row["error_code"], PyValue::from("PROMPT_TIMEOUT"), "{source}：{}", wire(&row));
+    assert_eq!(row["recovery_action"], PyValue::from("NONE"), "{source}：{}", wire(&row));
+}
+
+#[test]
+fn wp61_core_trusted_rpc_timeout_promotes_with_source() {
+    let mut h = ready();
+    let req = wp61_trusted_rpc("vim notes.txt");
+    let expected_timeout = req.timeout_s.max(profile_of(SHELL_PROFILE).template.hard_timeout_s);
+    let (cmd_id, grant) = wp61_submit_started(&mut h, req);
+    let tx_before = h.tx_effect_count();
+    let fx = finish_op(&mut h, &grant, OpOutcome::PromptTimeout { stdout: String::new() });
+
+    assert_eq!(h.core.state(), SessionState::Ready, "可信 human 逾時不轉 ATTACHED");
+    let lease = h.core.active_lease().expect("可信 RPC human 逾時應升格 interactive lease");
+    assert_eq!(lease.owner, "human:cli", "lease owner 為正規化後的 source（Python `owner=source`）");
+    assert_eq!(lease.timeout_s, expected_timeout, "max(timeout_s, hard_timeout_s)");
+    let lease_id = lease.interactive_id.clone();
+    wp61_assert_promoted_record(&h, &cmd_id, &lease_id);
+    assert!(start_ops(&fx).is_empty(), "升格不得排任何救援 op");
+    assert_eq!(h.tx_effect_count(), tx_before, "升格結算不得產生任何 TX");
+}
+
+#[test]
+fn wp61_core_trusted_rpc_reboot_promotes_with_source() {
+    let mut h = ready();
+    let (cmd_id, grant) = wp61_submit_started(&mut h, wp61_trusted_rpc("reboot"));
+    let tx_before = h.tx_effect_count();
+    let fx = finish_op(&mut h, &grant, OpOutcome::RebootExpected);
+
+    assert_eq!(h.core.state(), SessionState::Attached, "可信 human reboot 轉 ATTACHED，不進 RECOVERING");
+    let public = h.public();
+    assert_eq!(public.get("last_error"), Some(&"REBOOTING".into()), "{}", wire(&public));
+    assert_eq!(public.get("recovering"), Some(&PyValue::Bool(false)), "{}", wire(&public));
+    assert!(!h.core.pending_auto_login_for_test(), "不得排 agent 自動登入恢復");
+    let lease = h.core.active_lease().expect("可信 RPC human reboot 應升格 interactive lease");
+    assert_eq!(lease.owner, "human:cli", "lease owner 為正規化後的 source（Python `owner=source`）");
+    assert_eq!(
+        lease.timeout_s,
+        profile_of(SHELL_PROFILE)
+            .template
+            .hard_timeout_s
+            .max(sw_proto::constants::ATTACHED_CONSOLE_LEASE_TIMEOUT_S),
+        "max(hard_timeout_s, ATTACHED_CONSOLE_LEASE_TIMEOUT_S)"
+    );
+    let lease_id = lease.interactive_id.clone();
+    wp61_assert_promoted_record(&h, &cmd_id, &lease_id);
+    assert!(start_ops(&fx).is_empty(), "不得排 reboot 恢復 op");
+    let later = h.advance(Duration::from_secs(5));
+    assert!(start_ops(&later).is_empty(), "其後亦不得啟動自動登入恢復");
+    assert_eq!(h.core.state(), SessionState::Attached);
+    assert_eq!(h.tx_effect_count(), tx_before, "升格結算不得產生任何 TX");
+}
+
+#[test]
+fn wp61_core_foreground_trust_does_not_leak() {
+    for source in ["human:cli", "human:x"] {
+        // 正常結算：可信命令在前景時排入明寫 human 前綴的非可信命令，前者結算後同一事件內開始後者。
+        let mut h = ready();
+        let (first_id, first) = wp61_submit_started(&mut h, wp61_trusted_rpc("true"));
+        let next_req = wp61_untrusted_rpc("printf 'broken", source);
+        let (resp, fx) = h.rpc_full(SessionRequest::Submit(next_req.clone()));
+        let next_id = wp61_submitted_id(resp);
+        assert!(wp61_next_started(&fx).is_none(), "{source}：前景占用時應排隊");
+        let fx = finish_op(
+            &mut h,
+            &first,
+            OpOutcome::CommandResult(pydict! {
+                "ok" => true,
+                "execution_mode" => "line",
+                "stdout" => "",
+                "partial" => false,
+            }),
+        );
+        assert_eq!(h.reg.get(&first_id).unwrap()["status"], PyValue::from("done"));
+        assert!(h.core.active_lease().is_none());
+        let (grant, queued) = wp61_next_started(&fx).expect("前一筆結算後下一筆出列");
+        wp61_assert_started(&grant, &queued, &next_id, &next_req);
+        finish_op(&mut h, &grant, OpOutcome::PromptTimeout { stdout: String::new() });
+        wp61_assert_agent_timeout(&h, &next_id, source);
+
+        // drain：可信命令在途時 Recover drain 並重新 READY，新的非可信命令不得承接上一筆的可信資格或 owner。
+        let mut h = ready();
+        let _ = wp61_submit_started(&mut h, wp61_trusted_rpc("sleep 100"));
+        recover_and_reattach(&mut h, LoginOutcome::Ready);
+        assert_eq!(h.core.state(), SessionState::Ready);
+        assert!(h.core.active_lease().is_none());
+        let (cmd_id, grant) = wp61_submit_started(&mut h, wp61_untrusted_rpc("printf 'broken", source));
+        finish_op(&mut h, &grant, OpOutcome::PromptTimeout { stdout: String::new() });
+        wp61_assert_agent_timeout(&h, &cmd_id, source);
+    }
+
+    // 反向：非可信命令結算後同一事件內開始的可信命令，其快照不得被前一筆的結算清掉。
+    let mut h = ready();
+    let (_, first) = wp61_submit_started(&mut h, wp61_untrusted_rpc("true", "human:x"));
+    let next_req = wp61_trusted_rpc("vim notes.txt");
+    let (resp, _) = h.rpc_full(SessionRequest::Submit(next_req.clone()));
+    let next_id = wp61_submitted_id(resp);
+    let fx = finish_op(
+        &mut h,
+        &first,
+        OpOutcome::CommandResult(pydict! {
+            "ok" => true,
+            "execution_mode" => "line",
+            "stdout" => "",
+            "partial" => false,
+        }),
+    );
+    let (grant, queued) = wp61_next_started(&fx).expect("前一筆結算後下一筆出列");
+    wp61_assert_started(&grant, &queued, &next_id, &next_req);
+    finish_op(&mut h, &grant, OpOutcome::PromptTimeout { stdout: String::new() });
+    assert_eq!(h.core.state(), SessionState::Ready);
+    let lease_id = h.core.active_lease().expect("可信命令逾時升格").interactive_id.clone();
+    assert_eq!(h.core.active_lease().unwrap().owner, "human:cli");
+    wp61_assert_promoted_record(&h, &next_id, &lease_id);
+}
+
 /// High（2f4f76a）：真 OpRunner 下，line editor 命令逾時不送 CTRL-C／CTRL-D。
 #[test]
 fn human_line_timeout_sends_no_rescue_keys() {
