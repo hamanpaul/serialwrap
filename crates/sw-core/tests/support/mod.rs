@@ -1287,6 +1287,7 @@ impl EffectExecutor for RigExec {
                     let _ = tx.try_send(ControlEvent::HumanTxCompleted { tag, report });
                 }
             }
+            Effect::PollCustody { .. } => {}
         }
     }
 }
@@ -2815,6 +2816,7 @@ fn effect_kind(e: &Effect) -> &'static str {
         Effect::LeaseIndex(_) => "LeaseIndex",
         Effect::Reattach { .. } => "Reattach",
         Effect::ClearRevokedHandoff { .. } => "ClearRevokedHandoff",
+        Effect::PollCustody { .. } => "PollCustody",
     }
 }
 

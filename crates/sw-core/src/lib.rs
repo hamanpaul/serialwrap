@@ -11,6 +11,7 @@ pub mod admission;
 pub mod alias_registry;
 pub mod arbiter;
 pub mod capture;
+pub mod custody;
 pub mod drain;
 pub mod event_engine;
 pub mod deferred;

@@ -286,6 +286,9 @@ pub enum SessionRequest {
     /// 只供測試（test-fakes）：佇列長度 `{len, physical_len}`（審查 F74：RPC cancel 的實體移除）。
     #[cfg(feature = "test-fakes")]
     QueueLensForTest,
+    /// 只供測試（test-fakes）：查詢 retired drains 的 epoch 列表。
+    #[cfg(feature = "test-fakes")]
+    RetiredDrainsForTest,
 }
 
 /// `SessionCore::on_event` 的輸出效果；由 actor executor 執行（sans-IO）。
@@ -361,6 +364,8 @@ pub enum Effect {
     HumanTx { tag: HumanTxTag, permit: TxPermit, payload: Vec<u8> },
     /// P6 增補 #10（07 Task 7）：全域 `interactive_id → session_id` 索引；同批 Effects 中一律排在 `Reply` 之前。
     LeaseIndex(LeaseIndexOp),
+    /// S2-PAR-wp510r R1: 輪詢保管帳本終態與 offer。
+    PollCustody { tokens: Vec<u64> },
 }
 
 /// `Effect` 的有序容器。
@@ -617,6 +622,8 @@ pub struct SessionCore {
     flash_prev_state: Option<SessionState>,
     /// P8 Task 8（SC-32）：Probe／FLASHING 期間延後的 `DeviceDetached` 原因（flash 結束後 reconcile）。
     pending_detach: Option<DetachReason>,
+    /// S2-PAR-wp510r R1: actor 啟動效果（在 actor 啟動進入 loop 前執行）。
+    startup_effects: Vec<Effect>,
 }
 
 struct PendingOpenStop {
@@ -822,7 +829,17 @@ impl SessionCore {
             flash_probe_id: None,
             flash_prev_state: None,
             pending_detach: None,
+            startup_effects: Vec::new(),
         }
+    }
+
+    /// S2-PAR-wp510r R1: actor 啟動效果管理。
+    pub fn push_startup_effect(&mut self, e: Effect) {
+        self.startup_effects.push(e);
+    }
+
+    pub fn take_startup_effects(&mut self) -> Vec<Effect> {
+        std::mem::take(&mut self.startup_effects)
     }
 
     /// P6：設定 human line mode 的路徑風格（daemon 依 `Pal.caps.path_flavor` 呼叫）。
@@ -2392,6 +2409,11 @@ impl SessionCore {
                     "physical_len" => PyValue::from(self.queue.physical_len() as i64),
                 }),
             )],
+            #[cfg(feature = "test-fakes")]
+            SessionRequest::RetiredDrainsForTest => {
+                let epochs: Vec<PyValue> = self.retired_open_closes.iter().map(|r| PyValue::Int(PyInt::Small(r.epoch as i128))).collect();
+                vec![Effect::Reply(reply, Ok(pydict! { "epochs" => PyValue::List(epochs) }))]
+            }
             #[cfg(feature = "test-fakes")]
             SessionRequest::ForceStateForTest(state) => {
                 self.set_state(state, now);

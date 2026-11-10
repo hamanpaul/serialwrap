@@ -672,6 +672,10 @@ pub struct WorkerSnapshot {
 }
 
 impl IoWorker {
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     pub fn start(handle: Box<dyn SerialHandle>, args: IoWorkerArgs) -> IoWorker {
         IoWorker::start_observed(handle, args, Vec::new())
     }
@@ -972,9 +976,23 @@ fn wait_for_rx_dispatch(
     epoch: u64,
     rx_seq: u64,
 ) -> Result<(), PalError> {
+    wait_for_rx_dispatch_with_timeout(
+        safety,
+        epoch,
+        rx_seq,
+        Duration::from_millis(crate::resources::DRAIN_TIMEOUT_MS),
+    )
+}
+
+fn wait_for_rx_dispatch_with_timeout(
+    safety: &Sender<ControlEvent>,
+    epoch: u64,
+    rx_seq: u64,
+    timeout: Duration,
+) -> Result<(), PalError> {
     let (reply, ack) = bounded(1);
     let expired = Arc::new(AtomicBool::new(false));
-    let deadline = Instant::now() + Duration::from_millis(crate::resources::DRAIN_TIMEOUT_MS);
+    let deadline = Instant::now() + timeout;
     if let Err(error) = safety
         .send_timeout(
             ControlEvent::DrainDataBarrier {
@@ -994,12 +1012,38 @@ fn wait_for_rx_dispatch(
     }
     match ack.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(()) => Ok(()),
-        Err(error) => {
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
             expired.store(true, Ordering::Release);
             Err(PalError::plain(
                 PalErrorKind::Io,
-                format!("RX drain barrier 等待逾時，capture 順序未確認：{error}"),
+                "回收者排空，無 actor 確認 RX dispatch".to_string(),
             ))
         }
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+            expired.store(true, Ordering::Release);
+            Err(PalError::plain(
+                PalErrorKind::Io,
+                "RX drain barrier 等待逾時，capture 順序未確認：timed out waiting on channel".to_string(),
+            ))
+        }
+    }
 }
+
+#[doc(hidden)]
+pub fn wait_for_rx_dispatch_for_test(
+    safety: &Sender<ControlEvent>,
+    epoch: u64,
+    rx_seq: u64,
+) -> Result<(), PalError> {
+    wait_for_rx_dispatch(safety, epoch, rx_seq)
+}
+
+#[doc(hidden)]
+pub fn wait_for_rx_dispatch_with_timeout_for_test(
+    safety: &Sender<ControlEvent>,
+    epoch: u64,
+    rx_seq: u64,
+    timeout: Duration,
+) -> Result<(), PalError> {
+    wait_for_rx_dispatch_with_timeout(safety, epoch, rx_seq, timeout)
 }

@@ -147,6 +147,8 @@ pub enum TimerEvent {
     DrainTimeout { epoch: u64, stop_id: StopId },
     /// P7 Task 9：force recover 第 `n` 次 READY 輪詢（`_force_recover` 的 `time.sleep(1.0)`；`id` 為等待者）。
     ForceRecoverPoll { id: u64, n: u32 },
+    /// S2-PAR-wp510r R1: CustodyPoll 本地計時器（每 500 ms 補收或確認終態/offer）。
+    CustodyPoll,
 }
 
 /// `DeviceDetached` 原因（→ `DEVICE_REMOVED`／`DEVICE_REBOUND_REQUIRED`）。

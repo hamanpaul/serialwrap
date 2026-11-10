@@ -253,15 +253,72 @@ impl ActorHandle {
 /// 效果執行器（executor 在 actor thread 外的 IO worker 側實作；測試以替身實作）。
 pub trait EffectExecutor: Send {
     fn execute(&mut self, e: Effect, tx: &Sender<ControlEvent>, safety: &Sender<ControlEvent>);
+    /// S2-PAR-wp510r R1: 效果立即回饋佇列（executor 推回的事件先於下一次 mailbox 收取被處理）。
+    fn execute_with_feedback(
+        &mut self,
+        e: Effect,
+        tx: &Sender<ControlEvent>,
+        safety: &Sender<ControlEvent>,
+        _feedback: &mut std::collections::VecDeque<ControlEvent>,
+    ) {
+        self.execute(e, tx, safety);
+    }
 }
 
-/// 啟動 actor thread。
-pub fn spawn_actor(
+/// 建立 session actor 失敗錯誤（DR-9：持鎖建立失敗回傳 Result，取代 expect panic 導致鎖中毒）。
+#[derive(Debug)]
+pub struct SpawnError(pub std::io::Error);
+
+impl std::fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "建立 session actor thread 失敗：{}", self.0)
+    }
+}
+
+impl std::error::Error for SpawnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+#[cfg(feature = "test-fakes")]
+static INJECT_ACTOR_SPAWN_FAIL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "test-fakes")]
+pub fn inject_actor_spawn_fail(n: usize) {
+    INJECT_ACTOR_SPAWN_FAIL_COUNT.store(n, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// 嘗試啟動 actor thread（回傳 Result，呼叫端在 R2 全面切換）。
+pub fn try_spawn_actor(
     core: SessionCore,
+    mailbox: Mailbox,
+    exec: Box<dyn EffectExecutor>,
+    clock: Arc<dyn Clock>,
+) -> Result<ActorHandle, SpawnError> {
+    try_spawn_actor_with_reaper(core, mailbox, exec, clock, 0, None)
+}
+
+/// 支援帶世代號與回收者命令通道的 actor 啟動。
+pub fn try_spawn_actor_with_reaper(
+    mut core: SessionCore,
     mut mailbox: Mailbox,
     mut exec: Box<dyn EffectExecutor>,
     clock: Arc<dyn Clock>,
-) -> ActorHandle {
+    inc: u64,
+    reaper_cmd: Option<Sender<crate::custody::ReaperCmd>>,
+) -> Result<ActorHandle, SpawnError> {
+    #[cfg(feature = "test-fakes")]
+    {
+        let count = INJECT_ACTOR_SPAWN_FAIL_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        if count > 0 {
+            INJECT_ACTOR_SPAWN_FAIL_COUNT.store(count - 1, std::sync::atomic::Ordering::SeqCst);
+            return Err(SpawnError(std::io::Error::other(
+                "injected H-actor-spawn-fail",
+            )));
+        }
+    }
+
     let control = mailbox.control_sender();
     let safety = mailbox.safety_sender();
     let data = mailbox.data_sender();
@@ -280,18 +337,52 @@ pub fn spawn_actor(
         .rsplit_once(':')
         .map(|(_, com)| com.to_string())
         .unwrap_or_else(|| core.session_id().to_string());
+    let startup_effects = core.take_startup_effects();
     let join = std::thread::Builder::new()
         .name(format!("serialwrap-session-{com}"))
         .spawn(move || {
+            // S2-PAR-wp510r: ExitReclaim 守衛只在 actor 執行緒 closure 內建立
+            let _exit_reclaim = reaper_cmd.map(|tx| {
+                crate::custody::ExitReclaim::new(core.session_id().to_string(), inc, tx)
+            });
+
             let mut core = core;
             let mut timers: Vec<(u64, TimerEvent)> = Vec::new();
+            let mut immediate_feedback: std::collections::VecDeque<ControlEvent> = std::collections::VecDeque::new();
             let mut processed = (0u64, 0u64);
             let mut next_tick = clock.mono_ns().saturating_add(1_000_000_000);
             let mut panic_type: Option<&'static str> = None;
             let mut panic_count = 0u8;
 
+            // 啟動效果在進入 loop 前執行
+            for effect in startup_effects {
+                exec.execute_with_feedback(effect, &thread_control, &thread_safety, &mut immediate_feedback);
+            }
+
             loop {
                 let now = clock.mono_ns();
+
+                // 立即回饋佇列最高優先級處理
+                if let Some(event) = immediate_feedback.pop_front() {
+                    if dispatch(
+                        &mut core,
+                        MailboxItem::Control(event),
+                        now,
+                        &thread_control,
+                        &thread_safety,
+                        &clock,
+                        &mut exec,
+                        &mut timers,
+                        &mut processed,
+                        &mut panic_type,
+                        &mut panic_count,
+                        &mut immediate_feedback,
+                    ) {
+                        break;
+                    }
+                    continue;
+                }
+
                 if let Some(index) = timers.iter().position(|(at, _)| *at <= now) {
                     let (_due, event) = timers.remove(index);
                     #[cfg(feature = "test-fakes")]
@@ -308,6 +399,7 @@ pub fn spawn_actor(
                         &mut processed,
                         &mut panic_type,
                         &mut panic_count,
+                        &mut immediate_feedback,
                     ) {
                         break;
                     }
@@ -333,6 +425,7 @@ pub fn spawn_actor(
                         &mut processed,
                         &mut panic_type,
                         &mut panic_count,
+                        &mut immediate_feedback,
                     ) {
                         break;
                     }
@@ -385,6 +478,7 @@ pub fn spawn_actor(
                     &mut processed,
                     &mut panic_type,
                     &mut panic_count,
+                    &mut immediate_feedback,
                 );
                 if let Some(mark) = data_mark {
                     // 依賴事件只會在 current epoch 時判定；保留舊 epoch 的 dispatch watermark，
@@ -400,8 +494,9 @@ pub fn spawn_actor(
                 }
             }
         })
-        .expect("建立 session actor thread");
-    ActorHandle {
+        .map_err(SpawnError)?;
+
+    Ok(ActorHandle {
         control,
         safety,
         data,
@@ -412,7 +507,17 @@ pub fn spawn_actor(
         data_observer,
         #[cfg(feature = "test-fakes")]
         safety_observer,
-    }
+    })
+}
+
+/// 啟動 actor thread。
+pub fn spawn_actor(
+    core: SessionCore,
+    mailbox: Mailbox,
+    exec: Box<dyn EffectExecutor>,
+    clock: Arc<dyn Clock>,
+) -> ActorHandle {
+    try_spawn_actor(core, mailbox, exec, clock).expect("建立 session actor thread")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -428,6 +533,7 @@ fn dispatch(
     _processed: &mut (u64, u64),
     panic_type: &mut Option<&'static str>,
     panic_count: &mut u8,
+    feedback: &mut std::collections::VecDeque<ControlEvent>,
 ) -> bool {
     let (reply, event_name) = match &item {
         MailboxItem::Control(ControlEvent::Request { reply, .. })
@@ -474,7 +580,7 @@ fn dispatch(
                 if let Effect::Schedule { at, ev } = effect {
                     timers.push((at, ev));
                 } else {
-                    exec.execute(effect, control, safety);
+                    exec.execute_with_feedback(effect, control, safety, feedback);
                 }
             }
         }

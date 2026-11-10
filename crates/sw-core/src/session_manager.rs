@@ -125,11 +125,11 @@ struct Preopened {
 }
 
 /// `SerialHandle::split` 的四件組；可原樣重組成 `SerialHandle` 交給 `IoWorker::start`（同一 OS handle）。
-struct HandleParts {
-    reader: Box<dyn SerialReader>,
-    writer: Box<dyn SerialWriter>,
-    waker: Arc<dyn IoWaker>,
-    close: CloseToken,
+pub struct HandleParts {
+    pub reader: Box<dyn SerialReader>,
+    pub writer: Box<dyn SerialWriter>,
+    pub waker: Arc<dyn IoWaker>,
+    pub close: CloseToken,
 }
 
 impl HandleParts {
@@ -556,6 +556,13 @@ struct Inner {
     handoff_frozen: bool,
     /// P8 Task 14：`begin_shutdown` 已呼叫（交接回滾只還原自己設的 stopping gate，不撤銷 shutdown 的）。
     shutdown_started: bool,
+    /// S2-PAR-wp510r R1: 保管帳本基礎設施
+    #[allow(dead_code)]
+    pub custody: crate::custody::CustodyLedger,
+    #[allow(dead_code)]
+    pub prepared: HashMap<u64, PreparedAttachWorker>,
+    #[allow(dead_code)]
+    pub deliverer: crate::custody::Deliverer,
 }
 
 /// P8 Task 14：偵測 PROBE 的 fence（每次 `probe_send` 新建）與交接凍結旗標，同一把鎖內登記與讀取：
@@ -681,6 +688,11 @@ struct Shared {
     lone_surrogates: bool,
     /// 啟動存檔重現的 Python 未捕捉例外末行（`_save_state` 的 `UnicodeEncodeError`）；daemon 據此 exit 1。
     startup_error: Mutex<Option<String>>,
+    /// S2-PAR-wp510r R1: 回收者命令通道與執行緒
+    #[allow(dead_code)]
+    pub reaper_cmd_tx: Sender<crate::custody::ReaperCmd>,
+    #[allow(dead_code)]
+    pub reaper: Mutex<Option<crate::custody::ReaperThread>>,
 }
 
 /// PROBE 的 writer 交給 TxWriter thread 期間留在 `HandleParts` 的占位（任何提交一律 NotSubmitted）。
@@ -3820,6 +3832,8 @@ impl EffectExecutor for ManagerExec {
             }
             // P6 Task 6（07 D-15(5)）：交給 per-epoch pump（try_send，actor 永不阻塞）；送不出去以 NotSubmitted 回報。
             Effect::HumanTx { tag, permit, payload } => self.human_tx(tag, permit, payload, tx),
+            // S2-PAR-wp510r R1: 輪詢保管帳本終態與 offer
+            Effect::PollCustody { tokens: _ } => {}
         }
     }
 }
@@ -3849,6 +3863,9 @@ impl SessionManager {
         wal.set_health_sink(fanout.clone());
         let (note_tx, note_rx) = crossbeam_channel::unbounded();
         let (watcher_tx, watcher_rx) = crossbeam_channel::unbounded();
+        let (reaper_cmd_tx, _reaper_cmd_rx) = crossbeam_channel::unbounded();
+        let (_reaper_event_tx, reaper_event_rx) = crossbeam_channel::unbounded();
+        let reaper_thread = crate::custody::ReaperThread::start(reaper_cmd_tx.clone(), reaper_event_rx);
         let max_sessions = pyint_usize(&load.max_sessions, 16);
         let shared = Arc::new(Shared {
             serial,
@@ -3912,6 +3929,8 @@ impl SessionManager {
             query_timeout_override: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             file_transfer_timeout_override: Mutex::new(None),
+            reaper_cmd_tx,
+            reaper: Mutex::new(Some(reaper_thread)),
         });
         shared.bootstrap_sessions(&load.profiles);
         let mgr = Arc::new(SessionManager {
@@ -5326,6 +5345,59 @@ impl SessionManager {
     #[cfg(feature = "test-fakes")]
     pub fn set_open_bridge_post_take_hook_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
         *lock(&self.shared.open_bridge_post_take_hook) = Some(hook);
+    }
+
+    /// 只供測試（test-fakes）：查詢 by_id 的保管帳本紀錄快照。
+    #[cfg(feature = "test-fakes")]
+    pub fn custody_for_test(&self, by_id: &str) -> Option<crate::custody::CustodySnapshot> {
+        lock(&self.shared.inner).custody.get_custody(by_id).map(|c| c.snapshot())
+    }
+
+    /// 只供測試（test-fakes）：查詢 token 的終態。
+    #[cfg(feature = "test-fakes")]
+    pub fn terminal_for_test(&self, token: u64) -> Option<crate::custody::Terminal> {
+        lock(&self.shared.inner).custody.terminals.get(&token).cloned()
+    }
+
+    /// 只供測試（test-fakes）：查詢 token 是否在 prepared 表中。
+    #[cfg(feature = "test-fakes")]
+    pub fn prepared_for_test(&self, token: u64) -> bool {
+        lock(&self.shared.inner).prepared.contains_key(&token)
+    }
+
+    /// 只供測試（test-fakes）：查詢 sid 是否有尚未送達的 DeviceAttached 義務。
+    #[cfg(feature = "test-fakes")]
+    pub fn delivery_obligation_for_test(&self, sid: &str) -> bool {
+        lock(&self.shared.inner).deliverer.obligations.contains_key(sid)
+    }
+
+    /// 只供測試（test-fakes）：查詢送達者對 sid 的嘗試次數。
+    #[cfg(feature = "test-fakes")]
+    pub fn delivery_attempts_for_test(&self, sid: &str) -> usize {
+        lock(&self.shared.inner).deliverer.attempts(sid)
+    }
+
+    /// 只供測試（test-fakes）：查詢 session 已退休的 epoch 集合。
+    #[cfg(feature = "test-fakes")]
+    pub fn retired_drains_for_test(&self, sid: &str) -> Vec<u64> {
+        let inner = lock(&self.shared.inner);
+        if let Some(entry) = inner.sessions.get(sid) {
+            if let Ok(res) = entry.actor.request(crate::session_core::SessionRequest::RetiredDrainsForTest, Duration::from_millis(500)) {
+                if let Some(PyValue::List(items)) = res.get("epochs") {
+                    return items.iter().filter_map(|v| match v {
+                        PyValue::Int(PyInt::Small(n)) => Some(*n as u64),
+                        _ => None,
+                    }).collect();
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// 只供測試（test-fakes）：設定下 n 次 actor spawn 注入失敗。
+    #[cfg(feature = "test-fakes")]
+    pub fn inject_actor_spawn_fail_for_test(&self, n: usize) {
+        crate::actor::inject_actor_spawn_fail(n);
     }
 
     /// 只供測試（test-fakes）：設定 `by_id` 下一次 `finish_attach_op` 取得 manager 鎖之前的一次性暫停點。
