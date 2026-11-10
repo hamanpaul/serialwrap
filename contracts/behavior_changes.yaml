@@ -1,6 +1,6 @@
 # 行為變更登記（BC／SC／DF）。由 P0-T5 建立，對應 docs/rust-refactor/plans/01-stage0-contracts.md T5 與調和表 spec-reconciliation.md §1。
-# BC-01～BC-05 依 OD-04 核准；SC-01～SC-32（SC-08 已依 OD-14 #3 撤回）與 SC-34～SC-37（SC-37 依 OD-21）、SC-39（OD-48）、DF-01～DF-25 依定稿規格、調和表與相關 OD 推導；SC-30、DF-18 由 P7 Task 0 登記（08 §0.5）；DF-23 依 OD-57、DF-24 依 OD-73 由 P7 登記；DF-25 依 OD-77 登記；SC-32 由 P8 Task 1 登記（09 §0.4，Rust-only）。
-# SC-33 依擁有者 OD-79 撤回、不登記（原列案例改列 SC-03），亦不新增 pending owner item 8；DF-26 保留給 OD-80（編排者 2026-11-07），SC-38 未佔用。
+# BC-01～BC-05 依 OD-04 核准；SC-01～SC-37（SC-08 已依 OD-14 #3 撤回、SC-33 已依 OD-79 撤回；SC-37 依 OD-21）、SC-39（OD-48）、DF-01～DF-25 依定稿規格、調和表與相關 OD 推導；SC-30、DF-18 由 P7 Task 0 登記（08 §0.5）；DF-23 依 OD-57、DF-24 依 OD-73 由 P7 登記；DF-25 依 OD-77 登記；SC-32 由 P8 Task 1 登記（09 §0.4，Rust-only）。
+# SC-33 依擁有者 OD-79 撤回（傳輸中途被拒回 AUTOBOOT_QUIET／COMMAND_ABORTED_IN_FLIGHT），編號保留不重用，亦不新增 pending owner item 8（原列案例改列 SC-03）；DF-26 保留給 OD-80（編排者 2026-11-07），SC-38 未佔用。
 # SC-08 依 OD-14 #3 撤回（UDS 維持 0660），編號保留不重用。
 # SC-11 交接排空窗口依 OD-16 (3) 擁有者接受（2026-10-22）：related_decisions、spec_refs、approval_conditions 已載明；owner_confirmation 維持 not_required、owner_item 不指派（擁有者佇列編號未定，見 spec-reconciliation SC-11 列），故不改動 pending 佇列與 tests/test_p1oc_catalog.py 釘定的 confirmed 清單。
 # 登錄時全部為 APPROVED（核准未實作）；實作後依狀態推進協定改為 IMPLEMENTED，VERIFIED 只由擁有者標記。

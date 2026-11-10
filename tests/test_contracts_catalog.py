@@ -1464,6 +1464,14 @@ def test_bc_real_rust_only_python_null() -> None:
     assert by_id["SC-25"].scope in {"rust_only", "python_when_manifest_present"}
 
 
+def test_sc33_withdrawn_per_od79() -> None:
+    """SC-33 依 OD-79 撤回：整筆自登記移除、編號保留不重用，其案例改列 SC-03，pending item 8 移除。"""
+    changes, confirmations, _ = _bc()
+    assert "SC-33" not in {c.id for c in changes}
+    assert all(o.item != 8 for o in confirmations)
+    assert not any("SC-33" in c.case_ids for c in changes)
+
+
 def test_bc_real_sc22_switch_guard_not_force_overridable() -> None:
     """SC-22 supervision-mode set 護欄不可由 --force 覆寫，且停止必經交接（R1-F3）。"""
     by_id = _bc_by_id()
