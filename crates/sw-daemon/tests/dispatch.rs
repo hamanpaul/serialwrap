@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use support::{BY_ID_A, BY_ID_B, REAL_A, REAL_B, RIG_PID, RigSpec, ServiceRig, wait_until};
 use sw_core::state_store::{LoadedState, ReleasedRow};
-use sw_pal::fakes::{FakeDevice, FakeSerialBackend};
+use sw_pal::fakes::{FakeDevice, FakeEnv, FakeSerialBackend};
 use sw_pal::proc_scan::{DaemonProc, ProcIdentity};
 use sw_pal::traits::{
     Clock, DeviceInfo, DevicePath, HolderReport, HolderScanStatus, OpenError, PalError,
@@ -8602,3 +8602,98 @@ fn df27_rpc_post_login_timeout_rejects_zero_tx_then_reprobes_ready() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// WP7-3：console unlock 的 reboot 前清 RX（G10，Low）端到端 RPC 驗證
+// 呼叫路徑：`Service::rpc(command.submit)` → `SubmitReq` → `SessionCore::submit`
+// → queue → `start_next` → `OpSpec::Command` → `OpRunner::run_command`
+// → `run_reboot`（清空 RX：若 `console_unlock_env` 已宣告，丟棄 `ctx.rx` 舊資料）
+// → UART 送出 reboot → prompt 逾時 → `OpOutcome::RebootExpected`
+// → `SessionCore::finish_command` → `reboot_recovery_tick` → `EnsureReady`
+// → `ensure_console_unlocked`：此時舊 prompt 已清，送出 unlock secret 解鎖。
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wp73_rpc_reboot_clears_rx_for_console_unlock_service_rig() {
+    const PROFILE: &str = "profiles:\n  cu:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    console_unlock_env: SW_T_UNLOCK\n    console_unlock_idle_s: 0.05\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: cu, device_by_id: /s/by-id/usb-A}\n";
+    let env = Arc::new(FakeEnv::default());
+    env.vars
+        .lock()
+        .unwrap()
+        .insert("SW_T_UNLOCK".to_string(), "dummy-unlock".to_string());
+    let spec = RigSpec {
+        yaml: PROFILE.to_string(),
+        devices: vec![(BY_ID_A.into(), REAL_A.into())],
+        explicit_target_count: 1,
+        allowlist: None,
+        wait_ready: vec!["COM0".into()],
+    };
+    let r = ServiceRig::build_with_env(spec, env);
+    let dev = r.device(REAL_A);
+    r.settle();
+
+    // 初始 attach 已進入 READY，此時 dev 已有 initial TX，RX 亦有舊的 root@t:/#。
+    // 模擬 DUT 重開機：清除預設回覆，只有在收到 "dummy-unlock" 時才回覆 prompt。
+    dev.clear_replies();
+    dev.on_tx_match(
+        r"dummy-unlock",
+        Box::new(|_| b"\r\nroot@t:/# ".to_vec()),
+    );
+    dev.on_tx_match(
+        r"__READY__[0-9a-f]+",
+        Box::new(|line: &[u8]| {
+            let text = String::from_utf8_lossy(line).into_owned();
+            let token = text
+                .split("__READY__")
+                .nth(1)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            format!("__READY__{token}\r\nroot@t:/# ").into_bytes()
+        }),
+    );
+
+    let tx_mark = dev.tx_len();
+    let response = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"reboot","timeout_s":1}"#,
+    );
+    assert_eq!(
+        response.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&response)
+    );
+    let cmd_id = s(&response, "cmd_id").to_string();
+    let mut record = PyDict::default();
+    wait_until("reboot 命令結案", || {
+        r.clock.advance(Duration::from_millis(100));
+        record = sub(
+            &r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#)),
+            "command",
+        );
+        !matches!(record.get("done_at"), None | Some(PyValue::Null))
+    });
+    assert_eq!(s(&record, "status"), "done", "{}", j(&record));
+    assert_eq!(
+        record.get("partial"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&record)
+    );
+
+    // 推進時鐘等待 recovery 完成並回到 READY
+    wait_until("session 恢復 READY", || {
+        r.clock.advance(Duration::from_millis(200));
+        r.session("COM0")
+            .and_then(|session| session.get("state").cloned())
+            == Some(PyValue::from("READY"))
+    });
+
+    let reboot_tx = String::from_utf8_lossy(&dev.tx_since(tx_mark)).into_owned();
+    assert!(
+        reboot_tx.contains("dummy-unlock"),
+        "reboot 後的 unlock 流程必須送出 unlock 密鑰，不得誤用舊 root prompt 作為證據；實際 TX: {reboot_tx:?}"
+    );
+}
+

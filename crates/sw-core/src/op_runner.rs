@@ -834,6 +834,10 @@ fn run_reboot(
 ) -> OpOutcome {
     let t = &ctx.profile.template;
     let command = q.req.command.as_str();
+    if t.console_unlock_env.as_deref().is_some_and(|s| !s.is_empty()) {
+        // G10（Python `session_manager.py:6421-6423`）：已重開的舊 root prompt 不可在 recovery 中被當成解鎖證據。
+        ctx.rx.clear();
+    }
     let pre_offset = ctx.rx.snapshot_len();
     let payload = command_payload(command);
     let report = send(

@@ -301,6 +301,7 @@ pub struct ServiceRig {
     pub registry: Arc<CommandRegistry>,
     pub devices: BTreeMap<String, FakeDevice>,
     pub version: String,
+    pub env: Arc<FakeEnv>,
     /// P6 Task 10：`with_console_backend` 的 console 替身工廠（其餘建構子為 `None`）。
     pub console: Option<Arc<RigPtyFactory>>,
     /// P8 Task 10：`with_flash` 的 flash 端點組件（其餘建構子為 `None`）。
@@ -317,6 +318,19 @@ impl ServiceRig {
         ServiceRig::build_with_console(spec, None)
     }
 
+    /// 以指定環境變數建構 rig，供憑證與 console unlock 測試使用。
+    pub fn build_with_env(spec: RigSpec, env: Arc<FakeEnv>) -> ServiceRig {
+        ServiceRig::build_with_code_identity(
+            spec,
+            None,
+            None,
+            Some("/fake/bundle".to_string()),
+            None,
+            LoadedState::default(),
+            Some(env),
+        )
+    }
+
     /// 以指定的載入狀態建構 rig；不需在 `RigSpec` 增加跨既有測試的必填欄位。
     pub fn build_with_loaded_state(spec: RigSpec, loaded: LoadedState) -> ServiceRig {
         ServiceRig::build_with_code_identity(
@@ -326,6 +340,7 @@ impl ServiceRig {
             Some("/fake/bundle".to_string()),
             None,
             loaded,
+            None,
         )
     }
 
@@ -342,6 +357,7 @@ impl ServiceRig {
             Some("/fake/bundle".to_string()),
             Some(serial_backend),
             loaded,
+            None,
         )
     }
 
@@ -376,6 +392,7 @@ impl ServiceRig {
             Some("/fake/bundle".to_string()),
             None,
             LoadedState::default(),
+            None,
         )
     }
 
@@ -391,6 +408,7 @@ impl ServiceRig {
             Some("/fake/bundle".to_string()),
             serial_backend,
             LoadedState::default(),
+            None,
         )
     }
 
@@ -401,7 +419,9 @@ impl ServiceRig {
         code_path: Option<String>,
         serial_backend: Option<Arc<dyn SerialBackend>>,
         loaded: LoadedState,
+        env: Option<Arc<FakeEnv>>,
     ) -> ServiceRig {
+        let env = env.unwrap_or_else(|| Arc::new(FakeEnv::default()));
         let serial = FakeSerialBackend::new();
         let mut devices = BTreeMap::new();
         let mut snapshot = Vec::new();
@@ -448,7 +468,7 @@ impl ServiceRig {
             loaded,
             load,
             clock: clock.clone(),
-            env: Arc::new(FakeEnv::default()),
+            env: env.clone(),
             fs: fs.clone(),
             warn: Arc::new(|_msg: String| {}),
         });
@@ -480,6 +500,7 @@ impl ServiceRig {
             registry,
             devices,
             version: RIG_VERSION.to_string(),
+            env,
             console,
             flash: None,
         };
@@ -519,6 +540,7 @@ impl ServiceRig {
             code_path.map(str::to_string),
             None,
             LoadedState::default(),
+            None,
         )
     }
 
@@ -568,6 +590,15 @@ impl ServiceRig {
             allowlist: None,
             wait_ready: Vec::new(),
         })
+    }
+
+    /// 設定環境變數（憑證與 console unlock 測試使用）。
+    pub fn set_env(&self, key: &str, value: &str) {
+        self.env
+            .vars
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_string(), value.to_string());
     }
 
     /// 呼叫 `Service::rpc`（`params_json` 為 JSON 物件文字）；`Err` 時 panic。
@@ -950,6 +981,7 @@ impl ServiceRig {
             registry,
             devices,
             version: RIG_VERSION.to_string(),
+            env: Arc::new(FakeEnv::default()),
             console: None,
             flash: Some(FlashParts {
                 state,

@@ -813,6 +813,20 @@ impl FakeDevice {
             .push((regex, reply));
         check_tx_triggers_and_matches(&self.inner);
     }
+
+    /// 清除所有已註冊的 trigger replies 與 regex matches（測試模擬 DUT 狀態切換用）。
+    pub fn clear_replies(&self) {
+        self.inner
+            .tx_replies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.inner
+            .tx_matches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
 }
 
 /// 替身的 `UartExclusive`（Task 1 Produces）：`report` 由測試預先注入，`probe_holders` 回傳對應報告。

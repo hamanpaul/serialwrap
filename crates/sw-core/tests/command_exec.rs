@@ -4588,3 +4588,61 @@ fn wp55_submit_time_trust_matrix() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// WP7-3：console unlock 的 reboot 前清 RX（G10，Low）
+// 對照 Python `sw_core/session_manager.py:6421-6423`：
+//   if session.profile.console_unlock_env:
+//       # 已重開的舊 root prompt 不可在 recovery 中被當成解鎖證據。
+//       bridge.clear_rx_buffer()
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wp73_reboot_clears_rx_for_console_unlock_avoids_stale_prompt_evidence() {
+    const PROFILE: &str = "profiles:\n  cu:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    console_unlock_env: SW_T_UNLOCK\n    console_unlock_idle_s: 0.05\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: cu, act_no: 1, alias: cu+1, device_by_id: /s/by-id/usb-A}\n";
+    let h = ActorRig::new(PROFILE);
+    h.set_env("SW_T_UNLOCK", "secret123");
+    let h = h.ready();
+    // 初始 attach 時，假 DUT 回覆 prompt，此時 h.rx 中留有舊的 root prompt。
+    assert!(h.rx.tail(100).contains("root@t:"));
+
+    // 模擬 DUT 重開機：清除對一般 \n 的預設回覆；
+    // DUT 在收到 reboot 後進入靜默（超過 console_unlock_idle_s），只有在收到 unlock 密鑰時才回覆 prompt。
+    h.dev.clear_replies();
+    h.dev.on_tx_match(
+        r"secret123",
+        Box::new(|_| b"\r\nroot@t:/# ".to_vec()),
+    );
+    h.dev.on_tx_match(
+        r"__READY__[0-9a-f]+",
+        Box::new(|line: &[u8]| {
+            let text = String::from_utf8_lossy(line).into_owned();
+            let token = text
+                .split("__READY__")
+                .nth(1)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            format!("__READY__{token}\r\nroot@t:/# ").into_bytes()
+        }),
+    );
+
+    let id = h.submit_ok("reboot");
+    wait_tx(&h, b"reboot\n");
+    advance_until(&h, Duration::from_millis(100), "reboot 收尾", |h| {
+        is_done(h, &id)
+    });
+    h.wait_state("RECOVERING");
+
+    // 推進時鐘以越過 boot quiet window (2.0s) 與 console_unlock_idle_s (0.05s)
+    advance_until(&h, Duration::from_millis(200), "恢復 READY", |h| {
+        state_of(h) == "READY"
+    });
+
+    let tx = String::from_utf8_lossy(&h.dev.take_tx()).into_owned();
+    assert!(
+        tx.contains("secret123"),
+        "reboot 後的 unlock 流程必須送出 unlock 密鑰，不得誤用舊 root prompt 當作解鎖證據；實際 TX: {tx:?}"
+    );
+}
+
