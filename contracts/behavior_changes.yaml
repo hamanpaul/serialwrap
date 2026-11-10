@@ -1,6 +1,6 @@
 # 行為變更登記（BC／SC／DF）。由 P0-T5 建立，對應 docs/rust-refactor/plans/01-stage0-contracts.md T5 與調和表 spec-reconciliation.md §1。
-# BC-01～BC-05 依 OD-04 核准；SC-01～SC-37（SC-08 已依 OD-14 #3 撤回、SC-33 已依 OD-79 撤回；SC-37 依 OD-21）、SC-39（OD-48）、DF-01～DF-25 依定稿規格、調和表與相關 OD 推導；SC-30、DF-18 由 P7 Task 0 登記（08 §0.5）；DF-23 依 OD-57、DF-24 依 OD-73 由 P7 登記；DF-25 依 OD-77 登記；SC-32 由 P8 Task 1 登記（09 §0.4，Rust-only）。
-# SC-33 依擁有者 OD-79 撤回（傳輸中途被拒回 AUTOBOOT_QUIET／COMMAND_ABORTED_IN_FLIGHT），編號保留不重用，亦不新增 pending owner item 8（原列案例改列 SC-03）；DF-26 保留給 OD-80（編排者 2026-11-07），SC-38 未佔用。
+# BC-01～BC-05 依 OD-04 核准；SC-01～SC-37（SC-08 已依 OD-14 #3 撤回、SC-33 已依 OD-79 撤回；SC-37 依 OD-21）、SC-39（OD-48）、DF-01～DF-27 依定稿規格、調和表與相關 OD 推導；SC-30、DF-18 由 P7 Task 0 登記（08 §0.5）；DF-23 依 OD-57、DF-24 依 OD-73 由 P7 登記；DF-25 依 OD-77 登記；DF-26 依 OD-80 登記；DF-27 依 OD-81 登記；SC-32 由 P8 Task 1 登記（09 §0.4，Rust-only）。
+# SC-33 依擁有者 OD-79 撤回（傳輸中途被拒回 AUTOBOOT_QUIET／COMMAND_ABORTED_IN_FLIGHT），編號保留不重用，亦不新增 pending owner item 8（原列案例改列 SC-03）；DF-26 依 OD-80 登記，SC-38 未佔用。
 # SC-08 依 OD-14 #3 撤回（UDS 維持 0660），編號保留不重用。
 # SC-11 交接排空窗口依 OD-16 (3) 擁有者接受（2026-10-22）：related_decisions、spec_refs、approval_conditions 已載明；owner_confirmation 維持 not_required、owner_item 不指派（擁有者佇列編號未定，見 spec-reconciliation SC-11 列），故不改動 pending 佇列與 tests/test_p1oc_catalog.py 釘定的 confirmed 清單。
 # 登錄時全部為 APPROVED（核准未實作）；實作後依狀態推進協定改為 IMPLEMENTED，VERIFIED 只由擁有者標記。
@@ -1775,6 +1775,33 @@ changes:
     compatibility_impact: "互動租約開著時，取消若落在該次輸入已送出、命令尚未返回的瞬間，Python 0.4.0 現行行為會把 interactive:<id> 永久加入 revoke ledger，同一租約之後每次 interactive-send 都回 SESSION_BUSY，直到租約逾時。修正後取消只撤銷原命令的 op，lease 續用、後續 send 照常送達；提交前（開 lease 前、fence 提交前）的取消仍零 TX 並回 FLUSHED_BY_RECOVERY。"
     approval_conditions: "涵蓋 TX 完成後、執行器返回前的取消：lease 仍存活，後續兩次 interactive-send 皆 ok 並送達 UART；提交前取消維持零 TX 且不遺留 lease。Python 與 Rust 都須符合（OD-77 B1），Rust 補回歸測試。"
     related_decisions: ["OD-77"]
+  - id: "DF-26"
+    kind: "DF"
+    title: "檔案拉取不依賴 131072 字元 RX 視窗上限（Python 受限、Rust 不受限）"
+    status: "APPROVED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-11-06"
+      decision_ref: "OD-80"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.1"
+      rust:
+        stage: "slice-2.4"
+    approved_at_revision: 11
+    spec_refs: ["§11.6"]
+    reconciliation_refs: ["EVT-D-F4"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P8"]
+    case_ids: ["f7-larger-file-not-truncated"]
+    compatibility_impact: "Python 基線（sw_core/file_transfer.py:386-398 與 sw_core/uart_io.py:358, 1671）：pull_file 一次性等待 prompt 後以 bridge.rx_text_from(pre) 取回全段輸出，受限於 UARTBridge._rx_max_chars=131072 字元視窗；當傳輸內容超過 131072 字元（約 96 KiB raw）時，視窗前端的 BEGIN sentinel 被修剪，extract_between_sentinels 解析失敗回 PULL_PARSE_FAILED（案例 f7-larger-file-not-truncated 於 Python 預期 SKIP）。Rust 重構（crates/sw-core/src/file_transfer.rs:480-514 collect_until_prompt）採分段輪詢並搬移已到達行至本地緩衝，不依賴 RX 視窗大小，大檔（含 1 MB）pull 可正常完成。對外差異：大於 131072 字元的大檔 pull 在 Python 失敗（PULL_PARSE_FAILED），在 Rust 成功。"
+    approval_conditions: "涵蓋 131072 字元視窗跨界的大檔 pull：Python 0.4.0 維持現行行為或於 0.4.1 雙邊修正；Rust 在 pull 大於視窗之檔案時（如 1 MB）不依賴單一視窗容量，成功完成 base64 解碼與 checksum 驗證，不回 PULL_PARSE_FAILED。案例 f7-larger-file-not-truncated 改列本條目，不採 XFAIL。"
+    related_decisions: ["OD-80"]
   - id: "DF-27"
     kind: "DF"
     title: "登入後命令逾時後的退避重探（Python 維持 DETACHED、Rust 沿用退避重探回 READY）"

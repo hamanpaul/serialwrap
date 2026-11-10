@@ -487,6 +487,15 @@ def test_df25_case_registration():
 
 
 @pytest.mark.memory_only
+def test_f7_larger_file_not_truncated_has_df26():
+    cases_data = _load_cases()
+    matches = [c for c in cases_data.get("cases", []) if c.get("case_id") == "f7-larger-file-not-truncated"]
+    assert len(matches) == 1, f"f7-larger-file-not-truncated 必須恰好存在一筆，實際找到 {len(matches)} 筆"
+    c = matches[0]
+    assert c.get("behavior_changes") == ["DF-26"], f"behavior_changes 必須為 ['DF-26']，實際為 {c.get('behavior_changes')}"
+
+
+@pytest.mark.memory_only
 def test_invariants_from_spec_only():
     cases_data = _load_cases()
     invariant_ids = set(cases_data.get("invariant_ids") or [])

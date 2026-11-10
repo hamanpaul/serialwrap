@@ -14,7 +14,7 @@
 #   - s24-*（P8 Task 1）：suite 新增 rust-l1、family 新增 S24（schema 列舉只增不改）；SC-33 依 OD-79 撤回，原列 SC-33 的案例改列 SC-03；
 #     s24-xfer-abort-on-release 依 OD-62 比照 BC-03；source_ref／evidence 中尚未建立的節點由承接 Task 依此命名建立。
 schema_version: 1
-revision: 2026-11-10.2
+revision: 2026-11-10.3
 spec: docs/rust-refactor/serialwrap-rust-spec-final.md
 invariant_ids: [zero_tx_on_reject, no_forbidden_interleave, no_stale_context_replay, no_reopen_before_handoff, no_auto_resend, insufficient_evidence_not_pass]
 features:
@@ -668,7 +668,7 @@ cases:
   prerequisites: [file_transfer]
   necessity: conditional
   issues: ['#21', '#161', '#166']
-  behavior_changes: []
+  behavior_changes: [DF-26]
   destructive: false
   expected: PASS
   sentinel: null

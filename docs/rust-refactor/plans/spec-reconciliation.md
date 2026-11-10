@@ -449,7 +449,7 @@ P1 T02～T05 原定交付 `contracts/golden/wal/*.json`，但該計畫未產生�
 | EVT-D-F1 | `chunk_size` 為 0 或負數時的強制轉型 | — | KEEP | 基線 | P8 | no |
 | EVT-D-F2 | file 類 CLI 預設 timeout 5 s（#123） | — | KEEP | 已知缺口 | P3 | no |
 | EVT-D-F3 | MOVE 失敗不清理暫存檔 | — | KEEP | 基線 | P8 | no |
-| EVT-D-F4 | pull 受 131072 字元 RX 視窗限制（F7 `f7-larger-file-not-truncated` 的 1 MB pull 因此 `PULL_PARSE_FAILED`） | §11.6 | FIX（OD-80；原 KEEP） | 擁有者 2026-11-06 裁決（OD-80，`reviews/rulings/s2.md`）：登記 DF，讓 pull 不依賴 131072 字元視窗，不採 XFAIL；編號 DF-26 保留給本列（編排者 2026-11-07 裁決），登記與 Python 側修正不在 P8 Task 1；Rust 引擎 P8 Task 4 已分段讀取（`file_transfer_engine.rs::pull_over_rx_window_succeeds_od80`） | P8 | yes（已裁決 OD-80，2026-11-06） |
+| EVT-D-F4 | pull 受 131072 字元 RX 視窗限制（F7 `f7-larger-file-not-truncated` 的 1 MB pull 因此 `PULL_PARSE_FAILED`） | §11.6 | FIX（OD-80；原 KEEP） | 擁有者 2026-11-06 裁決（OD-80，`reviews/rulings/s2.md`）：登記 DF，讓 pull 不依賴 131072 字元視窗，不採 XFAIL；已依 OD-80 登記為 DF-26；Rust 引擎 P8 Task 4 已分段讀取（`file_transfer_engine.rs::pull_over_rx_window_succeeds_od80`） | P8 | yes（已裁決 OD-80，2026-11-06） |
 | EVT-D-F5 | 非 strict base64 解碼 | — | KEEP | `a2b_base64_lenient` | P8 | no |
 | EVT-D-F6 | file transfer 不排隊，直接回 `SESSION_BUSY` | §5.2.1 | KEEP | 基線 | P8 | no |
 | XFER-ABORT-01 | release／recover／shutdown 中止進行中的 file transfer：0.3.2 依時序回 `TRANSFER_TIMEOUT`、`MOVE_TIMEOUT`、`CHECKSUM_VERIFY_FAILED`、`TARGET_DECODER_FAILED` 或例外；S1X-a-4 起 Python 以 `_file_tx_rejected_result` 映射傳輸中被拒的 TX | §5.3「Recovery 清除未執行命令／中止已確認部分 TX」 | KEEP（OD-62 已裁決：比照 BC-03） | 擁有者 2026-10-29 裁決 (a)（OD-62，`reviews/rulings/s1.md`）：drain、世代過期或取消且尚未寫出任何 byte → `FLUSHED_BY_RECOVERY`；已寫出至少 1 byte → `COMMAND_ABORTED_IN_FLIGHT`（push 附 `chunks_sent`／`chunks_total`），並比照一般命令寫 WAL META `command_aborted_in_flight`（`cmd_id` 為傳輸前綴 `ft-<8hex>`、`confirmed_tx_bytes` 為整段累計；s1 rulings 第 41、43 列）；結果不明等其餘情形維持傳輸自身結束碼；一律不自動重送。main 的 Python 基線已實作，Rust 逐字承接；09 §0.4 原稿「Rust 一律回 framing `EXCEPTION`」作廢。契約已記於 BC-03／SC-04 的 compatibility_impact，本列不另登記；案例 `s24-xfer-abort-on-release` | S1X-a/P8 | yes（已裁決 OD-62，2026-10-29） |
@@ -560,7 +560,7 @@ P6 Task 0 對上表的影響（2026-10-24）：§2.6 新增 KEEP＋DOC 三列 CO
 
 P7 Task 0 對本節的影響（2026-10-26）：§1.1 新增 SC-30、§1.2 新增 DF-18（皆為登記項，非 §2 調和列），上表列數不變（合計 302 列）；SC-11 列補 Event Engine 停止序細化一句。
 
-P8 Task 1 對本節的影響（2026-11-08）：§2.9 新增 KEEP 列 XFER-ABORT-01（OD-62）與 MCU-STATUS-01；EVT-D-F4 依 OD-80 由 KEEP 改 FIX（DF-26 保留、尚未登記）。上表已依此重算：KEEP 由 151 列變為 152 列、FIX 由 26 列增為 27 列，合計 304 列。§1.1 新增 SC-32（登記項，Rust-only）與 SC-33 撤回註記（OD-79），皆非 §2 調和列；§3.1 記錄 09 §0.4 三項 needs-owner 的裁決。
+P8 Task 1 對本節的影響（2026-11-08）：§2.9 新增 KEEP 列 XFER-ABORT-01（OD-62）與 MCU-STATUS-01；EVT-D-F4 依 OD-80 由 KEEP 改 FIX（已登記為 DF-26）。上表已依此重算：KEEP 由 151 列變為 152 列、FIX 由 26 列增為 27 列，合計 304 列。§1.1 新增 SC-32（登記項，Rust-only）與 SC-33 撤回註記（OD-79），皆非 §2 調和列；§3.1 記錄 09 §0.4 三項 needs-owner 的裁決。
 
 ## 6. P3 登記：Rust-only 非契約差異（arch §0.7）
 
