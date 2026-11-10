@@ -2346,6 +2346,339 @@ fn wp51_source_policy_end_to_end() {
     assert_eq!(s(&released, "source_normalized_from"), "human");
 }
 
+// WP6-1 第 1 項：RPC bare human 逾時升格的 ServiceRig 規格（OD-74、rulings s2 D5）。
+// 呼叫路徑：Service::rpc(command.submit) 以原始 source 填 SubmitReq.trusted_human → SessionManager route →
+// SessionCore::submit／queue → OpRunner 送命令並逾時 → SessionCore 結案與 lease → command.get／interactive_status；
+// FakeDevice 與 WAL 同時檢查命令和任何不帶 cmd_id 的救援 TX。
+
+fn wp61_decode_b64(value: &str) -> Vec<u8> {
+    fn digit(byte: u8) -> u8 {
+        match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => panic!("WAL payload_b64 字元無效：{byte}"),
+        }
+    }
+
+    let mut decoded = Vec::new();
+    for chunk in value.as_bytes().chunks_exact(4) {
+        let a = digit(chunk[0]);
+        let b = digit(chunk[1]);
+        let c = if chunk[2] == b'=' { 0 } else { digit(chunk[2]) };
+        let d = if chunk[3] == b'=' { 0 } else { digit(chunk[3]) };
+        decoded.push((a << 2) | (b >> 4));
+        if chunk[2] != b'=' {
+            decoded.push((b << 4) | (c >> 2));
+        }
+        if chunk[3] != b'=' {
+            decoded.push((c << 6) | d);
+        }
+    }
+    assert_eq!(value.len() % 4, 0, "WAL payload_b64 長度無效：{value}");
+    decoded
+}
+
+/// 讀取指定 WAL 序號之後的全部 TX，不以命令 cmd_id 過濾救援鍵。
+fn wp61_wal_tx_since(r: &ServiceRig, after_seq: u64) -> Vec<(String, Vec<u8>)> {
+    let bytes = r.wfs.contents(WP55_WAL.as_ref()).unwrap_or_default();
+    String::from_utf8(bytes)
+        .expect("WAL 應為 UTF-8")
+        .lines()
+        .filter_map(|line| {
+            let PyValue::Dict(record) = sw_proto::pyjson::loads(line).expect("WAL 行應為 JSON")
+            else {
+                panic!("WAL 行應為 object：{line}");
+            };
+            let seq = record
+                .get("seq")
+                .and_then(PyValue::as_i64)
+                .expect("WAL seq 應為整數");
+            (seq > after_seq as i64 && record.get("dir") == Some(&PyValue::from("TX"))).then(|| {
+                (
+                    s(&record, "source").to_string(),
+                    wp61_decode_b64(s(&record, "payload_b64")),
+                )
+            })
+        })
+        .collect()
+}
+
+struct Wp61TimeoutEvidence {
+    cmd_id: String,
+    record: PyDict,
+    uart_tx: Vec<u8>,
+    wal_tx: Vec<(String, Vec<u8>)>,
+}
+
+/// 先確認命令已寫上假 UART，再以小步 FakeClock 推進到終態；每步留出 actor 的真實排程時間。
+fn wp61_submit_timeout(
+    r: &ServiceRig,
+    raw_source: &str,
+    command: &str,
+    annotation: Option<(&str, &str)>,
+    source_class: &str,
+    reply_on_ctrl_c: bool,
+) -> Wp61TimeoutEvidence {
+    let dev = r.device(REAL_A);
+    r.settle();
+    if reply_on_ctrl_c {
+        dev.on_tx_reply(b"\x03", b"\r\nroot@t:/# ");
+    }
+    let tx_mark = dev.tx_len();
+    let wal_seq = r.wal.current_seq();
+    let params =
+        format!(r#"{{"selector":"COM0","cmd":"{command}","source":"{raw_source}","timeout_s":1}}"#);
+    let response = r.call("command.submit", &params);
+    assert_eq!(
+        response.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{raw_source}：{}",
+        j(&response)
+    );
+    let cmd_id = s(&response, "cmd_id").to_string();
+    assert_eq!(
+        j(&response),
+        wp51_submit_success_response(
+            r,
+            &cmd_id,
+            annotation.map(|(source, _)| source),
+            annotation.map(|(_, from)| from),
+            source_class,
+        ),
+        "{raw_source}：成功回應"
+    );
+    let command_line = format!("{command}\n");
+    wait_until(&format!("{raw_source} 命令 TX"), || {
+        dev.tx_since(tx_mark).starts_with(command_line.as_bytes())
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let record = loop {
+        let record = sub(
+            &r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#)),
+            "command",
+        );
+        if record
+            .get("done_at")
+            .is_some_and(|done_at| !done_at.is_null())
+        {
+            break record;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "等待 {raw_source} 命令逾時終態：{}",
+            j(&record)
+        );
+        r.clock.advance(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(80));
+    };
+
+    Wp61TimeoutEvidence {
+        cmd_id,
+        record,
+        uart_tx: dev.tx_since(tx_mark),
+        wal_tx: wp61_wal_tx_since(r, wal_seq),
+    }
+}
+
+#[test]
+fn wp61_rpc_bare_human_timeout_promotes_without_keys() {
+    let mut outcomes = Vec::new();
+    for raw_source in ["human", "human:"] {
+        // 每個原始來源各用新 rig，避免 lease 或 UART / WAL 狀態互相影響。
+        let r = ServiceRig::ready_shell();
+        let evidence = wp61_submit_timeout(
+            &r,
+            raw_source,
+            "vim notes.txt",
+            Some(("human:cli", raw_source)),
+            "human",
+            false,
+        );
+        outcomes.push((raw_source, evidence, r));
+    }
+
+    for (raw_source, evidence, r) in outcomes {
+        assert_eq!(
+            s(&evidence.record, "status"),
+            "interactive",
+            "{}",
+            j(&evidence.record)
+        );
+        assert_eq!(
+            s(&evidence.record, "execution_mode"),
+            "interactive",
+            "{}",
+            j(&evidence.record)
+        );
+        assert_eq!(evidence.record.get("partial"), Some(&PyValue::Bool(true)));
+        assert_eq!(s(&evidence.record, "stdout"), "");
+        assert_eq!(
+            s(&evidence.record, "recovery_action"),
+            "PROMOTE_HUMAN_INTERACTIVE",
+            "{}",
+            j(&evidence.record)
+        );
+        let interactive_id = s(&evidence.record, "interactive_session_id");
+        let lease = r.call(
+            "session.interactive_status",
+            &format!(r#"{{"interactive_id":"{interactive_id}"}}"#),
+        );
+        assert_eq!(s(&lease, "owner"), "human:cli", "{raw_source} lease owner");
+        let public = r.call(
+            "session.self_test",
+            r#"{"selector":"COM0","strict_human_lock":true}"#,
+        );
+        assert_eq!(
+            public.get("interactive_owner"),
+            Some(&PyValue::from("human:cli")),
+            "{raw_source} 公開 interactive_owner：{}",
+            j(&public)
+        );
+        let command_line = b"vim notes.txt\n";
+        assert_eq!(
+            evidence.uart_tx, command_line,
+            "{raw_source} UART TX 不得含救援鍵"
+        );
+        let wal_tx: Vec<u8> = evidence
+            .wal_tx
+            .iter()
+            .flat_map(|(_, payload)| payload.iter().copied())
+            .collect();
+        assert_eq!(
+            wal_tx, command_line,
+            "{raw_source} WAL 所有 TX（含無 cmd_id 的救援 TX）不得含 CTRL-C／D；cmd_id={}",
+            evidence.cmd_id
+        );
+    }
+}
+
+/// 驗證明確 agent 來源在逾時後走 CTRL-C，且救援 TX 以 system:recover WAL 記錄。
+fn assert_wp61_ctrl_c_recovery(
+    evidence: &Wp61TimeoutEvidence,
+    public: &PyDict,
+    command: &str,
+    source_class: &str,
+) {
+    assert_eq!(
+        s(&evidence.record, "status"),
+        "done",
+        "{}",
+        j(&evidence.record)
+    );
+    assert_eq!(
+        s(&evidence.record, "recovery_action"),
+        "CTRL_C",
+        "{}",
+        j(&evidence.record)
+    );
+    assert_eq!(s(&evidence.record, "source_class"), source_class);
+    assert_eq!(
+        public.get("interactive_owner"),
+        Some(&PyValue::Null),
+        "不可升格 lease：{}",
+        j(public)
+    );
+    let expected = [command.as_bytes(), b"\n", b"\x03"].concat();
+    assert_eq!(evidence.uart_tx, expected, "UART 僅送命令及 CTRL-C");
+    let wal_tx: Vec<u8> = evidence
+        .wal_tx
+        .iter()
+        .flat_map(|(_, payload)| payload.iter().copied())
+        .collect();
+    assert_eq!(wal_tx, expected, "WAL 全部 TX（含無 cmd_id 的救援 TX）");
+    assert!(
+        evidence
+            .wal_tx
+            .iter()
+            .any(|(source, payload)| source == "system:recover" && payload == b"\x03"),
+        "WAL 必須包含未依命令 cmd_id 篩選的 system:recover CTRL-C：{:?}",
+        evidence.wal_tx
+    );
+    assert!(!wal_tx.contains(&0x04), "WAL 不得含 CTRL-D");
+}
+
+#[test]
+fn wp61_rpc_explicit_human_cli_timeout_uses_agent_recovery() {
+    for raw_source in ["human:cli", "human:x"] {
+        let r = ServiceRig::ready_shell();
+        let command = "printf 'broken";
+        let evidence = wp61_submit_timeout(&r, raw_source, command, None, "human", true);
+        let public = r.call(
+            "session.self_test",
+            r#"{"selector":"COM0","strict_human_lock":true}"#,
+        );
+        assert_wp61_ctrl_c_recovery(&evidence, &public, command, "human");
+    }
+}
+
+#[test]
+fn wp61_rpc_unknown_prefix_timeout_uses_agent_recovery() {
+    let r = ServiceRig::ready_shell();
+    let command = "printf 'broken";
+    let evidence = wp61_submit_timeout(&r, "codex", command, None, "agent", true);
+    let public = r.call(
+        "session.self_test",
+        r#"{"selector":"COM0","strict_human_lock":true}"#,
+    );
+    assert_wp61_ctrl_c_recovery(&evidence, &public, command, "agent");
+}
+
+#[test]
+fn wp61_rpc_system_recover_rejected_without_effects() {
+    let r = ServiceRig::ready_shell();
+    r.settle();
+    let dev = r.device(REAL_A);
+    let session_id = r.mgr.resolve("COM0").expect("COM0 session");
+    let before_effects = r.side_effect_fingerprint();
+    let before_session = r.session("COM0").expect("session 前態");
+    let before_registry = r.registry.len();
+    let before_pending = r.registry.pending(&session_id);
+    let before_queue = r.mgr.session_queue_lens("COM0");
+    let before_uart = dev.tx_since(0);
+    let before_wal = r.wfs.contents(WP55_WAL.as_ref()).expect("WAL 初始內容");
+    let before_open_attempts = dev.open_attempts();
+
+    let response = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"echo source-policy","source":"system:recover"}"#,
+    );
+    r.settle();
+
+    assert_eq!(
+        j(&response),
+        wp51_source_reserved_response(&r, "system:recover"),
+        "保留來源必須逐位元組回覆 SOURCE_RESERVED"
+    );
+    assert_eq!(
+        r.side_effect_fingerprint(),
+        before_effects,
+        "WAL／state／UART 副作用"
+    );
+    assert_eq!(r.session("COM0").expect("session 後態"), before_session);
+    assert_eq!(r.registry.len(), before_registry, "不得增加 registry 紀錄");
+    assert_eq!(
+        r.registry.pending(&session_id),
+        before_pending,
+        "不得增加 pending"
+    );
+    assert_eq!(
+        r.mgr.session_queue_lens("COM0"),
+        before_queue,
+        "不得增加 queue"
+    );
+    assert_eq!(dev.tx_since(0), before_uart, "不得新增 UART TX");
+    assert_eq!(
+        r.wfs.contents(WP55_WAL.as_ref()).expect("WAL 後態"),
+        before_wal,
+        "不得新增 WAL 記錄"
+    );
+    assert_eq!(dev.open_attempts(), before_open_attempts, "不得重開裝置");
+}
+
 #[test]
 fn submit_bad_timeout_raises_before_selector_check() {
     let r = ServiceRig::ready_shell();
