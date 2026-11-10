@@ -8281,3 +8281,324 @@ fn wp510_review7_rpc_confirmed_close_allows_reopen() {
     );
     wait_until("確認關閉後可再次開埠", || dev.open_attempts() > attempts);
 }
+
+// ---------------------------------------------------------------------------
+// OD-81／DF-27 第 6 項：登入後命令逾時的重探 RPC 端到端（docs/rust-refactor/reviews/rulings/s2.md「OD-81」）。
+//
+// Python 基線：`_attach_by_id` 的 ensure_ready 回 `POST_LOGIN_CMD_TIMEOUT`（`origin/main:sw_core/login_fsm.py:174`）→ 關
+// bridge、DETACHED；`_is_reprobe_prompt_error`（`origin/main:sw_core/session_manager.py:2112-2136`）不含此碼 → 永不重探；
+// 期間 agent `command.submit` 經 `_resolve_session_id` 回 `{"ok":false,"error_code":"SESSION_NOT_READY","session":…}`
+// （`origin/main:sw_core/service.py:793`）。DF-27：Rust 沿用既有退避重探並回 READY（Python 依 OD-75 不改）。
+//
+// 呼叫路徑：熱插 `SessionManager::update_devices` → DeviceAttached → `Effect::OpenBridge` → 開橋成功 →
+// `Effect::StartLogin` → `ManagerExec::start_login`（登入執行緒）→ `login_fsm::run_login_plan`／`ensure_ready` →
+// `finalize_ready`（post_login_cmd 逾時 → `POST_LOGIN_CMD_TIMEOUT`）→ `ControlEvent::LoginFinished` →
+// `SessionCore::login_finished`（`Failed` → `begin_stop(StopKind::LoginFailed)`）→ drain／stop receipt → DETACHED →
+// actor 依 FakeClock 每秒 Tick → `reprobe_tick` → `reprobe::prepare`（`is_reprobe_prompt_error` 納入此碼）→
+// `ReprobeAction::Attach` → `Effect::OpenBridge`／`StartLogin` → READY。拒絕：`Service::rpc("command.submit")` →
+// session gate（非 READY）→ 同步回應、不進 actor queue、UART／WAL／registry／state.json 皆不變。
+// ---------------------------------------------------------------------------
+
+/// 需帳密登入（帳密來自 env_file）的 shell profile：prompt 刻意與 `install_shell_replies` 的 `root@t` 不同，使替身
+/// 預設的一次性 `\n` → `root@t:/# ` 應答不被當成 prompt，登入必走 login／password 分支（`maybe_login` 成功後清 RX
+/// 視窗），post_login_cmd 的 prompt 等待因此只看 `sh` 之後的 RX。
+const DF27_YAML: &str = "profiles:\n  c:\n    platform: shell\n    prompt_regex: '(?m)^df27@t:.*# '\n    login_regex: '(?m)login: ?$'\n    password_regex: '(?m)Password: ?$'\n    user_env: SW_DF27_U\n    pass_env: SW_DF27_P\n    env_file: /fake/df27.env\n    post_login_cmd: sh\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: c, device_by_id: /s/by-id/usb-A}\n";
+const DF27_ENV_FILE: &str = "/fake/df27.env";
+const DF27_PROMPT: &[u8] = b"\r\ndf27@t:/# ";
+const DF27_CODE: &str = "POST_LOGIN_CMD_TIMEOUT";
+
+fn df27_field(r: &ServiceRig, key: &str) -> PyValue {
+    r.session("COM0")
+        .and_then(|session| session.get(key).cloned())
+        .unwrap_or(PyValue::Null)
+}
+
+/// 逐秒推進 FakeClock（一次跳多秒只合併成一個 Tick），每步等背景穩定後檢查；回傳第一個使 `cond` 成立的 session
+/// 快照，`max_s` 秒內不成立則 panic。注意 ServiceRig 的 FakeClock 為非 threaded：登入執行緒等待 prompt 時會自行以
+/// 10 ms 切片推進，故登入在途期間的時間欄位不固定，斷言一律針對回傳的同一份快照。
+fn df27_advance_until(
+    r: &ServiceRig,
+    max_s: u64,
+    what: &str,
+    mut cond: impl FnMut(&PyDict) -> bool,
+) -> PyDict {
+    for _ in 0..=max_s {
+        let session = r.session("COM0").expect("COM0 session");
+        if cond(&session) {
+            return session;
+        }
+        r.clock.advance(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(25));
+        r.settle();
+    }
+    panic!(
+        "{max_s} s 內未達成：{what}；session={}",
+        j(&r.session("COM0").expect("COM0 session"))
+    );
+}
+
+/// agent `command.submit` 在 DETACHED 時的拒絕：回應以 RPC_WIRE 逐位元組等於 Python `service.py:793` 形狀
+/// （session 取自同一時刻的 `session.get_state`），且 UART／WAL／registry／queue／state.json 全不變。只用於無登入
+/// 執行緒在途的 DETACHED 窗口（時鐘不自行推進，session 投影穩定）。
+fn df27_assert_rejected_zero_tx(r: &ServiceRig, marker: &str) {
+    r.settle();
+    let session = r.session("COM0").expect("COM0 session");
+    let expected = sw_proto::pydict! {
+        "ok" => false,
+        "error_code" => "SESSION_NOT_READY",
+        "session" => PyValue::Dict(session),
+        "version" => r.version.clone(),
+    };
+    assert_wp52_rpc_rejected_without_side_effects(
+        r,
+        &format!(
+            r#"{{"selector":"COM0","cmd":"echo {marker}","source":"agent:df27","timeout_s":5}}"#
+        ),
+        &j(&expected),
+    );
+}
+
+/// 對照 `tests/contract_blackbox/test_p7_latency_noise.py::test_df27_rust_post_login_timeout_reprobes_ready`（真實
+/// daemon 黑箱）與 `crates/sw-core/tests/session_core_reprobe_p7.rs::df27_failed_login_drains_then_retries_to_ready`
+/// （核心）：真 `SessionManager`＋`Service` 上，熱插 attach 登入的 post_login_cmd 逾時 → DETACHED＋`POST_LOGIN_CMD_TIMEOUT`；
+/// 兩個 DETACHED 窗口（首次失敗後、退避中）的 agent 提交以 Python 形狀逐位元組拒絕且零副作用，重探開橋在途（ATTACHING）
+/// 的提交亦以 SESSION_NOT_READY 拒絕；第一次重探（attempt 1）仍逾時 → 回 DETACHED 並排定退避；修好 DUT 後第二次重探回
+/// READY 並重置進度，之後 agent 命令真正寫到 UART；三筆被拒命令全程未出現在 UART。
+#[test]
+fn df27_rpc_post_login_timeout_rejects_zero_tx_then_reprobes_ready() {
+    use std::sync::atomic::AtomicBool;
+    use sw_pal::traits::FsOps;
+
+    let r = ServiceRig::build(RigSpec {
+        yaml: DF27_YAML.to_string(),
+        devices: vec![(BY_ID_A.into(), REAL_A.into())],
+        explicit_target_count: 1,
+        allowlist: None,
+        wait_ready: vec![],
+    });
+    // 啟動時 env_file 不存在：帳密未解析 → ATTACHED＋CREDENTIALS_UNRESOLVED（零 TX、不重探）。
+    r.wait_state("COM0", "ATTACHED");
+    assert_eq!(
+        df27_field(&r, "last_error"),
+        PyValue::from("CREDENTIALS_UNRESOLVED")
+    );
+
+    let dev = r.device(REAL_A);
+    let sh_ok = Arc::new(AtomicBool::new(false));
+    dev.on_tx_match("^$", Box::new(|_line: &[u8]| b"\r\nlogin: ".to_vec()));
+    dev.on_tx_match(
+        "^root$",
+        Box::new(|_line: &[u8]| b"\r\nPassword: ".to_vec()),
+    );
+    dev.on_tx_match("^pw-df27$", Box::new(|_line: &[u8]| DF27_PROMPT.to_vec()));
+    let flag = sh_ok.clone();
+    dev.on_tx_match(
+        "^sh$",
+        Box::new(move |_line: &[u8]| {
+            if flag.load(Ordering::SeqCst) {
+                DF27_PROMPT.to_vec()
+            } else {
+                // 進了子 shell 卻沒有回 prompt：post_login_cmd 的 prompt 等待逾時。
+                b"\r\n[subshell waiting]\r\n".to_vec()
+            }
+        }),
+    );
+    dev.on_tx_match(
+        r"__READY__[0-9a-f]+",
+        Box::new(|line: &[u8]| {
+            let text = String::from_utf8_lossy(line).into_owned();
+            let token = text
+                .split("__READY__")
+                .nth(1)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let mut out = format!("__READY__{token}").into_bytes();
+            out.extend_from_slice(DF27_PROMPT);
+            out
+        }),
+    );
+    dev.on_tx_match(
+        "^echo df27-after$",
+        Box::new(|_line: &[u8]| {
+            let mut out = b"\r\ndf27-after".to_vec();
+            out.extend_from_slice(DF27_PROMPT);
+            out
+        }),
+    );
+
+    // 補齊帳密後以熱插觸發全新 attach（`_attach_by_id`；不經手動 attach／recover）。
+    r.fs.atomic_write(
+        std::path::Path::new(DF27_ENV_FILE),
+        b"SW_DF27_U=root\nSW_DF27_P=pw-df27\n",
+        None,
+    )
+    .expect("寫入 env_file");
+    r.mgr.update_devices(&[]);
+    r.wait_state("COM0", "DETACHED");
+    r.settle();
+    let tx_mark = dev.tx_len();
+    r.mgr.update_devices(&[(
+        BY_ID_A.to_string(),
+        DeviceInfo {
+            by_id: BY_ID_A.to_string(),
+            real_path: REAL_A.to_string(),
+        },
+    )]);
+
+    // 1. attach 登入：login／password 成功、送出 post_login_cmd，prompt 未回 → DETACHED＋POST_LOGIN_CMD_TIMEOUT。
+    let failed = df27_advance_until(&r, 10, "attach 登入逾時進 DETACHED", |session| {
+        s(session, "state") == "DETACHED"
+            && session.get("last_error") == Some(&PyValue::from(DF27_CODE))
+    });
+    let sent = String::from_utf8_lossy(&dev.tx_since(tx_mark)).into_owned();
+    assert!(
+        sent.contains("root\n") && sent.contains("sh\n"),
+        "登入與 post_login_cmd 應已送出：{sent:?}"
+    );
+    assert!(
+        !sent.contains("__READY__"),
+        "post_login_cmd 逾時不得送 nonce probe：{sent:?}"
+    );
+    assert_eq!(
+        failed.get("reprobe_attempts"),
+        Some(&PyValue::from(0)),
+        "attach 失敗本身不計重探 attempt：{}",
+        j(&failed)
+    );
+    df27_assert_rejected_zero_tx(&r, "df27-reject-detached");
+
+    // 2. 依 RX idle 起第一次重探：開橋在途（ATTACHING）只計一次 attempt、清 last_error。此窗口登入執行緒在途、時鐘
+    //    自行推進（見 `df27_advance_until`），提交只斷言拒絕碼與未產生 cmd_id，零 TX 由第 6 步全程 UART 檢查證明；
+    //    逐位元組回應比對在下方兩個 DETACHED 窗口。
+    let reopening = df27_advance_until(
+        &r,
+        10,
+        "DF-27：DETACHED＋POST_LOGIN_CMD_TIMEOUT 應自動重探開橋",
+        |session| s(session, "state") == "ATTACHING",
+    );
+    assert_eq!(
+        reopening.get("reprobe_attempts"),
+        Some(&PyValue::from(1)),
+        "真正開橋一次記一次 attempt：{}",
+        j(&reopening)
+    );
+    assert_eq!(
+        reopening.get("last_error"),
+        Some(&PyValue::Null),
+        "重新 attach 時清 last_error：{}",
+        j(&reopening)
+    );
+    let in_flight = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"echo df27-reject-attaching","source":"agent:df27","timeout_s":5}"#,
+    );
+    assert_eq!(
+        s(&in_flight, "error_code"),
+        "SESSION_NOT_READY",
+        "{}",
+        j(&in_flight)
+    );
+    assert_eq!(
+        keys(&in_flight),
+        ["ok", "error_code", "session", "version"],
+        "{}",
+        j(&in_flight)
+    );
+    assert_eq!(
+        s(&sub(&in_flight, "session"), "state"),
+        "ATTACHING",
+        "{}",
+        j(&in_flight)
+    );
+
+    // 3. 第一次重探仍逾時 → 回 DETACHED、attempts 不變且已排定退避。
+    let backoff = df27_advance_until(&r, 10, "第一次重探逾時回 DETACHED", |session| {
+        s(session, "state") == "DETACHED"
+            && session.get("last_error") == Some(&PyValue::from(DF27_CODE))
+    });
+    assert_eq!(
+        backoff.get("reprobe_attempts"),
+        Some(&PyValue::from(1)),
+        "drain 收尾不計 attempt：{}",
+        j(&backoff)
+    );
+    assert_ne!(
+        backoff.get("next_reprobe_at"),
+        Some(&PyValue::Null),
+        "失敗後排定退避：{}",
+        j(&backoff)
+    );
+    assert_eq!(
+        backoff.get("reprobe_exhausted"),
+        Some(&PyValue::Bool(false))
+    );
+    df27_assert_rejected_zero_tx(&r, "df27-reject-backoff");
+
+    // 4. DUT 恢復：退避到期後第二次重探 → READY，錯誤與重探進度重置；不呼叫 attach／recover。
+    sh_ok.store(true, Ordering::SeqCst);
+    let ready = df27_advance_until(&r, 20, "DF-27：第二次重探回 READY", |session| {
+        s(session, "state") == "READY"
+    });
+    assert_eq!(
+        ready.get("last_error"),
+        Some(&PyValue::Null),
+        "{}",
+        j(&ready)
+    );
+    assert_eq!(
+        ready.get("reprobe_attempts"),
+        Some(&PyValue::from(0)),
+        "READY 後重置 attempts：{}",
+        j(&ready)
+    );
+    assert_eq!(
+        ready.get("next_reprobe_at"),
+        Some(&PyValue::Null),
+        "READY 後清 backoff：{}",
+        j(&ready)
+    );
+    assert_eq!(ready.get("reprobe_exhausted"), Some(&PyValue::Bool(false)));
+
+    // 5. READY 後 agent 命令經 RPC 真正寫到 UART 並完成。
+    let after_mark = dev.tx_len();
+    let response = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"echo df27-after","source":"agent:df27","timeout_s":5}"#,
+    );
+    assert_eq!(
+        response.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&response)
+    );
+    let cmd_id = s(&response, "cmd_id").to_string();
+    let mut record = PyDict::default();
+    wait_until("READY 後命令完成", || {
+        r.clock.advance(Duration::from_millis(100));
+        record = sub(
+            &r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#)),
+            "command",
+        );
+        !matches!(record.get("done_at"), None | Some(PyValue::Null))
+    });
+    assert_eq!(s(&record, "status"), "done", "{}", j(&record));
+    assert_eq!(
+        dev.tx_since(after_mark),
+        b"echo df27-after\n".to_vec(),
+        "READY 後命令原樣寫到 UART"
+    );
+
+    // 6. 被拒的三筆提交全程未進 UART（無延後送出）。
+    let all_tx = String::from_utf8_lossy(&dev.tx_since(0)).into_owned();
+    for marker in [
+        "df27-reject-detached",
+        "df27-reject-attaching",
+        "df27-reject-backoff",
+    ] {
+        assert!(
+            !all_tx.contains(marker),
+            "被拒命令 {marker} 不得寫到 UART：{all_tx:?}"
+        );
+    }
+}
