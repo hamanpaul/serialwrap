@@ -305,13 +305,11 @@ pub struct DeliveryObligation {
     pub event: DeviceAttachedEvent,
     pub bind_gen: u64,
     pub inc: u64,
+    pub created_at: Instant,
+    pub frozen_at_create: Duration,
     pub next_at: Instant,
     pub backoff: Duration,
     pub attempts: usize,
-    pub open_elapsed: Duration,
-    pub last_open_at: Instant,
-    pub pending_since: Option<Instant>,
-    pub last_state: HandoffFreezeState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -796,12 +794,7 @@ impl Deliverer {
         inc: u64,
         now: Instant,
     ) {
-        let initial_state = self.gate.handoff_freeze_state();
-        let pending_since = if initial_state == HandoffFreezeState::Pending {
-            Some(now)
-        } else {
-            None
-        };
+        let frozen_at_create = self.gate.frozen_total(now);
         self.obligations.insert(sid.to_string(), DeliveryObligation {
             event: DeviceAttachedEvent {
                 by_id: by_id.to_string(),
@@ -809,13 +802,11 @@ impl Deliverer {
             },
             bind_gen,
             inc,
+            created_at: now,
+            frozen_at_create,
             next_at: now,
             backoff: Duration::from_millis(10),
             attempts: 0,
-            open_elapsed: Duration::ZERO,
-            last_open_at: now,
-            pending_since,
-            last_state: initial_state,
         });
     }
 
@@ -831,30 +822,11 @@ impl Deliverer {
         }
     }
 
-    /// 記錄進入凍結轉態（依轉態記錄暫停區間並扣除，不能只在輪詢時覆寫時間戳）。
-    pub fn notify_freeze(&mut self, now: Instant) {
-        for ob in self.obligations.values_mut() {
-            // 進入 Pending 時先結算截至凍結時點的 Open 耗時
-            if ob.last_state == HandoffFreezeState::Open {
-                let delta = now.saturating_duration_since(ob.last_open_at);
-                ob.open_elapsed += delta;
-            }
-            if ob.pending_since.is_none() {
-                ob.pending_since = Some(now);
-            }
-            ob.last_state = HandoffFreezeState::Pending;
-        }
-    }
+    /// 記錄進入凍結轉態通知（喚醒送達者，不再記帳）。
+    pub fn notify_freeze(&mut self, _now: Instant) {}
 
-    /// 記錄解除凍結轉態（扣除暫停區間，重設 last_open_at 為回到 Open 的時點）。
-    pub fn notify_thaw(&mut self, now: Instant) {
-        for ob in self.obligations.values_mut() {
-            // 解凍時記錄實際轉態時點，清除 pending_since，下一次投遞須計入解凍後耗時
-            ob.pending_since = None;
-            ob.last_open_at = now;
-            ob.last_state = HandoffFreezeState::Open;
-        }
-    }
+    /// 記錄解除凍結轉態通知（喚醒送達者，不再記帳）。
+    pub fn notify_thaw(&mut self, _now: Instant) {}
 
     /// 單步送達執行。
     pub fn step_delivery(
@@ -871,16 +843,7 @@ impl Deliverer {
         // 依 T14 檢查凍結狀態
         match self.gate.handoff_freeze_state() {
             HandoffFreezeState::Pending => {
-                // Pending 時暫停嘗試、保留義務、不計總時限、attempts 不增；
-                // 進入 Pending 時先結算截至凍結時點 now 的 Open 耗時
-                if ob.last_state == HandoffFreezeState::Open {
-                    let delta = now.saturating_duration_since(ob.last_open_at);
-                    ob.open_elapsed += delta;
-                }
-                if ob.pending_since.is_none() {
-                    ob.pending_since = Some(now);
-                }
-                ob.last_state = HandoffFreezeState::Pending;
+                // Pending 時暫停嘗試、保留義務、不計總時限、attempts 不增
                 return DeliveryStepResult::PausedPending;
             }
             HandoffFreezeState::Permanent => {
@@ -888,24 +851,15 @@ impl Deliverer {
                 self.obligations.remove(sid);
                 return DeliveryStepResult::Cancelled;
             }
-            HandoffFreezeState::Open => {
-                if ob.last_state == HandoffFreezeState::Pending {
-                    // 若先前處於 Pending（未呼叫 notify_thaw 或首次在輪詢中偵測到解凍）：
-                    // 以 now 作為解凍進入 Open 的起點
-                    ob.pending_since = None;
-                    ob.last_open_at = now;
-                    ob.last_state = HandoffFreezeState::Open;
-                } else {
-                    let delta = now.saturating_duration_since(ob.last_open_at);
-                    ob.open_elapsed += delta;
-                    ob.last_open_at = now;
-                    ob.last_state = HandoffFreezeState::Open;
-                }
-            }
+            HandoffFreezeState::Open => {}
         }
 
-        // 檢查 30 秒總時限（只累計 Open 狀態度過的時間，Pending 期間不計入）
-        if ob.open_elapsed >= Duration::from_secs(30) {
+        // 檢查 30 秒總時限（扣除凍結區間）
+        let total_elapsed = now.saturating_duration_since(ob.created_at);
+        let frozen_elapsed = self.gate.frozen_total(now).saturating_sub(ob.frozen_at_create);
+        let effective_open = total_elapsed.saturating_sub(frozen_elapsed);
+
+        if effective_open >= Duration::from_secs(30) {
             eprintln!("[serialwrap:WARNING] 送達義務超逾 30s 總時限，丟棄：sid={}, by_id={}", sid, ob.event.by_id);
             self.obligations.remove(sid);
             return DeliveryStepResult::TimedOut;

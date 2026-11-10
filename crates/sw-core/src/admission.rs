@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// 一項尚未完成的有副作用操作（Python `Ticket(kind, com, seq)`）。只能經 [`AdmissionGate::done`] 歸還。
 #[derive(Debug, PartialEq, Eq)]
@@ -130,12 +131,21 @@ struct GateInner {
     token: Option<String>,
     /// 只記錄由 `freeze_if_idle` 新建立之凍結的 token；`freeze()` 建立或接手者不計入。
     idle_token: Option<String>,
+    /// 凍結累計時間（已完成的凍結區間累計）。
+    frozen_accum: Duration,
+    /// 目前 Pending 凍結開始的時間點；非 Pending 時為 None。
+    pending_since: Option<Instant>,
 }
+
+#[cfg(feature = "test-fakes")]
+type TimeSource = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 /// 共同 admission 邊界（見模組說明）。
 pub struct AdmissionGate {
     inner: Mutex<GateInner>,
     handoff_settled: Condvar,
+    #[cfg(feature = "test-fakes")]
+    time_source: Option<TimeSource>,
 }
 
 impl Default for AdmissionGate {
@@ -149,7 +159,40 @@ impl AdmissionGate {
         AdmissionGate {
             inner: Mutex::new(GateInner::default()),
             handoff_settled: Condvar::new(),
+            #[cfg(feature = "test-fakes")]
+            time_source: None,
         }
+    }
+
+    /// 建立注入自訂時鐘來源的 AdmissionGate（僅供 test-fakes 使用）。
+    #[cfg(feature = "test-fakes")]
+    pub fn with_clock<F>(time_source: F) -> AdmissionGate
+    where
+        F: Fn() -> Instant + Send + Sync + 'static,
+    {
+        AdmissionGate {
+            inner: Mutex::new(GateInner::default()),
+            handoff_settled: Condvar::new(),
+            time_source: Some(Arc::new(time_source)),
+        }
+    }
+
+    /// 建立注入共用時鐘來源的 AdmissionGate（僅供 test-fakes 使用）。
+    #[cfg(feature = "test-fakes")]
+    pub fn with_time_source(time_source: Arc<dyn Fn() -> Instant + Send + Sync>) -> AdmissionGate {
+        AdmissionGate {
+            inner: Mutex::new(GateInner::default()),
+            handoff_settled: Condvar::new(),
+            time_source: Some(time_source),
+        }
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(feature = "test-fakes")]
+        if let Some(ref ts) = self.time_source {
+            return ts();
+        }
+        Instant::now()
     }
 
     /// 是否已凍結（shutdown 或交接）。
@@ -195,9 +238,17 @@ impl AdmissionGate {
     /// daemon 一般關機的凍結：停止接受新操作，不做 busy 判定；接手後交接失敗的 `thaw` 不得解除。
     pub fn freeze(&self) {
         let mut g = self.lock();
+        let was_pending = g.frozen && g.idle_token.is_some();
         g.frozen = true;
         // shutdown 凍結接手後，handoff 的失敗路徑不得再以先前 token 撤銷它。
         g.idle_token = None;
+        if was_pending {
+            // Pending -> Permanent：結算後清除
+            if let Some(since) = g.pending_since.take() {
+                let now = self.now();
+                g.frozen_accum += now.saturating_duration_since(since);
+            }
+        }
         if g.token.is_none() {
             g.token = Some(new_token());
         }
@@ -213,6 +264,11 @@ impl AdmissionGate {
         g.frozen = false;
         g.token = None;
         g.idle_token = None;
+        // Pending -> Open：把 now - pending_since 加進 frozen_accum，清除 pending_since
+        if let Some(since) = g.pending_since.take() {
+            let now = self.now();
+            g.frozen_accum += now.saturating_duration_since(since);
+        }
         self.handoff_settled.notify_all();
         true
     }
@@ -240,6 +296,11 @@ impl AdmissionGate {
             return false;
         }
         g.idle_token = None;
+        // Pending -> Permanent：同樣結算後清除
+        if let Some(since) = g.pending_since.take() {
+            let now = self.now();
+            g.frozen_accum += now.saturating_duration_since(since);
+        }
         self.handoff_settled.notify_all();
         true
     }
@@ -249,7 +310,15 @@ impl AdmissionGate {
         let mut g = self.lock();
         if g.frozen {
             // 已凍結：本次呼叫不是建立者，之後的 thaw 不得撤銷該凍結。
+            let was_pending = g.idle_token.is_some();
             g.idle_token = None;
+            if was_pending {
+                // Pending -> Permanent
+                if let Some(since) = g.pending_since.take() {
+                    let now = self.now();
+                    g.frozen_accum += now.saturating_duration_since(since);
+                }
+            }
             self.handoff_settled.notify_all();
             let token = g.token.get_or_insert_with(new_token).clone();
             return FreezeOutcome::Frozen { token, created: false };
@@ -287,7 +356,22 @@ impl AdmissionGate {
         g.frozen = true;
         g.token = Some(token.clone());
         g.idle_token = Some(token.clone());
+        // Open -> Pending：記下 pending_since
+        let now = self.now();
+        g.pending_since = Some(now);
         FreezeOutcome::Frozen { token, created: true }
+    }
+
+    /// 取得截至指定時刻的總凍結時間（含已結算之累積時間，若目前仍在 Pending 則加上自 pending_since 起算之經過時間）。
+    /// 結果保證單調不遞減。
+    pub fn frozen_total(&self, now: Instant) -> Duration {
+        let g = self.lock();
+        let current_pending = if let Some(since) = g.pending_since {
+            now.saturating_duration_since(since)
+        } else {
+            Duration::ZERO
+        };
+        g.frozen_accum.saturating_add(current_pending)
     }
 
     /// 目前未歸還的 ticket 數（觀測用）。
