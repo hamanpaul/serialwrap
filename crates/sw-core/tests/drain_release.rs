@@ -4433,3 +4433,135 @@ fn wp510r_r3_p8_c4913ae_custody_path_clears_both_fields() {
     assert_eq!(public["drain_timeout_epoch"], PyValue::Null);
     assert!(h.state_store.last_released().contains_key("t:COM0"));
 }
+
+/// `RetiredDrainsForTest` 回覆的保管紀錄 token（actor 等待 `CustodyTerminal` 者）。
+fn wp510r_custody_awaits(h: &mut CoreHarness) -> Vec<i64> {
+    let response = h.rpc(SessionRequest::RetiredDrainsForTest).unwrap();
+    match response.get("custody") {
+        Some(PyValue::List(items)) => items.iter().filter_map(PyValue::as_i64).collect(),
+        other => panic!("retired drains 查詢回應異常：{other:?}"),
+    }
+}
+
+/// T14 凍結分類（設計第 5 版 §3.1.7；第 8 項新增的事件）：`CustodyClaimed`（`ClaimForStop` 的立即回饋）在 Pending 與
+/// Permanent 都立即處理；`CustodyTerminal` 與開埠終態（生命週期）在 Pending 延後、撤銷後重播，在 Permanent 照常處理並
+/// 回覆 release waiter（不啟動新工作）。
+#[test]
+fn wp510r_r3_t14_custody_events_under_pending_and_permanent_freeze() {
+    for permanent in [false, true] {
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        wp510r_birth_takeover(&mut h);
+        let (rx, _) = h.rpc_deferred(release());
+        let token = if permanent {
+            h.reg.admission_gate().freeze();
+            None
+        } else {
+            match h.reg.admission_gate().freeze_if_idle("wp510r-custody") {
+                sw_core::admission::FreezeOutcome::Frozen { token, .. } => Some(token),
+                outcome => panic!("應建立暫時凍結：{outcome:?}"),
+            }
+        };
+        h.feed(ControlEvent::CustodyClaimed {
+            token: WP510R_CUSTODY_TOKEN,
+            outcome: sw_core::mailbox::CustodyClaimOutcome::Closing,
+        });
+        assert_eq!(
+            wp510r_custody_awaits(&mut h),
+            vec![WP510R_CUSTODY_TOKEN as i64],
+            "立即回饋（permanent={permanent}）立即處理"
+        );
+        let mut effects = h.feed(ControlEvent::CustodyTerminal {
+            token: WP510R_CUSTODY_TOKEN,
+            closed: true,
+            error: None,
+        });
+        effects.extend(h.feed(ControlEvent::BridgeOpened {
+            epoch_hint: 0,
+            result: Err(OpenFailure::CloseBlocked),
+        }));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::OpenBridge { .. } | Effect::ClaimCustody { .. })),
+            "不啟動新工作"
+        );
+        match token {
+            Some(token) => {
+                assert!(rx.try_recv().is_err(), "Pending：生命週期事件延後");
+                assert!(h.reg.admission_gate().thaw(&token));
+                let _ = h.rpc(SessionRequest::GetState);
+                let response = rx.try_recv().expect("撤銷凍結後重播並回覆").unwrap();
+                assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
+            }
+            None => {
+                let response = rx.try_recv().expect("Permanent：生命週期事件照常處理").unwrap();
+                assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
+            }
+        }
+    }
+}
+
+/// T14 凍結分類：`AcceptCustody`（Request，bypass）在 Pending／Permanent 下拒絕、不啟動新工作（不認領、不開埠）。
+#[test]
+fn wp510r_r3_t14_accept_custody_rejected_under_freeze() {
+    for permanent in [false, true] {
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        if permanent {
+            h.reg.admission_gate().freeze();
+        } else {
+            let _ = h.reg.admission_gate().freeze_if_idle("wp510r-accept");
+        }
+        let (response, effects) = h.rpc_full(SessionRequest::AcceptCustody {
+            token: 91,
+            by_id: DEVICE_BY_ID.into(),
+            real_path: REAL_PATH.into(),
+            open_now: true,
+        });
+        assert_eq!(response.unwrap().get("ok"), Some(&PyValue::Bool(false)));
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                Effect::ClaimOffered { .. } | Effect::ClaimCustody { .. } | Effect::OpenBridge { .. }
+            )),
+            "凍結（permanent={permanent}）期間不接受保管、不開埠"
+        );
+    }
+}
+
+/// T14 凍結分類：`BindDeadlineElapsed`（Request，bypass）在 Pending／Permanent 下照常處理，只回覆該 bind waiter；
+/// shutdown（Permanent 的停止）對保管紀錄發 `ClaimForStop`（資源收尾，三種狀態皆執行）。
+#[test]
+fn wp510r_r3_t14_bind_notice_and_claim_for_stop_under_freeze() {
+    for permanent in [false, true] {
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        wp510r_birth_takeover(&mut h);
+        let (ack_tx, ack_rx) = bounded(1);
+        let (bind_rx, _) = h.rpc_deferred(SessionRequest::BindWithAck {
+            by_id: WP510R_BIND_TARGET.into(),
+            ack: ack_tx,
+        });
+        let Ok(sw_core::mailbox::WaitAck::Bind { id, .. }) = ack_rx.try_recv() else {
+            panic!("BindWait 須回報 WaitAck::Bind");
+        };
+        if permanent {
+            h.reg.admission_gate().freeze();
+        } else {
+            let _ = h.reg.admission_gate().freeze_if_idle("wp510r-bind-notice");
+        }
+        let _ = h.rpc_full(SessionRequest::BindDeadlineElapsed { id });
+        let bind = bind_rx.try_recv().expect("凍結期間 bind 通知照常處理").unwrap();
+        session_error(&bind, "SESSION_RECOVERING");
+        if permanent {
+            let mut h2 = CoreHarness::new(SHELL_PROFILE);
+            wp510r_birth_takeover(&mut h2);
+            h2.reg.admission_gate().freeze();
+            let (reply, _rx) = bounded(1);
+            let effects = h2.feed(ControlEvent::Shutdown { reply });
+            assert_eq!(
+                wp510r_claims(&effects, WP510R_CUSTODY_TOKEN),
+                1,
+                "Permanent 下 shutdown 仍對保管紀錄發 ClaimForStop"
+            );
+        }
+    }
+}
