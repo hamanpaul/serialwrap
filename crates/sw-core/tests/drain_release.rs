@@ -3057,6 +3057,9 @@ fn wp510_review12_retired_bridge_close_failure_keeps_release_stalled() {
     let (rx, _) = h.rpc_deferred(release());
     assert!(rx.try_recv().is_err(), "關閉回條前不得回覆 release");
     h.receipt(epoch, stop).handle_closed(false).feed();
+    // 設計第 5 版 §6 #10（F，T-1；擁有者 2026-11-10 D1 改回 T-1）：等待期間收到失敗回條不提前回覆，首次期限才回。
+    assert!(rx.try_recv().is_err(), "期限前不得回覆");
+    h.advance(Duration::from_secs(4));
     let response = rx
         .try_recv()
         .expect("關閉失敗應回覆 release")
@@ -3375,8 +3378,8 @@ fn wp510r_r3_own_stop_success_with_failed_retired_drain_waits_first_deadline() {
 }
 
 /// DR-4(a) closed:false：RELEASED 上 device.attach 落盤失敗而退休的 bridge，release 等待期間收到失敗回條：回
-/// DRAIN_STALLED、進集合、已 RELEASED 不改 state、不得回成功；之後的 release 也是 DRAIN_STALLED。回覆時點（T-1）見
-/// 回報 SPEC-GAP（#71 與 FakeClock）。
+/// DRAIN_STALLED、進集合、已 RELEASED 不改 state、不得回成功；之後的 release 也是 DRAIN_STALLED。回覆時點依 T-1：
+/// 首次期限前不回覆（設計 §3.1.6 第二處）。
 #[test]
 fn wp510r_r3_dr4_released_attach_commit_failure_close_false_stalls() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
@@ -3385,6 +3388,8 @@ fn wp510r_r3_dr4_released_attach_commit_failure_close_false_stalls() {
     assert!(rx.try_recv().is_err(), "回條前不得回覆");
     h.receipt(r_epoch, r_stop).handle_closed(false).feed();
     assert!(h.unconfirmed.contains(DEVICE_BY_ID));
+    // T-1（審查 P8-566d90b-4）：失敗回條在等待期間到達不提前回覆。
+    assert!(rx.try_recv().is_err(), "首次期限前不得回覆");
     h.advance(Duration::from_secs(4));
     let response = rx.try_recv().expect("期限內應回覆").unwrap();
     session_error(&response, "DRAIN_STALLED");
@@ -3566,4 +3571,332 @@ fn wp510r_r3_p8_c4913ae_new_receipt_first_keeps_stalled_until_retired_receipt() 
     assert_eq!(public["drain_stalled"], PyValue::Bool(false));
     assert_eq!(public["drain_timeout_epoch"], PyValue::Null);
     assert!(h.state_store.last_released().contains_key("t:COM0"));
+}
+
+// ---------------------------------------------------------------------------
+// S2-PAR-wp510r R3 第 2 輪：審查 P8-566d90b-1～4 的回歸。
+// ---------------------------------------------------------------------------
+
+/// 開埠途中改指 → 舊路徑開埠成功而退休、以新路徑重開（DR-8 前置）→ `停止` → 新路徑開埠失敗。回傳退休 bridge 的
+/// `(epoch, stop_id)`；`stop` 由呼叫端在新開埠在途時送出。
+fn wp510r_rebound_new_open_fails_after(
+    h: &mut CoreHarness,
+    stop: impl FnOnce(&mut CoreHarness),
+) -> (u64, StopId) {
+    let (epoch, stop_id, effects) = wp510r_rebound_retired(h);
+    assert_eq!(
+        wp510r_open_bridge_paths(&effects),
+        vec![WP510R_NEW_PATH.to_string()],
+        "前置：以新路徑重開"
+    );
+    stop(h);
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Err(OpenFailure::Other(PalError::io(5, "open failed"))),
+    });
+    (epoch, stop_id)
+}
+
+/// P8-566d90b-1：退休 bridge 回條未到時，`session.clear` 等待的新路徑開埠失敗：clear 仍以開埠終態完成（DETACHED／
+/// CLEARED），不得因退休 bridge 而永不回覆；退休 bridge 回條 `handle_closed:false` 之後的 release 依 T-1 等到首次期限
+/// 才回 DRAIN_STALLED（Python clear 不等被取消的 attach 作業，release 找到作業才等 `done` 至期限，
+/// `origin/main:sw_core/session_manager.py:3104-3107`、`:3188-3204`）。
+#[test]
+fn wp510r_r3_p8_566d90b_clear_completes_when_new_open_fails_with_retired_drain() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (clear_tx, clear_rx) = bounded(1);
+    let (epoch, stop) = wp510r_rebound_new_open_fails_after(&mut h, |h| {
+        let (rx, _) = h.rpc_deferred(SessionRequest::Clear);
+        assert!(rx.try_recv().is_err(), "前置：新路徑開埠在途時 clear 等待開埠終態");
+        clear_tx.send(rx).unwrap();
+    });
+    let clear_rx = clear_rx.recv().unwrap();
+    let response = clear_rx
+        .try_recv()
+        .expect("新路徑開埠失敗後 clear 應回覆")
+        .unwrap();
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
+    let public = h.public();
+    assert_eq!(public["state"], PyValue::from("DETACHED"), "{public:?}");
+    assert_eq!(public["last_error"], PyValue::from("CLEARED"), "{public:?}");
+
+    h.receipt(epoch, stop).handle_closed(false).feed();
+    assert!(h.unconfirmed.contains(DEVICE_BY_ID));
+    let (rx, _) = h.rpc_deferred(release());
+    assert!(rx.try_recv().is_err(), "期限前不得回覆");
+    h.advance(Duration::from_millis(2500));
+    assert!(rx.try_recv().is_err(), "首次期限前不得回覆");
+    h.advance(Duration::from_millis(700));
+    let response = rx.try_recv().expect("首次期限到應回覆").unwrap();
+    session_error(&response, "DRAIN_STALLED");
+    let again = h.rpc(release()).unwrap();
+    session_error(&again, "DRAIN_STALLED");
+}
+
+/// P8-566d90b-1（拔除版本）：同上，但新開埠在途時裝置拔除：新開埠失敗即以 DETACHED／DEVICE_REMOVED 收尾，不停在
+/// RECOVERING。
+#[test]
+fn wp510r_r3_p8_566d90b_removal_completes_when_new_open_fails_with_retired_drain() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let _ = wp510r_rebound_new_open_fails_after(&mut h, |h| {
+        h.feed(ControlEvent::DeviceDetached {
+            by_id: DEVICE_BY_ID.into(),
+            reason: DetachReason::Removed,
+        });
+    });
+    let public = h.public();
+    assert_eq!(public["state"], PyValue::from("DETACHED"), "{public:?}");
+    assert_eq!(public["last_error"], PyValue::from("DEVICE_REMOVED"), "{public:?}");
+}
+
+/// P8-566d90b-2：READY（有自身 bridge）的 session 收到遲到的 `BridgeOpened` 而退休另一個 bridge，回條未到：
+/// `device.attach` 回 `already_attached:true`、`session.attach` 照有 bridge 的冪等判斷回成功；回條 `handle_closed:false`
+/// 之後 `session.attach` 亦同（Python 有 bridge 的冪等判斷先於在途表分流，`origin/main:sw_core/session_manager.py:3420`、
+/// `:3427-3443`）。失敗回條後的 `device.attach` 依既有第 13 項先判未確認關閉，不在本案範圍。
+#[test]
+fn wp510r_r3_p8_566d90b_ready_with_retired_bridge_attach_stays_idempotent() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let stale = h.opened_bridge("/fake/tty-stale");
+    let stale_epoch = stale.epoch;
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Ok(stale),
+    });
+    let (r_epoch, r_stop) = h.pending_stop();
+    assert_eq!(r_epoch, stale_epoch, "前置：遲到的 bridge 退休並排空");
+    assert_eq!(h.public()["state"], PyValue::from("READY"));
+
+    let (response, effects) = h.rpc_full(SessionRequest::DeviceAttach { force: false });
+    let response = response.unwrap();
+    assert!(wp510r_open_bridge_paths(&effects).is_empty());
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
+    assert_eq!(response.get("already_attached"), Some(&PyValue::Bool(true)), "{response:?}");
+    let attached = h.rpc(SessionRequest::SessionAttach).unwrap();
+    assert_eq!(attached.get("ok"), Some(&PyValue::Bool(true)), "{attached:?}");
+
+    h.receipt(r_epoch, r_stop).handle_closed(false).feed();
+    let attached = h.rpc(SessionRequest::SessionAttach).unwrap();
+    assert_eq!(attached.get("ok"), Some(&PyValue::Bool(true)), "{attached:?}");
+    assert_eq!(h.public()["state"], PyValue::from("READY"));
+}
+
+const WP510R_BIND_TARGET: &str = "/s/by-id/usb-wp510r-bind-target";
+
+fn bind_to(target: &str) -> SessionRequest {
+    SessionRequest::Bind {
+        by_id: target.into(),
+    }
+}
+
+/// P8-566d90b-3（設計 §3.1.3、§3.1.6 BindWait）：退休 bridge 回條未到時 `session.bind`：等到回條，成功回條後照原流程
+/// 改綁，回 ok、DETACHED／DEVICE_NOT_FOUND（Python 取消作業並等 `done`，確認關閉後遞迴 bind，
+/// `origin/main:sw_core/session_manager.py:3676-3694`、`:3727`）。
+#[test]
+fn wp510r_r3_p8_566d90b_bind_waits_retired_receipt_then_rebinds() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (r_epoch, r_stop) = wp510r_released_attach_commit_failure(&mut h);
+    let (rx, effects) = h.rpc_deferred(bind_to(WP510R_BIND_TARGET));
+    assert!(wp510r_open_bridge_paths(&effects).is_empty());
+    assert!(rx.try_recv().is_err(), "退休 bridge 回條前 bind 不得回覆");
+    assert_eq!(h.public()["device_by_id"], PyValue::from(DEVICE_BY_ID));
+    h.advance(Duration::from_millis(1000));
+    assert!(rx.try_recv().is_err(), "BindWait 期限前不得回覆");
+    h.receipt(r_epoch, r_stop).handle_closed(true).feed();
+    let response = rx.try_recv().expect("成功回條後 bind 應回覆").unwrap();
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
+    let public = h.public();
+    assert_eq!(public["state"], PyValue::from("DETACHED"), "{public:?}");
+    assert_eq!(public["last_error"], PyValue::from("DEVICE_NOT_FOUND"), "{public:?}");
+    assert_eq!(public["device_by_id"], PyValue::from(WP510R_BIND_TARGET));
+    assert_eq!(public["drain_stalled"], PyValue::Bool(false));
+}
+
+/// P8-566d90b-3：bind 等待期間退休 bridge 回條 `handle_closed:false`：收到終態即回 SESSION_RECOVERING，state
+/// RECOVERING、`drain_stalled:true` 與 epoch，不改綁（Python 關閉失敗時設 RECOVERING、drain_stalled 與 epoch，
+/// `origin/main:sw_core/session_manager.py:3697-3711`；設計 §3.1.6 bind waiter 收到終態即回）。
+#[test]
+fn wp510r_r3_p8_566d90b_bind_retired_close_failure_reports_recovering_stalled() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (r_epoch, r_stop) = wp510r_released_attach_commit_failure(&mut h);
+    let (rx, _) = h.rpc_deferred(bind_to(WP510R_BIND_TARGET));
+    assert!(rx.try_recv().is_err());
+    h.receipt(r_epoch, r_stop).handle_closed(false).feed();
+    let response = rx.try_recv().expect("失敗回條後 bind 應立即回覆").unwrap();
+    session_error(&response, "SESSION_RECOVERING");
+    assert_eq!(response.get("drain_stalled"), Some(&PyValue::Bool(true)), "{response:?}");
+    let public = h.public();
+    assert_eq!(response.get("drain_timeout_epoch"), Some(&public["bridge_generation"]));
+    assert_eq!(public["state"], PyValue::from("RECOVERING"), "{public:?}");
+    assert_eq!(public["drain_stalled"], PyValue::Bool(true));
+    assert_eq!(public["device_by_id"], PyValue::from(DEVICE_BY_ID), "關閉未確認不得改綁");
+    assert!(h.unconfirmed.contains(DEVICE_BY_ID));
+}
+
+/// P8-566d90b-3：退休 bridge 回條在 BindWait 期限（3000 ms）內未到：bind 回 SESSION_RECOVERING、state RECOVERING、
+/// `drain_stalled:true` 與 epoch；遲到的成功回條維持 RECOVERING 與 stalled、不改綁（設計 `design-v3.md` §3.1.4 bind）。
+#[test]
+fn wp510r_r3_p8_566d90b_bind_retired_receipt_timeout_reports_recovering_stalled() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (r_epoch, r_stop) = wp510r_released_attach_commit_failure(&mut h);
+    let (rx, _) = h.rpc_deferred(bind_to(WP510R_BIND_TARGET));
+    h.advance(Duration::from_millis(2900));
+    assert!(rx.try_recv().is_err(), "BindWait 期限前不得回覆");
+    h.advance(Duration::from_millis(200));
+    let response = rx.try_recv().expect("BindWait 期限到應回覆").unwrap();
+    session_error(&response, "SESSION_RECOVERING");
+    assert_eq!(response.get("drain_stalled"), Some(&PyValue::Bool(true)), "{response:?}");
+    assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
+    h.receipt(r_epoch, r_stop).handle_closed(true).feed();
+    let public = h.public();
+    assert_eq!(public["state"], PyValue::from("RECOVERING"), "{public:?}");
+    assert_eq!(public["drain_stalled"], PyValue::Bool(true), "{public:?}");
+    assert_eq!(public["device_by_id"], PyValue::from(DEVICE_BY_ID), "遲到的終態不改綁");
+}
+
+/// P8-566d90b-3：退休 bridge 已回失敗之後才 bind：終態已知，立即回 SESSION_RECOVERING（stalled），不改綁。
+#[test]
+fn wp510r_r3_p8_566d90b_bind_after_retired_close_failure_reports_recovering_stalled() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (r_epoch, r_stop) = wp510r_released_attach_commit_failure(&mut h);
+    h.receipt(r_epoch, r_stop).handle_closed(false).feed();
+    let response = h.rpc(bind_to(WP510R_BIND_TARGET)).unwrap();
+    session_error(&response, "SESSION_RECOVERING");
+    assert_eq!(response.get("drain_stalled"), Some(&PyValue::Bool(true)), "{response:?}");
+    assert_eq!(h.public()["device_by_id"], PyValue::from(DEVICE_BY_ID));
+    assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
+}
+
+/// P8-566d90b-4（設計 §3.1.6 第二處 T-1）：release 等待退休 bridge 時失敗回條在首次期限前到達：處理失敗回條時只登記
+/// 未確認關閉，不提前回覆、不改 drain 欄位；首次期限才回 DRAIN_STALLED（Python 作業關閉失敗不設 `done`，release 等滿
+/// 期限，`origin/main:sw_core/session_manager.py:3188-3204`、`:4320-4332`）。
+#[test]
+fn wp510r_r3_p8_566d90b_retired_failure_during_release_waits_first_deadline() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (r_epoch, r_stop) = wp510r_released_attach_commit_failure(&mut h);
+    let (rx, _) = h.rpc_deferred(release());
+    h.advance(Duration::from_millis(1000));
+    h.receipt(r_epoch, r_stop).handle_closed(false).feed();
+    assert!(h.unconfirmed.contains(DEVICE_BY_ID), "失敗回條即登記未確認關閉");
+    assert!(rx.try_recv().is_err(), "首次期限前不得回覆");
+    assert_eq!(h.public()["drain_stalled"], PyValue::Bool(false), "回覆前不改 drain 欄位");
+    let (second_rx, _) = h.rpc_deferred(release());
+    assert!(second_rx.try_recv().is_err(), "期限內的 release 共用首次期限");
+    h.advance(Duration::from_millis(1900));
+    assert!(rx.try_recv().is_err(), "首次期限前不得回覆");
+    h.advance(Duration::from_millis(200));
+    let response = rx.try_recv().expect("首次期限到應回覆").unwrap();
+    session_error(&response, "DRAIN_STALLED");
+    session_error(&second_rx.try_recv().expect("共用首次期限").unwrap(), "DRAIN_STALLED");
+    assert_eq!(h.public()["drain_stalled"], PyValue::Bool(true));
+    let again = h.rpc(release()).unwrap();
+    session_error(&again, "DRAIN_STALLED");
+}
+
+/// 設計 §3.1.6「不改的部分」：同時有 retired drain 時，自身 bridge 的不安全回條也依 T-1 等到首次期限才回
+/// DRAIN_STALLED（Python release 先找作業，`origin/main:sw_core/session_manager.py:3104-3107`、`:3188-3204`）。
+#[test]
+fn wp510r_r3_own_stop_failure_with_retired_drain_waits_first_deadline() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let live_epoch = h.epoch();
+    let stale = h.opened_bridge("/fake/tty-stale");
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Ok(stale),
+    });
+    let (rx, _) = h.rpc_deferred(release());
+    let (epoch, stop) = h.pending_stop();
+    assert_eq!(epoch, live_epoch, "前置：release 排空自身 bridge");
+    h.advance(Duration::from_millis(500));
+    h.receipt(epoch, stop).handle_closed(false).feed();
+    assert!(h.unconfirmed.contains(DEVICE_BY_ID));
+    assert!(rx.try_recv().is_err(), "有 retired drain 時自身不安全回條不提前回覆");
+    h.advance(Duration::from_millis(2300));
+    assert!(rx.try_recv().is_err(), "首次期限前不得回覆");
+    h.advance(Duration::from_millis(300));
+    let response = rx.try_recv().expect("首次期限到應回覆").unwrap();
+    session_error(&response, "DRAIN_STALLED");
+    assert_eq!(h.public()["drain_stalled"], PyValue::Bool(true));
+    assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
+    let again = h.rpc(release()).unwrap();
+    session_error(&again, "DRAIN_STALLED");
+}
+
+/// T14 凍結分類（設計 §3.1.7）：`TimerEvent::BindWaitTimeout` 屬生命週期 Timer。Permanent 期間照常處理（只回覆該 bind
+/// waiter，不改綁、不啟動新工作）。
+#[test]
+fn wp510r_r3_t14_bind_wait_timeout_handled_under_permanent_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let _ = wp510r_released_attach_commit_failure(&mut h);
+    let (rx, _) = h.rpc_deferred(bind_to(WP510R_BIND_TARGET));
+    h.reg.admission_gate().freeze();
+    let effects = h.advance(Duration::from_millis(3100));
+    assert!(wp510r_open_bridge_paths(&effects).is_empty(), "永久凍結期間不啟動新工作");
+    let response = rx.try_recv().expect("永久凍結期間仍須結算 bind 等待者").unwrap();
+    session_error(&response, "SESSION_RECOVERING");
+    assert_eq!(response.get("drain_stalled"), Some(&PyValue::Bool(true)), "{response:?}");
+    assert_eq!(h.public()["device_by_id"], PyValue::from(DEVICE_BY_ID));
+}
+
+/// T14 凍結分類：`TimerEvent::BindWaitTimeout` 在 Pending（暫時凍結）期間延後，撤銷凍結後重播並回覆。
+#[test]
+fn wp510r_r3_t14_bind_wait_timeout_deferred_under_pending_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let _ = wp510r_released_attach_commit_failure(&mut h);
+    let (rx, _) = h.rpc_deferred(bind_to(WP510R_BIND_TARGET));
+    let token = match h.reg.admission_gate().freeze_if_idle("wp510r-bind-wait") {
+        sw_core::admission::FreezeOutcome::Frozen { token, .. } => token,
+        outcome => panic!("應建立暫時凍結：{outcome:?}"),
+    };
+    h.advance(Duration::from_millis(3100));
+    assert!(rx.try_recv().is_err(), "暫時凍結期間 Timer 延後");
+    assert!(h.reg.admission_gate().thaw(&token));
+    h.advance(Duration::from_millis(1000));
+    let response = rx.try_recv().expect("撤銷凍結後重播並回覆").unwrap();
+    session_error(&response, "SESSION_RECOVERING");
+    assert_eq!(response.get("drain_stalled"), Some(&PyValue::Bool(true)), "{response:?}");
+}
+
+/// T14 凍結分類：`SessionRequest::ReleaseDeadlineElapsed` 屬 Request（bypass）。Pending 與 Permanent 期間都處理，只回覆
+/// 既有 release waiter（T-1 等待），不啟動新工作。
+#[test]
+fn wp510r_r3_t14_release_deadline_notice_handled_under_pending_and_permanent_freeze() {
+    for permanent in [false, true] {
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        let (r_epoch, r_stop) = wp510r_released_attach_commit_failure(&mut h);
+        let (rx, _) = h.rpc_deferred(release());
+        h.receipt(r_epoch, r_stop).handle_closed(false).feed();
+        assert!(rx.try_recv().is_err(), "前置：T-1 等待中");
+        if permanent {
+            h.reg.admission_gate().freeze();
+        } else {
+            let _ = h.reg.admission_gate().freeze_if_idle("wp510r-release-deadline");
+        }
+        let (ack, effects) = h.rpc_full(SessionRequest::ReleaseDeadlineElapsed);
+        assert_eq!(ack.unwrap().get("ok"), Some(&PyValue::Bool(true)));
+        assert!(wp510r_open_bridge_paths(&effects).is_empty(), "不啟動新工作");
+        let response = rx
+            .try_recv()
+            .unwrap_or_else(|_| panic!("凍結（permanent={permanent}）期間首次期限通知須回覆 release"))
+            .unwrap();
+        session_error(&response, "DRAIN_STALLED");
+    }
+}
+
+/// `ReleaseDeadlineElapsed` 只作用在 T-1 等待（有 retired drain）：自身 bridge 排空中的 release 沿用自身期限，不受通知
+/// 影響（凍結節點 `close_failure_keeps_recovering_and_no_success` 等依賴的基線時點不變）。
+#[test]
+fn wp510r_r3_release_deadline_notice_ignored_without_retired_drain() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let (rx, _) = h.rpc_deferred(release());
+    let (ack, _) = h.rpc_full(SessionRequest::ReleaseDeadlineElapsed);
+    assert_eq!(ack.unwrap().get("ok"), Some(&PyValue::Bool(true)));
+    assert!(rx.try_recv().is_err(), "沒有 retired drain 時不得提前結算自身排空");
+    assert_eq!(h.public()["drain_stalled"], PyValue::Bool(false));
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).handle_closed(true).feed();
+    let response = rx.try_recv().expect("回條後回覆").unwrap();
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
 }

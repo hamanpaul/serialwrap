@@ -152,6 +152,10 @@ pub enum TimerEvent {
     ForceRecoverPoll { id: u64, n: u32 },
     /// S2-PAR-wp510r R1: CustodyPoll 本地計時器（每 500 ms 補收或確認終態/offer）。
     CustodyPoll,
+    /// S2-PAR-wp510r R3（設計 §3.1.6 BindWait）：`session.bind` 等待 retired drain 終態的期限（請求 +3000 ms）。
+    /// T14 分類同其他 `Timer`（生命週期）：Open 處理、Pending 延後並於撤銷後重播、Permanent 處理（只回覆該 bind waiter，
+    /// 不啟動新工作）。
+    BindWaitTimeout { id: u64 },
 }
 
 /// `DeviceDetached` 原因（→ `DEVICE_REMOVED`／`DEVICE_REBOUND_REQUIRED`）。

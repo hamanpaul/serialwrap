@@ -240,6 +240,13 @@ pub enum SessionRequest {
     MarkAttachStalled {
         epoch: u64,
     },
+    /// S2-PAR-wp510r R3（設計 §3.1.6 T-1；SPEC-GAP 2 的處理）：release 的首次期限（RPC 進入時刻 +3000 ms，實時）
+    /// 已到而 actor 尚未回覆。由 manager 的 release RPC 執行緒送出（Python `release_device` 在取得 manager lock 前起算
+    /// 期限並以實時等待作業 `done`，`origin/main:sw_core/session_manager.py:3117-3124`、`:3188-3204`）；actor 只在 T-1
+    /// 等待（有 retired drain）時，以等同自身 `DrainTimeout` 的方式回 DRAIN_STALLED（`mark_drain_timeout`，冪等）。
+    /// 正式環境 actor 時鐘即實時，兩者同時到期；測試 rig 的 FakeClock 不自行推進時由此通知收尾。
+    /// T14 分類：Request（bypass），Open／Pending／Permanent 皆處理；只回覆既有 release waiter，不啟動新工作。
+    ReleaseDeadlineElapsed,
     /// OD-63：placeholder release 的開埠逾時；`token` 讓遲到收尾只清除同一個 op 的 stall。
     PlaceholderAttachStalled {
         token: u64,
@@ -518,6 +525,11 @@ pub struct SessionCore {
     /// S3 遲到的舊 epoch `BridgeOpened`、S4 其他不接手就排空的已開啟 bridge。開埠終態（`open_real_path`）與 handle
     /// 關閉終態分開追蹤：release、shutdown、bind、attach 都查這張表；收斂規則見 `retired_drain_receipt`。
     retired_drains: Vec<RetiredDrain>,
+    /// 設計 §3.1.3、§3.1.6 BindWait：`session.bind` 等待 retired drain 的終態（期限＝請求 +3000 ms，只回 bind
+    /// waiter）。Python `bind_session` 取消作業後等 `done`，確認關閉才遞迴 bind（`origin/main:sw_core/session_manager.py:3676-3694`、
+    /// `:3727`），逾時或關閉失敗設 RECOVERING＋drain_stalled＋epoch（`:3697-3711`）。審查 P8-566d90b-3。
+    bind_waits: Vec<BindWait>,
+    next_bind_wait_id: u64,
     next_op_id: u64,
     next_uuid: u64,
     quiet_since: Option<Mono>,
@@ -723,6 +735,13 @@ struct RetiredDrain {
     receipt: RetiredReceipt,
 }
 
+/// 等待 retired drain 終態的 `session.bind`（見 `SessionCore::bind_waits`）。
+struct BindWait {
+    id: u64,
+    target: String,
+    reply: Reply,
+}
+
 /// 退休排空項目的回條狀態（D1 三態：成功回條即移除項目，不留在表內）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RetiredReceipt {
@@ -781,6 +800,8 @@ impl SessionCore {
             release_persist_pending: false,
             retired_stops: VecDeque::new(),
             retired_drains: Vec::new(),
+            bind_waits: Vec::new(),
+            next_bind_wait_id: 0,
             next_op_id: 0,
             next_uuid: 0,
             quiet_since: None,
@@ -999,7 +1020,8 @@ impl SessionCore {
     ///     ConsoleCountChanged, BridgeOpened, UartIoError, UartTxCompleted, DrainDataBarrier, WorkerStopped,
     ///     WorkerDrainTimeout, OpFinished, LoginFinished, StateCommitted, HumanTxCompleted, FlashSyncProbeStart,
     ///     FlashProbeReleased, FlashSyncMatched, FlashHolderGone}、Timer::{BootQuietExpired, LeaseExpiry,
-    ///     DrainTimeout, ForceRecoverPoll}、Data::ConsoleDisconnected。BridgeOpened／LoginFinished 僅結算凍結前已
+    ///     DrainTimeout, ForceRecoverPoll, BindWaitTimeout}、Data::ConsoleDisconnected。Request 中的
+    ///     `ReleaseDeadlineElapsed`（wp510r R3）只回覆既有 release waiter，三種狀態都處理。BridgeOpened／LoginFinished 僅結算凍結前已
     ///     接受的開啟／探測，不在凍結後繼續 readiness。Python 收尾對照：session_manager.py:1734-1792, 4443-4462,
     ///     8042-8064, 8067-8088；console close：uart_io.py:1505-1525。
     /// (c) Data::UartRxChunk 依 rulings/s2.md「P8X-9e51abd-1 降為 Low」維持現況，不在本項改 RX 記帳
@@ -2426,6 +2448,11 @@ impl SessionCore {
                     "physical_len" => PyValue::from(self.queue.physical_len() as i64),
                 }),
             )],
+            SessionRequest::ReleaseDeadlineElapsed => {
+                let mut effects = self.release_deadline_elapsed(now);
+                effects.push(Effect::Reply(reply, Ok(pydict! { "ok" => true })));
+                effects
+            }
             #[cfg(feature = "test-fakes")]
             SessionRequest::RetiredDrainsForTest => {
                 let epochs: Vec<PyValue> = self.retired_drains.iter().map(|r| PyValue::Int(PyInt::Small(r.epoch as i128))).collect();
@@ -2672,8 +2699,9 @@ impl SessionCore {
         // 待開埠（clear 後等 manager 再解析）、開埠中、已開埠等 unreleased 落盤。
         let attach_inflight = self.pending_attach.is_some()
             || self.open_real_path.is_some()
-            // retired drain 未收斂（DR-4 c；Python 作業仍在 `_active_attach_ops`，`:3428-3432`）。
-            || !self.retired_drains.is_empty()
+            // retired drain 未收斂且沒有自身 bridge（DR-4 c；Python 作業仍在 `_active_attach_ops`，`:3428-3432`）。有自身
+            // bridge 時先走下方有 bridge 的冪等判斷（Python `:3420` 先於在途表分流 `:3427-3443`；審查 P8-566d90b-2）。
+            || (self.generations.conn_epoch.is_none() && !self.retired_drains.is_empty())
             || (self.state == SessionState::Attaching && self.generations.conn_epoch.is_none())
             || matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }));
         if attach_inflight {
@@ -2792,10 +2820,12 @@ impl SessionCore {
         }
         if self.open_real_path.is_some()
             || self.pending_attach.is_some()
-            || !self.retired_drains.is_empty()
             || matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }))
         {
             return vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))];
+        }
+        if !self.retired_drains.is_empty() {
+            return self.bind_wait_retired_drains(by_id, reply, now);
         }
         if self.generations.conn_epoch.is_some() {
             self.pending_bind = Some(by_id);
@@ -2803,6 +2833,69 @@ impl SessionCore {
         }
         self.apply_bind(by_id, now);
         vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
+    }
+
+    /// BindWait（設計 §3.1.6）：退休 bridge 的 handle 尚未確認關閉時，bind 等到其終態，上限 3000 ms。
+    /// - 已有失敗回條（D1 iii，終態已知）：立即回 SESSION_RECOVERING＋stalled，不改綁。
+    /// - 仍待回條：掛起並排 `BindWaitTimeout`；成功回條後重新走 bind（Python 遞迴 `:3727`），失敗回條或逾時回
+    ///   SESSION_RECOVERING＋stalled（`retired_drain_receipt`、`bind_wait_timeout`）。
+    fn bind_wait_retired_drains(&mut self, target: String, reply: Reply, now: Mono) -> Vec<Effect> {
+        if self
+            .retired_drains
+            .iter()
+            .any(|entry| entry.receipt == RetiredReceipt::Failed)
+        {
+            return vec![Effect::Reply(reply, Ok(self.bind_stalled_reply(now)))];
+        }
+        self.next_bind_wait_id = self.next_bind_wait_id.saturating_add(1);
+        let id = self.next_bind_wait_id;
+        self.bind_waits.push(BindWait { id, target, reply });
+        vec![Effect::Schedule {
+            at: now.saturating_add(crate::resources::DRAIN_TIMEOUT_MS.saturating_mul(1_000_000)),
+            ev: TimerEvent::BindWaitTimeout { id },
+        }]
+    }
+
+    /// Python `bind_session` 等待逾時或關閉失敗：活 session 設 RECOVERING、`drain_stalled`、`drain_timeout_epoch`，回
+    /// SESSION_RECOVERING（`origin/main:sw_core/session_manager.py:3697-3711`）。
+    fn bind_stalled_reply(&mut self, now: Mono) -> PyDict {
+        self.set_state(SessionState::Recovering, now);
+        self.drain_stalled = true;
+        self.drain_timeout_epoch = Some(self.generations.bridge_generation);
+        self.session_recovering_reply(now)
+    }
+
+    /// BindWait 期限到（只回該 bind waiter；已由終態回覆者不動）。
+    fn bind_wait_timeout(&mut self, id: u64, now: Mono) -> Vec<Effect> {
+        let Some(index) = self.bind_waits.iter().position(|wait| wait.id == id) else {
+            return Vec::new();
+        };
+        let wait = self.bind_waits.remove(index);
+        vec![Effect::Reply(wait.reply, Ok(self.bind_stalled_reply(now)))]
+    }
+
+    /// retired drain 收到失敗回條：所有 bind waiter 立即回 SESSION_RECOVERING＋stalled（bind 收到終態即回）。
+    fn fail_bind_waits(&mut self, now: Mono) -> Vec<Effect> {
+        let waits = std::mem::take(&mut self.bind_waits);
+        waits
+            .into_iter()
+            .map(|wait| Effect::Reply(wait.reply, Ok(self.bind_stalled_reply(now))))
+            .collect()
+    }
+
+    /// retired drain 全部成功收斂：bind waiter 重新走 bind（Python 遞迴 `:3727`）；期間有停止進行中（release 等）時回
+    /// SESSION_RECOVERING＋當下的 drain 欄位（Python `release_request` 已設時，`:3716-3726`）。
+    fn resume_bind_waits(&mut self, now: Mono) -> Vec<Effect> {
+        let waits = std::mem::take(&mut self.bind_waits);
+        let mut effects = Vec::new();
+        for wait in waits {
+            if self.pending_open_stop.is_some() || self.stop.is_some() {
+                effects.push(Effect::Reply(wait.reply, Ok(self.session_recovering_reply(now))));
+            } else {
+                effects.extend(self.bind_request(wait.target, wait.reply, now));
+            }
+        }
+        effects
     }
 
     /// 改綁的狀態套用（離開 RELEASED、清 released metadata、裝置視為未在線）。
@@ -2971,8 +3064,12 @@ impl SessionCore {
                 let failure_error = open_failure_last_error(&failure);
                 if let Some(pending) = self.pending_open_stop.take() {
                     self.open_real_path = None;
-                    if !self.retired_drains.is_empty() {
-                        // 開埠已到終態，但先前退休的 bridge 仍持有 handle（收斂規則）：停止留到其回條才完成。
+                    if matches!(pending.kind, StopKind::Release | StopKind::Shutdown)
+                        && !self.retired_drains.is_empty()
+                    {
+                        // 開埠已到終態，但先前退休的 bridge 仍持有 handle（收斂規則）：release／shutdown 留到其回條才完成
+                        // （`retired_drain_receipt`）。其他停止（clear、拔除、改指等）沒有等待 retired drain 的收尾路徑，
+                        // 照開埠終態完成，與 `begin_stop`、`worker_stopped` 的範圍一致（審查 P8-566d90b-1）。
                         self.pending_open_stop = Some(pending);
                         return Vec::new();
                     }
@@ -3174,8 +3271,10 @@ impl SessionCore {
     ///   中的 attach）、retired_drains、自身 IoWorker 三者都已收斂才完成停止（Python `_finish_attach_op` 確認關閉後才
     ///   完成 release，`origin/main:sw_core/session_manager.py:4320-4363`）。
     /// - `handle_closed:false`：項目轉失敗並永久保留，登記 by_id 為未確認關閉（D1 iii；Python 關閉失敗即回 False、
-    ///   保留作業且不設 `done`，`:4322-4332`）。等待中的 release 立即回 DRAIN_STALLED（T-1 的切換見下方 SPEC-GAP 註記）；
-    ///   其他停止（shutdown）不回覆、判為未排空。
+    ///   保留作業且不設 `done`，`:4322-4332`）。等待中的 release 依 T-1 不提前回覆、不改 drain 欄位，由首次期限
+    ///   （`mark_drain_timeout`）回 DRAIN_STALLED（設計 §3.1.6 第二處；Python release 等 `done` 至期限，`:3188-3204`）；
+    ///   其他停止（shutdown）不回覆、判為未排空；bind waiter 收到終態即回 SESSION_RECOVERING＋stalled。
+    /// - 全部成功收斂後，bind waiter 重新走 bind（`resume_bind_waits`）。
     /// - 不配對的回條不動。
     fn retired_drain_receipt(&mut self, receipt: &WorkerStoppedReceipt, now: Mono) -> Vec<Effect> {
         let Some(index) = self
@@ -3200,32 +3299,11 @@ impl SessionCore {
                     self.profile.com
                 )));
             }
-            let release_waiting = self
-                .pending_open_stop
-                .as_ref()
-                .is_some_and(|pending| pending.kind == StopKind::Release);
-            if !release_waiting {
-                // 其他停止（shutdown 等）：保留 stalled、不回覆（shutdown 判為未排空）。
-                effects.extend(self.pending_open_close_unconfirmed(now));
-                return effects;
-            }
-            // 設計 §3.1.6 第二處的 T-1（失敗在等待期間到達時不提前回覆）與凍結節點
-            // `daemon::dispatch::wp510_review12_rpc_release_retired_bridge_close_failure_reports_drain_stalled`（#71，A 類，
-            // ServiceRig 的 actor 期限由 FakeClock 驅動而該節點不推進時鐘）衝突，維持即時回覆並列 SPEC-GAP 待裁決。
-            let mut reply_waiters = Vec::new();
-            if let Some(pending) = &mut self.pending_open_stop {
-                pending.stalled = true;
-                pending.close_failed = true;
-                reply_waiters.append(&mut pending.waiters);
-            }
-            self.drain_stalled = true;
-            self.drain_timeout_epoch = Some(self.generations.bridge_generation);
-            self.placeholder_attach_stall_token = None;
-            effects.extend(
-                reply_waiters
-                    .into_iter()
-                    .map(|waiter| Effect::Reply(waiter, Ok(self.drain_stalled_reply(now)))),
-            );
+            effects.extend(self.fail_bind_waits(now));
+            // T-1（設計 §3.1.6 第二處）：release 只標記關閉失敗並保留，不提前回覆、不改 drain 欄位；首次期限由
+            // `mark_drain_timeout` 回 DRAIN_STALLED，期限已過之後的 release 立即回。其他停止（shutdown 等）保留
+            // stalled、不回覆（shutdown 判為未排空）。
+            effects.extend(self.pending_open_close_unconfirmed(now));
             return effects;
         }
         self.retired_drains.remove(index);
@@ -3233,6 +3311,7 @@ impl SessionCore {
         if !self.retired_drains.is_empty() {
             return effects;
         }
+        effects.extend(self.resume_bind_waits(now));
         if let Some(pending) = self.pending_open_stop.as_ref() {
             let settled = !pending.close_failed
                 && self.open_real_path.is_none()
@@ -4007,6 +4086,7 @@ impl SessionCore {
                 self.mark_drain_timeout(epoch, stop_id, now)
             }
             TimerEvent::ForceRecoverPoll { id, n } => self.force_recover_poll(id, n, now),
+            TimerEvent::BindWaitTimeout { id } => self.bind_wait_timeout(id, now),
             _ => Vec::new(),
         }
     }
@@ -4401,6 +4481,29 @@ impl SessionCore {
         });
     }
 
+    /// `SessionRequest::ReleaseDeadlineElapsed`：release 的首次期限（實時）已到。只作用在 T-1 等待（有 retired drain，
+    /// 設計 §3.1.6）：對 release 的停止套用與自身期限計時器相同的 `mark_drain_timeout`（已逾時者冪等）。沒有 retired
+    /// drain 的 release（自身 bridge 排空、開埠在途）沿用自身的 `DrainTimeout`，不受此通知影響。
+    fn release_deadline_elapsed(&mut self, now: Mono) -> Vec<Effect> {
+        if self.retired_drains.is_empty() {
+            return Vec::new();
+        }
+        if let Some(stop) = &self.stop {
+            if stop.kind != StopKind::Release {
+                return Vec::new();
+            }
+            let (epoch, id) = (stop.epoch, stop.id);
+            return self.mark_drain_timeout(epoch, id, now);
+        }
+        match &self.pending_open_stop {
+            Some(pending) if pending.kind == StopKind::Release => {
+                let (generation, id) = (pending.generation, pending.id);
+                self.mark_drain_timeout(generation, id, now)
+            }
+            _ => Vec::new(),
+        }
+    }
+
     fn mark_drain_timeout(&mut self, epoch: u64, stop_id: StopId, now: Mono) -> Vec<Effect> {
         let stalled_epoch = self.generations.bridge_generation;
         if let Some(stop) = &mut self.stop {
@@ -4467,6 +4570,24 @@ impl SessionCore {
             self.deps
                 .unconfirmed_closes
                 .insert(&self.profile.device_by_id);
+            let release_t1 = !self.retired_drains.is_empty()
+                && self
+                    .stop
+                    .as_ref()
+                    .is_some_and(|stop| stop.kind == StopKind::Release);
+            if release_t1 {
+                // 設計 §3.1.6「不改的部分」：自身 bridge 的不安全回條立即回 STALL 只限沒有帳本紀錄與 retired drain 的
+                // 情形；同時有 retired drain 時依 Python 先找作業的順序（`:3104-3107`）採 T-1：不提前回覆、不改 drain
+                // 欄位，由首次期限（`mark_drain_timeout`）回 DRAIN_STALLED（`:3188-3204`）。
+                append_receipt_warnings(&receipt, &mut effects, &self.profile.com);
+                if let Some(error) = receipt.close_error.as_ref() {
+                    effects.push(Effect::Warn(format!(
+                        "WARNING session {} UART handle 關閉失敗：{error:?}",
+                        self.profile.com
+                    )));
+                }
+                return effects;
+            }
             let mut reply_waiters = Vec::new();
             if let Some(stop) = &mut self.stop {
                 stop.stalled = true;

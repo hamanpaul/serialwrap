@@ -252,6 +252,68 @@ impl ActorHandle {
     }
 }
 
+impl ActorHandle {
+    /// 同 [`ActorHandle::request`]，但 `notice_at`（實時）到而仍未回覆時，於 safety lane 補送一次 `notice`（不等其回覆、
+    /// lane 滿則略過），之後繼續等待原請求的回覆直到 `timeout`。供 release 的首次期限通知使用
+    /// （`SessionRequest::ReleaseDeadlineElapsed`；Python 以實時等待作業 `done` 至期限，
+    /// `origin/main:sw_core/session_manager.py:3188-3204`）。
+    pub fn request_with_notice(
+        &self,
+        req: SessionRequest,
+        timeout: Duration,
+        notice_at: Instant,
+        notice: SessionRequest,
+    ) -> Result<PyDict, PyErr> {
+        let deadline = Instant::now() + timeout;
+        let (reply, rx) = crossbeam_channel::bounded(1);
+        let sender = if matches!(&req, SessionRequest::Release { .. }) {
+            &self.safety
+        } else {
+            &self.control
+        };
+        match sender.send_timeout(ControlEvent::Request { req, reply }, timeout) {
+            Ok(()) => {}
+            Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
+                return Err(PyErr::value_error("internal timeout"));
+            }
+            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                return Err(PyErr::value_error("session actor stopped"));
+            }
+        }
+        if notice_at < deadline {
+            match rx.recv_timeout(notice_at.saturating_duration_since(Instant::now())) {
+                Ok(result) => return result,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    return Err(self.disconnected_error());
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    let (notice_reply, _notice_rx) = crossbeam_channel::bounded(1);
+                    let _ = self.safety.try_send(ControlEvent::Request {
+                        req: notice,
+                        reply: notice_reply,
+                    });
+                }
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(result) => result,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                Err(PyErr::value_error("internal timeout"))
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(self.disconnected_error()),
+        }
+    }
+
+    fn disconnected_error(&self) -> PyErr {
+        if self.join.is_finished() {
+            PyErr::value_error("session actor stopped")
+        } else {
+            PyErr::value_error("internal timeout")
+        }
+    }
+}
+
 /// 效果執行器（executor 在 actor thread 外的 IO worker 側實作；測試以替身實作）。
 pub trait EffectExecutor: Send {
     fn execute(&mut self, e: Effect, tx: &Sender<ControlEvent>, safety: &Sender<ControlEvent>);

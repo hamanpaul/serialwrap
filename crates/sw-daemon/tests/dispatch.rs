@@ -6,7 +6,7 @@ mod support;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use support::{BY_ID_A, BY_ID_B, REAL_A, REAL_B, RIG_PID, RigSpec, ServiceRig, wait_until};
 use sw_core::state_store::{LoadedState, ReleasedRow};
@@ -8981,4 +8981,132 @@ fn wp510r_r3_rpc_dr4_retired_drain_blocks_attach_and_shutdown_until_receipt() {
     wait_until("退休 bridge 回條結算", || r.mgr.retired_drains_for_test(&sid).is_empty());
     assert!(!dev.is_open(), "退休 bridge 的 handle 已關閉");
     assert_eq!(dev.open_attempts(), opens_before + 1, "全程不另開");
+}
+
+// ---------------------------------------------------------------------------
+// S2-PAR-wp510r R3 第 2 輪（審查 P8-566d90b-3、-4）：ServiceRig 端到端。
+// ---------------------------------------------------------------------------
+
+const WP510R_FREE_BY_ID: &str = "/s/by-id/usb-wp510r-free";
+
+/// DR-4 前置（ServiceRig）：RELEASED 的 COM0 `device.attach` 開埠成功但 unreleased 落盤 ENOSPC，退休 bridge 的關閉停在
+/// 暫停點。回傳 `(rig, device, sid, 開埠次數)`。
+fn wp510r_rpc_retired_bridge_paused() -> (Arc<ServiceRig>, FakeDevice, String, usize) {
+    let r = Arc::new(ServiceRig::ready_shell());
+    let dev = r.device(support::REAL_A).clone();
+    let released = r.call("device.release", r#"{"selector":"COM0"}"#);
+    assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&released));
+    r.wait_state("COM0", "RELEASED");
+    dev.pause_next_close();
+    r.fs.fail_next_atomic_write(PalError::io(28, "[Errno 28] No space left on device"));
+    let error = r.call_err("device.attach", r#"{"selector":"COM0","force":true}"#);
+    assert!(error.message.contains("No space left"), "{}", error.message);
+    assert!(dev.wait_paused(Duration::from_secs(5)), "前置：退休 bridge 的關閉停在暫停點");
+    let sid = r.mgr.resolve("COM0").expect("COM0 sid");
+    assert_eq!(r.mgr.retired_drains_for_test(&sid).len(), 1, "前置：retired_drains 登記退休 epoch");
+    let opens = dev.open_attempts();
+    (r, dev, sid, opens)
+}
+
+/// P8-566d90b-3 端到端：退休 bridge 回條前 `session.bind`：回條前不回覆，成功回條後改綁並回 ok（DETACHED／
+/// DEVICE_NOT_FOUND，新 by_id 不在線）。路徑：`Service::rpc("session.bind")` → `SessionManager::route_with_selector`
+/// → `SessionManager::bind` → actor `bind_request`（`bind_wait_retired_drains` 掛起）→ 回收者轉送的 `WorkerStopped`
+/// → `retired_drain_receipt` → `resume_bind_waits` → `bind_request` → `apply_bind`。
+#[test]
+fn wp510r_r3_rpc_bind_waits_retired_receipt_then_rebinds() {
+    let (r, dev, sid, opens) = wp510r_rpc_retired_bridge_paused();
+    let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+    let bind_rig = Arc::clone(&r);
+    let bind = std::thread::spawn(move || {
+        let _ = reply_tx.send(bind_rig.call(
+            "session.bind",
+            &format!(r#"{{"selector":"COM0","device_by_id":"{WP510R_FREE_BY_ID}"}}"#),
+        ));
+    });
+    let early = reply_rx.recv_timeout(Duration::from_millis(500)).ok();
+    dev.release_pause();
+    let reply = reply_rx.recv_timeout(Duration::from_secs(10)).ok().or(early.clone());
+    bind.join().expect("bind thread 不應 panic");
+    assert!(early.is_none(), "退休 bridge 回條前 bind 不得回覆：{:?}", early.as_ref().map(j));
+    let reply = reply.expect("成功回條後 bind 應回覆");
+    assert_eq!(reply.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&reply));
+    let session = r.session("COM0").expect("COM0 session");
+    assert_eq!(s(&session, "state"), "DETACHED", "{}", j(&session));
+    assert_eq!(s(&session, "last_error"), "DEVICE_NOT_FOUND", "{}", j(&session));
+    assert_eq!(s(&session, "device_by_id"), WP510R_FREE_BY_ID, "{}", j(&session));
+    assert!(r.mgr.retired_drains_for_test(&sid).is_empty());
+    assert!(!dev.is_open(), "退休 bridge 的 handle 已關閉");
+    assert_eq!(dev.open_attempts(), opens, "全程不另開");
+}
+
+/// P8-566d90b-3 端到端：bind 等待期間退休 bridge 回條 `handle_closed:false`：收到終態即回 SESSION_RECOVERING＋
+/// drain_stalled，state RECOVERING，不改綁、登記未確認關閉。
+#[test]
+fn wp510r_r3_rpc_bind_retired_close_failure_reports_recovering_stalled() {
+    let (r, dev, _sid, opens) = wp510r_rpc_retired_bridge_paused();
+    let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+    let bind_rig = Arc::clone(&r);
+    let bind = std::thread::spawn(move || {
+        let started = Instant::now();
+        let reply = bind_rig.call(
+            "session.bind",
+            &format!(r#"{{"selector":"COM0","device_by_id":"{WP510R_FREE_BY_ID}"}}"#),
+        );
+        let _ = reply_tx.send((reply, started.elapsed()));
+    });
+    let early = reply_rx.recv_timeout(Duration::from_millis(300)).ok();
+    dev.fail_close(PalError::io(5, "injected close failure"));
+    dev.release_pause();
+    let reply = reply_rx.recv_timeout(Duration::from_secs(10)).ok().or(early.clone());
+    bind.join().expect("bind thread 不應 panic");
+    assert!(early.is_none(), "退休 bridge 回條前 bind 不得回覆");
+    let (reply, elapsed) = reply.expect("失敗回條後 bind 應回覆");
+    assert!(elapsed < Duration::from_millis(2500), "bind 收到失敗終態即回，耗時 {elapsed:?}");
+    assert_eq!(s(&reply, "error_code"), "SESSION_RECOVERING", "{}", j(&reply));
+    assert_eq!(reply.get("drain_stalled"), Some(&PyValue::Bool(true)), "{}", j(&reply));
+    let session = r.session("COM0").expect("COM0 session");
+    assert_eq!(s(&session, "state"), "RECOVERING", "{}", j(&session));
+    assert_eq!(s(&session, "device_by_id"), support::BY_ID_A, "關閉未確認不得改綁");
+    assert!(r.mgr.unconfirmed_close_for_test(support::BY_ID_A), "退休 bridge 關閉未確認須登記阻擋");
+    assert_eq!(dev.open_attempts(), opens, "全程不另開");
+}
+
+/// P8-566d90b-4 端到端（設計 §3.1.6 第二處 T-1）：release 等待退休 bridge 時失敗回條先到：release 不提前回覆，於首次
+/// 期限（RPC 進入 +3 s，實時）回 DRAIN_STALLED；期限已過的 release 立即回。路徑：`Service::rpc("device.release")` →
+/// `SessionManager::route_inner`（起算首次期限）→ `route_after_release_settle` → `ActorHandle::request_with_notice` →
+/// actor `begin_stop(Release)`（retired_drains 未收斂建立待決停止）→ `retired_drain_receipt`（失敗只登記、不回覆）→ 首次
+/// 期限 `ReleaseDeadlineElapsed` → `release_deadline_elapsed` → `mark_drain_timeout`。
+#[test]
+fn wp510r_r3_rpc_release_retired_failure_waits_first_deadline() {
+    let (r, dev, _sid, opens) = wp510r_rpc_retired_bridge_paused();
+    let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+    let release_rig = Arc::clone(&r);
+    let release = std::thread::spawn(move || {
+        let started = Instant::now();
+        let reply = release_rig.call("device.release", r#"{"selector":"COM0"}"#);
+        let _ = reply_tx.send((reply, started.elapsed()));
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    dev.fail_close(PalError::io(5, "injected close failure"));
+    dev.release_pause();
+    wait_until("失敗回條登記未確認關閉", || r.mgr.unconfirmed_close_for_test(support::BY_ID_A));
+    let early = reply_rx.recv_timeout(Duration::from_millis(1500)).ok();
+    let reply = reply_rx.recv_timeout(Duration::from_secs(10)).ok().or(early.clone());
+    release.join().expect("release thread 不應 panic");
+    assert!(
+        early.is_none(),
+        "失敗回條在等待期間到達不得提前回覆：{:?}",
+        early.as_ref().map(|(reply, elapsed)| (j(reply), *elapsed))
+    );
+    let (reply, elapsed) = reply.expect("首次期限到應回覆");
+    assert!(elapsed >= Duration::from_millis(2500), "首次期限前不得回覆，耗時 {elapsed:?}");
+    assert!(elapsed < Duration::from_millis(5000), "首次期限後應回覆，耗時 {elapsed:?}");
+    assert_eq!(s(&reply, "error_code"), "DRAIN_STALLED", "{}", j(&reply));
+    assert_eq!(reply.get("drain_stalled"), Some(&PyValue::Bool(true)), "{}", j(&reply));
+    assert_eq!(s(&sub(&reply, "session"), "state"), "RELEASED", "已 RELEASED 不改 state");
+    let started = Instant::now();
+    let again = r.call("device.release", r#"{"selector":"COM0"}"#);
+    assert!(started.elapsed() < Duration::from_millis(1000), "期限已過的 release 立即回");
+    assert_eq!(s(&again, "error_code"), "DRAIN_STALLED", "{}", j(&again));
+    assert_eq!(dev.open_attempts(), opens, "全程不另開");
 }

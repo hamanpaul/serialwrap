@@ -4631,6 +4631,8 @@ impl SessionManager {
         request_selector: Option<&str>,
     ) -> Result<PyDict, PyErr> {
         self.pump();
+        // release 的首次期限：與 Python `release_device` 一樣在取得 manager lock 前起算（`:3117-3124`）。
+        let release_deadline = Instant::now() + ATTACH_OP_WAIT;
         if let SessionRequest::DeviceAttach { force } = &req {
             let is_placeholder = lock(&self.shared.inner)
                 .sessions
@@ -4654,7 +4656,7 @@ impl SessionManager {
             }
         }
         let is_release = matches!(req, SessionRequest::Release { .. });
-        let result = self.route_after_release_settle(sid, req, timeout);
+        let result = self.route_after_release_settle(sid, req, timeout, release_deadline);
         if let Some((by_id, token)) = revoked_handoff {
             self.shared.clear_revoked_handoff(&by_id, token);
         }
@@ -4683,6 +4685,7 @@ impl SessionManager {
         sid: &str,
         req: SessionRequest,
         timeout: Duration,
+        release_deadline: Instant,
     ) -> Result<PyDict, PyErr> {
         let stopping = lock(&self.shared.inner).stopping;
         match &req {
@@ -4722,7 +4725,21 @@ impl SessionManager {
             // P8 Task 6：file.* 的 manager 層同樣先 `_refresh_interactive_locked`（human lease 的 peer 判定）。
             self.shared.send_console_scan(sid);
         }
-        let result = self.shared.request(sid, req, timeout)?;
+        let result = if is_release {
+            // T-1（設計 §3.1.6；SPEC-GAP 2）：actor 等待 retired drain 時，release 於首次期限（實時）回 DRAIN_STALLED。
+            // 首次期限未獲回覆即通知 actor（`ReleaseDeadlineElapsed`），actor 時鐘未推進時（測試 rig）亦於期限收尾。
+            match self.shared.actor_of(sid) {
+                Some(actor) => actor.request_with_notice(
+                    req,
+                    timeout,
+                    release_deadline,
+                    SessionRequest::ReleaseDeadlineElapsed,
+                )?,
+                None => self.shared.request(sid, req, timeout)?,
+            }
+        } else {
+            self.shared.request(sid, req, timeout)?
+        };
         if is_open && is_ok(&result) {
             if let Some(iid) = str_of(&result, "interactive_id") {
                 lock(&self.shared.inner)
