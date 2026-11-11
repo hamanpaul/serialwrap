@@ -237,6 +237,8 @@ struct Entry {
     sid: String,
     profile: SessionProfile,
     profile_source: String,
+    /// 與 actor 同步的綁定世代；保管 release 等待者以此使改綁前的送達快照失效。
+    binding_generation: u64,
     /// OD-63：原 template 已不存在的 RELEASED session 佔位；不對外公開、不寫入 state.json。
     #[cfg_attr(not(feature = "test-fakes"), allow(dead_code))]
     released_placeholder: bool,
@@ -597,12 +599,16 @@ struct Inner {
 struct CustodyReleaseWait {
     sid: String,
     by_id: String,
+    binding_generation: u64,
+    deadline: Instant,
     /// 首次 release 時綁在該 by_id 上的 session actor（session 世代）：補送前核對同一 sid、同一 actor、仍綁同一 by_id。
     actor: Arc<ActorHandle>,
     source: String,
     reason: PyValue,
     /// release 已於首次期限回 DRAIN_STALLED、不再等待回條（與關閉者的結算在同一把 manager lock 內判定）。
     stalled: bool,
+    /// 首次期限回覆；後續 release 仍須沿用這份 DRAIN_STALLED 回覆，不等待送達者。
+    stalled_reply: Option<PyDict>,
     /// 關閉已確認，尚未成功把首次 release 入列；僅由送達者在 manager lock 外嘗試入列。
     completion_pending: bool,
     next_attempt: Option<Instant>,
@@ -750,6 +756,9 @@ struct Shared {
     /// S2-PAR-wp510r R3（test-fakes）：帳本紀錄的關閉者確認關閉並結算後、通知 actor（`CustodyTerminal`）前的暫停點。
     #[cfg(feature = "test-fakes")]
     custody_close_pre_notify_hook: Mutex<Option<ByIdTestHook>>,
+    /// 只供測試（test-fakes）：late release 送達者已鎖外收集待送事件、尚未寫入 actor safety lane 時暫停。
+    #[cfg(feature = "test-fakes")]
+    late_release_before_send_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// S2-PAR-wp510r R4（test-fakes）：W6 worker 的 `BeginExternalAttach` 已被接受、以該 token 登記帳本紀錄之前的一次性
     /// 暫停點（重現「先取消、後登記」：停止者在登記前送達，`ClaimForStop` 寫入 tombstone）。
     #[cfg(feature = "test-fakes")]
@@ -1104,7 +1113,9 @@ impl Shared {
             return true;
         };
         let same_session = inner.sessions.get(&wait.sid).is_some_and(|entry| {
-            Arc::ptr_eq(&entry.actor, &wait.actor) && entry.profile.device_by_id == by_id
+            Arc::ptr_eq(&entry.actor, &wait.actor)
+                && entry.profile.device_by_id == by_id
+                && entry.binding_generation == wait.binding_generation
         });
         if !wait.stalled || !same_session {
             inner.custody_release_waits.remove(&token);
@@ -1817,6 +1828,7 @@ impl Shared {
                 sid: sid.clone(),
                 profile,
                 profile_source: profile_source.to_string(),
+                binding_generation: 0,
                 released_placeholder,
                 actor: Arc::new(actor),
                 fence,
@@ -2357,12 +2369,20 @@ impl Shared {
         if !r.as_ref().is_ok_and(is_ok) {
             return;
         }
+        let already_bound = r
+            .as_ref()
+            .ok()
+            .and_then(|reply| reply.get("already_bound"))
+            == Some(&PyValue::Bool(true));
         // 作業帶著預開 handle（接手的未消費預開作業）時，先存入帳本（`Held{Worker}`），改綁落盤後以 `AcceptCustody` 交給
         // 該 session（設計 C7）；已取消者留在作業內由 worker 收尾關閉（Python `_attach_by_id` 見 `cancelled` 中止並
         // `_finish_attach_op`，`:4933-4944`）。
         let (offered, displaced) = {
             let mut inner = lock(&self.inner);
             let known = inner.sessions.get_mut(sid).map(|e| {
+                if !already_bound {
+                    e.binding_generation = e.binding_generation.saturating_add(1);
+                }
                 e.profile.device_by_id = by_id.to_string();
                 lock(&e.io.profile).device_by_id = by_id.to_string();
             });
@@ -3396,6 +3416,9 @@ impl Shared {
             for (k, mut e) in entries {
                 if k == sid {
                     e.sid = new_sid.clone();
+                    if e.profile.device_by_id != profile.device_by_id {
+                        e.binding_generation = e.binding_generation.saturating_add(1);
+                    }
                     e.profile = profile.clone();
                     e.profile_source = source.to_string();
                     *lock(&e.io.sid) = new_sid.clone();
@@ -5272,12 +5295,15 @@ impl crate::custody::DelivererCallback for Shared {
                 let same_session = inner.sessions.get(&wait.sid).is_some_and(|entry| {
                     Arc::ptr_eq(&entry.actor, &wait.actor)
                         && entry.profile.device_by_id == wait.by_id
+                        && entry.binding_generation == wait.binding_generation
                 });
-                if !same_session
-                    || snap.freeze_state == crate::admission::HandoffFreezeState::Permanent
-                {
+                if !same_session {
                     stale.push(token);
-                } else if snap.freeze_state == crate::admission::HandoffFreezeState::Open
+                } else if matches!(
+                    snap.freeze_state,
+                    crate::admission::HandoffFreezeState::Open
+                        | crate::admission::HandoffFreezeState::Permanent
+                )
                     && wait.next_attempt.is_none_or(|next| next <= now)
                 {
                     due.push((token, wait));
@@ -5292,11 +5318,21 @@ impl crate::custody::DelivererCallback for Shared {
             self.cv.notify_all();
         }
 
+        #[cfg(feature = "test-fakes")]
+        if !late_releases.is_empty() {
+            let hook = lock(&self.late_release_before_send_hook).take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+
         // Safety lane 的 retry 絕不持有 manager lock；Full 只延後重試，不撤銷 token/session 的完成義務。
         for (token, wait) in late_releases {
             let (reply, _ignored) = crossbeam_channel::bounded(1);
             let event = ControlEvent::Request {
                 req: SessionRequest::CompleteStalledRelease {
+                    by_id: wait.by_id.clone(),
+                    binding_generation: wait.binding_generation,
                     source: wait.source.clone(),
                     reason: wait.reason.clone(),
                 },
@@ -5312,6 +5348,7 @@ impl crate::custody::DelivererCallback for Shared {
                     let same_session = inner.sessions.get(&wait.sid).is_some_and(|entry| {
                         Arc::ptr_eq(&entry.actor, &wait.actor)
                             && entry.profile.device_by_id == wait.by_id
+                            && entry.binding_generation == wait.binding_generation
                     });
                     if same_wait && same_session {
                         inner.custody_release_waits.remove(&token);
@@ -5354,6 +5391,7 @@ impl Shared {
         let same_session = inner.sessions.get(&expected.sid).is_some_and(|entry| {
             Arc::ptr_eq(&entry.actor, &expected.actor)
                 && entry.profile.device_by_id == expected.by_id
+                && entry.binding_generation == expected.binding_generation
         });
         if !same_session {
             inner.custody_release_waits.remove(&token);
@@ -5386,6 +5424,8 @@ impl Shared {
 fn same_custody_release_wait(current: &CustodyReleaseWait, expected: &CustodyReleaseWait) -> bool {
     current.sid == expected.sid
         && current.by_id == expected.by_id
+        && current.binding_generation == expected.binding_generation
+        && current.deadline == expected.deadline
         && Arc::ptr_eq(&current.actor, &expected.actor)
 }
 
@@ -5507,6 +5547,8 @@ impl SessionManager {
             finish_attach_op_pre_lock_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             custody_close_pre_notify_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            late_release_before_send_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             external_attach_pre_register_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
@@ -5908,6 +5950,7 @@ impl SessionManager {
             },
             WaitLateCompletion {
                 token: u64,
+                deadline: Instant,
             },
         }
         loop {
@@ -5917,6 +5960,7 @@ impl SessionManager {
                     return Ok(None);
                 };
                 let by_id = entry.profile.device_by_id.clone();
+                let binding_generation = entry.binding_generation;
                 if by_id.is_empty() {
                     return Ok(None);
                 }
@@ -5972,10 +6016,13 @@ impl SessionManager {
                             .or_insert_with(|| CustodyReleaseWait {
                                 sid: sid.to_string(),
                                 by_id: by_id.clone(),
+                                binding_generation,
+                                deadline,
                                 actor,
                                 source: source.to_string(),
                                 reason: reason.clone(),
                                 stalled: false,
+                                stalled_reply: None,
                                 completion_pending: false,
                                 next_attempt: None,
                                 retry_delay: Duration::from_millis(10),
@@ -5993,12 +6040,20 @@ impl SessionManager {
                         .custody_release_waits
                         .iter()
                         .find_map(|(token, wait)| {
-                            (wait.sid == sid && wait.by_id == by_id && wait.completion_pending)
+                            (wait.sid == sid
+                                && wait.by_id == by_id
+                                && wait.binding_generation == binding_generation
+                                && wait.completion_pending)
                                 .then_some(*token)
                         })
                 {
                     // 關閉回條已到、但首次 release 尚未成功入列時，後續 release 等待同一送達義務，避免新請求搶先覆寫來源。
-                    Step::WaitLateCompletion { token }
+                    let deadline = inner
+                        .custody_release_waits
+                        .get(&token)
+                        .map(|wait| wait.deadline)
+                        .unwrap_or(candidate_release_deadline);
+                    Step::WaitLateCompletion { token, deadline }
                 } else {
                     // 交給 session、尚未由正式 bridge 接手的 handle 是該 session 擁有的帳本紀錄：由 actor 的 release 收尾
                     // （`ClaimForStop`，設計 §3.1.4 release；SPEC-GAP 2 的期限通知見 `route_after_release_settle`）。
@@ -6027,26 +6082,73 @@ impl SessionManager {
                         return Ok(Some(reply));
                     }
                 }
-                Step::WaitLateCompletion { token } => self.wait_late_release_enqueued(token),
+                Step::WaitLateCompletion { token, deadline } => {
+                    if let Some(reply) = self.wait_late_release_enqueued(sid, token, deadline)? {
+                        return Ok(Some(reply));
+                    }
+                }
             }
         }
     }
 
-    /// 後續 release 不得越過首次 release 的遲到完成義務；送達者成功入列或 session 世代失效時喚醒。
-    fn wait_late_release_enqueued(&self, token: u64) {
+    /// 後續 release 沿用首次絕對期限；期限到回首次 DRAIN_STALLED 回覆，遲到完成仍由送達者重試。
+    fn wait_late_release_enqueued(
+        &self,
+        sid: &str,
+        token: u64,
+        deadline: Instant,
+    ) -> Result<Option<PyDict>, PyErr> {
         let mut inner = lock(&self.shared.inner);
-        while inner
-            .custody_release_waits
-            .get(&token)
-            .is_some_and(|wait| wait.completion_pending)
-            && !inner.stopping
-        {
+        loop {
+            let Some(wait) = inner.custody_release_waits.get(&token) else {
+                return Ok(None);
+            };
+            let same_session = inner.sessions.get(sid).is_some_and(|entry| {
+                Arc::ptr_eq(&entry.actor, &wait.actor)
+                    && entry.profile.device_by_id == wait.by_id
+                    && entry.binding_generation == wait.binding_generation
+            });
+            if !same_session || !wait.completion_pending {
+                return Ok(None);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                if let Some(reply) = wait.stalled_reply.clone() {
+                    return Ok(Some(reply));
+                }
+                // 首次 waiter 已標 stalled，但其 actor 回覆尚未回到 manager 時只作短暫鎖外收斂；期限不再重新起算。
+                drop(inner);
+                return Ok(Some(self.late_release_stalled_fallback(sid)));
+            }
             let (next, _) = self
                 .shared
                 .cv
-                .wait_timeout(inner, Duration::from_millis(50))
+                .wait_timeout(inner, (deadline - now).min(Duration::from_millis(50)))
                 .unwrap_or_else(|error| error.into_inner());
             inner = next;
+        }
+    }
+
+    /// 首次 waiter 尚未寫入快取時的有限 fallback；正常路徑重用 `MarkAttachStalled` 的完整回覆。
+    fn late_release_stalled_fallback(&self, sid: &str) -> PyDict {
+        let mut session = self.shared.session_public(sid).unwrap_or_default();
+        let epoch = session
+            .get("bridge_generation")
+            .and_then(PyValue::as_i64)
+            .unwrap_or(0)
+            .max(0);
+        let state = session.get("state").and_then(PyValue::as_str);
+        if state != Some("RELEASED") {
+            session.insert("state", PyValue::from("RECOVERING"));
+        }
+        session.insert("drain_stalled", PyValue::Bool(true));
+        session.insert("drain_timeout_epoch", PyValue::from(epoch));
+        pydict! {
+            "ok" => false,
+            "error_code" => "DRAIN_STALLED",
+            "drain_stalled" => true,
+            "drain_timeout_epoch" => epoch,
+            "session" => PyValue::Dict(session)
         }
     }
 
@@ -6116,6 +6218,13 @@ impl SessionManager {
         };
         let mut response = await_actor_reply(stalled_reply, QUERY_TIMEOUT)?;
         response.insert("error_code", PyValue::from("DRAIN_STALLED"));
+        if let Some(wait) = lock(&self.shared.inner)
+            .custody_release_waits
+            .get_mut(&token)
+        {
+            wait.stalled_reply = Some(response.clone());
+        }
+        self.shared.cv.notify_all();
         Ok(Some(response))
     }
 
@@ -6401,6 +6510,7 @@ impl SessionManager {
         let has_device = {
             let mut inner = lock(&self.shared.inner);
             if let Some(e) = inner.sessions.get_mut(&sid) {
+                e.binding_generation = e.binding_generation.saturating_add(1);
                 e.profile.device_by_id = by_id.clone();
                 lock(&e.io.profile).device_by_id = by_id.clone();
             }
@@ -7792,6 +7902,23 @@ impl SessionManager {
             .custody_release_waits
             .get(&token)
             .map(|wait| wait.full_attempts)
+    }
+
+    /// 只供測試（test-fakes）：暫停 late release 在 manager 鎖外收集事件後、送入 actor safety lane 前。
+    #[cfg(feature = "test-fakes")]
+    pub fn pause_next_late_release_delivery_for_test(
+        &self,
+    ) -> (
+        crossbeam_channel::Receiver<()>,
+        crossbeam_channel::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+        *lock(&self.shared.late_release_before_send_hook) = Some(Box::new(move || {
+            let _ = entered_tx.send(());
+            let _ = resume_rx.recv();
+        }));
+        (entered_rx, resume_tx)
     }
 
     /// 只供測試（test-fakes）：暫停下一個自動登入結果 dispatch，確定性安排交接凍結與結果回填的交錯。

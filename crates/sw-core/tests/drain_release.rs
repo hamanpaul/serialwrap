@@ -5786,6 +5786,8 @@ fn wp510r_r6_p8_add3ca0_1_complete_stalled_release_under_each_freeze_state() {
             _ => None,
         };
         let (rx, effects) = h.rpc_deferred(SessionRequest::CompleteStalledRelease {
+            by_id: "/s/by-id/usb-A".into(),
+            binding_generation: 0,
             source: "agent".into(),
             reason: PyValue::from("late-close"),
         });
@@ -5828,6 +5830,8 @@ fn wp510r_r6_p8_add3ca0_1_complete_stalled_release_on_released_is_idempotent() {
     let released_at = h.public()["released_at"].clone();
     let again = h
         .rpc(SessionRequest::CompleteStalledRelease {
+            by_id: "/s/by-id/usb-A".into(),
+            binding_generation: 0,
             source: "agent".into(),
             reason: PyValue::from("late-close"),
         })

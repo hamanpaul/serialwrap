@@ -180,6 +180,8 @@ pub enum SessionRequest {
     /// T14 分類：Request（bypass），Open／Pending／Permanent 皆處理（Python `_finish_attach_op` 不看交接凍結）；只完成
     /// 既有 release 義務，不啟動新工作（不開埠、不送 TX）。
     CompleteStalledRelease {
+        by_id: String,
+        binding_generation: u64,
         source: String,
         reason: PyValue,
     },
@@ -567,6 +569,8 @@ pub struct SessionCore {
     /// 最近一次發布到 fence 的 `foreground_busy`（P7 Task 16-wire）。
     published_foreground_busy: bool,
     sid: String,
+    /// session 綁定世代；舊 by-id 的晚到完成事件不得作用在後續 bind 上。
+    binding_generation: u64,
     profile_source: String,
     deps: CoreDeps,
     state: SessionState,
@@ -919,6 +923,7 @@ impl SessionCore {
             profile,
             published_foreground_busy: false,
             sid,
+            binding_generation: 0,
             profile_source: profile_source.to_string(),
             deps,
             state: SessionState::Detached,
@@ -2568,15 +2573,27 @@ impl SessionCore {
             }
             SessionRequest::Submit(req) => self.submit(req, reply, now),
             SessionRequest::Release { source, reason } => self.release_request(source, reason, reply, now),
-            SessionRequest::CompleteStalledRelease { source, reason } => {
-                if self.state != SessionState::Released
-                    && self.stop.is_none()
-                    && self.pending_open_stop.is_none()
+            SessionRequest::CompleteStalledRelease {
+                by_id,
+                binding_generation,
+                source,
+                reason,
+            } => {
+                if self.profile.device_by_id != by_id
+                    || self.binding_generation != binding_generation
                 {
-                    self.drain_stalled = false;
-                    self.drain_timeout_epoch = None;
+                    // manager 的鎖外送達快照可能早於 bind；在 actor 套用副作用前再驗一次身分。
+                    vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
+                } else {
+                    if self.state != SessionState::Released
+                        && self.stop.is_none()
+                        && self.pending_open_stop.is_none()
+                    {
+                        self.drain_stalled = false;
+                        self.drain_timeout_epoch = None;
+                    }
+                    self.release_request(source, reason, reply, now)
                 }
-                self.release_request(source, reason, reply, now)
             }
             SessionRequest::ReleaseWithAck { source, reason, ack } => {
                 let effects = self.release_request(source, reason, reply, now);
@@ -2791,6 +2808,9 @@ impl SessionCore {
                     || self.open_real_path.is_some()
                 {
                     return vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))];
+                }
+                if self.profile.device_by_id != profile.device_by_id {
+                    self.binding_generation = self.binding_generation.saturating_add(1);
                 }
                 self.sid = format!("{}:{}", profile.template.profile_name, profile.com);
                 self.profile = profile;
@@ -3375,6 +3395,7 @@ impl SessionCore {
 
     /// 改綁的狀態套用（離開 RELEASED、清 released metadata、裝置視為未在線）。
     fn apply_bind(&mut self, target: String, now: Mono) {
+        self.binding_generation = self.binding_generation.saturating_add(1);
         if self.state == SessionState::Released {
             self.release_persist_pending = false;
             self.pending_release = None;
