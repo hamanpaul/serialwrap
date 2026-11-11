@@ -10521,6 +10521,122 @@ fn wp510r_r6_rpc_snapshot_query_timeout_preserves_late_release_completion() {
     assert_eq!(dev.close_count(), 1, "parked handle 僅關閉一次");
 }
 
+/// 審查 P8-990a04b-1（High，HEAD `990a04b3`）：首次 release 的快照查詢因 actor 暫停超過 5 秒而失敗、parked 關閉在暫停中
+/// 成功、之後再送第二次 release；原實作由 manager 代答第二次 release 時缺少快照而回例外。第 15 項（擁有者 2026-11-11
+/// 「wp510r release 等待改為 actor 主導」）後 manager 不保存快照、不代答：actor 暫停期間兩個 release 都排在 mailbox；
+/// 恢復後首次 release 認領時紀錄已結算（沒有要等的對象），照一般 release 完成 RELEASED 並落盤（`released_by` 取首次
+/// release 的 `cli`），第二次 release 冪等回 already_released；零重開、只關閉一次。Python release 在 RPC 執行緒同步處理，
+/// 找不到作業即照常釋放（`origin/main:sw_core/session_manager.py:3095-3219`）。
+#[test]
+fn wp510r_i15_rpc_p8_990a04b_1_releases_queued_during_actor_pause_after_parked_close() {
+    let r = wp510_b_placeholder_rig();
+    let dev = wp510_review8_double_enospc_bind_setup(&r, false);
+    let sid = s(&r.session("COM1").expect("COM1 session"), "session_id").to_string();
+    let token = r
+        .mgr
+        .custody_for_test(WP510_PLACEHOLDER_BY_ID)
+        .expect("前置：parked 帳本紀錄")
+        .token;
+    let unplug = wp510r_i15_unplug_parked_paused(&r, &dev);
+    let attempts = dev.open_attempts();
+
+    let (actor_resume, query) = wp510r_i15_hold_com1_actor(&r);
+    let (first_rx, first) = wp510r_i15_spawn_release(&r);
+    std::thread::sleep(Duration::from_millis(5300));
+    dev.release_pause();
+    unplug.join().expect("拔除執行緒不應 panic");
+    assert!(r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_none(), "關閉回條移除帳本紀錄");
+    assert_eq!(
+        r.mgr.terminal_for_test(token).map(|t| t.handle),
+        Some(sw_core::custody::TerminalHandle::Closed)
+    );
+    let (second_rx, second) = wp510r_i15_spawn_release(&r);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(first_rx.try_recv().is_err(), "actor 暫停期間 manager 不代答首次 release");
+    assert!(second_rx.try_recv().is_err(), "actor 暫停期間 manager 不代答第二次 release");
+
+    actor_resume.send(()).expect("恢復 actor");
+    assert!(query.join().expect("查詢執行緒不應 panic").is_ok());
+    let first_result = first_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("恢復後首次 release 回覆")
+        .expect("首次 release RPC");
+    first.join().expect("首次 release 執行緒不應 panic");
+    assert_eq!(first_result.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&first_result));
+    assert_eq!(first_result.get("already_released"), None, "{}", j(&first_result));
+    assert_eq!(s(&sub(&first_result, "session"), "state"), "RELEASED");
+    let second_result = second_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("恢復後第二次 release 回覆")
+        .expect("第二次 release RPC");
+    second.join().expect("第二次 release 執行緒不應 panic");
+    assert_eq!(
+        second_result.get("already_released"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&second_result)
+    );
+    wait_until("RELEASED 落盤", || wp510r_r6_state_has_released_sid(&r, &sid));
+    let session = r.session("COM1").expect("COM1 session");
+    assert_eq!(s(&session, "released_by"), "cli", "{}", j(&session));
+    assert_eq!(session.get("drain_stalled"), Some(&PyValue::Bool(false)), "{}", j(&session));
+    assert_eq!(dev.close_count(), 1, "parked handle 只關閉一次");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(dev.open_attempts(), attempts, "release 之後不重開");
+}
+
+/// 已知差異 N-14（設計第 5 版 §1.10、D1 iii＋T-1）：未消費的 parked（`Held{Parked}`）由 release 自己觸發關閉且關閉失敗
+/// （closed:false）時，首次 release 等滿自己的 3 秒絕對期限才回 DRAIN_STALLED，期限已過的 release 立即回；紀錄轉
+/// CloseFailed、登記未確認關閉，之後不重開、零 TX、不落盤 released。第 15 項前 manager 在 RPC 執行緒同步關閉並立即回
+/// DRAIN_STALLED（Python 在 release 內同步關閉後立即回，`origin/main:sw_core/session_manager.py:3109-3111`、`:3188-3190`、
+/// `:3193`）；actor 主導後關閉交關閉者、終態以 `CustodyTerminal` 通知，依 T-1 於首次期限回覆。
+#[test]
+fn wp510r_i15_rpc_release_triggered_parked_close_failure_waits_first_deadline() {
+    let r = wp510_b_placeholder_rig();
+    let dev = wp510_review8_double_enospc_bind_setup(&r, false);
+    let sid = s(&r.session("COM1").expect("COM1 session"), "session_id").to_string();
+    let parked = r
+        .mgr
+        .custody_for_test(WP510_PLACEHOLDER_BY_ID)
+        .expect("前置：parked 帳本紀錄");
+    assert_eq!(parked.owner, sw_core::custody::CustodyOwner::Parked, "{parked:?}");
+    let attempts = dev.open_attempts();
+    let tx_before = dev.tx_len();
+    dev.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
+
+    let started = Instant::now();
+    let stalled = r.call("device.release", r#"{"selector":"COM1"}"#);
+    let elapsed = started.elapsed();
+    assert_eq!(stalled.get("error_code"), Some(&PyValue::from("DRAIN_STALLED")), "{}", j(&stalled));
+    assert_eq!(stalled.get("drain_stalled"), Some(&PyValue::Bool(true)), "{}", j(&stalled));
+    assert!(
+        elapsed >= Duration::from_millis(2900),
+        "T-1：失敗終態不提前回覆，等滿首次 3 秒期限：{elapsed:?}"
+    );
+    assert_eq!(s(&sub(&stalled, "session"), "state"), "RECOVERING", "{}", j(&stalled));
+    let rec = r
+        .mgr
+        .custody_for_test(WP510_PLACEHOLDER_BY_ID)
+        .expect("CloseFailed 紀錄保留");
+    assert_eq!(rec.token, parked.token, "同一 token");
+    assert!(matches!(rec.phase, CustodyPhaseSnapshot::CloseFailed { .. }), "{rec:?}");
+    assert!(r.mgr.unconfirmed_close_for_test(WP510_PLACEHOLDER_BY_ID), "登記未確認關閉");
+
+    let again_at = Instant::now();
+    let again = r.call("device.release", r#"{"selector":"COM1"}"#);
+    assert_eq!(again.get("error_code"), Some(&PyValue::from("DRAIN_STALLED")), "{}", j(&again));
+    assert!(
+        again_at.elapsed() < Duration::from_millis(1000),
+        "期限已過的 release 立即回：{:?}",
+        again_at.elapsed()
+    );
+    assert!(!wp510r_r6_state_has_released_sid(&r, &sid), "關閉未確認不得落盤 released");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(dev.close_count(), 1, "只嘗試關閉一次");
+    assert_eq!(dev.open_attempts(), attempts, "不重開");
+    assert_eq!(dev.tx_len(), tx_before, "零 TX");
+}
+
 /// P8-2c5eb6b-1：release 首次期限到期後才進入 Permanent，晚到成功回條仍完成既有 release。
 #[test]
 fn wp510r_r6_rpc_late_release_completion_survives_shutdown_freeze() {

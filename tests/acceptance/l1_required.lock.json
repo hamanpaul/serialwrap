@@ -22105,6 +22105,8 @@
           "cargo:sw-daemon::dispatch::wp510_rpc_placeholder_retirement_enospc_stops_handoff",
           "cargo:sw-daemon::dispatch::wp510_rpc_release_cancels_inflight_placeholder_attach",
           "cargo:sw-daemon::dispatch::wp510_rpc_shutdown_before_placeholder_probe_submit_sends_zero_tx",
+          "cargo:sw-daemon::dispatch::wp510r_i15_rpc_p8_990a04b_1_releases_queued_during_actor_pause_after_parked_close",
+          "cargo:sw-daemon::dispatch::wp510r_i15_rpc_release_triggered_parked_close_failure_waits_first_deadline",
           "cargo:sw-daemon::dispatch::wp510r_r3_rpc_bind_retired_close_failure_reports_recovering_stalled",
           "cargo:sw-daemon::dispatch::wp510r_r3_rpc_bind_waits_retired_receipt_then_rebinds",
           "cargo:sw-daemon::dispatch::wp510r_r3_rpc_dr4_retired_drain_blocks_attach_and_shutdown_until_receipt",
