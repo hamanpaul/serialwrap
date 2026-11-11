@@ -4782,3 +4782,68 @@ fn wp510r_r3_p8_7bb9935_clear_then_release_deadline_not_inherited() {
     wp510r_assert_fresh_release_deadline(&first, &second, before);
     assert!(rx.try_recv().is_err(), "首次期限前不得回覆");
 }
+
+/// P8-7bb9935-4（Fable Medium；P8-566d90b-1 的保管路徑回歸）：出生即接管、開埠在途時 `session.clear`，關閉工作者關閉中
+/// （`CustodyClaimed(Closing)`）、開埠工作 claim 失敗回 `CloseBlocked` 之後，clear 不等帳本紀錄的關閉終態即回 ok，
+/// DETACHED／CLEARED（只有 release／shutdown 等 retired drain；Python clear 不等被取消的 attach 作業，
+/// `origin/main:sw_core/session_manager.py:3058-3082`）。
+#[test]
+fn wp510r_r3_p8_7bb9935_custody_clear_completes_before_close_terminal() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    wp510r_birth_takeover(&mut h);
+    let (rx, effects) = h.rpc_deferred(SessionRequest::Clear);
+    assert_eq!(wp510r_claims(&effects, WP510R_CUSTODY_TOKEN), 1, "clear 取消帳本紀錄");
+    wp510r_custody_claimed(&mut h, sw_core::mailbox::CustodyClaimOutcome::Closing);
+    assert!(rx.try_recv().is_err(), "開埠工作終態前不回覆");
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Err(OpenFailure::CloseBlocked),
+    });
+    let response = rx
+        .try_recv()
+        .expect("clear 不等帳本紀錄的關閉終態即回覆")
+        .unwrap();
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
+    let public = h.public();
+    assert_eq!(public["state"], PyValue::from("DETACHED"), "{public:?}");
+    assert_eq!(public["last_error"], PyValue::from("CLEARED"), "{public:?}");
+    assert_eq!(
+        wp510r_custody_awaits(&mut h),
+        vec![WP510R_CUSTODY_TOKEN as i64],
+        "帳本紀錄仍在等關閉終態"
+    );
+    let effects = h.feed(ControlEvent::CustodyTerminal {
+        token: WP510R_CUSTODY_TOKEN,
+        closed: true,
+        error: None,
+    });
+    assert!(wp510r_open_bridge_paths(&effects).is_empty(), "關閉終態不重開");
+    assert_eq!(h.public()["state"], PyValue::from("DETACHED"));
+}
+
+/// P8-7bb9935-4（拔除版本）：同上，裝置拔除：開埠工作終態後即 DETACHED／DEVICE_REMOVED，不等帳本紀錄的關閉終態
+/// （Python `update_devices` 不等被取消的 attach 作業，`origin/main:sw_core/session_manager.py:4031-4063`）。
+#[test]
+fn wp510r_r3_p8_7bb9935_custody_removal_completes_before_close_terminal() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    wp510r_birth_takeover(&mut h);
+    let effects = h.feed(ControlEvent::DeviceDetached {
+        by_id: DEVICE_BY_ID.into(),
+        reason: DetachReason::Removed,
+    });
+    assert_eq!(wp510r_claims(&effects, WP510R_CUSTODY_TOKEN), 1, "拔除取消帳本紀錄");
+    wp510r_custody_claimed(&mut h, sw_core::mailbox::CustodyClaimOutcome::Closing);
+    assert_eq!(h.public()["state"], PyValue::from("RECOVERING"), "前置：開埠工作終態前");
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Err(OpenFailure::CloseBlocked),
+    });
+    let public = h.public();
+    assert_eq!(public["state"], PyValue::from("DETACHED"), "{public:?}");
+    assert_eq!(public["last_error"], PyValue::from("DEVICE_REMOVED"), "{public:?}");
+    assert_eq!(
+        wp510r_custody_awaits(&mut h),
+        vec![WP510R_CUSTODY_TOKEN as i64],
+        "帳本紀錄仍在等關閉終態"
+    );
+}
