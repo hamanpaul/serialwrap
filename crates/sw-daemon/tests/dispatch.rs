@@ -9464,3 +9464,47 @@ fn wp510r_r3_rpc_p8_14fe592_commit_cancel_release_close_failure_t1() {
     assert_eq!(dev.open_attempts(), attempts);
     assert_eq!(dev.tx_len(), tx_before, "零 TX");
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// S2-PAR-wp510r 第 8 項第 2 輪：Fable 審查 P8-7bb9935-1（High）的 ServiceRig 端到端。
+//
+// 呼叫路徑：`Service::rpc("session.bind")` → manager bind（`offer_custody`，`AcceptCustody{open_now:false}`）→ 掛鉤停在
+// `DeviceOnline` 之前；`Service::rpc("session.recover")` → actor `recover_request` 的 Reattach 計畫 → 持有帳本紀錄時發
+// `Effect::ClaimCustody` → `OpenCtx::open_bridge_custody` 以原 handle 開 bridge；`device.release` → `begin_stop` →
+// 正式 bridge 排空、關閉該 handle。
+// ---------------------------------------------------------------------------------------------------------------
+
+/// P8-7bb9935-1：bind 已把 parked handle 交給 COM1（`AcceptCustody`）、送出 `DeviceOnline` 之前插入 `session.recover`。
+/// Python `recover_session` 無 bridge、裝置在線即 ATTACHING 並 `_spawn_attach`（`origin/main:sw_core/session_manager.py:7970-7977`），
+/// 由同一作業的 handle 續行、不另開（`:4115-4116`、`:4852-4854`），回 REATTACH。放行 bind 後 COM1 以原 handle 到 READY、
+/// 帳本紀錄移除；release 關閉該 handle（close 1），之後的 `device.attach` 照常成功。
+#[test]
+fn wp510r_r3_rpc_p8_7bb9935_recover_before_bind_device_online_uses_held_handle() {
+    let r = Arc::new(wp510_b_placeholder_rig());
+    let (bind, go, dev) = wp510_review9_bind_paused_before_device_online(&r);
+    let attempts = dev.open_attempts();
+
+    let recovered = r.call("session.recover", r#"{"selector":"COM1"}"#);
+    let attempts_after_recover = dev.open_attempts();
+    go.send(()).expect("放行 bind");
+    let bound = bind.join().expect("bind thread 不應 panic");
+
+    assert_eq!(recovered.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&recovered));
+    assert_eq!(s(&recovered, "action"), "REATTACH", "{}", j(&recovered));
+    assert_eq!(attempts_after_recover, attempts, "recover 以原 handle 續行，不另開埠");
+    assert_eq!(bound.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&bound));
+    r.wait_state("COM1", "READY");
+    assert_eq!(dev.open_attempts(), attempts, "沿用交給 session 的 handle，不另開埠");
+    assert_eq!(dev.close_count(), 0);
+    assert!(r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_none(), "正式 bridge 接手後帳本紀錄移除");
+    assert!(!r.mgr.has_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID));
+
+    let released = r.call("device.release", r#"{"selector":"COM1"}"#);
+    assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&released));
+    assert!(!dev.is_open(), "release 回 ok 時 handle 已關閉");
+    assert_eq!(dev.close_count(), 1);
+    r.wait_state("COM1", "RELEASED");
+
+    let attached = r.call("device.attach", r#"{"selector":"COM1"}"#);
+    assert_eq!(attached.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&attached));
+}

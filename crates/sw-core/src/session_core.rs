@@ -536,6 +536,9 @@ pub struct SessionCore {
     external_attach: Option<u64>,
     /// 目前 `external_attach` 已發過 `ClaimForStop`（同一 token 只發一次，C6 冪等）。
     external_claimed: bool,
+    /// 開埠在途的是保管開埠（`ClaimCustody`，由 `custody_open_effect` 設定、`BridgeOpened` 取走）。開埠種類明確記錄，
+    /// 不以「有開埠在途且有 `external_attach`」推定：一般開埠的終態不得清除保管（審查 P8-7bb9935-1）。
+    custody_opening: bool,
     /// SPEC-GAP 2：目前 release 停止的身分與首次期限（實時，`WaitAck::Release`）。
     release_wait_rt: Option<(StopId, std::time::Instant)>,
     /// clear 收尾後等 manager 再解析（Python `_spawn_attach` → `_reresolve_profile_on_reattach`）再送
@@ -842,6 +845,7 @@ impl SessionCore {
             open_real_path: None,
             external_attach: None,
             external_claimed: false,
+            custody_opening: false,
             release_wait_rt: None,
             reattach_pending: false,
             reopen_after_retired: false,
@@ -3201,7 +3205,8 @@ impl SessionCore {
         now: Mono,
     ) -> Vec<Effect> {
         // 保管紀錄的開埠工作（`ClaimCustody`）回報終態：之後本 session 不再持有該紀錄（已接手、已關閉或已由取消者收尾）。
-        let custody_open = self.open_real_path.is_some() && self.external_attach.is_some();
+        // 只看明確記錄的開埠種類（審查 P8-7bb9935-1）：一般開埠的終態不清除保管。
+        let custody_open = std::mem::take(&mut self.custody_opening);
         if custody_open {
             self.external_attach = None;
             self.external_claimed = false;
@@ -3635,7 +3640,9 @@ impl SessionCore {
                 .iter()
                 .any(|entry| entry.custody_token == Some(token))
             {
-                let release_deadline_rt = self.release_wait_rt.map(|(_, deadline)| deadline);
+                // 只沿用目前 release 停止的首次期限；已結束的 release 留下的期限不得記到之後才建立的等待上（審查
+                // P8-7bb9935-3）。沒有 release 在等時留空，由之後的首次 release 決定（`ensure_release_wait_rt`）。
+                let release_deadline_rt = self.current_release_deadline_rt();
                 self.retired_drains.push(RetiredDrain {
                     epoch: 0,
                     stop_id: StopId(0),
@@ -3650,7 +3657,7 @@ impl SessionCore {
                 self.publish_retired_drains();
             }
         }
-        if self.open_real_path.is_none() {
+        if !self.custody_opening {
             self.external_attach = None;
             self.external_claimed = false;
         }
@@ -3693,6 +3700,7 @@ impl SessionCore {
     /// 以帳本紀錄 `token` 開埠（與 `device_attached` 的 OpenBridge 相同的開埠在途設定）。
     fn custody_open_effect(&mut self, token: u64, real_path: &str, now: Mono) -> Effect {
         self.reattach_pending = false;
+        self.custody_opening = true;
         self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
         self.open_generation = self.generations.fsm_gen;
         self.open_real_path = Some(real_path.to_string());
@@ -3714,9 +3722,13 @@ impl SessionCore {
         reply: Reply,
         now: Mono,
     ) -> Vec<Effect> {
+        // 只在會開埠的狀態接受（審查 P8-7bb9935-1）：DETACHED，或 clear 收尾後等 manager 再解析的 ATTACHING（與 manager
+        // W6／DETACHED-rebind 送出前的條件相同）。其他狀態（例如 bind 等待逾時的 RECOVERING）接受了也不會開埠，紀錄只會
+        // 停在本 session 手上；拒絕後由 manager 收尾（`close_unoffered_custody`）。
+        let awaiting = self.reattach_pending && self.state == SessionState::Attaching;
         let acceptable = by_id == self.profile.device_by_id
             && matches!(self.handoff_freeze_state(), crate::admission::HandoffFreezeState::Open)
-            && self.state != SessionState::Released
+            && (self.state == SessionState::Detached || awaiting)
             && !self.shutdown_requested
             && self.stop.is_none()
             && self.pending_open_stop.is_none()
@@ -3737,8 +3749,7 @@ impl SessionCore {
         self.device_present = true;
         self.known_real_path = Some(real_path.clone());
         let mut effects = vec![Effect::ClaimOffered { token }];
-        let awaiting = self.reattach_pending && self.state == SessionState::Attaching;
-        if open_now && (self.state == SessionState::Detached || awaiting) {
+        if open_now {
             self.set_last_error(None, None);
             effects.push(self.custody_open_effect(token, &real_path, now));
         }
@@ -3749,11 +3760,7 @@ impl SessionCore {
     /// 目前 release 停止的身分與首次期限（SPEC-GAP 2）：首次期限只在首次 release 決定一次並記在被等待的對象上
     /// （retired drain／保管紀錄的 `release_deadline_rt`），之後的 release 沿用。
     fn ensure_release_wait_rt(&mut self) -> Option<(StopId, std::time::Instant)> {
-        let id = match (&self.stop, &self.pending_open_stop) {
-            (Some(stop), _) if stop.kind == StopKind::Release => stop.id,
-            (None, Some(pending)) if pending.kind == StopKind::Release => pending.id,
-            _ => return None,
-        };
+        let id = self.current_release_stop_id()?;
         if let Some((current, deadline)) = self.release_wait_rt {
             if current == id {
                 return Some((id, deadline));
@@ -3773,6 +3780,23 @@ impl SessionCore {
         }
         self.release_wait_rt = Some((id, deadline));
         Some((id, deadline))
+    }
+
+    /// 目前 release 停止（自身 bridge 排空或開埠在途的停止待決）的身分；沒有 release 在等時為 `None`。
+    fn current_release_stop_id(&self) -> Option<StopId> {
+        match (&self.stop, &self.pending_open_stop) {
+            (Some(stop), _) if stop.kind == StopKind::Release => Some(stop.id),
+            (None, Some(pending)) if pending.kind == StopKind::Release => Some(pending.id),
+            _ => None,
+        }
+    }
+
+    /// 目前 release 停止的首次期限：`release_wait_rt` 只在其身分仍是目前的 release 停止時有效（審查 P8-7bb9935-3）。
+    fn current_release_deadline_rt(&self) -> Option<std::time::Instant> {
+        let id = self.current_release_stop_id()?;
+        self.release_wait_rt
+            .filter(|(current, _)| *current == id)
+            .map(|(_, deadline)| deadline)
     }
 
     /// `ReleaseWithAck` 受理後回報 `WaitAck::Release`（只在 release 仍在等待時；已回覆者 RPC 直接取得回覆）。
@@ -4959,8 +4983,11 @@ impl SessionCore {
         deadline: std::time::Instant,
         now: Mono,
     ) -> Vec<Effect> {
-        // SPEC-GAP 2：只結算身分與首次期限都相符、仍在等待的那一筆；重複或過期的通知不產生效果。
-        if self.release_wait_rt != Some((stop_id, deadline)) {
+        // SPEC-GAP 2：只結算身分與首次期限都相符、仍在等待的那一筆；重複或過期的通知（含已結束的 release 留下者，審查
+        // P8-7bb9935-3）不產生效果。
+        if self.release_wait_rt != Some((stop_id, deadline))
+            || self.current_release_stop_id() != Some(stop_id)
+        {
             return Vec::new();
         }
         if self.retired_drains.is_empty() {
@@ -6678,6 +6705,29 @@ impl SessionCore {
                     .known_real_path
                     .clone()
                     .unwrap_or_else(|| self.profile.device_by_id.clone());
+                if let Some(token) = self.external_attach {
+                    // 本 session 持有尚未開埠的帳本紀錄（bind 改綁到 parked、`DeviceOnline` 之前等；審查 P8-7bb9935-1）：
+                    // Python `_spawn_attach` 由同一作業的 handle 續行，不另開（`origin/main:sw_core/session_manager.py:4115-4116`、
+                    // `:4852-4854`）。以 `ClaimCustody` 認領原 handle；已有取消者在收尾（`ClaimForStop` 已發）時不認領，
+                    // 等其終態後才重開（同單次在途）。
+                    self.set_last_error(None, None);
+                    if self.external_claimed {
+                        self.set_state(SessionState::Attaching, now);
+                        self.reopen_after_retired = true;
+                        return vec![Effect::Reply(reply, Ok(reattach_reply(self)))];
+                    }
+                    let open = self.custody_open_effect(token, &real_path, now);
+                    return vec![open, Effect::Reply(reply, Ok(reattach_reply(self)))];
+                }
+                if !self.retired_drains.is_empty() {
+                    // 單次在途（設計 DR-8 a；審查 P8-7bb9935-2）：退休 bridge 或帳本紀錄的 handle 尚未確認關閉，recover 不另開
+                    // 第二個 handle；回條（`handle_closed:true`）到了才以目前路徑重開（`try_converge`）。Python `_spawn_attach`
+                    // 遇同 by_id 在途作業即去重，由該作業結束後的重試開埠（`:4115-4116`、`:4126-4145`）。
+                    self.set_last_error(None, None);
+                    self.set_state(SessionState::Attaching, now);
+                    self.reopen_after_retired = true;
+                    return vec![Effect::Reply(reply, Ok(reattach_reply(self)))];
+                }
                 self.set_last_error(None, None);
                 self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
                 self.open_generation = self.generations.fsm_gen;

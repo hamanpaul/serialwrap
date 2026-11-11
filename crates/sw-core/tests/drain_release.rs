@@ -4568,3 +4568,217 @@ fn wp510r_r3_t14_bind_notice_and_claim_for_stop_under_freeze() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// S2-PAR-wp510r 第 8 項第 2 輪：Fable 審查 P8-7bb9935-1～4 的回歸。
+// ---------------------------------------------------------------------------
+
+/// `Recover` 請求（CLI `session.recover` 預設參數）。
+fn wp510r_recover() -> SessionRequest {
+    SessionRequest::Recover {
+        timeout_s: 2.0,
+        force: false,
+    }
+}
+
+/// `effects` 中針對 `token` 的 `ClaimCustody` 開埠路徑。
+fn wp510r_custody_open_paths(effects: &[Effect], token: u64) -> Vec<String> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::ClaimCustody { token: t, dev, .. } if *t == token => Some(dev.0.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// P8-7bb9935-1（Fable High）觸發點一：session 持有帳本紀錄、尚未開埠（`AcceptCustody{open_now:false}`；bind 改綁到
+/// parked、`DeviceOnline` 之前）時 `session.recover`：回 REATTACH，以 `ClaimCustody` 認領原 handle，不另發一般
+/// `OpenBridge`（Python `recover_session` 無 bridge、裝置在線即 ATTACHING 並 `_spawn_attach`，由同一作業的 handle 續行，
+/// `origin/main:sw_core/session_manager.py:7970-7977`、`:4852-4854`）。之後的 `DeviceAttached` 不再開埠，停止仍作用於
+/// 帳本紀錄。
+#[test]
+fn wp510r_r3_p8_7bb9935_recover_with_held_custody_claims_same_handle() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let accepted = h
+        .rpc(SessionRequest::AcceptCustody {
+            token: 78,
+            by_id: DEVICE_BY_ID.into(),
+            real_path: REAL_PATH.into(),
+            open_now: false,
+        })
+        .unwrap();
+    assert_eq!(accepted.get("ok"), Some(&PyValue::Bool(true)), "{accepted:?}");
+    let (response, effects) = h.rpc_full(wp510r_recover());
+    let response = response.unwrap();
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
+    assert_eq!(response.get("action"), Some(&PyValue::from("REATTACH")), "{response:?}");
+    assert!(
+        wp510r_open_bridge_paths(&effects).is_empty(),
+        "持有帳本紀錄時 recover 不得另發一般 OpenBridge：{:?}",
+        wp510r_open_bridge_paths(&effects)
+    );
+    assert_eq!(
+        wp510r_custody_open_paths(&effects, 78),
+        vec![REAL_PATH.to_string()],
+        "recover 以 ClaimCustody 認領原 handle"
+    );
+    assert_eq!(h.public()["state"], PyValue::from("ATTACHING"));
+    let effects = h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    assert!(
+        wp510r_open_bridge_paths(&effects).is_empty() && wp510r_custody_open_paths(&effects, 78).is_empty(),
+        "開埠在途時 DeviceAttached 不再開埠"
+    );
+    let (_rx, effects) = h.rpc_deferred(release());
+    assert_eq!(wp510r_claims(&effects, 78), 1, "停止仍作用於帳本紀錄");
+}
+
+/// P8-7bb9935-1 觸發點二：bind 等待帳本紀錄逾時後的 RECOVERING（沒有停止）不會開埠，`AcceptCustody{open_now:true}`
+/// 必須拒絕（紀錄由 manager 收尾），不得只認領不開埠、讓之後的 recover 另開一般 OpenBridge。`DETACHED` 與 clear 後等待
+/// 再解析的 ATTACHING 才接受（manager W6／DETACHED-rebind 的同一條件）。
+#[test]
+fn wp510r_r3_p8_7bb9935_accept_custody_rejected_when_state_would_not_open() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    wp510r_birth_takeover(&mut h);
+    let (bind_rx, _) = h.rpc_deferred(bind_to(WP510R_BIND_TARGET));
+    wp510r_custody_claimed(&mut h, sw_core::mailbox::CustodyClaimOutcome::Closing);
+    h.advance(Duration::from_millis(3100));
+    let bind = bind_rx.try_recv().expect("bind 等待逾時應回覆").unwrap();
+    session_error(&bind, "SESSION_RECOVERING");
+    wp510r_custody_close_and_open_terminal(&mut h, true);
+    assert_eq!(h.public()["state"], PyValue::from("RECOVERING"), "前置：bind 逾時的 RECOVERING");
+    assert!(wp510r_custody_awaits(&mut h).is_empty(), "前置：帳本紀錄已終態");
+    let (response, effects) = h.rpc_full(SessionRequest::AcceptCustody {
+        token: 79,
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+        open_now: true,
+    });
+    assert_eq!(response.unwrap().get("ok"), Some(&PyValue::Bool(false)), "不會開埠的狀態拒絕接受保管");
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ClaimOffered { .. } | Effect::ClaimCustody { .. })),
+        "拒絕時不認領"
+    );
+    let (response, effects) = h.rpc_full(wp510r_recover());
+    assert_eq!(response.unwrap().get("action"), Some(&PyValue::from("REATTACH")));
+    assert!(
+        wp510r_custody_open_paths(&effects, 79).is_empty(),
+        "未接受的紀錄不得由 recover 認領"
+    );
+}
+
+/// P8-7bb9935-2（Fable Medium）：單次在途（DR-8 a）也涵蓋 `session.recover`。開埠途中改指、舊路徑開埠成功而退休，
+/// session 在等舊回條（ATTACHING）時 recover：回 REATTACH、不發新路徑 OpenBridge（Python `_spawn_attach` 遇同 by_id 在途
+/// 作業即去重，`origin/main:sw_core/session_manager.py:4115-4116`）；舊回條 `handle_closed:true` 之後才以目前路徑重開。
+#[test]
+fn wp510r_r3_p8_7bb9935_recover_during_retired_wait_defers_open() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (epoch, stop, _) = wp510r_rebound_retired(&mut h);
+    let (response, effects) = h.rpc_full(wp510r_recover());
+    let response = response.unwrap();
+    assert_eq!(response.get("action"), Some(&PyValue::from("REATTACH")), "{response:?}");
+    assert!(
+        wp510r_open_bridge_paths(&effects).is_empty(),
+        "DR-8(a)：舊回條前 recover 不得發出新路徑 OpenBridge：{:?}",
+        wp510r_open_bridge_paths(&effects)
+    );
+    assert_eq!(h.public()["state"], PyValue::from("ATTACHING"));
+    let effects = h.receipt(epoch, stop).handle_closed(true).feed();
+    assert_eq!(
+        wp510r_open_bridge_paths(&effects),
+        vec![WP510R_NEW_PATH.to_string()],
+        "DR-8(b)：舊回條到了才以目前路徑重開"
+    );
+}
+
+/// P8-7bb9935-3 前置：session 先完成一次等待過的 release（留下第一次 release 的身分與首次期限），再改綁到
+/// `WP510R_BIND_TARGET` 並以 `AcceptCustody{open_now:true}` 取得新的帳本紀錄（開埠在途）。回傳第一次 release 的 `WaitAck`。
+fn wp510r_custody_after_completed_release(h: &mut CoreHarness) -> sw_core::mailbox::WaitAck {
+    h.to_ready();
+    let (rx, wait) = wp510r_release_with_ack(h);
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).handle_closed(true).feed();
+    let released = rx.try_recv().expect("前置：release 收尾").unwrap();
+    assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{released:?}");
+    assert_eq!(h.public()["state"], PyValue::from("RELEASED"));
+    let bound = h.rpc(bind_to(WP510R_BIND_TARGET)).unwrap();
+    assert_eq!(bound.get("ok"), Some(&PyValue::Bool(true)), "{bound:?}");
+    let (accepted, effects) = h.rpc_full(SessionRequest::AcceptCustody {
+        token: 78,
+        by_id: WP510R_BIND_TARGET.into(),
+        real_path: WP510R_NEW_PATH.into(),
+        open_now: true,
+    });
+    assert_eq!(accepted.unwrap().get("ok"), Some(&PyValue::Bool(true)));
+    assert_eq!(wp510r_custody_open_paths(&effects, 78), vec![WP510R_NEW_PATH.to_string()]);
+    // 讓第二次 release 的實時起點確實晚於第一次。
+    std::thread::sleep(Duration::from_millis(20));
+    wait
+}
+
+/// 第二次等待的首次期限必須以本次 release 起算（SPEC-GAP 2 條件 1、DR-6）：不得沿用已結束的第一次 release 的期限。
+fn wp510r_assert_fresh_release_deadline(
+    first: &sw_core::mailbox::WaitAck,
+    second: &sw_core::mailbox::WaitAck,
+    before: std::time::Instant,
+) {
+    let (
+        sw_core::mailbox::WaitAck::Release { stop_id: first_id, deadline: first_deadline },
+        sw_core::mailbox::WaitAck::Release { stop_id, deadline },
+    ) = (first, second)
+    else {
+        panic!("release 應回報 WaitAck::Release：{first:?} {second:?}");
+    };
+    assert_ne!(stop_id, first_id, "新的 release 停止");
+    assert!(
+        *deadline >= before + Duration::from_millis(sw_core::resources::DRAIN_TIMEOUT_MS),
+        "首次期限須以本次 release 起算（第一次 {first_deadline:?}，本次 {deadline:?}）"
+    );
+}
+
+/// P8-7bb9935-3（Fable Medium）情境 (a)：bind 取消新的帳本紀錄（BindWait，關閉進行中）之後的第一次 `device.release`。
+#[test]
+fn wp510r_r3_p8_7bb9935_bind_wait_release_deadline_not_inherited() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let first = wp510r_custody_after_completed_release(&mut h);
+    let (bind_rx, effects) = h.rpc_deferred(bind_to("/s/by-id/usb-wp510r-bind-other"));
+    assert_eq!(wp510r_claims(&effects, 78), 1, "bind 取消帳本紀錄");
+    h.feed(ControlEvent::CustodyClaimed {
+        token: 78,
+        outcome: sw_core::mailbox::CustodyClaimOutcome::Closing,
+    });
+    assert!(bind_rx.try_recv().is_err(), "前置：BindWait 等待關閉終態");
+    let before = std::time::Instant::now();
+    let (rx, second) = wp510r_release_with_ack(&mut h);
+    wp510r_assert_fresh_release_deadline(&first, &second, before);
+    assert!(rx.try_recv().is_err(), "首次期限前不得回覆");
+}
+
+/// P8-7bb9935-3 情境 (b)：`session.clear` 取消新的帳本紀錄、clear 回覆後關閉仍在進行，之後的第一次 `device.release`。
+#[test]
+fn wp510r_r3_p8_7bb9935_clear_then_release_deadline_not_inherited() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let first = wp510r_custody_after_completed_release(&mut h);
+    let (clear_rx, effects) = h.rpc_deferred(SessionRequest::Clear);
+    assert_eq!(wp510r_claims(&effects, 78), 1, "clear 取消帳本紀錄");
+    h.feed(ControlEvent::CustodyClaimed {
+        token: 78,
+        outcome: sw_core::mailbox::CustodyClaimOutcome::Closing,
+    });
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Err(OpenFailure::CloseBlocked),
+    });
+    let cleared = clear_rx.try_recv().expect("前置：clear 不等關閉終態").unwrap();
+    assert_eq!(cleared.get("ok"), Some(&PyValue::Bool(true)), "{cleared:?}");
+    assert_eq!(wp510r_custody_awaits(&mut h), vec![78], "前置：關閉仍在進行");
+    let before = std::time::Instant::now();
+    let (rx, second) = wp510r_release_with_ack(&mut h);
+    wp510r_assert_fresh_release_deadline(&first, &second, before);
+    assert!(rx.try_recv().is_err(), "首次期限前不得回覆");
+}
