@@ -1731,6 +1731,10 @@ fn test_dr7_deliverer_drops_obligation_on_formal_handoff_commit() {
 /// 審查 P8-6a679fb-1：bind 的 parked 續行以 C1′ 同 token 認領（`Taken{OpenJob}`），不借用 `claim_for_release`
 /// （原本標成 `Closing{release}`、owner Reaper，handle 其實仍在使用）。DeviceOnline 之前插入 `device.release`：release
 /// 認領交接列並關閉 handle（closed:true）後，該紀錄依 C3 結算（移除、終態 Closed），不留到下一次成功開埠才被覆寫。
+///
+/// 審查 P8-03333f7-1 修法 4：release 成功返回後 `route()` 會以 by_id 無條件結算帳本紀錄，會蓋掉關閉者自己的結算。
+/// 因此在 release 的關閉者確認關閉、尚未收尾關閉中作業時（`finish_attach_op` 取鎖前；release 仍在等作業收尾，
+/// actor 的 `Release` 尚未送出）斷言結算，只有 `close_claimed_handoff` 的 `settle_claimed_close` 能讓它成立。
 #[test]
 fn test_parked_continuation_bind_claims_same_token_and_settles_on_release_close() {
     let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1765,16 +1769,51 @@ fn test_parked_continuation_bind_claims_same_token_and_settles_on_release_close(
     );
     assert!(dev.is_open());
 
-    let released = m
-        .mgr
-        .route(
-            &full_sid,
+    // release 的關閉者（`spawn_handoff_closer` → `close_claimed_handoff`）確認關閉後、收尾作業前暫停。
+    let (fin_entered_tx, fin_entered_rx) = crossbeam_channel::bounded(1);
+    let (fin_go_tx, fin_go_rx) = crossbeam_channel::bounded::<()>(1);
+    m.mgr.set_finish_attach_op_pre_lock_hook_for_test(
+        DR7_BY_ID,
+        Box::new(move || {
+            let _ = fin_entered_tx.send(());
+            let _ = fin_go_rx.recv_timeout(Duration::from_secs(10));
+        }),
+    );
+    let release_mgr = m.mgr.clone();
+    let release_sid = full_sid.clone();
+    let release = std::thread::spawn(move || {
+        release_mgr.route(
+            &release_sid,
             sw_core::session_core::SessionRequest::Release {
                 source: "agent".to_string(),
                 reason: PyValue::Null,
             },
             Duration::from_secs(10),
         )
+    });
+    fin_entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("release 的關閉者應在確認關閉後、收尾關閉中作業前暫停");
+    assert!(!release.is_finished(), "release 仍在等待關閉中作業收尾，route 的全域結算尚未執行");
+    assert!(
+        m.mgr.has_inflight_attach_for_test(DR7_BY_ID),
+        "關閉中作業仍在在途表（release 等待中）"
+    );
+    assert_eq!(dev.close_count(), 1, "關閉者已關閉交給 session 的 handle");
+    assert!(
+        m.mgr.custody_for_test(DR7_BY_ID).is_none(),
+        "關閉者確認關閉即以 `settle_claimed_close` 結算，不靠 release 返回後的全域結算：{:?}",
+        m.mgr.custody_for_test(DR7_BY_ID)
+    );
+    assert_eq!(
+        m.mgr.terminal_for_test(token).map(|t| t.handle),
+        Some(TerminalHandle::Closed),
+        "release 返回前同 token 的終態已為 Closed"
+    );
+    fin_go_tx.send(()).expect("放行關閉者收尾");
+    let released = release
+        .join()
+        .expect("release 執行緒不應 panic")
         .expect("release 回 Ok");
     assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{released:?}");
     assert_eq!(dev.close_count(), 1, "release 關閉交給 session 的 handle 一次");
@@ -1826,6 +1865,225 @@ fn test_parked_continuation_spawn_attach_claims_same_token_and_settles_on_open_c
     assert!(!dev.is_open());
     assert!(!m.mgr.unconfirmed_close_for_test(DR7_BY_ID), "closed:true 不得登記未確認關閉");
     assert!(!m.mgr.has_inflight_attach_for_test(DR7_BY_ID), "parked 作業已由續行者取走");
+}
+
+/// 改綁離開的目標（不在線，不會送 DeviceOnline）。
+const DR7_AWAY_BY_ID: &str = "/s/by-id/usb-H";
+
+/// 審查 P8-03333f7-1 修法 1（沒有 release 全域結算的路徑）：佔位退休落盤失敗留下 parked（正式流程），`bind COM0→B3`
+/// 以 C1′ 同 token 認領並放進交接列、停在送出 DeviceOnline 之前；另一筆 `bind COM0→usb-H` 改綁離開 B3。bind 的取消
+/// 迴圈認領交接列、代為關閉 handle（`close_claimed_handoff`），確認關閉後 B3 紀錄必須依 C3 結算（移除、原 token 終態
+/// Closed），handle 只關閉一次；之後送出的 DeviceOnline（B3）不得重新開埠。拋棄式副本同時停用
+/// `close_claimed_handoff` 的 `settle_claimed_close` 與 `finish_attach_op` 的 `settle_taken_close` 即轉紅。
+#[test]
+fn test_parked_continuation_bind_rebind_away_settles_claimed_close() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (m, dev, token) = dr7_formal_parked_rig(None);
+    let full_sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (go_tx, go_rx) = crossbeam_channel::bounded::<()>(1);
+    m.mgr.set_bind_pre_device_online_hook_for_test(Box::new(move || {
+        let _ = entered_tx.send(());
+        let _ = go_rx.recv_timeout(Duration::from_secs(10));
+    }));
+    let bind_mgr = m.mgr.clone();
+    let bind_sid = full_sid.clone();
+    let bind = std::thread::spawn(move || bind_mgr.bind(&bind_sid, DR7_BY_ID));
+    entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("bind 應停在送出 DeviceOnline 之前");
+
+    let claimed = m.mgr.custody_for_test(DR7_BY_ID).expect("帳本紀錄");
+    assert_eq!(claimed.token, token, "同 token 認領");
+    assert_eq!(
+        claimed.phase,
+        CustodyPhaseSnapshot::Taken {
+            taker: CustodyTaker::OpenJob { sid: full_sid.clone(), gen: 1 },
+        },
+        "{claimed:?}"
+    );
+    assert!(m.mgr.has_handoff_for_test(DR7_BY_ID), "handle 已放進交接列、等待正式 bridge 接手");
+    assert!(dev.is_open());
+
+    let away = m.mgr.bind(&full_sid, DR7_AWAY_BY_ID).expect("改綁離開 B3 回 Ok");
+    assert_eq!(away.get("ok"), Some(&PyValue::Bool(true)), "{away:?}");
+    assert_eq!(dev.close_count(), 1, "改綁離開時關閉交接列的 handle 一次");
+    assert!(!dev.is_open());
+    assert!(
+        m.mgr.custody_for_test(DR7_BY_ID).is_none(),
+        "改綁離開代為關閉後 B3 紀錄必須結算，不得停在 Taken／Closing：{:?}",
+        m.mgr.custody_for_test(DR7_BY_ID)
+    );
+    assert_eq!(
+        m.mgr.terminal_for_test(token).map(|t| t.handle),
+        Some(TerminalHandle::Closed),
+        "原 token 的終態為 Closed"
+    );
+    assert!(!m.mgr.unconfirmed_close_for_test(DR7_BY_ID), "closed:true 不得登記未確認關閉");
+    assert!(!m.mgr.has_handoff_for_test(DR7_BY_ID), "交接列已移除");
+    assert!(!m.mgr.has_inflight_attach_for_test(DR7_BY_ID), "關閉中作業確認關閉後移出在途表");
+
+    go_tx.send(()).expect("放行第一筆 bind");
+    let first = bind.join().expect("bind 執行緒不應 panic").expect("第一筆 bind 回 Ok");
+    assert_eq!(first.get("ok"), Some(&PyValue::Bool(true)), "{first:?}");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(dev.open_attempts(), 1, "改綁離開後不得以 B3 重新開埠");
+    assert_eq!(dev.close_count(), 1, "handle 只關閉一次");
+    assert!(m.mgr.custody_for_test(DR7_BY_ID).is_none(), "之後不得留下 B3 紀錄");
+    assert_eq!(s_of(&m.session("COM0"), "device_by_id").as_deref(), Some(DR7_AWAY_BY_ID));
+}
+
+/// 審查 P8-03333f7-1 修法 2（交接列取自帳本 `Held` 的分支）：佔位 `device.attach` 成功，dynamic 偵測建立正式 session
+/// 時 handle 留在帳本（`Held`、owner 為新 session，出生即接管）並寫入交接列；正式 bridge 接手（`open_bridge` 取 handle）
+/// 之前裝置拔除。`detach_by_id` 認領交接列時把紀錄轉為 `Closing{shutdown}`、owner Reaper（`claim_handoff_locked`），
+/// `close_claimed_handoff` 確認關閉後只有 `settle_claimed_close` 會結算它（`finish_attach_op` 的 `settle_taken_close`
+/// 只結算 `Taken`）。拋棄式副本單獨停用 `close_claimed_handoff` 的 `settle_claimed_close` 即轉紅。
+#[test]
+fn test_birth_takeover_handoff_from_ledger_unplug_settles_claimed_close() {
+    use sw_core::state_store::{LoadedState, ReleasedRow};
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut loaded = LoadedState::default();
+    loaded.released.insert(
+        DR7_PLACEHOLDER_SID.to_string(),
+        ReleasedRow {
+            by_id: PyValue::Str(DR7_BY_ID.to_string()),
+            released_by: PyValue::Str("agent".to_string()),
+            released_at: PyValue::Str("2026-10-21T00:00:00".to_string()),
+            reason: PyValue::Str("manual".to_string()),
+        },
+    );
+    let m = ManagerRig::with(&manager_yaml(&[]), loaded, None);
+    let dev = m.add_device_at(DR7_BY_ID, DR7_REAL);
+    install_shell_replies(&dev);
+    m.mgr.update_devices(&m.snapshot());
+
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (go_tx, go_rx) = crossbeam_channel::bounded::<()>(1);
+    m.mgr.set_open_bridge_pre_take_hook_for_test(Box::new(move || {
+        let _ = entered_tx.send(());
+        let _ = go_rx.recv_timeout(Duration::from_secs(10));
+    }));
+    let placeholder = m.mgr.resolve(DR7_PLACEHOLDER_SID).expect("B3 的 RELEASED 佔位");
+    let attached = m
+        .mgr
+        .attach_released_placeholder(&placeholder, false)
+        .expect("device.attach 回 Ok");
+    assert_eq!(attached.get("ok"), Some(&PyValue::Bool(true)), "{attached:?}");
+    entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("正式 session 的 open_bridge 應停在接手 handle 之前");
+    wait_until("dynamic attach 作業收尾", || !m.mgr.has_inflight_attach_for_test(DR7_BY_ID));
+
+    let held = m.mgr.custody_for_test(DR7_BY_ID).expect("出生即接管的帳本紀錄");
+    assert_eq!(held.phase, CustodyPhaseSnapshot::Held, "handle 留在帳本：{held:?}");
+    let formal_sid = match &held.owner {
+        CustodyOwner::Session { sid, .. } => sid.clone(),
+        other => panic!("owner 應為新建的正式 session：{other:?}"),
+    };
+    assert_ne!(formal_sid, DR7_PLACEHOLDER_SID, "佔位已退休");
+    assert!(m.mgr.has_handoff_for_test(DR7_BY_ID), "交接列指向正式 session");
+    assert_eq!(dev.open_count(), 1, "前置：佔位開埠 1 次");
+    assert!(dev.is_open());
+    let token = held.token;
+
+    // 拔除：裝置已不在，正式 bridge 之後的開埠回 NotFound。
+    m.serial.fail_next_open(
+        DR7_REAL,
+        sw_pal::traits::OpenError::NotFound(PalError::plain(PalErrorKind::NotFound, "No such device")),
+    );
+    let without: Vec<_> = m.snapshot().into_iter().filter(|(k, _)| k != DR7_BY_ID).collect();
+    m.mgr.update_devices(&without);
+
+    assert_eq!(dev.close_count(), 1, "拔除時代為關閉交接列的 handle 一次");
+    assert!(!dev.is_open());
+    assert!(
+        m.mgr.custody_for_test(DR7_BY_ID).is_none(),
+        "交接列取自帳本 Held、轉 Closing 的紀錄，確認關閉即須結算：{:?}",
+        m.mgr.custody_for_test(DR7_BY_ID)
+    );
+    assert_eq!(
+        m.mgr.terminal_for_test(token).map(|t| t.handle),
+        Some(TerminalHandle::Closed),
+        "同 token 的終態為 Closed"
+    );
+    assert!(!m.mgr.unconfirmed_close_for_test(DR7_BY_ID), "closed:true 不得登記未確認關閉");
+    assert!(!m.mgr.has_handoff_for_test(DR7_BY_ID), "交接列已移除");
+    assert!(!m.mgr.has_inflight_attach_for_test(DR7_BY_ID), "關閉中作業確認關閉後移出在途表");
+
+    go_tx.send(()).expect("放行 open_bridge");
+    m.wait_state(&formal_sid, "DETACHED");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(m.mgr.custody_for_test(DR7_BY_ID).is_none(), "拔除後不得留下 B3 紀錄");
+    assert_eq!(dev.close_count(), 1, "handle 只關閉一次");
+    assert!(!dev.is_open());
+}
+
+/// 審查 P8-03333f7-1 修法 3（作業自行關閉）：佔位退休落盤失敗留下 parked，B3 沒有綁定的 session；`bootstrap_attach`
+/// → `spawn_attach_with` 以 C1′ 同 token 認領給 spawn worker（`Taken{Worker("spawn_attach")}`），`attach_dynamic`
+/// 以該 handle 偵測 template。偵測 PROBE 提交前裝置拔除（取消作業），作業自行關閉 handle（`close_parts`），
+/// `finish_attach_op` 必須以 `settle_taken_close` 結算（移除、原 token 終態 Closed）。拋棄式副本單獨停用
+/// `finish_attach_op` 的 `settle_taken_close` 即轉紅。
+#[test]
+fn test_parked_continuation_spawn_worker_cancelled_attach_dynamic_settles_taken_close() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (m, dev, token) = dr7_formal_parked_rig(None);
+    assert!(m.mgr.resolve("COM3").is_none(), "前置：B3 沒有綁定的 session");
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (go_tx, go_rx) = crossbeam_channel::bounded::<()>(1);
+    let fired = Arc::new(AtomicBool::new(false));
+    let worker_name = format!("serialwrap-attach-{DR7_BY_ID}");
+    m.mgr.set_probe_pre_submit_hook_for_test(Box::new(move || {
+        // 只攔 B3 的 attach worker 第一次 PROBE（其他 by_id 的作業直接通過）。
+        let on_b3 = std::thread::current().name() == Some(worker_name.as_str());
+        if on_b3 && !fired.swap(true, Ordering::SeqCst) {
+            let _ = entered_tx.send(());
+            let _ = go_rx.recv_timeout(Duration::from_secs(10));
+        }
+    }));
+    m.mgr.bootstrap_attach();
+    entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("B3 的 spawn worker 應停在偵測 PROBE 提交前");
+
+    let claimed = m.mgr.custody_for_test(DR7_BY_ID).expect("帳本紀錄");
+    assert_eq!(claimed.token, token, "同 token 認領");
+    assert_eq!(
+        claimed.phase,
+        CustodyPhaseSnapshot::Taken {
+            taker: CustodyTaker::Worker("spawn_attach".to_string()),
+        },
+        "{claimed:?}"
+    );
+    assert_eq!(claimed.owner, CustodyOwner::Worker("spawn_attach".to_string()));
+    assert!(m.mgr.has_inflight_attach_for_test(DR7_BY_ID), "spawn worker 的作業在途");
+    assert_eq!(dev.open_attempts(), 1, "認領原 handle，不重新開埠");
+    assert!(dev.is_open());
+
+    // 拔除：`update_devices` 取消在途作業；放行後作業見取消即自行關閉 handle。
+    let without: Vec<_> = m.snapshot().into_iter().filter(|(k, _)| k != DR7_BY_ID).collect();
+    m.mgr.update_devices(&without);
+    go_tx.send(()).expect("放行偵測 PROBE");
+    wait_until("取消的作業收尾", || !m.mgr.has_inflight_attach_for_test(DR7_BY_ID));
+
+    assert_eq!(dev.close_count(), 1, "作業自行關閉 handle 一次");
+    assert!(!dev.is_open());
+    assert!(
+        m.mgr.custody_for_test(DR7_BY_ID).is_none(),
+        "作業自行確認關閉後紀錄必須結算，不得停在 Taken：{:?}",
+        m.mgr.custody_for_test(DR7_BY_ID)
+    );
+    assert_eq!(
+        m.mgr.terminal_for_test(token).map(|t| t.handle),
+        Some(TerminalHandle::Closed),
+        "原 token 的終態為 Closed"
+    );
+    assert!(!m.mgr.unconfirmed_close_for_test(DR7_BY_ID), "closed:true 不得登記未確認關閉");
+    assert_eq!(dev.open_attempts(), 1, "取消後不得重新開埠");
+    assert!(
+        !m.com_by_id().contains_key(DR7_BY_ID),
+        "取消的偵測不得建立 B3 的 session：{:?}",
+        m.com_by_id()
+    );
 }
 
 fn claimed_inc(rec: &CustodySnapshot) -> u64 {
