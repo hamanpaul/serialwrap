@@ -8926,3 +8926,59 @@ fn wp73_rpc_reboot_clears_rx_for_console_unlock_service_rig() {
     );
 }
 
+
+// ---------------------------------------------------------------------------
+// S2-PAR-wp510r R3（設計第 5 版 §1.6 DR-4、§3.1.3 retired_drains）：ServiceRig 端到端。
+// ---------------------------------------------------------------------------
+
+/// DR-4(b)(c) 端到端：RELEASED session 的 `device.attach` 開埠成功但 unreleased 落盤 ENOSPC → actor 還原 RELEASED 並
+/// 退休 bridge（S2 退休來源）。退休 bridge 的關閉停在暫停點（回條前）時：(c) 再次 `device.attach` 回 SESSION_RECOVERING
+/// （五鍵）且不開埠；(b) shutdown 不得報已排空。放行關閉後回條 handle_closed:true，shutdown 收斂。
+/// 路徑：`Service::rpc("device.attach")` → `SessionManager::route_with_selector` → actor `attach_request`
+/// （retired_drains 未收斂視同在途）；shutdown：`SessionManager::shutdown` → actor `begin_stop(Shutdown)`（retired_drains
+/// 未收斂建立待決停止）→ 回收者轉送的 `WorkerStopped` → `retired_drain_receipt`。
+#[test]
+fn wp510r_r3_rpc_dr4_retired_drain_blocks_attach_and_shutdown_until_receipt() {
+    let r = ServiceRig::ready_shell();
+    let dev = r.device(support::REAL_A).clone();
+    let released = r.call("device.release", r#"{"selector":"COM0"}"#);
+    assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&released));
+    r.wait_state("COM0", "RELEASED");
+    let opens_before = dev.open_attempts();
+
+    dev.pause_next_close();
+    r.fs.fail_next_atomic_write(PalError::io(28, "[Errno 28] No space left on device"));
+    let error = r.call_err("device.attach", r#"{"selector":"COM0","force":true}"#);
+    assert!(error.message.contains("No space left"), "{}", error.message);
+    assert!(dev.wait_paused(Duration::from_secs(5)), "前置：退休 bridge 的關閉停在暫停點");
+    assert_eq!(dev.open_attempts(), opens_before + 1, "前置：device.attach 開埠一次");
+    let session = r.session("COM0").expect("COM0 session");
+    assert_eq!(s(&session, "state"), "RELEASED", "{}", j(&session));
+    let sid = r.mgr.resolve("COM0").expect("COM0 sid");
+    assert_eq!(r.mgr.retired_drains_for_test(&sid).len(), 1, "retired_drains 登記退休 epoch");
+
+    let again = r.call("device.attach", r#"{"selector":"COM0","force":true}"#);
+    assert_eq!(
+        j(&again)
+            .split(",\"session\":")
+            .next()
+            .map(str::to_string),
+        Some(format!(
+            "{{\"ok\":false,\"error_code\":\"SESSION_RECOVERING\",\"drain_stalled\":false,\"drain_timeout_epoch\":null"
+        )),
+        "{}",
+        j(&again)
+    );
+    assert_eq!(s(&sub(&again, "session"), "state"), "RELEASED");
+    assert_eq!(dev.open_attempts(), opens_before + 1, "retired drain 回條前不得再開埠");
+
+    let drained = r.mgr.shutdown(Duration::from_millis(400));
+    assert!(
+        drained.iter().any(|(name, ok)| name == &sid && !ok),
+        "退休 bridge 回條前 shutdown 不得報已排空：{drained:?}"
+    );
+    dev.release_pause();
+    wait_until("退休 bridge 回條結算", || r.mgr.retired_drains_for_test(&sid).is_empty());
+    assert!(!dev.is_open(), "退休 bridge 的 handle 已關閉");
+    assert_eq!(dev.open_attempts(), opens_before + 1, "全程不另開");
+}

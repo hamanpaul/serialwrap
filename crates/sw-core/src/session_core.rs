@@ -513,10 +513,11 @@ pub struct SessionCore {
     pending_commit: Option<PendingCommit>,
     release_persist_pending: bool,
     retired_stops: VecDeque<RetiredStop>,
-    /// 開埠成功但 actor 不接手而退休的 bridge（`retire_opened_bridge`），其 handle 尚未確認關閉者。開埠終態（
-    /// `open_real_path`）與 handle 關閉終態分開追蹤：release 須等到配對且 `handle_closed:true` 的回條才完成 RELEASED
-    /// （wp510 第十次整包審查 High P8-14fe592-1；見 `retired_open_close_receipt`）。
-    retired_open_closes: Vec<RetiredOpenClose>,
+    /// S2-PAR-wp510r R3（設計 §3.1.3）：退休 bridge 的排空項目（由 `retired_open_closes` 改寫而來），承接所有
+    /// `retire_opened_bridge` 的來源——S1 開埠返回時路徑不符或非 ATTACHING、S2 `PendingCommit::Attach` 落盤失敗後還原、
+    /// S3 遲到的舊 epoch `BridgeOpened`、S4 其他不接手就排空的已開啟 bridge。開埠終態（`open_real_path`）與 handle
+    /// 關閉終態分開追蹤：release、shutdown、bind、attach 都查這張表；收斂規則見 `retired_drain_receipt`。
+    retired_drains: Vec<RetiredDrain>,
     next_op_id: u64,
     next_uuid: u64,
     quiet_since: Option<Mono>,
@@ -712,15 +713,24 @@ struct RetiredStop {
     aborted_op: Option<(OpId, String)>,
 }
 
-/// 退休 bridge 的關閉中作業（見 `SessionCore::retired_open_closes`）。Python 對應：被取消的 attach 作業在
+/// 退休 bridge 的排空項目（見 `SessionCore::retired_drains`）。Python 對應：被取消的 attach 作業在
 /// `_finish_attach_op` 確認關閉 handle 前留在 `_active_attach_ops`、不設 `done`，release 等待 `done`
 /// （`origin/main:sw_core/session_manager.py:3104-3107`、`:3188-3204`、`:4320-4363`）。
-struct RetiredOpenClose {
+struct RetiredDrain {
     epoch: u64,
-    id: StopId,
+    stop_id: StopId,
     by_id: String,
-    /// 回條為 `handle_closed:false`：Python 作業保留在表內（`:4322-4332`），之後的 release 等到期限回 DRAIN_STALLED。
-    close_failed: bool,
+    receipt: RetiredReceipt,
+}
+
+/// 退休排空項目的回條狀態（D1 三態：成功回條即移除項目，不留在表內）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetiredReceipt {
+    /// （i）仍待回條。
+    Pending,
+    /// （iii）回條為 `handle_closed:false`：Python 作業保留在表內（`:4322-4332`），項目永不移除；之後的 release 依 T-1
+    /// 等到首次期限回 DRAIN_STALLED。
+    Failed,
 }
 
 impl SessionCore {
@@ -770,7 +780,7 @@ impl SessionCore {
             pending_commit: None,
             release_persist_pending: false,
             retired_stops: VecDeque::new(),
-            retired_open_closes: Vec::new(),
+            retired_drains: Vec::new(),
             next_op_id: 0,
             next_uuid: 0,
             quiet_since: None,
@@ -1578,9 +1588,10 @@ impl SessionCore {
             if self.state == SessionState::Attaching
                 || self.open_real_path.is_some()
                 || matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }))
-                // 退休 bridge 的 handle 尚未確認關閉：release 等其回條（`retired_open_close_receipt`），不得以無 bridge
-                // 直接完成 RELEASED（Python release 等待被取消作業的 `done`，`:3188-3204`）。
-                || kind == StopKind::Release && !self.retired_open_closes.is_empty()
+                // 退休 bridge 的 handle 尚未確認關閉（retired_drains）：release 等其回條（`retired_drain_receipt`），不得以
+                // 無 bridge 直接完成 RELEASED（Python release 等待被取消作業的 `done`，`:3188-3204`）；shutdown 同樣等到
+                // 終態才報已排空（DR-4 b；Python shutdown 收集作業並等待 `done`，`:1181-1185`、`:1228-1239`）。
+                || matches!(kind, StopKind::Release | StopKind::Shutdown) && !self.retired_drains.is_empty()
             {
                 self.next_stop_id = self.next_stop_id.saturating_add(1);
                 let id = StopId(self.next_stop_id);
@@ -1607,7 +1618,7 @@ impl SessionCore {
                 });
                 // P8 Task 5：與 fence 凍結同處喚醒檔案傳輸等待（不動 login run 的取消世代）。
                 self.deps.rx.cancel_transfer_runs();
-                if !already_released {
+                if !already_released && (kind != StopKind::Shutdown || self.state != SessionState::Released) {
                     self.set_state(SessionState::Recovering, now);
                 }
                 self.phase1_detach(&kind, already_released);
@@ -2191,7 +2202,7 @@ impl SessionCore {
                         effects.extend(self.begin_stop(StopKind::Release, Some(reply), now).0);
                         return effects;
                     }
-                    if !self.retired_open_closes.is_empty() {
+                    if !self.retired_drains.is_empty() {
                         // 退休 bridge 的 handle 尚未確認關閉（例如 RELEASED 上的 device.attach 落盤失敗而退休）：Python
                         // release 找到作業即等待 `done` 再回 already_released（`origin/main:sw_core/session_manager.py:3104-3111`、
                         // `:3188-3214`）。
@@ -2417,7 +2428,7 @@ impl SessionCore {
             )],
             #[cfg(feature = "test-fakes")]
             SessionRequest::RetiredDrainsForTest => {
-                let epochs: Vec<PyValue> = self.retired_open_closes.iter().map(|r| PyValue::Int(PyInt::Small(r.epoch as i128))).collect();
+                let epochs: Vec<PyValue> = self.retired_drains.iter().map(|r| PyValue::Int(PyInt::Small(r.epoch as i128))).collect();
                 vec![Effect::Reply(reply, Ok(pydict! { "epochs" => PyValue::List(epochs) }))]
             }
             #[cfg(feature = "test-fakes")]
@@ -2661,6 +2672,8 @@ impl SessionCore {
         // 待開埠（clear 後等 manager 再解析）、開埠中、已開埠等 unreleased 落盤。
         let attach_inflight = self.pending_attach.is_some()
             || self.open_real_path.is_some()
+            // retired drain 未收斂（DR-4 c；Python 作業仍在 `_active_attach_ops`，`:3428-3432`）。
+            || !self.retired_drains.is_empty()
             || (self.state == SessionState::Attaching && self.generations.conn_epoch.is_none())
             || matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }));
         if attach_inflight {
@@ -2779,6 +2792,7 @@ impl SessionCore {
         }
         if self.open_real_path.is_some()
             || self.pending_attach.is_some()
+            || !self.retired_drains.is_empty()
             || matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }))
         {
             return vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))];
@@ -2903,6 +2917,9 @@ impl SessionCore {
                     {
                         // #50（P5-T16）：attach 收尾時仍需 attach（Python `_spawn_attach` finally 再 spawn）：
                         // 裝置於開啟途中改指 → 以目前 known_real_path 再送一次 OpenBridge；裝置已不在則 DETACHED。
+                        // 設計 DR-8 的單次在途（舊回條後才重開）與凍結節點
+                        // `session_manager::attach_finish_respawns_when_state_requires`（不在設計 §6 改寫表內）衝突，
+                        // 依 D5「表外凍結節點不得改斷言」維持現行時點，列 SPEC-GAP 待裁決。
                         self.open_real_path = None;
                         effects.extend(self.reopen_known_device(SessionState::Attaching, now));
                     } else if self.state != SessionState::Attaching
@@ -2954,8 +2971,8 @@ impl SessionCore {
                 let failure_error = open_failure_last_error(&failure);
                 if let Some(pending) = self.pending_open_stop.take() {
                     self.open_real_path = None;
-                    if pending.kind == StopKind::Release && !self.retired_open_closes.is_empty() {
-                        // 開埠已到終態，但先前退休的 bridge 仍持有 handle：release 留到其關閉回條才完成。
+                    if !self.retired_drains.is_empty() {
+                        // 開埠已到終態，但先前退休的 bridge 仍持有 handle（收斂規則）：停止留到其回條才完成。
                         self.pending_open_stop = Some(pending);
                         return Vec::new();
                     }
@@ -3097,6 +3114,9 @@ impl SessionCore {
         self.drain_stalled = false;
         self.placeholder_attach_stall_token = None;
         if pending.kind == StopKind::Release {
+            // Python `_finish_attach_op` 的 release 分支：作業收尾一併清 `drain_timeout_epoch`
+            // （`origin/main:sw_core/session_manager.py:4346-4351`；P8-c4913ae-1）。
+            self.drain_timeout_epoch = None;
             if pending.already_released {
                 self.set_state(SessionState::Released, now);
                 return pending
@@ -3148,29 +3168,31 @@ impl SessionCore {
         effects
     }
 
-    /// 退休 bridge 的排空回條（wp510 第十次整包審查 High P8-14fe592-1）。`handle_closed:true` 移除該關閉中作業；若 release
-    /// 正等待（`pending_open_stop` 為 release）且已無開埠在途、無其他未確認的 handle，即完成 RELEASED 並落盤（Python
-    /// `_finish_attach_op` 確認關閉後完成 release，`origin/main:sw_core/session_manager.py:4320-4363`；期限已過者為遲到
-    /// 收尾，無等待者）。`handle_closed:false` 保留作業並登記 by_id 為未確認關閉（Python 關閉失敗即回 False、保留作業且
-    /// 不設 `done`，`:4322-4332`），等待中的 release 回 DRAIN_STALLED（`:3192-3204`）。不配對的回條不動。
-    fn retired_open_close_receipt(
-        &mut self,
-        receipt: &WorkerStoppedReceipt,
-        now: Mono,
-    ) -> Vec<Effect> {
+    /// retired drain 的排空回條（設計 §3.1.3 收斂規則、§3.1.6 D1／T-1；原 wp510 第十次整包審查 High P8-14fe592-1）。
+    ///
+    /// - `handle_closed:true`：移除該項目（D1 ii）。有停止待決（release、shutdown 等）時，awaits（開埠在途、落盤
+    ///   中的 attach）、retired_drains、自身 IoWorker 三者都已收斂才完成停止（Python `_finish_attach_op` 確認關閉後才
+    ///   完成 release，`origin/main:sw_core/session_manager.py:4320-4363`）。
+    /// - `handle_closed:false`：項目轉失敗並永久保留，登記 by_id 為未確認關閉（D1 iii；Python 關閉失敗即回 False、
+    ///   保留作業且不設 `done`，`:4322-4332`）。等待中的 release 立即回 DRAIN_STALLED（T-1 的切換見下方 SPEC-GAP 註記）；
+    ///   其他停止（shutdown）不回覆、判為未排空。
+    /// - 不配對的回條不動。
+    fn retired_drain_receipt(&mut self, receipt: &WorkerStoppedReceipt, now: Mono) -> Vec<Effect> {
         let Some(index) = self
-            .retired_open_closes
+            .retired_drains
             .iter()
-            .position(|entry| entry.epoch == receipt.epoch && entry.id == receipt.stop_id)
+            .position(|entry| entry.epoch == receipt.epoch && entry.stop_id == receipt.stop_id)
         else {
             return Vec::new();
         };
         let mut effects = Vec::new();
-        if receipt.handle_closed {
-            self.retired_open_closes.remove(index);
-        } else {
-            let entry = &mut self.retired_open_closes[index];
-            entry.close_failed = true;
+        if !receipt.handle_closed {
+            let entry = &mut self.retired_drains[index];
+            if entry.receipt == RetiredReceipt::Failed {
+                // 同一 epoch 重複的回條只結算一次（C6）。
+                return effects;
+            }
+            entry.receipt = RetiredReceipt::Failed;
             self.deps.unconfirmed_closes.insert(&entry.by_id);
             if let Some(error) = receipt.close_error.as_ref() {
                 effects.push(Effect::Warn(format!(
@@ -3178,22 +3200,23 @@ impl SessionCore {
                     self.profile.com
                 )));
             }
-        }
-        let release_waiting = self
-            .pending_open_stop
-            .as_ref()
-            .is_some_and(|pending| pending.kind == StopKind::Release);
-        if !release_waiting {
-            return effects;
-        }
-        if !receipt.handle_closed {
-            // R2 過渡期：retired drain 維持現狀（等待期間收到失敗立即回覆，設計 §4、§3.1.6 第二處），R3 改為 T-1。
+            let release_waiting = self
+                .pending_open_stop
+                .as_ref()
+                .is_some_and(|pending| pending.kind == StopKind::Release);
+            if !release_waiting {
+                // 其他停止（shutdown 等）：保留 stalled、不回覆（shutdown 判為未排空）。
+                effects.extend(self.pending_open_close_unconfirmed(now));
+                return effects;
+            }
+            // 設計 §3.1.6 第二處的 T-1（失敗在等待期間到達時不提前回覆）與凍結節點
+            // `daemon::dispatch::wp510_review12_rpc_release_retired_bridge_close_failure_reports_drain_stalled`（#71，A 類，
+            // ServiceRig 的 actor 期限由 FakeClock 驅動而該節點不推進時鐘）衝突，維持即時回覆並列 SPEC-GAP 待裁決。
             let mut reply_waiters = Vec::new();
             if let Some(pending) = &mut self.pending_open_stop {
                 pending.stalled = true;
-                if pending.kind == StopKind::Release {
-                    reply_waiters.append(&mut pending.waiters);
-                }
+                pending.close_failed = true;
+                reply_waiters.append(&mut pending.waiters);
             }
             self.drain_stalled = true;
             self.drain_timeout_epoch = Some(self.generations.bridge_generation);
@@ -3205,16 +3228,30 @@ impl SessionCore {
             );
             return effects;
         }
-        let settled = self.retired_open_closes.is_empty()
-            && self.open_real_path.is_none()
-            && !matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }))
-            && !self.close_unconfirmed();
-        if settled {
-            if let Some(pending) = self.pending_open_stop.take() {
+        self.retired_drains.remove(index);
+        self.publish_retired_drains();
+        if !self.retired_drains.is_empty() {
+            return effects;
+        }
+        if let Some(pending) = self.pending_open_stop.as_ref() {
+            let settled = !pending.close_failed
+                && self.open_real_path.is_none()
+                && !matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }))
+                && !self.close_unconfirmed();
+            if settled {
+                let pending = self.pending_open_stop.take().expect("剛確認的 pending stop");
                 effects.extend(self.finish_pending_open_stop(pending, now));
             }
+            return effects;
         }
         effects
+    }
+
+    /// 把 retired drain 是否未收斂發布到 fence（manager 的 shutdown 不經 actor mailbox 讀取，見
+    /// `FenceState::retired_drains_pending`）。
+    fn publish_retired_drains(&self) {
+        let pending = !self.retired_drains.is_empty();
+        self.deps.fence.with(|f| f.retired_drains_pending = pending);
     }
 
     fn retire_opened_bridge(&mut self, opened: OpenedBridge) -> Vec<Effect> {
@@ -3229,14 +3266,15 @@ impl SessionCore {
         while self.retired_stops.len() > 32 {
             self.retired_stops.pop_front();
         }
-        // 開埠已到終態，但 handle 仍由該 worker 持有到排空回條：留下可供 release 等待的關閉中作業（wp510 第十次整包
-        // 審查 High P8-14fe592-1；Python 被取消的作業確認關閉前留在 `_active_attach_ops`，`:4320-4363`）。
-        self.retired_open_closes.push(RetiredOpenClose {
+        // 開埠已到終態，但 handle 仍由該 worker 持有到排空回條：登記 retired drain，供 release、shutdown、bind、attach
+        // 等待（S1～S4 所有退休來源都經此處；Python 被取消的作業確認關閉前留在 `_active_attach_ops`，`:4320-4363`）。
+        self.retired_drains.push(RetiredDrain {
             epoch,
-            id: stop_id,
+            stop_id,
             by_id: self.profile.device_by_id.clone(),
-            close_failed: false,
+            receipt: RetiredReceipt::Pending,
         });
+        self.publish_retired_drains();
         let mut fx = vec![
             Effect::AdoptBridge {
                 epoch,
@@ -4419,7 +4457,7 @@ impl SessionCore {
                 self.apply_aborted_receipt(stale.aborted_op.as_ref(), &receipt, &mut effects);
             }
             append_receipt_warnings(&receipt, &mut effects, &self.profile.com);
-            effects.extend(self.retired_open_close_receipt(&receipt, now));
+            effects.extend(self.retired_drain_receipt(&receipt, now));
             return effects;
         }
 
@@ -4495,16 +4533,16 @@ impl SessionCore {
             reason: self.last_error.clone(),
         }));
 
-        self.drain_stalled = false;
         self.placeholder_attach_stall_token = None;
         self.recovering = false;
-        if stop.kind == StopKind::Release && !self.retired_open_closes.is_empty() {
-            // 本 bridge 已確認關閉，但先前退休的 bridge 仍持有 handle（wp510 第十次整包審查 High P8-14fe592-1）：release
-            // 改等其關閉回條（`retired_open_close_receipt`），沿用同一 stop id 與已排定的期限（`mark_drain_timeout`）。
+        if matches!(stop.kind, StopKind::Release | StopKind::Shutdown) && !self.retired_drains.is_empty() {
+            // 本 bridge 已確認關閉，但先前退休的 bridge 仍持有 handle（收斂規則）：release／shutdown 改等其回條
+            // （`retired_drain_receipt`），沿用同一 stop id 與已排定的期限（`mark_drain_timeout`）。retired drain 已失敗時
+            // 依 T-1 不立即回覆（設計 §3.1.6 第三處），由期限計時器回 STALL。
             self.pending_open_stop = Some(PendingOpenStop {
                 id: stop.id,
                 generation: stop.epoch,
-                kind: StopKind::Release,
+                kind: stop.kind.clone(),
                 waiters: stop.waiters,
                 started: stop.started,
                 stalled: stop.stalled,
@@ -4512,11 +4550,17 @@ impl SessionCore {
                 already_released: stop.already_released,
                 post_kind: None,
             });
-            if self.retired_open_closes.iter().any(|entry| entry.close_failed) {
+            if self
+                .retired_drains
+                .iter()
+                .any(|entry| entry.receipt == RetiredReceipt::Failed)
+            {
                 effects.extend(self.pending_open_close_unconfirmed(now));
             }
+            // 轉移等待對象（自身停止 → retired drain）時不清除 drain_stalled 與 epoch（設計 §3.1.3 收斂規則；P8-c4913ae-1）。
             return effects;
         }
+        self.drain_stalled = false;
         let kind = if stop.kind == StopKind::Release {
             StopKind::Release
         } else {

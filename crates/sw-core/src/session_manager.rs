@@ -6174,8 +6174,9 @@ impl SessionManager {
     /// 再以同一 control lane 的查詢作屏障，返回時 Phase 1 已在每個仍存活的 actor 執行過。等待回條屬 Phase 2。
     pub fn shutdown_phase1(&self, deadline: Instant) -> ShutdownDrain {
         self.begin_shutdown();
+        type ShutdownEntry = (String, Arc<ActorHandle>, Arc<Fence>);
         type ShutdownTargets = (
-            Vec<(String, Arc<ActorHandle>)>,
+            Vec<ShutdownEntry>,
             Vec<String>,
             Vec<(String, AttachOp, Option<Preopened>)>,
         );
@@ -6204,7 +6205,7 @@ impl SessionManager {
                 inner
                     .sessions
                     .values()
-                    .map(|e| (e.sid.clone(), e.actor.clone()))
+                    .map(|e| (e.sid.clone(), e.actor.clone(), e.fence.clone()))
                     .collect(),
                 inner.inflight.keys().cloned().collect(),
                 unconsumed_list,
@@ -6222,14 +6223,18 @@ impl SessionManager {
 
         let mut waits: Vec<(String, Option<Receiver<Result<PyDict, PyErr>>>)> = Vec::new();
         let mut barriers: Vec<Arc<ActorHandle>> = Vec::new();
-        for (sid, actor) in entries {
+        for (sid, actor, fence) in entries {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let state = actor
                 .request(SessionRequest::GetState, remaining.min(QUERY_TIMEOUT))
                 .ok()
                 .and_then(|r| session_of(&r))
                 .and_then(|s| str_of(&s, "state"));
-            if matches!(state.as_deref(), Some("DETACHED" | "RELEASED")) {
+            // S2-PAR-wp510r R3（DR-4 b）：DETACHED／RELEASED 但仍有退休 bridge 未確認關閉者照樣送 Shutdown 並等待其回條
+            // （Python shutdown 收集仍在表內的作業並等待 `done`，`origin/main:sw_core/session_manager.py:1181-1185`、
+            // `:1228-1239`）。
+            let retired_pending = fence.with(|f| f.retired_drains_pending);
+            if matches!(state.as_deref(), Some("DETACHED" | "RELEASED")) && !retired_pending {
                 continue;
             }
             let (reply, rx) = crossbeam_channel::bounded(1);

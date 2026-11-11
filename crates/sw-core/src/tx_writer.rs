@@ -122,6 +122,10 @@ pub struct FenceState {
     /// P8 Task 14：SC-11 交接停止的 TX 凍結（Python `UARTBridge.freeze_tx`）。與 drain 的 `frozen` 分開記錄：交接
     /// 未成立（TX fence 逾時）時只撤銷本旗標，不動 shutdown／drain 建立的 `frozen`。
     pub handoff_frozen: bool,
+    /// S2-PAR-wp510r R3：SessionCore 發布的「retired drain 未收斂」（`SessionCore::retired_drains` 非空，含失敗而永久保留
+    /// 者）。manager 的 shutdown 據此不略過 DETACHED／RELEASED 但仍有退休 bridge 未確認關閉的 session（DR-4 b）。不影響
+    /// `admit`。
+    pub retired_drains_pending: bool,
 }
 
 /// P8 Task 14：[`Fence::freeze_for_handoff`] 的結果。
@@ -222,6 +226,7 @@ impl Fence {
             flash_critical: false,
             bridge_passthrough: false,
             handoff_frozen: false,
+            retired_drains_pending: false,
         }), AtomicBool::new(false)))
     }
 
