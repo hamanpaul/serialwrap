@@ -1222,7 +1222,14 @@ pub trait ReaperCallback: Send + Sync + 'static {
 /// 回收者執行緒：專職消費 DrainDataBarrier 與 WorkerStopped。
 pub struct ReaperThread {
     stopped: Arc<AtomicBool>,
+    allow_exit: Arc<AtomicBool>,
+    wake: Sender<()>,
+    command_rx: Receiver<ReaperCmd>,
+    event_rx: Receiver<ControlEvent>,
+    pending_receipts: Arc<std::sync::atomic::AtomicUsize>,
+    active: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
+    detached: bool,
 }
 
 impl ReaperThread {
@@ -1234,6 +1241,15 @@ impl ReaperThread {
     ) -> Self {
         let stopped = Arc::new(AtomicBool::new(false));
         let thread_stopped = stopped.clone();
+        let allow_exit = Arc::new(AtomicBool::new(false));
+        let thread_allow_exit = allow_exit.clone();
+        let (wake, wake_rx) = crossbeam_channel::bounded(1);
+        let command_state_rx = reaper_cmd_rx.clone();
+        let event_state_rx = reaper_event_rx.clone();
+        let pending_receipts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let thread_pending_receipts = pending_receipts.clone();
+        let active = Arc::new(AtomicBool::new(false));
+        let thread_active = active.clone();
 
         let handle = std::thread::Builder::new()
             .name("serialwrap-reaper".into())
@@ -1245,12 +1261,16 @@ impl ReaperThread {
                     if stopping {
                         match reaper_cmd_rx.try_recv() {
                             Ok(cmd) => {
+                                thread_active.store(true, Ordering::Release);
                                 pending_receipts = pending_receipts
                                     .saturating_add(callback.handle_cmd(cmd, &reaper_event_tx));
+                                thread_pending_receipts.store(pending_receipts, Ordering::Release);
+                                thread_active.store(false, Ordering::Release);
                                 continue;
                             }
                             Err(crossbeam_channel::TryRecvError::Empty)
-                                if pending_receipts == 0 =>
+                                if pending_receipts == 0
+                                    && thread_allow_exit.load(Ordering::Acquire) =>
                             {
                                 break;
                             }
@@ -1263,11 +1283,15 @@ impl ReaperThread {
                         }
                     }
                     crossbeam_channel::select! {
+                        recv(wake_rx) -> _ => {}
                         recv(reaper_cmd_rx) -> msg => {
                             match msg {
                                 Ok(cmd) => {
+                                    thread_active.store(true, Ordering::Release);
                                     pending_receipts = pending_receipts
                                         .saturating_add(callback.handle_cmd(cmd, &reaper_event_tx));
+                                    thread_pending_receipts.store(pending_receipts, Ordering::Release);
+                                    thread_active.store(false, Ordering::Release);
                                 }
                                 Err(_) => stopping = true,
                             }
@@ -1280,8 +1304,11 @@ impl ReaperThread {
                                     drop(reply);
                                 }
                                 Ok(ControlEvent::WorkerStopped(receipt)) => {
+                                    thread_active.store(true, Ordering::Release);
                                     callback.handle_worker_stopped(receipt);
                                     pending_receipts = pending_receipts.saturating_sub(1);
+                                    thread_pending_receipts.store(pending_receipts, Ordering::Release);
+                                    thread_active.store(false, Ordering::Release);
                                 }
                                 Ok(_) => {}
                                 Err(_) => stopping = true,
@@ -1295,21 +1322,86 @@ impl ReaperThread {
 
         Self {
             stopped,
+            allow_exit,
+            wake,
+            command_rx: command_state_rx,
+            event_rx: event_state_rx,
+            pending_receipts,
+            active,
             handle: Some(handle),
+            detached: false,
         }
     }
 
     pub fn stop(&mut self) {
-        self.stopped.store(true, Ordering::Release);
+        self.request_stop();
+        self.allow_exit();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+    }
+
+    /// 開始停止並排空已受理命令；可先於共用期限的 join 等待發出。
+    pub fn request_stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        let _ = self.wake.try_send(());
+    }
+
+    /// 允許回收者在命令與回條排空後退出；關機 Phase 1 前不得開啟此門。
+    pub fn allow_exit(&self) {
+        self.allow_exit.store(true, Ordering::Release);
+        let _ = self.wake.try_send(());
+    }
+
+    /// 有其他生產者仍可能送交 ActorExited 時，放下 join 所有權並讓背景執行緒繼續收尾。
+    pub fn detach_for_cleanup(&mut self) {
+        self.request_stop();
+        self.detached = true;
+        self.handle.take();
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn is_finished_for_test(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+    }
+
+    /// 回收者已無工作待做；供共用關機期限剛到但執行緒只差排程退出時判定。
+    pub fn is_quiescent(&self) -> bool {
+        self.command_rx.is_empty()
+            && self.event_rx.is_empty()
+            && self.pending_receipts.load(Ordering::Acquire) == 0
+            && !self.active.load(Ordering::Acquire)
+    }
+
+    /// 在共用關機期限內等待回收者；逾時後 detach JoinHandle，讓回收執行緒繼續持有並完成收尾工作。
+    pub fn stop_until(&mut self, deadline: Instant) -> bool {
+        self.request_stop();
+        self.allow_exit();
+        let Some(handle) = self.handle.as_ref() else {
+            return true;
+        };
+        while !handle.is_finished() {
+            let now = Instant::now();
+            if now >= deadline {
+                self.handle.take();
+                return self.is_quiescent();
+            }
+            std::thread::sleep(Duration::from_millis(1).min(deadline - now));
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        true
     }
 }
 
 impl Drop for ReaperThread {
     fn drop(&mut self) {
-        self.stop();
+        if !self.detached {
+            self.stop();
+        }
     }
 }
 
@@ -1346,10 +1438,35 @@ impl DelivererThread {
     }
 
     pub fn stop(&mut self) {
-        self.stopped.store(true, Ordering::Relaxed);
+        self.request_stop();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+    }
+
+    /// 通知送達者停止；提供關機 Phase 1 與 session drain 並行收斂的入口。
+    pub fn request_stop(&self) {
+        self.stopped.store(true, Ordering::Relaxed);
+    }
+
+    /// 在共用關機期限內等待送達者；逾時後 detach JoinHandle，保留執行緒中的回呼所有權。
+    pub fn stop_until(&mut self, deadline: Instant) -> bool {
+        self.request_stop();
+        let Some(handle) = self.handle.as_ref() else {
+            return true;
+        };
+        while !handle.is_finished() {
+            let now = Instant::now();
+            if now >= deadline {
+                self.handle.take();
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1).min(deadline - now));
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        true
     }
 }
 

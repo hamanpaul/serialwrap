@@ -83,6 +83,7 @@ pub struct ShutdownDrain {
     deadline: Instant,
     waits: Vec<(String, Option<Receiver<Result<PyDict, PyErr>>>)>,
     inflight: Vec<String>,
+    actor_exits: Vec<(String, Arc<ActorHandle>)>,
 }
 
 /// `SessionManager::new` 的注入依賴（plan 06 Task 16 Produces）。
@@ -6354,12 +6355,12 @@ impl SessionManager {
             let sid = e.sid.clone();
             let old_by_id = e.profile.device_by_id.clone();
             let io = e.io.clone();
+            // 逾時後 cancel 已設仍保留 Opening token，後續 bind 必須接續等待同一作業的終態。
             let opening_token = inner.custody.get_custody(&old_by_id).and_then(|rec| {
                 (matches!(
                     &rec.owner,
                     crate::custody::CustodyOwner::Session { actor } if *actor == e.actor_id
-                ) && rec.cancel.is_none()
-                    && matches!(
+                ) && matches!(
                         &rec.phase,
                         crate::custody::CustodyPhase::Opening {
                             taker: crate::custody::CustodyTaker::OpenJob { actor }
@@ -7209,6 +7210,14 @@ impl SessionManager {
         self.shared.reaper_cmd_tx.clone()
     }
 
+    /// 只供測試（test-fakes）：確認 shutdown Phase 1 後回收者仍活著，接收 actor drain 產生的工作。
+    #[cfg(feature = "test-fakes")]
+    pub fn reaper_finished_for_test(&self) -> Option<bool> {
+        lock(&self.reaper)
+            .as_ref()
+            .map(crate::custody::ReaperThread::is_finished_for_test)
+    }
+
     /// 只供測試（test-fakes）：讓下一筆回收者命令停在 callback 入口。
     #[cfg(feature = "test-fakes")]
     pub fn set_reaper_cmd_hook_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
@@ -7492,6 +7501,7 @@ impl SessionManager {
     /// 再以同一 control lane 的查詢作屏障，返回時 Phase 1 已在每個仍存活的 actor 執行過。等待回條屬 Phase 2。
     pub fn shutdown_phase1(&self, deadline: Instant) -> ShutdownDrain {
         self.begin_shutdown();
+        self.request_background_stop();
         type ShutdownEntry = (String, Arc<ActorHandle>, Arc<Fence>);
         type ShutdownTargets = (
             Vec<ShutdownEntry>,
@@ -7550,6 +7560,7 @@ impl SessionManager {
 
         let mut waits: Vec<(String, Option<Receiver<Result<PyDict, PyErr>>>)> = Vec::new();
         let mut barriers: Vec<Arc<ActorHandle>> = Vec::new();
+        let mut actor_exits: Vec<(String, Arc<ActorHandle>)> = Vec::new();
         for (sid, actor, fence) in entries {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let state = actor
@@ -7571,6 +7582,7 @@ impl SessionManager {
                 .is_ok();
             if sent {
                 barriers.push(actor.clone());
+                actor_exits.push((sid.clone(), actor.clone()));
             }
             waits.push((sid, sent.then_some(rx)));
         }
@@ -7583,6 +7595,7 @@ impl SessionManager {
             deadline,
             waits,
             inflight,
+            actor_exits,
         }
     }
 
@@ -7592,6 +7605,7 @@ impl SessionManager {
             deadline,
             waits,
             inflight,
+            actor_exits,
         } = drain;
         let mut out = Vec::new();
         for (sid, rx) in waits {
@@ -7601,6 +7615,20 @@ impl SessionManager {
                     .is_ok_and(|r| r.is_ok_and(|reply| is_ok(&reply)))
             });
             out.push((sid, drained));
+        }
+        let mut actors_exited = true;
+        for (sid, actor) in actor_exits {
+            while !actor.join.is_finished() {
+                let now = Instant::now();
+                if now >= deadline {
+                    actors_exited = false;
+                    if let Some((_, drained)) = out.iter_mut().find(|(name, _)| name == &sid) {
+                        *drained = false;
+                    }
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1).min(deadline - now));
+            }
         }
         let wait_attach = |by_id: &str| -> bool {
             let mut inner = lock(&self.shared.inner);
@@ -7619,8 +7647,11 @@ impl SessionManager {
             !inner.inflight.contains_key(by_id)
         };
         let mut reported: HashSet<String> = HashSet::new();
+        let mut inflight_settled = true;
         for by_id in inflight {
-            out.push((format!("attach:{by_id}"), wait_attach(&by_id)));
+            let settled = wait_attach(&by_id);
+            inflight_settled &= settled;
+            out.push((format!("attach:{by_id}"), settled));
             reported.insert(by_id);
         }
         // 全帳本排空（不依 owner 篩選）：session 的 Shutdown 已讓 actor 收尾；parked、Reaper Closing 與其他未接手紀錄
@@ -7676,10 +7707,18 @@ impl SessionManager {
             .cloned()
             .collect();
         late.sort();
+        let mut late_inflight_settled = true;
         for by_id in late {
-            out.push((format!("attach:{by_id}"), wait_attach(&by_id)));
+            let settled = wait_attach(&by_id);
+            late_inflight_settled &= settled;
+            out.push((format!("attach:{by_id}"), settled));
         }
-        self.stop_background_threads();
+        // 所有已送出 Shutdown 的 actor 都已退出、初始與遲到的開埠工作均已終態後，才允許回收者退出。
+        let reaper_can_exit = actors_exited && inflight_settled && late_inflight_settled;
+        if reaper_can_exit {
+            self.allow_reaper_exit();
+        }
+        out.extend(self.stop_background_threads_until(deadline, reaper_can_exit));
         out
     }
 
@@ -7889,11 +7928,54 @@ impl SessionManager {
     /// 停止回收者與送達者背景執行緒（在不持有 manager 鎖的情況下停止並 join）。之後才送交的回收命令退回就地收尾
     /// （`custody::send_reclaim_or_finish`）。
     fn stop_background_threads(&self) {
-        if let Some(mut r) = lock(&self.reaper).take() {
+        let reaper = lock(&self.reaper).take();
+        if let Some(mut r) = reaper {
             r.stop();
         }
-        if let Some(mut d) = lock(&self.deliverer).take() {
+        let deliverer = lock(&self.deliverer).take();
+        if let Some(mut d) = deliverer {
             d.stop();
+        }
+    }
+
+    /// 關機步驟共用期限內停止背景執行緒；未完成者回報未收斂，執行緒仍保有其回呼與收尾資源。
+    fn stop_background_threads_until(
+        &self,
+        deadline: Instant,
+        reaper_can_exit: bool,
+    ) -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        let reaper = lock(&self.reaper).take();
+        if let Some(mut reaper) = reaper {
+            if reaper_can_exit && !reaper.stop_until(deadline) {
+                out.push(("reaper".to_string(), false));
+            } else if !reaper_can_exit {
+                reaper.detach_for_cleanup();
+            }
+        }
+        let deliverer = lock(&self.deliverer).take();
+        if let Some(mut deliverer) = deliverer {
+            if !deliverer.stop_until(deadline) {
+                out.push(("deliverer".to_string(), false));
+            }
+        }
+        out
+    }
+
+    /// Phase 1 通知背景執行緒停止；回收者只進入 drain 模式，保持接收直到允許退出。
+    fn request_background_stop(&self) {
+        if let Some(reaper) = lock(&self.reaper).as_ref() {
+            reaper.request_stop();
+        }
+        if let Some(deliverer) = lock(&self.deliverer).as_ref() {
+            deliverer.request_stop();
+        }
+    }
+
+    /// 初始 actor／開埠工作完成後才允許回收者退出，讓它在剩餘共用期限內排空已受理命令與回條。
+    fn allow_reaper_exit(&self) {
+        if let Some(reaper) = lock(&self.reaper).as_ref() {
+            reaper.allow_exit();
         }
     }
 

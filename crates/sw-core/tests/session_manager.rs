@@ -801,6 +801,230 @@ fn shutdown_budget_5s() {
     assert!(drained(&sid1), "COM1 應 drained:true");
 }
 
+/// wp510r 第 2 次整包審查 High：Phase 1 後回收者仍須接收 actor drain 送來的 worker 並結算回條。
+#[test]
+fn wp510r_r18_reaper_stays_live_through_phase1() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let manager = ManagerRig::templates_only();
+    let harness = CoreHarness::new(SHELL_PROFILE);
+    let path = "/dev/wp510r-r18-reaper-phase1";
+    let device = harness.add_serial_device(path);
+    let worker = harness.start_worker_at(1803, path);
+    let token = manager.mgr.custody_register_bridged_worker_for_test(
+        "COM83",
+        "by-id-wp510r-r18-reaper-phase1",
+        path,
+        1803,
+        worker,
+    );
+    let (actor, worker_token, epoch, worker) = manager
+        .mgr
+        .custody_take_bridged_worker_for_test("by-id-wp510r-r18-reaper-phase1")
+        .expect("取得 actor 尚未接手的真實 IoWorker");
+    assert_eq!(token, worker_token);
+
+    let drain = manager
+        .mgr
+        .shutdown_phase1(Instant::now() + Duration::from_secs(1));
+    std::thread::sleep(Duration::from_millis(100));
+    let reaper_alive = manager.mgr.reaper_finished_for_test() == Some(false);
+    let accepted = sw_core::custody::send_reclaim_or_finish(
+        &manager.mgr.reaper_cmd_sender_for_test(),
+        actor,
+        worker_token,
+        epoch,
+        sw_core::custody::ReclaimWorker::Real(worker),
+        None,
+    );
+    if accepted {
+        wait_until("Phase 1 後送入的 worker 收到配對終態", || {
+            manager.mgr.terminal_for_test(token).is_some()
+        });
+    }
+    let report = manager.mgr.shutdown_phase2(drain);
+    if !accepted {
+        wait_until("回收者已停止時的 fallback 仍關閉 worker", || {
+            device.close_count() == 1
+        });
+    }
+
+    assert!(reaper_alive, "Phase 1 後回收者仍須接收 actor drain 工作");
+    assert!(accepted, "Phase 1 後 Reclaim 必須成功入列");
+    assert!(
+        report.is_empty(),
+        "Phase 2 開始前回收已收斂，不應回報未完成工作：{report:?}"
+    );
+    assert_eq!(device.close_count(), 1, "真實 worker handle 恰好關閉一次");
+    assert_eq!(
+        manager
+            .mgr
+            .terminal_for_test(token)
+            .map(|terminal| terminal.handle),
+        Some(sw_core::custody::TerminalHandle::Closed),
+        "Phase 2 收到配對 Closed 終態"
+    );
+}
+
+/// wp510r 第 2 次整包審查 High：回收者的 writer 或 close 卡住時，shutdown 沿用共用期限返回，背景收尾仍保有 worker。
+#[test]
+fn wp510r_r18_shutdown_reaper_deadline_preserves_blocked_worker_cleanup() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let writer_manager = ManagerRig::templates_only();
+    let writer_harness = CoreHarness::new(SHELL_PROFILE);
+    let writer_path = "/dev/wp510r-r18-reaper-deadline-writer";
+    let writer_device = writer_harness.add_serial_device(writer_path);
+    writer_device.script_write(vec![FakeWriteStep::BlockForever]);
+    writer_harness
+        .fence
+        .with(|fence| fence.active_epoch = Some(1801));
+    let writer = writer_harness.start_worker_at(1801, writer_path);
+    let (report_tx, _report_rx) = crossbeam_channel::bounded(1);
+    writer
+        .tx()
+        .jobs
+        .send(sw_core::tx_writer::TxJob {
+            permit: sw_core::tx_writer::TxPermit {
+                op_id: sw_core::tx_writer::OpId(1),
+                epoch: 1801,
+                owner_gen: 0,
+                fsm_gen: 0,
+                class: sw_core::tx_writer::TxClass::Command,
+                source: "agent".to_string(),
+                cmd_id: None,
+                log: false,
+                input_epoch: None,
+                replay_hold: None,
+                probe_id: None,
+            },
+            payload: b"blocked\n".to_vec(),
+            reply: report_tx,
+            aggregate: None,
+        })
+        .expect("送出會卡在 fake writer 的 TX");
+    writer_device.wait_blocked();
+    let writer_token = writer_manager.mgr.custody_register_bridged_worker_for_test(
+        "COM81",
+        "by-id-wp510r-r18-deadline-writer",
+        writer_path,
+        1801,
+        writer,
+    );
+    let (writer_actor, worker_token, writer_epoch, writer) = writer_manager
+        .mgr
+        .custody_take_bridged_worker_for_test("by-id-wp510r-r18-deadline-writer")
+        .expect("取得 writer 阻塞中的真實 IoWorker");
+    assert_eq!(writer_token, worker_token);
+    writer_manager
+        .mgr
+        .reaper_cmd_sender_for_test()
+        .send(sw_core::custody::ReaperCmd::Reclaim {
+            actor: writer_actor,
+            token: worker_token,
+            epoch: writer_epoch,
+            worker: Box::new(sw_core::custody::ReclaimWorker::Real(writer)),
+        })
+        .expect("回收者受理 writer 回收命令");
+    wait_until("writer reclaim 已進入 BridgeDraining", || {
+        matches!(
+            writer_manager
+                .mgr
+                .custody_for_test("by-id-wp510r-r18-deadline-writer")
+                .map(|entry| entry.phase),
+            Some(CustodyPhaseSnapshot::BridgeDraining { .. })
+        )
+    });
+    let start = Instant::now();
+    let writer_report = writer_manager.mgr.shutdown(Duration::from_millis(120));
+    assert!(
+        start.elapsed() < Duration::from_millis(600),
+        "writer 永久阻塞不得卡住 shutdown：{:?}",
+        start.elapsed()
+    );
+    assert!(
+        writer_report.contains(&("reaper".to_string(), false)),
+        "reaper 必須在共用期限到時回報未收斂：{writer_report:?}"
+    );
+    assert!(
+        writer_report.contains(&("attach:by-id-wp510r-r18-deadline-writer".to_string(), false)),
+        "未完成的真實 worker 必須列入 shutdown 報告：{writer_report:?}"
+    );
+    writer_device.release_block();
+    wait_until("writer 放行後保管終態完成", || {
+        writer_manager.mgr.terminal_for_test(writer_token).is_some()
+    });
+    assert_eq!(writer_device.close_count(), 1, "背景收尾關閉 writer handle 一次");
+    assert!(!writer_device.is_open(), "背景收尾最終釋放 writer handle");
+    assert_eq!(
+        writer_manager
+            .mgr
+            .terminal_for_test(writer_token)
+            .map(|terminal| terminal.handle),
+        Some(sw_core::custody::TerminalHandle::Closed),
+        "writer 放行後有配對 Closed 終態"
+    );
+
+    let close_manager = ManagerRig::templates_only();
+    let close_harness = CoreHarness::new(SHELL_PROFILE);
+    let close_path = "/dev/wp510r-r18-reaper-deadline-close";
+    let close_device = close_harness.add_serial_device(close_path);
+    close_device.pause_next_close();
+    let close_worker = close_harness.start_worker_at(1802, close_path);
+    let close_token = close_manager.mgr.custody_register_bridged_worker_for_test(
+        "COM82",
+        "by-id-wp510r-r18-deadline-close",
+        close_path,
+        1802,
+        close_worker,
+    );
+    let (close_actor, worker_token, close_epoch, close_worker) = close_manager
+        .mgr
+        .custody_take_bridged_worker_for_test("by-id-wp510r-r18-deadline-close")
+        .expect("取得 close 暫停中的真實 IoWorker");
+    assert_eq!(close_token, worker_token);
+    close_manager
+        .mgr
+        .reaper_cmd_sender_for_test()
+        .send(sw_core::custody::ReaperCmd::Reclaim {
+            actor: close_actor,
+            token: worker_token,
+            epoch: close_epoch,
+            worker: Box::new(sw_core::custody::ReclaimWorker::Real(close_worker)),
+        })
+        .expect("回收者受理 close 回收命令");
+    assert!(close_device.wait_paused(Duration::from_secs(5)), "worker 應停在 fake close");
+    let start = Instant::now();
+    let close_report = close_manager.mgr.shutdown(Duration::from_millis(120));
+    assert!(
+        start.elapsed() < Duration::from_millis(600),
+        "close 永久阻塞不得卡住 shutdown：{:?}",
+        start.elapsed()
+    );
+    assert!(
+        close_report.contains(&("reaper".to_string(), false)),
+        "close 卡住時 reaper 應回報未收斂：{close_report:?}"
+    );
+    assert!(
+        close_report.contains(&("attach:by-id-wp510r-r18-deadline-close".to_string(), false)),
+        "close 卡住的 worker 必須列入 shutdown 報告：{close_report:?}"
+    );
+    close_device.release_pause();
+    wait_until("close 放行後保管終態完成", || {
+        close_manager.mgr.terminal_for_test(close_token).is_some()
+    });
+    assert_eq!(close_device.close_count(), 1, "背景收尾關閉暫停中的 handle 一次");
+    assert!(!close_device.is_open(), "背景收尾最終釋放暫停中的 handle");
+    assert_eq!(
+        close_manager
+            .mgr
+            .terminal_for_test(close_token)
+            .map(|terminal| terminal.handle),
+        Some(sw_core::custody::TerminalHandle::Closed),
+        "close 放行後有配對 Closed 終態"
+    );
+}
+
 /// BC-03（產品 executor）：release 中止已部分送出的前景命令時，`command_aborted_in_flight` META 只寫一筆
 /// （Python 僅 worker 的 `_map_aborted_result` 寫；Rust 的 drain 回條與 op runner 不得各寫一筆）。
 #[test]
@@ -5462,6 +5686,87 @@ fn wp510r_r18_bind_waits_for_plain_opening_custody_terminal() {
     assert_eq!(m.dev.close_count(), 1, "取消的一般開埠 handle 關閉一次");
     assert!(!m.dev.is_open(), "取消後不保留 handle");
     assert_eq!(tx_after, tx_before, "一般開埠取消後不得有登入 TX");
+}
+
+/// wp510r 第 2 次整包審查 Medium：首次 bind 等待逾時後，重試仍須等待同一 Opening token 的終態。
+#[test]
+fn wp510r_r18_bind_after_timeout_waits_for_same_plain_opening_terminal() {
+    const TARGET: &str = "/s/by-id/usb-wp510r-r18-bind-retry-target";
+    let m = ManagerRig::single_target(SHELL_PROFILE);
+    m.serial.block_open("/dev/ttyOLD");
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    wait_until("一般 OpenBridge 已進入開埠", || {
+        m.serial.open_attempts("/dev/ttyOLD") == 1
+    });
+    let device = m.device("/dev/ttyOLD");
+    let opening = m
+        .mgr
+        .custody_for_test("/s/by-id/usb-A")
+        .expect("一般開埠已登記 Opening");
+    let token = opening.token;
+    assert!(matches!(
+        opening.phase,
+        CustodyPhaseSnapshot::Opening { .. }
+    ));
+
+    let first = rpc(m.mgr.bind("COM0", "/s/by-id/usb-wp510r-r18-first-target"));
+    assert_eq!(
+        code_of(&first).as_deref(),
+        Some("SESSION_RECOVERING"),
+        "首次期限應回 RECOVERING：{first:?}"
+    );
+    assert_eq!(first.get("drain_stalled"), Some(&PyValue::Bool(true)));
+    assert!(
+        m.mgr.terminal_for_test(token).is_none(),
+        "首次 bind 逾時時 Opening 尚未收到終態"
+    );
+    let tx_before = device.tx_len();
+
+    let mgr = m.mgr.clone();
+    let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+    std::thread::spawn(move || {
+        let _ = done_tx.send(mgr.bind("COM0", TARGET));
+    });
+    let early = done_rx.recv_timeout(Duration::from_millis(150));
+    let waited = matches!(early, Err(crossbeam_channel::RecvTimeoutError::Timeout));
+    m.serial.release_open("/dev/ttyOLD");
+    let second = rpc(match early {
+        Ok(response) => response,
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("第二次 bind 在相同 Opening 終態後返回"),
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+            panic!("第二次 bind worker 不應提早斷線")
+        }
+    });
+    wait_until("Opening 收到配對終態", || {
+        m.mgr.terminal_for_test(token).is_some()
+    });
+    let public = m.session("COM0");
+    let tx_after = device.tx_len();
+    let _ = m.mgr.shutdown(Duration::from_millis(500));
+
+    assert!(
+        waited,
+        "第二次 bind 不得在 Opening 終態前立即回覆：{second:?}"
+    );
+    assert!(
+        is_ok(&second),
+        "Opening 關閉後第二次 bind 應套用：{second:?}"
+    );
+    assert_eq!(
+        s_of(&public, "device_by_id").as_deref(),
+        Some(TARGET),
+        "等待同一 token 終態後套用新的綁定：{public:?}"
+    );
+    assert_eq!(
+        device.close_count(),
+        1,
+        "被取消的 Opening handle 恰好關閉一次"
+    );
+    assert!(!device.is_open(), "被取消的 Opening handle 已關閉");
+    assert_eq!(tx_after, tx_before, "等待期間不得有登入 TX");
 }
 
 /// S2-PAR-wp510r 第 17 項紅燈：正式 W6 改名後，該 actor 在接手 offer 前退出，必須依穩定身分回收 Held handle。

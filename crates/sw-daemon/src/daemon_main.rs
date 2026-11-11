@@ -1513,7 +1513,7 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
     if !stalled.is_empty() {
         // Python `service.stop()` 的 ERROR 文字（非優雅停止）。
         eprintln!(
-            "serialwrapd: 有序關機逾時，未收斂 session={}（非優雅停止，SC-11 不計 PASS）",
+            "serialwrapd: 有序關機逾時，未收斂項目={}（非優雅停止，SC-11 不計 PASS）",
             stalled.join(",")
         );
         incomplete.push(format!("drain stalled: {}", stalled.join(",")));
