@@ -4363,9 +4363,12 @@ fn wp510r_r3_spec_gap2_bind_wait_notice_settles_once() {
     assert_eq!(bind.get("drain_stalled"), Some(&PyValue::Bool(true)));
     let effects = h.rpc_full(SessionRequest::BindDeadlineElapsed { id }).1;
     assert!(
-        !effects.iter().any(|e| matches!(e, Effect::Reply(..)) && false),
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::ClaimForStop { .. } | Effect::Persist { .. } | Effect::Schedule { .. })),
         "重複通知不產生效果"
     );
+    assert!(bind_rx.try_recv().is_err(), "重複通知不得再回覆 bind waiter");
     h.advance(Duration::from_millis(3100));
     assert!(bind_rx.try_recv().is_err(), "actor 計時器之後不得再回覆");
 }

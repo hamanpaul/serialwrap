@@ -1355,9 +1355,7 @@ impl Shared {
     fn close_session_custody_for(&self, by_id: &str, cancel: crate::custody::CustodyCancel) -> Option<u64> {
         let (token, claimed) = {
             let mut inner = lock(&self.inner);
-            let Some(rec) = inner.custody.get_custody(by_id) else {
-                return None;
-            };
+            let rec = inner.custody.get_custody(by_id)?;
             let crate::custody::CustodyOwner::Session { sid, .. } = &rec.owner else {
                 return None;
             };
