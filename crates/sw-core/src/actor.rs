@@ -244,13 +244,7 @@ impl ActorHandle {
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 Err(PyErr::value_error("internal timeout"))
             }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                if self.join.is_finished() {
-                    Err(PyErr::value_error("session actor stopped"))
-                } else {
-                    Err(PyErr::value_error("internal timeout"))
-                }
-            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(self.disconnected_error()),
         }
     }
 }
@@ -343,6 +337,12 @@ impl ActorHandle {
     }
 
     fn disconnected_error(&self) -> PyErr {
+        // 回覆通道斷線而 actor 執行緒正在結束（例如 OD-63 佔位退休後結束，mailbox 內未處理的請求隨之丟棄）：短暫等它結束再
+        // 判定，避免把「actor 已停止」誤報為逾時（S2-PAR-wp510r R5，P8-19df186-1）。
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while !self.join.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         if self.join.is_finished() {
             PyErr::value_error("session actor stopped")
         } else {
@@ -622,6 +622,25 @@ pub fn try_spawn_actor_with_reaper(
                     break;
                 }
             }
+            if core.retired() {
+                // S2-PAR-wp510r R5（設計 §3.1.3 `retired`）：退休的佔位 actor 結束前回覆已排入的請求（SESSION_NOT_FOUND）。
+                for event in mailbox.drain_control_for_exit() {
+                    let _ = dispatch(
+                        &mut core,
+                        MailboxItem::Control(event),
+                        clock.mono_ns(),
+                        &thread_control,
+                        &thread_safety,
+                        &clock,
+                        &mut exec,
+                        &mut timers,
+                        &mut processed,
+                        &mut panic_type,
+                        &mut panic_count,
+                        &mut immediate_feedback,
+                    );
+                }
+            }
         })
         .map_err(SpawnError)?;
 
@@ -700,6 +719,9 @@ fn dispatch(
         MailboxItem::Control(ControlEvent::CustodyClaimed { .. }) => (None, "CustodyClaimed"),
         MailboxItem::Control(ControlEvent::CustodyTerminal { .. }) => (None, "CustodyTerminal"),
         MailboxItem::Control(ControlEvent::CustodyOffer { .. }) => (None, "CustodyOffer"),
+        MailboxItem::Control(ControlEvent::PlaceholderOpened { .. }) => (None, "PlaceholderOpened"),
+        MailboxItem::Control(ControlEvent::HandoffWorkerPrepared { .. }) => (None, "HandoffWorkerPrepared"),
+        MailboxItem::Control(ControlEvent::RetireResult { .. }) => (None, "RetireResult"),
         #[cfg(feature = "test-fakes")]
         MailboxItem::Control(ControlEvent::ArmPanic { .. }) => (None, "ArmPanic"),
         MailboxItem::Data(_) => (None, "Data"),

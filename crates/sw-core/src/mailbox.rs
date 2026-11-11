@@ -149,9 +149,40 @@ pub enum ControlEvent {
     /// 計時器補收（`Effect::PollCustody` 的立即回饋）。actor 只在 `external_attach` 正在等 offer 且 token 相符時以
     /// `ClaimCustody` 開埠；其他情況忽略（C6）。T14 分類：生命週期（Open 認領後開埠、Pending 延後、Permanent 只關閉）。
     CustodyOffer { token: u64 },
+    /// S2-PAR-wp510r R5（設計 §3.1.4 W1 第 3 步；對應設計的 `BridgeOpened(Raw{token})`）：佔位 Raw 開埠工作的結果。
+    /// `Ok(())`：handle 已存回本 session 擁有的帳本紀錄 `token`（`Held{Session}`，parts 在帳本）。`Err`：沒有交出 handle；
+    /// `Cancelled`／`CloseUnconfirmed(Cancelled)` 表示提交點看到取消、已關閉並另送 `CustodyTerminal`，`cancel` 為取消原因
+    /// （裝置改指為 `Device`，Python 判「device」回 DEVICE_NOT_PRESENT；其餘判「operation」，
+    /// `origin/main:sw_core/session_manager.py:3573-3631`）。只帶 token、不承載所有權；actor 已結束時由開埠工作自行把
+    /// `Held` 轉 Closing 關閉（DR-1 h）。T14 分類：生命週期（Open 處理、Pending 延後、Permanent 只關閉、不退休）。
+    PlaceholderOpened {
+        token: u64,
+        result: Result<(), OpenFailure>,
+        cancel: Option<crate::custody::CustodyCancel>,
+    },
+    /// S2-PAR-wp510r R5（設計 §3.1.4 W1 第 2 步、D3）：`Effect::PrepareHandoffWorker` 的立即回饋。`token` 為 executor 預配的
+    /// 帳本 token；`Err` 為 RPC 錯誤訊息（Python `worker.start()` 的 `can't start new thread`，
+    /// `origin/main:sw_core/session_manager.py:3633-3637`）。T14 分類：立即回饋，Open／Pending／Permanent 皆立即處理。
+    HandoffWorkerPrepared { token: u64, result: Result<(), String> },
+    /// S2-PAR-wp510r R5（設計 §3.1.4 W1 第 5 步）：`Effect::RetirePlaceholder` 的立即回饋。T14 分類：立即回饋，三種凍結狀態皆
+    /// 立即處理（凍結時 executor 在鎖內看到凍結就不退休、改關閉，回 `Invalid`）。
+    RetireResult { token: u64, outcome: RetireOutcome },
     /// S2-PAR-wp510r: 測試注入 actor panic
     #[cfg(feature = "test-fakes")]
     ArmPanic { count: u8 },
+}
+
+/// `ControlEvent::RetireResult` 的內容（設計 §3.1.4 W1 第 5 步）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetireOutcome {
+    /// 鎖內已退休佔位並放行交接 worker（Python `_retire_released_placeholder_locked` 後存檔、`_spawn_attach(dynamic_only)`，
+    /// `origin/main:sw_core/session_manager.py:3592-3638`）。
+    Retired,
+    /// 鎖內已退休，存檔失敗：不回滾（`:3633`）；handle 依 D2 存回 `Held{Parked}`（或有取消時關閉），worker 丟棄。
+    PersistFailed(PyErr),
+    /// 鎖內驗證失敗（stopping、凍結、Entry 已非本 actor、裝置路徑改變、紀錄已取消），未退休。`device` 為裝置改變（Python 判
+    /// 「device」，`:3573-3577`）；`closing` 為 handle 已轉 Closing 交關閉工作者（之後送 `CustodyTerminal`）。
+    Invalid { device: bool, closing: bool },
 }
 
 /// `ControlEvent::CustodyClaimed` 的處理結果。
@@ -403,6 +434,22 @@ impl Mailbox {
 
     /// `deadline` 以 `Mono` 表示；實作以不超過 50 ms 的接收輪詢並每次醒來重讀 clock。
     /// `current_epoch` 用於丟棄舊 epoch 依賴。
+    /// S2-PAR-wp510r R5：actor 結束前取出尚未處理的控制事件（不等待、不經依賴判定）。退休的 OD-63 佔位 actor 以此回覆已排入
+    /// 的請求（SESSION_NOT_FOUND），不讓呼叫端等到逾時。
+    pub fn drain_control_for_exit(&mut self) -> Vec<ControlEvent> {
+        let mut out: Vec<ControlEvent> = self.pending_control.take().into_iter().collect();
+        out.extend(self.stash.drain(..));
+        out.extend(self.deferred_control.drain(..));
+        out.extend(self.drain_barriers.drain(..));
+        while let Ok(ev) = self.safety_rx.try_recv() {
+            out.push(ev);
+        }
+        while let Ok(ev) = self.control_rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
     pub fn recv_next(
         &mut self,
         processed: (u64, u64),

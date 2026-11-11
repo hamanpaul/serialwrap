@@ -756,10 +756,9 @@ impl Service {
         timeout: Duration,
     ) -> Result<PyDict, PyErr> {
         match self.manager.resolve(selector) {
-            Some(sid) if matches!(&req, SessionRequest::DeviceAttach { .. }) => self
-                .manager
-                .route_with_selector(&sid, req, timeout, selector),
-            Some(sid) => self.manager.route(&sid, req, timeout),
+            // 保留呼叫者原 selector：OD-63 佔位的 `device.attach` 回應與「排入後 session 已退休」的 SESSION_NOT_FOUND 都回顯它
+            // （S2-PAR-wp510r R5，P8-3786805-1、P8-19df186-1）。
+            Some(sid) => self.manager.route_with_selector(&sid, req, timeout, selector),
             None => Ok(session_not_found(selector)),
         }
     }

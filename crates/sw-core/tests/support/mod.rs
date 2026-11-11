@@ -1292,6 +1292,11 @@ impl EffectExecutor for RigExec {
                 }
             }
             Effect::PollCustody { .. } => {}
+            // S2-PAR-wp510r R5：ActorRig 不驅動 OD-63 佔位的 W1（佔位測試走 ManagerRig／ServiceRig）。
+            Effect::PrepareHandoffWorker
+            | Effect::OpenPlaceholderRaw { .. }
+            | Effect::RetirePlaceholder { .. }
+            | Effect::DiscardHandoffWorker { .. } => {}
         }
     }
 }
@@ -2852,6 +2857,10 @@ fn effect_kind(e: &Effect) -> &'static str {
         Effect::ClaimForStop { .. } => "ClaimForStop",
         Effect::ClaimOffered { .. } => "ClaimOffered",
         Effect::PollCustody { .. } => "PollCustody",
+        Effect::PrepareHandoffWorker => "PrepareHandoffWorker",
+        Effect::OpenPlaceholderRaw { .. } => "OpenPlaceholderRaw",
+        Effect::RetirePlaceholder { .. } => "RetirePlaceholder",
+        Effect::DiscardHandoffWorker { .. } => "DiscardHandoffWorker",
     }
 }
 

@@ -5135,3 +5135,369 @@ fn wp510r_r4_w6_clear_during_offer_wait_keeps_external_attach() {
         "clear 之後的 offer 照常開埠"
     );
 }
+
+// ---------------------------------------------------------------------------
+// S2-PAR-wp510r R5（設計 §4 R5、§3.1.4 W1、§1.2、§1.3）：佔位 W1 改由 actor。佔位 actor 先準備交接 worker（D3）、再以
+// PlaceholderRaw 模式開埠；開埠結果、退休結果都回到佔位 actor 自己的執行緒處理。
+// ---------------------------------------------------------------------------
+
+/// 佔位 Raw 開埠的帳本 token（executor 預配；測試直接以此回饋）。
+const WP510R_R5_TOKEN: u64 = 7_510_005;
+
+/// RELEASED 佔位 core（Python OD-63：template 不存在、保留持久化阻擋，`origin/main:sw_core/session_manager.py:1059-1116`），
+/// 裝置在線。
+fn wp510r_r5_placeholder(released_by: Option<&str>) -> CoreHarness {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.core.init_released(
+        released_by.map(str::to_string),
+        released_by.map(|_| "2026-10-21T00:00:00".to_string()),
+        PyValue::Null,
+    );
+    h.core.init_placeholder();
+    let _ = h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    h
+}
+
+fn wp510r_r5_has_prepare(effects: &[Effect]) -> bool {
+    effects.iter().any(|effect| matches!(effect, Effect::PrepareHandoffWorker))
+}
+
+fn wp510r_r5_has_raw_open(effects: &[Effect]) -> bool {
+    effects.iter().any(|effect| matches!(effect, Effect::OpenPlaceholderRaw { .. }))
+}
+
+fn wp510r_r5_retire_kind(effects: &[Effect]) -> Option<sw_core::session_core::RetireKind> {
+    effects.iter().find_map(|effect| match effect {
+        Effect::RetirePlaceholder { token, kind } if *token == WP510R_R5_TOKEN => Some(kind.clone()),
+        _ => None,
+    })
+}
+
+fn wp510r_r5_discards(effects: &[Effect]) -> usize {
+    effects
+        .iter()
+        .filter(|effect| matches!(effect, Effect::DiscardHandoffWorker { token } if *token == WP510R_R5_TOKEN))
+        .count()
+}
+
+/// 送出佔位 `device.attach`、回饋 worker 已準備，停在 PlaceholderRaw 開埠在途；回傳 attach 的回覆接收端。
+fn wp510r_r5_attach_to_open(h: &mut CoreHarness, force: bool) -> crossbeam_channel::Receiver<Result<PyDict, sw_proto::pycompat::PyErr>> {
+    let (rx, effects) = h.rpc_deferred(SessionRequest::DeviceAttach { force });
+    assert!(wp510r_r5_has_prepare(&effects), "D3：佔位 attach 先準備交接 worker");
+    assert!(!wp510r_r5_has_raw_open(&effects) && !wp510r_has_open(&effects), "worker 準備好之前不得開埠");
+    assert!(rx.try_recv().is_err(), "開埠返回前不回覆");
+    let effects = h.feed(ControlEvent::HandoffWorkerPrepared {
+        token: WP510R_R5_TOKEN,
+        result: Ok(()),
+    });
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::OpenPlaceholderRaw { token, precheck_holders, .. }
+                if *token == WP510R_R5_TOKEN && *precheck_holders != force
+        )),
+        "worker 準備好才以 PlaceholderRaw 模式開埠（force={force}）"
+    );
+    assert!(!wp510r_has_open(&effects), "佔位不以一般 OpenBridge 開埠");
+    assert!(rx.try_recv().is_err(), "開埠返回前不回覆");
+    rx
+}
+
+/// WP5-2（設計 v3 §1.3；D3）：交接 worker 建立失敗時回 RPC 錯誤 `can't start new thread`，不開埠、不改狀態，之後可再交接
+/// （Python 先存檔才 `worker.start()` 而例外穿出 RPC，`origin/main:sw_core/session_manager.py:3633-3637`、`:4147-4150`；
+/// Rust 依 D3 先準備 worker）。
+#[test]
+fn wp510r_r5_wp5_2_prepare_failure_replies_thread_error_without_open() {
+    let mut h = wp510r_r5_placeholder(Some("cli"));
+    let (rx, effects) = h.rpc_deferred(SessionRequest::DeviceAttach { force: false });
+    assert!(wp510r_r5_has_prepare(&effects));
+    let effects = h.feed(ControlEvent::HandoffWorkerPrepared {
+        token: WP510R_R5_TOKEN,
+        result: Err("can't start new thread".to_string()),
+    });
+    assert!(!wp510r_r5_has_raw_open(&effects) && !wp510r_has_open(&effects), "不開埠");
+    assert_eq!(
+        rx.try_recv().expect("立即回覆"),
+        Err(sw_proto::pycompat::PyErr { message: "can't start new thread".to_string() })
+    );
+    assert_eq!(h.public()["state"], PyValue::from("RELEASED"));
+    assert_eq!(h.public()["released_by"], PyValue::from("cli"));
+    let _rx = wp510r_r5_attach_to_open(&mut h, false);
+}
+
+/// B-6、WP4-3(a)（設計 v3 §1.1、§1.2）：開埠成功、沒有停止待決時發 RetirePlaceholder；退休成功後回 OKS（ATTACHING 快照：
+/// last_state_change_at 為退休時刻、last_error 與 released_* 清空，Python `origin/main:sw_core/session_manager.py:3592-3604`），
+/// 佔位 actor 進入 retired 終態（之後的請求回 SESSION_NOT_FOUND）並結束。
+#[test]
+fn wp510r_r5_b6_raw_open_retires_placeholder_with_attaching_snapshot() {
+    let mut h = wp510r_r5_placeholder(Some("cli"));
+    let loaded_at = h.public()["last_state_change_at"].clone();
+    let rx = wp510r_r5_attach_to_open(&mut h, false);
+    // 佔位於 T0 載入、T1 才退休（CoreHarness 的 wall 另行設定）。
+    h.set_wall_us(1_790_000_005_000_000);
+    let effects = h.feed(ControlEvent::PlaceholderOpened {
+        token: WP510R_R5_TOKEN,
+        result: Ok(()),
+        cancel: None,
+    });
+    assert_eq!(wp510r_r5_retire_kind(&effects), Some(sw_core::session_core::RetireKind::Opened));
+    assert_eq!(wp510r_claims(&effects, WP510R_R5_TOKEN), 0, "沒有停止待決時不關閉");
+    assert!(rx.try_recv().is_err(), "退休結果之前不回覆");
+    let effects = h.feed(ControlEvent::RetireResult {
+        token: WP510R_R5_TOKEN,
+        outcome: sw_core::mailbox::RetireOutcome::Retired,
+    });
+    assert_eq!(wp510r_r5_discards(&effects), 0, "已交給 worker，不丟棄");
+    let reply = rx.try_recv().expect("退休後回覆").expect("OKS");
+    assert_eq!(reply.get("ok"), Some(&PyValue::Bool(true)), "{reply:?}");
+    let PyValue::Dict(session) = reply["session"].clone() else {
+        panic!("session dict：{reply:?}");
+    };
+    assert_eq!(session["state"], PyValue::from("ATTACHING"));
+    assert_eq!(session["last_error"], PyValue::Null);
+    assert_eq!(session["released_by"], PyValue::Null);
+    assert_eq!(session["released_at"], PyValue::Null);
+    assert_ne!(session["last_state_change_at"], loaded_at, "WP4-3：快照由 set_state 蓋上退休時刻");
+    assert!(h.core.shutdown_complete(), "退休後佔位 actor 結束");
+    let gone = h.rpc(SessionRequest::GetState).expect("retired 終態回覆");
+    assert_eq!(gone.get("error_code"), Some(&PyValue::from("SESSION_NOT_FOUND")), "{gone:?}");
+}
+
+/// WP1-1、WP4-1(a)、G-2（設計 v3 §1.2、v1 §1.8）：開埠在途時 release 以 ClaimForStop 取消帳本紀錄（cancel＝Release，首次期限
+/// 記在紀錄上）；A 在開埠返回後回 SESSION_RECOVERING（Python 判「operation」，`origin/main:sw_core/session_manager.py:3581-3582`、
+/// `:3625-3631`）；B 在關閉回條之後才回 already_released，收尾補 released_by／released_at 並落盤（`_finish_attach_op`
+/// `:4339-4355`），鍵序 ok／already_released／session（`release_device` `:3209`）。
+#[test]
+fn wp510r_r5_wp1_1_release_during_raw_open_waits_close_then_already_released() {
+    let mut h = wp510r_r5_placeholder(None);
+    let attach = wp510r_r5_attach_to_open(&mut h, false);
+    let (release, effects) = h.rpc_deferred(SessionRequest::Release {
+        source: "cli".into(),
+        reason: PyValue::Null,
+    });
+    let claims: Vec<_> = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::ClaimForStop { token, cancel, release_deadline } => Some((*token, *cancel, release_deadline.is_some())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        claims,
+        vec![(WP510R_R5_TOKEN, sw_core::custody::CustodyCancel::Release, true)],
+        "release 取消佔位開埠的帳本紀錄，首次期限記在紀錄上"
+    );
+    assert!(attach.try_recv().is_err(), "WP1-1：A 不得早於開埠返回回覆");
+    let _ = h.feed(ControlEvent::CustodyClaimed {
+        token: WP510R_R5_TOKEN,
+        outcome: sw_core::mailbox::CustodyClaimOutcome::Cancelled,
+    });
+    assert!(attach.try_recv().is_err() && release.try_recv().is_err());
+    let _ = h.feed(ControlEvent::CustodyTerminal { token: WP510R_R5_TOKEN, closed: true, error: None });
+    assert!(release.try_recv().is_err(), "開埠終態之前 release 不完成");
+    let effects = h.feed(ControlEvent::PlaceholderOpened {
+        token: WP510R_R5_TOKEN,
+        result: Err(OpenFailure::Cancelled),
+        cancel: Some(sw_core::custody::CustodyCancel::Release),
+    });
+    assert!(wp510r_r5_retire_kind(&effects).is_none(), "有停止待決時不退休");
+    assert_eq!(wp510r_r5_discards(&effects), 1, "丟棄預先準備的 worker");
+    let a = attach.try_recv().expect("開埠返回後回覆").expect("dict");
+    assert_eq!(
+        a.0.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["ok", "error_code", "drain_stalled", "drain_timeout_epoch", "session"]
+    );
+    assert_eq!(a.get("error_code"), Some(&PyValue::from("SESSION_RECOVERING")));
+    assert_eq!(a.get("drain_stalled"), Some(&PyValue::Bool(false)));
+    assert_eq!(a.get("drain_timeout_epoch"), Some(&PyValue::Null));
+    let b = release.try_recv().expect("關閉回條後回覆").expect("dict");
+    assert_eq!(
+        b.0.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["ok", "already_released", "session"],
+        "G-2：Python `release_device` 鍵序（origin/main:sw_core/session_manager.py:3209）"
+    );
+    let PyValue::Dict(session) = b["session"].clone() else {
+        panic!("session dict：{b:?}");
+    };
+    assert_eq!(session["state"], PyValue::from("RELEASED"));
+    assert_eq!(session["released_by"], PyValue::from("cli"), "WP4-1：補 released_by");
+    assert!(matches!(&session["released_at"], PyValue::Str(_)), "WP4-1：補 released_at：{session:?}");
+    assert_eq!(session["drain_stalled"], PyValue::Bool(false));
+    assert_eq!(session["drain_timeout_epoch"], PyValue::Null);
+    let row = h.state_store.last_released();
+    assert!(row.values().any(|row| row.get("released_by") == Some(&PyValue::from("cli"))), "WP4-1：已落盤：{row:?}");
+}
+
+/// P8-693a29e-1、B-8（設計 v3 §1.1、§1.2）：開埠失敗依 Python 映射回覆（Held → DEVICE_STILL_HELD{pids, holder_unknown}，
+/// NotFound → DEVICE_NOT_PRESENT，鍵序同 Python `attach_device` `origin/main:sw_core/session_manager.py:3510-3526`），佔位不變；
+/// release 已在等待時同樣以此回覆 A，release 完成 already_released。OSError 沒有停止待決時走退休（B-7），有停止待決時回
+/// SESSION_RECOVERING（`:3555`、`:3561-3567`）。
+#[test]
+fn wp510r_r5_p8_693a29e_1_open_failures_map_python_replies() {
+    for with_release in [false, true] {
+        for (name, failure) in [
+            ("Held", OpenFailure::Held(holder(vec![4242], false))),
+            ("NotFound", OpenFailure::NotFound),
+        ] {
+            let mut h = wp510r_r5_placeholder(Some("cli"));
+            let attach = wp510r_r5_attach_to_open(&mut h, false);
+            let release = with_release.then(|| {
+                let (rx, _effects) = h.rpc_deferred(SessionRequest::Release {
+                    source: "cli".into(),
+                    reason: PyValue::Null,
+                });
+                let _ = h.feed(ControlEvent::CustodyClaimed {
+                    token: WP510R_R5_TOKEN,
+                    outcome: sw_core::mailbox::CustodyClaimOutcome::Cancelled,
+                });
+                let _ = h.feed(ControlEvent::CustodyTerminal { token: WP510R_R5_TOKEN, closed: true, error: None });
+                rx
+            });
+            let effects = h.feed(ControlEvent::PlaceholderOpened {
+                token: WP510R_R5_TOKEN,
+                result: Err(failure),
+                cancel: None,
+            });
+            assert_eq!(wp510r_r5_discards(&effects), 1, "{name}：丟棄預先準備的 worker");
+            let a = attach.try_recv().expect("開埠返回後回覆").expect("dict");
+            let expected = match name {
+                "Held" => r#"{"ok":false,"error_code":"DEVICE_STILL_HELD","pids":[4242],"holder_unknown":false,"selector":"COM0"}"#.to_string(),
+                _ => format!(r#"{{"ok":false,"error_code":"DEVICE_NOT_PRESENT","selector":"COM0","device_by_id":"{DEVICE_BY_ID}"}}"#),
+            };
+            assert_eq!(sw_proto::pyjson::dumps(&PyValue::Dict(a), &sw_proto::pyjson::RPC_WIRE), expected, "{name}（release={with_release}）");
+            assert_eq!(h.public()["state"], PyValue::from("RELEASED"));
+            if let Some(release) = release {
+                let b = release.try_recv().expect("release 收尾").expect("dict");
+                assert_eq!(b.get("already_released"), Some(&PyValue::Bool(true)), "{name}：{b:?}");
+                assert_eq!(h.public()["drain_stalled"], PyValue::Bool(false));
+            }
+        }
+    }
+    // OSError：沒有停止待決 → 退休（dynamic 再開，B-7）；有停止待決 → SESSION_RECOVERING。
+    let mut h = wp510r_r5_placeholder(Some("cli"));
+    let attach = wp510r_r5_attach_to_open(&mut h, false);
+    let effects = h.feed(ControlEvent::PlaceholderOpened {
+        token: WP510R_R5_TOKEN,
+        result: Err(OpenFailure::Other(PalError::plain(sw_pal::traits::PalErrorKind::PermissionDenied, "Permission denied"))),
+        cancel: None,
+    });
+    assert_eq!(
+        wp510r_r5_retire_kind(&effects),
+        Some(sw_core::session_core::RetireKind::OsError),
+        "OSError 且未取消：退休交 dynamic_only worker"
+    );
+    let _ = h.feed(ControlEvent::RetireResult {
+        token: WP510R_R5_TOKEN,
+        outcome: sw_core::mailbox::RetireOutcome::Retired,
+    });
+    let reply = attach.try_recv().expect("退休後回覆").expect("OKS");
+    let PyValue::Dict(session) = reply["session"].clone() else {
+        panic!("session dict：{reply:?}");
+    };
+    assert_eq!(session["state"], PyValue::from("DETACHED"));
+    assert_eq!(session["last_error"], PyValue::from("ATTACH_FAILED:PermissionError"));
+    assert!(matches!(&session["detached_at"], PyValue::Str(_)), "{session:?}");
+}
+
+/// DR-5(b)、設計 §3.1.7（T14）：佔位 Raw 的開埠結果在凍結前入列、凍結後交付——Pending 延後（撤銷後重播並退休），
+/// Permanent 只關閉（ClaimForStop Freeze）、不退休，A 回 SESSION_RECOVERING。立即回饋（HandoffWorkerPrepared、RetireResult）
+/// 三種狀態都立即處理；凍結時已準備好的 worker 不開埠（新工作不執行），以 `handoff_frozen` 回覆並丟棄 worker。
+#[test]
+fn wp510r_r5_t14_placeholder_opened_deferred_pending_closes_permanent() {
+    for permanent in [false, true] {
+        let mut h = wp510r_r5_placeholder(Some("cli"));
+        let attach = wp510r_r5_attach_to_open(&mut h, false);
+        let token = if permanent {
+            h.reg.admission_gate().freeze();
+            None
+        } else {
+            match h.reg.admission_gate().freeze_if_idle("wp510r-r5-raw") {
+                sw_core::admission::FreezeOutcome::Frozen { token, .. } => Some(token),
+                outcome => panic!("應建立暫時凍結：{outcome:?}"),
+            }
+        };
+        let effects = h.feed(ControlEvent::PlaceholderOpened {
+            token: WP510R_R5_TOKEN,
+            result: Ok(()),
+            cancel: None,
+        });
+        assert!(wp510r_r5_retire_kind(&effects).is_none(), "凍結期間不退休（permanent={permanent}）");
+        match token {
+            Some(token) => {
+                assert_eq!(wp510r_claims(&effects, WP510R_R5_TOKEN), 0, "Pending：延後");
+                assert!(attach.try_recv().is_err());
+                assert!(h.reg.admission_gate().thaw(&token));
+                let (_, replayed) = h.rpc_full(SessionRequest::GetState);
+                assert_eq!(
+                    wp510r_r5_retire_kind(&replayed),
+                    Some(sw_core::session_core::RetireKind::Opened),
+                    "撤銷凍結後重播並退休"
+                );
+            }
+            None => {
+                let claims: Vec<_> = effects
+                    .iter()
+                    .filter_map(|effect| match effect {
+                        Effect::ClaimForStop { token, cancel, .. } => Some((*token, *cancel)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    claims,
+                    vec![(WP510R_R5_TOKEN, sw_core::custody::CustodyCancel::Freeze)],
+                    "Permanent：只關閉"
+                );
+                let a = attach.try_recv().expect("Permanent 下回覆").expect("dict");
+                assert_eq!(a.get("error_code"), Some(&PyValue::from("SESSION_RECOVERING")), "{a:?}");
+            }
+        }
+    }
+    for permanent in [false, true] {
+        let mut h = wp510r_r5_placeholder(Some("cli"));
+        let (rx, effects) = h.rpc_deferred(SessionRequest::DeviceAttach { force: false });
+        assert!(wp510r_r5_has_prepare(&effects));
+        if permanent {
+            h.reg.admission_gate().freeze();
+        } else {
+            let _ = h.reg.admission_gate().freeze_if_idle("wp510r-r5-prepare");
+        }
+        let effects = h.feed(ControlEvent::HandoffWorkerPrepared {
+            token: WP510R_R5_TOKEN,
+            result: Ok(()),
+        });
+        assert!(!wp510r_r5_has_raw_open(&effects), "凍結期間不開埠（permanent={permanent}）");
+        assert_eq!(wp510r_r5_discards(&effects), 1, "丟棄已準備的 worker");
+        let reply = rx.try_recv().expect("立即回饋於凍結下立即處理").expect("dict");
+        assert_eq!(reply.get("error_code"), Some(&PyValue::from("FLUSHED_BY_SHUTDOWN")), "{reply:?}");
+        assert_eq!(reply.get("reason"), Some(&PyValue::from("handoff_frozen")), "{reply:?}");
+        assert_eq!(h.public()["state"], PyValue::from("RELEASED"));
+    }
+    // RetireResult（立即回饋）在凍結下立即處理：executor 在鎖內看到凍結就不退休（Invalid），A 回 SESSION_RECOVERING。
+    for permanent in [false, true] {
+        let mut h = wp510r_r5_placeholder(Some("cli"));
+        let attach = wp510r_r5_attach_to_open(&mut h, false);
+        let effects = h.feed(ControlEvent::PlaceholderOpened {
+            token: WP510R_R5_TOKEN,
+            result: Ok(()),
+            cancel: None,
+        });
+        assert_eq!(wp510r_r5_retire_kind(&effects), Some(sw_core::session_core::RetireKind::Opened));
+        if permanent {
+            h.reg.admission_gate().freeze();
+        } else {
+            let _ = h.reg.admission_gate().freeze_if_idle("wp510r-r5-retire");
+        }
+        let effects = h.feed(ControlEvent::RetireResult {
+            token: WP510R_R5_TOKEN,
+            outcome: sw_core::mailbox::RetireOutcome::Invalid { device: false, closing: false },
+        });
+        assert_eq!(wp510r_r5_discards(&effects), 1, "丟棄已準備的 worker（permanent={permanent}）");
+        let reply = attach.try_recv().expect("凍結下立即回覆").expect("dict");
+        assert_eq!(reply.get("error_code"), Some(&PyValue::from("SESSION_RECOVERING")), "{reply:?}");
+        assert!(!h.core.retired(), "未退休");
+        assert_eq!(h.public()["state"], PyValue::from("RELEASED"));
+    }
+}

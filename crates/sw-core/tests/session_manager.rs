@@ -1675,10 +1675,15 @@ fn wp510_review_release_cancels_placeholder_attach_before_retirement() {
 
     let (pause_tx, pause_rx) = crossbeam_channel::bounded::<()>(1);
     let (resume_tx, resume_rx) = crossbeam_channel::bounded::<()>(1);
-    m.mgr.set_placeholder_release_cancel_hook_for_test(Box::new(move || {
-        let _ = pause_tx.send(());
-        let _ = resume_rx.recv_timeout(Duration::from_secs(10));
-    }));
+    // 設計 §6 #60（H）：同步點由 ph-release-cancel（manager release 取得作業後暫停）改為 H-claim-pre-exec（佔位 actor 執行
+    // release 的 `ClaimForStop` 之前暫停）；先後順序與耗時上界不變。
+    m.mgr.set_claim_pre_exec_hook_for_test(
+        &sid,
+        Box::new(move || {
+            let _ = pause_tx.send(());
+            let _ = resume_rx.recv_timeout(Duration::from_secs(10));
+        }),
+    );
 
     let attach_manager = m.mgr.clone();
     let attach_sid = sid.clone();
@@ -2586,10 +2591,14 @@ fn wp510_lifecycle_concurrent_releases_share_first_attach_deadline() {
     m.serial.block_open(REAL);
 
     let (release_started_tx, release_started_rx) = crossbeam_channel::bounded(1);
-    m.mgr
-        .set_placeholder_release_cancel_hook_for_test(Box::new(move || {
+    // 設計 §6 #38（H）：同步點由 ph-release-cancel（只通知）改為 H-release-wait-created（首次 ReleaseWait 建立時通知、不暫停）；
+    // 先後順序與耗時上界不變。
+    m.mgr.set_release_wait_created_hook_for_test(
+        &sid,
+        Box::new(move || {
             let _ = release_started_tx.try_send(());
-        }));
+        }),
+    );
 
     let attach_manager = m.mgr.clone();
     let attach_sid = sid.clone();
@@ -5450,4 +5459,314 @@ fn wp510r_r4_w6_release_close_failure_keeps_blocked_and_stalled() {
     assert!(started.elapsed() < Duration::from_millis(1000), "首次期限已過，立即回：{:?}", started.elapsed());
     assert_eq!(m.serial.open_attempts(&real), 2, "不重開");
     assert!(device.is_open(), "closed:false 表示 handle 仍開啟");
+}
+
+// ---------------------------------------------------------------------------
+// S2-PAR-wp510r R5（設計 §4 R5、§3.1.4 W1、§1.2、§1.3）：佔位 W1 改由 actor（正式 manager／actor 路徑）。
+// ---------------------------------------------------------------------------
+
+const WP510R_R5_SID: &str = "gone-template:COM3";
+const WP510R_R5_BY_ID: &str = "/s/by-id/usb-G";
+const WP510R_R5_REAL: &str = "/dev/ttyG";
+
+/// WP1-1（設計 v3 §1.2）：開埠阻塞時帳本為佔位 actor 世代的 `Opening{PlaceholderOpen}`；release 在紀錄上寫入 cancel＝Release，
+/// 關閉回條之前不回覆；放行開埠後 A 回 SESSION_RECOVERING（RELEASED、drain false/null），B 回 already_released（鍵序
+/// ok／already_released／session，Python `release_device` `origin/main:sw_core/session_manager.py:3209`）。open 1、close 1、
+/// is_open false；佔位保留、沒有正式 session、零 TX；帳本最後為 None。
+#[test]
+fn wp510r_r5_wp1_1_release_during_placeholder_open_cancels_ledger_record() {
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(WP510R_R5_SID).expect("佔位 session");
+    let device = m.device(WP510R_R5_REAL);
+    m.mgr.update_devices(&m.snapshot());
+    m.serial.block_open(WP510R_R5_REAL);
+
+    let (attach_tx, attach_rx) = crossbeam_channel::bounded(1);
+    let attach_manager = m.mgr.clone();
+    let attach_sid = sid.clone();
+    let attach = std::thread::spawn(move || {
+        let _ = attach_tx.send(attach_manager.attach_released_placeholder(&attach_sid, false));
+    });
+    wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(WP510R_R5_REAL) == 1);
+    let rec = m.mgr.custody_for_test(WP510R_R5_BY_ID).expect("開埠在途須有帳本紀錄");
+    assert!(
+        matches!(
+            &rec.phase,
+            CustodyPhaseSnapshot::Opening { taker: sw_core::custody::CustodyTaker::PlaceholderOpen { sid: s, .. } }
+                if s == WP510R_R5_SID
+        ),
+        "開埠阻塞時為 Opening{{PlaceholderOpen}}：{rec:?}"
+    );
+    assert!(
+        matches!(&rec.owner, sw_core::custody::CustodyOwner::Session { sid: s, inc } if s == WP510R_R5_SID && *inc >= 1),
+        "owner 為佔位 actor 的世代（C7）：{rec:?}"
+    );
+    assert_eq!(rec.cancel, None);
+
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let release_manager = m.mgr.clone();
+    let release_sid = sid.clone();
+    let release = std::thread::spawn(move || {
+        let _ = release_tx.send(wp510_release(&release_manager, &release_sid));
+    });
+    wait_until("release 在帳本紀錄寫入取消", || {
+        m.mgr.custody_for_test(WP510R_R5_BY_ID).is_some_and(|r| {
+            r.token == rec.token && r.cancel == Some(sw_core::custody::CustodyCancel::Release)
+        })
+    });
+    assert!(release_rx.recv_timeout(Duration::from_millis(300)).is_err(), "關閉回條前 release 不得回覆");
+    assert!(attach_rx.try_recv().is_err(), "開埠返回前 attach 不得回覆");
+
+    m.serial.release_open(WP510R_R5_REAL);
+    let a = rpc(attach_rx.recv_timeout(RPC).expect("attach 應完成"));
+    let b = rpc(release_rx.recv_timeout(RPC).expect("release 應完成"));
+    attach.join().expect("attach thread");
+    release.join().expect("release thread");
+
+    assert_eq!(code_of(&a).as_deref(), Some("SESSION_RECOVERING"), "{a:?}");
+    assert_eq!(a.get("drain_stalled"), Some(&PyValue::Bool(false)));
+    assert_eq!(a.get("drain_timeout_epoch"), Some(&PyValue::Null));
+    assert_eq!(s_of(&session_field(&a), "state").as_deref(), Some("RELEASED"));
+    assert_eq!(
+        b.0.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["ok", "already_released", "session"],
+        "G-2：Python `release_device` 鍵序（origin/main:sw_core/session_manager.py:3209）：{b:?}"
+    );
+    let session = session_field(&b);
+    assert_eq!(s_of(&session, "state").as_deref(), Some("RELEASED"));
+    assert_eq!(s_of(&session, "released_by").as_deref(), Some("agent"), "沿用佔位的 released_by");
+    assert_eq!(session.get("drain_stalled"), Some(&PyValue::Bool(false)));
+    assert_eq!(session.get("drain_timeout_epoch"), Some(&PyValue::Null));
+    assert_eq!(device.open_count(), 1);
+    assert_eq!(device.close_count(), 1);
+    assert!(!device.is_open());
+    assert!(m.mgr.custody_for_test(WP510R_R5_BY_ID).is_none(), "帳本最後為 None");
+    assert_eq!(m.mgr.released_placeholder(&sid), Some(true), "佔位保留");
+    assert!(m.mgr.resolve("t:COM3").is_none(), "沒有正式 session");
+    assert!(device.take_tx().is_empty(), "零 TX");
+}
+
+/// WP5-2（設計 v3 §1.3；D3）：交接 worker 建立失敗時回 EXC `can't start new thread`，開埠次數 0、帳本與 prepared 皆空、佔位
+/// 不變並告警含 by_id；之後可以再交接。
+#[test]
+fn wp510r_r5_wp5_2_prepare_failure_leaves_no_ledger_or_prepared_worker() {
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(WP510R_R5_SID).expect("佔位 session");
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.fail_next_attach_spawn_for_test();
+    let error = m
+        .mgr
+        .attach_released_placeholder(&sid, false)
+        .expect_err("worker 建立失敗回 RPC 錯誤");
+    assert_eq!(error.message, "can't start new thread");
+    assert_eq!(m.serial.open_attempts(WP510R_R5_REAL), 0, "D3：worker 在開埠前準備");
+    assert!(m.mgr.custody_for_test(WP510R_R5_BY_ID).is_none());
+    assert_eq!(m.mgr.prepared_len_for_test(), 0, "prepared 為空");
+    assert!(
+        m.warnings().iter().any(|w| w.contains(WP510R_R5_BY_ID)),
+        "告警含 by_id：{:?}",
+        m.warnings()
+    );
+    wp510_b_assert_placeholder_retained(&m, &sid);
+    let again = rpc(m.mgr.attach_released_placeholder(&sid, false));
+    assert!(is_ok(&again), "之後可以再交接：{again:?}");
+    assert_eq!(m.mgr.prepared_len_for_test(), 0, "交接成功後 prepared 亦清空");
+}
+
+/// WP6-2(a)（設計 v3 §1.3；D2）：開埠成功後退休落盤 ENOSPC → 回 EXC、不回滾；帳本以同一 token 存回 `Held{Parked}`（不關閉、
+/// is_open true）；三種 selector 都查無佔位；零 TX。
+#[test]
+fn wp510r_r5_wp6_2_retire_persist_failure_parks_same_token() {
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(WP510R_R5_SID).expect("佔位 session");
+    let device = m.device(WP510R_R5_REAL);
+    m.mgr.update_devices(&m.snapshot());
+    m.serial.block_open(WP510R_R5_REAL);
+    let (attach_tx, attach_rx) = crossbeam_channel::bounded(1);
+    let attach_manager = m.mgr.clone();
+    let attach_sid = sid.clone();
+    let attach = std::thread::spawn(move || {
+        let _ = attach_tx.send(attach_manager.attach_released_placeholder(&attach_sid, false));
+    });
+    wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(WP510R_R5_REAL) == 1);
+    let token = m.mgr.custody_for_test(WP510R_R5_BY_ID).expect("開埠在途紀錄").token;
+    m.fs.fail_next_atomic_write(PalError::io(28, "No space left on device"));
+    m.serial.release_open(WP510R_R5_REAL);
+    let result = attach_rx.recv_timeout(RPC).expect("attach 應完成");
+    attach.join().expect("attach thread");
+    let error = result.expect_err("退休落盤失敗回 EXC");
+    assert!(error.message.contains("No space left on device"), "{}", error.message);
+    let rec = m.mgr.custody_for_test(WP510R_R5_BY_ID).expect("parked 紀錄");
+    assert_eq!(rec.token, token, "同一 token 存回 parked");
+    assert_eq!(rec.phase, CustodyPhaseSnapshot::Held);
+    assert_eq!(rec.owner, sw_core::custody::CustodyOwner::Parked);
+    assert!(device.is_open(), "D2：保留 parked handle");
+    assert_eq!(device.close_count(), 0);
+    for selector in [WP510R_R5_SID, "COM3", "gone-template+4"] {
+        assert!(m.mgr.resolve(selector).is_none(), "{selector} 已退休");
+    }
+    assert!(device.take_tx().is_empty(), "零 TX");
+}
+
+/// G-8（設計 v1 §1.8）：重啟後載入的一般 RELEASED session 從未收到 `DeviceAttached`；`device.attach` 以 manager 在鎖內取得的
+/// 裝置快照判斷在線（Python `attach_device` 讀 `self._devices`，`origin/main:sw_core/session_manager.py:3422-3423`、
+/// `:3482-3488`），不得誤回 DEVICE_NOT_PRESENT。
+#[test]
+fn wp510r_r5_g8_restored_released_session_attach_uses_manager_device_snapshot() {
+    const BY_ID: &str = "/s/by-id/usb-R";
+    let mut loaded = LoadedState::default();
+    loaded.released.insert("t:COM1".to_string(), released_row(BY_ID));
+    let m = ManagerRig::with(&manager_yaml(&[&t_target("COM1", 1, BY_ID)]), loaded, None);
+    let dev = m.add_device_at(BY_ID, "/dev/ttyR");
+    install_shell_replies(&dev);
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    assert_eq!(m.state_of("COM1").as_deref(), Some("RELEASED"));
+    let reply = rpc(m.mgr.route("t:COM1", SessionRequest::DeviceAttach { force: false }, RPC));
+    assert!(is_ok(&reply), "manager 快照中在線的裝置不得回 DEVICE_NOT_PRESENT：{reply:?}");
+    wait_until("t:COM1 開埠", || m.serial.open_attempts("/dev/ttyR") >= 1);
+}
+
+/// WP2-2、P8-19df186-2（設計 v3 §1.2）：開埠阻塞不放行時，t0 的 release#1 與 t0+1 s 的 release#2 共用首次 release 的絕對期限，
+/// 都在約 t0+3 s 回 DRAIN_STALLED（頂層 epoch＝g、session RELEASED、session.drain_stalled true／epoch g）；期限過後的
+/// release#3 在 200 ms 內回覆（Python `release_device` `origin/main:sw_core/session_manager.py:3117-3124`、`:3192-3204`；
+/// `tests/test_p1oc_drain_stalled.py:250-281`）。放行並關閉成功後收斂為 false/null、RELEASED，再 release 回 already_released。
+#[test]
+fn wp510r_r5_wp2_2_releases_share_first_absolute_deadline() {
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(WP510R_R5_SID).expect("佔位 session");
+    let device = m.device(WP510R_R5_REAL);
+    m.mgr.update_devices(&m.snapshot());
+    m.serial.block_open(WP510R_R5_REAL);
+    let attach_manager = m.mgr.clone();
+    let attach_sid = sid.clone();
+    let attach = std::thread::spawn(move || attach_manager.attach_released_placeholder(&attach_sid, false));
+    wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(WP510R_R5_REAL) == 1);
+    let t0 = Instant::now();
+    let spawn_release = |delay: Duration| {
+        let manager = m.mgr.clone();
+        let sid = sid.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            let response = wp510_release(&manager, &sid);
+            (response, t0.elapsed())
+        })
+    };
+    let first = spawn_release(Duration::ZERO);
+    let second = spawn_release(Duration::from_millis(1000));
+    let (first, first_at) = first.join().expect("release#1");
+    let (second, second_at) = second.join().expect("release#2");
+    for (name, response, at) in [("release#1", rpc(first), first_at), ("release#2", rpc(second), second_at)] {
+        assert_eq!(code_of(&response).as_deref(), Some("DRAIN_STALLED"), "{name}：{response:?}");
+        assert_eq!(response.get("drain_stalled"), Some(&PyValue::Bool(true)), "{name}");
+        let epoch = response.get("drain_timeout_epoch").cloned().expect("epoch");
+        assert!(matches!(epoch, PyValue::Int(_)), "{name}：epoch 為 g：{response:?}");
+        let session = session_field(&response);
+        assert_eq!(s_of(&session, "state").as_deref(), Some("RELEASED"), "{name}");
+        assert_eq!(session.get("drain_stalled"), Some(&PyValue::Bool(true)), "{name}");
+        assert_eq!(session.get("drain_timeout_epoch"), Some(&epoch), "{name}");
+        assert!(
+            at >= Duration::from_millis(2500) && at < Duration::from_millis(4500),
+            "{name} 於首次期限（約 t0+3 s）回覆：{at:?}"
+        );
+    }
+    let started = Instant::now();
+    let third = rpc(wp510_release(&m.mgr, &sid));
+    assert_eq!(code_of(&third).as_deref(), Some("DRAIN_STALLED"));
+    assert!(started.elapsed() < Duration::from_millis(200), "期限已過立即回：{:?}", started.elapsed());
+    m.serial.release_open(WP510R_R5_REAL);
+    let a = rpc(attach.join().expect("attach thread"));
+    assert_eq!(code_of(&a).as_deref(), Some("SESSION_RECOVERING"), "{a:?}");
+    wait_until("遲到的關閉收斂", || {
+        let session = m.session(&sid);
+        session.get("drain_stalled") == Some(&PyValue::Bool(false))
+            && session.get("drain_timeout_epoch") == Some(&PyValue::Null)
+    });
+    assert_eq!(m.state_of(&sid).as_deref(), Some("RELEASED"));
+    let again = rpc(wp510_release(&m.mgr, &sid));
+    assert_eq!(again.get("already_released"), Some(&PyValue::Bool(true)), "{again:?}");
+    assert_eq!(device.open_count(), 1);
+    assert_eq!(device.close_count(), 1);
+}
+
+/// WP1-4(a)（設計 v3 §1.2）：開埠阻塞時 shutdown，放行開埠成功 → A 回 SESSION_RECOVERING（五鍵），佔位不退休，handle 關閉一次，
+/// shutdown 報告已排空（Python shutdown 取消作業 `origin/main:sw_core/session_manager.py:1187`，開埠返回判「operation」
+/// `:3581`、`:3625-3631`）。
+#[test]
+fn wp510r_r5_wp1_4_shutdown_during_placeholder_open_reports_drained() {
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(WP510R_R5_SID).expect("佔位 session");
+    let device = m.device(WP510R_R5_REAL);
+    m.mgr.update_devices(&m.snapshot());
+    m.serial.block_open(WP510R_R5_REAL);
+    let attach_manager = m.mgr.clone();
+    let attach_sid = sid.clone();
+    let attach = std::thread::spawn(move || attach_manager.attach_released_placeholder(&attach_sid, false));
+    wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(WP510R_R5_REAL) == 1);
+    let shutdown_manager = m.mgr.clone();
+    let shutdown = std::thread::spawn(move || shutdown_manager.shutdown(Duration::from_secs(5)));
+    wait_until("shutdown 取消帳本紀錄", || {
+        m.mgr
+            .custody_for_test(WP510R_R5_BY_ID)
+            .is_some_and(|rec| rec.cancel == Some(sw_core::custody::CustodyCancel::Shutdown))
+    });
+    m.serial.release_open(WP510R_R5_REAL);
+    let a = rpc(attach.join().expect("attach thread"));
+    let drained = shutdown.join().expect("shutdown thread");
+    assert_eq!(
+        a.0.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["ok", "error_code", "drain_stalled", "drain_timeout_epoch", "session"],
+        "{a:?}"
+    );
+    assert_eq!(code_of(&a).as_deref(), Some("SESSION_RECOVERING"));
+    assert!(drained.iter().all(|(_, ok)| *ok), "shutdown 報告已排空：{drained:?}");
+    assert_eq!(device.close_count(), 1);
+    assert!(!device.is_open());
+    assert!(m.mgr.resolve(WP510R_R5_SID).is_some(), "不退休");
+    assert!(m.mgr.custody_for_test(WP510R_R5_BY_ID).is_none());
+    assert!(device.take_tx().is_empty(), "零 TX");
+}
+
+/// G-1（設計 v1 §1.8）：一般 session 開埠在途時兩個並行 release 進入時都不是 RELEASED（Python `release_device`
+/// `origin/main:sw_core/session_manager.py:3113-3138`），收尾後都回 REL（`:3210-3215`）：兩個回應位元組相同，都不帶
+/// already_released。
+#[test]
+fn wp510r_r5_g1_concurrent_releases_of_inflight_attach_share_identical_reply() {
+    let m = ManagerRig::single_target(&manager_yaml(&[&t_target("COM0", 1, "/s/by-id/usb-A")]));
+    m.serial.block_open("/dev/ttyOLD");
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    wait_until("COM0 開埠在途", || m.serial.open_attempts("/dev/ttyOLD") == 1);
+    let spawn_release = || {
+        let manager = m.mgr.clone();
+        std::thread::spawn(move || wp510_release(&manager, "t:COM0"))
+    };
+    let first = spawn_release();
+    wait_until("COM0 進入 RECOVERING", || m.state_of("COM0").as_deref() == Some("RECOVERING"));
+    let second = spawn_release();
+    std::thread::sleep(Duration::from_millis(200));
+    m.serial.release_open("/dev/ttyOLD");
+    let first = rpc(first.join().expect("release#1"));
+    let second = rpc(second.join().expect("release#2"));
+    assert!(is_ok(&first), "{first:?}");
+    assert!(first.get("already_released").is_none(), "{first:?}");
+    let wire = |d: &PyDict| sw_proto::pyjson::dumps(&PyValue::Dict(d.clone()), &sw_proto::pyjson::RPC_WIRE);
+    assert_eq!(wire(&first), wire(&second), "兩個並行 release 的回應位元組相同");
+    assert_eq!(m.state_of("COM0").as_deref(), Some("RELEASED"));
+}
+
+/// G-2（設計 v1 §1.8）：已 RELEASED 的 session 再 release 回 already_released，鍵序依 Python `release_device` 為
+/// ok／already_released／session（`origin/main:sw_core/session_manager.py:3209`、`:3219`）。
+#[test]
+fn wp510r_r5_g2_already_released_reply_key_order_matches_python() {
+    let m = ManagerRig::single_target(&manager_yaml(&[&t_target("COM0", 1, "/s/by-id/usb-A")])).ready();
+    let first = rpc(wp510_release(&m.mgr, "t:COM0"));
+    assert!(is_ok(&first), "{first:?}");
+    let again = rpc(wp510_release(&m.mgr, "t:COM0"));
+    assert_eq!(
+        again.0.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["ok", "already_released", "session"],
+        "{again:?}"
+    );
+    assert_eq!(again.get("already_released"), Some(&PyValue::Bool(true)));
 }

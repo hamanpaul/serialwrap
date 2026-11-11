@@ -9604,3 +9604,133 @@ fn wp510r_r4_rpc_p8_e25b69c_2_redetect_release_stall_ledger_then_released() {
     let again = r.call("device.release", r#"{"selector":"COM0"}"#);
     assert_eq!(again.get("already_released"), Some(&PyValue::Bool(true)), "不需第二次 release：{}", j(&again));
 }
+
+// ---------------------------------------------------------------------------
+// S2-PAR-wp510r R5（設計 §4 R5、§3.1.4 W1、§1.2、§1.3）：佔位 W1 改由 actor（RPC 端到端）。
+// ---------------------------------------------------------------------------
+
+/// P8-19df186-1 (ii)（設計 v3 §1.3）：退休在佔位 actor 自己的執行緒上完成；release 已取得佔位、但落在退休之後時回
+/// `SESSION_NOT_FOUND{selector}`（Python release 與退休各在一個鎖區段，`origin/main:sw_core/session_manager.py:3095-3138`、
+/// `:3573-3612`），A 回 OKS，正式 `t:COM3` 照常 attach；不得出現新舊 session 都不存在。
+#[test]
+fn wp510r_r5_rpc_p8_19df186_1_release_after_retirement_returns_not_found() {
+    let r = Arc::new(wp510_b_placeholder_rig());
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded::<()>(1);
+    r.mgr.set_placeholder_retire_pre_commit_hook_for_test(
+        WP510_PLACEHOLDER_SID,
+        Box::new(move || {
+            let _ = entered_tx.send(());
+            let _ = resume_rx.recv_timeout(Duration::from_secs(10));
+        }),
+    );
+    let attach_rig = Arc::clone(&r);
+    let attach = std::thread::spawn(move || {
+        attach_rig.call("device.attach", &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#))
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("佔位 actor 停在退休提交前");
+    let release_rig = Arc::clone(&r);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let release = std::thread::spawn(move || {
+        let _ = release_tx.send(release_rig.call("device.release", r#"{"selector":"COM3"}"#));
+    });
+    // release 已解析到佔位並排入它的 mailbox（佔位 actor 正在執行退休效果）。
+    assert!(release_rx.recv_timeout(Duration::from_millis(300)).is_err(), "退休提交前 release 不得回覆");
+    let _ = resume_tx.send(());
+    let attached = attach.join().expect("attach RPC thread");
+    let released = release_rx.recv_timeout(Duration::from_secs(5)).expect("release 應回覆");
+    release.join().expect("release RPC thread");
+    assert_eq!(attached.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&attached));
+    assert_eq!(
+        j(&released),
+        format!(
+            r#"{{"ok":false,"error_code":"SESSION_NOT_FOUND","selector":"COM3","version":"{}"}}"#,
+            r.version
+        ),
+        "退休後的 release RPC bytes"
+    );
+    wait_until("t:COM3 正式 session", || r.mgr.resolve("t:COM3").as_deref() == Some("t:COM3"));
+    assert!(r.mgr.resolve(WP510_PLACEHOLDER_SID).is_none(), "舊 sid 已退休");
+}
+
+/// P8-3786805-1（設計 v3 §1.2）：`force:true` 跳過預掃、開埠回 Held 時，回應位元組帶呼叫者原 selector（Python
+/// `origin/main:sw_core/session_manager.py:3510-3518`），佔位不變；三種 selector（sid、COM、alias）皆同。
+#[test]
+fn wp510r_r5_rpc_p8_3786805_1_force_open_held_echoes_original_selector() {
+    for selector in [WP510_PLACEHOLDER_SID, "COM3", WP510_PLACEHOLDER_ALIAS] {
+        let (r, backend, entered, dev) = wp510_b_placeholder_blocking_rig_with_open_error(Some(OpenError::Held(
+            HolderReport {
+                pids: vec![4242],
+                holder_unknown: false,
+                status: HolderScanStatus::Ok,
+            },
+        )));
+        let r = Arc::new(r);
+        let attach_rig = Arc::clone(&r);
+        let sel = selector.to_string();
+        let attach = std::thread::spawn(move || {
+            attach_rig.call("device.attach", &format!(r#"{{"selector":"{sel}","force":true}}"#))
+        });
+        entered.recv_timeout(Duration::from_secs(5)).expect("開埠進入阻塞點");
+        backend.release();
+        let response = attach.join().expect("attach RPC thread");
+        assert_eq!(
+            j(&response),
+            format!(
+                r#"{{"ok":false,"error_code":"DEVICE_STILL_HELD","pids":[4242],"holder_unknown":false,"selector":"{selector}","version":"{}"}}"#,
+                r.version
+            ),
+            "force＋Held RPC bytes（selector={selector}）"
+        );
+        assert_eq!(r.mgr.released_placeholder(WP510_PLACEHOLDER_SID), Some(true));
+        assert!(r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_none(), "開埠失敗不留帳本紀錄");
+        assert!(!dev.is_open());
+    }
+}
+
+/// WP1-1／WP1-3（設計 v3 §1.2）端到端：開埠阻塞時帳本為 `Opening{PlaceholderOpen}`；重複 attach 回 SESSION_RECOVERING（open 仍為
+/// 1）；release 寫入 cancel＝Release 並等到關閉回條；放行後 A 回 SESSION_RECOVERING、B 回 already_released（Python 鍵序
+/// `origin/main:sw_core/session_manager.py:3209`）。呼叫路徑：`device.release` → `SessionManager::route` → `ReleaseWithAck` →
+/// actor `begin_stop(Release)` → `Effect::ClaimForStop{token}` → 開埠工作提交點關閉 → `CustodyTerminal` →
+/// `PlaceholderOpened(Cancelled)` → 收斂 → 落盤 → 回覆。
+#[test]
+fn wp510r_r5_rpc_wp1_1_release_during_placeholder_open_waits_ledger_close() {
+    let (r, backend, entered, dev) = wp510_b_placeholder_blocking_rig();
+    let r = Arc::new(r);
+    let attach_rig = Arc::clone(&r);
+    let attach = std::thread::spawn(move || {
+        attach_rig.call("device.attach", &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#))
+    });
+    entered.recv_timeout(Duration::from_secs(5)).expect("開埠進入阻塞點");
+    let rec = r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).expect("開埠在途紀錄");
+    assert!(
+        matches!(&rec.phase, CustodyPhaseSnapshot::Opening { taker: sw_core::custody::CustodyTaker::PlaceholderOpen { .. } }),
+        "{rec:?}"
+    );
+    let duplicate = r.call("device.attach", &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#));
+    assert_eq!(s(&duplicate, "error_code"), "SESSION_RECOVERING", "{}", j(&duplicate));
+    let release_rig = Arc::clone(&r);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let release = std::thread::spawn(move || {
+        let _ = release_tx.send(release_rig.call("device.release", r#"{"selector":"COM3"}"#));
+    });
+    wait_until("release 在帳本紀錄寫入取消", || {
+        r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_some_and(|rec2| {
+            rec2.token == rec.token && rec2.cancel == Some(sw_core::custody::CustodyCancel::Release)
+        })
+    });
+    assert!(release_rx.recv_timeout(Duration::from_millis(200)).is_err(), "關閉回條前不回覆");
+    backend.release();
+    let attached = attach.join().expect("attach RPC thread");
+    let released = release_rx.recv_timeout(Duration::from_secs(5)).expect("release 應回覆");
+    release.join().expect("release RPC thread");
+    assert_eq!(s(&attached, "error_code"), "SESSION_RECOVERING", "{}", j(&attached));
+    let keys: Vec<&str> = released.0.keys().map(String::as_str).collect();
+    assert_eq!(keys, ["ok", "already_released", "session", "version"], "{}", j(&released));
+    assert_eq!(dev.open_count(), 1, "WP1-3：重複 attach 不另開");
+    assert_eq!(dev.close_count(), 1);
+    assert!(r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_none());
+    assert_eq!(r.mgr.released_placeholder(WP510_PLACEHOLDER_SID), Some(true));
+}
