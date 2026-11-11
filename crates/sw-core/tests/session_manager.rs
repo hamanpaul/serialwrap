@@ -5159,6 +5159,311 @@ fn wp510r_r4_is_w6_opening(rec: &sw_core::custody::CustodySnapshot, actor: sw_co
     ) && rec.owner == (sw_core::custody::CustodyOwner::Session { actor })
 }
 
+/// S2-PAR-wp510r 第 18 項紅燈：shutdown 停止回收者時，已成功入列的兩筆 Reclaim 都須關閉並結算配對回條。
+#[test]
+fn wp510r_r18_reaper_shutdown_finishes_accepted_reclaims_and_receipts() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let m = ManagerRig::templates_only();
+    let h = CoreHarness::new(SHELL_PROFILE);
+    let first_path = "/dev/wp510r-r18-reaper-first";
+    let second_path = "/dev/wp510r-r18-reaper-second";
+    let first_dev = h.add_serial_device(first_path);
+    let second_dev = h.add_serial_device(second_path);
+    let first_worker = h.start_worker_at(1801, first_path);
+    let second_worker = h.start_worker_at(1802, second_path);
+    let first_token = m.mgr.custody_register_bridged_worker_for_test(
+        "COM81",
+        "by-id-wp510r-r18-first",
+        first_path,
+        1801,
+        first_worker,
+    );
+    let second_token = m.mgr.custody_register_bridged_worker_for_test(
+        "COM82",
+        "by-id-wp510r-r18-second",
+        second_path,
+        1802,
+        second_worker,
+    );
+    let (first_actor, first_worker_token, first_epoch, first_worker) = m
+        .mgr
+        .custody_take_bridged_worker_for_test("by-id-wp510r-r18-first")
+        .expect("第一筆真實 worker");
+    let (second_actor, second_worker_token, second_epoch, second_worker) = m
+        .mgr
+        .custody_take_bridged_worker_for_test("by-id-wp510r-r18-second")
+        .expect("第二筆真實 worker");
+    assert_eq!(first_worker_token, first_token);
+    assert_eq!(second_worker_token, second_token);
+
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+    m.mgr.set_reaper_cmd_hook_for_test(Box::new(move || {
+        let _ = entered_tx.send(());
+        let _ = resume_rx.recv();
+    }));
+    let reaper = m.mgr.reaper_cmd_sender_for_test();
+    reaper
+        .send(sw_core::custody::ReaperCmd::Reclaim {
+            actor: first_actor,
+            token: first_worker_token,
+            epoch: first_epoch,
+            worker: Box::new(sw_core::custody::ReclaimWorker::Real(first_worker)),
+        })
+        .expect("第一筆回收命令已受理");
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("回收者停在第一筆命令");
+    reaper
+        .send(sw_core::custody::ReaperCmd::Reclaim {
+            actor: second_actor,
+            token: second_worker_token,
+            epoch: second_epoch,
+            worker: Box::new(sw_core::custody::ReclaimWorker::Real(second_worker)),
+        })
+        .expect("第二筆回收命令已成功入列");
+
+    let mgr = m.mgr.clone();
+    let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
+    std::thread::spawn(move || {
+        let _ = shutdown_tx.send(mgr.shutdown(Duration::from_millis(120)));
+    });
+    wait_until("shutdown 設定 stopping", || m.mgr.stopping_for_test());
+    std::thread::sleep(Duration::from_millis(300));
+    resume_tx.send(()).expect("放行第一筆回收命令");
+    let report = shutdown_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("shutdown 在回收者收尾後返回");
+
+    assert!(
+        report.contains(&("attach:by-id-wp510r-r18-first".to_string(), false)),
+        "期限內未排空的第一筆須回報 false：{report:?}"
+    );
+    assert!(
+        report.contains(&("attach:by-id-wp510r-r18-second".to_string(), false)),
+        "期限內未排空的第二筆須回報 false：{report:?}"
+    );
+    wait_until("兩筆 Reclaim worker 都關閉", || {
+        first_dev.close_count() == 1 && second_dev.close_count() == 1
+    });
+    assert_eq!(first_dev.close_count(), 1, "第一筆真實 worker 關閉一次");
+    assert_eq!(
+        second_dev.close_count(),
+        1,
+        "已入列的第二筆真實 worker 關閉一次"
+    );
+    wait_until("兩筆 Reclaim 都收到配對終態", || {
+        m.mgr.terminal_for_test(first_token).is_some()
+            && m.mgr.terminal_for_test(second_token).is_some()
+    });
+    assert!(
+        !first_dev.is_open() && !second_dev.is_open(),
+        "兩個 handle 都已關閉"
+    );
+    for token in [first_token, second_token] {
+        assert_eq!(
+            m.mgr
+                .terminal_for_test(token)
+                .map(|terminal| terminal.handle),
+            Some(sw_core::custody::TerminalHandle::Closed),
+            "token={token} 必須收到 Closed 回條"
+        );
+    }
+    assert!(m.mgr.custody_for_test("by-id-wp510r-r18-first").is_none());
+    assert!(m.mgr.custody_for_test("by-id-wp510r-r18-second").is_none());
+}
+
+/// S2-PAR-wp510r 第 18 項紅燈：第三次同型 panic 後，真實 W6 Held handle 仍須經 ClaimForStop 關閉並結算。
+#[test]
+fn wp510r_r18_repeated_panic_claims_real_w6_held_handle() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const BY_ID: &str = "/s/by-id/usb-wp510r-r18-panic";
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    let real = fallback_session_then_unplug(&m, BY_ID);
+    let device = m.device(&real);
+    let closes_before = device.close_count();
+    let old_sid = m.mgr.resolve("COM0").expect("fallback actor");
+
+    let (rematerialize_entered_tx, rematerialize_entered_rx) = crossbeam_channel::bounded(1);
+    let (rematerialize_resume_tx, rematerialize_resume_rx) = crossbeam_channel::bounded(1);
+    m.mgr.set_rematerialize_after_set_profile_hook_for_test(
+        &old_sid,
+        Box::new(move || {
+            let _ = rematerialize_entered_tx.send(());
+            let _ = rematerialize_resume_rx.recv();
+        }),
+    );
+    let _ = device.take_tx();
+    m.reply_probe(&real, b"root@t:/# ");
+    m.mgr.update_devices(&m.snapshot());
+    rematerialize_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("W6 已接受 SetProfile，停在改名之前");
+
+    let (actor_entered_rx, actor_resume_tx) = m
+        .mgr
+        .pause_next_request_for_test(&old_sid)
+        .expect("fallback actor 存在");
+    let query_mgr = m.mgr.clone();
+    let query_sid = old_sid.clone();
+    let query = std::thread::spawn(move || query_mgr.session_queue_lens(&query_sid));
+    actor_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("actor 暫停在查詢請求");
+
+    let control = m
+        .mgr
+        .actor_control_for_test(&old_sid)
+        .expect("actor control lane");
+    control
+        .send(sw_core::mailbox::ControlEvent::ArmPanic { count: 3 })
+        .expect("排入 panic 設定");
+    for _ in 0..3 {
+        control
+            .send(sw_core::mailbox::ControlEvent::DeviceMissing)
+            .expect("排入同型 panic 事件");
+    }
+    let mut filled = 0;
+    while control
+        .try_send(sw_core::mailbox::ControlEvent::ConsoleCountChanged { count: 0 })
+        .is_ok()
+    {
+        filled += 1;
+    }
+    assert!(
+        filled > 0,
+        "control lane 必須確實填滿以阻止 W6 offer 被接手"
+    );
+
+    rematerialize_resume_tx
+        .send(())
+        .expect("放行 W6 改名與 offer");
+    let token = {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(record) = m.mgr.custody_for_test(BY_ID) {
+                if record.phase == CustodyPhaseSnapshot::Held {
+                    break record.token;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "W6 真實 handle 應先存入 Held 帳本"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    assert!(
+        device.is_open(),
+        "offer 尚未被 actor 接手時真實 handle 仍開啟"
+    );
+    assert_eq!(device.close_count(), closes_before, "停止前不得提早關閉");
+    let tx_before_panic = device.tx_len();
+
+    actor_resume_tx.send(()).expect("放行 actor 連續 panic");
+    let _ = query.join();
+    wait_until("panic 復原的 ClaimForStop 關閉 handle", || {
+        m.mgr.terminal_for_test(token).is_some()
+    });
+    assert_eq!(
+        device.close_count(),
+        closes_before + 1,
+        "Held 真實 handle 恰好關閉一次"
+    );
+    assert!(!device.is_open(), "Held 真實 handle 已關閉");
+    assert!(
+        m.mgr.custody_for_test(BY_ID).is_none(),
+        "配對回條後移除帳本紀錄"
+    );
+    assert_eq!(
+        m.mgr
+            .terminal_for_test(token)
+            .map(|terminal| terminal.handle),
+        Some(sw_core::custody::TerminalHandle::Closed),
+        "ClaimForStop 必須取得配對 Closed 回條"
+    );
+    assert_eq!(
+        device.tx_len(),
+        tx_before_panic,
+        "停止收尾不得再送出登入 TX"
+    );
+    let renamed_sid = m.mgr.resolve("t:COM0").expect("W6 已正式改名");
+    wait_until("actor 由 panic 停止機制收斂", || {
+        s_of(&m.session(&renamed_sid), "state").as_deref() == Some("DETACHED")
+    });
+}
+
+/// S2-PAR-wp510r 第 18 項紅燈：一般 Opening 帳本 token 的 bind 必須取消開埠、等終態後再套用改綁。
+#[test]
+fn wp510r_r18_bind_waits_for_plain_opening_custody_terminal() {
+    const TARGET: &str = "/s/by-id/usb-wp510r-r18-bind-target";
+    let m = ManagerRig::single_target(SHELL_PROFILE);
+    m.serial.block_open("/dev/ttyOLD");
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    wait_until("一般 OpenBridge 已進入開埠", || {
+        m.serial.open_attempts("/dev/ttyOLD") == 1
+    });
+    let opening = m
+        .mgr
+        .custody_for_test("/s/by-id/usb-A")
+        .expect("一般開埠已登記 Opening");
+    assert!(
+        matches!(opening.phase, CustodyPhaseSnapshot::Opening { .. }),
+        "{opening:?}"
+    );
+    let token = opening.token;
+    let tx_before = m.dev.tx_len();
+
+    let mgr = m.mgr.clone();
+    let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+    std::thread::spawn(move || {
+        let _ = done_tx.send(mgr.bind("COM0", TARGET));
+    });
+    let first_response = done_rx.recv_timeout(Duration::from_millis(150));
+    let waited = matches!(
+        first_response,
+        Err(crossbeam_channel::RecvTimeoutError::Timeout)
+    );
+    m.serial.release_open("/dev/ttyOLD");
+    let response = rpc(match first_response {
+        Ok(response) => response,
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("bind 在開埠終態後返回"),
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+            panic!("bind worker 不應提早斷線")
+        }
+    });
+    if waited {
+        let terminal_deadline = Instant::now() + Duration::from_secs(5);
+        while m.mgr.terminal_for_test(token).is_none() {
+            assert!(
+                Instant::now() < terminal_deadline,
+                "Opening token 應有配對終態"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    let public = m.session("COM0");
+    let tx_after = m.dev.tx_len();
+    let _ = m.mgr.shutdown(Duration::from_millis(500));
+
+    assert!(
+        waited,
+        "bind 應等待帳本 Opening 的關閉終態，不可立即回 SESSION_RECOVERING"
+    );
+    assert!(is_ok(&response), "關閉終態成功後應套用改綁：{response:?}");
+    assert_eq!(
+        s_of(&public, "device_by_id").as_deref(),
+        Some(TARGET),
+        "新綁定已套用：{public:?}"
+    );
+    assert_eq!(m.dev.close_count(), 1, "取消的一般開埠 handle 關閉一次");
+    assert!(!m.dev.is_open(), "取消後不保留 handle");
+    assert_eq!(tx_after, tx_before, "一般開埠取消後不得有登入 TX");
+}
+
 /// S2-PAR-wp510r 第 17 項紅燈：正式 W6 改名後，該 actor 在接手 offer 前退出，必須依穩定身分回收 Held handle。
 #[test]
 fn wp510r_r17_w6_actor_exit_before_offer_adoption_reclaims_renamed_handle() {

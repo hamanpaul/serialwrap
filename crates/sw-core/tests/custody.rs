@@ -252,7 +252,13 @@ fn test_reaper_drain_data_barrier_not_confirmed_and_expires() {
 
     struct DummyCb;
     impl ReaperCallback for DummyCb {
-        fn handle_cmd(&self, _cmd: ReaperCmd, _event_tx: &crossbeam_channel::Sender<ControlEvent>) {}
+        fn handle_cmd(
+            &self,
+            _cmd: ReaperCmd,
+            _event_tx: &crossbeam_channel::Sender<ControlEvent>,
+        ) -> usize {
+            0
+        }
         fn handle_worker_stopped(&self, _receipt: WorkerStoppedReceipt) {}
     }
 

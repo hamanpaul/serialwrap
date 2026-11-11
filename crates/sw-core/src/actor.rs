@@ -786,7 +786,7 @@ fn dispatch(
                     if let Effect::Schedule { at, ev } = effect {
                         timers.push((at, ev));
                     } else {
-                        exec.execute(effect, control, safety);
+                        exec.execute_with_feedback(effect, control, safety, feedback);
                     }
                 }
                 *panic_count = 0;

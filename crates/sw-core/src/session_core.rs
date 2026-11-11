@@ -285,10 +285,12 @@ pub enum SessionRequest {
         /// 從 RPC 進入時刻起算的絕對期限；直接送入 actor 的測試／內部請求可留空。
         deadline: Option<std::time::Instant>,
     },
-    /// 同 `Bind`，另於建立 BindWait 時以 `ack` 回報 `WaitAck::Bind`。manager 的 `session.bind` 一律經此送出。
+    /// 同 `Bind`，另於建立 BindWait 時以 `ack` 回報 `WaitAck::Bind`。manager 的 `session.bind` 一律經此送出；
+    /// `opening_token` 是一般開埠的帳本紀錄時，actor 以 `ClaimForStop` 取消並等待終態。T14 分類仍為 Request bypass。
     BindWithAck {
         by_id: String,
         ack: crossbeam_channel::Sender<crate::mailbox::WaitAck>,
+        opening_token: Option<u64>,
     },
     /// S2-PAR-wp510r R3（設計 C7、§3.1.4 W6 協定的同步接受）：manager 把預開 handle（帳本紀錄 `token`）交給既有 session
     /// 之前先同步詢問。actor 可接受時（by_id 相符、非 RELEASED、無停止、無 bridge、無其他保管在途）記下
@@ -2613,9 +2615,9 @@ impl SessionCore {
             SessionRequest::BindWithAck { .. } if self.drain_in_progress() => {
                 vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))]
             }
-            SessionRequest::BindWithAck { by_id, ack } => {
+            SessionRequest::BindWithAck { by_id, ack, opening_token } => {
                 let before = self.next_bind_wait_id;
-                let effects = self.bind_request(by_id, reply, now);
+                let effects = self.bind_request(by_id, reply, opening_token, now);
                 if self.next_bind_wait_id != before {
                     if let Some(wait) = self.bind_waits.iter().find(|w| w.id == self.next_bind_wait_id) {
                         let _ = ack.try_send(crate::mailbox::WaitAck::Bind {
@@ -2924,7 +2926,7 @@ impl SessionCore {
             SessionRequest::Bind { .. } if self.drain_in_progress() => {
                 vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))]
             }
-            SessionRequest::Bind { by_id } => self.bind_request(by_id, reply, now),
+            SessionRequest::Bind { by_id } => self.bind_request(by_id, reply, None, now),
             SessionRequest::SetProfile {
                 profile,
                 profile_source,
@@ -3388,7 +3390,13 @@ impl SessionCore {
 
     /// P5-T16：`bind_session`（session 層）：同值冪等、有 bridge 先 `StopKind::Bind` drain、否則立即改綁。
     /// 改綁後一律 DETACHED＋`DEVICE_NOT_FOUND`；裝置在線時由 manager 隨後送 `DeviceAttached` 進 ATTACHING。
-    fn bind_request(&mut self, by_id: String, reply: Reply, now: Mono) -> Vec<Effect> {
+    fn bind_request(
+        &mut self,
+        by_id: String,
+        reply: Reply,
+        opening_token: Option<u64>,
+        now: Mono,
+    ) -> Vec<Effect> {
         if self.flash_busy() {
             // Python `bind_session` 鍵序：ok／error_code／selector／session（P8 Task 8：含 probe 窗口）。
             return vec![Effect::Reply(reply, Ok(self.flash_busy_reply(now)))];
@@ -3405,6 +3413,12 @@ impl SessionCore {
                     "session" => self.public(now, &self.public_ctx())
                 }),
             )];
+        }
+        if self.external_attach.is_none() {
+            if let Some(token) = opening_token {
+                self.external_attach = Some(token);
+                self.external_claimed = false;
+            }
         }
         if let Some(token) = self.external_attach {
             // 保管在途（出生即接管、`AcceptCustody`；設計 §3.1.4 bind「一律等到終態」）：取消本 session 的帳本紀錄並等到
@@ -3505,7 +3519,12 @@ impl SessionCore {
     /// SESSION_RECOVERING＋當下的 drain 欄位（Python `release_request` 已設時，`:3716-3726`）。
     fn resume_bind_waits(&mut self, now: Mono) -> Vec<Effect> {
         // 收斂規則（設計 §3.1.3）：retired drain 與保管紀錄都已終態才重新走 bind。
-        if !self.retired_drains.is_empty() || self.external_attach.is_some() {
+        if !self.retired_drains.is_empty()
+            || self.external_attach.is_some()
+            || self.open_real_path.is_some()
+            || self.pending_attach.is_some()
+            || matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }))
+        {
             return Vec::new();
         }
         let waits = std::mem::take(&mut self.bind_waits);
@@ -3514,7 +3533,7 @@ impl SessionCore {
             if wait.release_joined || self.pending_open_stop.is_some() || self.stop.is_some() {
                 effects.push(Effect::Reply(wait.reply, Ok(self.session_recovering_reply(now))));
             } else {
-                effects.extend(self.bind_request(wait.target, wait.reply, now));
+                effects.extend(self.bind_request(wait.target, wait.reply, None, now));
             }
         }
         effects
@@ -3627,7 +3646,7 @@ impl SessionCore {
             return self.try_converge(now);
         }
         let mut effects = self.bridge_opened_inner(epoch_hint, result, now);
-        if custody_open {
+        if custody_open || !self.bind_waits.is_empty() {
             effects.extend(self.try_converge(now));
         }
         effects

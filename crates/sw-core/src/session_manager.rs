@@ -766,6 +766,9 @@ struct Shared {
     /// catch_unwind 之外崩潰）；只對 sid 相符的 session 生效。
     #[cfg(feature = "test-fakes")]
     executor_unwind_hook: Mutex<Option<SidTestHook>>,
+    /// 只供測試（test-fakes）：回收者處理第一筆命令前的一次性暫停點。
+    #[cfg(feature = "test-fakes")]
+    reaper_cmd_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// 只供測試（test-fakes）：H-actor-panic-after-claim（設計 §0.4）——指定 session 的 `AdoptBridge` 已自帳本取出
     /// IoWorker、放入 workers 之前呼叫一次（重現 DR-1 f5 的 unwind）；只對 sid 相符的 session 生效。
     #[cfg(feature = "test-fakes")]
@@ -5583,7 +5586,16 @@ impl EffectExecutor for ManagerExec {
 }
 
 impl crate::custody::ReaperCallback for Shared {
-    fn handle_cmd(&self, cmd: crate::custody::ReaperCmd, event_tx: &crossbeam_channel::Sender<ControlEvent>) {
+    fn handle_cmd(
+        &self,
+        cmd: crate::custody::ReaperCmd,
+        event_tx: &crossbeam_channel::Sender<ControlEvent>,
+    ) -> usize {
+        #[cfg(feature = "test-fakes")]
+        if let Some(hook) = lock(&self.reaper_cmd_hook).take() {
+            hook();
+        }
+        let mut pending_receipts = 0usize;
         match cmd {
             crate::custody::ReaperCmd::ActorExited { actor } => {
                 let jobs = {
@@ -5623,7 +5635,9 @@ impl crate::custody::ReaperCallback for Shared {
                         }
                         crate::custody::ActorExitedJob::DrainBridge { worker, stop_id, .. } => {
                             if let Some(worker) = worker {
-                                worker.finish_async(stop_id, event_tx.clone());
+                                pending_receipts += usize::from(
+                                    worker.finish_async(stop_id, event_tx.clone()),
+                                );
                             }
                         }
                     }
@@ -5635,9 +5649,13 @@ impl crate::custody::ReaperCallback for Shared {
                     .custody
                     .mark_bridge_draining(actor, token, epoch, crate::drain::StopId(0));
                 drop(inner);
-                worker.finish_async(crate::drain::StopId(0), event_tx.clone());
+                pending_receipts += usize::from(worker.finish_async(
+                    crate::drain::StopId(0),
+                    event_tx.clone(),
+                ));
             }
         }
+        pending_receipts
     }
 
     fn handle_worker_stopped(&self, receipt: crate::drain::WorkerStoppedReceipt) {
@@ -5702,9 +5720,20 @@ impl crate::custody::DelivererCallback for Shared {
 struct WeakSharedReaper(std::sync::Weak<Shared>);
 
 impl crate::custody::ReaperCallback for WeakSharedReaper {
-    fn handle_cmd(&self, cmd: crate::custody::ReaperCmd, event_tx: &crossbeam_channel::Sender<ControlEvent>) {
+    fn handle_cmd(
+        &self,
+        cmd: crate::custody::ReaperCmd,
+        event_tx: &crossbeam_channel::Sender<ControlEvent>,
+    ) -> usize {
         if let Some(shared) = self.0.upgrade() {
-            shared.handle_cmd(cmd, event_tx);
+            shared.handle_cmd(cmd, event_tx)
+        } else {
+            match cmd {
+                crate::custody::ReaperCmd::ActorExited { .. } => 0,
+                crate::custody::ReaperCmd::Reclaim { worker, .. } => {
+                    usize::from((*worker).finish_async(crate::drain::StopId(0), event_tx.clone()))
+                }
+            }
         }
     }
 
@@ -5833,6 +5862,8 @@ impl SessionManager {
             file_transfer_timeout_override: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             executor_unwind_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            reaper_cmd_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             adopt_after_claim_hook: Mutex::new(None),
             reaper_cmd_tx,
@@ -6311,7 +6342,7 @@ impl SessionManager {
                 }
             }
         }
-        let (sid, io) = loop {
+        let (sid, io, opening_token) = loop {
             let inner = lock(&self.shared.inner);
             let Some(e) = inner.resolve(selector) else {
                 return Ok(pydict! {
@@ -6323,6 +6354,21 @@ impl SessionManager {
             let sid = e.sid.clone();
             let old_by_id = e.profile.device_by_id.clone();
             let io = e.io.clone();
+            let opening_token = inner.custody.get_custody(&old_by_id).and_then(|rec| {
+                (matches!(
+                    &rec.owner,
+                    crate::custody::CustodyOwner::Session { actor } if *actor == e.actor_id
+                ) && rec.cancel.is_none()
+                    && matches!(
+                        &rec.phase,
+                        crate::custody::CustodyPhase::Opening {
+                            taker: crate::custody::CustodyTaker::OpenJob { actor }
+                        } | crate::custody::CustodyPhase::Taken {
+                            taker: crate::custody::CustodyTaker::OpenJob { actor }
+                        } if *actor == e.actor_id
+                    ))
+                .then_some(rec.token)
+            });
             // #26：舊 by_id 的 attach op 進行中 → 取消並等待（上限 3000 ms）後重試；逾時 → SESSION_RECOVERING。本 session 的
             // W6 再解析作業（`external`）改由 actor 的 bind 以 `ClaimForStop` 取消並等到終態（BindWait 3000 ms，設計 §3.1.4
             // bind；S2-PAR-wp510r R4 移除再解析的 manager 等待迴圈）。
@@ -6371,7 +6417,7 @@ impl SessionManager {
                     "session_id" => other.sid.clone()
                 });
             }
-            break (sid, io);
+            break (sid, io, opening_token);
         };
         // SPEC-GAP 2（編排者 2026-11-11）：BindWait 期限以實時起算，actor 受理等待時以 `WaitAck::Bind` 告知，期限到仍未
         // 回覆即送 `BindDeadlineElapsed`（Python `bind_session` 以實時等待作業 `done`，`:3695-3710`）。
@@ -6380,6 +6426,7 @@ impl SessionManager {
                 |ack| SessionRequest::BindWithAck {
                     by_id: by_id.clone(),
                     ack,
+                    opening_token,
                 },
                 QUERY_TIMEOUT + ATTACH_OP_WAIT,
             )?,
@@ -7162,6 +7209,18 @@ impl SessionManager {
         self.shared.reaper_cmd_tx.clone()
     }
 
+    /// 只供測試（test-fakes）：讓下一筆回收者命令停在 callback 入口。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_reaper_cmd_hook_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
+        *lock(&self.shared.reaper_cmd_hook) = Some(hook);
+    }
+
+    /// 只供測試（test-fakes）：查詢 manager 是否已進入停止序。
+    #[cfg(feature = "test-fakes")]
+    pub fn stopping_for_test(&self) -> bool {
+        lock(&self.shared.inner).stopping
+    }
+
     /// 只供測試（test-fakes）：以真實 IoWorker 登錄帳本為 Bridged。
     #[cfg(feature = "test-fakes")]
     pub fn custody_register_bridged_worker_for_test(
@@ -7185,6 +7244,27 @@ impl SessionManager {
             .expect("register ok");
         inner.custody.adopt_bridged(token, epoch, worker).expect("adopt_bridged ok");
         token
+    }
+
+    /// 只供測試（test-fakes）：從 Bridged 帳本取出真實 IoWorker，以重現 actor 接手前的窗口。
+    #[cfg(feature = "test-fakes")]
+    pub fn custody_take_bridged_worker_for_test(
+        &self,
+        by_id: &str,
+    ) -> Option<(crate::custody::ActorId, u64, u64, crate::uart_bridge::IoWorker)> {
+        let mut inner = lock(&self.shared.inner);
+        let (actor, token, epoch) = {
+            let rec = inner.custody.get_custody(by_id)?;
+            let crate::custody::CustodyOwner::Session { actor } = &rec.owner else {
+                return None;
+            };
+            let crate::custody::CustodyPhase::Bridged { epoch, .. } = &rec.phase else {
+                return None;
+            };
+            (*actor, rec.token, *epoch)
+        };
+        let worker = inner.custody.claim_bridged_worker(token, epoch).ok()?;
+        Some((actor, token, epoch, worker))
     }
 
     /// 只供測試（test-fakes）：取得 manager 登錄之 session 的穩定 ActorId。

@@ -361,10 +361,13 @@ impl ReclaimWorker {
         }
     }
 
-    pub fn finish_async(self, stop_id: StopId, control: Sender<ControlEvent>) {
+    pub fn finish_async(self, stop_id: StopId, control: Sender<ControlEvent>) -> bool {
         match self {
-            ReclaimWorker::Real(w) => w.finish_async(stop_id, control),
-            ReclaimWorker::Mock(_) => {}
+            ReclaimWorker::Real(w) => {
+                w.finish_async(stop_id, control);
+                true
+            }
+            ReclaimWorker::Mock(_) => false,
         }
     }
 }
@@ -1211,7 +1214,8 @@ impl Deliverer {
 
 /// 回收者命令與事件回呼介面。
 pub trait ReaperCallback: Send + Sync + 'static {
-    fn handle_cmd(&self, cmd: ReaperCmd, event_tx: &Sender<ControlEvent>);
+    /// 執行命令並回報本次啟動、預期送回的 `WorkerStopped` 數量。
+    fn handle_cmd(&self, cmd: ReaperCmd, event_tx: &Sender<ControlEvent>) -> usize;
     fn handle_worker_stopped(&self, receipt: WorkerStoppedReceipt);
 }
 
@@ -1234,12 +1238,38 @@ impl ReaperThread {
         let handle = std::thread::Builder::new()
             .name("serialwrap-reaper".into())
             .spawn(move || {
-                while !thread_stopped.load(Ordering::Relaxed) {
+                let mut pending_receipts = 0usize;
+                let mut stopping = false;
+                loop {
+                    stopping |= thread_stopped.load(Ordering::Acquire);
+                    if stopping {
+                        match reaper_cmd_rx.try_recv() {
+                            Ok(cmd) => {
+                                pending_receipts = pending_receipts
+                                    .saturating_add(callback.handle_cmd(cmd, &reaper_event_tx));
+                                continue;
+                            }
+                            Err(crossbeam_channel::TryRecvError::Empty)
+                                if pending_receipts == 0 =>
+                            {
+                                break;
+                            }
+                            Err(crossbeam_channel::TryRecvError::Disconnected)
+                                if pending_receipts == 0 =>
+                            {
+                                break;
+                            }
+                            Err(_) => {}
+                        }
+                    }
                     crossbeam_channel::select! {
                         recv(reaper_cmd_rx) -> msg => {
                             match msg {
-                                Ok(cmd) => callback.handle_cmd(cmd, &reaper_event_tx),
-                                Err(_) => break,
+                                Ok(cmd) => {
+                                    pending_receipts = pending_receipts
+                                        .saturating_add(callback.handle_cmd(cmd, &reaper_event_tx));
+                                }
+                                Err(_) => stopping = true,
                             }
                         }
                         recv(reaper_event_rx) -> msg => {
@@ -1251,9 +1281,10 @@ impl ReaperThread {
                                 }
                                 Ok(ControlEvent::WorkerStopped(receipt)) => {
                                     callback.handle_worker_stopped(receipt);
+                                    pending_receipts = pending_receipts.saturating_sub(1);
                                 }
                                 Ok(_) => {}
-                                Err(_) => break,
+                                Err(_) => stopping = true,
                             }
                         }
                         default(Duration::from_millis(50)) => {}
@@ -1269,7 +1300,7 @@ impl ReaperThread {
     }
 
     pub fn stop(&mut self) {
-        self.stopped.store(true, Ordering::Relaxed);
+        self.stopped.store(true, Ordering::Release);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }

@@ -4350,6 +4350,7 @@ fn wp510r_r3_spec_gap2_bind_wait_notice_settles_once() {
     let (bind_rx, _) = h.rpc_deferred(SessionRequest::BindWithAck {
         by_id: WP510R_BIND_TARGET.into(),
         ack: ack_tx,
+        opening_token: None,
     });
     let wait = ack_rx.try_recv().expect("BindWait 須回報 WaitAck::Bind");
     let sw_core::mailbox::WaitAck::Bind { id, .. } = wait else {
@@ -4543,6 +4544,7 @@ fn wp510r_r3_t14_bind_notice_and_claim_for_stop_under_freeze() {
         let (bind_rx, _) = h.rpc_deferred(SessionRequest::BindWithAck {
             by_id: WP510R_BIND_TARGET.into(),
             ack: ack_tx,
+            opening_token: None,
         });
         let Ok(sw_core::mailbox::WaitAck::Bind { id, .. }) = ack_rx.try_recv() else {
             panic!("BindWait 須回報 WaitAck::Bind");
