@@ -1897,12 +1897,21 @@ impl Shared {
             prev
         };
         if !unconsumed.is_empty() {
+            let mut closed_ok = Vec::new();
             for (by_id, _op, pre) in unconsumed {
                 if let Some(pre) = pre {
-                    self.close_session_preopened(&by_id, pre);
+                    if self.close_session_preopened(&by_id, pre) {
+                        closed_ok.push(by_id);
+                    }
                 }
             }
             self.cv.notify_all();
+            // DR-2(a)：關閉期間到達的重插被 `spawn_attach_with` 擋下；closed:true 之後 by_id 仍在線者補排一次 attach。
+            for by_id in closed_ok {
+                if lock(&self.inner).devices.contains_key(&by_id) {
+                    self.spawn_attach(&by_id);
+                }
+            }
         }
         // Python `_mark_missing_devices_locked`（審查 F60）：與 Python 同在 detach／attach 之前標記。
         let missing: Vec<String> = {
@@ -1994,6 +2003,22 @@ impl Shared {
         // wp510 第 13 項：未確認關閉的 by_id 不再 attach（Python `_spawn_attach` 見 `_draining_by_ids` 即早退，
         // `origin/main:sw_core/session_manager.py:4113-4114`）。
         if self.unconfirmed_closes.contains(by_id) {
+            drop(inner);
+            if let Some(pre) = preopened {
+                let _ = pre.parts.close();
+            }
+            return;
+        }
+        // S2-PAR-wp510r R6（設計 DR-2 a、D1 i；規格 §5.2.4「收到並驗證回條前不得另開同一受管端點」）：by_id 上的帳本
+        // 紀錄仍在關閉或排空（熱插拔除、release、shutdown 正在關閉的 parked 或未接手 handle）時不另開；回條 closed:true
+        // 之後由關閉者補排一次 attach（`update_devices`）。Python 重插可立即開（`origin/main:sw_core/session_manager.py:4052-4063`），
+        // 屬設計核准的差異。
+        if inner.custody.get_custody(by_id).is_some_and(|rec| {
+            matches!(
+                rec.phase,
+                crate::custody::CustodyPhase::Closing { .. } | crate::custody::CustodyPhase::BridgeDraining { .. }
+            )
+        }) {
             drop(inner);
             if let Some(pre) = preopened {
                 let _ = pre.parts.close();
@@ -5687,6 +5712,11 @@ impl SessionManager {
                 op: AttachOp,
                 deadline: Instant,
             },
+            WaitCustodyClose {
+                by_id: String,
+                token: u64,
+                deadline: Instant,
+            },
         }
         loop {
             let step = {
@@ -5732,6 +5762,19 @@ impl SessionManager {
                             deadline,
                         }
                     }
+                } else if let Some(rec) = inner.custody.custody.get_mut(&by_id).filter(|rec| {
+                    rec.owner == crate::custody::CustodyOwner::Reaper
+                        && matches!(rec.phase, crate::custody::CustodyPhase::Closing { .. })
+                }) {
+                    // S2-PAR-wp510r R6（設計 DR-2 b、D1、T-1）：本 session 的 by_id 上有別的關閉者（熱插拔除等）正在關閉、
+                    // 不屬任何 session 的 parked handle：release 等它的關閉回條（D1 i），首次 release 的絕對期限記在紀錄上、
+                    // 之後的 release 沿用（`origin/main:sw_core/session_manager.py:3117-3124`）。
+                    let deadline = *rec.release_deadline.get_or_insert(candidate_release_deadline);
+                    Step::WaitCustodyClose {
+                        by_id,
+                        token: rec.token,
+                        deadline,
+                    }
                 } else {
                     // 交給 session、尚未由正式 bridge 接手的 handle 是該 session 擁有的帳本紀錄：由 actor 的 release 收尾
                     // （`ClaimForStop`，設計 §3.1.4 release；SPEC-GAP 2 的期限通知見 `route_after_release_settle`）。
@@ -5755,7 +5798,33 @@ impl SessionManager {
                         return Ok(Some(reply));
                     }
                 }
+                Step::WaitCustodyClose { by_id, token, deadline } => {
+                    if !self.wait_custody_close_for_release(&by_id, token, deadline) {
+                        return self.release_close_unconfirmed_reply(sid);
+                    }
+                }
             }
+        }
+    }
+
+    /// DR-2(b)：等別的關閉者關閉 by_id 上的帳本紀錄 `token`。紀錄移除（closed:true）回 true，之後由 actor 的 release
+    /// 照常收尾；關閉失敗（CloseFailed，D1 iii）或仍待回條，都等到首次期限（T-1）才回 false（DRAIN_STALLED）。
+    fn wait_custody_close_for_release(&self, by_id: &str, token: u64, deadline: Instant) -> bool {
+        let mut inner = lock(&self.shared.inner);
+        loop {
+            if inner.custody.get_custody(by_id).is_none_or(|rec| rec.token != token) {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, _) = self
+                .shared
+                .cv
+                .wait_timeout(inner, (deadline - now).min(Duration::from_millis(50)))
+                .unwrap_or_else(|e| e.into_inner());
+            inner = next;
         }
     }
 
@@ -7059,11 +7128,20 @@ impl SessionManager {
         // Python `shutdown_drain` 對未消費的 `_preopened_ports` 作業直接 `_finish_attach_op`（關閉 handle；關閉失敗保留作業、
         // 列為 stalled，`origin/main:sw_core/session_manager.py:1218-1227`、`:1231-1239`）。
         for (by_id, op, pre) in unconsumed {
+            let token = pre.as_ref().and_then(|pre| pre.custody);
             let receipt = match pre {
                 Some(pre) => Some(op.close_parts(pre.parts)),
                 None => op.close_preopened_with_receipt(),
             };
+            let closed = receipt.as_ref().is_some_and(|receipt| receipt.closed);
             self.shared.finish_worker_op(&by_id, &op, receipt);
+            // S2-PAR-wp510r R6（DR-5 c、C3）：shutdown 掃描自帳本認領（`claim_for_release` → Closing）的 parked handle 確認
+            // 關閉後，以同一 token 配對結算（移除紀錄、終態 Closed）；closed:false 由 `finish_worker_op` 轉 CloseFailed。
+            if let (true, Some(token)) = (closed, token) {
+                lock(&self.shared.inner)
+                    .custody
+                    .settle_claimed_close(&by_id, token, closed_terminal());
+            }
         }
 
         let mut waits: Vec<(String, Option<Receiver<Result<PyDict, PyErr>>>)> = Vec::new();

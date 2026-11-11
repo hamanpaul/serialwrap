@@ -5940,3 +5940,184 @@ fn wp510r_r5_p8_a07fdfb_1_same_path_update_before_oserror_retire_still_retires()
     wait_until("佔位交接的 dynamic 開埠", || m.serial.open_attempts(WP510R_R5_REAL) == 2);
     assert_eq!(m.mgr.resolve(WP510R_R5_SID), None, "舊佔位已退休");
 }
+
+// ---------------------------------------------------------------------------
+// S2-PAR-wp510r R6：失敗情境目錄補齊（設計 §1；DR-1 h、DR-1 a）
+// ---------------------------------------------------------------------------
+
+/// DR-1(h1)(h2)（設計 v3 §1.8、§3.1.5 W1 Raw）：佔位 Raw 開埠在途時佔位 actor 在 catch_unwind 之外結束；開埠工作
+/// 成功後把 handle 存回帳本 `Held{Session(PH)}`，`PlaceholderOpened` 送不出去（actor 已不在）時由開埠工作自行轉
+/// Closing 並關閉：(h1) closed:true 紀錄移除、終態 Closed、不登記未確認關閉；(h2) closed:false 轉 CloseFailed、
+/// 進未確認集合、handle 仍開著。兩者都不退休佔位、不開第二次、零 TX（Python 在鎖內移交、沒有通道失敗點，
+/// `origin/main:sw_core/session_manager.py:4374-4384`、`:5695-5707`；關閉失敗保留阻擋 `:4322-4332`）。
+#[test]
+fn wp510r_r6_dr1_h_placeholder_raw_open_undelivered_closes_via_ledger() {
+    for closed in [true, false] {
+        let m = wp510_b_placeholder_rig(false, false);
+        let sid = m.mgr.resolve(WP510R_R5_SID).expect("佔位 session");
+        let device = m.device(WP510R_R5_REAL);
+        if !closed {
+            device.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
+        }
+        m.mgr.update_devices(&m.snapshot());
+        m.serial.block_open(WP510R_R5_REAL);
+        let attach_manager = m.mgr.clone();
+        let attach_sid = sid.clone();
+        let attach = std::thread::spawn(move || attach_manager.attach_released_placeholder(&attach_sid, false));
+        wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(WP510R_R5_REAL) == 1);
+        let rec = m.mgr.custody_for_test(WP510R_R5_BY_ID).expect("佔位 Raw 開埠的帳本紀錄");
+        let token = rec.token;
+        // 佔位 actor 在開埠在途時結束（executor 在 catch_unwind 之外 unwind）。
+        m.mgr.set_executor_unwind_hook_for_test(
+            &sid,
+            Box::new(|| panic!("測試注入：佔位 actor 在 PlaceholderOpened 送達前結束")),
+        );
+        let ctrl = m.mgr.actor_control_for_test(&sid).expect("佔位 actor");
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        ctrl.send(sw_core::mailbox::ControlEvent::Request { req: SessionRequest::GetState, reply: tx })
+            .expect("送入查詢以觸發 unwind");
+        std::thread::sleep(Duration::from_millis(150));
+        m.serial.release_open(WP510R_R5_REAL);
+        let _ = attach.join().expect("attach thread 不應 panic");
+
+        if closed {
+            wait_until("(h1) 開埠工作自行關閉並結算", || {
+                m.mgr.terminal_for_test(token).is_some() && m.mgr.custody_for_test(WP510R_R5_BY_ID).is_none()
+            });
+            assert_eq!(
+                m.mgr.terminal_for_test(token).map(|t| t.handle),
+                Some(sw_core::custody::TerminalHandle::Closed),
+                "(h1) 終態 Closed"
+            );
+            assert!(!device.is_open(), "(h1) handle 已關閉");
+            assert!(!m.mgr.unconfirmed_close_for_test(WP510R_R5_BY_ID), "(h1) 不登記未確認關閉");
+        } else {
+            wait_until("(h2) 關閉失敗轉 CloseFailed", || {
+                matches!(
+                    m.mgr.custody_for_test(WP510R_R5_BY_ID).map(|rec| rec.phase),
+                    Some(sw_core::custody::CustodyPhaseSnapshot::CloseFailed { .. })
+                )
+            });
+            let rec = m.mgr.custody_for_test(WP510R_R5_BY_ID).expect("CloseFailed 紀錄保留");
+            assert_eq!(rec.token, token, "(h2) 同一 token");
+            assert!(m.mgr.unconfirmed_close_for_test(WP510R_R5_BY_ID), "(h2) 進未確認集合");
+            assert!(device.is_open(), "(h2) handle 仍開著");
+        }
+        assert_eq!(device.close_count(), 1, "只關閉一次（closed={closed}）");
+        assert_eq!(device.open_count(), 1, "不開第二次（closed={closed}）");
+        assert!(m.mgr.resolve(WP510R_R5_SID).is_some(), "不退休佔位（closed={closed}）");
+        assert!(device.take_tx().is_empty(), "零 TX（closed={closed}）");
+    }
+}
+
+/// DR-5(b)（設計 v3 §1.8、§3.1.7 `BridgeOpened`（Raw）：Pending 延後、Permanent 只關閉不退休）：佔位 Raw 開埠在凍結前
+/// 送出、開埠結果在凍結後交付。Permanent：佔位 actor 只關閉（`ClaimForStop(Freeze)`），配對回條後紀錄移除、終態
+/// Closed，不退休、零 TX、沒有 IoWorker（不建正式 session），attach 回 SESSION_RECOVERING。Pending：開埠結果延後、
+/// handle 留在帳本；撤銷凍結後重播並照常退休交接（Python 凍結期間不推進 attach，`origin/main:sw_core/session_manager.py:1127-1137`、
+/// `:1181-1239`）。
+#[test]
+fn wp510r_r6_dr5_b_placeholder_raw_opened_after_freeze() {
+    for permanent in [true, false] {
+        let m = wp510_b_placeholder_rig(false, false);
+        let sid = m.mgr.resolve(WP510R_R5_SID).expect("佔位 session");
+        let device = m.device(WP510R_R5_REAL);
+        m.mgr.update_devices(&m.snapshot());
+        m.serial.block_open(WP510R_R5_REAL);
+        let attach_manager = m.mgr.clone();
+        let attach_sid = sid.clone();
+        let attach = std::thread::spawn(move || attach_manager.attach_released_placeholder(&attach_sid, false));
+        wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(WP510R_R5_REAL) == 1);
+        let token = m.mgr.custody_for_test(WP510R_R5_BY_ID).expect("佔位 Raw 開埠紀錄").token;
+        let gate = m.reg.admission_gate();
+        let freeze = if permanent {
+            gate.freeze();
+            None
+        } else {
+            match gate.freeze_if_idle("wp510r-r6-dr5b") {
+                sw_core::admission::FreezeOutcome::Frozen { token, .. } => Some(token),
+                outcome => panic!("應建立暫時凍結：{outcome:?}"),
+            }
+        };
+        m.serial.release_open(WP510R_R5_REAL);
+        match freeze {
+            None => {
+                let a = rpc(attach.join().expect("attach thread"));
+                assert_eq!(code_of(&a).as_deref(), Some("SESSION_RECOVERING"), "{a:?}");
+                wait_until("Permanent：只關閉並結算", || {
+                    m.mgr.custody_for_test(WP510R_R5_BY_ID).is_none() && m.mgr.terminal_for_test(token).is_some()
+                });
+                assert_eq!(
+                    m.mgr.terminal_for_test(token).map(|t| t.handle),
+                    Some(sw_core::custody::TerminalHandle::Closed),
+                    "配對回條結算為 Closed"
+                );
+                assert_eq!(device.close_count(), 1);
+                assert!(!device.is_open());
+                assert!(m.mgr.resolve(WP510R_R5_SID).is_some(), "Permanent 不退休");
+                assert!(m.mgr.resolve("t:COM3").is_none(), "不建正式 session（沒有 IoWorker）");
+                assert!(device.take_tx().is_empty(), "零 TX");
+            }
+            Some(freeze) => {
+                std::thread::sleep(Duration::from_millis(300));
+                assert!(!attach.is_finished(), "Pending：開埠結果延後，attach 尚未回覆");
+                assert!(device.is_open(), "handle 留在帳本");
+                assert_eq!(m.mgr.custody_for_test(WP510R_R5_BY_ID).map(|r| r.token), Some(token));
+                assert!(m.mgr.resolve(WP510R_R5_SID).is_some(), "Pending 期間不退休");
+                assert!(gate.thaw(&freeze), "撤銷凍結");
+                // 交接延後的事件在下一個事件分派時重播。
+                let _ = m.mgr.session_queue_lens(&sid);
+                let a = rpc(attach.join().expect("attach thread"));
+                assert!(is_ok(&a), "撤銷凍結後照常退休交接：{a:?}");
+                assert!(m.mgr.resolve(WP510R_R5_SID).is_none(), "佔位已退休");
+                assert_eq!(device.close_count(), 0, "交接沿用原 handle");
+                assert_eq!(device.open_count(), 1);
+            }
+        }
+    }
+}
+
+/// DR-5(a)（設計 v3 §1.8、§3.1.7 `CustodyOffer`：Permanent 只關閉；manager 凍結 Permanent 時寫 cancel(Freeze)）：既有
+/// fallback session 重插後的 #181 再解析（W6）開埠在凍結前送出；正式交接凍結（`freeze_if_idle` → manager
+/// `freeze_for_handoff` → `commit_handoff`，同 `Service::handoff_stop`）成立後開埠才返回。W6 的 handle 只關閉、不交給
+/// actor adopt：配對回條（紀錄移除、終態 Closed）、零 TX（沒有 PROBE、沒有登入）、沒有 IoWorker（session 沒有
+/// attached_real_path）、不重新開埠（Python 凍結期間不推進 attach／readiness，`origin/main:sw_core/session_manager.py:1127-1137`、
+/// `:1181-1239`）。
+#[test]
+fn wp510r_r6_dr5_a_w6_open_returns_after_handoff_commit_closes_only() {
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    let real = fallback_session_then_unplug(&m, "/s/by-id/usb-D");
+    m.serial.block_open(&real);
+    m.mgr.update_devices(&m.snapshot());
+    wait_until("再偵測卡在 open", || m.serial.open_attempts(&real) == 2);
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let blocked = m.mgr.custody_for_test("/s/by-id/usb-D").expect("W6 開埠在途須登記帳本紀錄");
+    assert!(wp510r_r4_is_w6_opening(&blocked, &sid), "{blocked:?}");
+    let token = blocked.token;
+    let device = m.device(&real);
+    let closes_before = device.close_count();
+    let tx_before = device.tx_len();
+
+    let gate = m.reg.admission_gate();
+    let freeze = match gate.freeze_if_idle("update") {
+        sw_core::admission::FreezeOutcome::Frozen { token, .. } => token,
+        outcome => panic!("閒置的 gate 應新建交接凍結：{outcome:?}"),
+    };
+    let _unconverged = m.mgr.freeze_for_handoff(Duration::from_millis(500));
+    assert!(gate.commit_handoff(&freeze), "交接提交 → Permanent");
+
+    m.serial.release_open(&real);
+    wait_until("凍結後返回的 W6 handle 只關閉並結算", || {
+        m.mgr.custody_for_test("/s/by-id/usb-D").is_none() && m.mgr.terminal_for_test(token).is_some()
+    });
+    assert_eq!(
+        m.mgr.terminal_for_test(token).map(|t| t.handle),
+        Some(sw_core::custody::TerminalHandle::Closed),
+        "配對回條結算為 Closed"
+    );
+    assert_eq!(device.close_count(), closes_before + 1, "關閉一次");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(device.tx_len(), tx_before, "零 TX（沒有 PROBE、沒有登入）");
+    assert_eq!(m.serial.open_attempts(&real), 2, "不重新開埠");
+    let session = m.session("COM0");
+    assert_eq!(session.get("attached_real_path"), Some(&PyValue::Null), "沒有 IoWorker：{session:?}");
+}

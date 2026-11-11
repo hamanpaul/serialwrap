@@ -9874,3 +9874,60 @@ fn wp510r_r5_rpc_p8_a07fdfb_1_retarget_and_back_before_oserror_retire_keeps_plac
     assert!(r.mgr.resolve("t:COM3").is_none(), "沒有正式 session");
     assert_eq!(r.fs.bytes(support::STATE_PATH), state_before, "不落盤退休");
 }
+
+// ---------------------------------------------------------------------------
+// S2-PAR-wp510r R6（設計 §3.1.7、§1.8 DR-5）：T14 交接凍結下的保管紀錄（ServiceRig 端到端）
+// ---------------------------------------------------------------------------
+
+/// DR-5(c)（設計 v3 §1.8、§3.1.7 Request `Release`：admission 拒絕新請求、帳本不受影響、由 shutdown 掃描收尾）：parked B3
+/// 綁在 COM1 上（雙 ENOSPC：COM1 已於記憶體改綁、parked 未被取走）時 `daemon.handoff_stop` 成立；之後的 `device.release`
+/// 由 RPC admission 回 `FLUSHED_BY_SHUTDOWN`＋`reason:"handoff_frozen"`（逐位元組，Python `rpc()` 的凍結早退，
+/// `origin/main:sw_core/service.py:870-874`），parked handle 不關閉、帳本紀錄不變；shutdown 掃描帳本關閉 parked 並配對回條
+/// （關閉一次、紀錄移除、終態 Closed、報告已排空）。
+#[test]
+fn wp510r_r6_rpc_dr5_c_release_rejected_under_handoff_freeze_parked_closed_by_shutdown() {
+    let r = wp510_b_placeholder_rig();
+    let dev = wp510_review8_double_enospc_bind_setup(&r, true);
+    let parked = r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).expect("前置：parked 帳本紀錄");
+    assert_eq!(parked.owner, sw_core::custody::CustodyOwner::Parked, "{parked:?}");
+    assert_eq!(parked.phase, sw_core::custody::CustodyPhaseSnapshot::Held);
+    let token = parked.token;
+
+    let granted = r.svc.handoff_stop(&sw_proto::pydict! { "reason" => "update" });
+    assert_eq!(granted.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&granted));
+    assert_eq!(
+        r.mgr.deliverer_gate_for_test().handoff_freeze_state(),
+        sw_core::admission::HandoffFreezeState::Permanent
+    );
+    let released = r.call("device.release", r#"{"selector":"COM1"}"#);
+    assert_eq!(
+        j(&released),
+        j(&sw_proto::pydict! {
+            "ok" => false,
+            "error_code" => "FLUSHED_BY_SHUTDOWN",
+            "reason" => "handoff_frozen",
+            "version" => support::RIG_VERSION,
+        }),
+        "admission 拒絕凍結後的 release"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(dev.close_count(), 0, "release 被拒：parked handle 不關閉");
+    assert!(dev.is_open());
+    let after = r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).expect("帳本紀錄不變");
+    assert_eq!((after.token, after.owner.clone(), after.phase.clone()), (token, parked.owner.clone(), parked.phase.clone()));
+
+    let drained = r.mgr.shutdown(Duration::from_millis(1500));
+    assert!(
+        drained
+            .iter()
+            .any(|(target, ok)| target == &format!("attach:{WP510_PLACEHOLDER_BY_ID}") && *ok),
+        "shutdown 掃描關閉 parked 並報已排空：{drained:?}"
+    );
+    assert_eq!(dev.close_count(), 1, "parked handle 由 shutdown 掃描關閉一次");
+    assert!(!dev.is_open());
+    assert!(r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_none(), "配對回條後紀錄移除：{:?} term={:?}", r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID), r.mgr.terminal_for_test(token));
+    assert_eq!(
+        r.mgr.terminal_for_test(token).map(|t| t.handle),
+        Some(sw_core::custody::TerminalHandle::Closed)
+    );
+}
