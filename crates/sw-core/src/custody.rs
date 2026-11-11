@@ -473,8 +473,8 @@ pub struct CustodyLedger {
     pub session_inc: HashMap<String, u64>,
     /// 每個 sid 曾分配過的最高世代；rematerialize 後仍保留，避免延遲回收與 sid 重用碰撞。
     session_generation: HashMap<String, u64>,
-    /// 以 ExitReclaim 建立時的 (sid, 世代) 識別 actor，映射到 rematerialize 後的目前 sid。
-    actor_sid_by_origin: HashMap<(String, u64), String>,
+    /// 以 ExitReclaim 建立時的 (sid, 世代) 識別 actor，映射到 rematerialize 後的目前 (sid, 世代)。
+    actor_session_by_origin: HashMap<(String, u64), (String, u64)>,
     next_token: AtomicU64,
 }
 
@@ -493,7 +493,7 @@ impl CustodyLedger {
             unconfirmed,
             session_inc: HashMap::new(),
             session_generation: HashMap::new(),
-            actor_sid_by_origin: HashMap::new(),
+            actor_session_by_origin: HashMap::new(),
             next_token: AtomicU64::new(1),
         }
     }
@@ -504,8 +504,8 @@ impl CustodyLedger {
         *generation += 1;
         let inc = *generation;
         self.session_inc.insert(sid.to_string(), inc);
-        self.actor_sid_by_origin
-            .insert((sid.to_string(), inc), sid.to_string());
+        self.actor_session_by_origin
+            .insert((sid.to_string(), inc), (sid.to_string(), inc));
         inc
     }
 
@@ -513,31 +513,41 @@ impl CustodyLedger {
         self.session_inc.get(sid).copied().unwrap_or(0)
     }
 
-    /// W6 rematerialize：更新原始 actor 身分目前對應的公開 sid，並同步搬移其帳本 owner。
+    /// W6 rematerialize：更新原始 actor 身分目前對應的公開 sid 與世代，並同步搬移其帳本 owner。
     pub fn rematerialize_session(&mut self, old_sid: &str, new_sid: &str, inc: u64) -> bool {
         if old_sid == new_sid || self.current_session_inc(old_sid) != inc {
             return false;
         }
+        let old_current = (old_sid.to_string(), inc);
         let identity = self
-            .actor_sid_by_origin
+            .actor_session_by_origin
             .iter()
-            .find_map(|(identity, current_sid)| {
-                (identity.1 == inc && current_sid == old_sid).then(|| identity.clone())
-            });
+            .find_map(|(identity, current)| (current == &old_current).then(|| identity.clone()));
         let Some(identity) = identity else {
             return false;
         };
+
+        // 新公開 sid 必須使用它自己的新世代。沿用來源 inc 會與目標 sid 的歷史 actor 身分碰撞，
+        // 讓延遲的舊 ActorExited 被誤認成改名 actor 的退出。
+        let Some(new_inc) = self
+            .session_generation
+            .get(new_sid)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+        else {
+            return false;
+        };
         self.session_inc.remove(old_sid);
-        self.session_inc.insert(new_sid.to_string(), inc);
-        self.session_generation
-            .entry(new_sid.to_string())
-            .and_modify(|generation| *generation = (*generation).max(inc))
-            .or_insert(inc);
-        self.actor_sid_by_origin.insert(identity, new_sid.to_string());
+        self.session_inc.insert(new_sid.to_string(), new_inc);
+        self.session_generation.insert(new_sid.to_string(), new_inc);
+        self.actor_session_by_origin
+            .insert(identity, (new_sid.to_string(), new_inc));
         for rec in self.custody.values_mut() {
             if let CustodyOwner::Session { sid, inc: owner_inc } = &mut rec.owner {
                 if sid == old_sid && *owner_inc == inc {
                     *sid = new_sid.to_string();
+                    *owner_inc = new_inc;
                 }
             }
         }
@@ -1005,14 +1015,14 @@ impl CustodyLedger {
 
     /// 處理同世代的 ActorExited，鎖內取出受保管資源並產生具所有權的關閉／排空工作；非同世代的命令不予理會。
     pub fn handle_actor_exited(&mut self, sid: &str, inc: u64) -> Vec<ActorExitedJob> {
-        let Some(current_sid) = self.actor_sid_by_origin.get(&(sid.to_string(), inc)).cloned() else {
+        let Some((current_sid, current_inc)) = self.actor_session_by_origin.get(&(sid.to_string(), inc)).cloned() else {
             return Vec::new();
         };
 
         let mut jobs = Vec::new();
         for (by_id, rec) in self.custody.iter_mut() {
             if let CustodyOwner::Session { sid: s, inc: i } = &rec.owner {
-                if s == &current_sid && *i == inc {
+                if s == &current_sid && *i == current_inc {
                     match &mut rec.phase {
                         CustodyPhase::Held { parts } => {
                             let parts_taken = parts.take();

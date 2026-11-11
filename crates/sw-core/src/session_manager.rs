@@ -7169,6 +7169,14 @@ impl SessionManager {
         token
     }
 
+    /// 只供測試（test-fakes）：模擬 W6 rematerialize 的帳本身分與 owner 重鍵。
+    #[cfg(feature = "test-fakes")]
+    pub fn custody_rematerialize_for_test(&self, old_sid: &str, new_sid: &str) -> bool {
+        let mut inner = lock(&self.shared.inner);
+        let inc = inner.custody.current_session_inc(old_sid);
+        inner.custody.rematerialize_session(old_sid, new_sid, inc)
+    }
+
     /// 只供測試（test-fakes）：查詢 session 已退休的 epoch 集合。
     #[cfg(feature = "test-fakes")]
     pub fn retired_drains_for_test(&self, sid: &str) -> Vec<u64> {

@@ -20541,6 +20541,7 @@
           "cargo:sw-core::custody::wp510r_m16_actor_exit_reclaims_rekeyed_w6_custody",
           "cargo:sw-core::custody::wp510r_m16_shutdown_reports_reaper_close_failed_custody",
           "cargo:sw-core::custody::wp510r_m16_shutdown_waits_for_reaper_closing_custody",
+          "cargo:sw-core::custody::wp510r_r2_delayed_target_actor_exit_does_not_reclaim_rekeyed_actor",
           "cargo:sw-core::deferred_bc02::dead_client_not_replayed",
           "cargo:sw-core::deferred_bc02::empty_append_noop",
           "cargo:sw-core::deferred_bc02::entry_epoch_mismatch_not_replayed",

@@ -3035,6 +3035,96 @@ fn wp510r_m16_actor_exit_reclaims_rekeyed_w6_custody() {
     assert_eq!(jobs[0].token(), token);
 }
 
+/// S2-PAR-wp510r R2：目標 sid 的舊世代退出通知不得回收 W6 改名後的新 actor 資源；原 actor 身分仍可回收。
+#[test]
+fn wp510r_r2_delayed_target_actor_exit_does_not_reclaim_rekeyed_actor() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let m = ManagerRig::templates_only();
+    let h = CoreHarness::new(SHELL_PROFILE);
+    let historical_sid = "detected:COM0";
+    let actor_sid = "fallback:COM0";
+    let mut historical_devices = Vec::new();
+    for generation in 1..=2 {
+        let path = format!("/dev/tty-wp510r-r2-historical-{generation}");
+        let by_id = format!("by-id-wp510r-r2-historical-{generation}");
+        let device = h.add_serial_device(&path);
+        let worker = h.start_worker_at(700 + generation, &path);
+        let token = m
+            .mgr
+            .custody_register_bridged_worker_for_test(
+                historical_sid,
+                &by_id,
+                &path,
+                700 + generation,
+                worker,
+            );
+        m.mgr
+            .reaper_cmd_sender_for_test()
+            .send(ReaperCmd::ActorExited {
+                sid: historical_sid.into(),
+                inc: generation,
+            })
+            .expect("歷史 actor 退出通知送達");
+        wait_until("目標 sid 歷史 actor 已回收", || m.mgr.terminal_for_test(token).is_some());
+        assert_eq!(device.close_count(), 1, "歷史 actor 的 handle 正常關閉");
+        historical_devices.push(device);
+    }
+
+    let actor_path = "/dev/tty-wp510r-r2-rematerialized";
+    let actor_by_id = "by-id-wp510r-r2-rematerialized";
+    let actor_device = h.add_serial_device(actor_path);
+    let actor_worker = h.start_worker_at(703, actor_path);
+    let actor_token = m
+        .mgr
+        .custody_register_bridged_worker_for_test(actor_sid, actor_by_id, actor_path, 703, actor_worker);
+    assert!(m.mgr.custody_rematerialize_for_test(actor_sid, historical_sid));
+    let rematerialized = m.mgr.custody_for_test(actor_by_id).expect("W6 新 actor 紀錄仍在");
+    assert!(matches!(
+        &rematerialized.owner,
+        CustodyOwner::Session { sid, .. } if sid == historical_sid
+    ));
+
+    // 以另一筆退出命令作為回收者 barrier，確保舊通知已處理後再檢查 handle。
+    let barrier_sid = "wp510r-r2-barrier:COM0";
+    let barrier_path = "/dev/tty-wp510r-r2-barrier";
+    let barrier_by_id = "by-id-wp510r-r2-barrier";
+    let barrier_device = h.add_serial_device(barrier_path);
+    let barrier_worker = h.start_worker_at(704, barrier_path);
+    let barrier_token = m
+        .mgr
+        .custody_register_bridged_worker_for_test(barrier_sid, barrier_by_id, barrier_path, 704, barrier_worker);
+    let reaper_tx = m.mgr.reaper_cmd_sender_for_test();
+    reaper_tx
+        .send(ReaperCmd::ActorExited {
+            sid: historical_sid.into(),
+            inc: 1,
+        })
+        .expect("送出延遲的舊世代退出通知");
+    reaper_tx
+        .send(ReaperCmd::ActorExited {
+            sid: barrier_sid.into(),
+            inc: 1,
+        })
+        .expect("送出回收者 barrier");
+    wait_until("回收者處理完舊通知與 barrier", || m.mgr.terminal_for_test(barrier_token).is_some());
+    assert_eq!(barrier_device.close_count(), 1);
+    assert_eq!(actor_device.close_count(), 0, "舊世代通知不得關閉新 actor 的 handle");
+    assert!(actor_device.is_open(), "新 actor 的 handle 仍保持開啟");
+    assert_eq!(m.mgr.terminal_for_test(actor_token), None, "舊世代通知不產生新 actor 終態");
+    assert!(m.mgr.custody_for_test(actor_by_id).is_some(), "新 actor 的紀錄仍由帳本持有");
+
+    reaper_tx
+        .send(ReaperCmd::ActorExited {
+            sid: actor_sid.into(),
+            inc: 1,
+        })
+        .expect("送出改名 actor 自己的退出通知");
+    wait_until("改名 actor 自己的退出已回收 handle", || m.mgr.terminal_for_test(actor_token).is_some());
+    assert_eq!(actor_device.close_count(), 1, "原始 actor 身分仍可正常回收 handle");
+    assert!(m.mgr.custody_for_test(actor_by_id).is_none());
+    assert!(historical_devices.iter().all(|device| device.close_count() == 1));
+}
+
 /// 線上快照（B3 在線）。
 fn dr2_online(m: &ManagerRig) -> Vec<(String, sw_pal::traits::DeviceInfo)> {
     let mut snapshot = m.snapshot();
