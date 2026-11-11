@@ -246,24 +246,46 @@ pub enum SessionRequest {
     /// 等待（有 retired drain）時，以等同自身 `DrainTimeout` 的方式回 DRAIN_STALLED（`mark_drain_timeout`，冪等）。
     /// 正式環境 actor 時鐘即實時，兩者同時到期；測試 rig 的 FakeClock 不自行推進時由此通知收尾。
     /// T14 分類：Request（bypass），Open／Pending／Permanent 皆處理；只回覆既有 release waiter，不啟動新工作。
-    ReleaseDeadlineElapsed,
+    ///
+    /// 編排者 2026-11-11 SPEC-GAP 2 裁決：通知帶被等待對象的身分（release 停止的 `stop_id`）與首次期限 `deadline`
+    /// （actor 受理時以 `WaitAck::Release` 告知 RPC 執行緒）；actor 只結算目前仍在等、身分與期限都相符的那一筆，重複或
+    /// 過期的通知不產生效果。actor 自己的期限計時器保留，兩者誰先到都只結算一次（`mark_drain_timeout` 冪等）。
+    ReleaseDeadlineElapsed {
+        stop_id: StopId,
+        deadline: std::time::Instant,
+    },
+    /// 同 `ReleaseDeadlineElapsed`，作用於 BindWait（`WaitAck::Bind` 的 `id`）：期限到仍在等即回 SESSION_RECOVERING＋
+    /// stalled（`bind_wait_timeout`，已結算者冪等）。T14 分類同上。
+    BindDeadlineElapsed {
+        id: u64,
+    },
+    /// 同 `Release`，另於受理（加入或建立 release 停止）後以 `ack` 回報 `WaitAck::Release`（SPEC-GAP 2 的身分與首次
+    /// 期限），供 RPC 執行緒以實時到期通知。manager 的 `device.release` 一律經此送出。
+    ReleaseWithAck {
+        source: String,
+        reason: PyValue,
+        ack: crossbeam_channel::Sender<crate::mailbox::WaitAck>,
+    },
+    /// 同 `Bind`，另於建立 BindWait 時以 `ack` 回報 `WaitAck::Bind`。manager 的 `session.bind` 一律經此送出。
+    BindWithAck {
+        by_id: String,
+        ack: crossbeam_channel::Sender<crate::mailbox::WaitAck>,
+    },
+    /// S2-PAR-wp510r R3（設計 C7、§3.1.4 W6 協定的同步接受）：manager 把預開 handle（帳本紀錄 `token`）交給既有 session
+    /// 之前先同步詢問。actor 可接受時（by_id 相符、非 RELEASED、無停止、無 bridge、無其他保管在途）記下
+    /// `external_attach{token}` 並發 `Effect::ClaimOffered` 把紀錄轉為本 session 所有，`open_now` 時立即以
+    /// `ClaimCustody` 開埠；否則回 `ok:false`，紀錄不動（由 manager 收尾）。T14 分類：Request（bypass）；Pending／
+    /// Permanent 下拒絕（不啟動新工作）。
+    AcceptCustody {
+        token: u64,
+        by_id: String,
+        real_path: String,
+        open_now: bool,
+    },
     /// OD-63：placeholder release 的開埠逾時；`token` 讓遲到收尾只清除同一個 op 的 stall。
     PlaceholderAttachStalled {
         token: u64,
         epoch: u64,
-    },
-    /// release 取得交接 handle 的關閉中作業（`SessionManager` 的交接表認領）：Python `release_device` 找到作業即於鎖內
-    /// 把非 RELEASED 的 session 設 RECOVERING，首次 release 請求清 `drain_stalled`／`drain_timeout_epoch`
-    /// （`origin/main:sw_core/session_manager.py:3133-3139`）。
-    ///
-    /// `(by_id, handoff_token)` 是 release 撤銷的交接列（`SessionManager` 的撤銷標記）。標記的生命週期綁定被取消的開埠
-    /// 作業，不隨 release RPC 返回而移除（wp510 第九次整包審查 High P8-8463b22-1）：本請求處理時無開埠在途，之後的
-    /// `DeviceAttached` 在 RECOVERING／RELEASED 不再開埠，即以 `Effect::ClearRevokedHandoff` 清除；開埠在途時保留到
-    /// 該開埠的 `BridgeOpened` 終態（開埠 worker 撞到標記即不開埠，對應 Python 取消旗標隨作業保留、`_attach_by_id` 見
-    /// `cancelled` 中止，`:3125`、`:4933-4944`、`:4986-4996`）。
-    ReleaseAttachPending {
-        by_id: String,
-        handoff_token: u64,
     },
     /// 該 token 的 attach 作業已安全關閉 handle（release 請求過的作業收尾），清除先前由 release 逾時設定的 stall 欄位，
     /// 並依 Python `_finish_attach_op` 的 release 收尾（`session_manager.py:4340-4363`）處理第一個 release 請求
@@ -318,10 +340,27 @@ pub enum Effect {
         by_id: String,
         real_path: String,
     },
-    /// 被 release 撤銷的交接列已確定不會再被開埠取用（見 `SessionRequest::ReleaseAttachPending`）：executor 移除
-    /// manager 交接表中同 by_id、同 token 的撤銷標記（`token` 不同者不動）。
-    ClearRevokedHandoff {
-        by_id: String,
+    /// S2-PAR-wp510r R3（設計 §3.1.4 W2／W3）：出生即接管或 `AcceptCustody` 之後的開埠：開埠工作以 `token` 認領本
+    /// session 的帳本紀錄（`Held` → `Taken{OpenJob}`），在 adopt 提交點（manager 鎖內）看到取消就關閉而不接手
+    /// （`OpenFailure::Cancelled`，另送 `CustodyTerminal`）。紀錄已轉 Closing、已有取消或不存在時不開埠
+    /// （`OpenFailure::CloseBlocked`）。新 actor 以啟動效果送出（不依賴訊息，DR-1 a）。T14 分類：新工作的 OpenBridge。
+    ClaimCustody {
+        token: u64,
+        dev: DevicePath,
+        cfg: SerialConfig,
+    },
+    /// S2-PAR-wp510r R3（設計 C5、C6）：停止（release、bind、shutdown、clear、拔除、改指）作用於本 session 的帳本紀錄：
+    /// `Held` 轉 Closing 交關閉工作者，`Taken` 寫入取消標記，executor 以立即回饋 `CustodyClaimed` 回報結果。
+    /// `release_deadline`（實時）為首次 release 的絕對期限，寫入紀錄的 `release_deadline`（之後的 release 沿用）。
+    /// T14 分類：資源收尾，Open／Pending／Permanent 皆執行。
+    ClaimForStop {
+        token: u64,
+        cancel: crate::custody::CustodyCancel,
+        release_deadline: Option<std::time::Instant>,
+    },
+    /// S2-PAR-wp510r R3：`AcceptCustody` 接受後，executor 在 manager 鎖內把 `token` 的紀錄轉為本 session 所有
+    /// （parked 以 C1′ 同 token 認領給本 session 的開埠工作）。T14 分類：資源收尾（只改帳本歸屬，不開埠）。
+    ClaimOffered {
         token: u64,
     },
     BeginDrain {
@@ -491,8 +530,14 @@ pub struct SessionCore {
     pending_open_stop: Option<PendingOpenStop>,
     pending_attach: Option<PendingAttach>,
     open_real_path: Option<String>,
-    /// release 撤銷、等待在途開埠終態才清除的交接列 `(by_id, token)`（見 `SessionRequest::ReleaseAttachPending`）。
-    revoked_handoffs: Vec<(String, u64)>,
+    /// S2-PAR-wp510r R3（設計 §3.1.3）：本 session 擁有、尚未由正式 bridge 接手的帳本紀錄 token（出生即接管或
+    /// `AcceptCustody`）。有值時開埠以 `ClaimCustody{token}` 認領，停止以 `ClaimForStop{token}` 收尾；開埠工作回報
+    /// 終態（`BridgeOpened`）或 `ClaimForStop` 回報紀錄已不在本 session 手上時清除。
+    external_attach: Option<u64>,
+    /// 目前 `external_attach` 已發過 `ClaimForStop`（同一 token 只發一次，C6 冪等）。
+    external_claimed: bool,
+    /// SPEC-GAP 2：目前 release 停止的身分與首次期限（實時，`WaitAck::Release`）。
+    release_wait_rt: Option<(StopId, std::time::Instant)>,
     /// clear 收尾後等 manager 再解析（Python `_spawn_attach` → `_reresolve_profile_on_reattach`）再送
     /// `DeviceAttached`：期間 state 為 ATTACHING、無開埠（審查 F61／F62）。
     reattach_pending: bool,
@@ -739,6 +784,11 @@ struct RetiredDrain {
     stop_id: StopId,
     by_id: String,
     receipt: RetiredReceipt,
+    /// S2-PAR-wp510r R3：保管帳本紀錄的關閉等待（`ClaimForStop` 回報 Closing／Cancelled 後加入，`CustodyTerminal`
+    /// 結算）；為 `Some` 時不以 `WorkerStopped` 配對（`epoch`／`stop_id` 無意義）。
+    custody_token: Option<u64>,
+    /// SPEC-GAP 2：首次 release 的絕對期限（實時），記在被等待的對象上，之後的 release 沿用。
+    release_deadline_rt: Option<std::time::Instant>,
 }
 
 /// 等待 retired drain 終態的 `session.bind`（見 `SessionCore::bind_waits`）。
@@ -746,6 +796,11 @@ struct BindWait {
     id: u64,
     target: String,
     reply: Reply,
+    /// SPEC-GAP 2：bind 請求 +3000 ms（實時），`WaitAck::Bind` 告知 RPC 執行緒。
+    deadline_rt: std::time::Instant,
+    /// 等待期間有 release 加入（Python 作業的 `release_request` 已設）：終態到時不改綁、回 SESSION_RECOVERING＋當下的
+    /// session（`origin/main:sw_core/session_manager.py:3716-3726`；DR-6 b）。
+    release_joined: bool,
 }
 
 /// 退休排空項目的回條狀態（D1 三態：成功回條即移除項目，不留在表內）。
@@ -785,7 +840,9 @@ impl SessionCore {
             pending_open_stop: None,
             pending_attach: None,
             open_real_path: None,
-            revoked_handoffs: Vec::new(),
+            external_attach: None,
+            external_claimed: false,
+            release_wait_rt: None,
             reattach_pending: false,
             reopen_after_retired: false,
             open_generation: 0,
@@ -943,6 +1000,8 @@ impl SessionCore {
             ev,
             MailboxItem::Control(ControlEvent::Request { .. })
                 | MailboxItem::Control(ControlEvent::Shutdown { .. })
+                // S2-PAR-wp510r R3（設計 §3.1.7）：`ClaimForStop` 的立即回饋，三種凍結狀態皆立即處理。
+                | MailboxItem::Control(ControlEvent::CustodyClaimed { .. })
                 | MailboxItem::Control(ControlEvent::FlashSyncProbeStart { .. })
                 | MailboxItem::Control(ControlEvent::FlashProbeReleased { .. })
                 | MailboxItem::Control(ControlEvent::FlashSyncMatched { .. })
@@ -964,6 +1023,8 @@ impl SessionCore {
                     | ControlEvent::DrainDataBarrier { .. }
                     | ControlEvent::WorkerStopped(_)
                     | ControlEvent::WorkerDrainTimeout { .. }
+                    // S2-PAR-wp510r R3（設計 §3.1.7）：帳本紀錄的關閉終態（Pending 延後、Permanent 處理）。
+                    | ControlEvent::CustodyTerminal { .. }
                     | ControlEvent::OpFinished { .. }
                     | ControlEvent::LoginFinished { .. }
                     | ControlEvent::Timer(_)
@@ -1083,15 +1144,15 @@ impl SessionCore {
                 self.console_count = count;
             }
             MailboxItem::Control(ControlEvent::BridgeOpened { epoch_hint, result }) => {
-                // 開埠終態：等待本開埠的撤銷標記至此確定不會再被取用（開埠 worker 已撞到並移除，或路徑不同而未取用）。
-                effects.0.extend(
-                    std::mem::take(&mut self.revoked_handoffs)
-                        .into_iter()
-                        .map(|(by_id, token)| Effect::ClearRevokedHandoff { by_id, token }),
-                );
                 effects
                     .0
                     .extend(self.bridge_opened(epoch_hint, result, now));
+            }
+            MailboxItem::Control(ControlEvent::CustodyClaimed { token, outcome }) => {
+                effects.0.extend(self.custody_claimed(token, outcome, now));
+            }
+            MailboxItem::Control(ControlEvent::CustodyTerminal { token, closed, error }) => {
+                effects.0.extend(self.custody_terminal(token, closed, error, now));
             }
             MailboxItem::Control(ControlEvent::UartIoError { epoch, reason }) => {
                 if self.generations.conn_epoch == Some(epoch) {
@@ -1627,6 +1688,8 @@ impl SessionCore {
             // `:4031-4063`）；release／shutdown 仍依下方 retired_drains 條件等待（DR-8 d、DR-4 b）。
             if self.state == SessionState::Attaching && !single_flight_wait
                 || self.open_real_path.is_some()
+                // 保管在途（出生即接管、`AcceptCustody` 之後尚未開埠）：停止要等帳本紀錄的終態（設計 §3.1.4）。
+                || self.external_attach.is_some()
                 || matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }))
                 // 退休 bridge 的 handle 尚未確認關閉（retired_drains）：release 等其回條（`retired_drain_receipt`），不得以
                 // 無 bridge 直接完成 RELEASED（Python release 等待被取消作業的 `done`，`:3188-3204`）；shutdown 同樣等到
@@ -1661,7 +1724,59 @@ impl SessionCore {
                 if !already_released && (kind != StopKind::Shutdown || self.state != SessionState::Released) {
                     self.set_state(SessionState::Recovering, now);
                 }
+                if kind == StopKind::Release && !already_released {
+                    // G-3（設計 v1 §1.8）：release 找到在途作業即設 RECOVERING，首次 release 請求清 `drain_stalled`／
+                    // `drain_timeout_epoch`（Python `release_device` `origin/main:sw_core/session_manager.py:3132-3138`）。
+                    self.drain_stalled = false;
+                    self.drain_timeout_epoch = None;
+                }
                 self.phase1_detach(&kind, already_released);
+                if let Some(token) = self.external_attach {
+                    if !self.external_claimed {
+                        // 停止作用於本 session 的帳本紀錄（設計 C5）：Held 轉 Closing、Taken 寫入取消；首次 release 的
+                        // 絕對期限記在紀錄上（SPEC-GAP 2）。
+                        self.external_claimed = true;
+                        let release_deadline = if kind == StopKind::Release {
+                            self.ensure_release_wait_rt().map(|(_, deadline)| deadline)
+                        } else {
+                            None
+                        };
+                        effects.push(Effect::ClaimForStop {
+                            token,
+                            cancel: match kind {
+                                StopKind::Release => crate::custody::CustodyCancel::Release,
+                                StopKind::Shutdown => crate::custody::CustodyCancel::Shutdown,
+                                StopKind::Bind => crate::custody::CustodyCancel::Bind,
+                                StopKind::Removed | StopKind::Rebound => crate::custody::CustodyCancel::Device,
+                                _ => crate::custody::CustodyCancel::Release,
+                            },
+                            release_deadline,
+                        });
+                    }
+                }
+                if kind == StopKind::Release {
+                    // 已在等待關閉終態的帳本紀錄（例如 bind 先取消者）：首次 release 的絕對期限同樣記在紀錄上，之後的
+                    // release（含在途表的 close_failed 作業）沿用（SPEC-GAP 2 條件 1；Python `attach_op.release_deadline`
+                    // 只在首次 release 設定，`origin/main:sw_core/session_manager.py:3117-3124`）。
+                    let deadline = self.ensure_release_wait_rt().map(|(_, deadline)| deadline);
+                    let claimed_now = effects.0.iter().find_map(|effect| match effect {
+                        Effect::ClaimForStop { token, .. } => Some(*token),
+                        _ => None,
+                    });
+                    let tokens: Vec<u64> = self
+                        .retired_drains
+                        .iter()
+                        .filter_map(|entry| entry.custody_token)
+                        .filter(|token| Some(*token) != claimed_now)
+                        .collect();
+                    for token in tokens {
+                        effects.push(Effect::ClaimForStop {
+                            token,
+                            cancel: crate::custody::CustodyCancel::Release,
+                            release_deadline: deadline,
+                        });
+                    }
+                }
                 // G8（#243）：bridge 尚未接上時 clear（`session_manager.py:3059`）與拔除／重綁（`:4470`，
                 // `_begin_drain_locked` 無 bridge 回 None）都在請求當下以 `_detach_session_locked`（`:2704`）同步
                 // 歸零證據等待；release 改在開埠收斂時歸零（`_finish_attach_op` `:4344`），見 `drain_opened_bridge`。
@@ -2216,7 +2331,45 @@ impl SessionCore {
                 vec![Effect::Reply(reply, Ok(result))]
             }
             SessionRequest::Submit(req) => self.submit(req, reply, now),
-            SessionRequest::Release { source, reason } => {
+            SessionRequest::Release { source, reason } => self.release_request(source, reason, reply, now),
+            SessionRequest::ReleaseWithAck { source, reason, ack } => {
+                let effects = self.release_request(source, reason, reply, now);
+                self.send_release_ack(&ack);
+                effects
+            }
+            SessionRequest::BindWithAck { .. } if self.drain_in_progress() => {
+                vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))]
+            }
+            SessionRequest::BindWithAck { by_id, ack } => {
+                let before = self.next_bind_wait_id;
+                let effects = self.bind_request(by_id, reply, now);
+                if self.next_bind_wait_id != before {
+                    if let Some(wait) = self.bind_waits.iter().find(|w| w.id == self.next_bind_wait_id) {
+                        let _ = ack.try_send(crate::mailbox::WaitAck::Bind {
+                            id: wait.id,
+                            deadline: wait.deadline_rt,
+                        });
+                    }
+                }
+                effects
+            }
+            SessionRequest::AcceptCustody {
+                token,
+                by_id,
+                real_path,
+                open_now,
+            } => self.accept_custody(token, by_id, real_path, open_now, reply, now),
+            other => self.handle_request_rest(other, reply, now),
+        }
+    }
+
+    /// `SessionRequest::Release` 的本體（`ReleaseWithAck` 共用）。
+    fn release_request(&mut self, source: String, reason: PyValue, reply: Reply, now: Mono) -> Vec<Effect> {
+        for wait in &mut self.bind_waits {
+            wait.release_joined = true;
+        }
+        {
+            {
                 if self.state == SessionState::Released {
                     if self
                         .pending_open_stop
@@ -2285,6 +2438,11 @@ impl SessionCore {
                 self.console_count = 0;
                 self.begin_stop(StopKind::Release, Some(reply), now).0
             }
+        }
+    }
+
+    fn handle_request_rest(&mut self, req: SessionRequest, reply: Reply, now: Mono) -> Vec<Effect> {
+        match req {
             SessionRequest::InteractiveOpen {
                 owner,
                 timeout_s,
@@ -2389,29 +2547,6 @@ impl SessionCore {
                 response.insert("error_code", PyValue::from("SESSION_RECOVERING"));
                 vec![Effect::Reply(reply, Ok(response))]
             }
-            SessionRequest::ReleaseAttachPending {
-                by_id,
-                handoff_token,
-            } => {
-                if self.state != SessionState::Released {
-                    self.set_state(SessionState::Recovering, now);
-                    self.drain_stalled = false;
-                    self.drain_timeout_epoch = None;
-                }
-                let mut effects = Vec::new();
-                if self.open_real_path.is_some() {
-                    // 開埠在途：可能正要取用該交接列，保留撤銷標記到其 `BridgeOpened` 終態。
-                    self.revoked_handoffs.push((by_id, handoff_token));
-                } else {
-                    // 無開埠在途，且 RECOVERING／RELEASED 的 `DeviceAttached` 不再開埠：標記不會再被取用。
-                    effects.push(Effect::ClearRevokedHandoff {
-                        by_id,
-                        token: handoff_token,
-                    });
-                }
-                effects.push(Effect::Reply(reply, Ok(self.ok_session(now))));
-                effects
-            }
             SessionRequest::PlaceholderAttachSettled {
                 token,
                 release_source,
@@ -2466,15 +2601,34 @@ impl SessionCore {
                     "physical_len" => PyValue::from(self.queue.physical_len() as i64),
                 }),
             )],
-            SessionRequest::ReleaseDeadlineElapsed => {
-                let mut effects = self.release_deadline_elapsed(now);
+            SessionRequest::ReleaseDeadlineElapsed { stop_id, deadline } => {
+                let mut effects = self.release_deadline_elapsed(stop_id, deadline, now);
+                effects.push(Effect::Reply(reply, Ok(pydict! { "ok" => true })));
+                effects
+            }
+            SessionRequest::BindDeadlineElapsed { id } => {
+                let mut effects = self.bind_wait_timeout(id, now);
                 effects.push(Effect::Reply(reply, Ok(pydict! { "ok" => true })));
                 effects
             }
             #[cfg(feature = "test-fakes")]
             SessionRequest::RetiredDrainsForTest => {
-                let epochs: Vec<PyValue> = self.retired_drains.iter().map(|r| PyValue::Int(PyInt::Small(r.epoch as i128))).collect();
-                vec![Effect::Reply(reply, Ok(pydict! { "epochs" => PyValue::List(epochs) }))]
+                let epochs: Vec<PyValue> = self
+                    .retired_drains
+                    .iter()
+                    .filter(|r| r.custody_token.is_none())
+                    .map(|r| PyValue::Int(PyInt::Small(r.epoch as i128)))
+                    .collect();
+                let custody: Vec<PyValue> = self
+                    .retired_drains
+                    .iter()
+                    .filter_map(|r| r.custody_token)
+                    .map(|token| PyValue::Int(PyInt::Small(token as i128)))
+                    .collect();
+                vec![Effect::Reply(
+                    reply,
+                    Ok(pydict! { "epochs" => PyValue::List(epochs), "custody" => PyValue::List(custody) }),
+                )]
             }
             #[cfg(feature = "test-fakes")]
             SessionRequest::ForceStateForTest(state) => {
@@ -2524,6 +2678,11 @@ impl SessionCore {
             } => vec![Effect::Reply(
                 reply,
                 self.result_tail(&cmd_id, from_chunk, limit, now),
+            )],
+            // 其餘請求已於 `handle_request` 分派（GetState、Activity、Submit、Release 系列、AcceptCustody 等）。
+            _ => vec![Effect::Reply(
+                reply,
+                Err(PyErr::value_error("internal error: 未分派的請求")),
             )],
         }
     }
@@ -2720,6 +2879,7 @@ impl SessionCore {
             // retired drain 未收斂且沒有自身 bridge（DR-4 c；Python 作業仍在 `_active_attach_ops`，`:3428-3432`）。有自身
             // bridge 時先走下方有 bridge 的冪等判斷（Python `:3420` 先於在途表分流 `:3427-3443`；審查 P8-566d90b-2）。
             || (self.generations.conn_epoch.is_none() && !self.retired_drains.is_empty())
+            || self.external_attach.is_some()
             || (self.state == SessionState::Attaching && self.generations.conn_epoch.is_none())
             || matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }));
         if attach_inflight {
@@ -2836,6 +2996,22 @@ impl SessionCore {
                 }),
             )];
         }
+        if let Some(token) = self.external_attach {
+            // 保管在途（出生即接管、`AcceptCustody`；設計 §3.1.4 bind「一律等到終態」）：取消本 session 的帳本紀錄並等到
+            // 終態，上限 3000 ms（Python `bind_session` 取消作業後等 `done`，確認關閉才遞迴 bind，
+            // `origin/main:sw_core/session_manager.py:3676-3694`、`:3727`；逾時設 RECOVERING＋stalled，`:3697-3711`）。
+            let mut effects = Vec::new();
+            if !self.external_claimed {
+                self.external_claimed = true;
+                effects.push(Effect::ClaimForStop {
+                    token,
+                    cancel: crate::custody::CustodyCancel::Bind,
+                    release_deadline: None,
+                });
+            }
+            effects.extend(self.push_bind_wait(by_id, reply, now));
+            return effects;
+        }
         if self.open_real_path.is_some()
             || self.pending_attach.is_some()
             || matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }))
@@ -2865,9 +3041,23 @@ impl SessionCore {
         {
             return vec![Effect::Reply(reply, Ok(self.bind_stalled_reply(now)))];
         }
+        self.push_bind_wait(target, reply, now)
+    }
+
+    /// 掛起一筆 BindWait 並排 `BindWaitTimeout`（actor 期限計時器；RPC 執行緒另依 `WaitAck::Bind` 以實時通知，
+    /// SPEC-GAP 2）。
+    fn push_bind_wait(&mut self, target: String, reply: Reply, now: Mono) -> Vec<Effect> {
         self.next_bind_wait_id = self.next_bind_wait_id.saturating_add(1);
         let id = self.next_bind_wait_id;
-        self.bind_waits.push(BindWait { id, target, reply });
+        let deadline_rt = std::time::Instant::now()
+            + std::time::Duration::from_millis(crate::resources::DRAIN_TIMEOUT_MS);
+        self.bind_waits.push(BindWait {
+            id,
+            target,
+            reply,
+            deadline_rt,
+            release_joined: false,
+        });
         vec![Effect::Schedule {
             at: now.saturating_add(crate::resources::DRAIN_TIMEOUT_MS.saturating_mul(1_000_000)),
             ev: TimerEvent::BindWaitTimeout { id },
@@ -2904,10 +3094,14 @@ impl SessionCore {
     /// retired drain 全部成功收斂：bind waiter 重新走 bind（Python 遞迴 `:3727`）；期間有停止進行中（release 等）時回
     /// SESSION_RECOVERING＋當下的 drain 欄位（Python `release_request` 已設時，`:3716-3726`）。
     fn resume_bind_waits(&mut self, now: Mono) -> Vec<Effect> {
+        // 收斂規則（設計 §3.1.3）：retired drain 與保管紀錄都已終態才重新走 bind。
+        if !self.retired_drains.is_empty() || self.external_attach.is_some() {
+            return Vec::new();
+        }
         let waits = std::mem::take(&mut self.bind_waits);
         let mut effects = Vec::new();
         for wait in waits {
-            if self.pending_open_stop.is_some() || self.stop.is_some() {
+            if wait.release_joined || self.pending_open_stop.is_some() || self.stop.is_some() {
                 effects.push(Effect::Reply(wait.reply, Ok(self.session_recovering_reply(now))));
             } else {
                 effects.extend(self.bind_request(wait.target, wait.reply, now));
@@ -2974,6 +3168,13 @@ impl SessionCore {
         }
         self.reattach_pending = false;
         self.set_last_error(None, None);
+        if let Some(token) = self.external_attach {
+            // 本 session 擁有的帳本紀錄（`AcceptCustody`）：以 `ClaimCustody` 認領原 handle，不另開新 handle（C1′）。
+            if self.open_real_path.is_some() {
+                return Vec::new();
+            }
+            return vec![self.custody_open_effect(token, real_path, now)];
+        }
         if self.generations.conn_epoch.is_none() && !self.retired_drains.is_empty() {
             // 單次在途（設計 DR-8；規格 §5.2.4）：退休 bridge 的 handle 尚未確認關閉，同一 session 不另開第二個 handle；
             // 回條（handle_closed:true）到了才以目前路徑開（`retired_drain_receipt`）。Python 的 `_spawn_attach` 遇同
@@ -2994,6 +3195,32 @@ impl SessionCore {
     }
 
     fn bridge_opened(
+        &mut self,
+        epoch_hint: u64,
+        result: Result<OpenedBridge, OpenFailure>,
+        now: Mono,
+    ) -> Vec<Effect> {
+        // 保管紀錄的開埠工作（`ClaimCustody`）回報終態：之後本 session 不再持有該紀錄（已接手、已關閉或已由取消者收尾）。
+        let custody_open = self.open_real_path.is_some() && self.external_attach.is_some();
+        if custody_open {
+            self.external_attach = None;
+            self.external_claimed = false;
+        }
+        let custody_cancelled = custody_open
+            && matches!(&result, Err(OpenFailure::Cancelled | OpenFailure::CloseBlocked));
+        if custody_cancelled && self.pending_open_stop.is_none() && !self.bind_waits.is_empty() {
+            // bind 取消了保管開埠（BindWait 在等）：開埠已到終態，等帳本紀錄的關閉終態後重新走 bind（`settle_retired`）。
+            self.open_real_path = None;
+            return self.try_converge(now);
+        }
+        let mut effects = self.bridge_opened_inner(epoch_hint, result, now);
+        if custody_open {
+            effects.extend(self.try_converge(now));
+        }
+        effects
+    }
+
+    fn bridge_opened_inner(
         &mut self,
         _epoch_hint: u64,
         result: Result<OpenedBridge, OpenFailure>,
@@ -3302,18 +3529,30 @@ impl SessionCore {
     /// - 全部成功收斂後，bind waiter 重新走 bind（`resume_bind_waits`）。
     /// - 不配對的回條不動。
     fn retired_drain_receipt(&mut self, receipt: &WorkerStoppedReceipt, now: Mono) -> Vec<Effect> {
-        let Some(index) = self
-            .retired_drains
-            .iter()
-            .position(|entry| entry.epoch == receipt.epoch && entry.stop_id == receipt.stop_id)
-        else {
+        let Some(index) = self.retired_drains.iter().position(|entry| {
+            entry.custody_token.is_none()
+                && entry.epoch == receipt.epoch
+                && entry.stop_id == receipt.stop_id
+        }) else {
             return Vec::new();
         };
+        let warn = receipt.close_error.as_ref().map(|error| {
+            format!(
+                "WARNING session {} 退休 bridge 的 UART handle 關閉失敗：{error:?}",
+                self.profile.com
+            )
+        });
+        self.settle_retired(index, receipt.handle_closed, warn, now)
+    }
+
+    /// retired drain 項目（退休 bridge 或保管紀錄）的終態結算，見 `retired_drain_receipt`。`warn` 為關閉失敗時要發的
+    /// 告警（保管紀錄的關閉者已自行告警者傳 `None`）。
+    fn settle_retired(&mut self, index: usize, closed: bool, warn: Option<String>, now: Mono) -> Vec<Effect> {
         let mut effects = Vec::new();
-        if !receipt.handle_closed {
+        if !closed {
             let entry = &mut self.retired_drains[index];
             if entry.receipt == RetiredReceipt::Failed {
-                // 同一 epoch 重複的回條只結算一次（C6）。
+                // 同一 epoch／token 重複的回條只結算一次（C6）。
                 return effects;
             }
             entry.receipt = RetiredReceipt::Failed;
@@ -3321,11 +3560,8 @@ impl SessionCore {
             // 單次在途：舊 handle 關閉未確認時不重開（Python by_id 留在 `_draining_by_ids`，attach worker finally 不再
             // 重試，`origin/main:sw_core/session_manager.py:4126-4145`），session 停在 ATTACHING。
             self.reopen_after_retired = false;
-            if let Some(error) = receipt.close_error.as_ref() {
-                effects.push(Effect::Warn(format!(
-                    "WARNING session {} 退休 bridge 的 UART handle 關閉失敗：{error:?}",
-                    self.profile.com
-                )));
+            if let Some(warn) = warn {
+                effects.push(Effect::Warn(warn));
             }
             effects.extend(self.fail_bind_waits(now));
             // T-1（設計 §3.1.6 第二處）：release 只標記關閉失敗並保留，不提前回覆、不改 drain 欄位；首次期限由
@@ -3336,6 +3572,14 @@ impl SessionCore {
         }
         self.retired_drains.remove(index);
         self.publish_retired_drains();
+        effects.extend(self.try_converge(now));
+        effects
+    }
+
+    /// 收斂規則（設計 §3.1.3）：retired drain（含保管紀錄）、開埠在途、落盤中的 attach 都已收斂時，完成停止待決或重新走
+    /// bind；單次在途的重開也在此（DR-8 b）。
+    fn try_converge(&mut self, now: Mono) -> Vec<Effect> {
+        let mut effects = Vec::new();
         if !self.retired_drains.is_empty() {
             return effects;
         }
@@ -3343,6 +3587,7 @@ impl SessionCore {
         if let Some(pending) = self.pending_open_stop.as_ref() {
             let settled = !pending.close_failed
                 && self.open_real_path.is_none()
+                && self.external_attach.is_none()
                 && !matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }))
                 && !self.close_unconfirmed();
             if settled {
@@ -3364,6 +3609,185 @@ impl SessionCore {
             effects.extend(self.reopen_known_device(SessionState::Attaching, now));
         }
         effects
+    }
+
+    /// `ControlEvent::CustodyClaimed`（`ClaimForStop` 的立即回饋）：Closing／Cancelled 時登記等待該 token 的
+    /// `CustodyTerminal`（與退休 bridge 同表，收斂規則與 T-1 共用），Failed 時直接登記失敗項目（D1 iii）。紀錄已不在
+    /// 本 session 手上且沒有開埠在途時，清除 `external_attach`（不再有開埠會認領它）。
+    fn custody_claimed(
+        &mut self,
+        token: u64,
+        outcome: crate::mailbox::CustodyClaimOutcome,
+        now: Mono,
+    ) -> Vec<Effect> {
+        use crate::mailbox::CustodyClaimOutcome;
+        if self.external_attach != Some(token) {
+            return Vec::new();
+        }
+        let receipt = match outcome {
+            CustodyClaimOutcome::Closing | CustodyClaimOutcome::Cancelled => Some(RetiredReceipt::Pending),
+            CustodyClaimOutcome::Failed => Some(RetiredReceipt::Failed),
+            CustodyClaimOutcome::Gone => None,
+        };
+        if let Some(receipt) = receipt {
+            if !self
+                .retired_drains
+                .iter()
+                .any(|entry| entry.custody_token == Some(token))
+            {
+                let release_deadline_rt = self.release_wait_rt.map(|(_, deadline)| deadline);
+                self.retired_drains.push(RetiredDrain {
+                    epoch: 0,
+                    stop_id: StopId(0),
+                    by_id: self.profile.device_by_id.clone(),
+                    receipt,
+                    custody_token: Some(token),
+                    release_deadline_rt,
+                });
+                if receipt == RetiredReceipt::Failed {
+                    self.deps.unconfirmed_closes.insert(&self.profile.device_by_id);
+                }
+                self.publish_retired_drains();
+            }
+        }
+        if self.open_real_path.is_none() {
+            self.external_attach = None;
+            self.external_claimed = false;
+        }
+        let mut effects = Vec::new();
+        if receipt == Some(RetiredReceipt::Failed) {
+            effects.extend(self.fail_bind_waits(now));
+            effects.extend(self.pending_open_close_unconfirmed(now));
+            return effects;
+        }
+        effects.extend(self.try_converge(now));
+        effects
+    }
+
+    /// `ControlEvent::CustodyTerminal`：保管紀錄的關閉終態（關閉者已告警並登記未確認關閉）。只結算目前在等的那一筆。
+    fn custody_terminal(&mut self, token: u64, closed: bool, _error: Option<String>, now: Mono) -> Vec<Effect> {
+        let Some(index) = self
+            .retired_drains
+            .iter()
+            .position(|entry| entry.custody_token == Some(token))
+        else {
+            return Vec::new();
+        };
+        self.settle_retired(index, closed, None, now)
+    }
+
+    /// S2-PAR-wp510r R3（設計 §3.1.4 W2、C7）：出生即接管。manager 在建立 session 的同一臨界區把 PROBE 用過的 handle
+    /// 存為本 session 擁有的帳本紀錄（`Held{Session}`），actor 出生即 ATTACHING 並以啟動效果 `ClaimCustody` 開埠，
+    /// 不依賴 `DeviceAttached` 訊息（DR-1 a；Python `_attach_by_id_dynamic` 以同一 handle 建 bridge，作業留在
+    /// `_active_attach_ops`，`origin/main:sw_core/session_manager.py:5644-5647`、`:4374-4384`）。
+    pub fn init_external_attach(&mut self, token: u64, real_path: &str) {
+        self.device_present = true;
+        self.known_real_path = Some(real_path.to_string());
+        self.external_attach = Some(token);
+        self.external_claimed = false;
+        self.set_last_error(None, None);
+        let effect = self.custody_open_effect(token, real_path, 0);
+        self.push_startup_effect(effect);
+    }
+
+    /// 以帳本紀錄 `token` 開埠（與 `device_attached` 的 OpenBridge 相同的開埠在途設定）。
+    fn custody_open_effect(&mut self, token: u64, real_path: &str, now: Mono) -> Effect {
+        self.reattach_pending = false;
+        self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
+        self.open_generation = self.generations.fsm_gen;
+        self.open_real_path = Some(real_path.to_string());
+        self.set_state(SessionState::Attaching, now);
+        Effect::ClaimCustody {
+            token,
+            dev: DevicePath(real_path.to_string()),
+            cfg: self.serial_config(),
+        }
+    }
+
+    /// `SessionRequest::AcceptCustody`（設計 C7：owner＝本 session 的紀錄只在 actor 已知 token 時存在）。
+    fn accept_custody(
+        &mut self,
+        token: u64,
+        by_id: String,
+        real_path: String,
+        open_now: bool,
+        reply: Reply,
+        now: Mono,
+    ) -> Vec<Effect> {
+        let acceptable = by_id == self.profile.device_by_id
+            && matches!(self.handoff_freeze_state(), crate::admission::HandoffFreezeState::Open)
+            && self.state != SessionState::Released
+            && !self.shutdown_requested
+            && self.stop.is_none()
+            && self.pending_open_stop.is_none()
+            && self.generations.conn_epoch.is_none()
+            && self.open_real_path.is_none()
+            && self.pending_attach.is_none()
+            && self.external_attach.is_none()
+            && self.retired_drains.is_empty()
+            && !matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }))
+            && !self.close_unconfirmed();
+        if !acceptable {
+            let mut result = self.ok_session(now);
+            result.insert("ok", PyValue::Bool(false));
+            return vec![Effect::Reply(reply, Ok(result))];
+        }
+        self.external_attach = Some(token);
+        self.external_claimed = false;
+        self.device_present = true;
+        self.known_real_path = Some(real_path.clone());
+        let mut effects = vec![Effect::ClaimOffered { token }];
+        let awaiting = self.reattach_pending && self.state == SessionState::Attaching;
+        if open_now && (self.state == SessionState::Detached || awaiting) {
+            self.set_last_error(None, None);
+            effects.push(self.custody_open_effect(token, &real_path, now));
+        }
+        effects.push(Effect::Reply(reply, Ok(self.ok_session(now))));
+        effects
+    }
+
+    /// 目前 release 停止的身分與首次期限（SPEC-GAP 2）：首次期限只在首次 release 決定一次並記在被等待的對象上
+    /// （retired drain／保管紀錄的 `release_deadline_rt`），之後的 release 沿用。
+    fn ensure_release_wait_rt(&mut self) -> Option<(StopId, std::time::Instant)> {
+        let id = match (&self.stop, &self.pending_open_stop) {
+            (Some(stop), _) if stop.kind == StopKind::Release => stop.id,
+            (None, Some(pending)) if pending.kind == StopKind::Release => pending.id,
+            _ => return None,
+        };
+        if let Some((current, deadline)) = self.release_wait_rt {
+            if current == id {
+                return Some((id, deadline));
+            }
+        }
+        let deadline = self
+            .retired_drains
+            .iter()
+            .filter_map(|entry| entry.release_deadline_rt)
+            .min()
+            .unwrap_or_else(|| {
+                std::time::Instant::now()
+                    + std::time::Duration::from_millis(crate::resources::DRAIN_TIMEOUT_MS)
+            });
+        for entry in &mut self.retired_drains {
+            entry.release_deadline_rt.get_or_insert(deadline);
+        }
+        self.release_wait_rt = Some((id, deadline));
+        Some((id, deadline))
+    }
+
+    /// `ReleaseWithAck` 受理後回報 `WaitAck::Release`（只在 release 仍在等待時；已回覆者 RPC 直接取得回覆）。
+    fn send_release_ack(&mut self, ack: &crossbeam_channel::Sender<crate::mailbox::WaitAck>) {
+        let waiting = match (&self.stop, &self.pending_open_stop) {
+            (Some(stop), _) => stop.kind == StopKind::Release && !stop.stalled,
+            (None, Some(pending)) => pending.kind == StopKind::Release && !pending.stalled,
+            _ => false,
+        };
+        if !waiting {
+            return;
+        }
+        if let Some((stop_id, deadline)) = self.ensure_release_wait_rt() {
+            let _ = ack.try_send(crate::mailbox::WaitAck::Release { stop_id, deadline });
+        }
     }
 
     /// 把 retired drain 是否未收斂發布到 fence（manager 的 shutdown 不經 actor mailbox 讀取，見
@@ -3392,6 +3816,8 @@ impl SessionCore {
             stop_id,
             by_id: self.profile.device_by_id.clone(),
             receipt: RetiredReceipt::Pending,
+            custody_token: None,
+            release_deadline_rt: None,
         });
         self.publish_retired_drains();
         let mut fx = vec![
@@ -3441,7 +3867,10 @@ impl SessionCore {
                 response.insert("device_by_id", PyValue::from(pending.by_id));
                 vec![Effect::Reply(pending.reply, Ok(response))]
             }
-            OpenFailure::Other(_) | OpenFailure::CloseUnconfirmed(_) | OpenFailure::CloseBlocked => {
+            OpenFailure::Other(_)
+            | OpenFailure::CloseUnconfirmed(_)
+            | OpenFailure::CloseBlocked
+            | OpenFailure::Cancelled => {
                 self.open_real_path = None;
                 self.attached_real_path = None;
                 self.set_last_error(Some(failure_error), None);
@@ -4524,7 +4953,16 @@ impl SessionCore {
     /// `SessionRequest::ReleaseDeadlineElapsed`：release 的首次期限（實時）已到。只作用在 T-1 等待（有 retired drain，
     /// 設計 §3.1.6）：對 release 的停止套用與自身期限計時器相同的 `mark_drain_timeout`（已逾時者冪等）。沒有 retired
     /// drain 的 release（自身 bridge 排空、開埠在途）沿用自身的 `DrainTimeout`，不受此通知影響。
-    fn release_deadline_elapsed(&mut self, now: Mono) -> Vec<Effect> {
+    fn release_deadline_elapsed(
+        &mut self,
+        stop_id: StopId,
+        deadline: std::time::Instant,
+        now: Mono,
+    ) -> Vec<Effect> {
+        // SPEC-GAP 2：只結算身分與首次期限都相符、仍在等待的那一筆；重複或過期的通知不產生效果。
+        if self.release_wait_rt != Some((stop_id, deadline)) {
+            return Vec::new();
+        }
         if self.retired_drains.is_empty() {
             return Vec::new();
         }
@@ -7233,7 +7671,7 @@ fn open_failure_last_error(failure: &OpenFailure) -> String {
         OpenFailure::NotFound => "FileNotFoundError",
         OpenFailure::Other(error) => error.py_exc_name(),
         OpenFailure::CloseUnconfirmed(cause) => return open_failure_last_error(cause),
-        OpenFailure::CloseBlocked => "OSError",
+        OpenFailure::CloseBlocked | OpenFailure::Cancelled => "OSError",
     };
     format!("ATTACH_FAILED:{class}")
 }

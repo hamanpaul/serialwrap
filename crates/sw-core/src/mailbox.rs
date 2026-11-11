@@ -137,9 +137,40 @@ pub enum ControlEvent {
     FlashSyncMatched { probe_id: ProbeId, reply: FlashReply<Result<(), FlashReject>> },
     /// P8 Task 8：flasher 離開（holder 歸零）→ exit flashing；舊 probe 的遲到事件只回覆、不改狀態。
     FlashHolderGone { probe_id: ProbeId, reply: FlashReply<()> },
+    /// S2-PAR-wp510r R3（設計 §3.1.2 C4、§3.1.4 W3）：`Effect::ClaimForStop` 的立即回饋（executor 於 actor 執行緒在
+    /// manager 鎖內處理該 token 的帳本紀錄後推入立即回饋佇列，先於下一個 mailbox 事件處理）。`outcome` 為處理結果：
+    /// actor 依此決定是否等待該 token 的 `CustodyTerminal`。T14 分類：立即回饋，Open／Pending／Permanent 皆立即處理。
+    CustodyClaimed { token: u64, outcome: CustodyClaimOutcome },
+    /// S2-PAR-wp510r R3：session 擁有的帳本紀錄已有關閉終態（關閉工作者或開埠工作在提交點關閉）。`closed:false` 時
+    /// 紀錄已轉 CloseFailed 並登記未確認關閉（D1 iii）。T14 分類：生命週期（Open 處理、Pending 延後、Permanent 處理）。
+    CustodyTerminal { token: u64, closed: bool, error: Option<String> },
     /// S2-PAR-wp510r: 測試注入 actor panic
     #[cfg(feature = "test-fakes")]
     ArmPanic { count: u8 },
+}
+
+/// `ControlEvent::CustodyClaimed` 的處理結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustodyClaimOutcome {
+    /// 紀錄已轉 Closing（本次轉入或他人關閉中）：之後會有該 token 的 `CustodyTerminal`。
+    Closing,
+    /// 開埠工作持有中（`Taken`）：已寫入取消標記，開埠工作在提交點關閉並回報 `CustodyTerminal`。
+    Cancelled,
+    /// 紀錄已是 CloseFailed（D1 iii）。
+    Failed,
+    /// 紀錄已提交 adopt（`Bridged`）或已不存在：不會再有 `CustodyTerminal`，由 actor 自身的排空承擔。
+    Gone,
+}
+
+/// S2-PAR-wp510r R3（編排者 2026-11-11 SPEC-GAP 2 裁決）：actor 受理 release／bind 等待後回給 RPC 執行緒的期限確認。
+/// RPC 執行緒以 `deadline`（實時）為通知時點，到期仍未獲回覆即送帶同一身分的通知。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitAck {
+    /// release 等待：`stop_id` 為該停止，`deadline` 為首次 release 決定的絕對期限（記在被等待的對象上，之後的 release
+    /// 沿用）。
+    Release { stop_id: StopId, deadline: std::time::Instant },
+    /// bind 等待：`id` 為該 BindWait，`deadline` 為 bind 請求 +3000 ms。
+    Bind { id: u64, deadline: std::time::Instant },
 }
 
 /// 到期 timer（`Effect::Schedule` 的內容）。
@@ -191,8 +222,12 @@ pub enum OpenFailure {
     CloseUnconfirmed(Box<OpenFailure>),
     /// 開埠 gate 拒絕、未呼叫 `open_exclusive`：by_id 的關閉未確認（`session_core::UnconfirmedCloses`；Python
     /// `by_id in self._draining_by_ids` 時不開埠，`origin/main:sw_core/session_manager.py:3410-3417`、`:4847-4848`），
-    /// 或交給本 session 的預開 handle 已被 release 撤銷（Python 作業 `cancelled`，`_attach_by_id` 中止，`:4933-4944`）。
+    /// 或交給本 session 的預開 handle 已被取消者轉為 Closing（Python 作業 `cancelled`，`_attach_by_id` 中止，`:4933-4944`）。
     CloseBlocked,
+    /// S2-PAR-wp510r R3（設計 §3.1.4 W3 → W3′ 的 adopt 提交點）：開埠工作在提交點看到取消（release、bind、shutdown、
+    /// 改指），關閉 handle 而不接手（handle 的關閉終態另以 `CustodyTerminal` 回報）；Python attach 見 `cancelled` 中止並經
+    /// `_finish_attach_op` 關閉（`origin/main:sw_core/session_manager.py:5701-5712`、`:4320-4363`）。
+    Cancelled,
 }
 
 /// `Mailbox::recv_next` 的輸出項目。

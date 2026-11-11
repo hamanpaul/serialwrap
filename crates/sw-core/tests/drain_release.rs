@@ -2800,30 +2800,57 @@ fn wp510_review7_open_gate_close_blocked_maps_per_entry() {
     }
 }
 
-/// wp510 第 15 項（第九次整包審查 High P8-8463b22-1）：交接 handle 由 release 認領、`ReleaseAttachPending` 已把 session
-/// 設為 RECOVERING（`origin/main:sw_core/session_manager.py:3133-3139`），release 於期限回 DRAIN_STALLED
-/// （`:3192-3204`）之後，在途開埠（actor 已發 `OpenBridge`）的結果才回報。`h` 停在遲到收尾前的狀態並回傳收尾所用的 token。
-fn wp510_review11_release_stalled_with_open_in_flight(h: &mut CoreHarness) -> u64 {
-    let effects = h.feed(ControlEvent::DeviceAttached {
-        by_id: DEVICE_BY_ID.into(),
-        real_path: REAL_PATH.into(),
-    });
+/// 出生即接管的帳本 token（CoreHarness 不經 manager；`CustodyClaimed`／`CustodyTerminal` 由測試代 executor 送入）。
+const WP510R_CUSTODY_TOKEN: u64 = 77;
+
+/// 出生即接管（設計 §3.1.4 W2）：actor 帶 `external_attach{token}` 出生、ATTACHING，啟動效果為 `ClaimCustody`。
+fn wp510r_birth_takeover(h: &mut CoreHarness) {
+    h.core.init_external_attach(WP510R_CUSTODY_TOKEN, REAL_PATH);
+    let startup = h.core.take_startup_effects();
     assert!(
-        effects.iter().any(|effect| matches!(effect, Effect::OpenBridge { .. })),
-        "前置：actor 已發出 OpenBridge"
+        startup.iter().any(|effect| matches!(
+            effect,
+            Effect::ClaimCustody { token, dev, .. } if *token == WP510R_CUSTODY_TOKEN && dev.0 == REAL_PATH
+        )),
+        "前置：actor 以啟動效果 ClaimCustody 開埠"
     );
-    h.rpc(SessionRequest::ReleaseAttachPending {
-        by_id: DEVICE_BY_ID.into(),
-        handoff_token: 77,
-    })
-    .unwrap();
+    assert_eq!(h.public()["state"], PyValue::from("ATTACHING"));
+}
+
+/// `effects` 中針對 `token` 的 `ClaimForStop` 筆數。
+fn wp510r_claims(effects: &[Effect], token: u64) -> usize {
+    effects
+        .iter()
+        .filter(|effect| matches!(effect, Effect::ClaimForStop { token: t, .. } if *t == token))
+        .count()
+}
+
+/// wp510 第 15 項（第九次整包審查 High P8-8463b22-1）：release 等待在途開埠（Python 作業在 `_active_attach_ops`）時設
+/// RECOVERING（`origin/main:sw_core/session_manager.py:3133-3139`），release 於期限回 DRAIN_STALLED（`:3192-3204`）之後，
+/// 在途開埠的結果才回報。`h` 停在遲到收尾前的狀態並回傳收尾所用的 token。
+///
+/// 設計第 2 版 §6 #1、#2（H*；擁有者 2026-11-10 D5 核准）：`ReleaseAttachPending`＋`PlaceholderAttachStalled／Settled`
+/// 換成真實的 `Release{reason:"late-close"}`＋推進 3 s＋`CustodyTerminal`。出生即接管的 session 收到 release：
+/// `ClaimForStop` 作用於帳本紀錄（`outcome` 由測試代 executor 回饋），首次期限到回 DRAIN_STALLED。
+fn wp510_review11_release_stalled_with_open_in_flight(
+    h: &mut CoreHarness,
+    outcome: sw_core::mailbox::CustodyClaimOutcome,
+) -> u64 {
+    wp510r_birth_takeover(h);
+    let (rx, effects) = h.rpc_deferred(SessionRequest::Release {
+        source: "cli".into(),
+        reason: PyValue::from("late-close"),
+    });
+    assert_eq!(wp510r_claims(&effects, WP510R_CUSTODY_TOKEN), 1, "前置：release 取消帳本紀錄");
+    h.feed(ControlEvent::CustodyClaimed {
+        token: WP510R_CUSTODY_TOKEN,
+        outcome,
+    });
     assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
-    let token = 4242;
-    let stalled = h
-        .rpc(SessionRequest::PlaceholderAttachStalled { token, epoch: 0 })
-        .unwrap();
+    h.advance(Duration::from_secs(4));
+    let stalled = rx.try_recv().expect("首次期限到應回覆").unwrap();
     assert_eq!(stalled.get("drain_stalled"), Some(&PyValue::Bool(true)));
-    token
+    WP510R_CUSTODY_TOKEN
 }
 
 /// 遲到的關閉收尾（Python `_finish_attach_op` 的 release 分支，`:4340-4363`）：不需第二次 release，即轉 RELEASED、
@@ -2833,14 +2860,14 @@ fn wp510_review11_assert_late_settle_completes_release(h: &mut CoreHarness, toke
     wp510_review11_assert_release_completed(h);
 }
 
-/// 送出遲到的關閉收尾（`PlaceholderAttachSettled`，第一個 release 請求為 `cli`／`late-close`）。
+/// 送出遲到的關閉收尾（設計 §6 #1、#2 H*：帳本紀錄的關閉終態 `CustodyTerminal`；第一個 release 請求為
+/// `cli`／`late-close`）。
 fn wp510_review11_late_settle(h: &mut CoreHarness, token: u64) {
-    h.rpc(SessionRequest::PlaceholderAttachSettled {
+    h.feed(ControlEvent::CustodyTerminal {
         token,
-        release_source: "cli".into(),
-        release_reason: PyValue::from("late-close"),
-    })
-    .unwrap();
+        closed: true,
+        error: None,
+    });
 }
 
 /// 遲到收尾完成 release 的斷言（見 `wp510_review11_assert_late_settle_completes_release`）。
@@ -2862,7 +2889,10 @@ fn wp510_review11_assert_release_completed(h: &mut CoreHarness) {
 #[test]
 fn wp510_review11_open_failure_after_release_stalled_lets_late_settle_release() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
-    let token = wp510_review11_release_stalled_with_open_in_flight(&mut h);
+    let token = wp510_review11_release_stalled_with_open_in_flight(
+        &mut h,
+        sw_core::mailbox::CustodyClaimOutcome::Closing,
+    );
     h.feed(ControlEvent::BridgeOpened {
         epoch_hint: 0,
         result: Err(OpenFailure::Other(PalError::io(16, "Device or resource busy"))),
@@ -2873,19 +2903,27 @@ fn wp510_review11_open_failure_after_release_stalled_lets_late_settle_release() 
 /// 同上，但遲到的開埠成功：actor 不接手（非 ATTACHING），退休 bridge 後開埠同樣已到終態，遲到收尾須完成 RELEASED。
 /// 退休 bridge 的 handle 仍由其 worker 持有到排空回條（wp510 第十次整包審查 High P8-14fe592-1）：收尾須等配對且
 /// `handle_closed:true` 的回條才完成 RELEASED 並落盤（Python `_finish_attach_op` 確認關閉後才完成，`:4320-4363`）。
+///
+/// 設計 §6 #2（H*）：開埠工作已取得 handle（open 成功）時 release 的取消寫在紀錄上（`Cancelled`），開埠工作在 adopt
+/// 提交點看到取消而不接手（`OpenFailure::Cancelled`，不啟動 IoWorker），handle 的關閉回條改為 `CustodyTerminal`；原
+/// 「退休 bridge 開始排空」的內部前置由「不接手、不發 AdoptBridge／BeginDrain」取代。
 #[test]
 fn wp510_review11_open_success_after_release_stalled_lets_late_settle_release() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
-    let token = wp510_review11_release_stalled_with_open_in_flight(&mut h);
-    let opened = h.opened_bridge(REAL_PATH);
-    let retired_epoch = opened.epoch;
-    h.feed(ControlEvent::BridgeOpened {
+    let token = wp510_review11_release_stalled_with_open_in_flight(
+        &mut h,
+        sw_core::mailbox::CustodyClaimOutcome::Cancelled,
+    );
+    let effects = h.feed(ControlEvent::BridgeOpened {
         epoch_hint: 0,
-        result: Ok(opened),
+        result: Err(OpenFailure::Cancelled),
     });
-    let (epoch, stop) = h.pending_stop();
-    assert_eq!(epoch, retired_epoch, "前置：退休 bridge 開始排空");
-    wp510_review11_late_settle(&mut h, token);
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::AdoptBridge { .. } | Effect::BeginDrain { .. })),
+        "前置：開埠工作在提交點取消，不接手 bridge"
+    );
     assert_eq!(
         h.public()["state"],
         PyValue::from("RECOVERING"),
@@ -2895,77 +2933,110 @@ fn wp510_review11_open_success_after_release_stalled_lets_late_settle_release() 
         !h.state_store.last_released().contains_key("t:COM0"),
         "退休 bridge 的 handle 確認關閉前不得落盤"
     );
-    h.receipt(epoch, stop).handle_closed(true).feed();
+    wp510_review11_late_settle(&mut h, token);
     wp510_review11_assert_release_completed(&mut h);
-}
-
-/// `Effect::ClearRevokedHandoff` 的 `(by_id, token)` 清單。
-fn wp510_review11_revoke_clears(effects: &[Effect]) -> Vec<(String, u64)> {
-    effects
-        .iter()
-        .filter_map(|effect| match effect {
-            Effect::ClearRevokedHandoff { by_id, token } => Some((by_id.clone(), *token)),
-            _ => None,
-        })
-        .collect()
 }
 
 /// 撤銷標記的生命週期（wp510 第九次整包審查 High P8-8463b22-1）：開埠在途時 `ReleaseAttachPending` 不清除標記，
 /// 留到該開埠的 `BridgeOpened` 終態才清除（開埠 worker 撞到標記即不開埠；Python 取消旗標隨作業保留，
 /// `origin/main:sw_core/session_manager.py:3125`、`:4986-4996`），之後的開埠結果不再重複清除。
+///
+/// 設計第 2 版 §6 #4（S；擁有者 2026-11-10 D5 核准）：內部請求改為 `ClaimForStop`（取消寫在帳本紀錄上）與開埠終態序列；
+/// 斷言改為「取消持續到開埠終態、只結算一次、第二個終態不再產生效果」。
 #[test]
 fn wp510_review11_revoke_kept_until_in_flight_open_terminal() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
-    h.feed(ControlEvent::DeviceAttached {
-        by_id: DEVICE_BY_ID.into(),
-        real_path: REAL_PATH.into(),
+    wp510r_birth_takeover(&mut h);
+    let (rx, effects) = h.rpc_deferred(release());
+    assert_eq!(wp510r_claims(&effects, WP510R_CUSTODY_TOKEN), 1);
+    h.feed(ControlEvent::CustodyClaimed {
+        token: WP510R_CUSTODY_TOKEN,
+        outcome: sw_core::mailbox::CustodyClaimOutcome::Cancelled,
     });
-    let (_, effects) = h.rpc_full(SessionRequest::ReleaseAttachPending {
-        by_id: DEVICE_BY_ID.into(),
-        handoff_token: 77,
+    // 開埠在途時取消持續：第二個 release 不重發取消、不提前回覆。
+    let (rx2, effects) = h.rpc_deferred(release());
+    assert_eq!(wp510r_claims(&effects, WP510R_CUSTODY_TOKEN), 0, "開埠在途時取消只發一次");
+    assert!(rx.try_recv().is_err() && rx2.try_recv().is_err(), "開埠終態前不得回覆");
+    assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
+    h.feed(ControlEvent::CustodyTerminal {
+        token: WP510R_CUSTODY_TOKEN,
+        closed: true,
+        error: None,
+    });
+    assert!(rx.try_recv().is_err(), "開埠終態前不得回覆");
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Err(OpenFailure::Cancelled),
+    });
+    assert_eq!(rx.try_recv().expect("開埠終態後應回覆").unwrap().get("ok"), Some(&PyValue::Bool(true)));
+    assert_eq!(rx2.try_recv().expect("開埠終態後應回覆").unwrap().get("ok"), Some(&PyValue::Bool(true)));
+    assert_eq!(h.public()["state"], PyValue::from("RELEASED"));
+    let commits = h.state_store.commits();
+    let effects = h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Err(OpenFailure::Cancelled),
     });
     assert!(
-        wp510_review11_revoke_clears(&effects).is_empty(),
-        "開埠在途時不得清除撤銷標記"
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Reply(..) | Effect::Persist { .. } | Effect::ClaimForStop { .. })),
+        "第二個終態不再產生效果"
     );
-    let effects = h.feed(ControlEvent::BridgeOpened {
-        epoch_hint: 0,
-        result: Err(OpenFailure::CloseBlocked),
+    let effects = h.feed(ControlEvent::CustodyTerminal {
+        token: WP510R_CUSTODY_TOKEN,
+        closed: true,
+        error: None,
     });
-    assert_eq!(
-        wp510_review11_revoke_clears(&effects),
-        vec![(DEVICE_BY_ID.to_string(), 77)],
-        "在途開埠的終態清除撤銷標記"
-    );
-    let effects = h.feed(ControlEvent::BridgeOpened {
-        epoch_hint: 0,
-        result: Err(OpenFailure::CloseBlocked),
-    });
-    assert!(wp510_review11_revoke_clears(&effects).is_empty(), "只清除一次");
+    assert!(effects.is_empty(), "重複的關閉終態只結算一次");
+    assert_eq!(h.state_store.commits(), commits);
 }
 
 /// 無開埠在途：之後的 `DeviceAttached` 在 RECOVERING 不開埠（Python `_attach_by_id` 見取消中止），標記不會再被取用，
 /// `ReleaseAttachPending` 即清除。
+///
+/// 設計第 2 版 §6 #3（S；擁有者 2026-11-10 D5 核准）：內部請求改為 `ClaimForStop` 與關閉終態序列；斷言改為「沒有開埠在途時
+/// release 立即收斂，不留取消」。前置為 `AcceptCustody`（不立即開埠，例如 bind 改綁到 parked、`DeviceOnline` 之前）。
 #[test]
 fn wp510_review11_revoke_cleared_when_no_open_in_flight() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
-    let (_, effects) = h.rpc_full(SessionRequest::ReleaseAttachPending {
-        by_id: DEVICE_BY_ID.into(),
-        handoff_token: 78,
-    });
-    assert_eq!(
-        wp510_review11_revoke_clears(&effects),
-        vec![(DEVICE_BY_ID.to_string(), 78)]
-    );
+    let accepted = h
+        .rpc(SessionRequest::AcceptCustody {
+            token: 78,
+            by_id: DEVICE_BY_ID.into(),
+            real_path: REAL_PATH.into(),
+            open_now: false,
+        })
+        .unwrap();
+    assert_eq!(accepted.get("ok"), Some(&PyValue::Bool(true)), "{accepted:?}");
+    let (rx, effects) = h.rpc_deferred(release());
+    assert_eq!(wp510r_claims(&effects, 78), 1);
     assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
+    h.feed(ControlEvent::CustodyClaimed {
+        token: 78,
+        outcome: sw_core::mailbox::CustodyClaimOutcome::Closing,
+    });
     let effects = h.feed(ControlEvent::DeviceAttached {
         by_id: DEVICE_BY_ID.into(),
         real_path: REAL_PATH.into(),
     });
     assert!(
-        !effects.iter().any(|effect| matches!(effect, Effect::OpenBridge { .. })),
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::OpenBridge { .. } | Effect::ClaimCustody { .. })),
         "RECOVERING 的 DeviceAttached 不得開埠"
     );
+    h.feed(ControlEvent::CustodyTerminal {
+        token: 78,
+        closed: true,
+        error: None,
+    });
+    let response = rx.try_recv().expect("無開埠在途：關閉終態到即收斂").unwrap();
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
+    assert_eq!(h.public()["state"], PyValue::from("RELEASED"));
+    // 不留取消：之後的 release 為 already_released，不再作用於帳本。
+    let (again, effects) = h.rpc_full(release());
+    assert_eq!(again.unwrap().get("already_released"), Some(&PyValue::Bool(true)));
+    assert_eq!(wp510r_claims(&effects, 78), 0, "不留取消");
 }
 
 /// wp510 第十次整包審查 High（P8-14fe592-1）：bind 等待已取走交接 handle 的開埠逾時（`attach_op_stalled_reply` →
@@ -3618,8 +3689,9 @@ fn wp510r_r3_p8_c4913ae_open_in_flight_rebound_release_timeout_converges() {
     assert_eq!(public["drain_stalled"], PyValue::Bool(false));
     // 開埠在途轉自身 bridge 排空的收斂沿用既有凍結節點
     // `drain_release::release_during_pending_open_reply_is_stalled_until_close_receipt` 的 `drain_timeout_epoch` 保留
-    // 語意（Python `_complete_drain` 只清 `drain_stalled`，`origin/main:sw_core/session_manager.py:2913`）；與設計
-    // P8-c4913ae-1「false/null」的落差列 SPEC-GAP。
+    // 語意（Python `_complete_drain` 只清 `drain_stalled`，`origin/main:sw_core/session_manager.py:2884-2913`）。編排者
+    // 2026-11-11 SPEC-GAP 3 裁決：P8-c4913ae-1 的 false/null 只套用在經在途作業或帳本紀錄收尾的路徑（見
+    // `wp510r_r3_p8_c4913ae_custody_path_clears_both_fields`）。
     assert_eq!(public["drain_timeout_epoch"], epoch_after_transfer);
     assert!(h.state_store.last_released().contains_key("t:COM0"));
 }
@@ -3973,6 +4045,34 @@ fn wp510r_r3_t14_bind_wait_timeout_deferred_under_pending_freeze() {
     assert_eq!(response.get("drain_stalled"), Some(&PyValue::Bool(true)), "{response:?}");
 }
 
+/// SPEC-GAP 2：以 `ReleaseWithAck` 送 release（同 `release()`），回傳回覆通道與 actor 受理時回報的 `WaitAck`。
+fn wp510r_release_with_ack(
+    h: &mut CoreHarness,
+) -> (
+    crossbeam_channel::Receiver<Result<PyDict, sw_proto::pycompat::PyErr>>,
+    sw_core::mailbox::WaitAck,
+) {
+    let (ack_tx, ack_rx) = bounded(1);
+    let (rx, _) = h.rpc_deferred(SessionRequest::ReleaseWithAck {
+        source: "cli".into(),
+        reason: PyValue::Null,
+        ack: ack_tx,
+    });
+    let wait = ack_rx.try_recv().expect("release 等待中須回報 WaitAck");
+    (rx, wait)
+}
+
+/// `WaitAck` 對應的期限通知（RPC 執行緒在期限到仍未獲回覆時送出者）。
+fn wp510r_notice(wait: &sw_core::mailbox::WaitAck) -> SessionRequest {
+    match wait {
+        sw_core::mailbox::WaitAck::Release { stop_id, deadline } => SessionRequest::ReleaseDeadlineElapsed {
+            stop_id: *stop_id,
+            deadline: *deadline,
+        },
+        sw_core::mailbox::WaitAck::Bind { id, .. } => SessionRequest::BindDeadlineElapsed { id: *id },
+    }
+}
+
 /// T14 凍結分類：`SessionRequest::ReleaseDeadlineElapsed` 屬 Request（bypass）。Pending 與 Permanent 期間都處理，只回覆
 /// 既有 release waiter（T-1 等待），不啟動新工作。
 #[test]
@@ -3980,7 +4080,7 @@ fn wp510r_r3_t14_release_deadline_notice_handled_under_pending_and_permanent_fre
     for permanent in [false, true] {
         let mut h = CoreHarness::new(SHELL_PROFILE);
         let (r_epoch, r_stop) = wp510r_released_attach_commit_failure(&mut h);
-        let (rx, _) = h.rpc_deferred(release());
+        let (rx, wait) = wp510r_release_with_ack(&mut h);
         h.receipt(r_epoch, r_stop).handle_closed(false).feed();
         assert!(rx.try_recv().is_err(), "前置：T-1 等待中");
         if permanent {
@@ -3988,7 +4088,8 @@ fn wp510r_r3_t14_release_deadline_notice_handled_under_pending_and_permanent_fre
         } else {
             let _ = h.reg.admission_gate().freeze_if_idle("wp510r-release-deadline");
         }
-        let (ack, effects) = h.rpc_full(SessionRequest::ReleaseDeadlineElapsed);
+        // SPEC-GAP 2（編排者 2026-11-11）：通知帶 release 受理時回報的身分與首次期限。
+        let (ack, effects) = h.rpc_full(wp510r_notice(&wait));
         assert_eq!(ack.unwrap().get("ok"), Some(&PyValue::Bool(true)));
         assert!(wp510r_open_bridge_paths(&effects).is_empty(), "不啟動新工作");
         let response = rx
@@ -4005,8 +4106,8 @@ fn wp510r_r3_t14_release_deadline_notice_handled_under_pending_and_permanent_fre
 fn wp510r_r3_release_deadline_notice_ignored_without_retired_drain() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
     h.to_ready();
-    let (rx, _) = h.rpc_deferred(release());
-    let (ack, _) = h.rpc_full(SessionRequest::ReleaseDeadlineElapsed);
+    let (rx, wait) = wp510r_release_with_ack(&mut h);
+    let (ack, _) = h.rpc_full(wp510r_notice(&wait));
     assert_eq!(ack.unwrap().get("ok"), Some(&PyValue::Bool(true)));
     assert!(rx.try_recv().is_err(), "沒有 retired drain 時不得提前結算自身排空");
     assert_eq!(h.public()["drain_stalled"], PyValue::Bool(false));
@@ -4014,4 +4115,321 @@ fn wp510r_r3_release_deadline_notice_ignored_without_retired_drain() {
     h.receipt(epoch, stop).handle_closed(true).feed();
     let response = rx.try_recv().expect("回條後回覆").unwrap();
     assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
+}
+
+// ---------------------------------------------------------------------------
+// S2-PAR-wp510r 第 8 項（R3 之三）：出生即接管的帳本路徑、DR-6、SPEC-GAP 2、P8-d7af8df-1。
+// ---------------------------------------------------------------------------
+
+/// 出生即接管、開埠工作停在 pre-take（紀錄 `Held`）：bind 或 release 以 `ClaimForStop` 把紀錄轉 Closing。代 executor
+/// 回饋 `outcome`（Closing＝關閉工作者關閉中）。
+fn wp510r_custody_claimed(h: &mut CoreHarness, outcome: sw_core::mailbox::CustodyClaimOutcome) {
+    h.feed(ControlEvent::CustodyClaimed {
+        token: WP510R_CUSTODY_TOKEN,
+        outcome,
+    });
+}
+
+/// 帳本紀錄的關閉終態（關閉工作者送）與開埠工作的終態（claim 失敗：紀錄已是 Closing）。
+fn wp510r_custody_close_and_open_terminal(h: &mut CoreHarness, closed: bool) -> Vec<Effect> {
+    let mut effects = h.feed(ControlEvent::CustodyTerminal {
+        token: WP510R_CUSTODY_TOKEN,
+        closed,
+        error: (!closed).then(|| "[Errno 5] Input/output error".to_string()),
+    });
+    effects.extend(h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Err(OpenFailure::CloseBlocked),
+    }));
+    effects
+}
+
+/// DR-6(a)（設計 v3 §1.8；Python `bind_session`／`release_device` 各自的期限，`origin/main:sw_core/session_manager.py:3117-3124`、
+/// `:3132-3136`、`:3192-3204`、`:3695-3726`）：t=0 bind → t=1 首次 release → t=3 bind 到期 → t=4 release 到期。t=1：
+/// RECOVERING、drain false/null；t=3：bind 回 RECOV{true, g}，session drain true/g，release 繼續等；t=4：release 回
+/// STALL{true, g}。
+#[test]
+fn wp510r_r3_dr6_a_bind_and_release_deadlines_independent() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    wp510r_birth_takeover(&mut h);
+    let (bind_rx, effects) = h.rpc_deferred(bind_to(WP510R_BIND_TARGET));
+    assert_eq!(wp510r_claims(&effects, WP510R_CUSTODY_TOKEN), 1, "bind 取消帳本紀錄");
+    wp510r_custody_claimed(&mut h, sw_core::mailbox::CustodyClaimOutcome::Closing);
+    h.advance(Duration::from_millis(1000));
+    let (release_rx, effects) = h.rpc_deferred(release());
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ClaimForStop { token, release_deadline: Some(_), .. } if *token == WP510R_CUSTODY_TOKEN
+        )),
+        "首次 release 的絕對期限記在帳本紀錄上（SPEC-GAP 2 條件 1）"
+    );
+    let public = h.public();
+    assert_eq!(public["state"], PyValue::from("RECOVERING"));
+    assert_eq!(public["drain_stalled"], PyValue::Bool(false));
+    assert_eq!(public["drain_timeout_epoch"], PyValue::Null);
+    h.advance(Duration::from_millis(2100));
+    let bind = bind_rx.try_recv().expect("t=3 bind 到期應回覆").unwrap();
+    session_error(&bind, "SESSION_RECOVERING");
+    assert_eq!(bind.get("drain_stalled"), Some(&PyValue::Bool(true)));
+    let g = h.public()["bridge_generation"].clone();
+    assert_eq!(bind.get("drain_timeout_epoch"), Some(&g));
+    assert_eq!(h.public()["drain_stalled"], PyValue::Bool(true));
+    assert!(release_rx.try_recv().is_err(), "t=3 release 繼續等自己的期限");
+    h.advance(Duration::from_millis(1000));
+    let stall = release_rx.try_recv().expect("t=4 release 到期應回覆").unwrap();
+    session_error(&stall, "DRAIN_STALLED");
+    assert_eq!(stall.get("drain_stalled"), Some(&PyValue::Bool(true)));
+    assert_eq!(stall.get("drain_timeout_epoch"), Some(&g));
+}
+
+/// DR-6(b)：同 (a)，回條在 t=2.5：release 回 REL；bind 回 RECOV，帶回覆當下的 false/null 與 RELEASED（Python bind 等到
+/// `done` 時 `release_request` 已設，回 SESSION_RECOVERING＋當下 session，`:3716-3726`）。
+#[test]
+fn wp510r_r3_dr6_b_receipt_before_both_deadlines() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    wp510r_birth_takeover(&mut h);
+    let (bind_rx, _) = h.rpc_deferred(bind_to(WP510R_BIND_TARGET));
+    wp510r_custody_claimed(&mut h, sw_core::mailbox::CustodyClaimOutcome::Closing);
+    h.advance(Duration::from_millis(1000));
+    let (release_rx, _) = h.rpc_deferred(release());
+    h.advance(Duration::from_millis(1500));
+    wp510r_custody_close_and_open_terminal(&mut h, true);
+    let rel = release_rx.try_recv().expect("t=2.5 release 應回 REL").unwrap();
+    assert_eq!(rel.get("ok"), Some(&PyValue::Bool(true)), "{rel:?}");
+    let bind = bind_rx.try_recv().expect("t=2.5 bind 應回覆").unwrap();
+    session_error(&bind, "SESSION_RECOVERING");
+    assert_eq!(bind.get("drain_stalled"), Some(&PyValue::Bool(false)));
+    assert_eq!(bind.get("drain_timeout_epoch"), Some(&PyValue::Null));
+    assert_eq!(nested_session_state(&bind), PyValue::from("RELEASED"));
+    assert_eq!(h.public()["device_by_id"], PyValue::from(DEVICE_BY_ID), "release 在途不改綁");
+}
+
+/// DR-6(c)：回條在 t=3.5：t=3 bind 回 RECOV(true)；t=3.5 release 回 REL，drain 為 false/null（帳本紀錄收尾兩欄都清，
+/// 編排者 2026-11-11 SPEC-GAP 3 裁決；Python `_finish_attach_op` `:4345-4350`）。
+#[test]
+fn wp510r_r3_dr6_c_receipt_between_deadlines() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    wp510r_birth_takeover(&mut h);
+    let (bind_rx, _) = h.rpc_deferred(bind_to(WP510R_BIND_TARGET));
+    wp510r_custody_claimed(&mut h, sw_core::mailbox::CustodyClaimOutcome::Closing);
+    h.advance(Duration::from_millis(1000));
+    let (release_rx, _) = h.rpc_deferred(release());
+    h.advance(Duration::from_millis(2100));
+    let bind = bind_rx.try_recv().expect("t=3 bind 到期").unwrap();
+    assert_eq!(bind.get("drain_stalled"), Some(&PyValue::Bool(true)));
+    h.advance(Duration::from_millis(400));
+    assert!(release_rx.try_recv().is_err());
+    wp510r_custody_close_and_open_terminal(&mut h, true);
+    let rel = release_rx.try_recv().expect("t=3.5 release 應回 REL").unwrap();
+    assert_eq!(rel.get("ok"), Some(&PyValue::Bool(true)), "{rel:?}");
+    let public = h.public();
+    assert_eq!(public["state"], PyValue::from("RELEASED"));
+    assert_eq!(public["drain_stalled"], PyValue::Bool(false));
+    assert_eq!(public["drain_timeout_epoch"], PyValue::Null);
+}
+
+/// DR-6(d)：t=0 bind → t=3 bind 到期 → t=5 首次 release → t=8 到期。t=5 時 drain 重設為 false/null（G-3：首次 release
+/// 請求清兩欄，`:3132-3136`）；t=8 回 STALL；期間收到回條則回 REL（另一案）。
+#[test]
+fn wp510r_r3_dr6_d_release_after_bind_expiry_resets_drain_then_stalls() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    wp510r_birth_takeover(&mut h);
+    let (bind_rx, _) = h.rpc_deferred(bind_to(WP510R_BIND_TARGET));
+    wp510r_custody_claimed(&mut h, sw_core::mailbox::CustodyClaimOutcome::Closing);
+    h.advance(Duration::from_millis(3100));
+    let bind = bind_rx.try_recv().expect("t=3 bind 到期").unwrap();
+    assert_eq!(bind.get("drain_stalled"), Some(&PyValue::Bool(true)));
+    h.advance(Duration::from_millis(1900));
+    let (release_rx, _) = h.rpc_deferred(release());
+    let public = h.public();
+    assert_eq!(public["drain_stalled"], PyValue::Bool(false), "t=5 首次 release 重設 drain");
+    assert_eq!(public["drain_timeout_epoch"], PyValue::Null);
+    assert_eq!(public["state"], PyValue::from("RECOVERING"));
+    h.advance(Duration::from_millis(2900));
+    assert!(release_rx.try_recv().is_err(), "t=8 前不得回覆");
+    h.advance(Duration::from_millis(200));
+    let stall = release_rx.try_recv().expect("t=8 release 到期").unwrap();
+    session_error(&stall, "DRAIN_STALLED");
+    // 遲到的成功回條補完 RELEASED。
+    wp510r_custody_close_and_open_terminal(&mut h, true);
+    assert_eq!(h.public()["state"], PyValue::from("RELEASED"));
+    assert_eq!(h.public()["drain_stalled"], PyValue::Bool(false));
+}
+
+/// 同 DR-6(d)，期間（t=5～8）收到回條：release 回 REL。
+#[test]
+fn wp510r_r3_dr6_d_receipt_during_release_wait_reports_released() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    wp510r_birth_takeover(&mut h);
+    let (bind_rx, _) = h.rpc_deferred(bind_to(WP510R_BIND_TARGET));
+    wp510r_custody_claimed(&mut h, sw_core::mailbox::CustodyClaimOutcome::Closing);
+    h.advance(Duration::from_millis(3100));
+    let _ = bind_rx.try_recv().expect("t=3 bind 到期").unwrap();
+    h.advance(Duration::from_millis(1900));
+    let (release_rx, _) = h.rpc_deferred(release());
+    h.advance(Duration::from_millis(1500));
+    wp510r_custody_close_and_open_terminal(&mut h, true);
+    let rel = release_rx.try_recv().expect("回條後 release 應回 REL").unwrap();
+    assert_eq!(rel.get("ok"), Some(&PyValue::Bool(true)), "{rel:?}");
+    assert_eq!(h.public()["state"], PyValue::from("RELEASED"));
+}
+
+/// SPEC-GAP 2 回歸 (1)（編排者 2026-11-11）：首次期限由第一次 release 決定並記在被等待的對象上，第二次 release 共用同一
+/// 身分與期限（不以各自的 RPC 進入時間重算，WP2-2）。
+#[test]
+fn wp510r_r3_spec_gap2_first_release_deadline_shared_by_second_release() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    wp510r_birth_takeover(&mut h);
+    let (rx1, wait1) = wp510r_release_with_ack(&mut h);
+    wp510r_custody_claimed(&mut h, sw_core::mailbox::CustodyClaimOutcome::Closing);
+    std::thread::sleep(Duration::from_millis(20));
+    h.advance(Duration::from_millis(1000));
+    let (rx2, wait2) = wp510r_release_with_ack(&mut h);
+    assert_eq!(wait1, wait2, "第二次 release 沿用首次期限與同一身分");
+    // 首次期限（實時）到：一筆通知結算兩個 waiter。
+    let effects = h.rpc_full(wp510r_notice(&wait1)).1;
+    assert!(wp510r_open_bridge_paths(&effects).is_empty());
+    session_error(&rx1.try_recv().expect("首次期限到應回覆").unwrap(), "DRAIN_STALLED");
+    session_error(&rx2.try_recv().expect("共用首次期限").unwrap(), "DRAIN_STALLED");
+}
+
+/// SPEC-GAP 2 回歸 (2)：過期（身分或期限不符）的通知對新的等待無效。
+#[test]
+fn wp510r_r3_spec_gap2_stale_notice_ignored_for_new_wait() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    wp510r_birth_takeover(&mut h);
+    let (rx, wait) = wp510r_release_with_ack(&mut h);
+    wp510r_custody_claimed(&mut h, sw_core::mailbox::CustodyClaimOutcome::Closing);
+    let sw_core::mailbox::WaitAck::Release { stop_id, deadline } = wait.clone() else {
+        panic!("release 應回報 WaitAck::Release：{wait:?}");
+    };
+    for stale in [
+        SessionRequest::ReleaseDeadlineElapsed {
+            stop_id: StopId(stop_id.0 + 1000),
+            deadline,
+        },
+        SessionRequest::ReleaseDeadlineElapsed {
+            stop_id,
+            deadline: deadline - Duration::from_millis(1),
+        },
+    ] {
+        let (ack, _) = h.rpc_full(stale);
+        assert_eq!(ack.unwrap().get("ok"), Some(&PyValue::Bool(true)));
+        assert!(rx.try_recv().is_err(), "身分或期限不符的通知不得結算目前的等待");
+    }
+    assert_eq!(h.public()["drain_stalled"], PyValue::Bool(false));
+    let _ = h.rpc_full(wp510r_notice(&wait));
+    session_error(&rx.try_recv().expect("相符的通知結算").unwrap(), "DRAIN_STALLED");
+}
+
+/// SPEC-GAP 2 回歸 (3)：actor 計時器與 RPC 通知同時到時只回覆一次（`mark_drain_timeout` 冪等）。
+#[test]
+fn wp510r_r3_spec_gap2_timer_and_notice_reply_once() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    wp510r_birth_takeover(&mut h);
+    let (rx, wait) = wp510r_release_with_ack(&mut h);
+    wp510r_custody_claimed(&mut h, sw_core::mailbox::CustodyClaimOutcome::Closing);
+    let mut effects = h.advance(Duration::from_millis(3100));
+    effects.extend(h.rpc_full(wp510r_notice(&wait)).1);
+    effects.extend(h.rpc_full(wp510r_notice(&wait)).1);
+    session_error(&rx.try_recv().expect("期限到應回覆").unwrap(), "DRAIN_STALLED");
+    assert!(rx.try_recv().is_err(), "只回覆一次");
+    let stall_epochs = h.public()["drain_timeout_epoch"].clone();
+    assert_ne!(stall_epochs, PyValue::Null);
+}
+
+/// SPEC-GAP 2 回歸 (4)：BindWait 也以 `WaitAck::Bind` 告知身分；通知只結算目前那一筆 bind waiter，重複或過期的
+/// 通知不產生效果（ServiceRig 的實時端到端見 sw-daemon `wp510r_r3_rpc_p8_14fe592_*`）。
+#[test]
+fn wp510r_r3_spec_gap2_bind_wait_notice_settles_once() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    wp510r_birth_takeover(&mut h);
+    let (ack_tx, ack_rx) = bounded(1);
+    let (bind_rx, _) = h.rpc_deferred(SessionRequest::BindWithAck {
+        by_id: WP510R_BIND_TARGET.into(),
+        ack: ack_tx,
+    });
+    let wait = ack_rx.try_recv().expect("BindWait 須回報 WaitAck::Bind");
+    let sw_core::mailbox::WaitAck::Bind { id, .. } = wait else {
+        panic!("bind 應回報 WaitAck::Bind：{wait:?}");
+    };
+    wp510r_custody_claimed(&mut h, sw_core::mailbox::CustodyClaimOutcome::Closing);
+    let _ = h.rpc_full(SessionRequest::BindDeadlineElapsed { id: id + 1000 });
+    assert!(bind_rx.try_recv().is_err(), "不符的 bind 通知不得結算");
+    let _ = h.rpc_full(SessionRequest::BindDeadlineElapsed { id });
+    let bind = bind_rx.try_recv().expect("相符的 bind 通知結算").unwrap();
+    session_error(&bind, "SESSION_RECOVERING");
+    assert_eq!(bind.get("drain_stalled"), Some(&PyValue::Bool(true)));
+    let effects = h.rpc_full(SessionRequest::BindDeadlineElapsed { id }).1;
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Reply(..)) && false),
+        "重複通知不產生效果"
+    );
+    h.advance(Duration::from_millis(3100));
+    assert!(bind_rx.try_recv().is_err(), "actor 計時器之後不得再回覆");
+}
+
+/// P8-d7af8df-1（Fable Low）第一個分支：BindWait 期間插入 release、再收成功回條：bind 回 SESSION_RECOVERING
+/// （`drain_stalled:false`），release 回 already_released:true（佔位已 RELEASED 的 release 冪等），by_id 不變（Python
+/// `:3716-3726`）。
+#[test]
+fn wp510r_r3_p8_d7af8df_bind_wait_with_release_then_success_receipt() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (r_epoch, r_stop) = wp510r_released_attach_commit_failure(&mut h);
+    let (bind_rx, _) = h.rpc_deferred(bind_to(WP510R_BIND_TARGET));
+    let (release_rx, _) = h.rpc_deferred(release());
+    assert!(bind_rx.try_recv().is_err() && release_rx.try_recv().is_err());
+    h.receipt(r_epoch, r_stop).handle_closed(true).feed();
+    let bind = bind_rx.try_recv().expect("成功回條後 bind 應回覆").unwrap();
+    session_error(&bind, "SESSION_RECOVERING");
+    assert_eq!(bind.get("drain_stalled"), Some(&PyValue::Bool(false)), "{bind:?}");
+    let rel = release_rx.try_recv().expect("成功回條後 release 應回覆").unwrap();
+    assert_eq!(rel.get("already_released"), Some(&PyValue::Bool(true)), "{rel:?}");
+    assert_eq!(h.public()["device_by_id"], PyValue::from(DEVICE_BY_ID), "release 在途不改綁");
+}
+
+/// P8-d7af8df-1 第二個分支：READY（有自身 bridge）的 session 帶著退休 bridge，release 的自身停止收到
+/// `ReleaseDeadlineElapsed`（身分與首次期限相符）即回 DRAIN_STALLED（`release_deadline_elapsed` 的 `self.stop` 分支）。
+#[test]
+fn wp510r_r3_p8_d7af8df_ready_with_retired_bridge_release_notice_stalls() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let stale = h.opened_bridge("/fake/tty-stale");
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Ok(stale),
+    });
+    let (rx, wait) = wp510r_release_with_ack(&mut h);
+    assert!(rx.try_recv().is_err(), "前置：release 等待自身 bridge 與退休 bridge");
+    let _ = h.rpc_full(wp510r_notice(&wait));
+    let response = rx.try_recv().expect("首次期限通知即回 DRAIN_STALLED").unwrap();
+    session_error(&response, "DRAIN_STALLED");
+    assert_eq!(h.public()["drain_stalled"], PyValue::Bool(true));
+}
+
+/// P8-c4913ae-1（編排者 2026-11-11 SPEC-GAP 3 裁決：經帳本紀錄收尾的路徑兩欄都清）：出生即接管的 session，release 等待帳本
+/// 紀錄逾時 → DRAIN_STALLED{true, g}（list 與頂層一致）→ 遲到的成功回條後 RELEASED 且 false/null；release 進行中不得
+/// 再開埠。自身 bridge 排空的路徑保留 epoch，見 `wp510r_r3_p8_c4913ae_open_in_flight_rebound_release_timeout_converges`。
+#[test]
+fn wp510r_r3_p8_c4913ae_custody_path_clears_both_fields() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    wp510r_birth_takeover(&mut h);
+    let (rx, _) = h.rpc_deferred(release());
+    wp510r_custody_claimed(&mut h, sw_core::mailbox::CustodyClaimOutcome::Closing);
+    let effects = h.advance(Duration::from_millis(3500));
+    assert!(wp510r_open_bridge_paths(&effects).is_empty(), "release 進行中不得再開埠");
+    let stall = rx.try_recv().expect("首次期限到應回覆").unwrap();
+    session_error(&stall, "DRAIN_STALLED");
+    let g = h.public()["bridge_generation"].clone();
+    assert_eq!(stall.get("drain_timeout_epoch"), Some(&g));
+    assert_eq!(h.public()["drain_stalled"], PyValue::Bool(true), "list 與頂層一致");
+    assert_eq!(h.public()["drain_timeout_epoch"], g);
+    let effects = wp510r_custody_close_and_open_terminal(&mut h, true);
+    assert!(wp510r_open_bridge_paths(&effects).is_empty());
+    let public = h.public();
+    assert_eq!(public["state"], PyValue::from("RELEASED"), "{public:?}");
+    assert_eq!(public["drain_stalled"], PyValue::Bool(false));
+    assert_eq!(public["drain_timeout_epoch"], PyValue::Null);
+    assert!(h.state_store.last_released().contains_key("t:COM0"));
 }

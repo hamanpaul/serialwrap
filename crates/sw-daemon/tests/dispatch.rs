@@ -9110,3 +9110,357 @@ fn wp510r_r3_rpc_release_retired_failure_waits_first_deadline() {
     assert_eq!(s(&again, "error_code"), "DRAIN_STALLED", "{}", j(&again));
     assert_eq!(dev.open_attempts(), opens, "全程不另開");
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// S2-PAR-wp510r 第 8 項（R3 之三）：出生即接管、adopt 提交點的取消、帳本路徑的 release／bind 等待收進 actor。
+//
+// 呼叫路徑（接線證據）：`Service::rpc("device.attach")` → `route_with_selector` → `attach_released_placeholder` →
+// dynamic worker `attach_dynamic` → `create_session_locked`（`place_session_custody_locked` 存 `Held{Session}`、
+// `SessionCore::init_external_attach`）→ 新 actor 啟動效果 `Effect::ClaimCustody` → `OpenCtx::open_bridge_custody`；
+// `Service::rpc("device.release")` → `route_inner` → `route_after_release_settle` → `ActorHandle::request_with_ack_notice`
+// （`ReleaseWithAck`、`WaitAck::Release`）→ actor `release_request` → `begin_stop` 發 `Effect::ClaimForStop` →
+// `ManagerExec::execute_with_feedback`（`claim_custody_for_stop_locked`、`spawn_custody_closer`、立即回饋
+// `CustodyClaimed`）→ 關閉工作者 `finish_custody_close` → `CustodyTerminal` → actor `settle_retired` → `try_converge`。
+// ---------------------------------------------------------------------------------------------------------------
+
+/// 佔位交接後正式 session（t:COM3）的開埠工作停在 pre-take（`open_bridge_pre_take_hook`）。回傳 (rig, 裝置, 放行).
+fn wp510r_r3_pre_take_rig() -> (Arc<ServiceRig>, FakeDevice, crossbeam_channel::Sender<()>) {
+    let r = Arc::new(wp510_b_placeholder_rig());
+    let dev = r.device(WP510_REAL_G).clone();
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (go_tx, go_rx) = crossbeam_channel::bounded::<()>(1);
+    r.mgr.set_open_bridge_pre_take_hook_for_test(Box::new(move || {
+        let _ = entered_tx.send(());
+        let _ = go_rx.recv_timeout(Duration::from_secs(20));
+    }));
+    let attached = r.call(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    assert_eq!(attached.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&attached));
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("正式 session 的開埠工作應停在 pre-take");
+    // 出生即接管（設計 §3.1.4 W2、C7）：紀錄 `Held`、owner 為新 session。
+    let held = r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).expect("出生即接管的帳本紀錄");
+    assert_eq!(held.phase, CustodyPhaseSnapshot::Held, "{held:?}");
+    assert!(
+        matches!(&held.owner, sw_core::custody::CustodyOwner::Session { sid, .. } if sid == "t:COM3"),
+        "owner 為新建的正式 session：{held:?}"
+    );
+    (r, dev, go_tx)
+}
+
+/// P8-8463b22-1（設計 §1.4）：`tpl-a:COM3` 已建立、開埠工作停在 pre-take → release，關閉暫停超過 3 s → STALL（RECOVERING、
+/// true、g）。開埠工作 claim 失敗（紀錄已是 Closing），不另開。關閉完成後：RELEASED、"cli"、時間已填、false/null、有落盤列；
+/// open_attempts 不增加、close 1、零 TX；下一次 release 回 already_released（Python `:3105-3107`、`:3133`、`:3193-3204`、
+/// `:5701`、`:4339-4355`）。`open_first`：(a) 先放行開埠工作；否則 (b) 先放行關閉。
+fn wp510r_r3_rpc_p8_8463b22(open_first: bool) {
+    let (r, dev, go_tx) = wp510r_r3_pre_take_rig();
+    let attempts = dev.open_attempts();
+    let tx_before = dev.tx_len();
+    let closes_before = dev.close_count();
+    dev.pause_next_close();
+    let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+    let release_rig = Arc::clone(&r);
+    let release = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let reply = release_rig.call("device.release", r#"{"selector":"t:COM3"}"#);
+        let _ = reply_tx.send((reply, started.elapsed()));
+    });
+    let paused = dev.wait_paused(Duration::from_secs(5));
+    let closing = r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID);
+    let stalled = reply_rx.recv_timeout(Duration::from_secs(8)).ok();
+    let g = r.session("t:COM3").and_then(|s| s.get("bridge_generation").cloned());
+    if open_first {
+        let _ = go_tx.send(());
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let state_mid = r.session("t:COM3").map(|session| s(&session, "state").to_string());
+    dev.release_pause();
+    if !open_first {
+        wait_until("關閉完成", || !dev.is_open());
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            r.session("t:COM3").map(|session| s(&session, "state").to_string()).as_deref(),
+            Some("RECOVERING"),
+            "開埠工作仍在途時不得先完成 RELEASED"
+        );
+        let _ = go_tx.send(());
+    }
+    release.join().expect("release thread 不應 panic");
+
+    assert!(paused, "release 的關閉應停在暫停點");
+    let closing = closing.expect("關閉中的帳本紀錄");
+    assert!(
+        matches!(closing.phase, CustodyPhaseSnapshot::Closing { .. }),
+        "release 把紀錄轉 Closing，開埠工作之後的 claim 會失敗：{closing:?}"
+    );
+    let (stalled, elapsed) = stalled.expect("release 須於首次期限回覆");
+    assert!(elapsed < Duration::from_secs(6), "首次期限回覆：{elapsed:?}");
+    assert_eq!(s(&stalled, "error_code"), "DRAIN_STALLED", "{}", j(&stalled));
+    assert_eq!(stalled.get("drain_stalled"), Some(&PyValue::Bool(true)));
+    assert_eq!(stalled.get("drain_timeout_epoch").cloned(), g, "{}", j(&stalled));
+    assert_eq!(s(&sub(&stalled, "session"), "state"), "RECOVERING");
+    assert_eq!(state_mid.as_deref(), Some("RECOVERING"));
+
+    r.wait_state("t:COM3", "RELEASED");
+    wait_until("RELEASED 落盤", || {
+        wp510_review10_state_has_released_by_id(&r, WP510_PLACEHOLDER_BY_ID)
+    });
+    let session = r.session("t:COM3").expect("t:COM3 session");
+    assert_eq!(s(&session, "released_by"), "cli", "{}", j(&session));
+    assert!(session.get("released_at").and_then(PyValue::as_str).is_some());
+    assert_eq!(session.get("drain_stalled"), Some(&PyValue::Bool(false)), "{}", j(&session));
+    assert_eq!(session.get("drain_timeout_epoch"), Some(&PyValue::Null), "{}", j(&session));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(dev.open_attempts(), attempts, "開埠工作 claim 失敗，不另開");
+    assert_eq!(dev.close_count(), closes_before + 1, "handle 只關閉一次");
+    assert_eq!(dev.tx_len(), tx_before, "零 TX");
+    assert!(r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_none(), "帳本紀錄已結算");
+    let again = r.call("device.release", r#"{"selector":"t:COM3"}"#);
+    assert_eq!(again.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&again));
+    assert_eq!(again.get("already_released"), Some(&PyValue::Bool(true)), "{}", j(&again));
+}
+
+#[test]
+fn wp510r_r3_rpc_p8_8463b22_release_stall_then_open_job_first() {
+    wp510r_r3_rpc_p8_8463b22(true);
+}
+
+#[test]
+fn wp510r_r3_rpc_p8_8463b22_release_stall_then_close_first() {
+    wp510r_r3_rpc_p8_8463b22(false);
+}
+
+/// G-3（設計 v1 §1.8；Python `release_device` `:3132-3138`）：release 等待在途作業時先設 RECOVERING：等待期間 list 為
+/// RECOVERING、`command.submit` 回 SESSION_RECOVERING；首次 release 清 `drain_stalled`／`drain_timeout_epoch`。
+#[test]
+fn wp510r_r3_rpc_g3_release_waiting_custody_sets_recovering() {
+    let (r, dev, go_tx) = wp510r_r3_pre_take_rig();
+    dev.pause_next_close();
+    let release_rig = Arc::clone(&r);
+    let release = std::thread::spawn(move || release_rig.call("device.release", r#"{"selector":"t:COM3"}"#));
+    let paused = dev.wait_paused(Duration::from_secs(5));
+    let listed = r.session("t:COM3").expect("t:COM3 session");
+    let submit = r.call("command.submit", r#"{"selector":"t:COM3","cmd":"echo g3"}"#);
+    dev.release_pause();
+    let _ = go_tx.send(());
+    let released = release.join().expect("release thread 不應 panic");
+
+    assert!(paused, "前置：release 的關閉停在暫停點");
+    assert_eq!(s(&listed, "state"), "RECOVERING", "{}", j(&listed));
+    assert_eq!(listed.get("drain_stalled"), Some(&PyValue::Bool(false)), "{}", j(&listed));
+    assert_eq!(listed.get("drain_timeout_epoch"), Some(&PyValue::Null), "{}", j(&listed));
+    assert_eq!(s(&submit, "error_code"), "SESSION_RECOVERING", "{}", j(&submit));
+    assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&released));
+}
+
+/// WP5-1（設計 §1.4）：`tpl-a:COM3` 已建立，開埠工作在 pre-take 時 shutdown，closed:false：shutdown 報告未排空；有告警；
+/// `CloseFailed`；B3 進集合；IoWorker 未啟動、零 TX（Python `:5647-5704`、`:1187`、`:5701`、`:4322-4332`、`:1228-1239`）。
+#[test]
+fn wp510r_r3_rpc_wp5_1_shutdown_pre_take_close_failure_not_drained() {
+    let (r, dev, go_tx) = wp510r_r3_pre_take_rig();
+    let tx_before = dev.tx_len();
+    dev.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
+    let manager = r.mgr.clone();
+    let shutdown = std::thread::spawn(move || manager.shutdown(Duration::from_millis(1500)));
+    let drained = shutdown.join().expect("shutdown thread 不應 panic");
+    let _ = go_tx.send(());
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert!(
+        drained.iter().any(|(target, ok)| target == "t:COM3" && !ok),
+        "正式 session 未排空：{drained:?}"
+    );
+    assert!(
+        drained
+            .iter()
+            .any(|(target, ok)| target == &format!("attach:{WP510_PLACEHOLDER_BY_ID}") && !ok),
+        "未確認關閉的帳本紀錄列入 stalled：{drained:?}"
+    );
+    let custody = r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).expect("帳本紀錄保留");
+    assert!(matches!(custody.phase, CustodyPhaseSnapshot::CloseFailed { .. }), "{custody:?}");
+    assert!(r.mgr.unconfirmed_close_for_test(WP510_PLACEHOLDER_BY_ID), "B3 進未確認集合");
+    // 告警內容由 sw-core `wp510r_r3_wp5_1_shutdown_pre_take_close_failure_warns`（ManagerRig 擷取 stderr）驗證。
+    assert!(dev.is_open(), "closed:false 表示 handle 仍開啟");
+    assert_eq!(dev.open_count(), 1, "IoWorker 未啟動、不重開");
+    assert_eq!(dev.tx_len(), tx_before, "零 TX");
+}
+
+/// P8-fdc1413-1（設計第 5 版 §1.4，D1 iii＋T-1）：交接後 configure 失敗且 closed:false：`CloseFailed`、B3 進集合；之後的
+/// 首次 release 等到首次期限才回 DRAIN_STALLED（失敗在首次 release 之前已知），期限已過的 release 立即回；session
+/// DETACHED、不重開、零 TX（Python `:1278-1324`、`:1346-1368`、`:3188-3204`、`:4320-4332`）。
+#[test]
+fn wp510r_r3_rpc_p8_fdc1413_configure_close_failure_release_t1() {
+    let r = wp510_b_placeholder_rig();
+    let dev = r.device(WP510_REAL_G).clone();
+    dev.fail_configure(PalError::io(5, "[Errno 5] Input/output error"));
+    dev.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
+    let attached = r.call(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    assert_eq!(attached.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&attached));
+    wait_until("configure 失敗後退回 DETACHED", || {
+        r.session("t:COM3").is_some_and(|session| s(&session, "state") == "DETACHED")
+    });
+    wait_until("帳本紀錄轉 CloseFailed", || {
+        r.mgr
+            .custody_for_test(WP510_PLACEHOLDER_BY_ID)
+            .is_some_and(|c| matches!(c.phase, CustodyPhaseSnapshot::CloseFailed { .. }))
+    });
+    let attempts = dev.open_attempts();
+    let tx_before = dev.tx_len();
+    assert!(r.mgr.unconfirmed_close_for_test(WP510_PLACEHOLDER_BY_ID));
+
+    let started = std::time::Instant::now();
+    let first = r.call("device.release", r#"{"selector":"t:COM3"}"#);
+    let first_elapsed = started.elapsed();
+    let started = std::time::Instant::now();
+    let second = r.call("device.release", r#"{"selector":"t:COM3"}"#);
+    let second_elapsed = started.elapsed();
+    let drained = r.mgr.shutdown(Duration::from_millis(100));
+
+    assert_eq!(s(&first, "error_code"), "DRAIN_STALLED", "{}", j(&first));
+    assert!(first_elapsed >= Duration::from_millis(2500), "首次 release 等到首次期限：{first_elapsed:?}");
+    assert_eq!(s(&second, "error_code"), "DRAIN_STALLED", "{}", j(&second));
+    assert!(second_elapsed < Duration::from_millis(1000), "期限已過的 release 立即回：{second_elapsed:?}");
+    assert!(
+        drained
+            .iter()
+            .any(|(target, ok)| target == &format!("attach:{WP510_PLACEHOLDER_BY_ID}") && !ok),
+        "shutdown 未排空：{drained:?}"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(dev.open_attempts(), attempts, "不重開");
+    assert_eq!(dev.tx_len(), tx_before, "零 TX");
+}
+
+/// P8-14fe592-1 共用前置（設計第 5 版 §1.4）：① 開埠工作已取得交接 handle、停在 post-take ② `session.bind t:COM3 →
+/// 空閒 by_id` ③ 3 s 後 bind 回 RECOV{true, g, RECOVERING}（FakeClock 不推進：BindWait 由 RPC 執行緒的實時通知收尾，
+/// SPEC-GAP 2）④ 放行 post-take：adopt 提交點看到取消，關閉而不接手（不啟動 IoWorker、沒有登入 TX）；關閉停在暫停點；
+/// is_open true、open_attempts 不變。回傳 (rig, 裝置, 開埠次數, TX 長度, 關閉次數)。
+fn wp510r_r3_p8_14fe592_commit_cancel_closing() -> (Arc<ServiceRig>, FakeDevice, usize, usize, usize) {
+    let r = Arc::new(wp510_b_placeholder_rig());
+    let dev = r.device(WP510_REAL_G).clone();
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (go_tx, go_rx) = crossbeam_channel::bounded::<()>(1);
+    r.mgr.set_open_bridge_post_take_hook_for_test(Box::new(move || {
+        let _ = entered_tx.send(());
+        let _ = go_rx.recv_timeout(Duration::from_secs(20));
+    }));
+    let attached = r.call(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    assert_eq!(attached.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&attached));
+    let entered = entered_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+    let taken = r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID);
+    let attempts = dev.open_attempts();
+    let tx_before = dev.tx_len();
+    let closes_before = dev.close_count();
+    let started = std::time::Instant::now();
+    let bind = r.call(
+        "session.bind",
+        &format!(r#"{{"selector":"t:COM3","device_by_id":"{WP510_FREE_BY_ID}"}}"#),
+    );
+    let bind_elapsed = started.elapsed();
+    let g = r.session("t:COM3").and_then(|s| s.get("bridge_generation").cloned());
+    dev.pause_next_close();
+    let _ = go_tx.send(());
+    let paused = dev.wait_paused(Duration::from_secs(5));
+    if !paused {
+        dev.release_pause();
+    }
+    assert!(entered, "開埠工作應停在 post-take");
+    assert!(
+        taken.as_ref().is_some_and(|c| matches!(c.phase, CustodyPhaseSnapshot::Taken { .. })),
+        "post-take：紀錄為 Taken{{OpenJob}}：{taken:?}"
+    );
+    assert_eq!(s(&bind, "error_code"), "SESSION_RECOVERING", "{}", j(&bind));
+    assert_eq!(bind.get("drain_stalled"), Some(&PyValue::Bool(true)), "{}", j(&bind));
+    assert_eq!(bind.get("drain_timeout_epoch").cloned(), g, "{}", j(&bind));
+    assert_eq!(s(&sub(&bind, "session"), "state"), "RECOVERING", "{}", j(&bind));
+    assert!(
+        bind_elapsed >= Duration::from_millis(2500) && bind_elapsed < Duration::from_secs(5),
+        "bind 等 BindWait 期限（實時）：{bind_elapsed:?}"
+    );
+    assert!(paused, "adopt 提交點看到取消後的關閉應停在暫停點");
+    let closing = r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).expect("關閉中的帳本紀錄");
+    assert!(
+        matches!(closing.phase, CustodyPhaseSnapshot::Closing { .. }),
+        "adopt 提交點看到取消：關閉而不接手（不轉 Bridged）：{closing:?}"
+    );
+    assert!(dev.is_open(), "前置：handle 尚未關閉");
+    assert_eq!(dev.open_attempts(), attempts, "前置：沿用交接 handle，未另開");
+    (r, dev, attempts, tx_before, closes_before)
+}
+
+/// P8-14fe592-1(a)：⑤ 關閉暫停時 `device.release t:COM3`：回條前不回覆、不轉 RELEASED、不落盤；關閉成功後回 OK，
+/// RELEASED 並落盤，close 加 1，零 TX。
+#[test]
+fn wp510r_r3_rpc_p8_14fe592_commit_cancel_release_close_ok() {
+    let (r, dev, attempts, tx_before, closes_before) = wp510r_r3_p8_14fe592_commit_cancel_closing();
+    let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+    let release_rig = Arc::clone(&r);
+    let release = std::thread::spawn(move || {
+        let _ = reply_tx.send(release_rig.call("device.release", r#"{"selector":"t:COM3"}"#));
+    });
+    let early = reply_rx.recv_timeout(Duration::from_millis(500)).ok();
+    let state_mid = r.session("t:COM3").map(|session| s(&session, "state").to_string());
+    let persisted_mid = wp510_review10_state_has_released_by_id(&r, WP510_PLACEHOLDER_BY_ID);
+    dev.release_pause();
+    let released = early.or_else(|| reply_rx.recv_timeout(Duration::from_secs(10)).ok());
+    release.join().expect("release thread 不應 panic");
+
+    let released = released.expect("關閉後 release 應回覆");
+    assert_eq!(state_mid.as_deref(), Some("RECOVERING"), "回條前不轉 RELEASED");
+    assert!(!persisted_mid, "回條前不落盤");
+    assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&released));
+    assert_eq!(s(&sub(&released, "session"), "state"), "RELEASED", "{}", j(&released));
+    assert!(wp510_review10_state_has_released_by_id(&r, WP510_PLACEHOLDER_BY_ID));
+    assert_eq!(dev.close_count(), closes_before + 1);
+    assert_eq!(dev.open_attempts(), attempts);
+    assert_eq!(dev.tx_len(), tx_before, "零 TX（沒有 IoWorker、沒有登入 TX）");
+}
+
+/// P8-14fe592-1(b)：同 (a)，關閉回 closed:false：收到失敗回條時不提前回覆；release 在首次期限（⑤ 加 3 s）回
+/// DRAIN_STALLED（T-1），drain 欄位在回覆時才設為 true/g；B3 進集合；期限已過的 release 立即回 DRAIN_STALLED；零 TX。
+#[test]
+fn wp510r_r3_rpc_p8_14fe592_commit_cancel_release_close_failure_t1() {
+    let (r, dev, attempts, tx_before, _) = wp510r_r3_p8_14fe592_commit_cancel_closing();
+    dev.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
+    let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+    let release_rig = Arc::clone(&r);
+    let release = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let reply = release_rig.call("device.release", r#"{"selector":"t:COM3"}"#);
+        let _ = reply_tx.send((reply, started.elapsed()));
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    let reset = r.session("t:COM3").expect("t:COM3 session");
+    dev.release_pause();
+    let early = reply_rx.recv_timeout(Duration::from_millis(1000)).ok();
+    let (stalled, elapsed) = early
+        .clone()
+        .or_else(|| reply_rx.recv_timeout(Duration::from_secs(10)).ok())
+        .expect("release 應於首次期限回覆");
+    release.join().expect("release thread 不應 panic");
+    let started = std::time::Instant::now();
+    let again = r.call("device.release", r#"{"selector":"t:COM3"}"#);
+    let again_elapsed = started.elapsed();
+
+    assert_eq!(reset.get("drain_stalled"), Some(&PyValue::Bool(false)), "首次 release 重設 drain：{}", j(&reset));
+    assert!(early.is_none(), "收到失敗回條時不提前回覆（T-1）");
+    assert!(elapsed >= Duration::from_millis(2500), "首次期限回覆：{elapsed:?}");
+    assert_eq!(s(&stalled, "error_code"), "DRAIN_STALLED", "{}", j(&stalled));
+    assert_eq!(stalled.get("drain_stalled"), Some(&PyValue::Bool(true)));
+    let g = r.session("t:COM3").and_then(|s| s.get("bridge_generation").cloned());
+    assert_eq!(stalled.get("drain_timeout_epoch").cloned(), g);
+    assert!(r.mgr.unconfirmed_close_for_test(WP510_PLACEHOLDER_BY_ID), "B3 進集合");
+    assert_eq!(s(&again, "error_code"), "DRAIN_STALLED", "{}", j(&again));
+    assert!(again_elapsed < Duration::from_millis(1000), "期限已過的 release 立即回：{again_elapsed:?}");
+    assert_eq!(dev.open_attempts(), attempts);
+    assert_eq!(dev.tx_len(), tx_before, "零 TX");
+}

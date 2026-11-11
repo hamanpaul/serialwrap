@@ -184,7 +184,7 @@ fn probe_label(item: &MailboxItem) -> Option<&'static str> {
     match item {
         MailboxItem::Data(_) => None,
         MailboxItem::Control(ControlEvent::Request { req, .. }) => Some(match req {
-            SessionRequest::Release { .. } => "Release",
+            SessionRequest::Release { .. } | SessionRequest::ReleaseWithAck { .. } => "Release",
             SessionRequest::CancelQueued { .. } => "CancelQueued",
             _ => "Request",
         }),
@@ -221,7 +221,10 @@ impl ActorHandle {
     pub fn request(&self, req: SessionRequest, timeout: Duration) -> Result<PyDict, PyErr> {
         let deadline = Instant::now() + timeout;
         let (reply, rx) = crossbeam_channel::bounded(1);
-        let sender = if matches!(&req, SessionRequest::Release { .. }) {
+        let sender = if matches!(
+            &req,
+            SessionRequest::Release { .. } | SessionRequest::ReleaseWithAck { .. }
+        ) {
             &self.safety
         } else {
             &self.control
@@ -253,20 +256,24 @@ impl ActorHandle {
 }
 
 impl ActorHandle {
-    /// 同 [`ActorHandle::request`]，但 `notice_at`（實時）到而仍未回覆時，於 safety lane 補送一次 `notice`（不等其回覆、
-    /// lane 滿則略過），之後繼續等待原請求的回覆直到 `timeout`。供 release 的首次期限通知使用
-    /// （`SessionRequest::ReleaseDeadlineElapsed`；Python 以實時等待作業 `done` 至期限，
-    /// `origin/main:sw_core/session_manager.py:3188-3204`）。
-    pub fn request_with_notice(
+    /// 同 [`ActorHandle::request`]，另附期限確認通道（編排者 2026-11-11 SPEC-GAP 2 裁決）：actor 受理 release／bind
+    /// 等待時以 `WaitAck` 告知被等待對象的身分與首次期限（實時）；期限到仍未回覆時，於 safety lane 補送一次帶同一身分的
+    /// 通知（`ReleaseDeadlineElapsed`／`BindDeadlineElapsed`；不等其回覆、lane 滿則略過，actor 自己的期限計時器仍在），
+    /// 之後繼續等待原請求的回覆直到 `timeout`。Python 的 release／bind 由 RPC 執行緒以實時等待期限
+    /// （`origin/main:sw_core/session_manager.py:3117-3124`、`:3192-3204`、`:3695-3710`）。
+    pub fn request_with_ack_notice(
         &self,
-        req: SessionRequest,
+        build: impl FnOnce(Sender<crate::mailbox::WaitAck>) -> SessionRequest,
         timeout: Duration,
-        notice_at: Instant,
-        notice: SessionRequest,
     ) -> Result<PyDict, PyErr> {
         let deadline = Instant::now() + timeout;
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        let req = build(ack_tx);
         let (reply, rx) = crossbeam_channel::bounded(1);
-        let sender = if matches!(&req, SessionRequest::Release { .. }) {
+        let sender = if matches!(
+            &req,
+            SessionRequest::Release { .. } | SessionRequest::ReleaseWithAck { .. }
+        ) {
             &self.safety
         } else {
             &self.control
@@ -280,18 +287,48 @@ impl ActorHandle {
                 return Err(PyErr::value_error("session actor stopped"));
             }
         }
-        if notice_at < deadline {
-            match rx.recv_timeout(notice_at.saturating_duration_since(Instant::now())) {
-                Ok(result) => return result,
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                    return Err(self.disconnected_error());
+        // 先等回覆或期限確認（actor 未建立等待即不送確認、處理完請求時丟棄通道）。
+        let mut ack = None;
+        let mut ack_open = true;
+        while ack_open {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            crossbeam_channel::select! {
+                recv(rx) -> result => {
+                    return match result {
+                        Ok(result) => result,
+                        Err(_) => Err(self.disconnected_error()),
+                    };
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    let (notice_reply, _notice_rx) = crossbeam_channel::bounded(1);
-                    let _ = self.safety.try_send(ControlEvent::Request {
-                        req: notice,
-                        reply: notice_reply,
-                    });
+                recv(ack_rx) -> received => {
+                    ack = received.ok();
+                    ack_open = false;
+                }
+                default(remaining) => return Err(PyErr::value_error("internal timeout")),
+            }
+        }
+        if let Some(ack) = ack {
+            let (notice_at, notice) = match ack {
+                crate::mailbox::WaitAck::Release { stop_id, deadline } => (
+                    deadline,
+                    SessionRequest::ReleaseDeadlineElapsed { stop_id, deadline },
+                ),
+                crate::mailbox::WaitAck::Bind { id, deadline } => {
+                    (deadline, SessionRequest::BindDeadlineElapsed { id })
+                }
+            };
+            if notice_at < deadline {
+                match rx.recv_timeout(notice_at.saturating_duration_since(Instant::now())) {
+                    Ok(result) => return result,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        return Err(self.disconnected_error());
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        let (notice_reply, _notice_rx) = crossbeam_channel::bounded(1);
+                        let _ = self.safety.try_send(ControlEvent::Request {
+                            req: notice,
+                            reply: notice_reply,
+                        });
+                    }
                 }
             }
         }
@@ -660,6 +697,8 @@ fn dispatch(
         MailboxItem::Control(ControlEvent::FlashProbeReleased { .. }) => (None, "FlashProbeReleased"),
         MailboxItem::Control(ControlEvent::FlashSyncMatched { .. }) => (None, "FlashSyncMatched"),
         MailboxItem::Control(ControlEvent::FlashHolderGone { .. }) => (None, "FlashHolderGone"),
+        MailboxItem::Control(ControlEvent::CustodyClaimed { .. }) => (None, "CustodyClaimed"),
+        MailboxItem::Control(ControlEvent::CustodyTerminal { .. }) => (None, "CustodyTerminal"),
         #[cfg(feature = "test-fakes")]
         MailboxItem::Control(ControlEvent::ArmPanic { .. }) => (None, "ArmPanic"),
         MailboxItem::Data(_) => (None, "Data"),

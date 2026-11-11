@@ -272,6 +272,8 @@ fn mailbox_types(ev: DataEvent, reply: Reply, ob: OpenedBridge, of: OpenFailure,
             let _: Box<OpenFailure> = inner;
         }
         OpenFailure::CloseBlocked => {}
+        // S2-PAR-wp510r R3 新增：開埠工作在 adopt 提交點看到取消、不接手（設計 §3.1.4 W3 → W3′）。
+        OpenFailure::Cancelled => {}
     }
     let _: MailboxItem = item;
     let _: ControlEvent = ctl;

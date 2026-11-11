@@ -5085,3 +5085,55 @@ fn test_placeholder_attach_bridge_opened_send_failure_closed_settles() {
     assert!(c.is_none(), "關閉成功後帳本紀錄須被結算移除，實際為：{c:?}");
     assert!(!m.mgr.unconfirmed_close_for_test(BY_ID), "關閉成功不得進入未確認集合");
 }
+
+/// WP5-1（設計第 5 版 §1.4；S2-PAR-wp510r 第 8 項）：佔位交接後 `tpl-a:COM3` 已建立（出生即接管，紀錄 `Held{Session}`），
+/// 開埠工作停在 pre-take 時 shutdown，關閉回 closed:false：stderr 一筆含 by_id 與錯誤的告警、`CloseFailed`、B3 進未確認
+/// 集合、shutdown 報告未排空、IoWorker 未啟動、零 TX（Python `:5647-5704`、`:1187`、`:5701`、`:4322-4332`、`:1228-1239`）。
+#[test]
+fn wp510r_r3_wp5_1_shutdown_pre_take_close_failure_warns() {
+    const SID: &str = "gone-template:COM3";
+    const BY_ID: &str = "/s/by-id/usb-G";
+    const REAL: &str = "/dev/ttyG";
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    let device = m.device(REAL);
+    m.mgr.update_devices(&m.snapshot());
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (go_tx, go_rx) = crossbeam_channel::bounded::<()>(1);
+    m.mgr.set_open_bridge_pre_take_hook_for_test(Box::new(move || {
+        let _ = entered_tx.send(());
+        let _ = go_rx.recv_timeout(Duration::from_secs(10));
+    }));
+    let attached = rpc(m.mgr.attach_released_placeholder(&sid, false));
+    assert!(is_ok(&attached), "{attached:?}");
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("正式 session 的開埠工作應停在 pre-take");
+    let held = m.mgr.custody_for_test(BY_ID).expect("出生即接管的帳本紀錄");
+    assert_eq!(held.phase, CustodyPhaseSnapshot::Held, "{held:?}");
+    let tx_before = device.tx_len();
+    device.fail_close(sw_pal::traits::PalError::io(5, "[Errno 5] Input/output error"));
+    let drained = m.mgr.shutdown(Duration::from_millis(1500));
+    let _ = go_tx.send(());
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert!(
+        drained.iter().any(|(target, ok)| target == &format!("attach:{BY_ID}") && !ok),
+        "{drained:?}"
+    );
+    let custody = m.mgr.custody_for_test(BY_ID).expect("帳本紀錄保留");
+    assert!(matches!(custody.phase, CustodyPhaseSnapshot::CloseFailed { .. }), "{custody:?}");
+    assert!(m.mgr.unconfirmed_close_for_test(BY_ID));
+    let warnings = m.warnings();
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|w| w.contains(&format!("by_id={BY_ID}")) && w.contains("Input/output error"))
+            .count(),
+        1,
+        "關閉失敗恰好一筆含 by_id 與錯誤的告警：{warnings:?}"
+    );
+    assert!(device.is_open(), "closed:false 表示 handle 仍開啟");
+    assert_eq!(device.open_count(), 1, "IoWorker 未啟動、不重開");
+    assert_eq!(device.tx_len(), tx_before, "零 TX");
+}

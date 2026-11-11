@@ -1769,10 +1769,12 @@ fn test_parked_continuation_bind_claims_same_token_and_settles_on_release_close(
     );
     assert!(dev.is_open());
 
-    // release 的關閉者（`spawn_handoff_closer` → `close_claimed_handoff`）確認關閉後、收尾作業前暫停。
+    // release 的關閉者確認關閉後、收尾前暫停。S2-PAR-wp510r R3：交接列與 manager 端的 release 等待由帳本紀錄與 actor 的
+    // `ClaimForStop` 取代，關閉者為帳本的關閉工作者（`spawn_custody_closer` → `finish_custody_close`），暫停點換成其
+    // 「結算後、通知 actor（`CustodyTerminal`）前」（H 類：只換觸發手段與內部查詢，斷言不變）。
     let (fin_entered_tx, fin_entered_rx) = crossbeam_channel::bounded(1);
     let (fin_go_tx, fin_go_rx) = crossbeam_channel::bounded::<()>(1);
-    m.mgr.set_finish_attach_op_pre_lock_hook_for_test(
+    m.mgr.set_custody_close_pre_notify_hook_for_test(
         DR7_BY_ID,
         Box::new(move || {
             let _ = fin_entered_tx.send(());
@@ -1795,9 +1797,10 @@ fn test_parked_continuation_bind_claims_same_token_and_settles_on_release_close(
         .recv_timeout(Duration::from_secs(10))
         .expect("release 的關閉者應在確認關閉後、收尾關閉中作業前暫停");
     assert!(!release.is_finished(), "release 仍在等待關閉中作業收尾，route 的全域結算尚未執行");
-    assert!(
-        m.mgr.has_inflight_attach_for_test(DR7_BY_ID),
-        "關閉中作業仍在在途表（release 等待中）"
+    assert_eq!(
+        m.mgr.custody_awaits_for_test(&full_sid),
+        vec![token],
+        "關閉中作業仍在在途表（release 等待中）：actor 仍在等該紀錄的關閉終態"
     );
     assert_eq!(dev.close_count(), 1, "關閉者已關閉交給 session 的 handle");
     assert!(
