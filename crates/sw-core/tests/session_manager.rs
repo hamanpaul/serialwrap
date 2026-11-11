@@ -3545,6 +3545,8 @@ fn unresolvable_pin_falls_through() {
 fn attach_finish_respawns_when_state_requires() {
     // #50：開啟途中裝置改指（BridgeOpened 為舊路徑）→ 舊 worker 交 executor 退休 drain，且因 session 仍需 attach，
     // actor 以目前 real_path 再送一次 OpenBridge（Python `_spawn_attach` 收尾自動再 spawn）。對外狀態維持 ATTACHING。
+    // 擁有者 2026-11-11 裁決（SPEC-GAP 1，列入 D5 的 S 類）：單次在途（設計 DR-8；規格 §5.2.4）下，新路徑的
+    // OpenBridge 改在舊路徑回條（handle_closed:true）到了才送；回條前不得送出。其他斷言不變。
     let mut h = CoreHarness::new(SHELL_PROFILE);
     let first = h.feed(sw_core::mailbox::ControlEvent::DeviceAttached {
         by_id: DEVICE_BY_ID.to_string(),
@@ -3569,8 +3571,14 @@ fn attach_finish_respawns_when_state_requires() {
         "舊路徑的 worker 須退休 drain"
     );
     assert!(
+        !effects.iter().any(|e| matches!(e, sw_core::session_core::Effect::OpenBridge { .. })),
+        "單次在途：舊路徑回條前不得送出新路徑的 OpenBridge"
+    );
+    let (old_epoch, old_stop) = h.pending_stop();
+    let effects = h.receipt(old_epoch, old_stop).handle_closed(true).feed();
+    assert!(
         effects.iter().any(|e| matches!(e, sw_core::session_core::Effect::OpenBridge { dev, .. } if dev.0 == "/fake/tty-new")),
-        "仍需 attach → 以新路徑再送 OpenBridge"
+        "仍需 attach → 舊路徑回條（handle_closed:true）到了才以新路徑再送 OpenBridge"
     );
     assert_eq!(s_of(&h.public(), "state").as_deref(), Some("ATTACHING"));
 }

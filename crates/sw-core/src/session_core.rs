@@ -496,6 +496,12 @@ pub struct SessionCore {
     /// clear 收尾後等 manager 再解析（Python `_spawn_attach` → `_reresolve_profile_on_reattach`）再送
     /// `DeviceAttached`：期間 state 為 ATTACHING、無開埠（審查 F61／F62）。
     reattach_pending: bool,
+    /// S2-PAR-wp510r R3 單次在途（設計 DR-8；擁有者 2026-11-11 SPEC-GAP 1 裁決）：開埠途中裝置改指、舊路徑開埠成功而
+    /// 退休時設定；舊 bridge 的關閉回條（`handle_closed:true`）到了、且沒有停止待決時，才以目前路徑重開
+    /// （`retired_drain_receipt`）。回條前不得送新路徑的 `OpenBridge`（規格 §5.2.4「收到並驗證回條前不得另開同一受管
+    /// 端點」；Python attach worker 同步關閉舊 handle、結束後才重試，by_id 在 `_draining_by_ids` 時不重試，
+    /// `origin/main:sw_core/session_manager.py:4126-4145`）。任何停止開始即清除（release 在途不重開，DR-8 d）。
+    reopen_after_retired: bool,
     open_generation: u64,
     known_real_path: Option<String>,
     device_present: bool,
@@ -781,6 +787,7 @@ impl SessionCore {
             open_real_path: None,
             revoked_handoffs: Vec::new(),
             reattach_pending: false,
+            reopen_after_retired: false,
             open_generation: 0,
             known_real_path: None,
             device_present: false,
@@ -1547,6 +1554,14 @@ impl SessionCore {
     /// Two-Phase Drain 第一階段的發起點（Task 12；SC-04、arch §5.5）：`kind` 與 `waiter` 凍結簽章（P6 07 計畫依此呼叫）。
     pub fn begin_stop(&mut self, kind: StopKind, waiter: Option<Reply>, now: Mono) -> Effects {
         let mut effects = Effects(Vec::new());
+        // 單次在途（DR-8）：ATTACHING 只是在等改指時退休的舊 bridge 回條（沒有開埠在途、沒有落盤中的 attach）。
+        let single_flight_wait = self.reopen_after_retired
+            && self.open_real_path.is_none()
+            && self.pending_attach.is_none()
+            && !self.reattach_pending
+            && !matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }));
+        // 單次在途（DR-8 d）：停止待決時，舊路徑回條到達也不重開。
+        self.reopen_after_retired = false;
         // P8 Task 8（SC-32）：停止是 flash 結束路徑之一，無條件清 Fence／Ownership 的 flash_mode。
         self.flash_end_for_stop();
         // 再探進行中被 drain 搶進：等待者照 Python `attach_session` 的 pending drain 分支回 SESSION_RECOVERING。
@@ -1607,7 +1622,10 @@ impl SessionCore {
         // P6 增補 #11（07 Task 6 Step 3 第 7 點）：回放撤銷、BC-02 失效、ownership 重設與 retained human。
         self.human_phase1(&kind, &mut effects.0);
         let Some(epoch) = self.generations.conn_epoch else {
-            if self.state == SessionState::Attaching
+            // 單次在途的等待（`single_flight_wait`）不是開埠在途：clear、拔除、改指等停止照無 bridge 收尾，不等退休
+            // bridge 的回條（Python clear／`update_devices` 不等被取消的 attach 作業，`origin/main:sw_core/session_manager.py:3058-3082`、
+            // `:4031-4063`）；release／shutdown 仍依下方 retired_drains 條件等待（DR-8 d、DR-4 b）。
+            if self.state == SessionState::Attaching && !single_flight_wait
                 || self.open_real_path.is_some()
                 || matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }))
                 // 退休 bridge 的 handle 尚未確認關閉（retired_drains）：release 等其回條（`retired_drain_receipt`），不得以
@@ -2956,6 +2974,14 @@ impl SessionCore {
         }
         self.reattach_pending = false;
         self.set_last_error(None, None);
+        if self.generations.conn_epoch.is_none() && !self.retired_drains.is_empty() {
+            // 單次在途（設計 DR-8；規格 §5.2.4）：退休 bridge 的 handle 尚未確認關閉，同一 session 不另開第二個 handle；
+            // 回條（handle_closed:true）到了才以目前路徑開（`retired_drain_receipt`）。Python 的 `_spawn_attach` 遇同
+            // by_id 在途作業即去重、由該作業結束後的重試開埠（`origin/main:sw_core/session_manager.py:4114`、`:4126-4145`）。
+            self.set_state(SessionState::Attaching, now);
+            self.reopen_after_retired = true;
+            return Vec::new();
+        }
         self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
         self.open_generation = self.generations.fsm_gen;
         self.open_real_path = Some(real_path.to_string());
@@ -3008,13 +3034,12 @@ impl SessionCore {
                         && !path_matches
                         && !self.shutdown_requested
                     {
-                        // #50（P5-T16）：attach 收尾時仍需 attach（Python `_spawn_attach` finally 再 spawn）：
-                        // 裝置於開啟途中改指 → 以目前 known_real_path 再送一次 OpenBridge；裝置已不在則 DETACHED。
-                        // 設計 DR-8 的單次在途（舊回條後才重開）與凍結節點
-                        // `session_manager::attach_finish_respawns_when_state_requires`（不在設計 §6 改寫表內）衝突，
-                        // 依 D5「表外凍結節點不得改斷言」維持現行時點，列 SPEC-GAP 待裁決。
+                        // #50（P5-T16）：attach 收尾時仍需 attach（Python `_spawn_attach` finally 再 spawn）。單次在途
+                        // （設計 DR-8 a／b；擁有者 2026-11-11 SPEC-GAP 1 裁決）：舊路徑的 bridge 已退休排空，等它的關閉回條
+                        // （`handle_closed:true`）到了才以目前 known_real_path 重開（`retired_drain_receipt`）；回條前不送
+                        // 新路徑的 `OpenBridge`，同一 session 任何時刻最多一個 handle。
                         self.open_real_path = None;
-                        effects.extend(self.reopen_known_device(SessionState::Attaching, now));
+                        self.reopen_after_retired = true;
                     } else if self.state != SessionState::Attaching
                         && self.open_real_path.as_deref() == Some(opened_path.as_str())
                     {
@@ -3293,6 +3318,9 @@ impl SessionCore {
             }
             entry.receipt = RetiredReceipt::Failed;
             self.deps.unconfirmed_closes.insert(&entry.by_id);
+            // 單次在途：舊 handle 關閉未確認時不重開（Python by_id 留在 `_draining_by_ids`，attach worker finally 不再
+            // 重試，`origin/main:sw_core/session_manager.py:4126-4145`），session 停在 ATTACHING。
+            self.reopen_after_retired = false;
             if let Some(error) = receipt.close_error.as_ref() {
                 effects.push(Effect::Warn(format!(
                     "WARNING session {} 退休 bridge 的 UART handle 關閉失敗：{error:?}",
@@ -3322,6 +3350,18 @@ impl SessionCore {
                 effects.extend(self.finish_pending_open_stop(pending, now));
             }
             return effects;
+        }
+        // 單次在途（DR-8 b）：改指時退休的舊路徑 bridge 確認關閉後，才以目前路徑重開；期間有停止（release 等）或已
+        // 離開 ATTACHING（bind 改綁等）者不重開。
+        if std::mem::take(&mut self.reopen_after_retired)
+            && self.state == SessionState::Attaching
+            && self.stop.is_none()
+            && self.generations.conn_epoch.is_none()
+            && self.open_real_path.is_none()
+            && self.pending_attach.is_none()
+            && !self.shutdown_requested
+        {
+            effects.extend(self.reopen_known_device(SessionState::Attaching, now));
         }
         effects
     }

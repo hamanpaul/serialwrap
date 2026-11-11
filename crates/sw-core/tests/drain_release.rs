@@ -3103,6 +3103,10 @@ fn wp510_review12_release_after_retired_close_failure_reports_drain_stalled() {
 
 /// 開埠途中裝置改指（#50）：舊路徑的開埠結果不接手而退休，改以新路徑重開。release 等待新開埠時，新開埠即使失敗，
 /// 也要等退休 bridge 的 handle 確認關閉才完成 RELEASED（開埠終態與 handle 關閉終態分開追蹤）。
+///
+/// 設計第 3 版 §6 #5（S，含前置斷言反轉；擁有者 2026-11-10 D5 核准）：單次在途下，舊路徑 BridgeOpened 時不再發出新路徑
+/// OpenBridge（前置斷言反轉為「舊回條前不得發出」）；「新開埠失敗」一步不可達而刪除，改為 release 在舊回條前加入、
+/// 舊回條後不重開、RELEASED。退休回條前不回覆、RECOVERING、未落盤；回條後 ok、RELEASED、已落盤等斷言保留。
 #[test]
 fn wp510_review12_release_after_rebound_open_failure_waits_retired_close() {
     const NEW_PATH: &str = "/fake/tty-A2";
@@ -3121,25 +3125,26 @@ fn wp510_review12_release_after_rebound_open_failure_waits_retired_close() {
         result: Ok(opened),
     });
     assert!(
-        effects.iter().any(|effect| matches!(
-            effect,
-            Effect::OpenBridge { dev, .. } if dev.0 == NEW_PATH
-        )),
-        "前置：改以新路徑重開"
+        !effects.iter().any(|effect| matches!(effect, Effect::OpenBridge { .. })),
+        "前置：舊路徑回條前不得發出新路徑 OpenBridge（單次在途）"
     );
     let (epoch, stop) = h.pending_stop();
-    let (rx, _) = h.rpc_deferred(release());
-    h.feed(ControlEvent::BridgeOpened {
-        epoch_hint: 0,
-        result: Err(OpenFailure::Other(PalError::io(2, "No such file"))),
-    });
+    let (rx, effects) = h.rpc_deferred(release());
+    assert!(
+        !effects.iter().any(|effect| matches!(effect, Effect::OpenBridge { .. })),
+        "release 在舊回條前加入：不得開埠"
+    );
     assert!(
         rx.try_recv().is_err(),
         "退休 bridge 的 handle 關閉確認前不得回覆 release"
     );
     assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
     assert!(!h.state_store.last_released().contains_key("t:COM0"));
-    h.receipt(epoch, stop).handle_closed(true).feed();
+    let effects = h.receipt(epoch, stop).handle_closed(true).feed();
+    assert!(
+        !effects.iter().any(|effect| matches!(effect, Effect::OpenBridge { .. })),
+        "舊回條後 release 在途：不重開"
+    );
     let response = rx.try_recv().expect("確認關閉後應回覆").unwrap();
     assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
     assert_eq!(h.public()["state"], PyValue::from("RELEASED"));
@@ -3148,6 +3153,10 @@ fn wp510_review12_release_after_rebound_open_failure_waits_retired_close() {
 
 /// 同上，但新開埠成功並由 release 的排空接手：新 bridge 確認關閉後，仍要等退休 bridge 的 handle 確認關閉才完成
 /// RELEASED。
+///
+/// 設計第 3 版 §6 #6（S；擁有者 2026-11-10 D5 核准）：「新舊 bridge 同時存在」在單次在途下不可達，改為依序存在：
+/// 舊路徑 Ok → 舊回條（handle_closed:true）→ 才發新路徑 OpenBridge → release → 新路徑 Ok → 新回條。保留 RECOVERING、
+/// 未落盤、RELEASED、已落盤，以及多回條配對：新回條前不回覆；重送一份舊 epoch 的回條不完成新的等待。
 #[test]
 fn wp510_review12_release_after_rebound_open_success_waits_retired_close() {
     const NEW_PATH: &str = "/fake/tty-A2";
@@ -3166,6 +3175,16 @@ fn wp510_review12_release_after_rebound_open_success_waits_retired_close() {
         result: Ok(opened),
     });
     let (retired_epoch, retired_stop) = h.pending_stop();
+    let effects = h
+        .receipt(retired_epoch, retired_stop)
+        .handle_closed(true)
+        .feed();
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::OpenBridge { dev, .. } if dev.0 == NEW_PATH)),
+        "前置：舊回條（handle_closed:true）後才發新路徑 OpenBridge"
+    );
     let (rx, _) = h.rpc_deferred(release());
     let opened = h.opened_bridge(NEW_PATH);
     let new_epoch = opened.epoch;
@@ -3180,16 +3199,19 @@ fn wp510_review12_release_after_rebound_open_success_waits_retired_close() {
             _ => None,
         })
         .expect("前置：新 bridge 由 release 的排空接手");
-    h.receipt(new_epoch, new_stop).handle_closed(true).feed();
-    assert!(
-        rx.try_recv().is_err(),
-        "退休 bridge 的 handle 關閉確認前不得回覆 release"
-    );
+    assert!(rx.try_recv().is_err(), "新 bridge 的回條前不得回覆 release");
     assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
     assert!(!h.state_store.last_released().contains_key("t:COM0"));
     h.receipt(retired_epoch, retired_stop)
         .handle_closed(true)
         .feed();
+    assert!(
+        rx.try_recv().is_err(),
+        "重送一份舊 epoch 的回條不得完成新的等待"
+    );
+    assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
+    assert!(!h.state_store.last_released().contains_key("t:COM0"));
+    h.receipt(new_epoch, new_stop).handle_closed(true).feed();
     let response = rx.try_recv().expect("確認關閉後應回覆").unwrap();
     assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
     assert_eq!(h.public()["state"], PyValue::from("RELEASED"));
@@ -3288,6 +3310,84 @@ fn wp510r_rebound_retired(h: &mut CoreHarness) -> (u64, StopId, Vec<Effect>) {
     let (epoch, stop) = h.pending_stop();
     assert_eq!(epoch, retired_epoch, "前置：舊路徑的 bridge 退休並開始排空");
     (epoch, stop, effects)
+}
+
+/// DR-8(a)(b)（擁有者 2026-11-11 SPEC-GAP 1 裁決的單次在途；規格 §5.2.4）：舊路徑開埠成功而退休後，舊回條前不得
+/// 發出新路徑 OpenBridge；舊回條 `handle_closed:true` 之後才以目前路徑重開，任何時刻同一 session 最多一個 handle、零 TX
+/// （Python attach worker 同步關閉舊 handle、結束後才重試，`origin/main:sw_core/session_manager.py:4126-4145`）。
+#[test]
+fn wp510r_r3_dr8_reopen_only_after_retired_receipt() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (epoch, stop, effects) = wp510r_rebound_retired(&mut h);
+    assert!(wp510r_open_bridge_paths(&effects).is_empty(), "DR-8(a)：舊回條前不得發出新路徑 OpenBridge");
+    assert!(
+        !effects.iter().any(|effect| matches!(effect, Effect::StartLogin { .. } | Effect::StartOp { .. })),
+        "零 TX"
+    );
+    assert_eq!(h.public()["state"], PyValue::from("ATTACHING"));
+    // 不配對的回條（同 epoch、不同 stop_id）不得觸發重開。
+    let effects = h.receipt(epoch, StopId(stop.0 + 1000)).handle_closed(true).feed();
+    assert!(wp510r_open_bridge_paths(&effects).is_empty(), "不配對的回條不得觸發重開");
+    let effects = h.receipt(epoch, stop).handle_closed(true).feed();
+    assert_eq!(
+        wp510r_open_bridge_paths(&effects),
+        vec![WP510R_NEW_PATH.to_string()],
+        "DR-8(b)：舊回條 handle_closed:true 之後才以新路徑重開"
+    );
+    // 重送一份舊 epoch 的回條：不得再開第二個 handle。
+    let effects = h.receipt(epoch, stop).handle_closed(true).feed();
+    assert!(wp510r_open_bridge_paths(&effects).is_empty(), "同一 handle 只重開一次");
+    assert_eq!(h.public()["state"], PyValue::from("ATTACHING"));
+}
+
+/// DR-8：舊回條為 `handle_closed:false` 時不重開（Python by_id 留在 `_draining_by_ids`，attach worker finally 不再重試，
+/// `origin/main:sw_core/session_manager.py:4126-4145`）：by_id 登記未確認關閉，session 停在 ATTACHING、零開埠。
+#[test]
+fn wp510r_r3_dr8_retired_close_failure_does_not_reopen() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (epoch, stop, effects) = wp510r_rebound_retired(&mut h);
+    assert!(wp510r_open_bridge_paths(&effects).is_empty(), "舊回條前不得重開");
+    let effects = h.receipt(epoch, stop).handle_closed(false).feed();
+    assert!(wp510r_open_bridge_paths(&effects).is_empty(), "舊 handle 關閉未確認不得重開");
+    assert!(h.unconfirmed.contains(DEVICE_BY_ID));
+    assert_eq!(h.public()["state"], PyValue::from("ATTACHING"));
+}
+
+/// DR-8(d)：舊回條前 release：等到舊回條；release 在途不再重開；RELEASED 並落盤，drain 欄位 false/null（經在途作業收尾
+/// 的路徑兩欄都清，編排者 2026-11-11 SPEC-GAP 3 裁決；Python `_finish_attach_op` 的 release 分支，
+/// `origin/main:sw_core/session_manager.py:4339-4355`）。
+#[test]
+fn wp510r_r3_dr8_release_before_retired_receipt_does_not_reopen() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (epoch, stop, _) = wp510r_rebound_retired(&mut h);
+    let (rx, effects) = h.rpc_deferred(release());
+    assert!(wp510r_open_bridge_paths(&effects).is_empty());
+    assert!(rx.try_recv().is_err(), "舊回條前不得回覆 release");
+    assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
+    let effects = h.receipt(epoch, stop).handle_closed(true).feed();
+    assert!(wp510r_open_bridge_paths(&effects).is_empty(), "release 在途：舊回條後不重開");
+    let response = rx.try_recv().expect("舊回條後應回覆").unwrap();
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
+    let public = h.public();
+    assert_eq!(public["state"], PyValue::from("RELEASED"), "{public:?}");
+    assert_eq!(public["drain_stalled"], PyValue::Bool(false));
+    assert_eq!(public["drain_timeout_epoch"], PyValue::Null);
+    assert!(h.state_store.last_released().contains_key("t:COM0"));
+}
+
+/// DR-8：等待舊路徑回條期間再收到 `DeviceAttached`（裝置再次改指）：不得另開；舊回條後以最新路徑開一次。
+#[test]
+fn wp510r_r3_dr8_device_attached_during_retired_wait_defers_to_latest_path() {
+    const LATEST: &str = "/fake/tty-A3";
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (epoch, stop, _) = wp510r_rebound_retired(&mut h);
+    let effects = h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: LATEST.into(),
+    });
+    assert!(wp510r_open_bridge_paths(&effects).is_empty(), "舊回條前不得另開");
+    let effects = h.receipt(epoch, stop).handle_closed(true).feed();
+    assert_eq!(wp510r_open_bridge_paths(&effects), vec![LATEST.to_string()]);
 }
 
 /// DR-8(c)：新開埠在途時 release，新 bridge 排空回條後才 RELEASED。
@@ -3524,16 +3624,22 @@ fn wp510r_r3_p8_c4913ae_open_in_flight_rebound_release_timeout_converges() {
     assert!(h.state_store.last_released().contains_key("t:COM0"));
 }
 
-/// P8-c4913ae-1（設計 v2 §1.6 的回條順序「新先、舊後」）：開埠途中改指 → 舊路徑開埠成功而退休、以新路徑重開 →
-/// release → 推進超過 3 s 回 DRAIN_STALLED → 新 bridge 開埠成功並由 release 排空 → 新回條成功（仍等 retired drain）
-/// → 舊回條成功。轉移等待對象（自身停止 → retired drain）時不清除 stalled 與 epoch，list 與頂層一致；全部回條成功後
-/// 才 RELEASED 且 false/null；release 進行中不得再開埠（Python release 等作業至期限，`_finish_attach_op` 的 release
-/// 分支收尾清除兩欄，`origin/main:sw_core/session_manager.py:3192-3204`、`:4346-4351`）。
+/// P8-c4913ae-1（設計 v2 §1.6 的回條順序「新先、舊後」）：開埠途中改指 → 舊路徑開埠成功而退休 → release → 推進超過
+/// 3 s 回 DRAIN_STALLED → 舊回條成功。逾時後 list 與頂層一致、轉移等待對象時不清除 stalled 與 epoch；全部回條成功後才
+/// RELEASED 且 false/null；release 進行中不得再開埠（Python release 等作業至期限，`_finish_attach_op` 的 release 分支收尾
+/// 清除兩欄，`origin/main:sw_core/session_manager.py:3192-3204`、`:4346-4351`；編排者 2026-11-11 SPEC-GAP 3 裁決：經在途
+/// 作業收尾的路徑兩欄都清）。
+///
+/// 第 8 項（擁有者 2026-11-11 SPEC-GAP 1 裁決的單次在途）：「新路徑開埠、新回條先到」在單次在途下不可達（舊回條前不發
+/// 新路徑 OpenBridge，release 在途也不重開），改為最接近的可達交錯：release 在等待舊路徑回條時加入，逾時後舊回條到達。
 #[test]
 fn wp510r_r3_p8_c4913ae_new_receipt_first_keeps_stalled_until_retired_receipt() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
     let (old_epoch, old_stop, effects) = wp510r_rebound_retired(&mut h);
-    assert_eq!(wp510r_open_bridge_paths(&effects), vec![WP510R_NEW_PATH.to_string()]);
+    assert!(
+        wp510r_open_bridge_paths(&effects).is_empty(),
+        "前置：單次在途，舊路徑回條前不以新路徑重開"
+    );
     let (rx, effects) = h.rpc_deferred(release());
     assert!(wp510r_open_bridge_paths(&effects).is_empty());
     let effects = h.advance(Duration::from_millis(3500));
@@ -3544,21 +3650,10 @@ fn wp510r_r3_p8_c4913ae_new_receipt_first_keeps_stalled_until_retired_receipt() 
     assert_eq!(h.public()["drain_stalled"], PyValue::Bool(true), "list 與頂層一致");
     assert_eq!(h.public()["drain_timeout_epoch"], stall_epoch);
 
-    let opened = h.opened_bridge(WP510R_NEW_PATH);
-    let new_epoch = opened.epoch;
-    let effects = h.feed(ControlEvent::BridgeOpened {
-        epoch_hint: 0,
-        result: Ok(opened),
-    });
-    assert!(wp510r_open_bridge_paths(&effects).is_empty(), "release 進行中不得再開埠");
-    let (drain_epoch, drain_stop) = h.pending_stop();
-    assert_eq!(drain_epoch, new_epoch);
-    let effects = h.receipt(drain_epoch, drain_stop).handle_closed(true).feed();
-    assert!(wp510r_open_bridge_paths(&effects).is_empty());
     let public = h.public();
     assert_eq!(public["state"], PyValue::from("RECOVERING"), "retired drain 未收斂不得 RELEASED");
-    assert_eq!(public["drain_stalled"], PyValue::Bool(true), "轉移等待對象時不清除 stalled");
-    assert_eq!(public["drain_timeout_epoch"], stall_epoch, "轉移等待對象時不清除 epoch");
+    assert_eq!(public["drain_stalled"], PyValue::Bool(true), "等待中不清除 stalled");
+    assert_eq!(public["drain_timeout_epoch"], stall_epoch, "等待中不清除 epoch");
     assert!(!h.state_store.last_released().contains_key("t:COM0"));
     let again = h.rpc(release()).unwrap();
     session_error(&again, "DRAIN_STALLED");
@@ -3577,50 +3672,69 @@ fn wp510r_r3_p8_c4913ae_new_receipt_first_keeps_stalled_until_retired_receipt() 
 // S2-PAR-wp510r R3 第 2 輪：審查 P8-566d90b-1～4 的回歸。
 // ---------------------------------------------------------------------------
 
-/// 開埠途中改指 → 舊路徑開埠成功而退休、以新路徑重開（DR-8 前置）→ `停止` → 新路徑開埠失敗。回傳退休 bridge 的
-/// `(epoch, stop_id)`；`stop` 由呼叫端在新開埠在途時送出。
+/// 開埠途中改指 → 舊路徑開埠成功而退休（DR-8 前置）→ `停止`。回傳退休 bridge 的 `(epoch, stop_id)`；`stop` 由呼叫端
+/// 在等待舊路徑回條時送出。
+///
+/// 第 8 項（擁有者 2026-11-11 SPEC-GAP 1 裁決的單次在途）：原前置「以新路徑重開 → 新路徑開埠失敗」在單次在途下不可達
+/// （舊回條前不發新路徑 OpenBridge），改為最接近的可達交錯：停止在等待舊路徑回條、沒有開埠在途時到達。
 fn wp510r_rebound_new_open_fails_after(
     h: &mut CoreHarness,
     stop: impl FnOnce(&mut CoreHarness),
 ) -> (u64, StopId) {
     let (epoch, stop_id, effects) = wp510r_rebound_retired(h);
-    assert_eq!(
-        wp510r_open_bridge_paths(&effects),
-        vec![WP510R_NEW_PATH.to_string()],
-        "前置：以新路徑重開"
+    assert!(
+        wp510r_open_bridge_paths(&effects).is_empty(),
+        "前置：單次在途，舊路徑回條前不以新路徑重開"
     );
     stop(h);
-    h.feed(ControlEvent::BridgeOpened {
-        epoch_hint: 0,
-        result: Err(OpenFailure::Other(PalError::io(5, "open failed"))),
-    });
     (epoch, stop_id)
 }
 
-/// P8-566d90b-1：退休 bridge 回條未到時，`session.clear` 等待的新路徑開埠失敗：clear 仍以開埠終態完成（DETACHED／
-/// CLEARED），不得因退休 bridge 而永不回覆；退休 bridge 回條 `handle_closed:false` 之後的 release 依 T-1 等到首次期限
-/// 才回 DRAIN_STALLED（Python clear 不等被取消的 attach 作業，release 找到作業才等 `done` 至期限，
-/// `origin/main:sw_core/session_manager.py:3104-3107`、`:3188-3204`）。
+/// P8-566d90b-1：退休 bridge 回條未到時 `session.clear`：clear 不等退休 bridge 而回覆，不得因退休 bridge 而永不回覆；
+/// 退休 bridge 回條 `handle_closed:false` 之後的 release 依 T-1 等到首次期限才回 DRAIN_STALLED（Python clear 不等被取消
+/// 的 attach 作業，release 找到作業才等 `done` 至期限，`origin/main:sw_core/session_manager.py:3104-3107`、`:3188-3204`）。
+///
+/// 第 8 項（單次在途）：原前置「新路徑開埠在途、clear 等開埠終態、新開埠失敗」不可達，改為 clear 在等待舊路徑回條時到達。
+/// Python `clear_session` 無 bridge 分支以 `_detach_session_locked` 收尾，裝置在線時回覆前即設 ATTACHING＋
+/// `last_error=None` 再 `_spawn_attach`（同 by_id 在途去重，`:3058-3082`、`:4114`），故回覆後為 ATTACHING／null（原斷言
+/// DETACHED／CLEARED 屬不可達路徑的開埠失敗收尾）；舊路徑回條前不重開，回條 `handle_closed:false` 後也不重開。
 #[test]
 fn wp510r_r3_p8_566d90b_clear_completes_when_new_open_fails_with_retired_drain() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
     let (clear_tx, clear_rx) = bounded(1);
     let (epoch, stop) = wp510r_rebound_new_open_fails_after(&mut h, |h| {
-        let (rx, _) = h.rpc_deferred(SessionRequest::Clear);
-        assert!(rx.try_recv().is_err(), "前置：新路徑開埠在途時 clear 等待開埠終態");
+        let (rx, effects) = h.rpc_deferred(SessionRequest::Clear);
+        assert!(
+            wp510r_open_bridge_paths(&effects).is_empty(),
+            "舊路徑回條前 clear 不得開埠"
+        );
+        assert!(
+            effects.iter().any(|effect| matches!(effect, Effect::Reattach { .. })),
+            "clear 收尾交 manager 再解析（Python `_spawn_attach`）"
+        );
         clear_tx.send(rx).unwrap();
     });
     let clear_rx = clear_rx.recv().unwrap();
     let response = clear_rx
         .try_recv()
-        .expect("新路徑開埠失敗後 clear 應回覆")
+        .expect("clear 不等退休 bridge 回條即回覆")
         .unwrap();
     assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
     let public = h.public();
-    assert_eq!(public["state"], PyValue::from("DETACHED"), "{public:?}");
-    assert_eq!(public["last_error"], PyValue::from("CLEARED"), "{public:?}");
+    assert_eq!(public["state"], PyValue::from("ATTACHING"), "{public:?}");
+    assert_eq!(public["last_error"], PyValue::Null, "{public:?}");
+    // manager 再解析後送回 DeviceAttached：退休 bridge 未確認關閉，仍不開埠（單次在途）。
+    let effects = h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: WP510R_NEW_PATH.into(),
+    });
+    assert!(wp510r_open_bridge_paths(&effects).is_empty(), "舊路徑回條前不得開埠");
 
-    h.receipt(epoch, stop).handle_closed(false).feed();
+    let effects = h.receipt(epoch, stop).handle_closed(false).feed();
+    assert!(
+        wp510r_open_bridge_paths(&effects).is_empty(),
+        "舊 handle 關閉未確認：不重開"
+    );
     assert!(h.unconfirmed.contains(DEVICE_BY_ID));
     let (rx, _) = h.rpc_deferred(release());
     assert!(rx.try_recv().is_err(), "期限前不得回覆");
@@ -3634,7 +3748,8 @@ fn wp510r_r3_p8_566d90b_clear_completes_when_new_open_fails_with_retired_drain()
 }
 
 /// P8-566d90b-1（拔除版本）：同上，但新開埠在途時裝置拔除：新開埠失敗即以 DETACHED／DEVICE_REMOVED 收尾，不停在
-/// RECOVERING。
+/// RECOVERING。第 8 項（單次在途）：前置改為拔除在等待舊路徑回條時到達（見 `wp510r_rebound_new_open_fails_after`），
+/// 斷言不變（Python `update_devices` 不等被取消的 attach 作業，`origin/main:sw_core/session_manager.py:4031-4063`）。
 #[test]
 fn wp510r_r3_p8_566d90b_removal_completes_when_new_open_fails_with_retired_drain() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
