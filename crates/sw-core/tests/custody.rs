@@ -1603,17 +1603,21 @@ fn test_dr7_bind_device_online_full_queues_deliverer_and_retries() {
     assert_eq!(m.mgr.delivery_delivered_for_test(&full_sid), 0, "lane 滿期間不得送達");
 
     // 恢復容量前：同一 token 以 C1′ 認領給 COM0 的開埠工作（交接列），不登記新紀錄、不重新開埠。
+    let session_actor = m.mgr.actor_id_for_test(&full_sid).expect("COM0 session ActorId");
     let claimed = m.mgr.custody_for_test(DR7_BY_ID).expect("帳本紀錄");
-    let actor = claimed_actor(&claimed);
     assert_eq!(claimed.token, original_token, "沿用 parked 紀錄的 token");
     assert_eq!(
         claimed.phase,
         CustodyPhaseSnapshot::Taken {
-            taker: CustodyTaker::OpenJob { actor },
+            taker: CustodyTaker::OpenJob { actor: session_actor },
         },
         "parked 續行以同 token 認領，不轉 Closing：{claimed:?}"
     );
-    assert_eq!(claimed.owner, CustodyOwner::Session { actor }, "owner 與認領者是同一 actor");
+    assert_eq!(
+        claimed.owner,
+        CustodyOwner::Session { actor: session_actor },
+        "owner 必須是 COM0 的 session actor"
+    );
     assert!(!m.mgr.has_inflight_attach_for_test(DR7_BY_ID), "parked 作業已由 bind 取走");
     assert_eq!(dev.open_attempts(), open_attempts, "認領原 handle，不重新開埠");
     assert!(dev.is_open());
@@ -1745,20 +1749,20 @@ fn test_parked_continuation_bind_claims_same_token_and_settles_on_release_close(
         .recv_timeout(Duration::from_secs(10))
         .expect("bind 應停在送出 DeviceOnline 之前");
 
+    let session_actor = m.mgr.actor_id_for_test(&full_sid).expect("COM0 session ActorId");
     let claimed = m.mgr.custody_for_test(DR7_BY_ID).expect("帳本紀錄");
-    let actor = claimed_actor(&claimed);
     assert_eq!(claimed.token, token, "同 token 認領");
     assert_eq!(
         claimed.phase,
         CustodyPhaseSnapshot::Taken {
-            taker: CustodyTaker::OpenJob { actor },
+            taker: CustodyTaker::OpenJob { actor: session_actor },
         },
         "handle 交給 COM0 的開埠工作仍在使用，不得標成 Closing：{claimed:?}"
     );
     assert_eq!(
         claimed.owner,
-        CustodyOwner::Session { actor },
-        "owner 為認領的 session"
+        CustodyOwner::Session { actor: session_actor },
+        "owner 必須是 COM0 的 session actor"
     );
     assert!(dev.is_open());
 
@@ -1889,15 +1893,20 @@ fn test_parked_continuation_bind_rebind_away_settles_claimed_close() {
         .recv_timeout(Duration::from_secs(10))
         .expect("bind 應停在送出 DeviceOnline 之前");
 
+    let session_actor = m.mgr.actor_id_for_test(&full_sid).expect("COM0 session ActorId");
     let claimed = m.mgr.custody_for_test(DR7_BY_ID).expect("帳本紀錄");
-    let actor = claimed_actor(&claimed);
     assert_eq!(claimed.token, token, "同 token 認領");
     assert_eq!(
         claimed.phase,
         CustodyPhaseSnapshot::Taken {
-            taker: CustodyTaker::OpenJob { actor },
+            taker: CustodyTaker::OpenJob { actor: session_actor },
         },
         "{claimed:?}"
+    );
+    assert_eq!(
+        claimed.owner,
+        CustodyOwner::Session { actor: session_actor },
+        "owner 必須是 COM0 的 session actor"
     );
     assert!(m.mgr.has_handoff_for_test(DR7_BY_ID), "handle 已放進交接列、等待正式 bridge 接手");
     assert!(dev.is_open());
@@ -2082,13 +2091,6 @@ fn test_parked_continuation_spawn_worker_cancelled_attach_dynamic_settles_taken_
         "取消的偵測不得建立 B3 的 session：{:?}",
         m.com_by_id()
     );
-}
-
-fn claimed_actor(rec: &CustodySnapshot) -> ActorId {
-    match &rec.owner {
-        CustodyOwner::Session { actor } => *actor,
-        other => panic!("owner 應為 Session：{other:?}"),
-    }
 }
 
 #[test]
