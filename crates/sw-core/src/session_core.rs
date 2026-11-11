@@ -439,7 +439,9 @@ pub enum Effect {
     /// S2-PAR-wp510r R5（設計 §3.1.4 W1 第 5 步）：在佔位 actor 執行緒上、manager 鎖內一次完成退休（驗證沒有 stopping 或
     /// 凍結、Entry 仍是本 actor、裝置路徑未變、紀錄未取消 → 移除佔位、設 `pending_com`、紀錄改歸交接 worker），鎖外落盤並
     /// 放行 worker；結果以立即回饋 `RetireResult` 回報。T14 分類：新工作（凍結時 executor 不退休、改關閉）。
-    RetirePlaceholder { token: u64, kind: RetireKind },
+    /// `real_path` 為本次開埠的原路徑：無 handle（OSError）的退休沒有帳本紀錄可對照，executor 以它在鎖內核對裝置未改指
+    /// （審查 P8-a07fdfb-1；Python 的取消檢查與退休在同一鎖區段，`origin/main:sw_core/session_manager.py:3527-3531`）。
+    RetirePlaceholder { token: u64, kind: RetireKind, real_path: String },
     /// S2-PAR-wp510r R5：佔位 attach 沒有退休就結束（開埠失敗、取消、停止、凍結）時丟棄 `PrepareHandoffWorker` 準備的 worker
     /// （未放行即結束，WP5-2 `prepared_for_test()` 為空）。T14 分類：資源收尾，Open／Pending／Permanent 皆執行。
     DiscardHandoffWorker { token: u64 },
@@ -4099,6 +4101,8 @@ impl SessionCore {
     /// - 沒有停止：發 `RetirePlaceholder`（OSError 且未取消亦然，B-7）。
     /// - 開埠失敗依 Python 映射回覆 A（Held → DEVICE_STILL_HELD、NotFound → DEVICE_NOT_PRESENT、裝置改指的取消 →
     ///   DEVICE_NOT_PRESENT、其餘 → SESSION_RECOVERING；`:3510-3526`、`:3555`、`:3561-3567`、`:3611-3631`）。
+    /// - OSError 但帳本紀錄在開埠期間已被取消（`cancel` 為開埠工作在無 handle 收尾時讀到的紀錄取消，例如裝置改指）：不退休，
+    ///   回 SESSION_RECOVERING（Python 在同一鎖區段讀 `op.cancelled`，`:3529-3531`、`:3561-3567`；審查 P8-a07fdfb-1）。
     fn placeholder_opened(
         &mut self,
         token: u64,
@@ -4139,10 +4143,12 @@ impl SessionCore {
                 if let Some(ph) = pending.placeholder.as_mut() {
                     ph.phase = PlaceholderPhase::Retiring;
                 }
+                let real_path = pending.real_path.clone();
                 self.pending_attach = Some(pending);
                 return vec![Effect::RetirePlaceholder {
                     token,
                     kind: RetireKind::Opened,
+                    real_path,
                 }];
             }
             Ok(()) => {
@@ -4170,15 +4176,17 @@ impl SessionCore {
                         Self::placeholder_held_reply(&echo, holder.pids)
                     }
                     OpenFailure::NotFound => self.device_not_present_reply(&echo),
-                    OpenFailure::Other(error) if !stopping && !frozen => {
+                    OpenFailure::Other(error) if !stopping && !frozen && cancel.is_none() => {
                         if let Some(ph) = pending.placeholder.as_mut() {
                             ph.phase = PlaceholderPhase::Retiring;
                             ph.os_error = Some(error.py_exc_name().to_string());
                         }
+                        let real_path = pending.real_path.clone();
                         self.pending_attach = Some(pending);
                         return vec![Effect::RetirePlaceholder {
                             token,
                             kind: RetireKind::OsError,
+                            real_path,
                         }];
                     }
                     OpenFailure::Cancelled if cancel == Some(crate::custody::CustodyCancel::Device) => {

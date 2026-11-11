@@ -9734,3 +9734,67 @@ fn wp510r_r5_rpc_wp1_1_release_during_placeholder_open_waits_ledger_close() {
     assert!(r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_none());
     assert_eq!(r.mgr.released_placeholder(WP510_PLACEHOLDER_SID), Some(true));
 }
+
+/// P8-a07fdfb-1（審查第 1 輪 High）端到端：佔位 `device.attach` 開埠阻塞時同一 by_id 改指新路徑（`update_devices` →
+/// `detach_by_id` → `close_session_custody_for(Device)` 在帳本紀錄寫入 cancel＝Device），舊開埠接著回 PermissionError。
+/// 呼叫路徑：`device.attach` → `SessionManager::route_with_selector` → `DeviceAttachRouted` → 佔位 actor
+/// `PrepareHandoffWorker` → `OpenPlaceholderRaw` → `open_placeholder_raw` 的無 handle 收尾（帶回紀錄的取消）→
+/// `PlaceholderOpened(Other, cancel=Device)` → 不退休、丟棄 worker → 回覆。Python 已取消的 OSError 分支回
+/// SESSION_RECOVERING、保留 RELEASED 佔位（`origin/main:sw_core/session_manager.py:3529-3531`、`:3561-3567`）；新路徑零開埠。
+#[test]
+fn wp510r_r5_rpc_p8_a07fdfb_1_device_cancel_then_oserror_keeps_placeholder() {
+    const NEW_REAL: &str = "/fake/tty-G2";
+    let (r, backend, entered, dev) = wp510_b_placeholder_blocking_rig_with_open_error(Some(OpenError::Other(
+        PalError::plain(PalErrorKind::PermissionDenied, "Permission denied"),
+    )));
+    let new_dev = backend.delegate.add_device(NEW_REAL);
+    wp510_install_shell_replies(&new_dev);
+    let r = Arc::new(r);
+    let state_before = r.fs.bytes(support::STATE_PATH);
+    let attach_rig = Arc::clone(&r);
+    let attach = std::thread::spawn(move || {
+        attach_rig.call("device.attach", &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#))
+    });
+    entered.recv_timeout(Duration::from_secs(5)).expect("開埠進入阻塞點");
+    let token = r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).expect("開埠在途紀錄").token;
+    let retargeted: Vec<(String, DeviceInfo)> = r
+        .mgr
+        .list_devices()
+        .into_iter()
+        .map(|row| {
+            let by_id = s(&row, "by_id").to_string();
+            let real_path = if by_id == WP510_PLACEHOLDER_BY_ID {
+                NEW_REAL.to_string()
+            } else {
+                s(&row, "real_path").to_string()
+            };
+            (by_id.clone(), DeviceInfo { by_id, real_path })
+        })
+        .collect();
+    r.mgr.update_devices(&retargeted);
+    wait_until("裝置改指在帳本紀錄寫入取消", || {
+        r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_some_and(|rec| {
+            rec.token == token && rec.cancel == Some(sw_core::custody::CustodyCancel::Device)
+        })
+    });
+    backend.release();
+    let attached = attach.join().expect("attach RPC thread");
+    let session = r.session(WP510_PLACEHOLDER_SID).expect("佔位保留");
+    assert_eq!(s(&session, "state"), "RELEASED", "{}", j(&session));
+    assert_eq!(
+        j(&attached),
+        format!(
+            r#"{{"ok":false,"error_code":"SESSION_RECOVERING","drain_stalled":false,"drain_timeout_epoch":null,"session":{},"version":"{}"}}"#,
+            j(&session),
+            r.version
+        ),
+        "已取消的 OSError RPC bytes"
+    );
+    assert_eq!(r.mgr.released_placeholder(WP510_PLACEHOLDER_SID), Some(true));
+    assert!(r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_none(), "帳本無殘留紀錄");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(new_dev.open_attempts(), 0, "不啟動新路徑交接");
+    assert_eq!(dev.open_count(), 0, "舊路徑開埠失敗、未取得 handle");
+    assert!(r.mgr.resolve("t:COM3").is_none(), "沒有正式 session");
+    assert_eq!(r.fs.bytes(support::STATE_PATH), state_before, "不落盤退休");
+}

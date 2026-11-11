@@ -5171,7 +5171,7 @@ fn wp510r_r5_has_raw_open(effects: &[Effect]) -> bool {
 
 fn wp510r_r5_retire_kind(effects: &[Effect]) -> Option<sw_core::session_core::RetireKind> {
     effects.iter().find_map(|effect| match effect {
-        Effect::RetirePlaceholder { token, kind } if *token == WP510R_R5_TOKEN => Some(kind.clone()),
+        Effect::RetirePlaceholder { token, kind, .. } if *token == WP510R_R5_TOKEN => Some(kind.clone()),
         _ => None,
     })
 }
@@ -5500,4 +5500,54 @@ fn wp510r_r5_t14_placeholder_opened_deferred_pending_closes_permanent() {
         assert!(!h.core.retired(), "未退休");
         assert_eq!(h.public()["state"], PyValue::from("RELEASED"));
     }
+}
+
+/// P8-a07fdfb-1（審查第 1 輪 High）：佔位 Raw 開埠回一般 OSError，但帳本紀錄在開埠期間已被取消（裝置改指 Device、release
+/// Release）時，佔位 actor 不得退休：丟棄預先準備的 worker，A 依 Python 已取消的 OSError 分支回 SESSION_RECOVERING
+/// （RELEASED 佔位快照，`origin/main:sw_core/session_manager.py:3529-3531`、`:3561-3567`），佔位維持 RELEASED。未取消的
+/// OSError 照舊退休（B-7），且退休效果帶原開埠路徑供 executor 在鎖內核對。
+#[test]
+fn wp510r_r5_p8_a07fdfb_1_cancelled_oserror_replies_recovering_without_retire() {
+    let permission = || OpenFailure::Other(PalError::plain(sw_pal::traits::PalErrorKind::PermissionDenied, "Permission denied"));
+    for cancel in [sw_core::custody::CustodyCancel::Device, sw_core::custody::CustodyCancel::Release] {
+        let mut h = wp510r_r5_placeholder(Some("cli"));
+        let attach = wp510r_r5_attach_to_open(&mut h, false);
+        let before = h.public();
+        let effects = h.feed(ControlEvent::PlaceholderOpened {
+            token: WP510R_R5_TOKEN,
+            result: Err(permission()),
+            cancel: Some(cancel),
+        });
+        assert!(wp510r_r5_retire_kind(&effects).is_none(), "已取消（{cancel:?}）的 OSError 不退休");
+        assert_eq!(wp510r_r5_discards(&effects), 1, "{cancel:?}：丟棄預先準備的 worker");
+        let a = attach.try_recv().expect("開埠返回後回覆").expect("dict");
+        let mut expected = PyDict::new();
+        expected.insert("ok", PyValue::Bool(false));
+        expected.insert("error_code", PyValue::from("SESSION_RECOVERING"));
+        expected.insert("drain_stalled", PyValue::Bool(false));
+        expected.insert("drain_timeout_epoch", PyValue::Null);
+        expected.insert("session", PyValue::Dict(before.clone()));
+        assert_eq!(
+            sw_proto::pyjson::dumps(&PyValue::Dict(a), &sw_proto::pyjson::RPC_WIRE),
+            sw_proto::pyjson::dumps(&PyValue::Dict(expected), &sw_proto::pyjson::RPC_WIRE),
+            "{cancel:?}：A 回 SESSION_RECOVERING，佔位快照不變"
+        );
+        assert_eq!(h.public()["state"], PyValue::from("RELEASED"));
+        assert!(!h.core.retired(), "未退休");
+    }
+    let mut h = wp510r_r5_placeholder(Some("cli"));
+    let _attach = wp510r_r5_attach_to_open(&mut h, false);
+    let effects = h.feed(ControlEvent::PlaceholderOpened {
+        token: WP510R_R5_TOKEN,
+        result: Err(permission()),
+        cancel: None,
+    });
+    let paths: Vec<_> = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::RetirePlaceholder { token, real_path, .. } if *token == WP510R_R5_TOKEN => Some(real_path.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(paths, vec![REAL_PATH.to_string()], "未取消的 OSError 退休，效果帶原開埠路徑");
 }

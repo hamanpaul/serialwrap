@@ -5770,3 +5770,112 @@ fn wp510r_r5_g2_already_released_reply_key_order_matches_python() {
     );
     assert_eq!(again.get("already_released"), Some(&PyValue::Bool(true)));
 }
+
+// ---------------------------------------------------------------------------
+// S2-PAR-wp510r R5 第 2 輪（審查 P8-a07fdfb-1）：佔位開埠一般 OSError 收尾必須保留已發生的裝置取消，並在退休的鎖區段內
+// 核對原路徑。Python `attach_device` 的 OSError 分支在同一鎖區段內讀 `op.cancelled`，已取消即回 SESSION_RECOVERING、
+// 不退休（`origin/main:sw_core/session_manager.py:3527-3567`）；`update_devices` 對路徑改變的在途作業設 `op.cancelled`
+// （`:4031-4034`），RELEASED 的 by_id 不另起 attach。
+// ---------------------------------------------------------------------------
+
+const WP510R_R5_NEW_REAL: &str = "/dev/ttyG2";
+
+/// 佔位 by_id 改指 `WP510R_R5_NEW_REAL` 後的裝置快照（新路徑登錄為實體裝置；rig 的快照登錄不變）。
+fn wp510r_r5_retargeted_snapshot(m: &ManagerRig) -> Vec<(String, DeviceInfo)> {
+    install_shell_replies(&m.serial.add_device(WP510R_R5_NEW_REAL));
+    m.snapshot()
+        .into_iter()
+        .map(|(by_id, mut info)| {
+            if by_id == WP510R_R5_BY_ID {
+                info.real_path = WP510R_R5_NEW_REAL.to_string();
+            }
+            (by_id, info)
+        })
+        .collect()
+}
+
+/// 已取消的佔位 OSError 收尾：A 為 SESSION_RECOVERING（RELEASED 佔位快照、drain false/null），佔位與持久化 RELEASED 列
+/// 保留、帳本與預先準備的 worker 皆空、新路徑零開埠、沒有正式 session。
+fn wp510r_r5_assert_cancelled_oserror_kept(m: &ManagerRig, sid: &str, a: &PyDict) {
+    assert_eq!(
+        a.0.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["ok", "error_code", "drain_stalled", "drain_timeout_epoch", "session"],
+        "Python 已取消的 OSError 回應鍵序（origin/main:sw_core/session_manager.py:3561-3567）：{a:?}"
+    );
+    assert_eq!(code_of(a).as_deref(), Some("SESSION_RECOVERING"), "{a:?}");
+    assert_eq!(a.get("drain_stalled"), Some(&PyValue::Bool(false)));
+    assert_eq!(a.get("drain_timeout_epoch"), Some(&PyValue::Null));
+    let session = session_field(a);
+    assert_eq!(s_of(&session, "state").as_deref(), Some("RELEASED"), "{session:?}");
+    assert_eq!(s_of(&session, "session_id").as_deref(), Some(sid));
+    assert_eq!(s_of(&session, "last_error"), None, "已取消不得寫 ATTACH_FAILED：{session:?}");
+    assert_eq!(m.mgr.resolve(WP510R_R5_SID).as_deref(), Some(sid), "佔位保留");
+    assert_eq!(m.mgr.released_placeholder(sid), Some(true), "不解除 RELEASED");
+    assert!(m.load_state_now().released.contains_key(sid), "持久化 RELEASED 列保留：{}", m.state_text());
+    assert!(m.mgr.custody_for_test(WP510R_R5_BY_ID).is_none(), "帳本無殘留紀錄");
+    assert_eq!(m.mgr.prepared_len_for_test(), 0, "預先準備的交接 worker 已丟棄");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(m.serial.open_attempts(WP510R_R5_NEW_REAL), 0, "不啟動新路徑交接");
+    assert!(m.mgr.resolve("t:COM3").is_none(), "沒有正式 session");
+    assert_eq!(m.state_of(WP510R_R5_SID).as_deref(), Some("RELEASED"));
+}
+
+/// P8-a07fdfb-1（審查第 1 輪 High）：佔位 W1 開埠阻塞時同一 by_id 改指新路徑（帳本寫入 cancel＝Device），舊開埠接著回
+/// PermissionError。Python 已取消的 OSError 分支回 SESSION_RECOVERING、保留 RELEASED 佔位、不交接新路徑
+/// （`origin/main:sw_core/session_manager.py:3529-3531`、`:3561-3567`）。
+#[test]
+fn wp510r_r5_p8_a07fdfb_1_device_cancel_during_open_then_oserror_keeps_placeholder() {
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(WP510R_R5_SID).expect("佔位 session");
+    m.mgr.update_devices(&m.snapshot());
+    m.serial.block_open(WP510R_R5_REAL);
+    m.serial.fail_next_open(WP510R_R5_REAL, wp510_b_permission_error());
+
+    let (attach_tx, attach_rx) = crossbeam_channel::bounded(1);
+    let attach_manager = m.mgr.clone();
+    let attach_sid = sid.clone();
+    let attach = std::thread::spawn(move || {
+        let _ = attach_tx.send(attach_manager.attach_released_placeholder(&attach_sid, false));
+    });
+    wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(WP510R_R5_REAL) == 1);
+    let token = m.mgr.custody_for_test(WP510R_R5_BY_ID).expect("開埠在途紀錄").token;
+
+    m.mgr.update_devices(&wp510r_r5_retargeted_snapshot(&m));
+    wait_until("裝置改指在帳本紀錄寫入取消", || {
+        m.mgr.custody_for_test(WP510R_R5_BY_ID).is_some_and(|rec| {
+            rec.token == token && rec.cancel == Some(sw_core::custody::CustodyCancel::Device)
+        })
+    });
+    assert!(attach_rx.try_recv().is_err(), "開埠返回前 attach 不得回覆");
+
+    m.serial.release_open(WP510R_R5_REAL);
+    let a = rpc(attach_rx.recv_timeout(RPC).expect("attach 應完成"));
+    attach.join().expect("attach thread");
+    wp510r_r5_assert_cancelled_oserror_kept(&m, &sid, &a);
+}
+
+/// P8-a07fdfb-1（無 handle 退休的鎖內核對）：OSError 已結算帳本紀錄後、佔位 actor 取 manager 鎖退休之前（H-retire-pre-commit），
+/// 同一 by_id 改指新路徑。退休須在鎖內核對原路徑，不符即視同已取消（Python 檢查與退休在同一鎖區段，改指只會落在檢查之前，
+/// `origin/main:sw_core/session_manager.py:3527-3531`、`:4031-4034`），回 SESSION_RECOVERING、保留佔位、新路徑零開埠。
+#[test]
+fn wp510r_r5_p8_a07fdfb_1_device_change_before_oserror_retire_keeps_placeholder() {
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(WP510R_R5_SID).expect("佔位 session");
+    m.mgr.update_devices(&m.snapshot());
+    m.serial.fail_next_open(WP510R_R5_REAL, wp510_b_permission_error());
+    let retargeted = wp510r_r5_retargeted_snapshot(&m);
+    let hook_manager = m.mgr.clone();
+    let (hooked_tx, hooked_rx) = crossbeam_channel::bounded(1);
+    m.mgr.set_placeholder_retire_pre_commit_hook_for_test(
+        WP510R_R5_SID,
+        Box::new(move || {
+            hook_manager.update_devices(&retargeted);
+            let _ = hooked_tx.send(());
+        }),
+    );
+
+    let a = rpc(m.mgr.attach_released_placeholder(&sid, false));
+    hooked_rx.try_recv().expect("退休提交前已改指");
+    assert_eq!(m.serial.open_attempts(WP510R_R5_REAL), 1);
+    wp510r_r5_assert_cancelled_oserror_kept(&m, &sid, &a);
+}

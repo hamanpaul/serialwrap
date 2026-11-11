@@ -3817,7 +3817,9 @@ impl OpenCtx {
     /// `Effect::OpenPlaceholderRaw`（設計 §3.1.4 W1 第 3 步）：以預配的 `token` 登記本 session 擁有的 `Opening{PlaceholderOpen}`
     /// （C1 閘門；先取消者寫入的 tombstone 令登記中止）→ 預掃 holder → `open_exclusive` → 提交點（manager 鎖內）有取消、
     /// stopping 或裝置路徑改變就轉 Closing 並關閉（終態另送 `CustodyTerminal`），否則存回 `Held{Session}`（parts 在帳本）。
-    /// 沒有交出 handle 的結束（預掃、開埠失敗、登記被拒）以 NoHandle 結算紀錄並送 `CustodyTerminal`（停止可能正在等它）。
+    /// 沒有交出 handle 的結束（預掃、開埠失敗、登記被拒）以 NoHandle 結算紀錄並送 `CustodyTerminal`（停止可能正在等它）；
+    /// 結算前在同一鎖區段讀出紀錄已寫入的取消一併回報，佔位 actor 據此判斷 OSError 是否已取消（Python 的 OSError 分支在
+    /// 鎖內讀 `op.cancelled`，`origin/main:sw_core/session_manager.py:3529-3531`；審查 P8-a07fdfb-1）。
     /// Python `attach_device` 的第二段鎖內重驗與開埠（`origin/main:sw_core/session_manager.py:3455-3612`）。
     fn open_placeholder_raw(
         &self,
@@ -3830,9 +3832,14 @@ impl OpenCtx {
         let sid = lock(&self.io.sid).clone();
         let by_id = lock(&self.io.profile).device_by_id.clone();
         let no_handle = |failure: OpenFailure| {
-            {
+            let cancel = {
                 let mut inner = lock(&self.shared.inner);
-                if inner.custody.get_custody(&by_id).is_some_and(|rec| rec.token == token) {
+                let cancel = inner
+                    .custody
+                    .get_custody(&by_id)
+                    .filter(|rec| rec.token == token)
+                    .map(|rec| rec.cancel);
+                if cancel.is_some() {
                     inner.custody.settle_close(
                         token,
                         crate::custody::Terminal {
@@ -3841,14 +3848,15 @@ impl OpenCtx {
                         },
                     );
                 }
-            }
+                cancel.flatten()
+            };
             self.shared.cv.notify_all();
             let _ = control.send(ControlEvent::CustodyTerminal {
                 token,
                 closed: true,
                 error: None,
             });
-            (Err(failure), None)
+            (Err(failure), cancel)
         };
         {
             let mut inner = lock(&self.shared.inner);
@@ -4444,6 +4452,7 @@ impl ManagerExec {
         &mut self,
         token: u64,
         kind: crate::session_core::RetireKind,
+        real_path: &str,
         tx: &Sender<ControlEvent>,
         feedback: &mut std::collections::VecDeque<ControlEvent>,
     ) {
@@ -4479,7 +4488,14 @@ impl ManagerExec {
             ),
             _ => (false, inner.device_path(&by_id).is_some(), None),
         };
-        let device_ok = if opened { record_device_ok } else { inner.device_path(&by_id).is_some() };
+        // 無 handle（OSError）的退休沒有帳本紀錄可對照（開埠工作已以 NoHandle 結算）：在鎖內核對裝置仍指向本次開埠的原路徑。
+        // 改指發生在 OSError 結算之後、退休之前時視同已取消（Python 的取消檢查與退休在同一鎖區段，改指只會落在檢查之前並
+        // 設 `op.cancelled`，`origin/main:sw_core/session_manager.py:3527-3531`、`:4031-4034`；審查 P8-a07fdfb-1）。
+        let device_ok = if opened {
+            record_device_ok
+        } else {
+            inner.device_path(&by_id) == Some(real_path)
+        };
         let valid = !inner.stopping
             && !frozen
             && entry_ok
@@ -4659,7 +4675,9 @@ impl EffectExecutor for ManagerExec {
     ) {
         match e {
             Effect::PrepareHandoffWorker => self.prepare_handoff_worker(feedback),
-            Effect::RetirePlaceholder { token, kind } => self.retire_placeholder(token, kind, tx, feedback),
+            Effect::RetirePlaceholder { token, kind, real_path } => {
+                self.retire_placeholder(token, kind, &real_path, tx, feedback)
+            }
             Effect::ClaimForStop {
                 token,
                 cancel,
