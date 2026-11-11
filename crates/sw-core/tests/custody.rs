@@ -1489,96 +1489,350 @@ fn test_actor_repeated_panic_stops_and_settles_custody() {
     );
 }
 
+/// DR-7 前置的 B3（佔位 `gone-template:COM3` 的 by_id）。
+const DR7_PLACEHOLDER_SID: &str = "gone-template:COM3";
+const DR7_BY_ID: &str = "/s/by-id/usb-G";
+const DR7_REAL: &str = "/dev/ttyG";
+
+/// DR-7 前置（全程正式流程）：COM0 在 usb-A 上 READY；`gone-template:COM3` 是 B3 的 RELEASED 佔位，`device.attach`
+/// （`SessionManager::attach_released_placeholder`）開埠並退休佔位後落盤 ENOSPC，留下 parked 作業與帳本
+/// `Held{owner: Parked}`（`attach_released_placeholder` 的存檔失敗分支；Python 留在 `_preopened_ports`，
+/// `origin/main:sw_core/session_manager.py:3633-3637`）。`gate` 為命令登錄表的 admission gate（`None` 用預設）。
+/// 回傳 rig、B3 裝置替身與 parked 紀錄的 token。
+fn dr7_formal_parked_rig(
+    gate: Option<Arc<AdmissionGate>>,
+) -> (ManagerRig, sw_pal::fakes::serial::FakeDevice, u64) {
+    use sw_core::state_store::{LoadedState, ReleasedRow};
+    let mut loaded = LoadedState::default();
+    loaded.released.insert(
+        DR7_PLACEHOLDER_SID.to_string(),
+        ReleasedRow {
+            by_id: PyValue::Str(DR7_BY_ID.to_string()),
+            released_by: PyValue::Str("agent".to_string()),
+            released_at: PyValue::Str("2026-10-21T00:00:00".to_string()),
+            reason: PyValue::Str("manual".to_string()),
+        },
+    );
+    let yaml = manager_yaml(&["{com: COM0, profile: t, act_no: 1, alias: t+1, device_by_id: /s/by-id/usb-A}"]);
+    let primary = Some(("/s/by-id/usb-A", "/dev/ttyOLD"));
+    let m = match gate {
+        Some(gate) => ManagerRig::with_admission_gate(&yaml, loaded, primary, gate),
+        None => ManagerRig::with(&yaml, loaded, primary),
+    };
+    let dev = m.add_device_at(DR7_BY_ID, DR7_REAL);
+    install_shell_replies(&dev);
+    let m = m.ready();
+    let placeholder = m.mgr.resolve(DR7_PLACEHOLDER_SID).expect("B3 的 RELEASED 佔位");
+    assert_eq!(m.mgr.released_placeholder(&placeholder), Some(true));
+
+    m.fs.fail_next_atomic_write(PalError::io(28, "[Errno 28] No space left on device"));
+    let attached = m.mgr.attach_released_placeholder(&placeholder, false);
+    assert!(attached.is_err(), "退休落盤 ENOSPC 必須向上回錯：{attached:?}");
+    assert_eq!(m.mgr.resolve(DR7_PLACEHOLDER_SID), None, "落盤失敗不回滾：佔位已退休");
+    assert!(m.mgr.has_inflight_attach_for_test(DR7_BY_ID), "parked 作業留在在途表");
+    assert_eq!(dev.open_count(), 1, "前置：佔位開埠 1 次");
+    assert!(dev.is_open(), "前置：預開 handle 留在 parked 作業內");
+    let parked = m.mgr.custody_for_test(DR7_BY_ID).expect("parked 帳本紀錄");
+    assert_eq!(parked.owner, CustodyOwner::Parked, "正式流程建立的 parked 紀錄：{parked:?}");
+    assert_eq!(parked.phase, CustodyPhaseSnapshot::Held);
+    (m, dev, parked.token)
+}
+
+/// H-actor-hold＋H-deliver-fail 的結果。
+struct ActorHold {
+    /// 灌入 control lane 的事件數。
+    filled: usize,
+    resume: crossbeam_channel::Sender<()>,
+    query: std::thread::JoinHandle<()>,
+}
+
+/// H-actor-hold：令 `sid` 的 actor 停在一筆無關的查詢 Request（之後排入的 DeviceOnline 不會被取出）；再以完整 sid
+/// 取得 control sender 灌滿 lane（H-deliver-fail），使之後的 DeviceOnline 入列逾時、送達者的 `try_send` 回 Full。
+fn hold_actor_and_fill_control(
+    mgr: &Arc<sw_core::session_manager::SessionManager>,
+    sid: &str,
+) -> ActorHold {
+    let (entered, resume) = mgr.pause_next_request_for_test(sid).expect("actor 存在");
+    let query_mgr = mgr.clone();
+    let query_sid = sid.to_string();
+    let query = std::thread::spawn(move || {
+        let _ = query_mgr.session_queue_lens(&query_sid);
+    });
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("actor 應停在無關的查詢 Request");
+    let ctrl = mgr
+        .actor_control_for_test(sid)
+        .expect("sessions 以完整 sid 為鍵，應取得 control sender");
+    let mut filled = 0;
+    while ctrl.try_send(ControlEvent::ConsoleCountChanged { count: 0 }).is_ok() {
+        filled += 1;
+    }
+    ActorHold { filled, resume, query }
+}
+
+/// 在 `session.bind` 送出 DeviceOnline 之前執行 H-actor-hold＋H-deliver-fail，執行 bind 並回傳結果、耗時與暫停結果。
+fn dr7_bind_with_device_online_full(m: &ManagerRig, sid: &str) -> (PyValue, Duration, ActorHold) {
+    let hold: Arc<Mutex<Option<ActorHold>>> = Arc::new(Mutex::new(None));
+    let hook_hold = hold.clone();
+    let hook_mgr = m.mgr.clone();
+    let hook_sid = sid.to_string();
+    m.mgr.set_bind_pre_device_online_hook_for_test(Box::new(move || {
+        *hook_hold.lock().unwrap() = Some(hold_actor_and_fill_control(&hook_mgr, &hook_sid));
+    }));
+    let started = Instant::now();
+    let res = m.mgr.bind(sid, DR7_BY_ID).expect("bind 回 Ok");
+    let elapsed = started.elapsed();
+    let hold = hold.lock().unwrap().take().expect("bind 應在送出 DeviceOnline 之前執行暫停點");
+    (res.get("ok").cloned().unwrap_or(PyValue::Null), elapsed, hold)
+}
+
+/// DR-7(j)：佔位 attach 加退休落盤失敗留下 parked（正式流程），`bind COM0→B3` 成功，首次 DeviceOnline 因 actor
+/// 停在無關 Request 且 control lane 滿而入列逾時；bind 照常回 OK，送達義務交給送達者，lane 滿期間依退避重試；
+/// 容量恢復後只送達一次 → ATTACHING → 以原 token 的 handle 接手 → READY，開埠次數不增加，帳本最後 None。
+/// 拋棄式副本移除 bind 的 parked 接手接線（`SessionManager::bind` 的 `claim_parked_locked`／交接列）即轉紅。
 #[test]
 fn test_dr7_bind_device_online_full_queues_deliverer_and_retries() {
     let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let m = ManagerRig::single_target(SHELL_PROFILE).ready();
-    let sid = "COM0";
-    let full_sid = m.mgr.resolve(sid).expect("session 存在");
+    let (m, dev, original_token) = dr7_formal_parked_rig(None);
+    let full_sid = m.mgr.resolve("COM0").expect("COM0 session");
+    assert_ne!(full_sid, "COM0", "sessions 以完整 sid 為鍵");
+    let open_attempts = dev.open_attempts();
 
-    // 新增目標裝置供 bind 切換，並預先建立 parked handle
-    const NEW_BY_ID: &str = "/s/by-id/dr7-bind";
-    const NEW_REAL: &str = "/dev/ttyDR7";
-    let new_dev = m.add_device_at(NEW_BY_ID, NEW_REAL);
-    install_shell_replies(&new_dev);
+    let (ok, elapsed, hold) = dr7_bind_with_device_online_full(&m, &full_sid);
 
-    let cfg = sw_pal::SerialConfig::from_uart_profile(115200, 8, "N", 1, "none", false);
-    let fake_handle = m.serial.open_exclusive(&sw_pal::DevicePath(NEW_REAL.to_string()), &cfg).unwrap();
-    let parts = HandleParts::split(fake_handle);
-    let initial_open_count = new_dev.open_count();
-    assert_eq!(initial_open_count, 1, "parked handle 已開啟 1 次");
-
-    let original_token = m.mgr.custody_register_parked_for_test(NEW_BY_ID, NEW_REAL, Some(parts));
-    m.mgr.update_devices(&m.snapshot());
-    let custody_init = m.mgr.custody_for_test(NEW_BY_ID);
-    assert_eq!(custody_init.as_ref().map(|c| c.token), Some(original_token));
-    assert!(matches!(custody_init.as_ref().map(|c| &c.owner), Some(CustodyOwner::Parked)));
-
-    // 設定在 bind 送出 DeviceOnline 之前，暫停 actor 並以 H-deliver-fail 灌滿 control 通道，確定性引發首次送達失敗
-    let resume_holder = Arc::new(Mutex::new(None));
-    let resume_holder_clone = resume_holder.clone();
-    let mgr_for_hook = m.mgr.clone();
-    let sid_for_hook = sid.to_string();
-
-    m.mgr.set_bind_pre_device_online_hook_for_test(Box::new(move || {
-        let (_entered_rx, resume_tx) = mgr_for_hook.pause_next_request_for_test(&sid_for_hook).unwrap();
-        *resume_holder_clone.lock().unwrap() = Some(resume_tx);
-
-        if let Some(ctrl) = mgr_for_hook.actor_control_for_test(&sid_for_hook) {
-            while ctrl.try_send(ControlEvent::ConsoleCountChanged { count: 0 }).is_ok() {}
-        }
-    }));
-
-    // 凍結 gate，送達者即使輪詢也不會逾時或誤投遞
-    let gate = m.mgr.deliverer_gate_for_test();
-    let freeze_token = match gate.freeze_if_idle("test-dr7") {
-        FreezeOutcome::Frozen { token, .. } => token,
-        _ => panic!("gate 應可凍結"),
-    };
-
-    // 執行 bind：因為 actor Request 暫停且 control 通道已滿，首次 DeviceOnline 發送失敗
-    let res = m.mgr.bind(&full_sid, NEW_BY_ID).expect("bind ok");
-    assert_eq!(res.get("ok"), Some(&PyValue::Bool(true)));
-
-    // 斷言：送達義務成功寫入 deliverer
+    assert_eq!(ok, PyValue::Bool(true), "首次送達失敗時 bind 照常回 OK");
+    assert!(hold.filled > 0, "灌滿迴圈必須實際送入事件");
+    assert!(
+        elapsed >= Duration::from_millis(4900),
+        "DeviceOnline 應在 lane 滿時入列逾時（QUERY_TIMEOUT 5 s），不是被取出後暫停：{elapsed:?}"
+    );
     assert!(m.mgr.delivery_obligation_for_test(&full_sid), "首次送達失敗必須登錄送達義務");
+    wait_until("送達者於 lane 滿時重試", || m.mgr.delivery_attempts_for_test(&full_sid) >= 1);
+    assert!(m.mgr.delivery_obligation_for_test(&full_sid), "lane 滿期間義務保留");
+    assert_eq!(m.mgr.delivery_delivered_for_test(&full_sid), 0, "lane 滿期間不得送達");
 
-    // 斷言：恢復容量前，帳本紀錄維持原 token 且維持 Held { owner: Parked }
-    let c_held = m.mgr.custody_for_test(NEW_BY_ID).expect("parked 紀錄存在");
-    assert_eq!(c_held.token, original_token);
-    assert!(matches!(c_held.owner, CustodyOwner::Parked));
-    assert!(matches!(c_held.phase, CustodyPhaseSnapshot::Held { .. }));
+    // 恢復容量前：同一 token 以 C1′ 認領給 COM0 的開埠工作（交接列），不登記新紀錄、不重新開埠。
+    let claimed = m.mgr.custody_for_test(DR7_BY_ID).expect("帳本紀錄");
+    assert_eq!(claimed.token, original_token, "沿用 parked 紀錄的 token");
+    assert_eq!(
+        claimed.phase,
+        CustodyPhaseSnapshot::Taken {
+            taker: CustodyTaker::OpenJob { sid: full_sid.clone(), gen: 1 },
+        },
+        "parked 續行以同 token 認領，不轉 Closing：{claimed:?}"
+    );
+    assert!(!m.mgr.has_inflight_attach_for_test(DR7_BY_ID), "parked 作業已由 bind 取走");
+    assert_eq!(dev.open_attempts(), open_attempts, "認領原 handle，不重新開埠");
+    assert!(dev.is_open());
 
-    // 在 gate 凍結期間等待，驗證送達者背景執行緒不因凍結而丟棄義務
-    std::thread::sleep(Duration::from_millis(60));
-    assert!(m.mgr.delivery_obligation_for_test(&full_sid), "凍結期間義務保留");
-
-    // 解除 actor 暫停並恢復容量
-    if let Some(resume_tx) = resume_holder.lock().unwrap().take() {
-        let _ = resume_tx.send(());
-    }
-
-    // 解凍 gate
-    assert!(gate.thaw(&freeze_token));
-
-    // 等待送達者背景執行緒重送成功並清除義務
-    let t0 = Instant::now();
-    while t0.elapsed() < Duration::from_secs(3) {
-        if !m.mgr.delivery_obligation_for_test(&full_sid) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(!m.mgr.delivery_obligation_for_test(&full_sid), "送達者重送成功後義務必須清除");
-
-    // 等待 session 認領原 handle 並到達 READY
+    // 容量恢復：只送達一次，以原 handle 到 READY。
+    hold.resume.send(()).expect("放行 actor");
+    hold.query.join().expect("查詢執行緒不應 panic");
+    wait_until("送達者重送成功", || !m.mgr.delivery_obligation_for_test(&full_sid));
     m.wait_state("COM0", "READY");
+    assert_eq!(m.mgr.delivery_delivered_for_test(&full_sid), 1, "容量恢復後只送達一次");
+    assert_eq!(dev.open_attempts(), open_attempts, "認領原 parked handle 不得重複開埠");
+    assert_eq!(dev.close_count(), 0, "原 handle 由正式 bridge 接手，不關閉");
+    assert!(m.mgr.custody_for_test(DR7_BY_ID).is_none(), "正式 bridge 接手後帳本紀錄移除");
+    assert_eq!(s_of(&m.session("COM0"), "device_by_id").as_deref(), Some(DR7_BY_ID));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(m.mgr.delivery_delivered_for_test(&full_sid), 1, "之後不得重複送達");
+}
 
-    // 斷言：開埠次數沒有增加（認領原 parked handle，不重開）
-    assert_eq!(new_dev.open_count(), initial_open_count, "認領原 parked handle 不得重複開埠");
+/// 送達者接正式交接閘門（審查「既有碼待辦」）：送達者的 gate 就是命令登錄表的 admission gate（`Service::handoff_stop`
+/// 的 `freeze_if_idle`／`commit_handoff` 與 session actor 的交接延後共用同一物件）。正式交接凍結成立（Pending）後送達者
+/// 暫停嘗試、保留義務，凍結期間（假時鐘推進 45 s，超過 30 s 總時限）不計入時限；撤銷（交接失敗回滾）後繼續重試，
+/// 容量恢復後只送達一次並到 READY。
+#[test]
+fn test_dr7_deliverer_pauses_on_formal_handoff_freeze_without_counting_deadline() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let t0 = Instant::now();
+    let clock = FakeInstantClock::new(t0);
+    let gate = clock.gate();
+    let (m, dev, _token) = dr7_formal_parked_rig(Some(gate.clone()));
+    assert!(Arc::ptr_eq(&m.reg.admission_gate(), &gate), "命令登錄表掛上注入的 gate");
+    assert!(
+        Arc::ptr_eq(&m.mgr.deliverer_gate_for_test(), &m.reg.admission_gate()),
+        "送達者必須使用正式的 admission gate，而不是自建的 gate"
+    );
+    let full_sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let open_attempts = dev.open_attempts();
 
-    // 斷言：到達 READY 後帳本紀錄結算為 None
-    assert!(m.mgr.custody_for_test(NEW_BY_ID).is_none(), "到達 READY 後帳本紀錄必須結算為 None");
+    let (ok, _elapsed, hold) = dr7_bind_with_device_online_full(&m, &full_sid);
+    assert_eq!(ok, PyValue::Bool(true));
+    assert!(hold.filled > 0, "灌滿迴圈必須實際送入事件");
+    wait_until("凍結前送達者已在重試", || m.mgr.delivery_attempts_for_test(&full_sid) >= 1);
+
+    // 正式交接的第一步（`Service::handoff_stop` → `freeze_if_idle`）：凍結成立但尚未提交 → Pending。
+    let freeze = match m.reg.admission_gate().freeze_if_idle("update") {
+        FreezeOutcome::Frozen { token, created: true } => token,
+        other => panic!("閒置的 gate 應新建交接凍結：{other:?}"),
+    };
+    assert_eq!(gate.handoff_freeze_state(), HandoffFreezeState::Pending);
+    std::thread::sleep(Duration::from_millis(100));
+    let paused_attempts = m.mgr.delivery_attempts_for_test(&full_sid);
+    clock.set(t0 + Duration::from_secs(45));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        m.mgr.delivery_attempts_for_test(&full_sid),
+        paused_attempts,
+        "Pending 期間送達者不得嘗試"
+    );
+    assert!(m.mgr.delivery_obligation_for_test(&full_sid), "Pending 期間保留義務（未逾時、未丟棄）");
+
+    // 交接失敗回滾（`thaw`）→ Open：凍結的 45 s 不計入 30 s 總時限，義務仍在並繼續重試。
+    assert!(gate.thaw(&freeze));
+    wait_until("撤銷凍結後送達者繼續重試", || {
+        m.mgr.delivery_attempts_for_test(&full_sid) > paused_attempts
+    });
+    assert!(m.mgr.delivery_obligation_for_test(&full_sid), "凍結區間不計時限，義務不得逾時丟棄");
+    assert_eq!(m.mgr.delivery_delivered_for_test(&full_sid), 0);
+
+    hold.resume.send(()).expect("放行 actor");
+    hold.query.join().expect("查詢執行緒不應 panic");
+    wait_until("送達者重送成功", || !m.mgr.delivery_obligation_for_test(&full_sid));
+    m.wait_state("COM0", "READY");
+    assert_eq!(m.mgr.delivery_delivered_for_test(&full_sid), 1, "只送達一次");
+    assert_eq!(dev.open_attempts(), open_attempts, "認領原 parked handle 不得重複開埠");
+    assert!(m.mgr.custody_for_test(DR7_BY_ID).is_none());
+}
+
+/// 正式交接凍結轉 Permanent（`commit_handoff`）時送達者丟棄義務、不再送達；parked 續行的 handle 仍在交接列，帳本
+/// 紀錄維持同一 token（設計 §3.1.7 送達者列：Permanent 丟棄）。
+#[test]
+fn test_dr7_deliverer_drops_obligation_on_formal_handoff_commit() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (m, dev, token) = dr7_formal_parked_rig(None);
+    let full_sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let (ok, _elapsed, hold) = dr7_bind_with_device_online_full(&m, &full_sid);
+    assert_eq!(ok, PyValue::Bool(true));
+    assert!(hold.filled > 0, "灌滿迴圈必須實際送入事件");
+    assert!(m.mgr.delivery_obligation_for_test(&full_sid));
+
+    let gate = m.reg.admission_gate();
+    let freeze = match gate.freeze_if_idle("update") {
+        FreezeOutcome::Frozen { token, created: true } => token,
+        other => panic!("閒置的 gate 應新建交接凍結：{other:?}"),
+    };
+    assert!(gate.commit_handoff(&freeze), "TX fence 收斂後交接提交 → Permanent");
+    assert_eq!(gate.handoff_freeze_state(), HandoffFreezeState::Permanent);
+    wait_until("Permanent 時送達者丟棄義務", || !m.mgr.delivery_obligation_for_test(&full_sid));
+
+    hold.resume.send(()).expect("放行 actor");
+    hold.query.join().expect("查詢執行緒不應 panic");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(m.mgr.delivery_delivered_for_test(&full_sid), 0, "Permanent 丟棄後不再送達");
+    assert_eq!(dev.open_attempts(), 1, "未送達 DeviceAttached，不得開埠");
+    let rec = m.mgr.custody_for_test(DR7_BY_ID).expect("handle 仍由交接列保管");
+    assert_eq!(rec.token, token);
+}
+
+/// 審查 P8-6a679fb-1：bind 的 parked 續行以 C1′ 同 token 認領（`Taken{OpenJob}`），不借用 `claim_for_release`
+/// （原本標成 `Closing{release}`、owner Reaper，handle 其實仍在使用）。DeviceOnline 之前插入 `device.release`：release
+/// 認領交接列並關閉 handle（closed:true）後，該紀錄依 C3 結算（移除、終態 Closed），不留到下一次成功開埠才被覆寫。
+#[test]
+fn test_parked_continuation_bind_claims_same_token_and_settles_on_release_close() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (m, dev, token) = dr7_formal_parked_rig(None);
+    let full_sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (go_tx, go_rx) = crossbeam_channel::bounded::<()>(1);
+    m.mgr.set_bind_pre_device_online_hook_for_test(Box::new(move || {
+        let _ = entered_tx.send(());
+        let _ = go_rx.recv_timeout(Duration::from_secs(10));
+    }));
+    let bind_mgr = m.mgr.clone();
+    let bind_sid = full_sid.clone();
+    let bind = std::thread::spawn(move || bind_mgr.bind(&bind_sid, DR7_BY_ID));
+    entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("bind 應停在送出 DeviceOnline 之前");
+
+    let claimed = m.mgr.custody_for_test(DR7_BY_ID).expect("帳本紀錄");
+    assert_eq!(claimed.token, token, "同 token 認領");
+    assert_eq!(
+        claimed.phase,
+        CustodyPhaseSnapshot::Taken {
+            taker: CustodyTaker::OpenJob { sid: full_sid.clone(), gen: 1 },
+        },
+        "handle 交給 COM0 的開埠工作仍在使用，不得標成 Closing：{claimed:?}"
+    );
+    assert_eq!(
+        claimed.owner,
+        CustodyOwner::Session { sid: full_sid.clone(), inc: claimed_inc(&claimed) },
+        "owner 為認領的 session"
+    );
+    assert!(dev.is_open());
+
+    let released = m
+        .mgr
+        .route(
+            &full_sid,
+            sw_core::session_core::SessionRequest::Release {
+                source: "agent".to_string(),
+                reason: PyValue::Null,
+            },
+            Duration::from_secs(10),
+        )
+        .expect("release 回 Ok");
+    assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{released:?}");
+    assert_eq!(dev.close_count(), 1, "release 關閉交給 session 的 handle 一次");
+    assert!(!dev.is_open());
+    wait_until("關閉成功後帳本紀錄結算", || m.mgr.custody_for_test(DR7_BY_ID).is_none());
+    assert_eq!(
+        m.mgr.terminal_for_test(token).map(|t| t.handle),
+        Some(TerminalHandle::Closed),
+        "同 token 的終態為 Closed"
+    );
+    assert!(!m.mgr.unconfirmed_close_for_test(DR7_BY_ID));
+
+    go_tx.send(()).expect("放行 bind");
+    let bound = bind.join().expect("bind 執行緒不應 panic").expect("bind 回 Ok");
+    assert_eq!(bound.get("ok"), Some(&PyValue::Bool(true)));
+    m.wait_state("COM0", "RELEASED");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(dev.open_attempts(), 1, "release 之後不得重新開埠");
+    assert!(m.mgr.custody_for_test(DR7_BY_ID).is_none());
+}
+
+/// 審查 P8-6a679fb-1（`spawn_attach_with` 的 parked 續行）：佔位退休落盤失敗留下 parked，`bind COM0→B3` 的落盤也
+/// ENOSPC（記憶體已改綁、DeviceOnline 未送出，parked 未被取走）；之後 `bootstrap_attach` → `spawn_attach_with` 以 C1′
+/// 同 token 認領給 COM0 的開埠工作並交給交接列。正式 bridge 的 configure 失敗、handle 確認關閉（closed:true）時，該紀錄
+/// 依 C3 結算（移除、終態 Closed），不停在 `Closing`。
+#[test]
+fn test_parked_continuation_spawn_attach_claims_same_token_and_settles_on_open_close() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (m, dev, token) = dr7_formal_parked_rig(None);
+    let full_sid = m.mgr.resolve("COM0").expect("COM0 session");
+    m.fs.fail_next_atomic_write(PalError::io(28, "[Errno 28] No space left on device"));
+    let bound = m.mgr.bind(&full_sid, DR7_BY_ID);
+    assert!(bound.is_err(), "第二次落盤 ENOSPC 必須向上回錯：{bound:?}");
+    let parked = m.mgr.custody_for_test(DR7_BY_ID).expect("parked 紀錄仍在");
+    assert_eq!(parked.token, token);
+    assert_eq!(parked.owner, CustodyOwner::Parked, "bind 落盤失敗未取走 parked");
+    assert!(m.mgr.has_inflight_attach_for_test(DR7_BY_ID));
+
+    dev.fail_configure(PalError::io(5, "[Errno 5] Input/output error"));
+    m.mgr.bootstrap_attach();
+
+    wait_until("configure 失敗後關閉原 handle", || dev.close_count() == 1);
+    wait_until("關閉成功後帳本紀錄結算", || m.mgr.custody_for_test(DR7_BY_ID).is_none());
+    assert_eq!(
+        m.mgr.terminal_for_test(token).map(|t| t.handle),
+        Some(TerminalHandle::Closed),
+        "同 token 的終態為 Closed"
+    );
+    assert!(!dev.is_open());
+    assert!(!m.mgr.unconfirmed_close_for_test(DR7_BY_ID), "closed:true 不得登記未確認關閉");
+    assert!(!m.mgr.has_inflight_attach_for_test(DR7_BY_ID), "parked 作業已由續行者取走");
+}
+
+fn claimed_inc(rec: &CustodySnapshot) -> u64 {
+    match &rec.owner {
+        CustodyOwner::Session { inc, .. } => *inc,
+        other => panic!("owner 應為 Session：{other:?}"),
+    }
 }
 
 #[test]
@@ -1980,4 +2234,60 @@ fn test_dr9_actor_spawn_failure_via_manager_path() {
     // 驗證帳本中無殘留
     let c = m.mgr.custody_for_test(BY_ID);
     assert!(c.is_none(), "建構失敗清理後帳本不得殘留：{c:?}");
+}
+
+/// 審查（sol-7d19d5c8_6a679fb0）既有碼待辦：`claim_for_release` 在 phase 不是 `Held` 時回錯誤，紀錄的 owner、cancel、
+/// phase 與 token 都必須原樣保留（先檢查、成立才改）；只有 `Held` 才轉 `Closing{release}`、owner Reaper、cancel Release。
+#[test]
+fn test_claim_for_release_non_held_phase_leaves_record_unchanged() {
+    let unconfirmed = UnconfirmedCloses::new();
+    let mut ledger = CustodyLedger::new(unconfirmed.clone());
+    let by_id = "by-id-claim-release";
+    let real_path = "/dev/ttyCFR";
+    let sid = "t:COM5".to_string();
+    let inc = ledger.alloc_session_inc(&sid);
+    let token = ledger
+        .register(
+            by_id,
+            real_path,
+            CustodyOwner::Session { sid: sid.clone(), inc },
+            CustodyTaker::OpenJob { sid: sid.clone(), gen: 1 },
+        )
+        .unwrap();
+
+    let non_held = [
+        CustodyPhase::Opening { taker: CustodyTaker::OpenJob { sid: sid.clone(), gen: 1 } },
+        CustodyPhase::Taken { taker: CustodyTaker::OpenJob { sid: sid.clone(), gen: 1 } },
+        CustodyPhase::Bridged { epoch: 7, worker: None },
+        CustodyPhase::BridgeDraining { epoch: 7, stop_id: StopId(3) },
+        CustodyPhase::Closing { job: "stop".into() },
+        CustodyPhase::CloseFailed { error: "close unconfirmed".into() },
+    ];
+    for phase in non_held {
+        ledger.custody.get_mut(by_id).unwrap().phase = phase;
+        let before = ledger.get_custody(by_id).unwrap().snapshot();
+        assert!(
+            ledger.claim_for_release(by_id, token).is_err(),
+            "非 Held 的 phase 不得被 release 認領：{before:?}"
+        );
+        let after = ledger.get_custody(by_id).unwrap().snapshot();
+        assert_eq!(after, before, "claim_for_release 失敗時紀錄不得被改寫");
+        assert_eq!(after.owner, CustodyOwner::Session { sid: sid.clone(), inc });
+        assert_eq!(after.cancel, None);
+    }
+
+    // token 不符同樣不得改寫紀錄。
+    ledger.custody.get_mut(by_id).unwrap().phase = CustodyPhase::Held { parts: None };
+    let before = ledger.get_custody(by_id).unwrap().snapshot();
+    assert!(ledger.claim_for_release(by_id, token + 1000).is_err());
+    assert_eq!(ledger.get_custody(by_id).unwrap().snapshot(), before);
+
+    // Held 才成立：轉 Closing{release}、owner Reaper、cancel Release，token 不變。
+    assert!(ledger.claim_for_release(by_id, token).is_ok());
+    let claimed = ledger.get_custody(by_id).unwrap().snapshot();
+    assert_eq!(claimed.token, token);
+    assert_eq!(claimed.owner, CustodyOwner::Reaper);
+    assert_eq!(claimed.cancel, Some(CustodyCancel::Release));
+    assert_eq!(claimed.phase, CustodyPhaseSnapshot::Closing { job: "release".into() });
+    assert!(!unconfirmed.contains(by_id));
 }

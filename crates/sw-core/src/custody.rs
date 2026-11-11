@@ -619,20 +619,50 @@ impl CustodyLedger {
     }
 
     /// D4 / DR-7: release 認領未消費的 parked 紀錄並轉 Closing 由關閉工作者關閉。
+    /// 先檢查 token 與 phase，全部成立才改寫 owner、cancel 與 phase；回錯誤時紀錄原樣保留。
     pub fn claim_for_release(&mut self, by_id: &str, token: u64) -> Result<Option<HandleParts>, &'static str> {
         let rec = self.custody.get_mut(by_id).ok_or("not found")?;
         if rec.token != token {
             return Err("token mismatch");
         }
+        if !matches!(rec.phase, CustodyPhase::Held { .. }) {
+            return Err("not held");
+        }
+        let CustodyPhase::Held { parts } =
+            std::mem::replace(&mut rec.phase, CustodyPhase::Closing { job: "release".into() })
+        else {
+            unreachable!("上方已確認 phase 為 Held");
+        };
         rec.owner = CustodyOwner::Reaper;
         rec.cancel = Some(CustodyCancel::Release);
-        match std::mem::replace(&mut rec.phase, CustodyPhase::Closing { job: "release".into() }) {
-            CustodyPhase::Held { parts } => Ok(parts),
-            other => {
-                rec.phase = other;
-                Err("not held")
-            }
+        Ok(parts)
+    }
+
+    /// C1′ 同 token 認領的資源已關閉（成功接手以外的收尾）：紀錄仍是該 token、且資源已離開帳本（`Taken` 或
+    /// `Closing`）時依回條結算（closed:true 移除並記終態，closed:false 轉 CloseFailed 並登記未確認）；資源仍在帳本
+    /// （`Held`、`Bridged`）或已被其他流程結算者不動。回傳是否結算。
+    pub fn settle_claimed_close(&mut self, by_id: &str, token: u64, terminal: Terminal) -> bool {
+        let claimed = self.custody.get(by_id).is_some_and(|rec| {
+            rec.token == token
+                && matches!(rec.phase, CustodyPhase::Taken { .. } | CustodyPhase::Closing { .. })
+        });
+        if claimed {
+            self.settle_close(token, terminal);
         }
+        claimed
+    }
+
+    /// 同 [`CustodyLedger::settle_claimed_close`]，但只結算 `Taken`：認領方（開埠工作、attach 作業）自己持有並關閉的
+    /// handle。`Closing` 由轉入 Closing 的關閉者結算，不受其他持有者的關閉影響。
+    pub fn settle_taken_close(&mut self, by_id: &str, token: u64, terminal: Terminal) -> bool {
+        let taken = self
+            .custody
+            .get(by_id)
+            .is_some_and(|rec| rec.token == token && matches!(rec.phase, CustodyPhase::Taken { .. }));
+        if taken {
+            self.settle_close(token, terminal);
+        }
+        taken
     }
 
     /// C8 / DR-9: actor 建構失敗時清理並產出關閉工作。
@@ -924,6 +954,8 @@ pub enum DeliveryStepResult {
 pub struct Deliverer {
     pub obligations: HashMap<String, DeliveryObligation>,
     pub gate: Arc<AdmissionGate>,
+    /// 各 sid 實際送達（`try_send` 成功）的累計次數（觀測用：驗證容量恢復後只送達一次）。
+    delivered: HashMap<String, usize>,
 }
 
 impl Default for Deliverer {
@@ -937,7 +969,13 @@ impl Deliverer {
         Self {
             obligations: HashMap::new(),
             gate,
+            delivered: HashMap::new(),
         }
+    }
+
+    /// sid 累計實際送達次數。
+    pub fn delivered_count(&self, sid: &str) -> usize {
+        self.delivered.get(sid).copied().unwrap_or(0)
     }
 
     pub fn obligation_count(&self) -> usize {
@@ -1074,6 +1112,7 @@ impl Deliverer {
         }) {
             Ok(()) => {
                 self.obligations.remove(sid);
+                *self.delivered.entry(sid.to_string()).or_insert(0) += 1;
                 DeliveryStepResult::Delivered
             }
             Err(TrySendError::Full(_)) => {

@@ -122,6 +122,30 @@ const PROBE_COM: &str = "PROBE";
 struct Preopened {
     real_path: String,
     parts: HandleParts,
+    /// S2-PAR-wp510r（C1′）：handle 自保管帳本認領出來時的紀錄 token（`Taken`／`Closing`，資源已離開帳本）；
+    /// 收尾關閉時依此結算該紀錄（`Shared::close_before_bridge`、`close_claimed_handoff`、`finish_attach_op`）。
+    /// 不是自帳本取出的 handle（新開、PROBE 自開）為 `None`。
+    custody: Option<u64>,
+}
+
+impl Preopened {
+    /// 不屬於保管帳本紀錄的 handle。
+    fn new(real_path: String, parts: HandleParts) -> Preopened {
+        Preopened {
+            real_path,
+            parts,
+            custody: None,
+        }
+    }
+
+    /// 自保管帳本紀錄 `token` 認領出來的 handle。
+    fn claimed(real_path: String, parts: HandleParts, token: u64) -> Preopened {
+        Preopened {
+            real_path,
+            parts,
+            custody: Some(token),
+        }
+    }
 }
 
 /// `SerialHandle::split` 的四件組；可原樣重組成 `SerialHandle` 交給 `IoWorker::start`（同一 OS handle）。
@@ -156,6 +180,14 @@ fn close_error_text(receipt: &CloseReceipt) -> String {
         .as_ref()
         .map(|error| error.py_message.clone())
         .unwrap_or_else(|| "close 回條為 closed:false 且未附錯誤".to_string())
+}
+
+/// 保管帳本紀錄的成功關閉終態（handle 已確認關閉、無排空證據）。
+fn closed_terminal() -> crate::custody::Terminal {
+    crate::custody::Terminal {
+        handle: crate::custody::TerminalHandle::Closed,
+        evidence: crate::custody::TerminalEvidence::Complete,
+    }
 }
 
 /// Python `_finish_attach_op` 的預開 handle 關閉失敗告警（`session_manager.py:4326-4331`）。
@@ -399,6 +431,12 @@ struct AttachOp {
     /// PROBE TxWriter 的 CancelToken（Python `begin_drain` 的 `_tx_cancel.set()`，`uart_io.py:908-918`）；
     /// `probe_send` 登錄，取消者一併撤銷進行中的寫入。
     probe_cancel: Arc<Mutex<Option<CancelToken>>>,
+    /// S2-PAR-wp510r（C1′）：作業持有、自保管帳本認領出來的 handle 所屬紀錄 token（0＝無）。佔位開埠於登記時設定，
+    /// parked 續行與交接列的關閉中作業隨 `Preopened::custody` 帶入，`attach_dynamic` 自帳本取 handle 時設定。
+    custody_token: Arc<AtomicU64>,
+    /// 作業曾以 `close_parts` 確認關閉 handle（`closed:true`）；`finish_attach_op` 據此結算仍為 `Taken` 的帳本紀錄
+    /// （handle 交給 session 或出生即接管者不設定，紀錄由接手方結算）。
+    handle_closed: Arc<AtomicBool>,
 }
 
 impl AttachOp {
@@ -409,6 +447,7 @@ impl AttachOp {
         dynamic_only: bool,
         preopened: Option<Preopened>,
     ) -> AttachOp {
+        let preopened_custody = preopened.as_ref().and_then(|pre| pre.custody);
         AttachOp {
             token: NEXT_ATTACH_OP_TOKEN.fetch_add(1, Ordering::Relaxed),
             by_id: by_id.to_string(),
@@ -425,6 +464,22 @@ impl AttachOp {
             parked: Arc::new(AtomicBool::new(false)),
             probe_fence: Fence::new(),
             probe_cancel: Arc::new(Mutex::new(None)),
+            custody_token: Arc::new(AtomicU64::new(
+                preopened_custody.unwrap_or(0),
+            )),
+            handle_closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// 記錄作業持有之 handle 的保管帳本 token（C1′ 認領或佔位登記）。
+    fn set_custody_token(&self, token: u64) {
+        self.custody_token.store(token, Ordering::SeqCst);
+    }
+
+    fn custody_token(&self) -> Option<u64> {
+        match self.custody_token.load(Ordering::SeqCst) {
+            0 => None,
+            token => Some(token),
         }
     }
 
@@ -448,7 +503,9 @@ impl AttachOp {
 
     fn close_parts(&self, parts: HandleParts) -> CloseReceipt {
         let receipt = parts.close();
-        if !receipt.closed {
+        if receipt.closed {
+            self.handle_closed.store(true, Ordering::SeqCst);
+        } else {
             self.mark_close_failed(close_error_text(&receipt));
         }
         receipt
@@ -518,6 +575,10 @@ enum BridgeTake {
 #[cfg(feature = "test-fakes")]
 type ByIdTestHook = (String, Box<dyn FnOnce() + Send>);
 
+/// 只供測試（test-fakes）：綁定 session_id 的一次性鉤子。
+#[cfg(feature = "test-fakes")]
+type SidTestHook = (String, Box<dyn FnOnce() + Send>);
+
 /// 已建立、尚未放行的 attach worker 執行緒（`Shared::prepare_attach_worker`）。
 struct PreparedAttachWorker {
     go: Sender<()>,
@@ -575,7 +636,7 @@ struct HandoffProbes {
 }
 
 impl Inner {
-    fn new(unconfirmed: Arc<UnconfirmedCloses>) -> Self {
+    fn new(unconfirmed: Arc<UnconfirmedCloses>, admission: Arc<crate::admission::AdmissionGate>) -> Self {
         Self {
             sessions: IndexMap::new(),
             devices: BTreeMap::new(),
@@ -590,7 +651,7 @@ impl Inner {
             shutdown_started: false,
             custody: crate::custody::CustodyLedger::new(unconfirmed),
             prepared: HashMap::new(),
-            deliverer: crate::custody::Deliverer::default(),
+            deliverer: crate::custody::Deliverer::new(admission),
         }
     }
 
@@ -703,9 +764,10 @@ struct Shared {
     /// 只供測試（test-fakes）：覆寫傳檔 RPC 等待期限，驗證 actor timeout 後仍由操作持有 admission。
     #[cfg(feature = "test-fakes")]
     file_transfer_timeout_override: Mutex<Option<Duration>>,
-    /// 只供測試（test-fakes）：executor 執行效果時的注入 unwind 鉤子（重現 actor 在 catch_unwind 之外崩潰）。
+    /// 只供測試（test-fakes）：指定 session 的 executor 執行下一個效果時的一次性注入 unwind 鉤子（重現 actor 在
+    /// catch_unwind 之外崩潰）；只對 sid 相符的 session 生效。
     #[cfg(feature = "test-fakes")]
-    executor_unwind_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    executor_unwind_hook: Mutex<Option<SidTestHook>>,
     /// 載入的 state.json 含孤立 surrogate（`LoadedState::lone_surrogates`；啟動存檔前檢查）。
     lone_surrogates: bool,
     /// 啟動存檔重現的 Python 未捕捉例外末行（`_save_state` 的 `UnicodeEncodeError`）；daemon 據此 exit 1。
@@ -1135,10 +1197,7 @@ impl Shared {
                             job: "shutdown".into(),
                         };
                         rec.owner = crate::custody::CustodyOwner::Reaper;
-                        Preopened {
-                            real_path: rec.real_path.clone(),
-                            parts: p,
-                        }
+                        Preopened::claimed(rec.real_path.clone(), p, rec.token)
                     }),
                     _ => None,
                 }
@@ -1187,11 +1246,18 @@ impl Shared {
     /// （`PlaceholderAttachSettled`）；`closed:false` 以 by_id 與錯誤告警、保留作業並登記未確認關閉（`:4322-4332`）。
     /// 作業未能登錄（同 by_id 已有其他作業）時由 `retain_unconfirmed_close` 改標記該作業。
     fn close_claimed_handoff(&self, by_id: &str, op: &AttachOp) {
-        let failed = op
-            .close_preopened_with_receipt()
-            .is_some_and(|receipt| !receipt.closed);
+        let receipt = op.close_preopened_with_receipt();
+        let failed = receipt.as_ref().is_some_and(|receipt| !receipt.closed);
         if failed {
             self.retain_unconfirmed_close(by_id);
+        } else if receipt.is_some() {
+            // 認領出來的帳本 handle（交接列取自帳本 `Held` 轉 `Closing`，或 C1′ 續行的 `Taken`）已確認關閉：結算該
+            // token 的紀錄（C3），不留到下一次開埠才被覆寫（審查 P8-6a679fb-1）。
+            if let Some(token) = op.custody_token() {
+                lock(&self.inner)
+                    .custody
+                    .settle_claimed_close(by_id, token, closed_terminal());
+            }
         }
         self.finish_attach_op(by_id, op, None);
     }
@@ -1243,10 +1309,7 @@ impl Shared {
                                             gen: 1,
                                         },
                                     };
-                                    Preopened {
-                                        real_path: dev.to_string(),
-                                        parts: p,
-                                    }
+                                    Preopened::claimed(dev.to_string(), p, rec.token)
                                 })
                             }
                             _ => None,
@@ -1266,29 +1329,9 @@ impl Shared {
             return BridgeTake::Handle(pre);
         }
 
-        // handoff 查無交接列時：先看 io.preopened，再看 custody 是否有同 by_id 的 Parked handle (C1')
-        if let Some(pre) = lock(&io.preopened).take() {
-            return BridgeTake::Handle(Some(pre));
-        }
-
-        let by_id = lock(&io.profile).device_by_id.clone();
-        if let Ok((_token, parts)) = inner.custody.claim_parked(
-            &by_id,
-            dev,
-            crate::custody::CustodyTaker::OpenJob {
-                sid: lock(&io.sid).clone(),
-                gen: 1,
-            },
-        ) {
-            if let Some(parts) = parts {
-                return BridgeTake::Handle(Some(Preopened {
-                    real_path: dev.to_string(),
-                    parts,
-                }));
-            }
-        }
-
-        BridgeTake::Handle(None)
+        // handoff 查無交接列時沿用 `io.preopened`。parked 紀錄（`Held{owner: Parked}`）只與 parked 作業並存，由取走
+        // parked 作業的消費者在同一臨界區以 C1′ 同 token 認領（`claim_parked_locked`），這裡不會遇到未認領的 parked。
+        BridgeTake::Handle(lock(&io.preopened).take())
     }
 
     /// `open_bridge` 收尾：正式 bridge 已接手（Python `_handoff_attach_op_locked` `:4374-4383`）或 handle 已關閉
@@ -1305,9 +1348,17 @@ impl Shared {
     /// `open_bridge` 在正式 bridge 接手前關閉 handle（預開或剛開啟者）；回傳是否確認關閉。對應 Python `_attach_by_id`
     /// 的中止路徑：預開作業已移入 `_active_attach_ops`（`:4852-4854`），`_finish_attach_op` 關閉失敗即回 False 並保留
     /// 作業（`:4322-4332`）。`closed:false` 時告警並經 `retain_unconfirmed_close` 讓該 by_id 持續參與排空判定與阻擋。
-    fn close_before_bridge(&self, by_id: &str, parts: HandleParts) -> bool {
+    ///
+    /// `custody` 為 handle 自保管帳本認領時的 token（`Preopened::custody`）：確認關閉即結算仍為 `Taken` 的該紀錄（C3；
+    /// 審查 P8-6a679fb-1，不留到下一次成功開埠才被覆寫）。新開的 handle 傳 `None`。
+    fn close_before_bridge(&self, by_id: &str, parts: HandleParts, custody: Option<u64>) -> bool {
         let receipt = parts.close();
         if receipt.closed {
+            if let Some(token) = custody {
+                lock(&self.inner)
+                    .custody
+                    .settle_taken_close(by_id, token, closed_terminal());
+            }
             return true;
         }
         self.warn(preopened_close_warning(by_id, &close_error_text(&receipt)));
@@ -1781,7 +1832,7 @@ impl Shared {
                 if op.parked.swap(false, Ordering::SeqCst) {
                     let pre = inner.custody.claim_for_release(&by_id, op.token).ok().flatten().map(|parts| {
                         let real_path = inner.device_path(&by_id).unwrap_or("").to_string();
-                        Preopened { real_path, parts }
+                        Preopened::claimed(real_path, parts, op.token)
                     }).or_else(|| op.take_preopened());
                     unconsumed.push((by_id, op, pre));
                 }
@@ -1942,24 +1993,21 @@ impl Shared {
         {
             // 未消費的預開作業（佔位退休落盤失敗留下）：Python `_attach_by_id` 先自 `_preopened_ports` 取走作業，以同一
             // handle 續行 attach（`origin/main:sw_core/session_manager.py:4852-4854`）。handle 在本臨界區內交給新作業或
-            // session 的交接列，不離開 manager 的追蹤。
+            // session 的交接列，不離開 manager 的追蹤。帳本紀錄以 C1′ 同 token 認領（`Taken`，handle 仍在使用，不轉
+            // Closing；審查 P8-6a679fb-1）：已有綁定的 session 時由其開埠工作接手（交接列），否則由 spawn worker。
             let parked_op = inner.inflight.remove(by_id);
             if let Some(pre) = preopened.take() {
                 let _ = pre.parts.close();
             }
             if let Some(op) = parked_op {
-                let current = inner.device_path(by_id).map(str::to_string);
-                let pre = inner
-                    .custody
-                    .claim_for_release(by_id, op.token)
-                    .ok()
-                    .flatten()
-                    .map(|parts| Preopened {
-                        real_path: current.clone().unwrap_or_default(),
-                        parts,
-                    })
-                    .or_else(|| op.take_preopened());
-                preopened = pre;
+                let taker = match inner.session_by_id(by_id) {
+                    Some(e) => crate::custody::CustodyTaker::OpenJob {
+                        sid: e.sid.clone(),
+                        gen: 1,
+                    },
+                    None => crate::custody::CustodyTaker::Worker("spawn_attach".into()),
+                };
+                preopened = Self::claim_parked_locked(&mut inner, by_id, &op, taker);
             }
         }
         if let Some(op) = inner.inflight.get(by_id) {
@@ -1979,24 +2027,6 @@ impl Shared {
             }
             return;
         };
-        if preopened.is_none() {
-            if inner
-                .custody
-                .get_custody(by_id)
-                .is_some_and(|c| c.owner == crate::custody::CustodyOwner::Parked)
-            {
-                if let Ok((_token, Some(parts))) = inner.custody.claim_parked(
-                    by_id,
-                    &real,
-                    crate::custody::CustodyTaker::Worker("spawn_attach".into()),
-                ) {
-                    preopened = Some(Preopened {
-                        real_path: real.clone(),
-                        parts,
-                    });
-                }
-            }
-        }
         if let Some(e) = inner.session_by_id(by_id) {
             let pin_differs = pins
                 .get(by_id)
@@ -2030,19 +2060,35 @@ impl Shared {
                 return;
             }
         }
-        let op = AttachOp::new(
-            by_id,
-            &self.unconfirmed_closes,
-            after_clear,
-            dynamic_only,
-            preopened.map(|pre| Preopened {
-                real_path: real.clone(),
-                parts: pre.parts,
-            }),
-        );
+        // 只有 parked 續行會帶 handle 進來（呼叫端皆傳 `None`）：路徑沿用 handle 開啟時的路徑，與目前路徑不符者由
+        // `attach_dynamic` 關閉；帳本 token 隨 handle 帶入作業（`Preopened::custody` → `AttachOp::custody_token`）。
+        let op = AttachOp::new(by_id, &self.unconfirmed_closes, after_clear, dynamic_only, preopened);
         inner.inflight.insert(by_id.to_string(), op.clone());
         drop(inner);
         self.spawn_attach_worker(by_id, op);
+    }
+
+    /// C1′：取走 parked 作業（`swap(false)` 並移出 `inflight`）的續行者，在同一臨界區以同 token 認領其帳本紀錄
+    /// （`Held{owner: Parked}` → `Taken{taker}`，不轉 Closing、不登記新紀錄），回傳帶該 token 的 handle。路徑沿用紀錄
+    /// （handle 開啟時的路徑），與目前路徑是否相符由呼叫端判定（不符者關閉，見 `spawn_attach_with`、`bind`）。
+    /// 紀錄不是該作業的 parked 紀錄（token 不符、已非 `Held`）時不動帳本，只取作業自身的 handle。
+    fn claim_parked_locked(
+        inner: &mut Inner,
+        by_id: &str,
+        op: &AttachOp,
+        taker: crate::custody::CustodyTaker,
+    ) -> Option<Preopened> {
+        let rec_path = inner
+            .custody
+            .get_custody(by_id)
+            .filter(|rec| rec.token == op.token && rec.owner == crate::custody::CustodyOwner::Parked)
+            .map(|rec| rec.real_path.clone());
+        if let Some(rec_path) = rec_path {
+            if let Ok((token, Some(parts))) = inner.custody.claim_parked(by_id, &rec_path, taker) {
+                return Some(Preopened::claimed(rec_path, parts, token));
+            }
+        }
+        op.take_preopened()
     }
 
     /// 啟動已登錄於 `inflight` 的 attach op（自動 attach 路徑）。執行緒建立失敗沒有 RPC 可回報：告警留下診斷後
@@ -2353,6 +2399,7 @@ impl Shared {
                 Err(_) => return Ok(session_recovering_reply(public)),
             };
             op.token = token;
+            op.set_custody_token(token);
             inner.inflight.insert(by_id.clone(), op.clone());
         }
 
@@ -2527,6 +2574,16 @@ impl Shared {
             }
             return;
         }
+        // 作業自帳本認領（C1′ 續行、佔位開埠）的 handle 已由作業自己確認關閉（`close_parts` closed:true）：結算仍為
+        // `Taken` 的該紀錄（C3；審查 P8-6a679fb-1）。handle 已交給 session（交接列、出生即接管）者紀錄不是本作業的
+        // `Taken`，由接手方結算。
+        if let Some(token) = op.custody_token() {
+            if op.handle_closed.load(Ordering::SeqCst) {
+                inner
+                    .custody
+                    .settle_taken_close(by_id, token, closed_terminal());
+            }
+        }
         if inner
             .inflight
             .get(by_id)
@@ -2693,6 +2750,8 @@ impl Shared {
                         rec.phase = crate::custody::CustodyPhase::Taken {
                             taker: crate::custody::CustodyTaker::Worker("attach_dynamic".into()),
                         };
+                        // 作業之後自行關閉時（`close_parts`）由 `finish_attach_op` 結算此 token（C3）。
+                        op.set_custody_token(rec.token);
                         p
                     })
                 }
@@ -2749,10 +2808,7 @@ impl Shared {
                 && inner.sessions.len() < self.max_sessions
                 && inner.session_by_id(by_id).is_none();
             if valid {
-                let preopened = parts.take().map(|parts| Preopened {
-                    real_path: real.clone(),
-                    parts,
-                });
+                let preopened = parts.take().map(|parts| Preopened::new(real.clone(), parts));
                 let sid = self
                     .session_from_template_locked(&mut inner, &tpl, by_id, source, None, preopened);
                 if let Some(sid) = sid {
@@ -3051,10 +3107,7 @@ impl Shared {
                     &mut inner,
                     by_id,
                     &io,
-                    Preopened {
-                        real_path: real.clone(),
-                        parts,
-                    },
+                    Preopened::new(real.clone(), parts),
                 );
                 drop(inner);
                 for pre in displaced {
@@ -3604,9 +3657,10 @@ impl OpenCtx {
         let stopped = || OpenFailure::Other(PalError::plain(PalErrorKind::Io, "daemon stopping"));
         let by_id = lock(&self.io.profile).device_by_id.clone();
         // 接手前關閉 handle（見 `AttachOp` 的未確認關閉盤點）：`closed:false` 以 `CloseUnconfirmed` 包住原失敗交給 actor，
-        // manager 端由 `close_before_bridge` 保留阻擋作業。
-        let close_or_fail = |parts: HandleParts, failure: OpenFailure| {
-            if self.shared.close_before_bridge(&by_id, parts) {
+        // manager 端由 `close_before_bridge` 保留阻擋作業。`custody` 為 handle 自帳本認領時的 token（新開者 `None`），
+        // 確認關閉即結算該紀錄。
+        let close_or_fail = |parts: HandleParts, custody: Option<u64>, failure: OpenFailure| {
+            if self.shared.close_before_bridge(&by_id, parts, custody) {
                 failure
             } else {
                 OpenFailure::CloseUnconfirmed(Box::new(failure))
@@ -3614,7 +3668,7 @@ impl OpenCtx {
         };
         if lock(&self.shared.inner).stopping {
             if let Some(pre) = pre {
-                return Err(close_or_fail(pre.parts, stopped()));
+                return Err(close_or_fail(pre.parts, pre.custody, stopped()));
             }
             return Err(stopped());
         }
@@ -3623,10 +3677,12 @@ impl OpenCtx {
         // `_finish_attach_op` 關閉，`origin/main:sw_core/session_manager.py:4933-4944`）。
         if self.shared.unconfirmed_closes.contains(&by_id) {
             if let Some(pre) = pre {
-                return Err(close_or_fail(pre.parts, OpenFailure::CloseBlocked));
+                return Err(close_or_fail(pre.parts, pre.custody, OpenFailure::CloseBlocked));
             }
             return Err(OpenFailure::CloseBlocked);
         }
+        // 交給正式 bridge 的 handle 若取自帳本認領，記下 token：之後的關閉結算同一紀錄。
+        let mut handle_custody = None;
         let handle: Box<dyn SerialHandle> = match pre {
             Some(pre) if pre.real_path == dev.0 => {
                 // Python bridge 啟動時對預開 port 呼叫 `port.configure(self.profile)`：PROBE 以預設設定開啟，
@@ -3635,9 +3691,10 @@ impl OpenCtx {
                     Ok(()) => {}
                     Err(error) if error.kind == PalErrorKind::Unsupported => {}
                     Err(error) => {
-                        return Err(close_or_fail(pre.parts, OpenFailure::Other(error)));
+                        return Err(close_or_fail(pre.parts, pre.custody, OpenFailure::Other(error)));
                     }
                 }
+                handle_custody = pre.custody;
                 Box::new(ReassembledHandle(pre.parts))
             }
             other => {
@@ -3647,7 +3704,9 @@ impl OpenCtx {
                         PalErrorKind::Io,
                         "預開 UART handle 未確認關閉",
                     ));
-                    if let failure @ OpenFailure::CloseUnconfirmed(_) = close_or_fail(pre.parts, failure) {
+                    if let failure @ OpenFailure::CloseUnconfirmed(_) =
+                        close_or_fail(pre.parts, pre.custody, failure)
+                    {
                         return Err(failure);
                     }
                 }
@@ -3665,12 +3724,16 @@ impl OpenCtx {
         };
         if lock(&self.shared.inner).stopping {
             // open 返回時已進 stopping：不交給 actor（零 TX），立即關閉；未確認關閉同樣保留阻擋。
-            return Err(close_or_fail(HandleParts::split(handle), stopped()));
+            return Err(close_or_fail(HandleParts::split(handle), handle_custody, stopped()));
         }
         if self.shared.unconfirmed_closes.contains(&by_id) {
             // 開埠期間 by_id 才登記為未確認關閉：Python `attach_device` 開埠後重驗 `_draining_by_ids`，以 `_finish_attach_op`
             // 關閉剛開的 handle（`origin/main:sw_core/session_manager.py:3576-3588`、`:3614-3631`）；不交給 actor（零 TX）。
-            return Err(close_or_fail(HandleParts::split(handle), OpenFailure::CloseBlocked));
+            return Err(close_or_fail(
+                HandleParts::split(handle),
+                handle_custody,
+                OpenFailure::CloseBlocked,
+            ));
         }
         let epoch = self.shared.epochs.next();
         let observers = lock(&self.shared.rx_observers).clone();
@@ -3862,8 +3925,19 @@ impl ManagerExec {
 impl EffectExecutor for ManagerExec {
     fn execute(&mut self, e: Effect, tx: &Sender<ControlEvent>, safety: &Sender<ControlEvent>) {
         #[cfg(feature = "test-fakes")]
-        if let Some(hook) = lock(&self.shared.executor_unwind_hook).take() {
-            hook();
+        {
+            // 先在鎖內取出（只取 sid 相符者）再於鎖外呼叫：鉤子 panic 時不持有 guard，也不影響其他 session。
+            let sid = lock(&self.io.sid).clone();
+            let hook = {
+                let mut slot = lock(&self.shared.executor_unwind_hook);
+                match slot.as_ref() {
+                    Some((target, _)) if *target == sid => slot.take().map(|(_, hook)| hook),
+                    _ => None,
+                }
+            };
+            if let Some(hook) = hook {
+                hook();
+            }
         }
         match e {
             Effect::Reply(reply, result) => {
@@ -4288,6 +4362,9 @@ impl SessionManager {
         let (reaper_event_tx, reaper_event_rx) = crossbeam_channel::unbounded();
         let max_sessions = pyint_usize(&load.max_sessions, 16);
         let unconfirmed_closes = UnconfirmedCloses::new();
+        // 送達者的凍結狀態取自正式的交接 admission 邊界（命令登錄表的 gate；`Service::handoff_stop` 與 session actor 的
+        // 交接延後共用同一物件），正式交接凍結即暫停送達、凍結區間不計入 30 s 總時限（設計 §3.1.7、C4）。
+        let admission = registry.admission_gate();
         let shared = Arc::new(Shared {
             serial,
             uart_excl,
@@ -4306,7 +4383,7 @@ impl SessionManager {
             epochs: EpochAllocator::new(),
             templates: load.templates.clone(),
             max_sessions,
-            inner: Mutex::new(Inner::new(unconfirmed_closes.clone())),
+            inner: Mutex::new(Inner::new(unconfirmed_closes.clone(), admission)),
             cv: Condvar::new(),
             note_tx: note_tx.clone(),
             bg_index: {
@@ -4717,7 +4794,7 @@ impl SessionManager {
                         inner.inflight.remove(&by_id);
                         let pre = inner.custody.claim_for_release(&by_id, op.token).ok().flatten().map(|parts| {
                             let real_path = inner.device_path(&by_id).unwrap_or("").to_string();
-                            Preopened { real_path, parts }
+                            Preopened::claimed(real_path, parts, op.token)
                         }).or_else(|| op.take_preopened());
                         Step::CloseParked {
                             pre,
@@ -5192,6 +5269,8 @@ impl SessionManager {
             // `_attach_by_id` 取走 `_preopened_ports` 的作業並以同一 handle 建 bridge（`origin/main:sw_core/session_manager.py:4852-4854`、
             // `:4982`），因此把 handle 交給本 session 的正式 bridge，不重新開埠。
             // 移出在途表與寫入交接表在同一臨界區（Python `:4852-4854`），release／shutdown／bind 在任何時點都查得到。
+            // 帳本紀錄以 C1′ 同 token 認領給本 session 的開埠工作（`Taken{OpenJob}`，handle 仍在使用；審查 P8-6a679fb-1），
+            // 正式 bridge 接手（adopt）或關閉時結算。
             let parked = {
                 let mut inner = lock(&self.shared.inner);
                 let claimed = inner
@@ -5201,10 +5280,11 @@ impl SessionManager {
                 let op = if claimed { inner.inflight.remove(&by_id) } else { None };
                 op.map(|op| {
                     let current = inner.device_path(&by_id).map(str::to_string);
-                    let pre = inner.custody.claim_for_release(&by_id, op.token).ok().flatten().map(|parts| {
-                        let real_path = current.clone().unwrap_or_default();
-                        Preopened { real_path, parts }
-                    }).or_else(|| op.take_preopened());
+                    let taker = crate::custody::CustodyTaker::OpenJob {
+                        sid: sid.clone(),
+                        gen: 1,
+                    };
+                    let pre = Shared::claim_parked_locked(&mut inner, &by_id, &op, taker);
                     match pre {
                         Some(pre) if current.as_deref() == Some(pre.real_path.as_str()) => {
                             Shared::place_handoff_locked(&mut inner, &by_id, &io, pre)
@@ -5274,7 +5354,7 @@ impl SessionManager {
             let mut inner = lock(&self.shared.inner);
             inner.custody.claim_for_release(by_id, op.token).ok().flatten().map(|parts| {
                 let real_path = inner.device_path(by_id).unwrap_or("").to_string();
-                Preopened { real_path, parts }
+                Preopened::claimed(real_path, parts, op.token)
             }).or_else(|| op.take_preopened())
         };
         if let Some(pre) = pre {
@@ -5855,6 +5935,12 @@ impl SessionManager {
         lock(&self.shared.inner).deliverer.attempts(sid)
     }
 
+    /// 只供測試（test-fakes）：送達者對 sid 實際送達 DeviceAttached 的累計次數。
+    #[cfg(feature = "test-fakes")]
+    pub fn delivery_delivered_for_test(&self, sid: &str) -> usize {
+        lock(&self.shared.inner).deliverer.delivered_count(sid)
+    }
+
     /// 只供測試（test-fakes）：取得 deliverer 的 admission gate。
     #[cfg(feature = "test-fakes")]
     pub fn deliverer_gate_for_test(&self) -> Arc<crate::admission::AdmissionGate> {
@@ -5886,41 +5972,6 @@ impl SessionManager {
             )
             .expect("register ok");
         inner.custody.save_held_mock(token).expect("save_held_mock ok");
-        token
-    }
-
-    /// 只供測試（test-fakes）：在帳本登記一筆 owner 為 Parked 的 Held 紀錄。
-    #[cfg(feature = "test-fakes")]
-    pub fn custody_register_parked_for_test(
-        &self,
-        by_id: &str,
-        real_path: &str,
-        parts: Option<HandleParts>,
-    ) -> u64 {
-        let mut inner = lock(&self.shared.inner);
-        inner.devices.insert(
-            by_id.to_string(),
-            DeviceInfo {
-                by_id: by_id.to_string(),
-                real_path: real_path.to_string(),
-            },
-        );
-        let token = inner
-            .custody
-            .register(
-                by_id,
-                real_path,
-                crate::custody::CustodyOwner::Parked,
-                crate::custody::CustodyTaker::OpenJob {
-                    sid: "parked".to_string(),
-                    gen: 1,
-                },
-            )
-            .expect("register ok");
-        if let Some(rec) = inner.custody.custody.get_mut(by_id) {
-            rec.owner = crate::custody::CustodyOwner::Parked;
-            rec.phase = crate::custody::CustodyPhase::Held { parts };
-        }
         token
     }
 
@@ -6144,7 +6195,7 @@ impl SessionManager {
                 .map(|(by_id, token, op)| {
                     let pre = inner.custody.claim_for_release(&by_id, token).ok().flatten().map(|parts| {
                         let real_path = inner.device_path(&by_id).unwrap_or("").to_string();
-                        Preopened { real_path, parts }
+                        Preopened::claimed(real_path, parts, token)
                     }).or_else(|| op.take_preopened());
                     (by_id, op, pre)
                 })
@@ -6501,10 +6552,11 @@ impl SessionManager {
         }
     }
 
-    /// 只供測試（test-fakes）：設定 executor unwind 鉤子（重現 actor 在 catch_unwind 之外崩潰）。
+    /// 只供測試（test-fakes）：設定 `sid` 的 executor 一次性 unwind 鉤子（重現 actor 在 catch_unwind 之外崩潰）；
+    /// 只有該 session 的下一個效果會觸發。
     #[cfg(feature = "test-fakes")]
-    pub fn set_executor_unwind_hook_for_test(&self, hook: Box<dyn Fn() + Send + Sync>) {
-        *lock(&self.shared.executor_unwind_hook) = Some(hook);
+    pub fn set_executor_unwind_hook_for_test(&self, sid: &str, hook: Box<dyn FnOnce() + Send>) {
+        *lock(&self.shared.executor_unwind_hook) = Some((sid.to_string(), hook));
     }
 }
 

@@ -370,6 +370,28 @@ fn handoff_frozen_rejects_mutating_methods() {
     assert_eq!(assert_granted(&again, "重複交接"), s(&granted, "handoff_token").unwrap());
 }
 
+/// S2-PAR-wp510r（審查 sol-7d19d5c8_6a679fb0「既有碼待辦」）：DeviceAttached 送達者的凍結狀態取自正式的 admission
+/// 邊界——daemon 組裝的 `Service::admission()`（命令登錄表的 gate）與 manager 的送達者是同一個物件，不是送達者自建的
+/// gate。`daemon.handoff_stop` 成立（`freeze_if_idle` → TX fence 收斂 → `commit_handoff`）後送達者看到 Permanent（設計
+/// §3.1.7 送達者列：丟棄義務）；Pending 暫停與不計時限見 sw-core `custody::test_dr7_deliverer_pauses_on_formal_handoff_freeze_without_counting_deadline`。
+#[test]
+fn handoff_stop_freezes_custody_deliverer_gate() {
+    let r = ServiceRig::ready_shell();
+    let deliverer_gate = r.mgr.deliverer_gate_for_test();
+    assert!(
+        Arc::ptr_eq(r.svc.admission(), &deliverer_gate),
+        "送達者必須與 Service 共用正式的 admission gate"
+    );
+    assert_eq!(deliverer_gate.handoff_freeze_state(), sw_core::admission::HandoffFreezeState::Open);
+    let granted = r.svc.handoff_stop(&reason("update"));
+    assert_granted(&granted, "閒置交接");
+    assert_eq!(
+        deliverer_gate.handoff_freeze_state(),
+        sw_core::admission::HandoffFreezeState::Permanent,
+        "交接成立後送達者看到 Permanent"
+    );
+}
+
 /// 合併 P8 線與整合線 wp57（S2-PAR mergep8x）：admission 凍結的早退回應同樣經 Python `_versioned_response`
 /// （`origin/main:sw_core/service.py:870-874` 凍結回應、`:894-901` 補欄位），啟動指紋可用時在 `version` 之後補
 /// `code_fingerprint`；逐位元組比對 RPC wire。

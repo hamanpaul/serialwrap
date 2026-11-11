@@ -2346,6 +2346,7 @@ fn assemble_manager(
     serial: Arc<RigSerial>,
     warnings: Arc<Mutex<Vec<String>>>,
     console: Arc<dyn ConsoleTransportFactory>,
+    admission: Option<Arc<sw_core::admission::AdmissionGate>>,
 ) -> (Arc<SessionManager>, Arc<WalWriter>, Arc<CommandRegistry>) {
     let load = load_profiles(
         PROFILE_DIR,
@@ -2364,6 +2365,10 @@ fn assemble_manager(
     ));
     let warn_sink = warnings.clone();
     let registry = CommandRegistry::new();
+    if let Some(gate) = admission {
+        // 正式 admission 邊界於 manager 建構前掛上（daemon 的 `Service` 與 manager 共用同一登錄表的 gate）。
+        assert!(registry.set_admission(gate), "admission gate 只可掛上一次");
+    }
     let deps = ManagerDeps {
         serial: serial.clone(),
         uart_excl: Arc::new(RigExcl::for_serial(&serial)),
@@ -2428,6 +2433,27 @@ impl ManagerRig {
         primary: Option<(&str, &str)>,
         console: Arc<dyn ConsoleTransportFactory>,
     ) -> ManagerRig {
+        ManagerRig::assemble(yaml, loaded, primary, console, None)
+    }
+
+    /// 同 [`ManagerRig::with`]，但命令登錄表（manager 與 daemon `Service` 共用）的 admission gate 改用 `gate`
+    /// （例如注入假時鐘的 gate，驗證正式交接凍結對送達者的影響）。
+    pub fn with_admission_gate(
+        yaml: &str,
+        loaded: LoadedState,
+        primary: Option<(&str, &str)>,
+        gate: Arc<sw_core::admission::AdmissionGate>,
+    ) -> ManagerRig {
+        ManagerRig::assemble(yaml, loaded, primary, Arc::new(RigConsole), Some(gate))
+    }
+
+    fn assemble(
+        yaml: &str,
+        loaded: LoadedState,
+        primary: Option<(&str, &str)>,
+        console: Arc<dyn ConsoleTransportFactory>,
+        admission: Option<Arc<sw_core::admission::AdmissionGate>>,
+    ) -> ManagerRig {
         let serial = RigSerial::new();
         let shared = Arc::new(RigShared::default());
         let dev = match primary {
@@ -2462,6 +2488,7 @@ impl ManagerRig {
             serial.clone(),
             warnings.clone(),
             console.clone(),
+            admission,
         );
         ManagerRig {
             mgr,
@@ -2495,6 +2522,7 @@ impl ManagerRig {
             serial.clone(),
             Arc::new(Mutex::new(Vec::new())),
             Arc::new(RigConsole),
+            None,
         );
         (mgr, serial)
     }
@@ -2733,6 +2761,7 @@ impl ManagerRig {
             self.serial.clone(),
             warnings.clone(),
             self.console.clone(),
+            None,
         );
         ManagerRig {
             mgr,

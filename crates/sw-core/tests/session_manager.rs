@@ -4981,7 +4981,7 @@ fn test_placeholder_attach_bridge_opened_send_failure_close_failed_retains_block
     // 此時 preopened 已被取出，正式 bridge 正準備開啟。
     // 注入 executor 回呼 unwind，使 actor 在事件處理的 catch_unwind 外退出
     let resolved_sid = m.mgr.resolve("COM98").expect("session 存在");
-    m.mgr.set_executor_unwind_hook_for_test(Box::new(|| {
+    m.mgr.set_executor_unwind_hook_for_test(&resolved_sid, Box::new(|| {
         panic!("測試注入的 executor unwind（catch_unwind 之外）");
     }));
     if let Some(ctrl) = m.mgr.actor_control_for_test(&resolved_sid) {
@@ -4996,10 +4996,14 @@ fn test_placeholder_attach_bridge_opened_send_failure_close_failed_retains_block
     // 放行開埠工作，此時 actor 已退出，BridgeOpened 發送必失敗
     let _ = resume_tx.send(());
 
-    // 等待關閉與收尾
+    // 等待回收者結算到帳本終態（CloseFailed）：關閉計數遞增與結算之間有時間差，不以關閉計數為同步點。
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_secs(3) {
-        if device.close_count() >= 1 {
+        let settled = matches!(
+            m.mgr.custody_for_test(BY_ID).map(|c| c.phase),
+            Some(sw_core::custody::CustodyPhaseSnapshot::CloseFailed { .. })
+        );
+        if settled {
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -5042,7 +5046,7 @@ fn test_placeholder_attach_bridge_opened_send_failure_closed_settles() {
     // 此時 preopened 已被取出，正式 bridge 正準備開啟。
     // 注入 executor 回呼 unwind，使 actor 在事件處理的 catch_unwind 外退出
     let resolved_sid = m.mgr.resolve("COM97").expect("session 存在");
-    m.mgr.set_executor_unwind_hook_for_test(Box::new(|| {
+    m.mgr.set_executor_unwind_hook_for_test(&resolved_sid, Box::new(|| {
         panic!("測試注入的 executor unwind（catch_unwind 之外）");
     }));
     if let Some(ctrl) = m.mgr.actor_control_for_test(&resolved_sid) {
@@ -5057,10 +5061,10 @@ fn test_placeholder_attach_bridge_opened_send_failure_closed_settles() {
     // 放行開埠工作，此時 actor 已退出，BridgeOpened 發送必失敗
     let _ = resume_tx.send(());
 
-    // 等待關閉與收尾
+    // 等待回收者結算到帳本終態（紀錄移除）：關閉計數遞增與結算之間有時間差，不以關閉計數為同步點。
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_secs(3) {
-        if device.close_count() >= 1 {
+        if device.close_count() >= 1 && m.mgr.custody_for_test(BY_ID).is_none() {
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
