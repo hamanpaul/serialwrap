@@ -267,7 +267,8 @@ pub enum SessionRequest {
     /// bind 等待舊 by_id 的 attach op 逾時（#26；Python `bind_session` 直接寫活 session）：state RECOVERING、
     /// `drain_stalled=true`、`drain_timeout_epoch=epoch`，回 SESSION_RECOVERING 回應（審查 F64）。
     MarkAttachStalled {
-        epoch: u64,
+        /// 查詢快照成功時沿用當時 generation；查詢失敗時由 actor 讀取目前 generation。
+        epoch: Option<u64>,
     },
     /// S2-PAR-wp510r R3（設計 §3.1.6 T-1；SPEC-GAP 2 的處理）：release 的首次期限（RPC 進入時刻 +3000 ms，實時）
     /// 已到而 actor 尚未回覆。由 manager 的 release RPC 執行緒送出（Python `release_device` 在取得 manager lock 前起算
@@ -2837,7 +2838,8 @@ impl SessionCore {
                     self.set_state(SessionState::Recovering, now);
                 }
                 self.drain_stalled = true;
-                self.drain_timeout_epoch = Some(epoch);
+                self.drain_timeout_epoch =
+                    Some(epoch.unwrap_or(self.generations.bridge_generation));
                 let mut response = self.drain_stalled_reply(now);
                 response.insert("error_code", PyValue::from("SESSION_RECOVERING"));
                 vec![Effect::Reply(reply, Ok(response))]

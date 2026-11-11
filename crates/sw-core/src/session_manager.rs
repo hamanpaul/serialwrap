@@ -6193,23 +6193,30 @@ impl SessionManager {
         };
         let epoch = if let Some((_, epoch)) = saved {
             // 後續 release 沿用首次等待前快照；不得在 actor 暫停時再發 GetState。
-            epoch
+            Some(epoch.max(0) as u64)
         } else {
-            let snapshot = self.shared.session_public_checked(sid)?;
-            let epoch = snapshot
-                .get("bridge_generation")
-                .and_then(PyValue::as_i64)
-                .unwrap_or(0)
-                .max(0);
-            let mut inner = lock(&self.shared.inner);
-            let Some(wait) = inner.custody_release_waits.get_mut(&token) else {
-                return Ok(None);
-            };
-            // 多個 release waiter 共用首次快照與 epoch，不讓後續請求覆寫首次期限的回覆資料。
-            wait.stalled_session_snapshot.get_or_insert(snapshot);
-            *wait.stalled_timeout_epoch.get_or_insert(epoch)
+            match self.shared.session_public_checked(sid) {
+                Ok(snapshot) => {
+                    let epoch = snapshot
+                        .get("bridge_generation")
+                        .and_then(PyValue::as_i64)
+                        .unwrap_or(0)
+                        .max(0);
+                    let mut inner = lock(&self.shared.inner);
+                    let Some(wait) = inner.custody_release_waits.get_mut(&token) else {
+                        return Ok(None);
+                    };
+                    // 多個 release waiter 共用首次快照與 epoch，不讓後續請求覆寫首次期限的回覆資料。
+                    wait.stalled_session_snapshot.get_or_insert(snapshot);
+                    Some(*wait.stalled_timeout_epoch.get_or_insert(epoch) as u64)
+                }
+                Err(_) => {
+                    // 快照查詢失敗不能中止 release：期限分支會由 actor 自己讀取 bridge generation，
+                    // 並先把完成義務標記、排入 safety lane，再讓 parked close 回條結算。
+                    None
+                }
+            }
         };
-        let epoch = epoch as u64;
         let stalled_reply = {
             let mut inner = lock(&self.shared.inner);
             loop {
@@ -6260,6 +6267,21 @@ impl SessionManager {
             .custody_release_waits
             .get_mut(&token)
         {
+            if wait.stalled_session_snapshot.is_none() {
+                wait.stalled_session_snapshot = response.get("session").and_then(|value| {
+                    if let PyValue::Dict(session) = value {
+                        Some(session.clone())
+                    } else {
+                        None
+                    }
+                });
+            }
+            if wait.stalled_timeout_epoch.is_none() {
+                wait.stalled_timeout_epoch = response
+                    .get("drain_timeout_epoch")
+                    .and_then(PyValue::as_i64)
+                    .or_else(|| epoch.map(|epoch| epoch as i64));
+            }
             wait.stalled_reply = Some(response.clone());
         }
         self.shared.cv.notify_all();
@@ -6300,7 +6322,7 @@ impl SessionManager {
                     op.release_stalled.store(true, Ordering::SeqCst);
                     break enqueue_safety_request(
                         &actor,
-                        SessionRequest::MarkAttachStalled { epoch },
+                        SessionRequest::MarkAttachStalled { epoch: Some(epoch) },
                         QUERY_TIMEOUT,
                     )?;
                 }
@@ -6331,7 +6353,7 @@ impl SessionManager {
         };
         let reply = enqueue_safety_request(
             &actor,
-            SessionRequest::MarkAttachStalled { epoch },
+            SessionRequest::MarkAttachStalled { epoch: Some(epoch) },
             QUERY_TIMEOUT,
         )?;
         let mut response = await_actor_reply(reply, QUERY_TIMEOUT)?;
@@ -6690,7 +6712,11 @@ impl SessionManager {
             .max(0) as u64;
         match self
             .shared
-            .request(sid, SessionRequest::MarkAttachStalled { epoch }, QUERY_TIMEOUT)
+            .request(
+                sid,
+                SessionRequest::MarkAttachStalled { epoch: Some(epoch) },
+                QUERY_TIMEOUT,
+            )
         {
             Ok(reply) => reply,
             Err(_) => pydict! {
@@ -7922,7 +7948,7 @@ impl SessionManager {
         for _ in 0..count {
             let (reply, _reply_rx) = crossbeam_channel::bounded(1);
             match actor.safety.try_send(ControlEvent::Request {
-                req: SessionRequest::MarkAttachStalled { epoch },
+                req: SessionRequest::MarkAttachStalled { epoch: Some(epoch) },
                 reply,
             }) {
                 Ok(()) => enqueued += 1,

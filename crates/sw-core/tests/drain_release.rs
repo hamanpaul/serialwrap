@@ -3053,7 +3053,7 @@ fn wp510_review12_retired_bridge_after_bind_stall(h: &mut CoreHarness) -> (u64, 
         "前置：actor 已發出 OpenBridge"
     );
     let stalled = h
-        .rpc(SessionRequest::MarkAttachStalled { epoch: 0 })
+        .rpc(SessionRequest::MarkAttachStalled { epoch: Some(0) })
         .unwrap();
     assert_eq!(stalled.get("error_code"), Some(&PyValue::from("SESSION_RECOVERING")));
     assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
@@ -5769,7 +5769,7 @@ fn wp510r_r6_p8_add3ca0_1_complete_stalled_release_under_each_freeze_state() {
     for freeze in ["open", "pending", "permanent"] {
         let mut h = CoreHarness::new(SHELL_PROFILE);
         let stalled = h
-            .rpc(SessionRequest::MarkAttachStalled { epoch: 1 })
+            .rpc(SessionRequest::MarkAttachStalled { epoch: Some(1) })
             .unwrap();
         assert_eq!(stalled.get("error_code"), Some(&PyValue::from("SESSION_RECOVERING")));
         assert_eq!(h.public()["drain_stalled"], PyValue::Bool(true), "前置（{freeze}）");
