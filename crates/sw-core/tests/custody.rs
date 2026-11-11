@@ -289,6 +289,91 @@ fn test_reaper_drain_data_barrier_not_confirmed_and_expires() {
 }
 
 #[test]
+fn wp510r_r19_reaper_timeout_detach_does_not_spin_and_still_settles_receipt() {
+    struct PendingReceiptCb {
+        settled_tx: crossbeam_channel::Sender<bool>,
+    }
+
+    impl ReaperCallback for PendingReceiptCb {
+        fn handle_cmd(
+            &self,
+            _cmd: ReaperCmd,
+            _event_tx: &crossbeam_channel::Sender<ControlEvent>,
+        ) -> usize {
+            1
+        }
+
+        fn handle_worker_stopped(&self, receipt: WorkerStoppedReceipt) {
+            self.settled_tx
+                .send(receipt.handle_closed)
+                .expect("回報 WorkerStopped 已結算");
+        }
+    }
+
+    let (cmd_tx, cmd_rx) = unbounded();
+    let (event_tx, event_rx) = unbounded();
+    let (settled_tx, settled_rx) = bounded(1);
+    let mut reaper = ReaperThread::start(
+        cmd_rx,
+        event_rx,
+        event_tx.clone(),
+        Arc::new(PendingReceiptCb { settled_tx }),
+    );
+    let loop_iterations = reaper.loop_iterations_for_test();
+    let thread_finished = reaper.thread_finished_for_test();
+    cmd_tx
+        .send(ReaperCmd::ActorExited {
+            actor: ActorId::for_test(1901),
+        })
+        .expect("排入待回收命令");
+
+    assert!(
+        !reaper.stop_until(Instant::now() + Duration::from_millis(30)),
+        "待回條未完成時，共用期限應逾時並回報未收斂"
+    );
+    drop(reaper);
+
+    // 讓舊實作觀察到 wake sender 斷線，再測量 250 ms 無事件期間的回圈次數。
+    std::thread::sleep(Duration::from_millis(75));
+    let before = loop_iterations.load(Ordering::Acquire);
+    std::thread::sleep(Duration::from_millis(250));
+    let after = loop_iterations.load(Ordering::Acquire);
+
+    event_tx
+        .send(ControlEvent::WorkerStopped(WorkerStoppedReceipt {
+            epoch: 1901,
+            stop_id: StopId(1901),
+            ledger: TxLedger::default(),
+            unrecorded: vec![],
+            wal_error: None,
+            handle_closed: true,
+            close_error: None,
+        }))
+        .expect("送入完成回條");
+    assert!(
+        settled_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("回條應由回收者結算"),
+        "回條應保留成功關閉終態"
+    );
+
+    let exit_deadline = Instant::now() + Duration::from_secs(1);
+    while !thread_finished.load(Ordering::Acquire) && Instant::now() < exit_deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        thread_finished.load(Ordering::Acquire),
+        "結算最後一筆回條後，已允許退出的回收執行緒應結束"
+    );
+
+    let idle_iterations = after.saturating_sub(before);
+    assert!(
+        idle_iterations <= 20,
+        "逾時 detach 後的無事件等待不應空轉；250 ms 增加 {idle_iterations} 次回圈"
+    );
+}
+
+#[test]
 fn test_panic_guard_reports_failed_unknown() {
     let unconfirmed = UnconfirmedCloses::new();
     let mut ledger = CustodyLedger::new(unconfirmed);

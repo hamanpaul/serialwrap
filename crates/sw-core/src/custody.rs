@@ -1228,6 +1228,10 @@ pub struct ReaperThread {
     event_rx: Receiver<ControlEvent>,
     pending_receipts: Arc<std::sync::atomic::AtomicUsize>,
     active: Arc<AtomicBool>,
+    #[cfg(feature = "test-fakes")]
+    loop_iterations: Arc<AtomicU64>,
+    #[cfg(feature = "test-fakes")]
+    thread_finished: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
     detached: bool,
 }
@@ -1244,19 +1248,32 @@ impl ReaperThread {
         let allow_exit = Arc::new(AtomicBool::new(false));
         let thread_allow_exit = allow_exit.clone();
         let (wake, wake_rx) = crossbeam_channel::bounded(1);
+        let thread_wake = wake.clone();
         let command_state_rx = reaper_cmd_rx.clone();
         let event_state_rx = reaper_event_rx.clone();
         let pending_receipts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let thread_pending_receipts = pending_receipts.clone();
         let active = Arc::new(AtomicBool::new(false));
         let thread_active = active.clone();
+        #[cfg(feature = "test-fakes")]
+        let loop_iterations = Arc::new(AtomicU64::new(0));
+        #[cfg(feature = "test-fakes")]
+        let thread_loop_iterations = loop_iterations.clone();
+        #[cfg(feature = "test-fakes")]
+        let thread_finished = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "test-fakes")]
+        let mark_thread_finished = thread_finished.clone();
 
         let handle = std::thread::Builder::new()
             .name("serialwrap-reaper".into())
             .spawn(move || {
+                // stop_until 逾時後外層會 detach；由執行緒保管 sender，避免 receiver 斷線後 select 空轉。
+                let _wake_guard = thread_wake;
                 let mut pending_receipts = 0usize;
                 let mut stopping = false;
                 loop {
+                    #[cfg(feature = "test-fakes")]
+                    thread_loop_iterations.fetch_add(1, Ordering::Relaxed);
                     stopping |= thread_stopped.load(Ordering::Acquire);
                     if stopping {
                         match reaper_cmd_rx.try_recv() {
@@ -1317,6 +1334,8 @@ impl ReaperThread {
                         default(Duration::from_millis(50)) => {}
                     }
                 }
+                #[cfg(feature = "test-fakes")]
+                mark_thread_finished.store(true, Ordering::Release);
             })
             .expect("建立 reaper thread");
 
@@ -1328,6 +1347,10 @@ impl ReaperThread {
             event_rx: event_state_rx,
             pending_receipts,
             active,
+            #[cfg(feature = "test-fakes")]
+            loop_iterations,
+            #[cfg(feature = "test-fakes")]
+            thread_finished,
             handle: Some(handle),
             detached: false,
         }
@@ -1365,6 +1388,18 @@ impl ReaperThread {
         self.handle
             .as_ref()
             .is_some_and(std::thread::JoinHandle::is_finished)
+    }
+
+    /// 只供測試：取得回收者主迴圈計數器，驗證逾時 detach 後仍會等待而不空轉。
+    #[cfg(feature = "test-fakes")]
+    pub fn loop_iterations_for_test(&self) -> Arc<AtomicU64> {
+        self.loop_iterations.clone()
+    }
+
+    /// 只供測試：觀察已 detach 的回收者是否完成收尾並退出。
+    #[cfg(feature = "test-fakes")]
+    pub fn thread_finished_for_test(&self) -> Arc<AtomicBool> {
+        self.thread_finished.clone()
     }
 
     /// 回收者已無工作待做；供共用關機期限剛到但執行緒只差排程退出時判定。
