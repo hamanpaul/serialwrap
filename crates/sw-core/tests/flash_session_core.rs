@@ -1015,3 +1015,55 @@ fn flash_critical_device_detached_then_probe_start_matches_python_blackbox() {
     assert_eq!(bb::state(&rig), "ATTACHED", "略過不延後：probe 結束後也不補做 detach");
     assert_eq!(rig.dev.close_count(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// S2-PAR-wp510r R6：G-6 flash 入口讀未確認集合（設計 v1 §1.8、v3 §1.9）
+// ---------------------------------------------------------------------------
+
+/// G-6：by_id 的 handle 尚未確認關閉時不得授權 flash probe。Python 以 `_draining_by_ids` 涵蓋「排空中（含 attach 衍生的
+/// 退休 bridge）」與「關閉失敗後保留」兩種情況：`collect_flash_candidates_and_mark` 略過、`enter_flashing` 回
+/// SESSION_RECOVERING（`origin/main:sw_core/session_manager.py:3282-3288`、`:3317-3326`；作業只在安全回條後移除，
+/// `:1346-1368`）。Rust 對應退休 bridge（retired drains）與未確認關閉集合：退休 bridge 排空中拒絕；回條
+/// `handle_closed:true` 後恢復為候選；`handle_closed:false`（進未確認集合）持續拒絕。
+#[test]
+fn wp510r_r6_g6_probe_start_rejects_draining_or_unconfirmed_by_id() {
+    for closed in [true, false] {
+        let mut h = kit::attached_passthrough();
+        let stale = h.opened_bridge("/fake/tty-stale");
+        let stale_epoch = stale.epoch;
+        h.feed(ControlEvent::BridgeOpened { epoch_hint: 0, result: Ok(stale) });
+        let (epoch, stop) = h.pending_stop();
+        assert_eq!(epoch, stale_epoch, "前置：多餘的 bridge 退休並開始排空");
+        assert_eq!(kit::state(&h), SessionState::Attached);
+        assert_eq!(
+            kit::probe_start(&mut h, 1),
+            Err(FlashReject::ByIdDraining),
+            "退休 bridge 排空中不得授權 probe（closed={closed}）"
+        );
+        assert_eq!(kit::flash_mode(&h), FlashMode::Off);
+        h.receipt(epoch, stop).handle_closed(closed).feed();
+        if closed {
+            kit::probe_start(&mut h, 2).expect("安全回條後恢復為 flash 候選");
+            assert_eq!(kit::flash_mode(&h), FlashMode::Probe(2));
+        } else {
+            assert!(h.unconfirmed.contains(DEVICE_BY_ID), "關閉失敗登記未確認集合");
+            assert_eq!(kit::probe_start(&mut h, 2), Err(FlashReject::ByIdDraining), "未確認關閉持續拒絕");
+            assert_eq!(kit::flash_mode(&h), FlashMode::Off);
+            assert_eq!(kit::state(&h), SessionState::Attached);
+        }
+    }
+}
+
+/// G-6：probe 窗口期間 by_id 轉為排空中（多餘 bridge 退休）時，`FlashSyncMatched`（Python `enter_flashing`）不得進
+/// FLASHING（Python 回 SESSION_RECOVERING、service 隨即釋放 gate，`origin/main:sw_core/session_manager.py:3317-3326`、
+/// `sw_core/service.py:510-512`）。
+#[test]
+fn wp510r_r6_g6_matched_rejects_draining_by_id() {
+    let mut h = kit::attached_passthrough();
+    kit::probe_start(&mut h, 1).expect("probe 1");
+    let stale = h.opened_bridge("/fake/tty-stale");
+    h.feed(ControlEvent::BridgeOpened { epoch_hint: 0, result: Ok(stale) });
+    assert_eq!(kit::matched(&mut h, 1), Err(FlashReject::ByIdDraining));
+    assert_eq!(kit::state(&h), SessionState::Attached, "不得進 FLASHING");
+    assert_ne!(kit::flash_mode(&h), FlashMode::Flashing);
+}

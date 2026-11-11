@@ -22,6 +22,12 @@ impl SessionCore {
         self.deps.fence.with(|f| f.flash_mode != FlashMode::Off)
     }
 
+    /// S2-PAR-wp510r R6（G-6）：by_id 的 handle 尚未確認關閉——退休 bridge 排空中，或已登記未確認關閉集合。對應 Python
+    /// `_draining_by_ids`（排空作業只在安全回條後移除，`origin/main:sw_core/session_manager.py:1346-1368`、`:2918-2919`）。
+    fn flash_by_id_draining(&self) -> bool {
+        !self.retired_drains.is_empty() || self.close_unconfirmed()
+    }
+
     /// destructive 操作（release／clear／bind／recover）的 flash 臨界判定（Python `_flash_busy_locked`）：FLASHING、
     /// probe 窗口，或 manager 已標 flash-critical（`collect_flash_candidates_and_mark` 之後、probe 之前）。
     pub(super) fn flash_busy(&self) -> bool {
@@ -58,6 +64,9 @@ impl SessionCore {
         }
         if self.drain_in_progress() {
             return Err(FlashReject::DrainInProgress);
+        }
+        if self.flash_by_id_draining() {
+            return Err(FlashReject::ByIdDraining);
         }
         if self.fg_slot_busy() {
             return Err(FlashReject::ForegroundBusy);
@@ -127,6 +136,11 @@ impl SessionCore {
         }
         if !matches!(self.state, SessionState::Ready | SessionState::Attached) {
             let _ = reply.try_send(Err(FlashReject::BadState(self.state)));
+            return Vec::new();
+        }
+        // G-6：Python `enter_flashing` 在進 FLASHING 前重驗 `_draining_by_ids`（`session_manager.py:3317-3326`）。
+        if self.flash_by_id_draining() {
+            let _ = reply.try_send(Err(FlashReject::ByIdDraining));
             return Vec::new();
         }
         self.flash_prev_state = Some(self.state);

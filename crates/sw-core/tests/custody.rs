@@ -616,7 +616,6 @@ fn test_deliverer_unaccounted_open_duration_before_freeze_leads_to_timeout() {
     clock.set(t_30_2);
     assert!(gate.thaw(&freeze_token));
     assert_eq!(gate.handoff_freeze_state(), HandoffFreezeState::Open);
-    deliverer.notify_thaw(t_30_2);
     let _ = actor_rx.try_recv();
 
     // 4. t = 30.3s 再投遞
@@ -651,7 +650,7 @@ fn test_deliverer_delayed_poll_after_thaw_leads_to_timeout() {
     let outcome = deliverer.step_delivery(sid, &actor_tx, t_29_7);
     assert_eq!(outcome, DeliveryStepResult::Backoff);
 
-    // 2. t = 29.9s 進入 Pending，外部通知 freeze
+    // 2. t = 29.9s 進入 Pending（閘門自行記帳凍結區間）
     let t_29_9 = t0 + Duration::from_millis(29_900);
     clock.set(t_29_9);
     let freeze_res = gate.freeze_if_idle("freeze-op-3");
@@ -660,14 +659,12 @@ fn test_deliverer_delayed_poll_after_thaw_leads_to_timeout() {
         _ => panic!("預期 Frozen"),
     };
     assert_eq!(gate.handoff_freeze_state(), HandoffFreezeState::Pending);
-    deliverer.notify_freeze(t_29_9);
 
-    // 3. t = 30.2s 解凍，外部通知 thaw，清空 channel
+    // 3. t = 30.2s 解凍（閘門結算凍結區間），清空 channel
     let t_30_2 = t0 + Duration::from_millis(30_200);
     clock.set(t_30_2);
     assert!(gate.thaw(&freeze_token));
     assert_eq!(gate.handoff_freeze_state(), HandoffFreezeState::Open);
-    deliverer.notify_thaw(t_30_2);
     let _ = actor_rx.try_recv();
 
     // 4. t = 30.4s 解凍後延遲輪詢
@@ -2036,7 +2033,8 @@ fn test_parked_continuation_spawn_worker_cancelled_attach_dynamic_settles_taken_
     let fired = Arc::new(AtomicBool::new(false));
     let worker_name = format!("serialwrap-attach-{DR7_BY_ID}");
     m.mgr.set_probe_pre_submit_hook_for_test(Box::new(move || {
-        // 只攔 B3 的 attach worker 第一次 PROBE（其他 by_id 的作業直接通過）。
+        // 只攔 B3 的 attach worker 第一次 PROBE；其他 by_id 的作業直接通過（鉤子在 manager 鎖與鉤子槽鎖之外呼叫，
+        // 暫停中不卡住其他 by_id 的 PROBE；本 rig 也只有 B3 會跑 PROBE，usb-A 是 YAML target）。
         let on_b3 = std::thread::current().name() == Some(worker_name.as_str());
         if on_b3 && !fired.swap(true, Ordering::SeqCst) {
             let _ = entered_tx.send(());
@@ -2551,4 +2549,101 @@ fn test_claim_for_release_non_held_phase_leaves_record_unchanged() {
     assert_eq!(claimed.cancel, Some(CustodyCancel::Release));
     assert_eq!(claimed.phase, CustodyPhaseSnapshot::Closing { job: "release".into() });
     assert!(!unconfirmed.contains(by_id));
+}
+
+/// 審查 P8-6a679fb-4：回收者停止後（命令通道已斷線，例如 `shutdown` 第二階段之後）送交排空的未接手 IoWorker 不得被
+/// 直接丟棄（IoWorker 沒有 Drop 收尾，丟棄即留下開著的 handle 與讀寫執行緒）：`Reclaim` 守衛的 Drop 與開埠工作的送交
+/// 都退回就地 `finish_async`，真 handle 關閉恰好一次。
+#[test]
+fn test_reclaim_after_reaper_stopped_falls_back_to_finish_async() {
+    let h = CoreHarness::new(SHELL_PROFILE);
+    let (cmd_tx, cmd_rx) = unbounded::<ReaperCmd>();
+    drop(cmd_rx);
+
+    let guard_path = "/dev/ttyUSB-reclaim-guard";
+    let guard_dev = h.add_serial_device(guard_path);
+    let guard_worker = h.start_worker_at(300, guard_path);
+    {
+        let _reclaim = Reclaim::new(31, 300, guard_worker, cmd_tx.clone());
+    }
+    wait_until("Reclaim 守衛的退回收尾關閉 handle", || guard_dev.close_count() == 1);
+    assert!(!guard_dev.is_open(), "handle 已關閉");
+
+    let job_path = "/dev/ttyUSB-reclaim-job";
+    let job_dev = h.add_serial_device(job_path);
+    let job_worker = h.start_worker_at(301, job_path);
+    let sent = send_reclaim_or_finish(&cmd_tx, 32, 301, ReclaimWorker::Real(job_worker), None);
+    assert!(!sent, "回收者已停止：不得回報已送交");
+    wait_until("送交失敗後就地收尾關閉 handle", || job_dev.close_count() == 1);
+    assert!(!job_dev.is_open());
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(guard_dev.close_count(), 1, "只關閉一次");
+    assert_eq!(job_dev.close_count(), 1, "只關閉一次");
+}
+
+/// DR-1(f5)（設計 §3.1.4 W3′ 第 3、4(c) 步、C2）：正式流程（佔位 attach → 出生即接管 → `ClaimCustody` → adopt 提交
+/// `Bridged{Some}` → BridgeOpened）下，actor 的 `AdoptBridge` 自帳本取出 IoWorker 後、放入 workers 前 unwind
+/// （H-actor-panic-after-claim，在 catch_unwind 之外）。`Reclaim` 守衛的 Drop 只送命令，回收者把紀錄轉 `BridgeDraining`
+/// 並排空：真 handle 關閉恰好一次、配對回條結算為 Closed、紀錄移除、不登記未確認關閉、沒有登入 TX。
+#[test]
+fn test_dr1_f5_formal_adopt_bridge_unwind_after_claim_reaper_drains() {
+    use sw_core::state_store::{LoadedState, ReleasedRow};
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut loaded = LoadedState::default();
+    loaded.released.insert(
+        DR7_PLACEHOLDER_SID.to_string(),
+        ReleasedRow {
+            by_id: PyValue::Str(DR7_BY_ID.to_string()),
+            released_by: PyValue::Str("agent".to_string()),
+            released_at: PyValue::Str("2026-10-21T00:00:00".to_string()),
+            reason: PyValue::Str("manual".to_string()),
+        },
+    );
+    let m = ManagerRig::with(&manager_yaml(&[]), loaded, None);
+    let dev = m.add_device_at(DR7_BY_ID, DR7_REAL);
+    install_shell_replies(&dev);
+    m.mgr.update_devices(&m.snapshot());
+
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (go_tx, go_rx) = crossbeam_channel::bounded::<()>(1);
+    m.mgr.set_open_bridge_pre_take_hook_for_test(Box::new(move || {
+        let _ = entered_tx.send(());
+        let _ = go_rx.recv_timeout(Duration::from_secs(10));
+    }));
+    let placeholder = m.mgr.resolve(DR7_PLACEHOLDER_SID).expect("B3 的 RELEASED 佔位");
+    let attached = m
+        .mgr
+        .attach_released_placeholder(&placeholder, false)
+        .expect("device.attach 回 Ok");
+    assert_eq!(attached.get("ok"), Some(&PyValue::Bool(true)), "{attached:?}");
+    entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("正式 session 的開埠工作應停在接手 handle 之前");
+    let held = m.mgr.custody_for_test(DR7_BY_ID).expect("出生即接管的帳本紀錄");
+    let formal_sid = match &held.owner {
+        CustodyOwner::Session { sid, .. } => sid.clone(),
+        other => panic!("owner 應為新建的正式 session：{other:?}"),
+    };
+    let token = held.token;
+    let tx_before = dev.tx_len();
+    m.mgr.set_adopt_after_claim_hook_for_test(
+        &formal_sid,
+        Box::new(|| panic!("測試注入：AdoptBridge 取出 IoWorker 後 unwind（H-actor-panic-after-claim）")),
+    );
+    go_tx.send(()).expect("放行開埠工作");
+
+    wait_until("回收者排空並結算終態", || m.mgr.terminal_for_test(token).is_some());
+    assert_eq!(
+        m.mgr.terminal_for_test(token).map(|t| t.handle),
+        Some(TerminalHandle::Closed),
+        "Reclaim 命令交回收者排空，配對回條結算為 Closed"
+    );
+    wait_until("handle 關閉", || dev.close_count() == 1);
+    assert!(!dev.is_open(), "handle 已關閉");
+    assert!(m.mgr.custody_for_test(DR7_BY_ID).is_none(), "handle_closed:true 後紀錄移除");
+    assert!(!m.mgr.unconfirmed_close_for_test(DR7_BY_ID), "closed:true 不得登記未確認關閉");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(dev.close_count(), 1, "只關閉一次");
+    assert_eq!(dev.open_count(), 1, "不重新開埠");
+    assert_eq!(dev.tx_len(), tx_before, "actor 未接手：沒有登入 TX");
 }

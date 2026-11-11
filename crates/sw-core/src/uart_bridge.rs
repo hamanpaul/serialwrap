@@ -1114,15 +1114,6 @@ fn wait_for_rx_dispatch_with_timeout(
 }
 
 #[doc(hidden)]
-pub fn wait_for_rx_dispatch_for_test(
-    safety: &Sender<ControlEvent>,
-    epoch: u64,
-    rx_seq: u64,
-) -> Result<(), PalError> {
-    wait_for_rx_dispatch(safety, epoch, rx_seq)
-}
-
-#[doc(hidden)]
 pub fn wait_for_rx_dispatch_with_timeout_for_test(
     safety: &Sender<ControlEvent>,
     epoch: u64,

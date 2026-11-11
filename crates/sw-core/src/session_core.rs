@@ -84,6 +84,10 @@ pub enum FlashReject {
     FlashAlreadyActive,
     /// `FlashSyncMatched` 的 probe_id 與目前 `Probe(id)` 不符。
     ProbeMismatch,
+    /// S2-PAR-wp510r R6（G-6）：by_id 的 handle 尚未確認關閉——退休 bridge 排空中或已登記未確認關閉集合（Python
+    /// `_draining_by_ids`：`collect_flash_candidates_and_mark` 略過、`enter_flashing` 回 SESSION_RECOVERING，
+    /// `origin/main:sw_core/session_manager.py:3282-3288`、`:3317-3326`）。
+    ByIdDraining,
 }
 
 /// P8 Task 8：probe 授權（`epoch`＝授權當下的 `active_epoch`，TX permit 須帶同一 epoch）。
@@ -1021,8 +1025,50 @@ impl SessionCore {
         self.startup_effects.push(e);
     }
 
+    /// 取出啟動效果（actor 執行緒進入事件迴圈前執行）。S2-PAR-wp510r R6（審查 P8-7bb9935-5；設計 §3.1.7「新工作的
+    /// 開埠：Pending／Permanent 不執行」）：交接凍結期間建構的出生即接管 session 不執行 `ClaimCustody`，改依凍結狀態處置
+    /// （見 `startup_custody_under_freeze`）；未凍結時照舊回傳。
     pub fn take_startup_effects(&mut self) -> Vec<Effect> {
-        std::mem::take(&mut self.startup_effects)
+        let effects = std::mem::take(&mut self.startup_effects);
+        let state = self.handoff_freeze_state();
+        if state == crate::admission::HandoffFreezeState::Open {
+            return effects;
+        }
+        let mut out = Vec::with_capacity(effects.len());
+        for effect in effects {
+            match effect {
+                Effect::ClaimCustody { token, .. } if self.external_attach == Some(token) => {
+                    out.extend(self.startup_custody_under_freeze(token, state));
+                }
+                other => out.push(other),
+            }
+        }
+        out
+    }
+
+    /// 凍結期間出生即接管的處置。帳本紀錄已是本 session 的 `Held`，等同已收到 offer：撤回 `custody_open_effect` 設下的
+    /// 開埠在途標記（開埠工作未提交），交給 offer 的凍結規則（`custody_offer`）——Pending 時把 offer 放進交接延後佇列，
+    /// 撤銷凍結後重播並以同一 token 開埠；Permanent 時只關閉（`ClaimForStop(Freeze)`，不 adopt）。
+    fn startup_custody_under_freeze(
+        &mut self,
+        token: u64,
+        state: crate::admission::HandoffFreezeState,
+    ) -> Vec<Effect> {
+        self.custody_opening = false;
+        self.open_real_path = None;
+        if state == crate::admission::HandoffFreezeState::Pending {
+            self.external_offer_pending = true;
+            self.deferred_handoff_events
+                .push_back(MailboxItem::Control(ControlEvent::CustodyOffer { token }));
+            return Vec::new();
+        }
+        self.external_offer_pending = false;
+        self.external_claimed = true;
+        vec![Effect::ClaimForStop {
+            token,
+            cancel: crate::custody::CustodyCancel::Freeze,
+            release_deadline: None,
+        }]
     }
 
     /// P6：設定 human line mode 的路徑風格（daemon 依 `Pal.caps.path_flavor` 呼叫）。

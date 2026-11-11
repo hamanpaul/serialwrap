@@ -430,13 +430,37 @@ impl<T: IntoReclaimWorker> Drop for Reclaim<T> {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
             if let Some(tx) = self.cmd_tx.take() {
-                let _ = tx.send(ReaperCmd::Reclaim {
-                    token: self.token,
-                    epoch: self.epoch,
-                    worker: Box::new(inner.into_reclaim_worker()),
-                });
+                send_reclaim_or_finish(&tx, self.token, self.epoch, inner.into_reclaim_worker(), None);
             }
         }
+    }
+}
+
+/// 把未被接手的 worker 送交回收者排空（不阻塞、不取 manager 鎖）。回收者已停止、命令通道斷線時（審查 P8-6a679fb-4：
+/// `shutdown` 第二階段停掉回收者之後）不得直接丟棄 worker——IoWorker 沒有 Drop 收尾，丟棄即留下開著的 handle 與讀寫
+/// 執行緒——退回就地 `finish_async`：handle 由 worker 自身的收尾關閉一次，回條送往 `control`（未提供時送往立即丟棄的
+/// 通道；此時已沒有帳本結算者）。回傳是否已送交回收者。
+pub fn send_reclaim_or_finish(
+    cmd_tx: &Sender<ReaperCmd>,
+    token: u64,
+    epoch: u64,
+    worker: ReclaimWorker,
+    control: Option<&Sender<ControlEvent>>,
+) -> bool {
+    match cmd_tx.send(ReaperCmd::Reclaim {
+        token,
+        epoch,
+        worker: Box::new(worker),
+    }) {
+        Ok(()) => true,
+        Err(crossbeam_channel::SendError(ReaperCmd::Reclaim { worker, .. })) => {
+            let control = control
+                .cloned()
+                .unwrap_or_else(|| crossbeam_channel::unbounded().0);
+            worker.finish_async(StopId(0), control);
+            false
+        }
+        Err(_) => false,
     }
 }
 
@@ -1000,7 +1024,9 @@ pub enum DeliveryStepResult {
 pub struct Deliverer {
     pub obligations: HashMap<String, DeliveryObligation>,
     pub gate: Arc<AdmissionGate>,
-    /// 各 sid 實際送達（`try_send` 成功）的累計次數（觀測用：驗證容量恢復後只送達一次）。
+    /// 只供測試（test-fakes）：各 sid 實際送達（`try_send` 成功）的累計次數（驗證容量恢復後只送達一次）。正式路徑
+    /// 不記帳，避免 session 移除後殘留（審查 P8-03333f7-3）。
+    #[cfg(feature = "test-fakes")]
     delivered: HashMap<String, usize>,
 }
 
@@ -1015,11 +1041,13 @@ impl Deliverer {
         Self {
             obligations: HashMap::new(),
             gate,
+            #[cfg(feature = "test-fakes")]
             delivered: HashMap::new(),
         }
     }
 
-    /// sid 累計實際送達次數。
+    /// 只供測試（test-fakes）：sid 累計實際送達次數。
+    #[cfg(feature = "test-fakes")]
     pub fn delivered_count(&self, sid: &str) -> usize {
         self.delivered.get(sid).copied().unwrap_or(0)
     }
@@ -1087,12 +1115,6 @@ impl Deliverer {
         }
     }
 
-    /// 記錄進入凍結轉態通知（喚醒送達者，不再記帳）。
-    pub fn notify_freeze(&mut self, _now: Instant) {}
-
-    /// 記錄解除凍結轉態通知（喚醒送達者，不再記帳）。
-    pub fn notify_thaw(&mut self, _now: Instant) {}
-
     /// 單步送達執行（以指定時間取樣快照）。
     pub fn step_delivery(
         &mut self,
@@ -1101,16 +1123,6 @@ impl Deliverer {
         now: Instant,
     ) -> DeliveryStepResult {
         let snap = self.gate.snapshot_at(now);
-        self.step_delivery_with_snapshot(sid, actor_tx, snap)
-    }
-
-    /// 單步送達執行（使用當前時刻的一致快照）。
-    pub fn step_delivery_now(
-        &mut self,
-        sid: &str,
-        actor_tx: &Sender<ControlEvent>,
-    ) -> DeliveryStepResult {
-        let snap = self.gate.snapshot();
         self.step_delivery_with_snapshot(sid, actor_tx, snap)
     }
 
@@ -1158,7 +1170,10 @@ impl Deliverer {
         }) {
             Ok(()) => {
                 self.obligations.remove(sid);
-                *self.delivered.entry(sid.to_string()).or_insert(0) += 1;
+                #[cfg(feature = "test-fakes")]
+                {
+                    *self.delivered.entry(sid.to_string()).or_insert(0) += 1;
+                }
                 DeliveryStepResult::Delivered
             }
             Err(TrySendError::Full(_)) => {

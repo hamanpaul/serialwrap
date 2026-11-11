@@ -578,15 +578,13 @@ struct Inner {
     handoff_frozen: bool,
     /// P8 Task 14：`begin_shutdown` 已呼叫（交接回滾只還原自己設的 stopping gate，不撤銷 shutdown 的）。
     shutdown_started: bool,
-    /// S2-PAR-wp510r R1: 保管帳本基礎設施
-    #[allow(dead_code)]
-    pub custody: crate::custody::CustodyLedger,
-    #[allow(dead_code)]
+    /// S2-PAR-wp510r：by_id 保管帳本（尚未被 actor 確認接手的 handle 或 IoWorker；設計 §3.1.2）。
+    custody: crate::custody::CustodyLedger,
     /// S2-PAR-wp510r R5（設計 §3.1.4 W1 第 2 步、D3）：佔位 attach 預先準備的交接 worker（帳本 token → 作業與執行緒），
     /// `RetirePlaceholder` 退休成功時放行，其他結束路徑丟棄（`Effect::DiscardHandoffWorker`）。
-    pub prepared: HashMap<u64, PreparedHandoff>,
-    #[allow(dead_code)]
-    pub deliverer: crate::custody::Deliverer,
+    prepared: HashMap<u64, PreparedHandoff>,
+    /// S2-PAR-wp510r：DeviceAttached 送達義務（設計 §3.1.2 C4；由送達者執行緒執行）。
+    deliverer: crate::custody::Deliverer,
 }
 
 /// P8 Task 14：偵測 PROBE 的 fence（每次 `probe_send` 新建）與交接凍結旗標，同一把鎖內登記與讀取：
@@ -690,8 +688,9 @@ struct Shared {
     path_flavor: sw_pal::PalPathFlavor,
     /// 只供測試（test-fakes）：偵測 PROBE 的 Fence 建立後、交給 TxWriter 提交前呼叫（重現「健康快照之後才發布
     /// WAL unhealthy」的競態；sol-backfill p5 #6）。
+    /// 鉤子先複製出鎖外再呼叫：暫停中的鉤子不得卡住其他 by_id 的 PROBE（審查 P8-7e34afb-1）。
     #[cfg(feature = "test-fakes")]
-    probe_pre_submit_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    probe_pre_submit_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// 只供測試（test-fakes）：release 的 `ClaimForStop` 已在 actor 執行緒上寫入取消之後呼叫（S2-PAR-wp510r R5：佔位 W1
     /// 改由 actor 之後，「release 已取得並取消在途佔位開埠」的等價確認點）。
     #[cfg(feature = "test-fakes")]
@@ -750,13 +749,16 @@ struct Shared {
     /// catch_unwind 之外崩潰）；只對 sid 相符的 session 生效。
     #[cfg(feature = "test-fakes")]
     executor_unwind_hook: Mutex<Option<SidTestHook>>,
+    /// 只供測試（test-fakes）：H-actor-panic-after-claim（設計 §0.4）——指定 session 的 `AdoptBridge` 已自帳本取出
+    /// IoWorker、放入 workers 之前呼叫一次（重現 DR-1 f5 的 unwind）；只對 sid 相符的 session 生效。
+    #[cfg(feature = "test-fakes")]
+    adopt_after_claim_hook: Mutex<Option<SidTestHook>>,
     /// 載入的 state.json 含孤立 surrogate（`LoadedState::lone_surrogates`；啟動存檔前檢查）。
     lone_surrogates: bool,
     /// 啟動存檔重現的 Python 未捕捉例外末行（`_save_state` 的 `UnicodeEncodeError`）；daemon 據此 exit 1。
     startup_error: Mutex<Option<String>>,
-    /// S2-PAR-wp510r R1: 回收者命令通道與執行緒
-    #[allow(dead_code)]
-    pub reaper_cmd_tx: Sender<crate::custody::ReaperCmd>,
+    /// S2-PAR-wp510r R1：回收者命令通道（無界；`ExitReclaim`／`Reclaim` 守衛與開埠工作只送命令、不取 manager 鎖）。
+    reaper_cmd_tx: Sender<crate::custody::ReaperCmd>,
 }
 
 /// PROBE 的 writer 交給 TxWriter thread 期間留在 `HandleParts` 的占位（任何提交一律 NotSubmitted）。
@@ -792,8 +794,9 @@ pub struct SessionManager {
     watcher_rx: Receiver<WatcherEvent>,
     note_rx: Receiver<ManagerNote>,
     pump_lock: Arc<Mutex<()>>,
-    pub reaper: Mutex<Option<crate::custody::ReaperThread>>,
-    pub deliverer: Mutex<Option<crate::custody::DelivererThread>>,
+    /// S2-PAR-wp510r：回收者與送達者背景執行緒（`shutdown` 第二階段停止並 join）。
+    reaper: Mutex<Option<crate::custody::ReaperThread>>,
+    deliverer: Mutex<Option<crate::custody::DelivererThread>>,
     _console: Arc<dyn ConsoleTransportFactory>,
     _caps: Capabilities,
 }
@@ -2131,10 +2134,16 @@ impl Shared {
         op: &AttachOp,
         taker: crate::custody::CustodyTaker,
     ) -> Option<Preopened> {
+        // 只認領帳本確實持有 handle 的 parked 紀錄（`Held{parts: Some}`，正式流程一律如此）；`parts: None` 時不動帳本，
+        // 避免紀錄被改成 `Taken` 而手上的 handle 不帶 token、關閉時無從結算（審查 P8-03333f7-2）。
         let rec_path = inner
             .custody
             .get_custody(by_id)
-            .filter(|rec| rec.token == op.token && rec.owner == crate::custody::CustodyOwner::Parked)
+            .filter(|rec| {
+                rec.token == op.token
+                    && rec.owner == crate::custody::CustodyOwner::Parked
+                    && matches!(rec.phase, crate::custody::CustodyPhase::Held { parts: Some(_) })
+            })
             .map(|rec| rec.real_path.clone());
         if let Some(rec_path) = rec_path {
             if let Ok((token, Some(parts))) = inner.custody.claim_parked(by_id, &rec_path, taker) {
@@ -2780,8 +2789,11 @@ impl Shared {
         // 註冊協定與通知串行化，取得的必為最新狀態（Python 於送出時才讀共用 WAL unhealthy）。
         self.fanout.register(fence.clone());
         #[cfg(feature = "test-fakes")]
-        if let Some(hook) = lock(&self.probe_pre_submit_hook).as_ref() {
-            hook();
+        {
+            let hook = lock(&self.probe_pre_submit_hook).clone();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
         let writer = std::mem::replace(&mut parts.writer, Box::new(DetachedWriter));
         let (control_tx, _control_rx) = crossbeam_channel::unbounded();
@@ -4139,6 +4151,22 @@ impl OpenCtx {
 }
 
 impl ManagerExec {
+    /// H-actor-panic-after-claim（test-fakes）：先在鎖內取出（只取 sid 相符者）再於鎖外呼叫。
+    #[cfg(feature = "test-fakes")]
+    fn run_adopt_after_claim_hook(&self) {
+        let sid = lock(&self.io.sid).clone();
+        let hook = {
+            let mut slot = lock(&self.shared.adopt_after_claim_hook);
+            match slot.as_ref() {
+                Some((target, _)) if *target == sid => slot.take().map(|(_, hook)| hook),
+                _ => None,
+            }
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     fn com(&self) -> String {
         lock(&self.io.profile).com.clone()
     }
@@ -4373,11 +4401,14 @@ impl ManagerExec {
                     });
                 drop(inner);
                 if let Some((token, worker)) = token_and_worker {
-                    let _ = ctx.shared.reaper_cmd_tx.send(crate::custody::ReaperCmd::Reclaim {
+                    // 回收者已停止時退回就地收尾（審查 P8-6a679fb-4）。
+                    crate::custody::send_reclaim_or_finish(
+                        &ctx.shared.reaper_cmd_tx,
                         token,
-                        epoch: opened.epoch,
-                        worker: Box::new(crate::custody::ReclaimWorker::Real(worker)),
-                    });
+                        opened.epoch,
+                        crate::custody::ReclaimWorker::Real(worker),
+                        Some(&control),
+                    );
                 } else {
                     opened.worker.finish_async(crate::drain::StopId(0), control.clone());
                 }
@@ -4676,9 +4707,11 @@ impl ManagerExec {
             return;
         };
         let held = matches!(rec.phase, crate::custody::CustodyPhase::Held { .. });
+        // parked 只在帳本確實持有 handle（`Held{parts: Some}`）時認領（審查 P8-03333f7-2；理由同 `claim_parked_locked`）。
+        let parked_with_parts = matches!(rec.phase, crate::custody::CustodyPhase::Held { parts: Some(_) });
         let rec_path = rec.real_path.clone();
         match rec.owner.clone() {
-            crate::custody::CustodyOwner::Parked if held => {
+            crate::custody::CustodyOwner::Parked if parked_with_parts => {
                 let parked_op = inner
                     .inflight
                     .get(&by_id)
@@ -4838,20 +4871,35 @@ impl EffectExecutor for ManagerExec {
                 if lock(&self.opened_listener).remove(&epoch) {
                     self.listener_epoch = Some(epoch);
                 }
+                // W3′（設計 §3.1.4 第 3 步、C2、C3）：① 鎖內自帳本取出 IoWorker（`Bridged{Some}` → `Bridged{None}`）；
+                // ② 鎖外以 `Reclaim` 守衛保護、放入 workers 後解除守衛；③ 鎖內移除紀錄。①～③ 之間 unwind 時守衛的 Drop
+                // 只送 `ReaperCmd::Reclaim`（不取鎖），由回收者把紀錄轉 `BridgeDraining` 並排空（DR-1 f5）。取不到者（非
+                // 保管開埠、或回收者已取走）不動帳本，沿用效果自帶的 worker。
                 let by_id = lock(&self.io.profile).device_by_id.clone();
-                let mut inner = lock(&self.shared.inner);
-                let real_worker = inner
-                    .custody
-                    .custody
-                    .get(&by_id)
-                    .map(|r| r.token)
-                    .and_then(|token| {
-                        let res = inner.custody.claim_bridged_worker(token, epoch).ok();
-                        inner.custody.remove_bridged(token);
-                        res
+                let claimed = {
+                    let mut inner = lock(&self.shared.inner);
+                    let token = inner.custody.custody.get(&by_id).map(|r| r.token);
+                    token.and_then(|token| {
+                        inner
+                            .custody
+                            .claim_bridged_worker(token, epoch)
+                            .ok()
+                            .map(|real| (token, real))
                     })
-                    .unwrap_or(worker);
-                lock(&self.workers).insert(epoch, real_worker);
+                };
+                match claimed {
+                    Some((token, real)) => {
+                        let guard =
+                            crate::custody::Reclaim::new(token, epoch, real, self.shared.reaper_cmd_tx.clone());
+                        #[cfg(feature = "test-fakes")]
+                        self.run_adopt_after_claim_hook();
+                        lock(&self.workers).insert(epoch, guard.defuse());
+                        lock(&self.shared.inner).custody.remove_bridged(token);
+                    }
+                    None => {
+                        lock(&self.workers).insert(epoch, worker);
+                    }
+                }
             }
             Effect::BeginDrain { stop_id, epoch } => {
                 lock(&self.opened_rx).remove(&epoch);
@@ -5259,6 +5307,8 @@ impl SessionManager {
             file_transfer_timeout_override: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             executor_unwind_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            adopt_after_claim_hook: Mutex::new(None),
             reaper_cmd_tx,
         });
         let reaper_thread = crate::custody::ReaperThread::start(
@@ -6506,6 +6556,11 @@ impl SessionManager {
                     && matches!(str_of(s, "state").as_deref(), Some("READY" | "ATTACHED"))
                     && s.get("foreground_busy") != Some(&PyValue::Bool(true))
                     && s.get("drain_stalled") != Some(&PyValue::Bool(true))
+                    // S2-PAR-wp510r R6（G-6）：by_id 在未確認關閉集合者不列為候選（Python 略過 `_draining_by_ids`，
+                    // `origin/main:sw_core/session_manager.py:3282-3288`）；退休 bridge 排空中由 actor 的
+                    // `FlashSyncProbeStart` 授權判定拒絕。
+                    && !str_of(s, "device_by_id")
+                        .is_some_and(|by_id| !by_id.is_empty() && self.shared.unconfirmed_closes.contains(&by_id))
             });
             match candidate {
                 Some(public) => {
@@ -6627,7 +6682,7 @@ impl SessionManager {
     /// 只供測試（test-fakes）：偵測 PROBE 的 Fence 建立後、提交前執行 `hook`（見 `probe_pre_submit_hook`）。
     #[cfg(feature = "test-fakes")]
     pub fn set_probe_pre_submit_hook_for_test(&self, hook: Box<dyn Fn() + Send + Sync>) {
-        *lock(&self.shared.probe_pre_submit_hook) = Some(hook);
+        *lock(&self.shared.probe_pre_submit_hook) = Some(Arc::from(hook));
     }
 
     /// 只供測試（test-fakes）：設定「release 已在帳本紀錄寫入取消」的確認點（每次 release 的 `ClaimForStop` 執行後呼叫）。
@@ -6682,12 +6737,6 @@ impl SessionManager {
     #[cfg(feature = "test-fakes")]
     pub fn terminal_for_test(&self, token: u64) -> Option<crate::custody::Terminal> {
         lock(&self.shared.inner).custody.terminals.get(&token).cloned()
-    }
-
-    /// 只供測試（test-fakes）：查詢 token 是否在 prepared 表中。
-    #[cfg(feature = "test-fakes")]
-    pub fn prepared_for_test(&self, token: u64) -> bool {
-        lock(&self.shared.inner).prepared.contains_key(&token)
     }
 
     /// 只供測試（test-fakes）：查詢 sid 是否有尚未送達的 DeviceAttached 義務。
@@ -6827,13 +6876,8 @@ impl SessionManager {
         *lock(&self.shared.external_attach_pre_register_hook) = Some((by_id.to_string(), hook));
     }
 
-    /// 只供測試（test-fakes）：設定下 n 次 actor spawn 注入失敗。
-    #[cfg(feature = "test-fakes")]
-    pub fn inject_actor_spawn_fail_for_test(&self, n: usize) {
-        crate::actor::inject_actor_spawn_fail(n);
-    }
-
-    /// 只供測試（test-fakes）：設定 `by_id` 下一次 `finish_attach_op` 取得 manager 鎖之前的一次性暫停點。
+    /// 只供測試（test-fakes）：設定 `by_id` 下一次 attach worker 作業收尾（`finish_worker_op`，原 `finish_attach_op`）
+    /// 取得 manager 鎖之前的一次性暫停點。
     #[cfg(feature = "test-fakes")]
     pub fn set_finish_attach_op_pre_lock_hook_for_test(
         &self,
@@ -7353,8 +7397,9 @@ impl SessionManager {
         *lock(&self.shared.file_transfer_timeout_override) = Some(timeout);
     }
 
-    /// 停止回收者與送達者背景執行緒（在不持有 manager 鎖的情況下停止並 join）。
-    pub fn stop_background_threads(&self) {
+    /// 停止回收者與送達者背景執行緒（在不持有 manager 鎖的情況下停止並 join）。之後才送交的回收命令退回就地收尾
+    /// （`custody::send_reclaim_or_finish`）。
+    fn stop_background_threads(&self) {
         if let Some(mut r) = lock(&self.reaper).take() {
             r.stop();
         }
@@ -7368,6 +7413,13 @@ impl SessionManager {
     #[cfg(feature = "test-fakes")]
     pub fn set_executor_unwind_hook_for_test(&self, sid: &str, hook: Box<dyn FnOnce() + Send>) {
         *lock(&self.shared.executor_unwind_hook) = Some((sid.to_string(), hook));
+    }
+
+    /// 只供測試（test-fakes）：H-actor-panic-after-claim——`sid` 的下一次 `AdoptBridge` 自帳本取出 IoWorker 後、放入
+    /// workers 之前執行 `hook`（設計 §0.4、DR-1 f5）。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_adopt_after_claim_hook_for_test(&self, sid: &str, hook: Box<dyn FnOnce() + Send>) {
+        *lock(&self.shared.adopt_after_claim_hook) = Some((sid.to_string(), hook));
     }
 }
 

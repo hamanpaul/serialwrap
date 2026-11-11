@@ -678,3 +678,27 @@ fn cap_posix_pty__endpoint_slave_never_exclusive() {
     assert_eq!((r.joined, r.unlinked), (true, true));
     assert!(std::fs::symlink_metadata(&link).is_err(), "stop 後 ttyMCU symlink 已移除");
 }
+
+// ---------------------------------------------------------------------------
+// S2-PAR-wp510r R6：G-6 flash 入口讀未確認集合（設計 v1 §1.8、v3 §1.9）
+// ---------------------------------------------------------------------------
+
+/// G-6 端到端（真 manager＋FlashCoordinator＋端點）：by_id 在未確認關閉集合內的線不列為 flash 候選、不標 flash-critical
+/// （Python `collect_flash_candidates_and_mark` 略過 `_draining_by_ids`，`origin/main:sw_core/session_manager.py:3282-3288`）。
+/// flasher 的 sync 不得送往 MCU、端點保持沉默、偵測結果 none、不進 FLASHING。對照組：同一條線未登記時照常認線。
+#[test]
+fn wp510r_r6_g6_unconfirmed_by_id_is_not_flash_candidate() {
+    let rig = one_line(Mcu::ti_sbl());
+    let mgr = rig.mgr();
+    mgr.mark_unconfirmed_close_for_test("by-id/mcu");
+    rig.flasher_write(SYNC);
+    rig.run_detection();
+    assert!(rig.serial_tx("COM0").is_empty(), "未確認關閉的線不得收到 probe");
+    assert!(rig.master_writes().is_empty(), "未匹配：端點保持沉默");
+    assert_eq!(rig.last_detect_json(), r#"{"status":"none","com":null,"family":null,"hits":[]}"#);
+    assert_eq!(rig.state("COM0"), "ATTACHED");
+    assert!(!mgr.flash_critical("COM0"), "略過的候選不得留下 flash-critical 標記");
+
+    let control = flashing(Mcu::ti_sbl());
+    assert_eq!(control.state("COM0"), "FLASHING", "對照組：未登記時照常認線");
+}

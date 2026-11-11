@@ -5551,3 +5551,205 @@ fn wp510r_r5_p8_a07fdfb_1_cancelled_oserror_replies_recovering_without_retire() 
         .collect();
     assert_eq!(paths, vec![REAL_PATH.to_string()], "未取消的 OSError 退休，效果帶原開埠路徑");
 }
+
+// ---------------------------------------------------------------------------
+// S2-PAR-wp510r R6（設計 §4 R6、§3.1.7）：T14 凍結案例收尾與本包累積的審查回歸。
+// ---------------------------------------------------------------------------
+
+/// 審查 P8-7bb9935-5（設計 §3.1.7「新工作的 OpenBridge：Pending／Permanent 不執行」）：出生即接管的 session 在交接凍結
+/// 期間建構時，啟動效果不得執行 `ClaimCustody`。Pending：開埠延後，撤銷凍結後才以同一 token 開埠；Permanent：只關閉
+/// （`ClaimForStop(Freeze)`，不 adopt），與 W6 offer 在 Permanent 下的處置相同（`custody_offer`）。
+#[test]
+fn wp510r_r6_t14_birth_takeover_claim_custody_deferred_pending_closes_permanent() {
+    for permanent in [false, true] {
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        let freeze = if permanent {
+            h.reg.admission_gate().freeze();
+            None
+        } else {
+            match h.reg.admission_gate().freeze_if_idle("wp510r-r6-birth") {
+                sw_core::admission::FreezeOutcome::Frozen { token, .. } => Some(token),
+                outcome => panic!("應建立暫時凍結：{outcome:?}"),
+            }
+        };
+        h.core.init_external_attach(WP510R_CUSTODY_TOKEN, REAL_PATH);
+        let startup = h.core.take_startup_effects();
+        assert!(
+            wp510r_custody_open_paths(&startup, WP510R_CUSTODY_TOKEN).is_empty(),
+            "凍結（permanent={permanent}）期間啟動效果不得 ClaimCustody"
+        );
+        assert!(!wp510r_has_open(&startup), "凍結期間不得開埠");
+        assert_eq!(h.public()["state"], PyValue::from("ATTACHING"), "permanent={permanent}");
+        match freeze {
+            Some(freeze) => {
+                assert_eq!(wp510r_claims(&startup, WP510R_CUSTODY_TOKEN), 0, "Pending：延後，不關閉");
+                let (_, effects) = h.rpc_full(SessionRequest::GetState);
+                assert!(
+                    wp510r_custody_open_paths(&effects, WP510R_CUSTODY_TOKEN).is_empty(),
+                    "Pending 期間其他事件不得帶出開埠"
+                );
+                assert!(h.reg.admission_gate().thaw(&freeze));
+                let (_, replayed) = h.rpc_full(SessionRequest::GetState);
+                assert_eq!(
+                    wp510r_custody_open_paths(&replayed, WP510R_CUSTODY_TOKEN),
+                    vec![REAL_PATH.to_string()],
+                    "撤銷凍結後以同一 token 開埠"
+                );
+            }
+            None => {
+                let claims: Vec<_> = startup
+                    .iter()
+                    .filter_map(|effect| match effect {
+                        Effect::ClaimForStop { token, cancel, .. } => Some((*token, *cancel)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    claims,
+                    vec![(WP510R_CUSTODY_TOKEN, sw_core::custody::CustodyCancel::Freeze)],
+                    "Permanent：只關閉（ClaimForStop Freeze）"
+                );
+            }
+        }
+    }
+}
+
+/// 審查 P8-566d90b-5 之一（Python `shutdown_drain` 只收尾作業、不改 session 狀態，`origin/main:sw_core/session_manager.py:1181-1239`）：
+/// RELEASED 的 session 帶著退休 bridge（DR-4 前置）收到 shutdown：等回條期間與回條之後都維持 RELEASED，`last_error`
+/// 不被改寫。
+#[test]
+fn wp510r_r6_p8_566d90b_5_released_shutdown_keeps_released_state() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (r_epoch, r_stop) = wp510r_released_attach_commit_failure(&mut h);
+    let before = h.public();
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    h.feed(ControlEvent::Shutdown { reply: shutdown_tx });
+    assert!(shutdown_rx.try_recv().is_err(), "回條前 shutdown 不得回覆");
+    let waiting = h.public();
+    assert_eq!(waiting["state"], PyValue::from("RELEASED"), "等退休 bridge 期間維持 RELEASED：{waiting:?}");
+    assert_eq!(waiting["last_error"], before["last_error"]);
+    h.receipt(r_epoch, r_stop).handle_closed(true).feed();
+    assert!(h.core.shutdown_complete());
+    assert_eq!(shutdown_rx.try_recv().unwrap().unwrap()["ok"], PyValue::Bool(true));
+    let after = h.public();
+    assert_eq!(after["state"], PyValue::from("RELEASED"), "收尾後仍為 RELEASED：{after:?}");
+    assert_eq!(after["last_error"], before["last_error"], "收尾不改寫 last_error：{after:?}");
+}
+
+/// 審查 P8-566d90b-5 之二（Python shutdown 等所有排空作業，含 attach 衍生的退休 bridge，`origin/main:sw_core/session_manager.py:1181-1239`）：
+/// READY 的 session 同時有自身 bridge 與退休 bridge 時 shutdown：自身 bridge 的回條先到不得完成停止，退休 bridge 回條
+/// `handle_closed:true` 之後才回覆 shutdown 並報已排空。
+#[test]
+fn wp510r_r6_p8_566d90b_5_shutdown_waits_retired_bridge_after_own_receipt() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let stale = h.opened_bridge("/fake/tty-stale");
+    let stale_epoch = stale.epoch;
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Ok(stale),
+    });
+    let (r_epoch, r_stop) = h.pending_stop();
+    assert_eq!(r_epoch, stale_epoch, "前置：多餘的 bridge 退休並開始排空");
+    assert_eq!(wp510r_retired_epochs(&mut h), vec![stale_epoch as i64]);
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    h.feed(ControlEvent::Shutdown { reply: shutdown_tx });
+    let (own_epoch, own_stop) = h.pending_stop();
+    assert_ne!(own_epoch, r_epoch, "前置：shutdown 排空自身 bridge");
+    h.receipt(own_epoch, own_stop).handle_closed(true).feed();
+    assert!(shutdown_rx.try_recv().is_err(), "自身 bridge 收尾後仍須等退休 bridge 回條");
+    assert!(!h.core.shutdown_complete(), "退休 bridge 未確認關閉不得報已排空");
+    h.receipt(r_epoch, r_stop).handle_closed(true).feed();
+    assert!(h.core.shutdown_complete());
+    assert_eq!(shutdown_rx.try_recv().unwrap().unwrap()["ok"], PyValue::Bool(true));
+}
+
+/// 審查 P8-c92ef3e-1 之一：持有尚未開埠的帳本紀錄（`AcceptCustody{open_now:false}`）時 bind 到他處，bind 的
+/// `ClaimForStop(Bind)` 已認領該紀錄（關閉中）；此時 `session.recover` 回 REATTACH、ATTACHING，不得再以 `ClaimCustody`
+/// 認領或另發一般 `OpenBridge`（Python `_spawn_attach` 遇同 by_id 在途作業即去重，`origin/main:sw_core/session_manager.py:4115-4116`）。
+/// 關閉終態到了 bind 才完成改綁（DETACHED）。
+#[test]
+fn wp510r_r6_p8_c92ef3e_1_recover_after_bind_claimed_custody_does_not_open() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let accepted = h
+        .rpc(SessionRequest::AcceptCustody {
+            token: WP510R_CUSTODY_TOKEN,
+            by_id: DEVICE_BY_ID.into(),
+            real_path: REAL_PATH.into(),
+            open_now: false,
+        })
+        .unwrap();
+    assert_eq!(accepted.get("ok"), Some(&PyValue::Bool(true)), "{accepted:?}");
+    let (bind_rx, effects) = h.rpc_deferred(bind_to(WP510R_BIND_TARGET));
+    assert_eq!(wp510r_claims(&effects, WP510R_CUSTODY_TOKEN), 1, "前置：bind 取消帳本紀錄");
+    assert!(bind_rx.try_recv().is_err(), "前置：bind 等關閉終態");
+    // recover 在 bind 的 `ClaimForStop` 已發出、認領結果尚未交回時到達（取消者已在收尾）。
+    let (response, effects) = h.rpc_full(wp510r_recover());
+    let response = response.unwrap();
+    assert_eq!(response.get("action"), Some(&PyValue::from("REATTACH")), "{response:?}");
+    assert!(
+        wp510r_custody_open_paths(&effects, WP510R_CUSTODY_TOKEN).is_empty(),
+        "紀錄已由取消者認領：recover 不得再 ClaimCustody"
+    );
+    assert!(wp510r_open_bridge_paths(&effects).is_empty(), "recover 不得另發一般 OpenBridge");
+    assert_eq!(h.public()["state"], PyValue::from("ATTACHING"));
+    wp510r_custody_claimed(&mut h, sw_core::mailbox::CustodyClaimOutcome::Closing);
+    assert!(bind_rx.try_recv().is_err(), "bind 等關閉終態");
+    let effects = h.feed(ControlEvent::CustodyTerminal {
+        token: WP510R_CUSTODY_TOKEN,
+        closed: true,
+        error: None,
+    });
+    assert!(wp510r_custody_open_paths(&effects, WP510R_CUSTODY_TOKEN).is_empty());
+    let bound = bind_rx.try_recv().expect("關閉終態後 bind 應回覆").unwrap();
+    assert_eq!(bound.get("ok"), Some(&PyValue::Bool(true)), "{bound:?}");
+    assert_eq!(h.public()["device_by_id"], PyValue::from(WP510R_BIND_TARGET));
+    assert_eq!(h.public()["state"], PyValue::from("DETACHED"));
+}
+
+/// 審查 P8-c92ef3e-1 之二（SPEC-GAP 2 條件 2：通知只結算目前仍在等的那一筆）：第一次（帶 ack 的）release 完成後，
+/// session 重新 attach 到 READY 並帶著退休 bridge；以不帶 ack 的 `Release` 建立排空自身 bridge 的新停止（不更新
+/// `release_wait_rt`）。第一次 release 遺留的 `ReleaseDeadlineElapsed` 遲到時不得讓新停止回 DRAIN_STALLED；兩個回條
+/// `handle_closed:true` 後新 release 照常完成。
+#[test]
+fn wp510r_r6_p8_c92ef3e_1_stale_notice_does_not_stall_unacked_release() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let (first_rx, first_wait) = wp510r_release_with_ack(&mut h);
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).handle_closed(true).feed();
+    let first = first_rx.try_recv().expect("前置：第一次 release 收尾").unwrap();
+    assert_eq!(first.get("ok"), Some(&PyValue::Bool(true)), "{first:?}");
+    assert_eq!(h.public()["state"], PyValue::from("RELEASED"));
+    let (attach_rx, _) = h.rpc_deferred(SessionRequest::DeviceAttach { force: true });
+    h.bridge_ok();
+    let attached = attach_rx.try_recv().expect("前置：device.attach 回覆").unwrap();
+    assert_eq!(attached.get("ok"), Some(&PyValue::Bool(true)), "{attached:?}");
+    let (epoch, fsm_gen) = (h.epoch(), h.core.generations().fsm_gen);
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    assert_eq!(h.public()["state"], PyValue::from("READY"), "前置：重新 attach 到 READY");
+    let stale = h.opened_bridge("/fake/tty-stale");
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Ok(stale),
+    });
+    let (r_epoch, r_stop) = h.pending_stop();
+    let (rx, _) = h.rpc_deferred(release());
+    let (own_epoch, own_stop) = h.pending_stop();
+    assert_ne!(own_epoch, r_epoch, "前置：新 release 排空自身 bridge");
+    assert!(rx.try_recv().is_err(), "前置：新 release 等待中");
+    let (ack, _) = h.rpc_full(wp510r_notice(&first_wait));
+    assert_eq!(ack.unwrap().get("ok"), Some(&PyValue::Bool(true)));
+    assert!(rx.try_recv().is_err(), "第一次 release 的遲到通知不得結算新的停止");
+    assert_eq!(h.public()["drain_stalled"], PyValue::Bool(false));
+    h.receipt(own_epoch, own_stop).handle_closed(true).feed();
+    h.receipt(r_epoch, r_stop).handle_closed(true).feed();
+    let done = rx.try_recv().expect("兩個回條到齊後 release 回覆").unwrap();
+    assert_eq!(done.get("ok"), Some(&PyValue::Bool(true)), "{done:?}");
+    assert_eq!(nested_session_state(&done), PyValue::from("RELEASED"), "{done:?}");
+}
