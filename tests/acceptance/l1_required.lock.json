@@ -22126,6 +22126,7 @@
           "cargo:sw-daemon::dispatch::wp510r_r6_rpc_late_release_completion_survives_shutdown_freeze",
           "cargo:sw-daemon::dispatch::wp510r_r6_rpc_late_release_retry_wait_uses_first_deadline",
           "cargo:sw-daemon::dispatch::wp510r_r6_rpc_late_release_snapshot_is_invalidated_by_bind",
+          "cargo:sw-daemon::dispatch::wp510r_r6_rpc_late_release_uses_snapshot_when_first_stall_reply_pending",
           "cargo:sw-daemon::dispatch::wp510r_r6_rpc_p8_add3ca0_1_release_late_close_retries_when_safety_lane_full",
           "cargo:sw-daemon::dispatch::wp510r_r6_rpc_p8_add3ca0_1_release_stalled_on_parked_unplug_close_completes_late",
           "cargo:sw-daemon::dispatch::wp51_interactive_owner_policy",

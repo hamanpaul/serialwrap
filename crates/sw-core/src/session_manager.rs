@@ -605,6 +605,9 @@ struct CustodyReleaseWait {
     actor: Arc<ActorHandle>,
     source: String,
     reason: PyValue,
+    /// 首次等待前取得的公開 session 狀態與 timeout epoch；期限後回覆不得再查詢 actor。
+    stalled_session_snapshot: Option<PyDict>,
+    stalled_timeout_epoch: Option<i64>,
     /// release 已於首次期限回 DRAIN_STALLED、不再等待回條（與關閉者的結算在同一把 manager lock 內判定）。
     stalled: bool,
     /// 首次期限回覆；後續 release 仍須沿用這份 DRAIN_STALLED 回覆，不等待送達者。
@@ -6021,6 +6024,8 @@ impl SessionManager {
                                 actor,
                                 source: source.to_string(),
                                 reason: reason.clone(),
+                                stalled_session_snapshot: None,
+                                stalled_timeout_epoch: None,
                                 stalled: false,
                                 stalled_reply: None,
                                 completion_pending: false,
@@ -6116,9 +6121,17 @@ impl SessionManager {
                 if let Some(reply) = wait.stalled_reply.clone() {
                     return Ok(Some(reply));
                 }
-                // 首次 waiter 已標 stalled，但其 actor 回覆尚未回到 manager 時只作短暫鎖外收斂；期限不再重新起算。
+                // 首次 waiter 已標 stalled，但其 actor 回覆尚未回到 manager；期限已過時只用首次等待前保存的快照，
+                // 不得再向可能暫停的 actor 發 GetState。
+                let snapshot = wait
+                    .stalled_session_snapshot
+                    .clone()
+                    .ok_or_else(|| PyErr::value_error("release stalled session snapshot unavailable"))?;
+                let epoch = wait
+                    .stalled_timeout_epoch
+                    .ok_or_else(|| PyErr::value_error("release stalled timeout epoch unavailable"))?;
                 drop(inner);
-                return Ok(Some(self.late_release_stalled_fallback(sid)));
+                return Ok(Some(Self::late_release_stalled_fallback(snapshot, epoch)));
             }
             let (next, _) = self
                 .shared
@@ -6129,14 +6142,8 @@ impl SessionManager {
         }
     }
 
-    /// 首次 waiter 尚未寫入快取時的有限 fallback；正常路徑重用 `MarkAttachStalled` 的完整回覆。
-    fn late_release_stalled_fallback(&self, sid: &str) -> PyDict {
-        let mut session = self.shared.session_public(sid).unwrap_or_default();
-        let epoch = session
-            .get("bridge_generation")
-            .and_then(PyValue::as_i64)
-            .unwrap_or(0)
-            .max(0);
+    /// 首次 waiter 尚未寫入快取時，用首次等待前保存的完整快照組出 STALL 回覆；不查詢 actor。
+    fn late_release_stalled_fallback(mut session: PyDict, epoch: i64) -> PyDict {
         let state = session.get("state").and_then(PyValue::as_str);
         if state != Some("RELEASED") {
             session.insert("state", PyValue::from("RECOVERING"));
@@ -6166,12 +6173,43 @@ impl SessionManager {
         token: u64,
         deadline: Instant,
     ) -> Result<Option<PyDict>, PyErr> {
-        let epoch = self
-            .shared
-            .session_public(sid)
-            .and_then(|session| session.get("bridge_generation").and_then(PyValue::as_i64))
-            .unwrap_or(0)
-            .max(0) as u64;
+        let saved = {
+            let inner = lock(&self.shared.inner);
+            let Some(wait) = inner.custody_release_waits.get(&token) else {
+                return Ok(None);
+            };
+            match (
+                wait.stalled_session_snapshot.clone(),
+                wait.stalled_timeout_epoch,
+            ) {
+                (Some(snapshot), Some(epoch)) => Some((snapshot, epoch)),
+                (None, None) => None,
+                _ => {
+                    return Err(PyErr::value_error(
+                        "release stalled session snapshot and timeout epoch are inconsistent",
+                    ));
+                }
+            }
+        };
+        let epoch = if let Some((_, epoch)) = saved {
+            // 後續 release 沿用首次等待前快照；不得在 actor 暫停時再發 GetState。
+            epoch
+        } else {
+            let snapshot = self.shared.session_public_checked(sid)?;
+            let epoch = snapshot
+                .get("bridge_generation")
+                .and_then(PyValue::as_i64)
+                .unwrap_or(0)
+                .max(0);
+            let mut inner = lock(&self.shared.inner);
+            let Some(wait) = inner.custody_release_waits.get_mut(&token) else {
+                return Ok(None);
+            };
+            // 多個 release waiter 共用首次快照與 epoch，不讓後續請求覆寫首次期限的回覆資料。
+            wait.stalled_session_snapshot.get_or_insert(snapshot);
+            *wait.stalled_timeout_epoch.get_or_insert(epoch)
+        };
+        let epoch = epoch as u64;
         let stalled_reply = {
             let mut inner = lock(&self.shared.inner);
             loop {
@@ -7902,6 +7940,17 @@ impl SessionManager {
             .custody_release_waits
             .get(&token)
             .map(|wait| wait.full_attempts)
+    }
+
+    /// 只供測試（test-fakes）：確認首次 release 已保存完整 session 快照與 timeout epoch。
+    #[cfg(feature = "test-fakes")]
+    pub fn custody_release_snapshot_ready_for_test(&self, token: u64) -> bool {
+        lock(&self.shared.inner)
+            .custody_release_waits
+            .get(&token)
+            .is_some_and(|wait| {
+                wait.stalled_session_snapshot.is_some() && wait.stalled_timeout_epoch.is_some()
+            })
     }
 
     /// 只供測試（test-fakes）：暫停 late release 在 manager 鎖外收集事件後、送入 actor safety lane 前。
