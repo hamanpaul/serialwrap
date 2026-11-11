@@ -10006,3 +10006,167 @@ fn wp510r_r6_rpc_p8_add3ca0_1_release_stalled_on_parked_unplug_close_completes_l
     assert_eq!(again.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&again));
     assert_eq!(again.get("already_released"), Some(&PyValue::Bool(true)), "{}", j(&again));
 }
+
+/// 審查 P8-add3ca0-1 的 safety lane 滿載交錯：保留首次 release 的完成義務直到能成功排入 actor。
+#[test]
+fn wp510r_r6_rpc_p8_add3ca0_1_release_late_close_retries_when_safety_lane_full() {
+    let r = wp510_b_placeholder_rig();
+    let dev = wp510_review8_double_enospc_bind_setup(&r, false);
+    let parked = r
+        .mgr
+        .custody_for_test(WP510_PLACEHOLDER_BY_ID)
+        .expect("前置：parked 帳本紀錄");
+    let token = parked.token;
+    let without: Vec<(String, DeviceInfo)> = r
+        .mgr
+        .list_devices()
+        .into_iter()
+        .filter_map(|row| {
+            let by_id = s(&row, "by_id").to_string();
+            let real_path = s(&row, "real_path").to_string();
+            (by_id != WP510_PLACEHOLDER_BY_ID)
+                .then(|| (by_id.clone(), DeviceInfo { by_id, real_path }))
+        })
+        .collect();
+    dev.pause_next_close();
+    let unplug_mgr = r.mgr.clone();
+    let unplug = std::thread::spawn(move || unplug_mgr.update_devices(&without));
+    assert!(
+        dev.wait_paused(Duration::from_secs(5)),
+        "拔除的熱插執行緒停在 parked handle 的關閉"
+    );
+
+    let stalled = r.call("device.release", r#"{"selector":"COM1"}"#);
+    assert_eq!(
+        stalled.get("ok"),
+        Some(&PyValue::Bool(false)),
+        "{}",
+        j(&stalled)
+    );
+    assert_eq!(
+        stalled.get("error_code"),
+        Some(&PyValue::from("DRAIN_STALLED")),
+        "{}",
+        j(&stalled)
+    );
+    assert_eq!(
+        stalled.get("drain_stalled"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&stalled)
+    );
+    let com1_sid = s(&r.session("COM1").expect("COM1 session"), "session_id").to_string();
+    assert!(
+        !wp510r_r6_state_has_released_sid(&r, &com1_sid),
+        "逾時當下 COM1 未落盤"
+    );
+    let attempts = dev.open_attempts();
+
+    let safety_observer = r
+        .mgr
+        .safety_receiver_for_test("COM1")
+        .expect("COM1 safety lane");
+    wait_until("暫停 actor 前 safety lane 已清空", || {
+        safety_observer.is_empty()
+    });
+    let (actor_paused, actor_resume) = r
+        .mgr
+        .pause_next_request_for_test("COM1")
+        .expect("COM1 actor");
+    let query_service = r.svc.clone();
+    let query = std::thread::spawn(move || {
+        query_service.rpc(
+            "session.get_state",
+            &sw_proto::pydict! { "selector" => "COM1" },
+        )
+    });
+    actor_paused
+        .recv_timeout(Duration::from_secs(5))
+        .expect("actor 已停在查詢 dispatch");
+    assert!(!query.is_finished(), "查詢仍卡在暫停的 actor");
+
+    const SAFETY_CAPACITY: usize = sw_core::resources::MAILBOX_CONTROL_CAP;
+    let duplicate_service = r.svc.clone();
+    let duplicate_release = std::thread::spawn(move || {
+        duplicate_service.rpc(
+            "device.release",
+            &sw_proto::pydict! { "selector" => "COM1" },
+        )
+    });
+    wait_until("重複 release 排入 stalled safety request", || {
+        safety_observer.len() == 1
+    });
+    let remaining = r
+        .mgr
+        .enqueue_stalled_releases_for_test("COM1", 0, SAFETY_CAPACITY - 1)
+        .expect("COM1 actor");
+    assert_eq!(
+        remaining,
+        SAFETY_CAPACITY - 1,
+        "注入同型 stalled release 請求填滿 safety lane"
+    );
+    assert_eq!(
+        safety_observer.len(),
+        SAFETY_CAPACITY,
+        "actor 暫停時 safety lane 恰好滿載"
+    );
+
+    dev.release_pause();
+    unplug.join().expect("拔除的熱插執行緒不應 panic");
+    assert!(
+        r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_none(),
+        "關閉回條移除帳本紀錄"
+    );
+    wait_until(
+        "遲到 release 確認滿載時投遞失敗並保留義務",
+        || {
+            r.mgr
+                .late_release_full_attempts_for_test(token)
+                .is_some_and(|attempts| attempts > 0)
+        },
+    );
+    actor_resume.send(()).expect("恢復 actor");
+    assert!(
+        query.join().expect("查詢執行緒不應 panic").is_ok(),
+        "actor 查詢正常回覆"
+    );
+    let duplicate = duplicate_release
+        .join()
+        .expect("重複 release 執行緒不應 panic")
+        .expect("release 回覆");
+    assert_eq!(
+        duplicate.get("error_code"),
+        Some(&PyValue::from("DRAIN_STALLED")),
+        "{}",
+        j(&duplicate)
+    );
+
+    r.wait_state("COM1", "RELEASED");
+    let session = r.session("COM1").expect("COM1 session");
+    assert_eq!(
+        session.get("drain_stalled"),
+        Some(&PyValue::Bool(false)),
+        "{}",
+        j(&session)
+    );
+    assert_eq!(
+        session.get("drain_timeout_epoch"),
+        Some(&PyValue::Null),
+        "{}",
+        j(&session)
+    );
+    wait_until("滿載後遲到完成的 RELEASED 落盤", || {
+        wp510r_r6_state_has_released_sid(&r, &com1_sid)
+    });
+    assert_eq!(dev.close_count(), 1, "parked handle 只關閉一次");
+    assert!(
+        r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_none(),
+        "回條後紀錄移除"
+    );
+    assert_eq!(
+        r.mgr.terminal_for_test(token).map(|t| t.handle),
+        Some(sw_core::custody::TerminalHandle::Closed)
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(dev.open_attempts(), attempts, "release 完成後不自動重開");
+}
