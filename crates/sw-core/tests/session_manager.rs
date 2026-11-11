@@ -5879,3 +5879,64 @@ fn wp510r_r5_p8_a07fdfb_1_device_change_before_oserror_retire_keeps_placeholder(
     assert_eq!(m.serial.open_attempts(WP510R_R5_REAL), 1);
     wp510r_r5_assert_cancelled_oserror_kept(&m, &sid, &a);
 }
+
+/// P8-a07fdfb-1（審查第 2 輪殘留，High）：OSError 已結算帳本紀錄後、佔位 actor 取 manager 鎖退休之前（H-retire-pre-commit），
+/// 同一 by_id 先改指新路徑、再改回原路徑。Python 的 `update_devices` 對在途作業的取消不可撤銷（路徑恢復不清除
+/// `op.cancelled`，`origin/main:sw_core/session_manager.py:4031-4034`），OSError 收尾在同一鎖區段讀到已取消即回
+/// SESSION_RECOVERING、不退休（`:3529-3531`、`:3561-3567`）。只比對退休當下的路徑字串分不出「改指再改回」：須保留本次作業的
+/// 取消到退休提交。斷言佔位保留、原路徑開埠總次數仍為 1（不交接再開）、新路徑零開埠。
+#[test]
+fn wp510r_r5_p8_a07fdfb_1_retarget_and_back_before_oserror_retire_keeps_placeholder() {
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(WP510R_R5_SID).expect("佔位 session");
+    m.mgr.update_devices(&m.snapshot());
+    m.serial.fail_next_open(WP510R_R5_REAL, wp510_b_permission_error());
+    let retargeted = wp510r_r5_retargeted_snapshot(&m);
+    let original = m.snapshot();
+    let hook_manager = m.mgr.clone();
+    let (hooked_tx, hooked_rx) = crossbeam_channel::bounded(1);
+    m.mgr.set_placeholder_retire_pre_commit_hook_for_test(
+        WP510R_R5_SID,
+        Box::new(move || {
+            hook_manager.update_devices(&retargeted);
+            hook_manager.update_devices(&original);
+            let _ = hooked_tx.send(());
+        }),
+    );
+
+    let a = rpc(m.mgr.attach_released_placeholder(&sid, false));
+    hooked_rx.try_recv().expect("退休提交前已改指再改回");
+    assert_eq!(m.serial.open_attempts(WP510R_R5_REAL), 1);
+    wp510r_r5_assert_cancelled_oserror_kept(&m, &sid, &a);
+    assert_eq!(m.serial.open_attempts(WP510R_R5_REAL), 1, "原路徑不得由交接 worker 再開埠");
+}
+
+/// P8-a07fdfb-1 對照組：退休提交前的裝置更新若沒有改變本 by_id 的路徑（同一快照重掃），Python 不取消作業
+/// （`origin/main:sw_core/session_manager.py:4031-4034` 只在路徑不同時 `op.cancelled.set()`），OSError 照 B-7 退休並交接
+/// dynamic 再開一次（`:3529-3560`）。防止以「任何裝置更新都取消」矯枉過正。
+#[test]
+fn wp510r_r5_p8_a07fdfb_1_same_path_update_before_oserror_retire_still_retires() {
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(WP510R_R5_SID).expect("佔位 session");
+    m.mgr.update_devices(&m.snapshot());
+    m.serial.fail_next_open(WP510R_R5_REAL, wp510_b_permission_error());
+    let same = m.snapshot();
+    let hook_manager = m.mgr.clone();
+    let (hooked_tx, hooked_rx) = crossbeam_channel::bounded(1);
+    m.mgr.set_placeholder_retire_pre_commit_hook_for_test(
+        WP510R_R5_SID,
+        Box::new(move || {
+            hook_manager.update_devices(&same);
+            let _ = hooked_tx.send(());
+        }),
+    );
+
+    let a = rpc(m.mgr.attach_released_placeholder(&sid, false));
+    hooked_rx.try_recv().expect("退休提交前已重掃同一快照");
+    assert!(is_ok(&a), "路徑未變不取消，OSError 照 B-7 退休：{a:?}");
+    let snapshot = session_field(&a);
+    assert_eq!(s_of(&snapshot, "state").as_deref(), Some("DETACHED"));
+    assert_eq!(s_of(&snapshot, "last_error").as_deref(), Some("ATTACH_FAILED:PermissionError"));
+    wait_until("佔位交接的 dynamic 開埠", || m.serial.open_attempts(WP510R_R5_REAL) == 2);
+    assert_eq!(m.mgr.resolve(WP510R_R5_SID), None, "舊佔位已退休");
+}

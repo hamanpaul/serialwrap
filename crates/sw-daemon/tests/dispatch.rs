@@ -9798,3 +9798,79 @@ fn wp510r_r5_rpc_p8_a07fdfb_1_device_cancel_then_oserror_keeps_placeholder() {
     assert!(r.mgr.resolve("t:COM3").is_none(), "沒有正式 session");
     assert_eq!(r.fs.bytes(support::STATE_PATH), state_before, "不落盤退休");
 }
+
+/// P8-a07fdfb-1（審查第 2 輪殘留，High）端到端：佔位 `device.attach` 開埠回 PermissionError，開埠工作以 NoHandle 結算帳本
+/// 紀錄；佔位 actor 執行 `RetirePlaceholder`、取 manager 鎖之前（H-retire-pre-commit）同一 by_id 先改指新路徑、再改回原路徑。
+/// 呼叫路徑：`device.attach` → `SessionManager::route_with_selector` → `DeviceAttachRouted` → 佔位 actor `PrepareHandoffWorker`
+/// → `OpenPlaceholderRaw` → `open_placeholder_raw` 無 handle 收尾 → `PlaceholderOpened(Other)` → `RetirePlaceholder{OsError}` →
+/// `retire_placeholder` 鎖內核對本次作業的取消 → `RetireResult::Invalid` → 回覆。Python 的取消不因路徑恢復撤銷
+/// （`origin/main:sw_core/session_manager.py:4031-4034`），OSError 收尾讀到已取消即回 SESSION_RECOVERING、保留 RELEASED 佔位
+/// （`:3529-3531`、`:3561-3567`）；原路徑不再開埠、新路徑零開埠、不落盤退休。
+#[test]
+fn wp510r_r5_rpc_p8_a07fdfb_1_retarget_and_back_before_oserror_retire_keeps_placeholder() {
+    const NEW_REAL: &str = "/fake/tty-G2";
+    let (r, backend, entered, dev) = wp510_b_placeholder_blocking_rig_with_open_error(Some(OpenError::Other(
+        PalError::plain(PalErrorKind::PermissionDenied, "Permission denied"),
+    )));
+    let new_dev = backend.delegate.add_device(NEW_REAL);
+    wp510_install_shell_replies(&new_dev);
+    let r = Arc::new(r);
+    let state_before = r.fs.bytes(support::STATE_PATH);
+    let original: Vec<(String, DeviceInfo)> = r
+        .mgr
+        .list_devices()
+        .into_iter()
+        .map(|row| {
+            let by_id = s(&row, "by_id").to_string();
+            let real_path = s(&row, "real_path").to_string();
+            (by_id.clone(), DeviceInfo { by_id, real_path })
+        })
+        .collect();
+    let retargeted: Vec<(String, DeviceInfo)> = original
+        .iter()
+        .map(|(by_id, info)| {
+            let mut info = info.clone();
+            if by_id == WP510_PLACEHOLDER_BY_ID {
+                info.real_path = NEW_REAL.to_string();
+            }
+            (by_id.clone(), info)
+        })
+        .collect();
+    let hook_rig = Arc::clone(&r);
+    let (hooked_tx, hooked_rx) = crossbeam_channel::bounded(1);
+    r.mgr.set_placeholder_retire_pre_commit_hook_for_test(
+        WP510_PLACEHOLDER_SID,
+        Box::new(move || {
+            hook_rig.mgr.update_devices(&retargeted);
+            hook_rig.mgr.update_devices(&original);
+            let _ = hooked_tx.send(());
+        }),
+    );
+    let attach_rig = Arc::clone(&r);
+    let attach = std::thread::spawn(move || {
+        attach_rig.call("device.attach", &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#))
+    });
+    entered.recv_timeout(Duration::from_secs(5)).expect("開埠進入阻塞點");
+    backend.release();
+    let attached = attach.join().expect("attach RPC thread");
+    hooked_rx.try_recv().expect("退休提交前已改指再改回");
+    let session = r.session(WP510_PLACEHOLDER_SID).expect("佔位保留");
+    assert_eq!(s(&session, "state"), "RELEASED", "{}", j(&session));
+    assert_eq!(
+        j(&attached),
+        format!(
+            r#"{{"ok":false,"error_code":"SESSION_RECOVERING","drain_stalled":false,"drain_timeout_epoch":null,"session":{},"version":"{}"}}"#,
+            j(&session),
+            r.version
+        ),
+        "已取消的 OSError RPC bytes"
+    );
+    assert_eq!(r.mgr.released_placeholder(WP510_PLACEHOLDER_SID), Some(true));
+    assert!(r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_none(), "帳本無殘留紀錄");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(entered.try_recv().is_err(), "原路徑開埠總次數仍為 1");
+    assert_eq!(dev.open_attempts(), 0, "原路徑不得由交接 worker 再開埠");
+    assert_eq!(new_dev.open_attempts(), 0, "不啟動新路徑交接");
+    assert!(r.mgr.resolve("t:COM3").is_none(), "沒有正式 session");
+    assert_eq!(r.fs.bytes(support::STATE_PATH), state_before, "不落盤退休");
+}

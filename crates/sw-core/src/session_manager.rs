@@ -526,9 +526,20 @@ type ByIdTestHook = (String, Box<dyn FnOnce() + Send>);
 type SidTestHook = (String, Box<dyn FnOnce() + Send>);
 
 /// 佔位 W1 預先準備的交接 worker（`Inner::prepared`）：dynamic_only 作業與尚未放行的執行緒。
+///
+/// 同一 token 的紀錄從準備（開埠之前）存活到 `RetirePlaceholder` 在 manager 鎖內消費（或 `DiscardHandoffWorker` 丟棄），
+/// 因此也承載本次佔位開埠作業的裝置取消：`open_placeholder_raw` 在登記帳本紀錄的鎖區段設定 `watch_path`，此後
+/// `update_devices` 見同一 by_id 不再指向它（改指或離線）就設 `device_cancelled`，之後路徑恢復也不清除。對應 Python
+/// `update_devices` 對 `_attach_ops` 作業 `op.cancelled.set()`（`origin/main:sw_core/session_manager.py:4031-4034`），
+/// 作業從登記（`:3494-3501`）存活到 OSError 收尾的鎖區段（`:3527-3533`）；帳本紀錄在無 handle 收尾時已結算，
+/// 不能再承載取消（審查 P8-a07fdfb-1）。
 pub struct PreparedHandoff {
     op: AttachOp,
     worker: PreparedAttachWorker,
+    /// 本次佔位開埠的原路徑；`None` 表示尚未登記開埠（裝置更新不影響）。
+    watch_path: Option<String>,
+    /// 登記開埠後同一 by_id 曾不指向 `watch_path`（不可撤銷）。
+    device_cancelled: bool,
 }
 
 /// 已建立、尚未放行的 attach worker 執行緒（`Shared::prepare_attach_worker`）。
@@ -1833,6 +1844,19 @@ impl Shared {
                 return;
             }
             let prev = std::mem::replace(&mut inner.devices, new.clone());
+            // 佔位開埠作業（已登記 `watch_path`）的 by_id 不再指向原路徑：在預先準備的交接紀錄寫入不可撤銷的取消，之後
+            // 改回原路徑也不清除；OSError 收尾已結算帳本紀錄時，退休提交仍據此判定已取消（Python `update_devices` 對
+            // `_attach_ops` 作業 `op.cancelled.set()`，`origin/main:sw_core/session_manager.py:4031-4034`；審查 P8-a07fdfb-1）。
+            {
+                let Inner { prepared, devices, .. } = &mut *inner;
+                for handoff in prepared.values_mut() {
+                    if let Some(path) = handoff.watch_path.as_deref() {
+                        if devices.get(&handoff.op.by_id).map(|d| d.real_path.as_str()) != Some(path) {
+                            handoff.device_cancelled = true;
+                        }
+                    }
+                }
+            }
             // 裝置離線／改指：使進行中的 attach op 失效（#27）。
             let invalid_ops: Vec<(String, AttachOp)> = inner
                 .inflight
@@ -3877,7 +3901,13 @@ impl OpenCtx {
                 },
                 crate::custody::CustodyTaker::PlaceholderOpen { sid: sid.clone(), gen: token },
             ) {
-                Ok(()) => {}
+                Ok(()) => {
+                    // 與裝置路徑核對同一鎖區段起監看本次開埠的原路徑：之後的改指／離線在預先準備的交接紀錄留下不可撤銷
+                    // 的取消，存活到退休提交（Python 作業登記與 `update_devices` 取消，`:3486-3501`、`:4031-4034`）。
+                    if let Some(prepared) = inner.prepared.get_mut(&token) {
+                        prepared.watch_path = Some(dev.0.clone());
+                    }
+                }
                 Err(crate::custody::CustodyRegisterError::Tombstoned) => {
                     drop(inner);
                     return no_handle(OpenFailure::Cancelled);
@@ -4437,7 +4467,15 @@ impl ManagerExec {
             Ok(worker) => {
                 lock(&self.shared.inner)
                     .prepared
-                    .insert(token, PreparedHandoff { op, worker });
+                    .insert(
+                        token,
+                        PreparedHandoff {
+                            op,
+                            worker,
+                            watch_path: None,
+                            device_cancelled: false,
+                        },
+                    );
                 Ok(())
             }
             Err(_) => Err(THREAD_START_FAILED.to_string()),
@@ -4488,9 +4526,11 @@ impl ManagerExec {
             ),
             _ => (false, inner.device_path(&by_id).is_some(), None),
         };
-        // 無 handle（OSError）的退休沒有帳本紀錄可對照（開埠工作已以 NoHandle 結算）：在鎖內核對裝置仍指向本次開埠的原路徑。
-        // 改指發生在 OSError 結算之後、退休之前時視同已取消（Python 的取消檢查與退休在同一鎖區段，改指只會落在檢查之前並
-        // 設 `op.cancelled`，`origin/main:sw_core/session_manager.py:3527-3531`、`:4031-4034`；審查 P8-a07fdfb-1）。
+        // 本次作業的裝置取消在此與退休同一鎖區段消費（`prepared` 已自表移出）：登記開埠後曾改指或離線即不退休，即使退休
+        // 當下已改回原路徑（Python 取消不可撤銷，OSError 收尾在同一鎖區段讀 `op.cancelled` 決定是否退休，
+        // `origin/main:sw_core/session_manager.py:3527-3533`、`:4031-4034`；審查 P8-a07fdfb-1）。
+        let device_cancelled = prepared.as_ref().is_some_and(|handoff| handoff.device_cancelled);
+        // 無 handle（OSError）的退休沒有帳本紀錄可對照（開埠工作已以 NoHandle 結算）：另在鎖內核對裝置仍指向本次開埠的原路徑。
         let device_ok = if opened {
             record_device_ok
         } else {
@@ -4500,6 +4540,7 @@ impl ManagerExec {
             && !frozen
             && entry_ok
             && device_ok
+            && !device_cancelled
             && prepared.is_some()
             && (!opened || record_ok);
         if !valid {
@@ -4538,7 +4579,7 @@ impl ManagerExec {
             });
             return;
         }
-        let PreparedHandoff { op, worker } = prepared.expect("已驗證 prepared worker");
+        let PreparedHandoff { op, worker, .. } = prepared.expect("已驗證 prepared worker");
         if opened {
             // 紀錄改歸交接 worker（ext 為 None，C6：退休後的佔位不會碰到它）；handle 留在帳本由 worker 以 `Held` 認領（C1′
             // 同 token 一路交給正式 session，B-6）。
