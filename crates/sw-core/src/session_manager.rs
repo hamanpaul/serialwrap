@@ -235,6 +235,7 @@ struct SessionIo {
 /// manager 的 session 鏡像（selector 解析、rank、管理操作用；狀態本身以 actor 為準）。
 struct Entry {
     sid: String,
+    actor_id: crate::custody::ActorId,
     profile: SessionProfile,
     profile_source: String,
     /// 與 actor 同步的綁定世代；保管 release 等待者以此使改綁前的送達快照失效。
@@ -630,6 +631,10 @@ impl Inner {
             .find(|e| e.profile.device_by_id == by_id)
     }
 
+    fn actor_id(&self, sid: &str) -> Option<crate::custody::ActorId> {
+        self.sessions.get(sid).map(|entry| entry.actor_id)
+    }
+
     fn resolve(&self, selector: &str) -> Option<&Entry> {
         if let Some(e) = self.sessions.get(selector) {
             return Some(e);
@@ -738,6 +743,9 @@ struct Shared {
     /// 暫停點（重現「先取消、後登記」：停止者在登記前送達，`ClaimForStop` 寫入 tombstone）。
     #[cfg(feature = "test-fakes")]
     external_attach_pre_register_hook: Mutex<Option<ByIdTestHook>>,
+    /// 只供測試（test-fakes）：W6 rematerialize 的 SetProfile 已由 actor 接受、manager 改名之前的一次性暫停點。
+    #[cfg(feature = "test-fakes")]
+    rematerialize_after_set_profile_hook: Mutex<Option<SidTestHook>>,
     /// 只供測試（test-fakes）：下一次建立 attach worker 執行緒時模擬 `Builder::spawn()` 失敗（執行緒資源耗盡）。
     #[cfg(feature = "test-fakes")]
     fail_next_attach_spawn: AtomicBool,
@@ -1089,21 +1097,17 @@ impl Shared {
     }
 
     /// S2-PAR-wp510r R3（設計 §3.1.4 W2、C7）：出生即接管的帳本登記。PROBE 用過的 handle 存為新 session 擁有的紀錄
-    /// （`Held{Session{sid, inc}}`，parts 在帳本）；handle 自帳本認領而來（`Preopened::custody`）者沿用同一 token，否則
+    /// （`Held{Session{actor}}`，parts 在帳本）；handle 自帳本認領而來（`Preopened::custody`）者沿用同一 token，否則
     /// 登記新 token（C1 閘門）。回傳 token；by_id 已有其他紀錄或關閉未確認時交還 handle 由呼叫端關閉。與移出在途作業、
     /// 建立 session 在同一臨界區（Python `_attach_by_id_dynamic` 改寫作業 `session_id` 後仍留在 `_active_attach_ops`，
     /// `origin/main:sw_core/session_manager.py:5644-5647`）。
     fn place_session_custody_locked(
         inner: &mut Inner,
         by_id: &str,
-        sid: &str,
-        inc: u64,
+        actor: crate::custody::ActorId,
         pre: Preopened,
     ) -> Result<u64, Preopened> {
-        let owner = crate::custody::CustodyOwner::Session {
-            sid: sid.to_string(),
-            inc,
-        };
+        let owner = crate::custody::CustodyOwner::Session { actor };
         if let Some(token) = pre.custody {
             if let Some(rec) = inner.custody.custody.get_mut(by_id).filter(|rec| rec.token == token) {
                 // `Taken`：handle 自帳本認領而來（佔位開埠成功、parked 續行）；`Opening`：同一作業登記的紀錄尚無 handle
@@ -1126,10 +1130,7 @@ impl Shared {
             by_id,
             &pre.real_path,
             owner,
-            crate::custody::CustodyTaker::OpenJob {
-                sid: sid.to_string(),
-                gen: 1,
-            },
+            crate::custody::CustodyTaker::OpenJob { actor },
         ) {
             Ok(token) => {
                 if let Some(rec) = inner.custody.custody.get_mut(by_id) {
@@ -1520,8 +1521,9 @@ impl Shared {
             Failed,
             Other,
         }
+        let actor_id = inner.actor_id(sid);
         let Some((token, real_path, kind)) = inner.custody.custody.get(by_id).map(|rec| {
-            let own = matches!(&rec.owner, crate::custody::CustodyOwner::Session { sid: owner, .. } if owner == sid);
+            let own = actor_id.is_some_and(|actor| rec.owner == crate::custody::CustodyOwner::Session { actor });
             let kind = match &rec.phase {
                 _ if own => Kind::Other,
                 crate::custody::CustodyPhase::Held { .. } if rec.owner == crate::custody::CustodyOwner::Parked => {
@@ -1623,7 +1625,11 @@ impl Shared {
             let owner = rec.owner.clone();
             let token = rec.token;
             let io = match owner {
-                crate::custody::CustodyOwner::Session { sid, .. } => inner.sessions.get(&sid).map(|e| e.io.clone()),
+                crate::custody::CustodyOwner::Session { actor } => inner
+                    .sessions
+                    .values()
+                    .find(|entry| entry.actor_id == actor)
+                    .map(|entry| entry.io.clone()),
                 _ => None,
             };
             let (outcome, parts) =
@@ -1911,13 +1917,13 @@ impl Shared {
             core.set_last_error_observer(Box::new(move |v: &str| lock(&sink).push(v.to_string())));
             history
         };
-        let inc = inner.custody.alloc_session_inc(&sid);
+        let actor_id = crate::custody::ActorId::allocate();
         // S2-PAR-wp510r R3 出生即接管（設計 §3.1.4 W2、C7）：PROBE 用過的 handle 存為新 session 擁有的帳本紀錄，新 actor
         // 出生即帶 `external_attach{token}`、ATTACHING，並以啟動效果 `ClaimCustody` 開埠（不送 `DeviceAttached`）。
         let mut displaced = None;
         if let Some(pre) = preopened {
             let real_path = pre.real_path.clone();
-            match Self::place_session_custody_locked(inner, &profile.device_by_id, &sid, inc, pre) {
+            match Self::place_session_custody_locked(inner, &profile.device_by_id, actor_id, pre) {
                 Ok(token) => core.init_external_attach(token, &real_path),
                 Err(pre) => displaced = Some(pre),
             }
@@ -1978,20 +1984,20 @@ impl Shared {
             persist_jobs: JobQueue::new("persist"),
             opened_rx: Arc::new(Mutex::new(HashMap::new())),
             opened_listener: Arc::new(Mutex::new(HashSet::new())),
-            inc,
+            actor_id,
         };
         let actor = match try_spawn_actor_with_reaper(
             core,
             mailbox,
             Box::new(exec),
             self.clock.clone(),
-            inc,
+            actor_id,
             Some(self.reaper_cmd_tx.clone()),
         ) {
             Ok(actor) => actor,
             Err(e) => {
                 self.warn(format!("actor 建立失敗（sid={sid}）：{e}"));
-                let jobs = inner.custody.handle_spawn_failure(&sid, inc);
+                let jobs = inner.custody.handle_spawn_failure(actor_id);
                 for job in jobs {
                     let term = job.execute_and_settle(&mut inner.custody, None);
                     if let Ok(Some(t)) = term {
@@ -2019,6 +2025,7 @@ impl Shared {
             sid.clone(),
             Entry {
                 sid: sid.clone(),
+                actor_id,
                 profile,
                 profile_source: profile_source.to_string(),
                 binding_generation: 0,
@@ -2346,10 +2353,7 @@ impl Shared {
             }
             if let Some(op) = parked_op {
                 let taker = match inner.session_by_id(by_id) {
-                    Some(e) => crate::custody::CustodyTaker::OpenJob {
-                        sid: e.sid.clone(),
-                        gen: 1,
-                    },
+                    Some(e) => crate::custody::CustodyTaker::OpenJob { actor: e.actor_id },
                     None => crate::custody::CustodyTaker::Worker("spawn_attach".into()),
                 };
                 preopened = Self::claim_parked_locked(&mut inner, by_id, &op, taker);
@@ -2610,20 +2614,17 @@ impl Shared {
             if self.begin_external_attach(sid, by_id, token, &real_path) {
                 let offered = {
                     let mut inner = lock(&self.inner);
-                    let inc = inner.custody.current_session_inc(sid);
+                    let actor_id = inner.actor_id(sid);
                     let actor = inner.sessions.get(sid).map(|e| e.actor.control.clone());
                     let cancelled = op.cancelled.load(Ordering::SeqCst);
-                    match (inner.custody.custody.get_mut(by_id), actor) {
-                        (Some(rec), Some(actor))
+                    match (inner.custody.custody.get_mut(by_id), actor_id, actor) {
+                        (Some(rec), Some(actor_id), Some(actor))
                             if rec.token == token
                                 && rec.cancel.is_none()
                                 && !cancelled
                                 && matches!(rec.phase, crate::custody::CustodyPhase::Held { parts: Some(_) }) =>
                         {
-                            rec.owner = crate::custody::CustodyOwner::Session {
-                                sid: sid.to_string(),
-                                inc,
-                            };
+                            rec.owner = crate::custody::CustodyOwner::Session { actor: actor_id };
                             Some(actor.try_send(ControlEvent::CustodyOffer { token }))
                         }
                         _ => None,
@@ -2811,12 +2812,16 @@ impl Shared {
                     // 該 session 結束外部 attach（停止在等它的終態時亦一併收斂；設計 C2 持有者須回報終態）。
                     match (&rec.owner, &rec.phase) {
                         (
-                            crate::custody::CustodyOwner::Session { sid, .. },
+                            crate::custody::CustodyOwner::Session { actor },
                             crate::custody::CustodyPhase::Opening {
                                 taker: crate::custody::CustodyTaker::Worker(_),
                             },
                         ) if op.custody_token() == Some(rec.token) => {
-                            external_abort = Some((sid.clone(), rec.token));
+                            external_abort = inner
+                                .sessions
+                                .values()
+                                .find(|entry| entry.actor_id == *actor)
+                                .map(|entry| (entry.sid.clone(), rec.token));
                             let token = rec.token;
                             inner.custody.settle_close(
                                 token,
@@ -3009,8 +3014,10 @@ impl Shared {
                     .session_from_template_locked(&mut inner, &tpl, by_id, source, None, preopened);
                 if let Some(sid) = sid {
                     inner.probe_paths.insert(sid.clone(), real.clone());
-                    let born = inner.custody.get_custody(by_id).is_some_and(|rec| {
-                        matches!(&rec.owner, crate::custody::CustodyOwner::Session { sid: owner, .. } if *owner == sid)
+                    let born = inner.sessions.get(&sid).is_some_and(|entry| {
+                        inner.custody.get_custody(by_id).is_some_and(|rec| {
+                            rec.owner == crate::custody::CustodyOwner::Session { actor: entry.actor_id }
+                        })
                     });
                     inner.sessions.get(&sid).map(|e| (e.actor.clone(), born))
                 } else {
@@ -3297,26 +3304,25 @@ impl Shared {
         // `:4185-4191`）；有 tombstone（停止者先到）就中止。
         let registered = {
             let mut inner = lock(&self.inner);
-            let inc = inner.custody.current_session_inc(sid);
+            let actor = inner.actor_id(sid);
             if op.cancelled.load(Ordering::SeqCst) {
                 Err(crate::custody::CustodyRegisterError::Tombstoned)
-            } else {
+            } else if let Some(actor) = actor {
                 inner
                     .custody
                     .register_with_token(
                         by_id,
                         token,
                         &real,
-                        crate::custody::CustodyOwner::Session {
-                            sid: sid.to_string(),
-                            inc,
-                        },
+                        crate::custody::CustodyOwner::Session { actor },
                         crate::custody::CustodyTaker::Worker(format!("attach-{}", op.token)),
                     )
-                    .map(|()| inc)
+                    .map(|()| actor)
+            } else {
+                Err(crate::custody::CustodyRegisterError::Tombstoned)
             }
         };
-        let Ok(inc) = registered else {
+        let Ok(actor_id) = registered else {
             self.abort_external_attach(sid, by_id, token, None);
             return;
         };
@@ -3358,25 +3364,26 @@ impl Shared {
                 }
             }
         }
-        // 第 3 步：鎖內存回 `Held{Session}`（rematerialize 改名時同步更新 owner），`try_send CustodyOffer`；送不出去（Full）
+        // 第 3 步：鎖內存回 `Held{Session}`，以不變的 ActorId 寫入 owner，再 `try_send CustodyOffer`；送不出去（Full）
         // 由 actor 的 `CustodyPoll` 補收，actor 已結束（Disconnected）就由此關閉並結算（設計 §3.1.5）。Python 再偵測不寫
         // sticky（`_maybe_persist_sticky` 只在動態 attach；審查 F65）。
         let offered = {
             let mut inner = lock(&self.inner);
-            let actor = inner.sessions.get(&sid_now).map(|e| e.actor.control.clone());
+            let actor = inner
+                .sessions
+                .get(&sid_now)
+                .map(|entry| (entry.actor_id, entry.actor.control.clone()));
             let cancelled = op.cancelled.load(Ordering::SeqCst);
             match (inner.custody.custody.get_mut(by_id), actor) {
-                (Some(rec), Some(actor))
-                    if rec.token == token
+                (Some(rec), Some((target_actor, actor)))
+                    if target_actor == actor_id
+                        && rec.token == token
                         && rec.cancel.is_none()
                         && !cancelled
                         && matches!(rec.phase, crate::custody::CustodyPhase::Opening { .. }) =>
                 {
                     rec.phase = crate::custody::CustodyPhase::Held { parts: Some(parts) };
-                    rec.owner = crate::custody::CustodyOwner::Session {
-                        sid: sid_now.clone(),
-                        inc,
-                    };
+                    rec.owner = crate::custody::CustodyOwner::Session { actor: actor_id };
                     Ok(actor.try_send(ControlEvent::CustodyOffer { token }))
                 }
                 _ => Err(parts),
@@ -3487,9 +3494,10 @@ impl Shared {
                 .get(by_id)
                 .is_some_and(|op| op.token == token && op.parked.load(Ordering::SeqCst));
             let actor = inner.sessions.get(sid).map(|e| e.actor.control.clone());
-            let inc = inner.custody.current_session_inc(sid);
+            let actor_id = inner.actor_id(sid);
             let claimable = parked_op
                 && actor.is_some()
+                && actor_id.is_some()
                 && inner.custody.get_custody(by_id).is_some_and(|rec| {
                     rec.token == token
                         && rec.owner == crate::custody::CustodyOwner::Parked
@@ -3509,8 +3517,7 @@ impl Shared {
                         if let Some(rec) = inner.custody.custody.get_mut(by_id) {
                             rec.phase = crate::custody::CustodyPhase::Held { parts };
                             rec.owner = crate::custody::CustodyOwner::Session {
-                                sid: sid.to_string(),
-                                inc,
+                                actor: actor_id.expect("claimable 已確認 actor id"),
                             };
                         }
                         let actor = actor.expect("claimable 已確認 actor");
@@ -3591,6 +3598,19 @@ impl Shared {
         if !r.as_ref().is_ok_and(is_ok) {
             return None;
         }
+        #[cfg(feature = "test-fakes")]
+        {
+            let hook = {
+                let mut slot = lock(&self.rematerialize_after_set_profile_hook);
+                match slot.as_ref() {
+                    Some((target, _)) if target == sid => slot.take().map(|(_, hook)| hook),
+                    _ => None,
+                }
+            };
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         // state.json 先落盤（alias 列搬移、binding key 搬移），再於鏡像改名：外部觀察到新 sid 時檔案已一致。
         let now = self.now_iso();
         let old_sid = sid.to_string();
@@ -3624,11 +3644,12 @@ impl Shared {
         }
         let rekeyed = {
             let mut inner = lock(&self.inner);
-            let inc = inner.custody.current_session_inc(sid);
-            let rekeyed = new_sid == sid || inner.custody.rematerialize_session(sid, &new_sid, inc);
+            let actor_id = inner.actor_id(sid);
+            let mut rekeyed = new_sid == sid;
             let entries = std::mem::take(&mut inner.sessions);
             for (k, mut e) in entries {
                 if k == sid {
+                    rekeyed = true;
                     e.sid = new_sid.clone();
                     if e.profile.device_by_id != profile.device_by_id {
                         e.binding_generation = e.binding_generation.saturating_add(1);
@@ -3641,6 +3662,9 @@ impl Shared {
                 } else {
                     inner.sessions.insert(k, e);
                 }
+            }
+            if let Some(actor_id) = actor_id {
+                inner.deliverer.rematerialize_obligation(sid, &new_sid, actor_id);
             }
             if let Some(p) = inner.probe_paths.remove(sid) {
                 inner.probe_paths.insert(new_sid.clone(), p);
@@ -3938,8 +3962,8 @@ struct ManagerExec {
     opened_rx: Arc<Mutex<HashMap<u64, Arc<RxShared>>>>,
     /// 開埠工作者已綁定 TCP console listener、尚待 `AdoptBridge` 接手的 epoch（P6：listener 與開埠同一工作）。
     opened_listener: Arc<Mutex<HashSet<u64>>>,
-    /// S2-PAR-wp510r R2: actor 世代號
-    inc: u64,
+    /// actor 的不可變身分。
+    actor_id: crate::custody::ActorId,
 }
 
 /// actor 外的單執行緒 FIFO 工作者（有界佇列；延遲建立，executor 卸除即結束）。
@@ -3987,8 +4011,8 @@ struct OpenCtx {
     hub: Option<Arc<crate::human_console::hub::HubHandle>>,
     /// 開埠工作者綁定 TCP console listener 的 epoch（與 executor 共用；`AdoptBridge` 接手為 `listener_epoch`）。
     opened_listener: Arc<Mutex<HashSet<u64>>>,
-    /// actor 世代號（佔位 Raw 開埠登記帳本紀錄的 owner，C7）。
-    inc: u64,
+    /// actor 的不可變身分（開埠登記、認領與停止均以此比對）。
+    actor_id: crate::custody::ActorId,
 }
 
 impl OpenCtx {
@@ -4055,7 +4079,6 @@ impl OpenCtx {
 
     /// 一般 `OpenBridge` 也走共用 by-id 保管閘門：新開埠先登記 `Opening`；同路徑的 parked handle 以原 token 接手。
     fn register_plain_open(&self, dev: &DevicePath) -> Result<(u64, Option<Preopened>), OpenFailure> {
-        let sid = lock(&self.io.sid).clone();
         let by_id = lock(&self.io.profile).device_by_id.clone();
         let mut inner = lock(&self.shared.inner);
         if inner.stopping {
@@ -4083,10 +4106,7 @@ impl OpenCtx {
             {
                 return Err(OpenFailure::CloseBlocked);
             }
-            let taker = crate::custody::CustodyTaker::OpenJob {
-                sid: sid.clone(),
-                gen: self.inc,
-            };
+            let taker = crate::custody::CustodyTaker::OpenJob { actor: self.actor_id };
             let (claimed_token, parts) = inner
                 .custody
                 .claim_parked(&by_id, &dev.0, taker)
@@ -4107,14 +4127,8 @@ impl OpenCtx {
             .register(
                 &by_id,
                 &dev.0,
-                crate::custody::CustodyOwner::Session {
-                    sid: sid.clone(),
-                    inc: self.inc,
-                },
-                crate::custody::CustodyTaker::OpenJob {
-                    sid,
-                    gen: self.inc,
-                },
+                crate::custody::CustodyOwner::Session { actor: self.actor_id },
+                crate::custody::CustodyTaker::OpenJob { actor: self.actor_id },
             )
             .map_err(|_| OpenFailure::CloseBlocked)?;
         Ok((token, None))
@@ -4147,7 +4161,7 @@ impl OpenCtx {
     }
 
     /// 成功開埠後把 `Opening` 轉為 `Taken`；取消先到時呼叫者關閉 handle 並配對結算。
-    fn mark_open_job_taken(&self, by_id: &str, sid: &str, real_path: &str, token: u64) -> bool {
+    fn mark_open_job_taken(&self, by_id: &str, real_path: &str, token: u64) -> bool {
         let mut inner = lock(&self.shared.inner);
         let stopping = inner.stopping;
         let path_matches = inner.device_path(by_id) == Some(real_path);
@@ -4164,8 +4178,7 @@ impl OpenCtx {
             crate::custody::CustodyPhase::Opening { .. } => {
                 rec.phase = crate::custody::CustodyPhase::Taken {
                     taker: crate::custody::CustodyTaker::OpenJob {
-                        sid: sid.to_string(),
-                        gen: self.inc,
+                        actor: self.actor_id,
                     },
                 };
                 true
@@ -4214,7 +4227,6 @@ impl OpenCtx {
         if let Some(hook) = lock(&self.shared.open_bridge_pre_take_hook).take() {
             hook();
         }
-        let sid = lock(&self.io.sid).clone();
         let by_id = lock(&self.io.profile).device_by_id.clone();
         let mut mismatched = None;
         let pre = {
@@ -4222,14 +4234,14 @@ impl OpenCtx {
             match inner.custody.custody.get_mut(&by_id).filter(|rec| {
                 rec.token == token
                     && rec.cancel.is_none()
-                    && matches!(&rec.owner, crate::custody::CustodyOwner::Session { sid: owner, .. } if *owner == sid)
+                    && rec.owner == crate::custody::CustodyOwner::Session { actor: self.actor_id }
             }) {
                 Some(rec) => match &mut rec.phase {
                     crate::custody::CustodyPhase::Held { parts } if parts.is_some() => {
                         let parts = parts.take().expect("剛確認的 parts");
                         if rec.real_path == dev.0 {
                             rec.phase = crate::custody::CustodyPhase::Taken {
-                                taker: crate::custody::CustodyTaker::OpenJob { sid: sid.clone(), gen: 1 },
+                                taker: crate::custody::CustodyTaker::OpenJob { actor: self.actor_id },
                             };
                             Some(Preopened::claimed(rec.real_path.clone(), parts, token))
                         } else {
@@ -4306,7 +4318,6 @@ impl OpenCtx {
         precheck_holders: bool,
         control: &Sender<ControlEvent>,
     ) -> (Result<(), OpenFailure>, Option<crate::custody::CustodyCancel>) {
-        let sid = lock(&self.io.sid).clone();
         let by_id = lock(&self.io.profile).device_by_id.clone();
         let no_handle = |failure: OpenFailure| {
             let cancel = {
@@ -4348,11 +4359,8 @@ impl OpenCtx {
                 &by_id,
                 token,
                 &dev.0,
-                crate::custody::CustodyOwner::Session {
-                    sid: sid.clone(),
-                    inc: self.inc,
-                },
-                crate::custody::CustodyTaker::PlaceholderOpen { sid: sid.clone(), gen: token },
+                crate::custody::CustodyOwner::Session { actor: self.actor_id },
+                crate::custody::CustodyTaker::PlaceholderOpen { actor: self.actor_id },
             ) {
                 Ok(()) => {
                     // 與裝置路徑核對同一鎖區段起監看本次開埠的原路徑：之後的改指／離線在預先準備的交接紀錄留下不可撤銷
@@ -4524,8 +4532,7 @@ impl OpenCtx {
             }
         };
         if let Some(token) = handle_custody {
-            let sid = lock(&self.io.sid).clone();
-            if !self.mark_open_job_taken(&by_id, &sid, &dev.0, token) {
+            if !self.mark_open_job_taken(&by_id, &dev.0, token) {
                 let receipt = HandleParts::split(handle).close();
                 let closed = receipt.closed;
                 self.shared
@@ -4833,7 +4840,7 @@ impl ManagerExec {
             com: self.com(),
             hub: self.hub.clone(),
             opened_listener: self.opened_listener.clone(),
-            inc: self.inc,
+            actor_id: self.actor_id,
         };
         let control = tx.clone();
         let opened_rx = self.opened_rx.clone();
@@ -4878,6 +4885,7 @@ impl ManagerExec {
                     // 回收者已停止時退回就地收尾（審查 P8-6a679fb-4）。
                     crate::custody::send_reclaim_or_finish(
                         &ctx.shared.reaper_cmd_tx,
+                        ctx.actor_id,
                         token,
                         opened.epoch,
                         crate::custody::ReclaimWorker::Real(worker),
@@ -4917,7 +4925,7 @@ impl ManagerExec {
             com: self.com(),
             hub: self.hub.clone(),
             opened_listener: self.opened_listener.clone(),
-            inc: self.inc,
+            actor_id: self.actor_id,
         };
         let control = tx.clone();
         let submitted = self.open_jobs.submit(Box::new(move || {
@@ -5174,9 +5182,15 @@ impl ManagerExec {
     /// 以 C1′ 同 token 認領給本 session 的開埠工作（`Taken{OpenJob}`，handle 放入 `io.preopened`，自在途表移出 parked
     /// 作業）；worker 存入的紀錄（`Held{Worker}`）改 owner。紀錄已不可認領時不動（開埠工作回 `CloseBlocked`）。
     fn claim_offered(&mut self, token: u64) {
-        let sid = lock(&self.io.sid).clone();
         let by_id = lock(&self.io.profile).device_by_id.clone();
         let mut inner = lock(&self.shared.inner);
+        if !inner
+            .sessions
+            .values()
+            .any(|entry| entry.actor_id == self.actor_id && Arc::ptr_eq(&entry.io, &self.io))
+        {
+            return;
+        }
         let Some(rec) = inner.custody.get_custody(&by_id).filter(|rec| rec.token == token) else {
             return;
         };
@@ -5194,7 +5208,7 @@ impl ManagerExec {
                     return;
                 }
                 inner.inflight.remove(&by_id);
-                let taker = crate::custody::CustodyTaker::OpenJob { sid: sid.clone(), gen: 1 };
+                let taker = crate::custody::CustodyTaker::OpenJob { actor: self.actor_id };
                 if let Ok((token, Some(parts))) = inner.custody.claim_parked(&by_id, &rec_path, taker) {
                     *lock(&self.io.preopened) = Some(Preopened::claimed(rec_path, parts, token));
                 }
@@ -5203,9 +5217,10 @@ impl ManagerExec {
             }
             crate::custody::CustodyOwner::Worker(_) if held => {
                 if let Some(rec) = inner.custody.custody.get_mut(&by_id) {
-                    rec.owner = crate::custody::CustodyOwner::Session { sid, inc: self.inc };
+                    rec.owner = crate::custody::CustodyOwner::Session { actor: self.actor_id };
                 }
             }
+            crate::custody::CustodyOwner::Session { actor } if actor == self.actor_id => {}
             _ => {}
         }
     }
@@ -5268,14 +5283,13 @@ impl EffectExecutor for ManagerExec {
                 // 設計 C4 的補收（`TimerEvent::CustodyPoll`）：W6 的 offer 或終態通知送不出去時，由 actor 自己查帳本。紀錄已是
                 // 本 session 的 `Held`（未取消）→ 補送 `CustodyOffer`；紀錄已轉 CloseFailed，或已移除且有終態／tombstone →
                 // 補送 `CustodyTerminal`。資源收尾類效果：只查詢，不改帳本。
-                let sid = lock(&self.io.sid).clone();
                 let inner = lock(&self.shared.inner);
                 for token in tokens {
                     match inner.custody.get_custody_by_token(token) {
                         Some(rec) => match &rec.phase {
                             crate::custody::CustodyPhase::Held { parts: Some(_) }
                                 if rec.cancel.is_none()
-                                    && matches!(&rec.owner, crate::custody::CustodyOwner::Session { sid: owner, .. } if *owner == sid) =>
+                                    && rec.owner == crate::custody::CustodyOwner::Session { actor: self.actor_id } =>
                             {
                                 feedback.push_back(ControlEvent::CustodyOffer { token });
                             }
@@ -5375,8 +5389,13 @@ impl EffectExecutor for ManagerExec {
                 };
                 match claimed {
                     Some((token, real)) => {
-                        let guard =
-                            crate::custody::Reclaim::new(token, epoch, real, self.shared.reaper_cmd_tx.clone());
+                        let guard = crate::custody::Reclaim::new(
+                            self.actor_id,
+                            token,
+                            epoch,
+                            real,
+                            self.shared.reaper_cmd_tx.clone(),
+                        );
                         #[cfg(feature = "test-fakes")]
                         self.run_adopt_after_claim_hook();
                         lock(&self.workers).insert(epoch, guard.defuse());
@@ -5397,13 +5416,12 @@ impl EffectExecutor for ManagerExec {
                 if let Some(pump) = self.pumps.remove(&epoch) {
                     pump.stop();
                 }
-                let sid = lock(&self.io.sid).clone();
                 let worker = lock(&self.workers).remove(&epoch);
                 if let Some(worker) = worker {
                     worker.finish_async(stop_id, safety.clone());
                 }
                 let mut inner = lock(&self.shared.inner);
-                let jobs = inner.custody.claim_for_stop(&sid, self.inc, crate::custody::CustodyCancel::Release);
+                let jobs = inner.custody.claim_for_stop(self.actor_id, crate::custody::CustodyCancel::Release);
                 for job in jobs {
                     let _ = job.execute_and_settle(&mut inner.custody, Some(safety));
                 }
@@ -5567,11 +5585,11 @@ impl EffectExecutor for ManagerExec {
 impl crate::custody::ReaperCallback for Shared {
     fn handle_cmd(&self, cmd: crate::custody::ReaperCmd, event_tx: &crossbeam_channel::Sender<ControlEvent>) {
         match cmd {
-            crate::custody::ReaperCmd::ActorExited { sid, inc } => {
+            crate::custody::ReaperCmd::ActorExited { actor } => {
                 let jobs = {
                     let mut inner = lock(&self.inner);
-                    inner.deliverer.cancel_obligation(&sid, None);
-                    inner.custody.handle_actor_exited(&sid, inc)
+                    inner.deliverer.cancel_obligations_for_actor(actor);
+                    inner.custody.handle_actor_exited(actor)
                 };
                 for job in jobs {
                     match job {
@@ -5611,9 +5629,11 @@ impl crate::custody::ReaperCallback for Shared {
                     }
                 }
             }
-            crate::custody::ReaperCmd::Reclaim { token, epoch, worker } => {
+            crate::custody::ReaperCmd::Reclaim { actor, token, epoch, worker } => {
                 let mut inner = lock(&self.inner);
-                let _ = inner.custody.mark_bridge_draining(token, epoch, crate::drain::StopId(0));
+                let _ = inner
+                    .custody
+                    .mark_bridge_draining(actor, token, epoch, crate::drain::StopId(0));
                 drop(inner);
                 worker.finish_async(crate::drain::StopId(0), event_tx.clone());
             }
@@ -5668,9 +5688,10 @@ impl crate::custody::DelivererCallback for Shared {
         for sid in sids {
             if let Some(entry) = inner.sessions.get(&sid) {
                 let control = entry.actor.control.clone();
+                let actor_id = entry.actor_id;
                 inner
                     .deliverer
-                    .step_delivery_with_snapshot(&sid, &control, snap);
+                    .step_delivery_with_snapshot(&sid, actor_id, &control, snap);
             } else {
                 inner.deliverer.obligations.remove(&sid);
             }
@@ -5798,6 +5819,8 @@ impl SessionManager {
             custody_close_pre_notify_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             external_attach_pre_register_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            rematerialize_after_set_profile_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             fail_next_attach_spawn: AtomicBool::new(false),
             #[cfg(feature = "test-fakes")]
@@ -6455,8 +6478,9 @@ impl SessionManager {
                 );
                 if applied.is_err() {
                     let mut inner = lock(&self.shared.inner);
-                    let inc = inner.custody.current_session_inc(&sid);
-                    inner.deliverer.add_obligation(&sid, &by_id, &real_path, 1, inc);
+                    if let Some(actor_id) = inner.actor_id(&sid) {
+                        inner.deliverer.add_obligation(&sid, &by_id, &real_path, 1, actor_id);
+                    }
                 } else {
                     let mut inner = lock(&self.shared.inner);
                     inner.deliverer.cancel_obligation(&sid, None);
@@ -7118,17 +7142,14 @@ impl SessionManager {
     #[cfg(feature = "test-fakes")]
     pub fn custody_register_held_session_for_test(&self, sid: &str, by_id: &str, real_path: &str) -> u64 {
         let mut inner = lock(&self.shared.inner);
-        let inc = inner.custody.current_session_inc(sid);
+        let actor = inner.actor_id(sid).unwrap_or_else(crate::custody::ActorId::allocate);
         let token = inner
             .custody
             .register(
                 by_id,
                 real_path,
-                crate::custody::CustodyOwner::Session { sid: sid.to_string(), inc },
-                crate::custody::CustodyTaker::OpenJob {
-                    sid: sid.to_string(),
-                    gen: 1,
-                },
+                crate::custody::CustodyOwner::Session { actor },
+                crate::custody::CustodyTaker::OpenJob { actor },
             )
             .expect("register ok");
         inner.custody.save_held_mock(token).expect("save_held_mock ok");
@@ -7145,36 +7166,50 @@ impl SessionManager {
     #[cfg(feature = "test-fakes")]
     pub fn custody_register_bridged_worker_for_test(
         &self,
-        sid: &str,
+        _sid: &str,
         by_id: &str,
         real_path: &str,
         epoch: u64,
         worker: crate::uart_bridge::IoWorker,
     ) -> u64 {
         let mut inner = lock(&self.shared.inner);
-        let inc = inner.custody.alloc_session_inc(sid);
+        let actor = crate::custody::ActorId::allocate();
         let token = inner
             .custody
             .register(
                 by_id,
                 real_path,
-                crate::custody::CustodyOwner::Session { sid: sid.to_string(), inc },
-                crate::custody::CustodyTaker::OpenJob {
-                    sid: sid.to_string(),
-                    gen: 1,
-                },
+                crate::custody::CustodyOwner::Session { actor },
+                crate::custody::CustodyTaker::OpenJob { actor },
             )
             .expect("register ok");
         inner.custody.adopt_bridged(token, epoch, worker).expect("adopt_bridged ok");
         token
     }
 
-    /// 只供測試（test-fakes）：模擬 W6 rematerialize 的帳本身分與 owner 重鍵。
+    /// 只供測試（test-fakes）：取得 manager 登錄之 session 的穩定 ActorId。
     #[cfg(feature = "test-fakes")]
-    pub fn custody_rematerialize_for_test(&self, old_sid: &str, new_sid: &str) -> bool {
-        let mut inner = lock(&self.shared.inner);
-        let inc = inner.custody.current_session_inc(old_sid);
-        inner.custody.rematerialize_session(old_sid, new_sid, inc)
+    pub fn actor_id_for_test(&self, sid: &str) -> Option<crate::custody::ActorId> {
+        lock(&self.shared.inner).actor_id(sid)
+    }
+
+    /// 只供測試（test-fakes）：由帳本 owner 查詢 ActorId。
+    #[cfg(feature = "test-fakes")]
+    pub fn custody_actor_for_test(&self, by_id: &str) -> Option<crate::custody::ActorId> {
+        let inner = lock(&self.shared.inner);
+        match &inner.custody.get_custody(by_id)?.owner {
+            crate::custody::CustodyOwner::Session { actor } => Some(*actor),
+            _ => None,
+        }
+    }
+
+    /// 只供測試（test-fakes）：由穩定 ActorId 查詢目前 manager sid。
+    #[cfg(feature = "test-fakes")]
+    pub fn sid_for_actor_for_test(&self, actor: crate::custody::ActorId) -> Option<String> {
+        lock(&self.shared.inner)
+            .sessions
+            .iter()
+            .find_map(|(sid, entry)| (entry.actor_id == actor).then(|| sid.clone()))
     }
 
     /// 只供測試（test-fakes）：查詢 session 已退休的 epoch 集合。
@@ -7226,6 +7261,12 @@ impl SessionManager {
     #[cfg(feature = "test-fakes")]
     pub fn set_external_attach_pre_register_hook_for_test(&self, by_id: &str, hook: Box<dyn FnOnce() + Send>) {
         *lock(&self.shared.external_attach_pre_register_hook) = Some((by_id.to_string(), hook));
+    }
+
+    /// 只供測試（test-fakes）：rematerialize 的 SetProfile 已完成、manager 改名之前暫停指定 actor。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_rematerialize_after_set_profile_hook_for_test(&self, sid: &str, hook: Box<dyn FnOnce() + Send>) {
+        *lock(&self.shared.rematerialize_after_set_profile_hook) = Some((sid.to_string(), hook));
     }
 
     /// 只供測試（test-fakes）：設定 `by_id` 下一次 attach worker 作業收尾（`finish_worker_op`，原 `finish_attach_op`）

@@ -9182,7 +9182,7 @@ fn wp510r_r3_pre_take_rig() -> (Arc<ServiceRig>, FakeDevice, crossbeam_channel::
     let held = r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).expect("出生即接管的帳本紀錄");
     assert_eq!(held.phase, CustodyPhaseSnapshot::Held, "{held:?}");
     assert!(
-        matches!(&held.owner, sw_core::custody::CustodyOwner::Session { sid, .. } if sid == "t:COM3"),
+        matches!(&held.owner, sw_core::custody::CustodyOwner::Session { actor } if Some(*actor) == r.mgr.actor_id_for_test("t:COM3")),
         "owner 為新建的正式 session：{held:?}"
     );
     (r, dev, go_tx)
@@ -9595,7 +9595,7 @@ fn wp510r_r4_rpc_p8_e25b69c_2_redetect_release_stall_ledger_then_released() {
             CustodyPhaseSnapshot::Opening {
                 taker: sw_core::custody::CustodyTaker::Worker(_)
             }
-        ) && matches!(&blocked.owner, sw_core::custody::CustodyOwner::Session { sid: owner, .. } if *owner == sid),
+        ) && matches!(&blocked.owner, sw_core::custody::CustodyOwner::Session { actor } if Some(*actor) == r.mgr.actor_id_for_test(&sid)),
         "{blocked:?}"
     );
     let closes_before = dev.close_count();

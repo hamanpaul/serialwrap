@@ -4842,6 +4842,7 @@ fn test_b1_placeholder_attach_handoff_and_release_settles_custody() {
 
     let m = wp510_b_placeholder_rig(false, false);
     m.mgr.update_devices(&m.snapshot());
+    let placeholder_actor = m.mgr.actor_id_for_test(PLACEHOLDER_SID).expect("佔位 actor 身分");
 
     // 1. 對 gone-template:COM3 執行佔位 attach
     let res = m.mgr.attach_released_placeholder(PLACEHOLDER_SID, false).expect("attach_released_placeholder ok");
@@ -4859,8 +4860,7 @@ fn test_b1_placeholder_attach_handoff_and_release_settles_custody() {
         assert_ne!(
             c.owner,
             sw_core::custody::CustodyOwner::Session {
-                sid: PLACEHOLDER_SID.to_string(),
-                inc: 0,
+                actor: placeholder_actor,
             },
             "正式 session 接手後帳本 owner 不得仍為舊佔位 session"
         );
@@ -5150,13 +5150,133 @@ fn wp510r_r3_wp5_1_shutdown_pre_take_close_failure_warns() {
 }
 
 /// S2-PAR-wp510r R4：`custody_for_test` 的紀錄是否為 W6 worker 的開埠在途（`Opening{Worker}`，owner＝該 session）。
-fn wp510r_r4_is_w6_opening(rec: &sw_core::custody::CustodySnapshot, sid: &str) -> bool {
+fn wp510r_r4_is_w6_opening(rec: &sw_core::custody::CustodySnapshot, actor: sw_core::custody::ActorId) -> bool {
     matches!(
         &rec.phase,
         CustodyPhaseSnapshot::Opening {
             taker: sw_core::custody::CustodyTaker::Worker(_),
         }
-    ) && matches!(&rec.owner, sw_core::custody::CustodyOwner::Session { sid: owner, .. } if owner == sid)
+    ) && rec.owner == (sw_core::custody::CustodyOwner::Session { actor })
+}
+
+/// S2-PAR-wp510r 第 17 項紅燈：正式 W6 改名後，該 actor 在接手 offer 前退出，必須依穩定身分回收 Held handle。
+#[test]
+fn wp510r_r17_w6_actor_exit_before_offer_adoption_reclaims_renamed_handle() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const BY_ID: &str = "/s/by-id/usb-D";
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    let historical = CoreHarness::new(SHELL_PROFILE);
+    let mut historical_actors = Vec::new();
+    let mut historical_records = Vec::new();
+    for generation in 1..=2 {
+        let path = format!("/dev/wp510r-r17-historical-{generation}");
+        let by_id = format!("by-id-wp510r-r17-historical-{generation}");
+        let device = historical.add_serial_device(&path);
+        let worker = historical.start_worker_at(900 + generation, &path);
+        let token = m.mgr.custody_register_bridged_worker_for_test(
+            "t:COM0",
+            &by_id,
+            &path,
+            900 + generation,
+            worker,
+        );
+        historical_actors.push(m.mgr.custody_actor_for_test(&by_id).expect("歷史 owner ActorId"));
+        historical_records.push((device, token));
+    }
+    let real = fallback_session_then_unplug(&m, BY_ID);
+    let closes_before = m.device(&real).close_count();
+    let old_sid = m.mgr.resolve("COM0").expect("fallback actor");
+
+    let (rematerialize_entered_tx, rematerialize_entered_rx) = crossbeam_channel::bounded(1);
+    let (rematerialize_resume_tx, rematerialize_resume_rx) = crossbeam_channel::bounded(1);
+    m.mgr.set_rematerialize_after_set_profile_hook_for_test(
+        &old_sid,
+        Box::new(move || {
+            let _ = rematerialize_entered_tx.send(());
+            let _ = rematerialize_resume_rx.recv();
+        }),
+    );
+    let _ = m.device(&real).take_tx();
+    m.reply_probe(&real, b"root@t:/# ");
+    m.mgr.update_devices(&m.snapshot());
+    rematerialize_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("正式 W6 已由 actor 接受 SetProfile，停在 manager 改名前");
+
+    // actor 暫停在已受理的查詢；填滿 control lane，確保 W6 的 CustodyOffer 尚未被 actor 接手。
+    let (actor_entered_rx, actor_resume_tx) = m
+        .mgr
+        .pause_next_request_for_test(&old_sid)
+        .expect("fallback actor 存在");
+    let query_mgr = m.mgr.clone();
+    let query_sid = old_sid.clone();
+    let query = std::thread::spawn(move || query_mgr.session_queue_lens(&query_sid));
+    actor_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("actor 已停在查詢 Request");
+    let control = m.mgr.actor_control_for_test(&old_sid).expect("actor control lane");
+    let mut filled = 0;
+    while control
+        .try_send(sw_core::mailbox::ControlEvent::ConsoleCountChanged { count: 0 })
+        .is_ok()
+    {
+        filled += 1;
+    }
+    assert!(filled > 0, "control lane 必須確實被填滿");
+    rematerialize_resume_tx.send(()).expect("放行正式 W6 rematerialize");
+
+    let token = {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(rec) = m.mgr.custody_for_test(BY_ID) {
+                if rec.phase == CustodyPhaseSnapshot::Held {
+                    break rec.token;
+                }
+            }
+            assert!(Instant::now() < deadline, "正式 W6 應將 handle 存回 Held");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let new_sid = m.mgr.resolve("t:COM0").expect("W6 已正式改名到偵測 template");
+    let held = m.mgr.custody_for_test(BY_ID).expect("Held 紀錄");
+    let renamed_actor = m.mgr.actor_id_for_test(&new_sid).expect("改名後仍為同一 actor");
+    assert!(matches!(
+        &held.owner,
+        sw_core::custody::CustodyOwner::Session { actor } if *actor == renamed_actor
+    ));
+    assert!(m.device(&real).is_open(), "actor 接手前 handle 由帳本保管");
+
+    // 延遲送達佔用相同公開 sid 舊世代的退出通知，不得誤關 W6 handle。
+    let reaper = m.mgr.reaper_cmd_sender_for_test();
+    for ((device, old_token), old_actor) in historical_records.iter().zip(historical_actors) {
+        reaper
+            .send(sw_core::custody::ReaperCmd::ActorExited { actor: old_actor })
+            .expect("延遲歷史 actor 退出通知送達");
+        wait_until("歷史 actor 關閉完成", || m.mgr.terminal_for_test(*old_token).is_some());
+        assert_eq!(device.close_count(), 1, "歷史 handle 關閉一次");
+    }
+    assert!(m.device(&real).is_open(), "歷史 ActorId 不得關閉 W6 handle");
+    assert!(m.mgr.terminal_for_test(token).is_none(), "歷史 ActorId 不產生 W6 終態");
+
+    // 讓 actor 的真實 ExitReclaim Drop 發送退出通知，不直接呼叫帳本回收 helper。
+    m.mgr.set_executor_unwind_hook_for_test(
+        &new_sid,
+        Box::new(|| panic!("注入 actor executor unwind")),
+    );
+    actor_resume_tx.send(()).expect("放行 actor 查詢");
+    let _ = query.join();
+    wait_until("W6 改名 actor 自身退出已結算回條", || {
+        m.mgr.terminal_for_test(token).is_some()
+    });
+
+    assert_eq!(m.device(&real).close_count(), closes_before + 1, "自身退出須關閉 W6 handle 一次");
+    assert!(!m.device(&real).is_open(), "自身退出後 handle 已關閉");
+    assert!(m.mgr.custody_for_test(BY_ID).is_none(), "成功回條後移除帳本紀錄");
+    assert_eq!(
+        m.mgr.terminal_for_test(token).map(|terminal| terminal.handle),
+        Some(sw_core::custody::TerminalHandle::Closed),
+        "W6 offer 未接手時，actor 自身退出須取得配對 Closed 回條"
+    );
 }
 
 /// S2-PAR-wp510r R4 紅燈 P8-e25b69c-2（設計 §1.6、§3.1.4 W6）：既有 fallback session 重插後的 #181 再解析卡在開埠超過
@@ -5176,7 +5296,10 @@ fn wp510r_r4_p8_e25b69c_2_redetect_release_stall_ledger_opening_then_released() 
     let tx_before = m.device(&real).tx_len();
     let sid = m.mgr.resolve("COM0").expect("COM0 session");
     let blocked = m.mgr.custody_for_test("/s/by-id/usb-D").expect("W6 開埠在途須登記帳本紀錄");
-    assert!(wp510r_r4_is_w6_opening(&blocked, &sid), "{blocked:?}");
+    assert!(wp510r_r4_is_w6_opening(
+        &blocked,
+        m.mgr.actor_id_for_test(&sid).expect("actor 身分"),
+    ), "{blocked:?}");
     assert_eq!(blocked.cancel, None, "release 前未取消：{blocked:?}");
 
     let started = Instant::now();
@@ -5195,7 +5318,10 @@ fn wp510r_r4_p8_e25b69c_2_redetect_release_stall_ledger_opening_then_released() 
     assert_eq!(reply.get("drain_stalled"), Some(&PyValue::Bool(true)));
     assert_eq!(s_of(&session_field(&reply), "state").as_deref(), Some("RECOVERING"), "{reply:?}");
     let stalled = m.mgr.custody_for_test("/s/by-id/usb-D").expect("阻塞期間紀錄保留");
-    assert!(wp510r_r4_is_w6_opening(&stalled, &sid), "{stalled:?}");
+    assert!(wp510r_r4_is_w6_opening(
+        &stalled,
+        m.mgr.actor_id_for_test(&sid).expect("actor 身分"),
+    ), "{stalled:?}");
     assert_eq!(stalled.token, blocked.token, "同一筆紀錄");
     assert_eq!(stalled.cancel, Some(sw_core::custody::CustodyCancel::Release), "{stalled:?}");
 
@@ -5303,7 +5429,7 @@ fn wp510r_r4_dr1_b_w6_offer_lane_full_custody_poll_claims_same_handle() {
     let held = m.mgr.custody_for_test("/s/by-id/usb-D").expect("紀錄");
     assert_eq!(held.token, token, "同一筆紀錄");
     assert!(
-        matches!(&held.owner, sw_core::custody::CustodyOwner::Session { sid: owner, .. } if *owner == sid),
+        matches!(&held.owner, sw_core::custody::CustodyOwner::Session { actor } if Some(*actor) == m.mgr.actor_id_for_test(&sid)),
         "lane 滿時紀錄保持 Held{{owner:Session}}：{held:?}"
     );
     let open_attempts = m.serial.open_attempts(&real);
@@ -5492,13 +5618,13 @@ fn wp510r_r5_wp1_1_release_during_placeholder_open_cancels_ledger_record() {
     assert!(
         matches!(
             &rec.phase,
-            CustodyPhaseSnapshot::Opening { taker: sw_core::custody::CustodyTaker::PlaceholderOpen { sid: s, .. } }
-                if s == WP510R_R5_SID
+            CustodyPhaseSnapshot::Opening { taker: sw_core::custody::CustodyTaker::PlaceholderOpen { actor } }
+                if Some(*actor) == m.mgr.actor_id_for_test(WP510R_R5_SID)
         ),
         "開埠阻塞時為 Opening{{PlaceholderOpen}}：{rec:?}"
     );
     assert!(
-        matches!(&rec.owner, sw_core::custody::CustodyOwner::Session { sid: s, inc } if s == WP510R_R5_SID && *inc >= 1),
+        matches!(&rec.owner, sw_core::custody::CustodyOwner::Session { actor } if Some(*actor) == m.mgr.actor_id_for_test(WP510R_R5_SID)),
         "owner 為佔位 actor 的世代（C7）：{rec:?}"
     );
     assert_eq!(rec.cancel, None);
@@ -6091,7 +6217,10 @@ fn wp510r_r6_dr5_a_w6_open_returns_after_handoff_commit_closes_only() {
     wait_until("再偵測卡在 open", || m.serial.open_attempts(&real) == 2);
     let sid = m.mgr.resolve("COM0").expect("COM0 session");
     let blocked = m.mgr.custody_for_test("/s/by-id/usb-D").expect("W6 開埠在途須登記帳本紀錄");
-    assert!(wp510r_r4_is_w6_opening(&blocked, &sid), "{blocked:?}");
+    assert!(wp510r_r4_is_w6_opening(
+        &blocked,
+        m.mgr.actor_id_for_test(&sid).expect("actor 身分"),
+    ), "{blocked:?}");
     let token = blocked.token;
     let device = m.device(&real);
     let closes_before = device.close_count();

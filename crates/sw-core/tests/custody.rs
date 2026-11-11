@@ -9,7 +9,7 @@
 //! - ExitReclaim 在正常結束、panic 超限、unwind 三種路徑都觸發，建構失敗時不觸發
 //! - Reclaim 的 Drop 不取鎖
 //! - 送達者的退避、取消、凍結暫停與丟棄、30 s 時限、冪等
-//! - 世代號防止舊命令處理新 actor 的紀錄
+//! - 不可變 ActorId 防止舊退出通知處理新 actor 的紀錄
 //! - wait_for_rx_dispatch 區分斷線與逾時兩種缺口文字
 
 #![cfg(feature = "test-fakes")]
@@ -66,8 +66,8 @@ fn test_c1_c8_transitions_valid_and_invalid() {
     let token1 = ledger.register(
         by_id,
         "/dev/ttyUSB0",
-        CustodyOwner::Session { sid: "COM1".into(), inc: 1 },
-        CustodyTaker::OpenJob { sid: "COM1".into(), gen: 1 },
+        CustodyOwner::Session { actor: ActorId::for_test(1) },
+        CustodyTaker::OpenJob { actor: ActorId::for_test(1) },
     ).expect("首次 register 應成功");
     assert!(token1 > 0);
 
@@ -75,8 +75,8 @@ fn test_c1_c8_transitions_valid_and_invalid() {
     let err = ledger.register(
         by_id,
         "/dev/ttyUSB0",
-        CustodyOwner::Session { sid: "COM2".into(), inc: 1 },
-        CustodyTaker::OpenJob { sid: "COM2".into(), gen: 1 },
+        CustodyOwner::Session { actor: ActorId::for_test(1) },
+        CustodyTaker::OpenJob { actor: ActorId::for_test(1) },
     );
     assert_eq!(err, Err(CustodyRegisterError::CustodyBusy { token: token1 }));
 
@@ -104,7 +104,7 @@ fn test_c1_c8_transitions_valid_and_invalid() {
     let claim_err = ledger.claim_parked(
         by_id_parked,
         "/dev/ttyUSB2",
-        CustodyTaker::OpenJob { sid: "COM3".into(), gen: 1 },
+        CustodyTaker::OpenJob { actor: ActorId::for_test(1) },
     );
     assert!(matches!(claim_err, Err(CustodyClaimParkedError::NotHeld)));
 
@@ -115,7 +115,7 @@ fn test_c1_c8_transitions_valid_and_invalid() {
     let claim_err = ledger.claim_parked(
         by_id_parked,
         "/dev/ttyUSB_WRONG",
-        CustodyTaker::OpenJob { sid: "COM3".into(), gen: 1 },
+        CustodyTaker::OpenJob { actor: ActorId::for_test(1) },
     );
     assert!(matches!(claim_err, Err(CustodyClaimParkedError::PathMismatch)));
 
@@ -123,7 +123,7 @@ fn test_c1_c8_transitions_valid_and_invalid() {
     let claim_ok = ledger.claim_parked(
         by_id_parked,
         "/dev/ttyUSB2",
-        CustodyTaker::OpenJob { sid: "COM3".into(), gen: 1 },
+        CustodyTaker::OpenJob { actor: ActorId::for_test(1) },
     );
     match claim_ok {
         Ok((claimed_token, _parts)) => {
@@ -136,7 +136,7 @@ fn test_c1_c8_transitions_valid_and_invalid() {
     let claim_err2 = ledger.claim_parked(
         by_id_parked,
         "/dev/ttyUSB2",
-        CustodyTaker::OpenJob { sid: "COM3".into(), gen: 2 },
+        CustodyTaker::OpenJob { actor: ActorId::for_test(2) },
     );
     assert!(
         matches!(claim_err2, Err(CustodyClaimParkedError::NotHeld | CustodyClaimParkedError::NotParked)),
@@ -153,8 +153,8 @@ fn test_enqueue_failure_leaves_ledger_unchanged() {
     let token = ledger.register(
         by_id,
         "/dev/ttyUSB0",
-        CustodyOwner::Session { sid: "COM1".into(), inc: 1 },
-        CustodyTaker::OpenJob { sid: "COM1".into(), gen: 1 },
+        CustodyOwner::Session { actor: ActorId::for_test(1) },
+        CustodyTaker::OpenJob { actor: ActorId::for_test(1) },
     ).expect("register 成功");
 
     let (tx, rx) = bounded(1);
@@ -182,17 +182,18 @@ fn test_enqueue_failure_leaves_ledger_unchanged() {
 fn test_reaper_worker_stopped_separate_handle_and_evidence() {
     let unconfirmed = UnconfirmedCloses::new();
     let mut ledger = CustodyLedger::new(unconfirmed.clone());
+    let actor = ActorId::for_test(1);
 
     let by_id = "usb-serial-reaper";
     let token = ledger.register(
         by_id,
         "/dev/ttyUSB0",
-        CustodyOwner::Reaper,
+        CustodyOwner::Session { actor },
         CustodyTaker::Worker("reap".into()),
     ).expect("register 成功");
 
     // 模擬轉入 BridgeDraining
-    ledger.mark_bridge_draining(token, 1, StopId(1)).expect("mark bridge draining");
+    ledger.mark_bridge_draining(actor, token, 1, StopId(1)).expect("mark bridge draining");
 
     // 1. handle_closed: true 但 evidence 有未落盤缺口
     let receipt_incomplete = WorkerStoppedReceipt {
@@ -221,10 +222,10 @@ fn test_reaper_worker_stopped_separate_handle_and_evidence() {
     let token2 = ledger.register(
         by_id,
         "/dev/ttyUSB0",
-        CustodyOwner::Reaper,
+        CustodyOwner::Session { actor },
         CustodyTaker::Worker("reap2".into()),
     ).expect("register 成功");
-    ledger.mark_bridge_draining(token2, 2, StopId(2)).expect("mark bridge draining");
+    ledger.mark_bridge_draining(actor, token2, 2, StopId(2)).expect("mark bridge draining");
 
     let receipt_failed = WorkerStoppedReceipt {
         epoch: 2,
@@ -308,10 +309,10 @@ fn test_exit_reclaim_triggers_on_normal_exit_panic_and_unwind_but_not_spawn_fail
         let h = CoreHarness::new(SHELL_PROFILE);
         let clock: Arc<dyn Clock> = h.clock.clone();
         let core = h.core;
-        let expected_sid = core.session_id().to_string();
+        let expected_actor = ActorId::for_test(101);
         let mb = Mailbox::new(256, 1024);
         let control = mb.control_sender();
-        let handle = try_spawn_actor_with_reaper(core, mb, Box::new(ReplyExec), clock, 1, Some(reaper_tx))
+        let handle = try_spawn_actor_with_reaper(core, mb, Box::new(ReplyExec), clock, expected_actor, Some(reaper_tx))
             .expect("spawn actor 成功");
 
         let (reply, _reply_rx) = bounded(1);
@@ -320,9 +321,8 @@ fn test_exit_reclaim_triggers_on_normal_exit_panic_and_unwind_but_not_spawn_fail
 
         let cmd = reaper_rx.try_recv().expect("reaper 應收到 ActorExited");
         match cmd {
-            ReaperCmd::ActorExited { sid, inc } => {
-                assert_eq!(sid, expected_sid);
-                assert_eq!(inc, 1);
+            ReaperCmd::ActorExited { actor } => {
+                assert_eq!(actor, expected_actor);
             }
             _ => panic!("預期 ActorExited"),
         }
@@ -335,7 +335,7 @@ fn test_exit_reclaim_triggers_on_normal_exit_panic_and_unwind_but_not_spawn_fail
         let h = CoreHarness::new(SHELL_PROFILE);
         let clock: Arc<dyn Clock> = h.clock.clone();
         let core = h.core;
-        let expected_sid = core.session_id().to_string();
+        let expected_actor = ActorId::for_test(102);
         let mb = Mailbox::new(256, 1024);
 
         struct UnwindingExec;
@@ -350,7 +350,7 @@ fn test_exit_reclaim_triggers_on_normal_exit_panic_and_unwind_but_not_spawn_fail
             }
         }
 
-        let handle = try_spawn_actor_with_reaper(core, mb, Box::new(UnwindingExec), clock, 2, Some(reaper_tx))
+        let handle = try_spawn_actor_with_reaper(core, mb, Box::new(UnwindingExec), clock, expected_actor, Some(reaper_tx))
             .expect("spawn actor 成功");
 
         // 發送一個會產生 Effect::Reply 的請求，觸發 executor panic unwind
@@ -365,9 +365,8 @@ fn test_exit_reclaim_triggers_on_normal_exit_panic_and_unwind_but_not_spawn_fail
 
         let cmd = reaper_rx.try_recv().expect("unwind 時 reaper 應收到 ActorExited");
         match cmd {
-            ReaperCmd::ActorExited { sid, inc } => {
-                assert_eq!(sid, expected_sid);
-                assert_eq!(inc, 2);
+            ReaperCmd::ActorExited { actor } => {
+                assert_eq!(actor, expected_actor);
             }
             _ => panic!("預期 ActorExited"),
         }
@@ -381,9 +380,9 @@ fn test_exit_reclaim_triggers_on_normal_exit_panic_and_unwind_but_not_spawn_fail
         h.core.arm_panic_on_next_events(3);
         let clock: Arc<dyn Clock> = h.clock.clone();
         let core = h.core;
-        let expected_sid = core.session_id().to_string();
+        let expected_actor = ActorId::for_test(103);
         let mb = Mailbox::new(256, 1024);
-        let handle = try_spawn_actor_with_reaper(core, mb, Box::new(ReplyExec), clock, 3, Some(reaper_tx))
+        let handle = try_spawn_actor_with_reaper(core, mb, Box::new(ReplyExec), clock, expected_actor, Some(reaper_tx))
             .expect("spawn actor 成功");
 
         // 連續三次請求觸發三次 panic
@@ -411,9 +410,8 @@ fn test_exit_reclaim_triggers_on_normal_exit_panic_and_unwind_but_not_spawn_fail
 
         let cmd = reaper_rx.try_recv().expect("Shutdown 退出後 reaper 應收到恰好一筆 ActorExited");
         match cmd {
-            ReaperCmd::ActorExited { sid, inc } => {
-                assert_eq!(sid, expected_sid);
-                assert_eq!(inc, 3);
+            ReaperCmd::ActorExited { actor } => {
+                assert_eq!(actor, expected_actor);
             }
             _ => panic!("預期 ActorExited"),
         }
@@ -429,7 +427,7 @@ fn test_exit_reclaim_triggers_on_normal_exit_panic_and_unwind_but_not_spawn_fail
         let mb = Mailbox::new(256, 1024);
 
         inject_actor_spawn_fail(1);
-        let res = try_spawn_actor_with_reaper(core, mb, Box::new(ReplyExec), clock, 4, Some(reaper_tx));
+        let res = try_spawn_actor_with_reaper(core, mb, Box::new(ReplyExec), clock, ActorId::for_test(104), Some(reaper_tx));
         assert!(res.is_err(), "注入失敗時應回傳 Err");
         assert!(reaper_rx.try_recv().is_err(), "spawn 失敗時不得送出任何命令");
     }
@@ -444,12 +442,12 @@ fn test_reclaim_drop_does_not_take_lock() {
     // 在持有某個鎖的環境下 drop Reclaim，不應死鎖
     {
         let mock_worker = MockWorker { epoch: 10 };
-        let _reclaim = Reclaim::new(1234, 10, mock_worker, tx);
+        let _reclaim = Reclaim::new(ActorId::for_test(1234), 1234, 10, mock_worker, tx);
     }
     drop(guard);
 
     match rx.try_recv() {
-        Ok(ReaperCmd::Reclaim { token, epoch, worker }) => {
+        Ok(ReaperCmd::Reclaim { token, epoch, worker, .. }) => {
             assert_eq!(token, 1234);
             assert_eq!(epoch, 10);
             assert_eq!(worker.epoch(), 10);
@@ -469,14 +467,14 @@ fn test_deliverer_backoff_cancellation_freeze_and_timeout() {
     let real_path = "/dev/ttyUSB0";
 
     // 1. 添加送達義務 (冪等性：新義務覆蓋舊義務)
-    deliverer.add_obligation(sid, by_id, real_path, 1, 1);
+    deliverer.add_obligation(sid, by_id, real_path, 1, ActorId::for_test(1));
     assert_eq!(deliverer.obligation_count(), 1);
-    deliverer.add_obligation(sid, by_id, real_path, 1, 1);
+    deliverer.add_obligation(sid, by_id, real_path, 1, ActorId::for_test(1));
     assert_eq!(deliverer.obligation_count(), 1);
 
     // 2. 當 actor lane 為滿時，try_send 回 Full，退避遞增
     actor_tx.send(ControlEvent::Tick).unwrap(); // 填滿容量
-    let outcome = deliverer.step_delivery(sid, &actor_tx, Instant::now());
+    let outcome = deliverer.step_delivery(sid, ActorId::for_test(1), &actor_tx, Instant::now());
     assert_eq!(outcome, DeliveryStepResult::Backoff);
     assert_eq!(deliverer.attempts(sid), 1);
 
@@ -488,7 +486,7 @@ fn test_deliverer_backoff_cancellation_freeze_and_timeout() {
     };
     assert_eq!(gate.handoff_freeze_state(), HandoffFreezeState::Pending);
 
-    let outcome_pending = deliverer.step_delivery(sid, &actor_tx, Instant::now() + Duration::from_millis(50));
+    let outcome_pending = deliverer.step_delivery(sid, ActorId::for_test(1), &actor_tx, Instant::now() + Duration::from_millis(50));
     assert_eq!(outcome_pending, DeliveryStepResult::PausedPending);
     assert_eq!(deliverer.attempts(sid), 1, "Pending 期間 attempts 不得增加");
 
@@ -498,7 +496,7 @@ fn test_deliverer_backoff_cancellation_freeze_and_timeout() {
 
     // 5. 釋放 actor lane 容量後，成功投遞
     let _ = actor_rx.try_recv();
-    let outcome_ok = deliverer.step_delivery(sid, &actor_tx, Instant::now() + Duration::from_millis(50));
+    let outcome_ok = deliverer.step_delivery(sid, ActorId::for_test(1), &actor_tx, Instant::now() + Duration::from_millis(50));
     assert_eq!(outcome_ok, DeliveryStepResult::Delivered);
     assert_eq!(deliverer.obligation_count(), 0);
 
@@ -512,14 +510,14 @@ fn test_deliverer_backoff_cancellation_freeze_and_timeout() {
     }
 
     // 6. 取消義務
-    deliverer.add_obligation("COM2", "by-id-2", "/dev/ttyUSB1", 1, 1);
+    deliverer.add_obligation("COM2", "by-id-2", "/dev/ttyUSB1", 1, ActorId::for_test(1));
     assert_eq!(deliverer.obligation_count(), 1);
     deliverer.cancel_obligation("COM2", Some(1));
     assert_eq!(deliverer.obligation_count(), 0);
 
     // 7. 30 秒總時限逾時丟棄
-    deliverer.add_obligation("COM3", "by-id-3", "/dev/ttyUSB2", 1, 1);
-    let outcome_timeout = deliverer.step_delivery("COM3", &actor_tx, Instant::now() + Duration::from_secs(31));
+    deliverer.add_obligation("COM3", "by-id-3", "/dev/ttyUSB2", 1, ActorId::for_test(1));
+    let outcome_timeout = deliverer.step_delivery("COM3", ActorId::for_test(1), &actor_tx, Instant::now() + Duration::from_secs(31));
     assert_eq!(outcome_timeout, DeliveryStepResult::TimedOut);
     assert_eq!(deliverer.obligation_count(), 0);
 }
@@ -536,14 +534,14 @@ fn test_deliverer_pending_duration_excluded_from_30s_timeout() {
     let by_id = "by-id-freeze";
     let real_path = "/dev/ttyUSB0";
 
-    deliverer.add_obligation_at(sid, by_id, real_path, 1, 1, t0);
+    deliverer.add_obligation_at(sid, by_id, real_path, 1, ActorId::for_test(1), t0);
 
     // 讓 actor lane 滿
     actor_tx.send(ControlEvent::Tick).unwrap();
 
     // 在 Open 狀態經歷 29.9 秒重試
     let t_29_9 = t0 + Duration::from_millis(29_900);
-    let outcome = deliverer.step_delivery(sid, &actor_tx, t_29_9);
+    let outcome = deliverer.step_delivery(sid, ActorId::for_test(1), &actor_tx, t_29_9);
     assert_eq!(outcome, DeliveryStepResult::Backoff);
 
     // 進入 Pending 狀態
@@ -556,7 +554,7 @@ fn test_deliverer_pending_duration_excluded_from_30s_timeout() {
     assert_eq!(gate.handoff_freeze_state(), HandoffFreezeState::Pending);
 
     // 審查 P8-057a065-3 重現：最後一次 Pending 呼叫在凍結起點（t_29_9），此後在 Pending 期間不再呼叫 step_delivery
-    let outcome_p = deliverer.step_delivery(sid, &actor_tx, t_29_9);
+    let outcome_p = deliverer.step_delivery(sid, ActorId::for_test(1), &actor_tx, t_29_9);
     assert_eq!(outcome_p, DeliveryStepResult::PausedPending);
 
     // 經過 0.2 秒後解凍，回到 Open 狀態
@@ -570,7 +568,7 @@ fn test_deliverer_pending_duration_excluded_from_30s_timeout() {
 
     // 在解凍後（自 t0 算起已過去 30.1 秒，但 Open 累積時間僅 29.9 秒）
     // 應繼續投遞成功，不得被判定 TimedOut 丟棄！
-    let outcome_final = deliverer.step_delivery(sid, &actor_tx, t_thawed);
+    let outcome_final = deliverer.step_delivery(sid, ActorId::for_test(1), &actor_tx, t_thawed);
     assert_ne!(outcome_final, DeliveryStepResult::TimedOut, "Pending 期間不得計入 30s 總時限");
     assert_eq!(outcome_final, DeliveryStepResult::Delivered);
     assert_eq!(deliverer.obligation_count(), 0);
@@ -588,14 +586,14 @@ fn test_deliverer_unaccounted_open_duration_before_freeze_leads_to_timeout() {
     let by_id = "by-id-freeze-unaccounted";
     let real_path = "/dev/ttyUSB0";
 
-    deliverer.add_obligation_at(sid, by_id, real_path, 1, 1, t0);
+    deliverer.add_obligation_at(sid, by_id, real_path, 1, ActorId::for_test(1), t0);
 
     // 填滿 channel
     actor_tx.send(ControlEvent::Tick).unwrap();
 
     // 1. Open 至 t = 29.8s，投遞因 channel 滿回傳 Backoff
     let t_29_8 = t0 + Duration::from_millis(29_800);
-    let outcome = deliverer.step_delivery(sid, &actor_tx, t_29_8);
+    let outcome = deliverer.step_delivery(sid, ActorId::for_test(1), &actor_tx, t_29_8);
     assert_eq!(outcome, DeliveryStepResult::Backoff);
 
     // 2. t = 30.0s 進入 Pending，呼叫一次 step_delivery
@@ -608,7 +606,7 @@ fn test_deliverer_unaccounted_open_duration_before_freeze_leads_to_timeout() {
     };
     assert_eq!(gate.handoff_freeze_state(), HandoffFreezeState::Pending);
 
-    let outcome_p = deliverer.step_delivery(sid, &actor_tx, t_30_0);
+    let outcome_p = deliverer.step_delivery(sid, ActorId::for_test(1), &actor_tx, t_30_0);
     assert_eq!(outcome_p, DeliveryStepResult::PausedPending);
 
     // 3. t = 30.2s 解凍；清空 channel
@@ -622,7 +620,7 @@ fn test_deliverer_unaccounted_open_duration_before_freeze_leads_to_timeout() {
     // 有效 Open 時間為：(30.3 - 0) - (gate.frozen_total(30.3) - 0) = 30.3 - 0.2 = 30.1 秒
     // 預期 TimedOut 且不送事件，義務移除
     let t_30_3 = t0 + Duration::from_millis(30_300);
-    let outcome_final = deliverer.step_delivery(sid, &actor_tx, t_30_3);
+    let outcome_final = deliverer.step_delivery(sid, ActorId::for_test(1), &actor_tx, t_30_3);
     assert_eq!(outcome_final, DeliveryStepResult::TimedOut, "有效 Open 時間已達 30.1s，應 TimedOut");
     assert_eq!(deliverer.obligation_count(), 0);
     assert!(actor_rx.try_recv().is_err(), "逾時後接收端不得取得任何事件");
@@ -640,14 +638,14 @@ fn test_deliverer_delayed_poll_after_thaw_leads_to_timeout() {
     let by_id = "by-id-freeze-delayed-poll";
     let real_path = "/dev/ttyUSB1";
 
-    deliverer.add_obligation_at(sid, by_id, real_path, 1, 1, t0);
+    deliverer.add_obligation_at(sid, by_id, real_path, 1, ActorId::for_test(1), t0);
 
     // 填滿 channel
     actor_tx.send(ControlEvent::Tick).unwrap();
 
     // 1. Open 至 t = 29.7s，投遞因 channel 滿回傳 Backoff
     let t_29_7 = t0 + Duration::from_millis(29_700);
-    let outcome = deliverer.step_delivery(sid, &actor_tx, t_29_7);
+    let outcome = deliverer.step_delivery(sid, ActorId::for_test(1), &actor_tx, t_29_7);
     assert_eq!(outcome, DeliveryStepResult::Backoff);
 
     // 2. t = 29.9s 進入 Pending（閘門自行記帳凍結區間）
@@ -671,7 +669,7 @@ fn test_deliverer_delayed_poll_after_thaw_leads_to_timeout() {
     // 有效 Open 時間為：(30.4 - 0) - (gate.frozen_total(30.4) - 0) = 30.4 - 0.3 = 30.1 秒
     // 預期 TimedOut 且不送事件，義務移除
     let t_30_4 = t0 + Duration::from_millis(30_400);
-    let outcome_final = deliverer.step_delivery(sid, &actor_tx, t_30_4);
+    let outcome_final = deliverer.step_delivery(sid, ActorId::for_test(1), &actor_tx, t_30_4);
     assert_eq!(outcome_final, DeliveryStepResult::TimedOut, "解凍後延遲輪詢計入有效 Open 時間達 30.1s，應 TimedOut");
     assert_eq!(deliverer.obligation_count(), 0);
     assert!(actor_rx.try_recv().is_err(), "逾時後接收端不得取得任何事件");
@@ -690,12 +688,12 @@ fn test_deliverer_delayed_first_pending_poll_does_not_timeout_prematurely() {
     let real_path = "/dev/ttyUSB2";
 
     // 1. t=0 建立義務，填滿 channel
-    deliverer.add_obligation_at(sid, by_id, real_path, 1, 1, t0);
+    deliverer.add_obligation_at(sid, by_id, real_path, 1, ActorId::for_test(1), t0);
     actor_tx.send(ControlEvent::Tick).unwrap();
 
     // 2. t=29.8s 投遞回 Backoff，隨即凍結為 Pending
     let t_29_8 = t0 + Duration::from_millis(29_800);
-    let outcome = deliverer.step_delivery(sid, &actor_tx, t_29_8);
+    let outcome = deliverer.step_delivery(sid, ActorId::for_test(1), &actor_tx, t_29_8);
     assert_eq!(outcome, DeliveryStepResult::Backoff);
 
     clock.set(t_29_8);
@@ -708,7 +706,7 @@ fn test_deliverer_delayed_first_pending_poll_does_not_timeout_prematurely() {
 
     // 3. 首次 Pending 輪詢延遲至 t=30.0s
     let t_30_0 = t0 + Duration::from_millis(30_000);
-    let outcome_p = deliverer.step_delivery(sid, &actor_tx, t_30_0);
+    let outcome_p = deliverer.step_delivery(sid, ActorId::for_test(1), &actor_tx, t_30_0);
     assert_eq!(outcome_p, DeliveryStepResult::PausedPending);
 
     // 4. t=30.2s 解凍，清空 channel，立即再投遞
@@ -718,7 +716,7 @@ fn test_deliverer_delayed_first_pending_poll_does_not_timeout_prematurely() {
     assert_eq!(gate.handoff_freeze_state(), HandoffFreezeState::Open);
     let _ = actor_rx.try_recv();
 
-    let outcome_final = deliverer.step_delivery(sid, &actor_tx, t_30_2);
+    let outcome_final = deliverer.step_delivery(sid, ActorId::for_test(1), &actor_tx, t_30_2);
 
     // 實際有效 Open 時間只有 29.8 秒，預期 Delivered，接收端恰好一筆事件
     assert_eq!(outcome_final, DeliveryStepResult::Delivered);
@@ -743,7 +741,7 @@ fn test_deliverer_multiple_freeze_thaw_cycles() {
     let sid1 = "COM10";
     let by_id1 = "by-id-multi-freeze-1";
     let real_path1 = "/dev/ttyUSB10";
-    deliverer.add_obligation_at(sid1, by_id1, real_path1, 1, 1, t0);
+    deliverer.add_obligation_at(sid1, by_id1, real_path1, 1, ActorId::for_test(1), t0);
 
     // 填滿 channel
     actor_tx.send(ControlEvent::Tick).unwrap();
@@ -775,7 +773,7 @@ fn test_deliverer_multiple_freeze_thaw_cycles() {
 
     // t=38s 投遞：有效 Open 時間為 38s - 10s = 28s < 30s，預期 Delivered
     let t_38 = t0 + Duration::from_secs(38);
-    let outcome = deliverer.step_delivery(sid1, &actor_tx, t_38);
+    let outcome = deliverer.step_delivery(sid1, ActorId::for_test(1), &actor_tx, t_38);
     assert_eq!(outcome, DeliveryStepResult::Delivered);
     assert_eq!(deliverer.obligation_count(), 0);
 
@@ -783,9 +781,9 @@ fn test_deliverer_multiple_freeze_thaw_cycles() {
     let sid2 = "COM11";
     let by_id2 = "by-id-multi-freeze-2";
     let real_path2 = "/dev/ttyUSB11";
-    deliverer.add_obligation_at(sid2, by_id2, real_path2, 1, 1, t0);
+    deliverer.add_obligation_at(sid2, by_id2, real_path2, 1, ActorId::for_test(2), t0);
     let t_41 = t0 + Duration::from_secs(41);
-    let outcome2 = deliverer.step_delivery(sid2, &actor_tx, t_41);
+    let outcome2 = deliverer.step_delivery(sid2, ActorId::for_test(2), &actor_tx, t_41);
     assert_eq!(outcome2, DeliveryStepResult::TimedOut);
     assert_eq!(deliverer.obligation_count(), 0);
 }
@@ -812,10 +810,10 @@ fn test_deliverer_obligation_created_during_pending() {
     let sid = "COM20";
     let by_id = "by-id-pending-create";
     let real_path = "/dev/ttyUSB20";
-    deliverer.add_obligation_at(sid, by_id, real_path, 1, 1, t_15);
+    deliverer.add_obligation_at(sid, by_id, real_path, 1, ActorId::for_test(1), t_15);
 
     // Pending 期間呼叫 step_delivery 應暫停
-    let outcome_p = deliverer.step_delivery(sid, &actor_tx, t_15);
+    let outcome_p = deliverer.step_delivery(sid, ActorId::for_test(1), &actor_tx, t_15);
     assert_eq!(outcome_p, DeliveryStepResult::PausedPending);
 
     // t=25s 解凍（義務經歷了 10s 的 Pending）
@@ -825,7 +823,7 @@ fn test_deliverer_obligation_created_during_pending() {
 
     // t=45s 投遞：自建立經過 30s，扣除 10s 凍結，有效 Open 時間為 20s < 30s，預期 Delivered
     let t_45 = t0 + Duration::from_secs(45);
-    let outcome = deliverer.step_delivery(sid, &actor_tx, t_45);
+    let outcome = deliverer.step_delivery(sid, ActorId::for_test(1), &actor_tx, t_45);
     assert_eq!(outcome, DeliveryStepResult::Delivered);
     assert_eq!(deliverer.obligation_count(), 0);
     assert_eq!(actor_rx.try_iter().count(), 1, "成功送達時接收端應收到一筆事件");
@@ -834,10 +832,10 @@ fn test_deliverer_obligation_created_during_pending() {
     let sid_timeout = "COM21";
     let by_id_timeout = "by-id-pending-timeout";
     let real_path_timeout = "/dev/ttyUSB21";
-    deliverer.add_obligation_at(sid_timeout, by_id_timeout, real_path_timeout, 1, 1, t_15);
+    deliverer.add_obligation_at(sid_timeout, by_id_timeout, real_path_timeout, 1, ActorId::for_test(1), t_15);
     // t=60s：自建立經過 45s，扣除 10s 凍結，有效 Open 時間為 35s > 30s，預期 TimedOut
     let t_60 = t0 + Duration::from_secs(60);
-    let outcome_timeout = deliverer.step_delivery(sid_timeout, &actor_tx, t_60);
+    let outcome_timeout = deliverer.step_delivery(sid_timeout, ActorId::for_test(1), &actor_tx, t_60);
     assert_eq!(outcome_timeout, DeliveryStepResult::TimedOut);
     assert_eq!(deliverer.obligation_count(), 0);
 }
@@ -853,7 +851,7 @@ fn test_deliverer_obligation_cancelled_when_pending_becomes_permanent() {
     let sid = "COM30";
     let by_id = "by-id-perm";
     let real_path = "/dev/ttyUSB30";
-    deliverer.add_obligation_at(sid, by_id, real_path, 1, 1, t0);
+    deliverer.add_obligation_at(sid, by_id, real_path, 1, ActorId::for_test(1), t0);
 
     // 進入 Pending
     let t_5 = t0 + Duration::from_secs(5);
@@ -868,7 +866,7 @@ fn test_deliverer_obligation_cancelled_when_pending_becomes_permanent() {
     assert_eq!(gate.handoff_freeze_state(), HandoffFreezeState::Permanent);
 
     // 送達者單步執行應回傳 Cancelled 並丟棄義務
-    let outcome = deliverer.step_delivery(sid, &actor_tx, t_5);
+    let outcome = deliverer.step_delivery(sid, ActorId::for_test(1), &actor_tx, t_5);
     assert_eq!(outcome, DeliveryStepResult::Cancelled);
     assert_eq!(deliverer.obligation_count(), 0);
 }
@@ -884,18 +882,18 @@ fn test_deliverer_times_out_when_effective_open_exceeds_30s() {
     let by_id = "by-id-pure-timeout";
     let real_path = "/dev/ttyUSB40";
 
-    deliverer.add_obligation_at(sid, by_id, real_path, 1, 1, t0);
+    deliverer.add_obligation_at(sid, by_id, real_path, 1, ActorId::for_test(1), t0);
     // 填滿 channel
     actor_tx.send(ControlEvent::Tick).unwrap();
 
     // t=29.9s 投遞回 Backoff
     let t_29_9 = t0 + Duration::from_millis(29_900);
-    let outcome = deliverer.step_delivery(sid, &actor_tx, t_29_9);
+    let outcome = deliverer.step_delivery(sid, ActorId::for_test(1), &actor_tx, t_29_9);
     assert_eq!(outcome, DeliveryStepResult::Backoff);
 
     // t=30.1s 投遞，有效 Open 時間達 30.1s >= 30s，預期 TimedOut
     let t_30_1 = t0 + Duration::from_millis(30_100);
-    let outcome_final = deliverer.step_delivery(sid, &actor_tx, t_30_1);
+    let outcome_final = deliverer.step_delivery(sid, ActorId::for_test(1), &actor_tx, t_30_1);
     assert_eq!(outcome_final, DeliveryStepResult::TimedOut);
     assert_eq!(deliverer.obligation_count(), 0);
     assert_eq!(actor_rx.try_iter().count(), 1, "除了最初塞入的 Tick 外不得取得任何新事件");
@@ -914,7 +912,7 @@ fn test_deliverer_time_sample_before_freeze_thaw_interleave_times_out() {
     let real_path = "/dev/ttyUSB50";
 
     // 1. t=0 建立義務
-    deliverer.add_obligation_at(sid, by_id, real_path, 1, 1, t0);
+    deliverer.add_obligation_at(sid, by_id, real_path, 1, ActorId::for_test(1), t0);
 
     // 2. 送達執行緒於 t=30.1s 取得輪詢時間，隨後暫停
     let t_poll = t0 + Duration::from_millis(30_100);
@@ -932,7 +930,7 @@ fn test_deliverer_time_sample_before_freeze_thaw_interleave_times_out() {
     assert!(gate.thaw(&token));
 
     // 4. 送達執行緒恢復，以已取得的 now=30.1s 執行 step_delivery；channel 有空位
-    let outcome = deliverer.step_delivery(sid, &actor_tx, t_poll);
+    let outcome = deliverer.step_delivery(sid, ActorId::for_test(1), &actor_tx, t_poll);
     assert_eq!(outcome, DeliveryStepResult::TimedOut, "義務在凍結前經歷 30.1s > 30s Open，不得被未來凍結扣除而送達");
     assert_eq!(deliverer.obligation_count(), 0, "逾時義務必須自 deliverer 移除");
     assert_eq!(actor_rx.try_iter().count(), 0, "逾時義務不得送出任何事件");
@@ -951,7 +949,7 @@ fn test_deliverer_snapshot_before_freeze_thaw_interleave_times_out() {
     let real_path = "/dev/ttyUSB51";
 
     // 1. t=0 建立義務
-    deliverer.add_obligation_at(sid, by_id, real_path, 1, 1, t0);
+    deliverer.add_obligation_at(sid, by_id, real_path, 1, ActorId::for_test(1), t0);
 
     // 2. 送達執行緒於 t=30.1s 取得閘門快照，隨後暫停
     let t_poll = t0 + Duration::from_millis(30_100);
@@ -974,7 +972,7 @@ fn test_deliverer_snapshot_before_freeze_thaw_interleave_times_out() {
     assert!(gate.thaw(&token));
 
     // 4. 送達執行緒恢復，使用先前取樣之快照呼叫 step_delivery_with_snapshot
-    let outcome = deliverer.step_delivery_with_snapshot(sid, &actor_tx, snap);
+    let outcome = deliverer.step_delivery_with_snapshot(sid, ActorId::for_test(1), &actor_tx, snap);
     assert_eq!(outcome, DeliveryStepResult::TimedOut, "快照時刻已滿 30.1s > 30s Open，不得被後續凍結扣除而送達");
     assert_eq!(deliverer.obligation_count(), 0, "逾時義務必須自 deliverer 移除");
     assert_eq!(actor_rx.try_iter().count(), 0, "逾時義務不得送出任何事件");
@@ -993,13 +991,12 @@ fn test_handle_actor_exited_takes_resources_and_produces_close_jobs() {
     let handle = backend.open_exclusive(&dev, &cfg).expect("open fake serial");
     let parts = HandleParts::split(handle);
 
-    let sid = "COM1";
-    let inc = ledger.alloc_session_inc(sid);
+    let actor = ActorId::allocate();
     let token = ledger.register(
         "by-id-held",
         "/dev/ttyUSB0",
-        CustodyOwner::Session { sid: sid.into(), inc },
-        CustodyTaker::OpenJob { sid: sid.into(), gen: 1 },
+        CustodyOwner::Session { actor },
+        CustodyTaker::OpenJob { actor },
     ).unwrap();
 
     // 存入 parts
@@ -1008,8 +1005,8 @@ fn test_handle_actor_exited_takes_resources_and_produces_close_jobs() {
         rec.phase = CustodyPhase::Held { parts: Some(parts) };
     }
 
-    // 當同世代 actor 結束時，呼叫 handle_actor_exited
-    let mut jobs = ledger.handle_actor_exited(sid, inc);
+    // 當相同 ActorId 的 actor 結束時，呼叫 handle_actor_exited
+    let mut jobs = ledger.handle_actor_exited(actor);
     assert_eq!(jobs.len(), 1, "應產出恰好一個關閉工作");
     let job = jobs.pop().unwrap();
     match &job {
@@ -1041,15 +1038,15 @@ fn test_handle_actor_exited_takes_resources_and_produces_close_jobs() {
     let _token_fail = ledger.register(
         "by-id-held-fail",
         "/dev/ttyUSB0_fail",
-        CustodyOwner::Session { sid: sid.into(), inc },
-        CustodyTaker::OpenJob { sid: sid.into(), gen: 3 },
+        CustodyOwner::Session { actor },
+        CustodyTaker::OpenJob { actor },
     ).unwrap();
     {
         let rec = ledger.custody.get_mut("by-id-held-fail").unwrap();
         rec.phase = CustodyPhase::Held { parts: Some(parts_fail) };
     }
 
-    let mut jobs_fail = ledger.handle_actor_exited(sid, inc);
+    let mut jobs_fail = ledger.handle_actor_exited(actor);
     assert_eq!(jobs_fail.len(), 1);
     let term_fail = jobs_fail.pop().unwrap().execute_and_settle(&mut ledger, None).unwrap().unwrap();
     assert!(matches!(term_fail.handle, TerminalHandle::Failed { .. }));
@@ -1062,14 +1059,14 @@ fn test_handle_actor_exited_takes_resources_and_produces_close_jobs() {
     let _token2 = ledger.register(
         "by-id-bridged-none",
         "/dev/ttyUSB1",
-        CustodyOwner::Session { sid: sid.into(), inc },
-        CustodyTaker::OpenJob { sid: sid.into(), gen: 2 },
+        CustodyOwner::Session { actor },
+        CustodyTaker::OpenJob { actor },
     ).unwrap();
     {
         let rec = ledger.custody.get_mut("by-id-bridged-none").unwrap();
         rec.phase = CustodyPhase::Bridged { epoch: 10, worker: None };
     }
-    let jobs2 = ledger.handle_actor_exited(sid, inc);
+    let jobs2 = ledger.handle_actor_exited(actor);
     assert!(jobs2.is_empty(), "Bridged{{worker: None}} 應留給 Reclaim 處理，不產出 job 也不覆寫");
     let snap2 = ledger.get_custody("by-id-bridged-none").unwrap().snapshot();
     assert!(matches!(snap2.phase, CustodyPhaseSnapshot::Bridged { epoch: 10, worker_in_ledger: false }));
@@ -1078,14 +1075,14 @@ fn test_handle_actor_exited_takes_resources_and_produces_close_jobs() {
     let token3 = ledger.register(
         "by-id-drain",
         "/dev/ttyUSB2",
-        CustodyOwner::Reaper,
+        CustodyOwner::Session { actor },
         CustodyTaker::Worker("w".into()),
     ).unwrap();
     {
         let rec = ledger.custody.get_mut("by-id-drain").unwrap();
         rec.phase = CustodyPhase::Bridged { epoch: 20, worker: None };
     }
-    let worker_opt = ledger.mark_bridge_draining(token3, 20, StopId(0)).unwrap();
+    let worker_opt = ledger.mark_bridge_draining(actor, token3, 20, StopId(0)).unwrap();
     assert!(worker_opt.is_none());
     let snap3 = ledger.get_custody("by-id-drain").unwrap().snapshot();
     assert!(matches!(snap3.phase, CustodyPhaseSnapshot::BridgeDraining { epoch: 20, stop_id: StopId(0) }));
@@ -1106,15 +1103,15 @@ fn test_handle_actor_exited_takes_resources_and_produces_close_jobs() {
     let token_worker = ledger.register(
         "by-id-worker",
         REAL_PATH,
-        CustodyOwner::Session { sid: sid.into(), inc },
-        CustodyTaker::OpenJob { sid: sid.into(), gen: 4 },
+        CustodyOwner::Session { actor },
+        CustodyTaker::OpenJob { actor },
     ).unwrap();
     {
         let rec = ledger.custody.get_mut("by-id-worker").unwrap();
         rec.phase = CustodyPhase::Bridged { epoch: worker_epoch, worker: Some(sw_core::custody::ReclaimWorker::Real(real_worker)) };
     }
 
-    let mut jobs_worker = ledger.handle_actor_exited(sid, inc);
+    let mut jobs_worker = ledger.handle_actor_exited(actor);
     assert_eq!(jobs_worker.len(), 1);
     let job_worker = jobs_worker.pop().unwrap();
     assert!(job_worker.is_drain_bridge());
@@ -1161,16 +1158,17 @@ fn test_handle_actor_exited_takes_resources_and_produces_close_jobs() {
 fn test_settle_worker_stopped_rejects_mismatched_epoch_and_stale_receipts() {
     let unconfirmed = UnconfirmedCloses::new();
     let mut ledger = CustodyLedger::new(unconfirmed.clone());
+    let actor = ActorId::for_test(1);
 
     let by_id = "by-id-settle-repro";
     let token = ledger.register(
         by_id,
         "/dev/ttyUSB0",
-        CustodyOwner::Reaper,
+        CustodyOwner::Session { actor },
         CustodyTaker::Worker("w".into()),
     ).unwrap();
 
-    ledger.mark_bridge_draining(token, 2, StopId(2)).unwrap();
+    ledger.mark_bridge_draining(actor, token, 2, StopId(2)).unwrap();
 
     // 1. 傳入過期回條 (epoch 1) 給處於 epoch 2 的 BridgeDraining
     let receipt_stale = WorkerStoppedReceipt {
@@ -1266,24 +1264,21 @@ fn test_generation_inc_prevents_stale_command() {
     let unconfirmed = UnconfirmedCloses::new();
     let mut ledger = CustodyLedger::new(unconfirmed);
 
-    let sid = "COM1";
-    let inc1 = ledger.alloc_session_inc(sid);
-    assert_eq!(inc1, 1);
+    let actor1 = ActorId::allocate();
+    let actor2 = ActorId::allocate();
+    assert_ne!(actor1, actor2);
+    assert!(actor1 < actor2, "ActorId 配置順序必須嚴格遞增");
 
     let token1 = ledger.register(
         "by-id-gen",
         "/dev/tty0",
-        CustodyOwner::Session { sid: sid.into(), inc: inc1 },
-        CustodyTaker::OpenJob { sid: sid.into(), gen: 1 },
+        CustodyOwner::Session { actor: actor2 },
+        CustodyTaker::OpenJob { actor: actor2 },
     ).unwrap();
 
-    // session 重建，世代號遞增到 2
-    let inc2 = ledger.alloc_session_inc(sid);
-    assert_eq!(inc2, 2);
-
-    // 舊世代 (inc=1) 的 ActorExited 命令到達
-    let stale_jobs = ledger.handle_actor_exited(sid, inc1);
-    assert!(stale_jobs.is_empty(), "舊世代命令不應影響當前世代帳本紀錄");
+    // 舊 actor 的延遲 ActorExited 不得影響新 actor 的紀錄。
+    let stale_jobs = ledger.handle_actor_exited(actor1);
+    assert!(stale_jobs.is_empty(), "不相同 ActorId 的命令不應影響帳本紀錄");
 
     // 紀錄應維持原樣
     let c = ledger.get_custody("by-id-gen").unwrap();
@@ -1334,14 +1329,13 @@ fn test_dr1_f_w3_prime_unconfirmed_bridge_handoff_reaper_drain() {
     let mut ledger = CustodyLedger::new(unconfirmed.clone());
 
     // 建立一個 Opening 紀錄並進入 Taken
-    let sid = "COM10";
     let by_id = "by-id-dr1-f";
     let real_path = "/dev/ttyUSB10";
     let token = ledger.register(
         by_id,
         real_path,
-        CustodyOwner::Session { sid: sid.into(), inc: 1 },
-        CustodyTaker::OpenJob { sid: sid.into(), gen: 1 },
+        CustodyOwner::Session { actor: ActorId::for_test(1) },
+        CustodyTaker::OpenJob { actor: ActorId::for_test(1) },
     ).unwrap();
 
     // 模擬開埠成功，進入 Bridged { epoch: 100, worker: None }
@@ -1353,7 +1347,7 @@ fn test_dr1_f_w3_prime_unconfirmed_bridge_handoff_reaper_drain() {
     );
 
     // (f1) BridgeOpened send 回 Disconnected：開埠工作者在鎖內轉 BridgeDraining，owner 改 Reaper
-    let _ = ledger.mark_bridge_draining(token, 100, StopId(1)).unwrap();
+    let _ = ledger.mark_bridge_draining(ActorId::for_test(1), token, 100, StopId(1)).unwrap();
     assert_eq!(
         ledger.get_custody(by_id).unwrap().snapshot().phase,
         CustodyPhaseSnapshot::BridgeDraining { epoch: 100, stop_id: StopId(1) }
@@ -1394,13 +1388,13 @@ fn test_dr7_parked_handoff_and_deliverer_retry() {
         by_id,
         real_path,
         CustodyOwner::Parked,
-        CustodyTaker::Retire { sid: sid.into() },
+        CustodyTaker::Retire { actor: ActorId::for_test(1) },
     ).unwrap();
     ledger.save_held_mock(token).unwrap();
     assert_eq!(ledger.get_custody(by_id).unwrap().owner, CustodyOwner::Parked);
 
     // 2. bind COM1 -> B3 成功，首次 DeviceOnline 送達失敗 (Full)，記送達義務
-    deliverer.add_obligation_at(sid, by_id, real_path, 1, 1, t0);
+    deliverer.add_obligation_at(sid, by_id, real_path, 1, ActorId::for_test(1), t0);
     assert!(deliverer.obligations.contains_key(sid));
 
     // 3. (k) 送達前 release COM1：取消送達義務
@@ -1417,22 +1411,21 @@ fn test_dr9_actor_spawn_failure_cleanup() {
     let unconfirmed = UnconfirmedCloses::new();
     let mut ledger = CustodyLedger::new(unconfirmed.clone());
 
-    let sid = "COM30";
     let by_id = "by-id-dr9";
     let real_path = "/dev/ttyUSB30";
-    let inc = ledger.alloc_session_inc(sid);
+    let actor = ActorId::allocate();
 
     // W2 熱插 spawn_attach，帳本已有出生即接管的 PROBE handle（owner 為新 sid）
     let token = ledger.register(
         by_id,
         real_path,
-        CustodyOwner::Session { sid: sid.into(), inc },
+        CustodyOwner::Session { actor },
         CustodyTaker::Worker("spawn_attach".into()),
     ).unwrap();
     ledger.save_held_mock(token).unwrap();
 
     // 模擬 try_spawn_actor 回 Err，建構者持鎖清理 (C8)
-    let jobs = ledger.handle_spawn_failure(sid, inc);
+    let jobs = ledger.handle_spawn_failure(actor);
     assert_eq!(jobs.len(), 1, "建構失敗應產出關閉工作");
     assert_eq!(jobs[0].token(), token);
 
@@ -1611,14 +1604,16 @@ fn test_dr7_bind_device_online_full_queues_deliverer_and_retries() {
 
     // 恢復容量前：同一 token 以 C1′ 認領給 COM0 的開埠工作（交接列），不登記新紀錄、不重新開埠。
     let claimed = m.mgr.custody_for_test(DR7_BY_ID).expect("帳本紀錄");
+    let actor = claimed_actor(&claimed);
     assert_eq!(claimed.token, original_token, "沿用 parked 紀錄的 token");
     assert_eq!(
         claimed.phase,
         CustodyPhaseSnapshot::Taken {
-            taker: CustodyTaker::OpenJob { sid: full_sid.clone(), gen: 1 },
+            taker: CustodyTaker::OpenJob { actor },
         },
         "parked 續行以同 token 認領，不轉 Closing：{claimed:?}"
     );
+    assert_eq!(claimed.owner, CustodyOwner::Session { actor }, "owner 與認領者是同一 actor");
     assert!(!m.mgr.has_inflight_attach_for_test(DR7_BY_ID), "parked 作業已由 bind 取走");
     assert_eq!(dev.open_attempts(), open_attempts, "認領原 handle，不重新開埠");
     assert!(dev.is_open());
@@ -1751,17 +1746,18 @@ fn test_parked_continuation_bind_claims_same_token_and_settles_on_release_close(
         .expect("bind 應停在送出 DeviceOnline 之前");
 
     let claimed = m.mgr.custody_for_test(DR7_BY_ID).expect("帳本紀錄");
+    let actor = claimed_actor(&claimed);
     assert_eq!(claimed.token, token, "同 token 認領");
     assert_eq!(
         claimed.phase,
         CustodyPhaseSnapshot::Taken {
-            taker: CustodyTaker::OpenJob { sid: full_sid.clone(), gen: 1 },
+            taker: CustodyTaker::OpenJob { actor },
         },
         "handle 交給 COM0 的開埠工作仍在使用，不得標成 Closing：{claimed:?}"
     );
     assert_eq!(
         claimed.owner,
-        CustodyOwner::Session { sid: full_sid.clone(), inc: claimed_inc(&claimed) },
+        CustodyOwner::Session { actor },
         "owner 為認領的 session"
     );
     assert!(dev.is_open());
@@ -1894,11 +1890,12 @@ fn test_parked_continuation_bind_rebind_away_settles_claimed_close() {
         .expect("bind 應停在送出 DeviceOnline 之前");
 
     let claimed = m.mgr.custody_for_test(DR7_BY_ID).expect("帳本紀錄");
+    let actor = claimed_actor(&claimed);
     assert_eq!(claimed.token, token, "同 token 認領");
     assert_eq!(
         claimed.phase,
         CustodyPhaseSnapshot::Taken {
-            taker: CustodyTaker::OpenJob { sid: full_sid.clone(), gen: 1 },
+            taker: CustodyTaker::OpenJob { actor },
         },
         "{claimed:?}"
     );
@@ -1977,7 +1974,7 @@ fn test_birth_takeover_handoff_from_ledger_unplug_settles_claimed_close() {
     let held = m.mgr.custody_for_test(DR7_BY_ID).expect("出生即接管的帳本紀錄");
     assert_eq!(held.phase, CustodyPhaseSnapshot::Held, "handle 留在帳本：{held:?}");
     let formal_sid = match &held.owner {
-        CustodyOwner::Session { sid, .. } => sid.clone(),
+        CustodyOwner::Session { actor } => m.mgr.sid_for_actor_for_test(*actor).expect("正式 session sid"),
         other => panic!("owner 應為新建的正式 session：{other:?}"),
     };
     assert_ne!(formal_sid, DR7_PLACEHOLDER_SID, "佔位已退休");
@@ -2087,9 +2084,9 @@ fn test_parked_continuation_spawn_worker_cancelled_attach_dynamic_settles_taken_
     );
 }
 
-fn claimed_inc(rec: &CustodySnapshot) -> u64 {
+fn claimed_actor(rec: &CustodySnapshot) -> ActorId {
     match &rec.owner {
-        CustodyOwner::Session { inc, .. } => *inc,
+        CustodyOwner::Session { actor } => *actor,
         other => panic!("owner 應為 Session：{other:?}"),
     }
 }
@@ -2109,9 +2106,10 @@ fn test_dr1_f1_to_f5_real_ioworker_reaper_drain() {
     let sid = "COM50";
     let by_id = "by-id-real-drain";
     let token = m.mgr.custody_register_bridged_worker_for_test(sid, by_id, dev_path, epoch, worker);
+    let actor = m.mgr.custody_actor_for_test(by_id).expect("帳本 actor id");
 
     // 經由正式 manager 的 reaper_cmd_sender 發送 ActorExited 命令觸發回收
-    m.mgr.reaper_cmd_sender_for_test().send(ReaperCmd::ActorExited { sid: sid.into(), inc: 1 }).unwrap();
+    m.mgr.reaper_cmd_sender_for_test().send(ReaperCmd::ActorExited { actor }).unwrap();
 
     // 等待回收者消費與結算
     let t0 = Instant::now();
@@ -2138,8 +2136,9 @@ fn test_dr1_f1_to_f5_real_ioworker_reaper_drain() {
     let sid_f2 = "COM51";
     let by_id_f2 = "by-id-fail-close";
     let token_f2 = m.mgr.custody_register_bridged_worker_for_test(sid_f2, by_id_f2, dev_path_f2, epoch_f2, worker_f2);
+    let actor_f2 = m.mgr.custody_actor_for_test(by_id_f2).expect("第二筆帳本 actor id");
 
-    m.mgr.reaper_cmd_sender_for_test().send(ReaperCmd::ActorExited { sid: sid_f2.into(), inc: 1 }).unwrap();
+    m.mgr.reaper_cmd_sender_for_test().send(ReaperCmd::ActorExited { actor: actor_f2 }).unwrap();
 
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_secs(3) {
@@ -2162,17 +2161,16 @@ fn test_dr1_f2_bridge_close_failure_close_failed_and_t1_stall() {
     let unconfirmed = UnconfirmedCloses::new();
     let mut ledger = CustodyLedger::new(unconfirmed.clone());
 
-    let sid = "COM12";
     let by_id = "by-id-dr1-f2";
     let real_path = "/dev/ttyUSB12";
     let token = ledger.register(
         by_id,
         real_path,
-        CustodyOwner::Session { sid: sid.into(), inc: 1 },
-        CustodyTaker::OpenJob { sid: sid.into(), gen: 1 },
+        CustodyOwner::Session { actor: ActorId::for_test(1) },
+        CustodyTaker::OpenJob { actor: ActorId::for_test(1) },
     ).unwrap();
 
-    let _ = ledger.mark_bridge_draining(token, 100, StopId(2)).unwrap();
+    let _ = ledger.mark_bridge_draining(ActorId::for_test(1), token, 100, StopId(2)).unwrap();
 
     // (f2) 收到失敗回條 handle_closed: false
     let receipt = WorkerStoppedReceipt {
@@ -2205,16 +2203,15 @@ fn test_dr1_f3_f4_actor_exited_before_adopt_bridge() {
     let unconfirmed = UnconfirmedCloses::new();
     let mut ledger = CustodyLedger::new(unconfirmed.clone());
 
-    let sid = "COM13";
     let by_id = "by-id-dr1-f3";
     let real_path = "/dev/ttyUSB13";
-    let inc = ledger.alloc_session_inc(sid);
+    let actor = ActorId::allocate();
 
     let token = ledger.register(
         by_id,
         real_path,
-        CustodyOwner::Session { sid: sid.into(), inc },
-        CustodyTaker::OpenJob { sid: sid.into(), gen: 1 },
+        CustodyOwner::Session { actor },
+        CustodyTaker::OpenJob { actor: ActorId::for_test(1) },
     ).unwrap();
 
     // 模擬已開埠成功，IoWorker 放在帳本中（Bridged），但 actor 在 AdoptBridge 前結束
@@ -2222,7 +2219,7 @@ fn test_dr1_f3_f4_actor_exited_before_adopt_bridge() {
     ledger.adopt_bridged_mock(token, 101, mock_worker).unwrap();
 
     // ActorExited 命令到達：回收者接手排空
-    let jobs = ledger.handle_actor_exited(sid, inc);
+    let jobs = ledger.handle_actor_exited(actor);
     assert_eq!(jobs.len(), 1);
     assert_eq!(
         ledger.get_custody(by_id).unwrap().snapshot().phase,
@@ -2249,23 +2246,22 @@ fn test_dr1_f5_reclaim_drain_after_adopt_bridge_claim_unwind() {
     let unconfirmed = UnconfirmedCloses::new();
     let mut ledger = CustodyLedger::new(unconfirmed.clone());
 
-    let sid = "COM15";
     let by_id = "by-id-dr1-f5";
     let real_path = "/dev/ttyUSB15";
-    let inc = ledger.alloc_session_inc(sid);
+    let actor = ActorId::allocate();
 
     let token = ledger.register(
         by_id,
         real_path,
-        CustodyOwner::Session { sid: sid.into(), inc },
-        CustodyTaker::OpenJob { sid: sid.into(), gen: 1 },
+        CustodyOwner::Session { actor },
+        CustodyTaker::OpenJob { actor },
     ).unwrap();
 
     // 放入 mock worker
     ledger.adopt_bridged_mock(token, 102, MockWorker { epoch: 102 }).unwrap();
 
     // AdoptBridge 取出後發生 unwind，Reclaim 守衛送出 reclaim 請求轉由回收者排空
-    let jobs = ledger.claim_for_stop(sid, inc, CustodyCancel::Release);
+    let jobs = ledger.claim_for_stop(actor, CustodyCancel::Release);
     assert_eq!(jobs.len(), 1);
     let (reaper_tx, _reaper_rx) = crossbeam_channel::unbounded();
     let term_opt = jobs.into_iter().next().unwrap().execute_and_settle(&mut ledger, Some(&reaper_tx)).unwrap();
@@ -2289,18 +2285,17 @@ fn test_dr1_f6_f7_f8_reaper_drain_evidence_gaps_and_wal_error() {
     let unconfirmed = UnconfirmedCloses::new();
     let mut ledger = CustodyLedger::new(unconfirmed.clone());
 
-    let sid = "COM16";
     let by_id = "by-id-dr1-f6";
     let real_path = "/dev/ttyUSB16";
 
     let token = ledger.register(
         by_id,
         real_path,
-        CustodyOwner::Session { sid: sid.into(), inc: 1 },
-        CustodyTaker::OpenJob { sid: sid.into(), gen: 1 },
+        CustodyOwner::Session { actor: ActorId::for_test(1) },
+        CustodyTaker::OpenJob { actor: ActorId::for_test(1) },
     ).unwrap();
 
-    let _ = ledger.mark_bridge_draining(token, 103, StopId(3)).unwrap();
+    let _ = ledger.mark_bridge_draining(ActorId::for_test(1), token, 103, StopId(3)).unwrap();
 
     // (f6)(f7)(f8): handle_closed: true, 但有 RX 缺口和 wal_error
     let gap = sw_core::drain::EvidenceGap {
@@ -2338,25 +2333,24 @@ fn test_dr7_l_m_actor_exited_cancels_obligation_and_com2_independent() {
 
     let sid1 = "COM1";
     let by_id1 = "by-id-com1";
-    let sid2 = "COM2";
     let by_id2 = "by-id-com2";
 
     // COM1 登記送達義務
-    deliverer.add_obligation_at(sid1, by_id1, "/dev/ttyCOM1", 1, 1, t0);
+    deliverer.add_obligation_at(sid1, by_id1, "/dev/ttyCOM1", 1, ActorId::for_test(1), t0);
     assert!(deliverer.obligations.contains_key(sid1));
 
-    // (l) 送達前 COM1 actor 結束（世代號 1）：移除義務
-    deliverer.cancel_obligation(sid1, Some(1));
+    // (l) 送達前 COM1 actor 結束：移除該 ActorId 的義務
+    deliverer.cancel_obligations_for_actor(ActorId::for_test(1));
     assert!(!deliverer.obligations.contains_key(sid1), "actor 結束必須清除送達義務");
 
     // (m) COM2 的未接手 worker 交給回收者排空，不等 COM1
     let token2 = ledger.register(
         by_id2,
         "/dev/ttyCOM2",
-        CustodyOwner::Session { sid: sid2.into(), inc: 1 },
-        CustodyTaker::OpenJob { sid: sid2.into(), gen: 1 },
+        CustodyOwner::Session { actor: ActorId::for_test(1) },
+        CustodyTaker::OpenJob { actor: ActorId::for_test(1) },
     ).unwrap();
-    let _ = ledger.mark_bridge_draining(token2, 200, StopId(20)).unwrap();
+    let _ = ledger.mark_bridge_draining(ActorId::for_test(1), token2, 200, StopId(20)).unwrap();
     let receipt2 = WorkerStoppedReceipt {
         epoch: 200,
         stop_id: StopId(20),
@@ -2377,31 +2371,29 @@ fn test_dr9_b_c_spawn_failure_dynamic_and_yaml() {
     let mut ledger = CustodyLedger::new(unconfirmed.clone());
 
     // (b) 動態建立失敗
-    let sid_b = "COM51";
-    let inc_b = ledger.alloc_session_inc(sid_b);
+    let actor_b = ActorId::allocate();
     let token_b = ledger.register(
         "by-id-dyn",
         "/dev/ttyDyn",
-        CustodyOwner::Session { sid: sid_b.into(), inc: inc_b },
+        CustodyOwner::Session { actor: actor_b },
         CustodyTaker::Worker("dynamic_create".into()),
     ).unwrap();
     ledger.save_held_mock(token_b).unwrap();
-    let jobs_b = ledger.handle_spawn_failure(sid_b, inc_b);
+    let jobs_b = ledger.handle_spawn_failure(actor_b);
     assert_eq!(jobs_b.len(), 1);
     let term_b = jobs_b.into_iter().next().unwrap().execute_and_settle(&mut ledger, None).unwrap();
     assert_eq!(term_b.unwrap().handle, TerminalHandle::Closed);
 
     // (c) 啟動 YAML target 失敗
-    let sid_c = "COM52";
-    let inc_c = ledger.alloc_session_inc(sid_c);
+    let actor_c = ActorId::allocate();
     let token_c = ledger.register(
         "by-id-yaml",
         "/dev/ttyYaml",
-        CustodyOwner::Session { sid: sid_c.into(), inc: inc_c },
+        CustodyOwner::Session { actor: actor_c },
         CustodyTaker::Worker("yaml_start".into()),
     ).unwrap();
     ledger.save_held_mock(token_c).unwrap();
-    let jobs_c = ledger.handle_spawn_failure(sid_c, inc_c);
+    let jobs_c = ledger.handle_spawn_failure(actor_c);
     assert_eq!(jobs_c.len(), 1);
     let term_c = jobs_c.into_iter().next().unwrap().execute_and_settle(&mut ledger, None).unwrap();
     assert_eq!(term_c.unwrap().handle, TerminalHandle::Closed);
@@ -2503,20 +2495,19 @@ fn test_claim_for_release_non_held_phase_leaves_record_unchanged() {
     let mut ledger = CustodyLedger::new(unconfirmed.clone());
     let by_id = "by-id-claim-release";
     let real_path = "/dev/ttyCFR";
-    let sid = "t:COM5".to_string();
-    let inc = ledger.alloc_session_inc(&sid);
+    let actor = ActorId::allocate();
     let token = ledger
         .register(
             by_id,
             real_path,
-            CustodyOwner::Session { sid: sid.clone(), inc },
-            CustodyTaker::OpenJob { sid: sid.clone(), gen: 1 },
+            CustodyOwner::Session { actor },
+            CustodyTaker::OpenJob { actor: ActorId::for_test(1) },
         )
         .unwrap();
 
     let non_held = [
-        CustodyPhase::Opening { taker: CustodyTaker::OpenJob { sid: sid.clone(), gen: 1 } },
-        CustodyPhase::Taken { taker: CustodyTaker::OpenJob { sid: sid.clone(), gen: 1 } },
+        CustodyPhase::Opening { taker: CustodyTaker::OpenJob { actor: ActorId::for_test(1) } },
+        CustodyPhase::Taken { taker: CustodyTaker::OpenJob { actor: ActorId::for_test(1) } },
         CustodyPhase::Bridged { epoch: 7, worker: None },
         CustodyPhase::BridgeDraining { epoch: 7, stop_id: StopId(3) },
         CustodyPhase::Closing { job: "stop".into() },
@@ -2531,7 +2522,7 @@ fn test_claim_for_release_non_held_phase_leaves_record_unchanged() {
         );
         let after = ledger.get_custody(by_id).unwrap().snapshot();
         assert_eq!(after, before, "claim_for_release 失敗時紀錄不得被改寫");
-        assert_eq!(after.owner, CustodyOwner::Session { sid: sid.clone(), inc });
+        assert_eq!(after.owner, CustodyOwner::Session { actor });
         assert_eq!(after.cancel, None);
     }
 
@@ -2564,7 +2555,7 @@ fn test_reclaim_after_reaper_stopped_falls_back_to_finish_async() {
     let guard_dev = h.add_serial_device(guard_path);
     let guard_worker = h.start_worker_at(300, guard_path);
     {
-        let _reclaim = Reclaim::new(31, 300, guard_worker, cmd_tx.clone());
+        let _reclaim = Reclaim::new(ActorId::for_test(31), 31, 300, guard_worker, cmd_tx.clone());
     }
     wait_until("Reclaim 守衛的退回收尾關閉 handle", || guard_dev.close_count() == 1);
     assert!(!guard_dev.is_open(), "handle 已關閉");
@@ -2572,7 +2563,7 @@ fn test_reclaim_after_reaper_stopped_falls_back_to_finish_async() {
     let job_path = "/dev/ttyUSB-reclaim-job";
     let job_dev = h.add_serial_device(job_path);
     let job_worker = h.start_worker_at(301, job_path);
-    let sent = send_reclaim_or_finish(&cmd_tx, 32, 301, ReclaimWorker::Real(job_worker), None);
+    let sent = send_reclaim_or_finish(&cmd_tx, ActorId::for_test(32), 32, 301, ReclaimWorker::Real(job_worker), None);
     assert!(!sent, "回收者已停止：不得回報已送交");
     wait_until("送交失敗後就地收尾關閉 handle", || job_dev.close_count() == 1);
     assert!(!job_dev.is_open());
@@ -2621,7 +2612,7 @@ fn test_dr1_f5_formal_adopt_bridge_unwind_after_claim_reaper_drains() {
         .expect("正式 session 的開埠工作應停在接手 handle 之前");
     let held = m.mgr.custody_for_test(DR7_BY_ID).expect("出生即接管的帳本紀錄");
     let formal_sid = match &held.owner {
-        CustodyOwner::Session { sid, .. } => sid.clone(),
+        CustodyOwner::Session { actor } => m.mgr.sid_for_actor_for_test(*actor).expect("正式 session sid"),
         other => panic!("owner 應為新建的正式 session：{other:?}"),
     };
     let token = held.token;
@@ -2689,7 +2680,7 @@ fn test_dr1_a_w2_handoff_new_actor_lane_full_keeps_handle_and_adopts() {
         .expect("正式 session 的開埠工作應停在接手 handle 之前");
     let held = m.mgr.custody_for_test(DR7_BY_ID).expect("出生即接管的帳本紀錄");
     let formal_sid = match &held.owner {
-        CustodyOwner::Session { sid, .. } => sid.clone(),
+        CustodyOwner::Session { actor } => m.mgr.sid_for_actor_for_test(*actor).expect("正式 session sid"),
         other => panic!("owner 應為新建的正式 session：{other:?}"),
     };
     let token = held.token;
@@ -3000,129 +2991,208 @@ fn wp510r_m16_shutdown_waits_for_reaper_closing_custody() {
     assert!(elapsed >= Duration::from_millis(450), "shutdown 應等到排空期限：{elapsed:?}");
 }
 
-/// S2-PAR-wp510r 第 16 項 Medium 3：W6 rematerialize 後，舊 ExitReclaim 身分仍須回收新 sid 名下的資源。
+/// S2-PAR-wp510r 第 16 項 Medium 3：W6 改名不改變帳本 owner，舊 actor id 仍可回收 Held handle。
 #[test]
 fn wp510r_m16_actor_exit_reclaims_rekeyed_w6_custody() {
     let mut ledger = CustodyLedger::new(UnconfirmedCloses::new());
-    let old_sid = "fallback:COM0";
-    let new_sid = "detected:COM0";
-    let inc = ledger.alloc_session_inc(old_sid);
+    let actor = ActorId::allocate();
     let token = ledger
         .register(
             DR7_BY_ID,
             DR7_REAL,
-            CustodyOwner::Session {
-                sid: old_sid.into(),
-                inc,
-            },
+            CustodyOwner::Session { actor },
             CustodyTaker::Worker("w6-rematerialize".into()),
         )
         .expect("W6 登記成功");
     ledger.save_held_mock(token).expect("帳本持有 handle");
 
-    // rematerialize 把 owner 與 actor 目前 sid 一起改名；actor closure 的 ExitReclaim 仍保存舊 sid。
-    assert!(ledger.rematerialize_session(old_sid, new_sid, inc));
-    assert_eq!(ledger.current_session_inc(old_sid), 0);
-    assert_eq!(ledger.current_session_inc(new_sid), inc);
-    assert_eq!(ledger.alloc_session_inc(new_sid), inc + 1, "改名後 sid 的世代不得與舊 actor 碰撞");
-    assert_eq!(ledger.get_custody(DR7_BY_ID).expect("紀錄").owner, CustodyOwner::Session {
-        sid: new_sid.into(),
-        inc,
-    });
-    let jobs = ledger.handle_actor_exited(old_sid, inc);
+    // manager 改變 sid 索引時，帳本沒有 sid 欄位可改寫，owner 仍是原 actor id。
+    assert_eq!(ledger.get_custody(DR7_BY_ID).expect("紀錄").owner, CustodyOwner::Session { actor });
+    let jobs = ledger.handle_actor_exited(actor);
 
-    assert_eq!(jobs.len(), 1, "舊 actor 身分必須解析到改名後 owner");
+    assert_eq!(jobs.len(), 1, "改名後的 actor 退出仍須產生關閉工作");
     assert_eq!(jobs[0].token(), token);
 }
 
-/// S2-PAR-wp510r R2：目標 sid 的舊世代退出通知不得回收 W6 改名後的新 actor 資源；原 actor 身分仍可回收。
+/// S2-PAR-wp510r R2：正式 W6 改名後，延遲的舊 ActorId 不得關閉新 handle；新 actor 接手後退出仍須回收。
 #[test]
 fn wp510r_r2_delayed_target_actor_exit_does_not_reclaim_rekeyed_actor() {
     let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let m = ManagerRig::templates_only();
-    let h = CoreHarness::new(SHELL_PROFILE);
-    let historical_sid = "detected:COM0";
-    let actor_sid = "fallback:COM0";
+    const BY_ID: &str = "/s/by-id/usb-D";
+    let m = ManagerRig::with(&manager_yaml(&[]), sw_core::state_store::LoadedState::default(), None);
+    let historical = CoreHarness::new(SHELL_PROFILE);
+    let mut historical_actors = Vec::new();
     let mut historical_devices = Vec::new();
     for generation in 1..=2 {
-        let path = format!("/dev/tty-wp510r-r2-historical-{generation}");
+        let path = format!("/dev/wp510r-r2-historical-{generation}");
         let by_id = format!("by-id-wp510r-r2-historical-{generation}");
-        let device = h.add_serial_device(&path);
-        let worker = h.start_worker_at(700 + generation, &path);
-        let token = m
-            .mgr
-            .custody_register_bridged_worker_for_test(
-                historical_sid,
-                &by_id,
-                &path,
-                700 + generation,
-                worker,
-            );
-        m.mgr
-            .reaper_cmd_sender_for_test()
-            .send(ReaperCmd::ActorExited {
-                sid: historical_sid.into(),
-                inc: generation,
-            })
-            .expect("歷史 actor 退出通知送達");
-        wait_until("目標 sid 歷史 actor 已回收", || m.mgr.terminal_for_test(token).is_some());
-        assert_eq!(device.close_count(), 1, "歷史 actor 的 handle 正常關閉");
-        historical_devices.push(device);
+        let device = historical.add_serial_device(&path);
+        let worker = historical.start_worker_at(700 + generation, &path);
+        let token = m.mgr.custody_register_bridged_worker_for_test(
+            "t:COM0",
+            &by_id,
+            &path,
+            700 + generation,
+            worker,
+        );
+        historical_actors.push(m.mgr.custody_actor_for_test(&by_id).expect("歷史 owner ActorId"));
+        historical_devices.push((device, token));
     }
 
-    let actor_path = "/dev/tty-wp510r-r2-rematerialized";
-    let actor_by_id = "by-id-wp510r-r2-rematerialized";
-    let actor_device = h.add_serial_device(actor_path);
-    let actor_worker = h.start_worker_at(703, actor_path);
-    let actor_token = m
-        .mgr
-        .custody_register_bridged_worker_for_test(actor_sid, actor_by_id, actor_path, 703, actor_worker);
-    assert!(m.mgr.custody_rematerialize_for_test(actor_sid, historical_sid));
-    let rematerialized = m.mgr.custody_for_test(actor_by_id).expect("W6 新 actor 紀錄仍在");
-    assert!(matches!(
-        &rematerialized.owner,
-        CustodyOwner::Session { sid, .. } if sid == historical_sid
-    ));
+    m.devices(&[BY_ID]);
+    let real = m.real_of(BY_ID);
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    assert_eq!(m.wait_profile_source("COM0"), "fallback");
+    m.wait_state("COM0", "ATTACHED");
+    let without: Vec<_> = m.snapshot().into_iter().filter(|(key, _)| key != BY_ID).collect();
+    m.mgr.update_devices(&without);
+    m.wait_state("COM0", "DETACHED");
+    let old_sid = m.mgr.resolve("COM0").expect("fallback actor");
+    let actor_before = m.mgr.actor_id_for_test(&old_sid).expect("fallback ActorId");
+    let (rematerialize_entered_tx, rematerialize_entered_rx) = crossbeam_channel::bounded(1);
+    let (rematerialize_resume_tx, rematerialize_resume_rx) = crossbeam_channel::bounded(1);
+    m.mgr.set_rematerialize_after_set_profile_hook_for_test(
+        &old_sid,
+        Box::new(move || {
+            let _ = rematerialize_entered_tx.send(());
+            let _ = rematerialize_resume_rx.recv();
+        }),
+    );
+    let _ = m.device(&real).take_tx();
+    m.reply_probe(&real, b"root@t:/# ");
+    m.mgr.update_devices(&m.snapshot());
+    rematerialize_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("正式 W6 已接受 SetProfile，停在 manager 改名前");
 
-    // 以另一筆退出命令作為回收者 barrier，確保舊通知已處理後再檢查 handle。
-    let barrier_sid = "wp510r-r2-barrier:COM0";
-    let barrier_path = "/dev/tty-wp510r-r2-barrier";
-    let barrier_by_id = "by-id-wp510r-r2-barrier";
-    let barrier_device = h.add_serial_device(barrier_path);
-    let barrier_worker = h.start_worker_at(704, barrier_path);
-    let barrier_token = m
+    let (actor_entered_rx, actor_resume_tx) = m
         .mgr
-        .custody_register_bridged_worker_for_test(barrier_sid, barrier_by_id, barrier_path, 704, barrier_worker);
-    let reaper_tx = m.mgr.reaper_cmd_sender_for_test();
-    reaper_tx
-        .send(ReaperCmd::ActorExited {
-            sid: historical_sid.into(),
-            inc: 1,
-        })
-        .expect("送出延遲的舊世代退出通知");
-    reaper_tx
-        .send(ReaperCmd::ActorExited {
-            sid: barrier_sid.into(),
-            inc: 1,
-        })
-        .expect("送出回收者 barrier");
-    wait_until("回收者處理完舊通知與 barrier", || m.mgr.terminal_for_test(barrier_token).is_some());
-    assert_eq!(barrier_device.close_count(), 1);
-    assert_eq!(actor_device.close_count(), 0, "舊世代通知不得關閉新 actor 的 handle");
-    assert!(actor_device.is_open(), "新 actor 的 handle 仍保持開啟");
-    assert_eq!(m.mgr.terminal_for_test(actor_token), None, "舊世代通知不產生新 actor 終態");
-    assert!(m.mgr.custody_for_test(actor_by_id).is_some(), "新 actor 的紀錄仍由帳本持有");
+        .pause_next_request_for_test(&old_sid)
+        .expect("fallback actor 存在");
+    let query_mgr = m.mgr.clone();
+    let query_sid = old_sid.clone();
+    let query = std::thread::spawn(move || query_mgr.session_queue_lens(&query_sid));
+    actor_entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("actor 已停在查詢 Request");
+    let control = m.mgr.actor_control_for_test(&old_sid).expect("actor control lane");
+    let mut filled = 0;
+    while control
+        .try_send(sw_core::mailbox::ControlEvent::ConsoleCountChanged { count: 0 })
+        .is_ok()
+    {
+        filled += 1;
+    }
+    assert!(filled > 0, "control lane 必須確實被填滿");
+    rematerialize_resume_tx.send(()).expect("放行正式 W6 rematerialize");
 
-    reaper_tx
-        .send(ReaperCmd::ActorExited {
-            sid: actor_sid.into(),
-            inc: 1,
-        })
-        .expect("送出改名 actor 自己的退出通知");
-    wait_until("改名 actor 自己的退出已回收 handle", || m.mgr.terminal_for_test(actor_token).is_some());
-    assert_eq!(actor_device.close_count(), 1, "原始 actor 身分仍可正常回收 handle");
-    assert!(m.mgr.custody_for_test(actor_by_id).is_none());
-    assert!(historical_devices.iter().all(|device| device.close_count() == 1));
+    let token = {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(rec) = m.mgr.custody_for_test(BY_ID) {
+                if rec.phase == CustodyPhaseSnapshot::Held {
+                    break rec.token;
+                }
+            }
+            assert!(Instant::now() < deadline, "正式 W6 應將 handle 存回 Held");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let new_sid = m.mgr.resolve("t:COM0").expect("W6 已正式改名到偵測 template");
+    let renamed_actor = m.mgr.actor_id_for_test(&new_sid).expect("改名後 actor 身分");
+    assert_eq!(renamed_actor, actor_before, "rematerialize 只改 sid 索引，不改 ActorId");
+    assert_eq!(m.mgr.custody_actor_for_test(BY_ID), Some(renamed_actor));
+    assert!(m.device(&real).is_open(), "W6 存回 Held 後 handle 仍開啟");
+
+    // 延遲送達兩個佔用同公開 sid 歷史身分的退出通知；它們不得匹配 W6 actor。
+    let reaper = m.mgr.reaper_cmd_sender_for_test();
+    for ((device, old_token), old_actor) in historical_devices.iter().zip(historical_actors) {
+        reaper
+            .send(ReaperCmd::ActorExited { actor: old_actor })
+            .expect("延遲的舊 ActorExited 送達");
+        wait_until("歷史 actor 回條", || m.mgr.terminal_for_test(*old_token).is_some());
+        assert_eq!(device.close_count(), 1);
+    }
+    assert!(m.device(&real).is_open(), "舊 ActorId 不得關閉 W6 handle");
+    assert!(m.mgr.terminal_for_test(token).is_none(), "舊 ActorId 不產生 W6 終態");
+    assert_eq!(m.mgr.custody_actor_for_test(BY_ID), Some(renamed_actor));
+
+    // 放行 actor 接收正式 CustodyOffer；改名後的 session 再走 release/stop，驗證一般開埠資源以 ActorId 回收。
+    actor_resume_tx.send(()).expect("放行 actor 查詢");
+    let _ = query.join();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while m.mgr.custody_for_test(BY_ID).is_some() && Instant::now() < deadline {
+        m.clock.advance(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(m.mgr.custody_for_test(BY_ID).is_none(), "正式 actor 已接手 W6 offer");
+    m.wait_state("COM0", "ATTACHED");
+
+    // W6 改名後拔除再插入，走一般 OpenBridge 開埠；Opening 的 owner 與 taker 必須仍是出生時的同一 ActorId。
+    let opens_before_reopen = m.device(&real).open_attempts();
+    let closes_before_reopen = m.device(&real).close_count();
+    m.mgr.update_devices(&without);
+    m.wait_state("COM0", "DETACHED");
+    wait_until("改名後舊 bridge 關閉", || {
+        m.device(&real).close_count() == closes_before_reopen + 1
+    });
+    m.serial.block_open(&real);
+    m.mgr.update_devices(&m.snapshot());
+    let open_deadline = Instant::now() + Duration::from_secs(5);
+    while !m
+        .mgr
+        .custody_for_test(BY_ID)
+        .is_some_and(|rec| matches!(rec.phase, CustodyPhaseSnapshot::Opening { .. }))
+        && Instant::now() < open_deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        m.mgr
+            .custody_for_test(BY_ID)
+            .is_some_and(|rec| matches!(rec.phase, CustodyPhaseSnapshot::Opening { .. })),
+        "改名後一般開埠進入 Opening；state={:?} inflight={} custody={:?} warnings={:?} events={:?}",
+        m.state_of("COM0"),
+        m.mgr.has_inflight_attach_for_test(BY_ID),
+        m.mgr.custody_for_test(BY_ID),
+        m.warnings(),
+        m.events(),
+    );
+    let opening = m.mgr.custody_for_test(BY_ID).expect("一般開埠 Opening 紀錄");
+    assert_eq!(opening.owner, CustodyOwner::Session { actor: renamed_actor });
+    assert_eq!(
+        opening.phase,
+        CustodyPhaseSnapshot::Opening {
+            taker: CustodyTaker::OpenJob { actor: renamed_actor },
+        },
+        "改名後一般開埠仍以穩定 ActorId 登記：{opening:?}"
+    );
+    m.serial.release_open(&real);
+    m.wait_state("COM0", "ATTACHED");
+    wait_until("改名後一般開埠由 actor 接手", || m.mgr.custody_for_test(BY_ID).is_none());
+    assert_eq!(m.mgr.actor_id_for_test(&new_sid), Some(renamed_actor));
+    assert_eq!(m.device(&real).open_attempts(), opens_before_reopen + 1, "一般開埠實際執行一次");
+
+    let released = m
+        .mgr
+        .route(
+            &new_sid,
+            sw_core::session_core::SessionRequest::Release {
+                source: "agent".into(),
+                reason: PyValue::Null,
+            },
+            Duration::from_secs(5),
+        )
+        .expect("改名後 release/stop 成功");
+    assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{released:?}");
+    wait_until("改名後開埠的 bridge 已由 stop 回收", || {
+        m.device(&real).close_count() == closes_before_reopen + 2
+    });
+    m.wait_state("COM0", "RELEASED");
+    assert_eq!(m.device(&real).close_count(), closes_before_reopen + 2, "一般重新開埠的 handle 只關閉一次");
+    assert!(!m.device(&real).is_open());
+    assert!(m.mgr.custody_for_test(BY_ID).is_none());
 }
 
 /// 線上快照（B3 在線）。
@@ -3319,9 +3389,10 @@ fn dr5_com2_reaper_drain(m: &ManagerRig, h: &CoreHarness) -> (u64, sw_pal::fakes
     let dev = h.add_serial_device(path);
     let worker = h.start_worker_at(500, path);
     let token = m.mgr.custody_register_bridged_worker_for_test("COM52", "by-id-dr5-com2", path, 500, worker);
+    let actor = m.mgr.custody_actor_for_test("by-id-dr5-com2").expect("COM2 帳本 actor id");
     m.mgr
         .reaper_cmd_sender_for_test()
-        .send(ReaperCmd::ActorExited { sid: "COM52".into(), inc: 1 })
+        .send(ReaperCmd::ActorExited { actor })
         .unwrap();
     (token, dev)
 }

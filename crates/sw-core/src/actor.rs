@@ -417,16 +417,16 @@ pub fn try_spawn_actor(
     exec: Box<dyn EffectExecutor>,
     clock: Arc<dyn Clock>,
 ) -> Result<ActorHandle, SpawnError> {
-    try_spawn_actor_with_reaper(core, mailbox, exec, clock, 0, None)
+    try_spawn_actor_with_reaper(core, mailbox, exec, clock, crate::custody::ActorId::allocate(), None)
 }
 
-/// 支援帶世代號與回收者命令通道的 actor 啟動。
+/// 支援帶不可變 ActorId 與回收者命令通道的 actor 啟動。
 pub fn try_spawn_actor_with_reaper(
     mut core: SessionCore,
     mut mailbox: Mailbox,
     mut exec: Box<dyn EffectExecutor>,
     clock: Arc<dyn Clock>,
-    inc: u64,
+    actor: crate::custody::ActorId,
     reaper_cmd: Option<Sender<crate::custody::ReaperCmd>>,
 ) -> Result<ActorHandle, SpawnError> {
     #[cfg(feature = "test-fakes")]
@@ -473,9 +473,7 @@ pub fn try_spawn_actor_with_reaper(
         .name(format!("serialwrap-session-{com}"))
         .spawn(move || {
             // S2-PAR-wp510r: ExitReclaim 守衛只在 actor 執行緒 closure 內建立
-            let _exit_reclaim = reaper_cmd.map(|tx| {
-                crate::custody::ExitReclaim::new(core.session_id().to_string(), inc, tx)
-            });
+            let _exit_reclaim = reaper_cmd.map(|tx| crate::custody::ExitReclaim::new(actor, tx));
 
             let mut core = core;
             let mut timers: Vec<(u64, TimerEvent)> = Vec::new();

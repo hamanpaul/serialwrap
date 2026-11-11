@@ -20,11 +20,31 @@ use crate::session_core::UnconfirmedCloses;
 use crate::session_manager::HandleParts;
 use crate::uart_bridge::IoWorker;
 
-/// 紀錄持有者；帶有 session actor 世代號 `inc`（每次建構遞增）。
+/// actor 的全域唯一身分；manager 建立 actor 時配置，生命週期內不可變。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ActorId(u64);
+
+impl ActorId {
+    /// 配置不重複的 process-wide actor 身分。
+    pub fn allocate() -> Self {
+        static NEXT_ACTOR_ID: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT_ACTOR_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+            .expect("ActorId 空間耗盡");
+        Self(id)
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub const fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+/// 保管紀錄的持有者；session actor 一律以不可變 ActorId 識別。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CustodyOwner {
     Worker(String),
-    Session { sid: String, inc: u64 },
+    Session { actor: ActorId },
     Parked,
     Reaper,
 }
@@ -33,9 +53,9 @@ pub enum CustodyOwner {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CustodyTaker {
     Worker(String),
-    OpenJob { sid: String, gen: u64 },
-    PlaceholderOpen { sid: String, gen: u64 },
-    Retire { sid: String },
+    OpenJob { actor: ActorId },
+    PlaceholderOpen { actor: ActorId },
+    Retire { actor: ActorId },
 }
 
 /// 取消原因。
@@ -307,7 +327,7 @@ impl ActorExitedJob {
 pub struct DeliveryObligation {
     pub event: DeviceAttachedEvent,
     pub bind_gen: u64,
-    pub inc: u64,
+    pub actor: ActorId,
     pub created_at: Instant,
     pub frozen_at_create: Duration,
     pub next_at: Instant,
@@ -367,22 +387,20 @@ impl IntoReclaimWorker for MockWorker {
 
 /// 回收者命令（經無界通道送出，Drop 絕不取 manager 鎖）。
 pub enum ReaperCmd {
-    ActorExited { sid: String, inc: u64 },
-    Reclaim { token: u64, epoch: u64, worker: Box<ReclaimWorker> },
+    ActorExited { actor: ActorId },
+    Reclaim { actor: ActorId, token: u64, epoch: u64, worker: Box<ReclaimWorker> },
 }
 
 /// 只在 actor 執行緒 closure 內建立的守衛；結束時送出 ActorExited。
 pub struct ExitReclaim {
-    sid: String,
-    inc: u64,
+    actor: ActorId,
     cmd_tx: Option<Sender<ReaperCmd>>,
 }
 
 impl ExitReclaim {
-    pub fn new(sid: String, inc: u64, cmd_tx: Sender<ReaperCmd>) -> Self {
+    pub fn new(actor: ActorId, cmd_tx: Sender<ReaperCmd>) -> Self {
         Self {
-            sid,
-            inc,
+            actor,
             cmd_tx: Some(cmd_tx),
         }
     }
@@ -395,16 +413,14 @@ impl ExitReclaim {
 impl Drop for ExitReclaim {
     fn drop(&mut self) {
         if let Some(tx) = self.cmd_tx.take() {
-            let _ = tx.send(ReaperCmd::ActorExited {
-                sid: self.sid.clone(),
-                inc: self.inc,
-            });
+            let _ = tx.send(ReaperCmd::ActorExited { actor: self.actor });
         }
     }
 }
 
 /// 保護已從帳本取出但尚未確認接手的 Worker。
 pub struct Reclaim<T: IntoReclaimWorker> {
+    pub actor: ActorId,
     pub token: u64,
     pub epoch: u64,
     inner: Option<T>,
@@ -412,8 +428,9 @@ pub struct Reclaim<T: IntoReclaimWorker> {
 }
 
 impl<T: IntoReclaimWorker> Reclaim<T> {
-    pub fn new(token: u64, epoch: u64, inner: T, cmd_tx: Sender<ReaperCmd>) -> Self {
+    pub fn new(actor: ActorId, token: u64, epoch: u64, inner: T, cmd_tx: Sender<ReaperCmd>) -> Self {
         Self {
+            actor,
             token,
             epoch,
             inner: Some(inner),
@@ -430,7 +447,7 @@ impl<T: IntoReclaimWorker> Drop for Reclaim<T> {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
             if let Some(tx) = self.cmd_tx.take() {
-                send_reclaim_or_finish(&tx, self.token, self.epoch, inner.into_reclaim_worker(), None);
+                send_reclaim_or_finish(&tx, self.actor, self.token, self.epoch, inner.into_reclaim_worker(), None);
             }
         }
     }
@@ -442,12 +459,14 @@ impl<T: IntoReclaimWorker> Drop for Reclaim<T> {
 /// 通道；此時已沒有帳本結算者）。回傳是否已送交回收者。
 pub fn send_reclaim_or_finish(
     cmd_tx: &Sender<ReaperCmd>,
+    actor: ActorId,
     token: u64,
     epoch: u64,
     worker: ReclaimWorker,
     control: Option<&Sender<ControlEvent>>,
 ) -> bool {
     match cmd_tx.send(ReaperCmd::Reclaim {
+        actor,
         token,
         epoch,
         worker: Box::new(worker),
@@ -470,11 +489,6 @@ pub struct CustodyLedger {
     pub terminals: HashMap<u64, Terminal>,
     pub tombstones: HashSet<u64>,
     pub unconfirmed: Arc<UnconfirmedCloses>,
-    pub session_inc: HashMap<String, u64>,
-    /// 每個 sid 曾分配過的最高世代；rematerialize 後仍保留，避免延遲回收與 sid 重用碰撞。
-    session_generation: HashMap<String, u64>,
-    /// 以 ExitReclaim 建立時的 (sid, 世代) 識別 actor，映射到 rematerialize 後的目前 (sid, 世代)。
-    actor_session_by_origin: HashMap<(String, u64), (String, u64)>,
     next_token: AtomicU64,
 }
 
@@ -491,67 +505,8 @@ impl CustodyLedger {
             terminals: HashMap::new(),
             tombstones: HashSet::new(),
             unconfirmed,
-            session_inc: HashMap::new(),
-            session_generation: HashMap::new(),
-            actor_session_by_origin: HashMap::new(),
             next_token: AtomicU64::new(1),
         }
-    }
-
-    /// 分配 sid 內遞增的 actor 世代號；回收身分以 (sid, 世代) 配對，W6 改名不改 actor 身分。
-    pub fn alloc_session_inc(&mut self, sid: &str) -> u64 {
-        let generation = self.session_generation.entry(sid.to_string()).or_insert(0);
-        *generation += 1;
-        let inc = *generation;
-        self.session_inc.insert(sid.to_string(), inc);
-        self.actor_session_by_origin
-            .insert((sid.to_string(), inc), (sid.to_string(), inc));
-        inc
-    }
-
-    pub fn current_session_inc(&self, sid: &str) -> u64 {
-        self.session_inc.get(sid).copied().unwrap_or(0)
-    }
-
-    /// W6 rematerialize：更新原始 actor 身分目前對應的公開 sid 與世代，並同步搬移其帳本 owner。
-    pub fn rematerialize_session(&mut self, old_sid: &str, new_sid: &str, inc: u64) -> bool {
-        if old_sid == new_sid || self.current_session_inc(old_sid) != inc {
-            return false;
-        }
-        let old_current = (old_sid.to_string(), inc);
-        let identity = self
-            .actor_session_by_origin
-            .iter()
-            .find_map(|(identity, current)| (current == &old_current).then(|| identity.clone()));
-        let Some(identity) = identity else {
-            return false;
-        };
-
-        // 新公開 sid 必須使用它自己的新世代。沿用來源 inc 會與目標 sid 的歷史 actor 身分碰撞，
-        // 讓延遲的舊 ActorExited 被誤認成改名 actor 的退出。
-        let Some(new_inc) = self
-            .session_generation
-            .get(new_sid)
-            .copied()
-            .unwrap_or(0)
-            .checked_add(1)
-        else {
-            return false;
-        };
-        self.session_inc.remove(old_sid);
-        self.session_inc.insert(new_sid.to_string(), new_inc);
-        self.session_generation.insert(new_sid.to_string(), new_inc);
-        self.actor_session_by_origin
-            .insert(identity, (new_sid.to_string(), new_inc));
-        for rec in self.custody.values_mut() {
-            if let CustodyOwner::Session { sid, inc: owner_inc } = &mut rec.owner {
-                if sid == old_sid && *owner_inc == inc {
-                    *sid = new_sid.to_string();
-                    *owner_inc = new_inc;
-                }
-            }
-        }
-        true
     }
 
     /// C1 新 token 閘門。
@@ -636,19 +591,10 @@ impl CustodyLedger {
         taker: CustodyTaker,
     ) -> Result<(u64, Option<HandleParts>), CustodyClaimParkedError> {
         let new_owner = match &taker {
-            CustodyTaker::OpenJob { sid, .. } => {
-                let inc = self.current_session_inc(sid);
-                CustodyOwner::Session { sid: sid.clone(), inc }
-            }
-            CustodyTaker::PlaceholderOpen { sid, .. } => {
-                let inc = self.current_session_inc(sid);
-                CustodyOwner::Session { sid: sid.clone(), inc }
-            }
+            CustodyTaker::OpenJob { actor } => CustodyOwner::Session { actor: *actor },
+            CustodyTaker::PlaceholderOpen { actor } => CustodyOwner::Session { actor: *actor },
             CustodyTaker::Worker(op) => CustodyOwner::Worker(op.clone()),
-            CustodyTaker::Retire { sid } => {
-                let inc = self.current_session_inc(sid);
-                CustodyOwner::Session { sid: sid.clone(), inc }
-            }
+            CustodyTaker::Retire { actor } => CustodyOwner::Session { actor: *actor },
         };
 
         let rec = self.custody.get_mut(by_id).ok_or(CustodyClaimParkedError::NotFound)?;
@@ -787,20 +733,16 @@ impl CustodyLedger {
     }
 
     /// C8 / DR-9: actor 建構失敗時清理並產出關閉工作。
-    pub fn handle_spawn_failure(&mut self, sid: &str, inc: u64) -> Vec<ActorExitedJob> {
-        self.handle_actor_exited(sid, inc)
+    pub fn handle_spawn_failure(&mut self, actor: ActorId) -> Vec<ActorExitedJob> {
+        self.handle_actor_exited(actor)
     }
 
     /// session 停止機制（ClaimForStop / begin_stop）收尾帳本紀錄。
-    pub fn claim_for_stop(&mut self, sid: &str, inc: u64, cancel: CustodyCancel) -> Vec<ActorExitedJob> {
-        let current_inc = self.current_session_inc(sid);
-        if inc != current_inc {
-            return Vec::new();
-        }
+    pub fn claim_for_stop(&mut self, actor: ActorId, cancel: CustodyCancel) -> Vec<ActorExitedJob> {
         let mut jobs = Vec::new();
         for (by_id, rec) in self.custody.iter_mut() {
-            if let CustodyOwner::Session { sid: s, inc: i } = &rec.owner {
-                if s == sid && *i == inc {
+            if let CustodyOwner::Session { actor: owner } = &rec.owner {
+                if *owner == actor {
                     rec.cancel = Some(cancel);
                     match &mut rec.phase {
                         CustodyPhase::Held { parts } => {
@@ -882,12 +824,20 @@ impl CustodyLedger {
 
     pub fn mark_bridge_draining(
         &mut self,
+        actor: ActorId,
         token: u64,
         epoch: u64,
         stop_id: StopId,
     ) -> Result<Option<ReclaimWorker>, &'static str> {
         for rec in self.custody.values_mut() {
             if rec.token == token {
+                let actor_owns_record = match &rec.owner {
+                    CustodyOwner::Session { actor: owner } => *owner == actor,
+                    _ => false,
+                };
+                if !actor_owns_record {
+                    return Err("actor owner mismatch");
+                }
                 let worker = match &mut rec.phase {
                     CustodyPhase::Bridged { worker, .. } => worker.take(),
                     _ => None,
@@ -1013,16 +963,12 @@ impl CustodyLedger {
         terminal
     }
 
-    /// 處理同世代的 ActorExited，鎖內取出受保管資源並產生具所有權的關閉／排空工作；非同世代的命令不予理會。
-    pub fn handle_actor_exited(&mut self, sid: &str, inc: u64) -> Vec<ActorExitedJob> {
-        let Some((current_sid, current_inc)) = self.actor_session_by_origin.get(&(sid.to_string(), inc)).cloned() else {
-            return Vec::new();
-        };
-
+    /// 處理指定 ActorId 的 ActorExited，鎖內取出受保管資源並產生具所有權的關閉／排空工作；其他 actor 的通知不予理會。
+    pub fn handle_actor_exited(&mut self, actor: ActorId) -> Vec<ActorExitedJob> {
         let mut jobs = Vec::new();
         for (by_id, rec) in self.custody.iter_mut() {
-            if let CustodyOwner::Session { sid: s, inc: i } = &rec.owner {
-                if s == &current_sid && *i == current_inc {
+            if let CustodyOwner::Session { actor: owner } = &rec.owner {
+                if *owner == actor {
                     match &mut rec.phase {
                         CustodyPhase::Held { parts } => {
                             let parts_taken = parts.take();
@@ -1110,9 +1056,9 @@ impl Deliverer {
         self.obligations.get(sid).map_or(0, |o| o.attempts)
     }
 
-    pub fn add_obligation(&mut self, sid: &str, by_id: &str, real_path: &str, bind_gen: u64, inc: u64) {
+    pub fn add_obligation(&mut self, sid: &str, by_id: &str, real_path: &str, bind_gen: u64, actor: ActorId) {
         let snap = self.gate.snapshot();
-        self.add_obligation_with_snapshot(sid, by_id, real_path, bind_gen, inc, snap);
+        self.add_obligation_with_snapshot(sid, by_id, real_path, bind_gen, actor, snap);
     }
 
     pub fn add_obligation_at(
@@ -1121,11 +1067,11 @@ impl Deliverer {
         by_id: &str,
         real_path: &str,
         bind_gen: u64,
-        inc: u64,
+        actor: ActorId,
         now: Instant,
     ) {
         let snap = self.gate.snapshot_at(now);
-        self.add_obligation_with_snapshot(sid, by_id, real_path, bind_gen, inc, snap);
+        self.add_obligation_with_snapshot(sid, by_id, real_path, bind_gen, actor, snap);
     }
 
     /// 使用給定之閘門快照建立送達義務（保證時刻、凍結狀態與累積凍結時間一致）。
@@ -1135,7 +1081,7 @@ impl Deliverer {
         by_id: &str,
         real_path: &str,
         bind_gen: u64,
-        inc: u64,
+        actor: ActorId,
         snap: GateSnapshot,
     ) {
         self.obligations.insert(sid.to_string(), DeliveryObligation {
@@ -1144,7 +1090,7 @@ impl Deliverer {
                 real_path: real_path.to_string(),
             },
             bind_gen,
-            inc,
+            actor,
             created_at: snap.now,
             frozen_at_create: snap.frozen_total,
             next_at: snap.now,
@@ -1165,24 +1111,47 @@ impl Deliverer {
         }
     }
 
+    pub fn cancel_obligations_for_actor(&mut self, actor: ActorId) {
+        self.obligations.retain(|_, obligation| obligation.actor != actor);
+    }
+
+    pub fn rematerialize_obligation(&mut self, old_sid: &str, new_sid: &str, actor: ActorId) {
+        if old_sid == new_sid {
+            return;
+        }
+        if let Some(obligation) = self.obligations.remove(old_sid) {
+            if obligation.actor == actor {
+                self.obligations.insert(new_sid.to_string(), obligation);
+            } else {
+                self.obligations.insert(old_sid.to_string(), obligation);
+            }
+        }
+    }
+
     /// 單步送達執行（以指定時間取樣快照）。
     pub fn step_delivery(
         &mut self,
         sid: &str,
+        actor: ActorId,
         actor_tx: &Sender<ControlEvent>,
         now: Instant,
     ) -> DeliveryStepResult {
         let snap = self.gate.snapshot_at(now);
-        self.step_delivery_with_snapshot(sid, actor_tx, snap)
+        self.step_delivery_with_snapshot(sid, actor, actor_tx, snap)
     }
 
     /// 單步送達執行（使用給定之一致快照，避免取樣時間差導致誤扣除未來凍結）。
     pub fn step_delivery_with_snapshot(
         &mut self,
         sid: &str,
+        actor: ActorId,
         actor_tx: &Sender<ControlEvent>,
         snap: GateSnapshot,
     ) -> DeliveryStepResult {
+        if self.obligations.get(sid).is_some_and(|obligation| obligation.actor != actor) {
+            self.obligations.remove(sid);
+            return DeliveryStepResult::Cancelled;
+        }
         let ob = match self.obligations.get_mut(sid) {
             Some(o) => o,
             None => return DeliveryStepResult::NoObligation,
