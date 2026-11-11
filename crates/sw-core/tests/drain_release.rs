@@ -4057,6 +4057,7 @@ fn wp510r_release_with_ack(
         source: "cli".into(),
         reason: PyValue::Null,
         ack: ack_tx,
+        deadline: None,
     });
     let wait = ack_rx.try_recv().expect("release 等待中須回報 WaitAck");
     (rx, wait)

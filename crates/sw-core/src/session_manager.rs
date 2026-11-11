@@ -263,14 +263,14 @@ static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 /// | `cancelled`；裝置改指 `:4031-4043`、bind `:3683-3691`、shutdown `:1175-1190`、release `:3117-3125` | 共用原子取消旗標；各取消者都阻止晚到 handle 交接，並由同一 close 回條決定是否可清除 op。 | `wp510_b_handoff_invalidated_during_open_closes_handle`; `shutdown_includes_inflight_attach`; `wp510_review_release_cancels_placeholder_attach_before_retirement`; `bind_with_inflight_attach_op_cancels_waits_3000ms` |
 /// | `done`；交接完成 `:4374-4383`、作業收尾 `:4320-4365`，release 等待 `:3192-3204` | 沒有獨立 done 欄位；`inflight` 項目存活代表未完成，條件變數喚醒等待者。close 成功後移除 op，close 失敗不會誤報完成。 | `wp510_review_late_placeholder_attach_completion_clears_drain_stall`; `wp510_rpc_failed_close_keeps_placeholder_drain_stalled` |
 /// | `probe_bridge`；註冊 `:4367-4372`，取消排空：shutdown `:1186-1193`、release `:3126-3131`、bind `:3686-3691`、裝置改指 `:4039-4043` | 不另建 PROBE bridge；`attach_dynamic`／`reattach_existing` 以同一預開 handle 偵測。PROBE 的 TX gate 是作業持有的 `probe_fence`／`probe_cancel`：所有取消者經 `AttachOp::cancel()` 在 fence 鎖內凍結並取消（`uart_io.py:908-918`），已越過 `still_valid()` 的 PROBE 於提交點重驗即拒絕（`:623-627`）、零 TX。 | `wp510_rpc_bind_then_device_attach_replaces_placeholder`; `wp510_tx_shutdown_after_still_valid_before_placeholder_probe_submit_sends_zero_tx`; `wp510_tx_device_path_change_before_hotplug_probe_submit_sends_zero_tx`; `wp510_rpc_shutdown_before_placeholder_probe_submit_sends_zero_tx` |
-/// | `release_request/release_deadline`；開始計時 `:3084-3086`、第一次設定及重用 `:3117-3125`，等待與逾期處理 `:3192-3204` | S2-PAR-wp510r 第 15 項起 release 由 actor 主導：首次 release 的 `(source, reason)` 記在 actor 的停止待決（`PendingRelease`），候選期限由 actor 受理時起算，經 `ClaimByIdForRelease` 寫入被等待對象（作業的 `release_deadline`、帳本紀錄的 `release_deadline`）的共享欄位；重複／並行 release 重用第一次期限，逾期即回 stalled。 | `wp510_review_release_cancels_placeholder_attach_before_retirement`; `wp510_lifecycle_repeated_release_uses_expired_attach_deadline`; `wp510_lifecycle_concurrent_releases_share_first_attach_deadline`; `wp510_review4_release_cancel_fills_null_release_metadata_and_persists` |
+/// | `release_request/release_deadline`；開始計時 `:3084-3086`、第一次設定及重用 `:3117-3125`，等待與逾期處理 `:3192-3204` | S2-PAR-wp510r 第 15 項起 release 由 actor 主導：首次 release 的 `(source, reason)` 記在 actor 的停止待決（`PendingRelease`）；manager 在 RPC 進入時建立 3 秒絕對期限並傳給 actor，期限經 `ClaimByIdForRelease` 寫入被等待對象（作業的 `release_deadline`、帳本紀錄的 `release_deadline`）；重複／並行 release 重用首次期限，逾期即回 stalled。 | `wp510_review_release_cancels_placeholder_attach_before_retirement`; `wp510_lifecycle_repeated_release_uses_expired_attach_deadline`; `wp510_lifecycle_concurrent_releases_share_first_attach_deadline`; `wp510_review4_release_cancel_fills_null_release_metadata_and_persists` |
 /// | `bind_requested`；設定與等待 `:3683-3697` | 無獨立欄位；一般 bind 以取消旗標和共用 inflight 排空。OD-63 佔位 bind 依裁決早退，不能取消或改動作業。 | `bind_with_inflight_attach_op_cancels_waits_3000ms`; `wp510_b_bind_placeholder_precedes_inflight_cancellation` |
 /// | close 成功／失敗；`_finish_attach_op` `:4320-4365` | close 成功才移除 inflight；任一取消原因的 `closed:false` 都保留阻擋並以 by_id 與 `CloseReceipt.error` 告警（`:4322-4332`），release 後續維持 `DRAIN_STALLED`。佔位 W1 的 release 收尾由佔位 actor 的停止收斂補齊 `released_by`／`released_at` 並持久化（`finish_pending_open_stop`，`:4341-4363`），失敗告警後由 release 重試（`:3206-3209`）。 | `wp510_review_late_placeholder_attach_completion_clears_drain_stall`; `wp510_rpc_failed_close_keeps_placeholder_drain_stalled`; `wp510_lifecycle_shutdown_cancel_fail_close_keeps_placeholder_blocked`; `wp510_lifecycle_device_path_change_cancel_fail_close_keeps_placeholder_blocked`; `wp510_review4_failed_preopened_close_warns_with_by_id_and_error`; `wp510_review4_release_cancel_persist_enospc_fails_release_then_retries` |
 /// | shutdown 取消及排空 `:1175-1239` | shutdown 取消作業並等待 `Inner::inflight` 清除；仍有 close:false 的作業回報未 drained。末段比照 `:1231-1239` 重新收集排空期間才保留的作業。 | `shutdown_includes_inflight_attach`; `wp510_lifecycle_shutdown_cancel_fail_close_keeps_placeholder_blocked`; `wp510_review5_shutdown_before_bridge_takes_preopened_fail_close_reports_stalled` |
 /// | 執行緒建立；`_spawn_attach` `:4147-4150`，佔位交接同步呼叫 `:3633-3638` | `prepare_attach_worker` 先建立、放行前不碰作業；佔位交接在開埠與退休前取得 worker，`Builder::spawn()` 失敗即告警並回 RPC 錯誤（`can't start new thread`），佔位與持久化阻擋不變。自動 attach 無 RPC，告警後收尾作業。 | `wp510_review5_handoff_worker_spawn_failure_returns_error_and_keeps_placeholder`; `wp510_review5_oserror_handoff_worker_spawn_failure_returns_error_and_keeps_placeholder` |
 ///
 /// 生命週期：建立 → 開埠完成並交接，或取消後晚到並關閉；關閉成功才移除作業，`closed:false` 一律保留作業。release 找到同一作業後取消並等待首次 deadline；期限到期回 `DRAIN_STALLED`。shutdown 取消並排空同一 inflight 集合。
-/// S2-PAR-wp510r 第 15 項（擁有者 2026-11-11「wp510r release 等待改為 actor 主導」）：attach worker 作業與 close_failed 作業的 release 等待由 actor 主導——`ClaimByIdForRelease` 取消作業並登記等待（`AttachOp::release_watch`），作業收尾（`finish_worker_op`）以 `CustodyTerminal` 通知；首次期限、DRAIN_STALLED 與遲到的 RELEASED 收尾都由 actor 的停止待決承擔（T-1），manager 不保存期限、快照或完成義務。對應 Python 在 manager lock 下設定 `drain_stalled` 與 `drain_timeout_epoch`。
+/// S2-PAR-wp510r 第 15 項（擁有者 2026-11-11「wp510r release 等待改為 actor 主導」）：attach worker 作業與 close_failed 作業的 release 等待由 actor 主導——`ClaimByIdForRelease` 取消作業並登記等待（`AttachOp::release_watch`），作業收尾（`finish_worker_op`）以 `CustodyTerminal` 通知；manager 在 RPC 進入時傳入首次絕對期限，actor 將期限記在被等待對象上，並由停止待決負責 DRAIN_STALLED 與遲到的 RELEASED 收尾（T-1）。manager 不保存快照或完成義務。對應 Python 在 manager lock 下設定 `drain_stalled` 與 `drain_timeout_epoch`。
 ///
 /// TX 來源盤點（wp510 第三次整包審查 High）：佔位交接期間與交接後、進入正式 bridge 前，可能送出 TX 的來源與其取消權：
 ///
@@ -1620,11 +1620,12 @@ impl Shared {
         let (token, claimed) = {
             let mut inner = lock(&self.inner);
             let rec = inner.custody.get_custody(by_id)?;
-            let crate::custody::CustodyOwner::Session { sid, .. } = &rec.owner else {
-                return None;
-            };
+            let owner = rec.owner.clone();
             let token = rec.token;
-            let io = inner.sessions.get(sid).map(|e| e.io.clone());
+            let io = match owner {
+                crate::custody::CustodyOwner::Session { sid, .. } => inner.sessions.get(&sid).map(|e| e.io.clone()),
+                _ => None,
+            };
             let (outcome, parts) =
                 Self::claim_custody_for_stop_locked(&mut inner, io.as_ref(), token, cancel, None);
             match outcome {
@@ -1645,8 +1646,8 @@ impl Shared {
     /// 的中止路徑：預開作業已移入 `_active_attach_ops`（`:4852-4854`），`_finish_attach_op` 關閉失敗即回 False 並保留
     /// 作業（`:4322-4332`）。`closed:false` 時告警並經 `retain_unconfirmed_close` 讓該 by_id 持續參與排空判定與阻擋。
     ///
-    /// `custody` 為 handle 自保管帳本認領時的 token（`Preopened::custody`）：確認關閉即結算仍為 `Taken` 的該紀錄（C3；
-    /// 審查 P8-6a679fb-1，不留到下一次成功開埠才被覆寫）。新開的 handle 傳 `None`。
+    /// `custody` 為新開或從保管帳本認領的 handle 對應 token：確認關閉即結算仍為 `Taken` 的該紀錄（C3；審查
+    /// P8-6a679fb-1，不留到下一次成功開埠才被覆寫）。
     fn close_before_bridge(&self, by_id: &str, parts: HandleParts, custody: Option<u64>) -> bool {
         let receipt = parts.close();
         if receipt.closed {
@@ -3621,8 +3622,10 @@ impl Shared {
         }) {
             self.warn(format!("state.json 寫入失敗（rematerialize {sid}）：{e:?}"));
         }
-        {
+        let rekeyed = {
             let mut inner = lock(&self.inner);
+            let inc = inner.custody.current_session_inc(sid);
+            let rekeyed = new_sid == sid || inner.custody.rematerialize_session(sid, &new_sid, inc);
             let entries = std::mem::take(&mut inner.sessions);
             for (k, mut e) in entries {
                 if k == sid {
@@ -3647,6 +3650,10 @@ impl Shared {
                     *v = new_sid.clone();
                 }
             }
+            rekeyed
+        };
+        if !rekeyed {
+            self.warn(format!("W6 actor 保管身分改名失敗（old_sid={sid}、new_sid={new_sid}）"));
         }
         Some(new_sid)
     }
@@ -4046,8 +4053,129 @@ impl OpenCtx {
         Some(endpoint)
     }
 
-    /// `OpenBridge`：stopping gate → `open_exclusive` → IoWorker（交給 session 的預開 handle 一律經帳本紀錄與
-    /// `ClaimCustody` 接手，見 `open_bridge_custody`）。
+    /// 一般 `OpenBridge` 也走共用 by-id 保管閘門：新開埠先登記 `Opening`；同路徑的 parked handle 以原 token 接手。
+    fn register_plain_open(&self, dev: &DevicePath) -> Result<(u64, Option<Preopened>), OpenFailure> {
+        let sid = lock(&self.io.sid).clone();
+        let by_id = lock(&self.io.profile).device_by_id.clone();
+        let mut inner = lock(&self.shared.inner);
+        if inner.stopping {
+            return Err(OpenFailure::Other(PalError::plain(PalErrorKind::Io, "daemon stopping")));
+        }
+        if inner.device_path(&by_id) != Some(dev.0.as_str()) {
+            return Err(OpenFailure::NotFound);
+        }
+        if self.shared.unconfirmed_closes.contains(&by_id) {
+            return Err(OpenFailure::CloseBlocked);
+        }
+        if let Some(rec) = inner.custody.get_custody(&by_id) {
+            let parked = rec.owner == crate::custody::CustodyOwner::Parked
+                && rec.real_path == dev.0
+                && rec.cancel.is_none()
+                && matches!(rec.phase, crate::custody::CustodyPhase::Held { parts: Some(_) });
+            if !parked {
+                return Err(OpenFailure::CloseBlocked);
+            }
+            let token = rec.token;
+            if inner
+                .inflight
+                .get(&by_id)
+                .is_some_and(|op| op.token == token && !op.parked.load(Ordering::SeqCst))
+            {
+                return Err(OpenFailure::CloseBlocked);
+            }
+            let taker = crate::custody::CustodyTaker::OpenJob {
+                sid: sid.clone(),
+                gen: self.inc,
+            };
+            let (claimed_token, parts) = inner
+                .custody
+                .claim_parked(&by_id, &dev.0, taker)
+                .map_err(|_| OpenFailure::CloseBlocked)?;
+            let Some(parts) = parts else {
+                return Err(OpenFailure::CloseBlocked);
+            };
+            if let Some(op) = inner.inflight.get(&by_id).filter(|op| op.token == token) {
+                op.parked.store(false, Ordering::SeqCst);
+            }
+            if inner.inflight.get(&by_id).is_some_and(|op| op.token == token) {
+                inner.inflight.remove(&by_id);
+            }
+            return Ok((claimed_token, Some(Preopened::claimed(dev.0.clone(), parts, claimed_token))));
+        }
+        let token = inner
+            .custody
+            .register(
+                &by_id,
+                &dev.0,
+                crate::custody::CustodyOwner::Session {
+                    sid: sid.clone(),
+                    inc: self.inc,
+                },
+                crate::custody::CustodyTaker::OpenJob {
+                    sid,
+                    gen: self.inc,
+                },
+            )
+            .map_err(|_| OpenFailure::CloseBlocked)?;
+        Ok((token, None))
+    }
+
+    /// 開埠工作尚未取得 handle 就結束時結算 `Opening`；等待中的 release 會收到配對的 NoHandle 終態。
+    fn settle_open_no_handle(&self, by_id: &str, token: u64, control: &Sender<ControlEvent>) {
+        let watchers = {
+            let mut inner = lock(&self.shared.inner);
+            if !inner.custody.get_custody(by_id).is_some_and(|rec| rec.token == token) {
+                return;
+            }
+            let watchers = Shared::take_custody_watchers_locked(&mut inner, by_id, Some(token));
+            inner.custody.settle_close(
+                token,
+                crate::custody::Terminal {
+                    handle: crate::custody::TerminalHandle::NoHandle,
+                    evidence: crate::custody::TerminalEvidence::Complete,
+                },
+            );
+            watchers
+        };
+        self.shared.cv.notify_all();
+        Shared::notify_custody_watchers(&watchers, token, true, None);
+        let _ = control.send(ControlEvent::CustodyTerminal {
+            token,
+            closed: true,
+            error: None,
+        });
+    }
+
+    /// 成功開埠後把 `Opening` 轉為 `Taken`；取消先到時呼叫者關閉 handle 並配對結算。
+    fn mark_open_job_taken(&self, by_id: &str, sid: &str, real_path: &str, token: u64) -> bool {
+        let mut inner = lock(&self.shared.inner);
+        let stopping = inner.stopping;
+        let path_matches = inner.device_path(by_id) == Some(real_path);
+        let Some(rec) = inner.custody.custody.get_mut(by_id).filter(|rec| rec.token == token) else {
+            return false;
+        };
+        if rec.cancel.is_some() || stopping || !path_matches {
+            rec.phase = crate::custody::CustodyPhase::Closing {
+                job: "open-cancelled".into(),
+            };
+            return false;
+        }
+        match rec.phase {
+            crate::custody::CustodyPhase::Opening { .. } => {
+                rec.phase = crate::custody::CustodyPhase::Taken {
+                    taker: crate::custody::CustodyTaker::OpenJob {
+                        sid: sid.to_string(),
+                        gen: self.inc,
+                    },
+                };
+                true
+            }
+            crate::custody::CustodyPhase::Taken { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// `OpenBridge`：一般開埠先登記共用帳本；parked 來源以同 token 接手，之後由 `open_bridge_with` 建立 bridge。
     fn open_bridge(
         &self,
         dev: DevicePath,
@@ -4067,7 +4195,8 @@ impl OpenCtx {
                 hook();
             }
         }
-        self.open_bridge_with(dev, cfg, precheck_holders, control, None)
+        let (token, pre) = self.register_plain_open(&dev)?;
+        self.open_bridge_with(dev, cfg, precheck_holders, control, pre, Some(token))
     }
 
     /// `ClaimCustody`（設計 §3.1.4 W3 → W3′）：開埠工作以 `token` 認領本 session 擁有的帳本紀錄（`Held` → `Taken{OpenJob}`；
@@ -4159,7 +4288,7 @@ impl OpenCtx {
                 hook();
             }
         }
-        self.open_bridge_with(dev, cfg, false, control, Some(pre))
+        self.open_bridge_with(dev, cfg, false, control, Some(pre), Some(token))
     }
 
     /// `Effect::OpenPlaceholderRaw`（設計 §3.1.4 W1 第 3 步）：以預配的 `token` 登記本 session 擁有的 `Opening{PlaceholderOpen}`
@@ -4297,6 +4426,7 @@ impl OpenCtx {
         precheck_holders: bool,
         control: &Sender<ControlEvent>,
         pre: Option<Preopened>,
+        custody_token: Option<u64>,
     ) -> Result<OpenedBridge, OpenFailure> {
         let stopped = || OpenFailure::Other(PalError::plain(PalErrorKind::Io, "daemon stopping"));
         let by_id = lock(&self.io.profile).device_by_id.clone();
@@ -4323,6 +4453,9 @@ impl OpenCtx {
             if let Some(pre) = pre {
                 return Err(close_or_fail(pre.parts, pre.custody, stopped()));
             }
+            if let Some(token) = custody_token {
+                self.settle_open_no_handle(&by_id, token, control);
+            }
             return Err(stopped());
         }
         // wp510 第 13 項：actor 發出 `OpenBridge` 之後 by_id 才登記為未確認關閉（各入口的 actor 端檢查之後）：不開埠，
@@ -4332,10 +4465,14 @@ impl OpenCtx {
             if let Some(pre) = pre {
                 return Err(close_or_fail(pre.parts, pre.custody, OpenFailure::CloseBlocked));
             }
+            if let Some(token) = custody_token {
+                self.settle_open_no_handle(&by_id, token, control);
+            }
             return Err(OpenFailure::CloseBlocked);
         }
-        // 交給正式 bridge 的 handle 若取自帳本認領，記下 token：之後的關閉結算同一紀錄。
-        let mut handle_custody = None;
+        // 新開埠與帳本認領都保留 token：之後 bridge 關閉時結算同一紀錄。
+        let fresh_open = pre.is_none();
+        let handle_custody = custody_token.or_else(|| pre.as_ref().and_then(|pre| pre.custody));
         let handle: Box<dyn SerialHandle> = match pre {
             Some(pre) if pre.real_path == dev.0 => {
                 // Python bridge 啟動時對預開 port 呼叫 `port.configure(self.profile)`：PROBE 以預設設定開啟，
@@ -4347,7 +4484,6 @@ impl OpenCtx {
                         return Err(close_or_fail(pre.parts, pre.custody, OpenFailure::Other(error)));
                     }
                 }
-                handle_custody = pre.custody;
                 Box::new(ReassembledHandle(pre.parts))
             }
             other => {
@@ -4366,15 +4502,41 @@ impl OpenCtx {
                 if precheck_holders {
                     let report = self.shared.uart_excl.probe_holders(&dev.0);
                     if !report.pids.is_empty() {
+                        if fresh_open {
+                            if let Some(token) = custody_token {
+                                self.settle_open_no_handle(&by_id, token, control);
+                            }
+                        }
                         return Err(OpenFailure::Held(report));
                     }
                 }
-                self.shared
-                    .serial
-                    .open_exclusive(&dev, &cfg)
-                    .map_err(open_failure)?
+                match self.shared.serial.open_exclusive(&dev, &cfg) {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        if fresh_open {
+                            if let Some(token) = custody_token {
+                                self.settle_open_no_handle(&by_id, token, control);
+                            }
+                        }
+                        return Err(open_failure(error));
+                    }
+                }
             }
         };
+        if let Some(token) = handle_custody {
+            let sid = lock(&self.io.sid).clone();
+            if !self.mark_open_job_taken(&by_id, &sid, &dev.0, token) {
+                let receipt = HandleParts::split(handle).close();
+                let closed = receipt.closed;
+                self.shared
+                    .finish_custody_close(&by_id, token, receipt, Some(control.clone()));
+                return Err(if closed {
+                    OpenFailure::Cancelled
+                } else {
+                    OpenFailure::CloseUnconfirmed(Box::new(OpenFailure::Cancelled))
+                });
+            }
+        }
         if lock(&self.shared.inner).stopping {
             // open 返回時已進 stopping：不交給 actor（零 TX），立即關閉；未確認關閉同樣保留阻擋。
             return Err(close_or_fail(HandleParts::split(handle), handle_custody, stopped()));
@@ -5864,6 +6026,9 @@ impl SessionManager {
         timeout: Duration,
         request_selector: Option<&str>,
     ) -> Result<PyDict, PyErr> {
+        let release_deadline = matches!(&req, SessionRequest::Release { .. }).then(|| {
+            Instant::now() + Duration::from_millis(crate::resources::DRAIN_TIMEOUT_MS)
+        });
         self.pump();
         let req = match req {
             SessionRequest::DeviceAttach { force } => {
@@ -5885,7 +6050,7 @@ impl SessionManager {
             }
             other => other,
         };
-        let result = self.route_dispatch(sid, req, timeout);
+        let result = self.route_dispatch(sid, req, timeout, release_deadline);
         let gone = match &result {
             Err(error) => error.message == "session actor stopped",
             Ok(reply) => str_of(reply, "error_code").as_deref() == Some("SESSION_NOT_FOUND"),
@@ -5908,9 +6073,15 @@ impl SessionManager {
     /// 取消、別人的 Closing 只加入 watcher），回饋的 token 由 actor 等到終態；首次期限、DRAIN_STALLED 與遲到的收斂都由
     /// actor 的停止待決承擔。manager 不保存期限、快照或完成義務。Python `release_device` 在 RPC 執行緒同步處理
     /// （`origin/main:sw_core/session_manager.py:3095-3219`），Rust 由 actor 串行化同一段流程。
-    fn route_dispatch(&self, sid: &str, req: SessionRequest, timeout: Duration) -> Result<PyDict, PyErr> {
+    fn route_dispatch(
+        &self,
+        sid: &str,
+        req: SessionRequest,
+        timeout: Duration,
+        release_deadline: Option<Instant>,
+    ) -> Result<PyDict, PyErr> {
         let is_release = matches!(req, SessionRequest::Release { .. });
-        let result = self.route_after_release_settle(sid, req, timeout);
+        let result = self.route_after_release_settle(sid, req, timeout, release_deadline);
         if is_release && result.as_ref().is_ok_and(is_ok) {
             // DR-7(k)：release 受理後取消該 session 尚未送達的 DeviceAttached 義務（帳本紀錄由 actor 的停止收尾結算）。
             lock(&self.shared.inner).deliverer.cancel_obligation(sid, None);
@@ -5923,6 +6094,7 @@ impl SessionManager {
         sid: &str,
         req: SessionRequest,
         timeout: Duration,
+        release_deadline: Option<Instant>,
     ) -> Result<PyDict, PyErr> {
         let stopping = lock(&self.shared.inner).stopping;
         match &req {
@@ -5963,10 +6135,9 @@ impl SessionManager {
             self.shared.send_console_scan(sid);
         }
         let result = if is_release {
-            // T-1（設計 §3.1.6；編排者 2026-11-11 SPEC-GAP 2 裁決）：actor 等待 retired drain 或帳本紀錄時，release 於首次
-            // 期限（實時）回 DRAIN_STALLED。首次期限由首次 release 決定並記在被等待的對象上，actor 受理時以
-            // `WaitAck::Release` 告知；期限到仍未回覆即送帶同一身分的 `ReleaseDeadlineElapsed`（actor 時鐘未推進時——
-            // 測試 rig——亦於期限收尾；Python `release_device` 以實時等待作業 `done`，`:3117-3124`、`:3188-3204`）。
+            // T-1：RPC 進入時先算絕對期限，隨 request 傳入 actor，再記在被等待的對象上；actor 受理較晚不會重設期限。
+            // `WaitAck::Release` 告知 RPC 執行緒同一期限，逾時時送 `ReleaseDeadlineElapsed`；Python 在取得 lock 前起算並保存
+            // 首次期限（`origin/main:sw_core/session_manager.py:3084-3086`、`:3122-3124`）。
             let SessionRequest::Release { source, reason } = req else {
                 unreachable!("is_release 已確認");
             };
@@ -5976,6 +6147,7 @@ impl SessionManager {
                         source: source.clone(),
                         reason: reason.clone(),
                         ack,
+                        deadline: release_deadline,
                     },
                     timeout,
                 )?,
@@ -7322,16 +7494,13 @@ impl SessionManager {
             out.push((format!("attach:{by_id}"), wait_attach(&by_id)));
             reported.insert(by_id);
         }
-        // session 擁有、尚未由正式 bridge 接手的帳本紀錄（出生即接管、`AcceptCustody`；Python 作業在
-        // `_active_attach_ops`）：session 的 Shutdown 已讓 actor 以 `ClaimForStop` 收尾；仍可交出者（actor 未收到 Shutdown，
-        // 例如 DETACHED／RELEASED 而未送）由此代為關閉，開埠工作持有或關閉中者等到終態；關閉未確認者由下方末段（在途表的
-        // close_failed 作業）列為 stalled（`origin/main:sw_core/session_manager.py:1175-1190`、`:1218-1239`、
-        // `_finish_attach_op` `:4322-4332`）。
+        // 全帳本排空（不依 owner 篩選）：session 的 Shutdown 已讓 actor 收尾；parked、Reaper Closing 與其他未接手紀錄
+        // 由此關閉或等待配對終態。CloseFailed 永久阻擋並列為未排空（Python shutdown 收集作業並檢查 `done`，
+        // `origin/main:sw_core/session_manager.py:1181-1185`、`:1228-1239`、`_finish_attach_op` `:4322-4332`）。
         let mut custody: Vec<(String, u64)> = lock(&self.shared.inner)
             .custody
             .custody
             .iter()
-            .filter(|(_, rec)| matches!(rec.owner, crate::custody::CustodyOwner::Session { .. }))
             .map(|(by_id, rec)| (by_id.clone(), rec.token))
             .collect();
         custody.sort();
@@ -7345,12 +7514,11 @@ impl SessionManager {
             let settled = {
                 let mut inner = lock(&self.shared.inner);
                 loop {
-                    let pending = inner.custody.get_custody(&by_id).is_some_and(|rec| {
-                        rec.token == token
-                            && !matches!(rec.phase, crate::custody::CustodyPhase::CloseFailed { .. })
-                    });
-                    if !pending {
-                        break true;
+                    let current = inner.custody.get_custody(&by_id).filter(|rec| rec.token == token);
+                    match current.map(|rec| &rec.phase) {
+                        None => break true,
+                        Some(crate::custody::CustodyPhase::CloseFailed { .. }) => break false,
+                        Some(_) => {}
                     }
                     let now = Instant::now();
                     if now >= deadline {

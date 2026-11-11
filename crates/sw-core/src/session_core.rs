@@ -265,7 +265,7 @@ pub enum SessionRequest {
     /// T14 分類：Request（bypass），Open／Pending／Permanent 皆處理；只回覆既有 release waiter，不啟動新工作。
     ///
     /// 編排者 2026-11-11 SPEC-GAP 2 裁決：通知帶被等待對象的身分（release 停止的 `stop_id`）與首次期限 `deadline`
-    /// （actor 受理時以 `WaitAck::Release` 告知 RPC 執行緒）；actor 只結算目前仍在等、身分與期限都相符的那一筆，重複或
+    /// （由 RPC 進入時建立，並以 `WaitAck::Release` 告知 RPC 執行緒）；actor 只結算目前仍在等、身分與期限都相符的那一筆，重複或
     /// 過期的通知不產生效果。actor 自己的期限計時器保留，兩者誰先到都只結算一次（`mark_drain_timeout` 冪等）。
     ReleaseDeadlineElapsed {
         stop_id: StopId,
@@ -282,6 +282,8 @@ pub enum SessionRequest {
         source: String,
         reason: PyValue,
         ack: crossbeam_channel::Sender<crate::mailbox::WaitAck>,
+        /// 從 RPC 進入時刻起算的絕對期限；直接送入 actor 的測試／內部請求可留空。
+        deadline: Option<std::time::Instant>,
     },
     /// 同 `Bind`，另於建立 BindWait 時以 `ack` 回報 `WaitAck::Bind`。manager 的 `session.bind` 一律經此送出。
     BindWithAck {
@@ -603,6 +605,8 @@ pub struct SessionCore {
     custody_opening: bool,
     /// SPEC-GAP 2：目前 release 停止的身分與首次期限（實時，`WaitAck::Release`）。
     release_wait_rt: Option<(StopId, std::time::Instant)>,
+    /// release 的 RPC 期限種子，僅在同步建立等待時供 `ensure_release_wait_rt` 消費。
+    release_deadline_seed: Option<std::time::Instant>,
     /// S2-PAR-wp510r 第 15 項：已發 `ClaimByIdForRelease`、等立即回饋 `ReleaseClaimed` 的 release（回饋先於下一個 mailbox
     /// 事件處理，期間不會有其他請求）。
     release_claim: Option<PendingReleaseClaim>,
@@ -817,6 +821,7 @@ struct PendingReleaseClaim {
     reason: PyValue,
     reply: Reply,
     ack: Option<crossbeam_channel::Sender<crate::mailbox::WaitAck>>,
+    release_deadline: std::time::Instant,
 }
 
 struct PendingRelease {
@@ -962,6 +967,7 @@ impl SessionCore {
             external_offer_pending: false,
             custody_opening: false,
             release_wait_rt: None,
+            release_deadline_seed: None,
             release_claim: None,
             custody_poll_armed: false,
             reattach_pending: false,
@@ -2594,10 +2600,15 @@ impl SessionCore {
             }
             SessionRequest::Submit(req) => self.submit(req, reply, now),
             SessionRequest::Release { source, reason } => {
-                self.release_request_with_ack(source, reason, reply, None, now)
+                self.release_request_with_ack(source, reason, reply, None, None, now)
             }
-            SessionRequest::ReleaseWithAck { source, reason, ack } => {
-                self.release_request_with_ack(source, reason, reply, Some(ack), now)
+            SessionRequest::ReleaseWithAck {
+                source,
+                reason,
+                ack,
+                deadline,
+            } => {
+                self.release_request_with_ack(source, reason, reply, Some(ack), deadline, now)
             }
             SessionRequest::BindWithAck { .. } if self.drain_in_progress() => {
                 vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))]
@@ -2641,6 +2652,7 @@ impl SessionCore {
         reason: PyValue,
         reply: Reply,
         ack: Option<crossbeam_channel::Sender<crate::mailbox::WaitAck>>,
+        deadline: Option<std::time::Instant>,
         now: Mono,
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
@@ -2656,20 +2668,26 @@ impl SessionCore {
             && self.pending_open_stop.is_none()
             && (self.state == SessionState::Released || !self.flash_busy());
         if claims_by_id {
+            let deadline = deadline.unwrap_or_else(|| {
+                std::time::Instant::now()
+                    + std::time::Duration::from_millis(crate::resources::DRAIN_TIMEOUT_MS)
+            });
             self.release_claim = Some(PendingReleaseClaim {
                 source,
                 reason,
                 reply,
                 ack,
+                release_deadline: deadline,
             });
             effects.push(Effect::ClaimByIdForRelease {
                 by_id: self.profile.device_by_id.clone(),
-                release_deadline: std::time::Instant::now()
-                    + std::time::Duration::from_millis(crate::resources::DRAIN_TIMEOUT_MS),
+                release_deadline: deadline,
             });
             return effects;
         }
+        self.release_deadline_seed = deadline;
         effects.extend(self.release_request_inner(source, reason, reply, now));
+        self.release_deadline_seed = None;
         if let Some(ack) = ack {
             self.send_release_ack(&ack);
         }
@@ -2723,7 +2741,9 @@ impl SessionCore {
                 self.publish_retired_drains();
             }
         }
+        self.release_deadline_seed = Some(pending.release_deadline);
         effects.extend(self.release_request_inner(pending.source, pending.reason, pending.reply, now));
+        self.release_deadline_seed = None;
         // T-1：首次期限已過（記在被等待對象上的期限早於本次 release）時立即回 DRAIN_STALLED。
         if let Some((stop_id, deadline)) = self.current_release_stop_id().zip(self.current_release_deadline_rt()) {
             if std::time::Instant::now() >= deadline {
@@ -4613,6 +4633,7 @@ impl SessionCore {
             .iter()
             .filter_map(|entry| entry.release_deadline_rt)
             .min()
+            .or_else(|| self.release_deadline_seed.take())
             .unwrap_or_else(|| {
                 std::time::Instant::now()
                     + std::time::Duration::from_millis(crate::resources::DRAIN_TIMEOUT_MS)

@@ -2957,6 +2957,84 @@ fn dr2_parked_unplugged_closing(
     (m, dev, token, unplug)
 }
 
+/// S2-PAR-wp510r 第 16 項 Medium 2：shutdown 必須把 owner=Reaper 的 CloseFailed 列為未排空。
+#[test]
+fn wp510r_m16_shutdown_reports_reaper_close_failed_custody() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (m, _dev, token, unplug) = dr2_parked_unplugged_closing(true);
+    unplug.join().expect("拔除執行緒不應 panic");
+    let rec = m.mgr.custody_for_test(DR7_BY_ID).expect("Reaper CloseFailed 保留");
+    assert_eq!(rec.token, token);
+    assert_eq!(rec.owner, CustodyOwner::Reaper);
+    assert!(matches!(rec.phase, CustodyPhaseSnapshot::CloseFailed { .. }));
+
+    let drained = m.mgr.shutdown(Duration::from_millis(500));
+
+    assert!(
+        drained.iter().any(|(target, ok)| target == &format!("attach:{DR7_BY_ID}") && !ok),
+        "shutdown 必須回報 Reaper 的失敗紀錄未排空：{drained:?}"
+    );
+}
+
+/// S2-PAR-wp510r 第 16 項 Medium 2：shutdown 須等 owner=Reaper 的 Closing 到期限，並列為未排空。
+#[test]
+fn wp510r_m16_shutdown_waits_for_reaper_closing_custody() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (m, dev, token, unplug) = dr2_parked_unplugged_closing(false);
+    assert!(dev.wait_paused(Duration::from_secs(5)), "前置：Reaper 關閉停在暫停點");
+    let rec = m.mgr.custody_for_test(DR7_BY_ID).expect("Reaper Closing 保留");
+    assert_eq!(rec.token, token);
+    assert_eq!(rec.owner, CustodyOwner::Reaper);
+    assert!(matches!(rec.phase, CustodyPhaseSnapshot::Closing { .. }));
+    let started = Instant::now();
+
+    let drained = m.mgr.shutdown(Duration::from_millis(500));
+    let elapsed = started.elapsed();
+
+    dev.release_pause();
+    unplug.join().expect("拔除執行緒不應 panic");
+    assert!(
+        drained.iter().any(|(target, ok)| target == &format!("attach:{DR7_BY_ID}") && !ok),
+        "shutdown 必須列出仍在 Closing 的 Reaper 紀錄：{drained:?}"
+    );
+    assert!(elapsed >= Duration::from_millis(450), "shutdown 應等到排空期限：{elapsed:?}");
+}
+
+/// S2-PAR-wp510r 第 16 項 Medium 3：W6 rematerialize 後，舊 ExitReclaim 身分仍須回收新 sid 名下的資源。
+#[test]
+fn wp510r_m16_actor_exit_reclaims_rekeyed_w6_custody() {
+    let mut ledger = CustodyLedger::new(UnconfirmedCloses::new());
+    let old_sid = "fallback:COM0";
+    let new_sid = "detected:COM0";
+    let inc = ledger.alloc_session_inc(old_sid);
+    let token = ledger
+        .register(
+            DR7_BY_ID,
+            DR7_REAL,
+            CustodyOwner::Session {
+                sid: old_sid.into(),
+                inc,
+            },
+            CustodyTaker::Worker("w6-rematerialize".into()),
+        )
+        .expect("W6 登記成功");
+    ledger.save_held_mock(token).expect("帳本持有 handle");
+
+    // rematerialize 把 owner 與 actor 目前 sid 一起改名；actor closure 的 ExitReclaim 仍保存舊 sid。
+    assert!(ledger.rematerialize_session(old_sid, new_sid, inc));
+    assert_eq!(ledger.current_session_inc(old_sid), 0);
+    assert_eq!(ledger.current_session_inc(new_sid), inc);
+    assert_eq!(ledger.alloc_session_inc(new_sid), inc + 1, "改名後 sid 的世代不得與舊 actor 碰撞");
+    assert_eq!(ledger.get_custody(DR7_BY_ID).expect("紀錄").owner, CustodyOwner::Session {
+        sid: new_sid.into(),
+        inc,
+    });
+    let jobs = ledger.handle_actor_exited(old_sid, inc);
+
+    assert_eq!(jobs.len(), 1, "舊 actor 身分必須解析到改名後 owner");
+    assert_eq!(jobs[0].token(), token);
+}
+
 /// 線上快照（B3 在線）。
 fn dr2_online(m: &ManagerRig) -> Vec<(String, sw_pal::traits::DeviceInfo)> {
     let mut snapshot = m.snapshot();

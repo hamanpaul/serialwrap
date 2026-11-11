@@ -6773,6 +6773,32 @@ fn wp510_review8_assert_bind_retry_closes_parked_handle(r: &ServiceRig, dev: &Fa
     assert!(!r.mgr.unconfirmed_close_for_test(WP510_PLACEHOLDER_BY_ID));
 }
 
+/// S2-PAR-wp510r 第 16 項 Medium 1：一般 `OpenBridge` 遇到同 real_path 的 parked 記錄時，以同 token 接手，不能重開 UART。
+#[test]
+fn wp510r_m16_device_attach_claims_parked_custody_token() {
+    let r = wp510_b_placeholder_rig();
+    let dev = wp510_review8_double_enospc_bind_setup(&r, false);
+    let parked = r
+        .mgr
+        .custody_for_test(WP510_PLACEHOLDER_BY_ID)
+        .expect("前置：雙 ENOSPC 留下 parked 帳本紀錄");
+    assert!(matches!(parked.owner, sw_core::custody::CustodyOwner::Parked));
+    let token = parked.token;
+    let attempts = dev.open_attempts();
+
+    let attached = r.call("device.attach", r#"{"selector":"COM1"}"#);
+
+    assert_eq!(attached.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&attached));
+    r.wait_state("COM1", "READY");
+    assert_eq!(dev.open_attempts(), attempts, "一般 attach 必須沿用 parked handle");
+    assert_eq!(dev.close_count(), 0, "接手時不得關閉 parked handle");
+    assert!(dev.is_open(), "正式 bridge 接手同一個已開 handle");
+    assert!(
+        r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_none(),
+        "AdoptBridge 確認接手後移除原 token={token}"
+    );
+}
+
 /// 審查 P8-503c341-1：COM1 已 RELEASED（無 bridge）時，連續兩次 ENOSPC 後重試同一 bind。
 #[test]
 fn wp510_review8_rpc_bind_retry_after_double_enospc_closes_parked_handle() {
@@ -10468,12 +10494,10 @@ fn wp510r_r6_rpc_late_release_uses_snapshot_when_first_stall_reply_pending() {
     assert_eq!(dev.close_count(), 1, "parked handle 僅關閉一次");
 }
 
-/// P8-0c50830-1：actor 暫停超過 5 秒（原本首次 release 的 GetState 逾時）時首次 release 不得失去首次期限與完成義務。
-/// 第 15 項改寫（擁有者 2026-11-11「wp510r release 等待改為 actor 主導」）：actor 主導後 release 不再先向 actor 查快照；
-/// actor 暫停期間 release 排在 mailbox，恢復後由 actor 受理、認領別的關閉者正在關閉的 parked 紀錄，並以受理時刻起算首次
-/// 期限（與 DR-1(e2) 相同：首次 ReleaseWait 在 actor 執行該 release 時建立）。結果斷言不變：首次期限到回 DRAIN_STALLED
-/// （完整 session 欄位、原 timeout epoch、RECOVERING）、關閉成功後完成 RELEASED 並落盤、`released_by` 取首次 release 的
-/// `cli`、只關閉一次。Python 依據：`origin/main:sw_core/session_manager.py:3117-3124`、`:3192-3204`、`:4340-4363`。
+/// P8-0c50830-1／wp510r 第 16 項 Medium 4：actor 暫停期間，release 的絕對期限仍從 RPC 進入時起算。
+/// 第 15 項改寫（擁有者 2026-11-11「wp510r release 等待改為 actor 主導」）：actor 暫停時 release 排在 mailbox；恢復後
+/// actor 認領正在關閉的 parked 紀錄，但必須沿用 RPC 進入時攜入的期限。Python 在鎖前起算（`origin/main:sw_core/session_manager.py:3084-3086`）、
+/// 並把首次期限記在等待對象上（`:3122-3124`）。關閉成功後仍完成 RELEASED、落盤、`released_by=cli`，只關閉一次。
 #[test]
 fn wp510r_r6_rpc_snapshot_query_timeout_preserves_late_release_completion() {
     let r = wp510_b_placeholder_rig();
@@ -10487,9 +10511,21 @@ fn wp510r_r6_rpc_snapshot_query_timeout_preserves_late_release_completion() {
     let unplug = wp510r_i15_unplug_parked_paused(&r, &dev);
 
     let (actor_resume, query) = wp510r_i15_hold_com1_actor(&r);
-    let (release_rx, release) = wp510r_i15_spawn_release(&r);
-    // 超過原本 GetState 的 5 秒查詢期限與 release 的 3 秒期限，再讓 actor 恢復。
-    std::thread::sleep(Duration::from_millis(5300));
+    let service = r.svc.clone();
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let release = std::thread::spawn(move || {
+        let entered = Instant::now();
+        let _ = entered_tx.send(entered);
+        let result = service.rpc(
+            "device.release",
+            &sw_proto::pydict! { "selector" => "COM1" },
+        );
+        let _ = release_tx.send(result);
+    });
+    let rpc_entered = entered_rx.recv().expect("取得 RPC 進入時刻");
+    // actor 尚在處理前一筆查詢時，release 已進 RPC；兩秒後恢復，首次期限只剩約一秒。
+    std::thread::sleep(Duration::from_secs(2));
     assert!(release_rx.try_recv().is_err(), "actor 暫停期間 release 不被回覆");
     assert!(
         r.mgr
@@ -10497,18 +10533,18 @@ fn wp510r_r6_rpc_snapshot_query_timeout_preserves_late_release_completion() {
             .is_some_and(|rec| !rec.watchers.contains(&sid)),
         "actor 尚未受理 release"
     );
-    let resumed = Instant::now();
     actor_resume.send(()).expect("恢復 actor");
     assert!(query.join().expect("查詢執行緒不應 panic").is_ok());
-    let release_result = release_rx
-        .recv_timeout(Duration::from_secs(6))
-        .expect("actor 受理後首次 release 於首次期限回覆");
-    let waited = resumed.elapsed();
+    let allowed_deadline = rpc_entered + Duration::from_secs(3) + Duration::from_millis(500);
+    let early_result = release_rx.recv_timeout(allowed_deadline.saturating_duration_since(Instant::now()));
+    let response_at = early_result.as_ref().ok().map(|_| Instant::now());
+    let release_result = match early_result {
+        Ok(result) => result,
+        Err(_) => release_rx
+            .recv_timeout(Duration::from_secs(4))
+            .expect("actor 恢復後 release 最終應回覆"),
+    };
     release.join().expect("首次 release 執行緒不應 panic");
-    assert!(
-        waited >= Duration::from_millis(2900),
-        "T-1：首次期限自 actor 受理 release 時起算：{waited:?}"
-    );
     let stalled = release_result.expect("首次 release 回 DRAIN_STALLED");
     wp510r_i15_assert_full_stall(&stalled, &snapshot, &sid, epoch);
 
@@ -10519,6 +10555,10 @@ fn wp510r_r6_rpc_snapshot_query_timeout_preserves_late_release_completion() {
     let released = r.session("COM1").expect("RELEASED session");
     assert_eq!(s(&released, "released_by"), "cli", "首次 release source 須保留");
     assert_eq!(dev.close_count(), 1, "parked handle 僅關閉一次");
+    assert!(
+        response_at.is_some_and(|at| at <= allowed_deadline),
+        "首次 release 應不晚於 RPC 進入 + 3 s（含 500 ms 排程容差）；RPC 進入={rpc_entered:?}，回覆={response_at:?}"
+    );
 }
 
 /// 審查 P8-990a04b-1（High，HEAD `990a04b3`）：首次 release 的快照查詢因 actor 暫停超過 5 秒而失敗、parked 關閉在暫停中
