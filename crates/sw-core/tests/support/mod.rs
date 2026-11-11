@@ -148,6 +148,11 @@ pub struct CoreHarness {
     pending_state_commits: Vec<(u64, StateDelta)>,
     /// P6 Task 6：console／human TX 效果記錄。
     p6: P6HarnessState,
+    /// S2-PAR-wp510r 第 15 項：下一次 `Effect::ClaimByIdForRelease` 的立即回饋內容（預設空：CoreHarness 沒有 manager 帳本，
+    /// by_id 上沒有其他紀錄或在途作業）。
+    pub next_release_claims: Vec<sw_core::mailbox::ReleaseClaim>,
+    /// 已收到的 `Effect::ClaimByIdForRelease`（by_id、候選首次期限），供斷言 release 的認領。
+    pub release_claim_requests: Vec<(String, Instant)>,
 }
 
 struct HarnessWorkers {
@@ -286,6 +291,8 @@ impl CoreHarness {
             defer_state_commits: false,
             pending_state_commits: Vec::new(),
             p6: P6HarnessState::new(input_epoch_pub),
+            next_release_claims: Vec::new(),
+            release_claim_requests: Vec::new(),
         }
     }
 
@@ -718,6 +725,12 @@ impl CoreHarness {
                         }
                         rest.push(Effect::SettleTx { epoch, op_id });
                     }
+                    Effect::ClaimByIdForRelease { by_id, release_deadline } => {
+                        // executor 的立即回饋：先於下一個 mailbox 事件處理（manager 的 `ManagerExec` 同序）。
+                        self.release_claim_requests.push((by_id.clone(), release_deadline));
+                        let claims = std::mem::take(&mut self.next_release_claims);
+                        pending.push(MailboxItem::Control(ControlEvent::ReleaseClaimed { by_id, claims }));
+                    }
                     other => rest.push(other),
                 }
             }
@@ -1092,7 +1105,10 @@ impl EffectExecutor for RigExec {
                 let _ = tx.send(ControlEvent::DeviceAttached { by_id, real_path });
             }
             // 測試替身無 manager 保管帳本（S2-PAR-wp510r R3 的帳本效果由 ManagerRig／ServiceRig 驗）。
-            Effect::ClaimCustody { .. } | Effect::ClaimForStop { .. } | Effect::ClaimOffered { .. } => {}
+            Effect::ClaimCustody { .. }
+            | Effect::ClaimForStop { .. }
+            | Effect::ClaimOffered { .. }
+            | Effect::ClaimByIdForRelease { .. } => {}
             Effect::Schedule { at, ev } => {
                 // 以 FakeClock 輪詢到期後投遞（測試替身；期限一律依 monotonic）。
                 let clock = self.clock.clone();
@@ -2855,6 +2871,7 @@ fn effect_kind(e: &Effect) -> &'static str {
         Effect::Reattach { .. } => "Reattach",
         Effect::ClaimCustody { .. } => "ClaimCustody",
         Effect::ClaimForStop { .. } => "ClaimForStop",
+        Effect::ClaimByIdForRelease { .. } => "ClaimByIdForRelease",
         Effect::ClaimOffered { .. } => "ClaimOffered",
         Effect::PollCustody { .. } => "PollCustody",
         Effect::PrepareHandoffWorker => "PrepareHandoffWorker",

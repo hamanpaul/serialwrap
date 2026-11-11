@@ -141,6 +141,11 @@ pub enum ControlEvent {
     /// manager 鎖內處理該 token 的帳本紀錄後推入立即回饋佇列，先於下一個 mailbox 事件處理）。`outcome` 為處理結果：
     /// actor 依此決定是否等待該 token 的 `CustodyTerminal`。T14 分類：立即回饋，Open／Pending／Permanent 皆立即處理。
     CustodyClaimed { token: u64, outcome: CustodyClaimOutcome },
+    /// S2-PAR-wp510r 第 15 項（設計 §3.1.4 release、§3.1.6）：`Effect::ClaimByIdForRelease` 的立即回饋。executor 在 manager
+    /// 鎖內處理 `by_id` 上不屬本 session 擁有的在途作業與帳本紀錄後推入立即回饋佇列（先於下一個 mailbox 事件處理）；
+    /// `claims` 為 actor 要等待終態的 token、結果與首次期限（記在被等待的對象上）。T14 分類：立即回饋，Open／Pending／
+    /// Permanent 皆立即處理（資源收尾，不啟動新工作）。
+    ReleaseClaimed { by_id: String, claims: Vec<ReleaseClaim> },
     /// S2-PAR-wp510r R3：session 擁有的帳本紀錄已有關閉終態（關閉工作者或開埠工作在提交點關閉）。`closed:false` 時
     /// 紀錄已轉 CloseFailed 並登記未確認關閉（D1 iii）。T14 分類：生命週期（Open 處理、Pending 延後、Permanent 處理）。
     CustodyTerminal { token: u64, closed: bool, error: Option<String> },
@@ -183,6 +188,17 @@ pub enum RetireOutcome {
     /// 鎖內驗證失敗（stopping、凍結、Entry 已非本 actor、裝置路徑改變、紀錄已取消），未退休。`device` 為裝置改變（Python 判
     /// 「device」，`:3573-3577`）；`closing` 為 handle 已轉 Closing 交關閉工作者（之後送 `CustodyTerminal`）。
     Invalid { device: bool, closing: bool },
+}
+
+/// `ControlEvent::ReleaseClaimed` 的一筆等待（S2-PAR-wp510r 第 15 項）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseClaim {
+    /// 等待身分：帳本紀錄 token，或在途作業收尾的等待 token（同一 token 空間）。
+    pub token: u64,
+    /// `Closing`／`Cancelled`：之後會有該 token 的 `CustodyTerminal`（或由 `CustodyPoll` 補收）；`Failed`：已是失敗終態。
+    pub outcome: CustodyClaimOutcome,
+    /// 首次 release 的絕對期限（實時），記在被等待的對象上，之後的 release 沿用。
+    pub deadline: std::time::Instant,
 }
 
 /// `ControlEvent::CustodyClaimed` 的處理結果。

@@ -7929,7 +7929,7 @@ fn wp510_review4_rpc_release_during_placeholder_open(
 /// wp510 第四次整包審查 Medium 1（RPC）：null 來源與時間的佔位開埠在途時 `device.release`（預設 source=cli）撤銷作業；
 /// handle 安全關閉後 release 回 `already_released`，補齊 `released_by`／`released_at` 並寫入 state.json。Python 對照：
 /// `origin/main:sw_core/session_manager.py:3117-3122`、`:4341-4363`、`:3206-3209`。呼叫路徑：`Service::rpc("device.release")`
-/// → `SessionManager::route_with_selector` → `release_attach_handles`（記錄 source）→ attach worker
+/// → `SessionManager::route_with_selector` → actor 的 release（第 15 項起取代 `release_attach_handles`；記錄 source）→ attach worker
 /// `finish_attach_op` → `SessionRequest::PlaceholderAttachSettled` → `SessionCore::persist_release` → `Effect::Persist`。
 #[test]
 fn wp510_review4_rpc_release_cancel_fills_null_release_metadata_and_persists() {
@@ -9521,7 +9521,7 @@ fn wp510r_r3_rpc_p8_7bb9935_recover_before_bind_device_online_uses_held_handle()
 }
 
 /// S2-PAR-wp510r R4 紅燈 P8-e25b69c-2 的端到端證據（設計 §1.6、§3.1.4 W6）：接線為 `Service::rpc("device.release")` →
-/// `SessionManager::route`（`release_attach_handles` 不再等待 W6 作業）→ `ReleaseWithAck` → actor `begin_stop(Release)` →
+/// `SessionManager::route`（manager 不等待 W6 作業；第 15 項起 release 的等待全由 actor 主導）→ `ReleaseWithAck` → actor `begin_stop(Release)` →
 /// `Effect::ClaimForStop{token}` → executor 在 manager 鎖內對 W6 紀錄（`Opening{Worker}`、owner＝COM0）寫入 cancel＝Release →
 /// RPC 執行緒於首次期限送 `ReleaseDeadlineElapsed` → DRAIN_STALLED。開埠遲到返回後 W6 worker 於檢查點關閉（零 PROBE TX）、
 /// `finish_custody_close` 結算並送 `CustodyTerminal` → actor 完成 RELEASED（released_by＝cli、drain 欄位清空）並落盤。
@@ -10006,8 +10006,9 @@ fn wp510r_r6_parked_release_wait_after_timeout(
 
 /// 審查 P8-add3ca0-1（設計 DR-2 b、D1 ii、T-1）：parked usb-G 綁在 COM1 上（雙 ENOSPC：COM1 已於記憶體改綁、parked 未被
 /// 取走）時拔除 usb-G、關閉暫停；`device.release COM1` 經 `Service::rpc` → `SessionManager::route` →
-/// `release_attach_handles`（`WaitCustodyClose`）等滿首次 3 秒期限回 DRAIN_STALLED。之後放行關閉（closed:true），熱插
-/// 執行緒的 `close_session_preopened` 結算紀錄並把首次 release 交給 COM1（`CompleteStalledRelease`）：不需第二次
+/// actor 的 `ClaimByIdForRelease`（第 15 項起取代 manager 的 `WaitCustodyClose`，登記為該紀錄的 watcher）等滿首次 3 秒期限回
+/// DRAIN_STALLED。之後放行關閉（closed:true），熱插執行緒的 `close_session_preopened` 結算紀錄並以 `CustodyTerminal` 通知
+/// COM1 的 actor，由其保留的停止待決完成首次 release：不需第二次
 /// release 即轉 RELEASED（`released_by` 取首次 release 的 `cli`）、清 `drain_stalled`／`drain_timeout_epoch`、落盤，
 /// usb-G 不重開；之後的 `device.release` 回 already_released（Python `_finish_attach_op` 的 release 分支，
 /// `origin/main:sw_core/session_manager.py:4340-4363`）。
@@ -10066,16 +10067,53 @@ fn wp510r_r6_rpc_p8_add3ca0_1_release_stalled_on_parked_unplug_close_completes_l
     assert_eq!(again.get("already_released"), Some(&PyValue::Bool(true)), "{}", j(&again));
 }
 
-/// 審查 P8-add3ca0-1 的 safety lane 滿載交錯：保留首次 release 的完成義務直到能成功排入 actor。
-#[test]
-fn wp510r_r6_rpc_p8_add3ca0_1_release_late_close_retries_when_safety_lane_full() {
-    let r = wp510_b_placeholder_rig();
-    let dev = wp510_review8_double_enospc_bind_setup(&r, false);
-    let parked = r
+/// 第 15 項（擁有者 2026-11-11「wp510r release 等待改為 actor 主導」）共用：讓 COM1 的 actor 停在一筆無關的
+/// `session.get_state`（H-actor-hold）；回傳 (放行通道, 查詢執行緒)。
+fn wp510r_i15_hold_com1_actor(
+    r: &ServiceRig,
+) -> (
+    crossbeam_channel::Sender<()>,
+    std::thread::JoinHandle<Result<PyDict, sw_proto::pycompat::PyErr>>,
+) {
+    let (actor_paused, actor_resume) = r
         .mgr
-        .custody_for_test(WP510_PLACEHOLDER_BY_ID)
-        .expect("前置：parked 帳本紀錄");
-    let token = parked.token;
+        .pause_next_request_for_test("COM1")
+        .expect("COM1 actor");
+    let query_service = r.svc.clone();
+    let query = std::thread::spawn(move || {
+        query_service.rpc(
+            "session.get_state",
+            &sw_proto::pydict! { "selector" => "COM1" },
+        )
+    });
+    actor_paused
+        .recv_timeout(Duration::from_secs(5))
+        .expect("actor 已停在查詢 dispatch");
+    assert!(!query.is_finished(), "查詢仍卡在暫停的 actor");
+    (actor_resume, query)
+}
+
+/// 第 15 項共用：在背景送 `device.release COM1`，回傳 (結果通道, 執行緒)。
+fn wp510r_i15_spawn_release(
+    r: &ServiceRig,
+) -> (
+    crossbeam_channel::Receiver<Result<PyDict, sw_proto::pycompat::PyErr>>,
+    std::thread::JoinHandle<()>,
+) {
+    let service = r.svc.clone();
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let handle = std::thread::spawn(move || {
+        let result = service.rpc(
+            "device.release",
+            &sw_proto::pydict! { "selector" => "COM1" },
+        );
+        let _ = tx.send(result);
+    });
+    (rx, handle)
+}
+
+/// 第 15 項共用：拔除 usb-G 並讓熱插執行緒停在 parked handle 的關閉。
+fn wp510r_i15_unplug_parked_paused(r: &ServiceRig, dev: &FakeDevice) -> std::thread::JoinHandle<()> {
     let without: Vec<(String, DeviceInfo)> = r
         .mgr
         .list_devices()
@@ -10092,116 +10130,82 @@ fn wp510r_r6_rpc_p8_add3ca0_1_release_late_close_retries_when_safety_lane_full()
     let unplug = std::thread::spawn(move || unplug_mgr.update_devices(&without));
     assert!(
         dev.wait_paused(Duration::from_secs(5)),
-        "拔除的熱插執行緒停在 parked handle 的關閉"
+        "拔除執行緒停在 parked handle 關閉"
     );
+    unplug
+}
 
-    let stalled = r.call("device.release", r#"{"selector":"COM1"}"#);
-    assert_eq!(
-        stalled.get("ok"),
-        Some(&PyValue::Bool(false)),
-        "{}",
-        j(&stalled)
-    );
-    assert_eq!(
-        stalled.get("error_code"),
-        Some(&PyValue::from("DRAIN_STALLED")),
-        "{}",
-        j(&stalled)
-    );
-    assert_eq!(
-        stalled.get("drain_stalled"),
-        Some(&PyValue::Bool(true)),
-        "{}",
-        j(&stalled)
-    );
-    let com1_sid = s(&r.session("COM1").expect("COM1 session"), "session_id").to_string();
-    assert!(
-        !wp510r_r6_state_has_released_sid(&r, &com1_sid),
-        "逾時當下 COM1 未落盤"
-    );
+/// 審查 P8-add3ca0-1 的 lane 滿載交錯。第 15 項改寫（擁有者 2026-11-11「wp510r release 等待改為 actor 主導」；比照
+/// 同日「包內新增 L1 節點改寫」的裁決保留結果斷言）：原本驗 manager 的遲到補送在 safety lane 滿載時保留義務；actor
+/// 主導後，完成義務就是 actor 自己的停止待決，關閉終態以 `CustodyTerminal`（關閉者鎖外 `try_send`）通知，送不進去時
+/// 留在帳本、由 actor 的 `CustodyPoll` 補收（設計 C4）。改驗同類交錯：首次 release 逾時回 DRAIN_STALLED 後 actor 暫停、
+/// control lane 灌滿，期間第二次 release 排入、parked 關閉成功（終態送不進 control lane）；恢復後第二次 release 沿用首次
+/// 期限回 DRAIN_STALLED，終態補收後完成首次 release（RELEASED、清 drain 欄位、落盤），不重開。Python `release_device`
+/// 在 RPC 執行緒同步處理（`origin/main:sw_core/session_manager.py:3095-3219`），逾時後作業才收尾時 `_finish_attach_op`
+/// 完成 release（`:4340-4363`）。
+#[test]
+fn wp510r_r6_rpc_p8_add3ca0_1_release_late_close_retries_when_safety_lane_full() {
+    let r = wp510_b_placeholder_rig();
+    let dev = wp510_review8_double_enospc_bind_setup(&r, false);
+    let (unplug, sid, token) = wp510r_r6_parked_release_wait_after_timeout(&r, &dev);
     let attempts = dev.open_attempts();
 
-    let safety_observer = r
-        .mgr
-        .safety_receiver_for_test("COM1")
-        .expect("COM1 safety lane");
-    wait_until("暫停 actor 前 safety lane 已清空", || {
-        safety_observer.is_empty()
-    });
-    let (actor_paused, actor_resume) = r
-        .mgr
-        .pause_next_request_for_test("COM1")
-        .expect("COM1 actor");
-    let query_service = r.svc.clone();
-    let query = std::thread::spawn(move || {
-        query_service.rpc(
-            "session.get_state",
-            &sw_proto::pydict! { "selector" => "COM1" },
-        )
-    });
-    actor_paused
-        .recv_timeout(Duration::from_secs(5))
-        .expect("actor 已停在查詢 dispatch");
-    assert!(!query.is_finished(), "查詢仍卡在暫停的 actor");
-
-    const SAFETY_CAPACITY: usize = sw_core::resources::MAILBOX_CONTROL_CAP;
-    let duplicate_service = r.svc.clone();
-    let duplicate_release = std::thread::spawn(move || {
-        duplicate_service.rpc(
-            "device.release",
-            &sw_proto::pydict! { "selector" => "COM1" },
-        )
-    });
-    wait_until("重複 release 排入 stalled safety request", || {
-        safety_observer.len() == 1
-    });
-    let remaining = r
-        .mgr
-        .enqueue_stalled_releases_for_test("COM1", 0, SAFETY_CAPACITY - 1)
-        .expect("COM1 actor");
-    assert_eq!(
-        remaining,
-        SAFETY_CAPACITY - 1,
-        "注入同型 stalled release 請求填滿 safety lane"
-    );
-    assert_eq!(
-        safety_observer.len(),
-        SAFETY_CAPACITY,
-        "actor 暫停時 safety lane 恰好滿載"
-    );
+    let (actor_resume, query) = wp510r_i15_hold_com1_actor(&r);
+    let control = r.mgr.actor_control_for_test(&sid).expect("COM1 control lane");
+    let mut filled = 0;
+    while control
+        .try_send(sw_core::mailbox::ControlEvent::ConsoleCountChanged { count: 0 })
+        .is_ok()
+    {
+        filled += 1;
+    }
+    assert!(filled > 0, "actor 暫停時 control lane 灌滿");
+    let (duplicate_rx, duplicate) = wp510r_i15_spawn_release(&r);
 
     dev.release_pause();
-    unplug.join().expect("拔除的熱插執行緒不應 panic");
+    wait_until("關閉回條結算：紀錄移除、終態留在帳本供補收", || {
+        r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_none()
+            && r.mgr.terminal_for_test(token).map(|t| t.handle)
+                == Some(sw_core::custody::TerminalHandle::Closed)
+    });
+    // 關閉者結算後鎖外 `try_send` 的 `CustodyTerminal` 因 control lane 滿而送不進去；熱插執行緒之後的 `DeviceMissing`
+    // 為阻塞送出，要等 actor 恢復才完成，故先恢復 actor 再 join。
     assert!(
-        r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_none(),
-        "關閉回條移除帳本紀錄"
+        duplicate_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "actor 暫停期間 release 不被回覆"
     );
-    wait_until(
-        "遲到 release 確認滿載時投遞失敗並保留義務",
-        || {
-            r.mgr
-                .late_release_full_attempts_for_test(token)
-                .is_some_and(|attempts| attempts > 0)
-        },
-    );
+
     actor_resume.send(()).expect("恢復 actor");
+    unplug.join().expect("拔除的熱插執行緒不應 panic");
     assert!(
         query.join().expect("查詢執行緒不應 panic").is_ok(),
         "actor 查詢正常回覆"
     );
-    let duplicate = duplicate_release
-        .join()
-        .expect("重複 release 執行緒不應 panic")
-        .expect("release 回覆");
+    let duplicate_result = duplicate_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("恢復後第二次 release 回覆")
+        .expect("release RPC");
+    duplicate.join().expect("重複 release 執行緒不應 panic");
     assert_eq!(
-        duplicate.get("error_code"),
+        duplicate_result.get("error_code"),
         Some(&PyValue::from("DRAIN_STALLED")),
         "{}",
-        j(&duplicate)
+        j(&duplicate_result)
     );
+    // 拔除的 `DeviceMissing` 會把無 bridge 的 session 標為 DETACHED（既有 `mark_missing_device`，Python
+    // `_mark_missing_devices_locked`）；終態尚未補收前不得完成 release。
+    assert_ne!(
+        s(&r.session("COM1").expect("COM1 session"), "state"),
+        "RELEASED",
+        "終態送不進 control lane，尚未補收"
+    );
+    assert!(!wp510r_r6_state_has_released_sid(&r, &sid), "補收前不落盤");
 
+    // `CustodyPoll`（500 ms）自帳本補收終態。
+    r.clock.advance(Duration::from_millis(600));
     r.wait_state("COM1", "RELEASED");
     let session = r.session("COM1").expect("COM1 session");
+    assert_eq!(s(&session, "released_by"), "cli", "{}", j(&session));
     assert_eq!(
         session.get("drain_stalled"),
         Some(&PyValue::Bool(false)),
@@ -10215,19 +10219,306 @@ fn wp510r_r6_rpc_p8_add3ca0_1_release_late_close_retries_when_safety_lane_full()
         j(&session)
     );
     wait_until("滿載後遲到完成的 RELEASED 落盤", || {
-        wp510r_r6_state_has_released_sid(&r, &com1_sid)
+        wp510r_r6_state_has_released_sid(&r, &sid)
     });
     assert_eq!(dev.close_count(), 1, "parked handle 只關閉一次");
     assert!(
         r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_none(),
         "回條後紀錄移除"
     );
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(dev.open_attempts(), attempts, "release 完成後不自動重開");
+}
+
+/// P8-2c5eb6b-2：遲到的 release 完成不得作用在改綁之後的新綁定。第 15 項改寫（擁有者 2026-11-11「wp510r release 等待
+/// 改為 actor 主導」）：manager 的遲到送達者及其暫停點已刪除，改為 actor 模型下可達的交錯：首次 release 逾時回
+/// DRAIN_STALLED 後 actor 暫停，期間 parked 關閉成功（終態排入 actor）、`session.bind` 改綁排在其後；actor 恢復後依序先
+/// 以終態完成首次 release（RELEASED），再由 bind 改綁到新 by_id（解除 released、DETACHED）。舊 release 的完成不得作用在
+/// 新綁定上：之後不再有遲到收尾把新綁定轉 RELEASED，state.json 也沒有該 session 的 released 列。Python release 與 bind
+/// 在 manager lock 內依序處理（`origin/main:sw_core/session_manager.py:3095-3219`、`:3664-3812`）。
+#[test]
+fn wp510r_r6_rpc_late_release_snapshot_is_invalidated_by_bind() {
+    let r = wp510_b_placeholder_rig();
+    let dev = wp510_review8_double_enospc_bind_setup(&r, false);
+    let (unplug, sid, token) = wp510r_r6_parked_release_wait_after_timeout(&r, &dev);
+    let (actor_resume, query) = wp510r_i15_hold_com1_actor(&r);
+
+    dev.release_pause();
+    unplug.join().expect("拔除執行緒不應 panic");
+    let rebound = "/s/by-id/wp510r-r6-rebound";
+    let bind_service = r.svc.clone();
+    let bind = std::thread::spawn(move || {
+        bind_service.rpc(
+            "session.bind",
+            &sw_proto::pydict! { "selector" => "COM1", "device_by_id" => rebound },
+        )
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!bind.is_finished(), "actor 暫停期間 bind 不被回覆");
+
+    actor_resume.send(()).expect("恢復 actor");
+    assert!(query.join().expect("查詢執行緒不應 panic").is_ok());
+    let bound = bind
+        .join()
+        .expect("bind 執行緒不應 panic")
+        .expect("bind RPC");
+    assert_eq!(bound.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&bound));
+    assert_eq!(
+        s(&r.session("COM1").expect("COM1 session"), "device_by_id"),
+        rebound
+    );
+    // 給任何遲到收尾（含 `CustodyPoll`）機會作用。
+    r.clock.advance(Duration::from_millis(600));
+    std::thread::sleep(Duration::from_millis(300));
+    let session = r.session("COM1").expect("改綁後的 session");
+    assert_eq!(
+        s(&session, "state"),
+        "DETACHED",
+        "舊 release 不得釋放新綁定：{}",
+        j(&session)
+    );
+    assert!(
+        !wp510r_r6_state_has_released_sid(&r, &sid),
+        "改綁後不得留下 released 列"
+    );
+    assert_eq!(dev.close_count(), 1, "parked handle 僅關閉一次");
+    assert!(r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_none());
     assert_eq!(
         r.mgr.terminal_for_test(token).map(|t| t.handle),
         Some(sw_core::custody::TerminalHandle::Closed)
     );
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(dev.open_attempts(), attempts, "release 完成後不自動重開");
+}
+
+/// P8-2c5eb6b-3：較晚的 release 共用首次絕對期限。第 15 項改寫（擁有者 2026-11-11「wp510r release 等待改為 actor
+/// 主導」）：原本驗 lane 滿載時 manager 立即代答；actor 主導後 release 的回覆由 actor 依自己的狀態組成，actor 暫停期間
+/// 不回覆（RPC 以既有逾時處理）。改驗：首次 release 逾時回 DRAIN_STALLED 後 actor 暫停，期間 parked 關閉成功、第二次
+/// release 排入；恢復後第二次 release 不重新起算自己的 3 秒，立即沿用首次期限回 DRAIN_STALLED，之後終態完成首次 release
+/// 並落盤。Python 依據：首次期限記在作業上、之後的 release 沿用（`origin/main:sw_core/session_manager.py:3117-3124`、
+/// `:3192-3204`），逾時後作業才收尾時完成 release（`:4340-4363`）。
+#[test]
+fn wp510r_r6_rpc_late_release_retry_wait_uses_first_deadline() {
+    let r = wp510_b_placeholder_rig();
+    let dev = wp510_review8_double_enospc_bind_setup(&r, false);
+    let (unplug, sid, _token) = wp510r_r6_parked_release_wait_after_timeout(&r, &dev);
+    let (actor_resume, query) = wp510r_i15_hold_com1_actor(&r);
+
+    dev.release_pause();
+    unplug.join().expect("拔除執行緒不應 panic");
+    let (duplicate_rx, duplicate) = wp510r_i15_spawn_release(&r);
+    assert!(
+        duplicate_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "actor 暫停期間 release 不被回覆"
+    );
+    let resumed = Instant::now();
+    actor_resume.send(()).expect("恢復 actor");
+    assert!(
+        query.join().expect("查詢執行緒不應 panic").is_ok(),
+        "查詢正常回覆"
+    );
+    let duplicate_result = duplicate_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("恢復後 release RPC 應完成")
+        .expect("release RPC");
+    let waited = resumed.elapsed();
+    duplicate.join().expect("第二次 release 執行緒不應 panic");
+    assert!(
+        waited < Duration::from_millis(1000),
+        "首次期限已過，第二次 release 不得重新等待自己的 3 秒：{waited:?}"
+    );
+    assert_eq!(
+        duplicate_result.get("error_code"),
+        Some(&PyValue::from("DRAIN_STALLED")),
+        "沿用首次期限回 stalled：{}",
+        j(&duplicate_result)
+    );
+
+    r.wait_state("COM1", "RELEASED");
+    let session = r.session("COM1").expect("COM1 session");
+    assert_eq!(
+        session.get("drain_stalled"),
+        Some(&PyValue::Bool(false)),
+        "{}",
+        j(&session)
+    );
+    wait_until("背景義務完成並落盤", || {
+        wp510r_r6_state_has_released_sid(&r, &sid)
+    });
+}
+
+/// 第 15 項共用：STALL 回應的完整形狀（頂層欄位順序與正常 STALL 回應相同、session 欄位順序與完整快照相同、原 timeout
+/// epoch、RECOVERING）。
+fn wp510r_i15_assert_full_stall(result: &PyDict, snapshot: &PyDict, sid: &str, epoch: i64) {
+    assert_eq!(
+        result.get("error_code"),
+        Some(&PyValue::from("DRAIN_STALLED")),
+        "{}",
+        j(result)
+    );
+    assert_eq!(
+        result.get("drain_timeout_epoch"),
+        Some(&PyValue::from(epoch)),
+        "沿用原 timeout epoch：{}",
+        j(result)
+    );
+    let stalled_session = sub(result, "session");
+    assert_eq!(s(&stalled_session, "session_id"), sid);
+    assert_eq!(s(&stalled_session, "device_by_id"), WP510_PLACEHOLDER_BY_ID);
+    assert_eq!(s(&stalled_session, "state"), "RECOVERING");
+    assert_eq!(
+        stalled_session.get("drain_stalled"),
+        Some(&PyValue::Bool(true))
+    );
+    assert_eq!(
+        stalled_session.get("drain_timeout_epoch"),
+        Some(&PyValue::from(epoch))
+    );
+    let shape = |keys: Vec<&str>| PyValue::List(keys.into_iter().map(PyValue::from).collect());
+    let normal_stall_response_shape = PyValue::List(
+        [
+            "ok",
+            "error_code",
+            "drain_stalled",
+            "drain_timeout_epoch",
+            "session",
+            "version",
+        ]
+        .into_iter()
+        .map(PyValue::from)
+        .collect(),
+    );
+    assert_eq!(
+        jv(&shape(keys(result))),
+        jv(&normal_stall_response_shape),
+        "頂層欄位順序須與正常 STALL 回應逐位元組同形：{}",
+        j(result)
+    );
+    assert_eq!(
+        jv(&shape(keys(&stalled_session))),
+        jv(&shape(keys(snapshot))),
+        "session 欄位及順序須與完整 session 快照逐位元組同形：{}",
+        j(result)
+    );
+}
+
+/// P8-6ca9bc8-1：首次 release 等待 parked 關閉期間 actor 暫停、首次期限在暫停中到期、關閉成功、第二次 release 排入。
+/// 第 15 項改寫（擁有者 2026-11-11「wp510r release 等待改為 actor 主導」）：原本驗 manager 以首次等待前保存的快照代答；
+/// actor 主導後回覆一律由 actor 依自己的狀態組成，不需另外的快照，actor 暫停期間兩個 release 都不被回覆（RPC 以既有逾時
+/// 處理）。恢復後：首次 release 由期限通知回 DRAIN_STALLED，第二次 release 沿用首次期限立即回 DRAIN_STALLED，帶完整
+/// session 欄位（與正常 STALL 回應逐位元組同形）與原 timeout epoch；之後終態完成首次 release 並落盤。Python release 在
+/// RPC 執行緒同步處理（`origin/main:sw_core/session_manager.py:3095-3219`），首次期限記在作業上（`:3117-3124`）。
+#[test]
+fn wp510r_r6_rpc_late_release_uses_snapshot_when_first_stall_reply_pending() {
+    let r = wp510_b_placeholder_rig();
+    let dev = wp510_review8_double_enospc_bind_setup(&r, false);
+    let snapshot = r.session("COM1").expect("COM1 完整 session 快照");
+    let sid = s(&snapshot, "session_id").to_string();
+    let epoch = snapshot
+        .get("bridge_generation")
+        .and_then(PyValue::as_i64)
+        .expect("原 timeout epoch");
+    let unplug = wp510r_i15_unplug_parked_paused(&r, &dev);
+
+    let (first_rx, first_release) = wp510r_i15_spawn_release(&r);
+    wait_until("首次 release 已由 actor 認領、登記為 watcher", || {
+        r.mgr
+            .custody_for_test(WP510_PLACEHOLDER_BY_ID)
+            .is_some_and(|rec| rec.watchers.contains(&sid))
+    });
+    assert!(first_rx.try_recv().is_err(), "首次 release 仍在等待 parked close");
+    let safety_observer = r
+        .mgr
+        .safety_receiver_for_test("COM1")
+        .expect("COM1 safety lane");
+    wait_until("暫停 actor 前 safety lane 已清空", || safety_observer.is_empty());
+    let (actor_resume, query) = wp510r_i15_hold_com1_actor(&r);
+    wait_until("首次期限到期，期限通知已排入 safety lane", || {
+        safety_observer.len() == 1
+    });
+
+    dev.release_pause();
+    unplug.join().expect("拔除執行緒不應 panic");
+    assert!(r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_none());
+    let (duplicate_rx, duplicate_release) = wp510r_i15_spawn_release(&r);
+    wait_until("第二次 release 已排入 safety lane", || safety_observer.len() == 2);
+    assert!(first_rx.try_recv().is_err(), "actor 暫停期間首次 release 不被回覆");
+    assert!(
+        duplicate_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "actor 暫停期間 manager 不代答第二次 release"
+    );
+
+    actor_resume.send(()).expect("恢復 actor");
+    assert!(query.join().expect("查詢執行緒不應 panic").is_ok(), "actor 查詢在恢復後正常完成");
+    let first_result = first_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("首次 release 在 actor 恢復後取得回覆")
+        .expect("首次 release RPC");
+    first_release.join().expect("首次 release 執行緒不應 panic");
+    wp510r_i15_assert_full_stall(&first_result, &snapshot, &sid, epoch);
+    let duplicate_result = duplicate_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("期限已過的第二次 release 應完成")
+        .expect("第二次 release RPC");
+    duplicate_release
+        .join()
+        .expect("第二次 release 執行緒不應 panic");
+    wp510r_i15_assert_full_stall(&duplicate_result, &snapshot, &sid, epoch);
+
+    r.wait_state("COM1", "RELEASED");
+    wait_until("完成義務落盤", || wp510r_r6_state_has_released_sid(&r, &sid));
+    assert_eq!(dev.close_count(), 1, "parked handle 僅關閉一次");
+}
+
+/// P8-0c50830-1：actor 暫停超過 5 秒（原本首次 release 的 GetState 逾時）時首次 release 不得失去首次期限與完成義務。
+/// 第 15 項改寫（擁有者 2026-11-11「wp510r release 等待改為 actor 主導」）：actor 主導後 release 不再先向 actor 查快照；
+/// actor 暫停期間 release 排在 mailbox，恢復後由 actor 受理、認領別的關閉者正在關閉的 parked 紀錄，並以受理時刻起算首次
+/// 期限（與 DR-1(e2) 相同：首次 ReleaseWait 在 actor 執行該 release 時建立）。結果斷言不變：首次期限到回 DRAIN_STALLED
+/// （完整 session 欄位、原 timeout epoch、RECOVERING）、關閉成功後完成 RELEASED 並落盤、`released_by` 取首次 release 的
+/// `cli`、只關閉一次。Python 依據：`origin/main:sw_core/session_manager.py:3117-3124`、`:3192-3204`、`:4340-4363`。
+#[test]
+fn wp510r_r6_rpc_snapshot_query_timeout_preserves_late_release_completion() {
+    let r = wp510_b_placeholder_rig();
+    let dev = wp510_review8_double_enospc_bind_setup(&r, false);
+    let snapshot = r.session("COM1").expect("COM1 完整 session 快照");
+    let sid = s(&snapshot, "session_id").to_string();
+    let epoch = snapshot
+        .get("bridge_generation")
+        .and_then(PyValue::as_i64)
+        .expect("原 timeout epoch");
+    let unplug = wp510r_i15_unplug_parked_paused(&r, &dev);
+
+    let (actor_resume, query) = wp510r_i15_hold_com1_actor(&r);
+    let (release_rx, release) = wp510r_i15_spawn_release(&r);
+    // 超過原本 GetState 的 5 秒查詢期限與 release 的 3 秒期限，再讓 actor 恢復。
+    std::thread::sleep(Duration::from_millis(5300));
+    assert!(release_rx.try_recv().is_err(), "actor 暫停期間 release 不被回覆");
+    assert!(
+        r.mgr
+            .custody_for_test(WP510_PLACEHOLDER_BY_ID)
+            .is_some_and(|rec| !rec.watchers.contains(&sid)),
+        "actor 尚未受理 release"
+    );
+    let resumed = Instant::now();
+    actor_resume.send(()).expect("恢復 actor");
+    assert!(query.join().expect("查詢執行緒不應 panic").is_ok());
+    let release_result = release_rx
+        .recv_timeout(Duration::from_secs(6))
+        .expect("actor 受理後首次 release 於首次期限回覆");
+    let waited = resumed.elapsed();
+    release.join().expect("首次 release 執行緒不應 panic");
+    assert!(
+        waited >= Duration::from_millis(2900),
+        "T-1：首次期限自 actor 受理 release 時起算：{waited:?}"
+    );
+    let stalled = release_result.expect("首次 release 回 DRAIN_STALLED");
+    wp510r_i15_assert_full_stall(&stalled, &snapshot, &sid, epoch);
+
+    dev.release_pause();
+    unplug.join().expect("拔除執行緒不應 panic");
+    r.wait_state("COM1", "RELEASED");
+    wait_until("晚到 release 已落盤", || wp510r_r6_state_has_released_sid(&r, &sid));
+    let released = r.session("COM1").expect("RELEASED session");
+    assert_eq!(s(&released, "released_by"), "cli", "首次 release source 須保留");
+    assert_eq!(dev.close_count(), 1, "parked handle 僅關閉一次");
 }
 
 /// P8-2c5eb6b-1：release 首次期限到期後才進入 Permanent，晚到成功回條仍完成既有 release。
@@ -10268,469 +10559,4 @@ fn wp510r_r6_rpc_late_release_completion_survives_shutdown_freeze() {
         r.mgr.terminal_for_test(token).map(|t| t.handle),
         Some(sw_core::custody::TerminalHandle::Closed)
     );
-}
-
-/// P8-2c5eb6b-2：送達者取得舊 release 快照後完成改綁；actor 必須依 by-id 與 bind 世代丟棄舊事件。
-#[test]
-fn wp510r_r6_rpc_late_release_snapshot_is_invalidated_by_bind() {
-    let r = wp510_b_placeholder_rig();
-    let dev = wp510_review8_double_enospc_bind_setup(&r, false);
-    let (unplug, sid, token) = wp510r_r6_parked_release_wait_after_timeout(&r, &dev);
-    let (delivery_paused, delivery_resume) = r.mgr.pause_next_late_release_delivery_for_test();
-
-    dev.release_pause();
-    unplug.join().expect("拔除執行緒不應 panic");
-    delivery_paused
-        .recv_timeout(Duration::from_secs(5))
-        .expect("送達者已鎖外取得舊 release 快照並暫停");
-
-    let rebound = "/s/by-id/wp510r-r6-rebound";
-    let bound = r.call(
-        "session.bind",
-        &format!(r#"{{"selector":"COM1","device_by_id":"{rebound}"}}"#),
-    );
-    assert_eq!(bound.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&bound));
-    assert_eq!(
-        s(&r.session("COM1").expect("COM1 session"), "device_by_id"),
-        rebound
-    );
-
-    delivery_resume.send(()).expect("恢復 late release 送達者");
-    wait_until("舊 token 義務因改綁失效", || {
-        r.mgr.late_release_full_attempts_for_test(token).is_none()
-    });
-    let session = r.session("COM1").expect("改綁後的 session");
-    assert_eq!(
-        s(&session, "state"),
-        "DETACHED",
-        "舊 release 不得釋放新綁定：{}",
-        j(&session)
-    );
-    assert!(
-        !wp510r_r6_state_has_released_sid(&r, &sid),
-        "舊 release 不得落盤"
-    );
-    assert_eq!(dev.close_count(), 1, "parked handle 僅關閉一次");
-}
-
-/// P8-2c5eb6b-3：較晚的 release 共用首次絕對期限；lane 滿載時立即回 DRAIN_STALLED，背景義務仍重試。
-#[test]
-fn wp510r_r6_rpc_late_release_retry_wait_uses_first_deadline() {
-    let r = wp510_b_placeholder_rig();
-    let dev = wp510_review8_double_enospc_bind_setup(&r, false);
-    let (unplug, sid, token) = wp510r_r6_parked_release_wait_after_timeout(&r, &dev);
-    let safety_observer = r
-        .mgr
-        .safety_receiver_for_test("COM1")
-        .expect("COM1 safety lane");
-    wait_until("首次 release safety lane 清空", || {
-        safety_observer.is_empty()
-    });
-    let (actor_paused, actor_resume) = r
-        .mgr
-        .pause_next_request_for_test("COM1")
-        .expect("COM1 actor");
-    let query_service = r.svc.clone();
-    let query = std::thread::spawn(move || {
-        query_service.rpc(
-            "session.get_state",
-            &sw_proto::pydict! { "selector" => "COM1" },
-        )
-    });
-    actor_paused
-        .recv_timeout(Duration::from_secs(5))
-        .expect("actor 已停在查詢 dispatch");
-    const SAFETY_CAPACITY: usize = sw_core::resources::MAILBOX_CONTROL_CAP;
-    assert_eq!(
-        r.mgr
-            .enqueue_stalled_releases_for_test("COM1", 0, SAFETY_CAPACITY),
-        Some(SAFETY_CAPACITY),
-        "填滿 safety lane"
-    );
-
-    dev.release_pause();
-    unplug.join().expect("拔除執行緒不應 panic");
-    wait_until("晚到 release 送達碰到滿載", || {
-        r.mgr
-            .late_release_full_attempts_for_test(token)
-            .is_some_and(|attempts| attempts > 0)
-    });
-
-    let duplicate_service = r.svc.clone();
-    let (duplicate_tx, duplicate_rx) = crossbeam_channel::bounded(1);
-    let duplicate = std::thread::spawn(move || {
-        let result = duplicate_service.rpc(
-            "device.release",
-            &sw_proto::pydict! { "selector" => "COM1" },
-        );
-        let _ = duplicate_tx.send(result);
-    });
-    let before_resume = duplicate_rx.recv_timeout(Duration::from_millis(500)).ok();
-    let returned_before_resume = before_resume.is_some();
-
-    actor_resume.send(()).expect("恢復 actor");
-    assert!(
-        query.join().expect("查詢執行緒不應 panic").is_ok(),
-        "查詢正常回覆"
-    );
-    let duplicate_result = before_resume.unwrap_or_else(|| {
-        duplicate_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("lane 恢復後 release RPC 應完成")
-    });
-    let duplicate_result = duplicate_result.expect("release RPC");
-    duplicate.join().expect("第二次 release 執行緒不應 panic");
-    assert!(
-        returned_before_resume,
-        "首次期限已過，第二次 release 不得等待 lane 解塞"
-    );
-    assert_eq!(
-        duplicate_result.get("error_code"),
-        Some(&PyValue::from("DRAIN_STALLED")),
-        "沿用首次期限回 stalled：{}",
-        j(&duplicate_result)
-    );
-
-    r.wait_state("COM1", "RELEASED");
-    let session = r.session("COM1").expect("COM1 session");
-    assert_eq!(
-        session.get("drain_stalled"),
-        Some(&PyValue::Bool(false)),
-        "{}",
-        j(&session)
-    );
-    wait_until("背景義務完成並落盤", || {
-        wp510r_r6_state_has_released_sid(&r, &sid)
-    });
-}
-
-/// P8-6ca9bc8-1：首次期限已標 stalled、回覆仍卡在 actor 且晚到完成因 safety lane 滿載重試時，第二次 release
-/// 只用首次等待前的 session 快照回覆，不等待 actor，也保留完整公開欄位與原 timeout epoch。
-#[test]
-fn wp510r_r6_rpc_late_release_uses_snapshot_when_first_stall_reply_pending() {
-    let r = wp510_b_placeholder_rig();
-    let dev = wp510_review8_double_enospc_bind_setup(&r, false);
-    let snapshot = r.session("COM1").expect("COM1 完整 session 快照");
-    let sid = s(&snapshot, "session_id").to_string();
-    let epoch = snapshot
-        .get("bridge_generation")
-        .and_then(PyValue::as_i64)
-        .expect("原 timeout epoch");
-    let token = r
-        .mgr
-        .custody_for_test(WP510_PLACEHOLDER_BY_ID)
-        .expect("前置：parked 帳本紀錄")
-        .token;
-    let without: Vec<(String, DeviceInfo)> = r
-        .mgr
-        .list_devices()
-        .into_iter()
-        .filter_map(|row| {
-            let by_id = s(&row, "by_id").to_string();
-            let real_path = s(&row, "real_path").to_string();
-            (by_id != WP510_PLACEHOLDER_BY_ID)
-                .then(|| (by_id.clone(), DeviceInfo { by_id, real_path }))
-        })
-        .collect();
-
-    dev.pause_next_close();
-    let unplug_mgr = r.mgr.clone();
-    let unplug = std::thread::spawn(move || unplug_mgr.update_devices(&without));
-    assert!(
-        dev.wait_paused(Duration::from_secs(5)),
-        "拔除執行緒停在 parked handle 關閉"
-    );
-
-    let first_service = r.svc.clone();
-    let (first_tx, first_rx) = crossbeam_channel::bounded(1);
-    let first_release = std::thread::spawn(move || {
-        let result = first_service.rpc(
-            "device.release",
-            &sw_proto::pydict! { "selector" => "COM1" },
-        );
-        let _ = first_tx.send(result);
-    });
-    // 首次 release 先保存完整 snapshot 與 epoch，接著於首次期限等 parked close。
-    wait_until("首次 release 已保存完整 snapshot 與 epoch", || {
-        r.mgr.custody_release_snapshot_ready_for_test(token)
-    });
-    assert!(first_rx.try_recv().is_err(), "首次 release 仍在等待 parked close");
-
-    let safety_observer = r
-        .mgr
-        .safety_receiver_for_test("COM1")
-        .expect("COM1 safety lane");
-    wait_until("暫停 actor 前 safety lane 已清空", || safety_observer.is_empty());
-    let (actor_paused, actor_resume) = r
-        .mgr
-        .pause_next_request_for_test("COM1")
-        .expect("COM1 actor");
-    let query_service = r.svc.clone();
-    let query = std::thread::spawn(move || {
-        query_service.rpc(
-            "session.get_state",
-            &sw_proto::pydict! { "selector" => "COM1" },
-        )
-    });
-    actor_paused
-        .recv_timeout(Duration::from_secs(5))
-        .expect("actor 已停在查詢 dispatch");
-    assert!(!query.is_finished(), "查詢仍卡在暫停的 actor");
-
-    const SAFETY_CAPACITY: usize = sw_core::resources::MAILBOX_CONTROL_CAP;
-    assert_eq!(
-        r.mgr
-            .enqueue_stalled_releases_for_test("COM1", 0, SAFETY_CAPACITY - 1),
-        Some(SAFETY_CAPACITY - 1),
-        "先填滿 safety lane 到只剩首次 stalled request 的位置"
-    );
-    wait_until("首次期限已將 MarkAttachStalled 排入 safety lane", || {
-        safety_observer.len() == SAFETY_CAPACITY
-    });
-    assert!(
-        !first_release.is_finished(),
-        "MarkAttachStalled 已入列但 actor 尚未回覆首次 release"
-    );
-
-    dev.release_pause();
-    unplug.join().expect("拔除執行緒不應 panic");
-    assert!(r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_none());
-    wait_until("完成義務遇到滿載並保留重試", || {
-        r.mgr
-            .late_release_full_attempts_for_test(token)
-            .is_some_and(|attempts| attempts > 0)
-    });
-
-    let duplicate_service = r.svc.clone();
-    let (duplicate_tx, duplicate_rx) = crossbeam_channel::bounded(1);
-    let duplicate_release = std::thread::spawn(move || {
-        let result = duplicate_service.rpc(
-            "device.release",
-            &sw_proto::pydict! { "selector" => "COM1" },
-        );
-        let _ = duplicate_tx.send(result);
-    });
-    let before_resume = duplicate_rx.recv_timeout(Duration::from_millis(500)).ok();
-    let returned_before_resume = before_resume.is_some();
-    let duplicate_result = before_resume.unwrap_or_else(|| {
-        duplicate_rx
-            .recv_timeout(Duration::from_secs(6))
-            .expect("期限已過的第二次 release 應完成")
-    });
-
-    actor_resume.send(()).expect("恢復 actor");
-    let query_result = query.join().expect("查詢執行緒不應 panic");
-    let first_result = first_rx.recv_timeout(Duration::from_secs(5)).ok();
-    first_release.join().expect("首次 release 執行緒不應 panic");
-    let duplicate_result = duplicate_result.expect("第二次 release RPC");
-    duplicate_release
-        .join()
-        .expect("第二次 release 執行緒不應 panic");
-
-    assert!(
-        returned_before_resume,
-        "首次期限已過時第二次 release 必須在 actor 恢復前立即回覆：{}",
-        j(&duplicate_result)
-    );
-    assert!(query_result.is_ok(), "actor 查詢在恢復後正常完成");
-    assert!(
-        first_result.is_some_and(|result| result.is_ok()),
-        "首次 MarkAttachStalled 在 actor 恢復後取得回覆"
-    );
-    assert_eq!(
-        duplicate_result.get("error_code"),
-        Some(&PyValue::from("DRAIN_STALLED")),
-        "{}",
-        j(&duplicate_result)
-    );
-    assert_eq!(
-        duplicate_result.get("drain_timeout_epoch"),
-        Some(&PyValue::from(epoch)),
-        "沿用首次 timeout epoch：{}",
-        j(&duplicate_result)
-    );
-    let stalled_session = sub(&duplicate_result, "session");
-    assert_eq!(s(&stalled_session, "session_id"), sid);
-    assert_eq!(s(&stalled_session, "device_by_id"), WP510_PLACEHOLDER_BY_ID);
-    assert_eq!(s(&stalled_session, "state"), "RECOVERING");
-    assert_eq!(
-        stalled_session.get("drain_stalled"),
-        Some(&PyValue::Bool(true))
-    );
-    assert_eq!(
-        stalled_session.get("drain_timeout_epoch"),
-        Some(&PyValue::from(epoch))
-    );
-    let actual_response_shape = PyValue::List(
-        keys(&duplicate_result)
-            .into_iter()
-            .map(PyValue::from)
-            .collect(),
-    );
-    let normal_stall_response_shape = PyValue::List(
-        [
-            "ok",
-            "error_code",
-            "drain_stalled",
-            "drain_timeout_epoch",
-            "session",
-            "version",
-        ]
-        .into_iter()
-        .map(PyValue::from)
-        .collect(),
-    );
-    assert_eq!(
-        jv(&actual_response_shape),
-        jv(&normal_stall_response_shape),
-        "頂層欄位順序須與正常 STALL 回應逐位元組同形：{}",
-        j(&duplicate_result)
-    );
-    let actual_shape = PyValue::List(
-        keys(&stalled_session)
-            .into_iter()
-            .map(PyValue::from)
-            .collect(),
-    );
-    let normal_stall_shape = PyValue::List(
-        keys(&snapshot)
-            .into_iter()
-            .map(PyValue::from)
-            .collect(),
-    );
-    assert_eq!(
-        jv(&actual_shape),
-        jv(&normal_stall_shape),
-        "session 欄位及順序須與完整正常 STALL snapshot 逐位元組同形：{}",
-        j(&duplicate_result)
-    );
-
-    r.wait_state("COM1", "RELEASED");
-    wait_until("背景完成義務成功送達並落盤", || {
-        wp510r_r6_state_has_released_sid(&r, &sid)
-    });
-    assert_eq!(dev.close_count(), 1, "parked handle 僅關閉一次");
-}
-
-/// P8-0c50830-1：首次 release 的 GetState 超時時仍保留首次 deadline 與晚到完成義務。
-#[test]
-fn wp510r_r6_rpc_snapshot_query_timeout_preserves_late_release_completion() {
-    let r = wp510_b_placeholder_rig();
-    let dev = wp510_review8_double_enospc_bind_setup(&r, false);
-    let snapshot = r.session("COM1").expect("COM1 完整 session 快照");
-    let sid = s(&snapshot, "session_id").to_string();
-    let epoch = snapshot
-        .get("bridge_generation")
-        .and_then(PyValue::as_i64)
-        .expect("原 timeout epoch");
-    let token = r
-        .mgr
-        .custody_for_test(WP510_PLACEHOLDER_BY_ID)
-        .expect("前置：parked 帳本紀錄")
-        .token;
-    let without: Vec<(String, DeviceInfo)> = r
-        .mgr
-        .list_devices()
-        .into_iter()
-        .filter_map(|row| {
-            let by_id = s(&row, "by_id").to_string();
-            let real_path = s(&row, "real_path").to_string();
-            (by_id != WP510_PLACEHOLDER_BY_ID)
-                .then(|| (by_id.clone(), DeviceInfo { by_id, real_path }))
-        })
-        .collect();
-
-    dev.pause_next_close();
-    let unplug_mgr = r.mgr.clone();
-    let unplug = std::thread::spawn(move || unplug_mgr.update_devices(&without));
-    assert!(
-        dev.wait_paused(Duration::from_secs(5)),
-        "拔除執行緒停在 parked handle 關閉"
-    );
-
-    let (actor_paused, actor_resume) = r
-        .mgr
-        .pause_next_request_for_test("COM1")
-        .expect("COM1 actor");
-    let release_service = r.svc.clone();
-    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-    let release = std::thread::spawn(move || {
-        let result = release_service.rpc(
-            "device.release",
-            &sw_proto::pydict! { "selector" => "COM1" },
-        );
-        let _ = release_tx.send(result);
-    });
-    actor_paused
-        .recv_timeout(Duration::from_secs(5))
-        .expect("首次 release 的 GetState 已停在 actor dispatch");
-    assert!(
-        !r.mgr.custody_release_snapshot_ready_for_test(token),
-        "actor 暫停時尚未保存 snapshot"
-    );
-
-    // GetState 的 5 秒查詢期限與 release 的 3 秒期限都先到；再讓 actor 恢復並處理 stalled request。
-    std::thread::sleep(Duration::from_millis(5300));
-    actor_resume.send(()).expect("恢復 actor");
-    let release_result = release_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("actor 恢復後首次 release 應取得 stalled 回覆");
-    release.join().expect("首次 release 執行緒不應 panic");
-
-    dev.release_pause();
-    unplug.join().expect("拔除執行緒不應 panic");
-
-    let stalled = release_result.expect("snapshot 查詢超時仍應回 DRAIN_STALLED");
-    assert_eq!(
-        stalled.get("error_code"),
-        Some(&PyValue::from("DRAIN_STALLED")),
-        "{}",
-        j(&stalled)
-    );
-    assert_eq!(
-        stalled.get("drain_timeout_epoch"),
-        Some(&PyValue::from(epoch)),
-        "沿用 actor 的原 timeout epoch：{}",
-        j(&stalled)
-    );
-    let stalled_session = sub(&stalled, "session");
-    assert_eq!(s(&stalled_session, "session_id"), sid);
-    assert_eq!(
-        s(&stalled_session, "device_by_id"),
-        WP510_PLACEHOLDER_BY_ID
-    );
-    assert_eq!(s(&stalled_session, "state"), "RECOVERING");
-    assert_eq!(
-        stalled_session.get("drain_stalled"),
-        Some(&PyValue::Bool(true))
-    );
-    assert_eq!(
-        stalled_session.get("drain_timeout_epoch"),
-        Some(&PyValue::from(epoch))
-    );
-    assert_eq!(
-        jv(&PyValue::List(
-            keys(&stalled_session)
-                .into_iter()
-                .map(PyValue::from)
-                .collect()
-        )),
-        jv(&PyValue::List(
-            keys(&snapshot).into_iter().map(PyValue::from).collect()
-        )),
-        "stall 回覆仍須帶完整公開 session 欄位：{}",
-        j(&stalled)
-    );
-
-    r.wait_state("COM1", "RELEASED");
-    wait_until("快照查詢超時後的晚到 release 已落盤", || {
-        wp510r_r6_state_has_released_sid(&r, &sid)
-    });
-    let released = r.session("COM1").expect("RELEASED session");
-    assert_eq!(
-        s(&released, "released_by"),
-        "cli",
-        "首次 release source 須保留"
-    );
-    assert_eq!(dev.close_count(), 1, "parked handle 僅關閉一次");
 }

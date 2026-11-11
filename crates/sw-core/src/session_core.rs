@@ -172,19 +172,6 @@ pub enum SessionRequest {
         source: String,
         reason: PyValue,
     },
-    /// 審查 P8-add3ca0-1（設計 DR-2 b、D1 ii）：release 等別的關閉者（熱插拔除等）關閉 by_id 上 parked 帳本紀錄，已於首次
-    /// 期限回 DRAIN_STALLED 之後，該關閉的 closed:true 回條才結算；由關閉者（manager 的 `close_session_preopened`）送出，
-    /// 完成首次 release，不需第二次 release。對應 Python `_finish_attach_op` 的 release 分支：RELEASED、`released_by`／
-    /// `released_reason` 取首次請求、清 `drain_stalled`／`drain_timeout_epoch` 並落盤
-    /// （`origin/main:sw_core/session_manager.py:4340-4363`）。無其他排空在途時才清 stalled 欄位，之後照 `Release` 處理。
-    /// T14 分類：Request（bypass），Open／Pending／Permanent 皆處理（Python `_finish_attach_op` 不看交接凍結）；只完成
-    /// 既有 release 義務，不啟動新工作（不開埠、不送 TX）。
-    CompleteStalledRelease {
-        by_id: String,
-        binding_generation: u64,
-        source: String,
-        reason: PyValue,
-    },
     DeviceAttach {
         force: bool,
     },
@@ -440,6 +427,15 @@ pub enum Effect {
     /// 立即回饋補送 `CustodyOffer`，已轉 CloseFailed 或已移除且有終態／tombstone 就補送 `CustodyTerminal`；不改帳本。
     /// T14 分類：資源收尾，Open／Pending／Permanent 皆執行。
     PollCustody { tokens: Vec<u64> },
+    /// S2-PAR-wp510r 第 15 項（設計 §3.1.4 release「`ClaimForStop{by_id, Release}`」；擁有者 2026-11-11「wp510r release 等待
+    /// 改為 actor 主導」）：release 在 actor 執行緒上、manager 鎖內處理 `by_id` 上不屬本 session 擁有的在途作業與帳本紀錄
+    /// （parked 轉 Closing 並加入 watcher、在途作業寫入取消、別人的 Closing 只加入 watcher），以立即回饋 `ReleaseClaimed`
+    /// 回報要等待的 token 與首次期限。`release_deadline`（實時）為本次 release 的候選首次期限；紀錄或作業已有期限者沿用。
+    /// T14 分類：資源收尾，Open／Pending／Permanent 皆執行。
+    ClaimByIdForRelease {
+        by_id: String,
+        release_deadline: std::time::Instant,
+    },
     /// S2-PAR-wp510r R5（設計 §3.1.4 W1 第 2 步、D3）：OD-63 佔位的 `device.attach` 先準備交接用的 attach worker（建立執行緒、
     /// 不開埠）。executor 預配帳本 token、把 worker 存入 `prepared`，以立即回饋 `HandoffWorkerPrepared` 回報；建立失敗時
     /// 告警（含 by_id）並回報錯誤，不開埠、不改狀態。T14 分類：新工作（Pending／Permanent 不發出）。
@@ -607,6 +603,11 @@ pub struct SessionCore {
     custody_opening: bool,
     /// SPEC-GAP 2：目前 release 停止的身分與首次期限（實時，`WaitAck::Release`）。
     release_wait_rt: Option<(StopId, std::time::Instant)>,
+    /// S2-PAR-wp510r 第 15 項：已發 `ClaimByIdForRelease`、等立即回饋 `ReleaseClaimed` 的 release（回饋先於下一個 mailbox
+    /// 事件處理，期間不會有其他請求）。
+    release_claim: Option<PendingReleaseClaim>,
+    /// `TimerEvent::CustodyPoll` 已排程（同時只有一條補收計時鏈）。
+    custody_poll_armed: bool,
     /// clear 收尾後等 manager 再解析（Python `_spawn_attach` → `_reresolve_profile_on_reattach`）再送
     /// `DeviceAttached`：期間 state 為 ATTACHING、無開埠（審查 F61／F62）。
     reattach_pending: bool,
@@ -810,6 +811,14 @@ enum ReprobeWaiter {
     Recover { force: bool },
 }
 
+/// `SessionCore::release_claim` 的內容（S2-PAR-wp510r 第 15 項）。
+struct PendingReleaseClaim {
+    source: String,
+    reason: PyValue,
+    reply: Reply,
+    ack: Option<crossbeam_channel::Sender<crate::mailbox::WaitAck>>,
+}
+
 struct PendingRelease {
     source: String,
     reason: PyValue,
@@ -893,6 +902,9 @@ struct RetiredDrain {
     custody_token: Option<u64>,
     /// SPEC-GAP 2：首次 release 的絕對期限（實時），記在被等待的對象上，之後的 release 沿用。
     release_deadline_rt: Option<std::time::Instant>,
+    /// S2-PAR-wp510r 第 15 項：由 release 的 `ClaimByIdForRelease` 登記（by_id 上不屬本 session 擁有的紀錄或在途作業），
+    /// 不另發 `ClaimForStop{token}`；以 `CustodyPoll` 補收終態。
+    by_id_claim: bool,
 }
 
 /// 等待 retired drain 終態的 `session.bind`（見 `SessionCore::bind_waits`）。
@@ -950,6 +962,8 @@ impl SessionCore {
             external_offer_pending: false,
             custody_opening: false,
             release_wait_rt: None,
+            release_claim: None,
+            custody_poll_armed: false,
             reattach_pending: false,
             reopen_after_retired: false,
             open_generation: 0,
@@ -1152,6 +1166,8 @@ impl SessionCore {
                 | MailboxItem::Control(ControlEvent::Shutdown { .. })
                 // S2-PAR-wp510r R3（設計 §3.1.7）：`ClaimForStop` 的立即回饋，三種凍結狀態皆立即處理。
                 | MailboxItem::Control(ControlEvent::CustodyClaimed { .. })
+                // S2-PAR-wp510r 第 15 項：`ClaimByIdForRelease` 的立即回饋，三種凍結狀態皆立即處理。
+                | MailboxItem::Control(ControlEvent::ReleaseClaimed { .. })
                 // S2-PAR-wp510r R5（設計 §3.1.7）：`PrepareHandoffWorker`／`RetirePlaceholder` 的立即回饋，三種凍結狀態皆立即處理。
                 | MailboxItem::Control(ControlEvent::HandoffWorkerPrepared { .. })
                 | MailboxItem::Control(ControlEvent::RetireResult { .. })
@@ -1324,6 +1340,9 @@ impl SessionCore {
             }
             MailboxItem::Control(ControlEvent::CustodyClaimed { token, outcome }) => {
                 effects.0.extend(self.custody_claimed(token, outcome, now));
+            }
+            MailboxItem::Control(ControlEvent::ReleaseClaimed { by_id, claims }) => {
+                effects.0.extend(self.release_claimed(by_id, claims, now));
             }
             MailboxItem::Control(ControlEvent::CustodyTerminal { token, closed, error }) => {
                 effects.0.extend(self.custody_terminal(token, closed, error, now));
@@ -1975,6 +1994,7 @@ impl SessionCore {
                     let tokens: Vec<u64> = self
                         .retired_drains
                         .iter()
+                        .filter(|entry| !entry.by_id_claim)
                         .filter_map(|entry| entry.custody_token)
                         .filter(|token| Some(*token) != claimed_now)
                         .collect();
@@ -2573,33 +2593,11 @@ impl SessionCore {
                 vec![Effect::Reply(reply, Ok(result))]
             }
             SessionRequest::Submit(req) => self.submit(req, reply, now),
-            SessionRequest::Release { source, reason } => self.release_request(source, reason, reply, now),
-            SessionRequest::CompleteStalledRelease {
-                by_id,
-                binding_generation,
-                source,
-                reason,
-            } => {
-                if self.profile.device_by_id != by_id
-                    || self.binding_generation != binding_generation
-                {
-                    // manager 的鎖外送達快照可能早於 bind；在 actor 套用副作用前再驗一次身分。
-                    vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
-                } else {
-                    if self.state != SessionState::Released
-                        && self.stop.is_none()
-                        && self.pending_open_stop.is_none()
-                    {
-                        self.drain_stalled = false;
-                        self.drain_timeout_epoch = None;
-                    }
-                    self.release_request(source, reason, reply, now)
-                }
+            SessionRequest::Release { source, reason } => {
+                self.release_request_with_ack(source, reason, reply, None, now)
             }
             SessionRequest::ReleaseWithAck { source, reason, ack } => {
-                let effects = self.release_request(source, reason, reply, now);
-                self.send_release_ack(&ack);
-                effects
+                self.release_request_with_ack(source, reason, reply, Some(ack), now)
             }
             SessionRequest::BindWithAck { .. } if self.drain_in_progress() => {
                 vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))]
@@ -2632,8 +2630,115 @@ impl SessionCore {
         }
     }
 
-    /// `SessionRequest::Release` 的本體（`ReleaseWithAck` 共用）。
-    fn release_request(&mut self, source: String, reason: PyValue, reply: Reply, now: Mono) -> Vec<Effect> {
+    /// `SessionRequest::Release`／`ReleaseWithAck` 的入口（S2-PAR-wp510r 第 15 項，設計 §3.1.4 release）：會建立新的 release
+    /// 停止（或在已 RELEASED 的 session 上收尾）時，先以 `ClaimByIdForRelease` 請 executor 在 manager 鎖內處理 by_id 上不屬
+    /// 本 session 擁有的在途作業與帳本紀錄，立即回饋 `ReleaseClaimed` 到達後才走 `release_request_inner`（回饋先於下一個
+    /// mailbox 事件處理）。Python `release_device` 先找 by_id 的在途作業與未消費的預開 handle，再處理 session
+    /// （`origin/main:sw_core/session_manager.py:3104-3111`）。加入既有停止、FLASHING 等直接回覆者不認領。
+    fn release_request_with_ack(
+        &mut self,
+        source: String,
+        reason: PyValue,
+        reply: Reply,
+        ack: Option<crossbeam_channel::Sender<crate::mailbox::WaitAck>>,
+        now: Mono,
+    ) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        if self.release_claim.is_some() {
+            // 立即回饋必定先於下一個 mailbox 事件；仍有未結算的認領代表 executor 未回饋（例如效果執行時 unwind），以空認領
+            // 收尾，不讓先到的 release 永遠等不到回覆。
+            let by_id = self.profile.device_by_id.clone();
+            effects.extend(self.release_claimed(by_id, Vec::new(), now));
+        }
+        let claims_by_id = !self.profile.device_by_id.is_empty()
+            && self.release_claim.is_none()
+            && self.stop.is_none()
+            && self.pending_open_stop.is_none()
+            && (self.state == SessionState::Released || !self.flash_busy());
+        if claims_by_id {
+            self.release_claim = Some(PendingReleaseClaim {
+                source,
+                reason,
+                reply,
+                ack,
+            });
+            effects.push(Effect::ClaimByIdForRelease {
+                by_id: self.profile.device_by_id.clone(),
+                release_deadline: std::time::Instant::now()
+                    + std::time::Duration::from_millis(crate::resources::DRAIN_TIMEOUT_MS),
+            });
+            return effects;
+        }
+        effects.extend(self.release_request_inner(source, reason, reply, now));
+        if let Some(ack) = ack {
+            self.send_release_ack(&ack);
+        }
+        effects
+    }
+
+    /// `ControlEvent::ReleaseClaimed`（`ClaimByIdForRelease` 的立即回饋）：把要等待的 token 登記為 retired drain（與退休
+    /// bridge、保管紀錄同表，收斂規則與 T-1 共用；首次期限記在被等待的對象上），再走原 release 流程。首次期限已過
+    /// （之前的 release 已在該對象上設定）時立即回 DRAIN_STALLED（T-1「期限已過的 release 立即回」，設計 §3.1.6）。
+    /// 仍待終態者排 `CustodyPoll` 補收（設計 C4：終態通知送不進去時留在帳本）。
+    fn release_claimed(
+        &mut self,
+        by_id: String,
+        claims: Vec<crate::mailbox::ReleaseClaim>,
+        now: Mono,
+    ) -> Vec<Effect> {
+        use crate::mailbox::CustodyClaimOutcome;
+        let Some(pending) = self.release_claim.take() else {
+            return Vec::new();
+        };
+        let mut effects = Vec::new();
+        if by_id == self.profile.device_by_id {
+            let mut added = false;
+            for claim in claims {
+                if self
+                    .retired_drains
+                    .iter()
+                    .any(|entry| entry.custody_token == Some(claim.token))
+                {
+                    continue;
+                }
+                let receipt = match claim.outcome {
+                    CustodyClaimOutcome::Failed => RetiredReceipt::Failed,
+                    _ => RetiredReceipt::Pending,
+                };
+                if receipt == RetiredReceipt::Failed {
+                    self.deps.unconfirmed_closes.insert(&self.profile.device_by_id);
+                }
+                self.retired_drains.push(RetiredDrain {
+                    epoch: 0,
+                    stop_id: StopId(0),
+                    by_id: by_id.clone(),
+                    receipt,
+                    custody_token: Some(claim.token),
+                    release_deadline_rt: Some(claim.deadline),
+                    by_id_claim: true,
+                });
+                added = true;
+            }
+            if added {
+                self.publish_retired_drains();
+            }
+        }
+        effects.extend(self.release_request_inner(pending.source, pending.reason, pending.reply, now));
+        // T-1：首次期限已過（記在被等待對象上的期限早於本次 release）時立即回 DRAIN_STALLED。
+        if let Some((stop_id, deadline)) = self.current_release_stop_id().zip(self.current_release_deadline_rt()) {
+            if std::time::Instant::now() >= deadline {
+                effects.extend(self.release_deadline_elapsed(stop_id, deadline, now));
+            }
+        }
+        if let Some(ack) = pending.ack {
+            self.send_release_ack(&ack);
+        }
+        effects.extend(self.arm_custody_poll(now));
+        effects
+    }
+
+    /// `SessionRequest::Release` 的本體（`release_request_with_ack` 於 by_id 認領之後呼叫）。
+    fn release_request_inner(&mut self, source: String, reason: PyValue, reply: Reply, now: Mono) -> Vec<Effect> {
         for wait in &mut self.bind_waits {
             wait.release_joined = true;
         }
@@ -3867,6 +3972,12 @@ impl SessionCore {
                 effects.push(Effect::Warn(warn));
             }
             effects.extend(self.fail_bind_waits(now));
+            if self.retired_drains[index].by_id_claim {
+                // S2-PAR-wp510r 第 15 項：release 認領的紀錄或作業關閉失敗（D1 iii）：項目保留為失敗，等待中的 release 依
+                // T-1 於首次期限回 DRAIN_STALLED；期限已過者結束停止待決（`abandon_failed_claim_release`）。
+                self.abandon_failed_claim_release();
+                return effects;
+            }
             // T-1（設計 §3.1.6 第二處）：release 只標記關閉失敗並保留，不提前回覆、不改 drain 欄位；首次期限由
             // `mark_drain_timeout` 回 DRAIN_STALLED，期限已過之後的 release 立即回。其他停止（shutdown 等）保留
             // stalled、不回覆（shutdown 判為未排空）。
@@ -3948,6 +4059,7 @@ impl SessionCore {
                     receipt,
                     custody_token: Some(token),
                     release_deadline_rt,
+                    by_id_claim: false,
                 });
                 if receipt == RetiredReceipt::Failed {
                     self.deps.unconfirmed_closes.insert(&self.profile.device_by_id);
@@ -4036,6 +4148,7 @@ impl SessionCore {
         self.external_offer_pending = true;
         self.device_present = true;
         self.known_real_path = Some(real_path);
+        self.custody_poll_armed = true;
         vec![
             Self::custody_poll_schedule(now),
             Effect::Reply(reply, Ok(self.ok_session(now))),
@@ -4052,14 +4165,40 @@ impl SessionCore {
 
     /// `TimerEvent::CustodyPoll`：仍在等 offer 時發 `PollCustody`（executor 查帳本，紀錄已是本 session 的 `Held` 就以立即
     /// 回饋補送 `CustodyOffer`，已有終態就補送 `CustodyTerminal`）並排下一次。Permanent 凍結下照常查詢（offer 只關閉）。
+    ///
+    /// S2-PAR-wp510r 第 15 項（設計 C4）：release 以 `ClaimByIdForRelease` 登記、仍待終態的 token 一併補收（關閉者鎖外
+    /// `try_send` 的 `CustodyTerminal` 送不進去時，終態留在帳本）。
     fn custody_poll(&mut self, now: Mono) -> Vec<Effect> {
-        match self.external_attach {
-            Some(token) if self.external_offer_pending => vec![
-                Effect::PollCustody { tokens: vec![token] },
-                Self::custody_poll_schedule(now),
-            ],
-            _ => Vec::new(),
+        self.custody_poll_armed = false;
+        let mut tokens: Vec<u64> = self
+            .external_attach
+            .filter(|_| self.external_offer_pending)
+            .into_iter()
+            .collect();
+        tokens.extend(self.pending_by_id_claims());
+        if tokens.is_empty() {
+            return Vec::new();
         }
+        self.custody_poll_armed = true;
+        vec![Effect::PollCustody { tokens }, Self::custody_poll_schedule(now)]
+    }
+
+    /// release 以 `ClaimByIdForRelease` 登記、仍待終態的 token。
+    fn pending_by_id_claims(&self) -> Vec<u64> {
+        self.retired_drains
+            .iter()
+            .filter(|entry| entry.by_id_claim && entry.receipt == RetiredReceipt::Pending)
+            .filter_map(|entry| entry.custody_token)
+            .collect()
+    }
+
+    /// 有仍待終態的 by_id 認領且尚未排程時，排一次 `CustodyPoll`。
+    fn arm_custody_poll(&mut self, now: Mono) -> Vec<Effect> {
+        if self.custody_poll_armed || self.pending_by_id_claims().is_empty() {
+            return Vec::new();
+        }
+        self.custody_poll_armed = true;
+        vec![Self::custody_poll_schedule(now)]
     }
 
     /// `ControlEvent::CustodyOffer`（設計 §3.1.4 W6 第 3 步）：W6 worker 已把 handle 存回本 session 的帳本紀錄。只在
@@ -4327,6 +4466,7 @@ impl SessionCore {
                         receipt: RetiredReceipt::Pending,
                         custody_token: Some(token),
                         release_deadline_rt: self.current_release_deadline_rt(),
+                        by_id_claim: false,
                     });
                     self.publish_retired_drains();
                     if let Some(ph) = pending.placeholder.as_mut() {
@@ -4544,6 +4684,7 @@ impl SessionCore {
             receipt: RetiredReceipt::Pending,
             custody_token: None,
             release_deadline_rt: None,
+            by_id_claim: false,
         });
         self.publish_retired_drains();
         let mut fx = vec![
@@ -5719,6 +5860,37 @@ impl SessionCore {
         }
     }
 
+    /// S2-PAR-wp510r 第 15 項（D1 iii＋T-1）：release 的首次期限已過、回過 DRAIN_STALLED，而剩下的只有 release 以
+    /// `ClaimByIdForRelease` 認領且已是失敗終態的項目（別的來源留下的 CloseFailed 紀錄、關閉未確認而保留的作業）時，結束
+    /// 停止待決：session 維持 stalled（state 與 drain 欄位不動），阻擋由帳本的 CloseFailed／未確認集合承擔，之後的 release
+    /// 再次認領並依期限已過立即回 DRAIN_STALLED。對應 Python release 在作業 `done` 永不設定時等到期限、設 stall 後返回，
+    /// 作業留在表內（`origin/main:sw_core/session_manager.py:3188-3204`、`:4320-4332`）。
+    fn abandon_failed_claim_release(&mut self) {
+        let Some(pending) = self.pending_open_stop.as_ref() else {
+            return;
+        };
+        if pending.kind != StopKind::Release
+            || !pending.stalled
+            || pending.close_failed
+            || !pending.waiters.is_empty()
+            || self.retired_drains.is_empty()
+            || !self
+                .retired_drains
+                .iter()
+                .all(|entry| entry.by_id_claim && entry.receipt == RetiredReceipt::Failed)
+            || self.open_real_path.is_some()
+            || self.external_attach.is_some()
+            || self.pending_attach.is_some()
+            || matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }))
+        {
+            return;
+        }
+        self.pending_open_stop = None;
+        self.pending_release = None;
+        self.retired_drains.retain(|entry| !entry.by_id_claim);
+        self.publish_retired_drains();
+    }
+
     fn mark_drain_timeout(&mut self, epoch: u64, stop_id: StopId, now: Mono) -> Vec<Effect> {
         let stalled_epoch = self.generations.bridge_generation;
         if let Some(stop) = &mut self.stop {
@@ -5744,13 +5916,17 @@ impl SessionCore {
                 self.drain_timeout_epoch = Some(stalled_epoch);
                 if pending.kind == StopKind::Release {
                     let waiters: Vec<_> = pending.waiters.drain(..).collect();
-                    if !waiters.is_empty() {
+                    let effects: Vec<Effect> = if waiters.is_empty() {
+                        Vec::new()
+                    } else {
                         let response = self.drain_stalled_reply(now);
-                        return waiters
+                        waiters
                             .into_iter()
                             .map(|waiter| Effect::Reply(waiter, Ok(response.clone())))
-                            .collect();
-                    }
+                            .collect()
+                    };
+                    self.abandon_failed_claim_release();
+                    return effects;
                 }
             }
         }

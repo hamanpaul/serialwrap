@@ -5756,24 +5756,44 @@ fn wp510r_r6_p8_c92ef3e_1_stale_notice_does_not_stall_unacked_release() {
 
 // ---------------------------------------------------------------------------
 // S2-PAR-wp510r 第 12 項第 2 輪：審查 P8-add3ca0-1（parked 關閉逾時後遲到回條完成首次 release）。
+// 第 15 項（擁有者 2026-11-11「wp510r release 等待改為 actor 主導」）改寫：manager 的 `CompleteStalledRelease` 遲到補送
+// 已刪除，release 由 actor 以 `ClaimByIdForRelease` 認領 by_id 上的紀錄並保留停止待決，遲到的關閉終態
+// （`CustodyTerminal`）直接完成首次 release。結果斷言不變（RELEASED、首次請求的來源與 reason、清 drain 欄位、落盤、
+// 不啟動新工作）。Python `release_device` 在 RPC 執行緒同步處理（`origin/main:sw_core/session_manager.py:3095-3219`），
+// 逾時後作業才收尾時 `_finish_attach_op` 完成 release（`:4340-4363`）。
 // ---------------------------------------------------------------------------
 
-/// 審查 P8-add3ca0-1 的 T14 凍結分類（設計 §3.1.7）：`SessionRequest::CompleteStalledRelease` 屬 Request（bypass）。DR-2(b)
-/// 的 release 等 parked 拔除關閉逾時（manager 送 `MarkAttachStalled`：RECOVERING＋stalled）之後，關閉者送出的遲到 release
-/// 在 Open／Pending／Permanent 都立即完成首次 release：RELEASED、`released_by`／`released_reason` 取首次請求、清
-/// `drain_stalled`／`drain_timeout_epoch`、落盤（Python `_finish_attach_op` 的 release 分支，
-/// `origin/main:sw_core/session_manager.py:4340-4363`，不看交接凍結），且不啟動新工作（不發 OpenBridge）。落盤回條
-/// `StateCommitted` 屬生命週期事件：Pending 延後、撤銷後重播才回覆（與 `Release` 相同），Open／Permanent 同步回覆。
+/// 審查 P8-add3ca0-1 的 T14 凍結分類（設計 §3.1.7）：release 認領別的關閉者正在關閉的紀錄（DR-2 b），等滿首次期限回
+/// DRAIN_STALLED（T-1）後，遲到的成功終態 `CustodyTerminal`（生命週期事件：Open／Permanent 處理、Pending 延後、撤銷後
+/// 重播）完成首次 release：RELEASED、`released_by`／`released_reason` 取首次請求、清 `drain_stalled`／`drain_timeout_epoch`、
+/// 落盤，且不啟動新工作（不發 OpenBridge）。第 15 項改寫：原本以 manager 送出的 `CompleteStalledRelease`（Request，bypass）
+/// 驅動；actor 主導後完成由 actor 自己的停止待決承擔，Pending 期間的完成時點隨 `CustodyTerminal` 的分類延到撤銷之後。
 #[test]
 fn wp510r_r6_p8_add3ca0_1_complete_stalled_release_under_each_freeze_state() {
+    const TOKEN: u64 = 0x15_0001;
     for freeze in ["open", "pending", "permanent"] {
         let mut h = CoreHarness::new(SHELL_PROFILE);
-        let stalled = h
-            .rpc(SessionRequest::MarkAttachStalled { epoch: Some(1) })
+        h.next_release_claims = vec![sw_core::mailbox::ReleaseClaim {
+            token: TOKEN,
+            outcome: sw_core::mailbox::CustodyClaimOutcome::Closing,
+            deadline: std::time::Instant::now() + Duration::from_secs(3),
+        }];
+        let (rx, _) = h.rpc_deferred(SessionRequest::Release {
+            source: "agent".into(),
+            reason: PyValue::from("late-close"),
+        });
+        assert_eq!(h.release_claim_requests.len(), 1, "{freeze}：release 先認領 by_id");
+        assert_eq!(h.release_claim_requests[0].0, "/s/by-id/usb-A", "{freeze}");
+        assert!(rx.try_recv().is_err(), "{freeze}：回條前不回覆");
+        assert_eq!(h.public()["state"], PyValue::from("RECOVERING"), "{freeze}：G-3");
+        let _ = h.advance(Duration::from_secs(4));
+        let stalled = rx
+            .try_recv()
+            .unwrap_or_else(|_| panic!("{freeze}：首次期限回 DRAIN_STALLED"))
             .unwrap();
-        assert_eq!(stalled.get("error_code"), Some(&PyValue::from("SESSION_RECOVERING")));
+        assert_eq!(stalled.get("error_code"), Some(&PyValue::from("DRAIN_STALLED")), "{freeze}");
         assert_eq!(h.public()["drain_stalled"], PyValue::Bool(true), "前置（{freeze}）");
-        assert_eq!(h.public()["drain_timeout_epoch"], PyValue::from(1), "前置（{freeze}）");
+        assert!(!h.state_store.last_released().contains_key("t:COM0"), "{freeze}：逾時當下不落盤");
         let thaw = match freeze {
             "pending" => match h.reg.admission_gate().freeze_if_idle("wp510r-late-release") {
                 sw_core::admission::FreezeOutcome::Frozen { token, .. } => Some(token),
@@ -5785,13 +5805,17 @@ fn wp510r_r6_p8_add3ca0_1_complete_stalled_release_under_each_freeze_state() {
             }
             _ => None,
         };
-        let (rx, effects) = h.rpc_deferred(SessionRequest::CompleteStalledRelease {
-            by_id: "/s/by-id/usb-A".into(),
-            binding_generation: 0,
-            source: "agent".into(),
-            reason: PyValue::from("late-close"),
+        let effects = h.feed(ControlEvent::CustodyTerminal {
+            token: TOKEN,
+            closed: true,
+            error: None,
         });
         assert!(wp510r_open_bridge_paths(&effects).is_empty(), "{freeze}：不啟動新工作");
+        if let Some(token) = thaw {
+            assert_eq!(h.public()["state"], PyValue::from("RECOVERING"), "Pending：關閉終態延後");
+            assert!(h.reg.admission_gate().thaw(&token));
+            let _ = h.rpc(SessionRequest::GetState);
+        }
         let public = h.public();
         assert_eq!(public["state"], PyValue::from("RELEASED"), "{freeze}：{public:?}");
         assert_eq!(public["released_by"], PyValue::from("agent"), "{freeze}");
@@ -5802,21 +5826,19 @@ fn wp510r_r6_p8_add3ca0_1_complete_stalled_release_under_each_freeze_state() {
             h.state_store.last_released().contains_key("t:COM0"),
             "{freeze}：RELEASED 必須落盤"
         );
-        if let Some(token) = thaw {
-            assert!(rx.try_recv().is_err(), "Pending：落盤回條延後");
-            assert!(h.reg.admission_gate().thaw(&token));
-            let _ = h.rpc(SessionRequest::GetState);
-        }
-        let reply = rx
-            .try_recv()
-            .unwrap_or_else(|_| panic!("{freeze}：應回覆"))
+        let again = h
+            .rpc(SessionRequest::Release {
+                source: "cli".into(),
+                reason: PyValue::Null,
+            })
             .unwrap();
-        assert_eq!(reply.get("ok"), Some(&PyValue::Bool(true)), "{freeze}：{reply:?}");
+        assert_eq!(again.get("already_released"), Some(&PyValue::Bool(true)), "{freeze}：{again:?}");
     }
 }
 
-/// 審查 P8-add3ca0-1：遲到 release 抵達時 session 已是 RELEASED（例如之後另一個 release 已完成）：冪等回
-/// `already_released`，不改動 drain 欄位、不刷新 `released_by`。
+/// 審查 P8-add3ca0-1：遲到的關閉終態抵達時 session 已是 RELEASED（例如之後另一個 release 已完成）：不屬目前等待的 token
+/// 不產生效果，之後的 release 冪等回 `already_released`，不改動 drain 欄位、不刷新 `released_by`。第 15 項改寫：原本的
+/// 遲到 `CompleteStalledRelease` 已刪除，改以 actor 模型下可達的遲到 `CustodyTerminal` 驗同一結果。
 #[test]
 fn wp510r_r6_p8_add3ca0_1_complete_stalled_release_on_released_is_idempotent() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
@@ -5828,10 +5850,14 @@ fn wp510r_r6_p8_add3ca0_1_complete_stalled_release_on_released_is_idempotent() {
         .unwrap();
     assert_eq!(first.get("ok"), Some(&PyValue::Bool(true)), "{first:?}");
     let released_at = h.public()["released_at"].clone();
+    let late = h.feed(ControlEvent::CustodyTerminal {
+        token: 0x15_0002,
+        closed: true,
+        error: None,
+    });
+    assert!(late.is_empty(), "不屬目前等待的終態不產生效果：{} 個效果", late.len());
     let again = h
-        .rpc(SessionRequest::CompleteStalledRelease {
-            by_id: "/s/by-id/usb-A".into(),
-            binding_generation: 0,
+        .rpc(SessionRequest::Release {
             source: "agent".into(),
             reason: PyValue::from("late-close"),
         })
@@ -5840,4 +5866,5 @@ fn wp510r_r6_p8_add3ca0_1_complete_stalled_release_on_released_is_idempotent() {
     let public = h.public();
     assert_eq!(public["released_by"], PyValue::from("cli"), "不刷新 provenance");
     assert_eq!(public["released_at"], released_at);
+    assert_eq!(public["drain_stalled"], PyValue::Bool(false));
 }

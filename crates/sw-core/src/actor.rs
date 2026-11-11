@@ -355,13 +355,20 @@ impl ActorHandle {
 pub trait EffectExecutor: Send {
     fn execute(&mut self, e: Effect, tx: &Sender<ControlEvent>, safety: &Sender<ControlEvent>);
     /// S2-PAR-wp510r R1: 效果立即回饋佇列（executor 推回的事件先於下一次 mailbox 收取被處理）。
+    ///
+    /// 預設實作：沒有保管帳本的 executor 對 `ClaimByIdForRelease`（S2-PAR-wp510r 第 15 項）回空認領（by_id 上沒有其他
+    /// 紀錄或在途作業），其餘照 `execute`。manager 的 `ManagerExec` 覆寫並在 manager 鎖內處理帳本。
     fn execute_with_feedback(
         &mut self,
         e: Effect,
         tx: &Sender<ControlEvent>,
         safety: &Sender<ControlEvent>,
-        _feedback: &mut std::collections::VecDeque<ControlEvent>,
+        feedback: &mut std::collections::VecDeque<ControlEvent>,
     ) {
+        if let Effect::ClaimByIdForRelease { by_id, .. } = e {
+            feedback.push_back(ControlEvent::ReleaseClaimed { by_id, claims: Vec::new() });
+            return;
+        }
         self.execute(e, tx, safety);
     }
 }
@@ -717,6 +724,7 @@ fn dispatch(
         MailboxItem::Control(ControlEvent::FlashSyncMatched { .. }) => (None, "FlashSyncMatched"),
         MailboxItem::Control(ControlEvent::FlashHolderGone { .. }) => (None, "FlashHolderGone"),
         MailboxItem::Control(ControlEvent::CustodyClaimed { .. }) => (None, "CustodyClaimed"),
+        MailboxItem::Control(ControlEvent::ReleaseClaimed { .. }) => (None, "ReleaseClaimed"),
         MailboxItem::Control(ControlEvent::CustodyTerminal { .. }) => (None, "CustodyTerminal"),
         MailboxItem::Control(ControlEvent::CustodyOffer { .. }) => (None, "CustodyOffer"),
         MailboxItem::Control(ControlEvent::PlaceholderOpened { .. }) => (None, "PlaceholderOpened"),
