@@ -585,6 +585,22 @@ struct Inner {
     prepared: HashMap<u64, PreparedHandoff>,
     /// S2-PAR-wp510r：DeviceAttached 送達義務（設計 §3.1.2 C4；由送達者執行緒執行）。
     deliverer: crate::custody::Deliverer,
+    /// 審查 P8-add3ca0-1（設計 DR-2 b、D1 ii）：release 等別的關閉者關閉 by_id 上 parked 帳本紀錄時，以紀錄 token 記下的
+    /// 首次 release 請求（帳本 token → 請求）。期限內回條者由 release RPC 照常交 actor；逾時（`stalled`）後回條 closed:true
+    /// 時由關閉者補送 release（Python `_AttachOp.release_request`，`origin/main:sw_core/session_manager.py:3117-3122`、
+    /// `:4340-4363`）。
+    custody_release_waits: HashMap<u64, CustodyReleaseWait>,
+}
+
+/// 審查 P8-add3ca0-1：等待別的關閉者關閉 parked 帳本紀錄的首次 release（見 `Inner::custody_release_waits`）。
+struct CustodyReleaseWait {
+    sid: String,
+    /// 首次 release 時綁在該 by_id 上的 session actor（session 世代）：補送前核對同一 sid、同一 actor、仍綁同一 by_id。
+    actor: Arc<ActorHandle>,
+    source: String,
+    reason: PyValue,
+    /// release 已於首次期限回 DRAIN_STALLED、不再等待回條（與關閉者的結算在同一把 manager lock 內判定）。
+    stalled: bool,
 }
 
 /// P8 Task 14：偵測 PROBE 的 fence（每次 `probe_send` 新建）與交接凍結旗標，同一把鎖內登記與讀取：
@@ -612,6 +628,7 @@ impl Inner {
             custody: crate::custody::CustodyLedger::new(unconfirmed),
             prepared: HashMap::new(),
             deliverer: crate::custody::Deliverer::new(admission),
+            custody_release_waits: HashMap::new(),
         }
     }
 
@@ -1044,6 +1061,10 @@ impl Shared {
 
     /// 關閉 Python 已先自表中取出的未消費預開 handle（release `:3108-3111`、bind `:3680-3681`／`:3776-3778`、裝置改指
     /// `:4045-4063`），回傳是否確認關閉；`closed:false` 時依 D1(iii) 登記永久阻擋。
+    ///
+    /// 審查 P8-add3ca0-1：release 等本次關閉超過首次期限回 DRAIN_STALLED 之後，closed:true 回條結算時把首次 release 交給
+    /// 綁在該 by_id 上的同一 session 完成（`CompleteStalledRelease`；與 `finish_worker_op` 的遲到收尾相同，
+    /// `origin/main:sw_core/session_manager.py:4340-4363`）。
     fn close_session_preopened(&self, by_id: &str, pre: Preopened) -> bool {
         let receipt = pre.parts.close();
         if !receipt.closed {
@@ -1052,22 +1073,54 @@ impl Shared {
             self.unconfirmed_closes.insert(by_id);
             let mut inner = lock(&self.inner);
             if let Some(rec) = inner.custody.custody.get_mut(by_id) {
-                rec.phase = crate::custody::CustodyPhase::CloseFailed { error };
-            }
-        } else {
-            let mut inner = lock(&self.inner);
-            if let Some(rec) = inner.custody.custody.get(by_id) {
                 let token = rec.token;
-                inner.custody.settle_close(
-                    token,
-                    crate::custody::Terminal {
-                        handle: crate::custody::TerminalHandle::Closed,
-                        evidence: crate::custody::TerminalEvidence::Complete,
-                    },
-                );
+                rec.phase = crate::custody::CustodyPhase::CloseFailed { error };
+                // D1(iii)：關閉失敗永久阻擋到重啟，release 維持 DRAIN_STALLED，不留補送義務。
+                inner.custody_release_waits.remove(&token);
             }
+            return false;
         }
-        receipt.closed
+        let mut inner = lock(&self.inner);
+        let Some(token) = inner.custody.custody.get(by_id).map(|rec| rec.token) else {
+            return true;
+        };
+        inner.custody.settle_close(
+            token,
+            crate::custody::Terminal {
+                handle: crate::custody::TerminalHandle::Closed,
+                evidence: crate::custody::TerminalEvidence::Complete,
+            },
+        );
+        // 期限內的回條由仍在等待的 release RPC 接著交 actor（見 `wait_custody_close_for_release`），此處只清除紀錄。
+        let Some(wait) = inner.custody_release_waits.remove(&token).filter(|wait| wait.stalled) else {
+            return true;
+        };
+        let same_session = inner.sessions.get(&wait.sid).is_some_and(|entry| {
+            Arc::ptr_eq(&entry.actor, &wait.actor) && entry.profile.device_by_id == by_id
+        });
+        if !same_session {
+            return true;
+        }
+        let (reply, _ignored) = crossbeam_channel::bounded(1);
+        let sent = wait
+            .actor
+            .safety
+            .try_send(ControlEvent::Request {
+                req: SessionRequest::CompleteStalledRelease {
+                    source: wait.source,
+                    reason: wait.reason,
+                },
+                reply,
+            })
+            .is_ok();
+        drop(inner);
+        if !sent {
+            self.warn(format!(
+                "parked handle 關閉後的遲到 release 收尾未能送達（by_id={by_id} token={token} sid={}）",
+                wait.sid
+            ));
+        }
+        true
     }
 
     /// S2-PAR-wp510r R3（設計 §3.1.4 W2、C7）：出生即接管的帳本登記。PROBE 用過的 handle 存為新 session 擁有的紀錄
@@ -1907,6 +1960,8 @@ impl Shared {
             }
             self.cv.notify_all();
             // DR-2(a)：關閉期間到達的重插被 `spawn_attach_with` 擋下；closed:true 之後 by_id 仍在線者補排一次 attach。
+            // 已補送逾時 release 的 by_id（審查 P8-add3ca0-1）：補送的 release 在 safety lane、補排的 `DeviceAttached` 在
+            // control lane，actor 先完成 RELEASED，之後的 `DeviceAttached` 不開埠。
             for by_id in closed_ok {
                 if lock(&self.inner).devices.contains_key(&by_id) {
                     self.spawn_attach(&by_id);
@@ -5770,9 +5825,24 @@ impl SessionManager {
                     // 不屬任何 session 的 parked handle：release 等它的關閉回條（D1 i），首次 release 的絕對期限記在紀錄上、
                     // 之後的 release 沿用（`origin/main:sw_core/session_manager.py:3117-3124`）。
                     let deadline = *rec.release_deadline.get_or_insert(candidate_release_deadline);
+                    let token = rec.token;
+                    // 審查 P8-add3ca0-1：首次 release 的請求與 session 世代以 token 保存；逾時後回條才到時由關閉者補送
+                    // （Python 只在第一個 release 寫入 `release_request`，`:3117-3122`）。
+                    if let Some(actor) = inner.sessions.get(sid).map(|entry| entry.actor.clone()) {
+                        inner
+                            .custody_release_waits
+                            .entry(token)
+                            .or_insert_with(|| CustodyReleaseWait {
+                                sid: sid.to_string(),
+                                actor,
+                                source: source.to_string(),
+                                reason: reason.clone(),
+                                stalled: false,
+                            });
+                    }
                     Step::WaitCustodyClose {
                         by_id,
-                        token: rec.token,
+                        token,
                         deadline,
                     }
                 } else {
@@ -5799,33 +5869,67 @@ impl SessionManager {
                     }
                 }
                 Step::WaitCustodyClose { by_id, token, deadline } => {
-                    if !self.wait_custody_close_for_release(&by_id, token, deadline) {
-                        return self.release_close_unconfirmed_reply(sid);
+                    if let Some(reply) = self.wait_custody_close_for_release(sid, &by_id, token, deadline)? {
+                        return Ok(Some(reply));
                     }
                 }
             }
         }
     }
 
-    /// DR-2(b)：等別的關閉者關閉 by_id 上的帳本紀錄 `token`。紀錄移除（closed:true）回 true，之後由 actor 的 release
-    /// 照常收尾；關閉失敗（CloseFailed，D1 iii）或仍待回條，都等到首次期限（T-1）才回 false（DRAIN_STALLED）。
-    fn wait_custody_close_for_release(&self, by_id: &str, token: u64, deadline: Instant) -> bool {
-        let mut inner = lock(&self.shared.inner);
-        loop {
-            if inner.custody.get_custody(by_id).is_none_or(|rec| rec.token != token) {
-                return true;
+    /// DR-2(b)：等別的關閉者關閉 by_id 上的帳本紀錄 `token`。紀錄移除（closed:true）回 `None`，之後由 actor 的 release
+    /// 照常收尾；關閉失敗（CloseFailed，D1 iii）或仍待回條，都等到首次期限（T-1）才回 DRAIN_STALLED。
+    ///
+    /// 審查 P8-add3ca0-1：期限到時在 manager lock 內把首次 release 標為逾時（`CustodyReleaseWait::stalled`）並把
+    /// `MarkAttachStalled` 排入 safety lane，再放開 lock：關閉者的結算與此判定互斥，期限內結算者由本 RPC 交 actor、
+    /// 逾時後結算者由關閉者補送 release；補送的 release 排在 `MarkAttachStalled` 之後，完成時清除 stalled
+    /// （與 `wait_attach_op_for_release` 相同，Python `:3192-3204`、`:4340-4363`）。
+    fn wait_custody_close_for_release(
+        &self,
+        sid: &str,
+        by_id: &str,
+        token: u64,
+        deadline: Instant,
+    ) -> Result<Option<PyDict>, PyErr> {
+        let epoch = self
+            .shared
+            .session_public(sid)
+            .and_then(|session| session.get("bridge_generation").and_then(PyValue::as_i64))
+            .unwrap_or(0)
+            .max(0) as u64;
+        let stalled_reply = {
+            let mut inner = lock(&self.shared.inner);
+            loop {
+                if inner.custody.get_custody(by_id).is_none_or(|rec| rec.token != token) {
+                    // 回條已結算（或紀錄由不補送的關閉者收尾）：本 RPC 接著交 actor 完成 release。
+                    inner.custody_release_waits.remove(&token);
+                    return Ok(None);
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    let Some(actor) = inner.sessions.get(sid).map(|entry| entry.actor.clone()) else {
+                        return Ok(None);
+                    };
+                    if let Some(wait) = inner.custody_release_waits.get_mut(&token) {
+                        wait.stalled = true;
+                    }
+                    break enqueue_safety_request(
+                        &actor,
+                        SessionRequest::MarkAttachStalled { epoch },
+                        QUERY_TIMEOUT,
+                    )?;
+                }
+                let (next, _) = self
+                    .shared
+                    .cv
+                    .wait_timeout(inner, (deadline - now).min(Duration::from_millis(50)))
+                    .unwrap_or_else(|e| e.into_inner());
+                inner = next;
             }
-            let now = Instant::now();
-            if now >= deadline {
-                return false;
-            }
-            let (next, _) = self
-                .shared
-                .cv
-                .wait_timeout(inner, (deadline - now).min(Duration::from_millis(50)))
-                .unwrap_or_else(|e| e.into_inner());
-            inner = next;
-        }
+        };
+        let mut response = await_actor_reply(stalled_reply, QUERY_TIMEOUT)?;
+        response.insert("error_code", PyValue::from("DRAIN_STALLED"));
+        Ok(Some(response))
     }
 
     /// 等待 release 已取消的在途作業收尾；作業移除回 `None`，期限到回 DRAIN_STALLED（Python `:3192-3204`）。

@@ -172,6 +172,17 @@ pub enum SessionRequest {
         source: String,
         reason: PyValue,
     },
+    /// 審查 P8-add3ca0-1（設計 DR-2 b、D1 ii）：release 等別的關閉者（熱插拔除等）關閉 by_id 上 parked 帳本紀錄，已於首次
+    /// 期限回 DRAIN_STALLED 之後，該關閉的 closed:true 回條才結算；由關閉者（manager 的 `close_session_preopened`）送出，
+    /// 完成首次 release，不需第二次 release。對應 Python `_finish_attach_op` 的 release 分支：RELEASED、`released_by`／
+    /// `released_reason` 取首次請求、清 `drain_stalled`／`drain_timeout_epoch` 並落盤
+    /// （`origin/main:sw_core/session_manager.py:4340-4363`）。無其他排空在途時才清 stalled 欄位，之後照 `Release` 處理。
+    /// T14 分類：Request（bypass），Open／Pending／Permanent 皆處理（Python `_finish_attach_op` 不看交接凍結）；只完成
+    /// 既有 release 義務，不啟動新工作（不開埠、不送 TX）。
+    CompleteStalledRelease {
+        source: String,
+        reason: PyValue,
+    },
     DeviceAttach {
         force: bool,
     },
@@ -2557,6 +2568,16 @@ impl SessionCore {
             }
             SessionRequest::Submit(req) => self.submit(req, reply, now),
             SessionRequest::Release { source, reason } => self.release_request(source, reason, reply, now),
+            SessionRequest::CompleteStalledRelease { source, reason } => {
+                if self.state != SessionState::Released
+                    && self.stop.is_none()
+                    && self.pending_open_stop.is_none()
+                {
+                    self.drain_stalled = false;
+                    self.drain_timeout_epoch = None;
+                }
+                self.release_request(source, reason, reply, now)
+            }
             SessionRequest::ReleaseWithAck { source, reason, ack } => {
                 let effects = self.release_request(source, reason, reply, now);
                 self.send_release_ack(&ack);

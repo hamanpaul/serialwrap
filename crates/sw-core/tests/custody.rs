@@ -3056,6 +3056,95 @@ fn test_dr2_b_release_bound_session_waits_parked_unplug_close() {
     assert!(m.mgr.custody_for_test(DR7_BY_ID).map(|r| r.token) != Some(token), "回條後紀錄結算");
 }
 
+/// DR-2(b) 逾時分支的前置：parked B3 已於記憶體綁到 COM0（bind 落盤 ENOSPC）、拔除 B3 且關閉暫停；`device.release COM0`
+/// 等滿首次 3 秒絕對期限回 DRAIN_STALLED（T-1）。回傳 rig、裝置、token、COM0 完整 sid 與拔除用熱插執行緒。
+fn dr2_b_release_stalled_on_parked_close() -> (
+    ManagerRig,
+    sw_pal::fakes::serial::FakeDevice,
+    u64,
+    String,
+    std::thread::JoinHandle<()>,
+) {
+    let (m, dev, token) = dr7_formal_parked_rig(None);
+    let full_sid = m.mgr.resolve("COM0").expect("COM0 session");
+    m.fs.fail_next_atomic_write(PalError::io(28, "[Errno 28] No space left on device"));
+    assert!(m.mgr.bind(&full_sid, DR7_BY_ID).is_err(), "前置：bind 落盤 ENOSPC");
+    assert_eq!(
+        m.mgr.custody_for_test(DR7_BY_ID).map(|rec| rec.owner),
+        Some(CustodyOwner::Parked),
+        "前置：parked 未被取走"
+    );
+    dev.pause_next_close();
+    let without: Vec<_> = m.snapshot().into_iter().filter(|(k, _)| k != DR7_BY_ID).collect();
+    let unplug_mgr = m.mgr.clone();
+    let unplug = std::thread::spawn(move || unplug_mgr.update_devices(&without));
+    wait_until("拔除的熱插執行緒停在 parked handle 的關閉", || dev.wait_paused(Duration::from_millis(50)));
+    let started = Instant::now();
+    let stalled = m
+        .mgr
+        .route(&full_sid, dr1_release(), Duration::from_secs(10))
+        .expect("release 回 Ok(reply)");
+    let elapsed = started.elapsed();
+    assert_eq!(dr1_error_code(&stalled).as_deref(), Some("DRAIN_STALLED"), "{stalled:?}");
+    assert!(elapsed >= Duration::from_millis(2900), "T-1：等滿首次 3 秒期限才回：{elapsed:?}");
+    assert!(dev.is_open(), "期限到時關閉仍暫停");
+    assert!(!dr1_persisted_released(&m, &full_sid), "逾時當下尚未 RELEASED 落盤");
+    (m, dev, token, full_sid, unplug)
+}
+
+/// 審查 P8-add3ca0-1（設計 DR-2 b、D1 ii；Python `_AttachOp.release_request` 由第一個 release 寫入、逾時後作業才收尾時
+/// `_finish_attach_op` 仍完成 release，`origin/main:sw_core/session_manager.py:3117-3122`、`:3192-3204`、`:4340-4363`）：
+/// release 等 parked 拔除關閉超過首次期限回 DRAIN_STALLED 之後，遲到的 closed:true 回條須完成首次 release：RELEASED、
+/// `released_by` 為首次 release 的來源、stalled 清除、落盤，且 B3 不自動重開。
+#[test]
+fn test_p8_add3ca0_1_late_parked_close_after_release_stall_completes_release() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (m, dev, token, full_sid, unplug) = dr2_b_release_stalled_on_parked_close();
+    let open_attempts = dev.open_attempts();
+    dev.release_pause();
+    unplug.join().expect("拔除的熱插執行緒不應 panic");
+    m.wait_state("COM0", "RELEASED");
+    let session = m.session(&full_sid);
+    assert_eq!(s_of(&session, "released_by").as_deref(), Some("agent"), "首次 release 的來源：{session:?}");
+    assert!(s_of(&session, "released_at").is_some(), "{session:?}");
+    assert_eq!(session.get("drain_stalled"), Some(&PyValue::Bool(false)), "{session:?}");
+    assert_eq!(session.get("drain_timeout_epoch"), Some(&PyValue::Null), "{session:?}");
+    wait_until("遲到完成的 RELEASED 落盤", || dr1_persisted_released(&m, &full_sid));
+    assert_eq!(m.mgr.terminal_for_test(token).map(|t| t.handle), Some(TerminalHandle::Closed));
+    assert!(m.mgr.custody_for_test(DR7_BY_ID).is_none(), "回條後紀錄結算");
+    assert_eq!(dev.close_count(), 1, "只關閉一次");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(dev.open_attempts(), open_attempts, "release 完成後不自動重開");
+    let again = m
+        .mgr
+        .route(&full_sid, dr1_release(), Duration::from_secs(10))
+        .expect("再次 release 回 Ok");
+    assert_eq!(again.get("already_released"), Some(&PyValue::Bool(true)), "{again:?}");
+}
+
+/// 審查 P8-add3ca0-1 的重插變體（DR-2 a＋b）：release 逾時後、關閉回條前 B3 重新上線；回條 closed:true 後完成首次
+/// release（RELEASED），關閉者不得補排 attach 重開 B3。
+#[test]
+fn test_p8_add3ca0_1_late_parked_close_with_replug_completes_release_without_reopen() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (m, dev, token, full_sid, unplug) = dr2_b_release_stalled_on_parked_close();
+    let open_attempts = dev.open_attempts();
+    m.mgr.update_devices(&dr2_online(&m));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(dev.open_attempts(), open_attempts, "回條前不得重新開埠");
+    dev.release_pause();
+    unplug.join().expect("拔除的熱插執行緒不應 panic");
+    m.wait_state("COM0", "RELEASED");
+    let session = m.session(&full_sid);
+    assert_eq!(s_of(&session, "released_by").as_deref(), Some("agent"), "{session:?}");
+    assert_eq!(session.get("drain_stalled"), Some(&PyValue::Bool(false)), "{session:?}");
+    wait_until("遲到完成的 RELEASED 落盤", || dr1_persisted_released(&m, &full_sid));
+    assert_eq!(m.mgr.terminal_for_test(token).map(|t| t.handle), Some(TerminalHandle::Closed));
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(dev.open_attempts(), open_attempts, "B3 在線但 COM0 已 RELEASED：不得重開");
+    assert_eq!(s_of(&m.session(&full_sid), "state").as_deref(), Some("RELEASED"));
+}
+
 /// DR-5(g) 的 COM2 前置（DR-1 f1）：另一個 by_id 的未接手真 IoWorker 經回收者排空（ActorExited 命令），回傳 (token, 裝置)。
 fn dr5_com2_reaper_drain(m: &ManagerRig, h: &CoreHarness) -> (u64, sw_pal::fakes::serial::FakeDevice) {
     let path = "/dev/ttyUSB-dr5-com2";

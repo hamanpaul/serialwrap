@@ -5753,3 +5753,87 @@ fn wp510r_r6_p8_c92ef3e_1_stale_notice_does_not_stall_unacked_release() {
     assert_eq!(done.get("ok"), Some(&PyValue::Bool(true)), "{done:?}");
     assert_eq!(nested_session_state(&done), PyValue::from("RELEASED"), "{done:?}");
 }
+
+// ---------------------------------------------------------------------------
+// S2-PAR-wp510r 第 12 項第 2 輪：審查 P8-add3ca0-1（parked 關閉逾時後遲到回條完成首次 release）。
+// ---------------------------------------------------------------------------
+
+/// 審查 P8-add3ca0-1 的 T14 凍結分類（設計 §3.1.7）：`SessionRequest::CompleteStalledRelease` 屬 Request（bypass）。DR-2(b)
+/// 的 release 等 parked 拔除關閉逾時（manager 送 `MarkAttachStalled`：RECOVERING＋stalled）之後，關閉者送出的遲到 release
+/// 在 Open／Pending／Permanent 都立即完成首次 release：RELEASED、`released_by`／`released_reason` 取首次請求、清
+/// `drain_stalled`／`drain_timeout_epoch`、落盤（Python `_finish_attach_op` 的 release 分支，
+/// `origin/main:sw_core/session_manager.py:4340-4363`，不看交接凍結），且不啟動新工作（不發 OpenBridge）。落盤回條
+/// `StateCommitted` 屬生命週期事件：Pending 延後、撤銷後重播才回覆（與 `Release` 相同），Open／Permanent 同步回覆。
+#[test]
+fn wp510r_r6_p8_add3ca0_1_complete_stalled_release_under_each_freeze_state() {
+    for freeze in ["open", "pending", "permanent"] {
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        let stalled = h
+            .rpc(SessionRequest::MarkAttachStalled { epoch: 1 })
+            .unwrap();
+        assert_eq!(stalled.get("error_code"), Some(&PyValue::from("SESSION_RECOVERING")));
+        assert_eq!(h.public()["drain_stalled"], PyValue::Bool(true), "前置（{freeze}）");
+        assert_eq!(h.public()["drain_timeout_epoch"], PyValue::from(1), "前置（{freeze}）");
+        let thaw = match freeze {
+            "pending" => match h.reg.admission_gate().freeze_if_idle("wp510r-late-release") {
+                sw_core::admission::FreezeOutcome::Frozen { token, .. } => Some(token),
+                outcome => panic!("應建立暫時凍結：{outcome:?}"),
+            },
+            "permanent" => {
+                h.reg.admission_gate().freeze();
+                None
+            }
+            _ => None,
+        };
+        let (rx, effects) = h.rpc_deferred(SessionRequest::CompleteStalledRelease {
+            source: "agent".into(),
+            reason: PyValue::from("late-close"),
+        });
+        assert!(wp510r_open_bridge_paths(&effects).is_empty(), "{freeze}：不啟動新工作");
+        let public = h.public();
+        assert_eq!(public["state"], PyValue::from("RELEASED"), "{freeze}：{public:?}");
+        assert_eq!(public["released_by"], PyValue::from("agent"), "{freeze}");
+        assert_eq!(public["released_reason"], PyValue::from("late-close"), "{freeze}");
+        assert_eq!(public["drain_stalled"], PyValue::Bool(false), "{freeze}");
+        assert_eq!(public["drain_timeout_epoch"], PyValue::Null, "{freeze}");
+        assert!(
+            h.state_store.last_released().contains_key("t:COM0"),
+            "{freeze}：RELEASED 必須落盤"
+        );
+        if let Some(token) = thaw {
+            assert!(rx.try_recv().is_err(), "Pending：落盤回條延後");
+            assert!(h.reg.admission_gate().thaw(&token));
+            let _ = h.rpc(SessionRequest::GetState);
+        }
+        let reply = rx
+            .try_recv()
+            .unwrap_or_else(|_| panic!("{freeze}：應回覆"))
+            .unwrap();
+        assert_eq!(reply.get("ok"), Some(&PyValue::Bool(true)), "{freeze}：{reply:?}");
+    }
+}
+
+/// 審查 P8-add3ca0-1：遲到 release 抵達時 session 已是 RELEASED（例如之後另一個 release 已完成）：冪等回
+/// `already_released`，不改動 drain 欄位、不刷新 `released_by`。
+#[test]
+fn wp510r_r6_p8_add3ca0_1_complete_stalled_release_on_released_is_idempotent() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let first = h
+        .rpc(SessionRequest::Release {
+            source: "cli".into(),
+            reason: PyValue::Null,
+        })
+        .unwrap();
+    assert_eq!(first.get("ok"), Some(&PyValue::Bool(true)), "{first:?}");
+    let released_at = h.public()["released_at"].clone();
+    let again = h
+        .rpc(SessionRequest::CompleteStalledRelease {
+            source: "agent".into(),
+            reason: PyValue::from("late-close"),
+        })
+        .unwrap();
+    assert_eq!(again.get("already_released"), Some(&PyValue::Bool(true)), "{again:?}");
+    let public = h.public();
+    assert_eq!(public["released_by"], PyValue::from("cli"), "不刷新 provenance");
+    assert_eq!(public["released_at"], released_at);
+}

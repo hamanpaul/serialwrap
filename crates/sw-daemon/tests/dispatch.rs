@@ -9931,3 +9931,78 @@ fn wp510r_r6_rpc_dr5_c_release_rejected_under_handoff_freeze_parked_closed_by_sh
         Some(sw_core::custody::TerminalHandle::Closed)
     );
 }
+
+// ---------------------------------------------------------------------------
+// S2-PAR-wp510r 第 12 項第 2 輪：審查 P8-add3ca0-1（ServiceRig 端到端）
+// ---------------------------------------------------------------------------
+
+/// `state.json` 的 `released` 段是否有 session_id 為 `sid` 的列。
+fn wp510r_r6_state_has_released_sid(r: &ServiceRig, sid: &str) -> bool {
+    let bytes = r.fs.bytes(support::STATE_PATH);
+    let Ok(PyValue::Dict(state)) = sw_proto::pyjson::loads(&String::from_utf8_lossy(&bytes)) else {
+        return false;
+    };
+    matches!(state.get("released"), Some(PyValue::Dict(rows)) if rows.get(sid).is_some())
+}
+
+/// 審查 P8-add3ca0-1（設計 DR-2 b、D1 ii、T-1）：parked usb-G 綁在 COM1 上（雙 ENOSPC：COM1 已於記憶體改綁、parked 未被
+/// 取走）時拔除 usb-G、關閉暫停；`device.release COM1` 經 `Service::rpc` → `SessionManager::route` →
+/// `release_attach_handles`（`WaitCustodyClose`）等滿首次 3 秒期限回 DRAIN_STALLED。之後放行關閉（closed:true），熱插
+/// 執行緒的 `close_session_preopened` 結算紀錄並把首次 release 交給 COM1（`CompleteStalledRelease`）：不需第二次
+/// release 即轉 RELEASED（`released_by` 取首次 release 的 `cli`）、清 `drain_stalled`／`drain_timeout_epoch`、落盤，
+/// usb-G 不重開；之後的 `device.release` 回 already_released（Python `_finish_attach_op` 的 release 分支，
+/// `origin/main:sw_core/session_manager.py:4340-4363`）。
+#[test]
+fn wp510r_r6_rpc_p8_add3ca0_1_release_stalled_on_parked_unplug_close_completes_late() {
+    let r = wp510_b_placeholder_rig();
+    let dev = wp510_review8_double_enospc_bind_setup(&r, false);
+    let parked = r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).expect("前置：parked 帳本紀錄");
+    assert_eq!(parked.owner, sw_core::custody::CustodyOwner::Parked, "{parked:?}");
+    let token = parked.token;
+    let without: Vec<(String, DeviceInfo)> = r
+        .mgr
+        .list_devices()
+        .into_iter()
+        .filter_map(|row| {
+            let by_id = s(&row, "by_id").to_string();
+            let real_path = s(&row, "real_path").to_string();
+            (by_id != WP510_PLACEHOLDER_BY_ID).then(|| (by_id.clone(), DeviceInfo { by_id, real_path }))
+        })
+        .collect();
+    dev.pause_next_close();
+    let unplug_mgr = r.mgr.clone();
+    let unplug = std::thread::spawn(move || unplug_mgr.update_devices(&without));
+    assert!(dev.wait_paused(Duration::from_secs(5)), "拔除的熱插執行緒停在 parked handle 的關閉");
+
+    let started = Instant::now();
+    let stalled = r.call("device.release", r#"{"selector":"COM1"}"#);
+    let elapsed = started.elapsed();
+    assert_eq!(stalled.get("ok"), Some(&PyValue::Bool(false)), "{}", j(&stalled));
+    assert_eq!(stalled.get("error_code"), Some(&PyValue::from("DRAIN_STALLED")), "{}", j(&stalled));
+    assert_eq!(stalled.get("drain_stalled"), Some(&PyValue::Bool(true)), "{}", j(&stalled));
+    assert!(elapsed >= Duration::from_millis(2900), "T-1：等滿首次 3 秒期限：{elapsed:?}");
+    assert!(dev.is_open(), "期限到時關閉仍暫停");
+    let com1_sid = s(&r.session("COM1").expect("COM1 session"), "session_id").to_string();
+    assert!(!wp510r_r6_state_has_released_sid(&r, &com1_sid), "逾時當下 COM1 未落盤");
+    let attempts = dev.open_attempts();
+
+    dev.release_pause();
+    unplug.join().expect("拔除的熱插執行緒不應 panic");
+    r.wait_state("COM1", "RELEASED");
+    let session = r.session("COM1").expect("COM1 session");
+    assert_eq!(s(&session, "released_by"), "cli", "{}", j(&session));
+    assert_eq!(session.get("drain_stalled"), Some(&PyValue::Bool(false)), "{}", j(&session));
+    assert_eq!(session.get("drain_timeout_epoch"), Some(&PyValue::Null), "{}", j(&session));
+    wait_until("遲到完成的 RELEASED 落盤", || wp510r_r6_state_has_released_sid(&r, &com1_sid));
+    assert_eq!(dev.close_count(), 1, "parked handle 只關閉一次");
+    assert!(r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_none(), "回條後紀錄移除");
+    assert_eq!(
+        r.mgr.terminal_for_test(token).map(|t| t.handle),
+        Some(sw_core::custody::TerminalHandle::Closed)
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(dev.open_attempts(), attempts, "release 完成後不自動重開");
+    let again = r.call("device.release", r#"{"selector":"COM1"}"#);
+    assert_eq!(again.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&again));
+    assert_eq!(again.get("already_released"), Some(&PyValue::Bool(true)), "{}", j(&again));
+}
