@@ -371,7 +371,7 @@ static NEXT_ATTACH_OP_TOKEN: AtomicU64 = AtomicU64::new(1);
 ///
 /// | 時點（handle 在哪） | release | shutdown | bind（舊 by_id） | 裝置拔除／改指 |
 /// |---|---|---|---|---|
-/// | 開埠在途／worker 持有（`inflight`，非 parked） | 取消並等待作業收尾，期限到回 DRAIN_STALLED（`release_attach_handles`） | 取消並等待，未收尾列 stalled | 取消並等待，逾時 SESSION_RECOVERING | 取消；worker 收尾關閉 |
+/// | 開埠在途／worker 持有（`inflight`，非 parked） | 取消並等待作業收尾，期限到回 DRAIN_STALLED（`release_attach_handles`）；S2-PAR-wp510r R4 起本 session 的 W6 再解析作業（`AttachOp::external`）不在此等待，改由 actor 的 `ClaimForStop` 寫入帳本紀錄的取消並依 T-1 等其終態 | 取消並等待，未收尾列 stalled | 取消並等待，逾時 SESSION_RECOVERING；W6 作業同 release 改由 actor 的 BindWait 等到終態 | 取消；worker 收尾關閉 |
 /// | parked（`inflight`，`parked`） | 取出並關閉；未確認只告警、立即 DRAIN_STALLED | 不取出直接關閉；未確認保留並列 stalled | 取出並關閉（`close_parked_for_bind`）；未確認只告警，照常改綁 | 取出並關閉；未確認只告警 |
 /// | 交給 session、actor 尚未接手（`handoff`，未 `taken`） | 認領並留撤銷標記（排入的 `open_bridge` 回 `CloseBlocked`、不另開新 handle；標記交 actor，無開埠在途即移除、開埠在途則於其 `BridgeOpened` 終態移除，不隨 release 返回或逾時移除），handle 移入關閉中作業並寫入第一個 release 的請求與期限；鎖內排入 `ReleaseAttachPending`（Python 設 RECOVERING `:3133-3139`）；專用執行緒關閉，release 照在途作業等待：確認關閉後交 actor 完成 RELEASED，期限到回 DRAIN_STALLED、遲到的關閉由 `PlaceholderAttachSettled` 完成 RELEASED；未確認保留 | session 排空後認領並關閉；未確認保留並列 stalled | 認領並關閉後重試；未確認保留，逾時 SESSION_RECOVERING | 認領並關閉；未確認保留 |
 /// | 交接列的關閉中作業（`inflight`，取消者正在關閉） | 取得同一作業、沿用首次期限等待（`:3104-3107`、`:3117-3125`），確認關閉前不回成功 | 等待，未收尾列 stalled | 等待，逾時 SESSION_RECOVERING | 已取消，由關閉者收尾 |
@@ -440,6 +440,10 @@ struct AttachOp {
     /// 作業曾以 `close_parts` 確認關閉 handle（`closed:true`）；`finish_attach_op` 據此結算仍為 `Taken` 的帳本紀錄
     /// （handle 交給 session 或出生即接管者不設定，紀錄由接手方結算）。
     handle_closed: Arc<AtomicBool>,
+    /// S2-PAR-wp510r R4（設計 §3.1.4 W6）：既有 session 的 #181 再解析作業（W6）。其 handle 走外部 attach 協定
+    /// （`BeginExternalAttach` → 帳本紀錄 owner＝該 session → `CustodyOffer`），停止由 actor 的 `ClaimForStop` 收尾：
+    /// manager 的 release 與 bind 不再取消或等待此作業（取代原本的一般 session release 等待與 #26 等待迴圈）。
+    external: Arc<AtomicBool>,
 }
 
 impl AttachOp {
@@ -471,6 +475,7 @@ impl AttachOp {
                 preopened_custody.unwrap_or(0),
             )),
             handle_closed: Arc::new(AtomicBool::new(false)),
+            external: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -700,6 +705,10 @@ struct Shared {
     /// S2-PAR-wp510r R3（test-fakes）：帳本紀錄的關閉者確認關閉並結算後、通知 actor（`CustodyTerminal`）前的暫停點。
     #[cfg(feature = "test-fakes")]
     custody_close_pre_notify_hook: Mutex<Option<ByIdTestHook>>,
+    /// S2-PAR-wp510r R4（test-fakes）：W6 worker 的 `BeginExternalAttach` 已被接受、以該 token 登記帳本紀錄之前的一次性
+    /// 暫停點（重現「先取消、後登記」：停止者在登記前送達，`ClaimForStop` 寫入 tombstone）。
+    #[cfg(feature = "test-fakes")]
+    external_attach_pre_register_hook: Mutex<Option<ByIdTestHook>>,
     /// 只供測試（test-fakes）：下一次建立 attach worker 執行緒時模擬 `Builder::spawn()` 失敗（執行緒資源耗盡）。
     #[cfg(feature = "test-fakes")]
     fail_next_attach_spawn: AtomicBool,
@@ -1131,8 +1140,8 @@ impl Shared {
         }
     }
 
-    /// worker 持有的 handle（W6 再解析、DETACHED-rebind 帶著的預開 handle）先存入帳本（`Held{Worker}`），再以
-    /// `AcceptCustody` 交給既有 session（`offer_custody`）。回傳 token；by_id 已有其他紀錄時交還 handle。
+    /// DETACHED-rebind 帶著的預開 handle 先存入帳本（`Held{Worker}`），再經外部 attach 協定（`BeginExternalAttach` 接受後
+    /// 改 owner 並送 `CustodyOffer`，S2-PAR-wp510r R4）交給既有 session。回傳 token；by_id 已有其他紀錄時交還 handle。
     fn place_worker_custody_locked(inner: &mut Inner, by_id: &str, op: &AttachOp, pre: Preopened) -> Result<u64, Preopened> {
         let owner = crate::custody::CustodyOwner::Worker(format!("attach-{}", op.token));
         if let Some(token) = pre.custody {
@@ -1161,8 +1170,9 @@ impl Shared {
         }
     }
 
-    /// 把帳本紀錄 `token` 交給既有 session（設計 C7：actor 先同步接受、記下 token，紀錄才轉為該 session 所有；W6 的
-    /// `BeginExternalAttach` 協定）。回傳是否接受；未接受時紀錄不動，由呼叫端收尾。
+    /// 把帳本紀錄 `token` 交給既有 session（設計 C7：actor 先同步接受、記下 token，紀錄才轉為該 session 所有）。只剩
+    /// `session.bind` 改綁到 parked 的路徑使用（`open_now:false`，之後經 `DeviceOnline` 開埠）；W6 與 parked 續行改走
+    /// `BeginExternalAttach`（S2-PAR-wp510r R4）。回傳是否接受；未接受時紀錄不動，由呼叫端收尾。
     fn offer_custody(&self, sid: &str, by_id: &str, token: u64, real_path: &str, open_now: bool) -> bool {
         self.request(
             sid,
@@ -1278,11 +1288,28 @@ impl Shared {
             .find(|(_, rec)| rec.token == token)
             .map(|(by_id, rec)| (by_id.clone(), rec))
         else {
+            // 先取消、後登記（設計 §3.1.4 W6 第 2 步）：已接受 `BeginExternalAttach` 的 W6 worker 尚未登記，寫入 tombstone，
+            // worker 之後的 `register_with_token` 即中止、不開埠。已結算移除的 token 本就在 tombstones 內（重複寫入無害）。
+            inner.custody.tombstones.insert(token);
             return (CustodyClaimOutcome::Gone, None);
         };
         if let Some(deadline) = release_deadline {
             rec.release_deadline.get_or_insert(deadline);
         }
+        if matches!(
+            rec.phase,
+            crate::custody::CustodyPhase::Opening { .. } | crate::custody::CustodyPhase::Taken { .. }
+        ) {
+            // 紀錄上的 PROBE fence 由 cancel 凍結（設計 §3.1.8 WP3-1、§3.1.9 零 TX）：持有該紀錄的 attach 作業（W6 再解析）
+            // 一併取消，進行中的 PROBE 寫入撤銷、已越過檢查點的提交於 fence 重驗即拒絕（Python release／bind／改指對作業
+            // `probe_bridge.begin_drain`，`origin/main:sw_core/session_manager.py:3125-3131`、`:3686-3691`、`:4039-4043`）。
+            if let Some(op) = inner.inflight.get(&by_id).filter(|op| op.custody_token() == Some(token)) {
+                op.cancel();
+            }
+        }
+        let Some(rec) = inner.custody.custody.get_mut(&by_id) else {
+            return (CustodyClaimOutcome::Gone, None);
+        };
         match &mut rec.phase {
             crate::custody::CustodyPhase::Held { parts } => {
                 let parts = parts.take();
@@ -2000,10 +2027,10 @@ impl Shared {
             parked_token,
             inner.session_by_id(by_id).map(|e| e.sid.clone()),
         ) {
-            // 未消費的預開作業、已有綁定的 session（設計 C7、DR-7）：以 `AcceptCustody` 交給該 session，actor 接受後在
-            // 自己的執行緒以 C1′ 同 token 認領 parked（`Effect::ClaimOffered`）並以 `ClaimCustody` 開埠；未接受時 parked
-            // 維持原狀（Python `_attach_by_id` 自 `_preopened_ports` 取走作業以同一 handle 續行，
-            // `origin/main:sw_core/session_manager.py:4852-4854`）。
+            // 未消費的預開作業、已有綁定的 session（設計 §3.1.4 W6 第 4 步、C7）：以 parked 紀錄的既有 token 送
+            // `BeginExternalAttach`，被接受後才 `claim_parked`（同 token 存回 `Held{Session}`）並送 `CustodyOffer`，actor 以
+            // `ClaimCustody` 開埠；未接受時 parked 維持原狀（Python `_attach_by_id` 自 `_preopened_ports` 取走作業以同一
+            // handle 續行，`origin/main:sw_core/session_manager.py:4852-4854`）。
             let rec_path = inner
                 .custody
                 .get_custody(by_id)
@@ -2015,8 +2042,8 @@ impl Shared {
                 let _ = pre.parts.close();
             }
             if let (Some(rec_path), Some(real)) = (rec_path, real) {
-                if rec_path == real && self.offer_custody(&sid, by_id, token, &real, true) {
-                    self.cv.notify_all();
+                if rec_path == real {
+                    self.offer_parked_to_session(&sid, by_id, token, &real);
                 }
             }
             return;
@@ -2086,7 +2113,12 @@ impl Shared {
         }
         // 只有 parked 續行會帶 handle 進來（呼叫端皆傳 `None`）：路徑沿用 handle 開啟時的路徑，與目前路徑不符者由
         // `attach_dynamic` 關閉；帳本 token 隨 handle 帶入作業（`Preopened::custody` → `AttachOp::custody_token`）。
+        let existing_session = inner.session_by_id(by_id).is_some();
         let op = AttachOp::new(by_id, &self.unconfirmed_closes, after_clear, dynamic_only, preopened);
+        if existing_session {
+            // 既有 session 的 #181 再解析（W6）：外部 attach 協定，停止由該 session 的 actor 收尾（設計 §3.1.4 W6）。
+            op.external.store(true, Ordering::SeqCst);
+        }
         inner.inflight.insert(by_id.to_string(), op.clone());
         drop(inner);
         self.spawn_attach_worker(by_id, op);
@@ -2228,8 +2260,8 @@ impl Shared {
     }
 
     /// DETACHED-rebind：改綁 session 到新 by_id，寫 binding override，然後 attach。作業帶有預開 handle（接手的未消費
-    /// 預開作業）時交給該 session 的正式 bridge（Python `_attach_by_id` 改綁後沿用 `preopened_op`，
-    /// `origin/main:sw_core/session_manager.py:4857-4866`、`:4982`）。
+    /// 預開作業）時經外部 attach 協定（`BeginExternalAttach` → `Held{Session}` → `CustodyOffer`）交給該 session 的正式
+    /// bridge（Python `_attach_by_id` 改綁後沿用 `preopened_op`，`origin/main:sw_core/session_manager.py:4857-4866`、`:4982`）。
     fn rebind_detached(self: &Arc<Self>, sid: &str, by_id: &str, op: &AttachOp) {
         let r = self.request(
             sid,
@@ -2276,8 +2308,54 @@ impl Shared {
             self.warn(format!("state.json 寫入失敗（binding {sid}）：{e:?}"));
         }
         if let Some((token, real_path)) = offered {
-            if self.offer_custody(sid, by_id, token, &real_path, true) {
-                return;
+            // 外部 attach 協定（設計 §3.1.4 W6、C7）：先 `BeginExternalAttach`，actor 記下 token 後紀錄才轉為該 session
+            // 所有（`Held{Session}`）並送 `CustodyOffer`；未接受或已取消時由此關閉並結算。
+            if self.begin_external_attach(sid, by_id, token, &real_path) {
+                let offered = {
+                    let mut inner = lock(&self.inner);
+                    let inc = inner.custody.current_session_inc(sid);
+                    let actor = inner.sessions.get(sid).map(|e| e.actor.control.clone());
+                    let cancelled = op.cancelled.load(Ordering::SeqCst);
+                    match (inner.custody.custody.get_mut(by_id), actor) {
+                        (Some(rec), Some(actor))
+                            if rec.token == token
+                                && rec.cancel.is_none()
+                                && !cancelled
+                                && matches!(rec.phase, crate::custody::CustodyPhase::Held { parts: Some(_) }) =>
+                        {
+                            rec.owner = crate::custody::CustodyOwner::Session {
+                                sid: sid.to_string(),
+                                inc,
+                            };
+                            Some(actor.try_send(ControlEvent::CustodyOffer { token }))
+                        }
+                        _ => None,
+                    }
+                };
+                match offered {
+                    Some(Ok(())) | Some(Err(crossbeam_channel::TrySendError::Full(_))) => return,
+                    Some(Err(crossbeam_channel::TrySendError::Disconnected(_))) => {
+                        self.close_unoffered_custody(by_id, token);
+                        return;
+                    }
+                    None => {
+                        // 已取消或紀錄已變：仍是 `Held` 者由此關閉並結算（`finish_custody_close` 依 by_id 通知本 session）；
+                        // 已在他人關閉中者等關閉者通知；紀錄已不在者通知 actor 結束外部 attach。
+                        let phase_closing = lock(&self.inner).custody.get_custody(by_id).and_then(|rec| {
+                            (rec.token == token).then_some(matches!(
+                                rec.phase,
+                                crate::custody::CustodyPhase::Closing { .. }
+                                    | crate::custody::CustodyPhase::CloseFailed { .. }
+                            ))
+                        });
+                        match phase_closing {
+                            Some(true) => {}
+                            Some(false) => self.close_unoffered_custody(by_id, token),
+                            None => self.notify_external_terminal(sid, token, true, None),
+                        }
+                        return;
+                    }
+                }
             }
             self.close_unoffered_custody(by_id, token);
         }
@@ -2650,11 +2728,40 @@ impl Shared {
                 }
             }
             inner.inflight.remove(by_id);
+            let mut external_abort = None;
             if let Some(rec) = inner.custody.custody.get(by_id) {
                 if matches!(rec.phase, crate::custody::CustodyPhase::Opening { .. }) {
-                    inner.custody.custody.remove(by_id);
+                    // W6 的紀錄（owner＝session、taker＝worker）在 worker 異常結束時仍是 Opening：以 NoHandle 結算並通知
+                    // 該 session 結束外部 attach（停止在等它的終態時亦一併收斂；設計 C2 持有者須回報終態）。
+                    match (&rec.owner, &rec.phase) {
+                        (
+                            crate::custody::CustodyOwner::Session { sid, .. },
+                            crate::custody::CustodyPhase::Opening {
+                                taker: crate::custody::CustodyTaker::Worker(_),
+                            },
+                        ) if op.custody_token() == Some(rec.token) => {
+                            external_abort = Some((sid.clone(), rec.token));
+                            let token = rec.token;
+                            inner.custody.settle_close(
+                                token,
+                                crate::custody::Terminal {
+                                    handle: crate::custody::TerminalHandle::NoHandle,
+                                    evidence: crate::custody::TerminalEvidence::Complete,
+                                },
+                            );
+                        }
+                        _ => {
+                            inner.custody.custody.remove(by_id);
+                        }
+                    }
                 }
             }
+            drop(inner);
+            self.cv.notify_all();
+            if let Some((sid, token)) = external_abort {
+                self.notify_external_terminal(&sid, token, true, None);
+            }
+            return;
         }
         drop(inner);
         self.cv.notify_all();
@@ -3117,23 +3224,81 @@ impl Shared {
         let Some(real) = lock(&self.inner).device_path(by_id).map(str::to_string) else {
             return;
         };
-        let handle = match self.gated_open(by_id, &real, op) {
-            None => return,
-            Some(Ok(h)) => h,
-            Some(Err(_)) => {
-                // 開埠失敗：交給 actor 的正式 attach 路徑回報（ATTACH_FAILED:*）。
+        // W6 外部 attach（設計 §3.1.4 W6）：先以預配 token 同步送 `BeginExternalAttach`，actor 記下 token 後才登記帳本紀錄
+        // （C7）與開埠；被拒（RELEASED、有停止、凍結、狀態不會開埠）就結束、不開埠（Python `_preopen_auto_attach_port`
+        // 回 None，`origin/main:sw_core/session_manager.py:4159-4176`）。
+        let token = lock(&self.inner).custody.alloc_token();
+        if !self.begin_external_attach(sid, by_id, token, &real) {
+            return;
+        }
+        #[cfg(feature = "test-fakes")]
+        {
+            let hook = {
+                let mut slot = lock(&self.external_attach_pre_register_hook);
+                match slot.as_ref() {
+                    Some((key, _)) if key == by_id => slot.take().map(|(_, hook)| hook),
+                    _ => None,
+                }
+            };
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        // 第 2 步：登記 `Opening{Worker}`、owner＝本 session（Python 作業登記於 `_attach_ops`、`session_id` 為該 session，
+        // `:4185-4191`）；有 tombstone（停止者先到）就中止。
+        let registered = {
+            let mut inner = lock(&self.inner);
+            let inc = inner.custody.current_session_inc(sid);
+            if op.cancelled.load(Ordering::SeqCst) {
+                Err(crate::custody::CustodyRegisterError::Tombstoned)
+            } else {
+                inner
+                    .custody
+                    .register_with_token(
+                        by_id,
+                        token,
+                        &real,
+                        crate::custody::CustodyOwner::Session {
+                            sid: sid.to_string(),
+                            inc,
+                        },
+                        crate::custody::CustodyTaker::Worker(format!("attach-{}", op.token)),
+                    )
+                    .map(|()| inc)
+            }
+        };
+        let Ok(inc) = registered else {
+            self.abort_external_attach(sid, by_id, token, None);
+            return;
+        };
+        op.set_custody_token(token);
+        if !self.external_still_valid(by_id, &real, op, token) {
+            self.abort_external_attach(sid, by_id, token, None);
+            return;
+        }
+        let opened = self.serial.open_exclusive(
+            &DevicePath(real.clone()),
+            &serial_config(&UartProfile::default()),
+        );
+        let handle = match opened {
+            Ok(h) => h,
+            Err(_) => {
+                // 開埠失敗：紀錄以 NoHandle 結算、actor 結束外部 attach，再交 actor 的正式 attach 路徑回報（ATTACH_FAILED:*）。
+                self.abort_external_attach(sid, by_id, token, None);
                 self.send_attached(by_id);
                 return;
             }
         };
         let mut parts = HandleParts::split(handle);
-        if !self.still_valid(by_id, &real, op) {
-            let _ = op.close_parts(parts);
+        // 開埠返回後的檢查點：release／bind／shutdown／拔除已寫入取消就關閉而不 PROBE（Python 開埠返回見 `cancelled` 即
+        // `_finish_attach_op`，`:4216-4245`；設計 C5：`Opening` 由持有者在下一個檢查點關閉）。
+        if !self.external_still_valid(by_id, &real, op, token) {
+            self.abort_external_attach(sid, by_id, token, Some(parts));
             return;
         }
         let detected = self.detect_template(op, &mut parts);
-        if !self.still_valid(by_id, &real, op) {
-            let _ = op.close_parts(parts);
+        if !self.external_still_valid(by_id, &real, op, token) {
+            self.abort_external_attach(sid, by_id, token, Some(parts));
             return;
         }
         let mut sid_now = sid.to_string();
@@ -3144,37 +3309,197 @@ impl Shared {
                 }
             }
         }
-        let mut inner = lock(&self.inner);
-        let known = inner.sessions.contains_key(&sid_now);
-        match known {
-            // 作業仍在在途表（worker 收尾才移除）：handle 於同一臨界區存入帳本（`Held{Worker}`），再以 `AcceptCustody`
-            // 交給 session（設計 C7、§3.1.4 W6）；已取消者不交出（Python `_attach_by_id` 見 `cancelled` 中止並
-            // `_finish_attach_op`，`origin/main:sw_core/session_manager.py:4933-4944`）。
-            true if !op.cancelled.load(Ordering::SeqCst) => {
-                let placed = Self::place_worker_custody_locked(
-                    &mut inner,
-                    by_id,
-                    op,
-                    Preopened::new(real.clone(), parts),
+        // 第 3 步：鎖內存回 `Held{Session}`（rematerialize 改名時同步更新 owner），`try_send CustodyOffer`；送不出去（Full）
+        // 由 actor 的 `CustodyPoll` 補收，actor 已結束（Disconnected）就由此關閉並結算（設計 §3.1.5）。Python 再偵測不寫
+        // sticky（`_maybe_persist_sticky` 只在動態 attach；審查 F65）。
+        let offered = {
+            let mut inner = lock(&self.inner);
+            let actor = inner.sessions.get(&sid_now).map(|e| e.actor.control.clone());
+            let cancelled = op.cancelled.load(Ordering::SeqCst);
+            match (inner.custody.custody.get_mut(by_id), actor) {
+                (Some(rec), Some(actor))
+                    if rec.token == token
+                        && rec.cancel.is_none()
+                        && !cancelled
+                        && matches!(rec.phase, crate::custody::CustodyPhase::Opening { .. }) =>
+                {
+                    rec.phase = crate::custody::CustodyPhase::Held { parts: Some(parts) };
+                    rec.owner = crate::custody::CustodyOwner::Session {
+                        sid: sid_now.clone(),
+                        inc,
+                    };
+                    Ok(actor.try_send(ControlEvent::CustodyOffer { token }))
+                }
+                _ => Err(parts),
+            }
+        };
+        match offered {
+            Ok(Ok(())) | Ok(Err(crossbeam_channel::TrySendError::Full(_))) => {}
+            Ok(Err(crossbeam_channel::TrySendError::Disconnected(_))) => {
+                self.close_unoffered_custody(by_id, token);
+            }
+            Err(parts) => self.abort_external_attach(&sid_now, by_id, token, Some(parts)),
+        }
+    }
+
+    /// W6 第 1 步（設計 §3.1.4）：在鎖外同步送 `BeginExternalAttach`，回傳 actor 是否接受。請求失敗（逾時、actor 已結束）
+    /// 時寫入 tombstone 並通知 actor 結束外部 attach：逾時的請求仍可能被 actor 處理而接受，tombstone 讓之後的 `CustodyPoll`
+    /// 以 NoHandle 收尾，不會一直等 offer。
+    fn begin_external_attach(&self, sid: &str, by_id: &str, token: u64, real_path: &str) -> bool {
+        let reply = self.request(
+            sid,
+            SessionRequest::BeginExternalAttach {
+                token,
+                by_id: by_id.to_string(),
+                real_path: real_path.to_string(),
+            },
+            QUERY_TIMEOUT,
+        );
+        match reply {
+            Ok(reply) => is_ok(&reply),
+            Err(_) => {
+                lock(&self.inner).custody.tombstones.insert(token);
+                self.notify_external_terminal(sid, token, true, None);
+                false
+            }
+        }
+    }
+
+    /// W6 檢查點：未 stopping、作業未取消、by_id 無未確認關閉、裝置路徑未變，且帳本紀錄仍是本 token、未被停止者寫入取消
+    /// （release、bind、shutdown、改指的 `ClaimForStop`；設計 C5）。
+    fn external_still_valid(&self, by_id: &str, real: &str, op: &AttachOp, token: u64) -> bool {
+        self.still_valid(by_id, real, op)
+            && lock(&self.inner)
+                .custody
+                .get_custody(by_id)
+                .is_some_and(|rec| rec.token == token && rec.cancel.is_none())
+    }
+
+    /// W6 中止（未交出 handle）：持有 handle 者關閉並依回條結算（closed:false 依 D1 iii 轉 CloseFailed、登記未確認關閉）；
+    /// 沒有 handle 者以 NoHandle 結算（紀錄未登記時寫入 tombstone）。兩者都以 `CustodyTerminal` 通知 actor：停止在等的是
+    /// 該紀錄的終態（release、bind 的等待），或外部 attach 仍在等 offer（就此結束）。
+    fn abort_external_attach(&self, sid: &str, by_id: &str, token: u64, parts: Option<HandleParts>) {
+        let notify = self.actor_of(sid).map(|actor| actor.control.clone());
+        if let Some(parts) = parts {
+            let receipt = parts.close();
+            match notify {
+                Some(notify) => self.finish_custody_close(by_id, token, receipt, Some(notify)),
+                None => self.finish_custody_close(by_id, token, receipt, None),
+            }
+            return;
+        }
+        {
+            let mut inner = lock(&self.inner);
+            if inner.custody.get_custody(by_id).is_some_and(|rec| {
+                rec.token == token && matches!(rec.phase, crate::custody::CustodyPhase::Opening { .. })
+            }) {
+                inner.custody.settle_close(
+                    token,
+                    crate::custody::Terminal {
+                        handle: crate::custody::TerminalHandle::NoHandle,
+                        evidence: crate::custody::TerminalEvidence::Complete,
+                    },
                 );
-                drop(inner);
-                match placed {
-                    // Python `_attach_by_id` 的再偵測不寫 sticky（`_maybe_persist_sticky` 只在動態 attach；審查 F65）。
-                    Ok(token) => {
-                        if !self.offer_custody(&sid_now, by_id, token, &real, true) {
-                            self.close_unoffered_custody(by_id, token);
-                            self.send_attached(by_id);
+            } else {
+                inner.custody.tombstones.insert(token);
+            }
+        }
+        self.cv.notify_all();
+        self.notify_external_terminal(sid, token, true, None);
+    }
+
+    /// 以 `CustodyTerminal` 通知 session 的 actor（鎖外、阻塞送；actor 已結束則略過）。
+    fn notify_external_terminal(&self, sid: &str, token: u64, closed: bool, error: Option<String>) {
+        if let Some(actor) = self.actor_of(sid) {
+            let _ = actor.control.send(ControlEvent::CustodyTerminal { token, closed, error });
+        }
+    }
+
+    /// 設計 §3.1.4 W6 第 4 步：既有 session 接手 parked。以 parked 紀錄的既有 token 送 `BeginExternalAttach`，被接受後才
+    /// `claim_parked`（同 token，owner 改為該 session，handle 存回 `Held{Session}`，parked 作業移出在途表），再
+    /// `try_send CustodyOffer`（送不出去時由 actor 的 `CustodyPoll` 補收）。請求未被接受時不認領，紀錄維持 Parked
+    /// （Python `_attach_by_id` 自 `_preopened_ports` 取走作業以同一 handle 續行，`origin/main:sw_core/session_manager.py:4852-4854`）。
+    fn offer_parked_to_session(&self, sid: &str, by_id: &str, token: u64, real: &str) {
+        if !self.begin_external_attach(sid, by_id, token, real) {
+            return;
+        }
+        enum Outcome {
+            /// 已存回 `Held{Session}` 並 `try_send CustodyOffer`；`disconnected`＝actor 已結束（Full 由 `CustodyPoll` 補收）。
+            Offered { disconnected: bool },
+            /// 紀錄已在他人關閉中：關閉者確認後通知（`finish_custody_close` 依 by_id 找到本 session）。
+            Closing,
+            /// 紀錄已不可認領（已結算、CloseFailed 或已非 parked）：通知 actor 結束外部 attach。
+            Abort { closed: bool, error: Option<String> },
+        }
+        let outcome = {
+            let mut inner = lock(&self.inner);
+            let parked_op = inner
+                .inflight
+                .get(by_id)
+                .is_some_and(|op| op.token == token && op.parked.load(Ordering::SeqCst));
+            let actor = inner.sessions.get(sid).map(|e| e.actor.control.clone());
+            let inc = inner.custody.current_session_inc(sid);
+            let claimable = parked_op
+                && actor.is_some()
+                && inner.custody.get_custody(by_id).is_some_and(|rec| {
+                    rec.token == token
+                        && rec.owner == crate::custody::CustodyOwner::Parked
+                        && rec.real_path == real
+                        && matches!(rec.phase, crate::custody::CustodyPhase::Held { parts: Some(_) })
+                });
+            if claimable {
+                if let Some(op) = inner.inflight.remove(by_id) {
+                    op.parked.store(false, Ordering::SeqCst);
+                }
+                match inner.custody.claim_parked(
+                    by_id,
+                    real,
+                    crate::custody::CustodyTaker::Worker(format!("w6-parked-{token}")),
+                ) {
+                    Ok((_, parts)) => {
+                        if let Some(rec) = inner.custody.custody.get_mut(by_id) {
+                            rec.phase = crate::custody::CustodyPhase::Held { parts };
+                            rec.owner = crate::custody::CustodyOwner::Session {
+                                sid: sid.to_string(),
+                                inc,
+                            };
+                        }
+                        let actor = actor.expect("claimable 已確認 actor");
+                        Outcome::Offered {
+                            disconnected: matches!(
+                                actor.try_send(ControlEvent::CustodyOffer { token }),
+                                Err(crossbeam_channel::TrySendError::Disconnected(_))
+                            ),
                         }
                     }
-                    Err(pre) => {
-                        let _ = op.close_parts(pre.parts);
-                    }
+                    Err(_) => Outcome::Abort { closed: true, error: None },
+                }
+            } else {
+                match inner.custody.get_custody(by_id).filter(|rec| rec.token == token) {
+                    Some(rec) => match &rec.phase {
+                        crate::custody::CustodyPhase::Closing { .. } => Outcome::Closing,
+                        crate::custody::CustodyPhase::CloseFailed { error } => Outcome::Abort {
+                            closed: false,
+                            error: Some(error.clone()),
+                        },
+                        _ => Outcome::Abort { closed: true, error: None },
+                    },
+                    None => match inner.custody.terminals.get(&token).map(|t| t.handle.clone()) {
+                        Some(crate::custody::TerminalHandle::Failed { error }) => Outcome::Abort {
+                            closed: false,
+                            error: Some(error),
+                        },
+                        _ => Outcome::Abort { closed: true, error: None },
+                    },
                 }
             }
-            _ => {
-                drop(inner);
-                let _ = op.close_parts(parts);
-            }
+        };
+        self.cv.notify_all();
+        match outcome {
+            Outcome::Offered { disconnected: false } => {}
+            Outcome::Offered { disconnected: true } => self.close_unoffered_custody(by_id, token),
+            Outcome::Closing => {}
+            Outcome::Abort { closed, error } => self.notify_external_terminal(sid, token, closed, error),
         }
     }
 
@@ -4254,6 +4579,44 @@ impl EffectExecutor for ManagerExec {
                 }
                 self.shared.cv.notify_all();
             }
+            Effect::PollCustody { tokens } => {
+                // 設計 C4 的補收（`TimerEvent::CustodyPoll`）：W6 的 offer 或終態通知送不出去時，由 actor 自己查帳本。紀錄已是
+                // 本 session 的 `Held`（未取消）→ 補送 `CustodyOffer`；紀錄已轉 CloseFailed，或已移除且有終態／tombstone →
+                // 補送 `CustodyTerminal`。資源收尾類效果：只查詢，不改帳本。
+                let sid = lock(&self.io.sid).clone();
+                let inner = lock(&self.shared.inner);
+                for token in tokens {
+                    match inner.custody.get_custody_by_token(token) {
+                        Some(rec) => match &rec.phase {
+                            crate::custody::CustodyPhase::Held { parts: Some(_) }
+                                if rec.cancel.is_none()
+                                    && matches!(&rec.owner, crate::custody::CustodyOwner::Session { sid: owner, .. } if *owner == sid) =>
+                            {
+                                feedback.push_back(ControlEvent::CustodyOffer { token });
+                            }
+                            crate::custody::CustodyPhase::CloseFailed { error } => {
+                                feedback.push_back(ControlEvent::CustodyTerminal {
+                                    token,
+                                    closed: false,
+                                    error: Some(error.clone()),
+                                });
+                            }
+                            _ => {}
+                        },
+                        None => {
+                            let terminal = inner.custody.terminals.get(&token).map(|terminal| match &terminal.handle {
+                                crate::custody::TerminalHandle::Failed { error } => (false, Some(error.clone())),
+                                _ => (true, None),
+                            });
+                            let terminal = terminal
+                                .or_else(|| inner.custody.tombstones.contains(&token).then_some((true, None)));
+                            if let Some((closed, error)) = terminal {
+                                feedback.push_back(ControlEvent::CustodyTerminal { token, closed, error });
+                            }
+                        }
+                    }
+                }
+            }
             other => self.execute(other, tx, safety),
         }
     }
@@ -4482,7 +4845,9 @@ impl EffectExecutor for ManagerExec {
             // P6 Task 6（07 D-15(5)）：交給 per-epoch pump（try_send，actor 永不阻塞）；送不出去以 NotSubmitted 回報。
             Effect::HumanTx { tag, permit, payload } => self.human_tx(tag, permit, payload, tx),
             // S2-PAR-wp510r R1: 輪詢保管帳本終態與 offer
-            Effect::PollCustody { tokens: _ } => {}
+            Effect::PollCustody { .. } => {
+                // 只經 `execute_with_feedback`（立即回饋）執行；此處不會收到。
+            }
         }
     }
 }
@@ -4696,6 +5061,8 @@ impl SessionManager {
             finish_attach_op_pre_lock_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             custody_close_pre_notify_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            external_attach_pre_register_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             fail_next_attach_spawn: AtomicBool::new(false),
             #[cfg(feature = "test-fakes")]
@@ -5058,7 +5425,15 @@ impl SessionManager {
                 if by_id.is_empty() {
                     return Ok(None);
                 }
-                if let Some(op) = inner.inflight.get(&by_id).cloned() {
+                if let Some(op) = inner
+                    .inflight
+                    .get(&by_id)
+                    .filter(|op| !op.external.load(Ordering::SeqCst))
+                    .cloned()
+                {
+                    // 本 session 的 W6 再解析作業（`external`）不在此等待：它的 handle 走外部 attach 協定，actor 的 release 以
+                    // `ClaimForStop` 取消並等該紀錄的終態，期限依 T-1（設計 §3.1.4 W6、§3.1.6；S2-PAR-wp510r R4 移除一般
+                    // session 的 manager release 等待）。
                     if op.parked.swap(false, Ordering::SeqCst) {
                         inner.inflight.remove(&by_id);
                         let pre = inner.custody.claim_for_release(&by_id, op.token).ok().flatten().map(|parts| {
@@ -5325,8 +5700,15 @@ impl SessionManager {
             let sid = e.sid.clone();
             let old_by_id = e.profile.device_by_id.clone();
             let io = e.io.clone();
-            // #26：舊 by_id 的 attach op 進行中 → 取消並等待（上限 3000 ms）後重試；逾時 → SESSION_RECOVERING。
-            if let Some(op) = inner.inflight.get(&old_by_id).cloned() {
+            // #26：舊 by_id 的 attach op 進行中 → 取消並等待（上限 3000 ms）後重試；逾時 → SESSION_RECOVERING。本 session 的
+            // W6 再解析作業（`external`）改由 actor 的 bind 以 `ClaimForStop` 取消並等到終態（BindWait 3000 ms，設計 §3.1.4
+            // bind；S2-PAR-wp510r R4 移除再解析的 manager 等待迴圈）。
+            if let Some(op) = inner
+                .inflight
+                .get(&old_by_id)
+                .filter(|op| !op.external.load(Ordering::SeqCst))
+                .cloned()
+            {
                 op.cancel();
                 if op.parked.swap(false, Ordering::SeqCst) {
                     // 未消費的預開作業沒有 worker，不可等待（審查 P8-503c341-1）：Python 自 `_preopened_ports` 取出後直接
@@ -6202,6 +6584,12 @@ impl SessionManager {
     #[cfg(feature = "test-fakes")]
     pub fn set_custody_close_pre_notify_hook_for_test(&self, by_id: &str, hook: Box<dyn FnOnce() + Send>) {
         *lock(&self.shared.custody_close_pre_notify_hook) = Some((by_id.to_string(), hook));
+    }
+
+    /// 只供測試（test-fakes）：W6 worker 的 `BeginExternalAttach` 被接受後、登記帳本紀錄前暫停（綁定 by_id，一次性）。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_external_attach_pre_register_hook_for_test(&self, by_id: &str, hook: Box<dyn FnOnce() + Send>) {
+        *lock(&self.shared.external_attach_pre_register_hook) = Some((by_id.to_string(), hook));
     }
 
     /// 只供測試（test-fakes）：設定下 n 次 actor spawn 注入失敗。

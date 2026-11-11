@@ -144,6 +144,11 @@ pub enum ControlEvent {
     /// S2-PAR-wp510r R3：session 擁有的帳本紀錄已有關閉終態（關閉工作者或開埠工作在提交點關閉）。`closed:false` 時
     /// 紀錄已轉 CloseFailed 並登記未確認關閉（D1 iii）。T14 分類：生命週期（Open 處理、Pending 延後、Permanent 處理）。
     CustodyTerminal { token: u64, closed: bool, error: Option<String> },
+    /// S2-PAR-wp510r R4（設計 §3.1.4 W6 第 3 步、C4）：W6 worker 已把 PROBE 用過的 handle 存回本 session 擁有的帳本紀錄
+    /// （`Held{Session}`）。只帶 token、不承載所有權：manager 在鎖內 `try_send`，送不出去時由 actor 的 `CustodyPoll`
+    /// 計時器補收（`Effect::PollCustody` 的立即回饋）。actor 只在 `external_attach` 正在等 offer 且 token 相符時以
+    /// `ClaimCustody` 開埠；其他情況忽略（C6）。T14 分類：生命週期（Open 認領後開埠、Pending 延後、Permanent 只關閉）。
+    CustodyOffer { token: u64 },
     /// S2-PAR-wp510r: 測試注入 actor panic
     #[cfg(feature = "test-fakes")]
     ArmPanic { count: u8 },
@@ -181,7 +186,9 @@ pub enum TimerEvent {
     DrainTimeout { epoch: u64, stop_id: StopId },
     /// P7 Task 9：force recover 第 `n` 次 READY 輪詢（`_force_recover` 的 `time.sleep(1.0)`；`id` 為等待者）。
     ForceRecoverPoll { id: u64, n: u32 },
-    /// S2-PAR-wp510r R1: CustodyPoll 本地計時器（每 500 ms 補收或確認終態/offer）。
+    /// S2-PAR-wp510r R1: CustodyPoll 本地計時器（每 500 ms 補收或確認終態/offer）。R4 起由 `BeginExternalAttach` 接受後
+    /// 排程，只在 `external_attach` 正在等 offer 時發 `Effect::PollCustody` 並重排。T14 分類同其他 `Timer`（生命週期）：
+    /// Open 處理、Pending 延後並於撤銷後重播、Permanent 處理（只查詢；補收到的 offer 只關閉）。
     CustodyPoll,
     /// S2-PAR-wp510r R3（設計 §3.1.6 BindWait）：`session.bind` 等待 retired drain 終態的期限（請求 +3000 ms）。
     /// T14 分類同其他 `Timer`（生命週期）：Open 處理、Pending 延後並於撤銷後重播、Permanent 處理（只回覆該 bind waiter，

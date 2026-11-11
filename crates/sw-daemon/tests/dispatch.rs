@@ -7724,11 +7724,22 @@ fn wp510_review10_rpc_release_timeout_then_late_redetect_finish_completes_releas
     assert_eq!(released.get("drain_stalled"), Some(&PyValue::Bool(true)), "{}", j(&released));
     assert_eq!(s(&sub(&released, "session"), "state"), "RECOVERING", "{}", j(&released));
     assert!(elapsed >= Duration::from_millis(2500), "release 須等待作業至期限：{elapsed:?}");
-    assert!(r.mgr.has_inflight_attach_for_test(WP510_R10_BY_ID_D));
+    // S2-PAR-wp510r R4（設計 §6 #67，H）：W6 作業改為外部 attach，在途改以帳本紀錄判定：阻塞時 `Opening{Worker}`、
+    // cancel＝Release；收尾後 `custody_for_test(B)`＝None。
+    let inflight = r.mgr.custody_for_test(WP510_R10_BY_ID_D).expect("阻塞時帳本紀錄在途");
+    assert!(
+        matches!(
+            inflight.phase,
+            sw_core::custody::CustodyPhaseSnapshot::Opening {
+                taker: sw_core::custody::CustodyTaker::Worker(_)
+            }
+        ) && inflight.cancel == Some(sw_core::custody::CustodyCancel::Release),
+        "{inflight:?}"
+    );
 
     backend.unblock();
     r.wait_state("COM0", "RELEASED");
-    wait_until("作業收尾", || !r.mgr.has_inflight_attach_for_test(WP510_R10_BY_ID_D));
+    wait_until("作業收尾", || r.mgr.custody_for_test(WP510_R10_BY_ID_D).is_none());
     wait_until("RELEASED 落盤", || wp510_review10_state_has_released_by_id(&r, WP510_R10_BY_ID_D));
     let session = r.session("COM0").expect("COM0 session");
     assert_eq!(s(&session, "released_by"), "cli", "{}", j(&session));
@@ -9507,4 +9518,89 @@ fn wp510r_r3_rpc_p8_7bb9935_recover_before_bind_device_online_uses_held_handle()
 
     let attached = r.call("device.attach", r#"{"selector":"COM1"}"#);
     assert_eq!(attached.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&attached));
+}
+
+/// S2-PAR-wp510r R4 紅燈 P8-e25b69c-2 的端到端證據（設計 §1.6、§3.1.4 W6）：接線為 `Service::rpc("device.release")` →
+/// `SessionManager::route`（`release_attach_handles` 不再等待 W6 作業）→ `ReleaseWithAck` → actor `begin_stop(Release)` →
+/// `Effect::ClaimForStop{token}` → executor 在 manager 鎖內對 W6 紀錄（`Opening{Worker}`、owner＝COM0）寫入 cancel＝Release →
+/// RPC 執行緒於首次期限送 `ReleaseDeadlineElapsed` → DRAIN_STALLED。開埠遲到返回後 W6 worker 於檢查點關閉（零 PROBE TX）、
+/// `finish_custody_close` 結算並送 `CustodyTerminal` → actor 完成 RELEASED（released_by＝cli、drain 欄位清空）並落盤。
+/// Python 對照見 `wp510_review10_rpc_release_timeout_then_late_redetect_finish_completes_release`。
+#[test]
+fn wp510r_r4_rpc_p8_e25b69c_2_redetect_release_stall_ledger_then_released() {
+    let delegate = FakeSerialBackend::new();
+    let dev = delegate.add_device(WP510_R10_REAL_D);
+    let backend = Arc::new(Wp510ToggleOpenBackend {
+        delegate,
+        path: WP510_R10_REAL_D.to_string(),
+        blocked: Mutex::new(false),
+        cv: Condvar::new(),
+        attempts: AtomicUsize::new(0),
+    });
+    let _unblock = Wp510UnblockOnDrop(Arc::clone(&backend));
+    let serial: Arc<dyn SerialBackend> = backend.clone();
+    let spec = RigSpec {
+        yaml: "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\n  others-template:\n    platform: passthrough\n    prompt_regex: '.*'\n    login_regex: '$^'\n    password_regex: '$^'\n    ready_probe: ''\n".to_string(),
+        devices: vec![(WP510_R10_BY_ID_D.to_string(), WP510_R10_REAL_D.to_string())],
+        explicit_target_count: 0,
+        allowlist: None,
+        wait_ready: Vec::new(),
+    };
+    let r = ServiceRig::build_with_loaded_state_and_serial_backend(spec, LoadedState::default(), serial);
+    r.wait_state("COM0", "ATTACHED");
+    let sid = s(&r.session("COM0").expect("COM0 session"), "session_id").to_string();
+    let snapshot = vec![(
+        WP510_R10_BY_ID_D.to_string(),
+        DeviceInfo {
+            by_id: WP510_R10_BY_ID_D.to_string(),
+            real_path: WP510_R10_REAL_D.to_string(),
+        },
+    )];
+    r.mgr.update_devices(&[]);
+    r.wait_state("COM0", "DETACHED");
+    backend.block();
+    let attempts_before = backend.attempts();
+    r.mgr.update_devices(&snapshot);
+    wait_until("再偵測卡在開埠", || backend.attempts() > attempts_before);
+    let blocked = r.mgr.custody_for_test(WP510_R10_BY_ID_D).expect("W6 開埠前已登記帳本紀錄");
+    assert!(
+        matches!(
+            blocked.phase,
+            CustodyPhaseSnapshot::Opening {
+                taker: sw_core::custody::CustodyTaker::Worker(_)
+            }
+        ) && matches!(&blocked.owner, sw_core::custody::CustodyOwner::Session { sid: owner, .. } if *owner == sid),
+        "{blocked:?}"
+    );
+    let closes_before = dev.close_count();
+    let tx_before = dev.tx_len();
+
+    let started = Instant::now();
+    let released = r.call("device.release", r#"{"selector":"COM0"}"#);
+    let elapsed = started.elapsed();
+    assert_eq!(s(&released, "error_code"), "DRAIN_STALLED", "{}", j(&released));
+    assert_eq!(released.get("drain_stalled"), Some(&PyValue::Bool(true)), "{}", j(&released));
+    assert_eq!(s(&sub(&released, "session"), "state"), "RECOVERING", "{}", j(&released));
+    assert!(elapsed >= Duration::from_millis(2500), "release 須等到首次期限：{elapsed:?}");
+    let stalled = r.mgr.custody_for_test(WP510_R10_BY_ID_D).expect("阻塞時紀錄保留");
+    assert_eq!(stalled.token, blocked.token);
+    assert_eq!(stalled.cancel, Some(sw_core::custody::CustodyCancel::Release), "{stalled:?}");
+    let listed = r.call("session.list", "{}");
+    assert!(j(&listed).contains("\"RECOVERING\""), "等待期間 list 為 RECOVERING：{}", j(&listed));
+
+    backend.unblock();
+    r.wait_state("COM0", "RELEASED");
+    wait_until("帳本紀錄收尾", || r.mgr.custody_for_test(WP510_R10_BY_ID_D).is_none());
+    wait_until("RELEASED 落盤", || wp510_review10_state_has_released_by_id(&r, WP510_R10_BY_ID_D));
+    let session = r.session("COM0").expect("COM0 session");
+    assert_eq!(s(&session, "released_by"), "cli", "{}", j(&session));
+    assert_eq!(session.get("drain_stalled"), Some(&PyValue::Bool(false)), "{}", j(&session));
+    assert_eq!(session.get("drain_timeout_epoch"), Some(&PyValue::Null), "{}", j(&session));
+    assert_eq!(dev.close_count(), closes_before + 1, "遲到的 handle 關閉一次");
+    assert!(!dev.is_open(), "沒有 IoWorker 持有 handle");
+    assert_eq!(dev.tx_len(), tx_before, "取消後不得送 PROBE");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(backend.attempts(), attempts_before + 1, "不另開");
+    let again = r.call("device.release", r#"{"selector":"COM0"}"#);
+    assert_eq!(again.get("already_released"), Some(&PyValue::Bool(true)), "不需第二次 release：{}", j(&again));
 }

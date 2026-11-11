@@ -699,6 +699,7 @@ fn dispatch(
         MailboxItem::Control(ControlEvent::FlashHolderGone { .. }) => (None, "FlashHolderGone"),
         MailboxItem::Control(ControlEvent::CustodyClaimed { .. }) => (None, "CustodyClaimed"),
         MailboxItem::Control(ControlEvent::CustodyTerminal { .. }) => (None, "CustodyTerminal"),
+        MailboxItem::Control(ControlEvent::CustodyOffer { .. }) => (None, "CustodyOffer"),
         #[cfg(feature = "test-fakes")]
         MailboxItem::Control(ControlEvent::ArmPanic { .. }) => (None, "ArmPanic"),
         MailboxItem::Data(_) => (None, "Data"),

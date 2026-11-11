@@ -62,6 +62,8 @@ pub type ProbeId = u64;
 
 /// 交接嘗試期間的 actor 事件暫存上限；滿載時回壓至 admission 凍結結束。
 const HANDOFF_DEFERRED_EVENTS_MAX: usize = 1024;
+/// S2-PAR-wp510r R4（設計 C4）：W6 等 offer 時的補收週期（`TimerEvent::CustodyPoll`）。
+const CUSTODY_POLL_INTERVAL_NS: Mono = 500_000_000;
 
 /// P8 Task 8：`FlashSyncProbeStart`／`FlashSyncMatched` 的拒絕原因（09 計畫 Task 8 狀態轉移表）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,6 +284,16 @@ pub enum SessionRequest {
         real_path: String,
         open_now: bool,
     },
+    /// S2-PAR-wp510r R4（設計 §3.1.4 W6 第 1 步、C7）：W6 worker（#181 再解析、既有 session 接手 parked）在開埠或認領
+    /// 之前先同步詢問。actor 可接受時（條件同 `AcceptCustody`）記下 `external_attach{token}` 並開始等 offer
+    /// （`CustodyOffer`；送不出去時由 `CustodyPoll` 計時器補收），不改 state、不開埠；之後的停止以 `ClaimForStop{token}`
+    /// 收尾（紀錄尚未登記時寫入 tombstone，worker 登記即中止）。拒絕時回 `ok:false`，worker 不開埠、不認領。T14 分類：
+    /// Request（bypass）；Pending／Permanent 下拒絕（不啟動新工作）。
+    BeginExternalAttach {
+        token: u64,
+        by_id: String,
+        real_path: String,
+    },
     /// OD-63：placeholder release 的開埠逾時；`token` 讓遲到收尾只清除同一個 op 的 stall。
     PlaceholderAttachStalled {
         token: u64,
@@ -410,7 +422,9 @@ pub enum Effect {
     HumanTx { tag: HumanTxTag, permit: TxPermit, payload: Vec<u8> },
     /// P6 增補 #10（07 Task 7）：全域 `interactive_id → session_id` 索引；同批 Effects 中一律排在 `Reply` 之前。
     LeaseIndex(LeaseIndexOp),
-    /// S2-PAR-wp510r R1: 輪詢保管帳本終態與 offer。
+    /// S2-PAR-wp510r R1: 輪詢保管帳本終態與 offer。R4：executor 在 manager 鎖內查詢，紀錄已是本 session 的 `Held` 就以
+    /// 立即回饋補送 `CustodyOffer`，已轉 CloseFailed 或已移除且有終態／tombstone 就補送 `CustodyTerminal`；不改帳本。
+    /// T14 分類：資源收尾，Open／Pending／Permanent 皆執行。
     PollCustody { tokens: Vec<u64> },
 }
 
@@ -536,6 +550,10 @@ pub struct SessionCore {
     external_attach: Option<u64>,
     /// 目前 `external_attach` 已發過 `ClaimForStop`（同一 token 只發一次，C6 冪等）。
     external_claimed: bool,
+    /// S2-PAR-wp510r R4（設計 §3.1.4 W6）：`external_attach` 來自已接受的 `BeginExternalAttach`，W6 worker 仍在開埠／PROBE，
+    /// 正在等 `CustodyOffer`（期間以 `CustodyPoll` 計時器補收）。收到 offer 後以 `ClaimCustody` 開埠；worker 中止（紀錄
+    /// 以 NoHandle 或關閉終態結算）時由 `CustodyTerminal` 清除。
+    external_offer_pending: bool,
     /// 開埠在途的是保管開埠（`ClaimCustody`，由 `custody_open_effect` 設定、`BridgeOpened` 取走）。開埠種類明確記錄，
     /// 不以「有開埠在途且有 `external_attach`」推定：一般開埠的終態不得清除保管（審查 P8-7bb9935-1）。
     custody_opening: bool,
@@ -845,6 +863,7 @@ impl SessionCore {
             open_real_path: None,
             external_attach: None,
             external_claimed: false,
+            external_offer_pending: false,
             custody_opening: false,
             release_wait_rt: None,
             reattach_pending: false,
@@ -1029,6 +1048,8 @@ impl SessionCore {
                     | ControlEvent::WorkerDrainTimeout { .. }
                     // S2-PAR-wp510r R3（設計 §3.1.7）：帳本紀錄的關閉終態（Pending 延後、Permanent 處理）。
                     | ControlEvent::CustodyTerminal { .. }
+                    // S2-PAR-wp510r R4（設計 §3.1.7）：W6 的 offer 通知（Pending 延後、Permanent 只關閉）。
+                    | ControlEvent::CustodyOffer { .. }
                     | ControlEvent::OpFinished { .. }
                     | ControlEvent::LoginFinished { .. }
                     | ControlEvent::Timer(_)
@@ -1157,6 +1178,9 @@ impl SessionCore {
             }
             MailboxItem::Control(ControlEvent::CustodyTerminal { token, closed, error }) => {
                 effects.0.extend(self.custody_terminal(token, closed, error, now));
+            }
+            MailboxItem::Control(ControlEvent::CustodyOffer { token }) => {
+                effects.0.extend(self.custody_offer(token, now));
             }
             MailboxItem::Control(ControlEvent::UartIoError { epoch, reason }) => {
                 if self.generations.conn_epoch == Some(epoch) {
@@ -1687,6 +1711,23 @@ impl SessionCore {
         // P6 增補 #11（07 Task 6 Step 3 第 7 點）：回放撤銷、BC-02 失效、ownership 重設與 retained human。
         self.human_phase1(&kind, &mut effects.0);
         let Some(epoch) = self.generations.conn_epoch else {
+            // S2-PAR-wp510r R4：W6 worker 仍在開埠／PROBE（等 offer、handle 尚未交出）時的 clear 不取消該作業，照無 bridge
+            // 的 clear 收尾（裝置在線 → ATTACHING＋`last_error=None`，再解析由在途作業續行）：Python `clear_session` 無 bridge
+            // 分支不碰在途作業，`_spawn_attach` 遇同 by_id 在途即去重（`origin/main:sw_core/session_manager.py:3058-3082`、
+            // `:4115-4116`）。之後的 offer 照常開埠。
+            let w6_clear = kind == StopKind::Clear
+                && self.external_offer_pending
+                && self.open_real_path.is_none()
+                && self.pending_attach.is_none()
+                && !matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }))
+                && self.retired_drains.is_empty();
+            if w6_clear {
+                return Effects(self.finish_stop_without_worker(
+                    kind,
+                    waiter.into_iter().collect(),
+                    now,
+                ));
+            }
             // 單次在途的等待（`single_flight_wait`）不是開埠在途：clear、拔除、改指等停止照無 bridge 收尾，不等退休
             // bridge 的回條（Python clear／`update_devices` 不等被取消的 attach 作業，`origin/main:sw_core/session_manager.py:3058-3082`、
             // `:4031-4063`）；release／shutdown 仍依下方 retired_drains 條件等待（DR-8 d、DR-4 b）。
@@ -2363,6 +2404,11 @@ impl SessionCore {
                 real_path,
                 open_now,
             } => self.accept_custody(token, by_id, real_path, open_now, reply, now),
+            SessionRequest::BeginExternalAttach {
+                token,
+                by_id,
+                real_path,
+            } => self.begin_external_attach(token, by_id, real_path, reply, now),
             other => self.handle_request_rest(other, reply, now),
         }
     }
@@ -3174,7 +3220,8 @@ impl SessionCore {
         self.set_last_error(None, None);
         if let Some(token) = self.external_attach {
             // 本 session 擁有的帳本紀錄（`AcceptCustody`）：以 `ClaimCustody` 認領原 handle，不另開新 handle（C1′）。
-            if self.open_real_path.is_some() {
+            // W6 worker 仍在開埠／PROBE（等 offer）時不認領：紀錄尚非 `Held`，由 `CustodyOffer` 開埠（設計 §3.1.4 W6）。
+            if self.open_real_path.is_some() || self.external_offer_pending {
                 return Vec::new();
             }
             return vec![self.custody_open_effect(token, real_path, now)];
@@ -3660,6 +3707,7 @@ impl SessionCore {
         if !self.custody_opening {
             self.external_attach = None;
             self.external_claimed = false;
+            self.external_offer_pending = false;
         }
         let mut effects = Vec::new();
         if receipt == Some(RetiredReceipt::Failed) {
@@ -3678,9 +3726,113 @@ impl SessionCore {
             .iter()
             .position(|entry| entry.custody_token == Some(token))
         else {
+            if self.external_offer_pending && self.external_attach == Some(token) {
+                // W6 worker 未交出 handle 就結束（開埠失敗、中止、關閉）：外部 attach 結束，不再等 offer。閉合失敗者紀錄已轉
+                // CloseFailed 並登記未確認關閉（D1 iii），之後的開埠一律被擋。
+                self.external_attach = None;
+                self.external_claimed = false;
+                self.external_offer_pending = false;
+                return self.try_converge(now);
+            }
             return Vec::new();
         };
         self.settle_retired(index, closed, None, now)
+    }
+
+    /// `SessionRequest::BeginExternalAttach`（設計 §3.1.4 W6 第 1 步）：條件同 `AcceptCustody`（只在會開埠的狀態、未凍結、
+    /// 無停止與其他在途）。接受後記下 token、開始等 offer 並排 `CustodyPoll`；不改 state（Python `_preopen_auto_attach_port`
+    /// 開埠成功前不公開 ATTACHING，`origin/main:sw_core/session_manager.py:4152-4247`）。
+    fn begin_external_attach(
+        &mut self,
+        token: u64,
+        by_id: String,
+        real_path: String,
+        reply: Reply,
+        now: Mono,
+    ) -> Vec<Effect> {
+        if !self.can_accept_external(&by_id) {
+            let mut result = self.ok_session(now);
+            result.insert("ok", PyValue::Bool(false));
+            return vec![Effect::Reply(reply, Ok(result))];
+        }
+        self.external_attach = Some(token);
+        self.external_claimed = false;
+        self.external_offer_pending = true;
+        self.device_present = true;
+        self.known_real_path = Some(real_path);
+        vec![
+            Self::custody_poll_schedule(now),
+            Effect::Reply(reply, Ok(self.ok_session(now))),
+        ]
+    }
+
+    /// `CustodyPoll` 的下一次排程（設計 C4：只要 external_attach 正在等 offer 就每 500 ms 補收一次）。
+    fn custody_poll_schedule(now: Mono) -> Effect {
+        Effect::Schedule {
+            at: now.saturating_add(CUSTODY_POLL_INTERVAL_NS),
+            ev: TimerEvent::CustodyPoll,
+        }
+    }
+
+    /// `TimerEvent::CustodyPoll`：仍在等 offer 時發 `PollCustody`（executor 查帳本，紀錄已是本 session 的 `Held` 就以立即
+    /// 回饋補送 `CustodyOffer`，已有終態就補送 `CustodyTerminal`）並排下一次。Permanent 凍結下照常查詢（offer 只關閉）。
+    fn custody_poll(&mut self, now: Mono) -> Vec<Effect> {
+        match self.external_attach {
+            Some(token) if self.external_offer_pending => vec![
+                Effect::PollCustody { tokens: vec![token] },
+                Self::custody_poll_schedule(now),
+            ],
+            _ => Vec::new(),
+        }
+    }
+
+    /// `ControlEvent::CustodyOffer`（設計 §3.1.4 W6 第 3 步）：W6 worker 已把 handle 存回本 session 的帳本紀錄。只在
+    /// `external_attach` 正在等 offer、token 相符時處理（C6：其餘忽略）。有停止待決時不開埠（停止的 `ClaimForStop` 收尾）；
+    /// Permanent 凍結下只關閉（`ClaimForStop(Freeze)`，不 adopt）；否則以 `ClaimCustody` 開埠（W3）。
+    fn custody_offer(&mut self, token: u64, now: Mono) -> Vec<Effect> {
+        if !self.external_offer_pending || self.external_attach != Some(token) {
+            return Vec::new();
+        }
+        if self.stop.is_some() || self.pending_open_stop.is_some() || self.shutdown_requested {
+            return Vec::new();
+        }
+        self.external_offer_pending = false;
+        if !matches!(self.handoff_freeze_state(), crate::admission::HandoffFreezeState::Open) {
+            if self.external_claimed {
+                return Vec::new();
+            }
+            self.external_claimed = true;
+            return vec![Effect::ClaimForStop {
+                token,
+                cancel: crate::custody::CustodyCancel::Freeze,
+                release_deadline: None,
+            }];
+        }
+        let real_path = self
+            .known_real_path
+            .clone()
+            .unwrap_or_else(|| self.profile.device_by_id.clone());
+        self.set_last_error(None, None);
+        vec![self.custody_open_effect(token, &real_path, now)]
+    }
+
+    /// `AcceptCustody`／`BeginExternalAttach` 的共同接受條件（審查 P8-7bb9935-1）：只在會開埠的狀態接受——DETACHED，或
+    /// clear 收尾後等 manager 再解析的 ATTACHING（與 manager W6／DETACHED-rebind 送出前的條件相同）。
+    fn can_accept_external(&self, by_id: &str) -> bool {
+        let awaiting = self.reattach_pending && self.state == SessionState::Attaching;
+        by_id == self.profile.device_by_id
+            && matches!(self.handoff_freeze_state(), crate::admission::HandoffFreezeState::Open)
+            && (self.state == SessionState::Detached || awaiting)
+            && !self.shutdown_requested
+            && self.stop.is_none()
+            && self.pending_open_stop.is_none()
+            && self.generations.conn_epoch.is_none()
+            && self.open_real_path.is_none()
+            && self.pending_attach.is_none()
+            && self.external_attach.is_none()
+            && self.retired_drains.is_empty()
+            && !matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }))
+            && !self.close_unconfirmed()
     }
 
     /// S2-PAR-wp510r R3（設計 §3.1.4 W2、C7）：出生即接管。manager 在建立 session 的同一臨界區把 PROBE 用過的 handle
@@ -3725,21 +3877,7 @@ impl SessionCore {
         // 只在會開埠的狀態接受（審查 P8-7bb9935-1）：DETACHED，或 clear 收尾後等 manager 再解析的 ATTACHING（與 manager
         // W6／DETACHED-rebind 送出前的條件相同）。其他狀態（例如 bind 等待逾時的 RECOVERING）接受了也不會開埠，紀錄只會
         // 停在本 session 手上；拒絕後由 manager 收尾（`close_unoffered_custody`）。
-        let awaiting = self.reattach_pending && self.state == SessionState::Attaching;
-        let acceptable = by_id == self.profile.device_by_id
-            && matches!(self.handoff_freeze_state(), crate::admission::HandoffFreezeState::Open)
-            && (self.state == SessionState::Detached || awaiting)
-            && !self.shutdown_requested
-            && self.stop.is_none()
-            && self.pending_open_stop.is_none()
-            && self.generations.conn_epoch.is_none()
-            && self.open_real_path.is_none()
-            && self.pending_attach.is_none()
-            && self.external_attach.is_none()
-            && self.retired_drains.is_empty()
-            && !matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }))
-            && !self.close_unconfirmed();
-        if !acceptable {
+        if !self.can_accept_external(&by_id) {
             let mut result = self.ok_session(now);
             result.insert("ok", PyValue::Bool(false));
             return vec![Effect::Reply(reply, Ok(result))];
@@ -4580,6 +4718,7 @@ impl SessionCore {
             }
             TimerEvent::ForceRecoverPoll { id, n } => self.force_recover_poll(id, n, now),
             TimerEvent::BindWaitTimeout { id } => self.bind_wait_timeout(id, now),
+            TimerEvent::CustodyPoll => self.custody_poll(now),
             _ => Vec::new(),
         }
     }
@@ -4743,6 +4882,13 @@ impl SessionCore {
                     return Vec::new();
                 };
                 self.set_last_error(None, None);
+                if self.external_attach.is_some() {
+                    // S2-PAR-wp510r R4：外部 attach（W6 worker 開埠／PROBE 中、或已交給本 session 的帳本紀錄）在途：同單次在途，
+                    // 不另開第二個 handle。Python `_prepare_reprobe_locked` 設 ATTACHING＋last_error=None 後 `_spawn_attach` 遇同
+                    // by_id 在途作業即去重（`origin/main:sw_core/session_manager.py:2248-2252`、`:4115-4116`）。
+                    self.set_state(SessionState::Attaching, now);
+                    return Vec::new();
+                }
                 if self.close_unconfirmed() {
                     // wp510 第 13 項：Python `_prepare_reprobe_locked` 已設 ATTACHING＋last_error=None 並記 attempt
                     // （`origin/main:sw_core/session_manager.py:2248-2252`），`reconcile_readiness` 的 `_spawn_attach` 因
@@ -6693,7 +6839,12 @@ impl SessionCore {
                         "session" => core.session_value(now),
                     }
                 };
-                if self.open_real_path.is_some() || self.pending_attach.is_some() || self.close_unconfirmed() {
+                if self.open_real_path.is_some()
+                    || self.pending_attach.is_some()
+                    || self.close_unconfirmed()
+                    // W6 worker 開埠／PROBE 中（等 offer）：同在途 attach（Python `_spawn_attach` 去重，`:4115-4116`）。
+                    || self.external_offer_pending
+                {
                     // attach 已在進行（開檔中）：Python `_spawn_attach` 對 in-flight attach 直接返回，回應仍是
                     // REATTACH；不重複發 `OpenBridge`（審查 F29）。wp510 第 13 項：未確認關閉的 by_id 同樣由
                     // `_spawn_attach` 早退（`origin/main:sw_core/session_manager.py:7970-7976`、`:4113-4114`）。

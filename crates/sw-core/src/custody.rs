@@ -150,6 +150,9 @@ pub enum TerminalEvidence {
 pub enum CustodyRegisterError {
     CustodyBusy { token: u64 },
     CloseBlocked,
+    /// S2-PAR-wp510r R4（設計 §3.1.4 W6 第 2 步）：預配的 token 已有 tombstone（停止者在登記前先取消：`ClaimForStop`
+    /// 查無紀錄時寫入），不得登記，worker 中止、不開埠。
+    Tombstoned,
 }
 
 /// 認領 parked 失敗原因。
@@ -505,6 +508,49 @@ impl CustodyLedger {
         };
         self.custody.insert(by_id.to_string(), custody);
         Ok(token)
+    }
+
+    /// S2-PAR-wp510r R4（設計 §3.1.4 W6 第 1 步）：預配 token。W6 worker 先以此 token 送 `BeginExternalAttach`，actor 接受
+    /// 後才以 [`CustodyLedger::register_with_token`] 登記（C7：owner＝Session 的紀錄只在 actor 已知 token 時存在）。
+    pub fn alloc_token(&self) -> u64 {
+        self.next_token.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// S2-PAR-wp510r R4（設計 §3.1.4 W6 第 2 步）：以預配的 `token` 登記（C1 閘門同 [`CustodyLedger::register`]）。token 已有
+    /// tombstone（先取消、後登記）時回 `Tombstoned`，紀錄不建立。
+    pub fn register_with_token(
+        &mut self,
+        by_id: &str,
+        token: u64,
+        real_path: &str,
+        owner: CustodyOwner,
+        taker: CustodyTaker,
+    ) -> Result<(), CustodyRegisterError> {
+        if self.tombstones.contains(&token) {
+            return Err(CustodyRegisterError::Tombstoned);
+        }
+        if self.unconfirmed.contains(by_id) {
+            return Err(CustodyRegisterError::CloseBlocked);
+        }
+        if let Some(existing) = self.custody.get(by_id) {
+            if matches!(existing.phase, CustodyPhase::CloseFailed { .. }) {
+                return Err(CustodyRegisterError::CloseBlocked);
+            }
+            return Err(CustodyRegisterError::CustodyBusy { token: existing.token });
+        }
+        self.custody.insert(
+            by_id.to_string(),
+            Custody {
+                token,
+                real_path: real_path.to_string(),
+                owner,
+                phase: CustodyPhase::Opening { taker },
+                cancel: None,
+                watchers: Vec::new(),
+                release_deadline: None,
+            },
+        );
+        Ok(())
     }
 
     /// C1' 同 token 認領（只用於 Held{owner: Parked} 且 real_path 相同）。

@@ -4847,3 +4847,291 @@ fn wp510r_r3_p8_7bb9935_custody_removal_completes_before_close_terminal() {
         "帳本紀錄仍在等關閉終態"
     );
 }
+
+/// S2-PAR-wp510r R4：W6 外部 attach 的 token（`BeginExternalAttach`）。
+const WP510R_W6_TOKEN: u64 = 91;
+
+/// W6 第 1 步：actor 接受 `BeginExternalAttach`，回傳同次效果。
+fn wp510r_w6_begin(h: &mut CoreHarness) -> Vec<Effect> {
+    let (response, effects) = h.rpc_full(SessionRequest::BeginExternalAttach {
+        token: WP510R_W6_TOKEN,
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    let response = response.unwrap();
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "前置：接受外部 attach：{response:?}");
+    effects
+}
+
+/// 效果中是否有任何開埠（正式開埠或保管開埠）。
+fn wp510r_has_open(effects: &[Effect]) -> bool {
+    effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::OpenBridge { .. } | Effect::ClaimCustody { .. }))
+}
+
+/// 效果中 `PollCustody` 的 token 列表（每筆效果一組）。
+fn wp510r_polls(effects: &[Effect]) -> Vec<Vec<u64>> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::PollCustody { tokens } => Some(tokens.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// S2-PAR-wp510r R4（設計 §3.1.4 W6 第 1、3 步，C6、C7）：DETACHED 的 session 接受 `BeginExternalAttach` 只記下 token，
+/// 不改 state、不開埠（Python `_preopen_auto_attach_port` 開埠成功前不公開 ATTACHING，
+/// `origin/main:sw_core/session_manager.py:4152-4247`）；worker 仍在開埠時的 `DeviceAttached` 不認領、不另開；token
+/// 不符的 offer 忽略；相符的 `CustodyOffer` 才以 `ClaimCustody` 開埠（ATTACHING），重複的 offer 忽略。
+#[test]
+fn wp510r_r4_w6_begin_external_attach_waits_offer_then_claims() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    assert_eq!(h.public()["state"], PyValue::from("DETACHED"), "前置：DETACHED");
+    let effects = wp510r_w6_begin(&mut h);
+    assert!(!wp510r_has_open(&effects), "接受只記下 token、不開埠");
+    assert_eq!(h.public()["state"], PyValue::from("DETACHED"), "開埠成功前不公開 ATTACHING");
+
+    let effects = h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    assert!(!wp510r_has_open(&effects), "W6 開埠在途時不另開：{}", effects.len());
+    let effects = h.feed(ControlEvent::CustodyOffer { token: WP510R_W6_TOKEN + 1 });
+    assert!(!wp510r_has_open(&effects), "token 不符的 offer 忽略");
+
+    let effects = h.feed(ControlEvent::CustodyOffer { token: WP510R_W6_TOKEN });
+    let claims: Vec<_> = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::ClaimCustody { token, dev, .. } => Some((*token, dev.0.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(claims, vec![(WP510R_W6_TOKEN, REAL_PATH.to_string())], "offer 後以同 token 開埠");
+    assert!(
+        !effects.iter().any(|effect| matches!(effect, Effect::OpenBridge { .. })),
+        "不另開新 handle"
+    );
+    assert_eq!(h.public()["state"], PyValue::from("ATTACHING"));
+    let effects = h.feed(ControlEvent::CustodyOffer { token: WP510R_W6_TOKEN });
+    assert!(!wp510r_has_open(&effects), "重複的 offer 忽略");
+}
+
+/// S2-PAR-wp510r R4（設計 C4「補收」）：等 offer 期間 actor 以本地計時器 `CustodyPoll` 每 500 ms 發 `PollCustody{token}`
+/// 並重排；收到 offer 之後不再查詢。
+#[test]
+fn wp510r_r4_w6_custody_poll_polls_until_offer() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    wp510r_w6_begin(&mut h);
+    assert!(wp510r_polls(&h.advance(Duration::from_millis(400))).is_empty(), "500 ms 前不查詢");
+    let first = h.advance(Duration::from_millis(100));
+    assert_eq!(wp510r_polls(&first), vec![vec![WP510R_W6_TOKEN]], "500 ms 到查詢一次");
+    let second = h.advance(Duration::from_millis(500));
+    assert_eq!(wp510r_polls(&second), vec![vec![WP510R_W6_TOKEN]], "仍在等 offer 時重排");
+    let effects = h.feed(ControlEvent::CustodyOffer { token: WP510R_W6_TOKEN });
+    assert!(wp510r_has_open(&effects), "補收的 offer 照常開埠");
+    assert!(wp510r_polls(&h.advance(Duration::from_secs(2))).is_empty(), "收到 offer 後不再查詢");
+}
+
+/// S2-PAR-wp510r R4（設計 §3.1.4 W6、C5；P8-e25b69c-2 的 actor 端）：等 offer 期間 release。actor 設 RECOVERING、
+/// 對該 token 發 `ClaimForStop{Release}`；紀錄仍在開埠（`Cancelled`）就等它的 `CustodyTerminal`，回條（closed:true）後才
+/// RELEASED 並落盤，drain 欄位兩欄皆清（SPEC-GAP 3：經在途作業收尾的路徑）；之後遲到的 offer 不開埠。另一路：紀錄尚未
+/// 登記（`Gone`，executor 寫入 tombstone）時沒有 handle 要等，立即 RELEASED。
+#[test]
+fn wp510r_r4_w6_release_during_offer_wait_waits_custody_terminal() {
+    for outcome in [
+        sw_core::mailbox::CustodyClaimOutcome::Cancelled,
+        sw_core::mailbox::CustodyClaimOutcome::Gone,
+    ] {
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        wp510r_w6_begin(&mut h);
+        let (rx, effects) = h.rpc_deferred(release());
+        let claims: Vec<_> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::ClaimForStop { token, cancel, .. } => Some((*token, *cancel)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            claims,
+            vec![(WP510R_W6_TOKEN, sw_core::custody::CustodyCancel::Release)],
+            "release 對外部 attach 的 token 發 ClaimForStop"
+        );
+        assert!(rx.try_recv().is_err(), "ClaimForStop 回饋前不回覆");
+        assert_eq!(h.public()["state"], PyValue::from("RECOVERING"), "G-3：找到在途作業即 RECOVERING");
+        h.feed(ControlEvent::CustodyClaimed {
+            token: WP510R_W6_TOKEN,
+            outcome,
+        });
+        if outcome == sw_core::mailbox::CustodyClaimOutcome::Cancelled {
+            assert!(rx.try_recv().is_err(), "紀錄仍在開埠：等其關閉終態");
+            assert!(h.state_store.last_released().is_empty(), "回條前不落盤 RELEASED");
+            h.feed(ControlEvent::CustodyTerminal {
+                token: WP510R_W6_TOKEN,
+                closed: true,
+                error: None,
+            });
+        }
+        let response = rx.try_recv().expect("終態後回覆 release").unwrap();
+        assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{outcome:?}：{response:?}");
+        let public = h.public();
+        assert_eq!(public["state"], PyValue::from("RELEASED"), "{outcome:?}");
+        assert_eq!(public["released_by"], PyValue::from("cli"));
+        assert_eq!(public["drain_stalled"], PyValue::Bool(false));
+        assert_eq!(public["drain_timeout_epoch"], PyValue::Null);
+        assert!(h.state_store.last_released().contains_key("t:COM0"), "RELEASED 落盤");
+        let effects = h.feed(ControlEvent::CustodyOffer { token: WP510R_W6_TOKEN });
+        assert!(!wp510r_has_open(&effects), "release 之後遲到的 offer 不開埠");
+        let response = h
+            .rpc(SessionRequest::BeginExternalAttach {
+                token: WP510R_W6_TOKEN + 1,
+                by_id: DEVICE_BY_ID.into(),
+                real_path: REAL_PATH.into(),
+            })
+            .unwrap();
+        assert_eq!(response.get("ok"), Some(&PyValue::Bool(false)), "RELEASED 拒絕外部 attach");
+    }
+}
+
+/// S2-PAR-wp510r R4（設計 §3.1.4 W6）：W6 worker 未交出 handle 就結束（開埠失敗、tombstone 中止）時以 `CustodyTerminal`
+/// 通知；actor 結束外部 attach、不再等 offer，之後的 `DeviceAttached` 照一般路徑開埠（交 actor 回報 ATTACH_FAILED）。
+#[test]
+fn wp510r_r4_w6_offer_wait_aborted_by_terminal_allows_plain_attach() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    wp510r_w6_begin(&mut h);
+    let effects = h.feed(ControlEvent::CustodyTerminal {
+        token: WP510R_W6_TOKEN,
+        closed: true,
+        error: None,
+    });
+    assert!(!wp510r_has_open(&effects), "中止通知本身不開埠");
+    assert_eq!(h.public()["state"], PyValue::from("DETACHED"));
+    assert!(wp510r_polls(&h.advance(Duration::from_secs(1))).is_empty(), "不再查詢 offer");
+    let effects = h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    assert_eq!(wp510r_open_bridge_paths(&effects), vec![REAL_PATH.to_string()], "外部 attach 結束後照一般路徑開埠");
+}
+
+/// S2-PAR-wp510r R4 DR-5(d)（設計 §3.1.7：Request `BeginExternalAttach` 屬 bypass，Pending／Permanent 回拒絕）：凍結
+/// 期間不記下 token、不開埠、不排 `CustodyPoll`；開埠中的 session（ATTACHING）同樣拒絕。
+#[test]
+fn wp510r_r4_t14_begin_external_attach_rejected_under_freeze() {
+    for permanent in [false, true] {
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        if permanent {
+            h.reg.admission_gate().freeze();
+        } else {
+            let _ = h.reg.admission_gate().freeze_if_idle("wp510r-r4-begin");
+        }
+        let (response, effects) = h.rpc_full(SessionRequest::BeginExternalAttach {
+            token: WP510R_W6_TOKEN,
+            by_id: DEVICE_BY_ID.into(),
+            real_path: REAL_PATH.into(),
+        });
+        assert_eq!(response.unwrap().get("ok"), Some(&PyValue::Bool(false)), "permanent={permanent}");
+        assert!(!wp510r_has_open(&effects), "凍結（permanent={permanent}）期間不開埠");
+        let effects = h.feed(ControlEvent::CustodyOffer { token: WP510R_W6_TOKEN });
+        assert!(!wp510r_has_open(&effects), "未接受的 token 之 offer 忽略");
+    }
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let effects = h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    assert!(wp510r_has_open(&effects), "前置：一般開埠在途");
+    let response = h
+        .rpc(SessionRequest::BeginExternalAttach {
+            token: WP510R_W6_TOKEN,
+            by_id: DEVICE_BY_ID.into(),
+            real_path: REAL_PATH.into(),
+        })
+        .unwrap();
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(false)), "已有開埠在途時拒絕");
+}
+
+/// S2-PAR-wp510r R4 DR-5(a)（設計 §3.1.7：`CustodyOffer` 屬生命週期，Pending 延後、撤銷後重播；Permanent 只關閉）：
+/// 凍結前接受外部 attach、凍結後才交付 offer。Pending：不開埠，撤銷凍結後重播並以 `ClaimCustody` 開埠。Permanent：不
+/// adopt、不開埠，只以 `ClaimForStop{Freeze}` 交關閉者收尾；`CustodyPoll` 在 Permanent 下照常查詢（資源收尾）。
+#[test]
+fn wp510r_r4_t14_custody_offer_deferred_pending_closes_permanent() {
+    for permanent in [false, true] {
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        wp510r_w6_begin(&mut h);
+        let token = if permanent {
+            h.reg.admission_gate().freeze();
+            None
+        } else {
+            match h.reg.admission_gate().freeze_if_idle("wp510r-r4-offer") {
+                sw_core::admission::FreezeOutcome::Frozen { token, .. } => Some(token),
+                outcome => panic!("應建立暫時凍結：{outcome:?}"),
+            }
+        };
+        if permanent {
+            assert_eq!(
+                wp510r_polls(&h.advance(Duration::from_millis(500))),
+                vec![vec![WP510R_W6_TOKEN]],
+                "Permanent 下 CustodyPoll 照常查詢"
+            );
+        }
+        let effects = h.feed(ControlEvent::CustodyOffer { token: WP510R_W6_TOKEN });
+        assert!(!wp510r_has_open(&effects), "凍結（permanent={permanent}）期間不 adopt、不開埠");
+        match token {
+            Some(token) => {
+                assert_eq!(wp510r_claims(&effects, WP510R_W6_TOKEN), 0, "Pending：offer 延後");
+                assert!(h.reg.admission_gate().thaw(&token));
+                let (_, replayed) = h.rpc_full(SessionRequest::GetState);
+                assert!(
+                    replayed.iter().any(|effect| matches!(
+                        effect,
+                        Effect::ClaimCustody { token, .. } if *token == WP510R_W6_TOKEN
+                    )),
+                    "撤銷凍結後重播 offer 並開埠"
+                );
+            }
+            None => {
+                let claims: Vec<_> = effects
+                    .iter()
+                    .filter_map(|effect| match effect {
+                        Effect::ClaimForStop { token, cancel, .. } => Some((*token, *cancel)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    claims,
+                    vec![(WP510R_W6_TOKEN, sw_core::custody::CustodyCancel::Freeze)],
+                    "Permanent：只關閉（ClaimForStop Freeze）"
+                );
+            }
+        }
+    }
+}
+
+/// S2-PAR-wp510r R4（設計 §3.1.4 W6；Python `clear_session` 無 bridge 分支不碰在途作業，
+/// `origin/main:sw_core/session_manager.py:3058-3082`，`_spawn_attach` 遇同 by_id 在途即去重 `:4115-4116`）：W6 worker 仍在
+/// 開埠／PROBE（等 offer）時 `session.clear` 立即回覆 ATTACHING＋`last_error=None`，不對外部 attach 發 `ClaimForStop`；
+/// 之後的 offer 照常以 `ClaimCustody` 開埠。
+#[test]
+fn wp510r_r4_w6_clear_during_offer_wait_keeps_external_attach() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    wp510r_w6_begin(&mut h);
+    let (response, effects) = h.rpc_full(SessionRequest::Clear);
+    let response = response.unwrap();
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
+    assert_eq!(nested_session_state(&response), PyValue::from("ATTACHING"), "{response:?}");
+    assert_eq!(wp510r_claims(&effects, WP510R_W6_TOKEN), 0, "clear 不取消在途的外部 attach");
+    assert!(!wp510r_has_open(&effects), "clear 不另開");
+    assert_eq!(h.public()["last_error"], PyValue::Null);
+    let effects = h.feed(ControlEvent::CustodyOffer { token: WP510R_W6_TOKEN });
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ClaimCustody { token, .. } if *token == WP510R_W6_TOKEN
+        )),
+        "clear 之後的 offer 照常開埠"
+    );
+}

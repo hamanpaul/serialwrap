@@ -3342,7 +3342,8 @@ fn wp510_review9_release_during_existing_session_redetect_cancels_and_waits() {
     assert!(!m.device(&real).is_open(), "release 後不得留下開啟的 handle");
     assert_eq!(m.device(&real).tx_len(), tx_before, "取消後不得送 PROBE");
     assert_eq!(s_of(&m.session("COM0"), "state").as_deref(), Some("RELEASED"));
-    assert!(!m.mgr.has_inflight_attach_for_test("/s/by-id/usb-D"));
+    // S2-PAR-wp510r R4（設計 §6 #57，H）：W6 作業改為外部 attach，在途改以帳本紀錄判定：收尾後 `custody_for_test(B)`＝None。
+    assert!(m.mgr.custody_for_test("/s/by-id/usb-D").is_none());
 }
 
 /// wp510 第八次整包審查 High（P8-e25b69c-2）：同上再偵測卡在 open 超過 release 期限。Python `release_device` 期限到回
@@ -3377,7 +3378,8 @@ fn wp510_review10_late_redetect_finish_after_release_timeout_completes_release()
     assert_eq!(code_of(&reply).as_deref(), Some("DRAIN_STALLED"), "{reply:?}");
     assert_eq!(reply.get("drain_stalled"), Some(&PyValue::Bool(true)));
     m.wait_state("COM0", "RELEASED");
-    wait_until("作業收尾", || !m.mgr.has_inflight_attach_for_test("/s/by-id/usb-D"));
+    // S2-PAR-wp510r R4（設計 §6 #42，H）：在途改以帳本紀錄判定，收尾後 `custody_for_test(B)`＝None。
+    wait_until("作業收尾", || m.mgr.custody_for_test("/s/by-id/usb-D").is_none());
     let session = m.session("COM0");
     assert_eq!(s_of(&session, "released_by").as_deref(), Some("agent"), "{session:?}");
     assert_eq!(s_of(&session, "released_reason").as_deref(), Some("flash"), "{session:?}");
@@ -5136,4 +5138,316 @@ fn wp510r_r3_wp5_1_shutdown_pre_take_close_failure_warns() {
     assert!(device.is_open(), "closed:false 表示 handle 仍開啟");
     assert_eq!(device.open_count(), 1, "IoWorker 未啟動、不重開");
     assert_eq!(device.tx_len(), tx_before, "零 TX");
+}
+
+/// S2-PAR-wp510r R4：`custody_for_test` 的紀錄是否為 W6 worker 的開埠在途（`Opening{Worker}`，owner＝該 session）。
+fn wp510r_r4_is_w6_opening(rec: &sw_core::custody::CustodySnapshot, sid: &str) -> bool {
+    matches!(
+        &rec.phase,
+        CustodyPhaseSnapshot::Opening {
+            taker: sw_core::custody::CustodyTaker::Worker(_),
+        }
+    ) && matches!(&rec.owner, sw_core::custody::CustodyOwner::Session { sid: owner, .. } if owner == sid)
+}
+
+/// S2-PAR-wp510r R4 紅燈 P8-e25b69c-2（設計 §1.6、§3.1.4 W6）：既有 fallback session 重插後的 #181 再解析卡在開埠超過
+/// release 首次期限。W6 先以 `BeginExternalAttach` 讓 actor 記下 token，帳本紀錄於開埠前登記為 `Opening{Worker}`、
+/// owner＝該 session；release 由 actor 以 `ClaimForStop` 寫入取消（cancel＝Release），期限到回 DRAIN_STALLED＋
+/// RECOVERING（Python `release_device` 找到作業取消並等到期限，`origin/main:sw_core/session_manager.py:3104-3138`、
+/// `:3192-3204`）。開埠遲到返回見取消即關閉、不送 PROBE（`:4216-4245`），`_finish_attach_op` 以第一個 release 的
+/// source 完成 RELEASED、清 stall 欄位並落盤（`:4339-4355`）；不需第二次 release，帳本收尾後 None。
+#[test]
+fn wp510r_r4_p8_e25b69c_2_redetect_release_stall_ledger_opening_then_released() {
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    let real = fallback_session_then_unplug(&m, "/s/by-id/usb-D");
+    m.serial.block_open(&real);
+    m.mgr.update_devices(&m.snapshot());
+    wait_until("再偵測卡在 open", || m.serial.open_attempts(&real) == 2);
+    let closes_before = m.device(&real).close_count();
+    let tx_before = m.device(&real).tx_len();
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let blocked = m.mgr.custody_for_test("/s/by-id/usb-D").expect("W6 開埠在途須登記帳本紀錄");
+    assert!(wp510r_r4_is_w6_opening(&blocked, &sid), "{blocked:?}");
+    assert_eq!(blocked.cancel, None, "release 前未取消：{blocked:?}");
+
+    let started = Instant::now();
+    let reply = m.mgr.route(
+        &sid,
+        SessionRequest::Release {
+            source: "cli".to_string(),
+            reason: PyValue::Null,
+        },
+        RPC,
+    );
+    let waited = started.elapsed();
+    let reply = rpc(reply);
+    assert!(waited >= Duration::from_millis(2500), "release 須等到首次期限：{waited:?}");
+    assert_eq!(code_of(&reply).as_deref(), Some("DRAIN_STALLED"), "{reply:?}");
+    assert_eq!(reply.get("drain_stalled"), Some(&PyValue::Bool(true)));
+    assert_eq!(s_of(&session_field(&reply), "state").as_deref(), Some("RECOVERING"), "{reply:?}");
+    let stalled = m.mgr.custody_for_test("/s/by-id/usb-D").expect("阻塞期間紀錄保留");
+    assert!(wp510r_r4_is_w6_opening(&stalled, &sid), "{stalled:?}");
+    assert_eq!(stalled.token, blocked.token, "同一筆紀錄");
+    assert_eq!(stalled.cancel, Some(sw_core::custody::CustodyCancel::Release), "{stalled:?}");
+
+    m.serial.release_open(&real);
+    m.wait_state("COM0", "RELEASED");
+    wait_until("帳本紀錄收尾", || m.mgr.custody_for_test("/s/by-id/usb-D").is_none());
+    let session = m.session("COM0");
+    assert_eq!(s_of(&session, "released_by").as_deref(), Some("cli"), "{session:?}");
+    assert_eq!(session.get("released_reason"), Some(&PyValue::Null), "{session:?}");
+    assert_eq!(session.get("drain_stalled"), Some(&PyValue::Bool(false)), "{session:?}");
+    assert_eq!(session.get("drain_timeout_epoch"), Some(&PyValue::Null), "{session:?}");
+    wait_until("RELEASED 落盤", || {
+        m.state_text().contains("\"released\"") && m.state_text().contains("/s/by-id/usb-D")
+    });
+    assert_eq!(m.device(&real).close_count(), closes_before + 1, "遲到的 handle 關閉一次");
+    assert!(!m.device(&real).is_open(), "沒有 IoWorker 持有 handle");
+    assert_eq!(m.device(&real).tx_len(), tx_before, "取消後不得送 PROBE");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(m.serial.open_attempts(&real), 2, "不得另開");
+    assert_eq!(
+        m.mgr.terminal_for_test(blocked.token).map(|t| t.handle),
+        Some(sw_core::custody::TerminalHandle::Closed),
+        "同 token 的終態為 Closed"
+    );
+}
+
+/// S2-PAR-wp510r R4（設計 §3.1.4 W6 第 2 步「有 tombstone 就中止」）：`BeginExternalAttach` 已被接受、W6 worker 登記帳本
+/// 紀錄之前 release 先到。actor 的 `ClaimForStop` 查無紀錄即寫入 tombstone 並完成 release（沒有 handle 要等），worker
+/// 之後的登記看到 tombstone 就中止、不開埠（Python release 在作業登記前到達時 session 沒有作業，直接 RELEASED；
+/// `_preopen_auto_attach_port` 見 RELEASED 即不登記、不開埠，`origin/main:sw_core/session_manager.py:4159-4166`）。
+#[test]
+fn wp510r_r4_w6_release_before_register_tombstone_aborts_open() {
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    let real = fallback_session_then_unplug(&m, "/s/by-id/usb-D");
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (go_tx, go_rx) = crossbeam_channel::bounded::<()>(1);
+    m.mgr.set_external_attach_pre_register_hook_for_test(
+        "/s/by-id/usb-D",
+        Box::new(move || {
+            let _ = entered_tx.send(());
+            let _ = go_rx.recv_timeout(Duration::from_secs(10));
+        }),
+    );
+    m.mgr.update_devices(&m.snapshot());
+    entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("W6 worker 應停在 BeginExternalAttach 接受後、登記前");
+    assert!(m.mgr.custody_for_test("/s/by-id/usb-D").is_none(), "登記前沒有帳本紀錄");
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+
+    let started = Instant::now();
+    let reply = rpc(wp510_release(&m.mgr, &sid));
+    assert!(is_ok(&reply), "{reply:?}");
+    assert!(started.elapsed() < Duration::from_millis(2000), "沒有 handle 要等：{:?}", started.elapsed());
+    assert_eq!(s_of(&session_field(&reply), "state").as_deref(), Some("RELEASED"), "{reply:?}");
+
+    go_tx.send(()).expect("放行 worker");
+    wait_until("worker 收尾", || !m.mgr.has_inflight_attach_for_test("/s/by-id/usb-D"));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(m.serial.open_attempts(&real), 1, "tombstone 令 worker 中止、不開埠");
+    assert!(m.mgr.custody_for_test("/s/by-id/usb-D").is_none(), "不得留下紀錄");
+    assert_eq!(s_of(&m.session("COM0"), "state").as_deref(), Some("RELEASED"));
+}
+
+/// S2-PAR-wp510r R4 DR-1(b)（設計 §1.8、C4、§3.1.5「W2／W6 offer 通知 Full」）：W6 worker 完成 PROBE、把 handle 存回
+/// `Held{Session}` 時該 session 的 control lane 已滿（H-actor-hold＋填滿 lane），`CustodyOffer` 的 `try_send` 回 Full。
+/// 紀錄保持 `Held{owner:Session}` 可查；放行後 actor 的 `CustodyPoll` 計時器（500 ms）補收 offer，以同一 handle 照常
+/// adopt，開埠次數不增加、不重複 TX。
+#[test]
+fn wp510r_r4_dr1_b_w6_offer_lane_full_custody_poll_claims_same_handle() {
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    let real = fallback_session_then_unplug(&m, "/s/by-id/usb-D");
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    m.serial.block_open(&real);
+    m.mgr.update_devices(&m.snapshot());
+    wait_until("再偵測卡在 open", || m.serial.open_attempts(&real) == 2);
+    let token = m.mgr.custody_for_test("/s/by-id/usb-D").expect("W6 紀錄").token;
+
+    // H-actor-hold：actor 停在一筆無關查詢，再灌滿 control lane。
+    let (entered, resume) = m.mgr.pause_next_request_for_test(&sid).expect("actor 存在");
+    let query_mgr = m.mgr.clone();
+    let query_sid = sid.clone();
+    let query = std::thread::spawn(move || {
+        let _ = query_mgr.session_queue_lens(&query_sid);
+    });
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("actor 應停在無關的查詢 Request");
+    let ctrl = m.mgr.actor_control_for_test(&sid).expect("control sender");
+    let mut filled = 0;
+    while ctrl
+        .try_send(sw_core::mailbox::ControlEvent::ConsoleCountChanged { count: 0 })
+        .is_ok()
+    {
+        filled += 1;
+    }
+    assert!(filled > 0, "灌滿迴圈必須實際送入事件");
+
+    m.serial.release_open(&real);
+    wait_until("W6 worker 存回 Held{Session}", || {
+        m.mgr
+            .custody_for_test("/s/by-id/usb-D")
+            .is_some_and(|rec| rec.phase == CustodyPhaseSnapshot::Held)
+    });
+    let held = m.mgr.custody_for_test("/s/by-id/usb-D").expect("紀錄");
+    assert_eq!(held.token, token, "同一筆紀錄");
+    assert!(
+        matches!(&held.owner, sw_core::custody::CustodyOwner::Session { sid: owner, .. } if *owner == sid),
+        "lane 滿時紀錄保持 Held{{owner:Session}}：{held:?}"
+    );
+    let open_attempts = m.serial.open_attempts(&real);
+    assert!(m.device(&real).is_open(), "handle 仍在帳本");
+
+    resume.send(()).expect("放行 actor");
+    query.join().expect("查詢執行緒不應 panic");
+    // CustodyPoll 是 actor 的本地計時器：推進 mono 讓補收觸發。
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while m.mgr.custody_for_test("/s/by-id/usb-D").is_some() && Instant::now() < deadline {
+        m.clock.advance(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        m.mgr.custody_for_test("/s/by-id/usb-D").is_none(),
+        "CustodyPoll 補收 offer 後由正式 bridge 接手：{:?}",
+        m.mgr.custody_for_test("/s/by-id/usb-D")
+    );
+    m.wait_state("COM0", "ATTACHED");
+    assert_eq!(m.serial.open_attempts(&real), open_attempts, "以原 handle adopt，不另開");
+    assert_eq!(m.device(&real).close_count(), 1, "只有拔除時那一次關閉");
+    assert!(m.device(&real).is_open(), "正式 bridge 持有 handle");
+}
+
+/// S2-PAR-wp510r R4（設計 §3.1.4 W6、§3.1.6 shutdown）：W6 再解析卡在開埠時 shutdown。actor 的 Shutdown 以
+/// `ClaimForStop{Shutdown}` 寫入帳本紀錄的取消，開埠返回後 W6 worker 於檢查點關閉（零 TX、不 PROBE），回條成功後報告
+/// 已排空、紀錄移除（Python shutdown 取消作業並等 `done`，`origin/main:sw_core/session_manager.py:1181-1185`、
+/// `:1228-1239`；開埠返回見取消即 `_finish_attach_op`，`:4216-4245`）。
+#[test]
+fn wp510r_r4_w6_shutdown_during_open_closes_and_reports_drained() {
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    let real = fallback_session_then_unplug(&m, "/s/by-id/usb-D");
+    m.serial.block_open(&real);
+    m.mgr.update_devices(&m.snapshot());
+    wait_until("再偵測卡在 open", || m.serial.open_attempts(&real) == 2);
+    let closes_before = m.device(&real).close_count();
+    let tx_before = m.device(&real).tx_len();
+    let serial = m.serial.clone();
+    let release_real = real.clone();
+    let unblock = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        serial.release_open(&release_real);
+    });
+    let drained = m.mgr.shutdown(Duration::from_secs(5));
+    unblock.join().expect("放行執行緒不應 panic");
+    assert!(drained.iter().all(|(_, ok)| *ok), "回條成功後報告已排空：{drained:?}");
+    assert_eq!(m.device(&real).close_count(), closes_before + 1, "遲到的 handle 關閉一次");
+    assert!(!m.device(&real).is_open());
+    assert_eq!(m.device(&real).tx_len(), tx_before, "零 TX");
+    assert!(m.mgr.custody_for_test("/s/by-id/usb-D").is_none(), "紀錄移除");
+    assert!(!m.mgr.unconfirmed_close_for_test("/s/by-id/usb-D"));
+}
+
+/// S2-PAR-wp510r R4（設計 §3.1.4 W6、C5、§3.1.9 零 TX；WP3-1 的 W6 版本）：W6 再解析已越過開埠檢查點、PROBE 尚未提交時
+/// release。actor 的 `ClaimForStop` 在 manager 鎖內寫入帳本紀錄的取消時，必須一併凍結該作業的 PROBE fence 並撤銷進行中
+/// 的寫入（Python release 對作業 `probe_bridge.begin_drain`，`origin/main:sw_core/session_manager.py:3125-3131`；
+/// `uart_io.py:908-918`、`:623-627`）：PROBE 零 TX，worker 於 PROBE 後的檢查點關閉而不交出，release 完成 RELEASED。
+#[test]
+fn wp510r_r4_w6_release_during_probe_freezes_probe_tx() {
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    let real = fallback_session_then_unplug(&m, "/s/by-id/usb-D");
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let tx_before = m.device(&real).tx_len();
+    let closes_before = m.device(&real).close_count();
+    let weak = std::sync::Arc::downgrade(&m.mgr);
+    let hook_sid = sid.clone();
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let (cancelled_tx, cancelled_rx) = crossbeam_channel::bounded(1);
+    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_fired = fired.clone();
+    m.mgr.set_probe_pre_submit_hook_for_test(Box::new(move || {
+        if hook_fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let Some(manager) = weak.upgrade() else {
+            return;
+        };
+        let release_mgr = manager.clone();
+        let release_sid = hook_sid.clone();
+        let tx = release_tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(wp510_release(&release_mgr, &release_sid));
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if manager
+                .custody_for_test("/s/by-id/usb-D")
+                .is_some_and(|rec| rec.cancel == Some(sw_core::custody::CustodyCancel::Release))
+            {
+                let _ = cancelled_tx.send(());
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }));
+    m.mgr.update_devices(&m.snapshot());
+    cancelled_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("PROBE 提交前 release 已寫入帳本紀錄的取消");
+    let reply = rpc(release_rx.recv_timeout(RPC).expect("release 應在 W6 收尾後回覆"));
+    assert!(is_ok(&reply), "{reply:?}");
+    m.wait_state("COM0", "RELEASED");
+    wait_until("帳本紀錄收尾", || m.mgr.custody_for_test("/s/by-id/usb-D").is_none());
+    assert_eq!(m.device(&real).tx_len(), tx_before, "取消後 PROBE 不得送出任何 TX");
+    assert_eq!(m.device(&real).close_count(), closes_before + 1, "W6 handle 關閉一次");
+    assert!(!m.device(&real).is_open());
+}
+
+/// S2-PAR-wp510r R4（設計 §3.1.6 D1 iii＋T-1、§3.1.4 W6）：W6 再解析卡在開埠時 release，期限到回 DRAIN_STALLED；之後開埠
+/// 返回、W6 worker 於檢查點關閉 handle 失敗（closed:false）。紀錄轉 CloseFailed 並登記未確認關閉（永久阻擋），session
+/// 維持 RECOVERING、不落盤 RELEASED；之後的 release 首次期限已過、立即回 DRAIN_STALLED（Python `_finish_attach_op` 關閉
+/// 失敗保留作業、`done` 永不設定，`origin/main:sw_core/session_manager.py:4320-4332`、`:3188-3204`）。
+#[test]
+fn wp510r_r4_w6_release_close_failure_keeps_blocked_and_stalled() {
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    let real = fallback_session_then_unplug(&m, "/s/by-id/usb-D");
+    m.serial.block_open(&real);
+    m.mgr.update_devices(&m.snapshot());
+    wait_until("再偵測卡在 open", || m.serial.open_attempts(&real) == 2);
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let token = m.mgr.custody_for_test("/s/by-id/usb-D").expect("W6 紀錄").token;
+    let reply = rpc(wp510_release(&m.mgr, &sid));
+    assert_eq!(code_of(&reply).as_deref(), Some("DRAIN_STALLED"), "{reply:?}");
+    let device = m.device(&real);
+    device.fail_close(sw_pal::traits::PalError::io(5, "[Errno 5] Input/output error"));
+    m.serial.release_open(&real);
+    wait_until("W6 關閉失敗轉 CloseFailed", || {
+        m.mgr.custody_for_test("/s/by-id/usb-D").is_some_and(|rec| {
+            rec.token == token && matches!(rec.phase, CustodyPhaseSnapshot::CloseFailed { .. })
+        })
+    });
+    assert!(m.mgr.unconfirmed_close_for_test("/s/by-id/usb-D"), "D1 iii：永久阻擋");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(s_of(&m.session("COM0"), "state").as_deref(), Some("RECOVERING"));
+    let released_rows = match sw_proto::pyjson::loads(&m.state_text()) {
+        Ok(PyValue::Dict(state)) => match state.get("released") {
+            Some(PyValue::Dict(rows)) => rows
+                .0
+                .values()
+                .filter(|row| match row {
+                    PyValue::Dict(row) => row.get("by_id").and_then(PyValue::as_str) == Some("/s/by-id/usb-D"),
+                    _ => false,
+                })
+                .count(),
+            _ => 0,
+        },
+        _ => 0,
+    };
+    assert_eq!(released_rows, 0, "關閉未確認不得落盤 RELEASED：{}", m.state_text());
+    let started = Instant::now();
+    let again = rpc(wp510_release(&m.mgr, &sid));
+    assert_eq!(code_of(&again).as_deref(), Some("DRAIN_STALLED"), "{again:?}");
+    assert!(started.elapsed() < Duration::from_millis(1000), "首次期限已過，立即回：{:?}", started.elapsed());
+    assert_eq!(m.serial.open_attempts(&real), 2, "不重開");
+    assert!(device.is_open(), "closed:false 表示 handle 仍開啟");
 }
