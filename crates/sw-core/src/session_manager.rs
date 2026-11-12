@@ -2686,23 +2686,12 @@ impl Shared {
         if !r.as_ref().is_ok_and(is_ok) {
             return;
         }
-        let already_bound = r
-            .as_ref()
-            .ok()
-            .and_then(|reply| reply.get("already_bound"))
-            == Some(&PyValue::Bool(true));
         // 作業帶著預開 handle（接手的未消費預開作業）時，先存入帳本（`Held{Worker}`），改綁落盤後以 `AcceptCustody` 交給
         // 該 session（設計 C7）；已取消者留在作業內由 worker 收尾關閉（Python `_attach_by_id` 見 `cancelled` 中止並
         // `_finish_attach_op`，`:4933-4944`）。
         let (offered, displaced) = {
             let mut inner = lock(&self.inner);
-            let known = inner.sessions.get_mut(sid).map(|e| {
-                if !already_bound {
-                    e.binding_generation = e.binding_generation.saturating_add(1);
-                }
-                e.profile.device_by_id = by_id.to_string();
-                lock(&e.io.profile).device_by_id = by_id.to_string();
-            });
+            let known = inner.sessions.get(sid).map(|_| ());
             inner.deliverer.cancel_obligation(sid, None);
             match known {
                 Some(()) if !op.cancelled.load(Ordering::SeqCst) => match op.take_preopened() {
@@ -3811,7 +3800,6 @@ impl Shared {
                     rekeyed = true;
                     e.sid = new_sid.clone();
                     if e.profile.device_by_id != profile.device_by_id {
-                        e.binding_generation = e.binding_generation.saturating_add(1);
                         inner.deliverer.cancel_obligation(sid, None);
                     }
                     e.profile = profile.clone();
@@ -5521,6 +5509,16 @@ impl EffectExecutor for ManagerExec {
             Effect::Reply(reply, result) => {
                 let _ = reply.try_send(result);
             }
+            Effect::PublishBinding { by_id, bind_gen } => {
+                let mut inner = lock(&self.shared.inner);
+                // 只接受本世代 actor 的事實；舊 actor 不得覆寫同 sid 的後繼。
+                if let Some(entry) = inner.sessions.values_mut().find(|e| e.actor_id == self.actor_id) {
+                    entry.binding_generation = bind_gen;
+                    entry.profile.device_by_id = by_id.clone();
+                    lock(&entry.io.profile).device_by_id = by_id;
+                    inner.deliverer.cancel_obligations_for_actor(self.actor_id);
+                }
+            }
             Effect::OpenBridge {
                 dev,
                 cfg,
@@ -6599,6 +6597,7 @@ impl SessionManager {
         };
         // SPEC-GAP 2（編排者 2026-11-11）：BindWait 期限以實時起算，actor 受理等待時以 `WaitAck::Bind` 告知，期限到仍未
         // 回覆即送 `BindDeadlineElapsed`（Python `bind_session` 以實時等待作業 `done`，`:3695-3710`）。
+        let old_by_id = lock(&io.profile).device_by_id.clone();
         let mut result = match self.shared.actor_of(&sid) {
             Some(actor) => actor.request_with_ack_notice(
                 |ack| SessionRequest::BindWithAck {
@@ -6621,18 +6620,14 @@ impl SessionManager {
         }
         // 未交給正式 bridge 的預開 handle（舊 by_id）關閉：Python 自 `_preopened_ports` 取出後關閉、例外忽略
         // （`origin/main:sw_core/session_manager.py:3776-3778`、`:3796-3800`）。
-        let old_by_id = lock(&io.profile).device_by_id.clone();
         if let Some(pre) = lock(&io.preopened).take() {
             self.shared.close_session_preopened(&old_by_id, pre);
         }
         let (has_device, bind_gen, actor_id) = {
-            let mut inner = lock(&self.shared.inner);
-            let Some(e) = inner.sessions.get_mut(&sid) else { return Ok(result) };
-            e.binding_generation = e.binding_generation.saturating_add(1);
-            e.profile.device_by_id = by_id.clone();
-            lock(&e.io.profile).device_by_id = by_id.clone();
+            let inner = lock(&self.shared.inner);
+            let Some(e) = inner.sessions.get(&sid).filter(|e| e.profile.device_by_id == by_id) else { return Ok(result) };
+            // actor 已先發布實際套用的世代；逾時後完成也同步，RPC 不再各自遞增。
             let (bind_gen, actor_id) = (e.binding_generation, e.actor_id);
-            inner.deliverer.cancel_obligation(&sid, None);
             (inner.devices.contains_key(&by_id), bind_gen, actor_id)
         };
         let commit_sid = sid.clone();
@@ -8161,6 +8156,17 @@ impl SessionManager {
         let sid = self.resolve(selector)?;
         let actor = self.shared.actor_of(&sid)?;
         Some(actor.probe.pause_before_next("Request"))
+    }
+
+    /// 只供測試：bind 已入列、套用之前暫停，保留正式 RPC 的查詢與 8 秒等待期限。
+    #[cfg(feature = "test-fakes")]
+    pub fn pause_next_bind_for_test(
+        &self,
+        selector: &str,
+    ) -> Option<(crossbeam_channel::Receiver<()>, crossbeam_channel::Sender<()>)> {
+        let sid = self.resolve(selector)?;
+        let actor = self.shared.actor_of(&sid)?;
+        Some(actor.probe.pause_before_next("Bind"))
     }
 
     /// 只供測試（test-fakes）：觀察 session safety lane 的積壓，安排有界 mailbox 滿載交錯。

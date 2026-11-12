@@ -344,6 +344,9 @@ pub enum SessionRequest {
 /// `SessionCore::on_event` 的輸出效果；由 actor executor 執行（sans-IO）。
 pub enum Effect {
     Reply(Reply, Result<PyDict, PyErr>),
+    /// actor 已套用的綁定事實；先於 RPC 回覆同步 manager，回覆逾時也不撤銷。
+    /// T14：只同步既成事實與撤銷舊義務，Open／Pending／Permanent 均執行，不啟動 I/O。
+    PublishBinding { by_id: String, bind_gen: u64 },
     /// 成功開啟的 worker 交由 actor executor 持有，供後續依 epoch drain。
     AdoptBridge {
         epoch: u64,
@@ -3189,13 +3192,16 @@ impl SessionCore {
                 {
                     return vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))];
                 }
-                if self.profile.device_by_id != profile.device_by_id {
-                    self.binding_generation = self.binding_generation.saturating_add(1);
-                }
+                let binding_changed = self.profile.device_by_id != profile.device_by_id;
                 self.sid = format!("{}:{}", profile.template.profile_name, profile.com);
                 self.profile = profile;
                 self.profile_source = profile_source;
-                vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
+                let mut effects = Vec::new();
+                if binding_changed {
+                    effects.push(self.publish_binding());
+                }
+                effects.push(Effect::Reply(reply, Ok(self.ok_session(now))));
+                effects
             }
             SessionRequest::SetAlias { alias } => {
                 self.profile.alias = alias;
@@ -3710,8 +3716,8 @@ impl SessionCore {
             self.pending_bind = Some(by_id);
             return self.begin_stop(StopKind::Bind, Some(reply), now).0;
         }
-        self.apply_bind(by_id, now);
-        vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
+        let published = self.apply_bind(by_id, now);
+        vec![published, Effect::Reply(reply, Ok(self.ok_session(now)))]
     }
 
     /// BindWait（設計 §3.1.6）：退休 bridge 的 handle 尚未確認關閉時，bind 等到其終態，上限 3000 ms。
@@ -3801,8 +3807,7 @@ impl SessionCore {
     }
 
     /// 改綁的狀態套用（離開 RELEASED、清 released metadata、裝置視為未在線）。
-    fn apply_bind(&mut self, target: String, now: Mono) {
-        self.binding_generation = self.binding_generation.saturating_add(1);
+    fn apply_bind(&mut self, target: String, now: Mono) -> Effect {
         if self.state == SessionState::Released {
             self.release_persist_pending = false;
             self.pending_release = None;
@@ -3815,6 +3820,16 @@ impl SessionCore {
         self.known_real_path = None;
         self.set_last_error(Some("DEVICE_NOT_FOUND".into()), None);
         self.set_state(SessionState::Detached, now);
+        self.publish_binding()
+    }
+
+    /// 綁定世代只由 actor 產生；manager 以效果同步，不依 RPC 是否收到回覆另行推算。
+    fn publish_binding(&mut self) -> Effect {
+        self.binding_generation = self.binding_generation.saturating_add(1);
+        Effect::PublishBinding {
+            by_id: self.profile.device_by_id.clone(),
+            bind_gen: self.binding_generation,
+        }
     }
 
     fn serial_config(&self) -> SerialConfig {
@@ -6555,7 +6570,7 @@ impl SessionCore {
                 self.set_last_error(Some("REBOUND".into()), None);
                 self.set_state(SessionState::Detached, now);
                 if let Some(target) = self.pending_bind.take() {
-                    self.apply_bind(target, now);
+                    effects.push(self.apply_bind(target, now));
                 }
                 for waiter in stop.waiters {
                     effects.push(Effect::Reply(waiter, Ok(self.ok_session(now))));

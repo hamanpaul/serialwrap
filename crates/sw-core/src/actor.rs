@@ -203,6 +203,9 @@ fn probe_label(item: &MailboxItem) -> Option<&'static str> {
 #[cfg(feature = "test-fakes")]
 fn probe_pause_label(item: &MailboxItem) -> Option<&'static str> {
     match item {
+        MailboxItem::Control(ControlEvent::Request {
+            req: SessionRequest::Bind { .. } | SessionRequest::BindWithAck { .. }, ..
+        }) => Some("Bind"),
         MailboxItem::Control(ControlEvent::LoginFinished { .. }) => Some("LoginFinished"),
         _ => probe_label(item),
     }
@@ -594,6 +597,9 @@ pub fn try_spawn_actor_with_reaper(
                 }
                 #[cfg(feature = "test-fakes")]
                 if let Some(label) = pause_label {
+                    if label == "Bind" {
+                        thread_probe.pause_before_dispatch("Request");
+                    }
                     thread_probe.pause_before_dispatch(label);
                 }
                 let data_mark = match &item {

@@ -23,6 +23,104 @@ use sw_core::custody::CustodyPhaseSnapshot;
 /// `foreign_holders` 會讀取行程內共用的 holder_unknown 登錄（#11）；登錄／精確比對 foreign_holders 的測試彼此序列化。
 static HOLDER_REGISTRY: Mutex<()> = Mutex::new(());
 
+/// P8-ea9e03d-1：正式 bind 已入列但等滿 8 秒逾時，晚到完成仍須發布綁定世代。
+fn i25_bind_completes_after_rpc_timeout() -> (ServiceRig, FakeDevice) {
+    let r = ServiceRig::ready_shell();
+    let dev = r.device(REAL_A).clone();
+    assert_eq!(
+        r.call("device.release", r#"{"selector":"COM0"}"#).get("ok"),
+        Some(&PyValue::Bool(true))
+    );
+    // 共用 fixture 的 newline trigger 只回一次；本案每次重新開埠都要能看到 prompt。
+    dev.on_tx_match(r"^$", Box::new(|_| b"root@t:/# ".to_vec()));
+    let (entered, resume) = r.mgr.pause_next_bind_for_test("COM0").unwrap();
+    let r = Arc::new(r);
+    let binding_r = r.clone();
+    let binding = std::thread::spawn(move || {
+        binding_r.call_err(
+            "session.bind",
+            &format!(r#"{{"selector":"COM0","device_by_id":"{BY_ID_A}"}}"#),
+        )
+    });
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    let error = binding.join().unwrap();
+    resume.send(()).unwrap();
+    assert_eq!(error.message, "internal timeout");
+    // 同 lane 查詢作為屏障，確定晚到 bind 已實際完成；不以固定 sleep 猜測。
+    let late = r.session("COM0").unwrap();
+    assert_eq!(s(&late, "state"), "DETACHED");
+    assert_eq!(s(&late, "device_by_id"), BY_ID_A);
+    assert_eq!(dev.open_attempts(), 1, "逾時的 RPC 不得自行重新開埠");
+    (
+        Arc::try_unwrap(r).unwrap_or_else(|_| panic!("bind 執行緒須已結束")),
+        dev,
+    )
+}
+
+#[test]
+fn wp510r_i25_rpc_timed_out_bind_late_completion_allows_retry() {
+    let (r, dev) = i25_bind_completes_after_rpc_timeout();
+    let retry = r.call(
+        "session.bind",
+        &format!(r#"{{"selector":"COM0","device_by_id":"{BY_ID_A}"}}"#),
+    );
+    assert_eq!(retry.get("ok"), Some(&PyValue::Bool(true)));
+    assert_eq!(
+        jv(sub(&retry, "session").get("state").unwrap()),
+        jv(&PyValue::from("ATTACHING")),
+        "有效通知不得被世代失配拒絕：{}",
+        j(&retry)
+    );
+    r.wait_state("COM0", "READY");
+    assert_eq!(dev.open_attempts(), 2);
+    let test = r.call("session.self_test", r#"{"selector":"COM0"}"#);
+    assert_ne!(s(&test, "classification"), "DEVICE_REBOUND_REQUIRED");
+    assert_eq!(s(&test, "current_real_path"), REAL_A);
+    assert_eq!(s(&test, "attached_real_path"), REAL_A);
+}
+
+#[test]
+fn wp510r_i25_rpc_timed_out_bind_late_completion_allows_replug() {
+    let (r, dev) = i25_bind_completes_after_rpc_timeout();
+    // 審查反例的原步驟：逾時晚到完成 → 再次成功 bind → 拔插仍須能重新開埠。
+    let retry = r.call(
+        "session.bind",
+        &format!(r#"{{"selector":"COM0","device_by_id":"{BY_ID_A}"}}"#),
+    );
+    assert_eq!(retry.get("ok"), Some(&PyValue::Bool(true)));
+    assert_eq!(
+        s(&sub(&retry, "session"), "state"),
+        "ATTACHING",
+        "{}",
+        j(&retry)
+    );
+    r.wait_state("COM0", "READY");
+    r.mgr.update_devices(&[]);
+    r.wait_state("COM0", "DETACHED");
+    let before_replug = dev.open_attempts();
+    r.mgr.update_devices(&[(
+        BY_ID_A.into(),
+        DeviceInfo {
+            by_id: BY_ID_A.into(),
+            real_path: REAL_A.into(),
+        },
+    )]);
+    r.wait_state("COM0", "READY");
+    assert_eq!(before_replug, 2);
+    assert_eq!(
+        dev.open_attempts(),
+        3,
+        "晚到完成後 watcher 的有效通知仍須開埠"
+    );
+    let test = r.call("session.self_test", r#"{"selector":"COM0"}"#);
+    assert_eq!(s(&test, "current_real_path"), REAL_A);
+    assert_eq!(s(&test, "attached_real_path"), REAL_A);
+    assert!(
+        !r.mgr
+            .delivery_obligation_for_test(&r.mgr.resolve("COM0").unwrap())
+    );
+}
+
 /// 第 25 項 Medium：bind 通知逾時後才登記舊義務，裝置已改指並完成重新連線。
 /// Python self_test 讀目前 _devices（origin/main:sw_core/session_manager.py:7658-7685）。
 #[test]

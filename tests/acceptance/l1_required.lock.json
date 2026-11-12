@@ -22165,6 +22165,8 @@
           "cargo:sw-daemon::dispatch::wp510r_i24_rpc_watcher_closing_retire_release_times_out_then_converges",
           "cargo:sw-daemon::dispatch::wp510r_i24_rpc_watcher_closing_retire_release_waits_success",
           "cargo:sw-daemon::dispatch::wp510r_i25_rpc_late_delivery_registration_cannot_revert_current_path",
+          "cargo:sw-daemon::dispatch::wp510r_i25_rpc_timed_out_bind_late_completion_allows_replug",
+          "cargo:sw-daemon::dispatch::wp510r_i25_rpc_timed_out_bind_late_completion_allows_retry",
           "cargo:sw-daemon::dispatch::wp510r_m16_device_attach_claims_parked_custody_token",
           "cargo:sw-daemon::dispatch::wp510r_r3_rpc_bind_retired_close_failure_reports_recovering_stalled",
           "cargo:sw-daemon::dispatch::wp510r_r3_rpc_bind_waits_retired_receipt_then_rebinds",

@@ -1102,7 +1102,7 @@ impl EffectExecutor for RigExec {
                     .unwrap_or_else(|e| e.into_inner())
                     .push(msg);
             }
-            Effect::Notify(_) => {}
+            Effect::Notify(_) | Effect::PublishBinding { .. } => {}
             Effect::Reattach { by_id, real_path } => {
                 // 測試替身無 manager 再解析：直接回送 DeviceAttached（等同無 pin、非 fallback）。
                 let _ = tx.send(ControlEvent::DeviceAttached { by_id, real_path });
@@ -2863,6 +2863,7 @@ impl P6HarnessState {
 fn effect_kind(e: &Effect) -> &'static str {
     match e {
         Effect::Reply(..) => "Reply",
+        Effect::PublishBinding { .. } => "PublishBinding",
         Effect::AdoptBridge { .. } => "AdoptBridge",
         Effect::OpenBridge { .. } => "OpenBridge",
         Effect::BeginDrain { .. } => "BeginDrain",
