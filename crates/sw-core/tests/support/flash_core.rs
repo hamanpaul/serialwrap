@@ -373,6 +373,30 @@ pub mod bb {
             .collect()
     }
 
+    /// 指定命令的完整 TX 是否已落入 WAL。
+    pub fn command_tx_in_wal(rig: &ActorRig, cmd_id: &str, want: &[u8]) -> bool {
+        rig.wal_rows().iter().any(|r| {
+            dir_of(r) == Some("TX")
+                && r.get("cmd_id").and_then(PyValue::as_str) == Some(cmd_id)
+                && payload_of(r).as_slice() == want
+        })
+    }
+
+    /// 等指定命令的完整 TX 落入 WAL。
+    pub fn wait_command_tx_in_wal(rig: &ActorRig, cmd_id: &str, want: &[u8]) {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if command_tx_in_wal(rig, cmd_id, want) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "等待 WAL 中 cmd_id={cmd_id} 的完整 TX {want:?} 逾時"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     /// 給 hub／TX pump／OpRunner 一段真實時間消化（零 TX 斷言前的穩定窗）。
     pub fn settle(rig: &ActorRig) {
         std::thread::sleep(Duration::from_millis(80));

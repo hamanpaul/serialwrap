@@ -227,12 +227,67 @@ fn probe_start_rejects_drain_in_progress() {
 }
 
 #[test]
+fn gpb_foreground_tx_barrier_waits_for_wal() {
+    const COMMAND: &str = "cat /proc/version";
+    const COMMAND_BYTES: &[u8] = b"cat /proc/version\n";
+
+    let rig = bb::ready(false);
+    let tx0 = rig.dev.tx_len();
+    rig.dev
+        .script_write(vec![sw_pal::fakes::FakeWriteStep::AcceptThenWouldBlock(
+            COMMAND_BYTES.len(),
+        )]);
+    let cmd_id = rig.submit_ok(COMMAND);
+    rig.wait_running(&cmd_id);
+
+    let paused = rig.dev.wait_paused(Duration::from_secs(5));
+    if !paused {
+        rig.dev.release_pause();
+        panic!("FakeWriteStep 未在完整命令 TX 後暫停");
+    }
+    let dut_received_command = rig.dev.tx_since(tx0) == COMMAND_BYTES;
+    let wal_has_command_tx = bb::command_tx_in_wal(&rig, &cmd_id, COMMAND_BYTES);
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let waiter = scope.spawn(|| {
+            started_tx.send(()).expect("通知等待執行緒已啟動");
+            bb::wait_command_tx_in_wal(&rig, &cmd_id, COMMAND_BYTES);
+            done_tx.send(()).expect("回報 WAL barrier 完成");
+        });
+
+        let waiter_started = started_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        let returned_while_writer_paused = done_rx.recv_timeout(Duration::from_millis(300)).is_ok();
+        rig.dev.release_pause();
+        let returned_after_release =
+            returned_while_writer_paused || done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        let waiter_joined = waiter.join().is_ok();
+        let wal_has_command_tx_after_release = bb::command_tx_in_wal(&rig, &cmd_id, COMMAND_BYTES);
+
+        assert!(waiter_started, "WAL barrier 等待執行緒未啟動");
+        assert!(dut_received_command, "暫停前 DUT 必須已收到完整命令 bytes");
+        assert!(!wal_has_command_tx, "writer 暫停期間 WAL 不得已有該命令 TX");
+        assert!(
+            !returned_while_writer_paused,
+            "WAL barrier 在指定命令尚未落 WAL 時提前返回"
+        );
+        assert!(returned_after_release, "放行 writer 後 WAL barrier 應完成");
+        assert!(waiter_joined, "WAL barrier 等待執行緒應正常結束");
+        assert!(
+            wal_has_command_tx_after_release,
+            "放行 writer 後 WAL 應含相同 cmd_id 與完整 payload"
+        );
+    });
+}
+
+#[test]
 fn probe_start_rejects_foreground_busy() {
     // 黑箱：passthrough READY 有前景命令執行中（SC-14）→ ForegroundBusy，之後 DUT 不再收到任何 bytes。
     let rig = bb::ready(false);
     let cmd = rig.submit_ok("cat /proc/version");
     rig.wait_running(&cmd);
-    bb::wait_dut_contains(&rig, 0, b"cat /proc/version");
+    bb::wait_command_tx_in_wal(&rig, &cmd, b"cat /proc/version\n");
     let tx0 = rig.dev.tx_len();
     let wal0 = bb::wal_tx(&rig).len();
     assert_eq!(bb::probe_start(&rig, 1), Err(FlashReject::ForegroundBusy));
