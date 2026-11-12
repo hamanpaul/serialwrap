@@ -3038,7 +3038,7 @@ fn dr1_persisted_released(m: &ManagerRig, sid: &str) -> bool {
 }
 
 /// DR-1(d)（設計 v3 §1.8；Python caller 逾時不撤銷 release 義務，`origin/main:sw_core/session_manager.py:3117-3125`）：parked
-/// B3 綁在 COM0 上（DeviceOnline 之前）時，release 請求未能入列（H-actor-hold＋灌滿 lane，短逾時 route）：RPC 回
+/// B3 綁在 COM0 上（DeviceOnline 之前）時，release 請求未能入列（H-actor-hold＋灌滿 safety lane，短逾時 route）：RPC 回
 /// `internal timeout`，帳本紀錄不變（同 token、同 phase、沒有取消）、B3 仍被阻擋、handle 未關閉。actor 恢復後下一個
 /// release 照 WP7-1 完成（REL、關閉一次、紀錄移除）。
 #[test]
@@ -3049,9 +3049,18 @@ fn test_dr1_d_release_not_enqueued_keeps_ledger_then_next_release_completes() {
     let before = m.mgr.custody_for_test(DR7_BY_ID).expect("帳本紀錄");
     let hold = hold_actor_and_fill_control(&m.mgr, &full_sid);
     assert!(hold.filled > 0, "灌滿迴圈必須實際送入事件");
+    // ReleaseWithAck 走 safety；只填 control 會變成「已入列但回覆逾時」，留下首次期限與被丟棄的 waiter（DR-1(e)）。
+    let safety = m.mgr.actor_safety_for_test(&full_sid).expect("release lane");
+    assert!(safety.is_empty(), "前置不得有既存 safety 請求");
+    let mut safety_filled = 0;
+    while safety.try_send(ControlEvent::ConsoleCountChanged { count: 0 }).is_ok() {
+        safety_filled += 1;
+    }
+    assert!(safety_filled > 0 && safety.is_full(), "確定阻擋 release 入列");
     let res = m.mgr.route(&full_sid, dr1_release(), Duration::from_millis(500));
     let err = res.expect_err("release 未入列必須回錯");
     assert_eq!(err.message, "internal timeout", "{err:?}");
+    assert_eq!(safety.len(), safety_filled, "DR-1(d)：逾時的 release 不得已入列 safety lane");
     let after = m.mgr.custody_for_test(DR7_BY_ID).expect("帳本紀錄不變");
     assert_eq!(after.token, before.token, "同一 token");
     assert_eq!(after.phase, before.phase, "phase 不變");
@@ -3061,6 +3070,9 @@ fn test_dr1_d_release_not_enqueued_keeps_ledger_then_next_release_completes() {
 
     hold.resume.send(()).expect("放行 actor");
     hold.query.join().expect("查詢執行緒不應 panic");
+    // 同一 control lane 的同步查詢排在灌入事件之後；回覆時兩條 lane 均已排空，才開始量下一個 release。
+    m.mgr.session_queue_lens(&full_sid).expect("actor 已排空滿載事件");
+    assert!(safety.is_empty(), "下一個 release 前 safety lane 已排空");
     let released = m
         .mgr
         .route(&full_sid, dr1_release(), Duration::from_secs(10))

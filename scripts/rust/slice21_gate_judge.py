@@ -227,8 +227,35 @@ def _empty_l1_verdict(reason: str) -> dict[str, Any]:
             "deselected_required": [], "duplicates": [], "not_run": [], "required_sha256": ""}
 
 
+LOCAL_WINDOWS_SECTIONS = {
+    "windows_cap_windows_native", "windows_cap_interactive_desktop", "windows_cap_supervisor_runtime",
+}
+
+
+def windows_evidence_problems(l1: Any, candidate: Any) -> list[str]:
+    """OD-55：開始與結束都須為乾淨的候選 commit；缺欄位不得視為已驗證。"""
+    if not isinstance(l1, Mapping):
+        return ["LOCAL-WINDOWS-TODO：證據不是物件"]
+    problems = []
+    if l1.get("platform") != "windows" or l1.get("finished") is not True:
+        problems.append("platform 須為 windows 且 finished 須為 true")
+    provenance = l1.get("provenance")
+    git = provenance.get("git") if isinstance(provenance, Mapping) else None
+    git = git if isinstance(git, Mapping) else {}
+    end = git.get("end")
+    end = end if isinstance(end, Mapping) else {}
+    if not isinstance(candidate, str) or re.fullmatch(r"[0-9a-f]{40}", candidate) is None:
+        problems.append("provenance 無法核對：本次候選 commit 缺失或格式不符")
+    for label, state in (("provenance.git", git), ("provenance.git.end", end)):
+        if state.get("head") != candidate or not state.get("head"):
+            problems.append(f"{label}.head={state.get('head')!r} 與候選 commit {candidate!r} 不符")
+        if state.get("clean") is not True:
+            problems.append(f"{label}.clean={state.get('clean')!r}（須為 true）")
+    return [f"LOCAL-WINDOWS-TODO：{reason}" for reason in problems]
+
+
 def _judge_test_section(sec: Mapping[str, Any], expect: Mapping[str, Any], platform: str,
-                        passed_pool: set[str]) -> tuple[str, dict[str, Any], list[str]]:
+                        passed_pool: set[str], candidate: Any = None) -> tuple[str, dict[str, Any], list[str]]:
     reasons: list[str] = []
     set_id = sec.get("required_set")
     if not set_id:
@@ -262,6 +289,10 @@ def _judge_test_section(sec: Mapping[str, Any], expect: Mapping[str, Any], platf
         l1 = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         return "EVIDENCE_MISSING", _empty_l1_verdict(f"l1_results 無法讀取：{exc}"), [f"l1_results 無法讀取：{rel}"]
+    if sec.get("name") in LOCAL_WINDOWS_SECTIONS:
+        problems = windows_evidence_problems(l1, candidate)
+        if problems:
+            return "EVIDENCE_MISSING", _empty_l1_verdict("；".join(problems)), problems
     verdict = dict(l1j.judge(l1, required, platform=platform))
     if verdict.get("verdict") != "INVALID":
         passed_pool.update(_passed_ids(l1))
@@ -873,7 +904,7 @@ def judge(report: Mapping[str, Any], expect: Mapping[str, Any]) -> dict[str, Any
             status, l1v = "EVIDENCE_MISSING", _empty_l1_verdict("section 缺失")
         elif name in TEST_SECTIONS:
             pool: set[str] = set()
-            status, l1v, reasons = _judge_test_section(sec, expect, TEST_SECTIONS[name], pool)
+            status, l1v, reasons = _judge_test_section(sec, expect, TEST_SECTIONS[name], pool, report.get("git_revision"))
             cap_cfg = CAPABILITY_SECTIONS.get(name)
             if cap_cfg is not None:
                 # SPEC-GAP #2：無能力探測、探測為不可用或能力不符 → EVIDENCE_MISSING（不得 PASS，也不因缺能力的失敗記 FAIL）。
@@ -1050,6 +1081,34 @@ def cmd_record_section(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_import_windows_section(args: argparse.Namespace) -> int:
+    """外部證據先核對版本再採納；用同一份位元組驗證、複製與記錄 SHA256。"""
+    source = pathlib.Path(args.source)
+    data = None
+    try:
+        data = source.read_bytes()
+        problems = windows_evidence_problems(json.loads(data), args.candidate_commit)
+    except (OSError, ValueError) as exc:
+        problems = [f"LOCAL-WINDOWS-TODO：無法讀取 Windows 證據 {source}：{exc}"]
+    cap = CAPABILITY_SECTIONS[args.name]["cap"]
+    rel = None
+    if not problems:
+        rel = f"{args.name}/l1-results.json"
+        dest = pathlib.Path(args.run_dir) / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        evidence = f"LOCAL-WINDOWS 證據檔 {source} sha256={hashlib.sha256(data).hexdigest()}"
+    else:
+        evidence = "；".join(problems)
+    return cmd_record_section(argparse.Namespace(
+        run_dir=args.run_dir, name=args.name, command=f"LOCAL-WINDOWS 匯入：{source}",
+        exit=json.loads(data).get("exit_code") if rel else None,
+        required_set=f"s21_gate:cap_{cap}", l1_results=rel, log="", section_verdict=None,
+        reason=problems, evidence=None, run_euid=None, extra_check=[],
+        capability_probe=f"{cap}={'unavailable' if problems else 'available'}:{evidence}",
+    ))
+
+
 def _parity_source(cfg: Mapping[str, Any]) -> tuple[str | None, str]:
     rel = str(cfg.get("source") or "")
     p = ROOT / rel
@@ -1138,7 +1197,7 @@ def cmd_assemble(args: argparse.Namespace) -> int:
     report: dict[str, Any] = {
         "schema_version": 1, "run_id": args.run_id,
         "started_at": args.started_at or dt.datetime.now(dt.timezone.utc).isoformat(),
-        "git_revision": (_git("rev-parse", "HEAD") or "unknown").strip(), "slice": "2.1",
+        "git_revision": (getattr(args, "candidate_commit", None) or _git("rev-parse", "HEAD") or "unknown").strip(), "slice": "2.1",
         "dry_run": bool(args.dry_run),
         "identity": build_identity(args), "sections": sections,
         "pending_decisions": list(expect_yaml.get("pending_decisions") or []),
@@ -1328,11 +1387,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     r.add_argument("--capability-probe", default=None,
                    help="能力集合 section 的能力探測（SPEC-GAP #2）：<cap>=available:<證據> 或 <cap>=unavailable:<證據>")
     r.add_argument("--extra-check", action="append", default=[], help="<名稱>=<exit>，可重複")
+    wi = sub.add_parser("import-windows-section", help="核對候選 commit 後匯入 OD-55 Windows 能力證據")
+    wi.add_argument("--run-dir", required=True)
+    wi.add_argument("--name", required=True, choices=sorted(LOCAL_WINDOWS_SECTIONS))
+    wi.add_argument("--candidate-commit", required=True)
+    wi.add_argument("--source", required=True)
     a = sub.add_parser("assemble")
     a.add_argument("--run-dir", required=True)
     a.add_argument("--run-id", required=True)
     a.add_argument("--expect", default=str(ROOT / "tests" / "acceptance" / "slice21_gate_expect.yaml"))
     a.add_argument("--started-at", default=None)
+    a.add_argument("--candidate-commit", default=None, help="gate 開始時固定的候選 commit")
     a.add_argument("--dry-run", action="store_true")
     a.add_argument("--cli-path", default=None)
     a.add_argument("--daemon-path", default=None)
@@ -1368,6 +1433,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.cmd == "record-section":
             return cmd_record_section(args)
+        if args.cmd == "import-windows-section":
+            return cmd_import_windows_section(args)
         if args.cmd == "assemble":
             return cmd_assemble(args)
         if args.cmd == "case-verdicts":

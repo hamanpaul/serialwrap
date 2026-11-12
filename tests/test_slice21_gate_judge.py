@@ -196,7 +196,11 @@ class _Case:
         else:
             ids = GATE_NODEIDS[name]
             runner = "pytest"
-        return _l1(platform, runner, [_row(i) for i in ids])
+        l1 = _l1(platform, runner, [_row(i) for i in ids])
+        if name.startswith("windows_cap_") and name in CAP_OF:
+            l1["provenance"] = {"git": {"head": "e" * 40, "clean": True,
+                                         "end": {"head": "e" * 40, "clean": True}}}
+        return l1
 
     def write_l1(self, name: str, report: dict) -> str:
         rel = f"l1/{name}.json"
@@ -1000,3 +1004,86 @@ def test_gate_script_capability_sections_caps_only_and_posix_pty_non_root():
     assert "nonroot_cmd" in sec3 and "--run-euid" in sec3 and "EVIDENCE_MISSING" in sec3
     l1 = text[text.index("# 2. Linux L1"):text.index("# 3. Linux cap_posix_pty")]
     assert "nonroot_cmd() {" in l1 and "SW_GATE_L1_USER" in l1 and "setpriv" in l1
+
+
+# wp510r 第 26 項：OD-55 外部證據必須綁定本次候選，匯入與重判都不得繞過。
+@pytest.mark.parametrize("cap", ["windows_native", "interactive_desktop", "supervisor_runtime"])
+@pytest.mark.parametrize("problem", ["old_head", "dirty", "missing_provenance", "missing_clean",
+                                    "missing_end", "changed_end", "dirty_end", "missing_candidate"])
+def test_windows_import_rejects_unbound_evidence(case, cap, problem):
+    name = f"windows_cap_{cap}"
+    l1 = case.l1[name]
+    if problem == "missing_provenance":
+        del l1["provenance"]
+    elif problem != "missing_candidate":
+        git = l1["provenance"]["git"]
+        if problem == "old_head":
+            git["head"] = "f" * 40
+        elif problem == "dirty":
+            git["clean"] = False
+        elif problem == "missing_clean":
+            del git["clean"]
+        elif problem == "missing_end":
+            del git["end"]
+        elif problem == "changed_end":
+            git["end"]["head"] = "f" * 40
+        elif problem == "dirty_end":
+            git["end"]["clean"] = False
+    report = case.report()
+    if problem == "missing_candidate":
+        del report["git_revision"]
+    out = _judge_mod().judge(report, case.expect())
+    sec = _sec(out, name)
+    assert sec["status"] == "EVIDENCE_MISSING"
+    assert sec["l1_verdict"]["verdict"] == "INSUFFICIENT"
+    assert any("LOCAL-WINDOWS-TODO" in reason and "provenance" in reason for reason in sec["reasons"])
+    assert out["verdict"] == "INCOMPLETE"
+
+
+@pytest.mark.parametrize("cap", ["windows_native", "interactive_desktop", "supervisor_runtime"])
+@pytest.mark.parametrize("failed", [False, True])
+def test_windows_import_matching_clean_commit_uses_l1_judge(case, cap, failed):
+    name = f"windows_cap_{cap}"
+    if failed:
+        case.l1[name]["results"][0] = _row(GATE_NODEIDS[name][0], "failed")
+        case.l1[name]["exit_code"] = 1
+    report = case.report()
+    if failed:
+        next(sec for sec in report["sections"] if sec["name"] == name)["exit"] = 1
+    sec = _sec(_judge_mod().judge(report, case.expect()), name)
+    assert sec["status"] == ("FAIL" if failed else "PASS")
+    assert sec["l1_verdict"]["verdict"] == ("FAIL" if failed else "PASS")
+
+
+@pytest.mark.parametrize("problem", [None, "old_head", "dirty", "missing_provenance"])
+def test_windows_section_import_records_provenance_rejection(case, problem):
+    """直接執行 gate 使用的匯入入口，拒收時不複製報告、不宣告能力可用，並保留原因。"""
+    name = "windows_cap_windows_native"
+    l1 = case.l1[name]
+    if problem == "old_head":
+        l1["provenance"]["git"]["head"] = "f" * 40
+    elif problem == "dirty":
+        l1["provenance"]["git"]["clean"] = False
+    elif problem == "missing_provenance":
+        del l1["provenance"]
+    source = case.base / case.write_l1(name, l1)
+    run = case.base / "imported"
+    j = _judge_mod()
+    assert j.main(["import-windows-section", "--run-dir", str(run), "--name", name,
+                   "--candidate-commit", "e" * 40, "--source", str(source)]) == 0
+    sec = json.loads((run / "sections" / f"{name}.json").read_text())
+    copied = run / name / "l1-results.json"
+    assert sec["capability_probe"]["available"] is (problem is None)
+    if problem is None:
+        assert copied.read_bytes() == source.read_bytes()
+        assert hashlib.sha256(source.read_bytes()).hexdigest() in sec["capability_probe"]["evidence"]
+        assert sec["l1_results"] == f"{name}/l1-results.json"
+    else:
+        assert not copied.exists()
+        assert sec["l1_results"] is None
+        assert any("LOCAL-WINDOWS-TODO" in reason and "provenance" in reason for reason in sec["reasons"])
+    # 採用匯入入口產生的片段重判，確認 exit／計數也接上正式 L1 judge。
+    expect = case.expect()
+    expect["base_dir"] = run
+    judged = j.judge({"git_revision": "e" * 40, "sections": [sec]}, expect)
+    assert _sec(judged, name)["status"] == ("PASS" if problem is None else "EVIDENCE_MISSING")

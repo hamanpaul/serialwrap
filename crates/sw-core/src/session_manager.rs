@@ -7370,6 +7370,13 @@ impl SessionManager {
         inner.sessions.get(sid).map(|e| e.actor.control.clone())
     }
 
+    /// 只供測試：取得 release 真正使用的 safety lane，以確定性重現「請求未入列」。
+    #[cfg(feature = "test-fakes")]
+    pub fn actor_safety_for_test(&self, sid: &str) -> Option<crossbeam_channel::Sender<crate::mailbox::ControlEvent>> {
+        let inner = lock(&self.shared.inner);
+        inner.sessions.get(sid).map(|e| e.actor.safety.clone())
+    }
+
     /// 只供測試（test-fakes）：在帳本登記一筆以指定 session 為 owner 的 Held 紀錄。
     #[cfg(feature = "test-fakes")]
     pub fn custody_register_held_session_for_test(&self, sid: &str, by_id: &str, real_path: &str) -> u64 {
