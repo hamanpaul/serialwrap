@@ -788,6 +788,8 @@ def test_l1_lock_frozen_set_excludes_capability_gated() -> None:
 
     結構判定以 _capability_gated 完成；reference 環境（hosted Windows 無 re2／無 SW_TEST_COM_PAIR／無真機序列埠）
     下這些案例必定 SKIP，判定 rule 6 會因此得 INSUFFICIENT，故鎖檔不得含之。
+    OD-53／OD-55：selector 明確以 `--ignored cap_<cap>__` 執行的能力集合（`_selector_explicit_caps`），其同 cap 前綴的
+    cargo 列豁免（gate 以 `--caps <cap>` 於具備能力的原生 Windows 實跑，不在 reference 環境 SKIP）；其他集合仍禁止。
     """
     lock = json.loads(Path("tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
     cache: dict = {}
@@ -795,7 +797,10 @@ def test_l1_lock_frozen_set_excludes_capability_gated() -> None:
         for plat, spec in lock["sets"][set_id].items():
             if plat != "windows":
                 continue
-            flagged = [nid for nid in spec["nodeids"] if _capability_gated(nid, cache)]
+            caps = _selector_explicit_caps(spec["selector"])
+            flagged = [nid for nid in spec["nodeids"] if _capability_gated(nid, cache)
+                       and not (nid.startswith("cargo:")
+                                and any(nid.rsplit("::", 1)[-1].startswith(f"cap_{cap}__") for cap in caps))]
             assert not flagged, f"{set_id}.windows 含能力 SKIP 案例（須自凍結集合移除）：{flagged[:5]}"
 
 
