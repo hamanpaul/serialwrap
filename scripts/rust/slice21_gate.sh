@@ -142,8 +142,6 @@ if [[ "$DRY_RUN" == "1" || ( "$PREFLIGHT_OK" != "1" && "$EVIDENCE_RUN" != "1" ) 
   record linux_l1 --required-set s21_core --reason "$why"
   record linux_cap_posix_pty --required-set s21_gate:linux_cap_posix_pty --reason "$why"
   record linux_cap_sys_admin --required-set s21_gate:cap_sys_admin --reason "$why"
-  record linux_cap_windows_native --required-set s21_gate:cap_windows_native --reason "$why"
-  record linux_cap_interactive_desktop --required-set s21_gate:cap_interactive_desktop --reason "$why"
   record linux_cap_supervisor_runtime --required-set s21_gate:cap_supervisor_runtime --reason "$why"
   record py_parity --required-set s21_gate:py_parity_full --reason "$why"
   record windows_native_l1 --required-set s21_core --reason "$why；需原生 Windows（win-test.sh）"
@@ -250,7 +248,8 @@ cap_probe() {  # cap_probe <cap>：印出 available:<證據> 或 unavailable:<�
       echo "unavailable:linux 主機（$(uname -s)）無法提供 cap_$1（需原生 Windows）" ;;
   esac
 }
-for cap in sys_admin windows_native interactive_desktop supervisor_runtime; do
+# 擁有者裁決 2026-11-12（rulings/s2.md「OD-55 Windows 部分的完成方式」第 4 點）：windows_native／interactive_desktop 的 linux section 退役，改由 windows_cap_<cap> 承擔（見下方 LOCAL-WINDOWS 匯入）。
+for cap in sys_admin supervisor_runtime; do
   sec="linux_cap_$cap"
   probe="$(cap_probe "$cap")"
   if [[ "$probe" == available:* ]] && ! caps_args "$sec"; then

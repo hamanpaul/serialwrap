@@ -41,7 +41,8 @@ parity:
 #   互動桌面／systemd 監管執行期；P5 第 6 輪 SPEC-GAP #2（編排者裁決）起各有一個 section（linux_cap_<cap>），gate 先探測能力，
 #   具備才以 --caps <cap> 實跑，否則記 EVIDENCE_MISSING 並標所需能力（sys_admin／supervisor_runtime → BLOCKED-OWNER＋實跑方式；
 #   windows_native／interactive_desktop → LOCAL-WINDOWS-TODO），不得記 PASS（judge CAPABILITY_SECTIONS）。
-# OD-68：核准移除 cap_windows_native／cap_interactive_desktop 的 Linux lock 列；在補齊原生 Windows selector 前，兩個 Linux section 因必要集合缺失維持 EVIDENCE_MISSING。
+# OD-68：核准移除 cap_windows_native／cap_interactive_desktop 的 Linux lock 列。擁有者裁決 2026-11-12（rulings/s2.md「OD-55 Windows 部分的完成方式」第 4 點）：
+#   linux_cap_windows_native／linux_cap_interactive_desktop 兩個 linux section 退役，改由 windows_cap_<cap> section 承擔。
 # SPEC-GAP #1（編排者裁決）：s21_gate:py_parity（凍結，selector 只有 1 筆）不改不刪、仍由 pytest_full 承擔；新集合
 #   s21_gate:py_parity_full（完整 selector＝舊集合全部 nodeid）由 py_parity section 以其 selector 實跑。
 #   OD-55（Windows 部分）：s21_core.windows 的能力列經 Windows 原生收集後移入 s21_gate:windows_cap_windows_com.windows 與
@@ -58,10 +59,6 @@ sections:
      command: "python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_cap_posix_pty/l1-results.json <caps-plan（OD-53 由鎖 selector 推導）：--caps posix_pty -- -p sw-pal --features test-fakes>（euid 0 時以 SW_GATE_L1_USER 降權，F108）"}
   - {name: linux_cap_sys_admin, kind: test, platform: linux, required_set: "s21_gate:cap_sys_admin",
      command: "能力探測（euid 0 且 CapEff 含 CAP_SYS_ADMIN）通過時：python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_cap_sys_admin/l1-results.json <caps-plan：--caps-only --caps sys_admin -- 集合 selector argv>"}
-  - {name: linux_cap_windows_native, kind: test, platform: linux, required_set: "s21_gate:cap_windows_native",
-     command: "linux 主機恆不具備（原生 Windows）：記 EVIDENCE_MISSING（LOCAL-WINDOWS-TODO）"}
-  - {name: linux_cap_interactive_desktop, kind: test, platform: linux, required_set: "s21_gate:cap_interactive_desktop",
-     command: "linux 主機恆不具備（Windows 互動 console）：記 EVIDENCE_MISSING（LOCAL-WINDOWS-TODO）"}
   - {name: linux_cap_supervisor_runtime, kind: test, platform: linux, required_set: "s21_gate:cap_supervisor_runtime",
      command: "能力探測（systemctl --user is-system-running 為 running／degraded）通過時：python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_cap_supervisor_runtime/l1-results.json <caps-plan：--caps-only --caps supervisor_runtime -- 集合 selector argv>"}
   - {name: windows_native_l1, kind: test, platform: windows, required_set: s21_core,

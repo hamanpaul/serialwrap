@@ -48,16 +48,13 @@ TEST_SECTIONS = {
     "pytest_full": ("linux", "s21_gate:pytest_full"),
     # P5 第 6 輪 SPEC-GAP #2（編排者裁決）：OD-55 linux 能力集合各一個 section（以 --caps <cap> 實跑，須附能力探測）
     "linux_cap_sys_admin": ("linux", "s21_gate:cap_sys_admin"),
-    "linux_cap_windows_native": ("linux", "s21_gate:cap_windows_native"),
-    "linux_cap_interactive_desktop": ("linux", "s21_gate:cap_interactive_desktop"),
     "linux_cap_supervisor_runtime": ("linux", "s21_gate:cap_supervisor_runtime"),
     # SPEC-GAP #1（編排者裁決）：py_parity section 以完整 selector 的新集合判定（舊 s21_gate:py_parity 仍由 pytest_full 承擔）
     "py_parity": ("linux", "s21_gate:py_parity_full"),
     # P5 第 8 輪 SPEC-GAP #1：計畫 06 Task 0b #76～#80 另以 add-only 新集合承擔。
     "py_parity_76_80": ("linux", "s21_gate:py_parity_76_80"),
 }
-CAP_OF = {"linux_cap_sys_admin": "sys_admin", "linux_cap_windows_native": "windows_native",
-          "linux_cap_interactive_desktop": "interactive_desktop", "linux_cap_supervisor_runtime": "supervisor_runtime",
+CAP_OF = {"linux_cap_sys_admin": "sys_admin", "linux_cap_supervisor_runtime": "supervisor_runtime",
           "windows_cap_windows_native": "windows_native", "windows_cap_interactive_desktop": "interactive_desktop",
           "windows_cap_supervisor_runtime": "supervisor_runtime"}
 NON_TEST_SECTIONS = ["l15_ab", "event_latency", "wal_s1w_perf", "cfg_boundary", "policy_check", "case_uptake"]
@@ -820,7 +817,9 @@ def test_gate_script_runs_capability_and_py_parity_sections():
     assert text.count("record py_parity ") >= 2                 # ＋實跑分支
     assert text.count("record py_parity_76_80 ") >= 2
     # 實跑分支：四個能力逐一探測，具備才 --caps <cap> 實跑，並把探測結果記入 section
-    assert "for cap in sys_admin windows_native interactive_desktop supervisor_runtime; do" in text
+    # 擁有者裁決 2026-11-12 第 4 點：windows_native／interactive_desktop 的 linux section 退役（改由 windows_cap_<cap> 承擔）
+    assert "for cap in sys_admin supervisor_runtime; do" in text
+    assert "record linux_cap_windows_native " not in text and "record linux_cap_interactive_desktop " not in text
     # 第 7 輪（OD-53 推導）：--caps 由 caps_args 依鎖 selector 推導，不再手寫 `--caps "$cap"`
     assert '"${CAPS_ARGV[@]}"' in text and '--capability-probe "$cap=$probe"' in text and "cap_probe()" in text
 
@@ -863,12 +862,17 @@ def test_real_lock_s21_sets_caps_derivable_and_gate_plan():
     for cap in ("sys_admin", "windows_native", "interactive_desktop", "supervisor_runtime"):
         plan = j.caps_plan(f"linux_cap_{cap}", exp, lock)
         if cap in ("windows_native", "interactive_desktop"):
-            # OD-68 核准移除這兩個集合的 Linux 列；沒有 linux selector 時 linux section 不可建立執行計畫
-            # （OD-55：Windows 列登記於同名集合的 windows 平台，由 Windows section 承擔）。
+            # OD-68 核准移除這兩個集合的 Linux 列；擁有者裁決 2026-11-12 第 4 點：linux section 退役，
+            # 改由 windows_cap_<cap> section 承擔（OD-55：Windows 列登記於同名集合的 windows 平台）。
             assert "linux" not in lock["sets"].get(f"s21_gate:cap_{cap}", {})
+            assert f"linux_cap_{cap}" not in j.TEST_SECTIONS
             assert plan is None, plan
             continue
         assert plan == {"caps": [cap], "argv": lock["sets"][f"s21_gate:cap_{cap}"]["linux"]["selector"]["argv"],
+                        "caps_only": True}, plan
+    for cap in ("windows_native", "interactive_desktop", "supervisor_runtime"):
+        plan = j.caps_plan(f"windows_cap_{cap}", exp, lock)
+        assert plan == {"caps": [cap], "argv": lock["sets"][f"s21_gate:cap_{cap}"]["windows"]["selector"]["argv"],
                         "caps_only": True}, plan
 
 
@@ -884,17 +888,25 @@ def test_underivable_caps_selector_is_evidence_missing(case):
 
 @pytest.mark.parametrize("cap", ["windows_native", "interactive_desktop"])
 def test_od68_removed_linux_capability_set_is_evidence_missing(case, cap):
-    """OD-68 移除 Linux-only lock 集合後，對應 gate section 必須明確保持 EVIDENCE_MISSING。"""
+    """OD-68 移除 Linux 列、擁有者裁決 2026-11-12 第 4 點退役 linux section 後，承擔的 windows_cap_<cap> section
+    在必要集合缺失時必須明確 EVIDENCE_MISSING；linux_cap_<cap> 不再是 gate section。"""
     set_id = f"s21_gate:cap_{cap}"
+    assert f"linux_cap_{cap}" not in _judge_mod().TEST_SECTIONS
+    assert f"linux_cap_{cap}" not in [item["name"] for item in case.report()["sections"]]
     expect = case.expect()
     expect["lock"]["sets"].pop(set_id)
     out = _judge_mod().judge(case.report(), expect)
-    section = _sec(out, f"linux_cap_{cap}")
+    section = _sec(out, f"windows_cap_{cap}")
     assert section["status"] == "EVIDENCE_MISSING"
     assert section["l1_verdict"]["verdict"] == "INSUFFICIENT"
     assert any(set_id in reason and "不在 l1_required.lock.json" in reason for reason in section["reasons"])
 
-    # OD-68 的承擔項仍須有 Windows 原生證據；未原生收集時不可因 Linux 列已移除而完成。
+    # OD-68 的承擔項仍須有 Windows 原生證據；未原生收集／未匯入時不可因 Linux 列已移除而完成。
+    carrier_report = case.report()
+    next(item for item in carrier_report["sections"] if item["name"] == f"windows_cap_{cap}")["l1_results"] = None
+    carrier_out = _judge_mod().judge(carrier_report, case.expect())
+    assert _sec(carrier_out, f"windows_cap_{cap}")["status"] == "EVIDENCE_MISSING"
+    assert carrier_out["verdict"] == "INCOMPLETE"
     report = case.report()
     windows_section = next(item for item in report["sections"] if item["name"] == "windows_native_l1")
     windows_section["l1_results"] = None
