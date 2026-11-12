@@ -3418,6 +3418,8 @@ impl SessionCore {
             if let Some(token) = opening_token {
                 self.external_attach = Some(token);
                 self.external_claimed = false;
+                // 一般開埠與 ClaimCustody 共用終態處理；bind 取消後不得再進登入。
+                self.custody_opening = self.open_real_path.is_some();
             }
         }
         if let Some(token) = self.external_attach {
@@ -3634,6 +3636,17 @@ impl SessionCore {
         // 保管紀錄的開埠工作（`ClaimCustody`）回報終態：之後本 session 不再持有該紀錄（已接手、已關閉或已由取消者收尾）。
         // 只看明確記錄的開埠種類（審查 P8-7bb9935-1）：一般開埠的終態不清除保管。
         let custody_open = std::mem::take(&mut self.custody_opening);
+        let custody_token = custody_open.then_some(self.external_attach).flatten();
+        let mut cancelled_custody = None;
+        if result.is_ok() {
+            if let Some(index) = self.retired_drains.iter().position(|entry| {
+                entry.custody_token.is_some() && entry.custody_token == custody_token
+            }) {
+                // 同一資源從保管帳本交給 actor 排空：移除 token 等待後，於下方原子換成 epoch／stop_id 等待，
+                // 不把 AdoptBridge 的 tombstone 當成關閉成功回條（C3、C5）。
+                cancelled_custody = Some(self.retired_drains.remove(index).release_deadline_rt);
+            }
+        }
         if custody_open {
             self.external_attach = None;
             self.external_claimed = false;
@@ -3643,13 +3656,36 @@ impl SessionCore {
         if custody_cancelled && self.pending_open_stop.is_none() && !self.bind_waits.is_empty() {
             // bind 取消了保管開埠（BindWait 在等）：開埠已到終態，等帳本紀錄的關閉終態後重新走 bind（`settle_retired`）。
             self.open_real_path = None;
-            return self.try_converge(now);
+            let mut effects = self.reply_cancelled_attach(now);
+            effects.extend(self.try_converge(now));
+            return effects;
         }
-        let mut effects = self.bridge_opened_inner(epoch_hint, result, now);
+        let epoch = result.as_ref().ok().map(|opened| opened.epoch);
+        let mut effects = if cancelled_custody.is_some() && self.pending_open_stop.is_none() {
+            // bind 在 Bridged 窗口寫入取消，包含 BindWait 已逾時的情況：只接手以排空，不啟動登入。
+            self.open_real_path = None;
+            let mut effects = self.reply_cancelled_attach(now);
+            effects.extend(self.retire_opened_bridge(result.expect("已確認成功的開埠")));
+            effects
+        } else {
+            self.bridge_opened_inner(epoch_hint, result, now)
+        };
+        if let Some(deadline) = cancelled_custody {
+            if let Some(entry) = self.retired_drains.iter_mut().find(|entry| Some(entry.epoch) == epoch) {
+                entry.release_deadline_rt = deadline;
+            }
+        }
         if custody_open || !self.bind_waits.is_empty() {
             effects.extend(self.try_converge(now));
         }
         effects
+    }
+
+    /// bind 取消一般開埠時，原 attach 依停止時的公開狀態回覆，不阻擋 BindWait 的後續收斂。
+    fn reply_cancelled_attach(&mut self, now: Mono) -> Vec<Effect> {
+        self.pending_attach.take().map(|pending| {
+            Effect::Reply(pending.reply, Ok(self.session_recovering_reply(now)))
+        }).into_iter().collect()
     }
 
     fn bridge_opened_inner(
@@ -4112,6 +4148,7 @@ impl SessionCore {
             self.external_offer_pending = false;
         }
         let mut effects = Vec::new();
+        effects.extend(self.arm_custody_poll(now));
         if receipt == Some(RetiredReceipt::Failed) {
             effects.extend(self.fail_bind_waits(now));
             effects.extend(self.pending_open_close_unconfirmed(now));
@@ -4205,7 +4242,7 @@ impl SessionCore {
     /// `TimerEvent::CustodyPoll`：仍在等 offer 時發 `PollCustody`（executor 查帳本，紀錄已是本 session 的 `Held` 就以立即
     /// 回饋補送 `CustodyOffer`，已有終態就補送 `CustodyTerminal`）並排下一次。Permanent 凍結下照常查詢（offer 只關閉）。
     ///
-    /// S2-PAR-wp510r 第 15 項（設計 C4）：release 以 `ClaimByIdForRelease` 登記、仍待終態的 token 一併補收（關閉者鎖外
+    /// 設計 C4：所有仍待終態的保管 token 都補收，不以 ClaimForStop／ClaimByIdForRelease 的來源區分（關閉者鎖外
     /// `try_send` 的 `CustodyTerminal` 送不進去時，終態留在帳本）。
     fn custody_poll(&mut self, now: Mono) -> Vec<Effect> {
         self.custody_poll_armed = false;
@@ -4214,7 +4251,9 @@ impl SessionCore {
             .filter(|_| self.external_offer_pending)
             .into_iter()
             .collect();
-        tokens.extend(self.pending_by_id_claims());
+        tokens.extend(self.pending_custody_tokens());
+        tokens.sort_unstable();
+        tokens.dedup();
         if tokens.is_empty() {
             return Vec::new();
         }
@@ -4222,18 +4261,18 @@ impl SessionCore {
         vec![Effect::PollCustody { tokens }, Self::custody_poll_schedule(now)]
     }
 
-    /// release 以 `ClaimByIdForRelease` 登記、仍待終態的 token。
-    fn pending_by_id_claims(&self) -> Vec<u64> {
+    /// 所有仍待配對關閉終態的保管 token；by_id_claim 只決定認領來源，不決定是否補收。
+    fn pending_custody_tokens(&self) -> Vec<u64> {
         self.retired_drains
             .iter()
-            .filter(|entry| entry.by_id_claim && entry.receipt == RetiredReceipt::Pending)
+            .filter(|entry| entry.receipt == RetiredReceipt::Pending)
             .filter_map(|entry| entry.custody_token)
             .collect()
     }
 
-    /// 有仍待終態的 by_id 認領且尚未排程時，排一次 `CustodyPoll`。
+    /// 有仍待終態的保管紀錄且尚未排程時，排一次 `CustodyPoll`。
     fn arm_custody_poll(&mut self, now: Mono) -> Vec<Effect> {
-        if self.custody_poll_armed || self.pending_by_id_claims().is_empty() {
+        if self.custody_poll_armed || self.pending_custody_tokens().is_empty() {
             return Vec::new();
         }
         self.custody_poll_armed = true;

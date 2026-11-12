@@ -4884,6 +4884,56 @@ fn wp510r_polls(effects: &[Effect]) -> Vec<Vec<u64>> {
         .collect()
 }
 
+/// C4 自身 ClaimForStop 的等待也必須補收。CustodyPoll 在 Open 執行、Pending 延後、Permanent 只做收尾。
+fn wp510r_i21_own_custody_poll(freeze: &str) {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    wp510r_birth_takeover(&mut h);
+    let (release_rx, _) = h.rpc_deferred(release());
+    h.feed(ControlEvent::CustodyClaimed {
+        token: WP510R_CUSTODY_TOKEN,
+        outcome: sw_core::mailbox::CustodyClaimOutcome::Closing,
+    });
+    h.feed(ControlEvent::BridgeOpened { epoch_hint: 0, result: Err(OpenFailure::CloseBlocked) });
+    let thaw = match freeze {
+        "pending" => match h.reg.admission_gate().freeze_if_idle("i21-poll") {
+            sw_core::admission::FreezeOutcome::Frozen { token, .. } => Some(token),
+            other => panic!("Pending 前置失敗：{other:?}"),
+        },
+        "permanent" => { h.reg.admission_gate().freeze(); None },
+        _ => None,
+    };
+    let mut effects = h.advance(Duration::from_millis(600));
+    if let Some(token) = thaw {
+        assert!(wp510r_polls(&effects).is_empty(), "Pending 延後計時器");
+        assert!(h.reg.admission_gate().thaw(&token));
+        effects.extend(h.rpc_full(SessionRequest::GetState).1);
+    }
+    assert_eq!(wp510r_polls(&effects), vec![vec![WP510R_CUSTODY_TOKEN]], "自身等待必須補收（{freeze}）");
+    assert!(!wp510r_has_open(&effects), "補收只做收尾");
+    assert!(release_rx.try_recv().is_err(), "尚未收到補收終態，不得回成功");
+    // 代 executor 回報補收的配對終態；重送或過期的終態不能再次完成 release。
+    h.feed(ControlEvent::CustodyTerminal { token: WP510R_CUSTODY_TOKEN, closed: true, error: None });
+    let response = release_rx.try_recv().expect("補收後回覆").unwrap();
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)));
+    assert_eq!(h.public()["state"], PyValue::from("RELEASED"));
+    assert_eq!(h.public()["drain_stalled"], PyValue::Bool(false));
+    assert_eq!(h.public()["drain_timeout_epoch"], PyValue::Null);
+    assert!(!h.state_store.last_released().is_empty(), "成功落盤");
+    let duplicate = h.feed(ControlEvent::CustodyTerminal { token: WP510R_CUSTODY_TOKEN, closed: true, error: None });
+    assert!(duplicate.is_empty(), "重複終態無副作用");
+    assert!(release_rx.try_recv().is_err(), "只回覆一次");
+    assert!(wp510r_polls(&h.advance(Duration::from_secs(1))).is_empty(), "等待清空後停止補收");
+}
+
+#[test]
+fn wp510r_i21_own_custody_poll_open() { wp510r_i21_own_custody_poll("open"); }
+
+#[test]
+fn wp510r_i21_own_custody_poll_pending() { wp510r_i21_own_custody_poll("pending"); }
+
+#[test]
+fn wp510r_i21_own_custody_poll_permanent() { wp510r_i21_own_custody_poll("permanent"); }
+
 /// S2-PAR-wp510r R4（設計 §3.1.4 W6 第 1、3 步，C6、C7）：DETACHED 的 session 接受 `BeginExternalAttach` 只記下 token，
 /// 不改 state、不開埠（Python `_preopen_auto_attach_port` 開埠成功前不公開 ATTACHING，
 /// `origin/main:sw_core/session_manager.py:4152-4247`）；worker 仍在開埠時的 `DeviceAttached` 不認領、不另開；token

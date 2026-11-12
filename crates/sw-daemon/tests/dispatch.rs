@@ -10138,6 +10138,148 @@ fn wp510r_i15_spawn_release(
     (rx, handle)
 }
 
+/// 第 21 項 Medium 1：parked 已被 COM1 接手、尚未開埠時 release；真實關閉通知遇 Full 後由 C4 補收。
+/// Python `_finish_attach_op` 在關閉後完成 RELEASED、清 drain 並落盤（origin/main:sw_core/session_manager.py:4335-4364）。
+#[test]
+fn wp510r_i21_rpc_own_custody_terminal_full_poll_completes_release() {
+    let r = Arc::new(wp510_b_placeholder_rig());
+    let (bind, bind_go, dev) = wp510_review9_bind_paused_before_device_online(&r);
+    let sid = r.mgr.resolve("COM1").expect("COM1");
+    let record = r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).expect("COM1 已認領 parked");
+    assert_eq!(record.owner, sw_core::custody::CustodyOwner::Session {
+        actor: r.mgr.actor_id_for_test(&sid).unwrap(),
+    });
+    assert!(matches!(record.phase, CustodyPhaseSnapshot::Taken { .. }));
+    let attempts = dev.open_attempts();
+    let tx_before = dev.tx_len();
+    dev.pause_next_close();
+    let (release_rx, release) = wp510r_i15_spawn_release(&r);
+    assert!(dev.wait_paused(Duration::from_secs(5)), "自身 ClaimForStop 關閉 handle");
+    assert_eq!(r.mgr.custody_awaits_for_test(&sid), vec![record.token]);
+    let stalled = release_rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+    release.join().unwrap();
+    assert_eq!(s(&stalled, "error_code"), "DRAIN_STALLED");
+
+    let (actor_go, query) = wp510r_i15_hold_com1_actor(&r);
+    let control = r.mgr.actor_control_for_test(&sid).unwrap();
+    while control.try_send(sw_core::mailbox::ControlEvent::ConsoleCountChanged { count: 0 }).is_ok() {}
+    assert!(control.is_full(), "actor 暫停、control lane 滿載");
+    dev.release_pause();
+    wait_until("真實 CustodyTerminal 遇 Full", || r.mgr.custody_terminal_dropped_for_test(record.token));
+    assert_eq!(r.mgr.terminal_for_test(record.token).unwrap().handle, sw_core::custody::TerminalHandle::Closed);
+    actor_go.send(()).unwrap();
+    query.join().unwrap().unwrap();
+    bind_go.send(()).unwrap();
+    assert_eq!(bind.join().unwrap().get("ok"), Some(&PyValue::Bool(true)));
+    assert_eq!(r.mgr.custody_awaits_for_test(&sid), vec![record.token], "補收前保留自身等待");
+
+    r.clock.advance(Duration::from_millis(600));
+    r.wait_state("COM1", "RELEASED");
+    let session = r.session("COM1").unwrap();
+    assert_eq!(session.get("drain_stalled"), Some(&PyValue::Bool(false)));
+    assert_eq!(session.get("drain_timeout_epoch"), Some(&PyValue::Null));
+    assert!(r.mgr.custody_awaits_for_test(&sid).is_empty(), "自身等待已補收");
+    wait_until("RELEASED 落盤", || wp510r_r6_state_has_released_sid(&r, &sid));
+    let again = r.call("device.release", r#"{"selector":"COM1"}"#);
+    assert_eq!(j(&again), j(&sw_proto::pydict! {
+        "ok" => true, "already_released" => true, "session" => session, "version" => r.version.clone(),
+    }));
+    assert_eq!(dev.close_count(), 1);
+    assert_eq!(dev.open_attempts(), attempts);
+    assert_eq!(dev.tx_len(), tx_before, "沒有登入 TX");
+}
+
+/// 第 21 項 Medium 2：一般 OpenBridge 已提交 Bridged，bind 必須取消並等排空；期限前成功才改綁。
+/// Python bind 取消在途並等 done 後重試（origin/main:sw_core/session_manager.py:3676-3727、3757-3813）。
+fn wp510r_i21_rpc_bind_bridged(timeout: bool) {
+    const TARGET: &str = "/s/by-id/i21-offline";
+    let r = Arc::new(ServiceRig::ready_shell());
+    let dev = r.device(REAL_A).clone();
+    assert_eq!(r.call("device.release", r#"{"selector":"COM0"}"#).get("ok"), Some(&PyValue::Bool(true)));
+    let sid = r.mgr.resolve("COM0").unwrap();
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (go_tx, go_rx) = crossbeam_channel::bounded(1);
+    r.mgr.set_open_job_post_commit_hook_for_test(&sid, Box::new(move || {
+        entered_tx.send(()).unwrap();
+        go_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+    }));
+    let attach_rig = Arc::clone(&r);
+    let attach = std::thread::spawn(move || attach_rig.call("device.attach", r#"{"selector":"COM0"}"#));
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let bridged = r.mgr.custody_for_test(BY_ID_A).unwrap();
+    let epoch = match bridged.phase {
+        CustodyPhaseSnapshot::Bridged { epoch, worker_in_ledger: true } => epoch,
+        other => panic!("前置必須是帳本持有 IoWorker：{other:?}"),
+    };
+    let attempts = dev.open_attempts();
+    let closes = dev.close_count();
+    let tx_before = dev.tx_len();
+    let bind_rig = Arc::clone(&r);
+    let (bind_tx, bind_rx) = crossbeam_channel::bounded(1);
+    let bind = std::thread::spawn(move || {
+        let started = Instant::now();
+        let result = bind_rig.call("session.bind", &format!(r#"{{"selector":"COM0","device_by_id":"{TARGET}"}}"#));
+        bind_tx.send((result, started.elapsed())).unwrap();
+    });
+    // 保留舊版的早回覆以便先清理工作者，再讓核心斷言報出紅燈。
+    let early = bind_rx.recv_timeout(Duration::from_millis(300)).ok();
+    let cancelled = r.mgr.custody_for_test(BY_ID_A).and_then(|rec| rec.cancel);
+    let timed = if timeout {
+        early.clone().or_else(|| bind_rx.recv_timeout(Duration::from_secs(5)).ok())
+    } else {
+        None
+    };
+    dev.pause_next_close();
+    go_tx.send(()).unwrap();
+    let paused = dev.wait_paused(Duration::from_secs(2));
+    let retiring = r.mgr.retired_drains_for_test(&sid);
+    let before_receipt = if early.is_none() && !timeout { bind_rx.try_recv().ok() } else { None };
+    dev.release_pause();
+    let (bound, elapsed) = timed.or(early.clone()).or(before_receipt.clone())
+        .or_else(|| bind_rx.recv_timeout(Duration::from_secs(5)).ok()).expect("bind 回覆");
+    bind.join().unwrap();
+    let attached = attach.join().unwrap();
+    assert!(early.is_none(), "Bridged bind 不得立即拒絕：{:?}", early.as_ref().map(|(r, _)| j(r)));
+    assert_eq!(cancelled, Some(sw_core::custody::CustodyCancel::Bind), "同 token 寫入取消");
+    assert!(paused, "actor 收到 BridgeOpened 後只排空、不登入");
+    assert_eq!(retiring, vec![epoch], "配對關閉回條前仍保留該 epoch 的等待");
+    assert!(before_receipt.is_none(), "配對回條前不得改綁");
+    assert_eq!(s(&attached, "error_code"), "SESSION_RECOVERING", "原 attach 已取消");
+    wait_until("遲到 worker 已關閉", || dev.close_count() == closes + 1 && !dev.is_open());
+    wait_until("配對退休回條已結算", || r.mgr.retired_drains_for_test(&sid).is_empty());
+    assert_eq!(dev.close_count(), closes + 1, "配對 epoch={epoch} 的 worker 已關閉");
+    assert!(!dev.is_open());
+    assert!(r.mgr.custody_for_test(BY_ID_A).is_none());
+    assert!(r.mgr.retired_drains_for_test(&sid).is_empty(), "配對回條後退休排空收斂");
+    assert_eq!(dev.open_attempts(), attempts, "不另開舊埠");
+    assert_eq!(dev.tx_len(), tx_before, "取消後沒有登入 TX");
+    if timeout {
+        assert!(elapsed >= Duration::from_millis(2500) && elapsed < Duration::from_secs(5), "BindWait 期限：{elapsed:?}");
+        assert_eq!(s(&bound, "error_code"), "SESSION_RECOVERING");
+        assert_eq!(bound.get("drain_stalled"), Some(&PyValue::Bool(true)));
+        assert_eq!(bound.get("drain_timeout_epoch"), sub(&bound, "session").get("bridge_generation"));
+        assert_eq!(s(&sub(&bound, "session"), "state"), "RECOVERING");
+        assert_eq!(s(&r.session("COM0").unwrap(), "device_by_id"), BY_ID_A, "逾時後不套用改綁");
+    } else {
+        let session = r.session("COM0").unwrap();
+        assert_eq!(j(&bound), j(&sw_proto::pydict! { "ok" => true, "session" => session.clone(), "version" => r.version.clone() }));
+        assert_eq!(s(&session, "device_by_id"), TARGET);
+        assert_eq!(s(&session, "state"), "DETACHED");
+        let state = String::from_utf8(r.fs.bytes(support::STATE_PATH)).unwrap();
+        assert!(state.contains(TARGET), "改綁已落盤");
+    }
+}
+
+#[test]
+fn wp510r_i21_rpc_bind_bridged_waits_close_then_applies() {
+    wp510r_i21_rpc_bind_bridged(false);
+}
+
+#[test]
+fn wp510r_i21_rpc_bind_bridged_timeout_cancels_late_login() {
+    wp510r_i21_rpc_bind_bridged(true);
+}
+
 /// 第 15 項共用：拔除 usb-G 並讓熱插執行緒停在 parked handle 的關閉。
 fn wp510r_i15_unplug_parked_paused(r: &ServiceRig, dev: &FakeDevice) -> std::thread::JoinHandle<()> {
     let without: Vec<(String, DeviceInfo)> = r

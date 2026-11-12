@@ -740,6 +740,12 @@ struct Shared {
     /// S2-PAR-wp510r R3（test-fakes）：帳本紀錄的關閉者確認關閉並結算後、通知 actor（`CustodyTerminal`）前的暫停點。
     #[cfg(feature = "test-fakes")]
     custody_close_pre_notify_hook: Mutex<Option<ByIdTestHook>>,
+    /// 只供測試：實際終態通知因 control lane 滿載而遺失的 token。
+    #[cfg(feature = "test-fakes")]
+    custody_terminal_dropped: Mutex<HashSet<u64>>,
+    /// 只供測試：IoWorker 已存入 Bridged 帳本、BridgeOpened 尚未送出的窗口。
+    #[cfg(feature = "test-fakes")]
+    open_job_post_commit_hook: Mutex<Option<SidTestHook>>,
     /// S2-PAR-wp510r R4（test-fakes）：W6 worker 的 `BeginExternalAttach` 已被接受、以該 token 登記帳本紀錄之前的一次性
     /// 暫停點（重現「先取消、後登記」：停止者在登記前送達，`ClaimForStop` 寫入 tombstone）。
     #[cfg(feature = "test-fakes")]
@@ -1260,11 +1266,17 @@ impl Shared {
             inner.session_by_id(by_id).map(|entry| entry.actor.control.clone())
         });
         if let Some(control) = owner {
-            let _ = control.try_send(ControlEvent::CustodyTerminal {
+            let sent = control.try_send(ControlEvent::CustodyTerminal {
                 token,
                 closed: receipt.closed,
                 error,
             });
+            #[cfg(feature = "test-fakes")]
+            if matches!(sent, Err(crossbeam_channel::TrySendError::Full(_))) {
+                lock(&self.custody_terminal_dropped).insert(token);
+            }
+            #[cfg(not(feature = "test-fakes"))]
+            let _ = sent;
         }
     }
 
@@ -1309,10 +1321,7 @@ impl Shared {
         if let Some(deadline) = release_deadline {
             rec.release_deadline.get_or_insert(deadline);
         }
-        if matches!(
-            rec.phase,
-            crate::custody::CustodyPhase::Opening { .. } | crate::custody::CustodyPhase::Taken { .. }
-        ) {
+        if rec.phase.is_in_flight() {
             // 紀錄上的 PROBE fence 由 cancel 凍結（設計 §3.1.8 WP3-1、§3.1.9 零 TX）：持有該紀錄的 attach 作業（W6 再解析）
             // 一併取消，進行中的 PROBE 寫入撤銷、已越過檢查點的提交於 fence 重驗即拒絕（Python release／bind／改指對作業
             // `probe_bridge.begin_drain`，`origin/main:sw_core/session_manager.py:3125-3131`、`:3686-3691`、`:4039-4043`）。
@@ -1354,10 +1363,14 @@ impl Shared {
             }
             crate::custody::CustodyPhase::Closing { .. } => (CustodyClaimOutcome::Closing, None),
             crate::custody::CustodyPhase::CloseFailed { .. } => (CustodyClaimOutcome::Failed, None),
-            crate::custody::CustodyPhase::Bridged { .. }
-            | crate::custody::CustodyPhase::BridgeDraining { .. } => {
+            crate::custody::CustodyPhase::Bridged { .. } => {
                 rec.cancel = Some(cancel);
-                (CustodyClaimOutcome::Gone, None)
+                // actor 尚未接手：仍須等 BridgeOpened，再把保管等待轉為 worker 的配對排空等待。
+                (CustodyClaimOutcome::Cancelled, None)
+            }
+            crate::custody::CustodyPhase::BridgeDraining { .. } => {
+                rec.cancel = Some(cancel);
+                (CustodyClaimOutcome::Closing, None)
             }
         }
     }
@@ -1538,10 +1551,7 @@ impl Shared {
             };
             if let Some(custody_token) = op.custody_token() {
                 if let Some(rec) = inner.custody.custody.get_mut(by_id).filter(|rec| rec.token == custody_token) {
-                    if matches!(
-                        rec.phase,
-                        crate::custody::CustodyPhase::Opening { .. } | crate::custody::CustodyPhase::Taken { .. }
-                    ) {
+                    if rec.phase.is_in_flight() {
                         rec.cancel.get_or_insert(crate::custody::CustodyCancel::Release);
                     }
                     rec.release_deadline.get_or_insert(deadline);
@@ -2309,12 +2319,7 @@ impl Shared {
         // 紀錄仍在關閉或排空（熱插拔除、release、shutdown 正在關閉的 parked 或未接手 handle）時不另開；回條 closed:true
         // 之後由關閉者補排一次 attach（`update_devices`）。Python 重插可立即開（`origin/main:sw_core/session_manager.py:4052-4063`），
         // 屬設計核准的差異。
-        if inner.custody.get_custody(by_id).is_some_and(|rec| {
-            matches!(
-                rec.phase,
-                crate::custody::CustodyPhase::Closing { .. } | crate::custody::CustodyPhase::BridgeDraining { .. }
-            )
-        }) {
+        if inner.custody.get_custody(by_id).is_some_and(|rec| rec.phase.is_in_flight()) {
             drop(inner);
             if let Some(pre) = preopened {
                 self.enqueue_custody_job(crate::custody::ActorExitedJob::CloseHeld {
@@ -4953,6 +4958,20 @@ impl ManagerExec {
             };
             if let Ok(opened) = &result {
                 lock(&opened_rx).insert(opened.epoch, opened.rx.clone());
+                #[cfg(feature = "test-fakes")]
+                {
+                    let sid = lock(&ctx.io.sid).clone();
+                    let hook = {
+                        let mut slot = lock(&ctx.shared.open_job_post_commit_hook);
+                        match slot.as_ref() {
+                            Some((target, _)) if *target == sid => slot.take().map(|(_, hook)| hook),
+                            _ => None,
+                        }
+                    };
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
             }
             let sent = control.send(ControlEvent::BridgeOpened {
                 epoch_hint: 0,
@@ -5918,6 +5937,10 @@ impl SessionManager {
             #[cfg(feature = "test-fakes")]
             custody_close_pre_notify_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
+            custody_terminal_dropped: Mutex::new(HashSet::new()),
+            #[cfg(feature = "test-fakes")]
+            open_job_post_commit_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
             external_attach_pre_register_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             rematerialize_after_set_profile_hook: Mutex::new(None),
@@ -6426,19 +6449,12 @@ impl SessionManager {
             let sid = e.sid.clone();
             let old_by_id = e.profile.device_by_id.clone();
             let io = e.io.clone();
-            // 逾時後 cancel 已設仍保留 Opening token，後續 bind 必須接續等待同一作業的終態。
+            // actor 尚未確認接手的所有在途階段都交同一停止路徑；逾時後仍接續等待原 token。
             let opening_token = inner.custody.get_custody(&old_by_id).and_then(|rec| {
                 (matches!(
                     &rec.owner,
                     crate::custody::CustodyOwner::Session { actor } if *actor == e.actor_id
-                ) && matches!(
-                        &rec.phase,
-                        crate::custody::CustodyPhase::Opening {
-                            taker: crate::custody::CustodyTaker::OpenJob { actor }
-                        } | crate::custody::CustodyPhase::Taken {
-                            taker: crate::custody::CustodyTaker::OpenJob { actor }
-                        } if *actor == e.actor_id
-                    ))
+                ) && rec.phase.is_in_flight())
                 .then_some(rec.token)
             });
             // #26：舊 by_id 的 attach op 進行中 → 取消並等待（上限 3000 ms）後重試；逾時 → SESSION_RECOVERING。本 session 的
@@ -7435,6 +7451,18 @@ impl SessionManager {
     #[cfg(feature = "test-fakes")]
     pub fn set_custody_close_pre_notify_hook_for_test(&self, by_id: &str, hook: Box<dyn FnOnce() + Send>) {
         *lock(&self.shared.custody_close_pre_notify_hook) = Some((by_id.to_string(), hook));
+    }
+
+    /// 只供測試：確認關閉者的真實 try_send 因 Full 遺失終態通知。
+    #[cfg(feature = "test-fakes")]
+    pub fn custody_terminal_dropped_for_test(&self, token: u64) -> bool {
+        lock(&self.shared.custody_terminal_dropped).contains(&token)
+    }
+
+    /// 只供測試：在帳本持有 IoWorker 後、送出 BridgeOpened 前暫停指定 session。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_open_job_post_commit_hook_for_test(&self, sid: &str, hook: Box<dyn FnOnce() + Send>) {
+        *lock(&self.shared.open_job_post_commit_hook) = Some((sid.to_string(), hook));
     }
 
     /// 只供測試（test-fakes）：W6 worker 的 `BeginExternalAttach` 被接受後、登記帳本紀錄前暫停（綁定 by_id，一次性）。

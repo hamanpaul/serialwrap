@@ -79,6 +79,18 @@ pub enum CustodyPhase {
     CloseFailed { error: String },
 }
 
+impl CustodyPhase {
+    /// D1（i）：開埠、交接或關閉尚未收到配對回條；不能把 Bridged 視為已被 actor 接手。
+    /// Held 仍可由 C1′ 認領，CloseFailed 則是 D1（iii）的永久阻擋，兩者不屬於在途。
+    pub fn is_in_flight(&self) -> bool {
+        match self {
+            Self::Opening { .. } | Self::Taken { .. } | Self::Bridged { .. }
+            | Self::BridgeDraining { .. } | Self::Closing { .. } => true,
+            Self::Held { .. } | Self::CloseFailed { .. } => false,
+        }
+    }
+}
+
 /// 測試與觀測用的快照狀態（不包含不可 Clone 的 parts 或 worker）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CustodyPhaseSnapshot {
@@ -806,15 +818,7 @@ impl CustodyLedger {
             return true;
         }
         if let Some(rec) = self.custody.get(by_id) {
-            matches!(
-                rec.phase,
-                CustodyPhase::CloseFailed { .. }
-                    | CustodyPhase::Closing { .. }
-                    | CustodyPhase::BridgeDraining { .. }
-                    | CustodyPhase::Opening { .. }
-                    | CustodyPhase::Taken { .. }
-                    | CustodyPhase::Bridged { .. }
-            )
+            rec.phase.is_in_flight() || matches!(rec.phase, CustodyPhase::CloseFailed { .. })
         } else {
             false
         }
