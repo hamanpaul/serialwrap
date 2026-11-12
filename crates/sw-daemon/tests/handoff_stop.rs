@@ -1332,19 +1332,8 @@ impl Drop for HolderSampler {
     }
 }
 
-#[derive(Debug)]
-struct HandoffLink {
-    pid: Option<u32>,
-}
-
-/// 直接呼叫 daemon 的正式交接 RPC；舊行程的退出與 UART 釋放由呼叫端實際等待並驗證。
-fn daemon_handoff_before_start(env: &IsolatedEnv, old_pid: u32) -> Vec<HandoffLink> {
-    let _token = assert_granted(&rpc_handoff(&env.socket), "daemon.handoff_stop");
-    vec![HandoffLink { pid: Some(old_pid) }]
-}
-
-/// 舊 daemon 存活時繼任者實際競爭實例鎖並失敗；再以 daemon.handoff_stop RPC 交接，舊 daemon 退出後才啟新版。
-/// 全程 holder 取樣 `max_concurrent()<=1`、pid 依序為「舊 → 新」，最終繼任者 READY。
+/// 舊 daemon 存活時繼任者實際競爭實例鎖並失敗；再由 daemon.handoff_stop RPC 交接，舊 daemon 退出後才啟新版。
+/// 以實際行程結束與 holder 取樣驗證結果，不自行構造 CLI 交接紀錄。
 #[test]
 fn handoff_then_successor_never_double_held() {
     let env = isolated_env_with_pty_target();
@@ -1358,9 +1347,7 @@ fn handoff_then_successor_never_double_held() {
     assert!(contender.stderr().contains("DAEMON_ALREADY_RUNNING"), "繼任者必須實際遇到鎖衝突：{}", contender.stderr());
     assert!(old.try_alive(), "競爭鎖時舊 daemon 仍存活");
 
-    let chain = daemon_handoff_before_start(&env, old_pid);
-    assert_eq!(chain.len(), 1, "daemon RPC 只交接既有舊實例：{chain:?}");
-    assert_eq!(chain[0].pid, Some(old_pid), "交接記錄需指向舊 daemon");
+    let _handoff_token = assert_granted(&rpc_handoff(&env.socket), "daemon.handoff_stop");
     let status = old.wait(HANDOFF_DRAIN_GRACE + STOP_CAP + Duration::from_secs(2));
     assert_eq!(status.code(), Some(0), "交接後有序停止：{}", old.stderr());
     assert!(path_holders(&env.pty_slave).iter().all(|(pid, _)| *pid != old_pid), "舊 daemon 已釋放 UART");
