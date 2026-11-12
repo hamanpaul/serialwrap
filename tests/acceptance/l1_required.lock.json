@@ -23408,8 +23408,6 @@
           "cargo:sw-daemon::daemon_process::unreadable_state_json_exits_3_and_releases_lock",
           "cargo:sw-daemon::daemon_process::wal_dir_readonly_at_start_blocks_login_probe",
           "cargo:sw-daemon::daemon_process::wal_fault_after_ready_splits_agent_and_auto_tx",
-          "cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem",
-          "cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child",
           "cargo:sw-daemon::launcher::executable_file_busy_retries_until_spawn_succeeds",
           "cargo:sw-daemon::launcher::launcher_argv_matches_multi_open_rule2",
           "cargo:sw-daemon::launcher::launcher_argv_preserves_shell_argument_containing_slash",
@@ -23455,7 +23453,6 @@
           "cargo:sw-pal::device_source::windows_live_serialcomm_read_ok",
           "cargo:sw-pal::device_source::windows_scan_applies_bthenum_exclude_coms_and_bthmodem",
           "cargo:sw-pal::device_source::windows_scan_maps_real_path",
-          "cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c",
           "cargo:sw-pal::exec_delegate::exec_or_wait_propagates_exit_code_and_env",
           "cargo:sw-pal::exec_delegate::exec_or_wait_reports_missing_program",
           "cargo:sw-pal::fakes_selftest::block_until_cancel_returns_bytes_before_cancel",
@@ -23506,7 +23503,6 @@
           "cargo:sw-pal::fs_read::list_dir_returns_entry_names",
           "cargo:sw-pal::fs_read::read_missing_file_is_not_found",
           "cargo:sw-pal::fs_read::read_returns_file_bytes_unchanged",
-          "cargo:sw-pal::lock::cap_interactive_desktop__ctrl_break_stops_wait",
           "cargo:sw-pal::lock::lock_conformance_suite",
           "cargo:sw-pal::lock::normalize_for_compare_cases",
           "cargo:sw-pal::lock::signal_extra_channel_stops_wait",
@@ -23571,16 +23567,7 @@
           "cargo:sw-pal::serial_windows::missing_com_error_code_maps_to_not_found",
           "cargo:sw-pal::serial_windows::overlapped_completion_mapping",
           "cargo:sw-pal::serial_windows::read_wait_and_operation_errors_keep_distinct_sources",
-          "cargo:sw-pal::serial_windows::windows_native::cap_windows_com__cancel_blocked_write_partial",
-          "cargo:sw-pal::serial_windows::windows_native::cap_windows_com__cancel_pending_read_returns_woken",
-          "cargo:sw-pal::serial_windows::windows_native::cap_windows_com__conformance_suite",
-          "cargo:sw-pal::serial_windows::windows_native::cap_windows_com__dcb_matches_pyserial_after_dirty_state",
-          "cargo:sw-pal::serial_windows::windows_native::cap_windows_com__gate_revoke_after_pending_write_reaps_and_accounts",
-          "cargo:sw-pal::serial_windows::windows_native::cap_windows_com__second_open_access_denied",
-          "cargo:sw-pal::serial_windows::windows_native::cap_windows_com__submit_gate_panic_reaps_pending_write",
-          "cargo:sw-pal::serial_windows::windows_native::cap_windows_com__write_timeout_returns_partial",
           "cargo:sw-pal::serial_windows::windows_native::nonexistent_com_is_not_found",
-          "cargo:sw-pal::service_ctl::cap_supervisor_runtime__windows_task_roundtrip",
           "cargo:sw-pal::service_ctl::composite_service_ctl_dispatches_and_rejects_unsupported_modes",
           "cargo:sw-pal::service_ctl::on_demand_hold_is_noop_record",
           "cargo:sw-pal::service_ctl::on_demand_returns_no_systemd_shape",
@@ -23830,6 +23817,31 @@
         }
       }
     },
+    "s21_gate:cap_interactive_desktop": {
+      "windows": {
+        "nodeids": [
+          "cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c",
+          "cargo:sw-pal::lock::cap_interactive_desktop__ctrl_break_stops_wait"
+        ],
+        "selector": {
+          "argv": [
+            "--package",
+            "sw-pal",
+            "--package",
+            "sw-core",
+            "--package",
+            "sw-daemon",
+            "--features",
+            "test-fakes",
+            "--",
+            "--ignored",
+            "cap_interactive_desktop__"
+          ],
+          "markexpr": "",
+          "paths": []
+        }
+      }
+    },
     "s21_gate:cap_posix_pty": {
       "linux": {
         "nodeids": [
@@ -23889,6 +23901,28 @@
           "markexpr": "",
           "paths": []
         }
+      },
+      "windows": {
+        "nodeids": [
+          "cargo:sw-pal::service_ctl::cap_supervisor_runtime__windows_task_roundtrip"
+        ],
+        "selector": {
+          "argv": [
+            "--package",
+            "sw-pal",
+            "--package",
+            "sw-core",
+            "--package",
+            "sw-daemon",
+            "--features",
+            "test-fakes",
+            "--",
+            "--ignored",
+            "cap_supervisor_runtime__"
+          ],
+          "markexpr": "",
+          "paths": []
+        }
       }
     },
     "s21_gate:cap_sys_admin": {
@@ -23904,6 +23938,31 @@
             "--",
             "--ignored",
             "cap_sys_admin__"
+          ],
+          "markexpr": "",
+          "paths": []
+        }
+      }
+    },
+    "s21_gate:cap_windows_native": {
+      "windows": {
+        "nodeids": [
+          "cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem",
+          "cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child"
+        ],
+        "selector": {
+          "argv": [
+            "--package",
+            "sw-pal",
+            "--package",
+            "sw-core",
+            "--package",
+            "sw-daemon",
+            "--features",
+            "test-fakes",
+            "--",
+            "--ignored",
+            "cap_windows_native__"
           ],
           "markexpr": "",
           "paths": []
@@ -30467,6 +30526,33 @@
           "paths": [
             "tests/"
           ]
+        }
+      }
+    },
+    "s21_gate:windows_cap_windows_com": {
+      "windows": {
+        "nodeids": [
+          "cargo:sw-pal::serial_windows::windows_native::cap_windows_com__cancel_blocked_write_partial",
+          "cargo:sw-pal::serial_windows::windows_native::cap_windows_com__cancel_pending_read_returns_woken",
+          "cargo:sw-pal::serial_windows::windows_native::cap_windows_com__conformance_suite",
+          "cargo:sw-pal::serial_windows::windows_native::cap_windows_com__dcb_matches_pyserial_after_dirty_state",
+          "cargo:sw-pal::serial_windows::windows_native::cap_windows_com__gate_revoke_after_pending_write_reaps_and_accounts",
+          "cargo:sw-pal::serial_windows::windows_native::cap_windows_com__second_open_access_denied",
+          "cargo:sw-pal::serial_windows::windows_native::cap_windows_com__submit_gate_panic_reaps_pending_write",
+          "cargo:sw-pal::serial_windows::windows_native::cap_windows_com__write_timeout_returns_partial"
+        ],
+        "selector": {
+          "argv": [
+            "--package",
+            "sw-pal",
+            "--features",
+            "test-fakes",
+            "--",
+            "--ignored",
+            "cap_windows_com__"
+          ],
+          "markexpr": "",
+          "paths": []
         }
       }
     },
