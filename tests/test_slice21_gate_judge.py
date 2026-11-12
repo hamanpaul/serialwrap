@@ -852,8 +852,9 @@ def test_real_lock_s21_sets_caps_derivable_and_gate_plan():
     for cap in ("sys_admin", "windows_native", "interactive_desktop", "supervisor_runtime"):
         plan = j.caps_plan(f"linux_cap_{cap}", exp, lock)
         if cap in ("windows_native", "interactive_desktop"):
-            # OD-68 核准移除這兩個 Linux-only 集合；沒有 selector 時 gate 不可建立執行計畫。
-            assert f"s21_gate:cap_{cap}" not in lock["sets"]
+            # OD-68 核准移除這兩個集合的 Linux 列；沒有 linux selector 時 linux section 不可建立執行計畫
+            # （OD-55：Windows 列登記於同名集合的 windows 平台，由 Windows section 承擔）。
+            assert "linux" not in lock["sets"].get(f"s21_gate:cap_{cap}", {})
             assert plan is None, plan
             continue
         assert plan == {"caps": [cap], "argv": lock["sets"][f"s21_gate:cap_{cap}"]["linux"]["selector"]["argv"],

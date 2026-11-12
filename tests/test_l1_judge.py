@@ -912,7 +912,7 @@ def test_s21_core_linux_capability_rows_moved_to_cap_sets_od55() -> None:
     其 selector 為 OD-53 能力集合（`_selector_explicit_caps` 恰為該 cap）、nodeid 全為 `cap_<cap>__*` 且為 ignored 測試。
     非能力列三筆（helper `plain_holder_child`、`real_mkbundle_dev_output_verifies`、`windows_switch_running_exe_rename`）
     直接自 s21_core.linux 移除。OD-68 核准移除 cap_windows_native／cap_interactive_desktop 的 Linux 列；其集合尚無 Windows 原生列，
-    故目前不在 lock，對應 gate section 必須保持 EVIDENCE_MISSING（LOCAL-WINDOWS-TODO）。s21_core.windows 仍待 Windows 原生收集後處理。"""
+    故 lock 不得有其 linux 平台列，對應 linux gate section 必須保持 EVIDENCE_MISSING（LOCAL-WINDOWS-TODO）；Windows 列依 OD-55 原生收集後登記於同名集合的 windows 平台。"""
     ignored = _rust_ignored_tests()
     lock = json.loads(Path("tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
     core = lock["sets"]["s21_core"]["linux"]["nodeids"]
@@ -924,7 +924,8 @@ def test_s21_core_linux_capability_rows_moved_to_cap_sets_od55() -> None:
     for cap in _S21_LINUX_CAPS:
         set_id = f"s21_gate:cap_{cap}"
         if cap in _OD68_LINUX_REMOVED_CAPS:
-            assert set_id not in lock["sets"], f"OD-68 核准移除的 Linux-only 集合仍在 lock：{set_id}"
+            # OD-68 只核准移除 Linux 列；OD-55 Windows 原生收集後同名集合另有 windows 平台列（不在本測試判定範圍）。
+            assert "linux" not in lock["sets"].get(set_id, {}), f"OD-68 核准移除的 Linux 列仍在 lock：{set_id}.linux"
             continue
         spec = lock["sets"][set_id]["linux"]
         assert _selector_explicit_caps(spec["selector"]) == [cap], spec["selector"]

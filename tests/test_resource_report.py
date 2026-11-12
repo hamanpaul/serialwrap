@@ -1754,12 +1754,12 @@ def test_od68_removal_triples_are_approved_in_ci() -> None:
     allowed = tokens[tokens.index("--allow-removal") + 1:]
     missing = [triple for triple in triples if triple not in allowed]
     assert not missing, missing
-    windows_nodeids = set(
-        json.loads(Path("tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))["sets"]["s21_core"]["windows"]["nodeids"]
-    )
-    carried = (
-        "cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem",
-        "cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child",
-        "cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c",
-    )
-    assert not [nodeid for nodeid in carried if nodeid not in windows_nodeids]
+    sets = json.loads(Path("tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))["sets"]
+    # OD-55（Windows 原生收集後）：承擔列自 s21_core.windows 移入同能力的 windows 能力集合（selector `--ignored cap_<cap>__`）。
+    carried = {
+        "cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem": "s21_gate:cap_windows_native",
+        "cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child": "s21_gate:cap_windows_native",
+        "cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c": "s21_gate:cap_interactive_desktop",
+    }
+    assert not [nodeid for nodeid, set_id in carried.items()
+                if nodeid not in sets.get(set_id, {}).get("windows", {}).get("nodeids", [])]
