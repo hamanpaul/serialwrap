@@ -7492,6 +7492,22 @@ impl SessionManager {
         }
     }
 
+    /// 只供測試（test-fakes）：attach 已進入安全網、只等帳本終態的回覆 token；不持 manager 鎖等待 actor。
+    #[cfg(feature = "test-fakes")]
+    pub fn custody_attach_observers_for_test(&self, sid: &str) -> Vec<u64> {
+        let Some(actor) = self.shared.actor_of(sid) else { return Vec::new(); };
+        match actor.request(SessionRequest::RetiredDrainsForTest, Duration::from_millis(500)) {
+            Ok(res) => match res.get("observers") {
+                Some(PyValue::List(items)) => items.iter().filter_map(|v| match v {
+                    PyValue::Int(PyInt::Small(n)) => Some(*n as u64),
+                    _ => None,
+                }).collect(),
+                _ => Vec::new(),
+            },
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// 只供測試（test-fakes）：帳本紀錄的關閉者確認關閉並結算後、通知 actor 前暫停（綁定 by_id，一次性）。
     #[cfg(feature = "test-fakes")]
     pub fn set_custody_close_pre_notify_hook_for_test(&self, by_id: &str, hook: Box<dyn FnOnce() + Send>) {

@@ -910,6 +910,7 @@ struct RetiredStop {
 /// 退休 bridge 的排空項目（見 `SessionCore::retired_drains`）。Python 對應：被取消的 attach 作業在
 /// `_finish_attach_op` 確認關閉 handle 前留在 `_active_attach_ops`、不設 `done`，release 等待 `done`
 /// （`origin/main:sw_core/session_manager.py:3104-3107`、`:3188-3204`、`:4320-4363`）。
+/// 安全網的純觀察也在此補收 token，但 `purpose` 明確區分觀察與關閉，集合存在本身不代表取消。
 struct RetiredDrain {
     epoch: u64,
     stop_id: StopId,
@@ -925,6 +926,16 @@ struct RetiredDrain {
     by_id_claim: bool,
     /// 安全網補登記的等待不能在首次逾時後拋棄；它沒有 manager 再次認領／補送的保證。
     safety_observed: bool,
+    /// P8-5f67955-1：觀察等待不取消開埠；只有明確的關閉義務才把遲到 bridge 轉成排空。
+    purpose: CustodyWaitPurpose,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CustodyWaitPurpose {
+    /// attach 回覆等待帳本終態或配對接手確認，不要求關閉。
+    Observe,
+    /// release、bind、shutdown 或失效 attach 已要求關閉，必須等真實關閉回條。
+    Close,
 }
 
 /// 等待 retired drain 終態的 `session.bind`（見 `SessionCore::bind_waits`）。
@@ -2648,6 +2659,10 @@ impl SessionCore {
     /// 統一安全網：不從「沒有 parts／bridge／本地等待」推定 UART 已安全交還。
     /// 所有未終態 token 進同一 awaits 表，通知遺失由 CustodyPoll 補收；失敗永久保留。
     fn await_observed_custody(&mut self, now: Mono) -> (bool, Vec<Effect>) {
+        self.wait_observed_custody(now, CustodyWaitPurpose::Close)
+    }
+
+    fn wait_observed_custody(&mut self, now: Mono, purpose: CustodyWaitPurpose) -> (bool, Vec<Effect>) {
         use crate::custody::CustodyBarrier;
         let Some(observation) = self.custody_observation.clone() else {
             return (false, Vec::new());
@@ -2672,10 +2687,13 @@ impl SessionCore {
             CustodyBarrier::Pending(rec) => (Some(rec.token), RetiredReceipt::Pending, rec.release_deadline),
             CustodyBarrier::Failed { token, release_deadline } => (token, RetiredReceipt::Failed, release_deadline),
         };
-        if !self.retired_drains.iter().any(|entry| {
+        if let Some(entry) = self.retired_drains.iter_mut().find(|entry| {
             entry.by_id == self.profile.device_by_id && entry.custody_token == token
                 && (token.is_some() || entry.receipt == RetiredReceipt::Failed)
         }) {
+            // 停止加入既有觀察等待時升級義務；後來的 attach 不得把關閉義務降回觀察。
+            if purpose == CustodyWaitPurpose::Close { entry.purpose = purpose; }
+        } else {
             self.retired_drains.push(RetiredDrain {
                 epoch: 0,
                 stop_id: StopId(0),
@@ -2686,6 +2704,7 @@ impl SessionCore {
                 // 安全網只等待；不得拿其他 owner 的 token 發 ClaimForStop。
                 by_id_claim: true,
                 safety_observed: true,
+                purpose,
             });
             self.publish_retired_drains();
         }
@@ -2724,7 +2743,7 @@ impl SessionCore {
                 // 已明確移交 actor 的 epoch／stop_id 排空責任，保持 DR-4 的 attach 例外回覆時點。
                 // release 仍等該 epoch 的真實回條；AdoptBridge 的 tombstone 不結算這個等待。
                 if handed_to_drain { return vec![Effect::Reply(reply, result)]; }
-                let effects = self.await_observed_custody(now).1;
+                let effects = self.wait_observed_custody(now, CustodyWaitPurpose::Observe).1;
                 self.custody_attach_replies.push((rec.token, reply, result));
                 effects
             }
@@ -2918,11 +2937,12 @@ impl SessionCore {
         if by_id == self.profile.device_by_id {
             let mut added = false;
             for claim in claims {
-                if self
+                if let Some(entry) = self
                     .retired_drains
-                    .iter()
-                    .any(|entry| entry.custody_token == Some(claim.token))
+                    .iter_mut()
+                    .find(|entry| entry.custody_token == Some(claim.token))
                 {
+                    entry.purpose = CustodyWaitPurpose::Close;
                     continue;
                 }
                 let receipt = match claim.outcome {
@@ -2941,6 +2961,7 @@ impl SessionCore {
                     release_deadline_rt: Some(claim.deadline),
                     by_id_claim: true,
                     safety_observed: false,
+                    purpose: CustodyWaitPurpose::Close,
                 });
                 added = true;
             }
@@ -3208,9 +3229,12 @@ impl SessionCore {
                     .filter_map(|r| r.custody_token)
                     .map(|token| PyValue::Int(PyInt::Small(token as i128)))
                     .collect();
+                let observers: Vec<PyValue> = self.custody_attach_replies.iter()
+                    .map(|(token, _, _)| PyValue::Int(PyInt::Small(*token as i128)))
+                    .collect();
                 vec![Effect::Reply(
                     reply,
-                    Ok(pydict! { "epochs" => PyValue::List(epochs), "custody" => PyValue::List(custody) }),
+                    Ok(pydict! { "epochs" => PyValue::List(epochs), "custody" => PyValue::List(custody), "observers" => PyValue::List(observers) }),
                 )]
             }
             #[cfg(feature = "test-fakes")]
@@ -3849,7 +3873,8 @@ impl SessionCore {
         let mut cancelled_custody = None;
         if result.is_ok() {
             if let Some(index) = self.retired_drains.iter().position(|entry| {
-                entry.custody_token.is_some() && entry.custody_token == custody_token
+                entry.purpose == CustodyWaitPurpose::Close
+                    && entry.custody_token.is_some() && entry.custody_token == custody_token
             }) {
                 // 同一資源從保管帳本交給 actor 排空：移除 token 等待後，於下方原子換成 epoch／stop_id 等待，
                 // 不把 AdoptBridge 的 tombstone 當成關閉成功回條（C3、C5）。
@@ -3862,6 +3887,7 @@ impl SessionCore {
                 }
             }
         }
+        // Observe 項目保留原 token，不取消正常接手；AdoptBridge 確認接手後由 CustodyPoll 補收解除。
         if custody_open {
             self.external_attach = None;
             self.external_claimed = false;
@@ -4350,11 +4376,13 @@ impl SessionCore {
             CustodyClaimOutcome::Gone => None,
         };
         if let Some(receipt) = receipt {
-            if !self
+            if let Some(entry) = self
                 .retired_drains
-                .iter()
-                .any(|entry| entry.custody_token == Some(token))
+                .iter_mut()
+                .find(|entry| entry.custody_token == Some(token))
             {
+                entry.purpose = CustodyWaitPurpose::Close;
+            } else {
                 // 只沿用目前 release 停止的首次期限；已結束的 release 留下的期限不得記到之後才建立的等待上（審查
                 // P8-7bb9935-3）。沒有 release 在等時留空，由之後的首次 release 決定（`ensure_release_wait_rt`）。
                 let release_deadline_rt = self.current_release_deadline_rt();
@@ -4367,6 +4395,7 @@ impl SessionCore {
                     release_deadline_rt,
                     by_id_claim: false,
                     safety_observed: false,
+                    purpose: CustodyWaitPurpose::Close,
                 });
                 if receipt == RetiredReceipt::Failed {
                     self.deps.unconfirmed_closes.insert(&self.profile.device_by_id);
@@ -4784,6 +4813,7 @@ impl SessionCore {
                         release_deadline_rt: self.current_release_deadline_rt(),
                         by_id_claim: false,
                         safety_observed: false,
+                        purpose: CustodyWaitPurpose::Close,
                     });
                     self.publish_retired_drains();
                     if let Some(ph) = pending.placeholder.as_mut() {
@@ -5006,6 +5036,7 @@ impl SessionCore {
             release_deadline_rt: None,
             by_id_claim: false,
             safety_observed: false,
+            purpose: CustodyWaitPurpose::Close,
         });
         self.publish_retired_drains();
         let mut fx = vec![

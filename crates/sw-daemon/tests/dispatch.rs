@@ -10408,6 +10408,93 @@ fn wp510r_i24_rpc_watcher_closing_retire_release_failure_keeps_first_deadline() 
     wp510r_i24_watcher_closing(false, true);
 }
 
+/// P8-5f67955-1：拔除後重插的正常 OpenBridge 已提交，重複 attach 只能觀察，不能取消。
+/// 對照組不插入重複 RPC；兩組都要求 handle 保留，不把 READY 當成本項驗收。
+fn wp510r_i24_rpc_observer_attach_during_hotplug(duplicate: bool, release: bool) {
+    let r = Arc::new(ServiceRig::ready_shell());
+    let dev = r.device(REAL_A).clone();
+    let sid = r.mgr.resolve("COM0").unwrap();
+    r.mgr.update_devices(&[]);
+    r.wait_state("COM0", "DETACHED");
+    wait_until("舊 bridge 已關閉", || !dev.is_open());
+    let attempts = dev.open_attempts();
+    let closes = dev.close_count();
+    let (entered, opened) = crossbeam_channel::bounded(1);
+    let (go, resume) = crossbeam_channel::bounded(1);
+    r.mgr.set_open_job_post_commit_hook_for_test(&sid, Box::new(move || {
+        entered.send(()).unwrap();
+        resume.recv_timeout(Duration::from_secs(10)).unwrap();
+    }));
+    r.mgr.update_devices(&[(BY_ID_A.into(), DeviceInfo { by_id: BY_ID_A.into(), real_path: REAL_A.into() })]);
+    opened.recv_timeout(Duration::from_secs(5)).unwrap();
+    let record = r.mgr.custody_for_test(BY_ID_A).unwrap();
+    assert!(matches!(record.phase, CustodyPhaseSnapshot::Bridged { worker_in_ledger: true, .. }));
+    let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+    let attached = duplicate.then(|| {
+        let rig = Arc::clone(&r);
+        std::thread::spawn(move || reply_tx.send(rig.call("device.attach", r#"{"selector":"COM0"}"#)).unwrap())
+    });
+    if duplicate {
+        wait_until("重複 attach 已登記觀察等待", || r.mgr.custody_attach_observers_for_test(&sid) == vec![record.token]);
+        assert!(reply_rx.try_recv().is_err(), "接手確認前不回覆成功");
+        assert_eq!(r.mgr.custody_for_test(BY_ID_A).unwrap().cancel, None, "純觀察不寫取消");
+    }
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let released = release.then(|| {
+        let rig = Arc::clone(&r);
+        std::thread::spawn(move || release_tx.send(rig.call("device.release", r#"{"selector":"COM0"}"#)).unwrap())
+    });
+    if release {
+        wait_until("release 已取消同 token 並登記真正關閉義務", || {
+            r.mgr.custody_for_test(BY_ID_A).is_some_and(|rec| {
+                rec.token == record.token && rec.cancel == Some(sw_core::custody::CustodyCancel::Release)
+            }) && r.mgr.custody_awaits_for_test(&sid).contains(&record.token)
+        });
+        dev.pause_next_close();
+    }
+    go.send(()).unwrap();
+    if release {
+        assert!(dev.wait_paused(Duration::from_secs(5)));
+        assert!(release_rx.recv_timeout(Duration::from_millis(100)).is_err(), "觀察等待不能替代配對關閉回條");
+        dev.release_pause();
+        assert_eq!(release_rx.recv_timeout(Duration::from_secs(5)).unwrap().get("ok"), Some(&PyValue::Bool(true)));
+        released.unwrap().join().unwrap();
+        r.wait_state("COM0", "RELEASED");
+    }
+    wait_until("帳本已完成接手或關閉", || r.mgr.custody_for_test(BY_ID_A).is_none());
+    // 接手後讓既有 CustodyPoll 補收；這是 FakeClock，不以睡眠猜測 actor 順序。
+    r.clock.advance(Duration::from_millis(600));
+    if let Some(attached) = attached {
+        let response = reply_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        attached.join().unwrap();
+        let session = sub(&response, "session");
+        assert_eq!(j(&response), j(&sw_proto::pydict! { "ok" => true, "session" => session, "version" => r.version.clone() }));
+        assert!(r.mgr.custody_attach_observers_for_test(&sid).is_empty(), "等待回覆正常完成");
+    }
+    let session = r.session("COM0").unwrap();
+    assert_eq!(dev.is_open(), !release, "重複 attach 不得關閉有效新 bridge");
+    assert_eq!(dev.open_attempts(), attempts + 1, "沒有額外重開");
+    assert_eq!(dev.close_count(), closes + usize::from(release), "只有真正 release 才新增 close");
+    assert_eq!(session.get("attached_real_path"), Some(&if release { PyValue::Null } else { PyValue::from(REAL_A) }));
+    assert!(r.mgr.custody_awaits_for_test(&sid).is_empty());
+    assert!(r.mgr.retired_drains_for_test(&sid).is_empty());
+}
+
+#[test]
+fn wp510r_i24_rpc_observer_duplicate_attach_keeps_hotplug_bridge() {
+    wp510r_i24_rpc_observer_attach_during_hotplug(true, false);
+}
+
+#[test]
+fn wp510r_i24_rpc_observer_hotplug_without_duplicate_keeps_bridge() {
+    wp510r_i24_rpc_observer_attach_during_hotplug(false, false);
+}
+
+#[test]
+fn wp510r_i24_rpc_observer_then_release_still_waits_close_receipt() {
+    wp510r_i24_rpc_observer_attach_during_hotplug(true, true);
+}
+
 /// 安全網接到一般 OpenBridge 的 token 時，也必須把義務原子換成真實 epoch 回條，不能等待 ack 的假關閉。
 #[test]
 fn wp510r_i24_rpc_plain_bridged_release_waits_receipt() {

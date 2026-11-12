@@ -193,6 +193,36 @@ fn wp510r_i24_safety_attach_commit_release_transfers_to_own_stop_receipt() {
     assert!(!h.fence.with(|f| f.retired_drains_pending), "配對回條收斂後才解除 shutdown 屏障");
 }
 
+/// P8-5f67955-1：純觀察不能變成取消；開埠中各階段的重複 attach 都保留正常接手。
+#[test]
+fn wp510r_i24_observer_attach_preserves_open_across_nonterminal_phases() {
+    use sw_core::custody::{ActorId, CustodyPhaseSnapshot as Phase, CustodyTaker};
+    for phase in [
+        Phase::Opening { taker: CustodyTaker::OpenJob { actor: ActorId::for_test(24) } },
+        Phase::Taken { taker: CustodyTaker::OpenJob { actor: ActorId::for_test(24) } },
+        Phase::Bridged { epoch: 1, worker_in_ledger: true },
+    ] {
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.attach_device();
+        h.custody_observation = Some(wp510r_i24_barrier(phase));
+        let (reply, _) = h.rpc_deferred(SessionRequest::DeviceAttach { force: false });
+        assert!(reply.try_recv().is_err(), "尚未確認接手時仍須等待");
+        let poll = h.advance(Duration::from_millis(600));
+        assert!(poll.iter().any(|e| matches!(e, Effect::PollCustody { tokens } if tokens == &[424])));
+        h.custody_observation = None;
+        h.feed(ControlEvent::Tick);
+        assert!(reply.try_recv().is_err(), "未查帳本的事件不能解除觀察等待");
+        h.custody_observation = Some(wp510r_i24_barrier(Phase::Bridged { epoch: 1, worker_in_ledger: true }));
+        let effects = h.bridge_ok();
+        assert!(!effects.iter().any(|e| matches!(e, Effect::BeginDrain { .. })), "純等待不得排空有效 bridge");
+        assert_eq!(h.core.generations().conn_epoch, Some(1), "正常接手原 bridge");
+        assert!(reply.try_recv().is_err(), "效果尚未確認接手時不回覆");
+        wp510r_i24_terminal(&mut h);
+        assert_eq!(reply.try_recv().expect("接手確認後解除觀察等待").unwrap().get("ok"), Some(&PyValue::Bool(true)));
+        assert!(!h.fence.with(|f| f.retired_drains_pending), "純觀察不留下關閉義務");
+    }
+}
+
 fn session_error(response: &PyDict, code: &str) {
     assert_eq!(response.get("ok"), Some(&PyValue::Bool(false)));
     assert_eq!(response.get("error_code"), Some(&PyValue::from(code)));
