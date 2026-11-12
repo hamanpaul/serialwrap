@@ -3645,6 +3645,7 @@ impl SessionCore {
                 // 同一資源從保管帳本交給 actor 排空：移除 token 等待後，於下方原子換成 epoch／stop_id 等待，
                 // 不把 AdoptBridge 的 tombstone 當成關閉成功回條（C3、C5）。
                 cancelled_custody = Some(self.retired_drains.remove(index).release_deadline_rt);
+                self.publish_retired_drains();
             }
         }
         if custody_open {
@@ -3661,8 +3662,11 @@ impl SessionCore {
             return effects;
         }
         let epoch = result.as_ref().ok().map(|opened| opened.epoch);
-        let mut effects = if cancelled_custody.is_some() && self.pending_open_stop.is_none() {
-            // bind 在 Bridged 窗口寫入取消，包含 BindWait 已逾時的情況：只接手以排空，不啟動登入。
+        let mut effects = if cancelled_custody.is_some() {
+            // bind 在 Bridged 窗口寫入取消：只接手以退休排空，不啟動登入。release／shutdown 已加入時仍保留
+            // PendingOpenStop（含首次期限與逾時狀態），由配對回條後的 try_converge → finish_pending_open_stop
+            // 完成在途作業的收尾（Python `_finish_attach_op`，origin/main:sw_core/session_manager.py:4339-4364）；
+            // 轉成自身 bridge 的 StopOp 會遺失已 RELEASED 作業的恢復、清 drain 與落盤語意（P8-e385ed0-1）。
             self.open_real_path = None;
             let mut effects = self.reply_cancelled_attach(now);
             effects.extend(self.retire_opened_bridge(result.expect("已確認成功的開埠")));

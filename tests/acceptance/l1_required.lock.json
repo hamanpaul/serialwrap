@@ -22135,6 +22135,8 @@
           "cargo:sw-daemon::dispatch::wp510r_i20_rpc_query_and_release_while_reaper_held_close_paused",
           "cargo:sw-daemon::dispatch::wp510r_i21_rpc_bind_bridged_timeout_cancels_late_login",
           "cargo:sw-daemon::dispatch::wp510r_i21_rpc_bind_bridged_waits_close_then_applies",
+          "cargo:sw-daemon::dispatch::wp510r_i21_rpc_bind_release_bridged_after_both_deadlines",
+          "cargo:sw-daemon::dispatch::wp510r_i21_rpc_bind_release_bridged_before_deadlines",
           "cargo:sw-daemon::dispatch::wp510r_i21_rpc_own_custody_terminal_full_poll_completes_release",
           "cargo:sw-daemon::dispatch::wp510r_m16_device_attach_claims_parked_custody_token",
           "cargo:sw-daemon::dispatch::wp510r_r3_rpc_bind_retired_close_failure_reports_recovering_stalled",
