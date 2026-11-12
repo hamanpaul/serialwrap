@@ -2053,6 +2053,12 @@ fn stop_supervisor(
     let mut chain = Vec::new();
     let mut detail = PyDict::new();
     let stop = if daemon.is_some() {
+        let reason = if journal.op == "rollback" { "rollback" } else { "update" };
+        let rpc = if mode == &SupervisionMode::OnDemand && journal.target_autostart.is_none() {
+            StopRpc::UpdateHandoff { reason }
+        } else {
+            StopRpc::Handoff { reason }
+        };
         graceful_stop::graceful_stop_with_existing_hold(
             ctx,
             mode,
@@ -2060,7 +2066,7 @@ fn stop_supervisor(
             with_sudo,
             true,
             "update_confirm_released",
-            StopRpc::Handoff { reason: if journal.op == "rollback" { "rollback" } else { "update" } },
+            rpc,
             Some(held.record.clone()),
         )
     } else {

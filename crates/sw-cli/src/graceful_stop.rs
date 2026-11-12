@@ -90,6 +90,7 @@ pub struct StopReport {
 pub enum StopRpc {
     Plain,
     Handoff { reason: &'static str },
+    UpdateHandoff { reason: &'static str },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,7 +190,7 @@ pub fn graceful_stop_with_existing_hold(
                 append_commands(&mut ran, &commands);
             }
         }
-        StopRpc::Handoff { .. } => {
+        StopRpc::Handoff { .. } | StopRpc::UpdateHandoff { .. } => {
             if matches!(mode, SupervisionMode::OnDemand) {
                 if let Err(error) = acquire_autostart_lock(ctx) {
                     let mut failure = service_failure(mode, "hold_autostart", 1, "autostart_lock");
@@ -216,6 +217,43 @@ pub fn graceful_stop_with_existing_hold(
             id = crate::commands::daemon_cmd::capture_daemon_identity_public(ctx, endpoint);
             first_handoff_relaunched = id != initial_id && id.known;
         }
+    }
+
+    #[cfg(feature = "test-fakes")]
+    if matches!(rpc, StopRpc::UpdateHandoff { .. })
+        && ctx.env.get("SERIALWRAP_TEST_UPDATE_SOCKET").is_some()
+        && matches!(mode, SupervisionMode::OnDemand)
+    {
+        let StopRpc::UpdateHandoff { reason } = rpc else {
+            unreachable!()
+        };
+        let mut chain = Vec::new();
+        if let Err(error) =
+            ensure_released_or_rehandoff(ctx, mode, endpoint, with_sudo, reason, phase, &mut chain)
+        {
+            return Err(with_handoff_context(error, hold.clone(), chain));
+        }
+        if first_handoff_relaunched {
+            if let Some(first) = chain.first_mut() {
+                first.relaunched = true;
+            }
+        }
+        ran.extend(
+            chain
+                .iter()
+                .map(|_| vec!["serialwrap".into(), "daemon".into(), "handoff_stop".into()]),
+        );
+        let handoff_token = chain.last().map(|link| link.token.clone());
+        return Ok(StopReport {
+            graceful: true,
+            ran,
+            rc,
+            stdout,
+            stderr,
+            handoff_token,
+            chain,
+            hold,
+        });
     }
 
     if rpc == StopRpc::Plain {
@@ -311,8 +349,9 @@ pub fn graceful_stop_with_existing_hold(
         });
     }
 
-    let StopRpc::Handoff { reason } = rpc else {
-        unreachable!()
+    let reason = match rpc {
+        StopRpc::Handoff { reason } | StopRpc::UpdateHandoff { reason } => reason,
+        StopRpc::Plain => unreachable!(),
     };
     let mut chain = Vec::new();
     loop {
