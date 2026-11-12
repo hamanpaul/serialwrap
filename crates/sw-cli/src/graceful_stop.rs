@@ -723,6 +723,15 @@ fn scan_endpoint_identity(
             id: DaemonIdentity::default(),
             ran: Vec::new(),
         })?;
+    #[cfg(feature = "test-fakes")]
+    let daemons =
+        crate::test_update_scope::select_for_update(ctx, endpoint, &daemons).map_err(|_| {
+            StopFailure::Timeout {
+                phase,
+                id: DaemonIdentity::default(),
+                ran: Vec::new(),
+            }
+        })?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let target = crate::commands::daemon_cmd::normalize_endpoint_for_context(ctx, endpoint, &cwd);
     let mut matched = None;

@@ -119,6 +119,37 @@ fn daemon_record(pid: u32, socket: &str) -> DaemonProc {
     }
 }
 
+#[cfg(feature = "test-fakes")]
+fn with_update_test_scope(t: TestEnv) -> (TestEnv, String, String) {
+    let socket = t.default_socket();
+    let endpoint = t.isolated_endpoint(&socket);
+    let t = t.with_var("SERIALWRAP_TEST_UPDATE_SOCKET", &endpoint);
+    (t, socket, endpoint)
+}
+
+#[cfg(feature = "test-fakes")]
+#[derive(Debug, PartialEq, Eq)]
+enum ScopedHandoffError {
+    Timeout,
+    Busy(String),
+    Unconfirmed(String),
+    Other(String),
+}
+
+#[cfg(feature = "test-fakes")]
+fn compact_scoped_handoff_error(failure: StopFailure) -> ScopedHandoffError {
+    match failure.cause() {
+        StopFailure::Timeout { .. } => ScopedHandoffError::Timeout,
+        StopFailure::Handoff(HandoffError::Busy { code, .. }) => {
+            ScopedHandoffError::Busy(code.clone())
+        }
+        StopFailure::Handoff(HandoffError::Unconfirmed { code, .. }) => {
+            ScopedHandoffError::Unconfirmed(code.clone())
+        }
+        other => ScopedHandoffError::Other(format!("{other:?}")),
+    }
+}
+
 #[test]
 fn windows_task_stop_sends_daemon_stop_before_end() {
     let t = TestEnv::windows()
@@ -577,6 +608,199 @@ fn graceful_handoff_relaunched_instance_rehandoff_no_hard_stop() {
         2,
         "第 2 次交接送往 pid 9000"
     );
+    assert_eq!(hard_stop_count(&t), 0);
+}
+
+#[cfg(feature = "test-fakes")]
+#[test]
+fn scoped_handoff_ignores_foreign_daemons_but_rehandoffs_successor() {
+    let t = TestEnv::posix()
+        .with_idle_daemon_default(4242)
+        .with_restart_on_failure()
+        .with_daemon_exit_code_after_handoff(1)
+        .with_new_daemon_handoff_pids(&[9000]);
+    let (t, socket, endpoint) = with_update_test_scope(t);
+    let foreign = DaemonProc {
+        pid: 31337,
+        socket: None,
+        tree: vec![ProcIdentity {
+            pid: 31337,
+            start_ticks: Some(31337),
+        }],
+    };
+    let target = daemon_record(4242, &endpoint);
+    t.procs().add_instance(foreign.clone());
+    t.procs().script(vec![vec![foreign, target]]);
+
+    let mut chain = Vec::new();
+    let result = t.with_cli_ctx(|ctx| {
+        sw_cli::graceful_stop::ensure_released_or_rehandoff(
+            ctx,
+            &SupervisionMode::SystemdUser,
+            &socket,
+            false,
+            "update",
+            "service_update_wait_stop",
+            &mut chain,
+        )
+        .map_err(compact_scoped_handoff_error)
+    });
+
+    assert!(
+        result.is_ok(),
+        "隔離範圍中的目標及繼任者應完成交接：{result:?}"
+    );
+    assert_eq!(chain.len(), 2, "必須保留初始目標與繼任者兩筆 grant");
+    assert_eq!(chain[0].pid, Some(4242));
+    assert_eq!(chain[0].token, sha256_hex("handoff-4242")[..32]);
+    assert!(!chain[0].relaunched);
+    assert_eq!(chain[1].pid, Some(9000));
+    assert_eq!(chain[1].token, sha256_hex("handoff-9000")[..32]);
+    assert!(chain[1].relaunched);
+    assert_eq!(stop_count(&t, "daemon.handoff_stop"), 2);
+    assert_eq!(stop_count(&t, "daemon.stop"), 0);
+    assert_eq!(hard_stop_count(&t), 0);
+}
+
+#[cfg(feature = "test-fakes")]
+#[test]
+fn scoped_handoff_without_scope_rejects_unknown_daemon() {
+    let t = TestEnv::posix().with_idle_daemon_default(4242);
+    let socket = t.default_socket();
+    let endpoint = t.isolated_endpoint(&socket);
+    let foreign = DaemonProc {
+        pid: 31337,
+        socket: None,
+        tree: vec![ProcIdentity {
+            pid: 31337,
+            start_ticks: Some(31337),
+        }],
+    };
+    let target = daemon_record(4242, &endpoint);
+    t.procs().add_instance(foreign.clone());
+    t.procs().script(vec![vec![foreign, target]]);
+
+    let mut chain = Vec::new();
+    let failure = t
+        .with_cli_ctx(|ctx| {
+            sw_cli::graceful_stop::ensure_released_or_rehandoff(
+                ctx,
+                &SupervisionMode::SystemdUser,
+                &socket,
+                false,
+                "update",
+                "service_update_wait_stop",
+                &mut chain,
+            )
+            .map_err(compact_scoped_handoff_error)
+        })
+        .expect_err("缺少測試範圍時，未知 socket 行程必須 fail closed");
+
+    assert_eq!(failure, ScopedHandoffError::Timeout);
+    assert!(chain.is_empty());
+    assert_eq!(stop_count(&t, "daemon.handoff_stop"), 0);
+    assert_eq!(stop_count(&t, "daemon.stop"), 0);
+    assert_eq!(hard_stop_count(&t), 0);
+}
+
+#[cfg(feature = "test-fakes")]
+#[test]
+fn scoped_handoff_still_rejects_busy_target() {
+    let (t, socket, endpoint) =
+        with_update_test_scope(TestEnv::posix().with_idle_daemon_default(4242));
+    t.procs().add_instance(daemon_record(4242, &endpoint));
+    t.rpc().respond(&endpoint, "daemon.handoff_stop", BUSY);
+
+    let mut chain = Vec::new();
+    let failure = t
+        .with_cli_ctx(|ctx| {
+            sw_cli::graceful_stop::ensure_released_or_rehandoff(
+                ctx,
+                &SupervisionMode::SystemdUser,
+                &socket,
+                false,
+                "update",
+                "service_update_wait_stop",
+                &mut chain,
+            )
+            .map_err(compact_scoped_handoff_error)
+        })
+        .expect_err("範圍選取不得略過目標的 busy grant");
+
+    assert_eq!(
+        failure,
+        ScopedHandoffError::Busy("FLASHING_BUSY".to_string())
+    );
+    assert!(chain.is_empty());
+    assert_eq!(stop_count(&t, "daemon.handoff_stop"), 1);
+    assert_eq!(stop_count(&t, "daemon.stop"), 0);
+    assert_eq!(hard_stop_count(&t), 0);
+}
+
+#[cfg(feature = "test-fakes")]
+#[test]
+fn scoped_handoff_still_rejects_process_scan_failure() {
+    let (t, socket, _) = with_update_test_scope(TestEnv::posix().with_idle_daemon_default(4242));
+    t.procs().fail();
+
+    let mut chain = Vec::new();
+    let failure = t
+        .with_cli_ctx(|ctx| {
+            sw_cli::graceful_stop::ensure_released_or_rehandoff(
+                ctx,
+                &SupervisionMode::SystemdUser,
+                &socket,
+                false,
+                "update",
+                "service_update_wait_stop",
+                &mut chain,
+            )
+            .map_err(compact_scoped_handoff_error)
+        })
+        .expect_err("範圍選取不得把掃描錯誤轉成空清單");
+
+    assert_eq!(failure, ScopedHandoffError::Timeout);
+    assert!(chain.is_empty());
+    assert_eq!(stop_count(&t, "daemon.handoff_stop"), 0);
+    assert_eq!(stop_count(&t, "daemon.stop"), 0);
+    assert_eq!(hard_stop_count(&t), 0);
+}
+
+#[cfg(feature = "test-fakes")]
+#[test]
+fn scoped_handoff_still_rejects_invalid_grant() {
+    let (t, socket, endpoint) =
+        with_update_test_scope(TestEnv::posix().with_idle_daemon_default(4242));
+    t.procs().add_instance(daemon_record(4242, &endpoint));
+    t.rpc().respond(
+        &endpoint,
+        "daemon.handoff_stop",
+        r#"{"ok":true,"stopping":true,"handoff_token":"bad"}"#,
+    );
+
+    let mut chain = Vec::new();
+    let failure = t
+        .with_cli_ctx(|ctx| {
+            sw_cli::graceful_stop::ensure_released_or_rehandoff(
+                ctx,
+                &SupervisionMode::SystemdUser,
+                &socket,
+                false,
+                "update",
+                "service_update_wait_stop",
+                &mut chain,
+            )
+            .map_err(compact_scoped_handoff_error)
+        })
+        .expect_err("範圍選取不得接受格式錯誤的 grant");
+
+    assert_eq!(
+        failure,
+        ScopedHandoffError::Unconfirmed("INVALID_RESPONSE".to_string())
+    );
+    assert!(chain.is_empty());
+    assert_eq!(stop_count(&t, "daemon.handoff_stop"), 1);
+    assert_eq!(stop_count(&t, "daemon.stop"), 0);
     assert_eq!(hard_stop_count(&t), 0);
 }
 
