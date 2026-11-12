@@ -83,8 +83,28 @@ pub fn feature_bundle(cli: &Path) -> (PathBuf, PathBuf) {
     (version_dir, manifest)
 }
 
+/// 取得由 mkbundle 產生的舊版安裝來源；manifest 與雜湊不得由測試手寫。
+pub fn old_bundle_dir() -> PathBuf {
+    let directory = repository_root()
+        .join("target/s2-par/gpa3/base-bundle/versions")
+        .join(OLD_VERSION);
+    let manifest_path = directory.join("release-manifest.json");
+    assert!(
+        manifest_path.is_file(),
+        "找不到隔離安裝用舊版 dev bundle：{}；請執行 `scripts/rust/mkbundle.sh --dev --profile debug --version-override 0.0.1 --out target/s2-par/gpa3/base-bundle`",
+        manifest_path.display()
+    );
+    assert!(directory.join("SHA256SUMS").is_file(), "舊版 bundle 缺少工具產生的 SHA256SUMS");
+    let text = fs::read_to_string(&manifest_path).expect("讀取舊版 bundle manifest");
+    let PyValue::Dict(manifest) = pyjson::loads(&text).expect("解析舊版 bundle manifest") else {
+        panic!("舊版 bundle manifest 頂層須為 object");
+    };
+    assert_eq!(manifest.get("bundle_version").and_then(PyValue::as_str), Some(OLD_VERSION));
+    directory
+}
+
 pub fn unix_endpoint(socket: &Path) -> String {
-    format!("unix://{}", socket.display())
+    socket.display().to_string()
 }
 
 /// 建立隔離安裝入口，供 update 路徑辨識既有 current；bundle 內容來自 mkbundle 產物。
@@ -131,6 +151,44 @@ pub fn seed_install(bundle_dir: &Path, install_root: &Path) {
     fs::write(install_root.join("current-release.json"), bytes).expect("寫入隔離 current fixture");
 }
 
+/// 以 mkbundle 產生的舊版檔案建立可供 update 驗證的隔離安裝。
+pub fn seed_install_from_old_bundle(bundle_dir: &Path, install_root: &Path) {
+    let manifest_path = bundle_dir.join("release-manifest.json");
+    let text = fs::read_to_string(&manifest_path).expect("讀取舊版 bundle manifest");
+    let PyValue::Dict(manifest) = pyjson::loads(&text).expect("解析舊版 bundle manifest") else {
+        panic!("舊版 bundle manifest 頂層須為 object");
+    };
+    let version = manifest
+        .get("bundle_version")
+        .and_then(PyValue::as_str)
+        .expect("舊版 manifest 含 bundle_version");
+    assert_eq!(version, OLD_VERSION, "舊版 bundle 版本須符合 fixture 約定");
+    let version_dir = install_root.join("versions").join(version);
+    copy_tree(bundle_dir, &version_dir);
+
+    let bin = install_root.join("bin");
+    fs::create_dir_all(&bin).expect("建立隔離安裝入口目錄");
+    for name in ["serialwrap", "serialwrapd"] {
+        let link = bin.join(name);
+        let status = Command::new("ln")
+            .arg("-s")
+            .arg(format!("../versions/{version}/bin/{name}"))
+            .arg(&link)
+            .status()
+            .expect("建立隔離安裝入口 symlink");
+        assert!(status.success(), "建立隔離安裝入口失敗：{}", link.display());
+    }
+    let mut current = PyDict::new();
+    current.insert("backup_dir", PyValue::Null);
+    current.insert("bundle_version", PyValue::Str(version.to_string()));
+    current.insert("dir", PyValue::Str(format!("versions/{version}")));
+    current.insert("previous", PyValue::Null);
+    current.insert("switched_at", PyValue::Str("handoff-stop-fixture".to_string()));
+    let mut bytes = pyjson::dumps(&PyValue::Dict(current), &pyjson::DISK_STABLE).into_bytes();
+    bytes.push(b'\n');
+    fs::write(install_root.join("current-release.json"), bytes).expect("寫入隔離 current fixture");
+}
+
 fn copy_tree(source: &Path, destination: &Path) {
     fs::create_dir_all(destination).expect("建立隔離安裝版本目錄");
     for entry in fs::read_dir(source).expect("讀取 bundle 版本目錄") {
@@ -165,6 +223,59 @@ pub fn install_snapshot(install_root: &Path) -> InstallSnapshot {
         cli_entry: fs::read_link(install_root.join("bin/serialwrap")).ok(),
         daemon_entry: fs::read_link(install_root.join("bin/serialwrapd")).ok(),
     }
+}
+
+pub fn update_report(output: &Output) -> PyDict {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let root = match pyjson::loads(stdout.trim()) {
+        Ok(PyValue::Dict(root)) => root,
+        other => panic!("setup stdout 不是 JSON object：{other:?}\n{stdout}\n{}", String::from_utf8_lossy(&output.stderr)),
+    };
+    match root.get("update") {
+        Some(PyValue::Dict(report)) => report.clone(),
+        other => panic!("setup 回應缺 update report：{other:?}\n{stdout}"),
+    }
+}
+
+/// 從產品 `update.steps.stop_supervisor.detail.handoff_chain` 讀取交接鏈。
+pub fn handoff_chain(report: &PyDict) -> Vec<PyDict> {
+    let Some(PyValue::List(steps)) = report.get("steps") else {
+        panic!("update report 缺 steps");
+    };
+    let stops = steps.iter().filter_map(|value| match value {
+        PyValue::Dict(step) if step.get("step").and_then(PyValue::as_str) == Some("stop_supervisor") => Some(step),
+        _ => None,
+    }).collect::<Vec<_>>();
+    assert_eq!(stops.len(), 1, "產品 update 必須恰有一個 stop_supervisor step");
+    let Some(PyValue::Dict(detail)) = stops[0].get("detail") else {
+        panic!("stop_supervisor 缺 detail");
+    };
+    match detail.get("handoff_chain") {
+        Some(PyValue::List(chain)) => chain.iter().map(|value| match value {
+            PyValue::Dict(link) => link.clone(),
+            other => panic!("產品 handoff_chain 項目不是 object：{other:?}"),
+        }).collect(),
+        other => panic!("產品 stop_supervisor 未回報 handoff_chain：{other:?}"),
+    }
+}
+
+pub fn update_step<'a>(report: &'a PyDict, name: &str) -> &'a PyDict {
+    let Some(PyValue::List(steps)) = report.get("steps") else {
+        panic!("update report 缺 steps");
+    };
+    let matches = steps.iter().filter_map(|value| match value {
+        PyValue::Dict(step) if step.get("step").and_then(PyValue::as_str) == Some(name) => Some(step),
+        _ => None,
+    }).collect::<Vec<_>>();
+    assert_eq!(matches.len(), 1, "產品 update 必須恰有一個 {name} step");
+    matches[0]
+}
+
+pub fn daemon_pid(output: &Output) -> Option<u32> {
+    if !output.status.success() { return None; }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Ok(PyValue::Dict(response)) = pyjson::loads(stdout.trim()) else { return None; };
+    response.get("pid").and_then(PyValue::as_i64).and_then(|pid| u32::try_from(pid).ok())
 }
 
 /// 只傳入隔離 HOME、XDG 與 SERIALWRAP 路徑；呼叫端的 PATH/TMPDIR 由子行程啟動器明確補上。
@@ -214,6 +325,8 @@ pub fn isolated_cli_env(
         "SERIALWRAP_TEST_UPDATE_SOCKET".to_string(),
         endpoint.to_string(),
     );
+    vars.insert("SW_TEST_USER".to_string(), "root".to_string());
+    vars.insert("SW_TEST_PASS".to_string(), "pw".to_string());
     vars
 }
 
@@ -334,4 +447,136 @@ pub fn run_audited_cli(
     .expect("保存 CLI stderr");
     assert!(!timed_out, "CLI 子行程超過期限 {timeout:?}：{args:?}");
     output
+}
+
+/// 執行隔離 CLI 子行程；不繼承 caller 的設定或狀態路徑。
+pub fn run_cli(cli: &Path, vars: &BTreeMap<String, String>, args: &[&str], timeout: Duration) -> Output {
+    try_run_cli(cli, vars, args, timeout)
+        .unwrap_or_else(|| panic!("serialwrap CLI {:?} 啟動失敗或超過期限 {timeout:?}", args))
+}
+
+fn try_run_cli(cli: &Path, vars: &BTreeMap<String, String>, args: &[&str], timeout: Duration) -> Option<Output> {
+    let mut command = Command::new(cli);
+    command.args(args).env_clear().envs(vars)
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(path) = std::env::var_os("PATH") { command.env("PATH", path); }
+    if let Some(tmpdir) = std::env::var_os("TMPDIR") { command.env("TMPDIR", tmpdir); }
+    let mut child = command.spawn().ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// 僅清理隔離 endpoint 回報、且 executable 位於本測試安裝目錄的產品繼任者。
+pub struct ProductDaemonCleanup {
+    cli: PathBuf,
+    vars: BTreeMap<String, String>,
+    endpoint: String,
+    install_root: PathBuf,
+    expected_pid: Option<u32>,
+    active: bool,
+}
+
+impl ProductDaemonCleanup {
+    pub fn new(cli: PathBuf, vars: BTreeMap<String, String>, endpoint: String, install_root: PathBuf, run_dir: &Path) -> ProductDaemonCleanup {
+        let socket = endpoint.strip_prefix("unix://").unwrap_or(&endpoint);
+        assert!(Path::new(socket).is_absolute(), "cleanup socket 必須是絕對路徑");
+        assert!(Path::new(socket).starts_with(run_dir), "cleanup socket 必須位於隔離 run dir：{socket}");
+        ProductDaemonCleanup { cli, vars, endpoint, install_root, expected_pid: None, active: true }
+    }
+
+    fn status_pid(&self) -> Option<u32> {
+        let output = try_run_cli(&self.cli, &self.vars,
+            &["--socket", &self.endpoint, "daemon", "status"], Duration::from_secs(5))?;
+        daemon_pid(&output)
+    }
+
+    fn stop_owned(&self, expected: Option<u32>) -> bool {
+        let Some(pid) = self.status_pid() else { return false; };
+        if expected.is_some_and(|expected| expected != pid) { return false; }
+        let Ok(exe) = fs::canonicalize(format!("/proc/{pid}/exe")) else { return false; };
+        let Ok(versions) = fs::canonicalize(self.install_root.join("versions")) else { return false; };
+        if !exe.starts_with(&versions) || !is_product_daemon_executable(pid, &exe, &versions) {
+            return false;
+        }
+        let start_ticks = process_start_ticks(pid);
+        let _stopped = try_run_cli(&self.cli, &self.vars,
+            &["--socket", &self.endpoint, "daemon", "stop"], Duration::from_secs(20))
+            .is_some_and(|output| output.status.success());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let same = process_start_ticks(pid) == start_ticks
+                && fs::canonicalize(format!("/proc/{pid}/exe")).ok().as_deref() == Some(exe.as_path());
+            if !same { return true; }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let still_same = process_start_ticks(pid) == start_ticks
+            && fs::canonicalize(format!("/proc/{pid}/exe")).ok().as_deref() == Some(exe.as_path());
+        if still_same && start_ticks.is_some() {
+            let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                let same = process_start_ticks(pid) == start_ticks
+                    && fs::canonicalize(format!("/proc/{pid}/exe")).ok().as_deref() == Some(exe.as_path());
+                if !same { return true; }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        false
+    }
+
+    pub fn stop(&mut self, expected_pid: u32) {
+        let actual = self.status_pid();
+        assert_eq!(actual, Some(expected_pid), "隔離 endpoint 的繼任 daemon PID 必須符合產品回報：{actual:?}");
+        self.expected_pid = Some(expected_pid);
+        assert!(self.stop_owned(Some(expected_pid)), "無法安全停止隔離安裝的繼任 daemon PID {expected_pid}");
+        self.active = false;
+    }
+}
+
+impl Drop for ProductDaemonCleanup {
+    fn drop(&mut self) {
+        if self.active { let _ = self.stop_owned(self.expected_pid); }
+    }
+}
+
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = stat.rsplit_once(')')?.1.split_whitespace().collect::<Vec<_>>();
+    fields.get(19)?.parse().ok()
+}
+
+fn is_product_daemon_executable(pid: u32, exe: &Path, versions: &Path) -> bool {
+    if exe.file_name().and_then(|name| name.to_str()) == Some("serialwrapd") {
+        return true;
+    }
+    if exe.file_name().and_then(|name| name.to_str()) != Some("python3") {
+        return false;
+    }
+    let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else { return false; };
+    let args = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(String::from_utf8_lossy)
+        .collect::<Vec<_>>();
+    args.len() >= 4
+        && Path::new(args[0].as_ref()) == exe
+        && args[1] == "-I"
+        && args[2] == "-B"
+        && Path::new(args[3].as_ref()).starts_with(versions)
+        && Path::new(args[3].as_ref()).file_name().and_then(|name| name.to_str()) == Some("serialwrapd.py")
 }

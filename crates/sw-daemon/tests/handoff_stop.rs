@@ -1334,32 +1334,96 @@ impl Drop for HolderSampler {
     }
 }
 
-/// 舊 daemon 存活時繼任者實際競爭實例鎖並失敗；再由 daemon.handoff_stop RPC 交接，舊 daemon 退出後才啟新版。
-/// 以實際行程結束與 holder 取樣驗證結果，不自行構造 CLI 交接紀錄。
+/// 舊 daemon 存活時繼任者實際競爭實例鎖並失敗；再由正式 setup update 交接並啟動繼任者。
+/// 交接鏈與舊 PID 取自產品輸出，持有者取樣驗證全程沒有雙重持有。
 #[test]
 fn handoff_then_successor_never_double_held() {
     let env = isolated_env_with_pty_target();
+    let cli = handoff_cli::feature_cli_path();
+    let (_bundle_dir, manifest) = handoff_cli::feature_bundle(&cli);
+    let base_bundle = handoff_cli::old_bundle_dir();
+    let install_root = env.root.join("install");
+    handoff_cli::seed_install_from_old_bundle(&base_bundle, &install_root);
+    let endpoint = handoff_cli::unix_endpoint(&env.socket);
+    std::fs::write(
+        env.config_dir.join("config.yaml"),
+        format!("supervision_mode: on-demand\nsocket_path: \"{endpoint}\"\n"),
+    )
+    .expect("寫入隔離 on-demand config");
+    let vars = handoff_cli::isolated_cli_env(&env, &endpoint, &manifest, &install_root);
+    let mut cleanup = handoff_cli::ProductDaemonCleanup::new(
+        cli.clone(), vars.clone(), endpoint.clone(), install_root, &env.run_dir,
+    );
+
     let sampler = HolderSampler::start(env.pty_slave.clone());
-    let mut old = DaemonProc::spawn(&env, &[]);
+    let daemon_args = ["--socket", endpoint.as_str()];
+    let mut old = DaemonProc::spawn(&env, &daemon_args);
     support::wait_ready(&env, "COM0");
     let old_pid = old.pid();
-    let mut contender = DaemonProc::spawn(&env, &[]);
+    let mut contender = DaemonProc::spawn(&env, &daemon_args);
     let contended = contender.wait(Duration::from_secs(5));
     assert!(!contended.success(), "舊 daemon 存活時繼任者不得取得實例鎖");
-    assert!(contender.stderr().contains("DAEMON_ALREADY_RUNNING"), "繼任者必須實際遇到鎖衝突：{}", contender.stderr());
+    assert!(
+        contender.stderr().contains("DAEMON_ALREADY_RUNNING"),
+        "繼任者必須實際遇到鎖衝突：{}",
+        contender.stderr()
+    );
     assert!(old.try_alive(), "競爭鎖時舊 daemon 仍存活");
 
-    let _handoff_token = assert_granted(&rpc_handoff(&env.socket), "daemon.handoff_stop");
+    let update = handoff_cli::run_audited_cli(
+        &cli,
+        &vars,
+        &["--socket", endpoint.as_str(), "setup", "--on-demand"],
+        "handoff-successor",
+        Duration::from_secs(180),
+    );
+    let report = handoff_cli::update_report(&update);
+    let chain = handoff_cli::handoff_chain(&report);
+    assert_eq!(chain.len(), 1, "產品 update 必須恰回報一筆交接鏈：{chain:?}");
+    assert_eq!(
+        chain[0].get("pid").and_then(PyValue::as_i64),
+        Some(i64::from(old_pid)),
+        "產品交接鏈 PID 必須是實際舊 daemon：{chain:?}"
+    );
+    assert_eq!(chain[0].get("relaunched"), Some(&PyValue::Bool(false)), "初次交接不得標記 relaunched：{chain:?}");
+    let token = s(&chain[0], "token").unwrap_or_default();
+    assert!(is_hex32(token), "產品交接鏈須含有效 32 hex token：{chain:?}");
+    assert!(
+        update.status.success() && report.get("ok") == Some(&PyValue::Bool(true)),
+        "正式 setup update 必須成功：stdout={} stderr={}",
+        String::from_utf8_lossy(&update.stdout),
+        String::from_utf8_lossy(&update.stderr)
+    );
+    let start = handoff_cli::update_step(&report, "start_and_verify");
+    let Some(PyValue::Dict(start_detail)) = start.get("detail") else {
+        panic!("start_and_verify 缺 detail：{start:?}");
+    };
+    assert_eq!(start_detail.get("started"), Some(&PyValue::Bool(true)), "繼任者必須由產品 update 啟動：{start_detail:?}");
+
     let status = old.wait(HANDOFF_DRAIN_GRACE + STOP_CAP + Duration::from_secs(2));
     assert_eq!(status.code(), Some(0), "交接後有序停止：{}", old.stderr());
     assert!(path_holders(&env.pty_slave).iter().all(|(pid, _)| *pid != old_pid), "舊 daemon 已釋放 UART");
-    let new = DaemonProc::spawn(&env, &[]);
     support::wait_ready(&env, "COM0");
-    let new_pid = new.pid();
+    let new_status = handoff_cli::run_cli(
+        &cli,
+        &vars,
+        &["--socket", endpoint.as_str(), "daemon", "status"],
+        Duration::from_secs(15),
+    );
+    assert!(new_status.status.success(), "產品繼任者 daemon.status 必須成功：{}{}", String::from_utf8_lossy(&new_status.stdout), String::from_utf8_lossy(&new_status.stderr));
+    let new_pid = handoff_cli::daemon_pid(&new_status).expect("產品 daemon.status 必須回報繼任者 PID");
+    assert_ne!(new_pid, old_pid, "繼任者 PID 必須不同於舊 daemon");
+    let holders = path_holders(&env.pty_slave)
+        .into_iter()
+        .filter(|(_, comm)| comm.contains("serialwrapd"))
+        .map(|(pid, _)| pid)
+        .collect::<Vec<_>>();
+    assert_eq!(holders, vec![new_pid], "UART holder 必須是產品回報的繼任者：{holders:?}");
     let (max, seen) = sampler.finish();
     assert!(max <= 1, "任一時刻至多一個 daemon 持有 UART：max={max} seen={seen:?}");
-    assert_eq!(seen, vec![old_pid, new_pid], "持有者依序為舊 → 新：{seen:?}");
-    drop(new);
+    assert_eq!(seen, vec![old_pid, new_pid], "持有者依序恰為舊 → 新：{seen:?}");
+    cleanup.stop(new_pid);
+    assert!(path_holders(&env.pty_slave).is_empty(), "隔離繼任者清理後 UART 不得有 holder");
 }
 
 /// 正式建置忽略測試範圍變數；外部 daemon 仍須使 update 在安全檢查階段 fail-closed。
