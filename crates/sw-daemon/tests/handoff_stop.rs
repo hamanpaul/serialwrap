@@ -14,6 +14,8 @@
 #![cfg(feature = "test-fakes")]
 
 mod support;
+#[path = "support/handoff_cli.rs"]
+mod handoff_cli;
 
 use std::collections::BTreeMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -1358,6 +1360,85 @@ fn handoff_then_successor_never_double_held() {
     assert!(max <= 1, "任一時刻至多一個 daemon 持有 UART：max={max} seen={seen:?}");
     assert_eq!(seen, vec![old_pid, new_pid], "持有者依序為舊 → 新：{seen:?}");
     drop(new);
+}
+
+/// 正式建置忽略測試範圍變數；外部 daemon 仍須使 update 在安全檢查階段 fail-closed。
+#[test]
+fn default_cli_update_scope_cannot_bypass_foreign_daemon() {
+    let feature_cli = handoff_cli::feature_cli_path();
+    let default_cli = handoff_cli::no_fakes_cli_path();
+    assert_ne!(feature_cli, default_cli, "正式 CLI 必須來自獨立的 no-fakes target");
+    let (bundle_dir, manifest) = handoff_cli::feature_bundle(&feature_cli);
+    let audit_run =
+        std::env::var("SW_TEST_AUDIT_LABEL").unwrap_or_else(|_| "product".to_string());
+    assert!(
+        audit_run
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+        "SW_TEST_AUDIT_LABEL 只接受英數字與連字號"
+    );
+
+    for (label, explicit_socket) in [("explicit-socket", true), ("implicit-socket", false)] {
+        let daemon_env = isolated_env();
+        let socket_a = daemon_env.socket.clone();
+        let endpoint_a = handoff_cli::unix_endpoint(&socket_a);
+        let daemon_args = if explicit_socket {
+            vec!["--socket", endpoint_a.as_str()]
+        } else {
+            Vec::new()
+        };
+        let mut daemon = DaemonProc::spawn(&daemon_env, &daemon_args);
+        support::wait_socket(&socket_a, Duration::from_secs(10));
+        let ping = support::rpc_value(&socket_a, "health.ping", "{}");
+        assert_eq!(ping["ok"], PyValue::Bool(true), "測試 daemon A 已可回 ping：{ping:?}");
+        let daemon_pid = daemon.pid();
+
+        let cli_env = isolated_env();
+        let socket_b = cli_env.run_dir.join("foreign-daemon.sock");
+        let endpoint_b = handoff_cli::unix_endpoint(&socket_b);
+        assert_ne!(socket_a, socket_b, "A、B 必須是不同隔離 socket");
+        assert!(!socket_b.exists(), "CLI 的隔離 socket B 必須不存在：{}", socket_b.display());
+        std::fs::write(
+            cli_env.config_dir.join("config.yaml"),
+            format!("supervision_mode: on-demand\nsocket_path: \"{endpoint_b}\"\n"),
+        )
+        .expect("寫入隔離 on-demand config");
+
+        let install_root = cli_env.root.join("install");
+        handoff_cli::seed_install(&bundle_dir, &install_root);
+        let before = handoff_cli::install_snapshot(&install_root);
+        let vars = handoff_cli::isolated_cli_env(&cli_env, &endpoint_b, &manifest, &install_root);
+        let args = ["--socket", endpoint_b.as_str(), "setup", "--on-demand"];
+        let audit_label = format!("{audit_run}-{label}");
+        let output = handoff_cli::run_audited_cli(
+            &default_cli,
+            &vars,
+            &args,
+            &audit_label,
+            Duration::from_secs(90),
+        );
+
+        assert!(daemon.try_alive(), "安全檢查後測試 daemon A 仍存活（pid={daemon_pid}）");
+        let ping_after = support::rpc_value(&socket_a, "health.ping", "{}");
+        assert_eq!(ping_after["ok"], PyValue::Bool(true), "測試 daemon A 仍可回 ping：{ping_after:?}");
+        assert_eq!(
+            handoff_cli::install_snapshot(&install_root),
+            before,
+            "CLI 在拒絕更新前不得變更隔離安裝入口或 current（{label}）"
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let result = match pyjson::loads(stdout.trim()) {
+            Ok(PyValue::Dict(result)) => result,
+            other => panic!("正式 CLI stdout 須為 JSON object（{label}）：{other:?}\n{stdout}\n{}", String::from_utf8_lossy(&output.stderr)),
+        };
+        assert_eq!(output.status.code(), Some(2), "正式 CLI 必須拒絕更新（{label}）：{stdout}");
+        assert_eq!(result.get("ok"), Some(&PyValue::Bool(false)), "{label}：{stdout}");
+        assert_eq!(result.get("error_code").and_then(PyValue::as_str), Some("DEVICE_STILL_HELD"), "{label}：{stdout}");
+        assert_eq!(result.get("phase").and_then(PyValue::as_str), Some("update_safety_check"), "{label}：{stdout}");
+        let has_test_daemon_pid = matches!(result.get("pids"), Some(PyValue::List(pids)) if pids.iter().any(|pid| pid.as_i64() == Some(i64::from(daemon_pid))));
+        assert!(has_test_daemon_pid, "拒絕詳情須列出測試 daemon A 的 PID {daemon_pid}（{label}）：{stdout}");
+    }
 }
 
 
