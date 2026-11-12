@@ -760,6 +760,9 @@ pub struct SessionCore {
     /// 只供測試（test-fakes）：`last_error` 每次變更為非 None 時的觀察者（Task 16 `last_error_history`）。
     #[cfg(feature = "test-fakes")]
     last_error_observer: Option<Box<dyn Fn(&str) + Send>>,
+    /// 只供測試：移除保管 token 後、加入退休 epoch 前的排程窗口；不持有 fence 或 manager 鎖。
+    #[cfg(feature = "test-fakes")]
+    retired_drain_replace_hook: Option<Box<dyn Fn() + Send>>,
     /// P8 Task 8：目前授權的 flash probe（`FlashSyncProbeStart` 設定；同一 probe 的 Released／HolderGone 清除）。
     flash_probe_id: Option<ProbeId>,
     /// P8 Task 8：進 FLASHING 前的狀態（Python `flash_prev_state`；HolderGone 還原，I/O error／停止清除）。
@@ -1052,6 +1055,8 @@ impl SessionCore {
             fg_source: None,
             #[cfg(feature = "test-fakes")]
             last_error_observer: None,
+            #[cfg(feature = "test-fakes")]
+            retired_drain_replace_hook: None,
             flash_probe_id: None,
             flash_prev_state: None,
             pending_detach: None,
@@ -1789,6 +1794,12 @@ impl SessionCore {
     #[cfg(feature = "test-fakes")]
     pub fn set_last_error_observer(&mut self, observer: Box<dyn Fn(&str) + Send>) {
         self.last_error_observer = Some(observer);
+    }
+
+    /// 只供測試：觀察保管 token 轉退休 epoch 的中間窗口。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_retired_drain_replace_hook_for_test(&mut self, hook: Box<dyn Fn() + Send>) {
+        self.retired_drain_replace_hook = Some(hook);
     }
 
     /// P5-T16：manager 啟動時還原 `state.json` 的 RELEASED 列（spawn 前呼叫；Python `__init__` 的 released 實體化）。
@@ -3645,7 +3656,12 @@ impl SessionCore {
                 // 同一資源從保管帳本交給 actor 排空：移除 token 等待後，於下方原子換成 epoch／stop_id 等待，
                 // 不把 AdoptBridge 的 tombstone 當成關閉成功回條（C3、C5）。
                 cancelled_custody = Some(self.retired_drains.remove(index).release_deadline_rt);
-                self.publish_retired_drains();
+                // P8-22acfbb-1：替換期間仍有關閉義務，保持 fence 鏡像為 true；由 retire_opened_bridge 加入 epoch 後
+                // 統一發布，避免 shutdown 在 RELEASED 快照後讀到短暫的 false 而漏列 worker。
+                #[cfg(feature = "test-fakes")]
+                if let Some(hook) = &self.retired_drain_replace_hook {
+                    hook();
+                }
             }
         }
         if custody_open {

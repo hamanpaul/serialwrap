@@ -746,6 +746,12 @@ struct Shared {
     /// 只供測試：IoWorker 已存入 Bridged 帳本、BridgeOpened 尚未送出的窗口。
     #[cfg(feature = "test-fakes")]
     open_job_post_commit_hook: Mutex<Option<SidTestHook>>,
+    /// 只供測試：指定 actor 移除保管 token、尚未加入退休 epoch 的一次性暫停點。
+    #[cfg(feature = "test-fakes")]
+    retired_drain_replace_hook: Mutex<Option<SidTestHook>>,
+    /// 只供測試：shutdown 已取得狀態快照、尚未讀取退休排空鏡像的暫停點。
+    #[cfg(feature = "test-fakes")]
+    shutdown_pre_retired_check_hook: Mutex<Option<SidTestHook>>,
     /// S2-PAR-wp510r R4（test-fakes）：W6 worker 的 `BeginExternalAttach` 已被接受、以該 token 登記帳本紀錄之前的一次性
     /// 暫停點（重現「先取消、後登記」：停止者在登記前送達，`ClaimForStop` 寫入 tombstone）。
     #[cfg(feature = "test-fakes")]
@@ -1953,6 +1959,21 @@ impl Shared {
             let history = Arc::new(Mutex::new(Vec::new()));
             let sink = history.clone();
             core.set_last_error_observer(Box::new(move |v: &str| lock(&sink).push(v.to_string())));
+            let shared = Arc::downgrade(self);
+            let target_sid = sid.clone();
+            core.set_retired_drain_replace_hook_for_test(Box::new(move || {
+                let Some(shared) = shared.upgrade() else { return };
+                let hook = {
+                    let mut slot = lock(&shared.retired_drain_replace_hook);
+                    match slot.as_ref() {
+                        Some((target, _)) if *target == target_sid => slot.take().map(|(_, hook)| hook),
+                        _ => None,
+                    }
+                };
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }));
             history
         };
         let actor_id = crate::custody::ActorId::allocate();
@@ -5941,6 +5962,10 @@ impl SessionManager {
             #[cfg(feature = "test-fakes")]
             open_job_post_commit_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
+            retired_drain_replace_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            shutdown_pre_retired_check_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
             external_attach_pre_register_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             rematerialize_after_set_profile_hook: Mutex::new(None),
@@ -7465,6 +7490,18 @@ impl SessionManager {
         *lock(&self.shared.open_job_post_commit_hook) = Some((sid.to_string(), hook));
     }
 
+    /// 只供測試：token 換成 epoch 時，在兩者之間暫停 actor（鎖外執行）。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_retired_drain_replace_hook_for_test(&self, sid: &str, hook: Box<dyn FnOnce() + Send>) {
+        *lock(&self.shared.retired_drain_replace_hook) = Some((sid.to_string(), hook));
+    }
+
+    /// 只供測試：shutdown 取得 GetState 後、讀取退休排空鏡像前暫停（鎖外執行）。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_shutdown_pre_retired_check_hook_for_test(&self, sid: &str, hook: Box<dyn FnOnce() + Send>) {
+        *lock(&self.shared.shutdown_pre_retired_check_hook) = Some((sid.to_string(), hook));
+    }
+
     /// 只供測試（test-fakes）：W6 worker 的 `BeginExternalAttach` 被接受後、登記帳本紀錄前暫停（綁定 by_id，一次性）。
     #[cfg(feature = "test-fakes")]
     pub fn set_external_attach_pre_register_hook_for_test(&self, by_id: &str, hook: Box<dyn FnOnce() + Send>) {
@@ -7681,6 +7718,19 @@ impl SessionManager {
             // S2-PAR-wp510r R3（DR-4 b）：DETACHED／RELEASED 但仍有退休 bridge 未確認關閉者照樣送 Shutdown 並等待其回條
             // （Python shutdown 收集仍在表內的作業並等待 `done`，`origin/main:sw_core/session_manager.py:1181-1185`、
             // `:1228-1239`）。
+            #[cfg(feature = "test-fakes")]
+            {
+                let hook = {
+                    let mut slot = lock(&self.shared.shutdown_pre_retired_check_hook);
+                    match slot.as_ref() {
+                        Some((target, _)) if *target == sid => slot.take().map(|(_, hook)| hook),
+                        _ => None,
+                    }
+                };
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
             let retired_pending = fence.with(|f| f.retired_drains_pending);
             if matches!(state.as_deref(), Some("DETACHED" | "RELEASED")) && !retired_pending {
                 continue;

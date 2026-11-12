@@ -10405,6 +10405,139 @@ fn wp510r_i21_rpc_bind_release_bridged_after_both_deadlines() {
     wp510r_i21_rpc_bind_release_bridged(true);
 }
 
+/// P8-22acfbb-1：shutdown 已讀到 RELEASED 時，token 換成 epoch 的窗口與阻塞 close 都不能漏列。
+/// Python 在同一把鎖下追蹤 attach bridge，並等配對關閉終態（origin/main:sw_core/session_manager.py:1181-1239）。
+fn wp510r_i22_rpc_shutdown_during_token_epoch_replacement(timeout: bool) {
+    let r = Arc::new(ServiceRig::ready_shell());
+    let dev = r.device(REAL_A).clone();
+    assert_eq!(r.call("device.release", r#"{"selector":"COM0"}"#).get("ok"), Some(&PyValue::Bool(true)));
+    let sid = r.mgr.resolve("COM0").unwrap();
+    let fence = r.mgr.fence_for_test("COM0").unwrap();
+    let control = r.mgr.actor_control_for_test(&sid).unwrap();
+    let (opened_tx, opened_rx) = crossbeam_channel::bounded(1);
+    let (open_go_tx, open_go_rx) = crossbeam_channel::bounded(1);
+    r.mgr.set_open_job_post_commit_hook_for_test(&sid, Box::new(move || {
+        opened_tx.send(()).unwrap();
+        open_go_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    }));
+    let attach_rig = Arc::clone(&r);
+    let attach = std::thread::spawn(move || attach_rig.call("device.attach", r#"{"selector":"COM0"}"#));
+    opened_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let record = r.mgr.custody_for_test(BY_ID_A).unwrap();
+    let epoch = match record.phase {
+        CustodyPhaseSnapshot::Bridged { epoch, worker_in_ledger: true } => epoch,
+        other => panic!("前置必須是帳本持有 IoWorker：{other:?}"),
+    };
+    let attempts = dev.open_attempts();
+    let closes = dev.close_count();
+    let tx_before = dev.tx_len();
+    let bind_rig = Arc::clone(&r);
+    let bind = std::thread::spawn(move || bind_rig.call(
+        "session.bind", r#"{"selector":"COM0","device_by_id":"/s/by-id/i22-offline"}"#,
+    ));
+    wait_until("bind 已取消並等待原 token", || {
+        r.mgr.custody_for_test(BY_ID_A).is_some_and(|rec| {
+            rec.token == record.token && rec.cancel == Some(sw_core::custody::CustodyCancel::Bind)
+        }) && r.mgr.custody_awaits_for_test(&sid) == vec![record.token]
+    });
+    assert_eq!(s(&r.session("COM0").unwrap(), "state"), "RELEASED");
+    assert!(fence.with(|f| f.retired_drains_pending));
+
+    let (snapshot_tx, snapshot_rx) = crossbeam_channel::bounded(1);
+    let (check_go_tx, check_go_rx) = crossbeam_channel::bounded(1);
+    r.mgr.set_shutdown_pre_retired_check_hook_for_test(&sid, Box::new(move || {
+        snapshot_tx.send(()).unwrap();
+        check_go_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    }));
+    let (window_tx, window_rx) = crossbeam_channel::bounded(1);
+    let (replace_go_tx, replace_go_rx) = crossbeam_channel::bounded(1);
+    r.mgr.set_retired_drain_replace_hook_for_test(&sid, Box::new(move || {
+        window_tx.send(()).unwrap();
+        replace_go_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    }));
+    let shutdown_rig = Arc::clone(&r);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let (phase1_tx, phase1_rx) = crossbeam_channel::bounded(1);
+    let phase1 = std::thread::spawn(move || {
+        phase1_tx.send(shutdown_rig.mgr.shutdown_phase1(deadline)).unwrap();
+    });
+    snapshot_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    // GetState 已回覆 RELEASED，現在才交付 BridgeOpened，並停在 token 移除、epoch 加入之間。
+    dev.pause_next_close();
+    open_go_tx.send(()).unwrap();
+    window_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let pending_in_window = fence.with(|f| f.retired_drains_pending);
+    check_go_tx.send(()).unwrap();
+    // actor 仍暫停：正確路徑已排入 Shutdown；舊版跳過 session，直接完成 Phase 1。
+    wait_until("shutdown 已讀取替換窗口的鏡像", || !control.is_empty() || !phase1_rx.is_empty());
+    replace_go_tx.send(()).unwrap();
+    let close_paused = dev.wait_paused(Duration::from_secs(1));
+    let drain = phase1_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    phase1.join().unwrap();
+    let retiring = r.mgr.retired_drains_for_test(&sid);
+    let pending_during_close = fence.with(|f| f.retired_drains_pending);
+    assert!(r.mgr.custody_for_test(BY_ID_A).is_none(), "AdoptBridge 已移除帳本紀錄，Phase 2 只能依 actor 等待");
+    let shutdown_rig = Arc::clone(&r);
+    let (report_tx, report_rx) = crossbeam_channel::bounded(1);
+    let phase2 = std::thread::spawn(move || {
+        report_tx.send(shutdown_rig.mgr.shutdown_phase2(drain)).unwrap();
+    });
+    // 保留舊版早回覆，先放行 close、收好所有執行緒，再讓斷言回報真正的紅燈。
+    let early = report_rx.recv_timeout(Duration::from_millis(100)).ok();
+    let timed = if timeout {
+        Some(early.clone().unwrap_or_else(|| report_rx.recv_timeout(Duration::from_secs(3)).unwrap()))
+    } else {
+        None
+    };
+    let open_before_receipt = dev.is_open();
+    let deadline_elapsed = Instant::now() >= deadline;
+    let pending_before_receipt = fence.with(|f| f.retired_drains_pending);
+    dev.release_pause();
+    let report = timed.or_else(|| early.clone())
+        .unwrap_or_else(|| report_rx.recv_timeout(Duration::from_secs(3)).unwrap());
+    phase2.join().unwrap();
+    let attached = attach.join().unwrap();
+    let bound = bind.join().unwrap();
+    wait_until("成功關閉回條清除鏡像", || {
+        !dev.is_open() && dev.close_count() == closes + 1 && !fence.with(|f| f.retired_drains_pending)
+    });
+
+    assert!(pending_in_window, "token→epoch 替換窗口不可發布 retired_drains_pending=false；shutdown={report:?}");
+    assert!(close_paused && open_before_receipt, "真實 IoWorker 的 handle 在 close 暫停期間仍開啟");
+    assert_eq!(retiring, vec![epoch], "同資源等待已換成退休 epoch");
+    assert!(pending_during_close && pending_before_receipt, "成功回條前持續發布待排空");
+    assert!(early.is_none(), "close 阻塞時 shutdown 不得提前完成：{early:?}");
+    assert_eq!(report.iter().find(|(target, _)| target == &sid), Some(&(sid.clone(), !timeout)), "shutdown 不得漏列 session：{report:?}");
+    if timeout {
+        assert!(deadline_elapsed, "未排空判定必須等到共用期限");
+    }
+    assert_eq!(s(&attached, "error_code"), "SESSION_RECOVERING");
+    assert_eq!(s(&bound, "error_code"), "SESSION_RECOVERING");
+    for response in [&attached, &bound] {
+        let session = sub(response, "session");
+        assert_eq!(s(&session, "device_by_id"), BY_ID_A, "取消後保留原綁定");
+        assert_eq!(j(response), j(&sw_proto::pydict! {
+            "ok" => false, "error_code" => "SESSION_RECOVERING",
+            "drain_stalled" => session.get("drain_stalled").unwrap().clone(),
+            "drain_timeout_epoch" => session.get("drain_timeout_epoch").unwrap().clone(),
+            "session" => session, "version" => r.version.clone(),
+        }), "RPC 完整形狀與 drain 投影逐位元組一致");
+    }
+    assert_eq!(dev.close_count(), closes + 1);
+    assert_eq!(dev.open_attempts(), attempts, "取消後不增開埠");
+    assert_eq!(dev.tx_len(), tx_before, "取消後零登入 TX");
+}
+
+#[test]
+fn wp510r_i22_rpc_shutdown_token_epoch_window_waits_successful_close() {
+    wp510r_i22_rpc_shutdown_during_token_epoch_replacement(false);
+}
+
+#[test]
+fn wp510r_i22_rpc_shutdown_token_epoch_window_reports_blocked_close() {
+    wp510r_i22_rpc_shutdown_during_token_epoch_replacement(true);
+}
+
 /// 第 15 項共用：拔除 usb-G 並讓熱插執行緒停在 parked handle 的關閉。
 fn wp510r_i15_unplug_parked_paused(r: &ServiceRig, dev: &FakeDevice) -> std::thread::JoinHandle<()> {
     let without: Vec<(String, DeviceInfo)> = r
