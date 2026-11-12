@@ -432,7 +432,7 @@ pub enum Effect {
     /// T14 分類：資源收尾，Open／Pending／Permanent 皆執行。
     PollCustody { tokens: Vec<u64> },
     /// S2-PAR-wp510r 第 15 項（設計 §3.1.4 release「`ClaimForStop{by_id, Release}`」；擁有者 2026-11-11「wp510r release 等待
-    /// 改為 actor 主導」）：release 在 actor 執行緒上、manager 鎖內處理 `by_id` 上不屬本 session 擁有的在途作業與帳本紀錄
+    /// 改為 actor 主導」）：release 在 actor 執行緒上、manager 鎖內處理 `by_id` 上的在途作業與帳本紀錄（包括自身 owner）
     /// （parked 轉 Closing 並加入 watcher、在途作業寫入取消、別人的 Closing 只加入 watcher），以立即回饋 `ReleaseClaimed`
     /// 回報要等待的 token 與首次期限。`release_deadline`（實時）為本次 release 的候選首次期限；紀錄或作業已有期限者沿用。
     /// T14 分類：資源收尾，Open／Pending／Permanent 皆執行。
@@ -614,6 +614,14 @@ pub struct SessionCore {
     release_claim: Option<PendingReleaseClaim>,
     /// `TimerEvent::CustodyPoll` 已排程（同時只有一條補收計時鏈）。
     custody_poll_armed: bool,
+    /// 單次事件的帳本觀測值；事件結束即丟棄，不保存第二份生命週期狀態。
+    custody_observation: Option<crate::custody::CustodyBarrier>,
+    /// 本事件明確發出 AdoptBridge 的 epoch；不能從既有 conn_epoch 推定這次已完成所有權移交。
+    custody_transfers: Vec<u64>,
+    /// attach 的清理回覆等配對終態；所有等待 token 仍由 retired_drains 統一管理。
+    custody_attach_replies: Vec<(u64, Reply, Result<PyDict, PyErr>)>,
+    /// 最後一個成功回覆被安全網攔下時，保留原呼叫端的 already_released 形狀。
+    custody_release_shapes: Vec<(Reply, bool)>,
     /// clear 收尾後等 manager 再解析（Python `_spawn_attach` → `_reresolve_profile_on_reattach`）再送
     /// `DeviceAttached`：期間 state 為 ATTACHING、無開埠（審查 F61／F62）。
     reattach_pending: bool,
@@ -915,6 +923,8 @@ struct RetiredDrain {
     /// S2-PAR-wp510r 第 15 項：由 release 的 `ClaimByIdForRelease` 登記（by_id 上不屬本 session 擁有的紀錄或在途作業），
     /// 不另發 `ClaimForStop{token}`；以 `CustodyPoll` 補收終態。
     by_id_claim: bool,
+    /// 安全網補登記的等待不能在首次逾時後拋棄；它沒有 manager 再次認領／補送的保證。
+    safety_observed: bool,
 }
 
 /// 等待 retired drain 終態的 `session.bind`（見 `SessionCore::bind_waits`）。
@@ -975,6 +985,10 @@ impl SessionCore {
             release_deadline_seed: None,
             release_claim: None,
             custody_poll_armed: false,
+            custody_observation: None,
+            custody_transfers: Vec::new(),
+            custody_attach_replies: Vec::new(),
+            custody_release_shapes: Vec::new(),
             reattach_pending: false,
             reopen_after_retired: false,
             open_generation: 0,
@@ -1126,6 +1140,54 @@ impl SessionCore {
     }
 
     /// 處理一個事件；`now` 為 monotonic（Mono）。
+    pub fn on_event_with_custody(
+        &mut self,
+        ev: MailboxItem,
+        now: Mono,
+        observation: Option<crate::custody::CustodyBarrier>,
+    ) -> Effects {
+        self.custody_observation = observation;
+        self.custody_transfers.clear();
+        let drain_pending_before = !self.retired_drains.is_empty() || self.stop.is_some() || self.pending_open_stop.is_some();
+        // 所有 attach 結束點在同一出口檢查，包括早退、開埠失敗、取消與落盤回覆。
+        let mut attach_replies: Vec<Reply> = self.pending_attach.as_ref().map(|pending| pending.reply.clone()).into_iter().collect();
+        if let Some(PendingCommit::Attach { reply, .. } | PendingCommit::AttachFailed { reply, .. }) = &self.pending_commit {
+            attach_replies.push(reply.clone());
+        }
+        let incoming_attach = if let MailboxItem::Control(ControlEvent::Request {
+            req: SessionRequest::DeviceAttach { .. } | SessionRequest::DeviceAttachRouted { .. } | SessionRequest::SessionAttach,
+            reply,
+        }) = &ev {
+            Some(reply.clone())
+        } else { None };
+        let effects = self.on_event(ev, now);
+        let mut guarded = Vec::new();
+        for effect in effects.0 {
+            if let Effect::Reply(reply, _) = &effect {
+                self.custody_release_shapes.retain(|(saved, _)| !saved.same_channel(reply));
+            }
+            match effect {
+                // 退休成功已在鎖內把所有權交給後繼作業；D2 落盤失敗則明確留為 parked。
+                // 兩者是具名的移交結果，並非宣告 UART 已關閉，不能等待後繼工作的整段生命週期。
+                Effect::Reply(reply, result) if !self.retired && (
+                    attach_replies.iter().any(|pending| pending.same_channel(&reply))
+                    || incoming_attach.as_ref().is_some_and(|incoming| incoming.same_channel(&reply))
+                        && result.as_ref().is_ok_and(|value| value.get("ok") == Some(&PyValue::Bool(true)) && value.get("recommended_action").is_none())
+                ) => {
+                    guarded.extend(self.attach_reply(reply, result, now));
+                }
+                other => guarded.push(other),
+            }
+        }
+        guarded.extend(self.flush_custody_attach_replies(now));
+        let drain_pending_after = !self.retired_drains.is_empty() || self.stop.is_some() || self.pending_open_stop.is_some();
+        if drain_pending_before != drain_pending_after { self.publish_retired_drains(); }
+        self.custody_observation = None;
+        self.custody_transfers.clear();
+        Effects(guarded)
+    }
+
+    /// 處理一個 sans-IO 事件；帳本輸入由 on_event_with_custody 提供。
     pub fn on_event(&mut self, ev: MailboxItem, now: Mono) -> Effects {
         #[cfg(feature = "test-fakes")]
         if self.panic_events_remaining > 0 {
@@ -1844,6 +1906,9 @@ impl SessionCore {
     /// Two-Phase Drain 第一階段的發起點（Task 12；SC-04、arch §5.5）：`kind` 與 `waiter` 凍結簽章（P6 07 計畫依此呼叫）。
     pub fn begin_stop(&mut self, kind: StopKind, waiter: Option<Reply>, now: Mono) -> Effects {
         let mut effects = Effects(Vec::new());
+        if matches!(kind, StopKind::Release | StopKind::Shutdown) {
+            effects.0.extend(self.await_observed_custody(now).1);
+        }
         // 單次在途（DR-8）：ATTACHING 只是在等改指時退休的舊 bridge 回條（沒有開埠在途、沒有落盤中的 attach）。
         let single_flight_wait = self.reopen_after_retired
             && self.open_real_path.is_none()
@@ -2140,6 +2205,14 @@ impl SessionCore {
         waiters: Vec<Reply>,
         now: Mono,
     ) -> Vec<Effect> {
+        if matches!(kind, StopKind::Release | StopKind::Shutdown) {
+            let (blocked, mut effects) = self.await_observed_custody(now);
+            if blocked {
+                effects.extend(self.begin_stop(kind.clone(), None, now).0);
+                if let Some(pending) = self.pending_open_stop.as_mut() { pending.waiters.extend(waiters); }
+                return effects;
+            }
+        }
         let mut effects = Vec::new();
         self.reattach_pending = false;
         // G8（#243）：無 bridge 的同步 detach＝Python `_detach_session_locked`（`session_manager.py:2704`），歸零非同步
@@ -2337,16 +2410,11 @@ impl SessionCore {
                     if self.shutdown_requested {
                         self.shutdown_complete = true;
                     }
-                    owner
-                        .into_iter()
-                        .chain(waiters)
-                        .map(|(reply, already_released)| {
-                            Effect::Reply(
-                                reply,
-                                Ok(self.release_success_reply(now, already_released)),
-                            )
-                        })
-                        .collect()
+                    let mut effects = Vec::new();
+                    for (reply, already_released) in owner.into_iter().chain(waiters) {
+                        effects.extend(self.release_reply(reply, already_released, now));
+                    }
+                    effects
                 }
                 Err(error) => {
                     self.release_persist_pending = true;
@@ -2577,6 +2645,121 @@ impl SessionCore {
         }
     }
 
+    /// 統一安全網：不從「沒有 parts／bridge／本地等待」推定 UART 已安全交還。
+    /// 所有未終態 token 進同一 awaits 表，通知遺失由 CustodyPoll 補收；失敗永久保留。
+    fn await_observed_custody(&mut self, now: Mono) -> (bool, Vec<Effect>) {
+        use crate::custody::CustodyBarrier;
+        let Some(observation) = self.custody_observation.clone() else {
+            return (false, Vec::new());
+        };
+        if matches!(&observation, CustodyBarrier::Pending(rec)
+            if matches!(rec.phase, crate::custody::CustodyPhaseSnapshot::Bridged { epoch, .. }
+                if Some(epoch) == self.generations.conn_epoch)
+                && self.custody_transfers.contains(&self.generations.conn_epoch.unwrap_or(0))
+        ) {
+            // 本事件正在配對 AdoptBridge；若直接轉自身 StopOp，真正關閉仍由該 stop_id 回條負責。
+            return (self.stop.is_some(), Vec::new());
+        }
+        if matches!(&observation, CustodyBarrier::Pending(rec)
+            if matches!(rec.phase, crate::custody::CustodyPhaseSnapshot::Bridged { epoch, .. }
+                if self.custody_transfers.contains(&epoch)
+                    && self.retired_drains.iter().any(|entry| entry.custody_token.is_none() && entry.epoch == epoch))
+        ) {
+            // 本事件已把同一資源轉成 epoch／stop_id 等待；不得再加 token，亦不得把 ack 的 tombstone 當關閉回條。
+            return (true, self.arm_custody_poll(now));
+        }
+        let (token, receipt, deadline) = match observation {
+            CustodyBarrier::Pending(rec) => (Some(rec.token), RetiredReceipt::Pending, rec.release_deadline),
+            CustodyBarrier::Failed { token, release_deadline } => (token, RetiredReceipt::Failed, release_deadline),
+        };
+        if !self.retired_drains.iter().any(|entry| {
+            entry.by_id == self.profile.device_by_id && entry.custody_token == token
+                && (token.is_some() || entry.receipt == RetiredReceipt::Failed)
+        }) {
+            self.retired_drains.push(RetiredDrain {
+                epoch: 0,
+                stop_id: StopId(0),
+                by_id: self.profile.device_by_id.clone(),
+                receipt,
+                custody_token: token,
+                release_deadline_rt: deadline,
+                // 安全網只等待；不得拿其他 owner 的 token 發 ClaimForStop。
+                by_id_claim: true,
+                safety_observed: true,
+            });
+            self.publish_retired_drains();
+        }
+        (true, self.arm_custody_poll(now))
+    }
+
+    fn release_reply(&mut self, reply: Reply, already_released: bool, now: Mono) -> Vec<Effect> {
+        let shape = self.custody_release_shapes.iter().position(|(saved, _)| saved.same_channel(&reply));
+        let already_released = shape.map(|index| self.custody_release_shapes[index].1).unwrap_or(already_released);
+        let (blocked, mut effects) = self.await_observed_custody(now);
+        if blocked {
+            if shape.is_none() {
+                self.custody_release_shapes.push((reply.clone(), already_released));
+            }
+            effects.extend(self.begin_released_release("cli", reply, now));
+        } else {
+            if let Some(index) = shape { self.custody_release_shapes.remove(index); }
+            effects.push(Effect::Reply(reply, Ok(self.release_success_reply(now, already_released))));
+        }
+        effects
+    }
+
+    /// attach 接受新 bridge 是配對的所有權移交；其餘回覆必須先等仍在帳本中的清理。
+    fn attach_reply(&mut self, reply: Reply, result: Result<PyDict, PyErr>, now: Mono) -> Vec<Effect> {
+        let handoff = matches!(&self.custody_observation,
+            Some(crate::custody::CustodyBarrier::Pending(rec))
+                if matches!(rec.phase, crate::custody::CustodyPhaseSnapshot::Bridged { epoch, .. }
+                    if Some(epoch) == self.generations.conn_epoch && self.custody_transfers.contains(&epoch))
+        );
+        if handoff { return vec![Effect::Reply(reply, result)]; }
+        match self.custody_observation.clone() {
+            Some(crate::custody::CustodyBarrier::Pending(rec)) => {
+                let handed_to_drain = matches!(rec.phase, crate::custody::CustodyPhaseSnapshot::Bridged { epoch, .. }
+                    if self.custody_transfers.contains(&epoch)
+                        && self.retired_drains.iter().any(|entry| entry.custody_token.is_none() && entry.epoch == epoch));
+                // 已明確移交 actor 的 epoch／stop_id 排空責任，保持 DR-4 的 attach 例外回覆時點。
+                // release 仍等該 epoch 的真實回條；AdoptBridge 的 tombstone 不結算這個等待。
+                if handed_to_drain { return vec![Effect::Reply(reply, result)]; }
+                let effects = self.await_observed_custody(now).1;
+                self.custody_attach_replies.push((rec.token, reply, result));
+                effects
+            }
+            Some(crate::custody::CustodyBarrier::Failed { .. }) => {
+                vec![Effect::Reply(reply, result)]
+            }
+            None => vec![Effect::Reply(reply, result)],
+        }
+    }
+
+    fn flush_custody_attach_replies(&mut self, now: Mono) -> Vec<Effect> {
+        if matches!(self.custody_observation, Some(crate::custody::CustodyBarrier::Pending(_)))
+            || self.retired_drains.iter().any(|entry| entry.receipt == RetiredReceipt::Pending)
+        {
+            return Vec::new();
+        }
+        let failed = self.close_unconfirmed()
+            || matches!(self.custody_observation, Some(crate::custody::CustodyBarrier::Failed { .. }))
+            || self.retired_drains.iter().any(|entry| entry.receipt == RetiredReceipt::Failed);
+        std::mem::take(&mut self.custody_attach_replies).into_iter().map(|(_, reply, mut result)| {
+            if let Ok(value) = &mut result {
+                if failed && value.get("ok") == Some(&PyValue::Bool(true)) {
+                    *value = self.session_recovering_reply(now);
+                } else if value.get("session").is_some() {
+                    value.insert("session", PyValue::Dict(self.public(now, &self.public_ctx())));
+                    if value.get("drain_stalled").is_some() {
+                        value.insert("drain_stalled", PyValue::Bool(self.drain_stalled));
+                        value.insert("drain_timeout_epoch", self.drain_timeout_epoch.map(|epoch| py_int(epoch as i128)).unwrap_or(PyValue::Null));
+                    }
+                }
+            }
+            Effect::Reply(reply, result)
+        }).collect()
+    }
+
     fn release_success_reply(&self, now: Mono, already_released: bool) -> PyDict {
         if already_released {
             // G-2：Python `release_device` 的鍵序 ok／already_released／session
@@ -2655,8 +2838,8 @@ impl SessionCore {
     }
 
     /// `SessionRequest::Release`／`ReleaseWithAck` 的入口（S2-PAR-wp510r 第 15 項，設計 §3.1.4 release）：會建立新的 release
-    /// 停止（或在已 RELEASED 的 session 上收尾）時，先以 `ClaimByIdForRelease` 請 executor 在 manager 鎖內處理 by_id 上不屬
-    /// 本 session 擁有的在途作業與帳本紀錄，立即回饋 `ReleaseClaimed` 到達後才走 `release_request_inner`（回饋先於下一個
+    /// 停止（或在已 RELEASED 的 session 上收尾）時，先以 `ClaimByIdForRelease` 請 executor 在 manager 鎖內處理 by_id 上
+    /// 的在途作業與帳本紀錄（包括自身 owner），立即回饋 `ReleaseClaimed` 到達後才走 `release_request_inner`（回饋先於下一個
     /// mailbox 事件處理）。Python `release_device` 先找 by_id 的在途作業與未消費的預開 handle，再處理 session
     /// （`origin/main:sw_core/session_manager.py:3104-3111`）。加入既有停止、FLASHING 等直接回覆者不認領。
     fn release_request_with_ack(
@@ -2669,6 +2852,16 @@ impl SessionCore {
         now: Mono,
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
+        if self.pending_open_stop.as_ref().is_some_and(|pending| pending.kind != StopKind::Release)
+            && !self.retired_drains.is_empty()
+            && self.retired_drains.iter().all(|entry| entry.receipt == RetiredReceipt::Failed)
+            && self.generations.conn_epoch.is_none()
+            && self.open_real_path.is_none() && self.external_attach.is_none() && self.pending_attach.is_none()
+        {
+            // 前一個停止已到失敗終態：保留永久阻擋，但本次 release 仍須建立自己的 T-1 等待。
+            let pending = self.pending_open_stop.take().expect("剛確認的失敗停止");
+            for waiter in pending.waiters { effects.push(Effect::Reply(waiter, Ok(self.session_recovering_reply(now)))); }
+        }
         if self.release_claim.is_some() {
             // 立即回饋必定先於下一個 mailbox 事件；仍有未結算的認領代表 executor 未回饋（例如效果執行時 unwind），以空認領
             // 收尾，不讓先到的 release 永遠等不到回覆。
@@ -2747,6 +2940,7 @@ impl SessionCore {
                     custody_token: Some(claim.token),
                     release_deadline_rt: Some(claim.deadline),
                     by_id_claim: true,
+                    safety_observed: false,
                 });
                 added = true;
             }
@@ -2823,7 +3017,7 @@ impl SessionCore {
                     {
                         return self.retry_release_persistence(reply);
                     }
-                    return vec![Effect::Reply(reply, Ok(self.release_success_reply(now, true)))];
+                    return self.release_reply(reply, true, now);
                 }
                 if self.flash_busy() {
                     // P8 Task 8：FLASHING 或 probe 窗口／flash-critical（Python `_flash_busy_locked`）。
@@ -3647,7 +3841,11 @@ impl SessionCore {
         // 保管紀錄的開埠工作（`ClaimCustody`）回報終態：之後本 session 不再持有該紀錄（已接手、已關閉或已由取消者收尾）。
         // 只看明確記錄的開埠種類（審查 P8-7bb9935-1）：一般開埠的終態不清除保管。
         let custody_open = std::mem::take(&mut self.custody_opening);
-        let custody_token = custody_open.then_some(self.external_attach).flatten();
+        let custody_token = match (&result, &self.custody_observation) {
+            (Ok(opened), Some(crate::custody::CustodyBarrier::Pending(rec)))
+                if matches!(rec.phase, crate::custody::CustodyPhaseSnapshot::Bridged { epoch, .. } if epoch == opened.epoch) => Some(rec.token),
+            _ => custody_open.then_some(self.external_attach).flatten(),
+        };
         let mut cancelled_custody = None;
         if result.is_ok() {
             if let Some(index) = self.retired_drains.iter().position(|entry| {
@@ -3839,6 +4037,13 @@ impl SessionCore {
         opened: OpenedBridge,
         now: Mono,
     ) -> Vec<Effect> {
+        self.custody_transfers.push(opened.epoch);
+        // 落盤期間才加入 release 的路徑同樣把保管 token 原子轉成自身 StopOp，不能留待 ack tombstone 結算。
+        if let Some(crate::custody::CustodyBarrier::Pending(rec)) = &self.custody_observation {
+            if matches!(rec.phase, crate::custody::CustodyPhaseSnapshot::Bridged { epoch, .. } if epoch == opened.epoch) {
+                self.retired_drains.retain(|entry| entry.custody_token != Some(rec.token));
+            }
+        }
         let id = pending.id;
         let kind = pending.kind.clone();
         let waiters = pending.waiters;
@@ -3883,6 +4088,7 @@ impl SessionCore {
             f.owner_gen = self.generations.owner_gen;
             f.fsm_gen = self.generations.fsm_gen;
         });
+        self.publish_retired_drains();
         if !already_released {
             self.set_state(SessionState::Recovering, now);
         }
@@ -3947,6 +4153,11 @@ impl SessionCore {
     }
 
     fn finish_pending_open_stop(&mut self, pending: PendingOpenStop, now: Mono) -> Vec<Effect> {
+        let (blocked, effects) = self.await_observed_custody(now);
+        if blocked {
+            self.pending_open_stop = Some(pending);
+            return effects;
+        }
         self.drain_stalled = false;
         if pending.kind == StopKind::Release {
             // Python `_finish_attach_op` 的 release 分支：作業收尾一併清 `drain_timeout_epoch`
@@ -4067,7 +4278,7 @@ impl SessionCore {
                 effects.push(Effect::Warn(warn));
             }
             effects.extend(self.fail_bind_waits(now));
-            if self.retired_drains[index].by_id_claim {
+            if self.retired_drains[index].by_id_claim && !self.retired_drains[index].safety_observed {
                 // S2-PAR-wp510r 第 15 項：release 認領的紀錄或作業關閉失敗（D1 iii）：項目保留為失敗，等待中的 release 依
                 // T-1 於首次期限回 DRAIN_STALLED；期限已過者結束停止待決（`abandon_failed_claim_release`）。
                 self.abandon_failed_claim_release();
@@ -4088,7 +4299,7 @@ impl SessionCore {
     /// 收斂規則（設計 §3.1.3）：retired drain（含保管紀錄）、開埠在途、落盤中的 attach 都已收斂時，完成停止待決或重新走
     /// bind；單次在途的重開也在此（DR-8 b）。
     fn try_converge(&mut self, now: Mono) -> Vec<Effect> {
-        let mut effects = Vec::new();
+        let (_, mut effects) = self.await_observed_custody(now);
         if !self.retired_drains.is_empty() {
             return effects;
         }
@@ -4155,6 +4366,7 @@ impl SessionCore {
                     custody_token: Some(token),
                     release_deadline_rt,
                     by_id_claim: false,
+                    safety_observed: false,
                 });
                 if receipt == RetiredReceipt::Failed {
                     self.deps.unconfirmed_closes.insert(&self.profile.device_by_id);
@@ -4180,6 +4392,12 @@ impl SessionCore {
 
     /// `ControlEvent::CustodyTerminal`：保管紀錄的關閉終態（關閉者已告警並登記未確認關閉）。只結算目前在等的那一筆。
     fn custody_terminal(&mut self, token: u64, closed: bool, _error: Option<String>, now: Mono) -> Vec<Effect> {
+        if matches!(&self.custody_observation,
+            Some(crate::custody::CustodyBarrier::Pending(rec)) if rec.token == token
+        ) {
+            // 通知只是提示；帳本仍未終態時不能以通知推定關閉成功。
+            return self.arm_custody_poll(now);
+        }
         let Some(index) = self
             .retired_drains
             .iter()
@@ -4218,7 +4436,7 @@ impl SessionCore {
                 self.session_recovering_reply(now)
             };
             effects.push(Effect::DiscardHandoffWorker { token });
-            effects.push(Effect::Reply(pending.reply, Ok(response)));
+            effects.extend(self.attach_reply(pending.reply, Ok(response), now));
         }
         effects
     }
@@ -4530,7 +4748,7 @@ impl SessionCore {
     }
 
     /// `ControlEvent::RetireResult`（設計 §3.1.4 W1 第 5 步 4）：退休成功或落盤失敗（不回滾）後進入 retired 終態並結束；
-    /// 驗證失敗則不退休，handle 已轉 Closing 時等它的 `CustodyTerminal` 才回覆 A。
+    /// 驗證失敗則不退休，帳本未到終態時等它的 `CustodyTerminal` 才回覆 A。
     fn retire_result(&mut self, token: u64, outcome: crate::mailbox::RetireOutcome, now: Mono) -> Vec<Effect> {
         if !self.placeholder_attach(token, PlaceholderPhase::Retiring) {
             return Vec::new();
@@ -4565,6 +4783,7 @@ impl SessionCore {
                         custody_token: Some(token),
                         release_deadline_rt: self.current_release_deadline_rt(),
                         by_id_claim: false,
+                        safety_observed: false,
                     });
                     self.publish_retired_drains();
                     if let Some(ph) = pending.placeholder.as_mut() {
@@ -4756,14 +4975,15 @@ impl SessionCore {
         }
     }
 
-    /// 把 retired drain 是否未收斂發布到 fence（manager 的 shutdown 不經 actor mailbox 讀取，見
+    /// 把未收斂義務發布到 fence（manager 的 shutdown 不經 actor mailbox 讀取，見
     /// `FenceState::retired_drains_pending`）。
     fn publish_retired_drains(&self) {
-        let pending = !self.retired_drains.is_empty();
+        let pending = !self.retired_drains.is_empty() || self.stop.is_some() || self.pending_open_stop.is_some();
         self.deps.fence.with(|f| f.retired_drains_pending = pending);
     }
 
     fn retire_opened_bridge(&mut self, opened: OpenedBridge) -> Vec<Effect> {
+        self.custody_transfers.push(opened.epoch);
         self.next_stop_id = self.next_stop_id.saturating_add(1);
         let stop_id = StopId(self.next_stop_id);
         let epoch = opened.epoch;
@@ -4785,6 +5005,7 @@ impl SessionCore {
             custody_token: None,
             release_deadline_rt: None,
             by_id_claim: false,
+            safety_observed: false,
         });
         self.publish_retired_drains();
         let mut fx = vec![
@@ -4859,6 +5080,7 @@ impl SessionCore {
     }
 
     fn adopt_opened_bridge(&mut self, opened: OpenedBridge, now: Mono) -> Vec<Effect> {
+        self.custody_transfers.push(opened.epoch);
         let OpenedBridge {
             epoch,
             worker,
@@ -5977,7 +6199,7 @@ impl SessionCore {
             || !self
                 .retired_drains
                 .iter()
-                .all(|entry| entry.by_id_claim && entry.receipt == RetiredReceipt::Failed)
+                .all(|entry| entry.by_id_claim && !entry.safety_observed && entry.receipt == RetiredReceipt::Failed)
             || self.open_real_path.is_some()
             || self.external_attach.is_some()
             || self.pending_attach.is_some()
@@ -6143,6 +6365,9 @@ impl SessionCore {
         }));
 
         self.recovering = false;
+        if matches!(stop.kind, StopKind::Release | StopKind::Shutdown) {
+            effects.extend(self.await_observed_custody(now).1);
+        }
         if matches!(stop.kind, StopKind::Release | StopKind::Shutdown) && !self.retired_drains.is_empty() {
             // 本 bridge 已確認關閉，但先前退休的 bridge 仍持有 handle（收斂規則）：release／shutdown 改等其回條
             // （`retired_drain_receipt`），沿用同一 stop id 與已排定的期限（`mark_drain_timeout`）。retired drain 已失敗時
@@ -6186,9 +6411,7 @@ impl SessionCore {
                                 .collect(),
                         ));
                     } else {
-                        effects.extend(stop.waiters.into_iter().map(|reply| {
-                            Effect::Reply(reply, Ok(self.release_success_reply(now, true)))
-                        }));
+                        for reply in stop.waiters { effects.extend(self.release_reply(reply, true, now)); }
                     }
                 } else {
                     self.finish_release(now);

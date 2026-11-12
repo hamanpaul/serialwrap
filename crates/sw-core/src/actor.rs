@@ -353,6 +353,8 @@ impl ActorHandle {
 
 /// 效果執行器（executor 在 actor thread 外的 IO worker 側實作；測試以替身實作）。
 pub trait EffectExecutor: Send {
+    /// 單次事件的帳本輸入；無帳本的 sans-IO executor 以空帳本回覆。
+    fn pending_custody(&self) -> Option<crate::custody::CustodyBarrier> { None }
     fn execute(&mut self, e: Effect, tx: &Sender<ControlEvent>, safety: &Sender<ControlEvent>);
     /// S2-PAR-wp510r R1: 效果立即回饋佇列（executor 推回的事件先於下一次 mailbox 收取被處理）。
     ///
@@ -733,7 +735,36 @@ fn dispatch(
         MailboxItem::Data(_) => (None, "Data"),
     };
 
-    let result = catch_unwind(AssertUnwindSafe(|| core.on_event(item, now)));
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        // 只在可能開埠、交還或結算資源的事件讀帳本；RX／Tick 不可因查詢 manager 鎖而堵住唯讀 RPC。
+        let observes_custody = match &item {
+            MailboxItem::Control(ControlEvent::Request { req: SessionRequest::GetState | SessionRequest::Activity, .. }) => false,
+            #[cfg(feature = "test-fakes")]
+            MailboxItem::Control(ControlEvent::Request { req: SessionRequest::RetiredDrainsForTest, .. }) => false,
+            MailboxItem::Control(ControlEvent::Request { .. }
+                | ControlEvent::DeviceAttached { .. } | ControlEvent::DeviceDetached { .. } | ControlEvent::DeviceMissing
+                | ControlEvent::BridgeOpened { .. } | ControlEvent::UartIoError { .. }
+                | ControlEvent::WorkerStopped(_) | ControlEvent::WorkerDrainTimeout { .. }
+                | ControlEvent::StateCommitted { .. } | ControlEvent::Shutdown { .. }
+                | ControlEvent::CustodyClaimed { .. } | ControlEvent::ReleaseClaimed { .. }
+                | ControlEvent::CustodyTerminal { .. } | ControlEvent::CustodyOffer { .. }
+                | ControlEvent::PlaceholderOpened { .. } | ControlEvent::HandoffWorkerPrepared { .. }
+                | ControlEvent::RetireResult { .. }) => true,
+            MailboxItem::Control(ControlEvent::Timer(TimerEvent::CustodyPoll | TimerEvent::DrainTimeout { .. } | TimerEvent::BindWaitTimeout { .. })) => true,
+            MailboxItem::Data(DataEvent::UartRxChunk { .. } | DataEvent::ConsoleInputBytes { .. } | DataEvent::ConsoleDisconnected { .. })
+                | MailboxItem::Control(ControlEvent::EvictCapture { .. } | ControlEvent::ConsoleCountChanged { .. }
+                    | ControlEvent::UartTxCompleted { .. } | ControlEvent::DrainDataBarrier { .. }
+                    | ControlEvent::OpFinished { .. } | ControlEvent::LoginFinished { .. } | ControlEvent::Tick
+                    | ControlEvent::ConsoleConnected { .. } | ControlEvent::ConsoleScan { .. } | ControlEvent::HumanTxCompleted { .. }
+                    | ControlEvent::FlashSyncProbeStart { .. } | ControlEvent::FlashProbeReleased { .. }
+                    | ControlEvent::FlashSyncMatched { .. } | ControlEvent::FlashHolderGone { .. }
+                    | ControlEvent::Timer(TimerEvent::BootQuietExpired { .. } | TimerEvent::LeaseExpiry { .. } | TimerEvent::ForceRecoverPoll { .. })) => false,
+            #[cfg(feature = "test-fakes")]
+            MailboxItem::Control(ControlEvent::ArmPanic { .. }) => false,
+        };
+        let observation = observes_custody.then(|| exec.pending_custody()).flatten();
+        core.on_event_with_custody(item, now, observation)
+    }));
     match result {
         Ok(effects) => {
             *panic_type = None;

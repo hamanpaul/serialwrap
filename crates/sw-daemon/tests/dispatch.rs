@@ -10295,6 +10295,172 @@ fn wp510r_i23_rpc_offline_invalid_retire_terminal_full_poll_completes_attach() {
     assert!(r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_none(), "正式 actor 已確認接手");
 }
 
+/// 第 24 項 High：watcher 先拿走 Raw handle 並停在 close，退休失敗與已入列的 release 都必須等配對回條。
+/// Python release 等 attach 作業 done，關閉失敗不設 done（origin/main:sw_core/session_manager.py:3188-3209、4320-4364）。
+fn wp510r_i24_watcher_closing(late: bool, failed: bool) {
+    let r = Arc::new(wp510_b_placeholder_rig());
+    let dev = r.device(WP510_REAL_G).clone();
+    let state_before = r.fs.bytes(support::STATE_PATH);
+    let original: Vec<(String, DeviceInfo)> = r.mgr.list_devices().into_iter().map(|row| {
+        let by_id = s(&row, "by_id").to_string();
+        let real_path = s(&row, "real_path").to_string();
+        (by_id.clone(), DeviceInfo { by_id, real_path })
+    }).collect();
+    let changed: Vec<_> = original.into_iter()
+        .filter(|(by_id, _)| by_id != WP510_PLACEHOLDER_BY_ID).collect();
+    let (retire_tx, retire_rx) = crossbeam_channel::bounded(1);
+    let (retire_go, retire_resume) = crossbeam_channel::bounded(1);
+    r.mgr.set_placeholder_retire_pre_commit_hook_for_test(WP510_PLACEHOLDER_SID, Box::new(move || {
+        retire_tx.send(()).unwrap();
+        retire_resume.recv_timeout(Duration::from_secs(15)).unwrap();
+    }));
+    let attach_rig = Arc::clone(&r);
+    let (attach_tx, attach_rx) = crossbeam_channel::bounded(1);
+    let attach = std::thread::spawn(move || {
+        attach_tx.send(attach_rig.call("device.attach", &format!(
+            r#"{{"selector":"{WP510_PLACEHOLDER_ALIAS}"}}"#,
+        ))).unwrap();
+    });
+    retire_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let record = r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).unwrap();
+    assert!(matches!(record.phase, CustodyPhaseSnapshot::Held));
+
+    // release 先通過 manager pump 並排入 safety lane，才讓 watcher 把 handle 接走。
+    let safety = r.mgr.safety_receiver_for_test(WP510_PLACEHOLDER_SID).unwrap();
+    let release_rig = Arc::clone(&r);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let release = std::thread::spawn(move || {
+        let started = Instant::now();
+        let result = release_rig.call("device.release", r#"{"selector":"COM3"}"#);
+        release_tx.send((result, started.elapsed())).unwrap();
+    });
+    wait_until("release 已入 actor safety lane", || !safety.is_empty());
+    if failed {
+        dev.fail_close(PalError::plain(PalErrorKind::Io, "i24 close failed"));
+    }
+    dev.pause_next_close();
+    let watcher_rig = Arc::clone(&r);
+    let watcher = std::thread::spawn(move || watcher_rig.mgr.update_devices(&changed));
+    assert!(dev.wait_paused(Duration::from_secs(5)), "watcher 已拿走 handle、尚未有回條");
+    let closing = r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).unwrap();
+    assert_eq!(closing.token, record.token);
+    assert!(matches!(closing.phase, CustodyPhaseSnapshot::Closing { .. }));
+    assert_eq!(closing.owner, record.owner, "熱插關閉仍屬原 actor，不得因 owner 略過等待");
+    retire_go.send(()).unwrap();
+    // 紅燈也先完整放行／join，避免遺留 throwaway 工作者。
+    let early_release = release_rx.recv_timeout(Duration::from_millis(200)).ok();
+    let early_attach = attach_rx.try_recv().ok();
+    let timed = if late || failed {
+        early_release.clone().or_else(|| release_rx.recv_timeout(Duration::from_secs(5)).ok())
+    } else { None };
+    dev.release_pause();
+    watcher.join().unwrap();
+    let response = early_attach.clone().or_else(|| attach_rx.recv_timeout(Duration::from_secs(5)).ok()).unwrap();
+    attach.join().unwrap();
+    let (released, elapsed) = timed.or(early_release.clone())
+        .or_else(|| release_rx.recv_timeout(Duration::from_secs(5)).ok()).unwrap();
+    release.join().unwrap();
+    assert!(early_release.is_none(), "回條前 release 不得成功：{:?}", early_release.map(|(r, _)| j(&r)));
+    assert!(early_attach.is_none(), "退休失敗也須等帳本終態");
+    assert_eq!(j(&response), j(&sw_proto::pydict! {
+        "ok" => false, "error_code" => "DEVICE_NOT_PRESENT", "selector" => WP510_PLACEHOLDER_ALIAS,
+        "device_by_id" => WP510_PLACEHOLDER_BY_ID, "version" => r.version.clone(),
+    }));
+    if late || failed {
+        assert_eq!(s(&released, "error_code"), "DRAIN_STALLED");
+        assert!(elapsed >= Duration::from_millis(2500) && elapsed < Duration::from_secs(5), "首次期限：{elapsed:?}");
+        assert_eq!(released.get("drain_stalled"), Some(&PyValue::Bool(true)));
+    } else {
+        assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)));
+        assert_eq!(released.get("already_released"), Some(&PyValue::Bool(true)));
+    }
+    assert_eq!(dev.open_count(), 1);
+    assert_eq!(dev.close_count(), 1);
+    assert_eq!(dev.tx_len(), 0);
+    assert_eq!(r.mgr.prepared_len_for_test(), 0);
+    if failed {
+        assert!(r.mgr.unconfirmed_close_for_test(WP510_PLACEHOLDER_BY_ID));
+        let started = Instant::now();
+        assert_eq!(s(&r.call("device.release", r#"{"selector":"COM3"}"#), "error_code"), "DRAIN_STALLED");
+        assert!(started.elapsed() < Duration::from_secs(1), "後續 release 沿用已過的首次期限");
+        assert_eq!(r.fs.bytes(support::STATE_PATH), state_before, "失敗不落盤");
+    } else {
+        wait_until("成功回條收斂所有等待", || r.mgr.custody_awaits_for_test(WP510_PLACEHOLDER_SID).is_empty());
+        assert!(r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_none());
+        let again = r.call("device.release", r#"{"selector":"COM3"}"#);
+        assert_eq!(again.get("ok"), Some(&PyValue::Bool(true)));
+        assert_eq!(again.get("already_released"), Some(&PyValue::Bool(true)));
+    }
+}
+
+#[test]
+fn wp510r_i24_rpc_watcher_closing_retire_release_waits_success() {
+    wp510r_i24_watcher_closing(false, false);
+}
+
+#[test]
+fn wp510r_i24_rpc_watcher_closing_retire_release_times_out_then_converges() {
+    wp510r_i24_watcher_closing(true, false);
+}
+
+#[test]
+fn wp510r_i24_rpc_watcher_closing_retire_release_failure_keeps_first_deadline() {
+    wp510r_i24_watcher_closing(false, true);
+}
+
+/// 安全網接到一般 OpenBridge 的 token 時，也必須把義務原子換成真實 epoch 回條，不能等待 ack 的假關閉。
+#[test]
+fn wp510r_i24_rpc_plain_bridged_release_waits_receipt() {
+    let r = Arc::new(ServiceRig::ready_shell());
+    let dev = r.device(REAL_A).clone();
+    assert_eq!(r.call("device.release", r#"{"selector":"COM0"}"#).get("ok"), Some(&PyValue::Bool(true)));
+    let sid = r.mgr.resolve("COM0").unwrap();
+    let (entered, opened) = crossbeam_channel::bounded(1);
+    let (go, resume) = crossbeam_channel::bounded(1);
+    r.mgr.set_open_job_post_commit_hook_for_test(&sid, Box::new(move || {
+        entered.send(()).unwrap();
+        resume.recv_timeout(Duration::from_secs(10)).unwrap();
+    }));
+    let attach_rig = Arc::clone(&r);
+    let attach = std::thread::spawn(move || attach_rig.call("device.attach", r#"{"selector":"COM0"}"#));
+    opened.recv_timeout(Duration::from_secs(5)).unwrap();
+    let record = r.mgr.custody_for_test(BY_ID_A).unwrap();
+    let epoch = match record.phase {
+        CustodyPhaseSnapshot::Bridged { epoch, worker_in_ledger: true } => epoch,
+        other => panic!("帳本應持有真實 worker：{other:?}"),
+    };
+    let attempts = dev.open_attempts();
+    let tx_before = dev.tx_len();
+    let release_rig = Arc::clone(&r);
+    let (released, release_rx) = crossbeam_channel::bounded(1);
+    let release = std::thread::spawn(move || released.send(release_rig.call("device.release", r#"{"selector":"COM0"}"#)).unwrap());
+    wait_until("release 已認領一般 Bridged token", || r.mgr.custody_awaits_for_test(&sid).contains(&record.token));
+    dev.pause_next_close();
+    go.send(()).unwrap();
+    assert!(dev.wait_paused(Duration::from_secs(5)));
+    assert!(release_rx.recv_timeout(Duration::from_millis(100)).is_err(), "真實關閉回條前不得回覆");
+    let pending_epochs = r.mgr.retired_drains_for_test(&sid);
+    let pending_tokens = r.mgr.custody_awaits_for_test(&sid);
+    dev.release_pause();
+    let result = release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    release.join().unwrap();
+    // 紅燈也讓補收計時器收完舊 token，避免原 attach caller 留在 join。
+    r.clock.advance(Duration::from_millis(600));
+    let attached = attach.join().unwrap();
+    assert_eq!(pending_epochs, vec![epoch], "一般開埠也以配對 epoch 承接責任");
+    assert!(pending_tokens.is_empty(), "移交排空後不再等 ack tombstone 的假關閉");
+    assert_eq!(s(&attached, "error_code"), "SESSION_RECOVERING");
+    let session = r.session("COM0").unwrap();
+    assert_eq!(j(&result), j(&sw_proto::pydict! { "ok" => true, "already_released" => true, "session" => session.clone(), "version" => r.version.clone() }));
+    assert_eq!(s(&session, "state"), "RELEASED");
+    assert_eq!(session.get("drain_stalled"), Some(&PyValue::Bool(false)));
+    assert_eq!(session.get("drain_timeout_epoch"), Some(&PyValue::Null));
+    assert!(r.mgr.custody_for_test(BY_ID_A).is_none());
+    assert_eq!(dev.open_attempts(), attempts);
+    assert_eq!(dev.tx_len(), tx_before, "release 取消後零新增 TX");
+    assert!(!dev.is_open());
+}
+
 /// 第 21 項 Medium 2：一般 OpenBridge 已提交 Bridged，bind 必須取消並等排空；期限前成功才改綁。
 /// Python bind 取消在途並等 done 後重試（origin/main:sw_core/session_manager.py:3676-3727、3757-3813）。
 fn wp510r_i21_rpc_bind_bridged(timeout: bool) {

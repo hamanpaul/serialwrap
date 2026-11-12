@@ -34,6 +34,86 @@ use sw_proto::pyjson::PyValue;
 
 static SPAWN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// 帳本查詢若正在等 manager 鎖，普通 Tick 也不能把後面的唯讀 RPC 一起堵住。
+#[test]
+fn wp510r_i24_actor_tick_and_get_state_do_not_wait_for_custody_query() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    struct QueryExec {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        entered: crossbeam_channel::Sender<()>,
+        resume: crossbeam_channel::Receiver<()>,
+    }
+    impl EffectExecutor for QueryExec {
+        fn pending_custody(&self) -> Option<CustodyBarrier> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.entered.send(()).unwrap();
+                self.resume.recv_timeout(Duration::from_secs(5)).expect("帳本查詢已放行");
+            }
+            None
+        }
+        fn execute(&mut self, effect: sw_core::session_core::Effect, _: &crossbeam_channel::Sender<ControlEvent>, _: &crossbeam_channel::Sender<ControlEvent>) {
+            if let sw_core::session_core::Effect::Reply(reply, result) = effect { let _ = reply.send(result); }
+        }
+    }
+    let h = CoreHarness::new(SHELL_PROFILE);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (entered, observed) = bounded(1);
+    let (go, resume) = bounded(1);
+    let actor = spawn_actor(h.core, Mailbox::new(32, 32), Box::new(QueryExec { calls: calls.clone(), entered, resume }), h.clock.clone());
+    actor.control.send(ControlEvent::Tick).unwrap();
+    let (reply, response) = bounded(1);
+    actor.control.send(ControlEvent::Request { req: sw_core::session_core::SessionRequest::GetState, reply }).unwrap();
+    let mut result = None;
+    let queried = crossbeam_channel::select! {
+        recv(observed) -> _ => true,
+        recv(response) -> value => { result = Some(value.map_err(|e| e.to_string())); false },
+        default(Duration::from_secs(3)) => true,
+    };
+    // 紅燈也先放行查詢並收完 actor；Shutdown 仍必須使用真正的帳本查詢。
+    go.send(()).unwrap();
+    let result = result.unwrap_or_else(|| response.recv_timeout(Duration::from_secs(3)).map_err(|e| e.to_string()));
+    let (stop, stopped) = bounded(1);
+    actor.control.send(ControlEvent::Shutdown { reply: stop }).unwrap();
+    stopped.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+    actor.join.join().unwrap();
+    assert!(!queried, "Tick／GetState 不得等待保管帳本，否則會堵住唯讀 RPC");
+    assert!(result.unwrap().is_ok());
+    assert!(calls.load(Ordering::SeqCst) > 0, "真正的生命週期收尾仍必須查帳本");
+}
+
+#[test]
+fn wp510r_i24_query_blocks_reopen_until_terminal_for_every_phase() {
+    let actor = ActorId::for_test(24);
+    for phase in [
+        CustodyPhase::Opening { taker: CustodyTaker::OpenJob { actor } },
+        CustodyPhase::Held { parts: None },
+        CustodyPhase::Taken { taker: CustodyTaker::Retire { actor } },
+        CustodyPhase::Bridged { epoch: 7, worker: None },
+        CustodyPhase::BridgeDraining { epoch: 7, stop_id: StopId(8) },
+        CustodyPhase::Closing { job: "watcher".into() },
+    ] {
+        let mut ledger = CustodyLedger::default();
+        let token = ledger.register("B", "/fake/i24", CustodyOwner::Session { actor }, CustodyTaker::OpenJob { actor }).unwrap();
+        ledger.custody.get_mut("B").unwrap().phase = phase;
+        let snapshot = ledger.get_custody("B").unwrap().snapshot();
+        assert_eq!(ledger.pending_for("B"), Some(CustodyBarrier::Pending(snapshot)));
+        assert_eq!(ledger.register("B", "/fake/i24", CustodyOwner::Parked, CustodyTaker::Worker("new".into())), Err(CustodyRegisterError::CustodyBusy { token }));
+        ledger.settle_close(token + 1, Terminal { handle: TerminalHandle::Closed, evidence: TerminalEvidence::Complete });
+        assert!(matches!(ledger.pending_for("B"), Some(CustodyBarrier::Pending(_))), "別的回條不可解除");
+        ledger.settle_close(token, Terminal { handle: TerminalHandle::Closed, evidence: TerminalEvidence::Complete });
+        assert_eq!(ledger.pending_for("B"), None);
+        assert!(ledger.register("B", "/fake/i24", CustodyOwner::Parked, CustodyTaker::Worker("new".into())).is_ok());
+    }
+    let mut ledger = CustodyLedger::default();
+    let token = ledger.register("B", "/fake/i24", CustodyOwner::Session { actor }, CustodyTaker::OpenJob { actor }).unwrap();
+    ledger.settle_close(token, Terminal { handle: TerminalHandle::Failed { error: "unknown".into() }, evidence: TerminalEvidence::Complete });
+    assert_eq!(ledger.pending_for("B"), Some(CustodyBarrier::Failed { token: Some(token), release_deadline: None }));
+    assert_eq!(ledger.register("B", "/fake/i24", CustodyOwner::Parked, CustodyTaker::Worker("new".into())), Err(CustodyRegisterError::CloseBlocked));
+    ledger.unconfirmed.insert("C");
+    assert_eq!(ledger.pending_for("C"), Some(CustodyBarrier::Failed { token: None, release_deadline: None }));
+    assert!(ledger.is_open_blocked("C"), "未知終態也永久阻擋");
+}
+
 #[derive(Clone)]
 struct FakeInstantClock {
     now: Arc<Mutex<Instant>>,

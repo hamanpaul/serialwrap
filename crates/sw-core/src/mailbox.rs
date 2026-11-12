@@ -186,7 +186,7 @@ pub enum RetireOutcome {
     /// 鎖內已退休，存檔失敗：不回滾（`:3633`）；handle 依 D2 存回 `Held{Parked}`（或有取消時關閉），worker 丟棄。
     PersistFailed(PyErr),
     /// 鎖內驗證失敗（stopping、凍結、Entry 已非本 actor、裝置路徑改變、紀錄已取消），未退休。`device` 為裝置改變（Python 判
-    /// 「device」，`:3573-3577`）；`closing` 為 handle 已轉 Closing 交關閉工作者（之後送 `CustodyTerminal`）。
+    /// 「device」，`:3573-3577`）；`closing` 表示帳本仍有未終態紀錄；即使 handle 已由 watcher 取走，也必須等待與補收終態。
     Invalid { device: bool, closing: bool },
 }
 

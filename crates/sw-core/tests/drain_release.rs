@@ -22,6 +22,177 @@ fn release() -> SessionRequest {
     }
 }
 
+fn wp510r_i24_barrier(phase: sw_core::custody::CustodyPhaseSnapshot) -> sw_core::custody::CustodyBarrier {
+    sw_core::custody::CustodyBarrier::Pending(sw_core::custody::CustodySnapshot {
+        token: 424,
+        real_path: REAL_PATH.into(),
+        owner: sw_core::custody::CustodyOwner::Session { actor: sw_core::custody::ActorId::for_test(24) },
+        phase,
+        cancel: None,
+        release_deadline: None,
+        watchers: Vec::new(),
+    })
+}
+
+fn wp510r_i24_closing() -> sw_core::custody::CustodyBarrier {
+    wp510r_i24_barrier(sw_core::custody::CustodyPhaseSnapshot::Closing { job: "watcher".into() })
+}
+
+fn wp510r_i24_terminal(h: &mut CoreHarness) {
+    h.custody_observation = None;
+    h.feed(ControlEvent::CustodyTerminal { token: 424, closed: true, error: None });
+}
+
+/// 安全網不得因帳本 owner 相同、尚無本地 waits、或 phase 不是 Closing 而放行成功。
+#[test]
+fn wp510r_i24_safety_release_all_nonterminal_phases() {
+    use sw_core::custody::{ActorId, CustodyPhaseSnapshot as Phase, CustodyTaker};
+    let phases = vec![
+        Phase::Opening { taker: CustodyTaker::OpenJob { actor: ActorId::for_test(24) } },
+        Phase::Held,
+        Phase::Taken { taker: CustodyTaker::OpenJob { actor: ActorId::for_test(24) } },
+        Phase::Bridged { epoch: 77, worker_in_ledger: true },
+        Phase::Bridged { epoch: 77, worker_in_ledger: false },
+        Phase::BridgeDraining { epoch: 77, stop_id: StopId(9) },
+        Phase::Closing { job: "watcher".into() },
+    ];
+    for released in [false, true] {
+        for phase in &phases {
+            let mut h = CoreHarness::new(SHELL_PROFILE);
+            if released { h.core.init_released(Some("cli".into()), Some("old".into()), PyValue::Null); }
+            h.custody_observation = Some(wp510r_i24_barrier(phase.clone()));
+            let (rx, _) = h.rpc_deferred(release());
+            assert!(rx.try_recv().is_err(), "尚未終態不得成功：released={released}, phase={phase:?}");
+            assert!(h.state_store.last_released().is_empty(), "未關閉前不落盤");
+            let poll = h.advance(Duration::from_millis(600));
+            assert!(poll.iter().any(|e| matches!(e, Effect::PollCustody { tokens } if tokens == &[424])), "補收必須查同一 token");
+            // 假的成功提示不能越過仍未終態的帳本。
+            h.feed(ControlEvent::CustodyTerminal { token: 424, closed: true, error: None });
+            assert!(rx.try_recv().is_err(), "通知不是關閉證據：{phase:?}");
+            wp510r_i24_terminal(&mut h);
+            assert_eq!(rx.try_recv().unwrap().unwrap().get("ok"), Some(&PyValue::Bool(true)));
+        }
+    }
+}
+
+#[test]
+fn wp510r_i24_safety_release_own_bridge_receipt_is_not_ledger_terminal() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let (rx, _) = h.rpc_deferred(release());
+    let (epoch, stop) = h.pending_stop();
+    h.custody_observation = Some(wp510r_i24_closing());
+    h.receipt(epoch, stop).handle_closed(true).feed();
+    assert!(rx.try_recv().is_err(), "自身 bridge 回條不能代替帳本回條");
+    assert_eq!(h.public()["state"], PyValue::from("RECOVERING"));
+    assert!(h.state_store.last_released().is_empty());
+    wp510r_i24_terminal(&mut h);
+    assert_eq!(rx.try_recv().unwrap().unwrap().get("ok"), Some(&PyValue::Bool(true)));
+}
+
+#[test]
+fn wp510r_i24_safety_release_final_persist_reply_rechecks_ledger() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.defer_state_commits();
+    let (rx, _) = h.rpc_deferred(release());
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).handle_closed(true).feed();
+    h.custody_observation = Some(wp510r_i24_closing());
+    let commit = h.pending_state_commit_ids()[0];
+    h.complete_state_commit(commit);
+    assert!(rx.try_recv().is_err(), "持久化成功也要重新檢查帳本");
+    wp510r_i24_terminal(&mut h);
+    for commit in h.pending_state_commit_ids() { h.complete_state_commit(commit); }
+    let result = rx.try_recv().unwrap().unwrap();
+    assert_eq!(result.get("ok"), Some(&PyValue::Bool(true)));
+    assert!(result.get("already_released").is_none(), "保留原本第一次 release 的回覆形狀");
+}
+
+#[test]
+fn wp510r_i24_safety_attach_open_failure_waits_ledger_terminal() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.core.init_released(Some("cli".into()), Some("old".into()), PyValue::Null);
+    h.attach_device();
+    let (rx, _) = h.rpc_deferred(SessionRequest::DeviceAttach { force: false });
+    h.custody_observation = Some(wp510r_i24_closing());
+    h.feed(ControlEvent::BridgeOpened { epoch_hint: 0, result: Err(OpenFailure::NotFound) });
+    assert!(rx.try_recv().is_err(), "開埠失敗不能推定其他關閉已完成");
+    wp510r_i24_terminal(&mut h);
+    session_error(&rx.try_recv().unwrap().unwrap(), "DEVICE_NOT_PRESENT");
+}
+
+#[test]
+fn wp510r_i24_safety_attach_already_attached_success_waits_ledger_terminal() {
+    for bridged in [false, true] {
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.to_ready();
+        h.custody_observation = Some(if bridged {
+            wp510r_i24_barrier(sw_core::custody::CustodyPhaseSnapshot::Bridged { epoch: h.epoch(), worker_in_ledger: true })
+        } else { wp510r_i24_closing() });
+        let (rx, _) = h.rpc_deferred(SessionRequest::DeviceAttach { force: false });
+        assert!(rx.try_recv().is_err(), "現有 bridge／相同 epoch 不表示已確認接手或已關閉");
+        wp510r_i24_terminal(&mut h);
+        assert_eq!(rx.try_recv().unwrap().unwrap().get("ok"), Some(&PyValue::Bool(true)));
+    }
+}
+
+#[test]
+fn wp510r_i24_safety_unknown_terminal_never_releases_success() {
+    for token in [Some(424), None] {
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.core.init_released(Some("cli".into()), Some("old".into()), PyValue::Null);
+        h.custody_observation = Some(sw_core::custody::CustodyBarrier::Failed { token, release_deadline: None });
+        let (rx, _) = h.rpc_deferred(release());
+        assert!(rx.try_recv().is_err(), "T-1 仍等首次期限");
+        h.advance(Duration::from_secs(4));
+        session_error(&rx.try_recv().unwrap().unwrap(), "DRAIN_STALLED");
+        let (again, _) = h.rpc_deferred(release());
+        session_error(&again.try_recv().unwrap().unwrap(), "DRAIN_STALLED");
+        assert!(h.state_store.last_released().is_empty());
+    }
+}
+
+#[test]
+fn wp510r_i24_safety_failed_terminal_rejects_deferred_attach_success() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.custody_observation = Some(wp510r_i24_closing());
+    let (rx, _) = h.rpc_deferred(SessionRequest::DeviceAttach { force: false });
+    assert!(rx.try_recv().is_err());
+    h.custody_observation = Some(sw_core::custody::CustodyBarrier::Failed { token: Some(424), release_deadline: None });
+    h.feed(ControlEvent::CustodyTerminal { token: 424, closed: false, error: Some("unknown close".into()) });
+    session_error(&rx.try_recv().unwrap().unwrap(), "SESSION_RECOVERING");
+    assert!(h.unconfirmed.contains(DEVICE_BY_ID), "失敗終態永久保留");
+}
+
+#[test]
+fn wp510r_i24_safety_attach_commit_release_transfers_to_own_stop_receipt() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.core.init_released(Some("cli".into()), Some("old".into()), PyValue::Null);
+    h.attach_device();
+    h.defer_state_commits();
+    let (attached, _) = h.rpc_deferred(SessionRequest::DeviceAttach { force: false });
+    h.bridge_ok();
+    let commit = h.pending_state_commit_ids()[0];
+    // bridge_ok 已配置 epoch，但 commit 完成前尚未 AdoptBridge。
+    let epoch = h.epochs.next() - 1;
+    h.custody_observation = Some(wp510r_i24_barrier(sw_core::custody::CustodyPhaseSnapshot::Bridged { epoch, worker_in_ledger: true }));
+    let (released, _) = h.rpc_deferred(release());
+    h.complete_state_commit(commit);
+    let (drain_epoch, stop) = h.pending_stop();
+    assert_eq!(drain_epoch, epoch);
+    assert!(h.fence.with(|f| f.retired_drains_pending), "RELEASED 上的自身 StopOp 也必須讓 manager shutdown 等待");
+    assert!(released.try_recv().is_err(), "commit 並非關閉回條");
+    // executor 已配對接手；真正的關閉義務現在屬於自身 StopOp。
+    h.custody_observation = None;
+    h.receipt(epoch, stop).handle_closed(true).feed();
+    for commit in h.pending_state_commit_ids() { h.complete_state_commit(commit); }
+    assert_eq!(released.try_recv().expect("配對自身回條即完成，不等 token 的假關閉").unwrap().get("ok"), Some(&PyValue::Bool(true)));
+    session_error(&attached.try_recv().unwrap().unwrap(), "SESSION_RECOVERING");
+    assert!(!h.fence.with(|f| f.retired_drains_pending), "配對回條收斂後才解除 shutdown 屏障");
+}
+
 fn session_error(response: &PyDict, code: &str) {
     assert_eq!(response.get("ok"), Some(&PyValue::Bool(false)));
     assert_eq!(response.get("error_code"), Some(&PyValue::from(code)));

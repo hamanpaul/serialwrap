@@ -154,6 +154,14 @@ pub struct CustodySnapshot {
     pub watchers: Vec<String>,
 }
 
+/// by-id 的安全屏障；Held 仍持有資源，失敗／未知終態則永久阻擋到重啟。
+/// 查詢結果只是單次事件的輸入；所有權與終態仍只保存在帳本。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustodyBarrier {
+    Pending(CustodySnapshot),
+    Failed { token: Option<u64>, release_deadline: Option<Instant> },
+}
+
 /// 關閉終態（handle 結果與 evidence 分開）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Terminal {
@@ -527,6 +535,20 @@ impl CustodyLedger {
         }
     }
 
+    /// 第 24 項：所有交還、attach 收尾與重開判定共用這個查詢，不以 parts 或 owner 推定安全。
+    pub fn pending_for(&self, by_id: &str) -> Option<CustodyBarrier> {
+        let rec = self.custody.get(by_id);
+        if self.unconfirmed.contains(by_id)
+            || rec.is_some_and(|rec| matches!(rec.phase, CustodyPhase::CloseFailed { .. }))
+        {
+            return Some(CustodyBarrier::Failed {
+                token: rec.map(|rec| rec.token),
+                release_deadline: rec.and_then(|rec| rec.release_deadline),
+            });
+        }
+        rec.map(|rec| CustodyBarrier::Pending(rec.snapshot()))
+    }
+
     /// C1 新 token 閘門。
     pub fn register(
         &mut self,
@@ -535,14 +557,10 @@ impl CustodyLedger {
         owner: CustodyOwner,
         taker: CustodyTaker,
     ) -> Result<u64, CustodyRegisterError> {
-        if self.unconfirmed.contains(by_id) {
-            return Err(CustodyRegisterError::CloseBlocked);
-        }
-        if let Some(existing) = self.custody.get(by_id) {
-            if matches!(existing.phase, CustodyPhase::CloseFailed { .. }) {
-                return Err(CustodyRegisterError::CloseBlocked);
-            }
-            return Err(CustodyRegisterError::CustodyBusy { token: existing.token });
+        match self.pending_for(by_id) {
+            Some(CustodyBarrier::Failed { .. }) => return Err(CustodyRegisterError::CloseBlocked),
+            Some(CustodyBarrier::Pending(rec)) => return Err(CustodyRegisterError::CustodyBusy { token: rec.token }),
+            None => {}
         }
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         let custody = Custody {
@@ -577,14 +595,10 @@ impl CustodyLedger {
         if self.tombstones.contains(&token) {
             return Err(CustodyRegisterError::Tombstoned);
         }
-        if self.unconfirmed.contains(by_id) {
-            return Err(CustodyRegisterError::CloseBlocked);
-        }
-        if let Some(existing) = self.custody.get(by_id) {
-            if matches!(existing.phase, CustodyPhase::CloseFailed { .. }) {
-                return Err(CustodyRegisterError::CloseBlocked);
-            }
-            return Err(CustodyRegisterError::CustodyBusy { token: existing.token });
+        match self.pending_for(by_id) {
+            Some(CustodyBarrier::Failed { .. }) => return Err(CustodyRegisterError::CloseBlocked),
+            Some(CustodyBarrier::Pending(rec)) => return Err(CustodyRegisterError::CustodyBusy { token: rec.token }),
+            None => {}
         }
         self.custody.insert(
             by_id.to_string(),
@@ -814,13 +828,11 @@ impl CustodyLedger {
 
     /// C1 by-id 閘門檢查。
     pub fn is_open_blocked(&self, by_id: &str) -> bool {
-        if self.unconfirmed.contains(by_id) {
-            return true;
-        }
-        if let Some(rec) = self.custody.get(by_id) {
-            rec.phase.is_in_flight() || matches!(rec.phase, CustodyPhase::CloseFailed { .. })
-        } else {
-            false
+        match self.pending_for(by_id) {
+            // Held 可由 C1′ 認領原 handle；這不是另開埠的授權，register 仍拒絕既有紀錄。
+            Some(CustodyBarrier::Pending(rec)) => !matches!(rec.phase, CustodyPhaseSnapshot::Held),
+            Some(CustodyBarrier::Failed { .. }) => true,
+            None => false,
         }
     }
 

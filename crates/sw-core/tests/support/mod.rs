@@ -153,6 +153,8 @@ pub struct CoreHarness {
     pub next_release_claims: Vec<sw_core::mailbox::ReleaseClaim>,
     /// 已收到的 `Effect::ClaimByIdForRelease`（by_id、候選首次期限），供斷言 release 的認領。
     pub release_claim_requests: Vec<(String, Instant)>,
+    /// 單次事件的帳本替身輸入；預設空帳本，與無 manager 的 executor 相同。
+    pub custody_observation: Option<sw_core::custody::CustodyBarrier>,
 }
 
 struct HarnessWorkers {
@@ -293,6 +295,7 @@ impl CoreHarness {
             p6: P6HarnessState::new(input_epoch_pub),
             next_release_claims: Vec::new(),
             release_claim_requests: Vec::new(),
+            custody_observation: None,
         }
     }
 
@@ -669,7 +672,7 @@ impl CoreHarness {
         }
         let mut pending = vec![item];
         while let Some(item) = pending.pop() {
-            let effects = self.core.on_event(item, self.clock.mono_ns()).0;
+            let effects = self.core.on_event_with_custody(item, self.clock.mono_ns(), self.custody_observation.clone()).0;
             for effect in effects {
                 // P6：記錄 console／human TX 效果；auto-complete 的結算排在本批之後投遞。
                 if let Some(ev) = self.record_p6(&effect) {

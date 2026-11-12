@@ -1446,7 +1446,7 @@ impl Shared {
     }
 
     /// S2-PAR-wp510r 第 15 項（設計 §3.1.4 release「`ClaimForStop{by_id, Release}`」、§3.1.6；擁有者 2026-11-11「wp510r
-    /// release 等待改為 actor 主導」）：release 的 actor 在自己的執行緒上、manager 鎖內處理 by_id 上**不屬本 session 擁有**
+    /// release 等待改為 actor 主導」）：release 的 actor 在自己的執行緒上、manager 鎖內處理 by_id 上（包括自身 owner）
     /// 的在途作業與帳本紀錄，回傳 actor 要等待終態的 token 與首次期限，以及要交關閉者的 handle：
     /// - 未消費的 parked（`AttachOp::parked`、`Held{Parked}`）：移出在途表，紀錄轉 Closing（owner Reaper、cancel Release）並
     ///   登記 watcher，handle 交關閉者（D4；Python 自 `_preopened_ports` 取出後關閉，`origin/main:sw_core/session_manager.py:3108-3111`）。
@@ -1456,7 +1456,7 @@ impl Shared {
     /// - 別的關閉者正在關閉（Closing、回收者排空中）：只加入 watcher（DR-2 b）。
     ///
     /// 首次期限記在被等待的對象上（紀錄與作業的 `release_deadline`，首次 release 寫入、之後的 release 沿用，`:3117-3124`）。
-    /// 本 session 擁有的紀錄由 actor 自己的 `ClaimForStop{token}` 收尾，不在此處理（C6）。
+    /// 自身紀錄同樣回報等待；已知 token 的 `ClaimForStop` 與 by-id 認領可重複到達，依帳本冪等收尾。
     fn claim_by_id_for_release_locked(
         inner: &mut Inner,
         sid: &str,
@@ -1467,6 +1467,7 @@ impl Shared {
         if by_id.is_empty() {
             return (Vec::new(), None);
         }
+        let barrier = inner.custody.pending_for(by_id);
         fn watch_record(rec: &mut crate::custody::Custody, sid: &str, candidate: Instant) -> Instant {
             if !rec.watchers.iter().any(|watcher| watcher == sid) {
                 rec.watchers.push(sid.to_string());
@@ -1482,11 +1483,9 @@ impl Shared {
             if op.parked.swap(false, Ordering::SeqCst) {
                 inner.inflight.remove(by_id);
                 let real_path = inner.device_path(by_id).unwrap_or("").to_string();
-                let pre = inner
-                    .custody
-                    .claim_for_release(by_id, op.token)
-                    .ok()
-                    .flatten()
+                let claimed = inner.custody.claim_for_release(by_id, op.token);
+                let owns_close = claimed.is_ok();
+                let pre = claimed.ok().flatten()
                     .map(|parts| Preopened::claimed(real_path, parts, op.token))
                     .or_else(|| op.take_preopened());
                 let deadline = inner
@@ -1506,8 +1505,12 @@ impl Shared {
                     ),
                     // 沒有帳本紀錄可等（作業自帶的 handle）：關閉後即完成，不登記等待。
                     (Some(pre), None) => (Vec::new(), Some(pre)),
+                    (None, Some(deadline)) if !owns_close => (
+                        vec![ReleaseClaim { token: op.token, outcome: CustodyClaimOutcome::Closing, deadline }],
+                        None,
+                    ),
                     (None, Some(_)) => {
-                        // 紀錄沒有 handle 可關：以 NoHandle 結算，不等待。
+                        // 成功認領明確的空 Held（記憶體替身）；其他 phase 不能由拿不到 parts 推定 NoHandle。
                         inner.custody.settle_close(
                             op.token,
                             crate::custody::Terminal {
@@ -1579,10 +1582,12 @@ impl Shared {
             Other,
         }
         let actor_id = inner.actor_id(sid);
+        let own_record = actor_id.is_some_and(|actor| inner.custody.get_custody(by_id)
+            .is_some_and(|rec| rec.owner == crate::custody::CustodyOwner::Session { actor }));
         let Some((token, real_path, kind)) = inner.custody.custody.get(by_id).map(|rec| {
             let own = actor_id.is_some_and(|actor| rec.owner == crate::custody::CustodyOwner::Session { actor });
             let kind = match &rec.phase {
-                _ if own => Kind::Other,
+                crate::custody::CustodyPhase::Held { .. } if own => Kind::Parked,
                 crate::custody::CustodyPhase::Held { .. } if rec.owner == crate::custody::CustodyOwner::Parked => {
                     Kind::Parked
                 }
@@ -1590,6 +1595,7 @@ impl Shared {
                     Kind::Closing
                 }
                 crate::custody::CustodyPhase::CloseFailed { .. } => Kind::Failed,
+                _ if barrier.is_some() => Kind::Closing,
                 _ => Kind::Other,
             };
             (rec.token, rec.real_path.clone(), kind)
@@ -1610,7 +1616,7 @@ impl Shared {
                     .custody
                     .custody
                     .get_mut(by_id)
-                    .map(|rec| watch_record(rec, sid, candidate))
+                    .map(|rec| if own_record { *rec.release_deadline.get_or_insert(candidate) } else { watch_record(rec, sid, candidate) })
                     .unwrap_or(candidate);
                 match parts {
                     Some(parts) => (
@@ -1630,13 +1636,20 @@ impl Shared {
                 }
             }
             Kind::Closing => {
+                // 自身在途同樣要取消並等待；owner 相同並不代表 actor 已記得該 token。
+                let own_io = actor_id.and_then(|actor| inner.sessions.get(sid).filter(|entry| entry.actor_id == actor).map(|entry| entry.io.clone()));
+                let own = actor_id.is_some_and(|actor| inner.custody.get_custody(by_id)
+                    .is_some_and(|rec| rec.owner == crate::custody::CustodyOwner::Session { actor }));
+                let (outcome, parts) = if own {
+                    Shared::claim_custody_for_stop_locked(inner, own_io.as_ref(), token, crate::custody::CustodyCancel::Release, Some(candidate))
+                } else { (CustodyClaimOutcome::Closing, None) };
                 let deadline = inner
                     .custody
                     .custody
                     .get_mut(by_id)
-                    .map(|rec| watch_record(rec, sid, candidate))
+                    .map(|rec| if own_record { *rec.release_deadline.get_or_insert(candidate) } else { watch_record(rec, sid, candidate) })
                     .unwrap_or(candidate);
-                (claim(CustodyClaimOutcome::Closing, deadline), None)
+                (claim(outcome, deadline), parts.map(|(_, parts)| Preopened::claimed(real_path, parts, token)))
             }
             Kind::Failed => {
                 let deadline = inner
@@ -2340,7 +2353,7 @@ impl Shared {
         // 紀錄仍在關閉或排空（熱插拔除、release、shutdown 正在關閉的 parked 或未接手 handle）時不另開；回條 closed:true
         // 之後由關閉者補排一次 attach（`update_devices`）。Python 重插可立即開（`origin/main:sw_core/session_manager.py:4052-4063`），
         // 屬設計核准的差異。
-        if inner.custody.get_custody(by_id).is_some_and(|rec| rec.phase.is_in_flight()) {
+        if inner.custody.is_open_blocked(by_id) {
             drop(inner);
             if let Some(pre) = preopened {
                 self.enqueue_custody_job(crate::custody::ActorExitedJob::CloseHeld {
@@ -4210,7 +4223,7 @@ impl OpenCtx {
         if inner.device_path(&by_id) != Some(dev.0.as_str()) {
             return Err(OpenFailure::NotFound);
         }
-        if self.shared.unconfirmed_closes.contains(&by_id) {
+        if matches!(inner.custody.pending_for(&by_id), Some(crate::custody::CustodyBarrier::Failed { .. })) {
             return Err(OpenFailure::CloseBlocked);
         }
         if let Some(rec) = inner.custody.get_custody(&by_id) {
@@ -5168,9 +5181,11 @@ impl ManagerExec {
         let entry_ok = inner.sessions.get(&sid).is_some_and(|entry| {
             Arc::ptr_eq(&entry.io, &self.io) && entry.released_placeholder && entry.profile.device_by_id == by_id
         });
-        let (record_ok, record_device_ok, record_cancel) = match inner.custody.get_custody(&by_id) {
-            Some(rec) if rec.token == token => (
-                matches!(rec.phase, crate::custody::CustodyPhase::Held { parts: Some(_) }) && rec.cancel.is_none(),
+        let (record_ok, record_device_ok, record_cancel) = match inner.custody.pending_for(&by_id) {
+            Some(crate::custody::CustodyBarrier::Pending(rec)) if rec.token == token => (
+                matches!(rec.phase, crate::custody::CustodyPhaseSnapshot::Held) && rec.cancel.is_none()
+                    && rec.owner == crate::custody::CustodyOwner::Session { actor: self.actor_id }
+                    && inner.custody.get_custody(&by_id).is_some_and(|held| matches!(held.phase, crate::custody::CustodyPhase::Held { parts: Some(_) })),
                 inner.device_path(&by_id) == Some(rec.real_path.as_str()),
                 rec.cancel,
             ),
@@ -5217,8 +5232,9 @@ impl ManagerExec {
             } else {
                 None
             };
+            // watcher 可能已取走 parts 並正在 close；等待依帳本決定，與所有權位置無關。
+            let closing = matches!(inner.custody.pending_for(&by_id), Some(crate::custody::CustodyBarrier::Pending(_)));
             drop(inner);
-            let closing = parts.is_some();
             if let Some(parts) = parts {
                 self.shared
                     .spawn_custody_closer(by_id, token, parts, Some(tx.clone()));
@@ -5364,6 +5380,10 @@ impl ManagerExec {
 }
 
 impl EffectExecutor for ManagerExec {
+    fn pending_custody(&self) -> Option<crate::custody::CustodyBarrier> {
+        let by_id = lock(&self.io.profile).device_by_id.clone();
+        lock(&self.shared.inner).custody.pending_for(&by_id)
+    }
     /// `Effect::ClaimForStop` 在 actor 執行緒上、manager 鎖內處理本 session 的帳本紀錄，結果以立即回饋
     /// `CustodyClaimed` 先於下一個 mailbox 事件交回 actor（設計 §3.1.2 C4、C5）；交出的 handle 交關閉工作者。
     fn execute_with_feedback(
@@ -6475,13 +6495,12 @@ impl SessionManager {
             let old_by_id = e.profile.device_by_id.clone();
             let io = e.io.clone();
             // actor 尚未確認接手的所有在途階段都交同一停止路徑；逾時後仍接續等待原 token。
-            let opening_token = inner.custody.get_custody(&old_by_id).and_then(|rec| {
-                (matches!(
-                    &rec.owner,
-                    crate::custody::CustodyOwner::Session { actor } if *actor == e.actor_id
-                ) && rec.phase.is_in_flight())
-                .then_some(rec.token)
-            });
+            let opening_token = match inner.custody.pending_for(&old_by_id) {
+                Some(crate::custody::CustodyBarrier::Pending(rec))
+                    if rec.owner == crate::custody::CustodyOwner::Session { actor: e.actor_id }
+                        && !matches!(rec.phase, crate::custody::CustodyPhaseSnapshot::Held) => Some(rec.token),
+                _ => None,
+            };
             // #26：舊 by_id 的 attach op 進行中 → 取消並等待（上限 3000 ms）後重試；逾時 → SESSION_RECOVERING。本 session 的
             // W6 再解析作業（`external`）改由 actor 的 bind 以 `ClaimForStop` 取消並等到終態（BindWait 3000 ms，設計 §3.1.4
             // bind；S2-PAR-wp510r R4 移除再解析的 manager 等待迴圈）。
@@ -7436,9 +7455,10 @@ impl SessionManager {
     /// 只供測試（test-fakes）：查詢 session 已退休的 epoch 集合。
     #[cfg(feature = "test-fakes")]
     pub fn retired_drains_for_test(&self, sid: &str) -> Vec<u64> {
-        let inner = lock(&self.shared.inner);
-        if let Some(entry) = inner.sessions.get(sid) {
-            if let Ok(res) = entry.actor.request(crate::session_core::SessionRequest::RetiredDrainsForTest, Duration::from_millis(500)) {
+        // 查詢前先解鎖；排在查詢前面的生命週期事件也可能需要讀帳本。
+        let actor = lock(&self.shared.inner).sessions.get(sid).map(|entry| entry.actor.clone());
+        if let Some(actor) = actor {
+            if let Ok(res) = actor.request(crate::session_core::SessionRequest::RetiredDrainsForTest, Duration::from_millis(500)) {
                 if let Some(PyValue::List(items)) = res.get("epochs") {
                     return items.iter().filter_map(|v| match v {
                         PyValue::Int(PyInt::Small(n)) => Some(*n as u64),
