@@ -278,6 +278,80 @@ fn submit_blocking(r: &ServiceRig) -> String {
     id
 }
 
+/// S2-GP-gpb：經正式 `command.submit` RPC 接線到 UART 與 WAL；WAL TX 完整落盤後才取副作用基準。
+#[test]
+fn gpb_command_submit_reaches_uart_and_wal() {
+    let r = ServiceRig::ready_shell();
+    r.settle();
+    let dev = r.device(REAL_A);
+    let line = b"sleep 100\n";
+    let tx_mark = dev.tx_len();
+    let submitted = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"sleep 100","timeout_s":30}"#,
+    );
+    let cmd_id = s(&submitted, "cmd_id").to_string();
+    let session_id = r.mgr.resolve("COM0").expect("COM0 session");
+    assert_eq!(
+        j(&submitted),
+        format!(
+            "{{\"ok\":true,\"cmd_id\":\"{cmd_id}\",\"status\":\"accepted\",\"session_id\":\"{session_id}\",\"source_class\":\"agent\",\"version\":\"{}\"}}",
+            r.version
+        ),
+        "command.submit 完整 RPC wire 回應"
+    );
+
+    wait_until("命令經 command.get 進入 running", || {
+        let get = r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+        sub(&get, "command").get("status") == Some(&PyValue::from("running"))
+    });
+    let running = r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+    assert_eq!(
+        s(&sub(&running, "command"), "status"),
+        "running",
+        "{}",
+        j(&running)
+    );
+
+    wait_until("相同 cmd_id 的完整 WAL TX", || {
+        wp55_wal_tx(&r, &cmd_id) == vec![("agent".to_string(), wp55_b64(line))]
+    });
+
+    // 先等到 WAL TX 已含完整命令，再固定副作用基準供下方 RPC 狀態查詢前後比較。
+    let observed_uart = dev.tx_since(tx_mark);
+    let wal_rows = wp53_wal_rows(&r, &cmd_id);
+    let side_effect_baseline = (dev.tx_len(), r.wal.current_seq());
+    let state_reply = r.call("session.get_state", r#"{"selector":"COM0"}"#);
+    let state = sub(&state_reply, "session");
+
+    assert_eq!(state.get("session_id"), Some(&PyValue::from(session_id)));
+    assert_eq!(
+        state.get("foreground_busy"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&state)
+    );
+    assert_eq!(observed_uart, line, "UART bytes 必須恰為完整命令列");
+    assert_eq!(
+        wal_rows.len(),
+        1,
+        "本 cmd_id 須恰有一筆完整 TX：{wal_rows:?}"
+    );
+    assert_eq!(s(&wal_rows[0], "dir"), "TX");
+    assert_eq!(s(&wal_rows[0], "source"), "agent");
+    assert_eq!(s(&wal_rows[0], "payload_b64"), wp55_b64(line));
+    assert_eq!(
+        wal_rows[0].get("len").and_then(PyValue::as_i64),
+        Some(line.len() as i64),
+        "WAL 長度必須涵蓋完整 UART 命令"
+    );
+    assert_eq!(
+        (dev.tx_len(), r.wal.current_seq()),
+        side_effect_baseline,
+        "讀取 RPC session 狀態不得額外送 UART 或寫 WAL"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Step 1 計畫列
 // ---------------------------------------------------------------------------
