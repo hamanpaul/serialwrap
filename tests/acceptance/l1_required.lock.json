@@ -22140,6 +22140,7 @@
           "cargo:sw-daemon::dispatch::wp510r_i21_rpc_own_custody_terminal_full_poll_completes_release",
           "cargo:sw-daemon::dispatch::wp510r_i22_rpc_shutdown_token_epoch_window_reports_blocked_close",
           "cargo:sw-daemon::dispatch::wp510r_i22_rpc_shutdown_token_epoch_window_waits_successful_close",
+          "cargo:sw-daemon::dispatch::wp510r_i23_rpc_offline_invalid_retire_terminal_full_poll_completes_attach",
           "cargo:sw-daemon::dispatch::wp510r_m16_device_attach_claims_parked_custody_token",
           "cargo:sw-daemon::dispatch::wp510r_r3_rpc_bind_retired_close_failure_reports_recovering_stalled",
           "cargo:sw-daemon::dispatch::wp510r_r3_rpc_bind_waits_retired_receipt_then_rebinds",

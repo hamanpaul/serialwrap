@@ -10189,6 +10189,112 @@ fn wp510r_i21_rpc_own_custody_terminal_full_poll_completes_release() {
     assert_eq!(dev.tx_len(), tx_before, "沒有登入 TX");
 }
 
+/// 第 23 項 Medium：正式 Raw 開埠成功後、退休提交前離線；關閉通知遇 Full 時必須補收。
+/// Python 驗證失敗先同步關閉、清作業，再回 DEVICE_NOT_PRESENT
+/// （origin/main:sw_core/session_manager.py:3614-3622、4320-4365）。
+#[test]
+fn wp510r_i23_rpc_offline_invalid_retire_terminal_full_poll_completes_attach() {
+    let r = Arc::new(wp510_b_placeholder_rig());
+    let dev = r.device(WP510_REAL_G).clone();
+    // 交接 PROBE 與正式 bridge 都會送空行，替身須提供可重複的 shell prompt。
+    dev.on_tx_match("^$", Box::new(|_| b"root@t:/# ".to_vec()));
+    let state_before = r.fs.bytes(support::STATE_PATH);
+    let original: Vec<(String, DeviceInfo)> = r.mgr.list_devices().into_iter().map(|row| {
+        let by_id = s(&row, "by_id").to_string();
+        let real_path = s(&row, "real_path").to_string();
+        (by_id.clone(), DeviceInfo { by_id, real_path })
+    }).collect();
+    let changed: Vec<_> = original.iter()
+        .filter(|(by_id, _)| by_id != WP510_PLACEHOLDER_BY_ID).cloned().collect();
+    let (retire_tx, retire_rx) = crossbeam_channel::bounded(1);
+    let (retire_go, retire_resume) = crossbeam_channel::bounded(1);
+    r.mgr.set_placeholder_retire_pre_commit_hook_for_test(WP510_PLACEHOLDER_SID, Box::new(move || {
+        retire_tx.send(()).unwrap();
+        retire_resume.recv_timeout(Duration::from_secs(10)).unwrap();
+    }));
+    let attach_rig = Arc::clone(&r);
+    let (attach_tx, attach_rx) = crossbeam_channel::bounded(1);
+    let attach = std::thread::spawn(move || {
+        attach_tx.send(attach_rig.call("device.attach", &format!(
+            r#"{{"selector":"{WP510_PLACEHOLDER_ALIAS}"}}"#,
+        ))).unwrap();
+    });
+    retire_rx.recv_timeout(Duration::from_secs(5)).expect("Raw 開埠後停在 RetirePlaceholder");
+    let record = r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).expect("Raw handle 仍在帳本");
+    assert!(matches!(record.phase, CustodyPhaseSnapshot::Held));
+    assert_eq!(dev.open_count(), 1);
+    assert_eq!(dev.tx_len(), 0, "退休前零 TX");
+
+    let control = r.mgr.actor_control_for_test(WP510_PLACEHOLDER_SID).unwrap();
+    while control.try_send(sw_core::mailbox::ControlEvent::ConsoleCountChanged { count: 0 }).is_ok() {}
+    assert!(control.is_full());
+    let watcher_rig = Arc::clone(&r);
+    let watcher = std::thread::spawn(move || watcher_rig.mgr.update_devices(&changed));
+    // update_devices 已換掉正式裝置表；通知被滿載 lane 擋住，尚未進入 detach_by_id 認領 handle。
+    wait_until("watcher 已更新裝置表", || {
+        r.mgr.list_devices().iter().find(|row| s(row, "by_id") == WP510_PLACEHOLDER_BY_ID)
+            .map(|row| s(row, "real_path")) != Some(WP510_REAL_G)
+    });
+    assert!(!watcher.is_finished(), "watcher 停在滿載通知，handle 由退休驗證失敗分支關閉");
+    assert_eq!(r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).unwrap().token, record.token);
+
+    // RetireResult 是立即回饋；下一筆 request 暫停時，它已登記 ClosingInvalid 與 retired drain。
+    let (actor_paused, actor_go) = r.mgr.pause_next_request_for_test(WP510_PLACEHOLDER_SID).unwrap();
+    let query_service = r.svc.clone();
+    let query = std::thread::spawn(move || query_service.rpc(
+        "session.get_state", &sw_proto::pydict! { "selector" => WP510_PLACEHOLDER_SID },
+    ));
+    dev.pause_next_close();
+    retire_go.send(()).unwrap();
+    actor_paused.recv_timeout(Duration::from_secs(5)).expect("退休驗證失敗後 actor 暫停");
+    assert!(dev.wait_paused(Duration::from_secs(5)), "retire-invalid closer 已啟動");
+    let closing = r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).unwrap();
+    assert_eq!(closing.token, record.token);
+    assert_eq!(closing.phase, CustodyPhaseSnapshot::Closing { job: "retire-invalid".into() });
+    while control.try_send(sw_core::mailbox::ControlEvent::ConsoleCountChanged { count: 0 }).is_ok() {}
+    assert!(control.is_full(), "關閉完成時 control queue 滿載");
+    dev.release_pause();
+    wait_until("真實 CustodyTerminal 遇 Full", || r.mgr.custody_terminal_dropped_for_test(record.token));
+    assert_eq!(r.mgr.terminal_for_test(record.token).unwrap().handle, sw_core::custody::TerminalHandle::Closed);
+    assert!(!dev.is_open());
+    assert!(attach_rx.try_recv().is_err(), "通知未補收前 attach 不回覆");
+    actor_go.send(()).unwrap();
+    query.join().unwrap().unwrap();
+    watcher.join().unwrap();
+    assert_eq!(r.mgr.custody_awaits_for_test(WP510_PLACEHOLDER_SID), vec![record.token]);
+
+    r.clock.advance(Duration::from_millis(600));
+    let response = attach_rx.recv_timeout(Duration::from_secs(2)).expect("補收後 attach 應完成 DEVICE_NOT_PRESENT");
+    attach.join().unwrap();
+    assert_eq!(j(&response), j(&sw_proto::pydict! {
+        "ok" => false, "error_code" => "DEVICE_NOT_PRESENT", "selector" => WP510_PLACEHOLDER_ALIAS,
+        "device_by_id" => WP510_PLACEHOLDER_BY_ID, "version" => r.version.clone(),
+    }), "錯誤形狀與原 selector 依 Python 逐位元組比對");
+    assert_eq!(r.mgr.released_placeholder(WP510_PLACEHOLDER_SID), Some(true));
+    let session = r.session(WP510_PLACEHOLDER_SID).unwrap();
+    assert_eq!(s(&session, "state"), "RELEASED");
+    assert_eq!(session.get("drain_stalled"), Some(&PyValue::Bool(false)));
+    assert_eq!(session.get("drain_timeout_epoch"), Some(&PyValue::Null));
+    assert!(r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_none(), "帳本已清除");
+    assert!(r.mgr.custody_awaits_for_test(WP510_PLACEHOLDER_SID).is_empty(), "等待已清除");
+    assert!(r.mgr.retired_drains_for_test(WP510_PLACEHOLDER_SID).is_empty());
+    assert!(!r.mgr.has_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID));
+    assert_eq!(r.mgr.prepared_len_for_test(), 0);
+    assert_eq!(r.fs.bytes(support::STATE_PATH), state_before, "佔位未退休、不落盤");
+    assert_eq!(dev.open_count(), 1);
+    assert_eq!(dev.close_count(), 1);
+    assert_eq!(dev.tx_len(), 0, "失效交接零 TX");
+
+    r.mgr.update_devices(&original);
+    let retry = r.call("device.attach", r#"{"selector":"COM3"}"#);
+    assert_eq!(retry.get("ok"), Some(&PyValue::Bool(true)), "恢復後可再次 attach：{}", j(&retry));
+    assert_eq!(s(&sub(&retry, "session"), "state"), "ATTACHING");
+    r.wait_state("t:COM3", "READY");
+    assert!(r.mgr.resolve(WP510_PLACEHOLDER_SID).is_none(), "重試成功才退休佔位");
+    assert_eq!(dev.open_count(), 2, "重試只另開一次");
+    assert!(r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).is_none(), "正式 actor 已確認接手");
+}
+
 /// 第 21 項 Medium 2：一般 OpenBridge 已提交 Bridged，bind 必須取消並等排空；期限前成功才改綁。
 /// Python bind 取消在途並等 done 後重試（origin/main:sw_core/session_manager.py:3676-3727、3757-3813）。
 fn wp510r_i21_rpc_bind_bridged(timeout: bool) {

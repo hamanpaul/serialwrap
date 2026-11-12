@@ -4571,7 +4571,8 @@ impl SessionCore {
                         ph.phase = PlaceholderPhase::ClosingInvalid { device };
                     }
                     self.pending_attach = Some(pending);
-                    return Vec::new();
+                    // 終態通知可能因 control lane 滿載遺失；與其他保管等待相同，以計時器補收。
+                    return self.arm_custody_poll(now);
                 }
                 let echo = pending
                     .selector
