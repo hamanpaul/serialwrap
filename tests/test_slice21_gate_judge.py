@@ -38,6 +38,10 @@ TEST_SECTIONS = {
     "linux_cap_posix_pty": ("linux", "s21_gate:linux_cap_posix_pty"),
     "windows_native_l1": ("windows", "s21_core"),
     "windows_cap_windows_com": ("windows", "s21_gate:windows_cap_windows_com"),
+    # OD-55（Windows 部分）：windows 能力集合各一個 section（LOCAL-WINDOWS 證據匯入，須附能力探測）
+    "windows_cap_windows_native": ("windows", "s21_gate:cap_windows_native"),
+    "windows_cap_interactive_desktop": ("windows", "s21_gate:cap_interactive_desktop"),
+    "windows_cap_supervisor_runtime": ("windows", "s21_gate:cap_supervisor_runtime"),
     "blackbox_python": ("linux", "s21_gate:blackbox_python"),
     "blackbox_rust": ("linux", "s21_gate:blackbox_rust"),
     "existing_suites_rust": ("linux", "s21_gate:existing_suites_rust"),
@@ -53,7 +57,9 @@ TEST_SECTIONS = {
     "py_parity_76_80": ("linux", "s21_gate:py_parity_76_80"),
 }
 CAP_OF = {"linux_cap_sys_admin": "sys_admin", "linux_cap_windows_native": "windows_native",
-          "linux_cap_interactive_desktop": "interactive_desktop", "linux_cap_supervisor_runtime": "supervisor_runtime"}
+          "linux_cap_interactive_desktop": "interactive_desktop", "linux_cap_supervisor_runtime": "supervisor_runtime",
+          "windows_cap_windows_native": "windows_native", "windows_cap_interactive_desktop": "interactive_desktop",
+          "windows_cap_supervisor_runtime": "supervisor_runtime"}
 NON_TEST_SECTIONS = ["l15_ab", "event_latency", "wal_s1w_perf", "cfg_boundary", "policy_check", "case_uptake"]
 CORE_NODEIDS = ["cargo:sw-core::wal::a", "cargo:sw-core::wal::b", "cargo:sw-core::wal::c"]
 GATE_NODEIDS = {  # 每個 gate 集合的凍結 nodeid（測試用，兩個一組）
@@ -137,7 +143,8 @@ def _lock() -> dict:
     }}
     for name, (platform, set_id) in TEST_SECTIONS.items():
         if set_id.startswith("s21_gate:"):
-            sets[set_id] = {platform: {"nodeids": list(GATE_NODEIDS[name]), "selector": {"argv": ["pytest", "-q"]}}}
+            # OD-55：同名能力集合同時有 linux 與 windows section（如 s21_gate:cap_windows_native），依平台合併
+            sets.setdefault(set_id, {})[platform] = {"nodeids": list(GATE_NODEIDS[name]), "selector": {"argv": ["pytest", "-q"]}}
     return {"schema_version": 1, "sets": sets}
 
 
@@ -708,6 +715,9 @@ DISPOSITION = {"sys_admin": "BLOCKED-OWNER", "supervisor_runtime": "BLOCKED-OWNE
                "windows_native": "LOCAL-WINDOWS-TODO", "interactive_desktop": "LOCAL-WINDOWS-TODO"}
 NEEDS = {"sys_admin": "CAP_SYS_ADMIN", "supervisor_runtime": "systemd", "windows_native": "Windows",
          "interactive_desktop": "Windows"}
+# OD-55（Windows 部分）：同一能力在 windows section 的所需能力與處置（supervisor_runtime 於 Windows 為工作排程器、LOCAL-WINDOWS）。
+SECTION_DISPOSITION = {"windows_cap_supervisor_runtime": "LOCAL-WINDOWS-TODO"}
+SECTION_NEEDS = {"windows_cap_supervisor_runtime": "Windows"}
 
 
 @pytest.mark.parametrize("name", sorted(CAP_OF))
@@ -727,7 +737,8 @@ def test_capability_section_never_passes_without_capability_probe(case, name):
         out = j.judge(rep, case.expect())
         s = _sec(out, name)
         assert s["status"] == "EVIDENCE_MISSING", (probe, s["reasons"])
-        assert any(NEEDS[cap] in r and DISPOSITION[cap] in r for r in s["reasons"]), s["reasons"]
+        needs, disposition = SECTION_NEEDS.get(name, NEEDS[cap]), SECTION_DISPOSITION.get(name, DISPOSITION[cap])
+        assert any(needs in r and disposition in r for r in s["reasons"]), s["reasons"]
         assert out["verdict"] == "INCOMPLETE"
     assert _sec(j.judge(case.report(), case.expect()), name)["status"] == "PASS"   # 具備能力且全 passed
 

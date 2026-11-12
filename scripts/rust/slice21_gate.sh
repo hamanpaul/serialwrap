@@ -148,6 +148,9 @@ if [[ "$DRY_RUN" == "1" || ( "$PREFLIGHT_OK" != "1" && "$EVIDENCE_RUN" != "1" ) 
   record py_parity --required-set s21_gate:py_parity_full --reason "$why"
   record windows_native_l1 --required-set s21_core --reason "$why；需原生 Windows（win-test.sh）"
   record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com --reason "$com_reason"
+  record windows_cap_windows_native --required-set s21_gate:cap_windows_native --reason "$why；需原生 Windows 本機證據（LOCAL-WINDOWS-TODO）"
+  record windows_cap_interactive_desktop --required-set s21_gate:cap_interactive_desktop --reason "$why；需原生 Windows 本機證據（LOCAL-WINDOWS-TODO）"
+  record windows_cap_supervisor_runtime --required-set s21_gate:cap_supervisor_runtime --reason "$why；需原生 Windows 本機證據（LOCAL-WINDOWS-TODO）"
   record blackbox_python --required-set s21_gate:blackbox_python --reason "$why"
   record blackbox_rust --required-set s21_gate:blackbox_rust --reason "$why"
   record existing_suites_rust --required-set s21_gate:existing_suites_rust --reason "$why"
@@ -293,6 +296,25 @@ if [[ "$WITH_COM_PAIR" == "1" && -n "${SW_TEST_COM_PAIR:-}" ]]; then
 else
   record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com --reason "$com_reason"
 fi
+# OD-55（Windows 部分）：windows 能力集合的證據只能於原生 Windows 本機產生，本 gate 不在 Linux 端代跑。
+#   以 SW_GATE_LOCAL_WINDOWS_DIR 匯入 <dir>/windows_cap_<cap>/l1-results.json（cargo_l1_results.py --platform windows
+#   --caps-only --caps <cap> 的輸出）；缺檔、非 windows 平台或 finished 非 true → 能力探測 unavailable →
+#   EVIDENCE_MISSING（LOCAL-WINDOWS-TODO），不得 PASS。
+for cap in windows_native interactive_desktop supervisor_runtime; do
+  sec="windows_cap_$cap"
+  src="${SW_GATE_LOCAL_WINDOWS_DIR:-}/$sec/l1-results.json"
+  if [[ -n "${SW_GATE_LOCAL_WINDOWS_DIR:-}" && -f "$src" ]] && python3 -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); sys.exit(0 if d.get("platform") == "windows" and d.get("finished") is True else 1)' "$src"; then
+    mkdir -p "$RUN_DIR/$sec"
+    cp "$src" "$RUN_DIR/$sec/l1-results.json"
+    record "$sec" --required-set "s21_gate:cap_$cap" --command "LOCAL-WINDOWS 匯入：$src" \
+      --l1-results "$sec/l1-results.json" \
+      --capability-probe "$cap=available:LOCAL-WINDOWS 證據檔 $src sha256=$(sha256sum "$src" | cut -d' ' -f1)"
+  else
+    record "$sec" --required-set "s21_gate:cap_$cap" \
+      --capability-probe "$cap=unavailable:缺 LOCAL-WINDOWS 證據檔（SW_GATE_LOCAL_WINDOWS_DIR/$sec/l1-results.json）" \
+      --reason "需原生 Windows 本機證據（LOCAL-WINDOWS-TODO）；未匯入"
+  fi
+done
 
 # 6. release artifact（identity 與黑箱用）
 # 方法審閱 [High]（2026-10-29）：建置前先移除舊 artifact，建置失敗時不得留下舊 binary 被後續 section 與量測證據

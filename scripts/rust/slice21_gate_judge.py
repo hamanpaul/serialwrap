@@ -47,6 +47,11 @@ TEST_SECTIONS: dict[str, str] = {
     "linux_cap_posix_pty": "linux",
     "windows_native_l1": "windows",
     "windows_cap_windows_com": "windows",
+    # OD-55（Windows 原生收集後）：windows 能力集合各一個 section。證據只能於原生 Windows 本機產生
+    # （gate 以 SW_GATE_LOCAL_WINDOWS_DIR 匯入 LOCAL-WINDOWS 證據檔），缺少時 EVIDENCE_MISSING，不得 PASS。
+    "windows_cap_windows_native": "windows",
+    "windows_cap_interactive_desktop": "windows",
+    "windows_cap_supervisor_runtime": "windows",
     "blackbox_python": "linux",
     "blackbox_rust": "linux",
     "existing_suites_rust": "linux",
@@ -85,6 +90,15 @@ CAPABILITY_SECTIONS: dict[str, dict[str, str]] = {
     "linux_cap_interactive_desktop": {
         "cap": "interactive_desktop", "needs": "Windows 互動 console（非 Windows 版刻意 panic）", "disposition": "LOCAL-WINDOWS-TODO",
         "how_to_run": "linux 列的測試本體需 Windows 互動 console，linux 主機無法滿足；待擁有者裁決改由 Windows 原生集合承擔（OWNER-BATCH）"},
+    "windows_cap_windows_native": {
+        "cap": "windows_native", "needs": "原生 Windows 本機（PowerShell、Job Object、PE Subsystem）", "disposition": "LOCAL-WINDOWS-TODO",
+        "how_to_run": "於擁有者原生 Windows host（環境比照 scripts/rust/win-test.sh）執行 python3 scripts/rust/cargo_l1_results.py --platform windows --runner scripts/rust/win-runner.sh --out <dir>/windows_cap_windows_native/l1-results.json --caps-only --caps windows_native -- <s21_gate:cap_windows_native.windows selector argv>，再以 SW_GATE_LOCAL_WINDOWS_DIR=<dir> 匯入 gate；缺 LOCAL-WINDOWS 證據檔記 EVIDENCE_MISSING，不得 PASS（gate 以 caps-plan 由鎖 selector 推導，OD-53）"},
+    "windows_cap_interactive_desktop": {
+        "cap": "interactive_desktop", "needs": "原生 Windows 互動 console（擁有者登入的桌面 session）", "disposition": "LOCAL-WINDOWS-TODO",
+        "how_to_run": "於擁有者原生 Windows host（環境比照 scripts/rust/win-test.sh）執行 python3 scripts/rust/cargo_l1_results.py --platform windows --runner scripts/rust/win-runner.sh --out <dir>/windows_cap_interactive_desktop/l1-results.json --caps-only --caps interactive_desktop -- <s21_gate:cap_interactive_desktop.windows selector argv>，再以 SW_GATE_LOCAL_WINDOWS_DIR=<dir> 匯入 gate；缺 LOCAL-WINDOWS 證據檔記 EVIDENCE_MISSING，不得 PASS（gate 以 caps-plan 由鎖 selector 推導，OD-53）"},
+    "windows_cap_supervisor_runtime": {
+        "cap": "supervisor_runtime", "needs": "原生 Windows 工作排程器執行期（建立暫時排程工作，須擁有者授權）", "disposition": "LOCAL-WINDOWS-TODO",
+        "how_to_run": "於擁有者原生 Windows host（環境比照 scripts/rust/win-test.sh）執行 python3 scripts/rust/cargo_l1_results.py --platform windows --runner scripts/rust/win-runner.sh --out <dir>/windows_cap_supervisor_runtime/l1-results.json --caps-only --caps supervisor_runtime -- <s21_gate:cap_supervisor_runtime.windows selector argv>（建立暫時排程工作須設 SW_TEST_ALLOW_SCHTASKS，擁有者授權），再以 SW_GATE_LOCAL_WINDOWS_DIR=<dir> 匯入 gate；缺 LOCAL-WINDOWS 證據檔記 EVIDENCE_MISSING，不得 PASS（gate 以 caps-plan 由鎖 selector 推導，OD-53）"},
 }
 # F108：須以非 root 執行的測試類 section（section 片段 `run_euid` 須為非 0 整數）。sol P5-54dd588-2：linux_cap_posix_pty
 # 的必要集合含 sw-pal 預設測試（holder_scan_permission 等在 root 下必紅），比照 linux_l1。
@@ -95,6 +109,7 @@ NON_TEST_SECTIONS: tuple[str, ...] = (
 SECTION_ORDER: tuple[str, ...] = (
     "cfg_boundary", "linux_l1", "linux_cap_posix_pty", "linux_cap_sys_admin", "linux_cap_windows_native",
     "linux_cap_interactive_desktop", "linux_cap_supervisor_runtime", "windows_native_l1", "windows_cap_windows_com",
+    "windows_cap_windows_native", "windows_cap_interactive_desktop", "windows_cap_supervisor_runtime",
     "blackbox_python", "blackbox_rust", "existing_suites_rust", "l15_ab", "event_latency", "wal_s1w_perf",
     "case_uptake", "py_parity", "py_parity_76_80", "pytest_full", "policy_check",
 )

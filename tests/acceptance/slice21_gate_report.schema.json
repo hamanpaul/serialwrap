@@ -63,7 +63,8 @@
         "properties": {
           "name": {"enum": ["linux_l1", "linux_cap_posix_pty", "linux_cap_sys_admin", "linux_cap_windows_native",
                             "linux_cap_interactive_desktop", "linux_cap_supervisor_runtime", "windows_native_l1",
-                            "windows_cap_windows_com", "blackbox_python", "blackbox_rust", "existing_suites_rust", "l15_ab",
+                            "windows_cap_windows_com", "windows_cap_windows_native",
+                            "windows_cap_interactive_desktop", "windows_cap_supervisor_runtime", "blackbox_python", "blackbox_rust", "existing_suites_rust", "l15_ab",
                             "event_latency", "wal_s1w_perf", "cfg_boundary", "py_parity", "py_parity_76_80", "pytest_full", "policy_check",
                             "case_uptake"]},
           "status": {"enum": ["PASS", "FAIL", "EVIDENCE_MISSING"]},

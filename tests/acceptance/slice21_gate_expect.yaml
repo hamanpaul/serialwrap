@@ -44,7 +44,9 @@ parity:
 # OD-68：核准移除 cap_windows_native／cap_interactive_desktop 的 Linux lock 列；在補齊原生 Windows selector 前，兩個 Linux section 因必要集合缺失維持 EVIDENCE_MISSING。
 # SPEC-GAP #1（編排者裁決）：s21_gate:py_parity（凍結，selector 只有 1 筆）不改不刪、仍由 pytest_full 承擔；新集合
 #   s21_gate:py_parity_full（完整 selector＝舊集合全部 nodeid）由 py_parity section 以其 selector 實跑。
-#   s21_core.windows 的能力列待 Windows 原生收集登記 s21_gate:cap_<cap>.windows 後才移除（LOCAL-WINDOWS-TODO）。
+#   OD-55（Windows 部分）：s21_core.windows 的能力列經 Windows 原生收集後移入 s21_gate:windows_cap_windows_com.windows 與
+#   s21_gate:cap_{windows_native,interactive_desktop,supervisor_runtime}.windows；後三者各由 windows_cap_<cap> section 承擔，
+#   證據只能於原生 Windows 本機產生（SW_GATE_LOCAL_WINDOWS_DIR 匯入），缺少時 EVIDENCE_MISSING（LOCAL-WINDOWS-TODO），不得 PASS。
 additional_required_sets:
   pytest_full: ["s21_gate:py_parity"]
   linux_cap_posix_pty: ["s21_gate:cap_posix_pty"]
@@ -66,6 +68,12 @@ sections:
      command: "scripts/rust/win-test.sh --package sw-pal --package sw-core --package sw-daemon"}
   - {name: windows_cap_windows_com, kind: test, platform: windows, required_set: "s21_gate:windows_cap_windows_com",
      allowed_missing_bo: BO-S21-01, command: "scripts/rust/win-test.sh --caps windows_com --package sw-pal（需 --with-com-pair 與 SW_TEST_COM_PAIR）"}
+  - {name: windows_cap_windows_native, kind: test, platform: windows, required_set: "s21_gate:cap_windows_native",
+     command: "LOCAL-WINDOWS：原生 Windows 本機以 cargo_l1_results.py --platform windows --caps-only --caps windows_native -- <集合 selector argv> 產生 l1-results.json，SW_GATE_LOCAL_WINDOWS_DIR 匯入；缺證據檔記 EVIDENCE_MISSING（LOCAL-WINDOWS-TODO）"}
+  - {name: windows_cap_interactive_desktop, kind: test, platform: windows, required_set: "s21_gate:cap_interactive_desktop",
+     command: "LOCAL-WINDOWS：原生 Windows 本機以 cargo_l1_results.py --platform windows --caps-only --caps interactive_desktop -- <集合 selector argv> 產生 l1-results.json，SW_GATE_LOCAL_WINDOWS_DIR 匯入；缺證據檔記 EVIDENCE_MISSING（LOCAL-WINDOWS-TODO）"}
+  - {name: windows_cap_supervisor_runtime, kind: test, platform: windows, required_set: "s21_gate:cap_supervisor_runtime",
+     command: "LOCAL-WINDOWS：原生 Windows 本機以 cargo_l1_results.py --platform windows --caps-only --caps supervisor_runtime -- <集合 selector argv> 產生 l1-results.json，SW_GATE_LOCAL_WINDOWS_DIR 匯入；缺證據檔記 EVIDENCE_MISSING（LOCAL-WINDOWS-TODO）"}
   - {name: blackbox_python, kind: test, platform: linux, required_set: "s21_gate:blackbox_python",
      command: "python3 -m pytest -q tests/contract_blackbox/slice21 -m cap_posix_pty（Python daemon）"}
   - {name: blackbox_rust, kind: test, platform: linux, required_set: "s21_gate:blackbox_rust",
