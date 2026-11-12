@@ -2677,6 +2677,13 @@ impl ManagerRig {
     /// 熱插拔替身：以新實體路徑取代快照中 by_id 的實體路徑，安裝 shell 回應，送 `update_devices`，
     /// 並等到新路徑被 open（drain 與重開的順序由 `events()` 斷言）。
     pub fn retarget_by_id(&self, by_id: &str, new_real: &str) {
+        self.retarget_by_id_no_wait(by_id, new_real);
+        let want = format!("open:{new_real}");
+        wait_until(&want, || self.events().iter().any(|e| *e == want));
+    }
+
+    /// 同 `retarget_by_id`，但不等新路徑 open，供測試自行協調改指。
+    pub fn retarget_by_id_no_wait(&self, by_id: &str, new_real: &str) {
         let dev = self.serial.add_device(new_real);
         install_shell_replies(&dev);
         {
@@ -2692,8 +2699,6 @@ impl ManagerRig {
             }
         }
         self.mgr.update_devices(&self.snapshot());
-        let want = format!("open:{new_real}");
-        wait_until(&want, || self.events().iter().any(|e| *e == want));
     }
 
     /// 以 selector 找 session 的 `state`（找不到回 None）。
