@@ -10716,3 +10716,37 @@ fn wp510r_r6_rpc_late_release_completion_survives_shutdown_freeze() {
         Some(sw_core::custody::TerminalHandle::Closed)
     );
 }
+
+/// 第 20 項的 RPC 接線證據：回收者的 Held close 暫停時，正式查詢與另一 session release 仍照常完成。
+#[test]
+fn wp510r_i20_rpc_query_and_release_while_reaper_held_close_paused() {
+    let r = ServiceRig::ready_shell();
+    let serial = FakeSerialBackend::new();
+    let path = "/dev/ttyI20RpcHeld";
+    let dev = serial.add_device(path);
+    let config = SerialConfig::from_uart_profile(115200, 8, "none", 1, "none", false);
+    let handle = serial.open_exclusive(&DevicePath(path.into()), &config).unwrap();
+    let (actor, token) = r.mgr.custody_register_held_parts_for_test(
+        "by-id-i20-rpc-held", path, sw_core::session_manager::HandleParts::split(handle),
+    );
+    dev.pause_next_close();
+    r.mgr.reaper_cmd_sender_for_test().send(sw_core::custody::ReaperCmd::ActorExited { actor }).unwrap();
+    assert!(dev.wait_paused(Duration::from_secs(3)));
+    let started = Instant::now();
+    let listed = r.call("session.list", "{}");
+    let released = r.call("device.release", r#"{"selector":"COM0","source":"agent"}"#);
+    let elapsed = started.elapsed();
+    let state = r.call("session.get_state", r#"{"selector":"COM0"}"#);
+    let pending = r.mgr.terminal_for_test(token).is_none();
+    dev.release_pause();
+    wait_until("Held 配對回條", || r.mgr.terminal_for_test(token).is_some());
+
+    assert_eq!(listed.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&listed));
+    assert!(elapsed < Duration::from_secs(1), "查詢與另一 COM release 須在期限內完成：{elapsed:?}");
+    assert_eq!(j(&released), format!(r#"{{"ok":true,"session":{},"closed_consoles":0,"aborted_cmd":false,"version":"{}"}}"#, j(&sub(&state, "session")), r.version));
+    assert_eq!(s(&sub(&state, "session"), "state"), "RELEASED");
+    assert_eq!(r.devices[REAL_A].close_count(), 1, "RPC 確實走到 COM0 的 IoWorker close");
+    assert!(pending, "另一個 Held 尚無回條，不能宣告其成功");
+    assert_eq!(dev.close_count(), 1);
+    assert_eq!(r.mgr.terminal_for_test(token).unwrap().handle, sw_core::custody::TerminalHandle::Closed);
+}

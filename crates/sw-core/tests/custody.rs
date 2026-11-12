@@ -2572,8 +2572,10 @@ fn test_dr9_actor_spawn_failure_via_manager_path() {
     inject_actor_spawn_fail(0);
 
     // 驗證 manager 鎖未中毒，查詢在 1s 內返回
+    let started = Instant::now();
     assert!(m.mgr.resolve("COM0").is_none());
     assert_eq!(m.mgr.session_ids().len(), 0);
+    assert!(started.elapsed() < Duration::from_secs(1), "DR-9：查詢須在 1 秒內返回");
 
     // 驗證帳本中無殘留
     let c = m.mgr.custody_for_test(BY_ID);
@@ -3572,4 +3574,123 @@ fn test_dr5_f_g2_permanent_drops_obligation_parked_closed_by_shutdown() {
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(dev.close_count(), 1, "只關閉一次");
     assert_eq!(dev.open_attempts(), 1);
+}
+
+/// 第 20 項 r3-M2：Held 關閉卡住不能佔住唯一回收者；另一 COM 的 RX barrier 與回條須照常結算。
+#[test]
+fn wp510r_i20_held_close_pause_does_not_block_other_com_receipts_or_shutdown() {
+    let m = ManagerRig::templates_only();
+    let h = CoreHarness::new(SHELL_PROFILE);
+    let path = "/dev/ttyI20Held";
+    let dev = m.serial.add_device(path);
+    let handle = m.serial.open_exclusive(&sw_pal::traits::DevicePath(path.into()), &sw_pal::traits::SerialConfig::from_uart_profile(115200, 8, "none", 1, "none", false)).unwrap();
+    let (actor, token) = m.mgr.custody_register_held_parts_for_test("by-id-i20-held", path, HandleParts::split(handle));
+    dev.pause_next_close();
+    m.mgr.reaper_cmd_sender_for_test().send(ReaperCmd::ActorExited { actor }).unwrap();
+    assert!(dev.wait_paused(Duration::from_secs(3)), "Held close 已暫停");
+
+    let other_path = "/dev/ttyI20Bridge";
+    let other_dev = h.add_serial_device(other_path);
+    let worker = h.start_worker_at(20001, other_path);
+    other_dev.push_rx(b"i20 RX evidence\n");
+    wait_until("IoWorker 已接收 RX", || h.rx.total_bytes() > 0);
+    let other_token = m.mgr.custody_register_bridged_worker_for_test(
+        "COM21", "by-id-i20-bridge", other_path, 20001, worker,
+    );
+    let other_actor = m.mgr.custody_actor_for_test("by-id-i20-bridge").unwrap();
+    m.mgr.reaper_cmd_sender_for_test().send(ReaperCmd::ActorExited { actor: other_actor }).unwrap();
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(1) && m.mgr.terminal_for_test(other_token).is_none() {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let other_terminal = m.mgr.terminal_for_test(other_token);
+    let shutdown_start = Instant::now();
+    let report = m.mgr.shutdown(Duration::from_millis(250));
+    let shutdown_elapsed = shutdown_start.elapsed();
+    let still_pending = m.mgr.terminal_for_test(token).is_none();
+    dev.release_pause();
+    wait_until("Held 放行後配對終態", || m.mgr.terminal_for_test(token).is_some());
+
+    assert!(matches!(other_terminal, Some(Terminal { handle: TerminalHandle::Closed, evidence: TerminalEvidence::Incomplete { .. } })),
+        "Held 暫停期間，其他 COM 的 RX barrier 與 WorkerStopped 必須結算：{other_terminal:?}");
+    assert_eq!(other_dev.close_count(), 1);
+    assert!(still_pending, "暫停時不能偽造 Held 成功回條");
+    assert!(shutdown_elapsed < Duration::from_secs(1), "shutdown 須遵守期限：{shutdown_elapsed:?}");
+    assert!(report.iter().any(|(key, ok)| key == "attach:by-id-i20-held" && !ok), "Held 須列未排空：{report:?}");
+    assert!(!report.iter().any(|(key, ok)| key == "attach:by-id-i20-bridge" && !ok), "另一 COM 已排空：{report:?}");
+    assert_eq!(dev.close_count(), 1);
+    assert_eq!(m.mgr.terminal_for_test(token).unwrap().handle, TerminalHandle::Closed);
+}
+
+/// 第 20 項 r3-M3／WP4-2：兩種回收失敗各保留原錯誤、Failed 終態，且只告警一次。
+fn i20_reaper_close_failure_warn_once(bridged: bool) {
+    let m = ManagerRig::templates_only();
+    let h = CoreHarness::new(SHELL_PROFILE);
+    {
+        let (by_id, path, error) = if bridged {
+            ("by-id-i20-failed-worker", "/dev/ttyI20FailedWorker", "i20 worker close failed")
+        } else {
+            ("by-id-i20-failed-held", "/dev/ttyI20FailedHeld", "i20 held close failed")
+        };
+        let (dev, actor, token) = if bridged {
+            let dev = h.add_serial_device(path);
+            dev.fail_close(PalError::io(5, error));
+            let worker = h.start_worker_at(20002, path);
+            let token = m.mgr.custody_register_bridged_worker_for_test("COM22", by_id, path, 20002, worker);
+            let actor = m.mgr.custody_actor_for_test(by_id).unwrap();
+            (dev, actor, token)
+        } else {
+            let dev = m.serial.add_device(path);
+            dev.fail_close(PalError::io(5, error));
+            let handle = m.serial.open_exclusive(&sw_pal::traits::DevicePath(path.into()), &sw_pal::traits::SerialConfig::from_uart_profile(115200, 8, "none", 1, "none", false)).unwrap();
+            let (actor, token) = m.mgr.custody_register_held_parts_for_test(by_id, path, HandleParts::split(handle));
+            (dev, actor, token)
+        };
+        m.mgr.reaper_cmd_sender_for_test().send(ReaperCmd::ActorExited { actor }).unwrap();
+        wait_until("失敗回條結算", || m.mgr.terminal_for_test(token).is_some());
+        m.mgr.reaper_cmd_sender_for_test().send(ReaperCmd::ActorExited { actor }).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(m.mgr.terminal_for_test(token).unwrap().handle, TerminalHandle::Failed { error: error.into() });
+        assert!(m.mgr.unconfirmed_close_for_test(by_id));
+        assert!(matches!(m.mgr.custody_for_test(by_id).unwrap().phase, CustodyPhaseSnapshot::CloseFailed { error: ref e } if e == error));
+        assert_eq!(dev.close_count(), 1, "只嘗試關閉一次");
+        let warnings = m.warnings();
+        let matching: Vec<_> = warnings.iter().filter(|w| w.contains(by_id) && w.contains(error)).collect();
+        assert_eq!(matching.len(), 1, "每次失敗一筆 by-id＋錯誤告警：{warnings:?}");
+    }
+}
+
+#[test]
+fn wp510r_i20_reaper_held_close_failure_warns_once() {
+    i20_reaper_close_failure_warn_once(false);
+}
+
+#[test]
+fn wp510r_i20_reaper_unadopted_worker_close_failure_warns_once() {
+    i20_reaper_close_failure_warn_once(true);
+}
+
+/// 第 20 項同根因：shutdown 不能親自關閉 parked handle 而超出整體期限。
+#[test]
+fn wp510r_i20_shutdown_parked_close_pause_respects_budget_and_late_receipt() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (m, dev, token) = dr7_formal_parked_rig(None);
+    dev.pause_next_close();
+    let mgr = m.mgr.clone();
+    let (tx, rx) = bounded(1);
+    let thread = std::thread::spawn(move || {
+        let start = Instant::now();
+        let report = mgr.shutdown(Duration::from_millis(250));
+        tx.send((report, start.elapsed())).unwrap();
+    });
+    assert!(dev.wait_paused(Duration::from_secs(3)));
+    let response = rx.recv_timeout(Duration::from_secs(1));
+    dev.release_pause();
+    thread.join().unwrap();
+    let (report, elapsed) = response.expect("parked close 暫停時 shutdown 仍須在期限內回覆");
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    assert!(report.iter().any(|(key, ok)| key == &format!("attach:{DR7_BY_ID}") && !ok), "{report:?}");
+    wait_until("遲到 parked 配對回條", || m.mgr.terminal_for_test(token).is_some());
+    assert_eq!(m.mgr.terminal_for_test(token).unwrap().handle, TerminalHandle::Closed);
+    assert_eq!(dev.close_count(), 1);
 }

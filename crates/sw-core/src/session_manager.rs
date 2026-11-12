@@ -780,6 +780,8 @@ struct Shared {
     startup_error: Mutex<Option<String>>,
     /// S2-PAR-wp510r R1：回收者命令通道（無界；`ExitReclaim`／`Reclaim` 守衛與開埠工作只送命令、不取 manager 鎖）。
     reaper_cmd_tx: Sender<crate::custody::ReaperCmd>,
+    /// 無法建立關閉工作者時仍保留所有權；未知失敗永久阻擋到重啟，不在共用執行緒退回同步 close。
+    failed_closes: Mutex<Vec<HandleParts>>,
 }
 
 /// PROBE 的 writer 交給 TxWriter thread 期間留在 `HandleParts` 的占位（任何提交一律 NotSubmitted）。
@@ -1033,38 +1035,16 @@ impl Shared {
     /// watcher）在結算後以 `CustodyTerminal` 通知（鎖外 `try_send`，送不進去時由 actor 的 `CustodyPoll` 自帳本終態補收）；
     /// 首次期限、DRAIN_STALLED 回覆與遲到的 release 完成都由 actor 自己的停止待決承擔，manager 不保存等待狀態。
     fn close_session_preopened(&self, by_id: &str, pre: Preopened) -> bool {
+        let token = pre.custody.or_else(|| lock(&self.inner).custody.get_custody(by_id).map(|rec| rec.token));
         let receipt = pre.parts.close();
-        if !receipt.closed {
-            let error = close_error_text(&receipt);
-            self.warn(preopened_close_warning(by_id, &error));
-            self.unconfirmed_closes.insert(by_id);
-            let notify = {
-                let mut inner = lock(&self.inner);
-                let token = inner.custody.custody.get(by_id).map(|rec| rec.token);
-                let watchers = Self::take_custody_watchers_locked(&mut inner, by_id, token);
-                if let Some(rec) = inner.custody.custody.get_mut(by_id) {
-                    rec.phase = crate::custody::CustodyPhase::CloseFailed { error: error.clone() };
-                }
-                token.map(|token| (token, watchers))
-            };
-            self.cv.notify_all();
-            if let Some((token, watchers)) = notify {
-                Self::notify_custody_watchers(&watchers, token, false, Some(error));
-            }
-            return false;
+        let closed = receipt.closed;
+        if let Some(token) = token {
+            self.finish_custody_close(by_id, token, receipt, None);
+        } else if !closed {
+            self.warn(preopened_close_warning(by_id, &close_error_text(&receipt)));
+            self.retain_unconfirmed_close(by_id);
         }
-        let (token, watchers) = {
-            let mut inner = lock(&self.inner);
-            let Some(token) = inner.custody.custody.get(by_id).map(|rec| rec.token) else {
-                return true;
-            };
-            let watchers = Self::take_custody_watchers_locked(&mut inner, by_id, Some(token));
-            inner.custody.settle_close(token, closed_terminal());
-            (token, watchers)
-        };
-        self.cv.notify_all();
-        Self::notify_custody_watchers(&watchers, token, true, None);
-        true
+        closed
     }
 
     /// 取出 by_id 上帳本紀錄 `token`（`None`＝不論 token）的 watcher（等待其終態的 release actor），轉成各 actor 的
@@ -1194,7 +1174,7 @@ impl Shared {
     }
 
     /// 未被 session 接受的帳本紀錄（`Held`）轉 Closing 並關閉（同步），依回條結算（closed:false 依 D1 iii 永久阻擋）。
-    fn close_unoffered_custody(&self, by_id: &str, token: u64) {
+    fn close_unoffered_custody(self: &Arc<Self>, by_id: &str, token: u64) {
         let parts = {
             let mut inner = lock(&self.inner);
             let rec = inner.custody.custody.get_mut(by_id).filter(|rec| rec.token == token);
@@ -1213,7 +1193,7 @@ impl Shared {
             }
         };
         if let Some(parts) = parts {
-            self.finish_custody_close(by_id, token, parts.close(), None);
+            self.spawn_custody_closer(by_id.to_string(), token, parts, None);
         }
     }
 
@@ -1228,31 +1208,34 @@ impl Shared {
         receipt: CloseReceipt,
         notify: Option<Sender<ControlEvent>>,
     ) {
-        let error = (!receipt.closed).then(|| close_error_text(&receipt));
-        // S2-PAR-wp510r 第 15 項：以 `ClaimByIdForRelease` 等待這筆紀錄的 release（非擁有者）於結算後一併通知。
-        let watchers = {
-            let mut inner = lock(&self.inner);
-            Self::take_custody_watchers_locked(&mut inner, by_id, Some(token))
+        let terminal = crate::custody::Terminal {
+            handle: if receipt.closed {
+                crate::custody::TerminalHandle::Closed
+            } else {
+                crate::custody::TerminalHandle::Failed { error: close_error_text(&receipt) }
+            },
+            evidence: crate::custody::TerminalEvidence::Complete,
         };
-        if let Some(error) = error.as_ref() {
-            self.warn(preopened_close_warning(by_id, error));
-            let deadline = lock(&self.inner)
-                .custody
-                .get_custody(by_id)
-                .filter(|rec| rec.token == token)
-                .and_then(|rec| rec.release_deadline);
+        let error = (!receipt.closed).then(|| close_error_text(&receipt));
+        let (watchers, release_deadline) = {
+            let mut inner = lock(&self.inner);
+            if inner.custody.terminals.contains_key(&token) {
+                return;
+            }
+            let deadline = inner.custody.get_custody(by_id).filter(|rec| rec.token == token).and_then(|rec| rec.release_deadline);
+            let watchers = Self::take_custody_watchers_locked(&mut inner, by_id, Some(token));
+            inner.custody.settle_close(token, terminal.clone());
+            (watchers, deadline)
+        };
+        if error.is_some() {
             self.retain_unconfirmed_close(by_id);
-            if let Some(deadline) = deadline {
+            if let Some(deadline) = release_deadline {
                 if let Some(op) = lock(&self.inner).inflight.get(by_id) {
                     lock(&op.release_deadline).get_or_insert(deadline);
                 }
             }
-        } else {
-            let mut inner = lock(&self.inner);
-            if inner.custody.get_custody(by_id).is_some_and(|rec| rec.token == token) {
-                inner.custody.settle_close(token, closed_terminal());
-            }
         }
+        self.report_custody_terminal(by_id, token, &terminal);
         self.cv.notify_all();
         Self::notify_custody_watchers(&watchers, token, receipt.closed, error.clone());
         #[cfg(feature = "test-fakes")]
@@ -1273,11 +1256,25 @@ impl Shared {
             inner.session_by_id(by_id).map(|entry| entry.actor.control.clone())
         });
         if let Some(control) = owner {
-            let _ = control.send(ControlEvent::CustodyTerminal {
+            let _ = control.try_send(ControlEvent::CustodyTerminal {
                 token,
                 closed: receipt.closed,
                 error,
             });
+        }
+    }
+
+    /// 只有新接受的配對終態呼叫一次；handle 失敗與證據缺口分開回報。
+    fn report_custody_terminal(&self, by_id: &str, token: u64, terminal: &crate::custody::Terminal) {
+        if let crate::custody::TerminalHandle::Failed { error } = &terminal.handle {
+            self.warn(preopened_close_warning(by_id, error));
+        }
+        if let crate::custody::TerminalEvidence::Incomplete { gaps, wal_error } = &terminal.evidence {
+            let mut details = gaps.clone();
+            if let Some(error) = wal_error {
+                details.push(format!("wal_error: {error}"));
+            }
+            self.warn(format!("worker 排空證據不完整（by_id={by_id} token={token}）：{}", details.join(", ")));
         }
     }
 
@@ -1361,8 +1358,7 @@ impl Shared {
         }
     }
 
-    /// 以關閉工作者執行緒關閉 `claim_custody_for_stop_locked` 交出的 handle（停止不必卡在關閉本身，release 可於首次
-    /// 期限回 DRAIN_STALLED）；執行緒建立失敗時告警並於本執行緒直接關閉。
+    /// 關閉不得退回 manager、actor 或回收者執行緒；失敗保留所有權並回報未知終態。
     fn spawn_custody_closer(
         self: &Arc<Self>,
         by_id: String,
@@ -1377,14 +1373,51 @@ impl Shared {
         let spawned = std::thread::Builder::new()
             .name(format!("serialwrap-custody-close-{by_id}"))
             .spawn(move || {
-                if let Some((parts, notify)) = lock(&thread_slot).take() {
+                // 建構者可能仍在持鎖撤銷預留：越過這個屏障後才碰 UART。
+                drop(lock(&shared.inner));
+                let work = lock(&thread_slot).take();
+                if let Some((parts, notify)) = work {
                     shared.finish_custody_close(&key, token, parts.close(), notify);
                 }
             });
         if let Err(error) = spawned {
-            self.warn(format!("帳本 handle 關閉執行緒建立失敗（by_id={by_id}）：{error}"));
-            if let Some((parts, notify)) = lock(&slot).take() {
-                self.finish_custody_close(&by_id, token, parts.close(), notify);
+            let work = lock(&slot).take();
+            if let Some((parts, notify)) = work {
+                lock(&self.failed_closes).push(parts);
+                self.finish_custody_close(&by_id, token, CloseReceipt {
+                    closed: false,
+                    excl_cleared: false,
+                    error: Some(PalError::plain(PalErrorKind::Io, format!("關閉工作者建立失敗，handle 未知終態：{error}"))),
+                }, notify);
+            }
+        }
+    }
+
+    /// 呼叫者可持 manager 鎖；只移交已認領工作的所有權，不在這裡執行 I/O 或結算。
+    fn enqueue_custody_job(self: &Arc<Self>, job: crate::custody::ActorExitedJob) {
+        if let Err(crossbeam_channel::SendError(crate::custody::ReaperCmd::RunJob { job })) =
+            self.reaper_cmd_tx.send(crate::custody::ReaperCmd::RunJob { job: Box::new(job) })
+        {
+            let shared = self.clone();
+            std::thread::spawn(move || {
+                drop(lock(&shared.inner));
+                shared.dispatch_custody_job(*job, &crossbeam_channel::unbounded().0);
+            });
+        }
+    }
+
+    fn dispatch_custody_job(self: &Arc<Self>, job: crate::custody::ActorExitedJob, event_tx: &Sender<ControlEvent>) -> usize {
+        match job {
+            crate::custody::ActorExitedJob::CloseHeld { token, by_id, parts } => {
+                if let Some(parts) = parts {
+                    self.spawn_custody_closer(by_id, token, parts, None);
+                } else {
+                    self.finish_custody_close(&by_id, token, CloseReceipt { closed: true, excl_cleared: true, error: None }, None);
+                }
+                0
+            }
+            crate::custody::ActorExitedJob::DrainBridge { worker, stop_id, .. } => {
+                worker.map_or(0, |worker| usize::from(worker.finish_async(stop_id, event_tx.clone())))
             }
         }
     }
@@ -1598,31 +1631,16 @@ impl Shared {
         }
     }
 
-    /// release 認領的 parked handle 交關閉者（鎖外；release 不卡在關閉本身，首次期限由 actor 判定）。結算與通知見
-    /// `close_session_preopened`（watcher 收到 `CustodyTerminal`）；執行緒建立失敗時告警並於本執行緒直接關閉。
+    /// release 認領的 parked handle 走共用 closer；失敗也不退回 RPC／actor 執行緒同步關閉。
     fn spawn_release_claim_closer(self: &Arc<Self>, by_id: String, pre: Preopened) {
-        let shared = Arc::clone(self);
-        let key = by_id.clone();
-        let slot = Arc::new(Mutex::new(Some(pre)));
-        let thread_slot = Arc::clone(&slot);
-        let spawned = std::thread::Builder::new()
-            .name(format!("serialwrap-release-close-{by_id}"))
-            .spawn(move || {
-                if let Some(pre) = lock(&thread_slot).take() {
-                    shared.close_session_preopened(&key, pre);
-                }
-            });
-        if let Err(error) = spawned {
-            self.warn(format!("release 的 parked handle 關閉執行緒建立失敗（by_id={by_id}）：{error}"));
-            if let Some(pre) = lock(&slot).take() {
-                self.close_session_preopened(&by_id, pre);
-            }
-        }
+        let token = pre.custody.unwrap_or_else(|| lock(&self.inner).custody.alloc_token());
+        self.spawn_custody_closer(by_id, token, pre.parts, None);
     }
 
     /// manager 端的停止者（shutdown、拔除）處理 by_id 上 session 擁有的帳本紀錄：可交出的 handle 同步關閉並結算，
     /// 開埠工作持有者寫入取消（由開埠工作在提交點關閉）。回傳仍待終態的 token。
-    fn close_session_custody_for(&self, by_id: &str, cancel: crate::custody::CustodyCancel) -> Option<u64> {
+    fn close_session_custody_for(self: &Arc<Self>, by_id: &str, cancel: crate::custody::CustodyCancel) -> Option<u64> {
+        let shutdown = matches!(cancel, crate::custody::CustodyCancel::Shutdown);
         let (token, claimed) = {
             let mut inner = lock(&self.inner);
             let rec = inner.custody.get_custody(by_id)?;
@@ -1646,8 +1664,13 @@ impl Shared {
             }
         };
         if let Some((by_id, parts)) = claimed {
-            self.finish_custody_close(&by_id, token, parts.close(), None);
-            return None;
+            if shutdown {
+                self.spawn_custody_closer(by_id, token, parts, None);
+            } else {
+                // 熱插通知沿用 Python 的鎖外同步收尾順序（凍結節點依賴通知返回時已關閉）。
+                self.finish_custody_close(&by_id, token, parts.close(), None);
+                return None;
+            }
         }
         Some(token)
     }
@@ -1660,17 +1683,14 @@ impl Shared {
     /// P8-6a679fb-1，不留到下一次成功開埠才被覆寫）。
     fn close_before_bridge(&self, by_id: &str, parts: HandleParts, custody: Option<u64>) -> bool {
         let receipt = parts.close();
-        if receipt.closed {
-            if let Some(token) = custody {
-                lock(&self.inner)
-                    .custody
-                    .settle_taken_close(by_id, token, closed_terminal());
-            }
-            return true;
+        let closed = receipt.closed;
+        if let Some(token) = custody {
+            self.finish_custody_close(by_id, token, receipt, None);
+        } else if !closed {
+            self.warn(preopened_close_warning(by_id, &close_error_text(&receipt)));
+            self.retain_unconfirmed_close(by_id);
         }
-        self.warn(preopened_close_warning(by_id, &close_error_text(&receipt)));
-        self.retain_unconfirmed_close(by_id);
-        false
+        closed
     }
 
     /// 未確認關閉的 handle 以 `close_failed` 作業留在 `inflight`（Python 作業留在 `_active_attach_ops`、不設 `done`）：
@@ -1681,9 +1701,9 @@ impl Shared {
         let mut inner = lock(&self.inner);
         self.unconfirmed_closes.insert(by_id);
         if let Some(rec) = inner.custody.custody.get_mut(by_id) {
-            rec.phase = crate::custody::CustodyPhase::CloseFailed {
-                error: "close unconfirmed".into(),
-            };
+            if !matches!(rec.phase, crate::custody::CustodyPhase::CloseFailed { .. }) {
+                rec.phase = crate::custody::CustodyPhase::CloseFailed { error: "close unconfirmed".into() };
+            }
         }
         match inner.inflight.get(by_id) {
             Some(op) => op.close_failed.store(true, Ordering::SeqCst),
@@ -2003,25 +2023,19 @@ impl Shared {
                 self.warn(format!("actor 建立失敗（sid={sid}）：{e}"));
                 let jobs = inner.custody.handle_spawn_failure(actor_id);
                 for job in jobs {
-                    let term = job.execute_and_settle(&mut inner.custody, None);
-                    if let Ok(Some(t)) = term {
-                        if matches!(t.handle, crate::custody::TerminalHandle::Failed { .. }) {
-                            self.unconfirmed_closes.insert(&profile.device_by_id);
-                        }
-                    }
+                    self.enqueue_custody_job(job);
                 }
                 inner.pending_com.remove(&profile.device_by_id);
                 return None;
             }
         };
         if let Some(pre) = displaced {
-            // 同一 by_id 已有其他帳本紀錄（理論上不存在）：不交給新 session，就地關閉（持鎖中，不得再取 manager 鎖）；
-            // 關閉未確認依 D1(iii) 告警並登記阻擋。
-            let receipt = pre.parts.close();
-            if !receipt.closed {
-                self.warn(preopened_close_warning(&profile.device_by_id, &close_error_text(&receipt)));
-                self.unconfirmed_closes.insert(&profile.device_by_id);
-            }
+            // 被拒的 handle 同樣移交，不能在建構者持鎖時直接關閉。
+            self.enqueue_custody_job(crate::custody::ActorExitedJob::CloseHeld {
+                token: pre.custody.unwrap_or_else(|| inner.custody.alloc_token()),
+                by_id: profile.device_by_id.clone(),
+                parts: Some(pre.parts),
+            });
         }
         #[cfg(feature = "test-fakes")]
         self.spawned_workers.fetch_add(1, Ordering::SeqCst);
@@ -2227,7 +2241,7 @@ impl Shared {
     /// 屬 `_active_attach_ops` 的作業：`update_devices` 取消（`origin/main:sw_core/session_manager.py:4035-4043`），由持有
     /// 作業的 attach 中止並 `_finish_attach_op`，關閉未確認即保留（`:4322-4332`）；未取走者由此代為關閉，已取走者由開埠
     /// 路徑與 actor 的 `DeviceDetached` 收尾。
-    fn detach_by_id(&self, by_id: &str, reason: DetachReason) {
+    fn detach_by_id(self: &Arc<Self>, by_id: &str, reason: DetachReason) {
         // session 擁有、尚未由正式 bridge 接手的帳本紀錄（出生即接管、`AcceptCustody`）：可交出的 handle 由此同步關閉
         // 並結算，開埠工作持有中者寫入取消（Python `update_devices` 取消作業，由持有作業的 attach 中止並
         // `_finish_attach_op`，`origin/main:sw_core/session_manager.py:4035-4043`、`:4322-4332`）。
@@ -2261,10 +2275,15 @@ impl Shared {
         let released = self.released_by_ids();
         let pins = self.model_snapshot().profile_pins;
         let mut inner = lock(&self.inner);
+        let unused_handle_token = inner.custody.alloc_token();
         if inner.stopping {
             drop(inner);
             if let Some(pre) = preopened {
-                let _ = pre.parts.close();
+                self.enqueue_custody_job(crate::custody::ActorExitedJob::CloseHeld {
+                    token: pre.custody.unwrap_or(unused_handle_token),
+                    by_id: by_id.to_string(),
+                    parts: Some(pre.parts),
+                });
             }
             self.warn(format!("shutdown 中，略過 attach {by_id}"));
             return;
@@ -2274,7 +2293,11 @@ impl Shared {
         if self.unconfirmed_closes.contains(by_id) {
             drop(inner);
             if let Some(pre) = preopened {
-                let _ = pre.parts.close();
+                self.enqueue_custody_job(crate::custody::ActorExitedJob::CloseHeld {
+                    token: pre.custody.unwrap_or(unused_handle_token),
+                    by_id: by_id.to_string(),
+                    parts: Some(pre.parts),
+                });
             }
             return;
         }
@@ -2290,7 +2313,11 @@ impl Shared {
         }) {
             drop(inner);
             if let Some(pre) = preopened {
-                let _ = pre.parts.close();
+                self.enqueue_custody_job(crate::custody::ActorExitedJob::CloseHeld {
+                    token: pre.custody.unwrap_or(unused_handle_token),
+                    by_id: by_id.to_string(),
+                    parts: Some(pre.parts),
+                });
             }
             return;
         }
@@ -2301,14 +2328,22 @@ impl Shared {
         {
             drop(inner);
             if let Some(pre) = preopened {
-                let _ = pre.parts.close();
+                self.enqueue_custody_job(crate::custody::ActorExitedJob::CloseHeld {
+                    token: pre.custody.unwrap_or(unused_handle_token),
+                    by_id: by_id.to_string(),
+                    parts: Some(pre.parts),
+                });
             }
             return;
         }
         if released.contains(by_id) {
             drop(inner);
             if let Some(pre) = preopened {
-                let _ = pre.parts.close();
+                self.enqueue_custody_job(crate::custody::ActorExitedJob::CloseHeld {
+                    token: pre.custody.unwrap_or(unused_handle_token),
+                    by_id: by_id.to_string(),
+                    parts: Some(pre.parts),
+                });
             }
             return;
         }
@@ -2333,7 +2368,11 @@ impl Shared {
             let real = inner.device_path(by_id).map(str::to_string);
             drop(inner);
             if let Some(pre) = preopened {
-                let _ = pre.parts.close();
+                self.enqueue_custody_job(crate::custody::ActorExitedJob::CloseHeld {
+                    token: pre.custody.unwrap_or(unused_handle_token),
+                    by_id: by_id.to_string(),
+                    parts: Some(pre.parts),
+                });
             }
             if let (Some(rec_path), Some(real)) = (rec_path, real) {
                 if rec_path == real {
@@ -2353,7 +2392,11 @@ impl Shared {
             // Closing；審查 P8-6a679fb-1）：已有綁定的 session 時由其開埠工作接手（交接列），否則由 spawn worker。
             let parked_op = inner.inflight.remove(by_id);
             if let Some(pre) = preopened.take() {
-                let _ = pre.parts.close();
+                self.enqueue_custody_job(crate::custody::ActorExitedJob::CloseHeld {
+                    token: pre.custody.unwrap_or(unused_handle_token),
+                    by_id: by_id.to_string(),
+                    parts: Some(pre.parts),
+                });
             }
             if let Some(op) = parked_op {
                 let taker = match inner.session_by_id(by_id) {
@@ -2369,14 +2412,22 @@ impl Shared {
             }
             drop(inner);
             if let Some(pre) = preopened {
-                let _ = pre.parts.close();
+                self.enqueue_custody_job(crate::custody::ActorExitedJob::CloseHeld {
+                    token: pre.custody.unwrap_or(unused_handle_token),
+                    by_id: by_id.to_string(),
+                    parts: Some(pre.parts),
+                });
             }
             return;
         }
         let Some(real) = inner.device_path(by_id).map(str::to_string) else {
             drop(inner);
             if let Some(pre) = preopened {
-                let _ = pre.parts.close();
+                self.enqueue_custody_job(crate::custody::ActorExitedJob::CloseHeld {
+                    token: pre.custody.unwrap_or(unused_handle_token),
+                    by_id: by_id.to_string(),
+                    parts: Some(pre.parts),
+                });
             }
             return;
         };
@@ -2735,7 +2786,7 @@ impl Shared {
                 error: error.clone().unwrap_or_else(|| "close unconfirmed".into()),
             }
         };
-        inner.custody.terminals.insert(
+        inner.custody.settle_close(
             watch.token,
             crate::custody::Terminal {
                 handle,
@@ -2757,6 +2808,18 @@ impl Shared {
     }
 
     fn finish_worker_op(&self, by_id: &str, op: &AttachOp, close_receipt: Option<CloseReceipt>) {
+        // actor 建構失敗已把 handle 交獨立 closer：attach 工作者等配對終態後才完成自己的作業。
+        // Condvar 釋放 manager 鎖；查詢、release 與 shutdown 的期限不受此等待影響。
+        {
+            let mut inner = lock(&self.inner);
+            while inner.custody.get_custody(by_id).is_some_and(|rec| {
+                op.custody_token() == Some(rec.token)
+                    && rec.owner == crate::custody::CustodyOwner::Reaper
+                    && matches!(rec.phase, crate::custody::CustodyPhase::Closing { .. })
+            }) {
+                inner = self.cv.wait(inner).unwrap_or_else(|e| e.into_inner());
+            }
+        }
         if let Some(receipt) = close_receipt.as_ref().filter(|receipt| !receipt.closed) {
             // 呼叫端直接帶入的失敗回條（未經 `close_parts`）同樣留下錯誤內容並登記未確認關閉。
             op.mark_close_failed(close_error_text(receipt));
@@ -2764,9 +2827,7 @@ impl Shared {
         // Python `_finish_attach_op`（`session_manager.py:4322-4332`）：關閉失敗先以 by_id 與例外告警，
         // 再保留阻擋；每次失敗的關閉只告警一次（Rust 的 handle 只關閉一次）。`close_error` 只隨 `close_failed`
         // 一起寫入，告警與否不影響下方的保留判定。
-        if let Some(error) = lock(&op.close_error).take() {
-            self.warn(preopened_close_warning(by_id, &error));
-        }
+        let close_error = lock(&op.close_error).take();
         #[cfg(feature = "test-fakes")]
         {
             let hook = {
@@ -2783,13 +2844,33 @@ impl Shared {
         let mut inner = lock(&self.inner);
         if op.close_failed.load(Ordering::SeqCst) {
             self.unconfirmed_closes.insert(by_id);
-            let err = lock(&op.close_error).clone().unwrap_or_else(|| "close unconfirmed".into());
-            if let Some(rec) = inner.custody.custody.get_mut(by_id) {
-                rec.phase = crate::custody::CustodyPhase::CloseFailed { error: err.clone() };
+            let err = close_error.clone().or_else(|| inner.custody.get_custody(by_id).and_then(|rec| {
+                if let crate::custody::CustodyPhase::CloseFailed { error } = &rec.phase { Some(error.clone()) } else { None }
+            })).unwrap_or_else(|| "close unconfirmed".into());
+            let terminal = crate::custody::Terminal {
+                handle: crate::custody::TerminalHandle::Failed { error: err.clone() },
+                evidence: crate::custody::TerminalEvidence::Complete,
+            };
+            if let Some(token) = op.custody_token() {
+                if !inner.custody.terminals.contains_key(&token) {
+                    inner.custody.settle_close(token, terminal.clone());
+                }
             }
-            // S2-PAR-wp510r 第 15 項：作業保留（D1 iii），等待它的 release 收到失敗終態後依 T-1 於首次期限回 DRAIN_STALLED。
+            // Reaper 已持有本 token 的失敗終態，阻擋由帳本承擔；結束已完成的 attach 作業。
+            let reaper_settled = inner.custody.get_custody(by_id).is_some_and(|rec| {
+                op.custody_token() == Some(rec.token)
+                    && rec.owner == crate::custody::CustodyOwner::Reaper
+                    && matches!(rec.phase, crate::custody::CustodyPhase::CloseFailed { .. })
+            });
+            if reaper_settled && inner.inflight.get(by_id).is_some_and(|current| Arc::ptr_eq(&current.cancelled, &op.cancelled)) {
+                inner.inflight.remove(by_id);
+            }
             let watch = Self::settle_release_watch_locked(&mut inner, op, false, Some(err));
             drop(inner);
+            if close_error.is_some() {
+                self.report_custody_terminal(by_id, op.custody_token().unwrap_or(op.token), &terminal);
+            }
+            self.cv.notify_all();
             Self::notify_release_watch(watch);
             return;
         }
@@ -3479,7 +3560,7 @@ impl Shared {
     /// `claim_parked`（同 token，owner 改為該 session，handle 存回 `Held{Session}`，parked 作業移出在途表），再
     /// `try_send CustodyOffer`（送不出去時由 actor 的 `CustodyPoll` 補收）。請求未被接受時不認領，紀錄維持 Parked
     /// （Python `_attach_by_id` 自 `_preopened_ports` 取走作業以同一 handle 續行，`origin/main:sw_core/session_manager.py:4852-4854`）。
-    fn offer_parked_to_session(&self, sid: &str, by_id: &str, token: u64, real: &str) {
+    fn offer_parked_to_session(self: &Arc<Self>, sid: &str, by_id: &str, token: u64, real: &str) {
         if !self.begin_external_attach(sid, by_id, token, real) {
             return;
         }
@@ -4958,7 +5039,7 @@ impl ManagerExec {
                     }
                 };
                 if let Some(parts) = parts {
-                    ctx.shared.finish_custody_close(&by_id, token, parts.close(), None);
+                    ctx.shared.spawn_custody_closer(by_id, token, parts, None);
                 }
             }
         }));
@@ -5171,7 +5252,7 @@ impl ManagerExec {
                 };
                 self.shared.cv.notify_all();
                 if let Some(parts) = close {
-                    self.shared.finish_custody_close(&by_id, token, parts.close(), None);
+                    self.shared.spawn_custody_closer(by_id.clone(), token, parts, None);
                 }
                 drop(worker);
                 feedback.push_back(ControlEvent::RetireResult {
@@ -5424,10 +5505,9 @@ impl EffectExecutor for ManagerExec {
                 if let Some(worker) = worker {
                     worker.finish_async(stop_id, safety.clone());
                 }
-                let mut inner = lock(&self.shared.inner);
-                let jobs = inner.custody.claim_for_stop(self.actor_id, crate::custody::CustodyCancel::Release);
+                let jobs = lock(&self.shared.inner).custody.claim_for_stop(self.actor_id, crate::custody::CustodyCancel::Release);
                 for job in jobs {
-                    let _ = job.execute_and_settle(&mut inner.custody, Some(safety));
+                    self.shared.enqueue_custody_job(job);
                 }
                 if self.listener_epoch == Some(epoch) {
                     self.listener_epoch = None;
@@ -5586,9 +5666,9 @@ impl EffectExecutor for ManagerExec {
     }
 }
 
-impl crate::custody::ReaperCallback for Shared {
+impl Shared {
     fn handle_cmd(
-        &self,
+        self: &Arc<Self>,
         cmd: crate::custody::ReaperCmd,
         event_tx: &crossbeam_channel::Sender<ControlEvent>,
     ) -> usize {
@@ -5605,44 +5685,13 @@ impl crate::custody::ReaperCallback for Shared {
                     inner.custody.handle_actor_exited(actor)
                 };
                 for job in jobs {
-                    match job {
-                        crate::custody::ActorExitedJob::CloseHeld { token, parts, by_id: _ } => {
-                            let receipt = parts.map(|p| p.close());
-                            let (handle_term, evidence_term) = match receipt {
-                                Some(r) if r.closed => (
-                                    crate::custody::TerminalHandle::Closed,
-                                    crate::custody::TerminalEvidence::Complete,
-                                ),
-                                Some(r) => (
-                                    crate::custody::TerminalHandle::Failed {
-                                        error: r
-                                            .error
-                                            .map(|e| e.py_message)
-                                            .unwrap_or_else(|| "handle close failed".into()),
-                                    },
-                                    crate::custody::TerminalEvidence::Complete,
-                                ),
-                                None => (
-                                    crate::custody::TerminalHandle::Closed,
-                                    crate::custody::TerminalEvidence::Complete,
-                                ),
-                            };
-                            let term = crate::custody::Terminal {
-                                handle: handle_term,
-                                evidence: evidence_term,
-                            };
-                            let mut inner = lock(&self.inner);
-                            inner.custody.settle_close(token, term);
-                        }
-                        crate::custody::ActorExitedJob::DrainBridge { worker, stop_id, .. } => {
-                            if let Some(worker) = worker {
-                                pending_receipts += usize::from(
-                                    worker.finish_async(stop_id, event_tx.clone()),
-                                );
-                            }
-                        }
-                    }
+                    pending_receipts += self.dispatch_custody_job(job, event_tx);
                 }
+            }
+            crate::custody::ReaperCmd::RunJob { job } => {
+                // 建構者已在鎖內完成認領；先跨過鎖屏障才啟動關閉。
+                drop(lock(&self.inner));
+                pending_receipts += self.dispatch_custody_job(*job, event_tx);
             }
             crate::custody::ReaperCmd::Reclaim { actor, token, epoch, worker } => {
                 let mut inner = lock(&self.inner);
@@ -5676,19 +5725,16 @@ impl crate::custody::ReaperCallback for Shared {
                 .custody
                 .iter()
                 .find_map(|(by_id, rec)| (rec.token == token).then(|| by_id.clone()));
-            let watchers = by_id
-                .map(|by_id| Self::take_custody_watchers_locked(&mut inner, &by_id, Some(token)))
+            let watchers = by_id.as_ref()
+                .map(|by_id| Self::take_custody_watchers_locked(&mut inner, by_id, Some(token)))
                 .unwrap_or_default();
             let res = inner.custody.settle_worker_stopped(token, receipt);
             if let Ok(terminal) = res {
-                if let crate::custody::TerminalEvidence::Incomplete { gaps, wal_error } = &terminal.evidence {
-                    let mut parts = gaps.clone();
-                    if let Some(err) = wal_error {
-                        parts.push(format!("wal_error: {err}"));
-                    }
-                    (self.warn)(format!("worker 排空證據不完整（token={token}）：{}", parts.join(", ")));
-                }
                 drop(inner);
+                if let Some(by_id) = by_id {
+                    self.report_custody_terminal(&by_id, token, &terminal);
+                }
+                self.cv.notify_all();
                 let (closed, error) = match &terminal.handle {
                     crate::custody::TerminalHandle::Failed { error } => (false, Some(error.clone())),
                     _ => (true, None),
@@ -5731,6 +5777,18 @@ impl crate::custody::ReaperCallback for WeakSharedReaper {
         } else {
             match cmd {
                 crate::custody::ReaperCmd::ActorExited { .. } => 0,
+                crate::custody::ReaperCmd::RunJob { job } => {
+                    let event_tx = event_tx.clone();
+                    std::thread::spawn(move || match *job {
+                        crate::custody::ActorExitedJob::CloseHeld { parts, .. } => {
+                            if let Some(parts) = parts { let _ = parts.close(); }
+                        }
+                        crate::custody::ActorExitedJob::DrainBridge { worker, stop_id, .. } => {
+                            if let Some(worker) = worker { worker.finish_async(stop_id, event_tx); }
+                        }
+                    });
+                    0
+                }
                 crate::custody::ReaperCmd::Reclaim { worker, .. } => {
                     usize::from((*worker).finish_async(crate::drain::StopId(0), event_tx.clone()))
                 }
@@ -5868,6 +5926,7 @@ impl SessionManager {
             #[cfg(feature = "test-fakes")]
             adopt_after_claim_hook: Mutex::new(None),
             reaper_cmd_tx,
+            failed_closes: Mutex::new(Vec::new()),
         });
         let reaper_thread = crate::custody::ReaperThread::start(
             reaper_cmd_rx,
@@ -7204,6 +7263,26 @@ impl SessionManager {
         token
     }
 
+    /// 只供測試：以實際記憶體 handle 重現 actor 尚未接手的 Held 窗口。
+    #[cfg(feature = "test-fakes")]
+    pub fn custody_register_held_parts_for_test(
+        &self,
+        by_id: &str,
+        real_path: &str,
+        parts: HandleParts,
+    ) -> (crate::custody::ActorId, u64) {
+        let actor = crate::custody::ActorId::allocate();
+        let mut inner = lock(&self.shared.inner);
+        let token = inner.custody.register(
+            by_id, real_path,
+            crate::custody::CustodyOwner::Session { actor },
+            crate::custody::CustodyTaker::OpenJob { actor },
+        ).expect("測試 Held 登記");
+        inner.custody.custody.get_mut(by_id).unwrap().phase =
+            crate::custody::CustodyPhase::Held { parts: Some(parts) };
+        (actor, token)
+    }
+
     /// 只供測試（test-fakes）：取得回收者命令通道。
     #[cfg(feature = "test-fakes")]
     pub fn reaper_cmd_sender_for_test(&self) -> crossbeam_channel::Sender<crate::custody::ReaperCmd> {
@@ -7513,6 +7592,7 @@ impl SessionManager {
             for op in inner.inflight.values() {
                 op.cancel();
             }
+            let inflight_targets = inner.inflight.keys().cloned().collect();
             let to_claim: Vec<(String, u64, AttachOp)> = inner
                 .inflight
                 .iter()
@@ -7526,6 +7606,7 @@ impl SessionManager {
                         let real_path = inner.device_path(&by_id).unwrap_or("").to_string();
                         Preopened::claimed(real_path, parts, token)
                     }).or_else(|| op.take_preopened());
+                    inner.inflight.remove(&by_id);
                     (by_id, op, pre)
                 })
                 .collect();
@@ -7535,26 +7616,15 @@ impl SessionManager {
                     .values()
                     .map(|e| (e.sid.clone(), e.actor.clone(), e.fence.clone()))
                     .collect(),
-                inner.inflight.keys().cloned().collect(),
+                inflight_targets,
                 unconsumed_list,
             )
         };
         // Python `shutdown_drain` 對未消費的 `_preopened_ports` 作業直接 `_finish_attach_op`（關閉 handle；關閉失敗保留作業、
         // 列為 stalled，`origin/main:sw_core/session_manager.py:1218-1227`、`:1231-1239`）。
         for (by_id, op, pre) in unconsumed {
-            let token = pre.as_ref().and_then(|pre| pre.custody);
-            let receipt = match pre {
-                Some(pre) => Some(op.close_parts(pre.parts)),
-                None => op.close_preopened_with_receipt(),
-            };
-            let closed = receipt.as_ref().is_some_and(|receipt| receipt.closed);
-            self.shared.finish_worker_op(&by_id, &op, receipt);
-            // S2-PAR-wp510r R6（DR-5 c、C3）：shutdown 掃描自帳本認領（`claim_for_release` → Closing）的 parked handle 確認
-            // 關閉後，以同一 token 配對結算（移除紀錄、終態 Closed）；closed:false 由 `finish_worker_op` 轉 CloseFailed。
-            if let (true, Some(token)) = (closed, token) {
-                lock(&self.shared.inner)
-                    .custody
-                    .settle_claimed_close(&by_id, token, closed_terminal());
+            if let Some(pre) = pre.or_else(|| op.take_preopened()) {
+                self.shared.spawn_release_claim_closer(by_id, pre);
             }
         }
 
@@ -7632,7 +7702,13 @@ impl SessionManager {
         }
         let wait_attach = |by_id: &str| -> bool {
             let mut inner = lock(&self.shared.inner);
-            while inner.inflight.contains_key(by_id) {
+            // parked 已移交 closer，仍須以原本的目標回報；作業移出不等於配對關閉回條已到。
+            while inner.inflight.contains_key(by_id) || inner.custody.get_custody(by_id).is_some() {
+                if inner.custody.get_custody(by_id).is_some_and(|rec| {
+                    matches!(rec.phase, crate::custody::CustodyPhase::CloseFailed { .. })
+                }) {
+                    return false;
+                }
                 let now = Instant::now();
                 if now >= deadline {
                     break;
@@ -7644,7 +7720,7 @@ impl SessionManager {
                     .unwrap_or_else(|e| e.into_inner())
                     .0;
             }
-            !inner.inflight.contains_key(by_id)
+            !inner.inflight.contains_key(by_id) && inner.custody.get_custody(by_id).is_none()
         };
         let mut reported: HashSet<String> = HashSet::new();
         let mut inflight_settled = true;

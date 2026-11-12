@@ -266,6 +266,7 @@ impl ActorExitedJob {
     /// 執行關閉或啟動排空，並於 CloseHeld 時結算進帳本回傳 terminal。
     /// 若為 DrainBridge 且缺少 reaper_tx，回傳錯誤並完整歸還原工作所有權，不得消耗 worker。
     #[allow(clippy::result_large_err)]
+    #[cfg(feature = "test-fakes")]
     pub fn execute_and_settle(
         self,
         ledger: &mut CustodyLedger,
@@ -391,6 +392,8 @@ impl IntoReclaimWorker for MockWorker {
 /// 回收者命令（經無界通道送出，Drop 絕不取 manager 鎖）。
 pub enum ReaperCmd {
     ActorExited { actor: ActorId },
+    /// 已在 manager 鎖內認領的收尾工作；回收者只分派，實際 close 交獨立工作者。
+    RunJob { job: Box<ActorExitedJob> },
     Reclaim { actor: ActorId, token: u64, epoch: u64, worker: Box<ReclaimWorker> },
 }
 
@@ -883,7 +886,7 @@ impl CustodyLedger {
             return Err(CustodySettleError::AlreadySettled);
         }
 
-        let (by_id, expected_epoch, expected_stop_id) = match self.custody.iter().find(|(_, v)| v.token == token) {
+        let (_by_id, expected_epoch, expected_stop_id) = match self.custody.iter().find(|(_, v)| v.token == token) {
             Some((k, v)) => match &v.phase {
                 CustodyPhase::BridgeDraining { epoch, stop_id } => (k.clone(), *epoch, *stop_id),
                 _ => return Err(CustodySettleError::InvalidPhase),
@@ -930,21 +933,7 @@ impl CustodyLedger {
             evidence: evidence_term,
         };
 
-        self.terminals.insert(token, terminal.clone());
-
-        // 依 C3 處置紀錄
-        match &terminal.handle {
-            TerminalHandle::Closed | TerminalHandle::NoHandle => {
-                self.custody.remove(&by_id);
-                self.tombstones.insert(token);
-            }
-            TerminalHandle::Failed { error } => {
-                if let Some(rec) = self.custody.get_mut(&by_id) {
-                    rec.phase = CustodyPhase::CloseFailed { error: error.clone() };
-                }
-                self.unconfirmed.insert(&by_id);
-            }
-        }
+        self.settle_close(token, terminal.clone());
 
         Ok(terminal)
     }
@@ -955,14 +944,7 @@ impl CustodyLedger {
             handle: TerminalHandle::Failed { error: "unknown".into() },
             evidence: TerminalEvidence::Complete,
         };
-        self.terminals.insert(token, terminal.clone());
-        let by_id_found = self.custody.iter().find_map(|(k, v)| (v.token == token).then(|| k.clone()));
-        if let Some(by_id) = by_id_found {
-            if let Some(rec) = self.custody.get_mut(&by_id) {
-                rec.phase = CustodyPhase::CloseFailed { error: "unknown".into() };
-            }
-            self.unconfirmed.insert(&by_id);
-        }
+        self.settle_close(token, terminal.clone());
         terminal
     }
 

@@ -6860,3 +6860,68 @@ fn wp510r_r6_dr5_a_w6_open_returns_after_handoff_commit_closes_only() {
     let session = m.session("COM0");
     assert_eq!(session.get("attached_real_path"), Some(&PyValue::Null), "沒有 IoWorker：{session:?}");
 }
+
+/// 第 20 項 r3-M1／DR-9：actor 建構失敗且關閉卡住時，manager 查詢、release 與 shutdown 各自有界。
+#[test]
+fn wp510r_i20_actor_spawn_failure_close_pause_keeps_manager_responsive() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const BY_ID: &str = "/s/by-id/usb-I20";
+    const REAL: &str = "/dev/ttyI20Spawn";
+    const SID: &str = "gone-template:COM120";
+    let mut loaded = LoadedState::default();
+    loaded.released.insert(SID.into(), released_row(BY_ID));
+    let target = t_target("COM0", 1, "/s/by-id/i20-offline");
+    let m = ManagerRig::with(&manager_yaml(&[&target]), loaded, None);
+    m.add_device_at(BY_ID, REAL);
+    let dev = m.device(REAL);
+    install_shell_replies(&dev);
+    dev.pause_next_close();
+    sw_core::actor::inject_actor_spawn_fail_for("t:COM120");
+    m.mgr.update_devices(&m.snapshot());
+    assert!(is_ok(&m.mgr.attach_released_placeholder(SID, false).unwrap()));
+    assert!(dev.wait_paused(Duration::from_secs(5)), "建構失敗後關閉已暫停");
+
+    let (query_tx, query_rx) = crossbeam_channel::bounded(1);
+    let mgr = m.mgr.clone();
+    let query = std::thread::spawn(move || {
+        let start = Instant::now();
+        let ids = mgr.session_ids();
+        let token = mgr.custody_for_test(BY_ID).map(|rec| rec.token);
+        query_tx.send((ids, token, start.elapsed())).unwrap();
+    });
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let mgr = m.mgr.clone();
+    let release = std::thread::spawn(move || {
+        let start = Instant::now();
+        let reply = mgr.route("t:COM0", SessionRequest::Release { source: "agent".into(), reason: PyValue::Null }, RPC);
+        release_tx.send((reply, start.elapsed())).unwrap();
+    });
+    let query_result = query_rx.recv_timeout(Duration::from_secs(1));
+    let release_result = release_rx.recv_timeout(Duration::from_secs(1));
+    let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
+    let mgr = m.mgr.clone();
+    let shutdown = std::thread::spawn(move || {
+        let start = Instant::now();
+        let report = mgr.shutdown(Duration::from_millis(300));
+        shutdown_tx.send((report, start.elapsed())).unwrap();
+    });
+    let shutdown_result = shutdown_rx.recv_timeout(Duration::from_secs(1));
+    dev.release_pause();
+    query.join().unwrap();
+    release.join().unwrap();
+    shutdown.join().unwrap();
+    sw_core::actor::inject_actor_spawn_fail_clear();
+
+    let (ids, token, query_elapsed) = query_result.expect("建構失敗的 close 暫停不能阻塞 manager 查詢");
+    assert!(!ids.contains(&"t:COM120".to_string()));
+    assert!(query_elapsed < Duration::from_secs(1), "DR-9 查詢：{query_elapsed:?}");
+    let (reply, elapsed) = release_result.expect("其他 session release 不得卡在 manager 鎖");
+    assert!(is_ok(&reply.unwrap()));
+    assert!(elapsed < Duration::from_secs(1), "release：{elapsed:?}");
+    let (report, elapsed) = shutdown_result.expect("shutdown 不得卡在 manager 鎖");
+    assert!(elapsed < Duration::from_secs(1), "shutdown：{elapsed:?}");
+    assert!(report.iter().any(|(key, ok)| key == &format!("attach:{BY_ID}") && !ok), "{report:?}");
+    wait_until("建構失敗的 handle 配對回條", || !dev.is_open() && m.mgr.custody_for_test(BY_ID).is_none());
+    assert_eq!(dev.close_count(), 1, "handle 恰好關閉一次");
+    assert_eq!(m.mgr.terminal_for_test(token.expect("Closing token")).unwrap().handle, sw_core::custody::TerminalHandle::Closed);
+}
