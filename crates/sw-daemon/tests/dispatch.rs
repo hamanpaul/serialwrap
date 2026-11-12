@@ -23,6 +23,67 @@ use sw_core::custody::CustodyPhaseSnapshot;
 /// `foreign_holders` 會讀取行程內共用的 holder_unknown 登錄（#11）；登錄／精確比對 foreign_holders 的測試彼此序列化。
 static HOLDER_REGISTRY: Mutex<()> = Mutex::new(());
 
+/// 第 25 項 Medium：bind 通知逾時後才登記舊義務，裝置已改指並完成重新連線。
+/// Python self_test 讀目前 _devices（origin/main:sw_core/session_manager.py:7658-7685）。
+#[test]
+fn wp510r_i25_rpc_late_delivery_registration_cannot_revert_current_path() {
+    let serial = FakeSerialBackend::new();
+    let old = serial.add_device(REAL_A);
+    let new = serial.add_device("/fake/i25-new");
+    support::install_shell_replies(&old);
+    support::install_shell_replies(&new);
+    let r = Arc::new(ServiceRig::build_with_serial_backend(RigSpec {
+        yaml: format!("profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\ntargets:\n  - {{com: COM0, profile: t, device_by_id: {BY_ID_A}}}\n"),
+        devices: vec![(BY_ID_A.into(), REAL_A.into())],
+        explicit_target_count: 1, allowlist: None, wait_ready: vec!["COM0".into()],
+    }, Some(serial)));
+    let sid = r.mgr.resolve("COM0").unwrap();
+    assert_eq!(r.call("device.release", r#"{"selector":"COM0"}"#).get("ok"), Some(&PyValue::Bool(true)));
+    let (held_tx, held_rx) = crossbeam_channel::bounded(1);
+    let manager = r.mgr.clone();
+    let hold_sid = sid.clone();
+    r.mgr.set_bind_pre_device_online_hook_for_test(Box::new(move || {
+        let (entered, resume) = manager.pause_next_request_for_test(&hold_sid).unwrap();
+        let query_mgr = manager.clone();
+        let query_sid = hold_sid.clone();
+        let query = std::thread::spawn(move || { let _ = query_mgr.session_queue_lens(&query_sid); });
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let control = manager.actor_control_for_test(&hold_sid).unwrap();
+        let mut filled = 0;
+        while control.try_send(sw_core::mailbox::ControlEvent::ConsoleCountChanged { count: 0 }).is_ok() { filled += 1; }
+        assert!(filled > 0);
+        held_tx.send((resume, query)).unwrap();
+    }));
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
+    r.mgr.set_bind_delivery_pre_register_hook_for_test(Box::new(move || {
+        entered_tx.send(()).unwrap();
+        resume_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+    }));
+    let bound_r = r.clone();
+    let bound = std::thread::spawn(move || bound_r.call("session.bind", &format!(r#"{{"selector":"COM0","device_by_id":"{BY_ID_A}"}}"#)));
+    let (actor_resume, query) = held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    actor_resume.send(()).unwrap();
+    query.join().unwrap();
+    r.mgr.update_devices(&[(BY_ID_A.into(), DeviceInfo { by_id: BY_ID_A.into(), real_path: "/fake/i25-new".into() })]);
+    r.wait_state("COM0", "READY");
+    let before = r.call("session.self_test", r#"{"selector":"COM0"}"#);
+    resume_tx.send(()).unwrap();
+    let bind = bound.join().unwrap();
+    wait_until("過期義務已被丟棄", || !r.mgr.delivery_obligation_for_test(&sid));
+    // 同 control lane 的查詢屏障，確定已入列的舊通知也處理完畢。
+    let _ = r.session("COM0").unwrap();
+    let after = r.call("session.self_test", r#"{"selector":"COM0"}"#);
+    assert_eq!(bind.get("ok"), Some(&PyValue::Bool(true)));
+    assert_eq!(s(&before, "current_real_path"), "/fake/i25-new");
+    assert_ne!(s(&after, "classification"), "DEVICE_REBOUND_REQUIRED", "過期通知不得污染診斷：{}", j(&after));
+    assert_eq!(jv(after.get("current_real_path").unwrap()), jv(&PyValue::from("/fake/i25-new")));
+    assert_eq!(s(&after, "attached_real_path"), "/fake/i25-new");
+    assert_eq!(r.mgr.delivery_delivered_for_test(&sid), 0, "過期義務必須丟棄，不能送達");
+    assert_eq!(new.open_attempts(), 1, "只開啟目前路徑一次");
+}
+
 fn holder_lock() -> std::sync::MutexGuard<'static, ()> {
     HOLDER_REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
 }

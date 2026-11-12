@@ -65,6 +65,9 @@ const HANDOFF_DEFERRED_EVENTS_MAX: usize = 1024;
 /// S2-PAR-wp510r R4（設計 C4）：W6 等 offer 時的補收週期（`TimerEvent::CustodyPoll`）。
 const CUSTODY_POLL_INTERVAL_NS: Mono = 500_000_000;
 
+/// 只讀 manager 的裝置與綁定事實；在事件實際套用（含凍結重播）時查詢。
+type DeviceDeliveryValidator = Arc<dyn Fn(&str, &str, u64) -> bool + Send + Sync>;
+
 /// P8 Task 8：`FlashSyncProbeStart`／`FlashSyncMatched` 的拒絕原因（09 計畫 Task 8 狀態轉移表）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlashReject {
@@ -318,6 +321,7 @@ pub enum SessionRequest {
     DeviceOnline {
         by_id: String,
         real_path: String,
+        bind_gen: u64,
     },
     /// P8 Task 6：`file.push`／`file.pull`（RPC 層已轉型；閘門、lease、前景槽在 actor 內原子判定）。
     FileTransfer(FileTransferRequest),
@@ -633,6 +637,7 @@ pub struct SessionCore {
     reopen_after_retired: bool,
     open_generation: u64,
     known_real_path: Option<String>,
+    device_delivery_validator: Option<DeviceDeliveryValidator>,
     device_present: bool,
     /// P7 Task 5：readiness reprobe 進度（`reprobe_attempts`／`next_reprobe_at`／`reprobe_exhausted`、single-flight）。
     reprobe: crate::reprobe::ReprobeState,
@@ -1004,6 +1009,7 @@ impl SessionCore {
             reopen_after_retired: false,
             open_generation: 0,
             known_real_path: None,
+            device_delivery_validator: None,
             device_present: false,
             reprobe: crate::reprobe::ReprobeState::default(),
             login_rx_before: None,
@@ -1148,6 +1154,17 @@ impl SessionCore {
     /// SC-28：TCP console 後端（human console 經 127.0.0.1 Telnet listener；SessionPublic 輸出 `console_endpoint`）。
     pub fn set_tcp_console(&mut self, on: bool) {
         self.human.tcp_console = on;
+    }
+
+    /// manager 注入目前裝置路徑／綁定世代的只讀查詢，避免重試事件使用入列時的舊快照。
+    pub fn set_device_delivery_validator(&mut self, validator: DeviceDeliveryValidator) {
+        self.device_delivery_validator = Some(validator);
+    }
+
+    fn device_delivery_current(&self, by_id: &str, real_path: &str, bind_gen: u64) -> bool {
+        self.profile.device_by_id == by_id
+            && self.binding_generation == bind_gen
+            && self.device_delivery_validator.as_ref().is_none_or(|validate| validate(by_id, real_path, bind_gen))
     }
 
     /// 處理一個事件；`now` 為 monotonic（Mono）。
@@ -1393,9 +1410,18 @@ impl SessionCore {
                     .extend(self.begin_stop(StopKind::Shutdown, Some(reply), now).0);
             }
             MailboxItem::Control(ControlEvent::DeviceAttached { by_id, real_path }) => {
-                effects
-                    .0
-                    .extend(self.device_attached(&by_id, &real_path, false, now));
+                // watcher 的目前裝置事實與「重試開埠」分開：合法改指即使在 READY／FLASHING 也要供 self-test／收尾讀取，
+                // 但先以 manager 目前路徑重驗；送達義務不能走這條不帶原綁定世代的觀測入口。
+                if self.device_delivery_current(&by_id, &real_path, self.binding_generation) {
+                    self.device_present = true;
+                    self.known_real_path = Some(real_path.clone());
+                    effects.0.extend(self.device_attached(&by_id, &real_path, false, now));
+                }
+            }
+            MailboxItem::Control(ControlEvent::DeviceAttachedRetry { by_id, real_path, bind_gen }) => {
+                if self.device_delivery_current(&by_id, &real_path, bind_gen) {
+                    effects.0.extend(self.device_attached(&by_id, &real_path, false, now));
+                }
             }
             MailboxItem::Control(ControlEvent::DeviceDetached { by_id, reason }) => {
                 if by_id == self.profile.device_by_id {
@@ -3175,9 +3201,13 @@ impl SessionCore {
                 self.profile.alias = alias;
                 vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
             }
-            SessionRequest::DeviceOnline { by_id, real_path } => {
+            SessionRequest::DeviceOnline { by_id, real_path, bind_gen } => {
                 // 回覆先於 OpenBridge（executor 依序執行；開埠可能阻塞）。
-                let opened = self.device_attached(&by_id, &real_path, true, now);
+                let opened = if self.device_delivery_current(&by_id, &real_path, bind_gen) {
+                    self.device_attached(&by_id, &real_path, true, now)
+                } else {
+                    Vec::new()
+                };
                 let mut effects = vec![Effect::Reply(reply, Ok(self.ok_session(now)))];
                 effects.extend(opened);
                 effects
@@ -3806,8 +3836,6 @@ impl SessionCore {
         if by_id != self.profile.device_by_id {
             return Vec::new();
         }
-        self.device_present = true;
-        self.known_real_path = Some(real_path.to_string());
         if self.shutdown_requested {
             return Vec::new();
         }
@@ -3818,6 +3846,8 @@ impl SessionCore {
         if self.state != SessionState::Detached && !awaiting {
             return Vec::new();
         }
+        self.device_present = true;
+        self.known_real_path = Some(real_path.to_string());
         if self.close_unconfirmed() {
             // wp510 第 13 項：未確認關閉的 by_id 不開埠。Python `_spawn_attach`／`_attach_by_id` 早退、不改狀態
             // （`origin/main:sw_core/session_manager.py:4113-4114`、`:4847-4848`）；bind 已先設 ATTACHING。

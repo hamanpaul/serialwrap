@@ -52,6 +52,12 @@ pub enum ControlEvent {
         by_id: String,
         real_path: String,
     },
+    /// 送達義務的重試通知；套用時重驗目前路徑與綁定世代。T14：Open 處理、Pending 延後、Permanent 丟棄。
+    DeviceAttachedRetry {
+        by_id: String,
+        real_path: String,
+        bind_gen: u64,
+    },
     DeviceDetached {
         by_id: String,
         reason: DetachReason,

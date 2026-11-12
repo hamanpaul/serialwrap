@@ -801,7 +801,7 @@ fn wait_state_in_process(socket: &Path, com: &str, want: &str) {
 }
 
 /// shell 假 DUT（FakeSerial）：`\n` → prompt；`__READY__<nonce>` → nonce＋prompt（與 `ServiceRig` 相同）。
-fn install_shell_replies(dev: &sw_pal::fakes::FakeDevice) {
+pub fn install_shell_replies(dev: &sw_pal::fakes::FakeDevice) {
     service_rig::install_shell_replies(dev);
 }
 

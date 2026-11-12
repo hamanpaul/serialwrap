@@ -628,6 +628,91 @@ fn test_reclaim_drop_does_not_take_lock() {
 }
 
 #[test]
+fn wp510r_i25_actor_rejects_old_binding_generation_even_after_binding_back() {
+    use sw_core::session_core::{Effect, SessionRequest, SessionState};
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    for by_id in ["other-by-id", DEVICE_BY_ID] {
+        assert_eq!(h.rpc(SessionRequest::Bind { by_id: by_id.into() }).unwrap()["ok"], PyValue::Bool(true));
+    }
+    // by-id 與路徑相同仍不能接受改綁前的世代。
+    let stale = h.feed(ControlEvent::DeviceAttachedRetry { by_id: DEVICE_BY_ID.into(), real_path: REAL_PATH.into(), bind_gen: 0 });
+    assert!(!stale.iter().any(|e| matches!(e, Effect::OpenBridge { .. })));
+    assert_eq!(h.core.state(), SessionState::Detached);
+    let current = h.feed(ControlEvent::DeviceAttachedRetry { by_id: DEVICE_BY_ID.into(), real_path: REAL_PATH.into(), bind_gen: 2 });
+    assert!(current.iter().any(|e| matches!(e, Effect::OpenBridge { .. })), "目前世代仍須正常開埠");
+}
+
+#[test]
+fn wp510r_i25_actor_revalidates_delivery_path_after_pending_and_discards_permanent() {
+    use sw_core::session_core::{Effect, SessionRequest, SessionState};
+    for permanent in [false, true] {
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        let valid = Arc::new(AtomicBool::new(true));
+        let current = valid.clone();
+        h.core.set_device_delivery_validator(Arc::new(move |by_id, path, generation| {
+            current.load(Ordering::SeqCst) && by_id == DEVICE_BY_ID && path == REAL_PATH && generation == 0
+        }));
+        let gate = h.reg.admission_gate();
+        let token = match gate.freeze_if_idle("i25-pending") {
+            FreezeOutcome::Frozen { token, .. } => token,
+            other => panic!("凍結失敗：{other:?}"),
+        };
+        assert!(h.feed(ControlEvent::DeviceAttachedRetry { by_id: DEVICE_BY_ID.into(), real_path: REAL_PATH.into(), bind_gen: 0 }).is_empty());
+        assert_eq!(h.core.state(), SessionState::Detached, "Pending 不開埠");
+        if permanent {
+            assert!(gate.commit_handoff(&token));
+        } else {
+            valid.store(false, Ordering::SeqCst);
+            assert!(gate.thaw(&token));
+        }
+        let replay = h.feed(ControlEvent::Tick);
+        assert!(!replay.iter().any(|e| matches!(e, Effect::OpenBridge { .. })));
+        assert_eq!(h.core.state(), SessionState::Detached);
+        // DeviceOnline 是帶回覆的同一送達入口，也必須重驗路徑。
+        valid.store(false, Ordering::SeqCst);
+        let (_, effects) = h.rpc_full(SessionRequest::DeviceOnline { by_id: DEVICE_BY_ID.into(), real_path: REAL_PATH.into(), bind_gen: 0 });
+        assert!(!effects.iter().any(|e| matches!(e, Effect::OpenBridge { .. })));
+        assert_eq!(h.core.state(), SessionState::Detached);
+    }
+}
+
+#[test]
+fn wp510r_i25_ignored_device_attached_does_not_overwrite_diagnostic_path() {
+    use sw_core::session_core::SessionRequest;
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_attached(Some("LOGIN_REQUIRED"));
+    h.core.set_device_delivery_validator(Arc::new(|by_id, path, _| by_id == DEVICE_BY_ID && path == REAL_PATH));
+    h.feed(ControlEvent::DeviceAttached { by_id: DEVICE_BY_ID.into(), real_path: "/fake/stale".into() });
+    let response = h.rpc(SessionRequest::SelfTest { timeout_s: 1.0, strict_human_lock: false }).unwrap();
+    assert_ne!(response["classification"], PyValue::from("DEVICE_REBOUND_REQUIRED"));
+    assert_eq!(response["current_real_path"], PyValue::from(REAL_PATH));
+    assert_eq!(response["attached_real_path"], PyValue::from(REAL_PATH));
+}
+
+#[test]
+fn wp510r_i25_deliverer_does_not_retry_before_backoff_deadline() {
+    let t0 = Instant::now();
+    let mut deliverer = Deliverer::default();
+    let (tx, rx) = bounded(1);
+    deliverer.add_obligation_at("COM0", "by-id", "/fake/old", 7, ActorId::for_test(1), t0);
+    tx.send(ControlEvent::Tick).unwrap();
+    assert_eq!(deliverer.step_delivery("COM0", ActorId::for_test(1), &tx, t0), DeliveryStepResult::Backoff);
+    let first_due = deliverer.obligations["COM0"].next_at;
+    let first_backoff = deliverer.obligations["COM0"].backoff;
+    // lane 仍滿：期限前不得再嘗試，也不得移動期限或倍增退避。
+    assert_eq!(deliverer.step_delivery("COM0", ActorId::for_test(1), &tx, t0 + Duration::from_millis(9)), DeliveryStepResult::Backoff);
+    assert_eq!(deliverer.attempts("COM0"), 1, "退避期限前不得再次嘗試");
+    assert_eq!(deliverer.obligations["COM0"].next_at, first_due);
+    assert_eq!(deliverer.obligations["COM0"].backoff, first_backoff);
+    rx.recv().unwrap();
+    // 容量提早恢復也不能越過退避；到期恰好送達一次。
+    assert_eq!(deliverer.step_delivery("COM0", ActorId::for_test(1), &tx, t0 + Duration::from_millis(9)), DeliveryStepResult::Backoff);
+    assert!(rx.try_recv().is_err());
+    assert_eq!(deliverer.step_delivery("COM0", ActorId::for_test(1), &tx, first_due), DeliveryStepResult::Delivered);
+    assert_eq!(deliverer.delivered_count("COM0"), 1);
+}
+
+#[test]
 fn test_deliverer_backoff_cancellation_freeze_and_timeout() {
     let (actor_tx, actor_rx) = bounded(1);
     let gate = Arc::new(AdmissionGate::new());
@@ -673,9 +758,10 @@ fn test_deliverer_backoff_cancellation_freeze_and_timeout() {
 
     // 驗證 actor 收到 DeviceAttached
     match actor_rx.try_recv() {
-        Ok(ControlEvent::DeviceAttached { by_id: ev_by_id, real_path: ev_path }) => {
+        Ok(ControlEvent::DeviceAttachedRetry { by_id: ev_by_id, real_path: ev_path, bind_gen }) => {
             assert_eq!(ev_by_id, by_id);
             assert_eq!(ev_path, real_path);
+            assert_eq!(bind_gen, 1);
         }
         _ => panic!("預期 DeviceAttached"),
     }
@@ -893,9 +979,10 @@ fn test_deliverer_delayed_first_pending_poll_does_not_timeout_prematurely() {
     assert_eq!(outcome_final, DeliveryStepResult::Delivered);
     assert_eq!(deliverer.obligation_count(), 0);
     match actor_rx.try_recv() {
-        Ok(ControlEvent::DeviceAttached { by_id: ev_by_id, real_path: ev_real_path }) => {
+        Ok(ControlEvent::DeviceAttachedRetry { by_id: ev_by_id, real_path: ev_real_path, bind_gen }) => {
             assert_eq!(ev_by_id, by_id);
             assert_eq!(ev_real_path, real_path);
+            assert_eq!(bind_gen, 1);
         }
         _ => panic!("接收端應恰好收到一筆 DeviceAttached 事件"),
     }

@@ -1149,6 +1149,18 @@ impl Deliverer {
         actor_tx: &Sender<ControlEvent>,
         snap: GateSnapshot,
     ) -> DeliveryStepResult {
+        self.step_delivery_with_retry_clock(sid, actor, actor_tx, snap, snap.now)
+    }
+
+    /// 閘門時鐘決定有效 Open 預算；重試時鐘決定實際排程。manager 的退避使用實時，不受測試閘門暫停時鐘影響。
+    pub fn step_delivery_with_retry_clock(
+        &mut self,
+        sid: &str,
+        actor: ActorId,
+        actor_tx: &Sender<ControlEvent>,
+        snap: GateSnapshot,
+        retry_now: Instant,
+    ) -> DeliveryStepResult {
         if self.obligations.get(sid).is_some_and(|obligation| obligation.actor != actor) {
             self.obligations.remove(sid);
             return DeliveryStepResult::Cancelled;
@@ -1183,10 +1195,15 @@ impl Deliverer {
             return DeliveryStepResult::TimedOut;
         }
 
+        if retry_now < ob.next_at {
+            return DeliveryStepResult::Backoff;
+        }
+
         // 嘗試投遞
-        match actor_tx.try_send(ControlEvent::DeviceAttached {
+        match actor_tx.try_send(ControlEvent::DeviceAttachedRetry {
             by_id: ob.event.by_id.clone(),
             real_path: ob.event.real_path.clone(),
+            bind_gen: ob.bind_gen,
         }) {
             Ok(()) => {
                 self.obligations.remove(sid);
@@ -1198,7 +1215,7 @@ impl Deliverer {
             }
             Err(TrySendError::Full(_)) => {
                 ob.attempts += 1;
-                ob.next_at = snap.now + ob.backoff;
+                ob.next_at = retry_now + ob.backoff;
                 ob.backoff = (ob.backoff * 2).min(Duration::from_millis(500));
                 DeliveryStepResult::Backoff
             }
@@ -1440,7 +1457,8 @@ impl Drop for ReaperThread {
 
 /// 送達者回呼介面。
 pub trait DelivererCallback: Send + Sync + 'static {
-    fn step_delivery(&self);
+    /// 回傳下一次需要檢查的間隔；退避期間不重取 manager 鎖。
+    fn step_delivery(&self) -> Duration;
 }
 
 /// 送達者背景執行緒：定期以退避策略執行 DeviceAttached 送達義務。
@@ -1458,8 +1476,8 @@ impl DelivererThread {
             .name("serialwrap-deliverer".into())
             .spawn(move || {
                 while !thread_stopped.load(Ordering::Relaxed) {
-                    callback.step_delivery();
-                    std::thread::sleep(Duration::from_millis(20));
+                    let wait = callback.step_delivery();
+                    std::thread::sleep(wait);
                 }
             })
             .expect("建立 deliverer thread");

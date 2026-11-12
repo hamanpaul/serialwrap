@@ -699,6 +699,7 @@ fn dispatch(
         MailboxItem::Control(ControlEvent::ConsoleScan { .. }) => (None, "ConsoleScan"),
         MailboxItem::Control(ControlEvent::HumanTxCompleted { .. }) => (None, "HumanTxCompleted"),
         MailboxItem::Control(ControlEvent::DeviceAttached { .. }) => (None, "DeviceAttached"),
+        MailboxItem::Control(ControlEvent::DeviceAttachedRetry { .. }) => (None, "DeviceAttachedRetry"),
         MailboxItem::Control(ControlEvent::DeviceDetached { .. }) => (None, "DeviceDetached"),
         MailboxItem::Control(ControlEvent::DeviceMissing) => (None, "DeviceMissing"),
         MailboxItem::Control(ControlEvent::EvictCapture { .. }) => (None, "EvictCapture"),
@@ -742,7 +743,8 @@ fn dispatch(
             #[cfg(feature = "test-fakes")]
             MailboxItem::Control(ControlEvent::Request { req: SessionRequest::RetiredDrainsForTest, .. }) => false,
             MailboxItem::Control(ControlEvent::Request { .. }
-                | ControlEvent::DeviceAttached { .. } | ControlEvent::DeviceDetached { .. } | ControlEvent::DeviceMissing
+                | ControlEvent::DeviceAttached { .. } | ControlEvent::DeviceAttachedRetry { .. }
+                | ControlEvent::DeviceDetached { .. } | ControlEvent::DeviceMissing
                 | ControlEvent::BridgeOpened { .. } | ControlEvent::UartIoError { .. }
                 | ControlEvent::WorkerStopped(_) | ControlEvent::WorkerDrainTimeout { .. }
                 | ControlEvent::StateCommitted { .. } | ControlEvent::Shutdown { .. }

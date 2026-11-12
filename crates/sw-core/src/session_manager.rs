@@ -608,6 +608,14 @@ struct HandoffProbes {
 }
 
 impl Inner {
+    fn delivery_is_current(&self, actor: crate::custody::ActorId, by_id: &str, real_path: &str, bind_gen: u64) -> bool {
+        !self.stopping
+            && self.device_path(by_id) == Some(real_path)
+            && self.sessions.values().any(|entry| {
+                entry.actor_id == actor && entry.profile.device_by_id == by_id && entry.binding_generation == bind_gen
+            })
+    }
+
     fn new(unconfirmed: Arc<UnconfirmedCloses>, admission: Arc<crate::admission::AdmissionGate>) -> Self {
         Self {
             sessions: IndexMap::new(),
@@ -766,6 +774,9 @@ struct Shared {
     /// 一次性暫停點（重現 actor 處理 `DeviceOnline` 前插入的 release／shutdown／bind；wp510 第七次整包審查 High）。
     #[cfg(feature = "test-fakes")]
     bind_pre_device_online_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// 只供測試：DeviceOnline 逾時後、登記送達義務前的交錯窗口。
+    #[cfg(feature = "test-fakes")]
+    bind_delivery_pre_register_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// 只供測試（test-fakes）：累計啟動過的 session actor 與 attach worker thread 數（`spawned_worker_count`）。
     #[cfg(feature = "test-fakes")]
     spawned_workers: std::sync::atomic::AtomicUsize,
@@ -1990,6 +2001,12 @@ impl Shared {
             history
         };
         let actor_id = crate::custody::ActorId::allocate();
+        let shared = Arc::downgrade(self);
+        core.set_device_delivery_validator(Arc::new(move |by_id, path, bind_gen| {
+            shared.upgrade().is_some_and(|shared| {
+                lock(&shared.inner).delivery_is_current(actor_id, by_id, path, bind_gen)
+            })
+        }));
         // S2-PAR-wp510r R3 出生即接管（設計 §3.1.4 W2、C7）：PROBE 用過的 handle 存為新 session 擁有的帳本紀錄，新 actor
         // 出生即帶 `external_attach{token}`、ATTACHING，並以啟動效果 `ClaimCustody` 開埠（不送 `DeviceAttached`）。
         let mut displaced = None;
@@ -2176,6 +2193,11 @@ impl Shared {
                 return;
             }
             let prev = std::mem::replace(&mut inner.devices, new.clone());
+            // 裝置離線／改指時，同一臨界區撤銷舊路徑的送達義務；逾時後才登記者另於登記點重驗。
+            let Inner { deliverer, devices, .. } = &mut *inner;
+            deliverer.obligations.retain(|_, obligation| {
+                devices.get(&obligation.event.by_id).is_some_and(|device| device.real_path == obligation.event.real_path)
+            });
             // 佔位開埠作業（已登記 `watch_path`）的 by_id 不再指向原路徑：在預先準備的交接紀錄寫入不可撤銷的取消，之後
             // 改回原路徑也不清除；OSError 收尾已結算帳本紀錄時，退休提交仍據此判定已取消（Python `update_devices` 對
             // `_attach_ops` 作業 `op.cancelled.set()`，`origin/main:sw_core/session_manager.py:4031-4034`；審查 P8-a07fdfb-1）。
@@ -2681,6 +2703,7 @@ impl Shared {
                 e.profile.device_by_id = by_id.to_string();
                 lock(&e.io.profile).device_by_id = by_id.to_string();
             });
+            inner.deliverer.cancel_obligation(sid, None);
             match known {
                 Some(()) if !op.cancelled.load(Ordering::SeqCst) => match op.take_preopened() {
                     Some(pre) => {
@@ -3789,6 +3812,7 @@ impl Shared {
                     e.sid = new_sid.clone();
                     if e.profile.device_by_id != profile.device_by_id {
                         e.binding_generation = e.binding_generation.saturating_add(1);
+                        inner.deliverer.cancel_obligation(sid, None);
                     }
                     e.profile = profile.clone();
                     e.profile_source = source.to_string();
@@ -5818,21 +5842,37 @@ impl Shared {
 }
 
 impl crate::custody::DelivererCallback for Shared {
-    fn step_delivery(&self) {
+    fn step_delivery(&self) -> Duration {
         let mut inner = lock(&self.inner);
         let snap = inner.deliverer.gate.snapshot();
+        let retry_now = Instant::now();
         let sids: Vec<String> = inner.deliverer.obligations.keys().cloned().collect();
         for sid in sids {
+            let current = inner.deliverer.obligations.get(&sid).is_some_and(|ob| {
+                inner.delivery_is_current(ob.actor, &ob.event.by_id, &ob.event.real_path, ob.bind_gen)
+            });
+            if !current {
+                inner.deliverer.cancel_obligation(&sid, None);
+                continue;
+            }
             if let Some(entry) = inner.sessions.get(&sid) {
                 let control = entry.actor.control.clone();
                 let actor_id = entry.actor_id;
                 inner
                     .deliverer
-                    .step_delivery_with_snapshot(&sid, actor_id, &control, snap);
+                    .step_delivery_with_retry_clock(&sid, actor_id, &control, snap, retry_now);
             } else {
                 inner.deliverer.obligations.remove(&sid);
             }
         }
+        if snap.freeze_state != crate::admission::HandoffFreezeState::Open {
+            return Duration::from_millis(20);
+        }
+        inner.deliverer.obligations.values()
+            .map(|ob| ob.next_at.saturating_duration_since(retry_now))
+            .min()
+            .unwrap_or(Duration::from_millis(20))
+            .max(Duration::from_millis(1))
     }
 }
 
@@ -5878,9 +5918,11 @@ impl crate::custody::ReaperCallback for WeakSharedReaper {
 struct WeakSharedDeliverer(std::sync::Weak<Shared>);
 
 impl crate::custody::DelivererCallback for WeakSharedDeliverer {
-    fn step_delivery(&self) {
+    fn step_delivery(&self) -> Duration {
         if let Some(shared) = self.0.upgrade() {
-            shared.step_delivery();
+            shared.step_delivery()
+        } else {
+            Duration::from_millis(20)
         }
     }
 }
@@ -5993,6 +6035,8 @@ impl SessionManager {
             fail_next_attach_spawn: AtomicBool::new(false),
             #[cfg(feature = "test-fakes")]
             bind_pre_device_online_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            bind_delivery_pre_register_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             spawned_workers: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "test-fakes")]
@@ -6483,7 +6527,7 @@ impl SessionManager {
             }
         }
         let (sid, io, opening_token) = loop {
-            let inner = lock(&self.shared.inner);
+            let mut inner = lock(&self.shared.inner);
             let Some(e) = inner.resolve(selector) else {
                 return Ok(pydict! {
                     "ok" => false,
@@ -6549,6 +6593,8 @@ impl SessionManager {
                     "session_id" => other.sid.clone()
                 });
             }
+            // 改綁受理時即撤銷舊義務；成功改綁後也會以新世代使晚到的登記失效。
+            inner.deliverer.cancel_obligation(&sid, None);
             break (sid, io, opening_token);
         };
         // SPEC-GAP 2（編排者 2026-11-11）：BindWait 期限以實時起算，actor 受理等待時以 `WaitAck::Bind` 告知，期限到仍未
@@ -6579,14 +6625,15 @@ impl SessionManager {
         if let Some(pre) = lock(&io.preopened).take() {
             self.shared.close_session_preopened(&old_by_id, pre);
         }
-        let has_device = {
+        let (has_device, bind_gen, actor_id) = {
             let mut inner = lock(&self.shared.inner);
-            if let Some(e) = inner.sessions.get_mut(&sid) {
-                e.binding_generation = e.binding_generation.saturating_add(1);
-                e.profile.device_by_id = by_id.clone();
-                lock(&e.io.profile).device_by_id = by_id.clone();
-            }
-            inner.devices.contains_key(&by_id)
+            let Some(e) = inner.sessions.get_mut(&sid) else { return Ok(result) };
+            e.binding_generation = e.binding_generation.saturating_add(1);
+            e.profile.device_by_id = by_id.clone();
+            lock(&e.io.profile).device_by_id = by_id.clone();
+            let (bind_gen, actor_id) = (e.binding_generation, e.actor_id);
+            inner.deliverer.cancel_obligation(&sid, None);
+            (inner.devices.contains_key(&by_id), bind_gen, actor_id)
         };
         let commit_sid = sid.clone();
         let commit_by = by_id.clone();
@@ -6652,17 +6699,28 @@ impl SessionManager {
                     SessionRequest::DeviceOnline {
                         by_id: by_id.clone(),
                         real_path: real_path.clone(),
+                        bind_gen,
                     },
                     QUERY_TIMEOUT,
                 );
                 if applied.is_err() {
+                    #[cfg(feature = "test-fakes")]
+                    {
+                        let hook = lock(&self.shared.bind_delivery_pre_register_hook).take();
+                        if let Some(hook) = hook { hook(); }
+                    }
                     let mut inner = lock(&self.shared.inner);
-                    if let Some(actor_id) = inner.actor_id(&sid) {
-                        inner.deliverer.add_obligation(&sid, &by_id, &real_path, 1, actor_id);
+                    if inner.delivery_is_current(actor_id, &by_id, &real_path, bind_gen) {
+                        inner.deliverer.add_obligation(&sid, &by_id, &real_path, bind_gen, actor_id);
+                        if let Some(obligation) = inner.deliverer.obligations.get_mut(&sid) {
+                            obligation.next_at = Instant::now();
+                        }
                     }
                 } else {
                     let mut inner = lock(&self.shared.inner);
-                    inner.deliverer.cancel_obligation(&sid, None);
+                    if inner.deliverer.obligations.get(&sid).is_some_and(|ob| ob.actor == actor_id && ob.bind_gen == bind_gen) {
+                        inner.deliverer.cancel_obligation(&sid, Some(bind_gen));
+                    }
                 }
                 if let Some(PyValue::Dict(mut live)) =
                     applied.ok().and_then(|r| r.get("session").cloned())
@@ -7565,6 +7623,12 @@ impl SessionManager {
     #[cfg(feature = "test-fakes")]
     pub fn set_bind_pre_device_online_hook_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
         *lock(&self.shared.bind_pre_device_online_hook) = Some(hook);
+    }
+
+    /// 只供測試：設定 DeviceOnline 逾時後、登記義務前的一次性暫停點。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_bind_delivery_pre_register_hook_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
+        *lock(&self.shared.bind_delivery_pre_register_hook) = Some(hook);
     }
 
     /// 只供測試（test-fakes）：下一次建立 attach worker 執行緒時模擬 `Builder::spawn()` 回錯。
