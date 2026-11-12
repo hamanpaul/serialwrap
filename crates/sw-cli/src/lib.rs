@@ -33,6 +33,9 @@ pub mod wslconf;
 /// P8 Task 13：windows-task 實跑測試的正式停止路徑 harness（只在 `test-fakes` 建置）。
 #[cfg(feature = "test-fakes")]
 pub mod wintask_harness;
+/// P8-b3ffd2a-1：更新路徑測試只選取隔離 run dir 的 daemon。
+#[cfg(feature = "test-fakes")]
+mod test_update_scope;
 
 use std::any::Any;
 use std::cell::Cell;
