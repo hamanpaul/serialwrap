@@ -78,6 +78,49 @@ fn base(entry: Entry) -> TestEnv {
     }
 }
 
+fn isolated_absent_base(entry: Entry) -> (TestEnv, String, String) {
+    let t = TestEnv::posix()
+        .with_install_root()
+        .with_supervisor_state("systemd-user", false, false);
+    let t = match entry {
+        Entry::Update => t
+            .with_installed("0.4.0")
+            .with_current("0.4.0", None)
+            .with_bundle("0.4.1"),
+        Entry::Rollback => t
+            .with_installed("0.4.1")
+            .with_current("0.4.1", Some("0.4.0")),
+    };
+    let socket = t.default_socket();
+    let endpoint = t.isolated_endpoint(&socket);
+    (t, socket, endpoint)
+}
+
+#[cfg(feature = "test-fakes")]
+fn scoped_absent_base(entry: Entry) -> (TestEnv, String, String) {
+    let (t, socket, endpoint) = isolated_absent_base(entry);
+    (
+        t.with_var("SERIALWRAP_TEST_UPDATE_SOCKET", &endpoint),
+        socket,
+        endpoint,
+    )
+}
+
+fn mark_same_uid_daemons(t: &TestEnv, pids: &[u32]) {
+    const UID: u32 = 1000;
+    t.procs().set_current_uid(Some(UID));
+    for pid in pids {
+        t.procs().set_details(sw_pal::proc_scan::ProcDetails {
+            pid: *pid,
+            ppid: Some(1),
+            uid: Some(UID),
+            exe: Some("/tmp/foreign/bin/serialwrapd".into()),
+            argv: vec!["serialwrapd".into()],
+            start_ticks: Some(80_000 + u64::from(*pid)),
+        });
+    }
+}
+
 fn healthy(t: TestEnv, list: &str, flashing: bool) -> TestEnv {
     let ep = TestEnv::win_endpoint();
     t.with_rpc_ok(ep, "health.ping", "{\"ok\":true,\"pong\":true}")
@@ -165,6 +208,40 @@ fn assert_untouched(t: &TestEnv, entry: Entry, what: &str) {
         entry.current(),
         "{what}：current-release.json 不得改變"
     );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RefusalSnapshot {
+    entry: Vec<u8>,
+    current: Vec<u8>,
+    config: Vec<u8>,
+    journal: Option<Vec<u8>>,
+}
+
+fn refusal_snapshot(t: &TestEnv) -> RefusalSnapshot {
+    RefusalSnapshot {
+        entry: t.entry_bytes("serialwrap"),
+        current: std::fs::read(t.root().current_file).expect("current-release.json 應存在"),
+        config: t.config_bytes(),
+        journal: t.journal_bytes(),
+    }
+}
+
+fn assert_refusal_unchanged(
+    t: &TestEnv,
+    entry: Entry,
+    before: &RefusalSnapshot,
+    what: &str,
+) {
+    assert_untouched(t, entry, what);
+    assert_eq!(t.entry_bytes("serialwrap"), before.entry, "{what}：stable entry 不得改變");
+    assert_eq!(
+        std::fs::read(t.root().current_file).expect("current-release.json 應存在"),
+        before.current,
+        "{what}：current-release.json 不得改變"
+    );
+    assert_eq!(t.config_bytes(), before.config, "{what}：config 不得改變");
+    assert_eq!(t.journal_bytes(), before.journal, "{what}：journal 不得改變");
 }
 
 /// 拒絕結果的比對欄位（`--force` 前後須逐欄相同）。
@@ -317,6 +394,148 @@ fn guard_process_alive_rpc_down_refuses() {
     assert_eq!(s(&j, "health"), "unknown", "{j:?}");
     assert!(!s(&j, "reason").is_empty(), "{j:?}");
     assert_untouched(&t, Entry::Rollback, "process alive");
+}
+
+#[cfg(feature = "test-fakes")]
+#[test]
+fn scoped_update_and_rollback_ignore_foreign_daemons() {
+    for entry in [Entry::Update, Entry::Rollback] {
+        let (t, _, endpoint) = scoped_absent_base(entry);
+        let t = match entry {
+            Entry::Update => t.with_new_daemon_reporting_version("0.4.1"),
+            Entry::Rollback => t.with_new_daemon_reporting_version("0.4.0"),
+        };
+        let foreign = vec![
+            DaemonProc {
+                pid: 7311,
+                socket: Some("unix:///tmp/foreign/run/serialwrapd.sock".into()),
+                tree: vec![ProcIdentity {
+                    pid: 7311,
+                    start_ticks: Some(7311),
+                }],
+            },
+            DaemonProc {
+                pid: 7312,
+                socket: None,
+                tree: vec![ProcIdentity {
+                    pid: 7312,
+                    start_ticks: Some(7312),
+                }],
+            },
+        ];
+        let t = t.with_procs(foreign);
+        mark_same_uid_daemons(&t, &[7311, 7312]);
+
+        let (rc, j, err) = run(&t, entry, false);
+        assert_eq!(rc, 0, "{entry:?}：隔離 endpoint 已不存在，外部 daemon 不得阻擋正式更新路徑：{j:?} {err}");
+        for name in ["safety_check", "confirm_released"] {
+            let step = steps(&j, entry)
+                .into_iter()
+                .find(|step| step["step"].as_str() == Some(name))
+                .unwrap_or_else(|| panic!("{entry:?}：缺少 {name}：{j:?}"));
+            assert_eq!(step["ok"], PyValue::Bool(true), "{entry:?}：{name} 必須成功：{step:?}");
+        }
+        assert_eq!(
+            s(&j[entry.key()], "to_version"),
+            if entry == Entry::Update { "0.4.1" } else { "0.4.0" }
+        );
+        assert_eq!(endpoint, t.isolated_endpoint(&t.default_socket()));
+    }
+}
+
+#[cfg(feature = "test-fakes")]
+#[test]
+fn scoped_update_target_busy_still_rejects() {
+    for entry in [Entry::Update, Entry::Rollback] {
+        let (t, socket, _) = scoped_absent_base(entry);
+        let t = t
+            .with_idle_daemon(&socket, 7411)
+            .with_rpc_ok(&socket, "mcu.status", "{\"ok\":true,\"flashing\":true}");
+        let before = refusal_snapshot(&t);
+
+        let (rc, j, _) = run(&t, entry, false);
+        assert_eq!(rc, 2, "{entry:?}：{j:?}");
+        assert_eq!((s(&j, "error_code"), s(&j, "phase")), ("FLASHING_BUSY", "update_safety_check"));
+        assert_eq!(step_names(&j, entry).last().map(String::as_str), Some("safety_check"));
+        assert_refusal_unchanged(&t, entry, &before, "scoped busy target");
+    }
+}
+
+#[cfg(feature = "test-fakes")]
+#[test]
+fn scoped_update_unknown_health_still_rejects() {
+    for entry in [Entry::Update, Entry::Rollback] {
+        let (t, socket, _) = scoped_absent_base(entry);
+        let t = t
+            .with_idle_daemon(&socket, 7421)
+            .with_rpc_recv_timeout(&socket, "health.ping");
+        let before = refusal_snapshot(&t);
+
+        let (rc, j, _) = run(&t, entry, false);
+        assert_eq!(rc, 2, "{entry:?}：{j:?}");
+        assert_eq!(
+            (s(&j, "error_code"), s(&j, "phase"), s(&j, "probe"), s(&j, "health")),
+            ("TIMEOUT", "update_safety_check", "health.ping", "unknown")
+        );
+        assert_refusal_unchanged(&t, entry, &before, "scoped unknown health");
+    }
+}
+
+#[cfg(feature = "test-fakes")]
+#[test]
+fn scoped_update_process_scan_failure_still_rejects() {
+    for entry in [Entry::Update, Entry::Rollback] {
+        let (t, _, _) = scoped_absent_base(entry);
+        t.procs().fail();
+        let before = refusal_snapshot(&t);
+
+        let (rc, j, _) = run(&t, entry, false);
+        assert_eq!(rc, 2, "{entry:?}：{j:?}");
+        assert_eq!((s(&j, "error_code"), s(&j, "phase")), ("DEVICE_STILL_HELD", "update_safety_check"));
+        assert_eq!(s(&j, "reason"), "proc_scan_failed");
+        assert_eq!(j["holder_unknown"], PyValue::Bool(true));
+        assert_refusal_unchanged(&t, entry, &before, "scoped ProcScan failure");
+    }
+}
+
+#[test]
+fn scoped_update_without_scope_still_rejects_foreign_daemons() {
+    for entry in [Entry::Update, Entry::Rollback] {
+        let (t, _, endpoint) = isolated_absent_base(entry);
+        // 無 feature 時刻意設定相同變數，證明正式建置不會讀取或套用測試範圍。
+        #[cfg(not(feature = "test-fakes"))]
+        let t = t.with_var("SERIALWRAP_TEST_UPDATE_SOCKET", &endpoint);
+        let t = t.with_procs(vec![
+            DaemonProc {
+                pid: 7511,
+                socket: Some("unix:///tmp/foreign/run/serialwrapd.sock".into()),
+                tree: vec![ProcIdentity {
+                    pid: 7511,
+                    start_ticks: Some(7511),
+                }],
+            },
+            DaemonProc {
+                pid: 7512,
+                socket: None,
+                tree: vec![ProcIdentity {
+                    pid: 7512,
+                    start_ticks: Some(7512),
+                }],
+            },
+        ]);
+        mark_same_uid_daemons(&t, &[7511, 7512]);
+        let before = refusal_snapshot(&t);
+
+        let (rc, j, _) = run(&t, entry, false);
+        assert_eq!(rc, 2, "{entry:?}：{j:?}");
+        assert_eq!((s(&j, "error_code"), s(&j, "phase")), ("DEVICE_STILL_HELD", "update_safety_check"));
+        assert_eq!(
+            j["pids"],
+            PyValue::List(vec![PyValue::from(7511i64), PyValue::from(7512i64)])
+        );
+        assert_refusal_unchanged(&t, entry, &before, "missing test scope");
+        assert_eq!(endpoint, t.isolated_endpoint(&t.default_socket()));
+    }
 }
 
 #[test]

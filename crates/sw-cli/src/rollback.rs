@@ -338,6 +338,31 @@ fn matching_daemons(
     daemons.iter().filter(|daemon| daemon.socket.as_deref().map_or(true, |socket| socket == endpoint)).cloned().collect()
 }
 
+/// 共用 update／rollback 的 daemon 清單；測試範圍只有 `test-fakes` 建置會套用。
+#[derive(Debug, Clone, Copy)]
+struct UpdateDaemonScanError;
+
+fn scan_update_daemons(
+    ctx: &CliCtx<'_>,
+    endpoint: &str,
+) -> Result<Vec<sw_pal::proc_scan::DaemonProc>, UpdateDaemonScanError> {
+    let daemons = ctx
+        .p
+        .procs
+        .serialwrapd_instances()
+        .map_err(|_| UpdateDaemonScanError)?;
+    #[cfg(feature = "test-fakes")]
+    {
+        crate::test_update_scope::select_for_update(ctx, endpoint, &daemons)
+            .map_err(|_| UpdateDaemonScanError)
+    }
+    #[cfg(not(feature = "test-fakes"))]
+    {
+        let _ = endpoint;
+        Ok(daemons)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepName {
     Lock,
@@ -533,7 +558,7 @@ pub fn safety_check(
         PingHealth::Healthy => {}
         PingHealth::Unknown(code, detail) => return Err((code, detail)),
         PingHealth::Unreachable => {
-            let daemons = ctx.p.procs.serialwrapd_instances().map_err(|_| {
+            let daemons = scan_update_daemons(ctx, endpoint).map_err(|_| {
                 let mut detail = PyDict::new();
                 detail.insert("holder_unknown", PyValue::Bool(true));
                 detail.insert("health", PyValue::Str("unknown".into()));
@@ -2894,7 +2919,7 @@ fn endpoint_presence(ctx: &CliCtx<'_>, endpoint: &str) -> EndpointPresence {
     if rpc(ctx, endpoint, "health.ping", 0.25).is_some_and(|response| response.get_truthy("ok")) {
         return EndpointPresence::Present(Vec::new());
     }
-    match ctx.p.procs.serialwrapd_instances() {
+    match scan_update_daemons(ctx, endpoint) {
         Ok(daemons) => {
             let pids = matching_daemons(ctx, endpoint, &daemons).iter().map(|daemon| daemon.pid).collect::<Vec<_>>();
             if pids.is_empty() { EndpointPresence::Absent } else { EndpointPresence::Present(pids) }
