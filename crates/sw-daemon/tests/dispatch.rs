@@ -10750,3 +10750,55 @@ fn wp510r_i20_rpc_query_and_release_while_reaper_held_close_paused() {
     assert_eq!(dev.close_count(), 1);
     assert_eq!(r.mgr.terminal_for_test(token).unwrap().handle, sw_core::custody::TerminalHandle::Closed);
 }
+
+/// P8-849e605-1：正式 RPC 在未接受交接的 close 回條前不得成功；回條後逐位元組比對完整回應。
+#[test]
+fn wp510r_i20_r2_rpc_release_waits_for_unoffered_close_receipt() {
+    let r = Arc::new(wp510_b_placeholder_rig());
+    let dev = r.device(WP510_REAL_G);
+    r.fs.fail_next_atomic_write(PalError::io(28, "[Errno 28] No space left on device"));
+    let error = r.call_err("device.attach", &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#));
+    assert!(error.message.contains("No space left on device"));
+    let token = r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID).unwrap().token;
+    r.mgr.update_devices(&[(WP510_PLACEHOLDER_BY_ID.into(), DeviceInfo {
+        by_id: WP510_PLACEHOLDER_BY_ID.into(), real_path: WP510_REAL_G.into(),
+    })]);
+    r.wait_state("COM0", "DETACHED");
+    r.wait_state("COM1", "DETACHED");
+    let (entered, at_write) = crossbeam_channel::bounded(1);
+    let (resume, go) = crossbeam_channel::bounded(1);
+    r.fs.before_next_atomic_write(Box::new(move || {
+        entered.send(()).unwrap();
+        go.recv().unwrap();
+    }));
+    r.mgr.bootstrap_attach();
+    at_write.recv_timeout(Duration::from_secs(3)).expect("binding 落盤暫停");
+    dev.pause_next_close();
+    let (result, reply) = crossbeam_channel::bounded(1);
+    let caller = r.clone();
+    let release = std::thread::spawn(move || {
+        result.send(caller.call("device.release", r#"{"selector":"COM0","source":"agent"}"#)).unwrap();
+    });
+    r.wait_state("COM0", "RECOVERING");
+    resume.send(()).unwrap();
+    assert!(dev.wait_paused(Duration::from_secs(3)));
+    let early = reply.recv_timeout(Duration::from_millis(200));
+    let no_early_reply = early.is_err();
+    let open = dev.is_open();
+    let no_terminal = r.mgr.terminal_for_test(token).is_none();
+    let inflight = r.mgr.has_inflight_attach_for_test(WP510_PLACEHOLDER_BY_ID);
+    let during = r.call("session.get_state", r#"{"selector":"COM0"}"#);
+    dev.release_pause();
+    let response = early.unwrap_or_else(|_| reply.recv_timeout(Duration::from_secs(5)).unwrap());
+    release.join().unwrap();
+    assert!(no_early_reply, "回條前 release 不得回覆：{}", j(&response));
+    assert!(open && no_terminal && inflight, "回條前保留 handle、token 與作業");
+    assert_eq!(s(&sub(&during, "session"), "state"), "RECOVERING");
+    let state = r.call("session.get_state", r#"{"selector":"COM0"}"#);
+    assert_eq!(j(&response), format!(r#"{{"ok":true,"session":{},"closed_consoles":0,"aborted_cmd":false,"version":"{}"}}"#, j(&sub(&state, "session")), r.version));
+    assert_eq!(s(&sub(&state, "session"), "state"), "RELEASED");
+    assert_eq!(r.mgr.terminal_for_test(token).unwrap().handle, sw_core::custody::TerminalHandle::Closed);
+    assert_eq!(dev.close_count(), 1);
+    assert_eq!(dev.open_attempts(), 1);
+    assert_eq!(dev.tx_len(), 0, "取消的交接不能開始 PROBE 或登入");
+}

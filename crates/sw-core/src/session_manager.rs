@@ -1173,7 +1173,8 @@ impl Shared {
         .is_ok_and(|reply| is_ok(&reply))
     }
 
-    /// 未被 session 接受的帳本紀錄（`Held`）轉 Closing 並關閉（同步），依回條結算（closed:false 依 D1 iii 永久阻擋）。
+    /// 未被 session 接受的 Held 在同一鎖內轉 Closing 並把關閉責任交給 Reaper；獨立 closer 依真實回條結算。
+    /// attach 作業仍須等同 token 終態，不能因交出 handle 就完成 release watch（P8-849e605-1）。
     fn close_unoffered_custody(self: &Arc<Self>, by_id: &str, token: u64) {
         let parts = {
             let mut inner = lock(&self.inner);
@@ -1183,7 +1184,10 @@ impl Shared {
                     &mut rec.phase,
                     crate::custody::CustodyPhase::Closing { job: "unoffered".into() },
                 ) {
-                    crate::custody::CustodyPhase::Held { parts } => parts,
+                    crate::custody::CustodyPhase::Held { parts } => {
+                        rec.owner = crate::custody::CustodyOwner::Reaper;
+                        parts
+                    }
                     other => {
                         rec.phase = other;
                         None
@@ -2808,7 +2812,7 @@ impl Shared {
     }
 
     fn finish_worker_op(&self, by_id: &str, op: &AttachOp, close_receipt: Option<CloseReceipt>) {
-        // actor 建構失敗已把 handle 交獨立 closer：attach 工作者等配對終態後才完成自己的作業。
+        // actor 建構失敗或未接受的交接已把 handle 交獨立 closer：attach 工作者等配對終態後才完成自己的作業。
         // Condvar 釋放 manager 鎖；查詢、release 與 shutdown 的期限不受此等待影響。
         {
             let mut inner = lock(&self.inner);
@@ -2818,6 +2822,14 @@ impl Shared {
                     && matches!(rec.phase, crate::custody::CustodyPhase::Closing { .. })
             }) {
                 inner = self.cv.wait(inner).unwrap_or_else(|e| e.into_inner());
+            }
+            // 終態才是關閉結果；closer 在解鎖後才發布 close_failed 旗標，不能在該窗口把失敗結算成成功。
+            // 原錯誤與一次告警已由帳本結算負責，不再經 mark_close_failed 登記待告警錯誤。
+            if op.custody_token().is_some_and(|token| matches!(
+                inner.custody.terminals.get(&token).map(|terminal| &terminal.handle),
+                Some(crate::custody::TerminalHandle::Failed { .. })
+            )) {
+                op.close_failed.store(true, Ordering::SeqCst);
             }
         }
         if let Some(receipt) = close_receipt.as_ref().filter(|receipt| !receipt.closed) {

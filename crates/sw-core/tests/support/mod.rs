@@ -1949,9 +1949,15 @@ pub struct RigFs {
     fail_next: Mutex<Option<PalError>>,
     /// 接續 `fail_next` 之後的連續失敗（錯誤、剩餘次數）；模擬持續 ENOSPC。
     fail_repeat: Mutex<Option<(PalError, usize)>>,
+    before_write: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl RigFs {
+    /// 下一次落盤前在鎖外暫停，供交接與 release 的確定性交錯使用。
+    pub fn before_next_atomic_write(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self.before_write.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+
     pub fn new() -> Arc<RigFs> {
         Arc::new(RigFs::default())
     }
@@ -2018,6 +2024,10 @@ impl FsRead for RigFs {
 
 impl FsOps for RigFs {
     fn atomic_write(&self, p: &Path, data: &[u8], _mode: Option<u32>) -> PalResult<()> {
+        let hook = self.before_write.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(hook) = hook {
+            hook();
+        }
         if let Some(err) = self
             .fail_next
             .lock()

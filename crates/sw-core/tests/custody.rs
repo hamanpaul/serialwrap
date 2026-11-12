@@ -3694,3 +3694,120 @@ fn wp510r_i20_shutdown_parked_close_pause_respects_budget_and_late_receipt() {
     assert_eq!(m.mgr.terminal_for_test(token).unwrap().handle, TerminalHandle::Closed);
     assert_eq!(dev.close_count(), 1);
 }
+
+/// P8-849e605-1：parked 續行改綁後、BeginExternalAttach 之前插入正式 route release。
+/// Python 等 attach 作業真正完成關閉才設 done（origin/main:sw_core/session_manager.py:3188-3204、4320-4364）。
+fn i20_r2_unoffered_close(fail: bool, late: bool) {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (m, dev, token) = dr7_formal_parked_rig(None);
+    let sid = m.mgr.resolve("COM0").unwrap();
+    let snapshot: Vec<_> = m.snapshot().into_iter().filter(|(id, _)| id == DR7_BY_ID).collect();
+    m.mgr.update_devices(&snapshot);
+    m.wait_state("COM0", "DETACHED");
+    let (entered, at_write) = bounded(1);
+    let (resume, go) = bounded(1);
+    m.fs.before_next_atomic_write(Box::new(move || {
+        entered.send(()).unwrap();
+        go.recv().unwrap();
+    }));
+    m.mgr.bootstrap_attach();
+    at_write.recv_timeout(Duration::from_secs(3)).expect("改綁落盤已暫停");
+    let held = m.mgr.custody_for_test(DR7_BY_ID).unwrap();
+    assert_eq!(held.token, token);
+    assert!(matches!(held.owner, CustodyOwner::Worker(_)), "尚未交給 actor");
+    assert_eq!(held.phase, CustodyPhaseSnapshot::Held);
+    dev.pause_next_close();
+    let error = "unoffered UART close failure";
+    if fail {
+        dev.fail_close(PalError::plain(PalErrorKind::Io, error));
+    }
+    let (result, reply) = bounded(1);
+    let mgr = m.mgr.clone();
+    let release_sid = sid.clone();
+    let started = Instant::now();
+    let release = std::thread::spawn(move || {
+        result.send(mgr.route(&release_sid, dr1_release(), Duration::from_secs(10))).unwrap();
+    });
+    m.wait_state("COM0", "RECOVERING");
+    resume.send(()).unwrap();
+    assert!(dev.wait_paused(Duration::from_secs(3)), "未被接受的 handle 由 closer 暫停關閉");
+    let early = reply.recv_timeout(Duration::from_millis(200));
+    let closing = m.mgr.custody_for_test(DR7_BY_ID).unwrap();
+    let inflight = m.mgr.has_inflight_attach_for_test(DR7_BY_ID);
+    let terminal_before = m.mgr.terminal_for_test(token);
+    let open_before = dev.is_open();
+    let persisted_before = dr1_persisted_released(&m, &sid);
+    let mut stalled = None;
+    if late && early.is_err() {
+        stalled = Some(reply.recv_timeout(Duration::from_secs(5)).expect("首次期限回 STALL").unwrap());
+        assert!(started.elapsed() >= Duration::from_millis(2500));
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(dev.is_open(), "逾時仍等待真實關閉");
+    }
+    dev.release_pause();
+    wait_until("原 token 真實關閉終態", || m.mgr.terminal_for_test(token).is_some());
+    // 紅燈時也先放行 close、結束 caller，避免測試替身殘留。
+    let no_early_reply = early.is_err();
+    let response = match early {
+        Ok(response) => response.unwrap(),
+        Err(_) => stalled.unwrap_or_else(|| reply.recv_timeout(Duration::from_secs(5)).unwrap().unwrap()),
+    };
+    release.join().unwrap();
+    assert!(matches!(closing.phase, CustodyPhaseSnapshot::Closing { .. }), "{closing:?}");
+    assert!(open_before, "close 暫停時 handle 仍開啟");
+    assert_eq!(terminal_before, None, "回條前原 token 沒有終態");
+    assert!(!persisted_before, "回條前不能 RELEASED 落盤");
+    assert!(inflight, "close 回條前 attach 作業與 release watch 必須存活");
+    assert!(no_early_reply, "真實關閉回條前不得回覆 release：{response:?}");
+    assert_eq!(closing.owner, CustodyOwner::Reaper, "交出 handle 時同步轉移關閉責任");
+    assert_eq!(dev.close_count(), 1, "handle 恰好關閉一次");
+    assert_eq!(dev.open_attempts(), 1, "不重開 parked handle");
+    if fail {
+        assert_eq!(dr1_error_code(&response).as_deref(), Some("DRAIN_STALLED"), "{response:?}");
+        assert!(started.elapsed() >= Duration::from_millis(2500), "失敗回條仍等首次期限");
+        assert_eq!(m.mgr.terminal_for_test(token).unwrap().handle, TerminalHandle::Failed { error: error.into() });
+        assert!(matches!(m.mgr.custody_for_test(DR7_BY_ID).unwrap().phase, CustodyPhaseSnapshot::CloseFailed { .. }));
+        assert!(m.mgr.unconfirmed_close_for_test(DR7_BY_ID));
+        assert_eq!(m.warnings().iter().filter(|s| s.contains(DR7_BY_ID) && s.contains(error)).count(), 1);
+        assert_eq!(m.state_of("COM0").as_deref(), Some("RECOVERING"));
+        assert!(!dr1_persisted_released(&m, &sid));
+        let after_deadline = Instant::now();
+        let again = m.mgr.route(&sid, dr1_release(), Duration::from_secs(5)).unwrap();
+        assert_eq!(dr1_error_code(&again).as_deref(), Some("DRAIN_STALLED"));
+        assert!(after_deadline.elapsed() < Duration::from_secs(1));
+        m.mgr.bootstrap_attach();
+        assert_eq!(dev.open_attempts(), 1, "失敗終態永久阻擋");
+    } else {
+        if late {
+            assert_eq!(dr1_error_code(&response).as_deref(), Some("DRAIN_STALLED"));
+        } else {
+            assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
+            assert_eq!(response.get("closed_consoles"), Some(&PyValue::from(0_i64)));
+            assert_eq!(response.get("aborted_cmd"), Some(&PyValue::Bool(false)));
+        }
+        m.wait_state("COM0", "RELEASED");
+        wait_until("RELEASED 落盤", || dr1_persisted_released(&m, &sid));
+        assert_eq!(m.mgr.terminal_for_test(token).unwrap().handle, TerminalHandle::Closed);
+        assert!(m.mgr.custody_for_test(DR7_BY_ID).is_none());
+        let session = m.session("COM0");
+        assert_eq!(session.get("drain_stalled"), Some(&PyValue::Bool(false)));
+        assert_eq!(session.get("drain_timeout_epoch"), Some(&PyValue::Null));
+        assert!(!m.mgr.has_inflight_attach_for_test(DR7_BY_ID));
+        assert!(!m.mgr.unconfirmed_close_for_test(DR7_BY_ID));
+    }
+}
+
+#[test]
+fn wp510r_i20_r2_unoffered_close_success_waits_for_receipt() {
+    i20_r2_unoffered_close(false, false);
+}
+
+#[test]
+fn wp510r_i20_r2_unoffered_close_late_success_settles_stalled_release() {
+    i20_r2_unoffered_close(false, true);
+}
+
+#[test]
+fn wp510r_i20_r2_unoffered_close_failure_keeps_release_stalled() {
+    i20_r2_unoffered_close(true, false);
+}
