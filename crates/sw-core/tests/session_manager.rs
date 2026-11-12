@@ -375,220 +375,119 @@ fn sticky_persisted_only_when_ready_and_path_unchanged() {
     });
 
     // READY 前 real_path 改變 → 不寫 sticky。
+    const BY_ID: &str = "/s/by-id/usb-S";
     let m2 = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
-    m2.devices(&["/s/by-id/usb-S"]);
+    m2.devices(&[BY_ID]);
+    let old_real = m2.real_of(BY_ID);
     // 只回應 login 的 prompt，不回應 ready_probe nonce，使 session 停在 READY 之前。
-    m2.reply_probe(&m2.real_of("/s/by-id/usb-S"), b"root@t:/# ");
-    m2.mgr.update_devices(&m2.snapshot());
-    m2.mgr.bootstrap_attach();
-    wait_until("偵測完成（非 READY）", || {
-        m2.state_of("COM0").is_some()
-    });
-    // 保留原來的非同步改指時機，但在 timeout 時同時留下狀態、事件與保管帳本證據。
-    let old_custody = m2.mgr.custody_for_test("/s/by-id/usb-S");
-    let old_token = old_custody.as_ref().map(|custody| custody.token);
-    let state_before_retarget = m2.state_of("COM0");
-    let events_before_retarget = m2.events();
-    m2.retarget_by_id_no_wait("/s/by-id/usb-S", "/dev/ttyMOVED");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !m2.events().iter().any(|event| event == "open:/dev/ttyMOVED")
-        && Instant::now() < deadline
-    {
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    let events_after_retarget = m2.events();
-    let original_retarget_opened = events_after_retarget
-        .iter()
-        .any(|event| event == "open:/dev/ttyMOVED");
-    std::thread::sleep(Duration::from_millis(100));
-    let original_terminal = old_token.and_then(|token| m2.mgr.terminal_for_test(token));
-    eprintln!(
-        "STICKY-DIAG window=uncontrolled point=retarget retarget=/dev/ttyMOVED opened={} token_before={:?} custody_phase_before={:?} state_before={:?} events_before={:?} terminal_after={:?} state_after={:?} new_open_attempts={} unconfirmed_close={} events_after={:?}",
-        original_retarget_opened,
-        old_token,
-        old_custody.as_ref().map(|custody| &custody.phase),
-        state_before_retarget,
-        events_before_retarget,
-        original_terminal,
-        m2.state_of("COM0"),
-        m2.serial.open_attempts("/dev/ttyMOVED"),
-        m2.mgr.unconfirmed_close_for_test("/s/by-id/usb-S"),
-        events_after_retarget,
-    );
-    // state.json 一律寫出 profile_detected 區段（Python `_save_state` 的 5 個 key），故以載入結果判斷「未寫入」。
-    assert!(
-        m2.load_state_now().profile_detected.is_empty(),
-        "READY 前 real_path 改變時不得寫入 sticky：{}",
-        m2.state_text()
-    );
-
-    // hook 被消耗後若測試提前 panic，仍嘗試放行 worker，避免殘留停在暫停點。
+    m2.reply_probe(&old_real, b"root@t:/# ");
+    let old_device = m2.device(&old_real);
+    let (open_enter_tx, open_enter_rx) = crossbeam_channel::bounded(1);
+    let (open_resume_tx, open_resume_rx) = crossbeam_channel::bounded(1);
     struct ResumeOnDrop(crossbeam_channel::Sender<()>);
     impl Drop for ResumeOnDrop {
         fn drop(&mut self) {
             let _ = self.0.try_send(());
         }
     }
+    let _resume_open = ResumeOnDrop(open_resume_tx.clone());
+    m2.mgr.set_open_bridge_post_take_hook_for_test(Box::new(move || {
+        let _ = open_enter_tx.send(());
+        let _ = open_resume_rx.recv();
+    }));
+    m2.mgr.update_devices(&m2.snapshot());
+    m2.mgr.bootstrap_attach();
+    assert!(
+        open_enter_rx.recv_timeout(RPC).is_ok(),
+        "舊路徑 open worker 應抵達已接手 custody 的同步屏障，events={:?}",
+        m2.events()
+    );
+    let old_custody = m2
+        .mgr
+        .custody_for_test(BY_ID)
+        .expect("open worker 接手時應有舊路徑 custody");
+    assert!(
+        matches!(
+            &old_custody.phase,
+            sw_core::custody::CustodyPhaseSnapshot::Taken { .. }
+        ),
+        "同步屏障須位於舊路徑已接手、尚未交給 session 的階段：{old_custody:?}"
+    );
+    assert_eq!(
+        m2.state_of("COM0").as_deref(),
+        Some("ATTACHING"),
+        "open 屏障時 session 必須仍未 READY"
+    );
+    assert!(
+        m2.events().iter().any(|event| event == &format!("open:{old_real}")),
+        "舊路徑必須已實際進入 open：{:?}",
+        m2.events()
+    );
+    open_resume_tx
+        .send(())
+        .expect("放行舊路徑 open worker");
+    wait_until("舊路徑登入結束但尚未 READY", || {
+        m2.state_of("COM0").as_deref() == Some("ATTACHED")
+    });
+    assert!(
+        m2.mgr
+            .wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)),
+        "改指前舊路徑 attach worker 必須已收尾，events={:?}",
+        m2.events()
+    );
+
     struct ReleasePauseOnDrop(sw_pal::fakes::serial::FakeDevice);
     impl Drop for ReleasePauseOnDrop {
         fn drop(&mut self) {
             self.0.release_pause();
         }
     }
-
-    // 以既有 hook 分別停在 custody 尚未接手及已接手、但 session 尚未 READY 的窗口。
-    // pre-take 用 close-pre-notify 暫停已結算的關閉通知；post-take 用 FakeDevice 暫停實際 close。
-    let diagnose_take_window =
-        |label: &str, set_initial_hook: fn(&SessionManager, Box<dyn FnOnce() + Send>)| {
-            const BY_ID: &str = "/s/by-id/usb-S";
-            const OLD_REAL: &str = "/dev/ttyOLD-STICKY";
-            const NEW_REAL: &str = "/dev/ttyMOVED";
-            let before_take = label == "old-bridge-not-taken";
-            let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
-            let old_device = m.add_device_at(BY_ID, OLD_REAL);
-            m.reply_probe(OLD_REAL, b"root@t:/# ");
-
-            let (initial_enter_tx, initial_enter_rx) = crossbeam_channel::bounded(1);
-            let (initial_resume_tx, initial_resume_rx) = crossbeam_channel::bounded(1);
-            let _initial_resume = ResumeOnDrop(initial_resume_tx.clone());
-            let (close_enter_tx, close_enter_rx) = crossbeam_channel::bounded(1);
-            let (close_resume_tx, close_resume_rx) = crossbeam_channel::bounded(1);
-            let _close_resume = ResumeOnDrop(close_resume_tx.clone());
-            if before_take {
-                m.mgr.set_custody_close_pre_notify_hook_for_test(
-                    BY_ID,
-                    Box::new(move || {
-                        let _ = close_enter_tx.send(());
-                        let _ = close_resume_rx.recv();
-                    }),
-                );
-            }
-            set_initial_hook(
-                m.mgr.as_ref(),
-                Box::new(move || {
-                    let _ = initial_enter_tx.send(());
-                    let _ = initial_resume_rx.recv();
-                }),
-            );
-            m.mgr.update_devices(&m.snapshot());
-            m.mgr.bootstrap_attach();
-
-            if initial_enter_rx.recv_timeout(RPC).is_err() {
-                eprintln!(
-                    "STICKY-DIAG window={label} point=initial-hook entered=false state={:?} custody={:?} terminal=None new_open_count=0 events={:?}",
-                    m.state_of("COM0"),
-                    m.mgr.custody_for_test(BY_ID),
-                    m.events(),
-                );
-                return false;
-            }
-
-            let Some(initial_custody) = m.mgr.custody_for_test(BY_ID) else {
-                eprintln!(
-                    "STICKY-DIAG window={label} point=initial-hook entered=true custody=None state={:?} new_open_count=0 events={:?}",
-                    m.state_of("COM0"),
-                    m.events(),
-                );
-                return false;
-            };
-            let token = initial_custody.token;
-            let state_at_take_hook = m.state_of("COM0");
-            let initial_phase_matches = if before_take {
-                matches!(&initial_custody.phase, CustodyPhaseSnapshot::Held)
-            } else {
-                matches!(&initial_custody.phase, CustodyPhaseSnapshot::Taken { .. })
-            };
-            eprintln!(
-                "STICKY-DIAG window={label} point=take-hook phase_matches={initial_phase_matches} token={token} custody={initial_custody:?} state={state_at_take_hook:?} old_open_attempts={} events={:?}",
-                m.serial.open_attempts(OLD_REAL),
-                m.events(),
-            );
-            let close_gate_entered = if before_take {
-                std::thread::scope(|scope| {
-                    let manager = &m;
-                    let retarget = scope.spawn(move || {
-                        manager.retarget_by_id_no_wait(BY_ID, NEW_REAL);
-                    });
-                    let entered = close_enter_rx.recv_timeout(RPC).is_ok();
-                    let terminal = m.mgr.terminal_for_test(token);
-                    let custody = m.mgr.custody_for_test(BY_ID);
-                    let state = m.state_of("COM0");
-                    let events = m.events();
-                    eprintln!(
-                        "STICKY-DIAG window={label} point=close-pre-notify entered={entered} phase_matches={initial_phase_matches} token={token} terminal={terminal:?} custody={custody:?} state={state:?} old_close_count={} new_open_attempts={} unconfirmed_close={} events={events:?}",
-                        old_device.close_count(),
-                        m.serial.open_attempts(NEW_REAL),
-                        m.mgr.unconfirmed_close_for_test(BY_ID),
-                    );
-                    // 先放行開埠工作，再放行 close 通知；不把 LoggedClose 的 close: 當成成功回條。
-                    let _ = initial_resume_tx.try_send(());
-                    let _ = close_resume_tx.try_send(());
-                    entered && retarget.join().is_ok()
-                })
-            } else {
-                m.retarget_by_id_no_wait(BY_ID, NEW_REAL);
-                old_device.pause_next_close();
-                let _fake_close_pause = ReleasePauseOnDrop(old_device.clone());
-                let _ = initial_resume_tx.try_send(());
-                let entered = old_device.wait_paused(RPC);
-                let terminal = m.mgr.terminal_for_test(token);
-                let custody = m.mgr.custody_for_test(BY_ID);
-                let state = m.state_of("COM0");
-                let events = m.events();
-                eprintln!(
-                    "STICKY-DIAG window={label} point=fake-close-paused entered={entered} phase_matches={initial_phase_matches} token={token} terminal={terminal:?} custody={custody:?} state={state:?} old_close_count={} new_open_attempts={} unconfirmed_close={} events={events:?}",
-                    old_device.close_count(),
-                    m.serial.open_attempts(NEW_REAL),
-                    m.mgr.unconfirmed_close_for_test(BY_ID),
-                );
-                if entered {
-                    old_device.release_pause();
-                }
-                entered
-            };
-            if !close_gate_entered {
-                return false;
-            }
-
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while m.serial.open_attempts(NEW_REAL) == 0 && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            let opened_after_receipt = m.serial.open_attempts(NEW_REAL) > 0;
-            let attach_idle = m.mgr.wait_attach_idle_for_test(BY_ID, Duration::from_millis(100));
-            let terminal_after_release = m.mgr.terminal_for_test(token);
-            let state_after_release = m.state_of("COM0");
-            let custody_after_release = m.mgr.custody_for_test(BY_ID);
-            let product_stall_shape = terminal_after_release.as_ref().is_some_and(|terminal| {
-                terminal.handle == sw_core::custody::TerminalHandle::Closed
-            }) && state_after_release.as_deref() == Some("ATTACHING")
-                && m.serial.open_attempts(NEW_REAL) == 0
-                && attach_idle;
-            eprintln!(
-                "STICKY-DIAG window={label} point=after-close-release phase_matches={initial_phase_matches} close_gate_entered={close_gate_entered} terminal={terminal_after_release:?} custody={custody_after_release:?} state={state_after_release:?} new_open_attempts={} attach_idle={attach_idle} product_stall_shape={product_stall_shape} opened_after_release={opened_after_receipt} events={:?}",
-                m.serial.open_attempts(NEW_REAL),
-                m.events(),
-            );
-            opened_after_receipt
-        };
-
-    let pre_take_ok = diagnose_take_window(
-        "old-bridge-not-taken",
-        SessionManager::set_open_bridge_pre_take_hook_for_test,
-    );
-    let post_take_ok = diagnose_take_window(
-        "bridge-taken-before-ready",
-        SessionManager::set_open_bridge_post_take_hook_for_test,
-    );
-
+    old_device.pause_next_close();
+    let _release_close = ReleasePauseOnDrop(old_device.clone());
+    m2.retarget_by_id_no_wait(BY_ID, "/dev/ttyMOVED");
     assert!(
-        original_retarget_opened,
-        "等待逾時：open:/dev/ttyMOVED；原路徑診斷見上方 STICKY-DIAG（token={old_token:?}, terminal={original_terminal:?}, state={:?}, new_open_count={}）",
-        m2.state_of("COM0"),
-        m2.serial.open_attempts("/dev/ttyMOVED"),
+        old_device.wait_paused(RPC),
+        "改指後舊路徑 close 應停在尚未回覆 CloseReceipt 的屏障"
     );
-    eprintln!(
-        "STICKY-DIAG conclusion original_retarget_opened={original_retarget_opened} pre_take_new_path_opened_after_close={pre_take_ok} post_take_new_path_opened_after_close={post_take_ok}"
+    assert_eq!(
+        m2.serial.open_attempts("/dev/ttyMOVED"),
+        0,
+        "單次在途規則要求舊路徑回條前不嘗試開新路徑：{:?}",
+        m2.events()
+    );
+    old_device.release_pause();
+    // close:<path> 只記錄 close 呼叫；以放行 close 後 actor 才能重開新路徑作為回條已消費的屏障。
+    wait_until("新路徑已 open", || {
+        m2.events()
+            .iter()
+            .any(|event| event == "open:/dev/ttyMOVED")
+    });
+    assert_eq!(old_device.close_count(), 1, "舊路徑 close 恰好一次");
+    assert!(!old_device.is_open(), "舊路徑 close 後 handle 已關閉");
+    let events = m2.events();
+    let close_old = events
+        .iter()
+        .position(|event| event == &format!("close:{old_real}"))
+        .expect("舊路徑應留下 close 記錄");
+    let open_new = events
+        .iter()
+        .position(|event| event == "open:/dev/ttyMOVED")
+        .expect("新路徑應留下 open 記錄");
+    assert!(
+        close_old < open_new,
+        "新路徑不得早於舊路徑 close receipt 開啟：{events:?}"
+    );
+    assert!(
+        m2.mgr
+            .wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)),
+        "改指後 attach worker 必須已收尾，events={events:?}"
+    );
+    m2.wait_state("COM0", "READY");
+    // state.json 一律寫出 profile_detected 區段（Python `_save_state` 的 5 個 key），故以載入結果判斷「未寫入」。
+    assert!(
+        m2.load_state_now().profile_detected.is_empty(),
+        "READY 前 real_path 改變時不得寫入 sticky：{}",
+        m2.state_text()
     );
 }
 
