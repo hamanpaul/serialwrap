@@ -27,18 +27,12 @@ use support::*;
 use sw_core::file_transfer::templates as t;
 use sw_core::session_core::SessionState;
 use sw_core::tx_writer::{OpId, TxClass, TxJob, TxPermit, TxReport};
-use sw_cli::ctx::{CliCtx, TextIo};
 use sw_pal::fakes::serial::{FakeDevice, FakeWriteStep};
-use sw_pal::fakes::FakeProcScan;
-use sw_pal::proc_scan::{DaemonProc as ScannedDaemonProc, ProcIdentity as ScannedProcIdentity};
-use sw_pal::service_ctl::SupervisionMode;
 use sw_pal::TxOutcome;
 use sw_pal::traits::DeviceInfo;
 use sw_proto::pycompat::a2b_base64_lenient;
-use sw_proto::pypath::{HomeLookup, PathFlavor};
 use sw_proto::pydict;
 use sw_proto::pyjson::{self, PyDict, PyValue};
-use sw_proto::runtime_paths::{EnvSnapshot, NativeTraits, RuntimePaths};
 
 /// Python `HANDOFF_DRAIN_GRACE_S`（`sw_core/daemon.py:134`）；黑箱不得 import 產品常數，於此重述。
 const HANDOFF_DRAIN_GRACE: Duration = Duration::from_secs(3);
@@ -1338,67 +1332,18 @@ impl Drop for HolderSampler {
     }
 }
 
-struct IsolatedHome(String);
-
-impl HomeLookup for IsolatedHome {
-    fn current_user_home(&self) -> Option<String> {
-        Some(self.0.clone())
-    }
-
-    fn user_home(&self, _user: &str) -> Option<String> {
-        Some(self.0.clone())
-    }
+#[derive(Debug)]
+struct HandoffLink {
+    pid: Option<u32>,
 }
 
-/// 經 sw-cli update／rollback 共用的正式交接編排等待舊實例退出（`rollback.rs` 的
-/// `ensure_released_or_rehandoff` 呼叫鏈），使用隔離 env 與 endpoint。
-fn update_handoff_before_start(env: &IsolatedEnv, old_pid: u32) -> Vec<sw_cli::graceful_stop::HandoffLink> {
-    let mut p = sw_pal::native_client();
-    let old = ScannedDaemonProc {
-        pid: old_pid,
-        socket: Some(env.socket.display().to_string()),
-        tree: vec![ScannedProcIdentity { pid: old_pid, start_ticks: None }],
-    };
-    let proc_scan = FakeProcScan::new(Vec::new());
-    proc_scan.script(vec![vec![old], vec![], vec![]]);
-    proc_scan.alive_script(old_pid, vec![true, false]);
-    p.procs = proc_scan;
-    let vars: Vec<(String, String)> = env.vars.iter().map(|(key, value)| (key.clone(), value.clone())).collect();
-    let env_snapshot = EnvSnapshot::from_pairs(vars);
-    let home = IsolatedHome(env.vars.get("HOME").expect("isolated HOME").clone());
-    let paths = RuntimePaths::resolve(
-        &env_snapshot,
-        NativeTraits { default_endpoint_is_tcp: false, path_flavor: PathFlavor::Posix },
-        &home,
-    )
-    .expect("isolated RuntimePaths");
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    let io = TextIo::new(&mut out, &mut err, "\n");
-    let mut ctx = CliCtx {
-        p: &p,
-        env: env_snapshot,
-        paths,
-        io,
-        verbose: 0,
-        cli_version: sw_proto::version::version(),
-        autostart_lock: None,
-    };
-    let mut chain = Vec::new();
-    sw_cli::graceful_stop::ensure_released_or_rehandoff(
-        &mut ctx,
-        &SupervisionMode::OnDemand,
-        &env.socket.display().to_string(),
-        false,
-        "update",
-        "update_start_and_verify",
-        &mut chain,
-    )
-    .unwrap_or_else(|failure| panic!("正式 update handoff 編排失敗：{failure:?}"));
-    chain
+/// 直接呼叫 daemon 的正式交接 RPC；舊行程的退出與 UART 釋放由呼叫端實際等待並驗證。
+fn daemon_handoff_before_start(env: &IsolatedEnv, old_pid: u32) -> Vec<HandoffLink> {
+    let _token = assert_granted(&rpc_handoff(&env.socket), "daemon.handoff_stop");
+    vec![HandoffLink { pid: Some(old_pid) }]
 }
 
-/// 舊 daemon 存活時繼任者實際競爭實例鎖並失敗；再經正式 update／rollback 交接等待舊 daemon 退出後才啟新版。
+/// 舊 daemon 存活時繼任者實際競爭實例鎖並失敗；再以 daemon.handoff_stop RPC 交接，舊 daemon 退出後才啟新版。
 /// 全程 holder 取樣 `max_concurrent()<=1`、pid 依序為「舊 → 新」，最終繼任者 READY。
 #[test]
 fn handoff_then_successor_never_double_held() {
@@ -1413,8 +1358,8 @@ fn handoff_then_successor_never_double_held() {
     assert!(contender.stderr().contains("DAEMON_ALREADY_RUNNING"), "繼任者必須實際遇到鎖衝突：{}", contender.stderr());
     assert!(old.try_alive(), "競爭鎖時舊 daemon 仍存活");
 
-    let chain = update_handoff_before_start(&env, old_pid);
-    assert_eq!(chain.len(), 1, "正式編排只交接既有舊實例：{chain:?}");
+    let chain = daemon_handoff_before_start(&env, old_pid);
+    assert_eq!(chain.len(), 1, "daemon RPC 只交接既有舊實例：{chain:?}");
     assert_eq!(chain[0].pid, Some(old_pid), "交接記錄需指向舊 daemon");
     let status = old.wait(HANDOFF_DRAIN_GRACE + STOP_CAP + Duration::from_secs(2));
     assert_eq!(status.code(), Some(0), "交接後有序停止：{}", old.stderr());

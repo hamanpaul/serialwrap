@@ -1436,7 +1436,7 @@ def test_bc_real_sc_df_ranges() -> None:
     assert "merge_oldest" in df22.compatibility_impact and "不得低估" in df22.compatibility_impact
 
     df26 = by_id["DF-26"]
-    assert df26.status == "APPROVED" and df26.scope == "both" and df26.applies_python_min == "0.4.1"
+    assert df26.status in {"APPROVED", "IMPLEMENTED", "VERIFIED"} and df26.scope == "both" and df26.applies_python_min == "0.4.1"
     assert df26.applies_rust_stage == "slice-2.4" and df26.ab_participation == "diff"
     assert list(df26.phases) == ["P8"]
     assert df26.approval.decision_ref == "OD-80"
@@ -1448,7 +1448,7 @@ def test_bc_real_sc_df_ranges() -> None:
     assert df26.case_ids == ("f7-larger-file-not-truncated",)
 
     df27 = by_id["DF-27"]
-    assert df27.status == "APPROVED" and df27.scope == "both" and df27.applies_python_min == "0.4.1"
+    assert df27.status in {"APPROVED", "IMPLEMENTED", "VERIFIED"} and df27.scope == "both" and df27.applies_python_min == "0.4.1"
     assert df27.applies_rust_stage == "slice-2.3" and df27.ab_participation == "diff"
     assert list(df27.phases) == ["P7"]
     assert df27.approval.decision_ref == "OD-81"

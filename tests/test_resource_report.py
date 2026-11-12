@@ -438,6 +438,8 @@ def test_windows_com_never_counted_without_device(tmp_path: Path) -> None:
     # （非 socket、非記憶體替身；唯一 monkeypatch 為寫入逾時常數），缺 device 時 skip，符合 windows_com 定義。
     known = {
         "tests/contract_blackbox/test_cli_mgmt_daemon.py",
+        # P8 Task 11：真實 CreateFileW 獨占 COM20；無原生 Windows／com0com pair 會 SKIP，不計為 passed。
+        "tests/contract_blackbox/test_s24_device_handoff_windows.py",
         "tests/test_p1oc_drain_stalled.py",
         "tests/test_spike1_remaining.py",
         "tests/test_stage0_uart_exclusive.py",
