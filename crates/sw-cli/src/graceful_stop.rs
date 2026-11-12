@@ -219,43 +219,6 @@ pub fn graceful_stop_with_existing_hold(
         }
     }
 
-    #[cfg(feature = "test-fakes")]
-    if matches!(rpc, StopRpc::UpdateHandoff { .. })
-        && ctx.env.get("SERIALWRAP_TEST_UPDATE_SOCKET").is_some()
-        && matches!(mode, SupervisionMode::OnDemand)
-    {
-        let StopRpc::UpdateHandoff { reason } = rpc else {
-            unreachable!()
-        };
-        let mut chain = Vec::new();
-        if let Err(error) =
-            ensure_released_or_rehandoff(ctx, mode, endpoint, with_sudo, reason, phase, &mut chain)
-        {
-            return Err(with_handoff_context(error, hold.clone(), chain));
-        }
-        if first_handoff_relaunched {
-            if let Some(first) = chain.first_mut() {
-                first.relaunched = true;
-            }
-        }
-        ran.extend(
-            chain
-                .iter()
-                .map(|_| vec!["serialwrap".into(), "daemon".into(), "handoff_stop".into()]),
-        );
-        let handoff_token = chain.last().map(|link| link.token.clone());
-        return Ok(StopReport {
-            graceful: true,
-            ran,
-            rc,
-            stdout,
-            stderr,
-            handoff_token,
-            chain,
-            hold,
-        });
-    }
-
     if rpc == StopRpc::Plain {
         let reach = call_stop(ctx, endpoint, "daemon.stop", &PyDict::new());
         ran.push(vec!["serialwrap".into(), "daemon".into(), "stop".into()]);

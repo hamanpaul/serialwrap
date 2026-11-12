@@ -31326,6 +31326,127 @@
         }
       }
     },
+    "s2_gpa3:cli-fakes": {
+      "linux": {
+        "nodeids": [
+          "cargo:sw-cli::mgmt_graceful_stop::capture_identity_requires_process_scan_evidence",
+          "cargo:sw-cli::mgmt_graceful_stop::graceful_handoff_gone_requires_process_scan_confirmation",
+          "cargo:sw-cli::mgmt_graceful_stop::graceful_handoff_hard_stop_only_same_identity",
+          "cargo:sw-cli::mgmt_graceful_stop::graceful_handoff_hold_failure_sends_no_stop",
+          "cargo:sw-cli::mgmt_graceful_stop::graceful_handoff_hold_prevents_restart_on_failure_relaunch",
+          "cargo:sw-cli::mgmt_graceful_stop::graceful_handoff_holds_before_any_stop_rpc",
+          "cargo:sw-cli::mgmt_graceful_stop::graceful_handoff_lock_timeout_reports_timeout",
+          "cargo:sw-cli::mgmt_graceful_stop::graceful_handoff_marks_first_link_when_identity_changes_during_hold",
+          "cargo:sw-cli::mgmt_graceful_stop::graceful_handoff_process_scan_failure_is_not_released",
+          "cargo:sw-cli::mgmt_graceful_stop::graceful_handoff_rejection_returns_hold_context",
+          "cargo:sw-cli::mgmt_graceful_stop::graceful_handoff_rejects_incomplete_or_invalid_grants",
+          "cargo:sw-cli::mgmt_graceful_stop::graceful_handoff_relaunch_loop_capped",
+          "cargo:sw-cli::mgmt_graceful_stop::graceful_handoff_relaunched_busy_is_refused",
+          "cargo:sw-cli::mgmt_graceful_stop::graceful_handoff_relaunched_instance_rehandoff_no_hard_stop",
+          "cargo:sw-cli::mgmt_graceful_stop::handoff_wait_does_not_call_any_pid_a_relaunch_when_identity_is_unknown",
+          "cargo:sw-cli::mgmt_graceful_stop::on_demand_handoff_exit_wait_is_bounded_from_listener_close",
+          "cargo:sw-cli::mgmt_graceful_stop::on_demand_handoff_persistent_ping_recv_timeout_keeps_grant_limit",
+          "cargo:sw-cli::mgmt_graceful_stop::on_demand_handoff_single_ping_recv_timeout_does_not_start_exit_wait",
+          "cargo:sw-cli::mgmt_graceful_stop::on_demand_handoff_still_answering_keeps_grant_limit",
+          "cargo:sw-cli::mgmt_graceful_stop::on_demand_handoff_waits_for_granted_instance_ordered_shutdown",
+          "cargo:sw-cli::mgmt_graceful_stop::scoped_handoff_ignores_foreign_daemons_but_rehandoffs_successor",
+          "cargo:sw-cli::mgmt_graceful_stop::scoped_handoff_still_rejects_busy_target",
+          "cargo:sw-cli::mgmt_graceful_stop::scoped_handoff_still_rejects_invalid_grant",
+          "cargo:sw-cli::mgmt_graceful_stop::scoped_handoff_still_rejects_process_scan_failure",
+          "cargo:sw-cli::mgmt_graceful_stop::scoped_handoff_without_scope_rejects_unknown_daemon",
+          "cargo:sw-cli::mgmt_graceful_stop::windows_service_plain_stop_requires_sudo_before_sc_config",
+          "cargo:sw-cli::mgmt_graceful_stop::windows_task_restart_aborts_when_daemon_never_exits",
+          "cargo:sw-cli::mgmt_graceful_stop::windows_task_stop_sends_daemon_stop_before_end",
+          "cargo:sw-cli::sw_cli::install_layout::embedded_stamp_tests::invalid_stamp_is_ignored",
+          "cargo:sw-cli::sw_cli::install_layout::embedded_stamp_tests::placeholder_is_not_a_fingerprint",
+          "cargo:sw-cli::sw_cli::install_layout::embedded_stamp_tests::twelve_hex_is_the_embedded_fingerprint",
+          "cargo:sw-cli::sw_cli::remote_tunnel::tests::posix_os_error_includes_python_filename",
+          "cargo:sw-cli::sw_cli::test_update_scope::tests::configured_scope_must_match_the_operation_endpoint",
+          "cargo:sw-cli::sw_cli::test_update_scope::tests::missing_default_or_non_isolated_run_dir_rejects_a_configured_scope",
+          "cargo:sw-cli::sw_cli::test_update_scope::tests::path_and_unix_url_forms_normalize_to_the_same_socket",
+          "cargo:sw-cli::sw_cli::test_update_scope::tests::scope_with_non_unix_endpoint_is_rejected",
+          "cargo:sw-cli::sw_cli::test_update_scope::tests::scoped_scan_keeps_only_matching_socket_and_preserves_process_identity",
+          "cargo:sw-cli::sw_cli::test_update_scope::tests::socket_outside_the_isolated_run_dir_is_rejected",
+          "cargo:sw-cli::sw_cli::test_update_scope::tests::successor_with_the_same_socket_is_kept_even_with_a_new_pid",
+          "cargo:sw-cli::sw_cli::test_update_scope::tests::unset_or_empty_scope_preserves_the_full_scan",
+          "cargo:sw-cli::update_guard::guard_background_capture_alone_does_not_block",
+          "cargo:sw-cli::update_guard::guard_daemon_absent_force_same_as_without",
+          "cargo:sw-cli::update_guard::guard_daemon_absent_passes",
+          "cargo:sw-cli::update_guard::guard_flashing_blocks_rollback",
+          "cargo:sw-cli::update_guard::guard_force_does_not_override",
+          "cargo:sw-cli::update_guard::guard_force_recheck_after_disable_still_refuses",
+          "cargo:sw-cli::update_guard::guard_foreground_blocks_rollback",
+          "cargo:sw-cli::update_guard::guard_interactive_lease_blocks_rollback",
+          "cargo:sw-cli::update_guard::guard_malformed_response_refuses",
+          "cargo:sw-cli::update_guard::guard_ping_socket_error_other_than_refused_refuses",
+          "cargo:sw-cli::update_guard::guard_ping_timeout_refuses",
+          "cargo:sw-cli::update_guard::guard_process_alive_rpc_down_refuses",
+          "cargo:sw-cli::update_guard::guard_rpc_timeout_refuses",
+          "cargo:sw-cli::update_guard::scoped_update_and_rollback_ignore_foreign_daemons",
+          "cargo:sw-cli::update_guard::scoped_update_process_scan_failure_still_rejects",
+          "cargo:sw-cli::update_guard::scoped_update_target_busy_still_rejects",
+          "cargo:sw-cli::update_guard::scoped_update_unknown_health_still_rejects",
+          "cargo:sw-cli::update_guard::scoped_update_without_scope_still_rejects_foreign_daemons",
+          "cargo:sw-cli::update_guard::setup_guard_message_unchanged"
+        ],
+        "selector": {
+          "argv": [
+            "-p",
+            "sw-cli",
+            "--features",
+            "test-fakes",
+            "--lib",
+            "--test",
+            "mgmt_graceful_stop",
+            "--test",
+            "update_guard"
+          ],
+          "markexpr": "",
+          "paths": []
+        }
+      }
+    },
+    "s2_gpa3:daemon-fakes": {
+      "linux": {
+        "nodeids": [
+          "cargo:sw-daemon::handoff_stop::auto_reprobe_ready_result_survives_failed_handoff_tx_fence",
+          "cargo:sw-daemon::handoff_stop::default_cli_update_scope_cannot_bypass_foreign_daemon",
+          "cargo:sw-daemon::handoff_stop::frozen_submit_validation_errors_precede_admission",
+          "cargo:sw-daemon::handoff_stop::handoff_busy_lease_and_recovering",
+          "cargo:sw-daemon::handoff_stop::handoff_busy_while_rpc_command_outstanding",
+          "cargo:sw-daemon::handoff_stop::handoff_drain_window_background_triggers_zero_tx",
+          "cargo:sw-daemon::handoff_stop::handoff_file_push_after_last_probe",
+          "cargo:sw-daemon::handoff_stop::handoff_file_push_ticket_survives_human_replay",
+          "cargo:sw-daemon::handoff_stop::handoff_file_push_ticket_survives_rpc_timeout",
+          "cargo:sw-daemon::handoff_stop::handoff_flash_races_prepare",
+          "cargo:sw-daemon::handoff_stop::handoff_flash_races_prepare_handoff_first",
+          "cargo:sw-daemon::handoff_stop::handoff_flash_races_prepare_probe_first",
+          "cargo:sw-daemon::handoff_stop::handoff_frozen_rejects_mutating_methods",
+          "cargo:sw-daemon::handoff_stop::handoff_frozen_response_carries_startup_fingerprint",
+          "cargo:sw-daemon::handoff_stop::handoff_ok_then_sc11_stop_order",
+          "cargo:sw-daemon::handoff_stop::handoff_reason_supervision_set_same_semantics",
+          "cargo:sw-daemon::handoff_stop::handoff_rollback_preserves_shutdown_freeze",
+          "cargo:sw-daemon::handoff_stop::handoff_service_push_ticket_blocks_until_done",
+          "cargo:sw-daemon::handoff_stop::handoff_session_query_timeout_preserves_lease_ticket",
+          "cargo:sw-daemon::handoff_stop::handoff_stop_freezes_custody_deliverer_gate",
+          "cargo:sw-daemon::handoff_stop::handoff_then_successor_never_double_held",
+          "cargo:sw-daemon::handoff_stop::handoff_tx_fence_timeout_thaws_without_stop",
+          "cargo:sw-daemon::handoff_stop::shutdown_during_force_recover_poll_finishes_handler_and_exits_zero"
+        ],
+        "selector": {
+          "argv": [
+            "-p",
+            "sw-daemon",
+            "--features",
+            "test-fakes",
+            "--test",
+            "handoff_stop"
+          ],
+          "markexpr": "",
+          "paths": []
+        }
+      }
+    },
     "s2_p8_t13:flash_endpoint_cap_posix_pty": {
       "linux": {
         "nodeids": [
