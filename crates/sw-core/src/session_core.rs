@@ -629,6 +629,8 @@ pub struct SessionCore {
     custody_attach_replies: Vec<(u64, Reply, Result<PyDict, PyErr>)>,
     /// 最後一個成功回覆被安全網攔下時，保留原呼叫端的 already_released 形狀。
     custody_release_shapes: Vec<(Reply, bool)>,
+    /// 保管開埠的 clear 已回覆 ATTACHING，等該 token 的 closed:true 後才交 manager 重解析一次。
+    custody_clear_retry_token: Option<u64>,
     /// clear 收尾後等 manager 再解析（Python `_spawn_attach` → `_reresolve_profile_on_reattach`）再送
     /// `DeviceAttached`：期間 state 為 ATTACHING、無開埠（審查 F61／F62）。
     reattach_pending: bool,
@@ -802,6 +804,9 @@ struct PendingOpenStop {
     /// S2-PAR-wp510r R5（WP4-1）：已 RELEASED 的 session 上首次 release 的來源；開埠在途的停止收尾時補 `released_by`
     /// （Python `release_source = session.released_by or source`，`origin/main:sw_core/session_manager.py:3117-3122`）。
     release_source: Option<String>,
+    /// 保管開埠在途時 clear 的 token 與可能先到的關閉終態；開埠與關閉兩個回條不保證順序。
+    custody_clear_token: Option<u64>,
+    custody_clear_closed: Option<bool>,
 }
 
 /// 進行中的登入 run（`Effect::StartLogin` 已發出）。
@@ -1007,6 +1012,7 @@ impl SessionCore {
             custody_transfers: Vec::new(),
             custody_attach_replies: Vec::new(),
             custody_release_shapes: Vec::new(),
+            custody_clear_retry_token: None,
             reattach_pending: false,
             reopen_after_retired: false,
             open_generation: 0,
@@ -1958,6 +1964,9 @@ impl SessionCore {
     /// Two-Phase Drain 第一階段的發起點（Task 12；SC-04、arch §5.5）：`kind` 與 `waiter` 凍結簽章（P6 07 計畫依此呼叫）。
     pub fn begin_stop(&mut self, kind: StopKind, waiter: Option<Reply>, now: Mono) -> Effects {
         let mut effects = Effects(Vec::new());
+        if kind != StopKind::Clear {
+            self.custody_clear_retry_token = None;
+        }
         if matches!(kind, StopKind::Release | StopKind::Shutdown) {
             effects.0.extend(self.await_observed_custody(now).1);
         }
@@ -2073,6 +2082,15 @@ impl SessionCore {
                     already_released,
                     post_kind: None,
                     release_source: None,
+                    custody_clear_token: if kind == StopKind::Clear {
+                        self.custody_opening
+                            .then_some(self.external_attach)
+                            .flatten()
+                            .or(self.custody_clear_retry_token)
+                    } else {
+                        None
+                    },
+                    custody_clear_closed: None,
                 });
                 self.generations.owner_gen = self.generations.owner_gen.saturating_add(1);
                 self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
@@ -4257,7 +4275,14 @@ impl SessionCore {
     }
 
     fn finish_pending_open_stop(&mut self, pending: PendingOpenStop, now: Mono) -> Vec<Effect> {
-        let (blocked, effects) = self.await_observed_custody(now);
+        // Python clear 不等待已取消 attach worker 的 `done`；保管 token 仍由 retired_drains 等待，
+        // 但開埠工作終態後 clear 可先回 ATTACHING，closed:true 才允許重試。
+        let custody_clear = pending.kind == StopKind::Clear && pending.custody_clear_token.is_some();
+        let (blocked, effects) = if custody_clear {
+            (false, Vec::new())
+        } else {
+            self.await_observed_custody(now)
+        };
         if blocked {
             self.pending_open_stop = Some(pending);
             return effects;
@@ -4307,6 +4332,7 @@ impl SessionCore {
         self.generations.conn_epoch = None;
         self.queue_registered = false;
         let kind = pending.post_kind.unwrap_or(pending.kind);
+        let mut effects = Vec::new();
         match kind {
             StopKind::Removed => {
                 self.device_present = false;
@@ -4317,18 +4343,46 @@ impl SessionCore {
                 self.set_last_error(Some("DEVICE_REBOUND_REQUIRED".into()), None)
             }
             StopKind::IoError if !self.pending_auto_login => self.set_last_error(None, None),
-            StopKind::Clear => self.set_last_error(Some("CLEARED".into()), None),
+            StopKind::Clear => {
+                crate::reprobe::reset(&mut self.reprobe);
+                if let Some(token) = pending.custody_clear_token {
+                    if self.device_present && !self.shutdown_requested {
+                        self.set_last_error(None, None);
+                        self.set_state(SessionState::Attaching, now);
+                        let close_pending = self.retired_drains.iter().any(|entry| {
+                            entry.custody_token == Some(token)
+                                && entry.purpose == CustodyWaitPurpose::Close
+                                && entry.receipt == RetiredReceipt::Pending
+                        });
+                        match pending.custody_clear_closed {
+                            Some(true) => effects.extend(self.request_reattach(now)),
+                            Some(false) => {}
+                            None if close_pending => self.custody_clear_retry_token = Some(token),
+                            None => effects.extend(self.request_reattach(now)),
+                        }
+                    } else {
+                        self.set_last_error(Some("CLEARED".into()), None);
+                    }
+                } else {
+                    self.set_last_error(Some("CLEARED".into()), None);
+                }
+            }
             _ => {}
         }
         // shutdown 不改 RELEASED（Python `shutdown_drain` 只收尾作業，不改 session 狀態，`:1181-1239`）。
-        if !(kind == StopKind::Shutdown && self.state == SessionState::Released) {
+        if kind == StopKind::Clear && pending.custody_clear_token.is_some() {
+            if !self.device_present || self.shutdown_requested {
+                self.set_state(SessionState::Detached, now);
+            }
+        } else if !(kind == StopKind::Shutdown && self.state == SessionState::Released) {
             self.set_state(SessionState::Detached, now);
         }
-        let effects: Vec<_> = pending
-            .waiters
-            .into_iter()
-            .map(|waiter| Effect::Reply(waiter, Ok(self.ok_session(now))))
-            .collect();
+        effects.extend(
+            pending
+                .waiters
+                .into_iter()
+                .map(|waiter| Effect::Reply(waiter, Ok(self.ok_session(now)))),
+        );
         if self.shutdown_requested {
             self.shutdown_complete = true;
         }
@@ -4529,7 +4583,18 @@ impl SessionCore {
                 PlaceholderPhase::ClosingInvalid { device } => Some(device),
                 _ => None,
             });
+        if let Some(pending) = &mut self.pending_open_stop {
+            if pending.custody_clear_token == Some(token) {
+                pending.custody_clear_closed = Some(closed);
+            }
+        }
         let mut effects = self.settle_retired(index, closed, None, now);
+        if self.custody_clear_retry_token == Some(token) {
+            self.custody_clear_retry_token = None;
+            if closed && self.state == SessionState::Attaching && self.device_present && !self.shutdown_requested {
+                effects.extend(self.request_reattach(now));
+            }
+        }
         if let Some(device) = invalid {
             // 佔位退休驗證失敗、handle 已關閉（或關閉未確認）：A 依 Python 判定回覆（`:3611-3631`）。
             let pending = self.pending_attach.take().expect("剛確認的佔位 attach");
@@ -6496,6 +6561,8 @@ impl SessionCore {
                 already_released: stop.already_released,
                 post_kind: None,
                 release_source: None,
+                custody_clear_token: None,
+                custody_clear_closed: None,
             });
             if self
                 .retired_drains

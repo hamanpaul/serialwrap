@@ -9718,6 +9718,86 @@ fn wp510r_r3_pre_take_rig() -> (Arc<ServiceRig>, FakeDevice, crossbeam_channel::
     (r, dev, go_tx)
 }
 
+/// 正式 RPC 接線：出生即接管的開埠在途時 clear 先回 ATTACHING／null；保管 handle 關閉回條抵達後，
+/// `CustodyTerminal` → actor `Effect::Reattach` → manager 重解析並開埠，回到 READY。關閉暫停期間不得另開同一 UART。
+#[test]
+fn gpx_rpc_clear_during_birth_takeover_reattaches_after_close() {
+    let (r, dev, open_go) = wp510r_r3_pre_take_rig();
+    // pre-take 已消耗 fixture 的一次性空行回覆；每次正式 bridge 重開都要回 shell prompt。
+    dev.on_tx_match("^$", Box::new(|_| b"root@t:/# ".to_vec()));
+    let opens_before = dev.open_count();
+    let attempts_before = dev.open_attempts();
+    let closes_before = dev.close_count();
+    dev.pause_next_close();
+
+    let clear_rig = Arc::clone(&r);
+    let (clear_tx, clear_rx) = crossbeam_channel::bounded(1);
+    let clear = std::thread::spawn(move || {
+        let _ = clear_tx.send(clear_rig.call("session.clear", r#"{"selector":"t:COM3"}"#));
+    });
+    let close_paused = dev.wait_paused(Duration::from_secs(5));
+    if !close_paused {
+        let _ = open_go.send(());
+        dev.release_pause();
+        let _ = clear.join();
+        panic!("clear 應取消保管開埠並停在 handle 關閉回條前");
+    }
+
+    open_go.send(()).expect("放行保管開埠工作，讓 clear 可收到開埠終態");
+    let before_close_terminal = clear_rx.recv_timeout(Duration::from_secs(5));
+    let session_while_close_paused = r.session("t:COM3");
+    let custody_while_close_paused = r.mgr.custody_for_test(WP510_PLACEHOLDER_BY_ID);
+    let state_before_close = before_close_terminal
+        .as_ref()
+        .ok()
+        .and_then(|_| r.session("t:COM3"));
+    let still_open = dev.is_open();
+    let attempts_before_terminal = dev.open_attempts();
+    let opens_before_terminal = dev.open_count();
+
+    dev.release_pause();
+    clear.join().expect("clear RPC worker 不應 panic");
+    let response = before_close_terminal.unwrap_or_else(|error| panic!(
+        "clear 不等帳本關閉終態即回覆：{error:?}; session={session_while_close_paused:?}; custody={custody_while_close_paused:?}"
+    ));
+    wait_until("關閉回條後重試開埠", || dev.open_count() > opens_before);
+    let ready_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshot = r.session("t:COM3");
+        if snapshot.as_ref().is_some_and(|state| s(state, "state") == "READY") {
+            break;
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "重試開埠後應回 READY：session={snapshot:?}; attempts={}; opens={}; closes={}",
+            dev.open_attempts(),
+            dev.open_count(),
+            dev.close_count()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    let pending_session = state_before_close.expect("clear 回覆時 session 可查詢");
+    assert_eq!(s(&pending_session, "state"), "ATTACHING", "{}", j(&pending_session));
+    assert_eq!(pending_session.get("last_error"), Some(&PyValue::Null), "{}", j(&pending_session));
+    assert_eq!(
+        j(&response),
+        j(&sw_proto::pydict! {
+            "ok" => true,
+            "session" => pending_session,
+            "version" => r.version.clone(),
+        }),
+        "session.clear 必須回完整 ATTACHING／null session"
+    );
+    assert!(still_open, "關閉回條前保管 handle 仍由唯一 owner 持有");
+    assert_eq!(attempts_before_terminal, attempts_before, "關閉回條前不得再嘗試開埠");
+    assert_eq!(opens_before_terminal, opens_before, "關閉回條前不得產生第二個 handle");
+    assert_eq!(dev.open_attempts(), attempts_before + 1, "關閉回條後只重試一次");
+    assert_eq!(dev.open_count(), opens_before + 1, "FakeDevice 同時最多一個 handle，且重試只開一次");
+    assert_eq!(dev.close_count(), closes_before + 1, "重試前舊保管 handle 已關閉一次");
+    assert!(dev.is_open(), "重試完成後新 bridge 持有 handle");
+}
+
 /// P8-8463b22-1（設計 §1.4）：`tpl-a:COM3` 已建立、開埠工作停在 pre-take → release，關閉暫停超過 3 s → STALL（RECOVERING、
 /// true、g）。開埠工作 claim 失敗（紀錄已是 Closing），不另開。關閉完成後：RELEASED、"cli"、時間已填、false/null、有落盤列；
 /// open_attempts 不增加、close 1、零 TX；下一次 release 回 already_released（Python `:3105-3107`、`:3133`、`:3193-3204`、

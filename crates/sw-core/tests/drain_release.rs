@@ -5285,10 +5285,11 @@ fn wp510r_r3_p8_7bb9935_clear_then_release_deadline_not_inherited() {
     assert!(rx.try_recv().is_err(), "首次期限前不得回覆");
 }
 
-/// P8-7bb9935-4（Fable Medium；P8-566d90b-1 的保管路徑回歸）：出生即接管、開埠在途時 `session.clear`，關閉工作者關閉中
+/// P8-7bb9935-4（依 Python 對齊）：出生即接管、開埠在途時 `session.clear`，關閉工作者關閉中
 /// （`CustodyClaimed(Closing)`）、開埠工作 claim 失敗回 `CloseBlocked` 之後，clear 不等帳本紀錄的關閉終態即回 ok，
-/// DETACHED／CLEARED（只有 release／shutdown 等 retired drain；Python clear 不等被取消的 attach 作業，
-/// `origin/main:sw_core/session_manager.py:3058-3082`）。
+/// 裝置在線時為 ATTACHING／null；關閉回條前不開埠，`closed:true` 後交 manager 重解析並只重試一次。
+/// Python `clear_session` 設 ATTACHING／None 並呼叫 `_spawn_attach`（`origin/main:sw_core/session_manager.py:3058-3082`）；
+/// 同 by_id 尚在 `_draining_by_ids` 時早退，worker 結束後才重試（`:4113-4145`）。
 #[test]
 fn wp510r_r3_p8_7bb9935_custody_clear_completes_before_close_terminal() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
@@ -5297,18 +5298,23 @@ fn wp510r_r3_p8_7bb9935_custody_clear_completes_before_close_terminal() {
     assert_eq!(wp510r_claims(&effects, WP510R_CUSTODY_TOKEN), 1, "clear 取消帳本紀錄");
     wp510r_custody_claimed(&mut h, sw_core::mailbox::CustodyClaimOutcome::Closing);
     assert!(rx.try_recv().is_err(), "開埠工作終態前不回覆");
-    h.feed(ControlEvent::BridgeOpened {
+    let effects = h.feed(ControlEvent::BridgeOpened {
         epoch_hint: 0,
         result: Err(OpenFailure::CloseBlocked),
     });
+    assert!(
+        effects.iter().all(|effect| !matches!(effect, Effect::OpenBridge { .. } | Effect::ClaimCustody { .. })),
+        "關閉回條前不得開埠"
+    );
     let response = rx
         .try_recv()
         .expect("clear 不等帳本紀錄的關閉終態即回覆")
         .unwrap();
     assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
     let public = h.public();
-    assert_eq!(public["state"], PyValue::from("DETACHED"), "{public:?}");
-    assert_eq!(public["last_error"], PyValue::from("CLEARED"), "{public:?}");
+    assert_eq!(public["state"], PyValue::from("ATTACHING"), "{public:?}");
+    assert_eq!(public["last_error"], PyValue::Null, "{public:?}");
+    g15_assert_reprobe_reset(&public, "保管開埠在途 clear");
     assert_eq!(
         wp510r_custody_awaits(&mut h),
         vec![WP510R_CUSTODY_TOKEN as i64],
@@ -5319,8 +5325,119 @@ fn wp510r_r3_p8_7bb9935_custody_clear_completes_before_close_terminal() {
         closed: true,
         error: None,
     });
-    assert!(wp510r_open_bridge_paths(&effects).is_empty(), "關閉終態不重開");
+    let reattaches = effects
+        .iter()
+        .filter(|effect| matches!(effect, Effect::Reattach { by_id, .. } if by_id == DEVICE_BY_ID))
+        .count();
+    assert_eq!(reattaches, 1, "closed:true 後恰好交 manager 重解析一次");
+    assert!(wp510r_open_bridge_paths(&effects).is_empty(), "必須先交 manager 重解析，不得直接開埠");
+    assert_eq!(h.public()["state"], PyValue::from("ATTACHING"));
+
+    let duplicate = h.feed(ControlEvent::CustodyTerminal {
+        token: WP510R_CUSTODY_TOKEN,
+        closed: true,
+        error: None,
+    });
+    assert!(
+        duplicate.iter().all(|effect| !matches!(effect, Effect::Reattach { .. } | Effect::OpenBridge { .. })),
+        "重複終態不得再次重試"
+    );
+}
+
+/// D1(iii)：保管開埠途中的 clear 已回 ATTACHING；若帳本關閉回條為 false，by_id 永久阻擋且不得重試。
+#[test]
+fn gpx_custody_clear_close_failure_never_reopens() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    wp510r_birth_takeover(&mut h);
+    let (rx, effects) = h.rpc_deferred(SessionRequest::Clear);
+    assert_eq!(wp510r_claims(&effects, WP510R_CUSTODY_TOKEN), 1, "clear 取消帳本紀錄");
+    wp510r_custody_claimed(&mut h, sw_core::mailbox::CustodyClaimOutcome::Closing);
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Err(OpenFailure::CloseBlocked),
+    });
+    let response = rx.try_recv().expect("開埠工作結束後 clear 立即回覆").unwrap();
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
+    assert_eq!(h.public()["state"], PyValue::from("ATTACHING"));
+    assert_eq!(h.public()["last_error"], PyValue::Null);
+    assert!(!h.unconfirmed.contains(DEVICE_BY_ID), "closed:false 前仍是待確認關閉");
+
+    let effects = h.feed(ControlEvent::CustodyTerminal {
+        token: WP510R_CUSTODY_TOKEN,
+        closed: false,
+        error: Some("close failed".into()),
+    });
+    assert!(
+        effects.iter().all(|effect| !matches!(effect, Effect::Reattach { .. } | Effect::OpenBridge { .. } | Effect::ClaimCustody { .. })),
+        "closed:false 不得再次開埠"
+    );
+    assert!(h.unconfirmed.contains(DEVICE_BY_ID), "未確認關閉須持續阻擋");
+    assert_eq!(h.public()["state"], PyValue::from("ATTACHING"));
+    assert_eq!(h.public()["last_error"], PyValue::Null);
+}
+
+/// Python clear 在裝置已離線時保留 DETACHED／CLEARED，不要求 closed:true 後重新 attach。
+#[test]
+fn gpx_custody_clear_device_absent_keeps_cleared() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    wp510r_birth_takeover(&mut h);
+    h.feed(ControlEvent::DeviceMissing);
+    assert_eq!(h.public()["state"], PyValue::from("DETACHED"), "前置：裝置離線");
+
+    let (rx, effects) = h.rpc_deferred(SessionRequest::Clear);
+    assert_eq!(wp510r_claims(&effects, WP510R_CUSTODY_TOKEN), 1, "clear 取消帳本紀錄");
+    wp510r_custody_claimed(&mut h, sw_core::mailbox::CustodyClaimOutcome::Closing);
+    let effects = h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Err(OpenFailure::CloseBlocked),
+    });
+    assert!(
+        effects.iter().all(|effect| !matches!(effect, Effect::Reattach { .. } | Effect::OpenBridge { .. } | Effect::ClaimCustody { .. })),
+        "clear 回覆前不得嘗試開埠"
+    );
+    let response = rx.try_recv().expect("開埠工作結束後 clear 立即回覆").unwrap();
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
     assert_eq!(h.public()["state"], PyValue::from("DETACHED"));
+    assert_eq!(h.public()["last_error"], PyValue::from("CLEARED"));
+
+    let effects = h.feed(ControlEvent::CustodyTerminal {
+        token: WP510R_CUSTODY_TOKEN,
+        closed: true,
+        error: None,
+    });
+    assert!(
+        effects.iter().all(|effect| !matches!(effect, Effect::Reattach { .. } | Effect::OpenBridge { .. } | Effect::ClaimCustody { .. })),
+        "裝置離線後不得重試"
+    );
+    assert_eq!(h.public()["state"], PyValue::from("DETACHED"));
+    assert_eq!(h.public()["last_error"], PyValue::from("CLEARED"));
+}
+
+/// 開埠在途期間 clear 即使維持舊 DETACHED 收尾，也必須清掉 Python `_reset_reprobe_progress` 的三個欄位。
+#[test]
+fn gpx_pending_open_clear_resets_reprobe() {
+    let (mut h, _) = g15_detached_with_reprobe_history();
+    let before = h.public();
+    assert_eq!(before["reprobe_attempts"], PyValue::from(1), "前置：已累積重探次數");
+    assert!(matches!(before["next_reprobe_at"], PyValue::Float(_)), "前置：存在退避期限");
+
+    let opened = h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    assert!(wp510r_open_bridge_paths(&opened).contains(&REAL_PATH.to_string()), "前置：重探開埠在途");
+    let (rx, _) = h.rpc_deferred(SessionRequest::Clear);
+    assert!(rx.try_recv().is_err(), "開埠終態前 clear 等待在途開埠");
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Err(OpenFailure::Other(PalError::io(5, "open failed"))),
+    });
+    let response = rx.try_recv().expect("開埠失敗後 clear 回覆").unwrap();
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{response:?}");
+    let public = h.public();
+    assert_eq!(public["state"], PyValue::from("DETACHED"), "非保管收尾不改既有狀態語意");
+    assert_eq!(public["last_error"], PyValue::from("CLEARED"));
+    g15_assert_reprobe_reset(&public, "一般開埠在途 clear");
 }
 
 /// P8-7bb9935-4（拔除版本）：同上，裝置拔除：開埠工作終態後即 DETACHED／DEVICE_REMOVED，不等帳本紀錄的關閉終態
