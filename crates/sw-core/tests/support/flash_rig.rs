@@ -837,6 +837,7 @@ impl FlashRig {
             serial: serial.clone(),
             uart_excl: Arc::new(NoHolders),
             console: Arc::new(MgrConsole),
+            windows_serial_console: None,
             caps: sw_pal::fakes::posix_caps(),
             wal: wal.clone(),
             registry: CommandRegistry::new(),

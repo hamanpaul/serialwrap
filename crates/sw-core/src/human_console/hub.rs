@@ -109,6 +109,9 @@ pub struct HubStatus {
     pub warnings: Mutex<VecDeque<String>>,
     /// 各 console 出向 ring 的 Display bytes（每輪更新，診斷用）。
     pub ring_display: Mutex<HashMap<String, usize>>,
+    /// `test-fakes`：各 console ring 累計丟棄的 Display bytes。
+    #[cfg(feature = "test-fakes")]
+    pub ring_dropped: Mutex<HashMap<String, u64>>,
     /// WARNING 模板用的 COM（`spawn_hub` 設定）。
     pub com: OnceLock<String>,
     /// hub thread 已結束。
@@ -136,6 +139,8 @@ impl HubStatus {
             pending: AtomicU64::new(0),
             warnings: Mutex::new(VecDeque::new()),
             ring_display: Mutex::new(HashMap::new()),
+            #[cfg(feature = "test-fakes")]
+            ring_dropped: Mutex::new(HashMap::new()),
             com: OnceLock::new(),
             exited: AtomicBool::new(false),
             #[cfg(feature = "test-fakes")]
@@ -275,7 +280,7 @@ pub fn spawn_hub(
         .expect("ConsoleMux 建立失敗")
 }
 
-/// 同 `spawn_hub`，直接取 console 工廠；`new_mux` 失敗（例如 Windows WSAPoll 尚未實作，LOCAL-WINDOWS-TODO）回 `Err`。
+/// 同 `spawn_hub`，直接取 console 工廠建立 PAL mux；建立失敗時將錯誤回傳給呼叫端。
 pub fn spawn_hub_with(
     com: String,
     factory: Arc<dyn sw_pal::console_pty::ConsoleTransportFactory>,
@@ -1047,8 +1052,18 @@ impl Hub {
             .ring_display
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "test-fakes")]
+        let mut dropped = self
+            .status
+            .ring_dropped
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "test-fakes")]
+        dropped.clear();
         for c in self.clients.values() {
             m.insert(c.cid.clone(), c.ring.display_bytes());
+            #[cfg(feature = "test-fakes")]
+            dropped.insert(c.cid.clone(), c.ring.dropped_total());
         }
     }
 }

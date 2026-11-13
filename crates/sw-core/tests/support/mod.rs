@@ -2410,6 +2410,7 @@ fn assemble_manager(
         serial: serial.clone(),
         uart_excl: Arc::new(RigExcl::for_serial(&serial)),
         console,
+        windows_serial_console: None,
         caps: sw_pal::fakes::posix_caps(),
         wal: wal.clone(),
         registry: registry.clone(),

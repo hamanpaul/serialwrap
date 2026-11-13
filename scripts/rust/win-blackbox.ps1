@@ -9,6 +9,7 @@
     [string]$ComPair,
     [int]$SelftestTimeoutSeconds = 900,
     [string]$Label = 'rust-1a-win',
+    [ValidateSet('stage1a', 'console')][string]$Subset = 'stage1a',
     # P7 Task 18A：逗號分隔的 pytest 路徑（如 tests\contract_blackbox\test_p7_events.py,…）；未給時維持 P3 行為＝整個 tests/contract_blackbox。
     [string]$Tests
 )
@@ -17,6 +18,9 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if ($ComPair -and $ComPair -cne 'COM20:COM21') {
     throw '此 Stage 1A runner 僅允許 DUT-side COM pair COM20:COM21'
+}
+if ($Subset -eq 'console' -and $ComPair -cne 'COM20:COM21') {
+    throw '-Subset console 必須明確使用 DUT-side COM pair COM20:COM21'
 }
 
 function Get-Sha256([string]$Path) {
@@ -522,14 +526,42 @@ function Invoke-Blackbox([string]$Name, [string]$JunitPath, [string]$CliPath, [s
         Remove-Item Env:SW_RESOURCE_REPORT -ErrorAction SilentlyContinue
     }
     # pytest argv 與凍結的 s1a_blackbox windows selector 完全一致；P7 Task 18A 的 -Tests 只替換路徑段。
-    $arguments = @('-3.12', '-m', 'pytest', 'tests/contract_blackbox', '-m', 'core_portable or windows_native',
-                   "--junitxml=$JunitPath")
-    if ($Tests) {
+    if ($Subset -eq 'console') {
+        $arguments = @(
+            '-3.12', '-m', 'pytest',
+            'tests/contract_blackbox/slice22/test_console_telnet.py',
+            'tests/contract_blackbox/slice22/test_interactive_lease.py',
+            '-m', 'core_portable or windows_native',
+            '--deselect', 'tests/contract_blackbox/slice22/test_interactive_lease.py::test_soft_preempt_restore_and_replay',
+            '--deselect', 'tests/contract_blackbox/slice22/test_interactive_lease.py::test_expiry_tick_restores_without_access',
+            '--deselect', 'tests/contract_blackbox/slice22/test_interactive_lease.py::test_stash_dropped_does_not_replay',
+            "--junitxml=$JunitPath"
+        )
+    } else {
+        $arguments = @('-3.12', '-m', 'pytest', 'tests/contract_blackbox', '-m', 'core_portable or windows_native',
+                       "--junitxml=$JunitPath")
+    }
+    if ($Tests -and $Subset -ne 'console') {
         $testPaths = @($Tests -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
         $arguments = @($arguments[0..2]) + $testPaths + @($arguments[4..($arguments.Length - 1)])
     }
-    $stdoutPath = Join-Path $OutDir "$Name.stdout.log"
-    $stderrPath = Join-Path $OutDir "$Name.stderr.log"
+    $evidenceDir = Split-Path -Parent $JunitPath
+    $null = New-Item -ItemType Directory -Path $evidenceDir -Force
+    $stdoutPath = Join-Path $evidenceDir 'pytest.stdout.log'
+    $stderrPath = Join-Path $evidenceDir 'pytest.stderr.log'
+    $env:SW_TEST_DAEMON_STDERR_DIR = Join-Path $evidenceDir 'daemon'
+    $null = New-Item -ItemType Directory -Path $env:SW_TEST_DAEMON_STDERR_DIR -Force
+    $oldHome = $env:HOME
+    $oldUserProfile = $env:USERPROFILE
+    $oldXdgConfigHome = $env:XDG_CONFIG_HOME
+    $oldXdgStateHome = $env:XDG_STATE_HOME
+    $isolatedWindowsHome = Join-Path $evidenceDir 'test-home'
+    $null = New-Item -ItemType Directory -Path $isolatedWindowsHome -Force
+    $env:HOME = $isolatedWindowsHome
+    $env:USERPROFILE = $isolatedWindowsHome
+    $env:XDG_CONFIG_HOME = Join-Path $isolatedWindowsHome 'xdg-config'
+    $env:XDG_STATE_HOME = Join-Path $isolatedWindowsHome 'xdg-state'
+    $null = New-Item -ItemType Directory -Path $env:XDG_CONFIG_HOME, $env:XDG_STATE_HOME -Force
     $oldErrorActionPreference = $ErrorActionPreference
     Push-Location -LiteralPath $script:stagingRepo
     try {
@@ -540,6 +572,17 @@ function Invoke-Blackbox([string]$Name, [string]$JunitPath, [string]$CliPath, [s
     } finally {
         Pop-Location
         $ErrorActionPreference = $oldErrorActionPreference
+        Remove-Item Env:SW_TEST_DAEMON_STDERR_DIR -ErrorAction SilentlyContinue
+        foreach ($name in @('HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME')) {
+            $oldValue = switch ($name) {
+                'HOME' { $oldHome }
+                'USERPROFILE' { $oldUserProfile }
+                'XDG_CONFIG_HOME' { $oldXdgConfigHome }
+                'XDG_STATE_HOME' { $oldXdgStateHome }
+            }
+            if ($null -eq $oldValue) { Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue }
+            else { Set-Item -LiteralPath "Env:$name" -Value $oldValue }
+        }
     }
     return [ordered]@{
         exit = $pytestExit
@@ -551,14 +594,15 @@ function Invoke-Blackbox([string]$Name, [string]$JunitPath, [string]$CliPath, [s
 }
 
 function Start-WindowsComBridge([string]$StagingRepo, [string]$ScratchRoot, [string]$OutputRoot,
-                                [string]$ComPair, [string]$RunId) {
+                                [string]$ComPair, [string]$RunId,
+                                [string]$EvidenceName = 'windows-com', [bool]$UseConsoleModel = $false) {
     if ($ComPair -cne 'COM20:COM21') { throw '拒絕開啟非 COM20:COM21 配對' }
-    $comRoot = Join-Path $OutputRoot 'windows-com'
+    $comRoot = Join-Path $OutputRoot $EvidenceName
     $bridgeRoot = Join-Path $comRoot 'bridge'
     $null = New-Item -ItemType Directory -Path $bridgeRoot -Force
     # bridge 證據（wire／control.json 皆 fsync）寫在 Windows 本機 scratch，停止後再回寫 OutputRoot：
     # \\wsl.localhost（9P）上 FlushFileBuffers 失敗時 CRT 一律回 EBADF，曾使 bridge 未建 control.json 即以 exit 3 結束。
-    $localBridgeRoot = Join-Path $ScratchRoot 'windows-com-bridge'
+    $localBridgeRoot = Join-Path $ScratchRoot ("uart-stdio-bridge-{0}" -f ($EvidenceName -replace '[\\/]', '-'))
     $null = New-Item -ItemType Directory -Path $localBridgeRoot -Force
     $bridgeSource = Join-Path $StagingRepo 'tools/uart_stdio_bridge/src'
     $runScript = Join-Path $ScratchRoot 'run-uart-stdio-bridge.py'
@@ -567,12 +611,29 @@ function Start-WindowsComBridge([string]$StagingRepo, [string]$ScratchRoot, [str
     $controlPath = Join-Path $localBridgeRoot 'control.json'
     $stdoutPath = Join-Path $localBridgeRoot 'stdout.log'
     $stderrPath = Join-Path $localBridgeRoot 'stderr.log'
-    $dutArgv = ConvertTo-Json -InputObject @('py', '-3.12', '-m', 'uart_stdio_bridge.dut', '--mode', 'echo') -Compress
     $bridgeArgs = @(
         'run', '--run-id', "g1-$RunId", '--case-id', 'stage1a-windows-com', '--port-id', 'COM0',
         '--evidence-dir', $localBridgeRoot, '--endpoint', 'win-serial', '--com', 'COM21',
-        '--transport-mode', 'virtual_com0com', '--dut-mode', 'local-process', '--dut-argv-json', $dutArgv
+        '--transport-mode', 'virtual_com0com', '--dut-mode', 'local-process'
     )
+    if ($UseConsoleModel) {
+        $targetJsonPath = Join-Path $localBridgeRoot 'target.json'
+        $targetConfig = [ordered]@{
+            platform = 'shell'
+            boot_banner = 'root@t:/# '
+            noise_enabled = $false
+            noise_interval_ms = 50
+            noise_pattern = 'KDBG:tick:{tick}'
+            default_response = "EXEC:{cmd}`r`nRESULT:{cmd}:OK`r`nroot@t:/# "
+            overrides = [ordered]@{}
+            login_steps = @()
+        }
+        Write-Json $targetJsonPath $targetConfig
+        $bridgeArgs += @('--dut-target-json', $targetJsonPath)
+    } else {
+        $dutArgv = ConvertTo-Json -InputObject @('py', '-3.12', '-m', 'uart_stdio_bridge.dut', '--mode', 'echo') -Compress
+        $bridgeArgs += @('--dut-argv-json', $dutArgv)
+    }
     Write-Json $specPath ([ordered]@{ argv = $bridgeArgs })
     $runnerCode = @'
 import json
@@ -922,6 +983,74 @@ finally:
     }
 }
 
+function Get-ConsoleJUnit([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return [ordered]@{ tests = 0; passed = 0; failed = 0; skipped = 0; rows = @{} }
+    }
+    [xml]$junit = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+    $rows = [ordered]@{}
+    foreach ($case in $junit.SelectNodes('//testcase')) {
+        $key = '{0}::{1}' -f $case.GetAttribute('classname'), $case.GetAttribute('name')
+        $outcome = 'passed'
+        if ($case.SelectSingleNode('./failure') -or $case.SelectSingleNode('./error')) {
+            $outcome = 'failed'
+        } elseif ($case.SelectSingleNode('./skipped')) {
+            $outcome = 'skipped'
+        }
+        if ($rows.Contains($key)) { throw "JUnit node 重複：$key" }
+        $rows[$key] = $outcome
+    }
+    $failed = @($rows.Values | Where-Object { $_ -eq 'failed' }).Count
+    $skipped = @($rows.Values | Where-Object { $_ -eq 'skipped' }).Count
+    return [ordered]@{
+        tests = $rows.Count
+        passed = $rows.Count - $failed - $skipped
+        failed = $failed
+        skipped = $skipped
+        rows = $rows
+    }
+}
+
+function Invoke-ConsoleAbRun([string]$Name, [string]$CliPath, [string]$DaemonPath,
+                             [string]$RuntimePath, [string]$RunLabel, [bool]$RustRun,
+                             [string]$BundlePath, [string]$ComPair, [string]$RunId) {
+    $evidenceDir = Join-Path $outputRoot $Name
+    $baselineListeners = Get-LoopbackListenerSnapshot
+    $bridge = Start-WindowsComBridge $stagingRepo $scratchRoot $outputRoot $ComPair `
+        "$RunId-$Name" $Name $true
+    $result = $null
+    $bridgeStop = $null
+    $releaseCheck = $null
+    try {
+        $result = Invoke-Blackbox $Name (Join-Path $evidenceDir 'junit.xml') $CliPath $DaemonPath `
+            $RuntimePath $RunLabel $RustRun $null $BundlePath $ComPair $bridge.wire $null
+    } finally {
+        $bridgeStop = Stop-WindowsComBridge $bridge $scratchRoot
+        $releaseCheck = Confirm-BlackboxRelease $stagingRepo $scratchRoot $baselineListeners
+        Write-Json (Join-Path $evidenceDir 'release-check.json') $releaseCheck
+        Write-Json (Join-Path $evidenceDir 'bridge-stop.json') $bridgeStop
+    }
+    $summary = Get-ConsoleJUnit (Join-Path $evidenceDir 'junit.xml')
+    return [ordered]@{
+        exit = if ($null -ne $result) { $result.exit } else { 1 }
+        junit = Join-Path $evidenceDir 'junit.xml'
+        stdout = if ($result) { $result.stdout } else { $null }
+        stderr = if ($result) { $result.stderr } else { $null }
+        daemon_stderr_dir = Join-Path $evidenceDir 'daemon'
+        wal_dir = Join-Path (Join-Path $evidenceDir 'daemon') 'wal'
+        bridge_wire = Join-Path $evidenceDir 'bridge\wire.ndjson'
+        bridge_stdout = Join-Path $evidenceDir 'bridge\stdout.log'
+        bridge_stderr = Join-Path $evidenceDir 'bridge\stderr.log'
+        bridge_stop = $bridgeStop
+        release_check = $releaseCheck
+        tests = $summary.tests
+        passed = $summary.passed
+        failed = $summary.failed
+        skipped = $summary.skipped
+        rows = $summary.rows
+    }
+}
+
 $sourceRoot = (Resolve-Path -LiteralPath $RepoSnapshot).ProviderPath
 $rustExecutable = (Resolve-Path -LiteralPath $RustExe).ProviderPath
 if (-not (Test-Path -LiteralPath $rustExecutable -PathType Leaf)) { throw "Rust CLI 不存在：$RustExe" }
@@ -1070,6 +1199,87 @@ try {
     $resourceReport = Join-Path $l1Directory 'resource-report.json'
     $pythonCli = Join-Path $stagingRepo 'serialwrap.py'
     $pythonDaemon = Join-Path $stagingRepo 'serialwrapd.py'
+
+    if ($Subset -eq 'console') {
+        $python = Invoke-ConsoleAbRun 'python' $pythonCli $pythonDaemon $runtimeExe 'python-win-console' `
+            $false $bundleRoot $ComPair $runId
+        $rust = Invoke-ConsoleAbRun 'rust' (Join-Path $bundleBin 'serialwrap.exe') $bundleDaemon $runtimeExe `
+            'rust-s2-console-win' $true $bundleRoot $ComPair $runId
+
+        $allKeys = @(@($python.rows.Keys) + @($rust.rows.Keys) | Sort-Object -Unique)
+        $differences = @()
+        foreach ($key in $allKeys) {
+            $pythonOutcome = if ($python.rows.Contains($key)) { $python.rows[$key] } else { 'missing' }
+            $rustOutcome = if ($rust.rows.Contains($key)) { $rust.rows[$key] } else { 'missing' }
+            if ($pythonOutcome -cne $rustOutcome) {
+                $differences += [ordered]@{ node = $key; python = $pythonOutcome; rust = $rustOutcome }
+            }
+        }
+        $failedRuns = @(@($python, $rust) | Where-Object {
+            $_.tests -ne 16 -or $_.passed -ne 16 -or $_.exit -ne 0 -or
+            $_.failed -gt 0 -or $_.skipped -gt 0 -or
+            $_.bridge_stop.status -ne 'PASS' -or -not $_.release_check.ok
+        })
+        $missing = @()
+        foreach ($run in @($python, $rust)) {
+            foreach ($path in @($run.junit, $run.bridge_wire)) {
+                if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item -LiteralPath $path).Length -eq 0) {
+                    $missing += "必要 console A/B 證據缺少或為空：$path"
+                }
+            }
+            foreach ($path in @($run.bridge_stdout, $run.bridge_stderr)) {
+                if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                    $missing += "必要 console A/B 診斷檔缺少：$path"
+                }
+            }
+            if (-not (Test-Path -LiteralPath $run.daemon_stderr_dir -PathType Container)) {
+                $missing += "daemon.stderr 證據目錄不存在：$($run.daemon_stderr_dir)"
+            } elseif (@(Get-ChildItem -LiteralPath $run.daemon_stderr_dir -Filter '*.daemon.stderr' -File).Count -eq 0) {
+                $missing += "daemon.stderr 診斷檔不存在：$($run.daemon_stderr_dir)"
+            }
+            if (-not (Test-Path -LiteralPath $run.wal_dir -PathType Container) -or
+                @(Get-ChildItem -LiteralPath $run.wal_dir -Filter '*.raw.wal.ndjson' -File | Where-Object { $_.Length -gt 0 }).Count -eq 0) {
+                $missing += "daemon WAL 證據缺少或為空：$($run.wal_dir)"
+            }
+        }
+        $windowsGaps = @(
+            'OD-85：test_soft_preempt_restore_and_replay',
+            'OD-85：test_expiry_tick_restores_without_access',
+            'OD-85：test_stash_dropped_does_not_replay'
+        )
+        $result = if ($missing.Count -gt 0) { 'EVIDENCE-INSUFFICIENT' } `
+                  elseif ($failedRuns.Count -gt 0 -or $differences.Count -gt 0) { 'FAIL' } else { 'PASS' }
+        $summary = [ordered]@{
+            format = 'windows-console-ab.v1'
+            subset = 'console'
+            run_id = $runId
+            result = $result
+            com_pair = $ComPair
+            tcp = '127.0.0.1 loopback'
+            python = $python
+            rust = $rust
+            outcomes_match = ($differences.Count -eq 0)
+            differences = $differences
+            windows_gaps = $windowsGaps
+            evidence_insufficient = $missing
+        }
+        Write-Json (Join-Path $outputRoot 'ab_summary.json') $summary
+        $report = [ordered]@{
+            run_id = $runId
+            subset = 'console'
+            result = $result
+            windows_com = 'NOT_RUN'
+            python = $python
+            rust = $rust
+            ab_summary = Join-Path $outputRoot 'ab_summary.json'
+            evidence_insufficient = $missing
+        }
+        Write-Json (Join-Path $outputRoot 'report.json') $report
+        Write-Output (Join-Path $outputRoot 'report.json')
+        if ($result -ne 'PASS') { exit 1 }
+        return
+    }
+
     if ($ComPair) {
         $selftest = Invoke-BridgeSelftest $stagingRepo $scratchRoot $outputRoot $ComPair $SelftestTimeoutSeconds
         Write-Json (Join-Path $outputRoot 'windows-com\selftest-result.json') $selftest

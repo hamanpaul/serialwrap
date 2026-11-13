@@ -6,6 +6,7 @@ import os
 import select
 import socket
 import time
+from collections.abc import Mapping
 
 
 def open_vtty(path: str) -> int:
@@ -47,6 +48,43 @@ def telnet_connect(endpoint: str) -> socket.socket:
     sock = socket.create_connection((host, int(port)), timeout=3.0)
     sock.setblocking(False)
     return sock
+
+
+def console_kind(attach_resp: Mapping[str, object]) -> str:
+    """依 attach 回應判定 console 使用 TCP 或 PTY。"""
+    transport = attach_resp.get("transport")
+    if transport == "tcp":
+        return "tcp"
+    if transport == "pty" or (transport is None and attach_resp.get("vtty")):
+        return "pty"
+    raise AssertionError(f"未知 console transport：{attach_resp!r}")
+
+
+def open_console(attach_resp: Mapping[str, object]) -> socket.socket | int:
+    """依 attach 回應連入 console；Windows 使用 TCP socket，POSIX 使用 PTY。"""
+    if console_kind(attach_resp) == "tcp":
+        endpoint = attach_resp.get("endpoint")
+        if not isinstance(endpoint, str):
+            raise AssertionError(f"TCP console 缺少 endpoint：{attach_resp!r}")
+        return telnet_connect(endpoint)
+    vtty = attach_resp.get("vtty")
+    if not isinstance(vtty, str):
+        raise AssertionError(f"PTY console 缺少 vtty：{attach_resp!r}")
+    return open_vtty(vtty)
+
+
+def write_console(client: socket.socket | int, data: bytes) -> None:
+    if isinstance(client, socket.socket):
+        client.sendall(data)
+    else:
+        os.write(client, data)
+
+
+def close_console(client: socket.socket | int) -> None:
+    if isinstance(client, socket.socket):
+        client.close()
+    else:
+        os.close(client)
 
 
 def sock_read_for(sock: socket.socket, seconds: float) -> bytes:

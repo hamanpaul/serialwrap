@@ -5,19 +5,59 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 cd "$ROOT"
 NO_COMPARE=0
+SUBSET=stage1a
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-compare) NO_COMPARE=1; shift ;;
+    --subset)
+      [[ $# -ge 2 && "$2" == console ]] || { echo "用法：--subset console" >&2; exit 2; }
+      SUBSET=console; shift 2 ;;
     -h|--help)
-      echo "用法：scripts/rust/win-blackbox.sh [--no-compare]";
+      echo "用法：scripts/rust/win-blackbox.sh [--no-compare] [--subset console]";
       exit 0
       ;;
     *) echo "win-blackbox.sh: 未知參數 $1" >&2; exit 2 ;;
   esac
 done
 
+windows_dirs=(
+  /mnt/c/Windows/System32
+  /mnt/c/Windows
+  /mnt/c/Windows/System32/WindowsPowerShell/v1.0
+  /mnt/c/Users/haman/AppData/Local/Microsoft/WindowsApps
+)
+for windows_dir in "${windows_dirs[@]}"; do
+  if [[ -d "$windows_dir" ]]; then
+    PATH="$windows_dir:$PATH"
+  fi
+done
+export PATH
+for windows_command in cmd.exe powershell.exe; do
+  if ! command -v "$windows_command" >/dev/null 2>&1; then
+    echo "win-blackbox.sh: 找不到 $windows_command；未執行 Windows 程式" >&2
+    exit 2
+  fi
+done
+if ! powershell.exe -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()' >/dev/null 2>&1; then
+  echo "win-blackbox.sh: WSL interop 預檢失敗；未執行 Windows 程式" >&2
+  exit 2
+fi
+if [[ ! -d /mnt/d ]]; then
+  echo "win-blackbox.sh: 無法檢查共用 D 槽空間；停止建置" >&2
+  exit 2
+fi
+d_available="$(df -BG --output=avail /mnt/d | tail -n 1 | tr -cd '0-9')"
+if [[ ! "$d_available" =~ ^[0-9]+$ || "$d_available" -lt 100 ]]; then
+  echo "win-blackbox.sh: D 槽可用空間低於 100G 或無法判定（${d_available:-unknown}G）；停止建置" >&2
+  exit 2
+fi
+
 if [[ -n "${SW_TEST_COM_PAIR:-}" && "$SW_TEST_COM_PAIR" != "COM20:COM21" ]]; then
   echo "win-blackbox.sh: 只允許 Stage 1A DUT-side COM pair COM20:COM21" >&2
+  exit 2
+fi
+if [[ "$SUBSET" == console && "${SW_TEST_COM_PAIR:-}" != "COM20:COM21" ]]; then
+  echo "win-blackbox.sh: --subset console 必須明確設定 SW_TEST_COM_PAIR=COM20:COM21" >&2
   exit 2
 fi
 selftest_timeout="${SW_WIN_SELFTEST_TIMEOUT_S:-900}"
@@ -125,6 +165,7 @@ ps_args=(-NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "$ROOT/scripts/r
   -RustExe "$rust_win" -RepoSnapshot "$repo_win" -GitBundle "$git_bundle_win" -OutDir "$out_win"
   -SelftestTimeoutSeconds "$selftest_timeout"
   -GitRevision "$git_revision" -ContractRevision "$contract_revision")
+ps_args+=(-Subset "$SUBSET")
 if [[ -d "$(wslpath -u "$python3123" 2>/dev/null)" ]]; then
   ps_args+=(-Python3123 "$python3123")
 fi
@@ -135,10 +176,64 @@ fi
 set +e
 powershell.exe "${ps_args[@]}"
 blackbox_rc=$?
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "$ROOT/scripts/rust/win-startup-100.ps1")" \
-  -Exe "$stage_exe_win" -OutDir "$(wslpath -w "$out_dir/startup")"
-startup_rc=$?
+if [[ "$SUBSET" == console ]]; then
+  startup_rc=0
+else
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "$ROOT/scripts/rust/win-startup-100.ps1")" \
+    -Exe "$stage_exe_win" -OutDir "$(wslpath -w "$out_dir/startup")"
+  startup_rc=$?
+fi
 set -e
+
+if [[ "$SUBSET" == console ]]; then
+  python3 - "$out_dir" "$run_id" "$blackbox_rc" "$imports_rc" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+out = Path(sys.argv[1])
+run_id = sys.argv[2]
+blackbox_rc = int(sys.argv[3])
+imports_rc = int(sys.argv[4])
+
+def read(name):
+    path = out / name
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+summary = read("ab_summary.json")
+insufficient = list((summary or {}).get("evidence_insufficient", []))
+imports = read("imports.json")
+if not summary:
+    insufficient.append("Windows console A/B summary 不存在")
+if imports_rc != 0 or not imports or imports.get("ok") is not True:
+    insufficient.append("Windows binary import 檢查未通過")
+
+if summary and summary.get("result") == "FAIL":
+    result = "FAIL"
+elif summary and summary.get("result") == "PASS" and not insufficient and blackbox_rc == 0:
+    result = "PASS"
+else:
+    result = "EVIDENCE-INSUFFICIENT"
+
+report = {
+    "run_id": run_id,
+    "subset": "console",
+    "result": result,
+    "com_pair": "COM20:COM21",
+    "windows_com": "NOT_RUN",
+    "ab_summary": str(out / "ab_summary.json"),
+    "python_junit": str(out / "python/junit.xml"),
+    "rust_junit": str(out / "rust/junit.xml"),
+    "evidence_insufficient": insufficient,
+}
+(out / "report.json").write_text(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+print(out / "report.json")
+raise SystemExit(0 if result == "PASS" else 1)
+PY
+  exit $?
+fi
 
 set +e
 if [[ "$NO_COMPARE" -eq 0 && -f "$out_dir/a.xml" && -f "$out_dir/b.xml" ]]; then

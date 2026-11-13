@@ -2921,6 +2921,10 @@
           "cargo:sw-daemon::sw_daemon::framing::tests::trim_matches_python_strip",
           "cargo:sw-daemon::sw_daemon::launcher::tests::current_release_rejects_parent_traversal",
           "cargo:sw-daemon::sw_daemon::launcher::tests::current_release_resolves_manifest_from_memfs",
+          "cargo:sw-daemon::windows_console_native::telnet_hub_end_to_end_with_fake_serial",
+          "cargo:sw-daemon::windows_console_native::telnet_listener_ephemeral_per_bridge",
+          "cargo:sw-daemon::windows_console_native::telnet_second_client_line_mode",
+          "cargo:sw-daemon::windows_console_native::telnet_slow_client_bounded",
           "cargo:sw-daemon::wintask_staging_isolation::every_isolation_var_comes_from_the_batch",
           "cargo:sw-daemon::wintask_staging_isolation::staging_batch_env_makes_daemon_isolation_hold_and_allowlist_effective",
           "cargo:sw-daemon::wintask_staging_isolation::staging_config_parsed_by_daemon_excludes_registry_coms",
@@ -9595,6 +9599,8 @@
           "tests/test_s22_gate_check.py::test_runner_exit_nonzero_insufficient",
           "tests/test_s22_gate_check.py::test_unchecked_only_case_is_insufficient",
           "tests/test_s22_gate_check.py::test_underivable_caps_selector_is_evidence_missing",
+          "tests/test_s22_gate_check.py::test_windows_com_console_cap_requires_native_evidence",
+          "tests/test_s22_gate_check.py::test_windows_daemon_console_cap_requires_native_evidence",
           "tests/test_s22_l1_lock_rust.py::test_p6_rust_tests_are_frozen_in_l1_lock[s22_gate:cargo_workspace]",
           "tests/test_s22_l1_lock_rust.py::test_p6_rust_tests_are_frozen_in_l1_lock[s22_gate:console_conformance_pty]",
           "tests/test_s22_l1_lock_rust.py::test_scanner_finds_known_golden_test",
@@ -23810,6 +23816,10 @@
           "cargo:sw-daemon::sw_daemon::framing::tests::trim_matches_python_strip",
           "cargo:sw-daemon::sw_daemon::launcher::tests::current_release_rejects_parent_traversal",
           "cargo:sw-daemon::sw_daemon::launcher::tests::current_release_resolves_manifest_from_memfs",
+          "cargo:sw-daemon::windows_console_native::telnet_hub_end_to_end_with_fake_serial",
+          "cargo:sw-daemon::windows_console_native::telnet_listener_ephemeral_per_bridge",
+          "cargo:sw-daemon::windows_console_native::telnet_second_client_line_mode",
+          "cargo:sw-daemon::windows_console_native::telnet_slow_client_bounded",
           "cargo:sw-daemon::wintask_staging_isolation::every_isolation_var_comes_from_the_batch",
           "cargo:sw-daemon::wintask_staging_isolation::staging_batch_env_makes_daemon_isolation_hold_and_allowlist_effective",
           "cargo:sw-daemon::wintask_staging_isolation::staging_config_parsed_by_daemon_excludes_registry_coms",
@@ -31729,6 +31739,8 @@
           "tests/test_s22_gate_check.py::test_runner_exit_nonzero_insufficient",
           "tests/test_s22_gate_check.py::test_unchecked_only_case_is_insufficient",
           "tests/test_s22_gate_check.py::test_underivable_caps_selector_is_evidence_missing",
+          "tests/test_s22_gate_check.py::test_windows_com_console_cap_requires_native_evidence",
+          "tests/test_s22_gate_check.py::test_windows_daemon_console_cap_requires_native_evidence",
           "tests/test_s22_l1_lock_rust.py::test_p6_rust_tests_are_frozen_in_l1_lock[s22_gate:cargo_workspace]",
           "tests/test_s22_l1_lock_rust.py::test_p6_rust_tests_are_frozen_in_l1_lock[s22_gate:console_conformance_pty]",
           "tests/test_s22_l1_lock_rust.py::test_scanner_finds_known_golden_test",
@@ -37159,6 +37171,32 @@
             "test-fakes",
             "--test",
             "console_conformance",
+            "--",
+            "--ignored",
+            "cap_windows_com__"
+          ],
+          "markexpr": "",
+          "paths": []
+        }
+      }
+    },
+    "s22_gate:windows_cap_windows_com_daemon": {
+      "windows": {
+        "nodeids": [
+          "cargo:sw-daemon::windows_console_native::cap_windows_com__serial_console_end_to_end",
+          "cargo:sw-daemon::windows_console_native::telnet_hub_end_to_end_with_fake_serial",
+          "cargo:sw-daemon::windows_console_native::telnet_listener_ephemeral_per_bridge",
+          "cargo:sw-daemon::windows_console_native::telnet_second_client_line_mode",
+          "cargo:sw-daemon::windows_console_native::telnet_slow_client_bounded"
+        ],
+        "selector": {
+          "argv": [
+            "--package",
+            "sw-daemon",
+            "--features",
+            "test-fakes",
+            "--test",
+            "windows_console_native",
             "--",
             "--ignored",
             "cap_windows_com__"

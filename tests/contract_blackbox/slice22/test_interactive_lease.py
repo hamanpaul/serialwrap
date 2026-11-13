@@ -8,7 +8,10 @@ import pytest
 
 from .console_helpers import open_vtty, tx_payload, wait_for, wait_rx_contains
 
-pytestmark = pytest.mark.cap_posix_pty
+if os.name == "nt":
+    pytestmark = [pytest.mark.windows_native, pytest.mark.windows_com]
+else:
+    pytestmark = [pytest.mark.posix_only, pytest.mark.cap_posix_pty]
 
 
 def _open(d, owner: str = "agent", timeout: str | None = None) -> dict:

@@ -32,7 +32,9 @@ use sw_pal::traits::{
     SerialConfig, SerialHandle, SerialReader, SerialWriter, SubmitGate, SysEnv, TxOutcome, TxResult,
     UartExclusive, WatcherEvent,
 };
-use sw_proto::config_types::{LoadResult, ProfileTemplate, SessionProfile, UartProfile};
+use sw_proto::config_types::{
+    LoadResult, ProfileTemplate, SerialConsoleMap, SessionProfile, UartProfile,
+};
 use sw_proto::pycompat::{PyErr, clean_text, iso_utc_now};
 use sw_proto::pydict;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
@@ -91,6 +93,8 @@ pub struct ManagerDeps {
     pub serial: Arc<dyn SerialBackend>,
     pub uart_excl: Arc<dyn UartExclusive>,
     pub console: Arc<dyn ConsoleTransportFactory>,
+    /// Windows `windows.serial_console` 的 by-id → com0com pair 對照；其他平台為 `None`。
+    pub windows_serial_console: Option<SerialConsoleMap>,
     pub caps: Capabilities,
     pub wal: Arc<WalWriter>,
     pub registry: Arc<CommandRegistry>,
@@ -250,6 +254,9 @@ struct Entry {
     io: Arc<SessionIo>,
     /// 與 executor 共用的各 epoch IoWorker（P8 Task 9：`tx_for`／`line_control_for` 以 Fence 的 `active_epoch` 取值）。
     workers: Arc<Mutex<HashMap<u64, IoWorker>>>,
+    /// P6 ConsoleHub；只供 `test-fakes` 驗證 ring 上限與丟棄診斷。
+    #[cfg(feature = "test-fakes")]
+    hub: Option<Arc<crate::human_console::hub::HubHandle>>,
     #[cfg(feature = "test-fakes")]
     history: Arc<Mutex<Vec<String>>>,
 }
@@ -679,6 +686,7 @@ struct Shared {
     uart_excl: Arc<dyn UartExclusive>,
     /// console 後端：哨兵 PTY 工廠（審查 F43）與 P6 Task 9／10 的 PTY 建立、ConsoleHub 的 mux。
     console: Arc<dyn ConsoleTransportFactory>,
+    windows_serial_console: Option<SerialConsoleMap>,
     wal: Arc<WalWriter>,
     registry: Arc<CommandRegistry>,
     clock: Arc<dyn Clock>,
@@ -2025,7 +2033,7 @@ impl Shared {
             next_pty_token: AtomicU64::new(0),
         });
         let mailbox = Mailbox::new(MAILBOX_CONTROL_CAP, MAILBOX_DATA_CHUNKS_CAP);
-        // P6 Task 9：每 session 一個 ConsoleHub（mux 不可用的平台不建立；Windows WSAPoll 屬 LOCAL-WINDOWS-TODO）。
+        // P6 Task 9：每 session 一個 ConsoleHub；只有 PAL 無法建立 mux 時略過（Windows 使用 WinConsoleMux）。
         let hub = crate::human_console::hub::spawn_hub_with(
             profile.com.clone(),
             self.console.clone(),
@@ -2036,6 +2044,13 @@ impl Shared {
         )
         .ok()
         .map(Arc::new);
+        #[cfg(feature = "test-fakes")]
+        let hub_for_entry = hub.clone();
+        let serial_console_port = self
+            .windows_serial_console
+            .as_ref()
+            .and_then(|map| map.0.get(&profile.device_by_id))
+            .map(|pair| pair.console_port.clone());
         // agent log 檔名以平台 Clock 的本地時間組成（Python `time.strftime` 本地時間；審查 F34）。
         core.set_capture_env(crate::capture::CaptureEnv {
             clock: Some(self.clock.clone()),
@@ -2067,6 +2082,8 @@ impl Shared {
             workers: workers.clone(),
             runners: HashMap::new(),
             hub,
+            serial_console_port,
+            serial_console_opened: false,
             pumps: HashMap::new(),
             listener_epoch: None,
             open_jobs: JobQueue::new("open"),
@@ -2117,6 +2134,8 @@ impl Shared {
                 fence,
                 io,
                 workers,
+                #[cfg(feature = "test-fakes")]
+                hub: hub_for_entry,
                 #[cfg(feature = "test-fakes")]
                 history,
             },
@@ -4104,6 +4123,10 @@ struct ManagerExec {
     runners: HashMap<u64, OpRunner>,
     /// P6 Task 9：該 session 的 ConsoleHub（RX 分流、console I/O）。
     hub: Option<Arc<crate::human_console::hub::HubHandle>>,
+    /// 07 D-12：此 session 設定的 com0com console-side 埠。
+    serial_console_port: Option<String>,
+    /// 同一 session hub 只開一次 com0com；bridge clear/recover 不重複開埠。
+    serial_console_opened: bool,
     /// P6 Task 6（07 D-15(5)）：每個 epoch 一條 human TX pump。
     pumps: HashMap<u64, crate::human_console::human_tx::HumanTxPump>,
     /// TCP console listener 所屬的 bridge epoch（該 epoch `BeginDrain` 時停止，ephemeral port，UIO-12.8-c）。
@@ -5556,6 +5579,32 @@ impl EffectExecutor for ManagerExec {
                 if lock(&self.opened_listener).remove(&epoch) {
                     self.listener_epoch = Some(epoch);
                 }
+                if !self.serial_console_opened {
+                    if let Some(port) = self.serial_console_port.as_ref() {
+                        if let Some(hub) = self.hub.as_ref() {
+                            if hub
+                                .cmd
+                                .try_send(crate::human_console::hub::HubCmd::OpenCom0com {
+                                    port: port.clone(),
+                                })
+                                .is_ok()
+                            {
+                                self.serial_console_opened = true;
+                                hub.waker.wake();
+                            } else {
+                                self.shared.warn(format!(
+                                    "serial console 開啟命令送不進 hub（com={} port={port}）",
+                                    self.com()
+                                ));
+                            }
+                        } else {
+                            self.shared.warn(format!(
+                                "serial console 沒有可用的 ConsoleHub（com={} port={port}）",
+                                self.com()
+                            ));
+                        }
+                    }
+                }
                 // W3′（設計 §3.1.4 第 3 步、C2、C3）：① 鎖內自帳本取出 IoWorker（`Bridged{Some}` → `Bridged{None}`）；
                 // ② 鎖外以 `Reclaim` 守衛保護、放入 workers 後解除守衛；③ 鎖內移除紀錄。①～③ 之間 unwind 時守衛的 Drop
                 // 只送 `ReaperCmd::Reclaim`（不取鎖），由回收者把紀錄轉 `BridgeDraining` 並排空（DR-1 f5）。取不到者（非
@@ -5960,6 +6009,7 @@ impl SessionManager {
             serial,
             uart_excl,
             console,
+            windows_serial_console,
             caps,
             wal,
             registry,
@@ -5986,6 +6036,7 @@ impl SessionManager {
             serial,
             uart_excl,
             console: console.clone(),
+            windows_serial_console,
             wal,
             registry,
             clock,
@@ -6489,6 +6540,30 @@ impl SessionManager {
     /// Python `add_rx_observer`：之後建立的 session bridge reader 依序通知（daemon 於 bootstrap attach 前註冊）。
     pub fn add_rx_observer(&self, observer: Arc<dyn crate::uart_bridge::RxObserver>) {
         lock(&self.shared.rx_observers).push(observer);
+    }
+
+    /// `test-fakes`：回傳指定 session 各 socket/console ring 的排隊與丟棄診斷。
+    #[cfg(feature = "test-fakes")]
+    pub fn console_hub_diagnostics(&self, selector: &str) -> Vec<(String, usize, u64)> {
+        let inner = lock(&self.shared.inner);
+        let Some(entry) = inner.resolve(selector) else {
+            return Vec::new();
+        };
+        let Some(hub) = entry.hub.as_ref() else {
+            return Vec::new();
+        };
+        let display = lock(&hub.status.ring_display);
+        let dropped = lock(&hub.status.ring_dropped);
+        display
+            .iter()
+            .map(|(client_id, bytes)| {
+                (
+                    client_id.clone(),
+                    *bytes,
+                    dropped.get(client_id).copied().unwrap_or_default(),
+                )
+            })
+            .collect()
     }
 
     /// `{by_id, real_path}`，依 by_id 排序。

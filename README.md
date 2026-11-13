@@ -887,8 +887,11 @@ carries `console_endpoint`. The listener binds `127.0.0.1` only: **any local
 user on the same machine can connect** (OD-12 trust scope); deploy on a
 single-user workstation. Optional com0com serial consoles are configured in
 `config.yaml` under `windows.serial_console` (`{<DUT COM>: {console_port,
-peer_port}}`); both ports are excluded from device enumeration, a malformed
-value is ignored with one WARNING.
+peer_port}}`); after the matching DUT bridge and TCP listener are ready, the
+daemon opens `console_port` and a terminal connects to `peer_port`. Both ports
+are excluded from device enumeration, a malformed value is ignored with one
+WARNING. TCP `session console-attach` remains socket-backed and does not open a
+human lease (OD-85).
 
 #### Windows release bundle (zip)
 
@@ -2713,7 +2716,7 @@ serialwrap wal current-seq
   - **Linux/WSL**：PTY（minicom 開 `/dev/pts/N`），行為不變。
   - **Windows**：無 PTY → `UARTBridge` 開 `127.0.0.1` TCP listener，且 listener 講 **Telnet**（#131：accept 即主動協商 WILL ECHO／WILL SGA／DO SGA／WILL BINARY，入向吞協商並把 NVT 的 CR NUL／CR LF 摺疊為單一 CR、出向逸出 0xFF）——**TeraTerm（TCP/IP, Service=Telnet）或 PuTTY（Telnet）**連入即得逐字元互動與遠端回顯（體驗同 ssh），沿用 raw ownership / suspend-resume coexistence / RX fan-out（agent 下命令期間連線不中斷）。raw（Service=Other／PuTTY Raw）仍可連作備援，惟連線瞬間會見到 12 bytes 協商 greeting、且 0xFF 依 telnet 語意處理。連線端點見 `session list` 每個 session 的 `console_endpoint` 欄位（#131），或 `session console-attach` 回傳的 `endpoint`（`protocol: "telnet"`）。
 - 真機驗證：Windows 對 CH340（`COM8`，TxRx 短接 loopback）實測序列埠 start/RX/TX/WAL/clean-stop 與 TCP console raw/雙向/agent coexistence/斷線偵測全數通過。
-- **Rust daemon 的 console 後端（Slice 2.2）**：依平台選擇——Linux/WSL 為 PTY、Windows 為 loopback Telnet listener；`SERIALWRAP_CONSOLE_BACKEND`（`auto`／`pty`／`tcp`，不分大小寫）可覆寫，Linux 上設 `tcp` 即走與 Windows 相同的 Telnet listener（每個 bridge 一個 `127.0.0.1` ephemeral port，recover／clear 後重新綁定），`session console-attach` 回 `{"client_id": null, "endpoint": "127.0.0.1:<port>", "transport": "tcp", "protocol": "telnet"}` 且不開 lease，`session list` 每列都有 `console_endpoint`。listener 只綁 `127.0.0.1`：**同機任何本機使用者都能連線**（OD-12 信任範圍），請部署在單人工作站。選配 com0com Serial console 於 `config.yaml` 的 `windows.serial_console`（`{<DUT COM>: {console_port, peer_port}}`）設定，兩端埠自動排除於裝置列舉，格式錯誤時整個鍵忽略並寫一筆 WARNING。
+- **Rust daemon 的 console 後端（Slice 2.2）**：依平台選擇——Linux/WSL 為 PTY、Windows 為 loopback Telnet listener；`SERIALWRAP_CONSOLE_BACKEND`（`auto`／`pty`／`tcp`，不分大小寫）可覆寫，Linux 上設 `tcp` 即走與 Windows 相同的 Telnet listener（每個 bridge 一個 `127.0.0.1` ephemeral port，recover／clear 後重新綁定），`session console-attach` 回 `{"client_id": null, "endpoint": "127.0.0.1:<port>", "transport": "tcp", "protocol": "telnet"}` 且不開 lease（OD-85），`session list` 每列都有 `console_endpoint`。listener 只綁 `127.0.0.1`：**同機任何本機使用者都能連線**（OD-12 信任範圍），請部署在單人工作站。選配 com0com Serial console 於 `config.yaml` 的 `windows.serial_console`（`{<DUT COM>: {console_port, peer_port}}`）設定；對應 DUT bridge 與 TCP listener 建立後，daemon 開啟 `console_port`，外接終端連接 `peer_port`。兩端埠自動排除於裝置列舉，格式錯誤時整個鍵忽略並寫一筆 WARNING。
 
 ### Windows Daemon（PORT-4）
 

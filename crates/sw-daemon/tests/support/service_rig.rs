@@ -23,7 +23,7 @@ use sw_pal::traits::{
     ConsoleTransportFactory, DeviceInfo, FsOps, FsRead, HolderReport, HolderScanStatus, PalError,
     PalErrorKind, PalResult, SerialBackend, UartExclusive,
 };
-use sw_proto::config_types::{ProfileFs, load_profiles};
+use sw_proto::config_types::{ProfileFs, RuntimeConfig, SerialConsoleMap, load_profiles};
 use sw_proto::pycompat::{PyErr, PyOsError};
 use sw_proto::pyjson::{self, PyDict, PyValue};
 use sw_proto::pypath::PathFlavor;
@@ -219,12 +219,20 @@ struct RigConsole;
 pub struct RigPtyFactory {
     pub fake: sw_pal::fakes::console::FakeConsoleFactory,
     created: Mutex<Vec<(String, sw_pal::fakes::console::FakeConsoleRef)>>,
+    native_tcp: bool,
+    native_com0com: bool,
+    serial_console: Option<SerialConsoleMap>,
+    opened_serial_consoles: Mutex<Vec<String>>,
 }
 
 impl RigPtyFactory {
     /// 依建立順序的 (slave_path, io 參照)。
     pub fn created(&self) -> Vec<(String, sw_pal::fakes::console::FakeConsoleRef)> {
         self.created.lock().unwrap().clone()
+    }
+
+    pub fn opened_serial_consoles(&self) -> Vec<String> {
+        self.opened_serial_consoles.lock().unwrap().clone()
     }
 }
 
@@ -240,7 +248,11 @@ impl ConsoleTransportFactory for RigPtyFactory {
         Ok(pair)
     }
     fn bind_tcp_console(&self) -> PalResult<Box<dyn sw_pal::console_pty::ConsoleListener>> {
-        self.fake.bind_tcp_console()
+        if self.native_tcp {
+            sw_pal::console_pty::NativeConsoleFactory::new(ConsoleKind::TcpTelnet).bind_tcp_console()
+        } else {
+            self.fake.bind_tcp_console()
+        }
     }
     fn held_slave_paths(&self) -> Option<std::collections::HashSet<String>> {
         self.fake.held_slave_paths()
@@ -249,7 +261,28 @@ impl ConsoleTransportFactory for RigPtyFactory {
         self.fake.slave_path_exists(path)
     }
     fn new_mux(&self) -> PalResult<Box<dyn sw_pal::console_mux::ConsoleMux>> {
-        self.fake.new_mux()
+        if self.native_tcp {
+            sw_pal::console_pty::NativeConsoleFactory::new(ConsoleKind::TcpTelnet).new_mux()
+        } else {
+            self.fake.new_mux()
+        }
+    }
+    fn open_com0com_console(&self, port: &str) -> PalResult<Box<dyn sw_pal::console_pty::ConsoleIo>> {
+        if self.native_com0com {
+            let io = sw_pal::console_pty::NativeConsoleFactory::new(ConsoleKind::TcpTelnet)
+                .open_com0com_console(port)?;
+            self.opened_serial_consoles.lock().unwrap().push(port.to_string());
+            Ok(io)
+        } else if self.native_tcp {
+            // 原生 TCP 測試只探測設定是否送到 factory；POSIX 沒有 com0com 埠，故模擬平台拒絕開啟。
+            self.opened_serial_consoles.lock().unwrap().push(port.to_string());
+            Err(PalError::plain(
+                PalErrorKind::Unsupported,
+                "測試使用原生 TCP factory；POSIX 不提供 com0com",
+            ))
+        } else {
+            self.fake.open_com0com_console(port)
+        }
     }
 }
 
@@ -381,6 +414,56 @@ impl ServiceRig {
         let factory = Arc::new(RigPtyFactory {
             fake: sw_pal::fakes::console::FakeConsoleFactory::new(kind),
             created: Mutex::new(Vec::new()),
+            native_tcp: false,
+            native_com0com: false,
+            serial_console: None,
+            opened_serial_consoles: Mutex::new(Vec::new()),
+        });
+        ServiceRig::build_with_console(
+            RigSpec {
+                yaml: format!("{TEMPLATES}targets:\n{}", target_line("COM0", BY_ID_A)),
+                devices: vec![(BY_ID_A.into(), REAL_A.into())],
+                explicit_target_count: 1,
+                allowlist: None,
+                wait_ready: vec!["COM0".into()],
+            },
+            Some(factory),
+        )
+    }
+
+    /// 原生 loopback TCP listener 與 ConsoleMux，UART 仍使用 FakeSerialBackend。
+    pub fn with_native_tcp_console() -> ServiceRig {
+        Self::with_native_tcp_console_config(None, false)
+    }
+
+    /// 原生 TCP listener 加 `windows.serial_console` map；測試可選擇 fake 或實際 com0com console 埠。
+    pub fn with_native_tcp_console_and_serial_console(
+        console_port: &str,
+        peer_port: &str,
+        native_com0com: bool,
+    ) -> ServiceRig {
+        let yaml = format!(
+            "windows:\n  serial_console:\n    {BY_ID_A}: {{console_port: {console_port}, peer_port: {peer_port}}}\n"
+        );
+        let map = RuntimeConfig::from_text(Some(&yaml))
+            .expect("測試 windows.serial_console YAML")
+            .windows_serial_console()
+            .expect("map 存在")
+            .expect("測試 windows.serial_console 結構正確");
+        Self::with_native_tcp_console_config(Some(map), native_com0com)
+    }
+
+    fn with_native_tcp_console_config(
+        serial_console: Option<SerialConsoleMap>,
+        native_com0com: bool,
+    ) -> ServiceRig {
+        let factory = Arc::new(RigPtyFactory {
+            fake: sw_pal::fakes::console::FakeConsoleFactory::new(ConsoleKind::TcpTelnet),
+            created: Mutex::new(Vec::new()),
+            native_tcp: true,
+            native_com0com,
+            serial_console,
+            opened_serial_consoles: Mutex::new(Vec::new()),
         });
         ServiceRig::build_with_console(
             RigSpec {
@@ -464,6 +547,10 @@ impl ServiceRig {
         let excl = Arc::new(RigExcl::default());
         let manager_serial: Arc<dyn SerialBackend> =
             serial_backend.unwrap_or_else(|| serial.clone());
+        let mut caps = sw_pal::fakes::posix_caps();
+        caps.com0com_console = console
+            .as_ref()
+            .is_some_and(|factory| factory.serial_console.is_some());
         let mgr = SessionManager::new(ManagerDeps {
             serial: manager_serial,
             uart_excl: excl.clone(),
@@ -471,7 +558,8 @@ impl ServiceRig {
                 Some(f) => f.clone() as Arc<dyn ConsoleTransportFactory>,
                 None => Arc::new(RigConsole),
             },
-            caps: sw_pal::fakes::posix_caps(),
+            windows_serial_console: console.as_ref().and_then(|factory| factory.serial_console.clone()),
+            caps,
             wal: wal.clone(),
             registry: registry.clone(),
             state: StateStore::spawn(PathBuf::from(STATE_PATH), fs.clone()),
@@ -690,6 +778,11 @@ impl ServiceRig {
 
     pub fn device(&self, real_path: &str) -> &FakeDevice {
         self.devices.get(real_path).expect("未登錄的裝置")
+    }
+
+    /// ConsoleHub 各 socket ring 的排隊 bytes 與累計丟棄 bytes。
+    pub fn console_hub_diagnostics(&self, selector: &str) -> Vec<(String, usize, u64)> {
+        self.mgr.console_hub_diagnostics(selector)
     }
 }
 
@@ -925,6 +1018,7 @@ impl ServiceRig {
             uart_excl: excl.clone(),
             console: Arc::new(RigConsole),
             caps: sw_pal::fakes::posix_caps(),
+            windows_serial_console: None,
             wal: wal.clone(),
             registry: registry.clone(),
             state: StateStore::spawn(PathBuf::from(STATE_PATH), fs.clone()),

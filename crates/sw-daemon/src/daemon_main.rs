@@ -1273,6 +1273,11 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
         serial: p.serial.clone(),
         uart_excl: p.uart_excl.clone(),
         console: p.console.clone(),
+        windows_serial_console: if p.caps.com0com_console {
+            cfg.windows_serial_console().and_then(Result::ok)
+        } else {
+            None
+        },
         caps: p.caps,
         wal: wal.clone(),
         registry: registry.clone(),
