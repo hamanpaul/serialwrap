@@ -585,7 +585,6 @@ fn cap_windows_com__console_com0com_no_modem_forward() {
     let (a, b) = console_pair();
     let p = sw_pal::native();
     let io = p.console.open_com0com_console(&a).unwrap();
-    let _peer = open_peer(&b);
     sw_pal::testutil::toggle_peer_modem_lines(&b);
     let calls = sw_pal::testutil::comm_api_calls(&*io);
     assert_eq!(calls.set_comm_state, 1, "僅開啟時一次");
@@ -828,12 +827,10 @@ fn console_reaper_skips_dev_link_without_identity() {
 }
 
 // ---------------------------------------------------------------------------
-// Windows 未實作 backend 不得 panic（sol 補審 P6 #4）
+// Windows console backend 不得保留 panic 型 stub（sol 補審 P6 #4）
 // ---------------------------------------------------------------------------
 
-/// `NativeConsoleFactory` 在 Windows 接線的 TCP listener／ConsoleMux／com0com 尚未實作（LOCAL-WINDOWS-TODO），
-/// 實作完成前必須回 `Unsupported` 類錯誤，不得落到 `todo!` 而 panic。主機（Linux）上以原始碼掃描守門，
-/// 使 Windows 專屬檔案的回歸在非 Windows CI 也會紅。
+/// 主機（Linux）上以原始碼掃描守門，使 Windows 專屬檔案的 panic stub 回歸在非 Windows CI 也會紅。
 #[test]
 fn windows_console_backends_have_no_panicking_stubs() {
     let sources = [
@@ -849,12 +846,22 @@ fn windows_console_backends_have_no_panicking_stubs() {
     }
 }
 
-/// Windows 原生：factory 的未實作 backend 回 `PalErrorKind::Unsupported`（不 panic）。
+/// Windows 原生：TCP、mux 與 com0com backend 可用，com0com 只開核准的 console pair。
 #[cfg(windows)]
 #[test]
 fn windows_unimplemented_console_backends_return_unsupported() {
     let p = sw_pal::native();
-    assert_eq!(p.console.bind_tcp_console().err().map(|e| e.kind), Some(PalErrorKind::Unsupported));
-    assert_eq!(p.console.new_mux().err().map(|e| e.kind), Some(PalErrorKind::Unsupported));
-    assert_eq!(p.console.open_com0com_console("COM250").err().map(|e| e.kind), Some(PalErrorKind::Unsupported));
+    let listener = p
+        .console
+        .bind_tcp_console()
+        .expect("TCP console backend 應可用");
+    assert!(listener.endpoint().starts_with("127.0.0.1:"));
+    let _mux = p.console.new_mux().expect("ConsoleMux 應可用");
+    let (console, peer) = console_pair();
+    assert_eq!((console.as_str(), peer.as_str()), ("COM22", "COM23"));
+    let io = p
+        .console
+        .open_com0com_console(&console)
+        .expect("核准的 com0com console 埠應可用");
+    assert!(io.has_external_peer(None));
 }

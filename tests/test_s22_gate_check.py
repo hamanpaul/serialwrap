@@ -25,6 +25,8 @@ CARGO_ARGV = ["--workspace", "--features", "test-fakes"]
 PTY_ARGV = ["--package", "sw-pal", "--features", "test-fakes", "--test", "console_conformance", "--", "--ignored", "cap_posix_pty__"]
 BB_ARGV = ["-q", "tests/contract_blackbox/slice22"]
 WIN_ARGV = ["--features", "test-fakes"]
+WIN_COM0COM_ARGV = ["--package", "sw-pal", "--features", "test-fakes", "--test", "console_conformance",
+                    "--", "--ignored", "cap_windows_com__"]
 PY_ARGV = ["-q", "tests/test_s22_py_parity.py"]
 
 RAW_OWNER = "tests/contract_blackbox/slice22/test_console_pty.py::test_first_console_raw_second_line_buffered"
@@ -32,6 +34,11 @@ PARTIAL = "cargo:sw-core::human_tx_lane::human_raw_partial_not_resent"
 PTY_CAP = "cargo:sw-pal::console_conformance::cap_posix_pty__mux_mixed_pty_and_tcp"
 WIN_CORE = "cargo:sw-core::console_hub::close_all_on_release"
 WIN_CAP = "cargo:sw-pal::console_conformance::cap_windows_com__console_com0com_open"
+WIN_COM0COM_CAPS = [
+    "cargo:sw-pal::console_conformance::cap_windows_com__console_com0com_roundtrip",
+    "cargo:sw-pal::console_conformance::cap_windows_com__console_com0com_exclusive",
+    "cargo:sw-pal::console_conformance::cap_windows_com__console_com0com_no_modem_forward",
+]
 PY_PARITY = "tests/test_s22_py_parity.py::test_parity_row"
 FUNC_REF = "func-test/runner.py -c co-01-line-buffering"
 # 合成 parity-amendments：§1 一列（P6）、§1 一列（P5，不計）、§3 P6 小節一列。
@@ -88,6 +95,7 @@ def _lock(win_extra: tuple[str, ...] = ()) -> dict:
         "s22_gate:console_conformance_pty": {"linux": spec(PTY_ARGV, [PTY_CAP])},
         "s22_gate:blackbox_rust": {"linux": spec(BB_ARGV, [RAW_OWNER])},
         "s22_gate:win_test": {"windows": spec(WIN_ARGV, [WIN_CORE, *win_extra])},
+        "s22_gate:windows_cap_windows_com": {"windows": spec(WIN_COM0COM_ARGV, WIN_COM0COM_CAPS)},
         "s22_gate:py_parity": {"linux": spec(PY_ARGV, [PY_PARITY])},
     }}
 
@@ -112,6 +120,9 @@ def _good_reports() -> dict[tuple[str, str], dict]:
         ("console_conformance_pty", "linux"): _report("linux", "cargo", PTY_ARGV, [_row(PTY_CAP)]),
         ("blackbox_rust", "linux"): _report("linux", "pytest", BB_ARGV, [_row(RAW_OWNER)]),
         ("win_test", "windows"): _report("windows", "cargo", WIN_ARGV, [_row(WIN_CORE), _row(WIN_CAP, "skipped")]),
+        ("windows_cap_windows_com", "windows"): _report(
+            "windows", "cargo", WIN_COM0COM_ARGV, [_row(nodeid) for nodeid in WIN_COM0COM_CAPS]
+        ),
         ("py_parity", "linux"): _report("linux", "pytest", PY_ARGV, [_row(PY_PARITY)]),
     }
 
@@ -225,6 +236,15 @@ def test_cap_windows_com_absent_is_blocked_not_pass(tmp_path: Path) -> None:
     rc, out = _run(tmp_path / "b", _good_reports(), lock=_lock(win_extra=(WIN_CAP,)))
     assert _section(out, "s22_gate:win_test", "windows")["verdict"] == "INSUFFICIENT", "不得以 ignored 充數"
     assert rc == 1
+
+
+def test_windows_com_console_cap_requires_native_evidence(tmp_path: Path) -> None:
+    reports = _good_reports()
+    del reports[("windows_cap_windows_com", "windows")]
+    rc, out = _run(tmp_path, reports)
+    section = _section(out, "s22_gate:windows_cap_windows_com", "windows")
+    assert section["verdict"] == "EVIDENCE_MISSING", section
+    assert out["result"] == "INSUFFICIENT" and rc == 1
 
 
 def test_all_present_pass(tmp_path: Path) -> None:
@@ -531,12 +551,15 @@ def test_plan_lists_derived_cargo_collect_commands(tmp_path: Path) -> None:
     rc, entries = plan(_lock(), "ok")
     by_set = {(e["set_id"], e["platform"]): e for e in entries}
     assert set(by_set) == {("s22_gate:cargo_workspace", "linux"), ("s22_gate:console_conformance_pty", "linux"),
-                           ("s22_gate:win_test", "windows")}, entries
+                           ("s22_gate:win_test", "windows"),
+                           ("s22_gate:windows_cap_windows_com", "windows")}, entries
     cap_entry = by_set[("s22_gate:console_conformance_pty", "linux")]
     assert cap_entry["caps"] == ["posix_pty"] and "--caps" in cap_entry["collect_argv"]
     out_arg = cap_entry["collect_argv"][cap_entry["collect_argv"].index("--out") + 1]
     assert out_arg == str(tmp_path / "ok" / "console_conformance_pty" / "linux" / "resource-report.json")
     assert by_set[("s22_gate:win_test", "windows")]["collect_argv"] is None
+    assert by_set[("s22_gate:windows_cap_windows_com", "windows")]["caps"] == ["windows_com"]
+    assert by_set[("s22_gate:windows_cap_windows_com", "windows")]["collect_argv"] is None
     assert rc == 0
     bad = _lock()
     bad["sets"]["s22_gate:console_conformance_pty"]["linux"]["selector"]["argv"] = [*PTY_ARGV[:-2], "--include-ignored"]
