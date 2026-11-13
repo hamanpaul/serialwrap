@@ -2409,6 +2409,187 @@ fn session_attach_with_release_request_session_recovering() {
 }
 
 #[test]
+fn gpx_session_attach_during_plain_attach_inflight_matches_python() {
+    let mut mismatches = Vec::new();
+
+    // 一般開埠仍在途：第二次 session.attach 回 ok＋session，並清除錯誤與重探歷史。
+    let (mut h, _) = g15_detached_with_reprobe_history();
+    let first = h.rpc_deferred(SessionRequest::SessionAttach);
+    let first_opens = first
+        .1
+        .iter()
+        .filter(|effect| matches!(effect, Effect::OpenBridge { .. }))
+        .count();
+    assert_eq!(first_opens, 1, "前置：第一次 session.attach 已發出 OpenBridge");
+    assert_eq!(h.public()["state"], PyValue::from("DETACHED"));
+    h.core.set_credentials_warned_for_test(true);
+    assert!(h.core.credentials_warned_for_test(), "前置：測試旗標已設為 true");
+    let (response, effects) = h.rpc_full(SessionRequest::SessionAttach);
+    let response = response.unwrap();
+    let expected = g13_ok_session(&h);
+    if g13_wire(&response) != expected {
+        mismatches.push(format!("一般在途：wire={} expected={expected}", g13_wire(&response)));
+    }
+    let public = h.public();
+    for (field, expected_value) in [
+        ("state", PyValue::from("ATTACHING")),
+        ("last_error", PyValue::Null),
+        ("reprobe_attempts", PyValue::from(0)),
+        ("reprobe_exhausted", PyValue::Bool(false)),
+        ("next_reprobe_at", PyValue::Null),
+    ] {
+        if public.get(field) != Some(&expected_value) {
+            mismatches.push(format!("一般在途：{field}={:?} expected={expected_value:?}", public.get(field)));
+        }
+    }
+    let duplicate_open_effects = effects
+        .iter()
+        .filter(|effect| matches!(effect, Effect::OpenBridge { .. }))
+        .count();
+    if duplicate_open_effects != 0 {
+        mismatches.push(format!("一般在途：第二次 session.attach 產生 {duplicate_open_effects} 個 OpenBridge"));
+    }
+    if h.core.credentials_warned_for_test() {
+        mismatches.push("一般在途：session.attach 沒有重置 credentials_warned".into());
+    }
+
+    // 開埠尚未返回時裝置已拔除：回 DEVICE_NOT_FOUND，session 收斂為 DETACHED。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let first_effects = h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    assert!(first_effects.iter().any(|effect| matches!(effect, Effect::OpenBridge { .. })));
+    h.feed(ControlEvent::DeviceMissing);
+    h.feed(ControlEvent::DeviceDetached {
+        by_id: DEVICE_BY_ID.into(),
+        reason: DetachReason::Removed,
+    });
+    let (response, effects) = h.rpc_full(SessionRequest::SessionAttach);
+    let response = response.unwrap();
+    let mut expected_reply = PyDict::new();
+    expected_reply.insert("ok", PyValue::Bool(false));
+    expected_reply.insert("error_code", PyValue::from("DEVICE_NOT_FOUND"));
+    expected_reply.insert("session", PyValue::Dict(h.public()));
+    let expected = g13_wire(&expected_reply);
+    if g13_wire(&response) != expected {
+        mismatches.push(format!("裝置離線：wire={} expected={expected}", g13_wire(&response)));
+    }
+    let public = h.public();
+    for (field, expected_value) in [
+        ("state", PyValue::from("DETACHED")),
+        ("last_error", PyValue::from("DEVICE_NOT_FOUND")),
+    ] {
+        if public.get(field) != Some(&expected_value) {
+            mismatches.push(format!("裝置離線：{field}={:?} expected={expected_value:?}", public.get(field)));
+        }
+    }
+    if g13_attach_side_effects(&effects) != 0 {
+        mismatches.push("裝置離線：第二次 session.attach 產生 attach 副作用".into());
+    }
+
+    // 在途作業已有 release：仍回完整 SESSION_RECOVERING。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let first_effects = h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    assert!(first_effects.iter().any(|effect| matches!(effect, Effect::OpenBridge { .. })));
+    let (_release_rx, _) = h.rpc_deferred(release());
+    let (response, effects) = h.rpc_full(SessionRequest::SessionAttach);
+    let response = response.unwrap();
+    let expected = g13_recovering(&h);
+    if g13_wire(&response) != expected {
+        mismatches.push(format!("release 在途：wire={} expected={expected}", g13_wire(&response)));
+    }
+    if g13_attach_side_effects(&effects) != 0 {
+        mismatches.push("release 在途：session.attach 產生 attach 副作用".into());
+    }
+
+    // RELEASED session 正在由 device.attach 開埠：session.attach 回 released:true。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let (_release_rx, _) = h.rpc_deferred(release());
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).handle_closed(true).feed();
+    let (first_rx, first_effects) = h.rpc_deferred(SessionRequest::DeviceAttach { force: false });
+    assert!(first_effects.iter().any(|effect| matches!(effect, Effect::OpenBridge { .. })));
+    assert!(first_rx.try_recv().is_err(), "前置：device.attach 仍在開埠");
+    let (response, effects) = h.rpc_full(SessionRequest::SessionAttach);
+    let response = response.unwrap();
+    let mut expected_reply = PyDict::new();
+    expected_reply.insert("ok", PyValue::Bool(true));
+    expected_reply.insert("released", PyValue::Bool(true));
+    expected_reply.insert("recommended_action", PyValue::from("device_attach"));
+    expected_reply.insert("session", PyValue::Dict(h.public()));
+    let expected = g13_wire(&expected_reply);
+    if g13_wire(&response) != expected {
+        mismatches.push(format!("RELEASED 開埠在途：wire={} expected={expected}", g13_wire(&response)));
+    }
+    if g13_attach_side_effects(&effects) != 0 {
+        mismatches.push("RELEASED 開埠在途：session.attach 產生 attach 副作用".into());
+    }
+
+    assert!(mismatches.is_empty(), "Python attach_session 分流不一致：\n{}", mismatches.join("\n"));
+}
+
+#[test]
+fn gpx_release_without_bridge_clears_drain_stalled() {
+    let mut direct = CoreHarness::new(SHELL_PROFILE);
+    direct
+        .rpc(SessionRequest::MarkAttachStalled { epoch: Some(9) })
+        .unwrap();
+    let direct_release = direct.rpc(release()).unwrap();
+    let direct_stalled = matches!(
+        direct_release.get("session"),
+        Some(PyValue::Dict(session)) if session.get("drain_stalled") == Some(&PyValue::Bool(false))
+    );
+    let direct_state = direct.public().get("state") == Some(&PyValue::from("RELEASED"));
+
+    let mut waited = CoreHarness::new(SHELL_PROFILE);
+    let (epoch, stop) = wp510r_released_attach_commit_failure(&mut waited);
+    let (bind_rx, _) = waited.rpc_deferred(bind_to(WP510R_BIND_TARGET));
+    waited.advance(Duration::from_millis(3001));
+    let timeout = bind_rx.try_recv().expect("BindWait 期限到應回覆").unwrap();
+    let timeout_stalled = timeout.get("drain_stalled") == Some(&PyValue::Bool(true));
+    waited.receipt(epoch, stop).handle_closed(true).feed();
+    let late_state = waited.public()["state"].clone();
+    let waited_release = waited.rpc(release()).unwrap();
+    let waited_stalled = matches!(
+        waited_release.get("session"),
+        Some(PyValue::Dict(session)) if session.get("drain_stalled") == Some(&PyValue::Bool(false))
+    );
+    let waited_state = waited.public().get("state") == Some(&PyValue::from("RELEASED"));
+
+    assert!(direct_stalled, "MarkAttachStalled 後無 bridge release 必須清 stalled：{direct_release:?}");
+    assert!(direct_state, "無 bridge release 必須完成 RELEASED：{:?}", direct.public());
+    assert!(timeout_stalled, "BindWait 先應回報 stalled：{timeout:?}");
+    assert_eq!(late_state, PyValue::from("RECOVERING"), "遲到成功回條後仍是 RECOVERING");
+    assert!(waited_stalled, "BindWait 遲到成功回條後 release 必須清 stalled：{waited_release:?}");
+    assert!(waited_state, "BindWait 後的無 bridge release 必須完成 RELEASED：{:?}", waited.public());
+}
+
+#[test]
+fn gpx_mark_attach_stalled_released_sets_recovering() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.core.init_released(Some("cli".into()), Some("old".into()), PyValue::Null);
+    let response = h
+        .rpc(SessionRequest::MarkAttachStalled { epoch: Some(77) })
+        .unwrap();
+    let public = h.public();
+    let mut expected_reply = PyDict::new();
+    expected_reply.insert("ok", PyValue::Bool(false));
+    expected_reply.insert("error_code", PyValue::from("SESSION_RECOVERING"));
+    expected_reply.insert("drain_stalled", PyValue::Bool(true));
+    expected_reply.insert("drain_timeout_epoch", PyValue::from(77));
+    expected_reply.insert("session", PyValue::Dict(public.clone()));
+    assert_eq!(g13_wire(&response), g13_wire(&expected_reply));
+    assert_eq!(public["state"], PyValue::from("RECOVERING"));
+    assert_eq!(public["drain_stalled"], PyValue::Bool(true));
+    assert_eq!(public["drain_timeout_epoch"], PyValue::from(77));
+}
+
+#[test]
 fn release_during_pending_open_reply_is_stalled_until_close_receipt() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
     h.feed(ControlEvent::DeviceAttached {

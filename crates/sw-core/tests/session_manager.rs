@@ -5915,6 +5915,56 @@ fn wp510r_r18_bind_after_timeout_waits_for_same_plain_opening_terminal() {
     assert_eq!(tx_after, tx_before, "等待期間不得有登入 TX");
 }
 
+/// S2-GP-gpx item 2：RELEASED session 的 device.attach 落盤失敗後留下退休 bridge；ManagerRig 的 bind 等待至期限，
+/// 回覆前把活 session 設為 RECOVERING（Python `bind_session`，`origin/main:sw_core/session_manager.py:3697-3711`）。
+#[test]
+fn gpx_bind_timeout_from_released_session_sets_recovering() {
+    const TARGET: &str = "/s/by-id/gpx-bind-target";
+    let m = ManagerRig::single_target(SHELL_PROFILE).ready();
+    let sid = m.mgr.resolve("COM0").expect("正式 session");
+    let released = rpc(wp510_release(&m.mgr, &sid));
+    assert!(is_ok(&released), "第一次 release 應完成：{released:?}");
+    assert_eq!(m.state_of(&sid).as_deref(), Some("RELEASED"));
+
+    m.dev.pause_next_close();
+    m.fs.fail_next_atomic_write(PalError::io(
+        28,
+        "[Errno 28] No space left on device",
+    ));
+    let attach = m.mgr.route(
+        &sid,
+        SessionRequest::DeviceAttach { force: true },
+        RPC,
+    ).expect_err("unreleased commit 失敗應由 device.attach 回 Err");
+    assert!(attach.message.contains("No space left on device"), "{}", attach.message);
+    assert!(
+        m.dev.wait_paused(Duration::from_secs(5)),
+        "release-failed attach 的退休 bridge close 應停在閘門"
+    );
+    assert!(!m.mgr.retired_drains_for_test(&sid).is_empty(), "退休 bridge 仍待回條");
+    assert_eq!(m.state_of(&sid).as_deref(), Some("RELEASED"), "落盤失敗的 attach 保留 RELEASED");
+
+    let bind_manager = m.mgr.clone();
+    let bind_sid = sid.clone();
+    let (bind_tx, bind_rx) = crossbeam_channel::bounded(1);
+    let bind_thread = std::thread::spawn(move || {
+        let _ = bind_tx.send(bind_manager.bind(&bind_sid, TARGET));
+    });
+    let bind_result = bind_rx.recv_timeout(Duration::from_secs(5));
+    m.dev.release_pause();
+    let bind = rpc(bind_result.expect("BindWait timeout 應在 5 秒內回覆"));
+    bind_thread.join().expect("bind thread");
+    let public = session_field(&bind);
+    let live = m.session(&sid);
+
+    assert_eq!(code_of(&bind).as_deref(), Some("SESSION_RECOVERING"), "{bind:?}");
+    assert_eq!(s_of(&public, "state").as_deref(), Some("RECOVERING"), "{bind:?}");
+    assert_eq!(s_of(&live, "state").as_deref(), Some("RECOVERING"), "活 session 亦須更新：{live:?}");
+    assert_eq!(bind.get("drain_stalled"), Some(&PyValue::Bool(true)), "{bind:?}");
+    assert_eq!(public.get("drain_stalled"), Some(&PyValue::Bool(true)), "{bind:?}");
+    assert_eq!(live.get("device_by_id"), Some(&PyValue::from("/s/by-id/usb-A")), "逾時不得改綁：{live:?}");
+}
+
 /// S2-PAR-wp510r 第 17 項紅燈：正式 W6 改名後，該 actor 在接手 offer 前退出，必須依穩定身分回收 Held handle。
 #[test]
 fn wp510r_r17_w6_actor_exit_before_offer_adoption_reclaims_renamed_handle() {

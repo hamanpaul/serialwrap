@@ -5762,6 +5762,111 @@ fn gpx_rpc_open_failure_rig() -> (ServiceRig, Arc<GpxDeviceAttachOpenFailureBack
     (rig, backend, dev)
 }
 
+struct GpxAttachInflightBlockingBackend {
+    delegate: Arc<FakeSerialBackend>,
+    calls: AtomicUsize,
+    entered: crossbeam_channel::Sender<()>,
+    gate: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl GpxAttachInflightBlockingBackend {
+    fn release(&self) {
+        let (released, cv) = &*self.gate;
+        *released.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        cv.notify_all();
+    }
+}
+
+impl SerialBackend for GpxAttachInflightBlockingBackend {
+    fn open_exclusive(
+        &self,
+        dev: &DevicePath,
+        cfg: &SerialConfig,
+    ) -> Result<Box<dyn SerialHandle>, OpenError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if dev.0 == REAL_A && call == 1 {
+            let _ = self.entered.send(());
+            let (released, cv) = &*self.gate;
+            let mut open = released.lock().unwrap_or_else(|e| e.into_inner());
+            while !*open {
+                open = cv.wait(open).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        self.delegate.open_exclusive(dev, cfg)
+    }
+}
+
+/// S2-GP-gpx item 2：正式 `session.attach` RPC → Service::rpc → manager actor `attach_request`；
+/// 開埠尚未完成時回 ok＋session，且不重複呼叫序列埠後端。
+#[test]
+fn gpx_rpc_session_attach_during_attach_inflight_returns_ok_session() {
+    let delegate = FakeSerialBackend::new();
+    let dev = delegate.add_device(REAL_A);
+    wp510_install_shell_replies(&dev);
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let backend = Arc::new(GpxAttachInflightBlockingBackend {
+        delegate,
+        calls: AtomicUsize::new(0),
+        entered: entered_tx,
+        gate: Arc::new((Mutex::new(false), Condvar::new())),
+    });
+    let r = ServiceRig::build_with_serial_backend(
+        RigSpec {
+            yaml: format!(
+                "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\ntargets:\n  - {{com: COM0, profile: t, device_by_id: {BY_ID_A}}}\n"
+            ),
+            devices: vec![(BY_ID_A.into(), REAL_A.into())],
+            explicit_target_count: 1,
+            allowlist: None,
+            wait_ready: Vec::new(),
+        },
+        Some(backend.clone()),
+    );
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("bootstrap attach 已進入 FakeSerialBackend 開埠閘門");
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1, "前置：只有首次 OpenBridge");
+
+    let (response, completed_while_opening, calls_while_opening) = std::thread::scope(|scope| {
+        let (response_tx, response_rx) = crossbeam_channel::bounded(1);
+        let call_rig = &r;
+        let call = scope.spawn(move || {
+            let response = call_rig.call("session.attach", r#"{"selector":"COM0"}"#);
+            let _ = response_tx.send(response);
+        });
+        let early = response_rx.recv_timeout(Duration::from_secs(2));
+        let calls_while_opening = backend.calls.load(Ordering::SeqCst);
+
+        // 即使回歸失敗而 RPC 卡住，也先放行 fake 開埠，避免留下阻塞執行緒。
+        backend.release();
+        let completed_while_opening = early.is_ok();
+        let response = early.unwrap_or_else(|_| {
+            response_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("釋放 FakeSerialBackend 後 session.attach 應返回")
+        });
+        call.join().expect("session.attach RPC thread");
+        (response, completed_while_opening, calls_while_opening)
+    });
+    let session = match response.get("session") {
+        Some(PyValue::Dict(session)) => session.clone(),
+        other => panic!("session.attach 應回傳 session dict：{other:?}"),
+    };
+    let expected = sw_proto::pydict! {
+        "ok" => true,
+        "session" => session.clone(),
+        "version" => r.version.clone(),
+    };
+    r.wait_state("COM0", "READY");
+
+    assert_eq!(j(&response), j(&expected), "session.attach RPC wire bytes");
+    assert!(completed_while_opening, "session.attach 應在首次 OpenBridge 尚未完成時回覆");
+    assert_eq!(s(&session, "state"), "ATTACHING", "開埠仍在途時保持 ATTACHING");
+    assert_eq!(calls_while_opening, 1, "在途回應不應再發 OpenBridge");
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1, "整段只開埠一次");
+    assert_eq!(dev.open_count(), 1, "FakeDevice 只建立一個 UART handle");
+}
+
 /// gpc ITEM 4：Held／AccessDenied／NotFound 與 force 經 `Service::rpc(device.attach)` →
 /// `SessionManager::route` → actor `OpenBridge` → `attach_open_failed`；逐位元組核對 Python wire。
 #[test]

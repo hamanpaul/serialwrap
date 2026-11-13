@@ -1184,8 +1184,10 @@ impl SessionCore {
         if let Some(PendingCommit::Attach { reply, .. } | PendingCommit::AttachFailed { reply, .. }) = &self.pending_commit {
             attach_replies.push(reply.clone());
         }
-        let incoming_attach = if let MailboxItem::Control(ControlEvent::Request {
-            req: SessionRequest::DeviceAttach { .. } | SessionRequest::DeviceAttachRouted { .. } | SessionRequest::SessionAttach,
+        // device.attach 的成功回覆須等待 custody 接手確認；Python session.attach 是觀察既有作業，
+        // 遇到在途 attach 應立即回覆，不能被同一個開埠作業的 custody barrier 延後。
+        let incoming_device_attach = if let MailboxItem::Control(ControlEvent::Request {
+            req: SessionRequest::DeviceAttach { .. } | SessionRequest::DeviceAttachRouted { .. },
             reply,
         }) = &ev {
             Some(reply.clone())
@@ -1201,7 +1203,7 @@ impl SessionCore {
                 // 兩者是具名的移交結果，並非宣告 UART 已關閉，不能等待後繼工作的整段生命週期。
                 Effect::Reply(reply, result) if !self.retired && (
                     attach_replies.iter().any(|pending| pending.same_channel(&reply))
-                    || incoming_attach.as_ref().is_some_and(|incoming| incoming.same_channel(&reply))
+                    || incoming_device_attach.as_ref().is_some_and(|incoming| incoming.same_channel(&reply))
                         && result.as_ref().is_ok_and(|value| value.get("ok") == Some(&PyValue::Bool(true)) && value.get("recommended_action").is_none())
                 ) => {
                     guarded.extend(self.attach_reply(reply, result, now));
@@ -1867,6 +1869,17 @@ impl SessionCore {
         self.set_last_error(error.map(str::to_string), detail.map(str::to_string));
     }
 
+    /// 只供測試（test-fakes）：設定／讀取私有帳密告警去重旗標，驗證手動 attach 會重置它。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_credentials_warned_for_test(&mut self, value: bool) {
+        self.credentials_warned = value;
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn credentials_warned_for_test(&self) -> bool {
+        self.credentials_warned
+    }
+
     /// 只供測試（test-fakes）：reader 端 agent log 寫入者（注入 RX 寫入、取樣交錯）。
     #[cfg(feature = "test-fakes")]
     pub fn capture_observer_for_test(&self) -> Arc<crate::capture::CaptureObserver> {
@@ -2269,6 +2282,7 @@ impl SessionCore {
             self.quiet.boot_evidence_wait_until = 0;
         }
         if kind == StopKind::Release {
+            self.drain_stalled = false;
             self.finish_release(now);
             effects.extend(
                 self.persist_release(waiters.into_iter().map(|reply| (reply, false)).collect()),
@@ -3224,9 +3238,7 @@ impl SessionCore {
                 self.file_transfer_request(req, Some(admission), reply, now)
             }
             SessionRequest::MarkAttachStalled { epoch } => {
-                if self.state != SessionState::Released {
-                    self.set_state(SessionState::Recovering, now);
-                }
+                self.set_state(SessionState::Recovering, now);
                 self.drain_stalled = true;
                 self.drain_timeout_epoch =
                     Some(epoch.unwrap_or(self.generations.bridge_generation));
@@ -3463,13 +3475,11 @@ impl SessionCore {
                 Ok(self.error_session("DEVICE_NOT_BOUND", now)),
             )];
         }
-        if session_attach
-            && self.state == SessionState::Released
-            && !self
-                .pending_open_stop
-                .as_ref()
-                .is_some_and(|pending| pending.already_released)
-        {
+        let release_inflight = self
+            .pending_open_stop
+            .as_ref()
+            .is_some_and(|pending| pending.kind == StopKind::Release);
+        if session_attach && self.state == SessionState::Released && !release_inflight {
             return vec![Effect::Reply(
                 reply,
                 Ok(pydict! {
@@ -3540,13 +3550,30 @@ impl SessionCore {
             if !session_attach && !self.device_present {
                 return vec![Effect::Reply(reply, Ok(self.device_not_present_reply(&echo)))];
             }
+            if session_attach {
+                // Python `attach_session` 的在途表分流（`origin/main:sw_core/session_manager.py:3888-3912`、
+                // `:3933-3944`）：release 在途已由上方 drain gate 回 SESSION_RECOVERING；RELEASED 由前置分支回
+                // `released:true`。一般在途時裝置離線就收斂為 DETACHED＋DEVICE_NOT_FOUND；在線則只重設 session 狀態，
+                // `_spawn_attach` 會以現有作業去重，不得再發 OpenBridge。
+                if !self.device_present {
+                    self.set_last_error(Some("DEVICE_NOT_FOUND".into()), None);
+                    self.detached_at = Some(self.wall_iso());
+                    self.set_state(SessionState::Detached, now);
+                    return vec![Effect::Reply(
+                        reply,
+                        Ok(self.error_session("DEVICE_NOT_FOUND", now)),
+                    )];
+                }
+                self.set_state(SessionState::Attaching, now);
+                self.set_last_error(None, None);
+                crate::reprobe::reset(&mut self.reprobe);
+                return vec![Effect::Reply(reply, Ok(self.ok_session(now)))];
+            }
             // S1X-a-3（G13）：`device.attach` 遇單純 attach 進行中回 `{"ok":true,"session"}`
             // （`origin/main:sw_core/session_manager.py:3428-3443`、`:3457-3467`）。`_attach_inflight_draining_locked`
             // （`:3384-3398`）的 drain 與在途 release 已由上方分支擋下；剩下 RELEASED（含自 RELEASED 開埠後 unreleased
             // 尚未落盤，Rust state 仍為 RELEASED）與 RELEASED 持久化未完成，仍屬 release 進行中。
-            // `session.attach` 不在此分流，維持原行為。
-            if !session_attach
-                && self.state != SessionState::Released
+            if self.state != SessionState::Released
                 && !self.release_persist_pending
             {
                 return vec![Effect::Reply(reply, Ok(self.ok_session(now)))];
@@ -6717,6 +6744,7 @@ impl SessionCore {
         // 非 RELEASED 的首次 release；已 RELEASED 的冪等 release 不經此處，不刷新 provenance。
         self.detached_at = Some(self.wall_iso());
         crate::reprobe::reset(&mut self.reprobe);
+        self.drain_stalled = false;
         self.set_state(SessionState::Released, now);
     }
 
