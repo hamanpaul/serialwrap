@@ -952,6 +952,57 @@ fn gpc_held_open_failure_matches_python_wire() {
     }
 }
 
+/// gpc ITEM 2：一般 RELEASED session 的實際開埠回 NotFound 時，RPC payload 依 Python `attach_device`
+///（`origin/main:sw_core/session_manager.py:3520-3527`）精確省略 `session`；force 不改變結果。
+#[test]
+fn gpc_not_found_open_failure_matches_python_wire() {
+    for force in [false, true] {
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.to_ready();
+        let (_release_rx, _) = h.rpc_deferred(release());
+        let (epoch, stop) = h.pending_stop();
+        h.receipt(epoch, stop).feed();
+
+        let released = h.public();
+        let released_by = released["released_by"].clone();
+        let released_at = released["released_at"].clone();
+        let released_reason = released["released_reason"].clone();
+        let persisted = h.state_store.last_released();
+        let commits = h.state_store.commits();
+        let tx_before = h.fake_device.tx_len();
+
+        let (attach_rx, open_effects) =
+            h.rpc_deferred(SessionRequest::DeviceAttach { force });
+        assert!(
+            open_effects.iter().any(|effect| matches!(effect, Effect::OpenBridge { .. })),
+            "force={force} 必須經實際開埠分支"
+        );
+        let failure_effects = h.feed(ControlEvent::BridgeOpened {
+            epoch_hint: 0,
+            result: Err(OpenFailure::NotFound),
+        });
+        let response = attach_rx.try_recv().expect("NotFound 後應回覆").expect("RPC 字典");
+        let expected = format!(
+            r#"{{"ok":false,"error_code":"DEVICE_NOT_PRESENT","selector":"COM0","device_by_id":"{DEVICE_BY_ID}"}}"#
+        );
+        assert_eq!(dumps(&PyValue::Dict(response), &RPC_WIRE), expected, "force={force}");
+        assert_eq!(h.public()["state"], PyValue::from("RELEASED"), "force={force}");
+        assert_eq!(h.public()["released_by"], released_by, "force={force}");
+        assert_eq!(h.public()["released_at"], released_at, "force={force}");
+        assert_eq!(h.public()["released_reason"], released_reason, "force={force}");
+        assert_eq!(h.state_store.last_released(), persisted, "force={force}: 持久化內容不變");
+        assert_eq!(h.state_store.commits(), commits, "force={force}: 不新增提交");
+        assert_eq!(h.fake_device.tx_len(), tx_before, "force={force}: 不新增 UART TX");
+        assert!(
+            !failure_effects.iter().any(|effect| matches!(
+                effect,
+                Effect::StartLogin { .. } | Effect::StartOp { .. } | Effect::Persist { .. }
+            )),
+            "force={force}: NotFound 不登入、不送命令、不落盤"
+        );
+    }
+}
+
 #[test]
 fn attach_force_does_not_bypass_identified_external_holder() {
     let mut h = CoreHarness::new(SHELL_PROFILE);

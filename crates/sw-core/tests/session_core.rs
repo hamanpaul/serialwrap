@@ -2459,9 +2459,8 @@ fn wp510_review4_attach_from_released_commit_ok_stamps_last_state_change_at() {
     );
 }
 
-/// 自 RELEASED 的 `device.attach` 開埠 OSError 轉 DETACHED 後 unreleased 落盤失敗：Rust 依既有設計還原 previous
-/// state（Python 例外後停在 DETACHED，`:3557-3561`；狀態值分歧列回報既有碼待辦）。還原本身仍是狀態改變，
-/// 須比照 setter（`:617-620`）寫入還原當下的時間，不可留下 DETACHED 的時間戳。
+/// N1 核准依 Python `attach_device`（`origin/main:sw_core/session_manager.py:3528-3560`）對齊：unreleased
+/// 落盤失敗仍保留 DETACHED；時間戳為首次轉 DETACHED 時刻，不再回復 RELEASED。
 #[test]
 fn wp510_review4_attach_failed_commit_err_restore_stamps_last_state_change_at() {
     let mut h = review4_released_harness();
@@ -2477,7 +2476,8 @@ fn wp510_review4_attach_failed_commit_err_restore_stamps_last_state_change_at() 
     });
     let detached = h.public();
     assert_eq!(pget(&detached, "state"), PyValue::from("DETACHED"));
-    assert_eq!(pget(&detached, "last_state_change_at"), review4_wall(&h));
+    let detached_at = pget(&detached, "last_state_change_at");
+    assert_eq!(detached_at, review4_wall(&h));
 
     h.jump_wall_us(5_000_000);
     let commit = *h
@@ -2491,13 +2491,77 @@ fn wp510_review4_attach_failed_commit_err_restore_stamps_last_state_change_at() 
         .try_recv()
         .expect("落盤失敗後應回覆")
         .expect_err("落盤失敗須回 Err");
-    let restored = h.public();
+    let after_failure = h.public();
 
     assert!(error.message.contains("No space left on device"), "{}", error.message);
-    assert_eq!(pget(&restored, "state"), PyValue::from("RELEASED"));
+    assert_eq!(pget(&after_failure, "state"), PyValue::from("DETACHED"));
+    assert_eq!(pget(&after_failure, "released_by"), PyValue::Null);
+    assert_eq!(pget(&after_failure, "released_at"), PyValue::Null);
+    assert_eq!(pget(&after_failure, "released_reason"), PyValue::Null);
     assert_eq!(
-        pget(&restored, "last_state_change_at"),
-        review4_wall(&h),
-        "DETACHED→RELEASED 的還原必須寫入還原當下時間"
+        pget(&after_failure, "last_state_change_at"),
+        detached_at,
+        "落盤失敗不再轉回 RELEASED，時間戳維持 DETACHED 轉換時刻"
+    );
+}
+
+/// gpd 第 6 點之 1：一般 RELEASED session 開埠遇 OSError、unreleased 落盤又失敗，依 Python
+/// `session_manager.py:3528-3560` 留在 DETACHED、清 provenance，並以 OSError 類名保留 last_error。
+#[test]
+fn gpx_released_attach_oserror_persist_failure_keeps_detached() {
+    let mut h = review4_released_harness();
+    h.defer_state_commits();
+    let tx_before = h.fake_device.tx_len();
+    h.jump_wall_us(5_000_000);
+
+    let (rx, open_effects) = h.rpc_deferred(SessionRequest::DeviceAttach { force: true });
+    assert!(open_effects.iter().any(|effect| matches!(effect, Effect::OpenBridge { .. })));
+    let _ = h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Err(OpenFailure::Other(sw_pal::traits::PalError::io(
+            5,
+            "[Errno 5] Input/output error",
+        ))),
+    });
+    assert!(
+        !h.pending_state_commit_ids().is_empty(),
+        "開埠 OSError 應排入 unreleased commit"
+    );
+    let detached = h.public();
+    assert_eq!(pget(&detached, "state"), PyValue::from("DETACHED"));
+    assert_eq!(
+        pget(&detached, "last_error"),
+        PyValue::from("ATTACH_FAILED:OSError")
+    );
+    let detached_at = pget(&detached, "last_state_change_at");
+
+    h.jump_wall_us(5_000_000);
+    let commit = *h
+        .pending_state_commit_ids()
+        .first()
+        .expect("開埠 OSError 應排入 unreleased commit");
+    h.state_store
+        .fail_next_commit(sw_pal::traits::PalError::io(28, "[Errno 28] No space left on device"));
+    let failure_effects = h.complete_state_commit(commit);
+    let error = rx
+        .try_recv()
+        .expect("落盤失敗後應回覆")
+        .expect_err("落盤失敗須回 Err");
+    let public = h.public();
+
+    assert!(error.message.contains("No space left on device"), "{}", error.message);
+    assert_eq!(pget(&public, "state"), PyValue::from("DETACHED"));
+    assert_eq!(pget(&public, "released_by"), PyValue::Null);
+    assert_eq!(pget(&public, "released_at"), PyValue::Null);
+    assert_eq!(pget(&public, "released_reason"), PyValue::Null);
+    assert_eq!(pget(&public, "last_error"), PyValue::from("ATTACH_FAILED:OSError"));
+    assert_eq!(pget(&public, "last_state_change_at"), detached_at);
+    assert_eq!(h.fake_device.tx_len(), tx_before, "開埠與落盤失敗不送登入或命令 TX");
+    assert!(
+        !failure_effects.iter().any(|effect| matches!(
+            effect,
+            Effect::OpenBridge { .. } | Effect::StartLogin { .. } | Effect::StartOp { .. }
+        )),
+        "落盤失敗只回 Err，不再開埠、登入或送命令"
     );
 }

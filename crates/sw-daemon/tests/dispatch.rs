@@ -5532,6 +5532,62 @@ fn wp58_assert_device_attach_recovering(r: &ServiceRig, response: &PyDict) {
     assert_eq!(j(response), j(&expected), "SESSION_RECOVERING 完整 RPC 回應");
 }
 
+/// gpd 第 1 點的 RPC 接線：`command.submit(expect_reboot)` 讓 bridge 留在 reboot recovery，`device.attach`
+/// 依 Python `attach_device`（`origin/main:sw_core/session_manager.py:3410-3421`）回已接上；`session.attach`
+/// 仍依 P7 `attach_state_result_mapping` 回 SESSION_RECOVERING。呼叫路徑由 Service RPC 進入 SessionManager/SessionCore。
+#[test]
+fn gpx_rpc_device_attach_during_reboot_recovery_already_attached() {
+    let r = ServiceRig::ready_shell();
+    let dev = r.device(REAL_A);
+    dev.clear_replies();
+
+    let submitted = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"reboot","timeout_s":1.0,"expect_reboot":true}"#,
+    );
+    assert_eq!(submitted.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&submitted));
+    let cmd_id = s(&submitted, "cmd_id").to_string();
+    let mut record = PyDict::default();
+    wait_until("expect_reboot 命令逾時結案", || {
+        r.clock.advance(Duration::from_millis(100));
+        record = sub(
+            &r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#)),
+            "command",
+        );
+        !matches!(record.get("done_at"), None | Some(PyValue::Null))
+    });
+    assert_eq!(s(&record, "status"), "done", "{}", j(&record));
+    r.wait_state("COM0", "RECOVERING");
+
+    let opens_before = dev.open_count();
+    let tx_before = dev.tx_len();
+    let attached = r.call("device.attach", r#"{"selector":"COM0"}"#);
+    let session = r.session("COM0").expect("RECOVERING session");
+    let expected = sw_proto::pydict! {
+        "ok" => true,
+        "already_attached" => true,
+        "session" => PyValue::Dict(session.clone()),
+        "version" => r.version.clone(),
+    };
+    assert_eq!(j(&attached), j(&expected), "device.attach 在 reboot recovery 的完整 RPC wire");
+    assert_eq!(s(&sub(&attached, "session"), "state"), "RECOVERING");
+
+    let session_attach = r.call("session.attach", r#"{"selector":"COM0"}"#);
+    let expected_session_attach = sw_proto::pydict! {
+        "ok" => false,
+        "error_code" => "SESSION_RECOVERING",
+        "session" => PyValue::Dict(session),
+        "version" => r.version.clone(),
+    };
+    assert_eq!(
+        j(&session_attach),
+        j(&expected_session_attach),
+        "session.attach 的 P7 attach_state_result_mapping 保持不變"
+    );
+    assert_eq!(dev.open_count(), opens_before, "兩個 RPC 都不得另開 bridge");
+    assert_eq!(dev.tx_len(), tx_before, "兩個 RPC 都不得新增 UART TX");
+}
+
 /// 正式 RPC 接線：`device.attach` 遇 `session.clear` drain 等待已提交 UART write 收尾時，仍回完整
 /// `SESSION_RECOVERING`；放開 FakeDevice 後 clear 完成並重新回 READY。這與 G13 的一般登入在途成功分流互補。
 #[test]
@@ -5652,6 +5708,142 @@ fn wp510_install_shell_replies(dev: &FakeDevice) {
             format!("__READY__{token}\r\nroot@t:/# ").into_bytes()
         }),
     );
+}
+
+struct GpxDeviceAttachOpenFailureBackend {
+    delegate: Arc<FakeSerialBackend>,
+    next: Mutex<Option<OpenError>>,
+    calls: AtomicUsize,
+}
+
+impl GpxDeviceAttachOpenFailureBackend {
+    fn fail_next(&self, error: OpenError) {
+        *self.next.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+    }
+}
+
+impl SerialBackend for GpxDeviceAttachOpenFailureBackend {
+    fn open_exclusive(
+        &self,
+        dev: &DevicePath,
+        cfg: &SerialConfig,
+    ) -> Result<Box<dyn SerialHandle>, OpenError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if dev.0 == REAL_A {
+            if let Some(error) = self.next.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                return Err(error);
+            }
+        }
+        self.delegate.open_exclusive(dev, cfg)
+    }
+}
+
+fn gpx_rpc_open_failure_rig() -> (ServiceRig, Arc<GpxDeviceAttachOpenFailureBackend>, FakeDevice) {
+    let delegate = FakeSerialBackend::new();
+    let dev = delegate.add_device(REAL_A);
+    wp510_install_shell_replies(&dev);
+    let backend = Arc::new(GpxDeviceAttachOpenFailureBackend {
+        delegate,
+        next: Mutex::new(None),
+        calls: AtomicUsize::new(0),
+    });
+    let rig = ServiceRig::build_with_serial_backend(
+        RigSpec {
+            yaml: format!(
+                "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\ntargets:\n  - {{com: COM0, profile: t, device_by_id: {BY_ID_A}}}\n"
+            ),
+            devices: vec![(BY_ID_A.into(), REAL_A.into())],
+            explicit_target_count: 1,
+            allowlist: None,
+            wait_ready: vec!["COM0".into()],
+        },
+        Some(backend.clone()),
+    );
+    (rig, backend, dev)
+}
+
+/// gpc ITEM 4：Held／AccessDenied／NotFound 與 force 經 `Service::rpc(device.attach)` →
+/// `SessionManager::route` → actor `OpenBridge` → `attach_open_failed`；逐位元組核對 Python wire。
+#[test]
+fn gpx_device_attach_open_failures_match_python_wire() {
+    let cases = vec![
+        (
+            "Held",
+            OpenError::Held(HolderReport {
+                pids: vec![4242],
+                holder_unknown: false,
+                status: HolderScanStatus::Ok,
+            }),
+            false,
+            r#"{"ok":false,"error_code":"DEVICE_STILL_HELD","pids":[4242],"holder_unknown":false,"selector":"COM0"}"#.to_string(),
+        ),
+        (
+            "AccessDenied",
+            OpenError::AccessDenied {
+                os: PalError::io(13, "[Errno 13] Permission denied"),
+                holder: HolderReport {
+                    pids: vec![],
+                    holder_unknown: true,
+                    status: HolderScanStatus::Unsupported,
+                },
+            },
+            false,
+            r#"{"ok":false,"error_code":"DEVICE_STILL_HELD","pids":[],"holder_unknown":true,"selector":"COM0"}"#.to_string(),
+        ),
+        (
+            "NotFound",
+            OpenError::NotFound(PalError::not_found("[Errno 2] No such device")),
+            false,
+            format!(r#"{{"ok":false,"error_code":"DEVICE_NOT_PRESENT","selector":"COM0","device_by_id":"{BY_ID_A}"}}"#),
+        ),
+        (
+            "force Held",
+            OpenError::Held(HolderReport {
+                pids: vec![4242],
+                holder_unknown: false,
+                status: HolderScanStatus::Ok,
+            }),
+            true,
+            r#"{"ok":false,"error_code":"DEVICE_STILL_HELD","pids":[4242],"holder_unknown":false,"selector":"COM0"}"#.to_string(),
+        ),
+    ];
+
+    for (name, failure, force, expected) in cases {
+        let (r, backend, dev) = gpx_rpc_open_failure_rig();
+        let released = r.call(
+            "device.release",
+            r#"{"selector":"COM0","source":"agent:gpx","reason":"test"}"#,
+        );
+        assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&released));
+        r.settle();
+        let session_before = r.session("COM0").expect("RELEASED session");
+        let persisted_before = r.fs.bytes(support::STATE_PATH);
+        let writes_before = r.fs.writes();
+        let tx_before = dev.tx_len();
+        let calls_before = backend.calls.load(Ordering::SeqCst);
+
+        backend.fail_next(failure);
+        let response = r.call(
+            "device.attach",
+            &format!(r#"{{"selector":"COM0","force":{force}}}"#),
+        );
+        let PyValue::Dict(mut expected_dict) =
+            sw_proto::pyjson::loads(&expected).expect("expected Python wire JSON")
+        else {
+            panic!("expected JSON 應為 dict");
+        };
+        expected_dict.insert("version", PyValue::from(r.version.clone()));
+        assert_eq!(
+            dumps(&PyValue::Dict(response.clone()), &RPC_WIRE),
+            dumps(&PyValue::Dict(expected_dict), &RPC_WIRE),
+            "{name}"
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), calls_before + 1, "{name}: 經實際開埠後端");
+        assert_eq!(r.session("COM0").as_ref(), Some(&session_before), "{name}: RELEASED session 不變");
+        assert_eq!(r.fs.bytes(support::STATE_PATH), persisted_before, "{name}: state.json 不變");
+        assert_eq!(r.fs.writes(), writes_before, "{name}: 不新增持久化提交");
+        assert_eq!(dev.tx_len(), tx_before, "{name}: 不登入、不新增 UART TX");
+    }
 }
 
 impl SerialBackend for Wp510GeneralOpenErrorBackend {

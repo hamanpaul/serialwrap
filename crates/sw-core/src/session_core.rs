@@ -905,7 +905,6 @@ enum PendingCommit {
     AttachFailed {
         id: u64,
         reply: Reply,
-        previous_state: SessionState,
     },
 }
 
@@ -2547,7 +2546,6 @@ impl SessionCore {
             },
             PendingCommit::AttachFailed {
                 reply,
-                previous_state,
                 ..
             } => match result {
                 Ok(()) => {
@@ -2560,8 +2558,11 @@ impl SessionCore {
                     vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
                 }
                 Err(error) => {
-                    // 開埠失敗已轉 DETACHED，落盤失敗還原 previous_state 也是狀態變更，經 setter 寫入時間（`:617-620`）。
-                    self.set_state(previous_state, now);
+                    // Python `attach_device` 先在記憶體設 DETACHED 並清除 released provenance，再呼叫
+                    // `_save_state()`；落盤失敗拋出時不回滾這些記憶體變更（`origin/main:sw_core/session_manager.py:3528-3560`）。
+                    self.released_by = None;
+                    self.released_at = None;
+                    self.released_reason = PyValue::Null;
                     vec![Effect::Reply(
                         reply,
                         Err(PyErr::value_error(error.py_message.clone())),
@@ -3490,11 +3491,11 @@ impl SessionCore {
             response.insert("selector", PyValue::from(self.profile.com.clone()));
             return vec![Effect::Reply(reply, Ok(response))];
         }
-        // RECOVERING 且 bridge 存在、無 drain（reboot recovery 等待中）：Python `attach_session` 不走
-        // `_pending_drain` 分支（無 drain 欄位），而是 bridge 存在的 `_attach_state_result` →
-        // `{"ok":false,"error_code":"SESSION_RECOVERING","session"}`（P7 Task 17 `attach_state_result_mapping`）。
+        // RECOVERING 且 bridge 存在、無 drain（reboot recovery 等待中）：Python `device.attach` 走
+        // bridge 冪等分支回 `already_attached:true`（`:3418-3421`）；`session.attach` 仍於下方以
+        // `_attach_state_result` 回 SESSION_RECOVERING（P7 Task 17 `attach_state_result_mapping`）。
         let recovering_with_bridge =
-            session_attach && self.state == SessionState::Recovering && self.generations.conn_epoch.is_some();
+            self.state == SessionState::Recovering && self.generations.conn_epoch.is_some();
         // drain／release 進行中與 release 持久化：一律 SESSION_RECOVERING（SC-04）。
         if self.drain_in_progress()
             || (self.state == SessionState::Recovering && !recovering_with_bridge)
@@ -3572,9 +3573,14 @@ impl SessionCore {
                 // `already_attached`，而是在途表分支回 `{"ok":true,"session"}`（`:3436-3437`）。
                 return vec![Effect::Reply(reply, Ok(self.ok_session(now)))];
             }
-            let mut response = self.ok_session(now);
-            response.insert("already_attached", PyValue::Bool(true));
-            return vec![Effect::Reply(reply, Ok(response))];
+            return vec![Effect::Reply(
+                reply,
+                Ok(pydict! {
+                    "ok" => true,
+                    "already_attached" => true,
+                    "session" => self.public(now, &self.public_ctx())
+                }),
+            )];
         }
         if self.release_persist_pending {
             return vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))];
@@ -5126,9 +5132,14 @@ impl SessionCore {
             }
             OpenFailure::NotFound => {
                 self.set_state(pending.previous_state, now);
-                let mut response = self.error_session("DEVICE_NOT_PRESENT", now);
-                response.insert("selector", PyValue::from(self.profile.com.clone()));
-                response.insert("device_by_id", PyValue::from(pending.by_id));
+                // Python `attach_device` 的實際 open NotFound 分支不附 `session`，鍵序為
+                // ok → error_code → selector → device_by_id（`origin/main:sw_core/session_manager.py:3520-3527`）。
+                let response = pydict! {
+                    "ok" => false,
+                    "error_code" => "DEVICE_NOT_PRESENT",
+                    "selector" => self.profile.com.clone(),
+                    "device_by_id" => pending.by_id,
+                };
                 vec![Effect::Reply(pending.reply, Ok(response))]
             }
             OpenFailure::Other(_)
@@ -5143,7 +5154,6 @@ impl SessionCore {
                 self.pending_commit = Some(PendingCommit::AttachFailed {
                     id,
                     reply: pending.reply,
-                    previous_state: pending.previous_state,
                 });
                 vec![Effect::Persist {
                     commit_id: id,

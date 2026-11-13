@@ -75,6 +75,69 @@ def _self_test(p7) -> dict:
     return j
 
 
+def test_device_attach_during_reboot_recovery_already_attached(p7, tmp_path):
+    """Python `attach_device` 在 reboot recovery 有 bridge 時冪等回 already_attached；不得重開埠或送 TX。"""
+    tgt = FakeTarget(
+        tmp_path / "t0",
+        commands={"overrides": {"reboot": {"response": ""}}},
+    )
+    # Cargo debug daemon 沒有 bundle manifest；A/B 執行可提供由 mkbundle 產生的同來源 manifest，
+    # 讓 Python 與 Rust 的完整 RPC 外層都帶有相同 code_fingerprint，保留鍵序逐項比對。
+    release_manifest = os.environ.get("SW_P7_RELEASE_MANIFEST")
+    extra_env = (
+        {"SERIALWRAP_RELEASE_MANIFEST": release_manifest}
+        if is_rust() and release_manifest
+        else {}
+    )
+    p7.start("shell", [tgt], extra_env=extra_env)
+    wait_state(p7.env, "COM0", "READY", timeout_s=60.0)
+    tgt.freeze_rx()
+    try:
+        rc, submitted = p7.cli(
+            "cmd",
+            "submit",
+            "--selector",
+            "COM0",
+            "--cmd",
+            "reboot",
+            "--cmd-timeout",
+            "0.2",
+            "--expect-reboot",
+        )
+        assert rc == 0 and submitted and submitted.get("ok") is True, (rc, submitted)
+        cmd_id = submitted["cmd_id"]
+        deadline = time.monotonic() + 15.0
+        while True:
+            status_rc, status = p7.cli("cmd", "status", "--cmd-id", cmd_id)
+            assert status_rc == 0 and status, (status_rc, status)
+            command = status.get("command") or {}
+            if command.get("done_at") is not None:
+                break
+            assert time.monotonic() < deadline, f"reboot 命令未結案：{status!r}"
+            time.sleep(0.05)
+
+        recovering = wait_state(p7.env, "COM0", "RECOVERING", timeout_s=10.0)
+        assert recovering.get("state") == "RECOVERING", recovering
+        tx_mark = tgt.rx_mark()
+        rc, reply = p7.cli("device", "attach", "--selector", "COM0")
+        assert rc == 0 and reply, (rc, reply)
+        assert list(reply) == sorted(reply), reply
+        assert set(reply) == {
+            "already_attached",
+            "code_fingerprint",
+            "id",
+            "ok",
+            "session",
+            "version",
+        }, reply
+        assert (reply["ok"], reply["already_attached"]) == (True, True), reply
+        assert reply["session"]["state"] == "RECOVERING", reply
+        assert _row(p7)["state"] == "RECOVERING"
+        assert tgt.rx_log_since(tx_mark) == b"", "device.attach 不得在已有 bridge 上新增 UART TX"
+    finally:
+        tgt.thaw_rx()
+
+
 @pytest.mark.parametrize("case", ["ready", "bootloader", "flood", "passthrough_attached", "passthrough_ready", "released"])
 def test_selftest_classifications(p7, tmp_path, case):
     if case == "ready":

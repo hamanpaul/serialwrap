@@ -1834,6 +1834,55 @@ fn wp510_b_assert_placeholder_retained(m: &ManagerRig, sid: &str) {
     assert!(m.mgr.resolve(sid).is_some(), "拒絕交接後佔位須保留");
 }
 
+/// gpd 第 6 點之 1 的 manager 接線：`route(DeviceAttach)` 開埠 OSError 後 unreleased 落盤失敗，
+/// actor 仍留 DETACHED；model 已先套用 Unreleased，故同一 by-id 拔插後可以重新 attach。
+#[test]
+fn gpx_released_attach_persist_failure_releases_memory_block() {
+    const BY_ID: &str = "/s/by-id/usb-A";
+    const REAL: &str = "/dev/ttyOLD";
+    let yaml = manager_yaml(&[&t_target("COM0", 1, BY_ID)]);
+    let mut loaded = LoadedState::default();
+    loaded.released.insert("t:COM0".into(), released_row(BY_ID));
+    let m = ManagerRig::with(&yaml, loaded, Some((BY_ID, REAL)));
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    m.wait_state("COM0", "RELEASED");
+
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    m.serial.fail_next_open(
+        REAL,
+        OpenError::Other(PalError::io(5, "[Errno 5] Input/output error")),
+    );
+    m.fs.fail_next_atomic_write(PalError::io(
+        28,
+        "[Errno 28] No space left on device",
+    ));
+    let error = m
+        .mgr
+        .route(
+            &sid,
+            SessionRequest::DeviceAttach { force: true },
+            RPC,
+        )
+        .expect_err("unreleased 落盤失敗須由 route 回 Err");
+    assert!(error.message.contains("No space left on device"), "{}", error.message);
+
+    let failed = m.session("COM0");
+    assert_eq!(s_of(&failed, "state").as_deref(), Some("DETACHED"), "{failed:?}");
+    assert_eq!(s_of(&failed, "last_error").as_deref(), Some("ATTACH_FAILED:OSError"), "{failed:?}");
+    assert_eq!(failed.get("released_by"), Some(&PyValue::Null), "{failed:?}");
+    assert_eq!(failed.get("released_at"), Some(&PyValue::Null), "{failed:?}");
+    assert_eq!(failed.get("released_reason"), Some(&PyValue::Null), "{failed:?}");
+
+    // 同一 actor 的 GetState 作為前一個 DeviceDetached 事件屏障，再以相同 by-id 重插。
+    m.mgr.update_devices(&[]);
+    let unplugged = m.session("COM0");
+    assert_eq!(s_of(&unplugged, "state").as_deref(), Some("DETACHED"), "{unplugged:?}");
+    m.mgr.update_devices(&m.snapshot());
+    m.wait_state("COM0", "READY");
+    assert_eq!(m.serial.open_attempts(REAL), 2, "重插應再次經實際開埠");
+}
+
 #[test]
 fn wp510_b_handoff_reuses_preopened_handle() {
     let m = wp510_b_placeholder_rig(false, false);
