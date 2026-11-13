@@ -32179,6 +32179,30 @@
         }
       }
     },
+    "s2_par_gpc:cargo": {
+      "linux": {
+        "nodeids": [
+          "cargo:sw-core::drain_release::gpc_held_open_failure_matches_python_wire"
+        ],
+        "selector": {
+          "argv": [
+            "cargo",
+            "test",
+            "-p",
+            "sw-core",
+            "--features",
+            "test-fakes",
+            "--test",
+            "drain_release",
+            "gpc_held_open_failure_matches_python_wire",
+            "--",
+            "--exact"
+          ],
+          "markexpr": "",
+          "paths": []
+        }
+      }
+    },
     "s2_par_wp51:cargo": {
       "linux": {
         "nodeids": [

@@ -5109,19 +5109,19 @@ impl SessionCore {
             OpenFailure::Held(holder) | OpenFailure::AccessDenied(holder) => {
                 self.set_state(pending.previous_state, now);
                 let holder_unknown = holder.pids.is_empty();
-                let mut response = self.error_session("DEVICE_STILL_HELD", now);
-                response.insert(
-                    "pids",
-                    PyValue::List(
+                let response = pydict! {
+                    "ok" => false,
+                    "error_code" => "DEVICE_STILL_HELD",
+                    "pids" => PyValue::List(
                         holder
                             .pids
                             .into_iter()
                             .map(|pid| py_int(pid as i128))
                             .collect(),
                     ),
-                );
-                response.insert("holder_unknown", PyValue::Bool(holder_unknown));
-                response.insert("selector", PyValue::from(self.profile.com.clone()));
+                    "holder_unknown" => holder_unknown,
+                    "selector" => self.profile.com.clone()
+                };
                 vec![Effect::Reply(pending.reply, Ok(response))]
             }
             OpenFailure::NotFound => {

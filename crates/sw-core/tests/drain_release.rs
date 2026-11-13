@@ -13,7 +13,7 @@ use sw_core::op_runner::OpOutcome;
 use sw_core::session_core::{Effect, SessionRequest};
 use sw_core::tx_writer::{EvidenceGap, OpId, TxLedger, TxOpLedger};
 use sw_pal::traits::{HolderReport, HolderScanStatus, PalError};
-use sw_proto::pyjson::{PyDict, PyValue};
+use sw_proto::pyjson::{dumps, PyDict, PyValue, RPC_WIRE};
 
 fn release() -> SessionRequest {
     SessionRequest::Release {
@@ -886,6 +886,73 @@ fn attach_during_drain_is_session_recovering() {
 }
 
 #[test]
+fn gpc_held_open_failure_matches_python_wire() {
+    let cases = [
+        (
+            OpenFailure::Held(holder(vec![4242], false)),
+            false,
+            r#"{"ok":false,"error_code":"DEVICE_STILL_HELD","pids":[4242],"holder_unknown":false,"selector":"COM0"}"#,
+            "已識別 holder",
+        ),
+        (
+            OpenFailure::Held(holder(vec![], true)),
+            false,
+            r#"{"ok":false,"error_code":"DEVICE_STILL_HELD","pids":[],"holder_unknown":true,"selector":"COM0"}"#,
+            "未知 holder",
+        ),
+        (
+            OpenFailure::AccessDenied(holder(vec![], true)),
+            false,
+            r#"{"ok":false,"error_code":"DEVICE_STILL_HELD","pids":[],"holder_unknown":true,"selector":"COM0"}"#,
+            "AccessDenied",
+        ),
+        (
+            OpenFailure::Held(holder(vec![4242], false)),
+            true,
+            r#"{"ok":false,"error_code":"DEVICE_STILL_HELD","pids":[4242],"holder_unknown":false,"selector":"COM0"}"#,
+            "force 不繞過已識別 holder",
+        ),
+    ];
+
+    for (failure, force, expected, label) in cases {
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.to_ready();
+        let (_release_rx, _) = h.rpc_deferred(release());
+        let (epoch, stop) = h.pending_stop();
+        h.receipt(epoch, stop).feed();
+        let commits = h.state_store.commits();
+        let tx_before = h.fake_device.tx_len();
+        let (attach_rx, open_effects) =
+            h.rpc_deferred(SessionRequest::DeviceAttach { force });
+        assert!(
+            open_effects.iter().any(|effect| match effect {
+                Effect::OpenBridge { precheck_holders, .. } => *precheck_holders != force,
+                _ => false,
+            }),
+            "{label}: force={force}"
+        );
+
+        let failure_effects = h.feed(ControlEvent::BridgeOpened {
+            epoch_hint: 0,
+            result: Err(failure),
+        });
+        let response = attach_rx.try_recv().unwrap().unwrap();
+        assert_eq!(
+            dumps(&PyValue::Dict(response), &RPC_WIRE),
+            expected,
+            "{label}"
+        );
+        assert_eq!(h.public()["state"], PyValue::from("RELEASED"), "{label}");
+        assert_eq!(h.state_store.commits(), commits, "{label}: 不提交 Unreleased");
+        assert_eq!(h.fake_device.tx_len(), tx_before, "{label}: 不新增 UART TX");
+        assert!(!failure_effects.iter().any(|effect| matches!(
+            effect,
+            Effect::StartLogin { .. } | Effect::StartOp { .. } | Effect::Persist { .. }
+        )), "{label}: 開埠失敗不開始登入或持久化");
+    }
+}
+
+#[test]
 fn attach_force_does_not_bypass_identified_external_holder() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
     h.to_ready();
@@ -911,7 +978,6 @@ fn attach_force_does_not_bypass_identified_external_holder() {
         vec![
             "ok",
             "error_code",
-            "session",
             "pids",
             "holder_unknown",
             "selector"
