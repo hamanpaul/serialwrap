@@ -56,6 +56,8 @@ pub enum StateDelta {
     Released { sid: String, row: ReleasedRow },
     Unreleased { sid: String },
     Binding { sid: String, by_id: Option<String> },
+    /// session.bind 的原子狀態轉換：清除 RELEASED 列並保存新 binding。
+    Bind { sid: String, by_id: String },
     Pin { device_key: String, profile: Option<String> },
     Detected { by_id: String, profile: String },
     AliasSet { alias: String, row: Option<PyDict> },
@@ -636,6 +638,11 @@ impl StateModel {
                     self.state.bindings.shift_remove(&sid);
                 }
             },
+            StateDelta::Bind { sid, by_id } => {
+                self.loaded_released.shift_remove(&sid);
+                self.state.released.shift_remove(&sid);
+                self.state.bindings.insert(sid, by_id);
+            }
             StateDelta::Pin {
                 device_key,
                 profile,

@@ -943,6 +943,9 @@ impl FakeStateStore {
             StateDelta::Unreleased { sid } => {
                 g.released.shift_remove(&sid);
             }
+            StateDelta::Bind { sid, .. } => {
+                g.released.shift_remove(&sid);
+            }
             _ => {}
         }
         Ok(())

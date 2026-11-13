@@ -2266,6 +2266,8 @@ impl Shared {
                 }
             }
         }
+        // 關閉 parked handle 期間 watcher 可能已提交較新的快照；後續事件依目前裝置表計算，避免舊快照覆蓋重插。
+        let current = lock(&self.inner).devices.clone();
         // Python `_mark_missing_devices_locked`（審查 F60）：與 Python 同在 detach／attach 之前標記。
         let missing: Vec<String> = {
             let inner = lock(&self.inner);
@@ -2273,7 +2275,8 @@ impl Shared {
                 .sessions
                 .values()
                 .filter(|e| {
-                    !e.profile.device_by_id.is_empty() && !new.contains_key(&e.profile.device_by_id)
+                    !e.profile.device_by_id.is_empty()
+                        && !current.contains_key(&e.profile.device_by_id)
                 })
                 .map(|e| e.sid.clone())
                 .collect()
@@ -2283,15 +2286,15 @@ impl Shared {
         }
         let changed: Vec<String> = prev
             .iter()
-            .filter(|(k, v)| new.get(*k).is_some_and(|n| n.real_path != v.real_path))
+            .filter(|(k, v)| current.get(*k).is_some_and(|n| n.real_path != v.real_path))
             .map(|(k, _)| k.clone())
             .collect();
         let removed: Vec<String> = prev
             .keys()
-            .filter(|k| !new.contains_key(*k))
+            .filter(|k| !current.contains_key(*k))
             .cloned()
             .collect();
-        let added: Vec<String> = new
+        let added: Vec<String> = current
             .keys()
             .filter(|k| !prev.contains_key(*k))
             .cloned()
@@ -5643,12 +5646,31 @@ impl EffectExecutor for ManagerExec {
             }
             Effect::Persist { commit_id, delta } => {
                 let release = matches!(delta, StateDelta::Released { .. });
+                let bind = matches!(delta, StateDelta::Bind { .. });
                 // sol P5-5cc4623-1：delta 依 actor 順序同步套入 model；工作者只跑 release 暫停鉤子並提交「當下」快照。
                 // 若延到工作者才套 delta，release 暫停期間完成的 bind（Unreleased＋新 binding）會被舊 Released 覆寫
                 // （Python `_save_release_state` 暫停後重建當前快照，不回放已失效的 delta）。
                 self.shared.model_apply(delta);
                 let shared = self.shared.clone();
                 let control = tx.clone();
+                if bind {
+                    // bind 與已暫停的 release 提交並行：release hook 在取得 StateStore 寫入槽前等待，bind 必須能先
+                    // 提交目前 model 並回覆，之後 release 再讀取同一最新快照（Python `origin/main:sw_core/session_manager.py:3810`）。
+                    let failed = tx.clone();
+                    let submitted = std::thread::Builder::new()
+                        .name("serialwrap-bind-persist".into())
+                        .spawn(move || {
+                            let result = shared.commit_sync_kind(|_| {}, false);
+                            let _ = control.send(ControlEvent::StateCommitted { commit_id, result });
+                        });
+                    if submitted.is_err() {
+                        let _ = failed.send(ControlEvent::StateCommitted {
+                            commit_id,
+                            result: Err(PalError::plain(PalErrorKind::Io, "bind 持久化工作者無法啟動")),
+                        });
+                    }
+                    return;
+                }
                 let submitted = self.persist_jobs.submit(Box::new(move || {
                     let result = shared.commit_sync_kind(|_| {}, release);
                     let _ = control.send(ControlEvent::StateCommitted { commit_id, result });
@@ -6630,19 +6652,6 @@ impl SessionManager {
             let (bind_gen, actor_id) = (e.binding_generation, e.actor_id);
             (inner.devices.contains_key(&by_id), bind_gen, actor_id)
         };
-        let commit_sid = sid.clone();
-        let commit_by = by_id.clone();
-        self.shared
-            .commit_sync(move |m| {
-                m.apply(StateDelta::Unreleased {
-                    sid: commit_sid.clone(),
-                });
-                m.apply(StateDelta::Binding {
-                    sid: commit_sid,
-                    by_id: Some(commit_by),
-                });
-            })
-            .map_err(|e| commit_error(&e))?;
         if has_device {
             // 改綁目標若有未消費的預開作業（佔位退休落盤失敗留下）：Python `bind_session` 收尾 `_spawn_attach`，
             // `_attach_by_id` 取走 `_preopened_ports` 的作業並以同一 handle 建 bridge（`origin/main:sw_core/session_manager.py:4852-4854`、

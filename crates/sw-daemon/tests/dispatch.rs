@@ -6,6 +6,7 @@ mod support;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use support::{BY_ID_A, BY_ID_B, REAL_A, REAL_B, RIG_PID, RigSpec, ServiceRig, wait_until};
@@ -119,6 +120,46 @@ fn wp510r_i25_rpc_timed_out_bind_late_completion_allows_replug() {
         !r.mgr
             .delivery_obligation_for_test(&r.mgr.resolve("COM0").unwrap())
     );
+}
+
+/// S2-GP-gpx ITEM 4：bind RPC 逾時後 actor 完成改綁，Unreleased／Binding 仍須原子落盤。
+/// Python `bind_session` 先改記憶體欄位，再於 `origin/main:sw_core/session_manager.py:3810` 呼叫 `_save_state`。
+#[test]
+fn gpx_rpc_bind_timeout_then_replug_persists_binding() {
+    let (r, dev) = i25_bind_completes_after_rpc_timeout();
+    let sid = r.mgr.resolve("COM0").expect("COM0 session");
+    let load_state = || {
+        sw_core::state_store::load_state(Path::new(support::STATE_PATH), r.fs.as_ref())
+            .expect("state.json 可重載")
+            .0
+    };
+
+    // 同 lane 查詢屏障確保晚到 actor commit 已完成；不得重試 session.bind。
+    r.settle();
+    let persisted = load_state();
+    assert!(
+        persisted.bindings.get(&sid).is_some_and(|by_id| by_id == BY_ID_A)
+            && !persisted.released.contains_key(&sid),
+        "晚到 bind 應同一提交持久化 binding 並移除 RELEASED：bindings={:?}, released={:?}",
+        persisted.bindings,
+        persisted.released
+    );
+
+    // 逾時後直接拔插，不重試 bind；清除舊 released 阻擋後，最新快照應自動 attach。
+    r.mgr.update_devices(&[]);
+    r.mgr.update_devices(&[(
+        BY_ID_A.into(),
+        DeviceInfo {
+            by_id: BY_ID_A.into(),
+            real_path: REAL_A.into(),
+        },
+    )]);
+    r.wait_state("COM0", "READY");
+    assert_eq!(dev.open_attempts(), 2, "重插只新增一次實際開埠");
+
+    let reloaded = load_state();
+    assert_eq!(reloaded.bindings.get(&sid).map(String::as_str), Some(BY_ID_A));
+    assert!(!reloaded.released.contains_key(&sid), "重載後不得有 RELEASED 列");
 }
 
 /// 第 25 項 Medium：bind 通知逾時後才登記舊義務，裝置已改指並完成重新連線。

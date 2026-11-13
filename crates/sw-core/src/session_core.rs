@@ -194,6 +194,7 @@ pub enum SessionRequest {
         force: bool,
     },
     Clear,
+    /// 內部 DETACHED-rebind：先發布 actor binding，manager 完成 handle 保管移交後提交；RPC 改綁使用 `BindWithAck`。
     Bind {
         by_id: String,
     },
@@ -663,6 +664,8 @@ pub struct SessionCore {
     next_stop_id: u64,
     next_commit_id: u64,
     pending_commit: Option<PendingCommit>,
+    /// Bind 存檔可與 release 的快照提交並行；各自依 commit_id 結算，避免互相覆寫等待者。
+    pending_bind_commit: Option<PendingBindCommit>,
     release_persist_pending: bool,
     retired_stops: VecDeque<RetiredStop>,
     /// S2-PAR-wp510r R3（設計 §3.1.3）：退休 bridge 的排空項目（由 `retired_open_closes` 改寫而來），承接所有
@@ -733,6 +736,7 @@ pub struct SessionCore {
     shutdown_complete: bool,
     /// P5-T16：`StopKind::Bind` drain 完成後要改綁的 by_id（Python `_DrainJob.target_by_id`）。
     pending_bind: Option<String>,
+    pending_bind_persist: bool,
     #[cfg(feature = "test-fakes")]
     panic_events_remaining: u8,
     /// P6：human console 狀態（ownership、line editor、DeferredBuffer、human TX lane、回放保留）。
@@ -913,6 +917,12 @@ enum PendingCommit {
     },
 }
 
+struct PendingBindCommit {
+    id: u64,
+    waiters: Vec<Reply>,
+    response: PyDict,
+}
+
 struct RetiredStop {
     epoch: u64,
     id: StopId,
@@ -955,6 +965,7 @@ struct BindWait {
     id: u64,
     target: String,
     reply: Reply,
+    persist: bool,
     /// SPEC-GAP 2：bind 請求 +3000 ms（實時），`WaitAck::Bind` 告知 RPC 執行緒。
     deadline_rt: std::time::Instant,
     /// 等待期間有 release 加入（Python 作業的 `release_request` 已設）：終態到時不改綁、回 SESSION_RECOVERING＋當下的
@@ -1032,6 +1043,7 @@ impl SessionCore {
             next_stop_id: 0,
             next_commit_id: 0,
             pending_commit: None,
+            pending_bind_commit: None,
             release_persist_pending: false,
             retired_stops: VecDeque::new(),
             retired_drains: Vec::new(),
@@ -1072,6 +1084,7 @@ impl SessionCore {
             shutdown_requested: false,
             shutdown_complete: false,
             pending_bind: None,
+            pending_bind_persist: false,
             #[cfg(feature = "test-fakes")]
             panic_events_remaining: 0,
             human: crate::human_console::HumanConsoleState::new(),
@@ -2459,6 +2472,31 @@ impl SessionCore {
         result: Result<(), PalError>,
         now: Mono,
     ) -> Vec<Effect> {
+        if self
+            .pending_bind_commit
+            .as_ref()
+            .is_some_and(|pending| pending.id == commit_id)
+        {
+            let pending = self.pending_bind_commit.take().expect("已確認的 bind commit");
+            let PendingBindCommit {
+                waiters, response, ..
+            } = pending;
+            if self.shutdown_requested && self.pending_commit.is_none() {
+                self.shutdown_complete = true;
+            }
+            return match result {
+                Ok(()) => waiters
+                    .into_iter()
+                    .map(|reply| Effect::Reply(reply, Ok(response.clone())))
+                    .collect(),
+                Err(error) => waiters
+                    .into_iter()
+                    .map(|reply| {
+                        Effect::Reply(reply, Err(PyErr::value_error(error.py_message.clone())))
+                    })
+                    .collect(),
+            };
+        }
         let Some(pending) = self.pending_commit.take() else {
             return Vec::new();
         };
@@ -2478,7 +2516,7 @@ impl SessionCore {
             } => match result {
                 Ok(()) => {
                     self.release_persist_pending = false;
-                    if self.shutdown_requested {
+                    if self.shutdown_requested && self.pending_bind_commit.is_none() {
                         self.shutdown_complete = true;
                     }
                     let mut effects = Vec::new();
@@ -2506,7 +2544,7 @@ impl SessionCore {
                         effects.extend(self.persist_release(
                             std::iter::once(next_owner).chain(waiters).collect(),
                         ));
-                    } else if self.shutdown_requested {
+                    } else if self.shutdown_requested && self.pending_bind_commit.is_none() {
                         self.shutdown_complete = true;
                     }
                     effects
@@ -2892,7 +2930,7 @@ impl SessionCore {
             }
             SessionRequest::BindWithAck { by_id, ack, opening_token } => {
                 let before = self.next_bind_wait_id;
-                let effects = self.bind_request(by_id, reply, opening_token, now);
+                let effects = self.bind_request(by_id, reply, opening_token, true, now);
                 if self.next_bind_wait_id != before {
                     if let Some(wait) = self.bind_waits.iter().find(|w| w.id == self.next_bind_wait_id) {
                         let _ = ack.try_send(crate::mailbox::WaitAck::Bind {
@@ -3214,7 +3252,7 @@ impl SessionCore {
             SessionRequest::Bind { .. } if self.drain_in_progress() => {
                 vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))]
             }
-            SessionRequest::Bind { by_id } => self.bind_request(by_id, reply, None, now),
+            SessionRequest::Bind { by_id } => self.bind_request(by_id, reply, None, false, now),
             SessionRequest::SetProfile {
                 profile,
                 profile_source,
@@ -3527,6 +3565,7 @@ impl SessionCore {
         // drain／release 進行中與 release 持久化：一律 SESSION_RECOVERING（SC-04）。
         if self.drain_in_progress()
             || (self.state == SessionState::Recovering && !recovering_with_bridge)
+            || self.pending_bind_commit.is_some()
             || matches!(&self.pending_commit, Some(PendingCommit::Release { .. }))
         {
             return vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))];
@@ -3711,6 +3750,7 @@ impl SessionCore {
         by_id: String,
         reply: Reply,
         opening_token: Option<u64>,
+        persist: bool,
         now: Mono,
     ) -> Vec<Effect> {
         if self.flash_busy() {
@@ -3751,31 +3791,38 @@ impl SessionCore {
                     release_deadline: None,
                 });
             }
-            effects.extend(self.push_bind_wait(by_id, reply, now));
+            effects.extend(self.push_bind_wait(by_id, reply, persist, now));
             return effects;
         }
         if self.open_real_path.is_some()
             || self.pending_attach.is_some()
+            || self.pending_bind_commit.is_some()
             || matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }))
         {
             return vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))];
         }
         if !self.retired_drains.is_empty() {
-            return self.bind_wait_retired_drains(by_id, reply, now);
+            return self.bind_wait_retired_drains(by_id, reply, persist, now);
         }
         if self.generations.conn_epoch.is_some() {
             self.pending_bind = Some(by_id);
+            self.pending_bind_persist = persist;
             return self.begin_stop(StopKind::Bind, Some(reply), now).0;
         }
-        let published = self.apply_bind(by_id, now);
-        vec![published, Effect::Reply(reply, Ok(self.ok_session(now)))]
+        self.apply_bind(by_id, now, vec![reply], persist)
     }
 
     /// BindWait（設計 §3.1.6）：退休 bridge 的 handle 尚未確認關閉時，bind 等到其終態，上限 3000 ms。
     /// - 已有失敗回條（D1 iii，終態已知）：立即回 SESSION_RECOVERING＋stalled，不改綁。
     /// - 仍待回條：掛起並排 `BindWaitTimeout`；成功回條後重新走 bind（Python 遞迴 `:3727`），失敗回條或逾時回
     ///   SESSION_RECOVERING＋stalled（`retired_drain_receipt`、`bind_wait_timeout`）。
-    fn bind_wait_retired_drains(&mut self, target: String, reply: Reply, now: Mono) -> Vec<Effect> {
+    fn bind_wait_retired_drains(
+        &mut self,
+        target: String,
+        reply: Reply,
+        persist: bool,
+        now: Mono,
+    ) -> Vec<Effect> {
         if self
             .retired_drains
             .iter()
@@ -3783,12 +3830,18 @@ impl SessionCore {
         {
             return vec![Effect::Reply(reply, Ok(self.bind_stalled_reply(now)))];
         }
-        self.push_bind_wait(target, reply, now)
+        self.push_bind_wait(target, reply, persist, now)
     }
 
     /// 掛起一筆 BindWait 並排 `BindWaitTimeout`（actor 期限計時器；RPC 執行緒另依 `WaitAck::Bind` 以實時通知，
     /// SPEC-GAP 2）。
-    fn push_bind_wait(&mut self, target: String, reply: Reply, now: Mono) -> Vec<Effect> {
+    fn push_bind_wait(
+        &mut self,
+        target: String,
+        reply: Reply,
+        persist: bool,
+        now: Mono,
+    ) -> Vec<Effect> {
         self.next_bind_wait_id = self.next_bind_wait_id.saturating_add(1);
         let id = self.next_bind_wait_id;
         let deadline_rt = std::time::Instant::now()
@@ -3797,6 +3850,7 @@ impl SessionCore {
             id,
             target,
             reply,
+            persist,
             deadline_rt,
             release_joined: false,
         });
@@ -3841,6 +3895,7 @@ impl SessionCore {
             || self.external_attach.is_some()
             || self.open_real_path.is_some()
             || self.pending_attach.is_some()
+            || self.pending_bind_commit.is_some()
             || matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }))
         {
             return Vec::new();
@@ -3851,14 +3906,22 @@ impl SessionCore {
             if wait.release_joined || self.pending_open_stop.is_some() || self.stop.is_some() {
                 effects.push(Effect::Reply(wait.reply, Ok(self.session_recovering_reply(now))));
             } else {
-                effects.extend(self.bind_request(wait.target, wait.reply, None, now));
+                effects.extend(self.bind_request(wait.target, wait.reply, None, wait.persist, now));
             }
         }
         effects
     }
 
-    /// 改綁的狀態套用（離開 RELEASED、清 released metadata、裝置視為未在線）。
-    fn apply_bind(&mut self, target: String, now: Mono) -> Effect {
+    /// 改綁的狀態套用（離開 RELEASED、清 released metadata、裝置視為未在線）。RPC bind 先更新 session 與 binding
+    /// 記憶體狀態（Python `origin/main:sw_core/session_manager.py:3781-3791`），再於 `:3810` 呼叫 `_save_state`；
+    /// `_save_state` 失敗時沿 RPC 回傳例外，不回滾已套用的記憶體狀態。內部 DETACHED-rebind 由 manager 在保管移交後提交。
+    fn apply_bind(
+        &mut self,
+        target: String,
+        now: Mono,
+        waiters: Vec<Reply>,
+        persist: bool,
+    ) -> Vec<Effect> {
         if self.state == SessionState::Released {
             self.release_persist_pending = false;
             self.pending_release = None;
@@ -3871,7 +3934,33 @@ impl SessionCore {
         self.known_real_path = None;
         self.set_last_error(Some("DEVICE_NOT_FOUND".into()), None);
         self.set_state(SessionState::Detached, now);
-        self.publish_binding()
+        let published = self.publish_binding();
+        let response = self.ok_session(now);
+        if !persist {
+            return std::iter::once(published)
+                .chain(
+                    waiters
+                        .into_iter()
+                        .map(|reply| Effect::Reply(reply, Ok(response.clone()))),
+                )
+                .collect();
+        }
+        let id = self.next_commit();
+        self.pending_bind_commit = Some(PendingBindCommit {
+            id,
+            waiters,
+            response,
+        });
+        vec![
+            published,
+            Effect::Persist {
+                commit_id: id,
+                delta: StateDelta::Bind {
+                    sid: self.sid.clone(),
+                    by_id: self.profile.device_by_id.clone(),
+                },
+            },
+        ]
     }
 
     /// 綁定世代只由 actor 產生；manager 以效果同步，不依 RPC 是否收到回覆另行推算。
@@ -6674,14 +6763,19 @@ impl SessionCore {
                 self.set_last_error(Some("REBOUND".into()), None);
                 self.set_state(SessionState::Detached, now);
                 if let Some(target) = self.pending_bind.take() {
-                    effects.push(self.apply_bind(target, now));
-                }
-                for waiter in stop.waiters {
-                    effects.push(Effect::Reply(waiter, Ok(self.ok_session(now))));
+                    let persist = std::mem::replace(&mut self.pending_bind_persist, false);
+                    effects.extend(self.apply_bind(target, now, stop.waiters, persist));
+                } else {
+                    for waiter in stop.waiters {
+                        effects.push(Effect::Reply(waiter, Ok(self.ok_session(now))));
+                    }
                 }
             }
         }
-        if self.shutdown_requested && self.pending_commit.is_none() {
+        if self.shutdown_requested
+            && self.pending_commit.is_none()
+            && self.pending_bind_commit.is_none()
+        {
             self.shutdown_complete = true;
         }
         effects

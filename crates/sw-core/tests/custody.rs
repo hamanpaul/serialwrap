@@ -3512,6 +3512,60 @@ fn test_dr2_a_replug_during_parked_close_waits_receipt_then_attaches_once() {
     assert_eq!(dev.close_count(), 1, "parked handle 只關閉一次");
 }
 
+/// S2-GP-gpx ITEM 4：bind 落盤 ENOSPC 後，parked handle 拔除關閉期間的重插不得被舊快照的 Removed 覆蓋。
+/// Python `update_devices` 先更新 `_devices`，再處理 close（`origin/main:sw_core/session_manager.py:4022-4063`）。
+#[test]
+fn gpx_bound_parked_unplug_close_replug_not_overwritten() {
+    let _guard = SPAWN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (m, dev, token) = dr7_formal_parked_rig(None);
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    m.fs.fail_next_atomic_write(PalError::io(28, "[Errno 28] No space left on device"));
+    let bound = m.mgr.bind(&sid, DR7_BY_ID);
+    assert!(bound.is_err(), "前置：bind 落盤 ENOSPC：{bound:?}");
+    assert_eq!(
+        s_of(&m.session(&sid), "device_by_id").as_deref(),
+        Some(DR7_BY_ID),
+        "前置：記憶體中的 COM0 已改綁"
+    );
+    assert_eq!(
+        m.mgr.custody_for_test(DR7_BY_ID).map(|rec| rec.owner),
+        Some(CustodyOwner::Parked),
+        "前置：bind 落盤失敗後 parked handle 仍留在保管帳本"
+    );
+
+    dev.pause_next_close();
+    let without: Vec<_> = m.snapshot().into_iter().filter(|(k, _)| k != DR7_BY_ID).collect();
+    let unplug_mgr = m.mgr.clone();
+    let unplug = std::thread::spawn(move || unplug_mgr.update_devices(&without));
+    wait_until("拔除的熱插執行緒停在 parked handle 的關閉", || {
+        dev.wait_paused(Duration::from_millis(50))
+    });
+    assert_eq!(m.mgr.custody_for_test(DR7_BY_ID).map(|rec| rec.token), Some(token));
+    let open_attempts = dev.open_attempts();
+
+    // 重插在舊 update_devices 尚於鎖外 close 時完成；以關閉回條同步，不用固定延遲猜測事件排序。
+    m.mgr.update_devices(&dr2_online(&m));
+    assert_eq!(dev.open_attempts(), open_attempts, "關閉回條前不得另開埠");
+    assert_eq!(m.mgr.custody_for_test(DR7_BY_ID).map(|rec| rec.token), Some(token));
+
+    dev.release_pause();
+    unplug.join().expect("拔除的熱插執行緒不應 panic");
+    wait_until("parked handle 關閉成功並結算", || {
+        m.mgr.custody_for_test(DR7_BY_ID).map(|rec| rec.token) != Some(token)
+    });
+    assert_eq!(
+        m.mgr.terminal_for_test(token).map(|t| t.handle),
+        Some(TerminalHandle::Closed)
+    );
+    wait_until("重插在舊拔除完成後只開埠一次", || dev.open_attempts() == open_attempts + 1);
+    m.wait_state("COM0", "READY");
+    let session = m.session(&sid);
+    assert_ne!(s_of(&session, "state").as_deref(), Some("DETACHED"), "重插後不可被舊 Removed 覆蓋：{session:?}");
+    assert_eq!(s_of(&session, "device_by_id").as_deref(), Some(DR7_BY_ID));
+    assert_eq!(dev.open_attempts(), open_attempts + 1, "回條後恰好一次 OpenBridge");
+    assert_eq!(dev.close_count(), 1, "parked handle 只關閉一次");
+}
+
 /// DR-2(c)（設計 v5 §1.8 DR-2(c)、D1 iii）：parked B3 拔除後關閉回 closed:false：CloseFailed、進未確認集合；重插與
 /// bootstrap 都不開埠。
 #[test]
