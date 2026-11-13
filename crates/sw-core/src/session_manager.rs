@@ -3248,6 +3248,9 @@ impl Shared {
         {
             let mut probes = lock(&self.handoff_probes);
             probes.live.push(fence.clone());
+            if self.probe_tx_frozen.load(Ordering::SeqCst) {
+                fence.with(|f| f.frozen = true);
+            }
             if probes.frozen {
                 fence.with(|f| f.handoff_frozen = true);
             }
@@ -7659,6 +7662,12 @@ impl SessionManager {
         *lock(&self.shared.persist_observer) = Some(observer);
     }
 
+    /// 只供測試（test-fakes）：讀取命令登錄表的副本，驗證 daemon 停機時的命令終態。
+    #[cfg(feature = "test-fakes")]
+    pub fn command_record_for_test(&self, cmd_id: &str) -> Option<PyDict> {
+        self.shared.registry.get(cmd_id)
+    }
+
     /// SC-11 stopping gate：冪等設定 `stopping=true`；之後任何自動或 RPC 路徑的 attach 都不開啟裝置。
     /// 建構子尾端啟動存檔重現的 Python 未捕捉例外末行（有值時 daemon 應印 traceback 並 exit 1）。
     pub fn startup_error(&self) -> Option<String> {
@@ -7666,9 +7675,53 @@ impl SessionManager {
     }
 
     pub fn begin_shutdown(&self) {
-        let mut inner = lock(&self.shared.inner);
-        inner.stopping = true;
-        inner.shutdown_started = true;
+        let entries = {
+            let mut inner = lock(&self.shared.inner);
+            inner.stopping = true;
+            if inner.shutdown_started {
+                return;
+            }
+            inner.shutdown_started = true;
+            inner
+                .sessions
+                .values()
+                .map(|entry| (entry.sid.clone(), entry.actor.clone(), entry.fence.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        // 發布 PROBE 停機旗標後再收集 live fences；probe_send 也會在登記臨界區重讀此旗標，
+        // 因此在這次快照前後建立的 probe 都會被凍結。
+        self.shared.probe_tx_frozen.store(true, Ordering::SeqCst);
+        let probes = {
+            let mut probes = lock(&self.shared.handoff_probes);
+            probes.frozen = true;
+            probes.live.clone()
+        };
+        for (_, _, fence) in &entries {
+            fence.freeze_for_shutdown();
+        }
+        for fence in &probes {
+            fence.freeze_for_shutdown();
+        }
+
+        // safety lane 讓停機沖刷越過一般控制佇列；回條確認 queue 已清，且目前前景工作仍可正常收尾。
+        let deadline = Instant::now() + QUERY_TIMEOUT;
+        let mut waits = Vec::with_capacity(entries.len());
+        for (_, actor, _) in entries {
+            let (reply, rx) = crossbeam_channel::bounded(1);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if actor
+                .safety
+                .send_timeout(ControlEvent::ShutdownGate { reply }, remaining)
+                .is_ok()
+            {
+                waits.push(rx);
+            }
+        }
+        for rx in waits {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let _ = rx.recv_timeout(remaining);
+        }
     }
 
     /// P8 Task 14：交接停止成立前凍結背景來源與既有 bridge 的新 TX（Python `SessionManager.freeze_for_handoff`）。

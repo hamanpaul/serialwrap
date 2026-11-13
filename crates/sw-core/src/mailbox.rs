@@ -118,6 +118,10 @@ pub enum ControlEvent {
         result: Result<(), PalError>,
     },
     Tick,
+    /// 停機 gate：不終止目前前景工作，但立即阻止新命令出列並沖刷 queued commands。
+    ShutdownGate {
+        reply: Reply,
+    },
     Shutdown {
         reply: Reply,
     },

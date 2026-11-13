@@ -5,7 +5,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -202,32 +202,58 @@ impl FenceState {
 
 /// TX fence：`0` 為 fence 狀態（OS 提交在其鎖內進行，見 [`FenceSubmitGate`]）；`1` 為 `handoff_frozen` 的不取鎖鏡像
 /// （每次 [`Fence::with`]／[`Fence::try_with`] 結束前於鎖內發布，見 [`Fence::handoff_frozen_published`]）。
-pub struct Fence(Mutex<FenceState>, AtomicBool);
+pub struct Fence(Mutex<FenceState>, AtomicBool, AtomicBool, Mutex<()>);
 
 impl Fence {
     pub fn new() -> Arc<Fence> {
-        Arc::new(Fence(Mutex::new(FenceState {
-            active_epoch: None,
-            owner_gen: 0,
-            fsm_gen: 0,
-            frozen: false,
-            quiet_active: false,
-            probe_quiet_exempt: false,
-            reconfirm_pending: false,
-            flash_mode: FlashMode::Off,
-            wal_unhealthy: false,
-            cancelled: CancelledOps::default(),
-            in_flight: None,
-            human_admission_blocked: false,
-            input_epoch: 0,
-            replay_auth: None,
-            foreground_busy: false,
-            reboot_arm_op: None,
-            flash_critical: false,
-            bridge_passthrough: false,
-            handoff_frozen: false,
-            retired_drains_pending: false,
-        }), AtomicBool::new(false)))
+        Arc::new(Fence(
+            Mutex::new(FenceState {
+                active_epoch: None,
+                owner_gen: 0,
+                fsm_gen: 0,
+                frozen: false,
+                quiet_active: false,
+                probe_quiet_exempt: false,
+                reconfirm_pending: false,
+                flash_mode: FlashMode::Off,
+                wal_unhealthy: false,
+                cancelled: CancelledOps::default(),
+                in_flight: None,
+                human_admission_blocked: false,
+                input_epoch: 0,
+                replay_auth: None,
+                foreground_busy: false,
+                reboot_arm_op: None,
+                flash_critical: false,
+                bridge_passthrough: false,
+                handoff_frozen: false,
+                retired_drains_pending: false,
+            }),
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+            Mutex::new(()),
+        ))
+    }
+
+    /// SessionCore 命令出列與停機旗標發布共用的序列化鎖。
+    pub fn lock_command_start(&self) -> MutexGuard<'_, ()> {
+        self.3
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 停機 gate：先發布跨執行緒旗標，再等 fence 鎖收斂目前 OS 提交；返回後不再允許新 TX。
+    pub fn freeze_for_shutdown(&self) {
+        {
+            let _start = self.lock_command_start();
+            self.2.store(true, Ordering::SeqCst);
+        }
+        self.with(|state| state.frozen = true);
+    }
+
+    /// 不取 fence 鎖讀取停機 gate，供 SessionCore 在 `start_next` 同步阻止新命令出列。
+    pub fn shutdown_started_published(&self) -> bool {
+        self.2.load(Ordering::SeqCst)
     }
 
     /// P8-1533cb5-1：不取 fence 鎖讀取 `handoff_frozen`（OS 提交持鎖期間也立即回傳）。
@@ -423,6 +449,10 @@ impl SubmitGate for FenceSubmitGate<'_> {
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.fence.shutdown_started_published() {
+            self.last_reject.set(Some(FenceReject::Frozen));
+            return Err(SubmitRevoked);
+        }
         if let Err(reason) = Fence::admit(&state, self.permit) {
             self.last_reject.set(Some(reason));
             return Err(SubmitRevoked);

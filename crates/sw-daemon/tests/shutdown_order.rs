@@ -376,6 +376,195 @@ fn order_is_exactly_1_to_7() {
 }
 
 #[test]
+fn gpx_shutdown_window_starts_no_new_command_zero_tx() {
+    // q1 已送出 UART、等待 prompt；停機 gate 後才讓它完成。q2 必須立即沖刷，不能在 flash.stop 窗口出列。
+    let env = isolated_env();
+    let (platform, handles) = in_process_platform_with_handles(
+        &env.vars,
+        vec![device("usb-SER-A-if00", "/fake/serial-s2-shutdown")],
+        Fixture::ReadyShell,
+    );
+    let dev = handles.devices[0].clone();
+    let manager_slot: Arc<Mutex<Option<Arc<SessionManager>>>> = Arc::new(Mutex::new(None));
+    let manager_for_hook = manager_slot.clone();
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let trace_for_hook = trace.clone();
+    let tx_at_gate = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+    let tx_at_gate_for_hook = tx_at_gate.clone();
+    let dev_for_hook = dev.clone();
+    let (window_tx, window_rx) = crossbeam_channel::bounded(1);
+    let hooks = DaemonHooks {
+        trace: Some(Box::new(move |event| {
+            match event {
+                TraceEvent::ShutdownGate => {
+                    tx_at_gate_for_hook.store(dev_for_hook.tx_len(), Ordering::SeqCst);
+                }
+                TraceEvent::EngineIntakeClosed => {
+                    let _ = window_tx.send(());
+                }
+                _ => {}
+            }
+            trace_for_hook.lock().unwrap().push(event);
+        })),
+        block_flash_endpoint_stop: true,
+        on_manager: Some(Box::new(move |manager| {
+            *manager_for_hook.lock().unwrap() = Some(manager);
+        })),
+        ..DaemonHooks::default()
+    };
+    let socket = env.socket.clone();
+    let dev_for_client = dev.clone();
+    let manager_for_client = manager_slot.clone();
+    let trace_for_client = trace.clone();
+    let client = thread::spawn(move || {
+        wait_socket(&socket, SHORT);
+        wait_state(&socket, "COM0", "READY");
+        let manager = manager_for_client.lock().unwrap().clone();
+        let q1_tx_start = dev_for_client.tx_len();
+        let q1_id = submit(&socket, "COM0", "q1")["cmd_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let q1_sent = !q1_id.is_empty()
+            && poll(SHORT, || {
+                dev_for_client
+                    .tx_since(q1_tx_start)
+                    .windows(2)
+                    .any(|bytes| bytes == b"q1")
+            });
+        let q1_running = !q1_id.is_empty()
+            && poll(SHORT, || {
+                manager
+                    .as_ref()
+                    .and_then(|m| m.command_record_for_test(&q1_id))
+                    .and_then(|record| {
+                        record
+                            .get("status")
+                            .and_then(PyValue::as_str)
+                            .map(str::to_string)
+                    })
+                    .is_some_and(|status| status == "running")
+            });
+        let q2_id = submit(&socket, "COM0", "q2")["cmd_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let q2_accepted = !q2_id.is_empty() && command_get(&socket, &q2_id)["status"] == "accepted";
+        let stop_reply = rpc_once(&socket, STOP);
+
+        // 此通知在 watcher.stop 之後、flash.stop 之前；block_flash_endpoint_stop 保留 2 s 停止窗口。
+        let in_window = window_rx.recv_timeout(SHORT).is_ok();
+        if in_window {
+            thread::sleep(Duration::from_millis(200));
+            dev_for_client.push_rx(b"q1\r\nroot@t:/# ");
+        }
+        let q1_completed_before_flash_stopped = !q1_id.is_empty()
+            && poll(Duration::from_millis(900), || {
+                manager
+                    .as_ref()
+                    .and_then(|m| m.command_record_for_test(&q1_id))
+                    .and_then(|record| {
+                        record
+                            .get("status")
+                            .and_then(PyValue::as_str)
+                            .map(str::to_string)
+                    })
+                    .is_some_and(|status| status == "done")
+            })
+            && !trace_for_client
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, TraceEvent::FlashStopped { .. }));
+        (
+            q1_id,
+            q2_id,
+            q1_sent,
+            q1_running,
+            q2_accepted,
+            in_window,
+            q1_completed_before_flash_stopped,
+            stop_reply,
+        )
+    });
+
+    let _code = run_with_hooks(vec!["serialwrapd".to_string()], platform, hooks);
+    let (q1_id, q2_id, q1_sent, q1_running, q2_accepted, in_window, q1_completed, stop_reply) =
+        client.join().expect("client thread");
+    assert!(!stop_reply.is_empty(), "daemon.stop 應回覆：{stop_reply:?}");
+    assert!(
+        !q1_id.is_empty() && q1_sent && q1_running,
+        "q1 應先進入 UART 前景：{q1_id:?}"
+    );
+    assert!(
+        !q2_id.is_empty() && q2_accepted,
+        "q2 停機前應仍為 accepted：{q2_id:?}"
+    );
+    assert!(in_window && q1_completed, "q1 應在 flash.stop 完成前收尾");
+
+    let manager = manager_slot
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("daemon 已建立 manager");
+    let q1 = manager
+        .command_record_for_test(&q1_id)
+        .expect("q1 命令紀錄");
+    assert_eq!(
+        q1.get("status"),
+        Some(&PyValue::from("done")),
+        "q1 應完成：{q1:?}"
+    );
+    let q2 = manager
+        .command_record_for_test(&q2_id)
+        .expect("q2 命令紀錄");
+    assert_eq!(
+        q2.get("status"),
+        Some(&PyValue::from("error")),
+        "q2 不得進入 running：{q2:?}"
+    );
+    assert_eq!(
+        q2.get("error_code"),
+        Some(&PyValue::from("FLUSHED_BY_SHUTDOWN")),
+        "q2 應在 ShutdownGate 立即沖刷：{q2:?}"
+    );
+
+    let gate_len = tx_at_gate.load(Ordering::SeqCst);
+    assert_ne!(gate_len, usize::MAX, "trace 應觀測到 ShutdownGate");
+    assert!(
+        dev.tx_since(gate_len).is_empty(),
+        "ShutdownGate 後 FakeDevice 不得收到 TX"
+    );
+    let all_tx = dev.tx_since(0);
+    assert!(
+        !all_tx.windows(2).any(|bytes| bytes == b"q2"),
+        "q2 不得送到 DUT：{all_tx:?}"
+    );
+
+    let wal = env.wal_dir.join("raw.wal.ndjson");
+    let q2_wal: Vec<_> = wal_records(&wal)
+        .into_iter()
+        .filter(|record| record.get("cmd_id").and_then(PyValue::as_str) == Some(q2_id.as_str()))
+        .collect();
+    assert!(q2_wal.is_empty(), "WAL 不得記錄 q2 TX：{q2_wal:?}");
+
+    let trace = trace.lock().unwrap().clone();
+    let flushed = trace
+        .iter()
+        .find_map(|event| match event {
+            TraceEvent::SessionsDrained { flushed, .. } => Some(flushed),
+            _ => None,
+        })
+        .expect("trace 含 flush_shutdown");
+    assert!(
+        flushed
+            .iter()
+            .any(|(cmd_id, code)| cmd_id == &q2_id && code == "FLUSHED_BY_SHUTDOWN"),
+        "q2 必須列在停機沖刷中：{flushed:?}"
+    );
+}
+
+#[test]
 fn stopping_gate_before_watcher_stop() {
     // gate（1a）先於 watcher.stop（1b）：watcher 最後一輪送出的 Delta 也被擋下，不得 open 新裝置。
     let env = isolated_env();

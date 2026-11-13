@@ -1289,6 +1289,7 @@ impl SessionCore {
         matches!(
             ev,
             MailboxItem::Control(ControlEvent::Request { .. })
+                | MailboxItem::Control(ControlEvent::ShutdownGate { .. })
                 | MailboxItem::Control(ControlEvent::Shutdown { .. })
                 // S2-PAR-wp510r R3（設計 §3.1.7）：`ClaimForStop` 的立即回饋，三種凍結狀態皆立即處理。
                 | MailboxItem::Control(ControlEvent::CustodyClaimed { .. })
@@ -1419,6 +1420,10 @@ impl SessionCore {
                     self.shutdown_complete = true;
                     effects.push(Effect::Reply(reply, Ok(pydict! { "ok" => true })));
                 }
+                MailboxItem::Control(ControlEvent::ShutdownGate { reply }) => {
+                    self.flush_shutdown_queue();
+                    effects.push(Effect::Reply(reply, Ok(pydict! { "ok" => true })));
+                }
                 _ => {}
             }
             return effects;
@@ -1426,6 +1431,10 @@ impl SessionCore {
         match ev {
             MailboxItem::Control(ControlEvent::Request { req, reply }) => {
                 effects.0.extend(self.handle_request(req, reply, now));
+            }
+            MailboxItem::Control(ControlEvent::ShutdownGate { reply }) => {
+                self.flush_shutdown_queue();
+                effects.push(Effect::Reply(reply, Ok(pydict! { "ok" => true })));
             }
             MailboxItem::Control(ControlEvent::Shutdown { reply }) => {
                 effects
@@ -7304,7 +7313,13 @@ impl SessionCore {
     }
 
     fn start_next(&mut self, now: Mono) -> Vec<Effect> {
+        let fence = self.deps.fence.clone();
+        let _start_gate = fence.lock_command_start();
         let mut effects = Vec::new();
+        if fence.shutdown_started_published() {
+            self.flush_shutdown_queue();
+            return effects;
+        }
         // P8 Task 6（審查 P8X-7af8adc-1）：file transfer 占用前景槽時照常出列並以 SESSION_BUSY 結束，不延後。
         if self.state == SessionState::Ready && self.file_transfer_in_foreground() {
             self.reject_queued_during_file_transfer(now);
@@ -7507,6 +7522,15 @@ impl SessionCore {
                 );
             }
         }
+    }
+
+    /// 停機 gate：不終止目前前景工作，立即沖刷尚未啟動的命令，並清掉 actor 內部 queue。
+    fn flush_shutdown_queue(&mut self) {
+        let _ = self.queue.drain_all();
+        self.abort_parked_command();
+        self.deps
+            .registry
+            .flush_session(&self.sid, "FLUSHED_BY_SHUTDOWN", &self.wall_iso());
     }
 
     // ---------------- background capture ----------------

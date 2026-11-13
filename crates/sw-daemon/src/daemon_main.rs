@@ -1452,7 +1452,12 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
     svc.shutdown_freeze();
     server.stop_accept(); // 1 只停 accept，不等進行中的 handler（避免 600 s file.push 卡死停止序）
     hooks.trace(Stage::ServerStopAccept);
+    let before: HashMap<String, Option<String>> = registry.error_codes().into_iter().collect();
     manager.begin_shutdown(); // 1a stopping gate（R1-F2）：之後熱插／bootstrap／recover／SC-32 延後 reconcile 不再 open
+    let flush_at = manager.now_iso();
+    for sid in manager.session_ids() {
+        registry.flush_session(&sid, "FLUSHED_BY_SHUTDOWN", &flush_at);
+    }
     hooks.trace(Stage::ShutdownGate);
     watcher.stop(); // 1b 停 watcher；channel 殘留的 Delta 由 1a gate 丟棄
     hooks.trace(Stage::WatcherStopped);
@@ -1472,7 +1477,6 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
     // 3 所有 session Phase 1（fence 凍結、RunCancel、取消進行中的檔案傳輸、排隊命令 FLUSHED_BY_SHUTDOWN）。
     // 步驟 3～5 與 5a 共用同一個 5 s 期限。
     let drain_deadline = Instant::now() + DRAIN_BUDGET;
-    let before: HashMap<String, Option<String>> = registry.error_codes().into_iter().collect();
     let drain = manager.shutdown_phase1(drain_deadline);
     hooks.trace(Stage::DrainPhase1);
     // 4 join handler（剩餘預算）：被取消的 handler 寫完回應後結束；逾時者列出 method，不再等待。

@@ -192,6 +192,7 @@ fn probe_label(item: &MailboxItem) -> Option<&'static str> {
         MailboxItem::Control(ControlEvent::Tick) => Some("Tick"),
         // OD-45：stop_request 的 L1 結構 gate（`at_most_one_data_item_before_control`）；drain_receipt 依 OD-64 為
         // `at_most_pre_dependency_data_plus_one`（見 `ProbeEntry::pre_dependency_data`）。
+        MailboxItem::Control(ControlEvent::ShutdownGate { .. }) => Some("ShutdownGate"),
         MailboxItem::Control(ControlEvent::Shutdown { .. }) => Some("Shutdown"),
         MailboxItem::Control(ControlEvent::WorkerStopped(_)) => Some("WorkerStopped"),
         #[cfg(feature = "test-fakes")]
@@ -698,6 +699,7 @@ fn dispatch(
 ) -> bool {
     let (reply, event_name) = match &item {
         MailboxItem::Control(ControlEvent::Request { reply, .. })
+        | MailboxItem::Control(ControlEvent::ShutdownGate { reply })
         | MailboxItem::Control(ControlEvent::Shutdown { reply }) => {
             (Some(reply.clone()), "Request")
         }
@@ -763,6 +765,7 @@ fn dispatch(
                 | MailboxItem::Control(ControlEvent::EvictCapture { .. } | ControlEvent::ConsoleCountChanged { .. }
                     | ControlEvent::UartTxCompleted { .. } | ControlEvent::DrainDataBarrier { .. }
                     | ControlEvent::OpFinished { .. } | ControlEvent::LoginFinished { .. } | ControlEvent::Tick
+                    | ControlEvent::ShutdownGate { .. }
                     | ControlEvent::ConsoleConnected { .. } | ControlEvent::ConsoleScan { .. } | ControlEvent::HumanTxCompleted { .. }
                     | ControlEvent::FlashSyncProbeStart { .. } | ControlEvent::FlashProbeReleased { .. }
                     | ControlEvent::FlashSyncMatched { .. } | ControlEvent::FlashHolderGone { .. }
