@@ -21,6 +21,7 @@ import pytest
 from bb_faketarget import FakeTarget
 from bb_harness import is_rust
 from bb_p7 import P7Rig, wait_state
+from p7_login_oracle import assert_login_window, login_window_bounds
 
 pytestmark = [pytest.mark.posix_only, pytest.mark.posix_pty, pytest.mark.process_rpc]
 
@@ -86,6 +87,70 @@ def _wait_command_done(p7, cmd_id: str, timeout_s: float = 30.0) -> dict:
             return last
         time.sleep(0.1)
     raise AssertionError(f"命令 {cmd_id} 未於 {timeout_s}s 內完成：{last!r}")
+
+
+def test_login_bytes_not_interleaved_with_agent_or_human(p7, tmp_path):
+    """OD-86：手動 recover 登入窗口禁止 agent TX；human raw bytes 依 Python 允許且不得遺失。"""
+    human = b"HUMAN_DURING_LOGIN_P7\n"
+    tgt = FakeTarget(
+        tmp_path / "t0",
+        delay_ms=1000,
+        login_steps=[
+            {"expect": "", "respond": "\r\nfake login: "},
+            {"expect": "root", "respond": "\r\nPassword: "},
+            {"expect": "pw", "respond": "\r\nroot@fake:~# "},
+        ],
+    )
+    p7.start("shell_unresolved", [tgt])
+    wait_state(p7.env, "COM0", "ATTACHED", timeout_s=30.0)
+    deadline = time.monotonic() + 15.0
+    while _row(p7).get("last_error") != "CREDENTIALS_UNRESOLVED":
+        assert time.monotonic() < deadline, _row(p7)
+        time.sleep(0.1)
+    console_fd, _ = _attach_human_vtty(p7, "s23-login-window")
+    try:
+        env_file = p7.tmp / "p7.env.unresolved"
+        env_file.write_text("SW_P7_USER=root\nSW_P7_PASS=pw\n", encoding="utf-8")
+        before = p7.wal_records("COM0", limit=5000)
+        after_seq = max((int(row.get("seq") or 0) for row in before), default=0)
+        rx_mark = tgt.rx_mark()
+        result: dict = {}
+
+        def recover() -> None:
+            result["response"] = p7.cli("session", "recover", "--selector", "COM0", timeout_s=60.0)
+
+        worker = threading.Thread(target=recover, daemon=True)
+        worker.start()
+        _wait_target_rx(tgt, b"pw\n", mark=rx_mark)
+        agent_rc, agent_response = p7.cli(
+            "cmd", "submit", "--selector", "COM0", "--source", "agent:p7",
+            "--cmd", "echo FORBIDDEN_DURING_LOGIN_P7",
+        )
+        assert agent_rc != 0 and agent_response and agent_response.get("ok") is False, (agent_rc, agent_response)
+        os.write(console_fd, human)
+        _wait_target_rx(tgt, human, mark=rx_mark)
+        worker.join(timeout=65.0)
+        assert not worker.is_alive(), "手動 session recover 未在期限內結束"
+        rc, response = result["response"]
+        assert rc == 0 and response and response.get("ok") is True, (rc, response)
+        wait_state(p7.env, "COM0", "READY", timeout_s=10.0)
+
+        rows = [row for row in p7.wal_records("COM0", limit=5000) if int(row.get("seq") or 0) > after_seq]
+        start, ready = login_window_bounds(
+            rows,
+            after_seq=after_seq,
+            username=b"root\n",
+            ready_prompt=b"root@fake:~# ",
+        )
+        assert_login_window(rows, login_start_seq=start, ready_seq=ready, human_payload=human)
+        human_seqs = [int(row["seq"]) for row in rows if row.get("dir") == "TX"
+                      and str(row.get("source", "")).startswith("human:")
+                      and human in base64.b64decode(row.get("payload_b64") or "")]
+        assert tgt.rx_log_since(rx_mark).count(human) == 1, f"human bytes 必須恰一次送達 target：{tgt.rx_log_since(rx_mark)!r}"
+        human_mono = [row.get("mono_ts_ns") for row in rows if int(row.get("seq") or 0) in human_seqs]
+        print(f"P7 login WAL window seq={start}..{ready}; human TX seq={human_seqs} mono_ts_ns={human_mono}")
+    finally:
+        os.close(console_fd)
 
 
 def test_recovery_and_reboot_do_not_replay_stale_input(p7, tmp_path):

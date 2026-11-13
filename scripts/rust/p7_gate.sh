@@ -229,14 +229,16 @@ if [[ -n "${P7_S22_GATE_JSON:-}" && -f "${P7_S22_GATE_JSON}" ]]; then
 fi
 run_row "cases.lock slice_2.3 coverage" coverage "${COV_EV[@]}" -- \
   python3 scripts/rust/p7_case_coverage.py "${COV_ARGS[@]}"
-# 15. 全套 pytest（p7_gate:python3-m-pytest-q-tests；任何失敗 → 該列 FAIL，l1_judge 規則）
+# 15. 全套 pytest（N3；依 2026-11-12 rulings/s2.md 第 3 點，比照 CI 排除兩項 Stage 1 證據測試；其他失敗 → FAIL）
 mkdir -p "$RUN/pytest-full"
 if [[ "$SKIP_FULL" == "1" ]]; then
   echo "--skip-full-pytest：未執行（不得作出口證據）" >"$RUN/logs/pytest-full.log"
 else
-  run_row "python3 -m pytest -q tests/" pytest-full --l1 "$RUN/pytest-full/l1-results.json" \
+  run_row "python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence" pytest-full --l1 "$RUN/pytest-full/l1-results.json" \
     --evidence "$RUN/pytest-full/junit.xml" -- \
     env SW_RESOURCE_REPORT="$RUN/pytest-full/l1-results.json" python3 -m pytest -q tests/ \
+    --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native \
+    --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence \
     --junitxml="$RUN/pytest-full/junit.xml"
 fi
 # 16. policy check

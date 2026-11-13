@@ -3575,6 +3575,7 @@
           "tests/contract_blackbox/test_p7_events.py::test_start_load_order",
           "tests/contract_blackbox/test_p7_invariants.py::test_evidence_insufficient_is_not_pass",
           "tests/contract_blackbox/test_p7_invariants.py::test_force_recover_attached_closes_before_reopen",
+          "tests/contract_blackbox/test_p7_invariants.py::test_login_bytes_not_interleaved_with_agent_or_human",
           "tests/contract_blackbox/test_p7_invariants.py::test_no_auto_resend_after_partial_or_timeout",
           "tests/contract_blackbox/test_p7_invariants.py::test_recovery_and_reboot_do_not_replay_stale_input",
           "tests/contract_blackbox/test_p7_invariants.py::test_rejected_requests_zero_tx",
@@ -3655,6 +3656,7 @@
           "tests/contract_blackbox/test_p7_events.py::test_start_load_order",
           "tests/contract_blackbox/test_p7_invariants.py::test_evidence_insufficient_is_not_pass",
           "tests/contract_blackbox/test_p7_invariants.py::test_force_recover_attached_closes_before_reopen",
+          "tests/contract_blackbox/test_p7_invariants.py::test_login_bytes_not_interleaved_with_agent_or_human",
           "tests/contract_blackbox/test_p7_invariants.py::test_no_auto_resend_after_partial_or_timeout",
           "tests/contract_blackbox/test_p7_invariants.py::test_recovery_and_reboot_do_not_replay_stale_input",
           "tests/contract_blackbox/test_p7_invariants.py::test_rejected_requests_zero_tx",
@@ -5147,6 +5149,7 @@
           "tests/contract_blackbox/test_p7_events.py::test_start_load_order",
           "tests/contract_blackbox/test_p7_invariants.py::test_evidence_insufficient_is_not_pass",
           "tests/contract_blackbox/test_p7_invariants.py::test_force_recover_attached_closes_before_reopen",
+          "tests/contract_blackbox/test_p7_invariants.py::test_login_bytes_not_interleaved_with_agent_or_human",
           "tests/contract_blackbox/test_p7_invariants.py::test_no_auto_resend_after_partial_or_timeout",
           "tests/contract_blackbox/test_p7_invariants.py::test_recovery_and_reboot_do_not_replay_stale_input",
           "tests/contract_blackbox/test_p7_invariants.py::test_rejected_requests_zero_tx",
@@ -5291,6 +5294,9 @@
           "tests/test_acceptance_cases.py::test_lr_mixed_stage0_and_evidence",
           "tests/test_acceptance_cases.py::test_manual_procedure_not_counted",
           "tests/test_acceptance_cases.py::test_no_duplicate_platform_rows",
+          "tests/test_acceptance_cases.py::test_p1_console_lease_cases_record_od85_windows_gap[p1-con-busy]",
+          "tests/test_acceptance_cases.py::test_p1_console_lease_cases_record_od85_windows_gap[p1-con-softpreempt]",
+          "tests/test_acceptance_cases.py::test_p7_login_case_contract_matches_od86",
           "tests/test_acceptance_cases.py::test_pending_issue_matches_registry",
           "tests/test_acceptance_cases.py::test_prerequisite_slice_order",
           "tests/test_acceptance_cases.py::test_realhw_cases_match_registry",
@@ -7212,6 +7218,7 @@
           "tests/test_functest_windows_wiring.py::test_windows_pty_mode_reports_capability_skip",
           "tests/test_functest_windows_wiring.py::test_windows_wait_endpoint_tcp_probe",
           "tests/test_functest_windows_wiring.py::test_windows_wiring_env_and_argv",
+          "tests/test_gate_pytest_argv_alignment.py::test_three_stage2_gates_and_preflight_match_ci_deselects",
           "tests/test_handoff_freeze_races.py::test_attach_body_after_handoff_freeze_reverts_pre_marked_attaching",
           "tests/test_handoff_freeze_races.py::test_attaching_marked_before_freeze_reverts_to_detached_without_attach",
           "tests/test_handoff_freeze_races.py::test_lease_self_heal_after_handoff_freeze_grants_nothing",
@@ -7920,6 +7927,8 @@
           "tests/test_p7_goldens_fresh.py::test_event_engine_order_golden_distinguishes_start_and_rule_set",
           "tests/test_p7_goldens_fresh.py::test_goldens_exist_and_are_fresh",
           "tests/test_p7_goldens_fresh.py::test_login_fsm_golden_covers_every_platform_and_error",
+          "tests/test_p7_login_wal_oracle.py::test_login_window_oracle_rejects_swallowed_human_bytes",
+          "tests/test_p7_login_wal_oracle.py::test_login_window_oracle_rejects_synthetic_agent_tx",
           "tests/test_p7_od56_ci_allow.py::test_od56_p7_bo1_triples_allowed_linux_only",
           "tests/test_p7_recover_parity.py::test_recover_not_ready_non_force_returns_not_ready",
           "tests/test_p7_recover_parity.py::test_recover_resets_credentials_warned",
@@ -8747,7 +8756,6 @@
           "tests/test_rust_bench_tools.py::test_bench_platform_mismatch_is_not_standard",
           "tests/test_rust_bench_tools.py::test_bench_script_outputs_percentiles",
           "tests/test_rust_bench_tools.py::test_bench_wsl_host_is_never_standard_even_with_full_manifest",
-          "tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native",
           "tests/test_rust_bench_tools.py::test_check_l1_completeness_rules",
           "tests/test_rust_bench_tools.py::test_check_p4_cases_l1_cli_scenarios[exit_code_nonzero]",
           "tests/test_rust_bench_tools.py::test_check_p4_cases_l1_cli_scenarios[missing_one]",
@@ -9369,7 +9377,6 @@
           "tests/test_rust_stage1a_gate.py::test_windows_l15_case_cannot_use_linux_evidence",
           "tests/test_rust_stage1b_registration.py::test_check_p4_cases_rejects_docker_for_l2",
           "tests/test_rust_stage1b_registration.py::test_no_delegated_groups_left_in_rust_source",
-          "tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
           "tests/test_rust_stage1b_registration.py::test_stage1b_adds_no_error_codes",
           "tests/test_rust_stage1b_registration.py::test_stage1b_behavior_changes_implemented_with_frozen_case_ids",
           "tests/test_rust_win_func_test.py::test_basic_argv_omits_scenarios_and_keeps_com_pair",
@@ -11157,6 +11164,30 @@
           "paths": [
             "tests/"
           ]
+        }
+      }
+    },
+    "p7_gate:win-test-sh-caps-windows-com": {
+      "windows": {
+        "nodeids": [
+          "cargo:sw-daemon::cap_windows_com_p7::cap_windows_com__p7_event_fire",
+          "cargo:sw-daemon::cap_windows_com_p7::cap_windows_com__p7_login_ready",
+          "cargo:sw-daemon::cap_windows_com_p7::cap_windows_com__p7_quiet_banner_zero_tx"
+        ],
+        "selector": {
+          "argv": [
+            "--package",
+            "sw-daemon",
+            "--test",
+            "cap_windows_com_p7",
+            "--features",
+            "test-fakes",
+            "--",
+            "--ignored",
+            "cap_windows_com__"
+          ],
+          "markexpr": "",
+          "paths": []
         }
       }
     },
@@ -27246,6 +27277,7 @@
           "tests/contract_blackbox/test_p7_events.py::test_start_load_order",
           "tests/contract_blackbox/test_p7_invariants.py::test_evidence_insufficient_is_not_pass",
           "tests/contract_blackbox/test_p7_invariants.py::test_force_recover_attached_closes_before_reopen",
+          "tests/contract_blackbox/test_p7_invariants.py::test_login_bytes_not_interleaved_with_agent_or_human",
           "tests/contract_blackbox/test_p7_invariants.py::test_no_auto_resend_after_partial_or_timeout",
           "tests/contract_blackbox/test_p7_invariants.py::test_recovery_and_reboot_do_not_replay_stale_input",
           "tests/contract_blackbox/test_p7_invariants.py::test_rejected_requests_zero_tx",
@@ -27390,6 +27422,9 @@
           "tests/test_acceptance_cases.py::test_lr_mixed_stage0_and_evidence",
           "tests/test_acceptance_cases.py::test_manual_procedure_not_counted",
           "tests/test_acceptance_cases.py::test_no_duplicate_platform_rows",
+          "tests/test_acceptance_cases.py::test_p1_console_lease_cases_record_od85_windows_gap[p1-con-busy]",
+          "tests/test_acceptance_cases.py::test_p1_console_lease_cases_record_od85_windows_gap[p1-con-softpreempt]",
+          "tests/test_acceptance_cases.py::test_p7_login_case_contract_matches_od86",
           "tests/test_acceptance_cases.py::test_pending_issue_matches_registry",
           "tests/test_acceptance_cases.py::test_prerequisite_slice_order",
           "tests/test_acceptance_cases.py::test_realhw_cases_match_registry",
@@ -29311,6 +29346,7 @@
           "tests/test_functest_windows_wiring.py::test_windows_pty_mode_reports_capability_skip",
           "tests/test_functest_windows_wiring.py::test_windows_wait_endpoint_tcp_probe",
           "tests/test_functest_windows_wiring.py::test_windows_wiring_env_and_argv",
+          "tests/test_gate_pytest_argv_alignment.py::test_three_stage2_gates_and_preflight_match_ci_deselects",
           "tests/test_handoff_freeze_races.py::test_attach_body_after_handoff_freeze_reverts_pre_marked_attaching",
           "tests/test_handoff_freeze_races.py::test_attaching_marked_before_freeze_reverts_to_detached_without_attach",
           "tests/test_handoff_freeze_races.py::test_lease_self_heal_after_handoff_freeze_grants_nothing",
@@ -30019,6 +30055,8 @@
           "tests/test_p7_goldens_fresh.py::test_event_engine_order_golden_distinguishes_start_and_rule_set",
           "tests/test_p7_goldens_fresh.py::test_goldens_exist_and_are_fresh",
           "tests/test_p7_goldens_fresh.py::test_login_fsm_golden_covers_every_platform_and_error",
+          "tests/test_p7_login_wal_oracle.py::test_login_window_oracle_rejects_swallowed_human_bytes",
+          "tests/test_p7_login_wal_oracle.py::test_login_window_oracle_rejects_synthetic_agent_tx",
           "tests/test_p7_od56_ci_allow.py::test_od56_p7_bo1_triples_allowed_linux_only",
           "tests/test_p7_recover_parity.py::test_recover_not_ready_non_force_returns_not_ready",
           "tests/test_p7_recover_parity.py::test_recover_resets_credentials_warned",
@@ -30846,7 +30884,6 @@
           "tests/test_rust_bench_tools.py::test_bench_platform_mismatch_is_not_standard",
           "tests/test_rust_bench_tools.py::test_bench_script_outputs_percentiles",
           "tests/test_rust_bench_tools.py::test_bench_wsl_host_is_never_standard_even_with_full_manifest",
-          "tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native",
           "tests/test_rust_bench_tools.py::test_check_l1_completeness_rules",
           "tests/test_rust_bench_tools.py::test_check_p4_cases_l1_cli_scenarios[exit_code_nonzero]",
           "tests/test_rust_bench_tools.py::test_check_p4_cases_l1_cli_scenarios[missing_one]",
@@ -31468,7 +31505,6 @@
           "tests/test_rust_stage1a_gate.py::test_windows_l15_case_cannot_use_linux_evidence",
           "tests/test_rust_stage1b_registration.py::test_check_p4_cases_rejects_docker_for_l2",
           "tests/test_rust_stage1b_registration.py::test_no_delegated_groups_left_in_rust_source",
-          "tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
           "tests/test_rust_stage1b_registration.py::test_stage1b_adds_no_error_codes",
           "tests/test_rust_stage1b_registration.py::test_stage1b_behavior_changes_implemented_with_frozen_case_ids",
           "tests/test_rust_win_func_test.py::test_basic_argv_omits_scenarios_and_keeps_com_pair",

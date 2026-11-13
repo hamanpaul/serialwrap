@@ -163,10 +163,13 @@ else
   FAILURES=1
 fi
 
+# N3（依 2026-11-12 rulings/s2.md 第 3 點）：Python 基線 pytest 參數與 CI 對齊。
 run_logged python-baseline env \
   SERIALWRAP_COVERAGE_RUN_DIR="$RUN_DIR" \
   SERIALWRAP_COVERAGE_LABEL=python-linux \
-  python3 -m pytest -q tests/
+  python3 -m pytest -q tests/ \
+  --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native \
+  --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence
 
 # Rust label 的 pytest 收集範圍：凡需 rust-linux 證據的 pytest nodeid（含 rust-l1 凍結案例的 pytest 節點），
 # 其檔案都要在此陣列內並與本輪 artifact 一起執行（P8X-24c6b39-6；tests/test_rust_contract_coverage.py 把關）。

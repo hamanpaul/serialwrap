@@ -585,6 +585,21 @@ P8 Task 1 對本節的影響（2026-11-08）：§2.9 新增 KEEP 列 XFER-ABORT-
 | NC-P5-01 | RX 速率視窗（RX_FLOOD 判定用）：Python `deque(maxlen=4096)` 超量時**丟最舊項目**，視窗內 bytes 總和會被低估；Rust 採 `merge_oldest`（合併最舊兩筆、保留 bytes 總和） | §5.4 RX_FLOOD（`RX_FLOOD_BYTES_PER_10S=20000`，10 s 視窗） | 暫定 IMPL（計畫 06 Task 0 `contracts/resource_limits.yaml` `rx_rate_window_entries`）；**未登記** `contracts/behavior_changes.yaml` | 洪泛下不低估 RX_FLOOD 判定；可觀測於 flood 情境的錯誤分類，屬 A/B 比較範圍內的潛在差異 | P5 | yes（決定 SC／DF／Rust-only；若為 SC 需補 `behavior_changes.yaml`） |
 | NC-P5-02 | 承接率斷路器觀測窗口語意：規格 §12.2 寫「連續三週內」且「觀測窗口起訖於切片開始時固定」；計畫 09 原寫「觀測窗口內任一連續三週」（滾動解讀）。Slice 2.1 實作採單一固定窗口（`[start, start+3w]`），窗口結束後的停滯不納入判定 | §12.2「校準與斷路器」、OD-02、OD-13（須定義分母與起訖） | 暫定 IMPL（固定窗口，依 §12.2 起訖固定句）；計畫 09 斷路器段改為沿用固定窗口 | 固定窗口對窗口外的停滯無感；改為滾動窗口會改變 P6～P8 的觸發語意，需重寫 `slice_breaker.evaluate` 並重審 P8 出口 | P5／P8 | RESOLVED（OD-44，2026-10-28）：維持固定窗口，實作不改；計畫 09 斷路器段已改為固定窗口寫法 |
 
+### 7.1 P8 已知差異（2026-11-12 裁決第 7 點；N2 另列）
+
+以下依 2026-11-12 `docs/rust-refactor/reviews/rulings/s2.md` 第 7 點登記；維持現有 Rust 行為，不在本項調整產品碼。
+
+| ID | 事實（現況） | 規格 | 裁決 | 理由 | 階段 | 需擁有者 |
+|---|---|---|---|---|---|---|
+| NC-P8-01 | `McuPattern` 的 `baud` 限於 `u32`、`timeout_ms` 限於 `u64`；超出範圍回錯，Python 整數沒有此固定寬度上限 | Python `sw_core/mcu_patterns.py` | KEEP（已知差異；2026-11-12 第 7 點） | `crates/sw-core/src/mcu_patterns.rs:90-99,198-205`；Ledger L64 記錄 Python 接受任意精度整數，Rust 轉換超界回 ValueError | P8 | no |
+| NC-P8-02 | flash probe 窗口內 `interactive_send` 靜默不送仍回 ok，但 Rust 不更新 `last_tx_at`；Python 呼叫 `_mark_session_tx` 更新時間戳 | Python `session_manager.py:7540` | KEEP（已知差異；2026-11-12 第 7 點） | `crates/sw-core/src/session_core/flash.rs:229-240`；只影響該時間戳欄位 | P8 | no |
+| NC-P8-03 | `collect_flash_candidates_and_mark` 先標記所有非 command-capable session，再查 actor 快照並撤回非候選者；標記與撤回間短暫可見 `FLASHING_BUSY` | Python `session_manager.py:3265` | KEEP（已知差異；2026-11-12 第 7 點） | Ledger L185；`crates/sw-core/src/session_manager.rs:7148-7191`，與 Python 單鎖原子候選標記不同 | P8 | no |
+| NC-P8-04 | handoff thaw 撤銷只對先前 `probes.live` 快照逐一解除；快照後登記的 PROBE fence 可能保留 frozen 旗標 | Python `session_manager.py` 的同鎖凍結／撤銷 | KEEP（已知差異；2026-11-12 第 7 點） | Ledger L346；`crates/sw-core/src/session_manager.rs:7750-7754,7781-7790` | P8 | no |
+| NC-P8-05 | RELEASED attach 開埠成功、unreleased 落盤未完成時，Rust 公開 state 仍是 RELEASED，第二次 `device.attach` 回 `SESSION_RECOVERING`；Python 已切 ATTACHING 並回 ok＋session | Python `session_manager.py:3592-3599` | KEEP（已知差異；2026-11-12 第 7 點） | Ledger L357／P8-140c92e-2；屬既有 commit 協定窗口，回 ok＋RELEASED 會更偏離 Python | P8 | no |
+| NC-P8-06 | handoff 永久凍結期間丟棄 `UartRxChunk`，不更新 RX 時間戳、boot quiet 或 background capture | Python `session_manager.py:4622-4670` | KEEP（已知差異；2026-11-12 第 7 點） | Ledger L365／P8X-9e51abd-1；只能在不超過 3 秒的排空窗口以唯讀 RPC 觀察 | P8 | no |
+| NC-P8-07 | `mirror_termios_from` 任一方向讀到 B0 時視為未設定，走 fallback；不把 B0 寫入實體 UART | arch §4.2 | KEEP（已知差異；2026-11-12 第 7 點） | `docs/rust-refactor/plans/rust-architecture.md:489-490`；Rust POSIX 測試 `crates/sw-pal/tests/flash_pty.rs:88-99` | P8 | no |
+| NC-P8-08 | `mirror_termios_from` 的 Python fallback 只捕獲 `OSError`；`termios.error` 若非 `OSError` 會向外拋出，無 fallback 時不送 ACK 並離開 FLASHING | Python `uart_io.py:2341-2376` | Python 基線缺陷（N2；比照 OD-77）；Rust 保留 fallback，不改 frozen test | 2026-11-13 `rulings/s2.md` N2 明定不對齊此錯誤路徑；不代表該 Python 失敗行為成為 Rust 契約 | P8 | RESOLVED（N2） |
+
 ## 8. P7 登記：上游補件（producer Phase 缺口，於消費 Phase 補上）
 
 由 `08-slice23-login-events.md` Task 0 前置核對（`scripts/rust/check_p7_prereqs.py`）回報 MISSING、經擁有者指派於 P7 分支補上的上游符號。補件只新增 producer 公開 API，語意以 Python 基線 golden 鎖定；不改既有 producer 行為、不登記 `contracts/behavior_changes.yaml`（非行為變更）。

@@ -477,9 +477,11 @@ else
   record py_parity_76_80 --required-set s21_gate:py_parity_76_80 --reason "l1_required.lock.json 無 s21_gate:py_parity_76_80.linux selector"
 fi
 
-# 11. 全套 pytest（s21_gate:pytest_full＋s21_gate:py_parity）
-pytest_l1 pytest_full pytest_full -- -q tests/
-record pytest_full --required-set s21_gate:pytest_full --command "SW_RESOURCE_REPORT=… python3 -m pytest -q tests/" \
+# 11. 全套 pytest（N3；依 2026-11-12 rulings/s2.md 第 3 點，比照 CI 排除兩項 Stage 1 證據測試）
+pytest_l1 pytest_full pytest_full -- -q tests/ \
+  --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native \
+  --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence
+record pytest_full --required-set s21_gate:pytest_full --command "SW_RESOURCE_REPORT=… python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence" \
   --exit "$LAST_RC" --log logs/pytest_full.log --l1-results pytest_full/l1-results.json
 
 # 11b. 承接率：case_verdicts.json 由 Task 20／21 的逐案證據（l15_ab 兩邊、移出 l15_ab 者的承擔測試、func-test）彙整，

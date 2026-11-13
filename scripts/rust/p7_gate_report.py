@@ -56,7 +56,7 @@ REQUIRED_ROWS: tuple[str, ...] = (
     "func-test ev-01-spawn-handler",
     "regen_lock --check",
     "cases.lock slice_2.3 coverage",
-    "python3 -m pytest -q tests/",
+    "python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
     "policy_check",
 )
 TEST_ROWS: frozenset[str] = frozenset({
@@ -70,8 +70,12 @@ TEST_ROWS: frozenset[str] = frozenset({
     "contract_blackbox slice22 B",
     "l15 slice21 B",
     "l15 slice23 B",
-    "python3 -m pytest -q tests/",
+    "python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
 })
+FULL_PYTEST_N3_ROW = (
+    "python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native "
+    "--deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence"
+)
 # 能力缺失 → BLOCKED-OWNER 的對應（列名 → (cap, B 編號)）。
 CAP_ROWS: Mapping[str, tuple[str, str]] = {
     "win-test.sh (non-COM)": ("windows_native", "B-06"),
@@ -113,6 +117,8 @@ def slug(name: str) -> str:
 
 def expected_set(name: str) -> str:
     """列名對應的必要集合固定為 `p7_gate:<slug>`，不得以其他集合替代（審查 P7-c5f0fc9-1）。"""
+    if name == FULL_PYTEST_N3_ROW:
+        return "p7_gate:python3-m-pytest-q-tests"
     return f"p7_gate:{slug(name)}"
 
 

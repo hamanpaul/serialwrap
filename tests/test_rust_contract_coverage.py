@@ -405,6 +405,10 @@ def test_t9_and_known_low_are_present_in_gate_report():
     assert "f7-binary-roundtrip-md5" in report
     assert "Windows 全部契約 ID" in report
     assert "rpc_method:service.status" in report and "BLOCKED-OWNER" in report
+    assert "T6 SPEC-GAP 4" in report
+    assert "cargo:sw-core::file_transfer_session::non_ready_states_rejected_with_session_zero_tx" in report
+    assert "crates/sw-core/tests/file_transfer_session.rs:451-470" in report
+    assert "crates/sw-core/src/session_core/file_xfer.rs:104-125" in report
 
 
 def test_t9_recorded_outcome_is_written_to_pending_column():

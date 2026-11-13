@@ -45,6 +45,7 @@ TEST_SECTIONS = {
     "blackbox_python": ("linux", "s21_gate:blackbox_python"),
     "blackbox_rust": ("linux", "s21_gate:blackbox_rust"),
     "existing_suites_rust": ("linux", "s21_gate:existing_suites_rust"),
+    # N3：gate argv 與 CI 同步排除兩項 Stage 1 證據測試；鎖 selector 遷移受 regen_lock 限制，列為 SPEC-GAP。
     "pytest_full": ("linux", "s21_gate:pytest_full"),
     # P5 第 6 輪 SPEC-GAP #2（編排者裁決）：OD-55 linux 能力集合各一個 section（以 --caps <cap> 實跑，須附能力探測）
     "linux_cap_sys_admin": ("linux", "s21_gate:cap_sys_admin"),

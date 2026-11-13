@@ -30,6 +30,15 @@ pub use service_rig::*;
 
 /// 以 `cargo test` 建置的 daemon 執行檔（`--features test-fakes` 下含測試專用 method）。
 pub const DAEMON_BIN: &str = env!("CARGO_BIN_EXE_serialwrapd");
+
+/// 實際啟動的 daemon 執行檔：有 `SW_TEST_SERIALWRAPD` 就用它，否則用 `DAEMON_BIN`（同 `launcher.rs::daemon_binary`）。
+/// WSL 交叉建置時 `CARGO_BIN_EXE_serialwrapd` 是 Linux 路徑，Windows 端找不到；`win-runner.sh` 會把 daemon 複製到
+/// staging 並以此變數告知 Windows 路徑。
+pub fn daemon_binary() -> PathBuf {
+    std::env::var_os("SW_TEST_SERIALWRAPD")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DAEMON_BIN))
+}
 pub const PING: &str = r#"{"id":1,"method":"health.ping"}"#;
 pub const STOP: &str = r#"{"id":2,"method":"daemon.stop"}"#;
 pub const SHORT: Duration = Duration::from_secs(10);
@@ -375,7 +384,7 @@ impl DaemonProc {
         let n = SEQ.fetch_add(1, Ordering::SeqCst);
         let stderr_path = env.root.join(format!("daemon-{n}.stderr"));
         let file = File::create(&stderr_path).expect("建立 stderr 檔");
-        let child = Command::new(DAEMON_BIN)
+        let child = Command::new(daemon_binary())
             .args(args)
             .envs(vars)
             .stdin(Stdio::null())

@@ -98,7 +98,9 @@ def test_required_rows_complete():
     assert set(g.REQUIRED_ROWS) >= {"check_cfg_boundary", "cargo test --workspace", "win-test.sh (non-COM)", "win-test.sh --caps windows_com",
         "contract_blackbox p7 A", "contract_blackbox p7 B", *g.OD59_ROWS, "contract_blackbox slice21 B", "contract_blackbox slice22 B",
         "l15 slice21 B", "l15 slice23 B", "func-test brcm-01-login-flow", "func-test ev-01-spawn-handler",
-        "regen_lock --check", "cases.lock slice_2.3 coverage", "python3 -m pytest -q tests/", "policy_check"}
+        "regen_lock --check", "cases.lock slice_2.3 coverage",
+        "python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
+        "policy_check"}
 
 
 def test_missing_required_row_is_incomplete(tmp_path):
@@ -283,22 +285,38 @@ def test_verify_requires_cli_and_daemon_artifacts(tmp_path):
 
 
 def test_full_pytest_row_needs_whole_frozen_set(tmp_path):
-    """審查 P7-f9e90a9-1：`python3 -m pytest -q tests/` 列的凍結集合須為完整 `-q tests/` 收集（扣除 Linux 平台 skip），
-    只提供 49 列 passed 的報告不得 PASS；完整集合全 passed 才 PASS。"""
+    """N3：舊鎖 selector 完整集合維持原判定；新 deselect argv 在 selector 遷移前不得 PASS。"""
     lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
     frozen = lock["sets"]["p7_gate:python3-m-pytest-q-tests"]["linux"]["nodeids"]
     assert len(frozen) > 5000, len(frozen)
     assert "tests/test_p7_gate_win_argv.py::test_gate_snapshots_artifacts_before_cargo_rebuilds" in frozen
-    name, sid = "python3 -m pytest -q tests/", "p7_gate:python3-m-pytest-q-tests"
+    name = "python3 -m pytest -q tests/"
+    sid = "p7_gate:python3-m-pytest-q-tests"
     judge = g._load_judge()
     for subset, want in ((frozen[:49], "INCOMPLETE"), (frozen, "PASS")):
         row = _l1_row(tmp_path, [(n, "passed") for n in subset], name=name, sid=sid, tag=f"n{len(subset)}")
         rep_path = tmp_path / row["l1_results"]
         rep = json.loads(rep_path.read_text(encoding="utf-8"))
-        rep.update(runner="pytest", argv=["pytest/__main__.py", "-q", "tests/"])
+        rep.update(runner="pytest", argv=["pytest/__main__.py", *lock["sets"][sid]["linux"]["selector"]["argv"]])
         rep_path.write_text(json.dumps(rep), encoding="utf-8")
         status, detail = g._test_row_status(tmp_path, row, lock, judge)
         assert status == want, (len(subset), status, detail)
+
+    deselect_name = (
+        "python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native "
+        "--deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence"
+    )
+    row = _l1_row(tmp_path, [(n, "passed") for n in frozen], name=deselect_name, sid=sid, tag="n3-selector-mismatch")
+    rep_path = tmp_path / row["l1_results"]
+    rep = json.loads(rep_path.read_text(encoding="utf-8"))
+    rep.update(runner="pytest", argv=[
+        "pytest/__main__.py", "-q", "tests/",
+        "--deselect", "tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native",
+        "--deselect", "tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
+    ])
+    rep_path.write_text(json.dumps(rep), encoding="utf-8")
+    status, detail = g._test_row_status(tmp_path, row, lock, judge)
+    assert status == "INCOMPLETE" and "selector mismatch" in detail, (status, detail)
 
 
 def test_report_records_tool_versions(tmp_path):

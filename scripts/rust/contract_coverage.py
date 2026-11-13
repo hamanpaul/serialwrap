@@ -1680,6 +1680,17 @@ def render_gate_report(report: Mapping[str, Any], cases: Sequence[Mapping[str, A
 
     lines.extend([
         "",
+        "## T6 SPEC-GAP 4：FLASHING／RECOVERING 下的 file.* 閘門",
+        "",
+        "- 結案依據：依 2026-11-12 擁有者裁決第 9 點，以 Rust L1 節點及 Python／Rust 程式路徑對照登記。",
+        "- Rust L1 nodeid：`cargo:sw-core::file_transfer_session::non_ready_states_rejected_with_session_zero_tx`（`crates/sw-core/tests/file_transfer_session.rs:451-470`；逐案測試同時覆蓋 file.push、file.pull、RECOVERING、FLASHING 與零 TX）。",
+        "- Rust 閘門：`crates/sw-core/src/session_core/file_xfer.rs:104-125`，`file_transfer_admit` 在進入 OpRunner 前依狀態拒絕傳輸。",
+        "- Python 對照：`origin/main:sw_core/service.py:1451-1466,1489-1501` 將兩個 RPC 送入 `SessionManager.file_push`／`file_pull`；`origin/main:sw_core/session_manager.py:8312-8323,8415-8424` 在非 READY 與 recovering 狀態拒絕。",
+        "- 狀態：**以 Rust L1＋程式對照結案**；本列不宣稱已取得 Python 對跑或 Windows 原生證據。",
+    ])
+
+    lines.extend([
+        "",
         "## 待裁決",
         "",
         "| 項目 | 裁決狀態 | 結果記錄 | 說明 |",
