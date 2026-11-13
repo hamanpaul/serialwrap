@@ -75,6 +75,72 @@ def _self_test(p7) -> dict:
     return j
 
 
+def test_huge_timeout_self_test_and_recover_match_python(p7, tmp_path):
+    """RPC `timeout_s=1e300` 在 READY self-test／recover 與 ATTACHED recover 都按 Python 回應並保留後續操作。"""
+    tgt = _ready_bootloader_target(p7, tmp_path)
+
+    rc, self_test = p7.cli(
+        "session", "self-test", "--selector", "COM0", "--probe-timeout", "1e300", timeout_s=15.0
+    )
+    assert rc == 0 and self_test and self_test.get("ok") is True, (rc, self_test)
+    assert self_test["classification"] == "OK", self_test
+    assert self_test["session"]["state"] == "READY", self_test
+    self_test_shape = set(self_test)
+
+    # READY recover 走 OpRunner rescue-key wait，明確覆蓋 RPC timeout 的超大值。
+    rc, recovered_ready = p7.cli(
+        "session", "recover", "--selector", "COM0", "--timeout", "1e300", timeout_s=15.0
+    )
+    assert rc == 0 and recovered_ready and recovered_ready.get("ok") is True, (rc, recovered_ready)
+    assert recovered_ready["error_code"] == "PROMPT_TIMEOUT_RECOVERED", recovered_ready
+    assert recovered_ready["partial"] is True, recovered_ready
+    assert recovered_ready["recovery_action"] == "CTRL_C", recovered_ready
+    ready_recover_shape = {"id", "error_code", "ok", "partial", "recovery_action", "stdout", "version"}
+    if "code_fingerprint" in self_test:
+        ready_recover_shape.add("code_fingerprint")
+    assert set(recovered_ready) == ready_recover_shape, recovered_ready
+    normal_ready = _self_test(p7)
+    assert set(normal_ready) == self_test_shape, (self_test_shape, normal_ready)
+    assert normal_ready["classification"] == "OK", normal_ready
+
+    # 以獨立的無 boot quiet ATTACHED session 測 recover：profile 與 RPC timeout 都是 1e300，先讓宣告的
+    # env_file 缺席而停在 CREDENTIALS_UNRESOLVED，再補上帳密；FakeTarget 已在 shell 狀態，會立即回應 probe。
+    from bb_p7 import P7Rig
+
+    recover_rig = P7Rig(tmp_path / "p7-recover")
+    recover_target = FakeTarget(tmp_path / "recover-target", login_steps=[])
+    try:
+        recover_rig.start("shell_unresolved", [recover_target], timeout_s=1e300)
+        attached = wait_state(recover_rig.env, "COM0", "ATTACHED", timeout_s=30.0)
+        deadline = time.monotonic() + 15.0
+        while attached.get("last_error") != "CREDENTIALS_UNRESOLVED":
+            assert time.monotonic() < deadline, attached
+            time.sleep(0.1)
+            attached = _row(recover_rig)
+        (recover_rig.tmp / "p7.env.unresolved").write_text(
+            "SW_P7_USER=root\nSW_P7_PASS=pw\n", encoding="utf-8"
+        )
+
+        rc, recovered = recover_rig.cli(
+            "session", "recover", "--selector", "COM0", "--timeout", "1e300", timeout_s=15.0
+        )
+        assert rc == 0 and recovered and recovered.get("ok") is True, (rc, recovered)
+        assert recovered["action"] == "REPROBE", recovered
+        assert recovered["recovered"] is True, recovered
+        assert recovered["session"]["state"] == "READY", recovered
+        recover_shape = {"id", "ok", "recovering", "action", "recovered", "session", "version"}
+        if "code_fingerprint" in self_test:
+            recover_shape.add("code_fingerprint")
+        assert set(recovered) == recover_shape, recovered
+
+        normal = _self_test(recover_rig)
+        assert set(normal) == self_test_shape, (self_test_shape, normal)
+        assert normal["classification"] == "OK", normal
+        assert normal["session"]["state"] == "READY", normal
+    finally:
+        recover_rig.stop()
+
+
 def test_device_attach_during_reboot_recovery_already_attached(p7, tmp_path):
     """Python `attach_device` 在 reboot recovery 有 bridge 時冪等回 already_attached；不得重開埠或送 TX。"""
     tgt = FakeTarget(

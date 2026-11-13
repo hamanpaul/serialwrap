@@ -13,6 +13,8 @@ use sw_core::human_console::ConsoleTransportKind;
 use sw_core::login_fsm::LoginOutcome;
 use sw_core::mailbox::ControlEvent;
 use sw_core::op_runner::{OpOutcome, OpSpec};
+use sw_core::quiet_gate::QuietState;
+use sw_core::reprobe::{target_still_valid, ReprobeState, ValidInput};
 use sw_core::session_core::*;
 use sw_core::tx_writer::{FenceReject, TxClass};
 use sw_pal::traits::{Clock, TxOutcome};
@@ -73,6 +75,21 @@ fn attached(profile: &str) -> CoreHarness {
     let mut h = CoreHarness::new(profile);
     h.to_attached(None);
     h
+}
+
+fn human_reprobe_harness() -> CoreHarness {
+    let mut h = attached(BOOT);
+    h.clock.advance(Duration::from_millis(100));
+    h.rx(b"recent target output");
+    h.attach_pty_console("c1", true);
+    h.input("c1", b"x");
+    assert_eq!(h.core.active_lease().map(|lease| lease.owner.as_str()), Some("human:c1"));
+    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:c1"));
+    h
+}
+
+fn has_start_login(effects: &[Effect]) -> bool {
+    effects.iter().any(|effect| matches!(effect, Effect::StartLogin { .. }))
 }
 
 /// 送 RPC，取出同批的 StartOp grant（若有）。
@@ -909,6 +926,88 @@ fn lease_context_shapes_in_core() {
         r#"{"interactive_owner":"human:c1","human_attached":true,"human_active":true,"recovery_mode":false}"#
     );
     let _ = pydict! {};
+}
+
+/// S2-GP-gpx ITEM 5：Python `_human_active_locked` 五條件同時成立時 suppress reprobe；59 s 仍擋、61 s 放行。
+/// Python `origin/main:sw_core/session_manager.py:2141-2156`；target 重驗對照同檔 `:2331-2340`。
+#[test]
+fn human_active_blocks_reprobe() {
+    let mut h = human_reprobe_harness();
+    let human_tx_mark = h.tx_effect_count();
+    let before_59 = h.advance_s(59.0);
+    assert!(!has_start_login(&before_59), "human 輸入 59 s 後仍不得 StartLogin");
+    assert_eq!(h.tx_effect_count(), human_tx_mark, "59 s 內不得送 probe TX");
+
+    let after_61 = h.advance_s(2.0);
+    assert!(has_start_login(&after_61), "human 輸入超過 60 s 才允許 probe");
+
+    // target_still_valid 寫入前亦須沿用 human_active；這是最後一道 probe 有效性檢查。
+    let profile = profile_of(BOOT);
+    let valid = ValidInput {
+        same_bridge: true,
+        by_id: &profile.device_by_id,
+        released: false,
+        device_present: true,
+        state: "ATTACHED",
+        last_error: Some("PROMPT_UNAVAILABLE"),
+        human_active: true,
+        rx_tail_512: "recent target output",
+        profile: &profile,
+    };
+    assert!(
+        !target_still_valid(&ReprobeState::default(), &mut QuietState::default(), &valid, 61_000_000_000),
+        "target_still_valid 亦不得放行 human active probe"
+    );
+    let inactive_valid = ValidInput { human_active: false, ..valid };
+    assert!(
+        target_still_valid(
+            &ReprobeState::default(),
+            &mut QuietState::default(),
+            &inactive_valid,
+            61_000_000_000,
+        ),
+        "target_still_valid 在其他條件相同且 human inactive 時應放行"
+    );
+
+    // Peer 消失即不 active，即使 raw input 尚在 60 s 視窗。
+    let mut peer_gone = human_reprobe_harness();
+    let first = peer_gone.advance_s(3.0);
+    assert!(!has_start_login(&first), "peer 在線且 human active 時先 suppress");
+    peer_gone
+        .core
+        .human_console_mut()
+        .peer_present
+        .insert("c1".into(), false);
+    let no_peer = peer_gone.advance_s(1.0);
+    assert!(has_start_login(&no_peer), "peer 不在線時須允許 probe");
+
+    // lease 仍屬 human，但 bridge 的 raw owner 不同時不算 human_active。
+    let mut owner_mismatch = human_reprobe_harness();
+    let first = owner_mismatch.advance_s(3.0);
+    assert!(!has_start_login(&first), "owner 相符時先 suppress");
+    owner_mismatch
+        .core
+        .human_console_mut()
+        .ownership
+        .interactive_owner = Some("agent:other".into());
+    let mismatch = owner_mismatch.advance_s(1.0);
+    assert!(has_start_login(&mismatch), "raw owner 不同於 human lease 時須 probe");
+
+    // active lease 屬 agent，但 human raw input timestamp 仍在視窗內。
+    let mut nonhuman_lease = ready();
+    nonhuman_lease.attach_pty_console("c1", true);
+    let opened = nonhuman_lease
+        .rpc(open_req("agent", 180.0, "", false))
+        .expect("soft-preempt human lease with agent lease");
+    assert_eq!(opened.get("ok"), Some(&true.into()), "{opened:?}");
+    assert_eq!(opened.get("soft_preempted"), Some(&true.into()), "{opened:?}");
+    assert_eq!(nonhuman_lease.core.active_lease().map(|lease| lease.owner.as_str()), Some("agent"));
+    nonhuman_lease.core.human_console_mut().ownership.last_human_input_at =
+        Some(nonhuman_lease.clock.mono_ns());
+    nonhuman_lease.force_state(SessionState::Attached);
+    nonhuman_lease.core.set_last_error_for_test(Some("PROMPT_UNAVAILABLE"), None);
+    let inactive = nonhuman_lease.advance_s(1.0);
+    assert!(has_start_login(&inactive), "lease owner 非 human 時須 probe，即使 human 剛輸入過");
 }
 
 // ---------------------------------------------------------------- console_detach／console_list（`session_manager.py:6775-6804`）

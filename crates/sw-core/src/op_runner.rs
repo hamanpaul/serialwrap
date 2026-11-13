@@ -581,7 +581,7 @@ fn compile_or_never(pattern: &str) -> PyRegex {
 }
 
 fn secs(value: f64) -> Duration {
-    Duration::from_secs_f64(value.max(0.0))
+    Duration::try_from_secs_f64(value.max(0.0)).unwrap_or(Duration::MAX)
 }
 
 /// `wait_for_regex_from(pattern, offset, timeout)`（期限依注入 Clock）。

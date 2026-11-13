@@ -4811,6 +4811,118 @@ fn wp56_advance_secs(r: &ServiceRig, secs: u64) {
     r.settle();
 }
 
+/// S2-GP-gpx ITEM 5：console_attach 後的 raw human 輸入在 reboot grace 結束時仍禁止 nonce reprobe。
+/// 呼叫路徑：`Service::rpc(session.console_attach)` → human lease／raw owner；FakeConsole raw bytes → UART；
+/// FakeClock Tick → `SessionCore::reprobe_tick` → `reprobe::prepare`／`target_still_valid` → FakeDevice。
+#[test]
+fn gpx_rpc_reprobe_skipped_while_human_types() {
+    let r = ServiceRig::with_console_backend("pty");
+    let dev = r.device(REAL_A);
+    dev.on_tx_reply(b"reboot\n", b"reboot\r\nroot@t:/# ");
+    let reboot = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"reboot","timeout_s":10}"#,
+    );
+    assert_eq!(reboot.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&reboot));
+    let cmd_id = s(&reboot, "cmd_id").to_string();
+    assert_eq!(s(&wp55_wait_done(&r, &cmd_id), "status"), "done");
+    r.settle();
+    assert_eq!(
+        r.session("COM0").unwrap().get("ready_reconfirm_pending"),
+        Some(&PyValue::Bool(true)),
+        "reboot prompt 只清 quiet，保留 reconfirm pending"
+    );
+
+    let attached = r.call("session.console_attach", r#"{"selector":"COM0"}"#);
+    assert_eq!(attached.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&attached));
+    let vtty = s(&attached, "vtty");
+    let (_, io) = r
+        .console
+        .as_ref()
+        .unwrap()
+        .created()
+        .into_iter()
+        .find(|(path, _)| path == vtty)
+        .expect("console_attach 建立的 FakeConsoleRef");
+
+    let tx_mark = dev.tx_len();
+    io.push_input(b"x");
+    wait_until("human raw input 寫入 UART", || dev.tx_len() > tx_mark);
+    wp56_advance_secs(&r, 50);
+    let tx_mark = dev.tx_len();
+    io.push_input(b"y");
+    wait_until("human 活躍視窗刷新到 UART", || dev.tx_len() > tx_mark);
+
+    let after_human_input = dev.tx_len();
+    let writes = dev.write_calls();
+    wp56_advance_secs(&r, 11); // 跨過 60 s reboot grace；human 最近輸入仍僅 11 s 前。
+    assert_eq!(dev.write_calls(), writes, "human_active 期間不得執行 probe TX");
+    assert!(dev.tx_since(after_human_input).is_empty(), "等待期間 FakeDevice 不得收到 nonce probe");
+    assert_eq!(
+        r.session("COM0").unwrap().get("ready_reconfirm_pending"),
+        Some(&PyValue::Bool(true)),
+        "無 probe 就不得確認 READY"
+    );
+}
+
+/// S2-GP-gpx ITEM 5：`timeout_s=1e300` 的 READY self-test 後 side lane 仍能在期限內完成一般呼叫。
+/// Python `service.py:1090-1099` 直通 `session_manager.py:7926-7934` 的回應形狀另由黑箱固定。
+#[test]
+fn gpx_rpc_self_test_huge_timeout_keeps_side_lane() {
+    let r = ServiceRig::ready_shell();
+    r.svc.set_long_route_timeout_for_test(Duration::from_secs(3));
+
+    let started = Instant::now();
+    let huge = r.call_raw("session.self_test", r#"{"selector":"COM0","timeout_s":1e300}"#);
+    let huge_elapsed = started.elapsed();
+    let started = Instant::now();
+    let normal = r.call_raw("session.self_test", r#"{"selector":"COM0"}"#);
+    assert!(huge_elapsed < Duration::from_secs(3), "huge self-test route timeout：{huge_elapsed:?}");
+    assert!(started.elapsed() < Duration::from_secs(3), "後續 self-test route timeout");
+    assert!(huge.is_ok(), "huge timeout self-test 必須完成：{}", huge.as_ref().err().map(|e| e.message.as_str()).unwrap_or(""));
+    assert!(normal.is_ok(), "huge timeout 後一般 self-test side lane 仍可用：{}", normal.as_ref().err().map(|e| e.message.as_str()).unwrap_or(""));
+    let huge = huge.unwrap();
+    let normal = normal.unwrap();
+    assert_eq!(keys(&huge), vec![
+        "ok", "classification", "session", "attached_real_path", "current_real_path", "attached_vtty",
+        "bridge_generation", "probe_ok", "recommended_action", "interactive_owner", "human_attached",
+        "human_active", "recovery_mode", "command_capable", "version",
+    ], "Python self-test response shape：{}", j(&huge));
+    assert_eq!(huge.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&huge));
+    assert_eq!(s(&huge, "classification"), "OK", "{}", j(&huge));
+
+    assert_eq!(keys(&normal), keys(&huge), "{}", j(&normal));
+    assert_eq!(s(&normal, "classification"), "OK", "{}", j(&normal));
+}
+
+/// S2-GP-gpx ITEM 5：READY `session.recover` 的超大 timeout 回 Python 形狀，後續一般 self-test 仍可回應。
+#[test]
+fn gpx_rpc_recover_huge_timeout_keeps_side_lane() {
+    let r = ServiceRig::ready_shell();
+    r.svc.set_long_route_timeout_for_test(Duration::from_secs(3));
+    let dev = r.device(REAL_A);
+    dev.on_tx_reply(b"\x03", b"\r\nroot@t:/# ");
+
+    let started = Instant::now();
+    let recovered = r.call_raw("session.recover", r#"{"selector":"COM0","timeout_s":1e300}"#);
+    let recovered_elapsed = started.elapsed();
+    let started = Instant::now();
+    let normal = r.call_raw("session.self_test", r#"{"selector":"COM0"}"#);
+    assert!(recovered_elapsed < Duration::from_secs(3), "recover 回應逾時：{recovered_elapsed:?}");
+    assert!(started.elapsed() < Duration::from_secs(3), "recover 後 self-test route timeout");
+    assert!(recovered.is_ok(), "huge timeout recover 必須完成：{}", recovered.as_ref().err().map(|e| e.message.as_str()).unwrap_or(""));
+    assert!(normal.is_ok(), "huge timeout recover 後一般 self-test 仍可回應：{}", normal.as_ref().err().map(|e| e.message.as_str()).unwrap_or(""));
+    let recovered = recovered.unwrap();
+    let normal = normal.unwrap();
+    assert_eq!(
+        j(&recovered),
+        format!(r#"{{"ok":true,"error_code":"PROMPT_TIMEOUT_RECOVERED","stdout":"","partial":true,"recovery_action":"CTRL_C","version":"{}"}}"#, r.version),
+        "Python READY recover response shape"
+    );
+
+    assert_eq!(s(&normal, "classification"), "OK", "{}", j(&normal));
+}
+
 /// 對照 `tests/test_async_reboot_evidence.py` 的 `TestStaleShellNonceBeforeBanner`、`TestGraceExpiryDoesNotDeadlock`
 /// 與 `TestSubmitTimeGateDuringWait`：RPC 提交 `reboot`，假 DUT 立即重印 prompt（非同步 reboot）→ `command.get` 正常
 /// 完成、session `boot_evidence_wait_remaining_s=60.0`；舊 shell 持續能應答 `\n` 與 nonce，但 10 s 內 UART 零 TX；

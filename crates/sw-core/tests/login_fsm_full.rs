@@ -122,6 +122,23 @@ fn unlock_k() -> SessionAuth {
     }
 }
 
+/// S2-GP-gpx ITEM 5：大於 `Duration` 範圍的 profile timeout 仍能由 Login FSM 接受即時 prompt／nonce。
+#[test]
+fn gpx_login_fsm_huge_profile_timeout_saturates_duration() {
+    let mut profile = prpl();
+    profile.template.timeout_s = 1e300;
+    let rig = LoginRig::new()
+        .on_eq("", "\r\nroot@prplOS:~# ")
+        .on_prefix("echo __READY__", "__READY__deadbeef\r\nroot@prplOS:~# ")
+        .build();
+
+    assert_eq!(probe_ready(&rig.io(), &profile), LoginOutcome::Ready);
+    assert_eq!(
+        rig.sent_payloads(),
+        [b"\n".to_vec(), b"echo __READY__deadbeef\n".to_vec()]
+    );
+}
+
 fn outcome(code: &str, probe: bool) -> LoginOutcome {
     if probe {
         LoginOutcome::NotReady(code.into())

@@ -935,6 +935,40 @@ fn result_tail_fallback_from_registry() {
     assert_eq!(r["error_code"], PyValue::from("CMD_NOT_FOUND"));
 }
 
+/// S2-GP-gpx ITEM 5：expect_reboot 與命令猜中 reboot 皆不建 background capture／id，result_tail 走 registry fallback。
+/// Python `origin/main:sw_core/session_manager.py:6840-6880`；擁有者裁決 `origin/docs/parity-amendments:docs/rust-refactor/reviews/rulings/s2.md`（2026-11-12，第 1 點第 4 小點）。
+#[test]
+fn gpx_background_reboot_command_creates_no_capture() {
+    for (command, expect_reboot) in [("sync && reboot", true), ("reboot", false)] {
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.to_ready();
+        let mut req = agent_submit(command);
+        req.mode = "background".into();
+        req.expect_reboot = expect_reboot;
+        let response = h.rpc(SessionRequest::Submit(req)).unwrap();
+        let id = response["cmd_id"].as_str().expect("cmd_id").to_string();
+
+        assert!(
+            h.core.background_cmd_ids_for_test().is_empty(),
+            "reboot 分流不建立 background_cmd_ids（command={command}, expect_reboot={expect_reboot})"
+        );
+        let tail = h
+            .rpc(SessionRequest::ResultTail {
+                cmd_id: id.clone(),
+                from_chunk: 3,
+                limit: 20,
+            })
+            .unwrap();
+        assert_eq!(
+            h.wire(&tail),
+            format!(
+                r#"{{"ok":true,"cmd_id":"{id}","status":"running","error_code":null,"from_seq":0,"last_seq":0,"from_chunk":3,"next_chunk":3,"chunks":[]}}"#
+            ),
+            "Python pre-capture fallback（command={command}, expect_reboot={expect_reboot})"
+        );
+    }
+}
+
 #[test]
 fn result_tail_negative_limit_exception() {
     let mut cap = BackgroundCapture::new("c".into(), "s".into(), 1, 0, 2.0, "t".into(), 0, 1);

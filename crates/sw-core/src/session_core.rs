@@ -10,7 +10,7 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 use sw_pal::traits::{DevicePath, PalError, SerialConfig, SysEnv};
 use sw_proto::config_types::SessionProfile;
-use sw_proto::constants::PASSTHROUGH_READY_QUIET_S;
+use sw_proto::constants::{HUMAN_ACTIVE_WINDOW_S, PASSTHROUGH_READY_QUIET_S};
 use sw_proto::pycompat::{PyErr, clean_text, py_round, strftime_local, uuid4_dashed, uuid4_hex};
 use sw_proto::pydict;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
@@ -6139,9 +6139,23 @@ impl SessionCore {
         let probe_busy = self.login_run.is_some() || self.foreground.is_some();
         let state = self.state.as_str();
         let last_error = self.last_error.clone();
-        // human_active：Python `_human_active_locked`（human lease＋外部 peer＋60 s 內有輸入）；human lease 由 P6
-        // console 建立（07 T7 `lease_context` 骨架），P6 合入前不可能成立。
-        let human_active = false;
+        // Python `_human_active_locked`（`session_manager.py:2141-2156`）：bridge、human lease、外部 peer、
+        // interactive owner 相符、且最近輸入在 60 s 視窗內，五項須同時成立。`lease_context` 的輸出不變。
+        let human_active_window_ns = (HUMAN_ACTIVE_WINDOW_S * 1_000_000_000.0) as u64;
+        let human_active = self.generations.conn_epoch.is_some()
+            && self.lease.as_ref().is_some_and(|lease| {
+                lease.is_human()
+                    && lease.human_client_id().is_some_and(|client_id| {
+                        self.human_peer_present(client_id)
+                            && self.human.ownership.interactive_owner.as_deref()
+                                == Some(lease.owner.as_str())
+                    })
+            })
+            && self
+                .human
+                .ownership
+                .last_human_input_at
+                .is_some_and(|last| now.saturating_sub(last) <= human_active_window_ns);
         let input = crate::reprobe::ReprobeInput {
             state,
             by_id: &self.profile.device_by_id,
@@ -6967,7 +6981,7 @@ impl SessionCore {
         }
     }
 
-    /// `_lease_context`：4 個 LeaseContext 鍵（Slice 2.1 無 human 鍵入追蹤，`human_active` 恆 false）。
+    /// `_lease_context`：固定保留 4 個 LeaseContext 鍵（02 §6.2）；reprobe 對 peer／owner 的額外判定不改輸出形狀。
     fn lease_ctx(&self) -> Vec<(&'static str, PyValue)> {
         // P6 Task 7：`_lease_context`（human_active 依最近 raw 鍵入，#53）。
         let ctx = self.lease_context_now(self.now_cache);
@@ -7409,16 +7423,18 @@ impl SessionCore {
                 });
                 return effects;
             }
-            if mode == "background" {
-                self.create_background_capture(&command.cmd_id, now);
-                self.background_cmd_ids.push(command.cmd_id.clone());
-            }
             // G3（Python `session_manager.py:6840-6868`）：與 `OpRunner::run_command` 相同的 reboot 判定——
             // `expect_reboot` 不看命令文字、不排除 passthrough；命令文字猜法只對非 passthrough 生效。此值一致流入
             // 送出前的 deferred 失效、`PendingOp::Command.reboot`（完成後只清 quiet）、`foreground_reboot`
             // （TX 結算 arm）與 TxWriter 的 `reboot_arm_op`（Python `_handle_reboot_command` 不分旗標或猜中）。
             let reboot = command.req.expect_reboot
                 || (!self.is_passthrough() && is_reboot_command(&command.req.command));
+            // Python `session_manager.py:6840-6880`：reboot 分支不建立 BackgroundCapture，也不加入 background_cmd_ids；
+            // result_tail 由 command registry 的 pre-capture fallback 回應（s2.md 2026-11-12 裁決第 1 點第 4 小點）。
+            if mode == "background" && !reboot {
+                self.create_background_capture(&command.cmd_id, now);
+                self.background_cmd_ids.push(command.cmd_id.clone());
+            }
             // WP6-1：保存請求的可信標記與來源快照，結算時逾時／reboot 升格與 lease owner 依此判定（OD-74）。
             self.command_fg_begin_req(&command.req, false);
             self.fg_cmd_timeout_s = command.req.timeout_s;

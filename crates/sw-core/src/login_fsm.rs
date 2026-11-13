@@ -407,7 +407,7 @@ fn declared(value: &Option<String>) -> bool {
 
 fn secs(s: f64) -> Duration {
     if s.is_finite() && s > 0.0 {
-        Duration::from_secs_f64(s)
+        Duration::try_from_secs_f64(s).unwrap_or(Duration::MAX)
     } else {
         Duration::ZERO
     }

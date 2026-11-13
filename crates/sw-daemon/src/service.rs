@@ -172,6 +172,9 @@ pub struct Service {
     /// 測試用（test-fakes）：拉長 TX fence 等待，穩定安排重探結果與失敗交接的交錯。
     #[cfg(feature = "test-fakes")]
     handoff_tx_fence_timeout_override: Mutex<Option<Duration>>,
+    /// 測試用（test-fakes）：縮短 self-test／recover RPC 等待上限，避免 side lane panic 回歸測試掛 600 秒。
+    #[cfg(feature = "test-fakes")]
+    long_route_timeout_override: Mutex<Option<Duration>>,
 }
 
 /// P8 Task 10：`mcu.status` 的 flash 真值來源（Python `_flash_endpoint.is_flashing()`、`_flash_active_com`、
@@ -388,6 +391,8 @@ impl Service {
             handoff: Mutex::new(BTreeSet::new()),
             #[cfg(feature = "test-fakes")]
             handoff_tx_fence_timeout_override: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            long_route_timeout_override: Mutex::new(None),
         }
     }
 
@@ -395,6 +400,27 @@ impl Service {
     #[cfg(feature = "test-fakes")]
     pub fn set_handoff_tx_fence_timeout_for_test(&self, timeout: Duration) {
         *lock(&self.handoff_tx_fence_timeout_override) = Some(timeout);
+    }
+
+    /// 只供測試（test-fakes）：覆寫 `session.self_test`／`session.recover` 的 RPC 等待上限。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_long_route_timeout_for_test(&self, timeout: Duration) {
+        *self
+            .long_route_timeout_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(timeout);
+    }
+
+    fn long_route_timeout(&self) -> Duration {
+        #[cfg(feature = "test-fakes")]
+        if let Some(timeout) = *self
+            .long_route_timeout_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            return timeout;
+        }
+        LONG_ROUTE_TIMEOUT
     }
 
     /// P8 Task 14：共同 admission 邊界（flash 端點的 sync-probe 與 RPC 分派共用同一個 gate）。
@@ -908,7 +934,7 @@ impl Service {
                             timeout_s,
                             strict_human_lock,
                         },
-                        LONG_ROUTE_TIMEOUT,
+                        self.long_route_timeout(),
                     ),
                     // `_self_test_impl` 查無分支：附 `_lease_context(None)`，外層再補 `command_capable: False`。
                     None => Ok(pydict! {
@@ -930,7 +956,11 @@ impl Service {
                 if selector.is_empty() {
                     return Ok(invalid_args());
                 }
-                self.route(&selector, SessionRequest::Recover { timeout_s, force }, LONG_ROUTE_TIMEOUT)
+                self.route(
+                    &selector,
+                    SessionRequest::Recover { timeout_s, force },
+                    self.long_route_timeout(),
+                )
             }
             "session.clear" => {
                 let selector = selector_chain(&p);

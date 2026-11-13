@@ -24,7 +24,7 @@ PROFILE_DIR = Path(__file__).resolve().parent / "p7_profiles"
 SOCKET_ENV = "SW_P7_SOCKET"
 # 只代換大寫佔位（`${BY_ID}`、`${ENV_FILE}`…）；`${nonce}` 屬 ready_probe 語法，原樣保留。
 _PLACEHOLDER = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
-_TIMEOUT_RE = re.compile(r"(?m)^([ \t]*timeout_s:[ \t]*)\d+(?:\.\d+)?")
+_TIMEOUT_RE = re.compile(r"(?m)^([ \t]*timeout_s:[ \t]*)\d+(?:\.\d+)?(?:[eE][+-]?\d+)?")
 
 
 def p7_profile_dir(tmp: Path, name: str, timeout_s: int | float | None = None, **subst: str) -> Path:

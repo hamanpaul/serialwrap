@@ -3,6 +3,7 @@
 - test_interactive_line_cmd_defined 屬 Slice 2.2 lock，於 2.1 作提前證據，不計入 2.1 分母。
 """
 import re
+import time
 
 import pytest
 
@@ -43,6 +44,48 @@ def test_background_result_tail_consistent(shell_daemon):
     found = re.findall(r"(?m)^M(\d+)\r?$", full)
     for i in range(1, 51):
         assert found.count(str(i)) == 1, f"M{i} 應恰出現 1 次，實際 {found.count(str(i))} 次"
+
+
+def test_background_reboot_result_tail_matches_python(shell_daemon):
+    """背景 reboot 不建立 capture；執行中 result_tail 回 pre-capture fallback。"""
+    target = shell_daemon.targets["COM0"]
+    target.freeze_rx()
+    try:
+        submitted = shell_daemon.sw(
+            "cmd", "submit", "--selector", "COM0", "--cmd", "reboot", "--mode", "background"
+        )
+        assert submitted["_rc"] == 0 and submitted.get("ok") is True, submitted
+        cmd_id = submitted["cmd_id"]
+
+        deadline = time.monotonic() + 5.0
+        command = None
+        while time.monotonic() < deadline:
+            status = shell_daemon.sw("cmd", "status", "--cmd-id", cmd_id)
+            command = status.get("command")
+            if isinstance(command, dict) and command.get("started_at") is not None:
+                break
+            time.sleep(0.02)
+        assert isinstance(command, dict) and command.get("status") == "running", command
+
+        page = shell_daemon.sw(
+            "cmd", "result-tail", "--cmd-id", cmd_id, "--from-chunk", "3", "--limit", "20"
+        )
+        assert page["_rc"] == 0 and page.get("ok") is True, page
+        assert {k: page[k] for k in (
+            "cmd_id", "status", "error_code", "from_seq", "last_seq", "from_chunk", "next_chunk", "chunks"
+        )} == {
+            "cmd_id": cmd_id,
+            "status": "running",
+            "error_code": None,
+            "from_seq": 0,
+            "last_seq": 0,
+            "from_chunk": 3,
+            "next_chunk": 3,
+            "chunks": [],
+        }, page
+    finally:
+        target.thaw_rx()
+    shell_daemon.wait_command_done(cmd_id, timeout=10.0)
 
 
 def test_interactive_line_cmd_defined(shell_daemon):
