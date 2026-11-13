@@ -50,11 +50,12 @@ def _require_cargo() -> None:
 
 
 class _LazyBundle:
-    """模組內共用的 dev bundle（`sentinel=True` 時為 `--delegate-sentinel` 扁平佈局）；第一次 `out()` 時以 mkbundle.sh 建立。"""
+    """模組內共用的 dev bundle；可選 Stage 2 或 `--delegate-sentinel` 扁平佈局。"""
 
-    def __init__(self, root: Path, *, sentinel: bool = False) -> None:
+    def __init__(self, root: Path, *, sentinel: bool = False, stage: str | None = None) -> None:
         self._root = root
         self._sentinel = sentinel
+        self._stage = stage
         self._out: Path | None = None
 
     def out(self) -> Path:
@@ -62,6 +63,8 @@ class _LazyBundle:
         if self._out is None:
             out = self._root / ("sentinel bundle" if self._sentinel else "dev bundle")
             args = [str(MKBUNDLE), "--dev"]
+            if self._stage is not None:
+                args += ["--stage", self._stage]
             if self._sentinel:
                 args.append("--delegate-sentinel")
             args += ["--out", str(out)]
@@ -88,6 +91,11 @@ def bundle(tmp_path_factory) -> _LazyBundle:
 @pytest.fixture(scope="module")
 def sentinel_bundle(tmp_path_factory) -> _LazyBundle:
     return _LazyBundle(tmp_path_factory.mktemp("mkbundle-sentinel", numbered=False), sentinel=True)
+
+
+@pytest.fixture(scope="module")
+def stage2_bundle(tmp_path_factory) -> _LazyBundle:
+    return _LazyBundle(tmp_path_factory.mktemp("mkbundle-stage2", numbered=False), stage="2")
 
 
 def _sha256(path: Path) -> str:
@@ -382,6 +390,8 @@ def test_python_cli_delegate_entry_and_runtime_version(bundle):
 def test_daemon_block_fields_nonempty_and_dev_bundle_shape(bundle):
     out = bundle.out()
     d = _manifest(out)["components"]["daemon"]
+    assert d["implementation"] == "python", "預設 Stage 1 dev bundle 必須維持 Python daemon"
+    assert d["entry"] == ["py/bin/python3", "-I", "-B", "py/serialwrapd.py"]
     assert d["git_revision"]
     assert d["launcher"]["sha256"] and d["runtime"]["sha256"] and d["package"]["tree_sha256"]
     # dev bundle 的 Rust launcher 指向版本目錄內的 serialwrapd，且不含 wheel。
@@ -417,6 +427,25 @@ def test_manifest_top_level_and_pairing(bundle):
     assert m["stage"] == "1A"
     assert m["bundle_version"] == VERSION
     assert m["pairing"] == {"rule": "exact", "cli_version": VERSION, "daemon_version": VERSION}
+
+
+def test_stage2_dev_bundle_manifest_selects_rust_daemon(stage2_bundle):
+    """Stage 2 bundle 必須宣告 Rust daemon，且保持凍結 manifest schema 與 state 相容識別。"""
+    import jsonschema
+
+    out = stage2_bundle.out()
+    manifest = _manifest(out)
+    daemon = manifest["components"]["daemon"]
+    assert manifest["stage"] == "rust-2-dev"
+    assert daemon["implementation"] == "rust"
+    assert daemon["state_schema"] == "python-state-v0"
+    assert daemon["entry"] == ["bin/serialwrapd"]
+    launcher = out / "versions" / VERSION / "bin" / "serialwrapd"
+    assert daemon["launcher"]["path"] == "bin/serialwrapd"
+    assert daemon["launcher"]["sha256"] == _sha256(launcher)
+    schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
+    errors = list(jsonschema.validators.validator_for(schema)(schema).iter_errors(manifest))
+    assert not errors, "; ".join(f"{list(error.absolute_path)}: {error.message}" for error in errors)
 
 
 def test_doctor_via_bundle_reports_version_pairing(bundle, tmp_path):

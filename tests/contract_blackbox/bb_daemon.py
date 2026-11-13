@@ -13,7 +13,7 @@ import socket
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from bb_harness import daemon_prefix
 
@@ -129,6 +129,21 @@ def _proc_diag(pid: int) -> list[dict[str, str]]:
     return rows
 
 
+def _proc_active(pid: int) -> bool:
+    """判斷 process 是否仍活躍；Z／X 視為結束，讀取權限不足時保守視為活躍。"""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        state = stat[stat.rindex(")") + 2 :].split(" ", 1)[0]
+    except (ValueError, IndexError):
+        return True
+    return state not in {"Z", "X"}
+
+
 def _stoplog(record: dict[str, Any]) -> None:
     """`$SW_AB_STOPLOG` 有設定時，以 NDJSON 附加一筆 stop 紀錄（各階段耗時與結果）。"""
     path = os.environ.get("SW_AB_STOPLOG")
@@ -142,11 +157,22 @@ def _stoplog(record: dict[str, Any]) -> None:
 
 
 class PyDaemon:
-    def __init__(self, env: Mapping[str, str], *, profile_dir: Path, socket: str, lock: Path) -> None:
+    def __init__(
+        self,
+        env: Mapping[str, str],
+        *,
+        profile_dir: Path,
+        socket: str,
+        lock: Path,
+        daemon_command: Sequence[str] | None = None,
+        handoff_only_stop: bool = False,
+    ) -> None:
         self.env = dict(env)
         self.profile_dir = Path(profile_dir)
         self.socket = socket
         self.lock = Path(lock)
+        self.daemon_command = list(daemon_command) if daemon_command is not None else None
+        self.handoff_only_stop = handoff_only_stop
         self.workdir = self.lock.parent
         self.proc: subprocess.Popen | None = None
         self._pids: list[int] = []
@@ -155,7 +181,7 @@ class PyDaemon:
         self.workdir.mkdir(parents=True, exist_ok=True)
         stderr_path = self.workdir / "daemon.stderr"
         with open(stderr_path, "ab") as stderr_file:
-            cmd = daemon_prefix() + [
+            cmd = list(self.daemon_command or daemon_prefix()) + [
                 "--profile-dir",
                 str(self.profile_dir),
                 "--socket",
@@ -197,7 +223,7 @@ class PyDaemon:
             time.sleep(0.1)
 
         if not ready:
-            self.stop()
+            self.stop(handoff_only=self.handoff_only_stop)
             raise TimeoutError(f"Daemon failed to respond to health.ping within {timeout_s}s")
 
         self._pids = _collect_pids(self.proc.pid)
@@ -213,8 +239,11 @@ class PyDaemon:
             with open(pidlog, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, separators=(",", ":")) + "\n")
 
-    def stop(self, timeout_s: float = 5.0) -> None:
+    def stop(self, timeout_s: float = 5.0, *, handoff_only: bool = False) -> None:
         if self.proc is None:
+            return
+        if handoff_only:
+            self._stop_via_handoff(timeout_s)
             return
         proc = self.proc
         pid = proc.pid
@@ -322,6 +351,59 @@ class PyDaemon:
                     pass
                 raise RuntimeError(f"Daemon socket {sock_path} 於 stop 後仍未消失")
 
+        self.proc = None
+
+    def _stop_via_handoff(self, timeout_s: float) -> None:
+        """只經 `daemon.handoff_stop` 停 daemon；失敗時不降級 daemon.stop、signal 或手動刪 socket。"""
+        proc = self.proc
+        if proc is None:
+            return
+        status = _send_rpc(self.socket, "health.status", {}, timeout_s=1.0)
+        if status and status.get("ok") is True:
+            pid = status.get("pid")
+            if not isinstance(pid, int) or pid <= 0:
+                raise RuntimeError(f"handoff-only stop 收到無效 health.status：{status!r}")
+            stopped = _send_rpc(self.socket, "daemon.handoff_stop", {"reason": "test_cleanup"}, timeout_s=3.0)
+            if not stopped or stopped.get("ok") is not True or stopped.get("stopping") is not True:
+                raise RuntimeError(f"handoff-only stop 被拒絕：{stopped!r}")
+        else:
+            if proc.poll() is None:
+                raise RuntimeError("health.status 不可達但原 daemon 仍活躍；拒絕改走 daemon.stop")
+            pid = proc.pid
+
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if pid == proc.pid:
+                if proc.poll() is not None:
+                    break
+            elif not _proc_active(pid):
+                break
+            time.sleep(0.02)
+        if pid == proc.pid:
+            if proc.poll() is None:
+                raise RuntimeError(f"handoff_stop 後 daemon pid={pid} 仍活躍")
+        elif _proc_active(pid):
+            raise RuntimeError(f"handoff_stop 後 daemon pid={pid} 仍活躍")
+        if pid != proc.pid:
+            if proc.poll() is None and _proc_active(proc.pid):
+                raise RuntimeError(f"Current daemon pid={proc.pid} 在 Previous daemon handoff 後仍活躍")
+            proc.poll()  # 回收已由 setup --rollback 的 handoff_stop 結束的 Current 子行程。
+
+        if os.name == "posix":
+            alive_children = [child for child in self._pids if child != proc.pid and _proc_active(child)]
+            if alive_children:
+                raise RuntimeError(f"handoff_stop 後 daemon 子行程仍活躍：{alive_children}")
+
+        sock_path: Path | None = None
+        if self.socket.startswith("unix://"):
+            sock_path = Path(self.socket[7:])
+        elif "://" not in self.socket:
+            sock_path = Path(self.socket)
+        if sock_path is not None:
+            while sock_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            if sock_path.exists():
+                raise RuntimeError(f"handoff_stop 後 daemon socket 仍存在：{sock_path}")
         self.proc = None
 
     @property

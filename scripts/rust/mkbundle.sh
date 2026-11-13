@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# 建立 Stage 1A bundle：開發 bundle 可含測試鉤子；正式候選 bundle 不含故障注入 feature，且自帶 PyYAML。
+# 建立 Stage 1A／Stage 2 bundle：開發 bundle 可含測試鉤子；正式候選 bundle 不含故障注入 feature，且自帶 PyYAML。
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
 用法：
-  scripts/rust/mkbundle.sh --dev --out <目錄> [--target <triple>] [--profile debug|release] [--version-override <版本>] [--with-com0com <signed zip>] [--with-com0com-fixture <fixture zip>] [--print-dir]
+  scripts/rust/mkbundle.sh --dev --out <目錄> [--stage 1|2] [--target <triple>] [--profile debug|release] [--version-override <版本>] [--with-com0com <signed zip>] [--with-com0com-fixture <fixture zip>] [--print-dir]
   scripts/rust/mkbundle.sh --dev --delegate-sentinel --out <目錄> [其他選項]
   scripts/rust/mkbundle.sh --release-bundle --profile release --out <目錄> [其他選項]
 
 選項：
   --dev                    建立開發 bundle（目前唯一支援的 bundle 類型）
+  --stage <1|2>            選擇 daemon 階段；預設 1（Stage 1A），Stage 2 僅支援 dev bundle
   --release-bundle         建立正式候選 bundle，不編入 sw-cli/test-fakes，並將 PyYAML 納入隔離 runtime
                            須使用乾淨 Git 工作樹（含未追蹤檔案），否則 exit 3；--dev 允許開發中來源
   --delegate-sentinel      組成與 dev bundle 相同（扁平佈局於 --out 根目錄），僅將委派入口改為 P4 測試 sentinel
@@ -29,6 +30,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 DEV=0
 RELEASE_BUNDLE=0
 SENTINEL=0
+STAGE=1
 PROFILE=debug
 TARGET=""
 OUT="$REPO_ROOT/target/mkbundle-dev"
@@ -42,6 +44,14 @@ while [[ $# -gt 0 ]]; do
     --dev) DEV=1; shift ;;
     --release-bundle) RELEASE_BUNDLE=1; shift ;;
     --delegate-sentinel) SENTINEL=1; shift ;;
+    --stage)
+      if [[ $# -lt 2 ]]; then
+        echo "mkbundle.sh: --stage 缺少階段參數" >&2
+        exit 2
+      fi
+      STAGE="$2"
+      shift 2
+      ;;
     --print-dir) shift ;;
     --out)
       if [[ $# -lt 2 ]]; then
@@ -106,6 +116,18 @@ if [[ "$DEV" -eq 0 && "$RELEASE_BUNDLE" -eq 0 ]]; then
 fi
 if [[ "$SENTINEL" -eq 1 && "$DEV" -ne 1 ]]; then
   echo "mkbundle.sh: --delegate-sentinel 僅支援 --dev" >&2
+  exit 2
+fi
+if [[ "$STAGE" != 1 && "$STAGE" != 2 ]]; then
+  echo "mkbundle.sh: --stage 僅支援 1 或 2" >&2
+  exit 2
+fi
+if [[ "$STAGE" == 2 && "$DEV" -ne 1 ]]; then
+  echo "mkbundle.sh: Stage 2 目前僅支援 --dev bundle" >&2
+  exit 2
+fi
+if [[ "$STAGE" == 2 && "$SENTINEL" -eq 1 ]]; then
+  echo "mkbundle.sh: --stage 2 不支援 --delegate-sentinel" >&2
   exit 2
 fi
 if [[ "$PROFILE" != debug && "$PROFILE" != release ]]; then
@@ -504,7 +526,7 @@ PY
     "$CLI_NAME" "$CLI_SHA" "$PACKAGE_TREE_SHA" "$PYTHON_VERSION" "$LAUNCHER_SHA" \
     "$RUNTIME_SHA" "$SKILL_SHA" "$SKILL_WINDOWS_SHA" "$PROFILE_TREE_SHA" "$SUPERVISOR_SHA" \
     "$TASK_XML_TEMPLATE_SHA" "$COM0COM_SHA" "$HELPER_MANIFEST_PATH" "${COM0COM_HELPER_SHA:-}" "$SENTINEL_ENTRY" \
-    "$CODE_FINGERPRINT" <<'PY'
+    "$CODE_FINGERPRINT" "$STAGE" <<'PY'
 import datetime
 import json
 import sys
@@ -531,12 +553,13 @@ import sys
     com0com_helper_sha,
     sentinel_entry,
     code_fingerprint,
-) = sys.argv[1:22]
+    stage,
+) = sys.argv[1:23]
 python_entry = ["py/bin/python3", "-I", "-B", "-m", "sw_core.cli"]
 manifest = {
     "schema_version": 1,
     "bundle_version": version,
-    "stage": "1A",
+    "stage": "rust-2-dev" if stage == "2" else "1A",
     "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     "target": target,
     "git_revision": revision,
@@ -591,6 +614,11 @@ manifest = {
         "daemon_version": version,
     },
 }
+if stage == "2":
+    # 凍結的 Stage 1 manifest schema 仍要求 entry/runtime/package；保留結構相容欄位，
+    # 但 implementation=rust 讓 serialwrapd 直接進 Rust daemon，不使用 Python daemon entry。
+    manifest["components"]["daemon"]["implementation"] = "rust"
+    manifest["components"]["daemon"]["entry"] = ["bin/serialwrapd"]
 if com0com_sha:
     manifest["components"]["com0com"] = {
         "optional": True,

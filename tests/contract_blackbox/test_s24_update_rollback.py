@@ -40,6 +40,7 @@ from pathlib import Path
 import pytest
 
 from bb_l15 import bundle_manifest_path, resume_pause, update_bundles, wait_pause
+from bb_harness import ab_label
 from p8_fixtures import FakeFlasher, HolderSampler
 
 pytestmark = [pytest.mark.posix_only]
@@ -76,8 +77,16 @@ class Installed:
     `previous=False`：Current＝0.4.0，供 0.4.1 bundle 的 `setup`（更新路徑）。
     """
 
-    def __init__(self, tmp_path: Path, sw_env, *, previous: bool) -> None:
-        old, new = update_bundles()
+    def __init__(
+        self,
+        tmp_path: Path,
+        sw_env,
+        *,
+        previous: bool,
+        bundle_pair: tuple[Path, Path] | None = None,
+        scope_update_to_test_daemon: bool = False,
+    ) -> None:
+        old, new = bundle_pair or update_bundles()
         self.root = tmp_path / "install-root"
         versions = self.root / "versions"
         versions.mkdir(parents=True)
@@ -107,6 +116,11 @@ class Installed:
         self.env = sw_env.isolated_env()
         self.env["SERIALWRAP_INSTALL_ROOT"] = str(self.root)
         self.env["SERIALWRAP_RELEASE_MANIFEST"] = str(bundle_manifest_path(new, NEW))
+        if scope_update_to_test_daemon:
+            # P8 fixture 為縮短 Unix socket 路徑，把 endpoint 放在 run_dir 外；測試範圍檢查要求
+            # SERIALWRAP_TEST_UPDATE_SOCKET 必須位於隔離 run dir，故此 CLI 副本以 socket 父目錄作 run dir。
+            self.env["SERIALWRAP_RUN_DIR"] = str(Path(sw_env.endpoint).parent)
+            self.env["SERIALWRAP_TEST_UPDATE_SOCKET"] = sw_env.endpoint
         config_dir = Path(self.env["SERIALWRAP_CONFIG_DIR"])
         config_dir.mkdir(parents=True, exist_ok=True)
         config = config_dir / "config.yaml"
@@ -132,6 +146,94 @@ class Installed:
 
     def assert_unchanged(self) -> None:
         assert self.current_file.read_bytes() == self.current_bytes, "current-release.json 不得改變"
+
+
+@pytest.fixture(scope="module")
+def cross_stage_bundles(tmp_path_factory) -> tuple[Path, Path]:
+    """建出 Current Rust Stage 2 與 Previous Python Stage 1A 的實際 release bundle。"""
+    repo = Path(__file__).resolve().parents[2]
+    root = tmp_path_factory.mktemp("s24-cross-stage-bundles")
+    env = dict(os.environ)
+    env["CARGO_TARGET_DIR"] = str(repo / "target")
+    bundles: list[Path] = []
+    for version, stage in ((OLD, None), (NEW, "2")):
+        out = root / f"bundle-{version}"
+        command = [
+            "bash",
+            str(repo / "scripts" / "rust" / "mkbundle.sh"),
+            "--dev",
+            "--version-override",
+            version,
+        ]
+        if stage is not None:
+            command += ["--stage", stage]
+        command += ["--out", str(out)]
+        result = subprocess.run(
+            command,
+            cwd=repo,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=900,
+            check=False,
+        )
+        assert result.returncode == 0, (
+            f"建置跨階段 bundle {version} 失敗（rc={result.returncode}）："
+            f"\n{result.stdout}\n{result.stderr}"
+        )
+        manifest = json.loads(bundle_manifest_path(out, version).read_text(encoding="utf-8"))
+        expected = "python" if stage is None else "rust"
+        assert manifest["components"]["daemon"]["implementation"] == expected, manifest
+        bundles.append(out)
+    return bundles[0], bundles[1]
+
+
+def _start_cross_stage_current(sw_env, shell_target, bundle_pair: tuple[Path, Path]) -> int:
+    """Rust B 輪以 Stage 2 release binary 起 daemon；Python A 輪沿用基線入口。"""
+    _old, new = bundle_pair
+    sw_env.require_handoff_stop()
+    if ab_label().startswith("rust"):
+        sw_env.daemon_exe = [str(new / "versions" / NEW / "bin" / "serialwrapd")]
+    sw_env.start(targets={"COM0": shell_target})
+    sw_env.wait_state("COM0", "READY", timeout=20)
+    pid = sw_env.daemon_pid
+    assert pid is not None
+    if ab_label().startswith("rust"):
+        expected = os.path.realpath(sw_env.daemon_exe[0])
+        actual = os.path.realpath(f"/proc/{pid}/exe")
+        assert actual == expected, f"Current 應由 Rust Stage 2 daemon 持有：{actual} != {expected}"
+    return pid
+
+
+def _proc_active(pid: int) -> bool:
+    """判定 pid 是否仍在執行；Z／X 不算活躍，讀取權限不足時保守視為活躍。"""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        state = stat[stat.rindex(")") + 2 :].split(" ", 1)[0]
+    except (ValueError, IndexError):
+        return True
+    return state not in {"Z", "X"}
+
+
+def _python_daemon_cmdline(pid: int) -> list[str]:
+    raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    return [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
+
+
+def _assert_previous_python_daemon(pid: int, install_root: Path) -> None:
+    expected_entry = str(install_root / "versions" / OLD / "py" / "serialwrapd.py")
+    argv = _python_daemon_cmdline(pid)
+    assert expected_entry in argv, f"Previous Python daemon argv 未指向 {expected_entry}：{argv}"
+
+
+def _stop_cross_stage_daemon_via_handoff(sw_env, timeout_s: float = 15.0) -> None:
+    """以 SC-23 handoff_stop 清理目前 endpoint 的 daemon，不發 daemon.stop 或 signal。"""
+    sw_env.stop_via_handoff(timeout_s=timeout_s)
 
 
 def _assert_refused(r, data, code: str, *, force: bool, key: str, what: str) -> None:
@@ -162,6 +264,138 @@ def _assert_daemon_untouched(sw_env, pid: int, what: str) -> None:
 def _assert_single_holder(sampler: HolderSampler, pid: int, what: str) -> None:
     assert sampler.max_concurrent() <= 1, f"{what}：UART 不得同時被兩個行程持有：{sampler.samples()[-5:]}"
     assert sampler.holders_seen() <= {pid}, f"{what}：只有受測 daemon 持有 UART：{sampler.holders_seen()}"
+
+
+@pytest.mark.posix_pty
+@pytest.mark.process_rpc
+def test_rollback_cross_stage_state_compat_released(
+    sw_env, shell_target, tmp_path: Path, cross_stage_bundles: tuple[Path, Path]
+) -> None:
+    """Current Stage 2 daemon release 後回滾至 Previous Python；同一 state.json 保留 RELEASED 再 attach。"""
+    old_bundle, _new_bundle = cross_stage_bundles
+    current_pid = _start_cross_stage_current(sw_env, shell_target, cross_stage_bundles)
+    try:
+        released = sw_env.rpc(
+            "device.release",
+            {"selector": "COM0", "source": "agent:gpx-i7", "reason": "cross-stage-rollback"},
+        )
+        assert released.get("ok") is True, released
+        assert sw_env.session("COM0").get("state") == "RELEASED"
+        state_path = sw_env.state_dir / "state.json"
+        assert state_path.is_file(), f"release 後應持久化 state.json：{state_path}"
+
+        inst = Installed(
+            tmp_path,
+            sw_env,
+            previous=True,
+            bundle_pair=cross_stage_bundles,
+            scope_update_to_test_daemon=True,
+        )
+        result, data = inst.setup("--rollback", timeout_s=300.0)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert data is not None, result.stdout
+        current = json.loads(inst.current_file.read_text(encoding="utf-8"))
+        assert current.get("bundle_version") == OLD, current
+
+        sw_env.wait_until(
+            lambda: (status := sw_env.rpc("health.status", {}, timeout_s=0.5)).get("ok") is True
+            and status.get("pid") != current_pid,
+            timeout=30,
+        )
+        previous_pid = sw_env.rpc("health.status", {}, timeout_s=1.0)["pid"]
+        _assert_previous_python_daemon(previous_pid, inst.root)
+        assert state_path.is_file(), "回滾後 Previous Python daemon 必須讀取同一 state.json 路徑"
+        assert sw_env.session("COM0").get("state") == "RELEASED"
+
+        attached = sw_env.rpc("device.attach", {"selector": "COM0"})
+        assert attached.get("ok") is True, attached
+        sw_env.wait_state("COM0", "READY", timeout=20)
+    finally:
+        _stop_cross_stage_daemon_via_handoff(sw_env)
+
+
+@pytest.mark.posix_pty
+@pytest.mark.process_rpc
+def test_rollback_cross_stage_ready_never_double_held(
+    sw_env, shell_target, tmp_path: Path, cross_stage_bundles: tuple[Path, Path]
+) -> None:
+    """Current Stage 2 daemon READY 回滾至 Previous Python；以完整取樣驗證停舊後才起新且 UART 不雙持有。"""
+    old_bundle, _new_bundle = cross_stage_bundles
+    current_pid = _start_cross_stage_current(sw_env, shell_target, cross_stage_bundles)
+    original = sw_env._daemon
+    assert original is not None and original.proc is not None
+    original_proc = original.proc
+    inst = Installed(
+        tmp_path,
+        sw_env,
+        previous=True,
+        bundle_pair=cross_stage_bundles,
+        scope_update_to_test_daemon=True,
+    )
+    setup_result: dict[str, object] = {}
+
+    def rollback() -> None:
+        try:
+            setup_result["result"], setup_result["data"] = inst.setup("--rollback", timeout_s=300.0)
+        except BaseException as error:  # noqa: BLE001 — 傳回主執行緒再判定
+            setup_result["error"] = error
+
+    runner = threading.Thread(target=rollback, name="cross-stage-rollback")
+    old_gone_at: float | None = None
+    new_seen_at: float | None = None
+    previous_pid: int | None = None
+    try:
+        with HolderSampler(shell_target.slave_path, 0.01, exclude=(os.getpid(),)) as sampler:
+            runner.start()
+            deadline = time.monotonic() + 330.0
+            while runner.is_alive() and time.monotonic() < deadline:
+                if original_proc.poll() is not None and old_gone_at is None:
+                    old_gone_at = time.monotonic()
+                try:
+                    status = sw_env.rpc("health.status", {}, timeout_s=0.1)
+                except (OSError, ValueError, TimeoutError):
+                    status = {}
+                observed_pid = status.get("pid") if status.get("ok") is True else None
+                if isinstance(observed_pid, int) and observed_pid != current_pid and new_seen_at is None:
+                    new_seen_at = time.monotonic()
+                    previous_pid = observed_pid
+                    assert old_gone_at is not None, (
+                        f"Previous daemon pid={previous_pid} 在 Current pid={current_pid} 消失前已出現"
+                    )
+                    assert old_gone_at <= new_seen_at, (old_gone_at, new_seen_at)
+                time.sleep(0.01)
+            runner.join(timeout=2.0)
+            assert not runner.is_alive(), "setup --rollback 未在期限內結束"
+            assert "error" not in setup_result, repr(setup_result.get("error"))
+            result = setup_result.get("result")
+            data = setup_result.get("data")
+            assert result is not None and result.returncode == 0, (
+                getattr(result, "stdout", "") + getattr(result, "stderr", "")
+            )
+            assert data is not None, getattr(result, "stdout", "")
+            if old_gone_at is None and original_proc.poll() is not None:
+                old_gone_at = time.monotonic()
+            assert old_gone_at is not None, f"Current daemon pid={current_pid} 未觀察到退出"
+            if previous_pid is None:
+                status = sw_env.rpc("health.status", {}, timeout_s=1.0)
+                previous_pid = status.get("pid")
+                new_seen_at = time.monotonic()
+            assert isinstance(previous_pid, int) and previous_pid != current_pid
+            assert new_seen_at is not None and old_gone_at <= new_seen_at, (old_gone_at, new_seen_at)
+            assert not _proc_active(current_pid), f"Current daemon pid={current_pid} 仍活躍"
+            _assert_previous_python_daemon(previous_pid, inst.root)
+            assert json.loads(inst.current_file.read_text(encoding="utf-8")).get("bundle_version") == OLD
+            sw_env.wait_state("COM0", "READY", timeout=20)
+            assert sampler.max_concurrent() <= 1, (
+                "跨階段交接期間 UART 不得雙持有：" + repr(sampler.samples()[-10:])
+            )
+            assert sampler.holders_seen() <= {current_pid, previous_pid}, sampler.holders_seen()
+            assert current_pid in sampler.holders_seen(), sampler.samples()[:5]
+            assert previous_pid in sampler.holders_seen(), sampler.samples()[-5:]
+    finally:
+        if runner.is_alive():
+            runner.join(timeout=310.0)
+        _stop_cross_stage_daemon_via_handoff(sw_env)
 
 
 # ---------------------------------------------------------------------------
@@ -203,9 +437,22 @@ class HeldPush:
         assert self.remote.read_bytes() == self.data, f"{what}：DUT 端檔案 md5 正確（外部 oracle）"
 
 
-def _rollback_while_push(sw_env, shell_target, tmp_path, *, force: bool, timing: str) -> None:
+def _rollback_while_push(
+    sw_env,
+    shell_target,
+    tmp_path,
+    *,
+    force: bool,
+    timing: str,
+    scope_update_to_test_daemon: bool = False,
+) -> None:
     pid = _ready(sw_env, shell_target)
-    inst = Installed(tmp_path, sw_env, previous=True)
+    inst = Installed(
+        tmp_path,
+        sw_env,
+        previous=True,
+        scope_update_to_test_daemon=scope_update_to_test_daemon,
+    )
     args = ["--rollback"] + (["--force"] if force else [])
     what = f"rollback force={force} timing={timing}"
     with HolderSampler(shell_target.slave_path, 0.01, exclude=(os.getpid(),)) as sampler:
@@ -245,7 +492,14 @@ def _rollback_while_push(sw_env, shell_target, tmp_path, *, force: bool, timing:
 @pytest.mark.process_rpc
 @pytest.mark.parametrize("timing", ["before_probe", "after_probe"])
 def test_rollback_refuses_while_push(sw_env, shell_target, tmp_path, timing):
-    _rollback_while_push(sw_env, shell_target, tmp_path, force=False, timing=timing)
+    _rollback_while_push(
+        sw_env,
+        shell_target,
+        tmp_path,
+        force=False,
+        timing=timing,
+        scope_update_to_test_daemon=timing == "after_probe",
+    )
 
 
 @pytest.mark.posix_pty
@@ -257,7 +511,14 @@ def test_rollback_refuses_while_push(sw_env, shell_target, tmp_path, timing):
 ])
 def test_rollback_force_refuses_while_push(sw_env, shell_target, tmp_path, entry, timing):
     if entry == "rollback":
-        _rollback_while_push(sw_env, shell_target, tmp_path, force=True, timing=timing)
+        _rollback_while_push(
+            sw_env,
+            shell_target,
+            tmp_path,
+            force=True,
+            timing=timing,
+            scope_update_to_test_daemon=timing == "after_probe",
+        )
         return
     # `setup --force`（0.4.1 bundle 更新 Current 0.4.0）：同一 safety_check，--force 只記 force_ignored。
     pid = _ready(sw_env, shell_target)

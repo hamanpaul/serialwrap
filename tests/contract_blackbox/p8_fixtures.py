@@ -215,6 +215,7 @@ class SwEnv:
         self._links: dict[str, str] = {}        # by-id 名稱 → slave 實體路徑（unplug／replug 用）
         self._prepared = False
         self._closed = False
+        self._handoff_only_stop = False
         _LIVE_ENVS.add(self)
 
     # ---------------------------------------------------------------- 環境與設定
@@ -257,15 +258,32 @@ class SwEnv:
             raise RuntimeError("daemon 已在執行")
         if not self._prepared:
             raise RuntimeError("尚未 prepare（profile／by-id 未寫入）")
-        d = PyDaemon(self._env, profile_dir=self.profile_dir, socket=self.endpoint, lock=self.lock)
+        d = PyDaemon(
+            self._env,
+            profile_dir=self.profile_dir,
+            socket=self.endpoint,
+            lock=self.lock,
+            daemon_command=self.daemon_exe,
+            handoff_only_stop=self._handoff_only_stop,
+        )
         d.start(timeout_s=timeout_s)
         self._daemon = d
 
     def stop(self, timeout_s: float = 5.0) -> None:
-        """`daemon.stop`；PyDaemon 確認主行程、子行程與 socket 皆消失（任一殘留即 raise）。冪等。"""
-        d, self._daemon = self._daemon, None
+        """依環境停止模式收尾；一般使用 daemon.stop，跨階段案例可強制只用 handoff_stop。"""
+        d = self._daemon
         if d is not None:
-            d.stop(timeout_s=timeout_s)
+            d.stop(timeout_s=timeout_s, handoff_only=self._handoff_only_stop)
+            self._daemon = None
+
+    def require_handoff_stop(self) -> None:
+        """此環境的 daemon 只能透過 daemon.handoff_stop 停止；清理不得降級成 signal。"""
+        self._handoff_only_stop = True
+
+    def stop_via_handoff(self, timeout_s: float = 15.0) -> None:
+        """透過 daemon.handoff_stop 停止目前 endpoint 的 daemon，包含 rollback 後替換的行程。"""
+        self.require_handoff_stop()
+        self.stop(timeout_s=timeout_s)
 
     def restart(self) -> None:
         self.stop()
@@ -289,7 +307,7 @@ class SwEnv:
         try:
             self.stop()
         finally:
-            if self._sock_root is not None:
+            if self._sock_root is not None and (not self._handoff_only_stop or self._daemon is None):
                 shutil.rmtree(self._sock_root, ignore_errors=True)
 
     # ---------------------------------------------------------------- CLI／RPC
