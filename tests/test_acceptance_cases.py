@@ -323,6 +323,28 @@ def test_windows_gap_has_reason():
 
 
 @pytest.mark.memory_only
+@pytest.mark.parametrize("case_id", ["p1-con-busy", "p1-con-softpreempt"])
+def test_p1_console_lease_cases_record_od85_windows_gap(case_id):
+    cases = {c["case_id"]: c for c in _load_cases().get("cases", [])}
+    case = cases[case_id]
+    reason = case.get("windows_gap_reason")
+    assert case["windows_status"] == "gap"
+    assert isinstance(reason, str) and "OD-85" in reason and "rulings/s2.md" in reason
+
+
+@pytest.mark.memory_only
+def test_p7_login_case_contract_matches_od86():
+    cases = {c["case_id"]: c for c in _load_cases().get("cases", [])}
+    case = cases["p7-invariants-login-bytes-not-interleaved-with-agent-or-human"]
+    assert case["title"] == "§11.3-2：login 窗口禁止 agent TX；human bytes 照 Python 可送並留 WAL"
+    assert case["contract"] == (
+        "08 Task 18：以 WAL seq／mono 檢查 username/login 至 nonce probe 後 READY；窗口內不得有 agent TX。"
+        "human bytes 依 Python 可在登入期間送出，且須記錄其 WAL 位置並證明送達 target。"
+    )
+    assert case["source_ref"] == "tests/contract_blackbox/test_p7_invariants.py::test_login_bytes_not_interleaved_with_agent_or_human"
+
+
+@pytest.mark.memory_only
 def test_windows_com_not_satisfied_by_memory():
     cases = _load_cases().get("cases", [])
     bad = []

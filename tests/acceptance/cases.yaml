@@ -14,7 +14,7 @@
 #   - s24-*（P8 Task 1）：suite 新增 rust-l1、family 新增 S24（schema 列舉只增不改）；SC-33 依 OD-79 撤回，原列 SC-33 的案例改列 SC-03；
 #     s24-xfer-abort-on-release 依 OD-62 比照 BC-03；source_ref／evidence 中尚未建立的節點由承接 Task 依此命名建立。
 schema_version: 1
-revision: 2026-11-10.3
+revision: 2026-11-13.1
 spec: docs/rust-refactor/serialwrap-rust-spec-final.md
 invariant_ids: [zero_tx_on_reject, no_forbidden_interleave, no_stale_context_replay, no_reopen_before_handoff, no_auto_resend, insufficient_evidence_not_pass]
 features:
@@ -1437,8 +1437,8 @@ cases:
   invariants: []
   layer: L3
   platforms: [linux, windows]
-  windows_status: ported
-  windows_gap_reason: null
+  windows_status: gap
+  windows_gap_reason: 'Windows TCP console 不建立 human interactive lease，故 human_active／SESSION_INTERACTIVE_BUSY 行為未移植；依 2026-11-12 rulings/s2.md 第 8 點與 OD-85 登記 Windows gap。'
   capabilities: [physical_uart, human_frontend, two_boards]
   cli_stage: 1B
   daemon_slice: '2.2'
@@ -1462,8 +1462,8 @@ cases:
   invariants: []
   layer: L3
   platforms: [linux, windows]
-  windows_status: ported
-  windows_gap_reason: null
+  windows_status: gap
+  windows_gap_reason: 'Windows TCP console 不建立 human interactive lease，故 idle human lease soft preempt 行為未移植；依 2026-11-12 rulings/s2.md 第 8 點與 OD-85 登記 Windows gap。'
   capabilities: [physical_uart, human_frontend, two_boards]
   cli_stage: 1B
   daemon_slice: '2.2'
@@ -4687,8 +4687,8 @@ cases:
   suite: contract-blackbox
   source_ref: tests/contract_blackbox/test_p7_invariants.py::test_login_bytes_not_interleaved_with_agent_or_human
   family: L15
-  title: '§11.3-2：login 序列不與 agent／human 交錯'
-  contract: '08 Task 18：reprobe 登入進行中並發 cmd submit＋human console 輸入；login 序列為連續片段，agent 命令只在 READY 之後出現，human bytes 不夾在 login 序列內。'
+  title: '§11.3-2：login 窗口禁止 agent TX；human bytes 照 Python 可送並留 WAL'
+  contract: '08 Task 18：以 WAL seq／mono 檢查 username/login 至 nonce probe 後 READY；窗口內不得有 agent TX。human bytes 依 Python 可在登入期間送出，且須記錄其 WAL 位置並證明送達 target。'
   invariants: [no_forbidden_interleave]
   layer: L1.5
   platforms: [linux]
