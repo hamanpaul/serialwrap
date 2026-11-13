@@ -254,14 +254,99 @@ pub struct CommApiCalls {
     pub escape_comm_function: u32,
 }
 
-/// LOCAL-WINDOWS-TODO（P6 Task 8）：讀 Windows com0com console io 的 API 計數器。
-pub fn comm_api_calls(_io: &dyn ConsoleIo) -> CommApiCalls {
-    todo!("P6 Task 8")
+/// 讀取 Windows com0com console handle 的 Win32 設定 API 計數。
+pub fn comm_api_calls(io: &dyn ConsoleIo) -> CommApiCalls {
+    #[cfg(windows)]
+    if let MuxHandleInner::Com0com(id) = io.mux_handle().0 {
+        let (set_comm_state, escape_comm_function) =
+            crate::console_com0com::windows::api_call_counts(id);
+        return CommApiCalls {
+            set_comm_state,
+            escape_comm_function,
+        };
+    }
+    let _ = io;
+    CommApiCalls::default()
 }
 
-/// 對 peer 端（COMb）改 baud 並切換 DTR／RTS。LOCAL-WINDOWS-TODO（P6 Task 8）。
-pub fn toggle_peer_modem_lines(_port: &str) {
-    todo!("P6 Task 8")
+/// 對 peer 端（COMb）改 baud 並切換 DTR／RTS。
+pub fn toggle_peer_modem_lines(port: &str) {
+    #[cfg(windows)]
+    toggle_windows_peer_modem_lines(port).expect("設定 com0com peer baud／modem lines");
+    #[cfg(not(windows))]
+    let _ = port;
+}
+
+#[cfg(windows)]
+fn toggle_windows_peer_modem_lines(port: &str) -> PalResult<()> {
+    use std::fs::File;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+    use windows_sys::Win32::Devices::Communication::{
+        EscapeCommFunction, GetCommState, SetCommState, CLRDTR, CLRRTS, DCB, SETDTR, SETRTS,
+    };
+    use windows_sys::Win32::Foundation::{
+        GetLastError, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let path = crate::serial::windows_model::win_device_name(port);
+    let wide_path: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: 路徑為有效 NUL 結尾 UTF-16；分享讀寫以符合 COM 埠的相容存取模式。
+    let raw = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        // SAFETY: 讀取目前執行緒最近一次 Win32 錯誤碼。
+        return Err(crate::traits::windows_win32_error(unsafe {
+            GetLastError()
+        }));
+    }
+    // SAFETY: `raw` 是剛建立的 peer handle，交由 File 唯一關閉。
+    let file = unsafe { File::from_raw_handle(raw as RawHandle) };
+    let handle = file.as_raw_handle() as HANDLE;
+    let mut dcb = DCB {
+        DCBlength: std::mem::size_of::<DCB>() as u32,
+        ..DCB::default()
+    };
+    // SAFETY: `dcb` 可寫，peer handle 由 `file` 持有。
+    if unsafe { GetCommState(handle, &mut dcb) } == 0 {
+        // SAFETY: 讀取目前執行緒最近一次 Win32 錯誤碼。
+        return Err(crate::traits::windows_win32_error(unsafe {
+            GetLastError()
+        }));
+    }
+    dcb.BaudRate = if dcb.BaudRate == 57_600 {
+        38_400
+    } else {
+        57_600
+    };
+    // SAFETY: `dcb` 是 GetCommState 初始化後僅改變 baud 的有效結構。
+    if unsafe { SetCommState(handle, &dcb) } == 0 {
+        // SAFETY: 讀取目前執行緒最近一次 Win32 錯誤碼。
+        return Err(crate::traits::windows_win32_error(unsafe {
+            GetLastError()
+        }));
+    }
+    for action in [SETDTR, CLRDTR, SETRTS, CLRRTS] {
+        // SAFETY: `handle` 是仍開啟的 peer 埠，action 為 Win32 modem-line 控制常數。
+        if unsafe { EscapeCommFunction(handle, action) } == 0 {
+            // SAFETY: 讀取目前執行緒最近一次 Win32 錯誤碼。
+            return Err(crate::traits::windows_win32_error(unsafe {
+                GetLastError()
+            }));
+        }
+    }
+    Ok(())
 }
 
 /// P8 Task 13（編排者 T9 裁決）：以「一般 open」扮演 flasher 的 tty 用戶端——`O_RDWR|O_NOCTTY|O_NONBLOCK`，

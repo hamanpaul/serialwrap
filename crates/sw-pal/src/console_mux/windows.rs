@@ -20,7 +20,7 @@ enum Slot {
 }
 
 struct Entry {
-    socket: SOCKET,
+    socket: Option<SOCKET>,
     write_interest: bool,
     slot: Slot,
 }
@@ -155,39 +155,41 @@ impl WinConsoleMux {
         }))
     }
 
-    fn insert(&mut self, id: MuxId, handle: MuxHandle, slot: Slot) -> PalResult<()> {
-        let MuxHandleInner::WinSocket(socket) = handle.0 else {
-            return Err(PalError::plain(
-                PalErrorKind::Unsupported,
-                "ConsoleMux：handle 不屬於此 PAL",
-            ));
-        };
+    fn insert(
+        &mut self,
+        id: MuxId,
+        handle: MuxHandle,
+        slot: Slot,
+        allow_com0com: bool,
+    ) -> PalResult<()> {
         if self.entries.contains_key(&id) {
             return Err(PalError::plain(
                 PalErrorKind::InvalidInput,
                 format!("ConsoleMux：id {id} 已登記"),
             ));
         }
+        let socket = match handle.0 {
+            MuxHandleInner::WinSocket(socket) => Some(socket as SOCKET),
+            MuxHandleInner::Com0com(channel) if allow_com0com => {
+                crate::console_com0com::windows::bind_mux_waker(channel, &self.wake)?;
+                None
+            }
+            _ => {
+                return Err(PalError::plain(
+                    PalErrorKind::Unsupported,
+                    "ConsoleMux：handle 不屬於此 PAL",
+                ));
+            }
+        };
         self.entries.insert(
             id,
             Entry {
-                socket: socket as SOCKET,
+                socket,
                 write_interest: false,
                 slot,
             },
         );
         Ok(())
-    }
-
-    fn io_socket(&self, id: MuxId) -> PalResult<SOCKET> {
-        match self.entries.get(&id) {
-            Some(Entry {
-                socket,
-                slot: Slot::Io(_),
-                ..
-            }) => Ok(*socket),
-            _ => Err(unknown_id(id)),
-        }
     }
 }
 
@@ -201,18 +203,25 @@ fn unknown_id(id: MuxId) -> PalError {
 impl ConsoleMux for WinConsoleMux {
     fn add_io(&mut self, id: MuxId, io: Box<dyn ConsoleIo>) -> PalResult<()> {
         let handle = io.mux_handle();
-        self.insert(id, handle, Slot::Io(io))
+        self.insert(id, handle, Slot::Io(io), true)
     }
 
     fn add_listener(&mut self, id: MuxId, listener: Box<dyn ConsoleListener>) -> PalResult<()> {
         let handle = listener.mux_handle();
-        self.insert(id, handle, Slot::Listener(listener))
+        self.insert(id, handle, Slot::Listener(listener), false)
     }
 
     fn remove(&mut self, id: MuxId) -> Option<MuxEntry> {
-        self.entries.remove(&id).map(|entry| match entry.slot {
-            Slot::Io(io) => MuxEntry::Io(io),
-            Slot::Listener(listener) => MuxEntry::Listener(listener),
+        self.entries.remove(&id).map(|entry| {
+            if let Slot::Io(io) = &entry.slot {
+                if let MuxHandleInner::Com0com(channel) = io.mux_handle().0 {
+                    crate::console_com0com::windows::unbind_mux_waker(channel);
+                }
+            }
+            match entry.slot {
+                Slot::Io(io) => MuxEntry::Io(io),
+                Slot::Listener(listener) => MuxEntry::Listener(listener),
+            }
         })
     }
 
@@ -223,33 +232,41 @@ impl ConsoleMux for WinConsoleMux {
     }
 
     fn wait(&mut self, timeout: Duration) -> PalResult<Vec<MuxEvent>> {
+        let ready = self.com0com_events();
+        if !ready.is_empty() {
+            return Ok(ready);
+        }
         let mut descriptors = Vec::with_capacity(self.entries.len() + 1);
         descriptors.push(WSAPOLLFD {
             fd: self.wake.read_socket(),
             events: POLLRDNORM,
             revents: 0,
         });
-        let ids: Vec<MuxId> = self.entries.keys().copied().collect();
-        for entry in self.entries.values() {
+        let mut socket_ids = Vec::with_capacity(self.entries.len());
+        for (&id, entry) in &self.entries {
+            let Some(socket) = entry.socket else {
+                continue;
+            };
             let mut events = POLLRDNORM;
             if entry.write_interest && matches!(entry.slot, Slot::Io(_)) {
                 events |= POLLWRNORM;
             }
             descriptors.push(WSAPOLLFD {
-                fd: entry.socket,
+                fd: socket,
                 events,
                 revents: 0,
             });
+            socket_ids.push(id);
         }
         if !poll_sockets(&mut descriptors, Some(timeout))? {
-            return Ok(Vec::new());
+            return Ok(self.com0com_events());
         }
         let mut events = Vec::new();
         if descriptors[0].revents != 0 {
             self.wake.drain();
             events.push(MuxEvent::Woken);
         }
-        for (descriptor, id) in descriptors[1..].iter().zip(ids) {
+        for (descriptor, id) in descriptors[1..].iter().zip(socket_ids) {
             let ready = descriptor.revents;
             if ready == 0 {
                 continue;
@@ -273,15 +290,32 @@ impl ConsoleMux for WinConsoleMux {
                 events.push(MuxEvent::Writable(id));
             }
         }
+        events.extend(self.com0com_events());
         Ok(events)
     }
 
     fn read(&mut self, id: MuxId, buffer: &mut [u8]) -> PalResult<ReadOutcome> {
-        read_socket(self.io_socket(id)?, buffer)
+        let entry = self.entries.get_mut(&id).ok_or_else(|| unknown_id(id))?;
+        match &mut entry.slot {
+            Slot::Io(io) => match io.mux_handle().0 {
+                MuxHandleInner::WinSocket(socket) => read_socket(socket as SOCKET, buffer),
+                MuxHandleInner::Com0com(_) => io.read(buffer, Some(Duration::ZERO)),
+                _ => Err(unknown_id(id)),
+            },
+            Slot::Listener(_) => Err(unknown_id(id)),
+        }
     }
 
     fn try_write(&mut self, id: MuxId, data: &[u8]) -> PalResult<usize> {
-        write_socket(self.io_socket(id)?, data)
+        let entry = self.entries.get_mut(&id).ok_or_else(|| unknown_id(id))?;
+        match &mut entry.slot {
+            Slot::Io(io) => match io.mux_handle().0 {
+                MuxHandleInner::WinSocket(socket) => write_socket(socket as SOCKET, data),
+                MuxHandleInner::Com0com(_) => io.try_write(data),
+                _ => Err(unknown_id(id)),
+            },
+            Slot::Listener(_) => Err(unknown_id(id)),
+        }
     }
 
     fn accept(&mut self, id: MuxId) -> PalResult<Option<(Box<dyn ConsoleIo>, String)>> {
@@ -299,6 +333,25 @@ impl ConsoleMux for WinConsoleMux {
 
     fn waker(&self) -> Arc<dyn IoWaker> {
         Arc::clone(&self.wake) as Arc<dyn IoWaker>
+    }
+}
+
+impl WinConsoleMux {
+    fn com0com_events(&self) -> Vec<MuxEvent> {
+        self.entries
+            .iter()
+            .filter_map(|(&id, entry)| match &entry.slot {
+                Slot::Io(io) => match io.mux_handle().0 {
+                    MuxHandleInner::Com0com(channel)
+                        if crate::console_com0com::windows::collect_readable(channel) =>
+                    {
+                        Some(MuxEvent::Readable(id))
+                    }
+                    _ => None,
+                },
+                Slot::Listener(_) => None,
+            })
+            .collect()
     }
 }
 

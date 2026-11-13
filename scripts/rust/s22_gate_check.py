@@ -62,6 +62,7 @@ REQUIRED_SECTIONS: dict[str, tuple[str, ...]] = {
     "s22_gate:console_conformance_pty": ("linux",),
     "s22_gate:blackbox_rust": ("linux",),
     "s22_gate:win_test": ("windows",),
+    "s22_gate:windows_cap_windows_com": ("windows",),
     "s22_gate:py_parity": ("linux",),
 }
 L15_FORMAT = "s22-l15-results.v1"
@@ -261,7 +262,10 @@ def judge_sections(results_dir: pathlib.Path, lock: dict[str, Any], judge) -> tu
                 sections.append({**entry, "verdict": "EVIDENCE_MISSING",
                                  "reasons": ["selector 推導不出收集器 --caps（OD-53：只接受 `--ignored cap_<cap>__`）"]})
             elif report is None:
-                sections.append({**entry, "verdict": "INSUFFICIENT", "reasons": [f"report missing：{path}"]})
+                native_windows_cap = set_id == "s22_gate:windows_cap_windows_com"
+                verdict = "EVIDENCE_MISSING" if native_windows_cap else "INSUFFICIENT"
+                reason = f"原生 Windows 能力證據缺少：{path}" if native_windows_cap else f"report missing：{path}"
+                sections.append({**entry, "verdict": verdict, "reasons": [reason]})
                 continue
             else:
                 verdict = judge.judge(report, list(spec.get("nodeids") or []), platform=platform,
