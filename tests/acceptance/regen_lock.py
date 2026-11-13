@@ -5,7 +5,7 @@
   python3 tests/acceptance/regen_lock.py --check --cases-only
                                                       # 只驗證案例鎖（供 func-test 執行器；不檢查 L1 鎖）
   python3 tests/acceptance/regen_lock.py --check --base <rev> [--allow-removal <set_id:platform:nodeid>…]
-                                                      # 另以 <rev> 的 L1 鎖為基準：基準已有的 (set, platform, nodeid) 消失或 selector 改變即 exit 1
+                                                      # 另以 <rev> 的 L1 鎖為基準；selector 僅接受 2026-11-13 N3 指定遷移
   python3 tests/acceptance/regen_lock.py --add-only   # 重算；既有 ID 從任何集合消失、被延後切片，或分母屬性被改動即 exit 1 且不寫檔，否則寫回
   python3 tests/acceptance/regen_lock.py --add-only --authorize-deferral <case_id>:OD-<n> …
                                                       # 擁有者裁決逐名授權的延後切片（OD-34 起）：只放行該案例 daemon_slice 往後移
@@ -17,7 +17,8 @@
           (--selector <json檔> | --argv-json <json> [--paths-json <json>] [--markexpr <str>])
                                                       # L1 必要集合只增（P2-T13，R5-F3）；既有 nodeid 消失即 exit 1 且不寫檔；
                                                       # 經核准替換者須逐筆列 --allow-removal set_id:platform:nodeid，三元組須全部屬於本次 set／平台，
-                                                      # 且清單必須與該集合消失集合完全相符；新增 set／平台時必須給 selector（檔案或行內 JSON 皆可）
+                                                      # 且清單必須與該集合消失集合完全相符；既有 selector 僅 N3 指定遷移可改
+                                                      # 新增 set／平台時必須給 selector（檔案或行內 JSON 皆可）
                                                       # OD-24：collect JSON 的 ignored 列新增時預設排除；明確 `-- --ignored cap_<cap>__` 僅納入同能力列；
                                                       # 鎖中既有 ignored 列仍屬 collected、不視為消失，只能逐名 --allow-removal 移除
   python3 tests/acceptance/regen_lock.py --p4-error-codes-add-only --allow-error-code <CODE>...
@@ -65,6 +66,26 @@ SLICES = ("2.1", "2.2", "2.3", "2.4")
 ATTR_KEYS = ("suite", "layer", "platforms", "expected", "necessity", "daemon_slice", "cli_stage", "stage0_required")
 # 核准移除之粒度為 (set_id, platform, nodeid) 三元組：同名 nodeid 在不同集合／平台的核准互不相通。
 Approval = tuple[str, str, str]
+
+# 2026-11-13 擁有者裁決 N3：pytest_full 兩集合移出已收過的 Stage 1 證據測試，
+# gate selector 逐字對齊 CI。這是唯一允許改既有 selector 的遷移。
+_N3_REMOVALS = frozenset({
+    "tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native",
+    "tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
+})
+_N3_PYTEST_FULL_SETS = frozenset({
+    "s21_gate:pytest_full",
+    "p7_gate:python3-m-pytest-q-tests",
+})
+_N3_OLD_SELECTOR = {"argv": ["-q", "tests/"], "paths": ["tests/"], "markexpr": ""}
+_N3_NEW_SELECTOR = {
+    "argv": [
+        "-q", "tests/", "--deselect", "tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native",
+        "--deselect", "tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
+    ],
+    "paths": ["tests/"],
+    "markexpr": "",
+}
 
 
 def _configure_stdio() -> None:
@@ -478,6 +499,27 @@ def _git_base_lock(lock_path: pathlib.Path, rev: str) -> tuple[dict[str, Any] | 
         return None, f"基準 {rev} 的鎖檔不是合法 JSON：{exc}"
 
 
+def _n3_selector_migration_allowed(
+    set_id: str,
+    platform: str,
+    old_selector: dict[str, Any],
+    new_selector: dict[str, Any],
+    removed: set[str],
+    approved: set[str],
+    retained: set[str],
+) -> bool:
+    """只放行 N3 的精確 selector、集合與兩筆逐名移除。"""
+    paired_removal = removed == _N3_REMOVALS and approved == _N3_REMOVALS
+    previously_approved_removal = not removed and not approved and _N3_REMOVALS.isdisjoint(retained)
+    return (
+        platform == "linux"
+        and set_id in _N3_PYTEST_FULL_SETS
+        and old_selector == _N3_OLD_SELECTOR
+        and new_selector == _N3_NEW_SELECTOR
+        and (paired_removal or previously_approved_removal)
+    )
+
+
 def parse_removal_approval(token: str) -> Approval:
     """解析 `set_id:platform:nodeid` 三元組；不合法或含糊即拋 ValueError。
 
@@ -527,7 +569,7 @@ def cmd_check_l1(lock_path: pathlib.Path, base: str | None, approvals: set[Appro
 
 
 def _report_base_diff(base: dict[str, Any], head: dict[str, Any], approvals: set[Approval]) -> int:
-    """基準已有的 (set, platform, nodeid) 於 HEAD 消失者，須有同一三元組之核准；selector 改變一律拒絕。"""
+    """基準 nodeid 移除須逐名核准；selector 僅接受 N3 的精確兩集合遷移。"""
     rc = 0
     head_sets = head.get("sets", {})
     for set_id, plats in sorted(base.get("sets", {}).items()):
@@ -536,9 +578,11 @@ def _report_base_diff(base: dict[str, Any], head: dict[str, Any], approvals: set
             if head_spec is None:
                 gone = list(spec["nodeids"])
                 changed = False
+                new_selector = spec["selector"]
             else:
                 gone = sorted(set(spec["nodeids"]) - set(head_spec["nodeids"]))
-                changed = head_spec["selector"] != spec["selector"]
+                new_selector = head_spec["selector"]
+                changed = new_selector != spec["selector"]
             for nid in gone:
                 if (set_id, plat, nid) in approvals:
                     print(f"[regen_lock] 基準已有、HEAD 已消失（已以 --allow-removal 允許）：{set_id}.{plat} {nid}")
@@ -546,8 +590,18 @@ def _report_base_diff(base: dict[str, Any], head: dict[str, Any], approvals: set
                     print(f"[regen_lock] FAIL 基準已有、HEAD 已消失（須擁有者裁決並以 --allow-removal {set_id}:{plat}:{nid} 列名）：{set_id}.{plat} {nid}")
                     rc = 1
             if changed:
-                print(f"[regen_lock] FAIL selector 改變（基準 {spec['selector']}）：{set_id}.{plat}")
-                rc = 1
+                approved_for_set = {
+                    nid for sid, approval_platform, nid in approvals
+                    if sid == set_id and approval_platform == plat
+                }
+                if _n3_selector_migration_allowed(
+                    set_id, plat, spec["selector"], new_selector, set(gone), approved_for_set,
+                    set(head_spec["nodeids"]) if head_spec is not None else set(),
+                ):
+                    print(f"[regen_lock] selector 依 2026-11-13 N3 核准遷移：{set_id}.{plat}")
+                else:
+                    print(f"[regen_lock] FAIL selector 改變（基準 {spec['selector']}）：{set_id}.{plat}")
+                    rc = 1
     return rc
 
 
@@ -662,11 +716,9 @@ def cmd_l1_add_only(lock_path: pathlib.Path, set_id: str, platform: str, collect
         new_spec = {"selector": selector, "nodeids": sorted(set(collected) - ignored_excluded)}
         added_count = len(new_spec["nodeids"])
     else:
-        if selector is not None and selector != spec["selector"]:
-            print(f"[regen_lock] REFUSED selector 與鎖檔不同：{set_id}.{platform}", file=sys.stderr)
-            return 1
-        # 既有集合的 selector 以鎖內版本為準；未傳 CLI selector 時不可退回「全部 ignored」。
-        ignored_excluded = ignored - _explicit_ignored_capability_nodeids(spec["selector"], ignored)
+        requested_selector = selector if selector is not None else spec["selector"]
+        # selector 遷移以新 selector 判斷 ignored 列；一般既有集合仍使用鎖內 selector。
+        ignored_excluded = ignored - _explicit_ignored_capability_nodeids(requested_selector, ignored)
         allowed = {nid for _s, _p, nid in approvals}
         # 既有 ignored 列仍在 collected 內，不視為消失（plan 04 Task 17）；OD-24 起可逐名核准移除
         removed = sorted((set(spec["nodeids"]) - set(collected)) | (allowed & set(spec["nodeids"]) & ignored))
@@ -681,10 +733,20 @@ def cmd_l1_add_only(lock_path: pathlib.Path, set_id: str, platform: str, collect
             print("[regen_lock] 每筆移除都須對應已核准的案例／測試替換並於交付說明列明。", file=sys.stderr)
             return 1
         added = sorted(set(collected) - set(spec["nodeids"]) - ignored_excluded)
-        if not added and not removed:
+        selector_changed = requested_selector != spec["selector"]
+        if selector_changed and not _n3_selector_migration_allowed(
+            set_id, platform, spec["selector"], requested_selector, set(removed), allowed,
+            set(added) | (set(spec["nodeids"]) - set(removed)),
+        ):
+            print(f"[regen_lock] REFUSED selector 與鎖檔不同且不符合 2026-11-13 N3：{set_id}.{platform}", file=sys.stderr)
+            return 1
+        if not added and not removed and not selector_changed:
             print(f"[regen_lock] {set_id}.{platform} 無新增 nodeid，鎖檔未變更")
             return 0
-        new_spec = {"selector": spec["selector"], "nodeids": sorted(set(added) | (set(spec["nodeids"]) - set(removed)))}
+        new_spec = {
+            "selector": requested_selector,
+            "nodeids": sorted(set(added) | (set(spec["nodeids"]) - set(removed))),
+        }
         added_count = len(added)
     lock["schema_version"] = 1
     platforms = lock.setdefault("sets", {}).setdefault(set_id, {})

@@ -45,7 +45,7 @@ TEST_SECTIONS = {
     "blackbox_python": ("linux", "s21_gate:blackbox_python"),
     "blackbox_rust": ("linux", "s21_gate:blackbox_rust"),
     "existing_suites_rust": ("linux", "s21_gate:existing_suites_rust"),
-    # N3：gate argv 與 CI 同步排除兩項 Stage 1 證據測試；鎖 selector 遷移受 regen_lock 限制，列為 SPEC-GAP。
+    # N3：gate argv 與 CI 同步排除兩項 Stage 1 證據測試；鎖 selector 由 regen_lock 的核准遷移更新。
     "pytest_full": ("linux", "s21_gate:pytest_full"),
     # P5 第 6 輪 SPEC-GAP #2（編排者裁決）：OD-55 linux 能力集合各一個 section（以 --caps <cap> 實跑，須附能力探測）
     "linux_cap_sys_admin": ("linux", "s21_gate:cap_sys_admin"),
@@ -65,6 +65,21 @@ GATE_NODEIDS = {  # 每個 gate 集合的凍結 nodeid（測試用，兩個一�
     for name in ("linux_cap_posix_pty", "windows_cap_windows_com", "blackbox_python", "blackbox_rust",
                  "existing_suites_rust", "pytest_full", *CAP_OF, "py_parity", "py_parity_76_80")
 }
+
+
+def test_pytest_full_lock_selector_matches_n3_ci_deselects():
+    """N3：s21 與 p7 的 full pytest 集合共用 CI deselect selector，移除列不在必要分母。"""
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    removed = [
+        "tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native",
+        "tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
+    ]
+    expected = ["-q", "tests/", "--deselect", removed[0], "--deselect", removed[1]]
+    s21 = lock["sets"]["s21_gate:pytest_full"]["linux"]
+    p7 = lock["sets"]["p7_gate:python3-m-pytest-q-tests"]["linux"]
+    assert s21["selector"]["argv"] == expected
+    assert p7["selector"] == s21["selector"]
+    assert not set(removed) & (set(s21["nodeids"]) | set(p7["nodeids"]))
 
 
 def _sha(text: str) -> str:

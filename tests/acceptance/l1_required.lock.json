@@ -7400,6 +7400,7 @@
           "tests/test_l1_judge.py::test_l1_lock_ignored_scan_exempts_only_explicit_capability_selectors",
           "tests/test_l1_judge.py::test_l1_lock_nodeids_subset_of_collect_only",
           "tests/test_l1_judge.py::test_l1_lock_shape_and_add_only",
+          "tests/test_l1_judge.py::test_n3_selector_migration_is_exact_and_owner_scoped",
           "tests/test_l1_judge.py::test_native_attach_spawn_regressions_registered_in_cap_set",
           "tests/test_l1_judge.py::test_regen_lock_check_requires_l1_lock",
           "tests/test_l1_judge.py::test_s21_core_linux_capability_rows_moved_to_cap_sets_od55",
@@ -9972,6 +9973,7 @@
           "tests/test_slice21_gate_judge.py::test_preflight_not_frozen_never_ready",
           "tests/test_slice21_gate_judge.py::test_py_parity_76_80_has_additive_plan_scope",
           "tests/test_slice21_gate_judge.py::test_py_parity_full_has_complete_selector_and_keeps_old_set",
+          "tests/test_slice21_gate_judge.py::test_pytest_full_lock_selector_matches_n3_ci_deselects",
           "tests/test_slice21_gate_judge.py::test_real_lock_s21_sets_caps_derivable_and_gate_plan",
           "tests/test_slice21_gate_judge.py::test_release_build_failure_is_fail_and_build_sha_must_match",
           "tests/test_slice21_gate_judge.py::test_required_nodeid_ignored_is_missing",
@@ -11158,7 +11160,11 @@
         "selector": {
           "argv": [
             "-q",
-            "tests/"
+            "tests/",
+            "--deselect",
+            "tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native",
+            "--deselect",
+            "tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence"
           ],
           "markexpr": "",
           "paths": [
@@ -29528,6 +29534,7 @@
           "tests/test_l1_judge.py::test_l1_lock_ignored_scan_exempts_only_explicit_capability_selectors",
           "tests/test_l1_judge.py::test_l1_lock_nodeids_subset_of_collect_only",
           "tests/test_l1_judge.py::test_l1_lock_shape_and_add_only",
+          "tests/test_l1_judge.py::test_n3_selector_migration_is_exact_and_owner_scoped",
           "tests/test_l1_judge.py::test_native_attach_spawn_regressions_registered_in_cap_set",
           "tests/test_l1_judge.py::test_regen_lock_check_requires_l1_lock",
           "tests/test_l1_judge.py::test_s21_core_linux_capability_rows_moved_to_cap_sets_od55",
@@ -32100,6 +32107,7 @@
           "tests/test_slice21_gate_judge.py::test_preflight_not_frozen_never_ready",
           "tests/test_slice21_gate_judge.py::test_py_parity_76_80_has_additive_plan_scope",
           "tests/test_slice21_gate_judge.py::test_py_parity_full_has_complete_selector_and_keeps_old_set",
+          "tests/test_slice21_gate_judge.py::test_pytest_full_lock_selector_matches_n3_ci_deselects",
           "tests/test_slice21_gate_judge.py::test_real_lock_s21_sets_caps_derivable_and_gate_plan",
           "tests/test_slice21_gate_judge.py::test_release_build_failure_is_fail_and_build_sha_must_match",
           "tests/test_slice21_gate_judge.py::test_required_nodeid_ignored_is_missing",
@@ -33286,7 +33294,11 @@
         "selector": {
           "argv": [
             "-q",
-            "tests/"
+            "tests/",
+            "--deselect",
+            "tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native",
+            "--deselect",
+            "tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence"
           ],
           "markexpr": "",
           "paths": [

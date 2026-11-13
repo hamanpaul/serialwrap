@@ -1185,6 +1185,117 @@ def test_l1_add_only_removes_only_explicitly_approved_nodeids(tmp_path: Path) ->
 
 
 @pytest.mark.process_rpc
+def test_n3_selector_migration_is_exact_and_owner_scoped(tmp_path: Path) -> None:
+    """2026-11-13 擁有者 N3：只准兩個 pytest_full 集合套用指定 deselect 並逐名移除。"""
+    removed = [
+        "tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native",
+        "tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
+    ]
+    old_selector = {"argv": ["-q", "tests/"], "paths": ["tests/"], "markexpr": ""}
+    new_selector = {
+        "argv": ["-q", "tests/", "--deselect", removed[0], "--deselect", removed[1]],
+        "paths": ["tests/"],
+        "markexpr": "",
+    }
+    set_ids = ("s21_gate:pytest_full", "p7_gate:python3-m-pytest-q-tests")
+    stable = "tests/test_rust_ci_workflow.py::test_existing_gate_contract"
+    for index, set_id in enumerate(set_ids):
+        repo = tmp_path / f"repo-{index}"
+        repo.mkdir()
+        lock_path = repo / "lock.json"
+        lock_path.write_text(json.dumps({
+            "schema_version": 1,
+            "sets": {set_id: {"linux": {"selector": old_selector, "nodeids": sorted([*removed, stable])}}},
+        }), encoding="utf-8")
+        original = lock_path.read_bytes()
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", "lock.json"], check=True)
+        git_env = os.environ.copy()
+        git_env.update({
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.invalid",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.invalid",
+        })
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True, env=git_env)
+        base_rev = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        collect = tmp_path / f"n3-{index}.collect"
+        collect.write_text(stable + "\n", encoding="utf-8")
+        regen_base = [
+            sys.executable, "tests/acceptance/regen_lock.py", "--lock-file", str(lock_path),
+            "--l1-add-only", "--set", set_id, "--platform", "linux", "--collect", str(collect),
+        ]
+        regen = [*regen_base, "--argv-json", json.dumps(new_selector["argv"]),
+                 "--paths-json", json.dumps(new_selector["paths"]), "--markexpr", ""]
+        approvals = [f"{set_id}:linux:{nodeid}" for nodeid in removed]
+
+        unapproved = subprocess.run(regen, capture_output=True, text=True, cwd=REPO_ROOT)
+        assert unapproved.returncode == 1, unapproved.stdout + unapproved.stderr
+        assert lock_path.read_bytes() == original
+
+        migrated = subprocess.run([*regen, "--allow-removal", *approvals], capture_output=True, text=True, cwd=REPO_ROOT)
+        assert migrated.returncode == 0, migrated.stdout + migrated.stderr
+        result = json.loads(lock_path.read_text(encoding="utf-8"))["sets"][set_id]["linux"]
+        assert result == {"selector": new_selector, "nodeids": [stable]}
+
+        check_base = [
+            sys.executable, "tests/acceptance/regen_lock.py", "--check", "--lock-file", str(lock_path),
+            "--base", base_rev,
+        ]
+        refused_base = subprocess.run(check_base, capture_output=True, text=True, cwd=REPO_ROOT)
+        assert refused_base.returncode == 1, refused_base.stdout + refused_base.stderr
+        accepted_base = subprocess.run(
+            [*check_base, "--allow-removal", *approvals], capture_output=True, text=True, cwd=REPO_ROOT,
+        )
+        assert accepted_base.returncode == 0, accepted_base.stdout + accepted_base.stderr
+
+        staged_repo = tmp_path / f"staged-repo-{index}"
+        staged_repo.mkdir()
+        staged_lock = staged_repo / "lock.json"
+        staged_lock.write_text(json.dumps({
+            "schema_version": 1,
+            "sets": {set_id: {"linux": {"selector": old_selector, "nodeids": [stable]}}},
+        }), encoding="utf-8")
+        subprocess.run(["git", "-C", str(staged_repo), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(staged_repo), "add", "lock.json"], check=True)
+        subprocess.run(["git", "-C", str(staged_repo), "commit", "-qm", "removals already approved"], check=True, env=git_env)
+        staged_base_rev = subprocess.run(
+            ["git", "-C", str(staged_repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        staged_collect = tmp_path / f"n3-staged-{index}.collect"
+        staged_collect.write_text(stable + "\n", encoding="utf-8")
+        staged_regen = [
+            sys.executable, "tests/acceptance/regen_lock.py", "--lock-file", str(staged_lock),
+            "--l1-add-only", "--set", set_id, "--platform", "linux", "--collect", str(staged_collect),
+            "--argv-json", json.dumps(new_selector["argv"]), "--paths-json", json.dumps(new_selector["paths"]),
+            "--markexpr", "",
+        ]
+        staged_migration = subprocess.run(staged_regen, capture_output=True, text=True, cwd=REPO_ROOT)
+        assert staged_migration.returncode == 0, staged_migration.stdout + staged_migration.stderr
+        staged_check = subprocess.run(
+            [sys.executable, "tests/acceptance/regen_lock.py", "--check", "--lock-file", str(staged_lock),
+             "--base", staged_base_rev], capture_output=True, text=True, cwd=REPO_ROOT,
+        )
+        assert staged_check.returncode == 0, staged_check.stdout + staged_check.stderr
+
+        bad_selector = dict(new_selector, argv=[*new_selector["argv"], "--continue-on-collection-errors"])
+        lock_path.write_text(json.dumps({
+            "schema_version": 1,
+            "sets": {set_id: {"linux": {"selector": old_selector, "nodeids": sorted([*removed, stable])}}},
+        }), encoding="utf-8")
+        before_bad = lock_path.read_bytes()
+        rejected = subprocess.run(
+            [*regen_base, "--argv-json", json.dumps(bad_selector["argv"]), "--paths-json",
+             json.dumps(bad_selector["paths"]), "--markexpr", "", "--allow-removal", *approvals],
+            capture_output=True, text=True, cwd=REPO_ROOT,
+        )
+        assert rejected.returncode == 1, rejected.stdout + rejected.stderr
+        assert lock_path.read_bytes() == before_bad
+
+
+@pytest.mark.process_rpc
 def test_l1_add_only_allow_removal_accepts_colon_set_id(tmp_path: Path) -> None:
     """OD-68：s21_gate:* 集合名含冒號，仍須可用完整三元組逐名核准 ignored 列移除。"""
     set_id = "s21_gate:cap_windows_native"
