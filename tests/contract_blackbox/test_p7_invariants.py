@@ -5,9 +5,6 @@
   0 byte、WAL 無 TX（READY_UNCONFIRMED 子案經 180 s quiet，為慢案、不得 SKIP）。
 - `test_release_during_login_waits_for_handle_close`（§11.3-4）。
 - `test_no_auto_resend_after_partial_or_timeout`（§11.3-5；SC-30 子案 Rust-only，cases.yaml 平台限定）。
-未承接（依賴 P6 human console，`session.console_attach` 於本分支 Rust 為 METHOD_NOT_FOUND，BLOCKED-UPSTREAM）：
-`test_login_bytes_not_interleaved_with_agent_or_human`（§11.3-2）、`test_recovery_and_reboot_do_not_replay_stale_input`
-（§11.3-3）。
 `test_evidence_insufficient_is_not_pass`（§11.3-6）：以合成 junit 驗證 `scripts/rust/p7_ab_report.py`（`run_p7_ab.sh` 的判定器）
 缺證據時該列 INCOMPLETE、整體結束碼非 0。
 stdlib＋PyYAML＋PTY，不得 import sw_core／serialwrap／serialwrapd。
@@ -59,6 +56,85 @@ def _daemon_fds_to(p7, path: str) -> int:
         except OSError:
             continue
     return n
+
+
+def _attach_human_vtty(p7, label: str) -> tuple[int, dict]:
+    from bb_daemon import _send_rpc
+    from bb_p7 import SOCKET_ENV
+
+    response = _send_rpc(p7.env[SOCKET_ENV], "session.console_attach", {"selector": "COM0", "label": label})
+    assert response and response.get("ok") is True and response.get("interactive_owner") is True \
+        and response.get("vtty"), response
+    fd = os.open(response["vtty"], os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    return fd, response
+
+
+def _wait_target_rx(tgt, needle: bytes, timeout_s: float = 15.0, *, mark: int = 0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while needle not in tgt.rx_log_since(mark):
+        assert time.monotonic() < deadline, f"FakeTarget 未收到 {needle!r}；目前 {tgt.rx_log_since(mark)!r}"
+        time.sleep(0.01)
+
+
+def _wait_command_done(p7, cmd_id: str, timeout_s: float = 30.0) -> dict:
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while time.monotonic() < deadline:
+        _, status = p7.cli("cmd", "status", "--cmd-id", cmd_id)
+        last = (status or {}).get("command")
+        if isinstance(last, dict) and last.get("done_at"):
+            return last
+        time.sleep(0.1)
+    raise AssertionError(f"命令 {cmd_id} 未於 {timeout_s}s 內完成：{last!r}")
+
+
+def test_recovery_and_reboot_do_not_replay_stale_input(p7, tmp_path):
+    """§11.3-3：重開機前的人類 raw 輸入可已上線，但 recovery 後不得重播。"""
+    tgt = FakeTarget(
+        tmp_path / "t0",
+        login_steps=[
+            {"expect": "", "respond": "\r\nfake login: "},
+            {"expect": "root", "respond": "\r\nPassword: "},
+            {"expect": "pw", "respond": "\r\nroot@fake:~# "},
+        ],
+        commands={"overrides": {"reboot": {"response": ""}, "STALE_HUMAN_P7": {"response": ""}}},
+    )
+    p7.start("shell", [tgt])
+    wait_state(p7.env, "COM0", "READY", timeout_s=30.0)
+    console_fd, _ = _attach_human_vtty(p7, "s23-no-replay")
+    try:
+        before = p7.wal_records("COM0", limit=5000)
+        seq_before = max((int(r.get("seq") or 0) for r in before), default=0)
+        rc, submitted = p7.cli("cmd", "submit", "--selector", "COM0", "--source", "agent:p7", "--cmd", "reboot",
+                               "--cmd-timeout", "2")
+        assert rc == 0 and submitted and submitted.get("ok") is True, (rc, submitted)
+        _wait_target_rx(tgt, b"reboot\n")
+        os.write(console_fd, b"STALE_HUMAN_P7\n")
+        _wait_command_done(p7, submitted["cmd_id"], timeout_s=15.0)
+
+        # target reboot 後由 daemon reboot recovery 重新登入；登入結果仍由 RPC/WAL 對外觀察。
+        tgt.boot([(0.0, "\r\nfake login: ")])
+        deadline = time.monotonic() + 15.0
+        boot_seq = None
+        while time.monotonic() < deadline:
+            rows = p7.wal_records("COM0", limit=5000)
+            boot_rows = [r for r in rows if int(r.get("seq") or 0) > seq_before and r.get("dir") == "RX"
+                         and b"fake login:" in base64.b64decode(r.get("payload_b64") or "")]
+            if boot_rows:
+                boot_seq = min(int(r["seq"]) for r in boot_rows)
+                break
+            time.sleep(0.05)
+        assert boot_seq is not None, "WAL 未記錄重開機後的 login prompt"
+        wait_state(p7.env, "COM0", "READY", timeout_s=60.0)
+        rc, after = p7.cli("cmd", "submit", "--selector", "COM0", "--source", "agent:p7", "--cmd", "echo AFTER_P7")
+        assert rc == 0 and after and after.get("ok") is True, (rc, after)
+        _wait_target_rx(tgt, b"echo AFTER_P7\n")
+        rows = p7.wal_records("COM0", limit=5000)
+        replay = [r for r in rows if int(r.get("seq") or 0) > boot_seq and r.get("dir") == "TX"
+                  and b"STALE_HUMAN_P7" in base64.b64decode(r.get("payload_b64") or "")]
+        assert not replay, f"重開機與 recovery 後不得重播舊 human input：{replay}"
+    finally:
+        os.close(console_fd)
 
 
 def _reject_zero_tx(p7, tgt, want: str) -> None:

@@ -250,10 +250,14 @@ def test_rollback_refuses_while_push(sw_env, shell_target, tmp_path, timing):
 
 @pytest.mark.posix_pty
 @pytest.mark.process_rpc
-@pytest.mark.parametrize("entry", ["rollback", "update"])
-def test_rollback_force_refuses_while_push(sw_env, shell_target, tmp_path, entry):
+@pytest.mark.parametrize(("entry", "timing"), [
+    pytest.param("rollback", "before_probe", id="rollback"),
+    pytest.param("update", "before_probe", id="update"),
+    pytest.param("rollback", "after_probe", id="rollback-after-probe"),
+])
+def test_rollback_force_refuses_while_push(sw_env, shell_target, tmp_path, entry, timing):
     if entry == "rollback":
-        _rollback_while_push(sw_env, shell_target, tmp_path, force=True, timing="before_probe")
+        _rollback_while_push(sw_env, shell_target, tmp_path, force=True, timing=timing)
         return
     # `setup --force`（0.4.1 bundle 更新 Current 0.4.0）：同一 safety_check，--force 只記 force_ignored。
     pid = _ready(sw_env, shell_target)
