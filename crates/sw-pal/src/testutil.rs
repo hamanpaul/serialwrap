@@ -197,9 +197,15 @@ pub fn nodelay(io: &dyn ConsoleIo) -> bool {
     match io.mux_handle().0 {
         #[cfg(unix)]
         MuxHandleInner::Posix(fd) => {
-            crate::console_tcp::posix::get_int_opt(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY).is_some_and(|v| v != 0)
+            crate::console_tcp::posix::get_int_opt(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY)
+                .is_some_and(|v| v != 0)
         }
-        // LOCAL-WINDOWS-TODO（P6 Task 8）：WinSocket 的 getsockopt(TCP_NODELAY)。
+        #[cfg(windows)]
+        MuxHandleInner::WinSocket(socket) => {
+            use windows_sys::Win32::Networking::WinSock::{IPPROTO_TCP, TCP_NODELAY};
+            crate::console_tcp::windows::get_int_opt(socket as _, IPPROTO_TCP, TCP_NODELAY)
+                .is_some_and(|v| v != 0)
+        }
         _ => false,
     }
 }
@@ -208,9 +214,15 @@ pub fn reuseaddr(l: &dyn ConsoleListener) -> bool {
     match l.mux_handle().0 {
         #[cfg(unix)]
         MuxHandleInner::Posix(fd) => {
-            crate::console_tcp::posix::get_int_opt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR).is_some_and(|v| v != 0)
+            crate::console_tcp::posix::get_int_opt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR)
+                .is_some_and(|v| v != 0)
         }
-        // LOCAL-WINDOWS-TODO（P6 Task 8）：WinSocket 的 getsockopt(SO_REUSEADDR)。
+        #[cfg(windows)]
+        MuxHandleInner::WinSocket(socket) => {
+            use windows_sys::Win32::Networking::WinSock::{SOL_SOCKET, SO_REUSEADDR};
+            crate::console_tcp::windows::get_int_opt(socket as _, SOL_SOCKET, SO_REUSEADDR)
+                .is_some_and(|v| v != 0)
+        }
         _ => false,
     }
 }
