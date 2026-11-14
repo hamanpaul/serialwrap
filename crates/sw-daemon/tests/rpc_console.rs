@@ -256,7 +256,7 @@ fn console_methods_no_longer_deferred() {
     let r = ServiceRig::with_console_backend("pty");
     // 編譯期內嵌（cargo_l1_results.py 以 repo 根為 cwd 執行測試執行檔，執行期相對路徑會失敗）。
     let scope = include_str!("../../../tests/acceptance/slice21_scope.yaml");
-    let still = support::deferred_methods(scope, &["2.1", sw_core::SLICE]);
+    let still = support::deferred_methods(scope, &["2.1", "2.2", "2.3", sw_core::SLICE]);
     assert!(still.iter().all(|m| !m.starts_with("session.console_")), "{still:?}");
     for m in ["session.console_attach", "session.console_detach", "session.console_list"] {
         let resp = r.call(m, r#"{"selector":"COM0","client_id":"x"}"#);

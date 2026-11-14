@@ -25,6 +25,7 @@ import pytest
 from bb_faketarget import FakeTarget
 from bb_harness import is_rust
 from bb_p7 import wait_state
+from rpc_meta import rpc_body
 
 pytestmark = [pytest.mark.posix_only, pytest.mark.posix_pty, pytest.mark.process_rpc]
 
@@ -187,15 +188,13 @@ def test_device_attach_during_reboot_recovery_already_attached(p7, tmp_path):
         tx_mark = tgt.rx_mark()
         rc, reply = p7.cli("device", "attach", "--selector", "COM0")
         assert rc == 0 and reply, (rc, reply)
-        assert list(reply) == sorted(reply), reply
-        assert set(reply) == {
-            "already_attached",
-            "code_fingerprint",
-            "id",
-            "ok",
-            "session",
-            "version",
-        }, reply
+        body = rpc_body(
+            reply,
+            expected_keys=("already_attached", "ok", "session"),
+            required_meta_keys=("id", "version"),
+        )
+        assert body["already_attached"] is True, reply
+        assert body["ok"] is True, reply
         assert (reply["ok"], reply["already_attached"]) == (True, True), reply
         assert reply["session"]["state"] == "RECOVERING", reply
         assert _row(p7)["state"] == "RECOVERING"

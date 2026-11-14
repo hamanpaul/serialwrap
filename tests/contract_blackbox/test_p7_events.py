@@ -18,6 +18,7 @@ import pytest
 from bb_faketarget import FakeTarget
 from bb_harness import is_rust, python_baseline_interpreter, run_cli
 from bb_p7 import wait_state
+from rpc_meta import rpc_body
 
 pytestmark = [pytest.mark.posix_only, pytest.mark.posix_pty, pytest.mark.process_rpc]
 
@@ -128,7 +129,8 @@ def test_rule_crud_and_reload(p7, tmp_path):
     rule = json.loads(rf.read_text(encoding="utf-8"))
     rc, j = p7.cli("event", "add", "--file", str(rf))
     assert rc == 0, (rc, j)
-    assert {k: v for k, v in j.items() if k not in ("id", "version")} == {**rule, "ok": True}, j
+    body = rpc_body(j, expected_keys=tuple(sorted({*rule, "ok"})))
+    assert body == {**rule, "ok": True}, j
     rc, j = p7.cli("event", "show", "p7.crud")
     assert rc == 0 and j["rule"] == rule, (rc, j)
     assert j["counter"] == {"exhausted": False, "fires": 0, "last_fire_ts": None}, j

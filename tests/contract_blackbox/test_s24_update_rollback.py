@@ -231,6 +231,23 @@ def _assert_previous_python_daemon(pid: int, install_root: Path) -> None:
     assert expected_entry in argv, f"Previous Python daemon argv 未指向 {expected_entry}：{argv}"
 
 
+def _previous_python_daemon_pids(install_root: Path) -> list[int]:
+    """以隔離 install root 的實際 argv 找到已啟動的 Previous Python daemon。"""
+    expected_entry = str(install_root / "versions" / OLD / "py" / "serialwrapd.py")
+    matches: list[int] = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        try:
+            argv = _python_daemon_cmdline(pid)
+        except OSError:
+            continue
+        if expected_entry in argv and _proc_active(pid):
+            matches.append(pid)
+    return sorted(matches)
+
+
 def _stop_cross_stage_daemon_via_handoff(sw_env, timeout_s: float = 15.0) -> None:
     """以 SC-23 handoff_stop 清理目前 endpoint 的 daemon，不發 daemon.stop 或 signal。"""
     sw_env.stop_via_handoff(timeout_s=timeout_s)
@@ -351,14 +368,11 @@ def test_rollback_cross_stage_ready_never_double_held(
             while runner.is_alive() and time.monotonic() < deadline:
                 if original_proc.poll() is not None and old_gone_at is None:
                     old_gone_at = time.monotonic()
-                try:
-                    status = sw_env.rpc("health.status", {}, timeout_s=0.1)
-                except (OSError, ValueError, TimeoutError):
-                    status = {}
-                observed_pid = status.get("pid") if status.get("ok") is True else None
-                if isinstance(observed_pid, int) and observed_pid != current_pid and new_seen_at is None:
+                matches = _previous_python_daemon_pids(inst.root)
+                assert len(matches) <= 1, f"隔離 install root 出現多個 Previous Python daemon：{matches}"
+                if matches and new_seen_at is None:
+                    previous_pid = matches[0]
                     new_seen_at = time.monotonic()
-                    previous_pid = observed_pid
                     assert old_gone_at is not None, (
                         f"Previous daemon pid={previous_pid} 在 Current pid={current_pid} 消失前已出現"
                     )

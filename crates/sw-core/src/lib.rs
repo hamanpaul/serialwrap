@@ -3,8 +3,8 @@
 /// `Clock::mono_ns()` 的單位（納秒）。
 pub type Mono = u64;
 
-/// 目前交付的切片識別字串（P6 Task 10：Slice 2.2 承接 console RPC，增補 #24）。
-pub const SLICE: &str = "2.2";
+/// 目前交付的切片識別字串（P8-T14：Slice 2.4 承接 `daemon.handoff_stop`）。
+pub const SLICE: &str = "2.4";
 
 pub mod actor;
 pub mod admission;

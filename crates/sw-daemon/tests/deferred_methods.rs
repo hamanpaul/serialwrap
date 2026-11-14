@@ -17,7 +17,7 @@ fn deferred_methods_excludes_delivered_slices() {
     let after_22 = support::deferred_methods(SCOPE, &["2.1", "2.2"]);
     assert!(after_22.is_empty(), "{after_22:?}");
 
-    let after_24 = support::deferred_methods(SCOPE, &["2.1", "2.2", "2.3", "2.4"]);
+    let after_24 = support::deferred_methods(SCOPE, &["2.1", "2.2", "2.3", sw_core::SLICE]);
     assert!(after_24.is_empty(), "{after_24:?}");
 }
 

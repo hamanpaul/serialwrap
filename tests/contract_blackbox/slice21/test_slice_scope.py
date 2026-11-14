@@ -1,8 +1,8 @@
-"""Slice 2.1 範圍清單（黑箱）：延後與未支援 method 一律回 METHOD_NOT_FOUND 且無副作用。
+"""Slice 2.1 範圍清單（黑箱）：尚未交付的 method 一律回 METHOD_NOT_FOUND 且無副作用。
 
 僅在 `SERIALWRAP_AB_LABEL` 以 `rust-s21` 開頭（Rust Slice 2.1 輪）時執行；Python 基線 skip。
 deferred method 清單取自 `tests/acceptance/slice21_scope.yaml`（Task 0 凍結）；
-P5 Task 0 雙審修正：同時涵蓋 `unsupported_catalog_methods`（`daemon.handoff_stop`，P8-T14 靠它讓更新與回滾 fail-closed）。
+P5 Task 0 雙審修正：同時涵蓋 `unsupported_catalog_methods`；已交付切片的 method 不再列為未支援。
 """
 import os
 from pathlib import Path
@@ -12,8 +12,17 @@ import pytest
 pytestmark = pytest.mark.cap_posix_pty
 
 SCOPE = Path(__file__).resolve().parents[3] / "tests" / "acceptance" / "slice21_scope.yaml"
-# Rust daemon 目前交付的切片（`sw_core::SLICE`）。
-DELIVERED_SLICE = "2.2"
+RUST_SLICE = Path(__file__).resolve().parents[3] / "crates" / "sw-core" / "src" / "lib.rs"
+
+
+def _delivered_slice() -> str:
+    """讀取 Rust daemon 實際編譯使用的 `sw_core::SLICE` 常數。"""
+    import re
+
+    source = RUST_SLICE.read_text(encoding="utf-8")
+    match = re.search(r'^pub const SLICE: &str = "([0-9]+(?:\.[0-9]+)+)";$', source, re.MULTILINE)
+    assert match is not None, "找不到 crates/sw-core/src/lib.rs 的 sw_core::SLICE"
+    return match.group(1)
 
 
 def _slice_key(text: str) -> tuple[int, ...]:
@@ -39,11 +48,13 @@ def test_deferred_methods(shell_daemon):
 
     scope = yaml.safe_load(SCOPE.read_text(encoding="utf-8"))
     assert len(scope["deferred_methods"]) == 3
-    # P7←P6 合併 D4：console 已交付、event 已移入 served；P8 Task 6：file method 亦已移入 served，
-    # 晚於 2.2 的延後 method 已無（下方仍檢查 unsupported_catalog_methods）。
-    deferred = [row["method"] for row in scope["deferred_methods"] if _slice_key(row["slice"]) > _slice_key(DELIVERED_SLICE)]
-    assert deferred == []
-    unsupported = [row["method"] for row in scope["unsupported_catalog_methods"]]
+    delivered = _delivered_slice()
+    deferred = [row["method"] for row in scope["deferred_methods"] if _slice_key(row["slice"]) > _slice_key(delivered)]
+    unsupported = [
+        row["method"]
+        for row in scope["unsupported_catalog_methods"]
+        if _slice_key(row["slice"]) > _slice_key(delivered)
+    ]
     methods = deferred + unsupported
     seq0 = shell_daemon.sw("wal", "current-seq")["seq"]
     for method in methods:
