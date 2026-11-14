@@ -416,7 +416,8 @@ class FakeTarget:
                 self._stop.wait(remaining)
                 continue
             self._emit_quiet(line)
-            t_next += interval
+            # 排程延遲時跳過錯過的週期，避免連續補送雜訊並長時間占住 PTY 寫入鎖。
+            t_next = max(t_next + interval, time.monotonic() + interval)
 
     def _maybe_relock(self) -> None:
         lock = self.console_lock

@@ -146,7 +146,7 @@ def test_d_boot_script_timing_within_100ms(make_target, tmp_path):
 
 
 @pytest.mark.posix_pty
-def test_e_noise_interval_within_20_percent(make_target, tmp_path):
+def test_e_noise_interval_within_20_percent(make_target, tmp_path, monkeypatch):
     ft = make_target(login_steps=[], noise={"interval_ms": 100, "pattern": "kernel: noise"})
     s = _Slave(ft.start(tmp_path / "by-id-e"))
     try:
@@ -160,6 +160,51 @@ def test_e_noise_interval_within_20_percent(make_target, tmp_path):
         assert 0.08 <= mean <= 0.12, mean
     finally:
         s.close()
+
+    # 若 noise thread 晚醒跨過多個週期，只送一行並從現在重新排期；不得補送成突發資料。
+    import bb_faketarget
+
+    class _Clock:
+        now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+    clock = _Clock()
+
+    class _Stop:
+        stalled = False
+        stopped = False
+
+        def is_set(self):
+            return self.stopped
+
+        def wait(self, timeout):
+            if not self.stalled:
+                self.stalled = True
+                clock.now += timeout + 0.3  # 模擬排程器錯過三個 100 ms 週期
+            else:
+                clock.now += timeout
+            return False
+
+        def set(self):
+            self.stopped = True
+
+    delayed = make_target(noise={"interval_ms": 100, "pattern": "kernel: noise"})
+    stop = _Stop()
+    delayed._stop = stop
+    emissions = []
+
+    def record_emission(data):
+        emissions.append((clock.monotonic(), data))
+        if len(emissions) == 2:
+            stop.stopped = True
+
+    delayed._emit_quiet = record_emission
+    monkeypatch.setattr(bb_faketarget.time, "monotonic", clock.monotonic)
+    delayed._noise_loop()
+    assert [data for _, data in emissions] == [b"kernel: noise\r\n"] * 2
+    assert emissions[1][0] - emissions[0][0] >= 0.1 - 1e-9, emissions
 
 
 @pytest.mark.posix_pty
