@@ -483,12 +483,290 @@ fn sticky_persisted_only_when_ready_and_path_unchanged() {
         "改指後 attach worker 必須已收尾，events={events:?}"
     );
     m2.wait_state("COM0", "READY");
+    assert_eq!(
+        m2.serial.open_attempts("/dev/ttyMOVED"),
+        1,
+        "舊路徑 close receipt 到達後，新路徑只送出一次 OpenBridge：{:?}",
+        m2.events()
+    );
     // state.json 一律寫出 profile_detected 區段（Python `_save_state` 的 5 個 key），故以載入結果判斷「未寫入」。
     assert!(
         m2.load_state_now().profile_detected.is_empty(),
         "READY 前 real_path 改變時不得寫入 sticky：{}",
         m2.state_text()
     );
+}
+
+#[test]
+fn sticky_retarget_waits_for_close_receipt_then_opens_new_path_once() {
+    const BY_ID: &str = "/s/by-id/usb-S";
+    const OLD_REAL: &str = "/dev/ttyOLD-STICKY";
+    const NEW_REAL: &str = "/dev/ttyMOVED";
+
+    let mut loaded = LoadedState::default();
+    loaded
+        .profile_detected
+        .insert(BY_ID.to_string(), "t".to_string());
+    let m = ManagerRig::with(&manager_yaml(&[]), loaded, None);
+    let old_device = m.add_device_at(BY_ID, OLD_REAL);
+    install_shell_replies(&old_device);
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    m.wait_state("COM0", "READY");
+    assert_eq!(
+        s_of(&m.session("COM0"), "profile_source").as_deref(),
+        Some("sticky"),
+        "本案例必須走 sticky profile"
+    );
+
+    struct ReleasePauseOnDrop(sw_pal::fakes::serial::FakeDevice);
+    impl Drop for ReleasePauseOnDrop {
+        fn drop(&mut self) {
+            self.0.release_pause();
+        }
+    }
+
+    old_device.pause_next_close();
+    let _release_close = ReleasePauseOnDrop(old_device.clone());
+    m.retarget_by_id_no_wait(BY_ID, NEW_REAL);
+    assert!(
+        old_device.wait_paused(RPC),
+        "sticky 改指必須停在舊路徑尚未回覆 CloseReceipt 的窗口"
+    );
+    assert_eq!(
+        m.serial.open_attempts(NEW_REAL),
+        0,
+        "舊路徑 CloseReceipt 前不得開新路徑：{:?}",
+        m.events()
+    );
+
+    old_device.release_pause();
+    wait_until("sticky 新路徑已 open", || {
+        m.events()
+            .iter()
+            .any(|event| event == &format!("open:{NEW_REAL}"))
+    });
+    assert!(
+        m.mgr
+            .wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)),
+        "CloseReceipt 後新路徑 attach worker 應收尾：{:?}",
+        m.events()
+    );
+    m.wait_state("COM0", "READY");
+    let events = m.events();
+    let close_old = events
+        .iter()
+        .position(|event| event == &format!("close:{OLD_REAL}"))
+        .expect("sticky 舊路徑應留下 close 記錄");
+    let open_new = events
+        .iter()
+        .position(|event| event == &format!("open:{NEW_REAL}"))
+        .expect("sticky 新路徑應留下 open 記錄");
+    assert!(
+        close_old < open_new,
+        "新路徑必須晚於舊路徑 CloseReceipt：{events:?}"
+    );
+    assert_eq!(old_device.close_count(), 1, "sticky 舊路徑只關閉一次");
+    assert_eq!(
+        m.serial.open_attempts(NEW_REAL),
+        1,
+        "舊路徑 CloseReceipt 後 sticky 新路徑只送出一次 OpenBridge：{events:?}"
+    );
+    eprintln!(
+        "sticky_retarget old_terminal=Closed state=READY new_open_attempts=1 events={events:?}"
+    );
+}
+
+#[test]
+fn sticky_retarget_cancelled_before_and_after_take_never_reopens() {
+    const BY_ID: &str = "/s/by-id/usb-S";
+    const OLD_REAL: &str = "/dev/ttyOLD-STICKY";
+    const NEW_REAL: &str = "/dev/ttyMOVED";
+
+    struct ResumeOnDrop(crossbeam_channel::Sender<()>);
+    impl Drop for ResumeOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.try_send(());
+        }
+    }
+
+    struct ReleasePauseOnDrop(sw_pal::fakes::serial::FakeDevice);
+    impl Drop for ReleasePauseOnDrop {
+        fn drop(&mut self) {
+            self.0.release_pause();
+        }
+    }
+
+    let run_window = |before_take: bool| {
+        let mut loaded = LoadedState::default();
+        loaded
+            .profile_detected
+            .insert(BY_ID.to_string(), "t".to_string());
+        let m = ManagerRig::with(&manager_yaml(&[]), loaded, None);
+        let old_device = m.add_device_at(BY_ID, OLD_REAL);
+        m.reply_probe(OLD_REAL, b"root@t:/# ");
+
+        let (open_enter_tx, open_enter_rx) = crossbeam_channel::bounded(1);
+        let (open_resume_tx, open_resume_rx) = crossbeam_channel::bounded(1);
+        let _resume_open = ResumeOnDrop(open_resume_tx.clone());
+        let token = if before_take {
+            let (close_enter_tx, close_enter_rx) = crossbeam_channel::bounded(1);
+            let (close_resume_tx, close_resume_rx) = crossbeam_channel::bounded(1);
+            let _resume_close = ResumeOnDrop(close_resume_tx.clone());
+            m.mgr.set_custody_close_pre_notify_hook_for_test(
+                BY_ID,
+                Box::new(move || {
+                    let _ = close_enter_tx.send(());
+                    let _ = close_resume_rx.recv();
+                }),
+            );
+            m.mgr
+                .set_open_bridge_pre_take_hook_for_test(Box::new(move || {
+                    let _ = open_enter_tx.send(());
+                    let _ = open_resume_rx.recv();
+                }));
+            m.mgr.update_devices(&m.snapshot());
+            m.mgr.bootstrap_attach();
+            assert!(
+                open_enter_rx.recv_timeout(RPC).is_ok(),
+                "pre-take 窗口應停在 OpenBridge 接手前：{:?}",
+                m.events()
+            );
+            let custody = m
+                .mgr
+                .custody_for_test(BY_ID)
+                .expect("pre-take 窗口應保留舊路徑 custody");
+            let token = custody.token;
+            assert!(
+                matches!(custody.phase, CustodyPhaseSnapshot::Held),
+                "pre-take 窗口須仍為 Held：{custody:?}"
+            );
+            assert_eq!(m.state_of("COM0").as_deref(), Some("ATTACHING"));
+            assert_eq!(
+                s_of(&m.session("COM0"), "profile_source").as_deref(),
+                Some("sticky")
+            );
+
+            std::thread::scope(|scope| {
+                let manager = &m;
+                let retarget = scope.spawn(move || {
+                    manager.retarget_by_id_no_wait(BY_ID, NEW_REAL);
+                });
+                assert!(
+                    close_enter_rx.recv_timeout(RPC).is_ok(),
+                    "pre-take 改指應完成舊 handle close 並停在回條通知前：{:?}",
+                    m.events()
+                );
+                let terminal = m
+                    .mgr
+                    .terminal_for_test(token)
+                    .expect("pre-take close 前應登記終態");
+                assert!(
+                    matches!(terminal.handle, sw_core::custody::TerminalHandle::Closed),
+                    "pre-take 舊路徑已關閉：{terminal:?}"
+                );
+                assert_eq!(m.serial.open_attempts(NEW_REAL), 0);
+                open_resume_tx.send(()).expect("放行 pre-take 開埠 worker");
+                close_resume_tx
+                    .send(())
+                    .expect("放行 pre-take close receipt");
+                retarget.join().expect("pre-take 改指執行緒");
+            });
+            token
+        } else {
+            m.mgr
+                .set_open_bridge_post_take_hook_for_test(Box::new(move || {
+                    let _ = open_enter_tx.send(());
+                    let _ = open_resume_rx.recv();
+                }));
+            m.mgr.update_devices(&m.snapshot());
+            m.mgr.bootstrap_attach();
+            assert!(
+                open_enter_rx.recv_timeout(RPC).is_ok(),
+                "post-take 窗口應停在 OpenBridge 接手後：{:?}",
+                m.events()
+            );
+            let custody = m
+                .mgr
+                .custody_for_test(BY_ID)
+                .expect("post-take 窗口應保留舊路徑 custody");
+            let token = custody.token;
+            assert!(
+                matches!(custody.phase, CustodyPhaseSnapshot::Taken { .. }),
+                "post-take 窗口須已 Taken：{custody:?}"
+            );
+            assert_eq!(m.state_of("COM0").as_deref(), Some("ATTACHING"));
+            assert_eq!(
+                s_of(&m.session("COM0"), "profile_source").as_deref(),
+                Some("sticky")
+            );
+
+            m.retarget_by_id_no_wait(BY_ID, NEW_REAL);
+            old_device.pause_next_close();
+            let _release_close = ReleasePauseOnDrop(old_device.clone());
+            open_resume_tx.send(()).expect("放行 post-take 開埠 worker");
+            assert!(
+                old_device.wait_paused(RPC),
+                "post-take 改指應停在舊路徑 close receipt 前：{:?}",
+                m.events()
+            );
+            assert_eq!(m.serial.open_attempts(NEW_REAL), 0);
+            old_device.release_pause();
+            wait_until("post-take 舊路徑關閉終態", || {
+                m.mgr.terminal_for_test(token).is_some_and(|terminal| {
+                    matches!(terminal.handle, sw_core::custody::TerminalHandle::Closed)
+                })
+            });
+            token
+        };
+
+        assert!(
+            m.mgr
+                .wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)),
+            "取消後舊路徑 attach worker 應收尾：{:?}",
+            m.events()
+        );
+        let terminal = m
+            .mgr
+            .terminal_for_test(token)
+            .expect("舊路徑 close receipt 應有終態");
+        assert!(
+            matches!(&terminal.handle, sw_core::custody::TerminalHandle::Closed),
+            "舊路徑必須以 close receipt 確認關閉：{terminal:?}"
+        );
+        assert_eq!(old_device.close_count(), 1, "舊路徑只關閉一次");
+        let state = m.state_of("COM0");
+        let expected_state = if before_take {
+            "RECOVERING"
+        } else {
+            "DETACHED"
+        };
+        assert!(
+            matches!(state.as_deref(), Some("RECOVERING" | "DETACHED")),
+            "取消後維持 Python 基線的 RECOVERING／DETACHED 狀態：{state:?}"
+        );
+        assert_eq!(
+            state.as_deref(),
+            Some(expected_state),
+            "{} 窗口的取消狀態符合 ledger：{state:?}",
+            if before_take { "pre-take" } else { "post-take" }
+        );
+        assert_eq!(
+            m.serial.open_attempts(NEW_REAL),
+            0,
+            "舊路徑 close receipt 後，本次已取消的 sticky attach 不得重開新路徑：{:?}",
+            m.events()
+        );
+        eprintln!(
+            "sticky_cancelled_window={} old_terminal={:?} state={} new_open_attempts=0",
+            if before_take { "pre-take" } else { "post-take" },
+            &terminal.handle,
+            state.as_deref().unwrap_or("<missing>")
+        );
+    };
+
+    run_window(true);
+    run_window(false);
 }
 
 #[test]
