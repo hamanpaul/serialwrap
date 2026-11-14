@@ -33,6 +33,7 @@ mkdir -p "$RUN/logs"
 cd "$ROOT"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 [[ "$TARGET_DIR" == /* ]] || TARGET_DIR="$ROOT/$TARGET_DIR"
+source "$ROOT/scripts/rust/gate_prereqs.sh" --gate
 REPORT=(python3 scripts/rust/p7_gate_report.py)
 # 受測 artifact 於建置後立即快照到 run 目錄：之後的 cargo L1 列（--features test-fakes）與全套 pytest 會重建
 # target/debug/ 的同名執行檔，若直接引用會讓黑箱跑到 test-fakes 版、verify 的 sha256 也對不上（第 12 輪實跑揭露）。
@@ -131,12 +132,34 @@ run_row "cargo test --workspace" cargo-test-workspace --l1 "$RUN/cargo-test-work
   python3 scripts/rust/cargo_l1_results.py --platform linux --out "$RUN/cargo-test-workspace/l1-results.json" \
   -- --workspace --features test-fakes
 # 3／4. Windows 原生（non-COM 與 COM pair）；能力缺失時只記錄，由報告判 BLOCKED-OWNER。
-win_l1() {  # win_l1 <dir>：取 win-test 最新報告的 l1_results
-  local rep l1
-  rep="$(ls -t "$ROOT"/target/win-test-report/*.json 2>/dev/null | grep -v -e '/l1-results-' -e '/summary-' | head -n1 || true)"
-  [[ -n "$rep" ]] || return 0
-  l1="$(python3 -c 'import json,sys,os; d=json.load(open(sys.argv[1])); print(os.path.join(os.path.dirname(sys.argv[1]), d.get("l1_results") or ""))' "$rep")"
-  [[ -f "$l1" ]] && cp "$l1" "$1/l1-results.json"
+win_l1() {  # win_l1 <dir> <該次 win-test log>：只匯入本次命令明列的 report
+  local dir="$1" log="$2" rep l1
+  if ! rep="$(python3 - "$log" "$ROOT/target/win-test-report" <<'PY'
+import pathlib, sys
+log = pathlib.Path(sys.argv[1])
+root = pathlib.Path(sys.argv[2]).resolve()
+paths = []
+for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+    candidate = pathlib.Path(line.strip())
+    if candidate.is_absolute() and candidate.parent.resolve() == root and candidate.is_file():
+        if candidate.name.endswith(".json") and not candidate.name.startswith(("l1-results-", "summary-")):
+            paths.append(candidate)
+print(paths[-1] if paths else "")
+PY
+)"; then rep=""; fi
+  [[ -n "$rep" ]] || { echo "本次 win-test 未輸出 report path" >>"$log"; return 0; }
+  if ! l1="$(python3 - "$rep" <<'PY'
+import json, pathlib, sys
+report = pathlib.Path(sys.argv[1])
+name = json.loads(report.read_text(encoding="utf-8")).get("l1_results")
+print(report.parent / name if isinstance(name, str) and name else "")
+PY
+)"; then l1=""; fi
+  if [[ -n "$l1" && -f "$l1" ]]; then
+    cp "$l1" "$dir/l1-results.json"
+  else
+    echo "本次 win-test report 未包含可讀 l1_results" >>"$log"
+  fi
   return 0
 }
 mkdir -p "$RUN/win-non-com" "$RUN/win-com"
@@ -151,7 +174,7 @@ if [[ " ${CAPS[*]} " == *" windows_native "* ]]; then
   record_existing "win-test.sh (non-COM)" - "$RUN/logs/win-non-com.log" '["scripts/rust/win-test.sh"]'
 else
   exec_logged win-non-com bash scripts/rust/win-test.sh "${WIN_NONCOM_ARGS[@]}"
-  win_l1 "$RUN/win-non-com"
+  win_l1 "$RUN/win-non-com" "$RUN/logs/win-non-com.log"
   record_existing "win-test.sh (non-COM)" "$LAST_RC" "$RUN/logs/win-non-com.log" \
     "$(argv_json scripts/rust/win-test.sh "${WIN_NONCOM_ARGS[@]}")" --l1 "$RUN/win-non-com/l1-results.json" --platform-windows
 fi
@@ -161,7 +184,7 @@ if [[ " ${CAPS[*]} " == *" windows_com "* ]]; then
 else
   # win-test.sh 只在 `--` 之後接受 cargo 參數（審查 P7-cd7acf0-5）。
   exec_logged win-com bash scripts/rust/win-test.sh "${WIN_COM_ARGS[@]}"
-  win_l1 "$RUN/win-com"
+  win_l1 "$RUN/win-com" "$RUN/logs/win-com.log"
   record_existing "win-test.sh --caps windows_com" "$LAST_RC" "$RUN/logs/win-com.log" \
     "$(argv_json scripts/rust/win-test.sh "${WIN_COM_ARGS[@]}")" --l1 "$RUN/win-com/l1-results.json" --platform-windows
 fi

@@ -59,7 +59,10 @@ pub fn feature_bundle(cli: &Path) -> (PathBuf, PathBuf) {
         .filter(|path| path.is_file())
         .or_else(|| {
             let repository = repository_root();
-            let fallback = repository.join("target/s2-par/gpa3/bundle/bin/serialwrap");
+            let fallback = std::env::var_os("SW_TEST_FEATURE_BUNDLE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| repository.join("target/s2-par/gpz/prereqs/bundle"));
+            let fallback = fallback.join("bin/serialwrap");
             let fallback = fs::canonicalize(fallback).ok()?;
             let fallback_version = fallback.parent()?.parent()?;
             let fallback_manifest = fallback_version.join("release-manifest.json");
@@ -85,13 +88,14 @@ pub fn feature_bundle(cli: &Path) -> (PathBuf, PathBuf) {
 
 /// 取得由 mkbundle 產生的舊版安裝來源；manifest 與雜湊不得由測試手寫。
 pub fn old_bundle_dir() -> PathBuf {
-    let directory = repository_root()
-        .join("target/s2-par/gpa3/base-bundle/versions")
-        .join(OLD_VERSION);
+    let base_bundle = std::env::var_os("SW_TEST_BASE_BUNDLE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repository_root().join("target/s2-par/gpz/prereqs/base-bundle"));
+    let directory = base_bundle.join("versions").join(OLD_VERSION);
     let manifest_path = directory.join("release-manifest.json");
     assert!(
         manifest_path.is_file(),
-        "找不到隔離安裝用舊版 dev bundle：{}；請執行 `scripts/rust/mkbundle.sh --dev --profile debug --version-override 0.0.1 --out target/s2-par/gpa3/base-bundle`",
+        "找不到隔離安裝用舊版 dev bundle：{}；請執行 `scripts/rust/gate_prereqs.sh` 建立候選版前置 bundle",
         manifest_path.display()
     );
     assert!(directory.join("SHA256SUMS").is_file(), "舊版 bundle 缺少工具產生的 SHA256SUMS");
@@ -332,8 +336,8 @@ pub fn isolated_cli_env(
 
 fn artifact_dir() -> PathBuf {
     let repository = repository_root();
-    let directory = repository.join("target/s2-par/gpa3");
-    fs::create_dir_all(&directory).expect("建立 gpa3 輸出目錄");
+    let directory = repository.join("target/s2-par/gpz/i4/handoff-stop");
+    fs::create_dir_all(&directory).expect("建立 gpz ITEM 4 handoff-stop 輸出目錄");
     directory
 }
 

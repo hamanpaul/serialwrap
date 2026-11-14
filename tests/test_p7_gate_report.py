@@ -101,6 +101,9 @@ def test_required_rows_complete():
         "regen_lock --check", "cases.lock slice_2.3 coverage",
         "python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
         "policy_check"}
+    script = (ROOT / "scripts/rust/p7_gate.sh").read_text(encoding="utf-8")
+    assert 'win_l1() {  # win_l1 <dir> <該次 win-test log>' in script
+    assert 'ls -t "$ROOT"/target/win-test-report' not in script
 
 
 def test_missing_required_row_is_incomplete(tmp_path):
@@ -170,6 +173,23 @@ def test_duplicate_or_unfinished_is_not_pass(tmp_path):
 def test_test_row_without_l1_results_is_incomplete(tmp_path):
     md = g.build_report(_results(tmp_path, [_row("cargo test --workspace", passed=500)]), l1_lock=_lock(tmp_path))
     assert "| cargo test --workspace | INCOMPLETE |" in md
+
+    row = _l1_row(tmp_path, [(REQ[0], "passed")], plat="windows", name="win-test.sh (non-COM)",
+                  sid="p7_gate:win-test-sh-non-com", tag="windows-old")
+    row["platform"] = "windows"
+    report_path = pathlib.Path(row["l1_results"])
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["provenance"] = {"git": {"head": "f" * 40, "clean": True,
+                                    "end": {"head": "f" * 40, "clean": True}}}
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    run = _results(tmp_path, [row], name="run_windows_old_head")
+    data = json.loads((run / "results.json").read_text(encoding="utf-8"))
+    data["git_head"] = g.current_head()
+    (run / "results.json").write_text(json.dumps(data), encoding="utf-8")
+    win_lock = _lock(tmp_path, sid="p7_gate:win-test-sh-non-com", plat="windows", ids=[REQ[0]])
+    md = g.build_report(run, l1_lock=win_lock)
+    assert "| win-test.sh (non-COM) | INCOMPLETE |" in md
+    assert "provenance.git.head" in md
 
 
 def test_full_required_set_passes(tmp_path):

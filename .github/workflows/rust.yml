@@ -63,7 +63,9 @@ jobs:
       - name: "cargo check（Windows GNU target）"
         run: cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
       - name: "cargo test（Linux，全部 feature）"
-        run: cargo test --workspace --all-features
+        run: |
+          source scripts/rust/gate_prereqs.sh --ci
+          cargo test --workspace --all-features
       - name: "錯誤碼生成檔與 contracts 一致性"
         run: python3 scripts/rust/gen_error_codes.py --check
       - name: "Rust 相關 pytest（SW_REQUIRE_CARGO=1：缺 cargo 即 FAIL，不得 SKIP）"

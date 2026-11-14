@@ -68,6 +68,11 @@ REQUIRED_SECTIONS: dict[str, tuple[str, ...]] = {
     "s22_gate:windows_cap_windows_com_daemon": ("windows",),
     "s22_gate:py_parity": ("linux",),
 }
+WINDOWS_PROVENANCE_SETS = frozenset({
+    "s22_gate:win_test",
+    "s22_gate:windows_cap_windows_com",
+    "s22_gate:windows_cap_windows_com_daemon",
+})
 L15_FORMAT = "s22-l15-results.v1"
 PARITY_STATUSES = ("PASS", "BLOCKED-OWNER", "OWNER-DECISION-PENDING", "PROCESS-EVIDENCE")
 # rulings/p6.md（P6 OWNER-BATCH #4，#185 證據形式）：流程項以出口報告段落為證據，逐名核准，不得擴及其他承接編號。
@@ -238,15 +243,40 @@ def collect_plan(lock: dict[str, Any], results_dir: pathlib.Path) -> list[dict[s
     return plan
 
 
+def windows_provenance_problems(report: Any, candidate_head: str) -> list[str]:
+    """Windows L1 證據只接受候選 HEAD 上乾淨工作樹產生的完整報告。"""
+    if not isinstance(report, Mapping):
+        return ["Windows l1-results 不是物件"]
+    problems: list[str] = []
+    if report.get("platform") != "windows" or report.get("finished") is not True:
+        problems.append("platform 須為 windows 且 finished 須為 true")
+    provenance = report.get("provenance")
+    git = provenance.get("git") if isinstance(provenance, Mapping) else None
+    git = git if isinstance(git, Mapping) else {}
+    end = git.get("end")
+    end = end if isinstance(end, Mapping) else {}
+    for label, state in (("provenance.git", git), ("provenance.git.end", end)):
+        if state.get("head") != candidate_head or not state.get("head"):
+            problems.append(f"{label}.head={state.get('head')!r} 與候選版 {candidate_head!r} 不符")
+        if state.get("clean") is not True:
+            problems.append(f"{label}.clean={state.get('clean')!r}（須為 true）")
+    return problems
+
+
 def judge_sections(results_dir: pathlib.Path, lock: dict[str, Any], judge) -> tuple[list[dict], dict[str, list[dict]]]:
     sections: list[dict] = []
     rows_by_nodeid: dict[str, list[dict]] = {}
     sets = lock.get("sets", {})
+    candidate_head = git_revision()
     for set_id, platforms in sorted(REQUIRED_SECTIONS.items()):
         for platform in platforms:
             if platform not in (sets.get(set_id) or {}):
-                sections.append({"set_id": set_id, "platform": platform, "verdict": "INSUFFICIENT",
-                                 "reasons": ["必要集合未登記於 L1 鎖（REQUIRED_SECTIONS）"]})
+                native_windows = set_id in WINDOWS_PROVENANCE_SETS
+                verdict = "EVIDENCE_MISSING" if native_windows else "INSUFFICIENT"
+                reason = ("必要原生 Windows 集合尚未登記，無可核對的候選版證據"
+                          if native_windows else "必要集合未登記於 L1 鎖（REQUIRED_SECTIONS）")
+                sections.append({"set_id": set_id, "platform": platform, "verdict": verdict,
+                                 "reasons": [reason]})
     for set_id in sorted(k for k in sets if k.startswith(SET_PREFIX)):
         for platform, spec in sorted(lock["sets"][set_id].items()):
             section = set_id[len(SET_PREFIX):]
@@ -261,26 +291,34 @@ def judge_sections(results_dir: pathlib.Path, lock: dict[str, Any], judge) -> tu
                 except (OSError, ValueError) as exc:
                     sections.append({**entry, "verdict": "INVALID", "reasons": [f"report unreadable：{exc}"]})
                     continue
+            evidence_trusted = False
             if caps is None:
                 sections.append({**entry, "verdict": "EVIDENCE_MISSING",
                                  "reasons": ["selector 推導不出收集器 --caps（OD-53：只接受 `--ignored cap_<cap>__`）"]})
             elif report is None:
-                native_windows_cap = set_id in {
-                    "s22_gate:windows_cap_windows_com",
-                    "s22_gate:windows_cap_windows_com_daemon",
-                }
+                native_windows_cap = set_id in WINDOWS_PROVENANCE_SETS
                 verdict = "EVIDENCE_MISSING" if native_windows_cap else "INSUFFICIENT"
-                reason = f"原生 Windows 能力證據缺少：{path}" if native_windows_cap else f"report missing：{path}"
+                reason = f"原生 Windows 證據缺少：{path}" if native_windows_cap else f"report missing：{path}"
                 sections.append({**entry, "verdict": verdict, "reasons": [reason]})
                 continue
             else:
-                verdict = judge.judge(report, list(spec.get("nodeids") or []), platform=platform,
-                                      selector=spec.get("selector"))
-                sections.append({**entry, "verdict": verdict["verdict"], "reasons": list(verdict.get("reasons") or [])})
+                if set_id in WINDOWS_PROVENANCE_SETS:
+                    provenance_problems = windows_provenance_problems(report, candidate_head)
+                else:
+                    provenance_problems = []
+                evidence_trusted = caps is not None and not provenance_problems
+                if provenance_problems:
+                    sections.append({**entry, "verdict": "EVIDENCE_MISSING", "reasons": provenance_problems})
+                else:
+                    verdict = judge.judge(report, list(spec.get("nodeids") or []), platform=platform,
+                                          selector=spec.get("selector"))
+                    sections.append({**entry, "verdict": verdict["verdict"],
+                                     "reasons": list(verdict.get("reasons") or [])})
             for row in (report or {}).get("results") or []:
                 if isinstance(row, dict):
                     rows_by_nodeid.setdefault(str(row.get("nodeid")), []).append(
-                        {**row, "_platform": platform, "_section": set_id, "_evidence": caps is not None})
+                        {**row, "_platform": platform, "_section": set_id,
+                         "_evidence": evidence_trusted if report is not None else False})
     return sections, rows_by_nodeid
 
 

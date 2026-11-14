@@ -230,6 +230,7 @@ def _empty_l1_verdict(reason: str) -> dict[str, Any]:
 LOCAL_WINDOWS_SECTIONS = {
     "windows_cap_windows_native", "windows_cap_interactive_desktop", "windows_cap_supervisor_runtime",
 }
+WINDOWS_PROVENANCE_SECTIONS = LOCAL_WINDOWS_SECTIONS | {"windows_native_l1", "windows_cap_windows_com"}
 
 
 def windows_evidence_problems(l1: Any, candidate: Any) -> list[str]:
@@ -252,6 +253,56 @@ def windows_evidence_problems(l1: Any, candidate: Any) -> list[str]:
         if state.get("clean") is not True:
             problems.append(f"{label}.clean={state.get('clean')!r}（須為 true）")
     return [f"LOCAL-WINDOWS-TODO：{reason}" for reason in problems]
+
+
+def windows_test_argv(section: str, lock: Mapping[str, Any]) -> list[str] | None:
+    """由 Windows 必要集合 selector 推導 win-test.sh 的實際 argv。"""
+    platform = TEST_SECTIONS.get(section)
+    if platform != "windows":
+        return None
+    set_id = section_expect_set(section)
+    if not set_id:
+        return None
+    spec = ((lock.get("sets") or {}).get(set_id) or {}).get(platform)
+    if not isinstance(spec, Mapping):
+        return None
+    selector = spec.get("selector")
+    caps = derive_caps(selector)
+    if caps is None or not caps:
+        return None
+    argv = [str(arg) for arg in ((selector or {}).get("argv") or [])]
+    return [part for cap in caps for part in ("--caps", cap)] + argv
+
+
+def section_expect_set(section: str) -> str | None:
+    """由 slice21 report schema 對照 section 的必要集合。"""
+    expect_yaml = _load_yaml(ROOT / "tests" / "acceptance" / "slice21_gate_expect.yaml")
+    row = next((item for item in (expect_yaml.get("sections") or []) if item.get("name") == section), None)
+    value = row.get("required_set") if isinstance(row, Mapping) else None
+    return str(value) if value else None
+
+
+def supervisor_runtime_changed(before: Any, after: Any) -> bool:
+    """systemd user unit 清單或 serialwrap.service 狀態有任一變化即為 True。"""
+    return before != after
+
+
+def supervisor_runtime_snapshot() -> dict[str, Any]:
+    """唯讀記錄 serialwrap user units 與 serialwrap.service 的 PID／ActiveState。"""
+    def capture(argv: list[str]) -> dict[str, Any]:
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=15, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {"exit_code": None, "stdout": "", "stderr": str(exc)}
+        return {"exit_code": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
+
+    units = capture(["systemctl", "--user", "list-units", "serialwrap*"])
+    service = capture(["systemctl", "--user", "show", "serialwrap.service", "--property=MainPID",
+                       "--property=ActiveState"])
+    return {
+        "units": units,
+        "service": service,
+    }
 
 
 def _judge_test_section(sec: Mapping[str, Any], expect: Mapping[str, Any], platform: str,
@@ -289,7 +340,7 @@ def _judge_test_section(sec: Mapping[str, Any], expect: Mapping[str, Any], platf
         l1 = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         return "EVIDENCE_MISSING", _empty_l1_verdict(f"l1_results 無法讀取：{exc}"), [f"l1_results 無法讀取：{rel}"]
-    if sec.get("name") in LOCAL_WINDOWS_SECTIONS:
+    if sec.get("name") in WINDOWS_PROVENANCE_SECTIONS:
         problems = windows_evidence_problems(l1, candidate)
         if problems:
             return "EVIDENCE_MISSING", _empty_l1_verdict("；".join(problems)), problems
@@ -1353,6 +1404,56 @@ def cmd_caps_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_windows_test_argv(args: argparse.Namespace) -> int:
+    lock = json.loads(pathlib.Path(args.lock).read_text(encoding="utf-8"))
+    argv = windows_test_argv(args.section, lock)
+    if argv is None:
+        print(f"slice21_gate_judge: {args.section} 的 Windows selector 無法推導", file=sys.stderr)
+        return 3
+    for arg in argv:
+        print(arg)
+    return 0
+
+
+def cmd_check_windows_l1(args: argparse.Namespace) -> int:
+    try:
+        report = json.loads(pathlib.Path(args.l1_results).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"EVIDENCE_MISSING: 無法讀取 Windows L1：{exc}")
+        return 3
+    problems = windows_evidence_problems(report, args.candidate_commit)
+    if problems:
+        print("EVIDENCE_MISSING: " + "；".join(problems))
+        return 3
+    print("PASS: Windows L1 provenance 符合候選版且工作樹乾淨")
+    return 0
+
+
+def cmd_supervisor_snapshot(args: argparse.Namespace) -> int:
+    snapshot = supervisor_runtime_snapshot()
+    text = json.dumps(snapshot, ensure_ascii=False, sort_keys=True) + "\n"
+    if args.out:
+        pathlib.Path(args.out).write_text(text, encoding="utf-8")
+    print(text, end="")
+    if any((snapshot.get(key) or {}).get("exit_code") != 0 for key in ("units", "service")):
+        return 3
+    return 0
+
+
+def cmd_supervisor_compare(args: argparse.Namespace) -> int:
+    before = json.loads(pathlib.Path(args.before).read_text(encoding="utf-8"))
+    after = json.loads(pathlib.Path(args.after).read_text(encoding="utf-8"))
+    for label, snapshot in (("before", before), ("after", after)):
+        if any((snapshot.get(key) or {}).get("exit_code") != 0 for key in ("units", "service")):
+            print(f"FAIL: {label} systemctl 快照不完整，不能確認 supervisor_runtime 前後狀態")
+            return 1
+    if supervisor_runtime_changed(before, after):
+        print("FAIL: supervisor_runtime 執行前後的 user units 或 serialwrap.service 狀態不同")
+        return 1
+    print("PASS: supervisor_runtime 執行前後的 user units 與 serialwrap.service 狀態相同")
+    return 0
+
+
 def cmd_judge(args: argparse.Namespace) -> int:
     report = json.loads(pathlib.Path(args.report).read_text(encoding="utf-8"))
     expect_yaml = _load_yaml(pathlib.Path(args.expect))
@@ -1428,6 +1529,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     cp = sub.add_parser("caps-plan", help="OD-53：由鎖 selector 推導 section 的收集器 --caps 與 argv")
     cp.add_argument("--section", required=True)
     cp.add_argument("--expect", default=str(ROOT / "tests" / "acceptance" / "slice21_gate_expect.yaml"))
+    wa = sub.add_parser("windows-test-argv", help="由 L1 selector 推導 win-test.sh 的 Windows argv")
+    wa.add_argument("--section", required=True)
+    wa.add_argument("--lock", default=str(ROOT / "tests" / "acceptance" / "l1_required.lock.json"))
+    cw = sub.add_parser("check-windows-l1", help="核對 Windows L1 provenance 與候選版本")
+    cw.add_argument("--l1-results", required=True)
+    cw.add_argument("--candidate-commit", required=True)
+    ss = sub.add_parser("supervisor-snapshot", help="唯讀快照 systemd user units 與 serialwrap.service")
+    ss.add_argument("--out", default=None)
+    sc = sub.add_parser("supervisor-compare", help="狀態有變即 FAIL")
+    sc.add_argument("--before", required=True)
+    sc.add_argument("--after", required=True)
     j = sub.add_parser("judge")
     j.add_argument("--report", required=True)
     j.add_argument("--expect", default=str(ROOT / "tests" / "acceptance" / "slice21_gate_expect.yaml"))
@@ -1447,6 +1559,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_wal_s1w_verdict(args)
         if args.cmd == "caps-plan":
             return cmd_caps_plan(args)
+        if args.cmd == "windows-test-argv":
+            return cmd_windows_test_argv(args)
+        if args.cmd == "check-windows-l1":
+            return cmd_check_windows_l1(args)
+        if args.cmd == "supervisor-snapshot":
+            return cmd_supervisor_snapshot(args)
+        if args.cmd == "supervisor-compare":
+            return cmd_supervisor_compare(args)
         return cmd_judge(args)
     except (OSError, ValueError, KeyError) as exc:
         print(f"slice21_gate_judge: {exc}", file=sys.stderr)

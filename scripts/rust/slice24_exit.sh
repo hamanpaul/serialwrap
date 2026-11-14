@@ -67,6 +67,7 @@ fi
 mkdir -p "$RUN_DIR/logs" "$RUN_DIR/artifacts"
 # Cargo、pytest 與 importer 的所有可寫產物固定落在本 worktree 的 target/。
 export CARGO_TARGET_DIR="$ROOT/target"
+source "$ROOT/scripts/rust/gate_prereqs.sh" --gate
 
 DRIVER_TSV="$RUN_DIR/driver.tsv"
 OWNER_TSV="$RUN_DIR/owner-evidence.tsv"

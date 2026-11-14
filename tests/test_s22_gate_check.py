@@ -87,7 +87,7 @@ def _row(nodeid: str, outcome: str = "passed") -> dict:
 
 
 def _report(platform: str, runner: str, argv: list[str], rows: list[dict], *, exit_code: int = 0, finished: bool = True) -> dict:
-    return {
+    report = {
         "schema_version": 2, "format": "l1-results.v1", "runner": runner, "platform": platform,
         # pytest 報告的 argv[0] 為程式入口（l1_judge `_report_argv` 會去掉）
         "argv": (["/x/pytest/__main__.py"] if runner == "pytest" else []) + list(argv), "markexpr": "", "counts": {}, "resources": {}, "uart_kind": "native",
@@ -95,6 +95,11 @@ def _report(platform: str, runner: str, argv: list[str], rows: list[dict], *, ex
         "collected": [r["nodeid"] for r in rows], "deselected": [], "results": rows,
         "exit_code": exit_code, "finished": finished, "deployed_content": None,
     }
+    if platform == "windows":
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+        report["provenance"] = {"git": {"head": head, "clean": True,
+                                         "end": {"head": head, "clean": True}}}
+    return report
 
 
 def _lock(win_extra: tuple[str, ...] = ()) -> dict:
@@ -264,6 +269,23 @@ def test_windows_com_console_cap_requires_native_evidence(tmp_path: Path) -> Non
     assert section["verdict"] == "EVIDENCE_MISSING", section
     assert out["result"] == "INSUFFICIENT" and rc == 1
 
+    windows_nodes = {
+        "win_test": WIN_CORE,
+        "windows_cap_windows_com": WIN_COM0COM_CAPS[0],
+        "windows_cap_windows_com_daemon": WIN_DAEMON_CONSOLE_TESTS[0],
+    }
+    for set_name, nodeid in windows_nodes.items():
+        reports = _good_reports()
+        reports[(set_name, "windows")]["provenance"]["git"]["head"] = "f" * 40
+        emap = _emap()
+        emap["cases"][f"stale-windows-{set_name}"] = {"status": "AUTOMATED", "tests": [nodeid]}
+        rc, out = _run(tmp_path / f"stale-{set_name}", reports, emap=emap)
+        section = _section(out, f"s22_gate:{set_name}", "windows")
+        assert section["verdict"] == "EVIDENCE_MISSING", section
+        assert any("provenance.git.head" in reason for reason in section["reasons"]), section
+        assert _case(out, f"stale-windows-{set_name}")["status"] == "INSUFFICIENT", out
+        assert out["result"] == "INSUFFICIENT" and rc == 1
+
 
 def test_windows_daemon_console_cap_requires_native_evidence(tmp_path: Path) -> None:
     reports = _good_reports()
@@ -298,9 +320,21 @@ def test_missing_report_and_pending_entry_insufficient(tmp_path: Path) -> None:
     emap = _emap()
     emap["cases"]["bc02-normal-replay-53"] = {"status": "PENDING"}
     rc, out = _run(tmp_path, reports, emap=emap)
-    assert _section(out, "s22_gate:win_test", "windows")["verdict"] == "INSUFFICIENT"
+    assert _section(out, "s22_gate:win_test", "windows")["verdict"] == "EVIDENCE_MISSING"
     assert _case(out, "bc02-normal-replay-53")["status"] == "INSUFFICIENT"
     assert out["result"] == "INSUFFICIENT" and rc == 1
+
+
+def test_s22_gate_driver_dry_run_emits_incomplete_json(tmp_path: Path) -> None:
+    run = tmp_path / "s22"
+    proc = subprocess.run(["bash", "scripts/rust/s22_gate.sh", "--dry-run", "--run-id", "dry", "--out", str(run)],
+                          cwd=ROOT, capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    report_path = run / "dry" / "s22-gate.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["dry_run"] is True
+    assert report["result"] == "INSUFFICIENT"
+    assert _section(report, "s22_gate:win_test", "windows")["verdict"] == "EVIDENCE_MISSING"
 
 
 def test_unchecked_only_case_is_insufficient(tmp_path: Path) -> None:
@@ -328,7 +362,8 @@ def test_missing_required_sets_insufficient(tmp_path: Path) -> None:
         lock = _lock()
         del lock["sets"][missing]
         rc, out = _run(tmp_path / str(i), _good_reports(), lock=lock)
-        assert any(s["set_id"] == missing and s["verdict"] == "INSUFFICIENT" for s in out["sections"]), (missing, out)
+        expected = "EVIDENCE_MISSING" if missing == "s22_gate:win_test" else "INSUFFICIENT"
+        assert any(s["set_id"] == missing and s["verdict"] == expected for s in out["sections"]), (missing, out)
         assert out["result"] == "INSUFFICIENT" and rc == 1
 
 

@@ -53,6 +53,11 @@ mkdir -p "$RUN_DIR/sections" "$RUN_DIR/logs"
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 cd "$ROOT"
 CANDIDATE_COMMIT="$(git rev-parse HEAD)"
+if [[ "$DRY_RUN" == "1" ]]; then
+  source "$ROOT/scripts/rust/gate_prereqs.sh" --dry-run
+else
+  source "$ROOT/scripts/rust/gate_prereqs.sh" --gate
+fi
 
 LINUX_TARGET="x86_64-unknown-linux-gnu"
 WIN_TARGET="x86_64-pc-windows-gnu"
@@ -135,6 +140,17 @@ exit_for_verdict() {
 }
 
 com_reason="未提供 SW_TEST_COM_PAIR／--with-com-pair（BO-S21-01：擁有者 host COM20:COM21）"
+WIN_COM_PLAN_OK=1
+WIN_COM_ARGS=()
+WIN_COM_ARGV_TEXT="$(python3 "$JUDGE" windows-test-argv --section windows_cap_windows_com 2>/dev/null)" || WIN_COM_PLAN_OK=0
+if [[ "$WIN_COM_PLAN_OK" == "1" ]]; then
+  mapfile -t WIN_COM_ARGS <<<"$WIN_COM_ARGV_TEXT"
+fi
+WIN_COM_COMMAND='SW_TEST_CONSOLE_PAIR="${SW_TEST_CONSOLE_PAIR:-}" scripts/rust/win-test.sh'
+for arg in "${WIN_COM_ARGS[@]}"; do
+  printf -v quoted '%q' "$arg"
+  WIN_COM_COMMAND+=" $quoted"
+done
 
 if [[ "$DRY_RUN" == "1" || ( "$PREFLIGHT_OK" != "1" && "$EVIDENCE_RUN" != "1" ) ]]; then
   why="dry-run：未執行"
@@ -146,7 +162,11 @@ if [[ "$DRY_RUN" == "1" || ( "$PREFLIGHT_OK" != "1" && "$EVIDENCE_RUN" != "1" ) 
   record linux_cap_supervisor_runtime --required-set s21_gate:cap_supervisor_runtime --reason "$why"
   record py_parity --required-set s21_gate:py_parity_full --reason "$why"
   record windows_native_l1 --required-set s21_core --reason "$why；需原生 Windows（win-test.sh）"
-  record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com --reason "$com_reason"
+  if [[ "$WIN_COM_PLAN_OK" == "1" ]]; then
+    record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com --command "$WIN_COM_COMMAND" --reason "$com_reason"
+  else
+    record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com --reason "必要集合 selector 推導不出 windows_com argv（EVIDENCE_MISSING）"
+  fi
   record windows_cap_windows_native --required-set s21_gate:cap_windows_native --reason "$why；需原生 Windows 本機證據（LOCAL-WINDOWS-TODO）"
   record windows_cap_interactive_desktop --required-set s21_gate:cap_interactive_desktop --reason "$why；需原生 Windows 本機證據（LOCAL-WINDOWS-TODO）"
   record windows_cap_supervisor_runtime --required-set s21_gate:cap_supervisor_runtime --reason "$why；需原生 Windows 本機證據（LOCAL-WINDOWS-TODO）"
@@ -258,11 +278,39 @@ for cap in sys_admin supervisor_runtime; do
       --reason "必要集合的 selector 推導不出收集器 --caps（OD-53）"
   elif [[ "$probe" == available:* ]]; then
     mkdir -p "$RUN_DIR/$sec"
+    supervisor_before="$RUN_DIR/$sec/supervisor-runtime.before.json"
+    supervisor_after="$RUN_DIR/$sec/supervisor-runtime.after.json"
+    if [[ "$cap" == "supervisor_runtime" ]]; then
+      run_logged supervisor_runtime_before python3 "$JUDGE" supervisor-snapshot --out "$supervisor_before"
+      if [[ "$LAST_RC" -ne 0 ]]; then
+        record "$sec" --required-set "s21_gate:cap_$cap" --capability-probe "$cap=$probe" \
+          --exit "$LAST_RC" --log logs/supervisor_runtime_before.log --section-verdict EVIDENCE_MISSING \
+          --reason "OD-29 (3)：無法完整取得 supervisor_runtime 執行前的 systemctl 快照；未執行測試"
+        continue
+      fi
+    fi
     run_logged "$sec" python3 scripts/rust/cargo_l1_results.py --platform linux \
       --out "$RUN_DIR/$sec/l1-results.json" "${CAPS_ARGV[@]}"
+    supervisor_test_rc="$LAST_RC"
+    if [[ "$cap" == "supervisor_runtime" ]]; then
+      run_logged supervisor_runtime_after python3 "$JUDGE" supervisor-snapshot --out "$supervisor_after"
+      set +e
+      python3 "$JUDGE" supervisor-compare --before "$supervisor_before" --after "$supervisor_after" \
+        >"$RUN_DIR/logs/supervisor_runtime_guard.log" 2>&1
+      supervisor_guard_rc=$?
+      set -e
+      cat "$supervisor_before" "$supervisor_after" >>"$RUN_DIR/logs/supervisor_runtime_guard.log"
+      if [[ "$supervisor_guard_rc" -ne 0 ]]; then
+        record "$sec" --required-set "s21_gate:cap_$cap" --command "cargo_l1_results.py --platform linux ${CAPS_ARGV[*]}" \
+          --exit "$supervisor_test_rc" --log logs/supervisor_runtime_guard.log --section-verdict FAIL \
+          --reason "OD-29 (3)：supervisor_runtime 執行前後的 serialwrap* units／serialwrap.service MainPID 或 ActiveState 有變化；停止 gate"
+        assemble
+        exit 1
+      fi
+    fi
     record "$sec" --required-set "s21_gate:cap_$cap" \
       --command "cargo_l1_results.py --platform linux ${CAPS_ARGV[*]}" \
-      --exit "$LAST_RC" --log "logs/$sec.log" --l1-results "$sec/l1-results.json" --capability-probe "$cap=$probe"
+      --exit "$supervisor_test_rc" --log "logs/$sec.log" --l1-results "$sec/l1-results.json" --capability-probe "$cap=$probe"
   else
     record "$sec" --required-set "s21_gate:cap_$cap" --capability-probe "$cap=$probe" \
       --reason "能力探測：${probe#unavailable:}；未執行 --caps $cap"
@@ -270,31 +318,87 @@ for cap in sys_admin supervisor_runtime; do
 done
 
 # 4／5. Windows 原生 L1 與 COM pair（win-test.sh；報告的 l1_results 複製進本 run）
-win_l1_into() {  # win_l1_into <section>：取 win-test 最新報告的 l1_results
-  local sec="$1" rep l1
-  rep="$(ls -t "$ROOT"/target/win-test-report/*.json 2>/dev/null | grep -v -e '/l1-results-' -e '/summary-' | head -n1 || true)"
-  [[ -n "$rep" ]] || return 0
-  l1="$(python3 -c 'import json,sys,os; d=json.load(open(sys.argv[1])); print(os.path.join(os.path.dirname(sys.argv[1]), d.get("l1_results") or ""))' "$rep")"
-  [[ -f "$l1" ]] && cp "$l1" "$RUN_DIR/$sec/l1-results.json"
+win_l1_into() {  # win_l1_into <section> <該次 win-test log>：只取本次命令輸出的 report path
+  local sec="$1" log="$2" rep l1
+  rep="$(python3 - "$RUN_DIR/$log" "$ROOT/target/win-test-report" <<'PY'
+import pathlib, sys
+log = pathlib.Path(sys.argv[1])
+root = pathlib.Path(sys.argv[2]).resolve()
+paths = []
+for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+    candidate = pathlib.Path(line.strip())
+    if not candidate.is_absolute() or candidate.parent.resolve() != root or not candidate.is_file():
+        continue
+    if candidate.name.startswith(("l1-results-", "summary-")) or not candidate.name.endswith(".json"):
+        continue
+    paths.append(candidate)
+print(paths[-1] if paths else "")
+PY
+)"
+  if [[ -z "$rep" ]]; then
+    WIN_IMPORT_REASON="本次 win-test log 未記錄可讀 report path"
+    return 1
+  fi
+  l1="$(python3 - "$rep" <<'PY'
+import json, pathlib, sys
+report = pathlib.Path(sys.argv[1])
+data = json.loads(report.read_text(encoding="utf-8"))
+name = data.get("l1_results")
+print(report.parent / name if isinstance(name, str) and name else "")
+PY
+)"
+  if [[ -z "$l1" || ! -f "$l1" ]]; then
+    WIN_IMPORT_REASON="本次 win-test report 沒有可讀 l1_results"
+    return 1
+  fi
+  if ! python3 "$JUDGE" check-windows-l1 --l1-results "$l1" --candidate-commit "$CANDIDATE_COMMIT" \
+      >"$RUN_DIR/logs/${sec}_provenance.log" 2>&1; then
+    WIN_IMPORT_REASON="$(tr '\n' ' ' <"$RUN_DIR/logs/${sec}_provenance.log")"
+    return 1
+  fi
+  cp "$l1" "$RUN_DIR/$sec/l1-results.json"
   return 0
 }
 mkdir -p "$RUN_DIR/windows_native_l1" "$RUN_DIR/windows_cap_windows_com"
 run_logged windows_native_l1 bash scripts/rust/win-test.sh --package sw-pal --package sw-core --package sw-daemon -- --features test-fakes -- --skip cap_
-win_l1_into windows_native_l1
+windows_native_rc="$LAST_RC"
 win_l1_arg=()
-[[ -f "$RUN_DIR/windows_native_l1/l1-results.json" ]] && win_l1_arg=(--l1-results windows_native_l1/l1-results.json)
-record windows_native_l1 --required-set s21_core --command "scripts/rust/win-test.sh --package sw-pal --package sw-core --package sw-daemon" \
-  --exit "$LAST_RC" --log logs/windows_native_l1.log "${win_l1_arg[@]}"
-if [[ "$WITH_COM_PAIR" == "1" && -n "${SW_TEST_COM_PAIR:-}" ]]; then
-  run_logged windows_cap_windows_com bash scripts/rust/win-test.sh --caps windows_com --package sw-pal -- --features test-fakes
-  win_l1_into windows_cap_windows_com
-  com_arg=()
-  [[ -f "$RUN_DIR/windows_cap_windows_com/l1-results.json" ]] && com_arg=(--l1-results windows_cap_windows_com/l1-results.json)
-  record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com \
-    --command "scripts/rust/win-test.sh --caps windows_com --package sw-pal" --exit "$LAST_RC" \
-    --log logs/windows_cap_windows_com.log "${com_arg[@]}"
+if win_l1_into windows_native_l1 logs/windows_native_l1.log; then
+  win_l1_arg=(--l1-results windows_native_l1/l1-results.json)
+  record windows_native_l1 --required-set s21_core --command "scripts/rust/win-test.sh --package sw-pal --package sw-core --package sw-daemon" \
+    --exit "$windows_native_rc" --log logs/windows_native_l1.log "${win_l1_arg[@]}"
+elif [[ "$windows_native_rc" -ne 0 ]]; then
+  record windows_native_l1 --required-set s21_core --command "scripts/rust/win-test.sh --package sw-pal --package sw-core --package sw-daemon" \
+    --exit "$windows_native_rc" --log logs/windows_native_l1.log --section-verdict FAIL --reason "$WIN_IMPORT_REASON"
 else
-  record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com --reason "$com_reason"
+  record windows_native_l1 --required-set s21_core --command "scripts/rust/win-test.sh --package sw-pal --package sw-core --package sw-daemon" \
+    --exit 0 --log logs/windows_native_l1.log --section-verdict EVIDENCE_MISSING --reason "$WIN_IMPORT_REASON"
+fi
+if [[ "$WITH_COM_PAIR" == "1" && -n "${SW_TEST_COM_PAIR:-}" ]]; then
+  if [[ "$WIN_COM_PLAN_OK" != "1" ]]; then
+    record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com \
+      --reason "必要集合 selector 推導不出 windows_com argv（OD-53；EVIDENCE_MISSING）"
+  else
+    run_logged windows_cap_windows_com env "SW_TEST_CONSOLE_PAIR=${SW_TEST_CONSOLE_PAIR:-}" bash scripts/rust/win-test.sh "${WIN_COM_ARGS[@]}"
+    windows_com_rc="$LAST_RC"
+    if win_l1_into windows_cap_windows_com logs/windows_cap_windows_com.log; then
+      com_arg=(--l1-results windows_cap_windows_com/l1-results.json)
+      record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com --command "$WIN_COM_COMMAND" \
+        --exit "$windows_com_rc" --log logs/windows_cap_windows_com.log "${com_arg[@]}"
+    elif [[ "$windows_com_rc" -ne 0 ]]; then
+      record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com --command "$WIN_COM_COMMAND" \
+        --exit "$windows_com_rc" --log logs/windows_cap_windows_com.log --section-verdict FAIL --reason "$WIN_IMPORT_REASON"
+    else
+      record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com --command "$WIN_COM_COMMAND" \
+        --exit 0 --log logs/windows_cap_windows_com.log --section-verdict EVIDENCE_MISSING --reason "$WIN_IMPORT_REASON"
+    fi
+  fi
+else
+  if [[ "$WIN_COM_PLAN_OK" == "1" ]]; then
+    record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com --command "$WIN_COM_COMMAND" --reason "$com_reason"
+  else
+    record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com --reason "必要集合 selector 推導不出 windows_com argv（EVIDENCE_MISSING）"
+  fi
 fi
 # OD-55（Windows 部分）：windows 能力集合的證據只能於原生 Windows 本機產生，本 gate 不在 Linux 端代跑。
 #   以 SW_GATE_LOCAL_WINDOWS_DIR 匯入 <dir>/windows_cap_<cap>/l1-results.json（cargo_l1_results.py --platform windows

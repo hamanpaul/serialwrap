@@ -172,7 +172,27 @@ def _evidence_errors(base: Path, evidence: Any, *, required: bool) -> list[str]:
     return errs
 
 
-def _test_row_status(base: Path, row: Mapping[str, Any], lock: Mapping[str, Any] | None, judge) -> tuple[str, str]:
+def _windows_provenance_problems(report: Mapping[str, Any], candidate_head: Any) -> list[str]:
+    problems: list[str] = []
+    if report.get("platform") != "windows" or report.get("finished") is not True:
+        problems.append("platform 須為 windows 且 finished 須為 true")
+    if not isinstance(candidate_head, str) or re.fullmatch(r"[0-9a-f]{40}", candidate_head) is None:
+        problems.append("results.json.git_head 無法核對 Windows 證據")
+    provenance = report.get("provenance")
+    git = provenance.get("git") if isinstance(provenance, Mapping) else None
+    git = git if isinstance(git, Mapping) else {}
+    end = git.get("end")
+    end = end if isinstance(end, Mapping) else {}
+    for label, state in (("provenance.git", git), ("provenance.git.end", end)):
+        if state.get("head") != candidate_head or not state.get("head"):
+            problems.append(f"{label}.head={state.get('head')!r} 與候選版 {candidate_head!r} 不符")
+        if state.get("clean") is not True:
+            problems.append(f"{label}.clean={state.get('clean')!r}（須為 true）")
+    return problems
+
+
+def _test_row_status(base: Path, row: Mapping[str, Any], lock: Mapping[str, Any] | None, judge,
+                     candidate_head: Any = None) -> tuple[str, str]:
     counts = row.get("test_counts") or {}
     rc = row.get("rc")
     sid = row.get("required_set")
@@ -191,6 +211,10 @@ def _test_row_status(base: Path, row: Mapping[str, Any], lock: Mapping[str, Any]
     except (OSError, ValueError) as exc:
         return "INCOMPLETE", f"l1_results 不可讀：{exc}"
     platform = row.get("platform") or report.get("platform") or "linux"
+    if platform == "windows":
+        problems = _windows_provenance_problems(report, candidate_head)
+        if problems:
+            return "INCOMPLETE", "; ".join(problems)[:300]
     try:
         required = judge.required_for(lock or {}, sid, platform)
         selector = lock["sets"][sid][platform].get("selector")
@@ -217,13 +241,14 @@ def _test_row_status(base: Path, row: Mapping[str, Any], lock: Mapping[str, Any]
     return "PASS", f"{sid} {len(required)} 筆"
 
 
-def _row_status(base: Path, row: Mapping[str, Any], caps_missing: set[str], lock, judge) -> tuple[str, str]:
+def _row_status(base: Path, row: Mapping[str, Any], caps_missing: set[str], lock, judge,
+                candidate_head: Any) -> tuple[str, str]:
     name = row.get("name", "")
     cap = CAP_ROWS.get(name)
     if cap is not None and cap[0] in caps_missing:
         return "BLOCKED-OWNER", cap[1]
     if name in TEST_ROWS:
-        return _test_row_status(base, row, lock, judge)
+        return _test_row_status(base, row, lock, judge, candidate_head)
     if row.get("rc") != 0:
         return "FAIL", f"rc={row.get('rc')}"
     ev = _evidence_errors(base, row.get("evidence"), required=True)
@@ -306,7 +331,7 @@ def build_report(results_dir: Path, *, l1_lock: Path | None = None) -> str:
                 status, detail = "INCOMPLETE", "未執行"
                 log_sha = ""
             else:
-                status, detail = _row_status(results_dir, row, caps_missing, lock, judge)
+                status, detail = _row_status(results_dir, row, caps_missing, lock, judge, data.get("git_head"))
                 log_sha = row.get("log_sha256") or ""
             statuses[name] = status
             lines.append(f"| {name} | {status} | {detail.replace('|', '/')} | {log_sha} |")

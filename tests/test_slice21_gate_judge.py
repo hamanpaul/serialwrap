@@ -145,7 +145,7 @@ def _row(nodeid: str, outcome: str = "passed", skip_kind: str | None = None) -> 
 def _l1(platform: str, runner: str, rows: list[dict], *, collected=None, deselected=(), exit_code=0, finished=True) -> dict:
     """l1-results.v1 報告（與 tests/acceptance/l1_results.schema.json 同形）。"""
     ids = [r["nodeid"] for r in rows]
-    return {
+    report = {
         "schema_version": 2, "format": "l1-results.v1", "runner": runner, "platform": platform,
         "argv": ["cargo", "test", "--workspace"] if runner == "cargo" else ["/x/pytest/__main__.py", "-q", "tests/"],
         "markexpr": "", "counts": {}, "resources": {}, "uart_kind": "native",
@@ -154,6 +154,11 @@ def _l1(platform: str, runner: str, rows: list[dict], *, collected=None, deselec
         "deselected": list(deselected), "results": rows,
         "exit_code": exit_code, "finished": finished, "deployed_content": None,
     }
+    if platform == "windows":
+        head = "e" * 40
+        report["provenance"] = {"git": {"head": head, "clean": True,
+                                         "end": {"head": head, "clean": True}}}
+    return report
 
 
 def _lock() -> dict:
@@ -963,6 +968,23 @@ def test_gate_script_derives_caps_from_lock():
     text = (ROOT / "scripts/rust/slice21_gate.sh").read_text(encoding="utf-8")
     assert "caps-plan" in text
     assert "--caps posix_pty \\" not in text and "-- -p sw-pal --features test-fakes\nrecord linux_cap_posix_pty" not in text
+    assert "windows-test-argv" in text and "SW_TEST_CONSOLE_PAIR" in text
+    assert "supervisor-snapshot" in text and "supervisor-compare" in text
+
+    for path in ("scripts/rust/p7_gate.sh", "scripts/rust/slice24_exit.sh"):
+        assert 'source "$ROOT/scripts/rust/gate_prereqs.sh" --gate' in (ROOT / path).read_text(encoding="utf-8")
+    workflow = (ROOT / ".github/workflows/rust.yml").read_text(encoding="utf-8")
+    assert "source scripts/rust/gate_prereqs.sh --ci" in workflow
+
+    j = _judge_mod()
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    selector = lock["sets"]["s21_gate:windows_cap_windows_com"]["windows"]["selector"]["argv"]
+    assert j.windows_test_argv("windows_cap_windows_com", lock) == ["--caps", "windows_com", *selector]
+
+    before = {"units": "serialwrap.service loaded active running", "service": {"MainPID": "12", "ActiveState": "active"}}
+    after = {"units": "serialwrap.service loaded active running", "service": {"MainPID": "13", "ActiveState": "active"}}
+    assert j.supervisor_runtime_changed(before, after) is True
+    assert j.supervisor_runtime_changed(before, before) is False
 
 
 # --------------------------------------------------------------------------- sol P5-54dd588-2（Medium）：能力 section 只跑能力列

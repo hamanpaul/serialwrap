@@ -14,7 +14,9 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
+import shlex
 import subprocess
 
 import pytest
@@ -50,6 +52,23 @@ def test_gate_dry_run_lists_all_blocked_owner_items(tmp_path):
     assert rep["verdict"] == "INCOMPLETE"                            # dry-run 永不 READY
     com = [s for s in rep["sections"] if s["name"] == "windows_cap_windows_com"][0]
     assert com["status"] == "EVIDENCE_MISSING"                      # 未提供 SW_TEST_COM_PAIR
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    selector = lock["sets"]["s21_gate:windows_cap_windows_com"]["windows"]["selector"]["argv"]
+    command = shlex.split(com["command"])
+    start = command.index("scripts/rust/win-test.sh")
+    assert command[start + 1:] == ["--caps", "windows_com", *selector]
+    assert "SW_TEST_CONSOLE_PAIR" in command[0], command
+
+    check_env = dict(os.environ)
+    check_env.pop("SW_TEST_SERIALWRAP_NO_FAKES", None)
+    missing = subprocess.run(["bash", "scripts/rust/gate_prereqs.sh", "--check-env"],
+                              cwd=ROOT, env=check_env, capture_output=True, text=True, timeout=30)
+    assert missing.returncode == 3, missing.stdout + missing.stderr
+    assert "EVIDENCE_MISSING" in missing.stdout and "SW_TEST_SERIALWRAP_NO_FAKES" in missing.stdout
+    prereqs = (ROOT / "scripts/rust/gate_prereqs.sh").read_text(encoding="utf-8")
+    assert 'export SW_TEST_SERIALWRAP_NO_FAKES=' in prereqs
+    assert 'target/s2-par/gpz/prereqs' in prereqs and 'no-fakes-target' in prereqs
+    assert 'awk -v avg="$load"' in prereqs
 
 
 def test_runbook_has_anchor_per_item():
