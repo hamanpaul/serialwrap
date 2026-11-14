@@ -166,7 +166,10 @@ pub fn isolated_env() -> IsolatedEnv {
     }
     // 額外 pop：config 路徑與測試白名單只由個別案例顯式設定。
     vars.insert("SERIALWRAP_CONFIG".to_string(), String::new());
-    vars.insert("SERIALWRAP_TEST_DEVICE_ALLOWLIST".to_string(), String::new());
+    vars.insert(
+        "SERIALWRAP_TEST_DEVICE_ALLOWLIST".to_string(),
+        test_device_allowlist_for_caps(sw_pal::native().caps).to_string(),
+    );
 
     IsolatedEnv {
         vars,
@@ -187,6 +190,15 @@ pub fn isolated_env() -> IsolatedEnv {
         pty_slave: PathBuf::new(),
         target: None,
         _root: guard,
+    }
+}
+
+/// 測試 daemon 的預設裝置白名單；此值會覆寫繼承的環境變數。
+pub fn test_device_allowlist_for_caps(caps: sw_pal::Capabilities) -> &'static str {
+    if caps.native_device == sw_pal::DeviceBackendKind::Win {
+        "COM250"
+    } else {
+        ""
     }
 }
 

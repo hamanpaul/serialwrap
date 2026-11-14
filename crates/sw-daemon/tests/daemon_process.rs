@@ -7,6 +7,8 @@
 mod support;
 
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -18,6 +20,15 @@ use sw_pal::traits::DeviceInfo;
 use sw_proto::pyjson::{self, PyValue};
 
 const ALLOWLIST: &str = "SERIALWRAP_TEST_DEVICE_ALLOWLIST";
+
+#[test]
+fn windows_caps_support_env_allowlist_is_com250() {
+    assert_eq!(
+        support::test_device_allowlist_for_caps(sw_pal::fakes::windows_caps()),
+        "COM250",
+        "Windows 測試 daemon 的預設 allowlist 必須只允許不存在的 COM250"
+    );
+}
 
 fn device(by_id: &str, real_path: &str) -> (String, DeviceInfo) {
     (
@@ -36,6 +47,25 @@ fn trace_hooks(sink: Arc<Mutex<Vec<TraceEvent>>>) -> DaemonHooks {
         trace: Some(Box::new(move |ev| sink.lock().unwrap().push(ev))),
         ..DaemonHooks::default()
     }
+}
+
+/// 以明確的 loopback TCP endpoint 呼叫 daemon；Windows RPC 後端不支援 Unix socket。
+fn loopback_rpc_value(port: u16, method: &str, params: &str) -> PyValue {
+    let Ok(mut stream) =
+        TcpStream::connect_timeout(&format!("127.0.0.1:{port}").parse().unwrap(), SHORT)
+    else {
+        return PyValue::Null;
+    };
+    let _ = stream.set_read_timeout(Some(SHORT));
+    let request = format!(r#"{{"id":1,"method":"{method}","params":{params}}}"#);
+    if writeln!(stream, "{request}").is_err() {
+        return PyValue::Null;
+    }
+    let mut response = String::new();
+    if BufReader::new(stream).read_line(&mut response).is_err() {
+        return PyValue::Null;
+    }
+    pyjson::loads(response.trim_end_matches(['\r', '\n'])).unwrap_or(PyValue::Null)
 }
 
 /// 每 100 ms 輪詢 `cond`，逾時 panic。
@@ -127,6 +157,42 @@ fn no_profiles_message_and_continue() {
 }
 
 #[test]
+fn windows_default_allowlist_health_has_no_dynamic_sessions() {
+    let caps = sw_pal::native().caps;
+    let env = isolated_env();
+    assert_eq!(
+        env.vars[ALLOWLIST],
+        support::test_device_allowlist_for_caps(caps),
+        "隔離環境的預設 allowlist 必須依 native PAL caps 選擇"
+    );
+    let probe = TcpListener::bind("127.0.0.1:0").expect("配置 loopback RPC port");
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let endpoint = format!("tcp://127.0.0.1:{port}");
+    let mut d = DaemonProc::spawn(&env, &["--socket", &endpoint]);
+    wait_until("loopback daemon RPC", SHORT, || {
+        loopback_rpc_value(port, "health.ping", "{}")["ok"] == true
+    });
+
+    if caps.native_device == sw_pal::DeviceBackendKind::Win {
+        let health = loopback_rpc_value(port, "health.status", "{}");
+        assert!(health["test_device_allowlist"]["enabled"] == true, "{health:?}");
+        assert_eq!(health["test_device_allowlist"]["source"], "env");
+        assert_eq!(
+            health["test_device_allowlist"]["coms"],
+            pyjson::loads(r#"["COM250"]"#).unwrap()
+        );
+        assert_eq!(
+            loopback_rpc_value(port, "session.list", "{}")["sessions"],
+            pyjson::loads("[]").unwrap()
+        );
+    }
+
+    assert!(loopback_rpc_value(port, "daemon.stop", "{}")["ok"] == true);
+    assert_eq!(d.wait(LONG).code(), Some(0));
+}
+
+#[test]
 fn unknown_arg_exit_2_usage() {
     let env = isolated_env();
     // argparse 以 `COLUMNS`（未設時 80）決定 usage 換行寬度；固定為 80 使結果與外層 shell 無關。
@@ -212,6 +278,7 @@ fn serialwrap_config_env_read_and_write_target() {
     let alt = env.root.join("alt.yaml");
     fs::write(&alt, "windows:\n  exclude_coms: [COM3]\n  test_device_allowlist: [\"/x/by-id/b-alt\"]\n").unwrap();
     let mut vars = env.vars.clone();
+    vars.insert(ALLOWLIST.to_string(), String::new());
     vars.insert("SERIALWRAP_CONFIG".to_string(), alt.display().to_string());
     let mut d = DaemonProc::spawn_with(&env, &vars, &[]);
     wait_socket(&env.socket, SHORT);
@@ -229,7 +296,9 @@ fn serialwrap_config_env_read_and_write_target() {
     let sys_yaml = "windows:\n  test_device_allowlist: [\"/sys/by-id/c\"]\n";
     fs::create_dir_all(env.system_config.parent().unwrap()).unwrap();
     fs::write(&env.system_config, sys_yaml).unwrap();
-    let mut d2 = DaemonProc::spawn(&env, &[]);
+    let mut vars2 = env.vars.clone();
+    vars2.insert(ALLOWLIST.to_string(), String::new());
+    let mut d2 = DaemonProc::spawn_with(&env, &vars2, &[]);
     wait_socket(&env.socket, SHORT);
     let h2 = health_status(&env.socket);
     assert_eq!(h2["test_device_allowlist"]["source"], "config");
@@ -949,6 +1018,9 @@ fn unreadable_config_isolated_fail_closed() {
         let env = isolated_env();
         let cfg = env.config_dir.join("config.yaml");
         fs::write(&cfg, &row.config).unwrap();
+        // 此案例驗證壞 config 的失敗行為，必須明確走 config fallback；Windows 隔離環境預設為 COM250。
+        let mut vars = env.vars.clone();
+        vars.insert(ALLOWLIST.to_string(), String::new());
         let out = if row.case_id == "permission_denied" {
             chmod(&cfg, "000");
             if is_root() {
@@ -959,7 +1031,7 @@ fn unreadable_config_isolated_fail_closed() {
                 }
                 let o = Command::new("/usr/bin/setpriv")
                     .args(["--reuid=65534", "--regid=65534", "--clear-groups", DAEMON_BIN])
-                    .envs(&env.vars)
+                    .envs(&vars)
                     .stdin(std::process::Stdio::null())
                     .output()
                     .expect("setpriv 執行 daemon");
@@ -968,10 +1040,10 @@ fn unreadable_config_isolated_fail_closed() {
                     stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
                 }
             } else {
-                run_to_exit(&env, &env.vars, &[])
+                run_to_exit(&env, &vars, &[])
             }
         } else {
-            run_to_exit(&env, &env.vars, &[])
+            run_to_exit(&env, &vars, &[])
         };
         assert_eq!(out.code, Some(row.code), "{}：{}", row.case_id, out.stderr);
         assert_eq!(out.stderr, row.stderr, "{}", row.case_id);
@@ -985,7 +1057,8 @@ fn unreadable_config_isolated_fail_closed() {
 fn unreadable_config_non_isolated_unchanged() {
     let env = isolated_env();
     fs::write(env.config_dir.join("config.yaml"), b"a:\n\tb: 1\n").unwrap();
-    let vars = non_isolated_vars(&env);
+    let mut vars = non_isolated_vars(&env);
+    vars.insert(ALLOWLIST.to_string(), String::new());
     let mut d = DaemonProc::spawn_with(&env, &vars, &[]);
     wait_socket(&env.socket, SHORT);
     let h = health_status(&env.socket);
