@@ -602,7 +602,7 @@ function Start-WindowsComBridge([string]$StagingRepo, [string]$ScratchRoot, [str
     $null = New-Item -ItemType Directory -Path $bridgeRoot -Force
     # bridge 證據（wire／control.json 皆 fsync）寫在 Windows 本機 scratch，停止後再回寫 OutputRoot：
     # \\wsl.localhost（9P）上 FlushFileBuffers 失敗時 CRT 一律回 EBADF，曾使 bridge 未建 control.json 即以 exit 3 結束。
-    $localBridgeRoot = Join-Path $ScratchRoot ("uart-stdio-bridge-{0}" -f ($EvidenceName -replace '[\\/]', '-'))
+    $localBridgeRoot = Join-Path $ScratchRoot 'windows-com-bridge'
     $null = New-Item -ItemType Directory -Path $localBridgeRoot -Force
     $bridgeSource = Join-Path $StagingRepo 'tools/uart_stdio_bridge/src'
     $runScript = Join-Path $ScratchRoot 'run-uart-stdio-bridge.py'

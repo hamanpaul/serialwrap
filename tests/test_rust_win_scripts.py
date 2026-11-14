@@ -166,12 +166,31 @@ def test_blackbox_pytest_argv_matches_frozen_l1_selectors():
 
     win_script = WIN_BLACKBOX_PS1.read_text(encoding="utf-8-sig")
     invoke = win_script.split("function Invoke-Blackbox", 1)[1].split("$sourceRoot =", 1)[0]
-    assignment = re.search(r"\$arguments = @\((.*?)\)", invoke, re.DOTALL)
-    assert assignment, "Invoke-Blackbox 必須明確列出 pytest argv"
+    # console subset 是 slice22 的獨立 A/B 路徑；完整 Windows L1 argv 在一般分支，
+    # 必須與鎖內（含核准遷移後）selector 逐項一致。
+    subset_branches = invoke.split("if ($Subset -eq 'console') {", 1)[1]
+    console_subset, full_run = subset_branches.split("} else {", 1)
+    assignment = re.search(r"\$arguments = @\((.*?)\)", full_run, re.DOTALL)
+    assert assignment, "Invoke-Blackbox 一般分支必須明確列出 pytest argv"
     actual_windows = [single if single else double for single, double in re.findall(
         r"'([^']*)'|\"([^\"]*)\"", assignment.group(1)
     )]
     assert actual_windows == ["-3.12", "-m", "pytest", *windows_selector, "--junitxml=$JunitPath"]
+    console_assignment = re.search(r"\$arguments = @\((.*?)\)", console_subset, re.DOTALL)
+    assert console_assignment, "console A/B 必須明確列出 slice22 selector"
+    actual_console = [single if single else double for single, double in re.findall(
+        r"'([^']*)'|\"([^\"]*)\"", console_assignment.group(1)
+    )]
+    assert actual_console == [
+        "-3.12", "-m", "pytest",
+        "tests/contract_blackbox/slice22/test_console_telnet.py",
+        "tests/contract_blackbox/slice22/test_interactive_lease.py",
+        "-m", "core_portable or windows_native",
+        "--deselect", "tests/contract_blackbox/slice22/test_interactive_lease.py::test_soft_preempt_restore_and_replay",
+        "--deselect", "tests/contract_blackbox/slice22/test_interactive_lease.py::test_expiry_tick_restores_without_access",
+        "--deselect", "tests/contract_blackbox/slice22/test_interactive_lease.py::test_stash_dropped_does_not_replay",
+        "--junitxml=$JunitPath",
+    ]
     assert "--confcutdir" not in invoke
     assert "no:cacheprovider" not in invoke
     assert "xfail_strict" not in invoke

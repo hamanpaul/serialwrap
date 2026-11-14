@@ -232,10 +232,7 @@ impl ConsoleMux for WinConsoleMux {
     }
 
     fn wait(&mut self, timeout: Duration) -> PalResult<Vec<MuxEvent>> {
-        let ready = self.com0com_events();
-        if !ready.is_empty() {
-            return Ok(ready);
-        }
+        let mut events = self.com0com_events();
         let mut descriptors = Vec::with_capacity(self.entries.len() + 1);
         descriptors.push(WSAPOLLFD {
             fd: self.wake.read_socket(),
@@ -258,10 +255,16 @@ impl ConsoleMux for WinConsoleMux {
             });
             socket_ids.push(id);
         }
-        if !poll_sockets(&mut descriptors, Some(timeout))? {
-            return Ok(self.com0com_events());
+        // com0com 的 level-ready 事件不能略過 socket poll；已有 serial event 時仍用零
+        // timeout 合併同一輪已 ready 的 TCP listener／client events，避免餓死 TCP。
+        let poll_timeout = if events.is_empty() {
+            Some(timeout)
+        } else {
+            Some(Duration::ZERO)
+        };
+        if !poll_sockets(&mut descriptors, poll_timeout)? {
+            return Ok(events);
         }
-        let mut events = Vec::new();
         if descriptors[0].revents != 0 {
             self.wake.drain();
             events.push(MuxEvent::Woken);
@@ -290,7 +293,11 @@ impl ConsoleMux for WinConsoleMux {
                 events.push(MuxEvent::Writable(id));
             }
         }
-        events.extend(self.com0com_events());
+        for event in self.com0com_events() {
+            if !events.contains(&event) {
+                events.push(event);
+            }
+        }
         Ok(events)
     }
 
@@ -342,6 +349,11 @@ impl WinConsoleMux {
             .iter()
             .filter_map(|(&id, entry)| match &entry.slot {
                 Slot::Io(io) => match io.mux_handle().0 {
+                    MuxHandleInner::Com0com(channel)
+                        if crate::console_com0com::windows::writer_failed(channel) =>
+                    {
+                        Some(MuxEvent::Hangup(id))
+                    }
                     MuxHandleInner::Com0com(channel)
                         if crate::console_com0com::windows::collect_readable(channel) =>
                     {

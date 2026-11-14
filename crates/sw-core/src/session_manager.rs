@@ -2083,7 +2083,6 @@ impl Shared {
             runners: HashMap::new(),
             hub,
             serial_console_port,
-            serial_console_opened: false,
             pumps: HashMap::new(),
             listener_epoch: None,
             open_jobs: JobQueue::new("open"),
@@ -4125,8 +4124,6 @@ struct ManagerExec {
     hub: Option<Arc<crate::human_console::hub::HubHandle>>,
     /// 07 D-12：此 session 設定的 com0com console-side 埠。
     serial_console_port: Option<String>,
-    /// 同一 session hub 只開一次 com0com；bridge clear/recover 不重複開埠。
-    serial_console_opened: bool,
     /// P6 Task 6（07 D-15(5)）：每個 epoch 一條 human TX pump。
     pumps: HashMap<u64, crate::human_console::human_tx::HumanTxPump>,
     /// TCP console listener 所屬的 bridge epoch（該 epoch `BeginDrain` 時停止，ephemeral port，UIO-12.8-c）。
@@ -5579,30 +5576,27 @@ impl EffectExecutor for ManagerExec {
                 if lock(&self.opened_listener).remove(&epoch) {
                     self.listener_epoch = Some(epoch);
                 }
-                if !self.serial_console_opened {
-                    if let Some(port) = self.serial_console_port.as_ref() {
-                        if let Some(hub) = self.hub.as_ref() {
-                            if hub
-                                .cmd
-                                .try_send(crate::human_console::hub::HubCmd::OpenCom0com {
-                                    port: port.clone(),
-                                })
-                                .is_ok()
-                            {
-                                self.serial_console_opened = true;
-                                hub.waker.wake();
-                            } else {
-                                self.shared.warn(format!(
-                                    "serial console 開啟命令送不進 hub（com={} port={port}）",
-                                    self.com()
-                                ));
-                            }
+                if let Some(port) = self.serial_console_port.as_ref() {
+                    if let Some(hub) = self.hub.as_ref() {
+                        if hub
+                            .cmd
+                            .try_send(crate::human_console::hub::HubCmd::OpenCom0com {
+                                port: port.clone(),
+                            })
+                            .is_ok()
+                        {
+                            hub.waker.wake();
                         } else {
                             self.shared.warn(format!(
-                                "serial console 沒有可用的 ConsoleHub（com={} port={port}）",
+                                "serial console 開啟命令送不進 hub（com={} port={port}）",
                                 self.com()
                             ));
                         }
+                    } else {
+                        self.shared.warn(format!(
+                            "serial console 沒有可用的 ConsoleHub（com={} port={port}）",
+                            self.com()
+                        ));
                     }
                 }
                 // W3′（設計 §3.1.4 第 3 步、C2、C3）：① 鎖內自帳本取出 IoWorker（`Bridged{Some}` → `Bridged{None}`）；

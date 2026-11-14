@@ -2229,6 +2229,7 @@ parametrized:
   tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_force_refuses_while_push:
   - rollback
   - update
+  - rollback-after-probe
   tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_refuses_while_push:
   - before_probe
   - after_probe

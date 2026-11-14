@@ -281,7 +281,12 @@ impl ConsoleTransportFactory for RigPtyFactory {
                 "測試使用原生 TCP factory；POSIX 不提供 com0com",
             ))
         } else {
-            self.fake.open_com0com_console(port)
+            let io = self.fake.open_com0com_console(port)?;
+            self.opened_serial_consoles
+                .lock()
+                .unwrap()
+                .push(port.to_string());
+            Ok(io)
         }
     }
 }
@@ -451,6 +456,42 @@ impl ServiceRig {
             .expect("map 存在")
             .expect("測試 windows.serial_console 結構正確");
         Self::with_native_tcp_console_config(Some(map), native_com0com)
+    }
+
+    /// Fake TCP hub 與 fake com0com console；供不依賴實體 COM pair 的生命週期測試使用。
+    pub fn with_fake_tcp_console_and_serial_console(
+        console_port: &str,
+        peer_port: &str,
+    ) -> ServiceRig {
+        let yaml = format!(
+            "windows:\n  serial_console:\n    {BY_ID_A}: {{console_port: {console_port}, peer_port: {peer_port}}}\n"
+        );
+        let map = RuntimeConfig::from_text(Some(&yaml))
+            .expect("測試 windows.serial_console YAML")
+            .windows_serial_console()
+            .expect("map 存在")
+            .expect("測試 windows.serial_console 結構正確");
+        let factory = Arc::new(RigPtyFactory {
+            fake: sw_pal::fakes::console::FakeConsoleFactory::new(ConsoleKind::TcpTelnet),
+            created: Mutex::new(Vec::new()),
+            native_tcp: false,
+            native_com0com: false,
+            serial_console: Some(map),
+            opened_serial_consoles: Mutex::new(Vec::new()),
+        });
+        ServiceRig::build_with_console(
+            RigSpec {
+                yaml: format!(
+                    "profiles:\n  t:\n    platform: passthrough\n    timeout_s: 2.0\nwindows:\n  serial_console:\n    {BY_ID_A}: {{console_port: {console_port}, peer_port: {peer_port}}}\ntargets:\n{}",
+                    target_line("COM0", BY_ID_A)
+                ),
+                devices: vec![(BY_ID_A.into(), REAL_A.into())],
+                explicit_target_count: 1,
+                allowlist: None,
+                wait_ready: Vec::new(),
+            },
+            Some(factory),
+        )
     }
 
     fn with_native_tcp_console_config(

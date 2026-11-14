@@ -427,7 +427,7 @@ def test_resource_report_cli_without_daemon_env_unmeasured(tmp_path: Path) -> No
 def test_windows_com_never_counted_without_device(tmp_path: Path) -> None:
     """無 SW_TEST_COM_PAIR 時，windows_com 項目不得計為 passed（P0 T14 第 6 條；§11.2 不以模擬代替 windows_com）。
 
-    P2-T13 審查修正：原測試只餵空清單（空轉）。現況 tests/ 有四個檔使用 windows_com（已知清單鎖定，新增者須審閱），
+    P2-T13 審查修正：原測試只餵空清單（空轉）。現況 tests/ 有七個檔使用 windows_com（已知清單鎖定，新增者須審閱），
     本測試實際以缺 device 的環境執行它們，斷言 resources.windows_com.passed == 0 且至少有一個 skipped。
     （計畫 Task 13 寫「本 Stage 無 windows_com 的 tests/ item」與現況不符，差異已於 PR 說明記錄。）
     """
@@ -437,11 +437,19 @@ def test_windows_com_never_counted_without_device(tmp_path: Path) -> None:
     # sw_core.serial_port.open_serial_port 於 SW_TEST_COM_PAIR 指定的真實 COM 上以 pyserial 後端開啟
     # （非 socket、非記憶體替身；唯一 monkeypatch 為寫入逾時常數），缺 device 時 skip，符合 windows_com 定義。
     known = {
+        # 此模組的 Windows 原生 daemon 管理案例使用 SW_TEST_COM_PAIR 指定的 COM 後端；缺 pair 時案例會 skip。
         "tests/contract_blackbox/test_cli_mgmt_daemon.py",
+        # slice22 fixture 以 Windows serial backend 開 COM20；Telnet console 本身走 loopback TCP，無 DUT pair 會 skip。
+        "tests/contract_blackbox/slice22/test_console_telnet.py",
+        # slice22 fixture 以 Windows serial backend 開 COM20；interactive lease 的 DUT I/O 依賴該 pair，無 pair 會 skip。
+        "tests/contract_blackbox/slice22/test_interactive_lease.py",
         # P8 Task 11：真實 CreateFileW 獨占 COM20；無原生 Windows／com0com pair 會 SKIP，不計為 passed。
         "tests/contract_blackbox/test_s24_device_handoff_windows.py",
+        # 以 PySerial 在 SW_TEST_COM_PAIR 指定的 COM 上驗證 drain stall；無 pair 時不算 windows_com PASS。
         "tests/test_p1oc_drain_stalled.py",
+        # spike1 裝置保護案例會以真實 COM 驗證跨 process holder；無 pair 時 skip。
         "tests/test_spike1_remaining.py",
+        # Stage 0 UART exclusive 案例開啟並檢查 SW_TEST_COM_PAIR 的 Windows COM handle。
         "tests/test_stage0_uart_exclusive.py",
     }
     users: set[str] = set()

@@ -4,7 +4,11 @@ import pytest
 
 pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
-from contract_blackbox.p7_login_oracle import assert_login_window, login_window_problems
+from contract_blackbox.p7_login_oracle import (
+    assert_login_window,
+    login_window_bounds,
+    login_window_problems,
+)
 
 
 def _row(seq: int, direction: str, source: str, payload: bytes) -> dict:
@@ -35,6 +39,36 @@ def test_login_window_oracle_rejects_synthetic_agent_tx():
     mutated = rows[:2] + [_row(12, "TX", "agent:mutation", b"echo forbidden\n")] + rows[2:]
     with pytest.raises(AssertionError, match="agent TX"):
         assert_login_window(mutated, login_start_seq=10, ready_seq=14, human_payload=b"HUMAN_DURING_LOGIN_P7\n")
+
+
+def test_login_window_oracle_waits_for_probe_nonce_across_rx_chunks():
+    rows = [
+        _row(10, "TX", "system", b"root\n"),
+        _row(11, "TX", "human:console-1", b"HUMAN_DURING_LOGIN_P7\n"),
+        _row(12, "TX", "system", b"pw\n"),
+        _row(13, "TX", "system", b"echo __READY__abc123\n"),
+        # 舊 prompt 不得結束登入窗口；probe nonce 跨 RX chunk 才回應。
+        _row(14, "RX", "system", b"root@fake:~# "),
+        _row(15, "TX", "agent:mutation", b"echo forbidden\n"),
+        _row(16, "RX", "system", b"__READY__abc"),
+        _row(17, "RX", "system", b"123\r\nroot@fake:~# "),
+    ]
+    start, ready = login_window_bounds(
+        rows,
+        after_seq=0,
+        username=b"root\n",
+        ready_prompt=b"root@fake:~# ",
+    )
+    assert (start, ready) == (10, 17), "窗口端點須位於 nonce 後的 prompt"
+    problems = login_window_problems(
+        rows,
+        login_start_seq=start,
+        ready_seq=ready,
+        human_payload=b"HUMAN_DURING_LOGIN_P7\n",
+    )
+    assert any("agent TX" in problem for problem in problems), (
+        "probe TX → 舊 prompt RX → agent TX → 分段 nonce 回應必須判紅"
+    )
 
 
 def test_login_window_oracle_rejects_swallowed_human_bytes():

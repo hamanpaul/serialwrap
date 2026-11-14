@@ -6,6 +6,10 @@
 #![allow(non_snake_case)]
 
 use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use sw_pal::console_mux::{select_console_kind, MuxEvent};
@@ -537,6 +541,45 @@ fn open_peer(port: &str) -> std::fs::File {
         .unwrap()
 }
 
+#[cfg(windows)]
+fn clear_console_peer(peer: &std::fs::File) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Devices::Communication::{PurgeComm, PURGE_RXCLEAR, PURGE_TXCLEAR};
+    use windows_sys::Win32::Foundation::HANDLE;
+
+    // 只清測試核准的 COM23 對端待處理位元組，避免前次中斷的能力案例污染本列。
+    // SAFETY: `peer` 持有有效的 com0com 對端 handle；purge 僅作用於此 handle 的 I/O queue。
+    assert_ne!(
+        unsafe {
+            PurgeComm(
+                peer.as_raw_handle() as HANDLE,
+                PURGE_RXCLEAR | PURGE_TXCLEAR,
+            )
+        },
+        0,
+        "清除測試 COM23 的殘留 I/O queue"
+    );
+}
+
+#[cfg(windows)]
+fn set_console_peer_write_timeout(peer: &std::fs::File) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Devices::Communication::{SetCommTimeouts, COMMTIMEOUTS};
+    use windows_sys::Win32::Foundation::HANDLE;
+
+    let timeouts = COMMTIMEOUTS {
+        WriteTotalTimeoutMultiplier: 0,
+        WriteTotalTimeoutConstant: 100,
+        ..COMMTIMEOUTS::default()
+    };
+    // SAFETY: `peer` 持有有效的核准 COM23 handle；timeout 僅限制測試 writer 的單次等待。
+    assert_ne!(
+        unsafe { SetCommTimeouts(peer.as_raw_handle() as HANDLE, &timeouts) },
+        0,
+        "設定測試 COM23 有界 write timeout"
+    );
+}
+
 #[test]
 #[ignore = "cap:windows_com"]
 fn cap_windows_com__console_com0com_roundtrip() {
@@ -547,22 +590,99 @@ fn cap_windows_com__console_com0com_roundtrip() {
     let mut mux = p.console.new_mux().unwrap();
     mux.add_io(1, io).unwrap();
     let mut peer = open_peer(&b);
+    #[cfg(windows)]
+    clear_console_peer(&peer);
     peer.write_all(b"hi").unwrap();
-    assert_eq!(
-        wait_for(&mut *mux, Duration::from_secs(2), |e| *e
-            == MuxEvent::Readable(1)),
-        Some(MuxEvent::Readable(1))
-    );
-    let mut buf = [0u8; 8];
-    assert!(matches!(
-        mux.read(1, &mut buf).unwrap(),
-        ReadOutcome::Data(2)
-    ));
-    assert_eq!(&buf[..2], b"hi");
+    let mut received = Vec::new();
+    while received.len() < 2 {
+        assert_eq!(
+            wait_for(&mut *mux, Duration::from_secs(2), |e| *e
+                == MuxEvent::Readable(1)),
+            Some(MuxEvent::Readable(1))
+        );
+        let mut buf = [0u8; 8];
+        if let ReadOutcome::Data(count) = mux.read(1, &mut buf).unwrap() {
+            received.extend_from_slice(&buf[..count]);
+        }
+    }
+    assert_eq!(&received, b"hi");
     assert_eq!(mux.try_write(1, b"ok").unwrap(), 2);
     let mut got = [0u8; 2];
     peer.read_exact(&mut got).unwrap();
     assert_eq!(&got, b"ok");
+
+    // com0com 持續有 RX 時，WinConsoleMux 仍須用零 timeout 收合 loopback socket events。
+    let listener = p.console.bind_tcp_console().unwrap();
+    let endpoint = listener.endpoint().to_string();
+    mux.add_listener(2, listener).unwrap();
+    let sending = Arc::new(AtomicBool::new(true));
+    #[cfg(windows)]
+    set_console_peer_write_timeout(&peer);
+    let sending_peer = Arc::clone(&sending);
+    let com_sender = thread::spawn(move || {
+        let stop_at = Instant::now() + Duration::from_millis(250);
+        while sending_peer.load(Ordering::Acquire) && Instant::now() < stop_at {
+            if peer.write_all(&[b'c'; 128]).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let initial_com_ready = wait_for(&mut *mux, Duration::from_secs(2), |event| {
+        *event == MuxEvent::Readable(1)
+    }) == Some(MuxEvent::Readable(1));
+    let mut tcp = TcpStream::connect(&endpoint).unwrap();
+    let tcp_input = b"tcp-input-during-com0com-rx";
+    tcp.write_all(tcp_input).unwrap();
+    let mut accepted = false;
+    let mut received = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline
+        && (!accepted
+            || !received
+                .windows(tcp_input.len())
+                .any(|window| window == tcp_input))
+    {
+        for event in mux.wait(Duration::from_millis(20)).unwrap() {
+            match event {
+                MuxEvent::Acceptable(2) => {
+                    if let Some((io, _)) = mux.accept(2).unwrap() {
+                        mux.add_io(3, io).unwrap();
+                        accepted = true;
+                    }
+                }
+                // 保留 com0com 的 level-ready 資料，讓舊版早退路徑無法碰到 socket poll。
+                MuxEvent::Readable(1) => {}
+                MuxEvent::Readable(3) => {
+                    let mut bytes = [0u8; 128];
+                    if let ReadOutcome::Data(count) = mux.read(3, &mut bytes).unwrap() {
+                        received.extend_from_slice(&bytes[..count]);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    sending.store(false, Ordering::Release);
+    com_sender.join().unwrap();
+    loop {
+        let events = mux.wait(Duration::ZERO).unwrap();
+        if !events.iter().any(|event| *event == MuxEvent::Readable(1)) {
+            break;
+        }
+        let mut bytes = [0u8; 8192];
+        if !matches!(mux.read(1, &mut bytes), Ok(ReadOutcome::Data(count)) if count > 0) {
+            break;
+        }
+    }
+    assert!(initial_com_ready, "先確認 com0com 持續送入資料");
+    assert!(accepted, "com0com 持續 RX 時仍須處理 TCP 新連線");
+    assert!(
+        received
+            .windows(tcp_input.len())
+            .any(|window| window == tcp_input),
+        "com0com 持續 RX 時仍須處理 TCP 輸入"
+    );
 }
 
 #[test]
@@ -846,7 +966,7 @@ fn windows_console_backends_have_no_panicking_stubs() {
     }
 }
 
-/// Windows 原生：TCP、mux 與 com0com backend 可用，com0com 只開核准的 console pair。
+/// Windows 原生非能力列：驗證 TCP/mux factory 與 com0com 型別能力，不依賴或開啟任何 COM 埠。
 #[cfg(windows)]
 #[test]
 fn windows_unimplemented_console_backends_return_unsupported() {
@@ -857,11 +977,8 @@ fn windows_unimplemented_console_backends_return_unsupported() {
         .expect("TCP console backend 應可用");
     assert!(listener.endpoint().starts_with("127.0.0.1:"));
     let _mux = p.console.new_mux().expect("ConsoleMux 應可用");
-    let (console, peer) = console_pair();
-    assert_eq!((console.as_str(), peer.as_str()), ("COM22", "COM23"));
-    let io = p
-        .console
-        .open_com0com_console(&console)
-        .expect("核准的 com0com console 埠應可用");
-    assert!(io.has_external_peer(None));
+    assert!(
+        p.caps.com0com_console,
+        "原生 Windows PAL 應宣告 com0com console 能力"
+    );
 }

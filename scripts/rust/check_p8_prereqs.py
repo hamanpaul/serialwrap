@@ -150,7 +150,7 @@ CHECKS: list[tuple[str, str, str, int, str | None]] = [
     # P4：sw-cli（sw-core 測試無法引用，故只以正規式核對）
     (f"{CLI}/graceful_stop.rs", r"pub fn graceful_stop\(", "P4 T7", 12, "graceful_stop"),
     (f"{CLI}/graceful_stop.rs", r"pub fn graceful_stop_with\(", "P4 T12", 14, "graceful_stop_with"),
-    (f"{CLI}/graceful_stop.rs", r"pub enum StopRpc \{\s*Plain,\s*Handoff \{ reason: &'static str \},\s*\}", "P4 T12", 14, None),
+    (f"{CLI}/graceful_stop.rs", r"pub enum StopRpc \{\s*Plain,\s*Handoff \{ reason: &'static str \},\s*UpdateHandoff \{ reason: &'static str \},\s*\}", "P4 T12", 14, None),
     (f"{CLI}/rollback.rs", r"pub fn safety_check\(", "P4 T12", 14, "safety_check"),
     (f"{CLI}/supervisor_defs.rs", r"pub fn render_user_unit\(exec_start: &str\) -> String", "P4 T3", 12, None),
     # 測試支援（P5 06 T11／T13／T18）

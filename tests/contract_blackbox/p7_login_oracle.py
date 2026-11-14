@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import re
 
 
 def _seq(row: dict) -> int:
@@ -41,14 +42,33 @@ def login_window_bounds(
     )
     if probe_row is None:
         raise AssertionError("WAL 缺少登入後的 nonce probe TX")
-    ready_row = next(
-        (row for row in ordered if _seq(row) > _seq(probe_row) and row.get("dir") == "RX"
-         and ready_prompt in _payload(row)),
-        None,
-    )
-    if ready_row is None:
-        raise AssertionError(f"WAL 缺少 nonce probe 後的 READY prompt：{ready_prompt!r}")
-    return start, _seq(ready_row)
+    nonce_match = re.search(rb"__READY__([0-9a-fA-F]+)", _payload(probe_row))
+    if nonce_match is None:
+        raise AssertionError("WAL nonce probe TX 缺少可解析的 __READY__ nonce")
+    nonce = nonce_match.group(1)
+    probe_seq = _seq(probe_row)
+    rx = bytearray()
+    rx_seq_by_byte: list[int] = []
+    nonce_seen = False
+    for row in ordered:
+        if _seq(row) <= probe_seq or row.get("dir") != "RX":
+            continue
+        payload = _payload(row)
+        if not payload:
+            continue
+        rx.extend(payload)
+        rx_seq_by_byte.extend([_seq(row)] * len(payload))
+        nonce_at = rx.find(nonce)
+        if nonce_at < 0:
+            continue
+        nonce_seen = True
+        prompt_at = rx.find(ready_prompt, nonce_at + len(nonce))
+        if prompt_at >= 0:
+            prompt_end = prompt_at + len(ready_prompt) - 1
+            return start, rx_seq_by_byte[prompt_end]
+    if not nonce_seen:
+        raise AssertionError(f"WAL 缺少 nonce probe 的實際回應：{nonce!r}")
+    raise AssertionError(f"WAL nonce 回應後缺少 READY prompt：{ready_prompt!r}")
 
 
 def login_window_problems(

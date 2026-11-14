@@ -6,7 +6,7 @@ use crate::console_mux::MuxHandleInner;
 use crate::console_pty::ConsoleIo;
 use crate::serial::windows_model::win_device_name;
 use crate::traits::{IoWaker, PalError, PalErrorKind, PalResult, ReadOutcome};
-use crossbeam_channel::{bounded, Receiver, SendTimeoutError, Sender, TryRecvError};
+use crossbeam_channel::{bounded, Receiver, SendTimeoutError, Sender, TryRecvError, TrySendError};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
@@ -32,6 +32,8 @@ use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED
 const READER_CHANNEL_CAPACITY: usize = 64;
 const READER_BUFFER_BYTES: usize = 4096;
 const READER_SEND_RETRY: Duration = Duration::from_millis(100);
+const WRITER_CHANNEL_CAPACITY: usize = 64;
+const WRITER_BUFFER_BYTES: usize = 4096;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static IO_REGISTRY: OnceLock<Mutex<HashMap<u64, Weak<Com0comState>>>> = OnceLock::new();
@@ -56,6 +58,8 @@ struct ReadQueue {
 
 struct Com0comState {
     reads: Mutex<ReadQueue>,
+    write_error: Mutex<Option<PalError>>,
+    write_start: Mutex<()>,
     local_wake: Arc<WinWakePair>,
     mux_wake: Mutex<Option<Weak<WinWakePair>>>,
     stopping: AtomicBool,
@@ -167,18 +171,53 @@ impl Com0comState {
             wake.wake();
         }
     }
+
+    fn writer_failed(&self) -> bool {
+        self.write_error
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some()
+    }
+
+    fn fail_writer(&self, error: PalError) {
+        if self.stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut write_error = self
+            .write_error
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if write_error.is_none() {
+            *write_error = Some(error);
+        }
+        drop(write_error);
+        self.notify();
+    }
 }
 
 struct Com0comConsoleIo {
     id: u64,
     file: File,
     state: Arc<Com0comState>,
+    writer_tx: Option<Sender<Vec<u8>>>,
+    writer: Option<JoinHandle<()>>,
     reader: Option<JoinHandle<()>>,
 }
 
 impl Drop for Com0comConsoleIo {
     fn drop(&mut self) {
+        let handle = self.file.as_raw_handle() as HANDLE;
+        // 與 writer 的 WriteFile 啟動序列化：取得鎖後設 stopping 並取消所有在途 I/O，
+        // 避免 writer 在取消之後才開始新的 overlapped write。
+        let _write_start = self
+            .state
+            .write_start
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         self.state.stopping.store(true, Ordering::SeqCst);
+        // SAFETY: handle 由 `file` 持有；null OVERLAPPED 表示取消此 handle 上所有在途 I/O。
+        unsafe { CancelIoEx(handle, std::ptr::null()) };
+        self.writer_tx.take();
         self.state.local_wake.wake();
         self.state
             .mux_wake
@@ -189,6 +228,10 @@ impl Drop for Com0comConsoleIo {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .remove(&self.id);
+        drop(_write_start);
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
@@ -201,7 +244,39 @@ impl crate::console_pty::ConsoleIo for Com0comConsoleIo {
     }
 
     fn try_write(&mut self, data: &[u8]) -> PalResult<usize> {
-        write_overlapped(self.file.as_raw_handle() as HANDLE, data)
+        if data.is_empty() {
+            return Ok(0);
+        }
+        if let Some(error) = self
+            .state
+            .write_error
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+        {
+            return Err(error);
+        }
+        if self.state.stopping.load(Ordering::SeqCst) {
+            return Err(PalError::plain(
+                PalErrorKind::Cancelled,
+                "com0com console 正在關閉",
+            ));
+        }
+        let count = data.len().min(WRITER_BUFFER_BYTES);
+        let Some(sender) = self.writer_tx.as_ref() else {
+            return Err(PalError::plain(
+                PalErrorKind::Cancelled,
+                "com0com console writer 已關閉",
+            ));
+        };
+        match sender.try_send(data[..count].to_vec()) {
+            Ok(()) => Ok(count),
+            Err(TrySendError::Full(_)) => Ok(0),
+            Err(TrySendError::Disconnected(_)) => Err(PalError::plain(
+                PalErrorKind::Io,
+                "com0com console writer 已停止",
+            )),
+        }
     }
 
     fn waker(&self) -> Arc<dyn IoWaker> {
@@ -279,6 +354,7 @@ pub fn open(port: &str) -> PalResult<Box<dyn ConsoleIo>> {
 
     let local_wake = WinWakePair::new()?;
     let (sender, receiver) = bounded(READER_CHANNEL_CAPACITY);
+    let (writer_tx, writer_rx) = bounded(WRITER_CHANNEL_CAPACITY);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let state = Arc::new(Com0comState {
         reads: Mutex::new(ReadQueue {
@@ -287,6 +363,8 @@ pub fn open(port: &str) -> PalResult<Box<dyn ConsoleIo>> {
             error: None,
             closed: false,
         }),
+        write_error: Mutex::new(None),
+        write_start: Mutex::new(()),
         local_wake,
         mux_wake: Mutex::new(None),
         stopping: AtomicBool::new(false),
@@ -298,6 +376,21 @@ pub fn open(port: &str) -> PalResult<Box<dyn ConsoleIo>> {
         .name(format!("sw-com0com-{id}"))
         .spawn(move || read_loop(reader_handle as HANDLE, sender, reader_state))
         .map_err(|error| PalError::plain(PalErrorKind::Io, error.to_string()))?;
+    let writer_handle = file.as_raw_handle() as usize;
+    let writer_state = Arc::clone(&state);
+    let writer = match thread::Builder::new()
+        .name(format!("sw-com0com-write-{id}"))
+        .spawn(move || write_loop(writer_handle as HANDLE, writer_rx, writer_state))
+    {
+        Ok(writer) => writer,
+        Err(error) => {
+            state.stopping.store(true, Ordering::SeqCst);
+            // SAFETY: handle 仍由 `file` 持有；取消 reader 目前的 overlapped request。
+            unsafe { CancelIoEx(handle, std::ptr::null()) };
+            let _ = reader.join();
+            return Err(PalError::plain(PalErrorKind::Io, error.to_string()));
+        }
+    };
     registry()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -306,6 +399,8 @@ pub fn open(port: &str) -> PalResult<Box<dyn ConsoleIo>> {
         id,
         file,
         state,
+        writer_tx: Some(writer_tx),
+        writer: Some(writer),
         reader: Some(reader),
     }))
 }
@@ -336,6 +431,10 @@ pub(crate) fn unbind_mux_waker(id: u64) {
 
 pub(crate) fn collect_readable(id: u64) -> bool {
     state_for(id).is_some_and(|state| state.collect())
+}
+
+pub(crate) fn writer_failed(id: u64) -> bool {
+    state_for(id).is_some_and(|state| state.writer_failed())
 }
 
 pub(crate) fn api_call_counts(id: u64) -> (u32, u32) {
@@ -370,6 +469,49 @@ fn read_loop(handle: HANDLE, sender: Sender<ReaderEvent>, state: Arc<Com0comStat
                 return;
             }
         }
+    }
+}
+
+fn write_loop(handle: HANDLE, receiver: Receiver<Vec<u8>>, state: Arc<Com0comState>) {
+    while let Ok(bytes) = receiver.recv() {
+        if state.stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let started = {
+                let _write_start = state
+                    .write_start
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if state.stopping.load(Ordering::SeqCst) {
+                    return;
+                }
+                start_write_overlapped(handle, &bytes[offset..])
+            };
+            let result = match started {
+                Ok(WriteStart::Complete(count)) => Ok(count),
+                Ok(WriteStart::Pending(pending)) => finish_write_overlapped(handle, pending),
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(count) if count > 0 => offset += count,
+                Ok(_) => {
+                    state.fail_writer(PalError::plain(
+                        PalErrorKind::Io,
+                        "com0com console overlapped write 未前進",
+                    ));
+                    return;
+                }
+                Err(_) if state.stopping.load(Ordering::SeqCst) => return,
+                Err(error) => {
+                    state.fail_writer(error);
+                    return;
+                }
+            }
+        }
+        // Hub 收到這次 completion 後再從有界 queue 取 ring 中尚未接受的資料。
+        state.notify();
     }
 }
 
@@ -531,15 +673,25 @@ fn read_overlapped(
     }
 }
 
-fn write_overlapped(handle: HANDLE, data: &[u8]) -> PalResult<usize> {
+enum WriteStart {
+    Complete(usize),
+    Pending(PendingWrite),
+}
+
+struct PendingWrite {
+    event: OwnedEvent,
+    overlapped: Box<OVERLAPPED>,
+}
+
+fn start_write_overlapped(handle: HANDLE, data: &[u8]) -> PalResult<WriteStart> {
     if data.is_empty() {
-        return Ok(0);
+        return Ok(WriteStart::Complete(0));
     }
     let event = create_event()?;
-    let mut overlapped = OVERLAPPED {
+    let mut overlapped = Box::new(OVERLAPPED {
         hEvent: event.0,
         ..OVERLAPPED::default()
-    };
+    });
     let mut transferred = 0u32;
     let length = data.len().min(u32::MAX as usize) as u32;
     // SAFETY: handle 與 event 有效；data 與 OVERLAPPED 在 completion 收斂前保持有效。
@@ -549,29 +701,40 @@ fn write_overlapped(handle: HANDLE, data: &[u8]) -> PalResult<usize> {
             data.as_ptr(),
             length,
             std::ptr::null_mut(),
-            &mut overlapped,
+            &mut *overlapped,
         )
     };
-    if status == 0 {
-        let code = unsafe { GetLastError() };
-        if code != ERROR_IO_PENDING {
-            return Err(crate::traits::windows_win32_error(code));
-        }
-        // SAFETY: COM write timeout 已設為 5 秒；多留 500 ms 收斂逾時與取消。
-        let wait = unsafe { WaitForSingleObject(event.0, 5_500) };
-        if wait == WAIT_TIMEOUT {
-            // SAFETY: 只取消本次寫入，並等待其完成狀態收斂。
-            unsafe { CancelIoEx(handle, &overlapped) };
-            // SAFETY: CancelIoEx 後 completion event 會喚醒此等待。
-            if unsafe { WaitForSingleObject(event.0, INFINITE) } != WAIT_OBJECT_0 {
-                return Err(last_error());
-            }
-        } else if wait != WAIT_OBJECT_0 {
+    if status != 0 {
+        // SAFETY: 同步完成的 overlapped WriteFile 不需等待。
+        if unsafe { GetOverlappedResult(handle, &*overlapped, &mut transferred, 0) } == 0 {
             return Err(last_error());
         }
+        return Ok(WriteStart::Complete(transferred as usize));
     }
-    // SAFETY: WriteFile 已同步完成或 completion event 已觸發。
-    if unsafe { GetOverlappedResult(handle, &overlapped, &mut transferred, 0) } == 0 {
+    let code = unsafe { GetLastError() };
+    if code != ERROR_IO_PENDING {
+        return Err(crate::traits::windows_win32_error(code));
+    }
+    Ok(WriteStart::Pending(PendingWrite { event, overlapped }))
+}
+
+fn finish_write_overlapped(handle: HANDLE, pending: PendingWrite) -> PalResult<usize> {
+    let PendingWrite { event, overlapped } = pending;
+    let mut transferred = 0u32;
+    // SAFETY: COM write timeout 已設為 5 秒；多留 500 ms 收斂逾時與取消。
+    let wait = unsafe { WaitForSingleObject(event.0, 5_500) };
+    if wait == WAIT_TIMEOUT {
+        // SAFETY: 只取消本次寫入，並等待其完成狀態收斂。
+        unsafe { CancelIoEx(handle, &*overlapped) };
+        // SAFETY: CancelIoEx 後 completion event 會喚醒此等待。
+        if unsafe { WaitForSingleObject(event.0, INFINITE) } != WAIT_OBJECT_0 {
+            return Err(last_error());
+        }
+    } else if wait != WAIT_OBJECT_0 {
+        return Err(last_error());
+    }
+    // SAFETY: WriteFile 已完成或 completion event 已觸發。
+    if unsafe { GetOverlappedResult(handle, &*overlapped, &mut transferred, 0) } == 0 {
         let error = last_error();
         if error.winerror == Some(ERROR_OPERATION_ABORTED as i32) {
             return Err(PalError::plain(PalErrorKind::TimedOut, "com0com 寫入逾時"));

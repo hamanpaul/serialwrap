@@ -2921,6 +2921,7 @@
           "cargo:sw-daemon::sw_daemon::framing::tests::trim_matches_python_strip",
           "cargo:sw-daemon::sw_daemon::launcher::tests::current_release_rejects_parent_traversal",
           "cargo:sw-daemon::sw_daemon::launcher::tests::current_release_resolves_manifest_from_memfs",
+          "cargo:sw-daemon::windows_console_native::gpx_release_then_reattach_reopens_com0com_console_exactly_once",
           "cargo:sw-daemon::windows_console_native::telnet_hub_end_to_end_with_fake_serial",
           "cargo:sw-daemon::windows_console_native::telnet_listener_ephemeral_per_bridge",
           "cargo:sw-daemon::windows_console_native::telnet_second_client_line_mode",
@@ -3749,6 +3750,7 @@
           "tests/contract_blackbox/slice21/test_f3_observability.py::test_fail_error_code",
           "tests/contract_blackbox/slice21/test_f3_observability.py::test_log_tail_latest",
           "tests/contract_blackbox/slice21/test_f4_session_semantics.py::test_activity_classification",
+          "tests/contract_blackbox/slice21/test_f4_session_semantics.py::test_background_reboot_result_tail_matches_python",
           "tests/contract_blackbox/slice21/test_f4_session_semantics.py::test_background_result_tail_consistent",
           "tests/contract_blackbox/slice21/test_f4_session_semantics.py::test_interactive_line_cmd_defined",
           "tests/contract_blackbox/slice21/test_oracle_redproof.py::test_redproof_attaching_allows_system_probe_only",
@@ -3787,6 +3789,7 @@
           "tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[SESSION_RECOVERING]",
           "tests/contract_blackbox/slice21/test_safety_core.py::test_released_survives_two_restarts_dynamic",
           "tests/contract_blackbox/slice21/test_safety_core.py::test_socket_mode_0660",
+          "tests/contract_blackbox/slice21/test_safety_core.py::test_stale_context_not_replayed",
           "tests/contract_blackbox/slice21/test_safety_core.py::test_two_daemons_same_tty",
           "tests/contract_blackbox/slice21/test_safety_core.py::test_wal_reader_hold_does_not_block_records",
           "tests/contract_blackbox/slice21/test_safety_core.py::test_wal_reset_archives_and_next_command_recorded",
@@ -3803,7 +3806,14 @@
           "tests/contract_blackbox/slice21/test_state_file_compat.py::test_non_dict_json_not_backed_up",
           "tests/contract_blackbox/slice21/test_state_file_compat.py::test_release_persist_oserror_message_like_python",
           "tests/contract_blackbox/slice21/test_state_file_compat.py::test_rust_written_state_is_loaded_by_python",
-          "tests/contract_blackbox/slice21/test_state_file_compat.py::test_startup_always_rewrites_state_json"
+          "tests/contract_blackbox/slice21/test_state_file_compat.py::test_startup_always_rewrites_state_json",
+          "tests/contract_blackbox/slice21/test_windows_nocom.py::test_config_yaml_socket_path_written",
+          "tests/contract_blackbox/slice21/test_windows_nocom.py::test_deferred_methods_windows",
+          "tests/contract_blackbox/slice21/test_windows_nocom.py::test_second_daemon_exit_2",
+          "tests/contract_blackbox/slice21/test_windows_nocom.py::test_session_public_console_endpoint_null",
+          "tests/contract_blackbox/slice21/test_windows_nocom.py::test_stop_exit_0",
+          "tests/contract_blackbox/slice21/test_windows_nocom.py::test_tcp_endpoint_loopback_and_ping",
+          "tests/contract_blackbox/slice21/test_windows_nocom.py::test_wal_share_delete_while_running"
         ],
         "selector": {
           "argv": [
@@ -7934,6 +7944,7 @@
           "tests/test_p7_goldens_fresh.py::test_login_fsm_golden_covers_every_platform_and_error",
           "tests/test_p7_login_wal_oracle.py::test_login_window_oracle_rejects_swallowed_human_bytes",
           "tests/test_p7_login_wal_oracle.py::test_login_window_oracle_rejects_synthetic_agent_tx",
+          "tests/test_p7_login_wal_oracle.py::test_login_window_oracle_waits_for_probe_nonce_across_rx_chunks",
           "tests/test_p7_od56_ci_allow.py::test_od56_p7_bo1_triples_allowed_linux_only",
           "tests/test_p7_recover_parity.py::test_recover_not_ready_non_force_returns_not_ready",
           "tests/test_p7_recover_parity.py::test_recover_resets_credentials_warned",
@@ -23816,6 +23827,7 @@
           "cargo:sw-daemon::sw_daemon::framing::tests::trim_matches_python_strip",
           "cargo:sw-daemon::sw_daemon::launcher::tests::current_release_rejects_parent_traversal",
           "cargo:sw-daemon::sw_daemon::launcher::tests::current_release_resolves_manifest_from_memfs",
+          "cargo:sw-daemon::windows_console_native::gpx_release_then_reattach_reopens_com0com_console_exactly_once",
           "cargo:sw-daemon::windows_console_native::telnet_hub_end_to_end_with_fake_serial",
           "cargo:sw-daemon::windows_console_native::telnet_listener_ephemeral_per_bridge",
           "cargo:sw-daemon::windows_console_native::telnet_second_client_line_mode",
@@ -30074,6 +30086,7 @@
           "tests/test_p7_goldens_fresh.py::test_login_fsm_golden_covers_every_platform_and_error",
           "tests/test_p7_login_wal_oracle.py::test_login_window_oracle_rejects_swallowed_human_bytes",
           "tests/test_p7_login_wal_oracle.py::test_login_window_oracle_rejects_synthetic_agent_tx",
+          "tests/test_p7_login_wal_oracle.py::test_login_window_oracle_waits_for_probe_nonce_across_rx_chunks",
           "tests/test_p7_od56_ci_allow.py::test_od56_p7_bo1_triples_allowed_linux_only",
           "tests/test_p7_recover_parity.py::test_recover_not_ready_non_force_returns_not_ready",
           "tests/test_p7_recover_parity.py::test_recover_resets_credentials_warned",
@@ -37184,6 +37197,7 @@
       "windows": {
         "nodeids": [
           "cargo:sw-daemon::windows_console_native::cap_windows_com__serial_console_end_to_end",
+          "cargo:sw-daemon::windows_console_native::gpx_release_then_reattach_reopens_com0com_console_exactly_once",
           "cargo:sw-daemon::windows_console_native::telnet_hub_end_to_end_with_fake_serial",
           "cargo:sw-daemon::windows_console_native::telnet_listener_ephemeral_per_bridge",
           "cargo:sw-daemon::windows_console_native::telnet_second_client_line_mode",

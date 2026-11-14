@@ -140,6 +140,57 @@ fn telnet_hub_end_to_end_with_fake_serial() {
     );
 }
 
+/// S2-GP-gpx M1：release → attach → 新 bridge adoption，hub 已關閉的 serial console 須恰好重開一次。
+#[test]
+fn gpx_release_then_reattach_reopens_com0com_console_exactly_once() {
+    let r = ServiceRig::with_fake_tcp_console_and_serial_console("COM22", "COM23");
+    wait_for("初始 COM22 serial console 開啟命令", || {
+        r.console.as_ref().unwrap().opened_serial_consoles().len() == 1
+    });
+    assert_eq!(r.console.as_ref().unwrap().opened_serial_consoles(), ["COM22"]);
+    let initial_console = r.console.as_ref().unwrap().fake.com0com_opened()[0].1.clone();
+    r.wait_state("COM0", "ATTACHED");
+    r.clock.advance(Duration::from_secs(31));
+    r.wait_state("COM0", "READY");
+
+    let released = r.call("device.release", r#"{"selector":"COM0"}"#);
+    assert_eq!(
+        released.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&released)
+    );
+    assert_eq!(
+        text(&r.session("COM0").expect("released session"), "state"),
+        "RELEASED"
+    );
+    assert!(initial_console.closed(), "device.release 必須關閉既有 com0com console");
+
+    let attached = r.call("device.attach", r#"{"selector":"COM0"}"#);
+    assert_eq!(
+        attached.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&attached)
+    );
+    r.wait_state("COM0", "ATTACHED");
+    wait_for("reattach 後第二次 COM22 serial console 開啟命令", || {
+        r.console.as_ref().unwrap().opened_serial_consoles().len() == 2
+    });
+    r.clock.advance(Duration::from_secs(31));
+    r.wait_state("COM0", "READY");
+    assert_eq!(
+        r.console.as_ref().unwrap().opened_serial_consoles(),
+        ["COM22", "COM22"],
+        "每次 bridge 恢復只補一個已關閉的 serial console"
+    );
+    assert_eq!(
+        r.console.as_ref().unwrap().fake.com0com_opened().len(),
+        2,
+        "重掛後恰好建立第二個成功的 fake com0com console"
+    );
+}
+
 /// 第一個 TCP client 使用 raw ownership；第二個 client 走 line mode，CRLF 送出一筆 UART 命令。
 #[test]
 fn telnet_second_client_line_mode() {
@@ -315,4 +366,79 @@ fn cap_windows_com__serial_console_end_to_end() {
         .map(|value| dumps(value, &RPC_WIRE))
         .unwrap_or_default();
     assert!(!listing.contains("COM22") && !listing.contains("COM23"), "console pair 不列為 DUT：{listing}");
+
+    // COM23 對端持續不讀。大量 DUT RX 讓 COM22 寫入進入 overlapped pending 後，
+    // 同一 hub 仍須 accept TCP、收取 TCP 輸入、顯示 UART RX，並能處理 release 關閉。
+    let endpoint = text(&response, "endpoint");
+    let flood = vec![b'r'; 8192];
+    for _ in 0..32 {
+        device.push_rx(&flood);
+    }
+    let mut tcp = connect(&endpoint);
+    tcp.set_read_timeout(Some(Duration::from_millis(750)))
+        .unwrap();
+    let mut greeting_bytes = [0u8; 12];
+    tcp.read_exact(&mut greeting_bytes)
+        .expect("COM22 寫入 pending 時同一 hub 仍須接受 TCP client");
+    assert_eq!(&greeting_bytes, TELNET_GREETING);
+    wait_for(
+        "TCP client 已由同一 console hub 登記",
+        || {
+            r.call("session.console_list", r#"{"selector":"COM0"}"#)
+                .get("consoles")
+                .and_then(PyValue::as_array)
+                .is_some_and(|rows| {
+                    rows.iter().any(|row| match row {
+                        PyValue::Dict(row) => {
+                            row.get("vtty").and_then(PyValue::as_str) == Some(endpoint.as_str())
+                        }
+                        _ => false,
+                    })
+                })
+        },
+    );
+    tcp.write_all(b"tcp-input-after-com0com-pressure\r\n")
+        .expect("送出 TCP line-mode human input");
+    let mut tcp_uart_tx = Vec::new();
+    wait_for(
+        "COM22 peer 不讀時 TCP 輸入仍送到 FakeSerial",
+        || {
+            tcp_uart_tx.extend(device.take_tx());
+            tcp_uart_tx
+                .windows(b"tcp-input-after-com0com-pressure".len())
+                .any(|window| window == b"tcp-input-after-com0com-pressure")
+        },
+    );
+    device.push_rx(b"tcp-display-after-com0com-pressure");
+    let mut displayed = Vec::new();
+    wait_for(
+        "COM22 peer 不讀時 TCP client 仍收到 UART display",
+        || {
+            let mut chunk = [0u8; 4096];
+            match tcp.read(&mut chunk) {
+                Ok(count) => displayed.extend_from_slice(&chunk[..count]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) => panic!("讀取 TCP display：{error}"),
+            }
+            displayed
+                .windows(b"tcp-display-after-com0com-pressure".len())
+                .any(|window| window == b"tcp-display-after-com0com-pressure")
+        },
+    );
+    let close_started = Instant::now();
+    let released = r.call("device.release", r#"{"selector":"COM0"}"#);
+    assert_eq!(
+        released.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&released)
+    );
+    assert!(
+        close_started.elapsed() < Duration::from_secs(3),
+        "release 關閉 console hub 不得等待 overlapped COM write"
+    );
 }

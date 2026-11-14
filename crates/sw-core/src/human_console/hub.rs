@@ -311,6 +311,7 @@ pub fn spawn_hub_with(
         input_epoch: Arc::clone(&input_epoch),
         clients: BTreeMap::new(),
         by_cid: HashMap::new(),
+        active_serial_consoles: HashMap::new(),
         listener: None,
         parked_listener: None,
         next_id: 1,
@@ -373,6 +374,8 @@ struct Hub {
     input_epoch: Arc<AtomicU64>,
     clients: BTreeMap<MuxId, HubClient>,
     by_cid: HashMap<String, MuxId>,
+    /// 實際已加入 mux 的 com0com console；close_all/remove_client 時同步移除。
+    active_serial_consoles: HashMap<MuxId, String>,
     listener: Option<MuxId>,
     /// 達 Telnet 上限時暫停 accept：listener 自 mux 移出暫存於此（SC-31(d)）。
     parked_listener: Option<Box<dyn ConsoleListener>>,
@@ -550,6 +553,7 @@ impl Hub {
         let Some(client) = self.clients.remove(&id) else {
             return;
         };
+        self.active_serial_consoles.remove(&id);
         self.by_cid.remove(&client.cid);
         if let Some(MuxEntry::Io(io)) = self.mux.remove(id) {
             io.close();
@@ -628,6 +632,11 @@ impl Hub {
                 self.parked_listener = None;
                 self.status.listener_up.store(false, Ordering::Release);
             }
+            HubCmd::OpenCom0com { port }
+                if self
+                    .active_serial_consoles
+                    .values()
+                    .any(|active| active == &port) => {}
             HubCmd::OpenCom0com { port } => match self.factory.open_com0com_console(&port) {
                 Ok(io) => {
                     let id = self.alloc_id();
@@ -638,6 +647,7 @@ impl Hub {
                         ));
                         return;
                     }
+                    self.active_serial_consoles.insert(id, port.clone());
                     let cid = self.new_client_id();
                     self.stream_lifetime += 1;
                     let lifetime = self.stream_lifetime;
