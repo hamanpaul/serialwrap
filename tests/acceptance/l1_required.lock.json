@@ -3789,7 +3789,6 @@
           "tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[SESSION_RECOVERING]",
           "tests/contract_blackbox/slice21/test_safety_core.py::test_released_survives_two_restarts_dynamic",
           "tests/contract_blackbox/slice21/test_safety_core.py::test_socket_mode_0660",
-          "tests/contract_blackbox/slice21/test_safety_core.py::test_stale_context_not_replayed",
           "tests/contract_blackbox/slice21/test_safety_core.py::test_two_daemons_same_tty",
           "tests/contract_blackbox/slice21/test_safety_core.py::test_wal_reader_hold_does_not_block_records",
           "tests/contract_blackbox/slice21/test_safety_core.py::test_wal_reset_archives_and_next_command_recorded",
@@ -3806,14 +3805,7 @@
           "tests/contract_blackbox/slice21/test_state_file_compat.py::test_non_dict_json_not_backed_up",
           "tests/contract_blackbox/slice21/test_state_file_compat.py::test_release_persist_oserror_message_like_python",
           "tests/contract_blackbox/slice21/test_state_file_compat.py::test_rust_written_state_is_loaded_by_python",
-          "tests/contract_blackbox/slice21/test_state_file_compat.py::test_startup_always_rewrites_state_json",
-          "tests/contract_blackbox/slice21/test_windows_nocom.py::test_config_yaml_socket_path_written",
-          "tests/contract_blackbox/slice21/test_windows_nocom.py::test_deferred_methods_windows",
-          "tests/contract_blackbox/slice21/test_windows_nocom.py::test_second_daemon_exit_2",
-          "tests/contract_blackbox/slice21/test_windows_nocom.py::test_session_public_console_endpoint_null",
-          "tests/contract_blackbox/slice21/test_windows_nocom.py::test_stop_exit_0",
-          "tests/contract_blackbox/slice21/test_windows_nocom.py::test_tcp_endpoint_loopback_and_ping",
-          "tests/contract_blackbox/slice21/test_windows_nocom.py::test_wal_share_delete_while_running"
+          "tests/contract_blackbox/slice21/test_state_file_compat.py::test_startup_always_rewrites_state_json"
         ],
         "selector": {
           "argv": [

@@ -251,6 +251,9 @@ def test_release_during_login_waits_for_handle_close(p7, tmp_path):
     while b"\n" not in tgt.rx_log():
         assert time.monotonic() < deadline, "daemon 未開始 login probe"
         time.sleep(0.05)
+    # 固定在 FakeTarget 已收到 probe、但尚未送回 login prompt 的窗口內 release；避免排程延遲
+    # 讓舊回應在 reattach 後抵達，將案例變成完整登入並誤判為未重現 Python 的中斷行為。
+    tgt.hold_reply(True)
     slave = tgt.slave_path
     assert _daemon_fds_to(p7, slave) >= 1, "login 進行中 daemon 應持有 tty"
     rc, j = p7.cli("device", "release", "--selector", "COM0", "--source", "agent:p7", "--reason", "flash")
@@ -266,6 +269,7 @@ def test_release_during_login_waits_for_handle_close(p7, tmp_path):
     while _daemon_fds_to(p7, slave) == 0:
         assert time.monotonic() < deadline, "device attach 後應重新開啟 tty"
         time.sleep(0.05)
+    tgt.hold_reply(False)
     # DF-23：attach 之後的收斂結果（Rust 回 READY；Python 落 DETACHED＋ATTACH_FAILED:TxIncompleteError 且不自動重試）
     if is_rust():
         s = wait_state(p7.env, "COM0", "READY", timeout_s=60.0)

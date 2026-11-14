@@ -302,13 +302,18 @@ def _df27_post_login_timeout_scenario(flavor: str, tmp_path: Path, expected_daem
                 f"受測 daemon 二進位與預期不符：期望 {expected_daemon_exe}，實際 {actual_exe}"
             )
 
-        # 1. 登入成功後送出 sh，假 target 回傳非 prompt 文字，等待 timeout_s 逾時
-        s_detached = wait_state(rig.env, "COM0", "DETACHED", timeout_s=15.0)
-        last_err = s_detached.get("last_error")
-        assert last_err == "POST_LOGIN_CMD_TIMEOUT", (
-            f"必須觀察到精確的 POST_LOGIN_CMD_TIMEOUT，實際為 {last_err!r}；"
-            f"若為 LOGIN_REQUIRED、TRANSPORT_STALL 或 RX_FLOOD 則判定 fixture 不成立"
-        )
+        # 1. 登入成功後送出 sh，假 target 回傳非 prompt 文字；忽略初始化時的 DETACHED，
+        #    等到精確錯誤碼出現，並確認它對應的狀態仍為 DETACHED。
+        deadline = time.monotonic() + 15.0
+        s_detached = _session_row(rig.env, "COM0")
+        while s_detached is None or s_detached.get("last_error") != "POST_LOGIN_CMD_TIMEOUT":
+            assert time.monotonic() < deadline, (
+                "必須觀察到精確的 POST_LOGIN_CMD_TIMEOUT；"
+                f"若為 LOGIN_REQUIRED、TRANSPORT_STALL 或 RX_FLOOD 則判定 fixture 不成立：{s_detached!r}"
+            )
+            time.sleep(0.2)
+            s_detached = _session_row(rig.env, "COM0")
+        assert s_detached.get("state") == "DETACHED", s_detached
 
         # 2. 觀察到逾時後，讓假 target 後續 sh 恢復正常回應，不呼叫手動 attach／recover、不重新插拔
         tgt.overrides["sh"] = {"response": "\r\n# "}

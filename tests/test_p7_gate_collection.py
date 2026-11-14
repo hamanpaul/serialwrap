@@ -58,11 +58,15 @@ def test_od72_slice21_nodes_keep_their_assigned_owner() -> None:
         "tests/contract_blackbox/slice21/test_windows_nocom.py::test_wal_share_delete_while_running",
     }
     deferred_case = "tests/contract_blackbox/slice21/test_safety_core.py::test_stale_context_not_replayed"
+    startup_case = "tests/contract_blackbox/slice21/test_state_file_compat.py::test_startup_always_rewrites_state_json"
+    reboot_tail_case = "tests/contract_blackbox/slice21/test_f4_session_semantics.py::test_background_reboot_result_tail_matches_python"
 
     assert not (linux_nodes & windows_cases), f"Windows 原生案例仍在 Linux slice21 集合：{sorted(linux_nodes & windows_cases)}"
     assert windows_cases <= windows_nodes, f"Windows 原生集合缺案例：{sorted(windows_cases - windows_nodes)}"
     assert deferred_case not in linux_nodes, "DF-20 deferred 案例仍在 P7 Linux slice21 集合"
     assert deferred_case in full_linux_nodes, "DF-20 案例不得從完整 pytest 分母刪除"
+    assert startup_case in linux_nodes, "OD-72 前已屬 Linux slice21 的 startup 案例必須保留原承擔"
+    assert reboot_tail_case in linux_nodes, "A1 新增的 background reboot result_tail 案例依裁決保留於 slice21"
 
 
 def test_od78_replacement_preserves_continue_on_error_coverage() -> None:
