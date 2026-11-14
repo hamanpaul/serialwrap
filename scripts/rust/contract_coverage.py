@@ -26,6 +26,7 @@ DEFAULT_CASES = ROOT / "tests/acceptance/cases.yaml"
 DEFAULT_CASES_LOCK = ROOT / "tests/acceptance/cases.lock.json"
 DEFAULT_MAP = ROOT / "contracts/coverage_map.yaml"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_GIT_REVISION = re.compile(r"^[0-9a-f]{40}$")
 _VALID_OUTCOMES = frozenset({"passed", "failed", "skipped", "xfailed", "error"})
 _VALID_PHASES = frozenset({"setup", "call", "teardown"})
 _OWNER_CAPS = frozenset({
@@ -655,6 +656,229 @@ def _identity_checks(
     return list(dict.fromkeys(errors))
 
 
+def _prior_identity_problem(
+    label: str,
+    revision: object,
+    daemon_sha256: object,
+    expected_revision: str | None,
+    expected_daemon_sha256: str | None,
+) -> str | None:
+    """先前切片逐案證據必須綁定本輪 commit 與實際受測 daemon。"""
+    if not isinstance(expected_revision, str) or not expected_revision:
+        return "本輪 git_revision 缺漏"
+    if not _GIT_REVISION.fullmatch(expected_revision):
+        return "本輪 git_revision 格式無效"
+    if not isinstance(expected_daemon_sha256, str) or not expected_daemon_sha256:
+        return "本輪 daemon_sha256 缺漏"
+    if not _SHA256.fullmatch(expected_daemon_sha256):
+        return "本輪 daemon_sha256 格式無效"
+    if not isinstance(revision, str) or not revision:
+        return f"{label} git_revision 缺漏"
+    if not _GIT_REVISION.fullmatch(revision):
+        return f"{label} git_revision 格式無效"
+    if not isinstance(daemon_sha256, str) or not daemon_sha256:
+        return f"{label} daemon_sha256 缺漏"
+    if not _SHA256.fullmatch(daemon_sha256):
+        return f"{label} daemon_sha256 格式無效"
+    if revision != expected_revision:
+        return f"{label} git_revision {revision[:12]} 與本輪 HEAD {expected_revision[:12]} 不符"
+    if daemon_sha256 != expected_daemon_sha256:
+        return f"{label} daemon sha256 {daemon_sha256[:12]} 與本輪 artifact {expected_daemon_sha256[:12]} 不符"
+    return None
+
+
+def _prior_verdict(status: object) -> str:
+    """只保留來源明確判定；其他值一律是證據缺漏。"""
+    if isinstance(status, str) and status in {"PASS", "FAIL", "BLOCKED-OWNER", "EVIDENCE_MISSING"}:
+        return status
+    return "EVIDENCE_MISSING"
+
+
+def load_prior_case_verdicts(
+    *,
+    slice21_run: Path | None,
+    slice22_gate: Path | None,
+    slice23_run: Path | None,
+    expected_git_revision: str | None,
+    expected_daemon_sha256: str | None,
+) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, Any]], list[str]]:
+    """匯入 2.1、2.2、2.3 gate 的逐案結果；來源缺漏不產生 PASS，identity 不符列錯誤。"""
+    verdicts: dict[str, dict[str, str]] = {}
+    sources: dict[str, dict[str, Any]] = {}
+    identity_errors: list[str] = []
+
+    def read_json(path: Path) -> dict[str, Any] | None:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def recorded_artifact_sha256(document: Mapping[str, Any], artifact_name: str) -> tuple[object, str | None]:
+        artifacts = document.get("artifacts")
+        if not isinstance(artifacts, Mapping):
+            return None, f"slice 2.3 results.json 缺 artifacts.{artifact_name}"
+        matches = [
+            digest for path, digest in artifacts.items()
+            if isinstance(path, str) and Path(path.replace("\\", "/")).name.removesuffix(".exe") == artifact_name
+        ]
+        if len(matches) != 1:
+            return None, f"slice 2.3 results.json 的 artifacts.{artifact_name} 不唯一"
+        return matches[0], None
+
+    def accept_source(
+        slice_id: str,
+        label: str,
+        path: Path,
+        revision: object,
+        daemon_sha256: object,
+        rows: Mapping[str, tuple[object, str]],
+        *,
+        reference_revision: str | None,
+        reference_daemon_sha256: str | None,
+        evidence_paths: Sequence[Path] = (),
+        format_problem: str | None = None,
+    ) -> None:
+        problem = _prior_identity_problem(
+            label, revision, daemon_sha256, reference_revision, reference_daemon_sha256,
+        )
+        accepted = problem is None and format_problem is None
+        reason = problem or format_problem
+        sources[slice_id] = {
+            "path": str(path),
+            "git_revision": revision,
+            "daemon_sha256": daemon_sha256,
+            "accepted": accepted,
+            "reason": reason,
+            "case_count": len(rows) if accepted else 0,
+            "evidence_sha256": {
+                evidence_path.name: _sha256(evidence_path)
+                for evidence_path in evidence_paths if evidence_path.is_file()
+            },
+        }
+        if problem and ("格式無效" in problem or "不符" in problem):
+            identity_errors.append(problem)
+        if not accepted:
+            return
+        for case_id, (raw_status, detail) in rows.items():
+            verdicts[case_id] = {"status": _prior_verdict(raw_status), "slice": slice_id, "detail": detail}
+
+    slice23_results: dict[str, Any] | None = None
+    reference_revision: str | None = None
+    reference_daemon_sha256: str | None = None
+    slice23_daemon_sha256: object = None
+    slice23_artifact_problem: str | None = None
+    reference_problem: str | None = None
+    if slice23_run is not None:
+        slice23_results = read_json(Path(slice23_run) / "results.json") if Path(slice23_run).is_dir() else None
+        prior_artifacts = (
+            slice23_results.get("prior_slice_artifacts")
+            if isinstance(slice23_results, dict) and isinstance(slice23_results.get("prior_slice_artifacts"), dict)
+            else {}
+        )
+        reference_revision = slice23_results.get("git_head") if slice23_results else None
+        reference_daemon_sha256 = prior_artifacts.get("serialwrapd_release")
+        if slice23_results is not None:
+            slice23_daemon_sha256, slice23_artifact_problem = recorded_artifact_sha256(slice23_results, "serialwrapd")
+        else:
+            slice23_artifact_problem = "slice 2.3 run 缺 results.json"
+        reference_problem = _prior_identity_problem(
+            "slice 2.3 gate results.json", reference_revision, reference_daemon_sha256,
+            expected_git_revision, reference_daemon_sha256 if isinstance(reference_daemon_sha256, str) else None,
+        )
+        if reference_problem and ("格式無效" in reference_problem or "不符" in reference_problem):
+            identity_errors.append(reference_problem)
+    elif slice21_run is not None or slice22_gate is not None:
+        reference_problem = "缺 slice 2.3 gate results.json，無法核對先前切片 artifact 身分"
+
+    if slice21_run is not None:
+        run = Path(slice21_run)
+        report = read_json(run / "report.json") if run.is_dir() else None
+        case_rows = read_json(run / "case_verdicts.json") if run.is_dir() else None
+        identity = report.get("identity") if isinstance(report, dict) and isinstance(report.get("identity"), dict) else {}
+        raw_verdicts = case_rows if isinstance(case_rows, dict) else {}
+        rows = {
+            case_id: (status, "slice21 gate case_verdicts.json")
+            for case_id, status in raw_verdicts.items()
+            if isinstance(case_id, str) and isinstance(status, str)
+        }
+        format_problem = None
+        if report is None:
+            format_problem = "slice21 gate run 缺 report.json"
+        elif case_rows is None or len(rows) != len(raw_verdicts):
+            format_problem = "slice21 gate 缺 case_verdicts.json 或格式不符"
+        accept_source(
+            "2.1", "slice21 gate", run, report.get("git_revision") if report else None,
+            identity.get("daemon_sha256"), rows,
+            reference_revision=reference_revision,
+            reference_daemon_sha256=reference_daemon_sha256,
+            evidence_paths=(run / "report.json", run / "case_verdicts.json"),
+            format_problem=format_problem or reference_problem,
+        )
+
+    if slice22_gate is not None:
+        path = Path(slice22_gate)
+        document = read_json(path)
+        identity = document.get("identity") if isinstance(document, dict) and isinstance(document.get("identity"), dict) else {}
+        cases = document.get("cases") if isinstance(document, dict) else None
+        rows: dict[str, tuple[object, str]] = {}
+        format_problem = None
+        if not isinstance(cases, list) or any(not isinstance(row, dict) or not isinstance(row.get("case_id"), str) for row in cases):
+            format_problem = "s22 gate 缺 cases[] 或格式不符"
+        else:
+            for row in cases:
+                case_id = row["case_id"]
+                detail = str(row.get("detail") or "s22 gate cases[].status")
+                rows[case_id] = ("EVIDENCE_MISSING", "s22 gate case_id 重複") if case_id in rows else (
+                    row.get("status"), detail,
+                )
+        accept_source(
+            "2.2", "s22 gate", path,
+            identity.get("git_revision"), identity.get("daemon_sha256"), rows,
+            reference_revision=reference_revision,
+            reference_daemon_sha256=reference_daemon_sha256,
+            evidence_paths=(path,),
+            format_problem=format_problem or ("s22 gate JSON 缺失或格式不符" if document is None else None) or reference_problem,
+        )
+
+    if slice23_run is not None:
+        run = Path(slice23_run)
+        results = slice23_results
+        coverage = read_json(run / "coverage.json") if run.is_dir() else None
+        prior_artifacts = results.get("prior_slice_artifacts") if isinstance(results, dict) and isinstance(results.get("prior_slice_artifacts"), dict) else {}
+        case_rows = coverage.get("rows") if isinstance(coverage, dict) else None
+        rows: dict[str, tuple[object, str]] = {}
+        format_problem = None
+        if not isinstance(case_rows, list) or any(not isinstance(row, dict) or not isinstance(row.get("case_id"), str) for row in case_rows):
+            format_problem = "slice 2.3 coverage 缺 rows[] 或格式不符"
+        elif coverage.get("set") not in (None, "slice_2.3"):
+            format_problem = "slice 2.3 coverage set 欄位不符"
+        else:
+            for row in case_rows:
+                case_id = row["case_id"]
+                detail = str(row.get("detail") or "slice 2.3 coverage rows[].status")
+                # p7_case_coverage 將非 PASS、非 BLOCKED-OWNER 統稱 GAP；GAP 不可被提升成 PASS。
+                status = "EVIDENCE_MISSING" if row.get("status") == "GAP" else row.get("status")
+                rows[case_id] = ("EVIDENCE_MISSING", "slice 2.3 case_id 重複") if case_id in rows else (
+                    status, detail,
+                )
+        if results is None:
+            format_problem = format_problem or "slice 2.3 run 缺 results.json"
+        accept_source(
+            "2.3", "slice 2.3 gate", run,
+            results.get("git_head") if results else None,
+            slice23_daemon_sha256, rows,
+            reference_revision=expected_git_revision,
+            reference_daemon_sha256=expected_daemon_sha256,
+            evidence_paths=(run / "results.json", run / "coverage.json"),
+            format_problem=(format_problem or slice23_artifact_problem
+                            or ("slice 2.3 run 缺 coverage.json 或格式不符" if coverage is None else None)),
+        )
+        sources["2.3"]["release_daemon_sha256"] = reference_daemon_sha256
+
+    return verdicts, sources, list(dict.fromkeys(identity_errors))
+
+
 def _validate_run(row: Mapping[str, Any]) -> list[str]:
     label = str(row.get("label", "unknown"))
     if row.get("_load_error"):
@@ -836,6 +1060,9 @@ def evaluate(
     expected_cases_lock_sha256: str | None = None,
     expected_platform: str = "linux",
     owner_evidence: Mapping[str, Mapping[str, Any]] | None = None,
+    prior_case_verdicts: Mapping[str, Mapping[str, str]] | None = None,
+    prior_sources: Mapping[str, Mapping[str, Any]] | None = None,
+    prior_identity_errors: Sequence[str] = (),
 ) -> dict[str, Any]:
     """依平台逐 nodeid 判定；任何不完整、重複或 BLOCKED-OWNER 結果皆不能成為 PASS。
 
@@ -843,7 +1070,7 @@ def evaluate(
     有效證據判 FAIL 時照實為 FAIL，缺漏或拒收仍維持 BLOCKED-OWNER。
     """
     run_root = run_dir or ROOT
-    identity_errors = _identity_checks(
+    run_identity_errors = _identity_checks(
         results,
         run_root,
         expect_cli_sha256,
@@ -853,6 +1080,7 @@ def evaluate(
         expected_cases_lock_sha256,
         expected_platform,
     )
+    identity_errors = list(dict.fromkeys([*run_identity_errors, *prior_identity_errors]))
     incomplete_runs = {
         str(row.get("label", "unknown")): _validate_run(row)
         for row in results
@@ -871,6 +1099,7 @@ def evaluate(
         "case_verdicts": {},
         "windows_verdicts": {},
         "owner_evidence": {},
+        "prior_sources": {key: dict(value) for key, value in (prior_sources or {}).items()},
     }
 
     for contract_id, item in sorted(contract_universe.items()):
@@ -894,6 +1123,26 @@ def evaluate(
                     owner_reason or item.get("blocked_reason") or f"擁有者證據待補：{caps or '外部資源'}"
                 )
                 continue
+
+        prior = (prior_case_verdicts or {}).get(contract_id.removeprefix("case:")) if item.get("kind") == "case" else None
+        if not nodeids and prior is not None:
+            if run_identity_errors:
+                report["missing_reasons"][contract_id] = "run identity invalid"
+            else:
+                prior_status = prior.get("status")
+                prior_detail = prior.get("detail") or f"slice {prior.get('slice')} 逐案證據"
+                if prior_status == "PASS":
+                    report["covered"].append(contract_id)
+                elif prior_status == "FAIL":
+                    report["failed"].append(contract_id)
+                    report["missing_reasons"][contract_id] = f"slice {prior.get('slice')} 逐案 FAIL：{prior_detail}"
+                elif prior_status == "BLOCKED-OWNER":
+                    report["blocked_owner"][contract_id] = f"slice {prior.get('slice')}：{prior_detail}"
+                else:
+                    report["missing_reasons"][contract_id] = (
+                        f"slice {prior.get('slice')} 逐案證據缺漏（{prior_status or 'EVIDENCE_MISSING'}）：{prior_detail}"
+                    )
+            continue
 
         if not nodeids:
             if owner_verdict == "PASS":
@@ -1750,10 +1999,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--platforms", action="append", default=[], help="測試用平台覆寫：ID=linux,windows")
     parser.add_argument("--expect-cli-sha256")
     parser.add_argument("--expect-daemon-sha256")
+    parser.add_argument("--expect-git-revision", help="先前切片 evidence 必須等於本輪完整 40 位 HEAD")
     parser.add_argument(
         "--expect-platform", choices=("linux", "windows"), default="linux",
         help="--expect-*-sha256 適用的平台；其他平台的 artifact 另以各自 runner manifest 核對",
     )
+    parser.add_argument("--slice21-run", type=Path, help="slice21 gate run 目錄（report.json＋case_verdicts.json）")
+    parser.add_argument("--slice22-gate", type=Path, help="s22_gate_check.py 輸出的逐案 gate JSON")
+    parser.add_argument("--slice23-run", type=Path, help="p7 gate run 目錄（results.json＋coverage.json）")
     parser.add_argument(
         "--import-longrun", type=Path,
         help="驗證長跑證據目錄並匯入 <run-dir>/longrun/；全部成立 exit 0，拒收 exit 1",
@@ -1819,6 +2072,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             ids[contract_id] = dict(ids[contract_id])
             ids[contract_id]["platforms"] = platforms
         result_rows = load_results(args.run_dir)
+        prior_case_verdicts, prior_sources, prior_identity_errors = load_prior_case_verdicts(
+            slice21_run=args.slice21_run,
+            slice22_gate=args.slice22_gate,
+            slice23_run=args.slice23_run,
+            expected_git_revision=args.expect_git_revision,
+            expected_daemon_sha256=args.expect_daemon_sha256,
+        )
         expected_sources = {
             "contract_revision": _contract_revision(args.contracts_dir),
             "cases_yaml_sha256": _sha256(args.cases),
@@ -1835,6 +2095,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_cases_lock_sha256=expected_sources["cases_lock_sha256"],
             expected_platform=args.expect_platform,
             owner_evidence=load_owner_evidence(args.run_dir, result_rows),
+            prior_case_verdicts=prior_case_verdicts,
+            prior_sources=prior_sources,
+            prior_identity_errors=prior_identity_errors,
         )
         report["run_dir"] = str(args.run_dir)
         body = json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"

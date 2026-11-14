@@ -17,6 +17,9 @@ RUN_DIR="${SW_SLICE24_RUN_DIR:-target/contract-coverage/$RUN_ID}"
 WINDOWS_RUN=""
 LONGRUN_DIR=""
 CANDIDATE_BUNDLE=""
+SLICE21_RUN=""
+SLICE22_GATE=""
+SLICE23_RUN=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -37,9 +40,21 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { echo "slice24_exit.sh: --candidate-bundle 缺少值" >&2; exit 2; }
       CANDIDATE_BUNDLE="$2"
       shift 2 ;;
+    --slice21-run)
+      [[ $# -ge 2 ]] || { echo "slice24_exit.sh: --slice21-run 缺少值" >&2; exit 2; }
+      SLICE21_RUN="$2"
+      shift 2 ;;
+    --slice22-gate)
+      [[ $# -ge 2 ]] || { echo "slice24_exit.sh: --slice22-gate 缺少值" >&2; exit 2; }
+      SLICE22_GATE="$2"
+      shift 2 ;;
+    --slice23-run)
+      [[ $# -ge 2 ]] || { echo "slice24_exit.sh: --slice23-run 缺少值" >&2; exit 2; }
+      SLICE23_RUN="$2"
+      shift 2 ;;
     -h|--help)
       sed -n '2,9p' "$0"
-      echo "用法：$0 [--run-id ID] [--candidate-bundle DIR] [--windows-run DIR] [--longrun DIR]"
+      echo "用法：$0 [--run-id ID] [--candidate-bundle DIR] [--windows-run DIR] [--longrun DIR] [--slice21-run DIR] [--slice22-gate FILE] [--slice23-run DIR]"
       exit 0 ;;
     *) echo "slice24_exit.sh: 未知參數 $1" >&2; exit 2 ;;
   esac
@@ -68,6 +83,29 @@ mkdir -p "$RUN_DIR/logs" "$RUN_DIR/artifacts"
 # Cargo、pytest 與 importer 的所有可寫產物固定落在本 worktree 的 target/。
 export CARGO_TARGET_DIR="$ROOT/target"
 source "$ROOT/scripts/rust/gate_prereqs.sh" --gate
+
+# 先前切片 gate 證據複製進本輪目錄後才匯入，保留輸入來源且讓報告可追溯。
+PRIOR_CASE_ARGS=()
+if [[ -n "$SLICE21_RUN" ]]; then
+  PRIOR_SLICE21="$RUN_DIR/prior-slices/slice21"
+  mkdir -p "$PRIOR_SLICE21"
+  [[ -f "$SLICE21_RUN/report.json" ]] && cp -p -- "$SLICE21_RUN/report.json" "$PRIOR_SLICE21/report.json"
+  [[ -f "$SLICE21_RUN/case_verdicts.json" ]] && cp -p -- "$SLICE21_RUN/case_verdicts.json" "$PRIOR_SLICE21/case_verdicts.json"
+  PRIOR_CASE_ARGS+=(--slice21-run "$PRIOR_SLICE21")
+fi
+if [[ -n "$SLICE22_GATE" ]]; then
+  PRIOR_SLICE22="$RUN_DIR/prior-slices/s22-gate.json"
+  mkdir -p "$(dirname "$PRIOR_SLICE22")"
+  [[ -f "$SLICE22_GATE" ]] && cp -p -- "$SLICE22_GATE" "$PRIOR_SLICE22"
+  PRIOR_CASE_ARGS+=(--slice22-gate "$PRIOR_SLICE22")
+fi
+if [[ -n "$SLICE23_RUN" ]]; then
+  PRIOR_SLICE23="$RUN_DIR/prior-slices/slice23"
+  mkdir -p "$PRIOR_SLICE23"
+  [[ -f "$SLICE23_RUN/results.json" ]] && cp -p -- "$SLICE23_RUN/results.json" "$PRIOR_SLICE23/results.json"
+  [[ -f "$SLICE23_RUN/coverage.json" ]] && cp -p -- "$SLICE23_RUN/coverage.json" "$PRIOR_SLICE23/coverage.json"
+  PRIOR_CASE_ARGS+=(--slice23-run "$PRIOR_SLICE23")
+fi
 
 DRIVER_TSV="$RUN_DIR/driver.tsv"
 OWNER_TSV="$RUN_DIR/owner-evidence.tsv"
@@ -176,6 +214,8 @@ run_logged python-baseline env \
 # 其檔案都要在此陣列內並與本輪 artifact 一起執行（P8X-24c6b39-6；tests/test_rust_contract_coverage.py 把關）。
 RUST_PYTEST_TARGETS=(
   tests/contract_blackbox
+  tests/acceptance/l15/test_slice21_l15.py
+  tests/acceptance/l15/test_slice23_l15.py
   tests/test_multiagent_e2e.py
   tests/test_human_agent_coexist.py
   tests/test_rust_contract_coverage.py
@@ -313,13 +353,17 @@ run_logged policy-check python3 -m policy_check --repo .
 JSON_REPORT="$RUN_DIR/slice24.json"
 MD_REPORT="$RUN_DIR/slice24.md"
 # 預期雜湊只對 Linux 候選 artifact；Windows 結果以其 runner SHA256SUMS 核對。
-run_logged contract-coverage python3 scripts/rust/contract_coverage.py \
+CONTRACT_COVERAGE_ARGS=(
   --run-dir "$RUN_DIR" \
   --expect-platform linux \
+  --expect-git-revision "$(git rev-parse HEAD)" \
   --expect-cli-sha256 "$(sha256sum "$RUST_CLI" 2>/dev/null | cut -d' ' -f1)" \
   --expect-daemon-sha256 "$(sha256sum "$RUST_DAEMON" 2>/dev/null | cut -d' ' -f1)" \
   --json "$JSON_REPORT" \
   --report "$MD_REPORT"
+)
+CONTRACT_COVERAGE_ARGS+=("${PRIOR_CASE_ARGS[@]}")
+run_logged contract-coverage python3 scripts/rust/contract_coverage.py "${CONTRACT_COVERAGE_ARGS[@]}"
 CONTRACT_COVERAGE_RC="$LAST_RC"
 
 if [[ -f "$JSON_REPORT" ]]; then

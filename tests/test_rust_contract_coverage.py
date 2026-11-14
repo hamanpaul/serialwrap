@@ -1159,6 +1159,14 @@ def test_slice24_exit_binds_candidate_bundle():
     assert 'RUST_CLI="$CANDIDATE_ROOT/bin/serialwrap"' in script
     assert 'RUST_DAEMON="$CANDIDATE_ROOT/bin/serialwrapd"' in script
     assert '--record-candidate-bundle "windows=$WINDOWS_RUN/bundle"' in script
+    assert "tests/acceptance/l15/test_slice21_l15.py" in script
+    assert "tests/acceptance/l15/test_slice23_l15.py" in script
+    assert "--slice21-run)" in script and "--slice22-gate)" in script and "--slice23-run)" in script
+    assert 'PRIOR_CASE_ARGS+=(--slice21-run "$PRIOR_SLICE21")' in script
+    assert 'PRIOR_CASE_ARGS+=(--slice22-gate "$PRIOR_SLICE22")' in script
+    assert 'PRIOR_CASE_ARGS+=(--slice23-run "$PRIOR_SLICE23")' in script
+    assert 'CONTRACT_COVERAGE_ARGS+=("${PRIOR_CASE_ARGS[@]}")' in script
+    assert '--expect-git-revision "$(git rev-parse HEAD)"' in script
 
 
 def _rewrite_gate(src: Path, platform: str, name: str, mutate) -> None:
@@ -1296,3 +1304,231 @@ def test_parametrized_union_requires_every_node_on_both_sides(tmp_path):
     run3, docs3 = _rust_python_docs(tmp_path / "fail", rust_fail, python_rows)
     report3 = cc.evaluate({"rpc_method:params": item}, docs3, run_dir=run3)
     assert "rpc_method:params" in report3["failed"], report3
+
+
+def _prior_slice_fixture(tmp_path):
+    import yaml
+
+    cc = _module()
+    contracts = tmp_path / "contracts"
+    contracts.mkdir()
+    (contracts / "error_codes.yaml").write_text("codes: []\n", encoding="utf-8")
+    (contracts / "session_last_errors.yaml").write_text("values: []\n", encoding="utf-8")
+    (contracts / "behavior_changes.yaml").write_text("changes: []\n", encoding="utf-8")
+    (contracts / "rpc_schema.json").write_text('{"x-methods": {}}\n', encoding="utf-8")
+    (contracts / "cli_schema.json").write_text('{"x-groups": []}\n', encoding="utf-8")
+    (contracts / "wal_record.schema.json").write_text('{}\n', encoding="utf-8")
+    (contracts / "state_file.schema.json").write_text('{}\n', encoding="utf-8")
+    map_file = contracts / "coverage_map.yaml"
+    map_file.write_text("entries: {}\n", encoding="utf-8")
+
+    ids_by_slice = {
+        "2.1": ["s21-pass", "s21-fail", "s21-absent", "s21-owner"],
+        "2.2": ["s22-pass", "s22-absent", "s22-invalid"],
+        "2.3": ["s23-pass", "s23-gap", "s23-invalid"],
+    }
+    cases = tmp_path / "cases.yaml"
+    cases.write_text(yaml.safe_dump({"cases": [
+        {"case_id": case_id, "daemon_slice": slice_id, "suite": "contract-blackbox", "layer": "L1",
+         "platforms": ["linux"], "evidence": []}
+        for slice_id, case_ids in ids_by_slice.items() for case_id in case_ids
+    ]}, allow_unicode=True), encoding="utf-8")
+    cases_lock = tmp_path / "cases.lock.json"
+    cases_lock.write_text(json.dumps({"sets": {"slice_2.4": [case_id for rows in ids_by_slice.values() for case_id in rows]}}), encoding="utf-8")
+
+    run = tmp_path / "run"
+    run.mkdir()
+    cli = run / "cli-artifact"
+    daemon = run / "daemon-artifact"
+    cli.write_bytes(b"candidate cli")
+    daemon.write_bytes(b"candidate daemon")
+    daemon_sha = hashlib.sha256(daemon.read_bytes()).hexdigest()
+    prior_daemon_sha = hashlib.sha256(b"prior slice release daemon").hexdigest()
+    revision = "a" * 40
+    (run / "results-rust-linux.json").write_text(json.dumps({
+        "label": "rust-linux", "platform": "linux", "cli_exe": str(cli),
+        "cli_sha256": hashlib.sha256(cli.read_bytes()).hexdigest(), "daemon_exe": str(daemon),
+        "daemon_sha256": daemon_sha, **REV,
+        "contract_revision": cc._contract_revision(contracts),
+        "cases_yaml_sha256": hashlib.sha256(cases.read_bytes()).hexdigest(),
+        "cases_lock_sha256": hashlib.sha256(cases_lock.read_bytes()).hexdigest(),
+        "collected": [], "exit_code": 0, "finished": True, "results": [],
+    }), encoding="utf-8")
+
+    slice21 = tmp_path / "slice21"
+    slice21.mkdir()
+    (slice21 / "report.json").write_text(json.dumps({
+        "run_id": "s21-fixture", "git_revision": revision,
+        "identity": {"daemon_sha256": prior_daemon_sha},
+    }), encoding="utf-8")
+    (slice21 / "case_verdicts.json").write_text(json.dumps({
+        "s21-pass": "PASS", "s21-fail": "FAIL", "s21-owner": "BLOCKED-OWNER",
+    }), encoding="utf-8")
+
+    slice22 = tmp_path / "s22-gate.json"
+    slice22.write_text(json.dumps({
+        "identity": {"git_revision": revision, "daemon_sha256": prior_daemon_sha},
+        "cases": [{"case_id": "s22-pass", "status": "PASS"}, {"case_id": "s22-invalid", "status": []}],
+    }), encoding="utf-8")
+
+    slice23 = tmp_path / "slice23"
+    slice23.mkdir()
+    (slice23 / "results.json").write_text(json.dumps({
+        "git_head": revision,
+        "artifacts": {"target/debug/serialwrap": hashlib.sha256(cli.read_bytes()).hexdigest(),
+                      "target/debug/serialwrapd": daemon_sha},
+        "prior_slice_artifacts": {"serialwrapd_release": prior_daemon_sha},
+    }), encoding="utf-8")
+    (slice23 / "coverage.json").write_text(json.dumps({
+        "set": "slice_2.3", "rows": [
+            {"case_id": "s23-pass", "status": "PASS", "detail": "s23 gate PASS"},
+            {"case_id": "s23-gap", "status": "GAP", "detail": "缺少逐案證據"},
+            {"case_id": "s23-invalid", "status": {}, "detail": "格式錯誤"},
+        ],
+    }), encoding="utf-8")
+
+    return {
+        "cc": cc, "contracts": contracts, "cases": cases, "cases_lock": cases_lock,
+        "map_file": map_file, "run": run, "slice21": slice21, "slice22": slice22,
+        "slice23": slice23, "revision": revision, "daemon_sha": daemon_sha,
+        "prior_daemon_sha": prior_daemon_sha,
+        "ids": [f"case:{case_id}" for values in ids_by_slice.values() for case_id in values],
+    }
+
+
+def _prior_slice_command(fixture, output: Path, selected: list[str]) -> list[str]:
+    args = [
+        "--run-dir", str(fixture["run"]), "--contracts-dir", str(fixture["contracts"]),
+        "--cases", str(fixture["cases"]), "--cases-lock", str(fixture["cases_lock"]),
+        "--map-file", str(fixture["map_file"]), "--json", str(output),
+        "--expect-git-revision", fixture["revision"], "--expect-daemon-sha256", fixture["daemon_sha"],
+        "--slice21-run", str(fixture["slice21"]), "--slice22-gate", str(fixture["slice22"]),
+        "--slice23-run", str(fixture["slice23"]),
+    ]
+    for contract_id in selected:
+        args.extend(["--only", contract_id])
+    return args
+
+
+def test_prior_slice_universe_lists_seventy_two_unmapped_cases():
+    """OD-88：靜態凍結 universe 的先前切片缺口為 2.1／2.2／2.3 的 13／18／41 案。"""
+    from collections import Counter
+    import yaml
+
+    cc = _module()
+    cases_doc = yaml.safe_load((ROOT / "tests/acceptance/cases.yaml").read_text(encoding="utf-8"))
+    cases = {row["case_id"]: row for row in cases_doc["cases"]}
+    frozen = json.loads((ROOT / "tests/acceptance/cases.lock.json").read_text(encoding="utf-8"))
+    universe = cc.universe(
+        ROOT / "contracts", ROOT / "tests/acceptance/cases.yaml",
+        ROOT / "tests/acceptance/cases.lock.json", ROOT / "contracts/coverage_map.yaml",
+    )
+    gaps = [
+        case_id for case_id in frozen["sets"]["slice_2.4"]
+        if cases[case_id].get("daemon_slice") in {"2.1", "2.2", "2.3"}
+        and not universe[f"case:{case_id}"]["nodeids"]
+        and not cc._is_owner_blocked(universe[f"case:{case_id}"])
+    ]
+    assert len(gaps) == 72
+    assert Counter(cases[case_id]["daemon_slice"] for case_id in gaps) == {"2.1": 13, "2.2": 18, "2.3": 41}
+
+
+def test_prior_slice_gate_verdicts_import_pass_fail_and_missing(tmp_path):
+    """OD-88：三個先前 gate 有逐案證據才沿用 PASS／FAIL；缺列或 GAP 維持 EVIDENCE_MISSING。"""
+    fixture = _prior_slice_fixture(tmp_path)
+    assert fixture["daemon_sha"] != fixture["prior_daemon_sha"]
+    output_path = tmp_path / "coverage.json"
+    result = _run(*_prior_slice_command(fixture, output_path, fixture["ids"]))
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert output_path.is_file(), result.stdout + result.stderr
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+    assert report["case_verdicts"] == {
+        "s21-pass": "PASS", "s21-fail": "FAIL", "s21-absent": "EVIDENCE_MISSING", "s21-owner": "BLOCKED-OWNER",
+        "s22-pass": "PASS", "s22-absent": "EVIDENCE_MISSING", "s22-invalid": "EVIDENCE_MISSING",
+        "s23-pass": "PASS", "s23-gap": "EVIDENCE_MISSING", "s23-invalid": "EVIDENCE_MISSING",
+    }
+    assert report["prior_sources"]["2.1"]["accepted"] is True
+    assert report["prior_sources"]["2.2"]["accepted"] is True
+    assert report["prior_sources"]["2.3"]["accepted"] is True
+    assert report["prior_sources"]["2.3"]["daemon_sha256"] == fixture["daemon_sha"]
+    assert report["prior_sources"]["2.3"]["daemon_sha256"] != fixture["prior_daemon_sha"]
+    assert report["prior_sources"]["2.1"]["evidence_sha256"]["report.json"] == hashlib.sha256(
+        (fixture["slice21"] / "report.json").read_bytes()
+    ).hexdigest()
+    assert report["prior_sources"]["2.3"]["evidence_sha256"]["coverage.json"] == hashlib.sha256(
+        (fixture["slice23"] / "coverage.json").read_bytes()
+    ).hexdigest()
+
+
+def test_prior_slice_missing_source_is_gap_not_identity_error(tmp_path):
+    """整份先前 gate 證據缺失時列缺漏，不混報為來源身分不符。"""
+    fixture = _prior_slice_fixture(tmp_path)
+    (fixture["slice21"] / "report.json").unlink()
+    (fixture["slice21"] / "case_verdicts.json").unlink()
+    output_path = tmp_path / "coverage.json"
+    result = _run(*_prior_slice_command(fixture, output_path, ["case:s21-pass"]))
+    assert result.returncode == 1, result.stdout + result.stderr
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+    assert report["case_verdicts"]["s21-pass"] == "EVIDENCE_MISSING"
+    assert not report["identity_errors"]
+    assert report["prior_sources"]["2.1"]["accepted"] is False
+
+    anchor_root = tmp_path / "missing-anchor"
+    anchor_root.mkdir()
+    missing_anchor = _prior_slice_fixture(anchor_root)
+    anchor_output = tmp_path / "missing-anchor-coverage.json"
+    anchor_args = _prior_slice_command(missing_anchor, anchor_output, ["case:s21-pass", "case:s22-pass"])
+    anchor_arg = anchor_args.index("--slice23-run")
+    del anchor_args[anchor_arg:anchor_arg + 2]
+    anchor_result = _run(*anchor_args)
+    assert anchor_result.returncode == 1, anchor_result.stdout + anchor_result.stderr
+    anchor_report = json.loads(anchor_output.read_text(encoding="utf-8"))
+    assert anchor_report["case_verdicts"] == {
+        "s21-pass": "EVIDENCE_MISSING", "s22-pass": "EVIDENCE_MISSING",
+    }
+    assert not anchor_report["identity_errors"]
+
+
+@pytest.mark.parametrize("mismatch", [
+    "slice21_revision", "slice21_daemon", "slice22_revision", "slice22_daemon", "slice23_revision", "slice23_daemon",
+])
+def test_prior_slice_identity_mismatch_is_reported_and_rejected(tmp_path, mismatch):
+    """來源 HEAD 或 daemon SHA 不符時，該來源不得覆蓋靜態缺口，且須列 identity error。"""
+    fixture = _prior_slice_fixture(tmp_path)
+    if mismatch.startswith("slice21"):
+        report_path = fixture["slice21"] / "report.json"
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        field = "git_revision" if mismatch.endswith("revision") else "identity"
+        if field == "identity":
+            report["identity"]["daemon_sha256"] = "0" * 64
+        else:
+            report[field] = "b" * 40
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        selected = ["case:s21-pass"]
+    elif mismatch.startswith("slice22"):
+        report_path = fixture["slice22"]
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        field = "git_revision" if mismatch.endswith("revision") else "daemon_sha256"
+        report["identity"][field] = "b" * 40 if field == "git_revision" else "0" * 64
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        selected = ["case:s22-pass"]
+    else:
+        report_path = fixture["slice23"] / "results.json"
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        if mismatch.endswith("revision"):
+            report["git_head"] = "b" * 40
+        else:
+            report["artifacts"]["target/debug/serialwrapd"] = "0" * 64
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        selected = ["case:s23-pass"]
+
+    output_path = tmp_path / "coverage.json"
+    result = _run(*_prior_slice_command(fixture, output_path, selected))
+    assert result.returncode == 1, result.stdout + result.stderr
+    output = json.loads(output_path.read_text(encoding="utf-8"))
+    source_key = mismatch.split("_", 1)[0]
+    case_id = {"slice21": "s21-pass", "slice22": "s22-pass", "slice23": "s23-pass"}[source_key]
+    assert output["case_verdicts"][case_id] == "EVIDENCE_MISSING"
+    assert output["identity_errors"]
+    source = {"slice21": "2.1", "slice22": "2.2", "slice23": "2.3"}[source_key]
+    assert output["prior_sources"][source]["accepted"] is False
