@@ -55,6 +55,8 @@ DEFAULT_LOCK = ROOT / "tests" / "acceptance" / "l1_required.lock.json"
 DEFAULT_CASES_LOCK = ROOT / "tests" / "acceptance" / "cases.lock.json"
 DEFAULT_PARITY_DOC = ROOT / "docs" / "rust-refactor" / "plans" / "parity-amendments-2026-10-26.md"
 DEFAULT_PREREQS = ROOT / "scripts" / "rust" / "check_p6_prereqs.py"
+DEFAULT_BREAKER_FREEZE = ROOT / "tests" / "acceptance" / "breaker" / "slice_2.2.json"
+DEFAULT_BREAKER_SNAPSHOTS = ROOT / "tests" / "acceptance" / "breaker" / "slice_2.2.snapshots.ndjson"
 SET_PREFIX = "s22_gate:"
 # 07 Task 13（R5-F3、增補 #187）：出口必要集合與平台；不得由 lock 內容推導（lock 少登記時會無聲縮小分母）。
 REQUIRED_SECTIONS: dict[str, tuple[str, ...]] = {
@@ -514,6 +516,23 @@ def run_prereqs(script: pathlib.Path) -> dict[str, Any]:
             "reasons": tail}
 
 
+def breaker_assessment() -> dict[str, Any]:
+    """以 2.2 凍結檔和快照執行斷路器，保留 OD-87 豁免前的實際判定。"""
+    path = ROOT / "scripts" / "rust" / "slice_breaker.py"
+    spec = importlib.util.spec_from_file_location("slice_breaker_s22", path)
+    if spec is None or spec.loader is None:
+        return {"slice": "2.2", "actual_verdict": "INSUFFICIENT", "gate_verdict": "INSUFFICIENT",
+                "exemption": None, "error": "無法載入 slice_breaker.py"}
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        return module.evaluate_gate(DEFAULT_BREAKER_FREEZE, DEFAULT_BREAKER_SNAPSHOTS,
+                                    stage2_estimate_weeks=0.0)
+    except (OSError, ValueError, KeyError, TypeError, OverflowError) as exc:
+        return {"slice": "2.2", "actual_verdict": "INSUFFICIENT", "gate_verdict": "INSUFFICIENT",
+                "exemption": None, "error": f"{type(exc).__name__}: {exc}"}
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--l1-results", required=True, type=pathlib.Path)
@@ -549,9 +568,14 @@ def main(argv: list[str] | None = None) -> int:
     coverage = map_coverage(emap, cases_lock)
     parity = judge_parity(p6_parity_numbers(args.parity_doc.read_text(encoding="utf-8")), emap, rows, l15)
     prereqs = run_prereqs(args.prereqs_script)
+    breaker = breaker_assessment()
     case_verdicts = [c["status"] for c in cases if c["status"] in _RANK]
     parity_verdicts = [r["verdict"] for r in parity if r["verdict"] in _RANK]
     extra = [coverage["verdict"], prereqs["verdict"]] + (["INSUFFICIENT"] if l15_reasons else [])
+    if breaker["gate_verdict"] == "FAIL":
+        extra.append("FAIL")
+    elif breaker["gate_verdict"] == "INSUFFICIENT":
+        extra.append("EVIDENCE_MISSING")
     result = _worst([s["verdict"] for s in sections] + case_verdicts + parity_verdicts + extra)
     if result == "INVALID":
         result = "FAIL"
@@ -568,7 +592,7 @@ def main(argv: list[str] | None = None) -> int:
         identity_missing = sorted(set(identity_missing + checked_missing))
         identity_mismatch = sorted(set(identity_mismatch + checked_mismatch))
     payload = {"sections": sections, "cases": cases, "map_coverage": coverage, "parity_rows": parity,
-               "prereqs": prereqs, "l15_reasons": l15_reasons, "result": result,
+               "prereqs": prereqs, "breaker": breaker, "l15_reasons": l15_reasons, "result": result,
                "dry_run": bool(args.dry_run), "identity": identity,
                "identity_problems": {"missing": identity_missing, "mismatch": identity_mismatch}}
     args.out.parent.mkdir(parents=True, exist_ok=True)

@@ -112,6 +112,16 @@ if ! [[ -n "${WSL_DISTRO_NAME:-}" || -e /proc/sys/fs/binfmt_misc/WSLInterop ]]; 
 "${REPORT[@]}" init --results-dir "$RUN" --run-id "$RUN_ID" --caps-missing "${CAPS[@]}" \
   --artifact "$RUST_CLI" "$RUST_D" --prior-slice-artifact serialwrapd_release "$PRIOR_RELEASE_D"
 
+# OD-87：記錄 2.3 的實際斷路器狀態；豁免只解除 gate 阻擋，評估輸出仍進入可驗證報告。
+set +e
+python3 scripts/rust/slice_breaker.py evaluate-gate \
+  --freeze tests/acceptance/breaker/slice_2.3.json \
+  --snapshots tests/acceptance/breaker/slice_2.3.snapshots.ndjson \
+  --out "$RUN/breaker.json" >"$RUN/logs/breaker.log" 2>&1
+BREAKER_RC=$?
+set -e
+"${REPORT[@]}" record-breaker --results-dir "$RUN" --breaker-json "$RUN/breaker.json" --exit-code "$BREAKER_RC"
+
 # 1. cfg 邊界
 run_row "check_cfg_boundary" check-cfg-boundary --evidence "$RUN/logs/check-cfg-boundary.log" -- \
   python3 scripts/rust/check_cfg_boundary.py

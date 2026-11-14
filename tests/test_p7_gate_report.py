@@ -332,6 +332,26 @@ def test_report_records_tool_versions(tmp_path):
     assert f'"pytest": "{_pytest.__version__}"' in md
 
 
+def test_report_records_od87_exemption_and_actual_breaker_verdict(tmp_path):
+    run = _results(tmp_path, [])
+    breaker = {
+        "slice": "2.3",
+        "actual_verdict": "FAIL",
+        "gate_verdict": "OD-87_EXEMPT",
+        "exemption": {"decision": "OD-87", "date": "2026-11-14"},
+        "assessment": {"tripped": True, "insufficient_evidence": False, "window_delta_pp": 0.0},
+    }
+    evidence = tmp_path / "breaker.json"
+    evidence.write_text(json.dumps(breaker), encoding="utf-8")
+    g.record_breaker(run, evidence, exit_code=0)
+    md = g.build_report(run)
+    assert "OD-87 豁免" in md and "2026-11-14" in md, md
+    assert "實際狀態：FAIL" in md, md
+    stored = json.loads((run / "results.json").read_text(encoding="utf-8"))
+    assert stored["breaker"]["actual_verdict"] == "FAIL"
+    assert stored["breaker"]["gate_verdict"] == "OD-87_EXEMPT"
+
+
 def test_owner_items_cover_every_coverage_b_number(tmp_path):
     """rulings/p7.md SPEC-GAP #4 (i)：coverage 引用的每個 B 編號（含先前切片 B-09～B-16）都須是報告的擁有者項目，
     無證據時列為 BLOCKED-OWNER（不得 PASS）。"""

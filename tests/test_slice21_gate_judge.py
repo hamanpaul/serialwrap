@@ -125,6 +125,13 @@ def _judge_mod():
     return mod
 
 
+def _load_script(name: str, relative: str):
+    spec = importlib.util.spec_from_file_location(name, ROOT / relative)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _row(nodeid: str, outcome: str = "passed", skip_kind: str | None = None) -> dict:
     if outcome == "passed":
         phases = {"setup": "passed", "call": "passed", "teardown": "passed"}
@@ -434,6 +441,23 @@ def test_case_uptake_tripped_is_fail(case):
     out = _judge_mod().judge(case.report(), case.expect())
     assert _sec(out, "case_uptake")["status"] == "FAIL"
     assert out["verdict"] == "FAIL"
+
+
+def test_case_uptake_od87_exemption_reports_tripped_without_blocking(case):
+    freeze_mod = _load_script("freeze_slice_cases_for_od87", "scripts/rust/freeze_slice_cases.py")
+    freeze_path = ROOT / "tests/acceptance/breaker/slice_2.1.json"
+    case.freeze = freeze_mod.load_effective_freeze(freeze_path)
+    case.case_verdicts = {cid: "PASS" for cid in case.freeze["required_case_ids"]}
+    case.breaker = {
+        "snapshots": [{"date": "2026-10-21", "rate": 0.0}, {"date": "2026-11-11", "rate": 0.05}],
+        "today": "2026-11-14", "stage2_estimate_weeks": 0.0,
+    }
+    out = _judge_mod().judge(case.report(), case.expect())
+    section = _sec(out, "case_uptake")
+    assert section["status"] == "PASS", section
+    assert out["case_uptake"]["breaker"]["actual_verdict"] == "FAIL"
+    assert out["case_uptake"]["breaker"]["gate_verdict"] == "OD-87_EXEMPT"
+    assert out["case_uptake"]["breaker"]["exemption"]["decision"] == "OD-87"
 
 
 def test_case_uptake_od02_resubmit_is_fail(case):

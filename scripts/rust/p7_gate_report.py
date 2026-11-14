@@ -270,6 +270,25 @@ def build_report(results_dir: Path, *, l1_lock: Path | None = None) -> str:
     ]
     for name, digest in sorted((data.get("artifacts") or {}).items()):
         lines.append(f"| {name} | {digest} |")
+    breaker = data.get("breaker")
+    if isinstance(breaker, Mapping):
+        assessment = breaker.get("assessment") if isinstance(breaker.get("assessment"), Mapping) else {}
+        exemption = breaker.get("exemption") if isinstance(breaker.get("exemption"), Mapping) else None
+        lines += ["", "## 承接率斷路器", "",
+                  f"- slice: `{breaker.get('slice')}`",
+                  f"- 快照數／凍結分母: `{breaker.get('snapshot_count')}`／`{breaker.get('denominator')}`",
+                  f"- 實際狀態：{breaker.get('actual_verdict')}",
+                  f"- tripped／insufficient_evidence: `{assessment.get('tripped')}`／`{assessment.get('insufficient_evidence')}`",
+                  f"- 窗口累計變化（pp）: `{assessment.get('window_delta_pp')}`"]
+        if assessment.get("reason"):
+            lines.append(f"- 實際判定原因: {str(assessment['reason']).replace('|', '/')}")
+        if exemption:
+            lines.append(f"- gate 效果：OD-87 豁免（{exemption.get('date')}；{exemption.get('reason')}）")
+        else:
+            lines.append(f"- gate 判定：{breaker.get('gate_verdict')}")
+        evidence = data.get("breaker_evidence")
+        if isinstance(evidence, Mapping):
+            lines.append(f"- 評估證據 sha256: `{evidence.get('sha256')}`；exit `{data.get('breaker_exit_code')}`")
     prior_artifacts = data.get("prior_slice_artifacts") or {}
     if prior_artifacts:
         lines += ["", "## 先前切片 artifact", "", "| artifact | sha256 |", "|---|---|"]
@@ -302,7 +321,8 @@ def build_report(results_dir: Path, *, l1_lock: Path | None = None) -> str:
             n = len(((lock or {}).get("sets", {}).get(sid, {}).get(plat) or {}).get("nodeids") or [])
             if n:
                 lines.append(f"| {sid} | {plat} | {n} |")
-    ok = all(s in ("PASS", "BLOCKED-OWNER") for s in statuses.values())
+    breaker_ok = not isinstance(breaker, Mapping) or breaker.get("gate_verdict") in ("PASS", "OD-87_EXEMPT")
+    ok = breaker_ok and all(s in ("PASS", "BLOCKED-OWNER") for s in statuses.values())
     lines += ["", f"結論：{'PASS（含 BLOCKED-OWNER）' if ok else 'NOT-PASS'}", ""]
     return "\n".join(lines)
 
@@ -331,6 +351,12 @@ def verify_report(md_path: Path, results_dir: Path, *, l1_lock: Path | None = No
         got = _sha256(_resolve(ROOT, path))
         if got is None or got != want:
             problems.append(f"artifact sha256 不符或缺檔：{path}")
+    breaker_evidence = data.get("breaker_evidence")
+    if isinstance(breaker_evidence, Mapping):
+        path, want = breaker_evidence.get("path"), breaker_evidence.get("sha256")
+        got = _sha256(_resolve(results_dir, path)) if isinstance(path, str) else None
+        if got is None or got != want:
+            problems.append("斷路器評估證據 sha256 不符或缺檔")
     prior_paths = data.get("prior_slice_artifact_paths") or {}
     for name, want in (data.get("prior_slice_artifacts") or {}).items():
         path = prior_paths.get(name)
@@ -422,6 +448,24 @@ def record_row(results_dir: Path, *, name: str, rc: int | None, log: Path, argv:
     return row
 
 
+def record_breaker(results_dir: Path, breaker_json: Path, *, exit_code: int) -> dict[str, Any]:
+    """將 slice_breaker 評估輸出及其 SHA-256 納入本 gate 的結果與可重算報告。"""
+    results_dir = Path(results_dir)
+    path = results_dir / "results.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    source = Path(breaker_json)
+    breaker = json.loads(source.read_text(encoding="utf-8"))
+    if not isinstance(breaker, Mapping):
+        raise ValueError("breaker.json 根節點必須是 object")
+    if not isinstance(breaker.get("actual_verdict"), str) or not isinstance(breaker.get("gate_verdict"), str):
+        raise ValueError("breaker.json 缺 actual_verdict／gate_verdict")
+    data["breaker"] = dict(breaker)
+    data["breaker_evidence"] = {"path": _rel_to(results_dir, source), "sha256": _sha256(source)}
+    data["breaker_exit_code"] = exit_code
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    return data["breaker"]
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -450,6 +494,10 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--results-dir", required=True, type=Path)
     v.add_argument("--md", required=True, type=Path)
     v.add_argument("--l1-lock", type=Path)
+    br = sub.add_parser("record-breaker")
+    br.add_argument("--results-dir", required=True, type=Path)
+    br.add_argument("--breaker-json", required=True, type=Path)
+    br.add_argument("--exit-code", required=True, type=int)
     args = ap.parse_args(argv)
     if args.cmd == "init":
         init_results(args.results_dir, args.run_id, caps_missing=args.caps_missing, artifacts=args.artifact,
@@ -466,6 +514,9 @@ def main(argv: list[str] | None = None) -> int:
             args.out.write_text(md, encoding="utf-8", newline="\n")
         else:
             sys.stdout.write(md)
+        return 0
+    if args.cmd == "record-breaker":
+        record_breaker(args.results_dir, args.breaker_json, exit_code=args.exit_code)
         return 0
     problems = verify_report(args.md, args.results_dir, l1_lock=args.l1_lock)
     for p in problems:

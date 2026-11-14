@@ -764,10 +764,10 @@ def append_breaker_snapshot(path: pathlib.Path, freeze: Mapping[str, Any], case_
 
 
 def judge_breaker(freeze: Mapping[str, Any] | None, breaker: Mapping[str, Any] | None) -> tuple[str, list[str], Any]:
-    """承接率斷路器（審查 b7cd852 #1）：以 `slice_breaker.evaluate` 判定，回 (status, reasons, evaluate 結果)。
+    """承接率斷路器回傳 (gate status, reasons, 實際結果與任何 OD-87 豁免)。
 
-    tripped 或 od02_resubmit → FAIL；insufficient_evidence、輸入缺漏或格式錯誤 → EVIDENCE_MISSING；其餘 PASS。
-    `breaker` 須含 `snapshots`（每週快照）、`today`（YYYY-MM-DD）與 `stage2_estimate_weeks`（OD-02 輸入）。
+    未豁免時 tripped／od02_resubmit → FAIL，insufficient_evidence → EVIDENCE_MISSING。
+    OD-87 只豁免 gate 阻擋，結果仍保留實際狀態、快照評估與裁決來源。
     """
     if not isinstance(breaker, Mapping):
         return "EVIDENCE_MISSING", ["斷路器輸入缺漏（每週快照／判定日／stage2_estimate_weeks）"], None
@@ -776,17 +776,21 @@ def judge_breaker(freeze: Mapping[str, Any] | None, breaker: Mapping[str, Any] |
         return "EVIDENCE_MISSING", [f"斷路器輸入缺漏：{missing or ['freeze']}"], None
     sb = _load_module("slice_breaker", SLICE_BREAKER_PATH)
     try:
-        sb._check_snapshot_denominators(list(breaker["snapshots"]), dict(freeze))
-        res = sb.evaluate(dict(freeze), list(breaker["snapshots"]), today=str(breaker["today"]),
-                          stage2_estimate_weeks=breaker["stage2_estimate_weeks"])
+        gate = sb.gate_assessment(dict(freeze), list(breaker["snapshots"]), today=str(breaker["today"]),
+                                  stage2_estimate_weeks=breaker["stage2_estimate_weeks"])
     except (ValueError, KeyError, TypeError, OverflowError) as exc:
         return "EVIDENCE_MISSING", [f"斷路器輸入錯誤：{exc}"], None
-    if res["tripped"] or res["od02_resubmit"]:
+    res = {**gate["assessment"], "actual_verdict": gate["actual_verdict"],
+           "gate_verdict": gate["gate_verdict"], "exemption": gate["exemption"],
+           "snapshot_count": gate["snapshot_count"]}
+    if gate["gate_verdict"] == "OD-87_EXEMPT":
+        return "PASS", [], res
+    if gate["actual_verdict"] == "FAIL":
         reasons = [r for r in (res.get("reason"),) if r]
         if res["od02_resubmit"]:
             reasons.append("Stage 2 已耗週數＋剩餘預估超過 OD-02 24 週上限")
         return "FAIL", reasons, res
-    if res["insufficient_evidence"]:
+    if gate["actual_verdict"] == "INSUFFICIENT":
         return "EVIDENCE_MISSING", [str(res.get("reason"))], res
     return "PASS", [], res
 

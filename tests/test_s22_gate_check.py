@@ -283,6 +283,15 @@ def test_all_present_pass(tmp_path: Path) -> None:
     assert all(s["verdict"] == "PASS" for s in out["sections"])
 
 
+def test_od87_breaker_state_is_reported_without_blocking_s22(tmp_path: Path) -> None:
+    rc, out = _run(tmp_path, _good_reports())
+    assert rc == 0 and out["result"] == "PASS", out
+    assert out["breaker"]["actual_verdict"] == "INSUFFICIENT", out["breaker"]
+    assert out["breaker"]["assessment"]["insufficient_evidence"] is True, out["breaker"]
+    assert out["breaker"]["gate_verdict"] == "OD-87_EXEMPT", out["breaker"]
+    assert out["breaker"]["exemption"]["decision"] == "OD-87", out["breaker"]
+
+
 def test_missing_report_and_pending_entry_insufficient(tmp_path: Path) -> None:
     reports = _good_reports()
     del reports[("win_test", "windows")]
