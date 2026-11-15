@@ -1,0 +1,1 @@
+{"log_dir_create_error":"[WinError 183] 當檔案已存在時，無法建立該檔案。: '<tmp>\\\\not-a-directory'","pull_local_write_error":"[Errno 2] No such file or directory: '<tmp>\\\\missing\\\\pull.bin'"}

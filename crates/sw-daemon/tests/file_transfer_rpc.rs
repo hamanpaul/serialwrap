@@ -174,6 +174,83 @@ fn file_push_and_pull_rpc_end_to_end() {
 }
 
 #[test]
+fn file_pull_local_write_error_matches_python_via_rpc() {
+    let rig = ServiceRig::ready_shell();
+    let dev = rig.device(REAL_A);
+    let fs = install_xfer_shell(dev);
+    fs.lock().unwrap().insert("/tmp/source.bin".into(), b"payload".to_vec());
+    let tmp = Tmp::new();
+    let local = std::path::Path::new(&tmp.0)
+        .join("missing")
+        .join("pull.bin")
+        .to_string_lossy()
+        .into_owned();
+    let params = format!(
+        r#"{{"selector":"COM0","remote_path":"/tmp/source.bin","local_path":{}}}"#,
+        json_string(&local)
+    );
+
+    let error = rig.call_err("file.pull", &params);
+    assert!(error.message.contains("No such file or directory"), "{}", error.message);
+    assert!(
+        dut_lines(dev).iter().any(|line| line.contains("base64 <")),
+        "pull 已經經由 RPC 送到 DUT，再因本機寫入失敗：{:?}",
+        dut_lines(dev)
+    );
+    assert_eq!(
+        rig.session("COM0").unwrap().get("foreground_busy"),
+        Some(&PyValue::Bool(false)),
+        "本機寫入失敗後要釋放傳輸中的前景槽"
+    );
+
+    if sw_pal::native().caps.path_flavor == sw_pal::PalPathFlavor::Windows {
+        let root = json_string(&tmp.0.to_string_lossy());
+        let root = &root[1..root.len() - 1];
+        let got = error.message.replace(root, "<tmp>");
+        let golden = pyjson::loads(include_str!("../../../contracts/golden/p7/windows_os_errors.json"))
+            .expect("Python 3.12 Windows OSError golden");
+        assert_eq!(
+            got,
+            golden["pull_local_write_error"].as_str().unwrap(),
+            "file.pull 本機 open(..., 'wb') 應保留 Python OSError errno、訊息與 filename repr"
+        );
+    }
+}
+
+#[test]
+fn session_log_dir_create_error_matches_python_via_rpc() {
+    let tmp = Tmp::new();
+    let blocker = std::path::Path::new(&tmp.0).join("not-a-directory");
+    std::fs::write(&blocker, b"file blocks directory creation").unwrap();
+    let log_dir = blocker.to_string_lossy().into_owned();
+    let rig = ServiceRig::ready_shell();
+    // 走 env fallback 提供原生 Windows 路徑，避免這個錯誤格式案例依賴尚未承接的 ProfileFs Windows flavor。
+    rig.set_env("SERIALWRAP_LOG_DIR", &log_dir);
+
+    let error = rig.call_err("session.log_start", r#"{"selector":"COM0"}"#);
+
+    if sw_pal::native().caps.path_flavor == sw_pal::PalPathFlavor::Windows {
+        let root = json_string(&tmp.0.to_string_lossy());
+        let root = &root[1..root.len() - 1];
+        let got = error.message.replace(root, "<tmp>");
+        let golden = pyjson::loads(include_str!("../../../contracts/golden/p7/windows_os_errors.json"))
+            .expect("Python 3.12 Windows OSError golden");
+        assert_eq!(
+            got,
+            golden["log_dir_create_error"].as_str().unwrap(),
+            "session.log_start 的 os.makedirs 應保留 Python WinError、訊息與 filename repr"
+        );
+    }
+    else {
+        assert!(
+            error.message.contains("File exists") && error.message.contains(&log_dir),
+            "{}",
+            error.message
+        );
+    }
+}
+
+#[test]
 fn file_rpc_rejections_have_no_side_effects() {
     let rig = ServiceRig::ready_shell();
     let before = rig.side_effect_fingerprint();

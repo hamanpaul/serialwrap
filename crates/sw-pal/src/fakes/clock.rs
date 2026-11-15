@@ -157,17 +157,33 @@ impl Clock for FakeClock {
     ) -> bool {
         if !self.is_threaded {
             // 非 threaded 模式（`sleep` 自行推進）：沒有其他 thread 會推進時鐘，故比照 `sleep` 以 10 ms 切片自行
-            // 推進；每片先以 5 ms 實時等待取消訊號（讓其他 thread 交付 RX），收到即回 false
+            // 推進；每片先讓其他 thread 有機會交付 RX 或取消等待，再推進假時鐘
             //（P7 Task 3：`RxShared::wait_for_regex_cancellable`；與 P5 login 等待的輪詢節奏相同）。
             const SLICE: Duration = Duration::from_millis(10);
-            const REAL_YIELD: Duration = Duration::from_millis(5);
             loop {
                 let now = self.mono_ns();
                 if now >= deadline_ns {
                     return true;
                 }
-                if cancel.recv_timeout(REAL_YIELD).is_ok() {
+                #[cfg(windows)]
+                if cancel.try_recv().is_ok() {
                     return false;
+                }
+                #[cfg(not(windows))]
+                if cancel.recv_timeout(Duration::from_millis(5)).is_ok() {
+                    return false;
+                }
+                // 用高精度單調時鐘界定 5 ms 的合作式讓出，避免 Windows 一般 timer 的 15.6 ms 粒度。
+                // 這仍讓背景 RX producer 有實際執行時間；虛擬時間每片固定推進 10 ms。
+                #[cfg(windows)]
+                {
+                    let real_deadline = std::time::Instant::now() + Duration::from_millis(5);
+                    while std::time::Instant::now() < real_deadline {
+                        if cancel.try_recv().is_ok() {
+                            return false;
+                        }
+                        std::thread::yield_now();
+                    }
                 }
                 let step = SLICE.min(Duration::from_nanos(deadline_ns - now));
                 self.sleeps

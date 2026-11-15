@@ -754,6 +754,12 @@ fn timeout_kills_process_group() {
         "sleep 30 & wait"
     };
     let real_clock = sw_pal::native().clock;
+    if sw_pal::native().caps.path_flavor == sw_pal::PalPathFlavor::Windows {
+        for key in ["PATH", "SYSTEMROOT"] {
+            let value = std::env::var(key).unwrap_or_else(|_| panic!("Windows 測試環境缺少 {key}"));
+            r.env.vars.lock().unwrap().insert(key.into(), value);
+        }
+    }
     let env: Arc<dyn SysEnv> = r.env.clone();
     let d = Dispatcher::start(
         8,
@@ -774,7 +780,19 @@ fn timeout_kills_process_group() {
     );
     let t0 = Instant::now();
     d.dispatch(f, "x".into());
-    r.emit.wait_for("fire_timeout", 1);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(ev) = r.emit.of_type("fire_completed").first() {
+            let exit_code = ev.get("exit_code").and_then(PyValue::as_i64);
+            eprintln!("timeout_kills_process_group observed fire_completed exit_code={exit_code:?}");
+            panic!("預期 fire_timeout，實際 fire_completed exit_code={exit_code:?}");
+        }
+        if !r.emit.of_type("fire_timeout").is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "逾時等待 fire_timeout：{:?}", r.emit.types());
+        std::thread::sleep(Duration::from_millis(2));
+    }
     assert!(t0.elapsed() < Duration::from_secs(5));
     let ev = &r.emit.of_type("fire_timeout")[0];
     let ms = ev.get("duration_ms").unwrap().as_i64().unwrap();

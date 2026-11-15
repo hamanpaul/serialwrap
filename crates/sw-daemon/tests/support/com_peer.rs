@@ -87,6 +87,16 @@ impl ComPeer {
             .open_exclusive(&DevicePath(port.to_string()), &cfg)
             .unwrap_or_else(|e| panic!("開啟 peer 端 {port} 失敗：{e:?}"));
         let (mut reader, writer, waker, close) = handle.split();
+        // 開啟 peer 前的 DUT TX 可能仍留在 com0com 佇列；先丟棄，不納入本次案例的 RX 證據。
+        let mut stale = [0u8; 4096];
+        loop {
+            match reader.read(&mut stale, Some(Duration::ZERO)) {
+                Ok(ReadOutcome::Data(0))
+                | Ok(ReadOutcome::Eof | ReadOutcome::Woken | ReadOutcome::TimedOut) => break,
+                Ok(ReadOutcome::Data(_)) => {}
+                Err(error) => panic!("清除 peer 端 {port} 殘留 bytes 失敗：{error:?}"),
+            }
+        }
         let shared = Arc::new(Mutex::new(Shared {
             received: Vec::new(),
             line: Vec::new(),

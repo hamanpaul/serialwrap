@@ -99,18 +99,14 @@ pub trait LocalFiles: Send + Sync {
 /// `std::fs` 實作；相對路徑以 daemon cwd 為準。
 pub struct StdLocalFiles;
 
-fn os_error_text(e: &std::io::Error, path: &str) -> String {
-    let raw = e.to_string();
-    let strerror = match raw.rfind(" (os error ") {
-        Some(i) => raw[..i].to_string(),
-        None => raw,
-    };
+fn os_error_text(error: sw_pal::traits::PalError, path: &str) -> String {
+    let has_os_code = error.os_code.is_some() || error.winerror.is_some();
     PyOsError {
-        errno: e.raw_os_error().map(i64::from),
-        winerror: None,
-        strerror: Some(strerror),
+        errno: error.os_code.map(i64::from),
+        winerror: error.winerror.map(i64::from),
+        strerror: Some(error.strerror),
         filename: Some(path.to_string()),
-        plain: None,
+        plain: (!has_os_code).then_some(error.py_message),
     }
     .to_string()
 }
@@ -120,10 +116,11 @@ impl LocalFiles for StdLocalFiles {
         std::path::Path::new(path).is_file()
     }
     fn read_all(&self, path: &str) -> Result<Vec<u8>, String> {
-        std::fs::read(path).map_err(|e| os_error_text(&e, path))
+        std::fs::read(path).map_err(|e| os_error_text(sw_pal::fs_ops::map_file_error(e), path))
     }
     fn write_truncate(&self, path: &str, data: &[u8]) -> Result<(), String> {
-        std::fs::write(path, data).map_err(|e| os_error_text(&e, path))
+        std::fs::write(path, data)
+            .map_err(|e| os_error_text(sw_pal::fs_ops::map_file_error(e), path))
     }
 }
 
