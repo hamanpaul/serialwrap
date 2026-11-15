@@ -99,9 +99,11 @@ if [[ "$list_only" == "0" ]]; then
     contracts/cli_help \
     contracts/error_codes.yaml \
     contracts/session_last_errors.yaml \
+    contracts/wal_meta_events.schema.json \
     contracts/cli_schema.json \
     contracts/rpc_schema.json \
     contracts/release_manifest.schema.json \
+    tests/acceptance/slice21_scope.yaml \
     tests/contract_blackbox/data \
     crates/sw-cli/tests/golden \
     crates/sw-cli/src \

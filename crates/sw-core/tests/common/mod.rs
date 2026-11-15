@@ -2,9 +2,12 @@
 
 use std::path::{Path, PathBuf};
 
-/// 以儲存庫根目錄為基準解析相對路徑（例如 `contracts/golden/wal`）。
+/// 以 SW_TEST_DATA_DIR 或儲存庫根目錄解析相對路徑（例如 `contracts/golden/wal`）。
 pub fn repo_path(rel: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(rel)
+    let root = std::env::var_os("SW_TEST_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
+    root.join(rel)
 }
 
 /// P6 golden TSV 工具（07 Task 2）。
