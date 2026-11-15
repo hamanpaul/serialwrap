@@ -474,6 +474,21 @@ fn without_verbatim_prefix(path: &Path) -> PathBuf {
     }
 }
 
+fn windows_path_key(path: &Path) -> String {
+    let visible = without_verbatim_prefix(path);
+    pypath::normpath(PathFlavor::Windows, &visible.to_string_lossy())
+}
+
+/// Windows stable entry 位於安裝根 `bin/`；一般開發 exe 不得沿用該安裝根的 current-release。
+fn is_windows_install_entry(ctx: &Ctx<'_>, exe: &Path, root: &InstallRoot) -> bool {
+    let exe_key = windows_path_key(exe);
+    root.entry_names.iter().any(|name| {
+        let candidate = join_path(ctx, &root.bin, name);
+        let resolved = ctx.p.env.realpath(&candidate).unwrap_or(candidate);
+        windows_path_key(&resolved).eq_ignore_ascii_case(&exe_key)
+    })
+}
+
 fn path_prefix_remainder<'a>(root: &str, path: &'a str, flavor: PathFlavor) -> Option<&'a str> {
     if path == root {
         return Some("");
@@ -1300,7 +1315,7 @@ fn manifest_exists(ctx: &Ctx<'_>, path: &Path) -> bool {
     ctx.p.fs.exists(path) && !ctx.p.fs.is_dir(path)
 }
 
-/// 定位 release manifest（`SERIALWRAP_RELEASE_MANIFEST` > realpath(current_exe) 上兩層 > Windows `current-release.json` 的 dir）。
+/// 定位 release manifest（`SERIALWRAP_RELEASE_MANIFEST` > realpath(current_exe) 上兩層 > Windows 安裝入口的 `current-release.json`）。
 pub fn locate_manifest(ctx: &Ctx<'_>) -> Result<(PathBuf, ReleaseManifest), LayoutError> {
     if let Some(override_path) = ctx
         .env
@@ -1327,15 +1342,21 @@ pub fn locate_manifest(ctx: &Ctx<'_>) -> Result<(PathBuf, ReleaseManifest), Layo
 
     if path_flavor(ctx) == PathFlavor::Windows {
         let root = resolve_install_root(ctx);
-        if let Some(current) = read_current(&root)? {
-            let install_dir = if pypath::isabs(path_flavor(ctx), &current.dir) {
-                PathBuf::from(&current.dir)
-            } else {
-                join_path(ctx, &root.root, &current.dir)
-            };
-            let candidate = install_dir.join("release-manifest.json");
-            if manifest_exists(ctx, &candidate) {
-                return load_manifest(ctx, &candidate);
+        let installed_entry = ctx.p.env.current_exe().is_ok_and(|exe| {
+            let real = without_verbatim_prefix(&ctx.p.env.realpath(&exe).unwrap_or(exe));
+            is_windows_install_entry(ctx, &real, &root)
+        });
+        if installed_entry {
+            if let Some(current) = read_current(&root)? {
+                let install_dir = if pypath::isabs(path_flavor(ctx), &current.dir) {
+                    PathBuf::from(&current.dir)
+                } else {
+                    join_path(ctx, &root.root, &current.dir)
+                };
+                let candidate = install_dir.join("release-manifest.json");
+                if manifest_exists(ctx, &candidate) {
+                    return load_manifest(ctx, &candidate);
+                }
             }
         }
     }

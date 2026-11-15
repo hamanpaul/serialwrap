@@ -193,6 +193,8 @@ class SwEnv:
         self.label: str = ab_label()
         self.daemon_exe: list[str] = daemon_prefix()
         self._env: dict[str, str] = isolated_env(self.base)
+        # Rust CLI 的 Windows manifest 尋找可能讀安裝根；隔離到每個案例，避免繼承使用者安裝。
+        self._env["SERIALWRAP_INSTALL_ROOT"] = str(self.base / "install-root")
         self.run_dir = Path(self._env["SERIALWRAP_RUN_DIR"])
         self.state_dir = Path(self._env["SERIALWRAP_STATE_DIR"])
         self.wal_dir = Path(self._env["SERIALWRAP_WAL_DIR"])

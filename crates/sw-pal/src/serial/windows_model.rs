@@ -130,6 +130,22 @@ pub fn comm_timeouts_model() -> CommTimeoutsModel {
     }
 }
 
+/// 第一次 `ReadFile` 的 bytes 加上讀取前已排隊的 bytes；對齊 pyserial `read(1)` 後取 `in_waiting`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadChunkPlan {
+    pub first_bytes: usize,
+    pub drain_bytes: usize,
+}
+
+/// 計算同一 RX chunk 的首讀與佇列 drain 長度，總量不超過呼叫端 buffer。
+pub fn read_chunk_plan(first_bytes: usize, waiting: usize, max_bytes: usize) -> ReadChunkPlan {
+    let first_bytes = first_bytes.min(max_bytes);
+    ReadChunkPlan {
+        first_bytes,
+        drain_bytes: waiting.min(max_bytes.saturating_sub(first_bytes)),
+    }
+}
+
 /// `_win_device_name`：`COMn`（n≥10 亦同）轉為 `\\.\COMn`；已含 `\\.\` 前綴者不變；其他路徑原樣回傳。
 pub fn win_device_name(path: &str) -> String {
     if path.starts_with(r"\\.\") {

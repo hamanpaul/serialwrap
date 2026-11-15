@@ -12,7 +12,7 @@ use sw_proto::constants::{CMD_REJECT_BYTES, CMD_WARN_BYTES};
 use sw_proto::pydict;
 use sw_proto::pyjson::{PyDict, PyValue};
 
-use crate::service::{Service, int};
+use crate::service::{int, Service};
 
 /// `holders_status` 字串（Python 僅 `ok`／`permission`／`unknown`；`unsupported` 為 Windows PAL 專屬）。
 /// `Partial` 只由 OD-48 的 `uart_holders_same_uid` 產生（health 不呼叫），為窮舉起見與 PermissionDenied 同樣回 `permission`。
@@ -38,7 +38,10 @@ fn status_rank(s: HolderScanStatus) -> u8 {
 }
 
 /// `detect_multi_open` 等價：`(multi_open, daemons, holders{tty: pid}, holders_status)`。
-fn detect_multi_open(svc: &Service, tty_paths: &[PathBuf]) -> (bool, Vec<PyValue>, PyDict, &'static str) {
+fn detect_multi_open(
+    svc: &Service,
+    tty_paths: &[PathBuf],
+) -> (bool, Vec<PyValue>, PyDict, &'static str) {
     let Ok(mut daemons) = svc.procs.serialwrapd_instances() else {
         return (false, Vec::new(), PyDict::new(), "unknown");
     };
@@ -71,6 +74,11 @@ fn detect_multi_open(svc: &Service, tty_paths: &[PathBuf]) -> (bool, Vec<PyValue
         if let Some(pid) = pids.iter().max() {
             holders.insert(&tty.to_string_lossy(), int(i128::from(*pid)));
         }
+    }
+    // Python `detect_multi_open` 以固定 `/proc` 路徑掃描；Windows 無 `/proc` 時回 unknown 與空集合。
+    // Windows PAL 雖可用 Toolhelp 列出行程，但該集合不是 Python 契約中的 `/proc` 掃描結果。
+    if status == HolderScanStatus::Unsupported {
+        return (false, Vec::new(), PyDict::new(), "unknown");
     }
     (multi_open, rows, holders, status_str(status))
 }
@@ -123,7 +131,8 @@ pub fn health(svc: &Service) -> PyDict {
     }
 
     let tty_paths = Service::attached_paths(&sessions);
-    let (multi_open, daemons, mut foreign_holders, holders_status) = detect_multi_open(svc, &tty_paths);
+    let (multi_open, daemons, mut foreign_holders, holders_status) =
+        detect_multi_open(svc, &tty_paths);
     // #11：鎖後 holder 掃描不完整的裝置以物件回報 `{device, holder_unknown, pids?}`，其餘仍為 path→pid。
     for device in sw_pal::serial::unknown_holder_devices() {
         let mut entry = pydict! { "device" => device.clone(), "holder_unknown" => true };

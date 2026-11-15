@@ -57,6 +57,7 @@ def test_v032_wrapper_runs_tagged_daemon_and_reports_032_version(tmp_path, monke
     )
     sw = SwEnv(tmp_path / "rig")
     sw._env["SW_PY032_ROOT"] = str(source)
+    assert sw._env.get("SERIALWRAP_INSTALL_ROOT"), "每輪 blackbox 必須使用隔離的安裝根"
     try:
         sw.start(targets={}, profile="passthrough")
         status = sw.cli("daemon", "status")
@@ -150,3 +151,149 @@ def test_mcu_flash_diff_loader_keeps_multiple_nodes_per_case(tmp_path):
     assert not failed
     assert "tests/test.py::patterns" in report and "tests/test.py::status" in report
     assert "SC-32" in report
+
+
+def _two_round_fixture():
+    return {
+        "python032": {
+            "s24-ho-windows-com::tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown": {
+                "attach_attempt": {
+                    "error_code": None,
+                    "exit": 0,
+                    "holder_unknown": None,
+                    "ok": True,
+                    "pids": None,
+                    "selector": None,
+                    "session_state": "ATTACHING",
+                }
+            },
+            "s24-ho-windows-com::tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_selftest_released_holder_unknown": {
+                "self_test": {
+                    "classification": "RELEASED",
+                    "external_holder": "none",
+                    "reclaimable": True,
+                    "recommended_action": "device_attach",
+                }
+            },
+            "s24-upd-guards::tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_refuses_while_push[after_probe]": {
+                "busy": [],
+                "error_code": "METHOD_NOT_FOUND",
+            },
+            "s24-upd-guards::tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_force_refuses_while_push[rollback-after-probe]": {
+                "busy": [],
+                "error_code": "METHOD_NOT_FOUND",
+            },
+        },
+        "rust": {
+            "s24-ho-windows-com::tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown": {
+                "attach_attempt": {
+                    "error_code": "DEVICE_STILL_HELD",
+                    "exit": 2,
+                    "holder_unknown": True,
+                    "ok": False,
+                    "pids": [],
+                    "selector": "COM0",
+                    "session_state": None,
+                }
+            },
+            "s24-ho-windows-com::tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_selftest_released_holder_unknown": {
+                "self_test": {
+                    "classification": "RELEASED",
+                    "external_holder": "none",
+                    "reclaimable": False,
+                    "recommended_action": "wait_external_flash",
+                }
+            },
+            "s24-upd-guards::tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_refuses_while_push[after_probe]": {
+                "busy": [{"com": "COM0", "foreground_busy": True, "interactive": False, "ops": ["file.push"]}],
+                "error_code": "SESSION_BUSY",
+            },
+            "s24-upd-guards::tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_force_refuses_while_push[rollback-after-probe]": {
+                "busy": [{"com": "COM0", "foreground_busy": True, "interactive": False, "ops": ["file.push"]}],
+                "error_code": "SESSION_BUSY",
+            },
+        },
+        "attributions": {},
+    }
+
+
+@pytest.mark.memory_only
+def test_mcu_flash_diff_two_round_mode_allows_only_six_reported_differences():
+    spec = importlib.util.spec_from_file_location("mcu_flash_parity_two_round", _DIFF_TOOL)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    report, failed = module.compare(_two_round_fixture())
+    assert not failed
+    assert report.count("OD-91 六欄已知差異") == 6
+    assert "Python 0.3.2" in report and "Rust" in report
+
+
+@pytest.mark.memory_only
+def test_mcu_flash_diff_two_round_mode_rejects_unknown_difference_and_missing_observation():
+    spec = importlib.util.spec_from_file_location("mcu_flash_parity_two_round_failures", _DIFF_TOOL)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    unknown = _two_round_fixture()
+    row = "unrelated-case::tests/test_unrelated.py::test_value"
+    unknown["python032"][row] = {"value": "python"}
+    unknown["rust"][row] = {"value": "rust"}
+    report, failed = module.compare(unknown)
+    assert failed
+    assert "未歸因" in report
+
+    mutated = _two_round_fixture()
+    row = "s24-ho-windows-com::tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown"
+    mutated["rust"][row]["attach_attempt"]["selector"] = "COM1"
+    _, failed = module.compare(mutated)
+    assert failed, "OD-91 例外必須比對報告列出的完整值"
+
+    missing = _two_round_fixture()
+    row = "s24-ho-windows-com::tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown"
+    del missing["rust"][row]
+    with pytest.raises(ValueError) as exc:
+        module.compare(missing)
+    assert row in str(exc.value)
+
+
+@pytest.mark.memory_only
+def test_mcu_flash_diff_bundle_accepts_omitted_python_main(tmp_path):
+    python032 = tmp_path / "python032.ndjson"
+    rust = tmp_path / "rust.ndjson"
+    output = tmp_path / "bundle.json"
+    for path, round_name in ((python032, "python032"), (rust, "rust")):
+        path.write_text(
+            json.dumps({
+                "round": round_name,
+                "case_id": "s24-mcu-rpc-shapes",
+                "nodeid": "tests/test.py::mcu_status",
+                "fields": {"body": "same"},
+            }) + "\n",
+            encoding="utf-8",
+        )
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(_DIFF_TOOL),
+            "bundle",
+            "--python032",
+            str(python032),
+            "--rust",
+            str(rust),
+            "--output",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert set(json.loads(output.read_text(encoding="utf-8"))) == {
+        "python032",
+        "rust",
+        "attributions",
+    }

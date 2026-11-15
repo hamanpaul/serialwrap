@@ -53,6 +53,19 @@ fn comm_timeouts_follow_pyserial_constants() {
 }
 
 #[test]
+fn read_chunk_drains_bytes_waiting_after_the_first_byte() {
+    let first = b"\x1b";
+    let waiting = b"[?2004h";
+    let plan = read_chunk_plan(first.len(), waiting.len(), 8192);
+
+    assert_eq!(plan.first_bytes, 1);
+    assert_eq!(plan.drain_bytes, waiting.len());
+    let mut chunk = first.to_vec();
+    chunk.extend_from_slice(&waiting[..plan.drain_bytes]);
+    assert_eq!(chunk, b"\x1b[?2004h");
+}
+
+#[test]
 fn device_name_normalization() {
     assert_eq!(win_device_name("com3"), r"\\.\COM3");
     assert_eq!(win_device_name(r"\\.\COM12"), r"\\.\COM12");
@@ -159,17 +172,17 @@ mod windows_native {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use sw_pal::conformance::{PeerEnd, serial_suite};
+    use sw_pal::conformance::{serial_suite, PeerEnd};
     use sw_pal::serial::windows::WindowsSerialBackend;
     use sw_pal::*;
     use windows_sys::Win32::Devices::Communication::{
-        COMMTIMEOUTS, DCB, GetCommState, SetCommState, SetCommTimeouts, SetupComm,
+        GetCommState, SetCommState, SetCommTimeouts, SetupComm, COMMTIMEOUTS, DCB,
     };
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+        CloseHandle, GetLastError, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING, ReadFile, WriteFile,
+        CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING,
     };
 
     static COM_TEST_LOCK: Mutex<()> = Mutex::new(());

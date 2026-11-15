@@ -4592,6 +4592,21 @@ fn health_status_scan_failure_shape() {
 }
 
 #[test]
+fn health_status_unsupported_process_scan_matches_python_windows_shape() {
+    let _g = holder_lock();
+    let r = ServiceRig::ready_shell();
+    r.procs.script(vec![vec![daemon(RIG_PID, "/run/a.sock")]]);
+    r.procs.holders(Vec::new(), HolderScanStatus::Unsupported);
+    let h = r.call("health.status", "{}");
+    assert_eq!(h.get("multi_open"), Some(&PyValue::Bool(false)));
+    assert_eq!(jv(h.get("foreign_holders").unwrap()), "{}");
+    assert_eq!(
+        jv(h.get("multi_open_detail").unwrap()),
+        "{\"daemons\":[],\"holders_status\":\"unknown\"}"
+    );
+}
+
+#[test]
 fn health_status_holders_status_permission() {
     let _g = holder_lock();
     let r = ServiceRig::ready_shell();

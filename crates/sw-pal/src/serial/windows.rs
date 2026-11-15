@@ -2,29 +2,30 @@
 
 #[cfg(any(test, feature = "test-fakes"))]
 use std::cell::Cell;
-use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Devices::Communication::{
-    COMMTIMEOUTS, DCB, GetCommState, SetCommState, SetCommTimeouts, SetupComm,
+    ClearCommError, GetCommState, SetCommState, SetCommTimeouts, SetupComm, COMMTIMEOUTS, COMSTAT,
+    DCB,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, ReadFile, WriteFile,
+    CreateFileW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
+};
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject, INFINITE,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
-use windows_sys::Win32::System::Threading::{
-    CreateEventW, INFINITE, ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
-};
 
 use crate::serial::windows_model::{
-    OpenErrorKind, PYSERIAL_ERROR_CHAR, PYSERIAL_XOFF_CHAR, PYSERIAL_XON_CHAR, classify_read_error,
-    classify_wait_error, comm_timeouts_model, dcb_flags, dcb_model, map_open_error,
-    map_overlapped_write_completion, win_device_name,
+    classify_read_error, classify_wait_error, comm_timeouts_model, dcb_flags, dcb_model,
+    map_open_error, map_overlapped_write_completion, read_chunk_plan, win_device_name,
+    OpenErrorKind, PYSERIAL_ERROR_CHAR, PYSERIAL_XOFF_CHAR, PYSERIAL_XON_CHAR,
 };
 use crate::traits::{
     CancelToken, CloseImpl, CloseReceipt, CloseToken, DevicePath, HolderReport, HolderScanStatus,
@@ -248,6 +249,17 @@ impl WinPort {
 
     fn is_open(&self) -> bool {
         !self.closed.load(Ordering::SeqCst)
+    }
+
+    /// pyserial `in_waiting`：`ClearCommError` 回報目前已進入 input queue 的 bytes。
+    fn in_waiting(&self) -> PalResult<usize> {
+        let mut errors = 0u32;
+        let mut status = COMSTAT::default();
+        // SAFETY: handle 有效；兩個輸出參數指向可寫結構，錯誤旗標只讀取、不清佇列。
+        if unsafe { ClearCommError(self.raw(), &mut errors, &mut status) } == 0 {
+            return Err(last_error_pal());
+        }
+        Ok(status.cbInQue as usize)
     }
 }
 
@@ -550,6 +562,73 @@ impl WindowsSerialReader {
         }
     }
 
+    /// 以 overlapped `ReadFile` 讀取指定區段，並把 timeout／wake 與完成狀態一併回傳。
+    fn read_into(
+        &mut self,
+        buffer: *mut u8,
+        len: usize,
+        start: Instant,
+        timeout: Option<Duration>,
+    ) -> Result<ReadStep, ReadError> {
+        self.reset_operation().map_err(classify_read_error)?;
+        // SAFETY: 呼叫端保證 buffer 至少有 len bytes，且其生命週期涵蓋 I/O 完成或取消收斂。
+        let started = unsafe {
+            ReadFile(
+                self.port.raw(),
+                buffer,
+                len.min(u32::MAX as usize) as u32,
+                std::ptr::null_mut(),
+                &mut self.overlapped,
+            )
+        };
+        if started == 0 {
+            let code = last_error();
+            if code != windows_sys::Win32::Foundation::ERROR_IO_PENDING {
+                return Err(classify_read_error(win32_error(code)));
+            }
+            self.mark_pending();
+        }
+
+        loop {
+            let wait_ms = remaining_timeout_ms(start, timeout);
+            match self.wait(wait_ms) {
+                Ok(WaitResult::Io) => {
+                    let completion = self.collect(false);
+                    if completion.win32 == ERROR_IO_INCOMPLETE {
+                        continue;
+                    }
+                    return Ok(ReadStep {
+                        completion,
+                        wake: false,
+                        timeout: false,
+                    });
+                }
+                Ok(WaitResult::Wake) => {
+                    if let Err(error) = self.wake_event.consume_if_signaled() {
+                        self.cancel_and_collect();
+                        return Err(classify_wait_error(error));
+                    }
+                    return Ok(ReadStep {
+                        completion: self.cancel_and_collect(),
+                        wake: true,
+                        timeout: false,
+                    });
+                }
+                Ok(WaitResult::Timeout) => {
+                    return Ok(ReadStep {
+                        completion: self.cancel_and_collect(),
+                        wake: false,
+                        timeout: true,
+                    });
+                }
+                Err(wait_error) => {
+                    self.cancel_and_collect();
+                    return Err(classify_wait_error(wait_error));
+                }
+            }
+        }
+    }
+
     fn wait(&self, timeout: u32) -> PalResult<WaitResult> {
         let handles = [self.io_event.handle, self.wake_event.raw()];
         // SAFETY: 等待期間，這兩個 handle 都由此 reader 持有。
@@ -576,7 +655,6 @@ impl WindowsSerialReader {
                     "ReadFile 回報超過讀取緩衝區的 bytes",
                 ));
             }
-            self.buffer.truncate(count);
             return Ok(ReadOutcome::Data(count));
         }
         if completion.ok {
@@ -619,85 +697,54 @@ impl SerialReader for WindowsSerialReader {
             {
                 return Ok(ReadOutcome::Woken);
             }
-            self.reset_operation().map_err(classify_read_error)?;
             let read_len = buf.len().min(u32::MAX as usize);
             self.buffer.resize(read_len, 0);
             let buffer_ptr = self.buffer.as_mut_ptr();
-            let overlapped_ptr = &mut self.overlapped as *mut OVERLAPPED;
-            // SAFETY: I/O 收斂前，buffer 與 OVERLAPPED 都由此 reader 持有。
-            let started = unsafe {
-                ReadFile(
-                    self.port.raw(),
-                    buffer_ptr,
-                    read_len as u32,
-                    std::ptr::null_mut(),
-                    overlapped_ptr,
-                )
-            };
-            if started == 0 {
-                let code = last_error();
-                if code != windows_sys::Win32::Foundation::ERROR_IO_PENDING {
-                    return Err(classify_read_error(win32_error(code)));
+            let first = self.read_into(buffer_ptr, 1, start, timeout)?;
+            let outcome = self
+                .read_result(first.completion, first.wake, first.timeout)
+                .map_err(classify_read_error)?;
+            let ReadOutcome::Data(first_bytes) = outcome else {
+                if outcome == ReadOutcome::TimedOut
+                    && retry_idle_read_timeout(timeout, start.elapsed())
+                {
+                    continue;
                 }
-                self.mark_pending();
+                return Ok(outcome);
+            };
+
+            // pyserial `_PySerialPort.read`：先阻塞一個 byte，再以 ClearCommError 取得
+            // in_waiting，將當下可讀內容讀入同一 chunk；idle timeout 仍只由首讀決定。
+            let plan = read_chunk_plan(
+                first_bytes,
+                self.port.in_waiting().map_err(classify_read_error)?,
+                read_len,
+            );
+            let mut total = plan.first_bytes;
+            if plan.drain_bytes > 0 {
+                let drain_start = Instant::now();
+                // SAFETY: drain_bytes 已限制在 buffer 剩餘容量內，first_bytes 不超過 read_len。
+                let drain_ptr = unsafe { self.buffer.as_mut_ptr().add(plan.first_bytes) };
+                let drain = self.read_into(drain_ptr, plan.drain_bytes, drain_start, timeout)?;
+                match self
+                    .read_result(drain.completion, drain.wake, drain.timeout)
+                    .map_err(classify_read_error)?
+                {
+                    ReadOutcome::Data(count) => {
+                        if count > plan.drain_bytes {
+                            return Err(classify_read_error(PalError::plain(
+                                PalErrorKind::Io,
+                                "ReadFile 回報超過目前佇列長度",
+                            )));
+                        }
+                        total += count;
+                    }
+                    ReadOutcome::Eof | ReadOutcome::TimedOut | ReadOutcome::Woken => {}
+                }
             }
 
-            loop {
-                let wait_ms = remaining_timeout_ms(start, timeout);
-                match self.wait(wait_ms) {
-                    Ok(WaitResult::Io) => {
-                        let completion = self.collect(false);
-                        if completion.win32 == ERROR_IO_INCOMPLETE {
-                            continue;
-                        }
-                        let outcome = self
-                            .read_result(completion, false, false)
-                            .map_err(classify_read_error)?;
-                        if let ReadOutcome::Data(count) = &outcome {
-                            buf[..*count].copy_from_slice(&self.buffer[..*count]);
-                        }
-                        if outcome == ReadOutcome::TimedOut
-                            && retry_idle_read_timeout(timeout, start.elapsed())
-                        {
-                            break;
-                        }
-                        return Ok(outcome);
-                    }
-                    Ok(WaitResult::Wake) => {
-                        if let Err(error) = self.wake_event.consume_if_signaled() {
-                            self.cancel_and_collect();
-                            return Err(classify_wait_error(error));
-                        }
-                        let completion = self.cancel_and_collect();
-                        let outcome = self
-                            .read_result(completion, true, false)
-                            .map_err(classify_read_error)?;
-                        if let ReadOutcome::Data(count) = &outcome {
-                            buf[..*count].copy_from_slice(&self.buffer[..*count]);
-                        }
-                        return Ok(outcome);
-                    }
-                    Ok(WaitResult::Timeout) => {
-                        let completion = self.cancel_and_collect();
-                        let outcome = self
-                            .read_result(completion, false, true)
-                            .map_err(classify_read_error)?;
-                        if let ReadOutcome::Data(count) = &outcome {
-                            buf[..*count].copy_from_slice(&self.buffer[..*count]);
-                        }
-                        if outcome == ReadOutcome::TimedOut
-                            && retry_idle_read_timeout(timeout, start.elapsed())
-                        {
-                            break;
-                        }
-                        return Ok(outcome);
-                    }
-                    Err(wait_error) => {
-                        self.cancel_and_collect();
-                        return Err(classify_wait_error(wait_error));
-                    }
-                }
-            }
+            buf[..total].copy_from_slice(&self.buffer[..total]);
+            return Ok(ReadOutcome::Data(total));
         }
     }
 }
@@ -1140,6 +1187,12 @@ struct Completion {
     transferred: u32,
     win32: u32,
     cancel_succeeded: bool,
+}
+
+struct ReadStep {
+    completion: Completion,
+    wake: bool,
+    timeout: bool,
 }
 
 fn cancellation_owns_aborted_completion(completion: Completion, cancel_requested: bool) -> bool {
