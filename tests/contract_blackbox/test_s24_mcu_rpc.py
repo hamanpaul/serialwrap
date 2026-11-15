@@ -18,6 +18,7 @@ import json
 import os
 
 import pytest
+from mcu_flash_parity import record_observation
 
 pytestmark = [pytest.mark.posix_only]
 
@@ -51,6 +52,11 @@ def _cli_bytes(d: dict, meta: dict) -> bytes:
     return (json.dumps(full, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
 
 
+def _cli_body_json(raw: dict) -> str:
+    body = {k: v for k, v in raw.items() if k not in _META_KEYS}
+    return json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
 def _link(sw_env):
     return sw_env.run_dir / "dev" / "ttyMCU"
 
@@ -72,6 +78,14 @@ def test_patterns_exact_bytes(sw_env):
     # `--retries` 唯讀白名單（§4.2）：daemon 在線時與單次呼叫同位元組。
     r2 = sw_env.cli("--retries", "1", "mcu", "patterns")
     assert (r2.exit, r2.stdout) == (0, r.stdout), r2.stderr
+    record_observation(
+        "s24-mcu-rpc-shapes",
+        "tests/contract_blackbox/test_s24_mcu_rpc.py::test_patterns_exact_bytes",
+        rpc_body_wire=_wire(_body(raw)),
+        cli_body_json=_cli_body_json(r.json),
+        cli_exit=r.exit,
+        retry_output_equal=r2.stdout == r.stdout,
+    )
 
 
 @pytest.mark.process_rpc
@@ -84,6 +98,14 @@ def test_status_idle_no_sessions(sw_env):
     assert r.stdout == _cli_bytes(IDLE_STATUS, _meta(raw))
     r2 = sw_env.cli("--retries", "1", "mcu", "status")
     assert (r2.exit, r2.stdout) == (0, r.stdout), r2.stderr
+    record_observation(
+        "s24-mcu-rpc-shapes",
+        "tests/contract_blackbox/test_s24_mcu_rpc.py::test_status_idle_no_sessions",
+        rpc_body_wire=_wire(_body(raw)),
+        cli_body_json=_cli_body_json(r.json),
+        cli_exit=r.exit,
+        retry_output_equal=r2.stdout == r.stdout,
+    )
 
 
 @pytest.mark.posix_pty
@@ -103,8 +125,18 @@ def test_status_candidates_and_ttymcu_lifecycle(sw_env, fake_mcu):
         "flashing_com": None,
         "last_detect": None,
     }
-    assert _wire(_body(sw_env.rpc("mcu.status", {}))) == _wire(want)
+    actual = _body(sw_env.rpc("mcu.status", {}))
+    assert _wire(actual) == _wire(want)
     assert fake_mcu.rx_log() == b"", "mcu.status 不得觸發任何 TX"
+    record_observation(
+        "s24-mcu-rpc-shapes",
+        "tests/contract_blackbox/test_s24_mcu_rpc.py::test_status_candidates_and_ttymcu_lifecycle",
+        candidate_coms=[row["com"] for row in actual["candidates"]],
+        candidate_command_capable=[row["command_capable"] for row in actual["candidates"]],
+        candidate_real_path_matches=all(row["real_path"] == os.path.realpath(row["by_id"]) for row in actual["candidates"]),
+        mcu_tx_hex=fake_mcu.rx_log().hex(),
+        endpoint_link_created=link.is_symlink(),
+    )
     sw_env.stop()
     assert not link.is_symlink() and not link.exists(), "daemon 停止後端點 link 必須移除"
 
@@ -117,8 +149,17 @@ def test_ttymcu_path_env_override(sw_env):
     _start_idle(sw_env)
     sw_env.wait_until(alt.is_symlink, timeout=10)
     assert not _link(sw_env).exists() and not _link(sw_env).is_symlink(), "覆寫後不得再建預設路徑"
+    alternate_created = alt.is_symlink()
+    default_exists = _link(sw_env).exists() or _link(sw_env).is_symlink()
     sw_env.stop()
     assert not alt.is_symlink() and not alt.exists()
+    record_observation(
+        "s24-mcu-rpc-shapes",
+        "tests/contract_blackbox/test_s24_mcu_rpc.py::test_ttymcu_path_env_override",
+        alternate_created=alternate_created,
+        default_exists=default_exists,
+        alternate_removed=not alt.is_symlink() and not alt.exists(),
+    )
 
 
 @pytest.mark.posix_pty
@@ -132,3 +173,9 @@ def test_ttymcu_start_failure_exits_1(sw_env):
     with pytest.raises(RuntimeError, match=r"rc=1$"):
         sw_env._start_daemon(timeout_s=15)
     assert not os.path.exists(sw_env.socket), "端點啟動失敗不得留下 RPC socket"
+    record_observation(
+        "s24-mcu-rpc-shapes",
+        "tests/contract_blackbox/test_s24_mcu_rpc.py::test_ttymcu_start_failure_exits_1",
+        daemon_start_exit=1,
+        rpc_socket_exists=os.path.exists(sw_env.socket),
+    )
