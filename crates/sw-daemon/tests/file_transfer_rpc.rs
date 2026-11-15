@@ -292,7 +292,7 @@ fn file_pull_over_rx_window_succeeds_od80_df26() {
             let cmd = String::from_utf8_lossy(line).trim_end_matches(['\r', '\n']).to_string();
             let w = words(&cmd);
             if w.first().map(String::as_str) == Some("printf") && w.iter().any(|x| x == "<") {
-                // 大檔 pull：以背景 thread 分段送出模擬真實 UART 鮑率傳輸，驗證分段 pull（OD-80／DF-26）
+                // 大檔 pull：背景 thread 分段送出，間隔留給原生 Windows reader 排空 RX；總回應仍超過 RX 視窗。
                 let at = w.iter().position(|x| x == "<").expect("pull 命令含 <");
                 let data = f.lock().unwrap().get(&w[at + 1]).cloned().unwrap_or_default();
                 let b64 = t::b64encode(&data);
@@ -307,7 +307,7 @@ fn file_pull_over_rx_window_succeeds_od80_df26() {
                 std::thread::spawn(move || {
                     for chunk in full_bytes.chunks(8192) {
                         dev_thread.push_rx(chunk);
-                        std::thread::sleep(std::time::Duration::from_millis(15));
+                        std::thread::sleep(std::time::Duration::from_millis(50));
                     }
                 });
                 return Vec::new();
