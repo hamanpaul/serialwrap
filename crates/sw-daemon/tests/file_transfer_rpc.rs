@@ -134,7 +134,7 @@ fn file_push_and_pull_rpc_end_to_end() {
     // bare human 依 OD-74 正規化為 human:cli；成功回應附 source／source_normalized_from（`_annotate_source`）。
     let r = rig.call(
         "file.push",
-        &format!(r#"{{"selector":"COM0","local_path":"{local}","remote_path":"/tmp/r.bin","ack_mode":"none","source":"human"}}"#),
+        &format!(r#"{{"selector":"COM0","local_path":{},"remote_path":"/tmp/r.bin","ack_mode":"none","source":"human"}}"#, json_string(&local)),
     );
     assert_eq!(
         keys(&r),
@@ -165,7 +165,7 @@ fn file_push_and_pull_rpc_end_to_end() {
 
     // pull：未帶 source 時不附來源標註。
     let out = tmp.path("back.bin");
-    let r = rig.call("file.pull", &format!(r#"{{"selector":"COM0","remote_path":"/tmp/r.bin","local_path":"{out}"}}"#));
+    let r = rig.call("file.pull", &format!(r#"{{"selector":"COM0","remote_path":"/tmp/r.bin","local_path":{}}}"#, json_string(&out)));
     assert_eq!(keys(&r), ["ok", "bytes", "md5", "local_path", "version"], "{}", wire(&r));
     assert_eq!(r.get("local_path"), Some(&PyValue::from(out.clone())));
     assert_eq!(std::fs::read(&out).unwrap(), data);
@@ -230,7 +230,7 @@ fn file_rpc_rejected_during_boot_quiet_returns_autoboot_quiet_zero_tx() {
     // file.push 於 boot quiet 期間被拒（SC-03，OD-79 撤回 SC-33）：回 AUTOBOOT_QUIET
     let r_push = rig.call(
         "file.push",
-        &format!(r#"{{"selector":"COM0","local_path":"{local}","remote_path":"/tmp/q.bin"}}"#),
+        &format!(r#"{{"selector":"COM0","local_path":{},"remote_path":"/tmp/q.bin"}}"#, json_string(&local)),
     );
     assert_eq!(
         keys(&r_push),
@@ -323,7 +323,7 @@ fn file_pull_over_rx_window_succeeds_od80_df26() {
     let out = tmp.path("large_back.bin");
     let r = rig.call(
         "file.pull",
-        &format!(r#"{{"selector":"COM0","remote_path":"/tmp/large.bin","local_path":"{out}"}}"#),
+        &format!(r#"{{"selector":"COM0","remote_path":"/tmp/large.bin","local_path":{}}}"#, json_string(&out)),
     );
     assert_eq!(keys(&r), ["ok", "bytes", "md5", "local_path", "version"], "{}", wire(&r));
     assert_eq!(r.get("ok"), Some(&PyValue::Bool(true)));

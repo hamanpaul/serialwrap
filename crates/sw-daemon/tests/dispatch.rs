@@ -9,7 +9,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use support::{BY_ID_A, BY_ID_B, REAL_A, REAL_B, RIG_PID, RigSpec, ServiceRig, wait_until};
+use support::{
+    BY_ID_A, BY_ID_B, REAL_A, REAL_B, RIG_PID, RigSpec, ServiceRig, json_string, wait_until,
+};
 use sw_core::state_store::{LoadedState, ReleasedRow};
 use sw_pal::fakes::{FakeDevice, FakeEnv, FakeSerialBackend};
 use sw_pal::proc_scan::{DaemonProc, ProcIdentity};
@@ -461,8 +463,10 @@ fn health_status_key_order_and_limits() {
     assert_eq!(h.get("running"), Some(&PyValue::Bool(true)));
     assert_eq!(h.get("sessions"), Some(&PyValue::from(1i64)));
     assert_eq!(h.get("devices"), Some(&PyValue::from(1i64)));
-    assert_eq!(s(&h, "wal_path"), "/fake/wal/raw.wal.ndjson");
-    assert_eq!(s(&h, "mirror_path"), "/fake/wal/raw.mirror.log");
+    // Python WAL 路徑由 os.path.join 組合（origin/main sw_core/wal.py:71-72）。
+    let sep = std::path::MAIN_SEPARATOR;
+    assert_eq!(s(&h, "wal_path"), format!("/fake/wal{sep}raw.wal.ndjson"));
+    assert_eq!(s(&h, "mirror_path"), format!("/fake/wal{sep}raw.mirror.log"));
     let wal = sub(&h, "wal");
     assert_eq!(
         keys(&wal),
@@ -3543,11 +3547,13 @@ fn log_tail_raw_wal_missing_shape() {
     let hint = format!(
         "WAL 已寫過 {n} 筆紀錄，但現行 WAL 檔不存在——稽核紀錄在 daemon 運行期間被移除（常見於外部工具 rmtree WAL 目錄）。消失期間的紀錄無法復原；daemon 會在下一次寫入時自動重建目錄續寫。以 `serialwrap doctor` 的 wal_writable 檢查確認目錄狀態。"
     );
+    // Python WAL 路徑由 os.path.join 組合，RPC JSON 會逸出 Windows 分隔符。
+    let wal_path = format!("/fake/wal{}raw.wal.ndjson", std::path::MAIN_SEPARATOR);
     assert_eq!(
         j(&resp),
         format!(
-            "{{\"ok\":false,\"error_code\":\"WAL_MISSING\",\"wal_path\":\"/fake/wal/raw.wal.ndjson\",\"wal_dir\":\"/fake/wal\",\"wal_dir_exists\":true,\"wal_file_exists\":false,\"current_seq\":{n},\"hint\":\"{hint}\",\"version\":\"{}\"}}",
-            r.version
+            "{{\"ok\":false,\"error_code\":\"WAL_MISSING\",\"wal_path\":{},\"wal_dir\":\"/fake/wal\",\"wal_dir_exists\":true,\"wal_file_exists\":false,\"current_seq\":{n},\"hint\":\"{hint}\",\"version\":\"{}\"}}",
+            json_string(&wal_path), r.version
         )
     );
     // wal.range 亦檢查；result.tail legacy 路徑不檢查。

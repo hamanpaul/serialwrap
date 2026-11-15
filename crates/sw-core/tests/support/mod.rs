@@ -99,7 +99,10 @@ struct MemProfileFs {
 
 impl ProfileFs for MemProfileFs {
     fn flavor(&self) -> PathFlavor {
-        PathFlavor::Posix
+        match sw_pal::native().caps.path_flavor {
+            sw_pal::PalPathFlavor::Posix => PathFlavor::Posix,
+            sw_pal::PalPathFlavor::Windows => PathFlavor::Windows,
+        }
     }
     fn is_dir(&self, p: &str) -> bool {
         p == PROFILE_DIR

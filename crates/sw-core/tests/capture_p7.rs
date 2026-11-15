@@ -77,13 +77,15 @@ impl LogFile for MemFile {
 #[test]
 fn log_path_uses_local_time() {
     // Python `time.strftime("%y%m%d-%H%M%S")`（本地時間）：1_700_000_000 為 2023-11-14 22:13:20 UTC，UTC+8 → 231115-061320。
+    // 路徑由 Python os.path.join 組合（origin/main sw_core/session_manager.py:8153-8155）。
+    let sep = std::path::MAIN_SEPARATOR;
     assert_eq!(
         log_path_for("/x", "COM2", 1_700_000_000, 28800),
-        "/x/COM2_231115-061320.log"
+        format!("/x{sep}COM2_231115-061320.log")
     );
     assert_eq!(
         log_path_for("/x", "COM0", 0, 0),
-        "/x/COM0_700101-000000.log"
+        format!("/x{sep}COM0_700101-000000.log")
     );
 }
 

@@ -22,6 +22,7 @@ use sw_core::op_runner::encode_interactive_payload;
 use sw_core::self_test::SelfTestProbes;
 use sw_core::session_core::SessionRequest;
 use sw_core::tx_writer::{FlashMode, OpId};
+use sw_pal::fs_ops::TEXT_NEWLINE_STR;
 use sw_pal::fakes::serial::{FakeUartExclusive, FakeWriteStep};
 use sw_pal::traits::{Clock, PalError};
 use sw_proto::pycompat::{PyErr, clean_text};
@@ -1168,7 +1169,11 @@ fn log_capture_start_stop_status() {
         vec!["ok", "capture_id", "log_path", "session"]
     );
     let path = start["log_path"].as_str().unwrap().to_string();
-    assert_eq!(path, format!("{dir}/COM0_700101-000000.log"));
+    // Python 以 os.path.join 組合 log_path（origin/main sw_core/session_manager.py:8153-8155）。
+    assert_eq!(
+        path,
+        format!("{dir}{}COM0_700101-000000.log", std::path::MAIN_SEPARATOR)
+    );
     assert!(start["capture_id"].as_str().unwrap().contains('-'));
     // 重複 start → already_active。
     let again = h.request(SessionRequest::LogStart);
@@ -1212,7 +1217,8 @@ fn log_capture_start_stop_status() {
     assert_eq!(stop["line_count"], int(1));
     assert_eq!(stop["byte_count"], int(5));
     let text = std::fs::read_to_string(&path).unwrap();
-    assert_eq!(text, "IDLE\n");
+    // Python 以文字模式寫 agent log，Windows 將寫入的 LF 轉為 CRLF（origin/main sw_core/session_manager.py:8158；4677-4680）。
+    assert_eq!(text, format!("IDLE{TEXT_NEWLINE_STR}"));
     assert!(!text.contains("FGDATA"));
     let stop2 = h.request(SessionRequest::LogStop);
     assert_eq!(stop2["error_code"], PyValue::from("NO_ACTIVE_CAPTURE"));

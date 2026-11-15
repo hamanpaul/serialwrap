@@ -328,7 +328,8 @@ fn payload(n: usize) -> Vec<u8> {
 
 fn push_params(local: &str, remote: &str) -> String {
     format!(
-        r#"{{"selector":"COM0","local_path":"{local}","remote_path":"{remote}","ack_mode":"none","chunk_size":256,"chunk_timeout_s":60}}"#
+        r#"{{"selector":"COM0","local_path":{},"remote_path":"{remote}","ack_mode":"none","chunk_size":256,"chunk_timeout_s":60}}"#,
+        json_string(local)
     )
 }
 
@@ -604,7 +605,8 @@ fn handoff_file_push_ticket_survives_rpc_timeout() {
     let local = tmp.write("src.bin", &data);
     let rig = r.clone();
     let params = format!(
-        r#"{{"selector":"COM0","local_path":"{local}","remote_path":"/tmp/svc-timeout.bin","ack_mode":"none","chunk_size":256,"chunk_timeout_s":3600}}"#
+        r#"{{"selector":"COM0","local_path":{},"remote_path":"/tmp/svc-timeout.bin","ack_mode":"none","chunk_size":256,"chunk_timeout_s":3600}}"#,
+        json_string(&local)
     );
     let push = thread::spawn(move || rig.call_err("file.push", &params));
     shell.wait_held();

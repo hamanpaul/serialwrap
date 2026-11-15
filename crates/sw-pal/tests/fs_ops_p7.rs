@@ -76,9 +76,11 @@ fn open_append_error_message_has_quoted_path() {
         Err(e) => e,
     };
     assert_eq!(err.kind, sw_pal::PalErrorKind::NotFound);
+    // Python session_manager 將 open 的 OSError 以 str(exc) 回覆（origin/main sw_core/session_manager.py:8158-8160）。
+    let python_path = p.display().to_string().replace('\\', "\\\\");
     assert_eq!(
         err.py_message,
-        format!("[Errno 2] No such file or directory: '{}'", p.display())
+        format!("[Errno 2] No such file or directory: '{python_path}'")
     );
 }
 

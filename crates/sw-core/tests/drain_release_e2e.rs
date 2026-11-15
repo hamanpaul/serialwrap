@@ -10,6 +10,7 @@ use sw_core::mailbox::{ControlEvent, DataEvent};
 use sw_core::session_core::*;
 use sw_core::tx_writer::OpId;
 use sw_pal::fakes::serial::FakeWriteStep;
+use sw_pal::fs_ops::TEXT_NEWLINE_STR;
 use sw_pal::traits::PalError;
 use sw_proto::pyjson::PyValue;
 
@@ -177,7 +178,12 @@ fn queued_rx_receipt_round(shutdown: bool, reattach: bool, round: usize) {
             bytes: b"OD69-STALE\n".to_vec(),
         }).expect("舊 epoch RX 應可入列");
     }
-    let markers = (0..8).map(|index| format!("OD69-RX-{round}-{index}\n")).collect::<String>();
+    let markers = (0..8)
+        .map(|index| format!("OD69-RX-{round}-{index}\n"))
+        .collect::<String>();
+    // Python 文字模式只轉換 agent log 檔的行尾；UART/RX/WAL 保留原始 LF。
+    // 對照 origin/main:sw_core/session_manager.py:8158、4677-4679。
+    let log_markers = markers.replace('\n', TEXT_NEWLINE_STR);
     h.dev.push_rx(markers.as_bytes());
     let deadline = Instant::now() + Duration::from_secs(5);
     while h.rx.watermark().1 <= initial_rx_seq || h.data_backlog() == 0 {
@@ -254,7 +260,7 @@ fn queued_rx_receipt_round(shutdown: bool, reattach: bool, round: usize) {
     );
     let captured = std::fs::read_to_string(&log_path).expect("capture 檔應存在");
     assert!(
-        captured.contains(&markers),
+        captured.contains(&log_markers),
         "receipt 處理前 RX 應已進 capture: {captured:?}"
     );
     assert!(!captured.contains("OD69-STALE"), "舊 epoch RX 不得寫入新 capture");

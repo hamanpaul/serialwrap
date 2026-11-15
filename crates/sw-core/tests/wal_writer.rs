@@ -558,9 +558,11 @@ fn rotate_rename_failure_marks_record() {
         .expect("現行檔應含 seq 2");
     assert_eq!(seq_of(&last), Some(2));
     assert_eq!(last.get("rotation_failed"), Some(&PyValue::Bool(true)));
+    // Python 以 os.path.join 建立 WAL 路徑（origin/main sw_core/wal.py:71）。
+    let wal_path = format!("/w{}raw.wal.ndjson", std::path::MAIN_SEPARATOR);
     assert_eq!(
         warnings.lock().unwrap().as_slice(),
-        &["WAL 輪替失敗（best-effort 續用既有檔案，不殺 reader）：/w/raw.wal.ndjson：[Errno 13] Permission denied"]
+        &[format!("WAL 輪替失敗（best-effort 續用既有檔案，不殺 reader）：{wal_path}：[Errno 13] Permission denied")]
     );
     // 續用原路徑：後續 append 仍寫入，歸檔＋現行合計無遺失
     w.append(req("RX", "uart", b"x"));
