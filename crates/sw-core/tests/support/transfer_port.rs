@@ -70,16 +70,25 @@ impl FakeDut {
     }
 
     pub fn echo_first_n_chars(n: usize) -> FakeDut {
-        FakeDut { echo_limit: Some(n), ..FakeDut::echo_all() }
+        FakeDut {
+            echo_limit: Some(n),
+            ..FakeDut::echo_all()
+        }
     }
 
     pub fn silent() -> FakeDut {
-        FakeDut { silent: true, ..FakeDut::echo_all() }
+        FakeDut {
+            silent: true,
+            ..FakeDut::echo_all()
+        }
     }
 
     /// 模擬 busybox shell：echo 命令、回 decoder probe sentinel 與 prompt `# `。
     pub fn shell() -> FakeDut {
-        FakeDut { shell: true, ..FakeDut::echo_all() }
+        FakeDut {
+            shell: true,
+            ..FakeDut::echo_all()
+        }
     }
 
     pub fn with_noise(mut self, noise: &str) -> FakeDut {
@@ -263,7 +272,8 @@ fn parse_records(bytes: &[u8]) -> Vec<WalRec> {
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| {
-            let PyValue::Dict(d) = loads(l.trim_end_matches('\r')).expect("WAL 行應為合法 JSON") else {
+            let PyValue::Dict(d) = loads(l.trim_end_matches('\r')).expect("WAL 行應為合法 JSON")
+            else {
                 panic!("WAL 行應為 object：{l}");
             };
             let text = |k: &str| d.get(k).and_then(PyValue::as_str).map(str::to_string);
@@ -327,7 +337,9 @@ fn spawn_dut(dev: FakeDevice, spec: FakeDut, stop: Arc<AtomicBool>, processed: A
                     if spec.shell {
                         let cmd = String::from_utf8_lossy(&line).to_string();
                         if cmd == t::decoder_probe_command() {
-                            out.extend_from_slice(format!("{}\r\n", t::DECODER_B64_SENTINEL).as_bytes());
+                            out.extend_from_slice(
+                                format!("{}\r\n", t::DECODER_B64_SENTINEL).as_bytes(),
+                            );
                         }
                         out.extend_from_slice(b"# ");
                     }
@@ -387,7 +399,10 @@ impl PortRig {
             let probe = dev.clone();
             let rx = Arc::clone(&rx);
             dev.on_os_submit(Box::new(move || {
-                bounds.lock().unwrap().push((probe.tx_len(), rx.total_bytes()));
+                bounds
+                    .lock()
+                    .unwrap()
+                    .push((probe.tx_len(), rx.total_bytes()));
             }));
         }
         let processed = Arc::new(Mutex::new(0usize));
@@ -402,7 +417,10 @@ impl PortRig {
             .expect("開啟假裝置");
         let wfs = FakeWalFs::new();
         let wal = Arc::new(WalWriter::open(
-            WalConfig { dir: "/w".into(), rotate_bytes: 1 << 26 },
+            WalConfig {
+                dir: "/w".into(),
+                rotate_bytes: 1 << 26,
+            },
             wfs.clone(),
             clock.clone(),
         ));
@@ -466,7 +484,13 @@ impl PortRig {
             rng: Arc::new(|buf: &mut [u8]| buf.fill(0x5a)),
             registry: CommandRegistry::new(),
         };
-        let grant = OpGrant { op_id: OP, epoch: EPOCH, owner_gen: 0, fsm_gen: 0, cmd_id: None };
+        let grant = OpGrant {
+            op_id: OP,
+            epoch: EPOCH,
+            owner_gen: 0,
+            fsm_gen: 0,
+            cmd_id: None,
+        };
         let cancel = RunCancel::new(&rx);
         PortRig {
             com: com.to_string(),
@@ -475,7 +499,11 @@ impl PortRig {
             rx,
             wal,
             wfs,
-            dut: DutHandle { dev, bounds, processed },
+            dut: DutHandle {
+                dev,
+                bounds,
+                processed,
+            },
             ctx,
             grant,
             cancel,
@@ -533,7 +561,9 @@ impl PortRig {
     pub fn finish_worker(&mut self) -> ReceiptAt {
         let worker = self.worker.take().expect("worker 只能收尾一次");
         worker.finish_async(StopId(1), self.ctl_tx.clone());
-        self.receipts.recv_timeout(REAL_WAIT).expect("等不到 WorkerStoppedReceipt")
+        self.receipts
+            .recv_timeout(REAL_WAIT)
+            .expect("等不到 WorkerStoppedReceipt")
     }
 
     /// 注入外部輸出（經 reader → WAL → RX 視窗），並等 RX 視窗收到。
@@ -553,11 +583,17 @@ impl PortRig {
 
     /// WAL 讀回的 TX 紀錄（本 rig 的 com）。
     pub fn tx_records(&self) -> Vec<WalRec> {
-        self.records().into_iter().filter(|r| r.dir == "TX").collect()
+        self.records()
+            .into_iter()
+            .filter(|r| r.dir == "TX")
+            .collect()
     }
 
     pub fn meta_records(&self) -> Vec<WalRec> {
-        self.records().into_iter().filter(|r| r.dir == "META").collect()
+        self.records()
+            .into_iter()
+            .filter(|r| r.dir == "META")
+            .collect()
     }
 }
 

@@ -93,13 +93,14 @@ sw_gate_prereqs_check_env() {
 
 sw_gate_prereqs_build() {
   local root="$sw_gate_prereqs_root"
+  local CARGO_TARGET_DIR="$root/target"
   local prereqs="$root/target/s2-par/gpz/prereqs"
   local no_fakes_target="$prereqs/no-fakes-target"
   local base_bundle="$prereqs/base-bundle"
   local feature_bundle="$prereqs/bundle"
   local linux_target="x86_64-unknown-linux-gnu"
 
-  export CARGO_TARGET_DIR="$root/target"
+  export CARGO_TARGET_DIR
   mkdir -p "$prereqs"
   CARGO_TARGET_DIR="$no_fakes_target" cargo build -p sw-cli --no-default-features --bin serialwrap --target "$linux_target" \
     || { sw_gate_prereqs_fail "no-fakes CLI 建置失敗"; return 1; }

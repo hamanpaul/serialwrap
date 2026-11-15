@@ -97,11 +97,11 @@ record_existing() {
 
 # 0. 受測 artifact：Rust CLI＋daemon（非 test-fakes）。先前切片 gate 使用 release daemon，另建同類型
 #    release 快照供來源 SHA 綁定；不放入一般 artifacts，避免混淆本次黑箱受測 debug daemon。
-cargo build --workspace --bins >"$RUN/logs/build.log" 2>&1 || { echo "p7_gate.sh: cargo build 失敗（$RUN/logs/build.log）" >&2; exit 1; }
+CARGO_TARGET_DIR="$TARGET_DIR" cargo build --workspace --bins >"$RUN/logs/build.log" 2>&1 || { echo "p7_gate.sh: cargo build 失敗（$RUN/logs/build.log）" >&2; exit 1; }
 mkdir -p "$RUN/artifacts" "$RUN/prior-slice-artifacts"
 cp -p "$TARGET_DIR/debug/serialwrap" "$RUST_CLI"
 cp -p "$TARGET_DIR/debug/serialwrapd" "$RUST_D"
-cargo build --release -p sw-daemon -p sw-cli --target x86_64-unknown-linux-gnu \
+CARGO_TARGET_DIR="$TARGET_DIR" cargo build --release -p sw-daemon -p sw-cli --target x86_64-unknown-linux-gnu \
   >"$RUN/logs/build-prior-slice-release.log" 2>&1 || {
   echo "p7_gate.sh: slice21 同類型 release 建置失敗（$RUN/logs/build-prior-slice-release.log）" >&2
   exit 1

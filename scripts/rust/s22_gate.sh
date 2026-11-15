@@ -122,30 +122,49 @@ def l15_rows() -> list[dict]:
     })
     rows: list[dict] = []
     selftest_ready = selftest_report is not None and selftest_report.is_file()
-    daemon_paths = [pathlib.Path(os.environ[name]).resolve() for name in
-                    ("SERIALWRAP_L15_PY_DAEMON", "SERIALWRAP_L15_RUST_DAEMON") if os.environ.get(name)]
-    pinned_daemons = len(daemon_paths) == 2 and all(
-        path.is_file() and path.is_relative_to(root) for path in daemon_paths
-    )
     for index, ref in enumerate(refs, start=1):
         tokens = shlex.split(ref)
         bridge = "--mode" in tokens and tokens[tokens.index("--mode") + 1] == "bridge"
-        if not pinned_daemons:
-            rows.append({"ref": ref, "outcome": "unchecked", "exit_code": None,
-                         "reason": "缺少 worktree 內明確指定的 SERIALWRAP_L15_PY_DAEMON／SERIALWRAP_L15_RUST_DAEMON"})
-            continue
-        if bridge and not selftest_ready:
-            rows.append({"ref": ref, "outcome": "unchecked", "exit_code": None,
-                         "reason": "缺少符合資格的 SERIALWRAP_L15_SELFTEST_REPORT"})
-            continue
         argv = [sys.executable, "func-test/runner.py", *tokens[1:]]
         if bridge and selftest_report is not None:
             argv.extend(["--selftest-report", str(selftest_report)])
-        env = os.environ.copy()
-        env["SERIALWRAP_GATE"] = "1"
-        rc = run_logged(f"l15-{index:02d}", argv, env)
-        rows.append({"ref": ref, "outcome": "passed" if rc == 0 else "failed", "exit_code": rc,
-                     "log": f"logs/l15-{index:02d}.log"})
+        daemon_specs = [
+            ("python", "SERIALWRAP_L15_PY_DAEMON"),
+            ("rust", "SERIALWRAP_L15_RUST_DAEMON"),
+        ]
+        valid_paths = []
+        for implementation, env_name in daemon_specs:
+            raw_path = os.environ.get(env_name)
+            path = pathlib.Path(raw_path).resolve() if raw_path else None
+            valid = path is not None and path.is_file() and path.is_relative_to(root)
+            valid_paths.append(path if valid else None)
+        distinct_paths = all(path is not None for path in valid_paths) and valid_paths[0] != valid_paths[1]
+        for implementation, env_name in daemon_specs:
+            raw_path = os.environ.get(env_name)
+            path = pathlib.Path(raw_path).resolve() if raw_path else None
+            valid = path is not None and path.is_file() and path.is_relative_to(root) and distinct_paths
+            if not valid:
+                rows.append({"ref": ref, "implementation": implementation, "outcome": "failed", "exit_code": 127,
+                             "reason": f"{env_name} 必須是 worktree 內存在且身分獨立的 daemon artifact"})
+                continue
+            if bridge and not selftest_ready:
+                rows.append({"ref": ref, "implementation": implementation, "outcome": "unchecked", "exit_code": None,
+                             "daemon_path": str(path.relative_to(root)), "daemon_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                             "reason": "缺少符合資格的 SERIALWRAP_L15_SELFTEST_REPORT"})
+                continue
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            env = os.environ.copy()
+            env["SERIALWRAP_GATE"] = "1"
+            env["SERIALWRAP_DAEMON_EXE"] = str(path)
+            label = f"l15-{index:02d}-{implementation}"
+            rc = run_logged(label, argv, env)
+            same_artifact = path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == digest
+            if not same_artifact and rc == 0:
+                rc = 1
+            rows.append({"ref": ref, "implementation": implementation,
+                         "outcome": "passed" if rc == 0 and same_artifact else "failed", "exit_code": rc,
+                         "daemon_path": str(path.relative_to(root)), "daemon_sha256": digest,
+                         "log": f"logs/{label}.log"})
     return rows
 
 if not dry_run:

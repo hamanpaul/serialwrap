@@ -345,12 +345,37 @@ def test_unchecked_only_case_is_insufficient(tmp_path: Path) -> None:
     case = _case(out, "co-01-line-buffering")
     assert case["status"] == "INSUFFICIENT" and case["unchecked_tests"] == [FUNC_REF], case
     assert out["result"] == "INSUFFICIENT" and rc == 1
-    passed = {"format": "s22-l15-results.v1", "runs": [{"ref": FUNC_REF, "outcome": "passed", "exit_code": 0}]}
+    driver = (ROOT / "scripts/rust/s22_gate.sh").read_text(encoding="utf-8")
+    assert 'env["SERIALWRAP_DAEMON_EXE"] = str(path)' in driver
+    assert '"daemon_sha256"' in driver and '"implementation"' in driver
+
+    def run_row(directory: Path, implementation: str, outcome: str = "passed", *, missing: bool = False) -> dict:
+        artifact = directory / f"{implementation}-daemon"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        if not missing:
+            artifact.write_bytes(f"{implementation} candidate daemon".encode())
+        digest = hashlib.sha256(artifact.read_bytes()).hexdigest() if artifact.is_file() else "0" * 64
+        return {"ref": FUNC_REF, "implementation": implementation, "outcome": outcome,
+                "exit_code": 0 if outcome == "passed" else 1,
+                "daemon_path": str(artifact), "daemon_sha256": digest}
+
+    passed = {"format": "s22-l15-results.v1", "runs": [
+        run_row(tmp_path / "daemons", "python"), run_row(tmp_path / "daemons", "rust")
+    ]}
     rc, out = _run(tmp_path / "b", _good_reports(), emap=emap, l15=passed)
     assert _case(out, "co-01-line-buffering")["status"] == "PASS" and rc == 0, out
-    failed = {"format": "s22-l15-results.v1", "runs": [{"ref": FUNC_REF, "outcome": "failed", "exit_code": 1}]}
+    failed = {"format": "s22-l15-results.v1", "runs": [
+        run_row(tmp_path / "failed-daemons", "python"),
+        run_row(tmp_path / "failed-daemons", "rust", "failed"),
+    ]}
     rc, out = _run(tmp_path / "c", _good_reports(), emap=emap, l15=failed)
     assert _case(out, "co-01-line-buffering")["status"] == "FAIL" and out["result"] == "FAIL" and rc == 1
+    bad_rust = {"format": "s22-l15-results.v1", "runs": [
+        run_row(tmp_path / "bad-daemons", "python"),
+        run_row(tmp_path / "bad-daemons", "rust", missing=True),
+    ]}
+    rc, out = _run(tmp_path / "bad-rust", _good_reports(), emap=emap, l15=bad_rust)
+    assert _case(out, "co-01-line-buffering")["status"] != "PASS" and rc == 1, out
     dup = {"format": "s22-l15-results.v1", "runs": [passed["runs"][0], passed["runs"][0]]}
     rc, out = _run(tmp_path / "d", _good_reports(), emap=emap, l15=dup)
     assert _case(out, "co-01-line-buffering")["status"] == "INSUFFICIENT" and rc == 1

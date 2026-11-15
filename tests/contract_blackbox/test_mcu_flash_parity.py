@@ -5,6 +5,7 @@ import importlib.util
 import inspect
 import json
 import subprocess
+import sys
 import tarfile
 from pathlib import Path
 
@@ -96,6 +97,19 @@ def test_mcu_flash_diff_tool_requires_and_renders_attribution(tmp_path):
     report, failed = module.compare(data)
     assert not failed
     assert "Python 0.3.2 之後修正" in report
+
+    # 缺少 Windows Rust self_test observation 必須在歸因前拒絕，OD-91 不能補出不存在的 observation。
+    missing_observation = {
+        "python032": {"win-self-test": {"result": "ok"}, "shared-case": {"result": "ok"}},
+        "python_main": {"win-self-test": {"result": "ok"}, "shared-case": {"result": "ok"}},
+        "rust": {"shared-case": {"result": "ok"}},
+        "attributions": {"win-self-test.result": {"kind": "v032_no_windows_daemon", "reference": "OD-91"}},
+    }
+    input_path, output_path = tmp_path / "missing.json", tmp_path / "missing.md"
+    input_path.write_text(json.dumps(missing_observation), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(_DIFF_TOOL), "compare", "--input", str(input_path),
+                           "--output", str(output_path)], capture_output=True, text=True, timeout=30)
+    assert proc.returncode != 0, (proc.stdout, proc.stderr)
 
 
 @pytest.mark.memory_only

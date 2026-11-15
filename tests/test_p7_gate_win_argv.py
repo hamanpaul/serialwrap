@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import pathlib
+import os
 import re
 import shlex
 import subprocess
@@ -43,13 +44,15 @@ def test_gate_func_comparison_lookup_finds_nested_report(tmp_path):
     assert r.stdout == str(nested / "comparison.json"), (r.stdout, r.stderr)
 
 
-def test_gate_snapshots_artifacts_before_cargo_rebuilds():
+def test_gate_snapshots_artifacts_before_cargo_rebuilds(tmp_path):
     """受測 CLI／daemon 須在 cargo build 後、cargo L1 列（--features test-fakes 會重建 target/debug）之前快照到 run
     目錄，黑箱與 verify 皆引用快照（第 12 輪實跑：引用 target/debug 使 verify 的 artifact sha256 不符）。"""
     text = (ROOT / "scripts/rust/p7_gate.sh").read_text(encoding="utf-8")
     assert 'RUST_D="$RUN/artifacts/serialwrapd"' in text and 'RUST_CLI="$RUN/artifacts/serialwrap"' in text
     build = text.index("cargo build --workspace --bins")
     assert 'TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"' in text
+    assert 'CARGO_TARGET_DIR="$TARGET_DIR" cargo build --workspace --bins' in text
+    assert 'CARGO_TARGET_DIR="$TARGET_DIR" cargo build --release -p sw-daemon -p sw-cli' in text
     snap = text.index('cp -p "$TARGET_DIR/debug/serialwrapd" "$RUST_D"')
     release = text.index("cargo build --release -p sw-daemon -p sw-cli --target x86_64-unknown-linux-gnu")
     release_snap = text.index('cp -p "$TARGET_DIR/x86_64-unknown-linux-gnu/release/serialwrapd" "$PRIOR_RELEASE_D"')
@@ -59,6 +62,59 @@ def test_gate_snapshots_artifacts_before_cargo_rebuilds():
     assert "--od59-contract" in text
     assert 'cp -p "$TARGET_DIR/debug/serialwrapd" "$RUST_D"' not in text[snap + 1:], \
         "debug artifact 快照之後不得再以 target/debug 的 daemon 取代 run 目錄快照"
+
+    # 真正執行 gate 使用的 cp 命令：舊 default target 留有二進位時，快照仍須取本輪 custom target SHA。
+    default_target = tmp_path / "default-target"
+    build_target = tmp_path / "candidate-target"
+    (default_target / "debug").mkdir(parents=True)
+    (build_target / "debug").mkdir(parents=True)
+    (default_target / "debug/serialwrapd").write_bytes(b"stale daemon")
+    (build_target / "debug/serialwrapd").write_bytes(b"new daemon from this build")
+    destination = tmp_path / "run/artifacts/serialwrapd"
+    destination.parent.mkdir(parents=True)
+    copy_line = next(line.strip() for line in text.splitlines()
+                     if line.strip() == 'cp -p "$TARGET_DIR/debug/serialwrapd" "$RUST_D"')
+    command = (f'TARGET_DIR={shlex.quote(str(build_target))}; RUST_D={shlex.quote(str(destination))}; '
+               f'{copy_line}')
+    copied = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=30)
+    assert copied.returncode == 0, copied.stderr
+    assert destination.read_bytes() == b"new daemon from this build"
+    assert destination.read_bytes() != (default_target / "debug/serialwrapd").read_bytes()
+
+    # 在不建置真實 cargo artifact 的隔離 fixture 內執行前置 build function，確認它恢復呼叫端目錄。
+    fixture_root = tmp_path / "prereqs-repo"
+    fixture_scripts = fixture_root / "scripts/rust"
+    fixture_scripts.mkdir(parents=True)
+    helper = ROOT / "scripts/rust/gate_prereqs.sh"
+    (fixture_scripts / "gate_prereqs.sh").write_text(helper.read_text(encoding="utf-8"), encoding="utf-8")
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    cargo_stub = fake_bin / "cargo"
+    cargo_stub.write_text(
+        "#!/usr/bin/env bash\nset -eu\ntarget=''\nwhile (($#)); do "
+        "if [[ $1 == --target ]]; then target=$2; shift 2; else shift; fi; done\n"
+        "mkdir -p \"$CARGO_TARGET_DIR/$target/debug\"; : >\"$CARGO_TARGET_DIR/$target/debug/serialwrap\"\n",
+        encoding="utf-8",
+    )
+    cargo_stub.chmod(0o755)
+    bundle_stub = fixture_scripts / "mkbundle.sh"
+    bundle_stub.write_text(
+        "#!/usr/bin/env bash\nset -eu\nout=''\nwhile (($#)); do "
+        "if [[ $1 == --out ]]; then out=$2; shift 2; else shift; fi; done\n"
+        "mkdir -p \"$out/bin\"; : >\"$out/bin/serialwrap\"\n",
+        encoding="utf-8",
+    )
+    bundle_stub.chmod(0o755)
+    caller_target = tmp_path / "caller-target"
+    env = os.environ.copy()
+    env["CARGO_TARGET_DIR"] = str(caller_target)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    shell = (f'source {shlex.quote(str(fixture_scripts / "gate_prereqs.sh"))} --dry-run >/dev/null; '
+             'sw_gate_prereqs_build >/dev/null; printf "%s" "$CARGO_TARGET_DIR"')
+    result = subprocess.run(["bash", "-c", shell], cwd=ROOT, env=env,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == str(caller_target), result.stdout
     ab_text = (ROOT / "scripts/rust/run_p7_ab.sh").read_text(encoding="utf-8")
     assert 'latency["samples_per_run"]' in ab_text and 'latency["repeats"]' in ab_text
     assert "P7_OD59_REQUIRE_CONTRACT=1" in ab_text and "od59-contract-a" in ab_text and "od59-contract-b" in ab_text

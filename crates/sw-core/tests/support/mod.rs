@@ -203,7 +203,11 @@ impl CoreHarness {
         let loaded = load_profiles(PROFILE_DIR, &fs).expect("測試 profile YAML 應可載入");
         assert_eq!(loaded.profiles.len(), 1, "targets 必須恰好一個");
         let profile = loaded.profiles.into_iter().next().expect("一個 target");
+        Self::new_with_profile(profile)
+    }
 
+    /// 以明確構造的 profile 建立 harness；只供需要覆蓋 loader 正常情況無法產生的防禦分支。
+    pub fn new_with_profile(profile: SessionProfile) -> CoreHarness {
         let clock = FakeClock::at(START_MONO_NS, START_WALL_US);
         let fence = Fence::new();
         let reg = CommandRegistry::new();
@@ -672,7 +676,10 @@ impl CoreHarness {
         }
         let mut pending = vec![item];
         while let Some(item) = pending.pop() {
-            let effects = self.core.on_event_with_custody(item, self.clock.mono_ns(), self.custody_observation.clone()).0;
+            let effects = self
+                .core
+                .on_event_with_custody(item, self.clock.mono_ns(), self.custody_observation.clone())
+                .0;
             for effect in effects {
                 // P6：記錄 console／human TX 效果；auto-complete 的結算排在本批之後投遞。
                 if let Some(ev) = self.record_p6(&effect) {
@@ -728,11 +735,18 @@ impl CoreHarness {
                         }
                         rest.push(Effect::SettleTx { epoch, op_id });
                     }
-                    Effect::ClaimByIdForRelease { by_id, release_deadline } => {
+                    Effect::ClaimByIdForRelease {
+                        by_id,
+                        release_deadline,
+                    } => {
                         // executor 的立即回饋：先於下一個 mailbox 事件處理（manager 的 `ManagerExec` 同序）。
-                        self.release_claim_requests.push((by_id.clone(), release_deadline));
+                        self.release_claim_requests
+                            .push((by_id.clone(), release_deadline));
                         let claims = std::mem::take(&mut self.next_release_claims);
-                        pending.push(MailboxItem::Control(ControlEvent::ReleaseClaimed { by_id, claims }));
+                        pending.push(MailboxItem::Control(ControlEvent::ReleaseClaimed {
+                            by_id,
+                            claims,
+                        }));
                     }
                     other => rest.push(other),
                 }
@@ -1296,7 +1310,9 @@ impl EffectExecutor for RigExec {
                     }
                 }
                 let refused = match self.pumps.get(&epoch) {
-                    Some(pump) => pump.try_submit(tag.clone(), permit.clone(), payload).is_err(),
+                    Some(pump) => pump
+                        .try_submit(tag.clone(), permit.clone(), payload)
+                        .is_err(),
                     None => true,
                 };
                 if refused {
@@ -1359,7 +1375,12 @@ impl ActorRig {
 
     /// P6 Task 9：附 ConsoleHub（PTY 替身工廠）的 actor rig。
     pub fn new_with_hub(profile_yaml: &str) -> ActorRig {
-        ActorRig::new_inner(profile_yaml, |_| {}, true, sw_core::capture::BackgroundIndex::new())
+        ActorRig::new_inner(
+            profile_yaml,
+            |_| {},
+            true,
+            sw_core::capture::BackgroundIndex::new(),
+        )
     }
 
     /// P6 Task 9：以 `SessionRequest::ConsoleAttach` 掛上 PTY 替身 console（executor 經 `ConsoleAdopt` 交給 hub）。
@@ -1393,7 +1414,12 @@ impl ActorRig {
 
     /// 同 `new`，但在 actor 啟動前可調整 `SessionCore`（Task 14：capture env、self-test 觀測注入）。
     pub fn new_with(profile_yaml: &str, setup: impl FnOnce(&mut SessionCore)) -> ActorRig {
-        ActorRig::new_inner(profile_yaml, setup, false, sw_core::capture::BackgroundIndex::new())
+        ActorRig::new_inner(
+            profile_yaml,
+            setup,
+            false,
+            sw_core::capture::BackgroundIndex::new(),
+        )
     }
 
     /// 同 `new_with`，並注入共用的 background capture 索引（審查 F28：全域上限）。
@@ -2030,7 +2056,11 @@ impl FsRead for RigFs {
 
 impl FsOps for RigFs {
     fn atomic_write(&self, p: &Path, data: &[u8], _mode: Option<u32>) -> PalResult<()> {
-        let hook = self.before_write.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let hook = self
+            .before_write
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some(hook) = hook {
             hook();
         }
@@ -2546,7 +2576,10 @@ impl ManagerRig {
     }
 
     /// 建構前令啟動存檔（建構子尾端第一次 state.json commit）以 `err` 失敗；回傳 manager 與其 serial 替身。
-    pub fn startup_commit_failure(yaml: &str, err: PalError) -> (Arc<SessionManager>, Arc<RigSerial>) {
+    pub fn startup_commit_failure(
+        yaml: &str,
+        err: PalError,
+    ) -> (Arc<SessionManager>, Arc<RigSerial>) {
         let serial = RigSerial::new();
         let _dev = serial.add_device("/dev/ttyOLD");
         let fs = RigFs::new();
@@ -3216,15 +3249,17 @@ impl CoreHarness {
     }
     /// ATTACHED 救援的 bridge 健康（running／serial_alive／vtty_alive）。
     pub fn set_bridge_health(&mut self, running: bool, serial_alive: bool, vtty_alive: bool) {
-        self.core.set_worker_health(Arc::new(move || sw_core::uart_bridge::WorkerSnapshot {
-            running,
-            serial_alive,
-        }));
-        self.core.set_self_test_probes(sw_core::self_test::SelfTestProbes {
-            holders: None,
-            vtty_alive: Some(Arc::new(move || Some(vtty_alive))),
-            ..Default::default()
-        });
+        self.core
+            .set_worker_health(Arc::new(move || sw_core::uart_bridge::WorkerSnapshot {
+                running,
+                serial_alive,
+            }));
+        self.core
+            .set_self_test_probes(sw_core::self_test::SelfTestProbes {
+                holders: None,
+                vtty_alive: Some(Arc::new(move || Some(vtty_alive))),
+                ..Default::default()
+            });
     }
     /// 該 console 目前的 `client_lifetime`。
     pub fn lifetime(&self, cid: &str) -> u64 {

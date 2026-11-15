@@ -82,7 +82,18 @@ fi
 mkdir -p "$RUN_DIR/logs" "$RUN_DIR/artifacts"
 # Cargo、pytest 與 importer 的所有可寫產物固定落在本 worktree 的 target/。
 export CARGO_TARGET_DIR="$ROOT/target"
-source "$ROOT/scripts/rust/gate_prereqs.sh" --gate
+DRIVER_TSV="$RUN_DIR/driver.tsv"
+OWNER_TSV="$RUN_DIR/owner-evidence.tsv"
+: >"$DRIVER_TSV"
+: >"$OWNER_TSV"
+if source "$ROOT/scripts/rust/gate_prereqs.sh" --gate >"$RUN_DIR/logs/gate-prereqs.log" 2>&1; then
+  :
+else
+  PREREQS_RC=$?
+  printf 'gate_prereqs\t%s\n' "$PREREQS_RC" >>"$DRIVER_TSV"
+  echo "slice24_exit.sh: gate_prereqs exit=$PREREQS_RC（$RUN_DIR/logs/gate-prereqs.log）" >&2
+  exit "$PREREQS_RC"
+fi
 
 # 先前切片 gate 證據複製進本輪目錄後才匯入，保留輸入來源且讓報告可追溯。
 PRIOR_CASE_ARGS=()
@@ -107,10 +118,6 @@ if [[ -n "$SLICE23_RUN" ]]; then
   PRIOR_CASE_ARGS+=(--slice23-run "$PRIOR_SLICE23")
 fi
 
-DRIVER_TSV="$RUN_DIR/driver.tsv"
-OWNER_TSV="$RUN_DIR/owner-evidence.tsv"
-: >"$DRIVER_TSV"
-: >"$OWNER_TSV"
 LAST_RC=0
 FAILURES=0
 

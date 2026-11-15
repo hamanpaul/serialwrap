@@ -1784,7 +1784,7 @@ entries:
     owner_phase: P0
   error_code:DEVICE_NOT_BOUND:
     nodeids:
-    - cargo:sw-core::session_manager::session_attach_paths
+    - cargo:sw-core::session_manager::device_not_bound_synthetic_profile_returns_device_not_bound
     owner_phase: P0
   error_code:DEVICE_NOT_FOUND:
     nodeids:
@@ -1800,7 +1800,7 @@ entries:
     owner_phase: P5
   error_code:DRAIN_STALLED:
     nodeids:
-    - cargo:sw-core::custody::test_dr1_d_release_not_enqueued_keeps_ledger_then_next_release_completes
+    - cargo:sw-core::drain_release_e2e::drain_timeout_marks_stalled_and_release_reports_drain_stalled
     owner_phase: P5
   error_code:ECHO_ACK_UNSUPPORTED:
     l1_only: true
@@ -1813,7 +1813,7 @@ entries:
     rust_only: true
   error_code:EMPTY_RESPONSE:
     nodeids:
-    - cargo:sw-cli::client_retry::empty_response
+    - cargo:sw-cli::client_retry::whitespace_line_empty
     owner_phase: P0
   error_code:ENV_FILE_SOURCE_FAILED:
     nodeids:
@@ -1821,7 +1821,7 @@ entries:
     owner_phase: P0
   error_code:EXCEPTION:
     nodeids:
-    - cargo:sw-core::capture_p7::log_responses_match_python_golden_bytes
+    - cargo:sw-daemon::framing::framing_byte_table
     owner_phase: P0
   error_code:EXPECT_REBOOT_MODE_UNSUPPORTED:
     nodeids:
@@ -1837,7 +1837,7 @@ entries:
     owner_phase: P5
   error_code:FLUSHED_BY_SHUTDOWN:
     nodeids:
-    - cargo:sw-core::admission::test_gate_frozen_total_truncates_to_queried_time_precisely
+    - cargo:sw-daemon::handoff_stop::handoff_frozen_rejects_mutating_methods
     owner_phase: P5
   error_code:FORCE_RECOVER_TIMEOUT:
     nodeids:
@@ -1913,7 +1913,7 @@ entries:
     owner_phase: P0
   error_code:METHOD_NOT_FOUND:
     nodeids:
-    - cargo:sw-cli::mgmt_legacy_handoff::legacy_b_python_script_under_versions_fails_closed
+    - cargo:sw-daemon::dispatch::unknown_method_not_found
     owner_phase: P0
   error_code:MOVE_FAILED:
     nodeids:
@@ -1973,7 +1973,7 @@ entries:
     owner_phase: P0
   error_code:REMOTE_NOT_SUPPORTED:
     nodeids:
-    - cargo:sw-cli::mgmt_connect::windows_connect_supported
+    - cargo:sw-cli::mgmt_daemon::start_endpoint_rejected_posix
     owner_phase: P4
   error_code:RULE_NOT_FOUND:
     nodeids:
@@ -1981,7 +1981,7 @@ entries:
     owner_phase: P0
   error_code:SAMPLE_READ_FAILED:
     nodeids:
-    - cargo:sw-proto::error_codes_sync::cli_codes_used_by_p3_exist_with_cli_interface
+    - cargo:sw-cli::profile_checks::sample_read_failure_returns_error_code_without_cli_failure
     owner_phase: P0
   error_code:SEND_FAILED:
     nodeids:
@@ -2055,7 +2055,7 @@ entries:
     owner_phase: P1
   error_code:TIMEOUT:
     nodeids:
-    - cargo:sw-cli::client_retry::backoff_caps_at_5s
+    - cargo:sw-cli::client_retry::etimedout_is_timeout
     owner_phase: P0
   error_code:TRANSFER_ECHO_STALL:
     nodeids:
@@ -2159,7 +2159,7 @@ entries:
     owner_phase: P0
   last_error:LOGIN_USER_REQUIRED:
     nodeids:
-    - cargo:sw-core::login_fsm_full::flood_reclassification_threshold_is_inclusive_20000
+    - cargo:sw-core::login_fsm_full::login_user_env_missing_does_not_fall_back_to_profile_username
     owner_phase: P0
   last_error:PASS_ENV_MISSING:
     nodeids:
@@ -2195,7 +2195,7 @@ entries:
     owner_phase: P0
   last_error:REBOOTING:
     nodeids:
-    - cargo:sw-core::command_exec::wp56_banner_then_prompt_restores_ready
+    - cargo:sw-core::session_core_lease::wp61_core_trusted_rpc_reboot_promotes_with_source
     owner_phase: P0
   last_error:REBOUND:
     nodeids:
@@ -2211,7 +2211,7 @@ entries:
     owner_phase: P0
   last_error:RELEASED:
     nodeids:
-    - cargo:sw-cli::mgmt_graceful_stop::graceful_handoff_process_scan_failure_is_not_released
+    - cargo:sw-core::drain_release_e2e::release_waits_for_receipt_and_aborts_partial_in_flight
     owner_phase: P0
   last_error:REPROBE_FAILED:*:
     nodeids:
@@ -2227,7 +2227,7 @@ entries:
     owner_phase: P0
   last_error:TRANSPORT_STALL:
     nodeids:
-    - cargo:sw-core::p7_skeleton::p7_public_items_are_reachable
+    - cargo:sw-core::transport_stall_wiring_p7::reprobe_zero_rx_after_30s_flips_to_transport_stall_once
     owner_phase: P0
   rpc_method:alias.assign:
     nodeids:

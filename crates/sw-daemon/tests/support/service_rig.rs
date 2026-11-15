@@ -13,7 +13,6 @@ use sw_core::session_manager::{ManagerDeps, SessionManager};
 use sw_core::state_store::{LoadedState, StateStore};
 use sw_core::wal::{WalConfig, WalWriter};
 use sw_daemon::service::{Service, ServiceDeps, TestAllowlist};
-use sw_pal::ConsoleKind;
 use sw_pal::fakes::clock::FakeClock;
 use sw_pal::fakes::env::FakeEnv;
 use sw_pal::fakes::proc::FakeProcScan;
@@ -23,7 +22,8 @@ use sw_pal::traits::{
     ConsoleTransportFactory, DeviceInfo, FsOps, FsRead, HolderReport, HolderScanStatus, PalError,
     PalErrorKind, PalResult, SerialBackend, UartExclusive,
 };
-use sw_proto::config_types::{ProfileFs, RuntimeConfig, SerialConsoleMap, load_profiles};
+use sw_pal::ConsoleKind;
+use sw_proto::config_types::{load_profiles, ProfileFs, RuntimeConfig, SerialConsoleMap};
 use sw_proto::pycompat::{PyErr, PyOsError};
 use sw_proto::pyjson::{self, PyDict, PyValue};
 use sw_proto::pypath::PathFlavor;
@@ -146,7 +146,11 @@ impl FsRead for RigFs {
 
 impl FsOps for RigFs {
     fn atomic_write(&self, p: &Path, data: &[u8], _mode: Option<u32>) -> PalResult<()> {
-        let hook = self.before_write.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let hook = self
+            .before_write
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some(hook) = hook {
             hook();
         }
@@ -244,12 +248,16 @@ impl ConsoleTransportFactory for RigPtyFactory {
         let io = sw_pal::fakes::console::FakeIo::unbounded();
         let r = io.reference();
         let pair = self.fake.pty_pair_from(io);
-        self.created.lock().unwrap().push((pair.slave_path.clone(), r));
+        self.created
+            .lock()
+            .unwrap()
+            .push((pair.slave_path.clone(), r));
         Ok(pair)
     }
     fn bind_tcp_console(&self) -> PalResult<Box<dyn sw_pal::console_pty::ConsoleListener>> {
         if self.native_tcp {
-            sw_pal::console_pty::NativeConsoleFactory::new(ConsoleKind::TcpTelnet).bind_tcp_console()
+            sw_pal::console_pty::NativeConsoleFactory::new(ConsoleKind::TcpTelnet)
+                .bind_tcp_console()
         } else {
             self.fake.bind_tcp_console()
         }
@@ -267,15 +275,24 @@ impl ConsoleTransportFactory for RigPtyFactory {
             self.fake.new_mux()
         }
     }
-    fn open_com0com_console(&self, port: &str) -> PalResult<Box<dyn sw_pal::console_pty::ConsoleIo>> {
+    fn open_com0com_console(
+        &self,
+        port: &str,
+    ) -> PalResult<Box<dyn sw_pal::console_pty::ConsoleIo>> {
         if self.native_com0com {
             let io = sw_pal::console_pty::NativeConsoleFactory::new(ConsoleKind::TcpTelnet)
                 .open_com0com_console(port)?;
-            self.opened_serial_consoles.lock().unwrap().push(port.to_string());
+            self.opened_serial_consoles
+                .lock()
+                .unwrap()
+                .push(port.to_string());
             Ok(io)
         } else if self.native_tcp {
             // 原生 TCP 測試只探測設定是否送到 factory；POSIX 沒有 com0com 埠，故模擬平台拒絕開啟。
-            self.opened_serial_consoles.lock().unwrap().push(port.to_string());
+            self.opened_serial_consoles
+                .lock()
+                .unwrap()
+                .push(port.to_string());
             Err(PalError::plain(
                 PalErrorKind::Unsupported,
                 "測試使用原生 TCP factory；POSIX 不提供 com0com",
@@ -494,6 +511,40 @@ impl ServiceRig {
         )
     }
 
+    /// Fake TCP hub 與 fake com0com，shell 假 DUT 可完成 force recover 的 reattach／READY 流程。
+    pub fn with_fake_tcp_console_and_serial_console_shell(
+        console_port: &str,
+        peer_port: &str,
+    ) -> ServiceRig {
+        let yaml = format!(
+            "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    ready_probe: \"echo __READY__${{nonce}}\"\n    timeout_s: 2.0\nwindows:\n  serial_console:\n    {BY_ID_A}: {{console_port: {console_port}, peer_port: {peer_port}}}\ntargets:\n{}",
+            target_line("COM0", BY_ID_A)
+        );
+        let map = RuntimeConfig::from_text(Some(&yaml))
+            .expect("測試 windows.serial_console YAML")
+            .windows_serial_console()
+            .expect("map 存在")
+            .expect("測試 windows.serial_console 結構正確");
+        let factory = Arc::new(RigPtyFactory {
+            fake: sw_pal::fakes::console::FakeConsoleFactory::new(ConsoleKind::TcpTelnet),
+            created: Mutex::new(Vec::new()),
+            native_tcp: false,
+            native_com0com: false,
+            serial_console: Some(map),
+            opened_serial_consoles: Mutex::new(Vec::new()),
+        });
+        ServiceRig::build_with_console(
+            RigSpec {
+                yaml,
+                devices: vec![(BY_ID_A.into(), REAL_A.into())],
+                explicit_target_count: 1,
+                allowlist: None,
+                wait_ready: vec!["COM0".into()],
+            },
+            Some(factory),
+        )
+    }
+
     fn with_native_tcp_console_config(
         serial_console: Option<SerialConsoleMap>,
         native_com0com: bool,
@@ -599,7 +650,9 @@ impl ServiceRig {
                 Some(f) => f.clone() as Arc<dyn ConsoleTransportFactory>,
                 None => Arc::new(RigConsole),
             },
-            windows_serial_console: console.as_ref().and_then(|factory| factory.serial_console.clone()),
+            windows_serial_console: console
+                .as_ref()
+                .and_then(|factory| factory.serial_console.clone()),
             caps,
             wal: wal.clone(),
             registry: registry.clone(),
@@ -921,7 +974,8 @@ impl RigFlashConsole {
 
     /// 之後的 `link` 一律回 `[Errno 20] Not a directory`（模擬端點目錄不可建立）。
     pub fn fail_link(&self) {
-        self.fail_link.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.fail_link
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn set_on_link(&self, f: Box<dyn Fn(&Path) + Send + Sync>) {
@@ -954,10 +1008,15 @@ impl ConsoleTransportFactory for RigFlashConsole {
         ConsoleKind::Pty
     }
     fn create_pty(&self) -> PalResult<sw_pal::PtyPair> {
-        let mut pair = self.fake.pty_pair_from(sw_pal::fakes::console::FakeIo::unbounded());
+        let mut pair = self
+            .fake
+            .pty_pair_from(sw_pal::fakes::console::FakeIo::unbounded());
         let (master, handle) = sw_pal::fakes::console::FakeConsoleIo::new();
         pair.master = Box::new(master);
-        self.masters.lock().unwrap_or_else(|e| e.into_inner()).push(handle);
+        self.masters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(handle);
         Ok(pair)
     }
     fn bind_tcp_console(&self) -> PalResult<Box<dyn sw_pal::console_pty::ConsoleListener>> {
@@ -980,19 +1039,30 @@ impl ConsoleTransportFactory for RigFlashConsole {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(link.to_path_buf(), slave_path.to_string());
-        if let Some(f) = self.on_link.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if let Some(f) = self
+            .on_link
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
             f(link);
         }
         Ok(())
     }
     fn unlink(&self, link: &Path) -> PalResult<()> {
-        self.links.lock().unwrap_or_else(|e| e.into_inner()).remove(link);
+        self.links
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(link);
         Ok(())
     }
     fn tty_setraw(&self, _slave: &sw_pal::console_pty::PtySlaveRef) -> PalResult<()> {
         Ok(())
     }
-    fn tcgetattr_speed(&self, _slave: &sw_pal::console_pty::PtySlaveRef) -> PalResult<sw_pal::console_pty::TermSpeed> {
+    fn tcgetattr_speed(
+        &self,
+        _slave: &sw_pal::console_pty::PtySlaveRef,
+    ) -> PalResult<sw_pal::console_pty::TermSpeed> {
         Err(PalError::plain(PalErrorKind::Io, "tcgetattr failed"))
     }
 }
@@ -1016,7 +1086,9 @@ impl ServiceRig {
     /// `Service::attach_flash` 掛上（與 daemon_main 同序：coordinator 先於 bootstrap attach 建立——RX observer 於 bridge
     /// 建立時取快照；端點於 bootstrap attach 之後才 start）。
     pub fn with_flash(setup: FlashSetup) -> ServiceRig {
-        use sw_core::flash_endpoint::{EndpointShutdown, FlashCoordinator, FlashEndpoint, ENDPOINT_GRACE};
+        use sw_core::flash_endpoint::{
+            EndpointShutdown, FlashCoordinator, FlashEndpoint, ENDPOINT_GRACE,
+        };
         use sw_core::mcu_patterns::McuPatternRegistry;
 
         let serial = FakeSerialBackend::new();
@@ -1093,9 +1165,13 @@ impl ServiceRig {
         }
         let mut caps = sw_pal::fakes::posix_caps();
         caps.flash_endpoint = setup.caps_flash;
-        let pal = sw_pal::fakes::platform().console(console.clone()).caps(caps).build();
-        let endpoint = FlashEndpoint::start(&pal, Path::new(FLASH_LINK), coord.clone(), ENDPOINT_GRACE)
-            .expect("FlashEndpoint::start");
+        let pal = sw_pal::fakes::platform()
+            .console(console.clone())
+            .caps(caps)
+            .build();
+        let endpoint =
+            FlashEndpoint::start(&pal, Path::new(FLASH_LINK), coord.clone(), ENDPOINT_GRACE)
+                .expect("FlashEndpoint::start");
         let svc = Arc::new(Service::new(ServiceDeps {
             manager: mgr.clone(),
             wal: wal.clone(),
@@ -1113,7 +1189,10 @@ impl ServiceRig {
         let state = sw_daemon::service::FlashState::new(coord.clone(), endpoint);
         assert!(svc.attach_flash(state.clone()), "attach_flash 第一次應成功");
         // P8 Task 14：flash sync-probe 與 RPC 分派共用 Service 的 admission 邊界（同 daemon_main 組裝）。
-        assert!(coord.set_admission(svc.admission().clone()), "set_admission 第一次應成功");
+        assert!(
+            coord.set_admission(svc.admission().clone()),
+            "set_admission 第一次應成功"
+        );
         let rig = ServiceRig {
             svc,
             mgr,

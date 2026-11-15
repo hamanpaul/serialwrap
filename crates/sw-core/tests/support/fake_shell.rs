@@ -67,15 +67,27 @@ impl ShellCaps {
         }
     }
     pub fn openssl_only() -> Self {
-        ShellCaps { base64: false, openssl: true, ..Self::busybox_base64() }
+        ShellCaps {
+            base64: false,
+            openssl: true,
+            ..Self::busybox_base64()
+        }
     }
     pub fn no_tools() -> Self {
-        ShellCaps { base64: false, openssl: false, ..Self::busybox_base64() }
+        ShellCaps {
+            base64: false,
+            openssl: false,
+            ..Self::busybox_base64()
+        }
     }
 }
 
 pub fn rej(reason: RejectReason, rejected_confirmed: usize) -> TxRejection {
-    TxRejection { reason, rejected_confirmed, unknown: false }
+    TxRejection {
+        reason,
+        rejected_confirmed,
+        unknown: false,
+    }
 }
 
 pub struct FakeShell {
@@ -139,7 +151,11 @@ impl FakeShell {
             let len = self.rx.chars().count();
             if len > max {
                 let cut = len - max;
-                let byte = self.rx.char_indices().nth(cut).map_or(self.rx.len(), |(i, _)| i);
+                let byte = self
+                    .rx
+                    .char_indices()
+                    .nth(cut)
+                    .map_or(self.rx.len(), |(i, _)| i);
                 self.rx.drain(..byte);
                 self.trimmed += cut as u64;
             }
@@ -147,9 +163,15 @@ impl FakeShell {
     }
 
     fn release(&mut self) {
-        let Some(n) = self.caps.release_per_wait else { return };
+        let Some(n) = self.caps.release_per_wait else {
+            return;
+        };
         let take = self.pending.chars().count().min(n);
-        let byte = self.pending.char_indices().nth(take).map_or(self.pending.len(), |(i, _)| i);
+        let byte = self
+            .pending
+            .char_indices()
+            .nth(take)
+            .map_or(self.pending.len(), |(i, _)| i);
         let part: String = self.pending.drain(..byte).collect();
         self.append_rx(&part);
     }
@@ -268,7 +290,9 @@ impl FakeShell {
 
     fn run_chunk(&mut self, rest: &str) -> String {
         let (payload, rest) = unquote_first(rest);
-        let Some(rest) = rest.trim_start().strip_prefix("| ") else { return "sh: syntax error\n".into() };
+        let Some(rest) = rest.trim_start().strip_prefix("| ") else {
+            return "sh: syntax error\n".into();
+        };
         let (tool, rest) = if let Some(r) = rest.strip_prefix("base64 -d ") {
             ("base64", r)
         } else if let Some(r) = rest.strip_prefix("openssl enc -base64 -d -A ") {
@@ -276,7 +300,11 @@ impl FakeShell {
         } else {
             return "sh: syntax error\n".into();
         };
-        let have = if tool == "base64" { self.caps.base64 } else { self.caps.openssl };
+        let have = if tool == "base64" {
+            self.caps.base64
+        } else {
+            self.caps.openssl
+        };
         let (op, rest) = unquote_first(rest);
         let (path, _) = unquote_first(rest.trim_start());
         let idx = self.chunk_seen;
@@ -310,14 +338,22 @@ impl FakeShell {
             return format!("{begin}sh: syntax error\n{fail}");
         };
         let (path, _) = unquote_first(rest);
-        let have = if tool == "base64" { self.caps.base64 } else { self.caps.openssl };
+        let have = if tool == "base64" {
+            self.caps.base64
+        } else {
+            self.caps.openssl
+        };
         if !have {
             return format!("{begin}sh: {tool}: not found\n{fail}");
         }
         let Some(data) = self.files.get(&path) else {
             return format!("{begin}sh: can't open '{path}': No such file or directory\n{fail}");
         };
-        let b64 = self.caps.pull_payload.clone().unwrap_or_else(|| t::b64encode(data));
+        let b64 = self
+            .caps
+            .pull_payload
+            .clone()
+            .unwrap_or_else(|| t::b64encode(data));
         let mut body = String::new();
         let chars: Vec<char> = b64.chars().collect();
         for line in chars.chunks(wrap) {
@@ -359,7 +395,12 @@ fn unquote_first(s: &str) -> (String, &str) {
 }
 
 impl TransferPort for FakeShell {
-    fn send_command(&mut self, cmd: &str, _source: &str, cmd_id: Option<&str>) -> Result<(), TransferAbort> {
+    fn send_command(
+        &mut self,
+        cmd: &str,
+        _source: &str,
+        cmd_id: Option<&str>,
+    ) -> Result<(), TransferAbort> {
         self.check_reject()?;
         self.raw_tx.push(format!("{cmd}\n").into_bytes());
         self.execute(cmd, cmd_id);
@@ -393,15 +434,24 @@ impl TransferPort for FakeShell {
                     acked += len;
                 } else {
                     let echoed: String = cmd.chars().take(acked).collect();
-                    self.raw_tx.push(cmd.chars().take(sent).collect::<String>().into_bytes());
+                    self.raw_tx
+                        .push(cmd.chars().take(sent).collect::<String>().into_bytes());
                     self.append_rx(&echoed);
-                    return Ok(EchoPaced { ok: false, acked_chars: acked, sent_chars: sent });
+                    return Ok(EchoPaced {
+                        ok: false,
+                        acked_chars: acked,
+                        sent_chars: sent,
+                    });
                 }
             }
         }
         self.raw_tx.push(format!("{cmd}\n").into_bytes());
         self.execute(cmd, cmd_id);
-        Ok(EchoPaced { ok: true, acked_chars: total, sent_chars: total })
+        Ok(EchoPaced {
+            ok: true,
+            acked_chars: total,
+            sent_chars: total,
+        })
     }
 
     fn cancel_input_line(&mut self, _source: &str) -> Result<(), TransferAbort> {
@@ -420,11 +470,20 @@ impl TransferPort for FakeShell {
             return self.rx.clone();
         }
         let rel = (from_offset - self.trimmed) as usize;
-        let byte = self.rx.char_indices().nth(rel).map_or(self.rx.len(), |(i, _)| i);
+        let byte = self
+            .rx
+            .char_indices()
+            .nth(rel)
+            .map_or(self.rx.len(), |(i, _)| i);
         self.rx[byte..].to_string()
     }
 
-    fn wait_for_regex_from(&mut self, re: &PyRegex, from_offset: u64, timeout: Duration) -> Result<bool, TransferAbort> {
+    fn wait_for_regex_from(
+        &mut self,
+        re: &PyRegex,
+        from_offset: u64,
+        timeout: Duration,
+    ) -> Result<bool, TransferAbort> {
         self.wait_calls += 1;
         if timeout.is_zero() {
             return Ok(false);
@@ -442,11 +501,17 @@ pub struct MemFiles {
 
 impl MemFiles {
     pub fn empty() -> Self {
-        MemFiles { inner: Mutex::new(BTreeMap::new()), fail_write: Mutex::new(vec![]) }
+        MemFiles {
+            inner: Mutex::new(BTreeMap::new()),
+            fail_write: Mutex::new(vec![]),
+        }
     }
     pub fn with(path: &str, data: &[u8]) -> Self {
         let f = Self::empty();
-        f.inner.lock().unwrap().insert(path.to_string(), data.to_vec());
+        f.inner
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), data.to_vec());
         f
     }
     pub fn get(&self, path: &str) -> Option<Vec<u8>> {
@@ -462,13 +527,17 @@ impl LocalFiles for MemFiles {
         self.inner.lock().unwrap().contains_key(path)
     }
     fn read_all(&self, path: &str) -> Result<Vec<u8>, String> {
-        self.get(path).ok_or_else(|| format!("[Errno 2] No such file or directory: '{path}'"))
+        self.get(path)
+            .ok_or_else(|| format!("[Errno 2] No such file or directory: '{path}'"))
     }
     fn write_truncate(&self, path: &str, data: &[u8]) -> Result<(), String> {
         if self.fail_write.lock().unwrap().iter().any(|p| p == path) {
             return Err(format!("[Errno 13] Permission denied: '{path}'"));
         }
-        self.inner.lock().unwrap().insert(path.to_string(), data.to_vec());
+        self.inner
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), data.to_vec());
         Ok(())
     }
 }
@@ -479,7 +548,9 @@ pub struct FixedIds {
 
 impl FixedIds {
     pub fn new(ids: &[&str]) -> Self {
-        FixedIds { queue: ids.iter().map(|s| s.to_string()).collect() }
+        FixedIds {
+            queue: ids.iter().map(|s| s.to_string()).collect(),
+        }
     }
 }
 

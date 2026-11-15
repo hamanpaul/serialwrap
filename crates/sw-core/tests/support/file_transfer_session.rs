@@ -110,7 +110,10 @@ impl ShellPeer {
 
     /// 含 `needle` 的完整輸入行數。
     pub fn lines_containing(&self, needle: &str) -> usize {
-        self.dut_lines().iter().filter(|l| l.contains(needle)).count()
+        self.dut_lines()
+            .iter()
+            .filter(|l| l.contains(needle))
+            .count()
     }
 
     /// 處理到 DUT 收到的第 `n` 個 byte（自 peer 啟動起算）時停住。
@@ -132,7 +135,8 @@ impl ShellPeer {
     /// 是否已停在 hold 點且 DUT 還有後續 bytes 送達（傳輸確實卡在 peer）。
     pub fn holding_with_input(&self) -> bool {
         let st = self.state.lock().unwrap();
-        st.hold_at.is_some_and(|h| st.processed >= h && st.received.len() > st.processed)
+        st.hold_at
+            .is_some_and(|h| st.processed >= h && st.received.len() > st.processed)
     }
 
     /// 是否已處理到 hold 點（之後不一定有新 bytes）。`hold_at_line` 的條件在處理下一個 byte 時才檢查，
@@ -140,7 +144,9 @@ impl ShellPeer {
     pub fn reached_hold(&self) -> bool {
         let st = self.state.lock().unwrap();
         st.hold_at.is_some_and(|h| st.processed >= h)
-            || st.hold_line.is_some_and(|(n, col)| st.lines.len() >= n && st.line.len() >= col)
+            || st
+                .hold_line
+                .is_some_and(|(n, col)| st.lines.len() >= n && st.line.len() >= col)
     }
 
     /// 解除 hold，補處理暫存的 bytes。
@@ -162,7 +168,11 @@ impl ShellPeer {
 
     /// 在下一行命令輸出之前插入 `bytes`。
     pub fn inject_before_next_output(&self, bytes: &[u8]) {
-        self.state.lock().unwrap().pending_inject.extend_from_slice(bytes);
+        self.state
+            .lock()
+            .unwrap()
+            .pending_inject
+            .extend_from_slice(bytes);
     }
 
     /// DUT 虛擬檔案系統中的檔案內容。
@@ -309,14 +319,22 @@ impl XferRig {
     pub fn ready(profile_yaml: &str, caps: ShellCaps) -> XferRig {
         let rig = ActorRig::new(profile_yaml).ready();
         let peer = ShellPeer::start(&rig.dev, caps);
-        XferRig { rig, peer, tmp: TempDir::new("rig") }
+        XferRig {
+            rig,
+            peer,
+            tmp: TempDir::new("rig"),
+        }
     }
 
     /// 同 [`XferRig::ready`]，但 actor 附 ConsoleHub（PTY 替身 console；human raw ownership 測試用）。
     pub fn ready_with_hub(profile_yaml: &str, caps: ShellCaps) -> XferRig {
         let rig = ActorRig::new_with_hub(profile_yaml).ready();
         let peer = ShellPeer::start(&rig.dev, caps);
-        XferRig { rig, peer, tmp: TempDir::new("hub") }
+        XferRig {
+            rig,
+            peer,
+            tmp: TempDir::new("hub"),
+        }
     }
 
     /// 送出 FileTransfer 請求並等回覆（`Err` 為 framing `EXCEPTION`）。
@@ -357,7 +375,9 @@ impl XferRig {
 
     /// 等 peer 停在 hold 點且後續 bytes 已送達（傳輸確實卡住）。
     pub fn wait_peer_holding(&self) {
-        wait_real("peer 停在 hold 點且有後續輸入", || self.peer.holding_with_input());
+        wait_real("peer 停在 hold 點且有後續輸入", || {
+            self.peer.holding_with_input()
+        });
     }
 
     /// 等 peer 處理到 hold 點。
@@ -378,7 +398,12 @@ impl XferRig {
             .wal_rows()
             .into_iter()
             .filter(|r| r.get("dir").and_then(PyValue::as_str) == Some("TX"))
-            .map(|r| r.get("cmd_id").and_then(PyValue::as_str).unwrap_or("").to_string())
+            .map(|r| {
+                r.get("cmd_id")
+                    .and_then(PyValue::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            })
             .collect()
     }
 }
@@ -399,7 +424,9 @@ pub fn keys(d: &PyDict) -> Vec<String> {
 
 /// 回應的 `error_code`。
 pub fn code(d: &PyDict) -> Option<String> {
-    d.get("error_code").and_then(PyValue::as_str).map(str::to_string)
+    d.get("error_code")
+        .and_then(PyValue::as_str)
+        .map(str::to_string)
 }
 
 /// 整數欄位。

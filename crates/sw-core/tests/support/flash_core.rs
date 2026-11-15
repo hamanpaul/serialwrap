@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::bounded;
 use sw_core::mailbox::ControlEvent;
-use sw_core::session_core::{Effect, FlashReject, ProbeGrant, ProbeId, SessionRequest, SessionState};
+use sw_core::session_core::{
+    Effect, FlashReject, ProbeGrant, ProbeId, SessionRequest, SessionState,
+};
 use sw_core::tx_writer::{FlashMode, OpId, TxClass, TxJob, TxPermit, TxReport};
 use sw_proto::pyjson::{loads, PyDict, PyValue};
 
@@ -25,7 +27,10 @@ fn dir_of(row: &PyDict) -> Option<&str> {
 
 /// WAL 列的 payload（base64 解碼）。
 pub fn payload_of(row: &PyDict) -> Vec<u8> {
-    let b64 = row.get("payload_b64").and_then(PyValue::as_str).unwrap_or("");
+    let b64 = row
+        .get("payload_b64")
+        .and_then(PyValue::as_str)
+        .unwrap_or("");
     b64_decode(b64)
 }
 
@@ -64,7 +69,9 @@ fn parse_wal(bytes: &[u8]) -> Vec<PyDict> {
 
 /// 回應的 `error_code`。
 pub fn code(r: &PyDict) -> Option<String> {
-    r.get("error_code").and_then(PyValue::as_str).map(str::to_string)
+    r.get("error_code")
+        .and_then(PyValue::as_str)
+        .map(str::to_string)
 }
 
 /// 回應的鍵序（RPC 線路不排序，Python 鍵序即契約）。
@@ -115,7 +122,11 @@ pub mod kit {
     pub fn attached_passthrough() -> CoreHarness {
         let mut h = CoreHarness::new(PASSTHROUGH_PROFILE);
         h.to_attached(None);
-        assert_eq!(h.fake_device.tx_len(), 0, "passthrough explicit target attach 零 TX");
+        assert_eq!(
+            h.fake_device.tx_len(),
+            0,
+            "passthrough explicit target attach 零 TX"
+        );
         h
     }
 
@@ -123,7 +134,11 @@ pub mod kit {
     pub fn ready_passthrough() -> CoreHarness {
         let mut h = attached_passthrough();
         h.advance(Duration::from_secs(31));
-        assert_eq!(h.core.state(), SessionState::Ready, "passthrough 30 s 安靜應升 READY");
+        assert_eq!(
+            h.core.state(),
+            SessionState::Ready,
+            "passthrough 30 s 安靜應升 READY"
+        );
         h
     }
 
@@ -134,10 +149,19 @@ pub mod kit {
         h
     }
 
-    pub fn probe_start_fx(h: &mut CoreHarness, id: ProbeId) -> (Result<ProbeGrant, FlashReject>, Vec<Effect>) {
+    pub fn probe_start_fx(
+        h: &mut CoreHarness,
+        id: ProbeId,
+    ) -> (Result<ProbeGrant, FlashReject>, Vec<Effect>) {
         let (tx, rx) = bounded(1);
-        let fx = h.feed(ControlEvent::FlashSyncProbeStart { probe_id: id, reply: tx });
-        (rx.try_recv().expect("FlashSyncProbeStart 應於同一事件回覆"), fx)
+        let fx = h.feed(ControlEvent::FlashSyncProbeStart {
+            probe_id: id,
+            reply: tx,
+        });
+        (
+            rx.try_recv().expect("FlashSyncProbeStart 應於同一事件回覆"),
+            fx,
+        )
     }
 
     pub fn probe_start(h: &mut CoreHarness, id: ProbeId) -> Result<ProbeGrant, FlashReject> {
@@ -146,8 +170,14 @@ pub mod kit {
 
     pub fn matched_fx(h: &mut CoreHarness, id: ProbeId) -> (Result<(), FlashReject>, Vec<Effect>) {
         let (tx, rx) = bounded(1);
-        let fx = h.feed(ControlEvent::FlashSyncMatched { probe_id: id, reply: tx });
-        (rx.try_recv().expect("FlashSyncMatched 應於同一事件回覆"), fx)
+        let fx = h.feed(ControlEvent::FlashSyncMatched {
+            probe_id: id,
+            reply: tx,
+        });
+        (
+            rx.try_recv().expect("FlashSyncMatched 應於同一事件回覆"),
+            fx,
+        )
     }
 
     pub fn matched(h: &mut CoreHarness, id: ProbeId) -> Result<(), FlashReject> {
@@ -160,8 +190,12 @@ pub mod kit {
 
     pub fn holder_gone(h: &mut CoreHarness, id: ProbeId) -> Vec<Effect> {
         let (tx, rx) = bounded(1);
-        let fx = h.feed(ControlEvent::FlashHolderGone { probe_id: id, reply: tx });
-        rx.try_recv().expect("FlashHolderGone 應於同一事件回覆（含舊 probe 的遲到事件）");
+        let fx = h.feed(ControlEvent::FlashHolderGone {
+            probe_id: id,
+            reply: tx,
+        });
+        rx.try_recv()
+            .expect("FlashHolderGone 應於同一事件回覆（含舊 probe 的遲到事件）");
         fx
     }
 
@@ -216,7 +250,10 @@ pub mod kit {
     }
 
     pub fn last_error(h: &CoreHarness) -> Option<String> {
-        h.public().get("last_error").and_then(PyValue::as_str).map(str::to_string)
+        h.public()
+            .get("last_error")
+            .and_then(PyValue::as_str)
+            .map(str::to_string)
     }
 
     /// 經真 IoWorker reader 注入 RX（WAL RX 寫入後才投遞 data lane）並送進 core。
@@ -232,7 +269,12 @@ pub mod kit {
     }
 
     /// 以指定 `input_epoch` 投遞 console 輸入（模擬 probe 前已排入 data lane、之後才處理的事件）。
-    pub fn console_input_with_epoch(h: &mut CoreHarness, cid: &str, epoch: u64, bytes: &[u8]) -> Vec<Effect> {
+    pub fn console_input_with_epoch(
+        h: &mut CoreHarness,
+        cid: &str,
+        epoch: u64,
+        bytes: &[u8],
+    ) -> Vec<Effect> {
         let lifetime = h.lifetime(cid);
         h.data(DataEvent::ConsoleInputBytes {
             client_id: cid.into(),
@@ -243,7 +285,10 @@ pub mod kit {
     }
 
     pub fn release_req() -> SessionRequest {
-        SessionRequest::Release { source: "cli".into(), reason: PyValue::Null }
+        SessionRequest::Release {
+            source: "cli".into(),
+            reason: PyValue::Null,
+        }
     }
 
     /// release 走完 drain 回條到 RELEASED。
@@ -278,7 +323,11 @@ pub mod bb {
         };
         let rig = rig.attach();
         rig.wait_state("ATTACHED");
-        assert_eq!(rig.dev.tx_len(), 0, "passthrough explicit target attach 零 TX");
+        assert_eq!(
+            rig.dev.tx_len(),
+            0,
+            "passthrough explicit target attach 零 TX"
+        );
         rig
     }
 
@@ -292,13 +341,19 @@ pub mod bb {
 
     pub fn probe_start(rig: &ActorRig, id: ProbeId) -> Result<ProbeGrant, FlashReject> {
         let (tx, rx) = bounded(1);
-        rig.send_control(ControlEvent::FlashSyncProbeStart { probe_id: id, reply: tx });
+        rig.send_control(ControlEvent::FlashSyncProbeStart {
+            probe_id: id,
+            reply: tx,
+        });
         rx.recv_timeout(WAIT).expect("FlashSyncProbeStart 回覆")
     }
 
     pub fn matched(rig: &ActorRig, id: ProbeId) -> Result<(), FlashReject> {
         let (tx, rx) = bounded(1);
-        rig.send_control(ControlEvent::FlashSyncMatched { probe_id: id, reply: tx });
+        rig.send_control(ControlEvent::FlashSyncMatched {
+            probe_id: id,
+            reply: tx,
+        });
         rx.recv_timeout(WAIT).expect("FlashSyncMatched 回覆")
     }
 
@@ -310,7 +365,10 @@ pub mod bb {
 
     pub fn holder_gone(rig: &ActorRig, id: ProbeId) {
         let (tx, rx) = bounded(1);
-        rig.send_control(ControlEvent::FlashHolderGone { probe_id: id, reply: tx });
+        rig.send_control(ControlEvent::FlashHolderGone {
+            probe_id: id,
+            reply: tx,
+        });
         rx.recv_timeout(WAIT).expect("FlashHolderGone 回覆");
     }
 
@@ -324,7 +382,13 @@ pub mod bb {
     }
 
     /// 以測試替身 coordinator 身分經現行 bridge 的 TxWriter 送一筆 TX（`source`＝"flash"）。
-    pub fn tx(rig: &ActorRig, epoch: u64, class: TxClass, probe_id: Option<u64>, payload: &[u8]) -> TxReport {
+    pub fn tx(
+        rig: &ActorRig,
+        epoch: u64,
+        class: TxClass,
+        probe_id: Option<u64>,
+        payload: &[u8],
+    ) -> TxReport {
         let (reply, rx) = bounded(1);
         let op = NEXT_OP.fetch_add(1, Ordering::SeqCst);
         rig.tx_handle()
@@ -356,7 +420,11 @@ pub mod bb {
     }
 
     pub fn state(rig: &ActorRig) -> String {
-        rig.get_state().get("state").and_then(PyValue::as_str).unwrap_or("").to_string()
+        rig.get_state()
+            .get("state")
+            .and_then(PyValue::as_str)
+            .unwrap_or("")
+            .to_string()
     }
 
     /// WAL TX 列（source, payload）。
@@ -366,7 +434,10 @@ pub mod bb {
             .filter(|r| dir_of(r) == Some("TX"))
             .map(|r| {
                 (
-                    r.get("source").and_then(PyValue::as_str).unwrap_or("").to_string(),
+                    r.get("source")
+                        .and_then(PyValue::as_str)
+                        .unwrap_or("")
+                        .to_string(),
                     payload_of(r),
                 )
             })
@@ -412,7 +483,10 @@ pub mod bb {
             if got.windows(want.len()).any(|w| w == want) {
                 return;
             }
-            assert!(Instant::now() < deadline, "DUT 未收到 {want:?}（實際 {got:?}）");
+            assert!(
+                Instant::now() < deadline,
+                "DUT 未收到 {want:?}（實際 {got:?}）"
+            );
             std::thread::sleep(Duration::from_millis(2));
         }
     }

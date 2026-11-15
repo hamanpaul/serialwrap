@@ -40,7 +40,10 @@ pub fn release(rig: &ActorRig, reason: &str) -> PyDict {
 
 /// 送出 `device.attach`（`force` 只略過開檔前預檢）並等回覆字典。
 pub fn device_attach(rig: &ActorRig, force: bool) -> PyDict {
-    recv(&rig.request_async(SessionRequest::DeviceAttach { force }), "device.attach")
+    recv(
+        &rig.request_async(SessionRequest::DeviceAttach { force }),
+        "device.attach",
+    )
 }
 
 /// 收回覆（逾時或 `Err` 即 panic）。
@@ -84,19 +87,31 @@ pub fn wait_tx_in_flight(rig: &ActorRig, base: usize) {
 pub fn assert_dut_silent(rig: &ActorRig, from: usize, window: Duration, what: &str) {
     let until = Instant::now() + window;
     while Instant::now() < until {
-        assert_eq!(rig.dev.tx_len(), from, "{what}：DUT 端零新增 bytes（實際 {:?}）", rig.dev.tx_since(from));
+        assert_eq!(
+            rig.dev.tx_len(),
+            from,
+            "{what}：DUT 端零新增 bytes（實際 {:?}）",
+            rig.dev.tx_since(from)
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     let _ = rig.get_state();
-    assert_eq!(rig.dev.tx_len(), from, "{what}：DUT 端零新增 bytes（實際 {:?}）", rig.dev.tx_since(from));
+    assert_eq!(
+        rig.dev.tx_len(),
+        from,
+        "{what}：DUT 端零新增 bytes（實際 {:?}）",
+        rig.dev.tx_since(from)
+    );
 }
 
 /// 讓 file push 停在 chunk 迴圈（chunk 0 完成、chunk 1 卡在第一個 echo slice）；回傳 push 的回覆接收端。
 pub fn push_held_in_chunk_loop(x: &XferRig) -> Receiver<Result<PyDict, PyErr>> {
     let data: Vec<u8> = (0..1536u32).map(|i| (i * 7 % 251) as u8).collect();
     let local = x.tmp.write("handoff.bin", &data);
-    x.peer
-        .hold_at_line(2, sw_core::file_transfer::templates::DEFAULT_ECHO_SLICE_SIZE);
+    x.peer.hold_at_line(
+        2,
+        sw_core::file_transfer::templates::DEFAULT_ECHO_SLICE_SIZE,
+    );
     let rx = x.transfer_async(push_req(&local, "/tmp/handoff.bin"));
     x.wait_peer_reached_hold();
     rx

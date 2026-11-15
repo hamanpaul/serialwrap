@@ -25,7 +25,9 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Receiver;
 use sw_core::arbiter::CommandRegistry;
 use sw_core::flash_endpoint::coordinator::FlashEventRecord;
-use sw_core::flash_endpoint::{EndpointShutdown, EndpointStopReceipt, FlashCoordinator, FlashEndpoint, ENDPOINT_GRACE};
+use sw_core::flash_endpoint::{
+    EndpointShutdown, EndpointStopReceipt, FlashCoordinator, FlashEndpoint, ENDPOINT_GRACE,
+};
 use sw_core::mcu_patterns::McuPatternRegistry;
 use sw_core::session_manager::{FlashCandidate, ManagerDeps, SessionManager};
 use sw_core::state_store::{LoadedState, StateStore};
@@ -33,15 +35,17 @@ use sw_core::tx_writer::{Fence, FlashMode};
 use sw_core::uart_bridge::RxObserver;
 use sw_core::wal::{WalConfig, WalWriter};
 use sw_pal::console_mux::MuxHandle;
-use sw_pal::console_pty::{ConsoleIo, ConsoleTransportFactory, ConsoleWriteHalf, PtyPair, Readiness, TermSpeed};
+use sw_pal::console_pty::{
+    ConsoleIo, ConsoleTransportFactory, ConsoleWriteHalf, PtyPair, Readiness, TermSpeed,
+};
 use sw_pal::fakes::clock::FakeClock;
 use sw_pal::fakes::console::{FakeConsoleFactory, FakeConsoleIo, FakeIo};
 use sw_pal::fakes::env::FakeEnv;
 use sw_pal::fakes::serial::{FakeDevice, FakeLineControl, FakeSerialBackend};
 use sw_pal::fakes::wal_fs::FakeWalFs;
 use sw_pal::traits::{
-    Clock, DeviceInfo, HolderReport, HolderScanStatus, IoWaker, PalError, PalErrorKind, PalResult, ReadOutcome,
-    UartExclusive,
+    Clock, DeviceInfo, HolderReport, HolderScanStatus, IoWaker, PalError, PalErrorKind, PalResult,
+    ReadOutcome, UartExclusive,
 };
 use sw_pal::ConsoleKind;
 use sw_proto::config_types::{load_profiles, ProfileFs};
@@ -156,7 +160,11 @@ impl Clock for RigClock {
         self.unregister(id);
     }
 
-    fn wait_until_or_cancel(&self, deadline_ns: u64, cancel: &crossbeam_channel::Receiver<()>) -> bool {
+    fn wait_until_or_cancel(
+        &self,
+        deadline_ns: u64,
+        cancel: &crossbeam_channel::Receiver<()>,
+    ) -> bool {
         let id = self.register(deadline_ns);
         let r = self.inner.wait_until_or_cancel(deadline_ns, cancel);
         self.unregister(id);
@@ -201,7 +209,10 @@ impl MasterShared {
         let mut st = lock(&self.st);
         st.write_attempts += 1;
         if st.closed {
-            return Err(PalError::plain(PalErrorKind::BrokenPipe, "[Errno 32] Broken pipe"));
+            return Err(PalError::plain(
+                PalErrorKind::BrokenPipe,
+                "[Errno 32] Broken pipe",
+            ));
         }
         if st.zero_writes || data.is_empty() {
             return Ok(0);
@@ -223,20 +234,35 @@ struct RigMaster {
 }
 
 impl RigMaster {
-    fn wait(&self, timeout: Option<Duration>, consume: bool, buf: &mut [u8]) -> PalResult<Result<ReadOutcome, Readiness>> {
+    fn wait(
+        &self,
+        timeout: Option<Duration>,
+        consume: bool,
+        buf: &mut [u8],
+    ) -> PalResult<Result<ReadOutcome, Readiness>> {
         let deadline = timeout.map(|t| Instant::now() + t);
         let mut st = lock(&self.sh.st);
         loop {
             if !consume && st.fail_wait {
-                return Err(PalError::plain(PalErrorKind::Io, "[Errno 9] Bad file descriptor"));
+                return Err(PalError::plain(
+                    PalErrorKind::Io,
+                    "[Errno 9] Bad file descriptor",
+                ));
             }
             if st.woken {
                 st.woken = false;
-                return Ok(if consume { Ok(ReadOutcome::Woken) } else { Err(Readiness::Woken) });
+                return Ok(if consume {
+                    Ok(ReadOutcome::Woken)
+                } else {
+                    Err(Readiness::Woken)
+                });
             }
             if consume && st.fail_next_read {
                 st.fail_next_read = false;
-                return Err(PalError::plain(PalErrorKind::Io, "[Errno 5] Input/output error"));
+                return Err(PalError::plain(
+                    PalErrorKind::Io,
+                    "[Errno 5] Input/output error",
+                ));
             }
             if !st.input.is_empty() {
                 if !consume {
@@ -260,9 +286,18 @@ impl RigMaster {
                 Some(d) => {
                     let now = Instant::now();
                     if now >= d {
-                        return Ok(if consume { Ok(ReadOutcome::TimedOut) } else { Err(Readiness::TimedOut) });
+                        return Ok(if consume {
+                            Ok(ReadOutcome::TimedOut)
+                        } else {
+                            Err(Readiness::TimedOut)
+                        });
                     }
-                    st = self.sh.cv.wait_timeout(st, d - now).unwrap_or_else(|e| e.into_inner()).0;
+                    st = self
+                        .sh
+                        .cv
+                        .wait_timeout(st, d - now)
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
                 }
             }
         }
@@ -477,17 +512,30 @@ pub struct Mcu {
 impl Mcu {
     /// 收到 `55 55` 回 `00 cc`；同步後每個封包（首 byte＝總長）回 `00 cc`；封包邊界再見 `55 55` 視為重新同步。
     pub fn ti_sbl() -> Mcu {
-        Mcu { sync_reply: Some(ACK.to_vec()), packet_ack: true, delay: Duration::ZERO, flood: 0 }
+        Mcu {
+            sync_reply: Some(ACK.to_vec()),
+            packet_ack: true,
+            delay: Duration::ZERO,
+            flood: 0,
+        }
     }
 
     /// 永不回應。
     pub fn silent() -> Mcu {
-        Mcu { sync_reply: None, packet_ack: false, delay: Duration::ZERO, flood: 0 }
+        Mcu {
+            sync_reply: None,
+            packet_ack: false,
+            delay: Duration::ZERO,
+            flood: 0,
+        }
     }
 
     /// 收到 sync 回 `reply`（其餘同 `ti_sbl`）。
     pub fn replying(reply: &[u8]) -> Mcu {
-        Mcu { sync_reply: Some(reply.to_vec()), ..Mcu::ti_sbl() }
+        Mcu {
+            sync_reply: Some(reply.to_vec()),
+            ..Mcu::ti_sbl()
+        }
     }
 
     /// sync 回應延遲 `d`（coordinator Clock 的時間）。
@@ -605,7 +653,9 @@ impl McuBank {
     fn quiescent(&self, seen: &SeenCounter) -> bool {
         let now = self.clock.now();
         lock(&self.devs).iter().all(|d| {
-            d.processed == d.dev.tx_len() && d.delayed.iter().all(|(due, _)| *due > now) && seen.get(&d.com) == d.pushed
+            d.processed == d.dev.tx_len()
+                && d.delayed.iter().all(|(due, _)| *due > now)
+                && seen.get(&d.com) == d.pushed
         })
     }
 }
@@ -792,7 +842,11 @@ impl FlashRig {
     /// 登記一條 passthrough explicit target（attach 零 TX、停在 ATTACHED）與其 MCU 行為。
     pub fn add_passthrough(&self, com: &str, by_id: &str, mcu: Mcu) {
         assert!(self.started.get().is_none(), "rig 已啟動，不能再加 target");
-        lock(&self.targets).push(Target { com: com.into(), by_id: by_id.into(), mcu });
+        lock(&self.targets).push(Target {
+            com: com.into(),
+            by_id: by_id.into(),
+            mcu,
+        });
     }
 
     fn s(&self) -> &Started {
@@ -814,19 +868,29 @@ impl FlashRig {
                 ));
             }
         }
-        let load = load_profiles(PROFILE_DIR, &MemProfiles { yaml }).expect("flash rig YAML 應可載入");
+        let load =
+            load_profiles(PROFILE_DIR, &MemProfiles { yaml }).expect("flash rig YAML 應可載入");
         let serial = FakeSerialBackend::new();
         let mut devs = HashMap::new();
         let mut snapshot = Vec::new();
         for t in &targets {
             let real = format!("/fake/tty-{}", t.com);
             devs.insert(t.com.clone(), serial.add_device(&real));
-            snapshot.push((t.by_id.clone(), DeviceInfo { by_id: t.by_id.clone(), real_path: real }));
+            snapshot.push((
+                t.by_id.clone(),
+                DeviceInfo {
+                    by_id: t.by_id.clone(),
+                    real_path: real,
+                },
+            ));
         }
         let mclock = FakeClock::new();
         let wfs = FakeWalFs::new();
         let wal = Arc::new(WalWriter::open(
-            WalConfig { dir: PathBuf::from(WAL_DIR), rotate_bytes: 67_108_864 },
+            WalConfig {
+                dir: PathBuf::from(WAL_DIR),
+                rotate_bytes: 67_108_864,
+            },
             wfs.clone(),
             mclock.clone(),
         ));
@@ -865,7 +929,9 @@ impl FlashRig {
         mgr.bootstrap_attach();
         for t in &targets {
             let com = t.com.clone();
-            wait_real(&format!("{com} ATTACHED"), || state_of(&mgr, &com).as_deref() == Some("ATTACHED"));
+            wait_real(&format!("{com} ATTACHED"), || {
+                state_of(&mgr, &com).as_deref() == Some("ATTACHED")
+            });
         }
         let bank = Arc::new(McuBank {
             devs: Mutex::new(
@@ -901,11 +967,20 @@ impl FlashRig {
         };
         let mut caps = sw_pal::fakes::posix_caps();
         caps.flash_endpoint = self.flash_caps;
-        let (console, link): (Arc<dyn ConsoleTransportFactory>, PathBuf) = match &self.real_pty_link {
-            Some(link) => (Arc::new(sw_pal::console_pty::NativeConsoleFactory::new(ConsoleKind::Pty)), link.clone()),
+        let (console, link): (Arc<dyn ConsoleTransportFactory>, PathBuf) = match &self.real_pty_link
+        {
+            Some(link) => (
+                Arc::new(sw_pal::console_pty::NativeConsoleFactory::new(
+                    ConsoleKind::Pty,
+                )),
+                link.clone(),
+            ),
             None => (self.console.clone(), PathBuf::from(LINK)),
         };
-        let pal = sw_pal::fakes::platform().console(console).caps(caps).build();
+        let pal = sw_pal::fakes::platform()
+            .console(console)
+            .caps(caps)
+            .build();
         let endpoint = FlashEndpoint::start(&pal, &link, coord.clone(), ENDPOINT_GRACE)
             .expect("FlashEndpoint::start");
         Started {
@@ -953,7 +1028,11 @@ impl FlashRig {
             if cond(self) {
                 return;
             }
-            assert!(Instant::now() < deadline, "drive 逾時：{what}；warnings={:?}", self.warnings());
+            assert!(
+                Instant::now() < deadline,
+                "drive 逾時：{what}；warnings={:?}",
+                self.warnings()
+            );
             self.settle();
             if cond(self) {
                 return;
@@ -976,7 +1055,11 @@ impl FlashRig {
             if now >= target {
                 break;
             }
-            let next = self.clock.min_deadline().filter(|d| *d > now && *d <= target).unwrap_or(target);
+            let next = self
+                .clock
+                .min_deadline()
+                .filter(|d| *d > now && *d <= target)
+                .unwrap_or(target);
             self.clock.advance(Duration::from_nanos(next - now));
         }
         self.settle();
@@ -1054,7 +1137,9 @@ impl FlashRig {
     /// 端點 slave 路徑（`/fake/pts/<n>`）。
     pub fn endpoint_slave_path(&self) -> String {
         let _ = self.s();
-        lock(&self.console.slave_path).clone().expect("端點 PTY 尚未建立")
+        lock(&self.console.slave_path)
+            .clone()
+            .expect("端點 PTY 尚未建立")
     }
 
     pub fn pty_creates(&self) -> usize {
@@ -1096,14 +1181,18 @@ impl FlashRig {
         self.drive_until(&format!("{com} FLASHING＋ACK 回放"), |r| {
             r.state(com) == "FLASHING" && r.master_writes().len() > before
         });
-        wait_real("holder watch thread 登記第一次等待", || self.clock.waiters() > 0);
+        wait_real("holder watch thread 登記第一次等待", || {
+            self.clock.waiters() > 0
+        });
         self.settle();
     }
 
     /// 驅動直到下一次 `on_flash_open` 返回。
     pub fn run_detection(&self) {
         let before = self.coord().opens_completed_for_test();
-        self.drive_until("on_flash_open 返回", |r| r.coord().opens_completed_for_test() > before);
+        self.drive_until("on_flash_open 返回", |r| {
+            r.coord().opens_completed_for_test() > before
+        });
     }
 
     /// 等 `com` 到達 `state`（不推進時間）。
@@ -1117,7 +1206,10 @@ impl FlashRig {
         wait_real("pump 讀走 flasher 寫入", || self.master_unread() == 0);
         if !last.is_empty() {
             wait_real("pump 送到 MCU 線", || {
-                self.s().devs.values().any(|d| d.tx_since(0).ends_with(&last))
+                self.s()
+                    .devs
+                    .values()
+                    .any(|d| d.tx_since(0).ends_with(&last))
             });
         }
         self.settle();
@@ -1216,10 +1308,15 @@ impl FlashRig {
         self.wal_rows()
             .iter()
             .filter(|r| {
-                r.get("dir").and_then(PyValue::as_str) == Some("TX") && r.get("com").and_then(PyValue::as_str) == Some(com)
+                r.get("dir").and_then(PyValue::as_str) == Some("TX")
+                    && r.get("com").and_then(PyValue::as_str) == Some(com)
             })
             .map(|r| WalTx {
-                source: r.get("source").and_then(PyValue::as_str).unwrap_or("").to_string(),
+                source: r
+                    .get("source")
+                    .and_then(PyValue::as_str)
+                    .unwrap_or("")
+                    .to_string(),
                 payload: b64_decode(r.get("payload_b64").and_then(PyValue::as_str).unwrap_or("")),
             })
             .collect()
@@ -1230,7 +1327,11 @@ impl FlashRig {
         self.settle();
         let rows: Vec<Vec<u8>> = self.wal_tx(com).into_iter().map(|r| r.payload).collect();
         let wire = self.device(com).tx_since(0);
-        assert_eq!(rows.concat(), wire, "{com}：WAL TX 與 MCU 線實際收到的 bytes 不一致");
+        assert_eq!(
+            rows.concat(),
+            wire,
+            "{com}：WAL TX 與 MCU 線實際收到的 bytes 不一致"
+        );
         rows
     }
 
@@ -1293,5 +1394,8 @@ fn state_of(mgr: &SessionManager, com: &str) -> Option<String> {
 
 /// `TermSpeed` 便捷建構（原始 `speed_t` 代碼）。
 pub fn speed(code: u32) -> PalResult<TermSpeed> {
-    Ok(TermSpeed { ispeed: code, ospeed: code })
+    Ok(TermSpeed {
+        ispeed: code,
+        ospeed: code,
+    })
 }

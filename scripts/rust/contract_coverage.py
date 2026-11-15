@@ -694,6 +694,18 @@ def _prior_verdict(status: object) -> str:
     return "EVIDENCE_MISSING"
 
 
+_PRIOR_VERDICT_RANK = {"PASS": 0, "EVIDENCE_MISSING": 1, "BLOCKED-OWNER": 2, "FAIL": 3}
+
+
+def _merge_prior_case_verdict(
+    verdicts: dict[str, dict[str, str]], case_id: str, incoming: dict[str, str],
+) -> None:
+    """OD-88：重疊來源採最差 verdict；後匯入 PASS 不可覆蓋既有 FAIL。"""
+    current = verdicts.get(case_id)
+    if current is None or _PRIOR_VERDICT_RANK[incoming["status"]] > _PRIOR_VERDICT_RANK[current["status"]]:
+        verdicts[case_id] = incoming
+
+
 def load_prior_case_verdicts(
     *,
     slice21_run: Path | None,
@@ -761,7 +773,10 @@ def load_prior_case_verdicts(
         if not accepted:
             return
         for case_id, (raw_status, detail) in rows.items():
-            verdicts[case_id] = {"status": _prior_verdict(raw_status), "slice": slice_id, "detail": detail}
+            _merge_prior_case_verdict(
+                verdicts, case_id,
+                {"status": _prior_verdict(raw_status), "slice": slice_id, "detail": detail},
+            )
 
     slice23_results: dict[str, Any] | None = None
     reference_revision: str | None = None

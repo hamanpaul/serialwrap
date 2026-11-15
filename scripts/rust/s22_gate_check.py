@@ -324,7 +324,27 @@ def judge_sections(results_dir: pathlib.Path, lock: dict[str, Any], judge) -> tu
 
 def _l15_passed(l15: dict[str, list[dict]] | None, ref: str) -> bool:
     runs = (l15 or {}).get(ref, [])
-    return len(runs) == 1 and runs[0].get("outcome") == "passed" and runs[0].get("exit_code") == 0
+    if len(runs) != 2 or {run.get("implementation") for run in runs} != {"python", "rust"}:
+        return False
+    paths: set[pathlib.Path] = set()
+    for run in runs:
+        path_value = run.get("daemon_path")
+        digest = run.get("daemon_sha256")
+        if (run.get("outcome") != "passed" or run.get("exit_code") != 0
+                or not isinstance(path_value, str) or not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest)):
+            return False
+        path = pathlib.Path(path_value)
+        if not path.is_absolute():
+            path = ROOT / path
+        try:
+            path = path.resolve(strict=True)
+            actual_digest = sha256_file(path)
+        except OSError:
+            return False
+        if actual_digest != digest:
+            return False
+        paths.add(path)
+    return len(paths) == 2
 
 
 def judge_tests(tests: list[str], rows_by_nodeid: dict[str, list[dict]],

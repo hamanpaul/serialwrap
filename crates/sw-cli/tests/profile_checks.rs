@@ -67,7 +67,9 @@ fn platform(files: &[(&str, &[u8])], dirs: &[&str]) -> ClientPlatform {
         service: sw_pal::fakes::FakeServiceCtl::new(Vec::new()),
         registry: sw_pal::fakes::FakeRegistry::new(Vec::new(), &[]),
         serial: sw_pal::fakes::serial::FakeSerialBackend::new(),
-        uart_excl: std::sync::Arc::new(sw_pal::fakes::serial::FakeUartExclusive { report: Default::default() }),
+        uart_excl: std::sync::Arc::new(sw_pal::fakes::serial::FakeUartExclusive {
+            report: Default::default(),
+        }),
         devices: sw_pal::fakes::platform::unconfigured_devices(),
         instance_lock: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("instance_lock")),
         wal_fs: sw_pal::fakes::wal_fs::FakeWalFs::new(),
@@ -120,6 +122,41 @@ fn run_profile(yaml: &str) -> (i32, String, String) {
         String::from_utf8(out).unwrap(),
         String::from_utf8(err).unwrap(),
     )
+}
+
+#[test]
+fn sample_read_failure_returns_error_code_without_cli_failure() {
+    // Python `sw_core/cli.py:2109-2114`：sample OSError 回 SAMPLE_READ_FAILED JSON，profile test exit 0。
+    let yaml = "profiles:\n  t:\n    platform: shell\n";
+    let p = platform(&[("/p/x.yaml", yaml.as_bytes())], &["/p"]);
+    let argv: Vec<OsString> = [
+        "serialwrap",
+        "profile",
+        "test",
+        "--profile",
+        "t",
+        "--sample",
+        "/missing-sample",
+        "--profile-dir",
+        "/p",
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let rc = sw_cli::run(argv, &p, &mut out, &mut err);
+    let out = String::from_utf8(out).unwrap();
+    assert_eq!(
+        rc, 0,
+        "Python sample read failure is JSON, not CLI failure: {out}"
+    );
+    assert!(
+        out.contains("\"error_code\":\"SAMPLE_READ_FAILED\""),
+        "{out}"
+    );
+    assert!(out.contains("\"ok\":false"), "{out}");
+    assert!(err.is_empty(), "{err:?}");
 }
 
 #[test]
@@ -204,7 +241,10 @@ fn boot_done_value_error_wins_over_later_bootloader_overflow() {
         "profiles:\n  t:\n    platform: shell\n    prompt_regex: \"x\"\n    login_regex: \"x\"\n    password_regex: \"x\"\n    boot_done_regex: \"(?a)(?u)\"\n    bootloader_prompts:\n      - \"a{4294967296}\"\n",
     );
     assert_eq!((rc, out.as_str()), (1, ""));
-    assert!(err.contains("ASCII and UNICODE flags are incompatible"), "err={err}");
+    assert!(
+        err.contains("ASCII and UNICODE flags are incompatible"),
+        "err={err}"
+    );
     assert!(!err.contains("repetition"), "err={err}");
 }
 
@@ -215,7 +255,10 @@ fn password_value_error_wins_over_later_boot_done_overflow() {
         "profiles:\n  t:\n    platform: shell\n    prompt_regex: \"x\"\n    login_regex: \"x\"\n    password_regex: \"(?a)(?u)\"\n    boot_done_regex: \"a{4294967296}\"\n",
     );
     assert_eq!((rc, out.as_str()), (1, ""));
-    assert!(err.contains("ASCII and UNICODE flags are incompatible"), "err={err}");
+    assert!(
+        err.contains("ASCII and UNICODE flags are incompatible"),
+        "err={err}"
+    );
     assert!(!err.contains("repetition"), "err={err}");
 }
 

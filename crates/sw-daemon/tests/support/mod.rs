@@ -78,7 +78,11 @@ struct RootGuard(PathBuf);
 
 impl Drop for RootGuard {
     fn drop(&mut self) {
-        let _ = Command::new("chmod").arg("-R").arg("u+w").arg(&self.0).status();
+        let _ = Command::new("chmod")
+            .arg("-R")
+            .arg("u+w")
+            .arg(&self.0)
+            .status();
         let _ = fs::remove_dir_all(&self.0);
     }
 }
@@ -155,9 +159,18 @@ pub fn isolated_env() -> IsolatedEnv {
         system_config.display().to_string(),
     );
     vars.insert("HOME".to_string(), home.display().to_string());
-    vars.insert("XDG_CONFIG_HOME".to_string(), home.join(".config").display().to_string());
-    vars.insert("XDG_STATE_HOME".to_string(), home.join(".state").display().to_string());
-    vars.insert("XDG_DATA_HOME".to_string(), home.join(".data").display().to_string());
+    vars.insert(
+        "XDG_CONFIG_HOME".to_string(),
+        home.join(".config").display().to_string(),
+    );
+    vars.insert(
+        "XDG_STATE_HOME".to_string(),
+        home.join(".state").display().to_string(),
+    );
+    vars.insert(
+        "XDG_DATA_HOME".to_string(),
+        home.join(".data").display().to_string(),
+    );
     vars.insert("XDG_RUNTIME_DIR".to_string(), String::new());
     vars.insert("SW_TEST_USER".to_string(), "root".to_string());
     vars.insert("SW_TEST_PASS".to_string(), "pw".to_string());
@@ -338,7 +351,14 @@ impl FakeTargetProc {
             .unwrap_or_else(|| panic!("假 DUT 未就緒：{line:?}"))
             .trim()
             .to_string();
-        (FakeTargetProc { child, stdin, stdout }, PathBuf::from(slave))
+        (
+            FakeTargetProc {
+                child,
+                stdin,
+                stdout,
+            },
+            PathBuf::from(slave),
+        )
     }
 
     fn send(&mut self, cmd: &str) -> String {
@@ -359,7 +379,11 @@ impl FakeTargetProc {
     }
 
     fn pause(&mut self, seconds: f64) {
-        assert_eq!(self.send(&format!("PAUSE {seconds}")), "OK", "假 DUT PAUSE 失敗");
+        assert_eq!(
+            self.send(&format!("PAUSE {seconds}")),
+            "OK",
+            "假 DUT PAUSE 失敗"
+        );
     }
 }
 
@@ -377,7 +401,9 @@ fn decode_hex(s: &str) -> Vec<u8> {
     s.as_bytes()
         .chunks(2)
         .filter(|c| c.len() == 2)
-        .map(|c| u8::from_str_radix(std::str::from_utf8(c).expect("hex 字元"), 16).expect("hex 位元組"))
+        .map(|c| {
+            u8::from_str_radix(std::str::from_utf8(c).expect("hex 字元"), 16).expect("hex 位元組")
+        })
         .collect()
 }
 
@@ -392,7 +418,11 @@ impl DaemonProc {
         Self::spawn_with(env, &env.vars, args)
     }
 
-    pub fn spawn_with(env: &IsolatedEnv, vars: &BTreeMap<String, String>, args: &[&str]) -> DaemonProc {
+    pub fn spawn_with(
+        env: &IsolatedEnv,
+        vars: &BTreeMap<String, String>,
+        args: &[&str],
+    ) -> DaemonProc {
         let n = SEQ.fetch_add(1, Ordering::SeqCst);
         let stderr_path = env.root.join(format!("daemon-{n}.stderr"));
         let file = File::create(&stderr_path).expect("建立 stderr 檔");
@@ -516,7 +546,11 @@ pub fn rpc_once(socket: &Path, line: &str) -> String {
             Ok(n) => out.extend_from_slice(&buf[..n]),
         }
     }
-    String::from_utf8_lossy(&out).lines().next().unwrap_or("").to_string()
+    String::from_utf8_lossy(&out)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string()
 }
 
 /// `{"id":1,"method":…,"params":…}` 的便利包裝；回應解析為 `PyValue`（失敗時為 `Null`）。
@@ -541,7 +575,12 @@ pub fn wait_socket(socket: &Path, timeout: Duration) {
 
 /// `session.get_state` 的 `session` 物件（找不到時為 `Null`）。
 pub fn get_state(socket: &Path, com: &str) -> PyValue {
-    rpc_value(socket, "session.get_state", &format!(r#"{{"selector":"{com}"}}"#))["session"].clone()
+    rpc_value(
+        socket,
+        "session.get_state",
+        &format!(r#"{{"selector":"{com}"}}"#),
+    )["session"]
+        .clone()
 }
 
 /// 輪詢直到 COM 進入 READY；逾時 panic（需要 PTY 假 DUT 與 shell 登入）。
@@ -579,7 +618,11 @@ pub fn path_holders(path: &Path) -> Vec<(u32, String)> {
         return out;
     };
     for entry in procs.flatten() {
-        let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
             continue;
         };
         if pid == me {
@@ -588,9 +631,17 @@ pub fn path_holders(path: &Path) -> Vec<(u32, String)> {
         let Ok(fds) = fs::read_dir(entry.path().join("fd")) else {
             continue;
         };
-        if fds.flatten().any(|fd| fs::read_link(fd.path()).map(|t| t == path).unwrap_or(false)) {
+        if fds
+            .flatten()
+            .any(|fd| fs::read_link(fd.path()).map(|t| t == path).unwrap_or(false))
+        {
             let cmd = fs::read(entry.path().join("cmdline"))
-                .map(|b| String::from_utf8_lossy(&b).replace('\0', " ").trim().to_string())
+                .map(|b| {
+                    String::from_utf8_lossy(&b)
+                        .replace('\0', " ")
+                        .trim()
+                        .to_string()
+                })
                 .unwrap_or_default();
             out.push((pid, cmd));
         }
@@ -624,7 +675,12 @@ pub fn health_status(socket: &Path) -> PyValue {
 
 /// `command.get` 的 `command` 物件（找不到時為 `Null`）。
 pub fn command_get(socket: &Path, cmd_id: &str) -> PyValue {
-    rpc_value(socket, "command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#))["command"].clone()
+    rpc_value(
+        socket,
+        "command.get",
+        &format!(r#"{{"cmd_id":"{cmd_id}"}}"#),
+    )["command"]
+        .clone()
 }
 
 /// 以 `session.list` 取得全部 session（依 session_id 排序）。
@@ -643,7 +699,11 @@ pub fn submit(socket: &Path, selector: &str, command: &str) -> PyValue {
 
 /// 確認 PTY slave 可被獨占以外的方式（一般 `open(O_RDWR)`）開啟：TIOCEXCL 已解除時成功。
 pub fn pty_can_open_exclusively(path: &Path) -> bool {
-    fs::OpenOptions::new().read(true).write(true).open(path).is_ok()
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .is_ok()
 }
 
 /// 目前是否為 root（root 下 chmod 無效，唯讀類案例須 skip 並列為證據不足）。
@@ -717,11 +777,20 @@ pub fn in_process_platform_with_handles(
     devices: Vec<(String, DeviceInfo)>,
     fixture: Fixture,
 ) -> (sw_pal::Platform, InProcHandles) {
-    use sw_pal::fakes::{FakeDeviceSource, FakeEnv, FakeSerialBackend, FakeUartExclusive, FakeWriteStep};
     use std::sync::Arc;
+    use sw_pal::fakes::{
+        FakeDeviceSource, FakeEnv, FakeSerialBackend, FakeUartExclusive, FakeWriteStep,
+    };
 
-    let config_dir = PathBuf::from(vars.get("SERIALWRAP_CONFIG_DIR").expect("vars 須含 SERIALWRAP_CONFIG_DIR"));
-    let socket = PathBuf::from(vars.get("SERIALWRAP_RUN_DIR").expect("vars 須含 SERIALWRAP_RUN_DIR")).join("serialwrapd.sock");
+    let config_dir = PathBuf::from(
+        vars.get("SERIALWRAP_CONFIG_DIR")
+            .expect("vars 須含 SERIALWRAP_CONFIG_DIR"),
+    );
+    let socket = PathBuf::from(
+        vars.get("SERIALWRAP_RUN_DIR")
+            .expect("vars 須含 SERIALWRAP_RUN_DIR"),
+    )
+    .join("serialwrapd.sock");
     let profile_dir = config_dir.join("profiles");
     fs::create_dir_all(&profile_dir).expect("建立 profiles 目錄");
     let yaml = match fixture {
@@ -749,8 +818,12 @@ pub fn in_process_platform_with_handles(
     // READY 之後的第一筆寫入（agent 命令）依夾具阻塞：ready nonce 回應的同時排入寫入腳本。
     if let Some(dev) = &first_dev {
         let step = match fixture {
-            Fixture::ReadyShellBlockingWithQueue => Some(FakeWriteStep::BlockUntilCancel { accept_before_cancel: 0 }),
-            Fixture::BlockForeverWriter | Fixture::BlockForeverWriterWalSyncFailure => Some(FakeWriteStep::BlockForever),
+            Fixture::ReadyShellBlockingWithQueue => Some(FakeWriteStep::BlockUntilCancel {
+                accept_before_cancel: 0,
+            }),
+            Fixture::BlockForeverWriter | Fixture::BlockForeverWriterWalSyncFailure => {
+                Some(FakeWriteStep::BlockForever)
+            }
             _ => None,
         };
         if let Some(step) = step {
@@ -773,16 +846,24 @@ pub fn in_process_platform_with_handles(
     let mut p = sw_pal::native();
     p.env = Arc::new(env);
     p.serial = serial.clone();
-    p.uart_excl = Arc::new(FakeUartExclusive { report: Default::default() });
-    let snapshot = devices.clone();
-    let script: Arc<std::sync::Mutex<Option<sw_pal::fakes::FakeDeviceScript>>> = Arc::new(std::sync::Mutex::new(None));
-    let script_slot = script.clone();
-    p.devices = Box::new(move |_sel: sw_pal::traits::DeviceSelection| -> Box<dyn sw_pal::traits::DeviceSource> {
-        let (source, handle) = FakeDeviceSource::new(snapshot.clone());
-        *script_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
-        Box::new(source)
+    p.uart_excl = Arc::new(FakeUartExclusive {
+        report: Default::default(),
     });
-    if matches!(fixture, Fixture::WalSyncFailure | Fixture::BlockForeverWriterWalSyncFailure) {
+    let snapshot = devices.clone();
+    let script: Arc<std::sync::Mutex<Option<sw_pal::fakes::FakeDeviceScript>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let script_slot = script.clone();
+    p.devices = Box::new(
+        move |_sel: sw_pal::traits::DeviceSelection| -> Box<dyn sw_pal::traits::DeviceSource> {
+            let (source, handle) = FakeDeviceSource::new(snapshot.clone());
+            *script_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+            Box::new(source)
+        },
+    );
+    if matches!(
+        fixture,
+        Fixture::WalSyncFailure | Fixture::BlockForeverWriterWalSyncFailure
+    ) {
         p.wal_fs = Arc::new(SyncFailWalFs(p.wal_fs.clone()));
     }
 
@@ -806,7 +887,14 @@ pub fn in_process_platform_with_handles(
         }
         _ => {}
     }
-    (p, InProcHandles { devices: all_devs, script, serial })
+    (
+        p,
+        InProcHandles {
+            devices: all_devs,
+            script,
+            serial,
+        },
+    )
 }
 
 /// 輪詢 session 狀態（in-process 夾具驅動 thread 用；逾時 panic）。
@@ -850,10 +938,16 @@ impl sw_pal::traits::WalFile for SyncFailFile {
 }
 
 impl sw_pal::traits::WalFs for SyncFailWalFs {
-    fn open_append(&self, path: &Path) -> sw_pal::traits::PalResult<Box<dyn sw_pal::traits::WalFile>> {
+    fn open_append(
+        &self,
+        path: &Path,
+    ) -> sw_pal::traits::PalResult<Box<dyn sw_pal::traits::WalFile>> {
         Ok(Box::new(SyncFailFile(self.0.open_append(path)?)))
     }
-    fn path_identity(&self, path: &Path) -> sw_pal::traits::PalResult<Option<sw_pal::traits::FileIdentity>> {
+    fn path_identity(
+        &self,
+        path: &Path,
+    ) -> sw_pal::traits::PalResult<Option<sw_pal::traits::FileIdentity>> {
         self.0.path_identity(path)
     }
     fn size(&self, path: &Path) -> sw_pal::traits::PalResult<Option<u64>> {
@@ -865,7 +959,11 @@ impl sw_pal::traits::WalFs for SyncFailWalFs {
     fn read_all(&self, path: &Path) -> sw_pal::traits::PalResult<Option<Vec<u8>>> {
         self.0.read_all(path)
     }
-    fn rename_noreplace_or_suffix(&self, from: &Path, base_to: &Path) -> sw_pal::traits::PalResult<PathBuf> {
+    fn rename_noreplace_or_suffix(
+        &self,
+        from: &Path,
+        base_to: &Path,
+    ) -> sw_pal::traits::PalResult<PathBuf> {
         self.0.rename_noreplace_or_suffix(from, base_to)
     }
     fn sync_dir(&self, dir: &Path) -> sw_pal::traits::PalResult<()> {
@@ -925,7 +1023,12 @@ pub fn deferred_methods(yaml: &str, delivered: &[&str]) -> Vec<String> {
             in_section = line.trim_end().starts_with("deferred_methods:");
             continue;
         }
-        let Some(item) = in_section.then(|| line.trim().strip_prefix("- {")).flatten() else { continue };
+        let Some(item) = in_section
+            .then(|| line.trim().strip_prefix("- {"))
+            .flatten()
+        else {
+            continue;
+        };
         let item = item.split('}').next().unwrap_or_default();
         let (Some(method), Some(slice)) = (field(item, "method"), field(item, "slice")) else {
             panic!("deferred_methods 列格式不符：{line}");

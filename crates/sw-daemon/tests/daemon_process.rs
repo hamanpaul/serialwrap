@@ -87,7 +87,9 @@ fn send_and_drop(socket: &std::path::Path, payload: &str) {
         .rpc
         .connect(&endpoint, sw_pal::traits::SockTimeout::Blocking(SHORT))
         .expect("連線 daemon");
-    stream.send_all(payload.as_bytes()).expect("送出 pipelined 請求");
+    stream
+        .send_all(payload.as_bytes())
+        .expect("送出 pipelined 請求");
 }
 
 fn last_wal_line(env: &IsolatedEnv) -> String {
@@ -104,7 +106,10 @@ fn second_daemon_same_lock_exits_2_with_stderr() {
     assert_eq!(out.code, Some(2));
     // Python 基線實測（P5-T19 修正預期值）：空 profile dir 先寫 `no profiles loaded`（load_profiles 早於取鎖），
     // 再寫 `DAEMON_ALREADY_RUNNING`；stderr 全文逐字比對。
-    assert_eq!(out.stderr, "serialwrapd: no profiles loaded\nserialwrapd: DAEMON_ALREADY_RUNNING\n");
+    assert_eq!(
+        out.stderr,
+        "serialwrapd: no profiles loaded\nserialwrapd: DAEMON_ALREADY_RUNNING\n"
+    );
     rpc_once(&env.socket, STOP);
     assert_eq!(a.wait(LONG).code(), Some(0));
 }
@@ -117,7 +122,8 @@ fn unreadable_state_json_exits_3_and_releases_lock() {
     assert_eq!(out.code, Some(3));
     // Python 基線實測（P5-T19 修正預期值）：`no profiles loaded` 先於 state.json 讀取失敗（load_profiles 早於取鎖與 state 載入）。
     assert!(
-        out.stderr.starts_with("serialwrapd: no profiles loaded\nserialwrapd: 無法讀取既有 state.json（"),
+        out.stderr
+            .starts_with("serialwrapd: no profiles loaded\nserialwrapd: 無法讀取既有 state.json（"),
         "{}",
         out.stderr
     );
@@ -132,17 +138,35 @@ fn unwritable_state_dir_startup_save_exits_1_before_attach() {
     // sol-backfill p5 #4：Python 基線實測（非 root、state 目錄 555）——`SessionManager.__init__` 的 `_save_state()`
     // 於 mkstemp 拋 `PermissionError: [Errno 13] Permission denied: '<state>/state.json.tmp.XXXX'`，traceback 後 rc 1，
     // 尚未 attach（假 DUT 收到 0 bytes）、state 目錄無新檔。
-    assert!(!is_root(), "證據不足：root 下 chmod 無效，state 目錄唯讀路徑須以非 root 執行");
+    assert!(
+        !is_root(),
+        "證據不足：root 下 chmod 無效，state 目錄唯讀路徑須以非 root 執行"
+    );
     let mut env = isolated_env_with_pty_target();
     chmod(&env.state_dir, "555");
     let out = run_to_exit(&env, &env.vars, &[]);
     chmod(&env.state_dir, "755");
     assert_eq!(out.code, Some(1), "{}", out.stderr);
-    assert!(out.stderr.contains("Traceback (most recent call last):"), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("Traceback (most recent call last):"),
+        "{}",
+        out.stderr
+    );
     let last = out.stderr.lines().last().unwrap_or_default();
-    assert!(last.starts_with("PermissionError: [Errno 13] Permission denied"), "{}", out.stderr);
-    assert!(env.target_rx().is_empty(), "啟動存檔失敗不得對 DUT 送出任何 bytes");
-    assert_eq!(fs::read_dir(&env.state_dir).unwrap().count(), 0, "state 目錄不得留下檔案");
+    assert!(
+        last.starts_with("PermissionError: [Errno 13] Permission denied"),
+        "{}",
+        out.stderr
+    );
+    assert!(
+        env.target_rx().is_empty(),
+        "啟動存檔失敗不得對 DUT 送出任何 bytes"
+    );
+    assert_eq!(
+        fs::read_dir(&env.state_dir).unwrap().count(),
+        0,
+        "state 目錄不得留下檔案"
+    );
 }
 
 #[test]
@@ -176,7 +200,10 @@ fn windows_default_allowlist_health_has_no_dynamic_sessions() {
 
     if caps.native_device == sw_pal::DeviceBackendKind::Win {
         let health = loopback_rpc_value(port, "health.status", "{}");
-        assert!(health["test_device_allowlist"]["enabled"] == true, "{health:?}");
+        assert!(
+            health["test_device_allowlist"]["enabled"] == true,
+            "{health:?}"
+        );
         assert_eq!(health["test_device_allowlist"]["source"], "env");
         assert_eq!(
             health["test_device_allowlist"]["coms"],
@@ -223,7 +250,9 @@ fn bare_double_dash_is_unrecognized_exit_2() {
         let out = run_to_exit(&env, &vars, &args);
         assert_eq!(out.code, Some(2), "{args:?}: {}", out.stderr);
         assert!(
-            out.stderr.ends_with(&format!("serialwrapd: error: unrecognized arguments: {tail}\n")),
+            out.stderr.ends_with(&format!(
+                "serialwrapd: error: unrecognized arguments: {tail}\n"
+            )),
             "{args:?}: {}",
             out.stderr
         );
@@ -241,7 +270,10 @@ fn no_args_uses_env_paths() {
     let mut d = DaemonProc::spawn(&env, &[]);
     wait_socket(&env.socket, SHORT);
     assert_eq!(env.socket, env.run_dir.join("serialwrapd.sock"));
-    assert!(env.run_dir.join("serialwrapd.lock").exists(), "lock 應位於 $SERIALWRAP_RUN_DIR");
+    assert!(
+        env.run_dir.join("serialwrapd.lock").exists(),
+        "lock 應位於 $SERIALWRAP_RUN_DIR"
+    );
     rpc_once(&env.socket, STOP);
     assert_eq!(d.wait(LONG).code(), Some(0));
 }
@@ -251,7 +283,8 @@ fn endpoint_written_after_bind() {
     let env = isolated_env();
     let mut d = DaemonProc::spawn(&env, &[]);
     wait_socket(&env.socket, SHORT);
-    let cfg = fs::read_to_string(env.config_dir.join("config.yaml")).expect("config.yaml 應於 bind 後寫入");
+    let cfg = fs::read_to_string(env.config_dir.join("config.yaml"))
+        .expect("config.yaml 應於 bind 後寫入");
     let want = format!("socket_path: {}", env.socket.display());
     assert!(cfg.lines().any(|l| l == want), "{cfg}");
     rpc_once(&env.socket, STOP);
@@ -259,13 +292,22 @@ fn endpoint_written_after_bind() {
 
     // config 目錄唯讀：寫入失敗為非致命，daemon 仍存活。
     // 審查 F81：root 下 chmod 無效＝證據不足，必須 FAIL（不得 return 計為 PASS）。
-    assert!(!is_root(), "證據不足：root 下 chmod 無效，寫入失敗路徑須以非 root 執行");
+    assert!(
+        !is_root(),
+        "證據不足：root 下 chmod 無效，寫入失敗路徑須以非 root 執行"
+    );
     let env2 = isolated_env();
     chmod(&env2.config_dir, "555");
     let mut d2 = DaemonProc::spawn(&env2, &[]);
     wait_socket(&env2.socket, SHORT);
-    d2.wait_stderr_contains("serialwrapd: 寫入 config.yaml endpoint 失敗（非致命）: ", SHORT);
-    assert!(rpc_value(&env2.socket, "health.ping", "{}")["ok"] == true, "寫入失敗不得殺死 daemon");
+    d2.wait_stderr_contains(
+        "serialwrapd: 寫入 config.yaml endpoint 失敗（非致命）: ",
+        SHORT,
+    );
+    assert!(
+        rpc_value(&env2.socket, "health.ping", "{}")["ok"] == true,
+        "寫入失敗不得殺死 daemon"
+    );
     rpc_once(&env2.socket, STOP);
     assert_eq!(d2.wait(LONG).code(), Some(0));
 }
@@ -276,7 +318,11 @@ fn serialwrap_config_env_read_and_write_target() {
 
     // A：SERIALWRAP_CONFIG 原樣勝出（即使指向新檔）：讀此檔、endpoint 寫此檔、CONFIG_DIR/config.yaml 不建立。
     let alt = env.root.join("alt.yaml");
-    fs::write(&alt, "windows:\n  exclude_coms: [COM3]\n  test_device_allowlist: [\"/x/by-id/b-alt\"]\n").unwrap();
+    fs::write(
+        &alt,
+        "windows:\n  exclude_coms: [COM3]\n  test_device_allowlist: [\"/x/by-id/b-alt\"]\n",
+    )
+    .unwrap();
     let mut vars = env.vars.clone();
     vars.insert(ALLOWLIST.to_string(), String::new());
     vars.insert("SERIALWRAP_CONFIG".to_string(), alt.display().to_string());
@@ -287,8 +333,14 @@ fn serialwrap_config_env_read_and_write_target() {
     assert_eq!(h["test_device_allowlist"]["coms"][0], "/x/by-id/b-alt");
     let text = fs::read_to_string(&alt).unwrap();
     let want = format!("socket_path: {}", env.socket.display());
-    assert!(text.lines().any(|l| l == want), "endpoint 應寫入 SERIALWRAP_CONFIG：{text}");
-    assert!(!env.config_dir.join("config.yaml").exists(), "SERIALWRAP_CONFIG 生效時不得建立 CONFIG_DIR/config.yaml");
+    assert!(
+        text.lines().any(|l| l == want),
+        "endpoint 應寫入 SERIALWRAP_CONFIG：{text}"
+    );
+    assert!(
+        !env.config_dir.join("config.yaml").exists(),
+        "SERIALWRAP_CONFIG 生效時不得建立 CONFIG_DIR/config.yaml"
+    );
     rpc_once(&env.socket, STOP);
     assert_eq!(d.wait(LONG).code(), Some(0));
 
@@ -303,8 +355,15 @@ fn serialwrap_config_env_read_and_write_target() {
     let h2 = health_status(&env.socket);
     assert_eq!(h2["test_device_allowlist"]["source"], "config");
     assert_eq!(h2["test_device_allowlist"]["coms"][0], "/sys/by-id/c");
-    assert_eq!(fs::read_to_string(&env.system_config).unwrap(), sys_yaml, "系統檔不得被寫入");
-    assert!(env.config_dir.join("config.yaml").exists(), "endpoint 應寫入 CONFIG_DIR/config.yaml");
+    assert_eq!(
+        fs::read_to_string(&env.system_config).unwrap(),
+        sys_yaml,
+        "系統檔不得被寫入"
+    );
+    assert!(
+        env.config_dir.join("config.yaml").exists(),
+        "endpoint 應寫入 CONFIG_DIR/config.yaml"
+    );
     rpc_once(&env.socket, STOP);
     assert_eq!(d2.wait(LONG).code(), Some(0));
 }
@@ -326,7 +385,10 @@ fn startup_order_scan_rank_watch() {
         let mut rows: Vec<PyValue> = Vec::new();
         let deadline = Instant::now() + LONG;
         while Instant::now() < deadline {
-            rows = session_list(&socket).as_array().cloned().unwrap_or_default();
+            rows = session_list(&socket)
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
             if rows.len() == 3 {
                 break;
             }
@@ -335,7 +397,11 @@ fn startup_order_scan_rank_watch() {
         rpc_once(&socket, STOP);
         rows
     });
-    let code = run_with_hooks(vec!["serialwrapd".to_string()], platform, trace_hooks(sink.clone()));
+    let code = run_with_hooks(
+        vec!["serialwrapd".to_string()],
+        platform,
+        trace_hooks(sink.clone()),
+    );
     let rows = client.join().expect("client thread");
     assert_eq!(code, 0);
 
@@ -395,7 +461,8 @@ fn sigterm_graceful_exit_0_and_flushes_queue() {
         let blk = submit(&socket, "COM0", "blk");
         let c1 = cmd_id(&blk);
         // 等 worker 撿起 blk（status running），q2／q3 才是排在它之後、未開始的排隊命令。
-        let running = !c1.is_empty() && poll(&mut || command_get(&socket, &c1)["status"] == "running");
+        let running =
+            !c1.is_empty() && poll(&mut || command_get(&socket, &c1)["status"] == "running");
         // 先等 q2 admission 回覆，再送 q3，固定 flush trace 的 admission 順序。
         let c2 = cmd_id(&submit(&socket, "COM0", "q2"));
         let c3 = cmd_id(&submit(&socket, "COM0", "q3"));
@@ -409,12 +476,22 @@ fn sigterm_graceful_exit_0_and_flushes_queue() {
         rpc_once(&socket, STOP);
         (ready, blk, running, c2, c3, queued)
     });
-    let code = run_with_hooks(vec!["serialwrapd".to_string()], platform, trace_hooks(sink.clone()));
+    let code = run_with_hooks(
+        vec!["serialwrapd".to_string()],
+        platform,
+        trace_hooks(sink.clone()),
+    );
     let (ready, blk, running, c2, c3, queued) = client.join().expect("client thread");
     assert!(ready, "COM0 未在 {LONG:?} 內進入 READY");
     assert_eq!(blk["ok"], true, "前景命令 blk 應被接受：{blk:?}");
-    assert!(running, "前景命令 blk 未在 {LONG:?} 內進入 running：{blk:?}");
-    assert!(!c2.is_empty() && !c3.is_empty(), "排隊命令應取得 cmd_id：{c2:?} {c3:?}");
+    assert!(
+        running,
+        "前景命令 blk 未在 {LONG:?} 內進入 running：{blk:?}"
+    );
+    assert!(
+        !c2.is_empty() && !c3.is_empty(),
+        "排隊命令應取得 cmd_id：{c2:?} {c3:?}"
+    );
     for (id, status) in [&c2, &c3].iter().zip(&queued) {
         assert_eq!(*status, "accepted", "STOP 前排隊命令 {id} 應尚未開始");
     }
@@ -431,7 +508,10 @@ fn sigterm_graceful_exit_0_and_flushes_queue() {
             TraceEvent::ShutdownGate,
             TraceEvent::WatcherStopped,
             TraceEvent::EngineIntakeClosed,
-            TraceEvent::FlashStopped { joined: true, unlinked: true },
+            TraceEvent::FlashStopped {
+                joined: true,
+                unlinked: true
+            },
             TraceEvent::DrainPhase1,
             TraceEvent::HandlersJoined { pending: vec![] },
             TraceEvent::DrainPhase2 {
@@ -473,12 +553,21 @@ fn real_sigterm_to_started_daemon_exits_0_after_flush() {
     thread::sleep(Duration::from_millis(300));
     let queued_ids: Vec<String> = queued
         .into_iter()
-        .map(|h| h.join().expect("queued submit")["cmd_id"].as_str().unwrap_or_default().to_string())
+        .map(|h| {
+            h.join().expect("queued submit")["cmd_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
         .collect();
     // 停機前最後一次 command.get：排隊命令仍為 accepted（未開始），停機 drain 才會以 FLUSHED_BY_SHUTDOWN 終結。
     for id in &queued_ids {
         assert!(!id.is_empty(), "排隊命令應取得 cmd_id");
-        assert_eq!(command_get(&socket, id)["status"], "accepted", "SIGTERM 前排隊命令 {id} 應尚未開始");
+        assert_eq!(
+            command_get(&socket, id)["status"],
+            "accepted",
+            "SIGTERM 前排隊命令 {id} 應尚未開始"
+        );
     }
 
     let status = Command::new("kill")
@@ -518,10 +607,20 @@ fn shutdown_with_stalled_drain_exits_1_with_diagnostic() {
         std::process::exit(code);
     }
     let env = isolated_env();
-    let out = run_child_test("shutdown_with_stalled_drain_exits_1_with_diagnostic", "stall", &env);
-    assert_eq!(out.code, Some(1), "不得宣告 graceful success：{}", out.stderr);
+    let out = run_child_test(
+        "shutdown_with_stalled_drain_exits_1_with_diagnostic",
+        "stall",
+        &env,
+    );
+    assert_eq!(
+        out.code,
+        Some(1),
+        "不得宣告 graceful success：{}",
+        out.stderr
+    );
     assert!(
-        out.stderr.contains("serialwrapd: shutdown incomplete: drain stalled: t:COM0"),
+        out.stderr
+            .contains("serialwrapd: shutdown incomplete: drain stalled: t:COM0"),
         "{}",
         out.stderr
     );
@@ -549,7 +648,8 @@ fn shutdown_wal_sync_failure_exits_1() {
     let out = run_child_test("shutdown_wal_sync_failure_exits_1", "walsync", &env);
     assert_eq!(out.code, Some(1), "{}", out.stderr);
     assert!(
-        out.stderr.contains("serialwrapd: shutdown incomplete: WAL sync failed: "),
+        out.stderr
+            .contains("serialwrapd: shutdown incomplete: WAL sync failed: "),
         "{}",
         out.stderr
     );
@@ -573,7 +673,10 @@ fn shutdown_releases_tty_before_exit() {
 #[test]
 fn wal_dir_readonly_at_start_blocks_login_probe() {
     // 審查 F81：root 下 chmod 無效＝證據不足，必須 FAIL（不得 return 計為 PASS）。
-    assert!(!is_root(), "證據不足：root 下 chmod 無效，唯讀 WAL 路徑須以非 root 執行（P5-T19 Review Focus 3）");
+    assert!(
+        !is_root(),
+        "證據不足：root 下 chmod 無效，唯讀 WAL 路徑須以非 root 執行（P5-T19 Review Focus 3）"
+    );
     let mut env = isolated_env_with_pty_target();
     chmod(&env.wal_dir, "555");
     let mut d = DaemonProc::spawn(&env, &[]);
@@ -617,22 +720,34 @@ fn wal_dir_readonly_at_start_blocks_login_probe() {
 #[test]
 fn non_root_holder_scan_permission_does_not_block_open() {
     // root 可讀所有 /proc/<pid>/fd，無法覆蓋權限不足路徑＝證據不足，必須 FAIL（不得 return 計為 PASS）。
-    assert!(!is_root(), "證據不足：須以非 root 執行（root 下 holder 掃描不會遇到 EACCES）");
+    assert!(
+        !is_root(),
+        "證據不足：須以非 root 執行（root 下 holder 掃描不會遇到 EACCES）"
+    );
     let denied = fs::read_dir("/proc")
         .expect("讀 /proc")
         .filter_map(Result::ok)
         .filter(|e| e.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit()))
         .any(|e| matches!(fs::read_dir(e.path().join("fd")), Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied));
-    assert!(denied, "證據不足：本機沒有 fd 目錄不可讀的他人行程，無法覆蓋權限不足路徑");
+    assert!(
+        denied,
+        "證據不足：本機沒有 fd 目錄不可讀的他人行程，無法覆蓋權限不足路徑"
+    );
     let env = isolated_env_with_pty_target();
     let mut d = DaemonProc::spawn(&env, &[]);
     wait_socket(&env.socket, SHORT);
     wait_ready(&env, "COM0");
     // 與 Python `serial_port.py` 逐字相同（`report.status`＝"permission"；daemon_logging.yaml uart_holder_scan_unknown）。
-    d.wait_stderr_contains("的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥", SHORT);
+    d.wait_stderr_contains(
+        "的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥",
+        SHORT,
+    );
     let h = health_status(&env.socket);
     let holders = format!("{:?}", h["foreign_holders"]);
-    assert!(holders.contains("holder_unknown"), "foreign_holders 應回報 holder 未知的裝置：{holders}");
+    assert!(
+        holders.contains("holder_unknown"),
+        "foreign_holders 應回報 holder 未知的裝置：{holders}"
+    );
     rpc_once(&env.socket, STOP);
     assert_eq!(d.wait(LONG).code(), Some(0));
 }
@@ -640,7 +755,10 @@ fn non_root_holder_scan_permission_does_not_block_open() {
 #[test]
 fn wal_fault_after_ready_splits_agent_and_auto_tx() {
     // 審查 F81：root 下 chmod 無效＝證據不足，必須 FAIL（不得 return 計為 PASS）。
-    assert!(!is_root(), "證據不足：root 下 chmod 無效，WAL 故障路徑須以非 root 執行（P5-T19 Review Focus 3）");
+    assert!(
+        !is_root(),
+        "證據不足：root 下 chmod 無效，WAL 故障路徑須以非 root 執行（P5-T19 Review Focus 3）"
+    );
     let mut env = isolated_env_with_pty_target();
     let mut d = DaemonProc::spawn(&env, &[]);
     wait_ready(&env, "COM0");
@@ -657,9 +775,14 @@ fn wal_fault_after_ready_splits_agent_and_auto_tx() {
     let r = submit(&env.socket, "COM0", "echo x");
     let cmd_id = r["cmd_id"].as_str().unwrap_or_default().to_string();
     assert!(!cmd_id.is_empty(), "{r:?}");
-    wait_until("command done", LONG, || command_get(&socket, &cmd_id)["status"] == "done");
+    wait_until("command done", LONG, || {
+        command_get(&socket, &cmd_id)["status"] == "done"
+    });
     let rx = env.target_rx();
-    assert!(rx.windows(7).any(|w| w == b"echo x\n"), "agent 命令應送出 echo x\\n");
+    assert!(
+        rx.windows(7).any(|w| w == b"echo x\n"),
+        "agent 命令應送出 echo x\\n"
+    );
 
     // 自動 TX（session self-test 的 probe）不得送出任何 bytes。
     let before = env.target_rx().len();
@@ -678,7 +801,10 @@ fn recover_tx_payloads(env: &IsolatedEnv) -> Vec<String> {
     wal.lines()
         .filter_map(|line| pyjson::loads(line).ok())
         .filter(|row| {
-            row["dir"] == "TX" && row["source"].as_str().is_some_and(|s| s.contains("recover"))
+            row["dir"] == "TX"
+                && row["source"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("recover"))
         })
         .filter_map(|row| row["payload_b64"].as_str().map(str::to_string))
         .collect()
@@ -692,31 +818,45 @@ fn daemon_stop_during_force_recover_with_client_gone() {
     // `session.recover --force`＋`daemon.stop` 後 client 立即斷線：recover handler 照常跑完（READY 路徑
     // `_recover_after_failure`，假 DUT 對 Ctrl-C 立即回 prompt → WAL 恰一筆 `system:recover` 的 `\x03`），回應寫入失敗後
     // 連線關閉，管線中的 `daemon.stop` 不被處理；daemon 持續運作，之後由新連線 `daemon.stop` 才有序停機（exit 0）。
-    let env = isolated_env_with_pty_target();
+    let mut env = isolated_env_with_pty_target();
     let mut d = DaemonProc::spawn(&env, &[]);
     wait_ready(&env, "COM0");
+    // 讓 handler 在 client disconnect 之後仍等待假 DUT，避免快速 Ctrl-C 回應時競態地先寫回應並處理 pipelined stop。
+    env.target_pause(8.0);
 
     let payload = format!(
         "{}\n{}\n",
-        r#"{"id":3,"method":"session.recover","params":{"selector":"COM0","force":true}}"#,
-        STOP
+        r#"{"id":3,"method":"session.recover","params":{"selector":"COM0","force":true}}"#, STOP
     );
     let sent = Instant::now();
     send_and_drop(&env.socket, &payload); // 送出後立即斷線
 
     // 收斂以救援 TX 實際寫入 WAL 為準（不以狀態判斷：COM0 起始即 READY）。
-    wait_until("救援 TX 寫入 WAL", LONG, || !recover_tx_payloads(&env).is_empty());
+    wait_until("救援 TX 寫入 WAL", LONG, || {
+        !recover_tx_payloads(&env).is_empty()
+    });
     thread::sleep(Duration::from_secs(1));
-    assert_eq!(recover_tx_payloads(&env), vec!["Aw==".to_string()], "救援 TX 應恰為 \\x03");
+    assert_eq!(
+        recover_tx_payloads(&env),
+        vec!["Aw==".to_string()],
+        "救援 TX 應恰為 \\x03"
+    );
     // 超過 force recover 上限（10 s）＋餘裕：管線中的 stop 若於 handler 結束後才被處理，此時行程已結束。
     if let Some(rest) = Duration::from_secs(11).checked_sub(sent.elapsed()) {
         thread::sleep(rest);
     }
 
     // 管線中的 daemon.stop 未被處理：daemon 仍存活、socket 保留，新連線 health.status 回 ok。
-    assert!(d.try_alive(), "回應寫入失敗後連線關閉，管線中的 daemon.stop 不得被處理：{}", d.stderr());
+    assert!(
+        d.try_alive(),
+        "回應寫入失敗後連線關閉，管線中的 daemon.stop 不得被處理：{}",
+        d.stderr()
+    );
     assert!(env.socket.exists(), "管線中的 daemon.stop 不得移除 socket");
-    assert!(health_status(&env.socket)["ok"] == true, "daemon 應仍可服務新連線");
+    assert!(
+        health_status(&env.socket)["ok"] == true,
+        "daemon 應仍可服務新連線"
+    );
     let last = last_wal_line(&env);
     assert!(pyjson::loads(&last).is_ok(), "WAL 最後一行不完整：{last}");
 
@@ -750,7 +890,9 @@ fn daemon_stop_from_second_connection_during_force_recover() {
             r#"{"id":3,"method":"session.recover","params":{"selector":"COM0","force":true}}"#
         ),
     );
-    wait_until("救援 TX 寫入 WAL", SHORT, || !recover_tx_payloads(&env).is_empty());
+    wait_until("救援 TX 寫入 WAL", SHORT, || {
+        !recover_tx_payloads(&env).is_empty()
+    });
     let started = Instant::now();
     rpc_once(&env.socket, STOP);
     let code = d.wait(Duration::from_secs(30)).code();
@@ -788,9 +930,14 @@ fn allowlist_rejected_reasons_exact() {
     // (2) SERIALWRAP_RUN_DIR 等於預設路徑。P5-T19 修正：Python `default_isolation_paths()` 以「三個隔離變數皆未設」
     // 計算預設值，RUN 預設為 `$XDG_STATE_HOME/serialwrap/run`（XDG_RUNTIME_DIR 為空），與 SERIALWRAP_STATE_DIR 無關；
     // 原預寫的 `<SERIALWRAP_STATE_DIR>/run` 不是預設值（Python 基線實測不拒絕、daemon 照常啟動）。
-    let default_run = PathBuf::from(&env.vars["XDG_STATE_HOME"]).join("serialwrap").join("run");
+    let default_run = PathBuf::from(&env.vars["XDG_STATE_HOME"])
+        .join("serialwrap")
+        .join("run");
     let mut vars = env.vars.clone();
-    vars.insert("SERIALWRAP_RUN_DIR".to_string(), default_run.display().to_string());
+    vars.insert(
+        "SERIALWRAP_RUN_DIR".to_string(),
+        default_run.display().to_string(),
+    );
     vars.insert(ALLOWLIST.to_string(), "/x/by-id/a".to_string());
     let out = run_to_exit(&env, &vars, &[]);
     assert_eq!(out.code, Some(2), "{}", out.stderr);
@@ -813,7 +960,11 @@ fn allowlist_rejected_reasons_exact() {
     );
     // 拒絕前不得以未 strip 的值建立目錄（舊實作在 cwd 下留下 `  /tmp/.../run /serialwrapd.lock`，曾被誤提交）。
     let stray = std::env::current_dir().unwrap().join("  ");
-    assert!(!stray.exists(), "未 strip 的 RUN_DIR 被當成相對路徑建立：{}", stray.display());
+    assert!(
+        !stray.exists(),
+        "未 strip 的 RUN_DIR 被當成相對路徑建立：{}",
+        stray.display()
+    );
 
     // (3) config windows.test_device_allowlist 非 list。
     fs::write(
@@ -870,8 +1021,17 @@ fn uncaught_panic_exit_1() {
     }
     let env = isolated_env();
     let out = run_child_test("uncaught_panic_exit_1", "panic", &env);
-    assert_eq!(out.code, Some(1), "未攔截 panic 必須 exit 1：{}", out.stderr);
-    assert!(out.stderr.contains("slice21 T19 injected panic"), "{}", out.stderr);
+    assert_eq!(
+        out.code,
+        Some(1),
+        "未攔截 panic 必須 exit 1：{}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("slice21 T19 injected panic"),
+        "{}",
+        out.stderr
+    );
 }
 
 #[test]
@@ -884,7 +1044,10 @@ fn handler_panic_does_not_kill_daemon() {
     assert!(r["ok"] == false, "{r:?}");
     assert_eq!(r["error_code"], "EXCEPTION");
     assert!(r["message"].as_str().is_some(), "{r:?}");
-    assert!(rpc_value(&env.socket, "health.ping", "{}")["ok"] == true, "handler panic 不得殺死 daemon");
+    assert!(
+        rpc_value(&env.socket, "health.ping", "{}")["ok"] == true,
+        "handler panic 不得殺死 daemon"
+    );
     rpc_once(&env.socket, STOP);
     assert_eq!(d.wait(LONG).code(), Some(0));
 }
@@ -910,7 +1073,11 @@ fn backend_env_checked_where_python_selects_it() {
     vars.insert("SERIALWRAP_RPC_BACKEND".to_string(), "bogus".to_string());
     let out = run_to_exit(&env, &vars, &["--bogus"]);
     assert_eq!(out.code, Some(2), "{}", out.stderr);
-    assert!(out.stderr.starts_with("usage: serialwrapd"), "{}", out.stderr);
+    assert!(
+        out.stderr.starts_with("usage: serialwrapd"),
+        "{}",
+        out.stderr
+    );
 
     // (2) LOCK 後端非法＋非隔離＋allowlist：SC-19 先行 → rc 2、TEST_DEVICE_ALLOWLIST_REJECTED。
     let mut vars = non_isolated_vars(&env);
@@ -918,7 +1085,11 @@ fn backend_env_checked_where_python_selects_it() {
     vars.insert(ALLOWLIST.to_string(), "/x/by-id/a".to_string());
     let out = run_to_exit(&env, &vars, &[]);
     assert_eq!(out.code, Some(2), "{}", out.stderr);
-    assert!(out.stderr.contains("TEST_DEVICE_ALLOWLIST_REJECTED"), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("TEST_DEVICE_ALLOWLIST_REJECTED"),
+        "{}",
+        out.stderr
+    );
 
     // (3) DEVICE 後端非法：目錄已建立、`no profiles loaded` 已印出後才失敗（exit 1）。
     let env3 = isolated_env();
@@ -959,8 +1130,14 @@ fn allowlist_rejected_before_runtime_dirs_and_lock() {
     let fresh_run = env.root.join("fresh-run");
     let fresh_wal = env.root.join("fresh-wal");
     let mut vars = non_isolated_vars(&env);
-    vars.insert("SERIALWRAP_RUN_DIR".to_string(), fresh_run.display().to_string());
-    vars.insert("SERIALWRAP_WAL_DIR".to_string(), fresh_wal.display().to_string());
+    vars.insert(
+        "SERIALWRAP_RUN_DIR".to_string(),
+        fresh_run.display().to_string(),
+    );
+    vars.insert(
+        "SERIALWRAP_WAL_DIR".to_string(),
+        fresh_wal.display().to_string(),
+    );
     vars.insert(ALLOWLIST.to_string(), "/x/by-id/a".to_string());
     let out = run_to_exit(&env, &vars, &[]);
     assert_eq!(out.code, Some(2), "{}", out.stderr);
@@ -968,11 +1145,20 @@ fn allowlist_rejected_before_runtime_dirs_and_lock() {
         out.stderr,
         "serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: not an isolated instance: SERIALWRAP_STATE_DIR unset\n"
     );
-    assert!(!default_state_dir(&env).exists(), "被拒時不得建立 STATE_DIR");
+    assert!(
+        !default_state_dir(&env).exists(),
+        "被拒時不得建立 STATE_DIR"
+    );
     assert!(!fresh_run.exists(), "被拒時不得建立 RUN_DIR");
     assert!(!fresh_wal.exists(), "被拒時不得建立 WAL_DIR");
-    assert!(!fresh_run.join("serialwrapd.lock").exists(), "被拒時不得取鎖／建立 lock 檔");
-    assert!(!env.config_dir.join("config.yaml").exists(), "被拒時不得寫入 config.yaml");
+    assert!(
+        !fresh_run.join("serialwrapd.lock").exists(),
+        "被拒時不得取鎖／建立 lock 檔"
+    );
+    assert!(
+        !env.config_dir.join("config.yaml").exists(),
+        "被拒時不得寫入 config.yaml"
+    );
 }
 
 /// `contracts/golden/allowlist_unreadable_config.tsv` 一列（Python 基線實測）。
@@ -1030,7 +1216,12 @@ fn unreadable_config_isolated_fail_closed() {
                     panic!("證據不足：permission_denied 列需非 root 或 /usr/bin/setpriv");
                 }
                 let o = Command::new("/usr/bin/setpriv")
-                    .args(["--reuid=65534", "--regid=65534", "--clear-groups", DAEMON_BIN])
+                    .args([
+                        "--reuid=65534",
+                        "--regid=65534",
+                        "--clear-groups",
+                        DAEMON_BIN,
+                    ])
                     .envs(&vars)
                     .stdin(std::process::Stdio::null())
                     .output()
@@ -1047,7 +1238,11 @@ fn unreadable_config_isolated_fail_closed() {
         };
         assert_eq!(out.code, Some(row.code), "{}：{}", row.case_id, out.stderr);
         assert_eq!(out.stderr, row.stderr, "{}", row.case_id);
-        assert!(!env.run_dir.join("serialwrapd.lock").exists(), "{}：被拒時不得取鎖", row.case_id);
+        assert!(
+            !env.run_dir.join("serialwrapd.lock").exists(),
+            "{}：被拒時不得取鎖",
+            row.case_id
+        );
     }
 }
 
@@ -1063,9 +1258,19 @@ fn unreadable_config_non_isolated_unchanged() {
     wait_socket(&env.socket, SHORT);
     let h = health_status(&env.socket);
     assert!(h["ok"] == true, "{h:?}");
-    assert!(h["test_device_allowlist"] == PyValue::Null, "非隔離實例不得輸出 test_device_allowlist：{h:?}");
-    d.wait_stderr_contains("serialwrapd: 寫入 config.yaml endpoint 失敗（非致命）: ", SHORT);
-    assert!(!d.stderr().contains("TEST_DEVICE_ALLOWLIST_REJECTED"), "{}", d.stderr());
+    assert!(
+        h["test_device_allowlist"] == PyValue::Null,
+        "非隔離實例不得輸出 test_device_allowlist：{h:?}"
+    );
+    d.wait_stderr_contains(
+        "serialwrapd: 寫入 config.yaml endpoint 失敗（非致命）: ",
+        SHORT,
+    );
+    assert!(
+        !d.stderr().contains("TEST_DEVICE_ALLOWLIST_REJECTED"),
+        "{}",
+        d.stderr()
+    );
     rpc_once(&env.socket, STOP);
     assert_eq!(d.wait(LONG).code(), Some(0));
 }
@@ -1082,7 +1287,10 @@ fn unreadable_config_env_allowlist_wins() {
     let h = health_status(&env.socket);
     assert!(h["test_device_allowlist"]["enabled"] == true, "{h:?}");
     assert_eq!(h["test_device_allowlist"]["source"], "env");
-    assert_eq!(h["test_device_allowlist"]["coms"], pyjson::loads(r#"["/x/by-id/a"]"#).unwrap());
+    assert_eq!(
+        h["test_device_allowlist"]["coms"],
+        pyjson::loads(r#"["/x/by-id/a"]"#).unwrap()
+    );
     rpc_once(&env.socket, STOP);
     assert_eq!(d.wait(LONG).code(), Some(0));
 }
@@ -1096,7 +1304,10 @@ fn release_kill_hook_env_isolated_only() {
     // 隔離實例：commit 後被殺。
     let env = isolated_env_with_pty_target();
     let mut vars = env.vars.clone();
-    vars.insert("SERIALWRAP_TEST_KILL_AFTER_SAVE".to_string(), "1".to_string());
+    vars.insert(
+        "SERIALWRAP_TEST_KILL_AFTER_SAVE".to_string(),
+        "1".to_string(),
+    );
     let mut d = DaemonProc::spawn_with(&env, &vars, &[]);
     wait_ready(&env, "COM0");
     let r = rpc_once(&env.socket, RELEASE);
@@ -1108,7 +1319,10 @@ fn release_kill_hook_env_isolated_only() {
         d.stderr()
     );
     let state = fs::read_to_string(env.state_dir.join("state.json")).expect("state.json 已落盤");
-    assert!(state.contains("\"released\"") && state.contains(TARGET_BY_ID), "{state}");
+    assert!(
+        state.contains("\"released\"") && state.contains(TARGET_BY_ID),
+        "{state}"
+    );
     let mut d2 = DaemonProc::spawn(&env, &[]);
     wait_socket(&env.socket, SHORT);
     assert_eq!(get_state(&env.socket, "COM0")["state"], "RELEASED");
@@ -1118,7 +1332,10 @@ fn release_kill_hook_env_isolated_only() {
     // 非隔離實例：只寫 WARNING、不終止，release 正常回覆。
     let env = isolated_env_with_pty_target();
     let mut vars = non_isolated_vars(&env);
-    vars.insert("SERIALWRAP_TEST_KILL_AFTER_SAVE".to_string(), "1".to_string());
+    vars.insert(
+        "SERIALWRAP_TEST_KILL_AFTER_SAVE".to_string(),
+        "1".to_string(),
+    );
     let mut d = DaemonProc::spawn_with(&env, &vars, &[]);
     wait_ready(&env, "COM0");
     let r = pyjson::loads(&rpc_once(&env.socket, RELEASE)).unwrap_or(PyValue::Null);
@@ -1139,7 +1356,10 @@ fn release_pause_hook_env_isolated_only() {
     let env = isolated_env_with_pty_target();
     let pause = env.root.join("pause");
     let mut vars = env.vars.clone();
-    vars.insert("SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE".to_string(), pause.display().to_string());
+    vars.insert(
+        "SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE".to_string(),
+        pause.display().to_string(),
+    );
     let mut d = DaemonProc::spawn_with(&env, &vars, &[]);
     wait_ready(&env, "COM0");
     let state_path = env.state_dir.join("state.json");
@@ -1148,10 +1368,17 @@ fn release_pause_hook_env_isolated_only() {
     let release = thread::spawn(move || rpc_once(&socket, RELEASE));
     let arrived = pause.join("arrived");
     wait_until("arrived 標記", LONG, || arrived.exists());
-    assert_eq!(fs::read_to_string(&arrived).unwrap(), format!("pid={}\n", d.pid()));
+    assert_eq!(
+        fs::read_to_string(&arrived).unwrap(),
+        format!("pid={}\n", d.pid())
+    );
     thread::sleep(Duration::from_millis(300));
     assert!(!release.is_finished(), "go 標記出現前 release 不得回覆");
-    assert_eq!(fs::read(&state_path).ok(), before, "commit 前暫停：state.json 不得改變");
+    assert_eq!(
+        fs::read(&state_path).ok(),
+        before,
+        "commit 前暫停：state.json 不得改變"
+    );
     fs::write(pause.join("go"), b"").unwrap();
     let r = pyjson::loads(&release.join().unwrap()).unwrap_or(PyValue::Null);
     assert!(r["ok"] == true, "{r:?}");
@@ -1162,7 +1389,10 @@ fn release_pause_hook_env_isolated_only() {
     let env = isolated_env_with_pty_target();
     let pause = env.root.join("pause");
     let mut vars = non_isolated_vars(&env);
-    vars.insert("SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE".to_string(), pause.display().to_string());
+    vars.insert(
+        "SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE".to_string(),
+        pause.display().to_string(),
+    );
     let mut d = DaemonProc::spawn_with(&env, &vars, &[]);
     wait_ready(&env, "COM0");
     let r = pyjson::loads(&rpc_once(&env.socket, RELEASE)).unwrap_or(PyValue::Null);
@@ -1184,13 +1414,23 @@ fn sigterm_sigint_orderly_stop() {
         let env = isolated_env_with_pty_target();
         let mut d = DaemonProc::spawn(&env, &[]);
         wait_ready(&env, "COM0");
-        let status = Command::new("kill").arg(sig).arg(d.pid().to_string()).status().expect("送出訊號");
+        let status = Command::new("kill")
+            .arg(sig)
+            .arg(d.pid().to_string())
+            .status()
+            .expect("送出訊號");
         assert!(status.success());
         assert_eq!(d.wait(LONG).code(), Some(0), "{sig}：{}", d.stderr());
         assert!(!env.socket.exists(), "{sig}：socket 檔應已移除");
         let last = last_wal_line(&env);
-        assert!(pyjson::loads(&last).is_ok(), "{sig}：WAL 最後一筆不完整：{last}");
-        assert!(pty_can_open_exclusively(&env.pty_slave), "{sig}：tty 應已釋放");
+        assert!(
+            pyjson::loads(&last).is_ok(),
+            "{sig}：WAL 最後一筆不完整：{last}"
+        );
+        assert!(
+            pty_can_open_exclusively(&env.pty_slave),
+            "{sig}：tty 應已釋放"
+        );
         // 鎖已釋放：新 daemon 可取得。
         let mut d2 = DaemonProc::spawn(&env, &[]);
         wait_socket(&env.socket, SHORT);

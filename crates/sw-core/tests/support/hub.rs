@@ -92,7 +92,13 @@ impl HubHarness {
             Arc::new(AtomicBool::new(false)),
             pumps_stop.clone(),
         );
-        pump(data_rx, data.clone(), blocked.clone(), paused.clone(), pumps_stop.clone());
+        pump(
+            data_rx,
+            data.clone(),
+            blocked.clone(),
+            paused.clone(),
+            pumps_stop.clone(),
+        );
         let start = clock.mono_ns();
         let hub = spawn_hub(
             com.to_string(),

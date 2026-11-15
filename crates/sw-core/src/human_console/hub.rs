@@ -62,6 +62,8 @@ pub enum HubCmd {
     /// 07 D-12。
     OpenCom0com {
         port: String,
+        /// close-all 世代快照；release 之前排入的命令不得越過 critical close-all。
+        close_generation: u64,
     },
     Out {
         client_id: String,
@@ -90,6 +92,8 @@ pub struct HubCritical {
     pub close_all: bool,
     /// 自上次取出以來的 close_all 請求數（hub 累加為已處理的 close 世代）。
     pub close_all_requests: u64,
+    /// 單調遞增的已提出 close-all 世代；不隨 pending 請求取出而歸零。
+    pub close_generation: u64,
     pub shutdown: bool,
 }
 
@@ -103,6 +107,9 @@ pub struct HubStatus {
     pub rx_full: AtomicBool,
     /// hub 迴圈輪數（測試與診斷）。
     pub loops: AtomicU64,
+    /// 測試用：累計送入 hub queue 的 com0com 開埠命令。
+    #[cfg(feature = "test-fakes")]
+    pub open_com0com_enqueued: AtomicU64,
     /// hub 的 `pending` 長度（測試與診斷）。
     pub pending: AtomicU64,
     /// 最近的 WARNING（上限 `HUB_WARNINGS_MAX`，同時寫 stderr）。
@@ -136,6 +143,8 @@ impl HubStatus {
             out_dropped: AtomicU64::new(0),
             rx_full: AtomicBool::new(false),
             loops: AtomicU64::new(0),
+            #[cfg(feature = "test-fakes")]
+            open_com0com_enqueued: AtomicU64::new(0),
             pending: AtomicU64::new(0),
             warnings: Mutex::new(VecDeque::new()),
             ring_display: Mutex::new(HashMap::new()),
@@ -209,7 +218,16 @@ impl HubHandle {
         self.critical(|c| {
             c.close_all = true;
             c.close_all_requests += 1;
+            c.close_generation += 1;
         });
+    }
+
+    /// 讀取下一個 hub 命令應綁定的 close-all 世代。
+    pub fn close_generation(&self) -> u64 {
+        self.critical
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .close_generation
     }
     pub fn shutdown(&self) {
         self.critical(|c| c.shutdown = true);
@@ -276,8 +294,15 @@ pub fn spawn_hub(
     clock: Arc<dyn Clock>,
     input_epoch: Arc<AtomicU64>,
 ) -> HubHandle {
-    spawn_hub_with(com, Arc::clone(&platform.console), control, data, clock, input_epoch)
-        .expect("ConsoleMux 建立失敗")
+    spawn_hub_with(
+        com,
+        Arc::clone(&platform.console),
+        control,
+        data,
+        clock,
+        input_epoch,
+    )
+    .expect("ConsoleMux 建立失敗")
 }
 
 /// 同 `spawn_hub`，直接取 console 工廠建立 PAL mux；建立失敗時將錯誤回傳給呼叫端。
@@ -501,14 +526,23 @@ impl Hub {
 
     /// 回 true＝shutdown。
     fn process_critical(&mut self) -> bool {
-        let taken = std::mem::take(&mut *self.critical.lock().unwrap_or_else(|e| e.into_inner()));
+        let taken = {
+            let mut critical = self.critical.lock().unwrap_or_else(|e| e.into_inner());
+            HubCritical {
+                close: std::mem::take(&mut critical.close),
+                close_all: std::mem::replace(&mut critical.close_all, false),
+                close_all_requests: std::mem::replace(&mut critical.close_all_requests, 0),
+                close_generation: critical.close_generation,
+                shutdown: critical.shutdown,
+            }
+        };
         if taken.shutdown {
             return true;
         }
         if taken.close_all {
             self.close_everything();
         }
-        self.close_gen += taken.close_all_requests;
+        self.close_gen = taken.close_generation;
         for cid in taken.close {
             if let Some(id) = self.by_cid.get(&cid).copied() {
                 self.remove_client(id, false);
@@ -632,54 +666,71 @@ impl Hub {
                 self.parked_listener = None;
                 self.status.listener_up.store(false, Ordering::Release);
             }
-            HubCmd::OpenCom0com { port }
+            HubCmd::OpenCom0com { port, .. }
                 if self
                     .active_serial_consoles
                     .values()
                     .any(|active| active == &port) => {}
-            HubCmd::OpenCom0com { port } => match self.factory.open_com0com_console(&port) {
-                Ok(io) => {
-                    let id = self.alloc_id();
-                    if let Err(e) = self.mux.add_io(id, io) {
-                        self.warn(format!(
-                            "serial console 開啟失敗（com={} port={port}）：{}",
-                            self.com, e.py_message
-                        ));
-                        return;
-                    }
-                    self.active_serial_consoles.insert(id, port.clone());
-                    let cid = self.new_client_id();
-                    self.stream_lifetime += 1;
-                    let lifetime = self.stream_lifetime;
-                    let now = self.clock.mono_ns();
-                    self.insert_client(
-                        id,
-                        HubClient {
-                            cid: cid.clone(),
-                            lifetime,
-                            kind: ConsoleTransportKind::Com0com,
-                            ring: OutRing::new(CONSOLE_OUT_RING_BYTES),
-                            telnet: None,
-                            attached_at: now,
-                            pty_path: None,
-                            _keepalive: None,
-                        },
-                    );
-                    self.pending
-                        .push_back(Pending::Control(ControlEvent::ConsoleConnected {
-                            client_id: cid,
-                            client_lifetime: lifetime,
-                            label: format!("serial:{port}"),
-                            vtty: port,
-                            kind: ConsoleTransportKind::Com0com,
-                            close_gen: self.close_gen,
-                        }));
+            HubCmd::OpenCom0com {
+                port,
+                close_generation,
+            } => {
+                // critical close-all 可能在本輪頂端快照後、此命令出列前到達；先套用它再核對世代。
+                if self.process_critical() {
+                    return;
                 }
-                Err(e) => self.warn(format!(
-                    "serial console 開啟失敗（com={} port={port}）：{}",
-                    self.com, e.py_message
-                )),
-            },
+                let requested_generation = self
+                    .critical
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .close_generation;
+                if close_generation != self.close_gen || close_generation != requested_generation {
+                    return;
+                }
+                match self.factory.open_com0com_console(&port) {
+                    Ok(io) => {
+                        let id = self.alloc_id();
+                        if let Err(e) = self.mux.add_io(id, io) {
+                            self.warn(format!(
+                                "serial console 開啟失敗（com={} port={port}）：{}",
+                                self.com, e.py_message
+                            ));
+                            return;
+                        }
+                        self.active_serial_consoles.insert(id, port.clone());
+                        let cid = self.new_client_id();
+                        self.stream_lifetime += 1;
+                        let lifetime = self.stream_lifetime;
+                        let now = self.clock.mono_ns();
+                        self.insert_client(
+                            id,
+                            HubClient {
+                                cid: cid.clone(),
+                                lifetime,
+                                kind: ConsoleTransportKind::Com0com,
+                                ring: OutRing::new(CONSOLE_OUT_RING_BYTES),
+                                telnet: None,
+                                attached_at: now,
+                                pty_path: None,
+                                _keepalive: None,
+                            },
+                        );
+                        self.pending
+                            .push_back(Pending::Control(ControlEvent::ConsoleConnected {
+                                client_id: cid,
+                                client_lifetime: lifetime,
+                                label: format!("serial:{port}"),
+                                vtty: port,
+                                kind: ConsoleTransportKind::Com0com,
+                                close_gen: self.close_gen,
+                            }));
+                    }
+                    Err(e) => self.warn(format!(
+                        "serial console 開啟失敗（com={} port={port}）：{}",
+                        self.com, e.py_message
+                    )),
+                }
+            }
             HubCmd::Out { client_id, item } => {
                 let Some(id) = self.by_cid.get(&client_id).copied() else {
                     return;
@@ -976,12 +1027,21 @@ impl Hub {
             }
         }
         let scan = Pending::Control(ControlEvent::ConsoleScan {
-            scan: ConsoleScanSnapshot { held, taken_at: now },
+            scan: ConsoleScanSnapshot {
+                held,
+                taken_at: now,
+            },
             source: ScanSource::Hub,
         });
         // D-18：pending 有界。尚未送出的 hub 掃描以新快照就地取代（只需最新者）；pending 已滿則略過本次。
         let queued = self.pending.iter().position(|p| {
-            matches!(p, Pending::Control(ControlEvent::ConsoleScan { source: ScanSource::Hub, .. }))
+            matches!(
+                p,
+                Pending::Control(ControlEvent::ConsoleScan {
+                    source: ScanSource::Hub,
+                    ..
+                })
+            )
         });
         match queued {
             Some(i) => self.pending[i] = scan,

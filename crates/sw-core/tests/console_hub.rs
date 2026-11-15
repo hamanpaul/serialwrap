@@ -33,7 +33,9 @@ fn input_events(t: &HubHarness) -> Vec<(String, Vec<u8>)> {
     t.data_events()
         .into_iter()
         .filter_map(|e| match e {
-            DataEvent::ConsoleInputBytes { client_id, bytes, .. } => Some((client_id, bytes)),
+            DataEvent::ConsoleInputBytes {
+                client_id, bytes, ..
+            } => Some((client_id, bytes)),
             _ => None,
         })
         .collect()
@@ -57,7 +59,10 @@ fn greeting_written_before_any_fanout_bytes() {
     assert!(got[12..].starts_with(b"RXDATA"));
     assert!(matches!(
         &t.control_events()[..],
-        [ControlEvent::ConsoleConnected { kind: ConsoleTransportKind::TcpTelnet, .. }]
+        [ControlEvent::ConsoleConnected {
+            kind: ConsoleTransportKind::TcpTelnet,
+            ..
+        }]
     ));
 }
 
@@ -70,7 +75,10 @@ fn slow_console_does_not_block_reader_or_other_console() {
     for _ in 0..384 {
         t.reader_push(&[b'x'; 8192]); // 3 MiB；reader 側一律 try_send
     }
-    assert!(start.elapsed() < Duration::from_millis(200), "reader 不得因 console 背壓阻塞");
+    assert!(
+        start.elapsed() < Duration::from_millis(200),
+        "reader 不得因 console 背壓阻塞"
+    );
     t.settle();
     assert_eq!(
         fast.written_len(),
@@ -100,8 +108,15 @@ fn full_mailbox_pauses_reading_without_blocking_hub() {
     t.block_mailbox(false);
     t.settle();
     // pending 上限 64（CONSOLE_HUB_PENDING_EVENTS）；harness 的 data lane 為 rendezvous，block 期間一律 Full。
-    assert!(t.data_events().len() <= 64, "pending 有界：{}", t.data_events().len());
-    assert!(t.warnings().iter().any(|w| w.contains("session mailbox 已滿")));
+    assert!(
+        t.data_events().len() <= 64,
+        "pending 有界：{}",
+        t.data_events().len()
+    );
+    assert!(t
+        .warnings()
+        .iter()
+        .any(|w| w.contains("session mailbox 已滿")));
 }
 
 // ---------------------------------------------------------------- 表列
@@ -116,7 +131,10 @@ fn telnet_reply_sent_even_in_flash() {
     c.push_input(&[IAC, WILL, NAWS]);
     t.settle();
     assert!(c.written().ends_with(&[IAC, DONT, NAWS]));
-    assert!(input_events(&t).is_empty(), "filter 後無資料 → 不送 ConsoleInputBytes");
+    assert!(
+        input_events(&t).is_empty(),
+        "filter 後無資料 → 不送 ConsoleInputBytes"
+    );
 }
 
 #[test]
@@ -178,7 +196,13 @@ fn echo_out_escaped_for_telnet() {
     let cid = connected_cid(&t);
     t.hub
         .cmd
-        .try_send(HubCmd::Out { client_id: cid, item: OutItem::Display { bytes: vec![0xFF], iac_escaped: false } })
+        .try_send(HubCmd::Out {
+            client_id: cid,
+            item: OutItem::Display {
+                bytes: vec![0xFF],
+                iac_escaped: false,
+            },
+        })
         .unwrap();
     t.settle();
     assert!(c.written().ends_with(&[0xFF, 0xFF]));
@@ -208,10 +232,9 @@ fn pty_io_error_emits_disconnected() {
     let c = t.adopt_pty_with(FakeIo::failing_read());
     t.settle();
     let cid = c.client_id();
-    assert!(t
-        .data_events()
-        .iter()
-        .any(|e| matches!(e, DataEvent::ConsoleDisconnected { client_id, .. } if *client_id == cid)));
+    assert!(t.data_events().iter().any(
+        |e| matches!(e, DataEvent::ConsoleDisconnected { client_id, .. } if *client_id == cid)
+    ));
 }
 
 #[test]
@@ -224,7 +247,11 @@ fn peer_scan_every_3s() {
         t.settle();
     }
     for e in t.control_events() {
-        if let ControlEvent::ConsoleScan { scan, source: ScanSource::Hub } = e {
+        if let ControlEvent::ConsoleScan {
+            scan,
+            source: ScanSource::Hub,
+        } = e
+        {
             times.push(scan.taken_at);
         }
     }
@@ -274,7 +301,9 @@ fn consoles_survive_conn_epoch_change() {
     assert!(!c1.closed());
     assert_eq!(c1.written(), b"oldnew".to_vec());
     assert!(
-        t.data_events().iter().all(|e| !matches!(e, DataEvent::ConsoleDisconnected { .. })),
+        t.data_events()
+            .iter()
+            .all(|e| !matches!(e, DataEvent::ConsoleDisconnected { .. })),
         "epoch 變更不產生 console 斷線"
     );
     // 端到端（真 epoch／IoWorker 重建、slave_path 不變）見 sw-daemon rpc_console::consoles_survive_bridge_rebuild。
@@ -299,7 +328,18 @@ fn critical_close_when_cmd_queue_full() {
     let cid = c1.client_id();
     t.stall();
     let mut sent = 0;
-    while t.hub.cmd.try_send(HubCmd::Out { client_id: cid.clone(), item: OutItem::Display { bytes: b"z".to_vec(), iac_escaped: false } }).is_ok() {
+    while t
+        .hub
+        .cmd
+        .try_send(HubCmd::Out {
+            client_id: cid.clone(),
+            item: OutItem::Display {
+                bytes: b"z".to_vec(),
+                iac_escaped: false,
+            },
+        })
+        .is_ok()
+    {
         sent += 1;
     }
     assert!(sent >= 1);
@@ -320,7 +360,11 @@ fn no_peer_pty_display_cleared_after_grace() {
     assert!(t.ring_display_bytes(&c.client_id()) > 0);
     t.advance(Duration::from_millis(3000)); // peer scan（attach 後已過 2.0 s grace）
     t.settle();
-    assert_eq!(t.ring_display_bytes(&c.client_id()), 0, "D-05：Display 清空");
+    assert_eq!(
+        t.ring_display_bytes(&c.client_id()),
+        0,
+        "D-05：Display 清空"
+    );
 }
 
 #[test]
@@ -336,8 +380,17 @@ fn control_overflow_closes_console() {
     }
     t.settle();
     assert!(deaf.closed());
-    assert!(t.data_events().iter().any(|e| matches!(e, DataEvent::ConsoleDisconnected { .. })));
-    assert_eq!(t.warnings().iter().filter(|w| w.contains("協商回覆累積超過 65536 bytes")).count(), 1);
+    assert!(t
+        .data_events()
+        .iter()
+        .any(|e| matches!(e, DataEvent::ConsoleDisconnected { .. })));
+    assert_eq!(
+        t.warnings()
+            .iter()
+            .filter(|w| w.contains("協商回覆累積超過 65536 bytes"))
+            .count(),
+        1
+    );
     assert!(!other.closed());
 }
 
@@ -352,10 +405,19 @@ fn telnet_accept_paused_at_32() {
         assert!(c.written().starts_with(&TELNET_GREETING));
     }
     assert!(clients[32].written().is_empty(), "第 33 個未被 accept");
-    assert_eq!(t.warnings().iter().filter(|w| w.contains("console 數已達 32")).count(), 1);
+    assert_eq!(
+        t.warnings()
+            .iter()
+            .filter(|w| w.contains("console 數已達 32"))
+            .count(),
+        1
+    );
     t.hub.close(&connected_cid(&t));
     t.settle();
-    assert!(clients[32].written().starts_with(&TELNET_GREETING), "關閉一個後被 accept");
+    assert!(
+        clients[32].written().starts_with(&TELNET_GREETING),
+        "關閉一個後被 accept"
+    );
 }
 
 #[test]
@@ -366,8 +428,17 @@ fn hub_rx_queue_full_drops_and_counts() {
     for _ in 0..300 {
         t.reader_push(b"x");
     }
-    assert_eq!(t.status().rx_dropped_chunks.load(Ordering::Relaxed), (300 - CONSOLE_HUB_RX_QUEUE) as u64);
-    assert_eq!(t.reader_warnings().iter().filter(|w| w.contains("fan-out 佇列已滿")).count(), 1);
+    assert_eq!(
+        t.status().rx_dropped_chunks.load(Ordering::Relaxed),
+        (300 - CONSOLE_HUB_RX_QUEUE) as u64
+    );
+    assert_eq!(
+        t.reader_warnings()
+            .iter()
+            .filter(|w| w.contains("fan-out 佇列已滿"))
+            .count(),
+        1
+    );
     t.unstall();
     t.settle();
 }
@@ -389,17 +460,35 @@ fn loop_quota_bounds_drain() {
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert!(t.loops() - loops0 <= 2, "close_all 在 2 輪迴圈內生效（D-17(2)）");
+    assert!(
+        t.loops() - loops0 <= 2,
+        "close_all 在 2 輪迴圈內生效（D-17(2)）"
+    );
 }
 
 #[test]
 fn com0com_open_failure_logs_and_continues() {
     let t = HubHarness::tcp("COM0");
     t.fake.fail_next_com0com();
-    t.hub.cmd.try_send(HubCmd::OpenCom0com { port: "COM40".into() }).unwrap();
+    t.hub
+        .cmd
+        .try_send(HubCmd::OpenCom0com {
+            port: "COM40".into(),
+            close_generation: t.hub.close_generation(),
+        })
+        .unwrap();
     t.settle();
-    assert!(t.warnings().iter().any(|w| w.contains("serial console 開啟失敗") && w.contains("port=COM40")));
-    t.hub.cmd.try_send(HubCmd::OpenCom0com { port: "COM41".into() }).unwrap();
+    assert!(t
+        .warnings()
+        .iter()
+        .any(|w| w.contains("serial console 開啟失敗") && w.contains("port=COM40")));
+    t.hub
+        .cmd
+        .try_send(HubCmd::OpenCom0com {
+            port: "COM41".into(),
+            close_generation: t.hub.close_generation(),
+        })
+        .unwrap();
     t.settle();
     assert_eq!(t.fake.com0com_opened().len(), 1, "hub 續行");
     assert!(t.control_events().iter().any(|e| matches!(e,
@@ -449,7 +538,10 @@ fn console_rx_handler_panic_isolated() {
     t.settle();
     good.push_input(b"ok");
     t.settle();
-    assert!(t.warnings().iter().any(|w| w.contains("console RX handler 例外")));
+    assert!(t
+        .warnings()
+        .iter()
+        .any(|w| w.contains("console RX handler 例外")));
     assert!(input_events(&t).iter().any(|(_, b)| b == b"ok"));
 }
 
@@ -468,7 +560,9 @@ fn fill_pending(t: &HubHarness) -> sw_pal::fakes::console::FakeConsoleRef {
         std::thread::sleep(Duration::from_millis(1));
     }
     let deadline = Instant::now() + Duration::from_secs(2);
-    while t.status().pending.load(Ordering::Acquire) < sw_proto::constants::CONSOLE_HUB_PENDING_EVENTS as u64 {
+    while t.status().pending.load(Ordering::Acquire)
+        < sw_proto::constants::CONSOLE_HUB_PENDING_EVENTS as u64
+    {
         assert!(Instant::now() < deadline, "pending 未滿");
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -484,7 +578,10 @@ fn full_pending_does_not_spin() {
     let before = t.status().loops.load(Ordering::Acquire);
     std::thread::sleep(Duration::from_millis(300));
     let spins = t.status().loops.load(Ordering::Acquire) - before;
-    assert!(spins <= 60, "300 ms 內 hub 迴圈 {spins} 輪（應以 ~10 ms 逾時重試，非空轉）");
+    assert!(
+        spins <= 60,
+        "300 ms 內 hub 迴圈 {spins} 輪（應以 ~10 ms 逾時重試，非空轉）"
+    );
     t.block_mailbox(false);
 }
 
@@ -499,7 +596,10 @@ fn scan_does_not_grow_pending_beyond_cap() {
         std::thread::sleep(Duration::from_millis(30));
     }
     let pending = t.status().pending.load(Ordering::Acquire);
-    assert!(pending <= sw_proto::constants::CONSOLE_HUB_PENDING_EVENTS as u64, "pending={pending}");
+    assert!(
+        pending <= sw_proto::constants::CONSOLE_HUB_PENDING_EVENTS as u64,
+        "pending={pending}"
+    );
     t.block_mailbox(false);
 }
 

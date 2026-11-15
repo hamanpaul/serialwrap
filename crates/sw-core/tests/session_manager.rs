@@ -9,9 +9,9 @@ mod support;
 use std::time::{Duration, Instant};
 
 use support::*;
+use sw_core::custody::CustodyPhaseSnapshot;
 use sw_core::session_core::{SessionRequest, SessionState};
 use sw_core::session_manager::SessionManager;
-use sw_core::custody::CustodyPhaseSnapshot;
 use sw_core::state_store::{LoadedState, ReleasedRow};
 use sw_pal::fakes::serial::FakeWriteStep;
 use sw_pal::traits::{
@@ -341,7 +341,10 @@ fn dynamic_probe_and_bridge_share_preopened_port() {
     m.mgr.update_devices(&m.snapshot());
     m.mgr.bootstrap_attach();
     m.wait_state("COM0", "READY");
-    assert_eq!(s_of(&m.session("COM0"), "profile_source").as_deref(), Some("detected"));
+    assert_eq!(
+        s_of(&m.session("COM0"), "profile_source").as_deref(),
+        Some("detected")
+    );
     assert_eq!(m.serial.open_attempts(&real), 1, "整段只 open 一次");
     assert_eq!(dev.open_count(), 1);
     assert_eq!(dev.close_count(), 0, "PROBE 與正式 bridge 之間沒有 close");
@@ -350,7 +353,10 @@ fn dynamic_probe_and_bridge_share_preopened_port() {
         "無 CloseReceipt 介於 PROBE 與正式 bridge 之間：{:?}",
         m.events()
     );
-    match m.serial.open_exclusive(&DevicePath(real.clone()), &probe_cfg()) {
+    match m
+        .serial
+        .open_exclusive(&DevicePath(real.clone()), &probe_cfg())
+    {
         Err(OpenError::Held(_)) => {}
         Err(other) => panic!("外部 open 應得 Held，實際 {other:?}"),
         Ok(_) => panic!("外部 open 應得 Held，實際成功"),
@@ -391,10 +397,11 @@ fn sticky_persisted_only_when_ready_and_path_unchanged() {
         }
     }
     let _resume_open = ResumeOnDrop(open_resume_tx.clone());
-    m2.mgr.set_open_bridge_post_take_hook_for_test(Box::new(move || {
-        let _ = open_enter_tx.send(());
-        let _ = open_resume_rx.recv();
-    }));
+    m2.mgr
+        .set_open_bridge_post_take_hook_for_test(Box::new(move || {
+            let _ = open_enter_tx.send(());
+            let _ = open_resume_rx.recv();
+        }));
     m2.mgr.update_devices(&m2.snapshot());
     m2.mgr.bootstrap_attach();
     assert!(
@@ -419,13 +426,13 @@ fn sticky_persisted_only_when_ready_and_path_unchanged() {
         "open 屏障時 session 必須仍未 READY"
     );
     assert!(
-        m2.events().iter().any(|event| event == &format!("open:{old_real}")),
+        m2.events()
+            .iter()
+            .any(|event| event == &format!("open:{old_real}")),
         "舊路徑必須已實際進入 open：{:?}",
         m2.events()
     );
-    open_resume_tx
-        .send(())
-        .expect("放行舊路徑 open worker");
+    open_resume_tx.send(()).expect("放行舊路徑 open worker");
     wait_until("舊路徑登入結束但尚未 READY", || {
         m2.state_of("COM0").as_deref() == Some("ATTACHED")
     });
@@ -992,6 +999,22 @@ fn clear_paths() {
 }
 
 #[test]
+fn device_not_bound_synthetic_profile_returns_device_not_bound() {
+    // Python `SessionManager.attach_session` 的防禦分支（origin/main `sw_core/session_manager.py:3885-3887`）；
+    // 正常 `load_profiles` 會在 `sw_core/config.py:364-366` 丟棄無 device_by_id 的 target。
+    let mut profile = profile_of(SHELL_PROFILE);
+    profile.device_by_id.clear();
+    let mut h = CoreHarness::new_with_profile(profile);
+
+    let response = h
+        .rpc(SessionRequest::SessionAttach)
+        .expect("session.attach 應以 DEVICE_NOT_BOUND 回應，而非穿出例外");
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(code_of(&response).as_deref(), Some("DEVICE_NOT_BOUND"));
+    assert!(matches!(response.get("session"), Some(PyValue::Dict(_))));
+}
+
+#[test]
 fn session_attach_paths() {
     let rig_s = |yaml: &str| ManagerRig::with(yaml, LoadedState::default(), None);
 
@@ -1090,7 +1113,10 @@ fn session_attach_paths() {
     let r = rpc(m.mgr.route(&sid, SessionRequest::SessionAttach, RPC));
     assert_eq!(code_of(&r).as_deref(), Some("SESSION_NOT_READY"));
     let sess = session_field(&r);
-    assert_eq!(r.get("last_error"), Some(&PyValue::from("PROMPT_UNAVAILABLE")));
+    assert_eq!(
+        r.get("last_error"),
+        Some(&PyValue::from("PROMPT_UNAVAILABLE"))
+    );
     assert_eq!(r.get("last_error"), sess.get("last_error"));
     assert_eq!(r.get("last_error_detail"), sess.get("last_error_detail"));
 
@@ -1329,7 +1355,11 @@ fn wp510r_r18_shutdown_reaper_deadline_preserves_blocked_worker_cleanup() {
     wait_until("writer 放行後保管終態完成", || {
         writer_manager.mgr.terminal_for_test(writer_token).is_some()
     });
-    assert_eq!(writer_device.close_count(), 1, "背景收尾關閉 writer handle 一次");
+    assert_eq!(
+        writer_device.close_count(),
+        1,
+        "背景收尾關閉 writer handle 一次"
+    );
     assert!(!writer_device.is_open(), "背景收尾最終釋放 writer handle");
     assert_eq!(
         writer_manager
@@ -1368,7 +1398,10 @@ fn wp510r_r18_shutdown_reaper_deadline_preserves_blocked_worker_cleanup() {
             worker: Box::new(sw_core::custody::ReclaimWorker::Real(close_worker)),
         })
         .expect("回收者受理 close 回收命令");
-    assert!(close_device.wait_paused(Duration::from_secs(5)), "worker 應停在 fake close");
+    assert!(
+        close_device.wait_paused(Duration::from_secs(5)),
+        "worker 應停在 fake close"
+    );
     let start = Instant::now();
     let close_report = close_manager.mgr.shutdown(Duration::from_millis(120));
     assert!(
@@ -1388,7 +1421,11 @@ fn wp510r_r18_shutdown_reaper_deadline_preserves_blocked_worker_cleanup() {
     wait_until("close 放行後保管終態完成", || {
         close_manager.mgr.terminal_for_test(close_token).is_some()
     });
-    assert_eq!(close_device.close_count(), 1, "背景收尾關閉暫停中的 handle 一次");
+    assert_eq!(
+        close_device.close_count(),
+        1,
+        "背景收尾關閉暫停中的 handle 一次"
+    );
     assert!(!close_device.is_open(), "背景收尾最終釋放暫停中的 handle");
     assert_eq!(
         close_manager
@@ -2131,31 +2168,52 @@ fn gpx_released_attach_persist_failure_releases_memory_block() {
         REAL,
         OpenError::Other(PalError::io(5, "[Errno 5] Input/output error")),
     );
-    m.fs.fail_next_atomic_write(PalError::io(
-        28,
-        "[Errno 28] No space left on device",
-    ));
+    m.fs.fail_next_atomic_write(PalError::io(28, "[Errno 28] No space left on device"));
     let error = m
         .mgr
-        .route(
-            &sid,
-            SessionRequest::DeviceAttach { force: true },
-            RPC,
-        )
+        .route(&sid, SessionRequest::DeviceAttach { force: true }, RPC)
         .expect_err("unreleased 落盤失敗須由 route 回 Err");
-    assert!(error.message.contains("No space left on device"), "{}", error.message);
+    assert!(
+        error.message.contains("No space left on device"),
+        "{}",
+        error.message
+    );
 
     let failed = m.session("COM0");
-    assert_eq!(s_of(&failed, "state").as_deref(), Some("DETACHED"), "{failed:?}");
-    assert_eq!(s_of(&failed, "last_error").as_deref(), Some("ATTACH_FAILED:OSError"), "{failed:?}");
-    assert_eq!(failed.get("released_by"), Some(&PyValue::Null), "{failed:?}");
-    assert_eq!(failed.get("released_at"), Some(&PyValue::Null), "{failed:?}");
-    assert_eq!(failed.get("released_reason"), Some(&PyValue::Null), "{failed:?}");
+    assert_eq!(
+        s_of(&failed, "state").as_deref(),
+        Some("DETACHED"),
+        "{failed:?}"
+    );
+    assert_eq!(
+        s_of(&failed, "last_error").as_deref(),
+        Some("ATTACH_FAILED:OSError"),
+        "{failed:?}"
+    );
+    assert_eq!(
+        failed.get("released_by"),
+        Some(&PyValue::Null),
+        "{failed:?}"
+    );
+    assert_eq!(
+        failed.get("released_at"),
+        Some(&PyValue::Null),
+        "{failed:?}"
+    );
+    assert_eq!(
+        failed.get("released_reason"),
+        Some(&PyValue::Null),
+        "{failed:?}"
+    );
 
     // 同一 actor 的 GetState 作為前一個 DeviceDetached 事件屏障，再以相同 by-id 重插。
     m.mgr.update_devices(&[]);
     let unplugged = m.session("COM0");
-    assert_eq!(s_of(&unplugged, "state").as_deref(), Some("DETACHED"), "{unplugged:?}");
+    assert_eq!(
+        s_of(&unplugged, "state").as_deref(),
+        Some("DETACHED"),
+        "{unplugged:?}"
+    );
     m.mgr.update_devices(&m.snapshot());
     m.wait_state("COM0", "READY");
     assert_eq!(m.serial.open_attempts(REAL), 2, "重插應再次經實際開埠");
@@ -2272,7 +2330,10 @@ fn wp510_b_handoff_cleans_old_identity_and_restart_block() {
         Some("removed-detected-template"),
         "handoff 必須保留 pin／detected 記錄"
     );
-    assert!(m.mgr.resolve(SID).is_none(), "舊 sid 應在 handoff 後立即退休");
+    assert!(
+        m.mgr.resolve(SID).is_none(),
+        "舊 sid 應在 handoff 後立即退休"
+    );
     let restarted = m.restart();
     assert!(restarted.mgr.resolve(SID).is_none(), "重啟不得復活舊佔位");
     assert!(!restarted.load_state_now().released.contains_key(SID));
@@ -2290,7 +2351,8 @@ fn wp510_b_concurrent_placeholder_attach_returns_session_recovering() {
 
     let manager = m.mgr.clone();
     let attach_sid = sid.clone();
-    let attach = std::thread::spawn(move || manager.attach_released_placeholder(&attach_sid, false));
+    let attach =
+        std::thread::spawn(move || manager.attach_released_placeholder(&attach_sid, false));
     wait_until("第一次佔位 attach 停在 open_exclusive", || {
         m.serial.open_attempts(REAL) == 1
     });
@@ -2301,14 +2363,23 @@ fn wp510_b_concurrent_placeholder_attach_returns_session_recovering() {
 
     assert_eq!(
         second.0.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["ok", "error_code", "drain_stalled", "drain_timeout_epoch", "session"],
+        [
+            "ok",
+            "error_code",
+            "drain_stalled",
+            "drain_timeout_epoch",
+            "session"
+        ],
         "佔位 attach 在途回應須有完整 recovering 欄位：{second:?}"
     );
     assert_eq!(code_of(&second).as_deref(), Some("SESSION_RECOVERING"));
     assert_eq!(second.get("ok"), Some(&PyValue::Bool(false)));
     assert_eq!(second.get("drain_stalled"), Some(&PyValue::Bool(false)));
     assert_eq!(second.get("drain_timeout_epoch"), Some(&PyValue::Null));
-    assert!(is_ok(&first), "第一個未被取消的 attach 可正常交接：{first:?}");
+    assert!(
+        is_ok(&first),
+        "第一個未被取消的 attach 可正常交接：{first:?}"
+    );
 }
 
 #[test]
@@ -2412,7 +2483,9 @@ fn wp510_review_late_placeholder_attach_completion_clears_drain_stall() {
     let attach = std::thread::spawn(move || {
         let _ = attach_tx.send(attach_manager.attach_released_placeholder(&attach_sid, false));
     });
-    wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(REAL) == 1);
+    wait_until("佔位 attach 停在 open_exclusive", || {
+        m.serial.open_attempts(REAL) == 1
+    });
 
     let release_manager = m.mgr.clone();
     let release_sid = sid.clone();
@@ -2443,11 +2516,9 @@ fn wp510_review_late_placeholder_attach_completion_clears_drain_stall() {
     ));
 
     m.serial.release_open(REAL);
-    let attach_reply = rpc(
-        attach_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("取消的佔位 attach 應在開埠返回後完成"),
-    );
+    let attach_reply = rpc(attach_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("取消的佔位 attach 應在開埠返回後完成"));
     attach.join().expect("attach thread 不應 panic");
     release.join().expect("release thread 不應 panic");
     assert_eq!(
@@ -2515,14 +2586,14 @@ fn wp510_review4_release_during_placeholder_open(
 ) -> (Result<PyDict, PyErr>, Result<PyDict, PyErr>) {
     m.serial.block_open(real);
     let (cancel_tx, cancel_rx) = crossbeam_channel::bounded::<()>(1);
-    m.mgr.set_placeholder_release_cancel_hook_for_test(Box::new(move || {
-        let _ = cancel_tx.try_send(());
-    }));
+    m.mgr
+        .set_placeholder_release_cancel_hook_for_test(Box::new(move || {
+            let _ = cancel_tx.try_send(());
+        }));
     let attach_manager = m.mgr.clone();
     let attach_sid = sid.to_string();
-    let attach = std::thread::spawn(move || {
-        attach_manager.attach_released_placeholder(&attach_sid, false)
-    });
+    let attach =
+        std::thread::spawn(move || attach_manager.attach_released_placeholder(&attach_sid, false));
     wait_until("佔位 attach 停在 open_exclusive", || {
         m.serial.open_attempts(real) == 1
     });
@@ -2558,8 +2629,16 @@ fn wp510_review4_release_cancel_fills_null_release_metadata_and_persists() {
     let sid = m.mgr.resolve(SID).expect("佔位 session");
     m.mgr.update_devices(&m.snapshot());
     let before = m.session(SID);
-    assert_eq!(before.get("released_by"), Some(&PyValue::Null), "前置：released_by 為 null");
-    assert_eq!(before.get("released_at"), Some(&PyValue::Null), "前置：released_at 為 null");
+    assert_eq!(
+        before.get("released_by"),
+        Some(&PyValue::Null),
+        "前置：released_by 為 null"
+    );
+    assert_eq!(
+        before.get("released_at"),
+        Some(&PyValue::Null),
+        "前置：released_at 為 null"
+    );
     m.clock.set_wall_us(WALL_US);
     let writes_before = m.state_writes();
 
@@ -2613,7 +2692,10 @@ fn wp510_review4_release_cancel_fills_null_release_metadata_and_persists() {
     assert_eq!(row.released_at, PyValue::from(expected_at.as_str()));
     assert_eq!(row.reason, PyValue::from("manual"));
     assert_eq!(m.mgr.released_placeholder(&sid), Some(true));
-    assert!(m.mgr.resolve("t:COM3").is_none(), "release 成功後不得交接 dynamic");
+    assert!(
+        m.mgr.resolve("t:COM3").is_none(),
+        "release 成功後不得交接 dynamic"
+    );
 }
 
 /// wp510 第四次整包審查 Medium 1（持久化失敗）：同一情境下 state.json 持續 ENOSPC。Python 收尾的
@@ -2658,13 +2740,20 @@ fn wp510_review4_release_cancel_persist_enospc_fails_release_then_retries() {
     assert_eq!(s_of(&listed, "state").as_deref(), Some("RELEASED"));
     assert_eq!(s_of(&listed, "released_by").as_deref(), Some("cli"));
     assert_eq!(
-        m.load_state_now().released.get(SID).map(|row| row.released_by.clone()),
+        m.load_state_now()
+            .released
+            .get(SID)
+            .map(|row| row.released_by.clone()),
         Some(PyValue::Null),
         "落盤失敗時 state.json 仍是舊列"
     );
 
     let retry = rpc(wp510_release(&m.mgr, &sid));
-    assert_eq!(retry.get("already_released"), Some(&PyValue::Bool(true)), "{retry:?}");
+    assert_eq!(
+        retry.get("already_released"),
+        Some(&PyValue::Bool(true)),
+        "{retry:?}"
+    );
     let retried = session_field(&retry);
     assert_eq!(
         s_of(&retried, "released_by").as_deref(),
@@ -2699,20 +2788,23 @@ fn wp510_lifecycle_shutdown_cancel_fail_close_keeps_placeholder_blocked() {
     let attach = std::thread::spawn(move || {
         let _ = attach_tx.send(attach_manager.attach_released_placeholder(&attach_sid, false));
     });
-    wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(REAL) == 1);
+    wait_until("佔位 attach 停在 open_exclusive", || {
+        m.serial.open_attempts(REAL) == 1
+    });
 
     let shutdown = m.mgr.shutdown(Duration::from_millis(100));
     device.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
     m.serial.release_open(REAL);
-    let attach_reply = rpc(
-        attach_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("shutdown 取消的開埠應返回"),
-    );
+    let attach_reply = rpc(attach_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("shutdown 取消的開埠應返回"));
     attach.join().expect("attach worker 不應 panic");
 
     let custody = m.mgr.custody_for_test(BY_ID).expect("custody entry");
-    assert!(matches!(custody.phase, CustodyPhaseSnapshot::CloseFailed { .. }), "CloseFailed");
+    assert!(
+        matches!(custody.phase, CustodyPhaseSnapshot::CloseFailed { .. }),
+        "CloseFailed"
+    );
     assert!(m.mgr.unconfirmed_close_for_test(BY_ID), "unconfirmed_close");
     let second_shutdown = m.mgr.shutdown(Duration::from_millis(100));
     let release_started = Instant::now();
@@ -2725,7 +2817,10 @@ fn wp510_lifecycle_shutdown_cancel_fail_close_keeps_placeholder_blocked() {
             .any(|(target, drained)| target == &format!("attach:{BY_ID}") && !drained),
         "首次 shutdown 不得把阻塞開埠列為已排空：{shutdown:?}"
     );
-    assert_eq!(code_of(&attach_reply).as_deref(), Some("SESSION_RECOVERING"));
+    assert_eq!(
+        code_of(&attach_reply).as_deref(),
+        Some("SESSION_RECOVERING")
+    );
     assert_eq!(device.close_count(), 1);
     assert!(device.is_open(), "fail_close 後 handle 仍須保持 open");
     assert!(
@@ -2756,7 +2851,9 @@ fn wp510_lifecycle_device_path_change_cancel_fail_close_keeps_placeholder_blocke
     let attach = std::thread::spawn(move || {
         let _ = attach_tx.send(attach_manager.attach_released_placeholder(&attach_sid, false));
     });
-    wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(REAL) == 1);
+    wait_until("佔位 attach 停在 open_exclusive", || {
+        m.serial.open_attempts(REAL) == 1
+    });
 
     m.serial.add_device(CHANGED);
     m.mgr.update_devices(&[(
@@ -2768,21 +2865,25 @@ fn wp510_lifecycle_device_path_change_cancel_fail_close_keeps_placeholder_blocke
     )]);
     device.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
     m.serial.release_open(REAL);
-    let attach_reply = rpc(
-        attach_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("裝置改指取消的開埠應返回"),
-    );
+    let attach_reply = rpc(attach_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("裝置改指取消的開埠應返回"));
     attach.join().expect("attach worker 不應 panic");
 
     let custody = m.mgr.custody_for_test(BY_ID).expect("custody entry");
-    assert!(matches!(custody.phase, CustodyPhaseSnapshot::CloseFailed { .. }), "CloseFailed");
+    assert!(
+        matches!(custody.phase, CustodyPhaseSnapshot::CloseFailed { .. }),
+        "CloseFailed"
+    );
     assert!(m.mgr.unconfirmed_close_for_test(BY_ID), "unconfirmed_close");
     let release_started = Instant::now();
     let release_reply = rpc(wp510_release(&m.mgr, &sid));
     let release_elapsed = release_started.elapsed();
 
-    assert_eq!(code_of(&attach_reply).as_deref(), Some("DEVICE_NOT_PRESENT"));
+    assert_eq!(
+        code_of(&attach_reply).as_deref(),
+        Some("DEVICE_NOT_PRESENT")
+    );
     assert_eq!(device.close_count(), 1);
     assert!(device.is_open(), "fail_close 後 handle 仍須保持 open");
     assert_eq!(code_of(&release_reply).as_deref(), Some("DRAIN_STALLED"));
@@ -2841,11 +2942,16 @@ fn wp510_review4_failed_preopened_close_warns_with_by_id_and_error() {
     }));
 
     let response = rpc(m.mgr.attach_released_placeholder(&sid, false));
-    assert!(is_ok(&response), "device.attach 應接受在線佔位：{response:?}");
+    assert!(
+        is_ok(&response),
+        "device.attach 應接受在線佔位：{response:?}"
+    );
     hook_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("交接後的 PROBE 應在提交前觸發裝置改指");
-    wait_until("被取消的預開 handle 嘗試關閉", || device.close_count() == 1);
+    wait_until("被取消的預開 handle 嘗試關閉", || {
+        device.close_count() == 1
+    });
     let warnings = wp510_review4_wait_warning(&m, WP510_REVIEW4_CLOSE_WARNING);
 
     assert!(
@@ -2866,7 +2972,10 @@ fn wp510_review4_failed_preopened_close_warns_with_by_id_and_error() {
         "關閉失敗後仍須保留阻擋"
     );
     assert!(m.mgr.resolve(SID).is_none(), "舊佔位已於交接時退休");
-    assert!(m.mgr.resolve("t:COM3").is_none(), "被取消的交接不得建立正式 session");
+    assert!(
+        m.mgr.resolve("t:COM3").is_none(),
+        "被取消的交接不得建立正式 session"
+    );
 }
 
 /// wp510 第四次整包審查 Medium 2（退休前）：佔位開埠途中裝置改指，`attach_released_placeholder` 收尾關閉晚到
@@ -2886,8 +2995,11 @@ fn wp510_review4_failed_late_handle_close_before_retirement_warns() {
 
     let attach_manager = m.mgr.clone();
     let attach_sid = sid.clone();
-    let attach = std::thread::spawn(move || attach_manager.attach_released_placeholder(&attach_sid, false));
-    wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(REAL) == 1);
+    let attach =
+        std::thread::spawn(move || attach_manager.attach_released_placeholder(&attach_sid, false));
+    wait_until("佔位 attach 停在 open_exclusive", || {
+        m.serial.open_attempts(REAL) == 1
+    });
     m.serial.add_device(CHANGED);
     m.mgr.update_devices(&[(
         BY_ID.to_string(),
@@ -2901,12 +3013,18 @@ fn wp510_review4_failed_late_handle_close_before_retirement_warns() {
     let attach_reply = rpc(attach.join().expect("attach thread 不應 panic"));
     let warnings = m.warnings();
 
-    assert_eq!(code_of(&attach_reply).as_deref(), Some("DEVICE_NOT_PRESENT"));
+    assert_eq!(
+        code_of(&attach_reply).as_deref(),
+        Some("DEVICE_NOT_PRESENT")
+    );
     assert!(
         warnings.iter().any(|w| w == WP510_REVIEW4_CLOSE_WARNING),
         "晚到 handle 關閉失敗必須以 by_id 與錯誤告警：{warnings:?}"
     );
-    assert!(m.mgr.has_inflight_attach_for_test(BY_ID), "關閉失敗後仍須保留阻擋");
+    assert!(
+        m.mgr.has_inflight_attach_for_test(BY_ID),
+        "關閉失敗後仍須保留阻擋"
+    );
     assert_eq!(m.mgr.released_placeholder(&sid), Some(true));
 }
 
@@ -2925,16 +3043,20 @@ fn wp510_review4_failed_session_preopened_close_on_shutdown_warns() {
     let weak = std::sync::Arc::downgrade(&m.mgr);
     let hook_device = device.clone();
     let (hook_tx, hook_rx) = crossbeam_channel::bounded(1);
-    m.mgr.set_open_bridge_pre_take_hook_for_test(Box::new(move || {
-        if let Some(manager) = weak.upgrade() {
-            hook_device.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
-            let drained = manager.shutdown(Duration::from_millis(50));
-            let _ = hook_tx.send(drained);
-        }
-    }));
+    m.mgr
+        .set_open_bridge_pre_take_hook_for_test(Box::new(move || {
+            if let Some(manager) = weak.upgrade() {
+                hook_device.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
+                let drained = manager.shutdown(Duration::from_millis(50));
+                let _ = hook_tx.send(drained);
+            }
+        }));
 
     let response = rpc(m.mgr.attach_released_placeholder(&sid, false));
-    assert!(is_ok(&response), "device.attach 應接受在線佔位：{response:?}");
+    assert!(
+        is_ok(&response),
+        "device.attach 應接受在線佔位：{response:?}"
+    );
     hook_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("正式 session 的 open_bridge 應觸發停機");
@@ -2946,7 +3068,10 @@ fn wp510_review4_failed_session_preopened_close_on_shutdown_warns() {
         "session 預開 handle 關閉失敗必須以 by_id 與錯誤告警：{warnings:?}"
     );
     assert_eq!(device.open_count(), 1, "停機後不得重新開埠");
-    assert!(device.take_tx().iter().all(|b| *b == b'\n'), "停機後只允許交接 PROBE 的 \\n");
+    assert!(
+        device.take_tx().iter().all(|b| *b == b'\n'),
+        "停機後只允許交接 PROBE 的 \\n"
+    );
 }
 
 /// wp510 第四次整包審查 Medium 3：佔位在 T0 啟動建立、T1 才 `device.attach`。Python 啟動還原以 setter 寫入 T0
@@ -3046,12 +3171,16 @@ fn wp510_tx_shutdown_after_still_valid_before_placeholder_probe_submit_sends_zer
     }));
 
     let response = rpc(m.mgr.attach_released_placeholder(&sid, false));
-    assert!(is_ok(&response), "device.attach 應接受在線佔位：{response:?}");
+    assert!(
+        is_ok(&response),
+        "device.attach 應接受在線佔位：{response:?}"
+    );
     let drained = hook_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("交接後的 PROBE 應在提交前觸發 shutdown");
     assert!(
-        m.mgr.wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)),
+        m.mgr
+            .wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)),
         "shutdown 取消的交接 worker 應收尾"
     );
 
@@ -3061,8 +3190,15 @@ fn wp510_tx_shutdown_after_still_valid_before_placeholder_probe_submit_sends_zer
             .any(|(target, ok)| target == &format!("attach:{BY_ID}") && !ok),
         "PROBE 尚在 worker 內時 shutdown 不得把交接作業列為已排空：{drained:?}"
     );
-    assert_eq!(device.os_submits(), 0, "shutdown 後 PROBE 不得提交任何 bytes 給 OS");
-    assert!(device.take_tx().is_empty(), "shutdown 後裝置不得收到 PROBE 的 \\n");
+    assert_eq!(
+        device.os_submits(),
+        0,
+        "shutdown 後 PROBE 不得提交任何 bytes 給 OS"
+    );
+    assert!(
+        device.take_tx().is_empty(),
+        "shutdown 後裝置不得收到 PROBE 的 \\n"
+    );
     assert_eq!(wp510_probe_tx_rows(&m), 0, "被撤銷的 PROBE TX 不得寫 WAL");
     assert_eq!(device.close_count(), 1, "未交接的預開 handle 應關閉一次");
     assert!(!device.is_open(), "shutdown 取消後不得保留預開 handle");
@@ -3105,12 +3241,20 @@ fn wp510_tx_device_path_change_before_hotplug_probe_submit_sends_zero_tx() {
         .recv_timeout(Duration::from_secs(5))
         .expect("熱插的 PROBE 應在提交前觸發裝置改指");
     assert!(
-        m.mgr.wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)),
+        m.mgr
+            .wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)),
         "裝置改指取消的 attach worker 應收尾"
     );
 
-    assert_eq!(device.os_submits(), 0, "裝置改指後 PROBE 不得提交任何 bytes 給 OS");
-    assert!(device.take_tx().is_empty(), "裝置改指後舊路徑不得收到 PROBE 的 \\n");
+    assert_eq!(
+        device.os_submits(),
+        0,
+        "裝置改指後 PROBE 不得提交任何 bytes 給 OS"
+    );
+    assert!(
+        device.take_tx().is_empty(),
+        "裝置改指後舊路徑不得收到 PROBE 的 \\n"
+    );
     assert_eq!(wp510_probe_tx_rows(&m), 0, "被撤銷的 PROBE TX 不得寫 WAL");
     assert_eq!(device.close_count(), 1, "取消後的 PROBE handle 應關閉一次");
     assert!(!device.is_open(), "取消後不得保留舊路徑 handle");
@@ -3143,13 +3287,13 @@ fn wp510_identity_alias_set_racing_placeholder_retirement_keeps_old_sid_retired(
     }));
 
     let reply = rpc(m.mgr.alias_set(&sid, LATE_ALIAS));
-    let attach = rpc(
-        hook_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("佔位退休應發生在 alias 持久化前"),
-    );
+    let attach = rpc(hook_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("佔位退休應發生在 alias 持久化前"));
     assert!(is_ok(&attach), "device.attach 應完成佔位退休：{attach:?}");
-    wait_until("t:COM3 正式 session", || m.mgr.resolve("t:COM3").is_some());
+    wait_until("t:COM3 正式 session", || {
+        m.mgr.resolve("t:COM3").is_some()
+    });
 
     assert_eq!(
         sw_proto::pyjson::dumps_dict(&reply, &sw_proto::pyjson::RPC_WIRE),
@@ -3208,7 +3352,9 @@ fn wp510_lifecycle_repeated_release_uses_expired_attach_deadline() {
     let attach = std::thread::spawn(move || {
         let _ = attach_tx.send(attach_manager.attach_released_placeholder(&attach_sid, false));
     });
-    wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(REAL) == 1);
+    wait_until("佔位 attach 停在 open_exclusive", || {
+        m.serial.open_attempts(REAL) == 1
+    });
 
     let first = rpc(wp510_release(&m.mgr, &sid));
     assert_eq!(code_of(&first).as_deref(), Some("DRAIN_STALLED"));
@@ -3254,7 +3400,9 @@ fn wp510_lifecycle_concurrent_releases_share_first_attach_deadline() {
     let attach = std::thread::spawn(move || {
         let _ = attach_tx.send(attach_manager.attach_released_placeholder(&attach_sid, false));
     });
-    wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(REAL) == 1);
+    wait_until("佔位 attach 停在 open_exclusive", || {
+        m.serial.open_attempts(REAL) == 1
+    });
 
     let first_manager = m.mgr.clone();
     let first_sid = sid.clone();
@@ -3293,8 +3441,14 @@ fn wp510_lifecycle_concurrent_releases_share_first_attach_deadline() {
     first.join().expect("第一個 release thread 不應 panic");
     second.join().expect("第二個 release thread 不應 panic");
 
-    assert_eq!(code_of(&rpc(first_result.0)).as_deref(), Some("DRAIN_STALLED"));
-    assert_eq!(code_of(&rpc(second_result.0)).as_deref(), Some("DRAIN_STALLED"));
+    assert_eq!(
+        code_of(&rpc(first_result.0)).as_deref(),
+        Some("DRAIN_STALLED")
+    );
+    assert_eq!(
+        code_of(&rpc(second_result.0)).as_deref(),
+        Some("DRAIN_STALLED")
+    );
     assert!(
         second_result.1 < Duration::from_millis(1500),
         "並行 release 重設期限，多等了 {:?}",
@@ -3381,11 +3535,9 @@ fn wp510_review_open_failure_after_release_clears_drain_stall() {
         ));
 
         m.serial.release_open(REAL);
-        let attach_reply = rpc(
-            attach_rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("取消的佔位 attach 應在開埠錯誤返回後完成"),
-        );
+        let attach_reply = rpc(attach_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("取消的佔位 attach 應在開埠錯誤返回後完成"));
         attach.join().expect("attach thread 不應 panic");
         release.join().expect("release thread 不應 panic");
         assert_eq!(
@@ -3419,16 +3571,26 @@ fn wp510_review_open_failure_after_release_clears_drain_stall() {
             },
             RPC,
         ));
-        assert!(is_ok(&repeated_release), "{failure_name}: {repeated_release:?}");
+        assert!(
+            is_ok(&repeated_release),
+            "{failure_name}: {repeated_release:?}"
+        );
         assert_eq!(
             repeated_release.get("already_released"),
             Some(&PyValue::Bool(true)),
             "{failure_name}: 排空完成後重複 release 應成功"
         );
-        assert_eq!(m.serial.open_attempts(REAL), 1, "{failure_name}: release 不開埠");
+        assert_eq!(
+            m.serial.open_attempts(REAL),
+            1,
+            "{failure_name}: release 不開埠"
+        );
 
         let retry = rpc(m.mgr.attach_released_placeholder(&sid, false));
-        assert!(is_ok(&retry), "{failure_name}: 排空完成後應可重新 attach：{retry:?}");
+        assert!(
+            is_ok(&retry),
+            "{failure_name}: 排空完成後應可重新 attach：{retry:?}"
+        );
         wait_until("重試 attach 成功交接預開 handle", || {
             m.serial.open_attempts(REAL) == 2 && m.mgr.resolve(SID).is_none()
         });
@@ -3447,19 +3609,26 @@ fn wp510_b_retirement_persist_enospc_keeps_placeholder_and_stops_handoff() {
     let sid = m.mgr.resolve(SID).expect("佔位 session");
     let device = m.device(REAL);
     m.mgr.update_devices(&m.snapshot());
-    m.fs.fail_next_atomic_write(PalError::io(
-        28,
-        "[Errno 28] No space left on device",
-    ));
+    m.fs.fail_next_atomic_write(PalError::io(28, "[Errno 28] No space left on device"));
 
     let response = m.mgr.attach_released_placeholder(&sid, false);
     std::thread::sleep(Duration::from_millis(100));
 
-    assert!(response.is_err(), "退休落盤 ENOSPC 必須向上回錯：{response:?}");
+    assert!(
+        response.is_err(),
+        "退休落盤 ENOSPC 必須向上回錯：{response:?}"
+    );
     assert_eq!(m.mgr.resolve(SID), None, "落盤失敗不回滾：佔位已退休");
     assert_eq!(m.mgr.released_placeholder(SID), None);
-    assert!(m.load_state_now().released.contains_key(SID), "寫入失敗，磁碟仍是舊的 RELEASED 列");
-    assert_eq!(m.serial.open_attempts(REAL), 1, "不得啟動 dynamic worker 重開埠");
+    assert!(
+        m.load_state_now().released.contains_key(SID),
+        "寫入失敗，磁碟仍是舊的 RELEASED 列"
+    );
+    assert_eq!(
+        m.serial.open_attempts(REAL),
+        1,
+        "不得啟動 dynamic worker 重開埠"
+    );
     assert_eq!(device.close_count(), 0, "預開 handle 留在作業內，不關閉");
     assert!(device.is_open(), "預開 handle 仍開啟");
     assert!(device.take_tx().is_empty(), "落盤失敗不得啟動偵測 TX");
@@ -3480,7 +3649,10 @@ fn wp510_b_open_error_with_fallback_stays_reattachable() {
     assert!(is_ok(&response), "一般開埠錯誤應交給 dynamic：{response:?}");
     let old_snapshot = session_field(&response);
     assert_eq!(s_of(&old_snapshot, "state").as_deref(), Some("DETACHED"));
-    assert_eq!(s_of(&old_snapshot, "last_error").as_deref(), Some("ATTACH_FAILED:PermissionError"));
+    assert_eq!(
+        s_of(&old_snapshot, "last_error").as_deref(),
+        Some("ATTACH_FAILED:PermissionError")
+    );
     wait_until("佔位 handoff 的第二次 dynamic 開埠", || {
         m.serial.open_attempts(REAL) == 2 && m.mgr.resolve("COM3").is_some()
     });
@@ -3490,7 +3662,10 @@ fn wp510_b_open_error_with_fallback_stays_reattachable() {
     });
     assert_eq!(m.mgr.resolve(SID), None, "舊佔位須退休");
     assert_eq!(m.mgr.released_placeholder("COM3"), Some(false));
-    assert_eq!(s_of(&m.session("COM3"), "profile_source").as_deref(), Some("fallback"));
+    assert_eq!(
+        s_of(&m.session("COM3"), "profile_source").as_deref(),
+        Some("fallback")
+    );
     assert!(m.mgr.resolve("COM3").is_some(), "原 COM 應有 fallback 列");
     assert_eq!(m.serial.open_attempts(REAL), 2);
 
@@ -3501,7 +3676,10 @@ fn wp510_b_open_error_with_fallback_stays_reattachable() {
     wait_until("fallback session 重新 attach", || {
         matches!(m.state_of("COM3").as_deref(), Some("ATTACHED" | "READY"))
     });
-    assert!(m.mgr.resolve("COM3").is_some(), "重新 attach 後原 COM 仍可查詢");
+    assert!(
+        m.mgr.resolve("COM3").is_some(),
+        "重新 attach 後原 COM 仍可查詢"
+    );
     assert_eq!(m.mgr.released_placeholder("COM3"), Some(false));
 }
 
@@ -3522,13 +3700,21 @@ fn wp510_b_open_error_without_fallback_reserves_com_until_unplug() {
     assert!(is_ok(&response), "一般開埠錯誤應交給 dynamic：{response:?}");
     let old_snapshot = session_field(&response);
     assert_eq!(s_of(&old_snapshot, "state").as_deref(), Some("DETACHED"));
-    assert_eq!(s_of(&old_snapshot, "last_error").as_deref(), Some("ATTACH_FAILED:PermissionError"));
-    wait_until("無 fallback 時 dynamic 第二次開埠", || m.serial.open_attempts(REAL) == 2);
+    assert_eq!(
+        s_of(&old_snapshot, "last_error").as_deref(),
+        Some("ATTACH_FAILED:PermissionError")
+    );
+    wait_until("無 fallback 時 dynamic 第二次開埠", || {
+        m.serial.open_attempts(REAL) == 2
+    });
     assert_eq!(m.mgr.resolve(SID), None);
     assert_eq!(m.mgr.resolve("COM3"), None);
     assert_eq!(m.mgr.com_for_by_id(BY_ID).as_deref(), Some("COM3"));
     assert_eq!(
-        m.mgr.attach_released_placeholder(SID, false).unwrap().get("error_code"),
+        m.mgr
+            .attach_released_placeholder(SID, false)
+            .unwrap()
+            .get("error_code"),
         Some(&PyValue::from("SESSION_NOT_FOUND"))
     );
 
@@ -3586,7 +3772,9 @@ fn wp510_b_missing_or_held_keeps_placeholder() {
 
     let offline = wp510_b_placeholder_rig(false, false);
     let sid = offline.mgr.resolve(SID).expect("佔位 session");
-    offline.mgr.update_devices(&snapshot_without(&offline, BY_ID));
+    offline
+        .mgr
+        .update_devices(&snapshot_without(&offline, BY_ID));
     let response = rpc(offline.mgr.attach_released_placeholder(&sid, false));
     assert_eq!(code_of(&response).as_deref(), Some("DEVICE_NOT_PRESENT"));
     assert_eq!(s_of(&response, "selector").as_deref(), Some("COM3"));
@@ -3597,15 +3785,21 @@ fn wp510_b_missing_or_held_keeps_placeholder() {
 
     let prescan = wp510_b_placeholder_rig(false, false);
     let sid = prescan.mgr.resolve(SID).expect("佔位 session");
-    prescan.serial.set_probe_holders(REAL, HolderReport {
-        pids: vec![771],
-        holder_unknown: false,
-        status: HolderScanStatus::Ok,
-    });
+    prescan.serial.set_probe_holders(
+        REAL,
+        HolderReport {
+            pids: vec![771],
+            holder_unknown: false,
+            status: HolderScanStatus::Ok,
+        },
+    );
     prescan.mgr.update_devices(&prescan.snapshot());
     let response = rpc(prescan.mgr.attach_released_placeholder(&sid, false));
     assert_eq!(code_of(&response).as_deref(), Some("DEVICE_STILL_HELD"));
-    assert_eq!(response.get("pids"), Some(&PyValue::List(vec![PyValue::Int(PyInt::Small(771))])));
+    assert_eq!(
+        response.get("pids"),
+        Some(&PyValue::List(vec![PyValue::Int(PyInt::Small(771))]))
+    );
     assert_eq!(response.get("holder_unknown"), Some(&PyValue::Bool(false)));
     wp510_b_assert_placeholder_retained(&prescan, SID);
     assert_eq!(prescan.serial.open_attempts(REAL), 0);
@@ -3653,7 +3847,10 @@ fn wp510_b_missing_or_held_keeps_placeholder() {
             assert_eq!(response.get("pids"), Some(&PyValue::List(pids)));
         }
         if let Some(unknown) = expected_unknown {
-            assert_eq!(response.get("holder_unknown"), Some(&PyValue::Bool(unknown)));
+            assert_eq!(
+                response.get("holder_unknown"),
+                Some(&PyValue::Bool(unknown))
+            );
         }
         wp510_b_assert_placeholder_retained(&m, SID);
         assert_eq!(m.serial.open_attempts(REAL), 1);
@@ -3676,17 +3873,23 @@ fn wp510_b_handoff_invalidated_during_open_closes_handle() {
         m.serial.block_open(REAL);
         let manager = m.mgr.clone();
         let attach_sid = sid.clone();
-        let attach = std::thread::spawn(move || manager.attach_released_placeholder(&attach_sid, false));
-        wait_until("佔位 handoff 開埠進入阻塞鉤子", || m.serial.open_attempts(REAL) == 1);
+        let attach =
+            std::thread::spawn(move || manager.attach_released_placeholder(&attach_sid, false));
+        wait_until("佔位 handoff 開埠進入阻塞鉤子", || {
+            m.serial.open_attempts(REAL) == 1
+        });
 
         match invalidation {
             "unplug" => m.mgr.update_devices(&snapshot_without(&m, BY_ID)),
             "rebind" => {
                 m.serial.add_device(CHANGED);
-                m.mgr.update_devices(&[(BY_ID.to_string(), DeviceInfo {
-                    by_id: BY_ID.to_string(),
-                    real_path: CHANGED.to_string(),
-                })]);
+                m.mgr.update_devices(&[(
+                    BY_ID.to_string(),
+                    DeviceInfo {
+                        by_id: BY_ID.to_string(),
+                        real_path: CHANGED.to_string(),
+                    },
+                )]);
             }
             "shutdown" => m.mgr.begin_shutdown(),
             _ => unreachable!(),
@@ -3694,11 +3897,19 @@ fn wp510_b_handoff_invalidated_during_open_closes_handle() {
         m.serial.release_open(REAL);
         let response = rpc(attach.join().expect("handoff worker 不應 panic"));
         match invalidation {
-            "unplug" | "rebind" => assert_eq!(code_of(&response).as_deref(), Some("DEVICE_NOT_PRESENT")),
+            "unplug" | "rebind" => {
+                assert_eq!(code_of(&response).as_deref(), Some("DEVICE_NOT_PRESENT"))
+            }
             "shutdown" => {
                 assert_eq!(
                     response.0.keys().map(String::as_str).collect::<Vec<_>>(),
-                    ["ok", "error_code", "drain_stalled", "drain_timeout_epoch", "session"],
+                    [
+                        "ok",
+                        "error_code",
+                        "drain_stalled",
+                        "drain_timeout_epoch",
+                        "session"
+                    ],
                     "shutdown 使佔位交接失效時須回完整 recovering 鍵：{response:?}"
                 );
                 assert_eq!(code_of(&response).as_deref(), Some("SESSION_RECOVERING"));
@@ -3707,7 +3918,11 @@ fn wp510_b_handoff_invalidated_during_open_closes_handle() {
             }
             _ => unreachable!(),
         }
-        assert_eq!(old_device.close_count(), 1, "{invalidation} 後 handle 須關閉");
+        assert_eq!(
+            old_device.close_count(),
+            1,
+            "{invalidation} 後 handle 須關閉"
+        );
         assert_eq!(m.mgr.resolve("COM3"), Some(sid.clone()));
         assert_eq!(m.mgr.resolve("t:COM3"), None);
         assert_eq!(m.mgr.released_placeholder(&sid), Some(true));
@@ -3730,7 +3945,8 @@ fn wp510_b_open_error_invalidated_returns_complete_recovering_response() {
 
     let manager = m.mgr.clone();
     let attach_sid = sid.clone();
-    let attach = std::thread::spawn(move || manager.attach_released_placeholder(&attach_sid, false));
+    let attach =
+        std::thread::spawn(move || manager.attach_released_placeholder(&attach_sid, false));
     wait_until("佔位開埠錯誤路徑停在 open_exclusive", || {
         m.serial.open_attempts(REAL) == 1
     });
@@ -3740,7 +3956,13 @@ fn wp510_b_open_error_invalidated_returns_complete_recovering_response() {
 
     assert_eq!(
         response.0.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["ok", "error_code", "drain_stalled", "drain_timeout_epoch", "session"],
+        [
+            "ok",
+            "error_code",
+            "drain_stalled",
+            "drain_timeout_epoch",
+            "session"
+        ],
         "一般開埠錯誤遇 shutdown 時須回完整 recovering 鍵：{response:?}"
     );
     assert_eq!(code_of(&response).as_deref(), Some("SESSION_RECOVERING"));
@@ -3750,7 +3972,10 @@ fn wp510_b_open_error_invalidated_returns_complete_recovering_response() {
 
 /// 拔除 by_id 後的快照（ManagerRig 的登錄不變，供之後重插）。
 fn snapshot_without(m: &ManagerRig, by_id: &str) -> Vec<(String, DeviceInfo)> {
-    m.snapshot().into_iter().filter(|(k, _)| k != by_id).collect()
+    m.snapshot()
+        .into_iter()
+        .filter(|(k, _)| k != by_id)
+        .collect()
 }
 
 /// 建立 fallback（others-template）動態 session，等它 ATTACHED 後拔除並等 DETACHED；回傳實體路徑。
@@ -3773,14 +3998,19 @@ fn released_dynamic_materialize_template_fallback() {
     // - 其他缺定義的 template（如 uboot-template）→ 以 passthrough 佔位實體化、WARNING、保留持久化阻擋（裝置上線也不 open）。
     const ONLY_PRPL: &str = "profiles:\n  prpl-template:\n    platform: prpl\n    prompt_regex: '(?m)^root@prpl:.*# '\n    timeout_s: 2.0\n";
     let mut loaded = LoadedState::default();
-    loaded
-        .released
-        .insert("others-template:COM3".to_string(), released_row("/s/by-id/usb-R"));
-    loaded
-        .released
-        .insert("uboot-template:COM4".to_string(), released_row("/s/by-id/usb-U"));
+    loaded.released.insert(
+        "others-template:COM3".to_string(),
+        released_row("/s/by-id/usb-R"),
+    );
+    loaded.released.insert(
+        "uboot-template:COM4".to_string(),
+        released_row("/s/by-id/usb-U"),
+    );
     let m = ManagerRig::with(ONLY_PRPL, loaded, None);
-    let sid = m.mgr.resolve("others-template:COM3").expect("others-template 應以最小 profile 實體化");
+    let sid = m
+        .mgr
+        .resolve("others-template:COM3")
+        .expect("others-template 應以最小 profile 實體化");
     let s = m.session(&sid);
     assert_eq!(s_of(&s, "state").as_deref(), Some("RELEASED"));
     assert_eq!(s_of(&s, "platform").as_deref(), Some("passthrough"));
@@ -3818,7 +4048,10 @@ fn released_dynamic_materialize_template_fallback() {
         s_of(&uboot_session, "device_by_id").as_deref(),
         Some("/s/by-id/usb-U")
     );
-    assert_eq!(s_of(&uboot_session, "released_by").as_deref(), Some("agent"));
+    assert_eq!(
+        s_of(&uboot_session, "released_by").as_deref(),
+        Some("agent")
+    );
     assert_eq!(
         s_of(&uboot_session, "released_at").as_deref(),
         Some("2026-10-21T00:00:00")
@@ -3831,7 +4064,9 @@ fn released_dynamic_materialize_template_fallback() {
     assert!(m.warnings().iter().any(|w| w
         == "released session 的 template 不存在（session=uboot-template:COM4、profile=uboot-template），保留持久化阻擋"));
     assert!(
-        m.load_state_now().released.contains_key("uboot-template:COM4"),
+        m.load_state_now()
+            .released
+            .contains_key("uboot-template:COM4"),
         "未實體化的 released 列須保留在 state.json"
     );
     let device_r = m.add_device_at("/s/by-id/usb-R", "/dev/ttyR");
@@ -3851,15 +4086,18 @@ fn released_dynamic_act_no_and_profile_source() {
     // #14：act_no 由 alias 列（<template>+N）推導，否則 COM 號＋1；profile_source 依 pin／detected／fallback；
     // session_id 沿用 state.json 的 key（template 經 pin 改變時不重算）。
     let mut loaded = LoadedState::default();
-    loaded
-        .released
-        .insert("prpl-template:COM2".to_string(), released_row("/s/by-id/usb-P1"));
-    loaded
-        .released
-        .insert("prpl-template:COM5".to_string(), released_row("/s/by-id/usb-P2"));
-    loaded
-        .released
-        .insert("others-template:COM8".to_string(), released_row("/s/by-id/usb-P3"));
+    loaded.released.insert(
+        "prpl-template:COM2".to_string(),
+        released_row("/s/by-id/usb-P1"),
+    );
+    loaded.released.insert(
+        "prpl-template:COM5".to_string(),
+        released_row("/s/by-id/usb-P2"),
+    );
+    loaded.released.insert(
+        "others-template:COM8".to_string(),
+        released_row("/s/by-id/usb-P3"),
+    );
     let mut row = PyDict::new();
     row.insert("session_id", PyValue::from("prpl-template:COM2"));
     loaded.aliases.insert("prpl-template+7".to_string(), row);
@@ -3877,7 +4115,10 @@ fn released_dynamic_act_no_and_profile_source() {
     assert_eq!(s_of(&a, "profile_source").as_deref(), Some("fallback"));
 
     let b = m.session("prpl-template:COM5");
-    assert_eq!(s_of(&b, "session_id").as_deref(), Some("prpl-template:COM5"));
+    assert_eq!(
+        s_of(&b, "session_id").as_deref(),
+        Some("prpl-template:COM5")
+    );
     assert_eq!(s_of(&b, "profile").as_deref(), Some("others-template"));
     assert_eq!(s_of(&b, "profile_source").as_deref(), Some("pin"));
     assert_eq!(b.get("act_no"), Some(&PyValue::Int(PyInt::Small(6))));
@@ -3897,19 +4138,28 @@ fn com_for_by_id_session_first_then_pending() {
     // #20：既有 session 的 COM 優先；否則 startup 預配（pending）COM；都沒有 → None。
     let yaml = manager_yaml(&[&others_target("COM5", 6, "/s/by-id/usb-X", "x")]);
     let m = ManagerRig::with(&yaml, LoadedState::default(), None);
-    m.mgr.prepare_dynamic_rank(&[
-        "/s/by-id/usb-X".to_string(),
-        "/s/by-id/usb-A".to_string(),
-    ]);
-    assert_eq!(m.mgr.com_for_by_id("/s/by-id/usb-X").as_deref(), Some("COM5"));
-    assert_eq!(m.mgr.com_for_by_id("/s/by-id/usb-A").as_deref(), Some("COM0"));
+    m.mgr
+        .prepare_dynamic_rank(&["/s/by-id/usb-X".to_string(), "/s/by-id/usb-A".to_string()]);
+    assert_eq!(
+        m.mgr.com_for_by_id("/s/by-id/usb-X").as_deref(),
+        Some("COM5")
+    );
+    assert_eq!(
+        m.mgr.com_for_by_id("/s/by-id/usb-A").as_deref(),
+        Some("COM0")
+    );
     assert_eq!(m.mgr.com_for_by_id("/s/by-id/usb-none"), None);
     m.add_device_at("/s/by-id/usb-X", "/dev/ttyX");
     m.devices(&["/s/by-id/usb-A"]);
     m.mgr.update_devices(&m.snapshot());
     m.mgr.bootstrap_attach();
-    wait_until("usb-A 建立 session", || m.com_by_id().contains_key("/s/by-id/usb-A"));
-    assert_eq!(m.mgr.com_for_by_id("/s/by-id/usb-A").as_deref(), Some("COM0"));
+    wait_until("usb-A 建立 session", || {
+        m.com_by_id().contains_key("/s/by-id/usb-A")
+    });
+    assert_eq!(
+        m.mgr.com_for_by_id("/s/by-id/usb-A").as_deref(),
+        Some("COM0")
+    );
 }
 
 #[test]
@@ -3920,11 +4170,16 @@ fn bind_with_inflight_attach_op_cancels_waits_3000ms() {
     let real = fallback_session_then_unplug(&m, "/s/by-id/usb-D");
     m.serial.block_open(&real);
     m.mgr.update_devices(&m.snapshot());
-    wait_until("再偵測卡在 open", || m.serial.open_attempts(&real) == 2);
+    wait_until("再偵測卡在 open", || {
+        m.serial.open_attempts(&real) == 2
+    });
     let t0 = std::time::Instant::now();
     let r = rpc(m.mgr.bind("COM0", "/s/by-id/usb-Z"));
     let waited = t0.elapsed();
-    assert!(waited >= Duration::from_millis(3000), "應等待 3000 ms：{waited:?}");
+    assert!(
+        waited >= Duration::from_millis(3000),
+        "應等待 3000 ms：{waited:?}"
+    );
     assert_eq!(code_of(&r).as_deref(), Some("SESSION_RECOVERING"));
     assert_eq!(r.get("drain_stalled"), Some(&PyValue::Bool(true)));
     assert_eq!(
@@ -3934,7 +4189,11 @@ fn bind_with_inflight_attach_op_cancels_waits_3000ms() {
     // 審查 F64：Python `bind_session` 逾時時寫入活的 session（state、drain_stalled、drain_timeout_epoch），
     // 之後 `session.get_state` 同為 RECOVERING＋drain_stalled，`command.submit` 回 SESSION_RECOVERING。
     let live = m.session("COM0");
-    assert_eq!(s_of(&live, "state").as_deref(), Some("RECOVERING"), "{live:?}");
+    assert_eq!(
+        s_of(&live, "state").as_deref(),
+        Some("RECOVERING"),
+        "{live:?}"
+    );
     assert_eq!(live.get("drain_stalled"), Some(&PyValue::Bool(true)));
     assert_eq!(
         live.get("drain_timeout_epoch"),
@@ -3942,11 +4201,19 @@ fn bind_with_inflight_attach_op_cancels_waits_3000ms() {
         "活 session 的 epoch 與回應一致"
     );
     let sid = m.mgr.resolve("COM0").expect("COM0 session");
-    let sub = rpc(m.mgr.route(&sid, SessionRequest::Submit(agent_submit("ls")), RPC));
-    assert_eq!(code_of(&sub).as_deref(), Some("SESSION_RECOVERING"), "{sub:?}");
+    let sub = rpc(m
+        .mgr
+        .route(&sid, SessionRequest::Submit(agent_submit("ls")), RPC));
+    assert_eq!(
+        code_of(&sub).as_deref(),
+        Some("SESSION_RECOVERING"),
+        "{sub:?}"
+    );
     m.serial.release_open(&real);
     // 取消的 op 拿到 handle 後立即關閉（不交給 session）。
-    wait_until("取消的 op 關閉 handle", || m.device(&real).close_count() == 2);
+    wait_until("取消的 op 關閉 handle", || {
+        m.device(&real).close_count() == 2
+    });
     let r = rpc(m.mgr.bind("COM0", "/s/by-id/usb-Z"));
     assert!(is_ok(&r), "op 結束後 bind 應成功：{r:?}");
     assert_eq!(
@@ -3966,7 +4233,9 @@ fn wp510_review9_release_during_existing_session_redetect_cancels_and_waits() {
     let real = fallback_session_then_unplug(&m, "/s/by-id/usb-D");
     m.serial.block_open(&real);
     m.mgr.update_devices(&m.snapshot());
-    wait_until("再偵測卡在 open", || m.serial.open_attempts(&real) == 2);
+    wait_until("再偵測卡在 open", || {
+        m.serial.open_attempts(&real) == 2
+    });
     let closes_before = m.device(&real).close_count();
     let tx_before = m.device(&real).tx_len();
     let sid = m.mgr.resolve("COM0").expect("COM0 session");
@@ -3996,9 +4265,15 @@ fn wp510_review9_release_during_existing_session_redetect_cancels_and_waits() {
         m.device(&real).close_count() == closes_before + 1
     });
     std::thread::sleep(Duration::from_millis(200));
-    assert!(!m.device(&real).is_open(), "release 後不得留下開啟的 handle");
+    assert!(
+        !m.device(&real).is_open(),
+        "release 後不得留下開啟的 handle"
+    );
     assert_eq!(m.device(&real).tx_len(), tx_before, "取消後不得送 PROBE");
-    assert_eq!(s_of(&m.session("COM0"), "state").as_deref(), Some("RELEASED"));
+    assert_eq!(
+        s_of(&m.session("COM0"), "state").as_deref(),
+        Some("RELEASED")
+    );
     // S2-PAR-wp510r R4（設計 §6 #57，H）：W6 作業改為外部 attach，在途改以帳本紀錄判定：收尾後 `custody_for_test(B)`＝None。
     assert!(m.mgr.custody_for_test("/s/by-id/usb-D").is_none());
 }
@@ -4013,7 +4288,9 @@ fn wp510_review10_late_redetect_finish_after_release_timeout_completes_release()
     let real = fallback_session_then_unplug(&m, "/s/by-id/usb-D");
     m.serial.block_open(&real);
     m.mgr.update_devices(&m.snapshot());
-    wait_until("再偵測卡在 open", || m.serial.open_attempts(&real) == 2);
+    wait_until("再偵測卡在 open", || {
+        m.serial.open_attempts(&real) == 2
+    });
     let closes_before = m.device(&real).close_count();
     let tx_before = m.device(&real).tx_len();
     let sid = m.mgr.resolve("COM0").expect("COM0 session");
@@ -4031,17 +4308,42 @@ fn wp510_review10_late_redetect_finish_after_release_timeout_completes_release()
     m.serial.release_open(&real);
     let reply = rpc(reply);
 
-    assert!(waited >= Duration::from_millis(2500), "release 須等待作業至期限：{waited:?}");
-    assert_eq!(code_of(&reply).as_deref(), Some("DRAIN_STALLED"), "{reply:?}");
+    assert!(
+        waited >= Duration::from_millis(2500),
+        "release 須等待作業至期限：{waited:?}"
+    );
+    assert_eq!(
+        code_of(&reply).as_deref(),
+        Some("DRAIN_STALLED"),
+        "{reply:?}"
+    );
     assert_eq!(reply.get("drain_stalled"), Some(&PyValue::Bool(true)));
     m.wait_state("COM0", "RELEASED");
     // S2-PAR-wp510r R4（設計 §6 #42，H）：在途改以帳本紀錄判定，收尾後 `custody_for_test(B)`＝None。
-    wait_until("作業收尾", || m.mgr.custody_for_test("/s/by-id/usb-D").is_none());
+    wait_until("作業收尾", || {
+        m.mgr.custody_for_test("/s/by-id/usb-D").is_none()
+    });
     let session = m.session("COM0");
-    assert_eq!(s_of(&session, "released_by").as_deref(), Some("agent"), "{session:?}");
-    assert_eq!(s_of(&session, "released_reason").as_deref(), Some("flash"), "{session:?}");
-    assert_eq!(session.get("drain_stalled"), Some(&PyValue::Bool(false)), "{session:?}");
-    assert_eq!(session.get("drain_timeout_epoch"), Some(&PyValue::Null), "{session:?}");
+    assert_eq!(
+        s_of(&session, "released_by").as_deref(),
+        Some("agent"),
+        "{session:?}"
+    );
+    assert_eq!(
+        s_of(&session, "released_reason").as_deref(),
+        Some("flash"),
+        "{session:?}"
+    );
+    assert_eq!(
+        session.get("drain_stalled"),
+        Some(&PyValue::Bool(false)),
+        "{session:?}"
+    );
+    assert_eq!(
+        session.get("drain_timeout_epoch"),
+        Some(&PyValue::Null),
+        "{session:?}"
+    );
     wait_until("RELEASED 落盤", || {
         m.state_text().contains("\"released\"") && m.state_text().contains("/s/by-id/usb-D")
     });
@@ -4059,8 +4361,11 @@ fn hotplug_invalidates_pending_attach_op_and_closes_unused_port() {
     let _ = dev.take_tx();
     m.serial.block_open(&real);
     m.mgr.update_devices(&m.snapshot());
-    wait_until("再偵測卡在 open", || m.serial.open_attempts(&real) == 2);
-    m.mgr.update_devices(&snapshot_without(&m, "/s/by-id/usb-D"));
+    wait_until("再偵測卡在 open", || {
+        m.serial.open_attempts(&real) == 2
+    });
+    m.mgr
+        .update_devices(&snapshot_without(&m, "/s/by-id/usb-D"));
     m.serial.release_open(&real);
     wait_until("未消費的 port 關閉", || dev.close_count() == 2);
     std::thread::sleep(Duration::from_millis(100));
@@ -4075,19 +4380,24 @@ fn pending_rank_pruned_on_removal() {
     // #28：裝置離線時 prune 其預配 COM；熱插的新裝置可回收該號，不得保留給已離線的板。
     let m = ManagerRig::templates_only();
     m.devices(&["/s/by-id/usb-B"]);
-    m.mgr.prepare_dynamic_rank(&[
-        "/s/by-id/usb-A".to_string(),
-        "/s/by-id/usb-B".to_string(),
-    ]);
-    assert_eq!(m.mgr.com_for_by_id("/s/by-id/usb-A").as_deref(), Some("COM0"));
+    m.mgr
+        .prepare_dynamic_rank(&["/s/by-id/usb-A".to_string(), "/s/by-id/usb-B".to_string()]);
+    assert_eq!(
+        m.mgr.com_for_by_id("/s/by-id/usb-A").as_deref(),
+        Some("COM0")
+    );
     m.mgr.update_devices(&m.snapshot()); // usb-A 不在快照 → prune
     assert_eq!(m.mgr.com_for_by_id("/s/by-id/usb-A"), None);
     m.mgr.bootstrap_attach();
-    wait_until("usb-B 建立 session", || m.com_by_id().contains_key("/s/by-id/usb-B"));
+    wait_until("usb-B 建立 session", || {
+        m.com_by_id().contains_key("/s/by-id/usb-B")
+    });
     assert_eq!(m.com_by_id()["/s/by-id/usb-B"], "COM1");
     m.devices(&["/s/by-id/usb-C"]);
     m.mgr.update_devices(&m.snapshot());
-    wait_until("usb-C 建立 session", || m.com_by_id().contains_key("/s/by-id/usb-C"));
+    wait_until("usb-C 建立 session", || {
+        m.com_by_id().contains_key("/s/by-id/usb-C")
+    });
     assert_eq!(m.com_by_id()["/s/by-id/usb-C"], "COM0");
 }
 
@@ -4097,14 +4407,20 @@ fn rematerialize_profile_recomputes_session_id_and_alias() {
     // 使用者自訂的 alias 保留。
     let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
     fallback_session_then_unplug(&m, "/s/by-id/usb-D");
-    assert_eq!(m.mgr.resolve("COM0").as_deref(), Some("others-template:COM0"));
+    assert_eq!(
+        m.mgr.resolve("COM0").as_deref(),
+        Some("others-template:COM0")
+    );
     assert!(is_ok(&rpc(m.mgr.pin("COM0", "prpl-template"))));
     m.mgr.update_devices(&m.snapshot());
     wait_until("rematerialize 完成", || {
         m.mgr.resolve("COM0").as_deref() == Some("prpl-template:COM0")
     });
     let s = m.session("COM0");
-    assert_eq!(s_of(&s, "session_id").as_deref(), Some("prpl-template:COM0"));
+    assert_eq!(
+        s_of(&s, "session_id").as_deref(),
+        Some("prpl-template:COM0")
+    );
     assert_eq!(s_of(&s, "alias").as_deref(), Some("prpl-template+1"));
     assert_eq!(s_of(&s, "profile_source").as_deref(), Some("pin"));
     assert_eq!(m.mgr.resolve("others-template:COM0"), None);
@@ -4116,12 +4432,17 @@ fn rematerialize_profile_recomputes_session_id_and_alias() {
             .and_then(PyValue::as_str),
         Some("prpl-template:COM0")
     );
-    assert!(!aliases.contains_key("others-template+1"), "舊自動 alias 應移除：{aliases:?}");
+    assert!(
+        !aliases.contains_key("others-template+1"),
+        "舊自動 alias 應移除：{aliases:?}"
+    );
 
     // 自訂 alias：rematerialize 不改名。
     let m2 = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
     fallback_session_then_unplug(&m2, "/s/by-id/usb-D");
-    assert!(is_ok(&rpc(m2.mgr.alias_set("others-template:COM0", "mybox"))));
+    assert!(is_ok(&rpc(m2
+        .mgr
+        .alias_set("others-template:COM0", "mybox"))));
     assert!(is_ok(&rpc(m2.mgr.pin("COM0", "prpl-template"))));
     m2.mgr.update_devices(&m2.snapshot());
     wait_until("rematerialize 完成", || {
@@ -4152,13 +4473,19 @@ fn pin_applies_on_reattach() {
         s_of(&m.session("COM0"), "profile_source").as_deref(),
         Some("pin")
     );
-    assert_eq!(s_of(&m.session("COM0"), "platform").as_deref(), Some("prpl"));
+    assert_eq!(
+        s_of(&m.session("COM0"), "platform").as_deref(),
+        Some("prpl")
+    );
     let probe_rows_after = m
         .wal_rows()
         .iter()
         .filter(|r| s_of(r, "com").as_deref() == Some("PROBE"))
         .count();
-    assert_eq!(probe_rows_after, probe_rows_before, "pin 繞過偵測，不得送 PROBE");
+    assert_eq!(
+        probe_rows_after, probe_rows_before,
+        "pin 繞過偵測，不得送 PROBE"
+    );
 }
 
 #[test]
@@ -4217,7 +4544,9 @@ fn attach_finish_respawns_when_state_requires() {
         real_path: "/fake/tty-new".to_string(),
     });
     assert!(
-        !second.iter().any(|e| matches!(e, sw_core::session_core::Effect::OpenBridge { .. })),
+        !second
+            .iter()
+            .any(|e| matches!(e, sw_core::session_core::Effect::OpenBridge { .. })),
         "ATTACHING 中不得並行第二個 open"
     );
     let opened = h.opened_bridge("/fake/tty-old");
@@ -4226,11 +4555,15 @@ fn attach_finish_respawns_when_state_requires() {
         result: Ok(opened),
     });
     assert!(
-        effects.iter().any(|e| matches!(e, sw_core::session_core::Effect::BeginDrain { .. })),
+        effects
+            .iter()
+            .any(|e| matches!(e, sw_core::session_core::Effect::BeginDrain { .. })),
         "舊路徑的 worker 須退休 drain"
     );
     assert!(
-        !effects.iter().any(|e| matches!(e, sw_core::session_core::Effect::OpenBridge { .. })),
+        !effects
+            .iter()
+            .any(|e| matches!(e, sw_core::session_core::Effect::OpenBridge { .. })),
         "單次在途：舊路徑回條前不得送出新路徑的 OpenBridge"
     );
     let (old_epoch, old_stop) = h.pending_stop();
@@ -4287,7 +4620,10 @@ fn device_attach_during_shutdown_errors() {
     m.wait_state("COM0", "RELEASED");
     let opens = m.dev.open_count();
     m.mgr.begin_shutdown();
-    match m.mgr.route(&sid, SessionRequest::DeviceAttach { force: false }, RPC) {
+    match m
+        .mgr
+        .route(&sid, SessionRequest::DeviceAttach { force: false }, RPC)
+    {
         Err(e) => assert_eq!(e.message, "daemon stopping"),
         Ok(d) => panic!("stopping 後 device.attach 應回 Err，實際 {d:?}"),
     }
@@ -4313,13 +4649,20 @@ fn dynamic_attach_skipped_during_shutdown_or_drain() {
     let real2 = m2.real_of("/s/by-id/usb-N");
     m2.serial.block_open(&real2);
     m2.mgr.update_devices(&m2.snapshot());
-    wait_until("動態 attach 卡在 open", || m2.serial.open_attempts(&real2) == 1);
+    wait_until("動態 attach 卡在 open", || {
+        m2.serial.open_attempts(&real2) == 1
+    });
     m2.mgr.begin_shutdown();
     m2.serial.release_open(&real2);
-    wait_until("open 返回後關閉", || m2.device(&real2).close_count() == 1);
+    wait_until("open 返回後關閉", || {
+        m2.device(&real2).close_count() == 1
+    });
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(m2.mgr.counts().0, 0, "drain／shutdown 中不建立動態 session");
-    assert!(m2.device(&real2).take_tx().is_empty(), "零 TX（不送偵測 probe）");
+    assert!(
+        m2.device(&real2).take_tx().is_empty(),
+        "零 TX（不送偵測 probe）"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4344,7 +4687,10 @@ fn detect_probe_tx_goes_through_fence() {
     let tx_rows = |m: &ManagerRig| {
         m.wal_rows()
             .into_iter()
-            .filter(|r| s_of(r, "com").as_deref() == Some("PROBE") && s_of(r, "dir").as_deref() == Some("TX"))
+            .filter(|r| {
+                s_of(r, "com").as_deref() == Some("PROBE")
+                    && s_of(r, "dir").as_deref() == Some("TX")
+            })
             .count()
     };
 
@@ -4357,7 +4703,11 @@ fn detect_probe_tx_goes_through_fence() {
     m.mgr.update_devices(&m.snapshot());
     m.mgr.bootstrap_attach();
     assert_eq!(m.wait_profile_source("COM0"), "fallback");
-    assert_eq!(m.device(&real).os_submits(), 0, "PROBE Fence 凍結時不得提交任何 bytes 給 OS");
+    assert_eq!(
+        m.device(&real).os_submits(),
+        0,
+        "PROBE Fence 凍結時不得提交任何 bytes 給 OS"
+    );
     assert_eq!(tx_rows(&m), 0, "未送出的 PROBE TX 不得寫 WAL");
     // 審查 F71：Python `detect_template` 的 `send_command("")` 被拒即拋例外，呼叫端 `except` → `detected=None`，
     // 不睡 3 s、不比對 RX（否則 DUT 在視窗內自吐的 prompt 會被誤判為 detected）。
@@ -4382,7 +4732,9 @@ fn detect_probe_tx_goes_through_fence() {
     let probe_payloads: Vec<String> = m
         .wal_rows()
         .into_iter()
-        .filter(|r| s_of(r, "com").as_deref() == Some("PROBE") && s_of(r, "dir").as_deref() == Some("TX"))
+        .filter(|r| {
+            s_of(r, "com").as_deref() == Some("PROBE") && s_of(r, "dir").as_deref() == Some("TX")
+        })
         .filter_map(|r| s_of(&r, "payload_b64"))
         .collect();
     assert_eq!(probe_payloads, vec!["Cg==".to_string()]);
@@ -4408,11 +4760,17 @@ fn detect_probe_fence_observes_wal_unhealthy_published_before_submit() {
     m.mgr.update_devices(&m.snapshot());
     m.mgr.bootstrap_attach();
     assert_eq!(m.wait_profile_source("COM0"), "fallback");
-    assert_eq!(m.device(&real).os_submits(), 0, "WAL 已 unhealthy 時 PROBE 不得提交任何 bytes 給 OS");
+    assert_eq!(
+        m.device(&real).os_submits(),
+        0,
+        "WAL 已 unhealthy 時 PROBE 不得提交任何 bytes 給 OS"
+    );
     let probe_tx = m
         .wal_rows()
         .into_iter()
-        .filter(|r| s_of(r, "com").as_deref() == Some("PROBE") && s_of(r, "dir").as_deref() == Some("TX"))
+        .filter(|r| {
+            s_of(r, "com").as_deref() == Some("PROBE") && s_of(r, "dir").as_deref() == Some("TX")
+        })
         .count();
     assert_eq!(probe_tx, 0, "被拒的 PROBE TX 不得寫 WAL");
 }
@@ -4444,7 +4802,10 @@ fn watcher_tick_services_deferred_wal_rotation() {
         m.clock.advance(Duration::from_millis(backoff_ms));
     }
     let h = m.wal.health().to_pydict();
-    assert_eq!(h.get("deferred_delete_pending").and_then(PyValue::as_i64), Some(1));
+    assert_eq!(
+        h.get("deferred_delete_pending").and_then(PyValue::as_i64),
+        Some(1)
+    );
     m.clock.advance(Duration::from_millis(1001));
     m.mgr.watcher_sender().send(WatcherEvent::Tick).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -4453,7 +4814,10 @@ fn watcher_tick_services_deferred_wal_rotation() {
         if h.get("deferred_delete_pending").and_then(PyValue::as_i64) == Some(0) {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "watcher Tick 未推進延後輪替：{h:?}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "watcher Tick 未推進延後輪替：{h:?}"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
     let text = String::from_utf8(m.wfs.contents(wal_path).expect("新現行檔")).unwrap();
@@ -4485,9 +4849,20 @@ fn sentinel_pty_reported_in_public_and_release() {
     let m = native_console_rig();
     let s = m.session("COM0");
     if has_pty() {
-        assert_eq!(s.get("console_count").and_then(PyValue::as_i64), Some(1), "{s:?}");
-        let vtty = s.get("vtty").and_then(PyValue::as_str).unwrap_or_default().to_string();
-        assert!(vtty.starts_with("/dev/pts/") && std::path::Path::new(&vtty).exists(), "vtty={vtty}");
+        assert_eq!(
+            s.get("console_count").and_then(PyValue::as_i64),
+            Some(1),
+            "{s:?}"
+        );
+        let vtty = s
+            .get("vtty")
+            .and_then(PyValue::as_str)
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            vtty.starts_with("/dev/pts/") && std::path::Path::new(&vtty).exists(),
+            "vtty={vtty}"
+        );
     } else {
         assert_eq!(s.get("console_count").and_then(PyValue::as_i64), Some(0));
         assert_eq!(s.get("vtty"), Some(&PyValue::Null));
@@ -4518,7 +4893,9 @@ fn selftest_fallback_passthrough_suggests_pin_profile() {
     let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
     m.devices(&["/s/by-id/usb-F"]);
     m.mgr.update_devices(&m.snapshot());
-    wait_until("fallback session", || m.wait_profile_source("COM0") == "fallback");
+    wait_until("fallback session", || {
+        m.wait_profile_source("COM0") == "fallback"
+    });
     m.wait_state("COM0", "ATTACHED");
     let real = m.real_of("/s/by-id/usb-F");
     let dev = m.device(&real);
@@ -4539,9 +4916,19 @@ fn selftest_fallback_passthrough_suggests_pin_profile() {
         },
         RPC,
     ));
-    assert_eq!(s_of(&r, "classification").as_deref(), Some("PASSTHROUGH"), "{r:?}");
-    assert_eq!(s_of(&r, "recommended_action").as_deref(), Some("pin_profile"));
-    assert_eq!(s_of(&r, "suggested_profile").as_deref(), Some("prpl-template"));
+    assert_eq!(
+        s_of(&r, "classification").as_deref(),
+        Some("PASSTHROUGH"),
+        "{r:?}"
+    );
+    assert_eq!(
+        s_of(&r, "recommended_action").as_deref(),
+        Some("pin_profile")
+    );
+    assert_eq!(
+        s_of(&r, "suggested_profile").as_deref(),
+        Some("prpl-template")
+    );
     let hint = s_of(&r, "hint").unwrap_or_default();
     assert!(
         hint.contains("serialwrap session pin --selector COM0 --profile prpl-template"),
@@ -4570,7 +4957,10 @@ fn log_filename_uses_local_time_by_default() {
         8 * 3600,
         "%y%m%d-%H%M%S",
     );
-    assert!(path.ends_with(&format!("COM0_{expected}.log")), "{path} vs {expected}");
+    assert!(
+        path.ends_with(&format!("COM0_{expected}.log")),
+        "{path} vs {expected}"
+    );
     let _ = rpc(m.mgr.route(&sid, SessionRequest::LogStop, RPC));
 }
 
@@ -4589,13 +4979,23 @@ fn dynamic_session_applies_template_uart_config() {
     dev.on_tx_reply(b"\n", b"root@fast:/# ");
     m.mgr.update_devices(&m.snapshot());
     m.mgr.bootstrap_attach();
-    wait_until("偵測命中 fast", || m.mgr.resolve("COM0").as_deref() == Some("fast:COM0"));
+    wait_until("偵測命中 fast", || {
+        m.mgr.resolve("COM0").as_deref() == Some("fast:COM0")
+    });
     wait_until("正式 bridge 已套用設定", || {
         dev.configs().last().is_some_and(|cfg| cfg.baud == 921_600)
     });
     let configs = dev.configs();
-    assert_eq!(configs.first().map(|c| c.baud), Some(115_200), "PROBE 以預設設定開啟：{configs:?}");
-    assert_eq!(m.serial.open_attempts(&real), 1, "PROBE 與正式 bridge 共用同一 handle（#51）");
+    assert_eq!(
+        configs.first().map(|c| c.baud),
+        Some(115_200),
+        "PROBE 以預設設定開啟：{configs:?}"
+    );
+    assert_eq!(
+        m.serial.open_attempts(&real),
+        1,
+        "PROBE 與正式 bridge 共用同一 handle（#51）"
+    );
 }
 
 #[test]
@@ -4646,7 +5046,6 @@ fn pin_then_clear_on_attached_session_applies_pin() {
     assert_eq!(probe_rows(&m), before, "pin 繞過偵測，不得送 PROBE");
 }
 
-
 #[test]
 fn shutdown_gate_after_open_started_stops_bridge_without_tx() {
     // 審查 F66（Medium，73634db）：原 #29 斷言在 begin_shutdown 之後才送熱插，update_devices 早退，修正前也綠。
@@ -4662,10 +5061,15 @@ fn shutdown_gate_after_open_started_stops_bridge_without_tx() {
     wait_until("open 進入阻塞", || m.serial.open_attempts(real) == 1);
     m.mgr.begin_shutdown();
     m.serial.release_open(real);
-    wait_until("COM0 DETACHED", || m.state_of("COM0").as_deref() == Some("DETACHED"));
+    wait_until("COM0 DETACHED", || {
+        m.state_of("COM0").as_deref() == Some("DETACHED")
+    });
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(m.state_of("COM0").as_deref(), Some("DETACHED"));
-    assert!(m.device(real).take_tx().is_empty(), "stopping 後不得送登入 probe");
+    assert!(
+        m.device(real).take_tx().is_empty(),
+        "stopping 後不得送登入 probe"
+    );
 }
 
 #[test]
@@ -4694,7 +5098,10 @@ fn recover_released_during_stopping_returns_released() {
     ));
     assert_eq!(r.get("ok"), Some(&PyValue::Bool(true)), "{r:?}");
     assert_eq!(r.get("released"), Some(&PyValue::Bool(true)));
-    assert_eq!(r.get("recommended_action"), Some(&PyValue::from("device_attach")));
+    assert_eq!(
+        r.get("recommended_action"),
+        Some(&PyValue::from("device_attach"))
+    );
 }
 
 #[test]
@@ -4720,7 +5127,11 @@ fn bind_to_online_device_live_state_attaching_before_reply() {
     let reply = session_field(&r);
     assert_eq!(s_of(&reply, "state").as_deref(), Some("ATTACHING"));
     assert_eq!(reply.get("last_error"), Some(&PyValue::Null));
-    assert_ne!(s_of(&live, "state").as_deref(), Some("DETACHED"), "{live:?}");
+    assert_ne!(
+        s_of(&live, "state").as_deref(),
+        Some("DETACHED"),
+        "{live:?}"
+    );
     assert_ne!(
         s_of(&live, "last_error").as_deref(),
         Some("DEVICE_NOT_FOUND"),
@@ -4735,12 +5146,16 @@ fn release_persist_point_failure_fails_release_commit() {
     struct FailingPoint;
     impl sw_core::session_manager::PersistObserver for FailingPoint {
         fn before_release_commit(&self) -> Result<(), sw_pal::PalError> {
-            Err(sw_pal::PalError::io(20, "[Errno 20] Not a directory: '/dev/null/x'"))
+            Err(sw_pal::PalError::io(
+                20,
+                "[Errno 20] Not a directory: '/dev/null/x'",
+            ))
         }
         fn after_commit(&self, _release: bool) {}
     }
     let m = ManagerRig::single_target(SHELL_PROFILE).ready();
-    m.mgr.set_persist_observer(std::sync::Arc::new(FailingPoint));
+    m.mgr
+        .set_persist_observer(std::sync::Arc::new(FailingPoint));
     let sid = m.mgr.resolve("COM0").expect("COM0 session");
     let r = m.mgr.route(
         &sid,
@@ -4762,9 +5177,15 @@ fn manager_startup_always_rewrites_state_json() {
     // 審查 F56（Medium，c96a91c）：Python `SessionManager.__init__` 尾端一律 `_save_state()`（#13），即使內容與磁碟
     // 相同也重寫；原 `state_store::startup_always_rewrites_state_json` 只驗 store 自身的 commit，不證明啟動會寫。
     let m = ManagerRig::with(SHELL_PROFILE, LoadedState::default(), None);
-    assert!(m.state_writes() >= 1, "SessionManager 建構即應寫一次 state.json");
+    assert!(
+        m.state_writes() >= 1,
+        "SessionManager 建構即應寫一次 state.json"
+    );
     let text = m.state_text();
-    assert!(text.contains("\"aliases\"") && text.ends_with('\n'), "{text:?}");
+    assert!(
+        text.contains("\"aliases\"") && text.ends_with('\n'),
+        "{text:?}"
+    );
 }
 
 #[test]
@@ -4806,7 +5227,11 @@ fn global_bg_capture_eviction_reaches_owner_session_via_manager() {
         &t_target("COM0", 1, "/s/by-id/usb-A"),
         &t_target("COM1", 2, "/s/by-id/usb-B"),
     ]);
-    let m = ManagerRig::with(&yaml, LoadedState::default(), Some(("/s/by-id/usb-A", "/dev/ttyA")));
+    let m = ManagerRig::with(
+        &yaml,
+        LoadedState::default(),
+        Some(("/s/by-id/usb-A", "/dev/ttyA")),
+    );
     let dev_b = m.add_device_at("/s/by-id/usb-B", "/dev/ttyB");
     install_shell_replies(&dev_b);
     m.mgr.update_devices(&m.snapshot());
@@ -4815,7 +5240,10 @@ fn global_bg_capture_eviction_reaches_owner_session_via_manager() {
     m.wait_state("COM1", "READY");
     // `on_tx_reply` 只推一次；65 筆命令改用逐行比對的 `on_tx_match`。
     for dev in [&m.dev, &dev_b] {
-        dev.on_tx_match("dmesg", Box::new(|_| b"dmesg\r\nline1\r\nroot@t:/# ".to_vec()));
+        dev.on_tx_match(
+            "dmesg",
+            Box::new(|_| b"dmesg\r\nline1\r\nroot@t:/# ".to_vec()),
+        );
     }
     let sid0 = m.mgr.resolve("COM0").unwrap();
     let sid1 = m.mgr.resolve("COM1").unwrap();
@@ -4861,7 +5289,11 @@ fn global_bg_capture_eviction_reaches_owner_session_via_manager() {
     wait_until("COM1 最舊 capture 被淘汰", || {
         s_of(&tail(&sid1, &ids1[0]), "error_code").as_deref() == Some("CMD_NOT_FOUND")
     });
-    assert_eq!(tail(&sid1, &ids1[1])["ok"], PyValue::Bool(true), "只淘汰最舊一筆");
+    assert_eq!(
+        tail(&sid1, &ids1[1])["ok"],
+        PyValue::Bool(true),
+        "只淘汰最舊一筆"
+    );
     assert_eq!(tail(&sid0, &id0)["ok"], PyValue::Bool(true), "新完成者保留");
 }
 
@@ -4875,7 +5307,11 @@ fn global_bg_capture_eviction_owner_routing_ignores_alias_collision() {
         &t_target("COM0", 1, "/s/by-id/usb-A"),
         &t_target("COM1", 2, "/s/by-id/usb-B"),
     ]);
-    let m = ManagerRig::with(&yaml, LoadedState::default(), Some(("/s/by-id/usb-A", "/dev/ttyA")));
+    let m = ManagerRig::with(
+        &yaml,
+        LoadedState::default(),
+        Some(("/s/by-id/usb-A", "/dev/ttyA")),
+    );
     let dev_b = m.add_device_at("/s/by-id/usb-B", "/dev/ttyB");
     install_shell_replies(&dev_b);
     m.mgr.update_devices(&m.snapshot());
@@ -4884,7 +5320,10 @@ fn global_bg_capture_eviction_owner_routing_ignores_alias_collision() {
     m.wait_state("COM1", "READY");
     // `on_tx_reply` 只推一次；65 筆命令改用逐行比對的 `on_tx_match`。
     for dev in [&m.dev, &dev_b] {
-        dev.on_tx_match("dmesg", Box::new(|_| b"dmesg\r\nline1\r\nroot@t:/# ".to_vec()));
+        dev.on_tx_match(
+            "dmesg",
+            Box::new(|_| b"dmesg\r\nline1\r\nroot@t:/# ".to_vec()),
+        );
     }
     let sid0 = m.mgr.resolve("COM0").unwrap();
     let sid1 = m.mgr.resolve("COM1").unwrap();
@@ -4933,7 +5372,11 @@ fn global_bg_capture_eviction_owner_routing_ignores_alias_collision() {
     wait_until("COM1 最舊 capture 被淘汰", || {
         s_of(&tail(&sid1, &ids1[0]), "error_code").as_deref() == Some("CMD_NOT_FOUND")
     });
-    assert_eq!(tail(&sid1, &ids1[1])["ok"], PyValue::Bool(true), "只淘汰最舊一筆");
+    assert_eq!(
+        tail(&sid1, &ids1[1])["ok"],
+        PyValue::Bool(true),
+        "只淘汰最舊一筆"
+    );
     assert_eq!(tail(&sid0, &id0)["ok"], PyValue::Bool(true), "新完成者保留");
 }
 
@@ -4946,7 +5389,9 @@ fn product_executor_blocked_open_keeps_actor_responsive_and_release_drain_stalle
     m.serial.block_open("/dev/ttyOLD");
     m.mgr.update_devices(&m.snapshot());
     m.mgr.bootstrap_attach();
-    wait_until("open 進入閘門", || m.serial.open_attempts("/dev/ttyOLD") >= 1);
+    wait_until("open 進入閘門", || {
+        m.serial.open_attempts("/dev/ttyOLD") >= 1
+    });
     let sid = m.mgr.resolve("COM0").expect("COM0 session");
     let state = m
         .mgr
@@ -4979,7 +5424,11 @@ fn product_executor_blocked_open_keeps_actor_responsive_and_release_drain_stalle
         .recv_timeout(Duration::from_secs(5))
         .expect("release 須於排空期限內回覆")
         .expect("release 回 dict");
-    assert_eq!(code_of(&session_field(&reply)).or_else(|| code_of(&reply)), Some("DRAIN_STALLED".to_string()), "{reply:?}");
+    assert_eq!(
+        code_of(&session_field(&reply)).or_else(|| code_of(&reply)),
+        Some("DRAIN_STALLED".to_string()),
+        "{reply:?}"
+    );
     m.serial.release_open("/dev/ttyOLD");
 }
 
@@ -5001,10 +5450,11 @@ fn product_executor_blocked_release_commit_keeps_actor_responsive() {
     let m = ManagerRig::single_target(SHELL_PROFILE).ready();
     let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
     let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-    m.mgr.set_persist_observer(std::sync::Arc::new(BlockingPoint {
-        entered: entered_tx,
-        release: release_rx,
-    }));
+    m.mgr
+        .set_persist_observer(std::sync::Arc::new(BlockingPoint {
+            entered: entered_tx,
+            release: release_rx,
+        }));
     let sid = m.mgr.resolve("COM0").expect("COM0 session");
     let mgr = m.mgr.clone();
     let sid2 = sid.clone();
@@ -5056,10 +5506,11 @@ fn release_commit_paused_then_bind_keeps_binding_without_stale_released_row() {
     let m = ManagerRig::single_target(SHELL_PROFILE).ready();
     let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
     let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-    m.mgr.set_persist_observer(std::sync::Arc::new(BlockingPoint {
-        entered: entered_tx,
-        release: release_rx,
-    }));
+    m.mgr
+        .set_persist_observer(std::sync::Arc::new(BlockingPoint {
+            entered: entered_tx,
+            release: release_rx,
+        }));
     let sid = m.mgr.resolve("COM0").expect("COM0 session");
     let mgr = m.mgr.clone();
     let sid2 = sid.clone();
@@ -5103,9 +5554,20 @@ fn release_commit_paused_then_bind_keeps_binding_without_stale_released_row() {
     r.mgr.update_devices(&r.snapshot());
     r.mgr.bootstrap_attach();
     let after = r.session("COM0");
-    assert_ne!(s_of(&after, "state").as_deref(), Some("RELEASED"), "{after:?}");
-    assert_eq!(s_of(&after, "device_by_id").as_deref(), Some(OFFLINE_B), "{after:?}");
-    assert!(r.load_state_now().released.is_empty(), "重啟後不得重新出現 released 列");
+    assert_ne!(
+        s_of(&after, "state").as_deref(),
+        Some("RELEASED"),
+        "{after:?}"
+    );
+    assert_eq!(
+        s_of(&after, "device_by_id").as_deref(),
+        Some(OFFLINE_B),
+        "{after:?}"
+    );
+    assert!(
+        r.load_state_now().released.is_empty(),
+        "重啟後不得重新出現 released 列"
+    );
 }
 
 /// sol-backfill p5 #4：Python `SessionManager.__init__` 尾端 `_save_state()` 失敗（EACCES／ENOSPC）即拋出，
@@ -5123,9 +5585,15 @@ fn startup_save_failure_reports_python_exception_line() {
         ),
     ] {
         let (mgr, serial) = ManagerRig::startup_commit_failure(SHELL_PROFILE, err);
-        let msg = mgr.startup_error().expect("啟動存檔失敗須回報 startup_error");
+        let msg = mgr
+            .startup_error()
+            .expect("啟動存檔失敗須回報 startup_error");
         assert!(msg.starts_with(prefix), "{msg:?}");
-        assert_eq!(serial.open_attempts("/dev/ttyOLD"), 0, "啟動存檔失敗不得開埠");
+        assert_eq!(
+            serial.open_attempts("/dev/ttyOLD"),
+            0,
+            "啟動存檔失敗不得開埠"
+        );
     }
 }
 
@@ -5138,7 +5606,11 @@ fn alias_set_reaches_actor_profile_for_get_state() {
     assert!(is_ok(&rpc(m.mgr.alias_set(&sid, "dut"))));
     let via = m.mgr.resolve("dut").expect("新 alias 可解析");
     let state = rpc(m.mgr.route(&via, SessionRequest::GetState, RPC));
-    assert_eq!(s_of(&session_field(&state), "alias").as_deref(), Some("dut"), "{state:?}");
+    assert_eq!(
+        s_of(&session_field(&state), "alias").as_deref(),
+        Some("dut"),
+        "{state:?}"
+    );
     let listed = m.session("COM0");
     assert_eq!(s_of(&listed, "alias").as_deref(), Some("dut"), "{listed:?}");
 }
@@ -5147,13 +5619,17 @@ fn alias_set_reaches_actor_profile_for_get_state() {
 fn wp510_review5_pause_open_bridge(m: &ManagerRig) -> crossbeam_channel::Sender<()> {
     let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
     let (go_tx, go_rx) = crossbeam_channel::bounded::<()>(1);
-    m.mgr.set_open_bridge_pre_take_hook_for_test(Box::new(move || {
-        let _ = entered_tx.send(());
-        let _ = go_rx.recv_timeout(Duration::from_secs(10));
-    }));
+    m.mgr
+        .set_open_bridge_pre_take_hook_for_test(Box::new(move || {
+            let _ = entered_tx.send(());
+            let _ = go_rx.recv_timeout(Duration::from_secs(10));
+        }));
     let sid = m.mgr.resolve("gone-template:COM3").expect("佔位 session");
     let response = rpc(m.mgr.attach_released_placeholder(&sid, false));
-    assert!(is_ok(&response), "device.attach 應接受在線佔位：{response:?}");
+    assert!(
+        is_ok(&response),
+        "device.attach 應接受在線佔位：{response:?}"
+    );
     entered_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("正式 session 的 open_bridge 應停在接手預開 handle 之前");
@@ -5206,7 +5682,11 @@ fn wp510_review5_shutdown_before_bridge_takes_preopened_fail_close_reports_stall
         "未確認關閉的 handle 必須持續阻擋"
     );
     let session = m.session("t:COM3");
-    assert_eq!(wp510_review5_bool(&session, "drain_stalled"), Some(true), "{session:?}");
+    assert_eq!(
+        wp510_review5_bool(&session, "drain_stalled"),
+        Some(true),
+        "{session:?}"
+    );
     let again = m.mgr.shutdown(Duration::from_millis(50));
     assert!(
         again.iter().any(|(key, ok)| key == &attach_key && !ok),
@@ -5239,8 +5719,16 @@ fn wp510_review5_release_waiting_bridge_open_fail_close_reports_drain_stalled() 
     go.send(()).expect("放行 open_bridge");
     let reply = rpc(release.join().expect("release thread 不應 panic"));
 
-    assert_eq!(code_of(&reply).as_deref(), Some("DRAIN_STALLED"), "{reply:?}");
-    assert_eq!(wp510_review5_bool(&reply, "drain_stalled"), Some(true), "{reply:?}");
+    assert_eq!(
+        code_of(&reply).as_deref(),
+        Some("DRAIN_STALLED"),
+        "{reply:?}"
+    );
+    assert_eq!(
+        wp510_review5_bool(&reply, "drain_stalled"),
+        Some(true),
+        "{reply:?}"
+    );
     assert_ne!(
         m.state_of("t:COM3").as_deref(),
         Some("RELEASED"),
@@ -5248,7 +5736,10 @@ fn wp510_review5_release_waiting_bridge_open_fail_close_reports_drain_stalled() 
     );
     assert!(device.is_open(), "closed:false 表示 handle 仍開啟");
     let custody = m.mgr.custody_for_test(BY_ID).expect("custody entry");
-    assert!(matches!(custody.phase, CustodyPhaseSnapshot::CloseFailed { .. }));
+    assert!(matches!(
+        custody.phase,
+        CustodyPhaseSnapshot::CloseFailed { .. }
+    ));
     assert!(m.mgr.unconfirmed_close_for_test(BY_ID));
     assert!(
         !m.load_state_now().released.contains_key(&formal),
@@ -5277,16 +5768,28 @@ fn wp510_review5_configure_failure_fail_close_keeps_handle_in_drain() {
 
     assert!(device.is_open(), "closed:false 表示 handle 仍開啟");
     let custody = m.mgr.custody_for_test(BY_ID).expect("custody entry");
-    assert!(matches!(custody.phase, CustodyPhaseSnapshot::CloseFailed { .. }), "CloseFailed");
+    assert!(
+        matches!(custody.phase, CustodyPhaseSnapshot::CloseFailed { .. }),
+        "CloseFailed"
+    );
     assert!(m.mgr.unconfirmed_close_for_test(BY_ID), "unconfirmed_close");
     let started = Instant::now();
     let reply = rpc(wp510_release(&m.mgr, "t:COM3"));
-    assert_eq!(code_of(&reply).as_deref(), Some("DRAIN_STALLED"), "{reply:?}");
-    assert!(started.elapsed() >= Duration::from_millis(2500), "release 等待作業至期限");
+    assert_eq!(
+        code_of(&reply).as_deref(),
+        Some("DRAIN_STALLED"),
+        "{reply:?}"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(2500),
+        "release 等待作業至期限"
+    );
     assert_ne!(m.state_of("t:COM3").as_deref(), Some("RELEASED"));
     let drained = m.mgr.shutdown(Duration::from_millis(100));
     assert!(
-        drained.iter().any(|(key, ok)| key == &format!("attach:{BY_ID}") && !ok),
+        drained
+            .iter()
+            .any(|(key, ok)| key == &format!("attach:{BY_ID}") && !ok),
         "未確認關閉的 handle 必須列入 shutdown stalled：{drained:?}"
     );
     assert_eq!(device.open_count(), 1, "不得重新開埠");
@@ -5328,7 +5831,9 @@ fn wp510_review6_finish_attach_op_rereads_close_failed_under_lock() {
     });
     finish_go_tx.send(()).expect("放行 attach worker 收尾");
     // worker 恢復後只剩取鎖與判定；以有界等待觀察作業是否被移除（保留時於期限後回 false）。
-    let removed = m.mgr.wait_attach_idle_for_test(BY_ID, Duration::from_millis(500));
+    let removed = m
+        .mgr
+        .wait_attach_idle_for_test(BY_ID, Duration::from_millis(500));
 
     let inflight_kept = m.mgr.has_inflight_attach_for_test(BY_ID);
     let release = rpc(wp510_release(&m.mgr, "t:COM3"));
@@ -5339,9 +5844,20 @@ fn wp510_review6_finish_attach_op_rereads_close_failed_under_lock() {
         "removed={removed} inflight={inflight_kept} release={release:?} state={state_after_release:?} shutdown={drained:?}"
     );
 
-    assert!(inflight_kept, "未確認關閉的 handle 必須保留 inflight 阻擋：{observed}");
-    assert_eq!(code_of(&release).as_deref(), Some("DRAIN_STALLED"), "{observed}");
-    assert_eq!(wp510_review5_bool(&release, "drain_stalled"), Some(true), "{observed}");
+    assert!(
+        inflight_kept,
+        "未確認關閉的 handle 必須保留 inflight 阻擋：{observed}"
+    );
+    assert_eq!(
+        code_of(&release).as_deref(),
+        Some("DRAIN_STALLED"),
+        "{observed}"
+    );
+    assert_eq!(
+        wp510_review5_bool(&release, "drain_stalled"),
+        Some(true),
+        "{observed}"
+    );
     assert_ne!(
         state_after_release.as_deref(),
         Some("RELEASED"),
@@ -5395,13 +5911,21 @@ fn wp510_review5_handoff_worker_spawn_failure_returns_error_and_keeps_placeholde
         persisted_before,
         "持久化阻擋不得因建立失敗改變"
     );
-    assert!(m.mgr.resolve("t:COM3").is_none(), "未建立 worker 不得出現正式 session");
+    assert!(
+        m.mgr.resolve("t:COM3").is_none(),
+        "未建立 worker 不得出現正式 session"
+    );
     assert!(!device.is_open(), "未交接的 handle 必須關閉");
-    assert!(!m.mgr.has_inflight_attach_for_test(BY_ID), "確認關閉後不得殘留阻擋");
+    assert!(
+        !m.mgr.has_inflight_attach_for_test(BY_ID),
+        "確認關閉後不得殘留阻擋"
+    );
 
     let retry = rpc(m.mgr.attach_released_placeholder(&sid, false));
     assert!(is_ok(&retry), "建立失敗後佔位仍可重新交接：{retry:?}");
-    wait_until("t:COM3 正式 session", || m.mgr.resolve("t:COM3").is_some());
+    wait_until("t:COM3 正式 session", || {
+        m.mgr.resolve("t:COM3").is_some()
+    });
 }
 
 /// 同上（一般 OSError 分支）：佔位開埠回一般 OSError 時同樣先建立 worker；建立失敗須傳回 RPC 錯誤並保留佔位。
@@ -5432,9 +5956,18 @@ fn wp510_review5_oserror_handoff_worker_spawn_failure_returns_error_and_keeps_pl
         m.warnings()
     );
     wp510_b_assert_placeholder_retained(&m, SID);
-    assert_eq!(m.load_state_now().released.contains_key(SID), persisted_before);
-    assert!(m.mgr.resolve("t:COM3").is_none(), "未建立 worker 不得出現正式 session");
-    assert!(!m.mgr.has_inflight_attach_for_test(BY_ID), "無 handle 的作業不得殘留阻擋");
+    assert_eq!(
+        m.load_state_now().released.contains_key(SID),
+        persisted_before
+    );
+    assert!(
+        m.mgr.resolve("t:COM3").is_none(),
+        "未建立 worker 不得出現正式 session"
+    );
+    assert!(
+        !m.mgr.has_inflight_attach_for_test(BY_ID),
+        "無 handle 的作業不得殘留阻擋"
+    );
 }
 
 /// wp510 第 13 項（開埠 gate）：`device.attach` 已由 actor 發出 `OpenBridge`、`open_bridge` 取預開 handle 之前，by_id 才
@@ -5450,19 +5983,26 @@ fn wp510_review7_open_bridge_gate_rejects_late_unconfirmed_close() {
     device.fail_configure(PalError::io(5, "[Errno 5] Input/output error"));
     let sid = m.mgr.resolve("gone-template:COM3").expect("佔位 session");
     assert!(is_ok(&rpc(m.mgr.attach_released_placeholder(&sid, false))));
-    wait_until("正式 session 套用設定失敗後退回 DETACHED", || {
-        m.state_of("t:COM3").as_deref() == Some("DETACHED")
-    });
-    assert!(m.mgr.wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)));
-    assert!(!m.mgr.unconfirmed_close_for_test(BY_ID), "closed:true 不登記阻擋");
+    wait_until(
+        "正式 session 套用設定失敗後退回 DETACHED",
+        || m.state_of("t:COM3").as_deref() == Some("DETACHED"),
+    );
+    assert!(m
+        .mgr
+        .wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)));
+    assert!(
+        !m.mgr.unconfirmed_close_for_test(BY_ID),
+        "closed:true 不登記阻擋"
+    );
     let attempts = m.serial.open_attempts(REAL);
 
     let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
     let (go_tx, go_rx) = crossbeam_channel::bounded::<()>(1);
-    m.mgr.set_open_bridge_pre_take_hook_for_test(Box::new(move || {
-        let _ = entered_tx.send(());
-        let _ = go_rx.recv_timeout(Duration::from_secs(10));
-    }));
+    m.mgr
+        .set_open_bridge_pre_take_hook_for_test(Box::new(move || {
+            let _ = entered_tx.send(());
+            let _ = go_rx.recv_timeout(Duration::from_secs(10));
+        }));
     let formal = m.mgr.resolve("t:COM3").expect("正式 session");
     let manager = m.mgr.clone();
     let attach = std::thread::spawn(move || {
@@ -5475,9 +6015,21 @@ fn wp510_review7_open_bridge_gate_rejects_late_unconfirmed_close() {
     go_tx.send(()).expect("放行 open_bridge");
     let reply = rpc(attach.join().expect("attach thread 不應 panic"));
 
-    assert_eq!(code_of(&reply).as_deref(), Some("SESSION_RECOVERING"), "{reply:?}");
-    assert_eq!(wp510_review5_bool(&reply, "drain_stalled"), Some(false), "{reply:?}");
-    assert_eq!(m.serial.open_attempts(REAL), attempts, "gate 必須在 open_exclusive 之前拒絕");
+    assert_eq!(
+        code_of(&reply).as_deref(),
+        Some("SESSION_RECOVERING"),
+        "{reply:?}"
+    );
+    assert_eq!(
+        wp510_review5_bool(&reply, "drain_stalled"),
+        Some(false),
+        "{reply:?}"
+    );
+    assert_eq!(
+        m.serial.open_attempts(REAL),
+        attempts,
+        "gate 必須在 open_exclusive 之前拒絕"
+    );
     assert_eq!(m.state_of("t:COM3").as_deref(), Some("DETACHED"));
 }
 
@@ -5490,14 +6042,22 @@ fn test_b1_placeholder_attach_handoff_and_release_settles_custody() {
 
     let m = wp510_b_placeholder_rig(false, false);
     m.mgr.update_devices(&m.snapshot());
-    let placeholder_actor = m.mgr.actor_id_for_test(PLACEHOLDER_SID).expect("佔位 actor 身分");
+    let placeholder_actor = m
+        .mgr
+        .actor_id_for_test(PLACEHOLDER_SID)
+        .expect("佔位 actor 身分");
 
     // 1. 對 gone-template:COM3 執行佔位 attach
-    let res = m.mgr.attach_released_placeholder(PLACEHOLDER_SID, false).expect("attach_released_placeholder ok");
+    let res = m
+        .mgr
+        .attach_released_placeholder(PLACEHOLDER_SID, false)
+        .expect("attach_released_placeholder ok");
     assert_eq!(res.get("ok"), Some(&PyValue::Bool(true)));
 
     // 2. 等待正式 t:COM3 到 ATTACHED / READY
-    wait_until("t:COM3 正式 session", || m.mgr.resolve(FORMAL_SID).is_some());
+    wait_until("t:COM3 正式 session", || {
+        m.mgr.resolve(FORMAL_SID).is_some()
+    });
     wait_until("COM3 正式 bridge", || {
         matches!(m.state_of("COM3").as_deref(), Some("ATTACHED" | "READY"))
     });
@@ -5515,19 +6075,25 @@ fn test_b1_placeholder_attach_handoff_and_release_settles_custody() {
     }
 
     // 3. 執行 release
-    let rel_res = m.mgr.route(
-        FORMAL_SID,
-        SessionRequest::Release {
-            source: "cli".into(),
-            reason: PyValue::Null,
-        },
-        Duration::from_secs(5),
-    ).expect("release 成功");
+    let rel_res = m
+        .mgr
+        .route(
+            FORMAL_SID,
+            SessionRequest::Release {
+                source: "cli".into(),
+                reason: PyValue::Null,
+            },
+            Duration::from_secs(5),
+        )
+        .expect("release 成功");
     assert_eq!(rel_res.get("ok"), Some(&PyValue::Bool(true)));
 
     // 4. 驗證 release 成功後帳本完全收尾（C3）
     let custody_step3 = m.mgr.custody_for_test(BY_ID);
-    assert!(custody_step3.is_none(), "成功 release 後帳本紀錄須被結算移除，實際為：{custody_step3:?}");
+    assert!(
+        custody_step3.is_none(),
+        "成功 release 後帳本紀錄須被結算移除，實際為：{custody_step3:?}"
+    );
 }
 
 fn wp510_b_custom_placeholder_rig(sid: &str, by_id: &str, real: &str) -> ManagerRig {
@@ -5560,15 +6126,24 @@ fn test_placeholder_attach_next_actor_spawn_failure_closes_handle_and_settles_cu
     m.mgr.update_devices(&m.snapshot());
 
     sw_core::actor::inject_actor_spawn_fail_for("t:COM98");
-    let res = m.mgr.attach_released_placeholder(PLACEHOLDER_SID, false).expect("attach_released_placeholder ok");
+    let res = m
+        .mgr
+        .attach_released_placeholder(PLACEHOLDER_SID, false)
+        .expect("attach_released_placeholder ok");
     assert_eq!(res.get("ok"), Some(&PyValue::Bool(true)));
 
     // 等待 attach 作業收尾
-    assert!(m.mgr.wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)));
+    assert!(m
+        .mgr
+        .wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)));
     sw_core::actor::inject_actor_spawn_fail_clear();
 
     // 斷言：已開 handle 必須明確關閉，且只關閉 1 次
-    assert_eq!(device.close_count(), 1, "actor 建構失敗時已開 handle 必須明確關閉 1 次");
+    assert_eq!(
+        device.close_count(),
+        1,
+        "actor 建構失敗時已開 handle 必須明確關閉 1 次"
+    );
     assert!(!device.is_open(), "關閉成功後 handle 不得保持開啟");
     assert!(m.mgr.session_ids().is_empty(), "建構失敗不得留下 session");
     let c = m.mgr.custody_for_test(BY_ID);
@@ -5588,20 +6163,38 @@ fn test_placeholder_attach_next_actor_spawn_failure_close_failed_enters_unconfir
     device.fail_close(PalError::io(5, "close failed"));
 
     sw_core::actor::inject_actor_spawn_fail_for("t:COM99");
-    let res = m.mgr.attach_released_placeholder(PLACEHOLDER_SID, false).expect("attach_released_placeholder ok");
+    let res = m
+        .mgr
+        .attach_released_placeholder(PLACEHOLDER_SID, false)
+        .expect("attach_released_placeholder ok");
     assert_eq!(res.get("ok"), Some(&PyValue::Bool(true)));
 
     // 等待 attach 作業收尾
-    assert!(m.mgr.wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)));
+    assert!(m
+        .mgr
+        .wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)));
     sw_core::actor::inject_actor_spawn_fail_clear();
 
     // 斷言：嘗試關閉 1 次，但 closed:false，進 unconfirmed 且帳本為 CloseFailed
-    assert_eq!(device.close_count(), 1, "actor 建構失敗時已開 handle 必須嘗試關閉 1 次");
+    assert_eq!(
+        device.close_count(),
+        1,
+        "actor 建構失敗時已開 handle 必須嘗試關閉 1 次"
+    );
     assert!(device.is_open(), "關閉失敗後 handle 仍保持開啟");
     assert!(m.mgr.session_ids().is_empty(), "建構失敗不得留下 session");
     let c = m.mgr.custody_for_test(BY_ID);
-    assert!(matches!(c.as_ref().map(|x| &x.phase), Some(sw_core::custody::CustodyPhaseSnapshot::CloseFailed { .. })), "關閉失敗帳本須為 CloseFailed：{c:?}");
-    assert!(m.mgr.unconfirmed_close_for_test(BY_ID), "關閉失敗須進入未確認集合");
+    assert!(
+        matches!(
+            c.as_ref().map(|x| &x.phase),
+            Some(sw_core::custody::CustodyPhaseSnapshot::CloseFailed { .. })
+        ),
+        "關閉失敗帳本須為 CloseFailed：{c:?}"
+    );
+    assert!(
+        m.mgr.unconfirmed_close_for_test(BY_ID),
+        "關閉失敗須進入未確認集合"
+    );
 }
 
 #[test]
@@ -5639,7 +6232,10 @@ fn test_placeholder_attach_bridge_opened_send_failure_close_failed_retains_block
         let _ = resume_rx.recv();
     }));
 
-    let res = m.mgr.attach_released_placeholder(PLACEHOLDER_SID, false).expect("attach_released_placeholder ok");
+    let res = m
+        .mgr
+        .attach_released_placeholder(PLACEHOLDER_SID, false)
+        .expect("attach_released_placeholder ok");
     assert_eq!(res.get("ok"), Some(&PyValue::Bool(true)));
 
     // 等待進入 post_take_hook
@@ -5648,9 +6244,12 @@ fn test_placeholder_attach_bridge_opened_send_failure_close_failed_retains_block
     // 此時 preopened 已被取出，正式 bridge 正準備開啟。
     // 注入 executor 回呼 unwind，使 actor 在事件處理的 catch_unwind 外退出
     let resolved_sid = m.mgr.resolve("COM98").expect("session 存在");
-    m.mgr.set_executor_unwind_hook_for_test(&resolved_sid, Box::new(|| {
-        panic!("測試注入的 executor unwind（catch_unwind 之外）");
-    }));
+    m.mgr.set_executor_unwind_hook_for_test(
+        &resolved_sid,
+        Box::new(|| {
+            panic!("測試注入的 executor unwind（catch_unwind 之外）");
+        }),
+    );
     if let Some(ctrl) = m.mgr.actor_control_for_test(&resolved_sid) {
         let (tx, _rx) = crossbeam_channel::bounded(1);
         let _ = ctrl.send(sw_core::mailbox::ControlEvent::Request {
@@ -5677,11 +6276,24 @@ fn test_placeholder_attach_bridge_opened_send_failure_close_failed_retains_block
     }
 
     // 斷言：嘗試關閉 1 次，但 closed:false，進 unconfirmed 且帳本保留 CloseFailed，阻擋後續開埠
-    assert_eq!(device.close_count(), 1, "送達失敗時已開 handle 必須嘗試關閉 1 次");
+    assert_eq!(
+        device.close_count(),
+        1,
+        "送達失敗時已開 handle 必須嘗試關閉 1 次"
+    );
     assert!(device.is_open(), "關閉失敗後 handle 仍保持開啟");
     let c = m.mgr.custody_for_test(BY_ID);
-    assert!(matches!(c.as_ref().map(|x| &x.phase), Some(sw_core::custody::CustodyPhaseSnapshot::CloseFailed { .. })), "送達失敗且關閉失敗時帳本須保留 CloseFailed：{c:?}");
-    assert!(m.mgr.unconfirmed_close_for_test(BY_ID), "關閉失敗須進入未確認集合阻擋開埠");
+    assert!(
+        matches!(
+            c.as_ref().map(|x| &x.phase),
+            Some(sw_core::custody::CustodyPhaseSnapshot::CloseFailed { .. })
+        ),
+        "送達失敗且關閉失敗時帳本須保留 CloseFailed：{c:?}"
+    );
+    assert!(
+        m.mgr.unconfirmed_close_for_test(BY_ID),
+        "關閉失敗須進入未確認集合阻擋開埠"
+    );
 }
 
 #[test]
@@ -5704,7 +6316,10 @@ fn test_placeholder_attach_bridge_opened_send_failure_closed_settles() {
         let _ = resume_rx.recv();
     }));
 
-    let res = m.mgr.attach_released_placeholder(PLACEHOLDER_SID, false).expect("attach_released_placeholder ok");
+    let res = m
+        .mgr
+        .attach_released_placeholder(PLACEHOLDER_SID, false)
+        .expect("attach_released_placeholder ok");
     assert_eq!(res.get("ok"), Some(&PyValue::Bool(true)));
 
     // 等待進入 post_take_hook
@@ -5713,9 +6328,12 @@ fn test_placeholder_attach_bridge_opened_send_failure_closed_settles() {
     // 此時 preopened 已被取出，正式 bridge 正準備開啟。
     // 注入 executor 回呼 unwind，使 actor 在事件處理的 catch_unwind 外退出
     let resolved_sid = m.mgr.resolve("COM97").expect("session 存在");
-    m.mgr.set_executor_unwind_hook_for_test(&resolved_sid, Box::new(|| {
-        panic!("測試注入的 executor unwind（catch_unwind 之外）");
-    }));
+    m.mgr.set_executor_unwind_hook_for_test(
+        &resolved_sid,
+        Box::new(|| {
+            panic!("測試注入的 executor unwind（catch_unwind 之外）");
+        }),
+    );
     if let Some(ctrl) = m.mgr.actor_control_for_test(&resolved_sid) {
         let (tx, _rx) = crossbeam_channel::bounded(1);
         let _ = ctrl.send(sw_core::mailbox::ControlEvent::Request {
@@ -5738,11 +6356,18 @@ fn test_placeholder_attach_bridge_opened_send_failure_closed_settles() {
     }
 
     // 斷言：嘗試關閉 1 次，closed:true，帳本紀錄結算並移除，未確認集合不含該 by_id
-    assert_eq!(device.close_count(), 1, "送達失敗時已開 handle 必須嘗試關閉 1 次");
+    assert_eq!(
+        device.close_count(),
+        1,
+        "送達失敗時已開 handle 必須嘗試關閉 1 次"
+    );
     assert!(!device.is_open(), "關閉成功後 handle 不得保持開啟");
     let c = m.mgr.custody_for_test(BY_ID);
     assert!(c.is_none(), "關閉成功後帳本紀錄須被結算移除，實際為：{c:?}");
-    assert!(!m.mgr.unconfirmed_close_for_test(BY_ID), "關閉成功不得進入未確認集合");
+    assert!(
+        !m.mgr.unconfirmed_close_for_test(BY_ID),
+        "關閉成功不得進入未確認集合"
+    );
 }
 
 /// WP5-1（設計第 5 版 §1.4；S2-PAR-wp510r 第 8 項）：佔位交接後 `tpl-a:COM3` 已建立（出生即接管，紀錄 `Held{Session}`），
@@ -5759,10 +6384,11 @@ fn wp510r_r3_wp5_1_shutdown_pre_take_close_failure_warns() {
     m.mgr.update_devices(&m.snapshot());
     let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
     let (go_tx, go_rx) = crossbeam_channel::bounded::<()>(1);
-    m.mgr.set_open_bridge_pre_take_hook_for_test(Box::new(move || {
-        let _ = entered_tx.send(());
-        let _ = go_rx.recv_timeout(Duration::from_secs(10));
-    }));
+    m.mgr
+        .set_open_bridge_pre_take_hook_for_test(Box::new(move || {
+            let _ = entered_tx.send(());
+            let _ = go_rx.recv_timeout(Duration::from_secs(10));
+        }));
     let attached = rpc(m.mgr.attach_released_placeholder(&sid, false));
     assert!(is_ok(&attached), "{attached:?}");
     entered_rx
@@ -5771,17 +6397,25 @@ fn wp510r_r3_wp5_1_shutdown_pre_take_close_failure_warns() {
     let held = m.mgr.custody_for_test(BY_ID).expect("出生即接管的帳本紀錄");
     assert_eq!(held.phase, CustodyPhaseSnapshot::Held, "{held:?}");
     let tx_before = device.tx_len();
-    device.fail_close(sw_pal::traits::PalError::io(5, "[Errno 5] Input/output error"));
+    device.fail_close(sw_pal::traits::PalError::io(
+        5,
+        "[Errno 5] Input/output error",
+    ));
     let drained = m.mgr.shutdown(Duration::from_millis(1500));
     let _ = go_tx.send(());
     std::thread::sleep(Duration::from_millis(200));
 
     assert!(
-        drained.iter().any(|(target, ok)| target == &format!("attach:{BY_ID}") && !ok),
+        drained
+            .iter()
+            .any(|(target, ok)| target == &format!("attach:{BY_ID}") && !ok),
         "{drained:?}"
     );
     let custody = m.mgr.custody_for_test(BY_ID).expect("帳本紀錄保留");
-    assert!(matches!(custody.phase, CustodyPhaseSnapshot::CloseFailed { .. }), "{custody:?}");
+    assert!(
+        matches!(custody.phase, CustodyPhaseSnapshot::CloseFailed { .. }),
+        "{custody:?}"
+    );
     assert!(m.mgr.unconfirmed_close_for_test(BY_ID));
     let warnings = m.warnings();
     assert_eq!(
@@ -5798,7 +6432,10 @@ fn wp510r_r3_wp5_1_shutdown_pre_take_close_failure_warns() {
 }
 
 /// S2-PAR-wp510r R4：`custody_for_test` 的紀錄是否為 W6 worker 的開埠在途（`Opening{Worker}`，owner＝該 session）。
-fn wp510r_r4_is_w6_opening(rec: &sw_core::custody::CustodySnapshot, actor: sw_core::custody::ActorId) -> bool {
+fn wp510r_r4_is_w6_opening(
+    rec: &sw_core::custody::CustodySnapshot,
+    actor: sw_core::custody::ActorId,
+) -> bool {
     matches!(
         &rec.phase,
         CustodyPhaseSnapshot::Opening {
@@ -6205,22 +6842,29 @@ fn gpx_bind_timeout_from_released_session_sets_recovering() {
     assert_eq!(m.state_of(&sid).as_deref(), Some("RELEASED"));
 
     m.dev.pause_next_close();
-    m.fs.fail_next_atomic_write(PalError::io(
-        28,
-        "[Errno 28] No space left on device",
-    ));
-    let attach = m.mgr.route(
-        &sid,
-        SessionRequest::DeviceAttach { force: true },
-        RPC,
-    ).expect_err("unreleased commit 失敗應由 device.attach 回 Err");
-    assert!(attach.message.contains("No space left on device"), "{}", attach.message);
+    m.fs.fail_next_atomic_write(PalError::io(28, "[Errno 28] No space left on device"));
+    let attach = m
+        .mgr
+        .route(&sid, SessionRequest::DeviceAttach { force: true }, RPC)
+        .expect_err("unreleased commit 失敗應由 device.attach 回 Err");
+    assert!(
+        attach.message.contains("No space left on device"),
+        "{}",
+        attach.message
+    );
     assert!(
         m.dev.wait_paused(Duration::from_secs(5)),
         "release-failed attach 的退休 bridge close 應停在閘門"
     );
-    assert!(!m.mgr.retired_drains_for_test(&sid).is_empty(), "退休 bridge 仍待回條");
-    assert_eq!(m.state_of(&sid).as_deref(), Some("RELEASED"), "落盤失敗的 attach 保留 RELEASED");
+    assert!(
+        !m.mgr.retired_drains_for_test(&sid).is_empty(),
+        "退休 bridge 仍待回條"
+    );
+    assert_eq!(
+        m.state_of(&sid).as_deref(),
+        Some("RELEASED"),
+        "落盤失敗的 attach 保留 RELEASED"
+    );
 
     let bind_manager = m.mgr.clone();
     let bind_sid = sid.clone();
@@ -6235,12 +6879,36 @@ fn gpx_bind_timeout_from_released_session_sets_recovering() {
     let public = session_field(&bind);
     let live = m.session(&sid);
 
-    assert_eq!(code_of(&bind).as_deref(), Some("SESSION_RECOVERING"), "{bind:?}");
-    assert_eq!(s_of(&public, "state").as_deref(), Some("RECOVERING"), "{bind:?}");
-    assert_eq!(s_of(&live, "state").as_deref(), Some("RECOVERING"), "活 session 亦須更新：{live:?}");
-    assert_eq!(bind.get("drain_stalled"), Some(&PyValue::Bool(true)), "{bind:?}");
-    assert_eq!(public.get("drain_stalled"), Some(&PyValue::Bool(true)), "{bind:?}");
-    assert_eq!(live.get("device_by_id"), Some(&PyValue::from("/s/by-id/usb-A")), "逾時不得改綁：{live:?}");
+    assert_eq!(
+        code_of(&bind).as_deref(),
+        Some("SESSION_RECOVERING"),
+        "{bind:?}"
+    );
+    assert_eq!(
+        s_of(&public, "state").as_deref(),
+        Some("RECOVERING"),
+        "{bind:?}"
+    );
+    assert_eq!(
+        s_of(&live, "state").as_deref(),
+        Some("RECOVERING"),
+        "活 session 亦須更新：{live:?}"
+    );
+    assert_eq!(
+        bind.get("drain_stalled"),
+        Some(&PyValue::Bool(true)),
+        "{bind:?}"
+    );
+    assert_eq!(
+        public.get("drain_stalled"),
+        Some(&PyValue::Bool(true)),
+        "{bind:?}"
+    );
+    assert_eq!(
+        live.get("device_by_id"),
+        Some(&PyValue::from("/s/by-id/usb-A")),
+        "逾時不得改綁：{live:?}"
+    );
 }
 
 /// S2-PAR-wp510r 第 17 項紅燈：正式 W6 改名後，該 actor 在接手 offer 前退出，必須依穩定身分回收 Held handle。
@@ -6264,7 +6932,11 @@ fn wp510r_r17_w6_actor_exit_before_offer_adoption_reclaims_renamed_handle() {
             900 + generation,
             worker,
         );
-        historical_actors.push(m.mgr.custody_actor_for_test(&by_id).expect("歷史 owner ActorId"));
+        historical_actors.push(
+            m.mgr
+                .custody_actor_for_test(&by_id)
+                .expect("歷史 owner ActorId"),
+        );
         historical_records.push((device, token));
     }
     let real = fallback_session_then_unplug(&m, BY_ID);
@@ -6298,7 +6970,10 @@ fn wp510r_r17_w6_actor_exit_before_offer_adoption_reclaims_renamed_handle() {
     actor_entered_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("actor 已停在查詢 Request");
-    let control = m.mgr.actor_control_for_test(&old_sid).expect("actor control lane");
+    let control = m
+        .mgr
+        .actor_control_for_test(&old_sid)
+        .expect("actor control lane");
     let mut filled = 0;
     while control
         .try_send(sw_core::mailbox::ControlEvent::ConsoleCountChanged { count: 0 })
@@ -6307,7 +6982,9 @@ fn wp510r_r17_w6_actor_exit_before_offer_adoption_reclaims_renamed_handle() {
         filled += 1;
     }
     assert!(filled > 0, "control lane 必須確實被填滿");
-    rematerialize_resume_tx.send(()).expect("放行正式 W6 rematerialize");
+    rematerialize_resume_tx
+        .send(())
+        .expect("放行正式 W6 rematerialize");
 
     let token = {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -6321,9 +6998,15 @@ fn wp510r_r17_w6_actor_exit_before_offer_adoption_reclaims_renamed_handle() {
             std::thread::sleep(Duration::from_millis(10));
         }
     };
-    let new_sid = m.mgr.resolve("t:COM0").expect("W6 已正式改名到偵測 template");
+    let new_sid = m
+        .mgr
+        .resolve("t:COM0")
+        .expect("W6 已正式改名到偵測 template");
     let held = m.mgr.custody_for_test(BY_ID).expect("Held 紀錄");
-    let renamed_actor = m.mgr.actor_id_for_test(&new_sid).expect("改名後仍為同一 actor");
+    let renamed_actor = m
+        .mgr
+        .actor_id_for_test(&new_sid)
+        .expect("改名後仍為同一 actor");
     assert!(matches!(
         &held.owner,
         sw_core::custody::CustodyOwner::Session { actor } if *actor == renamed_actor
@@ -6336,11 +7019,16 @@ fn wp510r_r17_w6_actor_exit_before_offer_adoption_reclaims_renamed_handle() {
         reaper
             .send(sw_core::custody::ReaperCmd::ActorExited { actor: old_actor })
             .expect("延遲歷史 actor 退出通知送達");
-        wait_until("歷史 actor 關閉完成", || m.mgr.terminal_for_test(*old_token).is_some());
+        wait_until("歷史 actor 關閉完成", || {
+            m.mgr.terminal_for_test(*old_token).is_some()
+        });
         assert_eq!(device.close_count(), 1, "歷史 handle 關閉一次");
     }
     assert!(m.device(&real).is_open(), "歷史 ActorId 不得關閉 W6 handle");
-    assert!(m.mgr.terminal_for_test(token).is_none(), "歷史 ActorId 不產生 W6 終態");
+    assert!(
+        m.mgr.terminal_for_test(token).is_none(),
+        "歷史 ActorId 不產生 W6 終態"
+    );
 
     // 讓 actor 的真實 ExitReclaim Drop 發送退出通知，不直接呼叫帳本回收 helper。
     m.mgr.set_executor_unwind_hook_for_test(
@@ -6353,11 +7041,20 @@ fn wp510r_r17_w6_actor_exit_before_offer_adoption_reclaims_renamed_handle() {
         m.mgr.terminal_for_test(token).is_some()
     });
 
-    assert_eq!(m.device(&real).close_count(), closes_before + 1, "自身退出須關閉 W6 handle 一次");
-    assert!(!m.device(&real).is_open(), "自身退出後 handle 已關閉");
-    assert!(m.mgr.custody_for_test(BY_ID).is_none(), "成功回條後移除帳本紀錄");
     assert_eq!(
-        m.mgr.terminal_for_test(token).map(|terminal| terminal.handle),
+        m.device(&real).close_count(),
+        closes_before + 1,
+        "自身退出須關閉 W6 handle 一次"
+    );
+    assert!(!m.device(&real).is_open(), "自身退出後 handle 已關閉");
+    assert!(
+        m.mgr.custody_for_test(BY_ID).is_none(),
+        "成功回條後移除帳本紀錄"
+    );
+    assert_eq!(
+        m.mgr
+            .terminal_for_test(token)
+            .map(|terminal| terminal.handle),
         Some(sw_core::custody::TerminalHandle::Closed),
         "W6 offer 未接手時，actor 自身退出須取得配對 Closed 回條"
     );
@@ -6375,15 +7072,20 @@ fn wp510r_r4_p8_e25b69c_2_redetect_release_stall_ledger_opening_then_released() 
     let real = fallback_session_then_unplug(&m, "/s/by-id/usb-D");
     m.serial.block_open(&real);
     m.mgr.update_devices(&m.snapshot());
-    wait_until("再偵測卡在 open", || m.serial.open_attempts(&real) == 2);
+    wait_until("再偵測卡在 open", || {
+        m.serial.open_attempts(&real) == 2
+    });
     let closes_before = m.device(&real).close_count();
     let tx_before = m.device(&real).tx_len();
     let sid = m.mgr.resolve("COM0").expect("COM0 session");
-    let blocked = m.mgr.custody_for_test("/s/by-id/usb-D").expect("W6 開埠在途須登記帳本紀錄");
-    assert!(wp510r_r4_is_w6_opening(
-        &blocked,
-        m.mgr.actor_id_for_test(&sid).expect("actor 身分"),
-    ), "{blocked:?}");
+    let blocked = m
+        .mgr
+        .custody_for_test("/s/by-id/usb-D")
+        .expect("W6 開埠在途須登記帳本紀錄");
+    assert!(
+        wp510r_r4_is_w6_opening(&blocked, m.mgr.actor_id_for_test(&sid).expect("actor 身分"),),
+        "{blocked:?}"
+    );
     assert_eq!(blocked.cancel, None, "release 前未取消：{blocked:?}");
 
     let started = Instant::now();
@@ -6397,30 +7099,70 @@ fn wp510r_r4_p8_e25b69c_2_redetect_release_stall_ledger_opening_then_released() 
     );
     let waited = started.elapsed();
     let reply = rpc(reply);
-    assert!(waited >= Duration::from_millis(2500), "release 須等到首次期限：{waited:?}");
-    assert_eq!(code_of(&reply).as_deref(), Some("DRAIN_STALLED"), "{reply:?}");
+    assert!(
+        waited >= Duration::from_millis(2500),
+        "release 須等到首次期限：{waited:?}"
+    );
+    assert_eq!(
+        code_of(&reply).as_deref(),
+        Some("DRAIN_STALLED"),
+        "{reply:?}"
+    );
     assert_eq!(reply.get("drain_stalled"), Some(&PyValue::Bool(true)));
-    assert_eq!(s_of(&session_field(&reply), "state").as_deref(), Some("RECOVERING"), "{reply:?}");
-    let stalled = m.mgr.custody_for_test("/s/by-id/usb-D").expect("阻塞期間紀錄保留");
-    assert!(wp510r_r4_is_w6_opening(
-        &stalled,
-        m.mgr.actor_id_for_test(&sid).expect("actor 身分"),
-    ), "{stalled:?}");
+    assert_eq!(
+        s_of(&session_field(&reply), "state").as_deref(),
+        Some("RECOVERING"),
+        "{reply:?}"
+    );
+    let stalled = m
+        .mgr
+        .custody_for_test("/s/by-id/usb-D")
+        .expect("阻塞期間紀錄保留");
+    assert!(
+        wp510r_r4_is_w6_opening(&stalled, m.mgr.actor_id_for_test(&sid).expect("actor 身分"),),
+        "{stalled:?}"
+    );
     assert_eq!(stalled.token, blocked.token, "同一筆紀錄");
-    assert_eq!(stalled.cancel, Some(sw_core::custody::CustodyCancel::Release), "{stalled:?}");
+    assert_eq!(
+        stalled.cancel,
+        Some(sw_core::custody::CustodyCancel::Release),
+        "{stalled:?}"
+    );
 
     m.serial.release_open(&real);
     m.wait_state("COM0", "RELEASED");
-    wait_until("帳本紀錄收尾", || m.mgr.custody_for_test("/s/by-id/usb-D").is_none());
+    wait_until("帳本紀錄收尾", || {
+        m.mgr.custody_for_test("/s/by-id/usb-D").is_none()
+    });
     let session = m.session("COM0");
-    assert_eq!(s_of(&session, "released_by").as_deref(), Some("cli"), "{session:?}");
-    assert_eq!(session.get("released_reason"), Some(&PyValue::Null), "{session:?}");
-    assert_eq!(session.get("drain_stalled"), Some(&PyValue::Bool(false)), "{session:?}");
-    assert_eq!(session.get("drain_timeout_epoch"), Some(&PyValue::Null), "{session:?}");
+    assert_eq!(
+        s_of(&session, "released_by").as_deref(),
+        Some("cli"),
+        "{session:?}"
+    );
+    assert_eq!(
+        session.get("released_reason"),
+        Some(&PyValue::Null),
+        "{session:?}"
+    );
+    assert_eq!(
+        session.get("drain_stalled"),
+        Some(&PyValue::Bool(false)),
+        "{session:?}"
+    );
+    assert_eq!(
+        session.get("drain_timeout_epoch"),
+        Some(&PyValue::Null),
+        "{session:?}"
+    );
     wait_until("RELEASED 落盤", || {
         m.state_text().contains("\"released\"") && m.state_text().contains("/s/by-id/usb-D")
     });
-    assert_eq!(m.device(&real).close_count(), closes_before + 1, "遲到的 handle 關閉一次");
+    assert_eq!(
+        m.device(&real).close_count(),
+        closes_before + 1,
+        "遲到的 handle 關閉一次"
+    );
     assert!(!m.device(&real).is_open(), "沒有 IoWorker 持有 handle");
     assert_eq!(m.device(&real).tx_len(), tx_before, "取消後不得送 PROBE");
     std::thread::sleep(Duration::from_millis(200));
@@ -6453,21 +7195,44 @@ fn wp510r_r4_w6_release_before_register_tombstone_aborts_open() {
     entered_rx
         .recv_timeout(Duration::from_secs(10))
         .expect("W6 worker 應停在 BeginExternalAttach 接受後、登記前");
-    assert!(m.mgr.custody_for_test("/s/by-id/usb-D").is_none(), "登記前沒有帳本紀錄");
+    assert!(
+        m.mgr.custody_for_test("/s/by-id/usb-D").is_none(),
+        "登記前沒有帳本紀錄"
+    );
     let sid = m.mgr.resolve("COM0").expect("COM0 session");
 
     let started = Instant::now();
     let reply = rpc(wp510_release(&m.mgr, &sid));
     assert!(is_ok(&reply), "{reply:?}");
-    assert!(started.elapsed() < Duration::from_millis(2000), "沒有 handle 要等：{:?}", started.elapsed());
-    assert_eq!(s_of(&session_field(&reply), "state").as_deref(), Some("RELEASED"), "{reply:?}");
+    assert!(
+        started.elapsed() < Duration::from_millis(2000),
+        "沒有 handle 要等：{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        s_of(&session_field(&reply), "state").as_deref(),
+        Some("RELEASED"),
+        "{reply:?}"
+    );
 
     go_tx.send(()).expect("放行 worker");
-    wait_until("worker 收尾", || !m.mgr.has_inflight_attach_for_test("/s/by-id/usb-D"));
+    wait_until("worker 收尾", || {
+        !m.mgr.has_inflight_attach_for_test("/s/by-id/usb-D")
+    });
     std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(m.serial.open_attempts(&real), 1, "tombstone 令 worker 中止、不開埠");
-    assert!(m.mgr.custody_for_test("/s/by-id/usb-D").is_none(), "不得留下紀錄");
-    assert_eq!(s_of(&m.session("COM0"), "state").as_deref(), Some("RELEASED"));
+    assert_eq!(
+        m.serial.open_attempts(&real),
+        1,
+        "tombstone 令 worker 中止、不開埠"
+    );
+    assert!(
+        m.mgr.custody_for_test("/s/by-id/usb-D").is_none(),
+        "不得留下紀錄"
+    );
+    assert_eq!(
+        s_of(&m.session("COM0"), "state").as_deref(),
+        Some("RELEASED")
+    );
 }
 
 /// S2-PAR-wp510r R4 DR-1(b)（設計 §1.8、C4、§3.1.5「W2／W6 offer 通知 Full」）：W6 worker 完成 PROBE、把 handle 存回
@@ -6481,8 +7246,14 @@ fn wp510r_r4_dr1_b_w6_offer_lane_full_custody_poll_claims_same_handle() {
     let sid = m.mgr.resolve("COM0").expect("COM0 session");
     m.serial.block_open(&real);
     m.mgr.update_devices(&m.snapshot());
-    wait_until("再偵測卡在 open", || m.serial.open_attempts(&real) == 2);
-    let token = m.mgr.custody_for_test("/s/by-id/usb-D").expect("W6 紀錄").token;
+    wait_until("再偵測卡在 open", || {
+        m.serial.open_attempts(&real) == 2
+    });
+    let token = m
+        .mgr
+        .custody_for_test("/s/by-id/usb-D")
+        .expect("W6 紀錄")
+        .token;
 
     // H-actor-hold：actor 停在一筆無關查詢，再灌滿 control lane。
     let (entered, resume) = m.mgr.pause_next_request_for_test(&sid).expect("actor 存在");
@@ -6533,7 +7304,11 @@ fn wp510r_r4_dr1_b_w6_offer_lane_full_custody_poll_claims_same_handle() {
         m.mgr.custody_for_test("/s/by-id/usb-D")
     );
     m.wait_state("COM0", "ATTACHED");
-    assert_eq!(m.serial.open_attempts(&real), open_attempts, "以原 handle adopt，不另開");
+    assert_eq!(
+        m.serial.open_attempts(&real),
+        open_attempts,
+        "以原 handle adopt，不另開"
+    );
     assert_eq!(m.device(&real).close_count(), 1, "只有拔除時那一次關閉");
     assert!(m.device(&real).is_open(), "正式 bridge 持有 handle");
 }
@@ -6548,7 +7323,9 @@ fn wp510r_r4_w6_shutdown_during_open_closes_and_reports_drained() {
     let real = fallback_session_then_unplug(&m, "/s/by-id/usb-D");
     m.serial.block_open(&real);
     m.mgr.update_devices(&m.snapshot());
-    wait_until("再偵測卡在 open", || m.serial.open_attempts(&real) == 2);
+    wait_until("再偵測卡在 open", || {
+        m.serial.open_attempts(&real) == 2
+    });
     let closes_before = m.device(&real).close_count();
     let tx_before = m.device(&real).tx_len();
     let serial = m.serial.clone();
@@ -6559,11 +7336,21 @@ fn wp510r_r4_w6_shutdown_during_open_closes_and_reports_drained() {
     });
     let drained = m.mgr.shutdown(Duration::from_secs(5));
     unblock.join().expect("放行執行緒不應 panic");
-    assert!(drained.iter().all(|(_, ok)| *ok), "回條成功後報告已排空：{drained:?}");
-    assert_eq!(m.device(&real).close_count(), closes_before + 1, "遲到的 handle 關閉一次");
+    assert!(
+        drained.iter().all(|(_, ok)| *ok),
+        "回條成功後報告已排空：{drained:?}"
+    );
+    assert_eq!(
+        m.device(&real).close_count(),
+        closes_before + 1,
+        "遲到的 handle 關閉一次"
+    );
     assert!(!m.device(&real).is_open());
     assert_eq!(m.device(&real).tx_len(), tx_before, "零 TX");
-    assert!(m.mgr.custody_for_test("/s/by-id/usb-D").is_none(), "紀錄移除");
+    assert!(
+        m.mgr.custody_for_test("/s/by-id/usb-D").is_none(),
+        "紀錄移除"
+    );
     assert!(!m.mgr.unconfirmed_close_for_test("/s/by-id/usb-D"));
 }
 
@@ -6613,12 +7400,24 @@ fn wp510r_r4_w6_release_during_probe_freezes_probe_tx() {
     cancelled_rx
         .recv_timeout(Duration::from_secs(10))
         .expect("PROBE 提交前 release 已寫入帳本紀錄的取消");
-    let reply = rpc(release_rx.recv_timeout(RPC).expect("release 應在 W6 收尾後回覆"));
+    let reply = rpc(release_rx
+        .recv_timeout(RPC)
+        .expect("release 應在 W6 收尾後回覆"));
     assert!(is_ok(&reply), "{reply:?}");
     m.wait_state("COM0", "RELEASED");
-    wait_until("帳本紀錄收尾", || m.mgr.custody_for_test("/s/by-id/usb-D").is_none());
-    assert_eq!(m.device(&real).tx_len(), tx_before, "取消後 PROBE 不得送出任何 TX");
-    assert_eq!(m.device(&real).close_count(), closes_before + 1, "W6 handle 關閉一次");
+    wait_until("帳本紀錄收尾", || {
+        m.mgr.custody_for_test("/s/by-id/usb-D").is_none()
+    });
+    assert_eq!(
+        m.device(&real).tx_len(),
+        tx_before,
+        "取消後 PROBE 不得送出任何 TX"
+    );
+    assert_eq!(
+        m.device(&real).close_count(),
+        closes_before + 1,
+        "W6 handle 關閉一次"
+    );
     assert!(!m.device(&real).is_open());
 }
 
@@ -6632,29 +7431,50 @@ fn wp510r_r4_w6_release_close_failure_keeps_blocked_and_stalled() {
     let real = fallback_session_then_unplug(&m, "/s/by-id/usb-D");
     m.serial.block_open(&real);
     m.mgr.update_devices(&m.snapshot());
-    wait_until("再偵測卡在 open", || m.serial.open_attempts(&real) == 2);
+    wait_until("再偵測卡在 open", || {
+        m.serial.open_attempts(&real) == 2
+    });
     let sid = m.mgr.resolve("COM0").expect("COM0 session");
-    let token = m.mgr.custody_for_test("/s/by-id/usb-D").expect("W6 紀錄").token;
+    let token = m
+        .mgr
+        .custody_for_test("/s/by-id/usb-D")
+        .expect("W6 紀錄")
+        .token;
     let reply = rpc(wp510_release(&m.mgr, &sid));
-    assert_eq!(code_of(&reply).as_deref(), Some("DRAIN_STALLED"), "{reply:?}");
+    assert_eq!(
+        code_of(&reply).as_deref(),
+        Some("DRAIN_STALLED"),
+        "{reply:?}"
+    );
     let device = m.device(&real);
-    device.fail_close(sw_pal::traits::PalError::io(5, "[Errno 5] Input/output error"));
+    device.fail_close(sw_pal::traits::PalError::io(
+        5,
+        "[Errno 5] Input/output error",
+    ));
     m.serial.release_open(&real);
     wait_until("W6 關閉失敗轉 CloseFailed", || {
         m.mgr.custody_for_test("/s/by-id/usb-D").is_some_and(|rec| {
             rec.token == token && matches!(rec.phase, CustodyPhaseSnapshot::CloseFailed { .. })
         })
     });
-    assert!(m.mgr.unconfirmed_close_for_test("/s/by-id/usb-D"), "D1 iii：永久阻擋");
+    assert!(
+        m.mgr.unconfirmed_close_for_test("/s/by-id/usb-D"),
+        "D1 iii：永久阻擋"
+    );
     std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(s_of(&m.session("COM0"), "state").as_deref(), Some("RECOVERING"));
+    assert_eq!(
+        s_of(&m.session("COM0"), "state").as_deref(),
+        Some("RECOVERING")
+    );
     let released_rows = match sw_proto::pyjson::loads(&m.state_text()) {
         Ok(PyValue::Dict(state)) => match state.get("released") {
             Some(PyValue::Dict(rows)) => rows
                 .0
                 .values()
                 .filter(|row| match row {
-                    PyValue::Dict(row) => row.get("by_id").and_then(PyValue::as_str) == Some("/s/by-id/usb-D"),
+                    PyValue::Dict(row) => {
+                        row.get("by_id").and_then(PyValue::as_str) == Some("/s/by-id/usb-D")
+                    }
                     _ => false,
                 })
                 .count(),
@@ -6662,11 +7482,24 @@ fn wp510r_r4_w6_release_close_failure_keeps_blocked_and_stalled() {
         },
         _ => 0,
     };
-    assert_eq!(released_rows, 0, "關閉未確認不得落盤 RELEASED：{}", m.state_text());
+    assert_eq!(
+        released_rows,
+        0,
+        "關閉未確認不得落盤 RELEASED：{}",
+        m.state_text()
+    );
     let started = Instant::now();
     let again = rpc(wp510_release(&m.mgr, &sid));
-    assert_eq!(code_of(&again).as_deref(), Some("DRAIN_STALLED"), "{again:?}");
-    assert!(started.elapsed() < Duration::from_millis(1000), "首次期限已過，立即回：{:?}", started.elapsed());
+    assert_eq!(
+        code_of(&again).as_deref(),
+        Some("DRAIN_STALLED"),
+        "{again:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(1000),
+        "首次期限已過，立即回：{:?}",
+        started.elapsed()
+    );
     assert_eq!(m.serial.open_attempts(&real), 2, "不重開");
     assert!(device.is_open(), "closed:false 表示 handle 仍開啟");
 }
@@ -6697,8 +7530,13 @@ fn wp510r_r5_wp1_1_release_during_placeholder_open_cancels_ledger_record() {
     let attach = std::thread::spawn(move || {
         let _ = attach_tx.send(attach_manager.attach_released_placeholder(&attach_sid, false));
     });
-    wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(WP510R_R5_REAL) == 1);
-    let rec = m.mgr.custody_for_test(WP510R_R5_BY_ID).expect("開埠在途須有帳本紀錄");
+    wait_until("佔位 attach 停在 open_exclusive", || {
+        m.serial.open_attempts(WP510R_R5_REAL) == 1
+    });
+    let rec = m
+        .mgr
+        .custody_for_test(WP510R_R5_BY_ID)
+        .expect("開埠在途須有帳本紀錄");
     assert!(
         matches!(
             &rec.phase,
@@ -6724,7 +7562,10 @@ fn wp510r_r5_wp1_1_release_during_placeholder_open_cancels_ledger_record() {
             r.token == rec.token && r.cancel == Some(sw_core::custody::CustodyCancel::Release)
         })
     });
-    assert!(release_rx.recv_timeout(Duration::from_millis(300)).is_err(), "關閉回條前 release 不得回覆");
+    assert!(
+        release_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "關閉回條前 release 不得回覆"
+    );
     assert!(attach_rx.try_recv().is_err(), "開埠返回前 attach 不得回覆");
 
     m.serial.release_open(WP510R_R5_REAL);
@@ -6736,7 +7577,10 @@ fn wp510r_r5_wp1_1_release_during_placeholder_open_cancels_ledger_record() {
     assert_eq!(code_of(&a).as_deref(), Some("SESSION_RECOVERING"), "{a:?}");
     assert_eq!(a.get("drain_stalled"), Some(&PyValue::Bool(false)));
     assert_eq!(a.get("drain_timeout_epoch"), Some(&PyValue::Null));
-    assert_eq!(s_of(&session_field(&a), "state").as_deref(), Some("RELEASED"));
+    assert_eq!(
+        s_of(&session_field(&a), "state").as_deref(),
+        Some("RELEASED")
+    );
     assert_eq!(
         b.0.keys().map(String::as_str).collect::<Vec<_>>(),
         ["ok", "already_released", "session"],
@@ -6744,13 +7588,20 @@ fn wp510r_r5_wp1_1_release_during_placeholder_open_cancels_ledger_record() {
     );
     let session = session_field(&b);
     assert_eq!(s_of(&session, "state").as_deref(), Some("RELEASED"));
-    assert_eq!(s_of(&session, "released_by").as_deref(), Some("agent"), "沿用佔位的 released_by");
+    assert_eq!(
+        s_of(&session, "released_by").as_deref(),
+        Some("agent"),
+        "沿用佔位的 released_by"
+    );
     assert_eq!(session.get("drain_stalled"), Some(&PyValue::Bool(false)));
     assert_eq!(session.get("drain_timeout_epoch"), Some(&PyValue::Null));
     assert_eq!(device.open_count(), 1);
     assert_eq!(device.close_count(), 1);
     assert!(!device.is_open());
-    assert!(m.mgr.custody_for_test(WP510R_R5_BY_ID).is_none(), "帳本最後為 None");
+    assert!(
+        m.mgr.custody_for_test(WP510R_R5_BY_ID).is_none(),
+        "帳本最後為 None"
+    );
     assert_eq!(m.mgr.released_placeholder(&sid), Some(true), "佔位保留");
     assert!(m.mgr.resolve("t:COM3").is_none(), "沒有正式 session");
     assert!(device.take_tx().is_empty(), "零 TX");
@@ -6769,7 +7620,11 @@ fn wp510r_r5_wp5_2_prepare_failure_leaves_no_ledger_or_prepared_worker() {
         .attach_released_placeholder(&sid, false)
         .expect_err("worker 建立失敗回 RPC 錯誤");
     assert_eq!(error.message, "can't start new thread");
-    assert_eq!(m.serial.open_attempts(WP510R_R5_REAL), 0, "D3：worker 在開埠前準備");
+    assert_eq!(
+        m.serial.open_attempts(WP510R_R5_REAL),
+        0,
+        "D3：worker 在開埠前準備"
+    );
     assert!(m.mgr.custody_for_test(WP510R_R5_BY_ID).is_none());
     assert_eq!(m.mgr.prepared_len_for_test(), 0, "prepared 為空");
     assert!(
@@ -6780,7 +7635,11 @@ fn wp510r_r5_wp5_2_prepare_failure_leaves_no_ledger_or_prepared_worker() {
     wp510_b_assert_placeholder_retained(&m, &sid);
     let again = rpc(m.mgr.attach_released_placeholder(&sid, false));
     assert!(is_ok(&again), "之後可以再交接：{again:?}");
-    assert_eq!(m.mgr.prepared_len_for_test(), 0, "交接成功後 prepared 亦清空");
+    assert_eq!(
+        m.mgr.prepared_len_for_test(),
+        0,
+        "交接成功後 prepared 亦清空"
+    );
 }
 
 /// WP6-2(a)（設計 v3 §1.3；D2）：開埠成功後退休落盤 ENOSPC → 回 EXC、不回滾；帳本以同一 token 存回 `Held{Parked}`（不關閉、
@@ -6798,15 +7657,28 @@ fn wp510r_r5_wp6_2_retire_persist_failure_parks_same_token() {
     let attach = std::thread::spawn(move || {
         let _ = attach_tx.send(attach_manager.attach_released_placeholder(&attach_sid, false));
     });
-    wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(WP510R_R5_REAL) == 1);
-    let token = m.mgr.custody_for_test(WP510R_R5_BY_ID).expect("開埠在途紀錄").token;
+    wait_until("佔位 attach 停在 open_exclusive", || {
+        m.serial.open_attempts(WP510R_R5_REAL) == 1
+    });
+    let token = m
+        .mgr
+        .custody_for_test(WP510R_R5_BY_ID)
+        .expect("開埠在途紀錄")
+        .token;
     m.fs.fail_next_atomic_write(PalError::io(28, "No space left on device"));
     m.serial.release_open(WP510R_R5_REAL);
     let result = attach_rx.recv_timeout(RPC).expect("attach 應完成");
     attach.join().expect("attach thread");
     let error = result.expect_err("退休落盤失敗回 EXC");
-    assert!(error.message.contains("No space left on device"), "{}", error.message);
-    let rec = m.mgr.custody_for_test(WP510R_R5_BY_ID).expect("parked 紀錄");
+    assert!(
+        error.message.contains("No space left on device"),
+        "{}",
+        error.message
+    );
+    let rec = m
+        .mgr
+        .custody_for_test(WP510R_R5_BY_ID)
+        .expect("parked 紀錄");
     assert_eq!(rec.token, token, "同一 token 存回 parked");
     assert_eq!(rec.phase, CustodyPhaseSnapshot::Held);
     assert_eq!(rec.owner, sw_core::custody::CustodyOwner::Parked);
@@ -6825,15 +7697,22 @@ fn wp510r_r5_wp6_2_retire_persist_failure_parks_same_token() {
 fn wp510r_r5_g8_restored_released_session_attach_uses_manager_device_snapshot() {
     const BY_ID: &str = "/s/by-id/usb-R";
     let mut loaded = LoadedState::default();
-    loaded.released.insert("t:COM1".to_string(), released_row(BY_ID));
+    loaded
+        .released
+        .insert("t:COM1".to_string(), released_row(BY_ID));
     let m = ManagerRig::with(&manager_yaml(&[&t_target("COM1", 1, BY_ID)]), loaded, None);
     let dev = m.add_device_at(BY_ID, "/dev/ttyR");
     install_shell_replies(&dev);
     m.mgr.update_devices(&m.snapshot());
     m.mgr.bootstrap_attach();
     assert_eq!(m.state_of("COM1").as_deref(), Some("RELEASED"));
-    let reply = rpc(m.mgr.route("t:COM1", SessionRequest::DeviceAttach { force: false }, RPC));
-    assert!(is_ok(&reply), "manager 快照中在線的裝置不得回 DEVICE_NOT_PRESENT：{reply:?}");
+    let reply = rpc(m
+        .mgr
+        .route("t:COM1", SessionRequest::DeviceAttach { force: false }, RPC));
+    assert!(
+        is_ok(&reply),
+        "manager 快照中在線的裝置不得回 DEVICE_NOT_PRESENT：{reply:?}"
+    );
     wait_until("t:COM1 開埠", || m.serial.open_attempts("/dev/ttyR") >= 1);
 }
 
@@ -6850,8 +7729,11 @@ fn wp510r_r5_wp2_2_releases_share_first_absolute_deadline() {
     m.serial.block_open(WP510R_R5_REAL);
     let attach_manager = m.mgr.clone();
     let attach_sid = sid.clone();
-    let attach = std::thread::spawn(move || attach_manager.attach_released_placeholder(&attach_sid, false));
-    wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(WP510R_R5_REAL) == 1);
+    let attach =
+        std::thread::spawn(move || attach_manager.attach_released_placeholder(&attach_sid, false));
+    wait_until("佔位 attach 停在 open_exclusive", || {
+        m.serial.open_attempts(WP510R_R5_REAL) == 1
+    });
     let t0 = Instant::now();
     let spawn_release = |delay: Duration| {
         let manager = m.mgr.clone();
@@ -6866,14 +7748,36 @@ fn wp510r_r5_wp2_2_releases_share_first_absolute_deadline() {
     let second = spawn_release(Duration::from_millis(1000));
     let (first, first_at) = first.join().expect("release#1");
     let (second, second_at) = second.join().expect("release#2");
-    for (name, response, at) in [("release#1", rpc(first), first_at), ("release#2", rpc(second), second_at)] {
-        assert_eq!(code_of(&response).as_deref(), Some("DRAIN_STALLED"), "{name}：{response:?}");
-        assert_eq!(response.get("drain_stalled"), Some(&PyValue::Bool(true)), "{name}");
+    for (name, response, at) in [
+        ("release#1", rpc(first), first_at),
+        ("release#2", rpc(second), second_at),
+    ] {
+        assert_eq!(
+            code_of(&response).as_deref(),
+            Some("DRAIN_STALLED"),
+            "{name}：{response:?}"
+        );
+        assert_eq!(
+            response.get("drain_stalled"),
+            Some(&PyValue::Bool(true)),
+            "{name}"
+        );
         let epoch = response.get("drain_timeout_epoch").cloned().expect("epoch");
-        assert!(matches!(epoch, PyValue::Int(_)), "{name}：epoch 為 g：{response:?}");
+        assert!(
+            matches!(epoch, PyValue::Int(_)),
+            "{name}：epoch 為 g：{response:?}"
+        );
         let session = session_field(&response);
-        assert_eq!(s_of(&session, "state").as_deref(), Some("RELEASED"), "{name}");
-        assert_eq!(session.get("drain_stalled"), Some(&PyValue::Bool(true)), "{name}");
+        assert_eq!(
+            s_of(&session, "state").as_deref(),
+            Some("RELEASED"),
+            "{name}"
+        );
+        assert_eq!(
+            session.get("drain_stalled"),
+            Some(&PyValue::Bool(true)),
+            "{name}"
+        );
         assert_eq!(session.get("drain_timeout_epoch"), Some(&epoch), "{name}");
         assert!(
             at >= Duration::from_millis(2500) && at < Duration::from_millis(4500),
@@ -6883,7 +7787,11 @@ fn wp510r_r5_wp2_2_releases_share_first_absolute_deadline() {
     let started = Instant::now();
     let third = rpc(wp510_release(&m.mgr, &sid));
     assert_eq!(code_of(&third).as_deref(), Some("DRAIN_STALLED"));
-    assert!(started.elapsed() < Duration::from_millis(200), "期限已過立即回：{:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "期限已過立即回：{:?}",
+        started.elapsed()
+    );
     m.serial.release_open(WP510R_R5_REAL);
     let a = rpc(attach.join().expect("attach thread"));
     assert_eq!(code_of(&a).as_deref(), Some("SESSION_RECOVERING"), "{a:?}");
@@ -6894,7 +7802,11 @@ fn wp510r_r5_wp2_2_releases_share_first_absolute_deadline() {
     });
     assert_eq!(m.state_of(&sid).as_deref(), Some("RELEASED"));
     let again = rpc(wp510_release(&m.mgr, &sid));
-    assert_eq!(again.get("already_released"), Some(&PyValue::Bool(true)), "{again:?}");
+    assert_eq!(
+        again.get("already_released"),
+        Some(&PyValue::Bool(true)),
+        "{again:?}"
+    );
     assert_eq!(device.open_count(), 1);
     assert_eq!(device.close_count(), 1);
 }
@@ -6911,8 +7823,11 @@ fn wp510r_r5_wp1_4_shutdown_during_placeholder_open_reports_drained() {
     m.serial.block_open(WP510R_R5_REAL);
     let attach_manager = m.mgr.clone();
     let attach_sid = sid.clone();
-    let attach = std::thread::spawn(move || attach_manager.attach_released_placeholder(&attach_sid, false));
-    wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(WP510R_R5_REAL) == 1);
+    let attach =
+        std::thread::spawn(move || attach_manager.attach_released_placeholder(&attach_sid, false));
+    wait_until("佔位 attach 停在 open_exclusive", || {
+        m.serial.open_attempts(WP510R_R5_REAL) == 1
+    });
     let shutdown_manager = m.mgr.clone();
     let shutdown = std::thread::spawn(move || shutdown_manager.shutdown(Duration::from_secs(5)));
     wait_until("shutdown 取消帳本紀錄", || {
@@ -6925,11 +7840,20 @@ fn wp510r_r5_wp1_4_shutdown_during_placeholder_open_reports_drained() {
     let drained = shutdown.join().expect("shutdown thread");
     assert_eq!(
         a.0.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["ok", "error_code", "drain_stalled", "drain_timeout_epoch", "session"],
+        [
+            "ok",
+            "error_code",
+            "drain_stalled",
+            "drain_timeout_epoch",
+            "session"
+        ],
         "{a:?}"
     );
     assert_eq!(code_of(&a).as_deref(), Some("SESSION_RECOVERING"));
-    assert!(drained.iter().all(|(_, ok)| *ok), "shutdown 報告已排空：{drained:?}");
+    assert!(
+        drained.iter().all(|(_, ok)| *ok),
+        "shutdown 報告已排空：{drained:?}"
+    );
     assert_eq!(device.close_count(), 1);
     assert!(!device.is_open());
     assert!(m.mgr.resolve(WP510R_R5_SID).is_some(), "不退休");
@@ -6946,13 +7870,17 @@ fn wp510r_r5_g1_concurrent_releases_of_inflight_attach_share_identical_reply() {
     m.serial.block_open("/dev/ttyOLD");
     m.mgr.update_devices(&m.snapshot());
     m.mgr.bootstrap_attach();
-    wait_until("COM0 開埠在途", || m.serial.open_attempts("/dev/ttyOLD") == 1);
+    wait_until("COM0 開埠在途", || {
+        m.serial.open_attempts("/dev/ttyOLD") == 1
+    });
     let spawn_release = || {
         let manager = m.mgr.clone();
         std::thread::spawn(move || wp510_release(&manager, "t:COM0"))
     };
     let first = spawn_release();
-    wait_until("COM0 進入 RECOVERING", || m.state_of("COM0").as_deref() == Some("RECOVERING"));
+    wait_until("COM0 進入 RECOVERING", || {
+        m.state_of("COM0").as_deref() == Some("RECOVERING")
+    });
     let second = spawn_release();
     std::thread::sleep(Duration::from_millis(200));
     m.serial.release_open("/dev/ttyOLD");
@@ -6960,8 +7888,14 @@ fn wp510r_r5_g1_concurrent_releases_of_inflight_attach_share_identical_reply() {
     let second = rpc(second.join().expect("release#2"));
     assert!(is_ok(&first), "{first:?}");
     assert!(first.get("already_released").is_none(), "{first:?}");
-    let wire = |d: &PyDict| sw_proto::pyjson::dumps(&PyValue::Dict(d.clone()), &sw_proto::pyjson::RPC_WIRE);
-    assert_eq!(wire(&first), wire(&second), "兩個並行 release 的回應位元組相同");
+    let wire = |d: &PyDict| {
+        sw_proto::pyjson::dumps(&PyValue::Dict(d.clone()), &sw_proto::pyjson::RPC_WIRE)
+    };
+    assert_eq!(
+        wire(&first),
+        wire(&second),
+        "兩個並行 release 的回應位元組相同"
+    );
     assert_eq!(m.state_of("COM0").as_deref(), Some("RELEASED"));
 }
 
@@ -6969,7 +7903,8 @@ fn wp510r_r5_g1_concurrent_releases_of_inflight_attach_share_identical_reply() {
 /// ok／already_released／session（`origin/main:sw_core/session_manager.py:3209`、`:3219`）。
 #[test]
 fn wp510r_r5_g2_already_released_reply_key_order_matches_python() {
-    let m = ManagerRig::single_target(&manager_yaml(&[&t_target("COM0", 1, "/s/by-id/usb-A")])).ready();
+    let m =
+        ManagerRig::single_target(&manager_yaml(&[&t_target("COM0", 1, "/s/by-id/usb-A")])).ready();
     let first = rpc(wp510_release(&m.mgr, "t:COM0"));
     assert!(is_ok(&first), "{first:?}");
     let again = rpc(wp510_release(&m.mgr, "t:COM0"));
@@ -7016,16 +7951,47 @@ fn wp510r_r5_assert_cancelled_oserror_kept(m: &ManagerRig, sid: &str, a: &PyDict
     assert_eq!(a.get("drain_stalled"), Some(&PyValue::Bool(false)));
     assert_eq!(a.get("drain_timeout_epoch"), Some(&PyValue::Null));
     let session = session_field(a);
-    assert_eq!(s_of(&session, "state").as_deref(), Some("RELEASED"), "{session:?}");
+    assert_eq!(
+        s_of(&session, "state").as_deref(),
+        Some("RELEASED"),
+        "{session:?}"
+    );
     assert_eq!(s_of(&session, "session_id").as_deref(), Some(sid));
-    assert_eq!(s_of(&session, "last_error"), None, "已取消不得寫 ATTACH_FAILED：{session:?}");
-    assert_eq!(m.mgr.resolve(WP510R_R5_SID).as_deref(), Some(sid), "佔位保留");
-    assert_eq!(m.mgr.released_placeholder(sid), Some(true), "不解除 RELEASED");
-    assert!(m.load_state_now().released.contains_key(sid), "持久化 RELEASED 列保留：{}", m.state_text());
-    assert!(m.mgr.custody_for_test(WP510R_R5_BY_ID).is_none(), "帳本無殘留紀錄");
-    assert_eq!(m.mgr.prepared_len_for_test(), 0, "預先準備的交接 worker 已丟棄");
+    assert_eq!(
+        s_of(&session, "last_error"),
+        None,
+        "已取消不得寫 ATTACH_FAILED：{session:?}"
+    );
+    assert_eq!(
+        m.mgr.resolve(WP510R_R5_SID).as_deref(),
+        Some(sid),
+        "佔位保留"
+    );
+    assert_eq!(
+        m.mgr.released_placeholder(sid),
+        Some(true),
+        "不解除 RELEASED"
+    );
+    assert!(
+        m.load_state_now().released.contains_key(sid),
+        "持久化 RELEASED 列保留：{}",
+        m.state_text()
+    );
+    assert!(
+        m.mgr.custody_for_test(WP510R_R5_BY_ID).is_none(),
+        "帳本無殘留紀錄"
+    );
+    assert_eq!(
+        m.mgr.prepared_len_for_test(),
+        0,
+        "預先準備的交接 worker 已丟棄"
+    );
     std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(m.serial.open_attempts(WP510R_R5_NEW_REAL), 0, "不啟動新路徑交接");
+    assert_eq!(
+        m.serial.open_attempts(WP510R_R5_NEW_REAL),
+        0,
+        "不啟動新路徑交接"
+    );
     assert!(m.mgr.resolve("t:COM3").is_none(), "沒有正式 session");
     assert_eq!(m.state_of(WP510R_R5_SID).as_deref(), Some("RELEASED"));
 }
@@ -7039,7 +8005,8 @@ fn wp510r_r5_p8_a07fdfb_1_device_cancel_during_open_then_oserror_keeps_placehold
     let sid = m.mgr.resolve(WP510R_R5_SID).expect("佔位 session");
     m.mgr.update_devices(&m.snapshot());
     m.serial.block_open(WP510R_R5_REAL);
-    m.serial.fail_next_open(WP510R_R5_REAL, wp510_b_permission_error());
+    m.serial
+        .fail_next_open(WP510R_R5_REAL, wp510_b_permission_error());
 
     let (attach_tx, attach_rx) = crossbeam_channel::bounded(1);
     let attach_manager = m.mgr.clone();
@@ -7047,8 +8014,14 @@ fn wp510r_r5_p8_a07fdfb_1_device_cancel_during_open_then_oserror_keeps_placehold
     let attach = std::thread::spawn(move || {
         let _ = attach_tx.send(attach_manager.attach_released_placeholder(&attach_sid, false));
     });
-    wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(WP510R_R5_REAL) == 1);
-    let token = m.mgr.custody_for_test(WP510R_R5_BY_ID).expect("開埠在途紀錄").token;
+    wait_until("佔位 attach 停在 open_exclusive", || {
+        m.serial.open_attempts(WP510R_R5_REAL) == 1
+    });
+    let token = m
+        .mgr
+        .custody_for_test(WP510R_R5_BY_ID)
+        .expect("開埠在途紀錄")
+        .token;
 
     m.mgr.update_devices(&wp510r_r5_retargeted_snapshot(&m));
     wait_until("裝置改指在帳本紀錄寫入取消", || {
@@ -7072,7 +8045,8 @@ fn wp510r_r5_p8_a07fdfb_1_device_change_before_oserror_retire_keeps_placeholder(
     let m = wp510_b_placeholder_rig(false, false);
     let sid = m.mgr.resolve(WP510R_R5_SID).expect("佔位 session");
     m.mgr.update_devices(&m.snapshot());
-    m.serial.fail_next_open(WP510R_R5_REAL, wp510_b_permission_error());
+    m.serial
+        .fail_next_open(WP510R_R5_REAL, wp510_b_permission_error());
     let retargeted = wp510r_r5_retargeted_snapshot(&m);
     let hook_manager = m.mgr.clone();
     let (hooked_tx, hooked_rx) = crossbeam_channel::bounded(1);
@@ -7100,7 +8074,8 @@ fn wp510r_r5_p8_a07fdfb_1_retarget_and_back_before_oserror_retire_keeps_placehol
     let m = wp510_b_placeholder_rig(false, false);
     let sid = m.mgr.resolve(WP510R_R5_SID).expect("佔位 session");
     m.mgr.update_devices(&m.snapshot());
-    m.serial.fail_next_open(WP510R_R5_REAL, wp510_b_permission_error());
+    m.serial
+        .fail_next_open(WP510R_R5_REAL, wp510_b_permission_error());
     let retargeted = wp510r_r5_retargeted_snapshot(&m);
     let original = m.snapshot();
     let hook_manager = m.mgr.clone();
@@ -7118,7 +8093,11 @@ fn wp510r_r5_p8_a07fdfb_1_retarget_and_back_before_oserror_retire_keeps_placehol
     hooked_rx.try_recv().expect("退休提交前已改指再改回");
     assert_eq!(m.serial.open_attempts(WP510R_R5_REAL), 1);
     wp510r_r5_assert_cancelled_oserror_kept(&m, &sid, &a);
-    assert_eq!(m.serial.open_attempts(WP510R_R5_REAL), 1, "原路徑不得由交接 worker 再開埠");
+    assert_eq!(
+        m.serial.open_attempts(WP510R_R5_REAL),
+        1,
+        "原路徑不得由交接 worker 再開埠"
+    );
 }
 
 /// P8-a07fdfb-1 對照組：退休提交前的裝置更新若沒有改變本 by_id 的路徑（同一快照重掃），Python 不取消作業
@@ -7129,7 +8108,8 @@ fn wp510r_r5_p8_a07fdfb_1_same_path_update_before_oserror_retire_still_retires()
     let m = wp510_b_placeholder_rig(false, false);
     let sid = m.mgr.resolve(WP510R_R5_SID).expect("佔位 session");
     m.mgr.update_devices(&m.snapshot());
-    m.serial.fail_next_open(WP510R_R5_REAL, wp510_b_permission_error());
+    m.serial
+        .fail_next_open(WP510R_R5_REAL, wp510_b_permission_error());
     let same = m.snapshot();
     let hook_manager = m.mgr.clone();
     let (hooked_tx, hooked_rx) = crossbeam_channel::bounded(1);
@@ -7146,8 +8126,13 @@ fn wp510r_r5_p8_a07fdfb_1_same_path_update_before_oserror_retire_still_retires()
     assert!(is_ok(&a), "路徑未變不取消，OSError 照 B-7 退休：{a:?}");
     let snapshot = session_field(&a);
     assert_eq!(s_of(&snapshot, "state").as_deref(), Some("DETACHED"));
-    assert_eq!(s_of(&snapshot, "last_error").as_deref(), Some("ATTACH_FAILED:PermissionError"));
-    wait_until("佔位交接的 dynamic 開埠", || m.serial.open_attempts(WP510R_R5_REAL) == 2);
+    assert_eq!(
+        s_of(&snapshot, "last_error").as_deref(),
+        Some("ATTACH_FAILED:PermissionError")
+    );
+    wait_until("佔位交接的 dynamic 開埠", || {
+        m.serial.open_attempts(WP510R_R5_REAL) == 2
+    });
     assert_eq!(m.mgr.resolve(WP510R_R5_SID), None, "舊佔位已退休");
 }
 
@@ -7173,9 +8158,16 @@ fn wp510r_r6_dr1_h_placeholder_raw_open_undelivered_closes_via_ledger() {
         m.serial.block_open(WP510R_R5_REAL);
         let attach_manager = m.mgr.clone();
         let attach_sid = sid.clone();
-        let attach = std::thread::spawn(move || attach_manager.attach_released_placeholder(&attach_sid, false));
-        wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(WP510R_R5_REAL) == 1);
-        let rec = m.mgr.custody_for_test(WP510R_R5_BY_ID).expect("佔位 Raw 開埠的帳本紀錄");
+        let attach = std::thread::spawn(move || {
+            attach_manager.attach_released_placeholder(&attach_sid, false)
+        });
+        wait_until("佔位 attach 停在 open_exclusive", || {
+            m.serial.open_attempts(WP510R_R5_REAL) == 1
+        });
+        let rec = m
+            .mgr
+            .custody_for_test(WP510R_R5_BY_ID)
+            .expect("佔位 Raw 開埠的帳本紀錄");
         let token = rec.token;
         // 佔位 actor 在開埠在途時結束（executor 在 catch_unwind 之外 unwind）。
         m.mgr.set_executor_unwind_hook_for_test(
@@ -7184,15 +8176,19 @@ fn wp510r_r6_dr1_h_placeholder_raw_open_undelivered_closes_via_ledger() {
         );
         let ctrl = m.mgr.actor_control_for_test(&sid).expect("佔位 actor");
         let (tx, _rx) = crossbeam_channel::bounded(1);
-        ctrl.send(sw_core::mailbox::ControlEvent::Request { req: SessionRequest::GetState, reply: tx })
-            .expect("送入查詢以觸發 unwind");
+        ctrl.send(sw_core::mailbox::ControlEvent::Request {
+            req: SessionRequest::GetState,
+            reply: tx,
+        })
+        .expect("送入查詢以觸發 unwind");
         std::thread::sleep(Duration::from_millis(150));
         m.serial.release_open(WP510R_R5_REAL);
         let _ = attach.join().expect("attach thread 不應 panic");
 
         if closed {
             wait_until("(h1) 開埠工作自行關閉並結算", || {
-                m.mgr.terminal_for_test(token).is_some() && m.mgr.custody_for_test(WP510R_R5_BY_ID).is_none()
+                m.mgr.terminal_for_test(token).is_some()
+                    && m.mgr.custody_for_test(WP510R_R5_BY_ID).is_none()
             });
             assert_eq!(
                 m.mgr.terminal_for_test(token).map(|t| t.handle),
@@ -7200,7 +8196,10 @@ fn wp510r_r6_dr1_h_placeholder_raw_open_undelivered_closes_via_ledger() {
                 "(h1) 終態 Closed"
             );
             assert!(!device.is_open(), "(h1) handle 已關閉");
-            assert!(!m.mgr.unconfirmed_close_for_test(WP510R_R5_BY_ID), "(h1) 不登記未確認關閉");
+            assert!(
+                !m.mgr.unconfirmed_close_for_test(WP510R_R5_BY_ID),
+                "(h1) 不登記未確認關閉"
+            );
         } else {
             wait_until("(h2) 關閉失敗轉 CloseFailed", || {
                 matches!(
@@ -7208,14 +8207,23 @@ fn wp510r_r6_dr1_h_placeholder_raw_open_undelivered_closes_via_ledger() {
                     Some(sw_core::custody::CustodyPhaseSnapshot::CloseFailed { .. })
                 )
             });
-            let rec = m.mgr.custody_for_test(WP510R_R5_BY_ID).expect("CloseFailed 紀錄保留");
+            let rec = m
+                .mgr
+                .custody_for_test(WP510R_R5_BY_ID)
+                .expect("CloseFailed 紀錄保留");
             assert_eq!(rec.token, token, "(h2) 同一 token");
-            assert!(m.mgr.unconfirmed_close_for_test(WP510R_R5_BY_ID), "(h2) 進未確認集合");
+            assert!(
+                m.mgr.unconfirmed_close_for_test(WP510R_R5_BY_ID),
+                "(h2) 進未確認集合"
+            );
             assert!(device.is_open(), "(h2) handle 仍開著");
         }
         assert_eq!(device.close_count(), 1, "只關閉一次（closed={closed}）");
         assert_eq!(device.open_count(), 1, "不開第二次（closed={closed}）");
-        assert!(m.mgr.resolve(WP510R_R5_SID).is_some(), "不退休佔位（closed={closed}）");
+        assert!(
+            m.mgr.resolve(WP510R_R5_SID).is_some(),
+            "不退休佔位（closed={closed}）"
+        );
         assert!(device.take_tx().is_empty(), "零 TX（closed={closed}）");
     }
 }
@@ -7235,9 +8243,17 @@ fn wp510r_r6_dr5_b_placeholder_raw_opened_after_freeze() {
         m.serial.block_open(WP510R_R5_REAL);
         let attach_manager = m.mgr.clone();
         let attach_sid = sid.clone();
-        let attach = std::thread::spawn(move || attach_manager.attach_released_placeholder(&attach_sid, false));
-        wait_until("佔位 attach 停在 open_exclusive", || m.serial.open_attempts(WP510R_R5_REAL) == 1);
-        let token = m.mgr.custody_for_test(WP510R_R5_BY_ID).expect("佔位 Raw 開埠紀錄").token;
+        let attach = std::thread::spawn(move || {
+            attach_manager.attach_released_placeholder(&attach_sid, false)
+        });
+        wait_until("佔位 attach 停在 open_exclusive", || {
+            m.serial.open_attempts(WP510R_R5_REAL) == 1
+        });
+        let token = m
+            .mgr
+            .custody_for_test(WP510R_R5_BY_ID)
+            .expect("佔位 Raw 開埠紀錄")
+            .token;
         let gate = m.reg.admission_gate();
         let freeze = if permanent {
             gate.freeze();
@@ -7254,7 +8270,8 @@ fn wp510r_r6_dr5_b_placeholder_raw_opened_after_freeze() {
                 let a = rpc(attach.join().expect("attach thread"));
                 assert_eq!(code_of(&a).as_deref(), Some("SESSION_RECOVERING"), "{a:?}");
                 wait_until("Permanent：只關閉並結算", || {
-                    m.mgr.custody_for_test(WP510R_R5_BY_ID).is_none() && m.mgr.terminal_for_test(token).is_some()
+                    m.mgr.custody_for_test(WP510R_R5_BY_ID).is_none()
+                        && m.mgr.terminal_for_test(token).is_some()
                 });
                 assert_eq!(
                     m.mgr.terminal_for_test(token).map(|t| t.handle),
@@ -7264,14 +8281,23 @@ fn wp510r_r6_dr5_b_placeholder_raw_opened_after_freeze() {
                 assert_eq!(device.close_count(), 1);
                 assert!(!device.is_open());
                 assert!(m.mgr.resolve(WP510R_R5_SID).is_some(), "Permanent 不退休");
-                assert!(m.mgr.resolve("t:COM3").is_none(), "不建正式 session（沒有 IoWorker）");
+                assert!(
+                    m.mgr.resolve("t:COM3").is_none(),
+                    "不建正式 session（沒有 IoWorker）"
+                );
                 assert!(device.take_tx().is_empty(), "零 TX");
             }
             Some(freeze) => {
                 std::thread::sleep(Duration::from_millis(300));
-                assert!(!attach.is_finished(), "Pending：開埠結果延後，attach 尚未回覆");
+                assert!(
+                    !attach.is_finished(),
+                    "Pending：開埠結果延後，attach 尚未回覆"
+                );
                 assert!(device.is_open(), "handle 留在帳本");
-                assert_eq!(m.mgr.custody_for_test(WP510R_R5_BY_ID).map(|r| r.token), Some(token));
+                assert_eq!(
+                    m.mgr.custody_for_test(WP510R_R5_BY_ID).map(|r| r.token),
+                    Some(token)
+                );
                 assert!(m.mgr.resolve(WP510R_R5_SID).is_some(), "Pending 期間不退休");
                 assert!(gate.thaw(&freeze), "撤銷凍結");
                 // 交接延後的事件在下一個事件分派時重播。
@@ -7298,13 +8324,18 @@ fn wp510r_r6_dr5_a_w6_open_returns_after_handoff_commit_closes_only() {
     let real = fallback_session_then_unplug(&m, "/s/by-id/usb-D");
     m.serial.block_open(&real);
     m.mgr.update_devices(&m.snapshot());
-    wait_until("再偵測卡在 open", || m.serial.open_attempts(&real) == 2);
+    wait_until("再偵測卡在 open", || {
+        m.serial.open_attempts(&real) == 2
+    });
     let sid = m.mgr.resolve("COM0").expect("COM0 session");
-    let blocked = m.mgr.custody_for_test("/s/by-id/usb-D").expect("W6 開埠在途須登記帳本紀錄");
-    assert!(wp510r_r4_is_w6_opening(
-        &blocked,
-        m.mgr.actor_id_for_test(&sid).expect("actor 身分"),
-    ), "{blocked:?}");
+    let blocked = m
+        .mgr
+        .custody_for_test("/s/by-id/usb-D")
+        .expect("W6 開埠在途須登記帳本紀錄");
+    assert!(
+        wp510r_r4_is_w6_opening(&blocked, m.mgr.actor_id_for_test(&sid).expect("actor 身分"),),
+        "{blocked:?}"
+    );
     let token = blocked.token;
     let device = m.device(&real);
     let closes_before = device.close_count();
@@ -7320,7 +8351,8 @@ fn wp510r_r6_dr5_a_w6_open_returns_after_handoff_commit_closes_only() {
 
     m.serial.release_open(&real);
     wait_until("凍結後返回的 W6 handle 只關閉並結算", || {
-        m.mgr.custody_for_test("/s/by-id/usb-D").is_none() && m.mgr.terminal_for_test(token).is_some()
+        m.mgr.custody_for_test("/s/by-id/usb-D").is_none()
+            && m.mgr.terminal_for_test(token).is_some()
     });
     assert_eq!(
         m.mgr.terminal_for_test(token).map(|t| t.handle),
@@ -7332,7 +8364,11 @@ fn wp510r_r6_dr5_a_w6_open_returns_after_handoff_commit_closes_only() {
     assert_eq!(device.tx_len(), tx_before, "零 TX（沒有 PROBE、沒有登入）");
     assert_eq!(m.serial.open_attempts(&real), 2, "不重新開埠");
     let session = m.session("COM0");
-    assert_eq!(session.get("attached_real_path"), Some(&PyValue::Null), "沒有 IoWorker：{session:?}");
+    assert_eq!(
+        session.get("attached_real_path"),
+        Some(&PyValue::Null),
+        "沒有 IoWorker：{session:?}"
+    );
 }
 
 /// 第 20 項 r3-M1／DR-9：actor 建構失敗且關閉卡住時，manager 查詢、release 與 shutdown 各自有界。
@@ -7352,8 +8388,13 @@ fn wp510r_i20_actor_spawn_failure_close_pause_keeps_manager_responsive() {
     dev.pause_next_close();
     sw_core::actor::inject_actor_spawn_fail_for("t:COM120");
     m.mgr.update_devices(&m.snapshot());
-    assert!(is_ok(&m.mgr.attach_released_placeholder(SID, false).unwrap()));
-    assert!(dev.wait_paused(Duration::from_secs(5)), "建構失敗後關閉已暫停");
+    assert!(is_ok(
+        &m.mgr.attach_released_placeholder(SID, false).unwrap()
+    ));
+    assert!(
+        dev.wait_paused(Duration::from_secs(5)),
+        "建構失敗後關閉已暫停"
+    );
 
     let (query_tx, query_rx) = crossbeam_channel::bounded(1);
     let mgr = m.mgr.clone();
@@ -7367,7 +8408,14 @@ fn wp510r_i20_actor_spawn_failure_close_pause_keeps_manager_responsive() {
     let mgr = m.mgr.clone();
     let release = std::thread::spawn(move || {
         let start = Instant::now();
-        let reply = mgr.route("t:COM0", SessionRequest::Release { source: "agent".into(), reason: PyValue::Null }, RPC);
+        let reply = mgr.route(
+            "t:COM0",
+            SessionRequest::Release {
+                source: "agent".into(),
+                reason: PyValue::Null,
+            },
+            RPC,
+        );
         release_tx.send((reply, start.elapsed())).unwrap();
     });
     let query_result = query_rx.recv_timeout(Duration::from_secs(1));
@@ -7386,16 +8434,33 @@ fn wp510r_i20_actor_spawn_failure_close_pause_keeps_manager_responsive() {
     shutdown.join().unwrap();
     sw_core::actor::inject_actor_spawn_fail_clear();
 
-    let (ids, token, query_elapsed) = query_result.expect("建構失敗的 close 暫停不能阻塞 manager 查詢");
+    let (ids, token, query_elapsed) =
+        query_result.expect("建構失敗的 close 暫停不能阻塞 manager 查詢");
     assert!(!ids.contains(&"t:COM120".to_string()));
-    assert!(query_elapsed < Duration::from_secs(1), "DR-9 查詢：{query_elapsed:?}");
+    assert!(
+        query_elapsed < Duration::from_secs(1),
+        "DR-9 查詢：{query_elapsed:?}"
+    );
     let (reply, elapsed) = release_result.expect("其他 session release 不得卡在 manager 鎖");
     assert!(is_ok(&reply.unwrap()));
     assert!(elapsed < Duration::from_secs(1), "release：{elapsed:?}");
     let (report, elapsed) = shutdown_result.expect("shutdown 不得卡在 manager 鎖");
     assert!(elapsed < Duration::from_secs(1), "shutdown：{elapsed:?}");
-    assert!(report.iter().any(|(key, ok)| key == &format!("attach:{BY_ID}") && !ok), "{report:?}");
-    wait_until("建構失敗的 handle 配對回條", || !dev.is_open() && m.mgr.custody_for_test(BY_ID).is_none());
+    assert!(
+        report
+            .iter()
+            .any(|(key, ok)| key == &format!("attach:{BY_ID}") && !ok),
+        "{report:?}"
+    );
+    wait_until("建構失敗的 handle 配對回條", || {
+        !dev.is_open() && m.mgr.custody_for_test(BY_ID).is_none()
+    });
     assert_eq!(dev.close_count(), 1, "handle 恰好關閉一次");
-    assert_eq!(m.mgr.terminal_for_test(token.expect("Closing token")).unwrap().handle, sw_core::custody::TerminalHandle::Closed);
+    assert_eq!(
+        m.mgr
+            .terminal_for_test(token.expect("Closing token"))
+            .unwrap()
+            .handle,
+        sw_core::custody::TerminalHandle::Closed
+    );
 }

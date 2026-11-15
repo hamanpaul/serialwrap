@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import shlex
 import subprocess
 
@@ -75,6 +76,40 @@ def test_runbook_has_anchor_per_item():
     text = (ROOT / "docs/rust-refactor/slice21-owner-runbook.md").read_text(encoding="utf-8")
     for i in range(1, 17):
         assert f"### BO-S21-{i:02d}" in text
+
+
+def test_slice24_prereq_failure_is_recorded_before_exit(tmp_path):
+    """M6：gate_prereqs 非零須寫入 driver.tsv 並停止後續收集。"""
+    script = (ROOT / "scripts/rust/slice24_exit.sh").read_text(encoding="utf-8")
+    match = re.search(
+        r'(?ms)^if source "\$ROOT/scripts/rust/gate_prereqs\.sh" --gate .*; then\n.*?^fi$', script
+    )
+    assert match, "slice24_exit.sh 必須明確檢查 gate_prereqs 的來源返回值"
+    assert script.index('DRIVER_TSV="$RUN_DIR/driver.tsv"') < match.start()
+
+    fake_root = tmp_path / "repo"
+    fake_prereqs = fake_root / "scripts/rust/gate_prereqs.sh"
+    fake_prereqs.parent.mkdir(parents=True)
+    fake_prereqs.write_text("return 37\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    (run_dir / "logs").mkdir(parents=True)
+    driver_tsv = tmp_path / "driver.tsv"
+    marker = tmp_path / "continued"
+    shell = (
+        f'ROOT="{fake_root}"; RUN_DIR="{run_dir}"; DRIVER_TSV="{driver_tsv}"; : >"$DRIVER_TSV";\n'
+        f'{match.group(0)}\n'
+        f'touch "{marker}"\n'
+    )
+    proc = subprocess.run(["bash", "-c", shell], capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 37, proc.stdout + proc.stderr
+    assert driver_tsv.read_text(encoding="utf-8") == "gate_prereqs\t37\n"
+    assert not marker.exists(), "前置失敗後不得繼續 gate 收集"
+
+    # slice21 與 P7 的 `set -e` 會在 source 非零時立即終止，不存在 slice24 的無 -e 靜默續跑問題。
+    for path in ("scripts/rust/slice21_gate.sh", "scripts/rust/p7_gate.sh"):
+        other = (ROOT / path).read_text(encoding="utf-8")
+        assert "set -euo pipefail" in other
+        assert other.index('source "$ROOT/scripts/rust/gate_prereqs.sh" --gate') < len(other)
 
 
 def test_bo_case_ids_cover_frozen_windows_cases():

@@ -1432,6 +1432,25 @@ def test_prior_slice_universe_lists_seventy_two_unmapped_cases():
     assert len(gaps) == 72
     assert Counter(cases[case_id]["daemon_slice"] for case_id in gaps) == {"2.1": 13, "2.2": 18, "2.3": 41}
 
+    coverage = yaml.safe_load((ROOT / "contracts/coverage_map.yaml").read_text(encoding="utf-8"))["entries"]
+    expected_nodes = {
+        "error_code:DEVICE_NOT_BOUND": "cargo:sw-core::session_manager::device_not_bound_synthetic_profile_returns_device_not_bound",
+        "error_code:DRAIN_STALLED": "cargo:sw-core::drain_release_e2e::drain_timeout_marks_stalled_and_release_reports_drain_stalled",
+        "error_code:EMPTY_RESPONSE": "cargo:sw-cli::client_retry::whitespace_line_empty",
+        "error_code:EXCEPTION": "cargo:sw-daemon::framing::framing_byte_table",
+        "error_code:FLUSHED_BY_SHUTDOWN": "cargo:sw-daemon::handoff_stop::handoff_frozen_rejects_mutating_methods",
+        "error_code:METHOD_NOT_FOUND": "cargo:sw-daemon::dispatch::unknown_method_not_found",
+        "error_code:REMOTE_NOT_SUPPORTED": "cargo:sw-cli::mgmt_daemon::start_endpoint_rejected_posix",
+        "error_code:SAMPLE_READ_FAILED": "cargo:sw-cli::profile_checks::sample_read_failure_returns_error_code_without_cli_failure",
+        "error_code:TIMEOUT": "cargo:sw-cli::client_retry::etimedout_is_timeout",
+        "last_error:TRANSPORT_STALL": "cargo:sw-core::transport_stall_wiring_p7::reprobe_zero_rx_after_30s_flips_to_transport_stall_once",
+        "last_error:LOGIN_USER_REQUIRED": "cargo:sw-core::login_fsm_full::login_user_env_missing_does_not_fall_back_to_profile_username",
+        "last_error:REBOOTING": "cargo:sw-core::session_core_lease::wp61_core_trusted_rpc_reboot_promotes_with_source",
+        "last_error:RELEASED": "cargo:sw-core::drain_release_e2e::release_waits_for_receipt_and_aborts_partial_in_flight",
+    }
+    for contract, nodeid in expected_nodes.items():
+        assert coverage[contract]["nodeids"] == [nodeid], (contract, coverage[contract])
+
 
 def test_prior_slice_gate_verdicts_import_pass_fail_and_missing(tmp_path):
     """OD-88：三個先前 gate 有逐案證據才沿用 PASS／FAIL；缺列或 GAP 維持 EVIDENCE_MISSING。"""
@@ -1458,6 +1477,20 @@ def test_prior_slice_gate_verdicts_import_pass_fail_and_missing(tmp_path):
     assert report["prior_sources"]["2.3"]["evidence_sha256"]["coverage.json"] == hashlib.sha256(
         (fixture["slice23"] / "coverage.json").read_bytes()
     ).hexdigest()
+
+    # OD-88：同一案例出現在 slice 2.1 與 P7 時，後匯入的 PASS 不得覆蓋權威 FAIL。
+    overlap_root = tmp_path / "overlap"
+    overlap_root.mkdir()
+    overlap = _prior_slice_fixture(overlap_root)
+    coverage_path = overlap["slice23"] / "coverage.json"
+    coverage = json.loads(coverage_path.read_text(encoding="utf-8"))
+    coverage["rows"].append({"case_id": "s21-fail", "status": "PASS", "detail": "P7 pass"})
+    coverage_path.write_text(json.dumps(coverage), encoding="utf-8")
+    overlap_output = tmp_path / "overlap-coverage.json"
+    overlap_result = _run(*_prior_slice_command(overlap, overlap_output, ["case:s21-fail"]))
+    assert overlap_result.returncode == 1, overlap_result.stdout + overlap_result.stderr
+    overlap_report = json.loads(overlap_output.read_text(encoding="utf-8"))
+    assert overlap_report["case_verdicts"]["s21-fail"] == "FAIL", overlap_report["case_verdicts"]
 
 
 def test_prior_slice_missing_source_is_gap_not_identity_error(tmp_path):

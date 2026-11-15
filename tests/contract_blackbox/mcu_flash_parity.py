@@ -98,6 +98,24 @@ def compare(data: dict[str, Any]) -> tuple[str, bool]:
             if not isinstance(row_key, str) or not isinstance(fields, dict):
                 raise ValueError(f"{name} 輪每案必須是 case/node → fields object")
 
+    expected_rows = set(runs["python032"])
+    for name in ROUNDS[1:]:
+        actual_rows = set(runs[name])
+        if actual_rows != expected_rows:
+            missing = sorted(expected_rows - actual_rows)
+            extra = sorted(actual_rows - expected_rows)
+            raise ValueError(f"{name} 輪 observation 案例不齊：缺少={missing!r}、額外={extra!r}")
+    for row_key in sorted(expected_rows):
+        expected_fields = set(runs["python032"][row_key])
+        if not expected_fields:
+            raise ValueError(f"{row_key} observation fields 不得為空")
+        for name in ROUNDS[1:]:
+            actual_fields = set(runs[name][row_key])
+            if actual_fields != expected_fields:
+                missing = sorted(expected_fields - actual_fields)
+                extra = sorted(actual_fields - expected_fields)
+                raise ValueError(f"{name} 輪 {row_key} fields 不齊：缺少={missing!r}、額外={extra!r}")
+
     attributions = data.get("attributions", {})
     if not isinstance(attributions, dict):
         raise ValueError("attributions 必須是 object")
