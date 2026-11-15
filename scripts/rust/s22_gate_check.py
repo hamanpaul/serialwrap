@@ -16,6 +16,8 @@
   其他來源（func-test、scenario）須在 `--l15-results`（`s22-l15-results.v1`：`{"format","runs":[{"ref","outcome",
   "exit_code"}]}`）中恰一列 `outcome == "passed"` 且 `exit_code == 0`；未提供或不符 → INSUFFICIENT（審查
   3317987_d6e3b3c-opus High #1：函式／腳本存在不等於已執行且通過）。
+- L1.5 `implementation` 須符合實際 daemon artifact；Rust 列須綁定 `--daemon-path`、`--build-linux-exit == 0` 與
+  `--built-daemon-sha256`。缺少或不符時記為 unchecked，使相關案例成為 INSUFFICIENT。
 - 必要集合（`REQUIRED_SECTIONS`，以計畫 07 Task 13 為準）由本檔固定：lock 缺任一集合／平台 → INSUFFICIENT；
   對照表 `cases` 的鍵集合須等於 `cases.lock.json` 凍結的 `slice_2.2`，否則 INSUFFICIENT（同報告 Medium #2）。
 - 增補 #180：以全表模式執行 `check_p6_prereqs.py --strict`，exit 非 0 → INSUFFICIENT。
@@ -439,6 +441,7 @@ def load_l15(path: pathlib.Path | None) -> tuple[dict[str, list[dict]] | None, l
 def validate_l15_identity(
     l15: dict[str, list[dict]] | None,
     candidate_path: pathlib.Path | None,
+    build_linux_exit: int | None,
     candidate_sha256: str | None,
 ) -> list[str]:
     """標記無法證明實作身分或 Rust 候選綁定的 L1.5 列為 unchecked。"""
@@ -462,6 +465,7 @@ def validate_l15_identity(
                         implementation,
                         artifact_path,
                         candidate_path=candidate_path if implementation == "rust" else None,
+                        build_linux_exit=build_linux_exit if implementation == "rust" else None,
                         candidate_sha256=candidate_sha256 if implementation == "rust" else None,
                     )
             if problem:
@@ -659,7 +663,9 @@ def main(argv: list[str] | None = None) -> int:
     emap = yaml.safe_load(args.map.read_text(encoding="utf-8")) or {}
     cases_lock = json.loads(args.cases_lock.read_text(encoding="utf-8"))
     l15, l15_reasons = load_l15(args.l15_results)
-    l15_reasons.extend(validate_l15_identity(l15, args.daemon_path, args.built_daemon_sha256))
+    l15_reasons.extend(validate_l15_identity(
+        l15, args.daemon_path, args.build_linux_exit, args.built_daemon_sha256
+    ))
     sections, rows = judge_sections(args.l1_results, lock, _load_judge())
     cases = judge_cases(emap, rows, l15)
     coverage = map_coverage(emap, cases_lock)

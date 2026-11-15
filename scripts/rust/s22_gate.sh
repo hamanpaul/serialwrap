@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Slice 2.2 出口證據編排：補跑鎖定的 Python parity、產生 L1.5 執行清單、匯入明確指定的 Windows 證據並判定。
+# Slice 2.2 出口證據編排：補跑鎖定的 Python parity、驗證 L1.5 daemon 身分與候選建置、匯入 Windows 證據並判定。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
@@ -154,6 +154,7 @@ def l15_rows() -> list[dict]:
                 implementation,
                 path,
                 candidate_path=daemon_path if implementation == "rust" else None,
+                build_linux_exit=build_exit if implementation == "rust" else None,
                 candidate_sha256=built_sha if implementation == "rust" else None,
             )
             if identity_problem:

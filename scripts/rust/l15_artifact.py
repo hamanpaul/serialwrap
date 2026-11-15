@@ -5,6 +5,8 @@ import hashlib
 import pathlib
 import re
 
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
 
 def daemon_implementation(path: pathlib.Path) -> str | None:
     """辨認 Rust ELF 與 Python 執行入口；未知格式一律不採信。"""
@@ -38,6 +40,7 @@ def l15_artifact_problem(
     artifact_path: pathlib.Path,
     *,
     candidate_path: pathlib.Path | None = None,
+    build_linux_exit: int | None = None,
     candidate_sha256: str | None = None,
 ) -> str | None:
     """驗證 L1.5 列的標籤及 Rust 候選路徑／建置雜湊。"""
@@ -48,6 +51,12 @@ def l15_artifact_problem(
         return None
     if candidate_path is None:
         return "L1.5 Rust 列缺少 --daemon-path 候選綁定"
+    if build_linux_exit is None:
+        return "L1.5 Rust 列缺少 --build-linux-exit 建置證據"
+    if build_linux_exit != 0:
+        return f"L1.5 Rust 列的候選建置未通過（exit {build_linux_exit}）"
+    if not isinstance(candidate_sha256, str) or not _SHA256_RE.fullmatch(candidate_sha256):
+        return "L1.5 Rust 列缺少有效的 --built-daemon-sha256 建置身分"
     try:
         artifact = artifact_path.resolve(strict=True)
         candidate = candidate_path.resolve(strict=True)

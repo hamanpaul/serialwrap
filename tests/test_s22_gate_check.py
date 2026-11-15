@@ -435,6 +435,23 @@ def test_l15_rust_artifact_must_match_reported_candidate(tmp_path: Path) -> None
     assert any("--daemon-path 候選不同" in reason for reason in out["l15_reasons"]), out["l15_reasons"]
 
 
+def test_l15_rust_requires_successful_candidate_build_identity(tmp_path: Path) -> None:
+    """缺 build exit 或建置 SHA 時，不能把 Rust L1.5 列當成候選版通過證據。"""
+    emap = _emap()
+    emap["cases"]["co-01-line-buffering"] = {"status": "AUTOMATED", "tests": [FUNC_REF]}
+    py_path, py_sha = _write_l15_artifact(tmp_path / "python" / "serialwrapd", "python")
+    candidate, candidate_sha = _write_l15_artifact(tmp_path / "candidate" / "serialwrapd", "rust")
+    l15 = {"format": "s22-l15-results.v1", "runs": [
+        _l15_run(FUNC_REF, "python", py_path, py_sha),
+        _l15_run(FUNC_REF, "rust", candidate, candidate_sha),
+    ]}
+
+    rc, out = _run(tmp_path / "run", _good_reports(), emap=emap, l15=l15, daemon_path=candidate)
+    case = _case(out, "co-01-line-buffering")
+    assert case["status"] == "INSUFFICIENT" and rc == 1, case
+    assert any("建置" in reason and "L1.5 Rust" in reason for reason in out["l15_reasons"]), out["l15_reasons"]
+
+
 def test_missing_required_sets_insufficient(tmp_path: Path) -> None:
     """審查 Medium #2：lock 缺任一必要 `s22_gate:*` 集合（例：win_test、blackbox_rust、py_parity）→ INSUFFICIENT。"""
     for i, missing in enumerate(("s22_gate:win_test", "s22_gate:blackbox_rust", "s22_gate:py_parity")):
