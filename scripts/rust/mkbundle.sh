@@ -10,8 +10,8 @@ usage() {
   scripts/rust/mkbundle.sh --release-bundle --profile release --out <目錄> [其他選項]
 
 選項：
-  --dev                    建立開發 bundle（目前唯一支援的 bundle 類型）
-  --stage <1|2>            選擇 daemon 階段；預設 1（Stage 1A），Stage 2 僅支援 dev bundle
+  --dev                    建立開發 bundle（含 test-fakes）
+  --stage <1|2>            選擇 daemon 階段；預設 1（Stage 1A），Stage 2 使用 Rust daemon
   --release-bundle         建立正式候選 bundle，不編入 sw-cli/test-fakes，並將 PyYAML 納入隔離 runtime
                            須使用乾淨 Git 工作樹（含未追蹤檔案），否則 exit 3；--dev 允許開發中來源
   --delegate-sentinel      組成與 dev bundle 相同（扁平佈局於 --out 根目錄），僅將委派入口改為 P4 測試 sentinel
@@ -122,10 +122,6 @@ if [[ "$STAGE" != 1 && "$STAGE" != 2 ]]; then
   echo "mkbundle.sh: --stage 僅支援 1 或 2" >&2
   exit 2
 fi
-if [[ "$STAGE" == 2 && "$DEV" -ne 1 ]]; then
-  echo "mkbundle.sh: Stage 2 目前僅支援 --dev bundle" >&2
-  exit 2
-fi
 if [[ "$STAGE" == 2 && "$SENTINEL" -eq 1 ]]; then
   echo "mkbundle.sh: --stage 2 不支援 --delegate-sentinel" >&2
   exit 2
@@ -197,18 +193,27 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 
 BUILD_ARGS=(build -p sw-cli -p sw-daemon)
+DAEMON_BUILD_ARGS=(build -p sw-daemon)
+CLI_BUILD_ARGS=(build -p sw-cli)
 # 更新 race barrier 與安裝故障注入僅編入 `--dev` bundle；正式候選不帶測試 feature。
 if [[ "$DEV" -eq 1 ]]; then
   BUILD_ARGS+=(--features test-fakes)
+  DAEMON_BUILD_ARGS+=(--features test-fakes)
+  CLI_BUILD_ARGS+=(--features test-fakes)
 fi
 if [[ -n "$COM0COM_ZIP" ]]; then
   BUILD_ARGS+=(-p sw-com0com-helper)
+  CLI_BUILD_ARGS+=(-p sw-com0com-helper)
 fi
 if [[ "$PROFILE" == release ]]; then
   BUILD_ARGS+=(--release)
+  DAEMON_BUILD_ARGS+=(--release)
+  CLI_BUILD_ARGS+=(--release)
 fi
 if [[ "$TARGET" != "$HOST_TRIPLE" ]]; then
   BUILD_ARGS+=(--target "$TARGET")
+  DAEMON_BUILD_ARGS+=(--target "$TARGET")
+  CLI_BUILD_ARGS+=(--target "$TARGET")
 fi
 # 呼叫端可指定隔離的 Cargo target dir；相對路徑一律相對 repo root 解讀。
 BUILD_ROOT="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
@@ -216,9 +221,8 @@ if [[ "$BUILD_ROOT" != /* ]]; then
   BUILD_ROOT="$REPO_ROOT/$BUILD_ROOT"
 fi
 
-# 編譯期把 bundle 內 Python daemon 的程式碼指紋印進 CLI（#241）。
-# 占位檔在開發建置維持 SWFP1: 加 12 個 0；這裡只在 cargo 期間改寫，結束或失敗都還原，
-# 讓執行檔離開 release-manifest.json 之後仍回報同一份指紋，且工作樹不留下真指紋。
+# Stage 1 編譯期嵌入 Python daemon 的程式碼指紋（#241）；Stage 2 先建 Rust daemon，
+# 再嵌入其執行檔 SHA-256 前 12 位。兩者都在 cargo 期間改寫占位檔，結束或失敗都還原。
 STAMP_FILE="$REPO_ROOT/crates/sw-cli/src/embedded_code_fingerprint.bin"
 STAMP_PLACEHOLDER='SWFP1:000000000000'
 stamp_active=0
@@ -229,7 +233,22 @@ restore_code_fingerprint_stamp() {
   fi
 }
 trap restore_code_fingerprint_stamp EXIT
-EARLY_FP="$(python3 -I -B - "$REPO_ROOT" <<'PY'
+BUILD_DIR="$BUILD_ROOT"
+if [[ "$TARGET" != "$HOST_TRIPLE" ]]; then
+  BUILD_DIR+="/$TARGET"
+fi
+BUILD_DIR+="/$PROFILE"
+
+if [[ "$STAGE" == 2 ]]; then
+  (cd "$REPO_ROOT" && SW_BUNDLE_VERSION="$VERSION" CARGO_TARGET_DIR="$BUILD_ROOT" cargo "${DAEMON_BUILD_ARGS[@]}" --quiet)
+  DAEMON_SRC="$BUILD_DIR/serialwrapd"
+  if [[ ! -x "$DAEMON_SRC" ]]; then
+    echo "mkbundle.sh: cargo build 後找不到 Rust daemon：$DAEMON_SRC" >&2
+    exit 1
+  fi
+  EARLY_FP="$(sha256sum -- "$DAEMON_SRC" | cut -c1-12)"
+else
+  EARLY_FP="$(python3 -I -B - "$REPO_ROOT" <<'PY'
 import sys
 from pathlib import Path
 
@@ -240,6 +259,7 @@ from sw_core.version import compute_code_fingerprint
 print(compute_code_fingerprint(str(root / "sw_core")) or "")
 PY
 )"
+fi
 if [[ -n "$EARLY_FP" ]]; then
   if [[ ! "$EARLY_FP" =~ ^[0-9a-f]{12}$ ]]; then
     echo "mkbundle.sh: 程式碼指紋格式不符：$EARLY_FP" >&2
@@ -248,15 +268,14 @@ if [[ -n "$EARLY_FP" ]]; then
   printf 'SWFP1:%s' "$EARLY_FP" > "$STAMP_FILE"
   stamp_active=1
 fi
-(cd "$REPO_ROOT" && SW_BUNDLE_VERSION="$VERSION" CARGO_TARGET_DIR="$BUILD_ROOT" cargo "${BUILD_ARGS[@]}" --quiet)
+if [[ "$STAGE" == 2 ]]; then
+  (cd "$REPO_ROOT" && SW_BUNDLE_VERSION="$VERSION" CARGO_TARGET_DIR="$BUILD_ROOT" cargo "${CLI_BUILD_ARGS[@]}" --quiet)
+else
+  (cd "$REPO_ROOT" && SW_BUNDLE_VERSION="$VERSION" CARGO_TARGET_DIR="$BUILD_ROOT" cargo "${BUILD_ARGS[@]}" --quiet)
+fi
 restore_code_fingerprint_stamp
 require_clean_release_source
 
-BUILD_DIR="$BUILD_ROOT"
-if [[ "$TARGET" != "$HOST_TRIPLE" ]]; then
-  BUILD_DIR+="/$TARGET"
-fi
-BUILD_DIR+="/$PROFILE"
 BIN_SRC="$BUILD_DIR/serialwrap"
 DAEMON_SRC="$BUILD_DIR/serialwrapd"
 CLI_NAME=serialwrap
@@ -468,23 +487,33 @@ for number, line in enumerate(golden_path.read_text(encoding="utf-8").splitlines
 PY
 
   PACKAGE_TREE_SHA="$("$PYTHON" -I -B -c 'import sw_core.release_manifest as m; print(m.package_tree_sha256())')"
-  CODE_FINGERPRINT="$("$PYTHON" -I -B - "$PY_DIR/sw_core" "$PY_SITE/sw_core" <<'PY'
+  CODE_FINGERPRINT="$("$PYTHON" -I -B - "$PY_DIR/sw_core" "$PY_SITE/sw_core" \
+    "$VERSION_DIR/bin/$DAEMON_NAME" "$STAGE" "$EARLY_FP" <<'PY'
+import hashlib
 import pathlib
 import sys
 
 import sw_core.version as version
 
-bundled_package, installed_package = (pathlib.Path(value).resolve() for value in sys.argv[1:])
+bundled_package, installed_package = (pathlib.Path(value).resolve() for value in sys.argv[1:3])
+daemon_binary = pathlib.Path(sys.argv[3])
+stage, build_fingerprint = sys.argv[4:6]
 loaded_package = pathlib.Path(version.__file__).resolve().parent
 if loaded_package != installed_package:
     raise SystemExit(f"daemon bundle runtime 載入了非預期 sw_core：{loaded_package}")
-fingerprints = [
-    version.compute_code_fingerprint(str(root))
-    for root in (installed_package, bundled_package)
-]
-if fingerprints[0] is None or fingerprints[0] != fingerprints[1]:
-    raise SystemExit(f"bundle 的兩份 sw_core 指紋不一致：{fingerprints}")
-print(fingerprints[0])
+if stage == "2":
+    fingerprint = hashlib.sha256(daemon_binary.read_bytes()).hexdigest()[:12]
+    if fingerprint != build_fingerprint:
+        raise SystemExit(f"Rust daemon 指紋與編譯期指紋不一致：{fingerprint} != {build_fingerprint}")
+else:
+    fingerprints = [
+        version.compute_code_fingerprint(str(root))
+        for root in (installed_package, bundled_package)
+    ]
+    if fingerprints[0] is None or fingerprints[0] != fingerprints[1]:
+        raise SystemExit(f"bundle 的兩份 sw_core 指紋不一致：{fingerprints}")
+    fingerprint = fingerprints[0]
+print(fingerprint)
 PY
   )"
   if [[ "$CODE_FINGERPRINT" != "$EARLY_FP" ]]; then
@@ -526,7 +555,7 @@ PY
     "$CLI_NAME" "$CLI_SHA" "$PACKAGE_TREE_SHA" "$PYTHON_VERSION" "$LAUNCHER_SHA" \
     "$RUNTIME_SHA" "$SKILL_SHA" "$SKILL_WINDOWS_SHA" "$PROFILE_TREE_SHA" "$SUPERVISOR_SHA" \
     "$TASK_XML_TEMPLATE_SHA" "$COM0COM_SHA" "$HELPER_MANIFEST_PATH" "${COM0COM_HELPER_SHA:-}" "$SENTINEL_ENTRY" \
-    "$CODE_FINGERPRINT" "$STAGE" <<'PY'
+    "$CODE_FINGERPRINT" "$STAGE" "$DEV" <<'PY'
 import datetime
 import json
 import sys
@@ -554,7 +583,8 @@ import sys
     sentinel_entry,
     code_fingerprint,
     stage,
-) = sys.argv[1:23]
+    dev,
+) = sys.argv[1:24]
 python_entry = ["py/bin/python3", "-I", "-B", "-m", "sw_core.cli"]
 manifest = {
     "schema_version": 1,
@@ -619,6 +649,7 @@ if stage == "2":
     # 但 implementation=rust 讓 serialwrapd 直接進 Rust daemon，不使用 Python daemon entry。
     manifest["components"]["daemon"]["implementation"] = "rust"
     manifest["components"]["daemon"]["entry"] = ["bin/serialwrapd"]
+    manifest["stage"] = "rust-2-dev" if dev == "1" else "rust-2"
 if com0com_sha:
     manifest["components"]["com0com"] = {
         "optional": True,

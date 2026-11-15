@@ -44,6 +44,11 @@ def sha256_file(path: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
+def rust_daemon_fingerprint(path: pathlib.Path) -> str:
+    """回傳 Rust daemon 執行檔 SHA-256 的前 12 位小寫十六進位。"""
+    return sha256_file(path)[:12]
+
+
 def _version_dir(path: str) -> pathlib.Path:
     return pathlib.Path(path).resolve()
 
@@ -126,19 +131,25 @@ def cmd_manifest(args: argparse.Namespace) -> int:
     if py_version != expected_py:
         raise SystemExit(f"Python 版本不符，預期 {expected_py}，實際 {py_version}")
 
-    fingerprint = sv.compute_code_fingerprint(str(package))
-    if fingerprint != args.expected_fingerprint:
-        raise SystemExit(f"編譯時嵌入的指紋 {args.expected_fingerprint} 與 bundle sw_core 指紋 {fingerprint} 不一致")
-
-    package_tree = rm.package_tree_sha256()
-    profiles_tree = rm.tree_sha256(str(package / "assets" / "profiles"))
     cli = vdir / "bin" / "serialwrap.exe"
     launcher = vdir / "bin" / "serialwrapd.exe"
     runtime = py / "python.exe"
+    if args.stage == "2":
+        fingerprint = rust_daemon_fingerprint(launcher)
+    else:
+        fingerprint = sv.compute_code_fingerprint(str(package))
+    if fingerprint != args.expected_fingerprint:
+        source_name = "Rust daemon" if args.stage == "2" else "bundle sw_core"
+        raise SystemExit(f"編譯時嵌入的指紋 {args.expected_fingerprint} 與 {source_name} 指紋 {fingerprint} 不一致")
+
+    package_tree = rm.package_tree_sha256()
+    profiles_tree = rm.tree_sha256(str(package / "assets" / "profiles"))
+    daemon_launcher_sha = sha256_file(launcher)
+    is_stage2 = args.stage == "2"
     manifest = {
         "schema_version": 1,
         "bundle_version": version,
-        "stage": "1A",
+        "stage": "rust-2" if is_stage2 else "1A",
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "target": TARGET,
         "git_revision": args.git_revision,
@@ -157,13 +168,13 @@ def cmd_manifest(args: argparse.Namespace) -> int:
                 "runtime_python_version": py_version,
             },
             "daemon": {
-                "implementation": "python",
+                "implementation": "rust" if is_stage2 else "python",
                 "version": version,
                 "git_revision": args.git_revision,
-                "entry": ["py/python.exe", "-I", "-B", "py/serialwrapd.py"],
+                "entry": ["bin/serialwrapd.exe"] if is_stage2 else ["py/python.exe", "-I", "-B", "py/serialwrapd.py"],
                 "state_schema": "python-state-v0",
                 "code_fingerprint": fingerprint,
-                "launcher": {"path": "bin/serialwrapd.exe", "sha256": sha256_file(launcher)},
+                "launcher": {"path": "bin/serialwrapd.exe", "sha256": daemon_launcher_sha},
                 "runtime": {
                     "path": "py/python.exe",
                     "python_version": py_version,
@@ -256,6 +267,16 @@ def cmd_validate(args: argparse.Namespace) -> int:
         errors.append("manifest 是 delegate-sentinel 測試 bundle")
     if manifest.get("target") != TARGET:
         errors.append(f"manifest target={manifest.get('target')!r}")
+    daemon = manifest["components"]["daemon"]
+    if manifest.get("stage") == "rust-2":
+        expected_fingerprint = rust_daemon_fingerprint(vdir / "bin" / "serialwrapd.exe")
+        if daemon.get("implementation") != "rust":
+            errors.append("Stage 2 daemon implementation 不為 rust")
+        if daemon.get("code_fingerprint") != expected_fingerprint:
+            errors.append(
+                "Stage 2 daemon code_fingerprint 不等於 launcher SHA-256 前 12 位："
+                f"{daemon.get('code_fingerprint')!r} != {expected_fingerprint}"
+            )
 
     sums_text = (vdir / "SHA256SUMS").read_bytes()
     if b"\r" in sums_text:
@@ -361,6 +382,7 @@ def main() -> int:
     p.add_argument("--git-revision", required=True)
     p.add_argument("--contract-revision", required=True)
     p.add_argument("--expected-fingerprint", required=True)
+    p.add_argument("--stage", choices=("1", "2"), default="1")
     p.set_defaults(func=cmd_manifest)
     p = sub.add_parser("validate")
     p.add_argument("--bundle-root", required=True)

@@ -1348,8 +1348,8 @@ pub fn locate_manifest(ctx: &Ctx<'_>) -> Result<(PathBuf, ReleaseManifest), Layo
 /// `mkbundle.sh` 在編譯前記入的 CLI 指紋占位。
 ///
 /// 格式為 `SWFP1:` 加 12 位小寫十六進位。開發建置維持 12 個 `0`，視為沒有指紋。
-/// bundle 建置時改寫成與 `sw_core/version.py` 相同演算法算出的 Python daemon 指紋，
-/// 讓執行檔被複製離開 `release-manifest.json` 之後仍保有同一份 CLI 指紋。
+/// bundle 建置時寫入 daemon 指紋：Stage 1 為 Python `sw_core` 指紋，Stage 2 為
+/// Rust daemon launcher 檔案 SHA-256 的前 12 位，讓執行檔離開 manifest 後仍保有同一值。
 const EMBEDDED_CODE_FINGERPRINT_STAMP: &[u8] = include_bytes!("embedded_code_fingerprint.bin");
 const EMBEDDED_STAMP_PREFIX: &[u8] = b"SWFP1:";
 const EMBEDDED_STAMP_PLACEHOLDER: &[u8] = b"000000000000";
@@ -1378,12 +1378,13 @@ fn is_embedded_fingerprint(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-/// 編譯期印入的 bundle Python daemon 指紋；開發建置為 `None`。
+/// 編譯期印入的 bundle daemon 指紋；Stage 1／Stage 2 使用各自 manifest 定義的摘要，
+/// 開發建置為 `None`。
 pub(crate) fn embedded_bundle_fingerprint() -> Option<String> {
     parse_embedded_stamp(EMBEDDED_CODE_FINGERPRINT_STAMP)
 }
 
-/// 依既有定位規則讀取 bundle 宣告的 Python daemon 程式碼指紋。
+/// 依既有定位規則讀取 bundle 宣告的 daemon 程式碼指紋。
 ///
 /// manifest 存在時只用其中的 `code_fingerprint`（欄位缺失為 `Ok(None)`，不退回編譯期指紋）。
 /// 找不到 manifest 時才用編譯期印入的指紋；開發建置沒有該指紋，與 Python 無法取得指紋時一樣。

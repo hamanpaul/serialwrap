@@ -443,6 +443,121 @@ def test_stage2_dev_bundle_manifest_selects_rust_daemon(stage2_bundle):
     launcher = out / "versions" / VERSION / "bin" / "serialwrapd"
     assert daemon["launcher"]["path"] == "bin/serialwrapd"
     assert daemon["launcher"]["sha256"] == _sha256(launcher)
+    assert daemon["code_fingerprint"] == _sha256(launcher)[:12]
+    schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
+    fingerprint_description = schema["properties"]["components"]["properties"]["daemon"]["properties"]["code_fingerprint"]["description"]
+    assert "SHA-256 的前 12 位" in fingerprint_description
+    assert "launcher.sha256" in fingerprint_description
+    errors = list(jsonschema.validators.validator_for(schema)(schema).iter_errors(manifest))
+    assert not errors, "; ".join(f"{list(error.absolute_path)}: {error.message}" for error in errors)
+
+
+def test_stage2_daemon_rpc_reports_bundle_fingerprint(stage2_bundle, tmp_path: Path) -> None:
+    """Stage 2 daemon 從相鄰 manifest 載入啟動指紋並由 health.ping 回報。"""
+    out = stage2_bundle.out()
+    manifest = _manifest(out)
+    expected = manifest["components"]["daemon"]["code_fingerprint"]
+    launcher = out / "bin" / "serialwrapd"
+    env = _harness_env(tmp_path / "isolated")
+    sockdir = Path(tempfile.mkdtemp(prefix="swd-", dir=tempfile.gettempdir()))
+    proc: subprocess.Popen | None = None
+    try:
+        sock = sockdir / "s"
+        with open(tmp_path / "stage2-daemon.log", "w", encoding="utf-8") as log:
+            proc = subprocess.Popen(
+                [
+                    str(launcher),
+                    "--socket", str(sock),
+                    "--lock", str(sockdir / "l"),
+                    "--profile-dir", str(tmp_path / "profiles"),
+                ],
+                env=env,
+                cwd=str(tmp_path),
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+            ping = _wait_ready(str(sock), proc)
+            assert ping.get("code_fingerprint") == expected, ping
+            _send_rpc(str(sock), "daemon.stop", {})
+            proc.wait(timeout=20)
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+        shutil.rmtree(sockdir, ignore_errors=True)
+
+
+def test_windows_stage2_manifest_uses_rust_daemon_binary_fingerprint(tmp_path: Path) -> None:
+    """Windows Stage 2 manifest 的 daemon 身分必須取自 Rust 執行檔摘要。"""
+    import jsonschema
+
+    version_dir = tmp_path / "bundle" / "versions" / VERSION
+    py_dir = version_dir / "py"
+    bin_dir = version_dir / "bin"
+    py_dir.mkdir(parents=True)
+    bin_dir.mkdir(parents=True)
+    shutil.copytree(
+        REPO / "sw_core",
+        py_dir / "sw_core",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    for path, content in (
+        (py_dir / "python.exe", b"embedded-python-fixture"),
+        (bin_dir / "serialwrap.exe", b"rust-cli-fixture"),
+        (bin_dir / "serialwrapd.exe", b"rust-daemon-fixture"),
+    ):
+        path.write_bytes(content)
+    daemon_fingerprint = _sha256(bin_dir / "serialwrapd.exe")[:12]
+    script = r"""
+import importlib.util
+import sys
+from pathlib import Path
+
+version_dir, source_root, version, fingerprint = sys.argv[1:]
+sys.path.insert(0, str(Path(version_dir) / "py"))
+helper_path = Path(source_root) / "scripts" / "rust" / "mkbundle_windows.py"
+spec = importlib.util.spec_from_file_location("mkbundle_windows", helper_path)
+helper = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(helper)
+sys.argv = [
+    str(helper_path), "manifest",
+    "--version-dir", version_dir,
+    "--source-root", source_root,
+    "--version", version,
+    "--git-revision", "0123456789abcdef0123456789abcdef01234567",
+    "--contract-revision", "89abcdef0123456789abcdef0123456789abcdef",
+    "--expected-fingerprint", fingerprint,
+    "--stage", "2",
+]
+raise SystemExit(helper.main())
+"""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            script,
+            str(version_dir),
+            str(REPO),
+            VERSION,
+            daemon_fingerprint,
+        ],
+        cwd=str(REPO),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    manifest = json.loads((version_dir / "release-manifest.json").read_text(encoding="utf-8"))
+    daemon = manifest["components"]["daemon"]
+    assert manifest["stage"] == "rust-2"
+    assert daemon["implementation"] == "rust"
+    assert daemon["entry"] == ["bin/serialwrapd.exe"]
+    assert daemon["launcher"]["sha256"] == _sha256(bin_dir / "serialwrapd.exe")
+    assert daemon["code_fingerprint"] == daemon_fingerprint
     schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
     errors = list(jsonschema.validators.validator_for(schema)(schema).iter_errors(manifest))
     assert not errors, "; ".join(f"{list(error.absolute_path)}: {error.message}" for error in errors)
@@ -573,6 +688,18 @@ def test_release_bundle_build_does_not_enable_test_fakes(tmp_path):
     fake_rustc = fake_bin / "rustc"
     fake_rustc.write_text("#!/bin/sh\nprintf 'host: x86_64-unknown-linux-gnu\\n'\n", encoding="utf-8")
     fake_rustc.chmod(0o755)
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  *'status --porcelain --untracked-files=all'*) exit 0 ;;\n"
+        "  *'rev-parse HEAD:contracts'*) printf '1111111111111111111111111111111111111111\\n' ;;\n"
+        "  *'rev-parse HEAD'*) printf '2222222222222222222222222222222222222222\\n' ;;\n"
+        "  *) exec /usr/bin/git \"$@\" ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
     fake_cargo = fake_bin / "cargo"
     fake_cargo.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$SW_CARGO_ARGS\"\nexit 0\n", encoding="utf-8")
     fake_cargo.chmod(0o755)
@@ -592,6 +719,68 @@ def test_release_bundle_build_does_not_enable_test_fakes(tmp_path):
     _assert_release_cargo_omits_test_fakes(args)
     assert "--release" in args
     assert result.returncode != 0, "fake cargo 未產生 binaries，後續 bundle 組裝應 fail-closed"
+
+
+def test_formal_stage2_build_passes_version_to_rust_daemon(tmp_path: Path) -> None:
+    """正式 Stage 2 的第一段 Rust daemon build 必須使用 bundle 版本覆寫。"""
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    trace = tmp_path / "cargo-trace"
+    fake_rustc = fake_bin / "rustc"
+    fake_rustc.write_text("#!/bin/sh\nprintf 'host: x86_64-unknown-linux-gnu\\n'\n", encoding="utf-8")
+    fake_rustc.chmod(0o755)
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  *'status --porcelain --untracked-files=all'*) exit 0 ;;\n"
+        "  *'rev-parse HEAD:contracts'*) printf '1111111111111111111111111111111111111111\\n' ;;\n"
+        "  *'rev-parse HEAD'*) printf '2222222222222222222222222222222222222222\\n' ;;\n"
+        "  *) exec /usr/bin/git \"$@\" ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    fake_cargo = fake_bin / "cargo"
+    fake_cargo.write_text(
+        "#!/bin/sh\n"
+        "printf 'SW_BUNDLE_VERSION=%s\\nARGV=%s\\n' \"${SW_BUNDLE_VERSION-<unset>}\" \"$*\" >> \"$SW_CARGO_TRACE\"\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_cargo.chmod(0o755)
+    env = dict(
+        os.environ,
+        PATH=f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        SW_CARGO_TRACE=str(trace),
+        SW_BUNDLE_VERSION="inherited-stale-version",
+        CARGO_TARGET_DIR=str(tmp_path / "cargo-target"),
+    )
+
+    result = subprocess.run(
+        [
+            str(MKBUNDLE),
+            "--release-bundle",
+            "--profile",
+            "release",
+            "--stage",
+            "2",
+            "--version-override",
+            "0.5.0",
+            "--out",
+            str(tmp_path / "release-stage2"),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+    assert trace.is_file(), result.stderr
+    calls = trace.read_text(encoding="utf-8")
+    assert "SW_BUNDLE_VERSION=0.5.0" in calls, calls
+    assert "ARGV=build -p sw-daemon --release" in calls, calls
+    assert result.returncode != 0, "fake cargo 未產生 daemon，後續 bundle 組裝應 fail-closed"
 
 
 def test_help_lists_supported_options_without_building():

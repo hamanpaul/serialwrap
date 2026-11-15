@@ -35,6 +35,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$Out,
+    [ValidateSet(1, 2)][int]$Stage = 1,
     [string]$SourceRoot,
     [string]$PrebuiltBinDir,
     [string]$HostPython = 'python',
@@ -164,21 +165,38 @@ if ($reparse) { Fail "py 內含 symlink／junction：$($reparse[0].FullName)" }
 Invoke-Native $PyExe @('-I', '-B', $Helper, 'isolation', '--py-dir', $PyDir) 'runtime 隔離檢查' | Out-Host
 
 # ---- 程式碼指紋與 Rust 二進位 ----
-$fingerprint = ([string](Invoke-Native $PyExe @('-I', '-B', $Helper, 'fingerprint', '--version-dir', $VersionDir) 'fingerprint' | Select-Object -Last 1)).Trim()
-if ($fingerprint -notmatch '^[0-9a-f]{12}$') { Fail "程式碼指紋格式不符：$fingerprint" }
+$fingerprint = $null
+if ($Stage -eq 1) {
+    $fingerprint = ([string](Invoke-Native $PyExe @('-I', '-B', $Helper, 'fingerprint', '--version-dir', $VersionDir) 'fingerprint' | Select-Object -Last 1)).Trim()
+}
 
 if ($PrebuiltBinDir) {
     $builtDir = (Resolve-Path -LiteralPath $PrebuiltBinDir).Path
+    if ($Stage -eq 2) {
+        $fingerprint = (Get-Sha256 (Join-Path $builtDir 'serialwrapd.exe')).Substring(0, 12)
+    }
 } else {
     $stampFile = Join-Path $SourceRoot 'crates\sw-cli\src\embedded_code_fingerprint.bin'
     $placeholder = 'SWFP1:000000000000'
+    $targetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $SourceRoot 'target' }
     try {
-        [System.IO.File]::WriteAllText($stampFile, "SWFP1:$fingerprint", [System.Text.UTF8Encoding]::new($false))
         Push-Location $SourceRoot
         try {
             $env:SW_BUNDLE_VERSION = $Version
             # 不帶 --features test-fakes；與 rust.yml 相同 gnu host toolchain（由 RUSTUP_TOOLCHAIN 指定）。
-            & cargo build --release --locked -p sw-cli -p sw-daemon
+            if ($Stage -eq 2) {
+                & cargo build --release --locked -p sw-daemon
+                if ($LASTEXITCODE -ne 0) { Fail "Rust daemon cargo build 失敗 (exit $LASTEXITCODE)" }
+                $builtDir = Join-Path $targetRoot 'release'
+                $fingerprint = (Get-Sha256 (Join-Path $builtDir 'serialwrapd.exe')).Substring(0, 12)
+            }
+            if ($fingerprint -notmatch '^[0-9a-f]{12}$') { Fail "程式碼指紋格式不符：$fingerprint" }
+            [System.IO.File]::WriteAllText($stampFile, "SWFP1:$fingerprint", [System.Text.UTF8Encoding]::new($false))
+            if ($Stage -eq 2) {
+                & cargo build --release --locked -p sw-cli
+            } else {
+                & cargo build --release --locked -p sw-cli -p sw-daemon
+            }
             if ($LASTEXITCODE -ne 0) { Fail "cargo build 失敗 (exit $LASTEXITCODE)" }
         } finally {
             Pop-Location
@@ -186,9 +204,9 @@ if ($PrebuiltBinDir) {
     } finally {
         [System.IO.File]::WriteAllText($stampFile, $placeholder, [System.Text.UTF8Encoding]::new($false))
     }
-    $targetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $SourceRoot 'target' }
-    $builtDir = Join-Path $targetRoot 'release'
+    if (-not $builtDir) { $builtDir = Join-Path $targetRoot 'release' }
 }
+if ($fingerprint -notmatch '^[0-9a-f]{12}$') { Fail "程式碼指紋格式不符：$fingerprint" }
 foreach ($name in 'serialwrap.exe', 'serialwrapd.exe') {
     if (-not (Test-Path -LiteralPath (Join-Path $builtDir $name))) { Fail "找不到 $builtDir\$name" }
     Copy-Item -LiteralPath (Join-Path $builtDir $name) -Destination (Join-Path $VBin $name) -Force
@@ -214,7 +232,7 @@ if ($versionOut -ne "serialwrap $Version (code $fingerprint)") { Fail "離開 ma
 Get-ChildItem -LiteralPath $VersionDir -Recurse -Force -Directory -Filter '__pycache__' | Remove-Item -Recurse -Force
 Invoke-Native $PyExe @('-I', '-B', $Helper, 'manifest', '--version-dir', $VersionDir, '--source-root', $SourceRoot,
     '--version', $Version, '--git-revision', $GitRevision, '--contract-revision', $ContractRevision,
-    '--expected-fingerprint', $fingerprint) 'manifest' | Out-Host
+    '--expected-fingerprint', $fingerprint, '--stage', "$Stage") 'manifest' | Out-Host
 Invoke-Native $HostPython @('-I', '-B', $Helper, 'validate', '--bundle-root', $Out, '--source-root', $SourceRoot,
     '--version', $Version) 'validate' | Out-Host
 
