@@ -8,6 +8,7 @@
 #   supervision-attest.json、bench-lock.json、gate evidence_hashes 所列檔案；Windows 另含 excl/）。
 #   由 contract_coverage.py --import-longrun 驗證後複製進 RUN_DIR/longrun/，判定時再重新驗證副本。
 set -uo pipefail
+export CARGO_INCREMENTAL=0
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
@@ -20,9 +21,16 @@ CANDIDATE_BUNDLE=""
 SLICE21_RUN=""
 SLICE22_GATE=""
 SLICE23_RUN=""
+SHARED_EVIDENCE=""
+DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --shared-evidence)
+      [[ $# -ge 2 ]] || { echo "slice24_exit.sh: --shared-evidence 缺少值" >&2; exit 2; }
+      SHARED_EVIDENCE="$2"
+      shift 2 ;;
     --run-id)
       [[ $# -ge 2 ]] || { echo "slice24_exit.sh: --run-id 缺少值" >&2; exit 2; }
       RUN_ID="$2"
@@ -54,11 +62,28 @@ while [[ $# -gt 0 ]]; do
       shift 2 ;;
     -h|--help)
       sed -n '2,9p' "$0"
-      echo "用法：$0 [--run-id ID] [--candidate-bundle DIR] [--windows-run DIR] [--longrun DIR] [--slice21-run DIR] [--slice22-gate FILE] [--slice23-run DIR]"
+      echo "用法：$0 [--dry-run] [--shared-evidence DIR] [--run-id ID] [--candidate-bundle DIR] [--windows-run DIR] [--longrun DIR] [--slice21-run DIR] [--slice22-gate FILE] [--slice23-run DIR]"
       exit 0 ;;
     *) echo "slice24_exit.sh: 未知參數 $1" >&2; exit 2 ;;
   esac
 done
+
+if [[ "$DRY_RUN" == "1" ]]; then
+  echo "slice24_exit.sh dry-run：只列出計畫，不執行命令。"
+  if [[ -n "$SHARED_EVIDENCE" ]]; then
+    echo "shared-evidence import：debug/release artifacts、pytest_full、cargo_fakes_p7、cargo_workspace_default、cargo_contract_results、s24_ab（$SHARED_EVIDENCE）；selector/provenance/SHA 不符記 EVIDENCE_MISSING，FAIL 照傳且不重跑。artifact provenance 不符：EVIDENCE_MISSING，不啟動本地建置。"
+    echo "執行：env CARGO_INCREMENTAL=0 cargo check --workspace --target x86_64-pc-windows-gnu。"
+  else
+    echo "執行：cargo build --workspace --bins；python3 scripts/rust/check_cfg_boundary.py。"
+    echo "執行：cargo test --workspace --features test-fakes；cargo test --workspace；env CARGO_INCREMENTAL=0 cargo check --workspace --target x86_64-pc-windows-gnu。"
+    echo "執行：python3 scripts/rust/import_cargo_results.py --label rust-linux --platform linux --include-cap posix_pty --include-cap process_rpc -- --workspace --features test-fakes。"
+    echo "執行：python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence。"
+    echo "執行：env SERIALWRAP_CLI_EXE=<CLI> SERIALWRAP_DAEMON_EXE=<DAEMON> SERIALWRAP_AB_LABEL=rust-linux python3 -m pytest -q tests/contract_blackbox tests/acceptance/l15/test_slice21_l15.py tests/acceptance/l15/test_slice23_l15.py tests/test_multiagent_e2e.py tests/test_human_agent_coexist.py tests/test_rust_contract_coverage.py tests/test_transfer_golden_fresh.py。"
+  fi
+  echo "匯入：--windows-run、--longrun、前置 slice 2.1～2.3 證據；執行 python3 -m tools.contracts check、python3 tests/acceptance/regen_lock.py --check、python3 -m policy_check --repo .。"
+  echo "執行：python3 scripts/rust/slice_breaker.py --freeze tests/acceptance/breaker/slice_2.4.json；python3 scripts/rust/contract_coverage.py <候選 artifact 與前置 slice 輸入>。"
+  exit 0
+fi
 
 if [[ ! "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
   echo "slice24_exit.sh: --run-id 只允許英數與 ._-" >&2
@@ -140,11 +165,40 @@ run_logged() {
   return 0
 }
 
-# 先快照不帶 test-fakes 的 daemon/CLI；後續 Cargo 測試不得改寫本輪受測 artifact。
-run_logged build-linux-candidate cargo build --workspace --bins
-BUILD_RC="$LAST_RC"
 RUST_CLI="$RUN_DIR/artifacts/serialwrap"
 RUST_DAEMON="$RUN_DIR/artifacts/serialwrapd"
+SHARED_ARTIFACTS_VALID=0
+SHARED_ARTIFACT_DIR="$RUN_DIR/shared-artifact-import"
+SHARED_ARTIFACT_ARGS=()
+if [[ -n "$SHARED_EVIDENCE" ]]; then
+  if python3 scripts/rust/gate_shared_evidence.py import-artifacts --shared-evidence "$SHARED_EVIDENCE" \
+      --out-dir "$SHARED_ARTIFACT_DIR" >"$RUN_DIR/logs/shared-artifacts.json" \
+      2>"$RUN_DIR/logs/shared-artifacts.stderr"; then
+    cp -p "$SHARED_ARTIFACT_DIR/debug_cli" "$RUST_CLI"
+    cp -p "$SHARED_ARTIFACT_DIR/debug_daemon" "$RUST_DAEMON"
+    BUILD_RC=0
+    SHARED_ARTIFACT_ARGS=(--artifact "debug_cli=$SHARED_ARTIFACT_DIR/debug_cli" \
+      --artifact "debug_daemon=$SHARED_ARTIFACT_DIR/debug_daemon" \
+      --artifact "release_cli=$SHARED_ARTIFACT_DIR/release_cli" \
+      --artifact "release_daemon=$SHARED_ARTIFACT_DIR/release_daemon")
+    SHARED_ARTIFACTS_VALID=1
+    if [[ -z "$CANDIDATE_BUNDLE" ]]; then
+      BUILD_RC=0
+      printf 'build-linux-candidate\t0\n' >>"$DRIVER_TSV"
+      printf 'shared artifact import\n' >"$RUN_DIR/logs/build-linux-candidate.log"
+    fi
+  else
+    FAILURES=1
+    echo "EVIDENCE_MISSING：共用 artifact provenance 不符。" >"$RUN_DIR/logs/build-linux-candidate.log"
+    cat "$RUN_DIR/logs/shared-artifacts.stderr" >>"$RUN_DIR/logs/build-linux-candidate.log" || true
+    BUILD_RC=3
+    printf 'build-linux-candidate\t%s\n' "$BUILD_RC" >>"$DRIVER_TSV"
+  fi
+else
+  run_logged build-linux-candidate cargo build --workspace --bins
+  BUILD_RC="$LAST_RC"
+  [[ "$BUILD_RC" != 0 ]] || { cp -p "$CARGO_TARGET_DIR/debug/serialwrap" "$RUST_CLI"; cp -p "$CARGO_TARGET_DIR/debug/serialwrapd" "$RUST_DAEMON"; }
+fi
 if [[ -n "$CANDIDATE_BUNDLE" ]]; then
   # 本輪候選＝指定 bundle：受測 CLI／daemon 直接取自其版本目錄（與 realhw deployed_content.install_dir 同解析），
   # 並記錄檔案清單與 tree 雜湊，供長跑 pinned bundle／CLI／daemon 交叉核對（P8X-e038dda-1）。
@@ -181,41 +235,120 @@ PY
     RUST_DAEMON="$RUN_DIR/artifacts/missing-candidate-daemon"
     echo "slice24_exit.sh: 候選 bundle 未記錄，後續結果不得計 PASS" >&2
   fi
-elif [[ "$BUILD_RC" -eq 0 && -f "$CARGO_TARGET_DIR/debug/serialwrap" && -f "$CARGO_TARGET_DIR/debug/serialwrapd" ]]; then
-  cp -p "$CARGO_TARGET_DIR/debug/serialwrap" "$RUST_CLI"
-  cp -p "$CARGO_TARGET_DIR/debug/serialwrapd" "$RUST_DAEMON"
+elif [[ "$BUILD_RC" -eq 0 && -f "$RUST_CLI" && -f "$RUST_DAEMON" ]]; then
+  :
 else
   printf 'artifact_snapshot\t1\n' >>"$DRIVER_TSV"
   FAILURES=1
   echo "slice24_exit.sh: Rust CLI／daemon artifact 缺失，後續結果不得計 PASS" >&2
 fi
+if [[ "$SHARED_ARTIFACTS_VALID" == "1" && -n "$CANDIDATE_BUNDLE" ]]; then
+  SHARED_ARTIFACT_ARGS=(--artifact "debug_cli=$SHARED_ARTIFACT_DIR/debug_cli" \
+    --artifact "debug_daemon=$SHARED_ARTIFACT_DIR/debug_daemon" \
+    --artifact "release_cli=$RUST_CLI" --artifact "release_daemon=$RUST_DAEMON")
+fi
 
 run_logged cfg-boundary python3 scripts/rust/check_cfg_boundary.py
-run_logged cargo-workspace-test-fakes cargo test --workspace --features test-fakes
-run_logged cargo-workspace-test cargo test --workspace
+if [[ -n "$SHARED_EVIDENCE" ]]; then
+  if [[ "$SHARED_ARTIFACTS_VALID" == 1 ]] && python3 scripts/rust/gate_shared_evidence.py import-section \
+      --shared-evidence "$SHARED_EVIDENCE" --gate slice24 --section cargo_fakes_p7 \
+      --required-set p7_gate:cargo-test-workspace --platform linux \
+      "${SHARED_ARTIFACT_ARGS[@]}" \
+      --out-dir "$RUN_DIR/shared-import" >"$RUN_DIR/logs/shared-cargo-fakes.json" \
+      2>"$RUN_DIR/logs/shared-cargo-fakes.stderr"; then
+    cp "$RUN_DIR/shared-import/logs/cargo-fakes-p7.log" "$RUN_DIR/logs/cargo-workspace-test-fakes.log"
+    LAST_RC="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["exit_code"])' "$RUN_DIR/logs/shared-cargo-fakes.json")"
+    printf 'cargo-workspace-test-fakes\t%s\n' "$LAST_RC" >>"$DRIVER_TSV"
+    [[ "$LAST_RC" == 0 ]] || FAILURES=1
+  else
+    echo "EVIDENCE_MISSING：共用 test-fakes 證據拒收；本段不重跑。" >"$RUN_DIR/logs/cargo-workspace-test-fakes.log"
+    cat "$RUN_DIR/logs/shared-cargo-fakes.stderr" >>"$RUN_DIR/logs/cargo-workspace-test-fakes.log" 2>/dev/null || true
+    printf 'cargo-workspace-test-fakes\t3\n' >>"$DRIVER_TSV"
+    FAILURES=1
+  fi
+  if [[ "$SHARED_ARTIFACTS_VALID" == 1 ]] && python3 scripts/rust/gate_shared_evidence.py import-section \
+      --shared-evidence "$SHARED_EVIDENCE" --gate slice24 --section cargo_workspace_default \
+      --expected-command cargo_workspace_default --platform linux \
+      "${SHARED_ARTIFACT_ARGS[@]}" \
+      --out-dir "$RUN_DIR/shared-import" >"$RUN_DIR/logs/shared-cargo-default.json" \
+      2>"$RUN_DIR/logs/shared-cargo-default.stderr"; then
+    cp "$RUN_DIR/shared-import/logs/cargo-workspace-default.log" "$RUN_DIR/logs/cargo-workspace-test.log"
+    LAST_RC="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["exit_code"])' "$RUN_DIR/logs/shared-cargo-default.json")"
+    printf 'cargo-workspace-test\t%s\n' "$LAST_RC" >>"$DRIVER_TSV"
+    [[ "$LAST_RC" == 0 ]] || FAILURES=1
+  else
+    echo "EVIDENCE_MISSING：共用 cargo workspace 證據拒收；本段不重跑。" >"$RUN_DIR/logs/cargo-workspace-test.log"
+    cat "$RUN_DIR/logs/shared-cargo-default.stderr" >>"$RUN_DIR/logs/cargo-workspace-test.log" 2>/dev/null || true
+    printf 'cargo-workspace-test\t3\n' >>"$DRIVER_TSV"
+    FAILURES=1
+  fi
+else
+  run_logged cargo-workspace-test-fakes cargo test --workspace --features test-fakes
+  run_logged cargo-workspace-test cargo test --workspace
+fi
 # 交叉編譯僅記開發檢查，不會啟動 Windows host，也不作 Windows 原生證據。
-run_logged cargo-windows-check cargo check --workspace --target x86_64-pc-windows-gnu
+run_logged cargo-windows-check env CARGO_INCREMENTAL=0 cargo check --workspace --target x86_64-pc-windows-gnu
 
 if [[ -f "$RUST_CLI" && -f "$RUST_DAEMON" ]]; then
-  run_logged rust-cargo-results env \
-    SERIALWRAP_CLI_EXE="$RUST_CLI" \
-    SERIALWRAP_DAEMON_EXE="$RUST_DAEMON" \
-    python3 scripts/rust/import_cargo_results.py \
-      --label rust-linux --platform linux --out-dir "$RUN_DIR" \
-      --include-cap posix_pty --include-cap process_rpc \
-      -- --workspace --features test-fakes
+  if [[ -n "$SHARED_EVIDENCE" ]]; then
+    if [[ "$SHARED_ARTIFACTS_VALID" == 1 ]] && python3 scripts/rust/gate_shared_evidence.py import-section \
+        --shared-evidence "$SHARED_EVIDENCE" --gate slice24 --section cargo_contract_results \
+        --expected-command cargo_contract_results --platform linux \
+        "${SHARED_ARTIFACT_ARGS[@]}" \
+        --out-dir "$RUN_DIR/shared-import" >"$RUN_DIR/logs/shared-cargo-contract-results.json" \
+        2>"$RUN_DIR/logs/shared-cargo-contract-results.stderr"; then
+      tar -xzf "$RUN_DIR/shared-import/slice24/cargo-results.tar.gz" -C "$RUN_DIR"
+      cp "$RUN_DIR/shared-import/logs/cargo-contract-results.log" "$RUN_DIR/logs/rust-cargo-results.log"
+      LAST_RC="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["exit_code"])' "$RUN_DIR/logs/shared-cargo-contract-results.json")"
+      printf 'rust-cargo-results\t%s\n' "$LAST_RC" >>"$DRIVER_TSV"
+      [[ "$LAST_RC" == 0 ]] || FAILURES=1
+    else
+      echo "EVIDENCE_MISSING：共用逐案 Cargo 結果拒收；本段不重跑。" >"$RUN_DIR/logs/rust-cargo-results.log"
+      cat "$RUN_DIR/logs/shared-cargo-contract-results.stderr" >>"$RUN_DIR/logs/rust-cargo-results.log" 2>/dev/null || true
+      printf 'rust-cargo-results\t3\n' >>"$DRIVER_TSV"
+      FAILURES=1
+    fi
+  else
+    run_logged rust-cargo-results env \
+      SERIALWRAP_CLI_EXE="$RUST_CLI" \
+      SERIALWRAP_DAEMON_EXE="$RUST_DAEMON" \
+      python3 scripts/rust/import_cargo_results.py \
+        --label rust-linux --platform linux --out-dir "$RUN_DIR" \
+        --include-cap posix_pty --include-cap process_rpc \
+        -- --workspace --features test-fakes
+  fi
 else
   printf 'rust-cargo-results\t1\n' >>"$DRIVER_TSV"
   FAILURES=1
 fi
 
 # N3（依 2026-11-12 rulings/s2.md 第 3 點）：Python 基線 pytest 參數與 CI 對齊。
-run_logged python-baseline env \
-  SERIALWRAP_COVERAGE_RUN_DIR="$RUN_DIR" \
-  SERIALWRAP_COVERAGE_LABEL=python-linux \
-  python3 -m pytest -q tests/ \
-  --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native \
-  --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence
+if [[ -n "$SHARED_EVIDENCE" ]]; then
+  if [[ "$SHARED_ARTIFACTS_VALID" == 1 ]] && python3 scripts/rust/gate_shared_evidence.py import-section \
+      --shared-evidence "$SHARED_EVIDENCE" --gate slice24 --section pytest_full \
+      --required-set p7_gate:python3-m-pytest-q-tests --platform linux \
+      "${SHARED_ARTIFACT_ARGS[@]}" \
+      --out-dir "$RUN_DIR/shared-import" >"$RUN_DIR/logs/shared-python-baseline.json" \
+      2>"$RUN_DIR/logs/shared-python-baseline.stderr"; then
+    tar -xzf "$RUN_DIR/shared-import/slice24/python-baseline-coverage.tar.gz" -C "$RUN_DIR"
+    cp "$RUN_DIR/shared-import/logs/pytest-full.log" "$RUN_DIR/logs/python-baseline.log"
+    LAST_RC="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["exit_code"])' "$RUN_DIR/logs/shared-python-baseline.json")"
+    printf 'python-baseline\t%s\n' "$LAST_RC" >>"$DRIVER_TSV"
+    [[ "$LAST_RC" == 0 ]] || FAILURES=1
+  else
+    echo "EVIDENCE_MISSING：共用 pytest_full 證據拒收；本段不重跑。" >"$RUN_DIR/logs/python-baseline.log"
+    cat "$RUN_DIR/logs/shared-python-baseline.stderr" >>"$RUN_DIR/logs/python-baseline.log" 2>/dev/null || true
+    printf 'python-baseline\t3\n' >>"$DRIVER_TSV"
+    FAILURES=1
+  fi
+else
+  run_logged python-baseline env \
+    SERIALWRAP_COVERAGE_RUN_DIR="$RUN_DIR" \
+    SERIALWRAP_COVERAGE_LABEL=python-linux \
+    python3 -m pytest -q tests/ \
+    --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native \
+    --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence
+fi
 
 # Rust label 的 pytest 收集範圍：凡需 rust-linux 證據的 pytest nodeid（含 rust-l1 凍結案例的 pytest 節點），
 # 其檔案都要在此陣列內並與本輪 artifact 一起執行（P8X-24c6b39-6；tests/test_rust_contract_coverage.py 把關）。
@@ -229,13 +362,34 @@ RUST_PYTEST_TARGETS=(
   tests/test_transfer_golden_fresh.py
 )
 if [[ -f "$RUST_CLI" && -f "$RUST_DAEMON" ]]; then
-  run_logged rust-blackbox env \
-    SERIALWRAP_CLI_EXE="$RUST_CLI" \
-    SERIALWRAP_DAEMON_EXE="$RUST_DAEMON" \
-    SERIALWRAP_AB_LABEL=rust-linux \
-    SERIALWRAP_COVERAGE_RUN_DIR="$RUN_DIR" \
-    SERIALWRAP_COVERAGE_LABEL=rust-linux \
-    python3 -m pytest -q "${RUST_PYTEST_TARGETS[@]}"
+  if [[ -n "$SHARED_EVIDENCE" ]]; then
+    if [[ "$SHARED_ARTIFACTS_VALID" == 1 ]] && python3 scripts/rust/gate_shared_evidence.py import-section \
+        --shared-evidence "$SHARED_EVIDENCE" --gate slice24 --section s24_ab \
+        --expected-command s24_ab --platform linux \
+        "${SHARED_ARTIFACT_ARGS[@]}" \
+        --out-dir "$RUN_DIR/shared-import" >"$RUN_DIR/logs/shared-rust-blackbox.json" \
+        2>"$RUN_DIR/logs/shared-rust-blackbox.stderr"; then
+      tar -xzf "$RUN_DIR/shared-import/slice24/coverage.tar.gz" -C "$RUN_DIR"
+      cp "$RUN_DIR/shared-import/slice24/s24-ab/junit.xml" "$RUN_DIR/rust-blackbox.junit.xml"
+      cp "$RUN_DIR/shared-import/logs/s24-ab.log" "$RUN_DIR/logs/rust-blackbox.log"
+      LAST_RC="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["exit_code"])' "$RUN_DIR/logs/shared-rust-blackbox.json")"
+      printf 'rust-blackbox\t%s\n' "$LAST_RC" >>"$DRIVER_TSV"
+      [[ "$LAST_RC" == 0 ]] || FAILURES=1
+    else
+      echo "EVIDENCE_MISSING：共用 Slice 2.4 A/B 證據拒收；本段不重跑。" >"$RUN_DIR/logs/rust-blackbox.log"
+      cat "$RUN_DIR/logs/shared-rust-blackbox.stderr" >>"$RUN_DIR/logs/rust-blackbox.log" 2>/dev/null || true
+      printf 'rust-blackbox\t3\n' >>"$DRIVER_TSV"
+      FAILURES=1
+    fi
+  else
+    run_logged rust-blackbox env \
+      SERIALWRAP_CLI_EXE="$RUST_CLI" \
+      SERIALWRAP_DAEMON_EXE="$RUST_DAEMON" \
+      SERIALWRAP_AB_LABEL=rust-linux \
+      SERIALWRAP_COVERAGE_RUN_DIR="$RUN_DIR" \
+      SERIALWRAP_COVERAGE_LABEL=rust-linux \
+      python3 -m pytest -q "${RUST_PYTEST_TARGETS[@]}"
+  fi
 else
   printf 'rust-blackbox\t1\n' >>"$DRIVER_TSV"
   FAILURES=1

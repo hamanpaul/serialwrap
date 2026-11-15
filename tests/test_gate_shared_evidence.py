@@ -131,6 +131,76 @@ def test_shared_failed_section_remains_fail_after_import(tmp_path):
     assert imported["status"] == "FAIL"
     assert imported["exit_code"] == 1
 
+    manifest["sections"]["pytest_full"]["exit_code"] = False
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    malformed_exit = _module().import_section(
+        shared,
+        gate="p7",
+        section="pytest_full",
+        required_set=set_id,
+        platform="linux",
+        expected_artifacts=artifacts,
+        current_head=manifest["provenance"]["git_head"],
+        worktree_clean=True,
+        destination=tmp_path / "p7-import-bool-exit",
+    )
+    assert malformed_exit["status"] == "EVIDENCE_MISSING"
+
+    for section, argv in (
+        ("p7_ab", ["bash", "scripts/rust/run_p7_ab.sh", "--unexpected", "--od59-contract"]),
+        ("s24_ab", ["-q", "tests/contract_blackbox", "tests/test_rust_contract_coverage.py", "tests/unlisted.py"]),
+    ):
+        manifest["sections"][section] = {
+            "argv": argv,
+            "exit_code": 0,
+            "files": {"log": {"path": "sections/pytest_full/pytest.log",
+                               "sha256": _sha(shared / "sections/pytest_full/pytest.log")}},
+        }
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    for section, command in (("p7_ab", "p7_ab"), ("s24_ab", "s24_ab")):
+        result = _module().validate_section(
+            shared,
+            gate="p7" if section == "p7_ab" else "slice24",
+            section=section,
+            required_set=None,
+            platform="linux",
+            expected_artifacts=artifacts,
+            current_head=manifest["provenance"]["git_head"],
+            worktree_clean=True,
+            expected_command=command,
+        )
+        assert result["status"] == "EVIDENCE_MISSING"
+
+    valid_argv = {
+        "p7_ab": [
+            "bash", "scripts/rust/run_p7_ab.sh", "--run-id", shared.name,
+            "--run-dir", str(shared / "work/p7-ab"), "--out", str(shared / "work/p7-ab.md"),
+            "--rust-cli", str(shared / "artifacts/debug_cli"),
+            "--rust-daemon", str(shared / "artifacts/debug_daemon"), "--od59-contract",
+        ],
+        "s24_ab": [
+            "-q", "tests/contract_blackbox", "tests/acceptance/l15/test_slice21_l15.py",
+            "tests/acceptance/l15/test_slice23_l15.py", "tests/test_multiagent_e2e.py",
+            "tests/test_human_agent_coexist.py", "tests/test_rust_contract_coverage.py",
+            "tests/test_transfer_golden_fresh.py",
+        ],
+    }
+    for section, command in (("p7_ab", "p7_ab"), ("s24_ab", "s24_ab")):
+        manifest["sections"][section]["argv"] = valid_argv[section]
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+        result = _module().validate_section(
+            shared,
+            gate="p7" if section == "p7_ab" else "slice24",
+            section=section,
+            required_set=None,
+            platform="linux",
+            expected_artifacts=artifacts,
+            current_head=manifest["provenance"]["git_head"],
+            worktree_clean=True,
+            expected_command=command,
+        )
+        assert result["status"] == "PASS"
+
 
 def _windows_l1_report(head: str, selector: list[str]) -> dict:
     nodeid = "cargo:sw-daemon::dispatch::one_required_case"
@@ -164,14 +234,17 @@ def _windows_l1_report(head: str, selector: list[str]) -> dict:
 
 
 def test_windows_l1_import_records_locked_selector_and_provenance(tmp_path):
-    shared, _, _, _ = _fixture(tmp_path, "p7")
+    shared, _, artifacts, _ = _fixture(tmp_path, "p7")
     head = _module().get_current_head()
     selector = ["--package", "sw-daemon", "--features", "test-fakes"]
     required_set = "test:windows_l1"
+    failed_set = "test:windows_l1_failed_case"
+    nodeid = "cargo:sw-daemon::dispatch::one_required_case"
     lock = tmp_path / "windows-lock.json"
-    lock.write_text(json.dumps({"sets": {required_set: {"windows": {
-        "selector": {"argv": selector}, "nodeids": ["cargo:sw-daemon::dispatch::one_required_case"]
-    }}}}), encoding="utf-8")
+    lock.write_text(json.dumps({"sets": {
+        set_id: {"windows": {"selector": {"argv": selector}, "nodeids": [nodeid]}}
+        for set_id in (required_set, failed_set)
+    }}), encoding="utf-8")
     source = tmp_path / "windows" / required_set / "l1-results.json"
     source.parent.mkdir(parents=True)
     source.write_text(json.dumps(_windows_l1_report(head, selector)), encoding="utf-8")
@@ -191,6 +264,25 @@ def test_windows_l1_import_records_locked_selector_and_provenance(tmp_path):
     assert section["argv"] == selector
     assert section["selectors"] == {f"{required_set}/windows": selector}
     assert section["files"]["l1-results.json"]["sha256"]
+
+    failed_report = _windows_l1_report(head, selector)
+    failed_report["counts"]["all"] = {"passed": 0, "failed": 1, "skipped": 0}
+    failed_report["results"][0]["outcome"] = "failed"
+    failed_report["results"][0]["phases"]["call"] = "failed"
+    failed_source = tmp_path / "windows" / failed_set / "l1-results.json"
+    failed_source.parent.mkdir(parents=True)
+    failed_source.write_text(json.dumps(failed_report), encoding="utf-8")
+    recorded_failure = _module().record_windows_l1(
+        shared, source_root=tmp_path / "windows", required_set=failed_set,
+        lock_path=lock, current_head=head, worktree_clean=True,
+    )
+    assert recorded_failure["status"] == "FAIL"
+    imported_failure = _module().import_section(
+        shared, gate="p7", section=f"windows_l1:{failed_set}", required_set=failed_set,
+        platform="windows", expected_artifacts=artifacts, current_head=head, worktree_clean=True,
+        destination=tmp_path / "windows-failed-import", lock_path=lock,
+    )
+    assert imported_failure["status"] == "FAIL"
 
 
 @pytest.mark.parametrize("mismatch", ("head", "dirty", "argv"))
@@ -228,6 +320,32 @@ def test_windows_l1_provenance_or_selector_mismatch_is_not_recorded(tmp_path, mi
     manifest = json.loads((shared / "manifest.json").read_text(encoding="utf-8"))
     assert f"windows_l1:{required_set}" not in manifest["sections"]
 
+    for outcome, collected, phases, counts in (
+        ("passed", ["cargo:sw-daemon::dispatch::unexpected_case"],
+         {"setup": "passed", "call": "passed", "teardown": "passed"},
+         {"passed": 1, "failed": 0, "skipped": 0}),
+        ("skipped", ["cargo:sw-daemon::dispatch::one_required_case"],
+         {"setup": "passed", "call": "skipped", "teardown": "passed"},
+         {"passed": 0, "failed": 0, "skipped": 1}),
+    ):
+        report = _windows_l1_report(head, selector)
+        report["collected"] = collected
+        report["counts"]["all"] = counts
+        report["results"][0]["outcome"] = outcome
+        report["results"][0]["phases"] = phases
+        source.write_text(json.dumps(report), encoding="utf-8")
+        invalid_result = _module().record_windows_l1(
+            shared,
+            source_root=tmp_path / "windows",
+            required_set=required_set,
+            lock_path=lock,
+            current_head=head,
+            worktree_clean=True,
+        )
+        assert invalid_result["status"] == "EVIDENCE_MISSING"
+        manifest = json.loads((shared / "manifest.json").read_text(encoding="utf-8"))
+        assert f"windows_l1:{required_set}" not in manifest["sections"]
+
 
 @pytest.mark.parametrize(
     "script,args",
@@ -249,13 +367,18 @@ def test_gate_dry_run_with_shared_evidence_exits_zero_and_skips_shared_commands(
         command.extend(args)
     proc = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=False)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "shared-evidence" in (proc.stdout + proc.stderr)
-    assert "import" in (proc.stdout + proc.stderr).lower()
+    output = proc.stdout + proc.stderr
+    assert "shared-evidence" in output
+    assert "import" in output.lower()
+    assert "artifact provenance 不符：EVIDENCE_MISSING，不啟動本地建置。" in output
+    if script == "slice24_exit.sh":
+        assert "env CARGO_INCREMENTAL=0 cargo check --workspace --target x86_64-pc-windows-gnu" in output
 
 
 def test_shared_driver_dry_run_lists_commands_without_running_them(tmp_path):
+    out_dir = "target/s2-par/gpz/i21/shared-dry-run"
     proc = subprocess.run(
-        ["bash", str(ROOT / "scripts/rust/gate_shared.sh"), "--dry-run", "--out", str(tmp_path / "shared")],
+        ["bash", str(ROOT / "scripts/rust/gate_shared.sh"), "--dry-run", "--out", out_dir, "--run-id", "dry-run"],
         cwd=ROOT,
         capture_output=True,
         text=True,
@@ -263,5 +386,7 @@ def test_shared_driver_dry_run_lists_commands_without_running_them(tmp_path):
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "cargo test --workspace" in proc.stdout
-    assert "run_p7_ab.sh --od59-contract" in proc.stdout
+    assert "run_p7_ab.sh" in proc.stdout
+    assert "--od59-contract" in proc.stdout
     assert "pytest -q tests/" in proc.stdout
+    assert str(ROOT / out_dir / "dry-run") in proc.stdout

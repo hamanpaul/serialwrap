@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Slice 2.3（P7）出口 gate 編排（08-slice23-login-events.md Task 19 Step 3）。
 #
-# 用法：scripts/rust/p7_gate.sh [--run-id ID] [--out-md PATH] [--skip-full-pytest]
+# 用法：scripts/rust/p7_gate.sh [--dry-run] [--shared-evidence DIR] [--run-id ID] [--out-md PATH] [--skip-full-pytest]
 #   建立 target/p7-gate/<run_id>/，依序執行並以 `p7_gate_report.py record` 記錄每個子程序的 argv、rc、時間、log
 #   （落檔＋sha256）、測試計數與 evidence；測試列另附 required_set（`p7_gate:<列名 slug>`）與 l1_results。
 #   本腳本只「執行並記錄」，列狀態一律由 scripts/rust/p7_gate_report.py 計算。全部子程序結束後才 `build` 寫出
@@ -12,12 +12,17 @@
 #   - --skip-full-pytest：不跑 `python3 -m pytest -q tests/`（該列記為未執行 → INCOMPLETE；僅供除錯，不得作出口證據）。
 # 結束碼：報告結論 PASS（含 BLOCKED-OWNER）且 verify 無不一致 → 0；否則 1；參數錯誤 → 2。
 set -euo pipefail
+export CARGO_INCREMENTAL=0
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUN_ID="$(date +%y%m%d-%H%M%S)"
 OUT_MD=""
 SKIP_FULL=0
+DRY_RUN=0
+SHARED_EVIDENCE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --shared-evidence) [[ $# -ge 2 ]] || { echo "p7_gate.sh: --shared-evidence 缺少值" >&2; exit 2; }; SHARED_EVIDENCE="$2"; shift 2 ;;
     --run-id) RUN_ID="$2"; shift 2 ;;
     --out-md) OUT_MD="$2"; shift 2 ;;
     --skip-full-pytest) SKIP_FULL=1; shift ;;
@@ -26,6 +31,22 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "p7_gate.sh: --run-id 只允許英數與 ._-" >&2; exit 2; }
+if [[ "$DRY_RUN" == "1" ]]; then
+  echo "p7_gate.sh dry-run：只列出計畫，不執行命令。"
+  if [[ -n "$SHARED_EVIDENCE" ]]; then
+    echo "shared-evidence import：debug/release artifacts、cargo_fakes_p7、pytest_full、p7_ab 與 Windows L1（$SHARED_EVIDENCE）；selector/provenance/SHA 不符記 EVIDENCE_MISSING，FAIL 照傳且不重跑。artifact provenance 不符：EVIDENCE_MISSING，不啟動本地建置。"
+  else
+    echo "執行：cargo build --workspace --bins；cargo build --release -p sw-daemon -p sw-cli --target x86_64-unknown-linux-gnu。"
+    echo "執行：python3 scripts/rust/cargo_l1_results.py --platform linux -- --workspace --features test-fakes。"
+    echo "執行：bash scripts/rust/run_p7_ab.sh --run-id <ID> --run-dir <RUN>/ab --out <RUN>/p7-ab.md --rust-cli <CLI> --rust-daemon <DAEMON> --od59-contract。"
+    echo "執行：bash scripts/rust/win-test.sh --package sw-pal --package sw-core --package sw-daemon -- --features test-fakes -- --skip cap_。"
+    echo "執行：bash scripts/rust/win-test.sh --caps windows_com --package sw-daemon -- --test cap_windows_com_p7 --features test-fakes -- --ignored cap_windows_com__（僅允許已核准 com0com pair）。"
+    echo "執行：python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence。"
+  fi
+  echo "執行：python3 scripts/rust/check_cfg_boundary.py；python3 tests/acceptance/regen_lock.py --check；python3 scripts/rust/p7_case_coverage.py；python3 -m policy_check --repo .。"
+  echo "執行：python3 scripts/rust/p7_gate_report.py build 與 verify；prior slice、func-test、coverage 段依目前輸入補齊。"
+  exit 0
+fi
 RUN="$ROOT/target/p7-gate/$RUN_ID"
 [[ ! -e "$RUN/results.json" ]] || { echo "p7_gate.sh: $RUN 已存在，拒絕覆寫（請換 --run-id）" >&2; exit 2; }
 mkdir -p "$RUN/logs"
@@ -95,21 +116,82 @@ record_existing() {
     --started-at "$(now)" --ended-at "$(now)" "${extra[@]}" $([[ ${#ev[@]} -gt 0 ]] && echo --evidence) "${ev[@]}"
 }
 
-# 0. 受測 artifact：Rust CLI＋daemon（非 test-fakes）。先前切片 gate 使用 release daemon，另建同類型
-#    release 快照供來源 SHA 綁定；不放入一般 artifacts，避免混淆本次黑箱受測 debug daemon。
-CARGO_TARGET_DIR="$TARGET_DIR" cargo build --workspace --bins >"$RUN/logs/build.log" 2>&1 || { echo "p7_gate.sh: cargo build 失敗（$RUN/logs/build.log）" >&2; exit 1; }
-mkdir -p "$RUN/artifacts" "$RUN/prior-slice-artifacts"
-cp -p "$TARGET_DIR/debug/serialwrap" "$RUST_CLI"
-cp -p "$TARGET_DIR/debug/serialwrapd" "$RUST_D"
-CARGO_TARGET_DIR="$TARGET_DIR" cargo build --release -p sw-daemon -p sw-cli --target x86_64-unknown-linux-gnu \
-  >"$RUN/logs/build-prior-slice-release.log" 2>&1 || {
-  echo "p7_gate.sh: slice21 同類型 release 建置失敗（$RUN/logs/build-prior-slice-release.log）" >&2
-  exit 1
+SHARED_WIN_RC=""
+import_shared_windows_l1() {  # import_shared_windows_l1 <required-set> <destination>
+  local set_id="$1" destination="$2" result="$RUN/logs/shared-windows-${set_id}.json"
+  [[ "$SHARED_ARTIFACTS_VALID" == "1" ]] || return 3
+  if ! python3 scripts/rust/gate_shared_evidence.py import-section --shared-evidence "$SHARED_EVIDENCE" \
+      --gate p7 --section "windows_l1:$set_id" --required-set "$set_id" --platform windows \
+      "${SHARED_ARTIFACT_ARGS[@]}" --out-dir "$destination" \
+      >"$result" 2>"$RUN/logs/shared-windows-${set_id}.stderr"; then
+    return 3
+  fi
+  SHARED_WIN_RC="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["exit_code"])' "$result")"
+  return 0
 }
-cp -p "$TARGET_DIR/x86_64-unknown-linux-gnu/release/serialwrapd" "$PRIOR_RELEASE_D"
+
+mkdir -p "$RUN/artifacts" "$RUN/prior-slice-artifacts"
+SHARED_ARTIFACTS_VALID=0
+SHARED_ARTIFACT_ARGS=()
+if [[ -n "$SHARED_EVIDENCE" ]]; then
+  if python3 scripts/rust/gate_shared_evidence.py import-artifacts \
+      --shared-evidence "$SHARED_EVIDENCE" --out-dir "$RUN/shared-artifact-import" \
+      >"$RUN/logs/shared-artifacts.json" 2>"$RUN/logs/shared-artifacts.stderr"; then
+    cp -p "$RUN/shared-artifact-import/debug_cli" "$RUST_CLI"
+    cp -p "$RUN/shared-artifact-import/debug_daemon" "$RUST_D"
+    cp -p "$RUN/shared-artifact-import/release_daemon" "$PRIOR_RELEASE_D"
+    SHARED_ARTIFACT_ARGS=(--artifact "debug_cli=$RUN/shared-artifact-import/debug_cli" \
+      --artifact "debug_daemon=$RUN/shared-artifact-import/debug_daemon" \
+      --artifact "release_cli=$RUN/shared-artifact-import/release_cli" \
+      --artifact "release_daemon=$RUN/shared-artifact-import/release_daemon")
+    SHARED_ARTIFACTS_VALID=1
+  else
+    echo "EVIDENCE_MISSING：共用 artifact provenance 不符；不在本 gate 重建。" >"$RUN/logs/shared-artifacts.log"
+  fi
+else
+  CARGO_TARGET_DIR="$TARGET_DIR" CARGO_INCREMENTAL=0 cargo build --workspace --bins >"$RUN/logs/build.log" 2>&1 || {
+    echo "p7_gate.sh: cargo build 失敗（$RUN/logs/build.log）" >&2; exit 1;
+  }
+  cp -p "$TARGET_DIR/debug/serialwrap" "$RUST_CLI"
+  cp -p "$TARGET_DIR/debug/serialwrapd" "$RUST_D"
+  CARGO_TARGET_DIR="$TARGET_DIR" CARGO_INCREMENTAL=0 cargo build --release -p sw-daemon -p sw-cli \
+    --target x86_64-unknown-linux-gnu >"$RUN/logs/build-prior-slice-release.log" 2>&1 || {
+    echo "p7_gate.sh: slice21 同類型 release 建置失敗（$RUN/logs/build-prior-slice-release.log）" >&2; exit 1;
+  }
+  cp -p "$TARGET_DIR/x86_64-unknown-linux-gnu/release/serialwrapd" "$PRIOR_RELEASE_D"
+fi
+SHARED_WIN_NONCOM_IMPORTED=0
+SHARED_WIN_COM_IMPORTED=0
+SHARED_WIN_NONCOM_RC=""
+SHARED_WIN_COM_RC=""
+if [[ -n "$SHARED_EVIDENCE" && "$SHARED_ARTIFACTS_VALID" == "1" ]]; then
+  mkdir -p "$RUN/win-non-com" "$RUN/win-com"
+  if import_shared_windows_l1 s21_core "$RUN/shared-windows-s21-core"; then
+    cp "$RUN/shared-windows-s21-core/l1-results.json" "$RUN/win-non-com/l1-results.json"
+    SHARED_WIN_NONCOM_IMPORTED=1
+    SHARED_WIN_NONCOM_RC="$SHARED_WIN_RC"
+  fi
+  if import_shared_windows_l1 p7_gate:win-test-sh-caps-windows-com "$RUN/shared-windows-p7-com"; then
+    cp "$RUN/shared-windows-p7-com/l1-results.json" "$RUN/win-com/l1-results.json"
+    SHARED_WIN_COM_IMPORTED=1
+    SHARED_WIN_COM_RC="$SHARED_WIN_RC"
+  fi
+fi
 CAPS=()
 if ! [[ -n "${WSL_DISTRO_NAME:-}" || -e /proc/sys/fs/binfmt_misc/WSLInterop ]]; then CAPS+=(windows_native windows_com); fi
 [[ -n "${SW_TEST_COM_PAIR:-}" ]] || CAPS+=(windows_com)
+if [[ -n "$SHARED_EVIDENCE" ]]; then
+  [[ "$SHARED_WIN_NONCOM_IMPORTED" == "1" ]] || CAPS+=(windows_native)
+  [[ "$SHARED_WIN_COM_IMPORTED" == "1" ]] || CAPS+=(windows_com)
+fi
+FILTERED_CAPS=()
+for cap in "${CAPS[@]}"; do
+  [[ "$cap" == windows_native && "$SHARED_WIN_NONCOM_IMPORTED" == "1" ]] && continue
+  [[ "$cap" == windows_com && "$SHARED_WIN_COM_IMPORTED" == "1" ]] && continue
+  if [[ -n "$SHARED_EVIDENCE" && " ${FILTERED_CAPS[*]} " == *" $cap "* ]]; then continue; fi
+  FILTERED_CAPS+=("$cap")
+done
+CAPS=("${FILTERED_CAPS[@]}")
 "${REPORT[@]}" init --results-dir "$RUN" --run-id "$RUN_ID" --caps-missing "${CAPS[@]}" \
   --artifact "$RUST_CLI" "$RUST_D" --prior-slice-artifact serialwrapd_release "$PRIOR_RELEASE_D"
 
@@ -128,9 +210,29 @@ run_row "check_cfg_boundary" check-cfg-boundary --evidence "$RUN/logs/check-cfg-
   python3 scripts/rust/check_cfg_boundary.py
 # 2. Linux L1（p7_gate:cargo-test-workspace）
 mkdir -p "$RUN/cargo-test-workspace"
-run_row "cargo test --workspace" cargo-test-workspace --l1 "$RUN/cargo-test-workspace/l1-results.json" -- \
-  python3 scripts/rust/cargo_l1_results.py --platform linux --out "$RUN/cargo-test-workspace/l1-results.json" \
-  -- --workspace --features test-fakes
+if [[ -n "$SHARED_EVIDENCE" ]]; then
+  SHARED_CARGO_JSON="$RUN/logs/shared-cargo-p7-import.json"
+  if [[ "$SHARED_ARTIFACTS_VALID" == 1 ]] && python3 scripts/rust/gate_shared_evidence.py import-section \
+      --shared-evidence "$SHARED_EVIDENCE" --gate p7 --section cargo_fakes_p7 \
+      --required-set p7_gate:cargo-test-workspace --platform linux \
+      "${SHARED_ARTIFACT_ARGS[@]}" --out-dir "$RUN/shared-import" \
+      >"$SHARED_CARGO_JSON" 2>"$RUN/logs/shared-cargo-p7-import.stderr"; then
+    cp "$RUN/shared-import/p7_gate/cargo-test-workspace/l1-results.json" "$RUN/cargo-test-workspace/l1-results.json"
+    cp "$RUN/shared-import/logs/cargo-fakes-p7.log" "$RUN/logs/cargo-test-workspace.log"
+    SHARED_RC="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["exit_code"])' "$SHARED_CARGO_JSON")"
+    record_existing "cargo test --workspace" "$SHARED_RC" "$RUN/logs/cargo-test-workspace.log" \
+      '["cargo","test","--workspace","--features","test-fakes"]' --l1 "$RUN/cargo-test-workspace/l1-results.json"
+  else
+    echo "EVIDENCE_MISSING：共用 cargo 證據拒收；本段不重跑。" >"$RUN/logs/cargo-test-workspace.log"
+    cat "$RUN/logs/shared-cargo-p7-import.stderr" >>"$RUN/logs/cargo-test-workspace.log" 2>/dev/null || true
+    record_existing "cargo test --workspace" - "$RUN/logs/cargo-test-workspace.log" \
+      '["cargo","test","--workspace","--features","test-fakes"]'
+  fi
+else
+  run_row "cargo test --workspace" cargo-test-workspace --l1 "$RUN/cargo-test-workspace/l1-results.json" -- \
+    python3 scripts/rust/cargo_l1_results.py --platform linux --out "$RUN/cargo-test-workspace/l1-results.json" \
+    -- --workspace --features test-fakes
+fi
 # 3／4. Windows 原生（non-COM 與 COM pair）；能力缺失時只記錄，由報告判 BLOCKED-OWNER。
 win_l1() {  # win_l1 <dir> <該次 win-test log>：只匯入本次命令明列的 report
   local dir="$1" log="$2" rep l1
@@ -169,7 +271,18 @@ mkdir -p "$RUN/win-non-com" "$RUN/win-com"
 # `p7_gate:win-test-sh-caps-windows-com`（windows）以同一 argv 為 selector，於原生 Windows 收集登記（P7-LW-9）。
 WIN_NONCOM_ARGS=(--package sw-pal --package sw-core --package sw-daemon -- --features test-fakes -- --skip cap_)
 WIN_COM_ARGS=(--caps windows_com --package sw-daemon -- --test cap_windows_com_p7 --features test-fakes -- --ignored cap_windows_com__)
-if [[ " ${CAPS[*]} " == *" windows_native "* ]]; then
+if [[ -n "$SHARED_EVIDENCE" ]]; then
+  if [[ "$SHARED_WIN_NONCOM_IMPORTED" == "1" ]]; then
+    echo "已匯入 shared-evidence windows_l1:s21_core；未啟動 Windows runner。" >"$RUN/logs/win-non-com.log"
+    record_existing "win-test.sh (non-COM)" "$SHARED_WIN_NONCOM_RC" "$RUN/logs/win-non-com.log" \
+      "$(argv_json scripts/rust/win-test.sh "${WIN_NONCOM_ARGS[@]}")" --l1 "$RUN/win-non-com/l1-results.json" --platform-windows
+  else
+    echo "EVIDENCE_MISSING：共用 s21_core Windows L1 缺失或 provenance／selector 不符；本段不重跑。" >"$RUN/logs/win-non-com.log"
+    cat "$RUN/logs/shared-windows-s21_core.stderr" >>"$RUN/logs/win-non-com.log" 2>/dev/null || true
+    record_existing "win-test.sh (non-COM)" - "$RUN/logs/win-non-com.log" \
+      "$(argv_json scripts/rust/win-test.sh "${WIN_NONCOM_ARGS[@]}")" --platform-windows
+  fi
+elif [[ " ${CAPS[*]} " == *" windows_native "* ]]; then
   echo "caps_missing: windows_native（非 WSL interop 環境；LOCAL-WINDOWS-TODO）" >"$RUN/logs/win-non-com.log"
   record_existing "win-test.sh (non-COM)" - "$RUN/logs/win-non-com.log" '["scripts/rust/win-test.sh"]'
 else
@@ -178,7 +291,18 @@ else
   record_existing "win-test.sh (non-COM)" "$LAST_RC" "$RUN/logs/win-non-com.log" \
     "$(argv_json scripts/rust/win-test.sh "${WIN_NONCOM_ARGS[@]}")" --l1 "$RUN/win-non-com/l1-results.json" --platform-windows
 fi
-if [[ " ${CAPS[*]} " == *" windows_com "* ]]; then
+if [[ -n "$SHARED_EVIDENCE" ]]; then
+  if [[ "$SHARED_WIN_COM_IMPORTED" == "1" ]]; then
+    echo "已匯入 shared-evidence windows_l1:p7_gate:win-test-sh-caps-windows-com；未啟動 Windows runner。" >"$RUN/logs/win-com.log"
+    record_existing "win-test.sh --caps windows_com" "$SHARED_WIN_COM_RC" "$RUN/logs/win-com.log" \
+      "$(argv_json scripts/rust/win-test.sh "${WIN_COM_ARGS[@]}")" --l1 "$RUN/win-com/l1-results.json" --platform-windows
+  else
+    echo "EVIDENCE_MISSING：共用 p7 Windows COM L1 缺失或 provenance／selector 不符；本段不重跑。" >"$RUN/logs/win-com.log"
+    cat "$RUN/logs/shared-windows-p7_gate:win-test-sh-caps-windows-com.stderr" >>"$RUN/logs/win-com.log" 2>/dev/null || true
+    record_existing "win-test.sh --caps windows_com" - "$RUN/logs/win-com.log" \
+      "$(argv_json scripts/rust/win-test.sh "${WIN_COM_ARGS[@]}")" --platform-windows
+  fi
+elif [[ " ${CAPS[*]} " == *" windows_com "* ]]; then
   echo "caps_missing: windows_com（未設 SW_TEST_COM_PAIR 或無 Windows；B-06 擁有者 host COM20:COM21）" >"$RUN/logs/win-com.log"
   record_existing "win-test.sh --caps windows_com" - "$RUN/logs/win-com.log" '["scripts/rust/win-test.sh","--caps","windows_com"]'
 else
@@ -192,12 +316,29 @@ fi
 # 5～12. 黑箱 A/B、先前切片必要回歸、func-test 兩案（run_p7_ab.sh 一次產出，逐階段成列）。
 AB="$RUN/ab"
 AB_MD="$RUN/p7-ab.md"
-set +e
-bash scripts/rust/run_p7_ab.sh --run-id "$RUN_ID" --run-dir "$AB" --out "$AB_MD" --rust-cli "$RUST_CLI" \
-  --od59-contract \
-  --rust-daemon "$RUST_D" >"$RUN/logs/run-p7-ab.log" 2>&1
-AB_RC=$?
-set -e
+if [[ -n "$SHARED_EVIDENCE" ]]; then
+  mkdir -p "$AB"
+  SHARED_AB_JSON="$RUN/logs/shared-p7-ab-import.json"
+  if [[ "$SHARED_ARTIFACTS_VALID" == 1 ]] && python3 scripts/rust/gate_shared_evidence.py import-section \
+      --shared-evidence "$SHARED_EVIDENCE" --gate p7 --section p7_ab --expected-command p7_ab --platform linux \
+      "${SHARED_ARTIFACT_ARGS[@]}" \
+      --out-dir "$RUN/shared-import" >"$SHARED_AB_JSON" 2>"$RUN/logs/shared-p7-ab-import.stderr"; then
+    tar -xzf "$RUN/shared-import/p7_gate/ab.tar.gz" -C "$AB"
+    [[ ! -f "$AB/p7-ab.md" ]] || cp "$AB/p7-ab.md" "$AB_MD"
+    cp "$RUN/shared-import/logs/p7-ab.log" "$RUN/logs/run-p7-ab.log"
+    AB_RC="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["exit_code"])' "$SHARED_AB_JSON")"
+  else
+    echo "EVIDENCE_MISSING：共用 p7 A/B 證據拒收；本段不重跑。" >"$RUN/logs/run-p7-ab.log"
+    cat "$RUN/logs/shared-p7-ab-import.stderr" >>"$RUN/logs/run-p7-ab.log" 2>/dev/null || true
+    AB_RC=3
+  fi
+else
+  set +e
+  bash scripts/rust/run_p7_ab.sh --run-id "$RUN_ID" --run-dir "$AB" --out "$AB_MD" --rust-cli "$RUST_CLI" \
+    --od59-contract --rust-daemon "$RUST_D" >"$RUN/logs/run-p7-ab.log" 2>&1
+  AB_RC=$?
+  set -e
+fi
 echo "run_p7_ab.sh rc=$AB_RC" >>"$RUN/logs/run-p7-ab.log"
 phase_row() {  # phase_row <列名> <階段目錄名>
   local d="$AB/$2" rc="-"
@@ -264,8 +405,30 @@ run_row "cases.lock slice_2.3 coverage" coverage "${COV_EV[@]}" -- \
   python3 scripts/rust/p7_case_coverage.py "${COV_ARGS[@]}"
 # 15. 全套 pytest（N3；依 2026-11-12 rulings/s2.md 第 3 點，比照 CI 排除兩項 Stage 1 證據測試；其他失敗 → FAIL）
 mkdir -p "$RUN/pytest-full"
+FULL_PYTEST_ROW='python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence'
 if [[ "$SKIP_FULL" == "1" ]]; then
   echo "--skip-full-pytest：未執行（不得作出口證據）" >"$RUN/logs/pytest-full.log"
+elif [[ -n "$SHARED_EVIDENCE" ]]; then
+  SHARED_PYTEST_JSON="$RUN/logs/shared-pytest-import.json"
+  if [[ "$SHARED_ARTIFACTS_VALID" == 1 ]] && python3 scripts/rust/gate_shared_evidence.py import-section \
+      --shared-evidence "$SHARED_EVIDENCE" --gate p7 --section pytest_full \
+      --required-set p7_gate:python3-m-pytest-q-tests --platform linux \
+      "${SHARED_ARTIFACT_ARGS[@]}" --out-dir "$RUN/shared-import" \
+      >"$SHARED_PYTEST_JSON" 2>"$RUN/logs/shared-pytest-import.stderr"; then
+    mkdir -p "$RUN/pytest-full"
+    cp "$RUN/shared-import/p7_gate/pytest-full/l1-results.json" "$RUN/pytest-full/l1-results.json"
+    cp "$RUN/shared-import/p7_gate/pytest-full/junit.xml" "$RUN/pytest-full/junit.xml"
+    cp "$RUN/shared-import/logs/pytest-full.log" "$RUN/logs/pytest-full.log"
+    SHARED_RC="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["exit_code"])' "$SHARED_PYTEST_JSON")"
+    record_existing "$FULL_PYTEST_ROW" "$SHARED_RC" "$RUN/logs/pytest-full.log" \
+      "$(argv_json -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence)" \
+      --l1 "$RUN/pytest-full/l1-results.json" --evidence "$RUN/pytest-full/junit.xml"
+  else
+    echo "EVIDENCE_MISSING：共用 pytest 證據拒收；本段不重跑。" >"$RUN/logs/pytest-full.log"
+    cat "$RUN/logs/shared-pytest-import.stderr" >>"$RUN/logs/pytest-full.log" 2>/dev/null || true
+    record_existing "$FULL_PYTEST_ROW" - "$RUN/logs/pytest-full.log" \
+      "$(argv_json -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence)"
+  fi
 else
   run_row "python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence" pytest-full --l1 "$RUN/pytest-full/l1-results.json" \
     --evidence "$RUN/pytest-full/junit.xml" -- \

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Slice 2.2 出口證據編排：補跑鎖定的 Python parity、驗證 L1.5 daemon 身分與候選建置、匯入 Windows 證據並判定。
 set -euo pipefail
+export CARGO_INCREMENTAL=0
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+cd "$ROOT"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-s22"
 OUT_ROOT="$ROOT/target/s22-gate"
 L1_DIR=""
@@ -12,6 +14,7 @@ DAEMON_PATH="${SERIALWRAP_L15_RUST_DAEMON:-}"
 BUILD_EXIT=""
 BUILT_DAEMON_SHA256=""
 DRY_RUN=0
+SHARED_EVIDENCE=""
 
 while (($#)); do
   case "$1" in
@@ -24,8 +27,9 @@ while (($#)); do
     --build-linux-exit) [[ $# -ge 2 ]] || { echo "s22_gate.sh: --build-linux-exit 缺少值" >&2; exit 2; }; BUILD_EXIT="$2"; shift 2 ;;
     --built-daemon-sha256) [[ $# -ge 2 ]] || { echo "s22_gate.sh: --built-daemon-sha256 缺少值" >&2; exit 2; }; BUILT_DAEMON_SHA256="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
+    --shared-evidence) [[ $# -ge 2 ]] || { echo "s22_gate.sh: --shared-evidence 缺少值" >&2; exit 2; }; SHARED_EVIDENCE="$2"; shift 2 ;;
     -h|--help)
-      printf '%s\n' '用法：scripts/rust/s22_gate.sh [--dry-run] [--run-id ID] [--out DIR] [--l1-results-dir DIR] [--windows-dir DIR] [--selftest-report FILE] [--daemon-path FILE] [--build-linux-exit N] [--built-daemon-sha256 SHA256]'
+      printf '%s\n' '用法：scripts/rust/s22_gate.sh [--dry-run] [--shared-evidence DIR] [--run-id ID] [--out DIR] [--l1-results-dir DIR] [--windows-dir DIR] [--selftest-report FILE] [--daemon-path FILE] [--build-linux-exit N] [--built-daemon-sha256 SHA256]'
       exit 0 ;;
     *) echo "s22_gate.sh: 未知參數 $1" >&2; exit 2 ;;
   esac
@@ -37,10 +41,90 @@ REPORT="$RUN_DIR/s22-gate.json"
 [[ ! -e "$REPORT" ]] || { echo "s22_gate.sh: $REPORT 已存在，拒絕覆寫" >&2; exit 2; }
 mkdir -p "$RUN_DIR/logs"
 [[ -n "$L1_DIR" ]] || L1_DIR="$RUN_DIR/l1-results"
+if [[ "$DRY_RUN" == "1" && -n "$SHARED_EVIDENCE" ]]; then
+  echo "shared-evidence import：debug/release artifacts、cargo_fakes_filtered、可用的 s22 Windows 原生 L1（$SHARED_EVIDENCE）；selector/provenance 不符即 EVIDENCE_MISSING，不重跑。artifact provenance 不符：EVIDENCE_MISSING，不啟動本地建置。"
+fi
+if [[ "$DRY_RUN" == "1" ]]; then
+  if [[ -z "$SHARED_EVIDENCE" ]]; then
+    echo "執行：python3 scripts/rust/cargo_l1_results.py --platform linux -- --workspace --features test-fakes -- --skip cap_。"
+  fi
+  python3 - "$ROOT/tests/acceptance/l1_required.lock.json" <<'PY'
+import json
+import shlex
+import sys
+from pathlib import Path
+
+lock = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+for section in ("parity_py", "py_parity"):
+    selector = lock["sets"][f"s22_gate:{section}"]["linux"]["selector"]["argv"]
+    print("執行：python3 -m pytest " + shlex.join(selector))
+PY
+  echo "執行：python3 func-test/runner.py <s22_gate_check.py 逐案列出的 L1.5 selector>（Python/Rust 各一列；需符合 daemon identity）。"
+  echo "匯入：Windows L1 與 --windows-dir 的 owner 證據；shared 模式不啟動 Windows runner。"
+  echo "執行：python3 scripts/rust/s22_gate_check.py --l1-results <DIR> --map tests/acceptance/slice22_evidence_map.yaml --lock tests/acceptance/l1_required.lock.json --l15-results <FILE> --dry-run。"
+  exit 0
+fi
+SHARED_ARTIFACTS_VALID=0
+SHARED_ARTIFACT_DIR="$RUN_DIR/shared-artifacts"
+SHARED_ARTIFACT_ARGS=()
+if [[ "$DRY_RUN" != "1" && -n "$SHARED_EVIDENCE" ]]; then
+  if python3 scripts/rust/gate_shared_evidence.py import-artifacts --shared-evidence "$SHARED_EVIDENCE" \
+      --out-dir "$SHARED_ARTIFACT_DIR" >"$RUN_DIR/logs/shared-artifacts.json" \
+      2>"$RUN_DIR/logs/shared-artifacts.stderr"; then
+    SHARED_ARTIFACTS_VALID=1
+    [[ -n "$DAEMON_PATH" ]] || DAEMON_PATH="$SHARED_ARTIFACT_DIR/release_daemon"
+    [[ -n "$BUILD_EXIT" ]] || BUILD_EXIT=0
+    [[ -n "$BUILT_DAEMON_SHA256" ]] || BUILT_DAEMON_SHA256="$(sha256sum "$DAEMON_PATH" | cut -d' ' -f1)"
+    export SERIALWRAP_L15_RUST_DAEMON="$DAEMON_PATH"
+    SHARED_ARTIFACT_ARGS=(--artifact "debug_cli=$SHARED_ARTIFACT_DIR/debug_cli" \
+      --artifact "debug_daemon=$SHARED_ARTIFACT_DIR/debug_daemon" \
+      --artifact "release_cli=$SHARED_ARTIFACT_DIR/release_cli" \
+      --artifact "release_daemon=$DAEMON_PATH")
+  fi
+fi
+if [[ "$DRY_RUN" != "1" && -n "$SHARED_EVIDENCE" ]]; then
+  IMPORT_DIR="$RUN_DIR/shared-import"
+  IMPORT_JSON="$RUN_DIR/logs/shared-cargo-import.json"
+  mkdir -p "$L1_DIR/cargo_workspace/linux"
+  if [[ "$SHARED_ARTIFACTS_VALID" == "1" ]] && python3 scripts/rust/gate_shared_evidence.py import-section --shared-evidence "$SHARED_EVIDENCE" \
+      --gate s22 --section cargo_fakes_filtered --required-set s22_gate:cargo_workspace --platform linux \
+      "${SHARED_ARTIFACT_ARGS[@]}" --out-dir "$IMPORT_DIR" \
+      >"$IMPORT_JSON" 2>"$RUN_DIR/logs/shared-cargo-import.stderr"; then
+    cp "$IMPORT_DIR/s22_gate/cargo_workspace/linux/resource-report.json" \
+      "$L1_DIR/cargo_workspace/linux/resource-report.json"
+    cp "$IMPORT_DIR/logs/cargo-fakes-filtered.log" "$RUN_DIR/logs/shared-cargo-workspace.log"
+  else
+    echo "EVIDENCE_MISSING：共用 cargo 證據拒收；本段不重跑。" >"$RUN_DIR/logs/shared-cargo-workspace.log"
+    cat "$RUN_DIR/logs/shared-cargo-import.stderr" >>"$RUN_DIR/logs/shared-cargo-workspace.log" || true
+  fi
+fi
+
+if [[ "$DRY_RUN" != "1" && -n "$SHARED_EVIDENCE" && "$SHARED_ARTIFACTS_VALID" == "1" ]]; then
+  for section in windows_cap_windows_com windows_cap_windows_com_daemon; do
+    set_id="s22_gate:$section"
+    import_dir="$RUN_DIR/shared-import-$section"
+    result="$RUN_DIR/logs/shared-$section-import.json"
+    if python3 scripts/rust/gate_shared_evidence.py import-section \
+        --shared-evidence "$SHARED_EVIDENCE" --gate s22 --section "windows_l1:$set_id" \
+        --required-set "$set_id" --platform windows "${SHARED_ARTIFACT_ARGS[@]}" \
+        --out-dir "$import_dir" >"$result" 2>"$RUN_DIR/logs/shared-$section-import.stderr"; then
+      report="$L1_DIR/$section/windows/resource-report.json"
+      mkdir -p "$(dirname "$report")"
+      cp "$import_dir/l1-results.json" "$report"
+      printf '已匯入 shared-evidence windows_l1:%s；未啟動 Windows runner.\n' "$set_id" \
+        >"$RUN_DIR/logs/import-$section.log"
+    else
+      printf 'EVIDENCE_MISSING：共用 Windows L1 拒收；本段不重跑。\n' >"$RUN_DIR/logs/import-$section.log"
+      cat "$RUN_DIR/logs/shared-$section-import.stderr" >>"$RUN_DIR/logs/import-$section.log" || true
+    fi
+  done
+fi
 
 set +e
+SHARED_EVIDENCE_FLAG=0
+[[ -n "$SHARED_EVIDENCE" ]] && SHARED_EVIDENCE_FLAG=1
 python3 - "$ROOT" "$RUN_DIR" "$L1_DIR" "$WINDOWS_DIR" "$SELFTEST_REPORT" "$DAEMON_PATH" \
-  "$BUILD_EXIT" "$BUILT_DAEMON_SHA256" "$DRY_RUN" <<'PY'
+  "$BUILD_EXIT" "$BUILT_DAEMON_SHA256" "$DRY_RUN" "$SHARED_EVIDENCE_FLAG" <<'PY'
 from __future__ import annotations
 
 import hashlib
@@ -65,6 +149,7 @@ daemon_path = pathlib.Path(sys.argv[6]).resolve() if sys.argv[6] else None
 build_exit = int(sys.argv[7]) if sys.argv[7] else None
 built_sha = sys.argv[8] or None
 dry_run = sys.argv[9] == "1"
+shared_evidence = sys.argv[10] == "1"
 if daemon_path is not None and not daemon_path.is_relative_to(root):
     print(f"EVIDENCE_MISSING: 候選 daemon 必須位於此 worktree：{daemon_path}", file=sys.stderr)
     daemon_path = None
@@ -90,7 +175,9 @@ def run_logged(label: str, argv: list[str], env: dict[str, str]) -> int:
 def import_windows_reports() -> None:
     if windows_dir is None:
         return
-    for section in ("win_test", "windows_cap_windows_com", "windows_cap_windows_com_daemon"):
+    sections = ("win_test",) if shared_evidence else (
+        "win_test", "windows_cap_windows_com", "windows_cap_windows_com_daemon")
+    for section in sections:
         source = windows_dir / section / "windows" / "resource-report.json"
         if not source.is_file():
             (logs_dir / f"import-{section}.log").write_text(
