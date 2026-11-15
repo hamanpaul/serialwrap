@@ -351,10 +351,11 @@ def test_unchecked_only_case_is_insufficient(tmp_path: Path) -> None:
 
     def run_row(directory: Path, implementation: str, outcome: str = "passed", *, missing: bool = False) -> dict:
         artifact = directory / f"{implementation}-daemon"
-        artifact.parent.mkdir(parents=True, exist_ok=True)
         if not missing:
-            artifact.write_bytes(f"{implementation} candidate daemon".encode())
-        digest = hashlib.sha256(artifact.read_bytes()).hexdigest() if artifact.is_file() else "0" * 64
+            artifact, digest = _write_l15_artifact(artifact, implementation)
+        else:
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            digest = "0" * 64
         return {"ref": FUNC_REF, "implementation": implementation, "outcome": outcome,
                 "exit_code": 0 if outcome == "passed" else 1,
                 "daemon_path": str(artifact), "daemon_sha256": digest}
@@ -362,7 +363,11 @@ def test_unchecked_only_case_is_insufficient(tmp_path: Path) -> None:
     passed = {"format": "s22-l15-results.v1", "runs": [
         run_row(tmp_path / "daemons", "python"), run_row(tmp_path / "daemons", "rust")
     ]}
-    rc, out = _run(tmp_path / "b", _good_reports(), emap=emap, l15=passed)
+    rust_run = next(row for row in passed["runs"] if row["implementation"] == "rust")
+    candidate_path = Path(rust_run["daemon_path"])
+    rc, out = _run(tmp_path / "b", _good_reports(), emap=emap, l15=passed,
+                   daemon_path=candidate_path, build_linux_exit=0,
+                   built_daemon_sha256=rust_run["daemon_sha256"])
     assert _case(out, "co-01-line-buffering")["status"] == "PASS" and rc == 0, out
     failed = {"format": "s22-l15-results.v1", "runs": [
         run_row(tmp_path / "failed-daemons", "python"),
@@ -379,6 +384,55 @@ def test_unchecked_only_case_is_insufficient(tmp_path: Path) -> None:
     dup = {"format": "s22-l15-results.v1", "runs": [passed["runs"][0], passed["runs"][0]]}
     rc, out = _run(tmp_path / "d", _good_reports(), emap=emap, l15=dup)
     assert _case(out, "co-01-line-buffering")["status"] == "INSUFFICIENT" and rc == 1
+
+
+def _write_l15_artifact(path: Path, kind: str) -> tuple[Path, str]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = (b"#!/bin/sh\nexec python3 ./serialwrapd.py \"$@\"\n" if kind == "python"
+               else b"\x7fELF rust-daemon fixture")
+    path.write_bytes(content)
+    return path, hashlib.sha256(content).hexdigest()
+
+
+def _l15_run(ref: str, implementation: str, path: Path, digest: str) -> dict:
+    return {"ref": ref, "implementation": implementation, "outcome": "passed", "exit_code": 0,
+            "daemon_path": str(path), "daemon_sha256": digest}
+
+
+def test_l15_rejects_two_python_launchers_labeled_python_and_rust(tmp_path: Path) -> None:
+    """L1.5 身分取自實際 artifact；兩份不同路徑的 Python wrapper 不能偽裝成 Python＋Rust。"""
+    emap = _emap()
+    emap["cases"]["co-01-line-buffering"] = {"status": "AUTOMATED", "tests": [FUNC_REF]}
+    py_path, py_sha = _write_l15_artifact(tmp_path / "python" / "serialwrapd", "python")
+    rust_path, rust_sha = _write_l15_artifact(tmp_path / "rust-copy" / "serialwrapd", "python")
+    l15 = {"format": "s22-l15-results.v1", "runs": [
+        _l15_run(FUNC_REF, "python", py_path, py_sha),
+        _l15_run(FUNC_REF, "rust", rust_path, rust_sha),
+    ]}
+
+    rc, out = _run(tmp_path / "run", _good_reports(), emap=emap, l15=l15)
+    case = _case(out, "co-01-line-buffering")
+    assert case["status"] == "INSUFFICIENT" and rc == 1, case
+    assert any("實際 artifact 身分" in reason for reason in out["l15_reasons"]), out["l15_reasons"]
+
+
+def test_l15_rust_artifact_must_match_reported_candidate(tmp_path: Path) -> None:
+    """L1.5 的 Rust 證據必須綁定 --daemon-path 指定的候選 artifact。"""
+    emap = _emap()
+    emap["cases"]["co-01-line-buffering"] = {"status": "AUTOMATED", "tests": [FUNC_REF]}
+    py_path, py_sha = _write_l15_artifact(tmp_path / "python" / "serialwrapd", "python")
+    candidate, candidate_sha = _write_l15_artifact(tmp_path / "candidate" / "serialwrapd", "rust")
+    stale, stale_sha = _write_l15_artifact(tmp_path / "old-target" / "serialwrapd", "rust")
+    l15 = {"format": "s22-l15-results.v1", "runs": [
+        _l15_run(FUNC_REF, "python", py_path, py_sha),
+        _l15_run(FUNC_REF, "rust", stale, stale_sha),
+    ]}
+
+    rc, out = _run(tmp_path / "run", _good_reports(), emap=emap, l15=l15,
+                   daemon_path=candidate, build_linux_exit=0, built_daemon_sha256=candidate_sha)
+    case = _case(out, "co-01-line-buffering")
+    assert case["status"] == "INSUFFICIENT" and rc == 1, case
+    assert any("--daemon-path 候選不同" in reason for reason in out["l15_reasons"]), out["l15_reasons"]
 
 
 def test_missing_required_sets_insufficient(tmp_path: Path) -> None:

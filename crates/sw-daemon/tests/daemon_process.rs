@@ -867,7 +867,10 @@ fn daemon_stop_during_force_recover_with_client_gone() {
     // 完成命令作為 session worker barrier：只有 recover handler 已結算，後續命令才會完成。
     let barrier = submit(&env.socket, "COM0", "echo barrier");
     let barrier_id = barrier["cmd_id"].as_str().unwrap_or_default().to_string();
-    assert!(!barrier_id.is_empty(), "barrier command 未取得 cmd_id：{barrier:?}");
+    assert!(
+        !barrier_id.is_empty(),
+        "barrier command 未取得 cmd_id：{barrier:?}"
+    );
     wait_until("recover 後 barrier command done", LONG, || {
         command_get(&env.socket, &barrier_id)["status"] == "done"
     });

@@ -54,6 +54,9 @@ import sys
 import yaml
 
 root = pathlib.Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(root))
+from scripts.rust.l15_artifact import l15_artifact_problem
+
 run_dir = pathlib.Path(sys.argv[2]).resolve()
 l1_dir = pathlib.Path(sys.argv[3]).resolve()
 windows_dir = pathlib.Path(sys.argv[4]).resolve() if sys.argv[4] else None
@@ -146,6 +149,18 @@ def l15_rows() -> list[dict]:
             if not valid:
                 rows.append({"ref": ref, "implementation": implementation, "outcome": "failed", "exit_code": 127,
                              "reason": f"{env_name} 必須是 worktree 內存在且身分獨立的 daemon artifact"})
+                continue
+            identity_problem = l15_artifact_problem(
+                implementation,
+                path,
+                candidate_path=daemon_path if implementation == "rust" else None,
+                candidate_sha256=built_sha if implementation == "rust" else None,
+            )
+            if identity_problem:
+                rows.append({"ref": ref, "implementation": implementation, "outcome": "unchecked", "exit_code": None,
+                             "daemon_path": str(path.relative_to(root)),
+                             "daemon_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                             "reason": identity_problem})
                 continue
             if bridge and not selftest_ready:
                 rows.append({"ref": ref, "implementation": implementation, "outcome": "unchecked", "exit_code": None,

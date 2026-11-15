@@ -50,6 +50,9 @@ from typing import Any, Mapping
 import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+from scripts.rust.l15_artifact import l15_artifact_problem
+
 L1_JUDGE = ROOT / "tests" / "acceptance" / "l1_judge.py"
 DEFAULT_LOCK = ROOT / "tests" / "acceptance" / "l1_required.lock.json"
 DEFAULT_CASES_LOCK = ROOT / "tests" / "acceptance" / "cases.lock.json"
@@ -433,6 +436,41 @@ def load_l15(path: pathlib.Path | None) -> tuple[dict[str, list[dict]] | None, l
     return out, []
 
 
+def validate_l15_identity(
+    l15: dict[str, list[dict]] | None,
+    candidate_path: pathlib.Path | None,
+    candidate_sha256: str | None,
+) -> list[str]:
+    """標記無法證明實作身分或 Rust 候選綁定的 L1.5 列為 unchecked。"""
+    reasons: list[str] = []
+    for ref, runs in (l15 or {}).items():
+        for run in runs:
+            if run.get("outcome") != "passed":
+                continue
+            implementation = run.get("implementation")
+            raw_path = run.get("daemon_path")
+            if not isinstance(raw_path, str) or not raw_path:
+                problem = f"L1.5 {implementation or 'unknown'} 列缺少 daemon_path"
+            else:
+                artifact_path = pathlib.Path(raw_path)
+                if not artifact_path.is_absolute():
+                    artifact_path = ROOT / artifact_path
+                if implementation not in ("python", "rust"):
+                    problem = f"L1.5 implementation 未知：{implementation!r}"
+                else:
+                    problem = l15_artifact_problem(
+                        implementation,
+                        artifact_path,
+                        candidate_path=candidate_path if implementation == "rust" else None,
+                        candidate_sha256=candidate_sha256 if implementation == "rust" else None,
+                    )
+            if problem:
+                run["outcome"] = "unchecked"
+                run["reason"] = problem
+                reasons.append(f"{ref}：{problem}")
+    return reasons
+
+
 def map_coverage(emap: dict[str, Any], cases_lock: dict[str, Any]) -> dict[str, Any]:
     """對照表鍵集合須等於凍結 `slice_2.2`（不得縮小或擴張分母）。"""
     frozen = set((cases_lock.get("sets") or {}).get("slice_2.2") or [])
@@ -621,6 +659,7 @@ def main(argv: list[str] | None = None) -> int:
     emap = yaml.safe_load(args.map.read_text(encoding="utf-8")) or {}
     cases_lock = json.loads(args.cases_lock.read_text(encoding="utf-8"))
     l15, l15_reasons = load_l15(args.l15_results)
+    l15_reasons.extend(validate_l15_identity(l15, args.daemon_path, args.built_daemon_sha256))
     sections, rows = judge_sections(args.l1_results, lock, _load_judge())
     cases = judge_cases(emap, rows, l15)
     coverage = map_coverage(emap, cases_lock)
