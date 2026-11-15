@@ -167,7 +167,7 @@ struct Inject {
 /// `daemon.stop`，並記錄送出時刻；結束前回報停止耗時。前提不成立時不 panic、照樣送 stop，由父行程的斷言收場。
 fn child_main(inject: Inject) -> ! {
     let vars = process_vars();
-    let socket = PathBuf::from(&vars["SERIALWRAP_RUN_DIR"]).join("serialwrapd.sock");
+    let socket = support::endpoint_from_vars(&vars);
     let (devices, fixture) = if inject.stuck_drain_and_wal {
         (vec![device("usb-SER-A-if00", "/dev/pts/10")], Fixture::BlockForeverWriterWalSyncFailure)
     } else {
@@ -191,7 +191,7 @@ fn child_main(inject: Inject) -> ! {
     {
         let socket = socket.clone();
         let stop_at = stop_at.clone();
-        thread::spawn(move || {
+        spawn_stop_guarded_client(socket.clone(), move || {
             wait_socket(&socket, LONG);
             if inject.stuck_drain_and_wal {
                 let ready = poll(LONG, || get_state(&socket, "COM0")["state"] == "READY");
@@ -350,7 +350,7 @@ fn order_is_exactly_1_to_7() {
     let socket = env.socket.clone();
     let log = PathBuf::from(&env.vars["SERIALWRAP_EVENTS_RUNTIME_DIR"]).join("events.ndjson");
     let events_log = log.clone();
-    let client = thread::spawn(move || {
+    let client = spawn_stop_guarded_client(socket.clone(), move || {
         wait_socket(&socket, SHORT);
         wait_state(&socket, "COM0", "READY");
         let fired = poll(SHORT, || event_types(&events_log).iter().any(|t| t == "fire_completed"));
@@ -416,7 +416,7 @@ fn gpx_shutdown_window_starts_no_new_command_zero_tx() {
     let dev_for_client = dev.clone();
     let manager_for_client = manager_slot.clone();
     let trace_for_client = trace.clone();
-    let client = thread::spawn(move || {
+    let client = spawn_stop_guarded_client(socket.clone(), move || {
         wait_socket(&socket, SHORT);
         wait_state(&socket, "COM0", "READY");
         let manager = manager_for_client.lock().unwrap().clone();
@@ -598,7 +598,7 @@ fn stopping_gate_before_watcher_stop() {
     let client = {
         let opened_a = opened_a.clone();
         let dev_a = dev_a.clone();
-        thread::spawn(move || {
+        spawn_stop_guarded_client(socket.clone(), move || {
             wait_socket(&socket, SHORT);
             let deadline = Instant::now() + SHORT;
             while dev_a.open_count() == 0 && Instant::now() < deadline {
@@ -635,7 +635,7 @@ fn long_file_push_does_not_block_stop() {
         Fixture::ReadyShellBlockingWithQueue,
     );
     let socket = env.socket.clone();
-    let client = thread::spawn(move || {
+    let client = spawn_stop_guarded_client(socket.clone(), move || {
         wait_socket(&socket, SHORT);
         wait_state(&socket, "COM0", "READY");
         let s = socket.clone();
@@ -720,7 +720,7 @@ fn second_sigterm_changes_nothing() {
         ..DaemonHooks::default()
     };
     let socket = env.socket.clone();
-    let client = thread::spawn(move || {
+    let client = spawn_stop_guarded_client(socket.clone(), move || {
         wait_socket(&socket, SHORT);
         wait_state(&socket, "COM0", "READY");
         sig_tx.send(()).expect("送出第一次停止訊號");
@@ -748,7 +748,7 @@ fn second_sigterm_real_signal_exits_0() {
     }
     assert_eq!(d.wait(LONG).code(), Some(0), "{}", d.stderr());
     assert!(!d.stderr().contains(INCOMPLETE), "{}", d.stderr());
-    assert!(!env.socket.exists(), "有序停機後 socket 檔應已移除");
+    assert!(!endpoint_is_serving(&env.socket), "有序停機後 RPC endpoint 應已關閉");
 }
 
 #[test]
@@ -762,7 +762,7 @@ fn engine_stop_before_wal_close() {
         Fixture::ReadyShellBlockingWithQueue,
     );
     let socket = env.socket.clone();
-    let client = thread::spawn(move || {
+    let client = spawn_stop_guarded_client(socket.clone(), move || {
         wait_socket(&socket, SHORT);
         wait_state(&socket, "COM0", "READY");
         rpc_once(&socket, STOP);
@@ -797,7 +797,7 @@ const REBOUND_PATH: &str = "/dev/pts/12";
 /// `DeviceAttached`（模擬 SC-32 延後的 reconcile），等 manager／actor 處理後才放行 close。
 fn hotplug_child() -> ! {
     let vars = process_vars();
-    let socket = PathBuf::from(&vars["SERIALWRAP_RUN_DIR"]).join("serialwrapd.sock");
+    let socket = support::endpoint_from_vars(&vars);
     let a = device(BY_ID_A, "/dev/pts/10");
     let new = device(BY_ID_NEW, "/dev/pts/11");
     let a_rebound = device(BY_ID_A, REBOUND_PATH);
@@ -879,7 +879,7 @@ fn hotplug_child() -> ! {
         })),
         ..DaemonHooks::default()
     };
-    thread::spawn(move || {
+    spawn_stop_guarded_client(socket.clone(), move || {
         wait_socket(&socket, LONG);
         let ready = poll(LONG, || get_state(&socket, "COM0")["state"] == "READY");
         eprintln!("OBS:ready={ready}");
@@ -1002,7 +1002,7 @@ fn shutdown_inflight_attach_drained_before_wal_close() {
     let socket = env.socket.clone();
     let client = {
         let gate = gate.clone();
-        thread::spawn(move || {
+        spawn_stop_guarded_client(socket.clone(), move || {
             wait_socket(&socket, SHORT);
             script.lock().unwrap().as_ref().expect("裝置來源已建立").set(vec![new]);
             let entered = poll(SHORT, || gate.entered.load(Ordering::SeqCst));

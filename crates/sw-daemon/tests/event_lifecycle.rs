@@ -106,7 +106,7 @@ fn engine_started_before_bootstrap_attach() {
     let socket = env.socket.clone();
     let log = events_log(&env);
     let log2 = log.clone();
-    let client = thread::spawn(move || {
+    let client = spawn_stop_guarded_client(socket.clone(), move || {
         wait_socket(&socket, Duration::from_secs(10));
         let seen = poll(Duration::from_secs(10), || {
             types(&log2).iter().any(|t| t == "match_recorded")
@@ -144,10 +144,10 @@ fn shutdown_aborts_long_handler_within_budget() {
             vec![device("usb-SER-A-if00", "/dev/pts/10")],
             Fixture::ReadyShellBlockingWithQueue,
         );
-        let socket = PathBuf::from(&vars["SERIALWRAP_RUN_DIR"]).join("serialwrapd.sock");
+        let socket = support::endpoint_from_vars(&vars);
         let stop_sent: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
         let sent = stop_sent.clone();
-        thread::spawn(move || {
+        spawn_stop_guarded_client(socket.clone(), move || {
             wait_socket(&socket, Duration::from_secs(10));
             if !poll(Duration::from_secs(10), || marker_alive(&marker)) {
                 eprintln!("RESULT handler_not_started");
@@ -266,11 +266,11 @@ fn shutdown_closes_event_intake_before_drain_behavior() {
             inner: platform.fs.clone(),
             closed: gate.clone(),
         });
-        let socket = PathBuf::from(&vars["SERIALWRAP_RUN_DIR"]).join("serialwrapd.sock");
+        let socket = support::endpoint_from_vars(&vars);
         let log = PathBuf::from(&vars["SERIALWRAP_EVENTS_RUNTIME_DIR"]).join("events.ndjson");
         let mirror = PathBuf::from(&vars["SERIALWRAP_WAL_DIR"]).join("raw.mirror.log");
         let driver_dev = dev.clone();
-        thread::spawn(move || {
+        spawn_stop_guarded_client(socket.clone(), move || {
             wait_socket(&socket, Duration::from_secs(10));
             wait_for("COM0 READY", Duration::from_secs(10), || {
                 get_state(&socket, "COM0")["state"] == "READY"

@@ -14,16 +14,22 @@ const OLD_VERSION: &str = "0.0.1";
 
 /// 找到帶 test-fakes 的 CLI；明確路徑優先，其次使用測試執行檔所屬 target profile。
 pub fn feature_cli_path() -> PathBuf {
-    let candidate = std::env::var_os("SW_TEST_SERIALWRAP")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let test_exe = std::env::current_exe().expect("取得 handoff_stop 測試執行檔路徑");
-            let profile_dir = test_exe
-                .parent()
-                .and_then(Path::parent)
-                .expect("測試執行檔應位於 target/<profile>/deps");
-            profile_dir.join(format!("serialwrap{}", std::env::consts::EXE_SUFFIX))
-        });
+    let candidate = if let Some(path) = std::env::var_os("SW_TEST_SERIALWRAP") {
+        PathBuf::from(path)
+    } else if let Some(daemon) = std::env::var_os("SW_TEST_SERIALWRAPD") {
+        // Windows runner 會把 daemon 與 CLI 一起 staging；以 daemon 路徑找同目錄的 feature CLI。
+        PathBuf::from(daemon)
+            .parent()
+            .expect("SW_TEST_SERIALWRAPD 應位於測試 staging 目錄")
+            .join(format!("serialwrap{}", std::env::consts::EXE_SUFFIX))
+    } else {
+        let test_exe = std::env::current_exe().expect("取得 handoff_stop 測試執行檔路徑");
+        let profile_dir = test_exe
+            .parent()
+            .and_then(Path::parent)
+            .expect("測試執行檔應位於 target/<profile>/deps");
+        profile_dir.join(format!("serialwrap{}", std::env::consts::EXE_SUFFIX))
+    };
     require_file(
         candidate,
         "feature CLI；設定 SW_TEST_SERIALWRAP 指向帶 test-fakes 的 serialwrap",
@@ -32,9 +38,17 @@ pub fn feature_cli_path() -> PathBuf {
 
 /// 正式 CLI 必須由獨立 no-fakes target 建置，禁止退回 feature profile 的共同產物。
 pub fn no_fakes_cli_path() -> PathBuf {
-    let candidate = std::env::var_os("SW_TEST_SERIALWRAP_NO_FAKES")
-        .map(PathBuf::from)
-        .expect("缺少 SW_TEST_SERIALWRAP_NO_FAKES；請指向獨立 target 建置的正式 serialwrap");
+    let candidate = if let Some(path) = std::env::var_os("SW_TEST_SERIALWRAP_NO_FAKES") {
+        PathBuf::from(path)
+    } else if let Some(daemon) = std::env::var_os("SW_TEST_SERIALWRAPD") {
+        // Windows runner 將獨立 target 的正式 CLI 以專用名稱與 daemon 一起 staging。
+        PathBuf::from(daemon)
+            .parent()
+            .expect("SW_TEST_SERIALWRAPD 應位於測試 staging 目錄")
+            .join(format!("serialwrap-no-fakes{}", std::env::consts::EXE_SUFFIX))
+    } else {
+        panic!("缺少 SW_TEST_SERIALWRAP_NO_FAKES；請指向獨立 target 建置的正式 serialwrap");
+    };
     require_file(
         candidate,
         "no-fakes CLI；請以獨立 Cargo target directory 建置",
@@ -61,6 +75,11 @@ pub fn feature_bundle(cli: &Path) -> (PathBuf, PathBuf) {
             let repository = repository_root();
             let fallback = std::env::var_os("SW_TEST_FEATURE_BUNDLE")
                 .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("SW_TEST_SERIALWRAPD")
+                        .and_then(|daemon| PathBuf::from(daemon).parent().map(Path::to_path_buf))
+                        .map(|staging| staging.join("bundle"))
+                })
                 .unwrap_or_else(|| repository.join("target/s2-par/gpz/prereqs/bundle"));
             let fallback = fallback.join("bin/serialwrap");
             let fallback = fs::canonicalize(fallback).ok()?;
@@ -90,6 +109,11 @@ pub fn feature_bundle(cli: &Path) -> (PathBuf, PathBuf) {
 pub fn old_bundle_dir() -> PathBuf {
     let base_bundle = std::env::var_os("SW_TEST_BASE_BUNDLE")
         .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("SW_TEST_SERIALWRAPD")
+                .and_then(|daemon| PathBuf::from(daemon).parent().map(Path::to_path_buf))
+                .map(|staging| staging.join("base-bundle"))
+        })
         .unwrap_or_else(|| repository_root().join("target/s2-par/gpz/prereqs/base-bundle"));
     let directory = base_bundle.join("versions").join(OLD_VERSION);
     let manifest_path = directory.join("release-manifest.json");
@@ -107,8 +131,8 @@ pub fn old_bundle_dir() -> PathBuf {
     directory
 }
 
-pub fn unix_endpoint(socket: &Path) -> String {
-    socket.display().to_string()
+pub fn endpoint(endpoint: &Path) -> String {
+    endpoint.display().to_string()
 }
 
 /// 建立隔離安裝入口，供 update 路徑辨識既有 current；bundle 內容來自 mkbundle 產物。
@@ -342,12 +366,17 @@ fn artifact_dir() -> PathBuf {
 }
 
 fn repository_root() -> PathBuf {
-    std::env::current_dir()
-        .expect("取得 handoff_stop 測試工作目錄")
+    let cwd = std::env::current_dir().expect("取得 handoff_stop 測試工作目錄");
+    if let Some(root) = cwd
         .ancestors()
         .find(|directory| directory.join("crates/sw-daemon/Cargo.toml").is_file())
-        .expect("從 handoff_stop 測試工作目錄定位 workspace 根目錄")
-        .to_path_buf()
+    {
+        return root.to_path_buf();
+    }
+    // Windows runner 只 staging 測試資料與執行檔；artifact 限定寫在本次 staging 根目錄。
+    std::env::var_os("SW_TEST_SERIALWRAPD")
+        .and_then(|daemon| PathBuf::from(daemon).parent().map(Path::to_path_buf))
+        .unwrap_or(cwd)
 }
 
 fn systemd_service_state(label: &str, edge: &str) -> Vec<u8> {

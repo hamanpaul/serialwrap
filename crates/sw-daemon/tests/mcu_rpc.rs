@@ -261,7 +261,7 @@ fn links_at(seen: &[(TraceEvent, usize)], ev: TraceEvent) -> Option<usize> {
 /// 啟動 in-process daemon，服務中記錄 `link` 是否存在後送 `daemon.stop`；回 (exit code, 服務中的 link 表)。
 fn run_and_stop(env: &IsolatedEnv, platform: sw_pal::Platform, hooks: DaemonHooks, console: Arc<RigFlashConsole>) -> (i32, BTreeMap<PathBuf, String>) {
     let socket = env.socket.clone();
-    let client = thread::spawn(move || {
+    let client = spawn_stop_guarded_client(socket.clone(), move || {
         wait_socket(&socket, SHORT);
         let during = console.links();
         rpc_once(&socket, STOP);
@@ -334,17 +334,16 @@ fn daemon_start_failure_of_flash_endpoint_exits_1() {
     let seen = seen.lock().unwrap().clone();
     assert!(links_at(&seen, TraceEvent::BootstrapAttach).is_some(), "端點在 bootstrap attach 之後才啟動：{seen:?}");
     assert!(links_at(&seen, TraceEvent::Bound).is_none(), "端點啟動失敗不得進入 RPC bind：{seen:?}");
-    assert!(!env.socket.exists(), "不得留下 RPC socket");
+    assert!(!endpoint_is_serving(&env.socket), "不得留下正在服務的 RPC endpoint");
 }
 
 /// 守衛：daemon 若進入 RPC 服務（socket 出現）即送 `daemon.stop`，避免「本應失敗卻持續服務」時測試卡住；
 /// 回傳是否曾送出 stop。`done` 設定或 30 s 後結束。
 fn stop_if_serving(socket: PathBuf, done: Arc<AtomicBool>) -> thread::JoinHandle<bool> {
-    thread::spawn(move || {
+    spawn_stop_guarded_client(socket.clone(), move || {
         let deadline = std::time::Instant::now() + LONG;
         while !done.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
-            if socket.exists() {
-                wait_socket(&socket, SHORT);
+            if endpoint_is_serving(&socket) {
                 rpc_once(&socket, STOP);
                 return true;
             }

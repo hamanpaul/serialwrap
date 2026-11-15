@@ -1103,7 +1103,7 @@ fn run_daemon<T: Send + 'static>(
     let socket = env.socket.clone();
     let client_thread = {
         let (socket, sink) = (socket.clone(), sink.clone());
-        thread::spawn(move || {
+        spawn_stop_guarded_client(socket.clone(), move || {
             wait_socket(&socket, LONG);
             let out = catch_unwind(AssertUnwindSafe(|| client(socket.clone(), dev, sink)));
             if out.is_err() {
@@ -1237,7 +1237,7 @@ fn shutdown_during_force_recover_poll_finishes_handler_and_exits_zero() {
         ..DaemonHooks::default()
     };
     let socket = env.socket.clone();
-    let client = thread::spawn(move || {
+    let client = spawn_stop_guarded_client(socket.clone(), move || {
         wait_socket(&socket, LONG);
         wait_ready(&socket);
         // READY 的 force recover 依 Python 先送 CTRL_C／CTRL_D；此測試要覆蓋 ATTACHED 的直接 clear＋輪詢路徑。
@@ -1344,7 +1344,7 @@ fn handoff_then_successor_never_double_held() {
     let base_bundle = handoff_cli::old_bundle_dir();
     let install_root = env.root.join("install");
     handoff_cli::seed_install_from_old_bundle(&base_bundle, &install_root);
-    let endpoint = handoff_cli::unix_endpoint(&env.socket);
+    let endpoint = handoff_cli::endpoint(&env.socket);
     std::fs::write(
         env.config_dir.join("config.yaml"),
         format!("supervision_mode: on-demand\nsocket_path: \"{endpoint}\"\n"),
@@ -1445,7 +1445,7 @@ fn default_cli_update_scope_cannot_bypass_foreign_daemon() {
     for (label, explicit_socket) in [("explicit-socket", true), ("implicit-socket", false)] {
         let daemon_env = isolated_env();
         let socket_a = daemon_env.socket.clone();
-        let endpoint_a = handoff_cli::unix_endpoint(&socket_a);
+        let endpoint_a = handoff_cli::endpoint(&socket_a);
         let daemon_args = if explicit_socket {
             vec!["--socket", endpoint_a.as_str()]
         } else {
@@ -1458,10 +1458,14 @@ fn default_cli_update_scope_cannot_bypass_foreign_daemon() {
         let daemon_pid = daemon.pid();
 
         let cli_env = isolated_env();
-        let socket_b = cli_env.run_dir.join("foreign-daemon.sock");
-        let endpoint_b = handoff_cli::unix_endpoint(&socket_b);
-        assert_ne!(socket_a, socket_b, "A、B 必須是不同隔離 socket");
-        assert!(!socket_b.exists(), "CLI 的隔離 socket B 必須不存在：{}", socket_b.display());
+        let socket_b = cli_env.socket.clone();
+        let endpoint_b = handoff_cli::endpoint(&socket_b);
+        assert_ne!(socket_a, socket_b, "A、B 必須使用不同隔離 endpoint");
+        assert!(
+            !support::endpoint_is_serving(&socket_b),
+            "CLI 的隔離 endpoint B 不得有 listener：{}",
+            socket_b.display()
+        );
         std::fs::write(
             cli_env.config_dir.join("config.yaml"),
             format!("supervision_mode: on-demand\nsocket_path: \"{endpoint_b}\"\n"),
