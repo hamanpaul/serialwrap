@@ -90,6 +90,7 @@ fn send_and_drop(socket: &std::path::Path, payload: &str) {
     stream
         .send_all(payload.as_bytes())
         .expect("送出 pipelined 請求");
+    drop(stream);
 }
 
 fn last_wal_line(env: &IsolatedEnv) -> String {
@@ -821,8 +822,6 @@ fn daemon_stop_during_force_recover_with_client_gone() {
     let mut env = isolated_env_with_pty_target();
     let mut d = DaemonProc::spawn(&env, &[]);
     wait_ready(&env, "COM0");
-    // 讓 handler 在 client disconnect 之後仍等待假 DUT，避免快速 Ctrl-C 回應時競態地先寫回應並處理 pipelined stop。
-    env.target_pause(8.0);
 
     let payload = format!(
         "{}\n{}\n",
@@ -845,6 +844,11 @@ fn daemon_stop_during_force_recover_with_client_gone() {
     if let Some(rest) = Duration::from_secs(11).checked_sub(sent.elapsed()) {
         thread::sleep(rest);
     }
+    assert_eq!(
+        recover_tx_payloads(&env),
+        vec!["Aw==".to_string()],
+        "READY prompt 後 CTRL-C 已結束 recover，不應再送 CTRL-D"
+    );
 
     // 管線中的 daemon.stop 未被處理：daemon 仍存活、socket 保留，新連線 health.status 回 ok。
     assert!(
@@ -859,6 +863,23 @@ fn daemon_stop_during_force_recover_with_client_gone() {
     );
     let last = last_wal_line(&env);
     assert!(pyjson::loads(&last).is_ok(), "WAL 最後一行不完整：{last}");
+
+    // 完成命令作為 session worker barrier：只有 recover handler 已結算，後續命令才會完成。
+    let barrier = submit(&env.socket, "COM0", "echo barrier");
+    let barrier_id = barrier["cmd_id"].as_str().unwrap_or_default().to_string();
+    assert!(!barrier_id.is_empty(), "barrier command 未取得 cmd_id：{barrier:?}");
+    wait_until("recover 後 barrier command done", LONG, || {
+        command_get(&env.socket, &barrier_id)["status"] == "done"
+    });
+    assert!(
+        env.target_rx().windows(13).any(|w| w == b"echo barrier\n"),
+        "recover handler 完成後 daemon 應能處理新命令"
+    );
+    assert_eq!(
+        recover_tx_payloads(&env),
+        vec!["Aw==".to_string()],
+        "新連線的 barrier 不得補出救援 Ctrl-D"
+    );
 
     // 新連線 daemon.stop → 有序停機。
     let started = Instant::now();
