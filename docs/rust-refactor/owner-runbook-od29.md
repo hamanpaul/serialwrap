@@ -81,3 +81,71 @@ $d="$env:LOCALAPPDATA\Temp\sw-od29"; New-Item -ItemType Directory -Force $d | Ou
 ```
 
 預期為 `1 passed`、`exit_code=0`、父診斷最後列 `PASS`，且兩個 delegate 診斷檔都存在並各含受測孫行程 PID。完成後由擁有者提供 `%LOCALAPPDATA%\Temp\sw-od29\` 下的結果 JSON、父診斷、兩個 child 診斷、兩個 delegate 診斷、transcript 與 `SHA256SUMS`，再逐字複製至 repo 證據目錄；本輪未寫入 Windows 根目錄，也未把本次交叉建置當成原生證據。
+
+## OD-89：Windows `interactive_desktop` L1 證據
+
+此流程由擁有者在 Windows Terminal 的 PowerShell 7 互動分頁執行。必須直接執行，不能從 WSL interop、排程工作、管線或輸出重新導向啟動。腳本會由目前 worktree 的 WSL UNC 路徑判定 distro，先用 WSL Cargo 只建置 `sw-pal` 的 `exec_delegate`、`lock` 兩個 Windows 測試執行檔，再複製到 `%LOCALAPPDATA%\Temp\sw-interactive-l1\<run-id>`，逐一於互動 console 執行鎖定的兩列。
+
+兩列是：
+
+- `cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c`
+- `cargo:sw-pal::lock::cap_interactive_desktop__ctrl_break_stops_wait`
+
+這兩項只測 Windows console／process 控制，不開序列埠、不碰正式安裝或 Windows 系統設定。執行前須確保候選 HEAD 已提交且工作樹乾淨（`target/` 除外）；產生後不得換候選 HEAD。
+
+### 執行命令
+
+在 Windows Terminal PowerShell 7 分頁：
+
+```powershell
+Set-Location '\\wsl.localhost\arc-260404\home\paul_chen\prj_pri\serialwrap-worktrees\rust-refactor-p7'
+& .\scripts\rust\win-interactive-l1.ps1
+```
+
+預期兩個測試各顯示 `... ok` 與 `1 passed; 0 failed`。結尾應顯示 `collected=2 passed=2 failed=0 finished=True`，並印出結果檔位置：
+
+```text
+target/win-interactive-l1/<run-id>/l1-results.json
+```
+
+結果是 `l1-results.v1`，`collected` 只含上列兩個 nodeid；`provenance.git.head` 和 `provenance.git.end.head` 都記錄候選 commit，兩端 `clean` 必須為 `true`。檔案另含 Windows build target、Rust toolchain、RUSTFLAGS 摘要及兩個受測 exe 的 SHA256。若任何測試失敗，照實保留 failed row 與非零 exit code，不得重跑直到變綠或改判。
+
+Windows section gate 建立 run directory 後，在 WSL 匯入原始結果；`<candidate-commit>` 必須等於結果檔記錄的 HEAD：
+
+```bash
+python3 scripts/rust/slice21_gate_judge.py import-windows-section \
+  --run-dir target/slice21-gate/<gate-run-id> \
+  --name windows_cap_interactive_desktop \
+  --candidate-commit <candidate-commit> \
+  --source target/win-interactive-l1/<run-id>/l1-results.json
+```
+
+成功時 section 片段位於 `target/slice21-gate/<gate-run-id>/sections/windows_cap_interactive_desktop.json`，L1 副本位於該 run 的 `windows_cap_interactive_desktop/l1-results.json`。先確認匯入完成，再刪除該次 `%LOCALAPPDATA%\Temp\sw-interactive-l1\<run-id>` 目錄；保留 `target/win-interactive-l1/<run-id>/l1-results.json` 供 gate 使用。
+
+## `supervisor_runtime` Windows task 實跑準備
+
+以下命令另需擁有者明確授權；本次準備不執行排程工作。測試須使用自己的 `sw-p8-test-<pid>` 工作名。建置前檢查共用 D 槽可用空間至少 100 GB；不足時停止：
+
+```bash
+df -BG --output=avail /mnt/d
+```
+
+擁有者授權後，在此 worktree 的 WSL shell 執行：
+
+```bash
+export PATH="/mnt/c/Windows/System32:/mnt/c/Windows/System32/WindowsPowerShell/v1.0:$PATH"
+command -v cmd.exe >/dev/null
+command -v wslpath >/dev/null
+cmd.exe /c ver
+export TMPDIR="$(mktemp -d /tmp/sw.XXXXXX)"
+trap 'rm -rf -- "$TMPDIR"' EXIT
+export CARGO_TARGET_DIR="$PWD/target"
+set -o pipefail
+cargo build -p sw-daemon --features test-fakes --bin serialwrapd --target x86_64-pc-windows-gnu
+cargo build -p sw-cli --features test-fakes --bin wintask_stop_harness --target x86_64-pc-windows-gnu
+SW_TEST_ALLOW_SCHTASKS=1 \
+SW_WIN_EXTRA_FILES="$PWD/target/x86_64-pc-windows-gnu/debug/serialwrapd.exe:$PWD/target/x86_64-pc-windows-gnu/debug/wintask_stop_harness.exe" \
+  scripts/rust/win-test.sh --package sw-pal --caps supervisor_runtime -- --test wintask_runtime
+```
+
+`SW_WIN_EXTRA_FILES` 必須同時帶入 `serialwrapd.exe` 與 `wintask_stop_harness.exe`；後者由 `wintask_runtime.rs:8` 的實跑契約要求。預期該檔的 capability 列顯示 `1 passed`，`target/win-test-report/` 會留下 run report 與對應的 `l1-results.v1`。測試正常結束會刪除本次 `sw-p8-test-<pid>` 排程工作並由 `win-runner.sh` 清除 staging；確認本次工作已不存在後，只清理由該次測試建立且仍殘留的精確 `sw-p8-test-<pid>` 工作和 temp 目錄。不得清理其他名稱的排程工作。
