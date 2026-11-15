@@ -1,7 +1,11 @@
 # 宣告式 ID 對應；空 nodeids 表示由 owner_phase 所屬 Phase 補齊。
 entries:
   bc:BC-01:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::wal_writer::shutdown_syncs_then_closes
+    - cargo:sw-core::wal_writer::lazy_open_idle_file_absent
+    - cargo:sw-core::wal_writer::enospc_on_open_handle_trips_all_fences
+    - cargo:sw-core::wal_writer::wal_contract_golden_matches_p1
     owner_phase: P5
   bc:BC-02:
     nodeids:
@@ -11,179 +15,265 @@ entries:
     - tests/contract_blackbox/slice22/test_console_bc02.py::test_normal_suspend_loses_no_keystroke
     owner_phase: P8
   bc:BC-03:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::arbiter::aborted_mapping_bc03
+    - cargo:sw-core::drain_release::release_waits_for_receipt_then_persists_and_maps_bc03
     owner_phase: P5
   bc:BC-04:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::gpx_device_attach_open_failures_match_python_wire
+    - cargo:sw-pal::serial_posix::flock_eacces_is_held
     owner_phase: P5
   bc:BC-05:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_remote::windows_argv_drops_control_master_but_identity_unchanged
+    - cargo:sw-cli::mgmt_remote::windows_connect_ready_via_ping
     owner_phase: P4
   bc:DF-01:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::event_store::reset_with_invalid_rule_id_counts_zero_df01
     owner_phase: P7
   bc:DF-02:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::login_quiet::human_prefixed_rpc_source_is_gated_like_agent_df02
     owner_phase: P5
   bc:DF-03:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::wal_writer::rotate_collision_adds_numeric_suffix
     owner_phase: P5
   bc:DF-04:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::session_manager::released_survives_two_restarts_dynamic
     owner_phase: P5
   bc:DF-05:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::start_locate_order_sibling_then_runtime
+    - cargo:sw-cli::mgmt_daemon::start_locate_honors_release_manifest_env
     owner_phase: P4
   bc:DF-06:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::client_retry::non_json_is_invalid_response
     owner_phase: P3
   bc:DF-07:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_service::service_bad_constructor_tag_reports_line_and_column
     owner_phase: P4
   bc:DF-08:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::event_schema::contains_with_bad_flag_is_rejected_df08
     owner_phase: P7
   bc:DF-09:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::event_store::load_all_valueerror_typeerror_are_failed_df09
     owner_phase: P7
   bc:DF-10:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_setup::df10_system_state_migration_target
     owner_phase: P4
   bc:DF-11:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_setup::wsl_without_sudo_never_runs_sudo_install
+    - cargo:sw-cli::mgmt_setup::reconcile_timeout_keeps_wsl_pending_sudo_commands
+    - cargo:sw-cli::mgmt_setup::wsl_systemd_target_with_sudo_installs
     owner_phase: P4
   bc:DF-12:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_setup::reconcile_handed_off_never_sends_daemon_stop
+    - cargo:sw-cli::mgmt_setup::reconcile_waits_on_status_pid_not_unrelated_socketless_daemon
     owner_phase: P4
   bc:DF-13:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_update::update_materializes_assets_preserving_profiles
+    - cargo:sw-cli::mgmt_setup::materialize_wrappers_posix_only
     owner_phase: P4
   bc:DF-14:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::daemon_process::startup_order_scan_rank_watch
     owner_phase: P5
   bc:DF-15:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::event_engine::end_to_end_fire_uses_exact_wal_seq_and_writes_ndjson
     owner_phase: P7
   bc:DF-16:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_setup::materialize_skill_always_refreshed_and_linked
     owner_phase: P4
   bc:DF-17:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::wal_writer::mirror_failure_retries_only_mirror
     owner_phase: P5
   bc:DF-18:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::event_store::upsert_overwrites_existing_df18
     owner_phase: P7
   bc:DF-19:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::lease_selftest::selftest_quiet_armed_after_precheck_before_submit_zero_tx
     owner_phase: P7
   bc:DF-20:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::rpc_console::df20_send_with_pre_recover_or_reboot_id_not_found_zero_tx
     owner_phase: P6
   bc:DF-21:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::arbiter::flush_only_accepted
+    - cargo:sw-core::command_exec::timeout_sends_ctrl_c_then_recovers_and_flushes_queue
     owner_phase: P5
   bc:DF-22:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::rx_reader::rate_window_merge_oldest_keeps_byte_sum
     owner_phase: P5
   bc:DF-23:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::df23_rpc_release_during_login_then_attach_returns_ready
     owner_phase: P7
   bc:DF-24:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::df24_rpc_session_list_completes_during_force_recover
     owner_phase: P7
   bc:DF-25:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::df25_interactive_cancel_preserves_lease
     owner_phase: P6
+  bc:DF-26:
+    nodeids:
+    - cargo:sw-daemon::file_transfer_rpc::file_pull_over_rx_window_succeeds_od80_df26
+    owner_phase: P8
+  bc:DF-27:
+    nodeids:
+    - cargo:sw-core::reprobe::df27_post_login_timeout_is_reprobe_eligible
+    owner_phase: P7
   bc:SC-01:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::session_core::recovering_submit_is_session_recovering_sc01
     owner_phase: P5
   bc:SC-02:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::flash_session_core::console_input_resumes_after_flash_ioerror_recovery
     owner_phase: P5
   bc:SC-03:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::command_exec::wp55_execute_time_trust_matrix
     owner_phase: P5
   bc:SC-04:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::drain_release::device_attach_dedup_same_by_id_inflight
     owner_phase: P5
   bc:SC-05:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::gpx_device_attach_open_failures_match_python_wire
+    - cargo:sw-pal::serial_posix::flock_eacces_is_held
     owner_phase: P5
   bc:SC-06:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::arbiter::flush_only_accepted
     owner_phase: P5
   bc:SC-07:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::echo_paced::paced_abort_after_partial_write_records_confirmed_bytes_then_errors
     owner_phase: P5
   bc:SC-09:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::endpoint_resolve::config_zero_socket_path
     owner_phase: P3
   bc:SC-10:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::start_treats_normalized_same_socket_as_no_conflict
     owner_phase: P5
   bc:SC-11:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_graceful_stop::on_demand_handoff_waits_for_granted_instance_ordered_shutdown
     owner_phase: P5
   bc:SC-12:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_setup::reconcile_waits_on_status_pid_not_unrelated_socketless_daemon
     owner_phase: P4
   bc:SC-13:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::lease_selftest::tick_expires_lease_sc13
     owner_phase: P6
   bc:SC-14:
     nodeids:
     - cargo:sw-core::flash_session_core::probe_rejected_when_foreground_busy_sc14
     owner_phase: P8
   bc:SC-15:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::out_ring::drop_oldest_keeps_newest_within_cap
     owner_phase: P6
   bc:SC-16:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::line_editor::exactly_16385_bytes_is_submitted_for_arbiter_to_reject
     owner_phase: P6
   bc:SC-17:
-    nodeids: []
+    nodeids:
+    - cargo:sw-pal::proc_scan::windows_scan_finds_self_spawned_fake_daemon
     owner_phase: P5
+    platforms: [windows]
   bc:SC-18:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::autostart_resend_carries_original_command_params
     owner_phase: P4
   bc:SC-19:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::daemon_process::allowlist_rejected_before_runtime_dirs_and_lock
     owner_phase: P1
   bc:SC-20:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::restart_on_demand_stop_wait_start
     owner_phase: P4
   bc:SC-21:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_remote::remote_stop_is_alias_of_close
     owner_phase: P4
   bc:SC-22:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_supervision_switch::supervision_set_idle_uses_handoff_not_daemon_stop
+    - cargo:sw-cli::mgmt_supervision_switch::supervision_set_probe_failure_has_no_side_effects
     owner_phase: P4
   bc:SC-23:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_update::update_on_demand_holds_autostart_lock_until_new_daemon_started
+    - cargo:sw-cli::mgmt_update::pairing_failure_after_switch_reverts_to_complete_previous
     owner_phase: P4
   bc:SC-24:
-    nodeids: []
+    nodeids:
+    - cargo:sw-pal::service_ctl::windows_task_install_writes_xml_then_creates_task
+    - cargo:sw-pal::service_ctl::windows_service_install_plan_register_held_is_disabled_and_not_started
     owner_phase: P4
   bc:SC-25:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_doctor::version_pairing_mismatch_detail
+    - cargo:sw-cli::mgmt_doctor::version_pairing_daemon_down_is_unreachable
+    - cargo:sw-cli::mgmt_com0com::version_pairing_checks_optional_component_and_helper_digests
     owner_phase: P4
   bc:SC-26:
-    nodeids: []
+    nodeids:
     owner_phase: P7
+    platforms: [windows]
+    blocked_reason: "Windows 原生 HandlerSpawner 節點尚未進入凍結鎖；待擁有者原生收集與執行後解除。"
   bc:SC-27:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::cli_spec_schema::cli_spec_matches_schema
     owner_phase: P4
   bc:SC-28:
-    nodeids: []
+    nodeids:
+    - cargo:sw-pal::console_conformance::select_console_kind_table
     owner_phase: P6
   bc:SC-29:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::windows_console_native::cap_windows_com__serial_console_end_to_end
     owner_phase: P6
+    platforms: [windows]
+    blocked_caps: [windows_com]
+    blocked_reason: "OD-01 com0com console 端點須由擁有者以核准的 COM22:COM23 實跑；本項不解除硬體阻塞。"
   bc:SC-30:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::session_core_login::reboot_recovery_banner_returns_to_wait_loop_sc30
     owner_phase: P7
   bc:SC-31:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::session_core_console::input_without_active_epoch_dropped_sc31
+    - cargo:sw-core::session_core_lease::stash_dropped_when_expired_sc31
     owner_phase: P6
   bc:SC-32:
     nodeids:
@@ -191,7 +281,9 @@ entries:
     - cargo:sw-core::flash_session_core::device_detached_during_flashing_is_deferred
     owner_phase: P8
   bc:SC-34:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::session_rpc_p7::attach_credentials_unresolved_last_error_field
+    - cargo:sw-core::session_core_login::attach_state_result_mapping
     owner_phase: P7
   bc:SC-35:
     nodeids:
@@ -208,10 +300,13 @@ entries:
     - cargo:sw-cli::mgmt_com0com::bundle_without_component_verifies
     owner_phase: P8
   bc:SC-37:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::daemon_process::backend_env_invalid_exit_1
+    - cargo:sw-daemon::daemon_process::backend_env_checked_where_python_selects_it
     owner_phase: P5
   bc:SC-39:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_legacy_handoff::legacy_a_on_demand_install_stops_with_rpc_and_setup_starts_new_daemon
     owner_phase: P4
   case:bc02-deferred-context-switch-clear:
     nodeids: []
@@ -1326,19 +1421,24 @@ entries:
     platforms:
     - windows
   cli_cmd:alias assign:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P5
   cli_cmd:alias list:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P0
   cli_cmd:alias set:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P5
   cli_cmd:alias unassign:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P5
   cli_cmd:cmd cancel:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P5
   cli_cmd:cmd result-tail:
     nodeids:
@@ -1367,55 +1467,73 @@ entries:
     - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
     owner_phase: P8
   cli_cmd:daemon restart:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::restart_on_demand_stop_wait_start
     owner_phase: P3
   cli_cmd:daemon start:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::start_locate_order_sibling_then_runtime
     owner_phase: P3
   cli_cmd:daemon status:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::autostart_not_for_daemon_status
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P0
   cli_cmd:daemon stop:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::stop_rpc_timeout_fixed_2s_no_retries
     owner_phase: P3
   cli_cmd:device attach:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P5
   cli_cmd:device list:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P0
   cli_cmd:device release:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P5
   cli_cmd:event add:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::event_add_document::add_keeps_key_order_nan_and_non_ascii_on_the_wire
     owner_phase: P5
   cli_cmd:event disable:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::event_params::enable_and_disable_send_selector
     owner_phase: P5
   cli_cmd:event enable:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::event_params::enable_and_disable_send_selector
     owner_phase: P5
   cli_cmd:event list:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::event_params::list_sends_selector_and_owner_with_nulls_when_absent
     owner_phase: P0
   cli_cmd:event reload:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::event_params::reload_sends_empty_params
     owner_phase: P5
   cli_cmd:event reset:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::event_params::reset_sends_rule_id_or_selector_with_the_other_null
     owner_phase: P5
   cli_cmd:event rm:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::event_params::rm_sends_rule_id
     owner_phase: P5
   cli_cmd:event show:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::event_params::show_sends_rule_id
     owner_phase: P0
   cli_cmd:event status:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::event_params::status_sends_selector_or_null
     owner_phase: P0
   cli_cmd:event tail:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::event_params::tail_defaults_and_explicit_values
     owner_phase: P0
   cli_cmd:file pull:
     nodeids:
@@ -1438,10 +1556,12 @@ entries:
     - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
     owner_phase: P8
   cli_cmd:log tail-raw:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P0
   cli_cmd:log tail-text:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P0
   cli_cmd:mcu patterns:
     nodeids:
@@ -1452,13 +1572,17 @@ entries:
     - tests/contract_blackbox/test_s24_mcu_rpc.py::test_status_idle_no_sessions
     owner_phase: P8
   cli_cmd:profile test:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::profile_cmd::matched_line_is_full_line
+    - cargo:sw-cli::profile_checks::class_range_error_precedes_unterminated_and_later_escape
     owner_phase: P3
   cli_cmd:remote stop:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_remote::remote_stop_is_alias_of_close
     owner_phase: P3
   cli_cmd:session activity:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P0
   cli_cmd:session attach:
     nodeids:
@@ -1471,10 +1595,12 @@ entries:
     - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
     owner_phase: P8
   cli_cmd:session bind:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P5
   cli_cmd:session clear:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P5
   cli_cmd:session console-attach:
     nodeids:
@@ -1491,7 +1617,8 @@ entries:
     - cargo:sw-core::session_core_lease::console_list_shape_sorted_and_prunes_stale
     owner_phase: P8
   cli_cmd:session interactive-close:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P6
   cli_cmd:session interactive-open:
     nodeids:
@@ -1518,19 +1645,24 @@ entries:
     - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
     owner_phase: P8
   cli_cmd:session list:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P0
   cli_cmd:session log-start:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P5
   cli_cmd:session log-status:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P0
   cli_cmd:session log-stop:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P5
   cli_cmd:session pin:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P5
   cli_cmd:session recover:
     nodeids:
@@ -1543,10 +1675,12 @@ entries:
     - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
     owner_phase: P8
   cli_cmd:session self-test:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P5
   cli_cmd:session unpin:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P5
   cli_cmd:stream tail:
     nodeids:
@@ -1555,90 +1689,118 @@ entries:
     - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
     owner_phase: P8
   cli_cmd:wal current-seq:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P0
   cli_cmd:wal export:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P0
   cli_cmd:wal reset:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
     owner_phase: P5
   error_code:ALIAS_NOT_FOUND:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::session_manager::alias_unassign_saves_before_check
     owner_phase: P0
   error_code:AUTOBOOT_QUIET:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::command_exec::reboot_prompt_returns_quickly_ok_not_partial
     owner_phase: P5
   error_code:BASE64_DECODE_FAILED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::pull_b64_bad_padding
     owner_phase: P0
   error_code:BENCH_ENDPOINT_NOT_REMEMBERED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::endpoint_resolve::bench_missing_file
     owner_phase: P0
   error_code:BENCH_STATE_IO_ERROR:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::endpoint_resolve::bench_state_is_dir
     owner_phase: P0
   error_code:CHECKSUM_MISMATCH:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::pull_md5_mismatch
     owner_phase: P0
   error_code:CHECKSUM_VERIFY_FAILED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_update::update_verify_failed_no_side_effects
     owner_phase: P0
   error_code:CMD_CONTAINS_NEWLINE:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::admission::registry_admission::frozen_submit_validation_precedes_admission
     owner_phase: P0
   error_code:CMD_NOT_CANCELABLE:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::arbiter::cancel_semantics
     owner_phase: P0
   error_code:CMD_NOT_FOUND:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::arbiter::cancel_semantics
     owner_phase: P0
   error_code:CMD_TOO_LONG:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::admission::registry_admission::frozen_submit_validation_precedes_admission
     owner_phase: P0
   error_code:COMMAND_ABORTED_IN_FLIGHT:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::arbiter::aborted_mapping_bc03
     owner_phase: P5
   error_code:CONSOLE_LINE_LIMIT_TOO_SMALL:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::pull_budget_pull_cmd
     owner_phase: P0
   error_code:CONSOLE_NOT_FOUND:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::session_core_lease::console_detach_unknown
     owner_phase: P0
   error_code:DAEMON_ALREADY_RUNNING:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::daemon_process::second_daemon_same_lock_exits_2_with_stderr
     owner_phase: P0
   error_code:DAEMON_ALREADY_RUNNING_ELSEWHERE:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::start_conflict_detects_module_form_daemon
     owner_phase: P0
     platforms:
     - linux
   error_code:DAEMON_BINARY_NOT_FOUND:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::start_binary_not_found
     owner_phase: P0
   error_code:DAEMON_EXITED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::autostart_failure_reports_stderr
     owner_phase: P4
   error_code:DAEMON_NOT_READY:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::start_not_ready_posix_15_attempts
     owner_phase: P0
   error_code:DEVICE_ALREADY_BOUND:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::session_manager::bind_paths
     owner_phase: P0
   error_code:DEVICE_NOT_BOUND:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::session_manager::session_attach_paths
     owner_phase: P0
   error_code:DEVICE_NOT_FOUND:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::drain_release::gpx_session_attach_during_plain_attach_inflight_matches_python
     owner_phase: P0
   error_code:DEVICE_NOT_PRESENT:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::drain_release::attach_not_found_device_not_present
     owner_phase: P0
   error_code:DEVICE_STILL_HELD:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_legacy_handoff::d3_2_foreign_socket_daemon_without_rpc_fails_closed
     owner_phase: P5
   error_code:DRAIN_STALLED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::custody::test_dr1_d_release_not_enqueued_keeps_ledger_then_next_release_completes
     owner_phase: P5
   error_code:ECHO_ACK_UNSUPPORTED:
     l1_only: true
@@ -1650,102 +1812,134 @@ entries:
     - windows
     rust_only: true
   error_code:EMPTY_RESPONSE:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::client_retry::empty_response
     owner_phase: P0
   error_code:ENV_FILE_SOURCE_FAILED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::restart_keeps_nested_start_stderr
     owner_phase: P0
   error_code:EXCEPTION:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::capture_p7::log_responses_match_python_golden_bytes
     owner_phase: P0
   error_code:EXPECT_REBOOT_MODE_UNSUPPORTED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::expect_reboot_parity::interactive_rejection_matches_python_cli_baseline_byte_for_byte
     owner_phase: P0
   error_code:FLASHING_BUSY:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_graceful_stop::graceful_handoff_rejection_returns_hold_context
     owner_phase: P5
   error_code:FLUSHED_BY_RECOVERY:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::arbiter::aborted_mapping_bc03
     owner_phase: P5
   error_code:FLUSHED_BY_SHUTDOWN:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::admission::test_gate_frozen_total_truncates_to_queried_time_precisely
     owner_phase: P5
   error_code:FORCE_RECOVER_TIMEOUT:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::command_exec::recover_force_timeout_after_10s
     owner_phase: P0
   error_code:INTERACTIVE_EXPIRED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::lease_selftest::lazy_expiry_keeps_tombstone_expired
     owner_phase: P6
   error_code:INTERACTIVE_NOT_FOUND:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::drain_release::stale_reply_context_rejected_after_release
     owner_phase: P0
   error_code:INTERNAL_ERROR:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::delegate_resolve::run_delegate_increments_depth_and_executes_once_with_three_environment_values
     owner_phase: P4
   error_code:INVALID_ARGS:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_com0com::rollback_rejects_com0com_flags
     owner_phase: P0
   error_code:INVALID_BENCH_CONFIG:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_connect::connect_invalid_config_extra_key
     owner_phase: P0
   error_code:INVALID_BENCH_STATE:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::endpoint_resolve::bench_bad_json
     owner_phase: P0
   error_code:INVALID_COMPLETION_REGEX:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::source_policy_parity::submit_checks_completion_then_source_then_expect_reboot
     owner_phase: P0
   error_code:INVALID_ENDPOINT:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::client_retry::invalid_timeout_crashes_only_after_endpoint_parse
     owner_phase: P0
   error_code:INVALID_EXPECT_REBOOT:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::arbiter::wp52_expect_reboot_raw_validation
     owner_phase: P0
   error_code:INVALID_JSON:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::framing::framing_byte_table
     owner_phase: P0
   error_code:INVALID_METHOD:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::framing::framing_byte_table
     owner_phase: P0
   error_code:INVALID_REQUEST:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::framing::framing_byte_table
     owner_phase: P0
   error_code:INVALID_RESPONSE:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::client_retry::invalid_response_not_transient
     owner_phase: P3
   error_code:INVALID_RULE_SCHEMA:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::event_rpc::rule_set_invalid_schema_and_type_error
     owner_phase: P0
   error_code:INVALID_TARGET:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_remote::parse_target_errors
     owner_phase: P0
   error_code:LOCAL_FILE_NOT_FOUND:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::push_local_missing
     owner_phase: P0
   error_code:LOG_OPEN_FAILED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::capture_p7::log_open_failed_detail_is_python_oserror_str
     owner_phase: P0
   error_code:METHOD_NOT_FOUND:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_legacy_handoff::legacy_b_python_script_under_versions_fails_closed
     owner_phase: P0
   error_code:MOVE_FAILED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::push_move_failed_no_cleanup
     owner_phase: P0
   error_code:MOVE_TIMEOUT:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::push_move_timeout_no_cleanup
     owner_phase: P0
   error_code:NEEDS_SUDO:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_graceful_stop::windows_service_plain_stop_requires_sudo_before_sc_config
     owner_phase: P0
     platforms:
     - linux
   error_code:NO_ACTIVE_CAPTURE:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::capture_p7::log_stop_without_capture
     owner_phase: P0
   error_code:NO_SYSTEMD:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::start_unknown_mode_routes_no_systemd
     owner_phase: P0
   error_code:PROFILE_IS_EXPLICIT:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::session_manager::pin_unpin_paths
     owner_phase: P0
   error_code:PROFILE_NOT_COMMAND_CAPABLE:
     nodeids:
@@ -1758,229 +1952,302 @@ entries:
     - cargo:sw-core::command_exec::passthrough_timeout_no_rescue_keys_no_downgrade
     owner_phase: P8
   error_code:PROMPT_TIMEOUT_FORCE_RECOVERED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::command_exec::recover_ready_path_force_fallbacks
     owner_phase: P0
   error_code:PROMPT_TIMEOUT_RECOVERED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::arbiter::complete_ok_true_drops_error_code
     owner_phase: P0
   error_code:PULL_PARSE_FAILED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::pull_parse_failed
     owner_phase: P0
   error_code:READY_UNCONFIRMED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::command_exec::wp55_submit_time_trust_matrix
     owner_phase: P0
   error_code:REMOTE_BIND_UNVERIFIED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_remote::open_role_probe_unverified_no_retry
     owner_phase: P0
   error_code:REMOTE_NOT_SUPPORTED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_connect::windows_connect_supported
     owner_phase: P4
   error_code:RULE_NOT_FOUND:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::event_rpc::rule_delete_get_list_and_not_found
     owner_phase: P0
   error_code:SAMPLE_READ_FAILED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-proto::error_codes_sync::cli_codes_used_by_p3_exist_with_cli_interface
     owner_phase: P0
   error_code:SEND_FAILED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::arbiter::aborted_mapping_bc03
     owner_phase: P5
   error_code:SESSION_BUSY:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_legacy_handoff::d8_disabled_running_unit_stays_disabled_after_refusal
     owner_phase: P0
   error_code:SESSION_INTERACTIVE_BUSY:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::command_exec::submit_during_agent_lease_is_rejected_at_execute_time
     owner_phase: P6
   error_code:SESSION_NOT_FOUND:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::client_retry::non_transient_no_retry
     owner_phase: P0
   error_code:SESSION_NOT_READY:
     nodeids:
     - cargo:sw-core::session_core::attached_passthrough_submit_not_ready_with_ready_in
     owner_phase: P8
   error_code:SESSION_QUEUE_FULL:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::admission::registry_admission::rejected_after_admission_releases_ticket
     owner_phase: P5
   error_code:SESSION_RECOVERING:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::command_exec::reboot_flushes_commands_queued_behind_it
     owner_phase: P5
   error_code:SOCKET_ERROR:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::cli_trace::trace_line_exact
     owner_phase: P0
   error_code:SOCKET_UNAVAILABLE:
-    nodeids: []
+    nodeids:
+    - cargo:sw-pal::lock::socket_probe_eacces_is_socket_unavailable
     owner_phase: P0
     platforms:
     - linux
   error_code:SOURCE_RESERVED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::file_transfer_session::rpc_invalid_args_matrix
     owner_phase: P0
   error_code:SSH_NOT_FOUND:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_remote::remote_ssh_resolution_precedes_endpoint_and_registry
     owner_phase: P0
   error_code:STATE_CHANGED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::recover_p7::recover_responses_match_python_golden_bytes
     owner_phase: P0
   error_code:TARGET_DECODER_FAILED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::push_decoder_failed
     owner_phase: P0
   error_code:TARGET_DECODER_MISSING:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::push_decoder_missing
     owner_phase: P0
   error_code:TARGET_ENCODER_FAILED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::pull_encoder_failed
     owner_phase: P0
   error_code:TARGET_ENCODER_MISSING:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::pull_encoder_missing
     owner_phase: P0
   error_code:TEST_DEVICE_ALLOWLIST_REJECTED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::daemon_process::allowlist_rejected_before_runtime_dirs_and_lock
     owner_phase: P1
   error_code:TIMEOUT:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::client_retry::backoff_caps_at_5s
     owner_phase: P0
   error_code:TRANSFER_ECHO_STALL:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::echo_paced::echo_stall_sends_one_cancel_line_only
     owner_phase: P0
   error_code:TRANSFER_PROBE_FAILED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::pull_probe_shell_error
     owner_phase: P0
   error_code:TRANSFER_TIMEOUT:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::pull_probe_timeout
     owner_phase: P0
   error_code:TUNNEL_CONFLICT:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_remote::open_conflict_different_identity
     owner_phase: P0
   error_code:TUNNEL_SPAWN_FAILED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_remote::open_spawn_failed_empty_tail_uses_error_code_as_message
     owner_phase: P0
   error_code:TUNNEL_STATUS_ERROR:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_connect::benches_status_tunnels_from_error_shapes
     owner_phase: P0
   error_code:TUNNEL_STILL_ACTIVE:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_connect::connect_close_still_active
     owner_phase: P0
   error_code:UNKNOWN_BENCH_CODE:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_connect::connect_unknown_code
     owner_phase: P0
   error_code:UNKNOWN_PROFILE:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::session_manager::pin_unpin_paths
     owner_phase: P0
   error_code:WAL_MISSING:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::log_tail_raw_wal_missing_shape
     owner_phase: P0
   last_error:ATTACH_FAILED:*:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::drain_release::attach_other_open_error_detached_attach_failed
     owner_phase: P0
   last_error:BCM_PROMPT_TIMEOUT:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::login_fsm_full::is_prompt_timeout_error_suffix
     owner_phase: P0
   last_error:BOOTLOADER_STUCK:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::reprobe::df27_post_login_timeout_is_reprobe_eligible
     owner_phase: P0
   last_error:BRIDGE_DOWN:*:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::drain_release::wp510_review7_worker_close_unconfirmed_registers_by_id
     owner_phase: P0
   last_error:CLEARED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::command_exec::wp56_detach_clears_evidence_wait
     owner_phase: P0
   last_error:CONSOLE_UNLOCK_BOOTLOADER:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::login_fsm_full::console_unlock_idle_timeout_and_bootloader
     owner_phase: P0
   last_error:CONSOLE_UNLOCK_IDLE_TIMEOUT:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::login_fsm_full::console_unlock_idle_timeout_and_bootloader
     owner_phase: P0
   last_error:CONSOLE_UNLOCK_PROMPT_TIMEOUT:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::login_fsm_full::console_unlock_idle_timeout_and_bootloader
     owner_phase: P0
   last_error:CREDENTIALS_UNRESOLVED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::login_fsm_full::console_unlock_idle_timeout_and_bootloader
     owner_phase: P0
   last_error:DEVICE_NOT_FOUND:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::drain_release::gpx_session_attach_during_plain_attach_inflight_matches_python
     owner_phase: P0
   last_error:DEVICE_REBOUND_REQUIRED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::custody::wp510r_i25_ignored_device_attached_does_not_overwrite_diagnostic_path
     owner_phase: P0
   last_error:DEVICE_REMOVED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::command_exec::wp56_detach_clears_evidence_wait
     owner_phase: P0
   last_error:DEVICE_REMOVED_DURING_ATTACH:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::session_core::device_removed_during_attach_uses_python_last_error
     owner_phase: P0
   last_error:LOGIN_PROMPT_TIMEOUT:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::drain_release::login_failure_detaches_after_receipt
     owner_phase: P0
   last_error:LOGIN_REQUIRED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::custody::wp510r_i25_ignored_device_attached_does_not_overwrite_diagnostic_path
     owner_phase: P0
   last_error:LOGIN_USER_REQUIRED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::login_fsm_full::flood_reclassification_threshold_is_inclusive_20000
     owner_phase: P0
   last_error:PASS_ENV_MISSING:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::login_fsm_full::password_resolution_errors
     owner_phase: P0
   last_error:PASS_ENV_REQUIRED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::login_fsm_full::password_resolution_errors
     owner_phase: P0
   last_error:POST_LOGIN_CMD_TIMEOUT:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::login_fsm_full::post_login_timeout_split
     owner_phase: P0
   last_error:PROMPT_TIMEOUT:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::arbiter::complete_ok_false
     owner_phase: P0
   last_error:PROMPT_UNAVAILABLE:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::login_fsm_full::flood_reclassification_threshold_is_inclusive_20000
     owner_phase: P0
   last_error:PRPL_PROMPT_TIMEOUT:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::login_fsm_full::prompt_timeout_error_by_platform
     owner_phase: P0
   last_error:READY_NONCE_TIMEOUT:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::command_exec::recover_attached_reprobe_not_recovered_last_error_field
     owner_phase: P0
   last_error:READY_PROMPT_TIMEOUT:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::login_quiet::flood_masking_exact_set
     owner_phase: P0
   last_error:REBOOTING:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::command_exec::wp56_banner_then_prompt_restores_ready
     owner_phase: P0
   last_error:REBOUND:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::drain_release::phase1_snapshot_sets_reason_and_clears_foreground
     owner_phase: P0
   last_error:RECOVERY_ERROR:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::session_core_login_exc_p7::reboot_recovery_raised_records_recovery_error
     owner_phase: P0
   last_error:RECOVERY_TIMEOUT:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::command_exec::reboot_recovery_timeout_to_attached
     owner_phase: P0
   last_error:RELEASED:
-    nodeids: []
+    nodeids:
+    - cargo:sw-cli::mgmt_graceful_stop::graceful_handoff_process_scan_failure_is_not_released
     owner_phase: P0
   last_error:REPROBE_FAILED:*:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::reprobe::df27_post_login_timeout_is_reprobe_eligible
     owner_phase: P0
   last_error:RX_FLOOD:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::lease_selftest::selftest_order_table
     owner_phase: P0
   last_error:SHELL_PROMPT_TIMEOUT:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::login_fsm_full::is_prompt_timeout_error_suffix
     owner_phase: P0
   last_error:TRANSPORT_STALL:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::p7_skeleton::p7_public_items_are_reachable
     owner_phase: P0
   rpc_method:alias.assign:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::alias_assign_shape
     owner_phase: P5
   rpc_method:alias.list:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::contract_coverage_alias_unassign_pin_unpin_rpc_routes
     owner_phase: P0
   rpc_method:alias.set:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::alias_set_empty_alias_allowed
     owner_phase: P5
   rpc_method:alias.unassign:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::contract_coverage_alias_unassign_pin_unpin_rpc_routes
     owner_phase: P5
   rpc_method:command.cancel:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::command_cancel_queued_command
     owner_phase: P5
   rpc_method:command.get:
     nodeids:
@@ -2009,49 +2276,64 @@ entries:
     - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
     owner_phase: P8
   rpc_method:daemon.handoff_stop:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::unknown_method_not_found
     owner_phase: P0
   rpc_method:daemon.stop:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::daemon_process::no_profiles_message_and_continue
     owner_phase: P0
   rpc_method:device.attach:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::gpx_device_attach_open_failures_match_python_wire
     owner_phase: P5
   rpc_method:device.list:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::device_list_sorted_by_by_id
     owner_phase: P0
   rpc_method:device.release:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::device_release_reason_is_raw_json
     owner_phase: P5
   rpc_method:event.com_disable:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::event_rpc::com_toggle_status_reset_reload_tail
     owner_phase: P5
   rpc_method:event.com_enable:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::event_rpc::com_toggle_status_reset_reload_tail
     owner_phase: P5
   rpc_method:event.com_status:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::event_rpc::com_toggle_status_reset_reload_tail
     owner_phase: P0
   rpc_method:event.reload:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::event_rpc::com_toggle_status_reset_reload_tail
     owner_phase: P5
   rpc_method:event.reset:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::event_rpc::com_toggle_status_reset_reload_tail
     owner_phase: P5
   rpc_method:event.rule_delete:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::event_rpc::rule_delete_get_list_and_not_found
     owner_phase: P5
   rpc_method:event.rule_get:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::event_rpc::rule_delete_get_list_and_not_found
     owner_phase: P0
   rpc_method:event.rule_list:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::event_rpc::rule_delete_get_list_and_not_found
     owner_phase: P0
   rpc_method:event.rule_set:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::event_rpc::rule_set_response_spreads_raw_with_ok_first
     owner_phase: P5
   rpc_method:event.tail:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::event_rpc::com_toggle_status_reset_reload_tail
     owner_phase: P0
   rpc_method:file.pull:
     nodeids:
@@ -2074,16 +2356,20 @@ entries:
     - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
     owner_phase: P8
   rpc_method:health.ping:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::health_ping_pong
     owner_phase: P0
   rpc_method:health.status:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::health_status_key_order_and_limits
     owner_phase: P0
   rpc_method:log.tail_raw:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::log_tail_raw_latest_mode_keys
     owner_phase: P0
   rpc_method:log.tail_text:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::log_tail_text_limit_zero_means_200
     owner_phase: P0
   rpc_method:mcu.patterns:
     nodeids:
@@ -2101,7 +2387,8 @@ entries:
     - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
     owner_phase: P8
   rpc_method:session.activity:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::activity_selector_chain_session_id
     owner_phase: P0
   rpc_method:session.attach:
     nodeids:
@@ -2114,10 +2401,12 @@ entries:
     - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
     owner_phase: P8
   rpc_method:session.bind:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::gpx_rpc_bind_timeout_then_replug_persists_binding
     owner_phase: P5
   rpc_method:session.clear:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::wp58_g14_rpc_clear_ready_with_device_returns_null_last_error
     owner_phase: P5
   rpc_method:session.console_attach:
     nodeids:
@@ -2134,10 +2423,12 @@ entries:
     - cargo:sw-core::session_core_lease::console_list_shape_sorted_and_prunes_stale
     owner_phase: P8
   rpc_method:session.get_state:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::session_rpc_p7::session_public_fields_p7
     owner_phase: P0
   rpc_method:session.interactive_close:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::wp51_interactive_owner_policy
     owner_phase: P6
   rpc_method:session.interactive_open:
     nodeids:
@@ -2164,19 +2455,24 @@ entries:
     - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
     owner_phase: P8
   rpc_method:session.list:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::session_list_sorted_by_session_id
     owner_phase: P0
   rpc_method:session.log_start:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::session_rpc_p7::log_rpcs_shapes
     owner_phase: P5
   rpc_method:session.log_status:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::session_rpc_p7::log_rpcs_shapes
     owner_phase: P0
   rpc_method:session.log_stop:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::session_rpc_p7::log_rpcs_shapes
     owner_phase: P5
   rpc_method:session.pin:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::contract_coverage_alias_unassign_pin_unpin_rpc_routes
     owner_phase: P5
   rpc_method:session.recover:
     nodeids:
@@ -2189,25 +2485,32 @@ entries:
     - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
     owner_phase: P8
   rpc_method:session.self_test:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::self_test_unknown_selector_has_lease_context_and_command_capable
     owner_phase: P5
   rpc_method:session.unpin:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::contract_coverage_alias_unassign_pin_unpin_rpc_routes
     owner_phase: P5
   rpc_method:wal.current_seq:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::wal_current_seq_shape
     owner_phase: P0
   rpc_method:wal.range:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::wal_range_keys_without_truncated
     owner_phase: P0
   rpc_method:wal.reset:
-    nodeids: []
+    nodeids:
+    - cargo:sw-daemon::dispatch::wal_reset_shape
     owner_phase: P5
   schema:state_file:
-    nodeids: []
+    nodeids:
+    - cargo:sw-core::state_store::python_bytes_roundtrip_exactly
     owner_phase: P0
   schema:wal_record:
-    nodeids: []
+    nodeids:
+    - cargo:sw-proto::wal_types_golden::test_wal_record_to_line_golden
     owner_phase: P0
 schema_version: 1
 # 參數化基底 nodeid 的必要參數完整集合（P8X-24c6b39-3）：判定器把基底展開成全部參數節點，

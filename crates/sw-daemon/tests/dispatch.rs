@@ -3635,6 +3635,64 @@ fn alias_assign_shape() {
     );
 }
 
+/// S2-GP-gpz ITEM 7：補齊 alias.unassign、session.pin／unpin 的 RPC 到 manager 接線證據。
+#[test]
+fn contract_coverage_alias_unassign_pin_unpin_rpc_routes() {
+    let r = ServiceRig::ready_shell();
+    let session_id = r.mgr.resolve("COM0").expect("COM0 session");
+    assert_eq!(
+        j(&r.call(
+            "alias.set",
+            &format!(r#"{{"session_id":"{session_id}","alias":"dut0"}}"#),
+        )),
+        format!(
+            "{{\"ok\":true,\"session_id\":\"{session_id}\",\"alias\":\"dut0\",\"version\":\"{}\"}}",
+            r.version
+        ),
+        "alias.set RPC wire"
+    );
+    let unassigned = r.call("alias.unassign", r#"{"alias":"dut0"}"#);
+    assert_eq!(
+        j(&unassigned),
+        format!(
+            "{{\"ok\":true,\"alias\":\"dut0\",\"version\":\"{}\"}}",
+            r.version
+        ),
+        "alias.unassign RPC wire"
+    );
+    let aliases = r.call("alias.list", "{}");
+    let rows = match aliases.get("aliases") {
+        Some(PyValue::List(rows)) => rows,
+        other => panic!("alias.list 應回 aliases 清單：{other:?}"),
+    };
+    assert!(
+        rows.iter().all(|row| {
+            !matches!(row, PyValue::Dict(row) if row.get("alias") == Some(&PyValue::from("dut0")))
+        }),
+        "alias.unassign 後不得留下 dut0：{}",
+        j(&aliases)
+    );
+
+    let dynamic = ServiceRig::templates_only(&[(BY_ID_A, REAL_A)]);
+    wait_until("動態 COM0 session", || dynamic.session("COM0").is_some());
+    assert_eq!(
+        j(&dynamic.call("session.pin", r#"{"selector":"COM0","profile":"t"}"#)),
+        format!(
+            "{{\"ok\":true,\"device_key\":\"{BY_ID_A}\",\"profile\":\"t\",\"version\":\"{}\"}}",
+            dynamic.version
+        ),
+        "session.pin RPC wire"
+    );
+    assert_eq!(
+        j(&dynamic.call("session.unpin", r#"{"selector":"COM0"}"#)),
+        format!(
+            "{{\"ok\":true,\"device_key\":\"{BY_ID_A}\",\"version\":\"{}\"}}",
+            dynamic.version
+        ),
+        "session.unpin RPC wire"
+    );
+}
+
 #[test]
 fn mcu_patterns_exact() {
     let r = ServiceRig::ready_shell();
@@ -4921,6 +4979,137 @@ fn gpx_rpc_recover_huge_timeout_keeps_side_lane() {
     );
 
     assert_eq!(s(&normal, "classification"), "OK", "{}", j(&normal));
+}
+
+/// OD-57／DF-23：登入進行中 release 後，再由 RPC attach 必須仍能回到 READY。
+/// Python 基線的 release／attach 路徑見 `origin/main:sw_core/session_manager.py:3084-3130`、`:3400-3444`；
+/// 此處以真 `Service`／`SessionManager` 驅動 `Service::rpc` → manager actor → login completion／release。
+#[test]
+fn df23_rpc_release_during_login_then_attach_returns_ready() {
+    let r = ServiceRig::ready_shell();
+    let dev = r.device(REAL_A).clone();
+
+    let released = r.call("device.release", r#"{"selector":"COM0"}"#);
+    assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&released));
+    assert_eq!(s(&sub(&released, "session"), "state"), "RELEASED");
+
+    let first_tx = dev.tx_len();
+    let first_attach = r.call("device.attach", r#"{"selector":"COM0"}"#);
+    assert_eq!(first_attach.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&first_attach));
+    assert_eq!(s(&sub(&first_attach, "session"), "state"), "ATTACHING");
+    wait_until("第一次 attach 登入 probe", || dev.tx_since(first_tx).contains(&b'\n'));
+
+    let release_during_login = r.call("device.release", r#"{"selector":"COM0"}"#);
+    assert_eq!(
+        release_during_login.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&release_during_login)
+    );
+    let released_session = sub(&release_during_login, "session");
+    assert_eq!(s(&released_session, "state"), "RELEASED");
+    let expected_release = sw_proto::pydict! {
+        "ok" => true,
+        "session" => PyValue::Dict(released_session.clone()),
+        "closed_consoles" => 0,
+        "aborted_cmd" => false,
+        "version" => r.version.clone(),
+    };
+    assert_eq!(j(&release_during_login), j(&expected_release), "release RPC wire");
+    assert!(!dev.is_open(), "release 回覆時舊 login bridge handle 必須已關閉");
+
+    let second_tx = dev.tx_len();
+    let second_attach = r.call("device.attach", r#"{"selector":"COM0"}"#);
+    assert_eq!(second_attach.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&second_attach));
+    assert_eq!(s(&sub(&second_attach, "session"), "state"), "ATTACHING");
+    wait_until("第二次 attach 登入 probe", || dev.tx_since(second_tx).contains(&b'\n'));
+    dev.push_rx(b"root@t:/# ");
+    r.wait_state("COM0", "READY");
+
+    assert!(dev.is_open(), "第二次 attach 的 bridge 必須保持開啟");
+    assert_eq!(s(&r.session("COM0").expect("COM0"), "state"), "READY");
+}
+
+/// OD-73／DF-24：force recover 執行中 `session.list` 必須能即時回覆，不等待同一個全域 session lock。
+/// Python 基線在 `origin/main:sw_core/session_manager.py:7938-8065` 持鎖執行 `_force_recover`；
+/// RPC 入口與 list 分支見 `origin/main:sw_core/service.py:1071-1072,1102-1108`。
+#[test]
+fn df24_rpc_session_list_completes_during_force_recover() {
+    let r = ServiceRig::build(RigSpec {
+        yaml: format!(
+            "profiles:\n  t:\n    platform: passthrough\n    prompt_regex: '.*'\n    timeout_s: 2.0\ntargets:\n  - {{com: COM0, profile: t, device_by_id: {BY_ID_A}}}\n"
+        ),
+        devices: vec![(BY_ID_A.into(), REAL_A.into())],
+        explicit_target_count: 1,
+        allowlist: None,
+        wait_ready: vec![],
+    });
+    r.wait_state("COM0", "ATTACHED");
+    r.svc.set_long_route_timeout_for_test(Duration::from_secs(15));
+    let dev = r.device(REAL_A).clone();
+    assert!(dev.is_open(), "測試前置：ATTACHED bridge 已開啟");
+    dev.pause_next_close();
+
+    let (recover_tx, recover_rx) = crossbeam_channel::bounded(1);
+    let recover_svc = r.svc.clone();
+    let recover_thread = std::thread::spawn(move || {
+        let result = recover_svc.rpc(
+            "session.recover",
+            &sw_proto::pydict! { "selector" => "COM0", "force" => true },
+        );
+        let _ = recover_tx.send(result);
+    });
+
+    let paused = dev.wait_paused(Duration::from_secs(5));
+    if !paused {
+        dev.release_pause();
+        let _ = recover_rx.recv_timeout(Duration::from_secs(5));
+        panic!("force recover 未進入 clear 的 bridge close");
+    }
+    assert!(recover_rx.try_recv().is_err(), "force recover 應仍在執行");
+    assert_eq!(
+        s(&r.session("COM0").expect("COM0 session"), "state"),
+        "RECOVERING",
+        "close 暫停時 force recover 應已凍結 session"
+    );
+
+    let started = Instant::now();
+    let listed = r.call("session.list", "{}");
+    let elapsed = started.elapsed();
+    assert_eq!(listed.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&listed));
+    assert!(elapsed < Duration::from_secs(1), "force recover 期間 session.list 應在 1 秒內回覆：{elapsed:?}");
+    assert!(recover_rx.try_recv().is_err(), "session.list 回覆時 force recover 尚未完成");
+
+    dev.release_pause();
+    r.wait_state("COM0", "ATTACHED");
+    let mut result = None;
+    for _ in 0..60 {
+        if let Ok(value) = recover_rx.try_recv() {
+            result = Some(value);
+            break;
+        }
+        r.clock.advance(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let recovered = result
+        .unwrap_or_else(|| {
+            panic!(
+                "逐秒推進 FakeClock 後 force recover 應完成；session={}、device_open={}、clock={:?}",
+                j(&r.session("COM0").expect("COM0")),
+                dev.is_open(),
+                r.clock.elapsed(),
+            )
+        })
+        .expect("session.recover RPC");
+    assert_eq!(
+        s(&recovered, "error_code"),
+        "FORCE_RECOVER_TIMEOUT",
+        "{}",
+        j(&recovered)
+    );
+    assert_eq!(s(&recovered, "action"), "FORCE_CLEAR_REATTACH");
+    assert_eq!(s(&r.session("COM0").expect("COM0"), "state"), "ATTACHED");
+    recover_thread.join().expect("recover RPC thread");
 }
 
 /// 對照 `tests/test_async_reboot_evidence.py` 的 `TestStaleShellNonceBeforeBanner`、`TestGraceExpiryDoesNotDeadlock`

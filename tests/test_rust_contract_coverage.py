@@ -1532,3 +1532,115 @@ def test_prior_slice_identity_mismatch_is_reported_and_rejected(tmp_path, mismat
     assert output["identity_errors"]
     source = {"slice21": "2.1", "slice22": "2.2", "slice23": "2.3"}[source_key]
     assert output["prior_sources"][source]["accepted"] is False
+
+
+def test_stage2_contract_ids_have_locked_rust_coverage_not_stage1_python():
+    """OD-88：P0～P7 契約須對應鎖定的 Rust 節點，不得沿用 Stage 1 Python 節點。"""
+    cc = _module()
+    universe = cc.universe(
+        ROOT / "contracts", ROOT / "tests/acceptance/cases.yaml",
+        ROOT / "tests/acceptance/cases.lock.json", ROOT / "contracts/coverage_map.yaml",
+    )
+    contract_ids = {
+        contract_id: item for contract_id, item in universe.items()
+        if not contract_id.startswith("case:")
+    }
+    stage2_targets = {
+        contract_id: item for contract_id, item in contract_ids.items()
+        if item.get("owner_phase") in {f"P{phase}" for phase in range(8)}
+        # OD-88 的 269 個靜態缺口含 DF-26；保留其既有 P8 phase 歸屬。
+        or contract_id == "bc:DF-26"
+    }
+    assert len(stage2_targets) == 269, f"OD-88 靜態 universe 數量改變：{len(stage2_targets)}"
+    missing = sorted(
+        contract_id for contract_id, item in stage2_targets.items()
+        if not item.get("nodeids") and not cc._is_owner_blocked(item)
+    )
+    assert not missing, f"未映射的 P0～P7 契約 ID：{missing}"
+    owner_blocked_missing = sorted(
+        contract_id for contract_id, item in stage2_targets.items()
+        if not item.get("nodeids") and cc._is_owner_blocked(item)
+    )
+    assert owner_blocked_missing == ["bc:SC-26"], (
+        f"未映射項目須逐一維持 BLOCKED-OWNER：{owner_blocked_missing}"
+    )
+
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    sets = lock.get("sets", {})
+    locked_nodeids = {
+        nodeid
+        for platforms in sets.values()
+        if isinstance(platforms, dict)
+        for rows in platforms.values()
+        if isinstance(rows, dict)
+        for nodeid in rows.get("nodeids", [])
+        if isinstance(nodeid, str)
+    }
+    stage1_python_sets = {"s1_pytest_full", "s1a_blackbox", "s1a_delegation", "s1b_20groups"}
+    stage1_python_nodeids = {
+        nodeid
+        for set_name in stage1_python_sets
+        for rows in sets.get(set_name, {}).values()
+        if isinstance(rows, dict)
+        for nodeid in rows.get("nodeids", [])
+        if isinstance(nodeid, str)
+    }
+    map_doc = cc._read_yaml(ROOT / "contracts/coverage_map.yaml")
+    parametrized = map_doc.get("parametrized", {})
+    referenced_rust_nodes = set()
+    unlocked = set()
+    for item in stage2_targets.values():
+        for nodeid in item.get("nodeids", []):
+            params = parametrized.get(nodeid)
+            expanded = [f"{nodeid}[{param}]" for param in params] if params is not None else [nodeid]
+            for executable_nodeid in expanded:
+                if executable_nodeid in locked_nodeids:
+                    referenced_rust_nodes.add(executable_nodeid)
+                else:
+                    unlocked.add(executable_nodeid)
+    unlocked = sorted(unlocked)
+    stage1_python = sorted(referenced_rust_nodes & stage1_python_nodeids)
+    assert not unlocked, f"coverage_map 引用了未登記的 nodeid：{unlocked}"
+    assert not stage1_python, f"coverage_map 沿用 Stage 1 Python nodeid：{stage1_python}"
+
+    capability_nodeids = {
+        nodeid for nodeid in referenced_rust_nodes
+        if nodeid.startswith("cargo:") and nodeid.rsplit("::", 1)[-1].startswith("cap_")
+    }
+    capability_set_nodeids = set()
+    non_capability_memberships = set()
+    wrong_capability_selectors = set()
+    malformed_capability_nodeids = set()
+    for nodeid in capability_nodeids:
+        test_name = nodeid.rsplit("::", 1)[-1]
+        capability_prefix, separator, _test_suffix = test_name.partition("__")
+        if not separator or not capability_prefix.startswith("cap_"):
+            malformed_capability_nodeids.add(nodeid)
+            continue
+        required_selector_arg = f"{capability_prefix}__"
+        for platforms in sets.values():
+            if not isinstance(platforms, dict):
+                continue
+            for rows in platforms.values():
+                if not isinstance(rows, dict) or nodeid not in rows.get("nodeids", []):
+                    continue
+                argv = rows.get("selector", {}).get("argv", [])
+                if "--ignored" not in argv:
+                    non_capability_memberships.add(nodeid)
+                elif required_selector_arg not in argv:
+                    wrong_capability_selectors.add(nodeid)
+                else:
+                    capability_set_nodeids.add(nodeid)
+    missing_capability_sets = sorted(capability_nodeids - capability_set_nodeids)
+    assert not non_capability_memberships, (
+        f"能力 nodeid 混入一般鎖集合：{sorted(non_capability_memberships)}"
+    )
+    assert not wrong_capability_selectors, (
+        f"能力 nodeid 登記在錯誤的 --ignored selector：{sorted(wrong_capability_selectors)}"
+    )
+    assert not malformed_capability_nodeids, (
+        f"能力 nodeid 格式錯誤：{sorted(malformed_capability_nodeids)}"
+    )
+    assert not missing_capability_sets, (
+        f"能力 nodeid 未登記在 --ignored 能力集合：{missing_capability_sets}"
+    )
