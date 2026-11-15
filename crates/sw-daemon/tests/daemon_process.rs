@@ -327,8 +327,13 @@ fn serialwrap_config_env_read_and_write_target() {
     let mut vars = env.vars.clone();
     vars.insert(ALLOWLIST.to_string(), String::new());
     vars.insert("SERIALWRAP_CONFIG".to_string(), alt.display().to_string());
+    let started_a = Instant::now();
     let mut d = DaemonProc::spawn_with(&env, &vars, &[]);
     wait_socket(&env.socket, SHORT);
+    eprintln!(
+        "[gpz16] startup_ready_ms={} case=SERIALWRAP_CONFIG",
+        started_a.elapsed().as_millis()
+    );
     let h = health_status(&env.socket);
     assert_eq!(h["test_device_allowlist"]["source"], "config");
     assert_eq!(h["test_device_allowlist"]["coms"][0], "/x/by-id/b-alt");
@@ -351,8 +356,13 @@ fn serialwrap_config_env_read_and_write_target() {
     fs::write(&env.system_config, sys_yaml).unwrap();
     let mut vars2 = env.vars.clone();
     vars2.insert(ALLOWLIST.to_string(), String::new());
+    let started_b = Instant::now();
     let mut d2 = DaemonProc::spawn_with(&env, &vars2, &[]);
     wait_socket(&env.socket, SHORT);
+    eprintln!(
+        "[gpz16] startup_ready_ms={} case=system-config-fallback",
+        started_b.elapsed().as_millis()
+    );
     let h2 = health_status(&env.socket);
     assert_eq!(h2["test_device_allowlist"]["source"], "config");
     assert_eq!(h2["test_device_allowlist"]["coms"][0], "/sys/by-id/c");
@@ -828,7 +838,14 @@ fn daemon_stop_during_force_recover_with_client_gone() {
         r#"{"id":3,"method":"session.recover","params":{"selector":"COM0","force":true}}"#, STOP
     );
     let sent = Instant::now();
+    env.target_hold_reply();
     send_and_drop(&env.socket, &payload); // 送出後立即斷線
+    wait_until(
+        "假 DUT 收到 Ctrl-C（回應仍暫停）",
+        Duration::from_millis(1500),
+        || env.target_rx().contains(&0x03),
+    );
+    env.target_release_reply();
 
     // 收斂以救援 TX 實際寫入 WAL 為準（不以狀態判斷：COM0 起始即 READY）。
     wait_until("救援 TX 寫入 WAL", LONG, || {

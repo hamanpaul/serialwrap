@@ -270,6 +270,22 @@ impl IsolatedEnv {
             .pause(seconds);
     }
 
+    /// 暫停假 DUT 的所有回應，直到測試明確放行；不依賴固定延遲。
+    pub fn target_hold_reply(&mut self) {
+        self.target
+            .as_mut()
+            .expect("無 PTY 假 DUT：請改用 isolated_env_with_pty_target()")
+            .hold_reply(true);
+    }
+
+    /// 放行假 DUT 的累積回應。
+    pub fn target_release_reply(&mut self) {
+        self.target
+            .as_mut()
+            .expect("無 PTY 假 DUT：請改用 isolated_env_with_pty_target()")
+            .hold_reply(false);
+    }
+
     /// 讓假 DUT 不再回 prompt（DUT 靜默）。
     pub fn target_mute(&mut self) {
         self.target
@@ -281,8 +297,8 @@ impl IsolatedEnv {
 
 /// PTY 假 DUT 子行程（以 `bb_faketarget.FakeTarget` 驅動；協定：stdin 一行一指令，stdout 一行一回應）。
 ///
-/// 指令：`RX`（回 `RX <hex>`，假 DUT 收到的全部位元組）、`MUTE`（改 prompt 為不可匹配字串，回 `OK`）、`EXIT`。
-/// `MUTE` 為暫時手段：Task 15a 的 `FakeTarget.pause_responding` 落地後改用之。
+/// 指令：`RX`（回 `RX <hex>`，假 DUT 收到的全部位元組）、`MUTE`（改 prompt 為不可匹配字串）、
+/// `PAUSE <秒>`（限時暫停回應）、`HOLD_REPLY`／`RELEASE_REPLY`（由測試同步控制回應）、`EXIT`。
 pub struct FakeTargetProc {
     child: Child,
     stdin: ChildStdin,
@@ -319,6 +335,12 @@ for raw in sys.stdin:
         print("OK", flush=True)
     elif cmd.startswith("PAUSE "):
         ft.pause_responding(float(cmd.split(" ", 1)[1]))
+        print("OK", flush=True)
+    elif cmd == "HOLD_REPLY":
+        ft.hold_reply(True)
+        print("OK", flush=True)
+    elif cmd == "RELEASE_REPLY":
+        ft.hold_reply(False)
         print("OK", flush=True)
     elif cmd == "EXIT":
         break
@@ -384,6 +406,11 @@ impl FakeTargetProc {
             "OK",
             "假 DUT PAUSE 失敗"
         );
+    }
+
+    fn hold_reply(&mut self, on: bool) {
+        let command = if on { "HOLD_REPLY" } else { "RELEASE_REPLY" };
+        assert_eq!(self.send(command), "OK", "假 DUT {command} 失敗");
     }
 }
 
