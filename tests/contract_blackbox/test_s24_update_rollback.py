@@ -41,6 +41,7 @@ import pytest
 
 from bb_l15 import bundle_manifest_path, resume_pause, update_bundles, wait_pause
 from bb_harness import ab_label
+from mcu_flash_parity import record_observation
 from p8_fixtures import FakeFlasher, HolderSampler
 
 pytestmark = [pytest.mark.posix_only]
@@ -451,6 +452,30 @@ class HeldPush:
         assert self.remote.read_bytes() == self.data, f"{what}：DUT 端檔案 md5 正確（外部 oracle）"
 
 
+def _record_update_guard_observation(nodeid: str, r, data: dict, key: str) -> None:
+    steps = (data.get(key) or {}).get("steps") or []
+    safety_detail = next((step.get("detail") or {} for step in steps if step.get("step") == "safety_check"), {})
+    busy = [
+        {
+            "com": row.get("com"),
+            "foreground_busy": row.get("foreground_busy"),
+            "interactive": bool(row.get("interactive_session_id")),
+            "ops": sorted(row.get("ops") or []),
+        }
+        for row in (data.get("busy") or [])
+    ]
+    record_observation(
+        "s24-upd-guards",
+        nodeid,
+        exit_code=r.returncode,
+        error_code=data.get("error_code"),
+        phase=data.get("phase"),
+        handoff=data.get("handoff"),
+        force_ignored=safety_detail.get("force_ignored"),
+        busy=busy,
+    )
+
+
 def _rollback_while_push(
     sw_env,
     shell_target,
@@ -458,6 +483,7 @@ def _rollback_while_push(
     *,
     force: bool,
     timing: str,
+    nodeid: str,
     scope_update_to_test_daemon: bool = False,
 ) -> None:
     pid = _ready(sw_env, shell_target)
@@ -473,6 +499,7 @@ def _rollback_while_push(
         if timing == "before_probe":
             push = HeldPush(sw_env, shell_target, tmp_path, "before")
             r, data = inst.setup(*args)
+            _record_update_guard_observation(nodeid, r, data, "rollback")
             _assert_refused(r, data, "SESSION_BUSY", force=force, key="rollback", what=what)
             busy = data.get("busy") or []
             assert any(row.get("com") == "COM0" and row.get("foreground_busy") is True for row in busy), f"{what}：{data}"
@@ -491,6 +518,7 @@ def _rollback_while_push(
             runner.join(120)
             assert not runner.is_alive(), f"{what}：setup 未在 120 s 內結束"
             r, data = out["r"], out["data"]
+            _record_update_guard_observation(nodeid, r, data, "rollback")
             _assert_refused(r, data, "SESSION_BUSY", force=force, key="rollback", what=what)
             assert data.get("handoff") == "refused", f"{what}：交接由 daemon 原子判定拒絕：{data}"
             busy = data.get("busy") or []
@@ -505,13 +533,14 @@ def _rollback_while_push(
 @pytest.mark.posix_pty
 @pytest.mark.process_rpc
 @pytest.mark.parametrize("timing", ["before_probe", "after_probe"])
-def test_rollback_refuses_while_push(sw_env, shell_target, tmp_path, timing):
+def test_rollback_refuses_while_push(sw_env, shell_target, tmp_path, timing, request):
     _rollback_while_push(
         sw_env,
         shell_target,
         tmp_path,
         force=False,
         timing=timing,
+        nodeid=request.node.nodeid,
         scope_update_to_test_daemon=timing == "after_probe",
     )
 
@@ -523,7 +552,7 @@ def test_rollback_refuses_while_push(sw_env, shell_target, tmp_path, timing):
     pytest.param("update", "before_probe", id="update"),
     pytest.param("rollback", "after_probe", id="rollback-after-probe"),
 ])
-def test_rollback_force_refuses_while_push(sw_env, shell_target, tmp_path, entry, timing):
+def test_rollback_force_refuses_while_push(sw_env, shell_target, tmp_path, entry, timing, request):
     if entry == "rollback":
         _rollback_while_push(
             sw_env,
@@ -531,6 +560,7 @@ def test_rollback_force_refuses_while_push(sw_env, shell_target, tmp_path, entry
             tmp_path,
             force=True,
             timing=timing,
+            nodeid=request.node.nodeid,
             scope_update_to_test_daemon=timing == "after_probe",
         )
         return
@@ -540,6 +570,7 @@ def test_rollback_force_refuses_while_push(sw_env, shell_target, tmp_path, entry
     with HolderSampler(shell_target.slave_path, 0.01, exclude=(os.getpid(),)) as sampler:
         push = HeldPush(sw_env, shell_target, tmp_path, "update-force")
         r, data = inst.setup("--force")
+        _record_update_guard_observation(request.node.nodeid, r, data, "update")
         _assert_refused(r, data, "SESSION_BUSY", force=True, key="update", what="update --force")
         inst.assert_unchanged()
         _assert_daemon_untouched(sw_env, pid, "update --force")
@@ -586,11 +617,28 @@ def _rollback_while_flashing(sw_env, fake_mcu, tmp_path, *, force: bool, entry: 
             r, data = inst.setup(*args)
             _assert_refused(r, data, "FLASHING_BUSY", force=force, key=key, what=what)
             assert data.get("message") == FLASH_MSG, f"{what}：{data}"
-            assert sw_env.session("COM0")["state"] == "FLASHING", f"{what}：拒絕後仍在 FLASHING"
+            flash_state = sw_env.session("COM0")["state"]
+            assert flash_state == "FLASHING", f"{what}：拒絕後仍在 FLASHING"
             inst.assert_unchanged()
             _assert_daemon_untouched(sw_env, pid, what)
             _finish_flash(sw_env, fake_mcu, fl, what)
             _assert_single_holder(sampler, pid, what)
+        steps = (data.get(key) or {}).get("steps") or []
+        safety_detail = next((step.get("detail") or {} for step in steps if step.get("step") == "safety_check"), {})
+        record_observation(
+            "s24-upd-guards",
+            "tests/contract_blackbox/test_s24_update_rollback.py::"
+            + (f"test_rollback_force_refuses_while_flashing[{entry}]" if force
+               else "test_rollback_refuses_while_flashing"),
+            rejected_exit=r.returncode,
+            error_code=data.get("error_code"),
+            phase=data.get("phase"),
+            force_ignored=safety_detail.get("force_ignored"),
+            flash_state_at_rejection=flash_state,
+            daemon_pid_unchanged=sw_env.daemon_pid == pid,
+            current_release_unchanged=inst.current_file.read_bytes() == inst.current_bytes,
+            mcu_tx_hex=fake_mcu.rx_log().hex(),
+        )
     finally:
         fl.close()
 
@@ -614,7 +662,7 @@ def test_rollback_force_refuses_while_flashing(sw_env, fake_mcu, tmp_path, entry
 
 @pytest.mark.posix_pty
 @pytest.mark.process_rpc
-def test_rollback_refuses_while_interactive_send(sw_env, shell_target, tmp_path):
+def test_rollback_refuses_while_interactive_send(sw_env, shell_target, tmp_path, request):
     pid = _ready(sw_env, shell_target)
     inst = Installed(tmp_path, sw_env, previous=True)
     opened = sw_env.rpc("session.interactive_open", {"selector": "COM0", "owner": "agent:t14", "timeout_s": 120})
@@ -626,6 +674,7 @@ def test_rollback_refuses_while_interactive_send(sw_env, shell_target, tmp_path)
         sent = sw_env.rpc_async("session.interactive_send", {"interactive_id": iid, "data": payload})
         sw_env.wait_until(shell_target.read_held, timeout=30)
         r, data = inst.setup("--rollback")
+        _record_update_guard_observation(request.node.nodeid, r, data, "rollback")
         _assert_refused(r, data, "SESSION_BUSY", force=False, key="rollback", what="interactive send")
         busy = data.get("busy") or []
         assert any(row.get("com") == "COM0" and row.get("interactive_session_id") == iid for row in busy), data

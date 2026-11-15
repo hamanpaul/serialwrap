@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 
 from bb_harness import is_rust
+from mcu_flash_parity import record_observation
 from p8_fixtures import ExternalHolder, HolderSampler
 
 pytestmark = [pytest.mark.posix_only]
@@ -364,11 +365,20 @@ def test_release_flashing_busy(sw_env, fake_mcu):
     link = sw_env.run_dir / "dev" / "ttyMCU"
     sw_env.wait_until(link.is_symlink, timeout=10)
     fl = FakeFlasher(link, baud=115200)
+    sync_ack = b""
+    flashing_response = None
     try:
         fl.write(b"\x55\x55")
-        assert fl.read_exact(2, timeout=3.0) == b"\x00\xcc"
+        sync_ack = fl.read_exact(2, timeout=3.0)
+        assert sync_ack == b"\x00\xcc"
         sw_env.wait_state("COM0", "FLASHING", timeout=5)
         rel = _body(sw_env.rpc("device.release", {"selector": "COM0", "source": "agent:p8", "reason": "busy"}))
+        flashing_response = {
+            "ok": rel["ok"],
+            "error_code": rel["error_code"],
+            "selector": rel["selector"],
+            "session_state": rel["session"]["state"],
+        }
         assert list(rel) == ["ok", "error_code", "selector", "session"], rel
         assert (rel["ok"], rel["error_code"], rel["selector"]) == (False, "FLASHING_BUSY", "COM0"), rel
         assert rel["session"]["state"] == "FLASHING", rel
@@ -379,6 +389,15 @@ def test_release_flashing_busy(sw_env, fake_mcu):
     rel = _body(sw_env.rpc("device.release", {"selector": "COM0", "source": "agent:p8", "reason": "after"}))
     assert rel["ok"] is True and rel["session"]["state"] == "RELEASED", rel
     assert fake_mcu.rx_log() == b"\x55\x55", "MCU 線只收到 flasher 自己的 sync"
+    record_observation(
+        "s24-flash-arbitration",
+        "tests/contract_blackbox/test_s24_device_handoff.py::test_release_flashing_busy",
+        sync_ack_hex=sync_ack.hex(),
+        release_during_flashing=flashing_response,
+        state_after_flash=rel["session"]["state"],
+        mcu_tx_hex=fake_mcu.rx_log().hex(),
+        release_after_flash_ok=rel["ok"],
+    )
 
 
 # ---------------------------------------------------------------------------
