@@ -101,6 +101,7 @@ preflight:
     - name: tests
       kind: tests
       argv: ["python3", "-m", "pytest", "-q", "tests/", "--deselect", "tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native", "--deselect", "tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence"]
-      timeout_seconds: 1800
+      # 全套 pytest 實測 6449.73 秒，含 15% 餘裕後向上取整至 7500 秒。
+      timeout_seconds: 7500
 conventions_engine:
   repo: hamanpaul/paulsha-conventions

@@ -584,7 +584,7 @@ impl Parser<'_> {
         if self.peek() == Some('|') {
             self.pos += 1;
             no_branches.push(self.parse_sequence(true, open, nested_depth)?);
-            while self.peek() == Some('|') {
+            if self.peek() == Some('|') {
                 return Err(self.error(
                     "conditional backref with more than two branches",
                     Some(self.pos),

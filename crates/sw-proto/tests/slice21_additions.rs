@@ -257,19 +257,37 @@ fn daemon_dirs_defaults() {
     let dirs: DaemonDirs = resolve_daemon_dirs(&env);
     assert_eq!(dirs.by_id_dir, "/dev/serial/by-id");
     assert_eq!(dirs.by_path_dir, "/dev/serial/by-path");
-    assert_eq!(dirs.events_dir, "~/.serialwrap/events.d");
-    assert_eq!(dirs.events_runtime_dir, "~/.local/state/serialwrap/events");
+    let separator = std::path::MAIN_SEPARATOR;
+    let events_dir = format!("~{separator}.serialwrap{separator}events.d");
+    let events_runtime_dir = format!("~{separator}.local{separator}state{separator}serialwrap{separator}events");
+    assert_eq!(dirs.events_dir, events_dir);
+    assert_eq!(dirs.events_runtime_dir, events_runtime_dir);
 
+    let home = if separator == '\\' {
+        "C:\\fakehome"
+    } else {
+        "/fakehome"
+    };
+    let state_home = if separator == '\\' {
+        "C:\\state"
+    } else {
+        "/state"
+    };
+    let by_id = format!("~{separator}by-id");
+    let expected_by_id = format!("{home}{separator}by-id");
+    let expected_events = format!("{home}{separator}.serialwrap{separator}events.d");
+    let expected_runtime = format!("{state_home}{separator}serialwrap{separator}events");
     let custom = EnvSnapshot::from_pairs(BTreeMap::from([
-        ("HOME".to_string(), "/fakehome".to_string()),
-        ("XDG_STATE_HOME".to_string(), "/state".to_string()),
-        ("SERIALWRAP_BY_ID_DIR".to_string(), "~/by-id".to_string()),
+        ("HOME".to_string(), home.to_string()),
+        ("USERPROFILE".to_string(), home.to_string()),
+        ("XDG_STATE_HOME".to_string(), state_home.to_string()),
+        ("SERIALWRAP_BY_ID_DIR".to_string(), by_id),
         ("SERIALWRAP_EVENTS_RUNTIME_DIR".to_string(), "".to_string()),
     ]));
     let dirs = resolve_daemon_dirs(&custom);
-    assert_eq!(dirs.by_id_dir, "/fakehome/by-id");
-    assert_eq!(dirs.events_dir, "/fakehome/.serialwrap/events.d");
-    assert_eq!(dirs.events_runtime_dir, "/state/serialwrap/events");
+    assert_eq!(dirs.by_id_dir, expected_by_id);
+    assert_eq!(dirs.events_dir, expected_events);
+    assert_eq!(dirs.events_runtime_dir, expected_runtime);
 }
 
 #[test]

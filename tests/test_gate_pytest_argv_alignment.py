@@ -37,7 +37,8 @@ def test_three_stage2_gates_and_preflight_match_ci_deselects():
         "python3", "-m", "pytest", "-q", "tests/",
         "--deselect", DESELECT[0], "--deselect", DESELECT[1],
     ]
-    assert tests_step["timeout_seconds"] == 1800
+    # 全套實測 6449.73 秒，另加 15% 餘裕並進位至 7500 秒。
+    assert tests_step["timeout_seconds"] == 7500
 
     sources = {}
     for relative in ("scripts/rust/slice21_gate.sh", "scripts/rust/p7_gate.sh", "scripts/rust/slice24_exit.sh"):

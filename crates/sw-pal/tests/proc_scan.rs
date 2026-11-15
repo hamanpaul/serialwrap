@@ -428,7 +428,7 @@ fn unreadable_proc_stat_is_conservatively_alive() {
     std::fs::create_dir_all(&process_dir).unwrap();
     let stat = process_dir.join("stat");
     std::fs::write(&stat, fake_proc_stat(pid, b"blocked", b'S', 778)).unwrap();
-    std::fs::set_permissions(&stat, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&stat, std::fs::Permissions::from_mode(0o000)).unwrap();
 
     let scan = PosixProcScan::with_root(tmp.path());
     assert!(scan.pid_alive(pid));
@@ -529,7 +529,7 @@ fn posix_tty_holder_scan_reports_permission_status() {
     let fd_dir = process_dir.join("fd");
     std::fs::create_dir_all(&fd_dir).unwrap();
     std::fs::write(process_dir.join("cmdline"), b"serialwrapd\0").unwrap();
-    std::fs::set_permissions(&fd_dir, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&fd_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
 
     let (holders, status) = PosixProcScan::with_root(tmp.path())
         .serialwrapd_tty_holders(&[tmp.path().join("tty-fake")]);
