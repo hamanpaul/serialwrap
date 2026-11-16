@@ -509,7 +509,7 @@ def _n3_selector_migration_allowed(
     retained: set[str],
 ) -> bool:
     """只放行 N3 的精確 selector、集合與兩筆逐名移除。"""
-    paired_removal = removed == _N3_REMOVALS and approved == _N3_REMOVALS
+    paired_removal = _N3_REMOVALS.issubset(removed) and removed == approved
     previously_approved_removal = not removed and not approved and _N3_REMOVALS.isdisjoint(retained)
     return (
         platform == "linux"
