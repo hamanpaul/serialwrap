@@ -95,7 +95,11 @@ fn log_responses_match_python_golden_bytes() {
     let mut checked = 0;
     for row in golden_rows("log_responses") {
         let setup = row.get("setup").clone();
-        let op = setup.get("op").and_then(PyValue::as_str).unwrap_or_default().to_string();
+        let op = setup
+            .get("op")
+            .and_then(PyValue::as_str)
+            .unwrap_or_default()
+            .to_string();
         let active = setup.get("capture_active").and_then(PyValue::as_bool) == Some(true);
         let is_dir = setup.get("log_path_is_dir").and_then(PyValue::as_bool) == Some(true);
         if setup.get("call").is_some() || row.opt_str("raised").is_some() {
@@ -111,7 +115,12 @@ fn log_responses_match_python_golden_bytes() {
             Some(PyValue::Dict(s)) => s.clone(),
             _ => PyDict::new(),
         };
-        let str_of = |k: &str| resp.get(k).and_then(PyValue::as_str).unwrap_or_default().to_string();
+        let str_of = |k: &str| {
+            resp.get(k)
+                .and_then(PyValue::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
         let cap = AgentLogCapture {
             capture_id: str_of("capture_id"),
             log_path: str_of("log_path"),
@@ -153,7 +162,10 @@ fn observer_writes_clean_text_and_counts_like_python() {
     obs.set_foreground_busy(false);
     let expected = "hello\n世界\n";
     assert_eq!(
-        (stats.line_count.load(Ordering::SeqCst), stats.byte_count.load(Ordering::SeqCst)),
+        (
+            stats.line_count.load(Ordering::SeqCst),
+            stats.byte_count.load(Ordering::SeqCst)
+        ),
         (2, expected.len() as u64)
     );
     assert_eq!(obs.remove("cap-1"), Some((2, expected.len() as u64)));
@@ -164,7 +176,10 @@ fn observer_writes_clean_text_and_counts_like_python() {
     );
     // 移除後不再寫入；錯誤 id 回 None。
     obs.on_rx("COM0", b"late\n", 4);
-    assert_eq!(*file.data.lock().unwrap(), sw_pal::fs_ops::text_mode_bytes(expected));
+    assert_eq!(
+        *file.data.lock().unwrap(),
+        sw_pal::fs_ops::text_mode_bytes(expected)
+    );
     assert_eq!(obs.remove("cap-1"), None);
 }
 
@@ -209,7 +224,14 @@ fn foreground_rx_is_not_captured_and_counts_match_python_rules() {
     let stop = h.request(SessionRequest::LogStop);
     assert_eq!(
         keys(&stop),
-        ["ok", "capture_id", "log_path", "line_count", "byte_count", "started_at"]
+        [
+            "ok",
+            "capture_id",
+            "log_path",
+            "line_count",
+            "byte_count",
+            "started_at"
+        ]
     );
     let expected = "hello\n世界\n";
     assert_eq!(
@@ -317,10 +339,17 @@ fn session_capture_counts_are_live() {
         },
         other => panic!("session：{other:?}"),
     };
-    assert_eq!(nested(&status), (int(2), int(4)), "log_status 的 session.capture 須為即時計數");
+    assert_eq!(
+        nested(&status),
+        (int(2), int(4)),
+        "log_status 的 session.capture 須為即時計數"
+    );
     let state = h.get_state();
     match &state["capture"] {
-        PyValue::Dict(c) => assert_eq!((c["line_count"].clone(), c["byte_count"].clone()), (int(2), int(4))),
+        PyValue::Dict(c) => assert_eq!(
+            (c["line_count"].clone(), c["byte_count"].clone()),
+            (int(2), int(4))
+        ),
         other => panic!("get_state capture：{other:?}"),
     }
 }
@@ -341,7 +370,10 @@ fn log_start_already_active() {
     let h = rig_with_log_dir(&dir);
     let first = h.request(SessionRequest::LogStart);
     let second = h.request(SessionRequest::LogStart);
-    assert_eq!(keys(&second), ["ok", "already_active", "capture_id", "log_path", "session"]);
+    assert_eq!(
+        keys(&second),
+        ["ok", "already_active", "capture_id", "log_path", "session"]
+    );
     assert_eq!(second["ok"], PyValue::Bool(true));
     assert_eq!(second["already_active"], PyValue::Bool(true));
     assert_eq!(second["capture_id"], first["capture_id"]);
@@ -378,27 +410,42 @@ fn log_status_inactive_and_active() {
     let active = h.request(SessionRequest::LogStatus);
     assert_eq!(
         keys(&active),
-        ["ok", "active", "capture_id", "log_path", "line_count", "byte_count", "started_at", "session"]
+        [
+            "ok",
+            "active",
+            "capture_id",
+            "log_path",
+            "line_count",
+            "byte_count",
+            "started_at",
+            "session"
+        ]
     );
     assert_eq!(active["active"], PyValue::Bool(true));
     assert_eq!(active["capture_id"], start["capture_id"]);
-    assert_eq!((active["line_count"].clone(), active["byte_count"].clone()), (int(1), int(5)));
+    assert_eq!(
+        (active["line_count"].clone(), active["byte_count"].clone()),
+        (int(1), int(5))
+    );
     match session_capture(&active) {
         PyValue::Dict(c) => {
             assert_eq!(c["capture_id"], start["capture_id"]);
-            assert_eq!((c["line_count"].clone(), c["byte_count"].clone()), (int(1), int(5)));
+            assert_eq!(
+                (c["line_count"].clone(), c["byte_count"].clone()),
+                (int(1), int(5))
+            );
         }
         other => panic!("session.capture：{other:?}"),
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, unix))]
 #[derive(Default)]
 struct TimeoutLogFs {
     opened_path: Mutex<Option<String>>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, unix))]
 impl LogFs for TimeoutLogFs {
     fn makedirs(&self, _dir: &str) -> std::io::Result<()> {
         Ok(())
@@ -410,7 +457,7 @@ impl LogFs for TimeoutLogFs {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, unix))]
 #[test]
 fn log_open_timeout_preserves_errno_strerror_and_path() {
     let fs = Arc::new(TimeoutLogFs::default());
@@ -504,7 +551,10 @@ fn log_status_counts_single_snapshot_under_concurrent_rx() {
     }
     let r = h.rpc(SessionRequest::LogStatus).expect("log_status");
     obs.set_counts_hook(None);
-    assert!(injected.load(Ordering::SeqCst), "hook 須觸發（取樣之間注入 RX）");
+    assert!(
+        injected.load(Ordering::SeqCst),
+        "hook 須觸發（取樣之間注入 RX）"
+    );
     let top = (r["line_count"].clone(), r["byte_count"].clone());
     let nested = match &r["session"] {
         PyValue::Dict(s) => match &s["capture"] {
@@ -513,5 +563,8 @@ fn log_status_counts_single_snapshot_under_concurrent_rx() {
         },
         other => panic!("session：{other:?}"),
     };
-    assert_eq!(top, nested, "同一回應的頂層與 session.capture 計數須來自同一快照");
+    assert_eq!(
+        top, nested,
+        "同一回應的頂層與 session.capture 計數須來自同一快照"
+    );
 }
