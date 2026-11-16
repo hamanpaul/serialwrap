@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::support::IsolatedEnv;
+use sw_pal::service_ctl::{SupervisionMode, TaskQuery};
 use sw_proto::pyjson::{self, PyDict, PyValue};
 
 const OLD_VERSION: &str = "0.0.1";
@@ -452,30 +453,47 @@ fn repository_root() -> PathBuf {
         .unwrap_or(cwd)
 }
 
-fn systemd_service_state(label: &str, edge: &str) -> Vec<u8> {
-    let output = Command::new("systemctl")
-        .args([
-            "--user",
-            "show",
-            "serialwrap.service",
-            "-p",
-            "MainPID",
-            "-p",
-            "ActiveEnterTimestamp",
-        ])
-        .output()
-        .expect("查詢 serialwrap.service 的 MainPID 與 ActiveEnterTimestamp");
-    assert!(
-        output.status.success(),
-        "systemctl --user show serialwrap.service 失敗（{label}/{edge}）：{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let path = artifact_dir().join(format!("systemd-{label}-{edge}.txt"));
-    fs::write(&path, &output.stdout).expect("保存 systemd service 快照");
-    output.stdout
+fn host_supervisor_state(label: &str, edge: &str) -> Vec<u8> {
+    let platform = sw_pal::native();
+    let state = if platform.caps.native_device == sw_pal::DeviceBackendKind::Win {
+        // Windows 的原生監管項是 Task Scheduler 工作；只查詢狀態，不呼叫變更命令。
+        // 以產品的唯讀 WindowsTaskCtl 查詢對應 \\serialwrap 工作，保留前後相同斷言。
+        match platform.service.query(&SupervisionMode::WindowsTask) {
+            TaskQuery::Running => b"Running".to_vec(),
+            TaskQuery::NotRunning(state) => format!("NotRunning:{state}").into_bytes(),
+            TaskQuery::NotFound => b"NotFound".to_vec(),
+            TaskQuery::QueryFailed(error) => {
+                panic!("查詢 Windows serialwrap 排程工作失敗（{label}/{edge}）：{error}")
+            }
+        }
+    } else {
+        // Linux 的既有安全檢查維持唯讀比對正式 systemd unit 的 PID 與啟動時間。
+        let output = Command::new("systemctl")
+            .args([
+                "--user",
+                "show",
+                "serialwrap.service",
+                "-p",
+                "MainPID",
+                "-p",
+                "ActiveEnterTimestamp",
+            ])
+            .output()
+            .expect("查詢 serialwrap.service 的 MainPID 與 ActiveEnterTimestamp");
+        assert!(
+            output.status.success(),
+            "systemctl --user show serialwrap.service 失敗（{label}/{edge}）：{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+
+    let path = artifact_dir().join(format!("supervisor-{label}-{edge}.txt"));
+    fs::write(&path, &state).expect("保存本機監管項唯讀快照");
+    state
 }
 
-/// 執行 CLI 子行程，前後保存並比較正式 service 的 PID 與啟動時間。
+/// 執行 CLI 子行程，前後保存並比較本機正式監管項狀態。
 pub fn run_audited_cli(
     cli: &Path,
     vars: &BTreeMap<String, String>,
@@ -483,7 +501,7 @@ pub fn run_audited_cli(
     label: &str,
     timeout: Duration,
 ) -> Output {
-    let before = systemd_service_state(label, "before");
+    let before = host_supervisor_state(label, "before");
     let mut command = Command::new(cli);
     command
         .args(args)
@@ -492,6 +510,14 @@ pub fn run_audited_cli(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Windows Winsock 載入 provider 需要 SystemRoot；env_clear 後只補回 OS 根目錄，
+    // CLI 的 SERIALWRAP 設定與狀態路徑仍完全使用 vars 中的隔離值。
+    if let Some(system_root) =
+        std::env::var_os("SystemRoot").or_else(|| std::env::var_os("WINDIR"))
+    {
+        command.env("SystemRoot", &system_root);
+        command.env("WINDIR", system_root);
+    }
     if let Some(path) = std::env::var_os("PATH") {
         command.env("PATH", path);
     }
@@ -502,10 +528,10 @@ pub fn run_audited_cli(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            let after = systemd_service_state(label, "after");
+            let after = host_supervisor_state(label, "after");
             assert_eq!(
                 before, after,
-                "CLI 啟動失敗期間正式 service 狀態不得改變（{label}）"
+                "CLI 啟動失敗期間本機正式監管項狀態不得改變（{label}）"
             );
             panic!("啟動正式 CLI {} 失敗：{error}", cli.display());
         }
@@ -525,20 +551,20 @@ pub fn run_audited_cli(
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let after = systemd_service_state(label, "after");
+                let after = host_supervisor_state(label, "after");
                 assert_eq!(
                     before, after,
-                    "檢查 CLI 子行程期間正式 service 狀態不得改變（{label}）"
+                    "檢查 CLI 子行程期間本機正式監管項狀態不得改變（{label}）"
                 );
                 panic!("檢查 CLI 子行程失敗：{error}");
             }
         }
     }
     let output = child.wait_with_output().expect("讀取 CLI 子行程輸出");
-    let after = systemd_service_state(label, "after");
+    let after = host_supervisor_state(label, "after");
     assert_eq!(
         before, after,
-        "CLI 子行程不得停止或重啟正式 serialwrap.service（{label}）"
+        "CLI 子行程不得改變本機正式監管項狀態（{label}）"
     );
     let directory = artifact_dir();
     fs::write(

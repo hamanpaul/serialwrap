@@ -169,6 +169,8 @@ enum PingHealth {
     Healthy,
     /// 連線被拒或端點不存在：尚需 `ProcScan` 確認沒有 `serialwrapd` 才算確認不存在。
     Unreachable,
+    /// Windows 對未監聽的 loopback TCP connect 可能回 TimedOut；補查行程只用來辨識既存 daemon，空結果仍 fail-closed。
+    ConnectTimedOut(PyDict),
     /// 健康不明（逾時、壞回應、其他連線失敗、回應 `ok:false`）：拒絕，`--force` 不適用。
     Unknown(&'static str, PyDict),
 }
@@ -195,6 +197,11 @@ fn ping_health(ctx: &CliCtx<'_>, endpoint: &str) -> PingHealth {
         let mut detail = outcome.resp;
         detail.0.shift_remove("ok");
         detail.0.shift_remove("error_code");
+        if failure.phase == crate::client::FailPhase::Connect
+            && failure.pal_kind == Some(sw_pal::PalErrorKind::TimedOut)
+        {
+            return PingHealth::ConnectTimedOut(detail);
+        }
         return if failure.pal_kind == Some(sw_pal::PalErrorKind::TimedOut) {
             unknown(ErrorCode::Timeout.as_str(), REASON_TIMEOUT, detail)
         } else {
@@ -328,6 +335,43 @@ pub(crate) fn same_uid_daemons(
         })
         .cloned()
         .collect()
+}
+
+fn process_alive_refusal_detail(
+    ctx: &CliCtx<'_>,
+    endpoint: &str,
+    daemons: &[sw_pal::proc_scan::DaemonProc],
+) -> Option<PyDict> {
+    let held = same_uid_daemons(ctx, daemons);
+    if held.is_empty() {
+        return None;
+    }
+    let mut detail = PyDict::new();
+    detail.insert(
+        "pids",
+        PyValue::List(
+            held.iter()
+                .map(|proc| PyValue::Int(PyInt::Small(i128::from(proc.pid))))
+                .collect(),
+        ),
+    );
+    if held
+        .iter()
+        .any(|proc| proc.socket.as_deref().is_some_and(|socket| socket != endpoint))
+    {
+        detail.insert(
+            "sockets",
+            PyValue::List(
+                held.iter()
+                    .map(|proc| opt_str(proc.socket.as_deref()))
+                    .collect(),
+            ),
+        );
+        detail.insert("endpoint", str_value(endpoint.to_string()));
+    }
+    detail.insert("health", PyValue::Str("unknown".into()));
+    detail.insert("reason", PyValue::Str(REASON_PROCESS_ALIVE.into()));
+    Some(detail)
 }
 
 fn matching_daemons(
@@ -557,6 +601,21 @@ pub fn safety_check(
     match ping_health(ctx, endpoint) {
         PingHealth::Healthy => {}
         PingHealth::Unknown(code, detail) => return Err((code, detail)),
+        PingHealth::ConnectTimedOut(mut detail) => {
+            // Windows 的未監聽 loopback TCP connect 依 Python 基線回 TimeoutError；若行程掃描找到 daemon，
+            // 用同一個 fail-closed 拒絕補上 PID；掃描空白或失敗仍回原本的 TIMEOUT。
+            if sw_proto::endpoint::is_loopback_tcp(endpoint) {
+                if let Ok(daemons) = scan_update_daemons(ctx, endpoint) {
+                    if let Some(held_detail) = process_alive_refusal_detail(ctx, endpoint, &daemons) {
+                        return Err((ErrorCode::DeviceStillHeld.as_str(), held_detail));
+                    }
+                }
+            }
+            detail.insert("probe", PyValue::Str("health.ping".into()));
+            detail.insert("health", PyValue::Str("unknown".into()));
+            detail.setdefault("reason", PyValue::Str(REASON_TIMEOUT.into()));
+            return Err((ErrorCode::Timeout.as_str(), detail));
+        }
         PingHealth::Unreachable => {
             let daemons = scan_update_daemons(ctx, endpoint).map_err(|_| {
                 let mut detail = PyDict::new();
@@ -567,16 +626,7 @@ pub fn safety_check(
             })?;
             // S1X-c-1／OD-48 D3.2：endpoint 不可 RPC 時，任何同 uid 的 serialwrapd（socket 不符或無 --socket 皆然）
             // 都可能是偵測不到的舊 daemon，fail-closed；他 uid 的行程不在掃描範圍。
-            let held = same_uid_daemons(ctx, &daemons);
-            if !held.is_empty() {
-                let mut detail = PyDict::new();
-                detail.insert("pids", PyValue::List(held.iter().map(|proc| PyValue::Int(PyInt::Small(i128::from(proc.pid)))).collect()));
-                if held.iter().any(|proc| proc.socket.as_deref().is_some_and(|socket| socket != endpoint)) {
-                    detail.insert("sockets", PyValue::List(held.iter().map(|proc| opt_str(proc.socket.as_deref())).collect()));
-                    detail.insert("endpoint", str_value(endpoint.to_string()));
-                }
-                detail.insert("health", PyValue::Str("unknown".into()));
-                detail.insert("reason", PyValue::Str(REASON_PROCESS_ALIVE.into()));
+            if let Some(detail) = process_alive_refusal_detail(ctx, endpoint, &daemons) {
                 return Err((ErrorCode::DeviceStillHeld.as_str(), detail));
             }
             return Ok(None);
