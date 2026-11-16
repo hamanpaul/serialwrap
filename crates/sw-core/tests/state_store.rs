@@ -9,11 +9,16 @@ use indexmap::IndexMap;
 use sw_core::alias_registry::AliasRegistry;
 use sw_core::state_store::*;
 use sw_pal::fakes::file_mode;
-use sw_pal::fs_ops::{FileLockGuard, FsOps, LinkKind};
+use sw_pal::fs_ops::{FileLockGuard, FsOps, LinkKind, TEXT_NEWLINE_STR};
 use sw_pal::traits::{FsRead, PalError, PalErrorKind, PalResult};
 use sw_proto::pyjson::{PyDict, PyValue};
 
-const PY_BYTES: &str = "{\"aliases\":{\"custom\":{\"session_id\":\"p:COM5\",\"updated_at\":\"2026-10-15T03:07:39.596535+00:00\"},\"zz\":{\"device_by_id\":\"/dev/serial/by-id/Z\",\"profile\":\"prpl-template\",\"updated_at\":\"2026-10-15T03:07:39.596600+00:00\"}},\"bindings\":{},\"profile_detected\":{},\"profile_pins\":{\"/dev/serial/by-id/X\":\"prpl-template\"},\"released\":{\"prpl-template:COM0\":{\"by_id\":\"/dev/serial/by-id/X\",\"reason\":\"r\",\"released_at\":\"t\",\"released_by\":\"cli\"}}}\n";
+// Python `os.fdopen(fd, "w")` 在 Windows 將結構換行轉為 CRLF（origin/main sw_core/session_manager.py:1485-1486）。
+const PY_BYTES_BODY: &str = "{\"aliases\":{\"custom\":{\"session_id\":\"p:COM5\",\"updated_at\":\"2026-10-15T03:07:39.596535+00:00\"},\"zz\":{\"device_by_id\":\"/dev/serial/by-id/Z\",\"profile\":\"prpl-template\",\"updated_at\":\"2026-10-15T03:07:39.596600+00:00\"}},\"bindings\":{},\"profile_detected\":{},\"profile_pins\":{\"/dev/serial/by-id/X\":\"prpl-template\"},\"released\":{\"prpl-template:COM0\":{\"by_id\":\"/dev/serial/by-id/X\",\"reason\":\"r\",\"released_at\":\"t\",\"released_by\":\"cli\"}}}";
+
+fn py_bytes() -> String {
+    format!("{PY_BYTES_BODY}{TEXT_NEWLINE_STR}")
+}
 
 fn native_fs() -> Arc<dyn FsOps> {
     sw_pal::native().fs
@@ -174,10 +179,10 @@ fn p4_atomic_write_semantics() {
 fn python_bytes_roundtrip_exactly() {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("state.json");
-    std::fs::write(&p, PY_BYTES).unwrap();
+    std::fs::write(&p, py_bytes()).unwrap();
     let (s, backup) = load_state(&p, &*sw_pal::native().fs).unwrap();
     assert!(backup.is_none());
-    assert_eq!(String::from_utf8(serialize_state(&s)).unwrap(), PY_BYTES);
+    assert_eq!(String::from_utf8(serialize_state(&s)).unwrap(), py_bytes());
     assert_eq!(
         s.released["prpl-template:COM0"].released_by,
         PyValue::from("cli")
@@ -352,7 +357,11 @@ fn unknown_keys_dropped_on_save() {
     assert!(!out.contains("future"));
     assert_eq!(
         out,
-        "{\"aliases\":{\"a\":{\"x\":1}},\"bindings\":{},\"profile_detected\":{},\"profile_pins\":{},\"released\":{}}\n"
+        format!(
+            "{}{}",
+            r#"{"aliases":{"a":{"x":1}},"bindings":{},"profile_detected":{},"profile_pins":{},"released":{}}"#,
+            TEXT_NEWLINE_STR
+        )
     );
 }
 
@@ -424,7 +433,7 @@ fn aliases_not_dict_fails_startup_like_python() {
 fn tmp_residue_ignored() {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("state.json");
-    write(&p, PY_BYTES);
+    write(&p, &py_bytes());
     write(&d.path().join("state.json.tmp.abc"), "{garbage");
     let (s, backup) = load(&p).unwrap();
     assert!(backup.is_none());
@@ -586,9 +595,14 @@ fn commit_file_mode_0600_and_trailing_newline() {
     store.commit_sync(LoadedState::default()).unwrap();
     let raw = std::fs::read(&p).unwrap();
     assert_eq!(raw.last(), Some(&b'\n'));
+    let expected = format!(
+        "{}{}",
+        r#"{"aliases":{},"bindings":{},"profile_detected":{},"profile_pins":{},"released":{}}"#,
+        TEXT_NEWLINE_STR
+    );
     assert_eq!(
         raw,
-        b"{\"aliases\":{},\"bindings\":{},\"profile_detected\":{},\"profile_pins\":{},\"released\":{}}\n"
+        expected.as_bytes()
     );
     if let Some(mode) = file_mode(&p) {
         assert_eq!(mode, 0o600);
@@ -599,7 +613,7 @@ fn commit_file_mode_0600_and_trailing_newline() {
 fn commit_failure_returns_error() {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("state.json");
-    write(&p, PY_BYTES);
+    write(&p, &py_bytes());
     let fs = CountingFs::new();
     let store = StateStore::spawn(p.clone(), fs.clone());
     fs.fail_atomic_write(PalError::new(
@@ -611,10 +625,10 @@ fn commit_failure_returns_error() {
     ));
     let err = store.commit_sync(LoadedState::default()).unwrap_err();
     assert_eq!(err.os_code, Some(5));
-    assert_eq!(std::fs::read_to_string(&p).unwrap(), PY_BYTES);
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), py_bytes());
     // #23：失敗後同一 store 可再次提交（重試入口）並成功落盤
     store.commit_sync(LoadedState::default()).unwrap();
-    assert_ne!(std::fs::read_to_string(&p).unwrap(), PY_BYTES);
+    assert_ne!(std::fs::read_to_string(&p).unwrap(), py_bytes());
 }
 
 /// #23：非同步 commit 的失敗經 done channel 回報，之後的 commit 依序執行（單一 persister）。
@@ -642,7 +656,7 @@ fn async_commit_reports_failure_then_retry_succeeds() {
 fn startup_always_rewrites_state_json() {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("state.json");
-    write(&p, PY_BYTES);
+    write(&p, &py_bytes());
     let fs = CountingFs::new();
     let (s, _) = load_state(&p, &*fs).unwrap();
     let mut m = StateModel::new(s);
@@ -653,7 +667,7 @@ fn startup_always_rewrites_state_json() {
     store.commit_sync(m.snapshot()).unwrap();
     store.commit_sync(m.snapshot()).unwrap();
     assert_eq!(fs.writes(), 2);
-    assert_eq!(std::fs::read_to_string(&p).unwrap(), PY_BYTES);
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), py_bytes());
     assert!(std::fs::metadata(&p).unwrap().modified().unwrap() > ino_before);
 }
 

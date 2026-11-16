@@ -46,6 +46,11 @@ pub const REAL_A: &str = "/fake/tty-A";
 pub const BY_ID_B: &str = "/s/by-id/usb-B";
 pub const REAL_B: &str = "/fake/tty-B";
 
+/// 將字串依 RPC 線上 JSON 規則編碼，讓 Windows 路徑中的反斜線保持為字串內容。
+pub fn json_string(value: &str) -> String {
+    pyjson::dumps(&PyValue::from(value), &pyjson::RPC_WIRE)
+}
+
 /// shell 模板 `t`（prompt `root@t:`）。
 const TEMPLATES: &str = "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\n";
 

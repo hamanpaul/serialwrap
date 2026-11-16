@@ -191,6 +191,14 @@ def _reset_com0com_pair() -> None:
             k32.CloseHandle(handle)
 
 
+@pytest.fixture(autouse=True)
+def _clear_com0com_pair_after_case():
+    """在 sw_env 停止其 daemon 後清除本案例使用的 pair 兩端。"""
+    yield
+    if os.name == "nt" and os.environ.get("SW_TEST_COM_PAIR") == "COM20:COM21":
+        _reset_com0com_pair()
+
+
 def _start_attached(sw_env) -> None:
     _require_pair()
     _reset_com0com_pair()

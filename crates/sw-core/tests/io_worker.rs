@@ -300,7 +300,9 @@ fn snapshot_tracks_handle_liveness_across_eof_error_and_stop() {
 
     device.remove();
     h.clock.advance(Duration::from_millis(200));
-    assert!(wait_until(Duration::from_secs(2), || device.read_errors() > 0));
+    assert!(wait_until(Duration::from_secs(2), || {
+        device.read_errors() > 0 && !worker.snapshot().running
+    }));
     assert_snapshot(
         &worker,
         WorkerSnapshot {

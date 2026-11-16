@@ -328,7 +328,8 @@ fn payload(n: usize) -> Vec<u8> {
 
 fn push_params(local: &str, remote: &str) -> String {
     format!(
-        r#"{{"selector":"COM0","local_path":"{local}","remote_path":"{remote}","ack_mode":"none","chunk_size":256,"chunk_timeout_s":60}}"#
+        r#"{{"selector":"COM0","local_path":{},"remote_path":"{remote}","ack_mode":"none","chunk_size":256,"chunk_timeout_s":60}}"#,
+        json_string(local)
     )
 }
 
@@ -604,7 +605,8 @@ fn handoff_file_push_ticket_survives_rpc_timeout() {
     let local = tmp.write("src.bin", &data);
     let rig = r.clone();
     let params = format!(
-        r#"{{"selector":"COM0","local_path":"{local}","remote_path":"/tmp/svc-timeout.bin","ack_mode":"none","chunk_size":256,"chunk_timeout_s":3600}}"#
+        r#"{{"selector":"COM0","local_path":{},"remote_path":"/tmp/svc-timeout.bin","ack_mode":"none","chunk_size":256,"chunk_timeout_s":3600}}"#,
+        json_string(&local)
     );
     let push = thread::spawn(move || rig.call_err("file.push", &params));
     shell.wait_held();
@@ -1103,7 +1105,7 @@ fn run_daemon<T: Send + 'static>(
     let socket = env.socket.clone();
     let client_thread = {
         let (socket, sink) = (socket.clone(), sink.clone());
-        thread::spawn(move || {
+        spawn_stop_guarded_client(socket.clone(), move || {
             wait_socket(&socket, LONG);
             let out = catch_unwind(AssertUnwindSafe(|| client(socket.clone(), dev, sink)));
             if out.is_err() {
@@ -1237,7 +1239,7 @@ fn shutdown_during_force_recover_poll_finishes_handler_and_exits_zero() {
         ..DaemonHooks::default()
     };
     let socket = env.socket.clone();
-    let client = thread::spawn(move || {
+    let client = spawn_stop_guarded_client(socket.clone(), move || {
         wait_socket(&socket, LONG);
         wait_ready(&socket);
         // READY 的 force recover 依 Python 先送 CTRL_C／CTRL_D；此測試要覆蓋 ATTACHED 的直接 clear＋輪詢路徑。
@@ -1336,6 +1338,7 @@ impl Drop for HolderSampler {
 
 /// 舊 daemon 存活時繼任者實際競爭實例鎖並失敗；再由正式 setup update 交接並啟動繼任者。
 /// 交接鏈與舊 PID 取自產品輸出，持有者取樣驗證全程沒有雙重持有。
+#[cfg(all(test, unix))]
 #[test]
 fn handoff_then_successor_never_double_held() {
     let env = isolated_env_with_pty_target();
@@ -1344,7 +1347,7 @@ fn handoff_then_successor_never_double_held() {
     let base_bundle = handoff_cli::old_bundle_dir();
     let install_root = env.root.join("install");
     handoff_cli::seed_install_from_old_bundle(&base_bundle, &install_root);
-    let endpoint = handoff_cli::unix_endpoint(&env.socket);
+    let endpoint = handoff_cli::endpoint(&env.socket);
     std::fs::write(
         env.config_dir.join("config.yaml"),
         format!("supervision_mode: on-demand\nsocket_path: \"{endpoint}\"\n"),
@@ -1445,7 +1448,7 @@ fn default_cli_update_scope_cannot_bypass_foreign_daemon() {
     for (label, explicit_socket) in [("explicit-socket", true), ("implicit-socket", false)] {
         let daemon_env = isolated_env();
         let socket_a = daemon_env.socket.clone();
-        let endpoint_a = handoff_cli::unix_endpoint(&socket_a);
+        let endpoint_a = handoff_cli::endpoint(&socket_a);
         let daemon_args = if explicit_socket {
             vec!["--socket", endpoint_a.as_str()]
         } else {
@@ -1458,10 +1461,14 @@ fn default_cli_update_scope_cannot_bypass_foreign_daemon() {
         let daemon_pid = daemon.pid();
 
         let cli_env = isolated_env();
-        let socket_b = cli_env.run_dir.join("foreign-daemon.sock");
-        let endpoint_b = handoff_cli::unix_endpoint(&socket_b);
-        assert_ne!(socket_a, socket_b, "A、B 必須是不同隔離 socket");
-        assert!(!socket_b.exists(), "CLI 的隔離 socket B 必須不存在：{}", socket_b.display());
+        let socket_b = cli_env.socket.clone();
+        let endpoint_b = handoff_cli::endpoint(&socket_b);
+        assert_ne!(socket_a, socket_b, "A、B 必須使用不同隔離 endpoint");
+        assert!(
+            !support::endpoint_is_serving(&socket_b),
+            "CLI 的隔離 endpoint B 不得有 listener：{}",
+            socket_b.display()
+        );
         std::fs::write(
             cli_env.config_dir.join("config.yaml"),
             format!("supervision_mode: on-demand\nsocket_path: \"{endpoint_b}\"\n"),
@@ -1534,6 +1541,7 @@ fn write_tty_line(path: &str, line: &str) {
 /// 的 Rust 承接）：交接成立後、窗口內以背景來源驅動 TX——DeviceWatcher（移除 by-id 連結一個輪詢週期後加回）與 console 行
 /// （對 session 的 vtty 寫一行）——DUT 自交接回覆起至 daemon 結束零新增 bytes；窗口內 `health.ping` 仍回應、daemon 未退出，
 /// 窗口結束後有序停止（exit 0）。
+#[cfg(all(test, unix))]
 #[test]
 fn handoff_drain_window_background_triggers_zero_tx() {
     let mut env = isolated_env_with_pty_target();

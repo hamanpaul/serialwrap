@@ -99,7 +99,10 @@ struct MemProfileFs {
 
 impl ProfileFs for MemProfileFs {
     fn flavor(&self) -> PathFlavor {
-        PathFlavor::Posix
+        match sw_pal::native().caps.path_flavor {
+            sw_pal::PalPathFlavor::Posix => PathFlavor::Posix,
+            sw_pal::PalPathFlavor::Windows => PathFlavor::Windows,
+        }
     }
     fn is_dir(&self, p: &str) -> bool {
         p == PROFILE_DIR
@@ -342,10 +345,15 @@ impl CoreHarness {
 
     /// 設定測試用 env 檔內容；路徑需與 profile 的 `env_file` 相同。
     pub fn set_env_file(&self, path: &str, contents: &str) {
+        let flavor = match sw_pal::native().caps.path_flavor {
+            sw_pal::PalPathFlavor::Posix => PathFlavor::Posix,
+            sw_pal::PalPathFlavor::Windows => PathFlavor::Windows,
+        };
+        let path = sw_proto::pypath::normpath(flavor, path);
         self.credential_files
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(path.to_string(), contents.to_string());
+            .insert(path, contents.to_string());
     }
 
     /// 目前 bridge 的 conn_epoch（尚未開出 bridge 時 panic）。

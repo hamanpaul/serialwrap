@@ -8,22 +8,29 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::support::IsolatedEnv;
+use sw_pal::service_ctl::{SupervisionMode, TaskQuery};
 use sw_proto::pyjson::{self, PyDict, PyValue};
 
 const OLD_VERSION: &str = "0.0.1";
 
 /// 找到帶 test-fakes 的 CLI；明確路徑優先，其次使用測試執行檔所屬 target profile。
 pub fn feature_cli_path() -> PathBuf {
-    let candidate = std::env::var_os("SW_TEST_SERIALWRAP")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let test_exe = std::env::current_exe().expect("取得 handoff_stop 測試執行檔路徑");
-            let profile_dir = test_exe
-                .parent()
-                .and_then(Path::parent)
-                .expect("測試執行檔應位於 target/<profile>/deps");
-            profile_dir.join(format!("serialwrap{}", std::env::consts::EXE_SUFFIX))
-        });
+    let candidate = if let Some(path) = std::env::var_os("SW_TEST_SERIALWRAP") {
+        PathBuf::from(path)
+    } else if let Some(daemon) = std::env::var_os("SW_TEST_SERIALWRAPD") {
+        // Windows runner 會把 daemon 與 CLI 一起 staging；以 daemon 路徑找同目錄的 feature CLI。
+        PathBuf::from(daemon)
+            .parent()
+            .expect("SW_TEST_SERIALWRAPD 應位於測試 staging 目錄")
+            .join(format!("serialwrap{}", std::env::consts::EXE_SUFFIX))
+    } else {
+        let test_exe = std::env::current_exe().expect("取得 handoff_stop 測試執行檔路徑");
+        let profile_dir = test_exe
+            .parent()
+            .and_then(Path::parent)
+            .expect("測試執行檔應位於 target/<profile>/deps");
+        profile_dir.join(format!("serialwrap{}", std::env::consts::EXE_SUFFIX))
+    };
     require_file(
         candidate,
         "feature CLI；設定 SW_TEST_SERIALWRAP 指向帶 test-fakes 的 serialwrap",
@@ -32,9 +39,17 @@ pub fn feature_cli_path() -> PathBuf {
 
 /// 正式 CLI 必須由獨立 no-fakes target 建置，禁止退回 feature profile 的共同產物。
 pub fn no_fakes_cli_path() -> PathBuf {
-    let candidate = std::env::var_os("SW_TEST_SERIALWRAP_NO_FAKES")
-        .map(PathBuf::from)
-        .expect("缺少 SW_TEST_SERIALWRAP_NO_FAKES；請指向獨立 target 建置的正式 serialwrap");
+    let candidate = if let Some(path) = std::env::var_os("SW_TEST_SERIALWRAP_NO_FAKES") {
+        PathBuf::from(path)
+    } else if let Some(daemon) = std::env::var_os("SW_TEST_SERIALWRAPD") {
+        // Windows runner 將獨立 target 的正式 CLI 以專用名稱與 daemon 一起 staging。
+        PathBuf::from(daemon)
+            .parent()
+            .expect("SW_TEST_SERIALWRAPD 應位於測試 staging 目錄")
+            .join(format!("serialwrap-no-fakes{}", std::env::consts::EXE_SUFFIX))
+    } else {
+        panic!("缺少 SW_TEST_SERIALWRAP_NO_FAKES；請指向獨立 target 建置的正式 serialwrap");
+    };
     require_file(
         candidate,
         "no-fakes CLI；請以獨立 Cargo target directory 建置",
@@ -61,7 +76,21 @@ pub fn feature_bundle(cli: &Path) -> (PathBuf, PathBuf) {
             let repository = repository_root();
             let fallback = std::env::var_os("SW_TEST_FEATURE_BUNDLE")
                 .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("SW_TEST_SERIALWRAPD")
+                        .and_then(|daemon| PathBuf::from(daemon).parent().map(Path::to_path_buf))
+                        .map(|staging| staging.join("bundle"))
+                })
                 .unwrap_or_else(|| repository.join("target/s2-par/gpz/prereqs/bundle"));
+            let mut staged_manifests: Vec<PathBuf> = fs::read_dir(fallback.join("versions"))
+                .ok()?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path().join("release-manifest.json"))
+                .filter(|path| path.is_file())
+                .collect();
+            if staged_manifests.len() == 1 {
+                return staged_manifests.pop();
+            }
             let fallback = fallback.join("bin/serialwrap");
             let fallback = fs::canonicalize(fallback).ok()?;
             let fallback_version = fallback.parent()?.parent()?;
@@ -90,6 +119,11 @@ pub fn feature_bundle(cli: &Path) -> (PathBuf, PathBuf) {
 pub fn old_bundle_dir() -> PathBuf {
     let base_bundle = std::env::var_os("SW_TEST_BASE_BUNDLE")
         .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("SW_TEST_SERIALWRAPD")
+                .and_then(|daemon| PathBuf::from(daemon).parent().map(Path::to_path_buf))
+                .map(|staging| staging.join("base-bundle"))
+        })
         .unwrap_or_else(|| repository_root().join("target/s2-par/gpz/prereqs/base-bundle"));
     let directory = base_bundle.join("versions").join(OLD_VERSION);
     let manifest_path = directory.join("release-manifest.json");
@@ -107,8 +141,8 @@ pub fn old_bundle_dir() -> PathBuf {
     directory
 }
 
-pub fn unix_endpoint(socket: &Path) -> String {
-    socket.display().to_string()
+pub fn endpoint(endpoint: &Path) -> String {
+    endpoint.display().to_string()
 }
 
 /// 建立隔離安裝入口，供 update 路徑辨識既有 current；bundle 內容來自 mkbundle 產物。
@@ -131,14 +165,7 @@ pub fn seed_install(bundle_dir: &Path, install_root: &Path) {
     fs::create_dir_all(&bin).expect("建立隔離安裝入口目錄");
     for name in ["serialwrap", "serialwrapd"] {
         let link = bin.join(name);
-        let target = format!("../versions/{OLD_VERSION}/bin/{name}");
-        let status = Command::new("ln")
-            .arg("-s")
-            .arg(target)
-            .arg(&link)
-            .status()
-            .expect("建立隔離安裝入口 symlink");
-        assert!(status.success(), "建立隔離安裝入口失敗：{}", link.display());
+        seed_install_entry(&old_dir, name, &link);
     }
 
     let mut current = PyDict::new();
@@ -174,13 +201,7 @@ pub fn seed_install_from_old_bundle(bundle_dir: &Path, install_root: &Path) {
     fs::create_dir_all(&bin).expect("建立隔離安裝入口目錄");
     for name in ["serialwrap", "serialwrapd"] {
         let link = bin.join(name);
-        let status = Command::new("ln")
-            .arg("-s")
-            .arg(format!("../versions/{version}/bin/{name}"))
-            .arg(&link)
-            .status()
-            .expect("建立隔離安裝入口 symlink");
-        assert!(status.success(), "建立隔離安裝入口失敗：{}", link.display());
+        seed_install_entry(&version_dir, name, &link);
     }
     let mut current = PyDict::new();
     current.insert("backup_dir", PyValue::Null);
@@ -191,6 +212,38 @@ pub fn seed_install_from_old_bundle(bundle_dir: &Path, install_root: &Path) {
     let mut bytes = pyjson::dumps(&PyValue::Dict(current), &pyjson::DISK_STABLE).into_bytes();
     bytes.push(b'\n');
     fs::write(install_root.join("current-release.json"), bytes).expect("寫入隔離 current fixture");
+}
+
+/// 依產品安裝佈局建立穩定入口：Windows 是一般檔案複本，POSIX 才是相對 symlink。
+fn seed_install_entry(version_dir: &Path, name: &str, entry: &Path) {
+    let source = version_dir.join("bin").join(name);
+    if std::path::MAIN_SEPARATOR == '\\' {
+        fs::copy(&source, entry).unwrap_or_else(|error| {
+            panic!("複製 Windows 隔離安裝入口失敗：{} -> {}：{error}", source.display(), entry.display())
+        });
+    } else {
+        let version = version_dir
+            .file_name()
+            .and_then(|part| part.to_str())
+            .expect("版本目錄名稱為 UTF-8");
+        create_relative_symlink(&format!("../versions/{version}/bin/{name}"), entry);
+    }
+}
+
+/// 在 POSIX 隔離安裝目錄建立相對 symlink。
+fn create_relative_symlink(target: &str, link: &Path) {
+    let output = Command::new("ln")
+        .arg("-s")
+        .arg(target)
+        .arg(link)
+        .output()
+        .expect("建立隔離安裝入口 symlink");
+    assert!(
+        output.status.success(),
+        "建立隔離安裝入口 symlink 失敗：{}：{}",
+        link.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn copy_tree(source: &Path, destination: &Path) {
@@ -216,16 +269,61 @@ fn copy_tree(source: &Path, destination: &Path) {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstallSnapshot {
     current: Vec<u8>,
-    cli_entry: Option<PathBuf>,
-    daemon_entry: Option<PathBuf>,
+    cli_entry: EntrySnapshot,
+    daemon_entry: EntrySnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EntrySnapshot {
+    Missing,
+    Symlink(PathBuf),
+    File {
+        bytes: Vec<u8>,
+        modified: Option<std::time::SystemTime>,
+        readonly: bool,
+    },
+    Other {
+        is_dir: bool,
+        len: u64,
+    },
+}
+
+fn entry_snapshot(path: &Path) -> EntrySnapshot {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return EntrySnapshot::Missing;
+        }
+        Err(error) => panic!("讀取隔離安裝入口 metadata 失敗：{}：{error}", path.display()),
+    };
+    if metadata.file_type().is_symlink() {
+        return EntrySnapshot::Symlink(
+            fs::read_link(path).unwrap_or_else(|error| {
+                panic!("讀取隔離安裝入口 symlink 失敗：{}：{error}", path.display())
+            }),
+        );
+    }
+    if metadata.is_file() {
+        return EntrySnapshot::File {
+            bytes: fs::read(path).unwrap_or_else(|error| {
+                panic!("讀取隔離安裝入口檔案失敗：{}：{error}", path.display())
+            }),
+            modified: metadata.modified().ok(),
+            readonly: metadata.permissions().readonly(),
+        };
+    }
+    EntrySnapshot::Other {
+        is_dir: metadata.is_dir(),
+        len: metadata.len(),
+    }
 }
 
 pub fn install_snapshot(install_root: &Path) -> InstallSnapshot {
     InstallSnapshot {
         current: fs::read(install_root.join("current-release.json"))
             .expect("讀取隔離 current-release.json"),
-        cli_entry: fs::read_link(install_root.join("bin/serialwrap")).ok(),
-        daemon_entry: fs::read_link(install_root.join("bin/serialwrapd")).ok(),
+        cli_entry: entry_snapshot(&install_root.join("bin/serialwrap")),
+        daemon_entry: entry_snapshot(&install_root.join("bin/serialwrapd")),
     }
 }
 
@@ -342,38 +440,60 @@ fn artifact_dir() -> PathBuf {
 }
 
 fn repository_root() -> PathBuf {
-    std::env::current_dir()
-        .expect("取得 handoff_stop 測試工作目錄")
+    let cwd = std::env::current_dir().expect("取得 handoff_stop 測試工作目錄");
+    if let Some(root) = cwd
         .ancestors()
         .find(|directory| directory.join("crates/sw-daemon/Cargo.toml").is_file())
-        .expect("從 handoff_stop 測試工作目錄定位 workspace 根目錄")
-        .to_path_buf()
+    {
+        return root.to_path_buf();
+    }
+    // Windows runner 只 staging 測試資料與執行檔；artifact 限定寫在本次 staging 根目錄。
+    std::env::var_os("SW_TEST_SERIALWRAPD")
+        .and_then(|daemon| PathBuf::from(daemon).parent().map(Path::to_path_buf))
+        .unwrap_or(cwd)
 }
 
-fn systemd_service_state(label: &str, edge: &str) -> Vec<u8> {
-    let output = Command::new("systemctl")
-        .args([
-            "--user",
-            "show",
-            "serialwrap.service",
-            "-p",
-            "MainPID",
-            "-p",
-            "ActiveEnterTimestamp",
-        ])
-        .output()
-        .expect("查詢 serialwrap.service 的 MainPID 與 ActiveEnterTimestamp");
-    assert!(
-        output.status.success(),
-        "systemctl --user show serialwrap.service 失敗（{label}/{edge}）：{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let path = artifact_dir().join(format!("systemd-{label}-{edge}.txt"));
-    fs::write(&path, &output.stdout).expect("保存 systemd service 快照");
-    output.stdout
+fn host_supervisor_state(label: &str, edge: &str) -> Vec<u8> {
+    let platform = sw_pal::native();
+    let state = if platform.caps.native_device == sw_pal::DeviceBackendKind::Win {
+        // Windows 的原生監管項是 Task Scheduler 工作；只查詢狀態，不呼叫變更命令。
+        // 以產品的唯讀 WindowsTaskCtl 查詢對應 \\serialwrap 工作，保留前後相同斷言。
+        match platform.service.query(&SupervisionMode::WindowsTask) {
+            TaskQuery::Running => b"Running".to_vec(),
+            TaskQuery::NotRunning(state) => format!("NotRunning:{state}").into_bytes(),
+            TaskQuery::NotFound => b"NotFound".to_vec(),
+            TaskQuery::QueryFailed(error) => {
+                panic!("查詢 Windows serialwrap 排程工作失敗（{label}/{edge}）：{error}")
+            }
+        }
+    } else {
+        // Linux 的既有安全檢查維持唯讀比對正式 systemd unit 的 PID 與啟動時間。
+        let output = Command::new("systemctl")
+            .args([
+                "--user",
+                "show",
+                "serialwrap.service",
+                "-p",
+                "MainPID",
+                "-p",
+                "ActiveEnterTimestamp",
+            ])
+            .output()
+            .expect("查詢 serialwrap.service 的 MainPID 與 ActiveEnterTimestamp");
+        assert!(
+            output.status.success(),
+            "systemctl --user show serialwrap.service 失敗（{label}/{edge}）：{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+
+    let path = artifact_dir().join(format!("supervisor-{label}-{edge}.txt"));
+    fs::write(&path, &state).expect("保存本機監管項唯讀快照");
+    state
 }
 
-/// 執行 CLI 子行程，前後保存並比較正式 service 的 PID 與啟動時間。
+/// 執行 CLI 子行程，前後保存並比較本機正式監管項狀態。
 pub fn run_audited_cli(
     cli: &Path,
     vars: &BTreeMap<String, String>,
@@ -381,7 +501,7 @@ pub fn run_audited_cli(
     label: &str,
     timeout: Duration,
 ) -> Output {
-    let before = systemd_service_state(label, "before");
+    let before = host_supervisor_state(label, "before");
     let mut command = Command::new(cli);
     command
         .args(args)
@@ -390,6 +510,14 @@ pub fn run_audited_cli(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Windows Winsock 載入 provider 需要 SystemRoot；env_clear 後只補回 OS 根目錄，
+    // CLI 的 SERIALWRAP 設定與狀態路徑仍完全使用 vars 中的隔離值。
+    if let Some(system_root) =
+        std::env::var_os("SystemRoot").or_else(|| std::env::var_os("WINDIR"))
+    {
+        command.env("SystemRoot", &system_root);
+        command.env("WINDIR", system_root);
+    }
     if let Some(path) = std::env::var_os("PATH") {
         command.env("PATH", path);
     }
@@ -400,10 +528,10 @@ pub fn run_audited_cli(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            let after = systemd_service_state(label, "after");
+            let after = host_supervisor_state(label, "after");
             assert_eq!(
                 before, after,
-                "CLI 啟動失敗期間正式 service 狀態不得改變（{label}）"
+                "CLI 啟動失敗期間本機正式監管項狀態不得改變（{label}）"
             );
             panic!("啟動正式 CLI {} 失敗：{error}", cli.display());
         }
@@ -423,20 +551,20 @@ pub fn run_audited_cli(
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let after = systemd_service_state(label, "after");
+                let after = host_supervisor_state(label, "after");
                 assert_eq!(
                     before, after,
-                    "檢查 CLI 子行程期間正式 service 狀態不得改變（{label}）"
+                    "檢查 CLI 子行程期間本機正式監管項狀態不得改變（{label}）"
                 );
                 panic!("檢查 CLI 子行程失敗：{error}");
             }
         }
     }
     let output = child.wait_with_output().expect("讀取 CLI 子行程輸出");
-    let after = systemd_service_state(label, "after");
+    let after = host_supervisor_state(label, "after");
     assert_eq!(
         before, after,
-        "CLI 子行程不得停止或重啟正式 serialwrap.service（{label}）"
+        "CLI 子行程不得改變本機正式監管項狀態（{label}）"
     );
     let directory = artifact_dir();
     fs::write(

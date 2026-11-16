@@ -3093,9 +3093,17 @@ fn test_dr1_d_release_not_enqueued_keeps_ledger_then_next_release_completes() {
 /// DR-1(e1)(e2) 共用：release 已受理但呼叫端回覆逾時之後的收斂。關閉暫停中：帳本為 Closing、cancel＝Release 不撤銷；
 /// 首次期限內的第二個 release 共用首次期限（在首次 release 加 3 s 時回 DRAIN_STALLED），期限後的 release 立即回
 /// DRAIN_STALLED；放行關閉後遲到的回條完成 RELEASED 並落盤；被丟棄的回覆通道不影響狀態（Python
-/// `origin/main:sw_core/session_manager.py:3117-3125`、`:3192-3204`、`:4339-4355`）。`wait_start` 為 actor 執行第一個
-/// release、建立首次 ReleaseWait 的時刻（不早於此）；第二個 release 在其後 1 s 才送出，共用期限時約 2 s 回覆。
-fn dr1_e_after_reply_timeout(m: &ManagerRig, dev: &sw_pal::fakes::serial::FakeDevice, token: u64, full_sid: &str, wait_start: Instant) {
+/// `origin/main:sw_core/session_manager.py:3085-3086`、`:3117-3125`、`:3192-3204`、`:4339-4355`）。`wait_start` 是 actor
+/// 開始執行第一次 release 的時刻，用來安排第二次 release；`deadline_start` 是首次 release RPC 進入前的取樣。
+/// 首次絕對期限依 Python 與 2026-11-11 編排者裁決（`rulings/s2.md`，SPEC-GAP 2）從 RPC 進入起算 3 s。
+fn dr1_e_after_reply_timeout(
+    m: &ManagerRig,
+    dev: &sw_pal::fakes::serial::FakeDevice,
+    token: u64,
+    full_sid: &str,
+    wait_start: Instant,
+    deadline_start: Instant,
+) {
     wait_until("release 的 ClaimForStop 已作用於紀錄", || {
         m.mgr.custody_for_test(DR7_BY_ID).is_some_and(|rec| rec.cancel == Some(CustodyCancel::Release))
     });
@@ -3114,9 +3122,9 @@ fn dr1_e_after_reply_timeout(m: &ManagerRig, dev: &sw_pal::fakes::serial::FakeDe
     let second_elapsed = second_at.elapsed();
     assert_eq!(dr1_error_code(&second).as_deref(), Some("DRAIN_STALLED"), "{second:?}");
     assert!(
-        wait_start.elapsed() >= Duration::from_millis(2500),
-        "共用首次 release 的期限：不得早於首次 ReleaseWait 加 3 s：{:?}",
-        wait_start.elapsed()
+        deadline_start.elapsed() >= Duration::from_millis(sw_core::resources::DRAIN_TIMEOUT_MS),
+        "共用首次 release 的絕對期限：不得早於首次 RPC 進入加 3 s：{:?}",
+        deadline_start.elapsed()
     );
     assert!(
         second_elapsed < Duration::from_millis(2600),
@@ -3154,7 +3162,7 @@ fn test_dr1_e1_release_reply_timeout_keeps_cancel_and_late_close_releases() {
     let first = m.mgr.route(&full_sid, dr1_release(), Duration::from_millis(500));
     let err = first.expect_err("關閉暫停中 release 回覆逾時");
     assert_eq!(err.message, "internal timeout", "{err:?}");
-    dr1_e_after_reply_timeout(&m, &dev, token, &full_sid, first_at);
+    dr1_e_after_reply_timeout(&m, &dev, token, &full_sid, first_at, first_at);
     go_tx.send(()).expect("放行 bind");
     let _ = bind.join().expect("bind 執行緒不應 panic");
     std::thread::sleep(Duration::from_millis(200));
@@ -3194,9 +3202,8 @@ fn test_dr1_e2_release_enqueued_then_actor_resumes_same_as_e1() {
     let resumed_at = Instant::now();
     resume.send(()).expect("放行 actor");
     query.join().expect("查詢執行緒不應 panic");
-    // 首次 ReleaseWait 在 actor 執行該 release 時建立（放行之後）。
-    let _ = first_at;
-    dr1_e_after_reply_timeout(&m, &dev, token, &full_sid, resumed_at);
+    // actor 放行後才開始執行 release；絕對期限仍沿用 RPC 進入時的 first_at。
+    dr1_e_after_reply_timeout(&m, &dev, token, &full_sid, resumed_at, first_at);
     go_tx.send(()).expect("放行 bind");
     let _ = bind.join().expect("bind 執行緒不應 panic");
     std::thread::sleep(Duration::from_millis(200));

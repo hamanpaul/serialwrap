@@ -10,9 +10,11 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use sw_pal::traits::{DeviceInfo, EndpointSpec, SockTimeout};
@@ -60,6 +62,7 @@ const POPPED_VARS: [&str; 5] = [
 ];
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
+static ISOLATED_TCP_PORTS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
 
 fn unique_root() -> PathBuf {
     let n = SEQ.fetch_add(1, Ordering::SeqCst);
@@ -94,7 +97,9 @@ impl Drop for RootGuard {
 pub struct IsolatedEnv {
     pub vars: BTreeMap<String, String>,
     pub root: PathBuf,
-    /// `<run>/serialwrapd.sock`（預設 endpoint）。
+    /// daemon 使用的 RPC endpoint（POSIX 為 Unix 路徑，Windows caps 為 loopback TCP URI）。
+    pub endpoint: String,
+    /// `<run>/serialwrapd.sock` 或 loopback TCP URI；供既有 RPC 測試 helper 傳遞 endpoint。
     pub socket: PathBuf,
     /// `<run>/serialwrapd.lock`。
     pub lock: PathBuf,
@@ -118,6 +123,11 @@ pub struct IsolatedEnv {
 
 /// 建立隔離環境（尚未寫入任何 profile／config）。
 pub fn isolated_env() -> IsolatedEnv {
+    isolated_env_for_caps(sw_pal::native().caps)
+}
+
+/// 以指定 native caps 建立隔離環境（供平台相依行為的 Linux 回歸測試注入假 caps）。
+pub fn isolated_env_for_caps(caps: sw_pal::Capabilities) -> IsolatedEnv {
     let root = unique_root();
     let guard = RootGuard(root.clone());
     let dir = |name: &str| -> PathBuf {
@@ -181,13 +191,16 @@ pub fn isolated_env() -> IsolatedEnv {
     vars.insert("SERIALWRAP_CONFIG".to_string(), String::new());
     vars.insert(
         "SERIALWRAP_TEST_DEVICE_ALLOWLIST".to_string(),
-        test_device_allowlist_for_caps(sw_pal::native().caps).to_string(),
+        test_device_allowlist_for_caps(caps).to_string(),
     );
 
+    let endpoint = isolated_endpoint_for_caps(caps, &run_dir);
+    vars.insert("SERIALWRAP_ENDPOINT".to_string(), endpoint.clone());
     IsolatedEnv {
         vars,
         root,
-        socket: run_dir.join("serialwrapd.sock"),
+        endpoint: endpoint.clone(),
+        socket: PathBuf::from(endpoint),
         lock: run_dir.join("serialwrapd.lock"),
         run_dir,
         state_dir,
@@ -204,6 +217,41 @@ pub fn isolated_env() -> IsolatedEnv {
         target: None,
         _root: guard,
     }
+}
+
+fn isolated_endpoint_for_caps(caps: sw_pal::Capabilities, run_dir: &Path) -> String {
+    if caps.native_device != sw_pal::DeviceBackendKind::Win {
+        return run_dir.join("serialwrapd.sock").display().to_string();
+    }
+
+    let mut used = ISOLATED_TCP_PORTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("配置隔離 loopback RPC 埠");
+        let port = listener.local_addr().expect("讀取隔離 RPC 埠").port();
+        if used.contains(&port) {
+            drop(listener);
+            continue;
+        }
+        used.push(port);
+        drop(listener);
+        return format!("tcp://127.0.0.1:{port}");
+    }
+}
+
+/// 從 daemon 使用的 env 解析 RPC endpoint；空值時沿用隔離 run 目錄的 Unix socket。
+pub fn endpoint_from_vars(vars: &BTreeMap<String, String>) -> PathBuf {
+    vars.get("SERIALWRAP_ENDPOINT")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(
+                vars.get("SERIALWRAP_RUN_DIR")
+                    .expect("vars 須含 SERIALWRAP_RUN_DIR"),
+            )
+            .join("serialwrapd.sock")
+        })
 }
 
 /// 測試 daemon 的預設裝置白名單；此值會覆寫繼承的環境變數。
@@ -450,9 +498,20 @@ impl DaemonProc {
         vars: &BTreeMap<String, String>,
         args: &[&str],
     ) -> DaemonProc {
+        Self::try_spawn_with_caps(env, vars, args, sw_pal::native().caps)
+            .unwrap_or_else(|message| panic!("{message}"))
+    }
+
+    pub fn try_spawn_with_caps(
+        env: &IsolatedEnv,
+        vars: &BTreeMap<String, String>,
+        args: &[&str],
+        caps: sw_pal::Capabilities,
+    ) -> Result<DaemonProc, String> {
+        require_test_daemon_allowlist(caps, vars)?;
         let n = SEQ.fetch_add(1, Ordering::SeqCst);
         let stderr_path = env.root.join(format!("daemon-{n}.stderr"));
-        let file = File::create(&stderr_path).expect("建立 stderr 檔");
+        let file = File::create(&stderr_path).map_err(|error| format!("建立 stderr 檔失敗：{error}"))?;
         let child = Command::new(daemon_binary())
             .args(args)
             .envs(vars)
@@ -460,8 +519,8 @@ impl DaemonProc {
             .stdout(Stdio::null())
             .stderr(Stdio::from(file))
             .spawn()
-            .expect("啟動 serialwrapd");
-        DaemonProc { child, stderr_path }
+            .map_err(|error| format!("啟動 serialwrapd 失敗：{error}"))?;
+        Ok(DaemonProc { child, stderr_path })
     }
 
     pub fn pid(&self) -> u32 {
@@ -507,6 +566,93 @@ impl DaemonProc {
     }
 }
 
+pub(super) fn require_test_daemon_allowlist(
+    caps: sw_pal::Capabilities,
+    vars: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    if caps.native_device != sw_pal::DeviceBackendKind::Win {
+        return Ok(());
+    }
+    let env_allowlist = vars
+        .get("SERIALWRAP_TEST_DEVICE_ALLOWLIST")
+        .is_some_and(|value| value.split(',').any(|item| !item.trim().is_empty()));
+    if env_allowlist || config_has_test_device_allowlist(vars) {
+        return Ok(());
+    }
+    Err(
+        "Windows caps 下拒絕啟動測試 serialwrapd：SERIALWRAP_TEST_DEVICE_ALLOWLIST 與 config allowlist 皆為空；請使用 COM250。"
+            .to_string(),
+    )
+}
+
+fn config_has_test_device_allowlist(vars: &BTreeMap<String, String>) -> bool {
+    let explicit = vars
+        .get("SERIALWRAP_CONFIG")
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from);
+    let local = vars
+        .get("SERIALWRAP_CONFIG_DIR")
+        .map(|directory| PathBuf::from(directory).join("config.yaml"));
+    let system = vars
+        .get("SERIALWRAP_TEST_SYSTEM_CONFIG_PATH")
+        .map(PathBuf::from);
+    let path = match explicit {
+        // Python／Rust config resolver treats an explicit non-empty SERIALWRAP_CONFIG as authoritative,
+        // even when the path does not exist. Do not authorize a daemon from a lower-priority file.
+        Some(path) => Some(path),
+        None => {
+            if local.as_ref().is_some_and(|path| path.exists()) {
+                local.clone()
+            } else if system.as_ref().is_some_and(|path| path.exists()) {
+                system.clone()
+            } else {
+                local.clone()
+            }
+        }
+    };
+    let Some(path) = path else {
+        return false;
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(config) = sw_proto::config_types::RuntimeConfig::from_text(Some(&text)) else {
+        return false;
+    };
+    matches!(
+        config.windows_test_device_allowlist(),
+        Ok(Some(allowlist)) if !allowlist.is_empty()
+    )
+}
+
+/// In-process RPC client 若在送出 `daemon.stop` 前 panic，限時重試 `health.ping` 並停止 server，
+/// 避免測試卡在 `run_with_hooks`。
+pub fn spawn_stop_guarded_client<T: Send + 'static>(
+    endpoint: PathBuf,
+    client: impl FnOnce() -> T + Send + 'static,
+) -> std::thread::JoinHandle<T> {
+    std::thread::spawn(move || match std::panic::catch_unwind(std::panic::AssertUnwindSafe(client)) {
+        Ok(value) => value,
+        Err(panic) => {
+            let deadline = Instant::now() + LONG;
+            while Instant::now() < deadline {
+                let serving = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    endpoint_is_serving(&endpoint)
+                }))
+                .unwrap_or(false);
+                if serving {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        rpc_once(&endpoint, STOP)
+                    }));
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            std::panic::resume_unwind(panic)
+        }
+    })
+}
+
 impl Drop for DaemonProc {
     fn drop(&mut self) {
         if matches!(self.child.try_wait(), Ok(None)) {
@@ -532,9 +678,32 @@ pub fn run_to_exit(env: &IsolatedEnv, vars: &BTreeMap<String, String>, args: &[&
     }
 }
 
+/// 直接執行 daemon 的 allowlist 前置拒絕案例。
+///
+/// 僅供故意提供空 env allowlist 與格式錯誤 config 的負向測試：harness 的一般啟動守門會先攔下空
+/// allowlist，使測試無法驗證 daemon 本身的 SC-19 錯誤文字。產品應在 `ensure_runtime_dirs`、取鎖與
+/// `DeviceWatcher::initial_scan` 之前拒絕，因此此 helper 仍執行真實 daemon，並由呼叫端核對拒絕與零副作用。
+pub fn run_allowlist_preflight_to_exit(
+    vars: &BTreeMap<String, String>,
+    args: &[&str],
+) -> Output {
+    let result = Command::new(daemon_binary())
+        .args(args)
+        .envs(vars)
+        .stdin(Stdio::null())
+        .output()
+        .expect("啟動 allowlist 前置拒絕案例的真實 serialwrapd");
+    Output {
+        code: result.status.code(),
+        stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
+    }
+}
+
 /// 以測試執行檔自身重新啟動一個測試函式（子行程模式）。子行程以環境變數 `S21_CHILD=<mode>` 辨識，
 /// 並在測試函式內呼叫 in-process 的 `run_with_hooks` 後以其 exit code 結束。
 pub fn run_child_test(test_name: &str, mode: &str, env: &IsolatedEnv) -> Output {
+    require_test_daemon_allowlist(sw_pal::native().caps, &env.vars)
+        .unwrap_or_else(|message| panic!("{message}"));
     let exe = std::env::current_exe().expect("測試執行檔路徑");
     let out = Command::new(exe)
         .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
@@ -552,7 +721,7 @@ pub fn run_child_test(test_name: &str, mode: &str, env: &IsolatedEnv) -> Output 
 /// 送一行 NDJSON 請求並取回第一行回應；連線失敗、對端斷線或未收到回應時回傳空字串。
 pub fn rpc_once(socket: &Path, line: &str) -> String {
     let platform = sw_pal::native();
-    let endpoint = EndpointSpec::Unix(socket.as_os_str().to_owned());
+    let endpoint = endpoint_spec(socket);
     let mut stream = match platform
         .rpc
         .connect(&endpoint, SockTimeout::Blocking(Duration::from_secs(20)))
@@ -580,6 +749,15 @@ pub fn rpc_once(socket: &Path, line: &str) -> String {
         .to_string()
 }
 
+pub fn endpoint_spec(endpoint: &Path) -> EndpointSpec {
+    match sw_proto::endpoint::parse_endpoint(&endpoint.to_string_lossy())
+        .unwrap_or_else(|error| panic!("測試 RPC endpoint 無效：{} ({error:?})", endpoint.display()))
+    {
+        sw_proto::endpoint::Endpoint::Unix(path) => EndpointSpec::Unix(path.into()),
+        sw_proto::endpoint::Endpoint::Tcp { host, port } => EndpointSpec::Tcp { host, port },
+    }
+}
+
 /// `{"id":1,"method":…,"params":…}` 的便利包裝；回應解析為 `PyValue`（失敗時為 `Null`）。
 pub fn rpc_value(socket: &Path, method: &str, params: &str) -> PyValue {
     let line = format!(r#"{{"id":1,"method":"{method}","params":{params}}}"#);
@@ -598,6 +776,11 @@ pub fn wait_socket(socket: &Path, timeout: Duration) {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// endpoint 是否正在接受 RPC；相容 Unix socket 檔案與 loopback TCP listener。
+pub fn endpoint_is_serving(endpoint: &Path) -> bool {
+    rpc_value(endpoint, "health.ping", "{}")["ok"] == true
 }
 
 /// `session.get_state` 的 `session` 物件（找不到時為 `Null`）。
@@ -809,15 +992,14 @@ pub fn in_process_platform_with_handles(
         FakeDeviceSource, FakeEnv, FakeSerialBackend, FakeUartExclusive, FakeWriteStep,
     };
 
+    require_test_daemon_allowlist(sw_pal::native().caps, vars)
+        .unwrap_or_else(|message| panic!("{message}"));
+
     let config_dir = PathBuf::from(
         vars.get("SERIALWRAP_CONFIG_DIR")
             .expect("vars 須含 SERIALWRAP_CONFIG_DIR"),
     );
-    let socket = PathBuf::from(
-        vars.get("SERIALWRAP_RUN_DIR")
-            .expect("vars 須含 SERIALWRAP_RUN_DIR"),
-    )
-    .join("serialwrapd.sock");
+    let socket = endpoint_from_vars(vars);
     let profile_dir = config_dir.join("profiles");
     fs::create_dir_all(&profile_dir).expect("建立 profiles 目錄");
     let yaml = match fixture {
@@ -896,7 +1078,7 @@ pub fn in_process_platform_with_handles(
 
     match fixture {
         Fixture::BlockForeverWriter => {
-            std::thread::spawn(move || {
+            spawn_stop_guarded_client(socket.clone(), move || {
                 wait_socket(&socket, LONG);
                 wait_state_in_process(&socket, "COM0", "READY");
                 let r = submit(&socket, "COM0", "stuck");
@@ -906,7 +1088,7 @@ pub fn in_process_platform_with_handles(
             });
         }
         Fixture::WalSyncFailure => {
-            std::thread::spawn(move || {
+            spawn_stop_guarded_client(socket.clone(), move || {
                 wait_socket(&socket, LONG);
                 wait_state_in_process(&socket, "COM0", "READY");
                 rpc_once(&socket, STOP);

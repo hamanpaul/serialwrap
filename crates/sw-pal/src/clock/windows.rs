@@ -4,7 +4,7 @@ use crate::traits::Clock;
 use std::sync::OnceLock;
 use std::time::Duration;
 use windows_sys::Win32::Foundation::FILETIME;
-use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
+use windows_sys::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime;
 use windows_sys::Win32::System::Time::{
     GetTimeZoneInformation, TIME_ZONE_ID_INVALID, TIME_ZONE_INFORMATION,
 };
@@ -24,7 +24,7 @@ impl Clock for NativeClock {
     fn wall_unix_us(&self) -> i64 {
         let mut file_time = FILETIME::default();
         // SAFETY: `file_time` 指向可寫 FILETIME；API 只填入目前 UTC 時間。
-        unsafe { GetSystemTimeAsFileTime(&mut file_time) };
+        unsafe { GetSystemTimePreciseAsFileTime(&mut file_time) };
         let ticks =
             (u64::from(file_time.dwHighDateTime) << 32) | u64::from(file_time.dwLowDateTime);
         let unix_ticks = i128::from(ticks) - 116_444_736_000_000_000i128;

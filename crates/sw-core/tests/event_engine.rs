@@ -61,6 +61,11 @@ fn dumps_default(v: &PyValue) -> String {
     )
 }
 
+/// Python event log 以 json.dumps(ensure_ascii=False) 序列化路徑（origin/main sw_core/event_engine/event_log.py:32）。
+fn json_string(s: &str) -> String {
+    pyjson::dumps(&PyValue::from(s), &pyjson::RPC_WIRE)
+}
+
 fn harness_with(
     known: &[&str],
     files: &[(&str, String)],
@@ -475,11 +480,12 @@ fn com_disable_clears_counter_then_emits_in_order() {
         d(h.engine.reload().unwrap()),
         r#"{"added": ["o.y"], "removed": ["o.z"], "changed": ["o.c"]}"#
     );
-    let bad = ev.join("bad.json").to_string_lossy().into_owned();
+    let bad_path = ev.join("bad.json").to_string_lossy().into_owned();
+    let bad = json_string(&bad_path);
     assert_eq!(
         h.log_from(n0),
         format!(
-            r#"[{{"type": "rule_load_failed", "path": "{bad}", "reason": "read/parse failed: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)"}}, {{"type": "com_enabled", "selector": "COM5", "triggered_by": "reload"}}, {{"type": "rule_loaded", "rule_id": "o.y"}}, {{"type": "rule_unloaded", "rule_id": "o.z"}}, {{"type": "rule_loaded", "rule_id": "o.c"}}]"#
+            r#"[{{"type": "rule_load_failed", "path": {bad}, "reason": "read/parse failed: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)"}}, {{"type": "com_enabled", "selector": "COM5", "triggered_by": "reload"}}, {{"type": "rule_loaded", "rule_id": "o.y"}}, {{"type": "rule_unloaded", "rule_id": "o.z"}}, {{"type": "rule_loaded", "rule_id": "o.c"}}]"#
         )
     );
     assert_eq!(
@@ -513,15 +519,16 @@ fn start_failed_load_written_and_all_selector_expands_on_start_rule_set_reload()
         FakeHandlerSpawner::scripted(vec![]),
     );
     h.engine.start().unwrap();
-    let bad = h
+    let bad_path = h
         .events_dir()
         .join("bad.json")
         .to_string_lossy()
         .into_owned();
+    let bad = json_string(&bad_path);
     assert_eq!(
         h.log_from(0),
         format!(
-            r#"[{{"type": "rule_load_failed", "path": "{bad}", "reason": "read/parse failed: Expecting value: line 1 column 2 (char 1)"}}, {{"type": "rule_loaded", "rule_id": "o.n"}}, {{"type": "com_enabled", "selector": "COM0", "triggered_by": "auto"}}]"#
+            r#"[{{"type": "rule_load_failed", "path": {bad}, "reason": "read/parse failed: Expecting value: line 1 column 2 (char 1)"}}, {{"type": "rule_loaded", "rule_id": "o.n"}}, {{"type": "com_enabled", "selector": "COM0", "triggered_by": "auto"}}]"#
         ),
         "DF-09：壞檔記 rule_load_failed、engine 正常啟動；start 時 rule_loaded 先於 com_enabled"
     );
@@ -548,7 +555,7 @@ fn start_failed_load_written_and_all_selector_expands_on_start_rule_set_reload()
     assert_eq!(
         h.log_from(n0),
         format!(
-            r#"[{{"type": "rule_load_failed", "path": "{bad}", "reason": "read/parse failed: Expecting value: line 1 column 2 (char 1)"}}, {{"type": "com_enabled", "selector": "COM2", "triggered_by": "reload"}}, {{"type": "rule_loaded", "rule_id": "o.m"}}]"#
+            r#"[{{"type": "rule_load_failed", "path": {bad}, "reason": "read/parse failed: Expecting value: line 1 column 2 (char 1)"}}, {{"type": "com_enabled", "selector": "COM2", "triggered_by": "reload"}}, {{"type": "rule_loaded", "rule_id": "o.m"}}]"#
         )
     );
     h.engine.stop(Instant::now() + Duration::from_secs(5));

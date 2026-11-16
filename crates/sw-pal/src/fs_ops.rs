@@ -26,6 +26,38 @@ pub mod posix;
 #[cfg(windows)]
 pub mod windows;
 
+/// 將本機檔案讀寫錯誤轉成 Python 相容的 PAL 錯誤。
+///
+/// Windows 檔案 API 回報的 Win32 錯誤需先轉成 CRT errno，才能對齊 Python `open` 的 `OSError`。
+pub fn map_file_error(error: std::io::Error) -> PalError {
+    #[cfg(unix)]
+    {
+        crate::traits::posix_io_error(error)
+    }
+    #[cfg(windows)]
+    {
+        windows::file_error(error)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        PalError::plain(PalErrorKind::Io, error.to_string())
+    }
+}
+
+/// 將建立目錄錯誤轉成 Python `os.makedirs` 相容的 PAL 錯誤。
+///
+/// Windows `os.makedirs` 保留 Win32 錯誤碼（例如 `[WinError 183]`），與 `open` 的 CRT errno 不同。
+pub fn map_mkdir_error(error: std::io::Error) -> PalError {
+    #[cfg(windows)]
+    {
+        windows::win32_error(error)
+    }
+    #[cfg(not(windows))]
+    {
+        map_file_error(error)
+    }
+}
+
 /// `symlink_or_copy_dir` 的結果（DF-16）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkKind {

@@ -7743,7 +7743,12 @@ impl SessionCore {
         self.capture_env
             .fs
             .makedirs(&log_dir)
-            .map_err(|error| PyErr::value_error(os_error_text(&error, &log_dir)))?;
+            .map_err(|error| {
+                PyErr::value_error(os_error_text(
+                    sw_pal::fs_ops::map_mkdir_error(error),
+                    &log_dir,
+                ))
+            })?;
         let filename = format!("{}_{}.log", self.profile.com, self.log_timestamp());
         let log_path = std::path::Path::new(&log_dir)
             .join(filename)
@@ -7756,7 +7761,8 @@ impl SessionCore {
             Ok(file) => file,
             Err(error) => {
                 return Ok(crate::capture::log_open_failed_reply(&os_error_text(
-                    &error, &log_path,
+                    sw_pal::fs_ops::map_file_error(error),
+                    &log_path,
                 )));
             }
         };
@@ -9157,17 +9163,16 @@ fn py_tail(text: &str, n: i128) -> String {
 }
 
 /// Python `str(OSError)`：`[Errno N] strerror: 'path'`。
-fn os_error_text(error: &std::io::Error, path: &str) -> String {
-    let message = error.to_string();
-    let strerror = message
-        .split(" (os error")
-        .next()
-        .unwrap_or(message.as_str())
-        .to_string();
-    match error.raw_os_error() {
-        Some(code) => format!("[Errno {code}] {strerror}: '{path}'"),
-        None => format!("{strerror}: '{path}'"),
+fn os_error_text(error: sw_pal::traits::PalError, path: &str) -> String {
+    let has_os_code = error.os_code.is_some() || error.winerror.is_some();
+    sw_proto::pycompat::PyOsError {
+        errno: error.os_code.map(i64::from),
+        winerror: error.winerror.map(i64::from),
+        strerror: Some(error.strerror),
+        filename: Some(path.to_string()),
+        plain: (!has_os_code).then_some(error.py_message),
     }
+    .to_string()
 }
 
 fn option_string(value: Option<&str>) -> PyValue {

@@ -502,12 +502,12 @@ fn wide_path(path: &Path) -> Vec<u16> {
         .collect()
 }
 
-fn file_error(error: io::Error) -> PalError {
+pub(super) fn file_error(error: io::Error) -> PalError {
     let code = error.raw_os_error().unwrap_or(5) as u32;
     windows_crt_error(windows_crt_errno(code))
 }
 
-fn win32_error(error: io::Error) -> PalError {
+pub(super) fn win32_error(error: io::Error) -> PalError {
     windows_win32_error(error.raw_os_error().unwrap_or(5) as u32)
 }
 

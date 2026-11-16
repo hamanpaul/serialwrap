@@ -1114,6 +1114,7 @@ def test_workflow_ci_l1_gates() -> None:
     # OD-16／OD-17 逐名核准，加上 OD-23（2026-10-27）補授權的 36 個既有移除三元組、OD-24 的 5 筆 #[ignore] 列與 OD-68 三筆 Linux 列
     # （docs/rust-refactor/reviews/s1x-unauthorized-removals.md）；順序與 tests.yml 完全一致。
     # OD-56（rulings/p7.md P7-BO-1）僅核准 s21_core.linux 兩個舊 nodeid，由替換測試承擔。
+    # OD-95 與編排者 2026-11-16 補記逐名核准 F2/F3 的 17 個 Windows nodeid。
     allowed_removals = (
         "s0_win_pytest:windows:tests/test_cli_stderr_full_error.py::TestRunRpcStderrKeepsMessage::test_socket_error_stderr_includes_error_code_and_message",
         "s0_win_pytest:windows:tests/test_contracts_catalog.py::test_ec_passthrough_single_meta_entry",
@@ -1670,6 +1671,23 @@ def test_workflow_ci_l1_gates() -> None:
         "s21_gate:cap_interactive_desktop:linux:cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c",
         "s21_core:linux:cargo:sw-core::login_quiet::unsupported_profile_no_auto_tx",
         "s21_core:linux:cargo:sw-core::session_manager::detect_skips_passthrough_console_unlock_and_unsupported",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::daemon_stop_during_force_recover_with_client_gone",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::daemon_stop_from_second_connection_during_force_recover",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::real_sigterm_to_started_daemon_exits_0_after_flush",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::shutdown_releases_tty_before_exit",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::wal_dir_readonly_at_start_blocks_login_probe",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::wal_fault_after_ready_splits_agent_and_auto_tx",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::non_root_holder_scan_permission_does_not_block_open",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::release_kill_hook_env_isolated_only",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::release_pause_hook_env_isolated_only",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::sigterm_sigint_orderly_stop",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::unwritable_state_dir_startup_save_exits_1_before_attach",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::endpoint_written_after_bind",
+        "s21_core:windows:cargo:sw-daemon::restart_after_commit::kill_before_commit_restores_previous_state",
+        "s21_core:windows:cargo:sw-daemon::restart_after_commit::kill_between_commit_and_reply_keeps_released_after_restart",
+        "s21_core:windows:cargo:sw-daemon::handoff_stop::handoff_drain_window_background_triggers_zero_tx",
+        "s21_core:windows:cargo:sw-daemon::handoff_stop::handoff_then_successor_never_double_held",
+        "s21_core:windows:cargo:sw-daemon::shutdown_order::second_sigterm_real_signal_exits_0",
     )
     for nodeid in allowed_removals:
         assert nodeid in lock_command, f"L1 擁有者裁決清單缺少 {nodeid}"
@@ -1748,13 +1766,14 @@ def test_od24_ignored_removal_triples_are_approved_in_ci() -> None:
 
 @pytest.mark.memory_only
 def test_od68_removal_triples_are_approved_in_ci() -> None:
-    """OD-68：三筆 windows-only 能力集合 Linux 移除須逐名核准於 CI 參數。"""
+    """OD-68／OD-95：核准的 L1 移除三元組須逐名列入 CI 參數。"""
     triples = (
         "s21_gate:cap_windows_native:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem",
         "s21_gate:cap_windows_native:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child",
         "s21_gate:cap_interactive_desktop:linux:cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c",
     )
-    wf = yaml.safe_load(Path(".github/workflows/tests.yml").read_text(encoding="utf-8"))
+    workflow_text = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
+    wf = yaml.safe_load(workflow_text)
     lock_steps = [
         st for st in wf["jobs"]["pytest"]["steps"]
         if "regen_lock.py --check --base" in str(st.get("run", ""))
@@ -1764,6 +1783,27 @@ def test_od68_removal_triples_are_approved_in_ci() -> None:
     allowed = tokens[tokens.index("--allow-removal") + 1:]
     missing = [triple for triple in triples if triple not in allowed]
     assert not missing, missing
+    od95 = (
+        "s21_core:windows:cargo:sw-daemon::daemon_process::daemon_stop_during_force_recover_with_client_gone",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::daemon_stop_from_second_connection_during_force_recover",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::real_sigterm_to_started_daemon_exits_0_after_flush",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::shutdown_releases_tty_before_exit",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::wal_dir_readonly_at_start_blocks_login_probe",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::wal_fault_after_ready_splits_agent_and_auto_tx",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::non_root_holder_scan_permission_does_not_block_open",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::release_kill_hook_env_isolated_only",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::release_pause_hook_env_isolated_only",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::sigterm_sigint_orderly_stop",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::unwritable_state_dir_startup_save_exits_1_before_attach",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::endpoint_written_after_bind",
+        "s21_core:windows:cargo:sw-daemon::restart_after_commit::kill_before_commit_restores_previous_state",
+        "s21_core:windows:cargo:sw-daemon::restart_after_commit::kill_between_commit_and_reply_keeps_released_after_restart",
+        "s21_core:windows:cargo:sw-daemon::handoff_stop::handoff_drain_window_background_triggers_zero_tx",
+        "s21_core:windows:cargo:sw-daemon::handoff_stop::handoff_then_successor_never_double_held",
+        "s21_core:windows:cargo:sw-daemon::shutdown_order::second_sigterm_real_signal_exits_0",
+    )
+    assert "OD-95（2026-11-15）" in workflow_text
+    assert not [triple for triple in od95 if triple not in allowed]
     sets = json.loads(Path("tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))["sets"]
     # OD-55（Windows 原生收集後）：承擔列自 s21_core.windows 移入同能力的 windows 能力集合（selector `--ignored cap_<cap>__`）。
     carried = {

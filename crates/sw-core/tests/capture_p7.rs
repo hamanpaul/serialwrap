@@ -27,6 +27,7 @@ use sw_core::capture::{
 use sw_core::session_core::SessionRequest;
 use sw_core::uart_bridge::RxObserver;
 use sw_pal::traits::Clock;
+use sw_proto::pycompat::PyOsError;
 use sw_proto::pyjson::{dumps_dict, loads, PyDict, PyInt, PyValue, RPC_WIRE};
 
 fn int(n: i128) -> PyValue {
@@ -77,13 +78,15 @@ impl LogFile for MemFile {
 #[test]
 fn log_path_uses_local_time() {
     // Python `time.strftime("%y%m%d-%H%M%S")`（本地時間）：1_700_000_000 為 2023-11-14 22:13:20 UTC，UTC+8 → 231115-061320。
+    // 路徑由 Python os.path.join 組合（origin/main sw_core/session_manager.py:8153-8155）。
+    let sep = std::path::MAIN_SEPARATOR;
     assert_eq!(
         log_path_for("/x", "COM2", 1_700_000_000, 28800),
-        "/x/COM2_231115-061320.log"
+        format!("/x{sep}COM2_231115-061320.log")
     );
     assert_eq!(
         log_path_for("/x", "COM0", 0, 0),
-        "/x/COM0_700101-000000.log"
+        format!("/x{sep}COM0_700101-000000.log")
     );
 }
 
@@ -405,11 +408,19 @@ fn log_open_failed_detail_is_python_oserror_str() {
     let r = h.request(SessionRequest::LogStart);
     assert_eq!(keys(&r), ["ok", "error_code", "detail"]);
     assert_eq!(r["error_code"], PyValue::from("LOG_OPEN_FAILED"));
-    let expected = if std::path::MAIN_SEPARATOR == '\\' {
-        format!("[Errno 13] Permission denied: '{path}'")
+    let (errno, strerror) = if std::path::MAIN_SEPARATOR == '\\' {
+        (13, "Permission denied")
     } else {
-        format!("[Errno 21] Is a directory: '{path}'")
+        (21, "Is a directory")
     };
+    let expected = PyOsError {
+        errno: Some(errno),
+        winerror: None,
+        strerror: Some(strerror.to_string()),
+        filename: Some(path),
+        plain: None,
+    }
+    .to_string();
     assert_eq!(r["detail"], PyValue::from(expected));
 }
 

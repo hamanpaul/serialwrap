@@ -100,7 +100,8 @@ fn isolated_absent_base(entry: Entry) -> (TestEnv, String, String) {
 fn scoped_absent_base(entry: Entry) -> (TestEnv, String, String) {
     let (t, socket, endpoint) = isolated_absent_base(entry);
     (
-        t.with_var("SERIALWRAP_TEST_UPDATE_SOCKET", &endpoint),
+        // selector 接受裸 Unix 路徑；避免 Windows 暫存目錄的磁碟代號被誤解析為 unix:// netloc。
+        t.with_var("SERIALWRAP_TEST_UPDATE_SOCKET", &socket),
         socket,
         endpoint,
     )
@@ -394,6 +395,23 @@ fn guard_process_alive_rpc_down_refuses() {
     assert_eq!(s(&j, "health"), "unknown", "{j:?}");
     assert!(!s(&j, "reason").is_empty(), "{j:?}");
     assert_untouched(&t, Entry::Rollback, "process alive");
+}
+
+#[test]
+fn guard_connect_timeout_with_foreign_daemon_reports_held_pid() {
+    // Windows 對未監聽的 loopback TCP endpoint 會回 TimedOut；掃描到同使用者 daemon 時仍須回報其 PID。
+    let ep = TestEnv::win_endpoint();
+    let t = base(Entry::Update)
+        .with_rpc_refused_kind(ep, PalErrorKind::TimedOut)
+        .with_procs(vec![DaemonProc::win(4242, ep)]);
+
+    let (rc, j, _) = run(&t, Entry::Update, false);
+    assert_eq!(rc, 2, "{j:?}");
+    assert_eq!((s(&j, "error_code"), s(&j, "phase")), ("DEVICE_STILL_HELD", "update_safety_check"));
+    assert_eq!(j["pids"][0], PyValue::from(4242i64), "{j:?}");
+    assert_eq!(s(&j, "health"), "unknown", "{j:?}");
+    assert_eq!(s(&j, "reason"), "process_alive_rpc_down", "{j:?}");
+    assert_untouched(&t, Entry::Update, "connect timeout with foreign daemon");
 }
 
 #[cfg(feature = "test-fakes")]

@@ -134,7 +134,7 @@ fn file_push_and_pull_rpc_end_to_end() {
     // bare human 依 OD-74 正規化為 human:cli；成功回應附 source／source_normalized_from（`_annotate_source`）。
     let r = rig.call(
         "file.push",
-        &format!(r#"{{"selector":"COM0","local_path":"{local}","remote_path":"/tmp/r.bin","ack_mode":"none","source":"human"}}"#),
+        &format!(r#"{{"selector":"COM0","local_path":{},"remote_path":"/tmp/r.bin","ack_mode":"none","source":"human"}}"#, json_string(&local)),
     );
     assert_eq!(
         keys(&r),
@@ -165,12 +165,89 @@ fn file_push_and_pull_rpc_end_to_end() {
 
     // pull：未帶 source 時不附來源標註。
     let out = tmp.path("back.bin");
-    let r = rig.call("file.pull", &format!(r#"{{"selector":"COM0","remote_path":"/tmp/r.bin","local_path":"{out}"}}"#));
+    let r = rig.call("file.pull", &format!(r#"{{"selector":"COM0","remote_path":"/tmp/r.bin","local_path":{}}}"#, json_string(&out)));
     assert_eq!(keys(&r), ["ok", "bytes", "md5", "local_path", "version"], "{}", wire(&r));
     assert_eq!(r.get("local_path"), Some(&PyValue::from(out.clone())));
     assert_eq!(std::fs::read(&out).unwrap(), data);
     let s = rig.session("COM0").expect("COM0");
     assert_eq!(s.get("foreground_busy"), Some(&PyValue::Bool(false)), "傳輸結束後釋放前景槽");
+}
+
+#[test]
+fn file_pull_local_write_error_matches_python_via_rpc() {
+    let rig = ServiceRig::ready_shell();
+    let dev = rig.device(REAL_A);
+    let fs = install_xfer_shell(dev);
+    fs.lock().unwrap().insert("/tmp/source.bin".into(), b"payload".to_vec());
+    let tmp = Tmp::new();
+    let local = std::path::Path::new(&tmp.0)
+        .join("missing")
+        .join("pull.bin")
+        .to_string_lossy()
+        .into_owned();
+    let params = format!(
+        r#"{{"selector":"COM0","remote_path":"/tmp/source.bin","local_path":{}}}"#,
+        json_string(&local)
+    );
+
+    let error = rig.call_err("file.pull", &params);
+    assert!(error.message.contains("No such file or directory"), "{}", error.message);
+    assert!(
+        dut_lines(dev).iter().any(|line| line.contains("base64 <")),
+        "pull 已經經由 RPC 送到 DUT，再因本機寫入失敗：{:?}",
+        dut_lines(dev)
+    );
+    assert_eq!(
+        rig.session("COM0").unwrap().get("foreground_busy"),
+        Some(&PyValue::Bool(false)),
+        "本機寫入失敗後要釋放傳輸中的前景槽"
+    );
+
+    if sw_pal::native().caps.path_flavor == sw_pal::PalPathFlavor::Windows {
+        let root = json_string(&tmp.0.to_string_lossy());
+        let root = &root[1..root.len() - 1];
+        let got = error.message.replace(root, "<tmp>");
+        let golden = pyjson::loads(include_str!("../../../contracts/golden/p7/windows_os_errors.json"))
+            .expect("Python 3.12 Windows OSError golden");
+        assert_eq!(
+            got,
+            golden["pull_local_write_error"].as_str().unwrap(),
+            "file.pull 本機 open(..., 'wb') 應保留 Python OSError errno、訊息與 filename repr"
+        );
+    }
+}
+
+#[test]
+fn session_log_dir_create_error_matches_python_via_rpc() {
+    let tmp = Tmp::new();
+    let blocker = std::path::Path::new(&tmp.0).join("not-a-directory");
+    std::fs::write(&blocker, b"file blocks directory creation").unwrap();
+    let log_dir = blocker.to_string_lossy().into_owned();
+    let rig = ServiceRig::ready_shell();
+    // 走 env fallback 提供原生 Windows 路徑，避免這個錯誤格式案例依賴尚未承接的 ProfileFs Windows flavor。
+    rig.set_env("SERIALWRAP_LOG_DIR", &log_dir);
+
+    let error = rig.call_err("session.log_start", r#"{"selector":"COM0"}"#);
+
+    if sw_pal::native().caps.path_flavor == sw_pal::PalPathFlavor::Windows {
+        let root = json_string(&tmp.0.to_string_lossy());
+        let root = &root[1..root.len() - 1];
+        let got = error.message.replace(root, "<tmp>");
+        let golden = pyjson::loads(include_str!("../../../contracts/golden/p7/windows_os_errors.json"))
+            .expect("Python 3.12 Windows OSError golden");
+        assert_eq!(
+            got,
+            golden["log_dir_create_error"].as_str().unwrap(),
+            "session.log_start 的 os.makedirs 應保留 Python WinError、訊息與 filename repr"
+        );
+    }
+    else {
+        assert!(
+            error.message.contains("File exists") && error.message.contains(&log_dir),
+            "{}",
+            error.message
+        );
+    }
 }
 
 #[test]
@@ -230,7 +307,7 @@ fn file_rpc_rejected_during_boot_quiet_returns_autoboot_quiet_zero_tx() {
     // file.push 於 boot quiet 期間被拒（SC-03，OD-79 撤回 SC-33）：回 AUTOBOOT_QUIET
     let r_push = rig.call(
         "file.push",
-        &format!(r#"{{"selector":"COM0","local_path":"{local}","remote_path":"/tmp/q.bin"}}"#),
+        &format!(r#"{{"selector":"COM0","local_path":{},"remote_path":"/tmp/q.bin"}}"#, json_string(&local)),
     );
     assert_eq!(
         keys(&r_push),
@@ -292,7 +369,7 @@ fn file_pull_over_rx_window_succeeds_od80_df26() {
             let cmd = String::from_utf8_lossy(line).trim_end_matches(['\r', '\n']).to_string();
             let w = words(&cmd);
             if w.first().map(String::as_str) == Some("printf") && w.iter().any(|x| x == "<") {
-                // 大檔 pull：以背景 thread 分段送出模擬真實 UART 鮑率傳輸，驗證分段 pull（OD-80／DF-26）
+                // 大檔 pull：背景 thread 分段送出，間隔留給原生 Windows reader 排空 RX；總回應仍超過 RX 視窗。
                 let at = w.iter().position(|x| x == "<").expect("pull 命令含 <");
                 let data = f.lock().unwrap().get(&w[at + 1]).cloned().unwrap_or_default();
                 let b64 = t::b64encode(&data);
@@ -307,7 +384,7 @@ fn file_pull_over_rx_window_succeeds_od80_df26() {
                 std::thread::spawn(move || {
                     for chunk in full_bytes.chunks(8192) {
                         dev_thread.push_rx(chunk);
-                        std::thread::sleep(std::time::Duration::from_millis(15));
+                        std::thread::sleep(std::time::Duration::from_millis(50));
                     }
                 });
                 return Vec::new();
@@ -323,7 +400,7 @@ fn file_pull_over_rx_window_succeeds_od80_df26() {
     let out = tmp.path("large_back.bin");
     let r = rig.call(
         "file.pull",
-        &format!(r#"{{"selector":"COM0","remote_path":"/tmp/large.bin","local_path":"{out}"}}"#),
+        &format!(r#"{{"selector":"COM0","remote_path":"/tmp/large.bin","local_path":{}}}"#, json_string(&out)),
     );
     assert_eq!(keys(&r), ["ok", "bytes", "md5", "local_path", "version"], "{}", wire(&r));
     assert_eq!(r.get("ok"), Some(&PyValue::Bool(true)));

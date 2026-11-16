@@ -49,6 +49,7 @@ jobs:
         # OD-24（2026-10-27）：s1b_cargo 的 5 筆 #[ignore] 列（68d0941 夾帶新增）逐名移除；承擔者見 owner-decisions-2026-10-15.md OD-24 列。
         # OD-68（2026-10-30）：逐名核准 windows-only 能力集合的 3 筆 linux 列移除；Windows 承擔列與 LOCAL-WINDOWS-TODO 見 slice21-owner-runbook.md。
         # OD-56（2026-10-29，rulings/p7.md P7-BO-1）：僅核准 s21_core.linux 兩個舊 nodeid，由替換測試承擔；windows 集合待原生一對一替換。
+        # OD-95（2026-11-15）與編排者 2026-11-16 補記：逐名撤回 F2/F3 的 17 個 POSIX 專屬 Windows nodeid；8 個屬凍結必要列，另 9 個撤回本批新增登記。
         # 其他移除仍由鎖檢查拒絕；逐列理由見 docs/rust-refactor/owner-decisions-addenda.md。
         run: >-
           python3 tests/acceptance/regen_lock.py --check --base "origin/$GITHUB_BASE_REF" --allow-removal
@@ -607,6 +608,23 @@ jobs:
           's21_gate:cap_interactive_desktop:linux:cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c'
           's21_core:linux:cargo:sw-core::login_quiet::unsupported_profile_no_auto_tx'
           's21_core:linux:cargo:sw-core::session_manager::detect_skips_passthrough_console_unlock_and_unsupported'
+          's21_core:windows:cargo:sw-daemon::daemon_process::daemon_stop_during_force_recover_with_client_gone'
+          's21_core:windows:cargo:sw-daemon::daemon_process::daemon_stop_from_second_connection_during_force_recover'
+          's21_core:windows:cargo:sw-daemon::daemon_process::real_sigterm_to_started_daemon_exits_0_after_flush'
+          's21_core:windows:cargo:sw-daemon::daemon_process::shutdown_releases_tty_before_exit'
+          's21_core:windows:cargo:sw-daemon::daemon_process::wal_dir_readonly_at_start_blocks_login_probe'
+          's21_core:windows:cargo:sw-daemon::daemon_process::wal_fault_after_ready_splits_agent_and_auto_tx'
+          's21_core:windows:cargo:sw-daemon::daemon_process::non_root_holder_scan_permission_does_not_block_open'
+          's21_core:windows:cargo:sw-daemon::daemon_process::release_kill_hook_env_isolated_only'
+          's21_core:windows:cargo:sw-daemon::daemon_process::release_pause_hook_env_isolated_only'
+          's21_core:windows:cargo:sw-daemon::daemon_process::sigterm_sigint_orderly_stop'
+          's21_core:windows:cargo:sw-daemon::daemon_process::unwritable_state_dir_startup_save_exits_1_before_attach'
+          's21_core:windows:cargo:sw-daemon::daemon_process::endpoint_written_after_bind'
+          's21_core:windows:cargo:sw-daemon::restart_after_commit::kill_before_commit_restores_previous_state'
+          's21_core:windows:cargo:sw-daemon::restart_after_commit::kill_between_commit_and_reply_keeps_released_after_restart'
+          's21_core:windows:cargo:sw-daemon::handoff_stop::handoff_drain_window_background_triggers_zero_tx'
+          's21_core:windows:cargo:sw-daemon::handoff_stop::handoff_then_successor_never_double_held'
+          's21_core:windows:cargo:sw-daemon::shutdown_order::second_sigterm_real_signal_exits_0'
 
   bridge-tools:
     if: github.event.action != 'labeled'
