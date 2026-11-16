@@ -20,9 +20,11 @@ use std::time::Duration;
 
 use common::p7::golden_rows;
 use support::*;
+#[cfg(all(test, unix))]
+use sw_core::capture::LogFs;
 use sw_core::capture::{
     log_open_failed_reply, log_path_for, log_start_reply, log_status_reply, log_stop_reply,
-    no_active_capture_reply, AgentLogCapture, CaptureEnv, CaptureObserver, LogFile, LogFs,
+    no_active_capture_reply, AgentLogCapture, CaptureEnv, CaptureObserver, LogFile,
 };
 use sw_core::session_core::SessionRequest;
 use sw_core::uart_bridge::RxObserver;
