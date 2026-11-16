@@ -80,10 +80,10 @@ if [[ -n "$SHARED_EVIDENCE" && "$DRY_RUN" != "1" ]]; then
       --out-dir "$SHARED_ARTIFACT_DIR" >"$RUN_DIR/logs/shared-artifacts.json" \
       2>"$RUN_DIR/logs/shared-artifacts.stderr"; then
     SHARED_ARTIFACTS_VALID=1
-    RUST_CLI="$SHARED_ARTIFACT_DIR/release_cli"
-    RUST_D="$SHARED_ARTIFACT_DIR/release_daemon"
-    SHARED_ARTIFACT_ARGS=(--artifact "debug_cli=$SHARED_ARTIFACT_DIR/debug_cli" \
-      --artifact "debug_daemon=$SHARED_ARTIFACT_DIR/debug_daemon" \
+    RUST_CLI="$SHARED_ARTIFACT_DIR/release/serialwrap"
+    RUST_D="$SHARED_ARTIFACT_DIR/release/serialwrapd"
+    SHARED_ARTIFACT_ARGS=(--artifact "debug_cli=$SHARED_ARTIFACT_DIR/debug/serialwrap" \
+      --artifact "debug_daemon=$SHARED_ARTIFACT_DIR/debug/serialwrapd" \
       --artifact "release_cli=$RUST_CLI" --artifact "release_daemon=$RUST_D")
   fi
 fi

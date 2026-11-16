@@ -78,12 +78,12 @@ def test_verify_detects_tampering(tmp_path):
     data = json.loads((d / "results.json").read_text(encoding="utf-8"))
     data["git_head"] = g.current_head()          # verify 核對目前 HEAD（P7-c5f0fc9-3）
     data["artifacts"] = _artifacts(tmp_path)     # verify 要求必要 artifact（P7-c5f0fc9-3 第二輪）
-    prior = d / "prior-slice-artifacts" / "serialwrapd-release"
+    prior = d / "prior-slice-artifacts" / "release" / "serialwrapd"
     prior.parent.mkdir(parents=True)
     prior.write_bytes(b"release daemon")
     import hashlib
     data["prior_slice_artifacts"] = {"serialwrapd_release": hashlib.sha256(prior.read_bytes()).hexdigest()}
-    data["prior_slice_artifact_paths"] = {"serialwrapd_release": "prior-slice-artifacts/serialwrapd-release"}
+    data["prior_slice_artifact_paths"] = {"serialwrapd_release": "prior-slice-artifacts/release/serialwrapd"}
     (d / "results.json").write_text(json.dumps(data), encoding="utf-8")
     md = tmp_path / "gate.md"
     md.write_text(g.build_report(d), encoding="utf-8")
@@ -262,7 +262,7 @@ def test_init_and_record_only_record_identity_and_counts(tmp_path):
     log／evidence 落 sha256；同名列覆寫（審查 P7-c5f0fc9-1：required_set 不由呼叫端決定）。"""
     run = tmp_path / "run"
     art = ROOT / "scripts/rust/p7_gate_report.py"
-    prior = run / "prior-slice-artifacts" / "serialwrapd-release"
+    prior = run / "prior-slice-artifacts" / "release" / "serialwrapd"
     prior.parent.mkdir(parents=True)
     prior.write_bytes(b"release daemon")
     data = g.init_results(run, "r9", caps_missing=["windows_com", "windows_com"], artifacts=[art],
@@ -270,7 +270,7 @@ def test_init_and_record_only_record_identity_and_counts(tmp_path):
     assert data["caps_missing"] == ["windows_com"] and data["git_head"] == g.current_head()
     assert data["artifacts"] == {"scripts/rust/p7_gate_report.py": g._sha256(art)}
     assert data["prior_slice_artifacts"] == {"serialwrapd_release": g._sha256(prior)}
-    assert data["prior_slice_artifact_paths"] == {"serialwrapd_release": "prior-slice-artifacts/serialwrapd-release"}
+    assert data["prior_slice_artifact_paths"] == {"serialwrapd_release": "prior-slice-artifacts/release/serialwrapd"}
     log = run / "x.log"
     log.write_text("hello", encoding="utf-8")
     l1 = run / "l1.json"

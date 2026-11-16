@@ -80,13 +80,13 @@ if [[ "$DRY_RUN" != "1" && -n "$SHARED_EVIDENCE" ]]; then
       --out-dir "$SHARED_ARTIFACT_DIR" >"$RUN_DIR/logs/shared-artifacts.json" \
       2>"$RUN_DIR/logs/shared-artifacts.stderr"; then
     SHARED_ARTIFACTS_VALID=1
-    [[ -n "$DAEMON_PATH" ]] || DAEMON_PATH="$SHARED_ARTIFACT_DIR/release_daemon"
+    [[ -n "$DAEMON_PATH" ]] || DAEMON_PATH="$SHARED_ARTIFACT_DIR/release/serialwrapd"
     [[ -n "$BUILD_EXIT" ]] || BUILD_EXIT=0
     [[ -n "$BUILT_DAEMON_SHA256" ]] || BUILT_DAEMON_SHA256="$(sha256sum "$DAEMON_PATH" | cut -d' ' -f1)"
     export SERIALWRAP_L15_RUST_DAEMON="$DAEMON_PATH"
-    SHARED_ARTIFACT_ARGS=(--artifact "debug_cli=$SHARED_ARTIFACT_DIR/debug_cli" \
-      --artifact "debug_daemon=$SHARED_ARTIFACT_DIR/debug_daemon" \
-      --artifact "release_cli=$SHARED_ARTIFACT_DIR/release_cli" \
+    SHARED_ARTIFACT_ARGS=(--artifact "debug_cli=$SHARED_ARTIFACT_DIR/debug/serialwrap" \
+      --artifact "debug_daemon=$SHARED_ARTIFACT_DIR/debug/serialwrapd" \
+      --artifact "release_cli=$SHARED_ARTIFACT_DIR/release/serialwrap" \
       --artifact "release_daemon=$DAEMON_PATH")
   else
     mark_shared_rejected s22_gate:cargo_workspace linux

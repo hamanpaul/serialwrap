@@ -18,6 +18,12 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LOCK = ROOT / "tests/acceptance/l1_required.lock.json"
 SCHEMA = "serialwrap-gate-shared-evidence.v1"
 REQUIRED_ARTIFACTS = ("debug_cli", "debug_daemon", "release_cli", "release_daemon")
+ARTIFACT_PATHS = {
+    "debug_cli": "debug/serialwrap",
+    "debug_daemon": "debug/serialwrapd",
+    "release_cli": "release/serialwrap",
+    "release_daemon": "release/serialwrapd",
+}
 
 
 def sha256_file(path: Path) -> str | None:
@@ -164,8 +170,8 @@ def _command_matches(name: str, argv: Any, shared_dir: Path) -> bool:
             "bash", "scripts/rust/run_p7_ab.sh", "--run-id", shared_dir.name,
             "--run-dir", str(shared_dir / "work/p7-ab"),
             "--out", str(shared_dir / "work/p7-ab.md"),
-            "--rust-cli", str(shared_dir / "artifacts/debug_cli"),
-            "--rust-daemon", str(shared_dir / "artifacts/debug_daemon"),
+            "--rust-cli", str(shared_dir / "artifacts" / ARTIFACT_PATHS["debug_cli"]),
+            "--rust-daemon", str(shared_dir / "artifacts" / ARTIFACT_PATHS["debug_daemon"]),
             "--od59-contract",
         ]
         return bool(re.fullmatch(r"[A-Za-z0-9._-]+", shared_dir.name)) and argv == expected
@@ -209,7 +215,10 @@ def validate_section(shared_dir: Path, *, gate: str, section: str, required_set:
         artifact_rows = {}
     for name in REQUIRED_ARTIFACTS:
         row = artifact_rows.get(name)
-        path = _safe_path(shared_dir, row.get("path") if isinstance(row, Mapping) else None)
+        raw_path = row.get("path") if isinstance(row, Mapping) else None
+        if raw_path != f"artifacts/{ARTIFACT_PATHS[name]}":
+            reasons.append(f"artifact 路徑不符：{name} 須為 artifacts/{ARTIFACT_PATHS[name]}")
+        path = _safe_path(shared_dir, raw_path)
         expected_hash = row.get("sha256") if isinstance(row, Mapping) else None
         actual_hash = sha256_file(path) if path is not None else None
         if not isinstance(expected_hash, str) or actual_hash != expected_hash:
@@ -329,7 +338,10 @@ def import_artifacts(shared_dir: Path, destination: Path, *, current_head: str |
     sources: dict[str, Path] = {}
     for name in REQUIRED_ARTIFACTS:
         row = artifact_rows.get(name)
-        source = _safe_path(shared_dir, row.get("path") if isinstance(row, Mapping) else None)
+        raw_path = row.get("path") if isinstance(row, Mapping) else None
+        if raw_path != f"artifacts/{ARTIFACT_PATHS[name]}":
+            reasons.append(f"artifact 路徑不符：{name} 須為 artifacts/{ARTIFACT_PATHS[name]}")
+        source = _safe_path(shared_dir, raw_path)
         expected_sha = row.get("sha256") if isinstance(row, Mapping) else None
         if source is None or not isinstance(expected_sha, str) or sha256_file(source) != expected_sha:
             reasons.append(f"artifact SHA256 不符或缺失：{name}")
@@ -341,7 +353,8 @@ def import_artifacts(shared_dir: Path, destination: Path, *, current_head: str |
     destination.mkdir(parents=True, exist_ok=True)
     copied: dict[str, str] = {}
     for name, source in sources.items():
-        target = destination / name
+        target = destination / ARTIFACT_PATHS[name]
+        target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
         copied[name] = str(target)
     return {"status": "PASS", "artifacts": copied}
@@ -359,7 +372,7 @@ def init_manifest(shared_dir: Path, artifact_paths: Mapping[str, Path], *, head:
         source = Path(artifact_paths[name]).resolve()
         if not source.is_file():
             raise ValueError(f"候選 artifact 缺失：{name}：{source}")
-        relative = Path("artifacts") / name
+        relative = Path("artifacts") / ARTIFACT_PATHS[name]
         destination = shared_dir / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)

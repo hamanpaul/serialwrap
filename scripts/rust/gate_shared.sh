@@ -142,7 +142,7 @@ CARGO_RESULTS_DIR="$RUN_DIR/work/s24-cargo-results"
 mkdir -p "$CARGO_RESULTS_DIR"
 CARGO_RESULTS_ARGV=(--include-cap posix_pty --include-cap process_rpc --workspace --features test-fakes)
 run_capture "$LOG_DIR/cargo-contract-results.log" env \
-  SERIALWRAP_CLI_EXE="$RUN_DIR/artifacts/debug_cli" SERIALWRAP_DAEMON_EXE="$RUN_DIR/artifacts/debug_daemon" \
+  SERIALWRAP_CLI_EXE="$RUN_DIR/artifacts/debug/serialwrap" SERIALWRAP_DAEMON_EXE="$RUN_DIR/artifacts/debug/serialwrapd" \
   python3 scripts/rust/import_cargo_results.py --label rust-linux --platform linux \
   --out-dir "$CARGO_RESULTS_DIR" --include-cap posix_pty --include-cap process_rpc \
   -- --workspace --features test-fakes
@@ -155,14 +155,14 @@ python3 scripts/rust/gate_shared_evidence.py record-section --shared-evidence "$
 P7_AB="$RUN_DIR/work/p7-ab"
 mkdir -p "$P7_AB"
 run_capture "$LOG_DIR/p7-ab.log" bash scripts/rust/run_p7_ab.sh --run-id "$RUN_ID" --run-dir "$P7_AB" \
-  --out "$RUN_DIR/work/p7-ab.md" --rust-cli "$RUN_DIR/artifacts/debug_cli" \
-  --rust-daemon "$RUN_DIR/artifacts/debug_daemon" --od59-contract
+  --out "$RUN_DIR/work/p7-ab.md" --rust-cli "$RUN_DIR/artifacts/debug/serialwrap" \
+  --rust-daemon "$RUN_DIR/artifacts/debug/serialwrapd" --od59-contract
 cp "$RUN_DIR/work/p7-ab.md" "$P7_AB/p7-ab.md" 2>/dev/null || true
 tar -czf "$RUN_DIR/work/p7-ab.tar.gz" -C "$P7_AB" .
 python3 scripts/rust/gate_shared_evidence.py record-section --shared-evidence "$RUN_DIR" --section p7_ab \
   --argv-json "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' bash scripts/rust/run_p7_ab.sh \
     --run-id "$RUN_ID" --run-dir "$P7_AB" --out "$RUN_DIR/work/p7-ab.md" \
-    --rust-cli "$RUN_DIR/artifacts/debug_cli" --rust-daemon "$RUN_DIR/artifacts/debug_daemon" --od59-contract)" \
+    --rust-cli "$RUN_DIR/artifacts/debug/serialwrap" --rust-daemon "$RUN_DIR/artifacts/debug/serialwrapd" --od59-contract)" \
   --exit-code "$LAST_RC" \
   --file p7_gate/ab.tar.gz="$RUN_DIR/work/p7-ab.tar.gz" --file logs/p7-ab.log="$LOG_DIR/p7-ab.log"
 
@@ -172,7 +172,7 @@ S24_TARGETS=(tests/contract_blackbox tests/acceptance/l15/test_slice21_l15.py \
 S24_DATA="$RUN_DIR/work/s24-ab"
 mkdir -p "$S24_DATA"
 run_capture "$LOG_DIR/s24-ab.log" env \
-  SERIALWRAP_CLI_EXE="$RUN_DIR/artifacts/debug_cli" SERIALWRAP_DAEMON_EXE="$RUN_DIR/artifacts/debug_daemon" \
+  SERIALWRAP_CLI_EXE="$RUN_DIR/artifacts/debug/serialwrap" SERIALWRAP_DAEMON_EXE="$RUN_DIR/artifacts/debug/serialwrapd" \
   SERIALWRAP_AB_LABEL=rust-linux SERIALWRAP_COVERAGE_RUN_DIR="$RUN_DIR/coverage" \
   SERIALWRAP_COVERAGE_LABEL=rust-linux python3 -m pytest -q "${S24_TARGETS[@]}" --junitxml="$S24_DATA/junit.xml"
 tar -czf "$RUN_DIR/work/s24-coverage.tar.gz" -C "$RUN_DIR" coverage

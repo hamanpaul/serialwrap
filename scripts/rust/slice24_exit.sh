@@ -176,13 +176,13 @@ if [[ -n "$SHARED_EVIDENCE" ]]; then
   if python3 scripts/rust/gate_shared_evidence.py import-artifacts --shared-evidence "$SHARED_EVIDENCE" \
       --out-dir "$SHARED_ARTIFACT_DIR" >"$RUN_DIR/logs/shared-artifacts.json" \
       2>"$RUN_DIR/logs/shared-artifacts.stderr"; then
-    cp -p "$SHARED_ARTIFACT_DIR/debug_cli" "$RUST_CLI"
-    cp -p "$SHARED_ARTIFACT_DIR/debug_daemon" "$RUST_DAEMON"
+    cp -p "$SHARED_ARTIFACT_DIR/debug/serialwrap" "$RUST_CLI"
+    cp -p "$SHARED_ARTIFACT_DIR/debug/serialwrapd" "$RUST_DAEMON"
     BUILD_RC=0
-    SHARED_ARTIFACT_ARGS=(--artifact "debug_cli=$SHARED_ARTIFACT_DIR/debug_cli" \
-      --artifact "debug_daemon=$SHARED_ARTIFACT_DIR/debug_daemon" \
-      --artifact "release_cli=$SHARED_ARTIFACT_DIR/release_cli" \
-      --artifact "release_daemon=$SHARED_ARTIFACT_DIR/release_daemon")
+    SHARED_ARTIFACT_ARGS=(--artifact "debug_cli=$SHARED_ARTIFACT_DIR/debug/serialwrap" \
+      --artifact "debug_daemon=$SHARED_ARTIFACT_DIR/debug/serialwrapd" \
+      --artifact "release_cli=$SHARED_ARTIFACT_DIR/release/serialwrap" \
+      --artifact "release_daemon=$SHARED_ARTIFACT_DIR/release/serialwrapd")
     SHARED_ARTIFACTS_VALID=1
     if [[ -z "$CANDIDATE_BUNDLE" ]]; then
       BUILD_RC=0
@@ -245,8 +245,8 @@ else
   echo "slice24_exit.sh: Rust CLI／daemon artifact 缺失，後續結果不得計 PASS" >&2
 fi
 if [[ "$SHARED_ARTIFACTS_VALID" == "1" && -n "$CANDIDATE_BUNDLE" ]]; then
-  SHARED_ARTIFACT_ARGS=(--artifact "debug_cli=$SHARED_ARTIFACT_DIR/debug_cli" \
-    --artifact "debug_daemon=$SHARED_ARTIFACT_DIR/debug_daemon" \
+  SHARED_ARTIFACT_ARGS=(--artifact "debug_cli=$SHARED_ARTIFACT_DIR/debug/serialwrap" \
+    --artifact "debug_daemon=$SHARED_ARTIFACT_DIR/debug/serialwrapd" \
     --artifact "release_cli=$RUST_CLI" --artifact "release_daemon=$RUST_DAEMON")
 fi
 

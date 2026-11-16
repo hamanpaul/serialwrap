@@ -60,7 +60,7 @@ REPORT=(python3 scripts/rust/p7_gate_report.py)
 # target/debug/ 的同名執行檔，若直接引用會讓黑箱跑到 test-fakes 版、verify 的 sha256 也對不上（第 12 輪實跑揭露）。
 RUST_CLI="$RUN/artifacts/serialwrap"
 RUST_D="$RUN/artifacts/serialwrapd"
-PRIOR_RELEASE_D="$RUN/prior-slice-artifacts/serialwrapd-release"
+PRIOR_RELEASE_D="$RUN/prior-slice-artifacts/release/serialwrapd"
 
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 argv_json() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@"; }
@@ -130,20 +130,20 @@ import_shared_windows_l1() {  # import_shared_windows_l1 <required-set> <destina
   return 0
 }
 
-mkdir -p "$RUN/artifacts" "$RUN/prior-slice-artifacts"
+mkdir -p "$RUN/artifacts" "$RUN/prior-slice-artifacts/release"
 SHARED_ARTIFACTS_VALID=0
 SHARED_ARTIFACT_ARGS=()
 if [[ -n "$SHARED_EVIDENCE" ]]; then
   if python3 scripts/rust/gate_shared_evidence.py import-artifacts \
       --shared-evidence "$SHARED_EVIDENCE" --out-dir "$RUN/shared-artifact-import" \
       >"$RUN/logs/shared-artifacts.json" 2>"$RUN/logs/shared-artifacts.stderr"; then
-    cp -p "$RUN/shared-artifact-import/debug_cli" "$RUST_CLI"
-    cp -p "$RUN/shared-artifact-import/debug_daemon" "$RUST_D"
-    cp -p "$RUN/shared-artifact-import/release_daemon" "$PRIOR_RELEASE_D"
-    SHARED_ARTIFACT_ARGS=(--artifact "debug_cli=$RUN/shared-artifact-import/debug_cli" \
-      --artifact "debug_daemon=$RUN/shared-artifact-import/debug_daemon" \
-      --artifact "release_cli=$RUN/shared-artifact-import/release_cli" \
-      --artifact "release_daemon=$RUN/shared-artifact-import/release_daemon")
+    cp -p "$RUN/shared-artifact-import/debug/serialwrap" "$RUST_CLI"
+    cp -p "$RUN/shared-artifact-import/debug/serialwrapd" "$RUST_D"
+    cp -p "$RUN/shared-artifact-import/release/serialwrapd" "$PRIOR_RELEASE_D"
+    SHARED_ARTIFACT_ARGS=(--artifact "debug_cli=$RUN/shared-artifact-import/debug/serialwrap" \
+      --artifact "debug_daemon=$RUN/shared-artifact-import/debug/serialwrapd" \
+      --artifact "release_cli=$RUN/shared-artifact-import/release/serialwrap" \
+      --artifact "release_daemon=$RUN/shared-artifact-import/release/serialwrapd")
     SHARED_ARTIFACTS_VALID=1
   else
     echo "EVIDENCE_MISSING：共用 artifact provenance 不符；不在本 gate 重建。" >"$RUN/logs/shared-artifacts.log"

@@ -23,6 +23,12 @@ GATE_SETS = {
     "p7": "p7_gate:python3-m-pytest-q-tests",
     "slice24": "s21_gate:pytest_full",
 }
+ARTIFACT_PATHS = {
+    "debug_cli": "debug/serialwrap",
+    "debug_daemon": "debug/serialwrapd",
+    "release_cli": "release/serialwrap",
+    "release_daemon": "release/serialwrapd",
+}
 
 
 def _module():
@@ -72,7 +78,7 @@ def _fixture(tmp_path: pathlib.Path, gate: str):
     }
     # Artifacts live under the shared evidence directory so import verification can hash the source copy.
     for name, path in artifacts.items():
-        dest = shared / "artifacts" / name
+        dest = shared / "artifacts" / ARTIFACT_PATHS[name]
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(path.read_bytes())
         manifest["provenance"]["artifacts"][name] = {"path": str(dest.relative_to(shared)), "sha256": _sha(dest)}
@@ -177,8 +183,8 @@ def test_shared_failed_section_remains_fail_after_import(tmp_path):
         "p7_ab": [
             "bash", "scripts/rust/run_p7_ab.sh", "--run-id", shared.name,
             "--run-dir", str(shared / "work/p7-ab"), "--out", str(shared / "work/p7-ab.md"),
-            "--rust-cli", str(shared / "artifacts/debug_cli"),
-            "--rust-daemon", str(shared / "artifacts/debug_daemon"), "--od59-contract",
+            "--rust-cli", str(shared / "artifacts/debug/serialwrap"),
+            "--rust-daemon", str(shared / "artifacts/debug/serialwrapd"), "--od59-contract",
         ],
         "s24_ab": [
             "-q", "tests/contract_blackbox", "tests/acceptance/l15/test_slice21_l15.py",
@@ -447,3 +453,89 @@ def test_shared_driver_stops_and_records_gate_prereq_failure_before_cargo(tmp_pa
     assert (log_dir / "driver.tsv").read_text(encoding="utf-8") == "gate_prereqs\t37\n"
     assert not cargo_log.exists(), "前置失敗後不得啟動 build 或 cargo L1"
     assert not (log_dir / "cargo-fakes-filtered.log").exists()
+
+
+def test_shared_artifact_init_and_import_preserve_executable_names(tmp_path):
+    api = _module()
+    sources = {}
+    for name in ARTIFACT_PATHS:
+        source = tmp_path / "candidate" / name
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(f"candidate:{name}".encode())
+        sources[name] = source
+
+    shared = tmp_path / "shared"
+    manifest = api.init_manifest(shared, sources, head="candidate-head", clean=True)
+    imported_dir = tmp_path / "imported"
+    imported = api.import_artifacts(
+        shared, imported_dir, current_head="candidate-head", worktree_clean=True,
+    )
+
+    assert imported["status"] == "PASS", imported
+    for name, relative in ARTIFACT_PATHS.items():
+        row = manifest["provenance"]["artifacts"][name]
+        assert row["path"] == f"artifacts/{relative}"
+        source_path = shared / row["path"]
+        imported_path = pathlib.Path(imported["artifacts"][name])
+        assert source_path.is_file() and source_path.name in ("serialwrap", "serialwrapd")
+        assert imported_path == imported_dir / relative
+        assert imported_path.name == source_path.name
+        assert _sha(imported_path) == row["sha256"]
+
+
+def test_gate_shared_artifact_paths_keep_cli_and_daemon_basenames():
+    required = {
+        "gate_shared.sh": (
+            'SERIALWRAP_CLI_EXE="$RUN_DIR/artifacts/debug/serialwrap"',
+            'SERIALWRAP_DAEMON_EXE="$RUN_DIR/artifacts/debug/serialwrapd"',
+            '--rust-cli "$RUN_DIR/artifacts/debug/serialwrap"',
+            '--rust-daemon "$RUN_DIR/artifacts/debug/serialwrapd"',
+        ),
+        "slice21_gate.sh": (
+            'RUST_CLI="$SHARED_ARTIFACT_DIR/release/serialwrap"',
+            'RUST_D="$SHARED_ARTIFACT_DIR/release/serialwrapd"',
+            '--artifact "debug_cli=$SHARED_ARTIFACT_DIR/debug/serialwrap"',
+            '--artifact "debug_daemon=$SHARED_ARTIFACT_DIR/debug/serialwrapd"',
+            '--artifact "release_cli=$RUST_CLI"',
+            '--artifact "release_daemon=$RUST_D"',
+        ),
+        "s22_gate.sh": (
+            'DAEMON_PATH="$SHARED_ARTIFACT_DIR/release/serialwrapd"',
+            '--artifact "debug_cli=$SHARED_ARTIFACT_DIR/debug/serialwrap"',
+            '--artifact "debug_daemon=$SHARED_ARTIFACT_DIR/debug/serialwrapd"',
+            '--artifact "release_cli=$SHARED_ARTIFACT_DIR/release/serialwrap"',
+            '--artifact "release_daemon=$DAEMON_PATH"',
+        ),
+        "p7_gate.sh": (
+            'RUST_CLI="$RUN/artifacts/serialwrap"',
+            'RUST_D="$RUN/artifacts/serialwrapd"',
+            'cp -p "$RUN/shared-artifact-import/debug/serialwrap" "$RUST_CLI"',
+            'cp -p "$RUN/shared-artifact-import/debug/serialwrapd" "$RUST_D"',
+            'cp -p "$RUN/shared-artifact-import/release/serialwrapd" "$PRIOR_RELEASE_D"',
+            '--artifact "debug_cli=$RUN/shared-artifact-import/debug/serialwrap"',
+            '--artifact "debug_daemon=$RUN/shared-artifact-import/debug/serialwrapd"',
+            '--artifact "release_cli=$RUN/shared-artifact-import/release/serialwrap"',
+            '--artifact "release_daemon=$RUN/shared-artifact-import/release/serialwrapd"',
+        ),
+        "slice24_exit.sh": (
+            'RUST_CLI="$RUN_DIR/artifacts/serialwrap"',
+            'RUST_DAEMON="$RUN_DIR/artifacts/serialwrapd"',
+            'cp -p "$SHARED_ARTIFACT_DIR/debug/serialwrap" "$RUST_CLI"',
+            'cp -p "$SHARED_ARTIFACT_DIR/debug/serialwrapd" "$RUST_DAEMON"',
+            '--artifact "debug_cli=$SHARED_ARTIFACT_DIR/debug/serialwrap"',
+            '--artifact "debug_daemon=$SHARED_ARTIFACT_DIR/debug/serialwrapd"',
+            '--artifact "release_cli=$SHARED_ARTIFACT_DIR/release/serialwrap"',
+            '--artifact "release_daemon=$SHARED_ARTIFACT_DIR/release/serialwrapd"',
+        ),
+        "run_p7_ab.sh": (
+            'RUST_CLI="$ROOT/target/debug/serialwrap"',
+            'RUST_D="$ROOT/target/debug/serialwrapd"',
+        ),
+    }
+    for filename, required_paths in required.items():
+        source = (ROOT / "scripts/rust" / filename).read_text(encoding="utf-8")
+        for path in required_paths:
+            assert path in source, f"{filename} 缺少具 serialwrap/serialwrapd basename 的接線：{path}"
+        for stale in ("/artifacts/debug_cli", "/artifacts/debug_daemon",
+                      "/artifacts/release_cli", "/artifacts/release_daemon"):
+            assert stale not in source, f"{filename} 仍讀取舊共用 artifact 路徑：{stale}"
