@@ -526,7 +526,7 @@ def load_results(run_dir: Path) -> list[dict[str, Any]]:
 
 
 def merge_result_layers(run_dir: Path, source_dirs: Sequence[Path]) -> None:
-    """把獨立匯入層的逐案結果合併到 run；同 label 沿用 Cargo／pytest 的身分與列合併規則。"""
+    """把獨立匯入層的逐案結果合併到 run；相同結果只匯入一次，其餘同 label 繼續合併 Cargo／pytest 身分與結果列。"""
     run_dir = Path(run_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     from import_cargo_results import _merge_existing
@@ -545,7 +545,17 @@ def merge_result_layers(run_dir: Path, source_dirs: Sequence[Path]) -> None:
             label = document.get("label")
             if not isinstance(label, str) or not label or Path(source_path).name != f"results-{label}.json":
                 raise ValueError(f"coverage 結果 label／檔名不符：{source_path}")
-            destination = run_dir / Path(source_path).name
+            source_file = Path(source_path)
+            destination = run_dir / source_file.name
+            if destination.is_file():
+                try:
+                    existing = json.loads(destination.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    existing = None
+                if existing == document:
+                    # s24 coverage 封存會含先前的 python-linux 檔；baseline 與黑箱兩層
+                    # 若帶入同一份結果，這是重複封裝，不應重複計入 nodeid／phase。
+                    continue
             merged = _merge_existing(destination, document)
             temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
             temporary.write_text(

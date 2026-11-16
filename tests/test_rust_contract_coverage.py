@@ -1080,7 +1080,7 @@ def test_nested_pytest_does_not_write_into_outer_coverage_run(tmp_path):
 
 
 def test_shared_coverage_package_import_merges_same_label_before_contract_judgement(tmp_path):
-    """OD-88／OD-93：coverage/ 外層封裝須扁平匯入，Rust Cargo 與 pytest 同 label 結果都進最終判定。"""
+    """OD-88／OD-93：兩層 coverage 封裝扁平匯入；重複 Python baseline 只計一次，Rust Cargo／pytest 同標籤結果仍合併。"""
     cc = _module()
     contract_id = "case:s24-xfer-templates-golden"
     universe = cc.universe(
@@ -1094,20 +1094,33 @@ def test_shared_coverage_package_import_merges_same_label_before_contract_judgem
     assert cargo_nodeids and pytest_nodeids
 
     cargo_dir = tmp_path / "cargo-results"
-    coverage_dir = tmp_path / "shared" / "coverage"
+    shared_run = tmp_path / "gate-shared-run"
+    coverage_dir = shared_run / "coverage"
+    python_nodeid = "tests/test_rust_contract_coverage.py::test_nested_pytest_does_not_write_into_outer_coverage_run"
     _results(cargo_dir, "rust-linux", "linux", [_row(nodeid) for nodeid in cargo_nodeids])
-    _results(coverage_dir, "rust-linux", "linux", [_row(nodeid) for nodeid in pytest_nodeids])
+    _results(coverage_dir, "python-linux", "linux", [_row(python_nodeid)])
     cargo_archive = tmp_path / "cargo-results.tar.gz"
     with tarfile.open(cargo_archive, "w:gz") as archive:
         archive.add(cargo_dir, arcname=".")
-    coverage_archive = tmp_path / "coverage.tar.gz"
+    python_archive = tmp_path / "python-baseline-coverage.tar.gz"
     packed = subprocess.run(
-        ["tar", "-czf", str(coverage_archive), "-C", str(coverage_dir.parent), "coverage"],
+        ["tar", "-czf", str(python_archive), "-C", str(shared_run), "coverage"],
         capture_output=True, text=True, check=False,
     )
     assert packed.returncode == 0, packed.stdout + packed.stderr
+    _results(coverage_dir, "rust-linux", "linux", [_row(nodeid) for nodeid in pytest_nodeids])
+    coverage_archive = tmp_path / "coverage.tar.gz"
+    packed = subprocess.run(
+        ["tar", "-czf", str(coverage_archive), "-C", str(shared_run), "coverage"],
+        capture_output=True, text=True, check=False,
+    )
+    assert packed.returncode == 0, packed.stdout + packed.stderr
+    with tarfile.open(python_archive, "r:gz") as archive:
+        assert any(member.name == "coverage/results-python-linux.json" for member in archive.getmembers())
     with tarfile.open(coverage_archive, "r:gz") as archive:
-        assert any(member.name.startswith("coverage/results-rust-linux.json") for member in archive.getmembers())
+        members = {member.name for member in archive.getmembers()}
+        assert "coverage/results-python-linux.json" in members
+        assert "coverage/results-rust-linux.json" in members
 
     shared_api_path = ROOT / "scripts/rust/gate_shared_evidence.py"
     shared_spec = importlib.util.spec_from_file_location("gate_shared_evidence_s24_test", shared_api_path)
@@ -1125,6 +1138,22 @@ def test_shared_coverage_package_import_merges_same_label_before_contract_judgem
         source.write_bytes(f"candidate:{name}".encode())
         artifacts[name] = source
     shared_api.init_manifest(shared, artifacts, head=head, clean=True)
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    pytest_argv = lock["sets"]["s21_gate:pytest_full"]["linux"]["selector"]["argv"]
+    baseline_l1 = tmp_path / "pytest-full" / "l1-results.json"
+    baseline_l1.parent.mkdir(parents=True)
+    baseline_l1.write_text("{}", encoding="utf-8")
+    baseline_log = tmp_path / "pytest-full.log"
+    baseline_log.write_text("pytest baseline passed\\n", encoding="utf-8")
+    shared_api.record_section(
+        shared, name="pytest_full", argv=pytest_argv, exit_code=0,
+        files={
+            "slice24/python-baseline-coverage.tar.gz": python_archive,
+            "logs/pytest-full.log": baseline_log,
+            "p7_gate/pytest-full/l1-results.json": baseline_l1,
+        },
+        required_sets=["s21_gate:pytest_full", "p7_gate:python3-m-pytest-q-tests"],
+    )
     cargo_argv = ["--include-cap", "posix_pty", "--include-cap", "process_rpc", "--workspace", "--features", "test-fakes"]
     shared_api.record_section(
         shared, name="cargo_contract_results", argv=cargo_argv, exit_code=0,
@@ -1152,6 +1181,26 @@ def test_shared_coverage_package_import_merges_same_label_before_contract_judgem
         destination=tmp_path / "imported-pytest", expected_command="s24_ab",
     )
     assert imported_coverage["status"] == "PASS", imported_coverage
+    imported_baseline = shared_api.import_section(
+        shared, gate="slice24", section="pytest_full", required_set="p7_gate:python3-m-pytest-q-tests",
+        platform="linux", expected_artifacts=artifacts, current_head=head, worktree_clean=True,
+        destination=tmp_path / "imported-python-baseline",
+    )
+    assert imported_baseline["status"] == "PASS", imported_baseline
+
+    shared_script = (ROOT / "scripts/rust/gate_shared.sh").read_text(encoding="utf-8")
+    assert 'python3 scripts/rust/gate_shared_evidence.py record-section --shared-evidence "$RUN_DIR" --section pytest_full' in shared_script
+    assert 'python3 scripts/rust/gate_shared_evidence.py record-section --shared-evidence "$RUN_DIR" --section s24_ab' in shared_script
+    assert 'tar -czf "$RUN_DIR/work/python-baseline-coverage.tar.gz" -C "$RUN_DIR" coverage' in shared_script
+    assert 'tar -czf "$RUN_DIR/work/s24-coverage.tar.gz" -C "$RUN_DIR" coverage' in shared_script
+    slice24_script = (ROOT / "scripts/rust/slice24_exit.sh").read_text(encoding="utf-8")
+    assert 'tar -xzf "$RUN_DIR/shared-import/slice24/python-baseline-coverage.tar.gz"' in slice24_script
+    assert 'tar -xzf "$RUN_DIR/shared-import/slice24/coverage.tar.gz"' in slice24_script
+    assert 'CONTRACT_COVERAGE_ARGS+=(--merge-results-from "$PYTHON_BASELINE_COVERAGE")' in slice24_script
+    assert 'CONTRACT_COVERAGE_ARGS+=(--merge-results-from "$RUST_BLACKBOX_COVERAGE")' in slice24_script
+    assert 'PYTHON_BASELINE_COVERAGE="$RUN_DIR/shared-import/python-baseline-coverage"' in slice24_script
+    assert 'RUST_BLACKBOX_COVERAGE="$RUN_DIR/shared-import/rust-blackbox-coverage"' in slice24_script
+    assert slice24_script.count("--strip-components=1") >= 2
 
     run = tmp_path / "slice24-run"
     run.mkdir()
@@ -1160,23 +1209,33 @@ def test_shared_coverage_package_import_merges_same_label_before_contract_judgem
         capture_output=True, text=True, check=False,
     )
     assert cargo_import.returncode == 0, cargo_import.stdout + cargo_import.stderr
-    pytest_layer = tmp_path / "flattened-coverage"
-    pytest_layer.mkdir()
-    pytest_import = subprocess.run(
-        ["tar", "-xzf", imported_coverage["files"]["slice24/coverage.tar.gz"], "-C", str(pytest_layer),
+    python_layer = tmp_path / "flattened-python-baseline"
+    python_layer.mkdir()
+    python_import = subprocess.run(
+        ["tar", "-xzf", imported_baseline["files"]["slice24/python-baseline-coverage.tar.gz"],
+         "-C", str(python_layer), "--strip-components=1"],
+        capture_output=True, text=True, check=False,
+    )
+    assert python_import.returncode == 0, python_import.stdout + python_import.stderr
+    rust_layer = tmp_path / "flattened-rust-blackbox-coverage"
+    rust_layer.mkdir()
+    rust_import = subprocess.run(
+        ["tar", "-xzf", imported_coverage["files"]["slice24/coverage.tar.gz"], "-C", str(rust_layer),
          "--strip-components=1"],
         capture_output=True, text=True, check=False,
     )
-    assert pytest_import.returncode == 0, pytest_import.stdout + pytest_import.stderr
+    assert rust_import.returncode == 0, rust_import.stdout + rust_import.stderr
     judgement_path = tmp_path / "contract-coverage.json"
     judged = _run(
-        "--run-dir", str(run), "--merge-results-from", str(pytest_layer),
-        "--only", contract_id, "--platforms", f"{contract_id}=linux",
-        "--json", str(judgement_path),
+        "--run-dir", str(run), "--merge-results-from", str(python_layer),
+        "--merge-results-from", str(rust_layer), "--only", contract_id,
+        "--platforms", f"{contract_id}=linux", "--json", str(judgement_path),
     )
     assert judged.returncode == 0, judged.stdout + judged.stderr
     verdict = json.loads(judgement_path.read_text(encoding="utf-8"))
+    merged_python = json.loads((run / "results-python-linux.json").read_text(encoding="utf-8"))
     merged_rust = json.loads((run / "results-rust-linux.json").read_text(encoding="utf-8"))
+    assert merged_python["collected"].count(python_nodeid) == 1, merged_python["collected"]
     assert set(cargo_nodeids + pytest_nodeids) <= set(merged_rust["collected"]), merged_rust["collected"]
     assert len(merged_rust["collected"]) == len(set(merged_rust["collected"]))
     assert contract_id in verdict["covered"], verdict
