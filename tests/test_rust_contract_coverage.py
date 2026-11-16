@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -1076,6 +1077,109 @@ def test_nested_pytest_does_not_write_into_outer_coverage_run(tmp_path):
     assert document["collected"] == [nodeid], document["collected"][:5]
     assert document["finished"] is True and not document.get("identity_errors")
     assert [row["phase"] for row in document["results"]] == ["setup", "call", "teardown"]
+
+
+def test_shared_coverage_package_import_merges_same_label_before_contract_judgement(tmp_path):
+    """OD-88／OD-93：coverage/ 外層封裝須扁平匯入，Rust Cargo 與 pytest 同 label 結果都進最終判定。"""
+    cc = _module()
+    contract_id = "case:s24-xfer-templates-golden"
+    universe = cc.universe(
+        ROOT / "contracts", ROOT / "tests/acceptance/cases.yaml",
+        ROOT / "tests/acceptance/cases.lock.json", ROOT / "contracts/coverage_map.yaml",
+    )
+    item = universe[contract_id]
+    assert item["rust_only"] is True
+    cargo_nodeids = [nodeid for nodeid in item["nodeids"] if nodeid.startswith("cargo:")]
+    pytest_nodeids = [nodeid for nodeid in item["nodeids"] if not nodeid.startswith("cargo:")]
+    assert cargo_nodeids and pytest_nodeids
+
+    cargo_dir = tmp_path / "cargo-results"
+    coverage_dir = tmp_path / "shared" / "coverage"
+    _results(cargo_dir, "rust-linux", "linux", [_row(nodeid) for nodeid in cargo_nodeids])
+    _results(coverage_dir, "rust-linux", "linux", [_row(nodeid) for nodeid in pytest_nodeids])
+    cargo_archive = tmp_path / "cargo-results.tar.gz"
+    with tarfile.open(cargo_archive, "w:gz") as archive:
+        archive.add(cargo_dir, arcname=".")
+    coverage_archive = tmp_path / "coverage.tar.gz"
+    packed = subprocess.run(
+        ["tar", "-czf", str(coverage_archive), "-C", str(coverage_dir.parent), "coverage"],
+        capture_output=True, text=True, check=False,
+    )
+    assert packed.returncode == 0, packed.stdout + packed.stderr
+    with tarfile.open(coverage_archive, "r:gz") as archive:
+        assert any(member.name.startswith("coverage/results-rust-linux.json") for member in archive.getmembers())
+
+    shared_api_path = ROOT / "scripts/rust/gate_shared_evidence.py"
+    shared_spec = importlib.util.spec_from_file_location("gate_shared_evidence_s24_test", shared_api_path)
+    assert shared_spec is not None and shared_spec.loader is not None
+    shared_api = importlib.util.module_from_spec(shared_spec)
+    shared_spec.loader.exec_module(shared_api)
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    shared_api.is_worktree_clean = lambda root=ROOT: True
+    shared_api.get_current_head = lambda root=ROOT: head
+    shared = tmp_path / "shared-evidence"
+    artifacts = {}
+    for name in shared_api.REQUIRED_ARTIFACTS:
+        source = tmp_path / "artifact-sources" / name
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(f"candidate:{name}".encode())
+        artifacts[name] = source
+    shared_api.init_manifest(shared, artifacts, head=head, clean=True)
+    cargo_argv = ["--include-cap", "posix_pty", "--include-cap", "process_rpc", "--workspace", "--features", "test-fakes"]
+    shared_api.record_section(
+        shared, name="cargo_contract_results", argv=cargo_argv, exit_code=0,
+        files={"slice24/cargo-results.tar.gz": cargo_archive}, platform="linux",
+    )
+    s24_argv = [
+        "-q", "tests/contract_blackbox", "tests/acceptance/l15/test_slice21_l15.py",
+        "tests/acceptance/l15/test_slice23_l15.py", "tests/test_multiagent_e2e.py",
+        "tests/test_human_agent_coexist.py", "tests/test_rust_contract_coverage.py",
+        "tests/test_transfer_golden_fresh.py",
+    ]
+    shared_api.record_section(
+        shared, name="s24_ab", argv=s24_argv, exit_code=0,
+        files={"slice24/coverage.tar.gz": coverage_archive}, platform="linux",
+    )
+    imported_cargo = shared_api.import_section(
+        shared, gate="slice24", section="cargo_contract_results", required_set=None, platform="linux",
+        expected_artifacts=artifacts, current_head=head, worktree_clean=True,
+        destination=tmp_path / "imported-cargo", expected_command="cargo_contract_results",
+    )
+    assert imported_cargo["status"] == "PASS", imported_cargo
+    imported_coverage = shared_api.import_section(
+        shared, gate="slice24", section="s24_ab", required_set=None, platform="linux",
+        expected_artifacts=artifacts, current_head=head, worktree_clean=True,
+        destination=tmp_path / "imported-pytest", expected_command="s24_ab",
+    )
+    assert imported_coverage["status"] == "PASS", imported_coverage
+
+    run = tmp_path / "slice24-run"
+    run.mkdir()
+    cargo_import = subprocess.run(
+        ["tar", "-xzf", imported_cargo["files"]["slice24/cargo-results.tar.gz"], "-C", str(run)],
+        capture_output=True, text=True, check=False,
+    )
+    assert cargo_import.returncode == 0, cargo_import.stdout + cargo_import.stderr
+    pytest_layer = tmp_path / "flattened-coverage"
+    pytest_layer.mkdir()
+    pytest_import = subprocess.run(
+        ["tar", "-xzf", imported_coverage["files"]["slice24/coverage.tar.gz"], "-C", str(pytest_layer),
+         "--strip-components=1"],
+        capture_output=True, text=True, check=False,
+    )
+    assert pytest_import.returncode == 0, pytest_import.stdout + pytest_import.stderr
+    judgement_path = tmp_path / "contract-coverage.json"
+    judged = _run(
+        "--run-dir", str(run), "--merge-results-from", str(pytest_layer),
+        "--only", contract_id, "--platforms", f"{contract_id}=linux",
+        "--json", str(judgement_path),
+    )
+    verdict = json.loads(judgement_path.read_text(encoding="utf-8"))
+    assert judged.returncode == 0, judged.stdout + judged.stderr
+    merged_rust = json.loads((run / "results-rust-linux.json").read_text(encoding="utf-8"))
+    assert set(cargo_nodeids + pytest_nodeids) <= set(merged_rust["collected"]), merged_rust["collected"]
+    assert len(merged_rust["collected"]) == len(set(merged_rust["collected"]))
+    assert contract_id in verdict["covered"], verdict
 
 
 # ---------------------------------------------------------------------------

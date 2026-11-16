@@ -22,7 +22,7 @@ use common::p7::golden_rows;
 use support::*;
 use sw_core::capture::{
     log_open_failed_reply, log_path_for, log_start_reply, log_status_reply, log_stop_reply,
-    no_active_capture_reply, AgentLogCapture, CaptureEnv, CaptureObserver, LogFile,
+    no_active_capture_reply, AgentLogCapture, CaptureEnv, CaptureObserver, LogFile, LogFs,
 };
 use sw_core::session_core::SessionRequest;
 use sw_core::uart_bridge::RxObserver;
@@ -390,6 +390,57 @@ fn log_status_inactive_and_active() {
         }
         other => panic!("session.capture：{other:?}"),
     }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct TimeoutLogFs {
+    opened_path: Mutex<Option<String>>,
+}
+
+#[cfg(target_os = "linux")]
+impl LogFs for TimeoutLogFs {
+    fn makedirs(&self, _dir: &str) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn open_append(&self, path: &str) -> std::io::Result<Box<dyn LogFile>> {
+        *self.opened_path.lock().unwrap() = Some(path.to_owned());
+        Err(std::io::Error::from_raw_os_error(110)) // FakeFs 注入 Linux ETIMEDOUT。
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn log_open_timeout_preserves_errno_strerror_and_path() {
+    let fs = Arc::new(TimeoutLogFs::default());
+    let fs_for_core = fs.clone();
+    let clock: Arc<dyn Clock> = sw_pal::fakes::clock::FakeClock::new();
+    let mut h = CoreHarness::new(&log_profile("/fake/logs"));
+    h.core.set_capture_env(CaptureEnv {
+        fs: fs_for_core,
+        clock: Some(clock),
+        default_log_dir: None,
+    });
+    h.to_ready();
+
+    let response = h.rpc(SessionRequest::LogStart).expect("log_start");
+    assert_eq!(response["error_code"], PyValue::from("LOG_OPEN_FAILED"));
+    let path = fs
+        .opened_path
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("FakeFs captured path");
+    let expected = PyOsError {
+        errno: Some(110),
+        winerror: None,
+        strerror: Some("Connection timed out".to_string()),
+        filename: Some(path),
+        plain: None,
+    }
+    .to_string();
+    assert_eq!(response["detail"], PyValue::from(expected));
 }
 
 #[test]

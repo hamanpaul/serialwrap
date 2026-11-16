@@ -152,6 +152,37 @@ def test_win_test_injects_runner_under_wsl(tmp_path):
     assert "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=" in out    # 本機為 WSL（binfmt_misc/WSLInterop 存在）
 
 
+@REQUIRES_WSL_INTEROP
+def test_win_test_dry_run_has_no_build_or_filesystem_side_effects(tmp_path):
+    """L1：dry-run 必須先於 cargo、mkdir、cp 與 bundle/staging 變更。"""
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    trace = tmp_path / "side-effects.log"
+    for command in ("cargo", "mkdir", "cp"):
+        wrapper = fake_bin / command
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' '{command} $*' >> \"$SW_WIN_TEST_SIDE_EFFECTS\"\n"
+            "exit 87\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": os.pathsep.join((str(fake_bin), "/usr/bin", "/bin", "/mnt/c/Windows/System32")),
+        "SW_WIN_TEST_SIDE_EFFECTS": str(trace),
+        "CARGO_TARGET_DIR": str(tmp_path / "target-must-not-exist"),
+    }
+    out = subprocess.run(
+        ["bash", str(WIN_TEST), "--dry-run"], cwd=ROOT, env=env,
+        capture_output=True, text=True, check=False,
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert not trace.exists(), trace.read_text(encoding="utf-8") if trace.exists() else ""
+    assert not (tmp_path / "target-must-not-exist").exists()
+    assert "dry-run" in out.stdout.lower()
+
+
 def test_blackbox_pytest_argv_matches_frozen_l1_selectors():
     """A／B 兩端 pytest argv 必須只含鎖定 selector 與 junit 輸出路徑。"""
     lock = json.loads(L1_LOCK.read_text(encoding="utf-8"))["sets"]

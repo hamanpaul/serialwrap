@@ -817,3 +817,123 @@ def test_plan_passes_actual_release_build_exit_to_identity() -> None:
     assert "S22_BUILD_EXIT=$?" in plan
     assert '--build-linux-exit "$S22_BUILD_EXIT"' in plan
     assert "--build-linux-exit 0" not in plan
+
+
+def _shared_evidence_module():
+    path = ROOT / "scripts/rust/gate_shared_evidence.py"
+    spec = importlib.util.spec_from_file_location("gate_shared_evidence_s22_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _s22_stale_report(tmp_path: Path, section: str, platform: str) -> tuple[Path, dict, dict]:
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    set_id = f"s22_gate:{section}"
+    locked = lock["sets"][set_id][platform]
+    report = _report(platform, "cargo", locked["selector"]["argv"],
+                     [_row(nodeid) for nodeid in locked["nodeids"]])
+    path = tmp_path / "stale-l1" / section / platform / "resource-report.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(report), encoding="utf-8")
+
+    judge_spec = importlib.util.spec_from_file_location("s22_l1_judge", ROOT / "tests/acceptance/l1_judge.py")
+    assert judge_spec is not None and judge_spec.loader is not None
+    judge = importlib.util.module_from_spec(judge_spec)
+    judge_spec.loader.exec_module(judge)
+    judged = judge.judge(report, locked["nodeids"], platform=platform, selector=locked["selector"])
+    assert judged["verdict"] == "PASS", judged
+    return path, lock, report
+
+
+def _shared_s22_import_fixture(tmp_path: Path, section: str, *, bad_selector: bool = False,
+                               bad_sha: bool = False) -> Path:
+    shared_api = _shared_evidence_module()
+    shared = tmp_path / "shared-evidence"
+    artifact_sources = {}
+    for name in ("debug_cli", "debug_daemon", "release_cli", "release_daemon"):
+        path = tmp_path / "candidate-artifacts" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"candidate:{name}".encode())
+        artifact_sources[name] = path
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    shared_api.init_manifest(shared, artifact_sources, head=head, clean=True)
+
+    set_id = f"s22_gate:{section}"
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    locked = lock["sets"][set_id]["linux" if section == "cargo_workspace" else "windows"]
+    report = _report("linux" if section == "cargo_workspace" else "windows", "cargo",
+                     locked["selector"]["argv"], [_row(nodeid) for nodeid in locked["nodeids"]])
+    if section != "cargo_workspace":
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+        report["provenance"] = {
+            "schema": "cargo-l1-provenance.v1", "platform": "windows",
+            "build_target": "x86_64-pc-windows-gnu",
+            "git": {"head": head, "clean": True, "end": {"head": head, "clean": True}},
+        }
+    report_source = tmp_path / "reports" / "l1-results.json"
+    report_source.parent.mkdir()
+    report_source.write_text(json.dumps(report), encoding="utf-8")
+
+    if section == "cargo_workspace":
+        log = tmp_path / "reports" / "cargo.log"
+        log.write_text("cargo tests passed\n", encoding="utf-8")
+        argv = [*locked["selector"]["argv"], "--selector-mismatch"] if bad_selector else locked["selector"]["argv"]
+        shared_api.record_section(
+            shared, name="cargo_fakes_filtered", argv=argv, exit_code=0,
+            files={
+                "s22_gate/cargo_workspace/linux/resource-report.json": report_source,
+                "logs/cargo-fakes-filtered.log": log,
+            }, required_sets=[set_id], platform="linux",
+        )
+    else:
+        windows_root = tmp_path / "windows-l1"
+        source = windows_root / set_id / "l1-results.json"
+        source.parent.mkdir(parents=True)
+        source.write_text(json.dumps(report), encoding="utf-8")
+        recorded = shared_api.record_windows_l1(
+            shared, source_root=windows_root, required_set=set_id, current_head=head,
+            worktree_clean=True,
+        )
+        assert recorded["status"] == "PASS", recorded
+        if bad_sha:
+            manifest_path = shared / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            rel = manifest["sections"][f"windows_l1:{set_id}"]["files"]["l1-results.json"]["path"]
+            (shared / rel).write_text("tampered after SHA256 registration", encoding="utf-8")
+    return shared
+
+
+@pytest.mark.parametrize(
+    ("section", "platform", "bad_selector", "bad_sha"),
+    [
+        ("cargo_workspace", "linux", True, False),
+        ("windows_cap_windows_com", "windows", False, True),
+    ],
+)
+def test_rejected_shared_evidence_cannot_fall_back_to_stale_green_l1(
+    tmp_path: Path, section: str, platform: str, bad_selector: bool, bad_sha: bool,
+) -> None:
+    """OD-93：selector／SHA 被拒時，舊的全綠 L1 報告仍不得讓該集合 PASS。"""
+    stale_path, _lock, stale_report = _s22_stale_report(tmp_path, section, platform)
+    stale_sha = hashlib.sha256(stale_path.read_bytes()).hexdigest()
+    shared = _shared_s22_import_fixture(
+        tmp_path, section, bad_selector=bad_selector, bad_sha=bad_sha,
+    )
+    out = tmp_path / "out"
+    proc = subprocess.run(
+        [
+            "bash", "scripts/rust/s22_gate.sh", "--run-id", "reject", "--out", str(out),
+            "--l1-results-dir", str(stale_path.parents[2]), "--shared-evidence", str(shared),
+            "--windows-dir", "", "--selftest-report", "", "--daemon-path", "",
+        ],
+        cwd=ROOT, capture_output=True, text=True, timeout=180,
+    )
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    report_path = out / "reject" / "s22-gate.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    judged = _section(report, f"s22_gate:{section}", platform)
+    assert judged["verdict"] == "EVIDENCE_MISSING", judged
+    assert stale_path.is_file() and hashlib.sha256(stale_path.read_bytes()).hexdigest() == stale_sha
+    assert "EVIDENCE_MISSING" in proc.stdout + proc.stderr

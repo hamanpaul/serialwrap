@@ -48,6 +48,29 @@ fn file_size_none_when_missing() {
     assert_eq!(fsops.file_size(&p).unwrap(), Some(5));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn file_io_timeout_preserves_errno_strerror_and_full_filename() {
+    use std::io;
+    use std::path::Path;
+
+    struct FakeFs;
+    impl FakeFs {
+        fn open(&self, _path: &Path) -> io::Result<()> {
+            Err(io::Error::from_raw_os_error(110)) // Linux ETIMEDOUT，完全不碰 host filesystem。
+        }
+    }
+
+    let path = Path::new("/tmp/serialwrap-timeout.bin");
+    let mapped = sw_pal::fs_ops::map_file_error(FakeFs.open(path).unwrap_err());
+    assert_eq!(mapped.os_code, Some(110));
+    assert_eq!(mapped.strerror, "Connection timed out");
+    assert_eq!(
+        format!("{}: '{}'", mapped.py_message, path.display()),
+        "[Errno 110] Connection timed out: '/tmp/serialwrap-timeout.bin'",
+    );
+}
+
 #[test]
 fn open_append_appends_and_creates() {
     let tmp = tempfile::tempdir().unwrap();
