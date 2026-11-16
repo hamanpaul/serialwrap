@@ -16,6 +16,7 @@ use sw_core::event_engine::BridgeQueries;
 use sw_daemon::daemon_main::TraceEvent;
 use sw_daemon::daemon_main::{run_with_hooks, DaemonHooks};
 use sw_pal::traits::DeviceInfo;
+use sw_proto::pyjson::{self, PyDict, PyValue};
 
 fn device(by_id: &str, real_path: &str) -> (String, DeviceInfo) {
     (
@@ -186,7 +187,12 @@ fn shutdown_aborts_long_handler_within_budget() {
         .lines()
         .filter(|l| l.contains("shutdown incomplete:"))
         .collect();
-    assert!(!out.stderr.contains("RESULT handler_not_started"), "handler 未啟動：{}", out.stderr);
+    assert!(
+        !out.stderr.contains("RESULT handler_not_started"),
+        "handler 未啟動；event records={:#?}\n{}",
+        events(&events_log(&env)),
+        out.stderr
+    );
     assert_eq!(out.code, Some(0), "aborted handler 已回收（unreaped 空）：{incomplete:?}\n{}", out.stderr);
     assert!(
         out.stderr
@@ -453,11 +459,31 @@ fn on_windows() -> bool {
 
 /// 長時間 handler（`sleep 60`／`ping -n 60`），命令列帶 `marker` 以便辨識行程樹。
 fn long_handler_json(marker: &str) -> String {
+    let mut handler = PyDict::new();
     if on_windows() {
-        format!(r#"{{"shell": "ping -n 60 127.0.0.1 > nul & rem {marker}"}}"#)
+        let ping = windows_system_exe("ping.exe");
+        handler.insert(
+            "shell",
+            PyValue::from(format!(r#""{}" -n 60 127.0.0.1 > nul & rem {marker}"#, ping.display())),
+        );
     } else {
-        format!(r#"{{"exec": ["/bin/sh", "-c", "sleep 60; : {marker}"]}}"#)
+        handler.insert(
+            "exec",
+            PyValue::List(vec![
+                PyValue::from("/bin/sh"),
+                PyValue::from("-c"),
+                PyValue::from(format!("sleep 60; : {marker}")),
+            ]),
+        );
     }
+    pyjson::dumps(&PyValue::Dict(handler), &pyjson::RPC_WIRE)
+}
+
+/// Windows 原生事件 handler 的子行程環境刻意不繼承未列入的 PATH，故用 SystemRoot 組成系統工具絕對路徑。
+fn windows_system_exe(name: &str) -> PathBuf {
+    PathBuf::from(std::env::var_os("SystemRoot").expect("Windows 原生測試須有 SystemRoot"))
+        .join("System32")
+        .join(name)
 }
 
 /// 命令列含 `marker` 且非 zombie 的行程是否存在：POSIX 掃 `/proc`；Windows 以 PowerShell 查 `Win32_Process`
@@ -467,7 +493,7 @@ fn marker_alive(marker: &str) -> bool {
         let query = format!(
             "@(Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{marker}*' -and $_.Name -ne 'powershell.exe' }}).Count"
         );
-        return std::process::Command::new("powershell")
+        return std::process::Command::new(windows_system_exe("WindowsPowerShell/v1.0/powershell.exe"))
             .args(["-NoProfile", "-Command", &query])
             .output()
             .ok()

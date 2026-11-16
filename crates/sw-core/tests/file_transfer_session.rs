@@ -17,6 +17,7 @@ use sw_core::file_transfer::{FileTransferKind, FileTransferRequest};
 use sw_core::session_core::{SessionRequest, SessionState};
 use sw_pal::fakes::serial::FakeWriteStep;
 use sw_pal::traits::Clock;
+use sw_proto::pycompat::PyOsError;
 use sw_proto::pydict;
 use sw_proto::pyjson::{self, PyDict, PyInt, PyValue};
 
@@ -526,7 +527,15 @@ fn pull_local_write_error_is_exception() {
     x.peer.put_file("/tmp/src.bin", b"payload");
     let bad = x.tmp.join("no/such/dir/x.bin");
     let err = x.transfer(pull_req("/tmp/src.bin", Some(&bad))).expect_err("本地寫入失敗應穿出為例外");
-    assert!(err.message.contains("No such file or directory") && err.message.contains(&bad), "{}", err.message);
+    let expected = PyOsError {
+        errno: Some(2),
+        winerror: None,
+        strerror: Some("No such file or directory".to_string()),
+        filename: Some(bad),
+        plain: None,
+    }
+    .to_string();
+    assert_eq!(err.message, expected);
     assert!(x.peer.lines_containing("base64 < ") >= 1, "pull 命令已送出（有 TX）");
     assert_eq!(x.rig.get_state().get("foreground_busy"), Some(&PyValue::Bool(false)));
 }

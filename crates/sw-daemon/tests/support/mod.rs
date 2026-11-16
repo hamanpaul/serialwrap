@@ -678,6 +678,27 @@ pub fn run_to_exit(env: &IsolatedEnv, vars: &BTreeMap<String, String>, args: &[&
     }
 }
 
+/// 直接執行 daemon 的 allowlist 前置拒絕案例。
+///
+/// 僅供故意提供空 env allowlist 與格式錯誤 config 的負向測試：harness 的一般啟動守門會先攔下空
+/// allowlist，使測試無法驗證 daemon 本身的 SC-19 錯誤文字。產品應在 `ensure_runtime_dirs`、取鎖與
+/// `DeviceWatcher::initial_scan` 之前拒絕，因此此 helper 仍執行真實 daemon，並由呼叫端核對拒絕與零副作用。
+pub fn run_allowlist_preflight_to_exit(
+    vars: &BTreeMap<String, String>,
+    args: &[&str],
+) -> Output {
+    let result = Command::new(daemon_binary())
+        .args(args)
+        .envs(vars)
+        .stdin(Stdio::null())
+        .output()
+        .expect("啟動 allowlist 前置拒絕案例的真實 serialwrapd");
+    Output {
+        code: result.status.code(),
+        stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
+    }
+}
+
 /// 以測試執行檔自身重新啟動一個測試函式（子行程模式）。子行程以環境變數 `S21_CHILD=<mode>` 辨識，
 /// 並在測試函式內呼叫 in-process 的 `run_with_hooks` 後以其 exit code 結束。
 pub fn run_child_test(test_name: &str, mode: &str, env: &IsolatedEnv) -> Output {

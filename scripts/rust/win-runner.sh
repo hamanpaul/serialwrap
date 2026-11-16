@@ -22,6 +22,7 @@ fi
 
 exe_source="$1"
 shift
+exe_name="$(basename "$exe_source")"
 list_only=0
 for arg in "$@"; do
   if [[ "$arg" == "--list" ]]; then
@@ -77,7 +78,6 @@ cleanup() {
   exit "$rc"
 }
 trap cleanup EXIT
-exe_name="$(basename "$exe_source")"
 cp -- "$exe_source" "$staging/$exe_name"
 chmod +x "$staging/$exe_name"
 
@@ -116,8 +116,12 @@ if [[ "$list_only" == "0" ]]; then
   done
 fi
 
-if [[ "$list_only" == "0" && -n "${SW_WIN_EXTRA_FILES:-}" ]]; then
-  IFS=: read -r -a extra_files <<< "$SW_WIN_EXTRA_FILES"
+extra_files_raw="${SW_WIN_EXTRA_FILES:-}"
+if [[ "$list_only" == "0" && "$exe_name" == handoff_stop-* && -n "${SW_WIN_HANDOFF_FILES:-}" ]]; then
+  extra_files_raw="${extra_files_raw:+$extra_files_raw:}$SW_WIN_HANDOFF_FILES"
+fi
+if [[ "$list_only" == "0" && -n "$extra_files_raw" ]]; then
+  IFS=: read -r -a extra_files <<< "$extra_files_raw"
   for source in "${extra_files[@]}"; do
     [[ -n "$source" ]] || continue
     if [[ ! -e "$source" ]]; then
@@ -125,7 +129,11 @@ if [[ "$list_only" == "0" && -n "${SW_WIN_EXTRA_FILES:-}" ]]; then
       rm -rf -- "$staging"
       exit 2
     fi
-    cp -R -- "$source" "$staging/"
+    if ! cp -RL -- "$source" "$staging/"; then
+      echo "win-runner.sh: Windows 測試資料 staging 失敗：$source" >&2
+      rm -rf -- "$staging"
+      exit 2
+    fi
   done
 fi
 

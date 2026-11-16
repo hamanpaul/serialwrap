@@ -14,7 +14,6 @@ mod support;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -27,7 +26,7 @@ use sw_pal::traits::{
     DeviceInfo, DevicePath, OpenError, PalError, PalResult, SerialBackend, SerialConfig, SerialHandle, SignalWait,
     WatcherEvent,
 };
-use sw_proto::pyjson::{self, PyValue};
+use sw_proto::pyjson::{self, PyDict, PyInt, PyValue};
 
 /// 計畫 Task 12 `shutdown_order_steps` 的完整停止序。
 const STEPS: [&str; 12] = [
@@ -90,9 +89,34 @@ fn wait_state(socket: &std::path::Path, com: &str, want: &str) {
 }
 
 fn push_line(local: &str) -> String {
-    format!(
-        r#"{{"id":7,"method":"file.push","params":{{"selector":"COM0","local_path":"{local}","remote_path":"/tmp/sw-p8t12.bin"}}}}"#
-    )
+    let mut params = PyDict::new();
+    params.insert("selector", PyValue::from("COM0"));
+    params.insert("local_path", PyValue::from(local.to_string()));
+    params.insert("remote_path", PyValue::from("/tmp/sw-p8t12.bin"));
+    let mut request = PyDict::new();
+    request.insert("id", PyValue::Int(PyInt::Small(7)));
+    request.insert("method", PyValue::from("file.push"));
+    request.insert("params", PyValue::Dict(params));
+    pyjson::dumps(&PyValue::Dict(request), &pyjson::RPC_WIRE)
+}
+
+/// 測試用 flash endpoint：Windows production caps 不支援 PTY，這兩個 shutdown fixture 只驗證共用停止序，
+/// 因此以記憶體 `ConsoleTransportFactory` 提供 endpoint，不建立 OS PTY、symlink 或序列埠。
+fn enable_fake_flash_endpoint(platform: &mut sw_pal::Platform) {
+    platform.caps.flash_endpoint = true;
+    platform.console = Arc::new(sw_pal::fakes::FakeConsoleFactory::with_flash(
+        platform.caps.console_kind,
+        true,
+    ));
+}
+
+/// Windows handler 的測試環境不保證有 PATH，使用原生 SystemRoot 下的 cmd.exe。
+fn windows_system_exe(name: &str) -> String {
+    PathBuf::from(std::env::var_os("SystemRoot").expect("Windows 原生測試須有 SystemRoot"))
+        .join("System32")
+        .join(name)
+        .display()
+        .to_string()
 }
 
 fn incomplete_lines(stderr: &str) -> Vec<&str> {
@@ -173,7 +197,10 @@ fn child_main(inject: Inject) -> ! {
     } else {
         (Vec::new(), Fixture::None)
     };
-    let (platform, _h) = in_process_platform_with_handles(&vars, devices, fixture);
+    let (mut platform, _h) = in_process_platform_with_handles(&vars, devices, fixture);
+    if inject.block_flash {
+        enable_fake_flash_endpoint(&mut platform);
+    }
     let (block_flash, stall_push) = (inject.block_flash, inject.stall_push);
     let entered = Arc::new(AtomicBool::new(false));
     let stop_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
@@ -335,10 +362,27 @@ fn order_is_exactly_1_to_7() {
     // 計畫 `shutdown_order_steps`：含一條已啟用的 event rule（命中 bootstrap ready probe 回應的 `__READY__`），
     // engine 已實際派工過 handler，停止序仍恰為 12 步。
     let env = isolated_env();
+    let mut handler = PyDict::new();
+    if std::path::MAIN_SEPARATOR == '\\' {
+        handler.insert(
+            "exec",
+            PyValue::List(vec![
+                PyValue::from(windows_system_exe("cmd.exe")),
+                PyValue::from("/d"),
+                PyValue::from("/c"),
+                PyValue::from("exit 0"),
+            ]),
+        );
+    } else {
+        handler.insert("exec", PyValue::List(vec![PyValue::from("true")]));
+    }
+    let handler = pyjson::dumps(&PyValue::Dict(handler), &pyjson::RPC_WIRE);
     fs::write(
         PathBuf::from(&env.vars["SERIALWRAP_EVENTS_DIR"]).join("o.order.json"),
-        r#"{"schema_version": 1, "owner": "o", "name": "order", "kind": "tool", "selectors": ["COM0"],
-            "pattern": {"kind": "contains", "value": "__READY__"}, "handler": {"exec": ["true"]}}"#,
+        format!(
+            r#"{{"schema_version": 1, "owner": "o", "name": "order", "kind": "tool", "selectors": ["COM0"],
+                "pattern": {{"kind": "contains", "value": "__READY__"}}, "handler": {handler}}}"#
+        ),
     )
     .expect("寫入 event rule");
     let sink = Arc::new(Mutex::new(Vec::new()));
@@ -379,11 +423,12 @@ fn order_is_exactly_1_to_7() {
 fn gpx_shutdown_window_starts_no_new_command_zero_tx() {
     // q1 已送出 UART、等待 prompt；停機 gate 後才讓它完成。q2 必須立即沖刷，不能在 flash.stop 窗口出列。
     let env = isolated_env();
-    let (platform, handles) = in_process_platform_with_handles(
+    let (mut platform, handles) = in_process_platform_with_handles(
         &env.vars,
         vec![device("usb-SER-A-if00", "/fake/serial-s2-shutdown")],
         Fixture::ReadyShell,
     );
+    enable_fake_flash_endpoint(&mut platform);
     let dev = handles.devices[0].clone();
     let manager_slot: Arc<Mutex<Option<Arc<SessionManager>>>> = Arc::new(Mutex::new(None));
     let manager_for_hook = manager_slot.clone();
@@ -455,7 +500,6 @@ fn gpx_shutdown_window_starts_no_new_command_zero_tx() {
         // 此通知在 watcher.stop 之後、flash.stop 之前；block_flash_endpoint_stop 保留 2 s 停止窗口。
         let in_window = window_rx.recv_timeout(SHORT).is_ok();
         if in_window {
-            thread::sleep(Duration::from_millis(200));
             dev_for_client.push_rx(b"q1\r\nroot@t:/# ");
         }
         let q1_completed_before_flash_stopped = !q1_id.is_empty()
@@ -629,23 +673,31 @@ fn long_file_push_does_not_block_stop() {
     fs::write(&local, vec![0x5a_u8; 64 * 1024]).expect("寫入 push 來源檔");
     let local = local.to_string_lossy().into_owned();
     let sink = Arc::new(Mutex::new(Vec::new()));
-    let (platform, _h) = in_process_platform_with_handles(
+    let (platform, handles) = in_process_platform_with_handles(
         &env.vars,
         vec![device("usb-SER-A-if00", "/dev/pts/10")],
         Fixture::ReadyShellBlockingWithQueue,
     );
+    let dev = handles.devices[0].clone();
     let socket = env.socket.clone();
+    let dev_for_client = dev.clone();
     let client = spawn_stop_guarded_client(socket.clone(), move || {
         wait_socket(&socket, SHORT);
         wait_state(&socket, "COM0", "READY");
+        let submits_before_push = dev_for_client.os_submits();
         let s = socket.clone();
         let push = thread::spawn(move || rpc_once(&s, &push_line(&local)));
-        let deadline = Instant::now() + SHORT;
-        while get_state(&socket, "COM0")["foreground_busy"] != true {
-            assert!(Instant::now() < deadline, "file.push 未進入前景");
-            thread::sleep(Duration::from_millis(20));
+        if !poll(SHORT, || get_state(&socket, "COM0")["foreground_busy"] == true) {
+            let reply = push.join().expect("push thread");
+            panic!("file.push 未進入前景，RPC 回覆：{reply:?}");
         }
-        thread::sleep(Duration::from_millis(300));
+        // 此夾具的 BlockUntilCancel 明確接受 0 bytes；以 FakeSerialBackend 的 OS submit 計數確認
+        // file.push 已將第一筆寫入交給阻塞中的 writer，不能等待尚未被接受的 remote_path 出現在 TX。
+        let submitted = poll(SHORT, || dev_for_client.os_submits() > submits_before_push);
+        if !submitted {
+            let reply = push.join().expect("push thread");
+            panic!("file.push 尚未將傳輸寫入交給假 UART writer，RPC 回覆：{reply:?}");
+        }
         let t0 = Instant::now();
         rpc_once(&socket, STOP);
         (t0, push.join().expect("push thread"))
@@ -739,7 +791,7 @@ fn second_sigterm_real_signal_exits_0() {
     let mut d = DaemonProc::spawn(&env, &[]);
     wait_ready(&env, "COM0");
     for _ in 0..2 {
-        let status = Command::new("kill")
+        let status = std::process::Command::new("kill")
             .arg("-TERM")
             .arg(d.pid().to_string())
             .status()

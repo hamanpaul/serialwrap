@@ -1144,12 +1144,11 @@ fn allowlist_rejected_reasons_exact() {
         out.stderr,
         "serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: not an isolated instance: SERIALWRAP_RUN_DIR equals default\n"
     );
-    // 拒絕前不得以未 strip 的值建立目錄（舊實作在 cwd 下留下 `  /tmp/.../run /serialwrapd.lock`，曾被誤提交）。
-    let stray = std::env::current_dir().unwrap().join("  ");
+    // Python `_run_async` 在 allowlist 判定後才呼叫 `ensure_runtime_dirs()`；拒絕前不得建立預設 RUN_DIR。
     assert!(
-        !stray.exists(),
-        "未 strip 的 RUN_DIR 被當成相對路徑建立：{}",
-        stray.display()
+        !default_run.exists(),
+        "allowlist 拒絕前不得建立預設 RUN_DIR：{}",
+        default_run.display()
     );
 
     // (3) config windows.test_device_allowlist 非 list。
@@ -1160,11 +1159,23 @@ fn allowlist_rejected_reasons_exact() {
     .unwrap();
     let mut vars = env.vars.clone();
     vars.insert(ALLOWLIST.to_string(), String::new());
-    let out = run_to_exit(&env, &vars, &[]);
+    let out = run_allowlist_preflight_to_exit(&vars, &[]);
     assert_eq!(out.code, Some(2), "{}", out.stderr);
     assert_eq!(
         out.stderr,
         "serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: invalid windows.test_device_allowlist\n"
+    );
+    assert!(
+        !env.run_dir.join("serialwrapd.lock").exists(),
+        "格式錯誤 allowlist 必須在取鎖前拒絕"
+    );
+    assert!(
+        !env.state_dir.join("state.json").exists(),
+        "格式錯誤 allowlist 必須在載入或寫入狀態前拒絕"
+    );
+    assert!(
+        !endpoint_is_serving(&env.socket),
+        "格式錯誤 allowlist 必須在綁定 RPC endpoint 前拒絕"
     );
 }
 

@@ -26,6 +26,7 @@ use sw_pal::fs_ops::TEXT_NEWLINE_STR;
 use sw_pal::fakes::serial::{FakeUartExclusive, FakeWriteStep};
 use sw_pal::traits::{Clock, PalError};
 use sw_proto::pycompat::{PyErr, clean_text};
+use sw_proto::pyfmt::py_repr_str;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue, loads};
 
 const BANNER: &[u8] = b"\r\nU-Boot 2024.04 (Oct 01 2024)\r\n";
@@ -1256,7 +1257,20 @@ fn log_capture_dir_not_creatable_is_exception() {
     let rx = h.request_async(SessionRequest::LogStart);
     let r = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let err = r.expect_err("makedirs 失敗為例外（framing EXCEPTION），不是 LOG_OPEN_FAILED");
-    assert!(err.message.contains("Errno"), "{}", err.message);
+    if std::path::MAIN_SEPARATOR == '\\' {
+        assert!(
+            err.message.starts_with("[WinError 183] "),
+            "Windows Python FileExistsError 的 winerror：{}",
+            err.message
+        );
+        assert!(
+            err.message.ends_with(&format!(": {}", py_repr_str(&dir))),
+            "Python OSError filename repr：{}",
+            err.message
+        );
+    } else {
+        assert!(err.message.contains("Errno"), "{}", err.message);
+    }
 }
 
 #[test]

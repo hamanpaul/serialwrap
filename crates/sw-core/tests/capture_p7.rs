@@ -27,6 +27,7 @@ use sw_core::capture::{
 use sw_core::session_core::SessionRequest;
 use sw_core::uart_bridge::RxObserver;
 use sw_pal::traits::Clock;
+use sw_proto::pycompat::PyOsError;
 use sw_proto::pyjson::{dumps_dict, loads, PyDict, PyInt, PyValue, RPC_WIRE};
 
 fn int(n: i128) -> PyValue {
@@ -407,11 +408,19 @@ fn log_open_failed_detail_is_python_oserror_str() {
     let r = h.request(SessionRequest::LogStart);
     assert_eq!(keys(&r), ["ok", "error_code", "detail"]);
     assert_eq!(r["error_code"], PyValue::from("LOG_OPEN_FAILED"));
-    let expected = if std::path::MAIN_SEPARATOR == '\\' {
-        format!("[Errno 13] Permission denied: '{path}'")
+    let (errno, strerror) = if std::path::MAIN_SEPARATOR == '\\' {
+        (13, "Permission denied")
     } else {
-        format!("[Errno 21] Is a directory: '{path}'")
+        (21, "Is a directory")
     };
+    let expected = PyOsError {
+        errno: Some(errno),
+        winerror: None,
+        strerror: Some(strerror.to_string()),
+        filename: Some(path),
+        plain: None,
+    }
+    .to_string();
     assert_eq!(r["detail"], PyValue::from(expected));
 }
 

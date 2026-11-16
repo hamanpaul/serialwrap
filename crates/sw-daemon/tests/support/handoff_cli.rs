@@ -81,6 +81,15 @@ pub fn feature_bundle(cli: &Path) -> (PathBuf, PathBuf) {
                         .map(|staging| staging.join("bundle"))
                 })
                 .unwrap_or_else(|| repository.join("target/s2-par/gpz/prereqs/bundle"));
+            let mut staged_manifests: Vec<PathBuf> = fs::read_dir(fallback.join("versions"))
+                .ok()?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path().join("release-manifest.json"))
+                .filter(|path| path.is_file())
+                .collect();
+            if staged_manifests.len() == 1 {
+                return staged_manifests.pop();
+            }
             let fallback = fallback.join("bin/serialwrap");
             let fallback = fs::canonicalize(fallback).ok()?;
             let fallback_version = fallback.parent()?.parent()?;
@@ -155,14 +164,7 @@ pub fn seed_install(bundle_dir: &Path, install_root: &Path) {
     fs::create_dir_all(&bin).expect("建立隔離安裝入口目錄");
     for name in ["serialwrap", "serialwrapd"] {
         let link = bin.join(name);
-        let target = format!("../versions/{OLD_VERSION}/bin/{name}");
-        let status = Command::new("ln")
-            .arg("-s")
-            .arg(target)
-            .arg(&link)
-            .status()
-            .expect("建立隔離安裝入口 symlink");
-        assert!(status.success(), "建立隔離安裝入口失敗：{}", link.display());
+        seed_install_entry(&old_dir, name, &link);
     }
 
     let mut current = PyDict::new();
@@ -198,13 +200,7 @@ pub fn seed_install_from_old_bundle(bundle_dir: &Path, install_root: &Path) {
     fs::create_dir_all(&bin).expect("建立隔離安裝入口目錄");
     for name in ["serialwrap", "serialwrapd"] {
         let link = bin.join(name);
-        let status = Command::new("ln")
-            .arg("-s")
-            .arg(format!("../versions/{version}/bin/{name}"))
-            .arg(&link)
-            .status()
-            .expect("建立隔離安裝入口 symlink");
-        assert!(status.success(), "建立隔離安裝入口失敗：{}", link.display());
+        seed_install_entry(&version_dir, name, &link);
     }
     let mut current = PyDict::new();
     current.insert("backup_dir", PyValue::Null);
@@ -215,6 +211,38 @@ pub fn seed_install_from_old_bundle(bundle_dir: &Path, install_root: &Path) {
     let mut bytes = pyjson::dumps(&PyValue::Dict(current), &pyjson::DISK_STABLE).into_bytes();
     bytes.push(b'\n');
     fs::write(install_root.join("current-release.json"), bytes).expect("寫入隔離 current fixture");
+}
+
+/// 依產品安裝佈局建立穩定入口：Windows 是一般檔案複本，POSIX 才是相對 symlink。
+fn seed_install_entry(version_dir: &Path, name: &str, entry: &Path) {
+    let source = version_dir.join("bin").join(name);
+    if std::path::MAIN_SEPARATOR == '\\' {
+        fs::copy(&source, entry).unwrap_or_else(|error| {
+            panic!("複製 Windows 隔離安裝入口失敗：{} -> {}：{error}", source.display(), entry.display())
+        });
+    } else {
+        let version = version_dir
+            .file_name()
+            .and_then(|part| part.to_str())
+            .expect("版本目錄名稱為 UTF-8");
+        create_relative_symlink(&format!("../versions/{version}/bin/{name}"), entry);
+    }
+}
+
+/// 在 POSIX 隔離安裝目錄建立相對 symlink。
+fn create_relative_symlink(target: &str, link: &Path) {
+    let output = Command::new("ln")
+        .arg("-s")
+        .arg(target)
+        .arg(link)
+        .output()
+        .expect("建立隔離安裝入口 symlink");
+    assert!(
+        output.status.success(),
+        "建立隔離安裝入口 symlink 失敗：{}：{}",
+        link.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn copy_tree(source: &Path, destination: &Path) {
@@ -240,16 +268,61 @@ fn copy_tree(source: &Path, destination: &Path) {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstallSnapshot {
     current: Vec<u8>,
-    cli_entry: Option<PathBuf>,
-    daemon_entry: Option<PathBuf>,
+    cli_entry: EntrySnapshot,
+    daemon_entry: EntrySnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EntrySnapshot {
+    Missing,
+    Symlink(PathBuf),
+    File {
+        bytes: Vec<u8>,
+        modified: Option<std::time::SystemTime>,
+        readonly: bool,
+    },
+    Other {
+        is_dir: bool,
+        len: u64,
+    },
+}
+
+fn entry_snapshot(path: &Path) -> EntrySnapshot {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return EntrySnapshot::Missing;
+        }
+        Err(error) => panic!("讀取隔離安裝入口 metadata 失敗：{}：{error}", path.display()),
+    };
+    if metadata.file_type().is_symlink() {
+        return EntrySnapshot::Symlink(
+            fs::read_link(path).unwrap_or_else(|error| {
+                panic!("讀取隔離安裝入口 symlink 失敗：{}：{error}", path.display())
+            }),
+        );
+    }
+    if metadata.is_file() {
+        return EntrySnapshot::File {
+            bytes: fs::read(path).unwrap_or_else(|error| {
+                panic!("讀取隔離安裝入口檔案失敗：{}：{error}", path.display())
+            }),
+            modified: metadata.modified().ok(),
+            readonly: metadata.permissions().readonly(),
+        };
+    }
+    EntrySnapshot::Other {
+        is_dir: metadata.is_dir(),
+        len: metadata.len(),
+    }
 }
 
 pub fn install_snapshot(install_root: &Path) -> InstallSnapshot {
     InstallSnapshot {
         current: fs::read(install_root.join("current-release.json"))
             .expect("讀取隔離 current-release.json"),
-        cli_entry: fs::read_link(install_root.join("bin/serialwrap")).ok(),
-        daemon_entry: fs::read_link(install_root.join("bin/serialwrapd")).ok(),
+        cli_entry: entry_snapshot(&install_root.join("bin/serialwrap")),
+        daemon_entry: entry_snapshot(&install_root.join("bin/serialwrapd")),
     }
 }
 
