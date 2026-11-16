@@ -62,7 +62,6 @@ PY
   echo "執行：python3 func-test/runner.py <s22_gate_check.py 逐案列出的 L1.5 selector>（Python/Rust 各一列；需符合 daemon identity）。"
   echo "匯入：Windows L1 與 --windows-dir 的 owner 證據；shared 模式不啟動 Windows runner。"
   echo "執行：python3 scripts/rust/s22_gate_check.py --l1-results <DIR> --map tests/acceptance/slice22_evidence_map.yaml --lock tests/acceptance/l1_required.lock.json --l15-results <FILE> --dry-run。"
-  exit 0
 fi
 SHARED_ARTIFACTS_VALID=0
 SHARED_ARTIFACT_DIR="$RUN_DIR/shared-artifacts"
