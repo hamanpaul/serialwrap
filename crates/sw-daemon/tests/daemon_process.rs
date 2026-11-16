@@ -259,6 +259,7 @@ fn unreadable_state_json_exits_3_and_releases_lock() {
     assert_eq!(again.code, Some(3), "{}", again.stderr);
 }
 
+#[cfg(all(test, unix))]
 #[test]
 fn unwritable_state_dir_startup_save_exits_1_before_attach() {
     // sol-backfill p5 #4：Python 基線實測（非 root、state 目錄 555）——`SessionManager.__init__` 的 `_save_state()`
@@ -413,7 +414,7 @@ fn no_args_uses_env_paths() {
 }
 
 #[test]
-fn endpoint_written_after_bind() {
+fn endpoint_is_written_after_bind() {
     let env = isolated_env();
     let mut d = DaemonProc::spawn(&env, &[]);
     wait_socket(&env.socket, SHORT);
@@ -423,8 +424,12 @@ fn endpoint_written_after_bind() {
     assert!(cfg.lines().any(|l| l == want), "{cfg}");
     rpc_once(&env.socket, STOP);
     assert_eq!(d.wait(LONG).code(), Some(0));
+}
 
-    // config 目錄唯讀：寫入失敗為非致命，daemon 仍存活。
+/// OD-95：設定目錄唯讀時端點寫入失敗不致命；保留既有 Linux L1 案例識別碼。
+#[cfg(all(test, unix))]
+#[test]
+fn endpoint_written_after_bind() {
     // 審查 F81：root 下 chmod 無效＝證據不足，必須 FAIL（不得 return 計為 PASS）。
     assert!(
         !is_root(),
@@ -676,6 +681,7 @@ fn sigterm_graceful_exit_0_and_flushes_queue() {
     );
 }
 
+#[cfg(all(test, unix))]
 #[test]
 fn real_sigterm_to_started_daemon_exits_0_after_flush() {
     let env = isolated_env_with_pty_target();
@@ -799,6 +805,7 @@ fn shutdown_wal_sync_failure_exits_1() {
     );
 }
 
+#[cfg(all(test, unix))]
 #[test]
 fn shutdown_releases_tty_before_exit() {
     let env = isolated_env_with_pty_target();
@@ -814,6 +821,7 @@ fn shutdown_releases_tty_before_exit() {
     );
 }
 
+#[cfg(all(test, unix))]
 #[test]
 fn wal_dir_readonly_at_start_blocks_login_probe() {
     // 審查 F81：root 下 chmod 無效＝證據不足，必須 FAIL（不得 return 計為 PASS）。
@@ -861,6 +869,7 @@ fn wal_dir_readonly_at_start_blocks_login_probe() {
 /// pids 空且 status 非 ok → 警告「無法確認 … 的外部 holder（status=…）」並照常開啟（`_set_holder_unknown`），
 /// `health.status.foreign_holders` 以 `{device, holder_unknown:true}` 回報，session 照常 READY。保守判定只保留在
 /// CLI 升級／回滾的安全檢查（`serialwrapd_tty_holders`，rulings/p7.md P7-71fe017-4）。
+#[cfg(all(test, unix))]
 #[test]
 fn non_root_holder_scan_permission_does_not_block_open() {
     // root 可讀所有 /proc/<pid>/fd，無法覆蓋權限不足路徑＝證據不足，必須 FAIL（不得 return 計為 PASS）。
@@ -896,6 +905,7 @@ fn non_root_holder_scan_permission_does_not_block_open() {
     assert_eq!(d.wait(LONG).code(), Some(0));
 }
 
+#[cfg(all(test, unix))]
 #[test]
 fn wal_fault_after_ready_splits_agent_and_auto_tx() {
     // 審查 F81：root 下 chmod 無效＝證據不足，必須 FAIL（不得 return 計為 PASS）。
@@ -954,6 +964,7 @@ fn recover_tx_payloads(env: &IsolatedEnv) -> Vec<String> {
         .collect()
 }
 
+#[cfg(all(test, unix))]
 #[test]
 fn daemon_stop_during_force_recover_with_client_gone() {
     // P5-T19 修正（與計畫 Review Focus 5 衝突，依 OD-14 #1 以 Python 行為為準，待擁有者確認；審查 F87）：
@@ -1042,6 +1053,7 @@ fn daemon_stop_during_force_recover_with_client_gone() {
     assert!(!endpoint_is_serving(&env.socket), "有序停機後 RPC endpoint 應已關閉");
 }
 
+#[cfg(all(test, unix))]
 #[test]
 fn daemon_stop_from_second_connection_during_force_recover() {
     // 審查 F87（Opus 修法）：force recover handler 進行中（假 DUT 暫停回應 8 s）、client 已斷線，由第二條連線送
@@ -1507,6 +1519,7 @@ const RELEASE: &str = r#"{"id":7,"method":"device.release","params":{"selector":
 
 /// #3／#68：產品 build 讀 `SERIALWRAP_TEST_KILL_AFTER_SAVE=1`；隔離實例於 release 持久化 commit 後、回覆前 exit 137，
 /// 重啟後仍 RELEASED；非隔離實例只寫凍結的 WARNING（`contracts/daemon_logging.yaml`）、不終止。
+#[cfg(all(test, unix))]
 #[test]
 fn release_kill_hook_env_isolated_only() {
     // 隔離實例：commit 後被殺。
@@ -1559,6 +1572,7 @@ fn release_kill_hook_env_isolated_only() {
 
 /// #4／#68：產品 build 讀 `SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE=<dir>`；隔離實例在 commit 前寫 `<dir>/arrived`
 /// （`pid=<pid>\n`）並輪詢 `<dir>/go`，期間 state.json 不變；非隔離實例只寫 WARNING、不暫停。
+#[cfg(all(test, unix))]
 #[test]
 fn release_pause_hook_env_isolated_only() {
     let env = isolated_env_with_pty_target();
@@ -1616,6 +1630,7 @@ fn release_pause_hook_env_isolated_only() {
 
 /// #72（POSIX）：SIGTERM／SIGINT → 有序停機（RPC 停、drain、WAL close、socket 檔移除、exit 0），與 Python `daemon.py:293-301` 相同。
 /// Windows `SetConsoleCtrlHandler`（`windows_console_ctrl_triggers_orderly_stop`）為 LOCAL-WINDOWS-TODO。
+#[cfg(all(test, unix))]
 #[test]
 fn sigterm_sigint_orderly_stop() {
     for sig in ["-TERM", "-INT"] {

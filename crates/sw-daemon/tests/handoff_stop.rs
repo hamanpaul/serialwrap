@@ -1338,6 +1338,7 @@ impl Drop for HolderSampler {
 
 /// 舊 daemon 存活時繼任者實際競爭實例鎖並失敗；再由正式 setup update 交接並啟動繼任者。
 /// 交接鏈與舊 PID 取自產品輸出，持有者取樣驗證全程沒有雙重持有。
+#[cfg(all(test, unix))]
 #[test]
 fn handoff_then_successor_never_double_held() {
     let env = isolated_env_with_pty_target();
@@ -1540,6 +1541,7 @@ fn write_tty_line(path: &str, line: &str) {
 /// 的 Rust 承接）：交接成立後、窗口內以背景來源驅動 TX——DeviceWatcher（移除 by-id 連結一個輪詢週期後加回）與 console 行
 /// （對 session 的 vtty 寫一行）——DUT 自交接回覆起至 daemon 結束零新增 bytes；窗口內 `health.ping` 仍回應、daemon 未退出，
 /// 窗口結束後有序停止（exit 0）。
+#[cfg(all(test, unix))]
 #[test]
 fn handoff_drain_window_background_triggers_zero_tx() {
     let mut env = isolated_env_with_pty_target();

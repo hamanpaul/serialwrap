@@ -13,6 +13,7 @@ use std::time::Duration;
 use support::*;
 
 /// commit 後、回覆前被 kill：重啟後必須仍是 RELEASED、不自動 attach、不開 tty。
+#[cfg(all(test, unix))]
 #[test]
 fn kill_between_commit_and_reply_keeps_released_after_restart() {
     if std::env::var("S21_CHILD").as_deref() == Ok("1") {
@@ -49,6 +50,7 @@ fn kill_between_commit_and_reply_keeps_released_after_restart() {
 }
 
 /// commit 前被 kill：重啟後依最後有效的 state.json 恢復，該 session 不是 RELEASED，release 從未被確認。
+#[cfg(all(test, unix))]
 #[test]
 fn kill_before_commit_restores_previous_state() {
     if std::env::var("S21_CHILD").as_deref() == Ok("before") {

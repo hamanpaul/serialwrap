@@ -731,6 +731,7 @@ fn second_sigterm_changes_nothing() {
     assert_eq!(steps(&sink.lock().unwrap()), STEPS.to_vec(), "每一步恰一次");
 }
 
+#[cfg(all(test, unix))]
 #[test]
 fn second_sigterm_real_signal_exits_0() {
     // 真 daemon 行程連收兩次 SIGTERM：第二次只記 log，仍有序停止 exit 0、不報 shutdown incomplete。

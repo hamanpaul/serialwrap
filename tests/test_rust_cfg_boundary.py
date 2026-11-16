@@ -46,7 +46,6 @@ def test_repo_clean():
         ('#![cfg(target_family = "unix")]\n', "cfg-predicate"),
         ("#[cfg_attr(unix, allow(dead_code))]\nfn a() {}\n", "cfg-predicate"),
         ("fn a() { if cfg!(windows) {} }\n", "cfg-predicate"),
-        ("#[cfg(all(test, unix))]\nfn a() {}\n", "cfg-predicate"),
         ("#[cfg(debug_assertions)]\nfn a() {}\n", "cfg-predicate"),
         ('#[cfg(feature = "other")]\nfn a() {}\n', "cfg-predicate"),
         ("use std::os::unix::ffi::OsStrExt;\n", "os-module"),
@@ -110,6 +109,28 @@ def test_native_test_allowlist_does_not_allow_other_cfg(tmp_path):
     r = _run(tmp_path)
     assert r.returncode == 1
     assert ": cfg-predicate: #[cfg(windows)]" in r.stdout
+
+
+def test_od95_allows_posix_gate_only_in_integration_tests(tmp_path):
+    """OD-95：整合測試可用 POSIX 條件從 Windows 收集結果排除。"""
+    snippet = "#[cfg(all(test, unix))]\n#[test]\nfn posix_only_case() {}\n"
+    _crate(tmp_path, "sw-cli", "tests/posix_only.rs", snippet)
+    allowed = _run(tmp_path)
+    assert allowed.returncode == 0, allowed.stdout + allowed.stderr
+
+    _crate(tmp_path, "sw-cli", "src/posix_only.rs", snippet)
+    rejected = _run(tmp_path)
+    assert rejected.returncode == 1
+    assert "crates/sw-cli/src/posix_only.rs:" in rejected.stdout
+    assert "crates/sw-cli/tests/posix_only.rs:" not in rejected.stdout
+
+
+def test_od95_does_not_allow_other_test_platform_gates(tmp_path):
+    """OD-95：邊界檢查仍拒絕其他測試平台條件。"""
+    _crate(tmp_path, "sw-cli", "tests/windows_only.rs", "#[cfg(all(test, windows))]\nfn windows_only() {}\n")
+    r = _run(tmp_path)
+    assert r.returncode == 1
+    assert "crates/sw-cli/tests/windows_only.rs:" in r.stdout
 
 
 def test_pal_exempt(tmp_path):
