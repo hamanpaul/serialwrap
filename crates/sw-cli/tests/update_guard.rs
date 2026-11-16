@@ -100,7 +100,8 @@ fn isolated_absent_base(entry: Entry) -> (TestEnv, String, String) {
 fn scoped_absent_base(entry: Entry) -> (TestEnv, String, String) {
     let (t, socket, endpoint) = isolated_absent_base(entry);
     (
-        t.with_var("SERIALWRAP_TEST_UPDATE_SOCKET", &endpoint),
+        // selector 接受裸 Unix 路徑；避免 Windows 暫存目錄的磁碟代號被誤解析為 unix:// netloc。
+        t.with_var("SERIALWRAP_TEST_UPDATE_SOCKET", &socket),
         socket,
         endpoint,
     )
