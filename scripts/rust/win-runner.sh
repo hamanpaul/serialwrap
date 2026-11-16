@@ -117,6 +117,10 @@ if [[ "$list_only" == "0" ]]; then
 fi
 
 extra_files_raw="${SW_WIN_EXTRA_FILES:-}"
+if [[ "$list_only" == "0" && "$exe_name" == lock-* && -n "${SW_WIN_SIGNAL_FILES:-}" ]]; then
+  # signal_wait_harness 只供 sw-pal lock 測試的獨立子行程使用，避免複製到每個 Windows target。
+  extra_files_raw="${extra_files_raw:+$extra_files_raw:}$SW_WIN_SIGNAL_FILES"
+fi
 if [[ "$list_only" == "0" && "$exe_name" == handoff_stop-* && -n "${SW_WIN_HANDOFF_FILES:-}" ]]; then
   extra_files_raw="${extra_files_raw:+$extra_files_raw:}$SW_WIN_HANDOFF_FILES"
 fi
