@@ -525,6 +525,36 @@ def load_results(run_dir: Path) -> list[dict[str, Any]]:
     return results
 
 
+def merge_result_layers(run_dir: Path, source_dirs: Sequence[Path]) -> None:
+    """把獨立匯入層的逐案結果合併到 run；同 label 沿用 Cargo／pytest 的身分與列合併規則。"""
+    run_dir = Path(run_dir).resolve()
+    run_dir.mkdir(parents=True, exist_ok=True)
+    from import_cargo_results import _merge_existing
+
+    for raw_source in source_dirs:
+        source_dir = Path(raw_source).resolve()
+        if source_dir == run_dir or not source_dir.is_dir():
+            raise ValueError(f"coverage 匯入層須為與 run 不同的既存目錄：{source_dir}")
+        documents = load_results(source_dir)
+        if not documents:
+            raise ValueError(f"coverage 匯入層沒有 results-*.json：{source_dir}")
+        for document in documents:
+            source_path = document.pop("_source_path", "")
+            if document.get("_load_error"):
+                raise ValueError(f"coverage 結果無法讀取：{source_path}：{document['_load_error']}")
+            label = document.get("label")
+            if not isinstance(label, str) or not label or Path(source_path).name != f"results-{label}.json":
+                raise ValueError(f"coverage 結果 label／檔名不符：{source_path}")
+            destination = run_dir / Path(source_path).name
+            merged = _merge_existing(destination, document)
+            temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+            temporary.write_text(
+                json.dumps(merged, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, destination)
+
+
 def _resolve_path(value: object, run_dir: Path) -> Path | None:
     if not isinstance(value, str) or not value:
         return None
@@ -2003,6 +2033,8 @@ def _parse_pairs(values: Sequence[str], *, comma_values: bool = False) -> dict[s
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True, help="單一輪次的結果檔目錄")
+    parser.add_argument("--merge-results-from", type=Path, action="append", default=[],
+                        help="先把獨立 coverage 層的 results-*.json 合併至 run（可重複）")
     parser.add_argument("--contracts-dir", type=Path, default=ROOT / "contracts")
     parser.add_argument("--cases", type=Path, default=DEFAULT_CASES)
     parser.add_argument("--cases-lock", type=Path, default=DEFAULT_CASES_LOCK)
@@ -2059,6 +2091,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0 if record["accepted"] else 1
 
     try:
+        if args.merge_results_from:
+            merge_result_layers(args.run_dir, args.merge_results_from)
         all_ids = universe(args.contracts_dir, args.cases, args.cases_lock, args.map_file)
         selected = set(args.only) if args.only else set(all_ids)
         unknown = selected - set(all_ids)

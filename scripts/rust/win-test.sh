@@ -57,6 +57,23 @@ else
   unset CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER || true
 fi
 
+if [[ "$DRY_RUN" == "1" ]]; then
+  printf 'L1 set: %s\n' "$L1_SET"
+  if [[ "$is_wsl" == "1" ]]; then
+    printf 'CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=%s\n' "$CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER"
+    printf 'CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=%s\n' "$CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER"
+  else
+    echo "Windows native host：不注入 Cargo runner/linker。"
+  fi
+  printf 'cargo test --no-run --message-format=json --target x86_64-pc-windows-gnu'
+  dry_run_args=("${PACKAGES[@]}" "${CARGO_ARGS[@]}")
+  if ((${#dry_run_args[@]} > 0)); then
+    printf ' %q' "${dry_run_args[@]}"
+  fi
+  printf '\n'
+  exit 0
+fi
+
 if [[ "$is_wsl" == "1" && " ${PACKAGES[*]} " == *" sw-daemon "* ]]; then
   daemon_exe="$ROOT/target/x86_64-pc-windows-gnu/debug/serialwrapd.exe"
   if [[ -n "${SW_WIN_EXTRA_FILES:-}" ]]; then
@@ -118,23 +135,6 @@ for cap in "${CAPS[@]}"; do
 done
 collector_args+=("${PACKAGES[@]}")
 collector_args+=("${CARGO_ARGS[@]}")
-
-if [[ "$DRY_RUN" == "1" ]]; then
-  printf 'L1 set: %s\n' "$L1_SET"
-  if [[ "$is_wsl" == "1" ]]; then
-    printf 'CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=%s\n' "$CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER"
-    printf 'CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=%s\n' "$CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER"
-  else
-    echo "Windows native host：不注入 Cargo runner/linker。"
-  fi
-  printf 'cargo test --no-run --message-format=json --target x86_64-pc-windows-gnu'
-  dry_run_args=("${PACKAGES[@]}" "${CARGO_ARGS[@]}")
-  if ((${#dry_run_args[@]} > 0)); then
-    printf ' %q' "${dry_run_args[@]}"
-  fi
-  printf '\n'
-  exit 0
-fi
 
 cd "$ROOT"
 python3 "$ROOT/scripts/rust/check_cfg_boundary.py"

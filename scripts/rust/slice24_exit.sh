@@ -145,6 +145,8 @@ fi
 
 LAST_RC=0
 FAILURES=0
+PYTHON_BASELINE_COVERAGE=""
+RUST_BLACKBOX_COVERAGE=""
 
 run_logged() {
   local name="$1"
@@ -330,7 +332,10 @@ if [[ -n "$SHARED_EVIDENCE" ]]; then
       "${SHARED_ARTIFACT_ARGS[@]}" \
       --out-dir "$RUN_DIR/shared-import" >"$RUN_DIR/logs/shared-python-baseline.json" \
       2>"$RUN_DIR/logs/shared-python-baseline.stderr"; then
-    tar -xzf "$RUN_DIR/shared-import/slice24/python-baseline-coverage.tar.gz" -C "$RUN_DIR"
+    PYTHON_BASELINE_COVERAGE="$RUN_DIR/shared-import/python-baseline-coverage"
+    mkdir -p "$PYTHON_BASELINE_COVERAGE"
+    tar -xzf "$RUN_DIR/shared-import/slice24/python-baseline-coverage.tar.gz" \
+      -C "$PYTHON_BASELINE_COVERAGE" --strip-components=1
     cp "$RUN_DIR/shared-import/logs/pytest-full.log" "$RUN_DIR/logs/python-baseline.log"
     LAST_RC="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["exit_code"])' "$RUN_DIR/logs/shared-python-baseline.json")"
     printf 'python-baseline\t%s\n' "$LAST_RC" >>"$DRIVER_TSV"
@@ -369,7 +374,10 @@ if [[ -f "$RUST_CLI" && -f "$RUST_DAEMON" ]]; then
         "${SHARED_ARTIFACT_ARGS[@]}" \
         --out-dir "$RUN_DIR/shared-import" >"$RUN_DIR/logs/shared-rust-blackbox.json" \
         2>"$RUN_DIR/logs/shared-rust-blackbox.stderr"; then
-      tar -xzf "$RUN_DIR/shared-import/slice24/coverage.tar.gz" -C "$RUN_DIR"
+      RUST_BLACKBOX_COVERAGE="$RUN_DIR/shared-import/rust-blackbox-coverage"
+      mkdir -p "$RUST_BLACKBOX_COVERAGE"
+      tar -xzf "$RUN_DIR/shared-import/slice24/coverage.tar.gz" \
+        -C "$RUST_BLACKBOX_COVERAGE" --strip-components=1
       cp "$RUN_DIR/shared-import/slice24/s24-ab/junit.xml" "$RUN_DIR/rust-blackbox.junit.xml"
       cp "$RUN_DIR/shared-import/logs/s24-ab.log" "$RUN_DIR/logs/rust-blackbox.log"
       LAST_RC="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["exit_code"])' "$RUN_DIR/logs/shared-rust-blackbox.json")"
@@ -523,6 +531,12 @@ CONTRACT_COVERAGE_ARGS=(
   --json "$JSON_REPORT" \
   --report "$MD_REPORT"
 )
+if [[ -n "$PYTHON_BASELINE_COVERAGE" ]]; then
+  CONTRACT_COVERAGE_ARGS+=(--merge-results-from "$PYTHON_BASELINE_COVERAGE")
+fi
+if [[ -n "$RUST_BLACKBOX_COVERAGE" ]]; then
+  CONTRACT_COVERAGE_ARGS+=(--merge-results-from "$RUST_BLACKBOX_COVERAGE")
+fi
 CONTRACT_COVERAGE_ARGS+=("${PRIOR_CASE_ARGS[@]}")
 run_logged contract-coverage python3 scripts/rust/contract_coverage.py "${CONTRACT_COVERAGE_ARGS[@]}"
 CONTRACT_COVERAGE_RC="$LAST_RC"

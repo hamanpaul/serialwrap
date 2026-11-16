@@ -32,7 +32,10 @@ pub mod windows;
 pub fn map_file_error(error: std::io::Error) -> PalError {
     #[cfg(unix)]
     {
-        crate::traits::posix_io_error(error)
+        match error.raw_os_error() {
+            Some(code) => crate::traits::posix_errno(code),
+            None => PalError::plain(PalErrorKind::Io, error.to_string()),
+        }
     }
     #[cfg(windows)]
     {

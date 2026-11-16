@@ -268,8 +268,14 @@ def windows_provenance_problems(report: Any, candidate_head: str) -> list[str]:
     return problems
 
 
-def judge_sections(results_dir: pathlib.Path, lock: dict[str, Any], judge) -> tuple[list[dict], dict[str, list[dict]]]:
+def judge_sections(
+    results_dir: pathlib.Path,
+    lock: dict[str, Any],
+    judge,
+    rejected_shared_evidence: set[tuple[str, str]] | None = None,
+) -> tuple[list[dict], dict[str, list[dict]]]:
     sections: list[dict] = []
+    rejected_shared_evidence = rejected_shared_evidence or set()
     rows_by_nodeid: dict[str, list[dict]] = {}
     sets = lock.get("sets", {})
     candidate_head = git_revision()
@@ -288,6 +294,10 @@ def judge_sections(results_dir: pathlib.Path, lock: dict[str, Any], judge) -> tu
             caps = derive_caps(spec.get("selector"))
             entry = {"set_id": set_id, "platform": platform, "caps": caps,
                      "collect_argv": collect_argv(set_id, platform, spec, results_dir)}
+            if (set_id, platform) in rejected_shared_evidence:
+                sections.append({**entry, "verdict": "EVIDENCE_MISSING",
+                                 "reasons": ["共用證據遭拒；不得回退採用既有 L1 報告"]})
+                continue
             path = results_dir / section / platform / "resource-report.json"
             report: dict[str, Any] | None = None
             if path.is_file():
@@ -649,6 +659,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--built-daemon-sha256", default=None,
                     help="release 建置成功當下記錄的 serialwrapd SHA-256")
     ap.add_argument("--dry-run", action="store_true", help="在輸出標記 dry_run；不改變既有判定")
+    ap.add_argument("--evidence-missing", action="append", default=[], metavar="SET_ID/PLATFORM",
+                    help="明確標記遭拒的共用證據；該集合不讀取舊 L1 報告")
     ap.add_argument("--out", type=pathlib.Path)
     ap.add_argument("--plan", action="store_true", help="只依 L1 鎖印出 cargo 集合的前置收集命令（OD-53 推導 --caps）")
     args = ap.parse_args(argv)
@@ -666,7 +678,13 @@ def main(argv: list[str] | None = None) -> int:
     l15_reasons.extend(validate_l15_identity(
         l15, args.daemon_path, args.build_linux_exit, args.built_daemon_sha256
     ))
-    sections, rows = judge_sections(args.l1_results, lock, _load_judge())
+    rejected_shared_evidence: set[tuple[str, str]] = set()
+    for value in args.evidence_missing:
+        set_id, separator, platform = value.rpartition("/")
+        if not separator or set_id not in REQUIRED_SECTIONS or platform not in REQUIRED_SECTIONS[set_id]:
+            ap.error(f"無效的 --evidence-missing 值：{value!r}")
+        rejected_shared_evidence.add((set_id, platform))
+    sections, rows = judge_sections(args.l1_results, lock, _load_judge(), rejected_shared_evidence)
     cases = judge_cases(emap, rows, l15)
     coverage = map_coverage(emap, cases_lock)
     parity = judge_parity(p6_parity_numbers(args.parity_doc.read_text(encoding="utf-8")), emap, rows, l15)

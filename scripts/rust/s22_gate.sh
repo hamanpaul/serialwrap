@@ -15,6 +15,15 @@ BUILD_EXIT=""
 BUILT_DAEMON_SHA256=""
 DRY_RUN=0
 SHARED_EVIDENCE=""
+SHARED_REJECTED_EVIDENCE=()
+
+mark_shared_rejected() {
+  local rejected="$1/$2" current
+  for current in "${SHARED_REJECTED_EVIDENCE[@]}"; do
+    [[ "$current" == "$rejected" ]] && return 0
+  done
+  SHARED_REJECTED_EVIDENCE+=("$rejected")
+}
 
 while (($#)); do
   case "$1" in
@@ -79,6 +88,10 @@ if [[ "$DRY_RUN" != "1" && -n "$SHARED_EVIDENCE" ]]; then
       --artifact "debug_daemon=$SHARED_ARTIFACT_DIR/debug_daemon" \
       --artifact "release_cli=$SHARED_ARTIFACT_DIR/release_cli" \
       --artifact "release_daemon=$DAEMON_PATH")
+  else
+    mark_shared_rejected s22_gate:cargo_workspace linux
+    mark_shared_rejected s22_gate:windows_cap_windows_com windows
+    mark_shared_rejected s22_gate:windows_cap_windows_com_daemon windows
   fi
 fi
 if [[ "$DRY_RUN" != "1" && -n "$SHARED_EVIDENCE" ]]; then
@@ -93,6 +106,7 @@ if [[ "$DRY_RUN" != "1" && -n "$SHARED_EVIDENCE" ]]; then
       "$L1_DIR/cargo_workspace/linux/resource-report.json"
     cp "$IMPORT_DIR/logs/cargo-fakes-filtered.log" "$RUN_DIR/logs/shared-cargo-workspace.log"
   else
+    mark_shared_rejected s22_gate:cargo_workspace linux
     echo "EVIDENCE_MISSING：共用 cargo 證據拒收；本段不重跑。" >"$RUN_DIR/logs/shared-cargo-workspace.log"
     cat "$RUN_DIR/logs/shared-cargo-import.stderr" >>"$RUN_DIR/logs/shared-cargo-workspace.log" || true
   fi
@@ -113,17 +127,23 @@ if [[ "$DRY_RUN" != "1" && -n "$SHARED_EVIDENCE" && "$SHARED_ARTIFACTS_VALID" ==
       printf '已匯入 shared-evidence windows_l1:%s；未啟動 Windows runner.\n' "$set_id" \
         >"$RUN_DIR/logs/import-$section.log"
     else
+      mark_shared_rejected "$set_id" windows
       printf 'EVIDENCE_MISSING：共用 Windows L1 拒收；本段不重跑。\n' >"$RUN_DIR/logs/import-$section.log"
       cat "$RUN_DIR/logs/shared-$section-import.stderr" >>"$RUN_DIR/logs/import-$section.log" || true
     fi
   done
+elif [[ "$DRY_RUN" != "1" && -n "$SHARED_EVIDENCE" ]]; then
+  mark_shared_rejected s22_gate:windows_cap_windows_com windows
+  mark_shared_rejected s22_gate:windows_cap_windows_com_daemon windows
 fi
 
 set +e
 SHARED_EVIDENCE_FLAG=0
 [[ -n "$SHARED_EVIDENCE" ]] && SHARED_EVIDENCE_FLAG=1
+REJECTED_SHARED_EVIDENCE_ARG="$(IFS=,; printf '%s' "${SHARED_REJECTED_EVIDENCE[*]}")"
 python3 - "$ROOT" "$RUN_DIR" "$L1_DIR" "$WINDOWS_DIR" "$SELFTEST_REPORT" "$DAEMON_PATH" \
-  "$BUILD_EXIT" "$BUILT_DAEMON_SHA256" "$DRY_RUN" "$SHARED_EVIDENCE_FLAG" <<'PY'
+  "$BUILD_EXIT" "$BUILT_DAEMON_SHA256" "$DRY_RUN" "$SHARED_EVIDENCE_FLAG" \
+  "$REJECTED_SHARED_EVIDENCE_ARG" <<'PY'
 from __future__ import annotations
 
 import hashlib
@@ -149,6 +169,7 @@ build_exit = int(sys.argv[7]) if sys.argv[7] else None
 built_sha = sys.argv[8] or None
 dry_run = sys.argv[9] == "1"
 shared_evidence = sys.argv[10] == "1"
+rejected_shared_evidence = [value for value in sys.argv[11].split(",") if value]
 if daemon_path is not None and not daemon_path.is_relative_to(root):
     print(f"EVIDENCE_MISSING: 候選 daemon 必須位於此 worktree：{daemon_path}", file=sys.stderr)
     daemon_path = None
@@ -292,6 +313,8 @@ if build_exit is not None:
     argv.extend(["--build-linux-exit", str(build_exit)])
 if built_sha:
     argv.extend(["--built-daemon-sha256", built_sha])
+for evidence in rejected_shared_evidence:
+    argv.extend(["--evidence-missing", evidence])
 if dry_run:
     argv.append("--dry-run")
 checker_rc = run_logged("s22-gate-check", argv, os.environ.copy())
