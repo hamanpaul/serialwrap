@@ -174,13 +174,13 @@ def test_win_test_dry_run_has_no_build_or_filesystem_side_effects(tmp_path):
         "CARGO_TARGET_DIR": str(tmp_path / "target-must-not-exist"),
     }
     out = subprocess.run(
-        ["bash", str(WIN_TEST), "--dry-run"], cwd=ROOT, env=env,
+        ["bash", str(WIN_TEST), "--package", "sw-daemon", "--dry-run"], cwd=ROOT, env=env,
         capture_output=True, text=True, check=False,
     )
     assert out.returncode == 0, out.stdout + out.stderr
     assert not trace.exists(), trace.read_text(encoding="utf-8") if trace.exists() else ""
     assert not (tmp_path / "target-must-not-exist").exists()
-    assert "dry-run" in out.stdout.lower()
+    assert "cargo test --no-run" in out.stdout
 
 
 def test_blackbox_pytest_argv_matches_frozen_l1_selectors():

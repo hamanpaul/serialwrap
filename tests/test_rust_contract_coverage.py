@@ -1174,8 +1174,8 @@ def test_shared_coverage_package_import_merges_same_label_before_contract_judgem
         "--only", contract_id, "--platforms", f"{contract_id}=linux",
         "--json", str(judgement_path),
     )
-    verdict = json.loads(judgement_path.read_text(encoding="utf-8"))
     assert judged.returncode == 0, judged.stdout + judged.stderr
+    verdict = json.loads(judgement_path.read_text(encoding="utf-8"))
     merged_rust = json.loads((run / "results-rust-linux.json").read_text(encoding="utf-8"))
     assert set(cargo_nodeids + pytest_nodeids) <= set(merged_rust["collected"]), merged_rust["collected"]
     assert len(merged_rust["collected"]) == len(set(merged_rust["collected"]))
