@@ -22,6 +22,7 @@ OUT_ROOT="$(realpath -m -- "$OUT_ROOT")"
 RUN_DIR="$OUT_ROOT/$RUN_ID"
 if [[ "$DRY_RUN" == "1" ]]; then
   echo "gate_shared.sh dry-run：候選 artifact 與共用證據目錄 $RUN_DIR"
+  echo "執行：source scripts/rust/gate_prereqs.sh --gate；失敗記錄到 <LOG_DIR>/driver.tsv 並停止。"
   echo "執行：cargo build --workspace --bins；cargo build --workspace --bins --release --target x86_64-unknown-linux-gnu。"
   echo "執行：env SW_RESOURCE_REPORT=<L1> SERIALWRAP_COVERAGE_RUN_DIR=<COVERAGE> SERIALWRAP_COVERAGE_LABEL=python-linux python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence --junitxml=<JUNIT>。"
   echo "執行：cargo test --workspace；python3 scripts/rust/cargo_l1_results.py --platform linux --out <L1> -- --workspace --features test-fakes -- --skip cap_。"
@@ -52,6 +53,16 @@ PY
 
 LOG_DIR="$ROOT/target/s2-par/gpz/gate-shared/$RUN_ID"
 mkdir -p "$LOG_DIR"
+if source "$ROOT/scripts/rust/gate_prereqs.sh" --gate >"$LOG_DIR/gate-prereqs.log" 2>&1; then
+  PREREQS_RC=0
+else
+  PREREQS_RC=$?
+fi
+printf 'gate_prereqs\t%s\n' "$PREREQS_RC" >"$LOG_DIR/driver.tsv"
+if [[ "$PREREQS_RC" -ne 0 ]]; then
+  echo "gate_shared.sh: gate_prereqs exit=$PREREQS_RC（$LOG_DIR/gate-prereqs.log）" >&2
+  exit "$PREREQS_RC"
+fi
 FAILURES=0
 LAST_RC=0
 run_capture() {

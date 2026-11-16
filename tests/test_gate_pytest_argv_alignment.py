@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shlex
 from pathlib import Path
 
@@ -48,8 +49,22 @@ def test_three_stage2_gates_and_preflight_match_ci_deselects():
             assert f"--deselect {nodeid}" in source, f"{relative} 未排除 {nodeid}"
 
     s21_record = next(
-        line for line in sources["scripts/rust/slice21_gate.sh"].splitlines()
-        if line.startswith("record pytest_full ")
+        line.strip() for line in sources["scripts/rust/slice21_gate.sh"].splitlines()
+        if line.strip().startswith("record pytest_full ") and "--command" in line
     )
     for nodeid in DESELECT:
         assert f"--deselect {nodeid}" in s21_record, "s21 記錄列命令與實際 argv 不一致"
+
+    shared_source = (ROOT / "scripts/rust/gate_shared.sh").read_text(encoding="utf-8")
+    assert ('for item in lock["sets"]["s21_gate:pytest_full"]["linux"]["selector"]["argv"]:'
+            in shared_source)
+    shared_pytest = next(
+        line.strip() for line in shared_source.splitlines()
+        if 'python3 -m pytest "${PYTEST_ARGV[@]}"' in line
+    )
+    assert '--junitxml="$PYTEST_DATA/junit.xml"' in shared_pytest
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    shared_argv = lock["sets"]["s21_gate:pytest_full"]["linux"]["selector"]["argv"]
+    p7_argv = lock["sets"]["p7_gate:python3-m-pytest-q-tests"]["linux"]["selector"]["argv"]
+    assert shared_argv == p7_argv
+    assert _deselected(shared_argv) == DESELECT

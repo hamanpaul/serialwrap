@@ -4,7 +4,9 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import pathlib
+import shutil
 import subprocess
 import sys
 
@@ -385,8 +387,63 @@ def test_shared_driver_dry_run_lists_commands_without_running_them(tmp_path):
         check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "source scripts/rust/gate_prereqs.sh --gate" in proc.stdout
     assert "cargo test --workspace" in proc.stdout
     assert "run_p7_ab.sh" in proc.stdout
     assert "--od59-contract" in proc.stdout
     assert "pytest -q tests/" in proc.stdout
     assert str(ROOT / out_dir / "dry-run") in proc.stdout
+
+
+def test_shared_driver_stops_and_records_gate_prereq_failure_before_cargo(tmp_path):
+    fixture = tmp_path / "repo"
+    scripts = fixture / "scripts/rust"
+    scripts.mkdir(parents=True)
+    driver = scripts / "gate_shared.sh"
+    shutil.copy2(ROOT / "scripts/rust/gate_shared.sh", driver)
+    shutil.copy2(ROOT / "scripts/rust/gate_shared_evidence.py", scripts / "gate_shared_evidence.py")
+    (fixture / ".gitignore").write_text("target/\n__pycache__/\n", encoding="utf-8")
+    (scripts / "gate_prereqs.sh").write_text(
+        "printf 'stub gate prerequisite failure\\n'\nreturn 37\n", encoding="utf-8"
+    )
+
+    subprocess.run(["git", "init", "--quiet", str(fixture)], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(fixture), "add", "."], check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-C", str(fixture), "-c", "user.name=Gate Test", "-c", "user.email=gate-test@example.invalid",
+         "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "fixture"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    cargo_log = tmp_path / "cargo.log"
+    cargo = fake_bin / "cargo"
+    cargo.write_text(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$CARGO_CALL_LOG\"\nexit 86\n", encoding="utf-8"
+    )
+    cargo.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["CARGO_CALL_LOG"] = str(cargo_log)
+    env["CARGO_TARGET_DIR"] = str(fixture / "target")
+    env["CARGO_INCREMENTAL"] = "0"
+
+    proc = subprocess.run(
+        ["bash", str(driver), "--out", str(tmp_path / "shared-evidence"), "--run-id", "prereq-fail"],
+        cwd=fixture,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+    log_dir = fixture / "target/s2-par/gpz/gate-shared/prereq-fail"
+    assert proc.returncode == 37, proc.stdout + proc.stderr
+    assert (log_dir / "gate-prereqs.log").read_text(encoding="utf-8") == "stub gate prerequisite failure\n"
+    assert (log_dir / "driver.tsv").read_text(encoding="utf-8") == "gate_prereqs\t37\n"
+    assert not cargo_log.exists(), "前置失敗後不得啟動 build 或 cargo L1"
+    assert not (log_dir / "cargo-fakes-filtered.log").exists()

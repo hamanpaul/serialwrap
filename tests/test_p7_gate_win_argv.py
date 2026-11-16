@@ -49,12 +49,12 @@ def test_gate_snapshots_artifacts_before_cargo_rebuilds(tmp_path):
     目錄，黑箱與 verify 皆引用快照（第 12 輪實跑：引用 target/debug 使 verify 的 artifact sha256 不符）。"""
     text = (ROOT / "scripts/rust/p7_gate.sh").read_text(encoding="utf-8")
     assert 'RUST_D="$RUN/artifacts/serialwrapd"' in text and 'RUST_CLI="$RUN/artifacts/serialwrap"' in text
-    build = text.index("cargo build --workspace --bins")
+    build = text.index('CARGO_TARGET_DIR="$TARGET_DIR" CARGO_INCREMENTAL=0 cargo build --workspace --bins >')
     assert 'TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"' in text
-    assert 'CARGO_TARGET_DIR="$TARGET_DIR" cargo build --workspace --bins' in text
-    assert 'CARGO_TARGET_DIR="$TARGET_DIR" cargo build --release -p sw-daemon -p sw-cli' in text
+    assert 'CARGO_TARGET_DIR="$TARGET_DIR" CARGO_INCREMENTAL=0 cargo build --workspace --bins' in text
+    assert 'CARGO_TARGET_DIR="$TARGET_DIR" CARGO_INCREMENTAL=0 cargo build --release -p sw-daemon -p sw-cli' in text
     snap = text.index('cp -p "$TARGET_DIR/debug/serialwrapd" "$RUST_D"')
-    release = text.index("cargo build --release -p sw-daemon -p sw-cli --target x86_64-unknown-linux-gnu")
+    release = text.index('CARGO_TARGET_DIR="$TARGET_DIR" CARGO_INCREMENTAL=0 cargo build --release -p sw-daemon -p sw-cli')
     release_snap = text.index('cp -p "$TARGET_DIR/x86_64-unknown-linux-gnu/release/serialwrapd" "$PRIOR_RELEASE_D"')
     l1 = text.index('run_row "cargo test --workspace"')
     assert build < snap < release < release_snap < l1
