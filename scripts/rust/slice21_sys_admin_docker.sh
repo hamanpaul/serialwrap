@@ -119,6 +119,23 @@ cp -a /host-cargo-registry "$CARGO_HOME/registry"
 
 WORK=/tmp/sw-sys-admin-evidence
 mkdir -p "$WORK"
+if ! ACTUAL_HEAD="$(git -C "$SW_SYS_ADMIN_ROOT" rev-parse --verify HEAD 2>&1)"; then
+  printf 'container Git HEAD 無法解析：\n%s\n' "$ACTUAL_HEAD" >&2
+  exit 91
+fi
+if [[ "$ACTUAL_HEAD" != "$SW_SYS_ADMIN_HEAD" ]]; then
+  printf 'container Git HEAD 不符：actual=%s expected=%s\n' "$ACTUAL_HEAD" "$SW_SYS_ADMIN_HEAD" >&2
+  exit 92
+fi
+if ! GIT_STATUS="$(git -C "$SW_SYS_ADMIN_ROOT" status --porcelain --untracked-files=normal -- . ':(exclude)target' 2>&1)"; then
+  printf 'container Git 工作樹狀態無法解析：\n%s\n' "$GIT_STATUS" >&2
+  exit 93
+fi
+if [[ -n "$GIT_STATUS" ]]; then
+  printf 'container Git 工作樹不乾淨：\n%s\n' "$GIT_STATUS" >&2
+  exit 94
+fi
+printf 'git-provenance: head=%s clean=true\n' "$ACTUAL_HEAD" >"$WORK/container.log"
 python3 - "$WORK/probe.json" <<'PY'
 import json, os, pathlib, re, sys
 text = pathlib.Path("/proc/self/status").read_text(encoding="ascii")
@@ -136,7 +153,7 @@ probe = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 raise SystemExit(0 if probe["euid"] == 0 and int(probe["cap_eff"], 16) & (1 << 21) else 1)
 PY
 then
-  printf 'probe: ' >"$WORK/container.log"
+  printf 'probe: ' >>"$WORK/container.log"
   python3 - "$WORK/probe.json" >>"$WORK/container.log" <<'PY'
 import json, pathlib, sys
 p = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
@@ -150,7 +167,7 @@ PY
   RUN_RC=$?
   set -e
 else
-  printf 'sys_admin probe unavailable: ' >"$WORK/container.log"
+  printf 'sys_admin probe unavailable: ' >>"$WORK/container.log"
   python3 - "$WORK/probe.json" >>"$WORK/container.log" <<'PY'
 import json, pathlib, sys
 p = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))

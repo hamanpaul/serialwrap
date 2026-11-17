@@ -317,3 +317,18 @@ def test_sys_admin_docker_driver_mounts_linked_worktree_git_metadata_readonly():
     assert '--env "GIT_COMMON_DIR=$GIT_COMMON_DIR_HOST"' in text
     assert '--env "GIT_WORK_TREE=$ROOT"' in text
     assert '--env "GIT_OPTIONAL_LOCKS=0"' in text
+
+
+def test_sys_admin_docker_driver_rejects_missing_or_mismatched_container_git_provenance():
+    """執行 CAP_SYS_ADMIN 測試前，容器要證明 Git HEAD 與工作樹均符合候選版。"""
+    text = (ROOT / "scripts/rust/slice21_sys_admin_docker.sh").read_text(encoding="utf-8")
+    container = text.split("CONTAINER_SCRIPT=$(cat <<'CONTAINER'", 1)[1].split("\nCONTAINER\n)", 1)[0]
+    assert 'if ! ACTUAL_HEAD="$(git -C "$SW_SYS_ADMIN_ROOT" rev-parse --verify HEAD' in container
+    assert 'if [[ "$ACTUAL_HEAD" != "$SW_SYS_ADMIN_HEAD" ]]; then' in container
+    assert 'exit 92' in container
+    assert 'if ! GIT_STATUS="$(git -C "$SW_SYS_ADMIN_ROOT" status --porcelain --untracked-files=normal' in container
+    assert ":(exclude)target" in container
+    assert 'if [[ -n "$GIT_STATUS" ]]; then' in container
+    assert 'exit 94' in container
+    assert container.index("rev-parse --verify HEAD") < container.index("cargo_l1_results.py")
+    assert container.index("status --porcelain") < container.index("cargo_l1_results.py")
