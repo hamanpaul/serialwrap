@@ -1292,3 +1292,32 @@ def test_windows_section_import_records_provenance_rejection(case, problem):
     expect["base_dir"] = run
     judged = j.judge({"git_revision": "e" * 40, "sections": [sec]}, expect)
     assert _sec(judged, name)["status"] == ("PASS" if problem is None else "EVIDENCE_MISSING")
+
+
+def test_slice21_and_s22_autogenerate_qualified_bridge_selftest_report(tmp_path):
+    """slice21-07、s22-05：未明示報告時須先試共用合格報告，再自測並預檢資格。"""
+    drivers = [ROOT / "scripts/rust/slice21_gate.sh", ROOT / "scripts/rust/s22_gate.sh"]
+    for path in drivers:
+        text = path.read_text(encoding="utf-8")
+        assert "uart_stdio_bridge selftest --endpoint posix-pty" in text, path
+        if path.name == "s22_gate.sh":
+            assert 'sys.executable, "-m", "uart_stdio_bridge", "selftest", "--endpoint", "posix-pty"' in text
+        assert "work/p7-ab/bridge-selftest/selftest-report.json" in text, path
+        assert "evaluate_bridge_eligibility" in text, path
+    s21 = drivers[0].read_text(encoding="utf-8")
+    assert "--bridge-selftest-report" in s21
+    s21_judge = (ROOT / "scripts/rust/slice21_gate_judge.py").read_text(encoding="utf-8")
+    s21_schema = (ROOT / "tests/acceptance/slice21_gate_report.schema.json").read_text(encoding="utf-8")
+    assert "bridge_selftest_report" in s21_judge and "bridge_selftest_report" in s21_schema
+    report_path = "/shared/work/p7-ab/bridge-selftest/selftest-report.json"
+    run_dir = tmp_path / "s21-report-path-test"
+    assert _judge_mod().main([
+        "record-section", "--run-dir", str(run_dir), "--name", "l15_ab",
+        "--bridge-selftest-report", report_path,
+    ]) == 0
+    section = json.loads((run_dir / "sections/l15_ab.json").read_text(encoding="utf-8"))
+    assert section["bridge_selftest_report"] == report_path
+    s22_driver = drivers[1].read_text(encoding="utf-8")
+    s22_judge = (ROOT / "scripts/rust/s22_gate_check.py").read_text(encoding="utf-8")
+    assert "--bridge-selftest-report" in s22_driver
+    assert '"bridge_selftest_report"' in s22_judge
