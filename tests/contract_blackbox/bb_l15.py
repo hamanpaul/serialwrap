@@ -103,9 +103,8 @@ def update_bundles() -> tuple[Path, Path]:
         _bundle_pair = bundles
         return _bundle_pair
 
-    temp_root = ROOT / "target" / "g5-tmp"
-    temp_root.mkdir(parents=True, exist_ok=True)
-    _bundle_work = tempfile.TemporaryDirectory(prefix="serialwrap-g5-bundles-", dir=temp_root)
+    # 暫存 bundle 根須與 worktree 無關；避免長 worktree 路徑污染 daemon 的 AF_UNIX endpoint 長度。
+    _bundle_work = tempfile.TemporaryDirectory(prefix="sw-g5-bundles-", dir="/tmp")
     root = Path(_bundle_work.name)
     cargo_target = root / "cargo-target"
     script = ROOT / "scripts" / "rust" / "mkbundle.sh"

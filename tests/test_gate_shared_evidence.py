@@ -596,6 +596,58 @@ def test_shared_artifact_init_and_import_preserve_executable_names(tmp_path, mon
     assert tampered["reasons"]
 
 
+def test_g5_bundle_tempdir_uses_short_system_path(tmp_path, monkeypatch):
+    """長 worktree 下的 G5 bundle 暫存根也不得沿用 ROOT/target/g5-tmp。"""
+    import importlib.util
+    import tempfile
+    from types import SimpleNamespace
+
+    module_path = ROOT / "tests/contract_blackbox/bb_l15.py"
+    monkeypatch.syspath_prepend(str(module_path.parent))
+    spec = importlib.util.spec_from_file_location("bb_l15_short_tmp_test", module_path)
+    assert spec is not None and spec.loader is not None
+    bb_l15 = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, bb_l15)
+    spec.loader.exec_module(bb_l15)
+
+    long_worktree = tmp_path / ("worktree-" + "x" * 120)
+    long_worktree.mkdir()
+    monkeypatch.setattr(bb_l15, "ROOT", long_worktree)
+    monkeypatch.setattr(bb_l15, "_bundle_work", None)
+    monkeypatch.setattr(bb_l15, "_bundle_pair", None)
+
+    real_temp_directory = tempfile.TemporaryDirectory
+    tempdir_args = {}
+
+    def make_temp_directory(*, prefix, dir, **kwargs):
+        tempdir_args["dir"] = pathlib.Path(dir)
+        return real_temp_directory(prefix=prefix, dir=dir, **kwargs)
+
+    monkeypatch.setattr(bb_l15, "tempfile", SimpleNamespace(TemporaryDirectory=make_temp_directory))
+
+    def fake_mkbundle(argv, **_kwargs):
+        version = argv[argv.index("--version-override") + 1]
+        out = pathlib.Path(argv[argv.index("--out") + 1])
+        cli = out / "bin" / "serialwrap"
+        cli.parent.mkdir(parents=True)
+        cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        cli.chmod(0o755)
+        (out / "release-manifest.json").write_text(
+            json.dumps({"bundle_version": version}), encoding="utf-8"
+        )
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(bb_l15, "subprocess", SimpleNamespace(run=fake_mkbundle))
+    bb_l15.update_bundles()
+    bundle_work = bb_l15._bundle_work
+    assert bundle_work is not None
+    work_path = pathlib.Path(bundle_work.name)
+    assert tempdir_args["dir"] == pathlib.Path("/tmp")
+    assert work_path.parent == pathlib.Path("/tmp")
+    bb_l15._cleanup_bundles()
+    assert not work_path.exists(), f"G5 暫存 bundle 目錄未清理：{work_path}"
+
+
 def test_gate_shared_artifact_paths_keep_cli_and_daemon_basenames():
     required = {
         "gate_shared.sh": (
