@@ -297,7 +297,7 @@ def test_sys_admin_docker_driver_uses_only_disposable_root_container():
     text = script.read_text(encoding="utf-8")
     assert "docker run" in text and "--rm" in text and "--cap-add SYS_ADMIN" in text
     assert "ubuntu:24.04" in text
-    assert 'target=/workspace,readonly' in text
+    assert 'target=$ROOT,readonly' in text
     assert "target=/host-rustup,readonly" in text
     assert "CARGO_TARGET_DIR=/tmp/" in text
     assert "apt-get update -qq >&2" in text
@@ -310,9 +310,10 @@ def test_sys_admin_docker_driver_mounts_linked_worktree_git_metadata_readonly():
     text = (ROOT / "scripts/rust/slice21_sys_admin_docker.sh").read_text(encoding="utf-8")
     assert 'GIT_DIR_HOST="$(git -C "$ROOT" rev-parse --absolute-git-dir)"' in text
     assert 'GIT_COMMON_DIR_HOST="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)"' in text
-    assert 'target=/host-gitdir,readonly' in text
-    assert 'target=/host-git-common,readonly' in text
-    assert '--env "GIT_DIR=/host-gitdir"' in text
-    assert '--env "GIT_COMMON_DIR=/host-git-common"' in text
-    assert '--env "GIT_WORK_TREE=/workspace"' in text
+    assert 'target=$GIT_DIR_HOST,readonly' in text
+    assert 'target=$GIT_COMMON_DIR_HOST,readonly' in text
+    assert '--workdir "$ROOT"' in text
+    assert '--env "GIT_DIR=$GIT_DIR_HOST"' in text
+    assert '--env "GIT_COMMON_DIR=$GIT_COMMON_DIR_HOST"' in text
+    assert '--env "GIT_WORK_TREE=$ROOT"' in text
     assert '--env "GIT_OPTIONAL_LOCKS=0"' in text
