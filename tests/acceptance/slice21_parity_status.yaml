@@ -13,6 +13,9 @@
 # 初填依據（2026-10-27，分支 p5work @ 8a7986e；同日 P5 審查修正輪更新 #3／#4／#32／#38／#46／#47／#52／#68／#72／A-88／A-92／D-106／F-W13）：Linux `cargo_l1_results.py -- --workspace --features test-fakes -- --skip cap_`
 #   逐案結果（P5-T19 已完成；T20 A/B 交付報告、T21 L1.5 未完成）、`grep` 測試函式是否存在、`tests/acceptance/l1_required.lock.json` 的 s21_core／s21_gate:py_parity。
 #   PASS 只表示「計畫指名的測試存在且本次 Linux 執行 passed」；Windows 原生證據仍由 gate 的 windows_native_l1 補齊。
+# 本輪唯讀 H* 證據（ba29434c）：Linux `work/cargo-fakes-filtered.json`、`work/pytest-full/l1-results.json`；
+# Windows `windows-l1/s21_core/l1-results.json`、`windows-l1/s21_gate:windows_cap_windows_com/l1-results.json`。
+# 以下狀態僅代表所列節點的 H* L1 結果；不代表候選 HEAD 的正式 Slice 2.1 gate verdict。
 schema_version: 1
 source: docs/rust-refactor/plans/parity-amendments-2026-10-26.md
 source_ref: origin/docs/parity-amendments
@@ -66,7 +69,12 @@ rows:
   - id: "#21"
     status: PASS
     tests: ["cargo:sw-core::drain_release::release_during_pending_open_bridge_closes_late_handle"]
-  - {id: "#22", status: INCOMPLETE, reason: "Rust release_during_pending_open_drain_stalled 已 passed，但 tests/test_p1oc_drain_stalled.py 尚未登記 s21_gate:py_parity（P5-T0b parity Step #77）"}
+  - id: "#22"
+    status: PASS
+    tests:
+      - "cargo:sw-core::drain_release::release_during_pending_open_drain_stalled"
+      - "tests/test_p1oc_drain_stalled.py::test_release_timeout_returns_drain_stalled"
+    note: "H* ba29434c：cargo-fakes-filtered.json 的 Rust 節點與 pytest-full/l1-results.json 的 Python 節點均 passed；Python 節點屬 s21_gate:py_parity_76_80。"
   - id: "#23"
     status: PASS
     tests:
@@ -177,7 +185,7 @@ rows:
     status: PASS
     # PA-OD-1／OD-21 (1)：SC-37 已登記於 contracts/behavior_changes.yaml（rust_only、absolute_only）。
     tests: ["cargo:sw-daemon::daemon_process::backend_env_invalid_exit_1", "cargo:sw-daemon::daemon_process::backend_env_checked_where_python_selects_it"]
-  - {id: "#72", status: INCOMPLETE, reason: "Rust sigterm_sigint_orderly_stop 已建立並登記 s21_core；windows_console_ctrl_triggers_orderly_stop（LOCAL-WINDOWS-TODO）與 Python test_sigterm_orderly_shutdown_posix 尚未建立"}
+  - {id: "#72", status: INCOMPLETE, reason: "Linux Rust `cargo:sw-daemon::daemon_process::sigterm_sigint_orderly_stop` 與 Python `tests/test_daemon_lock.py::test_sigterm_orderly_shutdown_posix[SIGINT]`／`[SIGTERM]` 已在 gate 集合，H* ba29434c 均 passed；仍缺計畫指名的 Windows `cargo:sw-daemon::daemon_process::windows_console_ctrl_triggers_orderly_stop`（目前只有 LOCAL-WINDOWS-TODO 註記，未在 source／鎖檔／H* Windows L1 收集）。`cap_interactive_desktop__ctrl_break_stops_wait` 是另一行為，不替代。"}
   - id: "#73"
     status: PASS
     tests: ["cargo:sw-daemon::framing::rpc_accept_paused_at_128_connections"]
@@ -188,17 +196,73 @@ rows:
   - id: "A-40"
     status: PASS
     tests: ["tests/test_multi_open_detect.py::TestDaemonStatusMultiOpen::test_health_status_warnings_no_profiles_no_devices"]
-  - {id: "A-86", status: INCOMPLETE, reason: "P5-T19 註記免測（#102）待 Task 19 完成時確認"}
-  - {id: "A-88", status: INCOMPLETE, reason: "Rust no_profiles_message_and_continue 已 passed（P5-T19 完成）；Python `no profiles loaded` 特性測試（#81）尚未新增"}
-  - {id: "A-92", status: INCOMPLETE, reason: "#101 second_daemon_same_lock_exits_2_with_stderr 已 passed（P5-T19 完成）；#78 Python 測試（test_daemon_lock.py 等）尚未登記 s21_gate:py_parity（selector 登記待擁有者，F57）"}
-  - {id: "A-94", status: INCOMPLETE, reason: "併 #72"}
+  - {id: "A-86", status: INCOMPLETE, reason: "P5-T19 #102 已確認 Rust 型別化錯誤沒有可觀察的非 SC-19 RuntimeError 重拋分支，免測；不再是待 Task 19 確認。現有 parity judge 的 PASS 必須附 passed nodeid，狀態集合又沒有 N/A；不挪用不相關測試或製造測試，先維持 INCOMPLETE。這是狀態模型需補 N/A／免測表示法的 SPEC-GAP。"}
+  - id: "A-88"
+    status: PASS
+    tests:
+      - "cargo:sw-daemon::daemon_process::no_profiles_message_and_continue"
+      - "tests/test_daemon_lock.py::test_no_profiles_loaded_stderr_and_continue_posix"
+    note: "H* ba29434c：Rust s21_core 與 Python s21_gate:py_parity_full 的兩個 node 均 passed。"
+  - id: "A-92"
+    status: PASS
+    tests:
+      - "cargo:sw-daemon::daemon_process::second_daemon_same_lock_exits_2_with_stderr"
+      - "tests/test_daemon_lock.py::TestDaemonLock::test_singleton_lock_pid_written"
+      - "tests/test_daemon_lock.py::test_no_profiles_loaded_stderr_and_continue_posix"
+      - "tests/test_daemon_lock.py::test_sigterm_orderly_shutdown_posix[SIGINT]"
+      - "tests/test_daemon_lock.py::test_sigterm_orderly_shutdown_posix[SIGTERM]"
+    note: "H* ba29434c：#101 Rust／Python 節點及 #78 test_daemon_lock.py 四個 s21_gate:py_parity_76_80 節點均 passed。"
+  - {id: "A-94", status: INCOMPLETE, reason: "併 #72：POSIX Rust 與 Python SIGINT／SIGTERM 節點在 H* ba29434c passed，但計畫指名的 Windows `windows_console_ctrl_triggers_orderly_stop` 仍未建立／收集；`cap_interactive_desktop__ctrl_break_stops_wait` 不等價，不可替代。"}
   - id: "A-103"
     status: PASS
     tests: ["cargo:sw-daemon::framing::rpc_accept_paused_at_128_connections"]
-  - {id: "A-104", status: INCOMPLETE, reason: "#78 JsonRpcUnixServer 相關 10 個 Python nodeid 尚未逐名登記 s21_gate:py_parity；#99 listen_options UDS 測試待 P5-T19"}
-  - {id: "A-106", status: INCOMPLETE, reason: "#78 Python 測試尚未登記 s21_gate:py_parity；#82／#84 Windows 列需原生收集（LOCAL-WINDOWS-TODO）"}
-  - {id: "A-107", status: INCOMPLETE, reason: "#78 Python 測試尚未登記 s21_gate:py_parity"}
-  - {id: "A-108", status: INCOMPLETE, reason: "#78 Python 測試尚未登記 s21_gate:py_parity；#84 Windows 列需原生收集（LOCAL-WINDOWS-TODO）"}
+  - id: "A-104"
+    status: PASS
+    tests:
+      - "tests/test_codex_fixes.py::test_rpc_socket_default_mode_is_0660"
+      - "tests/test_p1oc_socket_perm.py::test_socket_mode_0660_without_group"
+      - "tests/test_p1oc_socket_perm.py::test_socket_group_chgrp"
+      - "tests/test_p1oc_socket_perm.py::test_socket_group_chgrp_to_supplementary_group"
+      - "tests/test_p1oc_socket_perm.py::test_socket_group_unknown_ignored"
+      - "tests/test_p1oc_socket_perm.py::test_runtime_dirs_not_forced_0700"
+      - "tests/test_p1oc_socket_perm.py::test_no_umask_switch_in_start"
+      - "tests/test_stage0_platform_mgmt.py::test_socket_bound_with_restrictive_umask"
+      - "tests/test_stage0_platform_mgmt.py::test_socket_default_mode_0660"
+      - "tests/test_stage0_platform_mgmt.py::test_socket_group_mode_0660"
+      - "cargo:sw-pal::rpc_listener::uds_mode_0660_baseline"
+      - "cargo:sw-pal::rpc_listener::uds_existing_file_unlinked"
+      - "cargo:sw-pal::rpc_listener::uds_existing_socket_unlinked"
+      - "cargo:sw-pal::rpc_listener::uds_close_removes_socket"
+    note: "H* ba29434c：#78 的十個 s21_gate:py_parity_76_80 Python node 與 #99 四個 s21_core Linux Rust node 均 passed。"
+  - id: "A-106"
+    status: PASS
+    tests:
+      - "tests/test_contracts_gap_codes.py::TestGapPosixLock::test_socket_unavailable_lock"
+      - "tests/test_daemon_lock.py::TestDaemonLock::test_singleton_lock_pid_written"
+      - "tests/test_p1oc_socket_perm.py::test_socket_mode_0660_without_group"
+      - "cargo:sw-pal::serial_posix::fakes_conformance_suite"
+      - "cargo:sw-pal::serial_windows::windows_native::cap_windows_com__conformance_suite"
+      - "cargo:sw-pal::lock::second_acquire_same_lock_is_already_running_and_pid_written"
+      - "cargo:sw-pal::lock::windows_second_acquire_in_process"
+      - "cargo:sw-pal::lock::lock_conformance_suite"
+    note: "H* ba29434c：#78 Python 節點、#82 Linux serial conformance／Windows COM conformance、#84 Linux／Windows lock 節點均在各自 gate L1 結果 passed。"
+  - id: "A-107"
+    status: PASS
+    tests:
+      - "tests/test_daemon_lock.py::TestDaemonLock::test_singleton_lock_pid_written"
+      - "tests/test_daemon_lock.py::test_no_profiles_loaded_stderr_and_continue_posix"
+      - "tests/test_daemon_lock.py::test_sigterm_orderly_shutdown_posix[SIGINT]"
+      - "tests/test_daemon_lock.py::test_sigterm_orderly_shutdown_posix[SIGTERM]"
+    note: "H* ba29434c：#78 的 test_daemon_lock.py 四個 s21_gate:py_parity_76_80 node 均 passed。"
+  - id: "A-108"
+    status: PASS
+    tests:
+      - "tests/test_daemon_lock.py::TestDaemonLock::test_singleton_lock_pid_written"
+      - "tests/test_p1oc_socket_perm.py::test_socket_group_chgrp"
+      - "cargo:sw-pal::lock::second_acquire_same_lock_is_already_running_and_pid_written"
+      - "cargo:sw-pal::lock::windows_second_acquire_in_process"
+      - "cargo:sw-pal::lock::lock_conformance_suite"
+    note: "H* ba29434c：#78 Python lock／socket 節點與 #84 s21_core Linux／Windows lock 節點均 passed。"
   - id: "B-04"
     status: PASS
     tests:
@@ -209,7 +273,18 @@ rows:
     tests:
       - "cargo:sw-core::state_store::aliases_not_dict_fails_startup_like_python"
       - "tests/test_state_persistence_atomic.py::test_load_state_alias_row_not_dict_raises_uncaught[int]"
-  - {id: "B-36", status: INCOMPLETE, reason: "#77 p1oc 8 檔尚未登記 s21_gate:py_parity（P5 部分）；P7-T4 部分不在本 Phase"}
+  - id: "B-36"
+    status: PASS
+    tests:
+      - "tests/test_p1oc_drain_stalled.py::test_release_timeout_returns_drain_stalled"
+      - "tests/test_p1oc_sc35_state.py::test_passthrough_is_excluded_from_reprobe_paths"
+      - "tests/test_p1oc_sc35_commands.py::test_unusable_prompt_times_out_without_recovery_keys"
+      - "tests/test_p1oc_sc34_last_error.py::test_rpc_attach_response_matches_schema"
+      - "tests/test_p1oc_socket_perm.py::test_socket_mode_0660_without_group"
+      - "tests/test_p1oc_pt_quiet_oracle.py::test_silent_promotion_at_or_after_floor_passes"
+      - "tests/test_p1oc_catalog.py::test_sc34_sc35_registered_with_owner_decision"
+      - "tests/test_p1oc_docs.py::test_readme_passthrough_quiet_ready"
+    note: "H* ba29434c：s21_gate:py_parity_76_80 中 #77 的八檔 109/109 個 P5 node 均 passed；P7-T4 #17 仍在本 Phase 範圍外。"
   - id: "B-82"
     status: PASS
     tests: ["cargo:sw-core::drain_release::io_error_with_pending_auto_login_goes_recovering_not_attach"]
@@ -232,7 +307,12 @@ rows:
     tests:
       - "cargo:sw-core::session_manager::clear_during_shutdown_errors"
       - "tests/test_stage0_session_drain.py::test_clear_during_shutdown_raises_daemon_stopping"
-  - {id: "C-10", status: INCOMPLETE, reason: "併 #22／#77：test_p1oc_drain_stalled.py 尚未登記 s21_gate:py_parity"}
+  - id: "C-10"
+    status: PASS
+    tests:
+      - "cargo:sw-core::drain_release::release_during_pending_open_drain_stalled"
+      - "tests/test_p1oc_drain_stalled.py::test_release_timeout_returns_drain_stalled"
+    note: "H* ba29434c：s21_core Linux Rust 與 s21_gate:py_parity_76_80 Python node 均 passed（#22／#77）。"
   - id: "C-13"
     status: PASS
     tests: ["cargo:sw-core::drain_release::release_response_closed_consoles_and_aborted_cmd"]
@@ -260,7 +340,12 @@ rows:
   - id: "C-34"
     status: PASS
     tests: ["cargo:sw-core::session_manager::bind_with_inflight_attach_op_cancels_waits_3000ms"]
-  - {id: "C-44", status: INCOMPLETE, reason: "Rust session_attach_with_release_request_session_recovering 已 passed；Python oracle（#77 p1oc）尚未登記 s21_gate:py_parity"}
+  - id: "C-44"
+    status: PASS
+    tests:
+      - "cargo:sw-core::drain_release::session_attach_with_release_request_session_recovering"
+      - "tests/test_p1oc_drain_stalled.py::test_attach_during_drain_still_session_recovering"
+    note: "H* ba29434c：s21_core Linux Rust 與 s21_gate:py_parity_76_80 Python oracle（#77）均 passed。"
   - id: "C-53"
     status: PASS
     tests: ["cargo:sw-core::session_manager::hotplug_invalidates_pending_attach_op_and_closes_unused_port"]
@@ -281,7 +366,12 @@ rows:
       - "cargo:sw-core::session_manager::dynamic_attach_skipped_during_shutdown_or_drain"
       - "tests/test_stage0_session_drain.py::test_dynamic_attach_skipped_during_shutdown_or_drain"
   - {id: "D-44", status: INCOMPLETE, reason: "併 #45：D-44 Python 特性測試尚未新增"}
-  - {id: "D-51", status: INCOMPLETE, reason: "Rust passthrough_timeout_no_rescue_keys_no_downgrade 已 passed；Python oracle test_p1oc_sc35_commands.py（#77）尚未登記 s21_gate:py_parity"}
+  - id: "D-51"
+    status: PASS
+    tests:
+      - "cargo:sw-core::command_exec::passthrough_timeout_no_rescue_keys_no_downgrade"
+      - "tests/test_p1oc_sc35_commands.py::test_unusable_prompt_times_out_without_recovery_keys"
+    note: "H* ba29434c：s21_core Linux Rust 與 s21_gate:py_parity_76_80 Python oracle（#77）均 passed。"
   - id: "D-106"
     status: PASS
     tests: ["cargo:sw-daemon::daemon_process::release_kill_hook_env_isolated_only", "cargo:sw-daemon::daemon_process::release_pause_hook_env_isolated_only"]
@@ -299,14 +389,44 @@ rows:
   - id: "E-42"
     status: PASS
     tests: ["cargo:sw-core::rx_reader::reader_wait_error_reason_is_select_errno"]
-  - {id: "E-43", status: INCOMPLETE, reason: "#82 PAL conformance Linux 列已在 s21_core；Windows 列需原生收集（LOCAL-WINDOWS-TODO）"}
-  - {id: "E-50", status: INCOMPLETE, reason: "#79 begin_drain→cancel_pending_write 既有 Python 測試尚未登記 s21_gate:py_parity"}
-  - {id: "E-52", status: INCOMPLETE, reason: "#79 test_stage0_bridge_drain.py 兩筆尚未登記 s21_gate:py_parity"}
+  - id: "E-43"
+    status: PASS
+    tests:
+      - "cargo:sw-pal::serial_posix::fakes_conformance_suite"
+      - "cargo:sw-pal::serial_windows::windows_native::cap_windows_com__conformance_suite"
+      - "cargo:sw-pal::lock::lock_conformance_suite"
+    note: "H* ba29434c：Linux s21_core 的 serial／lock conformance passed；Windows `windows_cap_windows_com` 八個鎖定 node 全 passed（L1 共 11 passed），Windows s21_core lock conformance 亦 passed。"
+  - id: "E-50"
+    status: PASS
+    tests:
+      - "tests/test_stage0_bridge_drain.py::test_eagain_writer_is_cancelled_by_drain"
+    note: "H* ba29434c：#79 的既有 Python drain/cancel node 在 s21_gate:py_parity_76_80 與 pytest-full 均 passed。"
+  - id: "E-52"
+    status: PASS
+    tests:
+      - "tests/test_stage0_bridge_drain.py::test_reader_callback_can_stop_and_receive_preserved_consoles"
+      - "tests/test_stage0_bridge_drain.py::test_reader_thread_stops_within_poll"
+    note: "H* ba29434c：#79 的兩個既有 reader node 在 s21_gate:py_parity_76_80 與 pytest-full 均 passed。"
   - {id: "F-W13", status: INCOMPLETE, reason: "Rust rotate_schedule_cancelled_when_file_shrinks_or_vanishes 已建立並登記 s21_core；Python test_rotate_schedule_cancelled_on_shrink 尚未建立"}
-  - {id: "F-W32", status: INCOMPLETE, reason: "#80 test_reset_on_posix_still_fsyncs_directory 尚未登記 s21_gate:py_parity；#87 wal_fs Windows 列需原生收集"}
+  - id: "F-W32"
+    status: PASS
+    tests:
+      - "tests/test_wal.py::TestWalWindowsDirFsync::test_reset_on_posix_still_fsyncs_directory"
+      - "cargo:sw-pal::wal_fs::windows_tests::windows_posix_semantics_delete"
+      - "cargo:sw-pal::wal_fs::windows_tests::windows_classic_delete_pending_blocks_recreate_until_last_handle_closes"
+    note: "H* ba29434c：#80 Python oracle（py_parity_76_80）與 #87 兩個 s21_core Windows wal_fs node 均 passed。"
   - id: "F-S02"
     status: PASS
     tests: ["cargo:sw-pal::serial_posix::open_errno_maps_like_python"]
-  - {id: "F-S06", status: INCOMPLETE, reason: "併 #64／#76"}
-  - {id: "F-S11", status: INCOMPLETE, reason: "#80 test_serial_port.py::test_set_baud_runs 尚未登記 s21_gate:py_parity"}
-  - {id: "F-S19", status: INCOMPLETE, reason: "#83 Windows native cancel_pending_write Python 測試需以 Windows 原生收集登記 s21_gate:py_parity（LOCAL-WINDOWS-TODO）"}
+  - id: "F-S06"
+    status: PASS
+    tests:
+      - "cargo:sw-pal::proc_holders_namespace::foreign_namespace_same_string_not_holder"
+      - "tests/test_holder_probe_namespace.py::TestProbeHoldersNamespace::test_foreign_namespace_same_string_not_holder"
+    note: "H* ba29434c：s21_core Linux 的 Rust 實作名 node 與 #76 P5 的 13 個 py_parity_76_80 Python node 均 passed；其餘 5 個 Python node 屬 Slice 2.2。"
+  - id: "F-S11"
+    status: PASS
+    tests:
+      - "tests/test_serial_port.py::TestPosixSerialPortRoundtrip::test_set_baud_runs"
+    note: "H* ba29434c：#80 的既有 set_baud node 在 s21_gate:py_parity_76_80 與 pytest-full 均 passed。"
+  - {id: "F-S19", status: INCOMPLETE, reason: "#83 指名的 Python node `tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::test_windows_guarded_write_stall_drain_stalled_native` 已存在且在 s21_gate:pytest_full.linux 鎖中，但 H* Linux outcome 為 skipped（capability）；s21_gate:py_parity_full／py_parity_76_80 目前只有 linux selector，未將它登記為 Windows parity node，H* Windows L1 也沒有此 Python node 的執行結果。仍缺 Windows parity 登記及原生 Python passed 證據；Rust Windows COM cancel 測試不是 Python oracle，不替代。"}
