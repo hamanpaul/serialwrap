@@ -2,6 +2,7 @@
 # Slice 2.3（P7）出口 gate 編排（08-slice23-login-events.md Task 19 Step 3）。
 #
 # 用法：scripts/rust/p7_gate.sh [--dry-run] [--shared-evidence DIR] [--run-id ID] [--out-md PATH] [--skip-full-pytest]
+#       [--windows-ev01-report FILE] [--windows-ev01-bundle DIR]（亦可用 P7_WIN_EV01_REPORT／P7_WIN_EV01_BUNDLE）
 #   建立 target/p7-gate/<run_id>/，依序執行並以 `p7_gate_report.py record` 記錄每個子程序的 argv、rc、時間、log
 #   （落檔＋sha256）、測試計數與 evidence；測試列另附 required_set（`p7_gate:<列名 slug>`）與 l1_results。
 #   本腳本只「執行並記錄」，列狀態一律由 scripts/rust/p7_gate_report.py 計算。全部子程序結束後才 `build` 寫出
@@ -19,6 +20,8 @@ OUT_MD=""
 SKIP_FULL=0
 DRY_RUN=0
 SHARED_EVIDENCE=""
+WINDOWS_EV01_REPORT="${P7_WIN_EV01_REPORT:-}"
+WINDOWS_EV01_BUNDLE="${P7_WIN_EV01_BUNDLE:-}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
@@ -26,7 +29,9 @@ while [[ $# -gt 0 ]]; do
     --run-id) RUN_ID="$2"; shift 2 ;;
     --out-md) OUT_MD="$2"; shift 2 ;;
     --skip-full-pytest) SKIP_FULL=1; shift ;;
-    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    --windows-ev01-report) [[ $# -ge 2 ]] || { echo "p7_gate.sh: --windows-ev01-report 缺少值" >&2; exit 2; }; WINDOWS_EV01_REPORT="$2"; shift 2 ;;
+    --windows-ev01-bundle) [[ $# -ge 2 ]] || { echo "p7_gate.sh: --windows-ev01-bundle 缺少值" >&2; exit 2; }; WINDOWS_EV01_BUNDLE="$2"; shift 2 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
     *) echo "p7_gate.sh: 未知參數 $1" >&2; exit 2 ;;
   esac
 done
@@ -47,6 +52,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
   fi
   echo "執行：python3 scripts/rust/check_cfg_boundary.py；python3 tests/acceptance/regen_lock.py --check；python3 scripts/rust/p7_case_coverage.py；python3 -m policy_check --repo .。"
   echo "報告輸出路徑：$OUT_MD"
+  echo "Windows ev-01：匯入 win-func-test basic report＋Stage 2 bundle（--windows-ev01-report/--windows-ev01-bundle 或 P7_WIN_EV01_REPORT/P7_WIN_EV01_BUNDLE）；缺證據、HEAD／bundle SHA-256 不符或 verdict 非 PASS＋gate_eligible → 不得 PASS。"
   echo "執行：python3 scripts/rust/p7_gate_report.py build 與 verify；prior slice、func-test、coverage 段依目前輸入補齊。"
   exit 0
 fi
@@ -451,6 +457,12 @@ else
 fi
 # 16. policy check
 run_row "policy_check" policy-check --evidence "$RUN/logs/policy-check.log" -- python3 -m policy_check --repo .
+
+# OD-31：Windows Stage 2 ev-01 是 host 可執行列，不得以 BLOCKED-OWNER 代替缺失證據。
+WINDOWS_EV01_ARGS=(--results-dir "$RUN" --log "$RUN/logs/windows-ev01.log")
+[[ -z "$WINDOWS_EV01_REPORT" ]] || WINDOWS_EV01_ARGS+=(--report "$WINDOWS_EV01_REPORT")
+[[ -z "$WINDOWS_EV01_BUNDLE" ]] || WINDOWS_EV01_ARGS+=(--bundle "$WINDOWS_EV01_BUNDLE")
+python3 scripts/rust/p7_gate_report.py record-windows-ev01 "${WINDOWS_EV01_ARGS[@]}"
 
 # 報告與驗證（全部子程序結束後）。
 mkdir -p "$(dirname "$OUT_MD")"
