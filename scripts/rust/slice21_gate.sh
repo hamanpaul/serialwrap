@@ -619,23 +619,57 @@ else
 fi
 
 # 9. Task 21 L1.5 與 event_latency
-# bridge 自測報告（SERIALWRAP_L15_SELFTEST_REPORT）須存在且依 Task 8 正式資格判定合格；否則屬證據缺失，
-# 不得跑成 FAIL（審查 b7cd852 #2）。判定沿用 func-test/runner.py 的 evaluate_bridge_eligibility。
-l15_qualified=0
-if [[ -n "${SERIALWRAP_L15_SELFTEST_REPORT:-}" && -f "${SERIALWRAP_L15_SELFTEST_REPORT}" ]]; then
-  l15_qualified="$(python3 -c 'import sys; sys.path.insert(0, "func-test"); import runner; print(int(runner.evaluate_bridge_eligibility(sys.argv[1])[1]))' \
-    "$SERIALWRAP_L15_SELFTEST_REPORT" 2>/dev/null || echo 0)"
+# 自測報告須先符合 Task 8 資格；共用模式優先重用同一次 gate_shared 的 P7 A/B 報告，否則本 gate 自行產生。
+# 不合格仍記 EVIDENCE_MISSING，不得將自測失敗改判 PASS。
+bridge_report_qualified() {
+  local qualified
+  [[ -f "$1" ]] || return 1
+  qualified="$(python3 -c 'import sys; sys.path.insert(0, "func-test"); import runner; print(int(runner.evaluate_bridge_eligibility(sys.argv[1])[1]))' \
+    "$1" 2>/dev/null || echo 0)"
+  [[ "$qualified" == "1" ]]
+}
+bridge_selftest_report="${SERIALWRAP_L15_SELFTEST_REPORT:-}"
+bridge_selftest_source="explicit"
+if [[ -z "$bridge_selftest_report" ]]; then
+  bridge_selftest_source="generated"
+  if [[ -n "$SHARED_EVIDENCE" ]]; then
+    shared_bridge_report="$SHARED_EVIDENCE/work/p7-ab/bridge-selftest/selftest-report.json"
+    if bridge_report_qualified "$shared_bridge_report"; then
+      bridge_selftest_report="$shared_bridge_report"
+      bridge_selftest_source="shared"
+    fi
+  fi
+  if [[ -z "$bridge_selftest_report" ]]; then
+    bridge_selftest_dir="$RUN_DIR/bridge-selftest"
+    mkdir -p "$bridge_selftest_dir"
+    run_logged bridge_selftest env \
+      PYTHONPATH="$ROOT/tools/uart_stdio_bridge/src${PYTHONPATH:+:$PYTHONPATH}" \
+      python3 -m uart_stdio_bridge selftest --endpoint posix-pty --out "$bridge_selftest_dir"
+    if [[ -f "$bridge_selftest_dir/selftest-report.json" ]]; then
+      bridge_selftest_report="$bridge_selftest_dir/selftest-report.json"
+    fi
+  fi
 fi
+l15_qualified=0
+if [[ -n "$bridge_selftest_report" ]] && bridge_report_qualified "$bridge_selftest_report"; then
+  l15_qualified=1
+fi
+bridge_selftest_record_args=()
+if [[ -n "$bridge_selftest_report" ]]; then
+  bridge_selftest_record_args+=(--bridge-selftest-report "$bridge_selftest_report")
+fi
+bridge_selftest_reason="bridge_selftest_report source=$bridge_selftest_source path=${bridge_selftest_report:-<missing>} eligibility=$([[ "$l15_qualified" == "1" ]] && echo PASS || echo EVIDENCE_MISSING)"
 if [[ -n "$SHARED_EVIDENCE" && "$SHARED_ARTIFACTS_VALID" != "1" ]]; then
-  record l15_ab --section-verdict EVIDENCE_MISSING \
-    --reason "共用 artifact provenance 不符；L1.5 A/B 不以本地重建替代"
+  record l15_ab --section-verdict EVIDENCE_MISSING "${bridge_selftest_record_args[@]}" \
+    --reason "共用 artifact provenance 不符；L1.5 A/B 不以本地重建替代" --reason "$bridge_selftest_reason"
 elif [[ "$l15_qualified" != "1" ]]; then
-  record l15_ab --exit 0 --section-verdict EVIDENCE_MISSING \
-    --reason "SERIALWRAP_L15_SELFTEST_REPORT 未提供或 bridge 自測報告不合格（Task 8 資格判定）：L1.5 A/B 未執行"
+  record l15_ab --exit 0 --section-verdict EVIDENCE_MISSING "${bridge_selftest_record_args[@]}" \
+    --reason "bridge 自測報告不存在或未通過 Task 8 資格判定；L1.5 A/B 未執行" --reason "$bridge_selftest_reason"
 elif [[ -f tests/acceptance/l15/test_slice21_l15.py ]]; then
   mkdir -p "$RUN_DIR/l15_ab"
   # 逐案 outcome（l1-results.v1）供 case_verdicts 彙整（OD-60／OWNER-BATCH #8）。
-  run_logged l15_ab env SERIALWRAP_GATE=1 SERIALWRAP_L15_PY_DAEMON="$ROOT/tests/contract_blackbox/bin/py-serialwrapd" \
+  run_logged l15_ab env SERIALWRAP_GATE=1 SERIALWRAP_L15_SELFTEST_REPORT="$bridge_selftest_report" \
+    SERIALWRAP_L15_PY_DAEMON="$ROOT/tests/contract_blackbox/bin/py-serialwrapd" \
     SERIALWRAP_L15_RUST_DAEMON="$RUST_D" SW_RESOURCE_REPORT="$RUN_DIR/l15_ab/l1-results.json" \
     python3 -m pytest -q tests/acceptance/l15/test_slice21_l15.py
   # pytest 全綠但仍有 L1.5 待裁決缺口（情境斷言不完整，PA-OD-L15-*）時不計 PASS（審查 c0d221f #3）。
@@ -645,9 +679,11 @@ elif [[ -f tests/acceptance/l15/test_slice21_l15.py ]]; then
   if [[ "$l15_rc" != 0 ]]; then l15_verdict=FAIL; elif [[ -n "$l15_gaps" ]]; then l15_verdict=EVIDENCE_MISSING; else l15_verdict=PASS; fi
   record l15_ab --command "SERIALWRAP_GATE=1 pytest -q tests/acceptance/l15/test_slice21_l15.py" --exit "$l15_rc" \
     --log logs/l15_ab.log --section-verdict "$l15_verdict" --evidence l15_ab/l1-results.json \
+    "${bridge_selftest_record_args[@]}" --reason "$bridge_selftest_reason" \
     ${l15_gaps:+--reason "L1.5 待裁決缺口未結：$l15_gaps（slice21-l15-gaps.md）"}
 else
-  record l15_ab --reason "tests/acceptance/l15/test_slice21_l15.py 不存在（P5-T21 未完成）"
+  record l15_ab "${bridge_selftest_record_args[@]}" --reason "tests/acceptance/l15/test_slice21_l15.py 不存在（P5-T21 未完成）" \
+    --reason "$bridge_selftest_reason"
 fi
 # OD-45：event_latency = L1 結構 gate（五事件 l1_gate 須在 linux_l1 passed）＋外部量測三項（RPC 送出 → RPC 回應；
 #        idle 與 flood 20000 B/s；Rust 為判定對象，Python 基線以診斷樣本數另記供對照，不計入判定）。
@@ -705,17 +741,41 @@ if [[ -n "${SW_GATE_WAL_S1W_IMPORT:-}" ]]; then
   s1w_args+=(--host-label "${SW_GATE_WAL_S1W_HOST:-}")
   s1w_evidence=wal_s1w_perf/verdict.json
 fi
+s1w_python_baseline=""
+s1w_baseline_source="missing"
 if [[ -n "${SW_GATE_WAL_S1W_PY_BASELINE:-}" ]]; then
-  cp "$SW_GATE_WAL_S1W_PY_BASELINE" "$RUN_DIR/wal_s1w_perf/python-baseline.imported.json" 2>/dev/null || true
-  s1w_args+=(--python-baseline "$RUN_DIR/wal_s1w_perf/python-baseline.imported.json")
+  imported_python_baseline="$RUN_DIR/wal_s1w_perf/python-baseline.imported.json"
+  if cp "$SW_GATE_WAL_S1W_PY_BASELINE" "$imported_python_baseline" 2>/dev/null; then
+    s1w_python_baseline="$imported_python_baseline"
+    s1w_baseline_source="explicit"
+  fi
+elif [[ -f "$RUN_DIR/wal_s1w_perf/wal_s1w.json" ]]; then
+  s1w_virtualization="$(python3 -c 'import json,sys; print((json.load(open(sys.argv[1])).get("env") or {}).get("virtualization", "unknown"))' \
+    "$RUN_DIR/wal_s1w_perf/wal_s1w.json" 2>/dev/null || echo unknown)"
+  if [[ "$s1w_virtualization" == "wsl2" ]]; then
+    auto_python_baseline="$RUN_DIR/wal_s1w_perf/python-baseline.auto.json"
+    python_wal_root="$RUN_DIR/wal_s1w_perf/python-walroot"
+    run_logged wal_s1w_python_baseline python3 scripts/stage0/wal_microbench.py \
+      --out "$auto_python_baseline" --wal-root "$python_wal_root"
+    s1w_python_baseline_rc="$LAST_RC"
+    if [[ "$s1w_python_baseline_rc" == "0" && -f "$auto_python_baseline" ]]; then
+      s1w_python_baseline="$auto_python_baseline"
+      s1w_baseline_source="generated"
+    fi
+    rm -rf "$python_wal_root"
+  fi
+fi
+if [[ -n "$s1w_python_baseline" ]]; then
+  s1w_args+=(--python-baseline "$s1w_python_baseline")
 fi
 python3 "$JUDGE" wal-s1w-verdict "${s1w_args[@]}" --out "$RUN_DIR/wal_s1w_perf/verdict.json" >/dev/null 2>>"$RUN_DIR/logs/wal_s1w_perf.log" || true
 s1w_verdict="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["verdict"])' "$RUN_DIR/wal_s1w_perf/verdict.json" 2>/dev/null || echo EVIDENCE_MISSING)"
 s1w_reason="$(python3 -c 'import json,sys; print("；".join(json.load(open(sys.argv[1]))["reasons"]) or "—")' "$RUN_DIR/wal_s1w_perf/verdict.json" 2>/dev/null || echo "wal-s1w-verdict 未產生")"
 s1w_exit="$s1w_rc"; [[ "$s1w_verdict" == EVIDENCE_MISSING ]] && s1w_exit=0
-record wal_s1w_perf --command "cargo run --release -p sw-core --example wal_s1w（＋SW_GATE_WAL_S1W_IMPORT 匯入）" --exit "$s1w_exit" \
+record wal_s1w_perf --command "cargo run --release -p sw-core --example wal_s1w；Python baseline source=$s1w_baseline_source path=${s1w_python_baseline:-<missing>}" --exit "$s1w_exit" \
   --log logs/wal_s1w_perf.log --section-verdict "$s1w_verdict" --evidence "$s1w_evidence" \
   --reason "Linux 門檻依主機類型（OD-66：WSL2 另訂門檻＋不劣於 Python 基線；原生 §1.2）：$s1w_reason" \
+  --reason "Python baseline source=$s1w_baseline_source path=${s1w_python_baseline:-<missing>}" \
   --reason "Windows 原生與 EDR 下正式量測屬 BO-S21-14（EVIDENCE_MISSING）"
 
 # 10. Windows 無 COM 黑箱（BO-S21-13 承接 Windows 全套；此處只保留紀錄，不計入 section）。
