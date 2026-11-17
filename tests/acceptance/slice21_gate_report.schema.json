@@ -95,6 +95,8 @@
           "log": {"type": "string"},
           "reasons": {"type": "array", "items": {"type": "string"}},
           "evidence": {"type": ["string", "null"]},
+          "bridge_selftest_report": {"type": "string", "minLength": 1,
+                                    "description": "L1.5 使用之 bridge 自測報告來源路徑；資格由 evaluate_bridge_eligibility 判定。"},
           "section_verdict": {"enum": ["PASS", "FAIL", "EVIDENCE_MISSING"],
                               "description": "非測試類 section 自身報告的判定（如 wal_s1w verdict）；判定器只當輸入條件之一。"},
           "capability_probe": {
