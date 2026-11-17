@@ -336,8 +336,9 @@ rows:
     status: PASS
     tests:
       - "cargo:sw-core::login_quiet::invalid_bootloader_regex_skipped"
+      - "tests/test_boot_quiet.py::TestBootloaderPromptDoesNotClearQuiet::test_invalid_bootloader_regex_skipped_other_patterns_still_match"
       - "tests/test_bootloader_recovery.py::TestSelfTestBootloaderClassification::test_invalid_bootloader_regex_is_skipped_and_next_prompt_classifies"
-    note: "Python origin/main 會略過 re.error 並繼續比對後續樣式；Rust／Python 特性測試均驗證有效 prompt 仍命中。Python 基線不寫 WARNING，與計畫文字差異另列 SPEC-GAP。"
+    note: "Python origin/main 的 sw_core/session_manager.py:182-188 略過 re.error 並繼續比對後續樣式；boot_quiet 測試明確斷言不寫 WARNING，self_test 測試驗證有效 prompt 仍命中。這與計畫 06 Task 13 寫 WARNING 的文字不符，屬 Python 基線差異，未改 sw_core。"
   - id: "B-05（部分）"
     status: PASS
     tests: ["cargo:sw-core::state_store::profile_pins_and_detected_strip_tolerance"]
@@ -404,7 +405,7 @@ rows:
   - id: "C-93"
     status: PASS
     tests: ["cargo:sw-pal::device_source::watcher_stop_bounded_2s"]
-    note: "慢速 scan 超過 2 s 時 stop 在 2.2 s 容差內返回，且返回當下 scan 尚未結束；執行時觀察到 2 s timeout WARNING。"
+    note: "慢速 scan 超過 2 s 時 stop 在 2.2 s 容差內返回，返回當下 scan 尚未結束；watcher_stop_bounded_2s 以子行程 stderr 明確斷言輸出 `WARNING device watcher 未於 2s 內結束`。"
   - id: "C-95"
     status: PASS
     tests:

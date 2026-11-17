@@ -983,6 +983,32 @@ fn watcher_stop_is_bounded_when_scan_is_slow() {
 
 #[test]
 fn watcher_stop_bounded_2s() {
+    const CHILD_ENV: &str = "SW_TEST_WATCHER_STOP_BOUNDED_2S_CHILD";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        watcher_stop_bounded_2s_child();
+        return;
+    }
+
+    // `eprintln!` 由 Rust test harness 擷取；以 `--nocapture` 子行程讀取實際 stderr，
+    // 使 C-93 的 WARNING 成為斷言，而非僅靠人工觀察測試輸出。
+    let output = std::process::Command::new(std::env::current_exe().expect("目前測試執行檔"))
+        .args(["--exact", "watcher_stop_bounded_2s", "--nocapture"])
+        .env(CHILD_ENV, "1")
+        .output()
+        .expect("啟動 C-93 子測試");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "C-93 子測試失敗：\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("WARNING device watcher 未於 2s 內結束"),
+        "逾時 stop 必須實際寫出 2 s WARNING；stderr={stderr:?}"
+    );
+}
+
+fn watcher_stop_bounded_2s_child() {
     use std::sync::atomic::AtomicBool;
 
     let started = Arc::new(AtomicBool::new(false));
