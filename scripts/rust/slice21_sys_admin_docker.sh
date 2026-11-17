@@ -17,6 +17,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n "$OUT_DIR" ]] || { echo "slice21_sys_admin_docker.sh: 必須指定 --out" >&2; exit 2; }
+OUT_DIR="$(python3 "$ROOT/scripts/rust/slice21_sys_admin_paths.py" --out "$OUT_DIR" --repo "$ROOT")" || {
+  echo "slice21_sys_admin_docker.sh: --out 必須位於工作樹 target/ 內或 repo 外" >&2
+  exit 2
+}
 
 if [[ ! -r /etc/os-release ]]; then
   echo "slice21_sys_admin_docker.sh: 無法確認主機 Ubuntu 版本" >&2
@@ -69,11 +73,6 @@ if [[ "$PLAN_CHECK" != 1 ]]; then
 fi
 SELECTOR_JSON="$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1])["argv"],separators=(",",":")))' "$PLAN")"
 
-OUT_DIR="$(python3 - "$OUT_DIR" <<'PY'
-import pathlib, sys
-print(pathlib.Path(sys.argv[1]).expanduser().resolve())
-PY
-)"
 if [[ -e "$OUT_DIR" ]]; then
   echo "slice21_sys_admin_docker.sh: 結果目錄已存在，拒絕覆寫：$OUT_DIR" >&2
   exit 2

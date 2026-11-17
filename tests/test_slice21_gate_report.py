@@ -326,6 +326,34 @@ def test_slice21_gate_routes_external_sys_admin_results_to_importer():
     assert "SW_GATE_SYS_ADMIN_RESULTS" in text
 
 
+def test_sys_admin_docker_output_path_is_limited_to_target_or_external(tmp_path):
+    """OD101-09：--out 只接受 worktree target/ 或 repo 外路徑，先於 Docker 前置檢查。"""
+    helper_path = ROOT / "scripts/rust/slice21_sys_admin_paths.py"
+    spec = importlib.util.spec_from_file_location("slice21_sys_admin_paths_test", helper_path)
+    assert spec is not None and spec.loader is not None
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+
+    repo_target = helper.resolve_output_dir(ROOT / "target/s2-gfx/test-out", ROOT)
+    external = helper.resolve_output_dir(tmp_path / "external-out", ROOT)
+    assert repo_target == (ROOT / "target/s2-gfx/test-out").resolve()
+    assert external == (tmp_path / "external-out").resolve()
+    with pytest.raises(ValueError, match="target/ 內或 repo 外"):
+        helper.resolve_output_dir(ROOT / "artifacts/sys-admin-out", ROOT)
+    with pytest.raises(ValueError, match="無法解析"):
+        helper.resolve_output_dir("\0", ROOT)
+
+    script_path = ROOT / "scripts/rust/slice21_sys_admin_docker.sh"
+    script = script_path.read_text(encoding="utf-8")
+    assert script.index("slice21_sys_admin_paths.py") < script.index("command -v docker")
+    rejected = subprocess.run(
+        ["bash", str(script_path), "--out", str(ROOT / "artifacts/sys-admin-out")],
+        capture_output=True, text=True, check=False, timeout=10,
+    )
+    assert rejected.returncode == 2
+    assert "--out 必須位於工作樹 target/ 內或 repo 外" in rejected.stderr
+
+
 def test_sys_admin_docker_driver_uses_only_disposable_root_container():
     script = ROOT / "scripts/rust/slice21_sys_admin_docker.sh"
     text = script.read_text(encoding="utf-8")

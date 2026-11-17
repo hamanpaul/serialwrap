@@ -605,6 +605,51 @@ def universe(contracts_dir: Path, cases: Path, lock: Path, cmap: Path) -> dict[s
             raise ValueError(f"legacy rust_only 未在 entries 明確標記：{contract_id}")
         current["rust_only_reason"] = reason
 
+    raw_exclusion_approvals = map_doc.get("exclusion_approvals", {})
+    if not isinstance(raw_exclusion_approvals, dict):
+        raise ValueError("coverage_map.yaml 的 exclusion_approvals 必須是 mapping")
+    approved_exclusions: set[tuple[str, str, str]] = set()
+    for contract_id, by_platform in raw_exclusion_approvals.items():
+        if not isinstance(contract_id, str) or contract_id not in output:
+            raise ValueError(f"exclusion_approvals 列出 universe 外 ID：{contract_id}")
+        if not isinstance(by_platform, dict):
+            raise ValueError(f"exclusion_approvals 必須是平台至逐筆核准清單的 mapping：{contract_id}")
+        for platform, rows in by_platform.items():
+            if platform not in {"linux", "windows"} or platform not in output[contract_id].get("platforms", []):
+                raise ValueError(f"exclusion_approvals 指向未宣告的平台 {platform}：{contract_id}")
+            if not isinstance(rows, list) or not rows:
+                raise ValueError(f"exclusion_approvals.{platform} 必須是非空逐筆核准清單：{contract_id}")
+            for row in rows:
+                if not isinstance(row, dict) or set(row) != {"nodeid", "reason"}:
+                    raise ValueError(f"exclusion_approvals 每筆必須只有 nodeid 與 reason：{contract_id}/{platform}")
+                nodeid, reason = row.get("nodeid"), row.get("reason")
+                if (
+                    not isinstance(nodeid, str) or not nodeid.strip()
+                    or not isinstance(reason, str) or not reason.strip()
+                    or "\n" in reason or "\r" in reason
+                    or re.search(r"(?<![A-Za-z0-9-])(?:OD-99|slice24-05)(?![A-Za-z0-9-])", reason) is None
+                ):
+                    raise ValueError(
+                        f"exclusion_approvals 每筆須有 OD-99 或 slice24-05 出處與非空單行理由：{contract_id}/{platform}"
+                    )
+                approval_key = (contract_id, platform, nodeid.strip())
+                if approval_key in approved_exclusions:
+                    raise ValueError(f"exclusion_approvals 有重複核准：{approval_key}")
+                approved_exclusions.add(approval_key)
+
+    actual_exclusions = {
+        (contract_id, platform, nodeid)
+        for contract_id, item in output.items()
+        for platform, nodeids in item.get("exclude_nodeids", {}).items()
+        for nodeid in nodeids
+    }
+    missing_approvals = sorted(actual_exclusions - approved_exclusions)
+    orphan_approvals = sorted(approved_exclusions - actual_exclusions)
+    if missing_approvals or orphan_approvals:
+        raise ValueError(
+            f"exclude_nodeids 與逐筆核准必須一對一：未核准={missing_approvals}；孤兒核准={orphan_approvals}"
+        )
+
     approved_l1 = set(l1_approvals) | set(legacy_l1)
     for contract_id, item in output.items():
         if item.get("l1_only") and contract_id not in approved_l1:
@@ -624,6 +669,8 @@ def universe(contracts_dir: Path, cases: Path, lock: Path, cmap: Path) -> dict[s
             unreferenced = sorted(set(excluded) - referenced)
             if unreferenced:
                 raise ValueError(f"exclude_nodeids 只能排除此 ID 的明列節點：{contract_id}: {unreferenced}")
+            if not (referenced - set(excluded)):
+                raise ValueError(f"exclude_nodeids 排除後 {platform} 必要節點為空：{contract_id}")
 
     unextracted = set(output) - extracted_ids
     if unextracted:

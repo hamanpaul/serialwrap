@@ -124,6 +124,9 @@ PARITY_STATUSES = frozenset({"PASS", "NOT_APPLICABLE", "BLOCKED-OWNER", "OWNER-D
 _PARITY_RULING_RE = re.compile(
     r"^(docs/rust-refactor/(?:reviews/rulings|plans)/[A-Za-z0-9._/-]+\.md)#L([1-9][0-9]*)(?:-L([1-9][0-9]*))?$"
 )
+_PARITY_NOT_APPLICABLE_RULINGS = {
+    "A-86": "docs/rust-refactor/plans/06-slice21-daemon-core.md#L4624",
+}
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SKIP_OUTCOMES = frozenset({"skipped", "xfailed"})
 
@@ -238,16 +241,37 @@ def _empty_l1_verdict(reason: str) -> dict[str, Any]:
 LOCAL_WINDOWS_SECTIONS = {
     "windows_cap_windows_native", "windows_cap_interactive_desktop", "windows_cap_supervisor_runtime",
 }
-WINDOWS_PROVENANCE_SECTIONS = LOCAL_WINDOWS_SECTIONS | {"windows_native_l1", "windows_cap_windows_com"}
+WINDOWS_PROVENANCE_SECTIONS = LOCAL_WINDOWS_SECTIONS | {
+    "windows_native_l1", "windows_cap_windows_com", "py_parity_windows",
+}
 
 
-def windows_evidence_problems(l1: Any, candidate: Any) -> list[str]:
+def windows_evidence_problems(l1: Any, candidate: Any, selector: Any = None) -> list[str]:
     """OD-55：開始與結束都須為乾淨的候選 commit；缺欄位不得視為已驗證。"""
     if not isinstance(l1, Mapping):
         return ["LOCAL-WINDOWS-TODO：證據不是物件"]
     problems = []
     if l1.get("platform") != "windows" or l1.get("finished") is not True:
         problems.append("platform 須為 windows 且 finished 須為 true")
+    if selector is not None:
+        expected_argv = selector.get("argv") if isinstance(selector, Mapping) else None
+        expected_markexpr = selector.get("markexpr") if isinstance(selector, Mapping) else None
+        actual_argv = l1.get("argv")
+        if l1.get("runner") != "pytest":
+            problems.append("py_parity_windows 必須使用 pytest runner")
+        if not isinstance(expected_argv, list) or not all(isinstance(arg, str) for arg in expected_argv):
+            problems.append("Windows pytest 凍結 selector argv 缺失或格式錯誤")
+        elif not isinstance(actual_argv, list) or len(actual_argv) < 2 or actual_argv[1:] != expected_argv:
+            problems.append(f"Windows pytest argv 不符：report={actual_argv!r} lock={expected_argv!r}")
+        provenance = l1.get("provenance")
+        if not isinstance(provenance, Mapping) or provenance.get("schema") != "pytest-l1-provenance.v1":
+            problems.append("Windows pytest provenance schema 缺失或不符")
+        elif provenance.get("platform") != "windows":
+            problems.append("Windows pytest provenance platform 不符")
+        if not isinstance(expected_markexpr, str) or l1.get("markexpr") != expected_markexpr:
+            problems.append(
+                f"Windows pytest markexpr 不符：report={l1.get('markexpr')!r} lock={expected_markexpr!r}"
+            )
     provenance = l1.get("provenance")
     git = provenance.get("git") if isinstance(provenance, Mapping) else None
     git = git if isinstance(git, Mapping) else {}
@@ -349,7 +373,13 @@ def _judge_test_section(sec: Mapping[str, Any], expect: Mapping[str, Any], platf
     except (OSError, ValueError) as exc:
         return "EVIDENCE_MISSING", _empty_l1_verdict(f"l1_results 無法讀取：{exc}"), [f"l1_results 無法讀取：{rel}"]
     if sec.get("name") in WINDOWS_PROVENANCE_SECTIONS:
-        problems = windows_evidence_problems(l1, candidate)
+        selector = None
+        if sec.get("name") == "py_parity_windows":
+            selector = (((lock.get("sets") or {}).get(str(set_id)) or {}).get(platform) or {}).get("selector")
+            if not isinstance(selector, Mapping):
+                problems = [f"Windows pytest 凍結 selector 缺失：{set_id}/{platform}"]
+                return "EVIDENCE_MISSING", _empty_l1_verdict("；".join(problems)), problems
+        problems = windows_evidence_problems(l1, candidate, selector=selector)
         if problems:
             return "EVIDENCE_MISSING", _empty_l1_verdict("；".join(problems)), problems
     verdict = dict(l1j.judge(l1, required, platform=platform))
@@ -880,8 +910,8 @@ def parity_rows_from_doc(text: str) -> list[dict[str, str]]:
 
 
 def _valid_parity_ruling(ruling: Any, row_id: str) -> bool:
-    """只接受指向本 repo 計畫／裁決文件中、明確提及該列的行號引用。"""
-    if not isinstance(ruling, str):
+    """只接受逐列核准的免測裁決，並驗證引用行含完整列名與免測語意。"""
+    if not isinstance(ruling, str) or ruling != _PARITY_NOT_APPLICABLE_RULINGS.get(row_id):
         return False
     match = _PARITY_RULING_RE.fullmatch(ruling)
     if match is None:
@@ -891,7 +921,7 @@ def _valid_parity_ruling(ruling: Any, row_id: str) -> bool:
         return False
     start = int(match.group(2))
     end = int(match.group(3) or match.group(2))
-    if end < start or end - start > 20:
+    if end != start:
         return False
     path = ROOT.joinpath(*relative.parts)
     try:
@@ -901,7 +931,9 @@ def _valid_parity_ruling(ruling: Any, row_id: str) -> bool:
         return False
     if end > len(lines):
         return False
-    return row_id in "\n".join(lines[start - 1:end])
+    line = lines[start - 1]
+    complete_token = re.search(rf"(?<!\w){re.escape(row_id)}(?!\w)", line)
+    return complete_token is not None and "免測" in line
 
 
 def judge_parity(parity: Mapping[str, Any], passed_pool: set[str], bo_ids: set[str],
@@ -951,7 +983,7 @@ def judge_parity(parity: Mapping[str, Any], passed_pool: set[str], bo_ids: set[s
                 reasons.append("NOT_APPLICABLE 不得列測試 nodeid")
             elif not _valid_parity_ruling(ruling, rid):
                 status = "INCOMPLETE"
-                reasons.append("NOT_APPLICABLE 缺少指向該列之計畫／裁決具體行號的 ruling 出處")
+                reasons.append("NOT_APPLICABLE ruling 不在逐列核准清單，或引用行未含完整列名及免測裁決")
             else:
                 status = "NOT_APPLICABLE"
         elif claimed == "BLOCKED-OWNER":

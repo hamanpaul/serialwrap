@@ -679,6 +679,24 @@ def test_not_applicable_requires_source_row_and_specific_ruling(case, problem):
             assert isinstance(result["rows"][0]["ruling"], str)
 
 
+def test_not_applicable_rejects_unapproved_rows_even_when_the_source_mentions_them():
+    """OD101-01：只允許 A-86 的精確裁決行；提及列名不等於免測核准。"""
+    j = _judge_mod()
+    plan = "docs/rust-refactor/plans/06-slice21-daemon-core.md"
+    candidates = [
+        ("#46", f"{plan}#L4620"),
+        ("#4", f"{plan}#L4620"),
+        ("A-88", f"{plan}#L4623"),
+        ("A-115", f"{plan}#L4624"),
+    ]
+
+    for row_id, ruling in candidates:
+        parity = _parity_cfg([{"id": row_id, "status": "NOT_APPLICABLE", "ruling": ruling}])
+        result = j.judge_parity(parity, set(), set())
+        assert result["rows"][0]["status"] == "INCOMPLETE", (row_id, result)
+        assert result["incomplete"] is True, (row_id, result)
+
+
 def test_not_applicable_with_specific_plan_ruling_does_not_block_parity(case):
     """P5-T19 #102 的逐列免測狀態須帶指向計畫明確列的引用，且不要求不存在的測試 nodeid。"""
     j = _judge_mod()
@@ -1010,6 +1028,50 @@ def test_capability_sections_and_py_parity_match_expect_and_lock():
     assert uncarried == [], uncarried
 
 
+@pytest.mark.parametrize(
+    "problem", ["missing_provenance", "other_head", "dirty", "argv", "markexpr", "provenance_platform", "provenance_schema"]
+)
+def test_py_parity_windows_rejects_unbound_or_mismatched_l1(case, problem):
+    """OD101-04：Windows parity judge 核對 provenance 與凍結 selector／markexpr。"""
+    nodeid = "tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::test_windows_guarded_write_stall_drain_stalled_native"
+    selector = ["-q", nodeid, "-m", "windows_native and windows_com"]
+    exp = case.expect()
+    exp["lock"]["sets"]["s21_gate:py_parity"]["windows"] = {
+        "nodeids": [nodeid],
+        "selector": {"argv": selector, "markexpr": "windows_native and windows_com", "paths": [nodeid]},
+    }
+    l1 = _l1("windows", "pytest", [_row(nodeid)])
+    l1["argv"] = ["/x/pytest/__main__.py", *selector]
+    l1["markexpr"] = "windows_native and windows_com"
+    l1["provenance"] = {
+        "schema": "pytest-l1-provenance.v1", "platform": "windows",
+        "git": {"head": "e" * 40, "clean": True, "end": {"head": "e" * 40, "clean": True}},
+    }
+    if problem == "missing_provenance":
+        l1.pop("provenance")
+    elif problem == "other_head":
+        l1["provenance"]["git"]["head"] = "f" * 40
+    elif problem == "dirty":
+        l1["provenance"]["git"]["clean"] = False
+    elif problem == "provenance_platform":
+        l1["provenance"]["platform"] = "linux"
+    elif problem == "provenance_schema":
+        l1["provenance"]["schema"] = "other.v1"
+    elif problem == "argv":
+        l1["argv"].append("tests/unexpected.py")
+    else:
+        l1["markexpr"] = "windows_native"
+    case.l1["py_parity_windows"] = l1
+    case.parity = _parity_cfg([{"id": "F-S19", "status": "PASS", "tests": [nodeid]}])
+    exp["parity"] = case.parity
+
+    out = _judge_mod().judge(case.report(), exp)
+
+    assert _sec(out, "py_parity_windows")["status"] == "EVIDENCE_MISSING", (problem, _sec(out, "py_parity_windows"))
+    assert out["parity_amendments"]["rows"][0]["status"] == "INCOMPLETE", (problem, out["parity_amendments"])
+    assert out["parity_amendments"]["incomplete"] is True
+
+
 def test_windows_py_parity_passed_pool_requires_accepted_windows_l1(case):
     """F-S19 只有 Windows selector L1 判 PASS 時才加入 parity passed pool；缺證仍是 INCOMPLETE。"""
     nodeid = "tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::test_windows_guarded_write_stall_drain_stalled_native"
@@ -1022,6 +1084,10 @@ def test_windows_py_parity_passed_pool_requires_accepted_windows_l1(case):
     case.l1["py_parity_windows"] = _l1("windows", "pytest", [_row(nodeid)])
     case.l1["py_parity_windows"]["argv"] = ["/x/pytest/__main__.py", *selector]
     case.l1["py_parity_windows"]["markexpr"] = "windows_native and windows_com"
+    case.l1["py_parity_windows"]["provenance"] = {
+        "schema": "pytest-l1-provenance.v1", "platform": "windows",
+        "git": {"head": "e" * 40, "clean": True, "end": {"head": "e" * 40, "clean": True}},
+    }
     case.parity = _parity_cfg([{"id": "F-S19", "status": "PASS", "tests": [nodeid]}])
     exp["parity"] = case.parity
 
@@ -1034,6 +1100,43 @@ def test_windows_py_parity_passed_pool_requires_accepted_windows_l1(case):
     assert _sec(missing, "py_parity_windows")["status"] == "EVIDENCE_MISSING"
     assert missing["parity_amendments"]["rows"][0]["status"] == "INCOMPLETE"
     assert missing["parity_amendments"]["incomplete"] is True
+
+
+def test_py_parity_windows_binds_to_real_frozen_selector(case):
+    """OD101-04：使用正式 L1 lock；缺 Windows selector 時須 fail-closed，不以 synthetic selector 代替。"""
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    spec = lock["sets"]["s21_gate:py_parity"].get("windows")
+    expect = case.expect()
+    expect["lock"] = lock
+
+    if not isinstance(spec, dict) or not isinstance(spec.get("selector"), dict) or not spec.get("nodeids"):
+        nodeid = "tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::test_windows_guarded_write_stall_drain_stalled_native"
+        case.parity = _parity_cfg([{"id": "F-S19", "status": "PASS", "tests": [nodeid]}])
+        expect["parity"] = case.parity
+        out = _judge_mod().judge(case.report(), expect)
+        assert _sec(out, "py_parity_windows")["status"] == "EVIDENCE_MISSING"
+        assert out["parity_amendments"]["rows"][0]["status"] == "INCOMPLETE"
+        return
+
+    selector = spec["selector"]
+    assert isinstance(selector.get("argv"), list) and isinstance(selector.get("markexpr"), str)
+    nodeids = list(spec["nodeids"])
+    assert nodeids and all(isinstance(nodeid, str) for nodeid in nodeids)
+    l1 = _l1("windows", "pytest", [_row(nodeid) for nodeid in nodeids])
+    l1["argv"] = ["/x/pytest/__main__.py", *selector["argv"]]
+    l1["markexpr"] = selector["markexpr"]
+    l1["provenance"] = {
+        "schema": "pytest-l1-provenance.v1", "platform": "windows",
+        "git": {"head": "e" * 40, "clean": True, "end": {"head": "e" * 40, "clean": True}},
+    }
+    case.l1["py_parity_windows"] = l1
+    case.parity = _parity_cfg([{"id": "F-S19", "status": "PASS", "tests": nodeids}])
+    expect["parity"] = case.parity
+
+    out = _judge_mod().judge(case.report(), expect)
+
+    assert _sec(out, "py_parity_windows")["status"] == "PASS"
+    assert out["parity_amendments"]["rows"][0]["status"] == "PASS"
 
 
 def test_py_parity_full_has_complete_selector_and_keeps_old_set():

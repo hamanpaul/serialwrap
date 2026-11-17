@@ -2990,3 +2990,177 @@ platform_exclusions:
   error_code:DAEMON_ALREADY_RUNNING:
     linux:
     - tests/test_lock_win.py::test_two_locks_same_path_second_raises
+exclusion_approvals:
+  cli_cmd:alias list:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_alias_roundtrip
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:daemon restart:
+    windows:
+    - nodeid: tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_restart_ab
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:daemon start:
+    windows:
+    - nodeid: tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_start_ab_conflict
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:device attach:
+    linux:
+    - nodeid: tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    windows:
+    - nodeid: tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    - nodeid: tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    - nodeid: tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    - nodeid: tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    - nodeid: tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+  cli_cmd:device list:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_device_mcu_health
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:event list:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_rule_roundtrip
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:event show:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_show_returns_registered_rule
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:event status:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_status_lists_enabled_daemon_selector
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:event tail:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_tail_reads_matcher_log
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:log tail-raw:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_tail_raw_reads_daemon_wal
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:log tail-text:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:session activity:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_activity_reports_live_session
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:session console-list:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_console_attach_detach
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:session list:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_reaches_ready
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:session log-status:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_log_capture_lifecycle
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:wal current-seq:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:wal export:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  error_code:DAEMON_ALREADY_RUNNING:
+    linux:
+    - nodeid: tests/test_lock_win.py::test_two_locks_same_path_second_raises
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+  error_code:DEVICE_STILL_HELD:
+    linux:
+    - nodeid: tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    windows:
+    - nodeid: tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    - nodeid: tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    - nodeid: tests/test_stage0_uart_exclusive.py::TestAttachProbeDrain::test_attach_device_force_rejects_plain_external_holder
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+  rpc_method:alias.list:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_alias_roundtrip
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:daemon.handoff_stop:
+    windows:
+    - nodeid: tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_refuses_while_push[after_probe]
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:device.attach:
+    linux:
+    - nodeid: tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    windows:
+    - nodeid: tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    - nodeid: tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    - nodeid: tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    - nodeid: tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    - nodeid: tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+  rpc_method:device.list:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_device_mcu_health
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:event.com_status:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_status_lists_enabled_daemon_selector
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:event.rule_get:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_show_returns_registered_rule
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:event.rule_list:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_rule_roundtrip
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:event.tail:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_tail_reads_matcher_log
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:log.tail_raw:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_tail_raw_reads_daemon_wal
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:log.tail_text:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:session.activity:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_activity_reports_live_session
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:session.console_list:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_console_attach_detach
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:session.get_state:
+    windows:
+    - nodeid: tests/contract_blackbox/slice21/test_f1_cmd_contract.py::test_near_limit_no_logout
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:session.list:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_reaches_ready
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:session.log_status:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_log_capture_lifecycle
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:wal.current_seq:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:wal.range:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留

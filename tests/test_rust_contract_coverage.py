@@ -1283,6 +1283,19 @@ def test_od99_real_universe_has_adjudicated_l1_or_python_nodes(tmp_path):
         ROOT / "tests/acceptance/cases.lock.json", map_path,
     )
     base_map = {key: value for key, value in map_doc.items() if key not in {"od99_ab_nodeids", "l1_only_approvals"}}
+    od99_exclusions = {
+        (contract_id, platform, nodeid)
+        for contract_id, row in ab_nodeids.items()
+        for platform, nodeids in (row.get("exclude_nodeids") or {}).items()
+        for nodeid in nodeids
+    }
+    base_approvals = {}
+    for contract_id, by_platform in map_doc.get("exclusion_approvals", {}).items():
+        for platform, rows in by_platform.items():
+            kept = [row for row in rows if (contract_id, platform, row.get("nodeid")) not in od99_exclusions]
+            if kept:
+                base_approvals.setdefault(contract_id, {})[platform] = kept
+    base_map["exclusion_approvals"] = base_approvals
     base_map_path = tmp_path / "coverage_map-before-od99.yaml"
     base_map_path.write_text(yaml.safe_dump(base_map, allow_unicode=True, sort_keys=False), encoding="utf-8")
     base = cc.universe(
@@ -1433,6 +1446,147 @@ def test_od99_real_universe_has_adjudicated_l1_or_python_nodes(tmp_path):
                     continue
                 if platform not in _node_platforms(nodeid):
                     assert nodeid in excluded, (contract_id, platform, nodeid)
+
+
+def test_od101_exclusion_set_and_approvals_are_complete():
+    """OD101-02：凍結完整平台排除集合；每筆都須有 OD-99／slice24-05 逐筆核准。"""
+    import yaml
+
+    cc = _module()
+    universe = cc.universe(
+        ROOT / "contracts", ROOT / "tests/acceptance/cases.yaml",
+        ROOT / "tests/acceptance/cases.lock.json", ROOT / "contracts/coverage_map.yaml",
+    )
+    expected = {
+        ("error_code:DAEMON_ALREADY_RUNNING", "linux", "tests/test_lock_win.py::test_two_locks_same_path_second_raises"),
+        ("error_code:DEVICE_STILL_HELD", "linux", "tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown"),
+        ("error_code:DEVICE_STILL_HELD", "windows", "tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits"),
+        ("error_code:DEVICE_STILL_HELD", "windows", "tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns"),
+        ("error_code:DEVICE_STILL_HELD", "windows", "tests/test_stage0_uart_exclusive.py::TestAttachProbeDrain::test_attach_device_force_rejects_plain_external_holder"),
+        ("rpc_method:alias.list", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_alias_roundtrip"),
+        ("rpc_method:daemon.handoff_stop", "windows", "tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_refuses_while_push[after_probe]"),
+        ("rpc_method:device.attach", "linux", "tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown"),
+        ("rpc_method:device.attach", "windows", "tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend"),
+        ("rpc_method:device.attach", "windows", "tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits"),
+        ("rpc_method:device.attach", "windows", "tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns"),
+        ("rpc_method:device.attach", "windows", "tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown"),
+        ("rpc_method:device.attach", "windows", "tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq"),
+        ("rpc_method:device.list", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_device_mcu_health"),
+        ("rpc_method:event.com_status", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_status_lists_enabled_daemon_selector"),
+        ("rpc_method:event.rule_get", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_show_returns_registered_rule"),
+        ("rpc_method:event.rule_list", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_rule_roundtrip"),
+        ("rpc_method:event.tail", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_tail_reads_matcher_log"),
+        ("rpc_method:log.tail_raw", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_tail_raw_reads_daemon_wal"),
+        ("rpc_method:log.tail_text", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal"),
+        ("rpc_method:session.activity", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_activity_reports_live_session"),
+        ("rpc_method:session.console_list", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_console_attach_detach"),
+        ("rpc_method:session.get_state", "windows", "tests/contract_blackbox/slice21/test_f1_cmd_contract.py::test_near_limit_no_logout"),
+        ("rpc_method:session.list", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_reaches_ready"),
+        ("rpc_method:session.log_status", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_log_capture_lifecycle"),
+        ("rpc_method:wal.current_seq", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal"),
+        ("rpc_method:wal.range", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal"),
+        ("cli_cmd:daemon start", "windows", "tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_start_ab_conflict"),
+        ("cli_cmd:daemon restart", "windows", "tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_restart_ab"),
+        ("cli_cmd:device list", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_device_mcu_health"),
+        ("cli_cmd:device attach", "linux", "tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown"),
+        ("cli_cmd:device attach", "windows", "tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend"),
+        ("cli_cmd:device attach", "windows", "tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits"),
+        ("cli_cmd:device attach", "windows", "tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns"),
+        ("cli_cmd:device attach", "windows", "tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown"),
+        ("cli_cmd:device attach", "windows", "tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq"),
+        ("cli_cmd:session list", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_reaches_ready"),
+        ("cli_cmd:session activity", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_activity_reports_live_session"),
+        ("cli_cmd:session console-list", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_console_attach_detach"),
+        ("cli_cmd:session log-status", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_log_capture_lifecycle"),
+        ("cli_cmd:alias list", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_alias_roundtrip"),
+        ("cli_cmd:log tail-raw", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_tail_raw_reads_daemon_wal"),
+        ("cli_cmd:log tail-text", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal"),
+        ("cli_cmd:wal export", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal"),
+        ("cli_cmd:wal current-seq", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal"),
+        ("cli_cmd:event list", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_rule_roundtrip"),
+        ("cli_cmd:event show", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_show_returns_registered_rule"),
+        ("cli_cmd:event status", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_status_lists_enabled_daemon_selector"),
+        ("cli_cmd:event tail", "windows", "tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_tail_reads_matcher_log"),
+    }
+    actual = {
+        (contract_id, platform, nodeid)
+        for contract_id, item in universe.items()
+        for platform, nodeids in item.get("exclude_nodeids", {}).items()
+        for nodeid in nodeids
+    }
+    assert actual == expected, f"missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
+
+    map_doc = yaml.safe_load((ROOT / "contracts/coverage_map.yaml").read_text(encoding="utf-8"))
+    approvals = map_doc.get("exclusion_approvals")
+    assert isinstance(approvals, dict), "每筆平台排除都必須有逐筆核准與理由"
+    approved = {
+        (contract_id, platform, row.get("nodeid"))
+        for contract_id, by_platform in approvals.items()
+        for platform, rows in by_platform.items()
+        for row in rows
+        if isinstance(row, dict)
+    }
+    assert approved == expected, f"approval missing={sorted(expected - approved)}, extra={sorted(approved - expected)}"
+    assert len({contract_id for contract_id, platform, _ in expected if platform == "linux"}) == 4
+    assert len({contract_id for contract_id, platform, _ in expected if platform == "windows"}) == 35
+    assert len({contract_id for contract_id, platform, _ in expected
+                if platform == "windows" and contract_id in map_doc["od99_ab_nodeids"]}) == 32
+    for contract_id, by_platform in approvals.items():
+        for platform, rows in by_platform.items():
+            for row in rows:
+                reason = row.get("reason") if isinstance(row, dict) else None
+                assert isinstance(reason, str) and reason.strip() and "\n" not in reason and "\r" not in reason
+                assert "OD-99" in reason or "slice24-05" in reason, (contract_id, platform, row)
+
+
+def test_od101_exclusion_approval_and_nonempty_platform_gate(tmp_path):
+    """OD101-02：缺核准／理由、孤兒核准及排除後空集合均須拒絕。"""
+    import copy
+    import yaml
+
+    cc = _module()
+    source = ROOT / "contracts/coverage_map.yaml"
+    map_doc = yaml.safe_load(source.read_text(encoding="utf-8"))
+    source_universe = cc.universe(
+        ROOT / "contracts", ROOT / "tests/acceptance/cases.yaml",
+        ROOT / "tests/acceptance/cases.lock.json", source,
+    )
+    approvals = {}
+    for contract_id, item in source_universe.items():
+        for platform, nodeids in item.get("exclude_nodeids", {}).items():
+            approvals.setdefault(contract_id, {}).setdefault(platform, []).extend(
+                {"nodeid": nodeid, "reason": "OD-99 測試夾具逐筆核准。"} for nodeid in nodeids
+            )
+    map_doc["exclusion_approvals"] = approvals
+
+    def evaluate(doc, name):
+        path = tmp_path / f"{name}.yaml"
+        path.write_text(yaml.safe_dump(doc, allow_unicode=True, sort_keys=True), encoding="utf-8")
+        return cc.universe(
+            ROOT / "contracts", ROOT / "tests/acceptance/cases.yaml",
+            ROOT / "tests/acceptance/cases.lock.json", path,
+        )
+
+    missing = copy.deepcopy(map_doc)
+    missing["exclusion_approvals"]["error_code:DAEMON_ALREADY_RUNNING"]["linux"].clear()
+    no_reason = copy.deepcopy(map_doc)
+    no_reason["exclusion_approvals"]["error_code:DAEMON_ALREADY_RUNNING"]["linux"][0]["reason"] = ""
+    orphan = copy.deepcopy(map_doc)
+    orphan["exclusion_approvals"]["error_code:DAEMON_ALREADY_RUNNING"]["linux"].append(
+        {"nodeid": "tests/test_lock_win.py::test_not_an_exclusion", "reason": "OD-99 測試夾具逐筆核准。"}
+    )
+    for name, bad_doc in (("missing", missing), ("no-reason", no_reason), ("orphan", orphan)):
+        with pytest.raises(ValueError):
+            evaluate(bad_doc, name)
+
+    empty = copy.deepcopy(map_doc)
+    nodeid = "tests/contract_blackbox/test_s24_mcu_rpc.py::test_patterns_exact_bytes"
+    empty["entries"]["rpc_method:mcu.patterns"].setdefault("exclude_nodeids", {})["linux"] = [nodeid]
+    empty["exclusion_approvals"].setdefault("rpc_method:mcu.patterns", {}).setdefault("linux", []).append(
+        {"nodeid": nodeid, "reason": "slice24-05 測試夾具逐筆核准。"}
+    )
+    with pytest.raises(ValueError, match="排除後.*必要節點為空"):
+        evaluate(empty, "empty-platform")
 
 
 def test_platform_artifacts_are_checked_per_platform(tmp_path):
