@@ -45,7 +45,7 @@ use sw_proto::release_manifest::parse_current_release;
 use sw_proto::runtime_paths::{resolve_daemon_dirs, DaemonDirs, EnvSnapshot, NativeTraits, PathsError, RuntimePaths};
 
 use crate::code_identity::{capture as capture_code_identity, CodeIdentity};
-use crate::framing::{RpcHandler, RpcServer};
+use crate::framing::{RpcHandler, RpcServer, RpcStopAccept};
 use crate::service::{FlashState, Service, ServiceDeps, ServiceHandler};
 
 pub use crate::service::TestAllowlist;
@@ -1067,6 +1067,8 @@ type Hook = Arc<dyn Fn() + Send + Sync>;
 struct Hooks {
     before_release_commit: Option<Hook>,
     after_release_commit: Option<Hook>,
+    #[cfg(feature = "test-fakes")]
+    before_server_stop_accept: Option<Hook>,
     trace: Option<Box<dyn Fn(Stage) + Send + Sync>>,
     /// 每筆 RPC 分派前以 method 名呼叫（test-fakes `DaemonHooks::rpc_call`）。
     rpc_call: Option<Arc<dyn Fn(&str) + Send + Sync>>,
@@ -1433,7 +1435,12 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
         }
     };
     let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
-    let service_handler: Arc<dyn RpcHandler> = Arc::new(ServiceHandler::new(svc.clone(), stop_tx));
+    let stop_accept = RpcStopAccept::new();
+    let service_handler: Arc<dyn RpcHandler> = Arc::new(ServiceHandler::new(
+        svc.clone(),
+        stop_tx,
+        stop_accept.clone(),
+    ));
     let handler: Arc<dyn RpcHandler> = match &hooks.rpc_call {
         Some(hook) => Arc::new(HookedHandler {
             inner: service_handler,
@@ -1441,7 +1448,7 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
         }),
         None => service_handler,
     };
-    let server = RpcServer::start(listener, handler);
+    let server = RpcServer::start_with_stop_accept(listener, handler, stop_accept);
     hooks.trace(Stage::Bound);
     write_endpoint(&env, &paths, &p, &args.socket);
     hooks.trace(Stage::EndpointWritten);
@@ -1455,6 +1462,10 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
     // P8 Task 14：admission 凍結（Python `service.stop()` 的 `admission.freeze()`）：停止序開始後新操作一律 handoff_frozen；
     // 之後交接回滾不得撤銷此凍結。
     svc.shutdown_freeze();
+    #[cfg(feature = "test-fakes")]
+    if let Some(hook) = &hooks.before_server_stop_accept {
+        hook();
+    }
     server.stop_accept(); // 1 只停 accept，不等進行中的 handler（避免 600 s file.push 卡死停止序）
     hooks.trace(Stage::ServerStopAccept);
     let before: HashMap<String, Option<String>> = registry.error_codes().into_iter().collect();
@@ -1699,6 +1710,7 @@ impl From<Stage> for TraceEvent {
 pub struct DaemonHooks {
     pub before_state_commit: Option<Box<dyn Fn() + Send + Sync>>,
     pub after_state_commit: Option<Box<dyn Fn() + Send + Sync>>,
+    pub before_server_stop_accept: Option<Box<dyn Fn() + Send + Sync>>,
     pub trace: Option<Box<dyn Fn(TraceEvent) + Send + Sync>>,
     pub block_flash_endpoint_stop: bool,
     pub rpc_call: Option<Box<dyn Fn(&str) + Send + Sync>>,
@@ -1712,6 +1724,7 @@ pub fn run_with_hooks(argv: Vec<String>, platform: Platform, hooks: DaemonHooks)
     let DaemonHooks {
         before_state_commit,
         after_state_commit,
+        before_server_stop_accept,
         trace,
         block_flash_endpoint_stop,
         rpc_call,
@@ -1724,6 +1737,7 @@ pub fn run_with_hooks(argv: Vec<String>, platform: Platform, hooks: DaemonHooks)
     let inner = Hooks {
         before_release_commit: before_state_commit.map(Arc::from),
         after_release_commit: after_state_commit.map(Arc::from),
+        before_server_stop_accept: before_server_stop_accept.map(Arc::from),
         trace: trace.map(|t| -> Box<dyn Fn(Stage) + Send + Sync> { Box::new(move |s| t(TraceEvent::from(s))) }),
         rpc_call: rpc_call.map(Arc::from),
         on_manager,

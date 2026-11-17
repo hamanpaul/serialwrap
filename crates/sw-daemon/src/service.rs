@@ -38,7 +38,7 @@ use sw_proto::pyre::valid_completion_regex;
 use sw_proto::rpc_types::Params;
 use sw_proto::source_policy::{classify_source, check_source, SourceCheck};
 
-use crate::framing::RpcHandler;
+use crate::framing::{RpcHandler, RpcStopAccept};
 
 /// 一般 session 請求的等待上限。
 const ROUTE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -1487,15 +1487,21 @@ fn handoff_query_incomplete(com: &str, interactive_id: Option<String>) -> PyDict
 pub struct ServiceHandler {
     svc: Arc<Service>,
     stop: crossbeam_channel::Sender<()>,
+    stop_accept: RpcStopAccept,
     /// P8 Task 14：交接排空窗口的停止計時已排程（只排一次）。
     drain_armed: AtomicBool,
 }
 
 impl ServiceHandler {
-    pub fn new(svc: Arc<Service>, stop: crossbeam_channel::Sender<()>) -> ServiceHandler {
+    pub fn new(
+        svc: Arc<Service>,
+        stop: crossbeam_channel::Sender<()>,
+        stop_accept: RpcStopAccept,
+    ) -> ServiceHandler {
         ServiceHandler {
             svc,
             stop,
+            stop_accept,
             drain_armed: AtomicBool::new(false),
         }
     }
@@ -1506,6 +1512,7 @@ impl RpcHandler for ServiceHandler {
         self.svc.rpc(method, params)
     }
     fn request_stop(&self) {
+        self.stop_accept.request();
         let _ = self.stop.try_send(());
     }
     fn handoff_stop(&self, params: &PyDict) -> Result<PyDict, PyErr> {
@@ -1518,13 +1525,16 @@ impl RpcHandler for ServiceHandler {
             return;
         }
         let stop = self.stop.clone();
+        let stop_accept = self.stop_accept.clone();
         let spawned = std::thread::Builder::new()
             .name("serialwrap-handoff-drain".into())
             .spawn(move || {
                 std::thread::sleep(delay);
+                stop_accept.request();
                 let _ = stop.try_send(());
             });
         if spawned.is_err() {
+            self.stop_accept.request();
             let _ = self.stop.try_send(());
         }
     }

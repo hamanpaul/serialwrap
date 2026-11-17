@@ -308,6 +308,34 @@ fn no_profiles_message_and_continue() {
 }
 
 #[test]
+fn daemon_stop_reply_rejects_new_health_ping() {
+    let env = isolated_env();
+    let endpoint = env.socket.clone();
+    let platform = in_process_platform(&env.vars, Vec::new(), Fixture::None);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let hooks = DaemonHooks {
+        before_server_stop_accept: Some(Box::new(move || {
+            entered_tx.send(()).expect("通知停機前置鉤子已進入");
+            release_rx.recv().expect("解除停機前置鉤子");
+        })),
+        ..DaemonHooks::default()
+    };
+    let server = thread::spawn(move || run_with_hooks(vec!["serialwrapd".into()], platform, hooks));
+    wait_socket(&endpoint, SHORT);
+
+    let stopped = rpc_value(&endpoint, "daemon.stop", "{}");
+    assert_eq!(stopped["ok"], true, "daemon.stop 必須先回覆成功：{stopped:?}");
+    entered_rx.recv_timeout(SHORT).expect("daemon 停機必須抵達 server.stop_accept 前的同步點");
+    let ping = rpc_value(&endpoint, "health.ping", "{}");
+    release_tx.send(()).expect("解除停機前置鉤子");
+    let code = server.join().expect("daemon 行程執行緒");
+
+    assert_eq!(ping, PyValue::Null, "daemon.stop 回覆後新的 RPC 必須無法連線：{ping:?}");
+    assert_eq!(code, 0, "daemon.stop 應完成正常停止");
+}
+
+#[test]
 fn windows_default_allowlist_health_has_no_dynamic_sessions() {
     let caps = sw_pal::native().caps;
     let env = isolated_env();

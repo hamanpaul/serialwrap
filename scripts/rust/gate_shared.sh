@@ -24,6 +24,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
   echo "gate_shared.sh dry-run：候選 artifact 與共用證據目錄 $RUN_DIR"
   echo "執行：source scripts/rust/gate_prereqs.sh --gate；失敗記錄到 <LOG_DIR>/driver.tsv 並停止。"
   echo "執行：cargo build --workspace --bins；cargo build --workspace --bins --release --target x86_64-unknown-linux-gnu。"
+  echo "執行：scripts/rust/mkbundle.sh --release-bundle --stage 2 --profile release --out $RUN_DIR/candidate-bundle；以同 HEAD Stage 2 bundle 綁定 s24_ab，並在 pytest 設 SERIALWRAP_CLI_EXE、SERIALWRAP_DAEMON_EXE、SW_BUNDLE。"
   echo "執行：env SW_RESOURCE_REPORT=<L1> SERIALWRAP_COVERAGE_RUN_DIR=<COVERAGE> SERIALWRAP_COVERAGE_LABEL=python-linux python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence --junitxml=<JUNIT>。"
   echo "執行：cargo test --workspace；python3 scripts/rust/cargo_l1_results.py --platform linux --out <L1> -- --workspace --features test-fakes -- --skip cap_。"
   echo "執行：python3 scripts/rust/cargo_l1_results.py --platform linux --out <L1> -- --workspace --features test-fakes；python3 scripts/rust/import_cargo_results.py --label rust-linux --platform linux --include-cap posix_pty --include-cap process_rpc -- --workspace --features test-fakes。"
@@ -79,11 +80,20 @@ run_capture "$LOG_DIR/build-debug.log" cargo build --workspace --bins
 [[ "$LAST_RC" == 0 ]] || exit "$LAST_RC"
 run_capture "$LOG_DIR/build-release.log" cargo build --workspace --bins --release --target x86_64-unknown-linux-gnu
 [[ "$LAST_RC" == 0 ]] || exit "$LAST_RC"
+mkdir -p "$RUN_DIR"
+S24_BUNDLE="$RUN_DIR/candidate-bundle"
+run_capture "$LOG_DIR/build-s24-release-bundle.log" bash scripts/rust/mkbundle.sh \
+  --release-bundle --stage 2 --profile release --out "$S24_BUNDLE"
+[[ "$LAST_RC" == 0 ]] || exit "$LAST_RC"
+S24_BUNDLE_CLI="$(realpath -e "$S24_BUNDLE/bin/serialwrap")"
+S24_BUNDLE_DAEMON="$(realpath -e "$S24_BUNDLE/bin/serialwrapd")"
+S24_BUNDLE_VERSION_ROOT="$(dirname "$(dirname "$S24_BUNDLE_CLI")")"
 python3 scripts/rust/gate_shared_evidence.py init --shared-evidence "$RUN_DIR" \
+  --candidate-bundle "$S24_BUNDLE" \
   --artifact "debug_cli=$CARGO_TARGET_DIR/debug/serialwrap" \
   --artifact "debug_daemon=$CARGO_TARGET_DIR/debug/serialwrapd" \
-  --artifact "release_cli=$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/serialwrap" \
-  --artifact "release_daemon=$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/serialwrapd" \
+  --artifact "release_cli=$S24_BUNDLE_CLI" \
+  --artifact "release_daemon=$S24_BUNDLE_DAEMON" \
   >"$LOG_DIR/manifest-init.json"
 
 mapfile -d '' -t PYTEST_ARGV < <(python3 - <<'PY'
@@ -172,9 +182,11 @@ S24_TARGETS=(tests/contract_blackbox tests/acceptance/l15/test_slice21_l15.py \
 S24_DATA="$RUN_DIR/work/s24-ab"
 mkdir -p "$S24_DATA"
 run_capture "$LOG_DIR/s24-ab.log" env \
-  SERIALWRAP_CLI_EXE="$RUN_DIR/artifacts/debug/serialwrap" SERIALWRAP_DAEMON_EXE="$RUN_DIR/artifacts/debug/serialwrapd" \
-  SERIALWRAP_AB_LABEL=rust-linux SERIALWRAP_COVERAGE_RUN_DIR="$RUN_DIR/coverage" \
-  SERIALWRAP_COVERAGE_LABEL=rust-linux python3 -m pytest -q "${S24_TARGETS[@]}" --junitxml="$S24_DATA/junit.xml"
+  SERIALWRAP_CLI_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrap" \
+  SERIALWRAP_DAEMON_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrapd" \
+  SW_BUNDLE="$S24_BUNDLE" SERIALWRAP_AB_LABEL=rust-linux \
+  SERIALWRAP_COVERAGE_RUN_DIR="$RUN_DIR/coverage" SERIALWRAP_COVERAGE_LABEL=rust-linux \
+  python3 -m pytest -q "${S24_TARGETS[@]}" --junitxml="$S24_DATA/junit.xml"
 tar -czf "$RUN_DIR/work/s24-coverage.tar.gz" -C "$RUN_DIR" coverage
 python3 scripts/rust/gate_shared_evidence.py record-section --shared-evidence "$RUN_DIR" --section s24_ab \
   --argv-json "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' -q "${S24_TARGETS[@]}")" \

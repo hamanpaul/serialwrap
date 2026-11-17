@@ -18,8 +18,10 @@ import pytest
 from bb_harness import (
     cli_prefix,
     isolated_env,
+    is_rust,
     python_baseline_prefix,
     repo_root,
+    rust_daemon_code_fingerprint,
 )
 from mgmt_fixtures import STUBS_BIN
 
@@ -167,6 +169,30 @@ def test_setup_ab_user_with_stub_systemctl(tmp_path: Path) -> None:
         th.join(timeout=2.0)
 
         norm_stdout = _normalize_output(proc.stdout, work)
+        if label == "cli" and is_rust():
+            try:
+                rust_result = json.loads(proc.stdout)
+                rust_fingerprint = rust_result["daemon_code"]["installed"]
+            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                pytest.fail(f"Rust setup 回應缺少 daemon_code.installed：{proc.stdout!r}: {exc}")
+            expected_fingerprint = rust_daemon_code_fingerprint()
+            assert rust_fingerprint == expected_fingerprint, (
+                f"Rust setup daemon_code.installed 必須等於受測 bundle daemon digest："
+                f"{rust_fingerprint!r} != {expected_fingerprint!r}"
+            )
+            python_golden = json.loads(
+                (repo_root() / "contracts" / "cli_help" / "linux" / "action_version.json")
+                .read_text(encoding="utf-8")
+            )["stdout"]
+            golden_match = re.search(r"\(code ([0-9a-f]{12})\)", python_golden)
+            assert golden_match is not None, "Python version golden 缺少 code fingerprint"
+            python_fingerprint = golden_match.group(1)
+            assert proc.stdout.count(f'"installed":"{rust_fingerprint}"') == 1, (
+                "Rust setup 回應的 installed fingerprint 必須只出現一次"
+            )
+            norm_stdout = proc.stdout.replace(
+                f'"installed":"{rust_fingerprint}"', f'"installed":"{python_fingerprint}"', 1
+            )
         unit_file = work / "home" / ".config" / "systemd" / "user" / "serialwrap.service"
         unit_content = unit_file.read_text(encoding="utf-8") if unit_file.exists() else ""
         norm_unit = _normalize_output(unit_content, work)

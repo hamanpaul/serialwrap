@@ -71,7 +71,7 @@ done
 if [[ "$DRY_RUN" == "1" ]]; then
   echo "slice24_exit.sh dry-run：只列出計畫，不執行命令。"
   if [[ -n "$SHARED_EVIDENCE" ]]; then
-    echo "shared-evidence import：debug/release artifacts、pytest_full、cargo_fakes_p7、cargo_workspace_default、cargo_contract_results、s24_ab（$SHARED_EVIDENCE）；selector/provenance/SHA 不符記 EVIDENCE_MISSING，FAIL 照傳且不重跑。artifact provenance 不符：EVIDENCE_MISSING，不啟動本地建置。"
+    echo "shared-evidence import：debug/release artifacts、pytest_full、cargo_fakes_p7、cargo_workspace_default、cargo_contract_results、s24_ab（$SHARED_EVIDENCE）；候選 bundle 未指定 --candidate-bundle 時讀取 shared manifest，指定 --candidate-bundle DIR 時必須同 tree／manifest／CLI／daemon；SW_BUNDLE 指向該候選。selector/provenance/SHA 不符記 EVIDENCE_MISSING，FAIL 照傳且不重跑。artifact provenance 不符：EVIDENCE_MISSING，不啟動本地建置。"
     echo "執行：env CARGO_INCREMENTAL=0 cargo check --workspace --target x86_64-pc-windows-gnu。"
   else
     echo "執行：cargo build --workspace --bins；python3 scripts/rust/check_cfg_boundary.py。"
@@ -170,8 +170,30 @@ run_logged() {
 RUST_CLI="$RUN_DIR/artifacts/serialwrap"
 RUST_DAEMON="$RUN_DIR/artifacts/serialwrapd"
 SHARED_ARTIFACTS_VALID=0
+SHARED_BUNDLE_INVALID=0
 SHARED_ARTIFACT_DIR="$RUN_DIR/shared-artifact-import"
 SHARED_ARTIFACT_ARGS=()
+if [[ -n "$SHARED_EVIDENCE" ]]; then
+  BUNDLE_CHECK_ARGS=(--shared-evidence "$SHARED_EVIDENCE")
+  [[ -z "$CANDIDATE_BUNDLE" ]] || BUNDLE_CHECK_ARGS+=(--candidate-bundle "$CANDIDATE_BUNDLE")
+  if python3 scripts/rust/gate_shared_evidence.py check-candidate-bundle "${BUNDLE_CHECK_ARGS[@]}" \
+      >"$RUN_DIR/logs/shared-candidate-bundle.json" 2>"$RUN_DIR/logs/shared-candidate-bundle.stderr"; then
+    RESOLVED_BUNDLE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("path", ""))' \
+      "$RUN_DIR/logs/shared-candidate-bundle.json")"
+    if [[ -n "$RESOLVED_BUNDLE" ]]; then
+      CANDIDATE_BUNDLE="$RESOLVED_BUNDLE"
+    else
+      SHARED_BUNDLE_INVALID=1
+      FAILURES=1
+      echo "EVIDENCE_MISSING：共用證據未回傳有效 candidate bundle 路徑。" >"$RUN_DIR/logs/shared-candidate-bundle.stderr"
+    fi
+  else
+    SHARED_BUNDLE_INVALID=1
+    FAILURES=1
+    CANDIDATE_BUNDLE=""
+    echo "EVIDENCE_MISSING：共用 candidate bundle 缺失、不符 HEAD 或與外部指定候選不一致。" >>"$RUN_DIR/logs/shared-candidate-bundle.stderr"
+  fi
+fi
 if [[ -n "$SHARED_EVIDENCE" ]]; then
   if python3 scripts/rust/gate_shared_evidence.py import-artifacts --shared-evidence "$SHARED_EVIDENCE" \
       --out-dir "$SHARED_ARTIFACT_DIR" >"$RUN_DIR/logs/shared-artifacts.json" \
@@ -368,9 +390,15 @@ RUST_PYTEST_TARGETS=(
 )
 if [[ -f "$RUST_CLI" && -f "$RUST_DAEMON" ]]; then
   if [[ -n "$SHARED_EVIDENCE" ]]; then
-    if [[ "$SHARED_ARTIFACTS_VALID" == 1 ]] && python3 scripts/rust/gate_shared_evidence.py import-section \
+    S24_BUNDLE_ARGS=()
+    [[ -z "$CANDIDATE_BUNDLE" ]] || S24_BUNDLE_ARGS+=(--candidate-bundle "$CANDIDATE_BUNDLE")
+    if [[ "$SHARED_BUNDLE_INVALID" == 1 ]]; then
+      echo "EVIDENCE_MISSING：shared s24_ab candidate bundle 驗證失敗；拒絕匯入。" >"$RUN_DIR/logs/rust-blackbox.log"
+      printf 'rust-blackbox\t3\n' >>"$DRIVER_TSV"
+      FAILURES=1
+    elif [[ "$SHARED_ARTIFACTS_VALID" == 1 ]] && python3 scripts/rust/gate_shared_evidence.py import-section \
         --shared-evidence "$SHARED_EVIDENCE" --gate slice24 --section s24_ab \
-        --expected-command s24_ab --platform linux \
+        --expected-command s24_ab --platform linux "${S24_BUNDLE_ARGS[@]}" \
         "${SHARED_ARTIFACT_ARGS[@]}" \
         --out-dir "$RUN_DIR/shared-import" >"$RUN_DIR/logs/shared-rust-blackbox.json" \
         2>"$RUN_DIR/logs/shared-rust-blackbox.stderr"; then
@@ -390,7 +418,9 @@ if [[ -f "$RUST_CLI" && -f "$RUST_DAEMON" ]]; then
       FAILURES=1
     fi
   else
-    run_logged rust-blackbox env \
+    S24_BUNDLE_ENV=()
+    [[ -z "$CANDIDATE_BUNDLE" ]] || S24_BUNDLE_ENV+=("SW_BUNDLE=$CANDIDATE_BUNDLE")
+    run_logged rust-blackbox env "${S24_BUNDLE_ENV[@]}" \
       SERIALWRAP_CLI_EXE="$RUST_CLI" \
       SERIALWRAP_DAEMON_EXE="$RUST_DAEMON" \
       SERIALWRAP_AB_LABEL=rust-linux \

@@ -17,6 +17,7 @@ from typing import Any, Mapping, Sequence
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LOCK = ROOT / "tests/acceptance/l1_required.lock.json"
 SCHEMA = "serialwrap-gate-shared-evidence.v1"
+CANDIDATE_BUNDLE_SCHEMA = "gate-shared-candidate-bundle.v1"
 REQUIRED_ARTIFACTS = ("debug_cli", "debug_daemon", "release_cli", "release_daemon")
 ARTIFACT_PATHS = {
     "debug_cli": "debug/serialwrap",
@@ -31,6 +32,208 @@ def sha256_file(path: Path) -> str | None:
         return hashlib.sha256(path.read_bytes()).hexdigest()
     except OSError:
         return None
+
+
+def _hash_field(digest: Any, value: bytes) -> None:
+    digest.update(len(value).to_bytes(8, "big"))
+    digest.update(value)
+
+
+def _bundle_tree_sha256(root: Path) -> str:
+    """雜湊候選 bundle 的路徑、型別、權限、symlink 目標與一般檔案內容摘要。"""
+    root = Path(root)
+    if root.is_symlink():
+        raise ValueError(f"候選 bundle 根目錄不得為 symlink：{root}")
+    root = root.resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError(f"候選 bundle 必須是一般目錄：{root}")
+    digest = hashlib.sha256()
+    entries = sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix())
+    for item in entries:
+        relative = item.relative_to(root).as_posix().encode("utf-8")
+        _hash_field(digest, relative)
+        if item.is_symlink():
+            target = os.readlink(item).encode("utf-8")
+            try:
+                item.resolve(strict=True).relative_to(root)
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"候選 bundle symlink 失效或逸出目錄：{item}") from exc
+            _hash_field(digest, b"symlink")
+            _hash_field(digest, target)
+        elif item.is_file():
+            file_digest = sha256_file(item)
+            if file_digest is None:
+                raise ValueError(f"候選 bundle 檔案不可讀：{item}")
+            mode = item.stat().st_mode & 0o7777
+            _hash_field(digest, b"file")
+            _hash_field(digest, mode.to_bytes(4, "big"))
+            _hash_field(digest, bytes.fromhex(file_digest))
+        elif item.is_dir():
+            _hash_field(digest, b"directory")
+        else:
+            raise ValueError(f"候選 bundle 含非一般檔案：{item}")
+    return digest.hexdigest()
+
+
+def _candidate_bundle_identity(bundle_root: Path, *, shared_dir: Path | None = None,
+                               expected_head: str | None = None) -> dict[str, Any]:
+    """驗證同 HEAD Stage 2 bundle，回傳可重算的 tree、manifest 與實際 CLI／daemon 身分。"""
+    root = Path(bundle_root)
+    if root.is_symlink():
+        raise ValueError(f"candidate bundle 根目錄不得為 symlink：{root}")
+    root = root.resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError(f"candidate bundle 必須是一般目錄：{root}")
+    cli_entry = root / "bin" / "serialwrap"
+    daemon_entry = root / "bin" / "serialwrapd"
+    if not cli_entry.is_file() or not daemon_entry.is_file():
+        raise ValueError(f"candidate bundle 缺少 bin/serialwrap 或 bin/serialwrapd：{root}")
+
+    cli_real = cli_entry.resolve(strict=True)
+    daemon_real = daemon_entry.resolve(strict=True)
+    try:
+        cli_real.relative_to(root)
+        daemon_real.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("candidate bundle CLI／daemon symlink 不得逸出 bundle") from exc
+    version_root = cli_real.parent.parent
+    if daemon_real.parent.parent != version_root:
+        raise ValueError("candidate bundle CLI 與 daemon 不屬於同一版本目錄")
+    manifest_path = version_root / "release-manifest.json"
+    if not manifest_path.is_file():
+        candidates = sorted(root.glob("versions/*/release-manifest.json"))
+        if root.name == "versions" or not candidates:
+            candidates = sorted(root.glob("**/release-manifest.json"))
+        if len(candidates) != 1:
+            raise ValueError(f"candidate bundle 必須唯一定位版本 release-manifest.json：{root}")
+        manifest_path = candidates[0].resolve(strict=True)
+        version_root = manifest_path.parent
+        cli_real = version_root / "bin" / "serialwrap"
+        daemon_real = version_root / "bin" / "serialwrapd"
+    if not cli_real.is_file() or not daemon_real.is_file():
+        raise ValueError("candidate bundle 版本目錄缺少 serialwrap／serialwrapd")
+    try:
+        cli_rel = cli_real.relative_to(root).as_posix()
+        daemon_rel = daemon_real.relative_to(root).as_posix()
+        manifest_rel = manifest_path.resolve(strict=True).relative_to(root).as_posix()
+    except ValueError as exc:
+        raise ValueError("candidate bundle 版本檔案或 manifest 逸出 bundle") from exc
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"candidate release-manifest.json 不可讀：{exc}") from exc
+    if not isinstance(manifest, Mapping):
+        raise ValueError("candidate release-manifest.json 根節點必須是 object")
+    git_revision = manifest.get("git_revision")
+    if not isinstance(git_revision, str) or not git_revision:
+        raise ValueError("candidate release manifest 缺少 git_revision")
+    if expected_head is not None and git_revision != expected_head:
+        raise ValueError(f"candidate git_revision={git_revision!r} 不等於候選 HEAD {expected_head!r}")
+    components = manifest.get("components")
+    components = components if isinstance(components, Mapping) else {}
+    cli_component = components.get("cli")
+    daemon = components.get("daemon")
+    if not isinstance(cli_component, Mapping) or cli_component.get("implementation") != "rust":
+        raise ValueError("candidate bundle 必須是 Rust CLI release")
+    if not isinstance(daemon, Mapping) or daemon.get("implementation") != "rust":
+        raise ValueError("candidate bundle 必須是 Rust Stage 2 daemon release")
+    if manifest.get("stage") != "rust-2":
+        raise ValueError(f"candidate bundle 必須是正式 Stage 2 release，stage={manifest.get('stage')!r}")
+    target = manifest.get("target")
+    if target != "x86_64-unknown-linux-gnu":
+        raise ValueError(f"candidate bundle 必須是 Linux x86_64 release，target={target!r}")
+    fingerprint = daemon.get("code_fingerprint")
+    if not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{12}", fingerprint):
+        raise ValueError("candidate manifest 缺少有效 components.daemon.code_fingerprint")
+    bundle_version = manifest.get("bundle_version")
+    if not isinstance(bundle_version, str) or not bundle_version:
+        raise ValueError("candidate release manifest 缺少 bundle_version")
+    cli_sha = sha256_file(cli_real)
+    daemon_sha = sha256_file(daemon_real)
+    manifest_sha = sha256_file(manifest_path)
+    if not cli_sha or not daemon_sha or not manifest_sha:
+        raise ValueError("candidate bundle CLI／daemon／manifest 摘要不可讀")
+    if sha256_file(cli_entry) != cli_sha or sha256_file(daemon_entry) != daemon_sha:
+        raise ValueError("candidate bundle 頂層 CLI／daemon 入口與 manifest 版本目錄中的執行檔不同")
+    launcher = daemon.get("launcher")
+    if cli_component.get("sha256") != cli_sha or not isinstance(launcher, Mapping) or launcher.get("sha256") != daemon_sha:
+        raise ValueError("candidate manifest CLI／daemon binary SHA256 與實際執行檔不符")
+    if fingerprint != daemon_sha[:12]:
+        raise ValueError("candidate manifest daemon code_fingerprint 與 Rust daemon SHA256 前 12 位不符")
+    try:
+        relative_root = root.relative_to(Path(shared_dir).resolve(strict=True)).as_posix() if shared_dir else None
+    except ValueError:
+        relative_root = None
+    if shared_dir is not None and relative_root is None:
+        raise ValueError("candidate bundle 必須位於 shared evidence 目錄內")
+    return {
+        "schema": CANDIDATE_BUNDLE_SCHEMA,
+        "path": relative_root,
+        "tree_sha256": _bundle_tree_sha256(root),
+        "manifest_path": manifest_rel,
+        "manifest_sha256": manifest_sha,
+        "git_revision": git_revision,
+        "bundle_version": bundle_version,
+        "target": target,
+        "daemon_code_fingerprint": fingerprint,
+        "cli_path": cli_rel,
+        "cli_sha256": cli_sha,
+        "daemon_path": daemon_rel,
+        "daemon_sha256": daemon_sha,
+    }
+
+
+def _bundle_identity_matches(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    return all(left.get(key) == right.get(key) for key in (
+        "schema", "tree_sha256", "manifest_path", "manifest_sha256", "git_revision",
+        "bundle_version", "target", "daemon_code_fingerprint", "cli_path", "cli_sha256", "daemon_path", "daemon_sha256",
+    ))
+
+
+def _recorded_candidate_bundle(shared_dir: Path, provenance: Mapping[str, Any], *,
+                               expected_head: str | None) -> tuple[dict[str, Any] | None, Path | None, list[str]]:
+    record = provenance.get("candidate_bundle")
+    if not isinstance(record, Mapping):
+        return None, None, ["candidate bundle provenance 缺失"]
+    raw_path = record.get("path")
+    bundle_root = _safe_path(shared_dir, raw_path)
+    if bundle_root is None:
+        return None, None, ["candidate bundle provenance path 不安全或不存在"]
+    try:
+        actual = _candidate_bundle_identity(bundle_root, shared_dir=shared_dir, expected_head=expected_head)
+    except (OSError, ValueError) as exc:
+        return None, bundle_root, [f"candidate bundle 驗證失敗：{exc}"]
+    if dict(record) != actual:
+        return None, bundle_root, ["candidate bundle provenance 與目前檔案／manifest 摘要不符"]
+    return actual, bundle_root, []
+
+
+def check_candidate_bundle(shared_dir: Path, *, candidate_bundle: Path | None = None,
+                           current_head: str | None = None) -> dict[str, Any]:
+    """驗證 shared 中記錄的 bundle；外部指定時另核對候選 bundle 完全相同。"""
+    shared_dir = Path(shared_dir).resolve(strict=True)
+    manifest, reasons = _load_manifest(shared_dir)
+    if manifest is None:
+        return {"status": "EVIDENCE_MISSING", "reasons": reasons}
+    provenance = manifest.get("provenance")
+    if not isinstance(provenance, Mapping):
+        return {"status": "EVIDENCE_MISSING", "reasons": ["provenance 缺失"]}
+    want_head = current_head if current_head is not None else get_current_head()
+    recorded, recorded_path, errors = _recorded_candidate_bundle(shared_dir, provenance, expected_head=want_head)
+    reasons.extend(errors)
+    selected_path = recorded_path
+    if candidate_bundle is not None:
+        try:
+            supplied = _candidate_bundle_identity(Path(candidate_bundle), expected_head=want_head)
+        except (OSError, ValueError) as exc:
+            supplied = None
+            reasons.append(f"指定 candidate bundle 驗證失敗：{exc}")
+        if supplied is not None and recorded is not None and not _bundle_identity_matches(recorded, supplied):
+            reasons.append("指定 candidate bundle 與 s24_ab 共用證據記錄的候選不一致")
+        selected_path = Path(candidate_bundle).resolve()
+    if reasons:
+        return {"status": "EVIDENCE_MISSING", "reasons": reasons}
+    return {"status": "PASS", "path": str(selected_path), "identity": dict(recorded or {})}
 
 
 def get_current_head(root: Path = ROOT) -> str | None:
@@ -193,7 +396,8 @@ def _command_matches(name: str, argv: Any, shared_dir: Path) -> bool:
 def validate_section(shared_dir: Path, *, gate: str, section: str, required_set: str | None, platform: str,
                      expected_artifacts: Mapping[str, Path] | None = None,
                      current_head: str | None = None, worktree_clean: bool | None = None,
-                     lock_path: Path = DEFAULT_LOCK, expected_command: str | None = None) -> dict[str, Any]:
+                     lock_path: Path = DEFAULT_LOCK, expected_command: str | None = None,
+                     candidate_bundle: Path | None = None) -> dict[str, Any]:
     """依目前 HEAD、工作樹、artifact 與 lock selector 驗證一段共用證據。"""
     shared_dir = Path(shared_dir).resolve()
     manifest, reasons = _load_manifest(shared_dir)
@@ -259,6 +463,27 @@ def validate_section(shared_dir: Path, *, gate: str, section: str, required_set:
             if file_path is None or not isinstance(expected_hash, str) or sha256_file(file_path) != expected_hash:
                 reasons.append(f"evidence SHA256 不符或缺失：{role}")
 
+    if section == "s24_ab":
+        candidate_identity, recorded_path, bundle_errors = _recorded_candidate_bundle(
+            shared_dir, provenance, expected_head=want_head
+        )
+        reasons.extend(bundle_errors)
+        if candidate_identity is not None:
+            if row.get("candidate_bundle") != candidate_identity:
+                reasons.append("s24_ab candidate bundle provenance 未綁定或與 manifest 不符")
+            for artifact_name, digest_key in (("release_cli", "cli_sha256"), ("release_daemon", "daemon_sha256")):
+                artifact = artifact_rows.get(artifact_name)
+                if not isinstance(artifact, Mapping) or artifact.get("sha256") != candidate_identity.get(digest_key):
+                    reasons.append(f"s24_ab 受測候選與共用 {artifact_name} artifact 不同")
+            if candidate_bundle is not None:
+                try:
+                    supplied_identity = _candidate_bundle_identity(Path(candidate_bundle), expected_head=want_head)
+                except (OSError, ValueError) as exc:
+                    reasons.append(f"指定 s24_ab candidate bundle 驗證失敗：{exc}")
+                else:
+                    if not _bundle_identity_matches(candidate_identity, supplied_identity):
+                        reasons.append("指定 s24_ab candidate bundle 與共用證據記錄的候選不一致")
+
     if reasons:
         return {"status": "EVIDENCE_MISSING", "reasons": reasons}
     exit_code = row.get("exit_code")
@@ -292,12 +517,14 @@ def import_section(shared_dir: Path, *, gate: str, section: str, required_set: s
                    expected_artifacts: Mapping[str, Path] | None = None,
                    current_head: str | None = None, worktree_clean: bool | None = None,
                    destination: Path, lock_path: Path = DEFAULT_LOCK,
-                   expected_command: str | None = None) -> dict[str, Any]:
+                   expected_command: str | None = None,
+                   candidate_bundle: Path | None = None) -> dict[str, Any]:
     """驗證後複製 evidence；無效時不複製，也不提供重跑指示。"""
     result = validate_section(shared_dir, gate=gate, section=section, required_set=required_set,
                               platform=platform, expected_artifacts=expected_artifacts,
                               current_head=current_head, worktree_clean=worktree_clean,
-                              lock_path=lock_path, expected_command=expected_command)
+                              lock_path=lock_path, expected_command=expected_command,
+                              candidate_bundle=candidate_bundle)
     if result["status"] == "EVIDENCE_MISSING":
         return result
     root = Path(shared_dir).resolve()
@@ -361,11 +588,22 @@ def import_artifacts(shared_dir: Path, destination: Path, *, current_head: str |
 
 
 def init_manifest(shared_dir: Path, artifact_paths: Mapping[str, Path], *, head: str | None = None,
-                  clean: bool | None = None) -> dict[str, Any]:
-    """把四個 Linux 候選 artifact 複製到證據目錄並記錄 SHA256 provenance。"""
+                  clean: bool | None = None, candidate_bundle: Path | None = None) -> dict[str, Any]:
+    """把四個 Linux 候選 artifact 與可選的同 HEAD release bundle 記入 provenance。"""
     shared_dir = Path(shared_dir).resolve()
-    if shared_dir.exists() and any(shared_dir.iterdir()):
-        raise ValueError(f"輸出目錄非空：{shared_dir}")
+    candidate_identity: dict[str, Any] | None = None
+    if candidate_bundle is None:
+        if shared_dir.exists() and any(shared_dir.iterdir()):
+            raise ValueError(f"輸出目錄非空：{shared_dir}")
+    else:
+        shared_dir.mkdir(parents=True, exist_ok=True)
+        candidate_identity = _candidate_bundle_identity(
+            Path(candidate_bundle), shared_dir=shared_dir,
+            expected_head=head if head is not None else get_current_head(),
+        )
+        existing = list(shared_dir.iterdir())
+        if existing and (len(existing) != 1 or existing[0].resolve() != Path(candidate_bundle).resolve()):
+            raise ValueError(f"候選 bundle 以外的輸出目錄內容不允許：{shared_dir}")
     shared_dir.mkdir(parents=True, exist_ok=True)
     artifact_rows: dict[str, dict[str, str]] = {}
     for name in REQUIRED_ARTIFACTS:
@@ -379,11 +617,14 @@ def init_manifest(shared_dir: Path, artifact_paths: Mapping[str, Path], *, head:
         digest = sha256_file(destination)
         assert digest is not None
         artifact_rows[name] = {"path": relative.as_posix(), "sha256": digest}
-    manifest = {"schema": SCHEMA,
-                "provenance": {"git_head": head if head is not None else get_current_head(),
-                               "worktree_clean": clean if clean is not None else is_worktree_clean(),
-                               "artifacts": artifact_rows},
-                "sections": {}}
+    provenance: dict[str, Any] = {
+        "git_head": head if head is not None else get_current_head(),
+        "worktree_clean": clean if clean is not None else is_worktree_clean(),
+        "artifacts": artifact_rows,
+    }
+    if candidate_identity is not None:
+        provenance["candidate_bundle"] = candidate_identity
+    manifest = {"schema": SCHEMA, "provenance": provenance, "sections": {}}
     _write_manifest(shared_dir, manifest)
     return manifest
 
@@ -420,6 +661,22 @@ def record_section(shared_dir: Path, *, name: str, argv: Sequence[str], exit_cod
         if error is None and expected == actual_argv:
             selectors[f"{set_id}/{platform}"] = expected
     row = {"argv": actual_argv, "selectors": selectors, "exit_code": int(exit_code), "files": file_rows}
+    if name == "s24_ab":
+        provenance = manifest.get("provenance")
+        if not isinstance(provenance, Mapping):
+            raise ValueError("s24_ab 缺少共用 provenance")
+        identity, _bundle_path, errors = _recorded_candidate_bundle(
+            shared_dir, provenance, expected_head=provenance.get("git_head")
+        )
+        if errors or identity is None:
+            raise ValueError("s24_ab 必須綁定有效 candidate bundle：" + "; ".join(errors))
+        artifacts = provenance.get("artifacts")
+        artifacts = artifacts if isinstance(artifacts, Mapping) else {}
+        for artifact_name, digest_key in (("release_cli", "cli_sha256"), ("release_daemon", "daemon_sha256")):
+            artifact = artifacts.get(artifact_name)
+            if not isinstance(artifact, Mapping) or artifact.get("sha256") != identity.get(digest_key):
+                raise ValueError(f"s24_ab candidate bundle 與 {artifact_name} artifact 不同")
+        row["candidate_bundle"] = identity
     manifest["sections"][name] = row
     provenance = manifest.get("provenance")
     if isinstance(provenance, dict):
@@ -538,7 +795,8 @@ def _cli_import(args: argparse.Namespace) -> int:
                                 required_set=args.required_set, platform=args.platform,
                                 expected_artifacts=_parse_artifacts(args.artifact),
                                 destination=args.out_dir, lock_path=args.lock,
-                                expected_command=args.expected_command)
+                                expected_command=args.expected_command,
+                                candidate_bundle=args.candidate_bundle)
     except (OSError, ValueError) as exc:
         result = {"status": "EVIDENCE_MISSING", "reasons": [str(exc)]}
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
@@ -546,10 +804,17 @@ def _cli_import(args: argparse.Namespace) -> int:
 
 
 def _cli_init(args: argparse.Namespace) -> int:
-    manifest = init_manifest(args.shared_evidence, _parse_artifacts(args.artifact))
+    manifest = init_manifest(args.shared_evidence, _parse_artifacts(args.artifact),
+                             candidate_bundle=args.candidate_bundle)
     print(json.dumps({"schema": manifest["schema"], "provenance": manifest["provenance"]},
                      ensure_ascii=False, sort_keys=True))
     return 0
+
+
+def _cli_check_candidate_bundle(args: argparse.Namespace) -> int:
+    result = check_candidate_bundle(args.shared_evidence, candidate_bundle=args.candidate_bundle)
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 3 if result["status"] == "EVIDENCE_MISSING" else 0
 
 
 def _cli_import_artifacts(args: argparse.Namespace) -> int:
@@ -589,6 +854,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     imp.add_argument("--required-set")
     imp.add_argument("--expected-command", choices=("cargo_workspace_default", "p7_ab", "s24_ab",
                                                       "cargo_contract_results", "windows_l1"))
+    imp.add_argument("--candidate-bundle", type=Path,
+                     help="S24 外部指定時必須與共用 evidence 綁定的 release bundle 完全相同")
     imp.add_argument("--platform", required=True, choices=("linux", "windows"))
     imp.add_argument("--artifact", action="append", default=[], help="要與 provenance 比對的 name=path")
     imp.add_argument("--out-dir", type=Path, required=True)
@@ -597,7 +864,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     init = sub.add_parser("init", help="記錄候選 artifacts 與 git provenance")
     init.add_argument("--shared-evidence", type=Path, required=True)
     init.add_argument("--artifact", action="append", default=[], help="候選 artifact name=path")
+    init.add_argument("--candidate-bundle", type=Path, help="已建置並位於 shared evidence 目錄內的 release bundle root")
     init.set_defaults(func=_cli_init)
+    check_bundle = sub.add_parser("check-candidate-bundle", help="驗證共用證據記錄的候選 bundle 與可選外部指定值")
+    check_bundle.add_argument("--shared-evidence", type=Path, required=True)
+    check_bundle.add_argument("--candidate-bundle", type=Path,
+                              help="外部候選 bundle；省略時解析共用證據內記錄的 bundle")
+    check_bundle.set_defaults(func=_cli_check_candidate_bundle)
     artifact_import = sub.add_parser("import-artifacts", help="驗證後匯入 release/debug CLI 與 daemon")
     artifact_import.add_argument("--shared-evidence", type=Path, required=True)
     artifact_import.add_argument("--out-dir", type=Path, required=True)

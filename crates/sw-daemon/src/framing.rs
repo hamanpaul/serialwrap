@@ -360,6 +360,27 @@ struct ConnEntry {
     seq: u64,
 }
 
+/// 可由 RPC handler 於停止回應寫出後立即關閉新連線入口的共享旗標。
+#[derive(Clone, Debug)]
+pub struct RpcStopAccept(Arc<AtomicBool>);
+
+impl RpcStopAccept {
+    pub fn new() -> RpcStopAccept {
+        RpcStopAccept(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// 停止 acceptor；實際 join 與既有連線收尾仍由 daemon main 的停止序負責。
+    pub fn request(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Default for RpcStopAccept {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// RPC acceptor（連線上限 128；每連線 thread 與停止旗標）。
 pub struct RpcServer {
     stopping: Arc<AtomicBool>,
@@ -382,7 +403,15 @@ fn reap(conns: &Mutex<Vec<ConnEntry>>) {
 
 impl RpcServer {
     pub fn start(listener: Box<dyn RpcListener>, handler: Arc<dyn RpcHandler>) -> RpcServer {
-        let stopping = Arc::new(AtomicBool::new(false));
+        Self::start_with_stop_accept(listener, handler, RpcStopAccept::new())
+    }
+
+    pub fn start_with_stop_accept(
+        listener: Box<dyn RpcListener>,
+        handler: Arc<dyn RpcHandler>,
+        stop_accept: RpcStopAccept,
+    ) -> RpcServer {
+        let stopping = Arc::clone(&stop_accept.0);
         let conns: Arc<Mutex<Vec<ConnEntry>>> = Arc::new(Mutex::new(Vec::new()));
         let active = Arc::new(AtomicUsize::new(0));
         let acceptor = {
@@ -408,6 +437,11 @@ impl RpcServer {
                                 continue;
                             }
                         };
+                        // stop 回應寫出後 handler 會先 set 共享旗標；若 accept 已與停止並行，也不再建立新連線 handler。
+                        if stopping.load(Ordering::SeqCst) {
+                            drop(stream);
+                            break;
+                        }
                         // 讀逾時讓讀迴圈定期醒來檢查停止旗標（Produces ②）。
                         let _ = stream.set_read_timeout(Some(STOP_POLL));
                         let stop = Arc::new(ConnStop::new());

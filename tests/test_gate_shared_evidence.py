@@ -118,7 +118,7 @@ def test_shared_evidence_provenance_mismatch_is_missing_for_every_gate(tmp_path,
     assert result["reasons"]
 
 
-def test_shared_failed_section_remains_fail_after_import(tmp_path):
+def test_shared_failed_section_remains_fail_after_import(tmp_path, monkeypatch):
     shared, set_id, artifacts, _ = _fixture(tmp_path, "p7")
     manifest_path = shared / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -154,60 +154,53 @@ def test_shared_failed_section_remains_fail_after_import(tmp_path):
     )
     assert malformed_exit["status"] == "EVIDENCE_MISSING"
 
-    for section, argv in (
-        ("p7_ab", ["bash", "scripts/rust/run_p7_ab.sh", "--unexpected", "--od59-contract"]),
-        ("s24_ab", ["-q", "tests/contract_blackbox", "tests/test_rust_contract_coverage.py", "tests/unlisted.py"]),
-    ):
-        manifest["sections"][section] = {
-            "argv": argv,
-            "exit_code": 0,
-            "files": {"log": {"path": "sections/pytest_full/pytest.log",
-                               "sha256": _sha(shared / "sections/pytest_full/pytest.log")}},
-        }
-    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
-    for section, command in (("p7_ab", "p7_ab"), ("s24_ab", "s24_ab")):
-        result = _module().validate_section(
-            shared,
-            gate="p7" if section == "p7_ab" else "slice24",
-            section=section,
-            required_set=None,
-            platform="linux",
-            expected_artifacts=artifacts,
-            current_head=manifest["provenance"]["git_head"],
-            worktree_clean=True,
-            expected_command=command,
-        )
-        assert result["status"] == "EVIDENCE_MISSING"
-
-    valid_argv = {
-        "p7_ab": [
-            "bash", "scripts/rust/run_p7_ab.sh", "--run-id", shared.name,
-            "--run-dir", str(shared / "work/p7-ab"), "--out", str(shared / "work/p7-ab.md"),
-            "--rust-cli", str(shared / "artifacts/debug/serialwrap"),
-            "--rust-daemon", str(shared / "artifacts/debug/serialwrapd"), "--od59-contract",
-        ],
-        "s24_ab": [
-            "-q", "tests/contract_blackbox", "tests/acceptance/l15/test_slice21_l15.py",
-            "tests/acceptance/l15/test_slice23_l15.py", "tests/test_multiagent_e2e.py",
-            "tests/test_human_agent_coexist.py", "tests/test_rust_contract_coverage.py",
-            "tests/test_transfer_golden_fresh.py",
-        ],
+    manifest["sections"]["p7_ab"] = {
+        "argv": ["bash", "scripts/rust/run_p7_ab.sh", "--unexpected", "--od59-contract"],
+        "exit_code": 0,
+        "files": {"log": {"path": "sections/pytest_full/pytest.log",
+                           "sha256": _sha(shared / "sections/pytest_full/pytest.log")}},
     }
-    for section, command in (("p7_ab", "p7_ab"), ("s24_ab", "s24_ab")):
-        manifest["sections"][section]["argv"] = valid_argv[section]
-        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
-        result = _module().validate_section(
-            shared,
-            gate="p7" if section == "p7_ab" else "slice24",
-            section=section,
-            required_set=None,
-            platform="linux",
-            expected_artifacts=artifacts,
-            current_head=manifest["provenance"]["git_head"],
-            worktree_clean=True,
-            expected_command=command,
-        )
-        assert result["status"] == "PASS"
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    invalid_p7 = _module().validate_section(
+        shared, gate="p7", section="p7_ab", required_set=None, platform="linux",
+        expected_artifacts=artifacts, current_head=manifest["provenance"]["git_head"],
+        worktree_clean=True, expected_command="p7_ab",
+    )
+    assert invalid_p7["status"] == "EVIDENCE_MISSING"
+    manifest["sections"]["p7_ab"]["argv"] = [
+        "bash", "scripts/rust/run_p7_ab.sh", "--run-id", shared.name,
+        "--run-dir", str(shared / "work/p7-ab"), "--out", str(shared / "work/p7-ab.md"),
+        "--rust-cli", str(shared / "artifacts/debug/serialwrap"),
+        "--rust-daemon", str(shared / "artifacts/debug/serialwrapd"), "--od59-contract",
+    ]
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    valid_p7 = _module().validate_section(
+        shared, gate="p7", section="p7_ab", required_set=None, platform="linux",
+        expected_artifacts=artifacts, current_head=manifest["provenance"]["git_head"],
+        worktree_clean=True, expected_command="p7_ab",
+    )
+    assert valid_p7["status"] == "PASS"
+
+    api, s24_shared, _bundle, s24_artifacts, head = _s24_candidate_fixture(tmp_path / "s24", monkeypatch)
+    s24_manifest_path = s24_shared / "manifest.json"
+    s24_manifest = json.loads(s24_manifest_path.read_text(encoding="utf-8"))
+    s24_argv = s24_manifest["sections"]["s24_ab"]["argv"]
+    s24_manifest["sections"]["s24_ab"]["argv"] = [
+        "-q", "tests/contract_blackbox", "tests/test_rust_contract_coverage.py", "tests/unlisted.py",
+    ]
+    s24_manifest_path.write_text(json.dumps(s24_manifest, sort_keys=True), encoding="utf-8")
+    invalid_s24 = api.validate_section(
+        s24_shared, gate="slice24", section="s24_ab", required_set=None, platform="linux",
+        expected_artifacts=s24_artifacts, current_head=head, worktree_clean=True, expected_command="s24_ab",
+    )
+    assert invalid_s24["status"] == "EVIDENCE_MISSING"
+    s24_manifest["sections"]["s24_ab"]["argv"] = s24_argv
+    s24_manifest_path.write_text(json.dumps(s24_manifest, sort_keys=True), encoding="utf-8")
+    valid_s24 = api.validate_section(
+        s24_shared, gate="slice24", section="s24_ab", required_set=None, platform="linux",
+        expected_artifacts=s24_artifacts, current_head=head, worktree_clean=True, expected_command="s24_ab",
+    )
+    assert valid_s24["status"] == "PASS"
 
 
 def _windows_l1_report(head: str, selector: list[str]) -> dict:
@@ -355,6 +348,73 @@ def test_windows_l1_provenance_or_selector_mismatch_is_not_recorded(tmp_path, mi
         assert f"windows_l1:{required_set}" not in manifest["sections"]
 
 
+def _make_release_bundle(root: pathlib.Path, *, head: str, payload: str) -> pathlib.Path:
+    version_dir = root / "versions" / "0.4.1"
+    bin_dir = version_dir / "bin"
+    bin_dir.mkdir(parents=True)
+    cli_bytes = f"cli:{payload}\n".encode("utf-8")
+    daemon_bytes = f"daemon:{payload}\n".encode("utf-8")
+    (bin_dir / "serialwrap").write_bytes(cli_bytes)
+    (bin_dir / "serialwrapd").write_bytes(daemon_bytes)
+    manifest = {
+        "schema_version": 1,
+        "bundle_version": "0.4.1",
+        "stage": "rust-2",
+        "target": "x86_64-unknown-linux-gnu",
+        "git_revision": head,
+        "components": {
+            "cli": {"implementation": "rust", "sha256": hashlib.sha256(cli_bytes).hexdigest()},
+            "daemon": {
+                "implementation": "rust",
+                "code_fingerprint": hashlib.sha256(daemon_bytes).hexdigest()[:12],
+                "launcher": {"sha256": hashlib.sha256(daemon_bytes).hexdigest()},
+            },
+        },
+    }
+    (version_dir / "release-manifest.json").write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    top_bin = root / "bin"
+    top_bin.mkdir()
+    for name in ("serialwrap", "serialwrapd"):
+        (top_bin / name).write_bytes((bin_dir / name).read_bytes())
+    return root
+
+
+def _s24_candidate_fixture(tmp_path: pathlib.Path, monkeypatch):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    api = _module()
+    head = api.get_current_head()
+    assert head
+    monkeypatch.setattr(api, "get_current_head", lambda root=ROOT: head)
+    monkeypatch.setattr(api, "is_worktree_clean", lambda root=ROOT: True)
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    bundle = _make_release_bundle(shared / "candidate-bundle", head=head, payload="candidate-a")
+    source_artifacts = {}
+    for name in ("debug_cli", "debug_daemon"):
+        path = tmp_path / name
+        path.write_text(name, encoding="utf-8")
+        source_artifacts[name] = path
+    for artifact_name, executable_name in (("release_cli", "serialwrap"), ("release_daemon", "serialwrapd")):
+        path = bundle / "versions" / "0.4.1" / "bin" / executable_name
+        source_artifacts[artifact_name] = path
+    api.init_manifest(shared, source_artifacts, head=head, clean=True, candidate_bundle=bundle)
+    log = tmp_path / "s24.log"
+    junit = tmp_path / "junit.xml"
+    log.write_text("22 passed\\n", encoding="utf-8")
+    junit.write_text("<testsuite tests=\"22\" failures=\"0\"/>\\n", encoding="utf-8")
+    argv = [
+        "-q", "tests/contract_blackbox", "tests/acceptance/l15/test_slice21_l15.py",
+        "tests/acceptance/l15/test_slice23_l15.py", "tests/test_multiagent_e2e.py",
+        "tests/test_human_agent_coexist.py", "tests/test_rust_contract_coverage.py",
+        "tests/test_transfer_golden_fresh.py",
+    ]
+    api.record_section(
+        shared, name="s24_ab", argv=argv, exit_code=0,
+        files={"log": log, "slice24/s24-ab/junit.xml": junit},
+    )
+    return api, shared, bundle, source_artifacts, head
+
+
 @pytest.mark.parametrize(
     "script,args",
     [
@@ -381,6 +441,7 @@ def test_gate_dry_run_with_shared_evidence_exits_zero_and_skips_shared_commands(
     assert "artifact provenance 不符：EVIDENCE_MISSING，不啟動本地建置。" in output
     if script == "slice24_exit.sh":
         assert "env CARGO_INCREMENTAL=0 cargo check --workspace --target x86_64-pc-windows-gnu" in output
+        assert "候選 bundle" in output
 
 
 def test_shared_driver_dry_run_lists_commands_without_running_them(tmp_path):
@@ -397,6 +458,8 @@ def test_shared_driver_dry_run_lists_commands_without_running_them(tmp_path):
     assert "cargo test --workspace" in proc.stdout
     assert "run_p7_ab.sh" in proc.stdout
     assert "--od59-contract" in proc.stdout
+    assert "mkbundle.sh --release-bundle --stage 2 --profile release" in proc.stdout
+    assert "SW_BUNDLE" in proc.stdout
     assert "pytest -q tests/" in proc.stdout
     assert str(ROOT / out_dir / "dry-run") in proc.stdout
 
@@ -455,7 +518,7 @@ def test_shared_driver_stops_and_records_gate_prereq_failure_before_cargo(tmp_pa
     assert not (log_dir / "cargo-fakes-filtered.log").exists()
 
 
-def test_shared_artifact_init_and_import_preserve_executable_names(tmp_path):
+def test_shared_artifact_init_and_import_preserve_executable_names(tmp_path, monkeypatch):
     api = _module()
     sources = {}
     for name in ARTIFACT_PATHS:
@@ -482,6 +545,56 @@ def test_shared_artifact_init_and_import_preserve_executable_names(tmp_path):
         assert imported_path.name == source_path.name
         assert _sha(imported_path) == row["sha256"]
 
+    api, shared, bundle, artifacts, head = _s24_candidate_fixture(tmp_path / "s24", monkeypatch)
+    valid = api.validate_section(
+        shared, gate="slice24", section="s24_ab", required_set=None, platform="linux",
+        expected_artifacts=artifacts, current_head=head, worktree_clean=True, expected_command="s24_ab",
+    )
+    assert valid["status"] == "PASS", valid
+    resolved = api.check_candidate_bundle(shared)
+    assert resolved["status"] == "PASS", resolved
+    assert pathlib.Path(resolved["path"]) == bundle
+    cli_check = subprocess.run(
+        [sys.executable, str(TOOL), "check-candidate-bundle", "--shared-evidence", str(shared)],
+        cwd=ROOT, capture_output=True, text=True, check=False,
+    )
+    assert cli_check.returncode == 0, cli_check.stdout + cli_check.stderr
+    assert json.loads(cli_check.stdout)["path"] == str(bundle)
+
+    different = _make_release_bundle(tmp_path / "other-bundle", head=head, payload="candidate-b")
+    rejected = api.validate_section(
+        shared, gate="slice24", section="s24_ab", required_set=None, platform="linux",
+        expected_artifacts=artifacts, current_head=head, worktree_clean=True, expected_command="s24_ab",
+        candidate_bundle=different,
+    )
+    assert rejected["status"] == "EVIDENCE_MISSING"
+    assert rejected["reasons"]
+    external_mismatch = api.check_candidate_bundle(shared, candidate_bundle=different)
+    assert external_mismatch["status"] == "EVIDENCE_MISSING", external_mismatch
+    cli_mismatch = subprocess.run(
+        [sys.executable, str(TOOL), "check-candidate-bundle", "--shared-evidence", str(shared),
+         "--candidate-bundle", str(different)],
+        cwd=ROOT, capture_output=True, text=True, check=False,
+    )
+    assert cli_mismatch.returncode == 3, cli_mismatch.stdout + cli_mismatch.stderr
+    assert json.loads(cli_mismatch.stdout)["status"] == "EVIDENCE_MISSING"
+
+    dev_bundle = _make_release_bundle(tmp_path / "dev-bundle", head=head, payload="dev")
+    dev_manifest = dev_bundle / "versions" / "0.4.1" / "release-manifest.json"
+    dev_info = json.loads(dev_manifest.read_text(encoding="utf-8"))
+    dev_info["stage"] = "rust-2-dev"
+    dev_manifest.write_text(json.dumps(dev_info, sort_keys=True), encoding="utf-8")
+    dev_rejected = api.check_candidate_bundle(shared, candidate_bundle=dev_bundle)
+    assert dev_rejected["status"] == "EVIDENCE_MISSING", dev_rejected
+
+    (bundle / "versions" / "0.4.1" / "bin" / "serialwrapd").write_text("tampered\\n", encoding="utf-8")
+    tampered = api.validate_section(
+        shared, gate="slice24", section="s24_ab", required_set=None, platform="linux",
+        expected_artifacts=artifacts, current_head=head, worktree_clean=True, expected_command="s24_ab",
+    )
+    assert tampered["status"] == "EVIDENCE_MISSING"
+    assert tampered["reasons"]
+
 
 def test_gate_shared_artifact_paths_keep_cli_and_daemon_basenames():
     required = {
@@ -490,6 +603,9 @@ def test_gate_shared_artifact_paths_keep_cli_and_daemon_basenames():
             'SERIALWRAP_DAEMON_EXE="$RUN_DIR/artifacts/debug/serialwrapd"',
             '--rust-cli "$RUN_DIR/artifacts/debug/serialwrap"',
             '--rust-daemon "$RUN_DIR/artifacts/debug/serialwrapd"',
+            'scripts/rust/mkbundle.sh \\\n  --release-bundle --stage 2 --profile release',
+            '--candidate-bundle "$S24_BUNDLE"',
+            'SW_BUNDLE="$S24_BUNDLE"',
         ),
         "slice21_gate.sh": (
             'RUST_CLI="$SHARED_ARTIFACT_DIR/release/serialwrap"',
@@ -526,6 +642,9 @@ def test_gate_shared_artifact_paths_keep_cli_and_daemon_basenames():
             '--artifact "debug_daemon=$SHARED_ARTIFACT_DIR/debug/serialwrapd"',
             '--artifact "release_cli=$SHARED_ARTIFACT_DIR/release/serialwrap"',
             '--artifact "release_daemon=$SHARED_ARTIFACT_DIR/release/serialwrapd"',
+            'check-candidate-bundle "${BUNDLE_CHECK_ARGS[@]}"',
+            'S24_BUNDLE_ARGS+=(--candidate-bundle "$CANDIDATE_BUNDLE")',
+            'S24_BUNDLE_ENV+=("SW_BUNDLE=$CANDIDATE_BUNDLE")',
         ),
         "run_p7_ab.sh": (
             'RUST_CLI="$ROOT/target/debug/serialwrap"',

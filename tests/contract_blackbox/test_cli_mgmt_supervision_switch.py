@@ -11,6 +11,8 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -42,12 +44,22 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def _short_case_root() -> Path:
-    """Unix socket 名稱保留於工作樹短路徑，避免 pytest 暫存路徑超過 AF_UNIX 上限。"""
-    parent = ROOT / "target" / "g5-tmp"
-    parent.mkdir(parents=True, exist_ok=True)
-    root = parent / f"s{os.getpid() % 10000:04d}{time.time_ns() % 1000000:06d}"
-    root.mkdir()
-    return root
+    """在固定短暫存根建立 Unix socket 案例目錄，不依賴 worktree 絕對路徑。"""
+    return Path(tempfile.mkdtemp(prefix="sw-g5-", dir="/tmp"))
+
+
+@pytest.mark.memory_only
+def test_short_case_root_keeps_unix_socket_path_below_limit(tmp_path: Path, monkeypatch) -> None:
+    """即使 worktree 絕對路徑很長，案例 socket 仍短於 AF_UNIX sun_path 上限。"""
+    long_worktree = tmp_path / ("worktree-" + "x" * 120)
+    monkeypatch.setattr(sys.modules[__name__], "ROOT", long_worktree)
+    root = _short_case_root()
+    try:
+        socket_path = root / "run" / "serialwrapd.sock"
+        assert root.parent == Path("/tmp")
+        assert len(os.fsencode(socket_path)) < 104, f"AF_UNIX socket 路徑超過保守上限：{socket_path}"
+    finally:
+        shutil.rmtree(root)
 
 
 def _rust_cli() -> Path:
