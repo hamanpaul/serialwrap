@@ -15,6 +15,7 @@
 //!   3（既有 `state.json` 讀取失敗）。
 
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -56,8 +57,9 @@ const PROG: &str = "serialwrapd";
 const DESCRIPTION: &str = "serialwrap daemon";
 /// SC-19 隔離判定的三個目錄變數（依序檢查）。
 const ISOLATION_ENV_VARS: [&str; 3] = ["SERIALWRAP_STATE_DIR", "SERIALWRAP_RUN_DIR", "SERIALWRAP_CONFIG_DIR"];
-/// OD-11 測試裝置 allowlist 的 env。
-const ENV_TEST_DEVICE_ALLOWLIST: &str = "SERIALWRAP_TEST_DEVICE_ALLOWLIST";
+/// 測試鉤子的 CStr 會在執行檔中保留 NUL 邊界，供 release bundle 逐名掃描。
+const ENV_TEST_DEVICE_ALLOWLIST: &CStr = c"SERIALWRAP_TEST_DEVICE_ALLOWLIST";
+const ENV_TEST_SYSTEM_CONFIG_PATH: &CStr = c"SERIALWRAP_TEST_SYSTEM_CONFIG_PATH";
 /// T13 staging 專用 WAL 紀錄注入（只存在於 test-fakes build）。
 #[cfg(feature = "test-fakes")]
 pub const ENV_TEST_T13_WAL_RECORD: &str = "SERIALWRAP_TEST_T13_WAL_RECORD";
@@ -67,9 +69,13 @@ pub const T13_WAL_TEST_PAYLOAD: &[u8] = b"serialwrap T13 isolated staging WAL ev
 /// `test_allowlist.INVALID_CONFIG_REASON`。
 const INVALID_CONFIG_REASON: &str = "invalid windows.test_device_allowlist";
 /// Stage 0 測試鉤子（#3）：release 持久化落盤後、回覆前 `exit(137)`。
-const ENV_TEST_KILL_AFTER_SAVE: &str = "SERIALWRAP_TEST_KILL_AFTER_SAVE";
+const ENV_TEST_KILL_AFTER_SAVE: &CStr = c"SERIALWRAP_TEST_KILL_AFTER_SAVE";
 /// Stage 0 測試鉤子（#4）：release 持久化 commit 前的暫停目錄。
-const ENV_TEST_PAUSE_BEFORE_RELEASE_SAVE: &str = "SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE";
+const ENV_TEST_PAUSE_BEFORE_RELEASE_SAVE: &CStr = c"SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE";
+
+fn test_hook_env_name(name: &CStr) -> &str {
+    name.to_str().expect("測試鉤子環境變數名稱必須是 ASCII")
+}
 /// 停止序步驟 3～5（含 4 的 handler join）與 5a 共用的期限（SC-11／arch §6.1；Python
 /// `shutdown_drain(total_timeout_s=5.0)`）。P8 Task 12 起 handler join 移到 drain Phase 1 之後：長 RPC（file 傳輸、
 /// force recover 的等待等）先被 Phase 1 取消，join 只等它們寫完回應，不再沿用 P5 時「先等 handler 自然結束」的
@@ -567,7 +573,7 @@ fn isolation_reason(env: &dyn SysEnv, caps: &Capabilities, defaults: &RuntimePat
 
 /// env allowlist：有非空白內容即採用（逗號分隔、strip、去空、保序去重；解析後為空亦不回退 config）。
 fn env_allowlist(env: &dyn SysEnv) -> Option<Vec<String>> {
-    let raw = env.var(ENV_TEST_DEVICE_ALLOWLIST)?;
+    let raw = env.var(test_hook_env_name(ENV_TEST_DEVICE_ALLOWLIST))?;
     if py_strip(&raw).is_empty() {
         return None;
     }
@@ -695,7 +701,7 @@ fn system_config_path(env: &EnvSnapshot, p: &Platform) -> String {
     let isolated = isolation_defaults(&*p.env, &p.caps)
         .is_some_and(|defaults| isolation_reason(&*p.env, &p.caps, &defaults).is_none());
     if isolated {
-        if let Some(path) = env.get("SERIALWRAP_TEST_SYSTEM_CONFIG_PATH") {
+        if let Some(path) = env.get(test_hook_env_name(ENV_TEST_SYSTEM_CONFIG_PATH)) {
             return path.to_string();
         }
     }
@@ -1266,10 +1272,13 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
     let registry = CommandRegistry::new();
     let explicit_targets = load.profiles.len();
     let stage0 = Arc::new(Stage0Hooks {
-        kill: p.env.var(ENV_TEST_KILL_AFTER_SAVE).is_some_and(|v| py_strip(&v) == "1"),
+        kill: p
+            .env
+            .var(test_hook_env_name(ENV_TEST_KILL_AFTER_SAVE))
+            .is_some_and(|v| py_strip(&v) == "1"),
         pause_dir: p
             .env
-            .var(ENV_TEST_PAUSE_BEFORE_RELEASE_SAVE)
+            .var(test_hook_env_name(ENV_TEST_PAUSE_BEFORE_RELEASE_SAVE))
             .map(|v| py_strip(&v).to_string())
             .filter(|v| !v.is_empty()),
         isolation: isolation_reason(&*p.env, &p.caps, &iso_defaults),
