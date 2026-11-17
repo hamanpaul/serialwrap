@@ -23,17 +23,13 @@ import json
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import zipfile
 
 OWNER_MARKER = ".mkbundle-owner"
 TARGET = "x86_64-pc-windows-gnu"
 SHA256SUMS_LINE = re.compile(r"([0-9a-f]{64})  (.+)")
-TEST_HOOK_MARKERS = (
-    b"SERIALWRAP_TEST_",
-    b"SW_TEST_UPDATE_PAUSE_AFTER",
-    b"SW_TEST_UPDATE_FORCE_VERIFY_FAIL",
-)
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -296,11 +292,26 @@ def cmd_validate(args: argparse.Namespace) -> int:
         if sha256_file(vdir / relative) != listed[relative]:
             errors.append(f"SHA256SUMS 雜湊不符：{relative}")
 
-    for exe in sorted((vdir / "bin").glob("*.exe")) + sorted((root / "bin").glob("*.exe")):
-        data = exe.read_bytes()
-        for marker in TEST_HOOK_MARKERS:
-            if marker in data:
-                errors.append(f"{exe.relative_to(root).as_posix()} 含測試鉤子 {marker.decode()}")
+    executables = sorted((vdir / "bin").glob("*.exe")) + sorted((root / "bin").glob("*.exe"))
+    marker_checker = source / "scripts" / "rust" / "check_test_hook_markers.py"
+    checker_command = [sys.executable, "-I", "-B", str(marker_checker)]
+    for exe in executables:
+        checker_command.extend(("--binary", str(exe)))
+    try:
+        checked = subprocess.run(
+            checker_command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError as exc:
+        errors.append(f"無法執行共用測試鉤子檢查器：{exc}")
+    else:
+        if checked.returncode != 0:
+            messages = [line for line in checked.stderr.splitlines() if line]
+            errors.extend(messages or [f"共用測試鉤子檢查器失敗 (exit {checked.returncode})"])
     for path in root.rglob("delegate_sentinel*"):
         errors.append(f"bundle 含 delegate sentinel：{path}")
     for name in ("serialwrap.exe", "serialwrapd.exe"):

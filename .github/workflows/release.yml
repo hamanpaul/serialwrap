@@ -276,13 +276,9 @@ jobs:
             exit 1
           fi
 
-          # 正式候選不得編入測試鉤子（crates/sw-cli/src/lib.rs、rollback.rs）。
-          for marker in SERIALWRAP_TEST_ SW_TEST_UPDATE_PAUSE_AFTER SW_TEST_UPDATE_FORCE_VERIFY_FAIL; do
-            if grep -rlaF "$marker" "$version_dir/bin"; then
-              echo "::error::bundle binaries contain test hook ${marker}"
-              exit 1
-            fi
-          done
+          # CLI 不得含任何測試鉤子；daemon 只可含共用檢查器逐名允許的隔離測試鉤子。
+          python3 scripts/rust/check_test_hook_markers.py \
+            --binary "$version_dir/bin/serialwrap" --binary "$version_dir/bin/serialwrapd"
           if find "$root" -name 'delegate_sentinel*' | grep -q .; then
             echo "::error::bundle contains delegate sentinel test entry"
             exit 1
@@ -499,7 +495,7 @@ jobs:
         shell: pwsh
         run: |
           # 在 throwaway 根目錄解開實際要發佈的 zip：--version／--help、內層 SHA256SUMS、manifest 版本、._pth 無絕對路徑、
-          # 測試鉤子字串、runtime 隔離（yaml／serial／sw_core 皆由 bundle 載入）、setup／doctor、daemon start／status／stop。
+          # 共用 validator 的逐名測試鉤子政策、runtime 隔離（yaml／serial／sw_core 皆由 bundle 載入）、setup／doctor、daemon start／status／stop。
           # 全程使用隔離目錄與 SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM999，不開任何 COM 埠。
           .\scripts\rust\smoke-windows-bundle.ps1 -Zip "dist\serialwrap-$env:VERSION-windows-x86_64.zip" -Version $env:VERSION -HostPython python -SourceRoot $env:SOURCE_DIR
           if (-not $?) { exit 1 }

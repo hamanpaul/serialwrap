@@ -551,18 +551,40 @@ def test_windows_bundle_identity_rejects_release_test_hooks(tmp_path):
 
     _basic, bundle = _windows_ev01_fixture(tmp_path)
     version_dir = bundle / "versions/0.5.0"
-    daemon = b"stage2-daemon-exe SERIALWRAP_TEST_DEVICE_ALLOWLIST"
-    daemon_sha = hashlib.sha256(daemon).hexdigest()
-    (version_dir / "bin/serialwrapd.exe").write_bytes(daemon)
-    (bundle / "bin/serialwrapd.exe").write_bytes(daemon)
     manifest_path = version_dir / "release-manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["components"]["daemon"]["launcher"]["sha256"] = daemon_sha
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     sums_path = version_dir / "SHA256SUMS"
-    cli_sha = hashlib.sha256((version_dir / "bin/serialwrap.exe").read_bytes()).hexdigest()
-    sums_path.write_text(f"{cli_sha}  bin/serialwrap.exe\n{daemon_sha}  bin/serialwrapd.exe\n", encoding="utf-8")
 
+    def replace_binaries(cli: bytes, daemon: bytes) -> None:
+        for root in (version_dir / "bin", bundle / "bin"):
+            (root / "serialwrap.exe").write_bytes(cli)
+            (root / "serialwrapd.exe").write_bytes(daemon)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["components"]["cli"]["sha256"] = hashlib.sha256(cli).hexdigest()
+        manifest["components"]["daemon"]["launcher"]["sha256"] = hashlib.sha256(daemon).hexdigest()
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        sums_path.write_text(
+            f"{hashlib.sha256(cli).hexdigest()}  bin/serialwrap.exe\n"
+            f"{hashlib.sha256(daemon).hexdigest()}  bin/serialwrapd.exe\n",
+            encoding="utf-8",
+        )
+
+    allowed = (
+        b"SERIALWRAP_TEST_DEVICE_ALLOWLIST",
+        b"SERIALWRAP_TEST_SYSTEM_CONFIG_PATH",
+        b"SERIALWRAP_TEST_KILL_AFTER_SAVE",
+        b"SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE",
+    )
+    daemon = b"stage2-daemon-exe\0" + b"\0".join(allowed)
+    replace_binaries(b"stage2-cli-exe", daemon)
+    identity = g.windows_bundle_identity(bundle)
+    assert identity["daemon_sha256"] == hashlib.sha256(daemon).hexdigest()
+
+    for forbidden in (b"SERIALWRAP_TEST_UNAPPROVED_HOOK", b"SW_TEST_UPDATE_FUTURE_HOOK"):
+        replace_binaries(b"stage2-cli-exe", b"stage2-daemon-exe\0" + forbidden)
+        with pytest.raises(ValueError, match="禁用測試鉤子"):
+            g.windows_bundle_identity(bundle)
+
+    replace_binaries(b"stage2-cli-exe\0SERIALWRAP_TEST_DEVICE_ALLOWLIST", daemon)
     with pytest.raises(ValueError, match="禁用測試鉤子"):
         g.windows_bundle_identity(bundle)
 

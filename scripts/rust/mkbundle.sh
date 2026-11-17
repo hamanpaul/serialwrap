@@ -290,6 +290,10 @@ if [[ ! -x "$BIN_SRC" || ! -x "$DAEMON_SRC" ]]; then
   echo "mkbundle.sh: cargo build 後仍找不到 $BIN_SRC" >&2
   exit 1
 fi
+if [[ "$RELEASE_BUNDLE" -eq 1 ]]; then
+  python3 "$REPO_ROOT/scripts/rust/check_test_hook_markers.py" \
+    --binary "$BIN_SRC" --binary "$DAEMON_SRC"
+fi
 if [[ -n "$EARLY_FP" ]]; then
   # 複製到沒有 manifest 的目錄再問 --version，確認指紋在執行檔裡，而不是靠旁邊的 manifest。
   verify_dir="$(mktemp -d)"

@@ -149,6 +149,18 @@ def _sha256(path: Path) -> str | None:
         return None
 
 
+def _test_hook_inspector() -> Any:
+    """載入 bundle 建置器共用的逐名測試鉤子政策，避免 gate 副本漂移。"""
+    path = ROOT / "scripts/rust/check_test_hook_markers.py"
+    spec = importlib.util.spec_from_file_location("serialwrap_test_hook_markers", path)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"無法載入共用測試鉤子檢查器：{path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def windows_bundle_identity(bundle_dir: Path) -> dict[str, Any]:
     """核對 Windows bundle 的 Stage 2 manifest／執行檔，並計算完整檔案樹 SHA-256。"""
     root = Path(bundle_dir).resolve(strict=True)
@@ -252,13 +264,10 @@ def windows_bundle_identity(bundle_dir: Path) -> dict[str, Any]:
         if daemon.get("git_revision") != git_revision or cli.get("git_revision") != git_revision:
             raise ValueError("Stage 2 bundle 元件 git_revision 與 manifest 不符")
         binaries.append((daemon_rel, version_root / daemon_rel))
-    test_hook_markers = (b"SERIALWRAP_TEST_", b"SW_TEST_UPDATE_PAUSE_AFTER",
-                         b"SW_TEST_UPDATE_FORCE_VERIFY_FAIL")
+    hook_inspector = _test_hook_inspector()
     for relative, executable in binaries:
-        payload = executable.read_bytes()
-        for marker in test_hook_markers:
-            if marker in payload:
-                raise ValueError(f"Windows bundle 執行檔含禁用測試鉤子 {marker.decode('ascii')}：{relative}")
+        for marker in hook_inspector.inspect_binary(executable):
+            raise ValueError(f"Windows bundle 執行檔含禁用測試鉤子 {marker}：{relative}")
     return {
         "bundle_sha256": tree.hexdigest(),
         "stage": stage,

@@ -690,12 +690,20 @@ fn decide_on_unreadable_config(env: &dyn SysEnv, caps: &Capabilities, defaults: 
     allowlist_decision(false, Vec::new(), "config", Some(format!("invalid config.yaml: {error}")))
 }
 
-/// 系統唯讀設定檔路徑（`SYSTEM_CONFIG_PATH`；`SERIALWRAP_TEST_SYSTEM_CONFIG_PATH` 存在即採用，與 Python 相同含空字串）。
+/// 系統唯讀設定檔路徑；測試路徑覆寫僅對符合三個目錄隔離條件的實例生效。
 fn system_config_path(env: &EnvSnapshot, p: &Platform) -> String {
-    match env.get("SERIALWRAP_TEST_SYSTEM_CONFIG_PATH") {
-        Some(v) => v.to_string(),
-        None => pypath::join(flavor_of(&p.caps), &p.env.system_config_dir(), &["config.yaml"]),
+    let isolated = isolation_defaults(&*p.env, &p.caps)
+        .is_some_and(|defaults| isolation_reason(&*p.env, &p.caps, &defaults).is_none());
+    if isolated {
+        if let Some(path) = env.get("SERIALWRAP_TEST_SYSTEM_CONFIG_PATH") {
+            return path.to_string();
+        }
     }
+    pypath::join(
+        flavor_of(&p.caps),
+        &p.env.system_config_dir(),
+        &["config.yaml"],
+    )
 }
 
 /// SC-09：config 讀取路徑（`resolve_config_path(for_write=False)`：`SERIALWRAP_CONFIG` 原樣勝出，即使不存在 →
@@ -1907,6 +1915,46 @@ mod tests {
         assert!(is_optional_like("-x"));
         assert!(!is_optional_like("-"));
         assert!(!is_optional_like("-a b"));
+    }
+
+    #[cfg(feature = "test-fakes")]
+    #[test]
+    fn system_config_test_path_override_requires_isolation() {
+        use sw_pal::fakes::{platform, posix_caps, FakeSysEnv};
+
+        fn with_isolation(isolated: bool) -> (Platform, EnvSnapshot) {
+            let mut builder = FakeSysEnv::builder()
+                .home(Path::new("/tmp/sw-system-config-home"))
+                .system_config_dir(Path::new("/virtual/etc/serialwrap"))
+                .var("XDG_CONFIG_HOME", "/tmp/sw-system-config-xdg/config")
+                .var("XDG_STATE_HOME", "/tmp/sw-system-config-xdg/state")
+                .var("SERIALWRAP_TEST_SYSTEM_CONFIG_PATH", "/tmp/sw-test/system.yaml");
+            if isolated {
+                builder = builder
+                    .var("SERIALWRAP_STATE_DIR", "/tmp/sw-test/state")
+                    .var("SERIALWRAP_RUN_DIR", "/tmp/sw-test/run")
+                    .var("SERIALWRAP_CONFIG_DIR", "/tmp/sw-test/config");
+            }
+            let env = builder.build();
+            let caps = posix_caps();
+            let snapshot = snapshot_of(&caps, env.vars());
+            let platform = platform().caps(caps).env(env).build();
+            (platform, snapshot)
+        }
+
+        let (platform, env) = with_isolation(false);
+        assert_eq!(
+            system_config_path(&env, &platform),
+            "/virtual/etc/serialwrap/config.yaml",
+            "非隔離實例必須忽略測試用系統設定路徑覆寫"
+        );
+
+        let (platform, env) = with_isolation(true);
+        assert_eq!(
+            system_config_path(&env, &platform),
+            "/tmp/sw-test/system.yaml",
+            "隔離實例必須套用測試用系統設定路徑覆寫"
+        );
     }
 }
 
