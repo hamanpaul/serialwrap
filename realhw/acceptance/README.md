@@ -122,7 +122,7 @@ Linux 輪讓 Windows 上一個**非 `serialwrapd`** 的 pyserial 行程獨占 OP
    PY
    ```
 2. 建立彼此獨立的 `$RUN/home`、`config/profiles`、`state`、`run`、`wal`、`data`、`log`、`events`、`by-id`、`by-path`、`xdg-*` 目錄；`by-path` 必須保持空目錄。將 owner 核准的第二板穩定 udev link 設為 `SECOND_BOARD_LINK`（必須在 `/dev/serial/by-id/` 或 `/dev/serial/by-path/`，不得填 `/dev/ttyUSB*`），確認它存在且確為與 OPI 不同的裝置，再建立 `$RUN/by-id/sta-board` symlink。完成 WSL 步驟 1 後才啟動 Windows bridge；此時尚不建 target，因為 COM0 PTY symlink 要到下一步才建立。
-3. Windows bridge 已在前景執行後，確認 WSL `127.0.0.1:48701` localhost forwarding 可用（不要另開會消耗單一連線的 socket probe）。執行 `command -v socat` 留存結果，再以前景記錄檔啟動 repo 腳本；它優先使用 socat 的 `PTY,rawer,echo=0,wait-slave`，缺少 socat 時使用已測試的 Python PTY fallback。以有界等待確認 link 是新建 symlink，target 位於 `/dev/pts/`；不要手動建立或重用舊 symlink。
+3. Windows bridge 已在前景執行後，確認 WSL `127.0.0.1:48701` localhost forwarding 可用（不要另開會消耗單一連線的 socket probe）。執行 `command -v socat` 留存結果，再以前景記錄檔啟動 repo 腳本；腳本若找到 socat 會記錄其路徑，但仍固定使用 Python PTY bridge：實測 socat 的 TCP client 在既有連線中斷後會退出並移除 PTY，無法滿足長跑期間保持同一 PTY 並重連的要求。以有界等待確認 link 是新建 symlink，target 位於 `/dev/pts/`；不要手動建立或重用舊 symlink。
 
    ```bash
    set -euo pipefail
@@ -141,8 +141,10 @@ Linux 輪讓 Windows 上一個**非 `serialwrapd`** 的 pyserial 行程獨占 OP
    esac
    [[ -e "$SECOND_BOARD_LINK" ]]
    ln -s "$SECOND_BOARD_LINK" "$RUN/by-id/sta-board"
-   if command -v socat >"$RUN/socat-path.txt" 2>&1; then :; else
-     printf 'socat 不存在；啟動腳本將使用 Python PTY fallback\n' >"$RUN/socat-path.txt"
+   if command -v socat >"$RUN/socat-path.txt" 2>&1; then
+     printf 'socat 存在；因無法保留同一 PTY 進行 TCP 重連，啟動腳本固定使用 Python bridge。\n' >>"$RUN/socat-path.txt"
+   else
+     printf 'socat 不存在；啟動腳本使用 Python PTY/TCP bridge。\n' >"$RUN/socat-path.txt"
    fi
    "$REPO/realhw/bridge/start_pty_tcp_bridge.sh" \
      "$RUN/by-id/opi-bridge" 48701 >"$RUN/pty-tcp-bridge.log" 2>&1 &

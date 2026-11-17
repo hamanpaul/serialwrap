@@ -165,14 +165,23 @@ def test_launcher_uses_loopback_and_provides_pty_transport(tmp_path: Path) -> No
     command = ["bash", str(ROOT / "realhw/bridge/start_pty_tcp_bridge.sh"), str(link), str(peer.port)]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     slave_fd = -1
-    conn = None
+    connections: list[socket.socket] = []
     try:
         _wait_for(lambda: link.is_symlink(), timeout=3.0)
         slave_fd = os.open(link, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-        conn = peer.next_connection(timeout=3.0)
-        _exercise_round(slave_fd, conn, b"launcher")
+        pty_target = os.readlink(link)
+        first = peer.next_connection(timeout=3.0)
+        connections.append(first)
+        _exercise_round(slave_fd, first, b"launcher-first")
+
+        first.close()
+        second = peer.next_connection(timeout=3.0)
+        connections.append(second)
+        assert process.poll() is None, "TCP 斷線後 PTY bridge 必須保留行程與原 PTY"
+        assert link.is_symlink() and os.readlink(link) == pty_target
+        _exercise_round(slave_fd, second, b"launcher-reconnected")
     finally:
-        if conn is not None:
+        for conn in connections:
             conn.close()
         if slave_fd >= 0:
             os.close(slave_fd)

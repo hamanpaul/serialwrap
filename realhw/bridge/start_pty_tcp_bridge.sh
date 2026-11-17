@@ -26,12 +26,9 @@ fi
 mkdir -p -- "$(dirname -- "$pty_link")"
 
 if command -v socat >/dev/null 2>&1; then
-  echo "PTY bridge backend=socat link=$pty_link tcp=$host:$tcp_port" >&2
-  exec socat -d -d \
-    "PTY,link=$pty_link,rawer,echo=0,wait-slave" \
-    "TCP4:$host:$tcp_port,retry=1,interval=1,forever"
+  echo "已找到 socat ($(command -v socat))；其 TCP client 在已建立連線被中斷後會退出並移除 PTY，改用可重連且保留同一 PTY 的 Python bridge。" >&2
+else
+  echo "找不到 socat，使用 Python PTY/TCP bridge。" >&2
 fi
-
-echo "PTY bridge backend=python link=$pty_link tcp=$host:$tcp_port" >&2
 exec python3 "$script_dir/pty_tcp_bridge.py" \
   --pty-link "$pty_link" --host "$host" --port "$tcp_port"
