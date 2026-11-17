@@ -154,6 +154,7 @@ def _run(tmp_path: Path, reports: dict, lock: dict | None = None, emap: dict | N
          cases_lock: dict | None = None, l15: dict | None = None, prereqs_rc: int = 0,
          parity_doc: str = PARITY_DOC, daemon_path: Path | None = None,
          build_linux_exit: int | None = None, built_daemon_sha256: str | None = None,
+         bridge_selftest_report: Path | None = None,
          dry_run: bool = False) -> tuple[int, dict]:
     res = tmp_path / "l1"
     for (section, platform), rep in reports.items():
@@ -183,6 +184,8 @@ def _run(tmp_path: Path, reports: dict, lock: dict | None = None, emap: dict | N
         identity_args += ["--build-linux-exit", str(build_linux_exit)]
     if built_daemon_sha256 is not None:
         identity_args += ["--built-daemon-sha256", built_daemon_sha256]
+    if bridge_selftest_report is not None:
+        identity_args += ["--bridge-selftest-report", str(bridge_selftest_report)]
     if dry_run:
         identity_args += ["--dry-run"]
     out_path = tmp_path / "gate.json"
@@ -958,3 +961,19 @@ def test_rejected_shared_evidence_cannot_fall_back_to_stale_green_l1(
     assert judged["verdict"] == "EVIDENCE_MISSING", judged
     assert stale_path.is_file() and hashlib.sha256(stale_path.read_bytes()).hexdigest() == stale_sha
     assert "EVIDENCE_MISSING" in proc.stdout + proc.stderr
+
+
+def test_s22_gate_records_bridge_selftest_report_path(tmp_path: Path):
+    """s22-05：報告需可追溯 bridge 自測輸入，而非只記錄 L1.5 結果。"""
+    driver = (ROOT / "scripts/rust/s22_gate.sh").read_text(encoding="utf-8")
+    checker = (ROOT / "scripts/rust/s22_gate_check.py").read_text(encoding="utf-8")
+    assert "work/p7-ab/bridge-selftest/selftest-report.json" in driver
+    assert "uart_stdio_bridge selftest --endpoint posix-pty" in driver
+    assert 'sys.executable, "-m", "uart_stdio_bridge", "selftest", "--endpoint", "posix-pty"' in driver
+    assert "evaluate_bridge_eligibility" in driver
+    assert '"outcome": "failed" if report_exists else "unchecked"' in driver
+    assert "--bridge-selftest-report" in driver
+    assert '"bridge_selftest_report"' in checker
+    report_path = tmp_path / "shared/work/p7-ab/bridge-selftest/selftest-report.json"
+    _rc, report = _run(tmp_path / "run", _good_reports(), bridge_selftest_report=report_path)
+    assert report["l15_inputs"]["bridge_selftest_report"] == str(report_path)
