@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Slice 2 gate 共用前置：候選版 no-fakes CLI、Stage 2 handoff bundles 與主機安全預檢。
+# 結束碼：0 成功；--gate 主機預檢失敗為 3、建置失敗為 2；參數錯誤為 2；--check-env 缺少 artifact 為 3。
+# gate_shared.sh、p7_gate.sh、slice24_exit.sh 會將任何 --gate 失敗記入各自 run/logs/gate-prereqs.log，並回傳專用結束碼 4。
 
 sw_gate_prereqs_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 

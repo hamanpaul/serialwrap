@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import subprocess
 import sys
 
 import pytest
@@ -104,6 +105,16 @@ def test_required_rows_complete():
     script = (ROOT / "scripts/rust/p7_gate.sh").read_text(encoding="utf-8")
     assert 'win_l1() {  # win_l1 <dir> <該次 win-test log>' in script
     assert 'ls -t "$ROOT"/target/win-test-report' not in script
+
+    run_id = "default-report-path"
+    dry_run = subprocess.run(
+        ["bash", str(ROOT / "scripts/rust/p7_gate.sh"), "--dry-run", "--run-id", run_id],
+        cwd=ROOT, capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert dry_run.returncode == 0, dry_run.stdout + dry_run.stderr
+    default_report = ROOT / "target/p7-gate" / run_id / "p7-gate.md"
+    assert str(default_report) in dry_run.stdout, dry_run.stdout
+    assert "docs/rust-refactor/evidence/p7-gate-" not in dry_run.stdout
 
 
 def test_missing_required_row_is_incomplete(tmp_path):

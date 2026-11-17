@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # 在單一候選 HEAD 產生 S2 gate 可共用的證據。
+# 結束碼：0 完成；1 共用段失敗；2 參數／既有輸出錯誤；3 工作樹不乾淨或證據缺失；4 gate_prereqs 失敗。
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 OUT_ROOT="$ROOT/target/s2-shared-evidence"
@@ -22,7 +23,7 @@ OUT_ROOT="$(realpath -m -- "$OUT_ROOT")"
 RUN_DIR="$OUT_ROOT/$RUN_ID"
 if [[ "$DRY_RUN" == "1" ]]; then
   echo "gate_shared.sh dry-run：候選 artifact 與共用證據目錄 $RUN_DIR"
-  echo "執行：source scripts/rust/gate_prereqs.sh --gate；失敗記錄到 <LOG_DIR>/driver.tsv 並停止。"
+  echo "執行：source scripts/rust/gate_prereqs.sh --gate；失敗原因記錄到 $RUN_DIR/logs/gate-prereqs.log，driver.tsv 保留原始結束碼，driver 以結束碼 4 停止。"
   echo "執行：cargo build --workspace --bins；cargo build --workspace --bins --release --target x86_64-unknown-linux-gnu。"
   echo "執行：scripts/rust/mkbundle.sh --release-bundle --stage 2 --profile release --out $RUN_DIR/candidate-bundle；以同 HEAD Stage 2 bundle 綁定 s24_ab，並在 pytest 設 SERIALWRAP_CLI_EXE、SERIALWRAP_DAEMON_EXE、SW_BUNDLE。"
   echo "執行：env SW_RESOURCE_REPORT=<L1> SERIALWRAP_COVERAGE_RUN_DIR=<COVERAGE> SERIALWRAP_COVERAGE_LABEL=python-linux python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence --junitxml=<JUNIT>。"
@@ -36,6 +37,11 @@ if [[ "$DRY_RUN" == "1" ]]; then
 fi
 
 cd "$ROOT"
+WORKTREE_STATUS="$(git status --porcelain --untracked-files=normal)"
+if [[ -n "$WORKTREE_STATUS" ]]; then
+  printf 'gate_shared.sh: 工作樹不乾淨，拒絕正式執行（結束碼 3）。髒檔：\n%s\n' "$WORKTREE_STATUS" >&2
+  exit 3
+fi
 export TMPDIR="$(mktemp -d /tmp/sw.XXXXXX)"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 [[ "$CARGO_TARGET_DIR" == /* ]] || CARGO_TARGET_DIR="$ROOT/$CARGO_TARGET_DIR"
@@ -53,16 +59,19 @@ if not is_worktree_clean(Path(sys.argv[1])):
 PY
 
 LOG_DIR="$ROOT/target/s2-par/gpz/gate-shared/$RUN_ID"
-mkdir -p "$LOG_DIR"
-if source "$ROOT/scripts/rust/gate_prereqs.sh" --gate >"$LOG_DIR/gate-prereqs.log" 2>&1; then
+PREREQ_LOG="$RUN_DIR/logs/gate-prereqs.log"
+mkdir -p "$LOG_DIR" "$(dirname "$PREREQ_LOG")"
+if source "$ROOT/scripts/rust/gate_prereqs.sh" --gate >"$PREREQ_LOG" 2>&1; then
   PREREQS_RC=0
 else
   PREREQS_RC=$?
 fi
 printf 'gate_prereqs\t%s\n' "$PREREQS_RC" >"$LOG_DIR/driver.tsv"
 if [[ "$PREREQS_RC" -ne 0 ]]; then
-  echo "gate_shared.sh: gate_prereqs exit=$PREREQS_RC（$LOG_DIR/gate-prereqs.log）" >&2
-  exit "$PREREQS_RC"
+  printf 'gate_prereqs --gate 失敗（gate_prereqs 原始結束碼=%s；driver 結束碼=4）。\n' "$PREREQS_RC" >>"$PREREQ_LOG"
+  echo "gate_shared.sh: gate_prereqs --gate 失敗；driver 結束碼 4（原始結束碼 $PREREQS_RC；$PREREQ_LOG）" >&2
+  cat "$PREREQ_LOG" >&2
+  exit 4
 fi
 FAILURES=0
 LAST_RC=0

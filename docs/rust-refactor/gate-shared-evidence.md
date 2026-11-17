@@ -10,6 +10,8 @@
 scripts/rust/gate_shared.sh --out target/s2-shared-evidence --run-id <run-id> [--windows-l1 <dir>]
 ```
 
+`gate_shared.sh`、`p7_gate.sh` 與 `slice24_exit.sh` 的正式執行都會先檢查 `git status --porcelain --untracked-files=normal`；髒工作樹時列出髒檔並以結束碼 3 停止，不啟動前置或測試。三個 driver 的 `gate_prereqs.sh --gate` 失敗時，保留檢查／建置輸出的具體原因於各自 run 目錄的 `logs/gate-prereqs.log`，並以結束碼 4 回報（參數錯誤仍為 2）。P7 未指定 `--out-md` 時，報告寫到 `target/p7-gate/<run_id>/p7-gate.md`，不改動 `docs/`。
+
 四個 gate 以 `--shared-evidence <dir>/<run-id>` 指定同一目錄。`scripts/rust/gate_shared.sh --dry-run` 只列出命令，不執行測試。四個 gate 的 `--dry-run` 也只列計畫，不產生出口證據。
 
 共用 manifest 記錄候選 Git HEAD、產生時與匯入時的乾淨工作樹狀態、debug/release CLI 與 daemon 的 SHA256、每段實際 selector argv、鎖定集合，以及每個證據檔案的 SHA256。四個 artifact 的 manifest 識別名稱維持 `debug_cli`、`debug_daemon`、`release_cli`、`release_daemon`；實體路徑固定為 `artifacts/debug/serialwrap`、`artifacts/debug/serialwrapd`、`artifacts/release/serialwrap`、`artifacts/release/serialwrapd`，匯入 gate 的副本亦沿用各自的 `serialwrap`／`serialwrapd` 檔名。匯入時會核對目前 HEAD、乾淨狀態、artifact 路徑與四個 artifact 雜湊、證據檔雜湊及該 gate 的 `l1_required.lock.json` selector。任一項不符或段落缺失，都記為 `EVIDENCE_MISSING`，不會改跑該共用段；artifact provenance 不符時不會在 gate 內重建替代 binary。來源段的 FAIL 仍傳給原 judge，不會轉成 PASS。

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Slice 2.4 Linux 證據收集與出口報告；Windows／真機／長跑項只匯入擁有者既有證據。
+# 結束碼：0 完成；1 gate 判定失敗；2 參數／輸出路徑錯誤；3 工作樹不乾淨；4 gate_prereqs 失敗。
 # --candidate-bundle DIR：本輪候選 Linux bundle（mkbundle --release-bundle 輸出或安裝根；版本目錄＝bin/serialwrap
 #   解析後的上兩層，須含 release-manifest.json 且 git_revision＝本 worktree HEAD）。指定後受測 CLI／daemon 取自該 bundle，
 #   並寫入 RUN_DIR/artifacts/linux/candidate-bundle.json；長跑證據只有與它相同的 bundle／CLI／daemon 才能解除阻擋。
@@ -103,6 +104,11 @@ if [[ -e "$RUN_DIR" ]]; then
   echo "slice24_exit.sh: $RUN_DIR 已存在，拒絕混合不同輪次；請改用新的 --run-id" >&2
   exit 2
 fi
+WORKTREE_STATUS="$(git status --porcelain --untracked-files=normal)"
+if [[ -n "$WORKTREE_STATUS" ]]; then
+  printf 'slice24_exit.sh: 工作樹不乾淨，拒絕正式執行（結束碼 3）。髒檔：\n%s\n' "$WORKTREE_STATUS" >&2
+  exit 3
+fi
 
 mkdir -p "$RUN_DIR/logs" "$RUN_DIR/artifacts"
 # Cargo、pytest 與 importer 的所有可寫產物固定落在本 worktree 的 target/。
@@ -111,13 +117,16 @@ DRIVER_TSV="$RUN_DIR/driver.tsv"
 OWNER_TSV="$RUN_DIR/owner-evidence.tsv"
 : >"$DRIVER_TSV"
 : >"$OWNER_TSV"
-if source "$ROOT/scripts/rust/gate_prereqs.sh" --gate >"$RUN_DIR/logs/gate-prereqs.log" 2>&1; then
+PREREQ_LOG="$RUN_DIR/logs/gate-prereqs.log"
+if source "$ROOT/scripts/rust/gate_prereqs.sh" --gate >"$PREREQ_LOG" 2>&1; then
   :
 else
   PREREQS_RC=$?
   printf 'gate_prereqs\t%s\n' "$PREREQS_RC" >>"$DRIVER_TSV"
-  echo "slice24_exit.sh: gate_prereqs exit=$PREREQS_RC（$RUN_DIR/logs/gate-prereqs.log）" >&2
-  exit "$PREREQS_RC"
+  printf 'gate_prereqs --gate 失敗（gate_prereqs 原始結束碼=%s；driver 結束碼=4）。\n' "$PREREQS_RC" >>"$PREREQ_LOG"
+  echo "slice24_exit.sh: gate_prereqs --gate 失敗；driver 結束碼 4（原始結束碼 $PREREQS_RC；$PREREQ_LOG）" >&2
+  cat "$PREREQ_LOG" >&2
+  exit 4
 fi
 
 # 先前切片 gate 證據複製進本輪目錄後才匯入，保留輸入來源且讓報告可追溯。
