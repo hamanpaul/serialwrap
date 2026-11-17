@@ -50,6 +50,8 @@ if [[ -n "$WORKTREE_STATUS" ]]; then
   exit 4
 fi
 
+GIT_DIR_HOST="$(git -C "$ROOT" rev-parse --absolute-git-dir)"
+GIT_COMMON_DIR_HOST="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)"
 CARGO_HOME_HOST="$(realpath "${CARGO_HOME:-$HOME/.cargo}")"
 RUSTUP_HOME_HOST="$(realpath "${RUSTUP_HOME:-$HOME/.rustup}")"
 CARGO_BIN_HOST="$(realpath "$CARGO_HOME_HOST/bin")"
@@ -105,6 +107,10 @@ export CARGO_HOME=/tmp/sw-sys-admin-cargo-home
 export CARGO_TARGET_DIR=/tmp/sw-sys-admin-target
 export CARGO_INCREMENTAL=0
 export CARGO_NET_OFFLINE=true
+export GIT_DIR=/host-gitdir
+export GIT_COMMON_DIR=/host-git-common
+export GIT_WORK_TREE=/workspace
+export GIT_OPTIONAL_LOCKS=0
 export GIT_CONFIG_COUNT=1
 export GIT_CONFIG_KEY_0=safe.directory
 export GIT_CONFIG_VALUE_0=/workspace
@@ -185,6 +191,8 @@ CONTAINER
 set +e
 docker run --rm --cap-add SYS_ADMIN \
   --mount "type=bind,source=$ROOT,target=/workspace,readonly" \
+  --mount "type=bind,source=$GIT_DIR_HOST,target=/host-gitdir,readonly" \
+  --mount "type=bind,source=$GIT_COMMON_DIR_HOST,target=/host-git-common,readonly" \
   --mount "type=bind,source=$CARGO_BIN_HOST,target=/host-cargo-bin,readonly" \
   --mount "type=bind,source=$CARGO_REGISTRY_HOST,target=/host-cargo-registry,readonly" \
   --mount "type=bind,source=$RUSTUP_HOME_HOST,target=/host-rustup,readonly" \
@@ -192,6 +200,10 @@ docker run --rm --cap-add SYS_ADMIN \
   --env "SW_SYS_ADMIN_HEAD=$HEAD" \
   --env "SW_SYS_ADMIN_SELECTOR_JSON=$SELECTOR_JSON" \
   --env "SW_SYS_ADMIN_IMAGE_ID=$IMAGE_ID" \
+  --env "GIT_DIR=/host-gitdir" \
+  --env "GIT_COMMON_DIR=/host-git-common" \
+  --env "GIT_WORK_TREE=/workspace" \
+  --env "GIT_OPTIONAL_LOCKS=0" \
   --entrypoint /bin/bash "$IMAGE" -euc "$CONTAINER_SCRIPT" >"$ARCHIVE" 2>"$DOCKER_STDERR"
 DOCKER_RC=$?
 set -e

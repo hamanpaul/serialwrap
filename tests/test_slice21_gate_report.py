@@ -303,3 +303,16 @@ def test_sys_admin_docker_driver_uses_only_disposable_root_container():
     assert "apt-get update -qq >&2" in text
     assert "pkg-config libudev-dev >&2" in text
     assert "--device" not in text and "--privileged" not in text and "/dev/ttyUSB" not in text
+
+
+def test_sys_admin_docker_driver_mounts_linked_worktree_git_metadata_readonly():
+    """容器內的 L1 collector 必須能讀到 linked worktree 的 HEAD 與乾淨狀態。"""
+    text = (ROOT / "scripts/rust/slice21_sys_admin_docker.sh").read_text(encoding="utf-8")
+    assert 'GIT_DIR_HOST="$(git -C "$ROOT" rev-parse --absolute-git-dir)"' in text
+    assert 'GIT_COMMON_DIR_HOST="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)"' in text
+    assert 'target=/host-gitdir,readonly' in text
+    assert 'target=/host-git-common,readonly' in text
+    assert '--env "GIT_DIR=/host-gitdir"' in text
+    assert '--env "GIT_COMMON_DIR=/host-git-common"' in text
+    assert '--env "GIT_WORK_TREE=/workspace"' in text
+    assert '--env "GIT_OPTIONAL_LOCKS=0"' in text
