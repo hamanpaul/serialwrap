@@ -133,6 +133,43 @@ def test_windows_collection_excludes_posix_modules(tmp_path: Path) -> None:
     assert report_file.exists(), f"SW_RESOURCE_REPORT not written: {report_file}"
     data = json.loads(report_file.read_text(encoding="utf-8"))
     assert "tests/test_multiagent_e2e.py" in data.get("not_collected_platform", [])
+    provenance = data.get("provenance", {})
+    assert provenance.get("schema") == "pytest-l1-provenance.v1"
+    assert provenance.get("platform") == "windows"
+    git = provenance.get("git", {})
+    assert isinstance(git.get("head"), str) and len(git["head"]) == 40
+    assert git.get("end", {}).get("head") == git["head"]
+    assert type(git.get("clean")) is bool
+    assert type(git.get("end", {}).get("clean")) is bool
+
+
+@pytest.mark.memory_only
+def test_windows_git_snapshot_excludes_only_report_outputs(tmp_path: Path) -> None:
+    """Windows pytest provenance 記錄 Git HEAD／dirty，並只排除實際產出的報告檔。"""
+    import tests.resource_report_plugin as plugin
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "tests@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "pytest"], check=True)
+    tracked = repo / "tracked.txt"
+    tracked.write_text("baseline\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "baseline"], check=True)
+
+    report = repo / "resource-report.json"
+    junit = repo / "junit.xml"
+    report.write_text("report\n", encoding="utf-8")
+    junit.write_text("junit\n", encoding="utf-8")
+    clean = plugin._windows_git_snapshot(repo, [report, junit])
+    assert clean["clean"] is True
+    assert len(clean["head"]) == 40
+
+    tracked.write_text("modified\n", encoding="utf-8")
+    dirty = plugin._windows_git_snapshot(repo, [report, junit])
+    assert dirty["head"] == clean["head"]
+    assert dirty["clean"] is False
 
 
 @pytest.mark.process_rpc
@@ -1080,6 +1117,47 @@ def test_resource_report_argv_under_pytest_main(tmp_path: Path) -> None:
     assert res.returncode == 0, res.stdout + res.stderr
     data = json.loads(report_file.read_text(encoding="utf-8"))
     assert data["argv"][1:] == ["-q", str(sub)], data["argv"]
+
+
+@pytest.mark.process_rpc
+def test_windows_resource_report_records_git_provenance(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """原生 Windows pytest L1 記錄候選 HEAD 起訖及工作樹潔淨狀態。"""
+    from types import SimpleNamespace
+    import tests.resource_report_plugin as plugin
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    tracked = repo / "tracked.txt"
+    tracked.write_text("baseline\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "test fixture"], check=True)
+    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+    report_path = repo / "resource-report.json"
+    junit_path = repo / "junit.xml"
+    monkeypatch.setenv("SW_RESOURCE_REPORT", str(report_path))
+    monkeypatch.setattr(plugin.rr, "effective_platform", lambda: "windows")
+    config = SimpleNamespace(
+        rootpath=repo,
+        option=SimpleNamespace(markexpr="windows_native and windows_com", xmlpath=str(junit_path)),
+        invocation_params=SimpleNamespace(args=["-q", "tests/test_native.py::test_native"]),
+    )
+    session = SimpleNamespace(config=config, exitstatus=0)
+
+    plugin.pytest_sessionstart(session)
+    junit_path.write_text("generated junit output\n", encoding="utf-8")
+    plugin.pytest_sessionfinish(session, 0)
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["provenance"] == {
+        "schema": "pytest-l1-provenance.v1",
+        "platform": "windows",
+        "git": {"head": head, "clean": True, "end": {"head": head, "clean": True}},
+    }
 
 
 @pytest.mark.memory_only

@@ -61,11 +61,11 @@
         "required": ["name", "status", "command", "exit", "passed", "failed", "skipped", "deselected", "ignored",
                      "required_set", "l1_results", "l1_verdict", "allowed_missing_bo", "log"],
         "properties": {
-          "name": {"enum": ["linux_l1", "linux_cap_posix_pty", "linux_cap_sys_admin",
+          "name": {"enum": ["linux_l1", "linux_cap_posix_pty", "linux_cap_posix_pty_workspace", "linux_cap_sys_admin",
                             "linux_cap_supervisor_runtime", "windows_native_l1",
                             "windows_cap_windows_com", "windows_cap_windows_native",
                             "windows_cap_interactive_desktop", "windows_cap_supervisor_runtime", "blackbox_python", "blackbox_rust", "existing_suites_rust", "l15_ab",
-                            "event_latency", "wal_s1w_perf", "cfg_boundary", "py_parity", "py_parity_76_80", "pytest_full", "policy_check",
+                            "event_latency", "wal_s1w_perf", "cfg_boundary", "py_parity", "py_parity_windows", "py_parity_76_80", "pytest_full", "policy_check",
                             "case_uptake"]},
           "status": {"enum": ["PASS", "FAIL", "EVIDENCE_MISSING"]},
           "command": {"type": "string"},
@@ -95,6 +95,8 @@
           "log": {"type": "string"},
           "reasons": {"type": "array", "items": {"type": "string"}},
           "evidence": {"type": ["string", "null"]},
+          "bridge_selftest_report": {"type": "string", "minLength": 1,
+                                    "description": "L1.5 使用之 bridge 自測報告來源路徑；資格由 evaluate_bridge_eligibility 判定。"},
           "section_verdict": {"enum": ["PASS", "FAIL", "EVIDENCE_MISSING"],
                               "description": "非測試類 section 自身報告的判定（如 wal_s1w verdict）；判定器只當輸入條件之一。"},
           "capability_probe": {
@@ -146,7 +148,7 @@
     },
     "parity_amendments": {
       "type": "object",
-      "description": "#104：parity-amendments-2026-10-26.md 中承接 Phase 為 P5 的每一列；狀態取自 tests/acceptance/slice21_parity_status.yaml，經判定器核對（PASS 必附 nodeid 且於本次 L1 證據中 passed）。任一列 INCOMPLETE／無標記 → verdict INCOMPLETE。",
+      "description": "#104：parity-amendments-2026-10-26.md 中承接 Phase 為 P5 的每一列；狀態取自 tests/acceptance/slice21_parity_status.yaml，經判定器核對（PASS 必附 nodeid 且於本次 L1 證據中 passed；NOT_APPLICABLE 必附該列的計畫／裁決行號引用）。任一列 INCOMPLETE／無標記 → verdict INCOMPLETE。",
       "required": ["source", "status_file", "rows", "summary"],
       "properties": {
         "source": {"type": "string"},
@@ -160,9 +162,10 @@
             "properties": {
               "id": {"type": "string"},
               "take": {"type": "string"},
-              "status": {"enum": ["PASS", "BLOCKED-OWNER", "OWNER-DECISION-PENDING", "INCOMPLETE"]},
+              "status": {"enum": ["PASS", "NOT_APPLICABLE", "BLOCKED-OWNER", "OWNER-DECISION-PENDING", "INCOMPLETE"]},
               "claimed": {"type": ["string", "null"]},
               "tests": {"type": "array", "items": {"type": "string"}},
+              "ruling": {"type": ["string", "null"]},
               "reasons": {"type": "array", "items": {"type": "string"}}
             }
           }

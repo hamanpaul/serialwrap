@@ -21,9 +21,16 @@
   `selftest-report.json`（`python3 -m tools.uart_stdio_bridge selftest …` 產出，tool tree sha256 等於 `APPROVED_REVISION.json`）時才執行；
   未設或不合格時 `l15_ab` 記為 `EVIDENCE_MISSING`（不是 FAIL）。完整命令例：
   `SERIALWRAP_L15_SELFTEST_REPORT=<路徑>/selftest-report.json bash scripts/rust/slice21_gate.sh --run-id <run_id>`。
-- **承接率斷路器**：`case_uptake` 由 judge 以 `slice_breaker.evaluate` 判定（快照檔 `tests/acceptance/breaker/slice_2.1.snapshots.ndjson`、
-  OD-02 剩餘預估 `stage2_estimate_weeks` 取自 `tests/acceptance/slice21_gate_expect.yaml`）；tripped 或超過 OD-02 → FAIL，
+- **承接率斷路器**：`case_uptake` 由 judge 以 `slice_breaker.evaluate` 判定（已提交快照 `tests/acceptance/breaker/slice_2.1.snapshots.ndjson` 加上本次 run 的待提交快照、
+  OD-02 剩餘預估 `stage2_estimate_weeks` 取自 `tests/acceptance/slice21_gate_expect.yaml`）；正式 gate 只把本次一筆寫到
+  `target/slice21-gate/<run_id>/breaker/slice_2.1.pending.ndjson`，判定仍合併讀取兩者，未修改追蹤檔。tripped 或超過 OD-02 → FAIL，
   證據不足（含 `stage2_estimate_weeks` 未填）→ `EVIDENCE_MISSING`。`stage2_estimate_weeks` 由擁有者填值。
+- **四個 gate 收尾**：Slice 2.1～2.4 全部完成前不得合併待提交快照（共用證據要求工作樹乾淨）。四個 gate 跑完後，使用下列命令
+  將該 run 的唯一待提交列併入追蹤快照，並把原列封存於 run 目錄；再以收尾 commit 一併提交快照：
+  `python3 scripts/rust/slice21_gate_judge.py finalize-breaker-snapshot --run-dir target/slice21-gate/<run_id> --gates-complete`。
+  此收尾命令要求收尾前工作樹乾淨、run 的 `git_revision` 等於目前 HEAD，並拒絕缺報告、錯誤／多筆快照、run_id 或承接率不符，以及已存在不同或重複的 run_id。
+
+正式執行 `slice21_gate.sh` 前工作樹必須乾淨；若 `git status --porcelain --untracked-files=normal` 非空，gate 以結束碼 4 並列出狀態，且不建立 run 輸出。`--dry-run` 不執行此檢查。
 
 ### BO-S21-01
 
@@ -233,15 +240,56 @@
 
 gate 為 OD-55 的 linux 能力集合各設一個 section（`linux_cap_<cap>`）。gate 先探測能力，具備才實跑；否則記 EVIDENCE_MISSING 並附
 探測證據、所需能力與處置，**不得記 PASS**（judge `CAPABILITY_SECTIONS`；即使 l1 結果全 passed 也一樣，例如
-`cap_sys_admin__tiocexcl_bypass_documented` 在無權限時 early return 仍回 ok）。
+`cap_sys_admin__tiocexcl_bypass_documented` 在無權限時 early return 仍回 ok）。POSIX PTY 能力列另由
+`linux_cap_posix_pty_workspace` 以凍結 selector 收集並由 `l1_judge` 逐列判定；不設可缺豁免。
 
 | section | 集合 | 所需能力 | 處置 | 可行的實跑方式 |
 |---|---|---|---|---|
-| `linux_cap_sys_admin` | `s21_gate:cap_sys_admin` | root（euid 0）且 `CapEff` 含 CAP_SYS_ADMIN | BLOCKED-OWNER | 以 root 於可丟棄容器（例：`docker run --cap-add SYS_ADMIN`，掛載 repo）跑 gate（須設 `SW_GATE_L1_USER` 讓 linux_l1／linux_cap_posix_pty 降權為非 root，F108），或單獨執行 `python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_cap_sys_admin/l1-results.json --caps-only --caps sys_admin -- --workspace --features test-fakes -- --ignored cap_sys_admin__`（`--caps-only`：只跑能力列；root 下 sw-pal 預設測試數支必紅，不得一併執行。gate 以 `slice21_gate_judge.py caps-plan` 由鎖 selector 推導，OD-53） |
+| `linux_cap_posix_pty_workspace` | `s21_gate:cap_posix_pty` | Linux POSIX PTY；以非 root 執行 | 必須依 `l1_judge` 判定，不是 BLOCKED-OWNER | `python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_cap_posix_pty_workspace/l1-results.json --caps-only --caps posix_pty -- --workspace --features test-fakes -- --ignored cap_posix_pty__`；test-binary selector 逐字取自鎖，OD-53 |
+| `linux_cap_sys_admin` | `s21_gate:cap_sys_admin` | root（euid 0）且 `CapEff` 含 CAP_SYS_ADMIN | BLOCKED-OWNER | 以 `scripts/rust/slice21_sys_admin_docker.sh --out <空目錄>` 在 Ubuntu 24.04 執行；容器以 `--rm --cap-add SYS_ADMIN` 啟動，repo、該 worktree 的 Git dir／共用 Git dir 與主機 Rust toolchain 唯讀掛載；repo 與 Git metadata 使用主機原始絕對路徑掛載，以維持 linked worktree 的 gitdir back-reference，`GIT_DIR`／`GIT_COMMON_DIR`／`GIT_WORK_TREE` 指向對應路徑，並關閉 Git optional locks，確保可讀出真實 HEAD／clean provenance 而不寫入來源 metadata；`CARGO_TARGET_DIR` 留在容器 `/tmp`。selector 由 `slice21_gate_judge.py caps-plan` 從鎖推導，使用 `--caps-only --caps sys_admin`，不執行 root 下可能必紅的 sw-pal 預設測試。輸出須通過 HEAD、selector、L1 provenance、euid=0 與 `CapEff` bit 21 檢查；正式 gate 以 `SW_GATE_SYS_ADMIN_RESULTS=<結果目錄>` 匯入。未提供此變數時仍由 gate 探測主機；證據缺漏或不符一律 EVIDENCE_MISSING，不得 PASS。其他 Linux L1／POSIX PTY 段仍須依 F108 設 `SW_GATE_L1_USER` 降權為非 root。 |
 | `linux_cap_supervisor_runtime` | `s21_gate:cap_supervisor_runtime` | `systemctl --user is-system-running` 為 running／degraded | BLOCKED-OWNER | 於隔離的 systemd 容器（`tools/docker/systemd.Dockerfile`，OD-15）以一般使用者登入 session 跑 gate，或單獨執行 `... --out <run>/linux_cap_supervisor_runtime/l1-results.json --caps-only --caps supervisor_runtime -- --workspace --features test-fakes -- --ignored cap_supervisor_runtime__`；測試會建立並清除暫時 user unit |
 | `windows_cap_windows_native` | `s21_gate:cap_windows_native`（windows） | 原生 Windows 本機（PowerShell、Job Object、PE Subsystem） | LOCAL-WINDOWS-TODO | 證據只能於原生 Windows 本機產生：於擁有者 Windows host 以 `python3 scripts/rust/cargo_l1_results.py --platform windows --runner scripts/rust/win-runner.sh --out <dir>/windows_cap_windows_native/l1-results.json --caps-only --caps windows_native -- <集合 selector argv>`（環境比照 `win-test.sh`）產生，gate 以 `SW_GATE_LOCAL_WINDOWS_DIR=<dir>` 匯入；缺證據檔記 EVIDENCE_MISSING，不得 PASS |
 | `windows_cap_interactive_desktop` | `s21_gate:cap_interactive_desktop`（windows） | 原生 Windows 互動 console（擁有者登入的桌面 session） | LOCAL-WINDOWS-TODO | 證據只能於原生 Windows 本機產生：於擁有者 Windows host 以 `python3 scripts/rust/cargo_l1_results.py --platform windows --runner scripts/rust/win-runner.sh --out <dir>/windows_cap_interactive_desktop/l1-results.json --caps-only --caps interactive_desktop -- <集合 selector argv>`（環境比照 `win-test.sh`）產生，gate 以 `SW_GATE_LOCAL_WINDOWS_DIR=<dir>` 匯入；缺證據檔記 EVIDENCE_MISSING，不得 PASS |
 | `windows_cap_supervisor_runtime` | `s21_gate:cap_supervisor_runtime`（windows） | 原生 Windows 工作排程器執行期（建立暫時排程工作，須擁有者授權） | LOCAL-WINDOWS-TODO | 證據只能於原生 Windows 本機產生：於擁有者 Windows host 以 `python3 scripts/rust/cargo_l1_results.py --platform windows --runner scripts/rust/win-runner.sh --out <dir>/windows_cap_supervisor_runtime/l1-results.json --caps-only --caps supervisor_runtime -- <集合 selector argv>`（環境比照 `win-test.sh`；建立暫時排程工作須設 `SW_TEST_ALLOW_SCHTASKS`）產生，gate 以 `SW_GATE_LOCAL_WINDOWS_DIR=<dir>` 匯入；缺證據檔記 EVIDENCE_MISSING，不得 PASS |
+
+### Windows 原生 pytest parity L1（F-S19）
+
+此集合只承接 `tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::test_windows_guarded_write_stall_drain_stalled_native`。正式 selector（待收尾線依原生收集清單寫入 `l1_required.lock.json`）為：
+
+```text
+-q tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::test_windows_guarded_write_stall_drain_stalled_native -m "windows_native and windows_com"
+```
+
+於 WSL 呼叫既有 Stage 0 runner 做原生 Windows collect-only（將輸出 L1 的 `collected` 作鎖檔登記依據，不把 collect-only 當執行證據）：
+
+```bash
+SW_TEST_COM_PAIR=COM20:COM21 scripts/stage0/win-pytest.sh --collect-only -q \
+  tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::test_windows_guarded_write_stall_drain_stalled_native \
+  -m "windows_native and windows_com"
+```
+
+實際 L1 必須以同一 selector 執行（需要擁有者提供可工作的 COM pair；runner 會拒絕被 skip 的原生項目）：
+
+```bash
+SW_TEST_COM_PAIR=COM20:COM21 scripts/stage0/win-pytest.sh -q \
+  tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::test_windows_guarded_write_stall_drain_stalled_native \
+  -m "windows_native and windows_com"
+mkdir -p <windows-l1-root>/s21_gate:py_parity
+cp <win-pytest-run>/resource-report.json <windows-l1-root>/s21_gate:py_parity/l1-results.json
+scripts/rust/gate_shared.sh --run-id <shared-run-id> --windows-l1 <windows-l1-root>
+```
+
+`gate_shared.sh` 只匯入已登記於鎖檔的 Windows 集合；Slice 2.1 gate 再以 `--shared-evidence <shared-run-dir>` 接受該 L1。報告必須綁定候選 HEAD 起訖、兩端乾淨狀態、Windows 平台、鎖定 nodeid 與逐字 selector；失敗保留 FAIL，缺失或不符為 EVIDENCE_MISSING。
+
+sys_admin 正式流程範例（先以乾淨且已提交的候選 HEAD 產生證據，再將同一目錄交給 Slice 2.1 gate）：
+
+```bash
+scripts/rust/slice21_sys_admin_docker.sh --out target/slice21-sys-admin/<run-id>
+SW_GATE_SYS_ADMIN_RESULTS="$PWD/target/slice21-sys-admin/<run-id>" \
+  bash scripts/rust/slice21_gate.sh --shared-evidence <SHARED_ROOT>/<ID> --run-id s21-<ID> --out <OUT>
+```
+
+Docker 驅動不掛載任何序列埠或主機裝置，結果檔由主機使用者從容器輸出的封包建立；容器被移除後只保留 `l1-results.json`、`sys-admin-evidence.json`、`container.log` 與 Docker 驅動記錄。容器 L1 測試失敗時仍保留逐案結果，gate 依既有 `l1_judge` 判定，不轉成 PASS。
 
 擁有者裁決 2026-11-12（rulings/s2.md「OD-55 Windows 部分的完成方式」第 4 點）：`linux_cap_windows_native`、`linux_cap_interactive_desktop` 兩個 linux section 已退役（OD-68 後已無 linux 必要集合），改由上表的 `windows_cap_windows_native`、`windows_cap_interactive_desktop` 承擔。
 

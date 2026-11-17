@@ -91,6 +91,9 @@ RELEASE_BUILD_COMMAND = [
     "cargo", "build", "--release", "-p", "sw-daemon", "-p", "sw-cli",
     "--target", "x86_64-unknown-linux-gnu",
 ]
+SHARED_RELEASE_BUNDLE_COMMAND = [
+    "bash", "scripts/rust/mkbundle.sh", "--release-bundle", "--stage", "2", "--profile", "release",
+]
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -108,23 +111,53 @@ def git_revision() -> str:
 
 
 def build_identity(*, daemon_path: pathlib.Path | None, build_linux_exit: int | None,
-                   built_daemon_sha256: str | None, dry_run: bool = False) -> dict[str, Any]:
-    """記錄受測 daemon 與獨立 release 建置快照，供 P7 逐來源綁定。"""
+                   built_daemon_sha256: str | None, cli_path: pathlib.Path | None = None,
+                   shared_release_bundle: bool = False,
+                   shared_release_info: Mapping[str, Any] | None = None,
+                   dry_run: bool = False) -> dict[str, Any]:
+    """記錄受測 CLI／daemon 摘要與 release 來源，供下游逐來源綁定。"""
     daemon_sha256 = None
-    if daemon_path is not None and not dry_run:
-        try:
-            if daemon_path.is_file():
-                daemon_sha256 = sha256_file(daemon_path)
-        except OSError:
-            pass
+    cli_sha256 = None
+    if not dry_run:
+        for path, key in ((daemon_path, "daemon"), (cli_path, "cli")):
+            if path is None:
+                continue
+            try:
+                if path.is_file():
+                    digest = sha256_file(path)
+                    if key == "daemon":
+                        daemon_sha256 = digest
+                    else:
+                        cli_sha256 = digest
+            except OSError:
+                pass
+    bundle_path = shared_release_info.get("bundle_path") if shared_release_info else None
+    build_command = list(SHARED_RELEASE_BUNDLE_COMMAND if shared_release_bundle else RELEASE_BUILD_COMMAND)
+    if shared_release_bundle and isinstance(bundle_path, str) and bundle_path:
+        build_command.extend(["--out", bundle_path])
+    build = {
+        "command": build_command,
+        "linux_exit": build_linux_exit,
+        "daemon_sha256_at_build": built_daemon_sha256 or None,
+    }
+    if shared_release_bundle:
+        bundle_identity = shared_release_info.get("identity") if shared_release_info else None
+        build["source"] = {
+            "kind": "shared-manifest-stage2-release-bundle",
+            "bundle_path": bundle_path,
+            "bundle_identity": dict(bundle_identity) if isinstance(bundle_identity, Mapping) else None,
+            "imported_cli_path": str(cli_path) if cli_path is not None else None,
+            "imported_cli_sha256": cli_sha256,
+            "imported_daemon_path": str(daemon_path) if daemon_path is not None else None,
+            "imported_daemon_sha256": daemon_sha256,
+        }
     return {
         "git_revision": git_revision(),
+        "cli_path": str(cli_path) if cli_path is not None else None,
+        "cli_sha256": cli_sha256,
+        "daemon_path": str(daemon_path) if daemon_path is not None else None,
         "daemon_sha256": daemon_sha256,
-        "build": {
-            "command": list(RELEASE_BUILD_COMMAND),
-            "linux_exit": build_linux_exit,
-            "daemon_sha256_at_build": built_daemon_sha256 or None,
-        },
+        "build": build,
     }
 
 
@@ -654,10 +687,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--prereqs-script", type=pathlib.Path, default=DEFAULT_PREREQS)
     ap.add_argument("--daemon-path", type=pathlib.Path, default=None,
                     help="受測 release serialwrapd 執行檔（identity.daemon_sha256）")
+    ap.add_argument("--cli-path", type=pathlib.Path, default=None,
+                    help="受測 release serialwrap CLI 執行檔（identity.cli_sha256）")
+    ap.add_argument("--shared-release-bundle", action="store_true",
+                    help="記錄受測 artifact 來自共用 manifest 的 mkbundle Stage 2 release bundle 匯入副本")
+    ap.add_argument("--shared-release-info", type=pathlib.Path, default=None,
+                    help="經 gate_shared_evidence 驗證的 Stage 2 bundle 實際路徑與 identity JSON")
     ap.add_argument("--build-linux-exit", type=int, default=None,
                     help="指定 release 建置命令的退出碼")
     ap.add_argument("--built-daemon-sha256", default=None,
                     help="release 建置成功當下記錄的 serialwrapd SHA-256")
+    ap.add_argument("--bridge-selftest-report", type=pathlib.Path, default=None,
+                    help="記錄 L1.5 bridge 自測報告路徑，不變更資格判定")
     ap.add_argument("--dry-run", action="store_true", help="在輸出標記 dry_run；不改變既有判定")
     ap.add_argument("--evidence-missing", action="append", default=[], metavar="SET_ID/PLATFORM",
                     help="明確標記遭拒的共用證據；該集合不讀取舊 L1 報告")
@@ -672,6 +713,18 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if any(e["caps"] is None for e in plan) else 0
     if args.map is None or args.out is None:
         ap.error("判定模式須指定 --map 與 --out")
+    if args.shared_release_bundle != (args.shared_release_info is not None):
+        ap.error("--shared-release-bundle 與 --shared-release-info 必須同時提供")
+    shared_release_info = None
+    if args.shared_release_info is not None:
+        try:
+            shared_release_info = json.loads(args.shared_release_info.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            ap.error(f"共用 Stage 2 bundle identity 不可讀：{exc}")
+        if (not isinstance(shared_release_info, Mapping) or shared_release_info.get("status") != "PASS"
+                or not isinstance(shared_release_info.get("bundle_path"), str)
+                or not isinstance(shared_release_info.get("identity"), Mapping)):
+            ap.error("共用 Stage 2 bundle identity 缺少經驗證的實際路徑或 identity")
     emap = yaml.safe_load(args.map.read_text(encoding="utf-8")) or {}
     cases_lock = json.loads(args.cases_lock.read_text(encoding="utf-8"))
     l15, l15_reasons = load_l15(args.l15_results)
@@ -703,7 +756,9 @@ def main(argv: list[str] | None = None) -> int:
     elif result == "EVIDENCE_MISSING":
         result = "INSUFFICIENT"
     identity = build_identity(daemon_path=args.daemon_path, build_linux_exit=args.build_linux_exit,
-                              built_daemon_sha256=args.built_daemon_sha256, dry_run=args.dry_run)
+                              built_daemon_sha256=args.built_daemon_sha256, cli_path=args.cli_path,
+                              shared_release_bundle=args.shared_release_bundle,
+                              shared_release_info=shared_release_info, dry_run=args.dry_run)
     identity_missing, identity_mismatch = identity_problems(identity, args.daemon_path)
     if args.dry_run or identity_missing or identity_mismatch:
         # P7 _bind 以 identity.daemon_sha256 決定採用與否；不完整或自檢失敗時清空此鍵，
@@ -714,6 +769,8 @@ def main(argv: list[str] | None = None) -> int:
         identity_mismatch = sorted(set(identity_mismatch + checked_mismatch))
     payload = {"sections": sections, "cases": cases, "map_coverage": coverage, "parity_rows": parity,
                "prereqs": prereqs, "breaker": breaker, "l15_reasons": l15_reasons, "result": result,
+               "l15_inputs": {"bridge_selftest_report": str(args.bridge_selftest_report)
+                              if args.bridge_selftest_report else None},
                "dry_run": bool(args.dry_run), "identity": identity,
                "identity_problems": {"missing": identity_missing, "mismatch": identity_mismatch}}
     args.out.parent.mkdir(parents=True, exist_ok=True)
