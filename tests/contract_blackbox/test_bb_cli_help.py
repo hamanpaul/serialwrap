@@ -96,7 +96,14 @@ def test_help_usage_error_bytes(env, case):
     if is_rust() and (argv == ["--version"] or argv == ["--version", "session"]):
         from bb_harness import rust_daemon_code_fingerprint
 
-        _assert_rust_version_bytes(r.stdout, c["stdout"], rust_daemon_code_fingerprint())
+        manifest_fingerprint = rust_daemon_code_fingerprint()
+        _assert_rust_version_bytes(r.stdout, c["stdout"], manifest_fingerprint)
+        python_fingerprint = re.search(r"\(code ([0-9a-f]{12})\)", c["stdout"])
+        assert python_fingerprint is not None, f"Python version golden 缺少指紋：{c['stdout']!r}"
+        for wrong_fingerprint in {python_fingerprint.group(1), "0123456789ab"} - {manifest_fingerprint}:
+            wrong_output = _expected_rust_version_bytes(c["stdout"], wrong_fingerprint)
+            with pytest.raises(AssertionError, match="逐位元組"):
+                _assert_rust_version_bytes(wrong_output, c["stdout"], manifest_fingerprint)
         assert (r.rc, r.stderr.decode()) == (c["rc"], c["stderr"].replace("\n", nl))
         return
     if is_rust() and len(argv) == 2 and argv[0] in RUST_ONLY_HELP_GROUPS and argv[1] == "--help":
