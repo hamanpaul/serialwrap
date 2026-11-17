@@ -149,7 +149,14 @@ rows:
     status: PASS
     tests: ["cargo:sw-daemon::dispatch::health_status_foreign_holders_holder_unknown_object"]
     note: "併 #11"
-  - {id: "#45", status: INCOMPLETE, reason: "三個 Rust 測試已 passed；D-44 Python 特性測試（#81）尚未新增／登記 s21_gate:py_parity"}
+  - id: "#45"
+    status: PASS
+    tests:
+      - "cargo:sw-core::command_exec::bg_capture_marked_done_on_finish"
+      - "cargo:sw-core::command_exec::line_mode_terminates_existing_bg_capture"
+      - "cargo:sw-core::command_exec::evict_removes_session_background_cmd_ids"
+      - "tests/test_issue159_bg_fast_capture.py::TestIssue159BgFastCapture::test_line_mode_terminates_existing_bg_capture"
+    note: "三個 Rust 節點由 s21_core 承擔；D-44 Python 特性測試由 s21_gate:pytest_full 執行且已在該集合及 P7 全套集合內，本輪以既有節點補齊 parity 對照。"
   - id: "#46"
     status: PASS
     tests: ["cargo:sw-daemon::daemon_process::allowlist_rejected_before_runtime_dirs_and_lock"]
@@ -325,7 +332,12 @@ rows:
     tests:
       - "cargo:sw-core::drain_release::late_receipt_persist_failure_sets_pending_and_retries"
       - "tests/test_stage0_session_drain.py::test_release_persist_failure_retried"
-  - {id: "B-43（部分）", status: INCOMPLETE, reason: "Rust invalid_bootloader_regex_skipped 已 passed；Python 特性測試（#81）尚未新增／登記"}
+  - id: "B-43（部分）"
+    status: PASS
+    tests:
+      - "cargo:sw-core::login_quiet::invalid_bootloader_regex_skipped"
+      - "tests/test_bootloader_recovery.py::TestSelfTestBootloaderClassification::test_invalid_bootloader_regex_is_skipped_and_next_prompt_classifies"
+    note: "Python origin/main 會略過 re.error 並繼續比對後續樣式；Rust／Python 特性測試均驗證有效 prompt 仍命中。Python 基線不寫 WARNING，與計畫文字差異另列 SPEC-GAP。"
   - id: "B-05（部分）"
     status: PASS
     tests: ["cargo:sw-core::state_store::profile_pins_and_detected_strip_tolerance"]
@@ -389,8 +401,16 @@ rows:
       - "cargo:sw-core::session_manager::watcher_delta_is_acknowledged_after_manager_applies_snapshot"
       - "cargo:sw-daemon::dispatch::watcher_delta_rebind_is_visible_through_service_rpc"
     note: "併 #53"
-  - {id: "C-93", status: INCOMPLETE, reason: "watcher_stop_bounded_2s 尚未建立（P5-T5 #85）"}
-  - {id: "C-95", status: INCOMPLETE, reason: "Rust device_source 已登記 s21_core（linux）；Python tests/test_device_source.py::test_posix_by_path_dedup_and_sort（#81）尚未新增；Windows 列需原生收集"}
+  - id: "C-93"
+    status: PASS
+    tests: ["cargo:sw-pal::device_source::watcher_stop_bounded_2s"]
+    note: "慢速 scan 超過 2 s 時 stop 在 2.2 s 容差內返回，且返回當下 scan 尚未結束；執行時觀察到 2 s timeout WARNING。"
+  - id: "C-95"
+    status: PASS
+    tests:
+      - "cargo:sw-pal::device_source::by_id_wins_over_by_path_for_same_tty_and_sorted_names"
+      - "tests/test_device_source.py::test_posix_by_path_dedup_and_sort"
+    note: "Rust／Python POSIX 去重與排序節點均通過 Linux L1；Python node 已登記至 s21_gate:pytest_full 與 P7 全套。C-96／C-97 的 Windows 實機證據仍維持 BLOCKED-OWNER。"
   - {id: "C-96", status: BLOCKED-OWNER, bo: BO-S21-15, reason: "SERIALCOMM 實機排除證據需配對藍牙裝置的 Windows 機台；Rust 測試 Windows 列另需原生收集（LOCAL-WINDOWS-TODO）"}
   - {id: "C-97", status: BLOCKED-OWNER, bo: BO-S21-15, reason: "BTHENUM 遞迴實機證據需配對藍牙裝置的 Windows 機台；Rust 測試 Windows 列另需原生收集（LOCAL-WINDOWS-TODO）"}
   - id: "D-01"
@@ -398,7 +418,10 @@ rows:
     tests:
       - "cargo:sw-core::session_manager::dynamic_attach_skipped_during_shutdown_or_drain"
       - "tests/test_stage0_session_drain.py::test_dynamic_attach_skipped_during_shutdown_or_drain"
-  - {id: "D-44", status: INCOMPLETE, reason: "併 #45：D-44 Python 特性測試尚未新增"}
+  - id: "D-44"
+    status: PASS
+    tests: ["tests/test_issue159_bg_fast_capture.py::TestIssue159BgFastCapture::test_line_mode_terminates_existing_bg_capture"]
+    note: "既有 Python 特性測試直接驗證 line 命令終結 active background capture 並阻止後續 RX 累積；本輪已核對並以 pytest_full 執行、在 #45 parity 對照中列名。"
   - id: "D-51"
     status: PASS
     tests:
@@ -440,7 +463,12 @@ rows:
       - "tests/test_stage0_bridge_drain.py::test_reader_callback_can_stop_and_receive_preserved_consoles"
       - "tests/test_stage0_bridge_drain.py::test_reader_thread_stops_within_poll"
     note: "H* ba29434c：#79 的兩個既有 reader node 在 s21_gate:py_parity_76_80 與 pytest-full 均 passed。"
-  - {id: "F-W13", status: INCOMPLETE, reason: "Rust rotate_schedule_cancelled_when_file_shrinks_or_vanishes 已建立並登記 s21_core；Python test_rotate_schedule_cancelled_on_shrink 尚未建立"}
+  - id: "F-W13"
+    status: PASS
+    tests:
+      - "cargo:sw-core::wal_writer::rotate_schedule_cancelled_when_file_shrinks_or_vanishes"
+      - "tests/test_wal.py::test_rotate_schedule_cancelled_on_shrink"
+    note: "暫時性 rename 失敗排定重試後，Python WAL 檔縮至門檻以下；退避到期 tick 清除排程且不建立歸檔，對照 origin/main:sw_core/wal.py:200-203。"
   - id: "F-W32"
     status: PASS
     tests:

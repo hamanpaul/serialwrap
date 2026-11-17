@@ -980,3 +980,37 @@ fn watcher_stop_is_bounded_when_scan_is_slow() {
         finished.load(Ordering::SeqCst)
     });
 }
+
+#[test]
+fn watcher_stop_bounded_2s() {
+    use std::sync::atomic::AtomicBool;
+
+    let started = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let handle = DeviceWatcher::start(
+        Box::new(SlowSource {
+            started: Arc::clone(&started),
+            finished: Arc::clone(&finished),
+        }),
+        Duration::from_secs(60),
+        tx,
+        sw_pal::native().clock,
+    );
+    wait_until("逾時測試的慢速掃描開始", || started.load(Ordering::SeqCst));
+
+    let before = Instant::now();
+    handle.stop();
+    let elapsed = before.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(2_200),
+        "scan 卡住時 stop 應於 2 s 上限附近返回，實際耗時 {elapsed:?}"
+    );
+    assert!(
+        !finished.load(Ordering::SeqCst),
+        "stop 應在 2.3 s 掃描結束之前返回，實際耗時 {elapsed:?}"
+    );
+    wait_until("有界 stop 後 detached watcher 完成目前掃描", || {
+        finished.load(Ordering::SeqCst)
+    });
+}
