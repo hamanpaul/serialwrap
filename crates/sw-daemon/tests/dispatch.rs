@@ -49,11 +49,29 @@ fn i25_bind_completes_after_rpc_timeout() -> (ServiceRig, FakeDevice) {
     let error = binding.join().unwrap();
     resume.send(()).unwrap();
     assert_eq!(error.message, "internal timeout");
-    // 同 lane 查詢作為屏障，確定晚到 bind 已實際完成；不以固定 sleep 猜測。
+    // 同 lane 查詢只確認 actor 已發布 DETACHED；再等待持久化回條完成，才把晚到 bind 視為已結束。
     let late = r.session("COM0").unwrap();
     assert_eq!(s(&late, "state"), "DETACHED");
     assert_eq!(s(&late, "device_by_id"), BY_ID_A);
     assert_eq!(dev.open_attempts(), 1, "逾時的 RPC 不得自行重新開埠");
+    let sid = r.mgr.resolve("COM0").expect("COM0 session");
+    // 同 lane 查詢只證明記憶體已套用；還要等晚到 Bind 的持久化回條完成，否則緊接的 bind 可能撞上
+    // pending_bind_commit 而正確回 SESSION_RECOVERING（dispatch.rs 逐支執行時序，非產品錯誤）。
+    wait_until("逾時晚到 bind 的 binding commit 落盤", || {
+        sw_core::state_store::load_state(Path::new(support::STATE_PATH), r.fs.as_ref())
+            .ok()
+            .is_some_and(|(persisted, _)| {
+                persisted
+                    .bindings
+                    .get(&sid)
+                    .is_some_and(|by_id| by_id == BY_ID_A)
+                    && !persisted.released.contains_key(&sid)
+            })
+    });
+    r.settle();
+    let committed = r.session("COM0").unwrap();
+    assert_eq!(s(&committed, "state"), "DETACHED");
+    assert_eq!(s(&committed, "device_by_id"), BY_ID_A);
     (
         Arc::try_unwrap(r).unwrap_or_else(|_| panic!("bind 執行緒須已結束")),
         dev,
@@ -90,7 +108,12 @@ fn wp510r_i25_rpc_timed_out_bind_late_completion_allows_replug() {
         "session.bind",
         &format!(r#"{{"selector":"COM0","device_by_id":"{BY_ID_A}"}}"#),
     );
-    assert_eq!(retry.get("ok"), Some(&PyValue::Bool(true)));
+    assert_eq!(
+        retry.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "晚到 bind 提交已完成後，重試仍須成功：{}",
+        j(&retry)
+    );
     assert_eq!(
         s(&sub(&retry, "session"), "state"),
         "ATTACHING",
