@@ -1,11 +1,11 @@
 schema_version: 1
-revision: "2026-10-15.1"
-authority: "發版長跑門檻唯一來源（spec §15.11.4、§14.2、OD-09）；其他前端不得維護另一份數值"
-owner_decisions: [OD-09, OD-10, OD-13]
+revision: "2026-11-15.1"
+authority: "發版長跑門檻唯一來源（spec §15.11.4、§14.2、OD-09、OD-94）；其他前端不得維護另一份數值"
+owner_decisions: [OD-09, OD-10, OD-13, OD-94]
 workload:
   engine_case: lr-mixed
   engine_files: [realhw/cases/longrun.py]
-  min_continuous_duration_s: 172800
+  min_continuous_duration_s: 86400  # OD-94（2026-11-15）：每平台由 48 小時改為 24 小時。
   allow_segment_stitching: false
   snapshot_interval_s: 300
   observer_interval_s: 10
@@ -56,7 +56,7 @@ thresholds:
   resources:                 # §15.11.5：Linux／Windows 分開凍結、逐平台比較，不合併平均
     status: deferred
     decision: OD-09
-    freeze_deadline: "Stage 0 修正後 Python 48h 基線（Linux、Windows 各一）完成後、任何 Rust 候選長跑開始前"
+    freeze_deadline: "OD-94：Stage 0 修正後 Python 每平台 24h 基線完成後、任何 Rust 候選長跑開始前"
     per_platform:
       linux:   {rss_peak_kb: null, rss_steady_kb: null, rss_slope_kb_per_h: null}
       windows: {rss_peak_kb: null, rss_steady_kb: null, rss_slope_kb_per_h: null}

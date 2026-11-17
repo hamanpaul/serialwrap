@@ -30,8 +30,8 @@ scripts/rust/gate_shared.sh --out target/s2-shared-evidence --run-id <run-id> [-
 - `s22_gate:win_test` 已登記於 `l1_required.lock.json`。Slice 2.2 的共用模式直接從共用 manifest 匯入 `windows_l1:s22_gate:win_test`；缺少該段或其 provenance／selector／必要節點驗證失敗時維持 `EVIDENCE_MISSING`，不啟動 Windows runner，也不以 `--windows-dir` 替代共用 manifest 證據。非共用模式則依原流程使用明確指定的 Windows L1 目錄。
 - P7 共用模式下 Windows L1 匯入被拒時不記入 `caps_missing`；缺少該列的 `l1_results` 由 P7 judge 判為 `INCOMPLETE`。`BLOCKED-OWNER` 僅用於實際缺少 Windows 執行能力的主機，不用來掩蓋 provenance、selector、skip 或必要節點缺漏。
 
-Windows COM 測試仍依既有 owner/hardware 規則處理；Slice 2.4 的 `--windows-run` artifact、長跑及真機證據仍走原有匯入路徑。這些證據缺失時維持原判定，不由共用證據推定通過。
+Windows COM 測試仍依既有 owner/hardware 規則處理。Slice 2.4 正式流程**不帶 `--windows-run`**；BO #5 維持 **BLOCKED-OWNER**，`slice24.md` 列出凍結 lock 中每個 Windows `windows_l1:*` 段的實際判定，未提供的段明列 **EVIDENCE_MISSING**；這些 L1 不代替完整 Windows gate。OD-94 長跑另以 `realhw/acceptance/gate.py` 的 `release-gate.json` 出獨立報告，不匯入 `slice24.json`；`lr-mixed` 在 Slice 2.4 報告維持 **BLOCKED-OWNER**。
 
 ## 各 gate 的使用範圍
 
-`slice21_gate.sh` 匯入 filtered Cargo L1、全套 pytest 與其 Windows L1；`s22_gate.sh` 匯入 filtered Cargo L1 及已登記的 Windows capability L1；`p7_gate.sh` 匯入 P7 Cargo L1、全套 pytest、P7 A/B 與 Windows L1；`slice24_exit.sh` 匯入全套 pytest、一般 Cargo、test-fakes Cargo、逐案 Cargo 結果與 S24 A/B。各 gate 的 parity、cfg、policy、L1.5、owner/hardware 與其他專屬段仍由原流程判定。
+`slice21_gate.sh` 匯入 filtered Cargo L1、全套 pytest 與其 Windows L1；`s22_gate.sh` 匯入 filtered Cargo L1 及已登記的 Windows capability L1；`p7_gate.sh` 匯入 P7 Cargo L1、全套 pytest、P7 A/B 與 Windows L1；`slice24_exit.sh` 匯入全套 pytest、一般 Cargo、test-fakes Cargo、逐案 Cargo 結果與 S24 A/B，並在 `slice24.md` 列出共用 `windows_l1:*` 的重判結果；正式流程不帶 `--windows-run`。各 gate 的 parity、cfg、policy、L1.5、owner/hardware 與其他專屬段仍由原流程判定。

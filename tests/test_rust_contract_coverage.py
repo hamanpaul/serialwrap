@@ -391,24 +391,132 @@ def test_failed_case_is_reported_as_fail_in_incomplete_run(tmp_path):
     assert "case:failed-case" in output["failed"]
 
 
-def test_t9_and_known_low_are_present_in_gate_report():
+def test_t9_and_known_low_are_present_in_gate_report(tmp_path, monkeypatch):
     cc = _module()
+    from types import SimpleNamespace
+
+    sections = {
+        "windows_l1:s21_core": {"status": "PASS", "exit_code": 0, "reasons": []},
+        "windows_l1:s22_gate:win_test": {
+            "status": "FAIL", "exit_code": 1, "reasons": ["Windows 原生列未通過"],
+        },
+    }
+    calls = []
+
+    def validate_section(shared_dir, *, gate, section, required_set, platform, current_head):
+        calls.append((gate, section, required_set, platform, current_head))
+        return sections[section]
+
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    expected_sections = sorted(
+        f"windows_l1:{set_id}" for set_id, platforms in lock["sets"].items() if "windows" in platforms
+    )
+    missing_windows = cc._shared_windows_l1_verdicts(None, expected_head="a" * 40)
+    assert [row["section"] for row in missing_windows] == expected_sections
+    assert all(row["status"] == "EVIDENCE_MISSING" for row in missing_windows)
+    malformed = tmp_path / "malformed"
+    malformed.mkdir()
+    (malformed / "manifest.json").write_text("[]", encoding="utf-8")
+    malformed_windows = cc._shared_windows_l1_verdicts(malformed, expected_head="a" * 40)
+    assert [row["section"] for row in malformed_windows] == expected_sections
+    assert all(row["status"] == "EVIDENCE_MISSING" for row in malformed_windows)
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "manifest.json").write_text(json.dumps({
+        "sections": {name: {} for name in sections},
+    }), encoding="utf-8")
+    monkeypatch.setattr(
+        cc, "_repo_module", lambda name: SimpleNamespace(validate_section=validate_section),
+    )
+    windows_l1 = cc._shared_windows_l1_verdicts(shared, expected_head="a" * 40)
+    by_section = {row["section"]: row for row in windows_l1}
+    assert sorted(by_section) == expected_sections
+    for name in expected_sections:
+        if name in sections:
+            assert by_section[name] == {"section": name, **sections[name]}
+        else:
+            assert by_section[name]["status"] == "EVIDENCE_MISSING"
+            assert by_section[name]["exit_code"] is None
+    assert calls == [
+        ("slice24", name, name.removeprefix("windows_l1:"), "windows", "a" * 40)
+        for name in sorted(sections)
+    ]
+    mcu_case_ids = (
+        "s24-flash-baud-mirror", "s24-flash-holder-gone", "s24-flash-silent-unbridged",
+        "s24-flash-sync-replay", "s24-mcu-rpc-shapes",
+    )
+    cases = [
+        {"case_id": "lr-mixed", "platforms": ["linux", "windows"]},
+        *({"case_id": case_id, "platforms": ["linux"]} for case_id in mcu_case_ids),
+    ]
     report = cc.render_gate_report(
         {
-            "case_verdicts": {},
+            "case_verdicts": {
+                "lr-mixed": "PASS",  # 模擬錯誤輸入；報告 renderer 必須強制顯示 BLOCKED-OWNER。
+                "f7-binary-roundtrip-md5": "BLOCKED-OWNER",
+                "f7-larger-file-not-truncated": "BLOCKED-OWNER",
+                "sc14-flash-probe-eligibility": "PASS",
+                "sc35-passthrough-command-completion": "PASS",
+                "sc35-passthrough-quiet-ready": "PASS",
+                "sc36-win-installer-com0com-optional": "BLOCKED-OWNER",
+                "s24-flash-baud-mirror": "PASS",
+                "s24-flash-holder-gone": "PASS",
+                "s24-flash-silent-unbridged": "PASS",
+                "s24-flash-sync-replay": "PASS",
+                "s24-mcu-rpc-shapes": "PASS",
+            },
+            "covered": [
+                "case:sc14-flash-probe-eligibility",
+                "case:sc35-passthrough-command-completion",
+                "case:sc35-passthrough-quiet-ready",
+                "case:s24-flash-baud-mirror",
+                "case:s24-flash-holder-gone",
+                "case:s24-flash-silent-unbridged",
+                "case:s24-flash-sync-replay",
+                "case:s24-mcu-rpc-shapes",
+            ],
             "windows_verdicts": {"rpc_method:service.status": "BLOCKED-OWNER"},
-            "blocked_owner": {"case:f7-binary-roundtrip-md5": "需要擁有者 TestPilot 實機證據"},
+            "blocked_owner": {
+                "case:lr-mixed": "長跑證據另出報告；依 OD-94 維持 BLOCKED-OWNER",
+                "case:f7-binary-roundtrip-md5": "需要擁有者 TestPilot 實機證據",
+                "case:f7-larger-file-not-truncated": "需要擁有者裁決與實機證據",
+                "case:sc36-win-installer-com0com-optional": "缺少 Windows 原生 L1 證據",
+            },
         },
-        [],
-        {},
+        cases,
+        {"windows_l1": windows_l1},
     )
     assert "endpoint_reopen_after_flasher_set_excl_recorded" in report
     assert "EVIDENCE_MISSING" in report
     assert "P8X-9e51abd-1" in report
-    assert "凍結分母外的 BLOCKED-OWNER 案例" in report
-    assert "f7-binary-roundtrip-md5" in report
+    assert "coverage_map 另加案例（凍結分母外，6 案）" in report
+    for case_id, status in (
+        ("f7-binary-roundtrip-md5", "BLOCKED-OWNER"),
+        ("f7-larger-file-not-truncated", "BLOCKED-OWNER"),
+        ("sc14-flash-probe-eligibility", "PASS"),
+        ("sc35-passthrough-command-completion", "PASS"),
+        ("sc35-passthrough-quiet-ready", "PASS"),
+        ("sc36-win-installer-com0com-optional", "BLOCKED-OWNER"),
+    ):
+        assert f"`{case_id}`" in report and f"**{status}**" in report
     assert "Windows 全部契約 ID" in report
     assert "rpc_method:service.status" in report and "BLOCKED-OWNER" in report
+    assert "windows_l1:s21_core" in report and "**PASS**" in report
+    assert "windows_l1:s22_gate:win_test" in report and "**FAIL**" in report
+    missing_name = next(name for name in expected_sections if name not in sections)
+    assert f"`{missing_name}` | **EVIDENCE_MISSING**" in report
+    assert "BO #5" in report and "正式流程不帶 `--windows-run`" in report
+    assert "OD-94" in report and "lr-mixed" in report and "BLOCKED-OWNER" in report
+    assert "| `lr-mixed` | linux, windows | **BLOCKED-OWNER** |" in report
+    assert "OD-91" in report and "FakeMCU" in report and "v0.3.2" in report
+    assert "| `s24-mcu-rpc-shapes` | **PASS** |" in report
+    assert "不代表 MCU 真機燒錄" in report and "COM20:COM21" in report
+    assert "OD-96" in report and "attached_real_path" in report and "code_fingerprint" in report
+    assert "ba29434c" in report and "47097715" in report and "Python 3.12.3" in report
+    assert "test_rollback_refuses_while_push[after_probe]" in report
+    assert "test_rollback_force_refuses_while_push[rollback-after-probe]" in report
+    assert "dev" in report and "候選 bundle" in report
+    assert "P8X-9e51abd-1" in report
     assert "T6 SPEC-GAP 4" in report
     assert "cargo:sw-core::file_transfer_session::non_ready_states_rejected_with_session_zero_tx" in report
     assert "crates/sw-core/tests/file_transfer_session.rs:451-470" in report
@@ -440,7 +548,7 @@ def test_t9_recorded_outcome_is_written_to_pending_column():
 # T15 第 2 輪審查（P8X-24c6b39-1～7）回歸
 # ---------------------------------------------------------------------------
 EXIT_SCRIPT = ROOT / "scripts" / "rust" / "slice24_exit.sh"
-LONGRUN_S = 172800
+LONGRUN_S = 86400
 _NA = "NOT_APPLICABLE_BASELINE"
 _BUNDLE_BINARIES = {"linux": ("serialwrap", "serialwrapd"), "windows": ("serialwrap.exe", "serialwrapd.exe")}
 
@@ -515,7 +623,7 @@ def _bind_bundle(run: Path, platform: str, bundle: Path, *, record: bool = True,
 
 
 def _bind_candidate(run: Path, base: Path, platforms=("linux", "windows")) -> None:
-    """本輪候選＝_longrun_source 長跑所用的同一份 bundle。"""
+    """OD-94 獨立報告：驗證長跑候選 bundle 與本輪 RC identity 相同。"""
     for platform in platforms:
         _bind_bundle(run, platform, base / "bundles" / platform)
 
@@ -531,7 +639,7 @@ def _contracts_tree() -> str:
 
 
 def _longrun_source(base: Path, *, platforms=("linux", "windows"), results=None) -> Path:
-    """合成一份格式完整的長跑證據目錄（結構即 slice24_exit.sh --longrun 的輸入契約）。"""
+    """合成一份格式完整的 OD-94 長跑側檔證據目錄。"""
     results = results or {}
     src = base / "longrun-src"
     acceptance_sha = _sha_bytes((ROOT / "realhw/acceptance/longrun_acceptance.yaml").read_bytes())
@@ -547,7 +655,7 @@ def _longrun_source(base: Path, *, platforms=("linux", "windows"), results=None)
                   "auto_restart_disabled": True, "evidence": "Restart=no"}
         files = {
             "report.json": json.dumps({"meta": {"platform": platform}}) + "\n",
-            "events.ndjson": '{"kind":"start","t":0}\n{"kind":"stop","t":172810}\n',
+            "events.ndjson": f'{{"kind":"start","t":0}}\n{{"kind":"stop","t":{LONGRUN_S + 10}}}\n',
             "snapshots.ndjson": '{"t":0,"rss_kb":1}\n',
             "observer.ndjson": json.dumps({"kind": "header", "supervision": attest}) + "\n",
         }
@@ -586,8 +694,8 @@ def _longrun_source(base: Path, *, platforms=("linux", "windows"), results=None)
             "engine_result": {"verdict": "PASS"}, "release_gate_result": verdict, "baseline_result": None,
             "acceptance": {"sha256": acceptance_sha, "workload_contract_sha256": workload},
             "run": {
-                "started_at_utc": "2026-11-01T00:00:00+00:00", "ended_at_utc": "2026-11-03T00:00:10+00:00",
-                "duration_s": 172810, "cli_identity": {"pinned": True, "sha256": cli_sha},
+                "started_at_utc": "2026-11-01T00:00:00+00:00", "ended_at_utc": "2026-11-02T00:00:10+00:00",
+                "duration_s": LONGRUN_S + 10, "cli_identity": {"pinned": True, "sha256": cli_sha},
                 "deployed_content": {
                     "start": dict(identity), "end": dict(identity),
                     "daemon_live": [{"in_install": True, "image_sha256": _sha_bytes(f"d-{platform}".encode()), "error": None}],
@@ -605,8 +713,8 @@ def _longrun_source(base: Path, *, platforms=("linux", "windows"), results=None)
             "schema_version": "release-gate.v1", "platform": platform, "mode": "baseline",
             "release_gate_result": "NOT_APPLICABLE_BASELINE", "baseline_result": "PASS",
             "acceptance": {"sha256": acceptance_sha, "workload_contract_sha256": workload},
-            "run": {"duration_s": 172900, "engine_files_sha256": engine_files,
-                    "started_at_utc": "2026-10-20T00:00:00+00:00", "ended_at_utc": "2026-10-22T00:01:40+00:00"},
+            "run": {"duration_s": LONGRUN_S + 100, "engine_files_sha256": engine_files,
+                    "started_at_utc": "2026-10-20T00:00:00+00:00", "ended_at_utc": "2026-10-21T00:01:40+00:00"},
             "checks": [
                 {"id": check["id"], "group": check["group"], "status": "evaluated",
                  "result": _NA if check["result"] == _NA else "PASS", "detail": {}}
@@ -630,8 +738,21 @@ def _judge_lr_mixed(run: Path, out: Path):
     return result, json.loads(out.read_text(encoding="utf-8"))
 
 
+def _independent_longrun_verdict(run: Path):
+    cc = _module()
+    universe = cc.universe(cc.ROOT / "contracts", cc.DEFAULT_CASES, cc.DEFAULT_CASES_LOCK, cc.DEFAULT_MAP)
+    evidence = cc.load_owner_evidence(run, cc.load_results(run))[cc.LONGRUN_CASE]
+    return cc._owner_evidence_verdict(universe[cc.LONGRUN_CASE], evidence)
+
+
 def test_longrun_valid_evidence_unblocks_lr_mixed(tmp_path):
-    """P8X-24c6b39-1：有效長跑證據經匯入與重新驗證後才解除 lr-mixed 的擁有者阻擋。"""
+    """OD-94：24 小時門檻一致；有效長跑另出報告，不解除 Slice 2.4 的擁有者阻擋。"""
+    cc = _module()
+    import yaml
+
+    acceptance = yaml.safe_load((ROOT / "realhw/acceptance/longrun_acceptance.yaml").read_text(encoding="utf-8"))
+    assert acceptance["workload"]["min_continuous_duration_s"] == LONGRUN_S
+    assert cc._LONGRUN_MIN_DURATION_S == LONGRUN_S
     run = tmp_path / "run"
     imported = _import_longrun(run, _longrun_source(tmp_path))
     assert imported.returncode == 0, imported.stdout + imported.stderr
@@ -639,9 +760,12 @@ def test_longrun_valid_evidence_unblocks_lr_mixed(tmp_path):
     assert record["accepted"] is True
     assert {p: v["release_gate_result"] for p, v in record["platforms"].items()} == {"linux": "PASS", "windows": "PASS"}
     _bind_candidate(run, tmp_path)
+    assert _independent_longrun_verdict(run)[0] == "PASS"
     result, output = _judge_lr_mixed(run, tmp_path / "o.json")
-    assert output["case_verdicts"]["lr-mixed"] == "PASS"
-    assert "case:lr-mixed" in output["covered"] and "case:lr-mixed" not in output["blocked_owner"]
+    assert output["case_verdicts"]["lr-mixed"] == "BLOCKED-OWNER"
+    assert "case:lr-mixed" not in output["covered"] and "case:lr-mixed" in output["blocked_owner"]
+    assert "OD-94" in output["blocked_owner"]["case:lr-mixed"]
+    assert output["owner_evidence"] == {}
     assert result.returncode == 0, result.stderr
 
 
@@ -704,7 +828,7 @@ def _claims_pass_with_failed_check(src: Path) -> None:
     ],
 )
 def test_longrun_incomplete_or_tampered_evidence_is_rejected(tmp_path, mutate, platform, needle):
-    """P8X-24c6b39-1：缺漏或竄改的長跑證據必須拒收，lr-mixed 維持 BLOCKED-OWNER。"""
+    """OD-94：缺漏或竄改的長跑證據不得掩蓋拒收；lr-mixed 維持 BLOCKED-OWNER。"""
     run = tmp_path / "run"
     src = _longrun_source(tmp_path)
     mutate(src)
@@ -721,18 +845,22 @@ def test_longrun_incomplete_or_tampered_evidence_is_rejected(tmp_path, mutate, p
 
 
 def test_longrun_valid_fail_verdict_is_reported_as_fail(tmp_path):
-    """P8X-24c6b39-1：證據有效但 release gate 判 FAIL 時，案例為 FAIL，不得藏成 BLOCKED-OWNER 或 PASS。"""
+    """OD-94：獨立長跑保留 FAIL；該證據不改寫 Slice 2.4 的 BLOCKED-OWNER。"""
     run = tmp_path / "run"
     imported = _import_longrun(run, _longrun_source(tmp_path, results={"linux": "FAIL"}))
     assert imported.returncode == 0, imported.stdout + imported.stderr
     _bind_candidate(run, tmp_path)
+    independent_verdict, independent_reason = _independent_longrun_verdict(run)
+    assert independent_verdict == "FAIL" and "release_gate_result=FAIL" in independent_reason
     result, output = _judge_lr_mixed(run, tmp_path / "o.json")
-    assert output["case_verdicts"]["lr-mixed"] == "FAIL"
-    assert "case:lr-mixed" in output["failed"] and result.returncode == 1
+    assert output["case_verdicts"]["lr-mixed"] == "BLOCKED-OWNER"
+    assert "OD-94" in output["blocked_owner"]["case:lr-mixed"]
+    assert output["owner_evidence"] == {}
+    assert "case:lr-mixed" not in output["failed"] and result.returncode == 0
 
 
 def test_longrun_partial_platforms_stay_blocked(tmp_path):
-    """P8X-24c6b39-1：只交 Linux 長跑時，Windows 缺件仍阻擋 lr-mixed。"""
+    """OD-94：獨立長跑報告要求兩平台；缺少 Windows 仍維持 BLOCKED-OWNER。"""
     run = tmp_path / "run"
     imported = _import_longrun(run, _longrun_source(tmp_path, platforms=("linux",)))
     assert imported.returncode == 1, imported.stdout + imported.stderr
@@ -744,22 +872,28 @@ def test_longrun_partial_platforms_stay_blocked(tmp_path):
 
 
 def test_longrun_copy_is_revalidated_at_judgement(tmp_path):
-    """P8X-24c6b39-1：判定時重新驗證 run directory 內的副本，匯入後被改動即不得 PASS。"""
+    """OD-94：獨立長跑副本竄改仍被重新驗證，且 Slice 2.4 不消費該證據。"""
     run = tmp_path / "run"
     imported = _import_longrun(run, _longrun_source(tmp_path))
     assert imported.returncode == 0, imported.stdout + imported.stderr
     with (run / "longrun" / "linux" / "observer.ndjson").open("a", encoding="utf-8") as stream:
         stream.write('{"kind":"sample"}\n')
     _bind_candidate(run, tmp_path)
+    independent_verdict, independent_reason = _independent_longrun_verdict(run)
+    assert independent_verdict == "BLOCKED-OWNER" and "observer.ndjson" in independent_reason
     _, output = _judge_lr_mixed(run, tmp_path / "o.json")
     assert output["case_verdicts"]["lr-mixed"] == "BLOCKED-OWNER"
-    assert "observer.ndjson" in output["blocked_owner"]["case:lr-mixed"]
+    assert output["owner_evidence"] == {}
+    assert "OD-94" in output["blocked_owner"]["case:lr-mixed"]
 
 
 def test_slice24_exit_routes_longrun_through_importer():
-    """P8X-24c6b39-1：出口腳本的 --longrun 必須交給匯入驗證，不得只檢查目錄存在。"""
+    """OD-94：沿用凍結 nodeid；正式出口不將獨立長跑側檔匯入 Slice 2.4。"""
     script = EXIT_SCRIPT.read_text(encoding="utf-8")
-    assert '--import-longrun "$LONGRUN_DIR"' in script
+    assert "--longrun" not in script
+    assert "--import-longrun" not in script
+    assert "正式流程不帶 --windows-run" in script
+    assert "BO #5" in script
 
 
 class _FakeItem:
@@ -1662,7 +1796,7 @@ def _same_bins_other_bundle(base: Path) -> Path:
     ids=["other_candidate", "same_bins_other_bundle", "no_bundle_record", "no_rust_results", "record_not_tested_artifact"],
 )
 def test_longrun_must_bind_current_candidate(tmp_path, scenario, needle):
-    """P8X-e038dda-1：長跑的 bundle、CLI、daemon 必須等於本輪候選；舊候選的 PASS 不得替新候選解鎖。"""
+    """OD-94：獨立長跑仍須綁定候選 bundle；其判定不進 Slice 2.4。"""
     run = tmp_path / "run"
     imported = _import_longrun(run, _longrun_source(tmp_path))
     assert imported.returncode == 0, imported.stdout + imported.stderr
@@ -1680,9 +1814,11 @@ def test_longrun_must_bind_current_candidate(tmp_path, scenario, needle):
         # 候選 bundle 紀錄是 A，但本輪 rust-linux 實際受測的是另一份 artifact。
         _results(run, "rust-linux", "linux", [])
         _bind_bundle(run, "linux", same, results=False)
+    bound_verdict, bound_reason = _independent_longrun_verdict(run)
+    assert bound_verdict == "BLOCKED-OWNER", bound_reason
+    assert "linux" in bound_reason and needle in bound_reason, bound_reason
     verdict, reason = _judge_reason(run, tmp_path / "o.json")
-    assert verdict == "BLOCKED-OWNER", reason
-    assert "linux" in reason and needle in reason, reason
+    assert verdict == "BLOCKED-OWNER" and "OD-94" in reason
 
 
 def test_record_candidate_bundle_matches_deployed_content_digest(tmp_path):
@@ -1745,7 +1881,7 @@ def _drop(doc: dict, check_id: str) -> None:
 
 
 def test_longrun_dropping_safety_fail_row_is_rejected(tmp_path):
-    """P8X-e038dda-2：安全檢查 FAIL 時照實為 FAIL；移除該列並重算彙總後證據必須拒收，不得 PASS。"""
+    """OD-94：安全檢查 FAIL 照實留在獨立報告；刪除 FAIL 列仍拒收，2.4 維持 BLOCKED-OWNER。"""
     def fail_safety(doc):
         _set_result(doc, "safety_unauthorized_tx", "FAIL")
         _resummarize(doc)
@@ -1756,8 +1892,9 @@ def test_longrun_dropping_safety_fail_row_is_rejected(tmp_path):
     imported = _import_longrun(run, src)
     assert imported.returncode == 0, imported.stdout + imported.stderr
     _bind_candidate(run, tmp_path)
-    verdict, _ = _judge_reason(run, tmp_path / "o.json")
-    assert verdict == "FAIL"
+    assert _independent_longrun_verdict(run)[0] == "FAIL"
+    verdict, reason = _judge_reason(run, tmp_path / "o.json")
+    assert verdict == "BLOCKED-OWNER" and "OD-94" in reason
 
     def drop_row(doc):
         _drop(doc, "safety_unauthorized_tx")
@@ -1772,7 +1909,7 @@ def test_longrun_dropping_safety_fail_row_is_rejected(tmp_path):
     assert any("safety_unauthorized_tx" in error for error in record["platforms"]["linux"]["errors"]), record
     _bind_candidate(run2, tmp_path)
     verdict2, reason2 = _judge_reason(run2, tmp_path / "o2.json")
-    assert verdict2 == "BLOCKED-OWNER", reason2
+    assert verdict2 == "BLOCKED-OWNER" and "OD-94" in reason2
 
 
 def _cand(mutate):
@@ -1821,7 +1958,7 @@ def _regroup(doc: dict, check_id: str, group: str) -> None:
     ],
 )
 def test_longrun_requires_formal_gate_check_set(tmp_path, mutate, needle):
-    """P8X-e038dda-2：candidate 與 baseline 都須具備正式 P2 gate 的完整檢查集合、ID 唯一、group 與適用性一致。"""
+    """OD-94：獨立長跑仍要求正式 P2 gate 的完整檢查集合、ID 唯一、group 與適用性一致。"""
     src = _longrun_source(tmp_path)
     mutate(src)
     run = tmp_path / "run"

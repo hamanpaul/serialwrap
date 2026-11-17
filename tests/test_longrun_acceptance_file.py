@@ -111,7 +111,8 @@ def test_frozen_values_exact():
     thresholds = acceptance["thresholds"]
     assert thresholds["unexpected_cmd_error_rate"]["max_ratio"] == 0.01
     assert thresholds["effective_throughput"]["min_ratio_of_baseline"] == 0.95
-    assert acceptance["workload"]["min_continuous_duration_s"] == 172800
+    assert acceptance["workload"]["min_continuous_duration_s"] == 86400
+    assert "OD-94" in ACCEPTANCE.read_text(encoding="utf-8")
     assert acceptance["workload"]["allow_segment_stitching"] is False
     assert all(acceptance["safety"][key] == 0 for key in (
         "unauthorized_tx", "forbidden_double_holder", "cross_context_replay", "dangerous_auto_resend"

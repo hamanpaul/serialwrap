@@ -1,13 +1,10 @@
 #!/usr/bin/env bash
-# Slice 2.4 Linux 證據收集與出口報告；Windows／真機／長跑項只匯入擁有者既有證據。
+# Slice 2.4 Linux 證據收集與出口報告；Windows／真機證據只匯入擁有者既有證據，OD-94 長跑另出報告。
 # 結束碼：0 完成；1 gate 判定失敗；2 參數／輸出路徑錯誤；3 工作樹不乾淨；4 gate_prereqs 失敗。
 # --candidate-bundle DIR：本輪候選 Linux bundle（mkbundle --release-bundle 輸出或安裝根；版本目錄＝bin/serialwrap
 #   解析後的上兩層，須含 release-manifest.json 且 git_revision＝本 worktree HEAD）。指定後受測 CLI／daemon 取自該 bundle，
-#   並寫入 RUN_DIR/artifacts/linux/candidate-bundle.json；長跑證據只有與它相同的 bundle／CLI／daemon 才能解除阻擋。
-# --windows-run DIR：擁有者 Windows 原生 runner 產物（SHA256SUMS＋results-rust-windows.json；可附 bundle/ 版本目錄）。
-# --longrun DIR：長跑證據（longrun-manifest.json＋<platform>/release-gate.json、baseline-release-gate.json、
-#   supervision-attest.json、bench-lock.json、gate evidence_hashes 所列檔案；Windows 另含 excl/）。
-#   由 contract_coverage.py --import-longrun 驗證後複製進 RUN_DIR/longrun/，判定時再重新驗證副本。
+#   並寫入 RUN_DIR/artifacts/linux/candidate-bundle.json；OD-94 長跑證據另以 RC bundle 身分驗收，不輸入本報告。
+# --windows-run DIR：非正式的擁有者 Windows runner 產物匯入；正式流程不帶此參數，BO #5 維持 BLOCKED-OWNER。
 set -uo pipefail
 export CARGO_INCREMENTAL=0
 
@@ -17,7 +14,6 @@ cd "$ROOT"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-slice24"
 RUN_DIR="${SW_SLICE24_RUN_DIR:-target/contract-coverage/$RUN_ID}"
 WINDOWS_RUN=""
-LONGRUN_DIR=""
 CANDIDATE_BUNDLE=""
 SLICE21_RUN=""
 SLICE22_GATE=""
@@ -41,10 +37,6 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { echo "slice24_exit.sh: --windows-run 缺少值" >&2; exit 2; }
       WINDOWS_RUN="$2"
       shift 2 ;;
-    --longrun)
-      [[ $# -ge 2 ]] || { echo "slice24_exit.sh: --longrun 缺少值" >&2; exit 2; }
-      LONGRUN_DIR="$2"
-      shift 2 ;;
     --candidate-bundle)
       [[ $# -ge 2 ]] || { echo "slice24_exit.sh: --candidate-bundle 缺少值" >&2; exit 2; }
       CANDIDATE_BUNDLE="$2"
@@ -63,7 +55,7 @@ while [[ $# -gt 0 ]]; do
       shift 2 ;;
     -h|--help)
       sed -n '2,9p' "$0"
-      echo "用法：$0 [--dry-run] [--shared-evidence DIR] [--run-id ID] [--candidate-bundle DIR] [--windows-run DIR] [--longrun DIR] [--slice21-run DIR] [--slice22-gate FILE] [--slice23-run DIR]"
+      echo "用法：$0 [--dry-run] [--shared-evidence DIR] [--run-id ID] [--candidate-bundle DIR] [--windows-run DIR] [--slice21-run DIR] [--slice22-gate FILE] [--slice23-run DIR]"
       exit 0 ;;
     *) echo "slice24_exit.sh: 未知參數 $1" >&2; exit 2 ;;
   esac
@@ -81,7 +73,9 @@ if [[ "$DRY_RUN" == "1" ]]; then
     echo "執行：python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence。"
     echo "執行：env SERIALWRAP_CLI_EXE=<CLI> SERIALWRAP_DAEMON_EXE=<DAEMON> SERIALWRAP_AB_LABEL=rust-linux python3 -m pytest -q tests/contract_blackbox tests/acceptance/l15/test_slice21_l15.py tests/acceptance/l15/test_slice23_l15.py tests/test_multiagent_e2e.py tests/test_human_agent_coexist.py tests/test_rust_contract_coverage.py tests/test_transfer_golden_fresh.py。"
   fi
-  echo "匯入：--windows-run、--longrun、前置 slice 2.1～2.3 證據；執行 python3 -m tools.contracts check、python3 tests/acceptance/regen_lock.py --check、python3 -m policy_check --repo .。"
+  echo "正式流程不帶 --windows-run：BO #5 維持 BLOCKED-OWNER；slice24.md 列出凍結 lock 中各 windows_l1:* 判定，缺段列 EVIDENCE_MISSING。"
+  echo "匯入：前置 slice 2.1～2.3 證據；執行 python3 -m tools.contracts check、python3 tests/acceptance/regen_lock.py --check、python3 -m policy_check --repo .。"
+  echo "OD-94 長跑於 RC 後以 realhw/acceptance/gate.py 另產 release-gate.json，不匯入 slice24.json。"
   echo "執行：python3 scripts/rust/slice_breaker.py --freeze tests/acceptance/breaker/slice_2.4.json；python3 scripts/rust/contract_coverage.py <候選 artifact 與前置 slice 輸入>。"
   exit 0
 fi
@@ -529,24 +523,12 @@ else
   printf 'windows-candidate-bundle\tEVIDENCE_MISSING\n' >>"$OWNER_TSV"
 fi
 if [[ -z "$CANDIDATE_BUNDLE" ]]; then
-  # 未指定候選 bundle 時本輪受測的是 debug build，長跑（pinned release bundle）無法綁定本輪候選。
-  printf 'linux-candidate-bundle\tEVIDENCE_MISSING（未指定 --candidate-bundle；長跑無法綁定本輪候選）\n' >>"$OWNER_TSV"
+  # 未指定候選 bundle 時本輪受測的是 debug build，無法證明 S24 證據對應正式候選 bundle。
+  printf 'linux-candidate-bundle\tEVIDENCE_MISSING（未指定 --candidate-bundle；缺少本輪 release bundle 身分）\n' >>"$OWNER_TSV"
 fi
 
-# 長跑證據（計畫 Task 15 步驟 8）：驗證全部成立才匯入並解除 lr-mixed 的擁有者阻擋；
-# 缺漏、竄改或拒收的證據照實記錄，lr-mixed 維持 BLOCKED-OWNER。TestPilot、真機 COM 與 USB-UART 由擁有者另行執行。
-if [[ -n "$LONGRUN_DIR" ]]; then
-  LONGRUN_LOG="$RUN_DIR/logs/longrun-import.log"
-  python3 scripts/rust/contract_coverage.py --run-dir "$RUN_DIR" --import-longrun "$LONGRUN_DIR" >"$LONGRUN_LOG" 2>&1
-  LONGRUN_RC=$?
-  case "$LONGRUN_RC" in
-    0) printf 'longrun\tIMPORTED_PENDING_JUDGE（%s）\n' "$(grep -E '^longrun ' "$LONGRUN_LOG" | tr '\n' ' ')" >>"$OWNER_TSV" ;;
-    1) printf 'longrun\tREJECTED（見 %s）\n' "$LONGRUN_LOG" >>"$OWNER_TSV" ;;
-    *) printf 'longrun\tEVIDENCE_MISSING（匯入失敗 exit=%s，見 %s）\n' "$LONGRUN_RC" "$LONGRUN_LOG" >>"$OWNER_TSV" ;;
-  esac
-else
-  printf 'longrun\tBLOCKED-OWNER\n' >>"$OWNER_TSV"
-fi
+# OD-94：長跑在 RC 後以 realhw/acceptance/gate.py 獨立驗收，不進 slice24.json。
+printf 'longrun\tBLOCKED-OWNER（OD-94；另出 release-gate.json）\n' >>"$OWNER_TSV"
 printf 'physical_uart_testpilot\tBLOCKED-OWNER\n' >>"$OWNER_TSV"
 printf 'windows_com_supervisor_runtime\tBLOCKED-OWNER\n' >>"$OWNER_TSV"
 
@@ -575,6 +557,9 @@ if [[ -n "$PYTHON_BASELINE_COVERAGE" ]]; then
 fi
 if [[ -n "$RUST_BLACKBOX_COVERAGE" ]]; then
   CONTRACT_COVERAGE_ARGS+=(--merge-results-from "$RUST_BLACKBOX_COVERAGE")
+fi
+if [[ -n "$SHARED_EVIDENCE" ]]; then
+  CONTRACT_COVERAGE_ARGS+=(--windows-l1-shared-evidence "$SHARED_EVIDENCE")
 fi
 CONTRACT_COVERAGE_ARGS+=("${PRIOR_CASE_ARGS[@]}")
 run_logged contract-coverage python3 scripts/rust/contract_coverage.py "${CONTRACT_COVERAGE_ARGS[@]}"
