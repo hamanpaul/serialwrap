@@ -109,6 +109,17 @@ fn foreign_namespace_same_string_not_holder() {
 }
 
 #[test]
+fn same_name_pts_other_devpts_not_holder() {
+    // /dev/pts/7 同名且 st_rdev 相同；不同 devpts instance 的 st_dev 不同，不能誤認為 holder。
+    let mut proc_ns = FakeProcNs::new();
+    proc_ns.add_fd(4326, 3, chr(CONTAINER_DEV_B, 10, PTS7_RDEV));
+    let rep = proc_ns.probe(TTY);
+    assert!(rep.pids.is_empty(), "跨 devpts 假 holder 不得被列入：{rep:?}");
+    assert_eq!(rep.status, HolderScanStatus::Ok);
+    assert!(!rep.holder_unknown);
+}
+
+#[test]
 fn devpts_equal_rdev_different_inode_not_holder() {
     // Python `test_rdev_equal_alias_other_instance_not_holder`：rdev 相同、st_dev 不同 → 非 holder。
     let mut proc_ns = FakeProcNs::new();

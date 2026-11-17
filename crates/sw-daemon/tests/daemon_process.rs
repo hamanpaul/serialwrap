@@ -308,6 +308,30 @@ fn no_profiles_message_and_continue() {
 }
 
 #[test]
+fn serial_backend_env_warning_is_emitted_once() {
+    let env = isolated_env();
+    let mut vars = env.vars.clone();
+    vars.insert(
+        "SERIALWRAP_SERIAL_BACKEND".to_string(),
+        "pyserial".to_string(),
+    );
+    let mut daemon = DaemonProc::spawn_with(&env, &vars, &[]);
+    wait_socket(&env.socket, SHORT);
+
+    let warning =
+        "serialwrapd: SERIALWRAP_SERIAL_BACKEND=pyserial 在 Rust build 無對應後端，改用原生後端";
+    let stderr = daemon.stderr();
+    assert_eq!(
+        stderr.lines().filter(|line| *line == warning).count(),
+        1,
+        "{stderr}"
+    );
+
+    rpc_once(&env.socket, STOP);
+    assert_eq!(daemon.wait(LONG).code(), Some(0), "{}", daemon.stderr());
+}
+
+#[test]
 fn daemon_stop_reply_rejects_new_health_ping() {
     let env = isolated_env();
     let endpoint = env.socket.clone();

@@ -125,7 +125,7 @@ fn test_benches_yaml_path() {
 
 /// SC-09（plan 04 Task 7；逐字對齊 P1 `constants.resolve_config_path(for_write=False)`，02 T15）：
 /// `$SERIALWRAP_CONFIG` strip 後非空 → expanduser 後原樣回傳（即使不存在）；
-/// 否則 `CONFIG_DIR/config.yaml` 存在 → 它；否則 `<system_config_dir>/config.yaml` 存在 → 它；否則 `CONFIG_DIR/config.yaml`。
+/// 否則 `CONFIG_DIR/config.yaml` 存在 → 它；否則 `SYSTEM_CONFIG_PATH` 存在 → 它；否則 `CONFIG_DIR/config.yaml`。
 /// 註：P1 Python 實作不在本 worktree，期望值依凍結計畫文字撰寫。
 #[test]
 fn test_resolve_config_path_sc09() {
@@ -141,6 +141,12 @@ fn test_resolve_config_path_sc09() {
         ("explicit_blank_ignored", &[("SERIALWRAP_CONFIG", "  ")], &[USER, SYS], USER),
         ("user_beats_system", &[], &[USER, SYS], USER),
         ("system_fallback", &[], &[SYS], SYS),
+        (
+            "system_path_override",
+            &[("SERIALWRAP_TEST_SYSTEM_CONFIG_PATH", "/custom/system.yaml")],
+            &["/custom/system.yaml"],
+            "/custom/system.yaml",
+        ),
         ("neither_defaults_user", &[], &[], USER),
     ];
     for (id, extra, existing, want) in cases {
@@ -153,7 +159,7 @@ fn test_resolve_config_path_sc09() {
         let got = sw_proto::runtime_paths::resolve_config_path(
             &env,
             &paths,
-            "/etc/serialwrap",
+            &paths.system_config_path,
             PathFlavor::Posix,
             &H,
             &exists,

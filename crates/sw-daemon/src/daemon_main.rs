@@ -690,14 +690,6 @@ fn decide_on_unreadable_config(env: &dyn SysEnv, caps: &Capabilities, defaults: 
     allowlist_decision(false, Vec::new(), "config", Some(format!("invalid config.yaml: {error}")))
 }
 
-/// 系統唯讀設定檔路徑（`SYSTEM_CONFIG_PATH`；`SERIALWRAP_TEST_SYSTEM_CONFIG_PATH` 存在即採用，與 Python 相同含空字串）。
-fn system_config_path(env: &EnvSnapshot, p: &Platform) -> String {
-    match env.get("SERIALWRAP_TEST_SYSTEM_CONFIG_PATH") {
-        Some(v) => v.to_string(),
-        None => pypath::join(flavor_of(&p.caps), &p.env.system_config_dir(), &["config.yaml"]),
-    }
-}
-
 /// SC-09：config 讀取路徑（`resolve_config_path(for_write=False)`：`SERIALWRAP_CONFIG` 原樣勝出，即使不存在 →
 /// `CONFIG_DIR/config.yaml`（存在時）→ 系統檔（存在時）→ `CONFIG_DIR/config.yaml`）。
 fn config_read_path(env: &EnvSnapshot, paths: &RuntimePaths, p: &Platform) -> String {
@@ -710,9 +702,8 @@ fn config_read_path(env: &EnvSnapshot, paths: &RuntimePaths, p: &Platform) -> St
     if p.fs.exists(Path::new(&paths.config_yaml)) {
         return paths.config_yaml.clone();
     }
-    let system = system_config_path(env, p);
-    if p.fs.exists(Path::new(&system)) {
-        return system;
+    if p.fs.exists(Path::new(&paths.system_config_path)) {
+        return paths.system_config_path.clone();
     }
     paths.config_yaml.clone()
 }
@@ -1159,6 +1150,13 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
             return code;
         }
     };
+
+    if let Some(warning) = sw_pal::serial::serial_backend_env_warning(
+        env.get("SERIALWRAP_SERIAL_BACKEND"),
+        p.caps.native_backend,
+    ) {
+        eprintln!("{warning}");
+    }
 
     // SC-19：allowlist 判定必須最先執行——早於 ensure_runtime_dirs、profiles 載入與 lock（daemon.py:230-239，零副作用）（#46）。
     let Some(iso_defaults) = isolation_defaults(&*p.env, &p.caps) else {

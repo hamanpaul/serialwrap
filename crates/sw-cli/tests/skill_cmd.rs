@@ -124,6 +124,7 @@ fn skill_default_windows_outputs_skill_windows() {
         wal_dir: String::new(),
         log_dir: String::new(),
         config_yaml: String::new(),
+        system_config_path: String::new(),
         ttymcu_path: String::new(),
     };
     let mut out = Vec::new();

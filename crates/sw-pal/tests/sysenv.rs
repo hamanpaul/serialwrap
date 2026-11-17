@@ -2,6 +2,32 @@
 use sw_pal::native_client;
 
 #[test]
+fn sysenv_test_system_config_path_overrides() {
+    use std::path::Path;
+    use sw_pal::{fakes::FakeSysEnv, SysEnv};
+
+    let default = FakeSysEnv::builder()
+        .system_config_dir(Path::new("/isolated/system"))
+        .build();
+    let expected = Path::new("/isolated/system")
+        .join("config.yaml")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(default.system_config_path(), expected);
+
+    let explicit = FakeSysEnv::builder()
+        .var("SERIALWRAP_TEST_SYSTEM_CONFIG_PATH", "~/chosen/system.yaml")
+        .system_config_dir(Path::new("/ignored"))
+        .build();
+    assert_eq!(explicit.system_config_path(), "~/chosen/system.yaml");
+
+    let empty = FakeSysEnv::builder()
+        .var("SERIALWRAP_TEST_SYSTEM_CONFIG_PATH", "")
+        .build();
+    assert_eq!(empty.system_config_path(), "");
+}
+
+#[test]
 fn var_reads_process_environment() {
     let key = "SW_PAL_T9_VAR_PROBE";
     std::env::set_var(key, "probe-value");

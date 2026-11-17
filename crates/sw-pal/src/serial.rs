@@ -8,6 +8,27 @@ pub mod posix;
 #[cfg(windows)]
 pub mod windows;
 
+/// Rust build 只含當前平台的原生序列埠後端；對已知但不相符的 Python backend alias 回傳明確診斷。
+/// 未知值依 Python `_select_backend` 的 auto fallback 處理，不額外警告。
+pub fn serial_backend_env_warning(raw: Option<&str>, native: crate::BackendKind) -> Option<String> {
+    let raw = raw?;
+    if raw.is_empty() {
+        return None;
+    }
+    let requested = match raw.to_ascii_lowercase().as_str() {
+        "posix" | "termios" => Some(crate::BackendKind::Posix),
+        "pyserial" | "windows" | "win32" => Some(crate::BackendKind::Win),
+        "auto" => None,
+        _ => return None,
+    };
+    if requested.is_none() || requested == Some(native) {
+        return None;
+    }
+    Some(format!(
+        "serialwrapd: SERIALWRAP_SERIAL_BACKEND={raw} 在 Rust build 無對應後端，改用原生後端"
+    ))
+}
+
 /// Windows 後端的純函式模型（DCB、COMMTIMEOUTS、錯誤映射；無平台依賴，P5 Task 3）。
 pub mod windows_model;
 

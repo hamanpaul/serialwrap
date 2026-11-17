@@ -893,6 +893,7 @@ fn hotplug_child() -> ! {
                             added: vec![new.1.clone()],
                             removed: Vec::new(),
                             snapshot,
+                            ack: None,
                         })
                         .is_ok();
                     let detached = m.send_control(

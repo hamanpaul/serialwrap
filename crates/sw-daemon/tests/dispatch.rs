@@ -17,7 +17,7 @@ use sw_pal::fakes::{FakeDevice, FakeEnv, FakeSerialBackend};
 use sw_pal::proc_scan::{DaemonProc, ProcIdentity};
 use sw_pal::traits::{
     Clock, DeviceInfo, DevicePath, HolderReport, HolderScanStatus, OpenError, PalError,
-    PalErrorKind, SerialBackend, SerialConfig, SerialHandle, UartExclusive,
+    PalErrorKind, SerialBackend, SerialConfig, SerialHandle, UartExclusive, WatcherEvent,
 };
 use sw_proto::pycompat::iso_utc_now;
 use sw_proto::pyjson::{PyDict, PyValue, RPC_WIRE, dumps};
@@ -3737,6 +3737,46 @@ fn session_list_sorted_by_session_id() {
         .map(|v| v["session_id"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(ids, ["t:COM0", "t:COM1"]);
+}
+
+#[test]
+fn watcher_delta_rebind_is_visible_through_service_rpc() {
+    let r = ServiceRig::templates_only(&[(BY_ID_A, REAL_A)]);
+    let device = DeviceInfo {
+        by_id: BY_ID_A.to_string(),
+        real_path: REAL_A.to_string(),
+    };
+    let send_delta = |added: Vec<DeviceInfo>, removed: Vec<DeviceInfo>, snapshot: Vec<(String, DeviceInfo)>| {
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        r.mgr
+            .watcher_sender()
+            .send(WatcherEvent::Delta {
+                added,
+                removed,
+                snapshot,
+                ack: Some(ack_tx),
+            })
+            .expect("ServiceRig manager 應接收 watcher Delta");
+        assert!(
+            ack_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("ServiceRig manager 應確認 Delta"),
+            "成功套用的 Delta 應回覆接受"
+        );
+    };
+
+    send_delta(Vec::new(), vec![device.clone()], Vec::new());
+    r.wait_state("COM0", "DETACHED");
+    send_delta(
+        vec![device.clone()],
+        Vec::new(),
+        vec![(BY_ID_A.to_string(), device.clone())],
+    );
+    r.wait_state("COM0", "ATTACHED");
+
+    let session = r.session("COM0").expect("session.get_state 應查到重新掛接的 session");
+    assert_eq!(s(&session, "state"), "ATTACHED");
+    assert_eq!(s(&session, "attached_real_path"), REAL_A);
 }
 
 #[test]

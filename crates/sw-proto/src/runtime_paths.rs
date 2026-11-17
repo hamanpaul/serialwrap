@@ -135,6 +135,8 @@ pub struct RuntimePaths {
     pub log_dir: String,
     /// `os.path.join(CONFIG_DIR, "config.yaml")`。
     pub config_yaml: String,
+    /// Python `SYSTEM_CONFIG_PATH`；`SERIALWRAP_TEST_SYSTEM_CONFIG_PATH` 存在時原樣採用，含空字串。
+    pub system_config_path: String,
     /// `TTYMCU_PATH`＝`_env_path("SERIALWRAP_TTYMCU_PATH", os.path.join(RUN_DIR, "dev", "ttyMCU"))`（P8 Task 10；
     /// Windows flavor 亦產生值但 daemon 不使用——`caps.flash_endpoint=false` 時不建端點）。
     pub ttymcu_path: String,
@@ -281,6 +283,17 @@ impl RuntimePaths {
             &pypath::join(f, &user_home, &["b-log"]),
         );
         let config_yaml = pypath::join(f, &config_dir, &["config.yaml"]);
+        let system_config_path = match env.get("SERIALWRAP_TEST_SYSTEM_CONFIG_PATH") {
+            Some(path) => path.to_string(),
+            None => match f {
+                PathFlavor::Posix => "/etc/serialwrap/config.yaml".to_string(),
+                PathFlavor::Windows => pypath::join(
+                    f,
+                    env.get("ProgramData").unwrap_or(r"C:\ProgramData"),
+                    &["serialwrap", "config.yaml"],
+                ),
+            },
+        };
         // constants.py：`TTYMCU_PATH = _env_path("SERIALWRAP_TTYMCU_PATH", os.path.join(RUN_DIR, "dev", "ttyMCU"))`。
         let ttymcu_path = env_path(
             env,
@@ -303,6 +316,7 @@ impl RuntimePaths {
             wal_dir,
             log_dir,
             config_yaml,
+            system_config_path,
             ttymcu_path,
         })
     }
@@ -348,12 +362,12 @@ pub fn benches_yaml_path(
 ///
 /// 1. `$SERIALWRAP_CONFIG` strip 後非空 → `expanduser` 後原樣回傳（即使檔案不存在）；
 /// 2. `CONFIG_DIR/config.yaml` 存在 → 它；
-/// 3. `<system_config_dir>/config.yaml` 存在 → 它；
+/// 3. `SYSTEM_CONFIG_PATH` 存在 → 它；
 /// 4. 否則 `CONFIG_DIR/config.yaml`。
 pub fn resolve_config_path(
     env: &EnvSnapshot,
     paths: &RuntimePaths,
-    system_config_dir: &str,
+    system_config_path: &str,
     f: PathFlavor,
     home: &dyn HomeLookup,
     exists: &dyn Fn(&str) -> bool,
@@ -366,9 +380,8 @@ pub fn resolve_config_path(
     if exists(&paths.config_yaml) {
         return paths.config_yaml.clone();
     }
-    let system_yaml = pypath::join(f, system_config_dir, &["config.yaml"]);
-    if exists(&system_yaml) {
-        return system_yaml;
+    if exists(system_config_path) {
+        return system_config_path.to_string();
     }
     paths.config_yaml.clone()
 }

@@ -32,6 +32,24 @@ fn cfg() -> SerialConfig {
     SerialConfig::from_uart_profile(115200, 8, "N", 1, "none", false)
 }
 
+#[test]
+fn serial_backend_env_values() {
+    use sw_pal::serial::serial_backend_env_warning;
+
+    for raw in [None, Some(""), Some("auto"), Some("POSIX"), Some("termios"), Some("future"), Some(" pyserial ")] {
+        assert_eq!(serial_backend_env_warning(raw, BackendKind::Posix), None, "raw={raw:?}");
+    }
+    for raw in ["pyserial", "windows", "win32", "WINDOWS"] {
+        assert_eq!(
+            serial_backend_env_warning(Some(raw), BackendKind::Posix).as_deref(),
+            Some(format!(
+                "serialwrapd: SERIALWRAP_SERIAL_BACKEND={raw} 在 Rust build 無對應後端，改用原生後端"
+            ).as_str()),
+            "raw={raw:?}"
+        );
+    }
+}
+
 /// `Result<Box<dyn SerialHandle>, _>` 無法直接 `{:?}`（handle 為 trait object），此處只用來產生斷言訊息。
 fn show_open(r: &Result<Box<dyn SerialHandle>, OpenError>) -> String {
     match r {

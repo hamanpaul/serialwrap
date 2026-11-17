@@ -22,8 +22,18 @@ source_ref: origin/docs/parity-amendments
 source_sha256: 722b6d72034ae2fa7a37e98c35e9bf4c3782ffc047215785fdcab1a5d9e2bf1b
 rows:
   # ---------- §1 總表 ----------
-  - {id: "#1", status: INCOMPLETE, reason: "計畫指名 serial_backend_env_values／serial_backend_env_values_windows（P5-T2／T3 追加段）尚未建立"}
-  - {id: "#2", status: INCOMPLETE, reason: "sysenv_test_system_config_path_overrides 與 runtime_paths golden 新列不在本分支（修正在 feature/rust-refactor，尚未併入 P5）"}
+  - id: "#1"
+    status: PASS
+    tests:
+      - "cargo:sw-pal::serial_posix::serial_backend_env_values"
+      - "cargo:sw-daemon::daemon_process::serial_backend_env_warning_is_emitted_once"
+  - id: "#2"
+    status: PASS
+    tests:
+      - "cargo:sw-pal::sysenv::sysenv_test_system_config_path_overrides"
+      - "cargo:sw-cli::endpoint_resolve::system_config_path_override_is_used_by_cli"
+      - "cargo:sw-proto::runtime_paths_golden::posix"
+      - "cargo:sw-proto::runtime_paths_golden::windows"
   - id: "#3"
     status: PASS
     tests: ["cargo:sw-daemon::daemon_process::release_kill_hook_env_isolated_only"]
@@ -123,11 +133,18 @@ rows:
   - id: "#38"
     status: PASS
     tests: ["cargo:sw-core::tx_writer::cancelled_ops_bounded_512_fifo"]
-  - {id: "#39", status: INCOMPLETE, reason: "計畫指名 unknown_outcome_writes_confirmed_prefix_and_meta／unknown_without_confirmed_bytes_writes_meta_only 尚未建立（tx_writer.rs 現有 unknown_with_log_* 為不同語意的既有列，需 P5-T9 對齊）"}
+  - id: "#39"
+    status: PASS
+    tests:
+      - "cargo:sw-core::tx_writer::unknown_outcome_writes_confirmed_prefix_and_meta"
+      - "cargo:sw-core::tx_writer::unknown_without_confirmed_bytes_writes_meta_only"
   - id: "#41"
     status: PASS
     tests: ["cargo:sw-core::io_worker::snapshot_serial_alive_and_running_semantics"]
-  - {id: "#42", status: INCOMPLETE, reason: "併 #1"}
+  - id: "#42"
+    status: PASS
+    tests: ["cargo:sw-pal::serial_posix::serial_backend_env_values"]
+    note: "併 #1"
   - id: "#43"
     status: PASS
     tests: ["cargo:sw-daemon::dispatch::health_status_foreign_holders_holder_unknown_object"]
@@ -148,7 +165,13 @@ rows:
   - id: "#52"
     status: PASS
     tests: ["cargo:sw-core::tx_writer::cancelled_inflight_command_later_tx_refused"]
-  - {id: "#53", status: INCOMPLETE, reason: "watcher_delta_not_lost_when_consumer_rejects 尚未建立（P5-T5）"}
+  - id: "#53"
+    status: PASS
+    tests:
+      - "cargo:sw-pal::device_source::watcher_delta_not_lost_when_consumer_rejects"
+      - "cargo:sw-core::session_manager::watcher_delta_is_acknowledged_after_manager_applies_snapshot"
+      - "cargo:sw-daemon::dispatch::watcher_delta_rebind_is_visible_through_service_rpc"
+    note: "NC-13：consumer 拒收時保留 Delta，consumer 接受後才提交快照；ServiceRig 透過 RPC 驗證重新掛接可見。"
   - id: "#54"
     status: PASS
     tests:
@@ -171,7 +194,11 @@ rows:
   - id: "#63"
     status: PASS
     tests: ["cargo:sw-pal::serial_posix::flock_eacces_is_held"]
-  - {id: "#64", status: INCOMPLETE, reason: "proc_holders_namespace.rs 現有 15 案（計畫要求移植 18 案、指名的 same_name_pts_other_devpts_not_holder 不存在）；Python 18 案尚未登記 s21_gate:py_parity（#76）"}
+  - id: "#64"
+    status: PASS
+    tests:
+      - "cargo:sw-pal::proc_holders_namespace::same_name_pts_other_devpts_not_holder"
+    note: "精確指名節點已新增並登記；既有 foreign_namespace_same_string_not_holder 使用相同 fake st_dev／st_ino／st_rdev 與判定，保留且未作為替代。"
   - id: "#65"
     status: PASS
     tests: ["cargo:sw-pal::serial_posix::conflict_holder_unknown_when_no_pids"]
@@ -355,7 +382,13 @@ rows:
   - id: "C-63"
     status: PASS
     tests: ["cargo:sw-core::drain_release::probe_stop_timeout_waits_late_receipt"]
-  - {id: "C-90", status: INCOMPLETE, reason: "併 #53：watcher_delta_not_lost_when_consumer_rejects 尚未建立"}
+  - id: "C-90"
+    status: PASS
+    tests:
+      - "cargo:sw-pal::device_source::watcher_delta_not_lost_when_consumer_rejects"
+      - "cargo:sw-core::session_manager::watcher_delta_is_acknowledged_after_manager_applies_snapshot"
+      - "cargo:sw-daemon::dispatch::watcher_delta_rebind_is_visible_through_service_rpc"
+    note: "併 #53"
   - {id: "C-93", status: INCOMPLETE, reason: "watcher_stop_bounded_2s 尚未建立（P5-T5 #85）"}
   - {id: "C-95", status: INCOMPLETE, reason: "Rust device_source 已登記 s21_core（linux）；Python tests/test_device_source.py::test_posix_by_path_dedup_and_sort（#81）尚未新增；Windows 列需原生收集"}
   - {id: "C-96", status: BLOCKED-OWNER, bo: BO-S21-15, reason: "SERIALCOMM 實機排除證據需配對藍牙裝置的 Windows 機台；Rust 測試 Windows 列另需原生收集（LOCAL-WINDOWS-TODO）"}
