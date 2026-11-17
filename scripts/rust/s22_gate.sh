@@ -23,6 +23,7 @@ mark_shared_rejected() {
     [[ "$current" == "$rejected" ]] && return 0
   done
   SHARED_REJECTED_EVIDENCE+=("$rejected")
+  echo "EVIDENCE_MISSING：共用證據拒收：$rejected" >&2
 }
 
 while (($#)); do
@@ -108,7 +109,9 @@ if [[ "$DRY_RUN" != "1" && -n "$SHARED_EVIDENCE" ]]; then
   else
     mark_shared_rejected s22_gate:cargo_workspace linux
     echo "EVIDENCE_MISSING：共用 cargo 證據拒收；本段不重跑。" >"$RUN_DIR/logs/shared-cargo-workspace.log"
-    cat "$RUN_DIR/logs/shared-cargo-import.stderr" >>"$RUN_DIR/logs/shared-cargo-workspace.log" || true
+    if [[ -f "$RUN_DIR/logs/shared-cargo-import.stderr" ]]; then
+      cat "$RUN_DIR/logs/shared-cargo-import.stderr" >>"$RUN_DIR/logs/shared-cargo-workspace.log" || true
+    fi
   fi
 fi
 
@@ -143,7 +146,7 @@ SHARED_EVIDENCE_FLAG=0
 REJECTED_SHARED_EVIDENCE_ARG="$(IFS=,; printf '%s' "${SHARED_REJECTED_EVIDENCE[*]}")"
 python3 - "$ROOT" "$RUN_DIR" "$L1_DIR" "$WINDOWS_DIR" "$SELFTEST_REPORT" "$DAEMON_PATH" \
   "$BUILD_EXIT" "$BUILT_DAEMON_SHA256" "$DRY_RUN" "$SHARED_EVIDENCE_FLAG" \
-  "$REJECTED_SHARED_EVIDENCE_ARG" <<'PY'
+  "$REJECTED_SHARED_EVIDENCE_ARG" "$SHARED_EVIDENCE" <<'PY'
 from __future__ import annotations
 
 import hashlib
@@ -158,6 +161,8 @@ import yaml
 
 root = pathlib.Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(root))
+sys.path.insert(0, str(root / "func-test"))
+import runner as func_test_runner
 from scripts.rust.l15_artifact import l15_artifact_problem
 
 run_dir = pathlib.Path(sys.argv[2]).resolve()
@@ -170,6 +175,7 @@ built_sha = sys.argv[8] or None
 dry_run = sys.argv[9] == "1"
 shared_evidence = sys.argv[10] == "1"
 rejected_shared_evidence = [value for value in sys.argv[11].split(",") if value]
+shared_evidence_path = pathlib.Path(sys.argv[12]).resolve() if sys.argv[12] else None
 if daemon_path is not None and not daemon_path.is_relative_to(root):
     print(f"EVIDENCE_MISSING: 候選 daemon 必須位於此 worktree：{daemon_path}", file=sys.stderr)
     daemon_path = None
@@ -191,6 +197,37 @@ def run_logged(label: str, argv: list[str], env: dict[str, str]) -> int:
             stream.write(f"{type(exc).__name__}: {exc}\n")
             return 127
     return proc.returncode if proc.returncode >= 0 else 128 - proc.returncode
+
+selftest_source = "explicit" if selftest_report is not None else "missing"
+selftest_eligibility = "INSUFFICIENT_EVIDENCE"
+selftest_ready = False
+if not dry_run:
+    if selftest_report is None and shared_evidence_path is not None:
+        shared_report = shared_evidence_path / "work/p7-ab/bridge-selftest/selftest-report.json"
+        if shared_report.is_file():
+            eligibility, eligible = func_test_runner.evaluate_bridge_eligibility(shared_report)
+            if eligible:
+                selftest_report = shared_report.resolve()
+                selftest_source = "shared"
+                selftest_eligibility, selftest_ready = eligibility, True
+    if selftest_report is None:
+        # 依 run_p7_ab.sh：`python3 -m uart_stdio_bridge selftest --endpoint posix-pty`。
+        selftest_source = "generated"
+        selftest_dir = run_dir / "bridge-selftest"
+        selftest_dir.mkdir(parents=True, exist_ok=True)
+        selftest_env = os.environ.copy()
+        bridge_src = str(root / "tools/uart_stdio_bridge/src")
+        selftest_env["PYTHONPATH"] = bridge_src + (os.pathsep + selftest_env["PYTHONPATH"] if selftest_env.get("PYTHONPATH") else "")
+        selftest_rc = run_logged("bridge-selftest", [
+            sys.executable, "-m", "uart_stdio_bridge", "selftest", "--endpoint", "posix-pty",
+            "--out", str(selftest_dir),
+        ], selftest_env)
+        generated_report = selftest_dir / "selftest-report.json"
+        if generated_report.is_file():
+            selftest_report = generated_report.resolve()
+        (logs_dir / "bridge-selftest.exit").write_text(f"{selftest_rc}\n", encoding="utf-8")
+    if selftest_report is not None:
+        selftest_eligibility, selftest_ready = func_test_runner.evaluate_bridge_eligibility(selftest_report)
 
 def import_windows_reports() -> None:
     if windows_dir is None:
@@ -231,7 +268,6 @@ def l15_rows() -> list[dict]:
         if isinstance(ref, str) and ref.startswith("func-test/runner.py ")
     })
     rows: list[dict] = []
-    selftest_ready = selftest_report is not None and selftest_report.is_file()
     for index, ref in enumerate(refs, start=1):
         tokens = shlex.split(ref)
         bridge = "--mode" in tokens and tokens[tokens.index("--mode") + 1] == "bridge"
@@ -271,9 +307,13 @@ def l15_rows() -> list[dict]:
                              "reason": identity_problem})
                 continue
             if bridge and not selftest_ready:
-                rows.append({"ref": ref, "implementation": implementation, "outcome": "unchecked", "exit_code": None,
+                # 未提供報告仍是證據不足；已提供但資格不合格維持既有失敗效果，不得由預檢降級成 unchecked。
+                report_exists = selftest_report is not None and selftest_report.is_file()
+                rows.append({"ref": ref, "implementation": implementation,
+                             "outcome": "failed" if report_exists else "unchecked",
+                             "exit_code": 1 if report_exists else None,
                              "daemon_path": str(path.relative_to(root)), "daemon_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-                             "reason": "缺少符合資格的 SERIALWRAP_L15_SELFTEST_REPORT"})
+                             "reason": f"bridge selftest 資格未通過（{selftest_eligibility}）：{selftest_report or '<missing>'}"})
                 continue
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             env = os.environ.copy()
@@ -299,7 +339,9 @@ else:
     runs = []
 
 l15_path = run_dir / "l15-results.json"
-l15_path.write_text(json.dumps({"format": "s22-l15-results.v1", "runs": runs},
+l15_path.write_text(json.dumps({"format": "s22-l15-results.v1", "runs": runs,
+                                "bridge_selftest_report": str(selftest_report) if selftest_report else None,
+                                "bridge_selftest_eligibility": selftest_eligibility},
                               ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 report = run_dir / "s22-gate.json"
 argv = [
@@ -313,6 +355,8 @@ if build_exit is not None:
     argv.extend(["--build-linux-exit", str(build_exit)])
 if built_sha:
     argv.extend(["--built-daemon-sha256", built_sha])
+if selftest_report is not None:
+    argv.extend(["--bridge-selftest-report", str(selftest_report)])
 for evidence in rejected_shared_evidence:
     argv.extend(["--evidence-missing", evidence])
 if dry_run:
