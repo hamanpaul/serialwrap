@@ -44,6 +44,20 @@ def test_missing_com_pair_makes_com_row_blocked_not_pass(tmp_path):
     assert "| win-test.sh --caps windows_com | BLOCKED-OWNER | B-06 |" in md
 
 
+def test_rejected_shared_windows_import_is_incomplete_not_blocked_owner(tmp_path):
+    """匯入被拒時缺少 l1_results 必須維持 INCOMPLETE；實際能力缺失仍由 caps_missing 單獨判 BLOCKED-OWNER。"""
+    names = ("win-test.sh (non-COM)", "win-test.sh --caps windows_com")
+    rows = []
+    for name in names:
+        row = _row(name, rc=None, passed=0)
+        row["required_set"] = g.expected_set(name)
+        row["platform"] = "windows"
+        rows.append(row)
+    md = g.build_report(_results(tmp_path, rows, caps_missing=[]))
+    for name in names:
+        assert f"| {name} | INCOMPLETE | 缺 l1_results |" in md
+
+
 def test_com_row_with_pair_judged_by_run_not_blocked(tmp_path):
     # OD-15：擁有者 host 提供 COM20:COM21 時，COM 列依實跑結果判定，不得為 BLOCKED-OWNER
     md = g.build_report(_results(tmp_path, [_row("win-test.sh --caps windows_com", rc=1, passed=2, failed=1)]))

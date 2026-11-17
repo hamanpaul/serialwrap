@@ -7,8 +7,8 @@
 #   本腳本只「執行並記錄」，列狀態一律由 scripts/rust/p7_gate_report.py 計算。全部子程序結束後才 `build` 寫出
 #   綁定本次 run_id、HEAD、artifact sha256 的 md（預設 target/p7-gate/<run_id>/p7-gate.md），最後 `verify`
 #   必須回空清單。
-#   - Windows 列：非 WSL interop 環境記 caps_missing `windows_native`；未設 SW_TEST_COM_PAIR 記 `windows_com`
-#     （皆為 BLOCKED-OWNER B-06，不得標 PASS）。
+#   - Windows 列：非 WSL interop 環境記 caps_missing `windows_native`；非共用模式未設 SW_TEST_COM_PAIR 記 `windows_com`
+#     （皆為 BLOCKED-OWNER B-06，不得標 PASS）。共用模式匯入被拒時缺少 l1_results，判 INCOMPLETE，不冒充主機能力缺失。
 #   - --skip-full-pytest：不跑 `python3 -m pytest -q tests/`（該列記為未執行 → INCOMPLETE；僅供除錯，不得作出口證據）。
 # 結束碼：報告 PASS 且 verify 無不一致 → 0；否則 1；參數錯誤 → 2；髒工作樹（工作樹不乾淨）→ 3；gate_prereqs 失敗 → 4。
 set -euo pipefail
@@ -194,11 +194,8 @@ if [[ -n "$SHARED_EVIDENCE" && "$SHARED_ARTIFACTS_VALID" == "1" ]]; then
 fi
 CAPS=()
 if ! [[ -n "${WSL_DISTRO_NAME:-}" || -e /proc/sys/fs/binfmt_misc/WSLInterop ]]; then CAPS+=(windows_native windows_com); fi
-[[ -n "${SW_TEST_COM_PAIR:-}" ]] || CAPS+=(windows_com)
-if [[ -n "$SHARED_EVIDENCE" ]]; then
-  [[ "$SHARED_WIN_NONCOM_IMPORTED" == "1" ]] || CAPS+=(windows_native)
-  [[ "$SHARED_WIN_COM_IMPORTED" == "1" ]] || CAPS+=(windows_com)
-fi
+# 共用模式由 manifest 提供 COM L1；匯入拒收是證據缺漏，不因本機未接 COM pair 偽裝成能力缺失。
+if [[ -z "$SHARED_EVIDENCE" && -z "${SW_TEST_COM_PAIR:-}" ]]; then CAPS+=(windows_com); fi
 FILTERED_CAPS=()
 for cap in "${CAPS[@]}"; do
   [[ "$cap" == windows_native && "$SHARED_WIN_NONCOM_IMPORTED" == "1" ]] && continue

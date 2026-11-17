@@ -10,6 +10,8 @@
 scripts/rust/gate_shared.sh --out target/s2-shared-evidence --run-id <run-id> [--windows-l1 <dir>]
 ```
 
+共用證據目錄產生後不可搬動或改名。`p7_ab` 匯入會比對完整 argv，其中包含共用目錄的絕對路徑與目錄名；搬動或改名會使該段成為 `EVIDENCE_MISSING`，P7 的 A/B 與 func-test 證據列都不會被採用。因此應在產生前決定最終 `--out` 路徑，直接於該位置完成產生與匯入。
+
 `gate_shared.sh`、`p7_gate.sh` 與 `slice24_exit.sh` 的正式執行都會先檢查 `git status --porcelain --untracked-files=normal`；髒工作樹時列出髒檔並以結束碼 3 停止，不啟動前置或測試。三個 driver 的 `gate_prereqs.sh --gate` 失敗時，保留檢查／建置輸出的具體原因於各自 run 目錄的 `logs/gate-prereqs.log`，並以結束碼 4 回報（參數錯誤仍為 2）。P7 未指定 `--out-md` 時，報告寫到 `target/p7-gate/<run_id>/p7-gate.md`，不改動 `docs/`。
 
 四個 gate 以 `--shared-evidence <dir>/<run-id>` 指定同一目錄。`scripts/rust/gate_shared.sh --dry-run` 只列出命令，不執行測試。四個 gate 的 `--dry-run` 也只列計畫，不產生出口證據。
@@ -24,8 +26,9 @@ scripts/rust/gate_shared.sh --out target/s2-shared-evidence --run-id <run-id> [-
 - S24 A/B 執行前後各重新核對候選 bundle。任一檢查失敗時 `s24_ab` 明確記為 `EVIDENCE_MISSING`，不把測試結果當有效證據，並繼續處理 Windows L1 匯入；Windows 匯入結果仍依各自的 HEAD、乾淨狀態、selector 與 `l1_judge` 判定。
 - Slice 2.3 的黑箱使用 debug daemon；Slice 2.4 候選是 release bundle。跨切片身分以 P7 結果的 `prior_slice_artifacts.serialwrapd_release` 對照 2.4 的 `--expect-daemon-sha256`；若 release SHA 不符仍拒收，不能以 2.3 `artifacts.serialwrapd` 的 debug SHA 代替。
 - P7 的 A/B 由 `run_p7_ab.sh --od59-contract` 產生；資料目錄與報告一併匯入。
-- Windows L1 由編排者另行提供，不由共用 driver 建置或啟動 Windows runner。輸入目錄每個集合使用 `<dir>/<required-set>/l1-results.json`，例如 `<dir>/s21_core/l1-results.json`。匯入會要求 `l1-results.v1`、Windows 平台、Windows Cargo build target、候選 HEAD 起訖一致且乾淨，並逐字核對該集合的 Windows selector；再用唯一的 `tests/acceptance/l1_judge.py` 核對凍結 nodeid 集合、執行結果與 skip。必要列缺失或被 skip 時是 `EVIDENCE_MISSING`，測試失敗保留 `FAIL`。`s21_core` 可供 slice 2.1 與 P7 non-COM 共用；能力集合及 COM 集合各自依鎖檔保留獨立 selector。交叉編譯收集清單不能取代這些輸入。
-- 目前 `s22_gate:win_test` 尚未登記於 `l1_required.lock.json`，沒有可核對的 Windows selector；該必要段維持 `EVIDENCE_MISSING`，`--windows-dir` 不能補成共用證據。待原生 collection 的 selector 依鎖檔程序登記後，才能納入共用 manifest。
+- Windows L1 由原生 Windows 執行產生，不由共用 driver 建置或啟動 Windows runner。輸入目錄每個集合使用 `<dir>/<required-set>/l1-results.json`，例如 `<dir>/s21_core/l1-results.json`。匯入會要求 `l1-results.v1`、Windows 平台、Windows Cargo build target、候選 HEAD 起訖一致且乾淨，並逐字核對該集合的 Windows selector；再用唯一的 `tests/acceptance/l1_judge.py` 核對凍結 nodeid 集合、執行結果與 skip。必要列缺失或被 skip 時是 `EVIDENCE_MISSING`，測試失敗保留 `FAIL`。`s21_core` 可供 slice 2.1 與 P7 non-COM 共用；P7 COM 與各能力集合依鎖檔保留獨立 selector。交叉編譯收集清單不能取代這些輸入。
+- `s22_gate:win_test` 已登記於 `l1_required.lock.json`。Slice 2.2 的共用模式直接從共用 manifest 匯入 `windows_l1:s22_gate:win_test`；缺少該段或其 provenance／selector／必要節點驗證失敗時維持 `EVIDENCE_MISSING`，不啟動 Windows runner，也不以 `--windows-dir` 替代共用 manifest 證據。非共用模式則依原流程使用明確指定的 Windows L1 目錄。
+- P7 共用模式下 Windows L1 匯入被拒時不記入 `caps_missing`；缺少該列的 `l1_results` 由 P7 judge 判為 `INCOMPLETE`。`BLOCKED-OWNER` 僅用於實際缺少 Windows 執行能力的主機，不用來掩蓋 provenance、selector、skip 或必要節點缺漏。
 
 Windows COM 測試仍依既有 owner/hardware 規則處理；Slice 2.4 的 `--windows-run` artifact、長跑及真機證據仍走原有匯入路徑。這些證據缺失時維持原判定，不由共用證據推定通過。
 
