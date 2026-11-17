@@ -1115,6 +1115,8 @@ def cmd_record_section(args: argparse.Namespace) -> int:
         frag["reasons"] = list(args.reason)
     if args.evidence:
         frag["evidence"] = args.evidence
+    if getattr(args, "bridge_selftest_report", None):
+        frag["bridge_selftest_report"] = args.bridge_selftest_report
     if args.run_euid not in (None, ""):
         frag["run_euid"] = int(args.run_euid)
     if args.capability_probe:
@@ -1600,6 +1602,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     r.add_argument("--section-verdict", default=None, choices=("PASS", "FAIL", "EVIDENCE_MISSING"))
     r.add_argument("--reason", action="append", default=[])
     r.add_argument("--evidence", default=None)
+    r.add_argument("--bridge-selftest-report", default=None, help="L1.5 bridge 自測報告路徑（只記錄，不改資格判定）")
     r.add_argument("--run-euid", default=None, help="執行該 section 測試的 euid（F108：linux_l1 須非 0）")
     r.add_argument("--capability-probe", default=None,
                    help="能力集合 section 的能力探測（SPEC-GAP #2）：<cap>=available:<證據> 或 <cap>=unavailable:<證據>")
