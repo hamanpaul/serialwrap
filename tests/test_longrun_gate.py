@@ -559,6 +559,43 @@ def test_busy_is_expected_reject(tmp_path):
     assert counts["error_rate"] == 0
 
 
+def test_session_busy_expected_reject_is_limited_to_interactive_mode():
+    gate = _gate()
+    acceptance = _yaml().safe_load(ACCEPTANCE_SOURCE.read_text(encoding="utf-8"))
+    counting = copy.deepcopy(acceptance["counting"])
+    counting["expected_reject_by_mode"] = {"interactive": ["SESSION_BUSY"]}
+    cases = (
+        ("agent:rhw0", "interactive", "SESSION_BUSY"),
+        ("agent:rhw1", "line", "SESSION_BUSY"),
+        ("agent:rhw2", "background", "SESSION_BUSY"),
+        ("agent:rhw3", "interactive", "SESSION_INTERACTIVE_BUSY"),
+    )
+    events = []
+    for round_, (source, mode, error_code) in enumerate(cases):
+        base = {"source": source, "com": "COM0", "round": round_, "cmd_id": f"cmd-{round_}"}
+        events.append({**base, "kind": "submit", "t": round_ * 2})
+        events.append({**base, "kind": "error", "mode": mode, "detail": error_code, "t": round_ * 2 + 1})
+
+    counts = gate.count_commands(events, counting)
+    interactive = counts["COM0|agent:rhw0"]
+    line = counts["COM0|agent:rhw1"]
+    background = counts["COM0|agent:rhw2"]
+    interactive_lease = counts["COM0|agent:rhw3"]
+    assert interactive["expected_rejects"] == 1
+    assert interactive["unexpected_errors"] == 0
+    assert interactive["accepted"] == 0
+    assert interactive["error_rate"] == 0
+    for still_unexpected in (line, background):
+        assert still_unexpected["expected_rejects"] == 0
+        assert still_unexpected["unexpected_errors"] == 1
+        assert still_unexpected["accepted"] == 1
+        assert still_unexpected["error_rate"] == 1
+    assert interactive_lease["expected_rejects"] == 1
+    assert interactive_lease["unexpected_errors"] == 0
+    assert interactive_lease["accepted"] == 0
+    assert interactive_lease["error_rate"] == 0
+
+
 def test_worker_error_counts(tmp_path):
     gate = _gate()
     run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")

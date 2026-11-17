@@ -93,6 +93,7 @@
         "pair_key",
         "expected_reject_kinds",
         "expected_reject_error_codes",
+        "expected_reject_by_mode",
         "unresolved_policy",
         "worker_error_policy",
         "definitions"
@@ -122,6 +123,17 @@
           "type": "array",
           "items": {
             "type": "string"
+          }
+        },
+        "expected_reject_by_mode": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
           }
         },
         "unresolved_policy": {

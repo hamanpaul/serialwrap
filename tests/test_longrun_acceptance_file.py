@@ -34,6 +34,11 @@ def _validate_rejected(validator, schema, value):
 def test_acceptance_file_schema():
     acceptance, schema, validator = _load_acceptance_and_schema()
     validator(schema).validate(acceptance)
+    assert "OD-103" in acceptance["owner_decisions"]
+    assert acceptance["counting"]["expected_reject_by_mode"] == {"interactive": ["SESSION_BUSY"]}
+    invalid_mode_codes = copy.deepcopy(acceptance)
+    invalid_mode_codes["counting"]["expected_reject_by_mode"]["interactive"] = "SESSION_BUSY"
+    _validate_rejected(validator, schema, invalid_mode_codes)
 
     thresholds = acceptance["thresholds"]
     for key in ("unexpected_cmd_error_rate", "effective_throughput", "stuck_attached"):
