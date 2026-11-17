@@ -16,12 +16,12 @@ fn update_confirm_released_stays_fail_closed_when_multi_open_scan_says_ok() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_systemd(true)
         .with_var("USER", "alice")
         .with_supervisor_state("systemd-user", true, true)
         .with_idle_daemon_default(4242)
-        .with_new_daemon_reporting_version("0.4.1")
+        .with_new_daemon_reporting_version(CURRENT_VERSION)
         .with_rpc_ok(&endpoint, "session.list", list)
         .with_rpc_after_relaunch("session.list", list);
     // fail-closed 掃描：目標 tty 取不到身分 → Unknown；Python 相容掃描：略過該 tty → ok。

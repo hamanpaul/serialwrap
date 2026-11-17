@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from bb_harness import NL, run_cli
+from bb_l15 import OLD_BUNDLE_VERSION, NEW_BUNDLE_VERSION
 
 pytestmark = [pytest.mark.process_rpc]
 
@@ -405,7 +406,7 @@ def test_systemd_failure_keeps_complete_reason_and_stderr(tmp_path, monkeypatch)
     }
     monkeypatch.setattr(update, "repo_root", lambda: tmp_path)
     monkeypatch.setattr(update, "update_bundles", lambda: (tmp_path / "old", tmp_path / "new"))
-    for bundle, version in ((tmp_path / "old", "0.4.0"), (tmp_path / "new", "0.4.1")):
+    for bundle, version in ((tmp_path / "old", OLD_BUNDLE_VERSION), (tmp_path / "new", NEW_BUNDLE_VERSION)):
         cfg = bundle / "versions" / version / "py" / "pyvenv.cfg"
         cfg.parent.mkdir(parents=True)
         cfg.write_text("home = /usr/bin\ninclude-system-site-packages = false\n", encoding="utf-8")
@@ -432,7 +433,7 @@ def test_systemd_rejects_toolcache_runtime_before_docker(tmp_path, monkeypatch):
     import test_cli_mgmt_update as update
 
     old, new = tmp_path / "old", tmp_path / "new"
-    for bundle, version in ((old, "0.4.0"), (new, "0.4.1")):
+    for bundle, version in ((old, OLD_BUNDLE_VERSION), (new, NEW_BUNDLE_VERSION)):
         cfg = bundle / "versions" / version / "py" / "pyvenv.cfg"
         cfg.parent.mkdir(parents=True)
         cfg.write_text("home = /opt/hostedtoolcache/Python/3.12.3/x64/bin\ninclude-system-site-packages = false\n", encoding="utf-8")

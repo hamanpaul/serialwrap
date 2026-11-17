@@ -28,6 +28,7 @@ pytestmark = [pytest.mark.posix_only, pytest.mark.process_rpc]
 
 REPO = Path(__file__).resolve().parents[1]
 INSTALL_SH = REPO / "install.sh"
+CURRENT_VERSION = (REPO / "VERSION").read_text(encoding="utf-8").strip()
 VERSION = "0.4.0"
 TARBALL = f"serialwrap-{VERSION}-linux-x86_64.tar.gz"
 
@@ -297,7 +298,7 @@ def test_download_explicit_version(env, tmp_path):
 def test_download_latest_resolves_redirect(env, tmp_path, downloader):
     if shutil.which(downloader) is None:
         pytest.skip(f"cap_missing:{downloader}：host 無 {downloader}（證據不足，非 PASS）")
-    latest = "0.4.1"
+    latest = CURRENT_VERSION
     bundle = _make_bundle(tmp_path / "bundle")
     data = _tar_bytes(bundle, top=None)
     with _ReleaseServer(latest=f"v{latest}") as srv:

@@ -41,6 +41,7 @@ from bb_stubd import StubDaemon
 
 pytestmark = [pytest.mark.posix_only]
 ROOT = Path(__file__).resolve().parents[2]
+CURRENT_VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
 
 
 def _short_case_root() -> Path:
@@ -288,7 +289,7 @@ def test_supervision_set_rust_only_switch(tmp_path: Path, env: dict[str, str]) -
                 "health.ping": [{"reply": {"ok": True}}],
                 "mcu.status": [{"reply": {"ok": True, "flashing": False}}],
                 "session.list": [{"reply": {"ok": True, "sessions": []}}],
-                "health.status": [{"reply": {"ok": True, "pid": holder.pid, "version": "0.4.1"}}],
+                "health.status": [{"reply": {"ok": True, "pid": holder.pid, "version": CURRENT_VERSION}}],
                 "daemon.handoff_stop": [{"reply": handoff_reply}],
             }
         }

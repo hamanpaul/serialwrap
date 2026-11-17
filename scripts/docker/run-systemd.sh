@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+NEW_VERSION="$(tr -d '[:space:]' < "$REPO_ROOT/VERSION")"
 COMPOSE_FILE="$REPO_ROOT/tools/docker/compose.l15.yaml"
 source "$SCRIPT_DIR/common.sh"
 MODE=systemd-user
@@ -87,12 +88,12 @@ case "$SCENARIO" in
         BUNDLE_NEW="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve())' "$BUNDLE_NEW")"
         BUNDLE_OLD_MANIFEST="$(resolve_bundle_manifest "$BUNDLE_OLD")"
         BUNDLE_NEW_MANIFEST="$(resolve_bundle_manifest "$BUNDLE_NEW")"
-        python3 - "$BUNDLE_OLD_MANIFEST" "$BUNDLE_NEW_MANIFEST" <<'PY'
+        python3 - "$BUNDLE_OLD_MANIFEST" "$BUNDLE_NEW_MANIFEST" "$NEW_VERSION" <<'PY'
 import json
 import pathlib
 import sys
 
-for path, expected in zip(sys.argv[1:], ("0.4.0", "0.4.1"), strict=True):
+for path, expected in zip(sys.argv[1:3], ("0.4.1", sys.argv[3]), strict=True):
     manifest = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
     if manifest.get("bundle_version") != expected:
         raise SystemExit(f"bundle 版本應為 {expected}：{path}")
@@ -144,7 +145,7 @@ if ((DRY_RUN)); then
     echo "+ systemd unit 由 serialwrap setup 安裝；P1 SC-12 reconcile 由產品 CLI 執行"
     echo "+ evidence_layer=L1.5-docker producer=run-systemd.sh topology=docker-2c uart_kind=pty-fake"
     if [[ "$SCENARIO" == "update-exit1" ]]; then
-        echo '+ run systemd update-exit1 using mounted 0.4.0／0.4.1 dev bundles'
+        echo "+ run systemd update-exit1 using mounted 0.4.1／$NEW_VERSION dev bundles"
     fi
     exit 0
 fi

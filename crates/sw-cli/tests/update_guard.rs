@@ -44,7 +44,7 @@ const REFUSALS: [Refusal; 6] = [
     Refusal::ProcessAliveRpcDown,
 ];
 
-/// 執行入口：update（bundle 0.4.1 更新 Current 0.4.0）或 rollback（Current 0.4.1 → Previous 0.4.0）。
+/// 執行入口：update（目前版本 bundle 更新 Current 0.4.0）或 rollback（目前版本 Current → Previous 0.4.0）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Entry {
     Update,
@@ -62,7 +62,7 @@ impl Entry {
     fn current(self) -> &'static str {
         match self {
             Entry::Update => "0.4.0",
-            Entry::Rollback => "0.4.1",
+            Entry::Rollback => CURRENT_VERSION,
         }
     }
 }
@@ -73,8 +73,10 @@ fn base(entry: Entry) -> TestEnv {
         .with_install_root()
         .with_installed("0.4.0");
     match entry {
-        Entry::Update => t.with_current("0.4.0", None).with_bundle("0.4.1"),
-        Entry::Rollback => t.with_installed("0.4.1").with_current("0.4.1", Some("0.4.0")),
+        Entry::Update => t.with_current("0.4.0", None).with_bundle(CURRENT_VERSION),
+        Entry::Rollback => t
+            .with_installed(CURRENT_VERSION)
+            .with_current(CURRENT_VERSION, Some("0.4.0")),
     }
 }
 
@@ -86,10 +88,10 @@ fn isolated_absent_base(entry: Entry) -> (TestEnv, String, String) {
         Entry::Update => t
             .with_installed("0.4.0")
             .with_current("0.4.0", None)
-            .with_bundle("0.4.1"),
+            .with_bundle(CURRENT_VERSION),
         Entry::Rollback => t
-            .with_installed("0.4.1")
-            .with_current("0.4.1", Some("0.4.0")),
+            .with_installed(CURRENT_VERSION)
+            .with_current(CURRENT_VERSION, Some("0.4.0")),
     };
     let socket = t.default_socket();
     let endpoint = t.isolated_endpoint(&socket);
@@ -420,7 +422,7 @@ fn scoped_update_and_rollback_ignore_foreign_daemons() {
     for entry in [Entry::Update, Entry::Rollback] {
         let (t, _, endpoint) = scoped_absent_base(entry);
         let t = match entry {
-            Entry::Update => t.with_new_daemon_reporting_version("0.4.1"),
+            Entry::Update => t.with_new_daemon_reporting_version(CURRENT_VERSION),
             Entry::Rollback => t.with_new_daemon_reporting_version("0.4.0"),
         };
         let foreign = vec![
@@ -455,7 +457,11 @@ fn scoped_update_and_rollback_ignore_foreign_daemons() {
         }
         assert_eq!(
             s(&j[entry.key()], "to_version"),
-            if entry == Entry::Update { "0.4.1" } else { "0.4.0" }
+            if entry == Entry::Update {
+                CURRENT_VERSION
+            } else {
+                "0.4.0"
+            }
         );
         assert_eq!(endpoint, t.isolated_endpoint(&t.default_socket()));
     }
@@ -588,8 +594,8 @@ fn guard_force_recheck_after_disable_still_refuses() {
         .with_config("supervision_mode: windows-task\n")
         .with_install_root()
         .with_installed("0.4.0")
-        .with_installed("0.4.1")
-        .with_current("0.4.1", Some("0.4.0"))
+        .with_installed(CURRENT_VERSION)
+        .with_current(CURRENT_VERSION, Some("0.4.0"))
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(ep, 4242)
         .with_rpc_ok(ep, "session.list", IDLE_LIST)
@@ -611,7 +617,13 @@ fn guard_force_recheck_after_disable_still_refuses() {
         "交接只問一次"
     );
     assert!(!t.calls().iter().any(|c| c.get(1).map(String::as_str) == Some("/End")), "不得硬停");
-    assert_eq!(sw_cli::install_layout::read_current(&t.root()).unwrap().unwrap().bundle_version, "0.4.1");
+    assert_eq!(
+        sw_cli::install_layout::read_current(&t.root())
+            .unwrap()
+            .unwrap()
+            .bundle_version,
+        CURRENT_VERSION
+    );
 }
 
 #[test]

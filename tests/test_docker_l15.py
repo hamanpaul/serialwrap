@@ -338,7 +338,7 @@ def test_run_l15_dry_run_uses_suite_entrypoint(suite, expected):
 # POSIX-only（§10.4）：_run_script（tests/test_docker_l15.py:71）用 bash 執行 scripts/docker/*.sh；run-l15.sh:43／common.sh:7 需 POSIX bash 與 python3（WSL 路徑轉換 rc=127，Git Bash 缺 python3 rc=49）。
 @pytest.mark.posix_only
 @pytest.mark.process_rpc
-def test_run_systemd_dry_run_asserts_dropin():
+def test_run_systemd_dry_run_asserts_dropin(tmp_path):
     r = _run_script(RUN_SYSTEMD, "--mode", "systemd-user", "--dry-run")
     assert r.returncode == 0, _tail(r)
     assert "systemctl --user show serialwrap -p Restart -p RefuseManualStart" in r.stdout
@@ -346,6 +346,36 @@ def test_run_systemd_dry_run_asserts_dropin():
     assert "RefuseManualStart=yes" in r.stdout
     assert "journalctl --user -u serialwrap -o cat" in r.stdout
     assert "build_dut_image.sh" not in r.stdout
+
+    old_bundle, new_bundle = tmp_path / "old", tmp_path / "new"
+    old_bundle.mkdir()
+    new_bundle.mkdir()
+    (old_bundle / "release-manifest.json").write_text(
+        json.dumps({"bundle_version": "0.4.1"}), encoding="utf-8"
+    )
+    current_version = (REPO / "VERSION").read_text(encoding="utf-8").strip()
+    (new_bundle / "release-manifest.json").write_text(
+        json.dumps({"bundle_version": current_version}), encoding="utf-8"
+    )
+    update = _run_script(
+        RUN_SYSTEMD,
+        "--mode", "systemd-user", "--scenario", "update-exit1",
+        "--bundle-old", str(old_bundle), "--bundle-new", str(new_bundle),
+        "--out", str(tmp_path / "evidence"), "--dry-run",
+    )
+    assert update.returncode == 0, _tail(update)
+    assert f"mounted 0.4.1／{current_version} dev bundles" in update.stdout
+
+    bridge_src = str(REPO / "tools" / "uart_stdio_bridge" / "src")
+    sys.path.insert(0, bridge_src)
+    sys.path.insert(0, str(REPO))
+    try:
+        from scripts.docker import run_systemd_container  # noqa: PLC0415
+    finally:
+        sys.path.remove(str(REPO))
+        sys.path.remove(bridge_src)
+    assert run_systemd_container.OLD_VERSION == "0.4.1"
+    assert run_systemd_container.NEW_VERSION == current_version
 
 
 # POSIX-only（§10.4）：_run_script（tests/test_docker_l15.py:71）用 bash 執行 scripts/docker/*.sh；run-l15.sh:43／common.sh:7 需 POSIX bash 與 python3（WSL 路徑轉換 rc=127，Git Bash 缺 python3 rc=49）。

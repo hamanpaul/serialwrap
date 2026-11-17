@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+CURRENT_VERSION = (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip()
 sys.path.insert(0, str(REPO_ROOT / "regression"))
 
 from serialwrap_regression import harness  # noqa: E402
@@ -28,8 +29,8 @@ def _obs(**overrides) -> dict:
         "elapsed_s": 14.2,
         "old_tree_alive": [],
         "daemons_after": [5252],
-        "expected_version": "serialwrap 0.4.1",
-        "version_after": "0.4.1",
+        "expected_version": f"serialwrap {CURRENT_VERSION}",
+        "version_after": CURRENT_VERSION,
         "attached_before": {"COM0": "/dev/ttyUSB0"},
         "sessions_after": [{"com": "COM0", "state": "READY", "attached_real_path": "/dev/ttyUSB0"}],
     }

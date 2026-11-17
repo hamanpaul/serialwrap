@@ -39,15 +39,22 @@ from pathlib import Path
 
 import pytest
 
-from bb_l15 import bundle_manifest_path, resume_pause, update_bundles, wait_pause
+from bb_l15 import (
+    OLD_BUNDLE_VERSION,
+    NEW_BUNDLE_VERSION,
+    bundle_manifest_path,
+    resume_pause,
+    update_bundles,
+    wait_pause,
+)
 from bb_harness import ab_label
 from mcu_flash_parity import record_observation
 from p8_fixtures import FakeFlasher, HolderSampler
 
 pytestmark = [pytest.mark.posix_only]
 
-OLD = "0.4.0"
-NEW = "0.4.1"
+OLD = OLD_BUNDLE_VERSION
+NEW = NEW_BUNDLE_VERSION
 SYNC = b"\x55\x55"
 ACK = b"\x00\xcc"
 PACKET = b"\x03\x10\x20"
@@ -74,8 +81,8 @@ def _link_tree(src: Path, dst: Path) -> None:
 class Installed:
     """隔離 install root＋與受測 daemon 共用的 env（CONFIG／STATE／RUN… 皆為 `sw_env` 的隔離目錄）。
 
-    `previous=True`：Current＝0.4.1、Previous＝0.4.0（含完整備份），供 `setup --rollback`；
-    `previous=False`：Current＝0.4.0，供 0.4.1 bundle 的 `setup`（更新路徑）。
+    `previous=True`：Current＝目前版本、Previous＝0.4.1（含完整備份），供 `setup --rollback`；
+    `previous=False`：Current＝0.4.1，供目前版本 bundle 的 `setup`（更新路徑）。
     """
 
     def __init__(
@@ -564,7 +571,7 @@ def test_rollback_force_refuses_while_push(sw_env, shell_target, tmp_path, entry
             scope_update_to_test_daemon=timing == "after_probe",
         )
         return
-    # `setup --force`（0.4.1 bundle 更新 Current 0.4.0）：同一 safety_check，--force 只記 force_ignored。
+    # `setup --force`（目前版本 bundle 更新 0.4.1）：同一 safety_check，--force 只記 force_ignored。
     pid = _ready(sw_env, shell_target)
     inst = Installed(tmp_path, sw_env, previous=False)
     with HolderSampler(shell_target.slave_path, 0.01, exclude=(os.getpid(),)) as sampler:

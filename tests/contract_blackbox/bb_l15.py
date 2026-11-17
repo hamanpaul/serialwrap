@@ -25,6 +25,8 @@ from typing import Any
 from bb_harness import ab_env, repo_root
 
 ROOT = repo_root()
+OLD_BUNDLE_VERSION = "0.4.1"
+NEW_BUNDLE_VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
 BRIDGE_SRC = ROOT / "tools" / "uart_stdio_bridge" / "src"
 if str(BRIDGE_SRC) not in sys.path:
     sys.path.insert(0, str(BRIDGE_SRC))
@@ -79,7 +81,7 @@ def bundle_manifest_path(bundle: Path, expected_version: str | None = None) -> P
 
 
 def update_bundles() -> tuple[Path, Path]:
-    """建立本 pytest 行程共用的 0.4.0／0.4.1 test-hooks bundle。"""
+    """建立由上一個正式版 0.4.1 升至目前版本的 test-hooks bundle。"""
     global _bundle_work, _bundle_pair
     if _bundle_pair is not None:
         return _bundle_pair
@@ -90,7 +92,7 @@ def update_bundles() -> tuple[Path, Path]:
             raise AssertionError("SW_G5_BUNDLE_OLD 與 SW_G5_BUNDLE_NEW 必須同時設定")
         bundles = (Path(external_old).resolve(), Path(external_new).resolve())
         repo = ROOT.resolve()
-        for bundle, expected in zip(bundles, ("0.4.0", "0.4.1"), strict=True):
+        for bundle, expected in zip(bundles, (OLD_BUNDLE_VERSION, NEW_BUNDLE_VERSION), strict=True):
             if repo not in bundle.parents:
                 raise AssertionError(f"外部 G5 bundle 必須位於本 worktree：{bundle}")
             cli = bundle / "bin" / "serialwrap"
@@ -109,7 +111,7 @@ def update_bundles() -> tuple[Path, Path]:
     cargo_target = root / "cargo-target"
     script = ROOT / "scripts" / "rust" / "mkbundle.sh"
     outputs: list[Path] = []
-    for version in ("0.4.0", "0.4.1"):
+    for version in (OLD_BUNDLE_VERSION, NEW_BUNDLE_VERSION):
         out = root / f"bundle-{version}"
         env = dict(os.environ)
         env["CARGO_TARGET_DIR"] = str(cargo_target)

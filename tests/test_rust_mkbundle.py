@@ -1163,7 +1163,8 @@ def test_bundle_py_is_self_contained(tmp_path):
 
 
 def test_bundle_two_versions_have_distinct_tree_sha256(tmp_path):
-    versions = ("0.4.0", "0.4.1")
+    # 0.4.1 is the previous release; the second bundle tracks the current VERSION.
+    versions = ("0.4.1", VERSION)
     fingerprints: dict[str, str] = {}
     for version in versions:
         out = _build_bundle(tmp_path / f"bundle-{version}", version_override=version)
@@ -1190,10 +1191,10 @@ def test_bundle_two_versions_have_distinct_tree_sha256(tmp_path):
         assert m["bundle_version"] == version
         assert m["pairing"] == {"rule": "exact", "cli_version": version, "daemon_version": version}
         fingerprints[version] = _tree_sha256_stdlib(vdir)
-        if version == "0.4.0":
+        if version == "0.4.1":
             _run_daemon_session(out, _harness_env(tmp_path / "override-iso"), tmp_path / "override-daemon")
 
-    assert fingerprints["0.4.0"] != fingerprints["0.4.1"], "不同版本的 bundle_tree_sha256 必須不同"
+    assert fingerprints["0.4.1"] != fingerprints[VERSION], "不同版本的 bundle_tree_sha256 必須不同"
 
 
 def test_bundle_daemon_components_and_sha256sums(bundle):

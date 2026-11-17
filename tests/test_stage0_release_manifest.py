@@ -24,6 +24,7 @@ from unittest import mock
 import pytest
 
 pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+CURRENT_VERSION = (Path(__file__).resolve().parents[1] / "VERSION").read_text(encoding="utf-8").strip()
 
 BASELINE_LINUX_CHECKS = [
     "python",
@@ -182,7 +183,7 @@ def test_pairing_reports_mismatches_in_order(tmp_path: Path) -> None:
     item = rm.check_version_pairing(
         m,
         manifest_dir=str(tmp_path),
-        cli_version="0.4.1",
+        cli_version=CURRENT_VERSION,
         daemon_version=None,
         package_tree=lambda: "OTHER",
         asset_sha256={"skill": "S1", "skill_windows": "X"}.get,

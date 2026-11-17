@@ -39,6 +39,9 @@ use sw_proto::runtime_paths::{EnvSnapshot, NativeTraits, RuntimePaths};
 /// 腳本化 argv 的環境操作（`FakeSysEnvBuilder` 的一次呼叫，保存下來以便每次重建替身）。
 type EnvOp = Box<dyn Fn(FakeSysEnvBuilder) -> FakeSysEnvBuilder>;
 
+/// 由 Cargo workspace 注入的目前套件版本。
+pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// `health.ping` 的成功回應（與 P3 client 的 JSON 形狀一致）。
 const OK_PING: &str = r#"{"ok":true,"pid":1234,"version":"test"}"#;
 /// `session.list` 的成功回應（空清單）。
@@ -943,7 +946,7 @@ impl TestEnv {
 
     /// 新版 daemon spawn 後 RPC 立即拒絕，但 process scan 仍看見新 PID。
     pub fn with_new_daemon_rpc_down(self) -> Self {
-        let mut env = self.with_new_daemon_reporting_version("0.4.1");
+        let mut env = self.with_new_daemon_reporting_version(CURRENT_VERSION);
         let endpoint = if env.windows { Self::win_endpoint().to_string() } else { env.default_socket() };
         let counter = env.ensure_process().spawn_counter();
         env.rpc.refuse_after_spawn(&endpoint, counter);

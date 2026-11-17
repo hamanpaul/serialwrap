@@ -49,7 +49,20 @@ UNIT_DIR = HOME / ".config" / "systemd" / "user"
 SYSTEM_UNIT_DIR = pathlib.Path("/etc/systemd/system")
 SYSTEM_PROFILE_DIR = pathlib.Path("/etc/serialwrap/profiles")
 OLD_VERSION = "0.3.2"
-NEW_VERSION = "0.4.1"
+
+
+def _new_version() -> str:
+    """讀取 checkout 的 VERSION；容器端由 host runner 明確傳入同一版號。"""
+    version_file = pathlib.Path(__file__).resolve().parents[2] / "VERSION"
+    if version_file.is_file():
+        return version_file.read_text(encoding="utf-8").strip()
+    configured = os.environ.get("SW_UPGRADE_NEW_VERSION", "").strip()
+    if configured:
+        return configured
+    raise RuntimeError("容器端缺少 SW_UPGRADE_NEW_VERSION（必須等於 host VERSION）")
+
+
+NEW_VERSION = _new_version()
 ENTRY_NAMES = ("serialwrap", "serialwrapd")
 RUNUSER = shutil.which("runuser") or "/usr/sbin/runuser"
 # `daemon stop` 之後等舊 daemon 行程樹與 socket 消失的上限（秒）；逾時該步驟判 FAIL（on-demand 預熱競態裁決）。

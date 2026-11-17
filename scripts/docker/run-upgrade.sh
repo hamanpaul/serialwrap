@@ -187,7 +187,7 @@ if ((DRY_RUN)); then
     for mode in "${MODES[@]}"; do
         container_run "$mode" "$WORK/wheels" "${BUNDLE:-$WORK/bundle-$NEW_VERSION}"
         print_command "${run_cmd[@]}"
-        print_command docker exec "sw-upgrade-$RUN_ID-$mode" python3 /opt/sw-driver/run_upgrade_container.py \
+        print_command docker exec -e "SW_UPGRADE_NEW_VERSION=$NEW_VERSION" "sw-upgrade-$RUN_ID-$mode" python3 /opt/sw-driver/run_upgrade_container.py \
             --mode "$mode" --wheel "/opt/sw-old/serialwrap-$OLD_VERSION-py3-none-any.whl" --bundle /opt/sw-new --out /evidence \
             ${EXTRA_DRIVER_ARGS[@]+"${EXTRA_DRIVER_ARGS[@]}"}
     done
@@ -291,6 +291,7 @@ for mode in "${MODES[@]}"; do
     rc=0
     docker exec -e SW_HOST_UID="$(id -u)" -e SW_HOST_GID="$(id -g)" -e SW_UPGRADE_IMAGE="$IMAGE" \
         -e SW_UPGRADE_IMAGE_ID="$IMAGE_ID" -e SW_UPGRADE_DRIVER_REVISION="$SOURCE_REVISION" \
+        -e SW_UPGRADE_NEW_VERSION="$NEW_VERSION" \
         "$name" python3 /opt/sw-driver/run_upgrade_container.py \
         --mode "$mode" --wheel "/opt/sw-old/$(basename "$WHEEL")" --bundle /opt/sw-new --out /evidence \
         ${EXTRA_DRIVER_ARGS[@]+"${EXTRA_DRIVER_ARGS[@]}"} || rc=$?

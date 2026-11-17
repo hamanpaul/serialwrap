@@ -16,6 +16,7 @@ import pytest
 pytestmark = [pytest.mark.core_portable, pytest.mark.process_rpc]
 
 ROOT = Path(__file__).resolve().parents[1]
+CURRENT_VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
 TOOL = ROOT / "scripts" / "rust" / "contract_coverage.py"
 REV = {
     "contract_revision": "r",
@@ -1622,7 +1623,7 @@ def test_shared_coverage_package_import_merges_same_label_before_contract_judgem
     shared_api.get_current_head = lambda root=ROOT: head
     shared = tmp_path / "shared-evidence"
     bundle = shared / "candidate-bundle"
-    version_bin = bundle / "versions" / "0.4.1" / "bin"
+    version_bin = bundle / "versions" / CURRENT_VERSION / "bin"
     version_bin.mkdir(parents=True)
     cli_bytes = b"candidate Rust CLI"
     daemon_bytes = b"candidate Rust daemon"
@@ -1630,7 +1631,7 @@ def test_shared_coverage_package_import_merges_same_label_before_contract_judgem
     (version_bin / "serialwrapd").write_bytes(daemon_bytes)
     (version_bin.parent / "release-manifest.json").write_text(
         json.dumps({
-            "bundle_version": "0.4.1",
+            "bundle_version": CURRENT_VERSION,
             "stage": "rust-2",
             "target": "x86_64-unknown-linux-gnu",
             "git_revision": head,

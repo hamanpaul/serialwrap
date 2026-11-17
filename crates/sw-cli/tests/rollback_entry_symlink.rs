@@ -44,16 +44,16 @@ fn on_demand_rollback_spawns_through_symlink_entry() {
     let t = TestEnv::posix()
         .with_install_root()
         .with_installed("0.4.0")
-        .with_installed("0.4.1")
-        .with_current("0.4.1", Some("0.4.0"))
+        .with_installed(CURRENT_VERSION)
+        .with_current(CURRENT_VERSION, Some("0.4.0"))
         // CLI 自身的 bundle launcher（新版）：若 spawn 誤用它，argv[0] 會與穩定入口不同。
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("on-demand", false, false)
         .with_idle_daemon_default(4242)
         .with_new_daemon_reporting_version("0.4.0");
     t.with_previous_backup_mode("on-demand");
-    point_entry_at(&t, "serialwrap", "0.4.1");
-    point_entry_at(&t, "serialwrapd", "0.4.1");
+    point_entry_at(&t, "serialwrap", CURRENT_VERSION);
+    point_entry_at(&t, "serialwrapd", CURRENT_VERSION);
 
     let (rc, out, _) = t.run(&["setup", "--rollback"]);
     assert_eq!(rc, 0, "{out}");

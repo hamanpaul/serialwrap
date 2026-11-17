@@ -18,6 +18,8 @@ from uart_stdio_bridge.bridge.control import ControlClient
 
 OUT = pathlib.Path("/evidence")
 ROOT = pathlib.Path("/tmp/sw-t17")
+OLD_VERSION = "0.4.1"
+NEW_VERSION = (pathlib.Path(__file__).resolve().parents[2] / "VERSION").read_text(encoding="utf-8").strip()
 
 
 def _bundle_manifest_path(bundle: pathlib.Path, expected_version: str | None = None) -> pathlib.Path:
@@ -280,8 +282,8 @@ def _run_update_exit1(args: argparse.Namespace) -> int:
     old_cli = old_bundle / "bin" / "serialwrap"
     new_cli = new_bundle / "bin" / "serialwrap"
     old_daemon = (old_bundle / "bin" / "serialwrapd").resolve()
-    old_manifest = _bundle_manifest_path(old_bundle, "0.4.0")
-    new_manifest = _bundle_manifest_path(new_bundle, "0.4.1")
+    old_manifest = _bundle_manifest_path(old_bundle, OLD_VERSION)
+    new_manifest = _bundle_manifest_path(new_bundle, NEW_VERSION)
     evidence_root = runtime.host_evidence_root()
     scenario_root = ROOT / f"update-exit1-{run_id}"
     env: dict[str, str] | None = None
@@ -293,8 +295,8 @@ def _run_update_exit1(args: argparse.Namespace) -> int:
     failures: list[str] = []
     evidence: dict[str, Any] = {
         "scenario": "update-exit1",
-        "old_bundle_version": "0.4.0",
-        "new_bundle_version": "0.4.1",
+        "old_bundle_version": OLD_VERSION,
+        "new_bundle_version": NEW_VERSION,
         "product_exercised": ["serialwrap setup --user 初次安裝", "serialwrap setup --user 更新"],
         "harness_exercised": [
             "P2 bridge 假 UART holder PID 證據",
@@ -304,7 +306,7 @@ def _run_update_exit1(args: argparse.Namespace) -> int:
     try:
         if mode != "systemd-user":
             raise ValueError("update-exit1 僅支援 systemd-user")
-        for bundle, expected in ((old_bundle, "0.4.0"), (new_bundle, "0.4.1")):
+        for bundle, expected in ((old_bundle, OLD_VERSION), (new_bundle, NEW_VERSION)):
             manifest = json.loads(_bundle_manifest_path(bundle, expected).read_text(encoding="utf-8"))
             if manifest.get("bundle_version") != expected:
                 raise ValueError(f"bundle version 應為 {expected}：{bundle}")
@@ -468,8 +470,8 @@ def _run_update_exit1(args: argparse.Namespace) -> int:
                             failures.append(f"新版 daemon PID {new_pid} 未持有 bridge PTY：{_holder_pids(tty_path)}")
                         else:
                             _bridge_mark(control, "opened", new_pid)
-                        if status_result.returncode != 0 or status.get("version") != "0.4.1":
-                            failures.append(f"新版 daemon health version 未為 0.4.1：{status}")
+                        if status_result.returncode != 0 or status.get("version") != NEW_VERSION:
+                            failures.append(f"新版 daemon health version 未為 {NEW_VERSION}：{status}")
                         evidence["restart_policy_after_update"] = _show_value(mode, "Restart")
                         evidence["n_restarts_after_update"] = _show_value(mode, "NRestarts")
                         if evidence["restart_policy_after_update"] != "on-failure":
@@ -485,8 +487,8 @@ def _run_update_exit1(args: argparse.Namespace) -> int:
                         if current_path.is_file():
                             current = json.loads(current_path.read_text(encoding="utf-8"))
                             evidence["current_release_version"] = current.get("bundle_version")
-                            if evidence["current_release_version"] != "0.4.1":
-                                failures.append(f"current-release 版本不是 0.4.1：{current}")
+                            if evidence["current_release_version"] != NEW_VERSION:
+                                failures.append(f"current-release 版本不是 {NEW_VERSION}：{current}")
                         else:
                             failures.append(f"缺少 current-release.json：{current_path}")
 

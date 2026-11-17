@@ -34,9 +34,7 @@ RUN_UPGRADE = REPO / "scripts" / "docker" / "run-upgrade.sh"
 DOCKERFILE = REPO / "tools" / "docker" / "upgrade.Dockerfile"
 SYSTEMD_DOCKERFILE = REPO / "tools" / "docker" / "systemd.Dockerfile"
 UPGRADE_CONTAINER = REPO / "scripts" / "docker" / "run_upgrade_container.py"
-# 升級驗證的新版候選即目前版本：run-upgrade.sh 直接讀 VERSION（dry-run 測試以 `--version-override` 驗證輸出，
-# test_run_upgrade_reads_new_version_from_version_file 防止寫死）；容器 driver 在容器內執行、讀不到 VERSION，
-# 保留常數，由 test_upgrade_driver_new_version_matches_version_file 驗證等於 VERSION。
+# 升級驗證的新版候選即目前版本：host runner 與容器 driver 都使用 VERSION，driver 由 runner 傳入並由此測試核對。
 NEW_VERSION = (REPO / "VERSION").read_text(encoding="utf-8").strip()
 
 sys.path.insert(0, str(REPO))
@@ -363,7 +361,9 @@ def _row(driver: Any, check_id: str) -> dict[str, Any]:
     ("phase_seed", "seed_user_data", "0.3.2"),
     ("phase_upgrade_after_stop", "upgrade_after_stop", "0.3.2"),
     ("phase_install_sh", "old_daemon_stopped", "0.3.2"),
-    ("phase_downgrade", "downgrade_manual", NEW_VERSION),
+    # 保留凍結 lock 中舊參數 repr 的 nodeid；實際 cli 參數跟隨目前 VERSION。
+    pytest.param("phase_downgrade", "downgrade_manual", NEW_VERSION,
+                 id="phase_downgrade-downgrade_manual-0.4.1"),
     ("phase_reupgrade", "reupgrade", "0.3.2"),
 ])
 def test_driver_waits_for_old_daemon_exit_before_next_start(fake_driver, phase, check_id, cli):
@@ -385,7 +385,8 @@ def test_driver_waits_for_old_daemon_exit_before_next_start(fake_driver, phase, 
 @pytest.mark.parametrize("phase,check_id,cli", [
     ("phase_seed", "seed_user_data", "0.3.2"),
     ("phase_reupgrade", "reupgrade", "0.3.2"),
-    ("phase_downgrade", "downgrade_manual", NEW_VERSION),
+    pytest.param("phase_downgrade", "downgrade_manual", NEW_VERSION,
+                 id="phase_downgrade-downgrade_manual-0.4.1"),
 ])
 def test_driver_stop_wait_timeout_fails_and_is_recorded(fake_driver, phase, check_id, cli):
     """舊 daemon 在有界逾時內未結束：該步驟判 FAIL，detail 記錄殘留行程；seed 不得在逾時後硬起新 daemon。"""
@@ -922,6 +923,7 @@ def test_run_upgrade_dry_run_lists_both_modes_and_isolation(tmp_path):
     assert f"--release-bundle --profile release --version-override {NEW_VERSION}" in out
     assert "pip download --only-binary=:all:" in out
     assert "--network none" in out
+    assert f"SW_UPGRADE_NEW_VERSION={NEW_VERSION}" in out
     for mode in ("systemd-user", "on-demand"):
         assert f"--mode {mode}" in out, out
     assert "/dev/ttyUSB" not in out and "--device" not in out

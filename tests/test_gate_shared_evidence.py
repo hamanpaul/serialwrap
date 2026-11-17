@@ -15,6 +15,7 @@ import pytest
 pytestmark = [pytest.mark.core_portable, pytest.mark.process_rpc]
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+CURRENT_VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
 TOOL = ROOT / "scripts/rust/gate_shared_evidence.py"
 GATES = ("slice21", "s22", "p7", "slice24")
 GATE_SETS = {
@@ -512,7 +513,7 @@ def test_windows_native_pytest_l1_failure_is_preserved_as_fail(tmp_path):
 
 
 def _make_release_bundle(root: pathlib.Path, *, head: str, payload: str) -> pathlib.Path:
-    version_dir = root / "versions" / "0.4.1"
+    version_dir = root / "versions" / CURRENT_VERSION
     bin_dir = version_dir / "bin"
     bin_dir.mkdir(parents=True)
     cli_bytes = f"cli:{payload}\n".encode("utf-8")
@@ -521,7 +522,7 @@ def _make_release_bundle(root: pathlib.Path, *, head: str, payload: str) -> path
     (bin_dir / "serialwrapd").write_bytes(daemon_bytes)
     manifest = {
         "schema_version": 1,
-        "bundle_version": "0.4.1",
+        "bundle_version": CURRENT_VERSION,
         "stage": "rust-2",
         "target": "x86_64-unknown-linux-gnu",
         "git_revision": head,
@@ -558,7 +559,7 @@ def _s24_candidate_fixture(tmp_path: pathlib.Path, monkeypatch):
         path.write_text(name, encoding="utf-8")
         source_artifacts[name] = path
     for artifact_name, executable_name in (("release_cli", "serialwrap"), ("release_daemon", "serialwrapd")):
-        path = bundle / "versions" / "0.4.1" / "bin" / executable_name
+        path = bundle / "versions" / CURRENT_VERSION / "bin" / executable_name
         source_artifacts[artifact_name] = path
     api.init_manifest(shared, source_artifacts, head=head, clean=True, candidate_bundle=bundle)
     log = tmp_path / "s24.log"
@@ -797,14 +798,14 @@ def test_shared_artifact_init_and_import_preserve_executable_names(tmp_path, mon
     assert json.loads(cli_mismatch.stdout)["status"] == "EVIDENCE_MISSING"
 
     dev_bundle = _make_release_bundle(tmp_path / "dev-bundle", head=head, payload="dev")
-    dev_manifest = dev_bundle / "versions" / "0.4.1" / "release-manifest.json"
+    dev_manifest = dev_bundle / "versions" / CURRENT_VERSION / "release-manifest.json"
     dev_info = json.loads(dev_manifest.read_text(encoding="utf-8"))
     dev_info["stage"] = "rust-2-dev"
     dev_manifest.write_text(json.dumps(dev_info, sort_keys=True), encoding="utf-8")
     dev_rejected = api.check_candidate_bundle(shared, candidate_bundle=dev_bundle)
     assert dev_rejected["status"] == "EVIDENCE_MISSING", dev_rejected
 
-    (bundle / "versions" / "0.4.1" / "bin" / "serialwrapd").write_text("tampered\\n", encoding="utf-8")
+    (bundle / "versions" / CURRENT_VERSION / "bin" / "serialwrapd").write_text("tampered\\n", encoding="utf-8")
     tampered = api.validate_section(
         shared, gate="slice24", section="s24_ab", required_set=None, platform="linux",
         expected_artifacts=artifacts, current_head=head, worktree_clean=True, expected_command="s24_ab",
@@ -830,7 +831,7 @@ def test_cargo_results_and_s24_ab_use_the_same_candidate_bundle_sha256(tmp_path,
     assert cli_assignment in s24_block
     assert daemon_assignment in s24_block
 
-    version_root = bundle / "versions/0.4.1"
+    version_root = bundle / "versions" / CURRENT_VERSION
     env = os.environ.copy()
     env.update({
         "S24_BUNDLE_VERSION_ROOT": str(version_root),
@@ -873,7 +874,7 @@ def test_cargo_results_and_s24_ab_use_the_same_candidate_bundle_sha256(tmp_path,
 
 def test_s24_bundle_check_failure_is_recorded_missing_and_does_not_skip_windows_l1(tmp_path, monkeypatch):
     api, shared, bundle, artifacts, head = _s24_candidate_fixture(tmp_path / "s24", monkeypatch)
-    daemon = bundle / "versions/0.4.1/bin/serialwrapd"
+    daemon = bundle / "versions" / CURRENT_VERSION / "bin" / "serialwrapd"
     daemon.write_bytes(b"tampered after the S24 test\n")
     checked = api.check_candidate_bundle(shared, current_head=head)
     assert checked["status"] == "EVIDENCE_MISSING", checked
@@ -972,7 +973,7 @@ run_capture() { local log="$1"; shift; set +e; "$@" 2>&1 | tee "$log"; local sta
             "SW_TEST_LOG_DIR": str(log_dir),
             "SW_TEST_WINDOWS_L1": str(windows_l1),
             "SW_TEST_BUNDLE": str(run_root / "candidate-bundle"),
-            "SW_TEST_VERSION_ROOT": str(run_root / "candidate-bundle/versions/0.4.1"),
+            "SW_TEST_VERSION_ROOT": str(run_root / "candidate-bundle" / "versions" / CURRENT_VERSION),
         })
         proc = subprocess.run(["bash", str(harness)], cwd=ROOT, env=env,
                               capture_output=True, text=True, check=False)

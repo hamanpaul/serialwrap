@@ -28,6 +28,10 @@ fn sys_ep(t: &TestEnv) -> String {
     t.default_socket()
 }
 
+fn health_status(pid: u32, version: &str, wal_healthy: bool) -> String {
+    format!(r#"{{"ok":true,"pid":{pid},"version":"{version}","wal":{{"healthy":{wal_healthy}}}}}"#)
+}
+
 fn assert_back_to_original(t: &TestEnv, cfg0: &[u8], cur0: &[u8]) {
     assert_eq!(
         std::fs::read(t.root().current_file).unwrap(),
@@ -208,7 +212,7 @@ fn update_refuses_while_file_transfer_in_progress() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
         .with_rpc_ok(TestEnv::win_endpoint(), "mcu.status", "{\"flashing\":false,\"ok\":true}")
         .with_rpc_ok(
@@ -232,7 +236,7 @@ fn update_safety_probe_timeout_refuses() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
         .with_rpc_ok(TestEnv::win_endpoint(), "mcu.status", "{\"flashing\":false,\"ok\":true}")
         .with_rpc_recv_timeout(TestEnv::win_endpoint(), "session.list");
@@ -253,7 +257,7 @@ fn update_force_does_not_override_flashing() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
         .with_rpc_ok(TestEnv::win_endpoint(), "mcu.status", "{\"flashing\":true,\"ok\":true}")
         .with_rpc_ok(
@@ -278,8 +282,8 @@ fn rollback_force_does_not_override_flashing() {
         .with_supervisor_state("windows-task", false, false)
         .with_install_root()
         .with_installed("0.4.0")
-        .with_installed("0.4.1")
-        .with_current("0.4.1", Some("0.4.0"))
+        .with_installed(CURRENT_VERSION)
+        .with_current(CURRENT_VERSION, Some("0.4.0"))
         .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
         .with_rpc_ok(TestEnv::win_endpoint(), "mcu.status", "{\"flashing\":true,\"ok\":true}")
         .with_rpc_ok(
@@ -289,7 +293,13 @@ fn rollback_force_does_not_override_flashing() {
         );
     let (rc, out, _) = t.run(&["setup", "--rollback", "--force"]);
     assert_eq!(rc, 2);
-    assert_refused_untouched(&t, &json(&out), "rollback", "FLASHING_BUSY", "0.4.1");
+    assert_refused_untouched(
+        &t,
+        &json(&out),
+        "rollback",
+        "FLASHING_BUSY",
+        CURRENT_VERSION,
+    );
 }
 
 #[test]
@@ -299,7 +309,7 @@ fn update_force_does_not_override_file_transfer() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
         .with_rpc_ok(TestEnv::win_endpoint(), "mcu.status", "{\"flashing\":false,\"ok\":true}")
         .with_rpc_ok(
@@ -320,8 +330,8 @@ fn rollback_force_does_not_override_file_transfer() {
         .with_supervisor_state("windows-task", false, false)
         .with_install_root()
         .with_installed("0.4.0")
-        .with_installed("0.4.1")
-        .with_current("0.4.1", Some("0.4.0"))
+        .with_installed(CURRENT_VERSION)
+        .with_current(CURRENT_VERSION, Some("0.4.0"))
         .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
         .with_rpc_ok(TestEnv::win_endpoint(), "mcu.status", "{\"flashing\":false,\"ok\":true}")
         .with_rpc_ok(
@@ -331,7 +341,7 @@ fn rollback_force_does_not_override_file_transfer() {
         );
     let (rc, out, _) = t.run(&["setup", "--rollback", "--force"]);
     assert_eq!(rc, 2);
-    assert_refused_untouched(&t, &json(&out), "rollback", "SESSION_BUSY", "0.4.1");
+    assert_refused_untouched(&t, &json(&out), "rollback", "SESSION_BUSY", CURRENT_VERSION);
 }
 
 #[test]
@@ -341,7 +351,7 @@ fn update_file_push_after_last_probe() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
         .with_rpc_ok(TestEnv::win_endpoint(), "mcu.status", "{\"flashing\":false,\"ok\":true}")
@@ -366,8 +376,8 @@ fn update_flash_races_prepare() {
         .with_supervisor_state("windows-task", true, true)
         .with_install_root()
         .with_installed("0.4.0")
-        .with_installed("0.4.1")
-        .with_current("0.4.1", Some("0.4.0"))
+        .with_installed(CURRENT_VERSION)
+        .with_current(CURRENT_VERSION, Some("0.4.0"))
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
         .with_rpc_ok(TestEnv::win_endpoint(), "mcu.status", "{\"flashing\":false,\"ok\":true}")
@@ -380,7 +390,7 @@ fn update_flash_races_prepare() {
     let (rc, out, _) = t.run(&["setup", "--rollback", "--force"]);
     assert_eq!(rc, 2, "{out}");
     let j = json(&out);
-    assert_handoff_refused(&t, &j, "rollback", "FLASHING_BUSY", "0.4.1");
+    assert_handoff_refused(&t, &j, "rollback", "FLASHING_BUSY", CURRENT_VERSION);
     assert_eq!(rpc_params(&t, "daemon.handoff_stop")["reason"], "rollback");
 }
 
@@ -391,7 +401,7 @@ fn update_handoff_unsupported_daemon_refuses_without_stop() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
         .with_rpc_ok(TestEnv::win_endpoint(), "mcu.status", "{\"flashing\":false,\"ok\":true}")
@@ -429,7 +439,7 @@ fn pairing_failure_after_switch_reverts_to_complete_previous() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_new_daemon_reporting_version("0.4.0");
     let (rc, out, _) = t.run_from_bundle(&["setup"]);
     assert_eq!(rc, 2, "{out}");
@@ -455,7 +465,7 @@ fn revert_rehands_daemon_that_appears_after_registration_restore() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_systemd(true)
         .with_var("USER", "alice")
         .with_supervisor_state("systemd-user", true, true)
@@ -493,7 +503,7 @@ fn journal_persists_original_snapshot_before_disable() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_crash_at("stop_supervisor:before_effect");
@@ -542,7 +552,7 @@ fn journal_recovery_rejects_missing_or_mismatched_snapshot_without_side_effects(
             .with_install_root()
             .with_installed("0.4.0")
             .with_current("0.4.0", None)
-            .with_bundle("0.4.1")
+            .with_bundle(CURRENT_VERSION)
             .with_supervisor_state("windows-task", true, true)
             .with_idle_daemon(TestEnv::win_endpoint(), 4242)
             .with_crash_at("stop_supervisor:before_effect");
@@ -577,10 +587,10 @@ fn journal_recovery_restarts_original_on_demand_daemon_after_stop() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_config("supervision_mode: on-demand\n")
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
-        .with_new_daemon_reporting_version("0.4.1")
+        .with_new_daemon_reporting_version(CURRENT_VERSION)
         .with_rpc_after_relaunch("health.status", "{\"ok\":true,\"pid\":5252,\"version\":\"0.4.0\",\"wal\":{\"healthy\":true}}")
         .with_crash_at("confirm_released:after_effect");
     let (cfg0, cur0) = (t.config_bytes(), std::fs::read(t.root().current_file).unwrap());
@@ -616,7 +626,7 @@ fn journal_recovery_restores_original_enabled_and_running_windows_task() {
             .with_install_root()
             .with_installed("0.4.0")
         .with_current("0.4.0", None)
-            .with_bundle("0.4.1")
+            .with_bundle(CURRENT_VERSION)
             .with_supervisor_state("windows-task", enabled, running);
         if running {
             t = t.with_idle_daemon(TestEnv::win_endpoint(), 4242);
@@ -662,7 +672,7 @@ fn journal_recovery_backup_started_never_uses_partial_backup() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_crash_at("backup_started:after_config_copy");
@@ -702,7 +712,7 @@ fn switch_never_starts_before_backup_committed() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_crash_at("entries_switching:before_effect");
@@ -726,7 +736,7 @@ fn journal_recovery_with_unverifiable_backup_keeps_journal() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_crash_at("entries_switching:after_first_rename");
@@ -768,10 +778,10 @@ fn journal_recovery_failure_keeps_journal_and_skips_op() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_config("supervision_mode: on-demand\n")
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
-        .with_new_daemon_reporting_version("0.4.1")
+        .with_new_daemon_reporting_version(CURRENT_VERSION)
         .with_crash_at("confirm_released:after_effect");
     assert_eq!(t.run_from_bundle(&["setup"]).0, 137);
     let j0 = t.journal_bytes().unwrap();
@@ -813,7 +823,7 @@ fn revert_refuses_while_new_daemon_pushing() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_new_daemon_reporting_version("0.4.0")
@@ -866,7 +876,7 @@ fn revert_refuses_while_new_daemon_pushing() {
             < o.index_of_nth("service:release_autostart:true", 1),
         "拒絕後撤銷 autostart hold 並還原 enabled"
     );
-    assert_revert_deferred_untouched(&t, None, "0.4.1");
+    assert_revert_deferred_untouched(&t, None, CURRENT_VERSION);
     assert_eq!(
         t.journal_json().unwrap()["step"],
         "start_and_verify",
@@ -904,10 +914,10 @@ fn journal_recovery_refuses_while_new_daemon_flashing() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
-        .with_new_daemon_reporting_version("0.4.1")
+        .with_new_daemon_reporting_version(CURRENT_VERSION)
         .with_crash_at("start_and_verify:after_effect");
     let (cfg0, cur0) = (t.config_bytes(), std::fs::read(t.root().current_file).unwrap());
     assert_eq!(t.run_from_bundle(&["setup"]).0, 137);
@@ -939,7 +949,7 @@ fn journal_recovery_refuses_while_new_daemon_flashing() {
         rpc_params_nth(&t, "daemon.handoff_stop", h0)["reason"],
         "revert"
     );
-    assert_revert_deferred_untouched(&t, Some(&j0), "0.4.1");
+    assert_revert_deferred_untouched(&t, Some(&j0), CURRENT_VERSION);
     let (rc, out, _) = t.run_from_bundle(&["setup"]);
     assert_eq!(rc, 2);
     let o = json(&out);
@@ -956,7 +966,7 @@ fn journal_recovery_refuses_while_new_daemon_flashing() {
     );
     assert_eq!(o["recovered_journal"]["detail"]["handoff"], "refused");
     assert!(o.get("update").is_none(), "復原未完成不得繼續本次 update");
-    assert_revert_deferred_untouched(&t, Some(&j0), "0.4.1");
+    assert_revert_deferred_untouched(&t, Some(&j0), CURRENT_VERSION);
     let rec = t.recover().unwrap();
     assert!(rec.ok, "{:?}", rec.reason);
     assert!(methods(&t).iter().all(|m| m != "daemon.stop"));
@@ -976,10 +986,10 @@ fn update_interrupt_injection_every_point_recovers_to_previous() {
             .with_install_root()
             .with_installed("0.4.0")
         .with_current("0.4.0", None)
-            .with_bundle("0.4.1")
+            .with_bundle(CURRENT_VERSION)
             .with_supervisor_state("windows-task", true, true)
             .with_idle_daemon(TestEnv::win_endpoint(), 4242)
-            .with_new_daemon_reporting_version("0.4.1")
+            .with_new_daemon_reporting_version(CURRENT_VERSION)
             .with_crash_at(point);
         let t = if point.starts_with("revert_to_previous:") {
             t.with_new_daemon_reporting_version("0.4.0")
@@ -991,9 +1001,10 @@ fn update_interrupt_injection_every_point_recovers_to_previous() {
         let mut t = t;
         t.clear_crash();
         let t = t.with_new_daemon_reporting_version("0.4.0");
+        let current_status = health_status(5252, CURRENT_VERSION, true);
         let t = if *point == "start_and_verify:after_effect" || *point == "start_and_verify:started" {
             t.with_rpc_after_relaunch_seq("health.status", &[
-                "{\"ok\":true,\"pid\":5252,\"version\":\"0.4.1\",\"wal\":{\"healthy\":true}}",
+                current_status.as_str(),
                 "{\"ok\":true,\"pid\":5252,\"version\":\"0.4.0\",\"wal\":{\"healthy\":true}}",
             ])
         } else {
@@ -1066,18 +1077,18 @@ fn update_systemd_exit1_after_handoff_not_relaunched() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_systemd(true)
         .with_var("USER", "alice")
         .with_supervisor_state("systemd-user", true, true)
         .with_idle_daemon_default(4242)
         .with_restart_on_failure()
         .with_daemon_exit_code_after_handoff(1)
-        .with_new_daemon_reporting_version("0.4.1")
+        .with_new_daemon_reporting_version(CURRENT_VERSION)
         .with_gone_handoff_event();
     let (rc, out, _) = t.run_from_bundle(&["setup", "--user"]);
     assert_eq!(rc, 0, "{out}");
-    assert_eq!(json(&out)["update"]["to_version"], "0.4.1");
+    assert_eq!(json(&out)["update"]["to_version"], CURRENT_VERSION);
     let o = t.event_order();
     assert!(
         o.index_of("journal:stop_supervisor")
@@ -1133,7 +1144,7 @@ fn update_systemd_exit1_after_handoff_not_relaunched() {
             .unwrap()
             .unwrap()
             .bundle_version,
-        "0.4.1"
+        CURRENT_VERSION
     );
 }
 
@@ -1143,12 +1154,12 @@ fn update_windows_task_exit1_after_handoff_not_relaunched() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_restart_on_failure()
         .with_daemon_exit_code_after_handoff(1)
-        .with_new_daemon_reporting_version("0.4.1");
+        .with_new_daemon_reporting_version(CURRENT_VERSION);
     let (rc, out, _) = t.run_from_bundle(&["setup"]);
     assert_eq!(rc, 0, "{out}");
     let o = t.event_order();
@@ -1172,7 +1183,7 @@ fn update_relaunched_instance_during_backup_rehandoff_refuses_flash() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_config("supervision_mode: on-demand\n")
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_instance_appears_at("backup_started:after_config_copy", 5151, &["flash"]);
@@ -1217,7 +1228,7 @@ fn journal_recovery_releases_persistent_systemd_hold() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_systemd(true)
         .with_var("USER", "alice")
         .with_supervisor_state("systemd-user", true, true)
@@ -1263,10 +1274,10 @@ fn update_happy_path_steps_in_order() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
-        .with_new_daemon_reporting_version("0.4.1");
+        .with_new_daemon_reporting_version(CURRENT_VERSION);
     let (rc, out, _) = t.run_from_bundle(&["setup"]);
     assert_eq!(rc, 0, "{out}");
     let j = json(&out);
@@ -1288,7 +1299,7 @@ fn update_happy_path_steps_in_order() {
             "start_and_verify"
         ]
     );
-    assert_eq!(j["update"]["to_version"], "0.4.1");
+    assert_eq!(j["update"]["to_version"], CURRENT_VERSION);
     assert!(t.journal_json().is_none());
 }
 
@@ -1299,7 +1310,7 @@ fn update_lock_contention_no_side_effects() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_install_lock_holder();
     let (rc, out, _) = t.run_from_bundle(&["setup"]);
     assert_eq!(rc, 2);
@@ -1314,7 +1325,7 @@ fn update_lock_contention_does_not_recover_residual_journal() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_crash_at("lock:after_effect");
     assert_eq!(t.run_from_bundle(&["setup"]).0, 137);
     let journal_before = t.journal_bytes().expect("中斷後應保留 journal");
@@ -1335,7 +1346,7 @@ fn update_journal_persists_systemd_hold_plan_before_hold_side_effect() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_idle_daemon_default(4242)
         .with_supervisor_state("systemd-user", true, true)
         .with_command(
@@ -1363,7 +1374,7 @@ fn update_verify_failed_no_side_effects() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1");
+        .with_bundle(CURRENT_VERSION);
     t.write_file(&t.bundle_dir().join("bin").join("serialwrap"), b"tampered\n");
     let (rc, out, _) = t.run_from_bundle(&["setup"]);
     assert_eq!(rc, 2);
@@ -1373,7 +1384,7 @@ fn update_verify_failed_no_side_effects() {
         ("CHECKSUM_VERIFY_FAILED", "update_verify")
     );
     assert!(t.rpc().requests().is_empty());
-    assert!(!t.root().versions.join("0.4.1").exists());
+    assert!(!t.root().versions.join(CURRENT_VERSION).exists());
 }
 
 #[test]
@@ -1383,7 +1394,7 @@ fn update_refuses_incompatible_state_schema() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1");
+        .with_bundle(CURRENT_VERSION);
     let manifest_path = t.bundle_dir().join("release-manifest.json");
     let manifest = std::fs::read_to_string(&manifest_path)
         .unwrap()
@@ -1406,7 +1417,7 @@ fn update_flashing_busy() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
         .with_rpc_ok(TestEnv::win_endpoint(), "mcu.status", "{\"flashing\":true,\"ok\":true}")
         .with_rpc_ok(
@@ -1434,7 +1445,7 @@ fn update_busy_background_command() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
         .with_rpc_ok(TestEnv::win_endpoint(), "mcu.status", "{\"flashing\":false,\"ok\":true}")
         .with_rpc_ok(
@@ -1457,7 +1468,7 @@ fn update_busy_interactive_lease() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
         .with_rpc_ok(TestEnv::win_endpoint(), "mcu.status", "{\"flashing\":false,\"ok\":true}")
         .with_rpc_ok(
@@ -1480,7 +1491,7 @@ fn update_busy_recovering() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
         .with_rpc_ok(TestEnv::win_endpoint(), "mcu.status", "{\"flashing\":false,\"ok\":true}")
         .with_rpc_ok(
@@ -1503,7 +1514,7 @@ fn update_safety_malformed_session_list_refuses() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
         .with_rpc_ok(TestEnv::win_endpoint(), "mcu.status", "{\"flashing\":false,\"ok\":true}")
         .with_rpc_ok(TestEnv::win_endpoint(), "session.list", "{\"ok\":true}");
@@ -1523,7 +1534,7 @@ fn update_busy_appears_after_disable_aborts() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
@@ -1555,7 +1566,7 @@ fn update_handoff_recv_timeout_no_hard_stop() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
@@ -1585,7 +1596,7 @@ fn update_handoff_malformed_grant_refuses() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
         .with_rpc_ok(TestEnv::win_endpoint(), "mcu.status", "{\"flashing\":false,\"ok\":true}")
@@ -1607,10 +1618,10 @@ fn update_never_sends_plain_daemon_stop() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
-        .with_new_daemon_reporting_version("0.4.1");
+        .with_new_daemon_reporting_version(CURRENT_VERSION);
     let (rc, out, _) = t.run_from_bundle(&["setup"]);
     assert_eq!(rc, 0, "{out}");
     assert!(methods(&t).iter().all(|m| m != "daemon.stop"));
@@ -1631,7 +1642,7 @@ fn update_rpc_down_child_holds_com_blocks() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_rpc_refused(TestEnv::win_endpoint())
         .with_procs(vec![DaemonProc::win(4242, TestEnv::win_endpoint())]);
     let (rc, out, _) = t.run_from_bundle(&["setup"]);
@@ -1650,7 +1661,7 @@ fn update_identity_unknown_blocks() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
         .with_rpc_ok(TestEnv::win_endpoint(), "mcu.status", "{\"ok\":true,\"flashing\":false}")
         .with_rpc_ok(TestEnv::win_endpoint(), "session.list", IDLE_LIST);
@@ -1674,7 +1685,7 @@ fn update_force_does_not_override_interactive_or_recovering() {
             .with_install_root()
             .with_installed("0.4.0")
         .with_current("0.4.0", None)
-            .with_bundle("0.4.1")
+            .with_bundle(CURRENT_VERSION)
             .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
             .with_rpc_ok(TestEnv::win_endpoint(), "mcu.status", "{\"flashing\":false,\"ok\":true}")
             .with_rpc_ok(
@@ -1702,7 +1713,7 @@ fn update_force_does_not_skip_identity_or_probe() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
         .with_rpc_ok(TestEnv::win_endpoint(), "mcu.status", "{\"ok\":true,\"flashing\":false}")
         .with_rpc_ok(TestEnv::win_endpoint(), "session.list", IDLE_LIST);
@@ -1715,7 +1726,7 @@ fn update_force_does_not_skip_identity_or_probe() {
         .with_supervisor_state("windows-task", false, false)
         .with_install_root()
         .with_installed("0.4.0")
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
         .with_rpc_ok(TestEnv::win_endpoint(), "mcu.status", "{\"ok\":true,\"flashing\":false}")
         .with_rpc_recv_timeout(TestEnv::win_endpoint(), "session.list");
@@ -1731,7 +1742,7 @@ fn update_force_recheck_after_disable_still_aborts() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_rpc_ok(TestEnv::win_endpoint(), "health.ping", "{\"ok\":true}")
@@ -1756,20 +1767,20 @@ fn update_force_idle_same_result_as_without() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
-        .with_new_daemon_reporting_version("0.4.1");
+        .with_new_daemon_reporting_version(CURRENT_VERSION);
     let (_, out1, _) = t1.run_from_bundle(&["setup"]);
 
     let t2 = TestEnv::windows()
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
-        .with_new_daemon_reporting_version("0.4.1");
+        .with_new_daemon_reporting_version(CURRENT_VERSION);
     let (_, out2, _) = t2.run_from_bundle(&["setup", "--force"]);
 
     let j1 = json(&out1);
@@ -1792,10 +1803,10 @@ fn update_windows_task_graceful_before_switch() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
-        .with_new_daemon_reporting_version("0.4.1");
+        .with_new_daemon_reporting_version(CURRENT_VERSION);
     let (rc, _, _) = t.run_from_bundle(&["setup"]);
     assert_eq!(rc, 0);
     let o = t.event_order();
@@ -1810,7 +1821,7 @@ fn update_old_daemon_never_exits_aborts_without_switch() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_daemon_alive_forever(TestEnv::win_endpoint(), 4242);
     let (rc, out, _) = t.run_from_bundle(&["setup"]);
@@ -1838,12 +1849,12 @@ fn update_tty_still_held_posix_aborts() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_systemd(true)
         .with_var("USER", "alice")
         .with_supervisor_state("systemd-user", true, true)
         .with_idle_daemon_default(4242)
-        .with_new_daemon_reporting_version("0.4.1")
+        .with_new_daemon_reporting_version(CURRENT_VERSION)
         .with_rpc_ok(&endpoint, "session.list", "{\"ok\":true,\"sessions\":[{\"com\":\"COM0\",\"state\":\"READY\",\"attached_real_path\":\"/isolated/test-tty\",\"foreground_busy\":false,\"outstanding_commands\":0,\"interactive_session_id\":null,\"recovering\":false}]}")
         .with_rpc_after_relaunch("session.list", "{\"ok\":true,\"sessions\":[{\"com\":\"COM0\",\"state\":\"READY\",\"attached_real_path\":\"/isolated/test-tty\",\"foreground_busy\":false,\"outstanding_commands\":0,\"interactive_session_id\":null,\"recovering\":false}]}");
     t.procs().set_serialwrapd_tty_holders(&[4242]);
@@ -1866,7 +1877,7 @@ fn s1mx6b2_real_systemd_update_hold_recovers_only_owned_dropin() {
             .with_install_root()
             .with_installed("0.4.0")
             .with_current("0.4.0", None)
-            .with_bundle("0.4.1")
+            .with_bundle(CURRENT_VERSION)
             .with_config("supervision_mode: systemd-user\n")
             .with_var("USER", "alice");
         let xdg = base.home().with_file_name("xdg-config");
@@ -2011,12 +2022,12 @@ fn s1mx6_unit_snapshot_restore_ignores_xdg() {
             .with_install_root()
             .with_installed("0.4.0")
             .with_current("0.4.0", None)
-            .with_bundle("0.4.1")
+            .with_bundle(CURRENT_VERSION)
             .with_systemd(true)
             .with_var("USER", "alice")
             .with_supervisor_state("systemd-user", true, true)
             .with_idle_daemon_default(4242)
-            .with_new_daemon_reporting_version("0.4.1")
+            .with_new_daemon_reporting_version(CURRENT_VERSION)
             .with_rpc_after_relaunch("health.status", "{\"ok\":false}");
         let home_unit = t.home().join(".config/systemd/user/serialwrap.service");
         let xdg_unit = xdg.join("systemd/user/serialwrap.service");
@@ -2070,10 +2081,10 @@ fn update_backup_contains_required_files() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
-        .with_new_daemon_reporting_version("0.4.1");
+        .with_new_daemon_reporting_version(CURRENT_VERSION);
     t.write_file(&t.state_dir().join("state.json"), b"{}\n");
     t.write_file(&t.state_dir().join("benches.state.json"), b"{}\n");
     t.write_file(&t.config_dir().join("profiles").join("default.yaml"), b"defaults: {}\n");
@@ -2102,10 +2113,10 @@ fn update_version_ok_but_health_fails_reverts() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
-        .with_new_daemon_reporting_version("0.4.1")
+        .with_new_daemon_reporting_version(CURRENT_VERSION)
         .with_rpc_after_relaunch("health.status", "{\"ok\":false}");
     let (rc, out, _) = t.run_from_bundle(&["setup"]);
     assert_eq!(rc, 2);
@@ -2123,11 +2134,14 @@ fn update_wal_unhealthy_reverts() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
-        .with_new_daemon_reporting_version("0.4.1")
-        .with_rpc_after_relaunch("health.status", "{\"ok\":true,\"pid\":5252,\"version\":\"0.4.1\",\"wal\":{\"healthy\":false}}");
+        .with_new_daemon_reporting_version(CURRENT_VERSION)
+        .with_rpc_after_relaunch(
+            "health.status",
+            &health_status(5252, CURRENT_VERSION, false),
+        );
     let (rc, out, _) = t.run_from_bundle(&["setup"]);
     assert_eq!(rc, 2, "{out}");
     let j = json(&out);
@@ -2141,7 +2155,7 @@ fn update_revert_keeps_journal_when_previous_tty_holder_remains() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_rpc_ok(
@@ -2149,7 +2163,7 @@ fn update_revert_keeps_journal_when_previous_tty_holder_remains() {
             "session.list",
             "{\"ok\":true,\"sessions\":[{\"com\":\"COM0\",\"state\":\"READY\",\"attached_real_path\":\"COM20\",\"foreground_busy\":false,\"outstanding_commands\":0,\"interactive_session_id\":null,\"recovering\":false}]}",
         )
-        .with_new_daemon_reporting_version("0.4.1")
+        .with_new_daemon_reporting_version(CURRENT_VERSION)
         .with_rpc_after_relaunch("health.status", "{\"ok\":false}");
     t.procs().holders_script(vec![
         (Vec::new(), sw_pal::proc_scan::HolderScanStatus::Ok),
@@ -2168,7 +2182,7 @@ fn update_revert_keeps_journal_when_previous_tty_holder_remains() {
     assert_eq!(s(revert_error, "phase"), "update_confirm_released", "{out}");
     assert_eq!(revert_error["pids"], json("[8888]"));
     let current = std::fs::read_to_string(&t.root().current_file).expect("current-release.json 應保留");
-    assert_eq!(s(&json(&current), "bundle_version"), "0.4.1");
+    assert_eq!(s(&json(&current), "bundle_version"), CURRENT_VERSION);
     let journal = t.journal_json().expect("失敗回退需保留 journal");
     assert_eq!(s(&journal, "step"), "start_and_verify");
 }
@@ -2179,11 +2193,11 @@ fn update_released_session_auto_attached_reverts() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_rpc_ok(TestEnv::win_endpoint(), "session.list", "{\"ok\":true,\"sessions\":[{\"com\":\"COM1\",\"state\":\"RELEASED\",\"foreground_busy\":false,\"outstanding_commands\":0,\"interactive_session_id\":null,\"recovering\":false}]}")
-        .with_new_daemon_reporting_version("0.4.1")
+        .with_new_daemon_reporting_version(CURRENT_VERSION)
         .with_rpc_after_relaunch(
             "session.list",
             "{\"ok\":true,\"sessions\":[{\"com\":\"COM1\",\"state\":\"READY\",\"foreground_busy\":false,\"outstanding_commands\":0,\"interactive_session_id\":null,\"recovering\":false}]}",
@@ -2202,11 +2216,11 @@ fn update_accepts_ready_and_released_sessions_together() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_rpc_ok(TestEnv::win_endpoint(), "session.list", "{\"ok\":true,\"sessions\":[{\"com\":\"COM0\",\"state\":\"READY\",\"attached_real_path\":\"COM20\",\"foreground_busy\":false,\"outstanding_commands\":0,\"interactive_session_id\":null,\"recovering\":false},{\"com\":\"COM1\",\"state\":\"RELEASED\",\"foreground_busy\":false,\"outstanding_commands\":0,\"interactive_session_id\":null,\"recovering\":false}]}")
-        .with_new_daemon_reporting_version("0.4.1")
+        .with_new_daemon_reporting_version(CURRENT_VERSION)
         .with_rpc_after_relaunch("session.list", "{\"ok\":true,\"sessions\":[{\"com\":\"COM0\",\"state\":\"READY\",\"foreground_busy\":false,\"outstanding_commands\":0,\"interactive_session_id\":null,\"recovering\":false},{\"com\":\"COM1\",\"state\":\"RELEASED\",\"foreground_busy\":false,\"outstanding_commands\":0,\"interactive_session_id\":null,\"recovering\":false}]}");
     t.write_file(&t.state_dir().join("state.json"), b"{\"released\":{\"COM1\":{\"released_by\":\"test\"}}}\n");
     t.procs().holders(Vec::new(), sw_pal::proc_scan::HolderScanStatus::Unsupported);
@@ -2226,10 +2240,10 @@ fn update_smoke_failure_reverts() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
-        .with_new_daemon_reporting_version("0.4.1")
+        .with_new_daemon_reporting_version(CURRENT_VERSION)
         .with_rpc_after_relaunch("device.list", "{\"ok\":false}");
     let (rc, out, _) = t.run_from_bundle(&["setup"]);
     assert_eq!(rc, 2, "{out}");
@@ -2244,12 +2258,12 @@ fn update_materializes_assets_preserving_profiles() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_systemd(true)
         .with_var("USER", "alice")
         .with_supervisor_state("systemd-user", true, true)
         .with_idle_daemon_default(4242)
-        .with_new_daemon_reporting_version("0.4.1");
+        .with_new_daemon_reporting_version(CURRENT_VERSION);
     let user_profile = b"custom: profile\n";
     t.write_file(&t.config_dir().join("profiles").join("default.yaml"), user_profile);
     let skill = t.home().join(".local/share/serialwrap/skill/SKILL.md");
@@ -2259,7 +2273,7 @@ fn update_materializes_assets_preserving_profiles() {
     let config_before = t.config_bytes();
     let (rc, out, _) = t.run_from_bundle(&["setup"]);
     assert_eq!(rc, 0);
-    assert_eq!(json(&out)["update"]["to_version"], "0.4.1");
+    assert_eq!(json(&out)["update"]["to_version"], CURRENT_VERSION);
     assert_eq!(
         std::fs::read(t.config_dir().join("profiles").join("default.yaml")).unwrap(),
         user_profile,
@@ -2280,18 +2294,19 @@ fn update_materializes_assets_preserving_profiles() {
 
 #[test]
 fn journal_recovery_after_crash_mid_switch() {
+    let current_status = health_status(5252, CURRENT_VERSION, true);
     let t = TestEnv::windows()
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
-        .with_new_daemon_reporting_version("0.4.1")
+        .with_new_daemon_reporting_version(CURRENT_VERSION)
         .with_rpc_after_relaunch_seq("health.status", &[
             "{\"ok\":true,\"pid\":5252,\"version\":\"0.4.0\",\"wal\":{\"healthy\":true}}",
-            "{\"ok\":true,\"pid\":5252,\"version\":\"0.4.1\",\"wal\":{\"healthy\":true}}",
-            "{\"ok\":true,\"pid\":5252,\"version\":\"0.4.1\",\"wal\":{\"healthy\":true}}",
+            current_status.as_str(),
+            current_status.as_str(),
         ])
         .with_crash_at("entries_switching:after_first_rename");
     assert_eq!(t.run_from_bundle(&["setup"]).0, 137);
@@ -2312,7 +2327,7 @@ fn journal_recovery_keeps_journal_when_tty_holder_remains() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_rpc_ok(TestEnv::win_endpoint(), "session.list", "{\"ok\":true,\"sessions\":[{\"com\":\"COM0\",\"state\":\"READY\",\"attached_real_path\":\"COM20\",\"foreground_busy\":false,\"outstanding_commands\":0,\"interactive_session_id\":null,\"recovering\":false}]}")
@@ -2340,7 +2355,7 @@ fn journal_write_failure_aborts_before_effect() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_fs_fault_replace_suffix("install-journal.json");
     let (rc, out, _) = t.run_from_bundle(&["setup"]);
     assert_eq!(rc, 2);
@@ -2358,8 +2373,8 @@ fn rollback_keeps_current_state_same_schema() {
     let t = TestEnv::windows()
         .with_install_root()
         .with_installed("0.4.0")
-        .with_installed("0.4.1")
-        .with_current("0.4.1", Some("0.4.0"))
+        .with_installed(CURRENT_VERSION)
+        .with_current(CURRENT_VERSION, Some("0.4.0"))
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_new_daemon_reporting_version("0.4.0");
@@ -2383,15 +2398,15 @@ fn update_release_then_rollback_keeps_released() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
-        .with_new_daemon_reporting_version("0.4.1");
+        .with_new_daemon_reporting_version(CURRENT_VERSION);
     let released_state = b"{\"released\":{\"COM1\":{\"released_by\":\"test\"}}}\n";
     t.write_file(&t.state_dir().join("state.json"), released_state);
     let (update_rc, update_out, _) = t.run_from_bundle(&["setup"]);
     assert_eq!(update_rc, 0, "{update_out}");
-    assert_eq!(json(&update_out)["update"]["to_version"], "0.4.1");
+    assert_eq!(json(&update_out)["update"]["to_version"], CURRENT_VERSION);
     assert_eq!(std::fs::read(t.state_dir().join("state.json")).unwrap(), released_state);
     let (rollback_rc, rollback_out, _) = t.run(&["setup", "--rollback"]);
     assert_eq!(rollback_rc, 0, "{rollback_out}");
@@ -2405,8 +2420,8 @@ fn rollback_refuses_incompatible_state_schema() {
     let t = TestEnv::windows()
         .with_install_root()
         .with_installed("0.4.0")
-        .with_installed("0.4.1")
-        .with_current("0.4.1", Some("0.4.0"));
+        .with_installed(CURRENT_VERSION)
+        .with_current(CURRENT_VERSION, Some("0.4.0"));
     let prev_path = t.root().versions.join("0.4.0").join("release-manifest.json");
     let prev_manifest = std::fs::read_to_string(&prev_path)
         .unwrap()
@@ -2434,8 +2449,8 @@ fn rollback_reregisters_previous_task() {
         .with_config("supervision_mode: windows-task\n")
         .with_install_root()
         .with_installed("0.4.0")
-        .with_installed("0.4.1")
-        .with_current("0.4.1", Some("0.4.0"))
+        .with_installed(CURRENT_VERSION)
+        .with_current(CURRENT_VERSION, Some("0.4.0"))
         .with_real_service()
         .with_command_seq(&query, &[(0, "Running\n", ""), (0, "Disabled\n", "")])
         .with_command_raw(
@@ -2478,8 +2493,8 @@ fn rollback_cross_mode_windows_task_to_on_demand() {
     let t = TestEnv::windows()
         .with_install_root()
         .with_installed("0.4.0")
-        .with_installed("0.4.1")
-        .with_current("0.4.1", Some("0.4.0"))
+        .with_installed(CURRENT_VERSION)
+        .with_current(CURRENT_VERSION, Some("0.4.0"))
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_new_daemon_reporting_version("0.4.0");
@@ -2501,12 +2516,12 @@ fn rollback_cross_mode_failure_recovers_current() {
     let t = TestEnv::windows()
         .with_install_root()
         .with_installed("0.4.0")
-        .with_installed("0.4.1")
-        .with_current("0.4.1", Some("0.4.0"))
+        .with_installed(CURRENT_VERSION)
+        .with_current(CURRENT_VERSION, Some("0.4.0"))
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_new_daemon_reporting_version("0.4.0")
-        .with_rpc_after_relaunch("health.status", "{\"ok\":true,\"pid\":5252,\"version\":\"0.4.1\",\"wal\":{\"healthy\":true}}")
+        .with_rpc_after_relaunch("health.status", &health_status(5252, CURRENT_VERSION, true))
         .with_spawn_exits(1);
     t.with_previous_backup_mode("on-demand");
     let config_before = t.config_bytes();
@@ -2515,7 +2530,13 @@ fn rollback_cross_mode_failure_recovers_current() {
     let j = json(&out);
     assert_eq!(j["rollback"]["reverted"], true, "{out}");
     assert_eq!(j["rollback"]["revert_pending"], false, "{out}");
-    assert_eq!(sw_cli::install_layout::read_current(&t.root()).unwrap().unwrap().bundle_version, "0.4.1");
+    assert_eq!(
+        sw_cli::install_layout::read_current(&t.root())
+            .unwrap()
+            .unwrap()
+            .bundle_version,
+        CURRENT_VERSION
+    );
     assert_eq!(t.config_bytes(), config_before, "跨模式 rollback 失敗後須還原目前 mode 設定");
     assert_eq!(t.service().query_now().enabled, Some(true));
     assert!(acts(&t).iter().any(|action| action == "uninstall"));
@@ -2528,8 +2549,8 @@ fn systemd_rollback_daemon_reload_after_unit_restore() {
     let t = TestEnv::posix()
         .with_install_root()
         .with_installed("0.4.0")
-        .with_installed("0.4.1")
-        .with_current("0.4.1", Some("0.4.0"))
+        .with_installed(CURRENT_VERSION)
+        .with_current(CURRENT_VERSION, Some("0.4.0"))
         .with_supervisor_state("systemd-user", true, true)
         .with_idle_daemon_default(4242)
         .with_new_daemon_reporting_version("0.4.0");
@@ -2545,8 +2566,8 @@ fn rollback_twice_rolls_forward() {
     let t = TestEnv::windows()
         .with_install_root()
         .with_installed("0.4.0")
-        .with_installed("0.4.1")
-        .with_current("0.4.1", Some("0.4.0"))
+        .with_installed(CURRENT_VERSION)
+        .with_current(CURRENT_VERSION, Some("0.4.0"))
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_new_daemon_reporting_version("0.4.0");
@@ -2555,11 +2576,15 @@ fn rollback_twice_rolls_forward() {
     let cur1 = sw_cli::install_layout::read_current(&t.root()).unwrap().unwrap();
     assert_eq!(cur1.bundle_version, "0.4.0");
 
-    t.rpc().respond_after_relaunch(TestEnv::win_endpoint(), "health.status", "{\"ok\":true,\"pid\":5353,\"version\":\"0.4.1\",\"wal\":{\"healthy\":true}}");
+    t.rpc().respond_after_relaunch(
+        TestEnv::win_endpoint(),
+        "health.status",
+        &health_status(5353, CURRENT_VERSION, true),
+    );
     let (rc2, out2, _) = t.run(&["setup", "--rollback"]);
     assert_eq!(rc2, 0, "{out2}");
     let cur2 = sw_cli::install_layout::read_current(&t.root()).unwrap().unwrap();
-    assert_eq!(cur2.bundle_version, "0.4.1");
+    assert_eq!(cur2.bundle_version, CURRENT_VERSION);
 }
 
 #[test]
@@ -2567,8 +2592,8 @@ fn rollback_not_cli_only() {
     let t = TestEnv::windows()
         .with_install_root()
         .with_installed("0.4.0")
-        .with_installed("0.4.1")
-        .with_current("0.4.1", Some("0.4.0"))
+        .with_installed(CURRENT_VERSION)
+        .with_current(CURRENT_VERSION, Some("0.4.0"))
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_new_daemon_reporting_version("0.4.0");
@@ -2590,7 +2615,7 @@ fn update_start_failure_writes_failure_json() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_config("supervision_mode: on-demand\n")
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_spawn_exits(1);
@@ -2618,9 +2643,9 @@ fn update_on_demand_not_running_skips_daemon_start() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_config("supervision_mode: on-demand\n")
-        .with_new_daemon_reporting_version("0.4.1");
+        .with_new_daemon_reporting_version(CURRENT_VERSION);
     let (rc, _, _) = t.run_from_bundle(&["setup", "--on-demand"]);
     assert_eq!(rc, 0);
     assert!(t.process().spawns().is_empty());
@@ -2632,12 +2657,12 @@ fn fresh_install_materializes_profiles_and_sets_windows_task() {
         .with_process()
         .with_install_root()
         .with_real_service()
-        .with_bundle("0.4.1")
-        .with_new_daemon_reporting_version("0.4.1");
+        .with_bundle(CURRENT_VERSION)
+        .with_new_daemon_reporting_version(CURRENT_VERSION);
     let (rc, out, _) = t.run_from_bundle(&["setup"]);
     assert_eq!(rc, 0, "{out}");
     let j = json(&out);
-    assert_eq!(j["install"]["to_version"], "0.4.1");
+    assert_eq!(j["install"]["to_version"], CURRENT_VERSION);
     assert!(matches!(j["setup"], sw_proto::pyjson::PyValue::Dict(_)), "首次安裝需回報 reconcile 結果：{out}");
     assert!(j["legacy"].is_null(), "未發現 legacy 安裝時需明確回報 null：{out}");
     assert!(j["doctor_hint"].as_str().is_some(), "首次安裝需提供 doctor_hint：{out}");
@@ -2654,7 +2679,7 @@ fn revert_handoff_unsupported_new_daemon_keeps_journal() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_new_daemon_reporting_version("0.4.0")
@@ -2670,7 +2695,13 @@ fn revert_handoff_unsupported_new_daemon_keeps_journal() {
     assert_eq!(j["update"]["revert_error"]["handoff_outcome"], "refused");
     let hint = j["update"]["revert_error"]["hint"].as_str().unwrap();
     assert!(hint.contains("serialwrap daemon status") && hint.contains("serialwrap daemon stop"));
-    assert_eq!(sw_cli::install_layout::read_current(&t.root()).unwrap().unwrap().bundle_version, "0.4.1");
+    assert_eq!(
+        sw_cli::install_layout::read_current(&t.root())
+            .unwrap()
+            .unwrap()
+            .bundle_version,
+        CURRENT_VERSION
+    );
     assert!(t.rpc().requests().iter().all(|request| request.1 != "daemon.stop"));
     assert!(!t.calls().iter().any(|call| call.get(1).map(String::as_str) == Some("/End")));
     assert!(t.journal_json().is_some());
@@ -2682,7 +2713,7 @@ fn revert_handoff_recv_timeout_no_hard_stop() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_new_daemon_reporting_version("0.4.0")
@@ -2709,7 +2740,7 @@ fn revert_new_daemon_rpc_down_process_alive_defers() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_new_daemon_rpc_down();
@@ -2729,11 +2760,11 @@ fn rollback_revert_refuses_while_previous_daemon_pushing() {
     let t = TestEnv::windows()
         .with_install_root()
         .with_installed("0.4.0")
-        .with_installed("0.4.1")
-        .with_current("0.4.1", Some("0.4.0"))
+        .with_installed(CURRENT_VERSION)
+        .with_current(CURRENT_VERSION, Some("0.4.0"))
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
-        .with_new_daemon_reporting_version("0.4.1")
+        .with_new_daemon_reporting_version(CURRENT_VERSION)
         .with_new_daemon_handoff_script(&[BUSY_PUSH]);
     let (rc, out, _) = t.run(&["setup", "--rollback"]);
     assert_eq!(rc, 2, "{out}");
@@ -2757,7 +2788,7 @@ fn update_systemd_system_hold_needs_sudo() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("systemd-system", true, true)
         .with_idle_daemon_default(4242);
     t.service().respond(sw_pal::service_ctl::ServiceResult {
@@ -2787,12 +2818,12 @@ fn update_hold_failure_sends_no_stop_rpc() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_systemd(true)
         .with_var("USER", "alice")
         .with_supervisor_state("systemd-user", true, true)
         .with_idle_daemon_default(4242)
-        .with_new_daemon_reporting_version("0.4.1");
+        .with_new_daemon_reporting_version(CURRENT_VERSION);
     t.service().respond(sw_pal::service_ctl::ServiceResult {
         ok: false,
         mode: "systemd-user".into(),
@@ -2820,10 +2851,10 @@ fn update_no_daemon_still_holds_until_switch() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("systemd-user", true, false)
         .with_rpc_refused_default()
-        .with_new_daemon_reporting_version("0.4.1");
+        .with_new_daemon_reporting_version(CURRENT_VERSION);
     let (rc, _, _) = t.run_from_bundle(&["setup", "--user"]);
     assert_eq!(rc, 0);
     let o = t.event_order();
@@ -2838,10 +2869,10 @@ fn update_on_demand_holds_autostart_lock_until_new_daemon_started() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_config("supervision_mode: on-demand\n")
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
-        .with_new_daemon_reporting_version("0.4.1");
+        .with_new_daemon_reporting_version(CURRENT_VERSION);
     t.process().observe_lock_at_spawn(t.run_dir().join("autostart.lock"));
     let (rc, out, _) = t.run_from_bundle(&["setup", "--on-demand"]);
     assert_eq!(rc, 0, "{out}");
@@ -2850,7 +2881,7 @@ fn update_on_demand_holds_autostart_lock_until_new_daemon_started() {
     assert!(!t.autostart_lock_held(), "驗收完成後必須釋放 autostart.lock");
     let start_step = json(&out)["update"]["steps"].as_array().unwrap().iter()
         .find(|step| step["step"] == "start_and_verify").unwrap().clone();
-    assert_eq!(start_step["detail"]["daemon_version"], "0.4.1");
+    assert_eq!(start_step["detail"]["daemon_version"], CURRENT_VERSION);
 }
 
 #[test]
@@ -2859,7 +2890,7 @@ fn update_busy_handoff_releases_hold() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("systemd-user", true, true)
         .with_idle_daemon_default(4242)
         .with_rpc_ok_default(
@@ -2875,20 +2906,21 @@ fn update_busy_handoff_releases_hold() {
 
 #[test]
 fn update_relaunched_instance_rehandoff_ok_continues() {
+    let current_status = health_status(5252, CURRENT_VERSION, true);
     let t = TestEnv::posix()
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("systemd-user", true, true)
         .with_idle_daemon_default(4242)
         .with_supervisor_ignores_hold()
         .with_restart_on_failure()
         .with_daemon_exit_code_after_handoff(1)
-        .with_new_daemon_reporting_version("0.4.1")
+        .with_new_daemon_reporting_version(CURRENT_VERSION)
         .with_rpc_after_relaunch_seq("health.status", &[
             "{\"ok\":true,\"pid\":5252,\"version\":\"0.4.0\",\"wal\":{\"healthy\":true}}",
-            "{\"ok\":true,\"pid\":5252,\"version\":\"0.4.1\",\"wal\":{\"healthy\":true}}",
+            current_status.as_str(),
         ]);
     let (rc, out, _) = t.run_from_bundle(&["setup"]);
     assert_eq!(rc, 0, "{out}");
@@ -2896,7 +2928,7 @@ fn update_relaunched_instance_rehandoff_ok_continues() {
     assert_eq!(response["ok"], true);
     let start_step = response["update"]["steps"].as_array().unwrap().iter()
         .find(|step| step["step"] == "start_and_verify").unwrap();
-    assert_eq!(start_step["detail"]["daemon_version"], "0.4.1");
+    assert_eq!(start_step["detail"]["daemon_version"], CURRENT_VERSION);
     let stop_step = response["update"]["steps"].as_array().unwrap().iter()
         .find(|step| step["step"] == "stop_supervisor").unwrap();
     let chain = stop_step["detail"]["handoff_chain"].as_array().unwrap();
@@ -2907,7 +2939,13 @@ fn update_relaunched_instance_rehandoff_ok_continues() {
     assert_ne!(chain[0]["token"], chain[1]["token"]);
     assert_eq!(handoffs(&t), 2);
     assert!(acts(&t).iter().all(|action| action != "hard_stop"));
-    assert_eq!(sw_cli::install_layout::read_current(&t.root()).unwrap().unwrap().bundle_version, "0.4.1");
+    assert_eq!(
+        sw_cli::install_layout::read_current(&t.root())
+            .unwrap()
+            .unwrap()
+            .bundle_version,
+        CURRENT_VERSION
+    );
 }
 
 #[test]
@@ -2916,13 +2954,13 @@ fn update_hard_stop_never_targets_relaunched_identity() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("windows-task", true, true)
         .with_idle_daemon(TestEnv::win_endpoint(), 4242)
         .with_supervisor_ignores_hold()
         .with_restart_on_failure()
         .with_daemon_exit_code_after_handoff(1)
-        .with_new_daemon_reporting_version("0.4.1")
+        .with_new_daemon_reporting_version(CURRENT_VERSION)
         .with_rpc_after_relaunch("health.status", r#"{"ok":true,"pid":9000,"version":"0.4.0"}"#)
         .with_new_daemon_handoff_script(&[BUSY_PUSH]);
     let config_before = t.config_bytes();
@@ -2945,7 +2983,7 @@ fn update_relaunch_loop_aborts_without_switch() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_systemd(true)
         .with_var("USER", "alice")
         .with_supervisor_state("systemd-user", true, true)
@@ -2975,13 +3013,13 @@ fn update_instance_before_start_rehandoff() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_systemd(true)
         .with_var("USER", "alice")
         .with_supervisor_state("systemd-user", true, true)
         .with_idle_daemon_default(4242)
         .with_instance_appears_at("entries_switching:after_effect", 5252, &[])
-        .with_new_daemon_reporting_version("0.4.1");
+        .with_new_daemon_reporting_version(CURRENT_VERSION);
     let (rc, out, _) = t.run_from_bundle(&["setup"]);
     assert_eq!(rc, 0, "{out}");
     assert_eq!(json(&out)["ok"], true);
@@ -2990,7 +3028,13 @@ fn update_instance_before_start_rehandoff() {
     let order = t.event_order();
     assert!(order.index_of_nth("rpc:daemon.handoff_stop", 1) < order.index_of("service:release_autostart:true"));
     assert!(order.index_of("service:release_autostart:true") < order.index_of("service:start"));
-    assert_eq!(sw_cli::install_layout::read_current(&t.root()).unwrap().unwrap().bundle_version, "0.4.1");
+    assert_eq!(
+        sw_cli::install_layout::read_current(&t.root())
+            .unwrap()
+            .unwrap()
+            .bundle_version,
+        CURRENT_VERSION
+    );
 }
 
 #[test]
@@ -2999,7 +3043,7 @@ fn revert_rehold_before_new_daemon_handoff() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_systemd(true)
         .with_supervisor_state("systemd-user", true, true)
         .with_idle_daemon_default(4242)
@@ -3027,7 +3071,7 @@ fn revert_deferred_releases_hold() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("systemd-user", true, true)
         .with_idle_daemon_default(4242)
         .with_new_daemon_reporting_version("0.4.0")
@@ -3060,13 +3104,13 @@ fn revert_deferred_releases_hold() {
 #[test]
 fn revert_deferred_on_demand_recovery_waits_for_new_daemon_ordered_shutdown() {
     // S1 出口 A/B B 輪（2026-10-30）黑箱 test_revert_new_daemon_push_not_aborted_l15 的確定性對應：on-demand 更新驗證失敗，
-    // 回退因 file.push 延後（revert_pending）；push 完成後 recover_journal 對 0.4.1 daemon 交接成功，daemon 於 3 s 排空窗口後
+    // 回退因 file.push 延後（revert_pending）；push 完成後 recover_journal 對目前版本 daemon 交接成功，daemon 於 3 s 排空窗口後
     // 關閉監聽，SC-11 有序關機使行程於 grant 後 12 s 才結束。舊實作 grant 起 10 s 即回 TIMEOUT／handoff_timeout 並保留 journal。
     let t = TestEnv::posix()
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("on-demand", true, true)
         .with_config("supervision_mode: on-demand\n")
         .with_idle_daemon_default(4242)
@@ -3117,7 +3161,7 @@ fn journal_recovery_release_failure_keeps_journal() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("systemd-user", true, true)
         .with_idle_daemon_default(4242)
         .with_new_daemon_reporting_version("0.4.0")
@@ -3166,10 +3210,10 @@ fn update_interrupt_injection_every_point_releases_hold() {
             .with_install_root()
             .with_installed("0.4.0")
         .with_current("0.4.0", None)
-            .with_bundle("0.4.1")
+            .with_bundle(CURRENT_VERSION)
             .with_supervisor_state("systemd-user", true, true)
             .with_idle_daemon_default(4242)
-            .with_new_daemon_reporting_version("0.4.1")
+            .with_new_daemon_reporting_version(CURRENT_VERSION)
             .with_restart_on_failure()
             .with_crash_at(point);
         let t = if point.starts_with("revert_to_previous:") {
