@@ -428,7 +428,9 @@ def test_gate_dry_run_with_shared_evidence_exits_zero_and_skips_shared_commands(
     shared, _, _, _ = _fixture(tmp_path, "p7")
     command = ["bash", str(ROOT / "scripts/rust" / script), "--dry-run", "--shared-evidence", str(shared)]
     if "--out" in args:
-        command.extend([*args, str(tmp_path / script.removesuffix(".sh"))])
+        out = (ROOT / "target" / "s2-gfx" / "tests" / tmp_path.parent.name / tmp_path.name / "s22-shared-plan"
+               if script == "s22_gate.sh" else tmp_path / script.removesuffix(".sh"))
+        command.extend([*args, str(out)])
     elif "--out-md" in args:
         command.extend([*args, str(tmp_path / "p7.md")])
     else:
@@ -442,6 +444,8 @@ def test_gate_dry_run_with_shared_evidence_exits_zero_and_skips_shared_commands(
     if script == "slice24_exit.sh":
         assert "env CARGO_INCREMENTAL=0 cargo check --workspace --target x86_64-pc-windows-gnu" in output
         assert "候選 bundle" in output
+    if script == "s22_gate.sh":
+        shutil.rmtree(out, ignore_errors=True)
 
 
 def test_shared_driver_dry_run_lists_commands_without_running_them(tmp_path):

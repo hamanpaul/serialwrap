@@ -6,10 +6,14 @@
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import json
 import os
+import pathlib
+import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -351,7 +355,7 @@ def test_missing_report_and_pending_entry_insufficient(tmp_path: Path) -> None:
 
 
 def test_s22_gate_driver_dry_run_emits_incomplete_json(tmp_path: Path) -> None:
-    run = tmp_path / "s22"
+    run = ROOT / "target" / "s2-gfx" / "tests" / tmp_path.parent.name / tmp_path.name / "s22"
     proc = subprocess.run(["bash", "scripts/rust/s22_gate.sh", "--dry-run", "--run-id", "dry", "--out", str(run)],
                           cwd=ROOT, capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -360,6 +364,7 @@ def test_s22_gate_driver_dry_run_emits_incomplete_json(tmp_path: Path) -> None:
     assert report["dry_run"] is True
     assert report["result"] == "INSUFFICIENT"
     assert _section(report, "s22_gate:win_test", "windows")["verdict"] == "EVIDENCE_MISSING"
+    shutil.rmtree(run, ignore_errors=True)
 
 
 def test_unchecked_only_case_is_insufficient(tmp_path: Path) -> None:
@@ -947,14 +952,16 @@ def test_rejected_shared_evidence_cannot_fall_back_to_stale_green_l1(
     shared = _shared_s22_import_fixture(
         tmp_path, section, bad_selector=bad_selector, bad_sha=bad_sha,
     )
-    out = tmp_path / "out"
+    out = ROOT / "target" / "s2-gfx" / "tests" / tmp_path.parent.name / tmp_path.name / "rejected-shared"
+    out.parent.mkdir(parents=True, exist_ok=True)
     proc = subprocess.run(
         [
             "bash", "scripts/rust/s22_gate.sh", "--run-id", "reject", "--out", str(out),
             "--l1-results-dir", str(stale_path.parents[2]), "--shared-evidence", str(shared),
             "--windows-dir", "", "--selftest-report", "", "--daemon-path", "",
         ],
-        cwd=ROOT, capture_output=True, text=True, timeout=180,
+        cwd=ROOT, env={**os.environ, "SERIALWRAP_L15_PY_DAEMON": str(tmp_path / "missing-py-serialwrapd")},
+        capture_output=True, text=True, timeout=180,
     )
     assert proc.returncode != 0, proc.stdout + proc.stderr
     report_path = out / "reject" / "s22-gate.json"
@@ -967,6 +974,7 @@ def test_rejected_shared_evidence_cannot_fall_back_to_stale_green_l1(
     assert not (out / "reject" / "logs" / "blackbox_rust.log").exists()
     assert stale_path.is_file() and hashlib.sha256(stale_path.read_bytes()).hexdigest() == stale_sha
     assert "EVIDENCE_MISSING" in proc.stdout + proc.stderr
+    shutil.rmtree(out, ignore_errors=True)
 
 
 def test_s22_gate_records_bridge_selftest_report_path(tmp_path: Path):
@@ -1065,7 +1073,8 @@ def test_s22_driver_rejects_nonshared_formal_execution_before_running_python(tmp
         encoding="utf-8",
     )
     fake_python.chmod(0o755)
-    out = tmp_path / "out"
+    out = ROOT / "target" / "s2-gfx" / "tests" / tmp_path.parent.name / tmp_path.name / "nonshared"
+    out.parent.mkdir(parents=True, exist_ok=True)
     env = {
         **os.environ,
         "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
@@ -1080,3 +1089,231 @@ def test_s22_driver_rejects_nonshared_formal_execution_before_running_python(tmp
     assert "非共用模式" in proc.stderr
     assert not invoked.exists(), "拒絕前不應執行任何 Python 測試或 checker"
     assert not (out / "no-shared" / "s22-gate.json").exists()
+    shutil.rmtree(out, ignore_errors=True)
+
+
+def _s22_driver_functions() -> dict[str, object]:
+    driver = (ROOT / "scripts/rust/s22_gate.sh").read_text(encoding="utf-8")
+    source = driver.rsplit("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    module = ast.parse(source)
+    wanted = {"run_logged", "l15_rows"}
+    nodes = [node for node in module.body if isinstance(node, ast.FunctionDef) and node.name in wanted]
+    assert {node.name for node in nodes} == wanted
+    namespace: dict[str, object] = {
+        "hashlib": hashlib,
+        "os": os,
+        "pathlib": pathlib,
+        "shlex": shlex,
+        "sys": sys,
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "<s22_gate.py>", "exec"), namespace)
+    return namespace
+
+
+def _collect_s22_l15_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    emap: dict,
+    *,
+    python_daemon: bool = True,
+    rust_daemon: bool = True,
+) -> tuple[list[dict], list[dict], dict[str, Path | None]]:
+    from scripts.rust.l15_artifact import l15_artifact_problem
+
+    root = tmp_path.resolve()
+    python_path = root / "tests/contract_blackbox/bin/py-serialwrapd"
+    rust_path = root / "shared-artifacts/release/serialwrapd"
+    cli_path = root / "shared-artifacts/release/serialwrap"
+    if python_daemon:
+        python_path.parent.mkdir(parents=True, exist_ok=True)
+        python_path.write_text(
+            "#!/bin/sh\nexec python3 ./serialwrapd.py \"$@\"\n", encoding="utf-8"
+        )
+    if rust_daemon:
+        rust_path.parent.mkdir(parents=True, exist_ok=True)
+        rust_path.write_bytes(b"\x7fELF s22 rust daemon fixture")
+        cli_path.write_bytes(b"s22 shared release cli fixture")
+        monkeypatch.setenv("SERIALWRAP_L15_RUST_DAEMON", str(rust_path))
+    else:
+        monkeypatch.delenv("SERIALWRAP_L15_RUST_DAEMON", raising=False)
+    monkeypatch.delenv("SERIALWRAP_L15_PY_DAEMON", raising=False)
+    monkeypatch.setenv("SERIALWRAP_CLI_EXE", str(root / "outer-python-cli"))
+
+    calls: list[dict] = []
+    namespace = _s22_driver_functions()
+    namespace.update({
+        "l15_artifact_problem": l15_artifact_problem,
+        "root": root,
+        "emap": emap,
+        "selftest_report": None,
+        "daemon_path": rust_path if rust_daemon else None,
+        "build_exit": 0 if rust_daemon else None,
+        "built_sha": hashlib.sha256(rust_path.read_bytes()).hexdigest() if rust_daemon else None,
+        "cli_path": cli_path if rust_daemon else None,
+        "selftest_ready": True,
+        "selftest_eligibility": "PASS",
+        "run_dir": root / "run",
+        "logs_dir": root / "run/logs",
+    })
+    namespace["logs_dir"].mkdir(parents=True, exist_ok=True)
+
+    def record_run(label, argv, env, *, preamble=None, timeout=None):
+        calls.append({"label": label, "argv": list(argv), "env": dict(env),
+                      "preamble": preamble, "timeout": timeout})
+        return 0
+
+    namespace["run_logged"] = record_run
+    rows = namespace["l15_rows"]()
+    return rows, calls, {
+        "root": root,
+        "python": python_path,
+        "rust": rust_path if rust_daemon else None,
+        "cli": cli_path if rust_daemon else None,
+    }
+
+
+def test_s22_l15_rows_use_cases_and_parity_refs_default_python_and_shared_rust_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """s22-02／s22-11／s22-14：來源聯集、兩輪 CLI、每輪報告目錄與 900 秒逾時。"""
+    case_ref = "func-test/runner.py --case co-01-line-buffering"
+    parity_ref = "func-test/runner.py --case co-02-line-backspace"
+    emap = {
+        "cases": {"co-01-line-buffering": {"tests": [case_ref]}},
+        "parity_rows": {"#107": {"tests": [parity_ref]}},
+    }
+    rows, calls, paths = _collect_s22_l15_rows(tmp_path, monkeypatch, emap)
+
+    assert {(row["ref"], row["implementation"]) for row in rows} == {
+        (ref, implementation)
+        for ref in (case_ref, parity_ref)
+        for implementation in ("python", "rust")
+    }
+    assert all(row["outcome"] == "passed" for row in rows), rows
+    assert len(calls) == 4
+    for call in calls:
+        label = call["label"]
+        argv = call["argv"]
+        assert call["timeout"] == 900, call
+        assert argv[argv.index("--report-dir") + 1] == str(paths["root"] / "run/l15" / label), call
+        implementation = label.rsplit("-", 1)[1]
+        if implementation == "python":
+            assert call["env"].get("SERIALWRAP_DAEMON_EXE") == str(paths["python"])
+            assert "SERIALWRAP_CLI_EXE" not in call["env"], "Python 輪不得沿用外層 Rust CLI"
+        else:
+            assert call["env"].get("SERIALWRAP_DAEMON_EXE") == str(paths["rust"])
+            assert call["env"].get("SERIALWRAP_CLI_EXE") == str(paths["cli"]), call
+
+
+@pytest.mark.parametrize("missing_implementation", ["python", "rust"])
+def test_s22_l15_missing_daemon_is_unchecked_and_cannot_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing_implementation: str,
+) -> None:
+    """s22-04／s22-12：任一 daemon 缺席只記 unchecked，仍不能令 L1.5 判 PASS。"""
+    ref = "func-test/runner.py --case co-01-line-buffering"
+    emap = {"cases": {"co-01-line-buffering": {"tests": [ref]}}, "parity_rows": {}}
+    rows, calls, _paths = _collect_s22_l15_rows(
+        tmp_path, monkeypatch, emap,
+        python_daemon=missing_implementation != "python",
+        rust_daemon=missing_implementation != "rust",
+    )
+    missing = next(row for row in rows if row["implementation"] == missing_implementation)
+    available = next(row for row in rows if row["implementation"] != missing_implementation)
+    assert missing["outcome"] == "unchecked" and missing["exit_code"] is None, missing
+    assert available["outcome"] == "passed", available
+    checker = _gate_module()
+    assert not checker._l15_passed({ref: rows}, ref), "單邊缺 daemon 不得成為 PASS"
+    assert len(calls) == 1, calls
+
+
+@pytest.mark.parametrize("out_kind", ["outside-repo", "inside-repo-outside-target"])
+def test_s22_driver_rejects_outside_target_before_creating_run_dir(
+    tmp_path: Path, out_kind: str,
+) -> None:
+    """s22-13：輸出只能位於本 worktree 的 target/，拒絕必須先於任何寫入。"""
+    run_id = f"reject-{out_kind}-{tmp_path.name}"
+    out = tmp_path / "outside" if out_kind == "outside-repo" else ROOT / "docs"
+    run_dir = out / run_id
+    try:
+        proc = subprocess.run(
+            ["bash", "scripts/rust/s22_gate.sh", "--dry-run", "--run-id", run_id, "--out", str(out)],
+            cwd=ROOT, capture_output=True, text=True, timeout=30,
+        )
+        assert proc.returncode == 2, proc.stdout + proc.stderr
+        assert "--out" in proc.stderr and "target/" in proc.stderr, proc.stderr
+        assert not run_dir.exists(), "錯誤 --out 不得先建立任何輸出"
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+
+def test_s22_driver_exports_parsed_rust_daemon_and_ignores_outer_common_override(
+    tmp_path: Path,
+) -> None:
+    """s22-06／s22-12：child env 只使用解析後路徑，共用模式不繼承外層 artifact。"""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    capture = tmp_path / "daemon-env.txt"
+    fake_python = fake_bin / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "${SERIALWRAP_L15_RUST_DAEMON-<unset>}" >> "$S22_TEST_DAEMON_CAPTURE"\n'
+        f"exec {shlex.quote(sys.executable)} \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    base_env = {
+        **os.environ,
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        "S22_TEST_DAEMON_CAPTURE": str(capture),
+        "SERIALWRAP_L15_RUST_DAEMON": "/outer/not-shared/serialwrapd",
+    }
+
+    def run_driver(run_id: str, *extra: str) -> None:
+        out = ROOT / "target" / "s2-gfx" / "tests" / tmp_path.parent.name / tmp_path.name / run_id
+        out.parent.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.run(
+            ["bash", "scripts/rust/s22_gate.sh", "--dry-run", "--run-id", run_id,
+             "--out", str(out), *extra],
+            cwd=ROOT, env=base_env, capture_output=True, text=True, timeout=60,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        shutil.rmtree(out, ignore_errors=True)
+
+    explicit = str(tmp_path / "from-cli" / "serialwrapd")
+    run_driver("daemon-from-cli", "--daemon-path", explicit)
+    assert capture.read_text(encoding="utf-8").splitlines()[-1] == explicit
+
+    run_driver("common-ignores-outer", "--shared-evidence", str(tmp_path / "unused-shared"))
+    assert capture.read_text(encoding="utf-8").splitlines()[-1] == "", "共用模式不可繼承外層 Rust daemon"
+
+
+def test_s22_task13_step4_runs_shared_evidence_before_gate() -> None:
+    """s22-07：文件命令以同一 RUN_ID 產生並消費 shared evidence。"""
+    plan = (ROOT / "docs/rust-refactor/plans/07-slice22-console.md").read_text(encoding="utf-8")
+    shared = plan.index('scripts/rust/gate_shared.sh --run-id "$RUN_ID"')
+    gate = plan.index('scripts/rust/s22_gate.sh --shared-evidence "$SHARED_EVIDENCE" --run-id "$RUN_ID"')
+    assert shared < gate
+    assert 'SHARED_EVIDENCE="target/s2-shared-evidence/$RUN_ID"' in plan
+
+
+def test_s22_run_logged_turns_timeout_into_failed_exit(tmp_path: Path) -> None:
+    """逾時仍是執行失敗，不得因 runner 卡住而產生可通過列。"""
+    namespace = _s22_driver_functions()
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+
+    def timeout_run(argv, **kwargs):
+        assert kwargs.get("timeout") == 900
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    namespace.update({
+        "logs_dir": logs_dir,
+        "root": tmp_path,
+        "subprocess": type("FakeSubprocess", (), {
+            "run": staticmethod(timeout_run), "TimeoutExpired": subprocess.TimeoutExpired,
+            "STDOUT": subprocess.STDOUT
+        }),
+    })
+    rc = namespace["run_logged"]("l15-test", ["runner"], {}, timeout=900)
+    assert rc == 124
+    assert "900" in (logs_dir / "l15-test.log").read_text(encoding="utf-8")

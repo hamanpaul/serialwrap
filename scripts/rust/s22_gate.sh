@@ -11,7 +11,7 @@ L1_DIR=""
 WINDOWS_DIR="${SW_GATE_S22_WINDOWS_DIR:-}"
 SELFTEST_REPORT="${SERIALWRAP_L15_SELFTEST_REPORT:-}"
 CLI_PATH=""
-DAEMON_PATH="${SERIALWRAP_L15_RUST_DAEMON:-}"
+DAEMON_PATH=""
 BUILD_EXIT=""
 BUILT_DAEMON_SHA256=""
 DRY_RUN=0
@@ -46,6 +46,17 @@ while (($#)); do
     *) echo "s22_gate.sh: 未知參數 $1" >&2; exit 2 ;;
   esac
 done
+export SERIALWRAP_L15_RUST_DAEMON="$DAEMON_PATH"
+
+if ! OUT_ROOT="$(realpath -m -- "$OUT_ROOT")"; then
+  echo "s22_gate.sh: 無法解析 --out 路徑：$OUT_ROOT" >&2
+  exit 2
+fi
+TARGET_ROOT="$(realpath -m -- "$ROOT/target")"
+case "$OUT_ROOT" in
+  "$TARGET_ROOT"|"$TARGET_ROOT"/*) ;;
+  *) echo "s22_gate.sh: --out 必須位於本 worktree 的 target/ 底下：$OUT_ROOT" >&2; exit 2 ;;
+esac
 
 if [[ "$DRY_RUN" != "1" && -z "$SHARED_EVIDENCE" ]]; then
   echo "s22_gate.sh: 非共用模式的正式執行已停用；必須提供 --shared-evidence。" >&2
@@ -59,6 +70,7 @@ if [[ "$DRY_RUN" != "1" && -n "$SHARED_EVIDENCE" ]]; then
   BUILT_DAEMON_SHA256=""
   unset SERIALWRAP_L15_RUST_DAEMON
 fi
+export SERIALWRAP_L15_RUST_DAEMON="$DAEMON_PATH"
 
 [[ "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "s22_gate.sh: --run-id 只允許英數與 ._-" >&2; exit 2; }
 RUN_DIR="$OUT_ROOT/$RUN_ID"
@@ -253,7 +265,8 @@ emap = yaml.safe_load(map_path.read_text(encoding="utf-8")) or {}
 logs_dir = run_dir / "logs"
 l1_dir.mkdir(parents=True, exist_ok=True)
 
-def run_logged(label: str, argv: list[str], env: dict[str, str], *, preamble: list[str] | None = None) -> int:
+def run_logged(label: str, argv: list[str], env: dict[str, str], *, preamble: list[str] | None = None,
+               timeout: float | None = None) -> int:
     log = logs_dir / f"{label}.log"
     with log.open("w", encoding="utf-8") as stream:
         stream.write("+ " + shlex.join(argv) + "\n")
@@ -261,7 +274,11 @@ def run_logged(label: str, argv: list[str], env: dict[str, str], *, preamble: li
             stream.write(line + "\n")
         stream.flush()
         try:
-            proc = subprocess.run(argv, cwd=root, env=env, stdout=stream, stderr=subprocess.STDOUT, check=False)
+            proc = subprocess.run(argv, cwd=root, env=env, stdout=stream, stderr=subprocess.STDOUT,
+                                  timeout=timeout, check=False)
+        except subprocess.TimeoutExpired as exc:
+            stream.write(f"逾時（{timeout} 秒）：{exc}\n")
+            return 124
         except OSError as exc:
             stream.write(f"{type(exc).__name__}: {exc}\n")
             return 127
@@ -397,7 +414,8 @@ def run_blackbox_rust() -> None:
 def l15_rows() -> list[dict]:
     refs = sorted({
         ref
-        for entry in (emap.get("cases") or {}).values()
+        for section in ("cases", "parity_rows")
+        for entry in (emap.get(section) or {}).values()
         for ref in (entry or {}).get("tests") or []
         if isinstance(ref, str) and ref.startswith("func-test/runner.py ")
     })
@@ -409,23 +427,37 @@ def l15_rows() -> list[dict]:
         if bridge and selftest_report is not None:
             argv.extend(["--selftest-report", str(selftest_report)])
         daemon_specs = [
-            ("python", "SERIALWRAP_L15_PY_DAEMON"),
-            ("rust", "SERIALWRAP_L15_RUST_DAEMON"),
+            ("python", "SERIALWRAP_L15_PY_DAEMON",
+             os.environ.get("SERIALWRAP_L15_PY_DAEMON") or
+             str(root / "tests/contract_blackbox/bin/py-serialwrapd")),
+            ("rust", "SERIALWRAP_L15_RUST_DAEMON",
+             os.environ.get("SERIALWRAP_L15_RUST_DAEMON") or None),
         ]
-        valid_paths = []
-        for implementation, env_name in daemon_specs:
-            raw_path = os.environ.get(env_name)
-            path = pathlib.Path(raw_path).resolve() if raw_path else None
-            valid = path is not None and path.is_file() and path.is_relative_to(root)
-            valid_paths.append(path if valid else None)
-        distinct_paths = all(path is not None for path in valid_paths) and valid_paths[0] != valid_paths[1]
-        for implementation, env_name in daemon_specs:
-            raw_path = os.environ.get(env_name)
-            path = pathlib.Path(raw_path).resolve() if raw_path else None
-            valid = path is not None and path.is_file() and path.is_relative_to(root) and distinct_paths
-            if not valid:
+        configured_paths = {
+            implementation: pathlib.Path(raw_path).resolve() if raw_path else None
+            for implementation, _env_name, raw_path in daemon_specs
+        }
+        same_daemon_path = (
+            configured_paths["python"] is not None
+            and configured_paths["rust"] is not None
+            and configured_paths["python"] == configured_paths["rust"]
+        )
+        for implementation, env_name, raw_path in daemon_specs:
+            path = configured_paths[implementation]
+            if path is None or not path.is_file():
+                rows.append({"ref": ref, "implementation": implementation, "outcome": "unchecked",
+                             "exit_code": None,
+                             "reason": f"{env_name} 的 daemon 不存在，未執行此 L1.5 列"})
+                continue
+            if not path.is_relative_to(root):
                 rows.append({"ref": ref, "implementation": implementation, "outcome": "failed", "exit_code": 127,
-                             "reason": f"{env_name} 必須是 worktree 內存在且身分獨立的 daemon artifact"})
+                             "reason": f"{env_name} 必須指向 worktree 內的 daemon artifact"})
+                continue
+            if same_daemon_path:
+                rows.append({"ref": ref, "implementation": implementation, "outcome": "failed", "exit_code": 127,
+                             "daemon_path": str(path.relative_to(root)),
+                             "daemon_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                             "reason": "Python 與 Rust L1.5 必須使用身分獨立的 daemon artifact"})
                 continue
             identity_problem = l15_artifact_problem(
                 implementation,
@@ -465,7 +497,9 @@ def l15_rows() -> list[dict]:
             if implementation == "rust":
                 env["SERIALWRAP_CLI_EXE"] = str(cli_path)
             label = f"l15-{index:02d}-{implementation}"
-            rc = run_logged(label, argv, env)
+            report_dir = run_dir / "l15" / label
+            run_argv = [*argv, "--report-dir", str(report_dir)]
+            rc = run_logged(label, run_argv, env, timeout=900)
             same_artifact = path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == digest
             same_cli = (implementation != "rust" or
                         (cli_path.is_file() and hashlib.sha256(cli_path.read_bytes()).hexdigest() == rust_cli_sha))
