@@ -118,7 +118,9 @@ def test_linux_bundle_job_needs_publish_and_pins_toolchain():
     assert job.get("runs-on") == "ubuntu-24.04", f"{JOB} 必須 runs-on: ubuntu-24.04（OD-50）: {job.get('runs-on')}"
     needs = job.get("needs")
     needs = [needs] if isinstance(needs, str) else needs
-    assert needs == ["publish"], f"{JOB} 必須 needs: publish（等 GitHub Release 建立後才上傳）: {needs}"
+    assert set(needs) == {"publish", "classify-tag", "find-rc-assets"}, (
+        f"{JOB} 必須等既有 release 建立流程、tag 分類與 RC 探測完成: {needs}"
+    )
     uses = [step.get("uses", "") for step in _steps()]
     assert any(u.startswith("actions/checkout@") for u in uses)
     assert "dtolnay/rust-toolchain@1.96.1" in uses, "Rust toolchain 必須釘 1.96.1（與 rust.yml、rust-toolchain.toml 一致）"
@@ -226,7 +228,7 @@ def test_linux_bundle_job_step_order():
 def test_linux_bundle_job_build_commands():
     assert "cargo build --release" in _step("cargo-build")["run"]
     mkbundle = _step("mkbundle")["run"]
-    assert "scripts/rust/mkbundle.sh --release-bundle --profile release --out" in mkbundle
+    assert "scripts/rust/mkbundle.sh --release-bundle --stage 2 --profile release --out" in mkbundle
     assert "--version-override" not in mkbundle, "正式 bundle 不得以 --version-override 改版號（release 計畫 §2）"
     assert "--dev" not in mkbundle and "test-fakes" not in mkbundle
     assert BUNDLE_NAME in mkbundle
@@ -335,7 +337,9 @@ def test_windows_bundle_job_runs_on_hosted_windows_after_linux_bundle():
     assert job.get("runs-on") == "windows-latest", "OD-78：以 GitHub hosted windows-latest 建置，不用自架 runner"
     needs = job.get("needs")
     needs = [needs] if isinstance(needs, str) else needs
-    assert needs == ["publish-linux-bundle"], f"必須等 Linux bundle job 完成才合併 SHA256SUMS: {needs}"
+    assert set(needs) == {"publish-linux-bundle", "classify-tag", "find-rc-assets"}, (
+        f"正式 Windows bundle 必須等 Linux bundle 與正式版 fallback 判斷完成: {needs}"
+    )
     assert job.get("timeout-minutes"), "必須設定 timeout-minutes"
     assert job["env"]["RUSTUP_TOOLCHAIN"] == "1.96.1-x86_64-pc-windows-gnu", "必須釘 gnu host toolchain（與 rust.yml 相同）"
     condition = str(job.get("if", ""))
@@ -373,7 +377,7 @@ def test_windows_bundle_job_step_order_and_build_commands():
     steps = _win_steps()
     assert steps[0]["run"].strip() == "git config --global core.autocrlf false", "checkout 之前須關閉 autocrlf（位元組須與 Linux 一致）"
     mkbundle = _win_step("mkbundle")["run"]
-    assert "mkbundle-windows.ps1" in mkbundle and "-ZipPath" in mkbundle
+    assert "mkbundle-windows.ps1" in mkbundle and "-Stage 2" in mkbundle and "-ZipPath" in mkbundle
     assert "windows-x86_64" in mkbundle
     assert "check_win_imports.py" in mkbundle and "serialwrapd.exe" in mkbundle
     for forbidden in ("-Prebuilt", "-AllowDirty", "test-fakes", "com0com", "signtool", "Authenticode", "win-blackbox", "New-WindowsDevBundle"):
