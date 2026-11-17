@@ -93,8 +93,8 @@ if [[ "$ID" != ubuntu || "$VERSION_ID" != 24.04 ]]; then
 fi
 if ! command -v python3 >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1 || ! command -v cc >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y --no-install-recommends python3 git ca-certificates build-essential pkg-config libudev-dev
+  apt-get update -qq >&2
+  apt-get install -y --no-install-recommends python3 git ca-certificates build-essential pkg-config libudev-dev >&2
   apt-get clean
   rm -rf /var/lib/apt/lists/*
 fi

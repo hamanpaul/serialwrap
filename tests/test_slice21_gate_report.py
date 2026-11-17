@@ -300,4 +300,6 @@ def test_sys_admin_docker_driver_uses_only_disposable_root_container():
     assert 'target=/workspace,readonly' in text
     assert "target=/host-rustup,readonly" in text
     assert "CARGO_TARGET_DIR=/tmp/" in text
+    assert "apt-get update -qq >&2" in text
+    assert "pkg-config libudev-dev >&2" in text
     assert "--device" not in text and "--privileged" not in text and "/dev/ttyUSB" not in text
