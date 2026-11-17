@@ -1131,13 +1131,47 @@ def test_shared_coverage_package_import_merges_same_label_before_contract_judgem
     shared_api.is_worktree_clean = lambda root=ROOT: True
     shared_api.get_current_head = lambda root=ROOT: head
     shared = tmp_path / "shared-evidence"
+    bundle = shared / "candidate-bundle"
+    version_bin = bundle / "versions" / "0.4.1" / "bin"
+    version_bin.mkdir(parents=True)
+    cli_bytes = b"candidate Rust CLI"
+    daemon_bytes = b"candidate Rust daemon"
+    (version_bin / "serialwrap").write_bytes(cli_bytes)
+    (version_bin / "serialwrapd").write_bytes(daemon_bytes)
+    (version_bin.parent / "release-manifest.json").write_text(
+        json.dumps({
+            "bundle_version": "0.4.1",
+            "stage": "rust-2",
+            "target": "x86_64-unknown-linux-gnu",
+            "git_revision": head,
+            "components": {
+                "cli": {"implementation": "rust", "sha256": hashlib.sha256(cli_bytes).hexdigest()},
+                "daemon": {
+                    "implementation": "rust",
+                    "code_fingerprint": hashlib.sha256(daemon_bytes).hexdigest()[:12],
+                    "launcher": {"sha256": hashlib.sha256(daemon_bytes).hexdigest()},
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    top_bin = bundle / "bin"
+    top_bin.mkdir()
+    (top_bin / "serialwrap").write_bytes(cli_bytes)
+    (top_bin / "serialwrapd").write_bytes(daemon_bytes)
+
     artifacts = {}
     for name in shared_api.REQUIRED_ARTIFACTS:
-        source = tmp_path / "artifact-sources" / name
-        source.parent.mkdir(parents=True, exist_ok=True)
-        source.write_bytes(f"candidate:{name}".encode())
+        if name == "release_cli":
+            source = version_bin / "serialwrap"
+        elif name == "release_daemon":
+            source = version_bin / "serialwrapd"
+        else:
+            source = tmp_path / "artifact-sources" / name
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(f"candidate:{name}".encode())
         artifacts[name] = source
-    shared_api.init_manifest(shared, artifacts, head=head, clean=True)
+    shared_api.init_manifest(shared, artifacts, head=head, clean=True, candidate_bundle=bundle)
     lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
     pytest_argv = lock["sets"]["s21_gate:pytest_full"]["linux"]["selector"]["argv"]
     baseline_l1 = tmp_path / "pytest-full" / "l1-results.json"
