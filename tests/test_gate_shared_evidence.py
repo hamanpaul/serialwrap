@@ -672,7 +672,7 @@ def test_gate_shared_artifact_paths_keep_cli_and_daemon_basenames():
             '--artifact "debug_cli=$SHARED_ARTIFACT_DIR/debug/serialwrap"',
             '--artifact "debug_daemon=$SHARED_ARTIFACT_DIR/debug/serialwrapd"',
             '--artifact "release_cli=$SHARED_ARTIFACT_DIR/release/serialwrap"',
-            '--artifact "release_daemon=$DAEMON_PATH"',
+            '--artifact "release_daemon=$SHARED_ARTIFACT_DIR/release/serialwrapd"',
         ),
         "p7_gate.sh": (
             'RUST_CLI="$RUN/artifacts/serialwrap"',

@@ -2689,24 +2689,13 @@ Run（Windows 步驟由 orchestrator 執行，見「執行順序」第 5 點）�
 ```bash
 python3 -m pytest -q tests/test_acceptance_slice22.py tests/test_contracts_slice22.py tests/test_contracts_catalog.py
 python3 tests/acceptance/regen_lock.py --check
-G=target/s22-gate/$(date +%y%m%d-%H%M%S)                                  # R5-F3：出口以逐案 l1-results 判定，cargo_nonzero.sh 只留作開發迴圈防呆
-# s22_gate.sh 的 L1、log、l15-results 與報告都寫在本次 run 目錄；s22_gate_check.py 只寫指定的 --out，追蹤輸入僅供讀取。
-python3 scripts/rust/cargo_l1_results.py --platform linux --out $G/cargo_workspace/linux/resource-report.json -- --workspace --features test-fakes          # 含 06 全部 L1 測試
-python3 scripts/rust/cargo_l1_results.py --platform linux --out $G/console_conformance_pty/linux/resource-report.json -- -p sw-pal --features test-fakes --test console_conformance -- --include-ignored cap_posix_pty__
-scripts/rust/win-test.sh --features test-fakes --caps windows_com          # 報告的 l1_results 複製到 $G/win_test/windows/resource-report.json
+# R5-F3：全套共用證據只產生一次；s22_gate 自動執行 plan 推導的 console_conformance_pty 與 Rust release 黑箱。
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+SHARED_EVIDENCE="target/s2-shared-evidence/$RUN_ID"
+scripts/rust/gate_shared.sh --run-id "$RUN_ID"
+# 共用 manifest 匯入 win_test／能力列與 release artifact；共用模式不讀 --windows-dir。
+python3 scripts/rust/s22_gate.sh --shared-evidence "$SHARED_EVIDENCE" --run-id "$RUN_ID"
 python3 scripts/rust/check_cfg_boundary.py
-cargo build --release -p sw-daemon -p sw-cli --target x86_64-unknown-linux-gnu
-S22_BUILD_EXIT=$?
-S22_DAEMON_SHA=""
-if [ "$S22_BUILD_EXIT" -eq 0 ]; then
-  S22_DAEMON_SHA="$(sha256sum target/x86_64-unknown-linux-gnu/release/serialwrapd | cut -d' ' -f1)"
-fi
-SERIALWRAP_AB_LABEL=rust SERIALWRAP_CLI_EXE=$PWD/target/x86_64-unknown-linux-gnu/release/serialwrap SERIALWRAP_DAEMON_EXE=$PWD/target/x86_64-unknown-linux-gnu/release/serialwrapd \
-  SW_RESOURCE_REPORT=$G/blackbox_rust/linux/resource-report.json \
-  python3 -m pytest -q tests/contract_blackbox/slice21 tests/contract_blackbox/slice22 --junitxml=$G/blackbox_rust/linux/junit.xml   # 前一切片黑箱在 2.2 artifact 上重跑
-python3 scripts/rust/s22_gate_check.py --l1-results $G --map tests/acceptance/slice22_evidence_map.yaml \
-  --daemon-path "$PWD/target/x86_64-unknown-linux-gnu/release/serialwrapd" --build-linux-exit "$S22_BUILD_EXIT" \
-  --built-daemon-sha256 "$S22_DAEMON_SHA" --out $G/s22-gate.json
 python3 -m pytest -q tests/
 python3 -m policy_check --repo .
 ```

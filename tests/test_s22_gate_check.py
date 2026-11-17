@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -835,12 +836,13 @@ def test_gate_output_binds_release_sha_and_dry_run_cannot_supply_tested_sha(tmp_
 
 
 def test_plan_passes_actual_release_build_exit_to_identity() -> None:
-    """計畫須傳實際 build exit；失敗後留在 target 的舊 daemon 不得冒充本次產物。"""
+    """OD-93／s22-17：Task 13 Step 4 以共用 Stage 2 release artifact 作為候選來源，不重建裸 daemon。"""
     plan = (ROOT / "docs" / "rust-refactor" / "plans" / "07-slice22-console.md").read_text(encoding="utf-8")
 
-    assert "S22_BUILD_EXIT=$?" in plan
-    assert '--build-linux-exit "$S22_BUILD_EXIT"' in plan
-    assert "--build-linux-exit 0" not in plan
+    assert 'SHARED_EVIDENCE="target/s2-shared-evidence/$RUN_ID"' in plan
+    assert 'scripts/rust/gate_shared.sh --run-id "$RUN_ID"' in plan
+    assert 'scripts/rust/s22_gate.sh --shared-evidence "$SHARED_EVIDENCE" --run-id "$RUN_ID"' in plan
+    assert "cargo build --release -p sw-daemon -p sw-cli" not in plan
 
 
 def _shared_evidence_module():
@@ -959,6 +961,10 @@ def test_rejected_shared_evidence_cannot_fall_back_to_stale_green_l1(
     report = json.loads(report_path.read_text(encoding="utf-8"))
     judged = _section(report, f"s22_gate:{section}", platform)
     assert judged["verdict"] == "EVIDENCE_MISSING", judged
+    for section_name in ("console_conformance_pty", "blackbox_rust"):
+        assert _section(report, f"s22_gate:{section_name}", "linux")["verdict"] == "EVIDENCE_MISSING"
+    assert not (out / "reject" / "logs" / "console_conformance_pty.log").exists()
+    assert not (out / "reject" / "logs" / "blackbox_rust.log").exists()
     assert stale_path.is_file() and hashlib.sha256(stale_path.read_bytes()).hexdigest() == stale_sha
     assert "EVIDENCE_MISSING" in proc.stdout + proc.stderr
 
@@ -977,3 +983,100 @@ def test_s22_gate_records_bridge_selftest_report_path(tmp_path: Path):
     report_path = tmp_path / "shared/work/p7-ab/bridge-selftest/selftest-report.json"
     _rc, report = _run(tmp_path / "run", _good_reports(), bridge_selftest_report=report_path)
     assert report["l15_inputs"]["bridge_selftest_report"] == str(report_path)
+
+
+def test_s22_driver_runs_plan_derived_console_and_rust_blackbox() -> None:
+    """s22-01：兩個缺漏集合須由 driver 實際產生，argv 以 --plan／凍結 selector 為準。"""
+    driver = (ROOT / "scripts/rust/s22_gate.sh").read_text(encoding="utf-8")
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    selector = lock["sets"]["s22_gate:blackbox_rust"]["linux"]["selector"]["argv"]
+
+    assert '"--plan"' in driver and '"s22_gate:console_conformance_pty"' in driver
+    assert 'run_logged("console_conformance_pty",' in driver
+    assert 'set_id = "s22_gate:blackbox_rust"\n    selector = lock["sets"][set_id]["linux"]["selector"]' in driver
+    assert 'run_logged("blackbox_rust",' in driver
+    assert '"SERIALWRAP_AB_LABEL"] = "rust"' in driver
+    assert '"SERIALWRAP_CLI_EXE"] = str(cli_path)' in driver
+    assert '"SERIALWRAP_DAEMON_EXE"] = str(daemon_path)' in driver
+    l15_driver = driver.split("def l15_rows() -> list[dict]:", 1)[1].split("\nif not dry_run:", 1)[0]
+    assert 'env.pop("SERIALWRAP_CLI_EXE", None)' in l15_driver, "不可讓外層 CLI 覆寫 Python 基線"
+    assert 'env["SERIALWRAP_CLI_EXE"] = str(cli_path)' in l15_driver, "Rust L1.5 必須使用共用 release CLI"
+    assert '[sys.executable, "-m", "pytest", *selector["argv"], f"--junitxml={junit}"]' in driver
+    assert selector == ["-q", "tests/contract_blackbox/slice21", "tests/contract_blackbox/slice22"]
+
+
+def test_s22_shared_import_includes_win_test_and_ignores_windows_dir() -> None:
+    """s22-03：shared win_test 必須與兩組 Windows 能力列由同一 manifest 匯入。"""
+    driver = (ROOT / "scripts/rust/s22_gate.sh").read_text(encoding="utf-8")
+    assert 'for section in win_test windows_cap_windows_com windows_cap_windows_com_daemon; do' in driver
+    assert '"windows_l1:$set_id"' in driver
+    assert 'if shared_evidence or windows_dir is None:\n        return' in driver
+
+
+def test_s22_shared_build_identity_records_imported_stage2_bundle_and_cli_sha(tmp_path: Path) -> None:
+    """s22-15／s22-17：共用 release CLI／daemon 的 SHA 與 bundle 來源要寫入報告。"""
+    mod = _gate_module()
+    cli = tmp_path / "release" / "serialwrap"
+    daemon = tmp_path / "release" / "serialwrapd"
+    cli.parent.mkdir(parents=True)
+    cli.write_bytes(b"shared stage2 release cli")
+    daemon.write_bytes(b"shared stage2 release daemon")
+    daemon_sha = hashlib.sha256(daemon.read_bytes()).hexdigest()
+
+    bundle_path = tmp_path / "candidate-bundle"
+    bundle_identity = {"path": "candidate-bundle", "tree_sha256": "f" * 64, "git_revision": "a" * 40}
+    identity = mod.build_identity(
+        cli_path=cli,
+        daemon_path=daemon,
+        build_linux_exit=0,
+        built_daemon_sha256=daemon_sha,
+        shared_release_bundle=True,
+        shared_release_info={"status": "PASS", "bundle_path": str(bundle_path), "identity": bundle_identity},
+    )
+
+    assert identity["cli_sha256"] == hashlib.sha256(cli.read_bytes()).hexdigest()
+    assert identity["daemon_sha256"] == daemon_sha
+    assert identity["build"]["command"] == [
+        "bash", "scripts/rust/mkbundle.sh", "--release-bundle", "--stage", "2", "--profile", "release",
+        "--out", str(bundle_path),
+    ]
+    assert identity["build"]["source"]["bundle_path"] == str(bundle_path)
+    assert identity["build"]["source"]["bundle_identity"] == bundle_identity
+    assert identity["build"]["source"]["imported_cli_path"] == str(cli)
+    assert identity["build"]["source"]["imported_daemon_path"] == str(daemon)
+    driver = (ROOT / "scripts/rust/s22_gate.sh").read_text(encoding="utf-8")
+    assert "CLI SHA256" in driver and "daemon SHA256" in driver
+    assert '"--cli-path"' in driver and '"--shared-release-bundle"' in driver
+    assert '"--shared-release-info"' in driver
+    assert "checked = check_candidate_bundle(shared)" in driver
+    assert "recorded != expected or actual != expected" in driver
+    assert '"bundle_path": checked["path"]' in driver
+    assert 'str(run_dir / "logs/shared-release-bundle.json")' in driver
+
+
+def test_s22_driver_rejects_nonshared_formal_execution_before_running_python(tmp_path: Path) -> None:
+    """s22-01：正式 driver 不得以無共用 release artifact 的非共用模式執行。"""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    invoked = tmp_path / "python3-called"
+    fake_python = fake_bin / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\nprintf called > \"$S22_TEST_PYTHON_MARKER\"\nexit 91\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    out = tmp_path / "out"
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        "S22_TEST_PYTHON_MARKER": str(invoked),
+        "SERIALWRAP_L15_RUST_DAEMON": "",
+    }
+    proc = subprocess.run(
+        ["bash", "scripts/rust/s22_gate.sh", "--run-id", "no-shared", "--out", str(out)],
+        cwd=ROOT, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "非共用模式" in proc.stderr
+    assert not invoked.exists(), "拒絕前不應執行任何 Python 測試或 checker"
+    assert not (out / "no-shared" / "s22-gate.json").exists()
