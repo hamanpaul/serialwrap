@@ -477,8 +477,9 @@ def test_stitched_segments_fail(tmp_path):
 
 
 def test_short_run_fail(tmp_path):
+    """OD-94：低於 24 小時門檻的基線仍須判 FAIL。"""
     gate = _gate()
-    run = LongrunFixture(tmp_path).healthy(hours=47, platform="linux")
+    run = LongrunFixture(tmp_path).healthy(hours=23, platform="linux")
     out = gate.evaluate(run.inputs(mode="baseline"))
     assert _check(out, "continuous_duration")["result"] == "FAIL"
 
