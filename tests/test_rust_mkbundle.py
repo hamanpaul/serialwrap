@@ -1163,7 +1163,7 @@ def test_bundle_py_is_self_contained(tmp_path):
 
 
 def test_bundle_two_versions_have_distinct_tree_sha256(tmp_path):
-    # 0.4.1 is the previous release; the second bundle tracks the current VERSION.
+    # 0.4.1 為前一個正式版；第二個 bundle 使用目前的 VERSION。
     versions = ("0.4.1", VERSION)
     fingerprints: dict[str, str] = {}
     for version in versions:
