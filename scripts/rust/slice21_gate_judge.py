@@ -46,6 +46,7 @@ SLICE_BREAKER_PATH = ROOT / "scripts" / "rust" / "slice_breaker.py"
 TEST_SECTIONS: dict[str, str] = {
     "linux_l1": "linux",
     "linux_cap_posix_pty": "linux",
+    "linux_cap_posix_pty_workspace": "linux",
     "windows_native_l1": "windows",
     "windows_cap_windows_com": "windows",
     # OD-55（Windows 原生收集後）：windows 能力集合各一個 section。證據只能於原生 Windows 本機產生
@@ -96,13 +97,14 @@ CAPABILITY_SECTIONS: dict[str, dict[str, str]] = {
         "how_to_run": "於擁有者原生 Windows host（環境比照 scripts/rust/win-test.sh）執行 python3 scripts/rust/cargo_l1_results.py --platform windows --runner scripts/rust/win-runner.sh --out <dir>/windows_cap_supervisor_runtime/l1-results.json --caps-only --caps supervisor_runtime -- <s21_gate:cap_supervisor_runtime.windows selector argv>（建立暫時排程工作須設 SW_TEST_ALLOW_SCHTASKS，擁有者授權），再以 SW_GATE_LOCAL_WINDOWS_DIR=<dir> 匯入 gate；缺 LOCAL-WINDOWS 證據檔記 EVIDENCE_MISSING，不得 PASS（gate 以 caps-plan 由鎖 selector 推導，OD-53）"},
 }
 # F108：須以非 root 執行的測試類 section（section 片段 `run_euid` 須為非 0 整數）。sol P5-54dd588-2：linux_cap_posix_pty
-# 的必要集合含 sw-pal 預設測試（holder_scan_permission 等在 root 下必紅），比照 linux_l1。
-NON_ROOT_SECTIONS: frozenset[str] = frozenset({"linux_l1", "linux_cap_posix_pty"})
+# 的必要集合含 sw-pal 預設測試（holder_scan_permission 等在 root 下必紅），比照 linux_l1；posix_pty 能力列亦沿用非 root 執行，
+# 避免 /proc holder 掃描與權限語意受 root 改變。
+NON_ROOT_SECTIONS: frozenset[str] = frozenset({"linux_l1", "linux_cap_posix_pty", "linux_cap_posix_pty_workspace"})
 NON_TEST_SECTIONS: tuple[str, ...] = (
     "l15_ab", "event_latency", "wal_s1w_perf", "cfg_boundary", "policy_check", "case_uptake",
 )
 SECTION_ORDER: tuple[str, ...] = (
-    "cfg_boundary", "linux_l1", "linux_cap_posix_pty", "linux_cap_sys_admin",
+    "cfg_boundary", "linux_l1", "linux_cap_posix_pty", "linux_cap_posix_pty_workspace", "linux_cap_sys_admin",
     "linux_cap_supervisor_runtime", "windows_native_l1", "windows_cap_windows_com",
     "windows_cap_windows_native", "windows_cap_interactive_desktop", "windows_cap_supervisor_runtime",
     "blackbox_python", "blackbox_rust", "existing_suites_rust", "l15_ab", "event_latency", "wal_s1w_perf",

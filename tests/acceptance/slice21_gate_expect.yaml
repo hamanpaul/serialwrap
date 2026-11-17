@@ -36,7 +36,8 @@ parity:
   status_file: tests/acceptance/slice21_parity_status.yaml
 # #103：pytest_full 另須通過 Task 0b 的 Python 基線 parity 集合。
 # OD-55（2026-10-29）：s21_core.linux 的 cap_posix_pty__* 移入 s21_gate:cap_posix_pty（selector `--ignored cap_posix_pty__`），
-#   由 linux_cap_posix_pty section（cargo_l1_results.py --caps posix_pty）實跑承擔。其餘 linux 能力集合
+#   由 linux_cap_posix_pty_workspace section 以鎖中的 `--workspace --features test-fakes` 收集並執行；舊 linux_cap_posix_pty
+#   section 只承擔其 sw-pal 預設測試集合，避免 `-p sw-pal` 漏掉 sw-daemon 的能力列。其餘 linux 能力集合
 #   s21_gate:cap_{sys_admin,windows_native,interactive_desktop,supervisor_runtime} 需 CAP_SYS_ADMIN／原生 Windows／
 #   互動桌面／systemd 監管執行期；P5 第 6 輪 SPEC-GAP #2（編排者裁決）起各有一個 section（linux_cap_<cap>），gate 先探測能力，
 #   具備才以 --caps <cap> 實跑，否則記 EVIDENCE_MISSING 並標所需能力（sys_admin／supervisor_runtime → BLOCKED-OWNER＋實跑方式；
@@ -50,13 +51,14 @@ parity:
 #   證據只能於原生 Windows 本機產生（SW_GATE_LOCAL_WINDOWS_DIR 匯入），缺少時 EVIDENCE_MISSING（LOCAL-WINDOWS-TODO），不得 PASS。
 additional_required_sets:
   pytest_full: ["s21_gate:py_parity"]
-  linux_cap_posix_pty: ["s21_gate:cap_posix_pty"]
 sections:
   - {name: cfg_boundary, kind: non_test, required_set: null, command: "python3 scripts/rust/check_cfg_boundary.py"}
   - {name: linux_l1, kind: test, platform: linux, required_set: s21_core,
      command: "python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_l1/l1-results.json -- --workspace --features test-fakes -- --skip cap_"}
   - {name: linux_cap_posix_pty, kind: test, platform: linux, required_set: "s21_gate:linux_cap_posix_pty",
-     command: "python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_cap_posix_pty/l1-results.json <caps-plan（OD-53 由鎖 selector 推導）：--caps posix_pty -- -p sw-pal --features test-fakes>（euid 0 時以 SW_GATE_L1_USER 降權，F108）"}
+     command: "python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_cap_posix_pty/l1-results.json <caps-plan（OD-53 由鎖 selector 推導）：-p sw-pal --features test-fakes>（euid 0 時以 SW_GATE_L1_USER 降權，F108）"}
+  - {name: linux_cap_posix_pty_workspace, kind: test, platform: linux, required_set: "s21_gate:cap_posix_pty",
+     command: "python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_cap_posix_pty_workspace/l1-results.json <caps-plan（OD-53 由鎖 selector 推導）：--caps-only --caps posix_pty -- --workspace --features test-fakes -- --ignored cap_posix_pty__>（argv 逐字取鎖 selector；euid 0 時以 SW_GATE_L1_USER 降權）"}
   - {name: linux_cap_sys_admin, kind: test, platform: linux, required_set: "s21_gate:cap_sys_admin",
      command: "能力探測（euid 0 且 CapEff 含 CAP_SYS_ADMIN）通過時：python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_cap_sys_admin/l1-results.json <caps-plan：--caps-only --caps sys_admin -- 集合 selector argv>"}
   - {name: linux_cap_supervisor_runtime, kind: test, platform: linux, required_set: "s21_gate:cap_supervisor_runtime",

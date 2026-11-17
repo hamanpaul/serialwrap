@@ -207,9 +207,11 @@ if [[ "$DRY_RUN" == "1" || ( "$PREFLIGHT_OK" != "1" && "$EVIDENCE_RUN" != "1" ) 
   record cfg_boundary --reason "$why"
   record linux_l1 --required-set s21_core --reason "$why"
   record linux_cap_posix_pty --required-set s21_gate:linux_cap_posix_pty --reason "$why"
+  record linux_cap_posix_pty_workspace --required-set s21_gate:cap_posix_pty --reason "$why"
   record linux_cap_sys_admin --required-set s21_gate:cap_sys_admin --reason "$why"
   record linux_cap_supervisor_runtime --required-set s21_gate:cap_supervisor_runtime --reason "$why"
   record py_parity --required-set s21_gate:py_parity_full --reason "$why"
+  record py_parity_76_80 --required-set s21_gate:py_parity_76_80 --reason "$why"
   record windows_native_l1 --required-set s21_core --reason "$why；需原生 Windows（win-test.sh）"
   if [[ "$WIN_COM_PLAN_OK" == "1" ]]; then
     record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com --command "$WIN_COM_COMMAND" --reason "$com_reason"
@@ -320,6 +322,22 @@ elif nonroot_cmd "$RUN_DIR/linux_cap_posix_pty" python3 scripts/rust/cargo_l1_re
 else
   record linux_cap_posix_pty --required-set s21_gate:linux_cap_posix_pty --section-verdict EVIDENCE_MISSING --run-euid 0 \
     --reason "F108／sol P5-54dd588-2：gate 以 root 執行且無法降權（未設 SW_GATE_L1_USER 或無 setpriv）；linux_cap_posix_pty 須以非 root 補跑"
+fi
+
+# 3a. 完整 workspace posix_pty 能力集合（slice21-01）：selector 逐字取 s21_gate:cap_posix_pty，涵蓋 sw-daemon 與 sw-pal。
+mkdir -p "$RUN_DIR/linux_cap_posix_pty_workspace"
+if ! caps_args linux_cap_posix_pty_workspace; then
+  record linux_cap_posix_pty_workspace --required-set s21_gate:cap_posix_pty --reason "必要集合 selector 推導不出收集器 --caps（OD-53）"
+elif nonroot_cmd "$RUN_DIR/linux_cap_posix_pty_workspace" python3 scripts/rust/cargo_l1_results.py --platform linux \
+    --out "$RUN_DIR/linux_cap_posix_pty_workspace/l1-results.json" "${CAPS_ARGV[@]}"; then
+  run_logged linux_cap_posix_pty_workspace "${NONROOT_CMD[@]}"
+  record linux_cap_posix_pty_workspace --required-set s21_gate:cap_posix_pty \
+    --command "cargo_l1_results.py --platform linux ${CAPS_ARGV[*]}" \
+    --exit "$LAST_RC" --log logs/linux_cap_posix_pty_workspace.log \
+    --l1-results linux_cap_posix_pty_workspace/l1-results.json --run-euid "$NONROOT_EUID"
+else
+  record linux_cap_posix_pty_workspace --required-set s21_gate:cap_posix_pty --section-verdict EVIDENCE_MISSING --run-euid 0 \
+    --reason "F108：gate 以 root 執行且無法降權（未設 SW_GATE_L1_USER 或無 setpriv）；linux_cap_posix_pty_workspace 須以非 root 補跑"
 fi
 
 # 3b. OD-55 linux 能力集合（P5 第 6 輪 SPEC-GAP #2，編排者裁決）：先探測能力，具備才以 --caps <cap> 實跑；

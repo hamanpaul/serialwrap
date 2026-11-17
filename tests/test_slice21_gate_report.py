@@ -39,6 +39,7 @@ def test_blocked_owner_items_can_never_be_pass():
     assert set(s["properties"]["verdict"]["enum"]) == {"READY_FOR_OWNER_EVIDENCE", "INCOMPLETE", "FAIL"}
     sec = s["properties"]["sections"]["items"]["required"]
     assert {"skipped", "deselected", "required_set", "l1_results", "l1_verdict", "ignored"} <= set(sec)
+    assert "linux_cap_posix_pty_workspace" in s["properties"]["sections"]["items"]["properties"]["name"]["enum"]
     assert "expected_min_passed" not in s["properties"]["sections"]["items"]["properties"]   # R5-F3：計數門檻已移除
     assert {"cli_sha256", "daemon_sha256", "daemon_implementation", "contracts_revision", "cases_lock_sha256", "tool_revision", "platform"} <= set(s["properties"]["identity"]["required"])
 
@@ -79,6 +80,12 @@ def test_gate_dry_run_lists_all_blocked_owner_items(tmp_path):
     assert ids == [f"BO-S21-{i:02d}" for i in range(1, 17)]
     assert all(b["status"] == "BLOCKED-OWNER" for b in rep["blocked_owner"])
     assert rep["verdict"] == "INCOMPLETE"                            # dry-run 永不 READY
+    posix_pty = [s for s in rep["sections"] if s["name"] == "linux_cap_posix_pty_workspace"][0]
+    assert posix_pty["required_set"] == "s21_gate:cap_posix_pty"
+    assert posix_pty["status"] == "EVIDENCE_MISSING"
+    parity_76_80 = [s for s in rep["sections"] if s["name"] == "py_parity_76_80"][0]
+    assert parity_76_80["required_set"] == "s21_gate:py_parity_76_80"
+    assert parity_76_80["status"] == "EVIDENCE_MISSING"
     com = [s for s in rep["sections"] if s["name"] == "windows_cap_windows_com"][0]
     assert com["status"] == "EVIDENCE_MISSING"                      # 未提供 SW_TEST_COM_PAIR
     lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
