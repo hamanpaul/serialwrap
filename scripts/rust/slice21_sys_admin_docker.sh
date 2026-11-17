@@ -193,7 +193,6 @@ docker run --rm --cap-add SYS_ADMIN \
   --mount "type=bind,source=$GIT_COMMON_DIR_HOST,target=$GIT_COMMON_DIR_HOST,readonly" \
   --mount "type=bind,source=$ROOT,target=$ROOT,readonly" \
   --mount "type=bind,source=$GIT_DIR_HOST,target=$GIT_DIR_HOST,readonly" \
-
   --mount "type=bind,source=$CARGO_BIN_HOST,target=/host-cargo-bin,readonly" \
   --mount "type=bind,source=$CARGO_REGISTRY_HOST,target=/host-cargo-registry,readonly" \
   --mount "type=bind,source=$RUSTUP_HOME_HOST,target=/host-rustup,readonly" \
