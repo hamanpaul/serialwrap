@@ -265,3 +265,106 @@ def test_cli_selftest_exit_code(tmp_path):
         check=False,
     )
     assert only_st06.returncode == 0, only_st06.stdout + only_st06.stderr
+
+
+@pytest.mark.parametrize("emit_eof", [True, False])
+def test_st05_waits_for_stdout_eof_before_continuing_tx(tmp_path, monkeypatch, emit_eof):
+    import json
+    import threading
+    from types import SimpleNamespace
+
+    from uart_stdio_bridge.selftest import checks
+
+    class _Clock:
+        now = 0.0
+        emitted = False
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+            if emit_eof and seconds < 0.1 and not self.emitted:
+                _bridges[-1].writer.append(meta={"event": "dut_stdout_eof"})
+                self.emitted = True
+
+    class _Writer:
+        def __init__(self, path, **_kwargs):
+            self.path = Path(path)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text("", encoding="utf-8")
+            self.seq = 0
+
+        def append(self, **record):
+            self.seq += 1
+            record = {"seq": self.seq, **record}
+            with self.path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record) + "\n")
+
+    _bridges = []
+
+    class _Bridge:
+        def __init__(self, _cfg, _endpoint, _dut, writer, **_kwargs):
+            self.writer = writer
+            self._done_event = threading.Event()
+            self.failure = None
+            _bridges.append(self)
+
+        def start(self):
+            return None
+
+        def handle_action(self, action, _params, _action_id):
+            if action == "shutdown":
+                self.writer.append(meta={"event": "bridge_stop"})
+                self._done_event.set()
+            return {}
+
+        def wait(self):
+            return 0
+
+    class _Serial:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def write(self, data):
+            _bridges[-1].writer.append(observation="dut_stdin_write", len=len(data))
+            return len(data)
+
+        def read(self, size):
+            return b"A" * size
+
+    monkeypatch.setattr(checks, "time", _Clock())
+    monkeypatch.setattr(checks, "open_endpoint", lambda _spec: object())
+    monkeypatch.setattr(checks, "DutProcess", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(checks, "EvidenceWriter", _Writer)
+    monkeypatch.setattr(checks, "Bridge", _Bridge)
+    monkeypatch.setitem(sys.modules, "serial", SimpleNamespace(Serial=lambda *_args, **_kwargs: _Serial()))
+
+    ev_dir = tmp_path / "st05"
+    ev_dir.mkdir()
+    ctx = checks.SelftestContext(
+        endpoint="win-serial",
+        com_pair=("COM20", "COM21"),
+        transport_mode="virtual_com0com",
+        work_dir=tmp_path,
+    )
+
+    result = checks._run_st05(ctx, ev_dir)
+
+    if not emit_eof:
+        assert result.verdict == "FAIL"
+        assert "dut_stdout_eof" in result.reason
+        return
+
+    assert result.verdict == "PASS", result.reason
+    wire = [json.loads(line) for line in (ev_dir / "wire.ndjson").read_text().splitlines()]
+    eof_seq = next(record["seq"] for record in wire if record.get("meta", {}).get("event") == "dut_stdout_eof")
+    post_eof_tx = next(
+        record["seq"]
+        for record in wire
+        if record.get("observation") == "dut_stdin_write" and record.get("len") == 512
+    )
+    assert eof_seq < post_eof_tx

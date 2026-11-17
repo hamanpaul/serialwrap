@@ -202,6 +202,43 @@ def _write_all(fd: int, data: bytes, timeout_s: float = 10.0) -> None:
                 raise OSError("POLLERR 發生於檔案描述子")
 
 
+def _wire_has_meta(wire_path: pathlib.Path, event: str) -> bool:
+    """檢查 wire 前綴是否已持久化指定 META 事件。"""
+    try:
+        lines = wire_path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return False
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        meta = record.get("meta")
+        if isinstance(meta, dict) and meta.get("event") == event:
+            return True
+    return False
+
+
+def _wait_for_wire_meta(
+    wire_path: pathlib.Path,
+    event: str,
+    *,
+    timeout_s: float,
+    poll_s: float = 0.01,
+) -> bool:
+    """有界等待 wire 證據出現指定 META，不以固定 sleep 當同步條件。"""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if _wire_has_meta(wire_path, event):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(poll_s, remaining))
+
+
 # ST-03(a) Windows 分支的有界期限：寫入與讀取皆須於期限內完成，否則 fail closed（不無限等待）。
 ST03_WIN_WRITE_TIMEOUT_S = 120.0
 ST03_WIN_READ_DEADLINE_S = 120.0
@@ -862,6 +899,9 @@ def _run_st04(ctx: SelftestContext, ev_dir: pathlib.Path) -> CheckResult:
     return CheckResult("ST-04", "PASS", "stderr 大量輸出隔離正常，1 MiB 往返耗時合格且 wire 中無 stderr bytes", str(ev_dir))
 
 
+ST05_EOF_TIMEOUT_S = 5.0
+
+
 def _run_st05(ctx: SelftestContext, ev_dir: pathlib.Path) -> CheckResult:
     """ST-05: EOF 偵測 (DUT --close-stdout-after-bytes 1024 留 META dut_stdout_eof 且 TX 仍轉送)。"""
     if ctx.endpoint == "win-serial" and not ctx.com_pair:
@@ -884,6 +924,7 @@ def _run_st05(ctx: SelftestContext, ev_dir: pathlib.Path) -> CheckResult:
     data_first = b"A" * 1024
     data_second = b"B" * 512
     recvd = b""
+    eof_meta_observed = False
 
     try:
         if ctx.endpoint == "posix-pty":
@@ -891,7 +932,9 @@ def _run_st05(ctx: SelftestContext, ev_dir: pathlib.Path) -> CheckResult:
             try:
                 _write_all(fd, data_first)
                 recvd = _read_exact(fd, 1024, timeout_s=5.0)
-                time.sleep(0.2)
+                eof_meta_observed = _wait_for_wire_meta(
+                    ev_dir / "wire.ndjson", "dut_stdout_eof", timeout_s=ST05_EOF_TIMEOUT_S
+                )
                 _write_all(fd, data_second)
                 time.sleep(0.2)
             finally:
@@ -901,7 +944,9 @@ def _run_st05(ctx: SelftestContext, ev_dir: pathlib.Path) -> CheckResult:
             with serial.Serial(ctx.com_pair[0], 115200, timeout=5.0) as ser:
                 ser.write(data_first)
                 recvd = ser.read(1024)
-                time.sleep(0.2)
+                eof_meta_observed = _wait_for_wire_meta(
+                    ev_dir / "wire.ndjson", "dut_stdout_eof", timeout_s=ST05_EOF_TIMEOUT_S
+                )
                 ser.write(data_second)
                 time.sleep(0.2)
     finally:
@@ -914,6 +959,9 @@ def _run_st05(ctx: SelftestContext, ev_dir: pathlib.Path) -> CheckResult:
 
     if recvd != data_first:
         return CheckResult("ST-05", "FAIL", "關閉 stdout 前的 1024 位元組接收不完整", str(ev_dir))
+
+    if not eof_meta_observed:
+        return CheckResult("ST-05", "FAIL", "等待 dut_stdout_eof META 逾時", str(ev_dir))
 
     wire_lines = [
         json.loads(line)
