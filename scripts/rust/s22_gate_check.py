@@ -658,6 +658,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="指定 release 建置命令的退出碼")
     ap.add_argument("--built-daemon-sha256", default=None,
                     help="release 建置成功當下記錄的 serialwrapd SHA-256")
+    ap.add_argument("--bridge-selftest-report", type=pathlib.Path, default=None,
+                    help="記錄 L1.5 bridge 自測報告路徑，不變更資格判定")
     ap.add_argument("--dry-run", action="store_true", help="在輸出標記 dry_run；不改變既有判定")
     ap.add_argument("--evidence-missing", action="append", default=[], metavar="SET_ID/PLATFORM",
                     help="明確標記遭拒的共用證據；該集合不讀取舊 L1 報告")
@@ -714,6 +716,8 @@ def main(argv: list[str] | None = None) -> int:
         identity_mismatch = sorted(set(identity_mismatch + checked_mismatch))
     payload = {"sections": sections, "cases": cases, "map_coverage": coverage, "parity_rows": parity,
                "prereqs": prereqs, "breaker": breaker, "l15_reasons": l15_reasons, "result": result,
+               "l15_inputs": {"bridge_selftest_report": str(args.bridge_selftest_report)
+                              if args.bridge_selftest_report else None},
                "dry_run": bool(args.dry_run), "identity": identity,
                "identity_problems": {"missing": identity_missing, "mismatch": identity_mismatch}}
     args.out.parent.mkdir(parents=True, exist_ok=True)
