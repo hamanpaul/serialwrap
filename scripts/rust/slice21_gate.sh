@@ -211,6 +211,7 @@ if [[ "$DRY_RUN" == "1" || ( "$PREFLIGHT_OK" != "1" && "$EVIDENCE_RUN" != "1" ) 
   record linux_cap_sys_admin --required-set s21_gate:cap_sys_admin --reason "$why"
   record linux_cap_supervisor_runtime --required-set s21_gate:cap_supervisor_runtime --reason "$why"
   record py_parity --required-set s21_gate:py_parity_full --reason "$why"
+  record py_parity_windows --required-set s21_gate:py_parity --reason "$why；須以 shared-evidence --windows-l1 匯入原生 pytest L1"
   record py_parity_76_80 --required-set s21_gate:py_parity_76_80 --reason "$why"
   record windows_native_l1 --required-set s21_core --reason "$why；需原生 Windows（win-test.sh）"
   if [[ "$WIN_COM_PLAN_OK" == "1" ]]; then
@@ -806,6 +807,24 @@ if [[ "${#pyp_argv[@]}" -gt 0 ]]; then
     --exit "$LAST_RC" --log logs/py_parity.log --l1-results py_parity/l1-results.json
 else
   record py_parity --required-set s21_gate:py_parity_full --reason "l1_required.lock.json 無 s21_gate:py_parity_full.linux selector"
+fi
+
+# 10b2. F-S19：Windows 原生 Python L1 只從共用證據匯入；缺少／拒收時保留 EVIDENCE_MISSING。
+if [[ -n "$SHARED_EVIDENCE" ]]; then
+  if shared_windows_l1 s21_gate:py_parity slice21 "$RUN_DIR/shared-import/windows-py-parity"; then
+    mkdir -p "$RUN_DIR/py_parity_windows"
+    cp "$RUN_DIR/shared-import/windows-py-parity/l1-results.json" "$RUN_DIR/py_parity_windows/l1-results.json"
+    echo "已匯入 shared-evidence windows_l1:s21_gate:py_parity；未啟動 Windows pytest runner。" \
+      >"$RUN_DIR/logs/py_parity_windows.log"
+    record py_parity_windows --required-set s21_gate:py_parity --command "shared-evidence windows_l1:s21_gate:py_parity" \
+      --exit "$SHARED_L1_RC" --log logs/py_parity_windows.log --l1-results py_parity_windows/l1-results.json
+  else
+    record py_parity_windows --required-set s21_gate:py_parity --section-verdict EVIDENCE_MISSING \
+      --reason "共用 Windows pytest L1 缺失或 provenance／selector 不符；未重跑。" --log logs/shared-windows-s21_gate:py_parity.stderr
+  fi
+else
+  record py_parity_windows --required-set s21_gate:py_parity --section-verdict EVIDENCE_MISSING \
+    --reason "Windows 原生 pytest parity 僅接受 shared-evidence --windows-l1 匯入；未代跑。"
 fi
 
 # 10c. 計畫 06 Task 0b #76～#80 Python 基線 parity（P5 第 8 輪 SPEC-GAP #1）：獨立 add-only 集合，保留兩個既有 py_parity 集合。

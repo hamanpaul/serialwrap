@@ -87,6 +87,9 @@ sections:
   - {name: case_uptake, kind: non_test, required_set: null, command: "slice_breaker.acceptance_rate（Task 0b）"}
   - {name: py_parity, kind: test, platform: linux, required_set: "s21_gate:py_parity_full",
      command: "SW_RESOURCE_REPORT=<run>/py_parity/l1-results.json python3 -m pytest <s21_gate:py_parity_full selector.argv>"}
+  # F-S19（編排者裁決 2026-11-17）：Windows 原生 Python drain-stalled 證據只由 shared-evidence 的 --windows-l1 匯入。
+  - {name: py_parity_windows, kind: test, platform: windows, required_set: "s21_gate:py_parity",
+     command: "scripts/stage0/win-pytest.sh -q tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::test_windows_guarded_write_stall_drain_stalled_native -m 'windows_native and windows_com'；L1 由 gate_shared.sh --windows-l1 匯入"}
   - {name: py_parity_76_80, kind: test, platform: linux, required_set: "s21_gate:py_parity_76_80",
      command: "SW_RESOURCE_REPORT=<run>/py_parity_76_80/l1-results.json python3 -m pytest <s21_gate:py_parity_76_80 selector.argv>"}
   - {name: pytest_full, kind: test, platform: linux, required_set: "s21_gate:pytest_full",

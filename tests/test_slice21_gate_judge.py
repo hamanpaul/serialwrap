@@ -53,6 +53,8 @@ TEST_SECTIONS = {
     "linux_cap_supervisor_runtime": ("linux", "s21_gate:cap_supervisor_runtime"),
     # SPEC-GAP #1（編排者裁決）：py_parity section 以完整 selector 的新集合判定（舊 s21_gate:py_parity 仍由 pytest_full 承擔）
     "py_parity": ("linux", "s21_gate:py_parity_full"),
+    # F-S19：Windows 原生 pytest 證據由共用 windows_l1 匯入。
+    "py_parity_windows": ("windows", "s21_gate:py_parity"),
     # P5 第 8 輪 SPEC-GAP #1：計畫 06 Task 0b #76～#80 另以 add-only 新集合承擔。
     "py_parity_76_80": ("linux", "s21_gate:py_parity_76_80"),
 }
@@ -65,7 +67,7 @@ GATE_NODEIDS = {  # 每個 gate 集合的凍結 nodeid（測試用，兩個一�
     name: [f"tests/test_{name}.py::test_{i}" for i in ("alpha", "beta")]
     for name in ("linux_cap_posix_pty", "linux_cap_posix_pty_workspace", "windows_cap_windows_com",
                  "blackbox_python", "blackbox_rust", "existing_suites_rust", "pytest_full", *CAP_OF,
-                 "py_parity", "py_parity_76_80")
+                 "py_parity", "py_parity_windows", "py_parity_76_80")
 }
 
 
@@ -173,7 +175,12 @@ def _lock() -> dict:
             # OD-55：同名能力集合同時有 linux 與 windows section（如 s21_gate:cap_windows_native），依平台合併
             argv = (["--workspace", "--features", "test-fakes", "--", "--ignored", "cap_posix_pty__"]
                     if name == "linux_cap_posix_pty_workspace" else ["pytest", "-q"])
-            sets.setdefault(set_id, {})[platform] = {"nodeids": list(GATE_NODEIDS[name]), "selector": {"argv": argv}}
+            if name == "py_parity_windows":
+                argv = ["-q", GATE_NODEIDS[name][0], "-m", "windows_native and windows_com"]
+            selector = {"argv": argv}
+            if name == "py_parity_windows":
+                selector.update({"markexpr": "windows_native and windows_com", "paths": [GATE_NODEIDS[name][0]]})
+            sets.setdefault(set_id, {})[platform] = {"nodeids": list(GATE_NODEIDS[name]), "selector": selector}
     return {"schema_version": 1, "sets": sets}
 
 
@@ -235,6 +242,13 @@ class _Case:
         if name.startswith("windows_cap_") and name in CAP_OF:
             l1["provenance"] = {"git": {"head": "e" * 40, "clean": True,
                                          "end": {"head": "e" * 40, "clean": True}}}
+        if name == "py_parity_windows":
+            markexpr = "windows_native and windows_com"
+            l1["argv"] = ["/x/pytest/__main__.py", "-q", GATE_NODEIDS[name][0], "-m", markexpr]
+            l1["markexpr"] = markexpr
+            l1["provenance"] = {"schema": "pytest-l1-provenance.v1", "platform": "windows",
+                                "git": {"head": "e" * 40, "clean": True,
+                                        "end": {"head": "e" * 40, "clean": True}}}
         return l1
 
     def write_l1(self, name: str, report: dict) -> str:
@@ -633,6 +647,59 @@ def _parity_cfg(rows: list[dict]) -> dict:
             "source_rows": [{"id": r["id"], "take": "P5"} for r in rows], "source_sha256_actual": None}
 
 
+@pytest.mark.parametrize("problem", ["missing", "bad_format", "wrong_paragraph", "non_string", "not_source_row"])
+def test_not_applicable_requires_source_row_and_specific_ruling(case, problem):
+    """免測不得略過逐列列名及具體文件段落出處。"""
+    j = _judge_mod()
+    row = {"id": "A-86", "status": "NOT_APPLICABLE"}
+    plan = "docs/rust-refactor/plans/06-slice21-daemon-core.md"
+    lines = (ROOT / plan).read_text(encoding="utf-8").splitlines()
+    row_line = next(i for i, line in enumerate(lines, 1) if "| #102 |" in line and "A-86" in line)
+    if problem == "bad_format":
+        row["ruling"] = "docs/rust-refactor/plans/06-slice21-daemon-core.md"
+    elif problem == "wrong_paragraph":
+        row["ruling"] = f"{plan}#L{row_line + 1000}"
+    elif problem == "non_string":
+        row["ruling"] = {"path": plan, "line": row_line}
+    elif problem not in ("missing", "non_string"):
+        row["ruling"] = f"{plan}#L{row_line}"
+    parity = _parity_cfg([row])
+    if problem == "not_source_row":
+        parity["source_rows"] = [{"id": "#102", "take": "P5"}]
+
+    result = j.judge_parity(parity, set(), set())
+
+    if problem == "not_source_row":
+        assert result["incomplete"] is True
+        assert result["problems"]
+    else:
+        assert result["rows"][0]["status"] == "INCOMPLETE"
+        assert result["incomplete"] is True
+        if problem == "non_string":
+            assert isinstance(result["rows"][0]["ruling"], str)
+
+
+def test_not_applicable_with_specific_plan_ruling_does_not_block_parity(case):
+    """P5-T19 #102 的逐列免測狀態須帶指向計畫明確列的引用，且不要求不存在的測試 nodeid。"""
+    j = _judge_mod()
+    plan = "docs/rust-refactor/plans/06-slice21-daemon-core.md"
+    lines = (ROOT / plan).read_text(encoding="utf-8").splitlines()
+    row_line = next(i for i, line in enumerate(lines, 1) if "| #102 |" in line and "A-86" in line)
+    parity = _parity_cfg([{"id": "A-86", "status": "NOT_APPLICABLE", "ruling": f"{plan}#L{row_line}"}])
+
+    result = j.judge_parity(parity, set(), set())
+
+    assert result["rows"][0]["status"] == "NOT_APPLICABLE"
+    assert result["rows"][0]["ruling"] == f"{plan}#L{row_line}"
+    assert result["summary"] == {"NOT_APPLICABLE": 1}
+    assert result["incomplete"] is False
+
+    case.parity = parity
+    report = j.judge(case.report(), case.expect())
+    assert report["parity_amendments"]["rows"][0]["status"] == "NOT_APPLICABLE"
+    assert report["verdict"] == "READY_FOR_OWNER_EVIDENCE"
+
+
 def test_owner_decision_pending_requires_registered_decision(case):
     """4920d90 #1：OWNER-DECISION-PENDING 須帶存在於 pending_decisions 的 decision id，否則降為 INCOMPLETE。"""
     case.parity = _parity_cfg([{"id": "#32", "status": "OWNER-DECISION-PENDING"}])
@@ -933,6 +1000,7 @@ def test_capability_sections_and_py_parity_match_expect_and_lock():
     assert {test_secs[n][1] for n in CAP_OF} == {f"s21_gate:cap_{c}" for c in CAP_OF.values()}
     assert {n: c["cap"] for n, c in j.CAPABILITY_SECTIONS.items()} == CAP_OF
     assert test_secs["py_parity"] == ("linux", "s21_gate:py_parity_full")
+    assert test_secs["py_parity_windows"] == ("windows", "s21_gate:py_parity")
     assert "s21_gate:py_parity" in exp["additional_required_sets"]["pytest_full"]
     carried = {(sid, test_secs[n][0]) for n, (_, sid) in test_secs.items()}
     carried |= {(sid, test_secs[n][0]) for n, sids in exp["additional_required_sets"].items() for sid in sids}
@@ -940,6 +1008,32 @@ def test_capability_sections_and_py_parity_match_expect_and_lock():
     uncarried = sorted(f"{sid}.{plat}" for sid, spec in lock["sets"].items() if sid.startswith("s21_gate:")
                        for plat in spec if (sid, plat) not in carried)
     assert uncarried == [], uncarried
+
+
+def test_windows_py_parity_passed_pool_requires_accepted_windows_l1(case):
+    """F-S19 只有 Windows selector L1 判 PASS 時才加入 parity passed pool；缺證仍是 INCOMPLETE。"""
+    nodeid = "tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::test_windows_guarded_write_stall_drain_stalled_native"
+    selector = ["-q", nodeid, "-m", "windows_native and windows_com"]
+    exp = case.expect()
+    exp["lock"]["sets"]["s21_gate:py_parity"]["windows"] = {
+        "nodeids": [nodeid],
+        "selector": {"argv": selector, "markexpr": "windows_native and windows_com", "paths": [nodeid]},
+    }
+    case.l1["py_parity_windows"] = _l1("windows", "pytest", [_row(nodeid)])
+    case.l1["py_parity_windows"]["argv"] = ["/x/pytest/__main__.py", *selector]
+    case.l1["py_parity_windows"]["markexpr"] = "windows_native and windows_com"
+    case.parity = _parity_cfg([{"id": "F-S19", "status": "PASS", "tests": [nodeid]}])
+    exp["parity"] = case.parity
+
+    passed = _judge_mod().judge(case.report(), exp)
+    assert _sec(passed, "py_parity_windows")["status"] == "PASS"
+    assert passed["parity_amendments"]["rows"][0]["status"] == "PASS"
+
+    case.l1["py_parity_windows"] = None
+    missing = _judge_mod().judge(case.report(), exp)
+    assert _sec(missing, "py_parity_windows")["status"] == "EVIDENCE_MISSING"
+    assert missing["parity_amendments"]["rows"][0]["status"] == "INCOMPLETE"
+    assert missing["parity_amendments"]["incomplete"] is True
 
 
 def test_py_parity_full_has_complete_selector_and_keeps_old_set():
@@ -985,9 +1079,11 @@ def test_py_parity_76_80_has_additive_plan_scope():
 
 def test_gate_script_runs_capability_and_py_parity_sections():
     text = (ROOT / "scripts/rust/slice21_gate.sh").read_text(encoding="utf-8")
-    for name in (*CAP_OF, "py_parity", "py_parity_76_80"):
+    for name in (*CAP_OF, "py_parity", "py_parity_windows", "py_parity_76_80"):
         assert f"record {name} " in text, name                  # dry-run／拒絕開跑分支
     assert text.count("record py_parity ") >= 2                 # ＋實跑分支
+    assert text.count("record py_parity_windows ") >= 2
+    assert "shared_windows_l1 s21_gate:py_parity slice21" in text
     assert text.count("record py_parity_76_80 ") >= 2
     assert text.count("record linux_cap_posix_pty_workspace ") >= 2
     # 實跑分支：四個能力逐一探測，具備才 --caps <cap> 實跑，並把探測結果記入 section

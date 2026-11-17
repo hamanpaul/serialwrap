@@ -15,6 +15,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import subprocess
 import sys
 from collections.abc import Mapping
 from typing import Any
@@ -68,6 +69,7 @@ def _reset() -> None:
         meta={},
         report_path=None,
         deployed_start=None,
+        windows_git_start=None,
     )
 
 
@@ -78,6 +80,34 @@ def capture_deployed_env(env: Mapping[str, str]) -> None:
     """root conftest 在清除 env 隔離前呼叫，保留 `SERIALWRAP_CLI_EXE`／`SERIALWRAP_DAEMON_EXE`（R5-F4）。"""
     global _ENV_SNAPSHOT
     _ENV_SNAPSHOT = {CLI_ENV: env.get(CLI_ENV), DAEMON_ENV: env.get(DAEMON_ENV)}
+
+
+def _report_output_paths(config: pytest.Config, report_path: str) -> list[pathlib.Path]:
+    paths = [pathlib.Path(report_path)]
+    for name in ("xmlpath", "junitxml"):
+        raw = getattr(config.option, name, None)
+        if raw:
+            paths.append(pathlib.Path(raw))
+    return paths
+
+
+def _windows_git_snapshot(root: pathlib.Path, output_paths: list[pathlib.Path]) -> dict[str, Any]:
+    """取得 pytest 執行前後的 Git HEAD 與乾淨狀態，排除本次輸出的 L1／JUnit 檔。"""
+    root = pathlib.Path(root).resolve()
+    try:
+        head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True,
+                              text=True, check=True, timeout=10).stdout.strip()
+        status_argv = ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=all", "--", "."]
+        for output in output_paths:
+            try:
+                relative = output.resolve().relative_to(root).as_posix()
+            except (OSError, ValueError):
+                continue
+            status_argv.append(f":(exclude){relative}")
+        status = subprocess.run(status_argv, capture_output=True, text=True, check=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return {"head": None, "clean": False}
+    return {"head": head or None, "clean": bool(head) and not status.stdout.strip()}
 
 
 def _env(name: str) -> str | None:
@@ -161,6 +191,10 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     _state["report_path"] = path
     # 先移除上一次執行留下的報告：被 kill 的本次執行不得讓舊的 finished:true 報告冒充結果（P2-T13 審查修正）。
     pathlib.Path(path).unlink(missing_ok=True)
+    if rr.effective_platform() == "windows":
+        _state["windows_git_start"] = _windows_git_snapshot(
+            session.config.rootpath, _report_output_paths(session.config, path)
+        )
     _state["deployed_start"] = _measure_deployed()
 
 
@@ -330,4 +364,12 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         "deployed_content": deployed,
         "uart_kind": uart_kind,
     }
+    if rr.effective_platform() == "windows":
+        git_start = _state.get("windows_git_start") or {"head": None, "clean": False}
+        git_end = _windows_git_snapshot(config.rootpath, _report_output_paths(config, path))
+        report["provenance"] = {
+            "schema": "pytest-l1-provenance.v1",
+            "platform": "windows",
+            "git": {**git_start, "end": git_end},
+        }
     _write_report(path, report)

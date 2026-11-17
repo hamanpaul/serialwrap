@@ -285,16 +285,24 @@ def _load_manifest(shared_dir: Path) -> tuple[dict[str, Any] | None, list[str]]:
     return data, []
 
 
-def _locked_argv(set_id: str, platform: str, lock_path: Path) -> tuple[list[str] | None, str | None]:
+def _locked_selector(set_id: str, platform: str, lock_path: Path) -> tuple[Mapping[str, Any] | None, str | None]:
     try:
         lock = json.loads(lock_path.read_text(encoding="utf-8"))
         selector = lock["sets"][set_id][platform]["selector"]
-        argv = selector["argv"]
     except (OSError, ValueError, KeyError, TypeError) as exc:
         return None, f"鎖檔 selector 不可讀：{set_id}/{platform}：{exc}"
-    if not isinstance(argv, list) or not all(isinstance(part, str) for part in argv):
-        return None, f"鎖檔 selector argv 格式錯誤：{set_id}/{platform}"
-    return argv, None
+    if not isinstance(selector, Mapping) or not isinstance(selector.get("argv"), list) \
+            or not all(isinstance(part, str) for part in selector["argv"]):
+        return None, f"鎖檔 selector 格式錯誤：{set_id}/{platform}"
+    return selector, None
+
+
+def _locked_argv(set_id: str, platform: str, lock_path: Path) -> tuple[list[str] | None, str | None]:
+    selector, error = _locked_selector(set_id, platform, lock_path)
+    if error:
+        return None, error
+    assert selector is not None
+    return list(selector["argv"]), None
 
 
 def _locked_nodeids(set_id: str, platform: str, lock_path: Path) -> tuple[list[str] | None, str | None]:
@@ -320,21 +328,37 @@ def _evaluate_windows_l1(report: Mapping[str, Any], *, required_set: str, expect
         reasons.append(selector_error)
     if nodeids_error:
         reasons.append(nodeids_error)
-    if report.get("format") != "l1-results.v1" or report.get("runner") != "cargo" \
+    selector_doc, _selector_error = _locked_selector(required_set, "windows", lock_path)
+    runner = report.get("runner")
+    if report.get("format") != "l1-results.v1" or runner not in ("cargo", "pytest") \
             or report.get("platform") != "windows":
-        reasons.append("Windows L1 必須是 Cargo l1-results.v1")
-    if selector is not None and report.get("argv") != selector:
-        reasons.append(f"Windows L1 argv 不符：report={report.get('argv')!r} lock={selector!r}")
+        reasons.append("Windows L1 必須是原生 Windows l1-results.v1")
+    if selector is not None and runner == "cargo" and report.get("argv") != selector:
+        reasons.append(f"Windows Cargo L1 argv 不符：report={report.get('argv')!r} lock={selector!r}")
+    if runner == "pytest":
+        if required_set != "s21_gate:py_parity":
+            reasons.append(f"Windows pytest L1 僅允許 s21_gate:py_parity，拒收 {required_set}")
+        expected_markexpr = selector_doc.get("markexpr", "") if selector_doc is not None else None
+        if not isinstance(expected_markexpr, str) or report.get("markexpr") != expected_markexpr:
+            reasons.append(f"Windows pytest markexpr 不符：report={report.get('markexpr')!r} lock={expected_markexpr!r}")
     native = report.get("provenance")
     native = native if isinstance(native, Mapping) else {}
     git = native.get("git")
     git = git if isinstance(git, Mapping) else {}
     end = git.get("end")
     end = end if isinstance(end, Mapping) else {}
-    if native.get("schema") != "cargo-l1-provenance.v1" \
-            or native.get("platform") != "windows" \
-            or native.get("build_target") != "x86_64-pc-windows-gnu":
-        reasons.append("Windows L1 缺少原生 Windows Cargo provenance")
+    if runner == "cargo":
+        if required_set == "s21_gate:py_parity":
+            reasons.append("s21_gate:py_parity Windows L1 必須由 pytest runner 產生")
+        if native.get("schema") != "cargo-l1-provenance.v1" \
+                or native.get("platform") != "windows" \
+                or native.get("build_target") != "x86_64-pc-windows-gnu":
+            reasons.append("Windows Cargo L1 缺少原生 Windows Cargo provenance")
+    elif runner == "pytest":
+        if native.get("schema") != "pytest-l1-provenance.v1" or native.get("platform") != "windows":
+            reasons.append("Windows pytest L1 缺少原生 Windows pytest provenance")
+    else:
+        reasons.append("Windows L1 runner 不受支援")
     for label, row in (("provenance.git", git), ("provenance.git.end", end)):
         if row.get("head") != expected_head:
             reasons.append(f"{label}.head={row.get('head')!r} 與候選 HEAD {expected_head!r} 不符")

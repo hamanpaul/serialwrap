@@ -33,6 +33,23 @@ def _schema():
     return json.loads((ROOT / "tests/acceptance/slice21_gate_report.schema.json").read_text(encoding="utf-8"))
 
 
+def test_parity_schema_supports_not_applicable_and_ruling_field():
+    """A-86：gate report schema 可序列化免測狀態及引用欄位；引用語意由 judge 嚴格判定。"""
+    from jsonschema import Draft202012Validator
+
+    schema = _schema()
+    Draft202012Validator.check_schema(schema)
+    row_schema = schema["properties"]["parity_amendments"]["properties"]["rows"]["items"]
+    validator = Draft202012Validator(row_schema)
+    valid = {
+        "id": "A-86", "status": "NOT_APPLICABLE", "claimed": "NOT_APPLICABLE", "tests": [],
+        "ruling": "docs/rust-refactor/plans/06-slice21-daemon-core.md#L4624", "reasons": [],
+    }
+    assert validator.is_valid(valid)
+    assert validator.is_valid({**valid, "ruling": "malformed citation remains reportable as INCOMPLETE"})
+    assert not validator.is_valid({**valid, "status": "OTHER"})
+
+
 def test_blocked_owner_items_can_never_be_pass():
     s = _schema()
     assert s["properties"]["blocked_owner"]["items"]["properties"]["status"]["const"] == "BLOCKED-OWNER"
@@ -40,7 +57,9 @@ def test_blocked_owner_items_can_never_be_pass():
     assert set(s["properties"]["verdict"]["enum"]) == {"READY_FOR_OWNER_EVIDENCE", "INCOMPLETE", "FAIL"}
     sec = s["properties"]["sections"]["items"]["required"]
     assert {"skipped", "deselected", "required_set", "l1_results", "l1_verdict", "ignored"} <= set(sec)
-    assert "linux_cap_posix_pty_workspace" in s["properties"]["sections"]["items"]["properties"]["name"]["enum"]
+    section_names = set(s["properties"]["sections"]["items"]["properties"]["name"]["enum"])
+    assert "linux_cap_posix_pty_workspace" in section_names
+    assert "py_parity_windows" in section_names
     assert "expected_min_passed" not in s["properties"]["sections"]["items"]["properties"]   # R5-F3：計數門檻已移除
     assert {"cli_sha256", "daemon_sha256", "daemon_implementation", "contracts_revision", "cases_lock_sha256", "tool_revision", "platform"} <= set(s["properties"]["identity"]["required"])
 

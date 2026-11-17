@@ -252,6 +252,35 @@ gate 為 OD-55 的 linux 能力集合各設一個 section（`linux_cap_<cap>`）
 | `windows_cap_interactive_desktop` | `s21_gate:cap_interactive_desktop`（windows） | 原生 Windows 互動 console（擁有者登入的桌面 session） | LOCAL-WINDOWS-TODO | 證據只能於原生 Windows 本機產生：於擁有者 Windows host 以 `python3 scripts/rust/cargo_l1_results.py --platform windows --runner scripts/rust/win-runner.sh --out <dir>/windows_cap_interactive_desktop/l1-results.json --caps-only --caps interactive_desktop -- <集合 selector argv>`（環境比照 `win-test.sh`）產生，gate 以 `SW_GATE_LOCAL_WINDOWS_DIR=<dir>` 匯入；缺證據檔記 EVIDENCE_MISSING，不得 PASS |
 | `windows_cap_supervisor_runtime` | `s21_gate:cap_supervisor_runtime`（windows） | 原生 Windows 工作排程器執行期（建立暫時排程工作，須擁有者授權） | LOCAL-WINDOWS-TODO | 證據只能於原生 Windows 本機產生：於擁有者 Windows host 以 `python3 scripts/rust/cargo_l1_results.py --platform windows --runner scripts/rust/win-runner.sh --out <dir>/windows_cap_supervisor_runtime/l1-results.json --caps-only --caps supervisor_runtime -- <集合 selector argv>`（環境比照 `win-test.sh`；建立暫時排程工作須設 `SW_TEST_ALLOW_SCHTASKS`）產生，gate 以 `SW_GATE_LOCAL_WINDOWS_DIR=<dir>` 匯入；缺證據檔記 EVIDENCE_MISSING，不得 PASS |
 
+### Windows 原生 pytest parity L1（F-S19）
+
+此集合只承接 `tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::test_windows_guarded_write_stall_drain_stalled_native`。正式 selector（待收尾線依原生收集清單寫入 `l1_required.lock.json`）為：
+
+```text
+-q tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::test_windows_guarded_write_stall_drain_stalled_native -m "windows_native and windows_com"
+```
+
+於 WSL 呼叫既有 Stage 0 runner 做原生 Windows collect-only（將輸出 L1 的 `collected` 作鎖檔登記依據，不把 collect-only 當執行證據）：
+
+```bash
+SW_TEST_COM_PAIR=COM20:COM21 scripts/stage0/win-pytest.sh --collect-only -q \
+  tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::test_windows_guarded_write_stall_drain_stalled_native \
+  -m "windows_native and windows_com"
+```
+
+實際 L1 必須以同一 selector 執行（需要擁有者提供可工作的 COM pair；runner 會拒絕被 skip 的原生項目）：
+
+```bash
+SW_TEST_COM_PAIR=COM20:COM21 scripts/stage0/win-pytest.sh -q \
+  tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::test_windows_guarded_write_stall_drain_stalled_native \
+  -m "windows_native and windows_com"
+mkdir -p <windows-l1-root>/s21_gate:py_parity
+cp <win-pytest-run>/resource-report.json <windows-l1-root>/s21_gate:py_parity/l1-results.json
+scripts/rust/gate_shared.sh --run-id <shared-run-id> --windows-l1 <windows-l1-root>
+```
+
+`gate_shared.sh` 只匯入已登記於鎖檔的 Windows 集合；Slice 2.1 gate 再以 `--shared-evidence <shared-run-dir>` 接受該 L1。報告必須綁定候選 HEAD 起訖、兩端乾淨狀態、Windows 平台、鎖定 nodeid 與逐字 selector；失敗保留 FAIL，缺失或不符為 EVIDENCE_MISSING。
+
 sys_admin 正式流程範例（先以乾淨且已提交的候選 HEAD 產生證據，再將同一目錄交給 Slice 2.1 gate）：
 
 ```bash

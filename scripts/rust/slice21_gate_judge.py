@@ -66,6 +66,8 @@ TEST_SECTIONS: dict[str, str] = {
     # P5 第 6 輪 SPEC-GAP #1（編排者裁決）：py_parity section 以完整 selector 的新集合 s21_gate:py_parity_full 判定；
     # 舊集合 s21_gate:py_parity 不改不刪、仍由 pytest_full 承擔（兩者皆由 gate 執行）。
     "py_parity": "linux",
+    # F-S19：Windows 原生 pytest parity 證據，經 shared-evidence Windows L1 匯入。
+    "py_parity_windows": "windows",
     # P5 第 8 輪 SPEC-GAP #1：計畫 06 Task 0b #76～#80 的 add-only parity 集合。
     "py_parity_76_80": "linux",
 }
@@ -108,7 +110,7 @@ SECTION_ORDER: tuple[str, ...] = (
     "linux_cap_supervisor_runtime", "windows_native_l1", "windows_cap_windows_com",
     "windows_cap_windows_native", "windows_cap_interactive_desktop", "windows_cap_supervisor_runtime",
     "blackbox_python", "blackbox_rust", "existing_suites_rust", "l15_ab", "event_latency", "wal_s1w_perf",
-    "case_uptake", "py_parity", "py_parity_76_80", "pytest_full", "policy_check",
+    "case_uptake", "py_parity", "py_parity_windows", "py_parity_76_80", "pytest_full", "policy_check",
 )
 # 計畫判定規則：只有此 section 可在 EVIDENCE_MISSING 下不阻擋（不接受報告自行宣告的豁免）。
 ALLOWED_MISSING: dict[str, str] = {"windows_cap_windows_com": "BO-S21-01"}
@@ -118,7 +120,10 @@ IDENTITY_REQUIRED: tuple[str, ...] = (
 )
 TOOL_REVISION_REQUIRED: tuple[str, ...] = ("uart_stdio_bridge_tree_sha256", "runner_sha256")
 PLATFORM_REQUIRED: tuple[str, ...] = ("os", "kernel", "arch")
-PARITY_STATUSES = frozenset({"PASS", "BLOCKED-OWNER", "OWNER-DECISION-PENDING", "INCOMPLETE"})
+PARITY_STATUSES = frozenset({"PASS", "NOT_APPLICABLE", "BLOCKED-OWNER", "OWNER-DECISION-PENDING", "INCOMPLETE"})
+_PARITY_RULING_RE = re.compile(
+    r"^(docs/rust-refactor/(?:reviews/rulings|plans)/[A-Za-z0-9._/-]+\.md)#L([1-9][0-9]*)(?:-L([1-9][0-9]*))?$"
+)
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SKIP_OUTCOMES = frozenset({"skipped", "xfailed"})
 
@@ -874,6 +879,31 @@ def parity_rows_from_doc(text: str) -> list[dict[str, str]]:
     return rows
 
 
+def _valid_parity_ruling(ruling: Any, row_id: str) -> bool:
+    """只接受指向本 repo 計畫／裁決文件中、明確提及該列的行號引用。"""
+    if not isinstance(ruling, str):
+        return False
+    match = _PARITY_RULING_RE.fullmatch(ruling)
+    if match is None:
+        return False
+    relative = pathlib.PurePosixPath(match.group(1))
+    if relative.is_absolute() or ".." in relative.parts:
+        return False
+    start = int(match.group(2))
+    end = int(match.group(3) or match.group(2))
+    if end < start or end - start > 20:
+        return False
+    path = ROOT.joinpath(*relative.parts)
+    try:
+        path.resolve(strict=True).relative_to(ROOT.resolve(strict=True))
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, ValueError):
+        return False
+    if end > len(lines):
+        return False
+    return row_id in "\n".join(lines[start - 1:end])
+
+
 def judge_parity(parity: Mapping[str, Any], passed_pool: set[str], bo_ids: set[str],
                  decision_ids: set[str] | None = None) -> dict[str, Any]:
     status_doc = parity.get("status") or {}
@@ -914,6 +944,16 @@ def judge_parity(parity: Mapping[str, Any], passed_pool: set[str], bo_ids: set[s
                 status = "INCOMPLETE" if unverified else "PASS"
                 if unverified:
                     reasons.append(f"本次 L1 證據未見 passed：{unverified}")
+        elif claimed == "NOT_APPLICABLE":
+            ruling = row.get("ruling")
+            if tests:
+                status = "INCOMPLETE"
+                reasons.append("NOT_APPLICABLE 不得列測試 nodeid")
+            elif not _valid_parity_ruling(ruling, rid):
+                status = "INCOMPLETE"
+                reasons.append("NOT_APPLICABLE 缺少指向該列之計畫／裁決具體行號的 ruling 出處")
+            else:
+                status = "NOT_APPLICABLE"
         elif claimed == "BLOCKED-OWNER":
             bo = row.get("bo")
             status = "BLOCKED-OWNER" if bo in bo_ids else "INCOMPLETE"
@@ -929,8 +969,10 @@ def judge_parity(parity: Mapping[str, Any], passed_pool: set[str], bo_ids: set[s
             status = claimed
         if row and row.get("reason") and status != "PASS":
             reasons.append(str(row["reason"]))
+        raw_ruling = row.get("ruling") if row else None
+        reported_ruling = raw_ruling if raw_ruling is None or isinstance(raw_ruling, str) else repr(raw_ruling)
         out_rows.append({"id": rid, "take": takes.get(rid, ""), "status": status, "claimed": claimed,
-                         "tests": tests, "reasons": reasons})
+                         "tests": tests, "ruling": reported_ruling, "reasons": reasons})
     summary: dict[str, int] = {}
     for r in out_rows:
         summary[r["status"]] = summary.get(r["status"], 0) + 1

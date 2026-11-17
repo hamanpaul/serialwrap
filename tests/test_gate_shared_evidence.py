@@ -348,6 +348,169 @@ def test_windows_l1_provenance_or_selector_mismatch_is_not_recorded(tmp_path, mi
         assert f"windows_l1:{required_set}" not in manifest["sections"]
 
 
+def _windows_pytest_l1_report(head: str, selector: list[str], nodeid: str, markexpr: str) -> dict:
+    """Stage 0 Windows pytest L1 與 Cargo L1 共用結果格式，但使用獨立的 pytest provenance。"""
+    return {
+        "schema_version": 2,
+        "format": "l1-results.v1",
+        "runner": "pytest",
+        "platform": "windows",
+        "argv": ["-c", r"--junitxml=C:\\Temp\\junit.xml", *selector],
+        "markexpr": markexpr,
+        "counts": {},
+        "resources": {},
+        "uart_kind": "native",
+        "not_collected_platform": [],
+        "core_portable_platform_skips": [],
+        "collected": [nodeid],
+        "deselected": [],
+        "results": [{"nodeid": nodeid, "outcome": "passed", "skip_kind": None,
+                      "phases": {"setup": "passed", "call": "passed", "teardown": "passed"}}],
+        "exit_code": 0,
+        "finished": True,
+        "provenance": {
+            "schema": "pytest-l1-provenance.v1",
+            "platform": "windows",
+            "git": {"head": head, "clean": True, "end": {"head": head, "clean": True}},
+        },
+        "deployed_content": None,
+    }
+
+
+def test_windows_native_pytest_l1_import_checks_selector_and_git_provenance(tmp_path):
+    """Windows pytest 只能以專屬鎖列匯入，並核對平台、selector、HEAD 起訖與乾淨狀態。"""
+    shared, _, artifacts, _ = _fixture(tmp_path, "slice21")
+    api = _module()
+    head = api.get_current_head()
+    required_set = "s21_gate:py_parity"
+    nodeid = (
+        "tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::"
+        "test_windows_guarded_write_stall_drain_stalled_native"
+    )
+    markexpr = "windows_native and windows_com"
+    selector = ["-q", nodeid, "-m", markexpr]
+    lock = tmp_path / "python-windows-lock.json"
+    lock.write_text(json.dumps({"sets": {required_set: {"windows": {
+        "nodeids": [nodeid],
+        "selector": {"argv": selector, "markexpr": markexpr, "paths": [nodeid]},
+    }}}}), encoding="utf-8")
+    source_root = tmp_path / "windows"
+    source = source_root / required_set / "l1-results.json"
+    source.parent.mkdir(parents=True)
+    source.write_text(json.dumps(_windows_pytest_l1_report(head, selector, nodeid, markexpr)), encoding="utf-8")
+
+    recorded = api.record_windows_l1(
+        shared, source_root=source_root, required_set=required_set, lock_path=lock,
+        current_head=head, worktree_clean=True,
+    )
+
+    assert recorded["status"] == "PASS", recorded
+    imported = api.import_section(
+        shared, gate="slice21", section=f"windows_l1:{required_set}", required_set=required_set,
+        platform="windows", expected_artifacts=artifacts, current_head=head, worktree_clean=True,
+        destination=tmp_path / "windows-pytest-import", lock_path=lock,
+    )
+    assert imported["status"] == "PASS", imported
+    assert imported["argv"] == selector
+
+
+@pytest.mark.parametrize("mismatch", [
+    "start_head", "end_head", "start_dirty", "end_dirty", "argv", "markexpr", "platform", "runner",
+    "missing_provenance",
+])
+def test_windows_native_pytest_l1_provenance_or_selector_mismatch_is_not_recorded(tmp_path, mismatch):
+    """pytest L1 的任何 provenance／selector 偏差均須拒收，不能沿用 Cargo 的較寬路徑。"""
+    shared, _, _, _ = _fixture(tmp_path, "slice21")
+    api = _module()
+    head = api.get_current_head()
+    required_set = "s21_gate:py_parity"
+    nodeid = (
+        "tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::"
+        "test_windows_guarded_write_stall_drain_stalled_native"
+    )
+    markexpr = "windows_native and windows_com"
+    selector = ["-q", nodeid, "-m", markexpr]
+    lock = tmp_path / "python-windows-lock.json"
+    lock.write_text(json.dumps({"sets": {required_set: {"windows": {
+        "nodeids": [nodeid],
+        "selector": {"argv": selector, "markexpr": markexpr, "paths": [nodeid]},
+    }}}}), encoding="utf-8")
+    source_root = tmp_path / "windows"
+    source = source_root / required_set / "l1-results.json"
+    source.parent.mkdir(parents=True)
+    report = _windows_pytest_l1_report(head, selector, nodeid, markexpr)
+    if mismatch == "start_head":
+        report["provenance"]["git"]["head"] = "0" * 40
+    elif mismatch == "end_head":
+        report["provenance"]["git"]["end"]["head"] = "0" * 40
+    elif mismatch == "start_dirty":
+        report["provenance"]["git"]["clean"] = False
+    elif mismatch == "end_dirty":
+        report["provenance"]["git"]["end"]["clean"] = False
+    elif mismatch == "argv":
+        report["argv"].append("--maxfail=1")
+    elif mismatch == "markexpr":
+        report["markexpr"] = "windows_native"
+    elif mismatch == "platform":
+        report["platform"] = "linux"
+    elif mismatch == "runner":
+        report["runner"] = "cargo"
+        report["provenance"] = {
+            "schema": "cargo-l1-provenance.v1", "platform": "windows",
+            "build_target": "x86_64-pc-windows-gnu",
+            "git": {"head": head, "clean": True, "end": {"head": head, "clean": True}},
+            "executables": [],
+        }
+    else:
+        del report["provenance"]
+    source.write_text(json.dumps(report), encoding="utf-8")
+
+    result = api.record_windows_l1(
+        shared, source_root=source_root, required_set=required_set, lock_path=lock,
+        current_head=head, worktree_clean=True,
+    )
+
+    assert result["status"] == "EVIDENCE_MISSING", result
+    assert result["reasons"]
+    manifest = json.loads((shared / "manifest.json").read_text(encoding="utf-8"))
+    assert f"windows_l1:{required_set}" not in manifest["sections"]
+
+
+def test_windows_native_pytest_l1_failure_is_preserved_as_fail(tmp_path):
+    """Windows pytest 必要列失敗須沿用唯一 L1 judge 判 FAIL，而非改成缺證或通過。"""
+    shared, _, _, _ = _fixture(tmp_path, "slice21")
+    api = _module()
+    head = api.get_current_head()
+    required_set = "s21_gate:py_parity"
+    nodeid = (
+        "tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::"
+        "test_windows_guarded_write_stall_drain_stalled_native"
+    )
+    markexpr = "windows_native and windows_com"
+    selector = ["-q", nodeid, "-m", markexpr]
+    lock = tmp_path / "python-windows-lock.json"
+    lock.write_text(json.dumps({"sets": {required_set: {"windows": {
+        "nodeids": [nodeid],
+        "selector": {"argv": selector, "markexpr": markexpr, "paths": [nodeid]},
+    }}}}), encoding="utf-8")
+    source_root = tmp_path / "windows"
+    source = source_root / required_set / "l1-results.json"
+    source.parent.mkdir(parents=True)
+    report = _windows_pytest_l1_report(head, selector, nodeid, markexpr)
+    report["results"][0]["outcome"] = "failed"
+    report["results"][0]["phases"]["call"] = "failed"
+    report["exit_code"] = 1
+    source.write_text(json.dumps(report), encoding="utf-8")
+
+    result = api.record_windows_l1(
+        shared, source_root=source_root, required_set=required_set, lock_path=lock,
+        current_head=head, worktree_clean=True,
+    )
+
+    assert result["status"] == "FAIL", result
+    assert result["exit_code"] == 1
+
+
 def _make_release_bundle(root: pathlib.Path, *, head: str, payload: str) -> pathlib.Path:
     version_dir = root / "versions" / "0.4.1"
     bin_dir = version_dir / "bin"
