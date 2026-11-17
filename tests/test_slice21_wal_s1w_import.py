@@ -263,3 +263,14 @@ def test_all_writes_failed_with_pretty_latency_is_fail():
     doc.update(write_failures=40000, rotations_per_stream=[0, 0, 0, 0])
     st, reasons = judge.wal_s1w_verdict(None, imported=doc, host_label="owner-native", formal_params=FORMAL)
     assert st == "FAIL" and any("write_failures" in r for r in reasons), reasons
+
+
+def test_gate_generates_wsl2_python_baseline_on_wal_filesystem_when_missing():
+    """slice21-06：WSL2 無外部基線時同檔案系統即時產生並交給正式 judge 配對。"""
+    text = (ROOT / "scripts/rust/slice21_gate.sh").read_text(encoding="utf-8")
+    assert "scripts/stage0/wal_microbench.py" in text
+    assert 'get("env")' in text and 'get("virtualization"' in text and "wsl2" in text
+    assert "wal_s1w_perf/python-walroot" in text
+    assert '"--wal-root"' in text or "--wal-root" in text
+    assert 's1w_args+=(--python-baseline' in text
+    assert 'wal-s1w-verdict' in text
