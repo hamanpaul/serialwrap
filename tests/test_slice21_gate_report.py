@@ -18,6 +18,7 @@ import os
 import pathlib
 import re
 import shlex
+import shutil
 import subprocess
 
 import pytest
@@ -40,6 +41,33 @@ def test_blocked_owner_items_can_never_be_pass():
     assert {"skipped", "deselected", "required_set", "l1_results", "l1_verdict", "ignored"} <= set(sec)
     assert "expected_min_passed" not in s["properties"]["sections"]["items"]["properties"]   # R5-F3：計數門檻已移除
     assert {"cli_sha256", "daemon_sha256", "daemon_implementation", "contracts_revision", "cases_lock_sha256", "tool_revision", "platform"} <= set(s["properties"]["identity"]["required"])
+
+
+@pytest.mark.parametrize("dirty_kind", ["untracked", "tracked"])
+def test_formal_gate_rejects_dirty_worktree_before_writing_outputs(tmp_path, dirty_kind):
+    fake_root = tmp_path / "repo"
+    script = fake_root / "scripts/rust/slice21_gate.sh"
+    script.parent.mkdir(parents=True)
+    shutil.copy2(ROOT / "scripts/rust/slice21_gate.sh", script)
+    subprocess.run(["git", "init", "-q", str(fake_root)], check=True)
+    subprocess.run(["git", "-C", str(fake_root), "config", "user.name", "Gate Test"], check=True)
+    subprocess.run(["git", "-C", str(fake_root), "config", "user.email", "gate-test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(fake_root), "add", "scripts/rust/slice21_gate.sh"], check=True)
+    subprocess.run(["git", "-C", str(fake_root), "commit", "-qm", "test fixture"], check=True)
+    if dirty_kind == "untracked":
+        (fake_root / "untracked-output.json").write_text("dirty\n", encoding="utf-8")
+    else:
+        script.write_text(script.read_text(encoding="utf-8") + "\n# dirty\n", encoding="utf-8")
+
+    output_root = tmp_path / "outputs"
+    proc = subprocess.run(
+        ["bash", str(script), "--run-id", "dirty", "--out", str(output_root)],
+        cwd=fake_root, capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    assert "工作樹不乾淨" in proc.stderr
+    assert "git status --porcelain --untracked-files=normal" in proc.stderr
+    assert not output_root.exists(), "拒絕開跑前不得建立 run 輸出"
 
 
 def test_gate_dry_run_lists_all_blocked_owner_items(tmp_path):

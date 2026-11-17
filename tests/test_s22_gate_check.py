@@ -314,6 +314,27 @@ def test_od87_breaker_state_is_reported_without_blocking_s22(tmp_path: Path) -> 
     assert out["breaker"]["exemption"]["decision"] == "OD-87", out["breaker"]
 
 
+def test_s22_checker_does_not_modify_tracked_breaker_inputs(tmp_path: Path) -> None:
+    tracked_inputs = [
+        ROOT / "tests/acceptance/breaker/slice_2.2.json",
+        ROOT / "tests/acceptance/breaker/slice_2.2.snapshots.ndjson",
+    ]
+    before = {path: path.read_bytes() for path in tracked_inputs}
+    rc, out = _run(tmp_path, _good_reports())
+    assert rc == 0 and out["result"] == "PASS", out
+    assert {path: path.read_bytes() for path in tracked_inputs} == before
+    assert (tmp_path / "gate.json").is_file()
+
+    driver = (ROOT / "scripts/rust/s22_gate.sh").read_text(encoding="utf-8")
+    checker = SCRIPT.read_text(encoding="utf-8")
+    assert 'OUT_ROOT="$ROOT/target/s22-gate"' in driver
+    assert 'logs_dir = run_dir / "logs"' in driver
+    assert 'L1_DIR="$RUN_DIR/l1-results"' in driver
+    assert 'l15_path = run_dir / "l15-results.json"' in driver
+    assert 'report = run_dir / "s22-gate.json"' in driver
+    assert checker.count(".write_text(") == 1 and "args.out.write_text(" in checker
+
+
 def test_missing_report_and_pending_entry_insufficient(tmp_path: Path) -> None:
     reports = _good_reports()
     del reports[("win_test", "windows")]

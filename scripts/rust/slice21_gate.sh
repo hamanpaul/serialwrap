@@ -12,7 +12,8 @@
 # - §5.3 開工前凍結檢查：event_latency 未凍結時拒絕開跑（INSUFFICIENT_EVIDENCE，exit 3），不得以 skip 或 PASS 代替。
 #   --evidence-run：凍結檢查未通過時仍執行各 section 以取得證據（第三輪新增）；preflight 照實寫入報告，judge 依
 #   `event_latency_frozen: false` 一律判 INCOMPLETE（永不 READY），結束碼同 INCOMPLETE（3）。
-# 結束碼：--dry-run 一律 0；否則 READY_FOR_OWNER_EVIDENCE→0、FAIL→1、INCOMPLETE→3、參數或工具錯誤→2。
+# 正式執行要求工作樹乾淨；非空以專用結束碼 4 停止，不建立 run 輸出。
+# 結束碼：--dry-run 一律 0；READY_FOR_OWNER_EVIDENCE→0、FAIL→1、INCOMPLETE→3、參數／工具錯誤→2、工作樹不乾淨→4。
 set -euo pipefail
 export CARGO_INCREMENTAL=0
 
@@ -50,6 +51,17 @@ if [[ ! "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
   exit 2
 fi
 RUN_DIR="$OUT_DIR/$RUN_ID"
+if [[ "$DRY_RUN" != "1" ]]; then
+  if ! WORKTREE_STATUS="$(git -C "$ROOT" status --porcelain --untracked-files=normal)"; then
+    echo "slice21_gate.sh: 無法檢查工作樹狀態；拒絕正式執行" >&2
+    exit 2
+  fi
+  if [[ -n "$WORKTREE_STATUS" ]]; then
+    printf 'slice21_gate.sh: 工作樹不乾淨；正式執行前請先提交或清理變更（git status --porcelain --untracked-files=normal）：\n%s\n' \
+      "$WORKTREE_STATUS" >&2
+    exit 4
+  fi
+fi
 if [[ "$DRY_RUN" == "1" && -n "$SHARED_EVIDENCE" ]]; then
   echo "shared-evidence import：debug/release artifacts、pytest_full、cargo_fakes_filtered、Windows 原生 L1（$SHARED_EVIDENCE）；selector/provenance 不符即 EVIDENCE_MISSING，不重跑。artifact provenance 不符：EVIDENCE_MISSING，不啟動本地建置。"
 fi

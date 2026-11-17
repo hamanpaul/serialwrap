@@ -21,9 +21,16 @@
   `selftest-report.json`（`python3 -m tools.uart_stdio_bridge selftest …` 產出，tool tree sha256 等於 `APPROVED_REVISION.json`）時才執行；
   未設或不合格時 `l15_ab` 記為 `EVIDENCE_MISSING`（不是 FAIL）。完整命令例：
   `SERIALWRAP_L15_SELFTEST_REPORT=<路徑>/selftest-report.json bash scripts/rust/slice21_gate.sh --run-id <run_id>`。
-- **承接率斷路器**：`case_uptake` 由 judge 以 `slice_breaker.evaluate` 判定（快照檔 `tests/acceptance/breaker/slice_2.1.snapshots.ndjson`、
-  OD-02 剩餘預估 `stage2_estimate_weeks` 取自 `tests/acceptance/slice21_gate_expect.yaml`）；tripped 或超過 OD-02 → FAIL，
+- **承接率斷路器**：`case_uptake` 由 judge 以 `slice_breaker.evaluate` 判定（已提交快照 `tests/acceptance/breaker/slice_2.1.snapshots.ndjson` 加上本次 run 的待提交快照、
+  OD-02 剩餘預估 `stage2_estimate_weeks` 取自 `tests/acceptance/slice21_gate_expect.yaml`）；正式 gate 只把本次一筆寫到
+  `target/slice21-gate/<run_id>/breaker/slice_2.1.pending.ndjson`，判定仍合併讀取兩者，未修改追蹤檔。tripped 或超過 OD-02 → FAIL，
   證據不足（含 `stage2_estimate_weeks` 未填）→ `EVIDENCE_MISSING`。`stage2_estimate_weeks` 由擁有者填值。
+- **四個 gate 收尾**：Slice 2.1～2.4 全部完成前不得合併待提交快照（共用證據要求工作樹乾淨）。四個 gate 跑完後，使用下列命令
+  將該 run 的唯一待提交列併入追蹤快照，並把原列封存於 run 目錄；再以收尾 commit 一併提交快照：
+  `python3 scripts/rust/slice21_gate_judge.py finalize-breaker-snapshot --run-dir target/slice21-gate/<run_id> --gates-complete`。
+  此收尾命令要求收尾前工作樹乾淨、run 的 `git_revision` 等於目前 HEAD，並拒絕缺報告、錯誤／多筆快照、run_id 或承接率不符，以及已存在不同或重複的 run_id。
+
+正式執行 `slice21_gate.sh` 前工作樹必須乾淨；若 `git status --porcelain --untracked-files=normal` 非空，gate 以結束碼 4 並列出狀態，且不建立 run 輸出。`--dry-run` 不執行此檢查。
 
 ### BO-S21-01
 

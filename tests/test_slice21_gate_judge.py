@@ -437,6 +437,115 @@ def test_case_uptake_from_valid_pass_only(case):
     assert sorted(cu["pass_case_ids"]) == sorted(ids[:3])
 
 
+def test_assemble_keeps_breaker_snapshot_pending_and_preserves_verdict(tmp_path, monkeypatch, capsys):
+    """OD-60/OD-87：正式 assemble 只寫 run 待提交快照，且以提交快照＋本次一筆重判。"""
+    import datetime as dt
+    import types
+    import yaml
+
+    mod = _judge_mod()
+    candidate_commit = "e" * 40
+    root = tmp_path / "repo"
+    run_dir = root / "target/slice21-gate/run-pending"
+    acceptance = root / "tests/acceptance"
+    breaker_dir = acceptance / "breaker"
+    run_dir.mkdir(parents=True)
+    breaker_dir.mkdir(parents=True)
+    monkeypatch.setattr(mod, "ROOT", root)
+
+    today = dt.datetime.now(dt.timezone.utc).date()
+    start = today - dt.timedelta(weeks=6)
+    window_end = start + dt.timedelta(weeks=3)
+    freeze = {
+        "slice": "2.1", "denominator": 3, "required_case_ids": ["case-a", "case-b", "case-c"],
+        "window": {"start": start.isoformat(), "weeks": 3}, "stage2_started_at": start.isoformat(),
+        "amendments": [{"breaker_exemption": {"decision": "OD-87", "date": "2026-11-14",
+                         "slice": "2.1", "scope": "breaker_blocking_effect", "reason": "測試豁免"}}],
+    }
+    freeze_path = breaker_dir / "slice_2.1.json"
+    freeze_path.write_text(json.dumps(freeze), encoding="utf-8")
+    baseline_rows = [
+        {"date": start.isoformat(), "rate": 0.0, "passed": 0, "denominator": 3},
+        {"date": window_end.isoformat(), "rate": 0.0, "passed": 0, "denominator": 3},
+    ]
+    snapshots_path = breaker_dir / "slice_2.1.snapshots.ndjson"
+    baseline_text = "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in baseline_rows)
+    snapshots_path.write_text(baseline_text, encoding="utf-8")
+    (acceptance / "slice21_bo.yaml").write_text("items: []\n", encoding="utf-8")
+    lock_path = acceptance / "l1_required.lock.json"
+    lock_path.write_text(json.dumps(_lock()), encoding="utf-8")
+    expect_yaml = {
+        "freeze_file": str(freeze_path), "lock_file": str(lock_path),
+        "blocked_owner_file": "tests/acceptance/slice21_bo.yaml",
+        "breaker_snapshots_file": str(snapshots_path), "stage2_estimate_weeks": 0.0,
+        "parity": {"status_file": ""}, "sections": [],
+    }
+    expect_path = acceptance / "slice21_gate_expect.yaml"
+    expect_path.write_text(yaml.safe_dump(expect_yaml, allow_unicode=True), encoding="utf-8")
+    case_verdicts = {case_id: "PASS" for case_id in freeze["required_case_ids"]}
+    case_verdicts_path = run_dir / "case_verdicts.json"
+    case_verdicts_path.write_text(json.dumps(case_verdicts), encoding="utf-8")
+
+    real_loader = mod._load_module
+    monkeypatch.setattr(mod, "build_identity", lambda _args: json.loads(json.dumps(IDENTITY)))
+    monkeypatch.setattr(mod, "_load_module", lambda name, path: (
+        types.SimpleNamespace(load_effective_freeze=lambda _path: freeze)
+        if name == "freeze_slice_cases" else real_loader(name, path)
+    ))
+    rc = mod.main([
+        "assemble", "--run-dir", str(run_dir), "--run-id", "run-pending",
+        "--expect", str(expect_path), "--case-verdicts", str(case_verdicts_path),
+        "--append-breaker-snapshot", "--candidate-commit", candidate_commit,
+    ])
+    assert rc == 0, capsys.readouterr()
+
+    pending_path = run_dir / "breaker/slice_2.1.pending.ndjson"
+    assert snapshots_path.read_text(encoding="utf-8") == baseline_text, "assemble 不得修改已追蹤快照"
+    pending_rows = [json.loads(line) for line in pending_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(pending_rows) == 1
+    pending = pending_rows[0]
+    report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+    merged = {"snapshots": baseline_rows + pending_rows, "today": today.isoformat(), "stage2_estimate_weeks": 0.0}
+    expected = mod.judge_breaker(freeze, merged)
+    actual = report["case_uptake"]["breaker"]
+    assert actual is not None, (report["case_uptake"], expected)
+    assert actual["actual_verdict"] == expected[2]["actual_verdict"] == "FAIL"
+    assert actual["gate_verdict"] == expected[2]["gate_verdict"] == "OD-87_EXEMPT"
+    assert actual["snapshot_count"] == expected[2]["snapshot_count"] == len(baseline_rows) + 1
+    assert actual == expected[2]
+
+    monkeypatch.setattr(mod, "_git", lambda *args: "" if args[0] == "status" else candidate_commit)
+    finalize_rc = mod.main([
+        "finalize-breaker-snapshot", "--run-dir", str(run_dir), "--expect", str(expect_path),
+        "--gates-complete",
+    ])
+    assert finalize_rc == 0, capsys.readouterr()
+    committed_rows = [json.loads(line) for line in snapshots_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert committed_rows == baseline_rows + [pending]
+    archived_path = run_dir / "breaker/slice_2.1.committed.ndjson"
+    assert archived_path.is_file() and not pending_path.exists()
+    assert mod.breaker_inputs(expect_yaml, today=today.isoformat(), pending_snapshot_file=pending_path)["snapshots"] == committed_rows
+    before_duplicate = snapshots_path.read_bytes()
+    assert mod.main([
+        "finalize-breaker-snapshot", "--run-dir", str(run_dir), "--expect", str(expect_path),
+        "--gates-complete",
+    ]) == 2
+    assert snapshots_path.read_bytes() == before_duplicate
+
+    bad_run = run_dir.parent / "run-bad"
+    (bad_run / "breaker").mkdir(parents=True)
+    bad_report = dict(report, run_id="run-bad")
+    (bad_run / "report.json").write_text(json.dumps(bad_report), encoding="utf-8")
+    (bad_run / "case_verdicts.json").write_text(json.dumps(case_verdicts), encoding="utf-8")
+    bad_pending = dict(pending, run_id="run-bad", rate=0.5)
+    (bad_run / "breaker/slice_2.1.pending.ndjson").write_text(json.dumps(bad_pending) + "\n", encoding="utf-8")
+    assert mod.main([
+        "finalize-breaker-snapshot", "--run-dir", str(bad_run), "--expect", str(expect_path),
+        "--gates-complete",
+    ]) == 2
+    assert snapshots_path.read_bytes() == before_duplicate
+
+
 # --------------------------------------------------------------------------- 第三輪審查（d2d29a6_7af6567）
 
 def test_case_uptake_tripped_is_fail(case):

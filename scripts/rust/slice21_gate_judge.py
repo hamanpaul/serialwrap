@@ -16,7 +16,8 @@
 
 CLI（由 `scripts/rust/slice21_gate.sh` 呼叫）：
 - `record-section`：寫入一個 section 片段（計數一律由 `l1_results` 彙總）。
-- `assemble`：組裝 report.json（identity、BLOCKED-OWNER、parity、case_uptake）並以 `judge` 判定後寫回。
+- `assemble`：組裝 report.json（identity、BLOCKED-OWNER、parity、case_uptake）並以 `judge` 判定後寫回；本次快照只寫 run 目錄。
+- `finalize-breaker-snapshot`：四個 slice gate 完成後，核對報告與待提交列，再併入追蹤快照並封存 run 列。
 - `judge`：對既有 report.json 重新判定。
 
 只用 stdlib＋PyYAML；L1 判定與承接率分別依路徑載入 `tests/acceptance/l1_judge.py`、`scripts/rust/slice_breaker.py`。
@@ -802,13 +803,14 @@ def aggregate_case_verdicts(required_ids: Sequence[str], *, l15_rows: Sequence[M
 
 def append_breaker_snapshot(path: pathlib.Path, freeze: Mapping[str, Any], case_verdicts: Mapping[str, Any], *,
                             run_id: str, today: str | None = None) -> dict[str, Any]:
-    """OD-60：gate 每次正式實跑附加一筆斷路器快照（`slice_breaker` 格式＋`passed`／`denominator` 使 rate 可驗證）。"""
+    """OD-60：將本次正式實跑的斷路器快照寫入 run 待提交檔。"""
     up = case_uptake(freeze, case_verdicts)
     body = json.dumps(dict(sorted((str(k), v) for k, v in case_verdicts.items())), ensure_ascii=False,
                       sort_keys=True, separators=(",", ":"))
     snap = {"date": today or dt.datetime.now(dt.timezone.utc).date().isoformat(), "rate": up["rate"],
             "passed": up["valid_pass"], "denominator": up["denominator"], "run_id": run_id,
             "results_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest()}
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(snap, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
     return snap
@@ -1219,12 +1221,20 @@ def build_identity(args: argparse.Namespace) -> dict[str, Any]:
     return ident
 
 
-def breaker_inputs(expect_yaml: Mapping[str, Any], today: str | None = None) -> dict[str, Any]:
-    """組 `judge_breaker` 的輸入：快照檔（不存在即 None → 證據缺）、判定日（預設今日 UTC）、OD-02 剩餘預估週數。"""
+def breaker_inputs(expect_yaml: Mapping[str, Any], today: str | None = None,
+                   pending_snapshot_file: pathlib.Path | None = None) -> dict[str, Any]:
+    """組斷路器輸入：已提交快照加本次唯一待提交列；已提交檔缺漏仍視為證據缺漏。"""
     snaps = None
     rel = expect_yaml.get("breaker_snapshots_file")
-    if rel and (ROOT / rel).is_file():
-        snaps = [json.loads(line) for line in (ROOT / rel).read_text(encoding="utf-8").splitlines() if line.strip()]
+    committed = ROOT / rel if rel else None
+    if committed is not None and committed.is_file():
+        snaps = [json.loads(line) for line in committed.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if pending_snapshot_file is not None and pending_snapshot_file.is_file():
+            pending = [json.loads(line) for line in pending_snapshot_file.read_text(encoding="utf-8").splitlines()
+                       if line.strip()]
+            if len(pending) != 1:
+                raise ValueError(f"待提交斷路器快照須恰有一筆：{pending_snapshot_file}（實際 {len(pending)}）")
+            snaps.extend(pending)
     return {"snapshots": snaps, "today": today or dt.datetime.now(dt.timezone.utc).date().isoformat(),
             "stage2_estimate_weeks": expect_yaml.get("stage2_estimate_weeks")}
 
@@ -1232,6 +1242,7 @@ def breaker_inputs(expect_yaml: Mapping[str, Any], today: str | None = None) -> 
 def cmd_assemble(args: argparse.Namespace) -> int:
     run_dir = pathlib.Path(args.run_dir)
     expect_yaml = _load_yaml(pathlib.Path(args.expect))
+    pending_snapshot_file = run_dir / "breaker" / "slice_2.1.pending.ndjson"
     bo_doc = _load_yaml(ROOT / expect_yaml["blocked_owner_file"])
     sections = []
     frag_dir = run_dir / "sections"
@@ -1261,14 +1272,15 @@ def cmd_assemble(args: argparse.Namespace) -> int:
     if args.preflight and pathlib.Path(args.preflight).is_file():
         report["preflight"] = json.loads(pathlib.Path(args.preflight).read_text(encoding="utf-8"))
     if getattr(args, "append_breaker_snapshot", False) and not args.dry_run and expect_yaml.get("breaker_snapshots_file"):
-        # OD-60：每次正式實跑附加快照（判定前附加，斷路器以含本次的快照判定）。
+        # OD-60：gate 只寫 run 待提交檔，判定仍讀已提交快照＋本次一筆。
         freeze_mod = _load_module("freeze_slice_cases", ROOT / "scripts" / "rust" / "freeze_slice_cases.py")
-        snap = append_breaker_snapshot(ROOT / expect_yaml["breaker_snapshots_file"],
+        snap = append_breaker_snapshot(pending_snapshot_file,
                                        freeze_mod.load_effective_freeze(ROOT / expect_yaml["freeze_file"]),
                                        case_verdicts, run_id=args.run_id)
-        print(f"slice21_gate_judge: 斷路器快照已附加 {snap}")
+        print(f"slice21_gate_judge: 斷路器待提交快照已寫入 {pending_snapshot_file}: {snap}")
     expect, src_where = build_expect(expect_yaml, base_dir=run_dir, case_verdicts=case_verdicts,
-                                     daemon_path=args.daemon_path or None, bo_ids=[b["id"] for b in blocked])
+                                     daemon_path=args.daemon_path or None, bo_ids=[b["id"] for b in blocked],
+                                     pending_breaker_snapshot_file=pending_snapshot_file)
     out = judge(report, expect)
     report["sections"] = out["sections"]
     report["case_uptake"] = out["case_uptake"]
@@ -1286,7 +1298,8 @@ def cmd_assemble(args: argparse.Namespace) -> int:
 
 
 def build_expect(expect_yaml: Mapping[str, Any], *, base_dir: pathlib.Path, case_verdicts: Mapping[str, Any],
-                 daemon_path: str | None, bo_ids: Sequence[str]) -> tuple[dict[str, Any], str]:
+                 daemon_path: str | None, bo_ids: Sequence[str],
+                 pending_breaker_snapshot_file: pathlib.Path | None = None) -> tuple[dict[str, Any], str]:
     """`assemble` 與 `judge` 共用的 expect 建構（sol-backfill p5 #8）：鎖、凍結檔、斷路器輸入與 #104 parity
     狀態／來源一律由檔案重新載入並驗證；parity 狀態檔或來源不可得時仍帶入（judge_parity 判 INCOMPLETE），
     不得以「未提供 parity」略過必要條件。回傳 (expect, parity 來源位置)。"""
@@ -1309,7 +1322,8 @@ def build_expect(expect_yaml: Mapping[str, Any], *, base_dir: pathlib.Path, case
     expect = {"lock": lock, "base_dir": base_dir, "freeze": freeze, "case_verdicts": dict(case_verdicts),
               "daemon_path": daemon_path, "parity": parity_in,
               "additional_required_sets": expect_yaml.get("additional_required_sets") or {},
-              "bo_ids": list(bo_ids), "breaker": breaker_inputs(expect_yaml),
+              "bo_ids": list(bo_ids),
+              "breaker": breaker_inputs(expect_yaml, pending_snapshot_file=pending_breaker_snapshot_file),
               "l15_ab_excluded": list(expect_yaml.get("l15_ab_excluded") or [])}
     return expect, src_where
 
@@ -1454,6 +1468,100 @@ def cmd_supervisor_compare(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_finalize_breaker_snapshot(args: argparse.Namespace) -> int:
+    """在四個 slice gate 完成後，將本 run 唯一待提交快照併入追蹤檔。"""
+    run_dir = pathlib.Path(args.run_dir)
+    report_path = run_dir / "report.json"
+    pending_path = run_dir / "breaker" / "slice_2.1.pending.ndjson"
+    archived_path = pending_path.with_name("slice_2.1.committed.ndjson")
+    if not report_path.is_file():
+        raise ValueError(f"缺少 slice21 run 報告：{report_path}")
+    status = _git("status", "--porcelain", "--untracked-files=normal")
+    if status is None or status.strip():
+        raise ValueError("收尾前工作樹必須乾淨；不得把其他變更與斷路器快照一併帶入")
+    if not pending_path.is_file():
+        raise ValueError(f"缺少待提交斷路器快照：{pending_path}")
+    if archived_path.exists():
+        raise ValueError(f"拒絕覆寫已封存的 run 快照：{archived_path}")
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    candidate = report.get("git_revision") if isinstance(report, Mapping) else None
+    head = _git("rev-parse", "HEAD")
+    if not isinstance(candidate, str) or not head or candidate != head.strip():
+        raise ValueError("slice21 run 的 git_revision 與目前 HEAD 不符")
+    pending_rows = [json.loads(line) for line in pending_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if len(pending_rows) != 1 or not isinstance(pending_rows[0], dict):
+        raise ValueError(f"待提交斷路器快照須恰有一筆 object：{pending_path}")
+    pending = pending_rows[0]
+    run_id = report.get("run_id")
+    if not isinstance(run_id, str) or pending.get("run_id") != run_id:
+        raise ValueError("待提交斷路器快照 run_id 與 report.json 不符")
+    date_value = pending.get("date")
+    if not isinstance(date_value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_value):
+        raise ValueError("待提交斷路器快照 date 格式錯誤")
+    dt.date.fromisoformat(date_value)
+    rate = pending.get("rate")
+    passed = pending.get("passed")
+    denominator = pending.get("denominator")
+    if (isinstance(rate, bool) or not isinstance(rate, (int, float)) or not 0 <= rate <= 1
+            or isinstance(passed, bool) or not isinstance(passed, int)
+            or isinstance(denominator, bool) or not isinstance(denominator, int) or denominator <= 0
+            or passed < 0 or passed > denominator or rate != passed / denominator):
+        raise ValueError("待提交斷路器快照的 rate／passed／denominator 不一致")
+    if not isinstance(pending.get("results_sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", pending["results_sha256"]):
+        raise ValueError("待提交斷路器快照 results_sha256 格式錯誤")
+
+    expect_yaml = _load_yaml(pathlib.Path(args.expect))
+    rel = expect_yaml.get("breaker_snapshots_file")
+    if not rel:
+        raise ValueError("slice21_gate_expect.yaml 未指定 breaker_snapshots_file")
+    case_verdicts_path = run_dir / "case_verdicts.json"
+    if not case_verdicts_path.is_file():
+        raise ValueError(f"缺少本次逐案結果：{case_verdicts_path}")
+    case_verdicts = json.loads(case_verdicts_path.read_text(encoding="utf-8"))
+    if not isinstance(case_verdicts, Mapping):
+        raise ValueError("case_verdicts.json 必須是 object")
+    body = json.dumps(dict(sorted((str(key), value) for key, value in case_verdicts.items())), ensure_ascii=False,
+                      sort_keys=True, separators=(",", ":"))
+    if hashlib.sha256(body.encode("utf-8")).hexdigest() != pending["results_sha256"]:
+        raise ValueError("待提交快照 results_sha256 與 case_verdicts.json 不符")
+    freeze_mod = _load_module("freeze_slice_cases", ROOT / "scripts" / "rust" / "freeze_slice_cases.py")
+    freeze = freeze_mod.load_effective_freeze(ROOT / str(expect_yaml["freeze_file"]))
+    computed_uptake = case_uptake(freeze, case_verdicts)
+    if (computed_uptake["valid_pass"] != passed or computed_uptake["denominator"] != denominator
+            or computed_uptake["rate"] != rate):
+        raise ValueError("待提交快照與凍結分母／case_verdicts.json 不符")
+    committed_path = ROOT / str(rel)
+    if not committed_path.is_file():
+        raise ValueError(f"缺少已提交斷路器快照檔：{committed_path}")
+    committed_text = committed_path.read_text(encoding="utf-8")
+    committed_rows = [json.loads(line) for line in committed_text.splitlines() if line.strip()]
+    if any(not isinstance(row, dict) for row in committed_rows):
+        raise ValueError(f"已提交斷路器快照含非 object 列：{committed_path}")
+    same_run = [row for row in committed_rows if row.get("run_id") == run_id]
+    if len(same_run) > 1 or (same_run and same_run[0] != pending):
+        raise ValueError(f"已提交快照已有不同或重複的 run_id：{run_id}")
+
+    uptake = report.get("case_uptake") or {}
+    breaker = uptake.get("breaker") or {}
+    if (uptake.get("valid_pass") != passed or uptake.get("denominator") != denominator
+            or uptake.get("rate") != rate):
+        raise ValueError("待提交快照與 report.json 的承接率不符")
+    expected_count = len(committed_rows) if same_run else len(committed_rows) + 1
+    if breaker.get("snapshot_count") != expected_count:
+        raise ValueError("report.json 的斷路器 snapshot_count 與已提交＋待提交快照數不符")
+
+    if not same_run:
+        with committed_path.open("a", encoding="utf-8") as stream:
+            if committed_text and not committed_text.endswith("\n"):
+                stream.write("\n")
+            stream.write(json.dumps(pending, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+    pending_path.replace(archived_path)
+    action = "已存在且核對一致" if same_run else "已附加"
+    print(f"slice21_gate_judge: 斷路器快照{action}至 {committed_path}；run 證據封存於 {archived_path}")
+    return 0
+
+
 def cmd_judge(args: argparse.Namespace) -> int:
     report = json.loads(pathlib.Path(args.report).read_text(encoding="utf-8"))
     expect_yaml = _load_yaml(pathlib.Path(args.expect))
@@ -1461,8 +1569,10 @@ def cmd_judge(args: argparse.Namespace) -> int:
     case_verdicts = {}
     if args.case_verdicts and pathlib.Path(args.case_verdicts).is_file():
         case_verdicts = json.loads(pathlib.Path(args.case_verdicts).read_text(encoding="utf-8"))
-    expect, _ = build_expect(expect_yaml, base_dir=pathlib.Path(args.report).parent, case_verdicts=case_verdicts,
-                             daemon_path=args.daemon_path, bo_ids=bo_ids)
+    report_dir = pathlib.Path(args.report).parent
+    expect, _ = build_expect(expect_yaml, base_dir=report_dir, case_verdicts=case_verdicts,
+                             daemon_path=args.daemon_path, bo_ids=bo_ids,
+                             pending_breaker_snapshot_file=report_dir / "breaker" / "slice_2.1.pending.ndjson")
     out = judge(report, expect)
     print(json.dumps({"verdict": out["verdict"], "verdict_reasons": out["verdict_reasons"],
                       "sections": {s["name"]: s["status"] for s in out["sections"]}}, ensure_ascii=False, indent=1))
@@ -1540,6 +1650,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     sc = sub.add_parser("supervisor-compare", help="狀態有變即 FAIL")
     sc.add_argument("--before", required=True)
     sc.add_argument("--after", required=True)
+    fs = sub.add_parser("finalize-breaker-snapshot", help="四個 slice gate 完成後才併入 Slice 2.1 追蹤快照")
+    fs.add_argument("--run-dir", required=True)
+    fs.add_argument("--expect", default=str(ROOT / "tests" / "acceptance" / "slice21_gate_expect.yaml"))
+    fs.add_argument("--gates-complete", action="store_true", required=True,
+                    help="確認 2.1～2.4 四個 gate 已完成；確認前不得修改追蹤快照")
     j = sub.add_parser("judge")
     j.add_argument("--report", required=True)
     j.add_argument("--expect", default=str(ROOT / "tests" / "acceptance" / "slice21_gate_expect.yaml"))
@@ -1553,6 +1668,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_import_windows_section(args)
         if args.cmd == "assemble":
             return cmd_assemble(args)
+        if args.cmd == "finalize-breaker-snapshot":
+            return cmd_finalize_breaker_snapshot(args)
         if args.cmd == "case-verdicts":
             return cmd_case_verdicts(args)
         if args.cmd == "wal-s1w-verdict":
