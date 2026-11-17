@@ -2499,6 +2499,8 @@ def test_creds_file_fixed_does_not_auto_probe_until_attach(p7, tmp_path):
 **BLOCKED-OWNER:** B-08（測試團隊工作站）。
 **OD-31 承接（2026-10-28）：** func-test `ev-01-spawn-handler` 的 Windows 列在 Stage 1（Rust CLI＋Python daemon）因 Python 基線 `shell` handler 固定 `/bin/sh -c` 而必然不觸發，Stage 1 gate 依 OD-31 暫判 BLOCKED-OWNER（`scripts/rust/stage1a_gate.py` 的 `L15_OWNER_DEFERRED`）。本 Task 出口必須以 Rust daemon（SC-26，Task 14 `HandlerSpawner`）在擁有者 host Windows 原生（`scripts/rust/win-func-test.sh`，COM20:COM21）把該列跑到 PASS＋`gate_eligible`；未 PASS 不得標本 Phase 完成。Rust daemon 上線後應自 `L15_OWNER_DEFERRED` 移除 OD-31 列，使 Windows 列回到一般判定（不得以延後列替代 PASS）。
 
+**P7-05 gate 接線（2026-11-17）：** `p7_gate_report.py` 的必需列 `win-func-test ev-01-spawn-handler (Windows)` 匯入 `win-func-test.sh` 的 `basic/func-test-report.json`、同 run metadata 與 Windows Stage 2 bundle；須核對 metadata HEAD、bundle manifest 與完整 bundle 檔案樹 SHA-256，且結果為 PASS＋`gate_eligible`。缺證據或身分不符一律 `INCOMPLETE`（不得降為 `BLOCKED-OWNER`）。`p7_gate.sh` 以 `--windows-ev01-report`／`--windows-ev01-bundle` 或 `P7_WIN_EV01_REPORT`／`P7_WIN_EV01_BUNDLE` 指定輸入；執行 wrapper 時用 `--case ev-01-spawn-handler` 只跑該 basic 案例一次。
+
 **Files:**
 - Create: `crates/sw-daemon/tests/cap_windows_com_p7.rs`（`#[ignore = "cap:windows_com"]`；三案 `cap_windows_com__p7_login_ready`、`cap_windows_com__p7_quiet_banner_zero_tx`、`cap_windows_com__p7_event_fire`）
 - Create: `crates/sw-daemon/tests/support/com_peer.rs`（測試端腳本化 DUT：以 sw-pal serial backend 開 `SW_TEST_COM_PAIR` 的 peer 端（COMb），DSL 與 Task 1 `ScriptedBridge` 相同，記錄收到的全部 bytes）

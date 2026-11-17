@@ -2516,6 +2516,9 @@ schema_version: 1
 # 參數化基底 nodeid 的必要參數完整集合（P8X-24c6b39-3）：判定器把基底展開成全部參數節點，
 # 每個都要收集且通過；集合須與 pytest 實際收集一致（tests/test_rust_contract_coverage.py 把關）。
 parametrized:
+  tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_tail_raw_reads_daemon_wal:
+  - latest
+  - from-seq
   tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet:
   - quiet
   - quiet_human_explicit
@@ -2638,3 +2641,352 @@ parametrized:
   - account2-COMMAND_ABORTED_IN_FLIGHT
   - account3-SEND_FAILED
   - account4-FLUSHED_BY_RECOVERY
+# OD-99（2026-11-17）：依 rulings/s2.md §OD-99 逐 ID 記錄核准、既有 A/B 節點與平台排除。
+l1_only_approvals:
+  "bc:BC-01": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:BC-01 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:BC-03": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:BC-03 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:BC-04": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:BC-04 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:BC-05": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:BC-05 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-01": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-01 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-02": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-02 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-03": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-03 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-04": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-04 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-05": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-05 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-06": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-06 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-07": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-07 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-08": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-08 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-09": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-09 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-10": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-10 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-11": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-11 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-12": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-12 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-13": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-13 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-14": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-14 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-15": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-15 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-16": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-16 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-17": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-17 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-18": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-18 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-19": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-19 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-20": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-20 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-21": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-21 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-22": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-22 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-23": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-23 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-24": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-24 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-25": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-25 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-26": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-26 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-27": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-27 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-01": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-01 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-02": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-02 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-03": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-03 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-04": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-04 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-05": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-05 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-06": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-06 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-07": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-07 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-09": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-09 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-10": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-10 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-11": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-11 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-12": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-12 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-13": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-13 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-14": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-14 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-15": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-15 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-16": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-16 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-18": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-18 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-19": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-19 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-20": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-20 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-21": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-21 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-22": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-22 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-23": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-23 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-24": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-24 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-25": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-25 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-27": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-27 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-28": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-28 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-30": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-30 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-31": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-31 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-32": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-32 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-34": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-34 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-35": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-35 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-36": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-36 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-37": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-37 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-39": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-39 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "case:sc14-flash-probe-eligibility": {l1_only: true, reason: "OD-99（2026-11-17）裁決：case:sc14-flash-probe-eligibility 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "case:sc35-passthrough-command-completion": {l1_only: true, reason: "OD-99（2026-11-17）裁決：case:sc35-passthrough-command-completion 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "case:sc35-passthrough-quiet-ready": {l1_only: true, reason: "OD-99（2026-11-17）裁決：case:sc35-passthrough-quiet-ready 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "schema:state_file": {l1_only: true, reason: "OD-99（2026-11-17）裁決：schema:state_file 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "schema:wal_record": {l1_only: true, reason: "OD-99（2026-11-17）裁決：schema:wal_record 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+legacy_l1_only_approvals:
+  error_code:ECHO_ACK_UNSUPPORTED: "P8X-24c6b39-4 既有例外：此錯誤碼只有 Rust 實作，Python 基線沒有等價節點。"
+legacy_rust_only_approvals:
+  case:sc36-win-installer-com0com-optional: "既有 Windows 安裝案例只覆蓋 Rust com0com 選用元件，沒有 Python 實作。"
+  error_code:ECHO_ACK_UNSUPPORTED: "P8X-24c6b39-4 既有例外：ECHO_ACK_UNSUPPORTED 僅由 Rust L1 契約驗證。"
+od99_ab_nodeids:
+  cli_cmd:alias list:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[alias.list_alias_list]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_alias_roundtrip
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_alias_roundtrip
+  cli_cmd:daemon restart:
+    nodeids:
+    - tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_restart_ab
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_restart_ab
+  cli_cmd:daemon start:
+    nodeids:
+    - tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_start_ab_conflict
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_start_ab_conflict
+  cli_cmd:daemon status:
+    nodeids:
+    - tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_start_stop_ab_real_daemon
+  cli_cmd:daemon stop:
+    nodeids:
+    - tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_start_stop_ab_real_daemon
+  cli_cmd:device list:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[device.list_device_list]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_device_mcu_health
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_device_mcu_health
+  cli_cmd:event list:
+    nodeids:
+    - tests/contract_blackbox/test_bb_event.py::test_event_subcommands_wire_params
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_rule_roundtrip
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_rule_roundtrip
+  cli_cmd:event show:
+    nodeids:
+    - tests/contract_blackbox/test_bb_event.py::test_event_subcommands_wire_params
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_show_returns_registered_rule
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_show_returns_registered_rule
+  cli_cmd:event status:
+    nodeids:
+    - tests/contract_blackbox/test_bb_event.py::test_event_subcommands_wire_params
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_status_lists_enabled_daemon_selector
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_status_lists_enabled_daemon_selector
+  cli_cmd:event tail:
+    nodeids:
+    - tests/contract_blackbox/test_bb_event.py::test_event_subcommands_wire_params
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_tail_reads_matcher_log
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_tail_reads_matcher_log
+  cli_cmd:log tail-raw:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[log.tail_raw_log_tail-raw]
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[log.tail_raw_log_tail-raw_--from-seq_0]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_tail_raw_reads_daemon_wal
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_tail_raw_reads_daemon_wal
+  cli_cmd:log tail-text:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[log.tail_text_log_tail-text_--com_COM2_--limit_5]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+  cli_cmd:profile test:
+    nodeids:
+    - tests/contract_blackbox/test_bb_profile.py::test_success
+  cli_cmd:remote stop:
+    nodeids:
+    - tests/contract_blackbox/test_cli_mgmt_remote.py::test_remote_ab_status_close_empty
+  cli_cmd:session activity:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[session.activity_session_activity_--selector_A]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_activity_reports_live_session
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_activity_reports_live_session
+  cli_cmd:session console-list:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[session.console_list_session_console-list_--selector_A]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_console_attach_detach
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_console_attach_detach
+  cli_cmd:session list:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[session.list_session_list]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_reaches_ready
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_reaches_ready
+  cli_cmd:session log-status:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[session.log_status_session_log-status_--selector_A]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_log_capture_lifecycle
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_log_capture_lifecycle
+  cli_cmd:wal current-seq:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[wal.current_seq_wal_current-seq]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+  cli_cmd:wal export:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[wal.range_wal_export]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+  rpc_method:alias.list:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[alias.list_alias_list]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_alias_roundtrip
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_alias_roundtrip
+  rpc_method:daemon.handoff_stop:
+    nodeids:
+    - tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_refuses_while_push[after_probe]
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_refuses_while_push[after_probe]
+  rpc_method:daemon.stop:
+    nodeids:
+    - tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_start_stop_ab_real_daemon
+  rpc_method:device.list:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[device.list_device_list]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_device_mcu_health
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_device_mcu_health
+  rpc_method:event.com_status:
+    nodeids:
+    - tests/contract_blackbox/test_bb_event.py::test_event_subcommands_wire_params
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_status_lists_enabled_daemon_selector
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_status_lists_enabled_daemon_selector
+  rpc_method:event.rule_get:
+    nodeids:
+    - tests/contract_blackbox/test_bb_event.py::test_event_subcommands_wire_params
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_show_returns_registered_rule
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_show_returns_registered_rule
+  rpc_method:event.rule_list:
+    nodeids:
+    - tests/contract_blackbox/test_bb_event.py::test_event_subcommands_wire_params
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_rule_roundtrip
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_rule_roundtrip
+  rpc_method:event.tail:
+    nodeids:
+    - tests/contract_blackbox/test_bb_event.py::test_event_subcommands_wire_params
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_tail_reads_matcher_log
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_tail_reads_matcher_log
+  rpc_method:health.ping:
+    nodeids:
+    - tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_start_stop_ab_real_daemon
+  rpc_method:health.status:
+    nodeids:
+    - tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_start_stop_ab_real_daemon
+  rpc_method:log.tail_raw:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[log.tail_raw_log_tail-raw]
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[log.tail_raw_log_tail-raw_--from-seq_0]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_tail_raw_reads_daemon_wal
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_tail_raw_reads_daemon_wal
+  rpc_method:log.tail_text:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[log.tail_text_log_tail-text_--com_COM2_--limit_5]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+  rpc_method:session.activity:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[session.activity_session_activity_--selector_A]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_activity_reports_live_session
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_activity_reports_live_session
+  rpc_method:session.console_list:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[session.console_list_session_console-list_--selector_A]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_console_attach_detach
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_console_attach_detach
+  rpc_method:session.get_state:
+    nodeids:
+    - tests/contract_blackbox/slice21/test_f1_cmd_contract.py::test_near_limit_no_logout
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/slice21/test_f1_cmd_contract.py::test_near_limit_no_logout
+  rpc_method:session.list:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[session.list_session_list]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_reaches_ready
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_reaches_ready
+  rpc_method:session.log_status:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[session.log_status_session_log-status_--selector_A]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_log_capture_lifecycle
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_log_capture_lifecycle
+  rpc_method:wal.current_seq:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[wal.current_seq_wal_current-seq]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+  rpc_method:wal.range:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[wal.range_wal_export]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+platform_exclusions:
+  cli_cmd:device attach:
+    linux:
+    - tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown
+    windows:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+    - tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits
+    - tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+  rpc_method:device.attach:
+    linux:
+    - tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown
+    windows:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+    - tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits
+    - tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+  error_code:DEVICE_STILL_HELD:
+    linux:
+    - tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown
+    windows:
+    - tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits
+    - tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns
+    - tests/test_stage0_uart_exclusive.py::TestAttachProbeDrain::test_attach_device_force_rejects_plain_external_holder
+  error_code:DAEMON_ALREADY_RUNNING:
+    linux:
+    - tests/test_lock_win.py::test_two_locks_same_path_second_raises

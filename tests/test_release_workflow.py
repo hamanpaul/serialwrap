@@ -287,8 +287,10 @@ def test_linux_bundle_job_packages_and_uploads_named_artifacts():
 @pytest.mark.memory_only
 def test_linux_bundle_job_smoke_covers_required_checks():
     smoke = _step("smoke")["run"]
-    for needle in ("--version", "--help", "release-manifest.json", "sha256sum -c", "py/pyvenv.cfg",
-                   "home = /usr/bin", *TEST_FAKE_MARKERS):
+    for needle in (
+        "--version", "--help", "release-manifest.json", "sha256sum -c", "py/pyvenv.cfg",
+        "home = /usr/bin", "scripts/rust/check_test_hook_markers.py",
+    ):
         assert needle in smoke, f"smoke 步驟缺少 {needle!r}"
 
 
@@ -691,6 +693,10 @@ def _package_and_smoke(tmp_path: Path, mutate: Callable[[Path], None] | None = N
                        after_package: Callable[[Path], None] | None = None):
     work = tmp_path / "work"
     work.mkdir()
+    checker = REPO_ROOT / "scripts/rust/check_test_hook_markers.py"
+    staged_checker = work / "scripts/rust/check_test_hook_markers.py"
+    staged_checker.parent.mkdir(parents=True)
+    staged_checker.write_bytes(checker.read_bytes())
     runner_temp = tmp_path / "runner_temp"
     out = _fake_bundle(runner_temp)
     if mutate is not None:

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -334,6 +336,7 @@ def test_incomplete_run_cannot_satisfy(tmp_path):
 
 
 def test_duplicate_result_rows_not_best_of(tmp_path):
+    """結果檔真正重複寫入仍依 R5-F3 判為不完整；只有 plugin 彙整 subTest 報告。"""
     run = tmp_path / "run10"
     _results(run, "rust-linux", "linux", [_row("t::k", "failed"), _row("t::k")])
     _results(run, "python-linux", "linux", [_row("t::k")])
@@ -388,24 +391,132 @@ def test_failed_case_is_reported_as_fail_in_incomplete_run(tmp_path):
     assert "case:failed-case" in output["failed"]
 
 
-def test_t9_and_known_low_are_present_in_gate_report():
+def test_t9_and_known_low_are_present_in_gate_report(tmp_path, monkeypatch):
     cc = _module()
+    from types import SimpleNamespace
+
+    sections = {
+        "windows_l1:s21_core": {"status": "PASS", "exit_code": 0, "reasons": []},
+        "windows_l1:s22_gate:win_test": {
+            "status": "FAIL", "exit_code": 1, "reasons": ["Windows 原生列未通過"],
+        },
+    }
+    calls = []
+
+    def validate_section(shared_dir, *, gate, section, required_set, platform, current_head):
+        calls.append((gate, section, required_set, platform, current_head))
+        return sections[section]
+
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    expected_sections = sorted(
+        f"windows_l1:{set_id}" for set_id, platforms in lock["sets"].items() if "windows" in platforms
+    )
+    missing_windows = cc._shared_windows_l1_verdicts(None, expected_head="a" * 40)
+    assert [row["section"] for row in missing_windows] == expected_sections
+    assert all(row["status"] == "EVIDENCE_MISSING" for row in missing_windows)
+    malformed = tmp_path / "malformed"
+    malformed.mkdir()
+    (malformed / "manifest.json").write_text("[]", encoding="utf-8")
+    malformed_windows = cc._shared_windows_l1_verdicts(malformed, expected_head="a" * 40)
+    assert [row["section"] for row in malformed_windows] == expected_sections
+    assert all(row["status"] == "EVIDENCE_MISSING" for row in malformed_windows)
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "manifest.json").write_text(json.dumps({
+        "sections": {name: {} for name in sections},
+    }), encoding="utf-8")
+    monkeypatch.setattr(
+        cc, "_repo_module", lambda name: SimpleNamespace(validate_section=validate_section),
+    )
+    windows_l1 = cc._shared_windows_l1_verdicts(shared, expected_head="a" * 40)
+    by_section = {row["section"]: row for row in windows_l1}
+    assert sorted(by_section) == expected_sections
+    for name in expected_sections:
+        if name in sections:
+            assert by_section[name] == {"section": name, **sections[name]}
+        else:
+            assert by_section[name]["status"] == "EVIDENCE_MISSING"
+            assert by_section[name]["exit_code"] is None
+    assert calls == [
+        ("slice24", name, name.removeprefix("windows_l1:"), "windows", "a" * 40)
+        for name in sorted(sections)
+    ]
+    mcu_case_ids = (
+        "s24-flash-baud-mirror", "s24-flash-holder-gone", "s24-flash-silent-unbridged",
+        "s24-flash-sync-replay", "s24-mcu-rpc-shapes",
+    )
+    cases = [
+        {"case_id": "lr-mixed", "platforms": ["linux", "windows"]},
+        *({"case_id": case_id, "platforms": ["linux"]} for case_id in mcu_case_ids),
+    ]
     report = cc.render_gate_report(
         {
-            "case_verdicts": {},
+            "case_verdicts": {
+                "lr-mixed": "PASS",  # 模擬錯誤輸入；報告 renderer 必須強制顯示 BLOCKED-OWNER。
+                "f7-binary-roundtrip-md5": "BLOCKED-OWNER",
+                "f7-larger-file-not-truncated": "BLOCKED-OWNER",
+                "sc14-flash-probe-eligibility": "PASS",
+                "sc35-passthrough-command-completion": "PASS",
+                "sc35-passthrough-quiet-ready": "PASS",
+                "sc36-win-installer-com0com-optional": "BLOCKED-OWNER",
+                "s24-flash-baud-mirror": "PASS",
+                "s24-flash-holder-gone": "PASS",
+                "s24-flash-silent-unbridged": "PASS",
+                "s24-flash-sync-replay": "PASS",
+                "s24-mcu-rpc-shapes": "PASS",
+            },
+            "covered": [
+                "case:sc14-flash-probe-eligibility",
+                "case:sc35-passthrough-command-completion",
+                "case:sc35-passthrough-quiet-ready",
+                "case:s24-flash-baud-mirror",
+                "case:s24-flash-holder-gone",
+                "case:s24-flash-silent-unbridged",
+                "case:s24-flash-sync-replay",
+                "case:s24-mcu-rpc-shapes",
+            ],
             "windows_verdicts": {"rpc_method:service.status": "BLOCKED-OWNER"},
-            "blocked_owner": {"case:f7-binary-roundtrip-md5": "需要擁有者 TestPilot 實機證據"},
+            "blocked_owner": {
+                "case:lr-mixed": "長跑證據另出報告；依 OD-94 維持 BLOCKED-OWNER",
+                "case:f7-binary-roundtrip-md5": "需要擁有者 TestPilot 實機證據",
+                "case:f7-larger-file-not-truncated": "需要擁有者裁決與實機證據",
+                "case:sc36-win-installer-com0com-optional": "缺少 Windows 原生 L1 證據",
+            },
         },
-        [],
-        {},
+        cases,
+        {"windows_l1": windows_l1},
     )
     assert "endpoint_reopen_after_flasher_set_excl_recorded" in report
     assert "EVIDENCE_MISSING" in report
     assert "P8X-9e51abd-1" in report
-    assert "凍結分母外的 BLOCKED-OWNER 案例" in report
-    assert "f7-binary-roundtrip-md5" in report
+    assert "coverage_map 另加案例（凍結分母外，6 案）" in report
+    for case_id, status in (
+        ("f7-binary-roundtrip-md5", "BLOCKED-OWNER"),
+        ("f7-larger-file-not-truncated", "BLOCKED-OWNER"),
+        ("sc14-flash-probe-eligibility", "PASS"),
+        ("sc35-passthrough-command-completion", "PASS"),
+        ("sc35-passthrough-quiet-ready", "PASS"),
+        ("sc36-win-installer-com0com-optional", "BLOCKED-OWNER"),
+    ):
+        assert f"`{case_id}`" in report and f"**{status}**" in report
     assert "Windows 全部契約 ID" in report
     assert "rpc_method:service.status" in report and "BLOCKED-OWNER" in report
+    assert "windows_l1:s21_core" in report and "**PASS**" in report
+    assert "windows_l1:s22_gate:win_test" in report and "**FAIL**" in report
+    missing_name = next(name for name in expected_sections if name not in sections)
+    assert f"`{missing_name}` | **EVIDENCE_MISSING**" in report
+    assert "BO #5" in report and "正式流程不帶 `--windows-run`" in report
+    assert "OD-94" in report and "lr-mixed" in report and "BLOCKED-OWNER" in report
+    assert "| `lr-mixed` | linux, windows | **BLOCKED-OWNER** |" in report
+    assert "OD-91" in report and "FakeMCU" in report and "v0.3.2" in report
+    assert "| `s24-mcu-rpc-shapes` | **PASS** |" in report
+    assert "不代表 MCU 真機燒錄" in report and "COM20:COM21" in report
+    assert "OD-96" in report and "attached_real_path" in report and "code_fingerprint" in report
+    assert "ba29434c" in report and "47097715" in report and "Python 3.12.3" in report
+    assert "test_rollback_refuses_while_push[after_probe]" in report
+    assert "test_rollback_force_refuses_while_push[rollback-after-probe]" in report
+    assert "dev" in report and "候選 bundle" in report
+    assert "P8X-9e51abd-1" in report
     assert "T6 SPEC-GAP 4" in report
     assert "cargo:sw-core::file_transfer_session::non_ready_states_rejected_with_session_zero_tx" in report
     assert "crates/sw-core/tests/file_transfer_session.rs:451-470" in report
@@ -437,7 +548,7 @@ def test_t9_recorded_outcome_is_written_to_pending_column():
 # T15 第 2 輪審查（P8X-24c6b39-1～7）回歸
 # ---------------------------------------------------------------------------
 EXIT_SCRIPT = ROOT / "scripts" / "rust" / "slice24_exit.sh"
-LONGRUN_S = 172800
+LONGRUN_S = 86400
 _NA = "NOT_APPLICABLE_BASELINE"
 _BUNDLE_BINARIES = {"linux": ("serialwrap", "serialwrapd"), "windows": ("serialwrap.exe", "serialwrapd.exe")}
 
@@ -512,7 +623,7 @@ def _bind_bundle(run: Path, platform: str, bundle: Path, *, record: bool = True,
 
 
 def _bind_candidate(run: Path, base: Path, platforms=("linux", "windows")) -> None:
-    """本輪候選＝_longrun_source 長跑所用的同一份 bundle。"""
+    """OD-94 獨立報告：驗證長跑候選 bundle 與本輪 RC identity 相同。"""
     for platform in platforms:
         _bind_bundle(run, platform, base / "bundles" / platform)
 
@@ -528,7 +639,7 @@ def _contracts_tree() -> str:
 
 
 def _longrun_source(base: Path, *, platforms=("linux", "windows"), results=None) -> Path:
-    """合成一份格式完整的長跑證據目錄（結構即 slice24_exit.sh --longrun 的輸入契約）。"""
+    """合成一份格式完整的 OD-94 長跑側檔證據目錄。"""
     results = results or {}
     src = base / "longrun-src"
     acceptance_sha = _sha_bytes((ROOT / "realhw/acceptance/longrun_acceptance.yaml").read_bytes())
@@ -544,7 +655,7 @@ def _longrun_source(base: Path, *, platforms=("linux", "windows"), results=None)
                   "auto_restart_disabled": True, "evidence": "Restart=no"}
         files = {
             "report.json": json.dumps({"meta": {"platform": platform}}) + "\n",
-            "events.ndjson": '{"kind":"start","t":0}\n{"kind":"stop","t":172810}\n',
+            "events.ndjson": f'{{"kind":"start","t":0}}\n{{"kind":"stop","t":{LONGRUN_S + 10}}}\n',
             "snapshots.ndjson": '{"t":0,"rss_kb":1}\n',
             "observer.ndjson": json.dumps({"kind": "header", "supervision": attest}) + "\n",
         }
@@ -583,8 +694,8 @@ def _longrun_source(base: Path, *, platforms=("linux", "windows"), results=None)
             "engine_result": {"verdict": "PASS"}, "release_gate_result": verdict, "baseline_result": None,
             "acceptance": {"sha256": acceptance_sha, "workload_contract_sha256": workload},
             "run": {
-                "started_at_utc": "2026-11-01T00:00:00+00:00", "ended_at_utc": "2026-11-03T00:00:10+00:00",
-                "duration_s": 172810, "cli_identity": {"pinned": True, "sha256": cli_sha},
+                "started_at_utc": "2026-11-01T00:00:00+00:00", "ended_at_utc": "2026-11-02T00:00:10+00:00",
+                "duration_s": LONGRUN_S + 10, "cli_identity": {"pinned": True, "sha256": cli_sha},
                 "deployed_content": {
                     "start": dict(identity), "end": dict(identity),
                     "daemon_live": [{"in_install": True, "image_sha256": _sha_bytes(f"d-{platform}".encode()), "error": None}],
@@ -602,8 +713,8 @@ def _longrun_source(base: Path, *, platforms=("linux", "windows"), results=None)
             "schema_version": "release-gate.v1", "platform": platform, "mode": "baseline",
             "release_gate_result": "NOT_APPLICABLE_BASELINE", "baseline_result": "PASS",
             "acceptance": {"sha256": acceptance_sha, "workload_contract_sha256": workload},
-            "run": {"duration_s": 172900, "engine_files_sha256": engine_files,
-                    "started_at_utc": "2026-10-20T00:00:00+00:00", "ended_at_utc": "2026-10-22T00:01:40+00:00"},
+            "run": {"duration_s": LONGRUN_S + 100, "engine_files_sha256": engine_files,
+                    "started_at_utc": "2026-10-20T00:00:00+00:00", "ended_at_utc": "2026-10-21T00:01:40+00:00"},
             "checks": [
                 {"id": check["id"], "group": check["group"], "status": "evaluated",
                  "result": _NA if check["result"] == _NA else "PASS", "detail": {}}
@@ -627,8 +738,21 @@ def _judge_lr_mixed(run: Path, out: Path):
     return result, json.loads(out.read_text(encoding="utf-8"))
 
 
+def _independent_longrun_verdict(run: Path):
+    cc = _module()
+    universe = cc.universe(cc.ROOT / "contracts", cc.DEFAULT_CASES, cc.DEFAULT_CASES_LOCK, cc.DEFAULT_MAP)
+    evidence = cc.load_owner_evidence(run, cc.load_results(run))[cc.LONGRUN_CASE]
+    return cc._owner_evidence_verdict(universe[cc.LONGRUN_CASE], evidence)
+
+
 def test_longrun_valid_evidence_unblocks_lr_mixed(tmp_path):
-    """P8X-24c6b39-1：有效長跑證據經匯入與重新驗證後才解除 lr-mixed 的擁有者阻擋。"""
+    """OD-94：24 小時門檻一致；有效長跑另出報告，不解除 Slice 2.4 的擁有者阻擋。"""
+    cc = _module()
+    import yaml
+
+    acceptance = yaml.safe_load((ROOT / "realhw/acceptance/longrun_acceptance.yaml").read_text(encoding="utf-8"))
+    assert acceptance["workload"]["min_continuous_duration_s"] == LONGRUN_S
+    assert cc._LONGRUN_MIN_DURATION_S == LONGRUN_S
     run = tmp_path / "run"
     imported = _import_longrun(run, _longrun_source(tmp_path))
     assert imported.returncode == 0, imported.stdout + imported.stderr
@@ -636,9 +760,12 @@ def test_longrun_valid_evidence_unblocks_lr_mixed(tmp_path):
     assert record["accepted"] is True
     assert {p: v["release_gate_result"] for p, v in record["platforms"].items()} == {"linux": "PASS", "windows": "PASS"}
     _bind_candidate(run, tmp_path)
+    assert _independent_longrun_verdict(run)[0] == "PASS"
     result, output = _judge_lr_mixed(run, tmp_path / "o.json")
-    assert output["case_verdicts"]["lr-mixed"] == "PASS"
-    assert "case:lr-mixed" in output["covered"] and "case:lr-mixed" not in output["blocked_owner"]
+    assert output["case_verdicts"]["lr-mixed"] == "BLOCKED-OWNER"
+    assert "case:lr-mixed" not in output["covered"] and "case:lr-mixed" in output["blocked_owner"]
+    assert "OD-94" in output["blocked_owner"]["case:lr-mixed"]
+    assert output["owner_evidence"] == {}
     assert result.returncode == 0, result.stderr
 
 
@@ -701,7 +828,7 @@ def _claims_pass_with_failed_check(src: Path) -> None:
     ],
 )
 def test_longrun_incomplete_or_tampered_evidence_is_rejected(tmp_path, mutate, platform, needle):
-    """P8X-24c6b39-1：缺漏或竄改的長跑證據必須拒收，lr-mixed 維持 BLOCKED-OWNER。"""
+    """OD-94：缺漏或竄改的長跑證據不得掩蓋拒收；lr-mixed 維持 BLOCKED-OWNER。"""
     run = tmp_path / "run"
     src = _longrun_source(tmp_path)
     mutate(src)
@@ -718,18 +845,22 @@ def test_longrun_incomplete_or_tampered_evidence_is_rejected(tmp_path, mutate, p
 
 
 def test_longrun_valid_fail_verdict_is_reported_as_fail(tmp_path):
-    """P8X-24c6b39-1：證據有效但 release gate 判 FAIL 時，案例為 FAIL，不得藏成 BLOCKED-OWNER 或 PASS。"""
+    """OD-94：獨立長跑保留 FAIL；該證據不改寫 Slice 2.4 的 BLOCKED-OWNER。"""
     run = tmp_path / "run"
     imported = _import_longrun(run, _longrun_source(tmp_path, results={"linux": "FAIL"}))
     assert imported.returncode == 0, imported.stdout + imported.stderr
     _bind_candidate(run, tmp_path)
+    independent_verdict, independent_reason = _independent_longrun_verdict(run)
+    assert independent_verdict == "FAIL" and "release_gate_result=FAIL" in independent_reason
     result, output = _judge_lr_mixed(run, tmp_path / "o.json")
-    assert output["case_verdicts"]["lr-mixed"] == "FAIL"
-    assert "case:lr-mixed" in output["failed"] and result.returncode == 1
+    assert output["case_verdicts"]["lr-mixed"] == "BLOCKED-OWNER"
+    assert "OD-94" in output["blocked_owner"]["case:lr-mixed"]
+    assert output["owner_evidence"] == {}
+    assert "case:lr-mixed" not in output["failed"] and result.returncode == 0
 
 
 def test_longrun_partial_platforms_stay_blocked(tmp_path):
-    """P8X-24c6b39-1：只交 Linux 長跑時，Windows 缺件仍阻擋 lr-mixed。"""
+    """OD-94：獨立長跑報告要求兩平台；缺少 Windows 仍維持 BLOCKED-OWNER。"""
     run = tmp_path / "run"
     imported = _import_longrun(run, _longrun_source(tmp_path, platforms=("linux",)))
     assert imported.returncode == 1, imported.stdout + imported.stderr
@@ -741,22 +872,28 @@ def test_longrun_partial_platforms_stay_blocked(tmp_path):
 
 
 def test_longrun_copy_is_revalidated_at_judgement(tmp_path):
-    """P8X-24c6b39-1：判定時重新驗證 run directory 內的副本，匯入後被改動即不得 PASS。"""
+    """OD-94：獨立長跑副本竄改仍被重新驗證，且 Slice 2.4 不消費該證據。"""
     run = tmp_path / "run"
     imported = _import_longrun(run, _longrun_source(tmp_path))
     assert imported.returncode == 0, imported.stdout + imported.stderr
     with (run / "longrun" / "linux" / "observer.ndjson").open("a", encoding="utf-8") as stream:
         stream.write('{"kind":"sample"}\n')
     _bind_candidate(run, tmp_path)
+    independent_verdict, independent_reason = _independent_longrun_verdict(run)
+    assert independent_verdict == "BLOCKED-OWNER" and "observer.ndjson" in independent_reason
     _, output = _judge_lr_mixed(run, tmp_path / "o.json")
     assert output["case_verdicts"]["lr-mixed"] == "BLOCKED-OWNER"
-    assert "observer.ndjson" in output["blocked_owner"]["case:lr-mixed"]
+    assert output["owner_evidence"] == {}
+    assert "OD-94" in output["blocked_owner"]["case:lr-mixed"]
 
 
 def test_slice24_exit_routes_longrun_through_importer():
-    """P8X-24c6b39-1：出口腳本的 --longrun 必須交給匯入驗證，不得只檢查目錄存在。"""
+    """OD-94：沿用凍結 nodeid；正式出口不將獨立長跑側檔匯入 Slice 2.4。"""
     script = EXIT_SCRIPT.read_text(encoding="utf-8")
-    assert '--import-longrun "$LONGRUN_DIR"' in script
+    assert "--longrun" not in script
+    assert "--import-longrun" not in script
+    assert "正式流程不帶 --windows-run" in script
+    assert "BO #5" in script
 
 
 class _FakeItem:
@@ -797,6 +934,50 @@ def _plugin_run(plugin, session) -> None:
         for when in ("setup", "call", "teardown"):
             plugin.pytest_runtest_logreport(_FakeReport(item.nodeid, when))
     plugin.pytest_sessionfinish(session, 0)
+
+
+def test_coverage_plugin_aggregates_actual_unittest_subtests(tmp_path):
+    """pytest 的 unittest subTest 多份 call report 應合併，結果檔仍通過嚴格驗證。"""
+    run = tmp_path / "subtest-run"
+    env = {**os.environ, "SERIALWRAP_COVERAGE_RUN_DIR": str(run), "SERIALWRAP_COVERAGE_LABEL": "python-linux"}
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests/test_brcm_prompt_regex.py"],
+        cwd=ROOT, env=env, capture_output=True, text=True, timeout=300,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    document = json.loads((run / "results-python-linux.json").read_text(encoding="utf-8"))
+    assert not _module()._validate_run(document), document
+
+
+def test_coverage_plugin_coalesces_subtest_failure_as_failed(tmp_path):
+    """真實 pytest unittest.subTest 中任一子測試失敗時，彙整列必須是 failed。"""
+    run = tmp_path / "subtest-failure"
+    test_file = tmp_path / "test_subtest_failure.py"
+    test_file.write_text(
+        "import unittest\n"
+        "class TestSubtestFailure(unittest.TestCase):\n"
+        "    def test_children(self):\n"
+        "        for value in range(3):\n"
+        "            with self.subTest(value=value):\n"
+        "                self.assertNotEqual(value, 1)\n",
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join(filter(None, [str(ROOT / "tests/contract_blackbox"), os.environ.get("PYTHONPATH")])),
+        "SERIALWRAP_COVERAGE_RUN_DIR": str(run),
+        "SERIALWRAP_COVERAGE_LABEL": "python-linux",
+    }
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "coverage_plugin", str(test_file)],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300,
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    document = json.loads((run / "results-python-linux.json").read_text(encoding="utf-8"))
+    nodeid = next(nodeid for nodeid in document["collected"] if nodeid.endswith("::test_children"))
+    calls = [row for row in document["results"] if row["nodeid"] == nodeid and row["phase"] == "call"]
+    assert len(calls) == 1 and calls[0]["outcome"] == "failed", proc.stdout + proc.stderr
+    assert _module()._nodeid_failure(document, nodeid) == f"call outcome is failed: {nodeid}"
 
 
 def test_coverage_plugin_reads_artifacts_from_ab_env_snapshot(tmp_path, monkeypatch):
@@ -864,6 +1045,59 @@ def _rust_python_docs(tmp_path, rust_rows, python_rows, *, rust_collected=None, 
         _results(run, "python-linux", "linux", python_rows, **python_over),
     ]
     return run, [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+
+
+def test_platform_exclusions_filter_nodes_without_ignoring_unlisted_skips(tmp_path):
+    """OD-99：逐平台排除明列 nodeid；未列入排除的 SKIP 仍是缺證，不得算 PASS。"""
+    cc = _module()
+    cargo, portable, posix, windows = "cargo:sw-core::x::filter", "t::portable", "t::posix", "t::windows"
+    run = tmp_path / "run-filtered"
+    rust_linux = [
+        _row(cargo), _row(portable), _row(posix), _row(windows, "skipped"),
+    ]
+    python_linux = [_row(portable), _row(posix), _row(windows, "skipped")]
+    rust_windows = [_row(cargo), _row(portable), _row(posix, "skipped"), _row(windows)]
+    python_windows = [_row(portable), _row(posix, "skipped"), _row(windows)]
+    docs = [
+        json.loads(_results(run, "rust-linux", "linux", rust_linux).read_text(encoding="utf-8")),
+        json.loads(_results(run, "python-linux", "linux", python_linux).read_text(encoding="utf-8")),
+        json.loads(_results(run, "rust-windows", "windows", rust_windows).read_text(encoding="utf-8")),
+        json.loads(_results(run, "python-windows", "windows", python_windows).read_text(encoding="utf-8")),
+    ]
+    item = _item(
+        platforms=("linux", "windows"), nodeids=[cargo, portable, posix, windows],
+        exclude_nodeids={"linux": [windows], "windows": [posix]},
+    )
+    report = cc.evaluate({"rpc_method:filtered": item}, docs, run_dir=run)
+    assert report["covered"] == ["rpc_method:filtered"], report["missing_reasons"]
+
+    unfiltered = _item(platforms=("linux",), nodeids=[cargo, portable, windows])
+    report2 = cc.evaluate({"rpc_method:unfiltered-skip": unfiltered}, docs[:2], run_dir=run)
+    assert "rpc_method:unfiltered-skip" not in report2["covered"]
+    assert "windows" in report2["missing_reasons"]["rpc_method:unfiltered-skip"]
+
+
+def test_platform_exclusions_filter_python_contract_nodes(tmp_path):
+    """OD-99：exclude_nodeids 同時適用於 contract_tests，未列名 Python SKIP 仍拒絕。"""
+    cc = _module()
+    cargo, portable, windows = "cargo:sw-core::x::contract", "t::portable", "t::windows"
+    run, docs = _rust_python_docs(
+        tmp_path,
+        [_row(cargo)],
+        [_row(portable), _row(windows, "skipped")],
+        rust_collected=[cargo], python_collected=[portable, windows],
+    )
+    item = _item(
+        kind="error_code", nodeids=[cargo], python_nodeids=[portable, windows],
+        exclude_nodeids={"linux": [windows]},
+    )
+    report = cc.evaluate({"error_code:filtered": item}, docs, run_dir=run)
+    assert report["covered"] == ["error_code:filtered"], report["missing_reasons"]
+
+    unfiltered = _item(kind="error_code", nodeids=[cargo], python_nodeids=[portable, windows])
+    report2 = cc.evaluate({"error_code:unfiltered-skip": unfiltered}, docs, run_dir=run)
+    assert "error_code:unfiltered-skip" not in report2["covered"]
+    assert "windows" in report2["missing_reasons"]["error_code:unfiltered-skip"]
 
 
 def test_parametrized_base_requires_every_declared_parameter(tmp_path):
@@ -935,13 +1169,269 @@ def test_rust_l1_nodeids_are_not_required_in_python_results(tmp_path):
 
 
 def test_rust_l1_only_mapping_still_requires_python_side(tmp_path):
-    """P8X-24c6b39-4：外部契約只有 Cargo 節點、又沒有 Python 證據時不得成立（不可整項改 rust_only 迴避）。"""
+    """OD-99：只接受列名的 l1_only；未裁決的 l1_only／rust_only 仍須拒絕。"""
+    import yaml
+
     cc = _module()
     cargo = "cargo:sw-core::x::only_rust"
     run, docs = _rust_python_docs(tmp_path, [_row(cargo)], [_row("t::unrelated")])
     report = cc.evaluate({"error_code:X": _item(kind="error_code", nodeids=[cargo])}, docs, run_dir=run)
     assert "error_code:X" not in report["covered"]
     assert "Python" in report["missing_reasons"]["error_code:X"]
+
+    real = cc.universe(
+        ROOT / "contracts", ROOT / "tests/acceptance/cases.yaml",
+        ROOT / "tests/acceptance/cases.lock.json", ROOT / "contracts/coverage_map.yaml",
+    )
+    approved = sorted(
+        contract_id for contract_id, item in real.items()
+        if item.get("l1_only") and contract_id != "error_code:ECHO_ACK_UNSUPPORTED"
+    )
+    assert approved, "OD-99 核准的 l1_only 清單不可為空"
+    approved_id = next(
+        contract_id for contract_id in approved
+        if real[contract_id].get("nodeids")
+        and all(nodeid.startswith("cargo:") for nodeid in real[contract_id]["nodeids"])
+    )
+    approved_item = {**real[approved_id], "platforms": ["linux"]}
+    run2, docs2 = _rust_python_docs(
+        tmp_path / "approved",
+        [_row(nodeid) for nodeid in approved_item["nodeids"]],
+        [],
+    )
+    report2 = cc.evaluate({approved_id: approved_item}, docs2, run_dir=run2)
+    assert report2["covered"] == [approved_id], report2["missing_reasons"]
+
+    for flag in ("l1_only", "rust_only"):
+        coverage_map = tmp_path / f"unapproved-{flag}.yaml"
+        coverage_map.write_text(
+            yaml.safe_dump({"entries": {"error_code:DEVICE_STILL_HELD": {flag: True}}}),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match=flag):
+            cc.universe(
+                ROOT / "contracts", ROOT / "tests/acceptance/cases.yaml",
+                ROOT / "tests/acceptance/cases.lock.json", coverage_map,
+            )
+
+
+def _node_platforms(nodeid: str) -> set[str]:
+    """從測試節點的 pytest marker 判定可執行平台；沒有平台專屬 marker 視為雙平台。"""
+    path_text, _, qualified = nodeid.partition("::")
+    path = ROOT / path_text
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    marks: set[str] = set()
+
+    def marker_names(node: ast.AST) -> set[str]:
+        return {
+            child.attr for child in ast.walk(node)
+            if isinstance(child, ast.Attribute)
+            and isinstance(child.value, ast.Attribute)
+            and child.value.attr == "mark"
+            and isinstance(child.value.value, ast.Name)
+            and child.value.value.id == "pytest"
+        }
+
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "pytestmark" for target in statement.targets
+        ):
+            marks.update(marker_names(statement.value))
+
+    body = tree.body
+    for part in qualified.split("::"):
+        name = part.split("[", 1)[0]
+        found = next((
+            node for node in body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name
+        ), None)
+        if found is None:
+            break
+        marks.update(marker_names(ast.Module(body=found.decorator_list, type_ignores=[])))
+        if isinstance(found, ast.ClassDef):
+            for statement in found.body:
+                if isinstance(statement, ast.Assign) and any(
+                    isinstance(target, ast.Name) and target.id == "pytestmark" for target in statement.targets
+                ):
+                    marks.update(marker_names(statement.value))
+            body = found.body
+        else:
+            body = []
+
+    if "windows_native" in marks:
+        return {"windows"}
+    if "posix_only" in marks or "cap_posix_pty" in marks:
+        return {"linux"}
+    return {"linux", "windows"}
+
+
+def test_od99_real_universe_has_adjudicated_l1_or_python_nodes(tmp_path):
+    """OD-99：真實 universe 逐 ID 有 Python 節點或明確例外，且平台排除不把 skip 算成 PASS。"""
+    import yaml
+
+    cc = _module()
+    map_path = ROOT / "contracts/coverage_map.yaml"
+    map_doc = cc._read_yaml(map_path)
+    approvals = map_doc.get("l1_only_approvals")
+    assert isinstance(approvals, dict) and approvals, "缺少 OD-99 l1_only 明文核准清單"
+    ab_nodeids = map_doc.get("od99_ab_nodeids")
+    assert isinstance(ab_nodeids, dict) and ab_nodeids, "缺少 OD-99 對外介面 A/B nodeid 清單"
+    universe = cc.universe(
+        ROOT / "contracts", ROOT / "tests/acceptance/cases.yaml",
+        ROOT / "tests/acceptance/cases.lock.json", map_path,
+    )
+    base_map = {key: value for key, value in map_doc.items() if key not in {"od99_ab_nodeids", "l1_only_approvals"}}
+    base_map_path = tmp_path / "coverage_map-before-od99.yaml"
+    base_map_path.write_text(yaml.safe_dump(base_map, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    base = cc.universe(
+        ROOT / "contracts", ROOT / "tests/acceptance/cases.yaml",
+        ROOT / "tests/acceptance/cases.lock.json", base_map_path,
+    )
+
+    expected_api_ids = {
+        contract_id for contract_id, item in base.items()
+        if item.get("kind") in {"cli_cmd", "rpc_method"}
+        and "linux" in item.get("platforms", [])
+        and not cc._is_owner_blocked(item)
+        and item.get("nodeids")
+        and all(nodeid.startswith("cargo:") for nodeid in item["nodeids"])
+        and not item.get("python_nodeids")
+    }
+    assert set(ab_nodeids) == expected_api_ids, (
+        f"OD-99 A/B 對應必須且只能涵蓋未有 Python 節點的 API ID；"
+        f"missing={sorted(expected_api_ids - set(ab_nodeids))}, extra={sorted(set(ab_nodeids) - expected_api_ids)}"
+    )
+    for contract_id, row in ab_nodeids.items():
+        assert isinstance(row, dict), contract_id
+        nodeids = row.get("nodeids", [])
+        assert nodeids and all(nodeid.startswith("tests/contract_blackbox/") for nodeid in nodeids), contract_id
+        assert set(nodeids) <= set(universe[contract_id]["nodeids"]), contract_id
+        for platform, excluded in (row.get("exclude_nodeids") or {}).items():
+            assert platform in universe[contract_id]["platforms"], (contract_id, platform)
+            assert set(excluded) <= set(nodeids), contract_id
+        for nodeid in nodeids:
+            platforms = _node_platforms(nodeid)
+            for platform in universe[contract_id]["platforms"]:
+                excluded = nodeid in row.get("exclude_nodeids", {}).get(platform, [])
+                assert excluded == (platform not in platforms), (contract_id, platform, nodeid, excluded)
+
+    expected_l1 = {
+        contract_id for contract_id, item in base.items()
+        if item.get("kind") in {"bc", "schema", "case"}
+        and "linux" in item.get("platforms", [])
+        and not cc._is_owner_blocked(item)
+        and item.get("nodeids")
+        and all(nodeid.startswith("cargo:") for nodeid in item["nodeids"])
+        and not item.get("python_nodeids")
+        and not item.get("rust_only")
+    }
+    assert set(approvals) == expected_l1, (
+        f"OD-99 l1_only 清單須精確對齊 69 個無 Python 節點的 BC/schema/case；"
+        f"missing={sorted(expected_l1 - set(approvals))}, extra={sorted(set(approvals) - expected_l1)}"
+    )
+    for contract_id, approval in approvals.items():
+        assert isinstance(approval, dict) and approval.get("l1_only") is True, contract_id
+        reason = approval.get("reason")
+        assert isinstance(reason, str) and reason.startswith("OD-99") and reason.endswith("。"), contract_id
+        assert "\n" not in reason and "\r" not in reason, contract_id
+        assert universe[contract_id]["l1_only"] is True, contract_id
+        assert universe[contract_id]["l1_only_reason"] == reason, contract_id
+
+    cases_doc = cc._read_yaml(ROOT / "tests/acceptance/cases.yaml")
+    cases = {row["case_id"]: row for row in cases_doc["cases"]}
+    case_lock = cc._read_json(ROOT / "tests/acceptance/cases.lock.json")
+    prior_membership = {
+        "2.1": set(cc._read_json(ROOT / "tests/acceptance/breaker/slice_2.1.json")["required_case_ids"]),
+    }
+    prior_membership["2.2"] = set(
+        cc._read_yaml(ROOT / "tests/acceptance/slice22_evidence_map.yaml")["cases"]
+    )
+    prior_membership["2.3"] = set(case_lock["sets"]["slice_2.3"])
+    required_lock = cc._read_json(ROOT / "tests/acceptance/l1_required.lock.json")
+    linux_locked = set(required_lock["sets"]["s21_gate:pytest_full"]["linux"]["nodeids"])
+    parametrized = map_doc.get("parametrized", {})
+    missing: list[str] = []
+    for contract_id, item in universe.items():
+        if "linux" not in item.get("platforms", []):
+            continue
+        if cc._is_owner_blocked(item) or item.get("l1_only") or item.get("rust_only"):
+            continue
+        if item.get("kind") == "case" and not item.get("nodeids") and not item.get("python_nodeids"):
+            case_id = contract_id.removeprefix("case:")
+            case = cases.get(case_id, {})
+            slice_id = str(case.get("daemon_slice"))
+            assert slice_id in prior_membership and case_id in prior_membership[slice_id], (
+                f"無本輪節點且無對應先前切片逐案來源：{contract_id}"
+            )
+            continue
+        excluded = set(item.get("exclude_nodeids", {}).get("linux", []))
+        python_nodes = [
+            nodeid for nodeid in [*item.get("nodeids", []), *item.get("python_nodeids", [])]
+            if not nodeid.startswith("cargo:") and nodeid not in excluded
+        ]
+        if not python_nodes:
+            missing.append(contract_id)
+            continue
+        for nodeid in python_nodes:
+            assert "linux" in _node_platforms(nodeid), f"Linux 上不得使用單平台 skip 節點：{contract_id}: {nodeid}"
+            params = parametrized.get(nodeid)
+            required_nodeids = [f"{nodeid}[{param}]" for param in params] if params is not None else [nodeid]
+            for required_nodeid in required_nodeids:
+                assert required_nodeid in linux_locked, (
+                    f"A/B nodeid 未納入 Linux pytest 凍結集合：{contract_id}: {required_nodeid}"
+                )
+    assert not missing, f"非擁有者阻擋 ID 缺少 Python 節點或裁決例外：{sorted(missing)}"
+
+    legacy_l1 = map_doc.get("legacy_l1_only_approvals", {})
+    legacy_rust = map_doc.get("legacy_rust_only_approvals", {})
+    assert set(legacy_l1) == {"error_code:ECHO_ACK_UNSUPPORTED"}
+    assert set(legacy_rust) == {"error_code:ECHO_ACK_UNSUPPORTED", "case:sc36-win-installer-com0com-optional"}
+    assert universe["error_code:ECHO_ACK_UNSUPPORTED"]["l1_only_reason"] == legacy_l1["error_code:ECHO_ACK_UNSUPPORTED"]
+    assert universe["case:sc36-win-installer-com0com-optional"]["rust_only_reason"] == legacy_rust[
+        "case:sc36-win-installer-com0com-optional"
+    ]
+
+    windows_only = "tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown"
+    posix_attach_nodes = {
+        "tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend",
+        "tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits",
+        "tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns",
+        "tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown",
+        "tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq",
+    }
+    expected_exclusions = {
+        "cli_cmd:device attach": {"linux": {windows_only}, "windows": posix_attach_nodes},
+        "rpc_method:device.attach": {"linux": {windows_only}, "windows": posix_attach_nodes},
+        "error_code:DEVICE_STILL_HELD": {
+            "linux": {windows_only},
+            "windows": {
+                "tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits",
+                "tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns",
+                "tests/test_stage0_uart_exclusive.py::TestAttachProbeDrain::test_attach_device_force_rejects_plain_external_holder",
+            },
+        },
+        "error_code:DAEMON_ALREADY_RUNNING": {
+            "linux": {"tests/test_lock_win.py::test_two_locks_same_path_second_raises"},
+        },
+    }
+    for contract_id, by_platform in expected_exclusions.items():
+        actual = universe[contract_id].get("exclude_nodeids", {})
+        for platform, nodeids in by_platform.items():
+            assert set(actual.get(platform, [])) == nodeids, (contract_id, platform, actual)
+            referenced = set(universe[contract_id].get("nodeids", [])) | set(universe[contract_id].get("python_nodeids", []))
+            assert nodeids <= referenced, (contract_id, platform)
+
+    for contract_id in expected_exclusions:
+        item = universe[contract_id]
+        references = set(item.get("nodeids", [])) | set(item.get("python_nodeids", []))
+        for platform in item["platforms"]:
+            excluded = set(item.get("exclude_nodeids", {}).get(platform, []))
+            for nodeid in references:
+                if nodeid.startswith("cargo:"):
+                    continue
+                if platform not in _node_platforms(nodeid):
+                    assert nodeid in excluded, (contract_id, platform, nodeid)
 
 
 def test_platform_artifacts_are_checked_per_platform(tmp_path):
@@ -1226,7 +1716,8 @@ def test_shared_coverage_package_import_merges_same_label_before_contract_judgem
     assert 'python3 scripts/rust/gate_shared_evidence.py record-section --shared-evidence "$RUN_DIR" --section pytest_full' in shared_script
     assert 'python3 scripts/rust/gate_shared_evidence.py record-section --shared-evidence "$RUN_DIR" --section s24_ab' in shared_script
     assert 'tar -czf "$RUN_DIR/work/python-baseline-coverage.tar.gz" -C "$RUN_DIR" coverage' in shared_script
-    assert 'tar -czf "$RUN_DIR/work/s24-coverage.tar.gz" -C "$RUN_DIR" coverage' in shared_script
+    assert 'S24_COVERAGE_TAR="$RUN_DIR/work/s24-coverage.tar.gz"' in shared_script
+    assert 'tar -czf "$S24_COVERAGE_TAR" -C "$RUN_DIR" coverage' in shared_script
     slice24_script = (ROOT / "scripts/rust/slice24_exit.sh").read_text(encoding="utf-8")
     assert 'tar -xzf "$RUN_DIR/shared-import/slice24/python-baseline-coverage.tar.gz"' in slice24_script
     assert 'tar -xzf "$RUN_DIR/shared-import/slice24/coverage.tar.gz"' in slice24_script
@@ -1305,7 +1796,7 @@ def _same_bins_other_bundle(base: Path) -> Path:
     ids=["other_candidate", "same_bins_other_bundle", "no_bundle_record", "no_rust_results", "record_not_tested_artifact"],
 )
 def test_longrun_must_bind_current_candidate(tmp_path, scenario, needle):
-    """P8X-e038dda-1：長跑的 bundle、CLI、daemon 必須等於本輪候選；舊候選的 PASS 不得替新候選解鎖。"""
+    """OD-94：獨立長跑仍須綁定候選 bundle；其判定不進 Slice 2.4。"""
     run = tmp_path / "run"
     imported = _import_longrun(run, _longrun_source(tmp_path))
     assert imported.returncode == 0, imported.stdout + imported.stderr
@@ -1323,9 +1814,11 @@ def test_longrun_must_bind_current_candidate(tmp_path, scenario, needle):
         # 候選 bundle 紀錄是 A，但本輪 rust-linux 實際受測的是另一份 artifact。
         _results(run, "rust-linux", "linux", [])
         _bind_bundle(run, "linux", same, results=False)
+    bound_verdict, bound_reason = _independent_longrun_verdict(run)
+    assert bound_verdict == "BLOCKED-OWNER", bound_reason
+    assert "linux" in bound_reason and needle in bound_reason, bound_reason
     verdict, reason = _judge_reason(run, tmp_path / "o.json")
-    assert verdict == "BLOCKED-OWNER", reason
-    assert "linux" in reason and needle in reason, reason
+    assert verdict == "BLOCKED-OWNER" and "OD-94" in reason
 
 
 def test_record_candidate_bundle_matches_deployed_content_digest(tmp_path):
@@ -1388,7 +1881,7 @@ def _drop(doc: dict, check_id: str) -> None:
 
 
 def test_longrun_dropping_safety_fail_row_is_rejected(tmp_path):
-    """P8X-e038dda-2：安全檢查 FAIL 時照實為 FAIL；移除該列並重算彙總後證據必須拒收，不得 PASS。"""
+    """OD-94：安全檢查 FAIL 照實留在獨立報告；刪除 FAIL 列仍拒收，2.4 維持 BLOCKED-OWNER。"""
     def fail_safety(doc):
         _set_result(doc, "safety_unauthorized_tx", "FAIL")
         _resummarize(doc)
@@ -1399,8 +1892,9 @@ def test_longrun_dropping_safety_fail_row_is_rejected(tmp_path):
     imported = _import_longrun(run, src)
     assert imported.returncode == 0, imported.stdout + imported.stderr
     _bind_candidate(run, tmp_path)
-    verdict, _ = _judge_reason(run, tmp_path / "o.json")
-    assert verdict == "FAIL"
+    assert _independent_longrun_verdict(run)[0] == "FAIL"
+    verdict, reason = _judge_reason(run, tmp_path / "o.json")
+    assert verdict == "BLOCKED-OWNER" and "OD-94" in reason
 
     def drop_row(doc):
         _drop(doc, "safety_unauthorized_tx")
@@ -1415,7 +1909,7 @@ def test_longrun_dropping_safety_fail_row_is_rejected(tmp_path):
     assert any("safety_unauthorized_tx" in error for error in record["platforms"]["linux"]["errors"]), record
     _bind_candidate(run2, tmp_path)
     verdict2, reason2 = _judge_reason(run2, tmp_path / "o2.json")
-    assert verdict2 == "BLOCKED-OWNER", reason2
+    assert verdict2 == "BLOCKED-OWNER" and "OD-94" in reason2
 
 
 def _cand(mutate):
@@ -1464,7 +1958,7 @@ def _regroup(doc: dict, check_id: str, group: str) -> None:
     ],
 )
 def test_longrun_requires_formal_gate_check_set(tmp_path, mutate, needle):
-    """P8X-e038dda-2：candidate 與 baseline 都須具備正式 P2 gate 的完整檢查集合、ID 唯一、group 與適用性一致。"""
+    """OD-94：獨立長跑仍要求正式 P2 gate 的完整檢查集合、ID 唯一、group 與適用性一致。"""
     src = _longrun_source(tmp_path)
     mutate(src)
     run = tmp_path / "run"
@@ -1540,7 +2034,8 @@ def _prior_slice_fixture(tmp_path):
     cli.write_bytes(b"candidate cli")
     daemon.write_bytes(b"candidate daemon")
     daemon_sha = hashlib.sha256(daemon.read_bytes()).hexdigest()
-    prior_daemon_sha = hashlib.sha256(b"prior slice release daemon").hexdigest()
+    prior_daemon_sha = daemon_sha
+    slice23_debug_daemon_sha = hashlib.sha256(b"slice 2.3 debug daemon").hexdigest()
     revision = "a" * 40
     (run / "results-rust-linux.json").write_text(json.dumps({
         "label": "rust-linux", "platform": "linux", "cli_exe": str(cli),
@@ -1573,7 +2068,7 @@ def _prior_slice_fixture(tmp_path):
     (slice23 / "results.json").write_text(json.dumps({
         "git_head": revision,
         "artifacts": {"target/debug/serialwrap": hashlib.sha256(cli.read_bytes()).hexdigest(),
-                      "target/debug/serialwrapd": daemon_sha},
+                      "target/debug/serialwrapd": slice23_debug_daemon_sha},
         "prior_slice_artifacts": {"serialwrapd_release": prior_daemon_sha},
     }), encoding="utf-8")
     (slice23 / "coverage.json").write_text(json.dumps({
@@ -1588,7 +2083,7 @@ def _prior_slice_fixture(tmp_path):
         "cc": cc, "contracts": contracts, "cases": cases, "cases_lock": cases_lock,
         "map_file": map_file, "run": run, "slice21": slice21, "slice22": slice22,
         "slice23": slice23, "revision": revision, "daemon_sha": daemon_sha,
-        "prior_daemon_sha": prior_daemon_sha,
+        "prior_daemon_sha": prior_daemon_sha, "slice23_debug_daemon_sha": slice23_debug_daemon_sha,
         "ids": [f"case:{case_id}" for values in ids_by_slice.values() for case_id in values],
     }
 
@@ -1652,7 +2147,8 @@ def test_prior_slice_universe_lists_seventy_two_unmapped_cases():
 def test_prior_slice_gate_verdicts_import_pass_fail_and_missing(tmp_path):
     """OD-88：三個先前 gate 有逐案證據才沿用 PASS／FAIL；缺列或 GAP 維持 EVIDENCE_MISSING。"""
     fixture = _prior_slice_fixture(tmp_path)
-    assert fixture["daemon_sha"] != fixture["prior_daemon_sha"]
+    assert fixture["daemon_sha"] == fixture["prior_daemon_sha"]
+    assert fixture["slice23_debug_daemon_sha"] != fixture["daemon_sha"]
     output_path = tmp_path / "coverage.json"
     result = _run(*_prior_slice_command(fixture, output_path, fixture["ids"]))
     assert result.returncode == 1, result.stdout + result.stderr
@@ -1667,7 +2163,11 @@ def test_prior_slice_gate_verdicts_import_pass_fail_and_missing(tmp_path):
     assert report["prior_sources"]["2.2"]["accepted"] is True
     assert report["prior_sources"]["2.3"]["accepted"] is True
     assert report["prior_sources"]["2.3"]["daemon_sha256"] == fixture["daemon_sha"]
-    assert report["prior_sources"]["2.3"]["daemon_sha256"] != fixture["prior_daemon_sha"]
+    assert report["prior_sources"]["2.3"]["release_daemon_sha256"] == fixture["daemon_sha"]
+    assert report["prior_sources"]["2.3"]["daemon_sha256"] != fixture["slice23_debug_daemon_sha"]
+    rendered = fixture["cc"].render_gate_report(report, [], {"run_id": "prior-slice-fixture"})
+    assert "2.3 的黑箱使用 debug daemon" in rendered
+    assert "2.4 的候選是 release bundle" in rendered
     assert report["prior_sources"]["2.1"]["evidence_sha256"]["report.json"] == hashlib.sha256(
         (fixture["slice21"] / "report.json").read_bytes()
     ).hexdigest()
@@ -1748,7 +2248,7 @@ def test_prior_slice_identity_mismatch_is_reported_and_rejected(tmp_path, mismat
         if mismatch.endswith("revision"):
             report["git_head"] = "b" * 40
         else:
-            report["artifacts"]["target/debug/serialwrapd"] = "0" * 64
+            report["prior_slice_artifacts"]["serialwrapd_release"] = "0" * 64
         report_path.write_text(json.dumps(report), encoding="utf-8")
         selected = ["case:s23-pass"]
 
@@ -1817,10 +2317,19 @@ def test_stage2_contract_ids_have_locked_rust_coverage_not_stage1_python():
     }
     map_doc = cc._read_yaml(ROOT / "contracts/coverage_map.yaml")
     parametrized = map_doc.get("parametrized", {})
+    od99_ab_nodes = {
+        nodeid
+        for row in (map_doc.get("od99_ab_nodeids") or {}).values()
+        if isinstance(row, dict)
+        for nodeid in row.get("nodeids", [])
+        if isinstance(nodeid, str)
+    }
     referenced_rust_nodes = set()
     unlocked = set()
     for item in stage2_targets.values():
         for nodeid in item.get("nodeids", []):
+            if nodeid in od99_ab_nodes:
+                continue
             params = parametrized.get(nodeid)
             expanded = [f"{nodeid}[{param}]" for param in params] if params is not None else [nodeid]
             for executable_nodeid in expanded:
@@ -1829,9 +2338,9 @@ def test_stage2_contract_ids_have_locked_rust_coverage_not_stage1_python():
                 else:
                     unlocked.add(executable_nodeid)
     unlocked = sorted(unlocked)
-    stage1_python = sorted(referenced_rust_nodes & stage1_python_nodeids)
+    stage1_python = sorted((referenced_rust_nodes & stage1_python_nodeids) - od99_ab_nodes)
     assert not unlocked, f"coverage_map 引用了未登記的 nodeid：{unlocked}"
-    assert not stage1_python, f"coverage_map 沿用 Stage 1 Python nodeid：{stage1_python}"
+    assert not stage1_python, f"coverage_map 沿用未經 OD-99 核准的 Stage 1 Python nodeid：{stage1_python}"
 
     capability_nodeids = {
         nodeid for nodeid in referenced_rust_nodes

@@ -635,12 +635,14 @@ def test_shared_driver_stops_and_records_gate_prereq_failure_before_cargo(tmp_pa
     fixture = tmp_path / "repo"
     scripts = fixture / "scripts/rust"
     scripts.mkdir(parents=True)
-    driver = scripts / "gate_shared.sh"
-    shutil.copy2(ROOT / "scripts/rust/gate_shared.sh", driver)
+    for name in ("gate_shared.sh", "p7_gate.sh", "slice24_exit.sh"):
+        shutil.copy2(ROOT / "scripts/rust" / name, scripts / name)
     shutil.copy2(ROOT / "scripts/rust/gate_shared_evidence.py", scripts / "gate_shared_evidence.py")
     (fixture / ".gitignore").write_text("target/\n__pycache__/\n", encoding="utf-8")
     (scripts / "gate_prereqs.sh").write_text(
-        "printf 'stub gate prerequisite failure\\n'\nreturn 37\n", encoding="utf-8"
+        "printf '%s\\n' \"${PREREQ_DIAG:-stub gate prerequisite failure}\"\n"
+        "return \"${PREREQ_RC:-37}\"\n",
+        encoding="utf-8",
     )
 
     subprocess.run(["git", "init", "--quiet", str(fixture)], check=True, capture_output=True, text=True)
@@ -661,28 +663,76 @@ def test_shared_driver_stops_and_records_gate_prereq_failure_before_cargo(tmp_pa
         "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$CARGO_CALL_LOG\"\nexit 86\n", encoding="utf-8"
     )
     cargo.chmod(0o755)
-    env = os.environ.copy()
-    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
-    env["CARGO_CALL_LOG"] = str(cargo_log)
-    env["CARGO_TARGET_DIR"] = str(fixture / "target")
-    env["CARGO_INCREMENTAL"] = "0"
+    base_env = os.environ.copy()
+    base_env["PATH"] = f"{fake_bin}{os.pathsep}{base_env['PATH']}"
+    base_env["CARGO_CALL_LOG"] = str(cargo_log)
+    base_env["CARGO_TARGET_DIR"] = str(fixture / "target")
+    base_env["CARGO_INCREMENTAL"] = "0"
 
-    proc = subprocess.run(
-        ["bash", str(driver), "--out", str(tmp_path / "shared-evidence"), "--run-id", "prereq-fail"],
-        cwd=fixture,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=60,
+    drivers = {
+        "shared": {
+            "argv": ["--out", str(fixture / "target/s2-shared-evidence")],
+            "log": lambda run_id: fixture / f"target/s2-shared-evidence/{run_id}/logs/gate-prereqs.log",
+            "driver_tsv": lambda run_id: fixture / f"target/s2-par/gpz/gate-shared/{run_id}/driver.tsv",
+        },
+        "p7": {
+            "argv": [],
+            "log": lambda run_id: fixture / f"target/p7-gate/{run_id}/logs/gate-prereqs.log",
+        },
+        "slice24": {
+            "argv": [],
+            "log": lambda run_id: fixture / f"target/contract-coverage/{run_id}/logs/gate-prereqs.log",
+            "driver_tsv": lambda run_id: fixture / f"target/contract-coverage/{run_id}/driver.tsv",
+        },
+    }
+
+    def invoke(name, run_id, env):
+        script_name = {"shared": "gate_shared.sh", "p7": "p7_gate.sh", "slice24": "slice24_exit.sh"}[name]
+        command = ["bash", str(scripts / script_name), *drivers[name]["argv"], "--run-id", run_id]
+        return subprocess.run(command, cwd=fixture, env=env, capture_output=True, text=True,
+                              check=False, timeout=60)
+
+    # 髒樹必須在任何前置／建置前拒絕，並列出實際髒檔；參數錯誤仍保留 exit 2。
+    dirty_file = fixture / "dirty sentinel.txt"
+    dirty_file.write_text("uncommitted\n", encoding="utf-8")
+    dirty_env = base_env | {"PREREQ_DIAG": "stub prerequisite must not run", "PREREQ_RC": "37"}
+    for name in drivers:
+        run_id = f"dirty-{name}"
+        proc = invoke(name, run_id, dirty_env)
+        assert proc.returncode == 3, proc.stdout + proc.stderr
+        output = proc.stdout + proc.stderr
+        assert "工作樹不乾淨" in output and "dirty sentinel.txt" in output, output
+        assert "stub prerequisite must not run" not in output, output
+        assert not drivers[name]["log"](run_id).exists(), "髒樹拒絕時不得啟動 gate_prereqs"
+        script_name = {"shared": "gate_shared.sh", "p7": "p7_gate.sh", "slice24": "slice24_exit.sh"}[name]
+        bad_args = subprocess.run(
+            ["bash", str(scripts / script_name), "--unknown-option"],
+            cwd=fixture, env=dirty_env, capture_output=True, text=True, check=False, timeout=30,
+        )
+        assert bad_args.returncode == 2, bad_args.stdout + bad_args.stderr
+    dirty_file.unlink()
+
+    # 每種 gate 前置失敗都要留明確原因；三個 driver 統一用 exit 4，與參數錯誤 exit 2 分開。
+    failure_cases = (
+        ("gate_prereqs.sh: loadavg 99 不低於核心數一半（24/2）", 3),
+        ("gate_prereqs.sh: D 槽可用空間 99G，小於 100G", 3),
+        ("gate_prereqs.sh: 殘留 worktree 拋棄式 serialwrapd：123", 3),
+        ("gate_prereqs.sh: WSL interop 無法啟動 cmd.exe", 3),
+        ("gate_prereqs.sh: 候選版 Stage 2 bundle 建置失敗", 2),
     )
-
-    log_dir = fixture / "target/s2-par/gpz/gate-shared/prereq-fail"
-    assert proc.returncode == 37, proc.stdout + proc.stderr
-    assert (log_dir / "gate-prereqs.log").read_text(encoding="utf-8") == "stub gate prerequisite failure\n"
-    assert (log_dir / "driver.tsv").read_text(encoding="utf-8") == "gate_prereqs\t37\n"
-    assert not cargo_log.exists(), "前置失敗後不得啟動 build 或 cargo L1"
-    assert not (log_dir / "cargo-fakes-filtered.log").exists()
+    for index, (diagnostic, source_rc) in enumerate(failure_cases):
+        for name in drivers:
+            run_id = f"prereq-{index}-{name}"
+            env = base_env | {"PREREQ_DIAG": diagnostic, "PREREQ_RC": str(source_rc)}
+            proc = invoke(name, run_id, env)
+            assert proc.returncode == 4, proc.stdout + proc.stderr
+            log = drivers[name]["log"](run_id).read_text(encoding="utf-8")
+            assert diagnostic in log, log
+            assert "gate_prereqs --gate 失敗" in log, log
+            assert "gate_prereqs --gate 失敗" in (proc.stdout + proc.stderr)
+            if "driver_tsv" in drivers[name]:
+                assert drivers[name]["driver_tsv"](run_id).read_text(encoding="utf-8") == f"gate_prereqs\t{source_rc}\n"
+    assert not cargo_log.exists(), "髒樹或前置失敗後不得啟動 build 或 cargo L1"
 
 
 def test_shared_artifact_init_and_import_preserve_executable_names(tmp_path, monkeypatch):
@@ -763,6 +813,183 @@ def test_shared_artifact_init_and_import_preserve_executable_names(tmp_path, mon
     assert tampered["reasons"]
 
 
+def test_cargo_results_and_s24_ab_use_the_same_candidate_bundle_sha256(tmp_path, monkeypatch):
+    import importlib.util
+    from types import SimpleNamespace
+
+    api, shared, bundle, _artifacts, _head = _s24_candidate_fixture(tmp_path / "s24", monkeypatch)
+    script = (ROOT / "scripts/rust/gate_shared.sh").read_text(encoding="utf-8")
+    cargo_block = script.split("CARGO_RESULTS_DIR=", 1)[1].split("P7_AB=", 1)[0]
+    s24_block = script.split('run_capture "$LOG_DIR/s24-ab.log"', 1)[1].split(
+        'if [[ -n "$WINDOWS_L1" ]]', 1
+    )[0]
+    cli_assignment = 'SERIALWRAP_CLI_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrap"'
+    daemon_assignment = 'SERIALWRAP_DAEMON_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrapd"'
+    assert cli_assignment in cargo_block
+    assert daemon_assignment in cargo_block
+    assert cli_assignment in s24_block
+    assert daemon_assignment in s24_block
+
+    version_root = bundle / "versions/0.4.1"
+    env = os.environ.copy()
+    env.update({
+        "S24_BUNDLE_VERSION_ROOT": str(version_root),
+        "SERIALWRAP_CLI_EXE": str(version_root / "bin/serialwrap"),
+        "SERIALWRAP_DAEMON_EXE": str(version_root / "bin/serialwrapd"),
+    })
+    fixture = tmp_path / "cargo-fixture.json"
+    fixture.write_text(json.dumps({"targets": [], "exit_code": 0, "finished": True}), encoding="utf-8")
+    cargo_out = tmp_path / "cargo-results"
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "scripts/rust/import_cargo_results.py"),
+         "--label", "rust-linux", "--platform", "linux", "--out-dir", str(cargo_out),
+         "--fixture", str(fixture)],
+        cwd=ROOT, env=env, capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    cargo_result = json.loads((cargo_out / "results-rust-linux.json").read_text(encoding="utf-8"))
+
+    plugin_path = ROOT / "tests/contract_blackbox/coverage_plugin.py"
+    plugin_spec = importlib.util.spec_from_file_location("coverage_plugin_identity_under_test", plugin_path)
+    assert plugin_spec is not None and plugin_spec.loader is not None
+    plugin = importlib.util.module_from_spec(plugin_spec)
+    plugin_spec.loader.exec_module(plugin)
+    monkeypatch.setattr(plugin, "_ab_env", lambda: {
+        name: env[name] for name in ("SERIALWRAP_CLI_EXE", "SERIALWRAP_DAEMON_EXE")
+    } | {"SERIALWRAP_AB_LABEL": "rust-linux"})
+    monkeypatch.setattr(plugin, "_harness", lambda: SimpleNamespace(
+        cli_prefix=lambda: [env["SERIALWRAP_CLI_EXE"]],
+        daemon_prefix=lambda: [env["SERIALWRAP_DAEMON_EXE"]],
+    ))
+    cli, daemon, errors = plugin._artifact_identity("rust-linux")
+    assert errors == []
+    assert cargo_result["cli_sha256"] == plugin._sha256(pathlib.Path(cli))
+    assert cargo_result["daemon_sha256"] == plugin._sha256(pathlib.Path(daemon))
+    assert cargo_result["cli_sha256"] == _sha(version_root / "bin/serialwrap")
+    assert cargo_result["daemon_sha256"] == _sha(version_root / "bin/serialwrapd")
+    assert cargo_result["cli_sha256"] != _sha(shared / "artifacts/debug/serialwrap")
+    assert cargo_result["daemon_sha256"] != _sha(shared / "artifacts/debug/serialwrapd")
+
+
+def test_s24_bundle_check_failure_is_recorded_missing_and_does_not_skip_windows_l1(tmp_path, monkeypatch):
+    api, shared, bundle, artifacts, head = _s24_candidate_fixture(tmp_path / "s24", monkeypatch)
+    daemon = bundle / "versions/0.4.1/bin/serialwrapd"
+    daemon.write_bytes(b"tampered after the S24 test\n")
+    checked = api.check_candidate_bundle(shared, current_head=head)
+    assert checked["status"] == "EVIDENCE_MISSING", checked
+
+    check_log = tmp_path / "s24-bundle-check.log"
+    check_log.write_text("candidate bundle check failed\n", encoding="utf-8")
+    recorded = subprocess.run(
+        [sys.executable, str(TOOL), "record-missing-section",
+         "--shared-evidence", str(shared), "--section", "s24_ab",
+         "--argv-json", json.dumps(["-q", "tests/contract_blackbox"]),
+         "--exit-code", "3", "--reason", "candidate bundle check failed",
+         "--file", f"logs/s24-bundle-check.log={check_log}"],
+        cwd=ROOT, capture_output=True, text=True, check=False,
+    )
+    assert recorded.returncode == 0, recorded.stdout + recorded.stderr
+    manifest = json.loads((shared / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["sections"]["s24_ab"]["evidence_status"] == "EVIDENCE_MISSING"
+    imported = api.validate_section(
+        shared, gate="slice24", section="s24_ab", required_set=None, platform="linux",
+        expected_artifacts=artifacts, current_head=head, worktree_clean=True, expected_command="s24_ab",
+    )
+    assert imported["status"] == "EVIDENCE_MISSING", imported
+    daemon.write_bytes(b"daemon:candidate-a\n")
+    restored_bundle_import = api.validate_section(
+        shared, gate="slice24", section="s24_ab", required_set=None, platform="linux",
+        expected_artifacts=artifacts, current_head=head, worktree_clean=True, expected_command="s24_ab",
+    )
+    assert restored_bundle_import["status"] == "EVIDENCE_MISSING", restored_bundle_import
+
+    script = (ROOT / "scripts/rust/gate_shared.sh").read_text(encoding="utf-8")
+    s24_block = script.split("S24_TARGETS=(", 1)[1].split('if [[ -n "$WINDOWS_L1" ]]', 1)[0]
+    assert 'check_s24_candidate_bundle before' in s24_block
+    assert 'check_s24_candidate_bundle after' in s24_block
+    assert "record-missing-section" in s24_block
+    assert script.index('if [[ -n "$WINDOWS_L1" ]]') > script.index("S24_TARGETS=(")
+
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    windows_set = next(set_id for set_id, platforms in sorted(lock["sets"].items()) if "windows" in platforms)
+    real_python = sys.executable
+    for fail_at in (1, 2):
+        run_root = tmp_path / f"driver-failure-{fail_at}"
+        run_dir = run_root / "run"
+        log_dir = run_root / "logs"
+        windows_l1 = run_root / "windows-l1"
+        (windows_l1 / windows_set).mkdir(parents=True)
+        (windows_l1 / windows_set / "l1-results.json").write_text("{}\n", encoding="utf-8")
+        stub_bin = run_root / "bin"
+        stub_bin.mkdir(parents=True)
+        events = run_root / "events.log"
+        wrapper = stub_bin / "python3"
+        wrapper.write_text(r'''#!/usr/bin/env bash
+set -euo pipefail
+if [[ " $* " == *"gate_shared_evidence.py check-candidate-bundle"* ]]; then
+  count=0; [[ ! -f "$SW_TEST_CHECK_COUNT" ]] || count=$(<"$SW_TEST_CHECK_COUNT")
+  count=$((count + 1)); printf '%s' "$count" > "$SW_TEST_CHECK_COUNT"
+  echo "bundle-check-$count" >> "$SW_TEST_EVENTS"
+  echo "candidate check $count"
+  [[ "$count" != "$SW_TEST_FAIL_AT" ]] || exit 17
+  exit 0
+fi
+if [[ " $* " == *"record-missing-section"* ]]; then echo record-missing-section >> "$SW_TEST_EVENTS"; exit 0; fi
+if [[ " $* " == *"record-windows-l1"* ]]; then echo record-windows-l1 >> "$SW_TEST_EVENTS"; exit 0; fi
+if [[ "${1:-}" == -m && "${2:-}" == pytest ]]; then
+  echo pytest >> "$SW_TEST_EVENTS"
+  for arg in "$@"; do case "$arg" in --junitxml=*) mkdir -p "$(dirname "${arg#*=}")"; echo '<testsuite/>' > "${arg#*=}";; esac; done
+  exit 0
+fi
+exec "$SW_TEST_REAL_PYTHON" "$@"
+''', encoding="utf-8")
+        wrapper.chmod(0o755)
+        run_dir.mkdir(parents=True)
+        (run_dir / "coverage").mkdir()
+        harness = run_root / "exercise-s24-driver.sh"
+        harness_prefix = r'''#!/usr/bin/env bash
+set -euo pipefail
+set -o pipefail
+RUN_DIR="$SW_TEST_RUN_DIR"
+LOG_DIR="$SW_TEST_LOG_DIR"
+WINDOWS_L1="$SW_TEST_WINDOWS_L1"
+S24_BUNDLE="$SW_TEST_BUNDLE"
+S24_BUNDLE_VERSION_ROOT="$SW_TEST_VERSION_ROOT"
+mkdir -p "$LOG_DIR"
+FAILURES=0
+LAST_RC=0
+run_capture() { local log="$1"; shift; set +e; "$@" 2>&1 | tee "$log"; local statuses=("${PIPESTATUS[@]}"); set -e; LAST_RC="${statuses[0]}"; [[ "$LAST_RC" == 0 ]] || FAILURES=1; }
+'''
+        harness.write_text(harness_prefix + script[script.index("S24_TARGETS=("):], encoding="utf-8")
+        env = os.environ.copy()
+        env.update({
+            "PATH": f"{stub_bin}{os.pathsep}{env.get('PATH', '')}",
+            "SW_TEST_REAL_PYTHON": real_python,
+            "SW_TEST_EVENTS": str(events),
+            "SW_TEST_CHECK_COUNT": str(run_root / "check-count"),
+            "SW_TEST_FAIL_AT": str(fail_at),
+            "SW_TEST_RUN_DIR": str(run_dir),
+            "SW_TEST_LOG_DIR": str(log_dir),
+            "SW_TEST_WINDOWS_L1": str(windows_l1),
+            "SW_TEST_BUNDLE": str(run_root / "candidate-bundle"),
+            "SW_TEST_VERSION_ROOT": str(run_root / "candidate-bundle/versions/0.4.1"),
+        })
+        proc = subprocess.run(["bash", str(harness)], cwd=ROOT, env=env,
+                              capture_output=True, text=True, check=False)
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        observed = events.read_text(encoding="utf-8").splitlines()
+        assert observed.count("record-missing-section") == 1, observed
+        assert observed.count("record-windows-l1") == 1, observed
+        assert observed.index("record-missing-section") < observed.index("record-windows-l1"), observed
+        assert "Windows L1 匯入：1 個鎖定集合" in proc.stdout
+        assert observed.count("bundle-check-1") == 1
+        if fail_at == 1:
+            assert observed == ["bundle-check-1", "record-missing-section", "record-windows-l1"]
+        else:
+            assert observed == ["bundle-check-1", "pytest", "bundle-check-2",
+                                "record-missing-section", "record-windows-l1"]
+
+
 def test_g5_bundle_tempdir_uses_short_system_path(tmp_path, monkeypatch):
     """長 worktree 下的 G5 bundle 暫存根也不得沿用 ROOT/target/g5-tmp。"""
     import importlib.util
@@ -818,8 +1045,8 @@ def test_g5_bundle_tempdir_uses_short_system_path(tmp_path, monkeypatch):
 def test_gate_shared_artifact_paths_keep_cli_and_daemon_basenames():
     required = {
         "gate_shared.sh": (
-            'SERIALWRAP_CLI_EXE="$RUN_DIR/artifacts/debug/serialwrap"',
-            'SERIALWRAP_DAEMON_EXE="$RUN_DIR/artifacts/debug/serialwrapd"',
+            'SERIALWRAP_CLI_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrap"',
+            'SERIALWRAP_DAEMON_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrapd"',
             '--rust-cli "$RUN_DIR/artifacts/debug/serialwrap"',
             '--rust-daemon "$RUN_DIR/artifacts/debug/serialwrapd"',
             'scripts/rust/mkbundle.sh \\\n  --release-bundle --stage 2 --profile release',

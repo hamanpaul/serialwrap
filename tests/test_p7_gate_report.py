@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import subprocess
 import sys
 
 import pytest
@@ -17,6 +18,7 @@ sys.path.insert(0, str(ROOT / "scripts/rust"))
 import p7_gate_report as g  # noqa: E402
 
 pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+RESOURCE_AUDIT_WAIVERS = {"process_rpc": "test_required_rows_complete 僅啟動 p7_gate.sh --dry-run，不啟動 daemon 或進行 RPC"}
 
 
 def _results(tmp, rows, caps_missing=(), name="run", owner_evidence=None):
@@ -41,6 +43,20 @@ def test_zero_tests_is_not_pass(tmp_path):
 def test_missing_com_pair_makes_com_row_blocked_not_pass(tmp_path):
     md = g.build_report(_results(tmp_path, [_row("win-test.sh --caps windows_com", passed=0)], caps_missing=["windows_com"]))
     assert "| win-test.sh --caps windows_com | BLOCKED-OWNER | B-06 |" in md
+
+
+def test_rejected_shared_windows_import_is_incomplete_not_blocked_owner(tmp_path):
+    """匯入被拒時缺少 l1_results 必須維持 INCOMPLETE；實際能力缺失仍由 caps_missing 單獨判 BLOCKED-OWNER。"""
+    names = ("win-test.sh (non-COM)", "win-test.sh --caps windows_com")
+    rows = []
+    for name in names:
+        row = _row(name, rc=None, passed=0)
+        row["required_set"] = g.expected_set(name)
+        row["platform"] = "windows"
+        rows.append(row)
+    md = g.build_report(_results(tmp_path, rows, caps_missing=[]))
+    for name in names:
+        assert f"| {name} | INCOMPLETE | 缺 l1_results |" in md
 
 
 def test_com_row_with_pair_judged_by_run_not_blocked(tmp_path):
@@ -98,12 +114,25 @@ def test_required_rows_complete():
     assert set(g.REQUIRED_ROWS) >= {"check_cfg_boundary", "cargo test --workspace", "win-test.sh (non-COM)", "win-test.sh --caps windows_com",
         "contract_blackbox p7 A", "contract_blackbox p7 B", *g.OD59_ROWS, "contract_blackbox slice21 B", "contract_blackbox slice22 B",
         "l15 slice21 B", "l15 slice23 B", "func-test brcm-01-login-flow", "func-test ev-01-spawn-handler",
+        g.WINDOWS_EV01_ROW,
         "regen_lock --check", "cases.lock slice_2.3 coverage",
         "python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
         "policy_check"}
     script = (ROOT / "scripts/rust/p7_gate.sh").read_text(encoding="utf-8")
     assert 'win_l1() {  # win_l1 <dir> <該次 win-test log>' in script
     assert 'ls -t "$ROOT"/target/win-test-report' not in script
+    assert "--windows-ev01-report" in script and "--windows-ev01-bundle" in script
+    assert "P7_WIN_EV01_REPORT" in script and "P7_WIN_EV01_BUNDLE" in script
+
+    run_id = "default-report-path"
+    dry_run = subprocess.run(
+        ["bash", str(ROOT / "scripts/rust/p7_gate.sh"), "--dry-run", "--run-id", run_id],
+        cwd=ROOT, capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert dry_run.returncode == 0, dry_run.stdout + dry_run.stderr
+    default_report = ROOT / "target/p7-gate" / run_id / "p7-gate.md"
+    assert str(default_report) in dry_run.stdout, dry_run.stdout
+    assert "docs/rust-refactor/evidence/p7-gate-" not in dry_run.stdout
 
 
 def test_missing_required_row_is_incomplete(tmp_path):
@@ -381,3 +410,191 @@ def test_owner_items_cover_every_coverage_b_number(tmp_path):
     md = g.build_report(_results(tmp_path, []))
     for bid in sorted(used):
         assert f"| {bid} | BLOCKED-OWNER |" in md, bid
+
+
+def _windows_ev01_fixture(tmp_path, *, bundle_head=None, meta_head=None, verdict="PASS", gate_eligible=True):
+    import hashlib
+
+    head = bundle_head or g.current_head()
+    bundle = tmp_path / "windows-bundle"
+    version = "0.5.0"
+    version_dir = bundle / "versions" / version
+    version_bin = version_dir / "bin"
+    root_bin = bundle / "bin"
+    version_bin.mkdir(parents=True)
+    root_bin.mkdir(parents=True)
+    cli = b"stage2-cli-exe"
+    daemon = b"stage2-daemon-exe"
+    (version_bin / "serialwrap.exe").write_bytes(cli)
+    (version_bin / "serialwrapd.exe").write_bytes(daemon)
+    (root_bin / "serialwrap.exe").write_bytes(cli)
+    (root_bin / "serialwrapd.exe").write_bytes(daemon)
+    (root_bin / "current-release.json").write_text(
+        json.dumps({"bundle_version": version, "dir": f"versions/{version}"}), encoding="utf-8"
+    )
+    manifest = {
+        "schema_version": 1,
+        "bundle_version": version,
+        "stage": "rust-2",
+        "git_revision": head,
+        "target": "x86_64-pc-windows-gnu",
+        "components": {
+            "cli": {"implementation": "rust", "version": version, "git_revision": head,
+                    "path": "bin/serialwrap.exe", "sha256": hashlib.sha256(cli).hexdigest()},
+            "daemon": {"implementation": "rust", "version": version, "git_revision": head,
+                       "launcher": {"path": "bin/serialwrapd.exe", "sha256": hashlib.sha256(daemon).hexdigest()}},
+        },
+    }
+    (version_dir / "release-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (version_dir / "SHA256SUMS").write_text(
+        f"{hashlib.sha256(cli).hexdigest()}  bin/serialwrap.exe\n"
+        f"{hashlib.sha256(daemon).hexdigest()}  bin/serialwrapd.exe\n", encoding="utf-8"
+    )
+    report_root = tmp_path / "win-func-test"
+    basic = report_root / "basic" / "func-test-report.json"
+    basic.parent.mkdir(parents=True)
+    report = {
+        "schema_version": "func-test-report.v1",
+        "complete": True,
+        "independent_cases": 1,
+        "modes": {"bridge": {"runs": 1, "pass": int(verdict == "PASS"), "fail": int(verdict == "FAIL"),
+                              "insufficient": int(verdict == "INSUFFICIENT_EVIDENCE"), "skip": int(verdict == "SKIP")}},
+        "results": [{"case_id": "ev-01-spawn-handler", "mode": "bridge", "run_index": 0,
+                     "verdict": verdict, "gate_eligible": gate_eligible}],
+    }
+    report_bytes = json.dumps(report, sort_keys=True).encode()
+    basic.write_bytes(report_bytes)
+    identity = g.windows_bundle_identity(bundle)
+    meta = {
+        "schema_version": "win-func-test-meta.v2",
+        "git_head": meta_head or g.current_head(),
+        "git_tree": "a" * 40,
+        "git_clean": True,
+        "com_pair": {"daemon": "COM20", "bridge": "COM21"},
+        "transport_mode": "virtual_com0com",
+        "basic_report_sha256": hashlib.sha256(report_bytes).hexdigest(),
+        "bundle_sha256": identity["bundle_sha256"],
+        "bundle_stage": identity["stage"],
+        "bundle_version": identity["version"],
+        "bundle_git_revision": identity["git_revision"],
+        "bundle_manifest_sha256": identity["manifest_sha256"],
+        "cli_exe_sha256": identity["cli_sha256"],
+        "daemon_exe_sha256": identity["daemon_sha256"],
+        "daemon_exe_used": True,
+        "case_filter": "ev-01-spawn-handler",
+        "scenario_skipped": True,
+        "runs": {"scenarios": {"runner_argv": [], "skipped": True, "runner_exit": 0},
+                 "basic": {"report": "basic/func-test-report.json", "runner_exit": 0,
+                            "runner_argv": ["-3.12", "func-test/runner.py", "--mode", "bridge", "--case",
+                                            "ev-01-spawn-handler", "--daemon-com", "COM20", "--bridge-com", "COM21",
+                                            "--transport-mode", "virtual_com0com"]}},
+    }
+    (report_root / "win-func-test-meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    return basic, bundle
+
+
+def test_windows_ev01_is_a_required_row_and_missing_report_is_incomplete(tmp_path):
+    assert g.WINDOWS_EV01_ROW in g.REQUIRED_ROWS
+    status, _detail = g.windows_ev01_status(None, None, g.current_head())
+    assert status == "INCOMPLETE"
+    run = _results(tmp_path, [])
+    data = json.loads((run / "results.json").read_text(encoding="utf-8"))
+    data["git_head"] = g.current_head()
+    (run / "results.json").write_text(json.dumps(data), encoding="utf-8")
+    g.record_windows_ev01(run, report_path=None, bundle_dir=None, log_path=run / "logs/windows-ev01.log")
+    md = g.build_report(run)
+    row = next(line for line in md.splitlines() if g.WINDOWS_EV01_ROW in line)
+    assert f"| {g.WINDOWS_EV01_ROW} | INCOMPLETE |" in row
+    assert "BLOCKED-OWNER" not in row
+    assert "結論：NOT-PASS" in md
+
+
+def test_windows_ev01_rejects_report_bound_to_another_head(tmp_path):
+    basic, bundle = _windows_ev01_fixture(tmp_path, meta_head="f" * 40)
+    status, detail = g.windows_ev01_status(basic, bundle, g.current_head())
+    assert status == "INCOMPLETE", detail
+    assert "HEAD" in detail
+
+
+@pytest.mark.parametrize("verdict,gate_eligible", [("FAIL", True), ("INSUFFICIENT_EVIDENCE", False),
+                                                      ("SKIP", False), ("PASS", False)])
+def test_windows_ev01_nonpassing_or_ineligible_case_never_passes(tmp_path, verdict, gate_eligible):
+    basic, bundle = _windows_ev01_fixture(tmp_path, verdict=verdict, gate_eligible=gate_eligible)
+    status, _detail = g.windows_ev01_status(basic, bundle, g.current_head())
+    assert status != "PASS"
+    assert status == ("FAIL" if verdict == "FAIL" else "INCOMPLETE")
+
+
+def test_windows_ev01_passes_with_verified_head_bundle_and_eligible_result(tmp_path):
+    basic, bundle = _windows_ev01_fixture(tmp_path)
+    status, detail = g.windows_ev01_status(basic, bundle, g.current_head())
+    assert status == "PASS", detail
+    assert "gate_eligible" in detail
+
+
+def test_windows_ev01_snapshot_row_is_reported_and_recomputed(tmp_path):
+    basic, bundle = _windows_ev01_fixture(tmp_path)
+    run = _results(tmp_path, [])
+    data = json.loads((run / "results.json").read_text(encoding="utf-8"))
+    data["git_head"] = g.current_head()
+    (run / "results.json").write_text(json.dumps(data), encoding="utf-8")
+    log = run / "logs/windows-ev01.log"
+    g.record_windows_ev01(run, report_path=basic, bundle_dir=bundle, log_path=log)
+    md = g.build_report(run)
+    assert f"| {g.WINDOWS_EV01_ROW} | PASS |" in md
+    assert g._row_status(run, json.loads((run / "results.json").read_text())['rows'][0],
+                         set(), None, None, g.current_head())[0] == "PASS"
+
+
+def test_windows_bundle_identity_rejects_release_test_hooks(tmp_path):
+    import hashlib
+
+    _basic, bundle = _windows_ev01_fixture(tmp_path)
+    version_dir = bundle / "versions/0.5.0"
+    manifest_path = version_dir / "release-manifest.json"
+    sums_path = version_dir / "SHA256SUMS"
+
+    def replace_binaries(cli: bytes, daemon: bytes) -> None:
+        for root in (version_dir / "bin", bundle / "bin"):
+            (root / "serialwrap.exe").write_bytes(cli)
+            (root / "serialwrapd.exe").write_bytes(daemon)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["components"]["cli"]["sha256"] = hashlib.sha256(cli).hexdigest()
+        manifest["components"]["daemon"]["launcher"]["sha256"] = hashlib.sha256(daemon).hexdigest()
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        sums_path.write_text(
+            f"{hashlib.sha256(cli).hexdigest()}  bin/serialwrap.exe\n"
+            f"{hashlib.sha256(daemon).hexdigest()}  bin/serialwrapd.exe\n",
+            encoding="utf-8",
+        )
+
+    allowed = (
+        b"SERIALWRAP_TEST_DEVICE_ALLOWLIST",
+        b"SERIALWRAP_TEST_SYSTEM_CONFIG_PATH",
+        b"SERIALWRAP_TEST_KILL_AFTER_SAVE",
+        b"SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE",
+    )
+    daemon = b"stage2-daemon-exe\0" + b"\0".join(allowed)
+    replace_binaries(b"stage2-cli-exe", daemon)
+    identity = g.windows_bundle_identity(bundle)
+    assert identity["daemon_sha256"] == hashlib.sha256(daemon).hexdigest()
+
+    for forbidden in (b"SERIALWRAP_TEST_UNAPPROVED_HOOK", b"SW_TEST_UPDATE_FUTURE_HOOK"):
+        replace_binaries(b"stage2-cli-exe", b"stage2-daemon-exe\0" + forbidden)
+        with pytest.raises(ValueError, match="禁用測試鉤子"):
+            g.windows_bundle_identity(bundle)
+
+    replace_binaries(b"stage2-cli-exe\0SERIALWRAP_TEST_DEVICE_ALLOWLIST", daemon)
+    with pytest.raises(ValueError, match="禁用測試鉤子"):
+        g.windows_bundle_identity(bundle)
+
+
+def test_windows_ev01_requires_stage2_bundle_sha256_identity(tmp_path):
+    basic, bundle = _windows_ev01_fixture(tmp_path)
+    metadata_path = basic.parent.parent / "win-func-test-meta.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["bundle_sha256"] = "0" * 64
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    status, detail = g.windows_ev01_status(basic, bundle, g.current_head())
+    assert status == "INCOMPLETE", detail
+    assert "SHA-256" in detail or "SHA256" in detail

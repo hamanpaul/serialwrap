@@ -296,7 +296,10 @@ def test_baseline_stats_from_lr_mixed(tmp_path):
         release_manifest=env.linux_manifest,
     )
     workload = od09.workload(env.acceptance)
-    assert stats.duration_s == workload["min_continuous_duration_s"]
+    start_t = next(row["t"] for row in env.linux_run.events if row.get("kind") == "start")
+    stop_t = next(row["t"] for row in env.linux_run.events if row.get("kind") == "stop")
+    assert stats.duration_s == int(stop_t - start_t)
+    assert stats.duration_s >= workload["min_continuous_duration_s"]
     assert stats.hourly_done["COM0|agent:rhw0"]["hours"] == 48
 
 
@@ -866,7 +869,10 @@ def test_baseline_stats_accepts_non_grid_snapshot_times(tmp_path):
     rows = run.snapshots[:-1]
     run.set_snapshots([dict(row, t=1 + index * 300.5) for index, row in enumerate(rows)])
     stats = od09.baseline_stats(env.linux_case_dir, platform="linux", release_manifest=env.linux_manifest)
-    assert stats.duration_s == od09.workload(env.acceptance)["min_continuous_duration_s"]
+    start_t = next(row["t"] for row in run.events if row.get("kind") == "start")
+    stop_t = next(row["t"] for row in run.events if row.get("kind") == "stop")
+    assert stats.duration_s == int(stop_t - start_t)
+    assert stats.duration_s >= od09.workload(env.acceptance)["min_continuous_duration_s"]
     assert od09.validate_baseline(stats, acceptance_path=env.acceptance) == []
 
 

@@ -102,6 +102,78 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _run_windows_bundle_helper(command: str, *args: str, pythonpath: Path | None = None) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    if pythonpath is not None:
+        inherited = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = os.pathsep.join(
+            part for part in (str(pythonpath), inherited) if part
+        )
+    return subprocess.run(
+        [sys.executable, str(REPO / "scripts/rust/mkbundle_windows.py"), command, *args],
+        cwd=REPO,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+
+def _refresh_windows_stage2_validator_fixture(root: Path, daemon: bytes, cli: bytes) -> Path:
+    version_dir = root / "versions" / VERSION
+    version_bin = version_dir / "bin"
+    root_bin = root / "bin"
+    version_bin.mkdir(parents=True, exist_ok=True)
+    root_bin.mkdir(parents=True, exist_ok=True)
+    (version_bin / "serialwrapd.exe").write_bytes(daemon)
+    (version_bin / "serialwrap.exe").write_bytes(cli)
+    shutil.copy2(version_bin / "serialwrapd.exe", root_bin / "serialwrapd.exe")
+    shutil.copy2(version_bin / "serialwrap.exe", root_bin / "serialwrap.exe")
+    (root_bin / "current-release.json").write_text(
+        json.dumps({"bundle_version": VERSION, "dir": f"versions/{VERSION}"}),
+        encoding="utf-8",
+    )
+    fingerprint = _sha256(version_bin / "serialwrapd.exe")[:12]
+    result = _run_windows_bundle_helper(
+        "manifest",
+        "--version-dir", str(version_dir),
+        "--source-root", str(REPO),
+        "--version", VERSION,
+        "--git-revision", "0123456789abcdef0123456789abcdef01234567",
+        "--contract-revision", "89abcdef0123456789abcdef0123456789abcdef",
+        "--expected-fingerprint", fingerprint,
+        "--stage", "2",
+        pythonpath=version_dir / "py",
+    )
+    assert result.returncode == 0, result.stderr
+    return version_dir
+
+
+def _make_windows_stage2_validator_fixture(root: Path, daemon: bytes, cli: bytes) -> None:
+    py_dir = root / "versions" / VERSION / "py"
+    py_dir.mkdir(parents=True)
+    shutil.copytree(
+        REPO / "sw_core",
+        py_dir / "sw_core",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    (py_dir / "python.exe").write_bytes(b"embedded-python-fixture")
+    (py_dir / "python312._pth").write_text(
+        "python312.zip\n.\nLib\\site-packages\n", encoding="utf-8"
+    )
+    _refresh_windows_stage2_validator_fixture(root, daemon, cli)
+
+
+def _validate_windows_stage2_bundle(root: Path) -> subprocess.CompletedProcess:
+    return _run_windows_bundle_helper(
+        "validate",
+        "--bundle-root", str(root),
+        "--source-root", str(REPO),
+        "--version", VERSION,
+    )
+
+
 def _manifest(out: Path) -> dict:
     mpath = out / "versions" / VERSION / "release-manifest.json"
     assert mpath.exists(), f"manifest 不存在：{mpath}"
@@ -561,6 +633,48 @@ raise SystemExit(helper.main())
     schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
     errors = list(jsonschema.validators.validator_for(schema)(schema).iter_errors(manifest))
     assert not errors, "; ".join(f"{list(error.absolute_path)}: {error.message}" for error in errors)
+
+
+def test_windows_stage2_validator_allows_only_daemon_parity_hooks(tmp_path: Path) -> None:
+    """Stage 2 daemon 僅可帶四個逐名 hook；同前綴延伸、其他 hook 與 CLI 都拒絕。"""
+    allowed = (
+        b"SERIALWRAP_TEST_DEVICE_ALLOWLIST",
+        b"SERIALWRAP_TEST_SYSTEM_CONFIG_PATH",
+        b"SERIALWRAP_TEST_KILL_AFTER_SAVE",
+        b"SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE",
+    )
+    daemon = b"rust-daemon-fixture\0" + b"\0".join(allowed)
+    cli = b"rust-cli-fixture"
+    root = tmp_path / "windows-stage2"
+    _make_windows_stage2_validator_fixture(root, daemon, cli)
+
+    accepted = _validate_windows_stage2_bundle(root)
+    assert accepted.returncode == 0, accepted.stderr
+    assert "無測試鉤子" in accepted.stdout
+
+    for forbidden, marker in (
+        (b"SERIALWRAP_TEST_UNAPPROVED_HOOK", "SERIALWRAP_TEST_UNAPPROVED_HOOK"),
+        (b"SERIALWRAP_TEST_DEVICE_ALLOWLIST_EXTRA", "SERIALWRAP_TEST_DEVICE_ALLOWLIST_EXTRA"),
+        (b"SERIALWRAP_TEST_DEVICE_ALLOWLISTmissing", "SERIALWRAP_TEST_DEVICE_ALLOWLISTmissing"),
+        (b"SERIALWRAP_TEST_SYSTEM_CONFIG_PATHconfig.yaml", "SERIALWRAP_TEST_SYSTEM_CONFIG_PATHconfig"),
+        (
+            b"SERIALWRAP_TEST_KILL_AFTER_SAVESERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVETraceback (most call last):",
+            "SERIALWRAP_TEST_KILL_AFTER_SAVESERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVETraceback",
+        ),
+        (b"SW_TEST_UPDATE_FUTURE_HOOK", "SW_TEST_UPDATE_FUTURE_HOOK"),
+    ):
+        _refresh_windows_stage2_validator_fixture(root, daemon + b"\0" + forbidden, cli)
+        rejected = _validate_windows_stage2_bundle(root)
+        assert rejected.returncode == 1, rejected.stdout
+        assert marker in rejected.stderr
+
+    _refresh_windows_stage2_validator_fixture(
+        root, daemon, cli + b"\0SERIALWRAP_TEST_DEVICE_ALLOWLIST"
+    )
+    cli_rejected = _validate_windows_stage2_bundle(root)
+    assert cli_rejected.returncode == 1, cli_rejected.stdout
+    assert "serialwrap.exe" in cli_rejected.stderr
+    assert "SERIALWRAP_TEST_DEVICE_ALLOWLIST" in cli_rejected.stderr
 
 
 def test_doctor_via_bundle_reports_version_pairing(bundle, tmp_path):

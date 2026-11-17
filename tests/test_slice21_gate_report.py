@@ -145,26 +145,41 @@ def test_slice24_prereq_failure_is_recorded_before_exit(tmp_path):
     fake_root = tmp_path / "repo"
     fake_prereqs = fake_root / "scripts/rust/gate_prereqs.sh"
     fake_prereqs.parent.mkdir(parents=True)
-    fake_prereqs.write_text("return 37\n", encoding="utf-8")
+    fake_prereqs.write_text(
+        "printf 'gate_prereqs.sh: loadavg 99 不低於核心數一半（24/2）\\n'\nreturn 37\n", encoding="utf-8"
+    )
     run_dir = tmp_path / "run"
     (run_dir / "logs").mkdir(parents=True)
     driver_tsv = tmp_path / "driver.tsv"
     marker = tmp_path / "continued"
     shell = (
-        f'ROOT="{fake_root}"; RUN_DIR="{run_dir}"; DRIVER_TSV="{driver_tsv}"; : >"$DRIVER_TSV";\n'
+        f'ROOT="{fake_root}"; RUN_DIR="{run_dir}"; DRIVER_TSV="{driver_tsv}"; '
+        'PREREQ_LOG="$RUN_DIR/logs/gate-prereqs.log"; : >"$DRIVER_TSV";\n'
         f'{match.group(0)}\n'
         f'touch "{marker}"\n'
     )
     proc = subprocess.run(["bash", "-c", shell], capture_output=True, text=True, timeout=30)
-    assert proc.returncode == 37, proc.stdout + proc.stderr
+    assert proc.returncode == 4, proc.stdout + proc.stderr
     assert driver_tsv.read_text(encoding="utf-8") == "gate_prereqs\t37\n"
+    prereq_log = run_dir / "logs/gate-prereqs.log"
+    log_text = prereq_log.read_text(encoding="utf-8")
+    assert "gate_prereqs.sh: loadavg 99 不低於核心數一半（24/2）" in log_text
+    assert "gate_prereqs --gate 失敗" in log_text
+    assert "gate_prereqs --gate 失敗" in (proc.stdout + proc.stderr)
     assert not marker.exists(), "前置失敗後不得繼續 gate 收集"
 
-    # slice21 與 P7 的 `set -e` 會在 source 非零時立即終止，不存在 slice24 的無 -e 靜默續跑問題。
-    for path in ("scripts/rust/slice21_gate.sh", "scripts/rust/p7_gate.sh"):
-        other = (ROOT / path).read_text(encoding="utf-8")
-        assert "set -euo pipefail" in other
-        assert other.index('source "$ROOT/scripts/rust/gate_prereqs.sh" --gate') < len(other)
+    # P7 的參數錯誤與前置失敗必須有不同結束碼，且不能依賴 set -e 默默中止。
+    p7 = (ROOT / "scripts/rust/p7_gate.sh").read_text(encoding="utf-8")
+    assert "參數錯誤 → 2" in p7
+    assert "gate_prereqs 失敗 → 4" in p7
+    assert "gate_prereqs --gate" in p7
+    for name in ("gate_shared.sh", "p7_gate.sh", "slice24_exit.sh"):
+        driver = (ROOT / "scripts/rust" / name).read_text(encoding="utf-8")
+        header = "\n".join(driver.splitlines()[:20])
+        assert "結束碼" in header and "工作樹不乾淨" in header and "3" in header, name
+        assert "gate_prereqs" in header and "4" in header, name
+    prereqs = (ROOT / "scripts/rust/gate_prereqs.sh").read_text(encoding="utf-8")
+    assert "# 結束碼：" in "\n".join(prereqs.splitlines()[:5])
 
 
 def test_bo_case_ids_cover_frozen_windows_cases():

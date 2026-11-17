@@ -34,12 +34,12 @@ _OWNER_CAPS = frozenset({
 })
 _CARGO_PREFIX = "cargo:"
 
-# --- 長跑證據（計畫 Task 15 步驟 8；`slice24_exit.sh --longrun <dir>` 匯入）---
+# --- OD-94 長跑側檔驗證；不參與 Slice 2.4 JSON 或解除 `lr-mixed` 阻擋 ---
 # 輸入目錄結構：
 #   longrun-manifest.json                      {"schema_version":"slice24-longrun.v1","case_id":"lr-mixed",
 #                                               "platforms":{"<p>":{"bundle_tree_sha256":"<pinned bundle>"}}}
 #   <p>/release-gate.json                      P2 realhw/acceptance/gate.py candidate 輸出
-#   <p>/baseline-release-gate.json             對應 Python 48 h baseline 的 gate 輸出（mode=baseline）
+#   <p>/baseline-release-gate.json             對應 Python 24 h baseline 的 gate 輸出（mode=baseline；OD-94）
 #   <p>/supervision-attest.json                停用自動重啟的紀錄（observer --supervision-attest 同檔）
 #   <p>/bench-lock.json                        {"path","acquired_at_utc","released_at_utc"} bench lock 持有紀錄
 #   <p>/report.json、events.ndjson、snapshots.ndjson、observer.ndjson、wal/*   gate evidence_hashes 所列檔案
@@ -51,7 +51,7 @@ LONGRUN_MANIFEST = "longrun-manifest.json"
 LONGRUN_DIRNAME = "longrun"
 LONGRUN_RECORD = "longrun-evidence.json"
 DEFAULT_ACCEPTANCE = ROOT / "realhw/acceptance/longrun_acceptance.yaml"
-_LONGRUN_MIN_DURATION_S = 48 * 3600
+_LONGRUN_MIN_DURATION_S = 24 * 3600  # OD-94（2026-11-15）：每平台長跑門檻由 48 小時改為 24 小時。
 _GATE_SCHEMA = "release-gate.v1"
 _GATE_NA = "NOT_APPLICABLE_BASELINE"
 _GATE_VERDICTS = frozenset({"PASS", "FAIL", "INSUFFICIENT_EVIDENCE", "BLOCKED"})
@@ -221,18 +221,63 @@ def _case_nodes(case: Mapping[str, Any]) -> list[str]:
 def _mapping_entries(value: Mapping[str, Any]) -> dict[str, Any]:
     entries = value.get("entries", value.get("coverage_map", {}))
     if entries is None:
-        return {}
+        entries = {}
     if not isinstance(entries, dict):
         raise ValueError("coverage_map.yaml 的 entries 必須是 mapping")
-    return {str(key): row for key, row in entries.items()}
+    output = {str(key): row for key, row in entries.items()}
+
+    ab_nodes = value.get("od99_ab_nodeids", {})
+    if ab_nodes is not None and not isinstance(ab_nodes, dict):
+        raise ValueError("coverage_map.yaml 的 od99_ab_nodeids 必須是 mapping")
+    for contract_id, raw in (ab_nodes or {}).items():
+        if not isinstance(raw, dict):
+            raise ValueError(f"OD-99 A/B 對應必須是 mapping：{contract_id}")
+        row = dict(output.get(contract_id, {}))
+        overlay = dict(raw)
+        row["nodeids"] = list(dict.fromkeys([*_nodeids(row.get("nodeids")), *_nodeids(overlay.get("nodeids"))]))
+        exclusions = dict(row.get("exclude_nodeids") or {})
+        for platform, nodeids in (overlay.get("exclude_nodeids") or {}).items():
+            exclusions[platform] = list(dict.fromkeys([*_nodeids(exclusions.get(platform)), *_nodeids(nodeids)]))
+        if exclusions:
+            row["exclude_nodeids"] = exclusions
+        output[contract_id] = row
+
+    platform_exclusions = value.get("platform_exclusions", {})
+    if platform_exclusions is not None and not isinstance(platform_exclusions, dict):
+        raise ValueError("coverage_map.yaml 的 platform_exclusions 必須是 mapping")
+    for contract_id, exclusions in (platform_exclusions or {}).items():
+        if not isinstance(exclusions, dict):
+            raise ValueError(f"platform_exclusions 必須是平台至 nodeid 清單的 mapping：{contract_id}")
+        row = dict(output.get(contract_id, {}))
+        combined = dict(row.get("exclude_nodeids") or {})
+        for platform, nodeids in exclusions.items():
+            combined[platform] = list(dict.fromkeys([*_nodeids(combined.get(platform)), *_nodeids(nodeids)]))
+        row["exclude_nodeids"] = combined
+        output[contract_id] = row
+    return output
 
 
 def _map_row(value: object) -> dict[str, Any]:
     if isinstance(value, list):
-        return {"nodeids": _nodeids(value)}
+        return {"nodeids": _nodeids(value), "python_nodeids": [], "exclude_nodeids": {}}
     if isinstance(value, dict):
         row = dict(value)
         row["nodeids"] = _nodeids(row.get("nodeids"))
+        row["python_nodeids"] = _nodeids(row.get("python_nodeids"))
+        raw_exclusions = row.get("exclude_nodeids", {})
+        if not isinstance(raw_exclusions, dict):
+            raise ValueError("coverage_map exclude_nodeids 必須是 platform → nodeid 清單的 mapping")
+        exclusions: dict[str, list[str]] = {}
+        for platform, raw_nodeids in raw_exclusions.items():
+            if platform not in {"linux", "windows"}:
+                raise ValueError(f"exclude_nodeids 不支援的平台：{platform}")
+            if not isinstance(raw_nodeids, list) or any(not isinstance(nodeid, str) or not nodeid.strip() for nodeid in raw_nodeids):
+                raise ValueError(f"exclude_nodeids.{platform} 必須是非空 nodeid 字串清單")
+            nodeids = list(dict.fromkeys(nodeid.strip() for nodeid in raw_nodeids))
+            if any(nodeid.startswith(_CARGO_PREFIX) for nodeid in nodeids):
+                raise ValueError(f"exclude_nodeids.{platform} 不得排除 Rust Cargo nodeid")
+            exclusions[platform] = nodeids
+        row["exclude_nodeids"] = exclusions
         return row
     raise ValueError("coverage_map 每個 ID 必須是 nodeid 清單或 mapping")
 
@@ -463,6 +508,7 @@ def universe(contracts_dir: Path, cases: Path, lock: Path, cmap: Path) -> dict[s
             status=layer,
         )
 
+    map_flags: dict[str, dict[str, bool]] = {}
     for contract_id, raw_entry in map_entries.items():
         row = _map_row(raw_entry)
         current = output.get(contract_id)
@@ -474,6 +520,7 @@ def universe(contracts_dir: Path, cases: Path, lock: Path, cmap: Path) -> dict[s
                 "platforms": ["linux", "windows"],
                 "nodeids": [],
                 "python_nodeids": [],
+                "exclude_nodeids": {},
                 "rust_only": False,
                 "l1_only": False,
                 "blocked_caps": [],
@@ -483,13 +530,22 @@ def universe(contracts_dir: Path, cases: Path, lock: Path, cmap: Path) -> dict[s
             }
             output[contract_id] = current
         current["nodeids"] = list(dict.fromkeys([*current["nodeids"], *row.get("nodeids", [])]))
+        current["python_nodeids"] = list(dict.fromkeys([*current["python_nodeids"], *row.get("python_nodeids", [])]))
+        exclusions = current.setdefault("exclude_nodeids", {})
+        for platform, nodeids in row.get("exclude_nodeids", {}).items():
+            exclusions[platform] = list(dict.fromkeys([*exclusions.get(platform, []), *nodeids]))
         if isinstance(row.get("owner_phase"), str) and row["owner_phase"].strip():
             current["owner_phase"] = row["owner_phase"].strip()
         if isinstance(row.get("platforms"), list) and row["platforms"]:
             current["platforms"] = list(dict.fromkeys(str(value) for value in row["platforms"]))
         for key in ("rust_only", "l1_only"):
             if key in row:
-                current[key] = row[key] is True
+                if not isinstance(row[key], bool):
+                    raise ValueError(f"coverage_map {key} 必須為 boolean：{contract_id}")
+                map_flags.setdefault(contract_id, {})[key] = row[key]
+                if key == "rust_only" and current[key] and row[key] is False:
+                    raise ValueError(f"coverage_map 不得清除案例來源的 rust_only：{contract_id}")
+                current[key] = row[key]
         if isinstance(row.get("blocked_caps"), list):
             current["blocked_caps"] = list(dict.fromkeys([*current["blocked_caps"], *row["blocked_caps"]]))
         if isinstance(row.get("blocked_reason"), str):
@@ -498,6 +554,76 @@ def universe(contracts_dir: Path, cases: Path, lock: Path, cmap: Path) -> dict[s
         # 表示尚未交付映射，不能用從相鄰案例推導出的 nodeid 代替。
         if current["kind"] != "case" and "nodeids" in row and not row["nodeids"]:
             current["nodeids"] = []
+
+    l1_approvals = map_doc.get("l1_only_approvals", {})
+    legacy_l1 = map_doc.get("legacy_l1_only_approvals", {})
+    legacy_rust = map_doc.get("legacy_rust_only_approvals", {})
+    for name, approval_map in (
+        ("l1_only_approvals", l1_approvals),
+        ("legacy_l1_only_approvals", legacy_l1),
+        ("legacy_rust_only_approvals", legacy_rust),
+    ):
+        if not isinstance(approval_map, dict):
+            raise ValueError(f"coverage_map.yaml 的 {name} 必須是 mapping")
+        for contract_id, approval in approval_map.items():
+            if name == "l1_only_approvals":
+                reason = approval.get("reason") if isinstance(approval, dict) else None
+                if not isinstance(approval, dict) or approval.get("l1_only") is not True:
+                    raise ValueError(f"coverage_map {name} 每個 ID 必須明列 l1_only: true：{contract_id}")
+            else:
+                reason = approval
+            if (
+                not isinstance(contract_id, str) or not isinstance(reason, str) or not reason.strip()
+                or "\n" in reason or "\r" in reason
+            ):
+                raise ValueError(f"coverage_map {name} 必須逐 ID 附非空單行理由：{contract_id}")
+            if contract_id not in output:
+                raise ValueError(f"coverage_map {name} 列出 universe 外 ID：{contract_id}")
+
+    for contract_id, approval in l1_approvals.items():
+        reason = approval["reason"]
+        current = output[contract_id]
+        if current["kind"] not in {"bc", "schema", "case"} or _is_owner_blocked(current):
+            raise ValueError(f"OD-99 l1_only 只允許非擁有者阻擋的 BC/schema/case：{contract_id}")
+        if map_flags.get(contract_id, {}).get("l1_only") is False:
+            raise ValueError(f"coverage_map 不得取消 OD-99 l1_only：{contract_id}")
+        if not current["nodeids"] or any(not nodeid.startswith(_CARGO_PREFIX) for nodeid in current["nodeids"]):
+            raise ValueError(f"OD-99 l1_only 必須保留 Rust Cargo 節點：{contract_id}")
+        if current["python_nodeids"] or any(not nodeid.startswith(_CARGO_PREFIX) for nodeid in current["nodeids"]):
+            raise ValueError(f"OD-99 l1_only 不得掩蓋既有 Python 黑箱節點：{contract_id}")
+        current["l1_only"] = True
+        current["l1_only_reason"] = reason
+
+    for contract_id, reason in legacy_l1.items():
+        current = output[contract_id]
+        if map_flags.get(contract_id, {}).get("l1_only") is not True:
+            raise ValueError(f"legacy l1_only 未在 entries 明確標記：{contract_id}")
+        current["l1_only_reason"] = reason
+    for contract_id, reason in legacy_rust.items():
+        current = output[contract_id]
+        if map_flags.get(contract_id, {}).get("rust_only") is not True:
+            raise ValueError(f"legacy rust_only 未在 entries 明確標記：{contract_id}")
+        current["rust_only_reason"] = reason
+
+    approved_l1 = set(l1_approvals) | set(legacy_l1)
+    for contract_id, item in output.items():
+        if item.get("l1_only") and contract_id not in approved_l1:
+            raise ValueError(f"未經 OD-99 或既有明列裁決的 l1_only：{contract_id}")
+        if map_flags.get(contract_id, {}).get("l1_only") is True and contract_id not in approved_l1:
+            raise ValueError(f"未經 OD-99 或既有明列裁決的 l1_only：{contract_id}")
+        natural_rust_only = (
+            contract_id.startswith("case:")
+            and cases_by_id.get(contract_id.removeprefix("case:"), {}).get("suite") == "rust-l1"
+        )
+        if item.get("rust_only") and not natural_rust_only and contract_id not in legacy_rust:
+            raise ValueError(f"未經既有案例歸屬或明列裁決的 rust_only：{contract_id}")
+        for platform, excluded in item.get("exclude_nodeids", {}).items():
+            if platform not in item.get("platforms", []):
+                raise ValueError(f"exclude_nodeids 指向未宣告的平台 {platform}：{contract_id}")
+            referenced = set(item["nodeids"]) | set(item["python_nodeids"])
+            unreferenced = sorted(set(excluded) - referenced)
+            if unreferenced:
+                raise ValueError(f"exclude_nodeids 只能排除此 ID 的明列節點：{contract_id}: {unreferenced}")
 
     unextracted = set(output) - extracted_ids
     if unextracted:
@@ -835,11 +961,15 @@ def load_prior_case_verdicts(
         reference_daemon_sha256 = prior_artifacts.get("serialwrapd_release")
         if slice23_results is not None:
             slice23_daemon_sha256, slice23_artifact_problem = recorded_artifact_sha256(slice23_results, "serialwrapd")
+            if slice23_artifact_problem is None and (
+                not isinstance(slice23_daemon_sha256, str) or not _SHA256.fullmatch(slice23_daemon_sha256)
+            ):
+                slice23_artifact_problem = "slice 2.3 results.json 的 debug daemon SHA256 格式無效"
         else:
             slice23_artifact_problem = "slice 2.3 run 缺 results.json"
         reference_problem = _prior_identity_problem(
-            "slice 2.3 gate results.json", reference_revision, reference_daemon_sha256,
-            expected_git_revision, reference_daemon_sha256 if isinstance(reference_daemon_sha256, str) else None,
+            "slice 2.3 release daemon", reference_revision, reference_daemon_sha256,
+            expected_git_revision, expected_daemon_sha256,
         )
         if reference_problem and ("格式無效" in reference_problem or "不符" in reference_problem):
             identity_errors.append(reference_problem)
@@ -922,7 +1052,7 @@ def load_prior_case_verdicts(
         accept_source(
             "2.3", "slice 2.3 gate", run,
             results.get("git_head") if results else None,
-            slice23_daemon_sha256, rows,
+            reference_daemon_sha256, rows,
             reference_revision=expected_git_revision,
             reference_daemon_sha256=expected_daemon_sha256,
             evidence_paths=(run / "results.json", run / "coverage.json"),
@@ -1121,8 +1251,8 @@ def evaluate(
 ) -> dict[str, Any]:
     """依平台逐 nodeid 判定；任何不完整、重複或 BLOCKED-OWNER 結果皆不能成為 PASS。
 
-    擁有者阻擋的 ID 只有在 `owner_evidence` 經重新驗證、所有平台都成立時才解除；
-    有效證據判 FAIL 時照實為 FAIL，缺漏或拒收仍維持 BLOCKED-OWNER。
+    OD-94 的 `lr-mixed` 長跑只以 `realhw/acceptance/gate.py` 的獨立報告驗收，
+    不消費 `owner_evidence`、不寫入本報告的 JSON，也不解除其 BLOCKED-OWNER。
     """
     run_root = run_dir or ROOT
     run_identity_errors = _identity_checks(
@@ -1163,6 +1293,12 @@ def evaluate(
         has_empty_node = isinstance(raw_nodes, list) and any(isinstance(nodeid, str) and not nodeid.strip() for nodeid in raw_nodes)
 
         owner_verdict: str | None = None
+        if contract_id == LONGRUN_CASE:
+            report["blocked_owner"][contract_id] = (
+                "依 OD-94，24 小時長跑在 RC 後另行驗收並輸出 release-gate.json；"
+                "長跑證據不匯入 Slice 2.4 判定，故本報告維持 BLOCKED-OWNER。"
+            )
+            continue
         if _is_owner_blocked(item):
             owner_reason = None
             if contract_id in owner_evidence:
@@ -1215,14 +1351,19 @@ def evaluate(
             continue
 
         declared = item.get("parametrized") or {}
-        _rust_l1_nodes, blackbox_nodes = _split_nodeids(nodeids)
-        python_nodes = [nodeid for nodeid in item.get("python_nodeids", []) if isinstance(nodeid, str) and nodeid.strip()]
         needs_ab = not item.get("rust_only") and not item.get("l1_only")
         failures: list[str] = []
         missing_reasons: list[str] = []
         passed_all = True
         for platform in item.get("platforms", ["linux"]):
             platform = str(platform)
+            excluded = set(item.get("exclude_nodeids", {}).get(platform, []))
+            platform_nodeids = [nodeid for nodeid in nodeids if nodeid not in excluded]
+            _rust_l1_nodes, blackbox_nodes = _split_nodeids(platform_nodeids)
+            python_nodes = [
+                nodeid for nodeid in item.get("python_nodeids", [])
+                if isinstance(nodeid, str) and nodeid.strip() and nodeid not in excluded
+            ]
             rust_doc = _label_for(results, "rust", platform)
             if rust_doc is None:
                 if platform == "windows":
@@ -1241,7 +1382,7 @@ def evaluate(
 
             # Rust 側：Cargo L1 與雙邊黑箱節點都要在 rust-<platform> 逐項成立。
             rust_required: list[str] = []
-            for nodeid in nodeids:
+            for nodeid in platform_nodeids:
                 expanded, error = _expand_nodeid(nodeid, [rust_doc], declared)
                 if error:
                     missing_reasons.append(error)
@@ -1529,7 +1670,7 @@ def _validate_longrun_platform(
             errors.append("release-gate.json run.cases_yaml_sha256 與目前 cases.yaml 不同")
         duration = candidate_run.get("duration_s")
         if not isinstance(duration, (int, float)) or duration < _LONGRUN_MIN_DURATION_S:
-            errors.append(f"release-gate.json run.duration_s 未達 48 小時：{duration!r}")
+            errors.append(f"release-gate.json run.duration_s 未達 OD-94 的 24 小時：{duration!r}")
         cli_identity = candidate_run.get("cli_identity") if isinstance(candidate_run.get("cli_identity"), dict) else {}
         cli_sha = cli_identity.get("sha256")
         if cli_identity.get("pinned") is not True or not isinstance(cli_sha, str) or not _SHA256.fullmatch(cli_sha):
@@ -1589,7 +1730,7 @@ def _validate_longrun_platform(
             errors.append("baseline-release-gate.json baseline_result 與 checks 彙總不一致")
         base_duration = base_run.get("duration_s")
         if not isinstance(base_duration, (int, float)) or base_duration < _LONGRUN_MIN_DURATION_S:
-            errors.append(f"baseline-release-gate.json run.duration_s 未達 48 小時：{base_duration!r}")
+            errors.append(f"baseline-release-gate.json run.duration_s 未達 OD-94 的 24 小時：{base_duration!r}")
         if base_acceptance.get("workload_contract_sha256") != cand_acceptance.get("workload_contract_sha256"):
             errors.append("baseline-release-gate.json workload_contract_sha256 與 candidate 不同")
         if base_run.get("engine_files_sha256") != candidate_run.get("engine_files_sha256"):
@@ -1907,12 +2048,113 @@ def _t9_result_rows(run_info: Mapping[str, Any]) -> list[str]:
     return sorted(set(observations))
 
 
+def _shared_windows_l1_verdicts(shared_dir: Path | None, *, expected_head: str | None) -> list[dict[str, Any]]:
+    """依凍結 lock 重判每個共用 Windows L1 段；未匯入的鎖定段明列 EVIDENCE_MISSING。"""
+    try:
+        lock = _read_json(ROOT / "tests/acceptance/l1_required.lock.json")
+        locked_sets = lock.get("sets") if isinstance(lock, Mapping) else None
+        expected_names = sorted(
+            f"windows_l1:{set_id}"
+            for set_id, platforms in locked_sets.items()
+            if isinstance(set_id, str) and isinstance(platforms, Mapping) and "windows" in platforms
+        ) if isinstance(locked_sets, Mapping) else []
+    except (OSError, ValueError, json.JSONDecodeError):
+        expected_names = []
+    if not expected_names:
+        expected_names = ["windows_l1:*"]
+
+    def missing_rows(reason: str) -> list[dict[str, Any]]:
+        return [
+            {"section": section, "status": "EVIDENCE_MISSING", "exit_code": None, "reasons": [reason]}
+            for section in expected_names
+        ]
+
+    if shared_dir is None:
+        return missing_rows("未提供可驗證的共用 Windows L1 證據目錄")
+    try:
+        manifest = _read_json(Path(shared_dir) / "manifest.json")
+    except (OSError, ValueError, json.JSONDecodeError):
+        return missing_rows("共用證據 manifest.json 缺少或格式無效")
+    if not isinstance(manifest, Mapping):
+        return missing_rows("共用證據 manifest.json 根節點格式無效")
+    sections = manifest.get("sections")
+    if not isinstance(sections, Mapping):
+        return missing_rows("共用證據 manifest.sections 缺少或格式無效")
+    present_names = {
+        name for name in sections if isinstance(name, str) and name.startswith("windows_l1:")
+    }
+    names = sorted(set(expected_names) | present_names)
+
+    try:
+        shared_judge = _repo_module("scripts.rust.gate_shared_evidence")
+    except Exception as exc:  # noqa: BLE001 - 報告缺口不得影響其他逐案判定
+        return missing_rows(f"無法載入共用證據判定器：{type(exc).__name__}: {exc}")
+
+    verdicts: list[dict[str, Any]] = []
+    for section in names:
+        if section not in sections:
+            verdicts.append({
+                "section": section,
+                "status": "EVIDENCE_MISSING",
+                "exit_code": None,
+                "reasons": ["共用證據未提供此鎖定 Windows L1 段；未提供不視為 PASS"],
+            })
+            continue
+        required_set = section.removeprefix("windows_l1:")
+        try:
+            result = shared_judge.validate_section(
+                Path(shared_dir), gate="slice24", section=section, required_set=required_set,
+                platform="windows", current_head=expected_head,
+            )
+        except Exception as exc:  # noqa: BLE001 - section 異常須明確列為證據不足
+            result = {"status": "EVIDENCE_MISSING", "reasons": [f"判定失敗：{type(exc).__name__}: {exc}"]}
+        status = result.get("status")
+        if status not in {"PASS", "FAIL", "EVIDENCE_MISSING"}:
+            status = "EVIDENCE_MISSING"
+        reasons = result.get("reasons")
+        verdicts.append({
+            "section": section,
+            "status": status,
+            "exit_code": result.get("exit_code"),
+            "reasons": [str(reason) for reason in reasons] if isinstance(reasons, list) else [],
+        })
+    return verdicts
+
+
 def _longrun_report_lines(report: Mapping[str, Any]) -> list[str]:
-    owner = report.get("owner_evidence", {})
-    entry = owner.get(LONGRUN_CASE) if isinstance(owner, Mapping) else None
-    if not isinstance(entry, Mapping):
-        return ["- 未匯入長跑證據（`slice24_exit.sh --longrun <dir>`）；`lr-mixed` 維持 **BLOCKED-OWNER**。"]
-    return [f"- 判定：**{entry.get('verdict')}**；{entry.get('reason')}。"]
+    return [
+        "- 判定：**BLOCKED-OWNER**；依 OD-94，24 小時長跑在 RC 後另行驗收並以 `realhw/acceptance/gate.py` "
+        "輸出 `release-gate.json`；長跑證據不匯入 `slice24.json`，也不解除本列阻擋。",
+    ]
+
+
+def _mcu_simulation_rows(report: Mapping[str, Any]) -> list[str]:
+    """從本輪逐案判定列出 OD-91 模擬式 MCU A/B 案例，不推定真機證據。"""
+    case_ids = (
+        "s24-flash-baud-mirror",
+        "s24-flash-holder-gone",
+        "s24-flash-silent-unbridged",
+        "s24-flash-sync-replay",
+        "s24-mcu-rpc-shapes",
+    )
+    verdicts = report.get("case_verdicts", {})
+    blocked = report.get("blocked_owner", {})
+    missing = report.get("missing_reasons", {})
+    covered = set(report.get("covered", []))
+    rows = []
+    for case_id in case_ids:
+        contract_id = f"case:{case_id}"
+        status = verdicts.get(case_id, "EVIDENCE_MISSING") if isinstance(verdicts, Mapping) else "EVIDENCE_MISSING"
+        if isinstance(blocked, Mapping) and contract_id in blocked:
+            detail = str(blocked[contract_id])
+        elif isinstance(missing, Mapping) and contract_id in missing:
+            detail = str(missing[contract_id])
+        elif contract_id in covered:
+            detail = "本輪 FakeMCU／FakeFlasher 黑箱 A/B 節點完成；不代表 MCU 真機燒錄。"
+        else:
+            detail = "本輪沒有有效結果；不得推定為 PASS。"
+        rows.append(f"| `{case_id}` | **{status}** | {detail} |")
+    return rows
 
 
 def render_gate_report(report: Mapping[str, Any], cases: Sequence[Mapping[str, Any]], run_info: Mapping[str, Any]) -> str:
@@ -1924,6 +2166,10 @@ def render_gate_report(report: Mapping[str, Any], cases: Sequence[Mapping[str, A
         f"- run：`{run_id}`",
         f"- 產生時間：`{run_info.get('finished_at', '未指定')}`",
         "- 覆蓋判定：PASS 只代表本報告列出的對應 nodeid、平台及身分檢查全數成立。",
+        "",
+        "## 先前切片來源與候選身分",
+        "",
+        "- 2.3 的黑箱使用 debug daemon 執行；2.4 的候選是 release bundle。2.3 身分以 `prior_slice_artifacts.serialwrapd_release` 為準，且必須等於本輪 `--expect-daemon-sha256`；不以 2.3 `artifacts.serialwrapd` 的 debug SHA 作為候選身分。",
         "",
         "## 凍結案例",
         "",
@@ -1938,20 +2184,46 @@ def render_gate_report(report: Mapping[str, Any], cases: Sequence[Mapping[str, A
         case_id = str(case.get("case_id", ""))
         contract_id = f"case:{case_id}"
         status = verdicts.get(case_id, "EVIDENCE_MISSING")
-        detail = blocked.get(contract_id) or missing_reasons.get(contract_id) or ("測試與身分證據已通過" if status == "PASS" else "失敗證據" if contract_id in failed else "尚無有效結果")
+        if contract_id == LONGRUN_CASE:
+            status = "BLOCKED-OWNER"
+            detail = blocked.get(contract_id) or (
+                "依 OD-94，長跑另以 release-gate.json 出報告，不匯入 Slice 2.4。"
+            )
+        else:
+            detail = blocked.get(contract_id) or missing_reasons.get(contract_id) or ("測試與身分證據已通過" if status == "PASS" else "失敗證據" if contract_id in failed else "尚無有效結果")
         platforms = ", ".join(str(value) for value in case.get("platforms", []))
         lines.append(f"| `{case_id}` | {platforms} | **{status}** | {detail} |")
 
     frozen_case_ids = {str(case.get("case_id", "")) for case in cases}
-    supplemental_cases = sorted(
-        (contract_id, reason)
-        for contract_id, reason in blocked.items()
-        if contract_id.startswith("case:") and contract_id.removeprefix("case:") not in frozen_case_ids
+    supplemental_case_ids = sorted(
+        case_id for case_id in verdicts if case_id not in frozen_case_ids
     )
-    if supplemental_cases:
-        lines.extend(["", "## 凍結分母外的 BLOCKED-OWNER 案例", ""])
-        for contract_id, reason in supplemental_cases:
-            lines.append(f"- `{contract_id.removeprefix('case:')}`：**BLOCKED-OWNER**；{reason}。")
+    if supplemental_case_ids:
+        lines.extend([
+            "", f"## coverage_map 另加案例（凍結分母外，{len(supplemental_case_ids)} 案）", "",
+            "| case_id | 狀態 | 證據／待辦 |",
+            "|---|---|---|",
+        ])
+        covered_ids = set(report.get("covered", []))
+        for case_id in supplemental_case_ids:
+            contract_id = f"case:{case_id}"
+            status = verdicts.get(case_id, "EVIDENCE_MISSING")
+            if contract_id in blocked:
+                detail = blocked[contract_id]
+            elif contract_id in missing_reasons:
+                detail = missing_reasons[contract_id]
+            elif contract_id in covered_ids:
+                if case_id in {
+                    "sc14-flash-probe-eligibility",
+                    "sc35-passthrough-command-completion",
+                    "sc35-passthrough-quiet-ready",
+                }:
+                    detail = "Rust L1 節點通過；OD-99 核准 l1_only，不宣稱 Python 等價。"
+                else:
+                    detail = "本列必要證據與身分檢查通過。"
+            else:
+                detail = "尚無有效結果。"
+            lines.append(f"| `{case_id}` | **{status}** | {detail} |")
 
     lines.extend([
         "",
@@ -1981,6 +2253,76 @@ def render_gate_report(report: Mapping[str, Any], cases: Sequence[Mapping[str, A
             for contract_id, status in windows_contracts:
                 detail = blocked.get(contract_id) or missing_reasons.get(contract_id) or ("符合身分的 Windows 原生結果已通過" if status == "PASS" else "測項失敗" if status == "FAIL" else "尚無有效 Windows 原生結果")
                 lines.append(f"- `{contract_id}`：**{status}**；{detail}。")
+
+    lines.extend([
+        "",
+        "## 共用 Windows L1 段判定",
+        "",
+        "正式流程不帶 `--windows-run`。依 2026-11-17 編排者裁決第 6 點，Windows 正式 gate BO #5 維持 **BLOCKED-OWNER**；以下 `windows_l1:*` 是共用原生 L1 段的獨立判定，不替代 Slice 2.4 完整 Windows gate，也不把 FAIL／EVIDENCE_MISSING 改判。",
+        "",
+        "| 共用段 | 實際判定 | exit | 原因 |",
+        "|---|---|---:|---|",
+    ])
+    windows_l1 = run_info.get("windows_l1", [])
+    if not isinstance(windows_l1, list) or not windows_l1:
+        windows_l1 = [{
+            "section": "windows_l1:*", "status": "EVIDENCE_MISSING", "exit_code": None,
+            "reasons": ["未提供共用證據判定"],
+        }]
+    for row in windows_l1:
+        if not isinstance(row, Mapping):
+            continue
+        section = str(row.get("section", "windows_l1:*"))
+        status = str(row.get("status", "EVIDENCE_MISSING"))
+        exit_code = row.get("exit_code")
+        reasons = row.get("reasons", [])
+        reason = "; ".join(str(value) for value in reasons) if isinstance(reasons, list) else str(reasons)
+        cell = lambda value: str(value).replace("|", "\\|").replace("\n", " ")
+        lines.append(
+            f"| `{cell(section)}` | **{cell(status)}** | {cell(exit_code) if exit_code is not None else '—'} | {cell(reason or '無拒收理由')} |"
+        )
+
+    lines.extend([
+        "",
+        "## MCU 燒錄模擬證據（OD-91）",
+        "",
+        "- 擁有者依 OD-91 免除 2.4 出口前的 MCU 真機燒錄證據；不得把模擬描述成實機證據。",
+        "- 證據形式：FakeMCU、FakeFlasher、PTY FlashRig，以 `tests/contract_blackbox/test_s24_flash_endpoint.py`、`test_s24_mcu_rpc.py` 及 mcu_flash 相關 L1.5／func-test 情境做 A/B；Python 基線為 tag `v0.3.2`，並與 `origin/main` 基線並列。",
+        "- Rust 與 Python 0.3.2 的差異須逐項歸因至 0.3.2 之後的 Python 修正（附 main commit 與 file:line）或已登記 DF／裁決；無法歸因者按 Rust 缺陷處理。真機燒錄留待發布後有實機時補做。",
+        "- Windows 燒錄路徑依 release／handoff 模型，以 com0com COM20:COM21 黑箱驗證；不開啟其他 COM port。",
+        "",
+        "| MCU 模擬 A/B 案例 | 本輪判定 | 證據說明 |",
+        "|---|---|---|",
+        *_mcu_simulation_rows(report),
+        "",
+        "## OD-96 Windows COM6 真板 smoke 已知差異",
+        "",
+        "- 擁有者已接受為已知差異，不修、不阻擋 0.5.0；範圍只限 2026-11-17 對 Orange Pi 3 測試板的 COM6 smoke，不改 Linux 黑箱契約或 slice gate 判定。",
+        "- 比較來源：Rust 候選 `ba29434c`；Python `origin/main` 的 `serialwrapd.py` commit `47097715`，由 0.4.1 bundle 的 Python 3.12.3 執行。八個步驟結果一致，RX 切塊比例相近（1-byte 筆數 Rust 2/88、Python 2/86），`result_tail` 與 log 均無 ESC 殘片。",
+        "- ATTACHING 的 `session list`：Rust 有值、Python 為 null：`attached_real_path`、`console_endpoint`、`last_tx_at`、`last_tx_age_s`、`rx_bytes_last_10s`、`rx_rate_bps`。",
+        "- READY 的 `session list`：Rust 有值、Python 為 null：`last_probe_at`、`last_tx_at`、`last_tx_age_s`。",
+        "- `code_fingerprint`：Python 每個回應都有；dev Rust daemon 的 `daemon status` 為 null；0.5.0 bundle 依 OD-90 提供 Rust daemon digest。",
+        "",
+        "## S24 更新守衛 dev 鉤子證據層級",
+        "",
+        "依編排者 2026-11-17 裁決第 2 點與 09 計畫 Task 14，以下 8 個故障注入節點留在執行範圍並照常計入。受測 daemon 是同 HEAD 的候選 bundle；發起更新／回滾的 CLI 是同 HEAD 的 `test-fakes` dev 建置，用以啟用正式建置不存在的測試鉤子。因此它們是候選 daemon 的 L1.5 黑箱證據，不是正式 bundle CLI 證據；正式 bundle CLI 由另外 14 個測試承接。",
+        "",
+        "| nodeid | CLI 證據層級 | daemon 證據層級 |",
+        "|---|---|---|",
+    ])
+    dev_hook_nodeids = (
+        "test_rollback_refuses_while_push[before_probe]",
+        "test_rollback_refuses_while_push[after_probe]",
+        "test_rollback_force_refuses_while_push[rollback]",
+        "test_rollback_force_refuses_while_push[update]",
+        "test_rollback_force_refuses_while_push[rollback-after-probe]",
+        "test_rollback_refuses_while_flashing",
+        "test_rollback_force_refuses_while_flashing[rollback]",
+        "test_rollback_force_refuses_while_flashing[update]",
+    )
+    for nodeid in dev_hook_nodeids:
+        full_nodeid = f"tests/contract_blackbox/test_s24_update_rollback.py::{nodeid}"
+        lines.append(f"| `{full_nodeid}` | 同 HEAD dev (`test-fakes`) CLI | 同 HEAD 候選 bundle daemon |")
 
     lines.extend([
         "",
@@ -2051,6 +2393,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--map-file", type=Path, default=DEFAULT_MAP)
     parser.add_argument("--json", type=Path, help="JSON 報告輸出路徑")
     parser.add_argument("--report", type=Path, help="Markdown gate 報告輸出路徑")
+    parser.add_argument("--windows-l1-shared-evidence", type=Path,
+                        help="只供 Markdown 列出並重新判定共用證據中的 windows_l1:* section")
     parser.add_argument("--only", action="append", default=[], help="只判定指定 ID，可重複")
     parser.add_argument("--map", action="append", default=[], help="測試用 map 覆寫：ID=nodeid,nodeid")
     parser.add_argument("--platforms", action="append", default=[], help="測試用平台覆寫：ID=linux,windows")
@@ -2066,7 +2410,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--slice23-run", type=Path, help="p7 gate run 目錄（results.json＋coverage.json）")
     parser.add_argument(
         "--import-longrun", type=Path,
-        help="驗證長跑證據目錄並匯入 <run-dir>/longrun/；全部成立 exit 0，拒收 exit 1",
+        help="獨立驗證長跑證據側檔並複製至 <run-dir>/longrun/；不參與 Slice 2.4 判定",
     )
     parser.add_argument(
         "--record-candidate-bundle", metavar="PLATFORM=DIR",
@@ -2153,7 +2497,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_cases_yaml_sha256=expected_sources["cases_yaml_sha256"],
             expected_cases_lock_sha256=expected_sources["cases_lock_sha256"],
             expected_platform=args.expect_platform,
-            owner_evidence=load_owner_evidence(args.run_dir, result_rows),
             prior_case_verdicts=prior_case_verdicts,
             prior_sources=prior_sources,
             prior_identity_errors=prior_identity_errors,
@@ -2167,7 +2510,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             sys.stdout.write(body)
         if args.report:
             cases = _case_rows(args.cases, args.cases_lock)
-            markdown = render_gate_report(report, cases, {"run_id": args.run_dir.name, "results": result_rows})
+            windows_l1 = _shared_windows_l1_verdicts(
+                args.windows_l1_shared_evidence, expected_head=args.expect_git_revision,
+            )
+            markdown = render_gate_report(report, cases, {
+                "run_id": args.run_dir.name, "results": result_rows, "windows_l1": windows_l1,
+            })
             args.report.parent.mkdir(parents=True, exist_ok=True)
             args.report.write_text(markdown, encoding="utf-8")
         hard_errors = bool(report["missing"] or report["failed"] or report["ab_mismatch"] or report["identity_errors"] or report["incomplete_runs"])

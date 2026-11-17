@@ -2,15 +2,16 @@
 # Slice 2.3（P7）出口 gate 編排（08-slice23-login-events.md Task 19 Step 3）。
 #
 # 用法：scripts/rust/p7_gate.sh [--dry-run] [--shared-evidence DIR] [--run-id ID] [--out-md PATH] [--skip-full-pytest]
+#       [--windows-ev01-report FILE] [--windows-ev01-bundle DIR]（亦可用 P7_WIN_EV01_REPORT／P7_WIN_EV01_BUNDLE）
 #   建立 target/p7-gate/<run_id>/，依序執行並以 `p7_gate_report.py record` 記錄每個子程序的 argv、rc、時間、log
 #   （落檔＋sha256）、測試計數與 evidence；測試列另附 required_set（`p7_gate:<列名 slug>`）與 l1_results。
 #   本腳本只「執行並記錄」，列狀態一律由 scripts/rust/p7_gate_report.py 計算。全部子程序結束後才 `build` 寫出
-#   綁定本次 run_id、HEAD、artifact sha256 的 md（預設 docs/rust-refactor/evidence/p7-gate-<YYMMDD>.md），最後 `verify`
+#   綁定本次 run_id、HEAD、artifact sha256 的 md（預設 target/p7-gate/<run_id>/p7-gate.md），最後 `verify`
 #   必須回空清單。
-#   - Windows 列：非 WSL interop 環境記 caps_missing `windows_native`；未設 SW_TEST_COM_PAIR 記 `windows_com`
-#     （皆為 BLOCKED-OWNER B-06，不得標 PASS）。
+#   - Windows 列：非 WSL interop 環境記 caps_missing `windows_native`；非共用模式未設 SW_TEST_COM_PAIR 記 `windows_com`
+#     （皆為 BLOCKED-OWNER B-06，不得標 PASS）。共用模式匯入被拒時缺少 l1_results，判 INCOMPLETE，不冒充主機能力缺失。
 #   - --skip-full-pytest：不跑 `python3 -m pytest -q tests/`（該列記為未執行 → INCOMPLETE；僅供除錯，不得作出口證據）。
-# 結束碼：報告結論 PASS（含 BLOCKED-OWNER）且 verify 無不一致 → 0；否則 1；參數錯誤 → 2。
+# 結束碼：報告 PASS 且 verify 無不一致 → 0；否則 1；參數錯誤 → 2；髒工作樹（工作樹不乾淨）→ 3；gate_prereqs 失敗 → 4。
 set -euo pipefail
 export CARGO_INCREMENTAL=0
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -19,6 +20,8 @@ OUT_MD=""
 SKIP_FULL=0
 DRY_RUN=0
 SHARED_EVIDENCE=""
+WINDOWS_EV01_REPORT="${P7_WIN_EV01_REPORT:-}"
+WINDOWS_EV01_BUNDLE="${P7_WIN_EV01_BUNDLE:-}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
@@ -26,11 +29,15 @@ while [[ $# -gt 0 ]]; do
     --run-id) RUN_ID="$2"; shift 2 ;;
     --out-md) OUT_MD="$2"; shift 2 ;;
     --skip-full-pytest) SKIP_FULL=1; shift ;;
-    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    --windows-ev01-report) [[ $# -ge 2 ]] || { echo "p7_gate.sh: --windows-ev01-report 缺少值" >&2; exit 2; }; WINDOWS_EV01_REPORT="$2"; shift 2 ;;
+    --windows-ev01-bundle) [[ $# -ge 2 ]] || { echo "p7_gate.sh: --windows-ev01-bundle 缺少值" >&2; exit 2; }; WINDOWS_EV01_BUNDLE="$2"; shift 2 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
     *) echo "p7_gate.sh: 未知參數 $1" >&2; exit 2 ;;
   esac
 done
 [[ "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "p7_gate.sh: --run-id 只允許英數與 ._-" >&2; exit 2; }
+RUN="$ROOT/target/p7-gate/$RUN_ID"
+[[ -n "$OUT_MD" ]] || OUT_MD="$RUN/p7-gate.md"
 if [[ "$DRY_RUN" == "1" ]]; then
   echo "p7_gate.sh dry-run：只列出計畫，不執行命令。"
   if [[ -n "$SHARED_EVIDENCE" ]]; then
@@ -44,17 +51,31 @@ if [[ "$DRY_RUN" == "1" ]]; then
     echo "執行：python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence。"
   fi
   echo "執行：python3 scripts/rust/check_cfg_boundary.py；python3 tests/acceptance/regen_lock.py --check；python3 scripts/rust/p7_case_coverage.py；python3 -m policy_check --repo .。"
+  echo "報告輸出路徑：$OUT_MD"
+  echo "Windows ev-01：匯入 win-func-test basic report＋Stage 2 bundle（--windows-ev01-report/--windows-ev01-bundle 或 P7_WIN_EV01_REPORT/P7_WIN_EV01_BUNDLE）；缺證據、HEAD／bundle SHA-256 不符或 verdict 非 PASS＋gate_eligible → 不得 PASS。"
   echo "執行：python3 scripts/rust/p7_gate_report.py build 與 verify；prior slice、func-test、coverage 段依目前輸入補齊。"
   exit 0
 fi
-RUN="$ROOT/target/p7-gate/$RUN_ID"
+cd "$ROOT"
+WORKTREE_STATUS="$(git status --porcelain --untracked-files=normal)"
+if [[ -n "$WORKTREE_STATUS" ]]; then
+  printf 'p7_gate.sh: 工作樹不乾淨，拒絕正式執行（結束碼 3）。髒檔：\n%s\n' "$WORKTREE_STATUS" >&2
+  exit 3
+fi
 [[ ! -e "$RUN/results.json" ]] || { echo "p7_gate.sh: $RUN 已存在，拒絕覆寫（請換 --run-id）" >&2; exit 2; }
 mkdir -p "$RUN/logs"
-[[ -n "$OUT_MD" ]] || OUT_MD="$ROOT/docs/rust-refactor/evidence/p7-gate-$(date +%y%m%d).md"
-cd "$ROOT"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 [[ "$TARGET_DIR" == /* ]] || TARGET_DIR="$ROOT/$TARGET_DIR"
-source "$ROOT/scripts/rust/gate_prereqs.sh" --gate
+PREREQ_LOG="$RUN/logs/gate-prereqs.log"
+if source "$ROOT/scripts/rust/gate_prereqs.sh" --gate >"$PREREQ_LOG" 2>&1; then
+  :
+else
+  PREREQS_RC=$?
+  printf 'gate_prereqs --gate 失敗（gate_prereqs 原始結束碼=%s；driver 結束碼=4）。\n' "$PREREQS_RC" >>"$PREREQ_LOG"
+  echo "p7_gate.sh: gate_prereqs --gate 失敗；driver 結束碼 4（原始結束碼 $PREREQS_RC；$PREREQ_LOG）" >&2
+  cat "$PREREQ_LOG" >&2
+  exit 4
+fi
 REPORT=(python3 scripts/rust/p7_gate_report.py)
 # 受測 artifact 於建置後立即快照到 run 目錄：之後的 cargo L1 列（--features test-fakes）與全套 pytest 會重建
 # target/debug/ 的同名執行檔，若直接引用會讓黑箱跑到 test-fakes 版、verify 的 sha256 也對不上（第 12 輪實跑揭露）。
@@ -179,11 +200,8 @@ if [[ -n "$SHARED_EVIDENCE" && "$SHARED_ARTIFACTS_VALID" == "1" ]]; then
 fi
 CAPS=()
 if ! [[ -n "${WSL_DISTRO_NAME:-}" || -e /proc/sys/fs/binfmt_misc/WSLInterop ]]; then CAPS+=(windows_native windows_com); fi
-[[ -n "${SW_TEST_COM_PAIR:-}" ]] || CAPS+=(windows_com)
-if [[ -n "$SHARED_EVIDENCE" ]]; then
-  [[ "$SHARED_WIN_NONCOM_IMPORTED" == "1" ]] || CAPS+=(windows_native)
-  [[ "$SHARED_WIN_COM_IMPORTED" == "1" ]] || CAPS+=(windows_com)
-fi
+# 共用模式由 manifest 提供 COM L1；匯入拒收是證據缺漏，不因本機未接 COM pair 偽裝成能力缺失。
+if [[ -z "$SHARED_EVIDENCE" && -z "${SW_TEST_COM_PAIR:-}" ]]; then CAPS+=(windows_com); fi
 FILTERED_CAPS=()
 for cap in "${CAPS[@]}"; do
   [[ "$cap" == windows_native && "$SHARED_WIN_NONCOM_IMPORTED" == "1" ]] && continue
@@ -439,6 +457,12 @@ else
 fi
 # 16. policy check
 run_row "policy_check" policy-check --evidence "$RUN/logs/policy-check.log" -- python3 -m policy_check --repo .
+
+# OD-31：Windows Stage 2 ev-01 是 host 可執行列，不得以 BLOCKED-OWNER 代替缺失證據。
+WINDOWS_EV01_ARGS=(--results-dir "$RUN" --log "$RUN/logs/windows-ev01.log")
+[[ -z "$WINDOWS_EV01_REPORT" ]] || WINDOWS_EV01_ARGS+=(--report "$WINDOWS_EV01_REPORT")
+[[ -z "$WINDOWS_EV01_BUNDLE" ]] || WINDOWS_EV01_ARGS+=(--bundle "$WINDOWS_EV01_BUNDLE")
+python3 scripts/rust/p7_gate_report.py record-windows-ev01 "${WINDOWS_EV01_ARGS[@]}"
 
 # 報告與驗證（全部子程序結束後）。
 mkdir -p "$(dirname "$OUT_MD")"

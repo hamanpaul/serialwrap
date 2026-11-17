@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # 在單一候選 HEAD 產生 S2 gate 可共用的證據。
+# 結束碼：0 完成；1 共用段失敗；2 參數／既有輸出錯誤；3 工作樹不乾淨或證據缺失；4 gate_prereqs 失敗。
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 OUT_ROOT="$ROOT/target/s2-shared-evidence"
@@ -22,7 +23,7 @@ OUT_ROOT="$(realpath -m -- "$OUT_ROOT")"
 RUN_DIR="$OUT_ROOT/$RUN_ID"
 if [[ "$DRY_RUN" == "1" ]]; then
   echo "gate_shared.sh dry-run：候選 artifact 與共用證據目錄 $RUN_DIR"
-  echo "執行：source scripts/rust/gate_prereqs.sh --gate；失敗記錄到 <LOG_DIR>/driver.tsv 並停止。"
+  echo "執行：source scripts/rust/gate_prereqs.sh --gate；失敗原因記錄到 $RUN_DIR/logs/gate-prereqs.log，driver.tsv 保留原始結束碼，driver 以結束碼 4 停止。"
   echo "執行：cargo build --workspace --bins；cargo build --workspace --bins --release --target x86_64-unknown-linux-gnu。"
   echo "執行：scripts/rust/mkbundle.sh --release-bundle --stage 2 --profile release --out $RUN_DIR/candidate-bundle；以同 HEAD Stage 2 bundle 綁定 s24_ab，並在 pytest 設 SERIALWRAP_CLI_EXE、SERIALWRAP_DAEMON_EXE、SW_BUNDLE。"
   echo "執行：env SW_RESOURCE_REPORT=<L1> SERIALWRAP_COVERAGE_RUN_DIR=<COVERAGE> SERIALWRAP_COVERAGE_LABEL=python-linux python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence --junitxml=<JUNIT>。"
@@ -36,6 +37,11 @@ if [[ "$DRY_RUN" == "1" ]]; then
 fi
 
 cd "$ROOT"
+WORKTREE_STATUS="$(git status --porcelain --untracked-files=normal)"
+if [[ -n "$WORKTREE_STATUS" ]]; then
+  printf 'gate_shared.sh: 工作樹不乾淨，拒絕正式執行（結束碼 3）。髒檔：\n%s\n' "$WORKTREE_STATUS" >&2
+  exit 3
+fi
 export TMPDIR="$(mktemp -d /tmp/sw.XXXXXX)"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 [[ "$CARGO_TARGET_DIR" == /* ]] || CARGO_TARGET_DIR="$ROOT/$CARGO_TARGET_DIR"
@@ -53,16 +59,19 @@ if not is_worktree_clean(Path(sys.argv[1])):
 PY
 
 LOG_DIR="$ROOT/target/s2-par/gpz/gate-shared/$RUN_ID"
-mkdir -p "$LOG_DIR"
-if source "$ROOT/scripts/rust/gate_prereqs.sh" --gate >"$LOG_DIR/gate-prereqs.log" 2>&1; then
+PREREQ_LOG="$RUN_DIR/logs/gate-prereqs.log"
+mkdir -p "$LOG_DIR" "$(dirname "$PREREQ_LOG")"
+if source "$ROOT/scripts/rust/gate_prereqs.sh" --gate >"$PREREQ_LOG" 2>&1; then
   PREREQS_RC=0
 else
   PREREQS_RC=$?
 fi
 printf 'gate_prereqs\t%s\n' "$PREREQS_RC" >"$LOG_DIR/driver.tsv"
 if [[ "$PREREQS_RC" -ne 0 ]]; then
-  echo "gate_shared.sh: gate_prereqs exit=$PREREQS_RC（$LOG_DIR/gate-prereqs.log）" >&2
-  exit "$PREREQS_RC"
+  printf 'gate_prereqs --gate 失敗（gate_prereqs 原始結束碼=%s；driver 結束碼=4）。\n' "$PREREQS_RC" >>"$PREREQ_LOG"
+  echo "gate_shared.sh: gate_prereqs --gate 失敗；driver 結束碼 4（原始結束碼 $PREREQS_RC；$PREREQ_LOG）" >&2
+  cat "$PREREQ_LOG" >&2
+  exit 4
 fi
 FAILURES=0
 LAST_RC=0
@@ -152,7 +161,8 @@ CARGO_RESULTS_DIR="$RUN_DIR/work/s24-cargo-results"
 mkdir -p "$CARGO_RESULTS_DIR"
 CARGO_RESULTS_ARGV=(--include-cap posix_pty --include-cap process_rpc --workspace --features test-fakes)
 run_capture "$LOG_DIR/cargo-contract-results.log" env \
-  SERIALWRAP_CLI_EXE="$RUN_DIR/artifacts/debug/serialwrap" SERIALWRAP_DAEMON_EXE="$RUN_DIR/artifacts/debug/serialwrapd" \
+  SERIALWRAP_CLI_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrap" \
+  SERIALWRAP_DAEMON_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrapd" \
   python3 scripts/rust/import_cargo_results.py --label rust-linux --platform linux \
   --out-dir "$CARGO_RESULTS_DIR" --include-cap posix_pty --include-cap process_rpc \
   -- --workspace --features test-fakes
@@ -180,18 +190,82 @@ S24_TARGETS=(tests/contract_blackbox tests/acceptance/l15/test_slice21_l15.py \
   tests/acceptance/l15/test_slice23_l15.py tests/test_multiagent_e2e.py \
   tests/test_human_agent_coexist.py tests/test_rust_contract_coverage.py tests/test_transfer_golden_fresh.py)
 S24_DATA="$RUN_DIR/work/s24-ab"
+S24_COVERAGE_TAR="$RUN_DIR/work/s24-coverage.tar.gz"
+S24_ARGV_JSON="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' -q "${S24_TARGETS[@]}")"
 mkdir -p "$S24_DATA"
-run_capture "$LOG_DIR/s24-ab.log" env \
-  SERIALWRAP_CLI_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrap" \
-  SERIALWRAP_DAEMON_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrapd" \
-  SW_BUNDLE="$S24_BUNDLE" SERIALWRAP_AB_LABEL=rust-linux \
-  SERIALWRAP_COVERAGE_RUN_DIR="$RUN_DIR/coverage" SERIALWRAP_COVERAGE_LABEL=rust-linux \
-  python3 -m pytest -q "${S24_TARGETS[@]}" --junitxml="$S24_DATA/junit.xml"
-tar -czf "$RUN_DIR/work/s24-coverage.tar.gz" -C "$RUN_DIR" coverage
-python3 scripts/rust/gate_shared_evidence.py record-section --shared-evidence "$RUN_DIR" --section s24_ab \
-  --argv-json "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' -q "${S24_TARGETS[@]}")" \
-  --exit-code "$LAST_RC" --file slice24/coverage.tar.gz="$RUN_DIR/work/s24-coverage.tar.gz" \
-  --file logs/s24-ab.log="$LOG_DIR/s24-ab.log" --file slice24/s24-ab/junit.xml="$S24_DATA/junit.xml"
+
+check_s24_candidate_bundle() {
+  local point="$1"
+  local log="$LOG_DIR/s24-bundle-check-$point.log"
+  if python3 scripts/rust/gate_shared_evidence.py check-candidate-bundle \
+      --shared-evidence "$RUN_DIR" --candidate-bundle "$S24_BUNDLE" 2>&1 | tee "$log"; then
+    return 0
+  else
+    local rc=$?
+    printf 'EVIDENCE_MISSING: s24_ab 候選 bundle %s 檢查失敗（exit=%s）；不採用該段結果。\n' "$point" "$rc" \
+      | tee -a "$LOG_DIR/s24-ab.log" >&2
+    return "$rc"
+  fi
+}
+
+record_s24_missing() {
+  local reason="$1"
+  local exit_code="$2"
+  local files=()
+  [[ -f "$LOG_DIR/s24-ab.log" ]] && files+=(--file "logs/s24-ab.log=$LOG_DIR/s24-ab.log")
+  [[ -f "$LOG_DIR/s24-bundle-check-before.log" ]] && files+=(--file "logs/s24-bundle-check-before.log=$LOG_DIR/s24-bundle-check-before.log")
+  [[ -f "$LOG_DIR/s24-bundle-check-after.log" ]] && files+=(--file "logs/s24-bundle-check-after.log=$LOG_DIR/s24-bundle-check-after.log")
+  [[ -f "$S24_COVERAGE_TAR" ]] && files+=(--file "slice24/coverage.tar.gz=$S24_COVERAGE_TAR")
+  [[ -f "$S24_DATA/junit.xml" ]] && files+=(--file "slice24/s24-ab/junit.xml=$S24_DATA/junit.xml")
+  if python3 scripts/rust/gate_shared_evidence.py record-missing-section \
+      --shared-evidence "$RUN_DIR" --section s24_ab --argv-json "$S24_ARGV_JSON" \
+      --exit-code "$exit_code" --reason "$reason" "${files[@]}" 2>&1 \
+      | tee "$LOG_DIR/s24-ab-record-missing.log"; then
+    return 0
+  else
+    local rc=$?
+    echo "無法將 s24_ab 的 EVIDENCE_MISSING 寫入 manifest（exit=$rc）。" >&2
+    return "$rc"
+  fi
+}
+
+S24_RC=3
+if check_s24_candidate_bundle before; then
+  run_capture "$LOG_DIR/s24-ab.log" env \
+    SERIALWRAP_CLI_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrap" \
+    SERIALWRAP_DAEMON_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrapd" \
+    SW_BUNDLE="$S24_BUNDLE" SERIALWRAP_AB_LABEL=rust-linux \
+    SERIALWRAP_COVERAGE_RUN_DIR="$RUN_DIR/coverage" SERIALWRAP_COVERAGE_LABEL=rust-linux \
+    python3 -m pytest -q "${S24_TARGETS[@]}" --junitxml="$S24_DATA/junit.xml"
+  S24_RC="$LAST_RC"
+  tar -czf "$S24_COVERAGE_TAR" -C "$RUN_DIR" coverage
+  if check_s24_candidate_bundle after; then
+    if python3 scripts/rust/gate_shared_evidence.py record-section --shared-evidence "$RUN_DIR" --section s24_ab \
+        --argv-json "$S24_ARGV_JSON" --exit-code "$S24_RC" \
+        --file slice24/coverage.tar.gz="$S24_COVERAGE_TAR" \
+        --file logs/s24-ab.log="$LOG_DIR/s24-ab.log" \
+        --file slice24/s24-ab/junit.xml="$S24_DATA/junit.xml" 2>&1 \
+        | tee "$LOG_DIR/s24-ab-record.log"; then
+      :
+    else
+      RECORD_RC=$?
+      FAILURES=1
+      if ! record_s24_missing "s24_ab section 記錄失敗（exit=$RECORD_RC）；結果不可驗證" "$S24_RC"; then
+        FAILURES=1
+      fi
+    fi
+  else
+    FAILURES=1
+    if ! record_s24_missing "s24_ab 後置候選 bundle 檢查失敗；結果記為 EVIDENCE_MISSING" "$S24_RC"; then
+      FAILURES=1
+    fi
+  fi
+else
+  FAILURES=1
+  if ! record_s24_missing "s24_ab 前置候選 bundle 檢查失敗；測試未執行，結果記為 EVIDENCE_MISSING" "$S24_RC"; then
+    FAILURES=1
+  fi
+fi
 
 if [[ -n "$WINDOWS_L1" ]]; then
   [[ -d "$WINDOWS_L1" ]] || { echo "EVIDENCE_MISSING: Windows L1 目錄不存在：$WINDOWS_L1" >&2; exit 3; }

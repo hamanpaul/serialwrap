@@ -194,7 +194,7 @@ def pytest_collection_finish(session: Any) -> None:
 
 
 def pytest_runtest_logreport(report: Any) -> None:
-    """保留 setup、call、teardown 各階段結果，不用最後一列覆蓋前一列。"""
+    """保留 setup、call、teardown 各階段結果，暫存同階段報告供結束時彙整。"""
     _RESULTS.append({
         "nodeid": report.nodeid,
         "outcome": _outcome(report),
@@ -202,6 +202,24 @@ def pytest_runtest_logreport(report: Any) -> None:
         "skip_reason": getattr(report, "longreprtext", None) if report.skipped else None,
         "evidence": [],
     })
+
+
+def _coalesce_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """彙整 pytest unittest subTest 對同一 nodeid／phase 發出的多份報告，保留最差結果。"""
+    severity = {"passed": 0, "xfailed": 1, "skipped": 2, "failed": 3, "error": 4}
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    ordered: list[dict[str, Any]] = []
+    for result in results:
+        key = (result["nodeid"], result["phase"])
+        current = by_key.get(key)
+        if current is None:
+            current = dict(result)
+            by_key[key] = current
+            ordered.append(current)
+        elif severity[result["outcome"]] > severity[current["outcome"]]:
+            current["outcome"] = result["outcome"]
+            current["skip_reason"] = result.get("skip_reason")
+    return ordered
 
 
 @pytest.hookimpl(trylast=True)
@@ -236,7 +254,7 @@ def pytest_sessionfinish(session: Any, exitstatus: int) -> None:
         "collected": _COLLECTED,
         "exit_code": final_status,
         "finished": final_status == 0 and not session.shouldstop and not session.shouldfail,
-        "results": _RESULTS,
+        "results": _coalesce_results(_RESULTS),
     }
     if identity_errors:
         document["identity_errors"] = identity_errors

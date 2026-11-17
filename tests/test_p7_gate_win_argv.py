@@ -32,6 +32,29 @@ def test_gate_win_test_argv_parses(var):
         assert "--test cap_windows_com_p7" in r.stdout, r.stdout
 
 
+def test_shared_windows_import_rejection_does_not_mark_host_capability_missing():
+    """P7-07：WSL 有 Windows 能力但共用 L1 被拒時，不得因本機未接 COM pair 改判 BLOCKED-OWNER。"""
+    text = (ROOT / "scripts/rust/p7_gate.sh").read_text(encoding="utf-8")
+    start = text.index("CAPS=()")
+    end_marker = 'CAPS=("${FILTERED_CAPS[@]}")'
+    end = text.index(end_marker, start) + len(end_marker)
+    decision = text[start:end]
+    env = os.environ.copy()
+    env.pop("SW_TEST_COM_PAIR", None)
+    env.update({
+        "WSL_DISTRO_NAME": "fixture-wsl",
+        "SHARED_EVIDENCE": "fixture-shared-evidence",
+        "SHARED_WIN_NONCOM_IMPORTED": "0",
+        "SHARED_WIN_COM_IMPORTED": "0",
+    })
+    proc = subprocess.run(
+        ["bash", "-c", "set -euo pipefail\n" + decision + '\nprintf \'%s\\n\' "${CAPS[*]}"'],
+        cwd=ROOT, env=env, capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout == "\n", f"匯入被拒不得新增 caps_missing：{proc.stdout!r}"
+
+
 def test_gate_func_comparison_lookup_finds_nested_report(tmp_path):
     """func-test 列取 comparison.json 的那一行須找到 runner 的實際深度 report/<case>/bridge/<n>/（第 12 輪實跑：
     舊 glob 只到兩層，PASS 的 brcm-01-login-flow 被記成 rc 1）。"""

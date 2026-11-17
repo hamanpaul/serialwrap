@@ -27,10 +27,12 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import importlib.util
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -39,6 +41,7 @@ from typing import Any, Mapping, Sequence
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_L1_LOCK = ROOT / "tests/acceptance/l1_required.lock.json"
 OD59_ROWS: tuple[str, ...] = ("OD-59 control latency 500x3 A", "OD-59 control latency 500x3 B")
+WINDOWS_EV01_ROW = "win-func-test ev-01-spawn-handler (Windows)"
 
 REQUIRED_ROWS: tuple[str, ...] = (
     "check_cfg_boundary",
@@ -54,6 +57,7 @@ REQUIRED_ROWS: tuple[str, ...] = (
     "l15 slice23 B",
     "func-test brcm-01-login-flow",
     "func-test ev-01-spawn-handler",
+    WINDOWS_EV01_ROW,
     "regen_lock --check",
     "cases.lock slice_2.3 coverage",
     "python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
@@ -143,6 +147,245 @@ def _sha256(path: Path) -> str | None:
         return hashlib.sha256(path.read_bytes()).hexdigest()
     except OSError:
         return None
+
+
+def _test_hook_inspector() -> Any:
+    """載入 bundle 建置器共用的逐名測試鉤子政策，避免 gate 副本漂移。"""
+    path = ROOT / "scripts/rust/check_test_hook_markers.py"
+    spec = importlib.util.spec_from_file_location("serialwrap_test_hook_markers", path)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"無法載入共用測試鉤子檢查器：{path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def windows_bundle_identity(bundle_dir: Path) -> dict[str, Any]:
+    """核對 Windows bundle 的 Stage 2 manifest／執行檔，並計算完整檔案樹 SHA-256。"""
+    root = Path(bundle_dir).resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError(f"Windows bundle 不是目錄：{root}")
+    files: list[Path] = []
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise ValueError(f"Windows bundle 不得含 symlink：{path.relative_to(root)}")
+        if path.is_file() and path.relative_to(root).as_posix() != ".mkbundle-owner":
+            files.append(path)
+    tree = hashlib.sha256()
+    for path in sorted(files, key=lambda item: item.relative_to(root).as_posix().encode("utf-8")):
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        tree.update(len(relative).to_bytes(8, "big"))
+        tree.update(relative)
+        digest = _sha256(path)
+        if digest is None:
+            raise ValueError(f"無法讀取 Windows bundle 檔案：{path.relative_to(root)}")
+        tree.update(bytes.fromhex(digest))
+
+    try:
+        pointer = json.loads((root / "bin/current-release.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"bundle current-release.json 不可讀：{exc}") from exc
+    version = pointer.get("bundle_version") if isinstance(pointer, Mapping) else None
+    expected_dir = f"versions/{version}" if isinstance(version, str) else None
+    if not isinstance(version, str) or re.fullmatch(r"\d+\.\d+\.\d+", version) is None or pointer.get("dir") != expected_dir:
+        raise ValueError("bundle current-release.json 的 bundle_version／dir 不符")
+    version_root = (root / expected_dir).resolve()
+    if not version_root.is_relative_to(root):
+        raise ValueError("bundle current-release.json 指向 bundle 外路徑")
+    manifest_path = version_root / "release-manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"bundle release-manifest.json 不可讀：{exc}") from exc
+    if not isinstance(manifest, Mapping) or manifest.get("schema_version") != 1 \
+            or manifest.get("bundle_version") != version:
+        raise ValueError("bundle release-manifest.json 的 schema_version／bundle_version 不符")
+    sums_path = version_root / "SHA256SUMS"
+    try:
+        sums_lines = sums_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise ValueError(f"bundle SHA256SUMS 不可讀：{exc}") from exc
+    sums: dict[str, str] = {}
+    for line in sums_lines:
+        match = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
+        if match is None:
+            raise ValueError(f"bundle SHA256SUMS 格式錯誤：{line!r}")
+        digest, relative = match.groups()
+        if (relative.startswith("/") or "\\" in relative or ".." in relative.split("/")
+                or relative in {"release-manifest.json", "SHA256SUMS"} or relative in sums):
+            raise ValueError(f"bundle SHA256SUMS 路徑重複／不安全：{relative!r}")
+        sums[relative] = digest
+    version_files = {
+        path.relative_to(version_root).as_posix(): path
+        for path in version_root.rglob("*")
+        if path.is_file() and path.relative_to(version_root).as_posix() not in {"release-manifest.json", "SHA256SUMS"}
+    }
+    if set(sums) != set(version_files):
+        raise ValueError("bundle SHA256SUMS 清單與 version 目錄檔案集合不符")
+    for relative, path in version_files.items():
+        if _sha256(path) != sums[relative]:
+            raise ValueError(f"bundle SHA256SUMS SHA-256 不符：{relative}")
+    stage = manifest.get("stage")
+    git_revision = manifest.get("git_revision")
+    if not isinstance(git_revision, str) or re.fullmatch(r"[0-9a-f]{40}", git_revision) is None:
+        raise ValueError("bundle release-manifest.json 缺有效 git_revision")
+    components = manifest.get("components")
+    cli = components.get("cli") if isinstance(components, Mapping) else None
+    daemon = components.get("daemon") if isinstance(components, Mapping) else None
+    if not isinstance(cli, Mapping) or cli.get("implementation") != "rust" or cli.get("version") != version:
+        raise ValueError("bundle CLI 不是同版本 Rust 實作")
+    cli_rel = cli.get("path")
+    if cli_rel != "bin/serialwrap.exe":
+        raise ValueError(f"bundle manifest CLI path 不符：{cli_rel!r}")
+    cli_expected = cli.get("sha256")
+    cli_versioned = version_root / cli_rel
+    cli_root = root / "bin/serialwrap.exe"
+    cli_sha = _sha256(cli_versioned)
+    if not isinstance(cli_expected, str) or not _SHA256_RE.fullmatch(cli_expected) or cli_sha != cli_expected \
+            or _sha256(cli_root) != cli_expected:
+        raise ValueError("Windows bundle CLI SHA-256 與 manifest／穩定入口不符")
+
+    daemon_sha: str | None = None
+    binaries = [("bin/serialwrap.exe", cli_versioned)]
+    if stage == "rust-2":
+        if manifest.get("target") != "x86_64-pc-windows-gnu" or not isinstance(daemon, Mapping) \
+                or daemon.get("implementation") != "rust" or daemon.get("version") != version:
+            raise ValueError("bundle 不是 x86_64 Windows Rust Stage 2")
+        launcher = daemon.get("launcher")
+        daemon_rel = launcher.get("path") if isinstance(launcher, Mapping) else None
+        daemon_expected = launcher.get("sha256") if isinstance(launcher, Mapping) else None
+        if daemon_rel != "bin/serialwrapd.exe" or not isinstance(daemon_expected, str) \
+                or not _SHA256_RE.fullmatch(daemon_expected):
+            raise ValueError("Stage 2 bundle manifest daemon launcher 不符")
+        daemon_sha = _sha256(version_root / daemon_rel)
+        if daemon_sha != daemon_expected or _sha256(root / "bin/serialwrapd.exe") != daemon_expected:
+            raise ValueError("Windows bundle daemon SHA-256 與 manifest／穩定入口不符")
+        if daemon.get("git_revision") != git_revision or cli.get("git_revision") != git_revision:
+            raise ValueError("Stage 2 bundle 元件 git_revision 與 manifest 不符")
+        binaries.append((daemon_rel, version_root / daemon_rel))
+    hook_inspector = _test_hook_inspector()
+    for relative, executable in binaries:
+        for marker in hook_inspector.inspect_binary(executable):
+            raise ValueError(f"Windows bundle 執行檔含禁用測試鉤子 {marker}：{relative}")
+    return {
+        "bundle_sha256": tree.hexdigest(),
+        "stage": stage,
+        "version": version,
+        "git_revision": git_revision,
+        "manifest_sha256": _sha256(manifest_path),
+        "cli_sha256": cli_sha,
+        "daemon_sha256": daemon_sha,
+    }
+
+
+def windows_ev01_status(report_path: Path | None, bundle_dir: Path | None,
+                        candidate_head: Any) -> tuple[str, str]:
+    """以完整報告、HEAD 與 bundle 檔案樹身分核對 ev-01 Windows 列。"""
+    if report_path is None or bundle_dir is None:
+        return "INCOMPLETE", "缺 Windows ev-01 report 或 Stage 2 bundle 路徑"
+    report_path = Path(report_path)
+    bundle_dir = Path(bundle_dir)
+    if report_path.name != "func-test-report.json" or report_path.parent.name != "basic":
+        return "INCOMPLETE", "Windows ev-01 report 必須是 basic/func-test-report.json"
+    metadata_path = report_path.parent.parent / "win-func-test-meta.json"
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return "INCOMPLETE", f"Windows ev-01 report/meta 不可讀：{exc}"
+    if not isinstance(report, Mapping) or not isinstance(metadata, Mapping):
+        return "INCOMPLETE", "Windows ev-01 report/meta 根節點必須是 object"
+    if not isinstance(candidate_head, str) or re.fullmatch(r"[0-9a-f]{40}", candidate_head) is None:
+        return "INCOMPLETE", "P7 results.json.git_head 無法核對 Windows ev-01 證據"
+    if metadata.get("schema_version") != "win-func-test-meta.v2" or metadata.get("git_clean") is not True:
+        return "INCOMPLETE", "Windows func-test metadata schema/git_clean 不符"
+    for label, value in (("report metadata", metadata.get("git_head")),
+                         ("Stage 2 bundle", metadata.get("bundle_git_revision"))):
+        if value != candidate_head:
+            return "INCOMPLETE", f"{label} HEAD {value!r} 與候選版 {candidate_head!r} 不符"
+    if not isinstance(metadata.get("git_tree"), str) or re.fullmatch(r"[0-9a-f]{40}", metadata["git_tree"]) is None:
+        return "INCOMPLETE", "Windows func-test metadata 缺有效 git_tree"
+    if metadata.get("com_pair") != {"daemon": "COM20", "bridge": "COM21"} \
+            or metadata.get("transport_mode") != "virtual_com0com":
+        return "INCOMPLETE", "Windows ev-01 必須使用核准的 COM20:COM21 virtual_com0com"
+    if metadata.get("daemon_exe_used") is not True:
+        return "INCOMPLETE", "Windows ev-01 未證明以 Stage 2 Rust daemon 執行"
+
+    try:
+        identity = windows_bundle_identity(bundle_dir)
+    except (OSError, ValueError, TypeError) as exc:
+        return "INCOMPLETE", f"Windows Stage 2 bundle 無法核對：{exc}"
+    if identity.get("stage") != "rust-2":
+        return "INCOMPLETE", f"Windows bundle stage={identity.get('stage')!r}，須為 rust-2"
+    identity_fields = {
+        "bundle_sha256": "bundle_sha256",
+        "bundle_stage": "stage",
+        "bundle_version": "version",
+        "bundle_git_revision": "git_revision",
+        "bundle_manifest_sha256": "manifest_sha256",
+        "cli_exe_sha256": "cli_sha256",
+        "daemon_exe_sha256": "daemon_sha256",
+    }
+    for field, identity_key in identity_fields.items():
+        if metadata.get(field) != identity.get(identity_key):
+            return "INCOMPLETE", f"Windows bundle {field} SHA-256／身分與報告不符"
+    report_sha = _sha256(report_path)
+    if not isinstance(metadata.get("basic_report_sha256"), str) or metadata.get("basic_report_sha256") != report_sha:
+        return "INCOMPLETE", "Windows ev-01 basic report SHA-256 與 metadata 不符"
+
+    runs = metadata.get("runs") if isinstance(metadata.get("runs"), Mapping) else {}
+    scenario_run = runs.get("scenarios")
+    if metadata.get("case_filter") != "ev-01-spawn-handler" or metadata.get("scenario_skipped") is not True \
+            or not isinstance(scenario_run, Mapping) or scenario_run.get("skipped") is not True \
+            or scenario_run.get("runner_exit") != 0 or scenario_run.get("runner_argv") != []:
+        return "INCOMPLETE", "Windows func-test metadata 未證明只執行一次聚焦 ev-01 basic runner"
+    basic_run = runs.get("basic")
+    argv = basic_run.get("runner_argv") if isinstance(basic_run, Mapping) else None
+    if not isinstance(basic_run, Mapping) or basic_run.get("report") != "basic/func-test-report.json":
+        return "INCOMPLETE", "Windows func-test metadata 缺 basic report run"
+    if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
+        return "INCOMPLETE", "Windows basic runner argv 格式錯誤"
+    if argv[:4] != ["-3.12", "func-test/runner.py", "--mode", "bridge"] or "--scenarios" in argv:
+        return "INCOMPLETE", "Windows basic runner 不是指定的 bridge 模式"
+    for flag, expected in (("--case", "ev-01-spawn-handler"), ("--daemon-com", "COM20"),
+                           ("--bridge-com", "COM21"), ("--transport-mode", "virtual_com0com")):
+        if argv.count(flag) != 1:
+            return "INCOMPLETE", f"Windows basic runner {flag} 必須恰出現一次"
+        position = argv.index(flag)
+        if argv[position + 1:position + 2] != [expected]:
+            return "INCOMPLETE", f"Windows basic runner {flag} 不符"
+    try:
+        basic_exit = basic_run.get("runner_exit")
+        if type(basic_exit) is not int:
+            return "INCOMPLETE", "Windows basic runner exit 格式錯誤"
+        if report.get("schema_version") != "func-test-report.v1" or report.get("complete") is not True \
+                or report.get("independent_cases") != 1:
+            return "INCOMPLETE", "Windows basic func-test 報告未完整完成單一案例"
+        results = report.get("results")
+        if not isinstance(results, list) or len(results) != 1 or not isinstance(results[0], Mapping):
+            return "INCOMPLETE", "Windows basic func-test 報告不是恰一筆必要案例"
+        result = results[0]
+        if result.get("case_id") != "ev-01-spawn-handler" or result.get("mode") != "bridge" \
+                or type(result.get("run_index")) is not int or result.get("run_index") != 0:
+            return "INCOMPLETE", "Windows basic func-test 報告案例／mode／run_index 不符"
+        verdict = result.get("verdict")
+        expected_summary = {"runs": 1, "pass": int(verdict == "PASS"), "fail": int(verdict == "FAIL"),
+                            "insufficient": int(verdict == "INSUFFICIENT_EVIDENCE"), "skip": int(verdict == "SKIP")}
+        bridge_summary = (report.get("modes") or {}).get("bridge") if isinstance(report.get("modes"), Mapping) else None
+        if bridge_summary != expected_summary:
+            return "INCOMPLETE", "Windows basic func-test 統計與 ev-01 verdict 不符"
+        if verdict == "FAIL":
+            return "FAIL", "ev-01-spawn-handler Windows verdict=FAIL"
+        if verdict != "PASS":
+            return "INCOMPLETE", f"ev-01-spawn-handler Windows verdict={verdict!r}"
+        if result.get("gate_eligible") is not True:
+            return "INCOMPLETE", "ev-01-spawn-handler Windows gate_eligible 不是 true"
+        if basic_exit != 0:
+            return "INCOMPLETE", f"Windows basic runner_exit={basic_exit}，PASS 證據不完整"
+    except (AttributeError, TypeError, ValueError) as exc:
+        return "INCOMPLETE", f"Windows ev-01 report 格式錯誤：{exc}"
+    return "PASS", f"ev-01-spawn-handler PASS＋gate_eligible；bundle SHA-256 {identity['bundle_sha256']}"
 
 
 def _resolve(base: Path, p: str) -> Path:
@@ -241,9 +484,26 @@ def _test_row_status(base: Path, row: Mapping[str, Any], lock: Mapping[str, Any]
     return "PASS", f"{sid} {len(required)} 筆"
 
 
+def _windows_ev01_row_status(base: Path, row: Mapping[str, Any], candidate_head: Any) -> tuple[str, str]:
+    if row.get("rc") != 0:
+        return "FAIL", f"Windows ev-01 匯入 rc={row.get('rc')}"
+    evidence_errors = _evidence_errors(base, row.get("evidence"), required=True)
+    if evidence_errors:
+        return "INCOMPLETE", "; ".join(evidence_errors)
+    evidence = row.get("windows_ev01")
+    if not isinstance(evidence, Mapping):
+        return "INCOMPLETE", "缺 Windows ev-01 evidence import"
+    report_rel, bundle_rel = evidence.get("report_path"), evidence.get("bundle_path")
+    if not isinstance(report_rel, str) or not isinstance(bundle_rel, str):
+        return "INCOMPLETE", str(evidence.get("snapshot_error") or "缺 Windows ev-01 report/bundle 路徑")
+    return windows_ev01_status(_resolve(base, report_rel), _resolve(base, bundle_rel), candidate_head)
+
+
 def _row_status(base: Path, row: Mapping[str, Any], caps_missing: set[str], lock, judge,
                 candidate_head: Any) -> tuple[str, str]:
     name = row.get("name", "")
+    if name == WINDOWS_EV01_ROW:
+        return _windows_ev01_row_status(base, row, candidate_head)
     cap = CAP_ROWS.get(name)
     if cap is not None and cap[0] in caps_missing:
         return "BLOCKED-OWNER", cap[1]
@@ -473,6 +733,75 @@ def record_row(results_dir: Path, *, name: str, rc: int | None, log: Path, argv:
     return row
 
 
+def record_windows_ev01(results_dir: Path, *, report_path: Path | None, bundle_dir: Path | None,
+                        log_path: Path) -> dict[str, Any]:
+    """把外部 Windows ev-01 報告與 Stage 2 bundle 複製進 P7 run，供 build／verify 重算。"""
+    results_dir = Path(results_dir)
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    evidence: list[Path] = []
+    snapshot: dict[str, Any] = {}
+    messages: list[str] = []
+    destination = results_dir / "windows-ev01"
+    if report_path is None:
+        messages.append("未指定 Windows ev-01 report")
+    else:
+        source_report = Path(report_path)
+        if source_report.name != "func-test-report.json" or source_report.parent.name != "basic":
+            messages.append("report 路徑必須是 basic/func-test-report.json")
+        else:
+            source_meta = source_report.parent.parent / "win-func-test-meta.json"
+            if not source_report.is_file() or not source_meta.is_file():
+                messages.append("缺 basic/func-test-report.json 或 win-func-test-meta.json")
+            else:
+                report_copy = destination / "reports/basic/func-test-report.json"
+                meta_copy = destination / "reports/win-func-test-meta.json"
+                try:
+                    report_copy.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source_report, report_copy)
+                    shutil.copy2(source_meta, meta_copy)
+                except OSError as exc:
+                    snapshot["snapshot_error"] = f"Windows report/meta 快照失敗：{exc}"
+                    messages.append(snapshot["snapshot_error"])
+                else:
+                    evidence.extend((report_copy, meta_copy))
+                    snapshot["report_path"] = _rel_to(results_dir, report_copy)
+                    messages.append("已快照 basic report 與 metadata")
+    if bundle_dir is None:
+        messages.append("未指定 Windows Stage 2 bundle")
+    else:
+        source_bundle = Path(bundle_dir)
+        try:
+            windows_bundle_identity(source_bundle)
+            bundle_copy = destination / "bundle"
+            shutil.copytree(source_bundle, bundle_copy, ignore=shutil.ignore_patterns(".mkbundle-owner"))
+            snapshot["bundle_path"] = _rel_to(results_dir, bundle_copy)
+            messages.append("已快照 Windows bundle")
+        except (OSError, ValueError, shutil.Error) as exc:
+            snapshot["snapshot_error"] = f"Windows bundle 快照失敗：{exc}"
+            messages.append(snapshot["snapshot_error"])
+    log_path.write_text("\n".join(messages) + "\n", encoding="utf-8")
+    evidence.append(log_path)
+    imported_at = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    row = {
+        "name": WINDOWS_EV01_ROW,
+        "argv": ["import-win-func-test", str(report_path or ""), str(bundle_dir or "")],
+        "rc": 0,
+        "started_at": imported_at,
+        "ended_at": imported_at,
+        "log_path": _rel_to(results_dir, log_path),
+        "log_sha256": _sha256(log_path),
+        "platform": "windows",
+        "evidence": [{"path": _rel_to(results_dir, item), "sha256": _sha256(item)} for item in evidence],
+        "windows_ev01": snapshot,
+    }
+    result_file = results_dir / "results.json"
+    data = json.loads(result_file.read_text(encoding="utf-8"))
+    data["rows"] = [item for item in data.get("rows") or [] if item.get("name") != WINDOWS_EV01_ROW] + [row]
+    result_file.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    return row
+
+
 def record_breaker(results_dir: Path, breaker_json: Path, *, exit_code: int) -> dict[str, Any]:
     """將 slice_breaker 評估輸出及其 SHA-256 納入本 gate 的結果與可重算報告。"""
     results_dir = Path(results_dir)
@@ -523,6 +852,13 @@ def main(argv: list[str] | None = None) -> int:
     br.add_argument("--results-dir", required=True, type=Path)
     br.add_argument("--breaker-json", required=True, type=Path)
     br.add_argument("--exit-code", required=True, type=int)
+    we = sub.add_parser("record-windows-ev01")
+    we.add_argument("--results-dir", required=True, type=Path)
+    we.add_argument("--report", type=Path)
+    we.add_argument("--bundle", type=Path)
+    we.add_argument("--log", required=True, type=Path)
+    wi = sub.add_parser("windows-bundle-identity")
+    wi.add_argument("--bundle", required=True, type=Path)
     args = ap.parse_args(argv)
     if args.cmd == "init":
         init_results(args.results_dir, args.run_id, caps_missing=args.caps_missing, artifacts=args.artifact,
@@ -542,6 +878,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "record-breaker":
         record_breaker(args.results_dir, args.breaker_json, exit_code=args.exit_code)
+        return 0
+    if args.cmd == "record-windows-ev01":
+        record_windows_ev01(args.results_dir, report_path=args.report, bundle_dir=args.bundle, log_path=args.log)
+        return 0
+    if args.cmd == "windows-bundle-identity":
+        sys.stdout.write(json.dumps(windows_bundle_identity(args.bundle), sort_keys=True) + "\n")
         return 0
     problems = verify_report(args.md, args.results_dir, l1_lock=args.l1_lock)
     for p in problems:
