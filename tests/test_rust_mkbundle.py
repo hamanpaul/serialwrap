@@ -635,6 +635,21 @@ raise SystemExit(helper.main())
     assert not errors, "; ".join(f"{list(error.absolute_path)}: {error.message}" for error in errors)
 
 
+def test_windows_stage2_validator_rejects_parity_hook_in_unknown_executable(tmp_path: Path) -> None:
+    """共用 parity hook 只允許出現在 CLI 與 daemon，不得藉未知執行檔放行。"""
+    daemon = b"rust-daemon-fixture\0SERIALWRAP_TEST_SYSTEM_CONFIG_PATH"
+    cli = b"rust-cli-fixture\0SERIALWRAP_TEST_SYSTEM_CONFIG_PATH"
+    root = tmp_path / "windows-stage2"
+    _make_windows_stage2_validator_fixture(root, daemon, cli)
+    helper = root / "bin" / "serialwrap-helper.exe"
+    helper.write_bytes(b"helper-fixture\0SERIALWRAP_TEST_SYSTEM_CONFIG_PATH")
+
+    rejected = _validate_windows_stage2_bundle(root)
+    assert rejected.returncode == 1, rejected.stdout
+    assert helper.as_posix() in rejected.stderr
+    assert "SERIALWRAP_TEST_SYSTEM_CONFIG_PATH" in rejected.stderr
+
+
 def test_windows_stage2_validator_allows_only_daemon_parity_hooks(tmp_path: Path) -> None:
     """CLI 與 daemon 共用系統設定路徑；其餘三個 parity hook 僅 daemon 可用。"""
     allowed_daemon = (

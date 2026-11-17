@@ -20,23 +20,26 @@ DAEMON_ONLY_PARITY_HOOKS = frozenset(
 )
 # Windows 與 Linux bundle 建置器都呼叫本檔，勿在呼叫端另建放行清單。
 PARITY_HOOKS = COMMON_PARITY_HOOKS | DAEMON_ONLY_PARITY_HOOKS
-# Rust daemon hook names are NUL-terminated CStr literals; keep the binary scan exact when linkers coalesce statics.
+CLI_NAMES = frozenset({"serialwrap", "serialwrap.exe"})
+DAEMON_NAMES = frozenset({"serialwrapd", "serialwrapd.exe"})
+# Rust parity hook 使用 NUL 結尾 CStr；正規表示式只擷取候選名稱，仍須逐名精確比對。
 HOOK_PATTERNS = (
     ("SERIALWRAP_TEST_", re.compile(rb"SERIALWRAP_TEST_[A-Za-z0-9_]*")),
     ("SW_TEST_UPDATE_", re.compile(rb"SW_TEST_UPDATE_[A-Za-z0-9_]*")),
 )
-DAEMON_NAMES = frozenset({"serialwrapd", "serialwrapd.exe"})
 
 
 def inspect_binary(path: pathlib.Path) -> list[str]:
     data = path.read_bytes()
+    is_cli = path.name in CLI_NAMES
     is_daemon = path.name in DAEMON_NAMES
     rejected: list[str] = []
     for prefix, pattern in HOOK_PATTERNS:
         for match in pattern.finditer(data):
             marker = match.group().decode("ascii", errors="replace")
             if prefix == "SERIALWRAP_TEST_" and (
-                marker in COMMON_PARITY_HOOKS or (is_daemon and marker in DAEMON_ONLY_PARITY_HOOKS)
+                ((is_cli or is_daemon) and marker in COMMON_PARITY_HOOKS)
+                or (is_daemon and marker in DAEMON_ONLY_PARITY_HOOKS)
             ):
                 continue
             rejected.append(marker)
