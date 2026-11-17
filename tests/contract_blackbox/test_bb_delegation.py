@@ -217,6 +217,20 @@ def test_missing_manifest(tmp_path, env):
     exe.chmod(0o755)
     delegate_env = dict(env, SERIALWRAP_TEST_DELEGATE_GROUP="doctor")
     r = subprocess.run([str(exe), "doctor"], env=delegate_env, capture_output=True, check=False)
+    source = Path(bb_harness.cli_prefix()[-1]).resolve()
+    manifest = source.parent.parent / "release-manifest.json"
+    if (
+        manifest.is_file()
+        and json.loads(manifest.read_text(encoding="utf-8")).get("stage") == "rust-2"
+    ):
+        # 正式 Stage 2 不編入 test-fakes；測試專用委派環境變數必須被忽略。
+        assert r.returncode == 0
+        assert r.stderr == b""
+        out = _parse(r.stdout, r.stderr, r.returncode)
+        assert isinstance(out.get("checks"), list)
+        assert isinstance(out.get("ok"), bool)
+        assert "error_code" not in out
+        return
     assert r.returncode == 1
     out = _parse(r.stdout, r.stderr, r.returncode)
     assert out["error_code"] == "INTERNAL_ERROR"
