@@ -4,6 +4,9 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+// NUL 邊界讓 release bundle 可精確辨識這個 parity 環境變數名稱。
+const TEST_SYSTEM_CONFIG_PATH_OVERRIDE: &std::ffi::CStr = c"SERIALWRAP_TEST_SYSTEM_CONFIG_PATH";
+
 // 明列項目（不用 glob）：避免 proc_scan 的 `posix`／`windows` 子模組名洩漏成 `sw_pal::posix`。
 pub use crate::device_source::windows_model::{
     exclude_bluetooth, read_bt_ports, RegistryView, SERIALCOMM_KEY,
@@ -364,7 +367,11 @@ pub trait SysEnv: Send + Sync {
     fn system_config_dir(&self) -> String;
     /// `SYSTEM_CONFIG_PATH`：明確測試覆寫原樣優先（包含空字串），否則為 `system_config_dir()/config.yaml`。
     fn system_config_path(&self) -> String {
-        if let Some(path) = self.var("SERIALWRAP_TEST_SYSTEM_CONFIG_PATH") {
+        if let Some(path) = self.var(
+            TEST_SYSTEM_CONFIG_PATH_OVERRIDE
+                .to_str()
+                .expect("C 字串常值必為有效 UTF-8"),
+        ) {
             return path;
         }
         let mut path = PathBuf::from(self.system_config_dir());

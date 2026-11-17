@@ -575,18 +575,24 @@ def test_windows_bundle_identity_rejects_release_test_hooks(tmp_path):
         b"SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE",
     )
     daemon = b"stage2-daemon-exe\0" + b"\0".join(allowed)
-    replace_binaries(b"stage2-cli-exe", daemon)
+    cli = b"stage2-cli-exe\0SERIALWRAP_TEST_SYSTEM_CONFIG_PATH"
+    replace_binaries(cli, daemon)
     identity = g.windows_bundle_identity(bundle)
     assert identity["daemon_sha256"] == hashlib.sha256(daemon).hexdigest()
 
     for forbidden in (b"SERIALWRAP_TEST_UNAPPROVED_HOOK", b"SW_TEST_UPDATE_FUTURE_HOOK"):
-        replace_binaries(b"stage2-cli-exe", b"stage2-daemon-exe\0" + forbidden)
+        replace_binaries(cli, b"stage2-daemon-exe\0" + forbidden)
         with pytest.raises(ValueError, match="禁用測試鉤子"):
             g.windows_bundle_identity(bundle)
 
-    replace_binaries(b"stage2-cli-exe\0SERIALWRAP_TEST_DEVICE_ALLOWLIST", daemon)
-    with pytest.raises(ValueError, match="禁用測試鉤子"):
-        g.windows_bundle_identity(bundle)
+    for daemon_only in (
+        b"SERIALWRAP_TEST_DEVICE_ALLOWLIST",
+        b"SERIALWRAP_TEST_KILL_AFTER_SAVE",
+        b"SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE",
+    ):
+        replace_binaries(cli + b"\0" + daemon_only, daemon)
+        with pytest.raises(ValueError, match="禁用測試鉤子"):
+            g.windows_bundle_identity(bundle)
 
 
 def test_windows_ev01_requires_stage2_bundle_sha256_identity(tmp_path):

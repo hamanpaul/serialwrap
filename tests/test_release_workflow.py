@@ -36,12 +36,13 @@ RELEASE_YML = REPO_ROOT / ".github" / "workflows" / "release.yml"
 JOB = "publish-linux-bundle"
 BUNDLE_NAME = "serialwrap-${VERSION}-linux-x86_64"
 TARBALL = f"dist/{BUNDLE_NAME}.tar.gz"
-# 測試鉤子字串；正式候選二進位不得含有。
-TEST_FAKE_MARKERS = (
-    "SERIALWRAP_TEST_",
-    "SW_TEST_UPDATE_PAUSE_AFTER",
-    "SW_TEST_UPDATE_FORCE_VERIFY_FAIL",
-)
+# 正式 CLI 只允許與 Python 對齊的系統設定路徑；其餘測試鉤子一律拒絕。
+CLI_PARITY_HOOKS = {"SERIALWRAP_TEST_SYSTEM_CONFIG_PATH"}
+CLI_FORBIDDEN_PARITY_HOOKS = {
+    "SERIALWRAP_TEST_DEVICE_ALLOWLIST",
+    "SERIALWRAP_TEST_KILL_AFTER_SAVE",
+    "SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE",
+}
 
 
 def _load() -> dict[str, Any]:
@@ -236,7 +237,7 @@ def test_linux_bundle_job_build_commands():
 
 @pytest.mark.process_rpc
 def test_release_profile_binary_excludes_test_hooks():
-    """正式 release binary 不得包含委派覆寫或故障注入環境變數。"""
+    """正式 CLI 僅保留 Python parity 系統設定路徑，其餘測試鉤子仍須排除。"""
     target_root = REPO_ROOT / "target"
     target_root.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="release-workflow-", dir=target_root) as target_dir:
@@ -269,9 +270,13 @@ def test_release_profile_binary_excludes_test_hooks():
             check=False,
         )
         assert result.returncode == 0, f"strings 無法讀取 release binary：{result.stderr}"
-        assert "SERIALWRAP_TEST_" not in result.stdout
-        for marker in TEST_FAKE_MARKERS[1:]:
-            assert marker not in result.stdout, f"release binary 含測試鉤子 {marker}"
+        hook_names = set(re.findall(r"SERIALWRAP_TEST_[A-Za-z0-9_]*", result.stdout))
+        assert hook_names == CLI_PARITY_HOOKS, (
+            f"release CLI 只能含逐名核准的 parity hook {sorted(CLI_PARITY_HOOKS)}；實際為 {sorted(hook_names)}"
+        )
+        for marker in CLI_FORBIDDEN_PARITY_HOOKS:
+            assert marker not in hook_names, f"release CLI 含 daemon 專用測試鉤子 {marker}"
+        assert "SW_TEST_UPDATE_" not in result.stdout, "release CLI 含 SW_TEST_UPDATE_* 測試鉤子"
 
 
 @pytest.mark.memory_only

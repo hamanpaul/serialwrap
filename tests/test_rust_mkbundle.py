@@ -636,15 +636,15 @@ raise SystemExit(helper.main())
 
 
 def test_windows_stage2_validator_allows_only_daemon_parity_hooks(tmp_path: Path) -> None:
-    """Stage 2 daemon 僅可帶四個逐名 hook；同前綴延伸、其他 hook 與 CLI 都拒絕。"""
-    allowed = (
+    """CLI 與 daemon 共用系統設定路徑；其餘三個 parity hook 僅 daemon 可用。"""
+    allowed_daemon = (
         b"SERIALWRAP_TEST_DEVICE_ALLOWLIST",
         b"SERIALWRAP_TEST_SYSTEM_CONFIG_PATH",
         b"SERIALWRAP_TEST_KILL_AFTER_SAVE",
         b"SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE",
     )
-    daemon = b"rust-daemon-fixture\0" + b"\0".join(allowed)
-    cli = b"rust-cli-fixture"
+    daemon = b"rust-daemon-fixture\0" + b"\0".join(allowed_daemon)
+    cli = b"rust-cli-fixture\0SERIALWRAP_TEST_SYSTEM_CONFIG_PATH"
     root = tmp_path / "windows-stage2"
     _make_windows_stage2_validator_fixture(root, daemon, cli)
 
@@ -663,18 +663,25 @@ def test_windows_stage2_validator_allows_only_daemon_parity_hooks(tmp_path: Path
         ),
         (b"SW_TEST_UPDATE_FUTURE_HOOK", "SW_TEST_UPDATE_FUTURE_HOOK"),
     ):
-        _refresh_windows_stage2_validator_fixture(root, daemon + b"\0" + forbidden, cli)
-        rejected = _validate_windows_stage2_bundle(root)
-        assert rejected.returncode == 1, rejected.stdout
-        assert marker in rejected.stderr
+        for bad_daemon, bad_cli in (
+            (daemon + b"\0" + forbidden, cli),
+            (daemon, cli + b"\0" + forbidden),
+        ):
+            _refresh_windows_stage2_validator_fixture(root, bad_daemon, bad_cli)
+            rejected = _validate_windows_stage2_bundle(root)
+            assert rejected.returncode == 1, rejected.stdout
+            assert marker in rejected.stderr
 
-    _refresh_windows_stage2_validator_fixture(
-        root, daemon, cli + b"\0SERIALWRAP_TEST_DEVICE_ALLOWLIST"
-    )
-    cli_rejected = _validate_windows_stage2_bundle(root)
-    assert cli_rejected.returncode == 1, cli_rejected.stdout
-    assert "serialwrap.exe" in cli_rejected.stderr
-    assert "SERIALWRAP_TEST_DEVICE_ALLOWLIST" in cli_rejected.stderr
+    for daemon_only in (
+        b"SERIALWRAP_TEST_DEVICE_ALLOWLIST",
+        b"SERIALWRAP_TEST_KILL_AFTER_SAVE",
+        b"SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE",
+    ):
+        _refresh_windows_stage2_validator_fixture(root, daemon, cli + b"\0" + daemon_only)
+        cli_rejected = _validate_windows_stage2_bundle(root)
+        assert cli_rejected.returncode == 1, cli_rejected.stdout
+        assert "serialwrap.exe" in cli_rejected.stderr
+        assert daemon_only.decode() in cli_rejected.stderr
 
 
 def test_doctor_via_bundle_reports_version_pairing(bundle, tmp_path):

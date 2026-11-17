@@ -6,6 +6,9 @@ use crate::pyjson::PyInt;
 use crate::pypath::{self, HomeLookup, PathFlavor};
 use std::collections::BTreeMap;
 
+// 以 NUL 結尾保留二進位中的環境變數 token 邊界，供 release bundle 逐名掃描。
+const TEST_SYSTEM_CONFIG_PATH_OVERRIDE: &std::ffi::CStr = c"SERIALWRAP_TEST_SYSTEM_CONFIG_PATH";
+
 /// 凍結的環境變數快照。
 ///
 /// 鍵大小寫由建構方式決定（sw-proto 不依平台分支，平台語意由呼叫端選擇）：
@@ -283,7 +286,11 @@ impl RuntimePaths {
             &pypath::join(f, &user_home, &["b-log"]),
         );
         let config_yaml = pypath::join(f, &config_dir, &["config.yaml"]);
-        let system_config_path = match env.get("SERIALWRAP_TEST_SYSTEM_CONFIG_PATH") {
+        let system_config_path = match env.get(
+            TEST_SYSTEM_CONFIG_PATH_OVERRIDE
+                .to_str()
+                .expect("C 字串常值必為有效 UTF-8"),
+        ) {
             Some(path) => path.to_string(),
             None => match f {
                 PathFlavor::Posix => "/etc/serialwrap/config.yaml".to_string(),
