@@ -18,23 +18,63 @@ DAEMON_PARITY_HOOKS = frozenset(
         "SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE",
     }
 )
-HOOK_PATTERNS = (
-    ("SERIALWRAP_TEST_", re.compile(rb"SERIALWRAP_TEST_[A-Za-z0-9_]*")),
-    ("SW_TEST_UPDATE_", re.compile(rb"SW_TEST_UPDATE_[A-Za-z0-9_]*")),
-)
+SERIALWRAP_TEST_PREFIX = b"SERIALWRAP_TEST_"
+SW_TEST_UPDATE_PATTERN = re.compile(rb"SW_TEST_UPDATE_[A-Za-z0-9_]*")
+SERIALWRAP_TEST_PATTERN = re.compile(rb"SERIALWRAP_TEST_[A-Za-z0-9_]*")
+# rustc/link.exe 可把相鄰的靜態字串放在同一個 PE 區段且不加 NUL；只為實際相鄰字串
+# 精確列出尾綴，避免把已核准 hook 誤讀成更長的環境變數名稱。
+ADJACENT_LITERAL_SUFFIXES = {
+    "SERIALWRAP_TEST_SYSTEM_CONFIG_PATH": (b"config.yaml",),
+    "SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE": (b"Traceback (most call last):",),
+}
 DAEMON_NAMES = frozenset({"serialwrapd", "serialwrapd.exe"})
+
+
+def _is_identifier_byte(value: int) -> bool:
+    return 48 <= value <= 57 or 65 <= value <= 90 or 97 <= value <= 122 or value == 95
+
+
+def _identifier_at(data: bytes, start: int) -> bytes:
+    end = start
+    while end < len(data) and _is_identifier_byte(data[end]):
+        end += 1
+    return data[start:end]
+
+
+def _allowed_daemon_marker(data: bytes, start: int) -> str | None:
+    """只辨識精確 hook 名；不把任意同前綴的更長環境變數一併放行。"""
+    for name in DAEMON_PARITY_HOOKS:
+        marker = name.encode("ascii")
+        if not data.startswith(marker, start):
+            continue
+        end = start + len(marker)
+        if end == len(data) or not _is_identifier_byte(data[end]):
+            return name
+        # 相鄰的另一個 hook 會在其自己的 prefix 位置再次檢查；未知名稱仍會被拒。
+        if data.startswith(SERIALWRAP_TEST_PREFIX, end):
+            return name
+        for suffix in ADJACENT_LITERAL_SUFFIXES.get(name, ()):
+            after_suffix = end + len(suffix)
+            if data.startswith(suffix, end) and (
+                after_suffix == len(data) or not _is_identifier_byte(data[after_suffix])
+            ):
+                return name
+    return None
 
 
 def inspect_binary(path: pathlib.Path) -> list[str]:
     data = path.read_bytes()
     is_daemon = path.name in DAEMON_NAMES
     rejected: list[str] = []
-    for prefix, pattern in HOOK_PATTERNS:
-        for match in pattern.finditer(data):
-            marker = match.group().decode("ascii", errors="replace")
-            if prefix == "SERIALWRAP_TEST_" and is_daemon and marker in DAEMON_PARITY_HOOKS:
-                continue
-            rejected.append(marker)
+    for match in SERIALWRAP_TEST_PATTERN.finditer(data):
+        start = match.start()
+        if is_daemon and _allowed_daemon_marker(data, start) is not None:
+            continue
+        rejected.append(_identifier_at(data, start).decode("ascii", errors="replace"))
+    rejected.extend(
+        match.group().decode("ascii", errors="replace")
+        for match in SW_TEST_UPDATE_PATTERN.finditer(data)
+    )
     return list(dict.fromkeys(rejected))
 
 

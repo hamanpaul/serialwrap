@@ -643,7 +643,12 @@ def test_windows_stage2_validator_allows_only_daemon_parity_hooks(tmp_path: Path
         b"SERIALWRAP_TEST_KILL_AFTER_SAVE",
         b"SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE",
     )
-    daemon = b"rust-daemon-fixture\0" + b"\0".join(allowed)
+    adjacent_runtime_literals = (
+        b"SERIALWRAP_TEST_SYSTEM_CONFIG_PATHconfig.yaml\0"
+        b"SERIALWRAP_TEST_KILL_AFTER_SAVESERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE"
+        b"Traceback (most recent call last):\0"
+    )
+    daemon = b"rust-daemon-fixture\0" + b"\0".join(allowed) + b"\0" + adjacent_runtime_literals
     cli = b"rust-cli-fixture"
     root = tmp_path / "windows-stage2"
     _make_windows_stage2_validator_fixture(root, daemon, cli)
@@ -652,7 +657,11 @@ def test_windows_stage2_validator_allows_only_daemon_parity_hooks(tmp_path: Path
     assert accepted.returncode == 0, accepted.stderr
     assert "無測試鉤子" in accepted.stdout
 
-    for forbidden in (b"SERIALWRAP_TEST_UNAPPROVED_HOOK", b"SW_TEST_UPDATE_FUTURE_HOOK"):
+    for forbidden in (
+        b"SERIALWRAP_TEST_UNAPPROVED_HOOK",
+        b"SERIALWRAP_TEST_DEVICE_ALLOWLIST_EXTRA",
+        b"SW_TEST_UPDATE_FUTURE_HOOK",
+    ):
         _refresh_windows_stage2_validator_fixture(root, daemon + b"\0" + forbidden, cli)
         rejected = _validate_windows_stage2_bundle(root)
         assert rejected.returncode == 1, rejected.stdout
