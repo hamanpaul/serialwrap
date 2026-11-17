@@ -9,14 +9,15 @@
 // 測試名沿用計畫的 `cap_posix_pty__*` 命名（雙底線即為計畫指定的分隔），不套用 snake_case 警告。
 #![allow(non_snake_case)]
 
+use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{symlink, OpenOptionsExt};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sw_pal::conformance::posix_pty_pair;
 use sw_pal::conformance::NoHolders;
@@ -55,6 +56,238 @@ fn child_ready_and_wait() {
     std::io::stdout().flush().ok();
     let mut b = [0u8; 1];
     let _ = std::io::stdin().read(&mut b);
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IndependentHolderReady {
+    pid: libc::pid_t,
+    session_id: libc::pid_t,
+    opened: libc::c_int,
+}
+
+#[derive(Clone, Copy)]
+struct ProcIdentity {
+    state: char,
+    parent: libc::pid_t,
+    session_id: libc::pid_t,
+    start_time: u64,
+}
+
+/// 讀取 `/proc/<pid>/stat` 的 parent、session 與啟動時刻；comm 可含右括號，故從最後一個 `)` 後解析。
+fn proc_identity(pid: libc::pid_t) -> Option<ProcIdentity> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = stat
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    Some(ProcIdentity {
+        state: fields.first()?.chars().next()?,
+        parent: fields.get(1)?.parse().ok()?,
+        session_id: fields.get(3)?.parse().ok()?,
+        start_time: fields.get(19)?.parse().ok()?,
+    })
+}
+
+/// 真正位於呼叫者行程樹之外、獨立 session 的 PTY holder。
+///
+/// `probe_holders_in` 依 Python parity 的內部子行程防護排除呼叫者的整棵行程樹；單純 `Command::spawn` 的測試
+/// holder 會因此被排除，不代表第二個 daemon。此處 double-fork 後讓 holder 由系統 reaper 收養，並以 `setsid`
+/// 建立另一個 session；控制 pipe EOF 使它關閉 PTY，Drop 會等待並在必要時終止這支自己建立的測試行程。
+struct IndependentHolder {
+    pid: libc::pid_t,
+    start_time: u64,
+    release: Option<File>,
+}
+
+impl IndependentHolder {
+    fn spawn(dev: &DevicePath) -> Self {
+        let path = std::ffi::CString::new(dev.0.as_bytes()).expect("PTY path 不含 NUL");
+        let mut ready = [0; 2];
+        let mut release = [0; 2];
+        assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0, "ready pipe");
+        if unsafe { libc::pipe(release.as_mut_ptr()) } != 0 {
+            unsafe {
+                libc::close(ready[0]);
+                libc::close(ready[1]);
+            }
+            panic!("release pipe: {}", std::io::Error::last_os_error());
+        }
+
+        // SAFETY: fork 後的兩個子行程只呼叫 async-signal-safe 的 fork／setsid／open／read／write／close／_exit。
+        let reaper = unsafe { libc::fork() };
+        if reaper < 0 {
+            unsafe {
+                libc::close(ready[0]);
+                libc::close(ready[1]);
+                libc::close(release[0]);
+                libc::close(release[1]);
+            }
+            panic!("fork holder reaper: {}", std::io::Error::last_os_error());
+        }
+        if reaper == 0 {
+            unsafe {
+                libc::close(ready[0]);
+                libc::close(release[1]);
+                let pid = libc::fork();
+                if pid < 0 {
+                    let record = IndependentHolderReady {
+                        pid: 0,
+                        session_id: -1,
+                        opened: 0,
+                    };
+                    let bytes = (&record as *const IndependentHolderReady).cast::<u8>();
+                    let _ = libc::write(
+                        ready[1],
+                        bytes.cast(),
+                        std::mem::size_of::<IndependentHolderReady>(),
+                    );
+                    libc::close(ready[1]);
+                    libc::close(release[0]);
+                    libc::_exit(1);
+                }
+                if pid > 0 {
+                    libc::close(ready[1]);
+                    libc::close(release[0]);
+                    libc::_exit(0);
+                }
+
+                let session_id = libc::setsid();
+                let tty_fd = if session_id >= 0 {
+                    libc::open(
+                        path.as_ptr(),
+                        libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+                    )
+                } else {
+                    -1
+                };
+                let record = IndependentHolderReady {
+                    pid: libc::getpid(),
+                    session_id,
+                    opened: libc::c_int::from(tty_fd >= 0),
+                };
+                let bytes = (&record as *const IndependentHolderReady).cast::<u8>();
+                let mut offset = 0;
+                while offset < std::mem::size_of::<IndependentHolderReady>() {
+                    let written = libc::write(
+                        ready[1],
+                        bytes.add(offset).cast(),
+                        std::mem::size_of::<IndependentHolderReady>() - offset,
+                    );
+                    if written <= 0 {
+                        libc::_exit(1);
+                    }
+                    offset += written as usize;
+                }
+                libc::close(ready[1]);
+                if tty_fd < 0 {
+                    libc::close(release[0]);
+                    libc::_exit(1);
+                }
+                let mut byte = 0u8;
+                while libc::read(release[0], (&mut byte as *mut u8).cast(), 1) > 0 {}
+                libc::close(tty_fd);
+                libc::close(release[0]);
+                libc::_exit(0);
+            }
+        }
+
+        unsafe {
+            libc::close(ready[1]);
+            libc::close(release[0]);
+        }
+        // SAFETY: parent 已關閉對應 pipe 端點，以下 File 接管各自唯一的 fd。
+        let mut ready_reader = unsafe { File::from_raw_fd(ready[0]) };
+        let release_writer = unsafe { File::from_raw_fd(release[1]) };
+        let mut child_status = 0;
+        loop {
+            // SAFETY: `reaper` 是本測試剛建立且尚未回收的直接子行程。
+            let waited = unsafe { libc::waitpid(reaper, &mut child_status, 0) };
+            if waited == reaper {
+                break;
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::Interrupted,
+                "waitpid holder reaper"
+            );
+        }
+        assert!(
+            libc::WIFEXITED(child_status) && libc::WEXITSTATUS(child_status) == 0,
+            "holder reaper 應成功 double-fork，status={child_status}"
+        );
+
+        let mut record = std::mem::MaybeUninit::<IndependentHolderReady>::uninit();
+        // SAFETY: child 以相同 repr(C) 結構寫入完整 record；pid_t／c_int 的所有位元組組合皆可讀。
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                record.as_mut_ptr().cast::<u8>(),
+                std::mem::size_of::<IndependentHolderReady>(),
+            )
+        };
+        ready_reader
+            .read_exact(bytes)
+            .expect("讀取 detached holder 就緒狀態");
+        // SAFETY: read_exact 已填滿 repr(C) record，所有欄位都是整數型別。
+        let record = unsafe { record.assume_init() };
+        assert_eq!(record.opened, 1, "detached holder 必須成功開啟 PTY");
+        assert_eq!(
+            record.session_id, record.pid,
+            "holder 必須建立自己的 session"
+        );
+        let identity = proc_identity(record.pid).expect("detached holder 應仍存活");
+        assert_ne!(
+            identity.state, 'Z',
+            "holder 應在 release pipe EOF 前保持存活"
+        );
+        assert_eq!(identity.session_id, record.session_id);
+        assert_ne!(
+            identity.parent, reaper,
+            "holder 必須在中間 reaper 結束後重新收養"
+        );
+        assert_ne!(
+            identity.parent,
+            std::process::id() as libc::pid_t,
+            "holder 不得仍是呼叫者的子行程"
+        );
+        assert_ne!(
+            identity.session_id,
+            unsafe { libc::getsid(0) },
+            "holder 與測試必須位於不同 session"
+        );
+
+        Self {
+            pid: record.pid,
+            start_time: identity.start_time,
+            release: Some(release_writer),
+        }
+    }
+}
+
+impl Drop for IndependentHolder {
+    fn drop(&mut self) {
+        self.release.take(); // EOF 讓 holder 關閉自己開啟的 PTY。
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let Some(identity) = proc_identity(self.pid) else {
+                return;
+            };
+            if identity.state == 'Z' {
+                return;
+            }
+            if Instant::now() >= deadline {
+                // 僅在 PID、session leader 與啟動時刻仍相符時，終止本測試建立但未自行退出的 holder。
+                if identity.session_id == self.pid && identity.start_time == self.start_time {
+                    unsafe {
+                        libc::kill(self.pid, libc::SIGKILL);
+                    }
+                }
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
 }
 
 /// 以本測試二進位重入 `test`（子程序），角色與 slave 路徑經環境變數傳入。
@@ -116,36 +349,28 @@ fn spawn_child(test: &str, role: &str, dev: &DevicePath) -> Child {
 #[test]
 #[ignore = "cap:posix_pty"]
 fn cap_posix_pty__second_process_open_is_held() {
-    const NAME: &str = "cap_posix_pty__second_process_open_is_held";
-    if let Some(role) = child_role(NAME) {
-        assert_eq!(role, "hold");
-        // 子程序模擬第二個 daemon：持有獨占 handle 直到父程序結束它
-        let _h = sw_pal::native()
-            .serial
-            .open_exclusive(&child_dev(), &cfg())
-            .expect("child open_exclusive");
-        child_ready_and_wait();
-        return;
-    }
     let (dev, _peer) = posix_pty_pair();
-    let mut child = spawn_child(NAME, "hold", &dev);
+    // 必須是呼叫者行程樹外的另一個 session，否則內部子行程防護會正確排除 holder。
+    let holder = IndependentHolder::spawn(&dev);
     match sw_pal::native().serial.open_exclusive(&dev, &cfg()) {
         Err(OpenError::Held(rep)) => {
-            assert!(
-                rep.pids.contains(&child.id()),
-                "pids {:?} 應含子程序 pid {}",
-                rep.pids,
-                child.id()
+            eprintln!(
+                "外部 session holder：pid={} status={:?} holder_unknown={}",
+                holder.pid, rep.status, rep.holder_unknown
             );
-            assert!(!rep.holder_unknown, "已識別的外部 holder");
+            assert!(
+                rep.pids.contains(&(holder.pid as u32)),
+                "pids {:?} 應含外部 session holder pid {}",
+                rep.pids,
+                holder.pid
+            );
+            assert!(!rep.holder_unknown, "已識別的外部 holder 不得降為未知");
         }
         other => panic!(
-            "expected Held with child pid, got {}",
+            "expected Held with independent holder pid, got {}",
             show_open(&other)
         ),
     }
-    drop(child.stdin.take());
-    let _ = child.wait();
 }
 
 #[test]

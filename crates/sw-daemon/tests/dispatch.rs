@@ -17,7 +17,7 @@ use sw_pal::fakes::{FakeDevice, FakeEnv, FakeSerialBackend};
 use sw_pal::proc_scan::{DaemonProc, ProcIdentity};
 use sw_pal::traits::{
     Clock, DeviceInfo, DevicePath, HolderReport, HolderScanStatus, OpenError, PalError,
-    PalErrorKind, SerialBackend, SerialConfig, SerialHandle, UartExclusive,
+    PalErrorKind, SerialBackend, SerialConfig, SerialHandle, UartExclusive, WatcherEvent,
 };
 use sw_proto::pycompat::iso_utc_now;
 use sw_proto::pyjson::{PyDict, PyValue, RPC_WIRE, dumps};
@@ -49,11 +49,29 @@ fn i25_bind_completes_after_rpc_timeout() -> (ServiceRig, FakeDevice) {
     let error = binding.join().unwrap();
     resume.send(()).unwrap();
     assert_eq!(error.message, "internal timeout");
-    // 同 lane 查詢作為屏障，確定晚到 bind 已實際完成；不以固定 sleep 猜測。
+    // 同 lane 查詢只確認 actor 已發布 DETACHED；再等待持久化回條完成，才把晚到 bind 視為已結束。
     let late = r.session("COM0").unwrap();
     assert_eq!(s(&late, "state"), "DETACHED");
     assert_eq!(s(&late, "device_by_id"), BY_ID_A);
     assert_eq!(dev.open_attempts(), 1, "逾時的 RPC 不得自行重新開埠");
+    let sid = r.mgr.resolve("COM0").expect("COM0 session");
+    // 同 lane 查詢只證明記憶體已套用；還要等晚到 Bind 的持久化回條完成，否則緊接的 bind 可能撞上
+    // pending_bind_commit 而正確回 SESSION_RECOVERING（dispatch.rs 逐支執行時序，非產品錯誤）。
+    wait_until("逾時晚到 bind 的 binding commit 落盤", || {
+        sw_core::state_store::load_state(Path::new(support::STATE_PATH), r.fs.as_ref())
+            .ok()
+            .is_some_and(|(persisted, _)| {
+                persisted
+                    .bindings
+                    .get(&sid)
+                    .is_some_and(|by_id| by_id == BY_ID_A)
+                    && !persisted.released.contains_key(&sid)
+            })
+    });
+    r.settle();
+    let committed = r.session("COM0").unwrap();
+    assert_eq!(s(&committed, "state"), "DETACHED");
+    assert_eq!(s(&committed, "device_by_id"), BY_ID_A);
     (
         Arc::try_unwrap(r).unwrap_or_else(|_| panic!("bind 執行緒須已結束")),
         dev,
@@ -90,7 +108,12 @@ fn wp510r_i25_rpc_timed_out_bind_late_completion_allows_replug() {
         "session.bind",
         &format!(r#"{{"selector":"COM0","device_by_id":"{BY_ID_A}"}}"#),
     );
-    assert_eq!(retry.get("ok"), Some(&PyValue::Bool(true)));
+    assert_eq!(
+        retry.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "晚到 bind 提交已完成後，重試仍須成功：{}",
+        j(&retry)
+    );
     assert_eq!(
         s(&sub(&retry, "session"), "state"),
         "ATTACHING",
@@ -3737,6 +3760,46 @@ fn session_list_sorted_by_session_id() {
         .map(|v| v["session_id"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(ids, ["t:COM0", "t:COM1"]);
+}
+
+#[test]
+fn watcher_delta_rebind_is_visible_through_service_rpc() {
+    let r = ServiceRig::templates_only(&[(BY_ID_A, REAL_A)]);
+    let device = DeviceInfo {
+        by_id: BY_ID_A.to_string(),
+        real_path: REAL_A.to_string(),
+    };
+    let send_delta = |added: Vec<DeviceInfo>, removed: Vec<DeviceInfo>, snapshot: Vec<(String, DeviceInfo)>| {
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        r.mgr
+            .watcher_sender()
+            .send(WatcherEvent::Delta {
+                added,
+                removed,
+                snapshot,
+                ack: Some(ack_tx),
+            })
+            .expect("ServiceRig manager 應接收 watcher Delta");
+        assert!(
+            ack_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("ServiceRig manager 應確認 Delta"),
+            "成功套用的 Delta 應回覆接受"
+        );
+    };
+
+    send_delta(Vec::new(), vec![device.clone()], Vec::new());
+    r.wait_state("COM0", "DETACHED");
+    send_delta(
+        vec![device.clone()],
+        Vec::new(),
+        vec![(BY_ID_A.to_string(), device.clone())],
+    );
+    r.wait_state("COM0", "ATTACHED");
+
+    let session = r.session("COM0").expect("session.get_state 應查到重新掛接的 session");
+    assert_eq!(s(&session, "state"), "ATTACHED");
+    assert_eq!(s(&session, "attached_real_path"), REAL_A);
 }
 
 #[test]

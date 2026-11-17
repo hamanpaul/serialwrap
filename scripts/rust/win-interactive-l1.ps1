@@ -8,20 +8,29 @@ $PSNativeCommandUseErrorActionPreference = $false
 $TestSpecs = @(
     [pscustomobject]@{
         Nodeid = 'cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c'
+        Crate = 'sw-pal'
         Target = 'exec_delegate'
         TestName = 'cap_interactive_desktop__exec_or_wait_ctrl_c'
     }
     [pscustomobject]@{
         Nodeid = 'cargo:sw-pal::lock::cap_interactive_desktop__ctrl_break_stops_wait'
+        Crate = 'sw-pal'
         Target = 'lock'
         TestName = 'cap_interactive_desktop__ctrl_break_stops_wait'
+    }
+    [pscustomobject]@{
+        Nodeid = 'cargo:sw-daemon::daemon_process::cap_interactive_desktop__windows_console_ctrl_triggers_orderly_stop'
+        Crate = 'sw-daemon'
+        Target = 'daemon_process'
+        TestName = 'cap_interactive_desktop__windows_console_ctrl_triggers_orderly_stop'
     }
 )
 
 $TargetTriple = 'x86_64-pc-windows-gnu'
 $BuildArgs = @(
     'test', '--no-run', '--message-format=json', '--target', $TargetTriple,
-    '--package', 'sw-pal', '--features', 'test-fakes', '--test', 'exec_delegate', '--test', 'lock'
+    '--package', 'sw-pal', '--package', 'sw-daemon', '--features', 'test-fakes',
+    '--test', 'exec_delegate', '--test', 'lock', '--test', 'daemon_process'
 )
 $ReportArgv = @(
     '--package', 'sw-pal', '--package', 'sw-core', '--package', 'sw-daemon',
@@ -118,7 +127,7 @@ try {
     $buildArgsQuoted = @($BuildArgs | ForEach-Object { Quote-Bash $_ }) -join ' '
     $buildCommand = 'cd ' + $root + ' && export TMPDIR="$(mktemp -d /tmp/sw.XXXXXX)" CARGO_TARGET_DIR=' + $target +
         ' CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc' +
-        ' && cargo ' + $buildArgsQuoted
+        ' && heavy-slot serialwrap-gfxc nice -n 10 ionice -c2 -n7 cargo ' + $buildArgsQuoted
     $buildOutput = Invoke-Wsl $buildCommand
     $artifactPaths = @{}
     foreach ($line in ($buildOutput -split "`n")) {
@@ -131,13 +140,13 @@ try {
         }
         if ($record.reason -ne 'compiler-artifact' -or $record.profile.test -ne $true) { continue }
         $targetName = [string]$record.target.name
-        if ($targetName -notin @('exec_delegate', 'lock') -or -not $record.executable) { continue }
+        if ($targetName -notin @('exec_delegate', 'lock', 'daemon_process') -or -not $record.executable) { continue }
         if ($artifactPaths.ContainsKey($targetName)) {
             throw "Cargo 回報重複測試執行檔：$targetName"
         }
         $artifactPaths[$targetName] = [string]$record.executable
     }
-    foreach ($targetName in @('exec_delegate', 'lock')) {
+    foreach ($targetName in @('exec_delegate', 'lock', 'daemon_process')) {
         if (-not $artifactPaths.ContainsKey($targetName)) {
             throw "Cargo 未建置必要測試執行檔：$targetName"
         }
@@ -166,7 +175,7 @@ try {
         if (-not ($ExecutableRecords | Where-Object { $_.target -eq $spec.Target })) {
             $nodeids = @($TestSpecs | Where-Object { $_.Target -eq $spec.Target } | ForEach-Object { $_.Nodeid })
             $ExecutableRecords.Add([ordered]@{
-                crate = 'sw-pal'
+                crate = $spec.Crate
                 target = $spec.Target
                 path = $localExe
                 sha256 = $exeHash

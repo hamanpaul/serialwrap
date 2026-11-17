@@ -183,10 +183,14 @@ pub fn endpoint_alive(ctx: &CliCtx, ep: &str) -> bool {
 pub fn config_read_path(ctx: &CliCtx) -> String {
     let flavor = flavor_of(ctx);
     let home = EnvHome(ctx.p.env.as_ref());
-    let sys_cfg_dir = ctx.p.env.system_config_dir();
-    resolve_config_path(&ctx.env, &ctx.paths, &sys_cfg_dir, flavor, &home, &|p| {
-        ctx.p.fs.exists(Path::new(p))
-    })
+    resolve_config_path(
+        &ctx.env,
+        &ctx.paths,
+        &ctx.paths.system_config_path,
+        flavor,
+        &home,
+        &|p| ctx.p.fs.exists(Path::new(p)),
+    )
 }
 
 /// PAL I/O 錯誤 → `ConfigError::Os`（`OSError` 形狀，檔名為 `path`）。

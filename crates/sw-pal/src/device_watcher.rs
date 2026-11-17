@@ -145,19 +145,29 @@ impl DeviceWatcher {
         };
 
         let (added, removed) = Self::diff(previous, &current);
-        *previous = current.clone();
-        if (!added.is_empty() || !removed.is_empty())
-            && !send_or_stop(
+        if added.is_empty() && removed.is_empty() {
+            *previous = current;
+        } else {
+            let (ack_tx, ack_rx) = bounded(1);
+            if !send_or_stop(
                 tx,
                 stop_rx,
                 WatcherEvent::Delta {
                     added,
                     removed,
-                    snapshot: current,
+                    snapshot: current.clone(),
+                    ack: Some(ack_tx),
                 },
-            )
-        {
-            return false;
+            ) {
+                return false;
+            }
+            let accepted = select! {
+                recv(stop_rx) -> _ => return false,
+                recv(ack_rx) -> result => result.unwrap_or(false),
+            };
+            if accepted {
+                *previous = current;
+            }
         }
         send_or_stop(tx, stop_rx, WatcherEvent::Tick)
     }

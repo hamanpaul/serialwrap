@@ -592,14 +592,27 @@ fn watcher_reports_device_removed_after_initial_scan() {
     script.set(Vec::new());
     let (handle, rx) = start_watcher_with_baseline(Box::new(source), initial);
 
-    match rx.recv_timeout(WAIT).expect("初始掃描後拔除裝置應送出 Delta") {
+    match rx
+        .recv_timeout(WAIT)
+        .expect("初始掃描後拔除裝置應送出 Delta")
+    {
         WatcherEvent::Delta {
             added,
             removed,
             snapshot,
+            ack,
         } => {
+            ack.expect("watcher Delta 必須附確認通道")
+                .send(true)
+                .unwrap();
             assert!(added.is_empty());
-            assert_eq!(removed, vec![DeviceInfo { by_id: A.into(), real_path: TTY0.into() }]);
+            assert_eq!(
+                removed,
+                vec![DeviceInfo {
+                    by_id: A.into(),
+                    real_path: TTY0.into()
+                }]
+            );
             assert!(snapshot.is_empty());
         }
         other => panic!("預期首輪送出移除 Delta，實際：{other:?}"),
@@ -621,6 +634,9 @@ fn recv_until(
             .expect("逾時仍未收到符合條件的 WatcherEvent");
         if pred(&ev) {
             return ev;
+        }
+        if let WatcherEvent::Delta { ack: Some(ack), .. } = &ev {
+            ack.send(true).expect("略過事件的 consumer 應確認 Delta");
         }
     }
 }
@@ -698,7 +714,11 @@ fn watcher_emits_delta_only_when_changed() {
             added,
             removed,
             snapshot,
+            ack,
         } => {
+            ack.expect("watcher Delta 必須附確認通道")
+                .send(true)
+                .unwrap();
             assert_eq!(
                 added,
                 vec![DeviceInfo {
@@ -740,6 +760,82 @@ fn watcher_emits_delta_only_when_changed() {
 }
 
 #[test]
+fn watcher_delta_not_lost_when_consumer_rejects() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    let (source, _script) = FakeDeviceSource::new(vec![dev(A, TTY0)]);
+    let (handle, rx) = start_watcher_with_baseline(Box::new(source), Vec::new());
+
+    let first = recv_until(&rx, |event| matches!(event, WatcherEvent::Delta { .. }));
+    let (first_state, first_ack) = match first {
+        WatcherEvent::Delta {
+            added,
+            removed,
+            snapshot,
+            ack,
+        } => (
+            (added, removed, snapshot),
+            ack.expect("watcher Delta 必須附確認通道"),
+        ),
+        other => panic!("預期首輪裝置 Delta，實際：{other:?}"),
+    };
+    assert_eq!(
+        first_state.0,
+        vec![DeviceInfo {
+            by_id: A.into(),
+            real_path: TTY0.into()
+        }]
+    );
+    assert!(first_state.1.is_empty());
+    assert_eq!(first_state.2, vec![dev(A, TTY0)]);
+
+    // 模擬 consumer callback panic；consumer 隔離 panic 後以拒收回條要求 watcher 保留該變化。
+    let consumer = catch_unwind(AssertUnwindSafe(|| {
+        panic!("模擬 watcher consumer callback panic")
+    }));
+    assert!(consumer.is_err(), "測試 consumer 必須確實觸發並隔離 panic");
+    first_ack
+        .send(false)
+        .expect("watcher 仍在等待 consumer 回條");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let (second_state, second_ack) = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let event = rx
+            .recv_timeout(remaining)
+            .expect("consumer 拒收後下一輪仍須重送相同 Delta");
+        if let WatcherEvent::Delta {
+            added,
+            removed,
+            snapshot,
+            ack,
+        } = event
+        {
+            break (
+                (added, removed, snapshot),
+                ack.expect("重送的 Delta 必須附確認通道"),
+            );
+        }
+    };
+    assert_eq!(
+        second_state, first_state,
+        "未確認的 Delta 必須保留至 consumer 接受"
+    );
+    second_ack
+        .send(true)
+        .expect("consumer 接受回條應抵達 watcher");
+
+    let after = rx
+        .recv_timeout(WAIT)
+        .expect("consumer 接受後 watcher 應續送 Tick");
+    assert!(
+        matches!(after, WatcherEvent::Tick),
+        "接受後不應再重送 Delta：{after:?}"
+    );
+    handle.stop();
+}
+
+#[test]
 fn watcher_tick_panic_isolated() {
     let (inner, _script) = FakeDeviceSource::new(vec![dev(A, TTY0)]);
     let rounds = Arc::new(AtomicUsize::new(0));
@@ -749,7 +845,7 @@ fn watcher_tick_panic_isolated() {
         inject: Some((2, Injected::Panic)),
         threads: Arc::new(Mutex::new(Vec::new())),
     };
-    let (handle, rx) = start_watcher(Box::new(gate));
+    let (handle, rx) = start_watcher_with_baseline(Box::new(gate), vec![dev(A, TTY0)]);
 
     // 第 2 輪 panic 後 thread 必須續行：掃描計數需走到第 4 輪。
     wait_until("第 2 輪 panic 後 watcher 應續行到第 4 輪", || {
@@ -881,6 +977,66 @@ fn watcher_stop_is_bounded_when_scan_is_slow() {
         "scan 受阻時 stop 應在 2 s 上限後返回，實際耗時 {elapsed:?}"
     );
     wait_until("逾時後 detached watcher 完成目前掃描", || {
+        finished.load(Ordering::SeqCst)
+    });
+}
+
+#[test]
+fn watcher_stop_bounded_2s() {
+    const CHILD_ENV: &str = "SW_TEST_WATCHER_STOP_BOUNDED_2S_CHILD";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        watcher_stop_bounded_2s_child();
+        return;
+    }
+
+    // `eprintln!` 由 Rust test harness 擷取；以 `--nocapture` 子行程讀取實際 stderr，
+    // 使 C-93 的 WARNING 成為斷言，而非僅靠人工觀察測試輸出。
+    let output = std::process::Command::new(std::env::current_exe().expect("目前測試執行檔"))
+        .args(["--exact", "watcher_stop_bounded_2s", "--nocapture"])
+        .env(CHILD_ENV, "1")
+        .output()
+        .expect("啟動 C-93 子測試");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "C-93 子測試失敗：\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("WARNING device watcher 未於 2s 內結束"),
+        "逾時 stop 必須實際寫出 2 s WARNING；stderr={stderr:?}"
+    );
+}
+
+fn watcher_stop_bounded_2s_child() {
+    use std::sync::atomic::AtomicBool;
+
+    let started = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let handle = DeviceWatcher::start(
+        Box::new(SlowSource {
+            started: Arc::clone(&started),
+            finished: Arc::clone(&finished),
+        }),
+        Duration::from_secs(60),
+        tx,
+        sw_pal::native().clock,
+    );
+    wait_until("逾時測試的慢速掃描開始", || started.load(Ordering::SeqCst));
+
+    let before = Instant::now();
+    handle.stop();
+    let elapsed = before.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(2_200),
+        "scan 卡住時 stop 應於 2 s 上限附近返回，實際耗時 {elapsed:?}"
+    );
+    assert!(
+        !finished.load(Ordering::SeqCst),
+        "stop 應在 2.3 s 掃描結束之前返回，實際耗時 {elapsed:?}"
+    );
+    wait_until("有界 stop 後 detached watcher 完成目前掃描", || {
         finished.load(Ordering::SeqCst)
     });
 }

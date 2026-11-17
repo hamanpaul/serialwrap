@@ -1158,6 +1158,68 @@ fn unknown_with_log_writes_tx_outcome_unknown_meta() {
 }
 
 #[test]
+fn unknown_outcome_writes_confirmed_prefix_and_meta() {
+    let r = rig();
+    r.dev.script_write(vec![FakeWriteStep::Unknown {
+        confirmed: 2,
+        error: PalError::io(5, "[Errno 5] Input/output error"),
+    }]);
+    let submits_before = r.dev.os_submits();
+
+    let report = send(&r, TxClass::Command, 1, 7, b"hello");
+
+    assert_eq!(report.result.outcome, TxOutcome::Unknown { confirmed: 2 });
+    assert_eq!(r.dev.os_submits() - submits_before, 1, "Unknown 不得重送");
+    let lines = wal_lines(&r);
+    let tx_index = lines
+        .iter()
+        .position(|line| line.contains("\"dir\":\"TX\""))
+        .expect("確認前綴 TX");
+    let meta_index = lines
+        .iter()
+        .position(|line| line.contains("\"dir\":\"META\""))
+        .expect("Unknown META");
+    assert!(tx_index < meta_index, "TX 前綴必須先於 META：{lines:?}");
+    let txs = tx_lens(&r);
+    assert_eq!(txs.len(), 1, "只記錄一筆確認前綴 TX：{txs:?}");
+    assert!(
+        txs[0].contains("\"payload_b64\":\"aGU=\""),
+        "TX 僅記錄 `he`：{}",
+        txs[0]
+    );
+    let metas = meta_lens(&r);
+    assert_eq!(metas.len(), 1, "只記錄一筆 Unknown META：{metas:?}");
+    assert!(metas[0].contains("\"event\":\"tx_outcome_unknown\""));
+    assert!(metas[0].contains("\"requested_bytes\":5"));
+    assert!(metas[0].contains("\"confirmed_bytes\":2"));
+    assert!(metas[0].contains("\"unknown_range\":[2,5]"));
+}
+
+#[test]
+fn unknown_without_confirmed_bytes_writes_meta_only() {
+    let r = rig();
+    r.dev.script_write(vec![FakeWriteStep::Unknown {
+        confirmed: 0,
+        error: PalError::io(5, "[Errno 5] Input/output error"),
+    }]);
+    let submits_before = r.dev.os_submits();
+
+    let report = send(&r, TxClass::Command, 1, 7, b"hello");
+
+    assert_eq!(report.result.outcome, TxOutcome::Unknown { confirmed: 0 });
+    assert_eq!(r.dev.os_submits() - submits_before, 1, "Unknown 不得重送");
+    let lines = wal_lines(&r);
+    assert!(tx_lens(&r).is_empty(), "零確認不得寫 TX：{lines:?}");
+    let metas = meta_lens(&r);
+    assert_eq!(metas.len(), 1, "只寫一筆 META：{metas:?}");
+    assert!(metas[0].contains("\"event\":\"tx_outcome_unknown\""));
+    assert!(metas[0].contains("\"requested_bytes\":5"));
+    assert!(metas[0].contains("\"confirmed_bytes\":0"));
+    assert!(metas[0].contains("\"unknown_range\":[0,5]"));
+    assert!(metas[0].contains("\"payload_b64\":\"\""));
+}
+
+#[test]
 fn unknown_with_log_false_writes_no_meta() {
     let r = rig();
     r.dev.script_write(vec![FakeWriteStep::Unknown {

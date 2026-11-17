@@ -362,6 +362,15 @@ pub trait SysEnv: Send + Sync {
     /// SC-09：POSIX `"/etc/serialwrap"`；Windows `"%ProgramData%\serialwrap"`（ProgramData 缺時 `"C:\ProgramData\serialwrap"`）。
     /// CLI 不得自行判斷平台。
     fn system_config_dir(&self) -> String;
+    /// `SYSTEM_CONFIG_PATH`：明確測試覆寫原樣優先（包含空字串），否則為 `system_config_dir()/config.yaml`。
+    fn system_config_path(&self) -> String {
+        if let Some(path) = self.var("SERIALWRAP_TEST_SYSTEM_CONFIG_PATH") {
+            return path;
+        }
+        let mut path = PathBuf::from(self.system_config_dir());
+        path.push("config.yaml");
+        path.to_string_lossy().into_owned()
+    }
     fn current_user_home(&self) -> Option<String>;
     fn user_home(&self, user: &str) -> Option<String>;
     fn current_exe(&self) -> PalResult<PathBuf>;
@@ -617,6 +626,8 @@ pub enum WatcherEvent {
         added: Vec<DeviceInfo>,
         removed: Vec<DeviceInfo>,
         snapshot: Vec<(String, DeviceInfo)>,
+        /// `Some` 時 watcher 只有在 consumer 確認後才提交快照；`false`／丟棄代表下輪重送。
+        ack: Option<crossbeam_channel::Sender<bool>>,
     },
     Tick,
     ScanFailed(PalError),

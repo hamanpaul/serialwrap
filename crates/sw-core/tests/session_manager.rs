@@ -88,6 +88,35 @@ fn rank_assigns_com_by_sorted_by_id_before_watcher_start() {
 }
 
 #[test]
+fn watcher_delta_is_acknowledged_after_manager_applies_snapshot() {
+    let m = ManagerRig::templates_only();
+    m.devices(&["/s/by-id/usb-WATCHER"]);
+    m.mgr.prepare_dynamic_rank(&m.device_keys());
+    let snapshot = m.snapshot();
+    let added = snapshot.iter().map(|(_, info)| info.clone()).collect();
+    let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+
+    m.mgr
+        .watcher_sender()
+        .send(WatcherEvent::Delta {
+            added,
+            removed: Vec::new(),
+            snapshot,
+            ack: Some(ack_tx),
+        })
+        .expect("manager watcher channel 應可接收 Delta");
+
+    assert!(
+        ack_rx.recv_timeout(RPC).expect("manager 應確認已處理的 Delta"),
+        "成功套用的 watcher Delta 應回覆接受"
+    );
+    wait_until("manager 建立熱插裝置的 session", || {
+        m.com_by_id().contains_key("/s/by-id/usb-WATCHER")
+    });
+    assert_eq!(m.com_by_id()["/s/by-id/usb-WATCHER"], "COM0");
+}
+
+#[test]
 fn rebind_drains_before_reopen() {
     // Review Focus 2：同一 by_id 改指到另一實體路徑時，先完整 drain 舊 handle，才 open 新路徑。
     let m = ManagerRig::single_target(SHELL_PROFILE).ready();
@@ -1497,6 +1526,7 @@ fn begin_shutdown_blocks_hotplug_open() {
         }],
         removed: Vec::new(),
         snapshot: snap,
+        ack: None,
     });
     m.mgr.bootstrap_attach();
     let r = m.mgr.route(
@@ -1543,6 +1573,7 @@ fn begin_shutdown_blocks_hotplug_open() {
         }],
         removed: Vec::new(),
         snapshot: m2.snapshot(),
+        ack: None,
     });
     m2.mgr.bootstrap_attach();
     std::thread::sleep(Duration::from_millis(50));
@@ -1565,6 +1596,7 @@ fn shutdown_includes_inflight_attach() {
         }],
         removed: Vec::new(),
         snapshot: m.snapshot(),
+        ack: None,
     });
     wait_until("attach worker 卡在 open", || {
         m.serial.open_attempts(new_real) == 1

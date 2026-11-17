@@ -2379,7 +2379,18 @@ impl Shared {
 
     fn handle_watcher(self: &Arc<Self>, ev: WatcherEvent) {
         match ev {
-            WatcherEvent::Delta { snapshot, .. } => self.update_devices(&snapshot),
+            WatcherEvent::Delta { snapshot, ack, .. } => {
+                let accepted =
+                    catch_unwind(AssertUnwindSafe(|| self.update_devices(&snapshot))).is_ok();
+                if !accepted {
+                    self.warn(
+                        "watcher Delta consumer panic; retaining change for retry".to_string(),
+                    );
+                }
+                if let Some(ack) = ack {
+                    let _ = ack.send(accepted);
+                }
+            }
             // Python `Service._on_watcher_tick`：每輪先非阻塞服務 WAL 延後輪替（OD-19；無新流量時 append 不會發生）。
             // readiness reconcile 屬後續 Slice，不在 2.1 範圍。
             WatcherEvent::Tick => {

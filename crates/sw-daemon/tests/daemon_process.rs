@@ -308,6 +308,30 @@ fn no_profiles_message_and_continue() {
 }
 
 #[test]
+fn serial_backend_env_warning_is_emitted_once() {
+    let env = isolated_env();
+    let mut vars = env.vars.clone();
+    vars.insert(
+        "SERIALWRAP_SERIAL_BACKEND".to_string(),
+        "pyserial".to_string(),
+    );
+    let mut daemon = DaemonProc::spawn_with(&env, &vars, &[]);
+    wait_socket(&env.socket, SHORT);
+
+    let warning =
+        "serialwrapd: SERIALWRAP_SERIAL_BACKEND=pyserial 在 Rust build 無對應後端，改用原生後端";
+    let stderr = daemon.stderr();
+    assert_eq!(
+        stderr.lines().filter(|line| *line == warning).count(),
+        1,
+        "{stderr}"
+    );
+
+    rpc_once(&env.socket, STOP);
+    assert_eq!(daemon.wait(LONG).code(), Some(0), "{}", daemon.stderr());
+}
+
+#[test]
 fn daemon_stop_reply_rejects_new_health_ping() {
     let env = isolated_env();
     let endpoint = env.socket.clone();
@@ -1668,7 +1692,6 @@ fn release_pause_hook_env_isolated_only() {
 }
 
 /// #72（POSIX）：SIGTERM／SIGINT → 有序停機（RPC 停、drain、WAL close、socket 檔移除、exit 0），與 Python `daemon.py:293-301` 相同。
-/// Windows `SetConsoleCtrlHandler`（`windows_console_ctrl_triggers_orderly_stop`）為 LOCAL-WINDOWS-TODO。
 #[cfg(all(test, unix))]
 #[test]
 fn sigterm_sigint_orderly_stop() {
@@ -1699,4 +1722,252 @@ fn sigterm_sigint_orderly_stop() {
         rpc_once(&env.socket, STOP);
         assert_eq!(d2.wait(LONG).code(), Some(0), "{sig}");
     }
+}
+
+/// #72／A-94（Windows）：互動桌面送出 CTRL_C／CTRL_BREAK_EVENT 後走同一套有序停機序。
+///
+/// Python `sw_core/daemon.py:293-301` 只註冊 SIGINT／SIGTERM；Windows Rust PAL 的 console handler
+/// 將 CTRL_C／CTRL_BREAK／CTRL_CLOSE 共用轉為 daemon stop channel（`crates/sw-pal/src/signal/windows.rs:51-59`）。
+/// CTRL_CLOSE 只能由關閉 console 觸發，無法在共用互動桌面中安全合成；本測試以兩種可定向的 control event
+/// 驗證完整 daemon 路徑，並由同一 handler 分支涵蓋 CTRL_CLOSE 的映射。
+#[test]
+#[ignore = "需要 Windows Terminal 互動桌面；由 win-interactive-l1.ps1 執行"]
+#[allow(non_snake_case)] // 依 P3 能力節點規範使用 cap_<resource>__<name> 命名。
+fn cap_interactive_desktop__windows_console_ctrl_triggers_orderly_stop() {
+    if std::env::var_os("SW_S21_WINDOWS_CTRL_CHILD").is_some() {
+        windows_ctrl_child_main();
+    } else {
+        windows_ctrl_parent();
+    }
+}
+
+fn windows_ctrl_child_main() {
+    use sw_daemon::daemon_main::{ENV_TEST_T13_WAL_RECORD, T13_WAL_TEST_PAYLOAD};
+    sw_pal::test_support::enable_ctrl_c().expect("重新啟用子行程的 CTRL_C 接收");
+    let mut env = isolated_env();
+    env.vars.insert(
+        "SERIALWRAP_TEST_DEVICE_ALLOWLIST".to_string(),
+        "COM250".to_string(),
+    );
+    let wal_marker = env.root.join("t13-wal-marker");
+    fs::write(&wal_marker, T13_WAL_TEST_PAYLOAD).expect("寫入隔離 WAL marker");
+    env.vars.insert(
+        ENV_TEST_T13_WAL_RECORD.to_string(),
+        wal_marker.display().to_string(),
+    );
+
+    let trace = Arc::new(Mutex::new(Vec::<TraceEvent>::new()));
+    let trace_for_hook = trace.clone();
+    let ready_endpoint = env.endpoint.clone();
+    let ready_file = PathBuf::from(
+        std::env::var_os("SW_S21_WINDOWS_CTRL_READY_FILE").expect("子行程缺少 ready marker 路徑"),
+    );
+    let hooks = DaemonHooks {
+        trace: Some(Box::new(move |event| {
+            if matches!(event, TraceEvent::EndpointWritten) {
+                fs::write(&ready_file, format!("{ready_endpoint}\n"))
+                    .expect("發布 daemon endpoint ready marker");
+            }
+            trace_for_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(event);
+        })),
+        ..DaemonHooks::default()
+    };
+
+    let platform = in_process_platform(&env.vars, Vec::new(), Fixture::None);
+    platform
+        .signals
+        .install()
+        .expect("註冊 Windows console control handler");
+    let code = run_with_hooks(vec!["serialwrapd".to_string()], platform, hooks);
+    assert_eq!(code, 0, "console control 有序停機應 exit 0");
+    assert!(
+        !endpoint_is_serving(&env.socket),
+        "TCP RPC endpoint 在 stop accept／server stop 後應不再提供服務"
+    );
+
+    const EXPECTED_STEPS: [&str; 12] = [
+        "server.stop_accept",
+        "manager.begin_shutdown",
+        "watcher.stop",
+        "engine.close_intake",
+        "flash.stop",
+        "drain.phase1",
+        "server.join_handlers",
+        "drain.phase2",
+        "flush_shutdown",
+        "engine.stop",
+        "wal.sync_close",
+        "lock.release",
+    ];
+    let events = trace
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let steps = events
+        .iter()
+        .filter_map(TraceEvent::shutdown_step)
+        .collect::<Vec<_>>();
+    assert_eq!(steps, EXPECTED_STEPS, "停機步驟與 POSIX orderly-stop 對齊");
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            TraceEvent::HandlersJoined { pending } if pending.is_empty()
+        )),
+        "RPC handlers 應完成 join"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            TraceEvent::DrainPhase2 { stalled, drained } if stalled.is_empty() && drained.is_empty()
+        )),
+        "空 session 集合應完成 drain"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            TraceEvent::SessionsDrained { flushed, stalled } if flushed.is_empty() && stalled.is_empty()
+        )),
+        "shutdown flush 不應留下未完成 session"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TraceEvent::WalShutdown { ok: true })),
+        "WAL sync／close 應成功"
+    );
+    let last = last_wal_line(&env);
+    assert!(
+        pyjson::loads(&last).is_ok(),
+        "WAL 最後一筆應為完整 JSON：{last}"
+    );
+
+    // 能用同一組 endpoint／lock 再啟動並以 RPC 停止，證明 listener 與 singleton lock 均已釋放。
+    let platform = in_process_platform(&env.vars, Vec::new(), Fixture::None);
+    platform
+        .signals
+        .install()
+        .expect("重啟測試 daemon 時 console handler 保持註冊");
+    let endpoint = env.socket.clone();
+    let client = spawn_stop_guarded_client(endpoint.clone(), move || {
+        wait_socket(&endpoint, LONG);
+        rpc_once(&endpoint, STOP)
+    });
+    let code = run_with_hooks(
+        vec!["serialwrapd".to_string()],
+        platform,
+        DaemonHooks::default(),
+    );
+    let reply = client.join().expect("重啟 daemon stop RPC client");
+    assert_eq!(code, 0, "WAL／lock 已釋放後 daemon 應可重啟");
+    assert!(
+        pyjson::loads(&reply).unwrap_or(PyValue::Null)["ok"] == true,
+        "重啟 daemon 應可經 RPC 正常停止：{reply}"
+    );
+    assert!(
+        !endpoint_is_serving(&env.socket),
+        "第二次停止後 endpoint 也應關閉"
+    );
+}
+
+struct WindowsCtrlChild(std::process::Child);
+
+struct WindowsCtrlReadyFile(PathBuf);
+
+impl Drop for WindowsCtrlReadyFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+impl Drop for WindowsCtrlChild {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+fn windows_ctrl_parent() {
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+    use sw_pal::test_support::{
+        has_interactive_console, send_console_control_event, spawn_console_process_group,
+        ConsoleControlEvent,
+    };
+
+    assert!(
+        has_interactive_console(),
+        "測試必須從 Windows Terminal 互動 console 執行"
+    );
+
+    let run_event = |event: ConsoleControlEvent, name: &str| {
+        let ready_file = std::env::temp_dir().join(format!(
+            "sw21-console-ready-{}-{name}.txt",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&ready_file);
+        let _ready_guard = WindowsCtrlReadyFile(ready_file.clone());
+        let mut command =
+            Command::new(std::env::current_exe().expect("目前 daemon_process 測試執行檔"));
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "cap_interactive_desktop__windows_console_ctrl_triggers_orderly_stop",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("SW_S21_WINDOWS_CTRL_CHILD", "1")
+            .env(
+                "SW_S21_WINDOWS_CTRL_READY_FILE",
+                ready_file.display().to_string(),
+            )
+            .stdin(Stdio::null());
+        let mut child = WindowsCtrlChild(
+            spawn_console_process_group(command).expect("啟動 Windows console-event daemon 子行程"),
+        );
+
+        let deadline = Instant::now() + LONG;
+        let endpoint = loop {
+            if let Ok(value) = fs::read_to_string(&ready_file) {
+                let endpoint = value.trim();
+                if !endpoint.is_empty() {
+                    break PathBuf::from(endpoint);
+                }
+            }
+            if let Some(status) = child.0.try_wait().expect("檢查 daemon 子行程 ready 狀態")
+            {
+                panic!("{name} daemon 子行程在回報 endpoint 前退出：{status}");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{name} daemon 子行程未回報已就緒 endpoint"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        wait_socket(&endpoint, LONG);
+        let group_id = child.0.id();
+        send_console_control_event(group_id, event)
+            .unwrap_or_else(|error| panic!("送 {name} 到 daemon 專屬 process group 失敗：{error}"));
+
+        let deadline = Instant::now() + LONG;
+        let status = loop {
+            if let Some(status) = child.0.try_wait().expect("等待 daemon console stop") {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "daemon 收到 {name} 後未完成有序停機"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(status.code(), Some(0), "{name} 子行程 exit status");
+    };
+
+    run_event(ConsoleControlEvent::CtrlC, "CTRL_C_EVENT");
+    run_event(ConsoleControlEvent::CtrlBreak, "CTRL_BREAK_EVENT");
 }
