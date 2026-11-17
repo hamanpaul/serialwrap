@@ -1226,7 +1226,8 @@ def test_shared_coverage_package_import_merges_same_label_before_contract_judgem
     assert 'python3 scripts/rust/gate_shared_evidence.py record-section --shared-evidence "$RUN_DIR" --section pytest_full' in shared_script
     assert 'python3 scripts/rust/gate_shared_evidence.py record-section --shared-evidence "$RUN_DIR" --section s24_ab' in shared_script
     assert 'tar -czf "$RUN_DIR/work/python-baseline-coverage.tar.gz" -C "$RUN_DIR" coverage' in shared_script
-    assert 'tar -czf "$RUN_DIR/work/s24-coverage.tar.gz" -C "$RUN_DIR" coverage' in shared_script
+    assert 'S24_COVERAGE_TAR="$RUN_DIR/work/s24-coverage.tar.gz"' in shared_script
+    assert 'tar -czf "$S24_COVERAGE_TAR" -C "$RUN_DIR" coverage' in shared_script
     slice24_script = (ROOT / "scripts/rust/slice24_exit.sh").read_text(encoding="utf-8")
     assert 'tar -xzf "$RUN_DIR/shared-import/slice24/python-baseline-coverage.tar.gz"' in slice24_script
     assert 'tar -xzf "$RUN_DIR/shared-import/slice24/coverage.tar.gz"' in slice24_script
@@ -1540,7 +1541,8 @@ def _prior_slice_fixture(tmp_path):
     cli.write_bytes(b"candidate cli")
     daemon.write_bytes(b"candidate daemon")
     daemon_sha = hashlib.sha256(daemon.read_bytes()).hexdigest()
-    prior_daemon_sha = hashlib.sha256(b"prior slice release daemon").hexdigest()
+    prior_daemon_sha = daemon_sha
+    slice23_debug_daemon_sha = hashlib.sha256(b"slice 2.3 debug daemon").hexdigest()
     revision = "a" * 40
     (run / "results-rust-linux.json").write_text(json.dumps({
         "label": "rust-linux", "platform": "linux", "cli_exe": str(cli),
@@ -1573,7 +1575,7 @@ def _prior_slice_fixture(tmp_path):
     (slice23 / "results.json").write_text(json.dumps({
         "git_head": revision,
         "artifacts": {"target/debug/serialwrap": hashlib.sha256(cli.read_bytes()).hexdigest(),
-                      "target/debug/serialwrapd": daemon_sha},
+                      "target/debug/serialwrapd": slice23_debug_daemon_sha},
         "prior_slice_artifacts": {"serialwrapd_release": prior_daemon_sha},
     }), encoding="utf-8")
     (slice23 / "coverage.json").write_text(json.dumps({
@@ -1588,7 +1590,7 @@ def _prior_slice_fixture(tmp_path):
         "cc": cc, "contracts": contracts, "cases": cases, "cases_lock": cases_lock,
         "map_file": map_file, "run": run, "slice21": slice21, "slice22": slice22,
         "slice23": slice23, "revision": revision, "daemon_sha": daemon_sha,
-        "prior_daemon_sha": prior_daemon_sha,
+        "prior_daemon_sha": prior_daemon_sha, "slice23_debug_daemon_sha": slice23_debug_daemon_sha,
         "ids": [f"case:{case_id}" for values in ids_by_slice.values() for case_id in values],
     }
 
@@ -1652,7 +1654,8 @@ def test_prior_slice_universe_lists_seventy_two_unmapped_cases():
 def test_prior_slice_gate_verdicts_import_pass_fail_and_missing(tmp_path):
     """OD-88：三個先前 gate 有逐案證據才沿用 PASS／FAIL；缺列或 GAP 維持 EVIDENCE_MISSING。"""
     fixture = _prior_slice_fixture(tmp_path)
-    assert fixture["daemon_sha"] != fixture["prior_daemon_sha"]
+    assert fixture["daemon_sha"] == fixture["prior_daemon_sha"]
+    assert fixture["slice23_debug_daemon_sha"] != fixture["daemon_sha"]
     output_path = tmp_path / "coverage.json"
     result = _run(*_prior_slice_command(fixture, output_path, fixture["ids"]))
     assert result.returncode == 1, result.stdout + result.stderr
@@ -1667,7 +1670,11 @@ def test_prior_slice_gate_verdicts_import_pass_fail_and_missing(tmp_path):
     assert report["prior_sources"]["2.2"]["accepted"] is True
     assert report["prior_sources"]["2.3"]["accepted"] is True
     assert report["prior_sources"]["2.3"]["daemon_sha256"] == fixture["daemon_sha"]
-    assert report["prior_sources"]["2.3"]["daemon_sha256"] != fixture["prior_daemon_sha"]
+    assert report["prior_sources"]["2.3"]["release_daemon_sha256"] == fixture["daemon_sha"]
+    assert report["prior_sources"]["2.3"]["daemon_sha256"] != fixture["slice23_debug_daemon_sha"]
+    rendered = fixture["cc"].render_gate_report(report, [], {"run_id": "prior-slice-fixture"})
+    assert "2.3 的黑箱使用 debug daemon" in rendered
+    assert "2.4 的候選是 release bundle" in rendered
     assert report["prior_sources"]["2.1"]["evidence_sha256"]["report.json"] == hashlib.sha256(
         (fixture["slice21"] / "report.json").read_bytes()
     ).hexdigest()
@@ -1748,7 +1755,7 @@ def test_prior_slice_identity_mismatch_is_reported_and_rejected(tmp_path, mismat
         if mismatch.endswith("revision"):
             report["git_head"] = "b" * 40
         else:
-            report["artifacts"]["target/debug/serialwrapd"] = "0" * 64
+            report["prior_slice_artifacts"]["serialwrapd_release"] = "0" * 64
         report_path.write_text(json.dumps(report), encoding="utf-8")
         selected = ["case:s23-pass"]
 

@@ -20,7 +20,9 @@ scripts/rust/gate_shared.sh --out target/s2-shared-evidence --run-id <run-id> [-
 
 - 全套 Python 測試使用 `s21_gate:pytest_full` 與 `p7_gate:python3-m-pytest-q-tests` 的相同 Linux selector：`-q tests/`，並排除 `tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native` 和 `tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence`。同一份 L1、JUnit 與 coverage 輸入對應各 gate。
 - Slice 2.1／2.2 的 filtered Cargo L1 使用 `--workspace --features test-fakes -- --skip cap_`；P7 的 Cargo L1 使用 `--workspace --features test-fakes`。因鎖定 selector 不同，manifest 分成兩段，不能互相代用。
-- Slice 2.4 的一般 Cargo 測試 `cargo test --workspace`、test-fakes Cargo L1、逐案 contract Cargo 結果，以及 Rust contract blackbox A/B 各自記錄 argv 與輸出。
+- Slice 2.4 的一般 Cargo 測試 `cargo test --workspace`、test-fakes Cargo L1、逐案 contract Cargo 結果，以及 Rust contract blackbox A/B 各自記錄 argv 與輸出。逐案 Cargo 結果雖執行 test-fakes 測試 binary，其 `rust-linux` 受測身分蓋章與 S24 黑箱相同，使用同 HEAD 候選 bundle 版本目錄內的 `bin/serialwrap{,d}`，不得使用 debug artifact；兩層 SHA256 不一致時仍判身分錯誤。
+- S24 A/B 執行前後各重新核對候選 bundle。任一檢查失敗時 `s24_ab` 明確記為 `EVIDENCE_MISSING`，不把測試結果當有效證據，並繼續處理 Windows L1 匯入；Windows 匯入結果仍依各自的 HEAD、乾淨狀態、selector 與 `l1_judge` 判定。
+- Slice 2.3 的黑箱使用 debug daemon；Slice 2.4 候選是 release bundle。跨切片身分以 P7 結果的 `prior_slice_artifacts.serialwrapd_release` 對照 2.4 的 `--expect-daemon-sha256`；若 release SHA 不符仍拒收，不能以 2.3 `artifacts.serialwrapd` 的 debug SHA 代替。
 - P7 的 A/B 由 `run_p7_ab.sh --od59-contract` 產生；資料目錄與報告一併匯入。
 - Windows L1 由編排者另行提供，不由共用 driver 建置或啟動 Windows runner。輸入目錄每個集合使用 `<dir>/<required-set>/l1-results.json`，例如 `<dir>/s21_core/l1-results.json`。匯入會要求 `l1-results.v1`、Windows 平台、Windows Cargo build target、候選 HEAD 起訖一致且乾淨，並逐字核對該集合的 Windows selector；再用唯一的 `tests/acceptance/l1_judge.py` 核對凍結 nodeid 集合、執行結果與 skip。必要列缺失或被 skip 時是 `EVIDENCE_MISSING`，測試失敗保留 `FAIL`。`s21_core` 可供 slice 2.1 與 P7 non-COM 共用；能力集合及 COM 集合各自依鎖檔保留獨立 selector。交叉編譯收集清單不能取代這些輸入。
 - 目前 `s22_gate:win_test` 尚未登記於 `l1_required.lock.json`，沒有可核對的 Windows selector；該必要段維持 `EVIDENCE_MISSING`，`--windows-dir` 不能補成共用證據。待原生 collection 的 selector 依鎖檔程序登記後，才能納入共用 manifest。

@@ -161,7 +161,8 @@ CARGO_RESULTS_DIR="$RUN_DIR/work/s24-cargo-results"
 mkdir -p "$CARGO_RESULTS_DIR"
 CARGO_RESULTS_ARGV=(--include-cap posix_pty --include-cap process_rpc --workspace --features test-fakes)
 run_capture "$LOG_DIR/cargo-contract-results.log" env \
-  SERIALWRAP_CLI_EXE="$RUN_DIR/artifacts/debug/serialwrap" SERIALWRAP_DAEMON_EXE="$RUN_DIR/artifacts/debug/serialwrapd" \
+  SERIALWRAP_CLI_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrap" \
+  SERIALWRAP_DAEMON_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrapd" \
   python3 scripts/rust/import_cargo_results.py --label rust-linux --platform linux \
   --out-dir "$CARGO_RESULTS_DIR" --include-cap posix_pty --include-cap process_rpc \
   -- --workspace --features test-fakes
@@ -189,18 +190,82 @@ S24_TARGETS=(tests/contract_blackbox tests/acceptance/l15/test_slice21_l15.py \
   tests/acceptance/l15/test_slice23_l15.py tests/test_multiagent_e2e.py \
   tests/test_human_agent_coexist.py tests/test_rust_contract_coverage.py tests/test_transfer_golden_fresh.py)
 S24_DATA="$RUN_DIR/work/s24-ab"
+S24_COVERAGE_TAR="$RUN_DIR/work/s24-coverage.tar.gz"
+S24_ARGV_JSON="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' -q "${S24_TARGETS[@]}")"
 mkdir -p "$S24_DATA"
-run_capture "$LOG_DIR/s24-ab.log" env \
-  SERIALWRAP_CLI_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrap" \
-  SERIALWRAP_DAEMON_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrapd" \
-  SW_BUNDLE="$S24_BUNDLE" SERIALWRAP_AB_LABEL=rust-linux \
-  SERIALWRAP_COVERAGE_RUN_DIR="$RUN_DIR/coverage" SERIALWRAP_COVERAGE_LABEL=rust-linux \
-  python3 -m pytest -q "${S24_TARGETS[@]}" --junitxml="$S24_DATA/junit.xml"
-tar -czf "$RUN_DIR/work/s24-coverage.tar.gz" -C "$RUN_DIR" coverage
-python3 scripts/rust/gate_shared_evidence.py record-section --shared-evidence "$RUN_DIR" --section s24_ab \
-  --argv-json "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' -q "${S24_TARGETS[@]}")" \
-  --exit-code "$LAST_RC" --file slice24/coverage.tar.gz="$RUN_DIR/work/s24-coverage.tar.gz" \
-  --file logs/s24-ab.log="$LOG_DIR/s24-ab.log" --file slice24/s24-ab/junit.xml="$S24_DATA/junit.xml"
+
+check_s24_candidate_bundle() {
+  local point="$1"
+  local log="$LOG_DIR/s24-bundle-check-$point.log"
+  if python3 scripts/rust/gate_shared_evidence.py check-candidate-bundle \
+      --shared-evidence "$RUN_DIR" --candidate-bundle "$S24_BUNDLE" 2>&1 | tee "$log"; then
+    return 0
+  else
+    local rc=$?
+    printf 'EVIDENCE_MISSING: s24_ab 候選 bundle %s 檢查失敗（exit=%s）；不採用該段結果。\n' "$point" "$rc" \
+      | tee -a "$LOG_DIR/s24-ab.log" >&2
+    return "$rc"
+  fi
+}
+
+record_s24_missing() {
+  local reason="$1"
+  local exit_code="$2"
+  local files=()
+  [[ -f "$LOG_DIR/s24-ab.log" ]] && files+=(--file "logs/s24-ab.log=$LOG_DIR/s24-ab.log")
+  [[ -f "$LOG_DIR/s24-bundle-check-before.log" ]] && files+=(--file "logs/s24-bundle-check-before.log=$LOG_DIR/s24-bundle-check-before.log")
+  [[ -f "$LOG_DIR/s24-bundle-check-after.log" ]] && files+=(--file "logs/s24-bundle-check-after.log=$LOG_DIR/s24-bundle-check-after.log")
+  [[ -f "$S24_COVERAGE_TAR" ]] && files+=(--file "slice24/coverage.tar.gz=$S24_COVERAGE_TAR")
+  [[ -f "$S24_DATA/junit.xml" ]] && files+=(--file "slice24/s24-ab/junit.xml=$S24_DATA/junit.xml")
+  if python3 scripts/rust/gate_shared_evidence.py record-missing-section \
+      --shared-evidence "$RUN_DIR" --section s24_ab --argv-json "$S24_ARGV_JSON" \
+      --exit-code "$exit_code" --reason "$reason" "${files[@]}" 2>&1 \
+      | tee "$LOG_DIR/s24-ab-record-missing.log"; then
+    return 0
+  else
+    local rc=$?
+    echo "無法將 s24_ab 的 EVIDENCE_MISSING 寫入 manifest（exit=$rc）。" >&2
+    return "$rc"
+  fi
+}
+
+S24_RC=3
+if check_s24_candidate_bundle before; then
+  run_capture "$LOG_DIR/s24-ab.log" env \
+    SERIALWRAP_CLI_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrap" \
+    SERIALWRAP_DAEMON_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrapd" \
+    SW_BUNDLE="$S24_BUNDLE" SERIALWRAP_AB_LABEL=rust-linux \
+    SERIALWRAP_COVERAGE_RUN_DIR="$RUN_DIR/coverage" SERIALWRAP_COVERAGE_LABEL=rust-linux \
+    python3 -m pytest -q "${S24_TARGETS[@]}" --junitxml="$S24_DATA/junit.xml"
+  S24_RC="$LAST_RC"
+  tar -czf "$S24_COVERAGE_TAR" -C "$RUN_DIR" coverage
+  if check_s24_candidate_bundle after; then
+    if python3 scripts/rust/gate_shared_evidence.py record-section --shared-evidence "$RUN_DIR" --section s24_ab \
+        --argv-json "$S24_ARGV_JSON" --exit-code "$S24_RC" \
+        --file slice24/coverage.tar.gz="$S24_COVERAGE_TAR" \
+        --file logs/s24-ab.log="$LOG_DIR/s24-ab.log" \
+        --file slice24/s24-ab/junit.xml="$S24_DATA/junit.xml" 2>&1 \
+        | tee "$LOG_DIR/s24-ab-record.log"; then
+      :
+    else
+      RECORD_RC=$?
+      FAILURES=1
+      if ! record_s24_missing "s24_ab section 記錄失敗（exit=$RECORD_RC）；結果不可驗證" "$S24_RC"; then
+        FAILURES=1
+      fi
+    fi
+  else
+    FAILURES=1
+    if ! record_s24_missing "s24_ab 後置候選 bundle 檢查失敗；結果記為 EVIDENCE_MISSING" "$S24_RC"; then
+      FAILURES=1
+    fi
+  fi
+else
+  FAILURES=1
+  if ! record_s24_missing "s24_ab 前置候選 bundle 檢查失敗；測試未執行，結果記為 EVIDENCE_MISSING" "$S24_RC"; then
+    FAILURES=1
+  fi
+fi
 
 if [[ -n "$WINDOWS_L1" ]]; then
   [[ -d "$WINDOWS_L1" ]] || { echo "EVIDENCE_MISSING: Windows L1 目錄不存在：$WINDOWS_L1" >&2; exit 3; }

@@ -436,6 +436,20 @@ def validate_section(shared_dir: Path, *, gate: str, section: str, required_set:
     if not isinstance(row, Mapping):
         reasons.append(f"共用 section 缺失：{section}")
         return {"status": "EVIDENCE_MISSING", "reasons": reasons}
+    evidence_status = row.get("evidence_status")
+    if evidence_status is not None:
+        if evidence_status != "EVIDENCE_MISSING":
+            reasons.append(f"共用 section evidence_status 無效：{evidence_status!r}")
+        else:
+            evidence_reasons = row.get("evidence_reasons")
+            valid_reasons = (
+                [reason for reason in evidence_reasons if isinstance(reason, str) and reason]
+                if isinstance(evidence_reasons, list) else []
+            )
+            reasons.extend(valid_reasons)
+            if not valid_reasons:
+                reasons.append("共用 section 已記為 EVIDENCE_MISSING")
+        return {"status": "EVIDENCE_MISSING", "reasons": list(dict.fromkeys(reasons))}
 
     recorded_argv = row.get("argv")
     if required_set:
@@ -686,6 +700,55 @@ def record_section(shared_dir: Path, *, name: str, argv: Sequence[str], exit_cod
     return row
 
 
+def record_missing_section(shared_dir: Path, *, name: str, argv: Sequence[str], exit_code: int,
+                           files: Mapping[str, Path], reasons: Sequence[str]) -> dict[str, Any]:
+    """記錄因候選身分檢查失敗而不可用的 S24 共用段；只允許 fail-closed 狀態。"""
+    if name != "s24_ab":
+        raise ValueError("record-missing-section 僅供 s24_ab 使用")
+    if not reasons or any(not isinstance(reason, str) or not reason for reason in reasons):
+        raise ValueError("EVIDENCE_MISSING 必須附具體原因")
+    shared_dir = Path(shared_dir).resolve(strict=True)
+    manifest, errors = _load_manifest(shared_dir)
+    if manifest is None:
+        raise ValueError("無法載入共用 manifest：" + "; ".join(errors))
+    sections = manifest.get("sections")
+    if not isinstance(sections, dict):
+        raise ValueError("manifest.sections 格式錯誤")
+
+    destination = shared_dir / "sections" / name
+    destination.mkdir(parents=True, exist_ok=True)
+    file_rows: dict[str, dict[str, str]] = {}
+    for role, raw_path in files.items():
+        rel_role = _safe_role(str(role))
+        if rel_role is None:
+            raise ValueError(f"evidence role 路徑不安全：{role}")
+        source = Path(raw_path).resolve()
+        if not source.is_file():
+            continue
+        target = destination / rel_role
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source != target.resolve():
+            shutil.copy2(source, target)
+        digest = sha256_file(target)
+        assert digest is not None
+        file_rows[str(role)] = {"path": target.relative_to(shared_dir).as_posix(), "sha256": digest}
+
+    row = {
+        "argv": [str(item) for item in argv],
+        "exit_code": int(exit_code),
+        "files": file_rows,
+        "evidence_status": "EVIDENCE_MISSING",
+        "evidence_reasons": list(dict.fromkeys(reasons)),
+    }
+    sections[name] = row
+    provenance = manifest.get("provenance")
+    if isinstance(provenance, dict):
+        provenance["worktree_clean"] = (provenance.get("worktree_clean") is True and is_worktree_clean()
+                                         and get_current_head() == provenance.get("git_head"))
+    _write_manifest(shared_dir, manifest)
+    return row
+
+
 def record_windows_l1(shared_dir: Path, *, source_root: Path, required_set: str,
                       current_head: str | None = None, worktree_clean: bool | None = None,
                       lock_path: Path = DEFAULT_LOCK) -> dict[str, Any]:
@@ -837,6 +900,22 @@ def _cli_record(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cli_record_missing(args: argparse.Namespace) -> int:
+    try:
+        command_argv = json.loads(args.argv_json)
+    except ValueError as exc:
+        raise ValueError(f"argv-json 非有效 JSON：{exc}") from exc
+    if not isinstance(command_argv, list) or not all(isinstance(item, str) for item in command_argv):
+        raise ValueError("argv-json 須為字串陣列")
+    row = record_missing_section(
+        args.shared_evidence, name=args.section, argv=command_argv, exit_code=args.exit_code,
+        files=_parse_files(args.file), reasons=args.reason,
+    )
+    print(json.dumps({"status": row["evidence_status"], "reasons": row["evidence_reasons"]},
+                     ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 def _cli_record_windows(args: argparse.Namespace) -> int:
     result = record_windows_l1(args.shared_evidence, source_root=args.windows_l1,
                                required_set=args.required_set, lock_path=args.lock)
@@ -885,6 +964,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     rec.add_argument("--platform", default="linux", choices=("linux", "windows"))
     rec.add_argument("--lock", type=Path, default=DEFAULT_LOCK)
     rec.set_defaults(func=_cli_record)
+    rec_missing = sub.add_parser("record-missing-section", help="明確記錄 S24 section 的 EVIDENCE_MISSING 狀態")
+    rec_missing.add_argument("--shared-evidence", type=Path, required=True)
+    rec_missing.add_argument("--section", required=True, choices=("s24_ab",))
+    rec_missing.add_argument("--argv-json", required=True)
+    rec_missing.add_argument("--exit-code", required=True, type=int)
+    rec_missing.add_argument("--reason", action="append", required=True)
+    rec_missing.add_argument("--file", action="append", default=[], help="evidence file role=path；role 可包含子目錄")
+    rec_missing.set_defaults(func=_cli_record_missing)
     rec_win = sub.add_parser("record-windows-l1", help="匯入並驗證編排者提供的 Windows 原生 L1")
     rec_win.add_argument("--shared-evidence", type=Path, required=True)
     rec_win.add_argument("--windows-l1", type=Path, required=True,

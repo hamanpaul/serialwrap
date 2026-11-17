@@ -835,11 +835,15 @@ def load_prior_case_verdicts(
         reference_daemon_sha256 = prior_artifacts.get("serialwrapd_release")
         if slice23_results is not None:
             slice23_daemon_sha256, slice23_artifact_problem = recorded_artifact_sha256(slice23_results, "serialwrapd")
+            if slice23_artifact_problem is None and (
+                not isinstance(slice23_daemon_sha256, str) or not _SHA256.fullmatch(slice23_daemon_sha256)
+            ):
+                slice23_artifact_problem = "slice 2.3 results.json 的 debug daemon SHA256 格式無效"
         else:
             slice23_artifact_problem = "slice 2.3 run 缺 results.json"
         reference_problem = _prior_identity_problem(
-            "slice 2.3 gate results.json", reference_revision, reference_daemon_sha256,
-            expected_git_revision, reference_daemon_sha256 if isinstance(reference_daemon_sha256, str) else None,
+            "slice 2.3 release daemon", reference_revision, reference_daemon_sha256,
+            expected_git_revision, expected_daemon_sha256,
         )
         if reference_problem and ("格式無效" in reference_problem or "不符" in reference_problem):
             identity_errors.append(reference_problem)
@@ -922,7 +926,7 @@ def load_prior_case_verdicts(
         accept_source(
             "2.3", "slice 2.3 gate", run,
             results.get("git_head") if results else None,
-            slice23_daemon_sha256, rows,
+            reference_daemon_sha256, rows,
             reference_revision=expected_git_revision,
             reference_daemon_sha256=expected_daemon_sha256,
             evidence_paths=(run / "results.json", run / "coverage.json"),
@@ -1924,6 +1928,10 @@ def render_gate_report(report: Mapping[str, Any], cases: Sequence[Mapping[str, A
         f"- run：`{run_id}`",
         f"- 產生時間：`{run_info.get('finished_at', '未指定')}`",
         "- 覆蓋判定：PASS 只代表本報告列出的對應 nodeid、平台及身分檢查全數成立。",
+        "",
+        "## 先前切片來源與候選身分",
+        "",
+        "- 2.3 的黑箱使用 debug daemon 執行；2.4 的候選是 release bundle。2.3 身分以 `prior_slice_artifacts.serialwrapd_release` 為準，且必須等於本輪 `--expect-daemon-sha256`；不以 2.3 `artifacts.serialwrapd` 的 debug SHA 作為候選身分。",
         "",
         "## 凍結案例",
         "",
