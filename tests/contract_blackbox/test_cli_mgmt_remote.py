@@ -71,7 +71,7 @@ def _proc_status(pid: int) -> tuple[int, str] | None:
 
 
 def test_remote_ab_status_close_empty(tmp_path: Path) -> None:
-    results: dict[str, tuple[int, str, int, str]] = {}
+    results: dict[str, tuple[int, str, int, str, int, str]] = {}
     for label, prefix in (("python", python_baseline_prefix()), ("cli", cli_prefix())):
         work = tmp_path / label
         work.mkdir()
@@ -82,12 +82,19 @@ def test_remote_ab_status_close_empty(tmp_path: Path) -> None:
         close = subprocess.run(
             prefix + ["remote", "close"], env=env, capture_output=True, text=True, timeout=60
         )
-        results[label] = (status.returncode, status.stdout, close.returncode, close.stdout)
+        stop = subprocess.run(
+            prefix + ["remote", "stop"], env=env, capture_output=True, text=True, timeout=60
+        )
+        results[label] = (
+            status.returncode, status.stdout, close.returncode, close.stdout, stop.returncode, stop.stdout
+        )
 
     assert results["cli"] == results["python"]
     assert results["cli"] == (
         0,
         '{"ok":true,"tunnels":[]}\n',
+        0,
+        '{"closed":[],"ok":true}\n',
         0,
         '{"closed":[],"ok":true}\n',
     )

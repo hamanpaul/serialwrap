@@ -262,6 +262,8 @@ def _submit_after_on_demand_autostart(env: dict[str, str], wire: str, tx_baselin
     )
 
 
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
 def test_daemon_start_ab_conflict(tmp_path: Path, env: dict[str, str], no_delegation: Path) -> None:
     """SC-17／SC-10：同機已有 serialwrapd 綁在其他 socket → 兩實作以相同 stdout 與 rc 2 拒絕再 spawn。"""
     other = _spawn_fake_serialwrapd("/tmp/other")

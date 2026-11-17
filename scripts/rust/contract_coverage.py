@@ -221,18 +221,63 @@ def _case_nodes(case: Mapping[str, Any]) -> list[str]:
 def _mapping_entries(value: Mapping[str, Any]) -> dict[str, Any]:
     entries = value.get("entries", value.get("coverage_map", {}))
     if entries is None:
-        return {}
+        entries = {}
     if not isinstance(entries, dict):
         raise ValueError("coverage_map.yaml 的 entries 必須是 mapping")
-    return {str(key): row for key, row in entries.items()}
+    output = {str(key): row for key, row in entries.items()}
+
+    ab_nodes = value.get("od99_ab_nodeids", {})
+    if ab_nodes is not None and not isinstance(ab_nodes, dict):
+        raise ValueError("coverage_map.yaml 的 od99_ab_nodeids 必須是 mapping")
+    for contract_id, raw in (ab_nodes or {}).items():
+        if not isinstance(raw, dict):
+            raise ValueError(f"OD-99 A/B 對應必須是 mapping：{contract_id}")
+        row = dict(output.get(contract_id, {}))
+        overlay = dict(raw)
+        row["nodeids"] = list(dict.fromkeys([*_nodeids(row.get("nodeids")), *_nodeids(overlay.get("nodeids"))]))
+        exclusions = dict(row.get("exclude_nodeids") or {})
+        for platform, nodeids in (overlay.get("exclude_nodeids") or {}).items():
+            exclusions[platform] = list(dict.fromkeys([*_nodeids(exclusions.get(platform)), *_nodeids(nodeids)]))
+        if exclusions:
+            row["exclude_nodeids"] = exclusions
+        output[contract_id] = row
+
+    platform_exclusions = value.get("platform_exclusions", {})
+    if platform_exclusions is not None and not isinstance(platform_exclusions, dict):
+        raise ValueError("coverage_map.yaml 的 platform_exclusions 必須是 mapping")
+    for contract_id, exclusions in (platform_exclusions or {}).items():
+        if not isinstance(exclusions, dict):
+            raise ValueError(f"platform_exclusions 必須是平台至 nodeid 清單的 mapping：{contract_id}")
+        row = dict(output.get(contract_id, {}))
+        combined = dict(row.get("exclude_nodeids") or {})
+        for platform, nodeids in exclusions.items():
+            combined[platform] = list(dict.fromkeys([*_nodeids(combined.get(platform)), *_nodeids(nodeids)]))
+        row["exclude_nodeids"] = combined
+        output[contract_id] = row
+    return output
 
 
 def _map_row(value: object) -> dict[str, Any]:
     if isinstance(value, list):
-        return {"nodeids": _nodeids(value)}
+        return {"nodeids": _nodeids(value), "python_nodeids": [], "exclude_nodeids": {}}
     if isinstance(value, dict):
         row = dict(value)
         row["nodeids"] = _nodeids(row.get("nodeids"))
+        row["python_nodeids"] = _nodeids(row.get("python_nodeids"))
+        raw_exclusions = row.get("exclude_nodeids", {})
+        if not isinstance(raw_exclusions, dict):
+            raise ValueError("coverage_map exclude_nodeids 必須是 platform → nodeid 清單的 mapping")
+        exclusions: dict[str, list[str]] = {}
+        for platform, raw_nodeids in raw_exclusions.items():
+            if platform not in {"linux", "windows"}:
+                raise ValueError(f"exclude_nodeids 不支援的平台：{platform}")
+            if not isinstance(raw_nodeids, list) or any(not isinstance(nodeid, str) or not nodeid.strip() for nodeid in raw_nodeids):
+                raise ValueError(f"exclude_nodeids.{platform} 必須是非空 nodeid 字串清單")
+            nodeids = list(dict.fromkeys(nodeid.strip() for nodeid in raw_nodeids))
+            if any(nodeid.startswith(_CARGO_PREFIX) for nodeid in nodeids):
+                raise ValueError(f"exclude_nodeids.{platform} 不得排除 Rust Cargo nodeid")
+            exclusions[platform] = nodeids
+        row["exclude_nodeids"] = exclusions
         return row
     raise ValueError("coverage_map 每個 ID 必須是 nodeid 清單或 mapping")
 
@@ -463,6 +508,7 @@ def universe(contracts_dir: Path, cases: Path, lock: Path, cmap: Path) -> dict[s
             status=layer,
         )
 
+    map_flags: dict[str, dict[str, bool]] = {}
     for contract_id, raw_entry in map_entries.items():
         row = _map_row(raw_entry)
         current = output.get(contract_id)
@@ -474,6 +520,7 @@ def universe(contracts_dir: Path, cases: Path, lock: Path, cmap: Path) -> dict[s
                 "platforms": ["linux", "windows"],
                 "nodeids": [],
                 "python_nodeids": [],
+                "exclude_nodeids": {},
                 "rust_only": False,
                 "l1_only": False,
                 "blocked_caps": [],
@@ -483,13 +530,22 @@ def universe(contracts_dir: Path, cases: Path, lock: Path, cmap: Path) -> dict[s
             }
             output[contract_id] = current
         current["nodeids"] = list(dict.fromkeys([*current["nodeids"], *row.get("nodeids", [])]))
+        current["python_nodeids"] = list(dict.fromkeys([*current["python_nodeids"], *row.get("python_nodeids", [])]))
+        exclusions = current.setdefault("exclude_nodeids", {})
+        for platform, nodeids in row.get("exclude_nodeids", {}).items():
+            exclusions[platform] = list(dict.fromkeys([*exclusions.get(platform, []), *nodeids]))
         if isinstance(row.get("owner_phase"), str) and row["owner_phase"].strip():
             current["owner_phase"] = row["owner_phase"].strip()
         if isinstance(row.get("platforms"), list) and row["platforms"]:
             current["platforms"] = list(dict.fromkeys(str(value) for value in row["platforms"]))
         for key in ("rust_only", "l1_only"):
             if key in row:
-                current[key] = row[key] is True
+                if not isinstance(row[key], bool):
+                    raise ValueError(f"coverage_map {key} 必須為 boolean：{contract_id}")
+                map_flags.setdefault(contract_id, {})[key] = row[key]
+                if key == "rust_only" and current[key] and row[key] is False:
+                    raise ValueError(f"coverage_map 不得清除案例來源的 rust_only：{contract_id}")
+                current[key] = row[key]
         if isinstance(row.get("blocked_caps"), list):
             current["blocked_caps"] = list(dict.fromkeys([*current["blocked_caps"], *row["blocked_caps"]]))
         if isinstance(row.get("blocked_reason"), str):
@@ -498,6 +554,76 @@ def universe(contracts_dir: Path, cases: Path, lock: Path, cmap: Path) -> dict[s
         # 表示尚未交付映射，不能用從相鄰案例推導出的 nodeid 代替。
         if current["kind"] != "case" and "nodeids" in row and not row["nodeids"]:
             current["nodeids"] = []
+
+    l1_approvals = map_doc.get("l1_only_approvals", {})
+    legacy_l1 = map_doc.get("legacy_l1_only_approvals", {})
+    legacy_rust = map_doc.get("legacy_rust_only_approvals", {})
+    for name, approval_map in (
+        ("l1_only_approvals", l1_approvals),
+        ("legacy_l1_only_approvals", legacy_l1),
+        ("legacy_rust_only_approvals", legacy_rust),
+    ):
+        if not isinstance(approval_map, dict):
+            raise ValueError(f"coverage_map.yaml 的 {name} 必須是 mapping")
+        for contract_id, approval in approval_map.items():
+            if name == "l1_only_approvals":
+                reason = approval.get("reason") if isinstance(approval, dict) else None
+                if not isinstance(approval, dict) or approval.get("l1_only") is not True:
+                    raise ValueError(f"coverage_map {name} 每個 ID 必須明列 l1_only: true：{contract_id}")
+            else:
+                reason = approval
+            if (
+                not isinstance(contract_id, str) or not isinstance(reason, str) or not reason.strip()
+                or "\n" in reason or "\r" in reason
+            ):
+                raise ValueError(f"coverage_map {name} 必須逐 ID 附非空單行理由：{contract_id}")
+            if contract_id not in output:
+                raise ValueError(f"coverage_map {name} 列出 universe 外 ID：{contract_id}")
+
+    for contract_id, approval in l1_approvals.items():
+        reason = approval["reason"]
+        current = output[contract_id]
+        if current["kind"] not in {"bc", "schema", "case"} or _is_owner_blocked(current):
+            raise ValueError(f"OD-99 l1_only 只允許非擁有者阻擋的 BC/schema/case：{contract_id}")
+        if map_flags.get(contract_id, {}).get("l1_only") is False:
+            raise ValueError(f"coverage_map 不得取消 OD-99 l1_only：{contract_id}")
+        if not current["nodeids"] or any(not nodeid.startswith(_CARGO_PREFIX) for nodeid in current["nodeids"]):
+            raise ValueError(f"OD-99 l1_only 必須保留 Rust Cargo 節點：{contract_id}")
+        if current["python_nodeids"] or any(not nodeid.startswith(_CARGO_PREFIX) for nodeid in current["nodeids"]):
+            raise ValueError(f"OD-99 l1_only 不得掩蓋既有 Python 黑箱節點：{contract_id}")
+        current["l1_only"] = True
+        current["l1_only_reason"] = reason
+
+    for contract_id, reason in legacy_l1.items():
+        current = output[contract_id]
+        if map_flags.get(contract_id, {}).get("l1_only") is not True:
+            raise ValueError(f"legacy l1_only 未在 entries 明確標記：{contract_id}")
+        current["l1_only_reason"] = reason
+    for contract_id, reason in legacy_rust.items():
+        current = output[contract_id]
+        if map_flags.get(contract_id, {}).get("rust_only") is not True:
+            raise ValueError(f"legacy rust_only 未在 entries 明確標記：{contract_id}")
+        current["rust_only_reason"] = reason
+
+    approved_l1 = set(l1_approvals) | set(legacy_l1)
+    for contract_id, item in output.items():
+        if item.get("l1_only") and contract_id not in approved_l1:
+            raise ValueError(f"未經 OD-99 或既有明列裁決的 l1_only：{contract_id}")
+        if map_flags.get(contract_id, {}).get("l1_only") is True and contract_id not in approved_l1:
+            raise ValueError(f"未經 OD-99 或既有明列裁決的 l1_only：{contract_id}")
+        natural_rust_only = (
+            contract_id.startswith("case:")
+            and cases_by_id.get(contract_id.removeprefix("case:"), {}).get("suite") == "rust-l1"
+        )
+        if item.get("rust_only") and not natural_rust_only and contract_id not in legacy_rust:
+            raise ValueError(f"未經既有案例歸屬或明列裁決的 rust_only：{contract_id}")
+        for platform, excluded in item.get("exclude_nodeids", {}).items():
+            if platform not in item.get("platforms", []):
+                raise ValueError(f"exclude_nodeids 指向未宣告的平台 {platform}：{contract_id}")
+            referenced = set(item["nodeids"]) | set(item["python_nodeids"])
+            unreferenced = sorted(set(excluded) - referenced)
+            if unreferenced:
+                raise ValueError(f"exclude_nodeids 只能排除此 ID 的明列節點：{contract_id}: {unreferenced}")
 
     unextracted = set(output) - extracted_ids
     if unextracted:
@@ -1219,14 +1345,19 @@ def evaluate(
             continue
 
         declared = item.get("parametrized") or {}
-        _rust_l1_nodes, blackbox_nodes = _split_nodeids(nodeids)
-        python_nodes = [nodeid for nodeid in item.get("python_nodeids", []) if isinstance(nodeid, str) and nodeid.strip()]
         needs_ab = not item.get("rust_only") and not item.get("l1_only")
         failures: list[str] = []
         missing_reasons: list[str] = []
         passed_all = True
         for platform in item.get("platforms", ["linux"]):
             platform = str(platform)
+            excluded = set(item.get("exclude_nodeids", {}).get(platform, []))
+            platform_nodeids = [nodeid for nodeid in nodeids if nodeid not in excluded]
+            _rust_l1_nodes, blackbox_nodes = _split_nodeids(platform_nodeids)
+            python_nodes = [
+                nodeid for nodeid in item.get("python_nodeids", [])
+                if isinstance(nodeid, str) and nodeid.strip() and nodeid not in excluded
+            ]
             rust_doc = _label_for(results, "rust", platform)
             if rust_doc is None:
                 if platform == "windows":
@@ -1245,7 +1376,7 @@ def evaluate(
 
             # Rust 側：Cargo L1 與雙邊黑箱節點都要在 rust-<platform> 逐項成立。
             rust_required: list[str] = []
-            for nodeid in nodeids:
+            for nodeid in platform_nodeids:
                 expanded, error = _expand_nodeid(nodeid, [rust_doc], declared)
                 if error:
                     missing_reasons.append(error)

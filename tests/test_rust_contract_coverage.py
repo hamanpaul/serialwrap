@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -911,6 +913,59 @@ def _rust_python_docs(tmp_path, rust_rows, python_rows, *, rust_collected=None, 
     return run, [json.loads(path.read_text(encoding="utf-8")) for path in paths]
 
 
+def test_platform_exclusions_filter_nodes_without_ignoring_unlisted_skips(tmp_path):
+    """OD-99：逐平台排除明列 nodeid；未列入排除的 SKIP 仍是缺證，不得算 PASS。"""
+    cc = _module()
+    cargo, portable, posix, windows = "cargo:sw-core::x::filter", "t::portable", "t::posix", "t::windows"
+    run = tmp_path / "run-filtered"
+    rust_linux = [
+        _row(cargo), _row(portable), _row(posix), _row(windows, "skipped"),
+    ]
+    python_linux = [_row(portable), _row(posix), _row(windows, "skipped")]
+    rust_windows = [_row(cargo), _row(portable), _row(posix, "skipped"), _row(windows)]
+    python_windows = [_row(portable), _row(posix, "skipped"), _row(windows)]
+    docs = [
+        json.loads(_results(run, "rust-linux", "linux", rust_linux).read_text(encoding="utf-8")),
+        json.loads(_results(run, "python-linux", "linux", python_linux).read_text(encoding="utf-8")),
+        json.loads(_results(run, "rust-windows", "windows", rust_windows).read_text(encoding="utf-8")),
+        json.loads(_results(run, "python-windows", "windows", python_windows).read_text(encoding="utf-8")),
+    ]
+    item = _item(
+        platforms=("linux", "windows"), nodeids=[cargo, portable, posix, windows],
+        exclude_nodeids={"linux": [windows], "windows": [posix]},
+    )
+    report = cc.evaluate({"rpc_method:filtered": item}, docs, run_dir=run)
+    assert report["covered"] == ["rpc_method:filtered"], report["missing_reasons"]
+
+    unfiltered = _item(platforms=("linux",), nodeids=[cargo, portable, windows])
+    report2 = cc.evaluate({"rpc_method:unfiltered-skip": unfiltered}, docs[:2], run_dir=run)
+    assert "rpc_method:unfiltered-skip" not in report2["covered"]
+    assert "windows" in report2["missing_reasons"]["rpc_method:unfiltered-skip"]
+
+
+def test_platform_exclusions_filter_python_contract_nodes(tmp_path):
+    """OD-99：exclude_nodeids 同時適用於 contract_tests，未列名 Python SKIP 仍拒絕。"""
+    cc = _module()
+    cargo, portable, windows = "cargo:sw-core::x::contract", "t::portable", "t::windows"
+    run, docs = _rust_python_docs(
+        tmp_path,
+        [_row(cargo)],
+        [_row(portable), _row(windows, "skipped")],
+        rust_collected=[cargo], python_collected=[portable, windows],
+    )
+    item = _item(
+        kind="error_code", nodeids=[cargo], python_nodeids=[portable, windows],
+        exclude_nodeids={"linux": [windows]},
+    )
+    report = cc.evaluate({"error_code:filtered": item}, docs, run_dir=run)
+    assert report["covered"] == ["error_code:filtered"], report["missing_reasons"]
+
+    unfiltered = _item(kind="error_code", nodeids=[cargo], python_nodeids=[portable, windows])
+    report2 = cc.evaluate({"error_code:unfiltered-skip": unfiltered}, docs, run_dir=run)
+    assert "error_code:unfiltered-skip" not in report2["covered"]
+    assert "windows" in report2["missing_reasons"]["error_code:unfiltered-skip"]
+
+
 def test_parametrized_base_requires_every_declared_parameter(tmp_path):
     """P8X-24c6b39-3：參數化基底宣告展開為完整必要參數節點集合，逐項檢查收集與通過。"""
     cc = _module()
@@ -980,13 +1035,269 @@ def test_rust_l1_nodeids_are_not_required_in_python_results(tmp_path):
 
 
 def test_rust_l1_only_mapping_still_requires_python_side(tmp_path):
-    """P8X-24c6b39-4：外部契約只有 Cargo 節點、又沒有 Python 證據時不得成立（不可整項改 rust_only 迴避）。"""
+    """OD-99：只接受列名的 l1_only；未裁決的 l1_only／rust_only 仍須拒絕。"""
+    import yaml
+
     cc = _module()
     cargo = "cargo:sw-core::x::only_rust"
     run, docs = _rust_python_docs(tmp_path, [_row(cargo)], [_row("t::unrelated")])
     report = cc.evaluate({"error_code:X": _item(kind="error_code", nodeids=[cargo])}, docs, run_dir=run)
     assert "error_code:X" not in report["covered"]
     assert "Python" in report["missing_reasons"]["error_code:X"]
+
+    real = cc.universe(
+        ROOT / "contracts", ROOT / "tests/acceptance/cases.yaml",
+        ROOT / "tests/acceptance/cases.lock.json", ROOT / "contracts/coverage_map.yaml",
+    )
+    approved = sorted(
+        contract_id for contract_id, item in real.items()
+        if item.get("l1_only") and contract_id != "error_code:ECHO_ACK_UNSUPPORTED"
+    )
+    assert approved, "OD-99 核准的 l1_only 清單不可為空"
+    approved_id = next(
+        contract_id for contract_id in approved
+        if real[contract_id].get("nodeids")
+        and all(nodeid.startswith("cargo:") for nodeid in real[contract_id]["nodeids"])
+    )
+    approved_item = {**real[approved_id], "platforms": ["linux"]}
+    run2, docs2 = _rust_python_docs(
+        tmp_path / "approved",
+        [_row(nodeid) for nodeid in approved_item["nodeids"]],
+        [],
+    )
+    report2 = cc.evaluate({approved_id: approved_item}, docs2, run_dir=run2)
+    assert report2["covered"] == [approved_id], report2["missing_reasons"]
+
+    for flag in ("l1_only", "rust_only"):
+        coverage_map = tmp_path / f"unapproved-{flag}.yaml"
+        coverage_map.write_text(
+            yaml.safe_dump({"entries": {"error_code:DEVICE_STILL_HELD": {flag: True}}}),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match=flag):
+            cc.universe(
+                ROOT / "contracts", ROOT / "tests/acceptance/cases.yaml",
+                ROOT / "tests/acceptance/cases.lock.json", coverage_map,
+            )
+
+
+def _node_platforms(nodeid: str) -> set[str]:
+    """從測試節點的 pytest marker 判定可執行平台；沒有平台專屬 marker 視為雙平台。"""
+    path_text, _, qualified = nodeid.partition("::")
+    path = ROOT / path_text
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    marks: set[str] = set()
+
+    def marker_names(node: ast.AST) -> set[str]:
+        return {
+            child.attr for child in ast.walk(node)
+            if isinstance(child, ast.Attribute)
+            and isinstance(child.value, ast.Attribute)
+            and child.value.attr == "mark"
+            and isinstance(child.value.value, ast.Name)
+            and child.value.value.id == "pytest"
+        }
+
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "pytestmark" for target in statement.targets
+        ):
+            marks.update(marker_names(statement.value))
+
+    body = tree.body
+    for part in qualified.split("::"):
+        name = part.split("[", 1)[0]
+        found = next((
+            node for node in body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name
+        ), None)
+        if found is None:
+            break
+        marks.update(marker_names(ast.Module(body=found.decorator_list, type_ignores=[])))
+        if isinstance(found, ast.ClassDef):
+            for statement in found.body:
+                if isinstance(statement, ast.Assign) and any(
+                    isinstance(target, ast.Name) and target.id == "pytestmark" for target in statement.targets
+                ):
+                    marks.update(marker_names(statement.value))
+            body = found.body
+        else:
+            body = []
+
+    if "windows_native" in marks:
+        return {"windows"}
+    if "posix_only" in marks or "cap_posix_pty" in marks:
+        return {"linux"}
+    return {"linux", "windows"}
+
+
+def test_od99_real_universe_has_adjudicated_l1_or_python_nodes(tmp_path):
+    """OD-99：真實 universe 逐 ID 有 Python 節點或明確例外，且平台排除不把 skip 算成 PASS。"""
+    import yaml
+
+    cc = _module()
+    map_path = ROOT / "contracts/coverage_map.yaml"
+    map_doc = cc._read_yaml(map_path)
+    approvals = map_doc.get("l1_only_approvals")
+    assert isinstance(approvals, dict) and approvals, "缺少 OD-99 l1_only 明文核准清單"
+    ab_nodeids = map_doc.get("od99_ab_nodeids")
+    assert isinstance(ab_nodeids, dict) and ab_nodeids, "缺少 OD-99 對外介面 A/B nodeid 清單"
+    universe = cc.universe(
+        ROOT / "contracts", ROOT / "tests/acceptance/cases.yaml",
+        ROOT / "tests/acceptance/cases.lock.json", map_path,
+    )
+    base_map = {key: value for key, value in map_doc.items() if key not in {"od99_ab_nodeids", "l1_only_approvals"}}
+    base_map_path = tmp_path / "coverage_map-before-od99.yaml"
+    base_map_path.write_text(yaml.safe_dump(base_map, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    base = cc.universe(
+        ROOT / "contracts", ROOT / "tests/acceptance/cases.yaml",
+        ROOT / "tests/acceptance/cases.lock.json", base_map_path,
+    )
+
+    expected_api_ids = {
+        contract_id for contract_id, item in base.items()
+        if item.get("kind") in {"cli_cmd", "rpc_method"}
+        and "linux" in item.get("platforms", [])
+        and not cc._is_owner_blocked(item)
+        and item.get("nodeids")
+        and all(nodeid.startswith("cargo:") for nodeid in item["nodeids"])
+        and not item.get("python_nodeids")
+    }
+    assert set(ab_nodeids) == expected_api_ids, (
+        f"OD-99 A/B 對應必須且只能涵蓋未有 Python 節點的 API ID；"
+        f"missing={sorted(expected_api_ids - set(ab_nodeids))}, extra={sorted(set(ab_nodeids) - expected_api_ids)}"
+    )
+    for contract_id, row in ab_nodeids.items():
+        assert isinstance(row, dict), contract_id
+        nodeids = row.get("nodeids", [])
+        assert nodeids and all(nodeid.startswith("tests/contract_blackbox/") for nodeid in nodeids), contract_id
+        assert set(nodeids) <= set(universe[contract_id]["nodeids"]), contract_id
+        for platform, excluded in (row.get("exclude_nodeids") or {}).items():
+            assert platform in universe[contract_id]["platforms"], (contract_id, platform)
+            assert set(excluded) <= set(nodeids), contract_id
+        for nodeid in nodeids:
+            platforms = _node_platforms(nodeid)
+            for platform in universe[contract_id]["platforms"]:
+                excluded = nodeid in row.get("exclude_nodeids", {}).get(platform, [])
+                assert excluded == (platform not in platforms), (contract_id, platform, nodeid, excluded)
+
+    expected_l1 = {
+        contract_id for contract_id, item in base.items()
+        if item.get("kind") in {"bc", "schema", "case"}
+        and "linux" in item.get("platforms", [])
+        and not cc._is_owner_blocked(item)
+        and item.get("nodeids")
+        and all(nodeid.startswith("cargo:") for nodeid in item["nodeids"])
+        and not item.get("python_nodeids")
+        and not item.get("rust_only")
+    }
+    assert set(approvals) == expected_l1, (
+        f"OD-99 l1_only 清單須精確對齊 69 個無 Python 節點的 BC/schema/case；"
+        f"missing={sorted(expected_l1 - set(approvals))}, extra={sorted(set(approvals) - expected_l1)}"
+    )
+    for contract_id, approval in approvals.items():
+        assert isinstance(approval, dict) and approval.get("l1_only") is True, contract_id
+        reason = approval.get("reason")
+        assert isinstance(reason, str) and reason.startswith("OD-99") and reason.endswith("。"), contract_id
+        assert "\n" not in reason and "\r" not in reason, contract_id
+        assert universe[contract_id]["l1_only"] is True, contract_id
+        assert universe[contract_id]["l1_only_reason"] == reason, contract_id
+
+    cases_doc = cc._read_yaml(ROOT / "tests/acceptance/cases.yaml")
+    cases = {row["case_id"]: row for row in cases_doc["cases"]}
+    case_lock = cc._read_json(ROOT / "tests/acceptance/cases.lock.json")
+    prior_membership = {
+        "2.1": set(cc._read_json(ROOT / "tests/acceptance/breaker/slice_2.1.json")["required_case_ids"]),
+    }
+    prior_membership["2.2"] = set(
+        cc._read_yaml(ROOT / "tests/acceptance/slice22_evidence_map.yaml")["cases"]
+    )
+    prior_membership["2.3"] = set(case_lock["sets"]["slice_2.3"])
+    required_lock = cc._read_json(ROOT / "tests/acceptance/l1_required.lock.json")
+    linux_locked = set(required_lock["sets"]["s21_gate:pytest_full"]["linux"]["nodeids"])
+    parametrized = map_doc.get("parametrized", {})
+    missing: list[str] = []
+    for contract_id, item in universe.items():
+        if "linux" not in item.get("platforms", []):
+            continue
+        if cc._is_owner_blocked(item) or item.get("l1_only") or item.get("rust_only"):
+            continue
+        if item.get("kind") == "case" and not item.get("nodeids") and not item.get("python_nodeids"):
+            case_id = contract_id.removeprefix("case:")
+            case = cases.get(case_id, {})
+            slice_id = str(case.get("daemon_slice"))
+            assert slice_id in prior_membership and case_id in prior_membership[slice_id], (
+                f"無本輪節點且無對應先前切片逐案來源：{contract_id}"
+            )
+            continue
+        excluded = set(item.get("exclude_nodeids", {}).get("linux", []))
+        python_nodes = [
+            nodeid for nodeid in [*item.get("nodeids", []), *item.get("python_nodeids", [])]
+            if not nodeid.startswith("cargo:") and nodeid not in excluded
+        ]
+        if not python_nodes:
+            missing.append(contract_id)
+            continue
+        for nodeid in python_nodes:
+            assert "linux" in _node_platforms(nodeid), f"Linux 上不得使用單平台 skip 節點：{contract_id}: {nodeid}"
+            params = parametrized.get(nodeid)
+            required_nodeids = [f"{nodeid}[{param}]" for param in params] if params is not None else [nodeid]
+            for required_nodeid in required_nodeids:
+                assert required_nodeid in linux_locked, (
+                    f"A/B nodeid 未納入 Linux pytest 凍結集合：{contract_id}: {required_nodeid}"
+                )
+    assert not missing, f"非擁有者阻擋 ID 缺少 Python 節點或裁決例外：{sorted(missing)}"
+
+    legacy_l1 = map_doc.get("legacy_l1_only_approvals", {})
+    legacy_rust = map_doc.get("legacy_rust_only_approvals", {})
+    assert set(legacy_l1) == {"error_code:ECHO_ACK_UNSUPPORTED"}
+    assert set(legacy_rust) == {"error_code:ECHO_ACK_UNSUPPORTED", "case:sc36-win-installer-com0com-optional"}
+    assert universe["error_code:ECHO_ACK_UNSUPPORTED"]["l1_only_reason"] == legacy_l1["error_code:ECHO_ACK_UNSUPPORTED"]
+    assert universe["case:sc36-win-installer-com0com-optional"]["rust_only_reason"] == legacy_rust[
+        "case:sc36-win-installer-com0com-optional"
+    ]
+
+    windows_only = "tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown"
+    posix_attach_nodes = {
+        "tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend",
+        "tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits",
+        "tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns",
+        "tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown",
+        "tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq",
+    }
+    expected_exclusions = {
+        "cli_cmd:device attach": {"linux": {windows_only}, "windows": posix_attach_nodes},
+        "rpc_method:device.attach": {"linux": {windows_only}, "windows": posix_attach_nodes},
+        "error_code:DEVICE_STILL_HELD": {
+            "linux": {windows_only},
+            "windows": {
+                "tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits",
+                "tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns",
+                "tests/test_stage0_uart_exclusive.py::TestAttachProbeDrain::test_attach_device_force_rejects_plain_external_holder",
+            },
+        },
+        "error_code:DAEMON_ALREADY_RUNNING": {
+            "linux": {"tests/test_lock_win.py::test_two_locks_same_path_second_raises"},
+        },
+    }
+    for contract_id, by_platform in expected_exclusions.items():
+        actual = universe[contract_id].get("exclude_nodeids", {})
+        for platform, nodeids in by_platform.items():
+            assert set(actual.get(platform, [])) == nodeids, (contract_id, platform, actual)
+            referenced = set(universe[contract_id].get("nodeids", [])) | set(universe[contract_id].get("python_nodeids", []))
+            assert nodeids <= referenced, (contract_id, platform)
+
+    for contract_id in expected_exclusions:
+        item = universe[contract_id]
+        references = set(item.get("nodeids", [])) | set(item.get("python_nodeids", []))
+        for platform in item["platforms"]:
+            excluded = set(item.get("exclude_nodeids", {}).get(platform, []))
+            for nodeid in references:
+                if nodeid.startswith("cargo:"):
+                    continue
+                if platform not in _node_platforms(nodeid):
+                    assert nodeid in excluded, (contract_id, platform, nodeid)
 
 
 def test_platform_artifacts_are_checked_per_platform(tmp_path):
@@ -1869,10 +2180,19 @@ def test_stage2_contract_ids_have_locked_rust_coverage_not_stage1_python():
     }
     map_doc = cc._read_yaml(ROOT / "contracts/coverage_map.yaml")
     parametrized = map_doc.get("parametrized", {})
+    od99_ab_nodes = {
+        nodeid
+        for row in (map_doc.get("od99_ab_nodeids") or {}).values()
+        if isinstance(row, dict)
+        for nodeid in row.get("nodeids", [])
+        if isinstance(nodeid, str)
+    }
     referenced_rust_nodes = set()
     unlocked = set()
     for item in stage2_targets.values():
         for nodeid in item.get("nodeids", []):
+            if nodeid in od99_ab_nodes:
+                continue
             params = parametrized.get(nodeid)
             expanded = [f"{nodeid}[{param}]" for param in params] if params is not None else [nodeid]
             for executable_nodeid in expanded:
@@ -1881,9 +2201,9 @@ def test_stage2_contract_ids_have_locked_rust_coverage_not_stage1_python():
                 else:
                     unlocked.add(executable_nodeid)
     unlocked = sorted(unlocked)
-    stage1_python = sorted(referenced_rust_nodes & stage1_python_nodeids)
+    stage1_python = sorted((referenced_rust_nodes & stage1_python_nodeids) - od99_ab_nodes)
     assert not unlocked, f"coverage_map 引用了未登記的 nodeid：{unlocked}"
-    assert not stage1_python, f"coverage_map 沿用 Stage 1 Python nodeid：{stage1_python}"
+    assert not stage1_python, f"coverage_map 沿用未經 OD-99 核准的 Stage 1 Python nodeid：{stage1_python}"
 
     capability_nodeids = {
         nodeid for nodeid in referenced_rust_nodes
