@@ -334,6 +334,7 @@ def test_incomplete_run_cannot_satisfy(tmp_path):
 
 
 def test_duplicate_result_rows_not_best_of(tmp_path):
+    """結果檔真正重複寫入仍依 R5-F3 判為不完整；只有 plugin 彙整 subTest 報告。"""
     run = tmp_path / "run10"
     _results(run, "rust-linux", "linux", [_row("t::k", "failed"), _row("t::k")])
     _results(run, "python-linux", "linux", [_row("t::k")])
@@ -797,6 +798,50 @@ def _plugin_run(plugin, session) -> None:
         for when in ("setup", "call", "teardown"):
             plugin.pytest_runtest_logreport(_FakeReport(item.nodeid, when))
     plugin.pytest_sessionfinish(session, 0)
+
+
+def test_coverage_plugin_aggregates_actual_unittest_subtests(tmp_path):
+    """pytest 的 unittest subTest 多份 call report 應合併，結果檔仍通過嚴格驗證。"""
+    run = tmp_path / "subtest-run"
+    env = {**os.environ, "SERIALWRAP_COVERAGE_RUN_DIR": str(run), "SERIALWRAP_COVERAGE_LABEL": "python-linux"}
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests/test_brcm_prompt_regex.py"],
+        cwd=ROOT, env=env, capture_output=True, text=True, timeout=300,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    document = json.loads((run / "results-python-linux.json").read_text(encoding="utf-8"))
+    assert not _module()._validate_run(document), document
+
+
+def test_coverage_plugin_coalesces_subtest_failure_as_failed(tmp_path):
+    """真實 pytest unittest.subTest 中任一子測試失敗時，彙整列必須是 failed。"""
+    run = tmp_path / "subtest-failure"
+    test_file = tmp_path / "test_subtest_failure.py"
+    test_file.write_text(
+        "import unittest\n"
+        "class TestSubtestFailure(unittest.TestCase):\n"
+        "    def test_children(self):\n"
+        "        for value in range(3):\n"
+        "            with self.subTest(value=value):\n"
+        "                self.assertNotEqual(value, 1)\n",
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join(filter(None, [str(ROOT / "tests/contract_blackbox"), os.environ.get("PYTHONPATH")])),
+        "SERIALWRAP_COVERAGE_RUN_DIR": str(run),
+        "SERIALWRAP_COVERAGE_LABEL": "python-linux",
+    }
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "coverage_plugin", str(test_file)],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300,
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    document = json.loads((run / "results-python-linux.json").read_text(encoding="utf-8"))
+    nodeid = next(nodeid for nodeid in document["collected"] if nodeid.endswith("::test_children"))
+    calls = [row for row in document["results"] if row["nodeid"] == nodeid and row["phase"] == "call"]
+    assert len(calls) == 1 and calls[0]["outcome"] == "failed", proc.stdout + proc.stderr
+    assert _module()._nodeid_failure(document, nodeid) == f"call outcome is failed: {nodeid}"
 
 
 def test_coverage_plugin_reads_artifacts_from_ab_env_snapshot(tmp_path, monkeypatch):
