@@ -36,6 +36,8 @@ pub mod service_ctl;
 pub mod signal;
 pub mod sysenv;
 #[cfg(feature = "test-fakes")]
+pub mod test_support;
+#[cfg(feature = "test-fakes")]
 pub mod testutil;
 pub mod traits;
 pub mod tty_identity;

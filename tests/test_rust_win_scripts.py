@@ -34,6 +34,9 @@ OD89_INTERACTIVE_NODEIDS = [
     "cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c",
     "cargo:sw-pal::lock::cap_interactive_desktop__ctrl_break_stops_wait",
 ]
+GFC_C_DAEMON_CTRL_NODEID = (
+    "cargo:sw-daemon::daemon_process::cap_interactive_desktop__windows_console_ctrl_triggers_orderly_stop"
+)
 BLACKBOX_PURITY_GUARDS = {
     "tests/contract_blackbox/test_bb_no_product_import.py::test_no_product_import_anywhere_in_blackbox",
     "tests/contract_blackbox/test_bb_harness_selftest.py::test_bb_standalone_writes_l1_report",
@@ -1039,14 +1042,16 @@ def test_embedded_runtime_site_packages_include_pyserial():
 
 
 def test_win_interactive_l1_emits_od89_rows_and_importable_provenance(tmp_path):
-    """OD-89 harness 必須只執行鎖定的兩列，並產出可由 Windows section 匯入的 L1 provenance。"""
+    """互動 L1 harness 執行 OD-89 兩列與 GFC-C daemon stop，並產出可匯入的 provenance。"""
     assert WIN_INTERACTIVE_L1_PS1.is_file(), "scripts/rust/win-interactive-l1.ps1 尚未實作（OD-89）"
     script = WIN_INTERACTIVE_L1_PS1.read_text(encoding="utf-8-sig")
 
     specs = re.search(r"\$TestSpecs\s*=\s*@\((.*?)^\)", script, re.DOTALL | re.MULTILINE)
     assert specs, "harness 必須明列 OD-89 的測試 selector"
     nodeids = re.findall(r"(?im)^\s*Nodeid\s*=\s*'([^']+)'", specs.group(1))
-    assert nodeids == OD89_INTERACTIVE_NODEIDS
+    assert nodeids == [*OD89_INTERACTIVE_NODEIDS, GFC_C_DAEMON_CTRL_NODEID]
+    assert "'--test', 'daemon_process'" in script
+    assert "heavy-slot serialwrap-gfxc nice -n 10 ionice -c2 -n7 cargo " in script
     assert "--ignored" in script and "--exact" in script
     assert "WT_SESSION" in script
     assert "[Console]::IsInputRedirected" in script and "[Console]::IsOutputRedirected" in script
@@ -1064,7 +1069,8 @@ def test_win_interactive_l1_emits_od89_rows_and_importable_provenance(tmp_path):
 
     lock = json.loads(L1_LOCK.read_text(encoding="utf-8"))["sets"]
     required = lock["s21_gate:cap_interactive_desktop"]["windows"]
-    assert required["nodeids"] == OD89_INTERACTIVE_NODEIDS
+    assert set(OD89_INTERACTIVE_NODEIDS).issubset(required["nodeids"])
+    assert set(required["nodeids"]).issubset(nodeids)
     report_argv = re.search(r"\$ReportArgv\s*=\s*@\((.*?)^\)", script, re.DOTALL | re.MULTILINE)
     assert report_argv, "L1 report 必須明列 gate lock selector argv"
     assert re.findall(r"'([^']*)'", report_argv.group(1)) == required["selector"]["argv"]
@@ -1078,11 +1084,11 @@ def test_win_interactive_l1_emits_od89_rows_and_importable_provenance(tmp_path):
         "platform": "windows",
         "argv": required["selector"]["argv"],
         "markexpr": "",
-        "counts": {"all": {"passed": len(OD89_INTERACTIVE_NODEIDS), "failed": 0, "skipped": 0}},
+        "counts": {"all": {"passed": len(required["nodeids"]), "failed": 0, "skipped": 0}},
         "resources": {},
         "uart_kind": "native",
         "not_collected_platform": [],
-        "collected": OD89_INTERACTIVE_NODEIDS,
+        "collected": required["nodeids"],
         "deselected": [],
         "results": [
             {
@@ -1091,7 +1097,7 @@ def test_win_interactive_l1_emits_od89_rows_and_importable_provenance(tmp_path):
                 "skip_kind": None,
                 "phases": {"setup": "passed", "call": "passed", "teardown": "passed"},
             }
-            for nodeid in OD89_INTERACTIVE_NODEIDS
+            for nodeid in required["nodeids"]
         ],
         "exit_code": 0,
         "finished": True,
@@ -1116,7 +1122,7 @@ def test_win_interactive_l1_emits_od89_rows_and_importable_provenance(tmp_path):
 
     judged = l1_judge.judge(
         simulated,
-        OD89_INTERACTIVE_NODEIDS,
+        required["nodeids"],
         platform="windows",
         selector=required["selector"],
     )
@@ -1137,8 +1143,8 @@ def test_win_interactive_l1_emits_od89_rows_and_importable_provenance(tmp_path):
     assert imported.returncode == 0, imported.stdout + imported.stderr
     section = json.loads((run_dir / "sections/windows_cap_interactive_desktop.json").read_text(encoding="utf-8"))
     accepted = json.loads((run_dir / "windows_cap_interactive_desktop/l1-results.json").read_text(encoding="utf-8"))
-    assert section["passed"] == len(OD89_INTERACTIVE_NODEIDS)
-    assert [row["nodeid"] for row in accepted["results"]] == OD89_INTERACTIVE_NODEIDS
+    assert section["passed"] == len(required["nodeids"])
+    assert [row["nodeid"] for row in accepted["results"]] == required["nodeids"]
 
     runbook = (ROOT / "docs/rust-refactor/owner-runbook-od29.md").read_text(encoding="utf-8")
     assert "SW_WIN_EXTRA_FILES" in runbook and "wintask_stop_harness.exe" in runbook

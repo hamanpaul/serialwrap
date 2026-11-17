@@ -5,8 +5,9 @@
 # 判定器 scripts/rust/slice21_gate_judge.py 的規則（不得預設 PASS）：
 #   - 來源文件可得時，以文件重新抽出 P5 列並與本檔逐列比對：文件有而本檔無 → INCOMPLETE（無標記）；
 #     source_sha256 與文件不符 → 全段 INCOMPLETE（須重新核對後更新本檔）。
-#   - status 只能是 PASS／BLOCKED-OWNER／OWNER-DECISION-PENDING／INCOMPLETE。
+#   - status 只能是 PASS／NOT_APPLICABLE／BLOCKED-OWNER／OWNER-DECISION-PENDING／INCOMPLETE。
 #   - PASS 必須附 tests（nodeid）；且每個 nodeid 須在本次 gate 已載入的 l1-results 中恰為 passed，否則降為 INCOMPLETE。
+#   - NOT_APPLICABLE 不得附 tests；ruling 須以 path#Lline 指向計畫／裁決文件內明確提及該列 ID 的具體行。
 #   - BLOCKED-OWNER 必須附 bo（BO-S21-NN，須存在於 tests/acceptance/slice21_bo.yaml）。
 #   - OWNER-DECISION-PENDING 必須附 decision（須存在於 slice21_gate_expect.yaml 的 pending_decisions），否則降為 INCOMPLETE。
 #   - 任一列為 INCOMPLETE → gate verdict INCOMPLETE。
@@ -219,7 +220,14 @@ rows:
     status: PASS
     # PA-OD-1／OD-21 (1)：SC-37 已登記於 contracts/behavior_changes.yaml（rust_only、absolute_only）。
     tests: ["cargo:sw-daemon::daemon_process::backend_env_invalid_exit_1", "cargo:sw-daemon::daemon_process::backend_env_checked_where_python_selects_it"]
-  - {id: "#72", status: INCOMPLETE, reason: "Linux Rust `cargo:sw-daemon::daemon_process::sigterm_sigint_orderly_stop` 與 Python `tests/test_daemon_lock.py::test_sigterm_orderly_shutdown_posix[SIGINT]`／`[SIGTERM]` 已在 gate 集合，H* ba29434c 均 passed；仍缺計畫指名的 Windows `cargo:sw-daemon::daemon_process::windows_console_ctrl_triggers_orderly_stop`（目前只有 LOCAL-WINDOWS-TODO 註記，未在 source／鎖檔／H* Windows L1 收集）。`cap_interactive_desktop__ctrl_break_stops_wait` 是另一行為，不替代。"}
+  - id: "#72"
+    status: PASS
+    reason: "POSIX SIGINT／SIGTERM 基線與 Windows 互動桌面 CTRL_C／CTRL_BREAK orderly-stop 測試並列；Windows 測試涵蓋 RPC 停止、drain、WAL close、endpoint 停止及重啟。"
+    tests:
+      - "cargo:sw-daemon::daemon_process::sigterm_sigint_orderly_stop"
+      - "cargo:sw-daemon::daemon_process::cap_interactive_desktop__windows_console_ctrl_triggers_orderly_stop"
+      - "tests/test_daemon_lock.py::test_sigterm_orderly_shutdown_posix[SIGINT]"
+      - "tests/test_daemon_lock.py::test_sigterm_orderly_shutdown_posix[SIGTERM]"
   - id: "#73"
     status: PASS
     tests: ["cargo:sw-daemon::framing::rpc_accept_paused_at_128_connections"]
@@ -230,7 +238,10 @@ rows:
   - id: "A-40"
     status: PASS
     tests: ["tests/test_multi_open_detect.py::TestDaemonStatusMultiOpen::test_health_status_warnings_no_profiles_no_devices"]
-  - {id: "A-86", status: INCOMPLETE, reason: "P5-T19 #102 已確認 Rust 型別化錯誤沒有可觀察的非 SC-19 RuntimeError 重拋分支，免測；不再是待 Task 19 確認。現有 parity judge 的 PASS 必須附 passed nodeid，狀態集合又沒有 N/A；不挪用不相關測試或製造測試，先維持 INCOMPLETE。這是狀態模型需補 N/A／免測表示法的 SPEC-GAP。"}
+  - id: "A-86"
+    status: NOT_APPLICABLE
+    ruling: "docs/rust-refactor/plans/06-slice21-daemon-core.md#L4624"
+    reason: "A-86 對應的 Rust 型別化錯誤分支不可觀察，依 P5-T19 #102 逐列免測。"
   - id: "A-88"
     status: PASS
     tests:
@@ -246,7 +257,14 @@ rows:
       - "tests/test_daemon_lock.py::test_sigterm_orderly_shutdown_posix[SIGINT]"
       - "tests/test_daemon_lock.py::test_sigterm_orderly_shutdown_posix[SIGTERM]"
     note: "H* ba29434c：#101 Rust／Python 節點及 #78 test_daemon_lock.py 四個 s21_gate:py_parity_76_80 節點均 passed。"
-  - {id: "A-94", status: INCOMPLETE, reason: "併 #72：POSIX Rust 與 Python SIGINT／SIGTERM 節點在 H* ba29434c passed，但計畫指名的 Windows `windows_console_ctrl_triggers_orderly_stop` 仍未建立／收集；`cap_interactive_desktop__ctrl_break_stops_wait` 不等價，不可替代。"}
+  - id: "A-94"
+    status: PASS
+    reason: "與 #72 同一有序停機契約；Windows console CTRL_C／CTRL_BREAK 端到端測試與 POSIX Rust／Python 基線並列。"
+    tests:
+      - "cargo:sw-daemon::daemon_process::sigterm_sigint_orderly_stop"
+      - "cargo:sw-daemon::daemon_process::cap_interactive_desktop__windows_console_ctrl_triggers_orderly_stop"
+      - "tests/test_daemon_lock.py::test_sigterm_orderly_shutdown_posix[SIGINT]"
+      - "tests/test_daemon_lock.py::test_sigterm_orderly_shutdown_posix[SIGTERM]"
   - id: "A-103"
     status: PASS
     tests: ["cargo:sw-daemon::framing::rpc_accept_paused_at_128_connections"]

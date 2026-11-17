@@ -29826,6 +29826,7 @@
     "s21_gate:cap_interactive_desktop": {
       "windows": {
         "nodeids": [
+          "cargo:sw-daemon::daemon_process::cap_interactive_desktop__windows_console_ctrl_triggers_orderly_stop",
           "cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c",
           "cargo:sw-pal::lock::cap_interactive_desktop__ctrl_break_stops_wait"
         ],
