@@ -187,9 +187,9 @@ def test_placeholder_only_case_is_not_evidence(gate) -> None:
 
 
 POSIX_NODE = "sw-pal::process_tunnel::posix_terminate_kills_whole_group_including_grandchild"
-# 兩個平台的凍結 selector 皆不收集的節點：無平台 marker 的 contract_blackbox 節點（test_daemon_start_ab_conflict）。
-# 原用 test_daemon_restart_ab，該節點補上 posix_only 後已被 Linux s1b_20groups 收集（S1X G5），故改用仍未收集者。
-UNSELECTED_NODE = "tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_start_ab_conflict"
+# Rust-only 參數化 contract_blackbox 節點沒有平台 marker，兩平台的凍結 s1b_20groups selector 都不收集。
+# 使用實際的 --help 參數 nodeid，避免把後續加上 posix_only 的節點誤當成未收集案例（OD-99）。
+UNSELECTED_NODE = "tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[--help]"
 
 
 def test_pass_on_platform_outside_cargo_selector_does_not_count(gate) -> None:

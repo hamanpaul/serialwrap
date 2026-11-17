@@ -143,7 +143,7 @@ def test_windows_collection_excludes_posix_modules(tmp_path: Path) -> None:
     assert type(git.get("end", {}).get("clean")) is bool
 
 
-@pytest.mark.memory_only
+@pytest.mark.process_rpc
 def test_windows_git_snapshot_excludes_only_report_outputs(tmp_path: Path) -> None:
     """Windows pytest provenance 記錄 Git HEAD／dirty，並只排除實際產出的報告檔。"""
     import tests.resource_report_plugin as plugin
