@@ -246,11 +246,21 @@ gate 為 OD-55 的 linux 能力集合各設一個 section（`linux_cap_<cap>`）
 | section | 集合 | 所需能力 | 處置 | 可行的實跑方式 |
 |---|---|---|---|---|
 | `linux_cap_posix_pty_workspace` | `s21_gate:cap_posix_pty` | Linux POSIX PTY；以非 root 執行 | 必須依 `l1_judge` 判定，不是 BLOCKED-OWNER | `python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_cap_posix_pty_workspace/l1-results.json --caps-only --caps posix_pty -- --workspace --features test-fakes -- --ignored cap_posix_pty__`；test-binary selector 逐字取自鎖，OD-53 |
-| `linux_cap_sys_admin` | `s21_gate:cap_sys_admin` | root（euid 0）且 `CapEff` 含 CAP_SYS_ADMIN | BLOCKED-OWNER | 以 root 於可丟棄容器（例：`docker run --cap-add SYS_ADMIN`，掛載 repo）跑 gate（須設 `SW_GATE_L1_USER` 讓 linux_l1／linux_cap_posix_pty／linux_cap_posix_pty_workspace 降權為非 root，F108），或單獨執行 `python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_cap_sys_admin/l1-results.json --caps-only --caps sys_admin -- --workspace --features test-fakes -- --ignored cap_sys_admin__`（`--caps-only`：只跑能力列；root 下 sw-pal 預設測試數支必紅，不得一併執行。gate 以 `slice21_gate_judge.py caps-plan` 由鎖 selector 推導，OD-53） |
+| `linux_cap_sys_admin` | `s21_gate:cap_sys_admin` | root（euid 0）且 `CapEff` 含 CAP_SYS_ADMIN | BLOCKED-OWNER | 以 `scripts/rust/slice21_sys_admin_docker.sh --out <空目錄>` 在 Ubuntu 24.04 執行；容器以 `--rm --cap-add SYS_ADMIN` 啟動，repo 與主機 Rust toolchain 唯讀掛載，`CARGO_TARGET_DIR` 留在容器 `/tmp`。selector 由 `slice21_gate_judge.py caps-plan` 從鎖推導，使用 `--caps-only --caps sys_admin`，不執行 root 下可能必紅的 sw-pal 預設測試。輸出須通過 HEAD、selector、L1 provenance、euid=0 與 `CapEff` bit 21 檢查；正式 gate 以 `SW_GATE_SYS_ADMIN_RESULTS=<結果目錄>` 匯入。未提供此變數時仍由 gate 探測主機；證據缺漏或不符一律 EVIDENCE_MISSING，不得 PASS。其他 Linux L1／POSIX PTY 段仍須依 F108 設 `SW_GATE_L1_USER` 降權為非 root。 |
 | `linux_cap_supervisor_runtime` | `s21_gate:cap_supervisor_runtime` | `systemctl --user is-system-running` 為 running／degraded | BLOCKED-OWNER | 於隔離的 systemd 容器（`tools/docker/systemd.Dockerfile`，OD-15）以一般使用者登入 session 跑 gate，或單獨執行 `... --out <run>/linux_cap_supervisor_runtime/l1-results.json --caps-only --caps supervisor_runtime -- --workspace --features test-fakes -- --ignored cap_supervisor_runtime__`；測試會建立並清除暫時 user unit |
 | `windows_cap_windows_native` | `s21_gate:cap_windows_native`（windows） | 原生 Windows 本機（PowerShell、Job Object、PE Subsystem） | LOCAL-WINDOWS-TODO | 證據只能於原生 Windows 本機產生：於擁有者 Windows host 以 `python3 scripts/rust/cargo_l1_results.py --platform windows --runner scripts/rust/win-runner.sh --out <dir>/windows_cap_windows_native/l1-results.json --caps-only --caps windows_native -- <集合 selector argv>`（環境比照 `win-test.sh`）產生，gate 以 `SW_GATE_LOCAL_WINDOWS_DIR=<dir>` 匯入；缺證據檔記 EVIDENCE_MISSING，不得 PASS |
 | `windows_cap_interactive_desktop` | `s21_gate:cap_interactive_desktop`（windows） | 原生 Windows 互動 console（擁有者登入的桌面 session） | LOCAL-WINDOWS-TODO | 證據只能於原生 Windows 本機產生：於擁有者 Windows host 以 `python3 scripts/rust/cargo_l1_results.py --platform windows --runner scripts/rust/win-runner.sh --out <dir>/windows_cap_interactive_desktop/l1-results.json --caps-only --caps interactive_desktop -- <集合 selector argv>`（環境比照 `win-test.sh`）產生，gate 以 `SW_GATE_LOCAL_WINDOWS_DIR=<dir>` 匯入；缺證據檔記 EVIDENCE_MISSING，不得 PASS |
 | `windows_cap_supervisor_runtime` | `s21_gate:cap_supervisor_runtime`（windows） | 原生 Windows 工作排程器執行期（建立暫時排程工作，須擁有者授權） | LOCAL-WINDOWS-TODO | 證據只能於原生 Windows 本機產生：於擁有者 Windows host 以 `python3 scripts/rust/cargo_l1_results.py --platform windows --runner scripts/rust/win-runner.sh --out <dir>/windows_cap_supervisor_runtime/l1-results.json --caps-only --caps supervisor_runtime -- <集合 selector argv>`（環境比照 `win-test.sh`；建立暫時排程工作須設 `SW_TEST_ALLOW_SCHTASKS`）產生，gate 以 `SW_GATE_LOCAL_WINDOWS_DIR=<dir>` 匯入；缺證據檔記 EVIDENCE_MISSING，不得 PASS |
+
+sys_admin 正式流程範例（先以乾淨且已提交的候選 HEAD 產生證據，再將同一目錄交給 Slice 2.1 gate）：
+
+```bash
+scripts/rust/slice21_sys_admin_docker.sh --out target/slice21-sys-admin/<run-id>
+SW_GATE_SYS_ADMIN_RESULTS="$PWD/target/slice21-sys-admin/<run-id>" \
+  bash scripts/rust/slice21_gate.sh --shared-evidence <SHARED_ROOT>/<ID> --run-id s21-<ID> --out <OUT>
+```
+
+Docker 驅動不掛載任何序列埠或主機裝置，結果檔由主機使用者從容器輸出的封包建立；容器被移除後只保留 `l1-results.json`、`sys-admin-evidence.json`、`container.log` 與 Docker 驅動記錄。容器 L1 測試失敗時仍保留逐案結果，gate 依既有 `l1_judge` 判定，不轉成 PASS。
 
 擁有者裁決 2026-11-12（rulings/s2.md「OD-55 Windows 部分的完成方式」第 4 點）：`linux_cap_windows_native`、`linux_cap_interactive_desktop` 兩個 linux section 已退役（OD-68 後已無 linux 必要集合），改由上表的 `windows_cap_windows_native`、`windows_cap_interactive_desktop` 承擔。
 

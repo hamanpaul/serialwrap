@@ -366,6 +366,18 @@ cap_probe() {  # cap_probe <cap>：印出 available:<證據> 或 unavailable:<�
 # 擁有者裁決 2026-11-12（rulings/s2.md「OD-55 Windows 部分的完成方式」第 4 點）：windows_native／interactive_desktop 的 linux section 退役，改由 windows_cap_<cap> 承擔（見下方 LOCAL-WINDOWS 匯入）。
 for cap in sys_admin supervisor_runtime; do
   sec="linux_cap_$cap"
+  # 編排者裁決 2026-11-17 第 3 點（slice21-04）：外部 root 容器證據須先核對 HEAD、鎖 selector 與 euid／CapEff；
+  # 環境變數有值但證據無效時只記 EVIDENCE_MISSING，不退回主機探測或執行，也不得把 sys_admin 改成可缺。
+  if [[ "$cap" == "sys_admin" && -n "${SW_GATE_SYS_ADMIN_RESULTS:-}" ]]; then
+    if ! python3 "$ROOT/scripts/rust/slice21_sys_admin_evidence.py" import-section \
+        --results "$SW_GATE_SYS_ADMIN_RESULTS" --run-dir "$RUN_DIR" --candidate-commit "$CANDIDATE_COMMIT" \
+        >"$RUN_DIR/logs/sys_admin_import.json" 2>"$RUN_DIR/logs/sys_admin_import.stderr"; then
+      IMPORT_REASON="匯入工具失敗：$(tr '\n' ' ' <"$RUN_DIR/logs/sys_admin_import.stderr")；拒絕作為 sys_admin 證據"
+      record "$sec" --required-set "s21_gate:cap_sys_admin" --section-verdict EVIDENCE_MISSING \
+        --capability-probe "sys_admin=unavailable:$IMPORT_REASON" --log logs/sys_admin_import.stderr --reason "$IMPORT_REASON"
+    fi
+    continue
+  fi
   probe="$(cap_probe "$cap")"
   if [[ "$probe" == available:* ]] && ! caps_args "$sec"; then
     record "$sec" --required-set "s21_gate:cap_$cap" --capability-probe "$cap=$probe" \

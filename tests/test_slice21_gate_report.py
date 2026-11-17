@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import pathlib
@@ -154,3 +155,149 @@ def test_bo_case_ids_cover_frozen_windows_cases():
     rep_ids = {c for b in items for c in b["case_ids"]}
     assert {"win-com-open-exclusive", "win-com-txrx-bridge", "win-com-cancel-close", "win-wal-av-rotate", "win-wal-av-unlink",
             "win-wal-av-reader-handle", "win-wal-f12-progress"} <= rep_ids
+
+
+def _sys_admin_evidence(tmp_path, *, evidence_head=None, probe=True, cap_eff=None, selector=None, finished=True):
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    required = lock["sets"]["s21_gate:cap_sys_admin"]["linux"]
+    current_head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+    evidence_head = evidence_head or current_head
+    locked_selector = required["selector"]["argv"]
+    nodeids = required["nodeids"]
+    l1 = {
+        "schema_version": 2, "format": "l1-results.v1", "runner": "cargo", "platform": "linux",
+        "argv": locked_selector, "markexpr": "", "counts": {"all": {"passed": len(nodeids), "failed": 0, "skipped": 0}},
+        "resources": {}, "uart_kind": "native", "not_collected_platform": [], "collected": nodeids,
+        "deselected": [],
+        "results": [{"nodeid": nodeid, "outcome": "passed", "skip_kind": None,
+                     "phases": {"setup": "passed", "call": "passed", "teardown": "passed"}}
+                    for nodeid in nodeids],
+        "exit_code": 0, "finished": finished, "core_portable_platform_skips": [], "deployed_content": None,
+        "provenance": {"schema": "cargo-l1-provenance.v1", "platform": "linux",
+                       "git": {"head": evidence_head, "clean": True,
+                               "end": {"head": evidence_head, "clean": True}}},
+    }
+    evidence = {
+        "schema": "slice21-sys-admin-evidence.v1", "candidate_commit": evidence_head,
+        "required_set": "s21_gate:cap_sys_admin", "platform": "linux", "selector": selector or locked_selector,
+        "caps": ["sys_admin"], "caps_only": True, "cargo_exit_code": 0,
+        "image": "ubuntu:24.04", "image_id": "sha256:" + "a" * 64,
+        "container_os": {"id": "ubuntu", "version_id": "24.04"},
+        "cargo_target_dir": "/tmp/slice21-sys-admin-target",
+    }
+    if probe:
+        evidence["probe"] = {"euid": 0, "cap_eff": cap_eff or format(1 << 21, "x")}
+    source = tmp_path / "sys-admin-results"
+    source.mkdir()
+    (source / "l1-results.json").write_text(json.dumps(l1), encoding="utf-8")
+    (source / "sys-admin-evidence.json").write_text(json.dumps(evidence), encoding="utf-8")
+    (source / "container.log").write_text("cap_sys_admin test completed\n", encoding="utf-8")
+    return source, current_head, required
+
+
+def _import_sys_admin(tmp_path, results, candidate_head):
+    return subprocess.run(
+        ["python3", "scripts/rust/slice21_sys_admin_evidence.py", "import-section",
+         "--results", str(results), "--run-dir", str(tmp_path / "run"),
+         "--candidate-commit", candidate_head],
+        cwd=ROOT, capture_output=True, text=True, timeout=30,
+    )
+
+
+def test_sys_admin_import_rejects_missing_probe(tmp_path):
+    results, head, _ = _sys_admin_evidence(tmp_path, probe=False)
+    proc = _import_sys_admin(tmp_path, results, head)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    section = json.loads((tmp_path / "run/sections/linux_cap_sys_admin.json").read_text(encoding="utf-8"))
+    assert section["section_verdict"] == "EVIDENCE_MISSING"
+    assert section["capability_probe"]["available"] is False
+    assert section["l1_results"] is None
+    assert any("探測" in reason for reason in section["reasons"])
+
+
+def test_sys_admin_import_rejects_head_mismatch(tmp_path):
+    results, head, _ = _sys_admin_evidence(tmp_path, evidence_head="0" * 40)
+    proc = _import_sys_admin(tmp_path, results, head)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    section = json.loads((tmp_path / "run/sections/linux_cap_sys_admin.json").read_text(encoding="utf-8"))
+    assert section["section_verdict"] == "EVIDENCE_MISSING"
+    assert section["capability_probe"]["available"] is False
+    assert section["l1_results"] is None
+    assert any("HEAD" in reason or "head" in reason for reason in section["reasons"])
+
+
+def test_sys_admin_import_rejects_cap_eff_without_sys_admin(tmp_path):
+    results, head, _ = _sys_admin_evidence(tmp_path, cap_eff="1")
+    proc = _import_sys_admin(tmp_path, results, head)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    section = json.loads((tmp_path / "run/sections/linux_cap_sys_admin.json").read_text(encoding="utf-8"))
+    assert section["section_verdict"] == "EVIDENCE_MISSING"
+    assert section["capability_probe"]["available"] is False
+    assert section["l1_results"] is None
+
+
+def test_sys_admin_import_rejects_selector_mismatch(tmp_path):
+    results, head, _ = _sys_admin_evidence(tmp_path, selector=["--workspace", "--features", "test-fakes"])
+    proc = _import_sys_admin(tmp_path, results, head)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    section = json.loads((tmp_path / "run/sections/linux_cap_sys_admin.json").read_text(encoding="utf-8"))
+    assert section["section_verdict"] == "EVIDENCE_MISSING"
+    assert section["capability_probe"]["available"] is False
+    assert section["l1_results"] is None
+    assert any("selector" in reason for reason in section["reasons"])
+
+
+def test_sys_admin_import_rejects_incomplete_l1(tmp_path):
+    results, head, _ = _sys_admin_evidence(tmp_path, finished=False)
+    proc = _import_sys_admin(tmp_path, results, head)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    section = json.loads((tmp_path / "run/sections/linux_cap_sys_admin.json").read_text(encoding="utf-8"))
+    assert section["section_verdict"] == "EVIDENCE_MISSING"
+    assert section["capability_probe"]["available"] is False
+    assert section["l1_results"] is None
+    assert any("尚未完整結束" in reason for reason in section["reasons"])
+
+
+def test_sys_admin_import_preserves_locked_l1_and_probe(tmp_path):
+    results, head, required = _sys_admin_evidence(tmp_path)
+    proc = _import_sys_admin(tmp_path, results, head)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    run_dir = tmp_path / "run"
+    section = json.loads((run_dir / "sections/linux_cap_sys_admin.json").read_text(encoding="utf-8"))
+    assert section["required_set"] == "s21_gate:cap_sys_admin"
+    assert section["capability_probe"] == {
+        "cap": "sys_admin", "available": True,
+        "evidence": f"euid=0 CapEff={format(1 << 21, 'x')}",
+    }
+    assert section["run_euid"] == 0
+    assert section["l1_results"] == "linux_cap_sys_admin/l1-results.json"
+    l1_path = run_dir / section["l1_results"]
+    l1 = json.loads(l1_path.read_text(encoding="utf-8"))
+    spec = importlib.util.spec_from_file_location("l1_judge_sys_admin_test", ROOT / "tests/acceptance/l1_judge.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    result = module.judge(l1, required["nodeids"], platform="linux", selector=required["selector"])
+    assert result["verdict"] == "PASS", result
+    assert (run_dir / "logs/linux_cap_sys_admin.log").read_text(encoding="utf-8") == "cap_sys_admin test completed\n"
+
+
+def test_slice21_gate_routes_external_sys_admin_results_to_importer():
+    text = (ROOT / "scripts/rust/slice21_gate.sh").read_text(encoding="utf-8")
+    external = text.index('if [[ "$cap" == "sys_admin" && -n "${SW_GATE_SYS_ADMIN_RESULTS:-}" ]]')
+    fallback = text.index('probe="$(cap_probe "$cap")"', external)
+    assert "slice21_sys_admin_evidence.py" in text[external:fallback]
+    assert "import-section" in text[external:fallback]
+    assert "continue" in text[external:fallback]
+    assert "SW_GATE_SYS_ADMIN_RESULTS" in text
+
+
+def test_sys_admin_docker_driver_uses_only_disposable_root_container():
+    script = ROOT / "scripts/rust/slice21_sys_admin_docker.sh"
+    text = script.read_text(encoding="utf-8")
+    assert "docker run" in text and "--rm" in text and "--cap-add SYS_ADMIN" in text
+    assert "ubuntu:24.04" in text
+    assert 'target=/workspace,readonly' in text
+    assert "target=/host-rustup,readonly" in text
+    assert "CARGO_TARGET_DIR=/tmp/" in text
+    assert "--device" not in text and "--privileged" not in text and "/dev/ttyUSB" not in text
