@@ -1187,11 +1187,44 @@ impl FlashRig {
         self.settle();
     }
 
-    /// 驅動直到下一次 `on_flash_open` 返回。
+    /// 驅動直到下一次 `on_flash_open` 返回，且本次 probe 的終止事件已送達、actor 已解除 probe 狀態。
     pub fn run_detection(&self) {
-        let before = self.coord().opens_completed_for_test();
+        let coord = self.coord();
+        let before = coord.opens_completed_for_test();
+        let previous_events = coord.flash_events_for_test();
         self.drive_until("on_flash_open 返回", |r| {
             r.coord().opens_completed_for_test() > before
+        });
+
+        let starts: Vec<_> = coord
+            .flash_events_for_test()
+            .into_iter()
+            .filter(|event| {
+                event.kind == "FlashSyncProbeStart" && !previous_events.contains(event)
+            })
+            .collect();
+        wait_real("本次 probe 終止事件與 actor 狀態收斂", || {
+            let events = coord.flash_events_for_test();
+            starts.iter().all(|start| {
+                let matched = events.iter().any(|event| {
+                    event.com == start.com
+                        && event.probe_id == start.probe_id
+                        && event.kind == "FlashSyncMatched"
+                });
+                let finished = events.iter().any(|event| {
+                    event.com == start.com
+                        && event.probe_id == start.probe_id
+                        && event.kind
+                            == if matched {
+                                "FlashHolderGone"
+                            } else {
+                                "FlashProbeReleased"
+                            }
+                });
+                finished
+                    && self.flash_mode_of(&start.com) == FlashMode::Off
+                    && !self.flash_critical(&start.com)
+            })
         });
     }
 
