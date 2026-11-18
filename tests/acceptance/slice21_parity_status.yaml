@@ -509,4 +509,7 @@ rows:
     tests:
       - "tests/test_serial_port.py::TestPosixSerialPortRoundtrip::test_set_baud_runs"
     note: "H* ba29434c：#80 的既有 set_baud node 在 s21_gate:py_parity_76_80 與 pytest-full 均 passed。"
-  - {id: "F-S19", status: INCOMPLETE, reason: "#83 指名的 Python node `tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::test_windows_guarded_write_stall_drain_stalled_native` 已在 s21_gate:py_parity.windows 以 `windows_native and windows_com` selector 登記。2026-11-18 對候選 HEAD 8d21c7b7 的 Windows repo 副本執行 `scripts/stage0/win-pytest.sh --collect-only -q <nodeid> -m 'windows_native and windows_com'`，僅收集到該 node（exit 0）；resource report 的 results 為空、provenance.git.clean=false，沒有執行測試或 native passed 證據，故仍為 INCOMPLETE。Rust Windows COM cancel 測試不是 Python oracle，不替代。"}
+  - id: "F-S19"
+    status: PASS
+    tests: ["tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::test_windows_guarded_write_stall_drain_stalled_native"]
+    reason: "Windows 原生 py_parity_windows 證據：候選 cda9eae295e2b583484a402da46f501a8d684657 的 evidence/cand-cda9eae2/windows-l1/s21_gate:py_parity/l1-results.json 記錄此 node passed 1 次，provenance.platform=windows，起訖 HEAD 相同且 clean=true；slice21 py_parity_windows 段 PASS。"

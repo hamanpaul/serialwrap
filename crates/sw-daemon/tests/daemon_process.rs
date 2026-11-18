@@ -309,20 +309,23 @@ fn no_profiles_message_and_continue() {
 
 #[test]
 fn serial_backend_env_warning_is_emitted_once() {
+    // 指定非原生後端才會警告：POSIX 原生為 termios，Windows 原生為 pyserial。
+    let non_native = match sw_pal::native().caps.native_backend {
+        sw_pal::BackendKind::Posix => "pyserial",
+        sw_pal::BackendKind::Win => "posix",
+    };
     let env = isolated_env();
     let mut vars = env.vars.clone();
-    vars.insert(
-        "SERIALWRAP_SERIAL_BACKEND".to_string(),
-        "pyserial".to_string(),
-    );
+    vars.insert("SERIALWRAP_SERIAL_BACKEND".to_string(), non_native.to_string());
     let mut daemon = DaemonProc::spawn_with(&env, &vars, &[]);
     wait_socket(&env.socket, SHORT);
 
-    let warning =
-        "serialwrapd: SERIALWRAP_SERIAL_BACKEND=pyserial 在 Rust build 無對應後端，改用原生後端";
+    let warning = format!(
+        "serialwrapd: SERIALWRAP_SERIAL_BACKEND={non_native} 在 Rust build 無對應後端，改用原生後端"
+    );
     let stderr = daemon.stderr();
     assert_eq!(
-        stderr.lines().filter(|line| *line == warning).count(),
+        stderr.lines().filter(|line| *line == warning.as_str()).count(),
         1,
         "{stderr}"
     );

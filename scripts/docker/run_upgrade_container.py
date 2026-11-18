@@ -68,6 +68,78 @@ RUNUSER = shutil.which("runuser") or "/usr/sbin/runuser"
 # `daemon stop` 之後等舊 daemon 行程樹與 socket 消失的上限（秒）；逾時該步驟判 FAIL（on-demand 預熱競態裁決）。
 STOP_WAIT_S = 60.0
 
+
+def parse_proc_cmdline(data: bytes) -> list[str]:
+    """解析 /proc/<pid>/cmdline，先移除結尾 NUL，避免 argv 多出空字串。"""
+    payload = data.rstrip(b"\0")
+    if not payload:
+        return []
+    return [part.decode("utf-8", "replace") for part in payload.split(b"\0")]
+
+
+def _read_proc_exe_as_user(proc_exe: pathlib.Path, user: str) -> str:
+    """以 daemon 所屬使用者讀 /proc/<pid>/exe，處理容器內缺少 CAP_SYS_PTRACE 的情況。"""
+    proc = subprocess.run(
+        [RUNUSER, "-u", user, "--preserve-environment", "--", "readlink", "-f", str(proc_exe)],
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+    if proc.returncode != 0:
+        raise PermissionError(proc.stderr.strip() or f"runuser readlink rc={proc.returncode}")
+    target = proc.stdout.rstrip("\n")
+    if not target:
+        raise FileNotFoundError(f"runuser 未回報 {proc_exe} 的目標路徑")
+    return target
+
+
+def classify_bundle_source(
+    exe_path: str | None,
+    argv: list[str],
+    expected_version_dir: pathlib.Path,
+) -> dict[str, Any]:
+    """純函式：只以 executable 路徑是否位於候選版本目錄下判定 bundle 來源。"""
+    expected = pathlib.PurePath(os.path.normpath(str(expected_version_dir)))
+    executable = pathlib.PurePath(os.path.normpath(exe_path)) if exe_path else None
+    from_bundle = executable is not None and (executable == expected or expected in executable.parents)
+    return {
+        "from_bundle": from_bundle,
+        "exe_path": str(executable) if executable is not None else None,
+        "argv_mentions_bundle": any(str(expected) in arg for arg in argv),
+    }
+
+
+def bundle_source_evidence(
+    pid: int,
+    argv: list[str],
+    *,
+    proc_root: pathlib.Path = pathlib.Path("/proc"),
+    expected_version_dir: pathlib.Path = VERSIONS / NEW_VERSION,
+    daemon_user: str = USER,
+) -> dict[str, Any]:
+    """依 daemon 的實際 executable 路徑判斷來源；argv 只留作診斷，不參與判定。"""
+    proc_exe = pathlib.Path(proc_root) / str(pid) / "exe"
+    read_method = "proc_exe"
+    try:
+        try:
+            target = os.readlink(proc_exe)
+        except PermissionError:
+            target = _read_proc_exe_as_user(proc_exe, daemon_user)
+            read_method = f"runuser:{daemon_user}"
+        exe_path = pathlib.Path(target).resolve(strict=True)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        classification = classify_bundle_source(None, argv, expected_version_dir)
+        return {
+            **classification,
+            "exe_read_method": "unavailable",
+            "exe_read_error": f"{type(exc).__name__}: {exc}",
+        }
+
+    return {
+        **classify_bundle_source(str(exe_path), argv, expected_version_dir),
+        "exe_read_method": read_method,
+        "exe_read_error": None,
+    }
+
+
 BENCH_PROFILE = """\
 profiles:
   shellboard:
@@ -512,17 +584,21 @@ class Driver:
         status = self.wait_daemon(version=NEW_VERSION) or {}
         pids = uc.scan_daemon_instances(self.proc_root)
         argv = []
+        evidence = {"from_bundle": False, "exe_path": None, "exe_read_method": "unavailable",
+                    "exe_read_error": "daemon PID 不存在", "argv_mentions_bundle": False}
         if status.get("pid"):
             try:
-                argv = pathlib.Path(f"/proc/{status['pid']}/cmdline").read_bytes().decode("utf-8", "replace").split("\0")
+                cmdline = (self.proc_root / str(status["pid"]) / "cmdline").read_bytes()
+                argv = parse_proc_cmdline(cmdline)
             except OSError:
                 argv = []
-        from_bundle = any(str(VERSIONS / NEW_VERSION) in a for a in argv)
+            evidence = bundle_source_evidence(status["pid"], argv, proc_root=self.proc_root,
+                                             expected_version_dir=VERSIONS / NEW_VERSION, daemon_user=USER)
         ok = start.returncode == 0 and status.get("version") == NEW_VERSION and status.get("multi_open") is False \
-            and pids == [status.get("pid")] and from_bundle
+            and pids == [status.get("pid")] and evidence["from_bundle"]
         self.add(uc.row("new_daemon_started", "PASS" if ok else "FAIL", None if ok else f"{NEW_VERSION} daemon 未正確啟動",
                         start_rc=start.returncode, version=status.get("version"), pid=status.get("pid"),
-                        multi_open=status.get("multi_open"), instances=pids, argv=argv[:6]))
+                        multi_open=status.get("multi_open"), instances=pids, argv=argv[:6], **evidence))
         self._check_supervision("supervision_reconciled", status.get("pid"))
         self.add(uc.judge_state_compatible(self.baseline, self.state_view(), "state_compatible_upgrade"))
         self.add(uc.judge_doctor("doctor_green_new", self.doctor(f"{NEW_VERSION} doctor"), require_pairing=True))
@@ -532,17 +608,21 @@ class Driver:
         status = self.wait_daemon(version=NEW_VERSION) or {}
         pids = uc.scan_daemon_instances(self.proc_root)
         argv = []
+        evidence = {"from_bundle": False, "exe_path": None, "exe_read_method": "unavailable",
+                    "exe_read_error": "daemon PID 不存在", "argv_mentions_bundle": False}
         if status.get("pid"):
             try:
-                argv = pathlib.Path(f"/proc/{status['pid']}/cmdline").read_bytes().decode("utf-8", "replace").split("\0")
+                cmdline = (self.proc_root / str(status["pid"]) / "cmdline").read_bytes()
+                argv = parse_proc_cmdline(cmdline)
             except OSError:
                 argv = []
-        from_bundle = any(str(VERSIONS / NEW_VERSION) in a for a in argv)
+            evidence = bundle_source_evidence(status["pid"], argv, proc_root=self.proc_root,
+                                             expected_version_dir=VERSIONS / NEW_VERSION, daemon_user=USER)
         ok = status.get("version") == NEW_VERSION and status.get("multi_open") is False \
-            and pids == [status.get("pid")] and from_bundle
+            and pids == [status.get("pid")] and evidence["from_bundle"]
         self.add(uc.row("new_daemon_started", "PASS" if ok else "FAIL", None if ok else f"{NEW_VERSION} daemon 未由 setup 正確啟動",
                         started_by="setup", version=status.get("version"), pid=status.get("pid"),
-                        multi_open=status.get("multi_open"), instances=pids, argv=argv[:6]))
+                        multi_open=status.get("multi_open"), instances=pids, argv=argv[:6], **evidence))
         config_text = (CONFIG / "config.yaml").read_text(encoding="utf-8") if (CONFIG / "config.yaml").is_file() else ""
         mode_line = "supervision_mode: systemd-system" in config_text.splitlines()
         systemctl = lambda *a: self.run(["systemctl", *a], label="systemctl " + " ".join(a), timeout=30).stdout.strip()  # noqa: E731

@@ -201,6 +201,152 @@ def _load_driver():
     return module
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_bundle_source_uses_proc_exe_for_symlinked_stage2_daemon(tmp_path, monkeypatch):
+    driver = _load_driver()
+    expected = tmp_path / "home" / ".local" / "share" / "serialwrap" / "versions" / driver.NEW_VERSION
+    exe = expected / "bin" / "serialwrapd"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("fake executable", encoding="utf-8")
+    launcher = tmp_path / "home" / ".local" / "bin" / "serialwrapd"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("symlink launcher placeholder", encoding="utf-8")
+
+    proc_root = tmp_path / "proc"
+    pid = 401
+    _proc(proc_root, pid, [str(launcher)])
+    proc_exe = proc_root / str(pid) / "exe"
+    proc_exe.write_text("proc exe placeholder", encoding="utf-8")
+    real_readlink = driver.os.readlink
+
+    def read_exe_target(path, *args, **kwargs):
+        if Path(path) == proc_exe:
+            return str(exe)
+        return real_readlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(driver.os, "readlink", read_exe_target)
+    argv = [str(launcher)]
+
+    # 舊判斷只看 argv，Stage 2 的 .local/bin symlink 不含 bundle 版本目錄。
+    assert not any(str(expected) in arg for arg in argv)
+    evidence = driver.bundle_source_evidence(pid, argv, proc_root=proc_root, expected_version_dir=expected)
+    assert evidence["from_bundle"] is True, evidence
+    assert evidence["exe_path"] == str(exe.resolve())
+    assert evidence["argv_mentions_bundle"] is False
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_bundle_source_rejects_exe_from_old_version(tmp_path, monkeypatch):
+    driver = _load_driver()
+    versions = tmp_path / "home" / ".local" / "share" / "serialwrap" / "versions"
+    expected = versions / driver.NEW_VERSION
+    old_exe = versions / "0.4.0" / "bin" / "serialwrapd"
+    old_exe.parent.mkdir(parents=True)
+    old_exe.write_text("old fake executable", encoding="utf-8")
+    launcher = tmp_path / "home" / ".local" / "bin" / "serialwrapd"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("symlink launcher placeholder", encoding="utf-8")
+
+    proc_root = tmp_path / "proc"
+    pid = 402
+    _proc(proc_root, pid, [str(launcher)])
+    proc_exe = proc_root / str(pid) / "exe"
+    proc_exe.write_text("proc exe placeholder", encoding="utf-8")
+    real_readlink = driver.os.readlink
+
+    def read_old_exe_target(path, *args, **kwargs):
+        if Path(path) == proc_exe:
+            return str(old_exe)
+        return real_readlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(driver.os, "readlink", read_old_exe_target)
+
+    evidence = driver.bundle_source_evidence(pid, [str(launcher)], proc_root=proc_root,
+                                             expected_version_dir=expected)
+    assert evidence["from_bundle"] is False, evidence
+    assert evidence["exe_path"] == str(old_exe.resolve())
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_bundle_source_fails_closed_when_proc_exe_remains_unreadable(tmp_path, monkeypatch):
+    driver = _load_driver()
+    expected = tmp_path / "home" / ".local" / "share" / "serialwrap" / "versions" / driver.NEW_VERSION
+    exe = expected / "bin" / "serialwrapd"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("fake executable", encoding="utf-8")
+    proc_root = tmp_path / "proc"
+    pid = 403
+    _proc(proc_root, pid, [str(exe)])
+    proc_exe = proc_root / str(pid) / "exe"
+    proc_exe.write_text("proc exe placeholder", encoding="utf-8")
+    real_readlink = driver.os.readlink
+
+    def denied_readlink(path, *args, **kwargs):
+        if Path(path) == proc_exe:
+            raise PermissionError("EACCES")
+        return real_readlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(driver.os, "readlink", denied_readlink)
+    monkeypatch.setattr(driver, "_read_proc_exe_as_user",
+                        lambda path, user: (_ for _ in ()).throw(PermissionError("EACCES")))
+
+    # argv 若仍被當成依據會錯誤通過；無法讀到 exe 時必須 fail-closed。
+    argv = [str(exe)]
+    assert any(str(expected) in arg for arg in argv)
+    assert driver.classify_bundle_source(None, argv, expected)["from_bundle"] is False
+    evidence = driver.bundle_source_evidence(pid, argv, proc_root=proc_root, expected_version_dir=expected)
+    assert evidence["from_bundle"] is False, evidence
+    assert evidence["exe_path"] is None
+    assert evidence["exe_read_error"]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_bundle_source_retries_proc_exe_as_daemon_user_on_eacces(tmp_path, monkeypatch):
+    driver = _load_driver()
+    expected = tmp_path / "home" / ".local" / "share" / "serialwrap" / "versions" / driver.NEW_VERSION
+    exe = expected / "bin" / "serialwrapd"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("fake executable", encoding="utf-8")
+    proc_root = tmp_path / "proc"
+    pid = 404
+    _proc(proc_root, pid, [str(tmp_path / "home" / ".local" / "bin" / "serialwrapd")])
+    proc_exe = proc_root / str(pid) / "exe"
+    proc_exe.write_text("proc exe placeholder", encoding="utf-8")
+    real_readlink = driver.os.readlink
+
+    def denied_readlink(path, *args, **kwargs):
+        if Path(path) == proc_exe:
+            raise PermissionError("EACCES")
+        return real_readlink(path, *args, **kwargs)
+
+    calls = []
+
+    def read_as_user(path, user):
+        calls.append((path, user))
+        return str(exe.resolve())
+
+    monkeypatch.setattr(driver.os, "readlink", denied_readlink)
+    monkeypatch.setattr(driver, "_read_proc_exe_as_user", read_as_user)
+
+    evidence = driver.bundle_source_evidence(pid, [str(driver.BIN / "serialwrapd")],
+                                             proc_root=proc_root, expected_version_dir=expected)
+    assert evidence["from_bundle"] is True, evidence
+    assert evidence["exe_path"] == str(exe.resolve())
+    assert calls == [(proc_exe, driver.USER)]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_proc_cmdline_parser_removes_trailing_nul():
+    driver = _load_driver()
+    argv = str(driver.BIN / "serialwrapd")
+    assert driver.parse_proc_cmdline(argv.encode() + b"\0\0") == [argv]
+
+
 class _FakeContainer:
     """容器內 0.3.2／新版（`NEW_VERSION`）行為的記憶體替身：假 /proc 與 socket；`daemon stop` 先刪 socket 並回應，舊行程延遲
     `exit_delay` 秒才結束（None＝永不結束）。行程未結束前 `daemon start` 回 DAEMON_ALREADY_RUNNING_ELSEWHERE、
@@ -1192,6 +1338,18 @@ def test_run_upgrade_refuses_existing_evidence(tmp_path):
     assert r.returncode == 2, r.stdout + r.stderr
 
 
+def _assert_bundle_source_report(report):
+    check = next(row for row in report["checks"] if row["id"] == "new_daemon_started")
+    detail = check["detail"]
+    expected = Path("/", "home", "swtest", ".local", "share", "serialwrap", "versions") / NEW_VERSION
+    exe_path = Path(detail["exe_path"])
+    assert detail["from_bundle"] is True, check
+    assert expected in exe_path.parents, check
+    assert detail["exe_read_method"] in {"proc_exe", "runuser:swtest"}, check
+    assert detail["exe_read_error"] is None, check
+    assert "" not in detail["argv"], check
+
+
 @pytest.mark.posix_only
 @pytest.mark.process_rpc
 @pytest.mark.supervisor_runtime
@@ -1217,6 +1375,7 @@ def test_docker_upgrade_0_3_2_to_0_4_0(tmp_path):
         assert rep["verdict"] == "PASS", diag
         assert rep["evidence_layer"] == "L1.5-docker"
         assert rep["old_version"] == "0.3.2" and rep["new_version"] == NEW_VERSION
+        _assert_bundle_source_report(rep)
 
 
 # ---------- OD-50：install.sh 升級路徑（0.3.2 pipx、daemon 已停止 → install.sh --bundle） ----------
@@ -1421,3 +1580,4 @@ def test_docker_install_sh_upgrade_from_0_3_2(tmp_path):
         assert rep["scenario"] == "install-sh"
         assert rep["verdict"] == "PASS", diag
         assert {c["id"] for c in rep["checks"]} >= set(uc.REQUIRED_INSTALL_SH_CHECKS)
+        _assert_bundle_source_report(rep)
