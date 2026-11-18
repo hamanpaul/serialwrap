@@ -139,7 +139,8 @@ record_existing() {
 
 SHARED_WIN_RC=""
 import_shared_windows_l1() {  # import_shared_windows_l1 <required-set> <destination>
-  local set_id="$1" destination="$2" result="$RUN/logs/shared-windows-${set_id}.json"
+  local set_id="$1" destination="$2"
+  local result="$RUN/logs/shared-windows-${set_id}.json"
   [[ "$SHARED_ARTIFACTS_VALID" == "1" ]] || return 3
   if ! python3 scripts/rust/gate_shared_evidence.py import-section --shared-evidence "$SHARED_EVIDENCE" \
       --gate p7 --section "windows_l1:$set_id" --required-set "$set_id" --platform windows \

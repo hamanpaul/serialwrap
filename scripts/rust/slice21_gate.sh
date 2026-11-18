@@ -119,7 +119,8 @@ run_logged() {  # run_logged <log 名稱> <命令…>
 
 SHARED_L1_RC=""
 shared_windows_l1() {  # shared_windows_l1 <required-set> <gate> <output-dir>
-  local set_id="$1" gate="$2" output="$3" result="$RUN_DIR/logs/shared-windows-${set_id}.json"
+  local set_id="$1" gate="$2" output="$3"
+  local result="$RUN_DIR/logs/shared-windows-${set_id}.json"
   [[ "$SHARED_ARTIFACTS_VALID" == "1" ]] || return 3
   if ! python3 scripts/rust/gate_shared_evidence.py import-section \
       --shared-evidence "$SHARED_EVIDENCE" --gate "$gate" --section "windows_l1:$set_id" \
