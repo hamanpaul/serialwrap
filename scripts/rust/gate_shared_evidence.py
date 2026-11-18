@@ -639,8 +639,17 @@ def init_manifest(shared_dir: Path, artifact_paths: Mapping[str, Path], *, head:
             Path(candidate_bundle), shared_dir=shared_dir,
             expected_head=head if head is not None else get_current_head(),
         )
-        existing = list(shared_dir.iterdir())
-        if existing and (len(existing) != 1 or existing[0].resolve() != Path(candidate_bundle).resolve()):
+        # 只允許：候選 bundle 本身，以及 gate_shared.sh 在 init 前寫的 logs/gate-prereqs.log（一般檔、logs/ 內別無他物）。
+        bundle_path = Path(candidate_bundle).resolve()
+        prereq_dir = shared_dir / "logs"
+        for entry in shared_dir.iterdir():
+            if entry.resolve() == bundle_path:
+                continue
+            if (entry == prereq_dir and entry.is_dir() and not entry.is_symlink()
+                    and [p.name for p in entry.iterdir()] == ["gate-prereqs.log"]
+                    and (entry / "gate-prereqs.log").is_file()
+                    and not (entry / "gate-prereqs.log").is_symlink()):
+                continue
             raise ValueError(f"候選 bundle 以外的輸出目錄內容不允許：{shared_dir}")
     shared_dir.mkdir(parents=True, exist_ok=True)
     artifact_rows: dict[str, dict[str, str]] = {}

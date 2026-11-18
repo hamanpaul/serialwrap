@@ -1105,3 +1105,52 @@ def test_gate_shared_artifact_paths_keep_cli_and_daemon_basenames():
         for stale in ("/artifacts/debug_cli", "/artifacts/debug_daemon",
                       "/artifacts/release_cli", "/artifacts/release_daemon"):
             assert stale not in source, f"{filename} 仍讀取舊共用 artifact 路徑：{stale}"
+
+
+def _init_with_extra(tmp_path: pathlib.Path, monkeypatch, extra) -> None:
+    api = _module()
+    head = api.get_current_head()
+    assert head
+    monkeypatch.setattr(api, "get_current_head", lambda root=ROOT: head)
+    monkeypatch.setattr(api, "is_worktree_clean", lambda root=ROOT: True)
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    extra(shared)
+    bundle = _make_release_bundle(shared / "candidate-bundle", head=head, payload="candidate-a")
+    sources = {}
+    for name in ("debug_cli", "debug_daemon"):
+        path = tmp_path / name
+        path.write_text(name, encoding="utf-8")
+        sources[name] = path
+    for artifact_name, executable_name in (("release_cli", "serialwrap"), ("release_daemon", "serialwrapd")):
+        sources[artifact_name] = bundle / "versions" / CURRENT_VERSION / "bin" / executable_name
+    api.init_manifest(shared, sources, head=head, clean=True, candidate_bundle=bundle)
+
+
+def test_init_manifest_accepts_driver_prereq_log_next_to_candidate_bundle(tmp_path, monkeypatch):
+    """候選版 36ef2d7b 實跑：gate_shared.sh 先建 RUN_DIR/logs/gate-prereqs.log 才 init，init 卻拒絕整個目錄。"""
+    def prereq_log(shared: pathlib.Path) -> None:
+        (shared / "logs").mkdir()
+        (shared / "logs" / "gate-prereqs.log").write_text("ok\\n", encoding="utf-8")
+
+    _init_with_extra(tmp_path, monkeypatch, prereq_log)
+
+
+@pytest.mark.parametrize(
+    "extra_kind", ["stray_file", "stray_dir", "extra_log", "prereq_log_is_dir"],
+)
+def test_init_manifest_still_rejects_other_content(tmp_path, monkeypatch, extra_kind):
+    def extra(shared: pathlib.Path) -> None:
+        if extra_kind == "stray_file":
+            (shared / "old.json").write_text("{}", encoding="utf-8")
+        elif extra_kind == "stray_dir":
+            (shared / "coverage").mkdir()
+        elif extra_kind == "extra_log":
+            (shared / "logs").mkdir()
+            (shared / "logs" / "gate-prereqs.log").write_text("ok\\n", encoding="utf-8")
+            (shared / "logs" / "other.log").write_text("x\\n", encoding="utf-8")
+        else:
+            (shared / "logs" / "gate-prereqs.log").mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="候選 bundle 以外的輸出目錄內容不允許"):
+        _init_with_extra(tmp_path, monkeypatch, extra)
