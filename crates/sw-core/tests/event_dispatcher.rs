@@ -7,7 +7,7 @@
 #![cfg(feature = "test-fakes")]
 mod common;
 
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use common::p7::{b64, golden_rows, rule_json};
@@ -143,11 +143,37 @@ struct Rig {
     clock: Arc<FakeClock>,
     env: Arc<FakeEnv>,
     emit: RecordingEmit,
+    counter_save_signal: Option<Arc<CounterSaveSignal>>,
 }
 
 fn rig_with_clock(clock: Arc<FakeClock>) -> Rig {
     let dir = tempfile::tempdir().unwrap();
-    let counters = Arc::new(CounterStore::new(dir.path().into(), sw_pal::native().fs).unwrap());
+    let delay_ms = std::env::var("SW_TEST_COUNTER_SAVE_DELAY_MS")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .expect("SW_TEST_COUNTER_SAVE_DELAY_MS 必須是整數")
+        })
+        .filter(|value| *value > 0);
+    let (fs, counter_save_signal): (
+        Arc<dyn sw_pal::traits::FsOps>,
+        Option<Arc<CounterSaveSignal>>,
+    ) = match delay_ms {
+        Some(delay_ms) => {
+            let signal = Arc::new(CounterSaveSignal::default());
+            (
+                Arc::new(CounterSaveDelayFs {
+                    inner: sw_pal::native().fs,
+                    delay: Duration::from_millis(delay_ms),
+                    signal: signal.clone(),
+                }),
+                Some(signal),
+            )
+        }
+        None => (sw_pal::native().fs, None),
+    };
+    let counters = Arc::new(CounterStore::new(dir.path().into(), fs).unwrap());
     let env = Arc::new(FakeEnv::default());
     env.vars
         .lock()
@@ -159,6 +185,7 @@ fn rig_with_clock(clock: Arc<FakeClock>) -> Rig {
         clock,
         env,
         emit: RecordingEmit::default(),
+        counter_save_signal,
     }
 }
 
@@ -169,6 +196,36 @@ fn rig() -> Rig {
 }
 
 impl Rig {
+    fn wait_for_counter_save_start(&self, count: usize) {
+        if let Some(signal) = &self.counter_save_signal {
+            signal.wait_for_at_least(count);
+        }
+    }
+
+    fn wait_for_counter(
+        &self,
+        rule_id: &str,
+        expected_fires: i128,
+        expected_last_fire_ts: Option<i128>,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let counter = self.counters.load(rule_id).unwrap();
+            let last_fire_matches = match expected_last_fire_ts {
+                Some(expected) => counter.last_fire_ts == Some(PyInt::Small(expected)),
+                None => counter.last_fire_ts.is_some(),
+            };
+            if counter.fires == PyInt::Small(expected_fires) && last_fire_matches {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "逾時等待 {rule_id} 計數更新：期望 fires={expected_fires}, last_fire_ts={expected_last_fire_ts:?}；目前 {counter:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn start(&self, max: usize, sp: Arc<dyn HandlerSpawner>) -> Dispatcher {
         let clock: Arc<dyn Clock> = self.clock.clone();
         let env: Arc<dyn SysEnv> = self.env.clone();
@@ -196,7 +253,106 @@ fn ok(stdout: &[u8]) -> HandlerOutcome {
 }
 
 fn soon() -> Instant {
-    Instant::now() + Duration::from_secs(5)
+    let deadline_ms = std::env::var("SW_TEST_STOP_DEADLINE_MS")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .expect("SW_TEST_STOP_DEADLINE_MS 必須是整數")
+        })
+        .unwrap_or(5_000);
+    Instant::now() + Duration::from_millis(deadline_ms)
+}
+
+#[derive(Default)]
+struct CounterSaveSignal {
+    started: Mutex<usize>,
+    cv: Condvar,
+}
+
+impl CounterSaveSignal {
+    fn wait_for_at_least(&self, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut started = self.started.lock().unwrap_or_else(|e| e.into_inner());
+        while *started < expected {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                remaining > Duration::ZERO,
+                "逾時等待 {expected} 次 counter 寫入起始，目前 {started}"
+            );
+            let (next, timeout) = self
+                .cv
+                .wait_timeout(started, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            started = next;
+            assert!(
+                !timeout.timed_out() || *started >= expected,
+                "逾時等待 {expected} 次 counter 寫入起始，目前 {started}"
+            );
+        }
+    }
+
+    fn mark_started(&self) {
+        let mut started = self.started.lock().unwrap_or_else(|e| e.into_inner());
+        *started += 1;
+        self.cv.notify_all();
+    }
+}
+
+/// 測試專用的 `FsOps` 包裝：只延遲 counter 暫存檔寫入，以重現事件已 emit、計數尚未持久化的窗口。
+struct CounterSaveDelayFs {
+    inner: Arc<dyn sw_pal::traits::FsOps>,
+    delay: Duration,
+    signal: Arc<CounterSaveSignal>,
+}
+
+impl sw_pal::traits::FsRead for CounterSaveDelayFs {
+    fn read(&self, path: &std::path::Path) -> sw_pal::traits::PalResult<Vec<u8>> {
+        self.inner.read(path)
+    }
+    fn exists(&self, path: &std::path::Path) -> bool {
+        self.inner.exists(path)
+    }
+    fn is_dir(&self, path: &std::path::Path) -> bool {
+        self.inner.is_dir(path)
+    }
+    fn is_file(&self, path: &std::path::Path) -> bool {
+        self.inner.is_file(path)
+    }
+    fn list_dir(&self, path: &std::path::Path) -> sw_pal::traits::PalResult<Vec<String>> {
+        self.inner.list_dir(path)
+    }
+}
+
+impl sw_pal::traits::FsOps for CounterSaveDelayFs {
+    fn mkdirs(&self, path: &std::path::Path) -> sw_pal::traits::PalResult<()> {
+        self.inner.mkdirs(path)
+    }
+    fn replace(
+        &self,
+        from: &std::path::Path,
+        to: &std::path::Path,
+    ) -> sw_pal::traits::PalResult<()> {
+        self.inner.replace(from, to)
+    }
+    fn sync_file(&self, path: &std::path::Path) -> sw_pal::traits::PalResult<()> {
+        self.inner.sync_file(path)
+    }
+    fn create_truncate(
+        &self,
+        path: &std::path::Path,
+        bytes: &[u8],
+    ) -> sw_pal::traits::PalResult<()> {
+        if path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.ends_with(".counter.json.tmp"))
+        {
+            self.signal.mark_started();
+            std::thread::sleep(self.delay);
+        }
+        self.inner.create_truncate(path, bytes)
+    }
 }
 
 fn wait_for_clock_wait(
@@ -266,6 +422,9 @@ fn per_rule_busy_and_per_daemon_saturated() {
     );
     sp.release_all(ok(b"ok"));
     r.emit.wait_for("fire_completed", 2);
+    r.wait_for_counter_save_start(2);
+    r.wait_for_counter("o.a", 1, None);
+    r.wait_for_counter("o.b", 1, None);
     let rep = d.stop(soon());
     assert_eq!(rep, DispatcherStopReport::default());
     assert_eq!(r.emit.of_type("fire_completed").len(), 2);
@@ -282,6 +441,8 @@ fn fire_completed_shape() {
     let d = r.start(8, sp.clone());
     d.dispatch(fire("o.a", "COM0", 42), "line".into());
     r.emit.wait_for("fire_completed", 1);
+    r.wait_for_counter_save_start(1);
+    r.wait_for_counter("o.a", 1, None);
     d.stop(soon());
     let ev = &r.emit.of_type("fire_completed")[0];
     assert_eq!(
@@ -345,6 +506,8 @@ fn fire_timeout_shape() {
     let d = r.start(8, sp);
     d.dispatch(fire("o.a", "COM0", 5), "line".into());
     r.emit.wait_for("fire_timeout", 1);
+    r.wait_for_counter_save_start(1);
+    r.wait_for_counter("o.a", 1, None);
     d.stop(soon());
     let ev = &r.emit.of_type("fire_timeout")[0];
     assert_eq!(
@@ -370,6 +533,8 @@ fn spawn_failure_reports_fire_failed() {
     let d = r.start(8, sp);
     d.dispatch(fire("o.a", "COM0", 5), "line".into());
     r.emit.wait_for("fire_failed", 1);
+    r.wait_for_counter_save_start(1);
+    r.wait_for_counter("o.a", 1, Some(1_000_500));
     d.stop(soon());
     assert_eq!(
         dumps_default(&PyValue::Dict(r.emit.of_type("fire_failed")[0].clone())),
@@ -520,6 +685,8 @@ fn last_fire_ts_is_end_time() {
     let d = r.start(8, sp);
     d.dispatch(fire("o.a", "COM0", 1), "x".into());
     r.emit.wait_for("fire_completed", 1);
+    r.wait_for_counter_save_start(1);
+    r.wait_for_counter("o.a", 1, Some(1_002_000));
     d.stop(soon());
     let ev = &r.emit.of_type("fire_completed")[0];
     assert_eq!(ev.get("duration_ms"), Some(&PyValue::from(2000)));
@@ -709,6 +876,8 @@ fn close_intake_rejects_new_dispatch() {
     );
     sp.release_all(ok(b""));
     r.emit.wait_for("fire_completed", 1);
+    r.wait_for_counter_save_start(1);
+    r.wait_for_counter("o.a", 1, None);
     assert_eq!(sp.aborts_seen(), [false], "原 handler 不被 abort");
     assert_eq!(d.stop(soon()), DispatcherStopReport::default());
     assert_eq!(r.counters.load("o.a").unwrap().fires, PyInt::Small(1));
