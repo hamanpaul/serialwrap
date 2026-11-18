@@ -213,7 +213,7 @@ basic_report_sha=""
 [[ ! -f "$report_dir/basic/func-test-report.json" ]] || basic_report_sha="$(sha256sum "$report_dir/basic/func-test-report.json" | cut -d' ' -f1)"
 python3 - "$report_dir/win-func-test-meta.json" "$run_id" "$SW_WIN_HEAD" "$SW_WIN_TREE" "$SW_WIN_GIT_CLEAN" \
   "$selftest" "$selftest_sha" "$cli_sha" "$RUNNER_TIMEOUT_S" "$DAEMON_COM" "$BRIDGE_COM" \
-  "$TRANSPORT_MODE" "$scenario_rc" "$basic_rc" "$(json_array "${scenario_argv[@]}")" "$(json_array "${basic_argv[@]}")" \\
+  "$TRANSPORT_MODE" "$scenario_rc" "$basic_rc" "$(json_array "${scenario_argv[@]}")" "$(json_array "${basic_argv[@]}")" \
   "$BUNDLE_IDENTITY_JSON" "$basic_report_sha" "$CASE_FILTER" "$([[ "$BUNDLE_STAGE" == "rust-2" ]] && echo true || echo false)" <<'PY'
 import datetime as dt
 import json
