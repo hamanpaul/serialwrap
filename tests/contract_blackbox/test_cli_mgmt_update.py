@@ -76,7 +76,7 @@ def _start_rig(tmp_path: Path, env: dict[str, str], *, delay_ms: int = 1):
     profile_dir = prepare_profile(env)
     bridge = BridgeTarget.start(tmp_path / "bridge", env, delay_ms=delay_ms)
     try:
-        daemon = start_python_daemon(env, profile_dir)
+        daemon = start_python_daemon(env, profile_dir, bridge=bridge)
     except BaseException:
         bridge.stop()
         raise
