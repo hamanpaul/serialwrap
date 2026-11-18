@@ -21,4 +21,4 @@ Windows `win-serial` 路徑在該次審查中只有 mock 驗證，沒有真實 C
 
 ## 審查來源
 
-`/home/paul_chen/b-log/rust-refactor/exec/s2/gfx/od101-review.md`，段落「bridge 差異核准結論」。
+OD-101 獨立審查報告（證據識別 `OD101-REVIEW`），段落「bridge 差異核准結論」；原始審查檔存於編排者稽核資料，不在 repo 文件中記錄本機路徑。

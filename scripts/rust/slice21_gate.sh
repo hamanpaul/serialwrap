@@ -888,8 +888,9 @@ else
 fi
 
 # 12. policy check
-run_logged policy_check python3 -m policy_check --repo .
-record policy_check --command "python3 -m policy_check --repo ." --exit "$LAST_RC" --log logs/policy_check.log \
+POLICY_LABEL="release:$(cat "$ROOT/VERSION")"
+run_logged policy_check python3 -m policy_check --repo . --pr-labels "$POLICY_LABEL"
+record policy_check --command "python3 -m policy_check --repo . --pr-labels $POLICY_LABEL" --exit "$LAST_RC" --log logs/policy_check.log \
   --section-verdict "$([[ $LAST_RC == 0 ]] && echo PASS || echo FAIL)"
 
 # 9c. identity（CLI／daemon sha256、版本）＋判定

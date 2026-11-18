@@ -145,6 +145,9 @@ def test_full_pytest_runs_exactly_once_after_register_and_check():
     chk = _step_index(text, "check_p4_cases.py --check")
     pyt = _step_index(text, full)
     assert reg < chk < pyt, "register 與 check_p4_cases 必須先於完整 pytest（測試讀取 target/p4-evidence）"
+    assert 'step policy_check python3 -m policy_check --repo . --pr-labels "$POLICY_LABEL"' in text
+    assert 'POLICY_LABEL="release:$(cat "$REPO/VERSION")"' in text
+    assert 'log "policy_check_pr_label=$POLICY_LABEL"' in text
 
 
 def test_register_carries_windows_cli_and_junit():

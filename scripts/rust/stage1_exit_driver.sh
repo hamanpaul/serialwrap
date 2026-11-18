@@ -430,7 +430,9 @@ main() {
     --win-report "$WB_REPORT" --windows-com "$WB_DIR")
   log "GATE_ARGS=${GATE_ARGS[*]}"
   step stage1a_gate python3 scripts/rust/stage1a_gate.py "${GATE_ARGS[@]}"
-  step policy_check python3 -m policy_check --repo .
+  POLICY_LABEL="release:$(cat "$REPO/VERSION")"
+  log "policy_check_pr_label=$POLICY_LABEL"
+  step policy_check python3 -m policy_check --repo . --pr-labels "$POLICY_LABEL"
   step tools_contracts python3 -m tools.contracts check
   step git_status_end bash -c 'git status --short; echo "HEAD=$(git rev-parse HEAD)"'
 

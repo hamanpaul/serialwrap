@@ -2012,6 +2012,8 @@ def test_slice24_exit_binds_candidate_bundle():
     assert 'PRIOR_CASE_ARGS+=(--slice23-run "$PRIOR_SLICE23")' in script
     assert 'CONTRACT_COVERAGE_ARGS+=("${PRIOR_CASE_ARGS[@]}")' in script
     assert '--expect-git-revision "$(git rev-parse HEAD)"' in script
+    assert 'run_logged policy-check python3 -m policy_check --repo . --pr-labels "$POLICY_LABEL"' in script
+    assert '實際帶入的 label：`%s`' in script
 
 
 def _rewrite_gate(src: Path, platform: str, name: str, mutate) -> None:
@@ -2479,6 +2481,30 @@ def test_stage2_contract_ids_have_locked_rust_coverage_not_stage1_python():
         for nodeid in row.get("nodeids", [])
         if isinstance(nodeid, str)
     }
+    # OD-105 分類 3：此 Windows COM 節點以 S24 凍結 acceptance case 承擔，
+    # 不屬 Linux L1 required set；只核准這個與 case lock 精確綁定的 nodeid。
+    case_only_windows_nodes = {
+        "tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown":
+            "case:s24-ho-windows-com",
+    }
+    case_lock = json.loads((ROOT / "tests/acceptance/cases.lock.json").read_text(encoding="utf-8"))
+    for nodeid, case_id in case_only_windows_nodes.items():
+        case_row = universe.get(case_id)
+        case_key = case_id.removeprefix("case:")
+        locked_case = case_lock.get("case_attrs", {}).get(case_key)
+        assert case_row is not None, f"OD-105 承擔 case 不存在：{case_id}"
+        assert case_key in case_lock.get("sets", {}).get("slice_2.4", []), f"OD-105 case 未列入 S24 凍結集合：{case_id}"
+        assert locked_case is not None, f"OD-105 承擔 case 未凍結：{case_id}"
+        assert locked_case.get("necessity") == "required"
+        assert locked_case.get("layer") == "L1.5"
+        assert locked_case.get("platforms") == ["windows"]
+        assert case_row.get("kind") == "case"
+        assert case_row.get("status") == "L1.5"
+        assert case_row.get("nodeids") == [nodeid], f"OD-105 case/nodeid 對應改變：{case_id}"
+        assert case_row.get("owner_phase") == "P8"
+        assert case_row.get("platforms") == ["windows"]
+        assert "windows_com" in case_row.get("blocked_caps", [])
+
     referenced_rust_nodes = set()
     unlocked = set()
     for item in stage2_targets.values():
@@ -2488,6 +2514,8 @@ def test_stage2_contract_ids_have_locked_rust_coverage_not_stage1_python():
             params = parametrized.get(nodeid)
             expanded = [f"{nodeid}[{param}]" for param in params] if params is not None else [nodeid]
             for executable_nodeid in expanded:
+                if executable_nodeid in case_only_windows_nodes:
+                    continue
                 if executable_nodeid in locked_nodeids:
                     referenced_rust_nodes.add(executable_nodeid)
                 else:

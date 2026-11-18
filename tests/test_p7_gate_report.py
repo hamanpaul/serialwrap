@@ -110,7 +110,7 @@ def test_verify_detects_tampering(tmp_path):
     assert g.verify_report(md, d), "竄改後必須驗證失敗"
 
 
-def test_required_rows_complete():
+def test_required_rows_complete(tmp_path):
     assert set(g.REQUIRED_ROWS) >= {"check_cfg_boundary", "cargo test --workspace", "win-test.sh (non-COM)", "win-test.sh --caps windows_com",
         "contract_blackbox p7 A", "contract_blackbox p7 B", *g.OD59_ROWS, "contract_blackbox slice21 B", "contract_blackbox slice22 B",
         "l15 slice21 B", "l15 slice23 B", "func-test brcm-01-login-flow", "func-test ev-01-spawn-handler",
@@ -119,6 +119,11 @@ def test_required_rows_complete():
         "python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
         "policy_check"}
     script = (ROOT / "scripts/rust/p7_gate.sh").read_text(encoding="utf-8")
+    assert 'run_row "policy_check" policy-check --evidence "$RUN/logs/policy-check.log" -- python3 -m policy_check --repo . --pr-labels "$POLICY_LABEL"' in script
+    row = _row("policy_check")
+    row["argv"] = ["python3", "-m", "policy_check", "--repo", ".", "--pr-labels", "release:0.5.0"]
+    policy_md = g.build_report(_results(tmp_path, [row], name="policy-label-report"))
+    assert "- policy_check_pr_label: `release:0.5.0`" in policy_md
     assert 'win_l1() {  # win_l1 <dir> <該次 win-test log>' in script
     assert 'ls -t "$ROOT"/target/win-test-report' not in script
     assert "--windows-ev01-report" in script and "--windows-ev01-bundle" in script

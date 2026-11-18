@@ -178,6 +178,20 @@ def test_slice24_prereq_failure_is_recorded_before_exit(tmp_path):
         header = "\n".join(driver.splitlines()[:20])
         assert "結束碼" in header and "工作樹不乾淨" in header and "3" in header, name
         assert "gate_prereqs" in header and "4" in header, name
+
+    # OD-105／2026-11-18 裁決：tag 建立前各 gate 只能用 VERSION 推導 release 豁免，且報告保留實際 label。
+    for name, version_root in (
+        ("slice21_gate.sh", "$ROOT"),
+        ("p7_gate.sh", "$ROOT"),
+        ("slice24_exit.sh", "$ROOT"),
+        ("stage1_exit_driver.sh", "$REPO"),
+    ):
+        driver = (ROOT / "scripts/rust" / name).read_text(encoding="utf-8")
+        assert f'POLICY_LABEL="release:$(cat "{version_root}/VERSION")"' in driver, name
+        assert '--pr-labels "$POLICY_LABEL"' in driver, name
+        assert "--pr-labels \"${" not in driver, name
+    s21 = (ROOT / "scripts/rust/slice21_gate.sh").read_text(encoding="utf-8")
+    assert 'record policy_check --command "python3 -m policy_check --repo . --pr-labels $POLICY_LABEL"' in s21
     prereqs = (ROOT / "scripts/rust/gate_prereqs.sh").read_text(encoding="utf-8")
     assert "# 結束碼：" in "\n".join(prereqs.splitlines()[:5])
 

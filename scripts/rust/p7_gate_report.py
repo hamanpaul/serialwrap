@@ -527,6 +527,28 @@ def _owner_status(base: Path, owner_evidence: Mapping[str, Any], bid: str) -> tu
     return "PASS", "擁有者證據已核對"
 
 
+def _policy_check_pr_label(row: Mapping[str, Any] | None) -> str:
+    """回報 policy_check 實際 argv 帶入的 --pr-labels，不從環境或 VERSION 推算。"""
+    if not isinstance(row, Mapping):
+        return "未執行"
+    argv = row.get("argv")
+    if not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv):
+        return "argv 格式錯誤"
+    labels: list[str] = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--pr-labels":
+            labels.append(argv[index + 1] if index + 1 < len(argv) else "<缺值>")
+            index += 2
+        elif arg.startswith("--pr-labels="):
+            labels.append(arg.partition("=")[2])
+            index += 1
+        else:
+            index += 1
+    return "、".join(labels) if labels else "未帶入"
+
+
 def build_report(results_dir: Path, *, l1_lock: Path | None = None) -> str:
     results_dir = Path(results_dir)
     data = json.loads((results_dir / "results.json").read_text(encoding="utf-8"))
@@ -538,6 +560,7 @@ def build_report(results_dir: Path, *, l1_lock: Path | None = None) -> str:
     judge = _load_judge()
     caps_missing = set(data.get("caps_missing") or [])
     rows = {r.get("name"): r for r in data.get("rows") or [] if isinstance(r, Mapping)}
+    policy_label = _policy_check_pr_label(rows.get("policy_check"))
     lines = [
         "# Slice 2.3（P7）出口 gate 報告",
         "",
@@ -545,6 +568,7 @@ def build_report(results_dir: Path, *, l1_lock: Path | None = None) -> str:
         f"- git_head: `{data.get('git_head')}`",
         f"- worktree_clean: `{data.get('worktree_clean')}`",
         f"- caps_missing: `{sorted(caps_missing)}`",
+        f"- policy_check_pr_label: `{policy_label}`",
         f"- tool_versions: `{json.dumps(data.get('tool_versions'), sort_keys=True)}`",
         f"- l1_lock_sha256: `{_sha256(lock_path)}`",
         "",

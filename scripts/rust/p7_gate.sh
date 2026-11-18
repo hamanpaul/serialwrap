@@ -456,7 +456,8 @@ else
     --junitxml="$RUN/pytest-full/junit.xml"
 fi
 # 16. policy check
-run_row "policy_check" policy-check --evidence "$RUN/logs/policy-check.log" -- python3 -m policy_check --repo .
+POLICY_LABEL="release:$(cat "$ROOT/VERSION")"
+run_row "policy_check" policy-check --evidence "$RUN/logs/policy-check.log" -- python3 -m policy_check --repo . --pr-labels "$POLICY_LABEL"
 
 # OD-31：Windows Stage 2 ev-01 是 host 可執行列，不得以 BLOCKED-OWNER 代替缺失證據。
 WINDOWS_EV01_ARGS=(--results-dir "$RUN" --log "$RUN/logs/windows-ev01.log")

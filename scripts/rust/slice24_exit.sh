@@ -538,7 +538,8 @@ run_logged slice-breaker python3 scripts/rust/slice_breaker.py \
   --freeze tests/acceptance/breaker/slice_2.4.json \
   --snapshots tests/acceptance/breaker/slice_2.4.snapshots.ndjson \
   --today "$(date -u +%F)"
-run_logged policy-check python3 -m policy_check --repo .
+POLICY_LABEL="release:$(cat "$ROOT/VERSION")"
+run_logged policy-check python3 -m policy_check --repo . --pr-labels "$POLICY_LABEL"
 
 JSON_REPORT="$RUN_DIR/slice24.json"
 MD_REPORT="$RUN_DIR/slice24.md"
@@ -610,6 +611,9 @@ PY
 else
   echo "slice24_exit.sh: 未產生 slice24.json；請檢查 $RUN_DIR/logs/contract-coverage.log" >&2
   FAILURES=1
+fi
+if [[ -f "$MD_REPORT" ]]; then
+  printf '\n## R-07 release 豁免\n\n- 實際帶入的 label：`%s`\n' "$POLICY_LABEL" >>"$MD_REPORT"
 fi
 
 echo "slice24 JSON: $JSON_REPORT"
