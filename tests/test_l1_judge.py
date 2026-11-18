@@ -790,8 +790,15 @@ def test_l1_lock_frozen_set_excludes_capability_gated() -> None:
     下這些案例必定 SKIP，判定 rule 6 會因此得 INSUFFICIENT，故鎖檔不得含之。
     OD-53／OD-55：selector 明確以 `--ignored cap_<cap>__` 執行的能力集合（`_selector_explicit_caps`），其同 cap 前綴的
     cargo 列豁免（gate 以 `--caps <cap>` 於具備能力的原生 Windows 實跑，不在 reference 環境 SKIP）；其他集合仍禁止。
+    OD-101 F-S19 僅允許精確的 Python COM parity node 與 `windows_native and windows_com` selector；不擴大其他集合的豁免。
     """
     lock = json.loads(Path("tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    f_s19 = "tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::test_windows_guarded_write_stall_drain_stalled_native"
+    f_s19_selector = {
+        "argv": ["-q", f_s19, "-m", "windows_native and windows_com"],
+        "markexpr": "windows_native and windows_com",
+        "paths": [f_s19],
+    }
     cache: dict = {}
     for set_id in lock["sets"]:
         for plat, spec in lock["sets"][set_id].items():
@@ -799,8 +806,10 @@ def test_l1_lock_frozen_set_excludes_capability_gated() -> None:
                 continue
             caps = _selector_explicit_caps(spec["selector"])
             flagged = [nid for nid in spec["nodeids"] if _capability_gated(nid, cache)
-                       and not (nid.startswith("cargo:")
-                                and any(nid.rsplit("::", 1)[-1].startswith(f"cap_{cap}__") for cap in caps))]
+                       and not ((nid.startswith("cargo:")
+                                 and any(nid.rsplit("::", 1)[-1].startswith(f"cap_{cap}__") for cap in caps))
+                                or (set_id == "s21_gate:py_parity" and nid == f_s19
+                                    and spec["selector"] == f_s19_selector))]
             assert not flagged, f"{set_id}.windows 含能力 SKIP 案例（須自凍結集合移除）：{flagged[:5]}"
 
 
