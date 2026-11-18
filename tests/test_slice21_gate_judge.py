@@ -1029,7 +1029,9 @@ def test_capability_sections_and_py_parity_match_expect_and_lock():
 
 
 @pytest.mark.parametrize(
-    "problem", ["missing_provenance", "other_head", "dirty", "argv", "markexpr", "provenance_platform", "provenance_schema"]
+    "problem",
+    ["missing_provenance", "other_head", "dirty", "argv", "argv_not_list", "argv_str", "markexpr", "provenance_platform",
+     "provenance_schema"],
 )
 def test_py_parity_windows_rejects_unbound_or_mismatched_l1(case, problem):
     """OD101-04：Windows parity judge 核對 provenance 與凍結 selector／markexpr。"""
@@ -1059,6 +1061,10 @@ def test_py_parity_windows_rejects_unbound_or_mismatched_l1(case, problem):
         l1["provenance"]["schema"] = "other.v1"
     elif problem == "argv":
         l1["argv"].append("tests/unexpected.py")
+    elif problem == "argv_not_list":
+        l1["argv"] = 7  # OD101F-07：型別錯誤必須記為證據缺失，不得以例外中止 judge
+    elif problem == "argv_str":
+        l1["argv"] = " ".join(selector)
     else:
         l1["markexpr"] = "windows_native"
     case.l1["py_parity_windows"] = l1

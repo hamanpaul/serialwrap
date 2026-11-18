@@ -90,7 +90,9 @@ def test_od72_slice21_nodes_keep_their_assigned_owner() -> None:
     od105 = (ROOT / "docs/rust-refactor/reviews/od105-node-classification.md").read_text(encoding="utf-8")
     od105_rows = [line for line in od105.splitlines() if f"`{deferred_case}`" in line]
     assert len(od105_rows) == 1, "DF-20 案例必須在 OD-105 分類表恰列一次"
-    assert "| 1 |" in od105_rows[0] and "BB-RUST" in od105_rows[0], f"DF-20 案例的 OD-105 承擔不正確：{od105_rows[0]}"
+    assert "| 1 |" in od105_rows[0] and "`1-S24-RUST`" in od105_rows[0], f"DF-20 案例的 OD-105 承擔不正確：{od105_rows[0]}"
+    # DF-20 在 s21_gate:blackbox_rust（rust-s21）與 P7 slice21 B 輪會 skip，承擔只能是 s24_ab（rust-linux）。
+    assert deferred_case not in set(sets["s21_gate:blackbox_rust"]["linux"]["nodeids"]), "DF-20 案例不得列為 blackbox_rust 必要列"
     gate_shared = (ROOT / "scripts/rust/gate_shared.sh").read_text(encoding="utf-8")
     assert "S24_TARGETS=(tests/contract_blackbox " in gate_shared, "s24_ab 必須收集 tests/contract_blackbox 才能承擔 DF-20 案例"
     assert startup_case in linux_nodes, "OD-72 前已屬 Linux slice21 的 startup 案例必須保留原承擔"

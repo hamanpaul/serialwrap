@@ -7,7 +7,7 @@
 | 鍵 | OD-105 分類與承擔／理由 |
 |---|---|
 | `1-L15` | 分類 1：`s21_gate:l15_ab`（`slice21_gate.sh` 的 Task 21 L1.5 A/B，實跑 `tests/acceptance/l15/test_slice21_l15.py`，含 Python 與 Rust 兩輪）。不應誤寫成僅含 Rust node 的 `p7_gate:l15-slice21-b`。H*（`ba29434c`）只作參考，候選版仍須以共用證據重驗。 |
-| `1-BB-RUST` | 分類 1：`s21_gate:blackbox_rust`（Rust `cap_posix_pty` 黑箱套件；本 node 由目錄 selector 執行）。H* 舊跑結果僅作參考，候選版仍須以共用證據重驗。 |
+| `1-S24-RUST` | 分類 1：`s24_ab`（`gate_shared.sh` 以 label `rust-linux` 執行 `S24_TARGETS`，含 `tests/contract_blackbox`；DF-20 案例在 `s21_gate:blackbox_rust`（label `rust-s21`）與 P7 slice21 B 輪依 `ab_rows.py` 為 `deferred_rust_s21` skip，只在 `s24_ab` 實跑）。H*（`ba29434c`）`s24_ab` 的 rust-linux 結果為 passed，僅作參考，候選版須以共用證據重驗。 |
 | `2-S24` | 分類 2：Rust 專屬 CLI 黑箱由 `s24_ab` 承擔；實際共用命令目標含 `tests/contract_blackbox`。H*（`ba29434c`）僅為參考，候選版須重驗。 |
 | `s0_win_pytest.windows` | 分類 3：Stage 0 原生 Windows 全套 Python selector（`-q tests -m 'core_portable or windows_native'`）；selector 覆蓋整個 `tests/`。若表列 node 不在該 set 的凍結 L1 nodeids，仍可能由完整 selector 收集；不因此宣稱列入 required 或已 PASS。 |
 | `s0_bc.windows` | 分類 3：Stage 0 BC-01～BC-05 的 Windows 原生 L1 set（`S0-L1-BC`）；表列 node 依其實際 lock membership 註明。此集合尚未取得目前候選版 Windows 原生執行結果，不代表 PASS。 |
@@ -42,7 +42,7 @@
 | `tests/acceptance/l15/test_slice21_l15.py::test_case[python-SERIALWRAP_L15_PY_DAEMON-s21-quiet-zero-tx]` | 1 | `1-L15` |
 | `tests/acceptance/l15/test_slice21_l15.py::test_case[python-SERIALWRAP_L15_PY_DAEMON-s21-release-attach-handoff]` | 1 | `1-L15` |
 | `tests/acceptance/l15/test_slice21_l15.py::test_case[python-SERIALWRAP_L15_PY_DAEMON-s21-wire-equals-wal]` | 1 | `1-L15` |
-| `tests/contract_blackbox/slice21/test_safety_core.py::test_stale_context_not_replayed` | 1 | `1-BB-RUST` |
+| `tests/contract_blackbox/slice21/test_safety_core.py::test_stale_context_not_replayed` | 1 | `1-S24-RUST` |
 | `tests/contract_blackbox/slice21/test_windows_nocom.py::test_config_yaml_socket_path_written` | 3 | `s0_win_pytest.windows` |
 | `tests/contract_blackbox/slice21/test_windows_nocom.py::test_deferred_methods_windows` | 3 | `s0_win_pytest.windows` |
 | `tests/contract_blackbox/slice21/test_windows_nocom.py::test_second_daemon_exit_2` | 3 | `s0_win_pytest.windows` |

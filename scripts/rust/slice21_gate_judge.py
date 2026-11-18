@@ -261,6 +261,8 @@ def windows_evidence_problems(l1: Any, candidate: Any, selector: Any = None) -> 
             problems.append("py_parity_windows 必須使用 pytest runner")
         if not isinstance(expected_argv, list) or not all(isinstance(arg, str) for arg in expected_argv):
             problems.append("Windows pytest 凍結 selector argv 缺失或格式錯誤")
+        elif not isinstance(actual_argv, list) or not all(isinstance(arg, str) for arg in actual_argv):
+            problems.append("Windows pytest 報告 argv 缺失或格式錯誤")
         else:
             l1j = _l1_judge()
             normalized_report_argv = l1j._report_argv(l1)
