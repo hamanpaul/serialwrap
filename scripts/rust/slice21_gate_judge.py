@@ -261,8 +261,15 @@ def windows_evidence_problems(l1: Any, candidate: Any, selector: Any = None) -> 
             problems.append("py_parity_windows 必須使用 pytest runner")
         if not isinstance(expected_argv, list) or not all(isinstance(arg, str) for arg in expected_argv):
             problems.append("Windows pytest 凍結 selector argv 缺失或格式錯誤")
-        elif not isinstance(actual_argv, list) or len(actual_argv) < 2 or actual_argv[1:] != expected_argv:
-            problems.append(f"Windows pytest argv 不符：report={actual_argv!r} lock={expected_argv!r}")
+        else:
+            l1j = _l1_judge()
+            normalized_report_argv = l1j._report_argv(l1)
+            normalized_selector_argv = l1j.normalize_argv(expected_argv)
+            if normalized_report_argv != normalized_selector_argv:
+                problems.append(
+                    f"Windows pytest argv 不符：report={normalized_report_argv!r} "
+                    f"lock={normalized_selector_argv!r}"
+                )
         provenance = l1.get("provenance")
         if not isinstance(provenance, Mapping) or provenance.get("schema") != "pytest-l1-provenance.v1":
             problems.append("Windows pytest provenance schema 缺失或不符")

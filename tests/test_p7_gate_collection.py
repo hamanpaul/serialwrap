@@ -40,6 +40,26 @@ def test_p7_gate_frozen_nodes_are_collectable() -> None:
         missing = sorted(set(spec["nodeids"]) - collected)
         assert not missing, f"{set_id}.linux 凍結 nodeid 未被 selector 收集：{missing}"
 
+    # OD101I-02：同一 Windows 原生 selector 的三個完整 L1 集合必須凍結同一分母。
+    sets = _lock()["sets"]
+    windows_sets = [
+        sets["s21_core"]["windows"],
+        sets["p7_gate:win-test-sh-non-com"]["windows"],
+        sets["s22_gate:win_test"]["windows"],
+    ]
+    assert windows_sets[0]["selector"] == windows_sets[1]["selector"] == windows_sets[2]["selector"]
+    windows_nodeids = [set(spec["nodeids"]) for spec in windows_sets]
+    assert windows_nodeids[0] == windows_nodeids[1] == windows_nodeids[2]
+
+    # OD101I-12：H* 同一 HEAD 的三份 Windows L1 已收集並 passed 這兩列，不是未解差異。
+    audit = (ROOT / "docs/rust-refactor/reviews/od98-linux-pytest-skipped-audit.md").read_text(encoding="utf-8")
+    assert "需保留為未解差異" not in audit
+    assert "ba29434ce55f1bfd903945b451e269d6915b89e1" in audit
+    assert "selector 完全相同" in audit and "finished=true" in audit and "exit_code=0" in audit
+    assert "failed=0" in audit and "passed=2516" in audit and "skipped=33" in audit
+    assert "exact_cap_kept" in audit and "connection_cap_128_pauses_accept" in audit
+    assert "outcome=passed" in audit and "skip_kind=null" in audit
+
 
 def test_od72_slice21_nodes_keep_their_assigned_owner() -> None:
     """OD-72 移出 Linux slice21 集合時，Windows 案例與 DF-20 案例仍保留承擔。"""
@@ -64,7 +84,15 @@ def test_od72_slice21_nodes_keep_their_assigned_owner() -> None:
     assert not (linux_nodes & windows_cases), f"Windows 原生案例仍在 Linux slice21 集合：{sorted(linux_nodes & windows_cases)}"
     assert windows_cases <= windows_nodes, f"Windows 原生集合缺案例：{sorted(windows_cases - windows_nodes)}"
     assert deferred_case not in linux_nodes, "DF-20 deferred 案例仍在 P7 Linux slice21 集合"
-    assert deferred_case in full_linux_nodes, "DF-20 案例不得從完整 pytest 分母刪除"
+    # OD-105（2026-11-18）：Linux 全套 pytest 不可執行的 DF-20 案例改由 Rust 黑箱承擔，不再留在完整 pytest 分母；
+    # 但必須在 OD-105 分類表以分類 1／Rust 黑箱（s24_ab）列名，且路徑仍在 gate_shared.sh 的 S24_TARGETS 收集範圍內。
+    assert deferred_case not in full_linux_nodes, "OD-105 已將 DF-20 案例移出完整 pytest 分母"
+    od105 = (ROOT / "docs/rust-refactor/reviews/od105-node-classification.md").read_text(encoding="utf-8")
+    od105_rows = [line for line in od105.splitlines() if f"`{deferred_case}`" in line]
+    assert len(od105_rows) == 1, "DF-20 案例必須在 OD-105 分類表恰列一次"
+    assert "| 1 |" in od105_rows[0] and "BB-RUST" in od105_rows[0], f"DF-20 案例的 OD-105 承擔不正確：{od105_rows[0]}"
+    gate_shared = (ROOT / "scripts/rust/gate_shared.sh").read_text(encoding="utf-8")
+    assert "S24_TARGETS=(tests/contract_blackbox " in gate_shared, "s24_ab 必須收集 tests/contract_blackbox 才能承擔 DF-20 案例"
     assert startup_case in linux_nodes, "OD-72 前已屬 Linux slice21 的 startup 案例必須保留原承擔"
     assert reboot_tail_case in linux_nodes, "A1 新增的 background reboot result_tail 案例依裁決保留於 slice21"
 

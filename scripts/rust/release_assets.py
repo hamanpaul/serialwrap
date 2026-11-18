@@ -217,10 +217,11 @@ def validate_assets(*, tag: str, version_file: Path, tag_commit: str, assets_dir
     if assets_dir.is_symlink() or not assets_dir.is_dir():
         raise ReleaseValidationError(f"release assets 目錄不存在或不是一般目錄：{assets_dir}")
     root = assets_dir.resolve()
+    guide_name = "RC-INSTALL.md" if parsed.kind == "rc" else "RELEASE-INSTALL.md"
     expected_names = {
         _bundle_asset_name(parsed.version, "linux"),
         _bundle_asset_name(parsed.version, "windows"),
-        "RC-INSTALL.md",
+        guide_name,
         "SHA256SUMS",
     }
     actual_paths = list(root.iterdir())
@@ -356,6 +357,52 @@ def prepare_rc_assets(
         raise
 
 
+def prepare_formal_assets(
+    *,
+    rc_tag: str,
+    version_file: Path,
+    rc_commit: str,
+    release_tag: str,
+    assets_dir: Path,
+    guide: Path,
+    out_dir: Path,
+) -> dict[str, Any]:
+    """以已驗證 RC 的相同 bundle bytes 建正式版資產，改用正式版說明與 checksum。"""
+    parsed_rc = check_tag_version(rc_tag, version_file)
+    parsed_release = check_tag_version(release_tag, version_file)
+    if parsed_rc.kind != "rc":
+        raise ReleaseValidationError(f"來源 tag 必須是 RC：{rc_tag}")
+    if parsed_release.kind != "release":
+        raise ReleaseValidationError(f"目標 tag 必須是正式版：{release_tag}")
+    if parsed_rc.version != parsed_release.version:
+        raise ReleaseValidationError("來源 RC 與正式版 tag 必須是相同版本")
+    validate_assets(tag=rc_tag, version_file=version_file, tag_commit=rc_commit, assets_dir=assets_dir)
+    if not guide.is_file() or guide.is_symlink():
+        raise ReleaseValidationError(f"正式版安裝說明不存在或不是一般檔案：{guide}")
+    if out_dir.exists() or out_dir.is_symlink():
+        raise ReleaseValidationError(f"正式版輸出目錄已存在，拒絕覆寫：{out_dir}")
+
+    out_dir.mkdir(parents=True)
+    try:
+        linux_name = _bundle_asset_name(parsed_release.version, "linux")
+        windows_name = _bundle_asset_name(parsed_release.version, "windows")
+        shutil.copyfile(assets_dir / linux_name, out_dir / linux_name)
+        shutil.copyfile(assets_dir / windows_name, out_dir / windows_name)
+        shutil.copyfile(guide, out_dir / "RELEASE-INSTALL.md")
+        asset_names = sorted((linux_name, windows_name, "RELEASE-INSTALL.md"))
+        (out_dir / "SHA256SUMS").write_text(
+            "".join(f"{sha256_file(out_dir / name)}  {name}\n" for name in asset_names),
+            encoding="ascii",
+            newline="\n",
+        )
+        return validate_assets(
+            tag=release_tag, version_file=version_file, tag_commit=rc_commit, assets_dir=out_dir,
+        )
+    except Exception:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        raise
+
+
 def _write_github_output(path: Path | None, values: Mapping[str, str]) -> None:
     if path is not None:
         with path.open("a", encoding="utf-8", newline="\n") as handle:
@@ -409,6 +456,20 @@ def _cmd_prepare(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_prepare_formal(args: argparse.Namespace) -> int:
+    report = prepare_formal_assets(
+        rc_tag=args.rc_tag,
+        version_file=args.version_file,
+        rc_commit=args.rc_commit,
+        release_tag=args.tag,
+        assets_dir=args.assets_dir,
+        guide=args.guide,
+        out_dir=args.out_dir,
+    )
+    print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="驗證 Stage 2 RC／正式版 release assets")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -440,6 +501,18 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--guide", type=Path, required=True)
     prepare.add_argument("--out-dir", type=Path, required=True)
     prepare.set_defaults(handler=_cmd_prepare)
+
+    prepare_formal = commands.add_parser(
+        "prepare-formal-assets", help="沿用 RC bundle bytes，建立正式版說明與 checksum",
+    )
+    prepare_formal.add_argument("--rc-tag", required=True)
+    prepare_formal.add_argument("--rc-commit", required=True)
+    prepare_formal.add_argument("--tag", required=True, help="正式版 tag")
+    prepare_formal.add_argument("--version-file", type=Path, required=True)
+    prepare_formal.add_argument("--assets-dir", type=Path, required=True, help="已驗證的 RC 資產目錄")
+    prepare_formal.add_argument("--guide", type=Path, required=True, help="正式版安裝說明")
+    prepare_formal.add_argument("--out-dir", type=Path, required=True)
+    prepare_formal.set_defaults(handler=_cmd_prepare_formal)
     return parser
 
 

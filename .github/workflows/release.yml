@@ -84,16 +84,19 @@ jobs:
             rm -rf "$rc_dir"
             mkdir -p "$rc_dir"
             is_prerelease="$(gh release view "$rc_tag" --json isPrerelease --jq .isPrerelease 2>/dev/null || true)"
-            [ "$is_prerelease" = true ] || continue
+            if [ "$is_prerelease" != true ]; then
+              echo "::error::最新同版 RC 已不存在或不再是 prerelease，拒絕退回舊 RC：$rc_tag"
+              exit 1
+            fi
             if ! gh release download "$rc_tag" --dir "$rc_dir"; then
-              echo "::warning::略過無法下載完整資產的 RC：$rc_tag"
-              continue
+              echo "::error::最新同版 RC 資產下載失敗，拒絕退回舊 RC 或重建：$rc_tag"
+              exit 1
             fi
             rc_commit="$(git rev-parse --verify "refs/tags/${rc_tag}^{commit}" 2>/dev/null || true)"
             if [ -z "$rc_commit" ] || ! python3 scripts/rust/release_assets.py validate-assets \
               --tag "$rc_tag" --version-file VERSION --tag-commit "$rc_commit" --assets-dir "$rc_dir"; then
-              echo "::warning::RC 資產未通過 SHA256／Stage 2／版本／tag commit 驗證：$rc_tag"
-              continue
+              echo "::error::最新同版 RC 資產未通過 SHA256／Stage 2／版本／tag commit 驗證，拒絕退回舊 RC 或重建：$rc_tag"
+              exit 1
             fi
             echo "has_rc=true" >> "$GITHUB_OUTPUT"
             echo "rc_tag=$rc_tag" >> "$GITHUB_OUTPUT"
@@ -156,6 +159,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RC_TAG: ${{ needs.find-rc-assets.outputs.rc_tag }}
+          TAG_NAME: ${{ github.ref_name }}
         run: |
           is_prerelease="$(gh release view "$RC_TAG" --json isPrerelease --jq .isPrerelease)"
           if [ "$is_prerelease" != true ]; then
@@ -167,28 +171,38 @@ jobs:
             echo "::error::RC tag commit 在選取後改變：$RC_TAG"
             exit 1
           fi
+          release_commit="$(git rev-parse --verify "refs/tags/${TAG_NAME}^{commit}")"
+          python3 scripts/rust/release_promote_guard.py \
+            --repo . --rc-commit "$rc_commit" --release-commit "$release_commit"
           assets="$RUNNER_TEMP/promote-assets"
           mkdir -p "$assets"
           gh release download "$RC_TAG" --dir "$assets"
           python3 scripts/rust/release_assets.py validate-assets \
             --tag "$RC_TAG" --version-file VERSION --tag-commit "$rc_commit" --assets-dir "$assets"
           echo "rc_commit=$rc_commit" >> "$GITHUB_OUTPUT"
-      - name: Create formal draft release and upload the validated RC bytes
+      - name: Create formal draft release and upload RC bundle bytes with release instructions
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
+          RC_TAG: ${{ needs.find-rc-assets.outputs.rc_tag }}
+          RC_COMMIT: ${{ needs.find-rc-assets.outputs.rc_commit }}
           VERSION: ${{ needs.classify-tag.outputs.version }}
         run: |
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
             echo "::error::正式 release 已存在，拒絕覆寫：$TAG_NAME"
             exit 1
           fi
-          gh release create "$TAG_NAME" --verify-tag --draft --title "$TAG_NAME" --generate-notes
           assets="$RUNNER_TEMP/promote-assets"
+          formal_assets="$RUNNER_TEMP/formal-assets"
+          python3 scripts/rust/release_assets.py prepare-formal-assets \
+            --rc-tag "$RC_TAG" --rc-commit "$RC_COMMIT" --tag "$TAG_NAME" \
+            --version-file VERSION --assets-dir "$assets" \
+            --guide docs/rust-refactor/stage2-release-install.md --out-dir "$formal_assets"
+          gh release create "$TAG_NAME" --verify-tag --draft --title "$TAG_NAME" --generate-notes
           gh release upload "$TAG_NAME" \
-            "$assets/serialwrap-${VERSION}-linux-x86_64.tar.gz" \
-            "$assets/serialwrap-${VERSION}-windows-x86_64.zip" \
-            "$assets/SHA256SUMS" "$assets/RC-INSTALL.md"
+            "$formal_assets/serialwrap-${VERSION}-linux-x86_64.tar.gz" \
+            "$formal_assets/serialwrap-${VERSION}-windows-x86_64.zip" \
+            "$formal_assets/SHA256SUMS" "$formal_assets/RELEASE-INSTALL.md"
 
       - name: Download and validate uploaded draft bytes before publication
         id: verify-promoted
@@ -469,7 +483,7 @@ jobs:
             exit 1
           fi
 
-          # CLI 不得含任何測試鉤子；daemon 只可含共用檢查器逐名允許的隔離測試鉤子。
+          # 共用檢查器依逐名核准的 parity 鉤子 allowlist 審核 CLI／daemon 標記；任何未列名的測試鉤子均拒絕。
           python3 scripts/rust/check_test_hook_markers.py \
             --binary "$version_dir/bin/serialwrap" --binary "$version_dir/bin/serialwrapd"
           if find "$root" -name 'delegate_sentinel*' | grep -q .; then
@@ -609,6 +623,24 @@ jobs:
           }
           Write-Output "release tag $env:TAG_NAME matches VERSION $fileVersion"
           "VERSION=$fileVersion" | Add-Content -LiteralPath $env:GITHUB_ENV
+
+      - name: Refuse workflow_dispatch if the Windows bundle is already attached
+        id: refuse-dispatch-overwrite
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ inputs.tag }}
+        run: |
+          zip_name="serialwrap-${VERSION}-windows-x86_64.zip"
+          if ! asset_names="$(gh release view "$TAG_NAME" --json assets --jq '.assets[].name')"; then
+            echo "::error::無法確認 release $TAG_NAME 現有資產；拒絕 workflow_dispatch"
+            exit 1
+          fi
+          if printf '%s\n' "$asset_names" | grep -Fqx "$zip_name"; then
+            echo "::error::release $TAG_NAME 已有 $zip_name；拒絕覆寫或重建已發佈 bundle"
+            exit 1
+          fi
 
       - name: Set up Python 3.12.3 (build host)
         uses: actions/setup-python@v5

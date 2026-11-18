@@ -1138,6 +1138,24 @@ def test_py_parity_windows_binds_to_real_frozen_selector(case):
     assert _sec(out, "py_parity_windows")["status"] == "PASS"
     assert out["parity_amendments"]["rows"][0]["status"] == "PASS"
 
+    # win-pytest.sh 的實際 Windows argv：-c、含暫存路徑的 --junitxml= 必須與匯入層同樣正規化。
+    l1["argv"] = [
+        "-c",
+        r"--junitxml=C:\Users\runner\AppData\Local\Temp\sw-stage0\run\junit.xml",
+        *selector["argv"],
+    ]
+    case.l1["py_parity_windows"] = l1
+    out = _judge_mod().judge(case.report(), expect)
+    assert _sec(out, "py_parity_windows")["status"] == "PASS"
+    assert out["parity_amendments"]["rows"][0]["status"] == "PASS"
+
+    # 選擇器任何一項遭竄改都仍須 fail-closed。
+    l1["argv"].append("--maxfail=1")
+    case.l1["py_parity_windows"] = l1
+    out = _judge_mod().judge(case.report(), expect)
+    assert _sec(out, "py_parity_windows")["status"] == "EVIDENCE_MISSING"
+    assert out["parity_amendments"]["rows"][0]["status"] == "INCOMPLETE"
+
 
 def test_py_parity_full_has_complete_selector_and_keeps_old_set():
     """SPEC-GAP #1：s21_gate:py_parity（凍結、selector 只有 1 筆）不改不刪；新集合 py_parity_full 的 selector 須涵蓋

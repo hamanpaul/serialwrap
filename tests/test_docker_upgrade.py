@@ -920,7 +920,7 @@ def test_run_upgrade_dry_run_lists_both_modes_and_isolation(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     out = r.stdout
     assert "git archive v0.3.2" in out
-    assert f"--release-bundle --profile release --version-override {NEW_VERSION}" in out
+    assert f"--release-bundle --stage 2 --profile release --version-override {NEW_VERSION}" in out
     assert "pip download --only-binary=:all:" in out
     assert "--network none" in out
     assert f"SW_UPGRADE_NEW_VERSION={NEW_VERSION}" in out
@@ -1095,7 +1095,7 @@ def test_run_upgrade_dry_run_builds_bundle_with_system_python312_venv(tmp_path):
     assert "pyyaml==6.0.3" in pip and "jsonschema==4.10.3" in pip, pip
     mk = next(line for line in lines if "mkbundle.sh" in line)
     assert mk.startswith(f"+ env PATH={work}/build-venv/bin:"), mk
-    assert f"--release-bundle --profile release --version-override {NEW_VERSION}" in mk
+    assert f"--release-bundle --stage 2 --profile release --version-override {NEW_VERSION}" in mk
     check = next(line for line in lines if "pyvenv.cfg" in line)
     assert "home = /usr/bin" in check and "include-system-site-packages = false" in check, check
     assert lines.index(check) > lines.index(mk)

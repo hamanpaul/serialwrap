@@ -10,6 +10,9 @@ usage() {
     --linux-bundle <共用證據記錄的 Linux 候選 bundle> \
     --p7-run <P7 gate run 目錄：含 results.json、p7-gate.md、windows-ev01/bundle> \
     --windows-bundle <P7 ev-01 驗證的原始 Windows bundle> \
+    --slice21-run <Slice 2.1 正式 gate run 目錄> \
+    --slice22-report <Slice 2.2 正式 s22-gate.json> \
+    --slice24-run <Slice 2.4 正式 gate run 目錄> \
     --out <新的輸出目錄> [--repo OWNER/REPO]
 
 只有在擁有者確認建立該 RC tag 與 GitHub prerelease 後才可執行。
@@ -23,6 +26,9 @@ SHARED_EVIDENCE=""
 LINUX_BUNDLE=""
 WINDOWS_BUNDLE=""
 P7_RUN=""
+SLICE21_RUN=""
+SLICE22_REPORT=""
+SLICE24_RUN=""
 OUT=""
 REPO=""
 while (($#)); do
@@ -33,6 +39,9 @@ while (($#)); do
     --linux-bundle) (($# >= 2)) || { usage >&2; exit 2; }; LINUX_BUNDLE="$2"; shift 2 ;;
     --windows-bundle) (($# >= 2)) || { usage >&2; exit 2; }; WINDOWS_BUNDLE="$2"; shift 2 ;;
     --p7-run) (($# >= 2)) || { usage >&2; exit 2; }; P7_RUN="$2"; shift 2 ;;
+    --slice21-run) (($# >= 2)) || { usage >&2; exit 2; }; SLICE21_RUN="$2"; shift 2 ;;
+    --slice22-report) (($# >= 2)) || { usage >&2; exit 2; }; SLICE22_REPORT="$2"; shift 2 ;;
+    --slice24-run) (($# >= 2)) || { usage >&2; exit 2; }; SLICE24_RUN="$2"; shift 2 ;;
     --out) (($# >= 2)) || { usage >&2; exit 2; }; OUT="$2"; shift 2 ;;
     --repo) (($# >= 2)) || { usage >&2; exit 2; }; REPO="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -44,7 +53,7 @@ if [[ "$OWNER_CONFIRMED" -ne 1 ]]; then
   echo "publish_rc_assets.sh: 必須在擁有者確認後明確帶入 --owner-confirmed" >&2
   exit 2
 fi
-if [[ -z "$TAG" || -z "$SHARED_EVIDENCE" || -z "$LINUX_BUNDLE" || -z "$P7_RUN" || -z "$WINDOWS_BUNDLE" || -z "$OUT" ]]; then
+if [[ -z "$TAG" || -z "$SHARED_EVIDENCE" || -z "$LINUX_BUNDLE" || -z "$P7_RUN" || -z "$WINDOWS_BUNDLE" || -z "$SLICE21_RUN" || -z "$SLICE22_REPORT" || -z "$SLICE24_RUN" || -z "$OUT" ]]; then
   usage >&2
   exit 2
 fi
@@ -61,6 +70,9 @@ TAG_COMMIT="$(git -C "$ROOT" rev-parse --verify "refs/tags/${TAG}^{commit}")"
 python3 "$ROOT/scripts/rust/gate_shared_evidence.py" check-candidate-bundle \
   --shared-evidence "$SHARED_EVIDENCE" --candidate-bundle "$LINUX_BUNDLE"
 P7_RUN="$(realpath -e -- "$P7_RUN")"
+SLICE21_RUN="$(realpath -e -- "$SLICE21_RUN")"
+SLICE22_REPORT="$(realpath -e -- "$SLICE22_REPORT")"
+SLICE24_RUN="$(realpath -e -- "$SLICE24_RUN")"
 python3 - "$ROOT" "$P7_RUN" "$WINDOWS_BUNDLE" "$TAG_COMMIT" <<'PY'
 import json
 import sys
@@ -104,6 +116,9 @@ if recorded_identity != supplied_identity:
     raise SystemExit("指定 Windows bundle 與 P7 ev-01 gate 實際驗證的 bundle bytes 不同")
 print(f"P7 Windows ev-01 bundle verified: {supplied_bundle}")
 PY
+python3 "$ROOT/scripts/rust/release_gate_evidence.py" check \
+  --repo "$ROOT" --head "$TAG_COMMIT" \
+  --slice21-run "$SLICE21_RUN" --slice22-report "$SLICE22_REPORT" --slice24-run "$SLICE24_RUN"
 python3 "$ROOT/scripts/rust/release_assets.py" prepare-rc-assets \
   --tag "$TAG" \
   --version-file "$ROOT/VERSION" \

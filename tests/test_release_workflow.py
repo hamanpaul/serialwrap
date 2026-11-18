@@ -110,6 +110,9 @@ def test_existing_wheel_and_windows_exe_jobs_are_kept():
     exe_runs = "\n".join(step.get("run", "") for step in jobs["publish-windows-exe"]["steps"])
     assert "python -m PyInstaller --noconfirm serialwrap.spec" in exe_runs
     assert "dist/serialwrap.exe dist/serialwrapd.exe" in exe_runs
+    workflow_text = RELEASE_YML.read_text(encoding="utf-8")
+    assert "CLI 不得含任何測試鉤子" not in workflow_text
+    assert "逐名核准的 parity 鉤子" in workflow_text
 
 
 @pytest.mark.memory_only
@@ -374,11 +377,15 @@ def test_workflow_dispatch_backfills_existing_tag_without_republishing_other_art
     assert source_checkout[0]["with"]["ref"] == "refs/tags/${{ inputs.tag }}"
 
 
-@pytest.mark.memory_only
-def test_windows_bundle_job_step_order_and_build_commands():
-    order = ["verify-version", "mkbundle", "smoke", "upload"]
+@pytest.mark.process_rpc
+def test_windows_bundle_job_step_order_and_build_commands(tmp_path: Path):
+    order = ["verify-version", "refuse-dispatch-overwrite", "mkbundle", "smoke", "upload"]
     indexes = [_win_step_index(step_id) for step_id in order]
     assert indexes == sorted(indexes), f"{WIN_JOB} 步驟順序必須為 {order}: {indexes}"
+    guard = _win_step("refuse-dispatch-overwrite")
+    assert guard.get("if") == "${{ github.event_name == 'workflow_dispatch' }}"
+    guard_script = guard["run"]
+    assert "gh release view" in guard_script and "serialwrap-${VERSION}-windows-x86_64.zip" in guard_script
     steps = _win_steps()
     assert steps[0]["run"].strip() == "git config --global core.autocrlf false", "checkout 之前須關閉 autocrlf（位元組須與 Linux 一致）"
     mkbundle = _win_step("mkbundle")["run"]
@@ -392,6 +399,42 @@ def test_windows_bundle_job_step_order_and_build_commands():
     assert "smoke-windows-bundle.ps1" in smoke and "-Zip" in smoke
     setup_python = [s for s in steps if str(s.get("uses", "")).startswith("actions/setup-python@")]
     assert len(setup_python) == 1 and setup_python[0]["with"]["python-version"] == "3.12.3"
+
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir()
+    fake_gh = fakebin / "gh"
+    fake_gh.write_text(
+        "#!/bin/sh\n"
+        "[ \"$1 $2\" = 'release view' ] || exit 9\n"
+        "[ \"${GH_FAIL:-0}\" = 0 ] || exit 8\n"
+        "printf '%s\\n' \"${ASSET_NAMES:-}\"\n",
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o755)
+
+    def run_guard(asset_names: str = "", *, gh_fail: bool = False) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", guard_script],
+            cwd=tmp_path,
+            env={
+                **os.environ,
+                "PATH": f"{fakebin}:{os.environ['PATH']}",
+                "TAG_NAME": "v0.5.0",
+                "VERSION": "0.5.0",
+                "ASSET_NAMES": asset_names,
+                "GH_FAIL": "1" if gh_fail else "0",
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    existing = run_guard("serialwrap-0.5.0-windows-x86_64.zip")
+    assert existing.returncode != 0
+    assert "拒絕覆寫" in existing.stdout + existing.stderr
+    assert "--clobber" not in guard_script
+    assert run_guard("serialwrap-0.5.0-linux-x86_64.tar.gz").returncode == 0
+    assert run_guard(gh_fail=True).returncode != 0, "無法確認既有資產時必須 fail-closed"
 
 
 @pytest.mark.memory_only
