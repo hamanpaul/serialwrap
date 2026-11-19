@@ -309,3 +309,52 @@ def test_docker_observer_rejects_large_gap_and_non_monotonic_timestamps(tmp_path
     _metrics, failures, _header = runtime.read_observer(path, hours=0, interval_s=10.0)
     assert "observer_timestamps_not_monotonic" in failures
     assert "observer_gap_exceeded" in failures
+
+
+def test_observer_windows_probe_wakeup_does_not_skip_scheduled_sample(tmp_path, monkeypatch):
+    """Windows 獨占探測提早喚醒時不得多取一筆、再把下一筆往後推一個週期。
+
+    2026-11-19 Windows 長跑基線實測：每 300 s 出現「0.5 s＋19.5 s」一組間隔，19.5 s 只比
+    gate 的 max_observation_gap_factor（2.0 × 10 s）少 0.5 s；任何一次 Windows 端停頓就會讓
+    observation_gaps 判 INSUFFICIENT_EVIDENCE。取樣要維持固定週期，探測自走自己的週期。
+    """
+    observer = _observer()
+    now = [0.0]
+    calls = [0]
+    sample_times: list[float] = []
+
+    class FakeStop:
+        def is_set(self):
+            return now[0] >= 3100.0
+
+        def wait(self, timeout):
+            # 計時器喚醒有逐次不同的小延遲（Windows 計時粒度）；探測期限因此不會剛好落在取樣格點上。
+            calls[0] += 1
+            now[0] += timeout + ((calls[0] * 7919) % 13) / 1000.0
+            return False
+
+    def fake_sample(_sw, _boards, *, procscan):
+        sample_times.append(now[0])
+        now[0] += 0.5  # Windows 取樣（RPC＋行程掃描）實測約 0.5 s
+        return {"t_mono": now[0], "daemon": {}, "sessions": {}, "procscan": {}}
+
+    def fake_probe(_sw, com, *, expected_device, **_kwargs):
+        now[0] += 0.8
+        return {"wall_ts": "2026-11-19T00:00:00+00:00", "expected_device": expected_device,
+                "verdict": "exclusive"}
+
+    monkeypatch.setattr(observer.sys, "platform", "win32")
+    monkeypatch.setattr(observer, "sample", fake_sample)
+    monkeypatch.setattr(observer, "second_open_probe", fake_probe)
+    monkeypatch.setattr(observer.time, "monotonic", lambda: now[0])
+
+    assert observer.run_observer(
+        StubSwCli(), ["COM0"], interval_s=10.0, out=tmp_path / "observer.ndjson",
+        stop=FakeStop(), duration_s=None, excl_dir=tmp_path, excl_probe_interval_s=300.0,
+    ) == 0
+    gaps = [b - a for a, b in zip(sample_times, sample_times[1:])]
+    probes = _read_rows(tmp_path / "probes.ndjson")
+    assert len(probes) >= 10, probes
+    # 探測與取樣錯開時，取樣最多被探測耗時延後；不得出現接近兩個週期的缺口，也不得多出提早的額外樣本。
+    assert max(gaps) <= 10.0 + 0.8 + 0.5 + 0.02, gaps
+    assert min(gaps) >= 10.0 - 0.8 - 0.5 - 0.02, gaps
