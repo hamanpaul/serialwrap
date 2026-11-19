@@ -338,7 +338,14 @@ fn start_routes_windows_task_to_schtasks() {
         .with_config("supervision_mode: windows-task\n")
         .with_real_service();
     let (_, _, _) = t.run(&["daemon", "start"]);
-    assert_eq!(t.calls(), vec![argv(&["schtasks", "/Run", "/TN", "serialwrap"])]);
+    // #276：daemon start 轉送 service start，同樣先恢復啟用再 /Run。
+    assert_eq!(
+        t.calls(),
+        vec![
+            argv(&["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"]),
+            argv(&["schtasks", "/Run", "/TN", "serialwrap"]),
+        ]
+    );
 }
 
 #[test]
