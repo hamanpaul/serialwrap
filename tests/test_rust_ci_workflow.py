@@ -46,7 +46,7 @@ RUST_LINUX_REQUIRED_COMMANDS = [
         "SW_BUNDLE=\"$SW_BUNDLE\" SERIALWRAP_AB_LABEL=rust-linux "
         "python3 -m pytest -q tests/contract_blackbox "
         '-m "core_portable or posix_only" '
-        "--confcutdir=tests/contract_blackbox -p no:cacheprovider --basetemp=/mnt/sw-tmp/pt/stage2 "
+        "--confcutdir=tests/contract_blackbox -p no:cacheprovider --basetemp=/mnt/sw-tmp/pt/stage2 -o tmp_path_retention_policy=failed "
         "--junitxml=target/ci-blackbox/junit.xml"
     ),
     (

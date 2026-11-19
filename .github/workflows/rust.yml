@@ -104,7 +104,7 @@ jobs:
           source scripts/rust/gate_prereqs.sh --ci
           export SW_BUNDLE="$PWD/target/s24-bundle"
           S24_BUNDLE_VERSION_ROOT="$(dirname "$(dirname "$(realpath -e "$SW_BUNDLE/bin/serialwrap")")")"
-          SW_RESOURCE_REPORT=$PWD/target/ci-blackbox/resource-report.json SERIALWRAP_CLI_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrap" SERIALWRAP_DAEMON_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrapd" SW_BUNDLE="$SW_BUNDLE" SERIALWRAP_AB_LABEL=rust-linux python3 -m pytest -q tests/contract_blackbox -m "core_portable or posix_only" --confcutdir=tests/contract_blackbox -p no:cacheprovider --basetemp=/mnt/sw-tmp/pt/stage2 --junitxml=target/ci-blackbox/junit.xml
+          SW_RESOURCE_REPORT=$PWD/target/ci-blackbox/resource-report.json SERIALWRAP_CLI_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrap" SERIALWRAP_DAEMON_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrapd" SW_BUNDLE="$SW_BUNDLE" SERIALWRAP_AB_LABEL=rust-linux python3 -m pytest -q tests/contract_blackbox -m "core_portable or posix_only" --confcutdir=tests/contract_blackbox -p no:cacheprovider --basetemp=/mnt/sw-tmp/pt/stage2 -o tmp_path_retention_policy=failed --junitxml=target/ci-blackbox/junit.xml
       - name: "保存黑箱 A/B 與 L1.5 systemd 診斷"
         if: always()
         uses: actions/upload-artifact@v4

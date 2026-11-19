@@ -12,7 +12,8 @@ from typing import Any
 import pytest
 
 # repo 規則（tests/test_resource_markers.py）：每個 item 恰一個平台 marker 與資源 marker。
-pytestmark = [pytest.mark.core_portable]
+# 平台 marker 逐支標：新鮮度測試重現的是 Linux Python 基線（Python 在 Windows 走 TCP console 端點等平台分支，
+# 擷取結果本來就與 Linux golden 不同），只在 POSIX 有意義（編排者裁決 2026-11-20，PR #278 hosted CI）；其餘為可攜的純記憶體測試。
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 GOLDEN = ROOT / "contracts/golden/p7"
@@ -68,6 +69,7 @@ def _golden_differences(name: str, expected: bytes, actual: bytes) -> list[str]:
     return differences or [f"{name}: NDJSON bytes differ although parsed rows match"]
 
 
+@pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_goldens_exist_and_are_fresh():
     with tempfile.TemporaryDirectory() as td:
@@ -155,6 +157,7 @@ def test_goldens_exist_and_are_fresh():
     assert not windows_differences, "Windows ntpath 模擬與 Linux golden 不一致：\n" + "\n".join(windows_differences)
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_login_fsm_golden_covers_every_platform_and_error():
     rows = [json.loads(l) for l in (GOLDEN / "login_fsm_scenarios.ndjson").read_text(encoding="utf-8").splitlines()]
@@ -169,6 +172,7 @@ def test_login_fsm_golden_covers_every_platform_and_error():
     assert any(r.get("raised") == "error" for r in rows), "無效 regex 須照 Python 拋 re.error"
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_event_engine_order_golden_distinguishes_start_and_rule_set():
     rows = {r["id"]: r for r in map(json.loads, (GOLDEN / "event_engine_order.ndjson").read_text(encoding="utf-8").splitlines())}
@@ -176,6 +180,7 @@ def test_event_engine_order_golden_distinguishes_start_and_rule_set():
     assert rows["event_engine_order:start"]["types"][:2] == ["rule_loaded", "com_enabled"]
 
 
+@pytest.mark.core_portable
 @pytest.mark.memory_only
 @pytest.mark.parametrize("version", [(3, 11, 9), (3, 13, 0), (3, 14, 1)])
 def test_capture_refuses_non_312_python(version, monkeypatch, capsys):
