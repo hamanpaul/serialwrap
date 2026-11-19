@@ -577,7 +577,14 @@ def gen_log_responses() -> list[dict[str, Any]]:
                 os.makedirs(os.path.join(td, "blog", "COM0_" + FIXED_STRFTIME + ".log"))
             fn = {"start": mgr.log_start, "stop": mgr.log_stop, "status": mgr.log_status}[spec["op"]]
             try:
-                resp_s = wire(normalize_temporary_paths(fn(selector), td))
+                if spec.get("log_path_is_dir"):
+                    # 目錄目標的 open 錯誤在 Windows/POSIX 不同；fixture 固定相同的例外語意。
+                    log_path = os.path.join(td, "blog", "COM0_" + FIXED_STRFTIME + ".log")
+                    with mock.patch("builtins.open", side_effect=IsADirectoryError(21, "Is a directory", log_path)):
+                        response = fn(selector)
+                else:
+                    response = fn(selector)
+                resp_s = wire(normalize_temporary_paths(response, td))
                 raised = None
             except OSError as exc:      # Python 例外穿出 manager → framing EXCEPTION
                 resp_s, raised = None, type(exc).__name__

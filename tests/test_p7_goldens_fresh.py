@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -99,6 +100,16 @@ def test_goldens_exist_and_are_fresh():
         windows_differences.append("測試情境清單與 capture_p7_goldens.NAMES 不一致")
     normalize_temp_paths = getattr(capture, "normalize_temporary_paths", None)
     windows_temp_root = ntpath.join(r"C:\Users\fixture\AppData\Local\Temp", "p7-golden")
+    real_open = open
+
+    def windows_open(path, *args, **kwargs):
+        try:
+            path_text = os.fspath(path)
+        except TypeError:
+            return real_open(path, *args, **kwargs)
+        if path_text.endswith(".log") and os.path.isdir(path_text):
+            raise PermissionError(13, "Permission denied", path_text)
+        return real_open(path, *args, **kwargs)
 
     def simulate_windows_temp_paths(value, temp_dir):
         def as_windows(item):
@@ -126,7 +137,8 @@ def test_goldens_exist_and_are_fresh():
                 windows_differences.extend(_golden_differences(
                     name, (GOLDEN / f"{name}.ndjson").read_bytes(), windows_fresh))
         else:
-            with mock.patch.object(capture, "normalize_temporary_paths", simulate_windows_temp_paths), \
+            with mock.patch("builtins.open", side_effect=windows_open), \
+                 mock.patch.object(capture, "normalize_temporary_paths", simulate_windows_temp_paths), \
                  mock.patch.object(p7_sm_goldens, "normalize_temporary_paths", simulate_windows_temp_paths):
                 for name in NAMES:
                     windows_fresh = capture.render(name)
