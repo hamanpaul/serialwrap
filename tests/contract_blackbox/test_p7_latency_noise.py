@@ -571,7 +571,8 @@ def test_login_with_delay_and_noise(p7, tmp_path):
     )
     p7.start("bcm", [tgt], timeout_s=60)  # OD-81：逾時與否依主機排程，語意由 DF-27 確定性案例驗證。
     is_rust = ab_env.AB_ENV.get("SERIALWRAP_AB_LABEL", "").startswith("rust")
-    deadline = time.monotonic() + 180.0
+    # 此為觀察終態的測試上限；profile 的 timeout_s=60 與 OD-81 判定維持不變。
+    deadline = time.monotonic() + 300.0
     s = None
     python_timeout = False
     while time.monotonic() < deadline:

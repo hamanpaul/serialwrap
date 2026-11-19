@@ -339,7 +339,8 @@ pub fn install_shell_replies(dev: &FakeDevice) {
 
 /// 反覆檢查直到條件成立（真實時間；逾時 panic）。
 pub fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // hosted runner 的排程與 RPC I/O 較慢；此為測試觀察上限，不是產品期限。
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !cond() {
         assert!(Instant::now() < deadline, "等待逾時：{what}");
         std::thread::sleep(Duration::from_millis(2));

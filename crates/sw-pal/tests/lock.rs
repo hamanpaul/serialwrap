@@ -581,7 +581,8 @@ raise SystemExit(1)
         .stderr(Stdio::null())
         .spawn()
         .expect("啟動隔離的 Windows 鎖路徑子行程");
-    let status = wait_child_with_timeout(&mut child, Duration::from_secs(15))
+    // 只增加 hosted runner 上等待隔離測試子行程的上限，不改鎖路徑／互斥判定。
+    let status = wait_child_with_timeout(&mut child, Duration::from_secs(60))
         .expect("Windows 鎖路徑子行程應於期限內完成");
     assert!(
         status.success(),
