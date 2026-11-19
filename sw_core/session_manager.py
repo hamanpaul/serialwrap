@@ -373,6 +373,9 @@ class InteractiveLease:
     suspended_human: bool = False
     # human lease peer-loss grace：首次觀測到 console peer 消失的 monotonic 時間；peer 回復清為 None。
     peer_lost_at: float | None = None
+    # 內部 flag：Windows TCP console（#84 PORT-2）的 raw 擁有權由 bridge 直接管理，此 lease 只是
+    # session 層的鏡像（#275）。owner 換人或斷線時只移除鏡像、不清 bridge owner。不透出 RPC。
+    bridge_owned: bool = False
 
     def touch(self) -> None:
         self.last_activity_at = time.monotonic()
@@ -2139,6 +2142,9 @@ class SessionManager:
         return session.last_rx_mono == 0.0 or (now - session.last_rx_mono) >= REPROBE_RX_IDLE_S
 
     def _human_active_locked(self, session: SessionRuntime, now: float) -> bool:
+        if session.bridge is not None and session.interactive_session_id is None:
+            # Windows TCP console 沒經過 session 層：先補記鏡像 lease，reprobe 才會因人類打字而暫緩（#275）。
+            self._adopt_tcp_console_owner_locked(session)
         if session.bridge is None or session.interactive_session_id is None:
             return False
         lease = self._interactive.get(session.interactive_session_id)
@@ -2580,8 +2586,14 @@ class SessionManager:
                                 continue
                             # 原子 grant：僅當 bridge 仍完全 idle 才授予（消除 TOCTOU）
                             if bridge.try_grant_interactive_if_idle(f"human:{primary_cid}"):
-                                # owner 已由 try_grant 原子設定；僅補 session-layer lease 記錄
-                                self._record_self_heal_lease_locked(session, f"human:{primary_cid}")
+                                # owner 已由 try_grant 原子設定；僅補 session-layer lease 記錄。
+                                # TCP console 的擁有權由 bridge 管理，記成鏡像 lease（#275）。
+                                owner = f"human:{primary_cid}"
+                                self._record_self_heal_lease_locked(
+                                    session,
+                                    owner,
+                                    bridge_owned=self._bridge_tcp_console_owner(bridge) == owner,
+                                )
                     except Exception:  # noqa: BLE001 — 單一 bridge 自癒失敗不得中斷 tick
                         pass
 
@@ -2592,11 +2604,14 @@ class SessionManager:
                 return s
         return None
 
-    def _record_self_heal_lease_locked(self, session: SessionRuntime, owner: str) -> None:
+    def _record_self_heal_lease_locked(
+        self, session: SessionRuntime, owner: str, *, bridge_owned: bool = False
+    ) -> None:
         """自癒 grant 後補 session-layer lease 記錄。
 
         比照 _open_interactive_locked，但不呼叫 bridge.set_interactive_owner()——
         owner 已由 try_grant_interactive_if_idle 原子設定，重設會破壞原子性。
+        ``bridge_owned`` 見 ``InteractiveLease.bridge_owned``（#275）。
         """
         interactive_id = uuid.uuid4().hex
         lease = InteractiveLease(
@@ -2605,9 +2620,58 @@ class SessionManager:
             owner=owner,
             created_at=now_iso(),
             timeout_s=max(session.profile.hard_timeout_s, _ATTACHED_CONSOLE_LEASE_TIMEOUT_S),
+            bridge_owned=bridge_owned,
         )
         self._interactive[interactive_id] = lease
         session.interactive_session_id = interactive_id
+
+    @staticmethod
+    def _bridge_tcp_console_owner(bridge: UARTBridge | None) -> str | None:
+        """bridge 目前的 TCP console owner（``human:<cid>``）；非 TCP console 或取不到時 None。
+
+        以 ``isinstance(str)`` 判定，測試替身（MagicMock）回傳的非字串值一律視為沒有。
+        """
+        getter = getattr(bridge, "tcp_console_owner", None) if bridge is not None else None
+        if not callable(getter):
+            return None
+        owner = getter()
+        return owner if isinstance(owner, str) and owner.startswith("human:") else None
+
+    def _adopt_tcp_console_owner_locked(self, session: SessionRuntime) -> InteractiveLease | None:
+        """為 bridge 直接授予的 TCP console owner 補記鏡像 lease（#275）。
+
+        Windows TCP console 在 accept 時由 bridge 直接授予 raw 擁有權，不經 session 層，
+        session 因此沒有 lease：``human_attached``／``human_active`` 恆為 false，人類打字時
+        reprobe 也不會暫緩，interactive-open 也看不到人類在用。這裡補記一筆
+        ``bridge_owned`` lease（不改 bridge owner、不設 admission lease flag，比照自癒）。
+        PTY console 一律經 console-attach 建 lease，不在此補記。呼叫端須持 self._lock。
+        """
+        if session.interactive_session_id is not None or session.bridge is None:
+            return None
+        if self._handoff_frozen or session.state not in {"READY", "ATTACHED"}:
+            return None
+        owner = self._bridge_tcp_console_owner(session.bridge)
+        if owner is None:
+            return None
+        self._record_self_heal_lease_locked(session, owner, bridge_owned=True)
+        lease_id = session.interactive_session_id
+        return self._interactive.get(lease_id) if lease_id is not None else None
+
+    def _drop_bridge_owned_lease_locked(
+        self, session: SessionRuntime, lease: InteractiveLease
+    ) -> None:
+        """移除 bridge_owned 鏡像 lease，**不**清 bridge owner（#275）。
+
+        一般 close 會 ``set_interactive_owner(None)``；TCP console 斷線後若新連線已在 grace 窗內
+        取得 raw 擁有權，沿用一般 close 會把新連線的擁有權清掉。鏡像 lease 的生命週期以
+        bridge 為準，這裡只撤 session 層紀錄。
+        """
+        if session.interactive_session_id == lease.interactive_id:
+            session.interactive_session_id = None
+        session._push_tx_gate(session.bridge)
+        self._record_interactive_terminal_locked(
+            lease, terminal_status="closed", keep_tombstone=False
+        )
 
     def set_alias_for_session(self, session_id: str, alias: str) -> dict[str, Any]:
         with self._lock:
@@ -6096,7 +6160,8 @@ class SessionManager:
         post = _PostCloseAction()
         lease_id = session.interactive_session_id
         if lease_id is None:
-            return None, post
+            # Windows TCP console：bridge 已授予 raw 擁有權但 session 層沒有 lease 時補記鏡像（#275）。
+            return self._adopt_tcp_console_owner_locked(session), post
         lease = self._interactive.get(lease_id)
         if lease is None:
             _, post = self._close_interactive_locked(session, interactive_id=lease_id)
@@ -6114,6 +6179,13 @@ class SessionManager:
         if session.bridge is None:
             _, post = self._close_interactive_locked(session, interactive_id=lease_id)
             return None, post
+        if lease.bridge_owned:
+            # 鏡像 lease 跟著 bridge 走：TCP console owner 沒變就續用；換人或斷線時只撤鏡像
+            # （不清 bridge owner），再鏡像目前的 owner（#275）。
+            if self._bridge_tcp_console_owner(session.bridge) == lease.owner:
+                return lease, post
+            self._drop_bridge_owned_lease_locked(session, lease)
+            return self._adopt_tcp_console_owner_locked(session), post
         if lease.owner.startswith("human:"):
             client_id = lease.owner.split(":", 1)[1]
             if not session.bridge.console_has_external_peer(client_id):

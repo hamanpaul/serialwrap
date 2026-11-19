@@ -123,6 +123,12 @@ console listener 講 **Telnet**（server 主動協商 char-mode + 遠端回顯�
 - New-line Transmit：`CR` 或 `CR+LF` 皆可（telnet 層會把 Enter 正規化為單一 CR）。
 - **Local echo：不要勾**（遠端回顯已由 telnet 協商接手）。
 
+首個 Telnet console 會取得 raw 擁有權，session 層的待遇與 Linux 經 `console-attach` 的 minicom 相同（#275）：
+
+- `session self-test` 回報 `human_attached: true`；最後一次鍵入在 60 秒內時 `human_active: true`。agent 送命令前可據此判斷人類是否正在打字。
+- 人類閒置時，agent `interactive-open` 會 soft preempt；人類仍在打字時回 `SESSION_INTERACTIVE_BUSY`。
+- 連線期間以 bare `--source human` 送的 `cmd submit`／`file push`／`file pull` 回 `SESSION_INTERACTIVE_BUSY`：人類請直接在 Tera Term 裡打字。
+
 ## 7. PuTTY／telnet.exe 連線
 
 - PuTTY：Connection type 選 **Telnet**，Host `127.0.0.1`、Port 填 console port。
