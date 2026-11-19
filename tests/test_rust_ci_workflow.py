@@ -27,13 +27,26 @@ RUST_LINUX_REQUIRED_COMMANDS = [
     "python3 scripts/rust/gen_error_codes.py --check",
     "SW_REQUIRE_CARGO=1 python3 -m pytest -q tests/test_rust_*.py",
     "scripts/rust/mkbundle.sh --dev --out target/dev-bundle",
+    "mkdir -p /mnt/sw-tmp/pt",
     (
-        "SW_RESOURCE_REPORT=$PWD/target/ci-blackbox/resource-report.json "
+        "SW_RESOURCE_REPORT=$PWD/target/ci-blackbox/stage1a-resource-report.json "
         "SERIALWRAP_CLI_EXE=$PWD/target/dev-bundle/bin/serialwrap "
         "SERIALWRAP_AB_LABEL=rust-1a "
+        "python3 -m pytest -q tests/contract_blackbox/test_cli_no_delegation.py "
+        '-m "rust_only" '
+        "--confcutdir=tests/contract_blackbox -p no:cacheprovider --basetemp=/mnt/sw-tmp/pt/stage1a "
+        "--junitxml=target/ci-blackbox/junit-stage1a.xml"
+    ),
+    "scripts/rust/mkbundle.sh --release-bundle --stage 2 --profile release --out target/s24-bundle",
+    "source scripts/rust/gate_prereqs.sh --ci",
+    (
+        "SW_RESOURCE_REPORT=$PWD/target/ci-blackbox/resource-report.json "
+        "SERIALWRAP_CLI_EXE=\"$S24_BUNDLE_VERSION_ROOT/bin/serialwrap\" "
+        "SERIALWRAP_DAEMON_EXE=\"$S24_BUNDLE_VERSION_ROOT/bin/serialwrapd\" "
+        "SW_BUNDLE=\"$SW_BUNDLE\" SERIALWRAP_AB_LABEL=rust-linux "
         "python3 -m pytest -q tests/contract_blackbox "
         '-m "core_portable or posix_only" '
-        "--confcutdir=tests/contract_blackbox -p no:cacheprovider --basetemp=/mnt/sw-tmp/pt "
+        "--confcutdir=tests/contract_blackbox -p no:cacheprovider --basetemp=/mnt/sw-tmp/pt/stage2 "
         "--junitxml=target/ci-blackbox/junit.xml"
     ),
     (
