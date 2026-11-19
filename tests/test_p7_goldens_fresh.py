@@ -6,6 +6,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+from typing import Any
 
 import pytest
 
@@ -19,31 +20,127 @@ NAMES = ["env_file", "auth_resolution", "login_fsm_scenarios", "quiet_rx", "gate
          "redos", "line_buffer", "event_payload", "event_log_tail", "event_engine_order", "registry_load", "counter_file"]
 
 
+def _changed_paths(expected: Any, actual: Any, prefix: str = "$") -> list[str]:
+    if type(expected) is not type(actual):
+        return [prefix]
+    if isinstance(expected, dict):
+        changed = []
+        for key in sorted(set(expected) | set(actual)):
+            child = f"{prefix}.{key}"
+            if key not in expected or key not in actual:
+                changed.append(child)
+            else:
+                changed.extend(_changed_paths(expected[key], actual[key], child))
+        return changed
+    if isinstance(expected, list):
+        if len(expected) != len(actual):
+            return [f"{prefix}.length"]
+        changed = []
+        for index, (left, right) in enumerate(zip(expected, actual)):
+            changed.extend(_changed_paths(left, right, f"{prefix}[{index}]"))
+        return changed
+    return [] if expected == actual else [prefix]
+
+
+def _golden_differences(name: str, expected: bytes, actual: bytes) -> list[str]:
+    if expected == actual:
+        return []
+    try:
+        expected_rows = [json.loads(line) for line in expected.decode("utf-8").splitlines()]
+        actual_rows = [json.loads(line) for line in actual.decode("utf-8").splitlines()]
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return [f"{name}: NDJSON bytes differ"]
+
+    differences = []
+    if len(expected_rows) != len(actual_rows):
+        differences.append(f"{name}: row count {len(expected_rows)} != {len(actual_rows)}")
+    for index in range(max(len(expected_rows), len(actual_rows))):
+        if index >= len(expected_rows) or index >= len(actual_rows):
+            row = expected_rows[index] if index < len(expected_rows) else actual_rows[index]
+            differences.append(f"{name}:{row.get('id', index + 1)}: row missing")
+            continue
+        expected_row, actual_row = expected_rows[index], actual_rows[index]
+        changed = _changed_paths(expected_row, actual_row)
+        if changed:
+            row_id = actual_row.get("id", expected_row.get("id", index + 1))
+            differences.append(f"{name}:{row_id}: {', '.join(changed)}")
+    return differences or [f"{name}: NDJSON bytes differ although parsed rows match"]
+
+
 @pytest.mark.process_rpc
 def test_goldens_exist_and_are_fresh():
     with tempfile.TemporaryDirectory() as td:
         r = subprocess.run([sys.executable, str(ROOT / "scripts/rust/capture_p7_goldens.py"), "--out", td],
                            capture_output=True, text=True, cwd=ROOT)
         assert r.returncode == 0, r.stderr
+        capture_differences = []
         for name in NAMES:
             fresh = (pathlib.Path(td) / f"{name}.ndjson").read_bytes()
-            assert (GOLDEN / f"{name}.ndjson").read_bytes() == fresh, f"{name} 與現行 Python 基線不一致，請重新擷取並審閱差異"
+            capture_differences.extend(_golden_differences(
+                name, (GOLDEN / f"{name}.ndjson").read_bytes(), fresh))
+        assert not capture_differences, "擷取結果與 Linux golden 不一致：\n" + "\n".join(capture_differences)
 
-    # 在 Linux 也模擬 Windows 的 ~ 展開規則，確認 fixture 以 USERPROFILE 指向相同的合成家目錄。
-    import importlib.util
+    # 以 ntpath 模擬 Windows 的路徑與家目錄規則，逐一比較全部 golden generator。
+    import importlib
     import ntpath
+    from types import SimpleNamespace
     from unittest import mock
 
+    import sw_core.config as config
     from sw_core import auth as auth_mod
 
-    spec = importlib.util.spec_from_file_location("capture_p7_goldens_under_test", ROOT / "scripts/rust/capture_p7_goldens.py")
-    assert spec is not None and spec.loader is not None
-    capture = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(capture)
-    golden_rows = [json.loads(line) for line in (GOLDEN / "auth_resolution.ndjson").read_text(encoding="utf-8").splitlines()]
-    with mock.patch.object(auth_mod.os.path, "expanduser", ntpath.expanduser):
-        windows_rows = capture.gen_auth_resolution()
-    assert windows_rows == golden_rows, "Windows USERPROFILE 家目錄展開應維持 Linux 基線 golden 的邏輯結果"
+    rust_scripts = str(ROOT / "scripts/rust")
+    if rust_scripts not in sys.path:
+        sys.path.insert(0, rust_scripts)
+    capture = importlib.import_module("capture_p7_goldens")
+    p7_sm_goldens = importlib.import_module("p7_sm_goldens")
+    windows_differences = []
+    if set(NAMES) != set(capture.NAMES):
+        windows_differences.append("測試情境清單與 capture_p7_goldens.NAMES 不一致")
+    normalize_temp_paths = getattr(capture, "normalize_temporary_paths", None)
+    windows_temp_root = ntpath.join(r"C:\Users\fixture\AppData\Local\Temp", "p7-golden")
+
+    def simulate_windows_temp_paths(value, temp_dir):
+        def as_windows(item):
+            if isinstance(item, str):
+                if temp_dir not in item:
+                    return item
+                prefix, suffix = item.split(temp_dir, 1)
+                return prefix + windows_temp_root + suffix.replace("/", "\\")
+            if isinstance(item, dict):
+                return {key: as_windows(child) for key, child in item.items()}
+            if isinstance(item, list):
+                return [as_windows(child) for child in item]
+            if isinstance(item, tuple):
+                return tuple(as_windows(child) for child in item)
+            return item
+
+        return normalize_temp_paths(as_windows(value), windows_temp_root)
+
+    with mock.patch.object(config, "os", SimpleNamespace(path=ntpath)), \
+         mock.patch.object(auth_mod.os.path, "expanduser", ntpath.expanduser):
+        if normalize_temp_paths is None:
+            windows_differences.append("log_responses: temporary Windows path normalizer is missing")
+            for name in NAMES:
+                windows_fresh = capture.render(name)
+                windows_differences.extend(_golden_differences(
+                    name, (GOLDEN / f"{name}.ndjson").read_bytes(), windows_fresh))
+        else:
+            with mock.patch.object(capture, "normalize_temporary_paths", simulate_windows_temp_paths), \
+                 mock.patch.object(p7_sm_goldens, "normalize_temporary_paths", simulate_windows_temp_paths):
+                for name in NAMES:
+                    windows_fresh = capture.render(name)
+                    windows_differences.extend(_golden_differences(
+                        name, (GOLDEN / f"{name}.ndjson").read_bytes(), windows_fresh))
+
+    # Windows tempfile 會以反斜線分隔；以合成 temp root 驗證 capture 的共用正規化器。
+    windows_log_path = ntpath.join(windows_temp_root, "blog", "COM0_261026-000000.log")
+    if normalize_temp_paths is not None:
+        normalized = normalize_temp_paths({"log_path": windows_log_path}, windows_temp_root)
+        expected_path = {"log_path": "/golden/blog/COM0_261026-000000.log"}
+        if normalized != expected_path:
+            windows_differences.append(f"log_responses: Windows temp path {normalized!r} != {expected_path!r}")
+    assert not windows_differences, "Windows ntpath 模擬與 Linux golden 不一致：\n" + "\n".join(windows_differences)
 
 
 @pytest.mark.memory_only
