@@ -116,7 +116,7 @@ def test_verify_detects_tampering(tmp_path):
     assert g.verify_report(md, d), "竄改後必須驗證失敗"
 
 
-@pytest.mark.posix_only
+@pytest.mark.core_portable
 def test_required_rows_complete(tmp_path):
     assert set(g.REQUIRED_ROWS) >= {"check_cfg_boundary", "cargo test --workspace", "win-test.sh (non-COM)", "win-test.sh --caps windows_com",
         "contract_blackbox p7 A", "contract_blackbox p7 B", *g.OD59_ROWS, "contract_blackbox slice21 B", "contract_blackbox slice22 B",

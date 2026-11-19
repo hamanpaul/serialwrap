@@ -592,7 +592,7 @@ def _s24_candidate_fixture(tmp_path: pathlib.Path, monkeypatch):
     return api, shared, bundle, source_artifacts, head
 
 
-@pytest.mark.posix_only
+@pytest.mark.core_portable
 @pytest.mark.parametrize(
     "script,args",
     [
@@ -626,7 +626,7 @@ def test_gate_dry_run_with_shared_evidence_exits_zero_and_skips_shared_commands(
         shutil.rmtree(out, ignore_errors=True)
 
 
-@pytest.mark.posix_only
+@pytest.mark.core_portable
 def test_shared_driver_dry_run_lists_commands_without_running_them(tmp_path):
     out_dir = "target/s2-par/gpz/i21/shared-dry-run"
     proc = subprocess.run(
@@ -647,7 +647,7 @@ def test_shared_driver_dry_run_lists_commands_without_running_them(tmp_path):
     assert str(ROOT / out_dir / "dry-run") in proc.stdout
 
 
-@pytest.mark.posix_only
+@pytest.mark.core_portable
 def test_shared_driver_stops_and_records_gate_prereq_failure_before_cargo(tmp_path):
     fixture = tmp_path / "repo"
     scripts = fixture / "scripts/rust"
@@ -890,7 +890,7 @@ def test_cargo_results_and_s24_ab_use_the_same_candidate_bundle_sha256(tmp_path,
     assert cargo_result["daemon_sha256"] != _sha(shared / "artifacts/debug/serialwrapd")
 
 
-@pytest.mark.posix_only
+@pytest.mark.core_portable
 def test_s24_bundle_check_failure_is_recorded_missing_and_does_not_skip_windows_l1(tmp_path, monkeypatch):
     api, shared, bundle, artifacts, head = _s24_candidate_fixture(tmp_path / "s24", monkeypatch)
     daemon = bundle / "versions" / CURRENT_VERSION / "bin" / "serialwrapd"

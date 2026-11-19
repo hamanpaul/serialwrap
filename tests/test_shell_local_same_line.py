@@ -245,7 +245,7 @@ f() {
     ]
 
 
-@pytest.mark.posix_only
+@pytest.mark.core_portable
 def test_bash_nounset_same_statement_reference_exits_with_error() -> None:
     result = subprocess.run(
         ["bash", "-c", 'set -u; f(){ local a=1 b="$a"; echo "$b"; }; f'],

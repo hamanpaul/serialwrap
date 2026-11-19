@@ -366,7 +366,7 @@ def test_missing_report_and_pending_entry_insufficient(tmp_path: Path) -> None:
     assert out["result"] == "INSUFFICIENT" and rc == 1
 
 
-@pytest.mark.posix_only
+@pytest.mark.core_portable
 def test_s22_gate_driver_dry_run_emits_incomplete_json(tmp_path: Path) -> None:
     run = ROOT / "target" / "s2-gfx" / "tests" / tmp_path.parent.name / tmp_path.name / "s22"
     proc = subprocess.run(["bash", "scripts/rust/s22_gate.sh", "--dry-run", "--run-id", "dry", "--out", str(run)],
@@ -970,7 +970,7 @@ def _shared_s22_import_fixture(tmp_path: Path, section: str, *, bad_selector: bo
     return shared
 
 
-@pytest.mark.posix_only
+@pytest.mark.core_portable
 @pytest.mark.parametrize(
     ("section", "platform", "bad_selector", "bad_sha"),
     [
@@ -1101,7 +1101,7 @@ def test_s22_shared_build_identity_records_imported_stage2_bundle_and_cli_sha(tm
     assert 'str(run_dir / "logs/shared-release-bundle.json")' in driver
 
 
-@pytest.mark.posix_only
+@pytest.mark.core_portable
 def test_s22_driver_rejects_nonshared_formal_execution_before_running_python(tmp_path: Path) -> None:
     """s22-01：正式 driver 不得以無共用 release artifact 的非共用模式執行。"""
     fake_bin = tmp_path / "bin"
@@ -1268,7 +1268,7 @@ def test_s22_l15_missing_daemon_is_unchecked_and_cannot_pass(
     assert len(calls) == 1, calls
 
 
-@pytest.mark.posix_only
+@pytest.mark.core_portable
 @pytest.mark.parametrize("out_kind", ["outside-repo", "inside-repo-outside-target"])
 def test_s22_driver_rejects_outside_target_before_creating_run_dir(
     tmp_path: Path, out_kind: str,
@@ -1289,7 +1289,7 @@ def test_s22_driver_rejects_outside_target_before_creating_run_dir(
         shutil.rmtree(run_dir, ignore_errors=True)
 
 
-@pytest.mark.posix_only
+@pytest.mark.core_portable
 def test_s22_driver_exports_parsed_rust_daemon_and_ignores_outer_common_override(
     tmp_path: Path,
 ) -> None:
