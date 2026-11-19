@@ -557,7 +557,9 @@ pub fn huge_timeout_overflow_is_python_like(s: &dyn HandlerSpawner) {
     let marker = unique_marker();
     let win = is_windows(s);
     let cmd = if win {
-        format!("ping -n 3 127.0.0.1 >nul & rem {marker}")
+        // 子行程須活得比偵測輪詢久：Windows 的偵測每次起 PowerShell 查 Win32_Process，hosted runner 上單次即可超過 1 s
+        //（2026-11-19 GitHub hosted `windows-latest` 實測 2 s 的子行程在 1 s 窗口內未被偵測到）。
+        format!("ping -n 8 127.0.0.1 >nul & rem {marker}")
     } else {
         format!("sleep 2; : {marker}")
     };
@@ -573,11 +575,11 @@ pub fn huge_timeout_overflow_is_python_like(s: &dyn HandlerSpawner) {
     }
     assert!(t0.elapsed() < Duration::from_millis(1500), "溢位須立即回報，不得等子行程");
     assert!(
-        wait_until(|| process_with_marker_alive(&marker), Duration::from_secs(1)),
+        wait_until(|| process_with_marker_alive(&marker), Duration::from_secs(5)),
         "子行程已啟動且不被終止（Python Popen 成功後才溢位）"
     );
     assert!(
-        wait_until(|| !process_with_marker_alive(&marker), Duration::from_secs(10)),
+        wait_until(|| !process_with_marker_alive(&marker), Duration::from_secs(20)),
         "子行程自行結束"
     );
     // 未溢位的上限（POSIX INT_MAX ms）照常完成。
