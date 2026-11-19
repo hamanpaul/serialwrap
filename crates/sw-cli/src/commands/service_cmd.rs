@@ -47,10 +47,12 @@ pub fn run_service(ns: &Namespace, ctx: &mut CliCtx) -> i32 {
         },
     };
     let mode = SupervisionMode::parse(&mode_name);
-    if matches!(
+    // windows-task 的 Start 也走 service_action_response：先恢復啟用再 /Run（#276），與 daemon start 轉送一致。
+    if (matches!(
         mode,
         SupervisionMode::WindowsTask | SupervisionMode::WindowsService
-    ) && matches!(action, ServiceAction::Stop | ServiceAction::Restart)
+    ) && matches!(action, ServiceAction::Stop | ServiceAction::Restart))
+        || (matches!(mode, SupervisionMode::WindowsTask) && action == ServiceAction::Start)
     {
         let (mut resp, code) = service_action_response(ctx, &mode, action, with_sudo, &context);
         if let Some(raw) = raw_mode_json {
@@ -197,6 +199,22 @@ fn service_action_response(
                 resp.insert("graceful", PyValue::Bool(false));
                 return (resp, 2);
             }
+        }
+    }
+
+    // windows-task 的 stop 先停用排程工作、停完才恢復；中途被打斷會留下停用狀態，
+    // 而 `schtasks /Run` 對停用的工作一律失敗。沒有更新／監管切換 hold 時先恢復啟用
+    // （`/ENABLE` 冪等，與 Restart 路徑一致）；有 hold 時停用屬於 hold，維持原行為（#276）。
+    if matches!(mode, SupervisionMode::WindowsTask)
+        && action == ServiceAction::Start
+        && !crate::rollback::autostart_hold_present(ctx)
+    {
+        let enabled = ctx.p.service.set_enabled(mode, true, with_sudo);
+        if enabled.iter().any(|command| command.rc != 0) {
+            return (
+                service_failure(mode, action, "恢復啟用排程工作失敗", "service_enable"),
+                2,
+            );
         }
     }
 

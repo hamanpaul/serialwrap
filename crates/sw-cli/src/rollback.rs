@@ -4483,6 +4483,12 @@ fn autostart_hold_path(ctx: &CliCtx<'_>) -> PathBuf {
     ctx.env.get("SERIALWRAP_STATE_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(&ctx.paths.state_dir)).join("autostart-hold.json")
 }
 
+/// 是否有更新或監管模式切換留下的 autostart hold（進行中或中斷皆算）。
+/// 有 hold 時監管項的停用狀態屬於 hold 的一部分，呼叫端不得自行恢復啟用（#276）。
+pub(crate) fn autostart_hold_present(ctx: &CliCtx<'_>) -> bool {
+    ctx.p.fs.exists(&autostart_hold_path(ctx))
+}
+
 fn acquire_switch_autostart_lock(ctx: &mut CliCtx<'_>) -> Result<(), ErrorCode> {
     if ctx.autostart_lock.as_ref().is_some_and(|guard| guard.is_held()) {
         return Ok(());
