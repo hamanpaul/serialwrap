@@ -123,7 +123,12 @@ def test_second_daemon_exit_2(daemons, tmp_path):
     assert stderr.replace(b"\r\n", b"\n") == DAEMON_ALREADY_RUNNING_STDERR
 
 
+@pytest.mark.rust_only
 def test_wal_share_delete_while_running(daemons, tmp_path):
+    """Rust B 的 WAL 刪除契約；Python 無 COM 時 session.bind 不建立 WAL。
+
+    Ledger 待辦：定義 Python 基線也成立的無 COM WAL 觸發方式，恢復 A 輪覆蓋。
+    """
     port = _free_port()
     daemons.start(tmp_path, port)
     _provoke_wal_record(port)

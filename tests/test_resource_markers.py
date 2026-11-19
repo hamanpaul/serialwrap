@@ -50,6 +50,48 @@ def _platform_skip(decorators: list[ast.expr], src: str) -> bool:
     return False
 
 
+def _parameter_platform_marks(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    tree: ast.Module,
+) -> list[set[str]]:
+    """讀取 pytest.param 上的平台標記，讓參數級平台分類也納入靜態稽核。"""
+    for decorator in node.decorator_list:
+        if not (
+            isinstance(decorator, ast.Call)
+            and isinstance(decorator.func, ast.Attribute)
+            and decorator.func.attr == "parametrize"
+            and isinstance(decorator.func.value, ast.Attribute)
+            and decorator.func.value.attr == "mark"
+            and isinstance(decorator.func.value.value, ast.Name)
+            and decorator.func.value.value.id == "pytest"
+            and len(decorator.args) >= 2
+        ):
+            continue
+        values = decorator.args[1]
+        if isinstance(values, ast.Name):
+            for statement in tree.body:
+                if not isinstance(statement, ast.Assign):
+                    continue
+                if any(isinstance(target, ast.Name) and target.id == values.id for target in statement.targets):
+                    values = statement.value
+                    break
+        if not isinstance(values, (ast.List, ast.Tuple)):
+            continue
+        param_marks: list[set[str]] = []
+        for value in values.elts:
+            marks: set[str] = set()
+            if isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute):
+                if (value.func.attr == "param" and isinstance(value.func.value, ast.Name)
+                        and value.func.value.id == "pytest"):
+                    for keyword in value.keywords:
+                        if keyword.arg == "marks":
+                            marks |= _mark_names(keyword.value)
+            param_marks.append(marks)
+        if any(marks & PLATFORM for marks in param_marks):
+            return param_marks
+    return []
+
+
 @dataclass
 class Item:
     file: str
@@ -80,17 +122,29 @@ def _items(path: Path) -> list[Item]:
     items: list[Item] = []
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
-            items.append(Item(path.name, node.name,
-                              module_marks | _decor_marks(node.decorator_list),
-                              module_skip or _platform_skip(node.decorator_list, src), node))
+            base_marks = module_marks | _decor_marks(node.decorator_list)
+            parameter_marks = _parameter_platform_marks(node, tree)
+            if parameter_marks:
+                for index, marks in enumerate(parameter_marks):
+                    items.append(Item(path.name, f"{node.name}[param-{index}]", base_marks | marks,
+                                      module_skip or _platform_skip(node.decorator_list, src), node))
+            else:
+                items.append(Item(path.name, node.name, base_marks,
+                                  module_skip or _platform_skip(node.decorator_list, src), node))
         if isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
             cls_marks = _pytestmark(node.body) | _decor_marks(node.decorator_list)
             cls_skip = _platform_skip(node.decorator_list, src)
             for fn in node.body:
                 if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name.startswith("test"):
-                    items.append(Item(path.name, f"{node.name}.{fn.name}",
-                                      module_marks | cls_marks | _decor_marks(fn.decorator_list),
-                                      module_skip or cls_skip or _platform_skip(fn.decorator_list, src), node))
+                    base_marks = module_marks | cls_marks | _decor_marks(fn.decorator_list)
+                    parameter_marks = _parameter_platform_marks(fn, tree)
+                    if parameter_marks:
+                        for index, marks in enumerate(parameter_marks):
+                            items.append(Item(path.name, f"{node.name}.{fn.name}[param-{index}]", base_marks | marks,
+                                              module_skip or cls_skip or _platform_skip(fn.decorator_list, src), node))
+                    else:
+                        items.append(Item(path.name, f"{node.name}.{fn.name}", base_marks,
+                                          module_skip or cls_skip or _platform_skip(fn.decorator_list, src), node))
     return items
 
 
