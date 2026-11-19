@@ -244,7 +244,11 @@ def run_observer(sw: Any, boards: list[str], *, interval_s: float, out: Path, st
         elapsed = now - started
         if duration_s is not None and elapsed >= duration_s:
             break
-        _append(out, {"kind": "sample", **sample(sw, boards, procscan=procscan)})
+        # 只在取樣期限到時取樣並推進期限；探測期限提早喚醒時不得多取一筆、再把下一筆往後推一個週期
+        # （2026-11-19 Windows 長跑實測每 300 s 出現 0.5 s＋19.5 s 的間隔，僅比 gate 缺口門檻少 0.5 s）。
+        sample_due = now >= next_sample
+        if sample_due:
+            _append(out, {"kind": "sample", **sample(sw, boards, procscan=procscan)})
         if probe_enabled and now >= next_probe:
             for com in boards:
                 try:
@@ -256,11 +260,12 @@ def run_observer(sw: Any, boards: list[str], *, interval_s: float, out: Path, st
                 _append(probes_path, {"kind": "excl_probe", "com": com, **record})
             next_probe = now + float(excl_probe_interval_s)
         # 以固定期限排程，將 RPC／程序掃描耗時納入週期，避免長跑取樣逐筆漂移。
-        next_sample += float(interval_s)
-        after_sample = time.monotonic()
-        if interval_s > 0 and next_sample <= after_sample:
-            missed = int((after_sample - next_sample) // float(interval_s)) + 1
-            next_sample += missed * float(interval_s)
+        if sample_due:
+            next_sample += float(interval_s)
+            after_sample = time.monotonic()
+            if interval_s > 0 and next_sample <= after_sample:
+                missed = int((after_sample - next_sample) // float(interval_s)) + 1
+                next_sample += missed * float(interval_s)
         wait = max(0.0, next_sample - time.monotonic())
         if duration_s is not None:
             wait = min(wait, max(0.0, duration_s - (time.monotonic() - started)))
