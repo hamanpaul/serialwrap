@@ -1033,6 +1033,15 @@ def test_upgrade_image_pins_same_base_as_systemd_image():
     def base(path: Path) -> str:
         return next(line for line in path.read_text(encoding="utf-8").splitlines() if line.startswith("FROM "))
     assert base(DOCKERFILE) == base(SYSTEMD_DOCKERFILE)
+    for path in (DOCKERFILE, SYSTEMD_DOCKERFILE):
+        lines = path.read_text(encoding="utf-8").splitlines()
+        rewrite = next((i for i, line in enumerate(lines) if "sed -i" in line), None)
+        updates = [i for i, line in enumerate(lines) if "apt-get update" in line]
+        assert rewrite is not None and updates and rewrite < updates[0], path
+        rewrite_command = "\n".join(lines[rewrite:updates[0]])
+        for host in ("archive.ubuntu.com", "security.ubuntu.com"):
+            replacement = f"s|http://{host}/ubuntu|https://{host}/ubuntu|g"
+            assert replacement in rewrite_command, (path, replacement)
     text = DOCKERFILE.read_text(encoding="utf-8")
     assert "COPY" not in text
     for pkg in ("pipx", "systemd", "dbus-user-session"):

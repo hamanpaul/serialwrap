@@ -8,7 +8,12 @@ FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f57
 
 ENV container=docker DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update \
+# Hosted runner 對 Ubuntu archive 的 HTTP 連線不可用時，先改用 HTTPS 再更新索引與安裝套件。
+RUN sed -i \
+    -e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+    -e 's|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' \
+    /etc/apt/sources.list.d/ubuntu.sources \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
        bash ca-certificates dbus-user-session jq login minicom pipx python3 python3-venv sudo systemd systemd-sysv util-linux \
     && if getent passwd 1000 >/dev/null; then userdel -r "$(getent passwd 1000 | cut -d: -f1)"; fi \

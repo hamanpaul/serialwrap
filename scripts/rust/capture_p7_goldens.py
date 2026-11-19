@@ -234,6 +234,8 @@ def gen_auth_resolution() -> list[dict[str, Any]]:
                 files_out[key] = {"b64": b64(data)}
             environ = dict(case["environ"])
             environ["HOME"] = home
+            # expanduser 於 POSIX 讀 HOME、於 Windows 讀 USERPROFILE；兩者指向同一合成家目錄。
+            environ["USERPROFILE"] = home
             sp = session_profile(**case["profile"])
             old = os.getcwd()
             os.chdir(cwd)

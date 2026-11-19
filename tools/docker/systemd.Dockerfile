@@ -7,7 +7,12 @@ ARG DOCKER_CE_CLI_VERSION=5:29.8.2-1~ubuntu.24.04~noble
 
 ENV container=docker DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update \
+# Hosted runner 對 Ubuntu archive 的 HTTP 連線不可用時，先改用 HTTPS 再更新索引與安裝套件。
+RUN sed -i \
+    -e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+    -e 's|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' \
+    /etc/apt/sources.list.d/ubuntu.sources \
+    && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
