@@ -89,9 +89,55 @@ fn service_windows_task_start_runs_schtasks() {
     assert!(out.contains("\"ok\":true"));
     assert!(out.contains("\"action\":\"start\""));
     assert!(out.contains("\"mode\":\"windows-task\""));
+    // #276：先恢復啟用（中斷的 stop 可能留下停用狀態），再 /Run。
+    assert_eq!(
+        t.calls(),
+        vec![
+            vec!["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"],
+            vec!["schtasks", "/Run", "/TN", "serialwrap"],
+        ]
+    );
+}
+
+#[test]
+fn service_windows_task_start_keeps_disabled_under_autostart_hold() {
+    // #276：更新／監管切換的 hold 存在時，停用狀態屬於 hold，start 不得自行恢復啟用。
+    let t = TestEnv::windows()
+        .with_config("supervision_mode: windows-task\n")
+        .with_real_service();
+    t.write_file(
+        &t.state_dir().join("autostart-hold.json"),
+        b"{\"schema_version\":1,\"op\":\"supervision_set\"}",
+    );
+    let (_rc, _out, _err) = t.run(&["service", "start"]);
     assert_eq!(
         t.calls(),
         vec![vec!["schtasks", "/Run", "/TN", "serialwrap"]]
+    );
+}
+
+#[test]
+fn service_windows_task_start_enable_failure_skips_run() {
+    let t = TestEnv::windows()
+        .with_config("supervision_mode: windows-task\n")
+        .with_real_service()
+        .with_command(
+            &["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"],
+            1,
+            "",
+            "ERROR: Access is denied.\n",
+        );
+    let (rc, out, err) = t.run(&["service", "start"]);
+    assert_eq!(rc, 2);
+    assert!(out.contains("\"ok\":false"));
+    assert!(out.contains("\"error_code\":\"INTERNAL_ERROR\""));
+    assert!(out.contains("\"phase\":\"service_enable\""));
+    assert!(out.contains("\"action\":\"start\""));
+    assert!(err.starts_with("serialwrap: service start failed: "));
+    assert_eq!(
+        t.calls(),
+        vec![vec!["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"]],
+        "恢復啟用失敗時不得再 /Run"
     );
 }
 
