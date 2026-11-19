@@ -17,7 +17,7 @@ import uuid as uuid_mod
 from typing import Any
 from unittest import mock
 
-from capture_p7_goldens import profile_json, rows_with_ids, session_profile, wire
+from capture_p7_goldens import normalize_temporary_paths, profile_json, rows_with_ids, session_profile, wire
 from p7_fake_bridge import VirtualClock
 
 FIXED_ISO = "2026-10-26T00:00:00.000000+00:00"
@@ -577,7 +577,14 @@ def gen_log_responses() -> list[dict[str, Any]]:
                 os.makedirs(os.path.join(td, "blog", "COM0_" + FIXED_STRFTIME + ".log"))
             fn = {"start": mgr.log_start, "stop": mgr.log_stop, "status": mgr.log_status}[spec["op"]]
             try:
-                resp_s = wire(fn(selector)).replace(td, "/golden")
+                if spec.get("log_path_is_dir"):
+                    # 目錄目標的 open 錯誤在 Windows/POSIX 不同；fixture 固定相同的例外語意。
+                    log_path = os.path.join(td, "blog", "COM0_" + FIXED_STRFTIME + ".log")
+                    with mock.patch("builtins.open", side_effect=IsADirectoryError(21, "Is a directory", log_path)):
+                        response = fn(selector)
+                else:
+                    response = fn(selector)
+                resp_s = wire(normalize_temporary_paths(response, td))
                 raised = None
             except OSError as exc:      # Python 例外穿出 manager → framing EXCEPTION
                 resp_s, raised = None, type(exc).__name__

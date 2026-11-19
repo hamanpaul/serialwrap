@@ -40,6 +40,7 @@ NAMES = ["env_file", "auth_resolution", "login_fsm_scenarios", "quiet_rx", "gate
          "redos", "line_buffer", "event_payload", "event_log_tail", "event_engine_order", "registry_load", "counter_file"]
 
 GOLDEN_ROOT = "/golden"
+_GOLDEN_PATH_FIELDS = frozenset(("device_by_id", "env_file", "log_dir"))
 
 
 def b64(b: bytes) -> str:
@@ -53,6 +54,26 @@ def dumps_line(obj: Any) -> str:
 def wire(obj: Any) -> str:
     """回應 dict 的位元組形狀：保留 key 順序（不排序）、RPC 線上格式（緊湊、ensure_ascii=False）。"""
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def normalize_golden_path(value: str) -> str:
+    """以 `/` 表示 golden 內的路徑，保留跨平台相同的路徑語意。"""
+    return value.replace("\\", "/")
+
+
+def normalize_temporary_paths(value: Any, temp_dir: str) -> Any:
+    """把 fixture 暫存路徑換成穩定根目錄，並正規化 Windows 分隔符。"""
+    if isinstance(value, str):
+        if temp_dir not in value:
+            return value
+        return normalize_golden_path(value.replace(temp_dir, GOLDEN_ROOT))
+    if isinstance(value, dict):
+        return {key: normalize_temporary_paths(item, temp_dir) for key, item in value.items()}
+    if isinstance(value, list):
+        return [normalize_temporary_paths(item, temp_dir) for item in value]
+    if isinstance(value, tuple):
+        return tuple(normalize_temporary_paths(item, temp_dir) for item in value)
+    return value
 
 
 def rows_with_ids(name: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -125,6 +146,8 @@ def profile_json(sp: Any) -> dict[str, Any]:
             v = dataclasses.asdict(v)
         elif isinstance(v, tuple):
             v = list(v)
+        if f.name in _GOLDEN_PATH_FIELDS and isinstance(v, str):
+            v = normalize_golden_path(v)
         out[f.name] = v
     return out
 
@@ -246,7 +269,7 @@ def gen_auth_resolution() -> list[dict[str, Any]]:
                 os.chdir(old)
 
             def norm(s: str | None) -> str | None:
-                return None if s is None else s.replace(td, GOLDEN_ROOT).replace("\\", "/")
+                return None if s is None else normalize_temporary_paths(s, td)
 
             env_out = dict(case["environ"])
             env_out["HOME"] = f"{GOLDEN_ROOT}/home"
@@ -545,7 +568,7 @@ def gen_registry_load() -> list[dict[str, Any]]:
                     f.write(data)
             res = RuleRegistry(td).load_all()
             rows.append({"files": {k: b64(v) for k, v in files.items()}, "rules": [r.rule_id for r in res.rules],
-                         "failed": [[os.path.basename(fl.path), fl.reason.replace(td, GOLDEN_ROOT)] for fl in res.failed]})
+                         "failed": [[os.path.basename(fl.path), normalize_temporary_paths(fl.reason, td)] for fl in res.failed]})
     return rows_with_ids("registry_load", rows)
 
 
