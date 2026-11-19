@@ -91,8 +91,8 @@ print_command() {
     printf '\n'
 }
 if ((DRY_RUN)); then
-    print_command docker compose -f "$COMPOSE_FILE" -p "$PROJECT" build serialwrap dut-sim
-    print_command docker compose -f "$COMPOSE_FILE" -p "$PROJECT" --profile systemd-user build systemd
+    print_command docker compose --progress plain -f "$COMPOSE_FILE" -p "$PROJECT" build serialwrap dut-sim
+    print_command docker compose --progress plain -f "$COMPOSE_FILE" -p "$PROJECT" --profile systemd-user build systemd
     printf '+ docker compose -f %q -p %q run --rm --no-deps -T -v %q:%q -v %q:%q' \
         "$COMPOSE_FILE" "$PROJECT" /tmp/sw-l15-run /tmp/sw-l15-run "$OUT" "$OUT"
     if [[ -n "$BUNDLE" ]]; then printf ' -v %q:/opt/sw-bundle:ro' "$BUNDLE"; fi
@@ -180,8 +180,8 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-docker compose -f "$COMPOSE_FILE" -p "$PROJECT" build serialwrap dut-sim
-docker compose -f "$COMPOSE_FILE" -p "$PROJECT" --profile systemd-user build systemd
+docker compose --progress plain -f "$COMPOSE_FILE" -p "$PROJECT" build serialwrap dut-sim
+docker compose --progress plain -f "$COMPOSE_FILE" -p "$PROJECT" --profile systemd-user build systemd
 compose_args=(-f "$COMPOSE_FILE" -p "$PROJECT" run --rm --no-deps -T
     -v "$WORKSPACE:/tmp/sw-l15-run" -v "$OUT:$OUT"
     -e SW_OUT -e SW_REPORT -e SW_SUITE -e SW_CASE -e SW_DUT_IMAGE
