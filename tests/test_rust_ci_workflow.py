@@ -141,6 +141,23 @@ def test_rust_linux_job_ordered_commands():
                 break
         assert found, f"命令 {cmd!r} 未在 rust-linux steps 中依序找到"
 
+    # systemd stop 後須等 DUT PTY relay 排空停機前已送出的 TX，才能建立重啟前基線。
+    supervision_test = (REPO_ROOT / "tests/contract_blackbox/test_s24_supervision_systemd.py").read_text(
+        encoding="utf-8"
+    )
+    settled = "_settled_rx_len(shell_target)"
+    baseline = "before = len(received)"
+    assert supervision_test.count(settled) == 2, "停機與重啟後都須以 DUT RX 靜定作為觀察同步點"
+    baseline_at = supervision_test.index(baseline)
+    assert supervision_test.index(settled) < baseline_at, (
+        "重啟前的 no-auto-resend 基線必須在停機後 DUT RX 靜定才取樣"
+    )
+    restart_at = supervision_test.index("transient_unit.start()", baseline_at)
+    settle_after_restart = supervision_test.rindex(settled)
+    assert restart_at < supervision_test.index("time.sleep(1.0)", restart_at) < settle_after_restart, (
+        "重啟後須保留既有 1 秒觀察窗，並排空 DUT RX 後再判定"
+    )
+
 
 def test_rust_windows_hosted_job():
     """驗證 rust-windows-hosted 的 runs-on 為 windows-latest 且步驟含 cargo test --workspace。"""

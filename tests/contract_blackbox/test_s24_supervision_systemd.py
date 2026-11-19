@@ -108,6 +108,21 @@ def _assert_last_wal_crc(sw_env) -> None:
     assert last["crc32"] == f"{zlib.crc32(base64.b64decode(last['payload_b64'])) & 0xFFFFFFFF:08x}", last
 
 
+def _settled_rx_len(shell_target, quiet_s: float = 2.0, timeout_s: float = 10.0) -> int:
+    """等 DUT PTY relay 把已送達的 UART bytes 記錄完成，再回傳穩定長度。"""
+    last = len(shell_target.rx_log())
+    deadline = time.monotonic() + timeout_s
+    stable_since = time.monotonic()
+    while time.monotonic() < deadline:
+        time.sleep(0.05)
+        now = len(shell_target.rx_log())
+        if now != last:
+            last, stable_since = now, time.monotonic()
+        elif time.monotonic() - stable_since >= quiet_s:
+            return last
+    raise AssertionError(f"DUT RX 在 {timeout_s:.1f}s 內未靜定：{len(shell_target.rx_log())} bytes")
+
+
 def test_sigterm_ordered_shutdown(sw_env, shell_target, transient_unit):
     sw_env.prepare(targets={"COM0": shell_target})
     transient_unit.start()
@@ -154,6 +169,8 @@ def test_stop_during_push_flushes_wal(sw_env, shell_target, transient_unit, tmp_
             assert took <= STOP_CAP_S, f"停止耗時 {took:.2f}s 超過 2.0 s＋5 s"
             assert reply.get("ok") is False and reply.get("error_code") in OD62_ABORT_CODES, reply
         _assert_last_wal_crc(sw_env)
+        # daemon 已退出後，先讓 DUT relay 記完停機前已進入 PTY 的 bytes，避免把延遲觀察誤認為重啟重送。
+        _settled_rx_len(shell_target)
         tx_payloads = b"".join(base64.b64decode(r["payload_b64"]) for r in sw_env.wal_tx("COM0"))
         received = [c for c in shell_target.commands() if "SW_XFER_CHUNK" in c]
         assert received, "停止前 DUT 已收到 chunk"
@@ -163,7 +180,9 @@ def test_stop_during_push_flushes_wal(sw_env, shell_target, transient_unit, tmp_
         before = len(received)
         transient_unit.start()
         sw_env.wait_state("COM0", "READY", timeout=20)
+        # 保留原有 1 秒 no-auto-resend 觀察窗，再排空 relay 後比較 DUT 實收行數。
         time.sleep(1.0)
+        _settled_rx_len(shell_target)
         assert len([c for c in shell_target.commands() if "SW_XFER_CHUNK" in c]) == before, "重啟後不得重送 chunk"
     finally:
         # 中止的 push 不送 cleanup（OD-62）：自行移除 shelltarget（本機 /bin/sh）留下的上傳暫存檔與目的檔。
