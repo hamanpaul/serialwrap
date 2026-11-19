@@ -96,15 +96,15 @@ def _rel(p: Path | None) -> str | None:
         return None
     q = Path(p).resolve()
     try:
-        return str(q.relative_to(ROOT))
+        return q.relative_to(ROOT).as_posix()
     except ValueError:
         pass
     if RUN_DIR is not None:
         try:
-            return "$RUN_DIR/" + str(q.relative_to(Path(RUN_DIR).resolve()))
+            return "$RUN_DIR/" + q.relative_to(Path(RUN_DIR).resolve()).as_posix()
         except ValueError:
             pass
-    return "$EXTERNAL/" + str(q).lstrip("/")
+    return "$EXTERNAL/" + q.as_posix().lstrip("/")
 
 
 def _run_dir_label(p: Path | None) -> str | None:
@@ -114,9 +114,9 @@ def _run_dir_label(p: Path | None) -> str | None:
         return None
     q = Path(p).resolve()
     try:
-        return str(q.relative_to(ROOT))
+        return q.relative_to(ROOT).as_posix()
     except ValueError:
-        return "$EXTERNAL/" + str(q).lstrip("/")
+        return "$EXTERNAL/" + q.as_posix().lstrip("/")
 
 
 def load_cases(cases_yaml: Path) -> list[dict]:

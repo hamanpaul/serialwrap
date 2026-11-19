@@ -989,16 +989,24 @@ def test_coverage_plugin_reads_artifacts_from_ab_env_snapshot(tmp_path, monkeypa
     daemon = tmp_path / "serialwrapd"
     cli.write_bytes(b"\x7fELF cli")
     daemon.write_bytes(b"\x7fELF daemon")
+    label = "rust-windows" if os.name == "nt" else "rust-linux"
     monkeypatch.setattr(ab_env, "AB_ENV", {
-        "SERIALWRAP_CLI_EXE": str(cli), "SERIALWRAP_DAEMON_EXE": str(daemon), "SERIALWRAP_AB_LABEL": "rust-linux",
+        "SERIALWRAP_CLI_EXE": str(cli), "SERIALWRAP_DAEMON_EXE": str(daemon), "SERIALWRAP_AB_LABEL": label,
     })
     monkeypatch.delenv("SERIALWRAP_CLI_EXE", raising=False)
     monkeypatch.delenv("SERIALWRAP_DAEMON_EXE", raising=False)
     run = tmp_path / "run"
     monkeypatch.setenv("SERIALWRAP_COVERAGE_RUN_DIR", str(run))
-    monkeypatch.setenv("SERIALWRAP_COVERAGE_LABEL", "rust-linux")
+    monkeypatch.setenv("SERIALWRAP_COVERAGE_LABEL", label)
+    if label == "rust-windows":
+        windows_artifacts = run / "artifacts" / "windows"
+        windows_artifacts.mkdir(parents=True)
+        (windows_artifacts / "SHA256SUMS").write_text(
+            f"{_sha_bytes(cli.read_bytes())} {cli.name}\n{_sha_bytes(daemon.read_bytes())} {daemon.name}\n",
+            encoding="utf-8",
+        )
     _plugin_run(_plugin_module(), _FakeSession(["tests/contract_blackbox/test_x.py::test_y"]))
-    document = json.loads((run / "results-rust-linux.json").read_text(encoding="utf-8"))
+    document = json.loads((run / f"results-{label}.json").read_text(encoding="utf-8"))
     assert document["cli_sha256"] == _sha_bytes(cli.read_bytes())
     assert document["daemon_sha256"] == _sha_bytes(daemon.read_bytes())
     assert not document.get("identity_errors")
@@ -1148,11 +1156,31 @@ def test_parametrized_declarations_match_real_collection(tmp_path):
         for nodeid in [*item.get("nodeids", []), *item.get("python_nodeids", [])]
         if not nodeid.startswith("cargo:") and nodeid not in collected and nodeid in variants
     }
-    assert referenced, "應至少有 s24-xfer-session-gates 的參數化基底"
-    assert "tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet" in referenced
+    posix_only_declared: set[str] = set()
+    for base in declared:
+        module_path = ROOT / base.partition("::")[0]
+        if not module_path.is_file():
+            continue
+        module_ast = ast.parse(module_path.read_text(encoding="utf-8"))
+        for statement in module_ast.body:
+            if not isinstance(statement, ast.Assign):
+                continue
+            if not any(isinstance(target, ast.Name) and target.id == "pytestmark" for target in statement.targets):
+                continue
+            if any(isinstance(node, ast.Attribute) and node.attr == "posix_only" for node in ast.walk(statement.value)):
+                posix_only_declared.add(base)
+                break
+    expected_windows_exclusions = posix_only_declared if os.name == "nt" else set()
+    missing_bases = set(declared) - set(variants)
+    assert missing_bases == expected_windows_exclusions, (missing_bases, expected_windows_exclusions)
+    gate_base = "tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet"
+    assert gate_base in declared, "s24-xfer-session-gates 必須保留完整參數化宣告"
+    if os.name == "nt":
+        assert gate_base in expected_windows_exclusions, "Windows 排除只能來自模組層 posix_only 標記"
+    else:
+        assert gate_base in referenced, "Linux collection 必須包含 s24-xfer-session-gates 參數"
     for base in sorted(referenced):
         assert sorted(declared.get(base) or []) == sorted(variants[base]), base
-    assert set(declared) <= set(variants), "宣告了不存在的參數化基底"
 
 
 def test_rust_l1_nodeids_are_not_required_in_python_results(tmp_path):

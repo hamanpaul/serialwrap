@@ -244,7 +244,7 @@ def gen_auth_resolution() -> list[dict[str, Any]]:
                 os.chdir(old)
 
             def norm(s: str | None) -> str | None:
-                return None if s is None else s.replace(td, GOLDEN_ROOT)
+                return None if s is None else s.replace(td, GOLDEN_ROOT).replace("\\", "/")
 
             env_out = dict(case["environ"])
             env_out["HOME"] = f"{GOLDEN_ROOT}/home"

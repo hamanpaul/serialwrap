@@ -113,14 +113,22 @@ def test_tcp_endpoint_loopback_and_ping(daemons, tmp_path):
 
 def test_second_daemon_exit_2(daemons, tmp_path):
     port = _free_port()
-    daemons.start(tmp_path, port)
-    second = daemons.spawn(_env(tmp_path, port))           # 同 endpoint 再啟動
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    (profiles / "default.yaml").write_text("platform: passthrough\n", encoding="utf-8")
+    daemons.start(tmp_path, port, SERIALWRAP_PROFILE_DIR=str(profiles))
+    second = daemons.spawn(_env(tmp_path, port, SERIALWRAP_PROFILE_DIR=str(profiles)))  # 同 endpoint 再啟動
     _, stderr = second.communicate(timeout=20)
     assert second.returncode == 2
-    assert stderr == DAEMON_ALREADY_RUNNING_STDERR
+    assert stderr.replace(b"\r\n", b"\n") == DAEMON_ALREADY_RUNNING_STDERR
 
 
+@pytest.mark.rust_only
 def test_wal_share_delete_while_running(daemons, tmp_path):
+    """Rust B 的 WAL 刪除契約；Python 無 COM 時 session.bind 不建立 WAL。
+
+    Ledger 待辦：定義 Python 基線也成立的無 COM WAL 觸發方式，恢復 A 輪覆蓋。
+    """
     port = _free_port()
     daemons.start(tmp_path, port)
     _provoke_wal_record(port)
@@ -147,6 +155,7 @@ def test_config_yaml_socket_path_written(daemons, tmp_path):
     assert yaml.safe_load(config.read_text(encoding="utf-8"))["socket_path"] == f"tcp://127.0.0.1:{port}"
 
 
+@pytest.mark.rust_only
 def test_deferred_methods_windows(daemons, tmp_path):
     port = _free_port()
     daemons.start(tmp_path, port)

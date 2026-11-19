@@ -12,7 +12,7 @@ DECLARATIONS = {"local", "declare", "typeset", "readonly", "export"}
 ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
 NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
-pytestmark = [pytest.mark.core_portable, pytest.mark.process_rpc]
+pytestmark = [pytest.mark.process_rpc]
 
 
 def _shell_commands(source: str) -> list[list[tuple[str, int]]]:
@@ -216,6 +216,7 @@ def _tracked_shell_scripts() -> list[Path]:
     return [ROOT / path for path in output.splitlines() if path]
 
 
+@pytest.mark.core_portable
 def test_pattern_detects_prior_reference_and_ignores_self_or_other_statements() -> None:
     sample = '''\
 f() {
@@ -244,6 +245,7 @@ f() {
     ]
 
 
+@pytest.mark.posix_only
 def test_bash_nounset_same_statement_reference_exits_with_error() -> None:
     result = subprocess.run(
         ["bash", "-c", 'set -u; f(){ local a=1 b="$a"; echo "$b"; }; f'],
@@ -256,6 +258,7 @@ def test_bash_nounset_same_statement_reference_exits_with_error() -> None:
     assert "unbound variable" in result.stderr
 
 
+@pytest.mark.core_portable
 def test_tracked_shell_scripts_have_no_prior_reference_in_declaration() -> None:
     offenders = []
     for path in _tracked_shell_scripts():

@@ -52,8 +52,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-mingw-w64-x86-64 bubblewrap python3.12 python3.12-venv
-      - name: "安裝 Python 相依（PyYAML、pytest、jsonschema）"
-        run: python3 -m pip install --disable-pip-version-check pyyaml==6.0.3 pytest==9.0.3 jsonschema==4.10.3
+      - name: "安裝 Python 相依（PyYAML、pytest、jsonschema、policy_check）"
+        run: python3 -m pip install --disable-pip-version-check pyyaml==6.0.3 pytest==9.0.3 jsonschema==4.10.3 "git+https://github.com/hamanpaul/paulsha-conventions.git@2dcf2f815afeddc477c1cacc33df9beb06ae14fb"
       - name: "架構邊界：cfg 邊界檢查"
         run: python3 scripts/rust/check_cfg_boundary.py
       - name: "架構邊界：crate 依賴方向檢查"
@@ -77,7 +77,7 @@ jobs:
           actual="$(/usr/bin/python3.12 -I -c 'import platform; print(platform.python_version())')"
           test "$actual" = "$expected"
           /usr/bin/python3.12 -m venv target/ci-system-python
-          target/ci-system-python/bin/python3 -m pip install --disable-pip-version-check pyyaml==6.0.3 pytest==9.0.3 jsonschema==4.10.3
+          target/ci-system-python/bin/python3 -m pip install --disable-pip-version-check pyyaml==6.0.3 pytest==9.0.3 jsonschema==4.10.3 "git+https://github.com/hamanpaul/paulsha-conventions.git@2dcf2f815afeddc477c1cacc33df9beb06ae14fb"
       - name: "建置 Stage 1A 開發 bundle"
         run: PATH="$PWD/target/ci-system-python/bin:$PATH" scripts/rust/mkbundle.sh --dev --out target/dev-bundle
       - name: "黑箱契約 harness（Rust CLI 輪，tests/contract_blackbox）"

@@ -686,9 +686,9 @@ def verify_report(md_path: Path, results_dir: Path, *, l1_lock: Path | None = No
 
 def _rel_to(base: Path, p: Path) -> str:
     try:
-        return str(Path(p).resolve().relative_to(Path(base).resolve()))
+        return Path(p).resolve().relative_to(Path(base).resolve()).as_posix()
     except ValueError:
-        return str(p)
+        return Path(p).as_posix()
 
 
 def _tool_versions() -> dict[str, str | None]:

@@ -12,31 +12,35 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-pytestmark = [pytest.mark.core_portable, pytest.mark.process_rpc]
+pytestmark = [pytest.mark.process_rpc]
 
 GENERATORS = [
-    ("gen_pyjson.py", "pyjson.tsv"),
-    ("gen_pycompat.py", "pycompat.tsv"),
-    ("gen_pycompat.py", "pypath.posix.tsv"),
-    ("gen_pycompat.py", "pypath.windows.tsv"),
-    ("gen_unicode_tables.py", "unicode_tables.txt"),
-    ("gen_pyre.py", "pyre.tsv"),
-    ("gen_constants.py", "constants.json"),
-    ("gen_runtime_paths.py", "runtime_paths.posix.tsv"),
-    ("gen_runtime_paths.py", "runtime_paths.windows.tsv"),
-    ("gen_endpoint.py", "endpoint.tsv"),
-    ("gen_wal_line.py", "wal_line.tsv"),
-    ("gen_cli_trace.py", "cli_trace.tsv"),
+    pytest.param("gen_pyjson.py", "pyjson.tsv", marks=pytest.mark.core_portable),
+    pytest.param("gen_pycompat.py", "pycompat.tsv", marks=pytest.mark.core_portable),
+    pytest.param("gen_pycompat.py", "pypath.posix.tsv", marks=pytest.mark.core_portable),
+    pytest.param("gen_pycompat.py", "pypath.windows.tsv", marks=pytest.mark.core_portable),
+    pytest.param("gen_unicode_tables.py", "unicode_tables.txt", marks=pytest.mark.core_portable),
+    pytest.param("gen_pyre.py", "pyre.tsv", marks=pytest.mark.core_portable),
+    pytest.param("gen_constants.py", "constants.json", marks=pytest.mark.core_portable),
+    pytest.param("gen_runtime_paths.py", "runtime_paths.posix.tsv", marks=pytest.mark.core_portable),
+    pytest.param("gen_runtime_paths.py", "runtime_paths.windows.tsv", marks=pytest.mark.core_portable),
+    pytest.param("gen_endpoint.py", "endpoint.tsv", marks=pytest.mark.core_portable),
+    pytest.param("gen_wal_line.py", "wal_line.tsv", marks=pytest.mark.core_portable),
+    pytest.param("gen_cli_trace.py", "cli_trace.tsv", marks=pytest.mark.core_portable),
     # P6 Slice 2.2（07 Task 2／Task 3）
-    ("gen_telnet_filter.py", "telnet_filter.tsv"),
-    ("gen_line_editor.py", "line_editor.tsv"),
-    ("gen_human_line_mode.py", "human_console_mode.tsv"),
-    ("gen_human_line_mode.py", "human_console_mode.windows.tsv"),
-    ("gen_shlex.py", "shlex_split.tsv"),
+    pytest.param("gen_telnet_filter.py", "telnet_filter.tsv", marks=pytest.mark.core_portable),
+    pytest.param("gen_line_editor.py", "line_editor.tsv", marks=pytest.mark.core_portable),
+    pytest.param("gen_human_line_mode.py", "human_console_mode.tsv", marks=pytest.mark.core_portable),
+    pytest.param("gen_human_line_mode.py", "human_console_mode.windows.tsv", marks=pytest.mark.core_portable),
+    pytest.param("gen_shlex.py", "shlex_split.tsv", marks=pytest.mark.core_portable),
     # P7 Task 3 上游補件（P3 缺口）：sw_proto::pyre::escape
-    ("gen_pyre_escape.py", "pyre_escape.tsv"),
+    pytest.param("gen_pyre_escape.py", "pyre_escape.tsv", marks=pytest.mark.core_portable),
     # 審查 F84（P5-T19）：SC-19 壞 config.yaml 例外類別（permission 列於 root 時以 setpriv 降權）。
-    ("gen_allowlist_unreadable_config.py", "allowlist_unreadable_config.tsv"),
+    pytest.param(
+        "gen_allowlist_unreadable_config.py",
+        "allowlist_unreadable_config.tsv",
+        marks=pytest.mark.posix_only,
+    ),
 ]
 
 
@@ -58,6 +62,7 @@ def test_golden_is_fresh(tmp_path, script, out):
     sys.version_info[:3] != (3, 12, 3),
     reason="golden 以 CPython 3.12.3 為基準（CI 釘 3.12.3；其他版本為證據不足，非 PASS）",
 )
+@pytest.mark.core_portable
 def test_pyre_limits_is_fresh(tmp_path):
     """``pyre.limits.json`` 記錄 PARSE_DEPTH_LIMIT（Python 首次 RecursionError 的深度 T），須與重跑結果逐位元組相同。"""
     subprocess.run(
@@ -74,6 +79,7 @@ def test_pyre_limits_is_fresh(tmp_path):
     assert (tmp_path / "pyre.limits.json").read_bytes() == (ROOT / "contracts/golden/pyre.limits.json").read_bytes()
 
 
+@pytest.mark.core_portable
 def test_wal_record_goldens_are_fresh(tmp_path):
     target = tmp_path / "wal"
     subprocess.run(
@@ -104,6 +110,7 @@ def _git(*args: str) -> str:
     return subprocess.run(["git", "-C", str(ROOT), *args], check=True, capture_output=True, text=True).stdout
 
 
+@pytest.mark.core_portable
 def test_golden_gitattributes_force_lf():
     try:
         files = [f for f in _git("ls-files", "-z", "contracts/golden").split("\0") if f]
@@ -138,6 +145,7 @@ def _load_goldens_module(name: str):
     return mod
 
 
+@pytest.mark.core_portable
 def test_tsv_write_raw_is_single_source():
     tsv = _load_goldens_module("_tsv")
     assert callable(getattr(tsv, "write_raw_tsv", None)), "_tsv.py 應提供 write_raw_tsv"
@@ -147,6 +155,7 @@ def test_tsv_write_raw_is_single_source():
         assert "write_raw_tsv" in src and "from _tsv import" in src, f"{gen}.py 應改用 _tsv.write_raw_tsv"
 
 
+@pytest.mark.core_portable
 def test_tsv_raw_roundtrip_and_hex_mode(tmp_path):
     tsv = _load_goldens_module("_tsv")
     rows = [("a", "op", "0a,0d", "1:/0d"), ("b", "op", "", "")]
@@ -163,6 +172,7 @@ def test_tsv_raw_roundtrip_and_hex_mode(tmp_path):
     assert len(tsv.read_tsv(golden, raw=True)) == golden.read_bytes().count(b"\n")
 
 
+@pytest.mark.core_portable
 def test_tsv_write_raw_rejects_duplicates_and_separators(tmp_path):
     tsv = _load_goldens_module("_tsv")
     with pytest.raises(ValueError, match="重複"):

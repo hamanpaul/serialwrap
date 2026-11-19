@@ -9,10 +9,11 @@ import pathlib
 import shutil
 import subprocess
 import sys
+from urllib.parse import quote
 
 import pytest
 
-pytestmark = [pytest.mark.core_portable, pytest.mark.process_rpc]
+pytestmark = [pytest.mark.process_rpc]
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CURRENT_VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
@@ -42,6 +43,11 @@ def _module():
 
 def _sha(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _windows_l1_input(root: pathlib.Path, required_set: str) -> pathlib.Path:
+    """測試來源目錄採 Windows 可建立的集合 ID 編碼格式。"""
+    return root / quote(required_set, safe="") / "l1-results.json"
 
 
 def _fixture(tmp_path: pathlib.Path, gate: str):
@@ -82,12 +88,13 @@ def _fixture(tmp_path: pathlib.Path, gate: str):
         dest = shared / "artifacts" / ARTIFACT_PATHS[name]
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(path.read_bytes())
-        manifest["provenance"]["artifacts"][name] = {"path": str(dest.relative_to(shared)), "sha256": _sha(dest)}
+        manifest["provenance"]["artifacts"][name] = {"path": dest.relative_to(shared).as_posix(), "sha256": _sha(dest)}
         artifacts[name] = dest
     (shared / "manifest.json").write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
     return shared, set_id, artifacts, selector["argv"]
 
 
+@pytest.mark.core_portable
 @pytest.mark.parametrize("gate", GATES)
 @pytest.mark.parametrize("mismatch", ("head", "dirty", "artifact", "argv"))
 def test_shared_evidence_provenance_mismatch_is_missing_for_every_gate(tmp_path, gate, mismatch):
@@ -119,6 +126,7 @@ def test_shared_evidence_provenance_mismatch_is_missing_for_every_gate(tmp_path,
     assert result["reasons"]
 
 
+@pytest.mark.core_portable
 def test_shared_failed_section_remains_fail_after_import(tmp_path, monkeypatch):
     shared, set_id, artifacts, _ = _fixture(tmp_path, "p7")
     manifest_path = shared / "manifest.json"
@@ -235,6 +243,7 @@ def _windows_l1_report(head: str, selector: list[str]) -> dict:
     }
 
 
+@pytest.mark.core_portable
 def test_windows_l1_import_records_locked_selector_and_provenance(tmp_path):
     shared, _, artifacts, _ = _fixture(tmp_path, "p7")
     head = _module().get_current_head()
@@ -247,7 +256,7 @@ def test_windows_l1_import_records_locked_selector_and_provenance(tmp_path):
         set_id: {"windows": {"selector": {"argv": selector}, "nodeids": [nodeid]}}
         for set_id in (required_set, failed_set)
     }}), encoding="utf-8")
-    source = tmp_path / "windows" / required_set / "l1-results.json"
+    source = _windows_l1_input(tmp_path / "windows", required_set)
     source.parent.mkdir(parents=True)
     source.write_text(json.dumps(_windows_l1_report(head, selector)), encoding="utf-8")
 
@@ -271,7 +280,7 @@ def test_windows_l1_import_records_locked_selector_and_provenance(tmp_path):
     failed_report["counts"]["all"] = {"passed": 0, "failed": 1, "skipped": 0}
     failed_report["results"][0]["outcome"] = "failed"
     failed_report["results"][0]["phases"]["call"] = "failed"
-    failed_source = tmp_path / "windows" / failed_set / "l1-results.json"
+    failed_source = _windows_l1_input(tmp_path / "windows", failed_set)
     failed_source.parent.mkdir(parents=True)
     failed_source.write_text(json.dumps(failed_report), encoding="utf-8")
     recorded_failure = _module().record_windows_l1(
@@ -287,6 +296,7 @@ def test_windows_l1_import_records_locked_selector_and_provenance(tmp_path):
     assert imported_failure["status"] == "FAIL"
 
 
+@pytest.mark.core_portable
 @pytest.mark.parametrize("mismatch", ("head", "dirty", "argv"))
 def test_windows_l1_provenance_or_selector_mismatch_is_not_recorded(tmp_path, mismatch):
     shared, _, _, _ = _fixture(tmp_path, "p7")
@@ -297,7 +307,7 @@ def test_windows_l1_provenance_or_selector_mismatch_is_not_recorded(tmp_path, mi
     lock.write_text(json.dumps({"sets": {required_set: {"windows": {
         "selector": {"argv": selector}, "nodeids": ["cargo:sw-daemon::dispatch::one_required_case"]
     }}}}), encoding="utf-8")
-    source = tmp_path / "windows" / required_set / "l1-results.json"
+    source = _windows_l1_input(tmp_path / "windows", required_set)
     source.parent.mkdir(parents=True)
     report_head = "0" * 40 if mismatch == "head" else head
     report = _windows_l1_report(report_head, selector)
@@ -378,6 +388,7 @@ def _windows_pytest_l1_report(head: str, selector: list[str], nodeid: str, marke
     }
 
 
+@pytest.mark.core_portable
 def test_windows_native_pytest_l1_import_checks_selector_and_git_provenance(tmp_path):
     """Windows pytest 只能以專屬鎖列匯入，並核對平台、selector、HEAD 起訖與乾淨狀態。"""
     shared, _, artifacts, _ = _fixture(tmp_path, "slice21")
@@ -396,7 +407,7 @@ def test_windows_native_pytest_l1_import_checks_selector_and_git_provenance(tmp_
         "selector": {"argv": selector, "markexpr": markexpr, "paths": [nodeid]},
     }}}}), encoding="utf-8")
     source_root = tmp_path / "windows"
-    source = source_root / required_set / "l1-results.json"
+    source = _windows_l1_input(source_root, required_set)
     source.parent.mkdir(parents=True)
     source.write_text(json.dumps(_windows_pytest_l1_report(head, selector, nodeid, markexpr)), encoding="utf-8")
 
@@ -415,6 +426,7 @@ def test_windows_native_pytest_l1_import_checks_selector_and_git_provenance(tmp_
     assert imported["argv"] == selector
 
 
+@pytest.mark.core_portable
 @pytest.mark.parametrize("mismatch", [
     "start_head", "end_head", "start_dirty", "end_dirty", "argv", "markexpr", "platform", "runner",
     "missing_provenance",
@@ -437,7 +449,7 @@ def test_windows_native_pytest_l1_provenance_or_selector_mismatch_is_not_recorde
         "selector": {"argv": selector, "markexpr": markexpr, "paths": [nodeid]},
     }}}}), encoding="utf-8")
     source_root = tmp_path / "windows"
-    source = source_root / required_set / "l1-results.json"
+    source = _windows_l1_input(source_root, required_set)
     source.parent.mkdir(parents=True)
     report = _windows_pytest_l1_report(head, selector, nodeid, markexpr)
     if mismatch == "start_head":
@@ -477,6 +489,7 @@ def test_windows_native_pytest_l1_provenance_or_selector_mismatch_is_not_recorde
     assert f"windows_l1:{required_set}" not in manifest["sections"]
 
 
+@pytest.mark.core_portable
 def test_windows_native_pytest_l1_failure_is_preserved_as_fail(tmp_path):
     """Windows pytest 必要列失敗須沿用唯一 L1 judge 判 FAIL，而非改成缺證或通過。"""
     shared, _, _, _ = _fixture(tmp_path, "slice21")
@@ -495,7 +508,7 @@ def test_windows_native_pytest_l1_failure_is_preserved_as_fail(tmp_path):
         "selector": {"argv": selector, "markexpr": markexpr, "paths": [nodeid]},
     }}}}), encoding="utf-8")
     source_root = tmp_path / "windows"
-    source = source_root / required_set / "l1-results.json"
+    source = _windows_l1_input(source_root, required_set)
     source.parent.mkdir(parents=True)
     report = _windows_pytest_l1_report(head, selector, nodeid, markexpr)
     report["results"][0]["outcome"] = "failed"
@@ -579,6 +592,7 @@ def _s24_candidate_fixture(tmp_path: pathlib.Path, monkeypatch):
     return api, shared, bundle, source_artifacts, head
 
 
+@pytest.mark.posix_only
 @pytest.mark.parametrize(
     "script,args",
     [
@@ -612,6 +626,7 @@ def test_gate_dry_run_with_shared_evidence_exits_zero_and_skips_shared_commands(
         shutil.rmtree(out, ignore_errors=True)
 
 
+@pytest.mark.posix_only
 def test_shared_driver_dry_run_lists_commands_without_running_them(tmp_path):
     out_dir = "target/s2-par/gpz/i21/shared-dry-run"
     proc = subprocess.run(
@@ -632,6 +647,7 @@ def test_shared_driver_dry_run_lists_commands_without_running_them(tmp_path):
     assert str(ROOT / out_dir / "dry-run") in proc.stdout
 
 
+@pytest.mark.posix_only
 def test_shared_driver_stops_and_records_gate_prereq_failure_before_cargo(tmp_path):
     fixture = tmp_path / "repo"
     scripts = fixture / "scripts/rust"
@@ -736,6 +752,7 @@ def test_shared_driver_stops_and_records_gate_prereq_failure_before_cargo(tmp_pa
     assert not cargo_log.exists(), "髒樹或前置失敗後不得啟動 build 或 cargo L1"
 
 
+@pytest.mark.core_portable
 def test_shared_artifact_init_and_import_preserve_executable_names(tmp_path, monkeypatch):
     api = _module()
     sources = {}
@@ -814,6 +831,7 @@ def test_shared_artifact_init_and_import_preserve_executable_names(tmp_path, mon
     assert tampered["reasons"]
 
 
+@pytest.mark.core_portable
 def test_cargo_results_and_s24_ab_use_the_same_candidate_bundle_sha256(tmp_path, monkeypatch):
     import importlib.util
     from types import SimpleNamespace
@@ -872,6 +890,7 @@ def test_cargo_results_and_s24_ab_use_the_same_candidate_bundle_sha256(tmp_path,
     assert cargo_result["daemon_sha256"] != _sha(shared / "artifacts/debug/serialwrapd")
 
 
+@pytest.mark.posix_only
 def test_s24_bundle_check_failure_is_recorded_missing_and_does_not_skip_windows_l1(tmp_path, monkeypatch):
     api, shared, bundle, artifacts, head = _s24_candidate_fixture(tmp_path / "s24", monkeypatch)
     daemon = bundle / "versions" / CURRENT_VERSION / "bin" / "serialwrapd"
@@ -991,6 +1010,7 @@ run_capture() { local log="$1"; shift; set +e; "$@" 2>&1 | tee "$log"; local sta
                                 "record-missing-section", "record-windows-l1"]
 
 
+@pytest.mark.core_portable
 def test_g5_bundle_tempdir_uses_short_system_path(tmp_path, monkeypatch):
     """長 worktree 下的 G5 bundle 暫存根也不得沿用 ROOT/target/g5-tmp。"""
     import importlib.util
@@ -1018,7 +1038,9 @@ def test_g5_bundle_tempdir_uses_short_system_path(tmp_path, monkeypatch):
         tempdir_args["dir"] = pathlib.Path(dir)
         return real_temp_directory(prefix=prefix, dir=dir, **kwargs)
 
-    monkeypatch.setattr(bb_l15, "tempfile", SimpleNamespace(TemporaryDirectory=make_temp_directory))
+    monkeypatch.setattr(bb_l15, "tempfile", SimpleNamespace(
+        TemporaryDirectory=make_temp_directory, gettempdir=tempfile.gettempdir,
+    ))
 
     def fake_mkbundle(argv, **_kwargs):
         version = argv[argv.index("--version-override") + 1]
@@ -1037,12 +1059,14 @@ def test_g5_bundle_tempdir_uses_short_system_path(tmp_path, monkeypatch):
     bundle_work = bb_l15._bundle_work
     assert bundle_work is not None
     work_path = pathlib.Path(bundle_work.name)
-    assert tempdir_args["dir"] == pathlib.Path("/tmp")
-    assert work_path.parent == pathlib.Path("/tmp")
+    expected_temp_root = pathlib.Path(tempfile.gettempdir())
+    assert tempdir_args["dir"] == expected_temp_root
+    assert work_path.parent == expected_temp_root
     bb_l15._cleanup_bundles()
     assert not work_path.exists(), f"G5 暫存 bundle 目錄未清理：{work_path}"
 
 
+@pytest.mark.core_portable
 def test_gate_shared_artifact_paths_keep_cli_and_daemon_basenames():
     required = {
         "gate_shared.sh": (
@@ -1127,6 +1151,7 @@ def _init_with_extra(tmp_path: pathlib.Path, monkeypatch, extra) -> None:
     api.init_manifest(shared, sources, head=head, clean=True, candidate_bundle=bundle)
 
 
+@pytest.mark.core_portable
 def test_init_manifest_accepts_driver_prereq_log_next_to_candidate_bundle(tmp_path, monkeypatch):
     """候選版 36ef2d7b 實跑：gate_shared.sh 先建 RUN_DIR/logs/gate-prereqs.log 才 init，init 卻拒絕整個目錄。"""
     def prereq_log(shared: pathlib.Path) -> None:
@@ -1136,6 +1161,7 @@ def test_init_manifest_accepts_driver_prereq_log_next_to_candidate_bundle(tmp_pa
     _init_with_extra(tmp_path, monkeypatch, prereq_log)
 
 
+@pytest.mark.core_portable
 @pytest.mark.parametrize(
     "extra_kind", ["stray_file", "stray_dir", "extra_log", "prereq_log_is_dir"],
 )
