@@ -7,13 +7,15 @@ ARG DOCKER_CE_CLI_VERSION=5:29.8.2-1~ubuntu.24.04~noble
 
 ENV container=docker DEBIAN_FRONTEND=noninteractive
 
-# Hosted runner 對 Ubuntu archive 的 HTTP 連線不可用時，先改用 HTTPS 再更新索引與安裝套件。
-RUN sed -i \
+# Ubuntu base 沒有 CA bundle；首次安裝 CA 套件時仍由 APT 驗證簽署的 Release metadata，完成後恢復 HTTPS 憑證鏈驗證。
+RUN printf 'Acquire::https::Verify-Peer "false";\n' > /etc/apt/apt.conf.d/99bootstrap-no-ca \
+    && sed -i \
     -e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
     -e 's|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' \
     /etc/apt/sources.list.d/ubuntu.sources \
     && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm /etc/apt/apt.conf.d/99bootstrap-no-ca \
     && install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
     && chmod a+r /etc/apt/keyrings/docker.asc \

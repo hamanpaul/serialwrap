@@ -1034,7 +1034,8 @@ def test_upgrade_image_pins_same_base_as_systemd_image():
         return next(line for line in path.read_text(encoding="utf-8").splitlines() if line.startswith("FROM "))
     assert base(DOCKERFILE) == base(SYSTEMD_DOCKERFILE)
     for path in (DOCKERFILE, SYSTEMD_DOCKERFILE):
-        lines = path.read_text(encoding="utf-8").splitlines()
+        dockerfile = path.read_text(encoding="utf-8")
+        lines = dockerfile.splitlines()
         rewrite = next((i for i, line in enumerate(lines) if "sed -i" in line), None)
         updates = [i for i, line in enumerate(lines) if "apt-get update" in line]
         assert rewrite is not None and updates and rewrite < updates[0], path
@@ -1042,6 +1043,12 @@ def test_upgrade_image_pins_same_base_as_systemd_image():
         for host in ("archive.ubuntu.com", "security.ubuntu.com"):
             replacement = f"s|http://{host}/ubuntu|https://{host}/ubuntu|g"
             assert replacement in rewrite_command, (path, replacement)
+        assert len(updates) >= 2, path
+        bootstrap = next(i for i, line in enumerate(lines) if "Acquire::https::Verify-Peer" in line)
+        install_ca = next(i for i, line in enumerate(lines) if "apt-get install -y --no-install-recommends ca-certificates" in line)
+        remove_bootstrap = next(i for i, line in enumerate(lines) if "rm /etc/apt/apt.conf.d/99bootstrap-no-ca" in line)
+        assert bootstrap < updates[0] < install_ca < remove_bootstrap < updates[1], path
+        assert dockerfile.count('Acquire::https::Verify-Peer "false";') == 1, path
     text = DOCKERFILE.read_text(encoding="utf-8")
     assert "COPY" not in text
     for pkg in ("pipx", "systemd", "dbus-user-session"):

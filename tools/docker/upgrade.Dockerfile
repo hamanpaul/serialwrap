@@ -8,14 +8,18 @@ FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f57
 
 ENV container=docker DEBIAN_FRONTEND=noninteractive
 
-# Hosted runner 對 Ubuntu archive 的 HTTP 連線不可用時，先改用 HTTPS 再更新索引與安裝套件。
-RUN sed -i \
+# Ubuntu base 沒有 CA bundle；首次安裝 CA 套件時仍由 APT 驗證簽署的 Release metadata，完成後恢復 HTTPS 憑證鏈驗證。
+RUN printf 'Acquire::https::Verify-Peer "false";\n' > /etc/apt/apt.conf.d/99bootstrap-no-ca \
+    && sed -i \
     -e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
     -e 's|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' \
     /etc/apt/sources.list.d/ubuntu.sources \
     && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm /etc/apt/apt.conf.d/99bootstrap-no-ca \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
-       bash ca-certificates dbus-user-session jq login minicom pipx python3 python3-venv sudo systemd systemd-sysv util-linux \
+       bash dbus-user-session jq login minicom pipx python3 python3-venv sudo systemd systemd-sysv util-linux \
     && if getent passwd 1000 >/dev/null; then userdel -r "$(getent passwd 1000 | cut -d: -f1)"; fi \
     && useradd --create-home --uid 1000 --shell /bin/bash --groups dialout swtest \
     && h="$(getent passwd swtest | cut -d: -f6)" \
