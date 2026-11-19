@@ -13,6 +13,7 @@ import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
+from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LOCK = ROOT / "tests/acceptance/l1_required.lock.json"
@@ -803,7 +804,7 @@ def record_windows_l1(shared_dir: Path, *, source_root: Path, required_set: str,
     if provenance.get("worktree_clean") is not True or clean_now is not True:
         reasons.append("共用證據/current worktree 必須乾淨")
 
-    source = _safe_path(source_root, str(Path(required_set) / "l1-results.json"))
+    source = _windows_l1_source_path(source_root, required_set)
     if source is None:
         reasons.append(f"Windows L1 不可讀：{source_root / required_set / 'l1-results.json'}")
         report: dict[str, Any] = {}
@@ -852,6 +853,22 @@ def record_windows_l1(shared_dir: Path, *, source_root: Path, required_set: str,
     return {"status": evaluation["status"], "exit_code": exit_code,
             "section": section_name, "required_set": required_set, "platform": "windows",
             "argv": list(selector or []), "file_sha256": digest}
+
+
+def _windows_l1_source_path(source_root: Path, required_set: str) -> Path | None:
+    """解析 Windows L1 來源；Windows 目錄名將鎖定集合中的保留字元 percent-encode。
+
+    POSIX 匯入仍接受既有的原始集合名稱目錄，避免改寫已產生的證據包。
+    """
+    encoded = quote(required_set, safe="")
+    preferred = _safe_path(source_root, str(Path(encoded) / "l1-results.json"))
+    if preferred is None or preferred.is_file():
+        return preferred
+    if os.name != "nt":
+        legacy = _safe_path(source_root, str(Path(required_set) / "l1-results.json"))
+        if legacy is not None and legacy.is_file():
+            return legacy
+    return preferred
 
 
 def _write_manifest(shared_dir: Path, manifest: Mapping[str, Any]) -> None:

@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 import yaml
@@ -24,7 +25,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "rust" / "s22_gate_check.py"
 
-pytestmark = [pytest.mark.core_portable, pytest.mark.process_rpc]
+pytestmark = [pytest.mark.process_rpc]
 
 CARGO_ARGV = ["--workspace", "--features", "test-fakes"]
 PTY_ARGV = ["--package", "sw-pal", "--features", "test-fakes", "--test", "console_conformance", "--", "--ignored", "cap_posix_pty__"]
@@ -212,6 +213,7 @@ def _section(out: dict, set_id: str, platform: str) -> dict:
     return next(s for s in out["sections"] if s["set_id"] == set_id and s["platform"] == platform)
 
 
+@pytest.mark.core_portable
 def test_existing_function_not_executed_is_insufficient(tmp_path: Path) -> None:
     reports = _good_reports()
     reports[("blackbox_rust", "linux")] = _report("linux", "pytest", BB_ARGV, [])
@@ -223,6 +225,7 @@ def test_existing_function_not_executed_is_insufficient(tmp_path: Path) -> None:
     assert out["result"] == "INSUFFICIENT" and rc == 1
 
 
+@pytest.mark.core_portable
 def test_cargo_nonzero_count_is_not_enough(tmp_path: Path) -> None:
     reports = _good_reports()
     rows = [_row(f"cargo:sw-core::filler::t{i}") for i in range(200)]
@@ -232,6 +235,7 @@ def test_cargo_nonzero_count_is_not_enough(tmp_path: Path) -> None:
     assert out["result"] == "INSUFFICIENT" and rc == 1
 
 
+@pytest.mark.core_portable
 def test_required_ignored_or_duplicate_insufficient(tmp_path: Path) -> None:
     reports = _good_reports()
     reports[("console_conformance_pty", "linux")] = _report("linux", "cargo", PTY_ARGV, [_row(PTY_CAP, "skipped")])
@@ -251,6 +255,7 @@ def test_required_ignored_or_duplicate_insufficient(tmp_path: Path) -> None:
     assert out["result"] == "FAIL" and rc == 1
 
 
+@pytest.mark.core_portable
 def test_runner_exit_nonzero_insufficient(tmp_path: Path) -> None:
     for i, kwargs in enumerate(({"exit_code": 101}, {"finished": False})):
         reports = _good_reports()
@@ -260,6 +265,7 @@ def test_runner_exit_nonzero_insufficient(tmp_path: Path) -> None:
         assert out["result"] == "INSUFFICIENT" and rc == 1
 
 
+@pytest.mark.core_portable
 def test_cap_windows_com_absent_is_blocked_not_pass(tmp_path: Path) -> None:
     rc, out = _run(tmp_path / "a", _good_reports())
     assert _section(out, "s22_gate:win_test", "windows")["verdict"] == "PASS"
@@ -269,6 +275,7 @@ def test_cap_windows_com_absent_is_blocked_not_pass(tmp_path: Path) -> None:
     assert rc == 1
 
 
+@pytest.mark.core_portable
 def test_windows_com_console_cap_requires_native_evidence(tmp_path: Path) -> None:
     reports = _good_reports()
     del reports[("windows_cap_windows_com", "windows")]
@@ -295,6 +302,7 @@ def test_windows_com_console_cap_requires_native_evidence(tmp_path: Path) -> Non
         assert out["result"] == "INSUFFICIENT" and rc == 1
 
 
+@pytest.mark.core_portable
 def test_windows_daemon_console_cap_requires_native_evidence(tmp_path: Path) -> None:
     reports = _good_reports()
     del reports[("windows_cap_windows_com_daemon", "windows")]
@@ -304,6 +312,7 @@ def test_windows_daemon_console_cap_requires_native_evidence(tmp_path: Path) -> 
     assert out["result"] == "INSUFFICIENT" and rc == 1
 
 
+@pytest.mark.core_portable
 def test_all_present_pass(tmp_path: Path) -> None:
     rc, out = _run(tmp_path, _good_reports())
     assert out["result"] == "PASS" and rc == 0, out
@@ -313,6 +322,7 @@ def test_all_present_pass(tmp_path: Path) -> None:
     assert all(s["verdict"] == "PASS" for s in out["sections"])
 
 
+@pytest.mark.core_portable
 def test_od87_breaker_state_is_reported_without_blocking_s22(tmp_path: Path) -> None:
     rc, out = _run(tmp_path, _good_reports())
     assert rc == 0 and out["result"] == "PASS", out
@@ -322,6 +332,7 @@ def test_od87_breaker_state_is_reported_without_blocking_s22(tmp_path: Path) -> 
     assert out["breaker"]["exemption"]["decision"] == "OD-87", out["breaker"]
 
 
+@pytest.mark.core_portable
 def test_s22_checker_does_not_modify_tracked_breaker_inputs(tmp_path: Path) -> None:
     tracked_inputs = [
         ROOT / "tests/acceptance/breaker/slice_2.2.json",
@@ -343,6 +354,7 @@ def test_s22_checker_does_not_modify_tracked_breaker_inputs(tmp_path: Path) -> N
     assert checker.count(".write_text(") == 1 and "args.out.write_text(" in checker
 
 
+@pytest.mark.core_portable
 def test_missing_report_and_pending_entry_insufficient(tmp_path: Path) -> None:
     reports = _good_reports()
     del reports[("win_test", "windows")]
@@ -354,6 +366,7 @@ def test_missing_report_and_pending_entry_insufficient(tmp_path: Path) -> None:
     assert out["result"] == "INSUFFICIENT" and rc == 1
 
 
+@pytest.mark.posix_only
 def test_s22_gate_driver_dry_run_emits_incomplete_json(tmp_path: Path) -> None:
     run = ROOT / "target" / "s2-gfx" / "tests" / tmp_path.parent.name / tmp_path.name / "s22"
     proc = subprocess.run(["bash", "scripts/rust/s22_gate.sh", "--dry-run", "--run-id", "dry", "--out", str(run)],
@@ -367,6 +380,7 @@ def test_s22_gate_driver_dry_run_emits_incomplete_json(tmp_path: Path) -> None:
     shutil.rmtree(run, ignore_errors=True)
 
 
+@pytest.mark.core_portable
 def test_unchecked_only_case_is_insufficient(tmp_path: Path) -> None:
     """審查 3317987_d6e3b3c-opus High #1：只含 func-test／scenario 參照的 AUTOMATED 條目沒有 L1.5 執行證據時不得 PASS。"""
     emap = _emap()
@@ -429,6 +443,7 @@ def _l15_run(ref: str, implementation: str, path: Path, digest: str) -> dict:
             "daemon_path": str(path), "daemon_sha256": digest}
 
 
+@pytest.mark.core_portable
 def test_l15_rejects_two_python_launchers_labeled_python_and_rust(tmp_path: Path) -> None:
     """L1.5 身分取自實際 artifact；兩份不同路徑的 Python wrapper 不能偽裝成 Python＋Rust。"""
     emap = _emap()
@@ -446,6 +461,7 @@ def test_l15_rejects_two_python_launchers_labeled_python_and_rust(tmp_path: Path
     assert any("實際 artifact 身分" in reason for reason in out["l15_reasons"]), out["l15_reasons"]
 
 
+@pytest.mark.core_portable
 def test_l15_rust_artifact_must_match_reported_candidate(tmp_path: Path) -> None:
     """L1.5 的 Rust 證據必須綁定 --daemon-path 指定的候選 artifact。"""
     emap = _emap()
@@ -465,6 +481,7 @@ def test_l15_rust_artifact_must_match_reported_candidate(tmp_path: Path) -> None
     assert any("--daemon-path 候選不同" in reason for reason in out["l15_reasons"]), out["l15_reasons"]
 
 
+@pytest.mark.core_portable
 def test_l15_rust_requires_successful_candidate_build_identity(tmp_path: Path) -> None:
     """缺 build exit 或建置 SHA 時，不能把 Rust L1.5 列當成候選版通過證據。"""
     emap = _emap()
@@ -482,6 +499,7 @@ def test_l15_rust_requires_successful_candidate_build_identity(tmp_path: Path) -
     assert any("建置" in reason and "L1.5 Rust" in reason for reason in out["l15_reasons"]), out["l15_reasons"]
 
 
+@pytest.mark.core_portable
 def test_missing_required_sets_insufficient(tmp_path: Path) -> None:
     """審查 Medium #2：lock 缺任一必要 `s22_gate:*` 集合（例：win_test、blackbox_rust、py_parity）→ INSUFFICIENT。"""
     for i, missing in enumerate(("s22_gate:win_test", "s22_gate:blackbox_rust", "s22_gate:py_parity")):
@@ -493,6 +511,7 @@ def test_missing_required_sets_insufficient(tmp_path: Path) -> None:
         assert out["result"] == "INSUFFICIENT" and rc == 1
 
 
+@pytest.mark.core_portable
 def test_map_must_cover_frozen_slice22(tmp_path: Path) -> None:
     """審查 Medium #2：對照表鍵集合須等於凍結 slice_2.2；`cases: {}` 或缺鍵不得 PASS。"""
     emap = _emap()
@@ -504,6 +523,7 @@ def test_map_must_cover_frozen_slice22(tmp_path: Path) -> None:
     assert out["result"] == "INSUFFICIENT" and rc == 1
 
 
+@pytest.mark.core_portable
 def test_prereqs_strict_failure_insufficient(tmp_path: Path) -> None:
     """增補 #180：`check_p6_prereqs.py --strict` 非 0 → INSUFFICIENT。"""
     rc, out = _run(tmp_path, _good_reports(), prereqs_rc=1)
@@ -511,6 +531,7 @@ def test_prereqs_strict_failure_insufficient(tmp_path: Path) -> None:
     assert out["result"] == "INSUFFICIENT" and rc == 1
 
 
+@pytest.mark.core_portable
 def test_parity_rows_listed_and_pending_not_pass(tmp_path: Path) -> None:
     """增補 #187：承接 Phase 為 P6 的承接編號逐列輸出；未登記或 OWNER-DECISION-PENDING → result 不得為 PASS。"""
     rc, out = _run(tmp_path / "a", _good_reports())
@@ -527,6 +548,7 @@ def test_parity_rows_listed_and_pending_not_pass(tmp_path: Path) -> None:
     assert row["status"] == "OWNER-DECISION-PENDING" and row["verdict"] == "INSUFFICIENT" and rc == 1
 
 
+@pytest.mark.core_portable
 def test_module_importable_without_sw_core() -> None:
     spec = importlib.util.spec_from_file_location("s22_gate_check", SCRIPT)
     mod = importlib.util.module_from_spec(spec)
@@ -536,6 +558,7 @@ def test_module_importable_without_sw_core() -> None:
     assert "import sw_core" not in src and "from sw_core" not in src, "只用 stdlib＋PyYAML，判定委派 l1_judge"
 
 
+@pytest.mark.core_portable
 def test_overlapping_sections_same_nodeid_once_each_is_pass(tmp_path: Path) -> None:
     """實跑（第 4 輪 r4）：`console_conformance_pty` 的 selector 會執行整個 `console_conformance` binary，其非 cap 測試
     同時出現在 `cargo_workspace` 報告；兩個集合各恰一列 `passed` 時不得因跨集合合計兩列而判證據不足。
@@ -563,6 +586,7 @@ def test_overlapping_sections_same_nodeid_once_each_is_pass(tmp_path: Path) -> N
     assert _case(out, "f5-second-console-linebuffer")["status"] == "FAIL", out
 
 
+@pytest.mark.core_portable
 def test_duplicate_within_one_report_not_masked_by_other_report_pass(tmp_path: Path) -> None:
     """OD-54（sol P6-c6ddda1-1）：跨集合皆 passed、無 failed → PASS（cd80448 追認），但同一份報告（集合×平台）內部
     重複仍判 INSUFFICIENT，不得被另一份報告的單列 passed 遮蔽；逐案與 parity_rows 皆同。"""
@@ -592,6 +616,7 @@ def test_duplicate_within_one_report_not_masked_by_other_report_pass(tmp_path: P
     assert _case(out, "f5-second-console-linebuffer")["status"] == "FAIL", out
 
 
+@pytest.mark.core_portable
 def test_judge_tests_duplicate_in_one_report_is_insufficient_unit() -> None:
     """OD-54 判定器單元：`judge_tests` 直接以 rows 判定（不經檔案），確認同報告重複不被他報告 passed 遮蔽。"""
     spec = importlib.util.spec_from_file_location("s22_gate_check", SCRIPT)
@@ -616,6 +641,7 @@ def _process_report(red: dict | None = None, green: dict | None = None, heading:
     return f"# 出口報告\n\n{heading}\n\n說明文字：紅燈、綠燈。\n\n```json process-evidence\n{block}\n```\n\n## 其他\n"
 
 
+@pytest.mark.core_portable
 def test_process_evidence_row_requires_structured_red_and_green(tmp_path: Path) -> None:
     """rulings/p6.md OWNER-BATCH #4（#185 證據形式）＋sol P6-b64dad9-1：流程項以出口報告 `## #185` 段落內的
     `json process-evidence` 區塊為證據（不以說明文字關鍵字判定）。紅燈須為核准的 commit、非零退出、failed>0 且列出失敗測試；
@@ -670,6 +696,7 @@ def _gate_module():
     return mod
 
 
+@pytest.mark.core_portable
 def test_derive_caps_from_selector_unit() -> None:
     """rulings/p6.md「OD-53 selector 記錄 caps」：不改鎖 schema，由現有 selector 推導收集器 `--caps`。
     test-binary 參數（`--` 之後）恰為 `--ignored cap_<cap>__…` → `--caps <cap>…`；不含 ignored 篩選 → 不需 caps；
@@ -688,6 +715,7 @@ def test_derive_caps_from_selector_unit() -> None:
     assert mod.derive_caps({"argv": ["--ignored", "cap_posix_pty__"]}) is None, "`--` 之前的 --ignored 無法以 --caps 重現"
 
 
+@pytest.mark.core_portable
 def test_real_lock_s22_cargo_sets_caps_derivable() -> None:
     """現行 L1 鎖的每個 `s22_gate:*` 集合皆可推導：`console_conformance_pty` → `posix_pty`，其餘不需 caps。"""
     mod = _gate_module()
@@ -700,6 +728,7 @@ def test_real_lock_s22_cargo_sets_caps_derivable() -> None:
     assert all(v is not None for v in derived.values()), derived
 
 
+@pytest.mark.core_portable
 def test_underivable_caps_selector_is_evidence_missing(tmp_path: Path) -> None:
     """推導不出 `--caps` 的集合（例：計畫 07 Task 13 Step 4 原文 `--include-ignored cap_posix_pty__`，收集器不轉交）→
     該集合 EVIDENCE_MISSING、result 不得 PASS，即使報告各列皆 passed、argv 與 selector 相符；該報告的 passed 列不得
@@ -736,6 +765,7 @@ def test_underivable_caps_selector_is_evidence_missing(tmp_path: Path) -> None:
     assert _case(out, "sc28-cap-mux")["status"] == "PASS" and out["result"] == "PASS" and rc == 0, out
 
 
+@pytest.mark.core_portable
 def test_plan_lists_derived_cargo_collect_commands(tmp_path: Path) -> None:
     """`--plan`：只依 L1 鎖輸出各 cargo `s22_gate:*` 集合的收集命令（前置收集由 gate 推導，不手打 `--caps`）；
     推導不出者 `collect_argv` 為 null、exit 1。Windows 集合由 win-test.sh 原生收集，只列 caps。"""
@@ -769,6 +799,7 @@ def test_plan_lists_derived_cargo_collect_commands(tmp_path: Path) -> None:
     assert entry["caps"] is None and entry["collect_argv"] is None and rc == 1, entries
 
 
+@pytest.mark.core_portable
 def test_gate_output_records_identity_without_changing_verdict(tmp_path: Path) -> None:
     """S22 身分供 P7 綁定先前切片證據；缺少產物時自檢列出缺漏，但不可改寫既有 gate 判定。"""
     rc, out = _run(tmp_path, _good_reports())
@@ -781,6 +812,7 @@ def test_gate_output_records_identity_without_changing_verdict(tmp_path: Path) -
     assert "identity.daemon_sha256" in out["identity_problems"]["missing"]
 
 
+@pytest.mark.core_portable
 def test_identity_self_check_requires_matching_tested_and_release_daemon_sha(tmp_path: Path) -> None:
     """缺來源身分或實際受測 artifact 與獨立 release build SHA 不符時，identity 自檢必須明確拒絕。"""
     mod = _gate_module()
@@ -807,6 +839,7 @@ def test_identity_self_check_requires_matching_tested_and_release_daemon_sha(tmp
     assert not missing and any("實際 sha256" in reason for reason in mismatch), mismatch
 
 
+@pytest.mark.core_portable
 def test_gate_output_binds_release_sha_and_dry_run_cannot_supply_tested_sha(tmp_path: Path) -> None:
     """受測 daemon hash 與 build 快照分開輸出；dry-run 有標記且不提供可被 P7 採用的 daemon SHA。"""
     daemon = tmp_path / "release" / "serialwrapd"
@@ -840,6 +873,7 @@ def test_gate_output_binds_release_sha_and_dry_run_cannot_supply_tested_sha(tmp_
     assert "identity.daemon_sha256" in out["identity_problems"]["missing"]
 
 
+@pytest.mark.core_portable
 def test_plan_passes_actual_release_build_exit_to_identity() -> None:
     """OD-93／s22-17：Task 13 Step 4 以共用 Stage 2 release artifact 作為候選來源，不重建裸 daemon。"""
     plan = (ROOT / "docs" / "rust-refactor" / "plans" / "07-slice22-console.md").read_text(encoding="utf-8")
@@ -920,7 +954,7 @@ def _shared_s22_import_fixture(tmp_path: Path, section: str, *, bad_selector: bo
         )
     else:
         windows_root = tmp_path / "windows-l1"
-        source = windows_root / set_id / "l1-results.json"
+        source = windows_root / quote(set_id, safe="") / "l1-results.json"
         source.parent.mkdir(parents=True)
         source.write_text(json.dumps(report), encoding="utf-8")
         recorded = shared_api.record_windows_l1(
@@ -936,6 +970,7 @@ def _shared_s22_import_fixture(tmp_path: Path, section: str, *, bad_selector: bo
     return shared
 
 
+@pytest.mark.posix_only
 @pytest.mark.parametrize(
     ("section", "platform", "bad_selector", "bad_sha"),
     [
@@ -977,6 +1012,7 @@ def test_rejected_shared_evidence_cannot_fall_back_to_stale_green_l1(
     shutil.rmtree(out, ignore_errors=True)
 
 
+@pytest.mark.core_portable
 def test_s22_gate_records_bridge_selftest_report_path(tmp_path: Path):
     """s22-05：報告需可追溯 bridge 自測輸入，而非只記錄 L1.5 結果。"""
     driver = (ROOT / "scripts/rust/s22_gate.sh").read_text(encoding="utf-8")
@@ -993,6 +1029,7 @@ def test_s22_gate_records_bridge_selftest_report_path(tmp_path: Path):
     assert report["l15_inputs"]["bridge_selftest_report"] == str(report_path)
 
 
+@pytest.mark.core_portable
 def test_s22_driver_runs_plan_derived_console_and_rust_blackbox() -> None:
     """s22-01：兩個缺漏集合須由 driver 實際產生，argv 以 --plan／凍結 selector 為準。"""
     driver = (ROOT / "scripts/rust/s22_gate.sh").read_text(encoding="utf-8")
@@ -1013,6 +1050,7 @@ def test_s22_driver_runs_plan_derived_console_and_rust_blackbox() -> None:
     assert selector == ["-q", "tests/contract_blackbox/slice21", "tests/contract_blackbox/slice22"]
 
 
+@pytest.mark.core_portable
 def test_s22_shared_import_includes_win_test_and_ignores_windows_dir() -> None:
     """s22-03：shared win_test 必須與兩組 Windows 能力列由同一 manifest 匯入。"""
     driver = (ROOT / "scripts/rust/s22_gate.sh").read_text(encoding="utf-8")
@@ -1021,6 +1059,7 @@ def test_s22_shared_import_includes_win_test_and_ignores_windows_dir() -> None:
     assert 'if shared_evidence or windows_dir is None:\n        return' in driver
 
 
+@pytest.mark.core_portable
 def test_s22_shared_build_identity_records_imported_stage2_bundle_and_cli_sha(tmp_path: Path) -> None:
     """s22-15／s22-17：共用 release CLI／daemon 的 SHA 與 bundle 來源要寫入報告。"""
     mod = _gate_module()
@@ -1062,6 +1101,7 @@ def test_s22_shared_build_identity_records_imported_stage2_bundle_and_cli_sha(tm
     assert 'str(run_dir / "logs/shared-release-bundle.json")' in driver
 
 
+@pytest.mark.posix_only
 def test_s22_driver_rejects_nonshared_formal_execution_before_running_python(tmp_path: Path) -> None:
     """s22-01：正式 driver 不得以無共用 release artifact 的非共用模式執行。"""
     fake_bin = tmp_path / "bin"
@@ -1172,6 +1212,7 @@ def _collect_s22_l15_rows(
     }
 
 
+@pytest.mark.core_portable
 def test_s22_l15_rows_use_cases_and_parity_refs_default_python_and_shared_rust_cli(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1205,6 +1246,7 @@ def test_s22_l15_rows_use_cases_and_parity_refs_default_python_and_shared_rust_c
             assert call["env"].get("SERIALWRAP_CLI_EXE") == str(paths["cli"]), call
 
 
+@pytest.mark.core_portable
 @pytest.mark.parametrize("missing_implementation", ["python", "rust"])
 def test_s22_l15_missing_daemon_is_unchecked_and_cannot_pass(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing_implementation: str,
@@ -1226,6 +1268,7 @@ def test_s22_l15_missing_daemon_is_unchecked_and_cannot_pass(
     assert len(calls) == 1, calls
 
 
+@pytest.mark.posix_only
 @pytest.mark.parametrize("out_kind", ["outside-repo", "inside-repo-outside-target"])
 def test_s22_driver_rejects_outside_target_before_creating_run_dir(
     tmp_path: Path, out_kind: str,
@@ -1246,6 +1289,7 @@ def test_s22_driver_rejects_outside_target_before_creating_run_dir(
         shutil.rmtree(run_dir, ignore_errors=True)
 
 
+@pytest.mark.posix_only
 def test_s22_driver_exports_parsed_rust_daemon_and_ignores_outer_common_override(
     tmp_path: Path,
 ) -> None:
@@ -1287,6 +1331,7 @@ def test_s22_driver_exports_parsed_rust_daemon_and_ignores_outer_common_override
     assert capture.read_text(encoding="utf-8").splitlines()[-1] == "", "共用模式不可繼承外層 Rust daemon"
 
 
+@pytest.mark.core_portable
 def test_s22_task13_step4_runs_shared_evidence_before_gate() -> None:
     """s22-07：文件命令以同一 RUN_ID 產生並消費 shared evidence。"""
     plan = (ROOT / "docs/rust-refactor/plans/07-slice22-console.md").read_text(encoding="utf-8")
@@ -1296,6 +1341,7 @@ def test_s22_task13_step4_runs_shared_evidence_before_gate() -> None:
     assert 'SHARED_EVIDENCE="target/s2-shared-evidence/$RUN_ID"' in plan
 
 
+@pytest.mark.core_portable
 def test_s22_run_logged_turns_timeout_into_failed_exit(tmp_path: Path) -> None:
     """逾時仍是執行失敗，不得因 runner 卡住而產生可通過列。"""
     namespace = _s22_driver_functions()

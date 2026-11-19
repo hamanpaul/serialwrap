@@ -339,7 +339,7 @@ def test_external_evidence_path_is_locatable(tmp_path, monkeypatch):
     monkeypatch.setattr(ab, "RUN_DIR", run)
     assert ab._rel(run / "sub" / "a.xml") == "$RUN_DIR/sub/a.xml"
     other = tmp_path / "elsewhere" / "a.xml"
-    assert ab._rel(other) == "$EXTERNAL/" + str(other.resolve()).lstrip("/")
+    assert ab._rel(other) == "$EXTERNAL/" + other.resolve().as_posix().lstrip("/")
     assert ab._rel(ROOT / "scripts/rust/p7_ab_report.py") == "scripts/rust/p7_ab_report.py"
 
 
@@ -367,7 +367,7 @@ def test_report_header_run_dir_is_restorable(tmp_path):
     args = _report_args(tmp_path, None) + ["--run-dir", str(run)]
     ab.main(args)
     md = (tmp_path / "out.md").read_text(encoding="utf-8")
-    assert f"- run_dir: `$EXTERNAL/{str(run.resolve()).lstrip('/')}`" in md, md.splitlines()[:16]
+    assert f"- run_dir: `$EXTERNAL/{run.resolve().as_posix().lstrip('/')}`" in md, md.splitlines()[:16]
     assert "$RUN_DIR/." not in md
 
 

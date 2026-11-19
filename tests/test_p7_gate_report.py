@@ -17,7 +17,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts/rust"))
 import p7_gate_report as g  # noqa: E402
 
-pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+pytestmark = [pytest.mark.memory_only]
 RESOURCE_AUDIT_WAIVERS = {"process_rpc": "test_required_rows_complete 僅啟動 p7_gate.sh --dry-run，不啟動 daemon 或進行 RPC"}
 
 
@@ -35,16 +35,19 @@ def _row(name, rc=0, passed=3, failed=0, ev=()):
             "evidence": list(ev), "log_path": "x.log", "log_sha256": None}
 
 
+@pytest.mark.core_portable
 def test_zero_tests_is_not_pass(tmp_path):
     md = g.build_report(_results(tmp_path, [_row("win-test.sh (non-COM)", passed=0)]))
     assert "| win-test.sh (non-COM) | INCOMPLETE |" in md          # R5-F3：缺 l1_results／0 測試＝證據不足，永不 PASS
 
 
+@pytest.mark.core_portable
 def test_missing_com_pair_makes_com_row_blocked_not_pass(tmp_path):
     md = g.build_report(_results(tmp_path, [_row("win-test.sh --caps windows_com", passed=0)], caps_missing=["windows_com"]))
     assert "| win-test.sh --caps windows_com | BLOCKED-OWNER | B-06 |" in md
 
 
+@pytest.mark.core_portable
 def test_rejected_shared_windows_import_is_incomplete_not_blocked_owner(tmp_path):
     """匯入被拒時缺少 l1_results 必須維持 INCOMPLETE；實際能力缺失仍由 caps_missing 單獨判 BLOCKED-OWNER。"""
     names = ("win-test.sh (non-COM)", "win-test.sh --caps windows_com")
@@ -59,12 +62,14 @@ def test_rejected_shared_windows_import_is_incomplete_not_blocked_owner(tmp_path
         assert f"| {name} | INCOMPLETE | 缺 l1_results |" in md
 
 
+@pytest.mark.core_portable
 def test_com_row_with_pair_judged_by_run_not_blocked(tmp_path):
     # OD-15：擁有者 host 提供 COM20:COM21 時，COM 列依實跑結果判定，不得為 BLOCKED-OWNER
     md = g.build_report(_results(tmp_path, [_row("win-test.sh --caps windows_com", rc=1, passed=2, failed=1)]))
     assert "| win-test.sh --caps windows_com | FAIL |" in md
 
 
+@pytest.mark.core_portable
 def test_owner_items_blocked_without_evidence_and_pass_with_verified_evidence(tmp_path):
     md = g.build_report(_results(tmp_path, []))
     assert "| B-02 | BLOCKED-OWNER |" in md
@@ -89,6 +94,7 @@ def _artifacts(tmp):
     return out
 
 
+@pytest.mark.core_portable
 def test_verify_detects_tampering(tmp_path):
     d = _results(tmp_path, [_row("cargo test --workspace")])
     data = json.loads((d / "results.json").read_text(encoding="utf-8"))
@@ -110,6 +116,7 @@ def test_verify_detects_tampering(tmp_path):
     assert g.verify_report(md, d), "竄改後必須驗證失敗"
 
 
+@pytest.mark.posix_only
 def test_required_rows_complete(tmp_path):
     assert set(g.REQUIRED_ROWS) >= {"check_cfg_boundary", "cargo test --workspace", "win-test.sh (non-COM)", "win-test.sh --caps windows_com",
         "contract_blackbox p7 A", "contract_blackbox p7 B", *g.OD59_ROWS, "contract_blackbox slice21 B", "contract_blackbox slice22 B",
@@ -140,6 +147,7 @@ def test_required_rows_complete(tmp_path):
     assert "docs/rust-refactor/evidence/p7-gate-" not in dry_run.stdout
 
 
+@pytest.mark.core_portable
 def test_missing_required_row_is_incomplete(tmp_path):
     md = g.build_report(_results(tmp_path, []))
     assert "| policy_check | INCOMPLETE | 未執行 |" in md
@@ -183,6 +191,7 @@ def _l1_row(tmp, rows, *, exit_code=0, finished=True, plat="linux", name="cargo 
     return r
 
 
+@pytest.mark.core_portable
 def test_positive_count_without_required_nodeids_is_not_pass(tmp_path):
     lock = _lock(tmp_path)
     row = _l1_row(tmp_path, [("cargo:sw-core::other::x", "passed")])          # passed>0、failed==0：舊規則會給 PASS
@@ -190,12 +199,14 @@ def test_positive_count_without_required_nodeids_is_not_pass(tmp_path):
     assert "| cargo test --workspace | INCOMPLETE |" in md and "missing" in md
 
 
+@pytest.mark.core_portable
 def test_required_ignored_is_not_pass(tmp_path):
     lock = _lock(tmp_path)
     row = _l1_row(tmp_path, [(REQ[0], "passed"), (REQ[1], "passed"), (REQ[2], "skipped")])
     assert "| cargo test --workspace | INCOMPLETE |" in g.build_report(_results(tmp_path, [row]), l1_lock=lock)
 
 
+@pytest.mark.core_portable
 def test_duplicate_or_unfinished_is_not_pass(tmp_path):
     lock = _lock(tmp_path)
     dup = _l1_row(tmp_path, [(REQ[0], "passed"), (REQ[0], "passed"), (REQ[1], "passed"), (REQ[2], "passed")], tag="dup")
@@ -204,6 +215,7 @@ def test_duplicate_or_unfinished_is_not_pass(tmp_path):
     assert "| cargo test --workspace | INCOMPLETE |" in g.build_report(_results(tmp_path, [unf], name="run_unf"), l1_lock=lock)
 
 
+@pytest.mark.core_portable
 def test_test_row_without_l1_results_is_incomplete(tmp_path):
     md = g.build_report(_results(tmp_path, [_row("cargo test --workspace", passed=500)]), l1_lock=_lock(tmp_path))
     assert "| cargo test --workspace | INCOMPLETE |" in md
@@ -226,6 +238,7 @@ def test_test_row_without_l1_results_is_incomplete(tmp_path):
     assert "provenance.git.head" in md
 
 
+@pytest.mark.core_portable
 def test_full_required_set_passes(tmp_path):
     lock = _lock(tmp_path)
     row = _l1_row(tmp_path, [(n, "passed") for n in REQ] + [("cargo:sw-core::extra::y", "passed")], tag="ok")
@@ -234,6 +247,7 @@ def test_full_required_set_passes(tmp_path):
     assert "| cargo test --workspace | FAIL |" in g.build_report(_results(tmp_path, [bad], name="run_bad"), l1_lock=lock)
 
 
+@pytest.mark.core_portable
 def test_non_test_row_evidence_mismatch_is_incomplete(tmp_path):
     ev = tmp_path / "ev.txt"
     ev.write_text("x", encoding="utf-8")
@@ -244,6 +258,7 @@ def test_non_test_row_evidence_mismatch_is_incomplete(tmp_path):
 
 
 # ---- 審查 9065f14_c5f0fc9（Codex sol）回歸 ----
+@pytest.mark.core_portable
 def test_substitute_smaller_required_set_is_rejected(tmp_path):
     """P7-c5f0fc9-1：列名對應的必要集合固定，不得以較小集合替代。"""
     lock = tmp_path / "l1.lock.json"
@@ -255,6 +270,7 @@ def test_substitute_smaller_required_set_is_rejected(tmp_path):
     assert "| cargo test --workspace | INCOMPLETE |" in md, md
 
 
+@pytest.mark.core_portable
 def test_non_test_row_without_evidence_or_hash_is_not_pass(tmp_path):
     """P7-c5f0fc9-2：非測試列缺證據、或證據缺有效 sha256 → 不得 PASS；擁有者證據缺 hash → BLOCKED-OWNER。"""
     md = g.build_report(_results(tmp_path, [_row("func-test ev-01-spawn-handler")]))
@@ -267,6 +283,7 @@ def test_non_test_row_without_evidence_or_hash_is_not_pass(tmp_path):
     assert "| B-02 | BLOCKED-OWNER |" in md
 
 
+@pytest.mark.core_portable
 def test_verify_checks_head_and_artifacts(tmp_path):
     """P7-c5f0fc9-3：verify 核對目前 HEAD 與 artifact 實際 sha256。"""
     d = _results(tmp_path, [_row("cargo test --workspace")])
@@ -291,6 +308,7 @@ def test_verify_checks_head_and_artifacts(tmp_path):
     assert any("HEAD" in p for p in g.verify_report(md, d))
 
 
+@pytest.mark.core_portable
 def test_init_and_record_only_record_identity_and_counts(tmp_path):
     """`init`／`record` 只記錄不判定：artifact 為 repo 相對路徑＋sha256；測試列附列名對應的 required_set 與 l1 計數，
     log／evidence 落 sha256；同名列覆寫（審查 P7-c5f0fc9-1：required_set 不由呼叫端決定）。"""
@@ -322,6 +340,7 @@ def test_init_and_record_only_record_identity_and_counts(tmp_path):
     assert "required_set" not in nt and "test_counts" not in nt
 
 
+@pytest.mark.core_portable
 def test_verify_requires_cli_and_daemon_artifacts(tmp_path):
     """審查 P7-c5f0fc9-3（第二輪）：`artifacts:{}` 或缺 CLI／daemon 任一者，verify 必須回報不一致。"""
     d = _results(tmp_path, [_row("cargo test --workspace")])
@@ -338,6 +357,7 @@ def test_verify_requires_cli_and_daemon_artifacts(tmp_path):
 
 
 
+@pytest.mark.core_portable
 def test_full_pytest_row_needs_whole_frozen_set(tmp_path):
     """N3：兩個 Stage 1 證據 nodeid 移出必要集合後，gate 必須使用裁決核准的新 selector。"""
     lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
@@ -377,6 +397,7 @@ def test_full_pytest_row_needs_whole_frozen_set(tmp_path):
     assert status == "INCOMPLETE" and "selector mismatch" in detail, (status, detail)
 
 
+@pytest.mark.core_portable
 def test_report_records_tool_versions(tmp_path):
     """審查 P7-b85eec5-1：results.json 與報告須記受測 pytest／Python 版本（凍結 nodeid 的參數 id 依 pytest 版本而異）。"""
     import pytest as _pytest
@@ -386,6 +407,7 @@ def test_report_records_tool_versions(tmp_path):
     assert f'"pytest": "{_pytest.__version__}"' in md
 
 
+@pytest.mark.core_portable
 def test_report_records_od87_exemption_and_actual_breaker_verdict(tmp_path):
     run = _results(tmp_path, [])
     breaker = {
@@ -406,6 +428,7 @@ def test_report_records_od87_exemption_and_actual_breaker_verdict(tmp_path):
     assert stored["breaker"]["gate_verdict"] == "OD-87_EXEMPT"
 
 
+@pytest.mark.core_portable
 def test_owner_items_cover_every_coverage_b_number(tmp_path):
     """rulings/p7.md SPEC-GAP #4 (i)：coverage 引用的每個 B 編號（含先前切片 B-09～B-16）都須是報告的擁有者項目，
     無證據時列為 BLOCKED-OWNER（不得 PASS）。"""
@@ -498,6 +521,7 @@ def _windows_ev01_fixture(tmp_path, *, bundle_head=None, meta_head=None, verdict
     return basic, bundle
 
 
+@pytest.mark.core_portable
 def test_windows_ev01_is_a_required_row_and_missing_report_is_incomplete(tmp_path):
     assert g.WINDOWS_EV01_ROW in g.REQUIRED_ROWS
     status, _detail = g.windows_ev01_status(None, None, g.current_head())
@@ -514,6 +538,7 @@ def test_windows_ev01_is_a_required_row_and_missing_report_is_incomplete(tmp_pat
     assert "結論：NOT-PASS" in md
 
 
+@pytest.mark.core_portable
 def test_windows_ev01_rejects_report_bound_to_another_head(tmp_path):
     basic, bundle = _windows_ev01_fixture(tmp_path, meta_head="f" * 40)
     status, detail = g.windows_ev01_status(basic, bundle, g.current_head())
@@ -521,6 +546,7 @@ def test_windows_ev01_rejects_report_bound_to_another_head(tmp_path):
     assert "HEAD" in detail
 
 
+@pytest.mark.core_portable
 @pytest.mark.parametrize("verdict,gate_eligible", [("FAIL", True), ("INSUFFICIENT_EVIDENCE", False),
                                                       ("SKIP", False), ("PASS", False)])
 def test_windows_ev01_nonpassing_or_ineligible_case_never_passes(tmp_path, verdict, gate_eligible):
@@ -530,6 +556,7 @@ def test_windows_ev01_nonpassing_or_ineligible_case_never_passes(tmp_path, verdi
     assert status == ("FAIL" if verdict == "FAIL" else "INCOMPLETE")
 
 
+@pytest.mark.core_portable
 def test_windows_ev01_passes_with_verified_head_bundle_and_eligible_result(tmp_path):
     basic, bundle = _windows_ev01_fixture(tmp_path)
     status, detail = g.windows_ev01_status(basic, bundle, g.current_head())
@@ -537,6 +564,7 @@ def test_windows_ev01_passes_with_verified_head_bundle_and_eligible_result(tmp_p
     assert "gate_eligible" in detail
 
 
+@pytest.mark.core_portable
 def test_windows_ev01_snapshot_row_is_reported_and_recomputed(tmp_path):
     basic, bundle = _windows_ev01_fixture(tmp_path)
     run = _results(tmp_path, [])
@@ -551,6 +579,7 @@ def test_windows_ev01_snapshot_row_is_reported_and_recomputed(tmp_path):
                          set(), None, None, g.current_head())[0] == "PASS"
 
 
+@pytest.mark.core_portable
 def test_windows_bundle_identity_rejects_release_test_hooks(tmp_path):
     import hashlib
 
@@ -600,6 +629,7 @@ def test_windows_bundle_identity_rejects_release_test_hooks(tmp_path):
             g.windows_bundle_identity(bundle)
 
 
+@pytest.mark.core_portable
 def test_windows_ev01_requires_stage2_bundle_sha256_identity(tmp_path):
     basic, bundle = _windows_ev01_fixture(tmp_path)
     metadata_path = basic.parent.parent / "win-func-test-meta.json"

@@ -31,7 +31,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
   echo "執行：python3 scripts/rust/cargo_l1_results.py --platform linux --out <L1> -- --workspace --features test-fakes；python3 scripts/rust/import_cargo_results.py --label rust-linux --platform linux --include-cap posix_pty --include-cap process_rpc -- --workspace --features test-fakes。"
   echo "執行：bash scripts/rust/run_p7_ab.sh --run-id <ID> --run-dir <AB> --out <REPORT> --rust-cli <CLI> --rust-daemon <DAEMON> --od59-contract。"
   echo "執行：env SERIALWRAP_CLI_EXE=<CLI> SERIALWRAP_DAEMON_EXE=<DAEMON> SERIALWRAP_AB_LABEL=rust-linux python3 -m pytest -q tests/contract_blackbox tests/acceptance/l15/test_slice21_l15.py tests/acceptance/l15/test_slice23_l15.py tests/test_multiagent_e2e.py tests/test_human_agent_coexist.py tests/test_rust_contract_coverage.py tests/test_transfer_golden_fresh.py。"
-  echo "匯入：--windows-l1 <dir>/<required-set>/l1-results.json；只讀取編排者提供的原生 L1，不啟動 Windows runner。"
+  echo "匯入：--windows-l1 <dir>/<required-set>/l1-results.json；Windows 目錄名將集合 ID percent-encode（例如 : → %3A），POSIX 舊目錄名仍可讀；只讀取編排者提供的原生 L1，不啟動 Windows runner。"
   echo "輸出 manifest.json：HEAD、乾淨工作樹、debug/release CLI 與 daemon SHA256、selector argv、evidence SHA256。"
   exit 0
 fi
