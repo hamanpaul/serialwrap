@@ -6,47 +6,64 @@
 
 use sw_pal::conformance::handler_suite as suite;
 
+/// 本檔所有測試依序執行。Windows 的 `handler_inherits_only_stdio` 以可繼承的探針 handle 驗 spawner 只繼承
+/// stdio；同一行程內平行測試以 std `Command`（Windows 上 `bInheritHandles=TRUE`，會繼承所有可繼承 handle）
+/// 起的子行程——例如 `process_with_marker_alive` 每次輪詢起的 PowerShell——會把探針一起帶走，使探針檔被占用
+/// 而誤判 LEAKED（2026-11-19 GitHub hosted `windows-latest` 實測）。依序執行只消除測試之間的干擾，斷言不變。
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn native() -> std::sync::Arc<dyn sw_pal::traits::HandlerSpawner> {
     sw_pal::native().handlers
 }
 
 #[test]
 fn native_completes() {
+    let _serial = serial();
     suite::completes_with_stdin_echo_and_tail(&*native());
 }
 
 #[test]
 fn native_timeout_kills_tree() {
+    let _serial = serial();
     suite::timeout_kills_whole_tree(&*native());
 }
 
 #[test]
 fn native_tail_bounded() {
+    let _serial = serial();
     suite::stdout_tail_is_bounded(&*native());
 }
 
 #[test]
 fn native_spawn_failure() {
+    let _serial = serial();
     suite::spawn_failure_message_is_python_like(&*native());
 }
 
 #[test]
 fn native_env_cleared() {
+    let _serial = serial();
     suite::env_is_cleared_except_spec(&*native());
 }
 
 #[test]
 fn native_abort_terminates_tree() {
+    let _serial = serial();
     suite::abort_terminates_tree(&*native());
 }
 
 #[test]
 fn native_inherits_only_stdio() {
+    let _serial = serial();
     suite::handler_inherits_only_stdio(&*native());
 }
 
 #[test]
 fn native_cmd_shell_quotes() {
+    let _serial = serial();
     let h = native();
     if h.shell_argv("x")[0] == "cmd.exe" {
         suite::cmd_shell_preserves_inner_quotes(&*h);
@@ -56,23 +73,27 @@ fn native_cmd_shell_quotes() {
 #[cfg(unix)]
 #[test]
 fn native_spawn_enoexec_is_python_like() {
+    let _serial = serial();
     suite::spawn_enoexec_is_python_like(&*native());
 }
 
 #[cfg(unix)]
 #[test]
 fn native_huge_timeout_overflow_keeps_pipes_open() {
+    let _serial = serial();
     suite::huge_timeout_overflow_keeps_pipes_open(&*native());
 }
 
 #[cfg(unix)]
 #[test]
 fn native_env_order_is_spec_order() {
+    let _serial = serial();
     suite::env_order_is_spec_order(&*native());
 }
 
 #[test]
 fn native_huge_timeout_overflow_is_python_like() {
+    let _serial = serial();
     suite::huge_timeout_overflow_is_python_like(&*native());
 }
 
@@ -80,6 +101,7 @@ fn native_huge_timeout_overflow_is_python_like() {
 /// Windows `threading.TIMEOUT_MAX`＝4294967.294 s）。
 #[test]
 fn py_communicate_timeout_overflow_threshold() {
+    let _serial = serial();
     use std::time::Duration;
     use sw_pal::process::py_communicate_timeout_overflows as over;
     let max_ms: u64 = if cfg!(windows) { 0xFFFF_FFFE } else { i32::MAX as u64 };
@@ -91,6 +113,7 @@ fn py_communicate_timeout_overflow_threshold() {
 
 #[test]
 fn shell_argv_and_env_keys_by_platform() {
+    let _serial = serial();
     let h = native();
     let argv = h.shell_argv("x");
     assert!(argv == ["/bin/sh", "-c", "x"] || argv == ["cmd.exe", "/d", "/s", "/c", "x"]);
@@ -112,6 +135,7 @@ fn shell_argv_and_env_keys_by_platform() {
 
 #[test]
 fn py_returncode_matches_python_popen() {
+    let _serial = serial();
     // 審查 b65df2d_01c474c 9c4a80e-1：Python `Popen.returncode` 在 Windows 為不帶號 DWORD（`0xC0000005` → 3221225477），
     // POSIX 原值（訊號終止為 `-signum`）。
     use sw_pal::process::py_returncode;
@@ -128,11 +152,13 @@ fn py_returncode_matches_python_popen() {
 #[cfg(unix)]
 #[test]
 fn native_child_signal_mask_is_empty_even_if_spawner_blocks_term() {
+    let _serial = serial();
     suite::child_signal_mask_is_empty_even_if_spawner_blocks_term(native());
 }
 
 #[cfg(unix)]
 #[test]
 fn native_timeout_kills_background_job_when_spawner_blocks_term() {
+    let _serial = serial();
     suite::timeout_kills_background_job_when_spawner_blocks_term(native());
 }
