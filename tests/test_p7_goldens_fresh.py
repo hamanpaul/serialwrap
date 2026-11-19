@@ -29,6 +29,22 @@ def test_goldens_exist_and_are_fresh():
             fresh = (pathlib.Path(td) / f"{name}.ndjson").read_bytes()
             assert (GOLDEN / f"{name}.ndjson").read_bytes() == fresh, f"{name} 與現行 Python 基線不一致，請重新擷取並審閱差異"
 
+    # 在 Linux 也模擬 Windows 的 ~ 展開規則，確認 fixture 以 USERPROFILE 指向相同的合成家目錄。
+    import importlib.util
+    import ntpath
+    from unittest import mock
+
+    from sw_core import auth as auth_mod
+
+    spec = importlib.util.spec_from_file_location("capture_p7_goldens_under_test", ROOT / "scripts/rust/capture_p7_goldens.py")
+    assert spec is not None and spec.loader is not None
+    capture = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(capture)
+    golden_rows = [json.loads(line) for line in (GOLDEN / "auth_resolution.ndjson").read_text(encoding="utf-8").splitlines()]
+    with mock.patch.object(auth_mod.os.path, "expanduser", ntpath.expanduser):
+        windows_rows = capture.gen_auth_resolution()
+    assert windows_rows == golden_rows, "Windows USERPROFILE 家目錄展開應維持 Linux 基線 golden 的邏輯結果"
+
 
 @pytest.mark.memory_only
 def test_login_fsm_golden_covers_every_platform_and_error():
