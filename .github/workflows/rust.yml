@@ -1,7 +1,7 @@
 # Rust CI 與 Stage 1A 出口 gate 的 PR 側 workflow（P3-T19；依 docs/rust-refactor/plans/04-stage1a-rust-cli.md Task 19、規格 §11.5）。
 #
 # 三個 job（job id 即 GitHub 檢查名稱，required check 以 job id 設定，故不設 name:）：
-#   - rust-linux：每個 PR；Linux 原生建置測試＋Windows GNU 交叉檢查＋黑箱 A/B（Rust CLI 輪）。
+#   - rust-linux：每個 PR；Linux 原生建置測試＋Windows GNU 交叉檢查＋Stage 2 黑箱 A/B（Rust CLI＋daemon）。
 #   - rust-windows-hosted：每個 PR；GitHub 託管 Windows 免驅動 L1（portable）與匯入 DLL 檢查。
 #     只證明免驅動 Windows L1，不得計為 windows_com（OD-08）。
 #   - rust-windows-com：自架 Windows COM bench；僅 PR 帶 label run-windows-com（且為同 repo 分支）、
@@ -80,17 +80,31 @@ jobs:
           target/ci-system-python/bin/python3 -m pip install --disable-pip-version-check pyyaml==6.0.3 pytest==9.0.3 jsonschema==4.10.3 "git+https://github.com/hamanpaul/paulsha-conventions.git@2dcf2f815afeddc477c1cacc33df9beb06ae14fb"
       - name: "建置 Stage 1A 開發 bundle"
         run: PATH="$PWD/target/ci-system-python/bin:$PATH" scripts/rust/mkbundle.sh --dev --out target/dev-bundle
-      - name: "黑箱契約 harness（Rust CLI 輪，tests/contract_blackbox）"
+      - name: "準備黑箱 AppArmor 與 tmpfs 隔離環境"
         run: |
           # Ubuntu 24.04 hosted runner 的 AppArmor 預設限制非特權 namespace；只在此一次性 VM 開放。
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           mkdir -p target/ci-blackbox
-          export PATH="$PWD/target/ci-system-python/bin:$PATH"
-          export SW_BUNDLE="$PWD/target/dev-bundle"
           # bridge 證據寫入器收尾只等 10 秒，hosted runner 磁碟慢時傳 1 MiB 的案例會寫不完；暫存放 tmpfs
           sudo mkdir -p /mnt/sw-tmp
           sudo mount -t tmpfs -o size=8g,mode=1777 tmpfs /mnt/sw-tmp
-          SW_RESOURCE_REPORT=$PWD/target/ci-blackbox/resource-report.json SERIALWRAP_CLI_EXE=$PWD/target/dev-bundle/bin/serialwrap SERIALWRAP_AB_LABEL=rust-1a python3 -m pytest -q tests/contract_blackbox -m "core_portable or posix_only" --confcutdir=tests/contract_blackbox -p no:cacheprovider --basetemp=/mnt/sw-tmp/pt --junitxml=target/ci-blackbox/junit.xml
+          mkdir -p /mnt/sw-tmp/pt
+      - name: "Stage 1A CLI 委派路徑回歸（Rust CLI）"
+        run: |
+          export PATH="$PWD/target/ci-system-python/bin:$PATH"
+          SW_RESOURCE_REPORT=$PWD/target/ci-blackbox/stage1a-resource-report.json SERIALWRAP_CLI_EXE=$PWD/target/dev-bundle/bin/serialwrap SERIALWRAP_AB_LABEL=rust-1a python3 -m pytest -q tests/contract_blackbox/test_cli_no_delegation.py -m "rust_only" --confcutdir=tests/contract_blackbox -p no:cacheprovider --basetemp=/mnt/sw-tmp/pt/stage1a --junitxml=target/ci-blackbox/junit-stage1a.xml
+      - name: "建置 Stage 2 正式候選 bundle（Rust CLI＋Rust daemon）"
+        run: |
+          export PATH="$PWD/target/ci-system-python/bin:$PATH"
+          scripts/rust/mkbundle.sh --release-bundle --stage 2 --profile release --out target/s24-bundle
+      - name: "黑箱契約 harness（Stage 2 Rust CLI＋Rust daemon，tests/contract_blackbox）"
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/target/ci-system-python/bin:$PATH"
+          source scripts/rust/gate_prereqs.sh --ci
+          export SW_BUNDLE="$PWD/target/s24-bundle"
+          S24_BUNDLE_VERSION_ROOT="$(dirname "$(dirname "$(realpath -e "$SW_BUNDLE/bin/serialwrap")")")"
+          SW_RESOURCE_REPORT=$PWD/target/ci-blackbox/resource-report.json SERIALWRAP_CLI_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrap" SERIALWRAP_DAEMON_EXE="$S24_BUNDLE_VERSION_ROOT/bin/serialwrapd" SW_BUNDLE="$SW_BUNDLE" SERIALWRAP_AB_LABEL=rust-linux python3 -m pytest -q tests/contract_blackbox -m "core_portable or posix_only" --confcutdir=tests/contract_blackbox -p no:cacheprovider --basetemp=/mnt/sw-tmp/pt/stage2 --junitxml=target/ci-blackbox/junit.xml
       - name: "保存黑箱 A/B 與 L1.5 systemd 診斷"
         if: always()
         uses: actions/upload-artifact@v4
