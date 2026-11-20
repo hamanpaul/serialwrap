@@ -156,15 +156,26 @@ def _wait_ready_observing(sw_env, com: str, timeout: float) -> list[str]:
 
 
 def _restart_residue_report(
-    rx_at_restart: bytes, chunk_commands_before: int, commands_after: list[str], errors_seen: list[str],
+    rx_at_restart: bytes, after_restart: bytes, chunk_commands_before: int, commands_after: list[str],
+    errors_seen: list[str],
 ) -> dict:
-    """issue #282 的可觀察量（純計算，不含判定）：停機殘留在 DUT 輸入列的 bytes、重啟後 DUT 多執行的 chunk 命令數、
-    重啟後的 READY 等待期間是否出現過 PROMPT_UNAVAILABLE。"""
+    """issue #282 的可觀察量（純計算，不含判定）。
+
+    - `residual_input_bytes`：停機靜定後留在 DUT 輸入列、尚無行尾的 bytes（`rx_at_restart` 最後一個 `\\n` 之後）。
+    - `residual_submitted_after_restart`：重啟後 DUT 收到的第一個換行之前沒有清行控制字元（Ctrl-U／Ctrl-C），
+      也就是殘留內容被那個換行原樣送進 shell。chunk 命令的 sentinel 在行尾（`… && printf '%s\\n' 'SW_XFER_CHUNK_'…`），
+      殘留若斷在 sentinel 之前，補成的那一行不含 `SW_XFER_CHUNK`、`extra_chunk_commands` 仍為 0，所以另記這一項。
+    - `extra_chunk_commands`：重啟後 DUT 完整輸入行中含 chunk sentinel 的行數，比停機靜定後多幾行。
+    - `prompt_unavailable_seen`：重啟後的 READY 等待期間是否出現過 PROMPT_UNAVAILABLE（殘留停在引號內、shell 進入續行）。
+    """
     residual = rx_at_restart.rsplit(b"\n", 1)[-1]
+    before_first_newline, newline, _ = after_restart.partition(b"\n")
+    cleared = any(ctrl in before_first_newline for ctrl in (b"\x15", b"\x03"))
     chunk_commands_after = sum(1 for c in commands_after if "SW_XFER_CHUNK" in c)
     return {
         "residual_input_bytes": len(residual),
         "residual_has_chunk_sentinel": b"SW_XFER_CHUNK" in residual,
+        "residual_submitted_after_restart": bool(residual) and bool(newline) and not cleared,
         "extra_chunk_commands": chunk_commands_after - chunk_commands_before,
         "prompt_unavailable_seen": "PROMPT_UNAVAILABLE" in errors_seen,
         "errors_seen": list(errors_seen),
@@ -240,10 +251,13 @@ def test_stop_during_push_flushes_wal(sw_env, shell_target, transient_unit, tmp_
         # issue #282（0.5.1 修）：上面的位移判準看不到「停機殘留的半行被新 daemon 的探測換行送出」。這裡把它記成
         # 可觀察量（junit property＋warning），並限制在已知現象的範圍內：殘留至多一行，所以重啟後 DUT 至多多執行
         # 一個 chunk 命令；超過 1 就不是 #282，而是真的重送。
-        residue = _restart_residue_report(rx_at_restart, len(received), shell_target.commands(), errors_seen)
+        residue = _restart_residue_report(
+            rx_at_restart, after_restart, len(received), shell_target.commands(), errors_seen,
+        )
         for key, value in residue.items():
             record_property(f"issue282_{key}", value)
-        if residue["extra_chunk_commands"] or residue["prompt_unavailable_seen"]:
+        if (residue["residual_submitted_after_restart"] or residue["extra_chunk_commands"]
+                or residue["prompt_unavailable_seen"]):
             warnings.warn(
                 f"#282：push 進行中停機後 DUT 輸入列殘留被重啟後的探測換行送出（{residue}）", stacklevel=1,
             )
