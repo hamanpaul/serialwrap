@@ -1026,31 +1026,109 @@ def test_upgrade_image_grants_swtest_sudo_for_system_mode():
     assert "swtest ALL=(ALL) NOPASSWD: ALL" in text
 
 
+def _dockerfile_instructions(text: str) -> list[tuple[str, str]]:
+    """Dockerfile → `(指令, 參數)` 序列：略過註解與空行，把行尾 `\\` 續行併成一個指令。"""
+    out: list[tuple[str, str]] = []
+    pending = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.endswith("\\"):
+            pending += line[:-1] + " "
+            continue
+        keyword, _, args = (pending + line).strip().partition(" ")
+        out.append((keyword.upper(), " ".join(args.split())))
+        pending = ""
+    assert not pending, f"Dockerfile 以續行結尾：{pending!r}"
+    return out
+
+
+def _shell_and_chain(command: str) -> list[str]:
+    """把 RUN 的 shell 命令依最外層 `&&` 切成依序執行的子命令（引號內的 `&&` 不切）。"""
+    parts: list[str] = []
+    current: list[str] = []
+    quote = ""
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif command.startswith("&&", i):
+            parts.append("".join(current).strip())
+            current = []
+            i += 2
+            continue
+        current.append(ch)
+        i += 1
+    parts.append("".join(current).strip())
+    return [part for part in parts if part]
+
+
+def _assert_apt_bootstraps_ca_over_https(path: Path) -> None:
+    """依 Dockerfile 的指令執行順序模擬 APT 設定狀態（不看字面行號／出現次數）。
+
+    要保護的意圖（PR #278 第 3 輪：hosted runner 連不到 archive.ubuntu.com:80）：
+    - 任何 `apt-get update` 之前，Ubuntu 套件源已改成 https（archive 與 security 都要）；
+    - 基底映像沒有 CA bundle，只在安裝 ca-certificates 的那一段暫時關閉 HTTPS 憑證鏈驗證；
+    - CA 裝好後移除該暫時設定並重新 `apt-get update`，其餘套件都在驗證開啟的狀態下安裝，映像最後不留該設定。
+    """
+    commands = [cmd for keyword, args in _dockerfile_instructions(path.read_text(encoding="utf-8"))
+                if keyword == "RUN" for cmd in _shell_and_chain(args)]
+    hosts = ("archive.ubuntu.com", "security.ubuntu.com")
+    https_hosts: set[str] = set()
+    bootstrap_file: str | None = None       # 目前生效的「關閉 Verify-Peer」設定檔
+    bootstrap_count = 0
+    ca_installed = False
+    updated_since_verify_restored = True     # 尚未關閉過驗證時不需要重新 update
+    updates = 0
+    for cmd in commands:
+        words = cmd.split()
+        if 'Acquire::https::Verify-Peer "false"' in cmd:
+            target = cmd.rsplit(">", 1)[-1].strip()
+            assert target.startswith("/etc/apt/apt.conf.d/"), (path, cmd)
+            assert updates == 0, f"{path}：暫時關閉 Verify-Peer 必須在第一次 apt-get update 之前"
+            bootstrap_file = target
+            bootstrap_count += 1
+        elif words[:2] == ["sed", "-i"] and "ubuntu.sources" in cmd:
+            for host in hosts:
+                if f"s|http://{host}/ubuntu|https://{host}/ubuntu|g" in cmd:
+                    https_hosts.add(host)
+        elif words[:2] == ["apt-get", "update"]:
+            assert https_hosts == set(hosts), f"{path}：apt-get update 之前必須先把 {hosts} 改成 https（目前 {sorted(https_hosts)}）"
+            updates += 1
+            if bootstrap_file is None:
+                updated_since_verify_restored = True
+        elif words[:2] == ["apt-get", "install"]:
+            assert updates >= 1, f"{path}：apt-get install 之前必須先 apt-get update"
+            if bootstrap_file is not None:
+                assert "ca-certificates" in words, f"{path}：Verify-Peer 關閉期間只能是安裝 CA bundle 的那一次 install：{cmd}"
+                ca_installed = True
+            else:
+                assert updated_since_verify_restored, f"{path}：恢復憑證鏈驗證後必須重新 apt-get update 才能安裝套件：{cmd}"
+        elif words[:1] == ["rm"] and bootstrap_file is not None and bootstrap_file in words:
+            assert ca_installed, f"{path}：CA bundle 裝好之前不得移除暫時設定（之後的 https 會全部失敗）"
+            bootstrap_file = None
+            updated_since_verify_restored = False
+    assert bootstrap_count == 1, f"{path}：暫時關閉 Verify-Peer 只能發生一次（實際 {bootstrap_count}）"
+    assert ca_installed and bootstrap_file is None, f"{path}：映像不得殘留關閉 Verify-Peer 的 APT 設定"
+    assert updated_since_verify_restored, f"{path}：恢復憑證鏈驗證後必須重新 apt-get update"
+
+
 @pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_upgrade_image_pins_same_base_as_systemd_image():
     """升級容器與 OD-16 (5) systemd 容器使用同一個 ubuntu:24.04 digest，且不放 repo 內容、不連網安裝依賴。"""
     def base(path: Path) -> str:
-        return next(line for line in path.read_text(encoding="utf-8").splitlines() if line.startswith("FROM "))
+        return next(args for keyword, args in _dockerfile_instructions(path.read_text(encoding="utf-8")) if keyword == "FROM")
     assert base(DOCKERFILE) == base(SYSTEMD_DOCKERFILE)
     for path in (DOCKERFILE, SYSTEMD_DOCKERFILE):
-        dockerfile = path.read_text(encoding="utf-8")
-        lines = dockerfile.splitlines()
-        rewrite = next((i for i, line in enumerate(lines) if "sed -i" in line), None)
-        updates = [i for i, line in enumerate(lines) if "apt-get update" in line]
-        assert rewrite is not None and updates and rewrite < updates[0], path
-        rewrite_command = "\n".join(lines[rewrite:updates[0]])
-        for host in ("archive.ubuntu.com", "security.ubuntu.com"):
-            replacement = f"s|http://{host}/ubuntu|https://{host}/ubuntu|g"
-            assert replacement in rewrite_command, (path, replacement)
-        assert len(updates) >= 2, path
-        bootstrap = next(i for i, line in enumerate(lines) if "Acquire::https::Verify-Peer" in line)
-        install_ca = next(i for i, line in enumerate(lines) if "apt-get install -y --no-install-recommends ca-certificates" in line)
-        remove_bootstrap = next(i for i, line in enumerate(lines) if "rm /etc/apt/apt.conf.d/99bootstrap-no-ca" in line)
-        assert bootstrap < updates[0] < install_ca < remove_bootstrap < updates[1], path
-        assert dockerfile.count('Acquire::https::Verify-Peer "false";') == 1, path
+        _assert_apt_bootstraps_ca_over_https(path)
     text = DOCKERFILE.read_text(encoding="utf-8")
-    assert "COPY" not in text
+    assert not any(keyword in ("COPY", "ADD") for keyword, _ in _dockerfile_instructions(text))
     for pkg in ("pipx", "systemd", "dbus-user-session"):
         assert pkg in text, pkg
     assert "python3-yaml" not in text, "升級驗證映像不得以系統 PyYAML 遮住 bundle 缺少執行期依賴"
