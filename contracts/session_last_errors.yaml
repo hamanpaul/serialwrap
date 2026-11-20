@@ -10,7 +10,7 @@
 #   2. 裝置重新出現時的自動 attach（sw_core/session_manager.py:2602）會清除裝置狀態類的值（DEVICE_*、REBOUND、CLEARED、BRIDGE_DOWN:*、ATTACH_FAILED:*）；
 #      對探測結果類的值（登入、帳密、開機、恢復、REPROBE_FAILED）只以同一探測結果重新設回，不列為清除點。
 #   3. agent reboot 的清除點（sw_core/session_manager.py:3610）只在 READY 態觸發，而 READY 名義上 last_error 恆為 null，故不列入任何值。
-# detail 規則：LOGIN_FSM_DETAIL_ERRORS 12 值為 rx tail（截尾 300 字元）；TRANSPORT_STALL 為 transport_stall_hint 文字；BOOTLOADER_STUCK 為 matched_prompt；其餘 null。
+# detail 規則：LOGIN_FSM_DETAIL_ERRORS 12 值為 rx tail（截尾 300 字元）；TRANSPORT_STALL 為 transport_stall_hint 文字；BOOTLOADER_STUCK 為 matched_prompt；PROMPT_UNAVAILABLE 在自 attach 起零 RX 時為 never_rx_hint 文字、否則 null；其餘 null。
 # logging、detail 等描述欄位之模板字串逐字取自程式 format 字串；T16 以 contracts/daemon_logging.yaml 核對。
 # states 含 RECOVERING 者：值由 reboot 恢復迴圈（sw_core/session_manager.py:3441、3466、3432）經 ensure_ready 寫入時，state 仍為 RECOVERING；該迴圈成功收斂（:3454）的清除記為 operator:command.submit。
 schema_version: 1
@@ -362,10 +362,10 @@ values:
     reason_forms: []
     reachable: true
     meaning: "attach 後 prompt 不可用（開機窗或 probe 未見 prompt）"
-    agent_action: "attach 撞上 DUT 開機窗時屬暫態，daemon 會等 RX 閒置後自動重探；逾期未恢復時以 console attach 觀察"
+    agent_action: "attach 撞上 DUT 開機窗時屬暫態，daemon 會等 RX 閒置後自動重探；逾期未恢復時以 console attach 觀察；last_error_detail 有值（自 attach 起零 RX）時先依其分收發方向，不要反覆 recover 或換 profile"
     manual_recovery: "通常由 daemon 於 ATTACHED 狀態自動重探；逾期未恢復時以 session attach 手動重試"
     logging: "無"
-    detail: "null（無附帶 detail）"
+    detail: "probe 期間零 RX 且本 session 自 attach 起從未收到 RX（last_rx_mono 為 0）時為 never_rx_hint(real_path) 的繁中文字（提示先分收發方向：DUT 電源與埠、DUT TX 到轉接器 RX 與 GND、host USB 路徑）；其餘情況 null"
     terminal: false
     auto_reprobe: {attached: true, detached: false}
     states: ["ATTACHED"]

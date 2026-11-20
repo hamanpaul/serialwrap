@@ -10,6 +10,9 @@ USB re-enumeration。本模組提供：
   → TRANSPORT_STALL）；rx_delta==0 與 #153 RX_FLOOD（高 RX）特徵天然互斥。
 - :func:`resolve_usb_busid`／:func:`transport_stall_hint`：best-effort 解析 USB busid
   並產生可執行的 host 層復原指令提示。
+- :func:`is_never_rx_probe_failure`／:func:`never_rx_hint`：自 attach 起從未收到任何
+  RX 的 probe 失敗（:func:`classify_probe_failure` 條件 3 刻意排除的那一類）不改
+  last_error，只補分方向診斷的 detail。
 
 全部為純函式、無副作用；接線與告警去重在 ``session_manager._refine_probe_failure``。
 """
@@ -67,6 +70,33 @@ def classify_probe_failure(
     if now - last_rx_mono < TRANSPORT_STALL_MIN_RX_AGE_S:
         return err, False
     return ERROR_TRANSPORT_STALL, True
+
+
+def is_never_rx_probe_failure(err: str | None, *, rx_delta: int, last_rx_mono: float) -> bool:
+    """probe 失敗時，本 session 是否自 attach 起從未收到任何 RX。
+
+    與 :func:`classify_probe_failure` 互補：那邊以條件 3 排除「從未活過」的 session
+    （維持 PROMPT_UNAVAILABLE，不翻成 TRANSPORT_STALL）；這裡只認出這一類，供呼叫端
+    補 detail，last_error 本身不變。成立條件：
+
+    1. ``err == "PROMPT_UNAVAILABLE"``——login FSM 的 ``*_PROMPT_TIMEOUT`` 家族已有
+       rx tail detail（#174），不在此改寫。
+    2. ``rx_delta == 0``——probe 全程連 echo 都沒有。
+    3. ``last_rx_mono <= 0.0``——自 attach 起沒有任何 RX。
+    """
+    return err == "PROMPT_UNAVAILABLE" and rx_delta == 0 and last_rx_mono <= 0.0
+
+
+def never_rx_hint(real_path: str | None) -> str:
+    """自 attach 起零 RX 的 probe 失敗 detail：提示先分收發方向，再決定動哪一層。"""
+    where = f"（{real_path}）" if real_path else ""
+    return (
+        f"自 attach 起未收到任何 RX{where}，probe 期間連 echo 都沒有：先分收發方向再動作，"
+        "不要反覆 recover、換 profile 或重裝。常見原因：DUT 未上電或 console 不在這個埠；"
+        "DUT TX 到轉接器 RX 的線或 GND 未接好；host 端 USB 路徑異常"
+        "（dmesg 查 `urb stopped: -32` 或 usbip 斷線）。baud 不符時通常仍收得到亂碼位元組，"
+        "不會是零 RX。"
+    )
 
 
 def resolve_usb_busid(real_path: str | None) -> str | None:
