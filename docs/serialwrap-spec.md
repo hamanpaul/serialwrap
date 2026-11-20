@@ -693,6 +693,7 @@ background mode 的 `command.result_tail` 在 capture 尚未建立時，會回�
 - **`doctor` 的 `daemon_code_current`**（advisory）：以 `health.ping` 取 daemon 指紋與本行程
   比對；daemon 沒回報 `code_fingerprint` 視為舊 build（不一致）；daemon 連不上或本行程算不出
   指紋 → informational ok。
+- **`doctor` 的 `profile_template_fields`**（advisory）：比對出貨資產 `profiles/default.yaml` 與線上 `PROFILE_DIR/default.yaml`，對兩邊都有的 template 列出「資產有、線上沒有」的頂層欄位（只看是否存在，值為空或 `null` 算有設定；不比對值、不看 `uart.*` 等巢狀欄位；線上自行多加的欄位或 template 不算）。線上檔未物化、資產不可讀或 YAML 無法解析時 ok。`setup` 不覆寫既有 profile，舊安裝因此拿不到新版 template 新增的欄位（例如 #234 的 `boot_done_regex`）；`profile_bootloader_prompts` 只看單一欄位，兩項並存。
 
 **`serialwrap setup` 的行為**（`cli._run_setup` + `setup_cmd.reconcile(restart_daemon=…)`）：
 以既有的 `health.ping` 探測回應取 daemon 指紋（不多一次 RPC），與本行程（＝剛安裝的版本）比對：
