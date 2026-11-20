@@ -179,14 +179,19 @@ def test_stop_during_push_flushes_wal(sw_env, shell_target, transient_unit, tmp_
         assert received, "停止前 DUT 已收到 chunk"
         for line in received:
             assert line.encode() in tx_payloads, f"DUT 已收到的 chunk 必有對應 WAL TX：{line[:80]}"
-        # 重啟後不自動重送（no_auto_resend）：DUT 端零新增 chunk。
-        before = len(received)
+        # 重啟後不自動重送（no_auto_resend）：重啟後到達 DUT 的 bytes 不得含任何 chunk 命令。
+        # 以 DUT 端位元組位移切出「重啟後才收到」的部分（判準仍是 DUT 端，不用受測 daemon 自己寫的 WAL）：
+        # 停機時寫到一半、尚無行尾的 chunk 行，會被新 daemon 的第一個換行補成完整行；舊的「完整行數」比對因此會
+        # 把它誤算成重送（PR #278 第七輪 hosted CI：39 vs 38）。新 daemon 若真的重送，chunk sentinel 必出現在位移之後。
+        rx_before_restart = _settled_rx_len(shell_target)
         transient_unit.start()
         sw_env.wait_state("COM0", "READY", timeout=READY_WAIT_S)
-        # 保留原有 1 秒 no-auto-resend 觀察窗，再排空 relay 後比較 DUT 實收行數。
+        # 保留原有 1 秒 no-auto-resend 觀察窗，再排空 relay 後檢查重啟後收到的 bytes。
         time.sleep(1.0)
         _settled_rx_len(shell_target)
-        assert len([c for c in shell_target.commands() if "SW_XFER_CHUNK" in c]) == before, "重啟後不得重送 chunk"
+        after_restart = shell_target.rx_log()[rx_before_restart:]
+        assert b"SW_XFER_CHUNK" not in after_restart, f"重啟後不得重送 chunk：{after_restart[:240]!r}"
+        assert b"base64 -d >>" not in after_restart, f"重啟後不得重送 chunk 資料：{after_restart[:240]!r}"
     finally:
         # 中止的 push 不送 cleanup（OD-62）：自行移除 shelltarget（本機 /bin/sh）留下的上傳暫存檔與目的檔。
         Path(remote).unlink(missing_ok=True)
