@@ -48,6 +48,7 @@ pub const DOCTOR_ADVISORY_CHECKS: &[&str] = &[
     "jq_on_path",
     "minicom_on_path",
     "profile_bootloader_prompts",
+    "profile_template_fields",
     "daemon_code_current",
 ];
 
@@ -60,6 +61,7 @@ pub const DOCTOR_ADVISORY_CHECKS_WIN: &[&str] = &[
     "other_serialwrap_installs",
     "wal_dir",
     "profile_bootloader_prompts",
+    "profile_template_fields",
     "daemon_code_current",
 ];
 
@@ -195,6 +197,13 @@ const FIX_WAL_WRITABLE: &str = concat!(
 const FIX_PROFILE_PROMPTS: &str = concat!(
     "重新物化資產或手動補上：備份現有檔後執行 `serialwrap setup`，",
     "或把 sw_core/assets/profiles/default.yaml 對應 template 的 bootloader_prompts 段落補進線上檔",
+);
+/// `profile_template_fields`：缺欄位 fix（逐字照 Python `_check_profile_template_fields`）。
+const FIX_PROFILE_TEMPLATE_FIELDS: &str = concat!(
+    "setup 不覆寫既有 profile，升級後新增的欄位要手動補：備份線上檔後，參照出貨資產 ",
+    "sw_core/assets/profiles/default.yaml 把缺的欄位補進對應 template，再 ",
+    "serialwrap service restart（on-demand：daemon stop 後 daemon start）；",
+    "刻意不用的欄位可忽略本項",
 );
 // ---- Rust 側契約字串（07 §7.3 之外）----
 /// `python`／`pyyaml`／`pyserial` 共用的 daemon runtime 逐項說明前綴（07 §7.3 之外，Rust CLI 專屬）。
@@ -1350,6 +1359,94 @@ fn check_profile_bootloader_prompts(ctx: &CliCtx) -> Check {
     }
 }
 
+/// 純函式：出貨資產 template 有、線上同名 template 沒有的頂層欄位（依名稱排序）。
+///
+/// 只比對兩邊都存在的 template、只看欄位是否存在（值為空或 null 算有設定），不比對值也不看
+/// 巢狀欄位；YAML 解析失敗或結構不是 mapping 一律回空清單（同 Python `_profile_templates_missing_fields`）。
+fn profile_templates_missing_fields(asset_text: &str, live_text: &str) -> Vec<(String, Vec<String>)> {
+    let (Ok(asset), Ok(live)) = (yaml11::safe_load(asset_text), yaml11::safe_load(live_text))
+    else {
+        return Vec::new();
+    };
+    let (Some(asset_profiles), Some(live_profiles)) =
+        (profiles_entries(&asset), profiles_entries(&live))
+    else {
+        return Vec::new();
+    };
+    let mut drifted: Vec<(String, Vec<String>)> = Vec::new();
+    for (name, template) in &asset_profiles {
+        let YValue::Map(template) = template else {
+            continue;
+        };
+        let Some((_, YValue::Map(live_template))) =
+            live_profiles.iter().find(|(key, _)| key == name)
+        else {
+            continue;
+        };
+        let mut missing: Vec<String> = template
+            .0
+            .iter()
+            .filter_map(|(key, _)| match key {
+                YValue::Str(key) if !live_template.contains_str(key) => Some(key.clone()),
+                _ => None,
+            })
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        missing.sort();
+        drifted.push((py_str_of(name), missing));
+    }
+    drifted.sort();
+    drifted
+}
+
+/// `profile_template_fields`（advisory）：線上 profile 的 template 是否缺出貨資產已有的欄位。
+fn check_profile_template_fields(ctx: &CliCtx) -> Check {
+    let asset_text = PROFILE_ASSETS
+        .iter()
+        .find(|asset| asset.rel == "profiles/default.yaml")
+        .and_then(|asset| String::from_utf8(asset.bytes.to_vec()).ok());
+    let live_path = pypath::join(flavor_of(ctx), &ctx.paths.profile_dir, &["default.yaml"]);
+    let ok_with = |detail: String| Check {
+        check: "profile_template_fields",
+        ok: true,
+        detail,
+        fix: Some(String::new()),
+        advisory: false,
+        extra: PyDict::new(),
+    };
+    let Some(asset_text) = asset_text else {
+        return ok_with(DETAIL_ASSET_UNREADABLE.to_string());
+    };
+    let live_text = ctx
+        .p
+        .fs
+        .read(Path::new(&live_path))
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok());
+    let Some(live_text) = live_text else {
+        return ok_with(format!("線上 profile 未物化（{live_path}），略過"));
+    };
+    let drifted = profile_templates_missing_fields(&asset_text, &live_text);
+    if drifted.is_empty() {
+        return ok_with(DETAIL_MATCHES_ASSET.to_string());
+    }
+    let listed = drifted
+        .iter()
+        .map(|(name, keys)| format!("{name}（{}）", keys.join("、")))
+        .collect::<Vec<_>>()
+        .join("；");
+    Check {
+        check: "profile_template_fields",
+        ok: false,
+        detail: format!("線上 {live_path} 缺出貨資產已有的欄位：{listed}"),
+        fix: Some(FIX_PROFILE_TEMPLATE_FIELDS.to_string()),
+        advisory: false,
+        extra: PyDict::new(),
+    }
+}
+
 /// `devices`（Linux，advisory）：by-id 目錄條目數（含 dangling 項）；目錄不存在為 `0`。
 fn check_devices_linux(ctx: &CliCtx) -> Check {
     let dir = PathBuf::from(by_id_dir(ctx));
@@ -1580,6 +1677,7 @@ pub fn run_doctor(ctx: &mut CliCtx) -> Vec<Check> {
             check_wal_dir(ctx),
             check_wal_writable(ctx),
             check_profile_bootloader_prompts(ctx),
+            check_profile_template_fields(ctx),
             check_devices_windows(ctx),
         ]);
         windows_checks
@@ -1607,6 +1705,7 @@ pub fn run_doctor(ctx: &mut CliCtx) -> Vec<Check> {
             check_wal_dir(ctx),
             check_wal_writable(ctx),
             check_profile_bootloader_prompts(ctx),
+            check_profile_template_fields(ctx),
             check_devices_linux(ctx),
             check_wsl_systemd(ctx),
         ]
