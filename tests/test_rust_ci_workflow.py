@@ -146,16 +146,22 @@ def test_rust_linux_job_ordered_commands():
         encoding="utf-8"
     )
     settled = "_settled_rx_len(shell_target)"
-    baseline = "before = len(received)"
-    assert supervision_test.count(settled) == 2, "停機與重啟後都須以 DUT RX 靜定作為觀察同步點"
+    baseline = 'received = [c for c in shell_target.commands() if "SW_XFER_CHUNK" in c]'
+    # 同步點三個：停機後（建立已收 chunk 基線）、重啟前（記 DUT RX 位移）、重啟後（排空後判定）。
+    assert supervision_test.count(settled) == 3, "停機後、重啟前、重啟後都須以 DUT RX 靜定作為觀察同步點"
     baseline_at = supervision_test.index(baseline)
     assert supervision_test.index(settled) < baseline_at, (
         "重啟前的 no-auto-resend 基線必須在停機後 DUT RX 靜定才取樣"
     )
-    restart_at = supervision_test.index("transient_unit.start()", baseline_at)
+    pre_restart_at = supervision_test.index("rx_before_restart = _settled_rx_len(shell_target)", baseline_at)
+    restart_at = supervision_test.index("transient_unit.start()", pre_restart_at)
     settle_after_restart = supervision_test.rindex(settled)
     assert restart_at < supervision_test.index("time.sleep(1.0)", restart_at) < settle_after_restart, (
         "重啟後須保留既有 1 秒觀察窗，並排空 DUT RX 後再判定"
+    )
+    # 判定只看重啟前靜定位移之後才到 DUT 的 bytes（停機時寫到一半的 chunk 行不得被算成重送）。
+    assert settle_after_restart < supervision_test.index("shell_target.rx_log()[rx_before_restart:]"), (
+        "重啟後判定須只看重啟前 DUT RX 位移之後的 bytes"
     )
 
 
