@@ -22,7 +22,7 @@ from . import serial_port as serial_port_mod
 from . import uart_io as uart_io_mod
 from .alias_registry import AliasRegistry
 from .auth import AuthResolution, resolve_session_auth
-from .config import ProfileTemplate, SessionProfile, UartProfile
+from .config import TIMEOUT_RECOVERY_KEY_BYTES, ProfileTemplate, SessionProfile, UartProfile
 from .command_completion import ERROR_INVALID_COMPLETION_REGEX, valid_completion_regex
 from .expect_reboot import expect_reboot_rejection
 from .constants import (
@@ -1629,6 +1629,7 @@ class SessionManager:
             max_console_line_chars=tpl.max_console_line_chars,
             bootloader_prompts=tpl.bootloader_prompts,
             boot_done_regex=tpl.boot_done_regex,
+            timeout_recovery_keys=tpl.timeout_recovery_keys,
             uart=tpl.uart,
         )
         sid = session_id_override or f"{profile.profile_name}:{com}"
@@ -5312,6 +5313,7 @@ class SessionManager:
             max_console_line_chars=tpl.max_console_line_chars,
             bootloader_prompts=tpl.bootloader_prompts,
             boot_done_regex=tpl.boot_done_regex,
+            timeout_recovery_keys=tpl.timeout_recovery_keys,
             uart=tpl.uart,
         )
         session.profile_source = source
@@ -7036,11 +7038,15 @@ class SessionManager:
         # timeout 收尾（session 轉 ATTACHED），讓 autoboot 在無人打擾下自然跑完；window 解
         # 除後由既有 reprobe / reboot recovery 接手升 READY。
         # 迴圈外快速早退（省掉整段設置）；真正的授權判定在迴圈**內**逐 byte 重驗。
-        if not session.boot_quiet_active():
+        # profile 的 timeout_recovery_keys 決定送哪些鍵（預設 CTRL_C、CTRL_D）；空清單＝不送，
+        # 直接落到下方 timeout 收尾，與兩鍵都救不回時相同。
+        recovery_keys = session.profile.timeout_recovery_keys
+        if recovery_keys and not session.boot_quiet_active():
             invalidate_deferred = getattr(bridge, "invalidate_deferred", None)
             if callable(invalidate_deferred):
                 invalidate_deferred("recover")
-            for action_name, payload in (("CTRL_C", b"\x03"), ("CTRL_D", b"\x04")):
+            for action_name in recovery_keys:
+                payload = TIMEOUT_RECOVERY_KEY_BYTES[action_name]
                 # #162 回歸修（實機事故 2026-07-31）：gate 必須逐 byte 重驗。第二個 byte
                 # （CTRL-D）在第一個之後最多 min(timeout_s, 2.0) 秒才寫出，而 U-Boot
                 # autoboot 倒數窗實測就是 3 秒——CTRL-C 送出後 banner 才抵達、quiet 於

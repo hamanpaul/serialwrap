@@ -426,6 +426,13 @@ human command authority.
 | Explicit `human:<name>` (including `human:cli`) | Display class is human; agent per DF-02 | Agent timeout and boot quiet behavior; `source_class` does not grant permission |
 | `system`, `system:*` | reserved | Internal only (forced recovery, self-test, login probes); external callers get `SOURCE_RESERVED` |
 
+The recovery keys come from the profile's `timeout_recovery_keys` (template or
+target), default `[CTRL_C, CTRL_D]`. Set `[CTRL_C]` on a console where CTRL-D
+would log out a shell, or `[]` to send no keys at all; when no listed key brings
+the prompt back the result is the same as before (`PROMPT_TIMEOUT`, session
+demoted to `ATTACHED`). The same list is used by `session recover` on a `READY`
+session. Unknown names, duplicates or a non-list value fail profile loading.
+
 - Only the raw RPC values `human` and `human:` (no name) are **normalized to `human:cli`**
   and receive the OD-74 human gate and timeout behavior; successful responses carry `source`
   and `source_normalized_from`. An explicit `human:<name>` (including `human:cli`) follows
@@ -2240,7 +2247,7 @@ broker 只認單獨一條的 reboot（`reboot`、`systemctl reboot`、`shutdown 
 
 **命令限制**：命令字串不得含有 `\n` 換行字元，否則回傳 `CMD_CONTAINS_NEWLINE`。命令長度（UTF-8 位元組）> 4 KB 回 warning（`CMD_LENGTH_WARNING`），> 16 KB 拒絕（`CMD_TOO_LONG`）；broker 對命令內容不做截斷。注意這是 **broker 對單一 `--cmd` 參數的上限**，與 **target 端 tty line buffer（常見 4096 bytes）的物理單行限制**是兩回事——即使 broker 接受，過長單行仍可能在 target 端被截斷。上限可由 `serialwrap daemon status` 回應的 `limits` 欄位執行期查詢（`max_submit_cmd_bytes`／`warn_submit_cmd_bytes`／`reject_error_code`／`newline_error_code`／`warning_code`／`newline_forbidden`），client 不需硬編碼（#129）。
 
-**長命令與期限**：`--cmd-timeout`（預設 10 秒）是命令在 broker 內的總期限，即使命令一直有輸出，到點仍進恢復流程（先送 Ctrl-C，比不到 prompt 再送 Ctrl-D；Ctrl-D 打在已登入的 shell 等於登出）。另有靜默上限 `min(--cmd-timeout, 30 秒)`：一個等待窗內完全沒有新 RX 即視為靜默，同樣進恢復流程。`--expected-duration` 只把總期限延長為 `max(--cmd-timeout, --expected-duration)`，**不延長靜默上限**，適合 `make`、`python -m unittest` 這類持續有輸出的長命令：
+**長命令與期限**：`--cmd-timeout`（預設 10 秒）是命令在 broker 內的總期限，即使命令一直有輸出，到點仍進恢復流程（先送 Ctrl-C，比不到 prompt 再送 Ctrl-D；Ctrl-D 打在已登入的 shell 等於登出。送哪些鍵由 profile 的 `timeout_recovery_keys` 決定，預設 `[CTRL_C, CTRL_D]`；設 `[CTRL_C]` 不送 Ctrl-D，設 `[]` 完全不送，救不回 prompt 時照樣回 `PROMPT_TIMEOUT`、session 轉 `ATTACHED`；`READY` 時的 `session recover` 也用同一份清單）。另有靜默上限 `min(--cmd-timeout, 30 秒)`：一個等待窗內完全沒有新 RX 即視為靜默，同樣進恢復流程。`--expected-duration` 只把總期限延長為 `max(--cmd-timeout, --expected-duration)`，**不延長靜默上限**，適合 `make`、`python -m unittest` 這類持續有輸出的長命令：
 
 ```bash
 serialwrap cmd submit --selector COM0 --mode line --source agent:ci \
