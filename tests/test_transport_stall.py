@@ -135,6 +135,37 @@ class TestTransportStallHint(unittest.TestCase):
         self.assertIn("authorized", hint)
 
 
+class TestNeverRxProbeFailure(unittest.TestCase):
+    """自 attach 起零 RX 的 probe 失敗：只補 detail，不翻轉 last_error。"""
+
+    def test_prompt_unavailable_never_rx_matches(self) -> None:
+        self.assertTrue(transport_stall.is_never_rx_probe_failure(
+            "PROMPT_UNAVAILABLE", rx_delta=0, last_rx_mono=0.0))
+
+    def test_had_rx_before_does_not_match(self) -> None:
+        """曾有 RX → 交給 classify_probe_failure（TRANSPORT_STALL 路徑），不在此處理。"""
+        self.assertFalse(transport_stall.is_never_rx_probe_failure(
+            "PROMPT_UNAVAILABLE", rx_delta=0, last_rx_mono=100.0))
+
+    def test_rx_during_probe_does_not_match(self) -> None:
+        self.assertFalse(transport_stall.is_never_rx_probe_failure(
+            "PROMPT_UNAVAILABLE", rx_delta=3, last_rx_mono=0.0))
+
+    def test_login_fsm_errors_do_not_match(self) -> None:
+        """*_PROMPT_TIMEOUT 家族已有 rx tail detail（#174），不改寫。"""
+        for err in ("LOGIN_PROMPT_TIMEOUT", "PRPL_PROMPT_TIMEOUT", "CREDENTIALS_UNRESOLVED", None):
+            with self.subTest(err=err):
+                self.assertFalse(transport_stall.is_never_rx_probe_failure(
+                    err, rx_delta=0, last_rx_mono=0.0))
+
+    def test_hint_points_to_direction_diagnosis(self) -> None:
+        hint = transport_stall.never_rx_hint("/dev/ttyUSB0")
+        self.assertIn("/dev/ttyUSB0", hint)
+        self.assertIn("收發方向", hint)
+        self.assertIn("urb stopped", hint)
+        self.assertNotIn("（）", transport_stall.never_rx_hint(None))
+
+
 class TestBridgeRawRxCounter(unittest.TestCase):
     """raw RX 計數器（uart_io）：raw bytes（含 ANSI）、clear 不歸零、snapshot 露出。"""
 
@@ -291,6 +322,40 @@ class TestRefineProbeFailureIntegration(unittest.TestCase):
         self.assertEqual(session.last_error, "PROMPT_UNAVAILABLE")
         self.assertIsNone(session.last_error_detail)
         self.assertEqual(self._count_stall_meta(), 0)
+
+    def test_never_rx_since_attach_keeps_code_and_adds_hint(self) -> None:
+        """從未有 RX 的 session：last_error 仍是 PROMPT_UNAVAILABLE，detail 帶分方向提示。"""
+        mgr, session, bridge = self._make_manager()
+        session.last_rx_mono = 0.0
+
+        with mock.patch.object(sm_mod, "probe_ready",
+                               return_value=(False, "PROMPT_UNAVAILABLE")):
+            mgr._probe_existing_bridge(session, bridge)  # type: ignore[arg-type]
+
+        self.assertEqual(session.state, "ATTACHED")
+        self.assertEqual(session.last_error, "PROMPT_UNAVAILABLE")
+        self.assertEqual(session.last_error_detail,
+                         transport_stall.never_rx_hint("/dev/ttyFAKE0"))
+        self.assertFalse(session.transport_stall_warned)
+        self.assertEqual(self._count_stall_meta(), 0)
+        self.assertEqual(
+            session.to_public_dict()["last_error_detail"],
+            transport_stall.never_rx_hint("/dev/ttyFAKE0"),
+        )
+
+    def test_never_rx_but_echo_during_probe_has_no_hint(self) -> None:
+        mgr, session, bridge = self._make_manager()
+        session.last_rx_mono = 0.0
+
+        def probe_with_rx(_bridge: object, _sp: object) -> tuple[bool, str]:
+            bridge.rx_total += 5
+            return False, "PROMPT_UNAVAILABLE"
+
+        with mock.patch.object(sm_mod, "probe_ready", side_effect=probe_with_rx):
+            mgr._probe_existing_bridge(session, bridge)  # type: ignore[arg-type]
+
+        self.assertEqual(session.last_error, "PROMPT_UNAVAILABLE")
+        self.assertIsNone(session.last_error_detail)
 
     def test_mark_session_rx_rearms_warning(self) -> None:
         mgr, session, _ = self._make_manager()

@@ -489,7 +489,7 @@ PY
 | `PASS_ENV_REQUIRED` | 終態 | 不自動重探 | profile 設定了 user_env 但缺 pass_env，login 與 password 提示皆出現 | 在 profile 補上 pass_env 設定後，以 session attach 重試 |
 | `POST_LOGIN_CMD_TIMEOUT` | 終態 | 不自動重探 | 登入成功後執行 post_login_cmd 逾時 | 檢查 profile 的 post_login_cmd 與 timeout_s（bcm 切換 shell 的情境建議加大）後，以 session attach 重試 |
 | `PROMPT_TIMEOUT` | 非終態 | ATTACHED／DETACHED 自動重探 | 命令送出後等不到 prompt，且 CTRL_C／CTRL_D 皆未恢復（或 boot quiet 期間跳過強制按鍵）時，由 _transition_to_attached 轉為 ATTACHED | 此值具自動重探資格；逾期未恢復時以 session recover 或 console attach 檢查 target 狀態 |
-| `PROMPT_UNAVAILABLE` | 非終態 | 僅 ATTACHED 自動重探 | attach 後 prompt 不可用（開機窗或 probe 未見 prompt） | attach 撞上 DUT 開機窗時屬暫態，daemon 會等 RX 閒置後自動重探；逾期未恢復時以 console attach 觀察 |
+| `PROMPT_UNAVAILABLE` | 非終態 | 僅 ATTACHED 自動重探 | attach 後 prompt 不可用（開機窗或 probe 未見 prompt） | attach 撞上 DUT 開機窗時屬暫態，daemon 會等 RX 閒置後自動重探；逾期未恢復時以 console attach 觀察；last_error_detail 有值（自 attach 起零 RX）時先依其分收發方向，不要反覆 recover 或換 profile |
 | `PRPL_PROMPT_TIMEOUT` | 非終態 | ATTACHED／DETACHED 自動重探 | platform 為 prpl（其餘未指定者一律歸此）時等待 prompt 逾時 | 此值具自動重探資格；逾期未恢復時檢查 profile 的 prompt_regex 與 timeout_s，並以 session attach 重試 |
 | `READY_NONCE_TIMEOUT` | 終態 | 不自動重探 | READY 確認 nonce 逾時（ready_probe 的回聲未出現） | 檢查 profile 的 ready_probe 設定與 target 是否可執行命令，修正後以 session attach 重試 |
 | `READY_PROMPT_TIMEOUT` | 非終態 | ATTACHED／DETACHED 自動重探 | ready_probe 之後等不到 prompt（逾時） | 此值具自動重探資格；逾期未恢復時檢查 profile 的 ready_probe 與 prompt_regex，並以 session attach 重試 |
