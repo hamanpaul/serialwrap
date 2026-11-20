@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use support::{
     BY_ID_A, BY_ID_B, REAL_A, REAL_B, RIG_PID, RigSpec, ServiceRig, json_string, wait_until,
+    wait_until_within,
 };
 use sw_core::state_store::{LoadedState, ReleasedRow};
 use sw_pal::fakes::{FakeDevice, FakeEnv, FakeSerialBackend};
@@ -9904,8 +9905,12 @@ fn wp73_rpc_reboot_clears_rx_for_console_unlock_service_rig() {
         j(&record)
     );
 
-    // 推進時鐘等待 recovery 完成並回到 READY
-    wait_until("session 恢復 READY", || {
+    // 推進時鐘等待 recovery 完成並回到 READY。
+    // 這是 sw-daemon 測試中唯一有逾時紀錄的等待點：PR #278 第 4 輪 hosted rust-linux 在共用 10 秒上限下於此逾時一次
+    // （同一上限下第 2、3 輪整個 crate 全過）。本機單跑整支測試約 0.4 秒（限 2 核亦同），所以 hosted 那次超過 10 秒的
+    // 原因並未查明；在查明之前只保留這一處 60 秒的觀察上限（不是產品期限），其餘等待維持共用 10 秒。
+    // 若這裡在 60 秒仍逾時，請當成真的卡住來查，不要再加長。
+    wait_until_within("session 恢復 READY", Duration::from_secs(60), || {
         r.clock.advance(Duration::from_millis(200));
         r.session("COM0")
             .and_then(|session| session.get("state").cloned())

@@ -572,11 +572,32 @@ def test_login_with_delay_and_noise(p7, tmp_path):
     p7.start("bcm", [tgt], timeout_s=60)  # OD-81：逾時與否依主機排程，語意由 DF-27 確定性案例驗證。
     is_rust = ab_env.AB_ENV.get("SERIALWRAP_AB_LABEL", "").startswith("rust")
     # 此為觀察終態的測試上限；profile 的 timeout_s=60 與 OD-81 判定維持不變。
-    deadline = time.monotonic() + 300.0
+    t0 = time.monotonic()
+    deadline = t0 + 300.0
     s = None
     python_timeout = False
+    # 純診斷（PR #278；不參與通過條件）：記錄每次 session 列的「變化」、取樣失敗次數與單次輪詢耗時。
+    # hosted CI 四次失敗的傾印只有最後一次取樣（ATTACHING），看不出 DETACHED 當下的 last_error，
+    # 也分不出是「錯誤碼不在允許集合」還是「輪詢漏看 DETACHED 窗口」。
+    diag_keys = ("state", "last_error", "last_error_detail", "detached_at", "last_state_change_at")
+    history: list[tuple] = []
+    last_key: tuple | None = None
+    polls = none_samples = 0
+    slowest_poll_s = 0.0
     while time.monotonic() < deadline:
+        poll_t0 = time.monotonic()
         s = _session_row(p7.env, "COM0")
+        poll_s = time.monotonic() - poll_t0
+        polls += 1
+        slowest_poll_s = max(slowest_poll_s, poll_s)
+        if s is None:
+            none_samples += 1
+            key: tuple = ("<no-row>",)
+        else:
+            key = tuple(str(s.get(k))[:200] if s.get(k) is not None else None for k in diag_keys)
+        if key != last_key:
+            history.append((round(poll_t0 - t0, 2), round(poll_s, 2), *key))
+            last_key = key
         python_timeout = (
             not is_rust
             and s is not None
@@ -586,8 +607,19 @@ def test_login_with_delay_and_noise(p7, tmp_path):
         if s is not None and (s.get("state") == "READY" or python_timeout):
             break
         time.sleep(0.2)
+    stderr_path = p7.tmp / "daemon.stderr"
+    stderr_tail = (
+        stderr_path.read_text(encoding="utf-8", errors="replace")[-2000:] if stderr_path.is_file() else "<無 daemon.stderr>"
+    )
+    diag = (
+        f"輪詢 {polls} 次、無列／RPC 失敗 {none_samples} 次、單次最長 {slowest_poll_s:.2f}s、歷時 {time.monotonic() - t0:.1f}s；"
+        f"變化序列（t_s, poll_s, {', '.join(diag_keys)}）＝{history!r}；DUT 收到 {len(tgt.rx_log())} bytes；"
+        f"daemon.stderr 尾段＝{stderr_tail!r}"
+    )
+    # 通過時也留下走的是 READY 還是逾時路徑（pytest 只在失敗或 -rP／junit 時顯示）。
+    print("login_delay_noise_diag", diag)
     assert s is not None and (s.get("state") == "READY" or python_timeout), (
-        f"延遲雜訊登入未在期限內到達允許的終態；Rust 必須回 READY，Python 可依 OD-81 停在逾時 DETACHED：{s!r}"
+        f"延遲雜訊登入未在期限內到達允許的終態；Rust 必須回 READY，Python 可依 OD-81 停在逾時 DETACHED：{s!r}\n{diag}"
     )
     if s["state"] == "READY":
         assert s["last_error"] is None, s

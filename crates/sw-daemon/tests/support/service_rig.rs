@@ -337,12 +337,17 @@ pub fn install_shell_replies(dev: &FakeDevice) {
     );
 }
 
-/// 反覆檢查直到條件成立（真實時間；逾時 panic）。
-pub fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-    // hosted runner 的排程與 RPC I/O 較慢；此為測試觀察上限，不是產品期限。
-    let deadline = Instant::now() + Duration::from_secs(60);
+/// 反覆檢查直到條件成立（真實時間；逾時 panic）。共用上限 10 秒。
+pub fn wait_until(what: &str, cond: impl FnMut() -> bool) {
+    wait_until_within(what, Duration::from_secs(10), cond);
+}
+
+/// 同 [`wait_until`]，由呼叫端指定真實時間上限。只給有實際逾時紀錄的個別等待點使用，呼叫處須註明證據；
+/// 不得因單次失敗就把共用上限全域放寬（PR #278 十輪審查：10→60 秒曾一次套用到全部呼叫者）。
+pub fn wait_until_within(what: &str, limit: Duration, mut cond: impl FnMut() -> bool) {
+    let deadline = Instant::now() + limit;
     while !cond() {
-        assert!(Instant::now() < deadline, "等待逾時：{what}");
+        assert!(Instant::now() < deadline, "等待逾時（{limit:?}）：{what}");
         std::thread::sleep(Duration::from_millis(2));
     }
 }

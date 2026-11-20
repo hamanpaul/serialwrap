@@ -34,13 +34,17 @@ jobs:
         # P4 證據測試要讀出口 driver 產生的 target/p4-evidence，CI 沒有；出口 driver 的 pytest_full_junit 步驟照常強制
         run: python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence
       - name: 安裝 google-re2（[redos] 可選依賴）
+        # 第一遍紅時仍安裝 re2 並跑第二遍與鎖檢查（PR #278：十輪內第二遍只執行 4 次、鎖檢查 0 次，一輪只露一層）。
+        # `!cancelled()` 只取代預設的 `success()`：失敗步驟的結論不變，job 仍以失敗結束（不是 continue-on-error）。
+        if: ${{ !cancelled() }}
         run: python3 -m pip install --disable-pip-version-check google-re2
       - name: 執行測試套件（含 re2 線性引擎）
+        if: ${{ !cancelled() }}
         # 覆蓋 #91 re2 路徑：matcher 以 re2 線性引擎求值、免疫所有 catastrophic backtracking。
         # P4 證據測試要讀出口 driver 產生的 target/p4-evidence，CI 沒有；出口 driver 的 pytest_full_junit 步驟照常強制
         run: python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence
       - name: L1 必要集合鎖只增檢查（對 PR base，P2-T13 R5-F3）
-        if: github.event_name == 'pull_request'
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         # 基準 rev 的鎖檔中既有的 (set, platform, nodeid) 三元組消失或 selector 改變即失敗；移除須 --allow-removal set_id:platform:nodeid（逐筆）並於 PR 說明。
         # 核准粒度為三元組（收緊，2026-10-23；sol d82d146）：同名 nodeid 於其他集合／平台的核准不相通。
         # 清單與來源逐列對應真實移除事件（git 歷史 parent diff）：d82d146＝OD-16 (1)(2) RM-01～06（505）；61919dd＝OD-17 RM-01～03（4）；
