@@ -100,7 +100,8 @@ def _new_env(tmp_path: Path, **kwargs):
 
 def _make_proposal(env):
     od09 = _od09()
-    return od09.propose(env.linux_stats, env.windows_stats, baseline_gates=env.baseline_gates)
+    return od09.propose(env.linux_stats, env.windows_stats, baseline_gates=env.baseline_gates,
+                        generated_at=fakes_od09.ts(20, 8))
 
 
 def _freeze(env, *, overrides=None, now=None, proposal=None):
@@ -164,7 +165,8 @@ def test_stage0_chain_without_later_phases(tmp_path):
         env = fakes_od09.od09_env(Path({str(tmp_path)!r}))
         assert not (env.repo / "tests" / "acceptance" / "stage_exits.json").exists()
         assert not (env.repo / "docs" / "rust-refactor" / "evidence" / "index.json").exists()
-        prop = od09_freeze.propose(env.linux_stats, env.windows_stats, baseline_gates=env.baseline_gates)
+        prop = od09_freeze.propose(env.linux_stats, env.windows_stats, baseline_gates=env.baseline_gates,
+                                   generated_at=fakes_od09.ts(20, 8))
         od09_freeze.freeze(env.acceptance, prop, decision_id="OD-09-F1", approved_by="owner", overrides={{}},
                            stage0_index=env.stage0_index, evidence_root=env.evidence_root, ledger_path=env.ledger,
                            addenda_path=env.addenda, now=fakes_od09.ts(20, 9))

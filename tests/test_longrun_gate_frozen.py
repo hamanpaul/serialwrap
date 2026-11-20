@@ -38,7 +38,8 @@ def _load_yaml(path: Path):
 def _freeze_env(root: Path, *, overrides=None):
     env = fakes_od09.od09_env(root)
     od09 = _od09()
-    proposal = od09.propose(env.linux_stats, env.windows_stats, baseline_gates=env.baseline_gates)
+    proposal = od09.propose(env.linux_stats, env.windows_stats, baseline_gates=env.baseline_gates,
+                            generated_at=fakes_od09.ts(20, 8))
     od09.freeze(
         env.acceptance,
         proposal,
