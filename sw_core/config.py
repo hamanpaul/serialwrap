@@ -8,6 +8,11 @@ from typing import Any
 import yaml
 
 
+# 逾時恢復按鍵（session_manager._recover_after_failure）：鍵名 → 送出的 byte。
+TIMEOUT_RECOVERY_KEY_BYTES: dict[str, bytes] = {"CTRL_C": b"\x03", "CTRL_D": b"\x04"}
+DEFAULT_TIMEOUT_RECOVERY_KEYS: tuple[str, ...] = ("CTRL_C", "CTRL_D")
+
+
 @dataclasses.dataclass(frozen=True)
 class UartProfile:
     baud: int = 115200
@@ -43,6 +48,9 @@ class ProfileTemplate:
     # 不參與登入流程。空字串＝不設（只靠 login／prompt 或 180s 過期）。
     boot_done_regex: str = ""
     max_console_line_chars: int | None = None
+    # 命令逾時（及 READY 時 session recover）依序送出的恢復按鍵；預設與既有行為相同。
+    # 設 [CTRL_C] 不送 CTRL_D（避免把已登入的 shell 登出），設 [] 完全不送按鍵。
+    timeout_recovery_keys: tuple[str, ...] = DEFAULT_TIMEOUT_RECOVERY_KEYS
 
     @property
     def command_capable(self) -> bool:
@@ -79,6 +87,9 @@ class SessionProfile:
     # 不參與登入流程。空字串＝不設（只靠 login／prompt 或 180s 過期）。
     boot_done_regex: str = ""
     max_console_line_chars: int | None = None
+    # 命令逾時（及 READY 時 session recover）依序送出的恢復按鍵；預設與既有行為相同。
+    # 設 [CTRL_C] 不送 CTRL_D（避免把已登入的 shell 登出），設 [] 完全不送按鍵。
+    timeout_recovery_keys: tuple[str, ...] = DEFAULT_TIMEOUT_RECOVERY_KEYS
 
     @property
     def command_capable(self) -> bool:
@@ -110,6 +121,23 @@ def _as_opt_str(v: Any) -> str | None:
         return None
     s = str(v).strip()
     return s if s else None
+
+
+def _as_timeout_recovery_keys(
+    v: Any, default: tuple[str, ...] = DEFAULT_TIMEOUT_RECOVERY_KEYS
+) -> tuple[str, ...]:
+    """解析逾時恢復按鍵清單；只接受由 CTRL_C、CTRL_D 組成且不重複的 list，``None`` 取預設。
+
+    空 list 合法（完全不送恢復按鍵）。字串、未知鍵名或重複項目一律拒絕，
+    避免拼錯的設定悄悄退回預設、照送 CTRL_D。
+    """
+    if v is None:
+        return default
+    if not isinstance(v, list) or any(
+        not isinstance(k, str) or k not in TIMEOUT_RECOVERY_KEY_BYTES for k in v
+    ) or len(set(v)) != len(v):
+        raise ValueError("timeout_recovery_keys 必須是由 CTRL_C、CTRL_D 組成且不重複的清單")
+    return tuple(v)
 
 
 def _as_max_console_line_chars(v: Any, default: int | None = None) -> int | None:
@@ -194,6 +222,7 @@ def _template_from_dict(name: str, raw: dict[str, Any], *, base_dir: str) -> Pro
         if isinstance(raw.get("bootloader_prompts"), list)
         else (),
         boot_done_regex=str(raw.get("boot_done_regex") or "").strip(),
+        timeout_recovery_keys=_as_timeout_recovery_keys(raw.get("timeout_recovery_keys")),
     )
 
 
@@ -308,6 +337,9 @@ def _merge_session(
         uart=_load_uart(target.get("uart"), default=template.uart),
         bootloader_prompts=template.bootloader_prompts,
         boot_done_regex=str(target.get("boot_done_regex") or template.boot_done_regex).strip(),
+        timeout_recovery_keys=_as_timeout_recovery_keys(
+            target.get("timeout_recovery_keys"), template.timeout_recovery_keys
+        ),
     )
 
 
