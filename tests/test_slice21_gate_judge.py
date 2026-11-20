@@ -744,10 +744,18 @@ def test_preflight_not_frozen_never_ready(case):
     assert any("event_latency 未凍結" in r for r in out["verdict_reasons"])
 
 
-def test_cmd_judge_reloads_parity_like_assemble(case, capsys):
+def test_cmd_judge_reloads_parity_like_assemble(case, capsys, monkeypatch):
     """sol-backfill p5 #8：`judge` 子命令必須與 `assemble` 一樣重新載入 #104 parity 狀態與來源；
     來源文件不可得時 parity 為 INCOMPLETE，重新判定不得因漏載 parity 而放寬成 READY_FOR_OWNER_EVIDENCE。"""
+    import functools
+
     import yaml
+
+    mod = _judge_mod()
+    # `judge` 子命令沒有 today 參數，`breaker_inputs` 預設取真實 UTC 日期；FREEZE_SYNTH 的 OD-02 24 週上限在
+    # 2027-04-07，未固定日期時本測試自 2027-04-08 起 case_uptake 轉 FAIL、verdict 變 FAIL（PR #278 審查移時鐘實測）。
+    # 比照同檔其他案例固定為 BREAKER_OK 的日期；斷路器判定本身不放寬。
+    monkeypatch.setattr(mod, "breaker_inputs", functools.partial(mod.breaker_inputs, today=BREAKER_OK["today"]))
 
     base = case.base
     report_path = base / "report.json"
@@ -767,7 +775,7 @@ def test_cmd_judge_reloads_parity_like_assemble(case, capsys):
     }
     expect_path = base / "expect.yaml"
     expect_path.write_text(yaml.safe_dump(expect, allow_unicode=True), encoding="utf-8")
-    assert _judge_mod().main(["judge", "--report", str(report_path), "--expect", str(expect_path)]) == 0
+    assert mod.main(["judge", "--report", str(report_path), "--expect", str(expect_path)]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["verdict"] == "INCOMPLETE", out
     assert any("#104" in r for r in out["verdict_reasons"]), out

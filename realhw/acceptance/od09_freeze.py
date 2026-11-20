@@ -424,7 +424,7 @@ def _read_baseline_gate(platform: str, path: Path) -> dict[str, Any]:
 
 
 def propose(linux: BaselineStats, windows: BaselineStats, *, baseline_gates: Mapping[str, Path],
-            acceptance_path: Path = DEFAULT_ACCEPTANCE) -> dict[str, Any]:
+            acceptance_path: Path = DEFAULT_ACCEPTANCE, generated_at: str | None = None) -> dict[str, Any]:
     """依 PROPOSAL_RULES 的固定公式產生凍結提案（不讀取門檻檔的延後項內容）。
 
     拒絕：統計 platform 標籤與位置不符、任一統計有基線違規、基線 gate 的平台／模式／判定錯配。
@@ -473,7 +473,7 @@ def propose(linux: BaselineStats, windows: BaselineStats, *, baseline_gates: Map
             for platform in PLATFORMS
         },
         "proposal_rules": dict(PROPOSAL_RULES),
-        "generated_at": _now_iso(),
+        "generated_at": generated_at or _now_iso(),  # 可注入：測試以固定時點產生提案
         "acceptance_revision": _baseline_revision(docs),
     }
     proposal["proposal_sha256"] = _proposal_digest(proposal)

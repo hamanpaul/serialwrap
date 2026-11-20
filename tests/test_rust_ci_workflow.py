@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +24,7 @@ RUST_LINUX_REQUIRED_COMMANDS = [
     "python3 scripts/rust/check_cfg_boundary.py",
     "python3 scripts/rust/check_dep_direction.py",
     "cargo check --workspace --all-targets",
-    "cargo test --workspace --all-features",
+    "cargo test --workspace --all-features --no-fail-fast",
     "python3 scripts/rust/gen_error_codes.py --check",
     "SW_REQUIRE_CARGO=1 python3 -m pytest -q tests/test_rust_*.py",
     "scripts/rust/mkbundle.sh --dev --out target/dev-bundle",
@@ -63,6 +64,116 @@ def _load_yaml(path: Path) -> dict[str, Any]:
         data = yaml.safe_load(f)
     assert isinstance(data, dict), f"{path} 根節點必須是 mapping"
     return data
+
+
+def _assert_runs_after_earlier_failure(step: dict[str, Any], where: str) -> None:
+    """步驟必須在前面步驟失敗時仍執行（`!cancelled()` 取代預設的 `success()`），且不得以 continue-on-error 放行。
+
+    PR #278 十輪審查：步驟串行、前一個紅就不跑後面，一輪只露一層。`!cancelled()` 不改變失敗步驟的結論，
+    job 仍以失敗結束；`always()` 會連取消也照跑，不作為替代。
+    """
+    name = step.get("name", step.get("uses", "?"))
+    cond = str(step.get("if", ""))
+    assert "!cancelled()" in cond, f"{where} 的步驟 {name!r} 必須帶 if: !cancelled()（前面步驟失敗時仍執行）：{cond!r}"
+    assert "always()" not in cond, f"{where} 的步驟 {name!r} 不得改用 always()：{cond!r}"
+    assert "continue-on-error" not in step, f"{where} 的步驟 {name!r} 不得設定 continue-on-error"
+
+
+def _call_name(node: ast.AST) -> str:
+    """`f(...)`／`a.b(...)` 的被呼叫名稱（`f`／`a.b`）；其他節點回空字串。"""
+    if not isinstance(node, ast.Call):
+        return ""
+    try:
+        return ast.unparse(node.func)
+    except Exception:  # pragma: no cover - ast.unparse 對合法 AST 不會失敗
+        return ""
+
+
+def _assert_supervision_restart_sync_points(source: str) -> None:
+    """`test_stop_during_push_flushes_wal` 的三個 DUT RX 靜定同步點與位移判準（以 AST 的執行順序檢查，不釘字面次數／位置）。
+
+    要保護的意圖（PR #278 第 7、8 輪）：
+    1. 停機後先等 DUT RX 靜定，才取樣「已收到的 chunk」基線；
+    2. 重啟前再等一次靜定並記下 DUT RX 位移；
+    3. 重啟後保留 ≥1 秒觀察窗、再等一次靜定，判定只看該位移之後才到 DUT 的 bytes。
+    測試內多加或少加其他呼叫、改註解、改排版都不影響本檢查；拿掉任何一個同步點或改回整段 rx_log 判定才會失敗。
+    """
+    tree = ast.parse(source)
+    func = next(
+        (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "test_stop_during_push_flushes_wal"),
+        None,
+    )
+    assert func is not None, "test_s24_supervision_systemd.py 缺少 test_stop_during_push_flushes_wal"
+
+    def pos(node: ast.AST) -> tuple[int, int]:
+        return (node.lineno, node.col_offset)
+
+    calls = sorted((n for n in ast.walk(func) if isinstance(n, ast.Call)), key=pos)
+    assigns = sorted((n for n in ast.walk(func) if isinstance(n, ast.Assign)), key=pos)
+    settles = [c for c in calls if _call_name(c) == "_settled_rx_len"]
+
+    stop = next((c for c in calls if _call_name(c) == "transient_unit.stop"), None)
+    assert stop is not None, "測試必須呼叫 transient_unit.stop()"
+    restart = next((c for c in calls if _call_name(c) == "transient_unit.start" and pos(c) > pos(stop)), None)
+    assert restart is not None, "停機後必須以 transient_unit.start() 重啟"
+
+    # 1. 停機後的 chunk 基線（讀 shell_target.commands() 的第一個賦值）之前，已有一次靜定等待。
+    baseline = next(
+        (a for a in assigns if pos(stop) < pos(a) < pos(restart)
+         and any(_call_name(c) == "shell_target.commands" for c in ast.walk(a.value))),
+        None,
+    )
+    assert baseline is not None, "停機後、重啟前必須以 shell_target.commands() 取樣已收到的 chunk 基線"
+    assert any(pos(stop) < pos(c) < pos(baseline) for c in settles), (
+        "重啟前的 no-auto-resend 基線必須在停機後 DUT RX 靜定才取樣"
+    )
+
+    # 2. 基線之後、重啟之前，把靜定後的 DUT RX 長度記到一個名稱（位移）。
+    offset_assign = next(
+        (a for a in assigns if pos(baseline) < pos(a) < pos(restart)
+         and _call_name(a.value) == "_settled_rx_len"
+         and len(a.targets) == 1 and isinstance(a.targets[0], ast.Name)),
+        None,
+    )
+    assert offset_assign is not None, "重啟前必須再等一次 DUT RX 靜定並記下位移"
+    offset_name = offset_assign.targets[0].id
+
+    # 3. 重啟後：≥1 秒觀察窗 → 靜定 → 只取位移之後的 bytes 判定。
+    sleep = next(
+        (c for c in calls if pos(c) > pos(restart) and _call_name(c) == "time.sleep"
+         and c.args and isinstance(c.args[0], ast.Constant)
+         and isinstance(c.args[0].value, (int, float)) and c.args[0].value >= 1.0),
+        None,
+    )
+    assert sleep is not None, "重啟後須保留至少 1 秒的 no-auto-resend 觀察窗"
+    settle_after = next((c for c in settles if pos(c) > pos(sleep)), None)
+    assert settle_after is not None, "重啟後的觀察窗之後須排空 DUT RX 再判定"
+
+    def is_offset_slice(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Subscript)
+            and _call_name(node.value) == "shell_target.rx_log"
+            and isinstance(node.slice, ast.Slice)
+            and isinstance(node.slice.lower, ast.Name) and node.slice.lower.id == offset_name
+            and node.slice.upper is None
+        )
+
+    sliced = next(
+        (a for a in assigns if pos(a) > pos(settle_after) and is_offset_slice(a.value)
+         and len(a.targets) == 1 and isinstance(a.targets[0], ast.Name)),
+        None,
+    )
+    assert sliced is not None, "重啟後判定須只看重啟前 DUT RX 位移之後的 bytes"
+    sliced_name = sliced.targets[0].id
+    sentinel_asserts = [
+        n for n in ast.walk(func)
+        if isinstance(n, ast.Assert) and pos(n) > pos(sliced)
+        and any(isinstance(c, ast.Constant) and c.value == b"SW_XFER_CHUNK" for c in ast.walk(n.test))
+    ]
+    assert sentinel_asserts, "重啟後必須斷言 chunk sentinel 不出現"
+    for node in sentinel_asserts:
+        names = {c.id for c in ast.walk(node.test) if isinstance(c, ast.Name)}
+        assert sliced_name in names, "chunk sentinel 的判定對象必須是位移之後的 bytes，不得改回整段 rx_log"
 
 
 def test_rust_workflow_exists_and_triggers_on_pull_request():
@@ -141,21 +252,18 @@ def test_rust_linux_job_ordered_commands():
                 break
         assert found, f"命令 {cmd!r} 未在 rust-linux steps 中依序找到"
 
-    # systemd stop 後須等 DUT PTY relay 排空停機前已送出的 TX，才能建立重啟前基線。
-    supervision_test = (REPO_ROOT / "tests/contract_blackbox/test_s24_supervision_systemd.py").read_text(
-        encoding="utf-8"
-    )
-    settled = "_settled_rx_len(shell_target)"
-    baseline = "before = len(received)"
-    assert supervision_test.count(settled) == 2, "停機與重啟後都須以 DUT RX 靜定作為觀察同步點"
-    baseline_at = supervision_test.index(baseline)
-    assert supervision_test.index(settled) < baseline_at, (
-        "重啟前的 no-auto-resend 基線必須在停機後 DUT RX 靜定才取樣"
-    )
-    restart_at = supervision_test.index("transient_unit.start()", baseline_at)
-    settle_after_restart = supervision_test.rindex(settled)
-    assert restart_at < supervision_test.index("time.sleep(1.0)", restart_at) < settle_after_restart, (
-        "重啟後須保留既有 1 秒觀察窗，並排空 DUT RX 後再判定"
+    # 一輪露出全部（PR #278）：第一個檢查步驟之後的每個 run 步驟，在前面步驟失敗時仍須執行。
+    first_check = next(i for i, step in enumerate(steps) if "check_cfg_boundary.py" in str(step.get("run", "")))
+    later_runs = [step for step in steps[first_check + 1:] if isinstance(step, dict) and "run" in step]
+    assert len(later_runs) >= 13, f"rust-linux 檢查步驟數量異常：{len(later_runs)}"
+    for step in later_runs:
+        _assert_runs_after_earlier_failure(step, "rust-linux")
+    cargo_test = next(r for r in step_runs if "cargo test --workspace" in r)
+    assert "--no-fail-fast" in cargo_test, "Linux cargo test 必須帶 --no-fail-fast（一個 test binary 紅時仍跑完其餘）"
+
+    # systemd stop 後須等 DUT PTY relay 排空停機前已送出的 TX，才能建立重啟前基線（黑箱步驟所跑測試的同步點）。
+    _assert_supervision_restart_sync_points(
+        (REPO_ROOT / "tests/contract_blackbox/test_s24_supervision_systemd.py").read_text(encoding="utf-8")
     )
 
 
@@ -175,6 +283,12 @@ def test_rust_windows_hosted_job():
     assert any("cargo test --workspace" in r for r in step_runs), (
         "rust-windows-hosted 步驟必須包含 'cargo test --workspace'"
     )
+    assert any("cargo test --workspace --no-fail-fast" in r for r in step_runs), (
+        "rust-windows-hosted 的 cargo test 必須帶 --no-fail-fast"
+    )
+    # cargo test 紅時仍執行 release 建置與匯入 DLL 檢查（一輪露出全部，PR #278）。
+    imports_step = next(step for step in steps if "check_win_imports.py" in str(step.get("run", "")))
+    _assert_runs_after_earlier_failure(imports_step, "rust-windows-hosted")
 
 
 def test_rust_windows_com_job():
@@ -200,7 +314,26 @@ def test_rust_windows_com_job():
 
 
 def test_no_continue_on_error():
-    """驗證 rust.yml 中任何 job 或 step 皆未設定 continue-on-error: true。"""
+    """驗證 rust.yml 中任何 job 或 step 皆未設定 continue-on-error: true；
+    tests.yml 的 pytest job 同樣不得以 continue-on-error 放行，且第一遍失敗時仍須跑第二遍與 L1 鎖檢查。"""
+    pytest_job = _load_yaml(TESTS_YML)["jobs"]["pytest"]
+    assert "continue-on-error" not in pytest_job, "tests.yml 的 pytest job 不得設定 continue-on-error"
+    pytest_steps = pytest_job["steps"]
+    assert all("continue-on-error" not in step for step in pytest_steps), "pytest job 的步驟不得設定 continue-on-error"
+    full_runs = [i for i, step in enumerate(pytest_steps) if "python3 -m pytest -q tests/" in str(step.get("run", ""))]
+    assert len(full_runs) == 2, f"pytest job 必須有無 re2／有 re2 兩遍全套：{full_runs}"
+    re2_install = next(i for i, step in enumerate(pytest_steps) if "pip install" in str(step.get("run", ""))
+                       and "google-re2" in str(step.get("run", "")))
+    lock_check = next(i for i, step in enumerate(pytest_steps) if "regen_lock.py --check" in str(step.get("run", "")))
+    assert full_runs[0] < re2_install < full_runs[1], "google-re2 必須在第一遍之後、第二遍之前安裝"
+    assert "if" not in pytest_steps[full_runs[0]], "第一遍全套不得帶條件"
+    # PR #278 十輪內第二遍只執行 4 次、鎖檢查 0 次：第一遍紅時三個步驟仍須執行，job 結論仍為失敗。
+    for index in (re2_install, full_runs[1], lock_check):
+        _assert_runs_after_earlier_failure(pytest_steps[index], "tests.yml pytest")
+    assert "github.event_name == 'pull_request'" in str(pytest_steps[lock_check]["if"]), (
+        "L1 鎖只增檢查仍只在 pull_request 事件執行（需要 PR base）"
+    )
+
     doc = _load_yaml(RUST_YML)
     jobs = doc.get("jobs", {})
     assert jobs, "rust.yml 缺少 jobs"

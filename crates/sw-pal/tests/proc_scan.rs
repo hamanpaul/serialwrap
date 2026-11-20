@@ -605,8 +605,11 @@ fn windows_scan_finds_self_spawned_fake_daemon() {
 #[test]
 fn windows_pid_alive_never_terminates_target() {
     use sw_pal::proc_scan::WindowsProcScan;
+    // `pause` 讀 stdin；不給 stdin 時在 hosted runner（stdin 為 EOF／NUL）會立刻結束（PR #278 第七、八輪），
+    // 本測試持有一條開著的管線，讓子行程穩定存活到 kill。
     let mut child = std::process::Command::new("cmd.exe")
         .args(["/c", "pause"])
+        .stdin(std::process::Stdio::piped())
         .spawn()
         .unwrap();
     let child_pid = child.id();
