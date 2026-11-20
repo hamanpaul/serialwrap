@@ -123,10 +123,13 @@ def _settled_rx_len(shell_target, quiet_s: float = 2.0, timeout_s: float = 10.0)
     raise AssertionError(f"DUT RX 在 {timeout_s:.1f}s 內未靜定：{len(shell_target.rx_log())} bytes")
 
 
+# 測試觀察上限（非產品期限）：hosted runner 的 systemd 容器啟動＋登入可超過 20 s（PR #278 第六輪實測），放寬為 60 s。
+READY_WAIT_S = 60
+
 def test_sigterm_ordered_shutdown(sw_env, shell_target, transient_unit):
     sw_env.prepare(targets={"COM0": shell_target})
     transient_unit.start()
-    sw_env.wait_state("COM0", "READY", timeout=20)
+    sw_env.wait_state("COM0", "READY", timeout=READY_WAIT_S)
     took = transient_unit.stop()
     assert transient_unit.last_status() == "exited:0", (transient_unit.last_status(), took)
     assert sw_env.holders(shell_target.slave_path, exclude_self=True) == [], "停止後 tty 無殘留 holder"
@@ -138,7 +141,7 @@ def test_sigterm_ordered_shutdown(sw_env, shell_target, transient_unit):
 def test_restart_on_failure_keeps_released_and_wal_seq(sw_env, shell_target, transient_unit):
     sw_env.prepare(targets={"COM0": shell_target})
     transient_unit.start()
-    sw_env.wait_state("COM0", "READY", timeout=20)
+    sw_env.wait_state("COM0", "READY", timeout=READY_WAIT_S)
     rel = sw_env.rpc("device.release", {"selector": "COM0", "source": "agent:p8", "reason": "sup"})
     assert rel.get("ok") is True, rel
     seq0 = sw_env.rpc("wal.current_seq", {})["seq"]
@@ -154,7 +157,7 @@ def test_restart_on_failure_keeps_released_and_wal_seq(sw_env, shell_target, tra
 def test_stop_during_push_flushes_wal(sw_env, shell_target, transient_unit, tmp_path):
     sw_env.prepare(targets={"COM0": shell_target})
     transient_unit.start()
-    sw_env.wait_state("COM0", "READY", timeout=20)
+    sw_env.wait_state("COM0", "READY", timeout=READY_WAIT_S)
     src = tmp_path / "push.bin"
     src.write_bytes(bytes(range(256)) * 256)               # 64 KiB
     remote = f"/tmp/sw-p8t12-{os.getpid()}.bin"
@@ -179,7 +182,7 @@ def test_stop_during_push_flushes_wal(sw_env, shell_target, transient_unit, tmp_
         # 重啟後不自動重送（no_auto_resend）：DUT 端零新增 chunk。
         before = len(received)
         transient_unit.start()
-        sw_env.wait_state("COM0", "READY", timeout=20)
+        sw_env.wait_state("COM0", "READY", timeout=READY_WAIT_S)
         # 保留原有 1 秒 no-auto-resend 觀察窗，再排空 relay 後比較 DUT 實收行數。
         time.sleep(1.0)
         _settled_rx_len(shell_target)
