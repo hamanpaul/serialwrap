@@ -72,6 +72,14 @@ def _golden_differences(name: str, expected: bytes, actual: bytes) -> list[str]:
 @pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_goldens_exist_and_are_fresh():
+    # 擷取前置（capture_p7_goldens.py 第 12 行）：EVT-D-S15 golden 以「無 google-re2」的 Python 為基準，偵測到 re2 即拒絕擷取。
+    # tests.yml 的第二輪刻意安裝 re2 覆蓋 #91 線性引擎路徑；該輪不具備此前置，新鮮度由無 re2 的第一輪覆蓋。
+    try:
+        import re2  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        pytest.skip("cap_present:google-re2：EVT-D-S15 golden 以無 re2 的 Python 為基準，由無 re2 的測試輪覆蓋（非 PASS）")
     with tempfile.TemporaryDirectory() as td:
         r = subprocess.run([sys.executable, str(ROOT / "scripts/rust/capture_p7_goldens.py"), "--out", td],
                            capture_output=True, text=True, cwd=ROOT)

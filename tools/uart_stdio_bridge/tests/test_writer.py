@@ -792,7 +792,11 @@ def test_writer_close_slow_progress_exceeds_stall_timeout(tmp_path):
 
 
 def test_writer_flush_slow_progress_exceeds_stall_timeout(tmp_path):
-    """flush 等待佇列時以 writer 進度重設停滯期限。"""
+    """flush 等待佇列時以 writer 進度重設停滯期限。
+
+    每筆寫入 50 ms、停滯期限 500 ms：20 筆總長約 1 s 超過期限（只看總時長的實作會失敗），而單步遠小於期限；
+    原本 10 ms／80 ms 在 hosted Windows（計時粒度 15.6 ms、排程停頓）會誤判停滯（PR #278 第六輪）。
+    """
     first_write_entered = threading.Event()
     release_first_write = threading.Event()
     write_calls = {"n": 0}
@@ -804,7 +808,7 @@ def test_writer_flush_slow_progress_exceeds_stall_timeout(tmp_path):
             first_write_entered.set()
             release_first_write.wait()
         else:
-            time.sleep(0.01)
+            time.sleep(0.05)
         return os.write(fd, data)
 
     path = tmp_path / "wire.ndjson"
@@ -816,7 +820,7 @@ def test_writer_flush_slow_progress_exceeds_stall_timeout(tmp_path):
 
     def flush_writer():
         try:
-            w.flush(timeout_s=0.08)
+            w.flush(timeout_s=0.5)
         except Exception as exc:  # noqa: BLE001 - 收集預期失敗以利診斷
             flush_result["error"] = exc
 
