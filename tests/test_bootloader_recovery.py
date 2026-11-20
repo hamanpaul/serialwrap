@@ -181,6 +181,19 @@ class TestSelfTestBootloaderClassification(unittest.TestCase):
         # 不應發送 probe
         bridge.send_command.assert_not_called()
 
+    def test_invalid_bootloader_regex_is_skipped_and_next_prompt_classifies(self) -> None:
+        """無效樣式略過，後續有效 bootloader prompt 仍分類成功。"""
+        profile = _make_profile(bootloader_prompts=(r"[invalid(", r"^=> "))
+        mgr, bridge = self._make_manager_with_device(profile)
+        bridge.rx_tail.return_value = "boot output\n=> "
+
+        resp = mgr.self_test("COM0")
+
+        self.assertTrue(resp["ok"])
+        self.assertEqual(resp["classification"], "BOOTLOADER")
+        self.assertEqual(resp["matched_prompt"], r"^=> ")
+        bridge.send_command.assert_not_called()
+
     def test_empty_bootloader_prompts_uses_uboot_fallback(self) -> None:
         """bootloader_prompts 為空 → 退回 ``UBOOT_FALLBACK_PROMPTS`` 仍認得（#162 C1）。
 

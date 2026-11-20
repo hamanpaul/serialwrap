@@ -1,33 +1,109 @@
 //! 假單調時鐘。
 
 use crate::traits::Clock;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct FakeClock {
     pub now_ns: AtomicU64,
+    pub wall_us: AtomicI64,
+    pub local_offset_s: AtomicI32,
     pub sleeps: Mutex<Vec<Duration>>,
+    is_threaded: bool,
+    wait_mutex: Mutex<()>,
+    cond: Condvar,
+    subscribers: Mutex<Vec<crossbeam_channel::Sender<()>>>,
+}
+
+impl Default for FakeClock {
+    fn default() -> Self {
+        Self {
+            now_ns: AtomicU64::new(0),
+            wall_us: AtomicI64::new(0),
+            local_offset_s: AtomicI32::new(0),
+            sleeps: Mutex::new(Vec::new()),
+            is_threaded: false,
+            wait_mutex: Mutex::new(()),
+            cond: Condvar::new(),
+            subscribers: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 impl FakeClock {
     /// 建立共享用的假時鐘（P4-T1 替身介面；回 `Arc`）。
-    pub fn new() -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self::default())
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
     }
 
-    pub fn advance(&self, d: std::time::Duration) {
+    pub fn advance(&self, d: Duration) {
         let ns = d.as_nanos().min(u64::MAX as u128) as u64;
         let _ = self
             .now_ns
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |now| {
-                Some(now.saturating_add(ns))
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                Some(v.saturating_add(ns))
             });
+        let us = d.as_micros().min(i64::MAX as u128) as i64;
+        let _ = self
+            .wall_us
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                Some(v.saturating_add(us))
+            });
+
+        // 喚醒 sleep 中的等待者
+        let _guard = self.wait_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        self.cond.notify_all();
+        drop(_guard);
+
+        // 每次 advance 送一個 ()（容量 1、滿則略過）
+        let mut subs = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
+        subs.retain(|tx| {
+            !matches!(
+                tx.try_send(()),
+                Err(crossbeam_channel::TrySendError::Disconnected(()))
+            )
+        });
     }
+
     /// 自建立起所有 `sleep` 與 `advance` 的總和（單調時間差）。
-    pub fn elapsed(&self) -> std::time::Duration {
-        std::time::Duration::from_nanos(self.now_ns.load(Ordering::SeqCst))
+    pub fn elapsed(&self) -> Duration {
+        Duration::from_nanos(self.now_ns.load(Ordering::SeqCst))
+    }
+
+    /// Slice 2.1（threaded 模式）：建立 mono／wall 皆可控的假時鐘。
+    pub fn at(mono_ns: u64, wall_unix_us: i64) -> Arc<FakeClock> {
+        Arc::new(Self {
+            now_ns: AtomicU64::new(mono_ns),
+            wall_us: AtomicI64::new(wall_unix_us),
+            local_offset_s: AtomicI32::new(0),
+            sleeps: Mutex::new(Vec::new()),
+            is_threaded: true,
+            wait_mutex: Mutex::new(()),
+            cond: Condvar::new(),
+            subscribers: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Slice 2.1：只改 wall 時間，不動 mono（Review Focus 4）。
+    pub fn set_wall_us(&self, wall_unix_us: i64) {
+        self.wall_us.store(wall_unix_us, Ordering::SeqCst);
+    }
+
+    /// Slice 2.1：本地時區偏移（秒）。
+    pub fn set_local_offset_s(&self, s: i32) {
+        self.local_offset_s.store(s, Ordering::SeqCst);
+    }
+
+    /// Slice 2.1：每次 `advance` 送一個 `()`（容量 1，滿則略過）。
+    pub fn subscribe(&self) -> crossbeam_channel::Receiver<()> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(tx);
+        rx
     }
 
     pub fn sleeps_s(&self) -> Vec<f64> {
@@ -41,15 +117,98 @@ impl FakeClock {
 }
 
 impl Clock for FakeClock {
+    fn wall_unix_us(&self) -> i64 {
+        self.wall_us.load(Ordering::SeqCst)
+    }
+
+    fn local_utc_offset_s(&self) -> i32 {
+        self.local_offset_s.load(Ordering::SeqCst)
+    }
+
     fn mono_ns(&self) -> u64 {
         self.now_ns.load(Ordering::SeqCst)
     }
 
     fn sleep(&self, d: Duration) {
-        self.sleeps
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(d);
-        self.advance(d);
+        if self.is_threaded {
+            let ns = d.as_nanos().min(u64::MAX as u128) as u64;
+            let mut guard = self.wait_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            let target = self.now_ns.load(Ordering::SeqCst).saturating_add(ns);
+            self.sleeps
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(d);
+            while self.now_ns.load(Ordering::SeqCst) < target {
+                guard = self.cond.wait(guard).unwrap_or_else(|e| e.into_inner());
+            }
+        } else {
+            self.sleeps
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(d);
+            self.advance(d);
+        }
+    }
+
+    fn wait_until_or_cancel(
+        &self,
+        deadline_ns: u64,
+        cancel: &crossbeam_channel::Receiver<()>,
+    ) -> bool {
+        if !self.is_threaded {
+            // 非 threaded 模式（`sleep` 自行推進）：沒有其他 thread 會推進時鐘，故比照 `sleep` 以 10 ms 切片自行
+            // 推進；每片先讓其他 thread 有機會交付 RX 或取消等待，再推進假時鐘
+            //（P7 Task 3：`RxShared::wait_for_regex_cancellable`；與 P5 login 等待的輪詢節奏相同）。
+            const SLICE: Duration = Duration::from_millis(10);
+            loop {
+                let now = self.mono_ns();
+                if now >= deadline_ns {
+                    return true;
+                }
+                #[cfg(windows)]
+                if cancel.try_recv().is_ok() {
+                    return false;
+                }
+                #[cfg(not(windows))]
+                if cancel.recv_timeout(Duration::from_millis(5)).is_ok() {
+                    return false;
+                }
+                // 用高精度單調時鐘界定 5 ms 的合作式讓出，避免 Windows 一般 timer 的 15.6 ms 粒度。
+                // 這仍讓背景 RX producer 有實際執行時間；虛擬時間每片固定推進 10 ms。
+                #[cfg(windows)]
+                {
+                    let real_deadline = std::time::Instant::now() + Duration::from_millis(5);
+                    while std::time::Instant::now() < real_deadline {
+                        if cancel.try_recv().is_ok() {
+                            return false;
+                        }
+                        std::thread::yield_now();
+                    }
+                }
+                let step = SLICE.min(Duration::from_nanos(deadline_ns - now));
+                self.sleeps
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(step);
+                self.advance(step);
+            }
+        }
+        let advanced = self.subscribe();
+        loop {
+            let now = self.mono_ns();
+            if now >= deadline_ns {
+                return true;
+            }
+
+            let remaining = Duration::from_nanos(deadline_ns - now);
+            self.sleeps
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(remaining);
+            crossbeam_channel::select! {
+                recv(cancel) -> _ => return false,
+                recv(advanced) -> _ => {}
+            }
+        }
     }
 }

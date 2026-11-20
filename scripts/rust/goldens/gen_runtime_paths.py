@@ -2,7 +2,7 @@
 """產生 ``contracts/golden/runtime_paths.posix.tsv`` 與 ``runtime_paths.windows.tsv``。
 
 以 Python 3.12 執行 ``sw_core.constants``，驗證各種環境變數組合下的執行期路徑解析結果。
-至少 40 組 env 矩陣（涵蓋各 SERIALWRAP_*_DIR、XDG_*、SERIALWRAP_TCP_PORT 與 SERIALWRAP_ENDPOINT）。
+至少 40 組 env 矩陣（涵蓋各 SERIALWRAP_*_DIR、XDG_*、SERIALWRAP_TCP_PORT、SERIALWRAP_ENDPOINT、SERIALWRAP_TTYMCU_PATH 與 SYSTEM_CONFIG_PATH）。
 
 用法::
 
@@ -43,6 +43,8 @@ with unittest.mock.patch("os.path", posixpath), \\
             "run_dir": c.RUN_DIR,
             "socket_path": c.SOCKET_PATH,
             "state_dir": c.STATE_DIR,
+            "system_config_path": c.SYSTEM_CONFIG_PATH,
+            "ttymcu_path": c.TTYMCU_PATH,
             "wal_dir": c.WAL_DIR,
         }
         print(json.dumps(obj, sort_keys=True, separators=(",", ":")))
@@ -71,6 +73,8 @@ with unittest.mock.patch("os.path", ntpath), \\
             "run_dir": c.RUN_DIR,
             "socket_path": c.SOCKET_PATH,
             "state_dir": c.STATE_DIR,
+            "system_config_path": c.SYSTEM_CONFIG_PATH,
+            "ttymcu_path": c.TTYMCU_PATH,
             "wal_dir": c.WAL_DIR,
         }
         print(json.dumps(obj, sort_keys=True, separators=(",", ":")))
@@ -161,7 +165,18 @@ def build_env_matrix() -> list[tuple[str, dict[str, str]]]:
     cases.append(("endpoint_unix", {"SERIALWRAP_ENDPOINT": "/custom/path.sock"}))
     cases.append(("endpoint_empty", {"SERIALWRAP_ENDPOINT": ""}))
 
-    # 13. 複合隔離環境（常見於 CI / throwaway daemon）
+    # 13. SERIALWRAP_TTYMCU_PATH 各種組合（P8 Task 10：`TTYMCU_PATH`，預設 RUN_DIR/dev/ttyMCU）
+    cases.append(("ttymcu_path_empty", {"SERIALWRAP_TTYMCU_PATH": ""}))
+    cases.append(("ttymcu_path_spaces", {"SERIALWRAP_TTYMCU_PATH": "   "}))
+    cases.append(("ttymcu_path_home", {"SERIALWRAP_TTYMCU_PATH": "~/custom_mcu"}))
+    cases.append(("ttymcu_path_abs", {"SERIALWRAP_TTYMCU_PATH": "/var/sw/ttyMCU"}))
+
+    # 14. SYSTEM_CONFIG_PATH 原始覆寫與 Windows ProgramData fallback
+    cases.append(("system_config_path_override", {"SERIALWRAP_TEST_SYSTEM_CONFIG_PATH": "~/custom/system.yaml"}))
+    cases.append(("system_config_path_empty", {"SERIALWRAP_TEST_SYSTEM_CONFIG_PATH": ""}))
+    cases.append(("system_config_path_programdata", {"ProgramData": r"D:\SharedData"}))
+
+    # 15. 複合隔離環境（常見於 CI / throwaway daemon）
     cases.append((
         "isolated_throwaway",
         {

@@ -41,7 +41,10 @@ def test_contract_blackbox_cases_match_test_functions():
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         and node.name.startswith("test_")
     }
-    cases = [c for c in _load_cases().get("cases", []) if c.get("suite") == "contract-blackbox"]
+    all_bb = [c for c in _load_cases().get("cases", []) if c.get("suite") == "contract-blackbox"]
+    # P6 Task 0（07-slice22-console.md）：下游切片以 add-only 登記的 contract-blackbox 案例不屬 Stage 1A daemon black-box；
+    # Stage 1A 案例仍須與 test_bb_daemon_e2e.py 一一對應，切片案例另驗來源路徑。分群見 _split_contract_blackbox。
+    cases, later = _split_contract_blackbox(all_bb)
     expected_refs = {
         f"tests/contract_blackbox/test_bb_daemon_e2e.py::{name}" for name in names
     }
@@ -54,6 +57,55 @@ def test_contract_blackbox_cases_match_test_functions():
     )
     assert len(actual_refs) == len(cases), "contract-blackbox source_ref 不得重複"
     assert {c["case_id"] for c in cases} == expected_ids
+
+
+_STAGE1A_PLAN = "04-stage1a-rust-cli.md"
+_STAGE1A_SOURCE = "tests/contract_blackbox/test_bb_daemon_e2e.py::"
+
+
+def _split_contract_blackbox(all_bb: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """contract-blackbox 案例分成 Stage 1A 與下游切片兩群，並驗證各群的結構不變量。
+
+    parity-amendments-2026-10-26 #184（P6 審查 F5）：分群鍵改為結構欄位（``case_id`` 的 ``bb-`` 前綴或
+    ``source_ref`` 指向 ``test_bb_daemon_e2e.py``），不再依自由文字 ``implemented_by``；任一 Stage 1A 案例的
+    ``implemented_by`` 必須恰為 ``04-stage1a-rust-cli.md``，下游案例不得使用 ``bb-`` 前綴或 Stage 1A 來源。
+    """
+    stage1a = [c for c in all_bb
+               if c["case_id"].startswith("bb-") or str(c.get("source_ref", "")).startswith(_STAGE1A_SOURCE)]
+    later = [c for c in all_bb if c not in stage1a]
+    for c in stage1a:
+        assert c["case_id"].startswith("bb-"), f"{c['case_id']}：source_ref 屬 Stage 1A，case_id 必須以 bb- 開頭"
+        assert c.get("implemented_by") == _STAGE1A_PLAN, f"{c['case_id']}：Stage 1A 案例 implemented_by 必須為 {_STAGE1A_PLAN}"
+        assert str(c.get("source_ref", "")).startswith(_STAGE1A_SOURCE), f"{c['case_id']}：Stage 1A 案例來源必須為 {_STAGE1A_SOURCE}"
+    for c in later:
+        assert c.get("implemented_by") != _STAGE1A_PLAN, f"{c['case_id']}：非 bb- 案例不得標為 Stage 1A"
+        assert str(c.get("implemented_by", "")).startswith(("07-slice22-console.md", "08-slice23", "09-slice24")), c["case_id"]
+        assert str(c["source_ref"]).startswith(("tests/contract_blackbox/", "crates/")), c["case_id"]
+        assert "::" in c["source_ref"], c["case_id"]
+    assert len({c["source_ref"] for c in later}) == len(later), "切片 contract-blackbox source_ref 不得重複"
+    return stage1a, later
+
+
+@pytest.mark.memory_only
+@pytest.mark.parametrize("bad", [
+    # bb- 案例被標成切片計畫（舊邏輯會把它歸入切片群而無聲通過）
+    {"case_id": "bb-new-case", "implemented_by": "07-slice22-console.md",
+     "source_ref": "tests/contract_blackbox/slice22/test_x.py::test_new_case"},
+    # Stage 1A 案例 implemented_by 文字漂移
+    {"case_id": "bb-drift", "implemented_by": "04-stage1a-rust-cli.md ",
+     "source_ref": "tests/contract_blackbox/test_bb_daemon_e2e.py::test_drift"},
+    # 指向 Stage 1A 測試檔、卻不是 bb- 案例
+    {"case_id": "sc99-x", "implemented_by": "07-slice22-console.md",
+     "source_ref": "tests/contract_blackbox/test_bb_daemon_e2e.py::test_x"},
+    # 非 bb- 案例宣稱屬 Stage 1A
+    {"case_id": "sc98-y", "implemented_by": "04-stage1a-rust-cli.md",
+     "source_ref": "tests/contract_blackbox/slice22/test_y.py::test_y"},
+])
+def test_contract_blackbox_grouping_is_structural(bad):
+    ok = {"case_id": "bb-ok", "implemented_by": _STAGE1A_PLAN, "source_ref": _STAGE1A_SOURCE + "test_ok"}
+    assert _split_contract_blackbox([ok]) == ([ok], [])
+    with pytest.raises(AssertionError):
+        _split_contract_blackbox([ok, dict(bad, suite="contract-blackbox")])
 
 
 def _slice_to_tuple(s: str) -> tuple[int, ...]:
@@ -271,6 +323,28 @@ def test_windows_gap_has_reason():
 
 
 @pytest.mark.memory_only
+@pytest.mark.parametrize("case_id", ["p1-con-busy", "p1-con-softpreempt"])
+def test_p1_console_lease_cases_record_od85_windows_gap(case_id):
+    cases = {c["case_id"]: c for c in _load_cases().get("cases", [])}
+    case = cases[case_id]
+    reason = case.get("windows_gap_reason")
+    assert case["windows_status"] == "gap"
+    assert isinstance(reason, str) and "OD-85" in reason and "rulings/s2.md" in reason
+
+
+@pytest.mark.memory_only
+def test_p7_login_case_contract_matches_od86():
+    cases = {c["case_id"]: c for c in _load_cases().get("cases", [])}
+    case = cases["p7-invariants-login-bytes-not-interleaved-with-agent-or-human"]
+    assert case["title"] == "§11.3-2：login 窗口禁止 agent TX；human bytes 照 Python 可送並留 WAL"
+    assert case["contract"] == (
+        "08 Task 18：以 WAL seq／mono 檢查 username/login 至 nonce probe 後 READY；窗口內不得有 agent TX。"
+        "human bytes 依 Python 可在登入期間送出，且須記錄其 WAL 位置並證明送達 target。"
+    )
+    assert case["source_ref"] == "tests/contract_blackbox/test_p7_invariants.py::test_login_bytes_not_interleaved_with_agent_or_human"
+
+
+@pytest.mark.memory_only
 def test_windows_com_not_satisfied_by_memory():
     cases = _load_cases().get("cases", [])
     bad = []
@@ -406,6 +480,41 @@ def test_conditional_cases_declare_capability():
             if c.get("case_id", "").startswith("f7-") and "target_b64_tool" not in caps:
                 bad.append((c["case_id"], "f7-* conditional case must have target_b64_tool capability"))
     assert bad == [], f"Conditional cases with invalid capabilities: {bad}"
+
+
+@pytest.mark.memory_only
+def test_df25_case_registration():
+    cases_data = _load_cases()
+    matches = [c for c in cases_data.get("cases", []) if c.get("case_id") == "df25-interactive-cancel-preserves-lease"]
+    assert len(matches) == 1, f"df25-interactive-cancel-preserves-lease 必須恰好存在一筆，實際找到 {len(matches)} 筆"
+    c = matches[0]
+    assert c.get("behavior_changes") == ["DF-25"], f"behavior_changes 必須為 ['DF-25']，實際為 {c.get('behavior_changes')}"
+    assert c.get("necessity") == "conditional", f"necessity 必須為 conditional，實際為 {c.get('necessity')}"
+    assert c.get("daemon_slice") == "2.2", f"daemon_slice 必須為 '2.2'，實際為 {c.get('daemon_slice')}"
+    assert c.get("source_ref") == "crates/sw-daemon/tests/dispatch.rs::df25_interactive_cancel_preserves_lease", (
+        f"source_ref 必須精確指向 Rust 黑箱節點，實際為 {c.get('source_ref')}"
+    )
+
+    l1_path = REPO / "tests/acceptance/l1_required.lock.json"
+    l1_data = json.loads(l1_path.read_text(encoding="utf-8"))
+    s22_nodes = set(
+        l1_data.get("sets", {}).get("s22_gate:cargo_workspace", {}).get("linux", {}).get("nodeids", [])
+    )
+    expected_nodes = {
+        "cargo:sw-daemon::dispatch::df25_cancel_queued_interactive_zero_tx",
+        "cargo:sw-daemon::dispatch::df25_interactive_cancel_preserves_lease",
+    }
+    missing = expected_nodes - s22_nodes
+    assert not missing, f"新增的 Rust 測試節點必須在 s22_gate:cargo_workspace.linux 集合內，缺少：{missing}"
+
+
+@pytest.mark.memory_only
+def test_f7_larger_file_not_truncated_has_df26():
+    cases_data = _load_cases()
+    matches = [c for c in cases_data.get("cases", []) if c.get("case_id") == "f7-larger-file-not-truncated"]
+    assert len(matches) == 1, f"f7-larger-file-not-truncated 必須恰好存在一筆，實際找到 {len(matches)} 筆"
+    c = matches[0]
+    assert c.get("behavior_changes") == ["DF-26"], f"behavior_changes 必須為 ['DF-26']，實際為 {c.get('behavior_changes')}"
 
 
 @pytest.mark.memory_only
@@ -621,3 +730,110 @@ def test_counts_report():
     assert counts.get("by_suite") == by_suite, f"counts by_suite mismatch: {counts.get('by_suite')} vs {by_suite}"
     assert counts.get("by_layer") == by_layer, f"counts by_layer mismatch: {counts.get('by_layer')} vs {by_layer}"
     assert counts.get("by_slice") == by_slice, f"counts by_slice mismatch: {counts.get('by_slice')} vs {by_slice}"
+
+
+@pytest.mark.process_rpc
+def test_regen_lock_authorized_deferral_is_per_name(tmp_path: pathlib.Path):
+    """OD-34（擁有者裁決 2026-10-28）：案例延後切片只能逐名授權（`--authorize-deferral <case_id>:OD-<n>`）。
+    未授權者照舊拒絕；授權只放行該案例的 daemon_slice 往後移，不放行其他分母屬性改動或其他案例；
+    沒有實際延後的授權（過期 token）亦拒絕。"""
+    regen_script = REPO / "tests/acceptance/regen_lock.py"
+    orig_lock = (REPO / "tests/acceptance/cases.lock.json").read_text(encoding="utf-8")
+    counts = (REPO / "tests/acceptance/cases.counts.json").read_text(encoding="utf-8")
+    lock_now = json.loads(orig_lock)
+    cid = next(c for c in lock_now["sets"]["slice_2.2"] if c not in lock_now["sets"]["slice_2.1"]
+               and lock_now["case_attrs"][c]["daemon_slice"] == "2.2")
+
+    def run(tag: str, mutate, *extra: str) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
+        d = tmp_path / tag
+        d.mkdir()
+        cases_data = _load_cases()
+        mutate({c["case_id"]: c for c in cases_data["cases"]})
+        (d / "cases.yaml").write_text(yaml.safe_dump(cases_data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        (d / "cases.lock.json").write_text(orig_lock, encoding="utf-8")
+        (d / "cases.counts.json").write_text(counts, encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, str(regen_script), "--add-only", "--cases", str(d / "cases.yaml"),
+             "--lock", str(d / "cases.lock.json"), *extra],
+            cwd=REPO, capture_output=True, text=True, encoding="utf-8",
+        )
+        return proc, d / "cases.lock.json"
+
+    def defer(cases):
+        cases[cid]["daemon_slice"] = "2.3"
+
+    proc, lock = run("unauth", defer)
+    assert proc.returncode == 1 and "被延後切片" in proc.stderr, proc.stderr
+    assert lock.read_text(encoding="utf-8") == orig_lock
+
+    proc, lock = run("auth", defer, "--authorize-deferral", f"{cid}:OD-34")
+    assert proc.returncode == 0, proc.stderr
+    new = json.loads(lock.read_text(encoding="utf-8"))
+    assert cid not in new["sets"]["slice_2.2"] and cid in new["sets"]["slice_2.3"]
+    assert new["case_attrs"][cid]["daemon_slice"] == "2.3"
+    assert f"{cid}" in proc.stdout and "OD-34" in proc.stdout
+
+    def defer_and_shrink(cases):
+        defer(cases)
+        cases[cid]["platforms"] = ["linux"]
+
+    proc, lock = run("attr", defer_and_shrink, "--authorize-deferral", f"{cid}:OD-34")
+    assert proc.returncode == 1 and "分母屬性變更" in proc.stderr, proc.stderr
+    assert lock.read_text(encoding="utf-8") == orig_lock
+
+    proc, lock = run("stale", lambda cases: None, "--authorize-deferral", f"{cid}:OD-34")
+    assert proc.returncode == 1 and "未對應" in proc.stderr, proc.stderr
+
+    proc, lock = run("badref", defer, "--authorize-deferral", f"{cid}:owner")
+    assert proc.returncode == 2, proc.stderr
+def _defer_fixture(tmp_path: pathlib.Path, case_id: str, to_slice: str) -> tuple[pathlib.Path, pathlib.Path, str]:
+    cases_data = _load_cases()
+    target = next(c for c in cases_data["cases"] if c["case_id"] == case_id)
+    target["daemon_slice"] = to_slice
+    tmp_cases = tmp_path / "cases.yaml"
+    tmp_cases.write_text(yaml.safe_dump(cases_data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    tmp_lock = tmp_path / "cases.lock.json"
+    orig_lock = (REPO / "tests/acceptance/cases.lock.json").read_text(encoding="utf-8")
+    tmp_lock.write_text(orig_lock, encoding="utf-8")
+    (tmp_path / "cases.counts.json").write_text(
+        (REPO / "tests/acceptance/cases.counts.json").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    return tmp_cases, tmp_lock, orig_lock
+
+
+def _regen(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, str(REPO / "tests/acceptance/regen_lock.py"), *args],
+                          cwd=REPO, capture_output=True, text=True, encoding="utf-8")
+
+
+@pytest.mark.process_rpc
+def test_regen_lock_defer_requires_named_owner_decision(tmp_path: pathlib.Path):
+    """OD-34：既有案例延後切片只能逐名以 `--allow-defer case_id:from:to:OD-NN` 核准；未核准、核准不符或多列
+    未使用的核准皆拒絕且鎖檔不變；核准後只改該案例的 daemon_slice 與早期切片集合，其餘屬性與集合不動。"""
+    lock0 = json.loads((REPO / "tests/acceptance/cases.lock.json").read_text(encoding="utf-8"))
+    cid = next(c for c in lock0["sets"]["slice_2.1"]
+               if lock0["case_attrs"][c]["daemon_slice"] == "2.1" and c.startswith("l15-"))
+    tmp_cases, tmp_lock, orig_lock = _defer_fixture(tmp_path, cid, "2.3")
+    base = ["--add-only", "--cases", str(tmp_cases), "--lock", str(tmp_lock)]
+    plain = _regen(*base)
+    assert plain.returncode == 1 and tmp_lock.read_text(encoding="utf-8") == orig_lock
+    for bad in (f"{cid}:2.1:2.2:OD-34", f"{cid}:2.1:2.3:", "nosuch-case:2.1:2.3:OD-34", f"{cid}:2.1:2.3:OD-x"):
+        r = _regen(*base, "--allow-defer", bad)
+        assert r.returncode != 0, (bad, r.stdout, r.stderr)
+        assert tmp_lock.read_text(encoding="utf-8") == orig_lock, bad
+    extra = _regen(*base, "--allow-defer", f"{cid}:2.1:2.3:OD-34", "--allow-defer", "f1-too-long-rejected:2.1:2.3:OD-34")
+    assert extra.returncode != 0 and tmp_lock.read_text(encoding="utf-8") == orig_lock
+    ok = _regen(*base, "--allow-defer", f"{cid}:2.1:2.3:OD-34")
+    assert ok.returncode == 0, ok.stderr
+    assert "OD-34" in ok.stdout
+    lock1 = json.loads(tmp_lock.read_text(encoding="utf-8"))
+    assert cid not in lock1["sets"]["slice_2.1"] and cid not in lock1["sets"]["slice_2.2"]
+    assert cid in lock1["sets"]["slice_2.3"] and cid in lock1["sets"]["slice_2.4"]
+    assert lock1["case_attrs"][cid] == dict(lock0["case_attrs"][cid], daemon_slice="2.3")
+    for name, ids in lock0["sets"].items():
+        if name not in ("slice_2.1", "slice_2.2"):
+            assert set(ids) <= set(lock1["sets"][name]), name
+        else:
+            assert set(ids) - set(lock1["sets"][name]) == {cid}, name
+    chk = _regen("--check", "--cases-only", "--cases", str(tmp_cases), "--lock", str(tmp_lock))
+    assert chk.returncode == 0, chk.stderr

@@ -1,0 +1,104 @@
+   Compiling sw-pal v0.3.2 ($WORKTREE/target/od69-r8-a5d/mutation/crates/sw-pal)
+   Compiling sw-proto v0.3.2 ($WORKTREE/target/od69-r8-a5d/mutation/crates/sw-proto)
+   Compiling sw-core v0.3.2 ($WORKTREE/target/od69-r8-a5d/mutation/crates/sw-core)
+warning: unused variable: `reader_rx_seq`
+   --> crates/sw-core/src/uart_bridge.rs:647:43
+    |
+647 |                 let (ledger, reader_exit, reader_rx_seq, close_receipt) = match (writer_result, reader_result) {
+    |                                           ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_reader_rx_seq`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `sw-core` (lib) generated 1 warning (run `cargo fix --lib -p sw-core` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.40s
+     Running tests/drain_release_e2e.rs (target/debug/deps/drain_release_e2e-9cace3de62f16a73)
+
+running 7 tests
+test drain_receipt_dependency_wait_on_release_within_od64_bound ... OD64 release round=0 backlog=3 N_pre=3 witness=4 op_finished_before_receipt=true
+OD64 release round=1 backlog=4 N_pre=4 witness=5 op_finished_before_receipt=true
+OD64 release round=2 backlog=5 N_pre=5 witness=6 op_finished_before_receipt=true
+OD64 release round=3 backlog=6 N_pre=6 witness=7 op_finished_before_receipt=true
+OD64 release round=4 backlog=7 N_pre=7 witness=8 op_finished_before_receipt=true
+OD64 release round=5 backlog=3 N_pre=3 witness=4 op_finished_before_receipt=true
+OD64 release round=6 backlog=4 N_pre=4 witness=5 op_finished_before_receipt=true
+OD64 release round=7 backlog=5 N_pre=5 witness=6 op_finished_before_receipt=true
+OD64 release round=8 backlog=6 N_pre=6 witness=7 op_finished_before_receipt=true
+OD64 release round=9 backlog=7 N_pre=7 witness=8 op_finished_before_receipt=true
+OD64 release round=10 backlog=3 N_pre=3 witness=4 op_finished_before_receipt=true
+OD64 release round=11 backlog=4 N_pre=4 witness=5 op_finished_before_receipt=true
+OD64 release round=12 backlog=5 N_pre=5 witness=6 op_finished_before_receipt=true
+OD64 release round=13 backlog=6 N_pre=6 witness=7 op_finished_before_receipt=true
+OD64 release round=14 backlog=7 N_pre=7 witness=8 op_finished_before_receipt=true
+OD64 release round=15 backlog=3 N_pre=3 witness=4 op_finished_before_receipt=true
+OD64 release round=16 backlog=4 N_pre=4 witness=5 op_finished_before_receipt=true
+OD64 release round=17 backlog=5 N_pre=5 witness=6 op_finished_before_receipt=true
+OD64 release round=18 backlog=6 N_pre=6 witness=7 op_finished_before_receipt=true
+OD64 release round=19 backlog=7 N_pre=7 witness=8 op_finished_before_receipt=true
+ok
+test drain_receipt_dependency_wait_on_shutdown_within_od64_bound ... OD64 shutdown round=0 backlog=3 N_pre=3 witness=4 op_finished_before_receipt=true
+OD64 shutdown round=1 backlog=4 N_pre=4 witness=5 op_finished_before_receipt=true
+OD64 shutdown round=2 backlog=5 N_pre=5 witness=6 op_finished_before_receipt=true
+OD64 shutdown round=3 backlog=6 N_pre=6 witness=7 op_finished_before_receipt=true
+OD64 shutdown round=4 backlog=7 N_pre=7 witness=8 op_finished_before_receipt=true
+OD64 shutdown round=5 backlog=3 N_pre=3 witness=4 op_finished_before_receipt=true
+OD64 shutdown round=6 backlog=4 N_pre=4 witness=5 op_finished_before_receipt=true
+OD64 shutdown round=7 backlog=5 N_pre=5 witness=6 op_finished_before_receipt=true
+OD64 shutdown round=8 backlog=6 N_pre=6 witness=7 op_finished_before_receipt=true
+OD64 shutdown round=9 backlog=7 N_pre=7 witness=8 op_finished_before_receipt=true
+OD64 shutdown round=10 backlog=3 N_pre=3 witness=4 op_finished_before_receipt=true
+OD64 shutdown round=11 backlog=4 N_pre=4 witness=5 op_finished_before_receipt=true
+OD64 shutdown round=12 backlog=5 N_pre=5 witness=6 op_finished_before_receipt=true
+OD64 shutdown round=13 backlog=6 N_pre=6 witness=7 op_finished_before_receipt=true
+OD64 shutdown round=14 backlog=7 N_pre=7 witness=8 op_finished_before_receipt=true
+OD64 shutdown round=15 backlog=3 N_pre=3 witness=4 op_finished_before_receipt=true
+OD64 shutdown round=16 backlog=4 N_pre=4 witness=5 op_finished_before_receipt=true
+OD64 shutdown round=17 backlog=5 N_pre=5 witness=6 op_finished_before_receipt=true
+OD64 shutdown round=18 backlog=6 N_pre=6 witness=7 op_finished_before_receipt=true
+OD64 shutdown round=19 backlog=7 N_pre=7 witness=8 op_finished_before_receipt=true
+ok
+test new_bridge_receipt_ignores_old_epoch_rx_progress ...
+thread 'new_bridge_receipt_ignores_old_epoch_rx_progress' (280950) panicked at crates/sw-core/tests/drain_release_e2e.rs:247:5:
+reader watermark dispatch 必須先於 receipt；後續 test data 可留在 lane: ProbeEntry { label: "WorkerStopped", data_while_waiting: 0, data_backlog: 130, pre_dependency_data: 0 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test release_receipt_follows_queued_rx_capture_and_wal ...
+thread 'release_receipt_follows_queued_rx_capture_and_wal' (280986) panicked at crates/sw-core/tests/drain_release_e2e.rs:247:5:
+reader watermark dispatch 必須先於 receipt；後續 test data 可留在 lane: ProbeEntry { label: "WorkerStopped", data_while_waiting: 0, data_backlog: 129, pre_dependency_data: 0 }
+FAILED
+test release_waits_for_receipt_and_aborts_partial_in_flight ... ok
+test shutdown_and_drain_receipt_handled_within_one_data_item_under_flood ... OD45 flood=shutdown round=0 full=true flowing=200 bound=1
+OD45 flood=shutdown round=1 full=true flowing=200 bound=1
+OD45 flood=shutdown round=2 full=true flowing=200 bound=1
+OD45 flood=shutdown round=3 full=true flowing=200 bound=1
+OD45 flood=shutdown round=4 full=true flowing=200 bound=1
+OD45 flood=shutdown round=5 full=true flowing=200 bound=1
+OD45 flood=shutdown round=6 full=true flowing=200 bound=1
+OD45 flood=shutdown round=7 full=true flowing=200 bound=1
+OD45 flood=shutdown round=8 full=true flowing=200 bound=1
+OD45 flood=shutdown round=9 full=true flowing=200 bound=1
+OD45 flood=shutdown round=10 full=true flowing=200 bound=1
+OD45 flood=shutdown round=11 full=true flowing=200 bound=1
+OD45 flood=shutdown round=12 full=true flowing=200 bound=1
+OD45 flood=shutdown round=13 full=true flowing=200 bound=1
+OD45 flood=shutdown round=14 full=true flowing=200 bound=1
+OD45 flood=shutdown round=15 full=true flowing=200 bound=1
+OD45 flood=shutdown round=16 full=true flowing=200 bound=1
+OD45 flood=shutdown round=17 full=true flowing=200 bound=1
+OD45 flood=shutdown round=18 full=true flowing=200 bound=1
+OD45 flood=shutdown round=19 full=true flowing=200 bound=1
+ok
+test shutdown_receipt_follows_queued_rx_capture_and_wal ...
+thread 'shutdown_receipt_follows_queued_rx_capture_and_wal' (281416) panicked at crates/sw-core/tests/drain_release_e2e.rs:247:5:
+reader watermark dispatch 必須先於 receipt；後續 test data 可留在 lane: ProbeEntry { label: "WorkerStopped", data_while_waiting: 0, data_backlog: 129, pre_dependency_data: 0 }
+FAILED
+
+failures:
+
+failures:
+    new_bridge_receipt_ignores_old_epoch_rx_progress
+    release_receipt_follows_queued_rx_capture_and_wal
+    shutdown_receipt_follows_queued_rx_capture_and_wal
+
+test result: FAILED. 4 passed; 3 failed; 0 ignored; 0 measured; 8 filtered out; finished in 1.00s
+
+error: test failed, to rerun pass `-p sw-core --test drain_release_e2e`

@@ -96,7 +96,7 @@ values:
     detail: "null（無附帶 detail）"
     terminal: false
     auto_reprobe: {attached: false, detached: false}
-    states: ["DETACHED"]
+    states: ["DETACHED", "ATTACHING", "RECOVERING"]  # RECOVERING：drain Phase 1（_begin_drain_locked）等回條期間
     set_by: ["sw_core/session_manager.py:1841 (clear_session)"]
     cleared_by: ["auto:裝置在線立即清除@session_manager.py:1846", "auto:裝置事件觸發之 attach 開頭清除@session_manager.py:2602", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:daemon restart"]
     promoted_via: []
@@ -453,7 +453,7 @@ values:
     detail: "null（無附帶 detail）"
     terminal: false
     auto_reprobe: {attached: false, detached: false}
-    states: ["DETACHED"]
+    states: ["DETACHED", "RECOVERING"]  # RECOVERING：drain Phase 1（_begin_drain_locked）等回條期間
     set_by: ["sw_core/session_manager.py:2063 (bind_session)"]
     cleared_by: ["operator:session.bind", "auto:裝置事件觸發之 attach 開頭清除@session_manager.py:2602", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:daemon restart"]
     promoted_via: []
@@ -504,7 +504,7 @@ values:
     detail: "null（無附帶 detail）"
     terminal: true
     auto_reprobe: {attached: false, detached: false}
-    states: ["RELEASED", "DETACHED"]  # DETACHED：裝置離線時 _mark_missing_devices_locked（sw_core/session_manager.py:2240）改為 DETACHED，last_error 保留 RELEASED
+    states: ["RELEASED", "DETACHED", "RECOVERING"]  # RECOVERING：drain Phase 1（_begin_drain_locked）等回條期間；DETACHED：裝置離線時 _mark_missing_devices_locked（sw_core/session_manager.py:2240）改為 DETACHED，last_error 保留 RELEASED
     set_by: ["sw_core/session_manager.py:1866 (release_device)"]
     cleared_by: ["operator:device.attach", "operator:session.bind", "operator:daemon restart"]
     promoted_via: []

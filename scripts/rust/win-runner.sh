@@ -22,6 +22,14 @@ fi
 
 exe_source="$1"
 shift
+exe_name="$(basename "$exe_source")"
+list_only=0
+for arg in "$@"; do
+  if [[ "$arg" == "--list" ]]; then
+    list_only=1
+    break
+  fi
+done
 if [[ ! -f "$exe_source" ]]; then
   echo "win-runner.sh: Windows executable 不存在：$exe_source" >&2
   exit 2
@@ -40,14 +48,16 @@ local_appdata_unix="$(wslpath -u "$local_appdata" 2>/dev/null)" || {
 run_id="$(date +%y%m%d-%H%M%S)-$$"
 staging="$local_appdata_unix/Temp/sw-rust-test/$run_id"
 mkdir -p "$staging/tmp" "$staging/data"
-# drvfs 以 `case=dir` 掛載時，WSL 建立的目錄會被設為「逐目錄區分大小寫」，其下由 Windows
-# 程式新建的子目錄也會繼承；測試在 TMP 下建立的檔案因而失去 Windows 原生的不分大小寫語意
-# （例如 PATHEXT 的 `.EXE` 查不到 `.exe`）。staging/tmp 仍為空時即關閉該屬性，失敗則中止
-# （不得在非原生語意下產生 Windows 證據）。
-if ! fsutil.exe file setCaseSensitiveInfo "$(wslpath -w "$staging/tmp")" disable >/dev/null 2>&1; then
-  echo "win-runner.sh: 無法關閉 staging TMP 的逐目錄大小寫區分（fsutil setCaseSensitiveInfo）；證據不足" >&2
-  rm -rf -- "$staging"
-  exit 2
+if [[ "$list_only" == "0" ]]; then
+  # drvfs 以 `case=dir` 掛載時，WSL 建立的目錄會被設為「逐目錄區分大小寫」，其下由 Windows
+  # 程式新建的子目錄也會繼承；測試在 TMP 下建立的檔案因而失去 Windows 原生的不分大小寫語意
+  # （例如 PATHEXT 的 `.EXE` 查不到 `.exe`）。staging/tmp 仍為空時即關閉該屬性，失敗則中止
+  # （不得在非原生語意下產生 Windows 證據）。
+  if ! fsutil.exe file setCaseSensitiveInfo "$(wslpath -w "$staging/tmp")" disable >/dev/null 2>&1; then
+    echo "win-runner.sh: 無法關閉 staging TMP 的逐目錄大小寫區分（fsutil setCaseSensitiveInfo）；證據不足" >&2
+    rm -rf -- "$staging"
+    exit 2
+  fi
 fi
 keep_staging="${SW_WIN_KEEP:-0}"
 print_staging="${SW_WIN_PRINT_STAGING:-0}"
@@ -68,7 +78,6 @@ cleanup() {
   exit "$rc"
 }
 trap cleanup EXIT
-exe_name="$(basename "$exe_source")"
 cp -- "$exe_source" "$staging/$exe_name"
 chmod +x "$staging/$exe_name"
 
@@ -84,27 +93,39 @@ copy_data() {
   cp -R -- "$source" "$staging/data/$rel"
 }
 
-for rel in \
-  contracts/golden \
-  contracts/cli_help \
-  contracts/error_codes.yaml \
-  contracts/session_last_errors.yaml \
-  contracts/cli_schema.json \
-  contracts/rpc_schema.json \
-  contracts/release_manifest.schema.json \
-  tests/contract_blackbox/data \
-  crates/sw-cli/tests/golden \
-  crates/sw-cli/src \
-  sw_core/constants.py \
-  sw_core/assets/skill \
-  sw_core/assets/profiles \
-  sw_core/assets/tools \
-  VERSION; do
-  copy_data "$rel"
-done
+if [[ "$list_only" == "0" ]]; then
+  for rel in \
+    contracts/golden \
+    contracts/cli_help \
+    contracts/error_codes.yaml \
+    contracts/session_last_errors.yaml \
+    contracts/wal_meta_events.schema.json \
+    contracts/cli_schema.json \
+    contracts/rpc_schema.json \
+    contracts/release_manifest.schema.json \
+    tests/acceptance/slice21_scope.yaml \
+    tests/contract_blackbox/data \
+    crates/sw-cli/tests/golden \
+    crates/sw-cli/src \
+    sw_core/constants.py \
+    sw_core/assets/skill \
+    sw_core/assets/profiles \
+    sw_core/assets/tools \
+    VERSION; do
+    copy_data "$rel"
+  done
+fi
 
-if [[ -n "${SW_WIN_EXTRA_FILES:-}" ]]; then
-  IFS=: read -r -a extra_files <<< "$SW_WIN_EXTRA_FILES"
+extra_files_raw="${SW_WIN_EXTRA_FILES:-}"
+if [[ "$list_only" == "0" && "$exe_name" == lock-* && -n "${SW_WIN_SIGNAL_FILES:-}" ]]; then
+  # signal_wait_harness 只供 sw-pal lock 測試的獨立子行程使用，避免複製到每個 Windows target。
+  extra_files_raw="${extra_files_raw:+$extra_files_raw:}$SW_WIN_SIGNAL_FILES"
+fi
+if [[ "$list_only" == "0" && "$exe_name" == handoff_stop-* && -n "${SW_WIN_HANDOFF_FILES:-}" ]]; then
+  extra_files_raw="${extra_files_raw:+$extra_files_raw:}$SW_WIN_HANDOFF_FILES"
+fi
+if [[ "$list_only" == "0" && -n "$extra_files_raw" ]]; then
+  IFS=: read -r -a extra_files <<< "$extra_files_raw"
   for source in "${extra_files[@]}"; do
     [[ -n "$source" ]] || continue
     if [[ ! -e "$source" ]]; then
@@ -112,7 +133,11 @@ if [[ -n "${SW_WIN_EXTRA_FILES:-}" ]]; then
       rm -rf -- "$staging"
       exit 2
     fi
-    cp -R -- "$source" "$staging/"
+    if ! cp -RL -- "$source" "$staging/"; then
+      echo "win-runner.sh: Windows 測試資料 staging 失敗：$source" >&2
+      rm -rf -- "$staging"
+      exit 2
+    fi
   done
 fi
 
@@ -144,7 +169,8 @@ append_wsl_env() {
   wsl_env="${wsl_env//::/:}"
 }
 
-for name in SW_TEST_CAPS SW_TEST_COM_PAIR SW_TEST_SEED SW_TEST_SERIALWRAPD RUST_BACKTRACE RUST_TEST_THREADS; do
+# SW_TEST_ALLOW_SCHTASKS：P8 Task 13 擁有者授權旗標（建立暫時排程工作 sw-p8-test-<pid>），只轉送、不預設。
+for name in SW_TEST_CAPS SW_TEST_COM_PAIR SW_TEST_CONSOLE_PAIR SW_TEST_SEED SW_TEST_SERIALWRAPD SW_TEST_ALLOW_SCHTASKS RUST_BACKTRACE RUST_TEST_THREADS; do
   [[ -v "$name" ]] && append_wsl_env "${name}"
 done
 while IFS= read -r name; do

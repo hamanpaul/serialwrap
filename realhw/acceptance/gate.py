@@ -191,6 +191,9 @@ def _zero_bucket() -> dict[str, Any]:
 def _tally(events: list[dict[str, Any]], counting: dict[str, Any]) -> dict[str, Any]:
     reject_kinds = set(counting["expected_reject_kinds"])
     reject_codes = set(counting["expected_reject_error_codes"])
+    reject_codes_by_mode = {
+        mode: set(codes) for mode, codes in counting.get("expected_reject_by_mode", {}).items()
+    }
     counts: dict[str, dict[str, Any]] = {}
     completed_t: dict[str, list[float]] = {}
     pairs: dict[tuple[Any, Any], dict[str, Any]] = {}
@@ -209,6 +212,8 @@ def _tally(events: list[dict[str, Any]], counting: dict[str, Any]) -> dict[str, 
 
     for event in events:
         kind = event.get("kind")
+        mode = event.get("mode")
+        mode_reject_codes = reject_codes_by_mode.get(mode, set()) if isinstance(mode, str) else set()
         source = event.get("source")
         com = event.get("com")
         round_ = event.get("round")
@@ -257,8 +262,11 @@ def _tally(events: list[dict[str, Any]], counting: dict[str, Any]) -> dict[str, 
             else:
                 bucket(key)["failed"] += 1
                 bucket(key)["unexpected_errors"] += 1
-        elif kind in reject_kinds or (kind == "error" and (event.get("error_code") in reject_codes
-                                                           or event.get("detail") in reject_codes)):
+        elif kind in reject_kinds or (kind == "error" and (
+                event.get("error_code") in reject_codes
+                or event.get("detail") in reject_codes
+                or event.get("error_code") in mode_reject_codes
+                or event.get("detail") in mode_reject_codes)):
             if key is None:
                 continue
             pair = close(pair_id, "expected_reject") if pair_id is not None else None

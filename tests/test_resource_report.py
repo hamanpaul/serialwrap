@@ -133,6 +133,43 @@ def test_windows_collection_excludes_posix_modules(tmp_path: Path) -> None:
     assert report_file.exists(), f"SW_RESOURCE_REPORT not written: {report_file}"
     data = json.loads(report_file.read_text(encoding="utf-8"))
     assert "tests/test_multiagent_e2e.py" in data.get("not_collected_platform", [])
+    provenance = data.get("provenance", {})
+    assert provenance.get("schema") == "pytest-l1-provenance.v1"
+    assert provenance.get("platform") == "windows"
+    git = provenance.get("git", {})
+    assert isinstance(git.get("head"), str) and len(git["head"]) == 40
+    assert git.get("end", {}).get("head") == git["head"]
+    assert type(git.get("clean")) is bool
+    assert type(git.get("end", {}).get("clean")) is bool
+
+
+@pytest.mark.process_rpc
+def test_windows_git_snapshot_excludes_only_report_outputs(tmp_path: Path) -> None:
+    """Windows pytest provenance 記錄 Git HEAD／dirty，並只排除實際產出的報告檔。"""
+    import tests.resource_report_plugin as plugin
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "tests@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "pytest"], check=True)
+    tracked = repo / "tracked.txt"
+    tracked.write_text("baseline\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "baseline"], check=True)
+
+    report = repo / "resource-report.json"
+    junit = repo / "junit.xml"
+    report.write_text("report\n", encoding="utf-8")
+    junit.write_text("junit\n", encoding="utf-8")
+    clean = plugin._windows_git_snapshot(repo, [report, junit])
+    assert clean["clean"] is True
+    assert len(clean["head"]) == 40
+
+    tracked.write_text("modified\n", encoding="utf-8")
+    dirty = plugin._windows_git_snapshot(repo, [report, junit])
+    assert dirty["head"] == clean["head"]
+    assert dirty["clean"] is False
 
 
 @pytest.mark.process_rpc
@@ -427,7 +464,7 @@ def test_resource_report_cli_without_daemon_env_unmeasured(tmp_path: Path) -> No
 def test_windows_com_never_counted_without_device(tmp_path: Path) -> None:
     """無 SW_TEST_COM_PAIR 時，windows_com 項目不得計為 passed（P0 T14 第 6 條；§11.2 不以模擬代替 windows_com）。
 
-    P2-T13 審查修正：原測試只餵空清單（空轉）。現況 tests/ 有四個檔使用 windows_com（已知清單鎖定，新增者須審閱），
+    P2-T13 審查修正：原測試只餵空清單（空轉）。現況 tests/ 有七個檔使用 windows_com（已知清單鎖定，新增者須審閱），
     本測試實際以缺 device 的環境執行它們，斷言 resources.windows_com.passed == 0 且至少有一個 skipped。
     （計畫 Task 13 寫「本 Stage 無 windows_com 的 tests/ item」與現況不符，差異已於 PR 說明記錄。）
     """
@@ -437,9 +474,19 @@ def test_windows_com_never_counted_without_device(tmp_path: Path) -> None:
     # sw_core.serial_port.open_serial_port 於 SW_TEST_COM_PAIR 指定的真實 COM 上以 pyserial 後端開啟
     # （非 socket、非記憶體替身；唯一 monkeypatch 為寫入逾時常數），缺 device 時 skip，符合 windows_com 定義。
     known = {
+        # 此模組的 Windows 原生 daemon 管理案例使用 SW_TEST_COM_PAIR 指定的 COM 後端；缺 pair 時案例會 skip。
         "tests/contract_blackbox/test_cli_mgmt_daemon.py",
+        # slice22 fixture 以 Windows serial backend 開 COM20；Telnet console 本身走 loopback TCP，無 DUT pair 會 skip。
+        "tests/contract_blackbox/slice22/test_console_telnet.py",
+        # slice22 fixture 以 Windows serial backend 開 COM20；interactive lease 的 DUT I/O 依賴該 pair，無 pair 會 skip。
+        "tests/contract_blackbox/slice22/test_interactive_lease.py",
+        # P8 Task 11：真實 CreateFileW 獨占 COM20；無原生 Windows／com0com pair 會 SKIP，不計為 passed。
+        "tests/contract_blackbox/test_s24_device_handoff_windows.py",
+        # 以 PySerial 在 SW_TEST_COM_PAIR 指定的 COM 上驗證 drain stall；無 pair 時不算 windows_com PASS。
         "tests/test_p1oc_drain_stalled.py",
+        # spike1 裝置保護案例會以真實 COM 驗證跨 process holder；無 pair 時 skip。
         "tests/test_spike1_remaining.py",
+        # Stage 0 UART exclusive 案例開啟並檢查 SW_TEST_COM_PAIR 的 Windows COM handle。
         "tests/test_stage0_uart_exclusive.py",
     }
     users: set[str] = set()
@@ -1072,6 +1119,47 @@ def test_resource_report_argv_under_pytest_main(tmp_path: Path) -> None:
     assert data["argv"][1:] == ["-q", str(sub)], data["argv"]
 
 
+@pytest.mark.process_rpc
+def test_windows_resource_report_records_git_provenance(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """原生 Windows pytest L1 記錄候選 HEAD 起訖及工作樹潔淨狀態。"""
+    from types import SimpleNamespace
+    import tests.resource_report_plugin as plugin
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    tracked = repo / "tracked.txt"
+    tracked.write_text("baseline\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "test fixture"], check=True)
+    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+    report_path = repo / "resource-report.json"
+    junit_path = repo / "junit.xml"
+    monkeypatch.setenv("SW_RESOURCE_REPORT", str(report_path))
+    monkeypatch.setattr(plugin.rr, "effective_platform", lambda: "windows")
+    config = SimpleNamespace(
+        rootpath=repo,
+        option=SimpleNamespace(markexpr="windows_native and windows_com", xmlpath=str(junit_path)),
+        invocation_params=SimpleNamespace(args=["-q", "tests/test_native.py::test_native"]),
+    )
+    session = SimpleNamespace(config=config, exitstatus=0)
+
+    plugin.pytest_sessionstart(session)
+    junit_path.write_text("generated junit output\n", encoding="utf-8")
+    plugin.pytest_sessionfinish(session, 0)
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["provenance"] == {
+        "schema": "pytest-l1-provenance.v1",
+        "platform": "windows",
+        "git": {"head": head, "clean": True, "end": {"head": head, "clean": True}},
+    }
+
+
 @pytest.mark.memory_only
 def test_summarize_counts_every_resource_marker() -> None:
     """summarize 對多資源列逐一計數，平台總數只計一次。"""
@@ -1101,8 +1189,10 @@ def test_workflow_ci_l1_gates() -> None:
     assert len(lock_steps) == 1, "pytest job 須含 regen_lock --check --base 步驟"
     assert "pull_request" in str(lock_steps[0].get("if", ""))
     lock_command = str(lock_steps[0].get("run", ""))
-    # OD-16／OD-17 逐名核准，加上 OD-23（2026-10-27）補授權的 36 個既有移除三元組與 OD-24 的 5 筆 #[ignore] 列
+    # OD-16／OD-17 逐名核准，加上 OD-23（2026-10-27）補授權的 36 個既有移除三元組、OD-24 的 5 筆 #[ignore] 列與 OD-68 三筆 Linux 列
     # （docs/rust-refactor/reviews/s1x-unauthorized-removals.md）；順序與 tests.yml 完全一致。
+    # OD-56（rulings/p7.md P7-BO-1）僅核准 s21_core.linux 兩個舊 nodeid，由替換測試承擔。
+    # OD-95 與編排者 2026-11-16 補記逐名核准 F2/F3 的 17 個 Windows nodeid。
     allowed_removals = (
         "s0_win_pytest:windows:tests/test_cli_stderr_full_error.py::TestRunRpcStderrKeepsMessage::test_socket_error_stderr_includes_error_code_and_message",
         "s0_win_pytest:windows:tests/test_contracts_catalog.py::test_ec_passthrough_single_meta_entry",
@@ -1654,6 +1744,28 @@ def test_workflow_ci_l1_gates() -> None:
         "s1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_grandchild_entry",
         "s1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_launcher_entry",
         "s1b_cargo:windows:cargo:sw-pal::service_ctl::cap_supervisor_runtime__windows_task_roundtrip",
+        "s21_gate:cap_windows_native:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem",
+        "s21_gate:cap_windows_native:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child",
+        "s21_gate:cap_interactive_desktop:linux:cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c",
+        "s21_core:linux:cargo:sw-core::login_quiet::unsupported_profile_no_auto_tx",
+        "s21_core:linux:cargo:sw-core::session_manager::detect_skips_passthrough_console_unlock_and_unsupported",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::daemon_stop_during_force_recover_with_client_gone",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::daemon_stop_from_second_connection_during_force_recover",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::real_sigterm_to_started_daemon_exits_0_after_flush",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::shutdown_releases_tty_before_exit",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::wal_dir_readonly_at_start_blocks_login_probe",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::wal_fault_after_ready_splits_agent_and_auto_tx",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::non_root_holder_scan_permission_does_not_block_open",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::release_kill_hook_env_isolated_only",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::release_pause_hook_env_isolated_only",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::sigterm_sigint_orderly_stop",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::unwritable_state_dir_startup_save_exits_1_before_attach",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::endpoint_written_after_bind",
+        "s21_core:windows:cargo:sw-daemon::restart_after_commit::kill_before_commit_restores_previous_state",
+        "s21_core:windows:cargo:sw-daemon::restart_after_commit::kill_between_commit_and_reply_keeps_released_after_restart",
+        "s21_core:windows:cargo:sw-daemon::handoff_stop::handoff_drain_window_background_triggers_zero_tx",
+        "s21_core:windows:cargo:sw-daemon::handoff_stop::handoff_then_successor_never_double_held",
+        "s21_core:windows:cargo:sw-daemon::shutdown_order::second_sigterm_real_signal_exits_0",
     )
     for nodeid in allowed_removals:
         assert nodeid in lock_command, f"L1 擁有者裁決清單缺少 {nodeid}"
@@ -1728,3 +1840,54 @@ def test_od24_ignored_removal_triples_are_approved_in_ci() -> None:
     addenda = Path("docs/rust-refactor/owner-decisions-addenda.md").read_text(encoding="utf-8")
     pending = next(line for line in addenda.splitlines() if line.startswith("| PENDING-OD-S1X-L1-IGNORED-READD |"))
     assert "RESOLVED（OD-24" in pending
+
+
+@pytest.mark.memory_only
+def test_od68_removal_triples_are_approved_in_ci() -> None:
+    """OD-68／OD-95：核准的 L1 移除三元組須逐名列入 CI 參數。"""
+    triples = (
+        "s21_gate:cap_windows_native:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem",
+        "s21_gate:cap_windows_native:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child",
+        "s21_gate:cap_interactive_desktop:linux:cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c",
+    )
+    workflow_text = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
+    wf = yaml.safe_load(workflow_text)
+    lock_steps = [
+        st for st in wf["jobs"]["pytest"]["steps"]
+        if "regen_lock.py --check --base" in str(st.get("run", ""))
+    ]
+    assert len(lock_steps) == 1
+    tokens = shlex.split(str(lock_steps[0]["run"]))
+    allowed = tokens[tokens.index("--allow-removal") + 1:]
+    missing = [triple for triple in triples if triple not in allowed]
+    assert not missing, missing
+    od95 = (
+        "s21_core:windows:cargo:sw-daemon::daemon_process::daemon_stop_during_force_recover_with_client_gone",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::daemon_stop_from_second_connection_during_force_recover",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::real_sigterm_to_started_daemon_exits_0_after_flush",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::shutdown_releases_tty_before_exit",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::wal_dir_readonly_at_start_blocks_login_probe",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::wal_fault_after_ready_splits_agent_and_auto_tx",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::non_root_holder_scan_permission_does_not_block_open",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::release_kill_hook_env_isolated_only",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::release_pause_hook_env_isolated_only",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::sigterm_sigint_orderly_stop",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::unwritable_state_dir_startup_save_exits_1_before_attach",
+        "s21_core:windows:cargo:sw-daemon::daemon_process::endpoint_written_after_bind",
+        "s21_core:windows:cargo:sw-daemon::restart_after_commit::kill_before_commit_restores_previous_state",
+        "s21_core:windows:cargo:sw-daemon::restart_after_commit::kill_between_commit_and_reply_keeps_released_after_restart",
+        "s21_core:windows:cargo:sw-daemon::handoff_stop::handoff_drain_window_background_triggers_zero_tx",
+        "s21_core:windows:cargo:sw-daemon::handoff_stop::handoff_then_successor_never_double_held",
+        "s21_core:windows:cargo:sw-daemon::shutdown_order::second_sigterm_real_signal_exits_0",
+    )
+    assert "OD-95（2026-11-15）" in workflow_text
+    assert not [triple for triple in od95 if triple not in allowed]
+    sets = json.loads(Path("tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))["sets"]
+    # OD-55（Windows 原生收集後）：承擔列自 s21_core.windows 移入同能力的 windows 能力集合（selector `--ignored cap_<cap>__`）。
+    carried = {
+        "cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem": "s21_gate:cap_windows_native",
+        "cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child": "s21_gate:cap_windows_native",
+        "cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c": "s21_gate:cap_interactive_desktop",
+    }
+    assert not [nodeid for nodeid, set_id in carried.items()
+                if nodeid not in sets.get(set_id, {}).get("windows", {}).get("nodeids", [])]

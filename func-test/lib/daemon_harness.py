@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import yaml
 
@@ -206,8 +206,12 @@ class DaemonHarness:
             raise RuntimeError("bridge session 尚未建立")
         self.bridge.start()
 
-    def start(self) -> None:
-        """建立 case 根目錄，啟動 target/bridge，再啟動隔離 daemon。"""
+    def start(self, before_daemon: Callable[[], None] | None = None) -> None:
+        """建立 case 根目錄，啟動 target/bridge，再啟動隔離 daemon。
+
+        ``before_daemon``（OD-39）：DUT／bridge 就緒、profile 寫好之後、daemon 行程啟動之前呼叫
+        （情境 ``pre_daemon_steps``，例如 daemon 啟動前外部占用端點、自 daemon 啟動前起算零 TX 窗口）。
+        """
         if self._started:
             return
         self.bridge_stop_result = None
@@ -263,6 +267,14 @@ class DaemonHarness:
 
             if self.config.mode == "bridge":
                 self._start_bridge()
+            if before_daemon is not None:
+                if self.bridge is not None:
+                    self.bridge.daemon_started = False
+                try:
+                    before_daemon()
+                finally:
+                    if self.bridge is not None:
+                        self.bridge.daemon_started = True
 
             daemon_argv = resolve_daemon_argv()
             argv = [

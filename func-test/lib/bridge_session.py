@@ -213,7 +213,12 @@ class BridgeSession:
             raise StepError("bridge control client 尚未就緒")
         return self._control_client.call(action, params)
 
+    # OD-39：daemon 啟動前（pre_daemon_steps）WAL 尚未建立，邊界即 seq 0（之後所有紀錄都在窗口內）。
+    daemon_started: bool = True
+
     def _wal_current_seq(self) -> int:
+        if not self.daemon_started:
+            return 0
         if not self.rpc_endpoint:
             raise StepError("bridge settle 缺少 daemon RPC endpoint")
         from .cli_client import cli_run

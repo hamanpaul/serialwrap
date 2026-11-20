@@ -1,0 +1,53 @@
+{"fn":"hex_to_bytes","in":"5555","out":"55 55"}
+{"fn":"hex_to_bytes","in":"55 55","out":"55 55"}
+{"fn":"hex_to_bytes","in":"0x55 0x55","out":"55 55"}
+{"fn":"hex_to_bytes","in":"0X55","out":{"error":"ValueError"}}
+{"fn":"hex_to_bytes","in":"55\t55","out":"55 55"}
+{"fn":"hex_to_bytes","in":"5","out":{"error":"ValueError"}}
+{"fn":"hex_to_bytes","in":"zz","out":{"error":"ValueError"}}
+{"fn":"hex_to_bytes","in":"","out":""}
+{"fn":"hex_to_bytes","in":"00cc","out":"00 cc"}
+{"fn":"hex_to_bytes","in":"0x0x55","out":"55"}
+{"fn":"hex_to_bytes","in":"55\n55","out":"55 55"}
+{"fn":"hex_to_bytes","in":"5 5","out":"55"}
+{"fn":"hex_to_bytes","in":"\t55","out":"55"}
+{"fn":"hex_to_bytes","in":"55\t","out":"55"}
+{"fn":"hex_to_bytes","in":"０５","out":{"error":"ValueError"}}
+{"fn":"hex_to_bytes","in":"0x","out":""}
+{"fn":"hex_to_bytes","in":"x55","out":{"error":"ValueError"}}
+{"fn":"hex_to_bytes","in":"55\r\n66","out":"55 66"}
+{"fn":"from_dict","in":{"family":"f","probe":"5555","expect":"00cc","non_destructive":true},"out":"f|55 55|00 cc|115200|500"}
+{"fn":"from_dict","in":{"family":"f","probe":"55 55","expect":"0x00 0xcc","baud":9600,"timeout_ms":1500,"non_destructive":true},"out":"f|55 55|00 cc|9600|1500"}
+{"fn":"from_dict","in":{"family":"f","probe":"5555","expect":"00cc","non_destructive":true,"baud":"9600"},"out":"f|55 55|00 cc|9600|500"}
+{"fn":"from_dict","in":{"family":"f","probe":"5555","expect":"00cc","non_destructive":true,"baud":"x"},"out":{"error":"ValueError"}}
+{"fn":"from_dict","in":{"family":"f","probe":"5555","expect":"00cc","non_destructive":true,"baud":9600.7},"out":"f|55 55|00 cc|9600|500"}
+{"fn":"from_dict","in":{"family":"f","probe":"5555","expect":"00cc","non_destructive":true,"baud":true},"out":"f|55 55|00 cc|1|500"}
+{"fn":"from_dict","in":{"family":"f","probe":"5555","expect":"00cc","non_destructive":true,"baud":null},"out":{"error":"TypeError"}}
+{"fn":"from_dict","in":{"family":"f","probe":"5555","expect":"00cc","non_destructive":true,"timeout_ms":0},"out":"f|55 55|00 cc|115200|0"}
+{"fn":"from_dict","in":{"family":"f","probe":"5555","expect":"00cc","non_destructive":true,"timeout_ms":"abc"},"out":{"error":"ValueError"}}
+{"fn":"from_dict","in":{"family":"f","probe":"5555","expect":"00cc"},"out":{"error":"ValueError"}}
+{"fn":"from_dict","in":{"family":"f","probe":"5555","expect":"00cc","non_destructive":"false"},"out":"f|55 55|00 cc|115200|500"}
+{"fn":"from_dict","in":{"family":"f","probe":"5555","expect":"00cc","non_destructive":0},"out":{"error":"ValueError"}}
+{"fn":"from_dict","in":{"family":"f","probe":"5555","expect":"00cc","non_destructive":""},"out":{"error":"ValueError"}}
+{"fn":"from_dict","in":{"family":"f","probe":"5555","expect":"00cc","non_destructive":false},"out":{"error":"ValueError"}}
+{"fn":"from_dict","in":{"probe":"5555","expect":"00cc","non_destructive":true},"out":{"error":"KeyError"}}
+{"fn":"from_dict","in":{"family":123,"probe":"5555","expect":"00cc","non_destructive":true},"out":"123|55 55|00 cc|115200|500"}
+{"fn":"from_dict","in":{"family":true,"probe":"5555","expect":"00cc","non_destructive":true},"out":"True|55 55|00 cc|115200|500"}
+{"fn":"from_dict","in":{"family":"f","probe":5555,"expect":"00cc","non_destructive":true},"out":"f|55 55|00 cc|115200|500"}
+{"fn":"from_dict","in":{"family":"f","probe":null,"expect":"00cc","non_destructive":true},"out":{"error":"ValueError"}}
+{"fn":"from_dict","in":{"family":"f","probe":["55"],"expect":"00cc","non_destructive":true},"out":{"error":"ValueError"}}
+{"fn":"from_dict","in":{"family":"f","probe":"5","expect":"00cc","non_destructive":true},"out":{"error":"ValueError"}}
+{"fn":"from_dict","in":{"family":"f","probe":"5555","non_destructive":true},"out":{"error":"KeyError"}}
+{"fn":"from_dict","in":{"probe":"zz","non_destructive":false},"out":{"error":"KeyError"}}
+{"fn":"from_dict","in":{"family":"f","probe":"zz","expect":"00","baud":null,"non_destructive":true},"out":{"error":"ValueError"}}
+{"fn":"from_dict","in":{"family":"f","probe":"55","expect":"00","baud":null},"out":{"error":"TypeError"}}
+{"fn":"load","in":null,"out":"ti-cc26xx|55 55|00 cc|115200|500"}
+{"fn":"load","in":[],"out":"ti-cc26xx|55 55|00 cc|115200|500"}
+{"fn":"load","in":[{"family":"ti-cc26xx","probe":"5555","expect":"00cc","baud":9600,"non_destructive":true}],"out":"ti-cc26xx|55 55|00 cc|9600|500"}
+{"fn":"load","in":[{"family":"x-new","probe":"aa","expect":"bb","baud":57600,"non_destructive":true}],"out":"ti-cc26xx|55 55|00 cc|115200|500,x-new|aa|bb|57600|500"}
+{"fn":"load","in":[{"family":"x","probe":"aa","expect":"bb","non_destructive":true},{"family":"x","probe":"cc","expect":"dd","baud":1,"timeout_ms":9,"non_destructive":true}],"out":"ti-cc26xx|55 55|00 cc|115200|500,x|cc|dd|1|9"}
+{"fn":"load","in":[{"family":"x","probe":"aa","expect":"bb","non_destructive":false}],"out":{"error":"ValueError"}}
+{"fn":"load","in":[{"family":"y","probe":"zz","expect":"bb","non_destructive":true}],"out":{"error":"ValueError"}}
+{"fn":"load","in":[{"family":"ti-cc26xx","probe":"55","expect":"00","non_destructive":true},{"family":"a","probe":"01","expect":"02","non_destructive":true}],"out":"ti-cc26xx|55|00|115200|500,a|01|02|115200|500"}
+{"fn":"rpc","in":null,"out":[{"family":"ti-cc26xx","probe":"55 55","expect":"00 cc","baud":115200}]}
+{"fn":"rpc","in":[{"family":"x-new","probe":"0x0a","expect":"0b","baud":57600,"non_destructive":true}],"out":[{"family":"ti-cc26xx","probe":"55 55","expect":"00 cc","baud":115200},{"family":"x-new","probe":"0a","expect":"0b","baud":57600}]}

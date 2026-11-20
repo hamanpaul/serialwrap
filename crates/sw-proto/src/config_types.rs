@@ -4,7 +4,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::pycompat::{decode_utf8_strict, py_float_parse, py_int_parse, py_strip, PyOsError, UnicodeDecodeError};
+use crate::pycompat::{
+    decode_utf8_strict, py_float_parse, py_int_parse, py_strip, PyOsError, UnicodeDecodeError,
+};
 use crate::pyjson::PyInt;
 use crate::pypath::PathFlavor;
 use crate::yaml11::emit;
@@ -160,8 +162,14 @@ fn dec_str_sub_one(s: &str) -> String {
         }
         i -= 1;
     }
-    let start = digits.iter().position(|&d| d != 0).unwrap_or(digits.len() - 1);
-    digits[start..].iter().map(|&d| (b'0' + d) as char).collect()
+    let start = digits
+        .iter()
+        .position(|&d| d != 0)
+        .unwrap_or(digits.len() - 1);
+    digits[start..]
+        .iter()
+        .map(|&d| (b'0' + d) as char)
+        .collect()
 }
 
 fn as_int_val(v: Option<&YValue>, default: PyInt) -> PyInt {
@@ -327,11 +335,7 @@ fn as_unlock_idle(v: Option<&YValue>, default: f64) -> Result<f64, ConfigError> 
     }
 }
 
-fn resolve_opt_path(
-    v: Option<&YValue>,
-    base_dir: &str,
-    fs: &dyn ProfileFs,
-) -> Option<String> {
+fn resolve_opt_path(v: Option<&YValue>, base_dir: &str, fs: &dyn ProfileFs) -> Option<String> {
     let s = as_opt_str(v)?;
     let expanded = fs.expanduser(&s);
     let flavor = fs.flavor();
@@ -344,12 +348,18 @@ fn resolve_opt_path(
 }
 
 fn load_uart(raw: Option<&YValue>, default: Option<&UartProfile>) -> UartProfile {
-    let base_baud = default.map(|d| d.baud.clone()).unwrap_or(PyInt::Small(115200));
-    let base_data_bits = default.map(|d| d.data_bits.clone()).unwrap_or(PyInt::Small(8));
+    let base_baud = default
+        .map(|d| d.baud.clone())
+        .unwrap_or(PyInt::Small(115200));
+    let base_data_bits = default
+        .map(|d| d.data_bits.clone())
+        .unwrap_or(PyInt::Small(8));
     let base_parity = default
         .map(|d| d.parity.clone())
         .unwrap_or_else(|| "N".to_string());
-    let base_stop_bits = default.map(|d| d.stop_bits.clone()).unwrap_or(PyInt::Small(1));
+    let base_stop_bits = default
+        .map(|d| d.stop_bits.clone())
+        .unwrap_or(PyInt::Small(1));
     let base_flow_control = default
         .map(|d| d.flow_control.clone())
         .unwrap_or_else(|| "none".to_string());
@@ -516,7 +526,14 @@ fn load_templates(
     obj: &YMap,
     base_dir: &str,
     fs: &dyn ProfileFs,
-) -> Result<(BTreeMap<String, ProfileTemplate>, Vec<ProfileTemplate>, String), ConfigError> {
+) -> Result<
+    (
+        BTreeMap<String, ProfileTemplate>,
+        Vec<ProfileTemplate>,
+        String,
+    ),
+    ConfigError,
+> {
     let mut templates: BTreeMap<String, ProfileTemplate> = BTreeMap::new();
     let mut ordered: Vec<ProfileTemplate> = Vec::new();
 
@@ -948,5 +965,89 @@ fn upsert_str_key(map: &mut YMap, key: &str, value: &str) {
     {
         Some(slot) => slot.1 = value,
         None => map.0.push((YValue::Str(key.to_string()), value)),
+    }
+}
+
+impl RuntimeConfig {
+    /// `windows.exclude_coms` 讀取（Task 0c；Windows 裝置排除清單）。
+    pub fn windows_exclude_coms(&self) -> Vec<String> {
+        let Some(YValue::Map(windows)) = self.data.get_str("windows") else {
+            return Vec::new();
+        };
+        let Some(YValue::Seq(items)) = windows.get_str("exclude_coms") else {
+            return Vec::new();
+        };
+        let mut result = Vec::new();
+        for item in items {
+            let value = py_str_of(item);
+            if !result.contains(&value) {
+                result.push(value);
+            }
+        }
+        result
+    }
+    /// `windows.test_device_allowlist` 讀取（Task 0c；OD-11 allowlist，`Err(())` 表示型別不合法）。
+    pub fn windows_test_device_allowlist(&self) -> Result<Option<Vec<String>>, ()> {
+        let Some(YValue::Map(windows)) = self.data.get_str("windows") else {
+            return Ok(None);
+        };
+        let Some(value) = windows.get_str("test_device_allowlist") else {
+            return Ok(None);
+        };
+        let YValue::Seq(items) = value else {
+            return Err(());
+        };
+        let mut result = Vec::new();
+        for item in items {
+            let YValue::Str(item) = item else {
+                return Err(());
+            };
+            let item = py_strip(item).to_string();
+            if !item.is_empty() && !result.contains(&item) {
+                result.push(item);
+            }
+        }
+        Ok(Some(result))
+    }
+}
+
+/// P6 D-12：`windows.serial_console` 的一列（com0com Console-side pair）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SerialConsolePair {
+    pub console_port: String,
+    pub peer_port: String,
+}
+
+/// P6 D-12：DUT by_id → pair（依 YAML 順序）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SerialConsoleMap(pub indexmap::IndexMap<String, SerialConsolePair>);
+
+impl RuntimeConfig {
+    /// P6 D-12：`None`＝無此鍵；`Some(Err(()))`＝形狀不符（呼叫端寫 WARNING 並忽略整個鍵）。
+    pub fn windows_serial_console(&self) -> Option<Result<SerialConsoleMap, ()>> {
+        let Some(YValue::Map(windows)) = self.data.get_str("windows") else {
+            return None;
+        };
+        let value = windows.get_str("serial_console")?;
+        let YValue::Map(rows) = value else {
+            return Some(Err(()));
+        };
+        let text = |v: Option<&YValue>| match v {
+            Some(YValue::Str(s)) if !s.is_empty() => Ok(s.clone()),
+            _ => Err(()),
+        };
+        let mut out = indexmap::IndexMap::new();
+        for (key, row) in &rows.0 {
+            let (YValue::Str(by_id), YValue::Map(pair)) = (key, row) else {
+                return Some(Err(()));
+            };
+            let parsed = text(pair.get_str("console_port"))
+                .and_then(|c| text(pair.get_str("peer_port")).map(|p| (c, p)));
+            let Ok((console_port, peer_port)) = parsed else {
+                return Some(Err(()));
+            };
+            out.insert(by_id.clone(), SerialConsolePair { console_port, peer_port });
+        }
+        Some(Ok(SerialConsoleMap(out)))
     }
 }

@@ -266,6 +266,46 @@ fn windows_check_order() {
 }
 
 #[test]
+fn windows_stage2_bundle_does_not_require_pyserial_and_keeps_version_pairing() {
+    let t = TestEnv::windows()
+        .with_fake_registry(FakeRegistry::new(vec![], &[]))
+        .with_doctor_bundle("3.12.7");
+    let manifest_path = t.bundle_dir().join("release-manifest.json");
+    let manifest = std::fs::read_to_string(&manifest_path).expect("測試 manifest 應可讀");
+    let stage2 = manifest
+        .replace("\"stage\":\"1A\"", "\"stage\":\"rust-2\"")
+        .replace("\"implementation\":\"python\"", "\"implementation\":\"rust\"")
+        .replacen(
+            "\"state_schema\":\"python-state-v0\"",
+            "\"state_schema\":\"python-state-v0\",\"code_fingerprint\":\"abcdef012345\"",
+            1,
+        );
+    assert_ne!(stage2, manifest);
+    t.write_file(&manifest_path, stage2.as_bytes());
+
+    let endpoint = TestEnv::win_endpoint();
+    let health = format!(
+        r#"{{"ok":true,"pid":1234,"version":"{}","code_fingerprint":"abcdef012345"}}"#,
+        sw_cli::CLI_VERSION
+    );
+    let t = t
+        .with_rpc_ok(endpoint, "health.ping", r#"{"ok":true}"#)
+        .with_rpc_ok(endpoint, "health.status", &health);
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0, "{out}");
+    let doc = json(&out);
+    let names: Vec<String> = list(&doc, "checks")
+        .iter()
+        .map(|c| s(c.as_dict(), "check").to_string())
+        .collect();
+    assert!(names.contains(&"python".to_string()));
+    assert!(names.contains(&"pyyaml".to_string()));
+    assert!(!names.contains(&"pyserial".to_string()));
+    assert!(names.contains(&"version_pairing".to_string()));
+    assert!(b(find_check(&doc, "version_pairing"), "ok"));
+}
+
+#[test]
 fn s1m241_doctor_daemon_code_current_matrix() {
     for windows in [false, true] {
         let matching_ping = format!(r#"{{"ok":true,"code_fingerprint":"{DOCTOR_INSTALLED_FP}"}}"#);

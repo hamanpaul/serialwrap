@@ -1125,6 +1125,53 @@ fn locate_manifest_env_override_first() {
 }
 
 #[test]
+fn locate_manifest_dev_exe_does_not_adopt_unrelated_default_install() {
+    let t = TestEnv::windows();
+    let root = t.root();
+    let version_dir = PathBuf::from(format!("{}\\0.4.1", root.versions.display()));
+    write_bundle(&version_dir, "0.4.1");
+    let dev_exe = t.bundle_dir().join("bin").join("serialwrap.exe");
+    let mut dev_rig = custom_rig(
+        true,
+        &t.home(),
+        &[("SERIALWRAP_INSTALL_ROOT", &root.root.display().to_string())],
+        &dev_exe,
+        None,
+    );
+    let dev_ctx = dev_rig.ctx();
+    write_current(
+        &dev_ctx,
+        &root,
+        &CurrentRelease {
+            bundle_version: "0.4.1".to_string(),
+            dir: "versions\\0.4.1".to_string(),
+            previous: None,
+            backup_dir: None,
+            switched_at: "2026-11-15T00:00:00Z".to_string(),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(locate_manifest(&dev_ctx), Err(LayoutError::ManifestNotFound(_))),
+        "開發 exe 不得採用另一個安裝根的 current-release.json"
+    );
+    drop(dev_ctx);
+
+    let installed_exe = PathBuf::from(format!("{}\\serialwrap.exe", root.bin.display()));
+    let mut installed_rig = custom_rig(
+        true,
+        &t.home(),
+        &[("SERIALWRAP_INSTALL_ROOT", &root.root.display().to_string())],
+        &installed_exe,
+        None,
+    );
+    let installed_ctx = installed_rig.ctx();
+    let (_, manifest) = locate_manifest(&installed_ctx)
+        .expect("安裝入口仍須依 current-release.json 找 manifest");
+    assert_eq!(manifest.bundle_version, "0.4.1");
+}
+
+#[test]
 fn current_release_roundtrip_and_unknown_keys() {
     let t = TestEnv::posix();
     let mut rig = Rig::from_env(&t);

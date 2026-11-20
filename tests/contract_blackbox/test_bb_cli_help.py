@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -67,6 +68,20 @@ def test_platform_oracle_exists_and_boundary_values_are_native():
         assert case["native"] is True, f"{case_id} 的全域選項值不可當作委派群組"
 
 
+def _expected_rust_version_bytes(golden_stdout: str, fingerprint: str) -> bytes:
+    """只替換版本輸出中的指紋；其餘位元組仍必須符合 Python golden。"""
+    golden = golden_stdout.replace("\n", NL.decode()).encode("utf-8")
+    marker = b"(code dde486cbcbb5)"
+    assert golden.count(marker) == 1, f"Python version golden 指紋格式錯誤：{golden!r}"
+    return golden.replace(marker, f"(code {fingerprint})".encode("ascii"), 1)
+
+
+def _assert_rust_version_bytes(actual: bytes, golden_stdout: str, fingerprint: str) -> None:
+    assert re.fullmatch(r"[0-9a-f]{12}", fingerprint), f"manifest daemon 指紋格式錯誤：{fingerprint!r}"
+    expected = _expected_rust_version_bytes(golden_stdout, fingerprint)
+    assert actual == expected, f"Rust version 輸出除了 manifest 指紋以外必須逐位元組符合 Python golden：{actual!r} != {expected!r}"
+
+
 @pytest.mark.parametrize("case", list(_params()))
 def test_help_usage_error_bytes(env, case):
     c = json.loads(case.read_text(encoding="utf-8"))
@@ -78,6 +93,19 @@ def test_help_usage_error_bytes(env, case):
     r = run_cli(c["argv"], env=_env(env, c["columns"]))
     nl = NL.decode()
     argv = c["argv"]
+    if is_rust() and (argv == ["--version"] or argv == ["--version", "session"]):
+        from bb_harness import rust_daemon_code_fingerprint
+
+        manifest_fingerprint = rust_daemon_code_fingerprint()
+        _assert_rust_version_bytes(r.stdout, c["stdout"], manifest_fingerprint)
+        python_fingerprint = re.search(r"\(code ([0-9a-f]{12})\)", c["stdout"])
+        assert python_fingerprint is not None, f"Python version golden 缺少指紋：{c['stdout']!r}"
+        for wrong_fingerprint in {python_fingerprint.group(1), "0123456789ab"} - {manifest_fingerprint}:
+            wrong_output = _expected_rust_version_bytes(c["stdout"], wrong_fingerprint)
+            with pytest.raises(AssertionError, match="逐位元組"):
+                _assert_rust_version_bytes(wrong_output, c["stdout"], manifest_fingerprint)
+        assert (r.rc, r.stderr.decode()) == (c["rc"], c["stderr"].replace("\n", nl))
+        return
     if is_rust() and len(argv) == 2 and argv[0] in RUST_ONLY_HELP_GROUPS and argv[1] == "--help":
         golden = RUST_ONLY_HELP / f"{argv[0]}.{c['columns']}.txt"
         assert golden.is_file(), f"證據不足：缺少 Rust-only help golden {golden.relative_to(repo_root())}"

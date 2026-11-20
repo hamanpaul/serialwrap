@@ -1,0 +1,5 @@
+---
+type: fix
+scope: rust-refactor
+---
+Rust `OpRunner::run_command` 的 reboot 分流改為 `expect_reboot || guessed_reboot`，對齊 Python `session_manager.py` 的 `if expect_reboot or guessed_reboot`：帶 `expect_reboot:true` 的命令不論命令文字（如 `echo a && reboot`）、也不排除 passthrough，一律交給 reboot 分支；命令文字猜法仍只對非 passthrough 生效、未擴大。分流位於 completion pattern 與 `command_completion` META 之前，故旗標優先於 `completion_regex`：prompt 未在等待期限內回來時結算為 `EXPECT_REBOOT`（partial），不送 Ctrl-C／Ctrl-D、不依 completion regex 正常完成。無旗標的串接命令維持一般命令路徑。prompt 等待時間見 `242-wp53-reboot-prompt-wait.md`，actor 端 reboot quiet arming 見 `242-wp53-reboot-arming.md`。帶旗標的命令在 reboot 分流與命令 UART TX 之前先寫一筆 WAL META（`dir=META`、`source=system`、本命令 `cmd_id`、空 payload、`meta={"event":"command_expect_reboot","expect_reboot":true}`），對齊 Python `session_manager.py` 的 `if expect_reboot:` 稽核紀錄與 `contracts/wal_meta_events.schema.json` 的 `command_expect_reboot`：不分命令文字是否猜中、passthrough 也寫；旗標與 `completion_regex` 並用時只寫此 META、不寫 `command_completion`；無旗標命令不寫；被 submit-time 或 execute-time gate 拒絕的命令不寫。

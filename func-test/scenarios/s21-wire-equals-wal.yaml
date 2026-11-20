@@ -1,0 +1,215 @@
+---
+meta:
+  name: s21-wire-equals-wal
+  category: l15-scenario
+  severity: critical
+  description: "READY 後 20 筆命令逐筆到達終態；每埠、每 endpoint_generation 的 WAL TX bytes 等於 wire serial_read、wire serial_write 等於 WAL RX bytes（不比 chunk 邊界、seq、時間；Slice 2.1 Task 21，BC-01）"
+  scenario:
+    revision: "2026-10-27.1"
+    seed: 1021
+    capabilities: [posix_pty, process_rpc]
+    timeout_s: 120
+    invariants: [insufficient_evidence_not_pass]
+    behavior_changes: ["BC-01"]
+    expected: PASS
+    daemon_slice: "2.1"
+bridge: {applicable: true, only: true, compare: full}
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise: {enabled: false}
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+steps:
+  - action: wait_ready
+    timeout_s: 20
+  - action: op_begin
+    op_id: traffic
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_01"]
+    save_as: c01
+    expect: {ok: true}
+  - action: wait_cli_until
+    argv: ["cmd", "status", "--cmd-id", "{c01.cmd_id}"]
+    json_path: "command.status"
+    in: [done, error, canceled, interactive]
+    timeout_s: 20
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_02"]
+    save_as: c02
+    expect: {ok: true}
+  - action: wait_cli_until
+    argv: ["cmd", "status", "--cmd-id", "{c02.cmd_id}"]
+    json_path: "command.status"
+    in: [done, error, canceled, interactive]
+    timeout_s: 20
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_03"]
+    save_as: c03
+    expect: {ok: true}
+  - action: wait_cli_until
+    argv: ["cmd", "status", "--cmd-id", "{c03.cmd_id}"]
+    json_path: "command.status"
+    in: [done, error, canceled, interactive]
+    timeout_s: 20
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_04"]
+    save_as: c04
+    expect: {ok: true}
+  - action: wait_cli_until
+    argv: ["cmd", "status", "--cmd-id", "{c04.cmd_id}"]
+    json_path: "command.status"
+    in: [done, error, canceled, interactive]
+    timeout_s: 20
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_05"]
+    save_as: c05
+    expect: {ok: true}
+  - action: wait_cli_until
+    argv: ["cmd", "status", "--cmd-id", "{c05.cmd_id}"]
+    json_path: "command.status"
+    in: [done, error, canceled, interactive]
+    timeout_s: 20
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_06"]
+    save_as: c06
+    expect: {ok: true}
+  - action: wait_cli_until
+    argv: ["cmd", "status", "--cmd-id", "{c06.cmd_id}"]
+    json_path: "command.status"
+    in: [done, error, canceled, interactive]
+    timeout_s: 20
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_07"]
+    save_as: c07
+    expect: {ok: true}
+  - action: wait_cli_until
+    argv: ["cmd", "status", "--cmd-id", "{c07.cmd_id}"]
+    json_path: "command.status"
+    in: [done, error, canceled, interactive]
+    timeout_s: 20
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_08"]
+    save_as: c08
+    expect: {ok: true}
+  - action: wait_cli_until
+    argv: ["cmd", "status", "--cmd-id", "{c08.cmd_id}"]
+    json_path: "command.status"
+    in: [done, error, canceled, interactive]
+    timeout_s: 20
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_09"]
+    save_as: c09
+    expect: {ok: true}
+  - action: wait_cli_until
+    argv: ["cmd", "status", "--cmd-id", "{c09.cmd_id}"]
+    json_path: "command.status"
+    in: [done, error, canceled, interactive]
+    timeout_s: 20
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_10"]
+    save_as: c10
+    expect: {ok: true}
+  - action: wait_cli_until
+    argv: ["cmd", "status", "--cmd-id", "{c10.cmd_id}"]
+    json_path: "command.status"
+    in: [done, error, canceled, interactive]
+    timeout_s: 20
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_11"]
+    save_as: c11
+    expect: {ok: true}
+  - action: wait_cli_until
+    argv: ["cmd", "status", "--cmd-id", "{c11.cmd_id}"]
+    json_path: "command.status"
+    in: [done, error, canceled, interactive]
+    timeout_s: 20
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_12"]
+    save_as: c12
+    expect: {ok: true}
+  - action: wait_cli_until
+    argv: ["cmd", "status", "--cmd-id", "{c12.cmd_id}"]
+    json_path: "command.status"
+    in: [done, error, canceled, interactive]
+    timeout_s: 20
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_13"]
+    save_as: c13
+    expect: {ok: true}
+  - action: wait_cli_until
+    argv: ["cmd", "status", "--cmd-id", "{c13.cmd_id}"]
+    json_path: "command.status"
+    in: [done, error, canceled, interactive]
+    timeout_s: 20
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_14"]
+    save_as: c14
+    expect: {ok: true}
+  - action: wait_cli_until
+    argv: ["cmd", "status", "--cmd-id", "{c14.cmd_id}"]
+    json_path: "command.status"
+    in: [done, error, canceled, interactive]
+    timeout_s: 20
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_15"]
+    save_as: c15
+    expect: {ok: true}
+  - action: wait_cli_until
+    argv: ["cmd", "status", "--cmd-id", "{c15.cmd_id}"]
+    json_path: "command.status"
+    in: [done, error, canceled, interactive]
+    timeout_s: 20
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_16"]
+    save_as: c16
+    expect: {ok: true}
+  - action: wait_cli_until
+    argv: ["cmd", "status", "--cmd-id", "{c16.cmd_id}"]
+    json_path: "command.status"
+    in: [done, error, canceled, interactive]
+    timeout_s: 20
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_17"]
+    save_as: c17
+    expect: {ok: true}
+  - action: wait_cli_until
+    argv: ["cmd", "status", "--cmd-id", "{c17.cmd_id}"]
+    json_path: "command.status"
+    in: [done, error, canceled, interactive]
+    timeout_s: 20
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_18"]
+    save_as: c18
+    expect: {ok: true}
+  - action: wait_cli_until
+    argv: ["cmd", "status", "--cmd-id", "{c18.cmd_id}"]
+    json_path: "command.status"
+    in: [done, error, canceled, interactive]
+    timeout_s: 20
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_19"]
+    save_as: c19
+    expect: {ok: true}
+  - action: wait_cli_until
+    argv: ["cmd", "status", "--cmd-id", "{c19.cmd_id}"]
+    json_path: "command.status"
+    in: [done, error, canceled, interactive]
+    timeout_s: 20
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_20"]
+    save_as: c20
+    expect: {ok: true}
+  - action: wait_cli_until
+    argv: ["cmd", "status", "--cmd-id", "{c20.cmd_id}"]
+    json_path: "command.status"
+    in: [done, error, canceled, interactive]
+    timeout_s: 20
+  - action: op_end
+    op_id: traffic
+  # comparator 以每埠、每 endpoint_generation 的位元組總量比對 wire 與 WAL（§15.6.3）
+  - action: assert_compare

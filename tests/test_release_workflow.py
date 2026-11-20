@@ -36,12 +36,13 @@ RELEASE_YML = REPO_ROOT / ".github" / "workflows" / "release.yml"
 JOB = "publish-linux-bundle"
 BUNDLE_NAME = "serialwrap-${VERSION}-linux-x86_64"
 TARBALL = f"dist/{BUNDLE_NAME}.tar.gz"
-# 測試鉤子字串；正式候選二進位不得含有。
-TEST_FAKE_MARKERS = (
-    "SERIALWRAP_TEST_",
-    "SW_TEST_UPDATE_PAUSE_AFTER",
-    "SW_TEST_UPDATE_FORCE_VERIFY_FAIL",
-)
+# 正式 CLI 只允許與 Python 對齊的系統設定路徑；其餘測試鉤子一律拒絕。
+CLI_PARITY_HOOKS = {"SERIALWRAP_TEST_SYSTEM_CONFIG_PATH"}
+CLI_FORBIDDEN_PARITY_HOOKS = {
+    "SERIALWRAP_TEST_DEVICE_ALLOWLIST",
+    "SERIALWRAP_TEST_KILL_AFTER_SAVE",
+    "SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE",
+}
 
 
 def _load() -> dict[str, Any]:
@@ -109,6 +110,9 @@ def test_existing_wheel_and_windows_exe_jobs_are_kept():
     exe_runs = "\n".join(step.get("run", "") for step in jobs["publish-windows-exe"]["steps"])
     assert "python -m PyInstaller --noconfirm serialwrap.spec" in exe_runs
     assert "dist/serialwrap.exe dist/serialwrapd.exe" in exe_runs
+    workflow_text = RELEASE_YML.read_text(encoding="utf-8")
+    assert "CLI 不得含任何測試鉤子" not in workflow_text
+    assert "逐名核准的 parity 鉤子" in workflow_text
 
 
 @pytest.mark.memory_only
@@ -118,7 +122,9 @@ def test_linux_bundle_job_needs_publish_and_pins_toolchain():
     assert job.get("runs-on") == "ubuntu-24.04", f"{JOB} 必須 runs-on: ubuntu-24.04（OD-50）: {job.get('runs-on')}"
     needs = job.get("needs")
     needs = [needs] if isinstance(needs, str) else needs
-    assert needs == ["publish"], f"{JOB} 必須 needs: publish（等 GitHub Release 建立後才上傳）: {needs}"
+    assert set(needs) == {"publish", "classify-tag", "find-rc-assets"}, (
+        f"{JOB} 必須等既有 release 建立流程、tag 分類與 RC 探測完成: {needs}"
+    )
     uses = [step.get("uses", "") for step in _steps()]
     assert any(u.startswith("actions/checkout@") for u in uses)
     assert "dtolnay/rust-toolchain@1.96.1" in uses, "Rust toolchain 必須釘 1.96.1（與 rust.yml、rust-toolchain.toml 一致）"
@@ -226,7 +232,7 @@ def test_linux_bundle_job_step_order():
 def test_linux_bundle_job_build_commands():
     assert "cargo build --release" in _step("cargo-build")["run"]
     mkbundle = _step("mkbundle")["run"]
-    assert "scripts/rust/mkbundle.sh --release-bundle --profile release --out" in mkbundle
+    assert "scripts/rust/mkbundle.sh --release-bundle --stage 2 --profile release --out" in mkbundle
     assert "--version-override" not in mkbundle, "正式 bundle 不得以 --version-override 改版號（release 計畫 §2）"
     assert "--dev" not in mkbundle and "test-fakes" not in mkbundle
     assert BUNDLE_NAME in mkbundle
@@ -234,7 +240,7 @@ def test_linux_bundle_job_build_commands():
 
 @pytest.mark.process_rpc
 def test_release_profile_binary_excludes_test_hooks():
-    """正式 release binary 不得包含委派覆寫或故障注入環境變數。"""
+    """正式 CLI 僅保留 Python parity 系統設定路徑，其餘測試鉤子仍須排除。"""
     target_root = REPO_ROOT / "target"
     target_root.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="release-workflow-", dir=target_root) as target_dir:
@@ -267,9 +273,13 @@ def test_release_profile_binary_excludes_test_hooks():
             check=False,
         )
         assert result.returncode == 0, f"strings 無法讀取 release binary：{result.stderr}"
-        assert "SERIALWRAP_TEST_" not in result.stdout
-        for marker in TEST_FAKE_MARKERS[1:]:
-            assert marker not in result.stdout, f"release binary 含測試鉤子 {marker}"
+        hook_names = set(re.findall(r"SERIALWRAP_TEST_[A-Za-z0-9_]*", result.stdout))
+        assert hook_names == CLI_PARITY_HOOKS, (
+            f"release CLI 只能含逐名核准的 parity hook {sorted(CLI_PARITY_HOOKS)}；實際為 {sorted(hook_names)}"
+        )
+        for marker in CLI_FORBIDDEN_PARITY_HOOKS:
+            assert marker not in hook_names, f"release CLI 含 daemon 專用測試鉤子 {marker}"
+        assert "SW_TEST_UPDATE_" not in result.stdout, "release CLI 含 SW_TEST_UPDATE_* 測試鉤子"
 
 
 @pytest.mark.memory_only
@@ -287,8 +297,10 @@ def test_linux_bundle_job_packages_and_uploads_named_artifacts():
 @pytest.mark.memory_only
 def test_linux_bundle_job_smoke_covers_required_checks():
     smoke = _step("smoke")["run"]
-    for needle in ("--version", "--help", "release-manifest.json", "sha256sum -c", "py/pyvenv.cfg",
-                   "home = /usr/bin", *TEST_FAKE_MARKERS):
+    for needle in (
+        "--version", "--help", "release-manifest.json", "sha256sum -c", "py/pyvenv.cfg",
+        "home = /usr/bin", "scripts/rust/check_test_hook_markers.py",
+    ):
         assert needle in smoke, f"smoke 步驟缺少 {needle!r}"
 
 
@@ -333,7 +345,9 @@ def test_windows_bundle_job_runs_on_hosted_windows_after_linux_bundle():
     assert job.get("runs-on") == "windows-latest", "OD-78：以 GitHub hosted windows-latest 建置，不用自架 runner"
     needs = job.get("needs")
     needs = [needs] if isinstance(needs, str) else needs
-    assert needs == ["publish-linux-bundle"], f"必須等 Linux bundle job 完成才合併 SHA256SUMS: {needs}"
+    assert set(needs) == {"publish-linux-bundle", "classify-tag", "find-rc-assets"}, (
+        f"正式 Windows bundle 必須等 Linux bundle 與正式版 fallback 判斷完成: {needs}"
+    )
     assert job.get("timeout-minutes"), "必須設定 timeout-minutes"
     assert job["env"]["RUSTUP_TOOLCHAIN"] == "1.96.1-x86_64-pc-windows-gnu", "必須釘 gnu host toolchain（與 rust.yml 相同）"
     condition = str(job.get("if", ""))
@@ -363,15 +377,19 @@ def test_workflow_dispatch_backfills_existing_tag_without_republishing_other_art
     assert source_checkout[0]["with"]["ref"] == "refs/tags/${{ inputs.tag }}"
 
 
-@pytest.mark.memory_only
-def test_windows_bundle_job_step_order_and_build_commands():
-    order = ["verify-version", "mkbundle", "smoke", "upload"]
+@pytest.mark.process_rpc
+def test_windows_bundle_job_step_order_and_build_commands(tmp_path: Path):
+    order = ["verify-version", "refuse-dispatch-overwrite", "mkbundle", "smoke", "upload"]
     indexes = [_win_step_index(step_id) for step_id in order]
     assert indexes == sorted(indexes), f"{WIN_JOB} 步驟順序必須為 {order}: {indexes}"
+    guard = _win_step("refuse-dispatch-overwrite")
+    assert guard.get("if") == "${{ github.event_name == 'workflow_dispatch' }}"
+    guard_script = guard["run"]
+    assert "gh release view" in guard_script and "serialwrap-${VERSION}-windows-x86_64.zip" in guard_script
     steps = _win_steps()
     assert steps[0]["run"].strip() == "git config --global core.autocrlf false", "checkout 之前須關閉 autocrlf（位元組須與 Linux 一致）"
     mkbundle = _win_step("mkbundle")["run"]
-    assert "mkbundle-windows.ps1" in mkbundle and "-ZipPath" in mkbundle
+    assert "mkbundle-windows.ps1" in mkbundle and "-Stage 2" in mkbundle and "-ZipPath" in mkbundle
     assert "windows-x86_64" in mkbundle
     assert "check_win_imports.py" in mkbundle and "serialwrapd.exe" in mkbundle
     for forbidden in ("-Prebuilt", "-AllowDirty", "test-fakes", "com0com", "signtool", "Authenticode", "win-blackbox", "New-WindowsDevBundle"):
@@ -381,6 +399,42 @@ def test_windows_bundle_job_step_order_and_build_commands():
     assert "smoke-windows-bundle.ps1" in smoke and "-Zip" in smoke
     setup_python = [s for s in steps if str(s.get("uses", "")).startswith("actions/setup-python@")]
     assert len(setup_python) == 1 and setup_python[0]["with"]["python-version"] == "3.12.3"
+
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir()
+    fake_gh = fakebin / "gh"
+    fake_gh.write_text(
+        "#!/bin/sh\n"
+        "[ \"$1 $2\" = 'release view' ] || exit 9\n"
+        "[ \"${GH_FAIL:-0}\" = 0 ] || exit 8\n"
+        "printf '%s\\n' \"${ASSET_NAMES:-}\"\n",
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o755)
+
+    def run_guard(asset_names: str = "", *, gh_fail: bool = False) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", guard_script],
+            cwd=tmp_path,
+            env={
+                **os.environ,
+                "PATH": f"{fakebin}:{os.environ['PATH']}",
+                "TAG_NAME": "v0.5.0",
+                "VERSION": "0.5.0",
+                "ASSET_NAMES": asset_names,
+                "GH_FAIL": "1" if gh_fail else "0",
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    existing = run_guard("serialwrap-0.5.0-windows-x86_64.zip")
+    assert existing.returncode != 0
+    assert "拒絕覆寫" in existing.stdout + existing.stderr
+    assert "--clobber" not in guard_script
+    assert run_guard("serialwrap-0.5.0-linux-x86_64.tar.gz").returncode == 0
+    assert run_guard(gh_fail=True).returncode != 0, "無法確認既有資產時必須 fail-closed"
 
 
 @pytest.mark.memory_only
@@ -691,6 +745,10 @@ def _package_and_smoke(tmp_path: Path, mutate: Callable[[Path], None] | None = N
                        after_package: Callable[[Path], None] | None = None):
     work = tmp_path / "work"
     work.mkdir()
+    checker = REPO_ROOT / "scripts/rust/check_test_hook_markers.py"
+    staged_checker = work / "scripts/rust/check_test_hook_markers.py"
+    staged_checker.parent.mkdir(parents=True)
+    staged_checker.write_bytes(checker.read_bytes())
     runner_temp = tmp_path / "runner_temp"
     out = _fake_bundle(runner_temp)
     if mutate is not None:

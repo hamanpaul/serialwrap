@@ -1,0 +1,105 @@
+---
+meta:
+  name: s23-reboot-recovery-no-replay
+  category: l15-scenario
+  severity: critical
+  description: "human raw console 在 agent `reboot` 命令進行中、DUT 重開機之前輸入；DUT 重開機（U-Boot banner）→ reboot recovery 重新登入回 READY 後，重開機前的 human 輸入不得再出現在 wire（無論重開機前是否已上 wire 或被 deferred）（§11.3-3「Recovery／Reboot 不回放舊輸入」，BC-02；需 P6 human console，Rust BLOCKED-UPSTREAM；Slice 2.3 Task 18）"
+  scenario:
+    revision: "2026-10-29.1"
+    seed: 1023
+    capabilities: [posix_pty, process_rpc]
+    timeout_s: 150
+    invariants: [no_stale_context_replay, insufficient_evidence_not_pass]
+    behavior_changes: ["BC-02"]
+    expected: PASS
+    daemon_slice: "2.3"
+bridge:
+  applicable: true
+  only: true
+  compare: full
+  secrets_from_env_file: {file: p7.env, keys: [P7_PASS]}
+target:
+  platform: shell
+  boot_banner: "\r\nop3 login: "
+  login_steps:
+    - {expect: "root", respond: "\r\nPassword: "}
+    - {expect: "s3cretP7", respond: "\r\nroot@op3:~# "}
+  noise: {enabled: false}
+  commands:
+    overrides:
+      "reboot":
+        interactive: true
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@op3:~# "
+profile:
+  prompt_regex: '(?m)^root@op3:.*# '
+  login_regex: '(?mi)login:\s*$'
+  password_regex: '(?mi)password:\s*$'
+  user_env: 'P7_USER'
+  pass_env: 'P7_PASS'
+  env_file: 'p7.env'
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+env_files:
+  p7.env: |
+    P7_USER=root
+    P7_PASS=s3cretP7
+steps:
+  - action: wait_ready
+    timeout_s: 30
+  - action: attach_console
+    selector: COM0
+    label: s23-human
+    save_as: con
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "reboot", "--cmd-timeout", "30"]
+    save_as: rb
+    expect: {ok: true}
+  - action: wait_wire_marker
+    marker: "reboot\n"
+    observation: "serial_read"
+    timeout_s: 10
+  # agent 命令進行中 human 的 raw 輸入（Python 基線實測：此時直接透傳上 wire，不經 deferred）
+  - action: console_write
+    console_id: "{con.client_id}"
+    input: "STALE_HUMAN_P7\n"
+  - action: sleep
+    seconds: 1
+  - action: dut_control
+    action_name: logical_reboot
+    params:
+      pre_text: "\r\nU-Boot 2024.01\r\nHit any key to stop autoboot:  3 \r\n"
+      banner_delay_ms: 500
+  - action: wait_wire_marker
+    marker: "Hit any key"
+    observation: "serial_write"
+    timeout_s: 10
+  # 重開機邊界：此 op 結束之後的 serial_read 不得再出現重開機前的 human 輸入
+  - action: op_begin
+    op_id: rebooted
+  - action: op_end
+    op_id: rebooted
+  - action: wait_state
+    selector: COM0
+    state: READY
+    field: boot_quiet_remaining_s
+    value: null
+    timeout_s: 60
+  - action: wait_cli_until
+    argv: ["session", "list"]
+    json_path: "sessions.com=COM0.ready_reconfirm_pending"
+    equals: false
+    timeout_s: 30
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo AFTER"]
+    save_as: after
+    expect: {ok: true}
+  - action: wait_cli_until
+    argv: ["cmd", "status", "--cmd-id", "{after.cmd_id}"]
+    json_path: "command.status"
+    equals: done
+    timeout_s: 20
+  # reboot recovery 後 stale human 輸入不得回放
+  - action: assert_wire_absent
+    marker: "STALE_HUMAN_P7"
+    after_op: rebooted
+  - action: assert_compare

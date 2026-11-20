@@ -1,0 +1,58 @@
+{
+  "append_ns": {
+    "n": 39996,
+    "p50": 1009988,
+    "p95": 2250687,
+    "p99": 3206666
+  },
+  "env": {
+    "artifacts": {
+      "cli": "serialwrap 0.3.2",
+      "daemon": "525f70df81c0275090b9eb0e4f11bcb79cf814cda374c5c7e74c8c650db9dded"
+    },
+    "contract_tree": "1e13fbe2dcf64e8d9d7a1c873ba449b519181857",
+    "cpu": "AMD Ryzen 9 9900X 12-Core Processor",
+    "cpu_count": 24,
+    "endpoint_av": "unknown",
+    "fs_type": "ext4",
+    "memory_bytes": 101247266816,
+    "mix": {
+      "ansi": 0.2,
+      "prompt": 0.2,
+      "text": 0.6
+    },
+    "os": "linux",
+    "os_build": "6.18.54.1-microsoft-standard-WSL2",
+    "platform": "Linux-6.18.54.1-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+    "power": "AC",
+    "python": "3.12.3",
+    "serial": "none",
+    "storage_device": "/dev/sdd",
+    "timing_method": "time.perf_counter_ns",
+    "tool_revision": "924019418ebb115156a09ae93dfb86ddb00a9713",
+    "virtualization": "wsl2"
+  },
+  "ordinary_samples": 39996,
+  "prefill_bytes": [
+    62915031,
+    62915031,
+    62915031,
+    62915031
+  ],
+  "rotate_bytes": 67108864,
+  "rotate_max_ns": 902297134,
+  "rotate_pauses_ns": [
+    902297134,
+    888036001,
+    883866815,
+    897668392
+  ],
+  "rotate_samples": 4,
+  "rotations_per_stream": [
+    1,
+    1,
+    1,
+    1
+  ],
+  "total_records": 40000
+}

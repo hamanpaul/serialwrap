@@ -4,6 +4,9 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+// NUL 邊界讓 release bundle 可精確辨識這個 parity 環境變數名稱。
+const TEST_SYSTEM_CONFIG_PATH_OVERRIDE: &std::ffi::CStr = c"SERIALWRAP_TEST_SYSTEM_CONFIG_PATH";
+
 // 明列項目（不用 glob）：避免 proc_scan 的 `posix`／`windows` 子模組名洩漏成 `sw_pal::posix`。
 pub use crate::device_source::windows_model::{
     exclude_bluetooth, read_bt_ports, RegistryView, SERIALCOMM_KEY,
@@ -362,6 +365,19 @@ pub trait SysEnv: Send + Sync {
     /// SC-09：POSIX `"/etc/serialwrap"`；Windows `"%ProgramData%\serialwrap"`（ProgramData 缺時 `"C:\ProgramData\serialwrap"`）。
     /// CLI 不得自行判斷平台。
     fn system_config_dir(&self) -> String;
+    /// `SYSTEM_CONFIG_PATH`：明確測試覆寫原樣優先（包含空字串），否則為 `system_config_dir()/config.yaml`。
+    fn system_config_path(&self) -> String {
+        if let Some(path) = self.var(
+            TEST_SYSTEM_CONFIG_PATH_OVERRIDE
+                .to_str()
+                .expect("C 字串常值必為有效 UTF-8"),
+        ) {
+            return path;
+        }
+        let mut path = PathBuf::from(self.system_config_dir());
+        path.push("config.yaml");
+        path.to_string_lossy().into_owned()
+    }
     fn current_user_home(&self) -> Option<String>;
     fn user_home(&self, user: &str) -> Option<String>;
     fn current_exe(&self) -> PalResult<PathBuf>;
@@ -372,6 +388,11 @@ pub trait SysEnv: Send + Sync {
     /// `= Python errno.errorcode.get(code)`。
     fn errno_name(&self, code: i32) -> Option<&'static str>;
     fn pid(&self) -> u32;
+    /// P7 Task 2：daemon 端 `os.path`（`posixpath`／`ntpath`）方言，供 `os.path.expanduser` 等承接選擇；
+    /// 預設 POSIX，Windows 原生實作覆寫。
+    fn path_flavor(&self) -> crate::PalPathFlavor {
+        crate::PalPathFlavor::Posix
+    }
 
     /// 子行程執行（等同 Python `subprocess.run(capture_output=True, text=True)`）。逾時回 `rc=-1`、`stderr="TIMEOUT"`。
     fn run(&self, argv: &[String], timeout: Option<Duration>) -> PalResult<CmdOutput>;
@@ -453,6 +474,31 @@ pub trait FsRead: Send + Sync {
 pub trait Clock: Send + Sync {
     fn mono_ns(&self) -> u64;
     fn sleep(&self, d: Duration);
+    /// 等到單調時鐘期限或取消；回 `true` 表示期限已到，`false` 表示取消。
+    /// 預設實作使用真實經過時間，需支援可控時間的替身應覆寫此方法。
+    fn wait_until_or_cancel(
+        &self,
+        deadline_ns: u64,
+        cancel: &crossbeam_channel::Receiver<()>,
+    ) -> bool {
+        loop {
+            let now = self.mono_ns();
+            if now >= deadline_ns {
+                return true;
+            }
+
+            let remaining = Duration::from_nanos(deadline_ns - now);
+            crossbeam_channel::select! {
+                recv(cancel) -> _ => return false,
+                recv(crossbeam_channel::after(remaining)) -> _ => {}
+            }
+        }
+    }
+    /// Unix wall clock（微秒，Task 0c）。無預設實作：每個 `impl Clock` 必須明確覆寫，漏實作即編譯失敗（P5 Task 0 雙審修正）。
+    fn wall_unix_us(&self) -> i64;
+    /// 本地 UTC offset（秒，Task 0c）；呼叫端應與 `wall_unix_us()` 在同一時刻取值。
+    /// 無預設實作，漏實作即編譯失敗。
+    fn local_utc_offset_s(&self) -> i32;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -554,4 +600,584 @@ pub trait ProcessCtl: Send + Sync {
         Err(PalError::plain(PalErrorKind::Unsupported, "不支援提權啟動"))
     }
 
+}
+
+// ---- P5-T5 裝置來源型別（arch §4.3；計畫 Task 0 介面骨架的 TDD 紅燈 stub）----
+
+/// 單一裝置的識別資訊（arch §4.3）：`by_id` 為掃描到的路徑（Windows 為 `COMx`），`real_path` 為解析後實體路徑。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceInfo {
+    pub by_id: String,
+    pub real_path: String,
+}
+
+/// 裝置選擇條件（arch §4.3）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceSelection {
+    pub by_id_dir: PathBuf,
+    pub by_path_dir: PathBuf,
+    pub exclude_coms: Vec<String>,
+    /// SC-19（OD-11）：存在時只保留清單內的 by_id。
+    pub test_allowlist: Option<Vec<String>>,
+}
+
+/// 裝置來源（arch §4.3）：保留列舉順序。
+pub trait DeviceSource: Send {
+    fn scan(&mut self) -> PalResult<Vec<(String, DeviceInfo)>>;
+}
+
+/// DeviceWatcher 送出的事件（arch §4.3）。
+#[derive(Debug)]
+pub enum WatcherEvent {
+    Delta {
+        added: Vec<DeviceInfo>,
+        removed: Vec<DeviceInfo>,
+        snapshot: Vec<(String, DeviceInfo)>,
+        /// `Some` 時 watcher 只有在 consumer 確認後才提交快照；`false`／丟棄代表下輪重送。
+        ack: Option<crossbeam_channel::Sender<bool>>,
+    },
+    Tick,
+    ScanFailed(PalError),
+}
+
+// ---------------------------------------------------------------------------
+// Slice 2.1 骨架（P5 Task 1 測試替身所需；arch §4.2、§4.5）。
+// 僅宣告型別與簽章；SerialBackend／WalFs 的真實實作與 OS 語意由 Task 2／6 交付。
+// ---------------------------------------------------------------------------
+
+impl PalError {
+    /// 由 POSIX errno 與 Python `str(OSError)` 建立錯誤（替身與 PAL 實作共用）。
+    pub fn io(code: i32, py_message: &str) -> PalError {
+        PalError::new(kind_from_errno(code), Some(code), None, py_message, py_message)
+    }
+}
+
+/// 序列埠裝置路徑（POSIX：realpath；Windows：`\\.\COMn`）。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DevicePath(pub String);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Parity {
+    None,
+    Even,
+    Odd,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlowControl {
+    None,
+    RtsCts,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SerialConfig {
+    pub baud: u32,
+    pub data_bits: u8,
+    pub parity: Parity,
+    pub stop_bits: u8,
+    pub flow: FlowControl,
+    /// POSIX backend 忽略（UIO-12.1-e）。
+    pub xonxoff: bool,
+}
+
+impl SerialConfig {
+    /// 由 UartProfile 欄位建立。骨架對應表（parity `N`／`E`／`O`，flow `rtscts`）待 Task 2 依 config 語意確認。
+    pub fn from_uart_profile(
+        baud: u32,
+        data_bits: u8,
+        parity: &str,
+        stop_bits: u8,
+        flow_control: &str,
+        xonxoff: bool,
+    ) -> SerialConfig {
+        let parity = match parity.to_ascii_uppercase().as_str() {
+            "E" => Parity::Even,
+            "O" => Parity::Odd,
+            _ => Parity::None,
+        };
+        let flow = if flow_control.eq_ignore_ascii_case("rtscts") {
+            FlowControl::RtsCts
+        } else {
+            FlowControl::None
+        };
+        SerialConfig {
+            baud,
+            data_bits,
+            parity,
+            stop_bits,
+            flow,
+            xonxoff,
+        }
+    }
+}
+
+/// 獨占開啟失敗時的持有者診斷（arch §4.2）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HolderReport {
+    pub pids: Vec<u32>,
+    pub holder_unknown: bool,
+    pub status: HolderScanStatus,
+}
+
+#[derive(Debug)]
+pub enum OpenError {
+    /// POSIX EWOULDBLOCK(flock)、open EBUSY(TIOCEXCL)，或鎖後重掃識別到外部 holder。
+    Held(HolderReport),
+    /// Windows ERROR_ACCESS_DENIED：不推斷 holder，holder_unknown=true。
+    AccessDenied {
+        os: PalError,
+        holder: HolderReport,
+    },
+    NotFound(PalError),
+    Other(PalError),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReadOutcome {
+    Data(usize),
+    Eof,
+    Woken,
+    TimedOut,
+}
+
+/// 序列埠讀取失敗階段；等待失敗與真正讀取失敗對外映射為不同 reason。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReadError {
+    Wait(PalError),
+    Read(PalError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxOutcome {
+    NotSubmitted,
+    Completed(usize),
+    /// `confirmed` 為結果不明前 OS 已確認的前綴；未知尾段長度為 requested - confirmed。
+    Unknown {
+        confirmed: usize,
+    },
+}
+
+/// `Completed(n<len)` 加 `error` 表示部分完成後失敗。
+#[derive(Debug, Clone)]
+pub struct TxResult {
+    pub outcome: TxOutcome,
+    pub error: Option<PalError>,
+}
+
+pub trait IoWaker: Send + Sync {
+    fn wake(&self);
+}
+
+/// 取消旗標與喚醒器的組合（arch §4.2）。`cancel` 設旗標並喚醒阻塞中的 I/O。
+#[derive(Clone)]
+pub struct CancelToken {
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    waker: std::sync::Arc<dyn IoWaker>,
+}
+
+impl CancelToken {
+    pub fn new(waker: std::sync::Arc<dyn IoWaker>) -> CancelToken {
+        CancelToken {
+            flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            waker,
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.waker.wake();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// `close` 的實作端（各後端與替身各自實作）。
+pub trait CloseImpl: Send {
+    /// 回報底層 serial handle 是否仍有效；不以 EOF 或讀取錯誤推斷 handle 已關閉。
+    fn is_alive(&self) -> bool;
+    /// 對仍開啟的 handle 重新套用 UART 設定（Python bridge 啟動時對預開 port 的 `port.configure(profile)`；
+    /// 動態 session 的 PROBE 與正式 bridge 共用同一預開 handle，#51）。未支援的後端回 `Unsupported`。
+    fn configure(&self, _cfg: &SerialConfig) -> PalResult<()> {
+        Err(PalError::plain(
+            PalErrorKind::Unsupported,
+            "configure 於此後端未支援",
+        ))
+    }
+    fn close(self: Box<Self>) -> CloseReceipt;
+}
+
+/// 只能在 reader 與 writer 都交回後呼叫（型別保證不雙重關閉、不在 I/O 未收斂時關閉）。
+pub struct CloseToken {
+    inner: Box<dyn CloseImpl>,
+}
+
+impl CloseToken {
+    pub fn new(inner: Box<dyn CloseImpl>) -> CloseToken {
+        CloseToken { inner }
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.inner.is_alive()
+    }
+
+    /// 見 [`CloseImpl::configure`]。
+    pub fn configure(&self, cfg: &SerialConfig) -> PalResult<()> {
+        self.inner.configure(cfg)
+    }
+
+    pub fn close(self, r: Box<dyn SerialReader>, w: Box<dyn SerialWriter>) -> CloseReceipt {
+        drop(r);
+        drop(w);
+        self.inner.close()
+    }
+}
+
+/// `excl_cleared`：POSIX 關 fd 前 TIOCNXCL 是否成功（arch §4.2，R0-F3）；Windows／fake 恆等於 `closed`。
+#[derive(Debug, Clone)]
+pub struct CloseReceipt {
+    pub closed: bool,
+    pub excl_cleared: bool,
+    pub error: Option<PalError>,
+}
+
+pub trait SerialBackend: Send + Sync {
+    /// 以獨占方式開啟並完成設定（arch §4.2）。
+    fn open_exclusive(
+        &self,
+        dev: &DevicePath,
+        cfg: &SerialConfig,
+    ) -> Result<Box<dyn SerialHandle>, OpenError>;
+}
+
+pub trait SerialHandle: Send {
+    fn split(
+        self: Box<Self>,
+    ) -> (
+        Box<dyn SerialReader>,
+        Box<dyn SerialWriter>,
+        std::sync::Arc<dyn IoWaker>,
+        CloseToken,
+    );
+    fn set_baud(&self, baud: u32) -> PalResult<()>;
+    /// arch §4.2：`/dev/ttyMCU`（2.4）專用；委派 `line_control()`。
+    fn mirror_termios_from(
+        &self,
+        pty: &crate::console_pty::PtySlaveRef,
+        fallback_baud: Option<u32>,
+    ) -> PalResult<()> {
+        self.line_control().mirror_termios_from(pty, fallback_baud)
+    }
+    /// 序列線控制（split 前取得；split 後仍可持有並調整速率）。預設為全部 `Unsupported` 的實作。
+    fn line_control(&self) -> std::sync::Arc<dyn SerialLineControl> {
+        std::sync::Arc::new(UnsupportedLineControl)
+    }
+    fn is_alive(&self) -> bool;
+}
+
+/// 序列線控制（arch §4.2；`/dev/ttyMCU` 的 baud 鏡射）。可在 `split` 之後繼續持有。
+pub trait SerialLineControl: Send + Sync {
+    /// 未列於 POSIX_BAUD_MAP 的 baud → `Ok(())` no-op。
+    fn set_baud(&self, baud: u32) -> PalResult<()>;
+    /// 把 PTY slave 的速率鏡射到實體 UART：任一方向讀到 B0 視為「未設」→ 走 `fallback_baud`；
+    /// **絕不把 B0 寫到實體 UART**（B0 會拉低 DTR，可能重置 MCU）。
+    fn mirror_termios_from(&self, pty: &PtySlaveRef, fallback_baud: Option<u32>) -> PalResult<()>;
+}
+
+/// `SerialHandle::line_control` 的預設實作：全部 `Unsupported`。
+pub struct UnsupportedLineControl;
+
+impl SerialLineControl for UnsupportedLineControl {
+    fn set_baud(&self, _baud: u32) -> PalResult<()> {
+        Err(PalError::plain(PalErrorKind::Unsupported, "set_baud 於此後端不支援（line_control）"))
+    }
+    fn mirror_termios_from(&self, _pty: &PtySlaveRef, _fallback_baud: Option<u32>) -> PalResult<()> {
+        Err(PalError::plain(PalErrorKind::Unsupported, "mirror_termios_from 於此後端不支援（line_control）"))
+    }
+}
+
+/// `mirror_termios_from` 的決策結果（純函式，POSIX 與替身共用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorPlan {
+    /// 把這兩個（皆非 B0 的）速率代碼寫入實體 UART。
+    SetSpeeds { ispeed: u32, ospeed: u32 },
+    /// 走 fallback：`set_baud(baud)`，失敗忽略。
+    FallbackBaud(u32),
+    /// 什麼都不做。
+    Ignore,
+}
+
+/// 依 slave 速率讀取結果與 fallback 決定動作：任一方向 B0、或讀取失敗 → fallback（無 fallback 則忽略）。
+pub fn plan_mirror(slave: &PalResult<TermSpeed>, fallback_baud: Option<u32>) -> MirrorPlan {
+    match slave {
+        Ok(s) if s.ispeed != 0 && s.ospeed != 0 => MirrorPlan::SetSpeeds { ispeed: s.ispeed, ospeed: s.ospeed },
+        _ => match fallback_baud {
+            Some(b) => MirrorPlan::FallbackBaud(b),
+            None => MirrorPlan::Ignore,
+        },
+    }
+}
+
+/// 獨占診斷（arch §4.2）：只供診斷、不是鎖。POSIX 掃 `/proc/*/fd`；Windows 回 `holder_unknown:true`、`status:Unsupported`。
+pub trait UartExclusive: Send + Sync {
+    fn probe_holders(&self, real_path: &str) -> HolderReport;
+}
+
+pub trait SerialReader: Send {
+    /// 逾時以 `None` 表示無限等待；被 waker 喚醒回 `Woken`。
+    /// Windows COM 的 200 ms `COMMTIMEOUTS` idle timeout 只作內部輪詢；無資料時重發讀取，直到呼叫端期限到達。
+    fn read(
+        &mut self,
+        buf: &mut [u8],
+        timeout: Option<Duration>,
+    ) -> Result<ReadOutcome, ReadError>;
+}
+
+/// OS 提交的序列化點（arch §4.2，R0-F1）。`submit` 被撤銷時不得呼叫 `os_submit`。
+pub trait SubmitGate {
+    fn submit(
+        &self,
+        os_submit: &mut dyn FnMut() -> SubmitStep,
+    ) -> Result<SubmitStep, SubmitRevoked>;
+}
+
+#[derive(Debug, Clone)]
+pub enum SubmitStep {
+    /// POSIX write(2)=n>0 或 Windows 同步完成。
+    Accepted(usize),
+    /// Windows ERROR_IO_PENDING：已交 OS。
+    Pending,
+    /// EAGAIN：未交 OS。
+    WouldBlock,
+    /// 0 byte 交 OS。
+    Failed(PalError),
+}
+
+/// 原因由 gate 實作自行保存（PAL 不依賴 sw-core 的 FenceReject）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmitRevoked;
+
+/// 直接呼叫 `os_submit`；只供 PAL conformance 與 PAL 單元測試。
+pub struct AlwaysOpen;
+
+impl SubmitGate for AlwaysOpen {
+    fn submit(
+        &self,
+        os_submit: &mut dyn FnMut() -> SubmitStep,
+    ) -> Result<SubmitStep, SubmitRevoked> {
+        Ok(os_submit())
+    }
+}
+
+pub trait SerialWriter: Send {
+    /// 回傳值必須能區分「從未提交 OS」「OS 確認 n bytes」「結果不明」（BC-03）。
+    fn write_gated(&mut self, data: &[u8], cancel: &CancelToken, gate: &dyn SubmitGate) -> TxResult;
+
+    /// = `write_gated(data, cancel, &AlwaysOpen)`。
+    fn write(&mut self, data: &[u8], cancel: &CancelToken) -> TxResult {
+        self.write_gated(data, cancel, &AlwaysOpen)
+    }
+}
+
+/// WAL 檔案系統（arch §4.5）。
+pub trait WalFs: Send + Sync {
+    /// POSIX：`O_WRONLY|O_APPEND|O_CREAT|O_CLOEXEC`；Windows：share-delete 常駐 handle。
+    fn open_append(&self, path: &Path) -> PalResult<Box<dyn WalFile>>;
+    /// `None` = 路徑不存在；Windows classic DeletePending 的 `ERROR_ACCESS_DENIED` 以 `(0, 0)` identity 哨兵回報。
+    fn path_identity(&self, path: &Path) -> PalResult<Option<FileIdentity>>;
+    fn size(&self, path: &Path) -> PalResult<Option<u64>>;
+    fn tail_needs_termination(&self, path: &Path) -> PalResult<bool>;
+    /// 讀取整檔（Task 0 修訂 arch §4.5；Task 7 讀取 API 使用）。`None` = 路徑不存在。
+    fn read_all(&self, path: &Path) -> PalResult<Option<Vec<u8>>>;
+    /// DF-03：優先原子 no-replace；不支援時降級；同名加 `.1` `.2` …。
+    fn rename_noreplace_or_suffix(&self, from: &Path, base_to: &Path) -> PalResult<PathBuf>;
+    fn sync_dir(&self, dir: &Path) -> PalResult<()>;
+    fn ensure_dir(&self, dir: &Path) -> PalResult<()>;
+    /// `os.access(W_OK|X_OK)` 等價。
+    fn dir_writable(&self, dir: &Path) -> bool;
+}
+
+pub trait WalFile: Send {
+    /// 失敗時必須回報失敗前 OS 已確認寫出的長度 `sent`（R2-F3）。
+    fn write_all_flush(&mut self, bytes: &[u8]) -> Result<(), WalWriteError>;
+    fn sync(&mut self) -> PalResult<()>;
+    fn identity(&self) -> PalResult<FileIdentity>;
+    /// POSIX `st_nlink==0`；Windows `DeletePending`。
+    fn unlinked(&self) -> PalResult<bool>;
+    fn close(self: Box<Self>) -> PalResult<()>;
+}
+
+#[derive(PartialEq, Eq, Clone, Debug)]
+pub struct FileIdentity(pub u128, pub u128);
+
+/// WAL／mirror 寫入錯誤：`sent` 為失敗前已交 OS 且確認的 bytes。
+#[derive(Debug, Clone)]
+pub struct WalWriteError {
+    pub sent: usize,
+    pub error: PalError,
+}
+
+// ---------------------------------------------------------------------------
+// ConsoleTransportFactory（arch §4.7）：完整宣告位於 `crate::console_pty`，此處再匯出以保留既有路徑。
+// ---------------------------------------------------------------------------
+
+pub use crate::console_pty::{
+    ConsoleIo, ConsoleListener, ConsoleTransportFactory, ConsoleWriteHalf, KeepAlive, PtyPair, PtySlaveRef, Readiness,
+    TermSpeed,
+};
+// P7 Task 0（08）：event handler 產生器、USB busid 解析與 append 檔案，此處再匯出。
+pub use crate::device_source::UsbTopology;
+pub use crate::fs_ops::AppendFile;
+pub use crate::process::{HandlerAbort, HandlerOutcome, HandlerSpawner, HandlerSpec};
+// 實例鎖型別（arch §4.4）：實際定義於 `crate::lock`，此處再匯出，使 `use sw_pal::*` 可直接取得（Task 4 測試與 Task 19 使用）。
+pub use crate::lock::{InstanceLockError, InstanceLockFactory, InstanceLockGuard};
+
+// ---------------------------------------------------------------------------
+// Slice 2.1 介面（arch §4.4、§4.6、§4.9；Task 0 Produces）。實作由 Task 2／4／17 交付。
+// ---------------------------------------------------------------------------
+
+/// daemon 停止訊號等待（arch §4.9）。`install` 必須在 main 第一個動作、建立任何 thread 之前呼叫；重複呼叫回 `Ok(())`。
+pub trait SignalWait: Send + Sync {
+    fn install(&self) -> PalResult<()>;
+    /// 等待 OS 停止訊號或 `extra` 通知；`extra` sender 全數 drop 也視為停止。
+    /// Windows `CTRL_CLOSE_EVENT` handler 只排入通知並立即返回，console 關閉時的有序清理盡力完成。
+    fn wait_stop(&self, extra: crossbeam_channel::Receiver<()>);
+}
+
+/// RPC 伺服端連線（arch §4.6；P3 `RpcStream` 維持 client 專用）。
+pub trait RpcServerStream: std::io::Read + std::io::Write + Send {
+    fn shutdown_read(&mut self) -> PalResult<()>;
+    fn set_read_timeout(&mut self, d: Option<Duration>) -> PalResult<()>;
+}
+
+/// RPC listener 建立參數（arch §4.6）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListenOptions {
+    pub mode: u32,
+    pub group: Option<String>,
+    pub ensure_dir_mode: Option<u32>,
+}
+
+/// RPC listener 工廠（arch §4.6）。
+pub trait RpcListenerFactory: Send + Sync {
+    fn bind(&self, ep: &EndpointSpec, opts: &ListenOptions) -> PalResult<Box<dyn RpcListener>>;
+}
+
+/// RPC listener（arch §4.6）。
+pub trait RpcListener: Send {
+    /// 有界等待，供 stop 檢查。
+    fn accept(&mut self, timeout: Duration) -> PalResult<Option<Box<dyn RpcServerStream>>>;
+    /// Unix：移除 socket 檔。
+    fn close(self: Box<Self>);
+}
+
+impl PalError {
+    /// 由 errno 建立錯誤（P5 Task 0 交付純建構子）：沿用同檔 `posix_errno`／`windows_crt_error` 的 strerror 與 kind 對映，
+    /// `py_message` 為 `[Errno N] <strerror>`。Task 1 的替身與 Task 7 的 `py_exc_name` 依賴此實作，不得再為 stub。
+    pub fn from_errno(e: i32) -> PalError {
+        #[cfg(unix)]
+        {
+            posix_errno(e)
+        }
+        #[cfg(windows)]
+        {
+            windows_crt_error(e)
+        }
+    }
+    /// 使用者取消（`CancelToken` 觸發的 OS 操作中止）：kind `Cancelled`，os_code 125（ECANCELED）。
+    pub fn cancelled() -> PalError {
+        PalError::new(
+            PalErrorKind::Cancelled,
+            Some(125),
+            None,
+            "Operation canceled",
+            "[Errno 125] Operation canceled",
+        )
+    }
+    /// 找不到目標：kind `NotFound`，os_code 2（ENOENT）；`py_message` 原樣保留（Python `str(OSError)` 格式由呼叫端給定）。
+    pub fn not_found(py_message: &str) -> PalError {
+        PalError::new(
+            PalErrorKind::NotFound,
+            Some(2),
+            None,
+            "No such file or directory",
+            py_message,
+        )
+    }
+    /// 參數不合法：kind `InvalidInput`，os_code 22（EINVAL）。
+    pub fn invalid(msg: &str) -> PalError {
+        PalError::new(PalErrorKind::InvalidInput, Some(22), None, "Invalid argument", msg)
+    }
+    /// Python 例外類別名（計畫 06 Task 0 對照表）：ENOENT→FileNotFoundError、EACCES/EPERM→PermissionError、
+    /// EEXIST→FileExistsError、ETIMEDOUT→TimeoutError、其他→OSError。
+    /// `os_code` 缺席時依 kind 補判（NotFound→FileNotFoundError、PermissionDenied／AccessDenied→PermissionError、TimedOut→TimeoutError）。
+    pub fn py_exc_name(&self) -> &'static str {
+        match self.os_code {
+            Some(2) => "FileNotFoundError",
+            Some(1) | Some(13) => "PermissionError",
+            Some(17) => "FileExistsError",
+            Some(110) => "TimeoutError",
+            Some(_) => "OSError",
+            None => match self.kind {
+                PalErrorKind::NotFound => "FileNotFoundError",
+                PalErrorKind::PermissionDenied | PalErrorKind::AccessDenied => "PermissionError",
+                PalErrorKind::TimedOut => "TimeoutError",
+                _ => "OSError",
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod pal_error_ctor_tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_uses_cancelled_kind_and_ecanceled_code() {
+        let e = PalError::cancelled();
+        assert_eq!(e.kind, PalErrorKind::Cancelled);
+        assert_eq!(e.os_code, Some(125));
+        assert_eq!(e.py_exc_name(), "OSError");
+    }
+
+    #[test]
+    fn not_found_keeps_py_message_and_maps_to_file_not_found() {
+        let e = PalError::not_found("[Errno 2] No such file or directory");
+        assert_eq!(e.kind, PalErrorKind::NotFound);
+        assert_eq!(e.os_code, Some(2));
+        assert_eq!(e.py_message, "[Errno 2] No such file or directory");
+        assert_eq!(e.py_exc_name(), "FileNotFoundError");
+    }
+
+    #[test]
+    fn invalid_uses_invalid_input_kind_and_einval_code() {
+        let e = PalError::invalid("path contains NUL");
+        assert_eq!(e.kind, PalErrorKind::InvalidInput);
+        assert_eq!(e.os_code, Some(22));
+        assert_eq!(e.py_message, "path contains NUL");
+        assert_eq!(e.py_exc_name(), "OSError");
+    }
+
+    #[test]
+    fn from_errno_keeps_code_and_maps_python_exception_names() {
+        for (code, name) in [
+            (2, "FileNotFoundError"),
+            (1, "PermissionError"),
+            (13, "PermissionError"),
+            (17, "FileExistsError"),
+            (110, "TimeoutError"),
+            (5, "OSError"),
+        ] {
+            let e = PalError::from_errno(code);
+            assert_eq!(e.os_code, Some(code), "errno {code}");
+            assert!(e.py_message.starts_with(&format!("[Errno {code}] ")), "errno {code}: {}", e.py_message);
+            assert_eq!(e.py_exc_name(), name, "errno {code}");
+        }
+    }
+
+    #[test]
+    fn timed_out_without_code_maps_to_timeout_error() {
+        assert_eq!(timed_out().py_exc_name(), "TimeoutError");
+    }
 }

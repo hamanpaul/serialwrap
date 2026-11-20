@@ -227,10 +227,6 @@ impl World {
         self
     }
 
-    fn system_dir(mut self, dir: &str) -> Self {
-        self.system_config_dir = dir.to_string();
-        self
-    }
 }
 
 struct Run<R> {
@@ -488,6 +484,17 @@ fn config_alive() {
 }
 
 #[test]
+fn system_config_path_override_is_used_by_cli() {
+    let system_path = "/isolated/system-config/custom.yaml";
+    let w = World::new()
+        .env("SERIALWRAP_TEST_SYSTEM_CONFIG_PATH", system_path)
+        .file(system_path, "socket_path: /system.sock\n")
+        .probes(vec![probe_alive()]);
+    let r = resolve(w, None, None, None);
+    assert_eq!(r.value, ep("/system.sock", "config.yaml"));
+}
+
+#[test]
 fn config_dangling_fallback() {
     let w = World::new()
         .file(USER_CFG, "socket_path: /cfg.sock\n")
@@ -603,7 +610,10 @@ fn sc09_explicit_blank_ignored() {
 #[test]
 fn sc09_system_fallback() {
     let w = World::new()
-        .system_dir("/sys-test/serialwrap")
+        .env(
+            "SERIALWRAP_TEST_SYSTEM_CONFIG_PATH",
+            "/sys-test/serialwrap/config.yaml",
+        )
         .file("/sys-test/serialwrap/config.yaml", "socket_path: /sys.sock\n")
         .probes(vec![probe_alive()]);
     let r = resolve(w, None, None, None);

@@ -1,0 +1,81 @@
+---
+meta:
+  name: s23-quiet-mid-login-zero-tx
+  category: l15-scenario
+  severity: critical
+  description: "登入進行中（帳號已送出、DUT 停住）DUT 吐 U-Boot autoboot banner：自 banner 送出前起算 wire serial_read 零 byte——隨後出現的 Password prompt 不得引來 secret，帳號不重送（SC-30 的 0 byte 部分；Python P1 T20 後同樣 arm 之後 0 byte，見 behavior_changes.yaml SC-30；Slice 2.3 Task 18，§11.3）"
+  scenario:
+    revision: "2026-10-29.2"
+    seed: 1023
+    capabilities: [posix_pty, process_rpc]
+    timeout_s: 90
+    invariants: [zero_tx_on_reject, no_auto_resend, insufficient_evidence_not_pass]
+    behavior_changes: ["SC-30"]
+    expected: PASS
+    daemon_slice: "2.3"
+bridge:
+  applicable: true
+  only: true
+  compare: full
+  secrets_from_env_file: {file: p7.env, keys: [P7_PASS]}
+target:
+  platform: shell
+  boot_banner: "\r\nop3 login: "
+  login_steps:
+    # 收到帳號後 DUT 先停住（不回 Password prompt），banner 由測試在零 TX 窗口開始後主動送出
+    - {expect: "root", respond: ""}
+    - {expect: "s3cretP7", respond: "\r\nroot@op3:~# "}
+  noise: {enabled: false}
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@op3:~# "
+profile:
+  prompt_regex: '(?m)^root@op3:.*# '
+  login_regex: '(?mi)login:\s*$'
+  password_regex: '(?mi)password:\s*$'
+  user_env: 'P7_USER'
+  pass_env: 'P7_PASS'
+  env_file: 'p7.env'
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+env_files:
+  p7.env: |
+    P7_USER=root
+    P7_PASS=s3cretP7
+steps:
+  # daemon 送出帳號（登入進行中）；DUT 不回應
+  - action: wait_wire_marker
+    marker: "root\n"
+    observation: "serial_read"
+    timeout_s: 30
+  # 零 TX 窗口自送出 banner **之前** 開始（審查 P7-f9e90a9-3：窗口若在 banner 之後才開，會漏掉「收到 banner 後
+  # 立即送出」的 byte）
+  - action: op_begin
+    op_id: quiet
+  - action: dut_control
+    action_name: emit
+    params:
+      payload_b64: "DQpVLUJvb3QgMjAyNC4wMQ0KSGl0IGFueSBrZXkgdG8gc3RvcCBhdXRvYm9vdDogIDMgDQo="
+  - action: wait_wire_marker
+    marker: "Hit any key"
+    observation: "serial_write"
+    timeout_s: 10
+  - action: sleep
+    seconds: 1
+  # quiet 期間 DUT 出現 Password prompt：不得送 secret、不得重送帳號、不得送 probe
+  - action: dut_control
+    action_name: emit
+    params:
+      payload_b64: "DQpQYXNzd29yZDog"
+  - action: wait_wire_marker
+    marker: "Password: "
+    observation: "serial_write"
+    timeout_s: 10
+  - action: sleep
+    seconds: 6
+  - action: op_end
+    op_id: quiet
+  - action: assert_zero_tx
+    op_id: quiet
+  - action: assert_wire_contiguous
+    payloads: ["root\n"]
+  - action: assert_compare

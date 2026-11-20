@@ -48,7 +48,7 @@
 - Rust CLI `setup` 使用既有 `health.ping` 回應與安裝 manifest 比對 daemon 程式碼指紋；無法比較時省略 `daemon_code`。
 - 新增 profile 選配欄位 `boot_done_regex`（開機完成訊號），boot quiet window 期間 RX 命中即提早解除，與 `login_regex`／`prompt_regex` 同列判定、同樣受 `bootloader_prompts` 尾行例外約束，不參與登入流程；target 可覆寫，`serialwrap profile test` 一併回報命中。出貨 `prpl-template` 設為 askconsole 的「Please press Enter to activate this console」：prplOS 開機停在 askconsole 時既不匹配 login 也不匹配 prompt，過去只能等滿 180s 才恢復探測；實測 askconsole 在 U-Boot banner 後約 18s 出現，READY 可提早約 2 分半。#162 的 READY 再確認不變（解除 quiet 不清 `ready_reconfirm_pending`，仍由 nonce probe 確認並順帶消耗啟用 banner）。線上 `~/.config/serialwrap/profiles/*.yaml` 不會被 setup 覆寫，既有安裝需手動把此欄位補進對應 template。
 - 看得出 daemon 跑的是哪份程式碼，且 `serialwrap setup` 升級後會讓 systemd 服務的 daemon 換新碼。版本字串只來自 `VERSION`，release、分支 build、main 全印 `0.3.2`；`pipx install --force` 加 `serialwrap setup --user` 之後，已在跑的 systemd 服務不會被重啟（同模式刷新只重寫 unit，轉換路徑的 `systemctl start` 對 active 服務是 no-op），daemon 靜默沿用舊碼，agent 只能靠檔案時間猜，曾因此判斷錯誤。
-  
+
   - 程式碼指紋：`sw_core/**/*.py` 的 sha256 前 12 碼（不含 assets、`__pycache__`；每個行程只算一次）。`serialwrap --version` 印 `0.3.2 (code 1a2b3c4d5e6f)`（僅被問時才算）；daemon 啟動時算一次，`daemon status` 回 `code_fingerprint` 與 `code_path`，每個 RPC 回應也帶 `code_fingerprint`。
   - client↔daemon 比對：版本相同但指紋不同時，CLI 在 stderr 印一行並建議 `serialwrap service restart`；exit code 與 stdout JSON 不變。舊 build 的 daemon 沒有此欄位時靜默。
   - `serialwrap setup`：同模式的 systemd 服務 active 且 daemon 指紋與剛安裝的不同（或 daemon 完全不回報指紋）時，刷新 unit 後自動 restart 並核對重啟後的指紋，結果放在輸出的 `daemon_code`；指紋相同、daemon 連不上、服務非 active、flash 進行中、on-demand 一律不動。system scope 未帶 `--with-sudo` 只把 `sudo systemctl restart serialwrap` 列入 `pending_sudo`。新增 `--no-restart` 略過重啟。
@@ -56,13 +56,13 @@
   - 相容性：`serialwrap --version` 輸出由 `serialwrap 0.3.2` 變成 `serialwrap 0.3.2 (code …)`，以 regex 取 `\d+\.\d+\.\d+` 的既有消費者（realhw、regression preflight）不受影響。實測 CLI 每次呼叫約多 1.6 ms（約 59 ms 的 2.7%）。
   - 規格見 `docs/serialwrap-spec.md` §8.7。
 - 新增可選 `cmd submit --expect-reboot`（RPC `command.submit` 的 `expect_reboot` 布林）：明示這條命令會重開機，不管命令文字一律走既有 reboot 路徑（送出當下 arm boot quiet window、不送 Ctrl-C／Ctrl-D、由 recovery 等板子回 READY）。過去 broker 只認單獨一條的 `reboot`／`systemctl reboot`／`shutdown -r`／SysRq，`firstboot -y && reboot`、`bcm_bootstate 3 && reboot`、`sysupgrade …` 會被當一般命令、送出當下不 arm 開機靜默窗：shell 不再回 prompt 的板子等到逾時再送 Ctrl-C／Ctrl-D，打在 U-Boot autoboot 倒數上；shell 立刻重印 prompt 的板子（prplOS 非同步 reboot）則被當成正常完成，後續命令落進正在 shutdown 的系統；agent 只能記住「reboot 必須單獨一條」。旗標經 CLI、RPC、submit-time gate、arbiter queue 傳到 execute；未帶旗標時 arbiter callback 仍是既有七參數，`command.get` 一律回報 `expect_reboot`，帶旗標的命令執行前於 WAL 寫 `command_expect_reboot` META，submit 回應回聲 `expect_reboot: true` 以便發現舊版 daemon 默默忽略旗標。
-  
+
   - 串接命令的 prompt 等待：單獨 reboot 維持等 2 秒；帶旗標的串接命令改等 `max(--cmd-timeout, --expected-duration)`。原本固定 2 秒時，前段超過 2 秒就誤入 recovery 分支，之後 prompt 回來（prplOS 的 reboot 非同步）會被 recovery 迴圈當成開機完成、對仍活著的 shell 過早 `confirm_ready()`，session 在板子真正掉線前就回 READY，後續命令落進正在 shutdown 的系統（以 PTY 假 target 重現，修正後 gate 維持 `AUTOBOOT_QUIET`）。
   - 與其他參數：`--mode interactive` 帶旗標以 `EXPECT_REBOOT_MODE_UNSUPPORTED` 零 TX 拒絕；非布林值（如字串 `"false"`）以 `INVALID_EXPECT_REBOOT` 拒絕，不做真值轉換；同時帶 `--completion-regex` 時 reboot 優先；開機靜默窗內旗標不繞過 `AUTOBOOT_QUIET`。
   - 沒帶旗標、但命令在 `&&`／`||`／`;`／`&` 之後含 broker 認得的 reboot 區段時，submit 回應多一則非致命 `CHAINED_REBOOT_WARNING`（`warning` 維持單一欄位、既有 `CMD_LENGTH_WARNING` 優先，`warnings` 列出全部）。只提示，不改變執行；`_is_reboot_command` 的判定範圍沒有擴大。
   - 新增回歸 case `f9-expect-reboot-chained`（真板 reboot 時序，寫成後尚未上板跑過）。
 - 0.4.0 `setup` 遇到 0.3.x 舊 daemon（`daemon.handoff_stop` 回 `METHOD_NOT_FOUND`）時不再一律拒絕（OD-48）：確認版本低於 0.4.0、正向辨識為 Python 0.3.x daemon 行程且不在 bundle 的 `versions/` 底下後，先做停止前檢查（其他同使用者 daemon、flash／session 忙碌、外部監管者），把行程資訊寫進 `install-journal.legacy.json` 並 fsync，再於自動啟動 hold 之下停止舊 daemon（該 pid 為 systemd unit 的 MainPID 時用 `systemctl stop`，否則 RPC `daemon.stop`；不硬殺）。舊行程樹全部結束、沒有同使用者行程持有 UART、且沒有新出現的 serialwrapd，連續維持 5 秒才算停止（上限 330 秒；被重拉時對新行程重做檢查後再停，最多 3 次）。成功後照常切換並由 setup 啟動新版 daemon，報告新增 `legacy_stop`。舊 daemon 停止後若任何一步失敗，自動還原安裝狀態但不重啟任何 daemon，報告附 `legacy_daemon_stopped`、`restored` 與啟動指令（OD-48 修訂）；等待逾時回 `legacy_stop_pending`，保留 journal 與 hold，下一次 `setup` 先確認舊行程已結束再還原。`supervision-mode set` 維持拒絕。
-  
+
   同時修正 `setup` 更新／首次安裝與 `supervision-mode set` 一律以 `local_default_endpoint` 探測舊 daemon 的問題（S1X-c-1）：改依舊模式解析 daemon instance endpoint（systemd-system 固定 `/run/serialwrap/serialwrapd.sock`、Windows 模式用預設 endpoint、其餘優先取 config 中可連線的 unix `socket_path`），啟新／驗證改用目標模式的 endpoint；endpoint 不可 RPC 時，掃到任何同使用者的 serialwrapd 一律以 `DEVICE_STILL_HELD` 拒絕，systemd 監管顯示 running 卻連不上 daemon 時亦同。修正 systemd enabled 狀態誤判（D8）：enabled 改以 `systemctl is-enabled` 判定，撤銷自動啟動 hold 時還原 hold 取得當下的原值，原本 disabled 但正在執行的 unit 不再因一次升級或拒絕被改成 enabled。
 - release workflow 新增 `publish-linux-bundle` job（RELEASE-TODO-01）：tag push 時於 `publish` 之後以 `cargo build --release` 與 `mkbundle.sh --release-bundle --profile release` 建出 Linux x86_64 Rust bundle，打包為 `serialwrap-<VERSION>-linux-x86_64.tar.gz` 並產生 `SHA256SUMS`，解開後 smoke（`--version` 等於 `VERSION`、`--help`、release manifest 版本一致、內層雜湊核對、不含 test-fakes 故障注入鉤子）通過才以 `gh release upload` 附加；tag、`VERSION` 與 Cargo workspace 版號不一致即失敗。既有 wheel 與 PyInstaller exe job 不變；Windows bundle 由擁有者 runner 建置後附加（見 `docs/rust-refactor/release-0.4.0-plan.md` RELEASE-TODO-01）。
 - 新增 `contracts/behavior_changes.yaml`：登記 OD-04 核准的 BC-01～BC-05（核准者、日期、目標版本、核准時 catalog revision、案例 ID、A/B 參與方式、相容性影響、核准條件），以及依定稿規格推導的 SC-01～SC-27 與缺陷修正 DF-01～DF-17、DF-19（self-test nonce probe 提交點 quiet 重驗；DF-18 保留給 P7），另含 §11.3 六項安全不變量對照與 7 項待擁有者確認事項及預設值。
@@ -136,10 +136,10 @@
 - Stage 1 出口 gate 讀取 Python daemon 基線缺陷登記（OD-75）。符合平台、狀態與失敗訊息特徵的案例維持證據 FAIL，另列「基線已知缺陷（不擋）」；未登記、只有 B 輪失敗、特徵不符，以及 A/B 兩輪都失敗尚未分類者仍擋出口。`l15_exit_driver.py --rejudge` 可用既有證據重判，不重跑測試。OD-30～OD-32 的擁有者延後列行為不變。初始登記為空。
 - Rust CLI 跟進 #234 `boot_done_regex`：`sw-proto` profile 載入新增 `boot_done_regex`（template 載入與 target 覆寫語意與 Python 一致），`serialwrap profile test` 回報 `checks.boot_done_regex` 是否命中，CLI help golden 依 Python 變更重產。
 - 新增 0.3.2 正式版 → 0.4.0 候選的 Linux 升級驗證（OD-33）：`scripts/docker/run-upgrade.sh` 在 OD-16 (5) 的 ubuntu:24.04 systemd 容器（`tools/docker/upgrade.Dockerfile`，不連網、不帶裝置）內，對 systemd-user 與 on-demand 兩種監管模式各自執行 pipx 安裝 0.3.2 → bundle 升級 → `setup --rollback` → 手動降級 → 重新升級，檢查入口取代、config／profiles 保留、alias／binding 相容、監管收斂、doctor 與全程無 two-reader，結果寫 `upgrade-report.json`。並新增 `docs/rust-refactor/release-0.4.0-plan.md`（發佈內容、升級／降級程序、已知升級問題與 release notes 草稿）。
-  
+
   升級驗證判準收緊（雲端審查 e270e89#1～#3）：基線必須實際含重綁後的 `shellboard:COM7` by-id（binding 相容檢查不得空轉）；兩個拒絕型檢查除現場未改動外，拒絕原因也須與規格相符（舊 daemon 執行中為 `METHOD_NOT_FOUND`＋`daemon.handoff_stop`、回滾為 `INVALID_ARGS`＋`rollback_unavailable`）；`setup --rollback` 若成功，CLI 與 daemon 皆須回到 0.3.2 且設定逐位元組保留。
 - 追蹤 [#229](https://github.com/hamanpaul/serialwrap/issues/229)，驗證紀錄見 [每命令完成條件驗證](../docs/229-command-completion-validation.md)。
-  
+
   - 新增可選 `cmd submit --completion-regex`，經 RPC、仲裁佇列與命令記錄傳到執行層；noisy console 無 shell prompt 時可依本命令的新 producer RX 完成，只裁切完成標記之後的 profile prompt、保留完整 stdout 與既有 reboot recovery。
   - 在所有提交／執行入口檢查有界、可編譯且不匹配空串的 regex，無效值以 `INVALID_COMPLETION_REGEX` 零 TX 拒絕；命令記錄與 WAL META 提供完成設定稽核。
   - PTY 覆蓋 numeric RC／END、echo-only、歷史標記、原 prompt fallback、CLI/RPC 傳遞及七參數 callback 相容性。
@@ -178,45 +178,45 @@
 - 清空 Stage 1A 委派集合（20 個頂層群組全部由 Rust 原生承接）並承接終端類操作（console-attach／detach 及 serialwrap-minicom 端到端驗證）。
 - Stage 1 出口 gate 的會計與來源修正（S1X）：擁有者機台相依的 cargo 列（`cap_*` 與 `windows_switch_running_exe_rename`）不論是否在凍結鎖內，未執行時一律列為 BLOCKED-OWNER，不再靜默消失；pytest JUnit 必須帶 HEAD、`SW_REQUIRE_CARGO=1`、`git_clean=1`（工作樹含未追蹤檔乾淨，排除 `target/`）、以 pytest 實際生效設定（`effective`：keyword、markexpr、deselect、ignore、maxfail、collectonly、lf、ff，已涵蓋 `addopts`、`PYTEST_ADDOPTS` 與合併短旗標）判定未縮小範圍，以及涵蓋 `tests/` 的 argv provenance（`scripts/rust/junit_provenance.py`）；spike3 證據須 `artifact.git_clean=true`（`spike3_win_wal.py` 產出，schema 新增 `git_head`／`git_clean`）；spike3 Windows WAL 證據（`win-wal-av-*`）依 schema 與 git_head 讀入，EDR 未知不得 PASS。`func-test/runner.py` 的 `compare: none` 以斷言步驟全數 PASS 定義 gate_eligible，平台不適用的 step（`platforms`）記為 not_applicable 且不計 PASS；結果輸出結構化 `not_applicable_steps`、`na_only_gap`，gate 僅將「缺口純為 n/a」的列排除於阻擋之外，PASS 須由其他平台列 PASS＋eligible 提供；INSUFFICIENT／SKIP 對映 evidence-insufficient，不再記為 FAIL。`capture_cli_help.py --out` 不再改寫受版控的 `contracts/cli_help/_meta.json`。計畫 04／05／03 的 L1.5 指令改為 `--mode bridge`（提議待 OD-S1X-03），docker Rust-CLI L1.5 宣告為 BLOCKED-PREREQ。
 - 依 OD-17（擁有者裁決，2026-10-22）將 mkbundle 相關的 `#[ignore]` cargo L1 列改由 pytest 替換登記：新增 L1 集合 `s1_pytest_full`（linux，selector 為 Stage 1 pytest 全套 `-q tests/ -p junit_provenance`），收錄 `tests/test_rust_mkbundle.py::test_mkbundle_respects_cargo_target_dir_override` 與 `tests/test_rust_release_manifest_schema.py::test_manifest_schema_accepts_new_optional_fields` 兩個替換案例（兩者內含 `--ignored --exact` 驅動並斷言 `1 passed`），再逐名移除 `s1a_cargo`／linux、`s1b_cargo`／linux、`s1b_cargo`／windows 中對應的 `real_mkbundle_dev_output_verifies` 與 `mkbundle_respects_cargo_target_dir_override` 列（共 4 處、2 個唯一 nodeid）。`tests/acceptance/regen_lock.py --l1-add-only` 全程 add-only，移除以 `--allow-removal` 逐名核准；`.github/workflows/tests.yml` 與 `tests/test_resource_report.py::test_workflow_ci_l1_gates` 的核准清單同步。
-  
+
   Stage 1 出口 gate（`scripts/rust/stage1a_gate.py`）新增 `s1_pytest_full`／linux 列：報告讀 `<--l1-results>/linux/pytest-full/resource-report.json`，junit 取 `--pytest-junit-report`，每個凍結 nodeid 須在通過 provenance 驗證的 JUnit 中恰出現一次且為 passed（CHG-S1X-OD17-GATE-01，收緊，未新增放行規則）；缺報告、集合不存在、INSUFFICIENT 或 INVALID 一律為證據不足，FAIL 仍為 FAIL，未新增放行規則。`check_p4_cases.py` 未接線，以避免循環依賴。尚未執行 Stage 1 pytest 全套，故該列在產生報告前不得標為 PASS。
 - 依 OD-18 收斂 Stage 1 P4 證據閘門：平台不適用的（案例, 平台, 節點）組合不再要求該平台 rust PASS，但僅限 `check_p4_cases.py` 內 15 列核准清單（`APPROVED_NOT_APPLICABLE`），實算不適用列與清單不一致即 FAIL（待擁有者核准）；每個必要案例仍須至少一個平台有 rust PASS，不適用節點出現紀錄仍計為 FAIL。Windows dev bundle 的 `current-release.json` 指標 `dir` 一律以正斜線 `versions/<V>` 表示（launcher 拒收含反斜線之 dir），計畫 04 Task 17 與 `win-blackbox.ps1` 同步修訂；讀取端仍相容舊反斜線指標。
 - 登錄擁有者 OD-34～OD-44，新增 DF-20～DF-22，並使 Slice 2.4 計畫的承接率斷路器使用切片開始時凍結的三週觀測窗口。
 - S1X G5（sc20-daemon-restart）：`tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_restart_ab` 補上 P0 T14 規定的唯一平台 marker `posix_only` 與資源 marker `process_rpc`（依賴 `/proc` 與 `sh`，Windows 由 cargo `mgmt_daemon::restart_*` 承接 sc20）。該節點因此被 Linux `s1b_20groups` selector（`-m "core_portable or posix_only"`）收集，原先為「兩平台凍結 selector 皆不收集」而一律 FAIL 的狀態解除。
-  
+
   L1 凍結鎖 `tests/acceptance/l1_required.lock.json` 以 `regen_lock.py --l1-add-only` 於 `s1b_20groups`／linux 新增該 nodeid（新增 1 筆、移除 0 筆）；收集輸入限定為既有鎖定節點加該節點，逐字取自實際 `--collect-only` 輸出。windows 集合未變動。未放寬任何 judge、check 或斷言。
-  
+
   同步調整 `tests/test_check_p4_cases.py::test_pass_for_node_outside_every_selector_is_rejected`：原以 `test_daemon_restart_ab` 作為「兩平台皆不收集」之例，該前提因本變更不再成立，改用仍無平台 marker 之 `test_daemon_start_ab_conflict`，斷言不變。
 - Stage 1B 20groups 委派 sentinel bundle 改為扁平佈局（PENDING-OD-S1X-20GROUPS-LAYOUT 選項 (i)）：`scripts/rust/mkbundle.sh --delegate-sentinel` 的組成與 dev bundle 相同（`bin/serialwrap`、`bin/serialwrapd`、`py/sw_core`、`py/serialwrapd.py`、`SHA256SUMS`、`release-manifest.json`），僅將 `python_cli_delegate.entry` 改為 P4 sentinel（非委派守門：任何漏網委派都寫入 `DELEGATED` marker 並 exit 97）；stage 仍為 `rust-1b-dev`。組裝程序抽為 `assemble_bundle` 由 dev 與 sentinel 共用。`SHA256SUMS` 涵蓋包含 `.mkbundle-owner` 在內的全部檔案（僅排除 `release-manifest.json` 與 `SHA256SUMS` 本身；本段原述之排除已由 `rust-s1x-sentinel-checksum-owner-marker.md` 取代）。
-  
+
   測試端：`tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_ab_version_pairing_in_bundle` 標 `pidns_rig`，host 上其他 serialwrapd 造成的 pid 計數不穩由隔離 namespace 排除（測試斷言不變）。plan 05 Task 16 Step 4 的 20groups 命令補 `SERIALWRAP_DAEMON_EXE` 並於執行前移走既有 ab-suite 輸出。整段重跑證據尚未取得（見 `owner-decisions-addenda.md` CHG-S1X-OD16-OPEN-01 (e)）。
 - Stage 1 出口驅動腳本與計畫命令修正（S1X G2）：新增 `scripts/rust/stage1_exit_driver.sh` 作為 Stage 1A＋1B 一併出口的可重現入口。自測報告改以 `tools/uart_stdio_bridge/APPROVED_REVISION.json` 的核准 tree（c4c22c0e）挑選（`selftest-linux-20261022`、`selftest-windows-20261022`），找不到即非 0 結束，不再退回 tree 9eaed6de 的舊報告；`SW_BUNDLE` 明確 export；完整 pytest 改為唯一一次，並於 1B 證據登記與 `check_p4_cases` 之後執行（`SW_RESOURCE_REPORT` 寫入 `l1/linux/pytest-full/`，供 gate 第 7 列）；register 帶入 Windows CLI 與 junit；Windows L1.5 改接 G3 wrapper `win-func-test.sh`（帶 `--bundle <OutDir>/bundle` 與 `--selftest-report`，不帶 `--case`）、spike3 改接 `win-spike3.sh`（`--evidence-dir <run>`，單次執行四案，證據寫入 `<run>/spike3/<case>.json`），gate 帶 `--l15-report windows=` 與 `--spike3-evidence`；未設 `SW_EDR_*` 時 spike3 為 evidence-insufficient（整體 FAIL），非 BLOCKED-OWNER，驅動啟動時警示；既有 `target/p4-evidence` 與 `p4-bench-*.json` 於開頭整個搬到證據目錄（搬不刪），並以 mtime 檢查各報告產生於本次開跑之後（`cp -p` 保留來源時間）；報告路徑一律取工具輸出的 run_id，不以 `ls -t` 猜測；補跑 plan 05 Step 4 的兩步 bench（隔離 throwaway serialwrapd 與 bb_stubd）；移除重複的 `pytest_final` 與同一 HEAD 的重複 cargo 測試。plan 04 Task 19 Step 5 與 plan 05 Task 16 Step 4 已附 S1X 修訂說明。
 - Stage 1 systemd docker 實跑基底 pin 變更（OD-16 (5)，解除 BLOCKED-PREREQ-S1X-04）：`tools/docker/systemd.Dockerfile` 的基底由 `debian:12-slim`（glibc 2.36）改為 `ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac`（glibc 2.39，與 host 建置一致；Python 3.12.3）。digest 取自 `docker buildx imagetools inspect ubuntu:24.04` 的 index digest。apt 來源改為 Docker 官方 `ubuntu noble` 套件庫，`docker-ce-cli` 釘為 `5:29.8.2-1~ubuntu.24.04~noble`；新增 `python3-yaml`（bundle 的 py 執行環境以 `--system-site-packages` 建立，daemon 以 `-I` 啟動，須由系統 site 提供 PyYAML，與 host 的 `python3-yaml` 同源）；image 內預設 UID 1000 的 `ubuntu` 使用者先移除，以容納測試使用者 `swtest`（UID 1000）。原因：`test_update_systemd_exit1_not_relaunched_l15` 於 debian 基底下因 host 建置的 Rust 二進位需 `GLIBC_2.39` 而失敗（`GLIBC_2.39 not found`）。本 pin 同時影響 `scripts/docker/run-l15.sh`（其 build 步驟亦建置 systemd image）與 `run-systemd.sh`；`tools/docker/serialwrap.Dockerfile` 未變更。
-  
+
   同輪於 `scripts/docker/run_systemd_container.py` 的 `_run_update_exit1` 修正 harness 缺陷（非測試斷言變更；未放寬任何判定）：(1) 初次 `setup --user` 後以 `service restart` 啟動受監管 daemon 再等待 READY，與 `systemd_container.initialize_supervised` 相同（跨模式 setup 只註冊 unit）；(2) bridge 建立的 PTY slave 交給 swtest（`serve()` 既有做法）；(3) `_read_daemon_status` 的 `REPO` 改用 `systemd_container.REPO`（原為未定義名稱）；(4) `_holder_pids` 改為 root 與 daemon 使用者兩輪 `/proc` fd 掃描取聯集，仍無法讀取的現存行程拋出 RuntimeError（fail-closed）。原掃描以 root 執行，容器 root 無 CAP_SYS_PTRACE，讀不到 swtest 行程 fd 表，`OSError` 被吞為「無持有者」，會使 holder 判定恆真。
-  
+
   實跑證據：`tests/contract_blackbox/test_cli_mgmt_update.py::test_update_systemd_exit1_not_relaunched_l15` 1 passed（report verdict PASS、`evidence_layer: "L1.5-docker"`、producer `run-systemd.sh`、old daemon exit 1、NRestarts 0、holder marks 成對、current release 0.4.1）；`scripts/docker/run-systemd.sh --scenario hold` 亦 PASS。
 - 新增 Windows 原生 CPython 3.12.3（embeddable）擷取的 argparse help／usage／錯誤 golden：`contracts/cli_help/windows/` 共 14 筆情境（`--help`、`profile test --help`、10 個錯誤情境，以及 `test_platform_oracle_exists_and_boundary_values_are_native` 強制要求的 2 個平台 oracle 邊界值 `boundary_socket_connect`、`boundary_endpoint_connect`）與 `_meta.json`（`python_version` 3.12.3、擷取時的 git revision）。計畫字面為 12 筆；多出的 2 筆由該測試與凍結 lock 直接要求，須由審查者確認。`scripts/rust/capture_cli_help.py` 補 Windows 擷取可攜性：以擷取用直譯器執行 CLI、子行程輸出以 UTF-8 解碼、golden 一律寫為 LF、固定 env 與黑箱測試 `_env` 一致（`/golden/...`），新增 `--git-revision`，且 Windows 擷取不再改寫共享的 Linux `contracts/cli_help/_meta.json`；Linux golden 位元組不變。
-  
+
   oracle 變更：新增 Windows cli_help oracle（規格 §0.4），須由非實作者的審查者核可後方可凍結進 `s1a_blackbox.windows`。
 - Stage 1A 出口 G3 的 Windows 證據產生器：新增 `scripts/rust/win-func-test.sh`（以 WSL interop 在 Windows 本機 staging 執行 `func-test/runner.py --mode bridge --scenarios --daemon-com COM20 --bridge-com COM21 --transport-mode virtual_com0com`，產出 `--l15-report windows=` 來源）、`scripts/rust/win-spike3.sh`（以同一套 staging 執行 spike3 四案 `win-wal-av-rotate`／`win-wal-av-unlink`／`win-wal-av-reader-handle`／`win-wal-f12-progress`，產出 `--spike3-evidence` 來源），以及共用的 `scripts/rust/win-stage-lib.sh`（HEAD 子集 staging、以 PID＋起始時間監管 Windows 子行程）。EDR 參數只透傳呼叫者提供的值，wrapper 不自填；COM 僅限 COM20:COM21。新增 `tests/test_rust_win_func_test.py` 以靜態與 `--print-argv` 斷言 argv、COM 範圍、EDR 透傳與拒絕路徑。本變更不改 runner、spike3 工具與 gate 的判定規則。
 - 收緊正式 bundle 的 `test-fakes` 守門（cargo argv 的 `--features`）、L1.5 等待測試（LF 寫入前不得返回），以及 changelog fragment 的 policy_check 解析。README 的 0.3.x 升級步驟改為 OD-48 已可在 daemon 執行中升級；可觀察變更表更正 Rust CLI 已接受 `--expect-reboot`。
 - `uart_stdio_bridge` 核准 tree 更新為 `dde967aa…`（外層第 4 輪兩位非實作者審查皆 `BRIDGE: APPROVE`）；`s1x-bridge-review-3.md` 標明來源無法核對的舊核准原文不採信，新增第 4 次送審審查原文作為 `review_ref`。
 - 收緊 L1 凍結鎖的移除核准粒度（行為變更僅限測試閘門工具）：`tests/acceptance/regen_lock.py` 的 `--allow-removal` 改為 `set_id:platform:nodeid` 三元組，裸 nodeid 與非法格式以用法錯誤（exit 2）拒絕，`--check --base` 與 `--l1-add-only` 皆逐三元組比對。CI 之 `--allow-removal` 清單與釘定清單同步改為 545 筆三元組，逐筆對應真實移除事件（OD-16 (1)(2)、OD-17、既有 Linux 占位與舊裁決），不新增任何放行。`tests/test_rust_bench_tools.py` 之三個 pid namespace／`/proc` 測試移至 `tests/test_rust_bench_tools_posix.py`（模組層 `posix_only`，函式名稱不變）以修正平台分類。
 - Stage 1 出口 G5 黑箱 L1.5 oracle 修正（test oracle 變更；審查狀態：待兩位非實作者審查，未放寬任何斷言）：
-  
+
   - `tests/contract_blackbox/test_cli_mgmt_l15.py`：`test_restart_no_reopen_before_handoff`、`test_restart_no_stale_console_replay` 的 holder 交接判準改為 restart 期間背景取樣（`bb_l15.HolderObserver`），斷言取樣中新舊 holder 不得同時存在，且舊 holder 最後一次釋放不晚於新 holder 首次開啟（`bb_l15.assert_holder_handoff`）。Before：操作完成後才以 `wait_holder` 探測並依測試自身的呼叫順序寫入 `closed`／`opened` 標記再比較，因此即使新舊 holder 重疊，`old_close < new_open` 仍必然成立（假綠）。After：取樣自操作開始前即進行，取樣起點須已見舊 holder，重疊即 FAIL；`control.ndjson` 的 `opened`／`closed` 標記改為依取樣邊緣回放，僅供留存、不作判準。
   - `tests/contract_blackbox/bb_l15.py`：`run_nodeid_in_pidns` 的子 pytest exit status 非零一律回 `failed`，診斷保留 exit code 與 stderr／stdout 尾段。Before：`del returncode` 丟棄 exit status，僅憑單筆 JUnit 判定，子行程以 exit 1／3 結束而 JUnit 為 passed 時會被判為 PASS（例如 conftest live guard 以 `session.exitstatus=1` 回報的失敗）。
   - 新增 `tests/test_bb_l15_holder_observer.py`（含刻意重疊的負向測試，oracle 必須拒絕）與 `tests/test_bb_l15_pidns_exit.py`（stub 子行程回歸）。
   - 限制：取樣為 polling（單次掃描約 15–30 ms，觀測期間約佔一個 CPU 核心的大部分），短於一次掃描週期的瞬時重疊無法被觀測；判準為「已取樣到的重疊不得存在」，不宣稱完備。
   - 案例名稱與數量不變；`s1b_20groups` 之 nodeid 未改動。新增 nodeid 之 add-only 登記另由 G8 處理。
 - OD-19（2026-10-23）端點防毒驗收改為與防毒產品無關（S1X）：Windows WAL 的 rotate 與 unlink 遇共用違規（ERROR_SHARING_VIOLATION）或存取拒絕（ERROR_ACCESS_DENIED）時改為有上限的退避重試（10／50／200 ms），仍失敗者進入延遲佇列（1 s 間隔、非阻塞，於後續 append 或 `tick()` 重試直到完成），寫入路徑不持鎖睡眠且不因輪替阻塞；`health.status` 的 `wal` 新增 `rotate_retry`、`rotate_deferred`、`deferred_delete_pending` 三個整數觀測欄位（不改 `healthy`）。新增 `scripts/stage0/av_sim.py` 模擬防毒持有（不含 FILE_SHARE_DELETE、seed 可重現、10～500 ms）作為可重現的故障注入；spike3 改以 av_sim 注入與 `binary_integrity`（執行檔前後存在、sha256 不變、啟動未被拒）判定，防毒產品名與狀態改為工具唯讀查詢的資訊欄位，`--edr-*` 自填參數與 `SW_EDR_*` 已移除，`stage1a_gate` 的 spike3 判準隨之改為 binary_integrity。
-  
+
   接線與收緊（2026-10-23 審查修正）：`SerialwrapService` 的 DeviceWatcher 週期回呼改為先 `WalWriter.tick()` 再 `reconcile_readiness()`，使延後輪替在無新寫入時仍會完成；tick 驅動的現行檔輪替完成時寫入 `WAL_ROTATED_AFTER_DEFERRAL` META（維持現行檔存在與重啟後 seq 續接）。`AdmissionGate` 僅撤銷由交接自身建立的凍結。spike3 gate 收緊為逐 subject 重算 sha256、要求 `grabs ≥ 1`、`launch_error == none`，且 oplock 變體未實作（`not_implemented`）時不得 PASS（`oplock_not_covered`）。producer 現記錄每次 `WalWriter.append` 毫秒耗時；缺少有效樣本不得 PASS，上限未經 owner 裁決時維持 BLOCKED-OWNER。WAL 輪替持續 deferred 時每 60 秒最多再告警一次。
 - `file.push`／`file.pull` 傳輸中遇 drain、bridge 世代過期或取消時，改依擁有者裁決 OD-62（比照 BC-03）回應：本次傳輸尚未寫出任何 byte 回 `FLUSHED_BY_RECOVERY`（可在 READY 後重送），已寫出 ≥1 byte 回 `COMMAND_ABORTED_IN_FLIGHT`（不得自動重送），push 附 `chunks_sent`／`chunks_total`；0.3.2 在這些情境回 `TRANSFER_TIMEOUT`。「已寫出」以整段傳輸共用的操作 permit 累計。同步 `contracts/rpc_schema.json` 兩方法 `errors`／`error_order`、`contracts/error_codes.yaml` 兩碼 scope、BC-03／SC-04 `compatibility_impact` 與 SKILL 受管區段（S1X-a-4 第 2 輪）。
 - 契約補記 OD-63 佔位 session 的兩個既有行為（編排者裁決 S1X-a 第 3 輪 SPEC-GAP 1、2），程式不變：`contracts/rpc_schema.json` 的 `session.bind` result 比照 `session.attach` 的 RELEASED 分支補 `released`、`recommended_action` 屬性與 `x-order`，side_effects 的一般路徑一筆加 x-condition 排除佔位，另補一筆佔位早退項（佔位不離開 RELEASED、無其他副作用），`x-catalog-revision` 依 P0 規則遞增（rpc_schema 14→15；file.* META 說明同輪修改的 wal_meta_events 4→5）；DF-04 的 compatibility_impact、`openspec/specs/device-handoff/spec.md` 的 OD-63 情境與 README（中英）補述佔位 `session bind` 的回應，以及佔位開埠失敗且無 passthrough fallback template 時不留列（`device attach` 回 `SESSION_NOT_FOUND`）、`_pending_com` 保留原 COM 至裝置拔除或 daemon 重啟，之後依 dynamic 規則重新分配 COM。
 - 補上游 agent skill（`sw_core/assets/skill/SKILL.md`）三處過時或缺漏，並同步 README／`docs/serialwrap-spec.md` 中同樣不準的句子；不改程式行為，每個數字與行為皆對照 `session_manager.py`、`config.py`、`setup_cmd.py` 核實。
-  
+
   - `cmd submit` 的期限語意：總期限是 `--cmd-timeout`（命令一直有輸出也一樣會到點進恢復）、靜默上限是 `min(--cmd-timeout, 30s)`；`--expected-duration` 只延長總期限、不延長靜默上限，舊文「暫停 prompt timeout」不成立，已更正。逾時後非 human 來源依序送 Ctrl-C、Ctrl-D（各在 `min(--cmd-timeout, 2s)` 內比對 prompt），Ctrl-D 打在已登入的 shell 等於登出，開機靜默窗內不送。建議長時間或會靜默的命令在板上以 `setsid` 丟背景再輪詢；`--mode background` 與 `line` 共用同一段等待邏輯，不是長命令出口。
   - boot quiet window 補 `boot_done_regex`：命中 `login_regex`、`prompt_regex`、`boot_done_regex` 任一即解除（尾行為 `bootloader_prompts` 例外），三者都不中才等滿 180s；prplOS askconsole 要靠此欄位。`serialwrap setup` 不覆寫既有 profile，舊安裝需手動補欄位並重啟 service。
   - `--completion-regex`：指向 `docs/command-completion.md`，補要點（行首錨定、數字 RC 加獨立 END 行、每次換 nonce、上限 1024 bytes、不匹配空串）；它只換掉「等什麼」，總期限、靜默上限、逾時恢復語意不變，reboot 仍走既有 recovery。
@@ -259,85 +259,85 @@
 - Stage 1B 凍結 selector（`cargo test --workspace` 與 Windows `--package sw-pal --package sw-cli`，皆不含 `--features`）會再編譯兩支委派整合測試。行程內 override 不進入環境變數鉤子；`SERIALWRAP_TEST_DELEGATE_GROUP` 與 `SW_TEST_UPDATE_` 仍只在 `test-fakes` 建置讀取。不恢復 `sw-cli` 自我依賴，正式 release binary 不含那些字串。
 - Stage 1B A 輪若所有必要節點都是核准的 `rust_only` skip，且 JUnit 與 PID 日誌證明未啟動受測行程，改記實際 runner 環境摘要；其他設定紀錄缺失仍 fail-closed。
 - Stage 1B A/B 執行器的 Python 輪 skip 登記改為只核准 `rust_only` 節點，同一登記案例內的共用節點須實際執行並比較，不再因案例登記而整案拋出錯誤、導致 `summary.json` 未產生。`mkbundle.sh` 拒絕覆寫非空且非 mkbundle 建立的輸出目錄（exit 2，不寫入），mkbundle 建立的目錄則整個重建，避免 sentinel 與 dev 佈局混用、bundle 定位取到過期的頂層 manifest。
-  
+
   遷移（一次性，擁有者確認後執行）：舊版留在 `target/mkbundle-dev` 的無標記目錄會使 `mkbundle.sh --dev --out target/mkbundle-dev` 以 exit 2 拒絕，指令為 `rm -rf target/mkbundle-dev`。`ab_blackbox.sh` 已改為 `target/ab-runs/<run>/bundle`，不再讀取該目錄；pytest 的 `SW_BUNDLE` 預設改為 `target/mkbundle-pytest`（`test_fresh_install_blackbox` 與 `test_cli_mgmt_doctor`），該目錄不存在時測試明確失敗並提示建置指令，不再以舊目錄的過期 bundle 驗證。
 - 依 COM20:COM21 原生實測（`g3-peer-gate/261023-061416-2646662`），win-serial 端點於 com0com 且 `peer_gate=True` 時宣告 `peer_state`，對外 `status.peer_open` 為 DSR 即時取樣；非 gate 情境仍為 null。`transport_disconnect` 恆為 False（com0com 無不需管理員權限的斷線原語）。測試名稱同步改為描述新行為（`test_win_serial_status_reports_peer_open_when_peer_gated`、`test_peer_gate_declares_peer_state_capability`），並移除「函式名稱保留以維持 nodeid」之註解（該名稱未見於任何凍結鎖或腳本）。工具 tree 已變動，核准狀態見 `CHG-S1X-BRIDGE-PEER-STATE-01`（未核准）。
 - 修正 holder 探測以 readlink 字串或 `st_rdev` 判定同一 tty 的缺陷：docker 容器內獨立 devpts instance 的 `/dev/pts/N` 與主機同名、同 rdev（136:N），卻非同一裝置，會被誤判為外部 holder（可能使 host namespace 的 daemon attach 回 `DeviceHeldError`，並使黑箱 helper 的等待條件假成功）。
-  
+
   現行判準（`sw_core/serial_port.py::same_tty`）：`(st_dev, st_ino)` 相同即同一 tty；另允許非 devpts 字元裝置的 mknod 別名（兩邊皆 char device、rdev 相等且非零、major 不在 136–143），以涵蓋容器以 mknod 掛入同一實體 UART 節點之情境。devpts 不以 rdev 判定。`probe_holders`、`UARTBridge._enumerate_all_held_paths`（先以字串篩除非 `/dev/` link，降低 reaper 的 syscall 成本）與 `detect_multi_open` 皆採此判準；Rust `crates/sw-pal/src/proc_scan/posix.rs::serialwrapd_tty_holders` 同步。目標 tty 無法取得身分時回 `unknown`，不再當成確認無 holder。保留既有 permission／unknown 狀態語意。
-  
+
   黑箱測試 helper `_external_holders` 同步採同一判準。既有以假路徑佈置 holder 的單元測試改用實體檔案，rdev-only 正面案例改為非 devpts mknod 別名正面，並新增 inode 別名與跨 devpts 負面案例。新增 `tests/test_holder_probe_namespace.py` 作為 namespace 碰撞回歸（#155：pytest 可覆蓋，免 `regression/` case）。行為變更之擁有者登記見 `CHG-S1X-HOLDER-IDENTITY-01`（OPEN）。
 - Stage 1 黑箱 rig 改於獨立 user+pid+mount namespace 內執行：自啟 daemon 並呼叫 CLI `daemon start／restart`、`setup` 更新／回滾、`supervision-mode set` 的 Linux rig（`pidns_rig` 標記）整段重跑於隔離 namespace，不再因宿主生產 `serialwrapd` 或容器 daemon 被多開偵測而誤判 `DEVICE_STILL_HELD`／`DAEMON_ALREADY_RUNNING_ELSEWHERE`；namespace 不可用時 skip 並註明能力原因，不以 PASS 放行。`ab_blackbox.sh` 整段（A 輪、釋放確認、B 輪）於同一 namespace 內執行，並以 preflight（exit 4）判定非隔離或可見外部 `serialwrapd` 的 run 為 INVALID，身分檔記錄 `pid_namespace_isolated`（僅記錄，守門為 preflight）。`ab_blackbox.sh` 改於 `target/ab-runs/<run>/bundle` 建置本次 bundle，不再共用 `target/mkbundle-dev`。
-  
+
   修正 Rust CLI 回滾時 `start_and_verify` 誤啟動新版 daemon 的缺陷：POSIX 穩定入口為 symlink，PAL `is_file` 不跟隨連結，改以 `CLI 自身 bundle` 的 launcher 啟動，回滾必回報 `pairing_mismatch`；改為跟隨連結判定穩定入口。交接停止（`daemon.handoff_stop`）成功後，Python daemon 的 RPC 監聽保留有界排空窗口（`HANDOFF_DRAIN_GRACE_S`，3 秒）再停止，窗口內有副作用請求取得 `FLUSHED_BY_SHUTDOWN`＋`reason:"handoff_frozen"`，而非 socket 錯誤（此為 SC-11 字面「回覆後立即停止」的偏離，待擁有者或規格協調確認）。交接停止成功後的 `handoff_stop` 記入 setup／supervision 回報的 `ran`（與 `daemon stop` 對稱）。黑箱 chunk 延遲改以實際送出的 chunk 指令前綴觸發；busy push 測試以 ACK-gated 傳輸（`ack_mode=auto`）、16 KiB 檔案、20 秒首個 ACK 延遲，並以 `--chunk-timeout`（`BUSY_CHUNK_TIMEOUT_S`＝60 秒）避免 CLI 在 ACK 前逾時送出清理指令而破壞零 TX 斷言；背景執行緒例外於 `join()` 重新拋出；supervision 切換測試等待 holder 行程以 `serialwrapd` 身分出現於 `/proc`，消除競態。
 - 修正 Stage 1 出口 gate 與 P4 完成度檢查的 junit 計數：pytest 9 的 subtests 會計入 testsuite 的 `tests` 屬性，但不產生對應的 testcase 元素，致使 `s1_pytest_full` 的 junit 與 l1-results 列數永遠不符（5024 對 4932，差值 92）而判為證據不足。`scripts/rust/stage1a_gate.py`（黑箱分支與 `_junit_totals`）與 `scripts/rust/check_p4_cases.py`（`_junit_counts`）改以 testcase 元素逐一計數，計數實作依路徑載入 P2 `tests/acceptance/check_evidence_index.py::_junit_counts`，不另寫一份；P2 模組缺席或載入失敗時 fail-closed（閘門記入 errors 而整體 FAIL，P4 檢查列為 BLOCKED-PREREQ）。l1_judge 的逐項嚴格相等比對不變，pytest JUnit 含失敗或錯誤的整份失敗判定照舊；真正不一致（testcase 數與報告不等）仍判為證據不足。
-  
+
   補充（S1X 出口收尾）：`register_p4_evidence.py` 之 junit 計數改委派 `check_p4_cases`（再委派 P2 `check_evidence_index._junit_counts`），登記與檢查路徑採同一 testcase 層計數。
 - Windows L1.5 exit driver 依案例 YAML 驗證重複執行次數、run index 與證據路徑，接受完整合法重複報告並繼續拒絕缺次、重複索引及未授權失敗。
 - 依計畫 05 L3733 與附錄 B-17 修正 Stage 1 P4 完成度檢查對 `p1-rst-daemon` 的擁有者分類。該案例的 windows-task 面證據須以擁有者 throwaway Windows 工作實跑（`spike2 -Phase restart`）產生，該實跑不得於 73 h 長跑進行中執行，且 stage1 driver 不執行 judge_spike2；先前 `check_p4_cases.py --check` 僅對 L2／L3／manual 且標 `evidence_status: BLOCKED-OWNER` 的案例歸類擁有者缺口，`p1-rst-daemon`（L1.5、無該標記）因而只能判為 FAIL，exit 2 不可達。現改為：`JUDGE_SPIKE2_CASES` 之案例證據檔缺席時判為 BLOCKED-OWNER（exit 2，不得 PASS）；證據檔存在時照一般規則判定，FAIL 紀錄與無效紀錄（含 INSUFFICIENT_EVIDENCE）仍為 FAIL。`JUDGE_SPIKE2_CASES` 改為 `check_p4_cases.py` 的單一共用常數，`register_p4_evidence.py` 直接引用，兩支腳本的 owner 判定不再分歧。本次未修改 `p4_case_map.yaml`、`p4_required.lock.json`、案例 layer 或 evidence_status，亦不屬 lock amendment。
 - 修正 Stage 1 P4 證據管線與 Windows 黑箱腳本的缺陷（G4-p4-evidence-pipeline-and-windows-bundle-pointer），各項皆先以紅燈測試界定再修正：
-  
+
   - (a) `win-blackbox.ps1` 的 `bin\current-release.json` 之 `dir` 回復為 plan 04 Task 17 的 `versions\<V>`（相對安裝根）。`realhw/deployed_content.install_dir` 的 Windows 分支與 `register_p4_evidence` 的 manifest 候選改以 `cli.parent.parent` 解析，反斜線先正規化；絕對路徑與 POSIX 行為不變。Rust launcher 對反斜線 `dir` 的拒絕規則與 plan 04 Task 17 的衝突另列 OPEN（PENDING-OD-S1X-WIN-DIR-SEP），未在本次裁定。
   - (b) `pidns_rig` 子行程寫入的 pid 為 namespace 內部編號。`bb_daemon` 的 pidlog 列附 `pid_ns`，`bb_l15` 另記錄外層 unshare 的 host pid。`ab_blackbox_1b._release_check` 對不同 namespace 的列改以「host 上無行程屬於該 namespace」判定，仍有成員即 unreaped 並列出其 host pid；與 host 同 namespace 的列照原邏輯檢查，嚴格度不降低。**`bb_daemon.py` 與 `bb_l15.py` 為黑箱 oracle 基礎設施，待非實作者審查。**
   - (c) `register_p4_evidence` 的 cargo 執行檔改由凍結 `s1b_cargo` selector 的 argv 執行 `cargo test --no-run --message-format=json`（Windows 加 `--target x86_64-pc-windows-gnu`）取得，依 package＋target 唯一對應；對應不到或不唯一仍 FAIL。取代先前以 glob 搜尋 `target/debug/deps` 的做法。
   - (d)(e) 平台適用性共用規則（`check_p4_cases.platform_applicability`，`register`、`check`、`ab_blackbox_1b` 皆採用）：cargo 節點以是否在該平台 `s1b_cargo` 凍結鎖中判定；contract_blackbox pytest 節點以該平台 `s1b_20groups` 凍結 selector 的 markexpr 收集結果判定。不適用的（案例, 平台, 節點）組合不產生紀錄、不在該平台執行，並逐列列於 `summary.json` 與標準輸出的 `not_applicable`。兩平台皆不適用者一律 FAIL。**此規則縮小了必要證據的分母，須擁有者核准：見 CHG-S1X-P4-APPL-01（OPEN，共 14 組）。** Windows 巢狀 ab-suite 因此不再執行 `test_daemon_restart_ab`（依賴 /proc 與 sh，不在 Windows selector 中）。
   - (d') Linux A/B 選取回復 HEAD 之負向標記過濾，`test_daemon_restart_ab` 仍在 Linux A/B 內（A/B 覆蓋不縮減，CHG-S1X-P4-LINUX-AB-01）。
   - (f) `win-blackbox.ps1` 於 staging 刪除前把 `l1\windows\blackbox\ab-suite\` 複製回 OutDir；Windows dev bundle 匯出到 `<OutDir>\bundle\`（`bin\serialwrap.exe`、`bin\current-release.json`、`versions\<V>\release-manifest.json`，以及 manifest 的 `cli.path` 所指的 `versions\<V>\bin\serialwrap.exe`）。匯出失敗只記錄警告、不覆蓋原錯誤，且 scratch 一定刪除（巢狀 `finally`）；逐檔檢查來源存在，缺者略過並警告。`register_p4_evidence` 的 Rust CLI 以 `<OutDir>\bundle\bin\serialwrap.exe` 登錄時，Windows 穩定入口是 manifest 所指檔案的 byte 複本，故新增 `_windows_stable_entry_of`：僅限入口位於 `bin\`、同目錄指標解析到該 manifest 版本目錄，且內容仍須通過既有 sha256 比對；位於他處的同 byte 複本仍拒絕。
-  
+
   未修改 `p4_case_map.yaml`、`p4_required.lock.json` 與 `l1_required.lock.json`；未刪除案例、未放寬斷言或 judge 的判定規則。(d)(e) 之分母縮減與 `_windows_stable_entry_of` 的路徑放寬，皆待擁有者核准（見 CHG-S1X-P4-APPL-01 與 addenda）。
-  
+
   未完成項（OPEN，不得記為 PASS）：`test_daemon_restart_ab` 不在任一平台的凍結 selector 內，sc20-daemon-restart 兩平台皆 FAIL（PENDING-OD-S1X-P4-SC20）；bc05-three-topologies 在 Windows 無任何適用節點（PENDING-OD-S1X-P4-BC05-WIN）。兩者使 `check_p4_cases.py --check` 與 `test_p4_required_cases_have_passing_evidence` 恆為 FAIL，此為事先存在之缺口（sc20 於 HEAD 即無 Linux 紀錄來源），須由擁有者或計畫層級裁決。原生 Windows 黑箱實跑（2026-10-22）：巢狀 ab-suite 因 Windows selector 僅剩 rust-only 的 `test_autostart_l15_tx_once`，A 輪無受測行程而未留下 PID 日誌，B 輪未啟動；Windows COM 自測 ST-04 為 FAIL（bridge 工具，非本組）。`ab_blackbox_1b._bundle_identity` 於 Windows staging（無 `.git`）執行 `git rev-parse HEAD` 未捕捉 `CalledProcessError`，屬潛在缺陷，本次未修。
 - `process_ctl` 測試中以重新執行自身方式驗證 SIGCHLD 忽略（ECHILD）的 helper 改以 `output()` 擷取子行程 stdout／stderr，避免子 libtest 的 `running 1 test`、`.` 與 `test result:` 列繼承到父行程，與並行的 `test … ok` 結果列交錯，造成 L1 結果列解析缺漏；子行程失敗時輸出放入斷言訊息，斷言條件與 helper 行為不變。
-  
+
   同類寫法 `crates/sw-pal/tests/exec_delegate.rs` 的 `exec_or_wait_propagates_exit_code_and_env` 改以 `output()` 擷取子行程輸出（原 `status()` 繼承 stdout），斷言條件不變；`windows_process_ctl_preserves_unsigned_exit_code`（cfg(windows)）之 spawn 路徑仍繼承 stdio，屬 production 行為，未在本次修改。
 - 修正前置空行後 readline 折行命令回顯未剝除的問題。只接受命令原文加上符合間距的折行標記，保留其他 stdout。
 - 修正 Stage 1B sentinel 扁平 bundle（`scripts/rust/mkbundle.sh --dev --delegate-sentinel`）的 `SHA256SUMS` 缺列問題。先前組裝腳本刻意排除根目錄的組裝期所有權標記 `.mkbundle-owner`，但 Rust 驗證器（`verify_bundle`）要求 bundle 內除 `release-manifest.json` 與 `SHA256SUMS` 外每個檔案都有 checksum，因此 `serialwrap setup --on-demand` 回 `CHECKSUM_VERIFY_FAILED`（`sha256:.mkbundle-owner missing`）。現改為將 `.mkbundle-owner` 納入 `SHA256SUMS`，僅 `release-manifest.json` 與 `SHA256SUMS` 本身豁免；驗證器未放寬。所有權拒絕覆寫（`refuse_foreign_out`）保留不變。本條取代 `rust-s1x-sentinel-flat-bundle.md` 中「`SHA256SUMS` 排除 `.mkbundle-owner`」的敘述。
-  
+
   測試端：`tests/test_rust_mkbundle.py` 新增 `test_sha256sums_lists_every_file_dev`、`test_sha256sums_lists_every_file_sentinel`（除 `release-manifest.json` 與 `SHA256SUMS` 外每個檔案都列於 `SHA256SUMS` 且數值相符）與 `test_setup_on_demand_from_sentinel_bundle_isolated_home`（隔離 HOME 執行 `setup --on-demand` 須 rc=0）。最後一項於非特權 pid namespace 內執行，與 `pidns_rig` 同一隔離手段，避免宿主上無 `--socket` 的生產 daemon 進入 setup 的 safety check。
 - Spike 1 控制線隔離量測修正（S0-SPIKE1-REMAINING）：量測前改為把所有已開埠埠位的 RTS／DTR 全部拉低。pyserial 開埠預設 RTS／DTR 為 True，原先只拉低 COM20／COM22，未拉低的 COM23 會把 COM22 的 CTS／DSR／CD 釘在 true，使隔離比較無法偵測 console 端的洩漏。隔離判定改為基線與各 DUT 階段，兩個 console 埠的輸入線皆須全低，不再以「與基線相同」比對。新增 B→A（COM23→COM22）反向正向對照，確認兩個 console 埠的輸入線皆可觀測，缺此方向時不得判為隔離通過。報告新增 `outputs_cleared_before_baseline` 欄位與 `console_pair_positive_control` 的 `reverse_rts_only`／`reverse_dtr_only`。
-  
+
   證據登錄：Windows 原生重跑（DUT-side COM20:COM21、Console-side COM22:COM23）三項皆 PASS 後，將報告存入 `evidence/stage0/owner/p2-t18/spike1-remaining.json` 並登錄 `S0-SPIKE1-REMAINING` 為 present（sha256 已填）。證據索引相關測試的暫存根目錄改為一併複製既有 present 項目的 artifact，只調整夾具，不改動任何斷言。
 - Spike 3 將 go/ack 綁定至實際 lease acquisition 與期限，拒絕過期 acknowledgement；producer 與 Stage 1A gate 同時檢查主要 WAL workload 和 oplock 變體的 append 延遲樣本，依 OD-22 驗證 p99 不高於 100 ms、最大值不高於 600 ms。
 - Spike 3 現在記錄主案例 lease／刺激時點，以及 oplock 變體的實際 rename request、完成時間、append 樣本時間窗、RH break 通知與 close-handle 隱含 ACK。Stage 1A gate 以同一 lease request id 關聯這些事件，允許 ACK 後完成輪替，但要求 request 位於有效 lease、完成時間有界且與 append 樣本一致；主案例與 oplock append 樣本各自依 OD-22 檢查 p99 ≤100 ms、最大值 ≤600 ms。缺證據仍為 INSUFFICIENT_EVIDENCE，超限仍為 FAIL。
 - Windows Rust 黑箱 workflow 建立來源 HEAD 的 Git bundle 並傳給 `win-blackbox.ps1`，讓 staging 測試可驗證提交歷史；A/B comparator 明確驗證兩側 config digest 各自有效，但不把不同的 runner／夾具設定誤當成不相容。新增回歸固定這兩項行為。
 - 隔離 systemd L1.5 測試容器只增加 `SYS_PTRACE` capability，使非 dumpable 行程的 fd holder 可讀；掃描仍對未讀取成功的 PID fail-closed，並在證據中保留 PID 與讀取錯誤細節。
 - 修正 Stage 1B A/B 執行器在全 `rust_only` 選取下的 A 輪釋放檢查（S1X 出口 G2，PENDING-OD-S1X-WIN-AB-A-ROUND）。Windows 平台的 `ab_blackbox_1b` 只選到 `test_autostart_l15_tx_once`（rust_only），A 輪（Python 基線）於 conftest 即以 `rust-only contract` skip、不啟動受測行程，因此不會留下 PID 日誌；原本的 release 判定要求必有 PID 日誌，判為 `ok:false`，B 輪未啟動，`test_cli_mgmt_ab_suite_execution`、`s1a_blackbox.windows`、`s1b_20groups.windows` 與 `sc18-windows-ondemand-autostart` 因此 FAIL。Linux 的 `_release_check` 在同一條件下有相同問題。
-  
+
   依據 plan 05 Task 16（`docs/rust-refactor/plans/05-stage1b-rust-cli-mgmt.md` 第 3523 行）：「`rust_only` 案例只跑 B 並驗絕對契約」。新增共用前置判斷 `_a_round_release`（Linux 與 Windows 共用），僅當下列條件全部成立時，release 記為 `ok:true`、`a_round_spawned:false`、`reason` 為「全部選取節點為 rust_only，A 輪僅收集並 skip，未啟動受測行程」，並照常啟動 B 輪：
-  
+
   - 每個選取節點皆為 `_approved_python_skips` 核准的 `rust_only` 節點。
   - A 輪 exit 0，JUnit 可解析，且每個選取節點恰一列、結果為 `rust-only contract` 的 skip（passed、xfail 或其他理由的 skip 不符合）。
   - `a.pids` 不存在或無任何非空白列。
-  
+
   任一條件不成立（含選取中有共用節點、有 PID 列）一律沿用既有 `_release_check`，缺 PID 日誌仍判 FAIL（fail-closed）。
-  
+
   未放寬任何 judge 或斷言：`test_cli_mgmt_ab_suite_execution` 的斷言、`ab_compare` 判定規則、`_junit_required` 的 skip 核准規則與凍結 lock（`p4_required.lock.json`、`p4_case_map.yaml`）皆未改動；`_release_check` 本身的判定也未改，僅在上述前置條件成立時不呼叫它。B 輪仍須通過 Windows COM pair 與 selftest。`_junit_matches` 只抽出既有的節點比對邏輯，行為不變。
-  
+
   測試以 failing-first 方式加入 `tests/contract_blackbox/test_cli_mgmt_ab_suite.py`：全 rust_only 且 A 輪 skip 乾淨者放行並啟動 B 輪；混入共用節點者仍 `ok:false`；全 rust_only 但 A 輪有 passed、未核准 skip 或 exit 非 0 者仍 `ok:false`；PID 日誌有列者沿用既有檢查。
-  
+
   **待非實作者審查**：本變更對應 `docs/rust-refactor/owner-decisions-addenda.md` 中 PENDING-OD-S1X-WIN-AB-A-ROUND 的選項 (b)（放寬 release 判定），依該登記須經擁有者或非實作者核准。在核准前不得記為 PASS；該項狀態更新由 G5 負責，本 fragment 不改變其 OPEN 狀態。
-  
+
   **核准範圍（2026-10-23）**：Reviewer A（Sonnet max，非實作者）判定 G2 實作 sound；`_a_round_spawned_nothing` 之前置條件在真實凍結資料上 Windows 僅選到 `test_autostart_l15_tx_once`（核准 rust_only）、Linux 選取 13 節點且含共用節點故不觸發。正式核准仍待辦，PENDING-OD-S1X-WIN-AB-A-ROUND 維持 OPEN。
 - Windows 黑箱 runner 的 bridge 自測改以本機 scratch 作為 `--out`（與 stdout／stderr），不再直接寫入 OutDir（`\\wsl.localhost` 網路路徑）。ST-04 會對 `--out` 持續寫入 50 MB stderr 證據，網路路徑上曾出現 `dut.stderr.log` 截斷（48431104 bytes）與 `HARNESS_EVIDENCE_WRITE_FAILED`（bridge rc=3），連鎖使 `windows-com` 判 FAIL、B 輪缺 COM pair、`test_autostart_l15_tx_once` SKIP。行程結束後整份回寫 `OutDir\windows-com\bridge-selftest`（`selftest-report.json` 與 `work/`），並以 SHA256 逐檔比對；回寫不一致只會使證據不足，不會放行。資格判定（`is_qualified`、`verdict`、`tree_sha256`）維持原樣，`windows-com.json` 新增 `selftest_paths` 記錄本機與 OutDir 兩個路徑。新增 `tests/test_rust_win_scripts.py` 靜態斷言，鎖定 `--out` 不在 OutputRoot 或網路路徑之下、回寫步驟存在且位於行程結束之後。
-  
+
   補充（S1X 出口收尾）：selftest 回寫最多 3 次有界重試；stdout／stderr 兩份 log 併入 SHA256 逐檔比對，不一致即證據不足，不放行。
 - 修正 Windows COM 橋接自測與黑箱腳本的 Stage 1 出口缺陷：`WinSerialEndpoint` 原以單一狀態鎖包住阻塞的讀取與寫入，寫入阻塞（對端不讀、緩衝區滿）時會連帶阻住讀取端，bridge 無法排空接收端，即 ST-03(a) 所描述的雙向死鎖。現改為狀態鎖只保護 handle／generation／timeout 設定，讀與寫各以獨立串行鎖進行、彼此並行。ST-03(a) 的 Windows 分支回到計畫定義的「一次寫 2 MiB 且不讀，之後再讀」，寫入與讀取皆有界期限（逾時即 FAIL，不無限等待，不回傳部分資料當成功）；先前的並行 helper 已移除，改以端點層級測試（`tools/uart_stdio_bridge/tests/test_selftest_win_round_trip.py`）驗證。Windows 實機結果於 Stage 1 證據中另行記錄，未通過即 FAIL，不得以測試改寫放行。`win-blackbox.ps1` 快取 Process Handle，ExitCode 為 null 一律判定失敗；B 輪 junit 與 `SW_RESOURCE_REPORT` 改寫入 staging `l1\windows\blackbox\` 後再複製回 OutDir。bridge 工具樹的 `APPROVED_REVISION.json` 已還原為 HEAD（先前由實作者自行 re-pin 的內容不得保留）；新工具樹須由非實作者獨立審查後才可 pin。
 - 修正 Windows 委派 Job 的終止傳遞：`exec_or_wait` 的 Job 不再設定 `SILENT_BREAKAWAY_OK`，委派父行程被終止時，一般方式建立的孫行程不再靜默脫離 Job 而殘留；正常結束時改於關閉 Job 前解除 `KILL_ON_JOB_CLOSE`，維持 `daemon start` 類背景行程存活。
 - 修正 Stage 1 出口 Windows L1.5 producer（`win-func-test.sh`，COM20:COM21）首次實跑未產生 `func-test-report.json` 的六項缺陷（S1X G3）：
-  
+
   - runner 崩潰：`daemon_harness.stop()` 的臨時目錄回收遇 WinError 32 時中止整次執行。改為 daemon 行程以 Popen 確認結束、案例自建的 WAL 讀取 handle 持有者於回收前等待結束、臨時目錄回收有界重試；回收仍失敗者只寫入該案 `harness_diagnostics`，不改變案例判定。daemon 未確認結束或關閉失敗者判為 INSUFFICIENT_EVIDENCE、不得 `gate_eligible`，原已 FAIL 者保留判定。runner 於每案結束後寫出 `func-test-report.json`（原子取代），單一案例的未預期例外記為該案 INSUFFICIENT_EVIDENCE 並繼續其餘案例。
   - DUT 開機 banner 遺失（HARNESS_STREAM_MISMATCH）：未修正（BLOCKED，見下）。根因已實測確認：pyserial 開埠會清除該埠尚未讀取的位元組（COM20:COM21 實測），bridge 於 daemon 開啟 COM20 前輸出的 banner 因此遺失。harness 端無法僅以延後 banner 解決：延後 banner 會使 DUT 的 prompt（取自 boot_banner 末行）消失，probe 無法取得 prompt。需 bridge win-serial 端點提供寫入閘門（對應 posix peer_gate），屬 tools/uart_stdio_bridge 變更，本組未修改。（Supersede，2026-10-23：本條之「未修正（BLOCKED）」已由 `rust-s1x-win-serial-peer-gate.md` 所述之寫入閘門取代並完成原生實測；PENDING-OD-S1X-WIN-BANNER 仍 OPEN，待 Windows L1.5 重跑證實。）
   - 編碼：wrapper 不再全域強制 `PYTHONUTF8=1`（改以 `PYTHONIOENCODING=utf-8` 僅作用於 runner 自身的 stdio），bridge 的 stdout 明確以 UTF-8（`errors=replace`）解碼，使 bridge 子行程呼叫 git／powershell 時依系統 locale 解碼。
   - 基本案例：`win-func-test.sh` 於同一 staging 另跑一次基本案例（不帶 `--scenarios`），輸出 `basic/func-test-report.json`；驅動以第二個 `--l15-report windows=` 交給 gate（gate 5c-iv：cases.lock 宣告的 windows 平台都須有列）。`cases.lock.json` 的 platforms 未變動。
   - 測試資源標記：`tests/test_rust_win_func_test.py` 的 13 個項目逐一補上資源 marker（純字串讀取為 `memory_only`，執行 bash 子行程為 `process_rpc`），斷言未改。
   - 驅動 `stage1_exit_driver.sh`：`RUN_ID`、`WIN_L15_WRAPPER`、`SPIKE3_WRAPPER` 不再列於 `local`，環境覆寫恢復生效。
-  
+
   補充（報告完整性，S1X 出口收尾）：`func-test/runner.py` 之 `func-test-report.json` 加入 `complete` 旗標；每案中途寫出為 `false`，僅全部案例結束後的最後一次寫出為 `true`。`stage1a_gate.py` 拒收缺少或非 `true` 的 l15-report（整體 FAIL）。
 - Windows serial endpoint 改用高解析度 `perf_counter` 計時；讀寫於鎖等待後重算剩餘期限。bridge core 以 50 ms 呼叫 `read()`；當端點期限較短時，endpoint 只取 driver buffer 現有 bytes，沒有可讀資料時每 10 ms 輪詢一次 `in_waiting`，不進入固定 50 ms 的 pySerial 阻塞讀取。寫入 timeout 依 1 ms driver 精度向下量化，降低亞毫秒抖動引起的 setter churn；setter 耗時後若已設定 timeout 超出呼叫剩餘預算，端點不送出資料。DSR 在 reconfigure setter 前與 write 前都重新取樣；保留 busy-reader、鎖等待期限與未送出資料回歸案例。
-  
+
   期限邊界以可控時鐘驗證，包括 read/write 鎖等待、setter 完全或部分耗盡期限、零期限空讀取與 DSR 在鎖等待期間關閉。Bridge core 的 Windows serial 測試替身補上 `in_waiting`，與短期限讀取使用的 pySerial 介面一致。
 - 修正 `uart_stdio_bridge` Windows win-serial 端點缺少寫入閘門的問題（S1X，PENDING-OD-S1X-WIN-BANNER）：
-  
+
   - 端點以 COM-B 的 DSR 取樣對端（COM-A）是否開啟；`peer_gate=True` 時，對端未開啟或仍在 settle 窗口內不寫入（寫入串流長度為 0），以跨過 pySerial `open()` 的 `PurgeComm`。settle 窗口 0.2 s 為未經量測的選值，待原生實測校準。
   - `peer_gate` 僅對 `virtual_com0com` 啟用（CLI 預設啟用，`--no-peer-gate` 可關閉）；`physical_usb_uart` 建構時拒絕啟用，因其 DSR 映射未實測。
   - 寫入鎖等待期間 peer 可能關閉；端點在持有寫入串行鎖、呼叫 pySerial 前重新取樣 DSR，若已關閉則持續等待至呼叫期限並回 0，不送出 bytes。
@@ -351,7 +351,7 @@
   - 本變更改動 `tools/uart_stdio_bridge/src`，`APPROVED_REVISION.json` 的核准 tree 失效，須經非實作者審查並重新核准後，Windows 與 Linux 的 L1.5 結果才可視為有效證據。
 - Windows Stage 1 黑箱 runner 改由 WSL 端輸出 exact HEAD 的 Git bundle，再複製至本機 staging 載入歷史；避免 Windows Git 無法沿 UNC 路徑解析 WSL worktree 的 `.git` common-dir。
 - Stage 1 出口收尾第 2 輪：黑箱 A/B 腳本可於腳本模式執行、A 輪不再要求 release-manifest、必要清單改為正規化形式；P4 證據登記拒絕髒樹；daemon EIO 回 LOGIN 語意與 POSIX `current-release.json` 路徑修正；L15 延遲回覆情境補 READY 等待，runner 對未解析樣板 fail-closed；Windows COM 閘門改讀真機 `sequence.json` 佈局。未放寬任何斷言，凍結鎖未變動。
-  
+
   Stage 1 出口收尾修正輪：黑箱 L1 報告 deployed_content 於 B 輪恆為 null 之根因修正（contract_blackbox 共用已載入 plugin；ab_blackbox B 輪明定 SERIALWRAP_DAEMON_EXE；Windows current-release 指向改為相對 bin）；Windows 黑箱 staging 補 owner_gated 並加入間接 import 覆蓋測試；doctor A/B 比對前於隔離 namespace 輪詢殘留 daemon；bc05 三拓樸改 A/B 雙輪（test oracle 變更，待非實作者審查）。凍結鎖未變動，未放寬任何斷言。
 - 修正 bash readline 折行標記緊貼命令原有空白時，命令回顯未能剝除而混入 stdout 的問題；補上前置空行與多次折行回歸案例。
 - 修正 update／rollback／`setup` 中斷復原的交接停止等待：daemon 回 `daemon.handoff_stop` 後先保留 3 秒排空窗口才關閉監聽，CLI 卻自 grant 起只等 10 秒，排空窗口吃掉 SC-12「ping 不通且行程消失，上限 10 秒」的時間，已凍結、正在有序關機（bridge drain、thread join、WAL fsync）的 daemon 稍慢結束時，on-demand 模式即回 `TIMEOUT`（`reason:"handoff_timeout"`）並保留 journal。仍回 ping 時維持 grant 起 10 秒上限；只在 ping 於連線階段以 `ConnectionRefused`／`NotFound` 失敗且舊行程仍在時，改自監聽關閉起算 10 秒；ping 恢復時清除此計時。recv 逾時等仍連得上的失敗維持 grant 起 10 秒上限。
@@ -390,18 +390,18 @@
 - 修正 Rust CLI `event add --file`：規則 JSON 同時含合法鍵「NUL＋U+FD800」（如 `"\u0000\udbb6\udc00"`）與孤立 surrogate 鍵（如 `"\ud800"`）時，兩者原本被當成同一鍵合併，本應拒送的請求被改寫後送出；現比照 Python `json.load` 保留兩個鍵，於送出前以 `INTERNAL_ERROR` 拒送（S1-f2a23b1-1）。拒送時的錯誤位置也不再把合法的 NUL＋U+FD800 或 `\\u0000` 文字誤認為 surrogate，與 Python 相同。只含合法鍵時照常送出。
 - 修正 `process_ctl` 測試 `spawn_daemon_detached_new_session` 讀 `/proc/<pid>/environ` 的時序競態：原本 spawn 回傳後立即讀取，若子行程尚未完成 exec，會讀到 fork 自測試行程的父環境（缺 `P4_DETACHED_ENV=supplied`、帶 `HOME=`）或尚未發布的空 env 區段。改為先等 `/proc/<pid>/exe` 指向目標執行檔、再等 environ 非空（3 秒有界期限，逾時以 exe／environ 長度／stat 診斷判失敗）後才讀；`P4_DETACHED_ENV=supplied` 與不含 `HOME=` 兩項斷言不變。`spawn_daemon` 正式行為未改動。
 - 收斂 Stage 1 出口 gate 的 cargo 證據綁定與 junit 計數（G2-cargo-evidence-binding-junit-suite-counts），各項皆先以會失敗的測試界定再修正：
-  
+
   - (1) cargo 執行檔綁定（sol 58e539d#5、3f05797#1）。`cargo_l1_results.py` 於建置後、任何測試執行前記錄每個測試執行檔的 path 與 sha256，執行結束後重新核對（改寫或移除即 `finished: false`），並在報告頂層寫入 `provenance`（`cargo-l1-provenance.v1`）：受測 git HEAD 與工作樹乾淨狀態（開始與結束各一次）、`rustc -vV` 逐字輸出與摘要、RUSTFLAGS／CARGO_ENCODED_RUSTFLAGS 的設定狀態與 sha256（旗標文字不落盤），以及每個執行檔所含的 nodeid。Cargo 固定在收集器所在 repo 執行，並拒絕指向其他 workspace 的 `--manifest-path`，避免把外部產物配上本 repo 的 provenance。`register_p4_evidence.py` 移除登錄時的 `cargo test --no-run` 重建與以 `--list` 推定身分的路徑，改為只核對報告內的紀錄：缺 provenance、HEAD 或工作樹狀態不符、缺 rustc 紀錄、執行檔未唯一對應、缺 sha256，或磁碟上檔案的 sha256 與報告不符（改寫或重建後未重跑）一律 FAIL 並要求重跑。Windows 仍由 `win-test.sh` 呼叫同一收集器，`win-stage-lib.sh` 未修改。
   - (2) junit suite 宣告值（sol 11b1fd4）。P2 `tests/acceptance/check_evidence_index.py::_junit_counts` 同時讀取 testsuite 宣告的 failures／errors；宣告值大於 testcase 層計數即拋出 ValueError（fail-closed）。`check_p4_cases.check_l1` 將其判為 INVALID；pytest 集合的 junit 缺席或無法解析改判 INSUFFICIENT（原先會略過交叉核對）。`register_p4_evidence.py` 的 junit 列表與計數同樣 fail-closed。只拒收「宣告大於實際」方向，宣告值小於 testcase 層者不在此拒收（testcase 層失敗仍由 l1_judge 判 FAIL）。
   - (3) 測試可攜性（sol 3f05797#3）。`tests/test_register_p4_evidence.py` 不再使用 shebang 假 cargo、假 win-runner 與文字 `.exe` 替身（登錄器已不執行任何測試執行檔）；每個測試改用自備的乾淨 git repo 作為受測 repo，使登錄結果不受開發中工作樹的變更影響。
   - (4) manifest 指標邊界（58e539d#4 殘留）。`current-release.json` 的 `dir` 含 `..`、絕對路徑、空段、`.` 或磁碟代號即拒收，與 Rust launcher 的 `current_release_manifest_path` 同一規則；原「絕對路徑照用」的測試案例已依此改為拒收。
-  
+
   未修改凍結鎖（`l1_required.lock.json`、`p4_required.lock.json`）、selector、l1_judge 判定規則與 `win-stage-lib.sh`；未刪除或弱化既有斷言。plan 04／05 的對應文字由 G10 處理，addenda 列由 G8 處理，本次只在 commit 與本段說明。既有未含 provenance 的 cargo L1 報告將被拒收，須以新收集器重跑。
 - Windows `.py` daemon launcher 缺 manifest runtime 時，`daemon start` 訊息改為指出 launcher 與缺少的 runtime 路徑（仍為 `DAEMON_BINARY_NOT_FOUND`、fail-closed）。
 - 修正 docker systemd 實跑 harness 的 holder 掃描假釋放缺陷（sol 300f383，Medium）：`scripts/docker/run_systemd_container.py` 的 `_PROC_FD_SCAN` 原本只要 fd 目錄可列舉就把行程計為 `readable`，之後 `readlink()` 的 `PermissionError` 全被吞掉。兩輪掃描都無法解析某個現存 fd 時，該 PID 仍被視為已覆蓋，`_holder_pids()` 可能回傳空集合，使交接測試誤認裝置已釋放。
-  
+
   現行判準（fail-closed）：掃描 `scan()` 的輸出新增 `unresolved` 清單。fd 目錄列舉失敗（非 `FileNotFoundError`）、或有 fd 的 `readlink()` 失敗（非 `FileNotFoundError`）且未找到目標者，計為 `unresolved` 而非 `readable`。fd 或行程於讀取期間消失（`FileNotFoundError`）與無 fd 目錄者可忽略，不計為未解析。`_holder_pids()` 合併 root 與 daemon 使用者兩輪掃描：行程只要任一身分能完整解析其 fd 表即視為已覆蓋；兩個身分皆無法解析、行程仍存在、且屬於權限所及 uid（0／1000）時拋出 `RuntimeError`（證據不足，不回傳空集合）。判定範圍以 root 掃描時已存在的行程為準，兩輪之間新出現者（例如 `runuser` 父行程）不計入，避免誤報；其他 uid 行程仍不計入判定不足。殘留風險與原註記相同。
-  
+
   測試：新增 `tests/test_docker_holder_scan.py`（`posix_only` 與 `memory_only`，行程內以暫存假 `/proc` 樹執行與 harness 相同的掃描原始碼，注入 `PermissionError`／`FileNotFoundError`）。涵蓋：可列舉但 readlink 拒絕的行程不得為 readable、同行程另一 fd 命中仍判為 holder、消失的 fd 與行程可忽略、兩身分皆無法解析須 fail-closed、單一身分可解析時以其結果為準、消失的行程不 fail-closed。既有 `tests/test_docker_l15.py::test_holder_scan_fail_closes_only_on_reachable_uids` 未修改、仍通過。本變更不改動任何 L1 凍結鎖或已凍結的測試節點。
 - docker smoke 的 selftest 診斷遇到頂層非物件的報告 JSON 時改列「頂層非物件」，不再於 assert 訊息求值時拋 `AttributeError` 吞掉原失敗訊息。
 - `test_docker_smoke_two_container` 失敗時把 bridge selftest 報告的 verdict 與非 PASS 檢查附進斷言訊息（POSIX 短 basetemp 於 pytest 結束時刪除，失敗當次證據原本無法事後查閱）；判定不變。
@@ -409,7 +409,7 @@
 - Stage 1A gate 依 OD-31 把 Windows `ev-01-spawn-handler` 因 Python 基線 shell handler 在 Windows 不觸發（等待 `ev-fired` 逾時）的列、依 OD-32 把 Windows `sm-04-device-unplug` 的 `cap_missing:by_id_link` SKIP 列判為 BLOCKED-OWNER（不計 PASS）；Linux 列仍須 PASS，其他失敗型態照判 FAIL。
 - Stage 1A gate 的 `s1_pytest_full` 逐列對帳保留參數化 id，`[linux]`／`[windows]` 各自恰一次 passed 才放行，不再合併成同 key 而恆判證據不足，也不再以同函式另一參數補位；key 與 pytest JUnit classname 同形並保留完整目錄路徑，不同目錄的同名模組不會合併。
 - ### Fixed
-  
+
   - 修正 Python 基線交接凍結（SC-11 `daemon.handoff_stop`）的 fail-closed 缺口，違反 OD-16 窗口零 TX：TX fence 於期限內未收斂時，`freeze_tx` 回傳未收斂結果，交接回 `SESSION_BUSY`＋`busy`（不再回 `ok:true`），並撤銷本次新建立的 admission 與背景凍結（不凍結、不停止）；probe 於鎖外執行期間完成交接時，結果不得把 session 推進至 READY 或清除 `last_error`；reconcile tick 的 lease 到期、重探排程、console 回收與 lease 自癒區段於鎖內重新檢查凍結；attach 因凍結早退時還原預先標記的 `ATTACHING`。新增互斥交錯測試 `tests/test_handoff_freeze_races.py` 與 `tests/test_stage0_handoff_stop.py::test_handoff_refused_when_background_write_holds_tx_fence`。
 - 新增 R-21 整檔豁免防線 `tests/test_policy_r21_allow_guard.py`（逐字複製的雲端審查原文只容許第 3 行一處 structural 命中、不得有 credential／marker）；OD-23／OD-24／能力閘防線與此防線共 12 筆以 add-only 登記進 `s1_pytest_full.linux` 凍結集合。
 - OD-24：`scripts/rust/cargo_l1_results.py --list-only` 輸出改為 `{"collected":[...],"ignored":[...]}`，`tests/acceptance/regen_lock.py --l1-add-only` 新增時排除 ignored nodeid（鎖中既有 ignored 列不視為移除，只能逐名 `--allow-removal`）；新增防線要求所有 cargo 凍結集合不得含 `#[ignore]` 列，並自 `s1b_cargo` 逐名移除 5 筆 `#[ignore]` 列（CI `--allow-removal` 與 pinned 清單同步列名）。同次真實收集另登記 `start_windows_python_launcher_without_runtime_does_not_fall_through`（linux、windows 各 1 筆）。
@@ -437,11 +437,11 @@
 - 收緊 Stage 1 驗收與 0.4.0 升級驗證：SC-18 以 bridge barrier／checkpoint 核對完整 TX wire 前綴；出口 driver 只豁免 gate 已判定的 OD-30～OD-32 Windows `BLOCKED-OWNER` 列；正式候選 bundle 隔離 Python runtime、自帶 PyYAML 且不編入測試故障注入 feature。升級容器不再安裝系統 PyYAML 或共享 site-packages，避免掩蓋一般 pipx 使用者缺少執行依賴。
 - Stage 1 出口 G9b：補上 POSIX 回滾入口 symlink 的啟動回歸測試（sol 72a887e，Low）。新增 `crates/sw-cli/tests/rollback_entry_symlink.rs`：穩定入口 `bin/serialwrapd` 為指向回滾目標版本 launcher 的 symlink 時，on-demand 回滾的 `spawn_daemon` 必須以該入口啟動，測試直接斷言 spawn 的 argv[0]、入口解析結果與入口位元組，不再只依賴版本回報替身。spawn 路徑以原生 `Path` 比較，保留入口身分斷言並接受 Windows 的 `/`、`\` 等價分隔符表示。以暫時把入口判定還原為 `is_file()` 語意驗證測試會失敗（spawn 改用 CLI bundle launcher），驗證後已恢復。本次未變更產品碼 `crates/sw-cli/src/rollback.rs`。
 - 修正 func-test runner 的未解析樣板檢查（`TestRunner._require_resolved`）把合法的 shell 參數展開誤判為樣板的缺陷：原本以 `\{([a-zA-Z0-9_.]+)\}` 掃描展開後的字串，`${HOME}` 這類 DUT 端 shell 形式會被判成未解析樣板並拋出 StepError，例如 `cmd submit --cmd "echo ${HOME}"` 在送出前即被拒絕。
-  
+
   現行判準（`func-test/runner.py::_UNRESOLVED_TEMPLATE_RE`）：裸 `{var}`／`{var.field}`（前面不得緊接 `$`）與誤加 `$` 前綴的點號形式 `${var.field}` 仍視為未解析樣板並 fail-closed；`${NAME}`（不含點號）與 `$NAME` 為字面字串，原樣送出。`${var.field}` 含點號、不是合法 shell 識別字，因此仍予拒絕，避免 `${after_cmd.cmd_id}` 這類樣板因誤加 `$` 而漏檢。
-  
+
   已知殘留（未於本次處理）：(1) 不含點號的 `${NAME}` 若實為未就緒的 harness 樣板，無法與 DUT 端 shell 參數從字串區分，會被視為字面字串放行；(2) `_expand` 仍會把 `${NAME}` 中的 `{NAME}` 替換為同名 save_as 變數的值，與 save_as 名稱同名的 shell 變數會被展開錯誤，此行為未變更。
-  
+
   測試：`tests/test_functest_harness.py` 新增兩組案例，分別驗證 shell 形式（`${HOME}`、`$HOME`、`${A:-b}`）通過檢查，以及未解析樣板（含 `{after_cmd.cmd_id}`、`${after_cmd.cmd_id}`）仍拋出 StepError 且錯誤訊息不列出合法的 shell 形式。
 - 穩定 Stage 1A Spike 3 的 Windows helper 證據：ready 記錄以同目錄暫存檔原子發布，consumer 對未完成記錄重試；四種主案例都先確認 helper 已持有現行 WAL 再注入操作。helper 啟動失敗仍輸出符合 schema 的 INSUFFICIENT_EVIDENCE，保留可診斷證據。
 - 修正 Spike 3 在 Windows 使用粗解析度 `monotonic_ns()` 量測 append 的問題，改用 `perf_counter_ns()` 並將實際時鐘與解析度寫入證據；helper 到期釋放改以相同 QPC 截止值判定。oplock ACK 記錄 CloseHandle 呼叫區間，gate 對齊 helper 原始 break 記錄及延遲樣本。
@@ -460,7 +460,7 @@
 - 修正 Windows COM peer gate 在最後寫入檢查沿用重連前 settle 起點的競態。DSR low→high 後重新起算 200 ms settle；新回歸確認過渡期間不會把 banner 寫入 COM。
 - 修正 sol ca0106f（Medium）：win-serial 端點的期限設定原本在取得讀寫串行鎖之前完成，並行呼叫會互相覆寫 pySerial 的 `timeout`／`write_timeout`，可能使第一筆寫入提早逾時並觸發 `HARNESS_WRITE_UNCERTAIN`；且 setter 會在另一方向 I/O 進行中呼叫，pySerial 會重設整個 COM handle。修正後寫入期限設定於雙向靜止（寫入鎖與讀取鎖皆取得）時執行，鎖序固定為寫入 → 讀取，且期限設定與本次寫入共用寫入鎖。讀取期限固定為開啟時的 50 ms；`read()` 以短讀取輪詢至呼叫期限，不再等待寫入鎖來改設讀取期限，使阻塞寫入期間讀取仍能排空資料。已補交錯測試（以 fake serial 記錄實際期限、資料排空與 setter 違規），既有 com0com 與 peer gate 行為不變。工具 tree 已變動，核准狀態見 `PENDING-OD-S1X-BRIDGE-REVISION` 之 G9 段落（未核准；`APPROVED_REVISION.json` 本輪未變更）。
 - Windows `exec_or_wait` 以原始標準 handle 建立行程時，與背景 daemon spawn 暫時取消繼承旗標的區段串行；並新增呼叫端以單一 pipe 合併 stdout／stderr 時 `daemon start` 須立即 EOF 的原生案例。
-  
+
   此鎖修正沒有決定性回歸測試：合併 pipe 案例只覆蓋 `spawn_daemon` 的去重路徑，拿掉 `exec_or_wait_opts` 的鎖仍會通過（`exec_or_wait_opts` 成功時以 `process::exit` 結束行程，無法在測試內重現並行視窗）。
 - `win-com-txrx-bridge` 情境改依規格送 `echo W_1`～`echo W_50`，斷言每個 payload 在 wire 依序恰一次、50 個命令逐一 done（burst 送出後以第二個 `repeat` 逐一檢查），並新增 console bytes 原樣出現的檢查；func-test runner 的 `repeat` 提供 `{repeat.index}`，cli 的 `save_as` 可含參照逐次另存，並支援一層巢狀參照 `{w_{repeat.index}.cmd_id}`。舊情境以相同 payload 送 50 次卻預期 1 次，正確行為也會 FAIL。
 - 修正 Windows Rust 黑箱 bundle 將 daemon launcher 留在 staging 樹外的問題，並讓 SC-18 原生案例明確綁定 COM0 至核准的 COM20 DUT。
@@ -468,7 +468,7 @@
 - POSIX backend 的 `serialwrap setup --on-demand` 在同模式刷新時保留
   `config.yaml` 既有有效 TCP `socket_path`，包含 loopback SSH tunnel；
   不因 endpoint 暫時無法連線而改寫為本機 Unix socket。
-  
+
   - 保存規則限定目前與目標都是 on-demand、未顯式指定 endpoint 的情境；
     systemd、模式轉換與 win backend 維持既有契約。
   - `./install.sh --on-demand` 可轉交模式旗標；未帶旗標的 auto 安裝在有

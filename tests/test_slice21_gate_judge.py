@@ -1,0 +1,1554 @@
+"""Slice 2.1 出口 gate 判定器（scripts/rust/slice21_gate_judge.py）負向測試（P5-T22，紅燈）。
+
+對應計畫 Task 22 Step 1 的判定表。判定器為純函式，測試以記憶體內假報告驅動，
+L1 完整性判定重用 P2 唯一實作 `tests/acceptance/l1_judge.py`（不得另寫）。
+
+本檔約定的判定器介面（實作必須與之相容；計畫只給出 `judge(report, expect)` 名稱）：
+- `judge(report, expect) -> dict`，回傳含 `verdict`、`sections`（每列含 `name`、`status`、
+  `l1_verdict`）與 `case_uptake`（含 `valid_pass`、`denominator`、`rate`、`pass_case_ids`）。
+- `report`：schema 形狀，至少含 `identity`（必填欄位依 schema）與 `sections`；
+  section 的 `status`、`l1_verdict` 輸入值由判定器重新計算，不得沿用輸入。
+- `expect`：
+  - `lock`：`tests/acceptance/l1_required.lock.json` 形狀；必要集合以
+    `l1_judge.required_for(lock, required_set, platform)` 取得，缺集合 → EVIDENCE_MISSING。
+  - `base_dir`：`section.l1_results` 相對路徑的解析根；檔案缺失 → EVIDENCE_MISSING。
+  - `freeze`：Task 0b `tests/acceptance/breaker/slice_2.1.json` 形狀（`denominator`、`required_case_ids`）。
+  - `case_verdicts`：case_id → gate 判定（只有 `PASS` 計入 valid_pass）。
+  - `daemon_path`：可為 None；有值時與 `identity.daemon_sha256` 比對。
+
+紅燈原因：`scripts/rust/slice21_gate_judge.py` 尚不存在，載入即 FileNotFoundError。
+`test_case_uptake_from_valid_pass_only` 另依賴 Task 0b 產物 `slice_2.1.json`，缺檔時亦屬前置缺失。
+"""
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import pathlib
+
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+# 測試區段（與 schema sections 列舉對齊）：名稱 → (平台, required_set)
+TEST_SECTIONS = {
+    "linux_l1": ("linux", "s21_core"),
+    "linux_cap_posix_pty": ("linux", "s21_gate:linux_cap_posix_pty"),
+    "linux_cap_posix_pty_workspace": ("linux", "s21_gate:cap_posix_pty"),
+    "windows_native_l1": ("windows", "s21_core"),
+    "windows_cap_windows_com": ("windows", "s21_gate:windows_cap_windows_com"),
+    # OD-55（Windows 部分）：windows 能力集合各一個 section（LOCAL-WINDOWS 證據匯入，須附能力探測）
+    "windows_cap_windows_native": ("windows", "s21_gate:cap_windows_native"),
+    "windows_cap_interactive_desktop": ("windows", "s21_gate:cap_interactive_desktop"),
+    "windows_cap_supervisor_runtime": ("windows", "s21_gate:cap_supervisor_runtime"),
+    "blackbox_python": ("linux", "s21_gate:blackbox_python"),
+    "blackbox_rust": ("linux", "s21_gate:blackbox_rust"),
+    "existing_suites_rust": ("linux", "s21_gate:existing_suites_rust"),
+    # N3：gate argv 與 CI 同步排除兩項 Stage 1 證據測試；鎖 selector 由 regen_lock 的核准遷移更新。
+    "pytest_full": ("linux", "s21_gate:pytest_full"),
+    # P5 第 6 輪 SPEC-GAP #2（編排者裁決）：OD-55 linux 能力集合各一個 section（以 --caps <cap> 實跑，須附能力探測）
+    "linux_cap_sys_admin": ("linux", "s21_gate:cap_sys_admin"),
+    "linux_cap_supervisor_runtime": ("linux", "s21_gate:cap_supervisor_runtime"),
+    # SPEC-GAP #1（編排者裁決）：py_parity section 以完整 selector 的新集合判定（舊 s21_gate:py_parity 仍由 pytest_full 承擔）
+    "py_parity": ("linux", "s21_gate:py_parity_full"),
+    # F-S19：Windows 原生 pytest 證據由共用 windows_l1 匯入。
+    "py_parity_windows": ("windows", "s21_gate:py_parity"),
+    # P5 第 8 輪 SPEC-GAP #1：計畫 06 Task 0b #76～#80 另以 add-only 新集合承擔。
+    "py_parity_76_80": ("linux", "s21_gate:py_parity_76_80"),
+}
+CAP_OF = {"linux_cap_sys_admin": "sys_admin", "linux_cap_supervisor_runtime": "supervisor_runtime",
+          "windows_cap_windows_native": "windows_native", "windows_cap_interactive_desktop": "interactive_desktop",
+          "windows_cap_supervisor_runtime": "supervisor_runtime"}
+NON_TEST_SECTIONS = ["l15_ab", "event_latency", "wal_s1w_perf", "cfg_boundary", "policy_check", "case_uptake"]
+CORE_NODEIDS = ["cargo:sw-core::wal::a", "cargo:sw-core::wal::b", "cargo:sw-core::wal::c"]
+GATE_NODEIDS = {  # 每個 gate 集合的凍結 nodeid（測試用，兩個一組）
+    name: [f"tests/test_{name}.py::test_{i}" for i in ("alpha", "beta")]
+    for name in ("linux_cap_posix_pty", "linux_cap_posix_pty_workspace", "windows_cap_windows_com",
+                 "blackbox_python", "blackbox_rust", "existing_suites_rust", "pytest_full", *CAP_OF,
+                 "py_parity", "py_parity_windows", "py_parity_76_80")
+}
+
+
+def test_pytest_full_lock_selector_matches_n3_ci_deselects():
+    """N3：s21 與 p7 的 full pytest 集合共用 CI deselect selector，移除列不在必要分母。"""
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    removed = [
+        "tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native",
+        "tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
+    ]
+    expected = ["-q", "tests/", "--deselect", removed[0], "--deselect", removed[1]]
+    s21 = lock["sets"]["s21_gate:pytest_full"]["linux"]
+    p7 = lock["sets"]["p7_gate:python3-m-pytest-q-tests"]["linux"]
+    assert s21["selector"]["argv"] == expected
+    assert p7["selector"] == s21["selector"]
+    assert not set(removed) & (set(s21["nodeids"]) | set(p7["nodeids"]))
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+IDENTITY = {
+    "cli_path": "/x/serialwrap",
+    "cli_sha256": _sha("cli"),
+    "daemon_implementation": "rust",
+    "daemon_version": "0.0.0-test",
+    "daemon_artifact_id": "artifact-test",
+    "daemon_sha256": _sha("daemon"),
+    "contracts_revision": "rev-test",
+    "cases_lock_sha256": _sha("cases-lock"),
+    "freeze_file_sha256": _sha("freeze"),
+    "tool_revision": {"uart_stdio_bridge_tree_sha256": _sha("bridge"), "runner_sha256": _sha("runner")},
+    "platform": {"os": "linux", "kernel": "6.6.87.2-microsoft-standard-WSL2", "arch": "x86_64"},
+    "device": None,
+}
+FREEZE_SYNTH = {"denominator": 3, "required_case_ids": ["c-1", "c-2", "c-3"],
+                "window": {"start": "2026-10-21", "weeks": 3}, "stage2_started_at": "2026-10-21"}
+# 斷路器輸入（窗口內、未觸發）：case_uptake 依 slice_breaker.evaluate 判定（審查 b7cd852 #1）。
+BREAKER_OK = {"snapshots": [], "today": "2026-10-28", "stage2_estimate_weeks": 0.0}
+
+
+# event_latency 證據（方法審閱 [High]：judge 須讀證據內容並核對 artifact／commit／run／工具／契約身分）。
+EVLAT_REF = {"tool_sha256": _sha("evlat-tool"), "contract_sha256": _sha("contract"), "method_revision": "2026-10-29.2"}
+
+
+def _evlat_evidence(**identity) -> dict:
+    ident = {"artifact_source_commit": "e" * 40, "artifact_build_run_id": "t",       # daemon_sha256 預設跟隨報告 identity
+             "run_id": "t", "source_commit": "e" * 40, "source_tree_dirty": False, **EVLAT_REF}
+    ident.update(identity)
+    return {"schema": "event_latency_external.v1", "verdict": "PASS", "reasons": [], "identity": ident}
+
+
+def _judge_mod():
+    """載入判定器腳本（紅燈階段檔案不存在，於此拋 FileNotFoundError）。"""
+    spec = importlib.util.spec_from_file_location("slice21_gate_judge", ROOT / "scripts/rust/slice21_gate_judge.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _load_script(name: str, relative: str):
+    spec = importlib.util.spec_from_file_location(name, ROOT / relative)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _row(nodeid: str, outcome: str = "passed", skip_kind: str | None = None) -> dict:
+    if outcome == "passed":
+        phases = {"setup": "passed", "call": "passed", "teardown": "passed"}
+    elif outcome in ("failed", "error"):
+        phases = {"setup": "passed", "call": "failed", "teardown": None}
+    else:  # skipped／xfailed：整列在 setup 即跳過
+        phases = {"setup": "skipped", "call": None, "teardown": None}
+    return {"nodeid": nodeid, "outcome": outcome, "skip_kind": skip_kind, "phases": phases}
+
+
+def _l1(platform: str, runner: str, rows: list[dict], *, collected=None, deselected=(), exit_code=0, finished=True) -> dict:
+    """l1-results.v1 報告（與 tests/acceptance/l1_results.schema.json 同形）。"""
+    ids = [r["nodeid"] for r in rows]
+    report = {
+        "schema_version": 2, "format": "l1-results.v1", "runner": runner, "platform": platform,
+        "argv": ["cargo", "test", "--workspace"] if runner == "cargo" else ["/x/pytest/__main__.py", "-q", "tests/"],
+        "markexpr": "", "counts": {}, "resources": {}, "uart_kind": "native",
+        "not_collected_platform": [], "core_portable_platform_skips": [],
+        "collected": list(collected) if collected is not None else ids + list(deselected),
+        "deselected": list(deselected), "results": rows,
+        "exit_code": exit_code, "finished": finished, "deployed_content": None,
+    }
+    if platform == "windows":
+        head = "e" * 40
+        report["provenance"] = {"git": {"head": head, "clean": True,
+                                         "end": {"head": head, "clean": True}}}
+    return report
+
+
+def _lock() -> dict:
+    sets = {"s21_core": {
+        "linux": {"nodeids": list(CORE_NODEIDS), "selector": {"argv": ["cargo", "test", "--workspace"]}},
+        "windows": {"nodeids": list(CORE_NODEIDS), "selector": {"argv": ["cargo", "test", "--workspace"]}},
+    }}
+    for name, (platform, set_id) in TEST_SECTIONS.items():
+        if set_id.startswith("s21_gate:"):
+            # OD-55：同名能力集合同時有 linux 與 windows section（如 s21_gate:cap_windows_native），依平台合併
+            argv = (["--workspace", "--features", "test-fakes", "--", "--ignored", "cap_posix_pty__"]
+                    if name == "linux_cap_posix_pty_workspace" else ["pytest", "-q"])
+            if name == "py_parity_windows":
+                argv = ["-q", GATE_NODEIDS[name][0], "-m", "windows_native and windows_com"]
+            selector = {"argv": argv}
+            if name == "py_parity_windows":
+                selector.update({"markexpr": "windows_native and windows_com", "paths": [GATE_NODEIDS[name][0]]})
+            sets.setdefault(set_id, {})[platform] = {"nodeids": list(GATE_NODEIDS[name]), "selector": selector}
+    return {"schema_version": 1, "sets": sets}
+
+
+def _section(name: str, *, exit_code: int = 0, l1_results: str | None = None, required_set: str | None = None,
+             allowed_missing_bo: str | None = None, counts: dict | None = None) -> dict:
+    """輸入區段：status／l1_verdict 由判定器重算，此處放置占位值。"""
+    c = counts or {}
+    return {
+        "name": name, "status": "PASS", "command": f"run {name}", "exit": exit_code,
+        "passed": c.get("passed", 0), "failed": c.get("failed", 0), "skipped": c.get("skipped", 0),
+        "deselected": c.get("deselected", 0), "ignored": c.get("ignored", 0),
+        "required_set": required_set, "l1_results": l1_results, "l1_verdict": {},
+        "allowed_missing_bo": allowed_missing_bo, "log": f"logs/{name}.log",
+    }
+
+
+def _counts(l1: dict) -> dict:
+    rows = l1["results"]
+    return {
+        "passed": sum(1 for r in rows if r["outcome"] == "passed"),
+        "failed": sum(1 for r in rows if r["outcome"] in ("failed", "error")),
+        "skipped": sum(1 for r in rows if r["outcome"] in ("skipped", "xfailed")),
+        "deselected": len(l1["deselected"]),
+        "ignored": sum(1 for r in rows if r["skip_kind"] == "capability"),
+    }
+
+
+class _Case:
+    """測試夾具：可覆寫各區段的 l1 報告，產生 (report, expect)。"""
+
+    def __init__(self, base_dir: pathlib.Path) -> None:
+        self.base = base_dir
+        self.l1: dict[str, dict | None] = {}
+        self.extra_sections: list[dict] = []
+        self.identity = json.loads(json.dumps(IDENTITY))
+        self.freeze = FREEZE_SYNTH
+        self.case_verdicts: dict[str, str] = {}
+        self.daemon_path: pathlib.Path | None = None
+        self.breaker: dict | None = dict(BREAKER_OK)
+        self.parity: dict | None = None
+        self.pending_decisions: list[dict] = []
+        self.evlat: dict | None = _evlat_evidence()
+        for name, (platform, _) in TEST_SECTIONS.items():
+            self.l1[name] = self._default_l1(name, platform)
+
+    def _default_l1(self, name: str, platform: str) -> dict | None:
+        if name == "windows_cap_windows_com":
+            return None                                   # 無 COM pair：證據缺失（BO-S21-01 豁免）
+        if name in ("linux_l1", "windows_native_l1"):
+            ids = CORE_NODEIDS
+            runner = "cargo"
+        elif name == "linux_cap_posix_pty_workspace":
+            ids = GATE_NODEIDS[name]
+            runner = "cargo"
+        else:
+            ids = GATE_NODEIDS[name]
+            runner = "pytest"
+        l1 = _l1(platform, runner, [_row(i) for i in ids])
+        if name.startswith("windows_cap_") and name in CAP_OF:
+            l1["provenance"] = {"git": {"head": "e" * 40, "clean": True,
+                                         "end": {"head": "e" * 40, "clean": True}}}
+        if name == "py_parity_windows":
+            markexpr = "windows_native and windows_com"
+            l1["argv"] = ["/x/pytest/__main__.py", "-q", GATE_NODEIDS[name][0], "-m", markexpr]
+            l1["markexpr"] = markexpr
+            l1["provenance"] = {"schema": "pytest-l1-provenance.v1", "platform": "windows",
+                                "git": {"head": "e" * 40, "clean": True,
+                                        "end": {"head": "e" * 40, "clean": True}}}
+        return l1
+
+    def write_l1(self, name: str, report: dict) -> str:
+        rel = f"l1/{name}.json"
+        path = self.base / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(report), encoding="utf-8")
+        return rel
+
+    def report(self) -> dict:
+        sections = []
+        for name, (platform, required_set) in TEST_SECTIONS.items():
+            l1 = self.l1.get(name)
+            rel = self.write_l1(name, l1) if l1 is not None else None
+            counts = _counts(l1) if l1 is not None else None
+            allowed = "BO-S21-01" if name == "windows_cap_windows_com" else None
+            sections.append(_section(name, l1_results=rel, required_set=required_set,
+                                     allowed_missing_bo=allowed, counts=counts))
+            if name in ("linux_l1", "linux_cap_posix_pty", "linux_cap_posix_pty_workspace"):
+                sections[-1]["run_euid"] = 1000             # F108：Linux L1 與兩段 POSIX PTY 收集以非 root 執行
+            if name in CAP_OF:                                # SPEC-GAP #2：能力探測（本夾具假設具備能力）
+                sections[-1]["capability_probe"] = {"cap": CAP_OF[name], "available": True, "evidence": "fixture"}
+        for name in NON_TEST_SECTIONS:
+            sec = _section(name, exit_code=0)
+            sec["section_verdict"] = "PASS"   # 非測試類 section 須明確帶判定（審查 b7cd852 #3）
+            if name == "event_latency" and self.evlat is not None:
+                rel = "event_latency/rust.json"
+                (self.base / rel).parent.mkdir(parents=True, exist_ok=True)
+                ev = json.loads(json.dumps(self.evlat))
+                ev.setdefault("identity", {}).setdefault("daemon_sha256", self.identity.get("daemon_sha256"))
+                (self.base / rel).write_text(json.dumps(ev), encoding="utf-8")
+                sec["evidence"] = rel
+            sections.append(sec)
+        sections.extend(self.extra_sections)
+        return {"schema_version": 1, "run_id": "t", "git_revision": "e" * 40, "slice": "2.1", "identity": self.identity,
+                "sections": sections, "pending_decisions": list(self.pending_decisions)}
+
+    def expect(self) -> dict:
+        out = {"lock": _lock(), "base_dir": self.base, "freeze": self.freeze,
+               "case_verdicts": dict(self.case_verdicts), "daemon_path": self.daemon_path,
+               "event_latency_ref": dict(EVLAT_REF)}
+        if self.breaker is not None:
+            out["breaker"] = self.breaker
+        if self.parity is not None:
+            out["parity"] = self.parity
+        return out
+
+
+def _sec(out: dict, name: str) -> dict:
+    return [s for s in out["sections"] if s["name"] == name][0]
+
+
+@pytest.fixture
+def case(tmp_path):
+    return _Case(tmp_path)
+
+
+def test_all_skipped_is_not_pass(case):
+    ids = [f"tests/test_x.py::test_{i:02d}" for i in range(36)]
+    case.l1["blackbox_python"] = _l1("linux", "pytest", [_row(i, "skipped", "capability") for i in ids])
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "blackbox_python")["status"] == "EVIDENCE_MISSING"
+    assert out["verdict"] == "INCOMPLETE"
+
+
+def test_zero_tests_is_not_pass(case):
+    # 空收集即使 exit 0 也不能代替凍結必要列。
+    case.l1["linux_cap_posix_pty"] = _l1("linux", "cargo", [], collected=[], exit_code=0)
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "linux_cap_posix_pty")["status"] == "EVIDENCE_MISSING"
+    case.l1["linux_cap_posix_pty_workspace"] = _l1("linux", "cargo", [], collected=[], exit_code=0)
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "linux_cap_posix_pty_workspace")["status"] == "EVIDENCE_MISSING"
+    n1, n2 = GATE_NODEIDS["linux_cap_posix_pty_workspace"]
+    case.l1["linux_cap_posix_pty_workspace"] = _l1("linux", "cargo", [_row(n1, "failed"), _row(n2)], exit_code=101)
+    out = _judge_mod().judge(case.report(), case.expect())
+    failed = _sec(out, "linux_cap_posix_pty_workspace")
+    assert failed["status"] == "FAIL" and failed["l1_verdict"]["failed"] == [n1]
+    assert out["verdict"] == "FAIL"
+
+
+def test_count_threshold_cannot_substitute_required_nodeids(case):
+    # R5-F3：以其他 50 個測試湊數，必要 nodeid 皆未執行；舊的計數門檻會誤判 PASS
+    others = [f"cargo:sw-core::other::case_{i:02d}" for i in range(50)]
+    case.l1["linux_l1"] = _l1("linux", "cargo", [_row(i) for i in others], exit_code=0)
+    out = _judge_mod().judge(case.report(), case.expect())
+    sec = _sec(out, "linux_l1")
+    assert sec["status"] == "EVIDENCE_MISSING"
+    assert sorted(sec["l1_verdict"]["missing"]) == sorted(CORE_NODEIDS)
+    assert out["verdict"] == "INCOMPLETE"
+
+
+def test_required_nodeid_ignored_is_missing(case):
+    n1, n2 = GATE_NODEIDS["linux_cap_posix_pty"]
+    case.l1["linux_cap_posix_pty"] = _l1("linux", "pytest", [_row(n1), _row(n2, "skipped", "capability")])
+    out = _judge_mod().judge(case.report(), case.expect())
+    sec = _sec(out, "linux_cap_posix_pty")
+    assert sec["status"] == "EVIDENCE_MISSING"
+    assert sec["l1_verdict"]["skipped_required"][0]["nodeid"] == n2
+
+
+def test_duplicate_nodeid_is_missing(case):
+    n1, n2 = GATE_NODEIDS["linux_cap_posix_pty"]
+    # 同一必要 nodeid 兩列皆 passed（兩支 exe 重複執行）
+    case.l1["linux_cap_posix_pty"] = _l1("linux", "pytest", [_row(n1), _row(n1), _row(n2)])
+    out = _judge_mod().judge(case.report(), case.expect())
+    sec = _sec(out, "linux_cap_posix_pty")
+    assert sec["status"] == "EVIDENCE_MISSING"
+    assert n1 in sec["l1_verdict"]["duplicates"]
+    # 一列 failed 一列 passed → FAIL
+    case.l1["linux_cap_posix_pty"] = _l1("linux", "pytest", [_row(n1), _row(n1, "failed"), _row(n2)])
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "linux_cap_posix_pty")["status"] == "FAIL"
+
+
+def test_runner_exit_or_unfinished_is_missing(case):
+    ids = GATE_NODEIDS["blackbox_python"]
+    # 全部必要 nodeid passed，但 runner 以 101 結束（報告 exit_code 與區段 exit 不一致）
+    case.l1["blackbox_python"] = _l1("linux", "pytest", [_row(i) for i in ids], exit_code=101)
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "blackbox_python")["status"] == "EVIDENCE_MISSING"
+    # runner 未完成
+    case.l1["blackbox_python"] = _l1("linux", "pytest", [_row(i) for i in ids], finished=False)
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "blackbox_python")["status"] == "EVIDENCE_MISSING"
+
+
+def test_missing_l1_results_is_missing(case):
+    # (a) 測試類區段 l1_results 為 null
+    case.l1["blackbox_python"] = None
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "blackbox_python")["status"] == "EVIDENCE_MISSING"
+    # (b) 檔案不存在
+    rep = case.report()
+    [s for s in rep["sections"] if s["name"] == "blackbox_rust"][0]["l1_results"] = "l1/does-not-exist.json"
+    out = _judge_mod().judge(rep, case.expect())
+    assert _sec(out, "blackbox_rust")["status"] == "EVIDENCE_MISSING"
+    # (c) required_set 不在 lock
+    rep = case.report()
+    [s for s in rep["sections"] if s["name"] == "pytest_full"][0]["required_set"] = "s21_gate:not_in_lock"
+    out = _judge_mod().judge(rep, case.expect())
+    assert _sec(out, "pytest_full")["status"] == "EVIDENCE_MISSING"
+    # (d) 非測試類 policy_check required_set 為 null，不受影響
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "policy_check")["status"] == "PASS"
+
+
+def test_full_required_set_pass(case):
+    out = _judge_mod().judge(case.report(), case.expect())
+    for name in TEST_SECTIONS:
+        expected = "EVIDENCE_MISSING" if name == "windows_cap_windows_com" else "PASS"
+        assert _sec(out, name)["status"] == expected, name
+    for name in NON_TEST_SECTIONS:
+        assert _sec(out, name)["status"] == "PASS", name
+    assert out["verdict"] == "READY_FOR_OWNER_EVIDENCE"
+
+
+def test_deselected_counts_as_missing(case):
+    n1, n2 = GATE_NODEIDS["blackbox_rust"]
+    case.l1["blackbox_rust"] = _l1("linux", "pytest", [_row(n1)], collected=[n1, n2], deselected=[n2])
+    out = _judge_mod().judge(case.report(), case.expect())
+    sec = _sec(out, "blackbox_rust")
+    assert sec["status"] == "EVIDENCE_MISSING"
+    assert sec["l1_verdict"]["deselected_required"]
+
+
+def test_only_allowed_bo_section_may_be_missing(case):
+    # 只有 windows_cap_windows_com（BO-S21-01 豁免）缺 → READY
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert out["verdict"] == "READY_FOR_OWNER_EVIDENCE"
+    # blackbox_rust 缺（非豁免）→ INCOMPLETE
+    case.l1["blackbox_rust"] = None
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert out["verdict"] == "INCOMPLETE"
+
+
+def test_failed_section_is_fail(case):
+    ids = GATE_NODEIDS["blackbox_python"]
+    case.l1["blackbox_python"] = _l1("linux", "pytest", [_row(ids[0], "failed"), _row(ids[1])], exit_code=1)
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "blackbox_python")["status"] == "FAIL"
+    assert out["verdict"] == "FAIL"
+
+
+def test_identity_required(case):
+    for key in ("daemon_sha256", "cases_lock_sha256"):
+        case.identity.pop(key)
+        out = _judge_mod().judge(case.report(), case.expect())
+        assert out["verdict"] == "INCOMPLETE", key
+        case.identity = json.loads(json.dumps(IDENTITY))
+
+
+def test_identity_hash_matches_artifact(case):
+    artifact = case.base / "serialwrapd"
+    artifact.write_bytes(b"artifact-A")
+    case.daemon_path = artifact
+    case.identity["daemon_sha256"] = _sha("artifact-B")      # 不符
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert out["verdict"] == "FAIL"
+    case.identity["daemon_sha256"] = hashlib.sha256(b"artifact-A").hexdigest()   # 相符（正向對照）
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert out["verdict"] == "READY_FOR_OWNER_EVIDENCE"
+
+
+def test_case_uptake_from_valid_pass_only(case):
+    freeze = json.loads((ROOT / "tests/acceptance/breaker/slice_2.1.json").read_text(encoding="utf-8"))
+    ids = freeze["required_case_ids"]
+    case.freeze = freeze
+    case.case_verdicts = {ids[0]: "PASS", ids[1]: "PASS", ids[2]: "PASS", ids[3]: "SKIP", ids[4]: "EVIDENCE_MISSING"}
+    out = _judge_mod().judge(case.report(), case.expect())
+    cu = out["case_uptake"]
+    assert cu["valid_pass"] == 3
+    assert cu["rate"] == cu["valid_pass"] / freeze["denominator"]
+    assert cu["denominator"] == freeze["denominator"]
+    assert sorted(cu["pass_case_ids"]) == sorted(ids[:3])
+
+
+def test_assemble_keeps_breaker_snapshot_pending_and_preserves_verdict(tmp_path, monkeypatch, capsys):
+    """OD-60/OD-87：正式 assemble 只寫 run 待提交快照，且以提交快照＋本次一筆重判。"""
+    import datetime as dt
+    import types
+    import yaml
+
+    mod = _judge_mod()
+    candidate_commit = "e" * 40
+    root = tmp_path / "repo"
+    run_dir = root / "target/slice21-gate/run-pending"
+    acceptance = root / "tests/acceptance"
+    breaker_dir = acceptance / "breaker"
+    run_dir.mkdir(parents=True)
+    breaker_dir.mkdir(parents=True)
+    monkeypatch.setattr(mod, "ROOT", root)
+
+    today = dt.datetime.now(dt.timezone.utc).date()
+    start = today - dt.timedelta(weeks=6)
+    window_end = start + dt.timedelta(weeks=3)
+    freeze = {
+        "slice": "2.1", "denominator": 3, "required_case_ids": ["case-a", "case-b", "case-c"],
+        "window": {"start": start.isoformat(), "weeks": 3}, "stage2_started_at": start.isoformat(),
+        "amendments": [{"breaker_exemption": {"decision": "OD-87", "date": "2026-11-14",
+                         "slice": "2.1", "scope": "breaker_blocking_effect", "reason": "測試豁免"}}],
+    }
+    freeze_path = breaker_dir / "slice_2.1.json"
+    freeze_path.write_text(json.dumps(freeze), encoding="utf-8")
+    baseline_rows = [
+        {"date": start.isoformat(), "rate": 0.0, "passed": 0, "denominator": 3},
+        {"date": window_end.isoformat(), "rate": 0.0, "passed": 0, "denominator": 3},
+    ]
+    snapshots_path = breaker_dir / "slice_2.1.snapshots.ndjson"
+    baseline_text = "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in baseline_rows)
+    snapshots_path.write_text(baseline_text, encoding="utf-8")
+    (acceptance / "slice21_bo.yaml").write_text("items: []\n", encoding="utf-8")
+    lock_path = acceptance / "l1_required.lock.json"
+    lock_path.write_text(json.dumps(_lock()), encoding="utf-8")
+    expect_yaml = {
+        "freeze_file": str(freeze_path), "lock_file": str(lock_path),
+        "blocked_owner_file": "tests/acceptance/slice21_bo.yaml",
+        "breaker_snapshots_file": str(snapshots_path), "stage2_estimate_weeks": 0.0,
+        "parity": {"status_file": ""}, "sections": [],
+    }
+    expect_path = acceptance / "slice21_gate_expect.yaml"
+    expect_path.write_text(yaml.safe_dump(expect_yaml, allow_unicode=True), encoding="utf-8")
+    case_verdicts = {case_id: "PASS" for case_id in freeze["required_case_ids"]}
+    case_verdicts_path = run_dir / "case_verdicts.json"
+    case_verdicts_path.write_text(json.dumps(case_verdicts), encoding="utf-8")
+
+    real_loader = mod._load_module
+    monkeypatch.setattr(mod, "build_identity", lambda _args: json.loads(json.dumps(IDENTITY)))
+    monkeypatch.setattr(mod, "_load_module", lambda name, path: (
+        types.SimpleNamespace(load_effective_freeze=lambda _path: freeze)
+        if name == "freeze_slice_cases" else real_loader(name, path)
+    ))
+    rc = mod.main([
+        "assemble", "--run-dir", str(run_dir), "--run-id", "run-pending",
+        "--expect", str(expect_path), "--case-verdicts", str(case_verdicts_path),
+        "--append-breaker-snapshot", "--candidate-commit", candidate_commit,
+    ])
+    assert rc == 0, capsys.readouterr()
+
+    pending_path = run_dir / "breaker/slice_2.1.pending.ndjson"
+    assert snapshots_path.read_text(encoding="utf-8") == baseline_text, "assemble 不得修改已追蹤快照"
+    pending_rows = [json.loads(line) for line in pending_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(pending_rows) == 1
+    pending = pending_rows[0]
+    report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+    merged = {"snapshots": baseline_rows + pending_rows, "today": today.isoformat(), "stage2_estimate_weeks": 0.0}
+    expected = mod.judge_breaker(freeze, merged)
+    actual = report["case_uptake"]["breaker"]
+    assert actual is not None, (report["case_uptake"], expected)
+    assert actual["actual_verdict"] == expected[2]["actual_verdict"] == "FAIL"
+    assert actual["gate_verdict"] == expected[2]["gate_verdict"] == "OD-87_EXEMPT"
+    assert actual["snapshot_count"] == expected[2]["snapshot_count"] == len(baseline_rows) + 1
+    assert actual == expected[2]
+
+    monkeypatch.setattr(mod, "_git", lambda *args: "" if args[0] == "status" else candidate_commit)
+    finalize_rc = mod.main([
+        "finalize-breaker-snapshot", "--run-dir", str(run_dir), "--expect", str(expect_path),
+        "--gates-complete",
+    ])
+    assert finalize_rc == 0, capsys.readouterr()
+    committed_rows = [json.loads(line) for line in snapshots_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert committed_rows == baseline_rows + [pending]
+    archived_path = run_dir / "breaker/slice_2.1.committed.ndjson"
+    assert archived_path.is_file() and not pending_path.exists()
+    assert mod.breaker_inputs(expect_yaml, today=today.isoformat(), pending_snapshot_file=pending_path)["snapshots"] == committed_rows
+    before_duplicate = snapshots_path.read_bytes()
+    assert mod.main([
+        "finalize-breaker-snapshot", "--run-dir", str(run_dir), "--expect", str(expect_path),
+        "--gates-complete",
+    ]) == 2
+    assert snapshots_path.read_bytes() == before_duplicate
+
+    bad_run = run_dir.parent / "run-bad"
+    (bad_run / "breaker").mkdir(parents=True)
+    bad_report = dict(report, run_id="run-bad")
+    (bad_run / "report.json").write_text(json.dumps(bad_report), encoding="utf-8")
+    (bad_run / "case_verdicts.json").write_text(json.dumps(case_verdicts), encoding="utf-8")
+    bad_pending = dict(pending, run_id="run-bad", rate=0.5)
+    (bad_run / "breaker/slice_2.1.pending.ndjson").write_text(json.dumps(bad_pending) + "\n", encoding="utf-8")
+    assert mod.main([
+        "finalize-breaker-snapshot", "--run-dir", str(bad_run), "--expect", str(expect_path),
+        "--gates-complete",
+    ]) == 2
+    assert snapshots_path.read_bytes() == before_duplicate
+
+
+# --------------------------------------------------------------------------- 第三輪審查（d2d29a6_7af6567）
+
+def test_case_uptake_tripped_is_fail(case):
+    """b7cd852 #1：窗口結束且承接率累計增加 < 10 pp → 斷路器 tripped → case_uptake FAIL（不得固定 PASS）。"""
+    case.breaker = {"snapshots": [{"date": "2026-10-21", "rate": 0.0}, {"date": "2026-11-11", "rate": 0.05}],
+                    "today": "2026-11-20", "stage2_estimate_weeks": 0.0}
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "case_uptake")["status"] == "FAIL"
+    assert out["verdict"] == "FAIL"
+
+
+def test_case_uptake_od87_exemption_reports_tripped_without_blocking(case):
+    freeze_mod = _load_script("freeze_slice_cases_for_od87", "scripts/rust/freeze_slice_cases.py")
+    freeze_path = ROOT / "tests/acceptance/breaker/slice_2.1.json"
+    case.freeze = freeze_mod.load_effective_freeze(freeze_path)
+    case.case_verdicts = {cid: "PASS" for cid in case.freeze["required_case_ids"]}
+    case.breaker = {
+        "snapshots": [{"date": "2026-10-21", "rate": 0.0}, {"date": "2026-11-11", "rate": 0.05}],
+        "today": "2026-11-14", "stage2_estimate_weeks": 0.0,
+    }
+    out = _judge_mod().judge(case.report(), case.expect())
+    section = _sec(out, "case_uptake")
+    assert section["status"] == "PASS", section
+    assert out["case_uptake"]["breaker"]["actual_verdict"] == "FAIL"
+    assert out["case_uptake"]["breaker"]["gate_verdict"] == "OD-87_EXEMPT"
+    assert out["case_uptake"]["breaker"]["exemption"]["decision"] == "OD-87"
+
+
+def test_case_uptake_od02_resubmit_is_fail(case):
+    case.breaker = dict(BREAKER_OK, stage2_estimate_weeks=30.0)
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "case_uptake")["status"] == "FAIL"
+
+
+def test_case_uptake_insufficient_evidence_is_missing(case):
+    case.breaker = {"snapshots": [], "today": "2026-11-20", "stage2_estimate_weeks": 0.0}
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "case_uptake")["status"] == "EVIDENCE_MISSING"
+    assert out["verdict"] == "INCOMPLETE"
+
+
+def test_case_uptake_without_breaker_inputs_is_missing(case):
+    case.breaker = None
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "case_uptake")["status"] == "EVIDENCE_MISSING"
+
+
+def test_case_uptake_rate_zero_reported_in_reasons(case):
+    """正向對照：窗口內未觸發 → PASS，且 rate 照實回報（不因 PASS 改寫）。"""
+    out = _judge_mod().judge(case.report(), case.expect())
+    sec = _sec(out, "case_uptake")
+    assert sec["status"] == "PASS"
+    assert out["case_uptake"]["rate"] == 0.0
+    assert out["case_uptake"]["breaker"]["tripped"] is False
+
+
+def test_non_test_section_requires_explicit_verdict(case):
+    """b7cd852 #3：非測試類 section 只有 exit 0、缺 section_verdict → EVIDENCE_MISSING（不得預設放行）。"""
+    rep = case.report()
+    for sec in rep["sections"]:
+        if sec["name"] == "policy_check":
+            sec.pop("section_verdict")
+    out = _judge_mod().judge(rep, case.expect())
+    assert _sec(out, "policy_check")["status"] == "EVIDENCE_MISSING"
+    assert out["verdict"] == "INCOMPLETE"
+
+
+def _parity_cfg(rows: list[dict]) -> dict:
+    return {"status": {"rows": rows, "source_sha256": None}, "status_file": "x.yaml",
+            "source_rows": [{"id": r["id"], "take": "P5"} for r in rows], "source_sha256_actual": None}
+
+
+@pytest.mark.parametrize("problem", ["missing", "bad_format", "wrong_paragraph", "non_string", "not_source_row"])
+def test_not_applicable_requires_source_row_and_specific_ruling(case, problem):
+    """免測不得略過逐列列名及具體文件段落出處。"""
+    j = _judge_mod()
+    row = {"id": "A-86", "status": "NOT_APPLICABLE"}
+    plan = "docs/rust-refactor/plans/06-slice21-daemon-core.md"
+    lines = (ROOT / plan).read_text(encoding="utf-8").splitlines()
+    row_line = next(i for i, line in enumerate(lines, 1) if "| #102 |" in line and "A-86" in line)
+    if problem == "bad_format":
+        row["ruling"] = "docs/rust-refactor/plans/06-slice21-daemon-core.md"
+    elif problem == "wrong_paragraph":
+        row["ruling"] = f"{plan}#L{row_line + 1000}"
+    elif problem == "non_string":
+        row["ruling"] = {"path": plan, "line": row_line}
+    elif problem not in ("missing", "non_string"):
+        row["ruling"] = f"{plan}#L{row_line}"
+    parity = _parity_cfg([row])
+    if problem == "not_source_row":
+        parity["source_rows"] = [{"id": "#102", "take": "P5"}]
+
+    result = j.judge_parity(parity, set(), set())
+
+    if problem == "not_source_row":
+        assert result["incomplete"] is True
+        assert result["problems"]
+    else:
+        assert result["rows"][0]["status"] == "INCOMPLETE"
+        assert result["incomplete"] is True
+        if problem == "non_string":
+            assert isinstance(result["rows"][0]["ruling"], str)
+
+
+def test_not_applicable_rejects_unapproved_rows_even_when_the_source_mentions_them():
+    """OD101-01：只允許 A-86 的精確裁決行；提及列名不等於免測核准。"""
+    j = _judge_mod()
+    plan = "docs/rust-refactor/plans/06-slice21-daemon-core.md"
+    candidates = [
+        ("#46", f"{plan}#L4620"),
+        ("#4", f"{plan}#L4620"),
+        ("A-88", f"{plan}#L4623"),
+        ("A-115", f"{plan}#L4624"),
+    ]
+
+    for row_id, ruling in candidates:
+        parity = _parity_cfg([{"id": row_id, "status": "NOT_APPLICABLE", "ruling": ruling}])
+        result = j.judge_parity(parity, set(), set())
+        assert result["rows"][0]["status"] == "INCOMPLETE", (row_id, result)
+        assert result["incomplete"] is True, (row_id, result)
+
+
+def test_not_applicable_with_specific_plan_ruling_does_not_block_parity(case):
+    """P5-T19 #102 的逐列免測狀態須帶指向計畫明確列的引用，且不要求不存在的測試 nodeid。"""
+    j = _judge_mod()
+    plan = "docs/rust-refactor/plans/06-slice21-daemon-core.md"
+    lines = (ROOT / plan).read_text(encoding="utf-8").splitlines()
+    row_line = next(i for i, line in enumerate(lines, 1) if "| #102 |" in line and "A-86" in line)
+    parity = _parity_cfg([{"id": "A-86", "status": "NOT_APPLICABLE", "ruling": f"{plan}#L{row_line}"}])
+
+    result = j.judge_parity(parity, set(), set())
+
+    assert result["rows"][0]["status"] == "NOT_APPLICABLE"
+    assert result["rows"][0]["ruling"] == f"{plan}#L{row_line}"
+    assert result["summary"] == {"NOT_APPLICABLE": 1}
+    assert result["incomplete"] is False
+
+    case.parity = parity
+    report = j.judge(case.report(), case.expect())
+    assert report["parity_amendments"]["rows"][0]["status"] == "NOT_APPLICABLE"
+    assert report["verdict"] == "READY_FOR_OWNER_EVIDENCE"
+
+
+def test_owner_decision_pending_requires_registered_decision(case):
+    """4920d90 #1：OWNER-DECISION-PENDING 須帶存在於 pending_decisions 的 decision id，否則降為 INCOMPLETE。"""
+    case.parity = _parity_cfg([{"id": "#32", "status": "OWNER-DECISION-PENDING"}])
+    out = _judge_mod().judge(case.report(), case.expect())
+    row = out["parity_amendments"]["rows"][0]
+    assert row["status"] == "INCOMPLETE"
+    assert out["verdict"] == "INCOMPLETE"
+    case.parity = _parity_cfg([{"id": "#32", "status": "OWNER-DECISION-PENDING", "decision": "PA-OD-F67"}])
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert out["parity_amendments"]["rows"][0]["status"] == "INCOMPLETE"      # 未登記於 pending_decisions
+    case.pending_decisions = [{"id": "PA-OD-F67", "scenario": "x", "evidence": "y"}]
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert out["parity_amendments"]["rows"][0]["status"] == "OWNER-DECISION-PENDING"
+    assert out["verdict"] == "READY_FOR_OWNER_EVIDENCE"
+
+
+def test_preflight_not_frozen_never_ready(case):
+    """§5.3：event_latency 未凍結（preflight.event_latency_frozen false）時，即使 `--evidence-run` 執行了全部 section
+    且皆 PASS，verdict 仍為 INCOMPLETE（不得 READY）。"""
+    rep = case.report()
+    rep["preflight"] = {"event_latency_frozen": False, "reasons": ["event_latency.freeze_status='pending_review_record'"]}
+    out = _judge_mod().judge(rep, case.expect())
+    assert out["verdict"] == "INCOMPLETE"
+    assert any("event_latency 未凍結" in r for r in out["verdict_reasons"])
+
+
+def test_cmd_judge_reloads_parity_like_assemble(case, capsys, monkeypatch):
+    """sol-backfill p5 #8：`judge` 子命令必須與 `assemble` 一樣重新載入 #104 parity 狀態與來源；
+    來源文件不可得時 parity 為 INCOMPLETE，重新判定不得因漏載 parity 而放寬成 READY_FOR_OWNER_EVIDENCE。"""
+    import functools
+
+    import yaml
+
+    mod = _judge_mod()
+    # `judge` 子命令沒有 today 參數，`breaker_inputs` 預設取真實 UTC 日期；FREEZE_SYNTH 的 OD-02 24 週上限在
+    # 2027-04-07，未固定日期時本測試自 2027-04-08 起 case_uptake 轉 FAIL、verdict 變 FAIL（PR #278 審查移時鐘實測）。
+    # 比照同檔其他案例固定為 BREAKER_OK 的日期；斷路器判定本身不放寬。
+    monkeypatch.setattr(mod, "breaker_inputs", functools.partial(mod.breaker_inputs, today=BREAKER_OK["today"]))
+
+    base = case.base
+    report_path = base / "report.json"
+    report_path.write_text(json.dumps(case.report()), encoding="utf-8")
+    (base / "lock.json").write_text(json.dumps(_lock()), encoding="utf-8")
+    (base / "freeze.json").write_text(json.dumps(FREEZE_SYNTH), encoding="utf-8")
+    (base / "snapshots.ndjson").write_text("", encoding="utf-8")
+    (base / "parity.yaml").write_text(yaml.safe_dump({
+        "schema_version": 1, "source": "", "source_ref": None, "source_sha256": None,
+        "rows": [{"id": "#32", "status": "INCOMPLETE"}],
+    }), encoding="utf-8")
+    expect = {
+        "schema_version": 1, "lock_file": str(base / "lock.json"), "freeze_file": str(base / "freeze.json"),
+        "blocked_owner_file": "tests/acceptance/slice21_bo.yaml",
+        "breaker_snapshots_file": str(base / "snapshots.ndjson"), "stage2_estimate_weeks": 0.0,
+        "parity": {"status_file": str(base / "parity.yaml")}, "sections": [],
+    }
+    expect_path = base / "expect.yaml"
+    expect_path.write_text(yaml.safe_dump(expect, allow_unicode=True), encoding="utf-8")
+    assert mod.main(["judge", "--report", str(report_path), "--expect", str(expect_path)]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["verdict"] == "INCOMPLETE", out
+    assert any("#104" in r for r in out["verdict_reasons"]), out
+
+
+def test_l15_ab_excluded_case_requires_covering_pytest_passed(case):
+    """OD-40：`l15-wal-interference` 移出 l15_ab 判定後，改由逐名列出的 pytest WAL 測試承擔；
+    l15_ab 只有在每個 covered_by 測試於指定 section 恰為 passed 時才得 PASS，否則 EVIDENCE_MISSING（不得默默放行）。"""
+    nid = GATE_NODEIDS["blackbox_rust"][0]
+    exp = case.expect()
+    exp["l15_ab_excluded"] = [{"case_id": "l15-wal-interference", "decision": "OD-40",
+                               "covered_by": [{"section": "blackbox_rust", "nodeid": nid},
+                                              {"section": "blackbox_python", "nodeid": "tests/x.py::test_absent"}]}]
+    out = _judge_mod().judge(case.report(), exp)
+    assert _sec(out, "l15_ab")["status"] == "EVIDENCE_MISSING"
+    assert any("OD-40" in r and "test_absent" in r for r in _sec(out, "l15_ab")["reasons"])
+    assert out["verdict"] == "INCOMPLETE"
+    exp["l15_ab_excluded"][0]["covered_by"][1]["nodeid"] = GATE_NODEIDS["blackbox_python"][0]
+    out = _judge_mod().judge(case.report(), exp)
+    assert _sec(out, "l15_ab")["status"] == "PASS"
+    # 只在其他 section 通過不算（必須在列出的 section）
+    exp["l15_ab_excluded"][0]["covered_by"] = [{"section": "blackbox_python", "nodeid": nid}]
+    out = _judge_mod().judge(case.report(), exp)
+    assert _sec(out, "l15_ab")["status"] == "EVIDENCE_MISSING"
+
+
+def test_event_latency_section_requires_readable_evidence(case):
+    """方法審閱 [High]：judge 須讀取 event_latency 證據內容；`evidence: missing.json` 不得判 PASS。"""
+    assert _sec(_judge_mod().judge(case.report(), case.expect()), "event_latency")["status"] == "PASS"
+    rep = case.report()
+    for sec in rep["sections"]:
+        if sec["name"] == "event_latency":
+            sec["evidence"] = "missing.json"
+    out = _judge_mod().judge(rep, case.expect())
+    assert _sec(out, "event_latency")["status"] == "EVIDENCE_MISSING"
+    assert out["verdict"] == "INCOMPLETE"
+    case.evlat = None
+    assert _sec(_judge_mod().judge(case.report(), case.expect()), "event_latency")["status"] == "EVIDENCE_MISSING"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("daemon_sha256", "0" * 64),          # 量測的不是本 run 的 artifact
+    ("artifact_source_commit", "f" * 40),  # 建置來源不是本 run 的 git_revision（如建置失敗留下舊 binary）
+    ("artifact_source_commit", None),
+    ("artifact_build_run_id", "other-run"),
+    ("run_id", "other-run"),
+    ("tool_sha256", "1" * 64),
+    ("contract_sha256", "2" * 64),
+    ("method_revision", "2026-10-29.1"),
+])
+def test_event_latency_evidence_identity_must_match_run(case, field, value):
+    """方法審閱 [High]：量測 JSON 的 artifact、commit、run、工具與契約身分須與 gate 本 run 一致，否則不得 PASS。"""
+    case.evlat = _evlat_evidence(**{field: value})
+    out = _judge_mod().judge(case.report(), case.expect())
+    sec = _sec(out, "event_latency")
+    assert sec["status"] == "EVIDENCE_MISSING", (field, sec)
+    assert any(field in r for r in sec["reasons"]), sec["reasons"]
+
+
+def test_event_latency_evidence_verdict_drives_section(case):
+    """證據 verdict FAIL → section FAIL（即使 gate 片段帶 PASS）；INSUFFICIENT_EVIDENCE → EVIDENCE_MISSING。"""
+    case.evlat = {**_evlat_evidence(), "verdict": "FAIL", "reasons": ["外部量測超過上限：1/idle/stop_request"]}
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "event_latency")["status"] == "FAIL" and out["verdict"] == "FAIL"
+    case.evlat = {**_evlat_evidence(), "verdict": "INSUFFICIENT_EVIDENCE", "reasons": ["x"]}
+    assert _sec(_judge_mod().judge(case.report(), case.expect()), "event_latency")["status"] == "EVIDENCE_MISSING"
+
+
+def test_release_build_failure_is_fail_and_build_sha_must_match(case):
+    """方法審閱 [High]：Linux release 建置失敗（舊 binary 可能留存）→ FAIL；建置當下 sha256 與報告 artifact 不符 → FAIL。"""
+    case.identity["build"] = {"linux_exit": 0, "windows_exit": 0, "daemon_sha256_at_build": IDENTITY["daemon_sha256"]}
+    assert _judge_mod().judge(case.report(), case.expect())["verdict"] == "READY_FOR_OWNER_EVIDENCE"
+    case.identity["build"] = {"linux_exit": 101, "windows_exit": 0, "daemon_sha256_at_build": None}
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert out["verdict"] == "FAIL" and any("建置失敗" in r for r in out["verdict_reasons"])
+    case.identity["build"] = {"linux_exit": 0, "windows_exit": 0, "daemon_sha256_at_build": "0" * 64}
+    assert _judge_mod().judge(case.report(), case.expect())["verdict"] == "FAIL"
+
+
+def test_gate_script_removes_stale_artifact_and_binds_build_sha():
+    """方法審閱 [High]：gate 建置前移除舊 artifact；只在建置成功時把來源 commit／run／建置當下 sha256 傳給量測工具。"""
+    text = (ROOT / "scripts" / "rust" / "slice21_gate.sh").read_text(encoding="utf-8")
+    build_at = text.index("run_logged build_linux")
+    assert text.rindex('rm -f "$RUST_D" "$RUST_CLI"', 0, build_at) > 0
+    assert 'BUILD_LINUX_RC="$LAST_RC"' in text and 'BUILD_WINDOWS_RC="$LAST_RC"' in text
+    assert '--artifact-sha256 "$BUILT_D_SHA"' in text
+    evlat = text[text.index("run_logged event_latency "):]
+    assert '"${evlat_bind[@]}"' in evlat.splitlines()[2] or '"${evlat_bind[@]}"' in evlat[:400]
+    assert "--build-linux-exit" in text and "--built-daemon-sha256" in text
+
+
+def test_l15_ab_excluded_case_covered_by_section_requires_section_pass(case):
+    """OD-58：`s21-event-latency` 移出 l15_ab 後由 event_latency section 承擔（`covered_by_sections`）；
+    承擔 section 非 PASS 時 l15_ab 不得 PASS。"""
+    exp = case.expect()
+    exp["l15_ab_excluded"] = [{"case_id": "s21-event-latency", "decision": "OD-58",
+                               "covered_by": [{"section": "linux_l1", "nodeid": CORE_NODEIDS[0]}],
+                               "covered_by_sections": ["event_latency"]}]
+    assert _sec(_judge_mod().judge(case.report(), exp), "l15_ab")["status"] == "PASS"
+    case.evlat = None                                    # event_latency 證據缺 → EVIDENCE_MISSING
+    out = _judge_mod().judge(case.report(), exp)
+    assert _sec(out, "event_latency")["status"] == "EVIDENCE_MISSING"
+    sec = _sec(out, "l15_ab")
+    assert sec["status"] == "EVIDENCE_MISSING" and any("OD-58" in r and "event_latency" in r for r in sec["reasons"])
+
+
+def test_linux_l1_run_as_root_is_evidence_missing(case):
+    """F108（P5 第 5 輪 OWNER-BATCH #4，編排者裁決）：linux_l1 須以非 root 執行；euid==0 時不得記 PASS，也不得因
+    root 專屬失敗記 FAIL 了事，一律 EVIDENCE_MISSING 並要求非 root 補跑。未記錄 euid 同為證據不足。"""
+    def with_euid(euid, outcome="passed"):
+        rep = case.report()
+        for sec in rep["sections"]:
+            if sec["name"] == "linux_l1":
+                if euid is None:
+                    sec.pop("run_euid", None)
+                else:
+                    sec["run_euid"] = euid
+                if outcome != "passed":
+                    l1 = _l1("linux", "cargo", [_row(CORE_NODEIDS[0], outcome)] + [_row(i) for i in CORE_NODEIDS[1:]])
+                    sec["l1_results"] = case.write_l1("linux_l1_x", l1)
+                    sec.update(_counts(l1))
+        return _sec(_judge_mod().judge(rep, case.expect()), "linux_l1")
+    assert with_euid(1000)["status"] == "PASS"
+    assert with_euid(1000, "failed")["status"] == "FAIL"
+    root = with_euid(0)
+    assert root["status"] == "EVIDENCE_MISSING" and any("非 root" in r for r in root["reasons"])
+    assert with_euid(0, "failed")["status"] == "EVIDENCE_MISSING"
+    assert with_euid(None)["status"] == "EVIDENCE_MISSING"
+
+
+def test_gate_script_linux_l1_non_root_and_daemon_version_from_rpc():
+    """F108／F139：gate 的 linux_l1 於 euid==0 且無法降權時不執行並記 EVIDENCE_MISSING；daemon_version 取自 RPC。"""
+    text = (ROOT / "scripts" / "rust" / "slice21_gate.sh").read_text(encoding="utf-8")
+    l1 = text[text.index("# 2. Linux L1"):text.index("# 3. Linux cap_posix_pty")]
+    assert "id -u" in l1 and "SW_GATE_L1_USER" in l1 and "--run-euid" in l1 and "EVIDENCE_MISSING" in l1
+    assert "probe_daemon_version.py" in text
+    assert '"$RUST_D" --version' not in text      # serialwrapd 依 Python 1:1 不提供 --version
+
+
+def test_uncarried_gate_set_blocks_ready(case):
+    """sol P5-4f8acdf-1（High）：鎖中有 `s21_gate:*` 集合未被任何 section（含 additional_required_sets）承擔時，
+    其 nodeid 從未被執行或判定——不得 READY，verdict 須為 INCOMPLETE 並列出該集合。"""
+    exp = case.expect()
+    assert _judge_mod().judge(case.report(), exp)["verdict"] == "READY_FOR_OWNER_EVIDENCE"
+    # 第 7 輪：s21_gate:cap_sys_admin 已由 linux_cap_sys_admin section 承擔（SPEC-GAP #2），改以未承擔的集合名驗證守門。
+    exp["lock"]["sets"]["s21_gate:cap_uncarried"] = {
+        "linux": {"nodeids": ["cargo:sw-pal::serial_posix_process::cap_uncarried__x"],
+                  "selector": {"argv": ["--workspace", "--", "--ignored", "cap_uncarried__"]}}}
+    out = _judge_mod().judge(case.report(), exp)
+    assert out["verdict"] == "INCOMPLETE"
+    assert any("s21_gate:cap_uncarried" in r for r in out["verdict_reasons"]), out["verdict_reasons"]
+    # 以 additional_required_sets 指派給 section 即視為承擔（由該 section 判定）
+    exp["additional_required_sets"] = {"linux_cap_posix_pty": ["s21_gate:cap_uncarried"]}
+    out = _judge_mod().judge(case.report(), exp)
+    assert not any("未被任何 section 承擔" in r for r in out["verdict_reasons"])
+
+
+def test_uncarried_gate_set_is_judged_per_platform(case):
+    """sol P5-86b54d8-1 (a)：承擔以（集合, 平台）為粒度——windows section 承擔同名集合時，該集合的 linux 列
+    從未被任何 linux section 執行，仍須判 INCOMPLETE 並列出 linux 平台。"""
+    exp = case.expect()
+    sel = {"argv": ["--workspace", "--", "--ignored", "cap_example__"]}
+    exp["lock"]["sets"]["s21_gate:cap_example"] = {
+        "linux": {"nodeids": ["cargo:sw-daemon::launcher::cap_example__linux_only"], "selector": sel},
+        "windows": {"nodeids": [CORE_NODEIDS[0]], "selector": sel}}
+    exp["additional_required_sets"] = {"windows_native_l1": ["s21_gate:cap_example"]}
+    out = _judge_mod().judge(case.report(), exp)
+    assert _sec(out, "windows_native_l1")["status"] == "PASS"   # windows 列確實由 windows section 判定
+    assert out["verdict"] == "INCOMPLETE", out["verdict_reasons"]
+    assert any("s21_gate:cap_example.linux" in r for r in out["verdict_reasons"]), out["verdict_reasons"]
+    assert not any("s21_gate:cap_example.windows" in r for r in out["verdict_reasons"])
+
+
+def test_non_test_section_fragment_cannot_carry_gate_set(case):
+    """sol P5-86b54d8-1 (b)：非測試類 section 不判集合，其片段自帶的 additional_required_sets 不得算承擔
+    （不接受報告自行宣告承擔）。"""
+    exp = case.expect()
+    exp["lock"]["sets"]["s21_gate:cap_example"] = {
+        "linux": {"nodeids": ["cargo:sw-pal::serial_posix_process::cap_example__x"],
+                  "selector": {"argv": ["--workspace", "--", "--ignored", "cap_example__"]}}}
+    rep = case.report()
+    for sec in rep["sections"]:
+        if sec["name"] == "l15_ab":
+            sec["additional_required_sets"] = ["s21_gate:cap_example"]
+    out = _judge_mod().judge(rep, exp)
+    assert out["verdict"] == "INCOMPLETE", out["verdict_reasons"]
+    assert any("s21_gate:cap_example.linux" in r for r in out["verdict_reasons"]), out["verdict_reasons"]
+    # 測試類 section 片段自帶者照常由該 section 判定，故算承擔
+    for sec in rep["sections"]:
+        if sec["name"] == "linux_cap_posix_pty":
+            sec["additional_required_sets"] = ["s21_gate:cap_example"]
+    out = _judge_mod().judge(rep, exp)
+    assert not any("未被任何 section 承擔" in r for r in out["verdict_reasons"]), out["verdict_reasons"]
+    assert _sec(out, "linux_cap_posix_pty")["status"] == "EVIDENCE_MISSING"   # 該 nodeid 未執行 → 不得 PASS
+
+
+# --------------------------------------------------------------------------- 第 7 輪：SPEC-GAP #1／#2（編排者裁決）
+
+DISPOSITION = {"sys_admin": "BLOCKED-OWNER", "supervisor_runtime": "BLOCKED-OWNER",
+               "windows_native": "LOCAL-WINDOWS-TODO", "interactive_desktop": "LOCAL-WINDOWS-TODO"}
+NEEDS = {"sys_admin": "CAP_SYS_ADMIN", "supervisor_runtime": "systemd", "windows_native": "Windows",
+         "interactive_desktop": "Windows"}
+# OD-55（Windows 部分）：同一能力在 windows section 的所需能力與處置（supervisor_runtime 於 Windows 為工作排程器、LOCAL-WINDOWS）。
+SECTION_DISPOSITION = {"windows_cap_supervisor_runtime": "LOCAL-WINDOWS-TODO"}
+SECTION_NEEDS = {"windows_cap_supervisor_runtime": "Windows"}
+
+
+@pytest.mark.parametrize("name", sorted(CAP_OF))
+def test_capability_section_never_passes_without_capability_probe(case, name):
+    """SPEC-GAP #2：能力集合 section 以 --caps <cap> 實跑；本機無該能力時記 EVIDENCE_MISSING 並標所需能力與處置
+    （sys_admin／supervisor_runtime → BLOCKED-OWNER＋實跑方式；windows_native／interactive_desktop → LOCAL-WINDOWS-TODO），
+    不得記 PASS——即使 l1 結果全 passed（例如 cap_sys_admin 測試在無權限時 early return 仍回 ok）。"""
+    cap = CAP_OF[name]
+    j = _judge_mod()
+    for probe in (None, {"cap": cap, "available": False, "evidence": "euid=1000"},
+                  {"cap": "posix_pty", "available": True, "evidence": "錯的能力"}):
+        rep = case.report()
+        sec = [s for s in rep["sections"] if s["name"] == name][0]
+        sec.pop("capability_probe")
+        if probe is not None:
+            sec["capability_probe"] = probe
+        out = j.judge(rep, case.expect())
+        s = _sec(out, name)
+        assert s["status"] == "EVIDENCE_MISSING", (probe, s["reasons"])
+        needs, disposition = SECTION_NEEDS.get(name, NEEDS[cap]), SECTION_DISPOSITION.get(name, DISPOSITION[cap])
+        assert any(needs in r and disposition in r for r in s["reasons"]), s["reasons"]
+        assert out["verdict"] == "INCOMPLETE"
+    assert _sec(j.judge(case.report(), case.expect()), name)["status"] == "PASS"   # 具備能力且全 passed
+
+
+def test_capability_section_failure_with_capability_is_fail(case):
+    n1, n2 = GATE_NODEIDS["linux_cap_sys_admin"]
+    case.l1["linux_cap_sys_admin"] = _l1("linux", "cargo", [_row(n1), _row(n2, "failed")], exit_code=101)
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "linux_cap_sys_admin")["status"] == "FAIL"
+
+
+def test_capability_sections_and_py_parity_match_expect_and_lock():
+    """SPEC-GAP #1／#2：expect 的測試類 section 與判定器 TEST_SECTIONS 一致；鎖中每個（s21_gate 集合, 平台）都有 section 承擔
+    （OD-55 能力集合不再落入「未承擔集合」）；py_parity section 用新集合 py_parity_full，pytest_full 仍承擔舊 py_parity。"""
+    import yaml
+
+    j = _judge_mod()
+    exp = yaml.safe_load((ROOT / "tests/acceptance/slice21_gate_expect.yaml").read_text(encoding="utf-8"))
+    test_secs = {s["name"]: (s["platform"], s["required_set"]) for s in exp["sections"] if s["kind"] == "test"}
+    assert {n: p for n, (p, _) in test_secs.items()} == j.TEST_SECTIONS
+    assert {n for n, _ in test_secs.items()} <= set(j.SECTION_ORDER)
+    assert {test_secs[n][1] for n in CAP_OF} == {f"s21_gate:cap_{c}" for c in CAP_OF.values()}
+    assert {n: c["cap"] for n, c in j.CAPABILITY_SECTIONS.items()} == CAP_OF
+    assert test_secs["py_parity"] == ("linux", "s21_gate:py_parity_full")
+    assert test_secs["py_parity_windows"] == ("windows", "s21_gate:py_parity")
+    assert "s21_gate:py_parity" in exp["additional_required_sets"]["pytest_full"]
+    carried = {(sid, test_secs[n][0]) for n, (_, sid) in test_secs.items()}
+    carried |= {(sid, test_secs[n][0]) for n, sids in exp["additional_required_sets"].items() for sid in sids}
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    uncarried = sorted(f"{sid}.{plat}" for sid, spec in lock["sets"].items() if sid.startswith("s21_gate:")
+                       for plat in spec if (sid, plat) not in carried)
+    assert uncarried == [], uncarried
+
+
+@pytest.mark.parametrize(
+    "problem",
+    ["missing_provenance", "other_head", "dirty", "argv", "argv_not_list", "argv_str", "markexpr", "provenance_platform",
+     "provenance_schema"],
+)
+def test_py_parity_windows_rejects_unbound_or_mismatched_l1(case, problem):
+    """OD101-04：Windows parity judge 核對 provenance 與凍結 selector／markexpr。"""
+    nodeid = "tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::test_windows_guarded_write_stall_drain_stalled_native"
+    selector = ["-q", nodeid, "-m", "windows_native and windows_com"]
+    exp = case.expect()
+    exp["lock"]["sets"]["s21_gate:py_parity"]["windows"] = {
+        "nodeids": [nodeid],
+        "selector": {"argv": selector, "markexpr": "windows_native and windows_com", "paths": [nodeid]},
+    }
+    l1 = _l1("windows", "pytest", [_row(nodeid)])
+    l1["argv"] = ["/x/pytest/__main__.py", *selector]
+    l1["markexpr"] = "windows_native and windows_com"
+    l1["provenance"] = {
+        "schema": "pytest-l1-provenance.v1", "platform": "windows",
+        "git": {"head": "e" * 40, "clean": True, "end": {"head": "e" * 40, "clean": True}},
+    }
+    if problem == "missing_provenance":
+        l1.pop("provenance")
+    elif problem == "other_head":
+        l1["provenance"]["git"]["head"] = "f" * 40
+    elif problem == "dirty":
+        l1["provenance"]["git"]["clean"] = False
+    elif problem == "provenance_platform":
+        l1["provenance"]["platform"] = "linux"
+    elif problem == "provenance_schema":
+        l1["provenance"]["schema"] = "other.v1"
+    elif problem == "argv":
+        l1["argv"].append("tests/unexpected.py")
+    elif problem == "argv_not_list":
+        l1["argv"] = 7  # OD101F-07：型別錯誤必須記為證據缺失，不得以例外中止 judge
+    elif problem == "argv_str":
+        l1["argv"] = " ".join(selector)
+    else:
+        l1["markexpr"] = "windows_native"
+    case.l1["py_parity_windows"] = l1
+    case.parity = _parity_cfg([{"id": "F-S19", "status": "PASS", "tests": [nodeid]}])
+    exp["parity"] = case.parity
+
+    out = _judge_mod().judge(case.report(), exp)
+
+    assert _sec(out, "py_parity_windows")["status"] == "EVIDENCE_MISSING", (problem, _sec(out, "py_parity_windows"))
+    assert out["parity_amendments"]["rows"][0]["status"] == "INCOMPLETE", (problem, out["parity_amendments"])
+    assert out["parity_amendments"]["incomplete"] is True
+
+
+def test_windows_py_parity_passed_pool_requires_accepted_windows_l1(case):
+    """F-S19 只有 Windows selector L1 判 PASS 時才加入 parity passed pool；缺證仍是 INCOMPLETE。"""
+    nodeid = "tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::test_windows_guarded_write_stall_drain_stalled_native"
+    selector = ["-q", nodeid, "-m", "windows_native and windows_com"]
+    exp = case.expect()
+    exp["lock"]["sets"]["s21_gate:py_parity"]["windows"] = {
+        "nodeids": [nodeid],
+        "selector": {"argv": selector, "markexpr": "windows_native and windows_com", "paths": [nodeid]},
+    }
+    case.l1["py_parity_windows"] = _l1("windows", "pytest", [_row(nodeid)])
+    case.l1["py_parity_windows"]["argv"] = ["/x/pytest/__main__.py", *selector]
+    case.l1["py_parity_windows"]["markexpr"] = "windows_native and windows_com"
+    case.l1["py_parity_windows"]["provenance"] = {
+        "schema": "pytest-l1-provenance.v1", "platform": "windows",
+        "git": {"head": "e" * 40, "clean": True, "end": {"head": "e" * 40, "clean": True}},
+    }
+    case.parity = _parity_cfg([{"id": "F-S19", "status": "PASS", "tests": [nodeid]}])
+    exp["parity"] = case.parity
+
+    passed = _judge_mod().judge(case.report(), exp)
+    assert _sec(passed, "py_parity_windows")["status"] == "PASS"
+    assert passed["parity_amendments"]["rows"][0]["status"] == "PASS"
+
+    case.l1["py_parity_windows"] = None
+    missing = _judge_mod().judge(case.report(), exp)
+    assert _sec(missing, "py_parity_windows")["status"] == "EVIDENCE_MISSING"
+    assert missing["parity_amendments"]["rows"][0]["status"] == "INCOMPLETE"
+    assert missing["parity_amendments"]["incomplete"] is True
+
+
+def test_py_parity_windows_binds_to_real_frozen_selector(case):
+    """OD101-04：使用正式 L1 lock；缺 Windows selector 時須 fail-closed，不以 synthetic selector 代替。"""
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    spec = lock["sets"]["s21_gate:py_parity"].get("windows")
+    expect = case.expect()
+    expect["lock"] = lock
+
+    if not isinstance(spec, dict) or not isinstance(spec.get("selector"), dict) or not spec.get("nodeids"):
+        nodeid = "tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::test_windows_guarded_write_stall_drain_stalled_native"
+        case.parity = _parity_cfg([{"id": "F-S19", "status": "PASS", "tests": [nodeid]}])
+        expect["parity"] = case.parity
+        out = _judge_mod().judge(case.report(), expect)
+        assert _sec(out, "py_parity_windows")["status"] == "EVIDENCE_MISSING"
+        assert out["parity_amendments"]["rows"][0]["status"] == "INCOMPLETE"
+        return
+
+    selector = spec["selector"]
+    assert isinstance(selector.get("argv"), list) and isinstance(selector.get("markexpr"), str)
+    nodeids = list(spec["nodeids"])
+    assert nodeids and all(isinstance(nodeid, str) for nodeid in nodeids)
+    l1 = _l1("windows", "pytest", [_row(nodeid) for nodeid in nodeids])
+    l1["argv"] = ["/x/pytest/__main__.py", *selector["argv"]]
+    l1["markexpr"] = selector["markexpr"]
+    l1["provenance"] = {
+        "schema": "pytest-l1-provenance.v1", "platform": "windows",
+        "git": {"head": "e" * 40, "clean": True, "end": {"head": "e" * 40, "clean": True}},
+    }
+    case.l1["py_parity_windows"] = l1
+    case.parity = _parity_cfg([{"id": "F-S19", "status": "PASS", "tests": nodeids}])
+    expect["parity"] = case.parity
+
+    out = _judge_mod().judge(case.report(), expect)
+
+    assert _sec(out, "py_parity_windows")["status"] == "PASS"
+    assert out["parity_amendments"]["rows"][0]["status"] == "PASS"
+
+    # win-pytest.sh 的實際 Windows argv：-c、含暫存路徑的 --junitxml= 必須與匯入層同樣正規化。
+    l1["argv"] = [
+        "-c",
+        r"--junitxml=C:\Users\runner\AppData\Local\Temp\sw-stage0\run\junit.xml",
+        *selector["argv"],
+    ]
+    case.l1["py_parity_windows"] = l1
+    out = _judge_mod().judge(case.report(), expect)
+    assert _sec(out, "py_parity_windows")["status"] == "PASS"
+    assert out["parity_amendments"]["rows"][0]["status"] == "PASS"
+
+    # 選擇器任何一項遭竄改都仍須 fail-closed。
+    l1["argv"].append("--maxfail=1")
+    case.l1["py_parity_windows"] = l1
+    out = _judge_mod().judge(case.report(), expect)
+    assert _sec(out, "py_parity_windows")["status"] == "EVIDENCE_MISSING"
+    assert out["parity_amendments"]["rows"][0]["status"] == "INCOMPLETE"
+
+
+def test_py_parity_full_has_complete_selector_and_keeps_old_set():
+    """SPEC-GAP #1：s21_gate:py_parity（凍結、selector 只有 1 筆）不改不刪；新集合 py_parity_full 的 selector 須涵蓋
+    舊集合全部 nodeid（完整 selector），nodeid 為實際收集結果且 ⊇ 舊集合。"""
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    old = lock["sets"]["s21_gate:py_parity"]["linux"]
+    full = lock["sets"]["s21_gate:py_parity_full"]["linux"]
+    assert old["selector"]["paths"] == ["tests/test_stage0_session_drain.py::test_release_persist_failure_retried"]
+    assert set(old["nodeids"]) <= set(full["nodeids"])
+    paths = full["selector"]["paths"]
+    assert all(any(n == p or n.startswith(p.rstrip("/") + "::") for p in paths) for n in old["nodeids"]), paths
+    assert full["selector"]["argv"][-len(paths):] == paths
+
+
+def test_py_parity_76_80_has_additive_plan_scope():
+    """第 8 輪 #76～#80 另立集合；保留被其他 slice 承擔的兩組既有排除案例。"""
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    added = lock["sets"]["s21_gate:py_parity_76_80"]["linux"]
+    ids = added["nodeids"]
+    selector = added["selector"]
+    assert ids and len(ids) == len(set(ids))
+    assert set(ids) == set(selector["paths"])
+    assert selector["argv"][-len(ids):] == ids
+    required_files = {
+        "tests/test_holder_probe_namespace.py", "tests/test_p1oc_drain_stalled.py",
+        "tests/test_p1oc_sc35_state.py", "tests/test_p1oc_sc35_commands.py",
+        "tests/test_p1oc_sc34_last_error.py", "tests/test_p1oc_socket_perm.py",
+        "tests/test_p1oc_pt_quiet_oracle.py", "tests/test_p1oc_catalog.py", "tests/test_p1oc_docs.py",
+        "tests/test_daemon_lock.py", "tests/test_contracts_gap_codes.py",
+        "tests/test_stage0_bridge_drain.py", "tests/test_serial_port.py", "tests/test_wal.py",
+        "tests/test_stage0_platform_mgmt.py", "tests/test_codex_fixes.py",
+        "tests/test_daemon_service_selector.py",
+    }
+    assert required_files == {node.split("::", 1)[0] for node in ids}
+    assert not any("TestUartBridgeHeldPathsNamespace" in node for node in ids)
+    assert not any("test_file_push_pull_passthrough_rejected" in node for node in ids)
+    assert "tests/test_contracts_gap_codes.py::TestGapPosixLock::test_socket_unavailable_lock" in ids
+    assert "tests/test_stage0_bridge_drain.py::test_eagain_writer_is_cancelled_by_drain" in ids
+    assert "tests/test_serial_port.py::TestPosixSerialPortRoundtrip::test_set_baud_runs" in ids
+    assert "tests/test_wal.py::TestWalWindowsDirFsync::test_reset_on_posix_still_fsyncs_directory" in ids
+
+
+def test_gate_script_runs_capability_and_py_parity_sections():
+    text = (ROOT / "scripts/rust/slice21_gate.sh").read_text(encoding="utf-8")
+    for name in (*CAP_OF, "py_parity", "py_parity_windows", "py_parity_76_80"):
+        assert f"record {name} " in text, name                  # dry-run／拒絕開跑分支
+    assert text.count("record py_parity ") >= 2                 # ＋實跑分支
+    assert text.count("record py_parity_windows ") >= 2
+    assert "shared_windows_l1 s21_gate:py_parity slice21" in text
+    assert text.count("record py_parity_76_80 ") >= 2
+    assert text.count("record linux_cap_posix_pty_workspace ") >= 2
+    # 實跑分支：四個能力逐一探測，具備才 --caps <cap> 實跑，並把探測結果記入 section
+    # 擁有者裁決 2026-11-12 第 4 點：windows_native／interactive_desktop 的 linux section 退役（改由 windows_cap_<cap> 承擔）
+    assert "for cap in sys_admin supervisor_runtime; do" in text
+    assert "record linux_cap_windows_native " not in text and "record linux_cap_interactive_desktop " not in text
+    # 第 7 輪（OD-53 推導）：--caps 由 caps_args 依鎖 selector 推導，不再手寫 `--caps "$cap"`
+    assert '"${CAPS_ARGV[@]}"' in text and '--capability-probe "$cap=$probe"' in text and "cap_probe()" in text
+
+
+# --------------------------------------------------------------------------- 第 7 輪：OD-53 --caps 推導（rulings/p5.md 最新列）
+
+def test_derive_caps_matches_s22_rule():
+    """rulings/p5.md：slice21_gate.sh 的 `--caps` 改用與 s22 gate 相同的 OD-53 推導規則（rulings/p6.md「OD-53 selector 記錄
+    caps」）：test-binary 參數（`--` 之後）恰為 `--ignored cap_<cap>__…` → `--caps <cap>…`；不含 ignored 篩選 → 不需 caps；
+    其餘帶 ignored 意圖者推導不出（None）。"""
+    j = _judge_mod()
+    cap_argv = ["--workspace", "--features", "test-fakes", "--", "--ignored", "cap_posix_pty__"]
+    assert j.derive_caps({"argv": cap_argv}) == ["posix_pty"]
+    assert j.derive_caps({"argv": ["-p", "x", "--", "--ignored", "cap_posix_pty__", "cap_windows_com__"]}) == [
+        "posix_pty", "windows_com"]
+    assert j.derive_caps({"argv": ["--workspace", "--features", "test-fakes", "--", "--skip", "cap_"]}) == []
+    assert j.derive_caps({"argv": ["-p", "sw-pal", "--features", "test-fakes"]}) == []
+    assert j.derive_caps({"argv": ["-q", "tests/"]}) == []
+    for tail in (["--ignored"], ["--include-ignored"], ["--include-ignored", "cap_posix_pty__"],
+                 ["--ignored", "cap_posix_pty__", "other_filter"], ["--ignored", "cap_posix_pty"],
+                 ["--ignored", "--skip", "x", "cap_posix_pty__"], ["--ignored", "cap_posix_pty__", "--exact"]):
+        assert j.derive_caps({"argv": ["-p", "x", "--", *tail]}) is None, tail
+    assert j.derive_caps({"argv": ["--ignored", "cap_posix_pty__"]}) is None
+
+
+def test_real_lock_s21_sets_caps_derivable_and_gate_plan():
+    """現行鎖的每個 s21 集合皆可推導；POSIX PTY 預設列與 ignored 能力列分段判定，能力 argv 必須逐字等於鎖 selector。"""
+    j = _judge_mod()
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    derived = {(sid, plat): j.derive_caps(spec["selector"]) for sid, plats in lock["sets"].items()
+               if sid == "s21_core" or sid.startswith("s21_gate:") for plat, spec in plats.items()}
+    assert all(v is not None for v in derived.values()), derived
+    import yaml
+
+    exp = yaml.safe_load((ROOT / "tests/acceptance/slice21_gate_expect.yaml").read_text(encoding="utf-8"))
+    selector = lock["sets"]["s21_gate:cap_posix_pty"]["linux"]["selector"]["argv"]
+    assert selector == ["--workspace", "--features", "test-fakes", "--", "--ignored", "cap_posix_pty__"]
+    workspace_plan = j.caps_plan("linux_cap_posix_pty_workspace", exp, lock)
+    assert workspace_plan == {"caps": ["posix_pty"], "argv": selector, "caps_only": True}, workspace_plan
+    plan = j.caps_plan("linux_cap_posix_pty", exp, lock)
+    assert plan == {"caps": [], "argv": ["-p", "sw-pal", "--features", "test-fakes"], "caps_only": False}, plan
+    for cap in ("sys_admin", "windows_native", "interactive_desktop", "supervisor_runtime"):
+        plan = j.caps_plan(f"linux_cap_{cap}", exp, lock)
+        if cap in ("windows_native", "interactive_desktop"):
+            # OD-68 核准移除這兩個集合的 Linux 列；擁有者裁決 2026-11-12 第 4 點：linux section 退役，
+            # 改由 windows_cap_<cap> section 承擔（OD-55：Windows 列登記於同名集合的 windows 平台）。
+            assert "linux" not in lock["sets"].get(f"s21_gate:cap_{cap}", {})
+            assert f"linux_cap_{cap}" not in j.TEST_SECTIONS
+            assert plan is None, plan
+            continue
+        assert plan == {"caps": [cap], "argv": lock["sets"][f"s21_gate:cap_{cap}"]["linux"]["selector"]["argv"],
+                        "caps_only": True}, plan
+    for cap in ("windows_native", "interactive_desktop", "supervisor_runtime"):
+        plan = j.caps_plan(f"windows_cap_{cap}", exp, lock)
+        assert plan == {"caps": [cap], "argv": lock["sets"][f"s21_gate:cap_{cap}"]["windows"]["selector"]["argv"],
+                        "caps_only": True}, plan
+
+
+def test_underivable_caps_selector_is_evidence_missing(case):
+    """推導不出 `--caps` 的必要集合 → 該 section EVIDENCE_MISSING（即使 l1 全 passed）。"""
+    exp = case.expect()
+    exp["lock"]["sets"]["s21_gate:linux_cap_posix_pty"]["linux"]["selector"] = {
+        "argv": ["-p", "sw-pal", "--", "--include-ignored", "cap_posix_pty__"]}
+    out = _judge_mod().judge(case.report(), exp)
+    sec = _sec(out, "linux_cap_posix_pty")
+    assert sec["status"] == "EVIDENCE_MISSING" and any("OD-53" in r for r in sec["reasons"]), sec["reasons"]
+
+
+@pytest.mark.parametrize("cap", ["windows_native", "interactive_desktop"])
+def test_od68_removed_linux_capability_set_is_evidence_missing(case, cap):
+    """OD-68 移除 Linux 列、擁有者裁決 2026-11-12 第 4 點退役 linux section 後，承擔的 windows_cap_<cap> section
+    在必要集合缺失時必須明確 EVIDENCE_MISSING；linux_cap_<cap> 不再是 gate section。"""
+    set_id = f"s21_gate:cap_{cap}"
+    assert f"linux_cap_{cap}" not in _judge_mod().TEST_SECTIONS
+    assert f"linux_cap_{cap}" not in [item["name"] for item in case.report()["sections"]]
+    expect = case.expect()
+    expect["lock"]["sets"].pop(set_id)
+    out = _judge_mod().judge(case.report(), expect)
+    section = _sec(out, f"windows_cap_{cap}")
+    assert section["status"] == "EVIDENCE_MISSING"
+    assert section["l1_verdict"]["verdict"] == "INSUFFICIENT"
+    assert any(set_id in reason and "不在 l1_required.lock.json" in reason for reason in section["reasons"])
+
+    # OD-68 的承擔項仍須有 Windows 原生證據；未原生收集／未匯入時不可因 Linux 列已移除而完成。
+    carrier_report = case.report()
+    next(item for item in carrier_report["sections"] if item["name"] == f"windows_cap_{cap}")["l1_results"] = None
+    carrier_out = _judge_mod().judge(carrier_report, case.expect())
+    assert _sec(carrier_out, f"windows_cap_{cap}")["status"] == "EVIDENCE_MISSING"
+    assert carrier_out["verdict"] == "INCOMPLETE"
+    report = case.report()
+    windows_section = next(item for item in report["sections"] if item["name"] == "windows_native_l1")
+    windows_section["l1_results"] = None
+    windows_out = _judge_mod().judge(report, case.expect())
+    assert _sec(windows_out, "windows_native_l1")["status"] == "EVIDENCE_MISSING"
+    assert windows_out["verdict"] == "INCOMPLETE"
+
+
+def test_gate_script_derives_caps_from_lock():
+    text = (ROOT / "scripts/rust/slice21_gate.sh").read_text(encoding="utf-8")
+    assert "caps-plan" in text
+    assert "--caps posix_pty \\" not in text and "-- -p sw-pal --features test-fakes\nrecord linux_cap_posix_pty" not in text
+    assert "windows-test-argv" in text and "SW_TEST_CONSOLE_PAIR" in text
+    assert "supervisor-snapshot" in text and "supervisor-compare" in text
+
+    for path in ("scripts/rust/p7_gate.sh", "scripts/rust/slice24_exit.sh"):
+        assert 'source "$ROOT/scripts/rust/gate_prereqs.sh" --gate' in (ROOT / path).read_text(encoding="utf-8")
+    workflow = (ROOT / ".github/workflows/rust.yml").read_text(encoding="utf-8")
+    assert "source scripts/rust/gate_prereqs.sh --ci" in workflow
+
+    j = _judge_mod()
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    selector = lock["sets"]["s21_gate:windows_cap_windows_com"]["windows"]["selector"]["argv"]
+    assert j.windows_test_argv("windows_cap_windows_com", lock) == ["--caps", "windows_com", *selector]
+
+    before = {"units": "serialwrap.service loaded active running", "service": {"MainPID": "12", "ActiveState": "active"}}
+    after = {"units": "serialwrap.service loaded active running", "service": {"MainPID": "13", "ActiveState": "active"}}
+    assert j.supervisor_runtime_changed(before, after) is True
+    assert j.supervisor_runtime_changed(before, before) is False
+
+
+# --------------------------------------------------------------------------- sol P5-54dd588-2（Medium）：能力 section 只跑能力列
+
+def test_caps_plan_caps_only_when_every_set_selects_only_ignored_caps():
+    """section 的每個必要集合 selector 都只選 ignored 能力列（derive_caps 非空）→ `caps_only`（收集器 --caps-only，不跑預設
+    run）；任一集合含預設列（derive_caps 為 []）→ 須跑預設 run。"""
+    j = _judge_mod()
+    sel_cap = {"argv": ["--workspace", "--features", "test-fakes", "--", "--ignored", "cap_sys_admin__"]}
+    sel_default = {"argv": ["-p", "sw-pal", "--features", "test-fakes"]}
+    sel_posix = {"argv": ["--workspace", "--features", "test-fakes", "--", "--ignored", "cap_posix_pty__"]}
+    exp = {"sections": [{"name": "linux_cap_sys_admin", "required_set": "s21_gate:cap_sys_admin"},
+                        {"name": "linux_cap_posix_pty", "required_set": "s21_gate:linux_cap_posix_pty"},
+                        {"name": "linux_cap_posix_pty_workspace", "required_set": "s21_gate:cap_posix_pty"}],
+           "additional_required_sets": {}}
+    lock = {"sets": {"s21_gate:cap_sys_admin": {"linux": {"selector": sel_cap}},
+                     "s21_gate:linux_cap_posix_pty": {"linux": {"selector": sel_default}},
+                     "s21_gate:cap_posix_pty": {"linux": {"selector": sel_posix}}}}
+    assert j.caps_plan("linux_cap_sys_admin", exp, lock) == {"caps": ["sys_admin"], "argv": sel_cap["argv"], "caps_only": True}
+    assert j.caps_plan("linux_cap_posix_pty", exp, lock) == {"caps": [], "argv": sel_default["argv"],
+                                                             "caps_only": False}
+    assert j.caps_plan("linux_cap_posix_pty_workspace", exp, lock) == {
+        "caps": ["posix_pty"], "argv": sel_posix["argv"], "caps_only": True}
+    exp["additional_required_sets"] = {"linux_cap_sys_admin": ["s21_gate:linux_cap_posix_pty"]}   # 混入預設列集合
+    assert j.caps_plan("linux_cap_sys_admin", exp, lock)["caps_only"] is False
+
+
+def test_capability_section_with_only_capability_rows_passes(case):
+    """sol P5-54dd588-2：能力 section 的 l1 結果（--caps-only）只含能力列且 passed、其餘收集列 deselected → PASS；
+    deselected 列不在必要集合內，不影響判定。"""
+    n1, n2 = GATE_NODEIDS["linux_cap_sys_admin"]
+    others = ["cargo:sw-pal::serial::posix::tests::holder_scan_permission", "cargo:sw-pal::oserror_golden::x"]
+    case.l1["linux_cap_sys_admin"] = _l1("linux", "cargo", [_row(n1), _row(n2)], deselected=others)
+    out = _judge_mod().judge(case.report(), case.expect())
+    sec = _sec(out, "linux_cap_sys_admin")
+    assert sec["status"] == "PASS", sec["reasons"]
+
+
+def test_linux_cap_posix_pty_run_as_root_is_evidence_missing(case):
+    """sol P5-54dd588-2：linux_cap_posix_pty 的必要集合含 sw-pal 預設測試，其中數支在 root 下必紅（holder_scan_permission
+    等）。比照 F108：須以非 root 執行；run_euid 為 0 或未記錄 → EVIDENCE_MISSING（不得 PASS，也不因 root 專屬失敗記 FAIL）。"""
+    def with_euid(euid, outcome="passed"):
+        rep = case.report()
+        for sec in rep["sections"]:
+            if sec["name"] == "linux_cap_posix_pty":
+                if euid is None:
+                    sec.pop("run_euid", None)
+                else:
+                    sec["run_euid"] = euid
+                if outcome != "passed":
+                    n1, n2 = GATE_NODEIDS["linux_cap_posix_pty"]
+                    l1 = _l1("linux", "cargo", [_row(n1, outcome), _row(n2)], exit_code=101)
+                    sec["l1_results"] = case.write_l1("linux_cap_posix_pty_x", l1)
+                    sec.update(_counts(l1))
+        return _sec(_judge_mod().judge(rep, case.expect()), "linux_cap_posix_pty")
+    assert with_euid(1000)["status"] == "PASS"
+    assert with_euid(1000, "failed")["status"] == "FAIL"
+    root = with_euid(0)
+    assert root["status"] == "EVIDENCE_MISSING" and any("非 root" in r for r in root["reasons"])
+    assert with_euid(0, "failed")["status"] == "EVIDENCE_MISSING"
+    assert with_euid(None)["status"] == "EVIDENCE_MISSING"
+
+    for euid in (0, None):
+        rep = case.report()
+        section = next(sec for sec in rep["sections"] if sec["name"] == "linux_cap_posix_pty_workspace")
+        if euid is None:
+            section.pop("run_euid")
+        else:
+            section["run_euid"] = euid
+        out = _judge_mod().judge(rep, case.expect())
+        checked = _sec(out, "linux_cap_posix_pty_workspace")
+        assert checked["status"] == "EVIDENCE_MISSING" and any("非 root" in reason for reason in checked["reasons"])
+
+
+def test_capability_how_to_run_uses_caps_only():
+    """sol P5-54dd588-2：能力 section 的單獨執行命令（judge 原因文字與 runbook）須帶 --caps-only，否則先跑預設 run 必 FAIL。"""
+    j = _judge_mod()
+    for name in ("linux_cap_sys_admin", "linux_cap_supervisor_runtime"):
+        assert "--caps-only" in j.CAPABILITY_SECTIONS[name]["how_to_run"], name
+    runbook = (ROOT / "docs/rust-refactor/slice21-owner-runbook.md").read_text(encoding="utf-8")
+    rows = [ln for ln in runbook.splitlines() if ln.startswith("| `linux_cap_sys_admin`")
+            or ln.startswith("| `linux_cap_supervisor_runtime`")]
+    assert len(rows) == 2 and all("--caps-only" in ln for ln in rows), rows
+
+
+def test_gate_script_capability_sections_caps_only_and_posix_pty_non_root():
+    """sol P5-54dd588-2：gate 依 caps-plan 的 caps_only 帶 --caps-only；linux_cap_posix_pty 比照 linux_l1 於 root 時以
+    SW_GATE_L1_USER 降權、無法降權即不執行並記 EVIDENCE_MISSING，且記錄 --run-euid。"""
+    text = (ROOT / "scripts/rust/slice21_gate.sh").read_text(encoding="utf-8")
+    caps_fn = text[text.index("caps_args() {"):text.index("# 3. Linux cap_posix_pty")]
+    assert "caps_only" in caps_fn and "--caps-only" in caps_fn
+    sec3 = text[text.index("# 3. Linux cap_posix_pty"):text.index("# 3b.")]
+    assert "nonroot_cmd" in sec3 and "--run-euid" in sec3 and "EVIDENCE_MISSING" in sec3
+    assert "caps_args linux_cap_posix_pty_workspace" in sec3
+    assert '"${CAPS_ARGV[@]}"' in sec3 and "s21_gate:cap_posix_pty" in sec3
+    l1 = text[text.index("# 2. Linux L1"):text.index("# 3. Linux cap_posix_pty")]
+    assert "nonroot_cmd() {" in l1 and "SW_GATE_L1_USER" in l1 and "setpriv" in l1
+
+
+# wp510r 第 26 項：OD-55 外部證據必須綁定本次候選，匯入與重判都不得繞過。
+@pytest.mark.parametrize("cap", ["windows_native", "interactive_desktop", "supervisor_runtime"])
+@pytest.mark.parametrize("problem", ["old_head", "dirty", "missing_provenance", "missing_clean",
+                                    "missing_end", "changed_end", "dirty_end", "missing_candidate"])
+def test_windows_import_rejects_unbound_evidence(case, cap, problem):
+    name = f"windows_cap_{cap}"
+    l1 = case.l1[name]
+    if problem == "missing_provenance":
+        del l1["provenance"]
+    elif problem != "missing_candidate":
+        git = l1["provenance"]["git"]
+        if problem == "old_head":
+            git["head"] = "f" * 40
+        elif problem == "dirty":
+            git["clean"] = False
+        elif problem == "missing_clean":
+            del git["clean"]
+        elif problem == "missing_end":
+            del git["end"]
+        elif problem == "changed_end":
+            git["end"]["head"] = "f" * 40
+        elif problem == "dirty_end":
+            git["end"]["clean"] = False
+    report = case.report()
+    if problem == "missing_candidate":
+        del report["git_revision"]
+    out = _judge_mod().judge(report, case.expect())
+    sec = _sec(out, name)
+    assert sec["status"] == "EVIDENCE_MISSING"
+    assert sec["l1_verdict"]["verdict"] == "INSUFFICIENT"
+    assert any("LOCAL-WINDOWS-TODO" in reason and "provenance" in reason for reason in sec["reasons"])
+    assert out["verdict"] == "INCOMPLETE"
+
+
+@pytest.mark.parametrize("cap", ["windows_native", "interactive_desktop", "supervisor_runtime"])
+@pytest.mark.parametrize("failed", [False, True])
+def test_windows_import_matching_clean_commit_uses_l1_judge(case, cap, failed):
+    name = f"windows_cap_{cap}"
+    if failed:
+        case.l1[name]["results"][0] = _row(GATE_NODEIDS[name][0], "failed")
+        case.l1[name]["exit_code"] = 1
+    report = case.report()
+    if failed:
+        next(sec for sec in report["sections"] if sec["name"] == name)["exit"] = 1
+    sec = _sec(_judge_mod().judge(report, case.expect()), name)
+    assert sec["status"] == ("FAIL" if failed else "PASS")
+    assert sec["l1_verdict"]["verdict"] == ("FAIL" if failed else "PASS")
+
+
+@pytest.mark.parametrize("problem", [None, "old_head", "dirty", "missing_provenance"])
+def test_windows_section_import_records_provenance_rejection(case, problem):
+    """直接執行 gate 使用的匯入入口，拒收時不複製報告、不宣告能力可用，並保留原因。"""
+    name = "windows_cap_windows_native"
+    l1 = case.l1[name]
+    if problem == "old_head":
+        l1["provenance"]["git"]["head"] = "f" * 40
+    elif problem == "dirty":
+        l1["provenance"]["git"]["clean"] = False
+    elif problem == "missing_provenance":
+        del l1["provenance"]
+    source = case.base / case.write_l1(name, l1)
+    run = case.base / "imported"
+    j = _judge_mod()
+    assert j.main(["import-windows-section", "--run-dir", str(run), "--name", name,
+                   "--candidate-commit", "e" * 40, "--source", str(source)]) == 0
+    sec = json.loads((run / "sections" / f"{name}.json").read_text())
+    copied = run / name / "l1-results.json"
+    assert sec["capability_probe"]["available"] is (problem is None)
+    if problem is None:
+        assert copied.read_bytes() == source.read_bytes()
+        assert hashlib.sha256(source.read_bytes()).hexdigest() in sec["capability_probe"]["evidence"]
+        assert sec["l1_results"] == f"{name}/l1-results.json"
+    else:
+        assert not copied.exists()
+        assert sec["l1_results"] is None
+        assert any("LOCAL-WINDOWS-TODO" in reason and "provenance" in reason for reason in sec["reasons"])
+    # 採用匯入入口產生的片段重判，確認 exit／計數也接上正式 L1 judge。
+    expect = case.expect()
+    expect["base_dir"] = run
+    judged = j.judge({"git_revision": "e" * 40, "sections": [sec]}, expect)
+    assert _sec(judged, name)["status"] == ("PASS" if problem is None else "EVIDENCE_MISSING")
+
+
+def test_slice21_and_s22_autogenerate_qualified_bridge_selftest_report(tmp_path):
+    """slice21-07、s22-05：未明示報告時須先試共用合格報告，再自測並預檢資格。"""
+    drivers = [ROOT / "scripts/rust/slice21_gate.sh", ROOT / "scripts/rust/s22_gate.sh"]
+    for path in drivers:
+        text = path.read_text(encoding="utf-8")
+        assert "uart_stdio_bridge selftest --endpoint posix-pty" in text, path
+        if path.name == "s22_gate.sh":
+            assert 'sys.executable, "-m", "uart_stdio_bridge", "selftest", "--endpoint", "posix-pty"' in text
+        assert "work/p7-ab/bridge-selftest/selftest-report.json" in text, path
+        assert "evaluate_bridge_eligibility" in text, path
+    s21 = drivers[0].read_text(encoding="utf-8")
+    assert "--bridge-selftest-report" in s21
+    s21_judge = (ROOT / "scripts/rust/slice21_gate_judge.py").read_text(encoding="utf-8")
+    s21_schema = (ROOT / "tests/acceptance/slice21_gate_report.schema.json").read_text(encoding="utf-8")
+    assert "bridge_selftest_report" in s21_judge and "bridge_selftest_report" in s21_schema
+    report_path = "/shared/work/p7-ab/bridge-selftest/selftest-report.json"
+    run_dir = tmp_path / "s21-report-path-test"
+    assert _judge_mod().main([
+        "record-section", "--run-dir", str(run_dir), "--name", "l15_ab",
+        "--bridge-selftest-report", report_path,
+    ]) == 0
+    section = json.loads((run_dir / "sections/l15_ab.json").read_text(encoding="utf-8"))
+    assert section["bridge_selftest_report"] == report_path
+    s22_driver = drivers[1].read_text(encoding="utf-8")
+    s22_judge = (ROOT / "scripts/rust/s22_gate_check.py").read_text(encoding="utf-8")
+    assert "--bridge-selftest-report" in s22_driver
+    assert '"bridge_selftest_report"' in s22_judge

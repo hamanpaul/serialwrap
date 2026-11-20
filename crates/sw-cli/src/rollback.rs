@@ -141,7 +141,82 @@ fn invalid_probe(method: &str) -> (&'static str, PyDict) {
     let mut detail = PyDict::new();
     detail.insert("probe", PyValue::Str(method.to_string()));
     detail.insert("health", PyValue::Str("unknown".into()));
+    detail.insert("reason", PyValue::Str(REASON_MALFORMED.into()));
     (ErrorCode::InvalidResponse.as_str(), detail)
+}
+
+/// P8 Task 14：健康不明的原因（detail `reason`；與 `health:"unknown"` 並列，計畫 09 Task 14 行為變更）。
+const REASON_TIMEOUT: &str = "rpc_timeout";
+const REASON_MALFORMED: &str = "malformed_response";
+const REASON_RPC_ERROR: &str = "rpc_error";
+const REASON_PROBE_FAILED: &str = "probe_failed";
+const REASON_CLIENT_ERROR: &str = "client_error";
+const REASON_PROCESS_ALIVE: &str = "process_alive_rpc_down";
+const REASON_PROC_SCAN_FAILED: &str = "proc_scan_failed";
+
+/// `ok:false` 回應的健康不明原因：壞回應（不可解析、空回應）與其餘探測失敗分開。
+fn refusal_reason(code: &str) -> &'static str {
+    if code == ErrorCode::InvalidResponse.as_str() || code == ErrorCode::EmptyResponse.as_str() {
+        REASON_MALFORMED
+    } else {
+        REASON_PROBE_FAILED
+    }
+}
+
+/// `safety_check` 第一步 `health.ping`(0.5) 的三態結果（計畫 09 Task 14「daemon 健康三態」）。
+enum PingHealth {
+    /// 健康：照常檢查 busy 與身分。
+    Healthy,
+    /// 連線被拒或端點不存在：尚需 `ProcScan` 確認沒有 `serialwrapd` 才算確認不存在。
+    Unreachable,
+    /// Windows 對未監聽的 loopback TCP connect 可能回 TimedOut；補查行程只用來辨識既存 daemon，空結果仍 fail-closed。
+    ConnectTimedOut(PyDict),
+    /// 健康不明（逾時、壞回應、其他連線失敗、回應 `ok:false`）：拒絕，`--force` 不適用。
+    Unknown(&'static str, PyDict),
+}
+
+fn ping_health(ctx: &CliCtx<'_>, endpoint: &str) -> PingHealth {
+    const PROBE: &str = "health.ping";
+    let unknown = |code: &'static str, reason: &'static str, mut detail: PyDict| {
+        detail.insert("probe", PyValue::Str(PROBE.into()));
+        detail.insert("health", PyValue::Str("unknown".into()));
+        detail.setdefault("reason", PyValue::Str(reason.into()));
+        PingHealth::Unknown(code, detail)
+    };
+    let params = PyValue::Dict(PyDict::new());
+    let (outcome, failure) = match crate::client::call_with_failure(ctx, endpoint, PROBE, &params, 0.5, &PyInt::Small(0)) {
+        Ok(pair) => pair,
+        Err(_) => return unknown(ErrorCode::InternalError.as_str(), REASON_CLIENT_ERROR, PyDict::new()),
+    };
+    if let Some(failure) = failure {
+        let refused = failure.phase == crate::client::FailPhase::Connect
+            && matches!(failure.pal_kind, Some(sw_pal::PalErrorKind::ConnectionRefused | sw_pal::PalErrorKind::NotFound));
+        if refused {
+            return PingHealth::Unreachable;
+        }
+        let mut detail = outcome.resp;
+        detail.0.shift_remove("ok");
+        detail.0.shift_remove("error_code");
+        if failure.phase == crate::client::FailPhase::Connect
+            && failure.pal_kind == Some(sw_pal::PalErrorKind::TimedOut)
+        {
+            return PingHealth::ConnectTimedOut(detail);
+        }
+        return if failure.pal_kind == Some(sw_pal::PalErrorKind::TimedOut) {
+            unknown(ErrorCode::Timeout.as_str(), REASON_TIMEOUT, detail)
+        } else {
+            unknown(ErrorCode::SocketError.as_str(), REASON_RPC_ERROR, detail)
+        };
+    }
+    let response = outcome.resp;
+    if response.get_truthy("ok") {
+        return PingHealth::Healthy;
+    }
+    let code = error_code(response.get("error_code").and_then(as_str));
+    let mut detail = response;
+    detail.0.shift_remove("ok");
+    detail.0.shift_remove("error_code");
+    unknown(code, refusal_reason(code), detail)
 }
 
 fn checked_rpc(
@@ -185,6 +260,29 @@ fn checked_rpc(
         return Err((code, detail));
     }
     Ok(response)
+}
+
+/// `safety_check` 專用的探測：`checked_rpc` 失敗（健康不明）時另補 detail `reason`（計畫 09 Task 14：`health:"unknown"`
+/// 與 `reason` 並列）。`checked_rpc` 亦用於步驟 6 啟動驗收，該處的頂層 `reason`（`health_failed` 等）另有語意，不在此補。
+fn safety_rpc(
+    ctx: &CliCtx<'_>,
+    endpoint: &str,
+    method: &str,
+    timeout: f64,
+) -> Result<PyDict, (&'static str, PyDict)> {
+    checked_rpc(ctx, endpoint, method, timeout).map_err(|(code, mut detail)| {
+        let reason = if code == ErrorCode::Timeout.as_str() {
+            REASON_TIMEOUT
+        } else if code == ErrorCode::SocketError.as_str() {
+            REASON_RPC_ERROR
+        } else if code == ErrorCode::InternalError.as_str() && detail.get("ok").is_none() {
+            REASON_CLIENT_ERROR
+        } else {
+            refusal_reason(code)
+        };
+        detail.setdefault("reason", PyValue::Str(reason.into()));
+        (code, detail)
+    })
 }
 
 fn busy_session(value: &PyValue) -> Result<Option<PyValue>, ()> {
@@ -239,12 +337,74 @@ pub(crate) fn same_uid_daemons(
         .collect()
 }
 
+fn process_alive_refusal_detail(
+    ctx: &CliCtx<'_>,
+    endpoint: &str,
+    daemons: &[sw_pal::proc_scan::DaemonProc],
+) -> Option<PyDict> {
+    let held = same_uid_daemons(ctx, daemons);
+    if held.is_empty() {
+        return None;
+    }
+    let mut detail = PyDict::new();
+    detail.insert(
+        "pids",
+        PyValue::List(
+            held.iter()
+                .map(|proc| PyValue::Int(PyInt::Small(i128::from(proc.pid))))
+                .collect(),
+        ),
+    );
+    if held
+        .iter()
+        .any(|proc| proc.socket.as_deref().is_some_and(|socket| socket != endpoint))
+    {
+        detail.insert(
+            "sockets",
+            PyValue::List(
+                held.iter()
+                    .map(|proc| opt_str(proc.socket.as_deref()))
+                    .collect(),
+            ),
+        );
+        detail.insert("endpoint", str_value(endpoint.to_string()));
+    }
+    detail.insert("health", PyValue::Str("unknown".into()));
+    detail.insert("reason", PyValue::Str(REASON_PROCESS_ALIVE.into()));
+    Some(detail)
+}
+
 fn matching_daemons(
     _ctx: &CliCtx<'_>,
     endpoint: &str,
     daemons: &[sw_pal::proc_scan::DaemonProc],
 ) -> Vec<sw_pal::proc_scan::DaemonProc> {
     daemons.iter().filter(|daemon| daemon.socket.as_deref().map_or(true, |socket| socket == endpoint)).cloned().collect()
+}
+
+/// 共用 update／rollback 的 daemon 清單；測試範圍只有 `test-fakes` 建置會套用。
+#[derive(Debug, Clone, Copy)]
+struct UpdateDaemonScanError;
+
+fn scan_update_daemons(
+    ctx: &CliCtx<'_>,
+    endpoint: &str,
+) -> Result<Vec<sw_pal::proc_scan::DaemonProc>, UpdateDaemonScanError> {
+    let daemons = ctx
+        .p
+        .procs
+        .serialwrapd_instances()
+        .map_err(|_| UpdateDaemonScanError)?;
+    #[cfg(feature = "test-fakes")]
+    {
+        crate::test_update_scope::select_for_update(ctx, endpoint, &daemons)
+            .map_err(|_| UpdateDaemonScanError)
+    }
+    #[cfg(not(feature = "test-fakes"))]
+    {
+        let _ = endpoint;
+        Ok(daemons)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -436,29 +596,44 @@ pub fn safety_check(
     ctx: &CliCtx<'_>,
     endpoint: &str,
 ) -> Result<Option<DaemonSnapshot>, (&'static str, PyDict)> {
-    let ping = rpc(ctx, endpoint, "health.ping", 0.5);
-    if !ping.as_ref().is_some_and(|response| response.get_truthy("ok")) {
-        let daemons = ctx.p.procs.serialwrapd_instances().map_err(|_| {
-            let mut detail = PyDict::new();
-            detail.insert("holder_unknown", PyValue::Bool(true));
-            (ErrorCode::DeviceStillHeld.as_str(), detail)
-        })?;
-        // S1X-c-1／OD-48 D3.2：endpoint 不可 RPC 時，任何同 uid 的 serialwrapd（socket 不符或無 --socket 皆然）
-        // 都可能是偵測不到的舊 daemon，fail-closed；他 uid 的行程不在掃描範圍。
-        let held = same_uid_daemons(ctx, &daemons);
-        if !held.is_empty() {
-            let mut detail = PyDict::new();
-            detail.insert("pids", PyValue::List(held.iter().map(|proc| PyValue::Int(PyInt::Small(i128::from(proc.pid)))).collect()));
-            if held.iter().any(|proc| proc.socket.as_deref().is_some_and(|socket| socket != endpoint)) {
-                detail.insert("sockets", PyValue::List(held.iter().map(|proc| opt_str(proc.socket.as_deref())).collect()));
-                detail.insert("endpoint", str_value(endpoint.to_string()));
+    // P8 Task 14：daemon 健康三態。只有「連線被拒或端點不存在」且 ProcScan 確認沒有 serialwrapd 才算確認不存在；
+    // 逾時、壞回應、其他連線失敗一律健康不明而拒絕（`--force` 不適用：此時可能正處 FLASHING／FileTransfer）。
+    match ping_health(ctx, endpoint) {
+        PingHealth::Healthy => {}
+        PingHealth::Unknown(code, detail) => return Err((code, detail)),
+        PingHealth::ConnectTimedOut(mut detail) => {
+            // Windows 的未監聽 loopback TCP connect 依 Python 基線回 TimeoutError；若行程掃描找到 daemon，
+            // 用同一個 fail-closed 拒絕補上 PID；掃描空白或失敗仍回原本的 TIMEOUT。
+            if sw_proto::endpoint::is_loopback_tcp(endpoint) {
+                if let Ok(daemons) = scan_update_daemons(ctx, endpoint) {
+                    if let Some(held_detail) = process_alive_refusal_detail(ctx, endpoint, &daemons) {
+                        return Err((ErrorCode::DeviceStillHeld.as_str(), held_detail));
+                    }
+                }
             }
-            return Err((ErrorCode::DeviceStillHeld.as_str(), detail));
+            detail.insert("probe", PyValue::Str("health.ping".into()));
+            detail.insert("health", PyValue::Str("unknown".into()));
+            detail.setdefault("reason", PyValue::Str(REASON_TIMEOUT.into()));
+            return Err((ErrorCode::Timeout.as_str(), detail));
         }
-        return Ok(None);
+        PingHealth::Unreachable => {
+            let daemons = scan_update_daemons(ctx, endpoint).map_err(|_| {
+                let mut detail = PyDict::new();
+                detail.insert("holder_unknown", PyValue::Bool(true));
+                detail.insert("health", PyValue::Str("unknown".into()));
+                detail.insert("reason", PyValue::Str(REASON_PROC_SCAN_FAILED.into()));
+                (ErrorCode::DeviceStillHeld.as_str(), detail)
+            })?;
+            // S1X-c-1／OD-48 D3.2：endpoint 不可 RPC 時，任何同 uid 的 serialwrapd（socket 不符或無 --socket 皆然）
+            // 都可能是偵測不到的舊 daemon，fail-closed；他 uid 的行程不在掃描範圍。
+            if let Some(detail) = process_alive_refusal_detail(ctx, endpoint, &daemons) {
+                return Err((ErrorCode::DeviceStillHeld.as_str(), detail));
+            }
+            return Ok(None);
+        }
     }
 
-    let mcu = checked_rpc(ctx, endpoint, "mcu.status", 0.5)?;
+    let mcu = safety_rpc(ctx, endpoint, "mcu.status", 0.5)?;
     match mcu.get("flashing") {
         Some(PyValue::Bool(true)) => {
             let mut detail = PyDict::new();
@@ -468,7 +643,7 @@ pub fn safety_check(
         Some(PyValue::Bool(false)) => {}
         _ => return Err(invalid_probe("mcu.status")),
     }
-    let session_response = checked_rpc(ctx, endpoint, "session.list", 1.0)?;
+    let session_response = safety_rpc(ctx, endpoint, "session.list", 1.0)?;
     let sessions = match session_response.get("sessions") {
         Some(PyValue::List(values)) => values,
         _ => return Err(invalid_probe("session.list")),
@@ -1928,6 +2103,12 @@ fn stop_supervisor(
     let mut chain = Vec::new();
     let mut detail = PyDict::new();
     let stop = if daemon.is_some() {
+        let reason = if journal.op == "rollback" { "rollback" } else { "update" };
+        let rpc = if mode == &SupervisionMode::OnDemand && journal.target_autostart.is_none() {
+            StopRpc::UpdateHandoff { reason }
+        } else {
+            StopRpc::Handoff { reason }
+        };
         graceful_stop::graceful_stop_with_existing_hold(
             ctx,
             mode,
@@ -1935,7 +2116,7 @@ fn stop_supervisor(
             with_sudo,
             true,
             "update_confirm_released",
-            StopRpc::Handoff { reason: if journal.op == "rollback" { "rollback" } else { "update" } },
+            rpc,
             Some(held.record.clone()),
         )
     } else {
@@ -2794,7 +2975,7 @@ fn endpoint_presence(ctx: &CliCtx<'_>, endpoint: &str) -> EndpointPresence {
     if rpc(ctx, endpoint, "health.ping", 0.25).is_some_and(|response| response.get_truthy("ok")) {
         return EndpointPresence::Present(Vec::new());
     }
-    match ctx.p.procs.serialwrapd_instances() {
+    match scan_update_daemons(ctx, endpoint) {
         Ok(daemons) => {
             let pids = matching_daemons(ctx, endpoint, &daemons).iter().map(|daemon| daemon.pid).collect::<Vec<_>>();
             if pids.is_empty() { EndpointPresence::Absent } else { EndpointPresence::Present(pids) }

@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 import subprocess
 import sys
@@ -148,6 +150,51 @@ def test_start_python_daemon_uses_short_socket_path(tmp_path: Path, monkeypatch)
         assert daemon is not None
     finally:
         bb._cleanup_short_run_dir(env)
+
+
+@pytest.mark.posix_only
+@pytest.mark.memory_only
+def test_posix_open_probe_reports_errno_and_phase(tmp_path: Path) -> None:
+    """開埠診斷須保留失敗階段與 errno，且不把失敗轉成重試。"""
+    bb = _bb_l15()
+    result = bb._probe_posix_open(str(tmp_path / "missing-device"))
+
+    assert result["ok"] is False
+    assert result["phase"] == "os.open"
+    assert result["errno_name"] == "ENOENT"
+    assert result["path"] == str(tmp_path / "missing-device")
+
+
+@pytest.mark.posix_only
+@pytest.mark.memory_only
+def test_bridge_prompt_diagnostic_compares_ready_and_daemon_start(tmp_path: Path) -> None:
+    """diagnostic 以 wire 單調時鐘核對 PTY 世代與 prompt／daemon 啟動順序。"""
+    bb = _bb_l15()
+    evidence = tmp_path / "bridge-evidence"
+    evidence.mkdir()
+    rows = [
+        {
+            "dir": "META",
+            "endpoint_generation": 1,
+            "meta": {"event": "bridge_start"},
+        },
+        {
+            "observation": "dut_stdout_read",
+            "payload_b64": base64.b64encode(b"root@fake:~# ").decode("ascii"),
+            "mono_ts_ns": 2_000_000,
+            "wall_ts": "2026-11-18T00:00:00+00:00",
+        },
+    ]
+    (evidence / "wire.ndjson").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8",
+    )
+
+    result = bb._bridge_prompt_diagnostics(evidence, 1_000_000, 3_000_000)
+
+    assert result["endpoint_generation_at_bridge_start"] == 1
+    assert result["prompt_seen"] is True
+    assert result["prompt_after_bridge_ready_ms"] == 1.0
+    assert result["prompt_before_python_daemon_start"] is True
 
 
 @pytest.mark.core_portable

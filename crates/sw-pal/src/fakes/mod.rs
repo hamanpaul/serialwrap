@@ -5,31 +5,45 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub mod clock;
+pub mod console;
+pub mod device;
 pub mod env;
 pub mod fs;
+pub mod mem_stream;
 pub mod platform;
 pub mod proc;
 pub mod process;
 pub mod realfs;
 pub mod registry;
 pub mod rpc;
+pub mod serial;
 pub mod service;
 pub mod sysenv;
 pub mod tunnel;
+pub mod usb;
+pub mod wal_fs;
 
 // 測試以 `sw_pal::fakes::<Type>` 直接引用（計畫 Task 1／9／13 的 import 路徑）。
 pub use clock::FakeClock;
+pub use console::{FakeConsoleFactory, FakeConsoleHandle, FakeConsoleIo};
+pub use device::{FakeDeviceScript, FakeDeviceSource};
 pub use env::FakeEnv;
 pub use fs::{FaultFs, MemFs};
-pub use platform::{platform, posix_caps, windows_caps, FakePlatformBuilder};
+pub use mem_stream::MemStream;
+pub use platform::{FakePlatformBuilder, platform, posix_caps, windows_caps};
+#[cfg(unix)]
+pub use proc::FakeHolderFs;
 pub use proc::FakeProcScan;
-pub use process::{FakeProcessCtl, RecordingProcess};
+pub use process::{FakeHandlerSpawner, FakeProcessCtl, RecordingProcess};
 pub use realfs::{file_mode, real_fs};
 pub use registry::FakeRegistry;
 pub use rpc::{FakeConn, FakeRpcConnector, ScriptedConnector, StreamStep};
+pub use serial::{FakeLineControl, FakeDevice, FakeSerialBackend, FakeUartExclusive, FakeWriteStep};
 pub use service::FakeServiceCtl;
 pub use sysenv::{FakeSysEnv, FakeSysEnvBuilder};
 pub use tunnel::FakeTunnel;
+pub use usb::FakeUsb;
+pub use wal_fs::{ExternalHandle, FakeWalFs, WalWritePause};
 
 static EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -62,6 +76,18 @@ pub fn fake_platform(
         tunnel: tunnel::FakeTunnel::new(false),
         service: service::FakeServiceCtl::new(Vec::new()),
         registry: registry::FakeRegistry::new(Vec::new(), &[]),
+        serial: serial::FakeSerialBackend::new(),
+        uart_excl: Arc::new(serial::FakeUartExclusive {
+            report: Default::default(),
+        }),
+        devices: platform::unconfigured_devices(),
+        instance_lock: Arc::new(platform::Unconfigured("instance_lock")),
+        wal_fs: wal_fs::FakeWalFs::new(),
+        rpc_listen: Arc::new(platform::Unconfigured("rpc_listen")),
+        console: Arc::new(platform::Unconfigured("console")),
+        signals: Arc::new(platform::Unconfigured("signals")),
+        handlers: Arc::new(platform::Unconfigured("handlers")),
+        usb: Arc::new(platform::Unconfigured("usb")),
         caps: platform::posix_caps(),
     };
     (platform, connector, clock)

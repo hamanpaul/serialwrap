@@ -789,7 +789,8 @@ fn stop_routes_supervised_unless_explicit_target() {
     let (_, _, _) = t.run(&["daemon", "stop"]);
     assert_eq!(t.calls(), vec![argv(&["systemctl", "--user", "stop", "serialwrap"])]);
 
-    // (b) windows-task 且無 --socket → graceful_stop：/DISABLE → daemon.stop → /ENABLE。
+    // (b) windows-task 且無 --socket → graceful_stop：/DISABLE → daemon.stop → wait_stopped →（僅逾時或 RPC 不可達
+    // 且工作仍 Running 時 /End）→ /ENABLE（P8 Task 13）。本情境 daemon 正常結束：不得 /End，RPC 可達也不查工作狀態。
     let t = TestEnv::windows()
         .with_config("supervision_mode: windows-task\n")
         .with_real_service()
@@ -798,6 +799,16 @@ fn stop_routes_supervised_unless_explicit_target() {
     let o = t.event_order();
     assert!(o.index_of("run:schtasks /Change /TN serialwrap /DISABLE") < o.index_of("rpc:daemon.stop"));
     assert!(o.index_of("rpc:daemon.stop") < o.index_of("run:schtasks /Change /TN serialwrap /ENABLE"));
+    assert!(
+        !t.calls().iter().any(|c| c.get(1).map(String::as_str) == Some("/End")),
+        "daemon 已正常結束時不得 /End：{:?}",
+        t.calls()
+    );
+    assert!(
+        !t.calls().iter().any(|c| c.first().map(String::as_str) == Some("powershell.exe")),
+        "RPC 可達時不查排程工作狀態：{:?}",
+        t.calls()
+    );
 
     // (c) 帶 --socket（明確目標）→ 只送 RPC daemon.stop，不經監管。
     let t = TestEnv::posix()

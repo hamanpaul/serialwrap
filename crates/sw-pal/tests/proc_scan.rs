@@ -428,7 +428,7 @@ fn unreadable_proc_stat_is_conservatively_alive() {
     std::fs::create_dir_all(&process_dir).unwrap();
     let stat = process_dir.join("stat");
     std::fs::write(&stat, fake_proc_stat(pid, b"blocked", b'S', 778)).unwrap();
-    std::fs::set_permissions(&stat, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&stat, std::fs::Permissions::from_mode(0o000)).unwrap();
 
     let scan = PosixProcScan::with_root(tmp.path());
     assert!(scan.pid_alive(pid));
@@ -490,6 +490,18 @@ fn posix_tty_holder_scan_reports_unknown_when_target_unstatable() {
 
 #[cfg(unix)]
 #[test]
+fn posix_multi_open_holder_scan_skips_unstatable_target_like_detect_multi_open() {
+    // daemon status／doctor 走 Python `detect_multi_open`：`tty_stat` 回 None 即略過該 tty，status 維持 ok；
+    // 與 fail-closed 的 `serialwrapd_tty_holders`（上一案）刻意不同。
+    let tmp = tempfile::tempdir().unwrap();
+    let (holders, status) = PosixProcScan::with_root(tmp.path())
+        .multi_open_tty_holders(&[tmp.path().join("tty-missing")]);
+    assert!(holders.is_empty());
+    assert_eq!(status, HolderScanStatus::Ok);
+}
+
+#[cfg(unix)]
+#[test]
 fn posix_tty_holder_scan_reports_unknown_on_unreadable_fd_tree() {
     let tmp = tempfile::tempdir().unwrap();
     let process_dir = tmp.path().join("205");
@@ -517,7 +529,7 @@ fn posix_tty_holder_scan_reports_permission_status() {
     let fd_dir = process_dir.join("fd");
     std::fs::create_dir_all(&fd_dir).unwrap();
     std::fs::write(process_dir.join("cmdline"), b"serialwrapd\0").unwrap();
-    std::fs::set_permissions(&fd_dir, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&fd_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
 
     let (holders, status) = PosixProcScan::with_root(tmp.path())
         .serialwrapd_tty_holders(&[tmp.path().join("tty-fake")]);
@@ -593,8 +605,11 @@ fn windows_scan_finds_self_spawned_fake_daemon() {
 #[test]
 fn windows_pid_alive_never_terminates_target() {
     use sw_pal::proc_scan::WindowsProcScan;
+    // `pause` 讀 stdin；不給 stdin 時在 hosted runner（stdin 為 EOF／NUL）會立刻結束（PR #278 第七、八輪），
+    // 本測試持有一條開著的管線，讓子行程穩定存活到 kill。
     let mut child = std::process::Command::new("cmd.exe")
         .args(["/c", "pause"])
+        .stdin(std::process::Stdio::piped())
         .spawn()
         .unwrap();
     let child_pid = child.id();

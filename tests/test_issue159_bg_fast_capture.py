@@ -159,6 +159,41 @@ class TestIssue159BgFastCapture(unittest.TestCase):
         self.assertEqual(tail["status"], "error")
         self.assertEqual(tail["chunks"], ["partial line"])
 
+    def test_line_mode_terminates_existing_bg_capture(self) -> None:
+        """D-44（Rust parity #45 特性測試）：同 session 的 line 模式命令開始前，既有 active background
+        capture 即被終結（status=done，不等 quiet window），其後 RX 不再累積到該 capture。"""
+        mgr, session, bridge = self._setup_ready_session()
+        bridge.rx_snapshot_len.return_value = 0
+
+        def bg_wait(pattern, from_offset, timeout_s):
+            mgr._on_bridge_rx(session.session_id, b"bg-out\n$ ")
+            return True
+
+        bridge.wait_for_regex_from.side_effect = bg_wait
+        bridge.rx_text_from.return_value = "bg-out\n$ "
+        bg = mgr.execute_command(
+            "p:COM0", "bgcmd", "agent:test", "cid-bg", timeout_s=5.0, mode="bg",
+        )
+        self.assertTrue(bg["ok"])
+        before = mgr.get_background_result("cid-bg", from_chunk=0)
+        self.assertEqual(before["status"], "active")
+
+        def fg_wait(pattern, from_offset, timeout_s):
+            mgr._on_bridge_rx(session.session_id, b"fg-out\n$ ")
+            return True
+
+        bridge.wait_for_regex_from.side_effect = fg_wait
+        bridge.rx_text_from.return_value = "fg-out\n$ "
+        fg = mgr.execute_command(
+            "p:COM0", "echo fg", "agent:test", "cid-fg", timeout_s=5.0,
+        )
+        self.assertTrue(fg["ok"])
+        after = mgr.get_background_result("cid-bg", from_chunk=0)
+        self.assertEqual(after["status"], "done")
+        combined = "".join(after["chunks"])
+        self.assertIn("bg-out", combined)
+        self.assertNotIn("fg-out", combined)
+
 
 if __name__ == "__main__":
     unittest.main()

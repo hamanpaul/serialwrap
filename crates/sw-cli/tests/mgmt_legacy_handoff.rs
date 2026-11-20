@@ -30,12 +30,12 @@ fn d8_disabled_running_unit_stays_disabled_after_update() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_systemd(true)
         .with_var("USER", "alice")
         .with_supervisor_state("systemd-user", false, true)
         .with_idle_daemon_default(4242)
-        .with_new_daemon_reporting_version("0.4.1");
+        .with_new_daemon_reporting_version(CURRENT_VERSION);
     disabled_but_running_user_unit(&t);
     let (rc, out, _) = t.run_from_bundle(&["setup", "--user"]);
     assert_eq!(rc, 0, "{out}");
@@ -53,7 +53,7 @@ fn d8_disabled_running_unit_stays_disabled_after_refusal() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_systemd(true)
         .with_var("USER", "alice")
         .with_supervisor_state("systemd-user", false, true)
@@ -94,7 +94,11 @@ fn system_daemon_flashing(t: TestEnv) -> TestEnv {
 #[test]
 fn s1x_c1_update_detects_systemd_system_daemon_on_fixed_socket() {
     let t = system_daemon_flashing(
-        TestEnv::posix().with_install_root().with_installed("0.4.0").with_current("0.4.0", None).with_bundle("0.4.1"),
+        TestEnv::posix()
+            .with_install_root()
+            .with_installed("0.4.0")
+            .with_current("0.4.0", None)
+            .with_bundle(CURRENT_VERSION),
     );
     let (rc, out, _) = t.run_from_bundle(&["setup", "--system", "--with-sudo"]);
     assert_eq!(rc, 2, "{out}");
@@ -109,7 +113,11 @@ fn s1x_c1_update_detects_systemd_system_daemon_on_fixed_socket() {
 /// S1X-c-1／D9(i)：首次安裝（無 current-release.json）同樣以 systemd-system 固定 socket 偵測舊 daemon。
 #[test]
 fn s1x_c1_first_install_detects_systemd_system_daemon_on_fixed_socket() {
-    let t = system_daemon_flashing(TestEnv::posix().with_install_root().with_bundle("0.4.1"));
+    let t = system_daemon_flashing(
+        TestEnv::posix()
+            .with_install_root()
+            .with_bundle(CURRENT_VERSION),
+    );
     let (rc, out, _) = t.run_from_bundle(&["setup", "--system", "--with-sudo"]);
     assert_eq!(rc, 2, "{out}");
     let j = json(&out);
@@ -127,7 +135,7 @@ fn d3_2_foreign_socket_daemon_without_rpc_fails_closed() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_supervisor_state("on-demand", false, false)
         .with_procs(vec![DaemonProc {
             pid: 5151,
@@ -149,7 +157,7 @@ fn d3_2_supervisor_running_without_rpc_daemon_fails_closed() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_systemd(true)
         .with_var("USER", "alice")
         .with_supervisor_state("systemd-user", true, true);
@@ -923,13 +931,13 @@ fn s1_4baca8c_2_cross_mode_crash_after_start_stops_target_instance_first() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_systemd(true)
         .with_var("USER", "alice")
         .with_supervisor_state("on-demand", false, false)
         .with_config(&format!("supervision_mode: on-demand\nsocket_path: {old}\n"))
         .with_idle_daemon(old, 4242)
-        .with_new_daemon_reporting_version("0.4.1")
+        .with_new_daemon_reporting_version(CURRENT_VERSION)
         .with_crash_at("start_and_verify:started");
     let target = t.default_socket();
     assert_ne!(t.isolated_endpoint(old), t.isolated_endpoint(&target));
@@ -1059,13 +1067,13 @@ fn s1_f3c66b4_2_recover_reinterrupted_after_target_hold_completes() {
         .with_install_root()
         .with_installed("0.4.0")
         .with_current("0.4.0", None)
-        .with_bundle("0.4.1")
+        .with_bundle(CURRENT_VERSION)
         .with_systemd(true)
         .with_var("USER", "alice")
         .with_supervisor_state("on-demand", false, false)
         .with_config(&format!("supervision_mode: on-demand\nsocket_path: {old}\n"))
         .with_idle_daemon(old, 4242)
-        .with_new_daemon_reporting_version("0.4.1")
+        .with_new_daemon_reporting_version(CURRENT_VERSION)
         .with_crash_at("start_and_verify:started");
     t.service().set_strict_dropin(true);
     assert_eq!(t.run_from_bundle(&["setup", "--user"]).0, 137);

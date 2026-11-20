@@ -1,28 +1,29 @@
 {
   "schema_version": 1,
-  "cases_revision": "2026-11-03.1",
-  "total": 157,
+  "cases_revision": "2026-11-13.1",
+  "total": 239,
   "by_suite": {
-    "contract-blackbox": 33,
-    "func-test": 13,
+    "contract-blackbox": 100,
+    "func-test": 14,
     "l15-scenario": 15,
     "manual-procedure": 1,
     "realhw": 37,
     "regression": 45,
-    "windows-native": 13
+    "rust-l1": 6,
+    "windows-native": 21
   },
   "by_layer": {
-    "L1": 34,
-    "L1.5": 34,
+    "L1": 46,
+    "L1.5": 104,
     "L2": 46,
     "L3": 42,
     "manual": 1
   },
   "by_slice": {
-    "2.1": 49,
-    "2.2": 33,
-    "2.3": 29,
-    "2.4": 11,
+    "2.1": 48,
+    "2.2": 50,
+    "2.3": 71,
+    "2.4": 35,
     "None": 35
   }
 }

@@ -1,0 +1,3166 @@
+# 宣告式 ID 對應；空 nodeids 表示由 owner_phase 所屬 Phase 補齊。
+entries:
+  bc:BC-01:
+    nodeids:
+    - cargo:sw-core::wal_writer::shutdown_syncs_then_closes
+    - cargo:sw-core::wal_writer::lazy_open_idle_file_absent
+    - cargo:sw-core::wal_writer::enospc_on_open_handle_trips_all_fences
+    - cargo:sw-core::wal_writer::wal_contract_golden_matches_p1
+    owner_phase: P5
+  bc:BC-02:
+    nodeids:
+    - cargo:sw-core::deferred_bc02::overflow_deletes_whole_entry_then_new_bytes_kept
+    - cargo:sw-core::session_core_console::stale_epoch_input_dropped_and_diagnosed
+    - tests/contract_blackbox/slice22/test_console_bc02.py::test_banner_during_suspend_drops_deferred
+    - tests/contract_blackbox/slice22/test_console_bc02.py::test_normal_suspend_loses_no_keystroke
+    owner_phase: P8
+  bc:BC-03:
+    nodeids:
+    - cargo:sw-core::arbiter::aborted_mapping_bc03
+    - cargo:sw-core::drain_release::release_waits_for_receipt_then_persists_and_maps_bc03
+    owner_phase: P5
+  bc:BC-04:
+    nodeids:
+    - cargo:sw-daemon::dispatch::gpx_device_attach_open_failures_match_python_wire
+    - cargo:sw-pal::serial_posix::flock_eacces_is_held
+    owner_phase: P5
+  bc:BC-05:
+    nodeids:
+    - cargo:sw-cli::mgmt_remote::windows_argv_drops_control_master_but_identity_unchanged
+    - cargo:sw-cli::mgmt_remote::windows_connect_ready_via_ping
+    owner_phase: P4
+  bc:DF-01:
+    nodeids:
+    - cargo:sw-core::event_store::reset_with_invalid_rule_id_counts_zero_df01
+    owner_phase: P7
+  bc:DF-02:
+    nodeids:
+    - cargo:sw-core::login_quiet::human_prefixed_rpc_source_is_gated_like_agent_df02
+    owner_phase: P5
+  bc:DF-03:
+    nodeids:
+    - cargo:sw-core::wal_writer::rotate_collision_adds_numeric_suffix
+    owner_phase: P5
+  bc:DF-04:
+    nodeids:
+    - cargo:sw-core::session_manager::released_survives_two_restarts_dynamic
+    owner_phase: P5
+  bc:DF-05:
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::start_locate_order_sibling_then_runtime
+    - cargo:sw-cli::mgmt_daemon::start_locate_honors_release_manifest_env
+    owner_phase: P4
+  bc:DF-06:
+    nodeids:
+    - cargo:sw-cli::client_retry::non_json_is_invalid_response
+    owner_phase: P3
+  bc:DF-07:
+    nodeids:
+    - cargo:sw-cli::mgmt_service::service_bad_constructor_tag_reports_line_and_column
+    owner_phase: P4
+  bc:DF-08:
+    nodeids:
+    - cargo:sw-core::event_schema::contains_with_bad_flag_is_rejected_df08
+    owner_phase: P7
+  bc:DF-09:
+    nodeids:
+    - cargo:sw-core::event_store::load_all_valueerror_typeerror_are_failed_df09
+    owner_phase: P7
+  bc:DF-10:
+    nodeids:
+    - cargo:sw-cli::mgmt_setup::df10_system_state_migration_target
+    owner_phase: P4
+  bc:DF-11:
+    nodeids:
+    - cargo:sw-cli::mgmt_setup::wsl_without_sudo_never_runs_sudo_install
+    - cargo:sw-cli::mgmt_setup::reconcile_timeout_keeps_wsl_pending_sudo_commands
+    - cargo:sw-cli::mgmt_setup::wsl_systemd_target_with_sudo_installs
+    owner_phase: P4
+  bc:DF-12:
+    nodeids:
+    - cargo:sw-cli::mgmt_setup::reconcile_handed_off_never_sends_daemon_stop
+    - cargo:sw-cli::mgmt_setup::reconcile_waits_on_status_pid_not_unrelated_socketless_daemon
+    owner_phase: P4
+  bc:DF-13:
+    nodeids:
+    - cargo:sw-cli::mgmt_update::update_materializes_assets_preserving_profiles
+    - cargo:sw-cli::mgmt_setup::materialize_wrappers_posix_only
+    owner_phase: P4
+  bc:DF-14:
+    nodeids:
+    - cargo:sw-daemon::daemon_process::startup_order_scan_rank_watch
+    owner_phase: P5
+  bc:DF-15:
+    nodeids:
+    - cargo:sw-core::event_engine::end_to_end_fire_uses_exact_wal_seq_and_writes_ndjson
+    owner_phase: P7
+  bc:DF-16:
+    nodeids:
+    - cargo:sw-cli::mgmt_setup::materialize_skill_always_refreshed_and_linked
+    owner_phase: P4
+  bc:DF-17:
+    nodeids:
+    - cargo:sw-core::wal_writer::mirror_failure_retries_only_mirror
+    owner_phase: P5
+  bc:DF-18:
+    nodeids:
+    - cargo:sw-core::event_store::upsert_overwrites_existing_df18
+    owner_phase: P7
+  bc:DF-19:
+    nodeids:
+    - cargo:sw-core::lease_selftest::selftest_quiet_armed_after_precheck_before_submit_zero_tx
+    owner_phase: P7
+  bc:DF-20:
+    nodeids:
+    - cargo:sw-daemon::rpc_console::df20_send_with_pre_recover_or_reboot_id_not_found_zero_tx
+    owner_phase: P6
+  bc:DF-21:
+    nodeids:
+    - cargo:sw-core::arbiter::flush_only_accepted
+    - cargo:sw-core::command_exec::timeout_sends_ctrl_c_then_recovers_and_flushes_queue
+    owner_phase: P5
+  bc:DF-22:
+    nodeids:
+    - cargo:sw-core::rx_reader::rate_window_merge_oldest_keeps_byte_sum
+    owner_phase: P5
+  bc:DF-23:
+    nodeids:
+    - cargo:sw-daemon::dispatch::df23_rpc_release_during_login_then_attach_returns_ready
+    owner_phase: P7
+  bc:DF-24:
+    nodeids:
+    - cargo:sw-daemon::dispatch::df24_rpc_session_list_completes_during_force_recover
+    owner_phase: P7
+  bc:DF-25:
+    nodeids:
+    - cargo:sw-daemon::dispatch::df25_interactive_cancel_preserves_lease
+    owner_phase: P6
+  bc:DF-26:
+    nodeids:
+    - cargo:sw-daemon::file_transfer_rpc::file_pull_over_rx_window_succeeds_od80_df26
+    owner_phase: P8
+  bc:DF-27:
+    nodeids:
+    - cargo:sw-core::reprobe::df27_post_login_timeout_is_reprobe_eligible
+    owner_phase: P7
+  bc:SC-01:
+    nodeids:
+    - cargo:sw-core::session_core::recovering_submit_is_session_recovering_sc01
+    owner_phase: P5
+  bc:SC-02:
+    nodeids:
+    - cargo:sw-core::flash_session_core::console_input_resumes_after_flash_ioerror_recovery
+    owner_phase: P5
+  bc:SC-03:
+    nodeids:
+    - cargo:sw-core::command_exec::wp55_execute_time_trust_matrix
+    owner_phase: P5
+  bc:SC-04:
+    nodeids:
+    - cargo:sw-core::drain_release::device_attach_dedup_same_by_id_inflight
+    owner_phase: P5
+  bc:SC-05:
+    nodeids:
+    - cargo:sw-daemon::dispatch::gpx_device_attach_open_failures_match_python_wire
+    - cargo:sw-pal::serial_posix::flock_eacces_is_held
+    owner_phase: P5
+  bc:SC-06:
+    nodeids:
+    - cargo:sw-core::arbiter::flush_only_accepted
+    owner_phase: P5
+  bc:SC-07:
+    nodeids:
+    - cargo:sw-core::echo_paced::paced_abort_after_partial_write_records_confirmed_bytes_then_errors
+    owner_phase: P5
+  bc:SC-09:
+    nodeids:
+    - cargo:sw-cli::endpoint_resolve::config_zero_socket_path
+    owner_phase: P3
+  bc:SC-10:
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::start_treats_normalized_same_socket_as_no_conflict
+    owner_phase: P5
+  bc:SC-11:
+    nodeids:
+    - cargo:sw-cli::mgmt_graceful_stop::on_demand_handoff_waits_for_granted_instance_ordered_shutdown
+    owner_phase: P5
+  bc:SC-12:
+    nodeids:
+    - cargo:sw-cli::mgmt_setup::reconcile_waits_on_status_pid_not_unrelated_socketless_daemon
+    owner_phase: P4
+  bc:SC-13:
+    nodeids:
+    - cargo:sw-core::lease_selftest::tick_expires_lease_sc13
+    owner_phase: P6
+  bc:SC-14:
+    nodeids:
+    - cargo:sw-core::flash_session_core::probe_rejected_when_foreground_busy_sc14
+    owner_phase: P8
+  bc:SC-15:
+    nodeids:
+    - cargo:sw-core::out_ring::drop_oldest_keeps_newest_within_cap
+    owner_phase: P6
+  bc:SC-16:
+    nodeids:
+    - cargo:sw-core::line_editor::exactly_16385_bytes_is_submitted_for_arbiter_to_reject
+    owner_phase: P6
+  bc:SC-17:
+    nodeids:
+    - cargo:sw-pal::proc_scan::windows_scan_finds_self_spawned_fake_daemon
+    owner_phase: P5
+    platforms: [windows]
+  bc:SC-18:
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::autostart_resend_carries_original_command_params
+    owner_phase: P4
+  bc:SC-19:
+    nodeids:
+    - cargo:sw-daemon::daemon_process::allowlist_rejected_before_runtime_dirs_and_lock
+    owner_phase: P1
+  bc:SC-20:
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::restart_on_demand_stop_wait_start
+    owner_phase: P4
+  bc:SC-21:
+    nodeids:
+    - cargo:sw-cli::mgmt_remote::remote_stop_is_alias_of_close
+    owner_phase: P4
+  bc:SC-22:
+    nodeids:
+    - cargo:sw-cli::mgmt_supervision_switch::supervision_set_idle_uses_handoff_not_daemon_stop
+    - cargo:sw-cli::mgmt_supervision_switch::supervision_set_probe_failure_has_no_side_effects
+    owner_phase: P4
+  bc:SC-23:
+    nodeids:
+    - cargo:sw-cli::mgmt_update::update_on_demand_holds_autostart_lock_until_new_daemon_started
+    - cargo:sw-cli::mgmt_update::pairing_failure_after_switch_reverts_to_complete_previous
+    owner_phase: P4
+  bc:SC-24:
+    nodeids:
+    - cargo:sw-pal::service_ctl::windows_task_install_writes_xml_then_creates_task
+    - cargo:sw-pal::service_ctl::windows_service_install_plan_register_held_is_disabled_and_not_started
+    owner_phase: P4
+  bc:SC-25:
+    nodeids:
+    - cargo:sw-cli::mgmt_doctor::version_pairing_mismatch_detail
+    - cargo:sw-cli::mgmt_doctor::version_pairing_daemon_down_is_unreachable
+    - cargo:sw-cli::mgmt_com0com::version_pairing_checks_optional_component_and_helper_digests
+    owner_phase: P4
+  bc:SC-26:
+    nodeids:
+    owner_phase: P7
+    platforms: [windows]
+    blocked_reason: "Windows 原生 HandlerSpawner 節點尚未進入凍結鎖；待擁有者原生收集與執行後解除。"
+  bc:SC-27:
+    nodeids:
+    - cargo:sw-cli::cli_spec_schema::cli_spec_matches_schema
+    owner_phase: P4
+  bc:SC-28:
+    nodeids:
+    - cargo:sw-pal::console_conformance::select_console_kind_table
+    owner_phase: P6
+  bc:SC-29:
+    nodeids:
+    - cargo:sw-daemon::windows_console_native::cap_windows_com__serial_console_end_to_end
+    owner_phase: P6
+    platforms: [windows]
+    blocked_caps: [windows_com]
+    blocked_reason: "OD-01 com0com console 端點須由擁有者以核准的 COM22:COM23 實跑；本項不解除硬體阻塞。"
+  bc:SC-30:
+    nodeids:
+    - cargo:sw-core::session_core_login::reboot_recovery_banner_returns_to_wait_loop_sc30
+    owner_phase: P7
+  bc:SC-31:
+    nodeids:
+    - cargo:sw-core::session_core_console::input_without_active_epoch_dropped_sc31
+    - cargo:sw-core::session_core_lease::stash_dropped_when_expired_sc31
+    owner_phase: P6
+  bc:SC-32:
+    nodeids:
+    - cargo:sw-core::flash_session_core::io_error_during_flashing_drains_to_recovering
+    - cargo:sw-core::flash_session_core::device_detached_during_flashing_is_deferred
+    owner_phase: P8
+  bc:SC-34:
+    nodeids:
+    - cargo:sw-daemon::session_rpc_p7::attach_credentials_unresolved_last_error_field
+    - cargo:sw-core::session_core_login::attach_state_result_mapping
+    owner_phase: P7
+  bc:SC-35:
+    nodeids:
+    - cargo:sw-core::session_core::attached_passthrough_submit_not_ready_with_ready_in
+    - cargo:sw-core::session_core::passthrough_attach_no_login_no_probe
+    - cargo:sw-core::session_core::passthrough_quiet_tick_ready_at_30s
+    - cargo:sw-core::session_core::passthrough_rx_restarts_quiet_window
+    - cargo:sw-core::command_exec::passthrough_completion_regex_producer
+    - cargo:sw-core::command_exec::passthrough_usable_prompt_completion
+    - cargo:sw-core::command_exec::passthrough_unusable_prompt_timeout_no_recovery
+    owner_phase: P8
+  bc:SC-36:
+    nodeids:
+    - cargo:sw-cli::mgmt_com0com::bundle_without_component_verifies
+    owner_phase: P8
+  bc:SC-37:
+    nodeids:
+    - cargo:sw-daemon::daemon_process::backend_env_invalid_exit_1
+    - cargo:sw-daemon::daemon_process::backend_env_checked_where_python_selects_it
+    owner_phase: P5
+  bc:SC-39:
+    nodeids:
+    - cargo:sw-cli::mgmt_legacy_handoff::legacy_a_on_demand_install_stops_with_rpc_and_setup_starts_new_daemon
+    owner_phase: P4
+  case:bc02-deferred-context-switch-clear:
+    nodeids: []
+    owner_phase: P6
+  case:bc02-deferred-overflow-clear:
+    nodeids: []
+    owner_phase: P6
+  case:bc02-mailbox-stale-input-not-replayed:
+    nodeids: []
+    owner_phase: P6
+  case:bc02-normal-replay-53:
+    nodeids: []
+    owner_phase: P6
+  case:brcm-01-login-flow:
+    nodeids: []
+    owner_phase: P7
+  case:cap-windows-com--p7-event-fire:
+    blocked_caps:
+    - windows_com
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - windows
+  case:cap-windows-com--p7-login-ready:
+    blocked_caps:
+    - windows_com
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - windows
+  case:cap-windows-com--p7-quiet-banner-zero-tx:
+    blocked_caps:
+    - windows_com
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - windows
+  case:co-01-line-buffering:
+    nodeids: []
+    owner_phase: P6
+  case:cowork-01-agent-bad-cmd:
+    nodeids: []
+    owner_phase: P7
+  case:df18-event-replace-overwrite:
+    nodeids: []
+    owner_phase: P7
+  case:ev-01-spawn-handler:
+    nodeids: []
+    owner_phase: P7
+  case:f1-cmdid-survives-timeout:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:f1-limits-queryable:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:f1-near-limit-no-logout:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:f1-newline-rejected:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:f1-too-long-rejected:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:f10-creds-fixed-then-ready:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P7
+  case:f10-release-aborts-inflight-command:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P7
+  case:f10-release-drain-receipt:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P7
+  case:f10-unresolved-creds-terminal:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P7
+  case:f11-flood-probe-classified:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P7
+  case:f11-last-rx-age-sane:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P7
+  case:f12-version-reported-consistent:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:f12-wal-path-live:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:f2-history-bounded-rss:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:f2-queue-full-backpressure:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:f2-recovery-flushes-queue:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:f2-rx-window-crossing-prompt:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:f3-cmd-fail-observable:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:f3-device-error-names-selector:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:f3-fail-error-code:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:f3-log-tail-latest:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:f4-activity-classification:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:f4-background-result-tail-consistent:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:f4-interactive-line-cmd-defined:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+  case:f5-console-peer-gone-recycled:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+  case:f5-deferred-bytes-flushed:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+  case:f5-deferred-dropped-after-reboot:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+  case:f5-raw-ownership-survives-agent-rounds:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+  case:f5-second-console-linebuffer:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+  case:f6-ping-during-long-op:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+  case:f6-two-boards-no-starvation:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+  case:f7-binary-roundtrip-md5:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者 TestPilot 實機證據
+    nodeids: []
+    owner_phase: P2
+    platforms:
+    - linux
+    - windows
+  case:f7-larger-file-not-truncated:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: EVT-D-F4 KEEP 與 1 MB pull 契約衝突待擁有者裁決；實機證據待補
+    nodeids: []
+    owner_phase: P2
+    platforms:
+    - linux
+    - windows
+  case:f8-second-daemon-detected:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+  case:f8-tty-holders-reported:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+  case:ha-01-human-then-agent:
+    nodeids: []
+    owner_phase: P6
+  case:ha-05-concurrent-submit:
+    nodeids: []
+    owner_phase: P5
+  case:hk-01-special-keys-raw:
+    nodeids: []
+    owner_phase: P6
+  case:hk-02-agent-preempt-human:
+    nodeids: []
+    owner_phase: P6
+  case:hk-03-deferred-input-flush:
+    nodeids: []
+    owner_phase: P6
+  case:hk-04-minicom-exit-cleanup:
+    nodeids: []
+    owner_phase: P6
+  case:l15-context-switch-deferred-input:
+    nodeids: []
+    owner_phase: P6
+  case:l15-delayed-reply:
+    nodeids: []
+    owner_phase: P7
+  case:l15-dut-reboot-port-alive:
+    nodeids: []
+    owner_phase: P7
+  case:l15-dut-silent:
+    nodeids: []
+    owner_phase: P7
+  case:l15-exclusive-open:
+    nodeids: []
+    owner_phase: P5
+  case:l15-half-prompt:
+    nodeids: []
+    owner_phase: P5
+  case:l15-multi-source-contention-cli:
+    nodeids: []
+    owner_phase: P5
+  case:l15-multi-source-contention-console:
+    nodeids: []
+    owner_phase: P6
+  case:l15-reboot-min-guard:
+    nodeids: []
+    owner_phase: P5
+  case:l15-reject-zero-tx:
+    nodeids: []
+    owner_phase: P5
+  case:l15-release-inflight:
+    nodeids: []
+    owner_phase: P5
+  case:l15-slow-reader-backpressure:
+    nodeids: []
+    owner_phase: P5
+  case:l15-stale-event-delay:
+    nodeids: []
+    owner_phase: P5
+  case:l15-transport-disconnect:
+    nodeids: []
+    owner_phase: P5
+  case:l15-wal-interference:
+    nodeids: []
+    owner_phase: P5
+  case:lr-mixed:
+    blocked_caps:
+    - physical_uart
+    - longrun_bench
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P8
+  case:p0-blog-clean:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+  case:p0-clear-reattach:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:p0-cmd-async:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:p0-console-raw:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+  case:p0-doctor:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:p0-multiopen:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:p0-selftest:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:p0-wal-live:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:p1-cmd-file:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P8
+  case:p1-cmd-modes:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+  case:p1-cmd-serial:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:p1-con-busy:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+  case:p1-con-defer:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+  case:p1-con-fanout:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+  case:p1-con-liveness:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+  case:p1-con-orphan:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+  case:p1-con-second:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+  case:p1-con-softpreempt:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+  case:p1-ho-cycle:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P8
+  case:p1-ho-persist:
+    blocked_caps:
+    - physical_uart
+    - supervisor_runtime
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P8
+  case:p1-hp-cycle:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:p1-hp-reorder:
+    blocked_caps:
+    - physical_uart
+    - supervisor_runtime
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:p1-rst-bootwindow:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P7
+  case:p1-rst-daemon:
+    blocked_caps:
+    - physical_uart
+    - supervisor_runtime
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:p1-rst-reboot:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P7
+  case:p1-rst-recover:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+  case:p1-wal-fullrun:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+  case:p1-wal-reset:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+  case:p2-1-mcu-flash-manual:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P8
+    platforms:
+    - linux
+  case:p7-events-handler-no-inherited-fds:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-events-handler-timeout-kills-group:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-events-redos-rejected-no-re2:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-events-rule-crud-and-reload:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-events-rule-fire-handler-payload:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-events-start-load-order:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-invariants-evidence-insufficient-is-not-pass:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-invariants-login-bytes-not-interleaved-with-agent-or-human:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-invariants-no-auto-resend-after-partial-or-timeout:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-invariants-recovery-and-reboot-do-not-replay-stale-input:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-invariants-rejected-requests-zero-tx:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-invariants-release-during-login-waits-for-handle-close:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-latency-noise-control-latency-under-flood-with-events:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-latency-noise-login-with-delay-and-noise:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-log-capture-capture-skips-foreground:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-login-console-unlock-smart4r-like:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-login-creds-file-fixed-does-not-auto-probe-until-attach:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-login-creds-fixed-then-attach-ready:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-login-passthrough-banner-no-quiet-gate:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-login-passthrough-others-quiet-ready:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-login-passthrough-uboot-quiet-ready-no-login:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-login-platform-matrix:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-login-unresolved-credentials-terminal-zero-empty-secret-tx:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-quiet-reconfirm-attach-during-quiet-zero-tx:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-quiet-reconfirm-attached-bootloader-probe-sets-stuck:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-quiet-reconfirm-ready-bootloader-tail-terminal-d1:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-quiet-reconfirm-spontaneous-reboot-gates-agent:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-selftest-recover-recover-force-on-ready-runs-keys-first:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-selftest-recover-recover-force-timeout-attached:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-selftest-recover-recover-ready-ctrl-c:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-selftest-recover-selftest-classifications:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:p7-stall-transport-stall-flip:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:pt-quiet-ready:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P7
+  case:rc-01-interactive-mode-switch:
+    nodeids: []
+    owner_phase: P6
+  case:rm-live-cycle:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P7
+  case:rm-live-e2e:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P7
+  case:rm-live-orphan:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P7
+  case:rm-topo-agent-pull:
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P7
+  case:rm-topo-direct:
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P7
+  case:rm-topo-dual-nat:
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P7
+  case:rm-topo-gwports:
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P7
+  case:rm-topo-nat-host:
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P7
+  case:s24-contract-coverage:
+    nodeids:
+    - tests/test_rust_contract_coverage.py::test_skipped_and_teardown_error_never_count
+    - tests/test_rust_contract_coverage.py::test_blocked_owner_cases_are_reported_not_covered
+    - tests/test_rust_contract_coverage.py::test_all_mapped_nodeids_required_not_any
+    - tests/test_rust_contract_coverage.py::test_incomplete_run_cannot_satisfy
+    - tests/test_rust_contract_coverage.py::test_duplicate_result_rows_not_best_of
+    - tests/test_rust_contract_coverage.py::test_mapped_nodeid_not_collected_is_missing
+    - tests/test_rust_contract_coverage.py::test_identity_mismatch_rejected
+    owner_phase: P8
+    rust_only: true
+  case:s24-flash-arbitration:
+    nodeids:
+    - cargo:sw-core::flash_session_core::probe_then_matched_enters_flashing_and_invalidates_human_input
+    - cargo:sw-core::flash_session_core::probe_rejected_when_foreground_busy_sc14
+    - cargo:sw-core::flash_session_core::unmatched_release_only_clears_same_probe
+    owner_phase: P8
+    rust_only: true
+  case:s24-flash-baud-mirror:
+    nodeids:
+    - tests/contract_blackbox/test_s24_flash_endpoint.py::test_baud_mirrored_once_from_flasher
+    owner_phase: P8
+    platforms:
+    - linux
+  case:s24-flash-holder-gone:
+    nodeids:
+    - tests/contract_blackbox/test_s24_flash_endpoint.py::test_two_flashes_same_daemon
+    - tests/contract_blackbox/test_s24_flash_endpoint.py::test_sync_replay_pump_and_holder_gone
+    owner_phase: P8
+    platforms:
+    - linux
+  case:s24-flash-ioerror-recovering:
+    nodeids:
+    - cargo:sw-core::flash_session_core::io_error_during_flashing_drains_to_recovering
+    - cargo:sw-core::flash_session_core::device_detached_during_flashing_is_deferred
+    owner_phase: P8
+    rust_only: true
+  case:s24-flash-silent-unbridged:
+    nodeids:
+    - tests/contract_blackbox/test_s24_flash_endpoint.py::test_ttymcu_silent_when_unbridged
+    owner_phase: P8
+    platforms:
+    - linux
+  case:s24-flash-sync-replay:
+    nodeids:
+    - tests/contract_blackbox/test_s24_flash_endpoint.py::test_sync_replay_pump_and_holder_gone
+    owner_phase: P8
+    platforms:
+    - linux
+  case:s24-ho-ext-tool:
+    nodeids:
+    - tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits
+    owner_phase: P8
+    platforms:
+    - linux
+  case:s24-ho-persist-restart:
+    nodeids:
+    - tests/contract_blackbox/test_s24_device_handoff.py::test_released_survives_two_restarts_and_replug
+    owner_phase: P8
+    platforms:
+    - linux
+  case:s24-ho-second-daemon:
+    nodeids:
+    - tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns
+    owner_phase: P8
+    platforms:
+    - linux
+  case:s24-ho-windows-com:
+    blocked_caps:
+    - windows_com
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids:
+    - tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown
+    owner_phase: P8
+    platforms:
+    - windows
+  case:s24-mcu-rpc-shapes:
+    nodeids:
+    - tests/contract_blackbox/test_s24_mcu_rpc.py::test_patterns_exact_bytes
+    - tests/contract_blackbox/test_s24_mcu_rpc.py::test_status_idle_no_sessions
+    owner_phase: P8
+  case:s24-sup-systemd-runtime:
+    blocked_caps:
+    - supervisor_runtime
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids:
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+    platforms:
+    - linux
+  case:s24-sup-wintask-runtime:
+    blocked_caps:
+    - supervisor_runtime
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids:
+    - cargo:sw-pal::wintask_runtime::cap_supervisor_runtime__task_pt0s_restart_and_graceful_stop
+    owner_phase: P8
+    platforms:
+    - windows
+    rust_only: true
+  case:s24-upd-guards:
+    nodeids:
+    - tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_refuses_while_push
+    - tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_refuses_while_flashing
+    - tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_force_refuses_while_push
+    - tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_force_refuses_while_flashing
+    - tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_refuses_while_interactive_send
+    owner_phase: P8
+    platforms:
+    - linux
+  case:s24-upd-rollback-cross-stage:
+    nodeids:
+    - tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_cross_stage_state_compat_released
+    - tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_cross_stage_ready_never_double_held
+    owner_phase: P8
+    platforms:
+    - linux
+  case:s24-xfer-abort-on-release:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+    owner_phase: P8
+    platforms:
+    - linux
+  case:s24-xfer-echo-stall:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_echo_stall_blackbox
+    owner_phase: P8
+    platforms:
+    - linux
+  case:s24-xfer-error-shapes:
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::push_invalid_ack_mode
+    - cargo:sw-core::file_transfer_engine::push_budget_zero
+    - cargo:sw-core::file_transfer_engine::push_chunk_size_zero_direct_api
+    - cargo:sw-core::file_transfer_engine::push_local_missing
+    - cargo:sw-core::file_transfer_engine::push_echo_unsupported
+    - cargo:sw-core::file_transfer_engine::push_budget_fixed_cmds
+    - cargo:sw-core::file_transfer_engine::push_budget_raw_capacity_zero
+    - cargo:sw-core::file_transfer_engine::push_probe_timeout
+    - cargo:sw-core::file_transfer_engine::push_probe_shell_error
+    - cargo:sw-core::file_transfer_engine::push_decoder_missing
+    - cargo:sw-core::file_transfer_engine::push_chunk_timeout
+    - cargo:sw-core::file_transfer_engine::push_decoder_failed
+    - cargo:sw-core::file_transfer_engine::push_md5_unavailable
+    - cargo:sw-core::file_transfer_engine::push_md5_mismatch
+    - cargo:sw-core::file_transfer_engine::push_move_timeout_no_cleanup
+    - cargo:sw-core::file_transfer_engine::push_move_failed_no_cleanup
+    - cargo:sw-core::file_transfer_engine::push_bad_prompt_regex
+    - cargo:sw-core::file_transfer_engine::pull_probe_timeout
+    - cargo:sw-core::file_transfer_engine::pull_probe_shell_error
+    - cargo:sw-core::file_transfer_engine::pull_encoder_missing
+    - cargo:sw-core::file_transfer_engine::pull_timeout
+    - cargo:sw-core::file_transfer_engine::pull_encoder_failed
+    - cargo:sw-core::file_transfer_engine::pull_parse_failed
+    - cargo:sw-core::file_transfer_engine::pull_b64_non_ascii
+    - cargo:sw-core::file_transfer_engine::pull_b64_bad_padding
+    - cargo:sw-core::file_transfer_engine::pull_md5_mismatch
+    - cargo:sw-core::file_transfer_engine::pull_md5_unavailable
+    - cargo:sw-core::file_transfer_engine::pull_local_write_error
+    - cargo:sw-core::file_transfer_engine::pull_budget_pull_cmd
+    - cargo:sw-core::file_transfer_engine::push_tx_rejected_quiet_first_chunk_gives_rejection_without_cleanup
+    - cargo:sw-core::file_transfer_engine::push_tx_rejected_in_chunk_loop_carries_progress
+    - cargo:sw-core::file_transfer_engine::pull_tx_rejected_has_no_progress
+    owner_phase: P8
+    rust_only: true
+  case:s24-xfer-no-retry-side-effect:
+    nodeids:
+    - tests/contract_blackbox/test_s24_no_retry.py::test_side_effect_methods_not_retried
+    owner_phase: P8
+  case:s24-xfer-pull-roundtrip:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_pull_roundtrip_md5
+    owner_phase: P8
+    platforms:
+    - linux
+  case:s24-xfer-push-roundtrip:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_push_then_pull_roundtrip_md5
+    owner_phase: P8
+    platforms:
+    - linux
+  case:s24-xfer-session-gates:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet
+    owner_phase: P8
+    platforms:
+    - linux
+  case:s24-xfer-templates-golden:
+    nodeids:
+    - cargo:sw-core::file_transfer_golden::every_golden_row_matches_python
+    - cargo:sw-core::file_transfer_golden::chunk_template_lengths_match_inventory
+    - cargo:sw-core::file_transfer_golden::split_chunks_empty_file_yields_one_empty_chunk
+    - cargo:sw-core::file_transfer_golden::b64encode_has_no_trailing_newline
+    - tests/test_transfer_golden_fresh.py::test_file_transfer_golden_is_fresh
+    owner_phase: P8
+    rust_only: true
+  case:sc13-lease-expiry-tick:
+    nodeids: []
+    owner_phase: P6
+  case:sc14-flash-probe-eligibility:
+    nodeids:
+    - cargo:sw-core::flash_session_core::probe_rejected_when_foreground_busy_sc14
+    owner_phase: P8
+    platforms:
+    - linux
+  case:sc15-console-ring-drop-oldest:
+    nodeids: []
+    owner_phase: P6
+  case:sc16-console-line-reject-log:
+    nodeids: []
+    owner_phase: P6
+  case:sc28-console-backend-env:
+    nodeids: []
+    owner_phase: P6
+    platforms:
+    - linux
+  case:sc29-com0com-serial-console:
+    blocked_caps:
+    - windows_com
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+    platforms:
+    - windows
+  case:sc30-quiet-mid-login-aborts:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:sc31-console-stale-context-rust:
+    nodeids: []
+    owner_phase: P6
+    platforms:
+    - linux
+  case:sc34-attach-recover-last-error-field:
+    nodeids: []
+    owner_phase: P7
+    platforms:
+    - linux
+  case:sc35-passthrough-command-completion:
+    nodeids:
+    - cargo:sw-core::command_exec::passthrough_completion_regex_producer
+    - cargo:sw-core::command_exec::passthrough_usable_prompt_completion
+    owner_phase: P8
+    platforms:
+    - linux
+  case:sc35-passthrough-quiet-ready:
+    nodeids:
+    - cargo:sw-core::session_core::passthrough_attach_no_login_no_probe
+    - cargo:sw-core::session_core::passthrough_quiet_tick_ready_at_30s
+    owner_phase: P8
+    platforms:
+    - linux
+  case:sc36-win-installer-com0com-optional:
+    nodeids:
+    - cargo:sw-cli::mgmt_com0com::bundle_without_component_verifies
+    owner_phase: P8
+    platforms:
+    - windows
+    rust_only: true
+  case:sm-01-attach-to-ready:
+    nodeids: []
+    owner_phase: P5
+  case:sm-04-device-unplug:
+    nodeids: []
+    owner_phase: P5
+  case:win-com-cancel-close:
+    blocked_caps:
+    - windows_com
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+    platforms:
+    - windows
+  case:win-com-open-exclusive:
+    blocked_caps:
+    - windows_com
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+    platforms:
+    - windows
+  case:win-com-txrx-bridge:
+    blocked_caps:
+    - windows_com
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+    platforms:
+    - windows
+  case:win-task-72h:
+    blocked_caps:
+    - supervisor_runtime
+    - longrun_bench
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P8
+    platforms:
+    - windows
+  case:win-task-logon-trigger:
+    blocked_caps:
+    - supervisor_runtime
+    - interactive_desktop
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P8
+    platforms:
+    - windows
+  case:win-task-restart-on-failure:
+    blocked_caps:
+    - supervisor_runtime
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P8
+    platforms:
+    - windows
+  case:win-task-single-instance:
+    blocked_caps:
+    - supervisor_runtime
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P8
+    platforms:
+    - windows
+  case:win-telnet-deferred:
+    blocked_caps:
+    - windows_com
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+    platforms:
+    - windows
+  case:win-telnet-linebuffer:
+    blocked_caps:
+    - windows_com
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+    platforms:
+    - windows
+  case:win-telnet-raw-owner:
+    blocked_caps:
+    - windows_com
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+    platforms:
+    - windows
+  case:win-telnet-suspend-resume:
+    blocked_caps:
+    - windows_com
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P6
+    platforms:
+    - windows
+  case:win-wal-av-reader-handle:
+    blocked_caps:
+    - windows_com
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+    platforms:
+    - windows
+  case:win-wal-av-rotate:
+    blocked_caps:
+    - windows_com
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+    platforms:
+    - windows
+  case:win-wal-av-unlink:
+    blocked_caps:
+    - windows_com
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+    platforms:
+    - windows
+  case:win-wal-f12-progress:
+    blocked_caps:
+    - physical_uart
+    blocked_reason: 需要擁有者實機、Windows 原生或長時間執行證據
+    nodeids: []
+    owner_phase: P5
+    platforms:
+    - windows
+  cli_cmd:alias assign:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P5
+  cli_cmd:alias list:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P0
+  cli_cmd:alias set:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P5
+  cli_cmd:alias unassign:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P5
+  cli_cmd:cmd cancel:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P5
+  cli_cmd:cmd result-tail:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  cli_cmd:cmd status:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+    - cargo:sw-core::flash_session_core::probe_then_matched_enters_flashing_and_invalidates_human_input
+    - cargo:sw-core::flash_session_core::probe_rejected_when_foreground_busy_sc14
+    - cargo:sw-core::flash_session_core::unmatched_release_only_clears_same_probe
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  cli_cmd:cmd submit:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+    - cargo:sw-core::flash_session_core::probe_then_matched_enters_flashing_and_invalidates_human_input
+    - cargo:sw-core::flash_session_core::probe_rejected_when_foreground_busy_sc14
+    - cargo:sw-core::flash_session_core::unmatched_release_only_clears_same_probe
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  cli_cmd:daemon restart:
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::restart_on_demand_stop_wait_start
+    owner_phase: P3
+  cli_cmd:daemon start:
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::start_locate_order_sibling_then_runtime
+    owner_phase: P3
+  cli_cmd:daemon status:
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::autostart_not_for_daemon_status
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P0
+  cli_cmd:daemon stop:
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::stop_rpc_timeout_fixed_2s_no_retries
+    owner_phase: P3
+  cli_cmd:device attach:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P5
+  cli_cmd:device list:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P0
+  cli_cmd:device release:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P5
+  cli_cmd:event add:
+    nodeids:
+    - cargo:sw-cli::event_add_document::add_keeps_key_order_nan_and_non_ascii_on_the_wire
+    owner_phase: P5
+  cli_cmd:event disable:
+    nodeids:
+    - cargo:sw-cli::event_params::enable_and_disable_send_selector
+    owner_phase: P5
+  cli_cmd:event enable:
+    nodeids:
+    - cargo:sw-cli::event_params::enable_and_disable_send_selector
+    owner_phase: P5
+  cli_cmd:event list:
+    nodeids:
+    - cargo:sw-cli::event_params::list_sends_selector_and_owner_with_nulls_when_absent
+    owner_phase: P0
+  cli_cmd:event reload:
+    nodeids:
+    - cargo:sw-cli::event_params::reload_sends_empty_params
+    owner_phase: P5
+  cli_cmd:event reset:
+    nodeids:
+    - cargo:sw-cli::event_params::reset_sends_rule_id_or_selector_with_the_other_null
+    owner_phase: P5
+  cli_cmd:event rm:
+    nodeids:
+    - cargo:sw-cli::event_params::rm_sends_rule_id
+    owner_phase: P5
+  cli_cmd:event show:
+    nodeids:
+    - cargo:sw-cli::event_params::show_sends_rule_id
+    owner_phase: P0
+  cli_cmd:event status:
+    nodeids:
+    - cargo:sw-cli::event_params::status_sends_selector_or_null
+    owner_phase: P0
+  cli_cmd:event tail:
+    nodeids:
+    - cargo:sw-cli::event_params::tail_defaults_and_explicit_values
+    owner_phase: P0
+  cli_cmd:file pull:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+    - cargo:sw-core::flash_session_core::probe_then_matched_enters_flashing_and_invalidates_human_input
+    - cargo:sw-core::flash_session_core::probe_rejected_when_foreground_busy_sc14
+    - cargo:sw-core::flash_session_core::unmatched_release_only_clears_same_probe
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  cli_cmd:file push:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+    - cargo:sw-core::flash_session_core::probe_then_matched_enters_flashing_and_invalidates_human_input
+    - cargo:sw-core::flash_session_core::probe_rejected_when_foreground_busy_sc14
+    - cargo:sw-core::flash_session_core::unmatched_release_only_clears_same_probe
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  cli_cmd:log tail-raw:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P0
+  cli_cmd:log tail-text:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P0
+  cli_cmd:mcu patterns:
+    nodeids:
+    - tests/contract_blackbox/test_s24_mcu_rpc.py::test_patterns_exact_bytes
+    owner_phase: P8
+  cli_cmd:mcu status:
+    nodeids:
+    - tests/contract_blackbox/test_s24_mcu_rpc.py::test_status_idle_no_sessions
+    owner_phase: P8
+  cli_cmd:profile test:
+    nodeids:
+    - cargo:sw-cli::profile_cmd::matched_line_is_full_line
+    - cargo:sw-cli::profile_checks::class_range_error_precedes_unterminated_and_later_escape
+    owner_phase: P3
+  cli_cmd:remote stop:
+    nodeids:
+    - cargo:sw-cli::mgmt_remote::remote_stop_is_alias_of_close
+    owner_phase: P3
+  cli_cmd:session activity:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P0
+  cli_cmd:session attach:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+    - cargo:sw-core::flash_session_core::probe_then_matched_enters_flashing_and_invalidates_human_input
+    - cargo:sw-core::flash_session_core::probe_rejected_when_foreground_busy_sc14
+    - cargo:sw-core::flash_session_core::unmatched_release_only_clears_same_probe
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  cli_cmd:session bind:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P5
+  cli_cmd:session clear:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P5
+  cli_cmd:session console-attach:
+    nodeids:
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  cli_cmd:session console-detach:
+    nodeids:
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  cli_cmd:session console-list:
+    nodeids:
+    - cargo:sw-core::session_core_lease::console_list_shape_sorted_and_prunes_stale
+    owner_phase: P8
+  cli_cmd:session interactive-close:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P6
+  cli_cmd:session interactive-open:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+    - cargo:sw-core::flash_session_core::probe_then_matched_enters_flashing_and_invalidates_human_input
+    - cargo:sw-core::flash_session_core::probe_rejected_when_foreground_busy_sc14
+    - cargo:sw-core::flash_session_core::unmatched_release_only_clears_same_probe
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  cli_cmd:session interactive-send:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet
+    - cargo:sw-core::flash_session_core::probe_then_matched_enters_flashing_and_invalidates_human_input
+    - cargo:sw-core::flash_session_core::probe_rejected_when_foreground_busy_sc14
+    - cargo:sw-core::flash_session_core::unmatched_release_only_clears_same_probe
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  cli_cmd:session interactive-status:
+    nodeids:
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  cli_cmd:session list:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P0
+  cli_cmd:session log-start:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P5
+  cli_cmd:session log-status:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P0
+  cli_cmd:session log-stop:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P5
+  cli_cmd:session pin:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P5
+  cli_cmd:session recover:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+    - cargo:sw-core::flash_session_core::probe_then_matched_enters_flashing_and_invalidates_human_input
+    - cargo:sw-core::flash_session_core::probe_rejected_when_foreground_busy_sc14
+    - cargo:sw-core::flash_session_core::unmatched_release_only_clears_same_probe
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  cli_cmd:session self-test:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P5
+  cli_cmd:session unpin:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P5
+  cli_cmd:stream tail:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  cli_cmd:wal current-seq:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P0
+  cli_cmd:wal export:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P0
+  cli_cmd:wal reset:
+    nodeids:
+    - cargo:sw-cli::rpc_params::params_wire_exact
+    owner_phase: P5
+  error_code:ALIAS_NOT_FOUND:
+    nodeids:
+    - cargo:sw-core::session_manager::alias_unassign_saves_before_check
+    owner_phase: P0
+  error_code:AUTOBOOT_QUIET:
+    nodeids:
+    - cargo:sw-core::command_exec::reboot_prompt_returns_quickly_ok_not_partial
+    owner_phase: P5
+  error_code:BASE64_DECODE_FAILED:
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::pull_b64_bad_padding
+    owner_phase: P0
+  error_code:BENCH_ENDPOINT_NOT_REMEMBERED:
+    nodeids:
+    - cargo:sw-cli::endpoint_resolve::bench_missing_file
+    owner_phase: P0
+  error_code:BENCH_STATE_IO_ERROR:
+    nodeids:
+    - cargo:sw-cli::endpoint_resolve::bench_state_is_dir
+    owner_phase: P0
+  error_code:CHECKSUM_MISMATCH:
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::pull_md5_mismatch
+    owner_phase: P0
+  error_code:CHECKSUM_VERIFY_FAILED:
+    nodeids:
+    - cargo:sw-cli::mgmt_update::update_verify_failed_no_side_effects
+    owner_phase: P0
+  error_code:CMD_CONTAINS_NEWLINE:
+    nodeids:
+    - cargo:sw-core::admission::registry_admission::frozen_submit_validation_precedes_admission
+    owner_phase: P0
+  error_code:CMD_NOT_CANCELABLE:
+    nodeids:
+    - cargo:sw-core::arbiter::cancel_semantics
+    owner_phase: P0
+  error_code:CMD_NOT_FOUND:
+    nodeids:
+    - cargo:sw-core::arbiter::cancel_semantics
+    owner_phase: P0
+  error_code:CMD_TOO_LONG:
+    nodeids:
+    - cargo:sw-core::admission::registry_admission::frozen_submit_validation_precedes_admission
+    owner_phase: P0
+  error_code:COMMAND_ABORTED_IN_FLIGHT:
+    nodeids:
+    - cargo:sw-core::arbiter::aborted_mapping_bc03
+    owner_phase: P5
+  error_code:CONSOLE_LINE_LIMIT_TOO_SMALL:
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::pull_budget_pull_cmd
+    owner_phase: P0
+  error_code:CONSOLE_NOT_FOUND:
+    nodeids:
+    - cargo:sw-core::session_core_lease::console_detach_unknown
+    owner_phase: P0
+  error_code:DAEMON_ALREADY_RUNNING:
+    nodeids:
+    - cargo:sw-daemon::daemon_process::second_daemon_same_lock_exits_2_with_stderr
+    owner_phase: P0
+  error_code:DAEMON_ALREADY_RUNNING_ELSEWHERE:
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::start_conflict_detects_module_form_daemon
+    owner_phase: P0
+    platforms:
+    - linux
+  error_code:DAEMON_BINARY_NOT_FOUND:
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::start_binary_not_found
+    owner_phase: P0
+  error_code:DAEMON_EXITED:
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::autostart_failure_reports_stderr
+    owner_phase: P4
+  error_code:DAEMON_NOT_READY:
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::start_not_ready_posix_15_attempts
+    owner_phase: P0
+  error_code:DEVICE_ALREADY_BOUND:
+    nodeids:
+    - cargo:sw-core::session_manager::bind_paths
+    owner_phase: P0
+  error_code:DEVICE_NOT_BOUND:
+    nodeids:
+    - cargo:sw-core::session_manager::device_not_bound_synthetic_profile_returns_device_not_bound
+    owner_phase: P0
+  error_code:DEVICE_NOT_FOUND:
+    nodeids:
+    - cargo:sw-core::drain_release::gpx_session_attach_during_plain_attach_inflight_matches_python
+    owner_phase: P0
+  error_code:DEVICE_NOT_PRESENT:
+    nodeids:
+    - cargo:sw-core::drain_release::attach_not_found_device_not_present
+    owner_phase: P0
+  error_code:DEVICE_STILL_HELD:
+    nodeids:
+    - cargo:sw-cli::mgmt_legacy_handoff::d3_2_foreign_socket_daemon_without_rpc_fails_closed
+    owner_phase: P5
+  error_code:DRAIN_STALLED:
+    nodeids:
+    - cargo:sw-core::drain_release_e2e::drain_timeout_marks_stalled_and_release_reports_drain_stalled
+    owner_phase: P5
+  error_code:ECHO_ACK_UNSUPPORTED:
+    l1_only: true
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::push_echo_unsupported
+    owner_phase: P8
+    platforms:
+    - linux
+    - windows
+    rust_only: true
+  error_code:EMPTY_RESPONSE:
+    nodeids:
+    - cargo:sw-cli::client_retry::whitespace_line_empty
+    owner_phase: P0
+  error_code:ENV_FILE_SOURCE_FAILED:
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::restart_keeps_nested_start_stderr
+    owner_phase: P0
+  error_code:EXCEPTION:
+    nodeids:
+    - cargo:sw-daemon::framing::framing_byte_table
+    owner_phase: P0
+  error_code:EXPECT_REBOOT_MODE_UNSUPPORTED:
+    nodeids:
+    - cargo:sw-cli::expect_reboot_parity::interactive_rejection_matches_python_cli_baseline_byte_for_byte
+    owner_phase: P0
+  error_code:FLASHING_BUSY:
+    nodeids:
+    - cargo:sw-cli::mgmt_graceful_stop::graceful_handoff_rejection_returns_hold_context
+    owner_phase: P5
+  error_code:FLUSHED_BY_RECOVERY:
+    nodeids:
+    - cargo:sw-core::arbiter::aborted_mapping_bc03
+    owner_phase: P5
+  error_code:FLUSHED_BY_SHUTDOWN:
+    nodeids:
+    - cargo:sw-daemon::handoff_stop::handoff_frozen_rejects_mutating_methods
+    owner_phase: P5
+  error_code:FORCE_RECOVER_TIMEOUT:
+    nodeids:
+    - cargo:sw-core::command_exec::recover_force_timeout_after_10s
+    owner_phase: P0
+  error_code:INTERACTIVE_EXPIRED:
+    nodeids:
+    - cargo:sw-core::lease_selftest::lazy_expiry_keeps_tombstone_expired
+    owner_phase: P6
+  error_code:INTERACTIVE_NOT_FOUND:
+    nodeids:
+    - cargo:sw-core::drain_release::stale_reply_context_rejected_after_release
+    owner_phase: P0
+  error_code:INTERNAL_ERROR:
+    nodeids:
+    - cargo:sw-cli::delegate_resolve::run_delegate_increments_depth_and_executes_once_with_three_environment_values
+    owner_phase: P4
+  error_code:INVALID_ARGS:
+    nodeids:
+    - cargo:sw-cli::mgmt_com0com::rollback_rejects_com0com_flags
+    owner_phase: P0
+  error_code:INVALID_BENCH_CONFIG:
+    nodeids:
+    - cargo:sw-cli::mgmt_connect::connect_invalid_config_extra_key
+    owner_phase: P0
+  error_code:INVALID_BENCH_STATE:
+    nodeids:
+    - cargo:sw-cli::endpoint_resolve::bench_bad_json
+    owner_phase: P0
+  error_code:INVALID_COMPLETION_REGEX:
+    nodeids:
+    - cargo:sw-cli::source_policy_parity::submit_checks_completion_then_source_then_expect_reboot
+    owner_phase: P0
+  error_code:INVALID_ENDPOINT:
+    nodeids:
+    - cargo:sw-cli::client_retry::invalid_timeout_crashes_only_after_endpoint_parse
+    owner_phase: P0
+  error_code:INVALID_EXPECT_REBOOT:
+    nodeids:
+    - cargo:sw-core::arbiter::wp52_expect_reboot_raw_validation
+    owner_phase: P0
+  error_code:INVALID_JSON:
+    nodeids:
+    - cargo:sw-daemon::framing::framing_byte_table
+    owner_phase: P0
+  error_code:INVALID_METHOD:
+    nodeids:
+    - cargo:sw-daemon::framing::framing_byte_table
+    owner_phase: P0
+  error_code:INVALID_REQUEST:
+    nodeids:
+    - cargo:sw-daemon::framing::framing_byte_table
+    owner_phase: P0
+  error_code:INVALID_RESPONSE:
+    nodeids:
+    - cargo:sw-cli::client_retry::invalid_response_not_transient
+    owner_phase: P3
+  error_code:INVALID_RULE_SCHEMA:
+    nodeids:
+    - cargo:sw-daemon::event_rpc::rule_set_invalid_schema_and_type_error
+    owner_phase: P0
+  error_code:INVALID_TARGET:
+    nodeids:
+    - cargo:sw-cli::mgmt_remote::parse_target_errors
+    owner_phase: P0
+  error_code:LOCAL_FILE_NOT_FOUND:
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::push_local_missing
+    owner_phase: P0
+  error_code:LOG_OPEN_FAILED:
+    nodeids:
+    - cargo:sw-core::capture_p7::log_open_failed_detail_is_python_oserror_str
+    owner_phase: P0
+  error_code:METHOD_NOT_FOUND:
+    nodeids:
+    - cargo:sw-daemon::dispatch::unknown_method_not_found
+    owner_phase: P0
+  error_code:MOVE_FAILED:
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::push_move_failed_no_cleanup
+    owner_phase: P0
+  error_code:MOVE_TIMEOUT:
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::push_move_timeout_no_cleanup
+    owner_phase: P0
+  error_code:NEEDS_SUDO:
+    nodeids:
+    - cargo:sw-cli::mgmt_graceful_stop::windows_service_plain_stop_requires_sudo_before_sc_config
+    owner_phase: P0
+    platforms:
+    - linux
+  error_code:NO_ACTIVE_CAPTURE:
+    nodeids:
+    - cargo:sw-core::capture_p7::log_stop_without_capture
+    owner_phase: P0
+  error_code:NO_SYSTEMD:
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::start_unknown_mode_routes_no_systemd
+    owner_phase: P0
+  error_code:PROFILE_IS_EXPLICIT:
+    nodeids:
+    - cargo:sw-core::session_manager::pin_unpin_paths
+    owner_phase: P0
+  error_code:PROFILE_NOT_COMMAND_CAPABLE:
+    nodeids:
+    - cargo:sw-core::session_core::attached_non_capable_submit_profile_not_command_capable
+    - cargo:sw-core::file_transfer_session::passthrough_ready_returns_profile_not_command_capable_zero_tx
+    owner_phase: P8
+  error_code:PROMPT_TIMEOUT:
+    nodeids:
+    - cargo:sw-core::command_exec::passthrough_unusable_prompt_timeout_no_recovery
+    - cargo:sw-core::command_exec::passthrough_timeout_no_rescue_keys_no_downgrade
+    owner_phase: P8
+  error_code:PROMPT_TIMEOUT_FORCE_RECOVERED:
+    nodeids:
+    - cargo:sw-core::command_exec::recover_ready_path_force_fallbacks
+    owner_phase: P0
+  error_code:PROMPT_TIMEOUT_RECOVERED:
+    nodeids:
+    - cargo:sw-core::arbiter::complete_ok_true_drops_error_code
+    owner_phase: P0
+  error_code:PULL_PARSE_FAILED:
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::pull_parse_failed
+    owner_phase: P0
+  error_code:READY_UNCONFIRMED:
+    nodeids:
+    - cargo:sw-core::command_exec::wp55_submit_time_trust_matrix
+    owner_phase: P0
+  error_code:REMOTE_BIND_UNVERIFIED:
+    nodeids:
+    - cargo:sw-cli::mgmt_remote::open_role_probe_unverified_no_retry
+    owner_phase: P0
+  error_code:REMOTE_NOT_SUPPORTED:
+    nodeids:
+    - cargo:sw-cli::mgmt_daemon::start_endpoint_rejected_posix
+    owner_phase: P4
+  error_code:RULE_NOT_FOUND:
+    nodeids:
+    - cargo:sw-daemon::event_rpc::rule_delete_get_list_and_not_found
+    owner_phase: P0
+  error_code:SAMPLE_READ_FAILED:
+    nodeids:
+    - cargo:sw-cli::profile_checks::sample_read_failure_returns_error_code_without_cli_failure
+    owner_phase: P0
+  error_code:SEND_FAILED:
+    nodeids:
+    - cargo:sw-core::arbiter::aborted_mapping_bc03
+    owner_phase: P5
+  error_code:SESSION_BUSY:
+    nodeids:
+    - cargo:sw-cli::mgmt_legacy_handoff::d8_disabled_running_unit_stays_disabled_after_refusal
+    owner_phase: P0
+  error_code:SESSION_INTERACTIVE_BUSY:
+    nodeids:
+    - cargo:sw-core::command_exec::submit_during_agent_lease_is_rejected_at_execute_time
+    owner_phase: P6
+  error_code:SESSION_NOT_FOUND:
+    nodeids:
+    - cargo:sw-cli::client_retry::non_transient_no_retry
+    owner_phase: P0
+  error_code:SESSION_NOT_READY:
+    nodeids:
+    - cargo:sw-core::session_core::attached_passthrough_submit_not_ready_with_ready_in
+    owner_phase: P8
+  error_code:SESSION_QUEUE_FULL:
+    nodeids:
+    - cargo:sw-core::admission::registry_admission::rejected_after_admission_releases_ticket
+    owner_phase: P5
+  error_code:SESSION_RECOVERING:
+    nodeids:
+    - cargo:sw-core::command_exec::reboot_flushes_commands_queued_behind_it
+    owner_phase: P5
+  error_code:SOCKET_ERROR:
+    nodeids:
+    - cargo:sw-cli::cli_trace::trace_line_exact
+    owner_phase: P0
+  error_code:SOCKET_UNAVAILABLE:
+    nodeids:
+    - cargo:sw-pal::lock::socket_probe_eacces_is_socket_unavailable
+    owner_phase: P0
+    platforms:
+    - linux
+  error_code:SOURCE_RESERVED:
+    nodeids:
+    - cargo:sw-core::file_transfer_session::rpc_invalid_args_matrix
+    owner_phase: P0
+  error_code:SSH_NOT_FOUND:
+    nodeids:
+    - cargo:sw-cli::mgmt_remote::remote_ssh_resolution_precedes_endpoint_and_registry
+    owner_phase: P0
+  error_code:STATE_CHANGED:
+    nodeids:
+    - cargo:sw-core::recover_p7::recover_responses_match_python_golden_bytes
+    owner_phase: P0
+  error_code:TARGET_DECODER_FAILED:
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::push_decoder_failed
+    owner_phase: P0
+  error_code:TARGET_DECODER_MISSING:
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::push_decoder_missing
+    owner_phase: P0
+  error_code:TARGET_ENCODER_FAILED:
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::pull_encoder_failed
+    owner_phase: P0
+  error_code:TARGET_ENCODER_MISSING:
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::pull_encoder_missing
+    owner_phase: P0
+  error_code:TEST_DEVICE_ALLOWLIST_REJECTED:
+    nodeids:
+    - cargo:sw-daemon::daemon_process::allowlist_rejected_before_runtime_dirs_and_lock
+    owner_phase: P1
+  error_code:TIMEOUT:
+    nodeids:
+    - cargo:sw-cli::client_retry::etimedout_is_timeout
+    owner_phase: P0
+  error_code:TRANSFER_ECHO_STALL:
+    nodeids:
+    - cargo:sw-core::echo_paced::echo_stall_sends_one_cancel_line_only
+    owner_phase: P0
+  error_code:TRANSFER_PROBE_FAILED:
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::pull_probe_shell_error
+    owner_phase: P0
+  error_code:TRANSFER_TIMEOUT:
+    nodeids:
+    - cargo:sw-core::file_transfer_engine::pull_probe_timeout
+    owner_phase: P0
+  error_code:TUNNEL_CONFLICT:
+    nodeids:
+    - cargo:sw-cli::mgmt_remote::open_conflict_different_identity
+    owner_phase: P0
+  error_code:TUNNEL_SPAWN_FAILED:
+    nodeids:
+    - cargo:sw-cli::mgmt_remote::open_spawn_failed_empty_tail_uses_error_code_as_message
+    owner_phase: P0
+  error_code:TUNNEL_STATUS_ERROR:
+    nodeids:
+    - cargo:sw-cli::mgmt_connect::benches_status_tunnels_from_error_shapes
+    owner_phase: P0
+  error_code:TUNNEL_STILL_ACTIVE:
+    nodeids:
+    - cargo:sw-cli::mgmt_connect::connect_close_still_active
+    owner_phase: P0
+  error_code:UNKNOWN_BENCH_CODE:
+    nodeids:
+    - cargo:sw-cli::mgmt_connect::connect_unknown_code
+    owner_phase: P0
+  error_code:UNKNOWN_PROFILE:
+    nodeids:
+    - cargo:sw-core::session_manager::pin_unpin_paths
+    owner_phase: P0
+  error_code:WAL_MISSING:
+    nodeids:
+    - cargo:sw-daemon::dispatch::log_tail_raw_wal_missing_shape
+    owner_phase: P0
+  last_error:ATTACH_FAILED:*:
+    nodeids:
+    - cargo:sw-core::drain_release::attach_other_open_error_detached_attach_failed
+    owner_phase: P0
+  last_error:BCM_PROMPT_TIMEOUT:
+    nodeids:
+    - cargo:sw-core::login_fsm_full::is_prompt_timeout_error_suffix
+    owner_phase: P0
+  last_error:BOOTLOADER_STUCK:
+    nodeids:
+    - cargo:sw-core::reprobe::df27_post_login_timeout_is_reprobe_eligible
+    owner_phase: P0
+  last_error:BRIDGE_DOWN:*:
+    nodeids:
+    - cargo:sw-core::drain_release::wp510_review7_worker_close_unconfirmed_registers_by_id
+    owner_phase: P0
+  last_error:CLEARED:
+    nodeids:
+    - cargo:sw-core::command_exec::wp56_detach_clears_evidence_wait
+    owner_phase: P0
+  last_error:CONSOLE_UNLOCK_BOOTLOADER:
+    nodeids:
+    - cargo:sw-core::login_fsm_full::console_unlock_idle_timeout_and_bootloader
+    owner_phase: P0
+  last_error:CONSOLE_UNLOCK_IDLE_TIMEOUT:
+    nodeids:
+    - cargo:sw-core::login_fsm_full::console_unlock_idle_timeout_and_bootloader
+    owner_phase: P0
+  last_error:CONSOLE_UNLOCK_PROMPT_TIMEOUT:
+    nodeids:
+    - cargo:sw-core::login_fsm_full::console_unlock_idle_timeout_and_bootloader
+    owner_phase: P0
+  last_error:CREDENTIALS_UNRESOLVED:
+    nodeids:
+    - cargo:sw-core::login_fsm_full::console_unlock_idle_timeout_and_bootloader
+    owner_phase: P0
+  last_error:DEVICE_NOT_FOUND:
+    nodeids:
+    - cargo:sw-core::drain_release::gpx_session_attach_during_plain_attach_inflight_matches_python
+    owner_phase: P0
+  last_error:DEVICE_REBOUND_REQUIRED:
+    nodeids:
+    - cargo:sw-core::custody::wp510r_i25_ignored_device_attached_does_not_overwrite_diagnostic_path
+    owner_phase: P0
+  last_error:DEVICE_REMOVED:
+    nodeids:
+    - cargo:sw-core::command_exec::wp56_detach_clears_evidence_wait
+    owner_phase: P0
+  last_error:DEVICE_REMOVED_DURING_ATTACH:
+    nodeids:
+    - cargo:sw-core::session_core::device_removed_during_attach_uses_python_last_error
+    owner_phase: P0
+  last_error:LOGIN_PROMPT_TIMEOUT:
+    nodeids:
+    - cargo:sw-core::drain_release::login_failure_detaches_after_receipt
+    owner_phase: P0
+  last_error:LOGIN_REQUIRED:
+    nodeids:
+    - cargo:sw-core::custody::wp510r_i25_ignored_device_attached_does_not_overwrite_diagnostic_path
+    owner_phase: P0
+  last_error:LOGIN_USER_REQUIRED:
+    nodeids:
+    - cargo:sw-core::login_fsm_full::login_user_env_missing_does_not_fall_back_to_profile_username
+    owner_phase: P0
+  last_error:PASS_ENV_MISSING:
+    nodeids:
+    - cargo:sw-core::login_fsm_full::password_resolution_errors
+    owner_phase: P0
+  last_error:PASS_ENV_REQUIRED:
+    nodeids:
+    - cargo:sw-core::login_fsm_full::password_resolution_errors
+    owner_phase: P0
+  last_error:POST_LOGIN_CMD_TIMEOUT:
+    nodeids:
+    - cargo:sw-core::login_fsm_full::post_login_timeout_split
+    owner_phase: P0
+  last_error:PROMPT_TIMEOUT:
+    nodeids:
+    - cargo:sw-core::arbiter::complete_ok_false
+    owner_phase: P0
+  last_error:PROMPT_UNAVAILABLE:
+    nodeids:
+    - cargo:sw-core::login_fsm_full::flood_reclassification_threshold_is_inclusive_20000
+    owner_phase: P0
+  last_error:PRPL_PROMPT_TIMEOUT:
+    nodeids:
+    - cargo:sw-core::login_fsm_full::prompt_timeout_error_by_platform
+    owner_phase: P0
+  last_error:READY_NONCE_TIMEOUT:
+    nodeids:
+    - cargo:sw-core::command_exec::recover_attached_reprobe_not_recovered_last_error_field
+    owner_phase: P0
+  last_error:READY_PROMPT_TIMEOUT:
+    nodeids:
+    - cargo:sw-core::login_quiet::flood_masking_exact_set
+    owner_phase: P0
+  last_error:REBOOTING:
+    nodeids:
+    - cargo:sw-core::session_core_lease::wp61_core_trusted_rpc_reboot_promotes_with_source
+    owner_phase: P0
+  last_error:REBOUND:
+    nodeids:
+    - cargo:sw-core::drain_release::phase1_snapshot_sets_reason_and_clears_foreground
+    owner_phase: P0
+  last_error:RECOVERY_ERROR:
+    nodeids:
+    - cargo:sw-core::session_core_login_exc_p7::reboot_recovery_raised_records_recovery_error
+    owner_phase: P0
+  last_error:RECOVERY_TIMEOUT:
+    nodeids:
+    - cargo:sw-core::command_exec::reboot_recovery_timeout_to_attached
+    owner_phase: P0
+  last_error:RELEASED:
+    nodeids:
+    - cargo:sw-core::drain_release_e2e::release_waits_for_receipt_and_aborts_partial_in_flight
+    owner_phase: P0
+  last_error:REPROBE_FAILED:*:
+    nodeids:
+    - cargo:sw-core::reprobe::df27_post_login_timeout_is_reprobe_eligible
+    owner_phase: P0
+  last_error:RX_FLOOD:
+    nodeids:
+    - cargo:sw-core::lease_selftest::selftest_order_table
+    owner_phase: P0
+  last_error:SHELL_PROMPT_TIMEOUT:
+    nodeids:
+    - cargo:sw-core::login_fsm_full::is_prompt_timeout_error_suffix
+    owner_phase: P0
+  last_error:TRANSPORT_STALL:
+    nodeids:
+    - cargo:sw-core::transport_stall_wiring_p7::reprobe_zero_rx_after_30s_flips_to_transport_stall_once
+    owner_phase: P0
+  rpc_method:alias.assign:
+    nodeids:
+    - cargo:sw-daemon::dispatch::alias_assign_shape
+    owner_phase: P5
+  rpc_method:alias.list:
+    nodeids:
+    - cargo:sw-daemon::dispatch::contract_coverage_alias_unassign_pin_unpin_rpc_routes
+    owner_phase: P0
+  rpc_method:alias.set:
+    nodeids:
+    - cargo:sw-daemon::dispatch::alias_set_empty_alias_allowed
+    owner_phase: P5
+  rpc_method:alias.unassign:
+    nodeids:
+    - cargo:sw-daemon::dispatch::contract_coverage_alias_unassign_pin_unpin_rpc_routes
+    owner_phase: P5
+  rpc_method:command.cancel:
+    nodeids:
+    - cargo:sw-daemon::dispatch::command_cancel_queued_command
+    owner_phase: P5
+  rpc_method:command.get:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+    - cargo:sw-core::flash_session_core::probe_then_matched_enters_flashing_and_invalidates_human_input
+    - cargo:sw-core::flash_session_core::probe_rejected_when_foreground_busy_sc14
+    - cargo:sw-core::flash_session_core::unmatched_release_only_clears_same_probe
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  rpc_method:command.result_tail:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  rpc_method:command.submit:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+    - cargo:sw-core::flash_session_core::probe_then_matched_enters_flashing_and_invalidates_human_input
+    - cargo:sw-core::flash_session_core::probe_rejected_when_foreground_busy_sc14
+    - cargo:sw-core::flash_session_core::unmatched_release_only_clears_same_probe
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  rpc_method:daemon.handoff_stop:
+    nodeids:
+    - cargo:sw-daemon::dispatch::unknown_method_not_found
+    owner_phase: P0
+  rpc_method:daemon.stop:
+    nodeids:
+    - cargo:sw-daemon::daemon_process::no_profiles_message_and_continue
+    owner_phase: P0
+  rpc_method:device.attach:
+    nodeids:
+    - cargo:sw-daemon::dispatch::gpx_device_attach_open_failures_match_python_wire
+    owner_phase: P5
+  rpc_method:device.list:
+    nodeids:
+    - cargo:sw-daemon::dispatch::device_list_sorted_by_by_id
+    owner_phase: P0
+  rpc_method:device.release:
+    nodeids:
+    - cargo:sw-daemon::dispatch::device_release_reason_is_raw_json
+    owner_phase: P5
+  rpc_method:event.com_disable:
+    nodeids:
+    - cargo:sw-daemon::event_rpc::com_toggle_status_reset_reload_tail
+    owner_phase: P5
+  rpc_method:event.com_enable:
+    nodeids:
+    - cargo:sw-daemon::event_rpc::com_toggle_status_reset_reload_tail
+    owner_phase: P5
+  rpc_method:event.com_status:
+    nodeids:
+    - cargo:sw-daemon::event_rpc::com_toggle_status_reset_reload_tail
+    owner_phase: P0
+  rpc_method:event.reload:
+    nodeids:
+    - cargo:sw-daemon::event_rpc::com_toggle_status_reset_reload_tail
+    owner_phase: P5
+  rpc_method:event.reset:
+    nodeids:
+    - cargo:sw-daemon::event_rpc::com_toggle_status_reset_reload_tail
+    owner_phase: P5
+  rpc_method:event.rule_delete:
+    nodeids:
+    - cargo:sw-daemon::event_rpc::rule_delete_get_list_and_not_found
+    owner_phase: P5
+  rpc_method:event.rule_get:
+    nodeids:
+    - cargo:sw-daemon::event_rpc::rule_delete_get_list_and_not_found
+    owner_phase: P0
+  rpc_method:event.rule_list:
+    nodeids:
+    - cargo:sw-daemon::event_rpc::rule_delete_get_list_and_not_found
+    owner_phase: P0
+  rpc_method:event.rule_set:
+    nodeids:
+    - cargo:sw-daemon::event_rpc::rule_set_response_spreads_raw_with_ok_first
+    owner_phase: P5
+  rpc_method:event.tail:
+    nodeids:
+    - cargo:sw-daemon::event_rpc::com_toggle_status_reset_reload_tail
+    owner_phase: P0
+  rpc_method:file.pull:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+    - cargo:sw-core::flash_session_core::probe_then_matched_enters_flashing_and_invalidates_human_input
+    - cargo:sw-core::flash_session_core::probe_rejected_when_foreground_busy_sc14
+    - cargo:sw-core::flash_session_core::unmatched_release_only_clears_same_probe
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  rpc_method:file.push:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+    - cargo:sw-core::flash_session_core::probe_then_matched_enters_flashing_and_invalidates_human_input
+    - cargo:sw-core::flash_session_core::probe_rejected_when_foreground_busy_sc14
+    - cargo:sw-core::flash_session_core::unmatched_release_only_clears_same_probe
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  rpc_method:health.ping:
+    nodeids:
+    - cargo:sw-daemon::dispatch::health_ping_pong
+    owner_phase: P0
+  rpc_method:health.status:
+    nodeids:
+    - cargo:sw-daemon::dispatch::health_status_key_order_and_limits
+    owner_phase: P0
+  rpc_method:log.tail_raw:
+    nodeids:
+    - cargo:sw-daemon::dispatch::log_tail_raw_latest_mode_keys
+    owner_phase: P0
+  rpc_method:log.tail_text:
+    nodeids:
+    - cargo:sw-daemon::dispatch::log_tail_text_limit_zero_means_200
+    owner_phase: P0
+  rpc_method:mcu.patterns:
+    nodeids:
+    - tests/contract_blackbox/test_s24_mcu_rpc.py::test_patterns_exact_bytes
+    owner_phase: P8
+  rpc_method:mcu.status:
+    nodeids:
+    - tests/contract_blackbox/test_s24_mcu_rpc.py::test_status_idle_no_sessions
+    - tests/contract_blackbox/test_s24_mcu_rpc.py::test_status_candidates_and_ttymcu_lifecycle
+    owner_phase: P8
+  rpc_method:result.tail:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  rpc_method:session.activity:
+    nodeids:
+    - cargo:sw-daemon::dispatch::activity_selector_chain_session_id
+    owner_phase: P0
+  rpc_method:session.attach:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+    - cargo:sw-core::flash_session_core::probe_then_matched_enters_flashing_and_invalidates_human_input
+    - cargo:sw-core::flash_session_core::probe_rejected_when_foreground_busy_sc14
+    - cargo:sw-core::flash_session_core::unmatched_release_only_clears_same_probe
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  rpc_method:session.bind:
+    nodeids:
+    - cargo:sw-daemon::dispatch::gpx_rpc_bind_timeout_then_replug_persists_binding
+    owner_phase: P5
+  rpc_method:session.clear:
+    nodeids:
+    - cargo:sw-daemon::dispatch::wp58_g14_rpc_clear_ready_with_device_returns_null_last_error
+    owner_phase: P5
+  rpc_method:session.console_attach:
+    nodeids:
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  rpc_method:session.console_detach:
+    nodeids:
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  rpc_method:session.console_list:
+    nodeids:
+    - cargo:sw-core::session_core_lease::console_list_shape_sorted_and_prunes_stale
+    owner_phase: P8
+  rpc_method:session.get_state:
+    nodeids:
+    - cargo:sw-daemon::session_rpc_p7::session_public_fields_p7
+    owner_phase: P0
+  rpc_method:session.interactive_close:
+    nodeids:
+    - cargo:sw-daemon::dispatch::wp51_interactive_owner_policy
+    owner_phase: P6
+  rpc_method:session.interactive_open:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+    - cargo:sw-core::flash_session_core::probe_then_matched_enters_flashing_and_invalidates_human_input
+    - cargo:sw-core::flash_session_core::probe_rejected_when_foreground_busy_sc14
+    - cargo:sw-core::flash_session_core::unmatched_release_only_clears_same_probe
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  rpc_method:session.interactive_send:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet
+    - cargo:sw-core::flash_session_core::probe_then_matched_enters_flashing_and_invalidates_human_input
+    - cargo:sw-core::flash_session_core::probe_rejected_when_foreground_busy_sc14
+    - cargo:sw-core::flash_session_core::unmatched_release_only_clears_same_probe
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  rpc_method:session.interactive_status:
+    nodeids:
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  rpc_method:session.list:
+    nodeids:
+    - cargo:sw-daemon::dispatch::session_list_sorted_by_session_id
+    owner_phase: P0
+  rpc_method:session.log_start:
+    nodeids:
+    - cargo:sw-daemon::session_rpc_p7::log_rpcs_shapes
+    owner_phase: P5
+  rpc_method:session.log_status:
+    nodeids:
+    - cargo:sw-daemon::session_rpc_p7::log_rpcs_shapes
+    owner_phase: P0
+  rpc_method:session.log_stop:
+    nodeids:
+    - cargo:sw-daemon::session_rpc_p7::log_rpcs_shapes
+    owner_phase: P5
+  rpc_method:session.pin:
+    nodeids:
+    - cargo:sw-daemon::dispatch::contract_coverage_alias_unassign_pin_unpin_rpc_routes
+    owner_phase: P5
+  rpc_method:session.recover:
+    nodeids:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+    - cargo:sw-core::flash_session_core::probe_then_matched_enters_flashing_and_invalidates_human_input
+    - cargo:sw-core::flash_session_core::probe_rejected_when_foreground_busy_sc14
+    - cargo:sw-core::flash_session_core::unmatched_release_only_clears_same_probe
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+    owner_phase: P8
+  rpc_method:session.self_test:
+    nodeids:
+    - cargo:sw-daemon::dispatch::self_test_unknown_selector_has_lease_context_and_command_capable
+    owner_phase: P5
+  rpc_method:session.unpin:
+    nodeids:
+    - cargo:sw-daemon::dispatch::contract_coverage_alias_unassign_pin_unpin_rpc_routes
+    owner_phase: P5
+  rpc_method:wal.current_seq:
+    nodeids:
+    - cargo:sw-daemon::dispatch::wal_current_seq_shape
+    owner_phase: P0
+  rpc_method:wal.range:
+    nodeids:
+    - cargo:sw-daemon::dispatch::wal_range_keys_without_truncated
+    owner_phase: P0
+  rpc_method:wal.reset:
+    nodeids:
+    - cargo:sw-daemon::dispatch::wal_reset_shape
+    owner_phase: P5
+  schema:state_file:
+    nodeids:
+    - cargo:sw-core::state_store::python_bytes_roundtrip_exactly
+    owner_phase: P0
+  schema:wal_record:
+    nodeids:
+    - cargo:sw-proto::wal_types_golden::test_wal_record_to_line_golden
+    owner_phase: P0
+schema_version: 1
+# 參數化基底 nodeid 的必要參數完整集合（P8X-24c6b39-3）：判定器把基底展開成全部參數節點，
+# 每個都要收集且通過；集合須與 pytest 實際收集一致（tests/test_rust_contract_coverage.py 把關）。
+parametrized:
+  tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_tail_raw_reads_daemon_wal:
+  - latest
+  - from-seq
+  tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet:
+  - quiet
+  - quiet_human_explicit
+  - quiet_human_bare
+  - rpc_args
+  - not_found
+  - passthrough
+  - agent_lease
+  - foreground_busy
+  - command_during_transfer
+  tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_force_refuses_while_flashing:
+  - rollback
+  - update
+  tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_force_refuses_while_push:
+  - rollback
+  - update
+  - rollback-after-probe
+  tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_refuses_while_push:
+  - before_probe
+  - after_probe
+  tests/test_bench_connect_cli.py::test_bench_missing_endpoint_returns_structured_error_for_direct_cli_paths:
+  - argv0
+  - argv1
+  - argv2
+  tests/test_bench_connect_cli.py::test_connect_close_rejects_conflicting_stateful_tunnel_without_closing_or_clearing_state:
+  - existing_tunnel0
+  - existing_tunnel1
+  tests/test_bench_connect_cli.py::test_connect_parse_errors_return_structured_invalid_args:
+  - argv0
+  - argv1
+  - argv2
+  - argv3
+  - argv4
+  - argv5
+  - argv6
+  - argv7
+  - argv8
+  - argv9
+  tests/test_bench_connect_cli.py::test_nonempty_corrupted_remembered_endpoint_returns_invalid_bench_state:
+  - 'tcp://127.0.0.1:notaport'
+  - 'tcp://192.0.2.10:7777'
+  - 'unix:///tmp/serialwrap/serialwrapd.sock'
+  tests/test_command_completion.py::test_invalid_regex_direct_execute_rejects_before_any_tx:
+  - syntax
+  - empty
+  - bytes
+  - unicode-bytes
+  - type
+  - matches-empty
+  - invalid-unicode
+  - parser-recursion
+  tests/test_p1oc_sc34_last_error.py::test_attach_state_result_separates_last_error:
+  - CREDENTIALS_UNRESOLVED-None
+  - 'READY_NONCE_TIMEOUT-tail\u2026'
+  - None-None
+  tests/test_remote_tunnel.py::test_parse_target_rejects_bad:
+  - nohost
+  - 'host:'
+  - 'host:abc'
+  - 'host:-1'
+  - ''
+  - 'a@b@c:1'
+  tests/test_stage0_defect_fixes.py::test_daemon_bad_yaml_fails_before_daemon_action:
+  - start
+  - stop
+  - restart
+  - status
+  tests/test_stage0_gate_codes.py::test_file_rpc_rechecks_spoofed_human_as_agent:
+  - file.push-file_push-params0
+  - file.pull-file_pull-params1
+  tests/test_stage0_gate_codes.py::test_interactive_open_state_codes:
+  - RECOVERING
+  - FLASHING
+  tests/test_stage0_gate_codes.py::test_manager_quiet_window_returns_remaining_retry_after:
+  - execute_command
+  - file_push
+  tests/test_stage0_gate_codes.py::test_submit_time_state_codes:
+  - RECOVERING
+  - FLASHING
+  tests/test_stage0_handoff_stop.py::test_every_mutating_method_rejected_after_freeze:
+  - alias.assign
+  - alias.set
+  - alias.unassign
+  - command.cancel
+  - command.result_tail
+  - command.submit
+  - device.attach
+  - device.release
+  - event.com_disable
+  - event.com_enable
+  - event.reload
+  - event.reset
+  - event.rule_delete
+  - event.rule_set
+  - file.pull
+  - file.push
+  - result.tail
+  - session.attach
+  - session.bind
+  - session.clear
+  - session.console_attach
+  - session.console_detach
+  - session.interactive_close
+  - session.interactive_open
+  - session.interactive_send
+  - session.interactive_status
+  - session.log_start
+  - session.log_stop
+  - session.pin
+  - session.recover
+  - session.self_test
+  - session.unpin
+  - wal.reset
+  tests/test_stage0_platform_mgmt.py::test_daemon_restart_rejects_nonlocal_target_before_stop:
+  - argv0
+  - argv1
+  tests/test_stage0_session_drain.py::test_bc03_abort_mapping:
+  - account0-COMMAND_ABORTED_IN_FLIGHT
+  - account1-COMMAND_ABORTED_IN_FLIGHT
+  - account2-COMMAND_ABORTED_IN_FLIGHT
+  - account3-SEND_FAILED
+  - account4-FLUSHED_BY_RECOVERY
+# OD-99（2026-11-17）：依 rulings/s2.md §OD-99 逐 ID 記錄核准、既有 A/B 節點與平台排除。
+l1_only_approvals:
+  "bc:BC-01": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:BC-01 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:BC-03": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:BC-03 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:BC-04": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:BC-04 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:BC-05": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:BC-05 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-01": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-01 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-02": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-02 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-03": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-03 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-04": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-04 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-05": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-05 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-06": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-06 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-07": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-07 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-08": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-08 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-09": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-09 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-10": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-10 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-11": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-11 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-12": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-12 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-13": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-13 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-14": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-14 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-15": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-15 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-16": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-16 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-17": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-17 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-18": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-18 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-19": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-19 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-20": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-20 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-21": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-21 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-22": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-22 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-23": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-23 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-24": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-24 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-25": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-25 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-26": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-26 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:DF-27": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-27 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-01": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-01 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-02": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-02 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-03": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-03 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-04": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-04 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-05": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-05 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-06": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-06 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-07": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-07 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-09": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-09 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-10": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-10 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-11": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-11 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-12": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-12 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-13": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-13 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-14": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-14 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-15": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-15 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-16": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-16 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-18": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-18 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-19": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-19 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-20": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-20 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-21": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-21 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-22": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-22 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-23": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-23 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-24": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-24 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-25": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-25 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-27": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-27 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-28": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-28 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-30": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-30 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-31": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-31 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-32": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-32 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-34": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-34 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-35": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-35 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-36": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-36 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-37": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-37 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:SC-39": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:SC-39 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "case:sc14-flash-probe-eligibility": {l1_only: true, reason: "OD-99（2026-11-17）裁決：case:sc14-flash-probe-eligibility 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "case:sc35-passthrough-command-completion": {l1_only: true, reason: "OD-99（2026-11-17）裁決：case:sc35-passthrough-command-completion 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "case:sc35-passthrough-quiet-ready": {l1_only: true, reason: "OD-99（2026-11-17）裁決：case:sc35-passthrough-quiet-ready 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "schema:state_file": {l1_only: true, reason: "OD-99（2026-11-17）裁決：schema:state_file 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "schema:wal_record": {l1_only: true, reason: "OD-99（2026-11-17）裁決：schema:wal_record 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+legacy_l1_only_approvals:
+  error_code:ECHO_ACK_UNSUPPORTED: "P8X-24c6b39-4 既有例外：此錯誤碼只有 Rust 實作，Python 基線沒有等價節點。"
+legacy_rust_only_approvals:
+  case:sc36-win-installer-com0com-optional: "既有 Windows 安裝案例只覆蓋 Rust com0com 選用元件，沒有 Python 實作。"
+  error_code:ECHO_ACK_UNSUPPORTED: "P8X-24c6b39-4 既有例外：ECHO_ACK_UNSUPPORTED 僅由 Rust L1 契約驗證。"
+od99_ab_nodeids:
+  cli_cmd:alias list:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[alias.list_alias_list]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_alias_roundtrip
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_alias_roundtrip
+  cli_cmd:daemon restart:
+    nodeids:
+    - tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_restart_ab
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_restart_ab
+  cli_cmd:daemon start:
+    nodeids:
+    - tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_start_ab_conflict
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_start_ab_conflict
+  cli_cmd:daemon status:
+    nodeids:
+    - tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_start_stop_ab_real_daemon
+  cli_cmd:daemon stop:
+    nodeids:
+    - tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_start_stop_ab_real_daemon
+  cli_cmd:device list:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[device.list_device_list]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_device_mcu_health
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_device_mcu_health
+  cli_cmd:event list:
+    nodeids:
+    - tests/contract_blackbox/test_bb_event.py::test_event_subcommands_wire_params
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_rule_roundtrip
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_rule_roundtrip
+  cli_cmd:event show:
+    nodeids:
+    - tests/contract_blackbox/test_bb_event.py::test_event_subcommands_wire_params
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_show_returns_registered_rule
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_show_returns_registered_rule
+  cli_cmd:event status:
+    nodeids:
+    - tests/contract_blackbox/test_bb_event.py::test_event_subcommands_wire_params
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_status_lists_enabled_daemon_selector
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_status_lists_enabled_daemon_selector
+  cli_cmd:event tail:
+    nodeids:
+    - tests/contract_blackbox/test_bb_event.py::test_event_subcommands_wire_params
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_tail_reads_matcher_log
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_tail_reads_matcher_log
+  cli_cmd:log tail-raw:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[log.tail_raw_log_tail-raw]
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[log.tail_raw_log_tail-raw_--from-seq_0]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_tail_raw_reads_daemon_wal
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_tail_raw_reads_daemon_wal
+  cli_cmd:log tail-text:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[log.tail_text_log_tail-text_--com_COM2_--limit_5]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+  cli_cmd:profile test:
+    nodeids:
+    - tests/contract_blackbox/test_bb_profile.py::test_success
+  cli_cmd:remote stop:
+    nodeids:
+    - tests/contract_blackbox/test_cli_mgmt_remote.py::test_remote_ab_status_close_empty
+  cli_cmd:session activity:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[session.activity_session_activity_--selector_A]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_activity_reports_live_session
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_activity_reports_live_session
+  cli_cmd:session console-list:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[session.console_list_session_console-list_--selector_A]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_console_attach_detach
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_console_attach_detach
+  cli_cmd:session list:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[session.list_session_list]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_reaches_ready
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_reaches_ready
+  cli_cmd:session log-status:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[session.log_status_session_log-status_--selector_A]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_log_capture_lifecycle
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_log_capture_lifecycle
+  cli_cmd:wal current-seq:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[wal.current_seq_wal_current-seq]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+  cli_cmd:wal export:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[wal.range_wal_export]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+  rpc_method:alias.list:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[alias.list_alias_list]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_alias_roundtrip
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_alias_roundtrip
+  rpc_method:daemon.handoff_stop:
+    nodeids:
+    - tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_refuses_while_push[after_probe]
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_refuses_while_push[after_probe]
+  rpc_method:daemon.stop:
+    nodeids:
+    - tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_start_stop_ab_real_daemon
+  rpc_method:device.list:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[device.list_device_list]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_device_mcu_health
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_device_mcu_health
+  rpc_method:event.com_status:
+    nodeids:
+    - tests/contract_blackbox/test_bb_event.py::test_event_subcommands_wire_params
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_status_lists_enabled_daemon_selector
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_status_lists_enabled_daemon_selector
+  rpc_method:event.rule_get:
+    nodeids:
+    - tests/contract_blackbox/test_bb_event.py::test_event_subcommands_wire_params
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_show_returns_registered_rule
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_show_returns_registered_rule
+  rpc_method:event.rule_list:
+    nodeids:
+    - tests/contract_blackbox/test_bb_event.py::test_event_subcommands_wire_params
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_rule_roundtrip
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_rule_roundtrip
+  rpc_method:event.tail:
+    nodeids:
+    - tests/contract_blackbox/test_bb_event.py::test_event_subcommands_wire_params
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_tail_reads_matcher_log
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_tail_reads_matcher_log
+  rpc_method:health.ping:
+    nodeids:
+    - tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_start_stop_ab_real_daemon
+  rpc_method:health.status:
+    nodeids:
+    - tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_start_stop_ab_real_daemon
+  rpc_method:log.tail_raw:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[log.tail_raw_log_tail-raw]
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[log.tail_raw_log_tail-raw_--from-seq_0]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_tail_raw_reads_daemon_wal
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_tail_raw_reads_daemon_wal
+  rpc_method:log.tail_text:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[log.tail_text_log_tail-text_--com_COM2_--limit_5]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+  rpc_method:session.activity:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[session.activity_session_activity_--selector_A]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_activity_reports_live_session
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_activity_reports_live_session
+  rpc_method:session.console_list:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[session.console_list_session_console-list_--selector_A]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_console_attach_detach
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_console_attach_detach
+  rpc_method:session.get_state:
+    nodeids:
+    - tests/contract_blackbox/slice21/test_f1_cmd_contract.py::test_near_limit_no_logout
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/slice21/test_f1_cmd_contract.py::test_near_limit_no_logout
+  rpc_method:session.list:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[session.list_session_list]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_reaches_ready
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_reaches_ready
+  rpc_method:session.log_status:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[session.log_status_session_log-status_--selector_A]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_log_capture_lifecycle
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_log_capture_lifecycle
+  rpc_method:wal.current_seq:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[wal.current_seq_wal_current-seq]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+  rpc_method:wal.range:
+    nodeids:
+    - tests/contract_blackbox/test_bb_rpc_params.py::test_rpc_params_wire[wal.range_wal_export]
+    - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+    exclude_nodeids:
+      windows:
+      - tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+platform_exclusions:
+  cli_cmd:device attach:
+    linux:
+    - tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown
+    windows:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+    - tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits
+    - tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+  rpc_method:device.attach:
+    linux:
+    - tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown
+    windows:
+    - tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+    - tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits
+    - tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+    - tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+  error_code:DEVICE_STILL_HELD:
+    linux:
+    - tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown
+    windows:
+    - tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits
+    - tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns
+    - tests/test_stage0_uart_exclusive.py::TestAttachProbeDrain::test_attach_device_force_rejects_plain_external_holder
+  error_code:DAEMON_ALREADY_RUNNING:
+    linux:
+    - tests/test_lock_win.py::test_two_locks_same_path_second_raises
+exclusion_approvals:
+  cli_cmd:alias list:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_alias_roundtrip
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:daemon restart:
+    windows:
+    - nodeid: tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_restart_ab
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:daemon start:
+    windows:
+    - nodeid: tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_start_ab_conflict
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:device attach:
+    linux:
+    - nodeid: tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    windows:
+    - nodeid: tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    - nodeid: tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    - nodeid: tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    - nodeid: tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    - nodeid: tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+  cli_cmd:device list:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_device_mcu_health
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:event list:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_rule_roundtrip
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:event show:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_show_returns_registered_rule
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:event status:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_status_lists_enabled_daemon_selector
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:event tail:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_tail_reads_matcher_log
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:log tail-raw:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_tail_raw_reads_daemon_wal
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:log tail-text:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:session activity:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_activity_reports_live_session
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:session console-list:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_console_attach_detach
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:session list:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_reaches_ready
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:session log-status:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_log_capture_lifecycle
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:wal current-seq:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  cli_cmd:wal export:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  error_code:DAEMON_ALREADY_RUNNING:
+    linux:
+    - nodeid: tests/test_lock_win.py::test_two_locks_same_path_second_raises
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+  error_code:DEVICE_STILL_HELD:
+    linux:
+    - nodeid: tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    windows:
+    - nodeid: tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    - nodeid: tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    - nodeid: tests/test_stage0_uart_exclusive.py::TestAttachProbeDrain::test_attach_device_force_rejects_plain_external_holder
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+  rpc_method:alias.list:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_alias_roundtrip
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:daemon.handoff_stop:
+    windows:
+    - nodeid: tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_refuses_while_push[after_probe]
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:device.attach:
+    linux:
+    - nodeid: tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    windows:
+    - nodeid: tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    - nodeid: tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    - nodeid: tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    - nodeid: tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+    - nodeid: tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq
+      reason: slice24-05：此 nodeid 僅適用於明列的平台（Windows 原生／COM 或 POSIX），另一平台不收集；其他必要節點仍保留
+  rpc_method:device.list:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_device_mcu_health
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:event.com_status:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_status_lists_enabled_daemon_selector
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:event.rule_get:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_show_returns_registered_rule
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:event.rule_list:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_rule_roundtrip
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:event.tail:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_tail_reads_matcher_log
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:log.tail_raw:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_tail_raw_reads_daemon_wal
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:log.tail_text:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:session.activity:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_activity_reports_live_session
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:session.console_list:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_console_attach_detach
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:session.get_state:
+    windows:
+    - nodeid: tests/contract_blackbox/slice21/test_f1_cmd_contract.py::test_near_limit_no_logout
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:session.list:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_reaches_ready
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:session.log_status:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_log_capture_lifecycle
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:wal.current_seq:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留
+  rpc_method:wal.range:
+    windows:
+    - nodeid: tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_and_wal
+      reason: OD-99：此既有 A/B 覆蓋節點屬 POSIX／PTY 限定，Windows 不收集；其他必要節點仍保留

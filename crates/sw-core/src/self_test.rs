@@ -1,0 +1,69 @@
+//! `session.self_test` 分類（Slice 2.1 Task 14；05 §11 順序 0–15）。
+//!
+//! 分類本體在 `SessionCore::self_test_pre_probe`（需讀取 session 私有狀態）；本模組提供凍結簽章
+//! `classify_pre_probe` 與注入型別。nonce probe 由 `OpRunner`（`OpSpec::SelfTestProbe`）執行。
+
+use std::sync::Arc;
+
+use sw_pal::traits::{HolderReport, UartExclusive};
+use sw_proto::pyjson::PyDict;
+
+use crate::Mono;
+use crate::session_core::SessionCore;
+
+/// self-test 的前置觀測（由 actor 於 mailbox 外取得快照後注入）。
+pub struct SelfTestCtx {
+    pub device_present: bool,
+    pub holder: Option<HolderReport>,
+    pub by_id_realpath: Option<String>,
+    pub vtty_alive: Option<bool>,
+    /// 現行 bridge 的 IoWorker 快照（`bridge.snapshot()` 的 running／serial_alive；審查 F32）。
+    pub bridge: Option<crate::uart_bridge::WorkerSnapshot>,
+    pub strict_human_lock: bool,
+    pub now: Mono,
+}
+
+/// probe 成功／失敗回應共用的 bridge 欄位（pre-check 當下擷取）。
+#[derive(Clone, Debug)]
+pub struct SelfTestBase {
+    pub attached_real_path: Option<String>,
+    pub current_real_path: Option<String>,
+    pub bridge_generation: u64,
+    /// pre-check 當下的哨兵 vtty（`snapshot()["vtty"]`；審查 F30）。
+    pub attached_vtty: Option<String>,
+}
+
+/// 需要送出 probe 才能完成分類時回傳的待辦（nonce 與 timeout 由呼叫端轉為 TX）。
+pub struct NeedProbe {
+    pub probe: String,
+    pub nonce: String,
+    pub timeout_s: f64,
+    /// 已決定的欄位（回應字典的部分結果）。
+    pub partial: PyDict,
+    /// probe 結果回應的 bridge 欄位。
+    pub base: SelfTestBase,
+}
+
+/// self-test 的外部觀測注入（manager／測試設定；未設定時 RELEASED holder 視為無、哨兵 PTY 視為存活）。
+#[derive(Clone, Default)]
+pub struct SelfTestProbes {
+    /// RELEASED 分支的 `/proc` holder 掃描（`_probe_external_holder` 等價）。
+    pub holders: Option<Arc<dyn UartExclusive>>,
+    /// 哨兵 PTY slave 是否仍存在（`snapshot()["vtty_alive"]`；`None` 表示無哨兵）。未設定時依現行 vtty 路徑是否存在判定。
+    pub vtty_alive: Option<Arc<dyn Fn() -> Option<bool> + Send + Sync>>,
+    /// `vtty_alive` 未設定時判定哨兵路徑存在的函式（manager 注入 console 工廠的 `slave_path_exists`）；
+    /// `None` 時以 `std::path::Path::exists` 判定。
+    pub path_exists: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
+    /// 指定 epoch 的 IoWorker 快照（`snapshot()["running"]`／`["serial_alive"]`；審查 F32）；`None`＝無此 worker。
+    pub bridge_snapshot: Option<Arc<dyn Fn(u64) -> Option<crate::uart_bridge::WorkerSnapshot> + Send + Sync>>,
+    /// `_suggest_profile_from_rx` 的候選 template（manager 的全部 template，依載入順序；審查 F31）。
+    pub templates: Arc<Vec<sw_proto::config_types::ProfileTemplate>>,
+}
+
+/// probe 之前的分類（順序 0–15，05 §11）：能決定時回 `Ok(結果)`，否則回 `Err(NeedProbe)`。
+pub fn classify_pre_probe(core: &SessionCore, ctx: &SelfTestCtx) -> Result<PyDict, NeedProbe> {
+    core.self_test_pre_probe(ctx)
+}
+
+/// P7 Task 0 凍結的組裝器型別；保留供骨架編譯測試引用，實際回覆由 `SessionCore` 組裝。
+pub struct SelfTestFinal;

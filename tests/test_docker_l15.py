@@ -69,8 +69,22 @@ def _env(extra: dict[str, str] | None = None) -> dict[str, str]:
 
 def _run_script(script: Path, *args: str, env: dict[str, str] | None = None, timeout: int = 120):
     _require(script, "Task 17 runner")
-    return subprocess.run(["bash", str(script), *args], cwd=REPO, env=_env(env),
-                          capture_output=True, text=True, timeout=timeout)
+    try:
+        return subprocess.run(["bash", str(script), *args], cwd=REPO, env=_env(env),
+                              capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        def _text(value) -> str:
+            if isinstance(value, bytes):
+                return value.decode("utf-8", errors="replace")
+            return value or ""
+
+        stdout = _text(exc.stdout)
+        stderr = _text(exc.stderr)
+        raise AssertionError(
+            f"{script.name} 執行逾時（{timeout}s）：{' '.join(args)}\n"
+            f"--- stdout 尾端（最多 6000 字元）---\n{stdout[-6000:] or '（無輸出）'}\n"
+            f"--- stderr 尾端（最多 6000 字元）---\n{stderr[-6000:] or '（無輸出）'}"
+        ) from exc
 
 
 def _compose_services() -> dict:
@@ -293,10 +307,27 @@ def test_run_l15_dry_run_uses_sandbox_by_id():
 # POSIX-only（§10.4）：_run_script（tests/test_docker_l15.py:71）用 bash 執行 scripts/docker/*.sh；run-l15.sh:43／common.sh:7 需 POSIX bash 與 python3（WSL 路徑轉換 rc=127，Git Bash 缺 python3 rc=49）。
 @pytest.mark.posix_only
 @pytest.mark.process_rpc
-def test_run_l15_dry_run_labels_report():
+def test_run_l15_dry_run_labels_report(monkeypatch):
+    timeout_error = subprocess.TimeoutExpired(
+        ["bash", str(RUN_L15)], 900,
+        output=b"BuildKit: base image layer download pending",
+        stderr=b"registry transfer diagnostic",
+    )
+
+    def _timeout(*_args, **_kwargs):
+        raise timeout_error
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(subprocess, "run", _timeout)
+        with pytest.raises(AssertionError) as failure:
+            _run_script(RUN_L15, "func-test-bridge", "--dry-run")
+    assert "BuildKit: base image layer download pending" in str(failure.value)
+    assert "registry transfer diagnostic" in str(failure.value)
+
     r = _run_script(RUN_L15, "pytest-physical-uart", "--dry-run")
     assert r.returncode == 0, _tail(r)
     assert "--evidence-layer L1.5-docker" in r.stdout
+    assert "--progress plain" in r.stdout
     assert "-m posix_pty" in r.stdout
     assert "-m physical_uart" not in r.stdout
 
@@ -338,7 +369,7 @@ def test_run_l15_dry_run_uses_suite_entrypoint(suite, expected):
 # POSIX-only（§10.4）：_run_script（tests/test_docker_l15.py:71）用 bash 執行 scripts/docker/*.sh；run-l15.sh:43／common.sh:7 需 POSIX bash 與 python3（WSL 路徑轉換 rc=127，Git Bash 缺 python3 rc=49）。
 @pytest.mark.posix_only
 @pytest.mark.process_rpc
-def test_run_systemd_dry_run_asserts_dropin():
+def test_run_systemd_dry_run_asserts_dropin(tmp_path):
     r = _run_script(RUN_SYSTEMD, "--mode", "systemd-user", "--dry-run")
     assert r.returncode == 0, _tail(r)
     assert "systemctl --user show serialwrap -p Restart -p RefuseManualStart" in r.stdout
@@ -346,6 +377,36 @@ def test_run_systemd_dry_run_asserts_dropin():
     assert "RefuseManualStart=yes" in r.stdout
     assert "journalctl --user -u serialwrap -o cat" in r.stdout
     assert "build_dut_image.sh" not in r.stdout
+
+    old_bundle, new_bundle = tmp_path / "old", tmp_path / "new"
+    old_bundle.mkdir()
+    new_bundle.mkdir()
+    (old_bundle / "release-manifest.json").write_text(
+        json.dumps({"bundle_version": "0.4.1"}), encoding="utf-8"
+    )
+    current_version = (REPO / "VERSION").read_text(encoding="utf-8").strip()
+    (new_bundle / "release-manifest.json").write_text(
+        json.dumps({"bundle_version": current_version}), encoding="utf-8"
+    )
+    update = _run_script(
+        RUN_SYSTEMD,
+        "--mode", "systemd-user", "--scenario", "update-exit1",
+        "--bundle-old", str(old_bundle), "--bundle-new", str(new_bundle),
+        "--out", str(tmp_path / "evidence"), "--dry-run",
+    )
+    assert update.returncode == 0, _tail(update)
+    assert f"mounted 0.4.1／{current_version} dev bundles" in update.stdout
+
+    bridge_src = str(REPO / "tools" / "uart_stdio_bridge" / "src")
+    sys.path.insert(0, bridge_src)
+    sys.path.insert(0, str(REPO))
+    try:
+        from scripts.docker import run_systemd_container  # noqa: PLC0415
+    finally:
+        sys.path.remove(str(REPO))
+        sys.path.remove(bridge_src)
+    assert run_systemd_container.OLD_VERSION == "0.4.1"
+    assert run_systemd_container.NEW_VERSION == current_version
 
 
 # POSIX-only（§10.4）：_run_script（tests/test_docker_l15.py:71）用 bash 執行 scripts/docker/*.sh；run-l15.sh:43／common.sh:7 需 POSIX bash 與 python3（WSL 路徑轉換 rc=127，Git Bash 缺 python3 rc=49）。
@@ -513,8 +574,10 @@ def test_docker_smoke_two_container(tmp_path):
     # 本檔未註冊 docker marker（P0 T14 註冊表）；能力缺失以執行期能力式 SKIP 表達
     if not _docker_available():
         pytest.skip("cap_missing:docker：本機無可用 docker daemon（能力式 SKIP，證據不足，非 PASS）")
+    # hosted runner 曾在 systemd image 建置超過 900 秒；本機完整命令 102.62 秒、冷建該 image 97.44 秒。
+    # 延長上限保留慢速 runner 的完成機會，逾時仍 FAIL，並由 _run_script 附上 BuildKit 輸出尾端。
     r = _run_script(RUN_L15, "func-test-bridge", "--case", "sm-01-attach-to-ready", "--out", str(tmp_path),
-                    timeout=900)
+                    timeout=1800)
     assert r.returncode == 0, _tail(r) + _selftest_diag(tmp_path)
     report_path = tmp_path / "l15-docker-report.json"
     assert report_path.is_file(), "run-l15.sh 未寫出 l15-docker-report.json"

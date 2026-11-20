@@ -1,0 +1,29 @@
+   Compiling sw-core v0.3.2 ($WORKTREE/crates/sw-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.05s
+     Running tests/mailbox.rs (target/debug/deps/mailbox-661a0189be724e06)
+
+running 22 tests
+test actor_probe_records_pre_dependency_data_for_drain_receipt ... ok
+test actor_ticks_passthrough_ready_without_followup_event ... ok
+test control_first_when_independent ... ok
+test control_lane_bounded_256 ... ok
+test control_waits_for_dependent_rx ... ok
+test data_lane_bounded_1024 ... ok
+test dependency_released_on_worker_stopped ... ok
+test fake_clock_advance_observes_drain_timeout_in_session ... ok
+test fake_clock_advance_wakes_timer_promptly ... ok
+test full_dependency_stash_does_not_block_independent_release ... ok
+test full_dependency_stash_does_not_block_worker_receipt ... ok
+test independent_control_served_while_dependent_stashed ... ok
+test lane_witness_counts_data_returned_via_stopped_and_pending_paths ... ok
+test op_finished_waits_for_dependent_rx ... ok
+test pre_dependency_data_excludes_later_and_other_epoch_data ... ok
+test receipt_without_dependency_has_zero_pre_dependency_data ... ok
+test request_timeout_returns_internal_timeout ... ok
+test stale_epoch_dependency_released_immediately ... ok
+test stash_bounded_16 ... ok
+test stopped_receipt_records_pre_dependency_data ... ok
+test witness_counts_data_overtaking_stopped_receipt ... ok
+test zero_rx_dependency_is_ready_on_current_epoch ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s

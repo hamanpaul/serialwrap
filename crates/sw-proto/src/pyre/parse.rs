@@ -526,9 +526,21 @@ impl Parser<'_> {
                 }
                 Ok((Expr::Backreference { index }, true))
             }
-            _ => {
+            None => Err(self.error("unexpected end of pattern", Some(self.pos))),
+            Some('\\') => match self.chars.get(self.pos + 1) {
+                None => Err(self.error("bad escape (end of pattern)", Some(self.pos))),
+                Some(&ch) => {
+                    self.consume_token();
+                    Err(self.error(
+                        &format!("unknown extension ?P\\{ch}"),
+                        Some(open + 1),
+                    ))
+                }
+            },
+            Some(ch) => {
+                // 保留 P7 的錯誤文字，同時依 P5 tokenizer 消費完整 token。
                 self.consume_token();
-                Err(self.error("unknown extension ?P", Some(open + 1)))
+                Err(self.error(&format!("unknown extension ?P{ch}"), Some(open + 1)))
             }
         }
     }
@@ -572,7 +584,7 @@ impl Parser<'_> {
         if self.peek() == Some('|') {
             self.pos += 1;
             no_branches.push(self.parse_sequence(true, open, nested_depth)?);
-            while self.peek() == Some('|') {
+            if self.peek() == Some('|') {
                 return Err(self.error(
                     "conditional backref with more than two branches",
                     Some(self.pos),

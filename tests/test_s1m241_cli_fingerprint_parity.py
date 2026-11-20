@@ -1020,5 +1020,3 @@ def test_s1m241_setup_stale_systemd_no_restart_reports_skipped(bundle, tmp_path:
         assert ["--user", "restart", "serialwrap"] not in calls
     finally:
         _stop_daemon(daemon, endpoint)
-
-

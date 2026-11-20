@@ -16,6 +16,8 @@ import pytest
 
 from bb_harness import isolated_env, repo_root
 from bb_l15 import (
+    OLD_BUNDLE_VERSION,
+    NEW_BUNDLE_VERSION,
     BridgeTarget,
     RaisingThread,
     assert_no_tx_after,
@@ -74,7 +76,7 @@ def _start_rig(tmp_path: Path, env: dict[str, str], *, delay_ms: int = 1):
     profile_dir = prepare_profile(env)
     bridge = BridgeTarget.start(tmp_path / "bridge", env, delay_ms=delay_ms)
     try:
-        daemon = start_python_daemon(env, profile_dir)
+        daemon = start_python_daemon(env, profile_dir, bridge=bridge)
     except BaseException:
         bridge.stop()
         raise
@@ -137,7 +139,7 @@ def test_fresh_install_blackbox(tmp_path: Path) -> None:
 @pytest.mark.posix_pty
 @pytest.mark.pidns_rig
 def test_update_rollback_ab_isolated(tmp_path: Path, env: dict[str, str]) -> None:
-    """透過 bridge 以 0.4.0 安裝、更新至 0.4.1，再以真正 rollback 還原 0.4.0。"""
+    """透過 bridge 以 0.4.1 安裝、更新至目前版本，再以真正 rollback 還原 0.4.1。"""
     old, new = update_bundles()
     old_cli, _root = _install_old(tmp_path, env, old)
     bridge, daemon = _start_rig(tmp_path, env)
@@ -146,16 +148,16 @@ def test_update_rollback_ab_isolated(tmp_path: Path, env: dict[str, str]) -> Non
         before_pid = daemon_pid(env)
         update = run_cli(new_cli, ["setup", "--on-demand"], env, timeout_s=180.0)
         assert update.returncode == 0, update.stdout + update.stderr
-        assert installed_version(env) == "0.4.1"
+        assert installed_version(env) == NEW_BUNDLE_VERSION
         after_update_pid = daemon_pid(env)
         assert after_update_pid != before_pid
         assert wait_session(env)["state"] == "READY"
 
         rollback = run_cli(new_cli, ["setup", "--rollback"], env, timeout_s=180.0)
         assert rollback.returncode == 0, rollback.stdout + rollback.stderr
-        assert installed_version(env) == "0.4.0"
+        assert installed_version(env) == OLD_BUNDLE_VERSION
         status = rpc(env, "health.status")
-        assert status.get("ok") is True and status.get("version") == "0.4.0", status
+        assert status.get("ok") is True and status.get("version") == OLD_BUNDLE_VERSION, status
         assert daemon_pid(env) != after_update_pid
     finally:
         _stop_rig(bridge, daemon, old_cli, env)
@@ -241,7 +243,7 @@ def test_update_file_push_after_last_probe_l15(tmp_path: Path, env: dict[str, st
         assert data.get("error_code") == "SESSION_BUSY", data
         assert data.get("handoff") == "refused", data
         assert daemon_pid(env) == old_pid
-        assert installed_version(env) == "0.4.0"
+        assert installed_version(env) == OLD_BUNDLE_VERSION
         assert current_release_path(root).read_bytes() == current_bytes
         assert not any("shutdown" in json.dumps(row, ensure_ascii=False).lower() for row in wal_rows(env))
         push_thread.join(180.0)
@@ -305,7 +307,7 @@ def test_revert_new_daemon_push_not_aborted_l15(tmp_path: Path, env: dict[str, s
         assert report.get("revert_pending") is True, data
         assert report.get("revert_error", {}).get("error_code") == "SESSION_BUSY", data
         assert daemon_pid(env) == new_pid
-        assert installed_version(env) == "0.4.1"
+        assert installed_version(env) == NEW_BUNDLE_VERSION
         assert not any("shutdown" in json.dumps(row, ensure_ascii=False).lower() for row in wal_rows(env))
         push_thread.join(180.0)
         assert not push_thread.is_alive(), "1 MiB file push 未結束"
@@ -321,8 +323,8 @@ def test_revert_new_daemon_push_not_aborted_l15(tmp_path: Path, env: dict[str, s
         select_bundle(env, old)
         recovery = run_cli(old_cli, ["setup", "--on-demand"], env, timeout_s=180.0)
         assert recovery.returncode == 0, recovery.stdout + recovery.stderr
-        assert installed_version(env) == "0.4.0"
-        assert rpc(env, "health.status").get("version") == "0.4.0"
+        assert installed_version(env) == OLD_BUNDLE_VERSION
+        assert rpc(env, "health.status").get("version") == OLD_BUNDLE_VERSION
     finally:
         if update_thread.is_alive():
             resume_pause(pause_dir, "start_and_verify:started")
@@ -369,7 +371,7 @@ def test_update_push_after_freeze_zero_tx_l15(tmp_path: Path, env: dict[str, str
         assert not update_thread.is_alive(), "setup update 未在 120 秒內結束"
         update = update_rows[0]
         assert update.returncode == 0, update.stdout + update.stderr
-        assert installed_version(env) == "0.4.1"
+        assert installed_version(env) == NEW_BUNDLE_VERSION
         assert wait_session(env)["state"] == "READY"
     finally:
         if update_thread.is_alive():
@@ -452,7 +454,7 @@ def test_update_background_triggers_zero_tx_in_drain_window_l15(tmp_path: Path, 
         assert not update_thread.is_alive(), "setup update 未在 120 秒內結束"
         update = update_rows[0]
         assert update.returncode == 0, update.stdout + update.stderr
-        assert installed_version(env) == "0.4.1"
+        assert installed_version(env) == NEW_BUNDLE_VERSION
         assert wait_session(env)["state"] == "READY"
     finally:
         if console_fd is not None:
@@ -472,7 +474,7 @@ def test_update_systemd_exit1_not_relaunched_l15(tmp_path: Path, env: dict[str, 
     """經 run-systemd.sh 實跑兩版 bundle：舊 daemon exit 1 時 NRestarts 為零、holder 不重疊且新版本就緒。"""
     old, new = update_bundles()
     # 比照 release／run-upgrade：容器只有系統 Python，不能使用綁定 hosted toolcache 的 venv。
-    for bundle, version in ((old, "0.4.0"), (new, "0.4.1")):
+    for bundle, version in ((old, OLD_BUNDLE_VERSION), (new, NEW_BUNDLE_VERSION)):
         cfg = bundle / "versions" / version / "py" / "pyvenv.cfg"
         assert cfg.is_file(), f"Docker bundle 缺少 runtime 設定：{cfg}"
         runtime: dict[str, str] = {}

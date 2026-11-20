@@ -1,8 +1,4 @@
-"""P3-T17：WSL interop 的 Windows 原生執行腳本（win-runner.sh／win-test.sh）。
-
-需要 WSL interop（cmd.exe）與 cargo；缺任一即 SKIP（證據不足，非 PASS）。
-每個測試先斷言腳本存在，紅燈原因因此是「尚未實作」而非收集或執行期錯誤。
-"""
+"""P3-T17：Windows 原生執行腳本與離線證據契約。"""
 
 from __future__ import annotations
 
@@ -30,15 +26,26 @@ WIN_TEST = ROOT / "scripts/rust/win-test.sh"
 AB_BLACKBOX = ROOT / "scripts/rust/ab_blackbox.sh"
 WIN_BLACKBOX_SH = ROOT / "scripts/rust/win-blackbox.sh"
 WIN_BLACKBOX_PS1 = ROOT / "scripts/rust/win-blackbox.ps1"
+WIN_INTERACTIVE_L1_PS1 = ROOT / "scripts/rust/win-interactive-l1.ps1"
+SLICE21_JUDGE = ROOT / "scripts/rust/slice21_gate_judge.py"
 L1_LOCK = ROOT / "tests/acceptance/l1_required.lock.json"
 REPORT_DIR = ROOT / "target/win-test-report"
+OD89_INTERACTIVE_NODEIDS = [
+    "cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c",
+    "cargo:sw-pal::lock::cap_interactive_desktop__ctrl_break_stops_wait",
+]
+GFC_C_DAEMON_CTRL_NODEID = (
+    "cargo:sw-daemon::daemon_process::cap_interactive_desktop__windows_console_ctrl_triggers_orderly_stop"
+)
 BLACKBOX_PURITY_GUARDS = {
     "tests/contract_blackbox/test_bb_no_product_import.py::test_no_product_import_anywhere_in_blackbox",
     "tests/contract_blackbox/test_bb_harness_selftest.py::test_bb_standalone_writes_l1_report",
 }
-pytestmark = [pytest.mark.posix_only, pytest.mark.process_rpc,
-              pytest.mark.skipif(shutil.which("cmd.exe") is None or shutil.which("cargo") is None,
-                                 reason="需要 WSL interop 與 cargo（證據不足，非 PASS）")]
+pytestmark = [pytest.mark.posix_only, pytest.mark.process_rpc]
+REQUIRES_WSL_INTEROP = pytest.mark.skipif(
+    shutil.which("cmd.exe") is None or shutil.which("cargo") is None,
+    reason="需要 WSL interop 與 cargo（證據不足，非 PASS）",
+)
 XENV = {"CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER": "x86_64-w64-mingw32-gcc"}
 
 
@@ -72,6 +79,7 @@ def _runner(*args, env=None):
                           capture_output=True, env={**os.environ, **(env or {})}, check=False)
 
 
+@REQUIRES_WSL_INTEROP
 def test_runner_version_uses_crlf(win_exe):
     r = _runner(win_exe, "--version")
     version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
@@ -79,12 +87,14 @@ def test_runner_version_uses_crlf(win_exe):
     assert r.stdout == f"serialwrap {version}\r\n".encode()     # Q-05
 
 
+@REQUIRES_WSL_INTEROP
 def test_runner_propagates_nonzero_exit(win_exe):
     r = _runner(win_exe, "session")                              # argparse 錯 → 2
     assert r.returncode == 2
     assert b"\r\n" in r.stderr and b"usage: serialwrap session" in r.stderr
 
 
+@REQUIRES_WSL_INTEROP
 def test_runner_forwards_serialwrap_env(win_exe):
     r = _runner(win_exe, "--endpoint", "tcp://127.0.0.1:1", "session", "list", env={"SERIALWRAP_LOG_LEVEL": "INFO"})
     assert r.returncode == 2
@@ -92,6 +102,7 @@ def test_runner_forwards_serialwrap_env(win_exe):
     assert json.loads(first)["endpoint_id"] == "127.0.0.1:1"
 
 
+@REQUIRES_WSL_INTEROP
 def test_runner_cleans_or_keeps_staging(win_exe):
     keep = _runner(win_exe, "--version", env={"SW_WIN_KEEP": "1", "SW_WIN_PRINT_STAGING": "1"})
     staging = Path(keep.stderr.decode().strip().splitlines()[-1])
@@ -101,6 +112,7 @@ def test_runner_cleans_or_keeps_staging(win_exe):
     assert not Path(gone.stderr.decode().strip().splitlines()[-1]).exists()
 
 
+@REQUIRES_WSL_INTEROP
 def test_win_test_report_schema():
     assert WIN_TEST.is_file(), "scripts/rust/win-test.sh 尚未實作（P3-T17 Step 4）"
     r = subprocess.run([str(WIN_TEST), "--package", "sw-proto"], cwd=ROOT,
@@ -120,6 +132,7 @@ def test_win_test_report_schema():
     assert sum(row["outcome"] == "passed" for row in l1["results"]) == sum(e["passed"] for e in data["exes"])
 
 
+@REQUIRES_WSL_INTEROP
 def test_runner_stages_fixture_dir(win_exe, tmp_path):
     # golden 測試在 Windows 執行時必須讀得到資料：runner 要建 data\ 並設 SW_TEST_DATA_DIR
     assert WIN_TEST.is_file(), "scripts/rust/win-test.sh 尚未實作（P3-T17 Step 4）"
@@ -134,11 +147,43 @@ def test_runner_stages_fixture_dir(win_exe, tmp_path):
     shutil.rmtree(staging)
 
 
+@REQUIRES_WSL_INTEROP
 def test_win_test_injects_runner_under_wsl(tmp_path):
     assert WIN_TEST.is_file(), "scripts/rust/win-test.sh 尚未實作（P3-T17 Step 4）"
     out = subprocess.run(["bash", "-c", f"WSL_DISTRO_NAME= SW_WIN_TEST_PRINT_ENV=1 {ROOT}/scripts/rust/win-test.sh --dry-run"],
                          capture_output=True, text=True, check=False).stdout
     assert "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=" in out    # 本機為 WSL（binfmt_misc/WSLInterop 存在）
+
+
+@REQUIRES_WSL_INTEROP
+def test_win_test_dry_run_has_no_build_or_filesystem_side_effects(tmp_path):
+    """L1：dry-run 必須先於 cargo、mkdir、cp 與 bundle/staging 變更。"""
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    trace = tmp_path / "side-effects.log"
+    for command in ("cargo", "mkdir", "cp"):
+        wrapper = fake_bin / command
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' '{command} $*' >> \"$SW_WIN_TEST_SIDE_EFFECTS\"\n"
+            "exit 87\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": os.pathsep.join((str(fake_bin), "/usr/bin", "/bin", "/mnt/c/Windows/System32")),
+        "SW_WIN_TEST_SIDE_EFFECTS": str(trace),
+        "CARGO_TARGET_DIR": str(tmp_path / "target-must-not-exist"),
+    }
+    out = subprocess.run(
+        ["bash", str(WIN_TEST), "--package", "sw-daemon", "--dry-run"], cwd=ROOT, env=env,
+        capture_output=True, text=True, check=False,
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert not trace.exists(), trace.read_text(encoding="utf-8") if trace.exists() else ""
+    assert not (tmp_path / "target-must-not-exist").exists()
+    assert "cargo test --no-run" in out.stdout
 
 
 def test_blackbox_pytest_argv_matches_frozen_l1_selectors():
@@ -166,12 +211,31 @@ def test_blackbox_pytest_argv_matches_frozen_l1_selectors():
 
     win_script = WIN_BLACKBOX_PS1.read_text(encoding="utf-8-sig")
     invoke = win_script.split("function Invoke-Blackbox", 1)[1].split("$sourceRoot =", 1)[0]
-    assignment = re.search(r"\$arguments = @\((.*?)\)", invoke, re.DOTALL)
-    assert assignment, "Invoke-Blackbox 必須明確列出 pytest argv"
+    # console subset 是 slice22 的獨立 A/B 路徑；完整 Windows L1 argv 在一般分支，
+    # 必須與鎖內（含核准遷移後）selector 逐項一致。
+    subset_branches = invoke.split("if ($Subset -eq 'console') {", 1)[1]
+    console_subset, full_run = subset_branches.split("} else {", 1)
+    assignment = re.search(r"\$arguments = @\((.*?)\)", full_run, re.DOTALL)
+    assert assignment, "Invoke-Blackbox 一般分支必須明確列出 pytest argv"
     actual_windows = [single if single else double for single, double in re.findall(
         r"'([^']*)'|\"([^\"]*)\"", assignment.group(1)
     )]
     assert actual_windows == ["-3.12", "-m", "pytest", *windows_selector, "--junitxml=$JunitPath"]
+    console_assignment = re.search(r"\$arguments = @\((.*?)\)", console_subset, re.DOTALL)
+    assert console_assignment, "console A/B 必須明確列出 slice22 selector"
+    actual_console = [single if single else double for single, double in re.findall(
+        r"'([^']*)'|\"([^\"]*)\"", console_assignment.group(1)
+    )]
+    assert actual_console == [
+        "-3.12", "-m", "pytest",
+        "tests/contract_blackbox/slice22/test_console_telnet.py",
+        "tests/contract_blackbox/slice22/test_interactive_lease.py",
+        "-m", "core_portable or windows_native",
+        "--deselect", "tests/contract_blackbox/slice22/test_interactive_lease.py::test_soft_preempt_restore_and_replay",
+        "--deselect", "tests/contract_blackbox/slice22/test_interactive_lease.py::test_expiry_tick_restores_without_access",
+        "--deselect", "tests/contract_blackbox/slice22/test_interactive_lease.py::test_stash_dropped_does_not_replay",
+        "--junitxml=$JunitPath",
+    ]
     assert "--confcutdir" not in invoke
     assert "no:cacheprovider" not in invoke
     assert "xfail_strict" not in invoke
@@ -975,3 +1039,112 @@ def test_embedded_runtime_site_packages_include_pyserial():
     assert "import os, serial, yaml" in block
     assert "& (Join-Path $RuntimeRoot 'python.exe') -I -c 'import yaml, serial'" in block
     assert "-c 'import yaml'\n" not in block
+
+
+def test_win_interactive_l1_emits_od89_rows_and_importable_provenance(tmp_path):
+    """互動 L1 harness 執行 OD-89 兩列與 GFC-C daemon stop，並產出可匯入的 provenance。"""
+    assert WIN_INTERACTIVE_L1_PS1.is_file(), "scripts/rust/win-interactive-l1.ps1 尚未實作（OD-89）"
+    script = WIN_INTERACTIVE_L1_PS1.read_text(encoding="utf-8-sig")
+
+    specs = re.search(r"\$TestSpecs\s*=\s*@\((.*?)^\)", script, re.DOTALL | re.MULTILINE)
+    assert specs, "harness 必須明列 OD-89 的測試 selector"
+    nodeids = re.findall(r"(?im)^\s*Nodeid\s*=\s*'([^']+)'", specs.group(1))
+    assert nodeids == [*OD89_INTERACTIVE_NODEIDS, GFC_C_DAEMON_CTRL_NODEID]
+    assert "'--test', 'daemon_process'" in script
+    assert "heavy-slot serialwrap-gfxc nice -n 10 ionice -c2 -n7 cargo " in script
+    assert "--ignored" in script and "--exact" in script
+    assert "WT_SESSION" in script
+    assert "[Console]::IsInputRedirected" in script and "[Console]::IsOutputRedirected" in script
+    for forbidden_port in ("COM3", "COM4", "COM5", "COM24", "COM25"):
+        assert forbidden_port not in script
+
+    for field in (
+        "schema_version", "format", "runner", "platform", "argv", "markexpr", "counts", "resources",
+        "uart_kind", "not_collected_platform", "collected", "deselected", "results", "exit_code", "finished",
+        "core_portable_platform_skips", "provenance", "deployed_content",
+    ):
+        assert re.search(rf"(?im)^\s*{field}\s*=", script), f"l1-results.v1 缺欄位 {field}"
+    for field in ("cargo-l1-provenance.v1", "build_target", "git", "toolchain", "rustflags", "executables"):
+        assert field in script, f"provenance 缺欄位 {field}"
+
+    lock = json.loads(L1_LOCK.read_text(encoding="utf-8"))["sets"]
+    required = lock["s21_gate:cap_interactive_desktop"]["windows"]
+    assert set(OD89_INTERACTIVE_NODEIDS).issubset(required["nodeids"])
+    assert set(required["nodeids"]).issubset(nodeids)
+    report_argv = re.search(r"\$ReportArgv\s*=\s*@\((.*?)^\)", script, re.DOTALL | re.MULTILINE)
+    assert report_argv, "L1 report 必須明列 gate lock selector argv"
+    assert re.findall(r"'([^']*)'", report_argv.group(1)) == required["selector"]["argv"]
+    assert "df -BG --output=avail /mnt/d" in script
+
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
+    simulated = {
+        "schema_version": 2,
+        "format": "l1-results.v1",
+        "runner": "cargo",
+        "platform": "windows",
+        "argv": required["selector"]["argv"],
+        "markexpr": "",
+        "counts": {"all": {"passed": len(required["nodeids"]), "failed": 0, "skipped": 0}},
+        "resources": {},
+        "uart_kind": "native",
+        "not_collected_platform": [],
+        "collected": required["nodeids"],
+        "deselected": [],
+        "results": [
+            {
+                "nodeid": nodeid,
+                "outcome": "passed",
+                "skip_kind": None,
+                "phases": {"setup": "passed", "call": "passed", "teardown": "passed"},
+            }
+            for nodeid in required["nodeids"]
+        ],
+        "exit_code": 0,
+        "finished": True,
+        "core_portable_platform_skips": [],
+        "provenance": {
+            "schema": "cargo-l1-provenance.v1",
+            "platform": "windows",
+            "build_target": "x86_64-pc-windows-gnu",
+            "git": {"head": head, "clean": True, "end": {"head": head, "clean": True}},
+            "toolchain": {"rustc_vv": "rustc test", "rustc_vv_sha256": "0" * 64, "error": None},
+            "rustflags": {
+                "RUSTFLAGS": {"set": False, "sha256": None},
+                "CARGO_ENCODED_RUSTFLAGS": {"set": False, "sha256": None},
+            },
+            "executables": [],
+        },
+        "deployed_content": None,
+    }
+    source = tmp_path / "l1-results.json"
+    source.write_text(json.dumps(simulated, ensure_ascii=False) + "\n", encoding="utf-8")
+    import tests.acceptance.l1_judge as l1_judge
+
+    judged = l1_judge.judge(
+        simulated,
+        required["nodeids"],
+        platform="windows",
+        selector=required["selector"],
+    )
+    assert judged["verdict"] == "PASS", judged
+
+    run_dir = tmp_path / "gate-run"
+    imported = subprocess.run(
+        [
+            sys.executable, str(SLICE21_JUDGE), "import-windows-section",
+            "--run-dir", str(run_dir), "--name", "windows_cap_interactive_desktop",
+            "--candidate-commit", head, "--source", str(source),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert imported.returncode == 0, imported.stdout + imported.stderr
+    section = json.loads((run_dir / "sections/windows_cap_interactive_desktop.json").read_text(encoding="utf-8"))
+    accepted = json.loads((run_dir / "windows_cap_interactive_desktop/l1-results.json").read_text(encoding="utf-8"))
+    assert section["passed"] == len(required["nodeids"])
+    assert [row["nodeid"] for row in accepted["results"]] == required["nodeids"]
+
+    runbook = (ROOT / "docs/rust-refactor/owner-runbook-od29.md").read_text(encoding="utf-8")
+    assert "SW_WIN_EXTRA_FILES" in runbook and "wintask_stop_harness.exe" in runbook

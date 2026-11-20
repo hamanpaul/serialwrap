@@ -1,0 +1,908 @@
+#!/usr/bin/env bash
+# Slice 2.1 出口 gate（P5-T22；計畫 docs/rust-refactor/plans/06-slice21-daemon-core.md Task 22 Step 3）。
+#
+# 用法：scripts/rust/slice21_gate.sh [--dry-run] [--shared-evidence DIR] [--evidence-run] [--with-com-pair] [--run-id ID] [--out DIR]
+#   產出 <DIR>/<ID>/report.json（預設 DIR=target/slice21-gate），schema 見 tests/acceptance/slice21_gate_report.schema.json。
+#
+# 原則：
+# - 本腳本只負責「執行並記錄」每段 exit 與 l1-results；section 狀態與 verdict 一律由
+#   scripts/rust/slice21_gate_judge.py 計算（gate 腳本本身不判定）。
+# - --dry-run 只產生報告骨架與 BLOCKED-OWNER 清單，各 section EVIDENCE_MISSING，verdict 永遠 INCOMPLETE。
+# - 需 Windows 原生、com0com、bench 或擁有者的證據一律 EVIDENCE_MISSING／BLOCKED-OWNER，不得標 PASS。
+# - §5.3 開工前凍結檢查：event_latency 未凍結時拒絕開跑（INSUFFICIENT_EVIDENCE，exit 3），不得以 skip 或 PASS 代替。
+#   --evidence-run：凍結檢查未通過時仍執行各 section 以取得證據（第三輪新增）；preflight 照實寫入報告，judge 依
+#   `event_latency_frozen: false` 一律判 INCOMPLETE（永不 READY），結束碼同 INCOMPLETE（3）。
+# 正式執行要求工作樹乾淨；非空以專用結束碼 4 停止，不建立 run 輸出。
+# 結束碼：--dry-run 一律 0；READY_FOR_OWNER_EVIDENCE→0、FAIL→1、INCOMPLETE→3、參數／工具錯誤→2、工作樹不乾淨→4。
+set -euo pipefail
+export CARGO_INCREMENTAL=0
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+JUDGE="$ROOT/scripts/rust/slice21_gate_judge.py"
+DRY_RUN=0
+EVIDENCE_RUN=0
+WITH_COM_PAIR=0
+RUN_ID=""
+OUT_DIR="$ROOT/target/slice21-gate"
+SHARED_EVIDENCE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --shared-evidence)
+      [[ $# -ge 2 ]] || { echo "slice21_gate.sh: --shared-evidence 缺少值" >&2; exit 2; }
+      SHARED_EVIDENCE="$2"; shift 2 ;;
+    --evidence-run) EVIDENCE_RUN=1; shift ;;
+    --with-com-pair) WITH_COM_PAIR=1; shift ;;
+    --run-id)
+      [[ $# -ge 2 ]] || { echo "slice21_gate.sh: --run-id 缺少值" >&2; exit 2; }
+      RUN_ID="$2"; shift 2 ;;
+    --out)
+      [[ $# -ge 2 ]] || { echo "slice21_gate.sh: --out 缺少值" >&2; exit 2; }
+      OUT_DIR="$2"; shift 2 ;;
+    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
+    *) echo "slice21_gate.sh: 未知參數 $1" >&2; exit 2 ;;
+  esac
+done
+
+[[ -n "$RUN_ID" ]] || RUN_ID="$(date +%y%m%d-%H%M%S)"
+if [[ ! "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "slice21_gate.sh: --run-id 只允許英數與 ._-：$RUN_ID" >&2
+  exit 2
+fi
+RUN_DIR="$OUT_DIR/$RUN_ID"
+if [[ "$DRY_RUN" != "1" ]]; then
+  if ! WORKTREE_STATUS="$(git -C "$ROOT" status --porcelain --untracked-files=normal)"; then
+    echo "slice21_gate.sh: 無法檢查工作樹狀態；拒絕正式執行" >&2
+    exit 2
+  fi
+  if [[ -n "$WORKTREE_STATUS" ]]; then
+    printf 'slice21_gate.sh: 工作樹不乾淨；正式執行前請先提交或清理變更（git status --porcelain --untracked-files=normal）：\n%s\n' \
+      "$WORKTREE_STATUS" >&2
+    exit 4
+  fi
+fi
+if [[ "$DRY_RUN" == "1" && -n "$SHARED_EVIDENCE" ]]; then
+  echo "shared-evidence import：debug/release artifacts、pytest_full、cargo_fakes_filtered、Windows 原生 L1（$SHARED_EVIDENCE）；selector/provenance 不符即 EVIDENCE_MISSING，不重跑。artifact provenance 不符：EVIDENCE_MISSING，不啟動本地建置。"
+fi
+if [[ -e "$RUN_DIR/report.json" ]]; then
+  echo "slice21_gate.sh: $RUN_DIR/report.json 已存在，拒絕覆寫（請換 --run-id）" >&2
+  exit 2
+fi
+mkdir -p "$RUN_DIR/sections" "$RUN_DIR/logs"
+STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+cd "$ROOT"
+CANDIDATE_COMMIT="$(git rev-parse HEAD)"
+if [[ "$DRY_RUN" == "1" ]]; then
+  source "$ROOT/scripts/rust/gate_prereqs.sh" --dry-run
+else
+  source "$ROOT/scripts/rust/gate_prereqs.sh" --gate
+fi
+
+LINUX_TARGET="x86_64-unknown-linux-gnu"
+WIN_TARGET="x86_64-pc-windows-gnu"
+RUST_CLI="$ROOT/target/$LINUX_TARGET/release/serialwrap"
+RUST_D="$ROOT/target/$LINUX_TARGET/release/serialwrapd"
+WIN_D="$ROOT/target/$WIN_TARGET/release/serialwrapd.exe"
+SHARED_ARTIFACTS_VALID=0
+SHARED_ARTIFACT_DIR="$RUN_DIR/shared-artifacts"
+SHARED_ARTIFACT_ARGS=()
+if [[ -n "$SHARED_EVIDENCE" && "$DRY_RUN" != "1" ]]; then
+  if python3 scripts/rust/gate_shared_evidence.py import-artifacts --shared-evidence "$SHARED_EVIDENCE" \
+      --out-dir "$SHARED_ARTIFACT_DIR" >"$RUN_DIR/logs/shared-artifacts.json" \
+      2>"$RUN_DIR/logs/shared-artifacts.stderr"; then
+    SHARED_ARTIFACTS_VALID=1
+    RUST_CLI="$SHARED_ARTIFACT_DIR/release/serialwrap"
+    RUST_D="$SHARED_ARTIFACT_DIR/release/serialwrapd"
+    SHARED_ARTIFACT_ARGS=(--artifact "debug_cli=$SHARED_ARTIFACT_DIR/debug/serialwrap" \
+      --artifact "debug_daemon=$SHARED_ARTIFACT_DIR/debug/serialwrapd" \
+      --artifact "release_cli=$RUST_CLI" --artifact "release_daemon=$RUST_D")
+  fi
+fi
+
+record() {  # record <name> [record-section 參數…]
+  local name="$1"; shift
+  python3 "$JUDGE" record-section --run-dir "$RUN_DIR" --name "$name" "$@"
+}
+
+# 執行一段命令：stdout／stderr 寫入 logs/<name>.log，回傳值存入全域 LAST_RC（不中斷整體 gate）。
+LAST_RC=0
+run_logged() {  # run_logged <log 名稱> <命令…>
+  local log="$RUN_DIR/logs/$1.log"; shift
+  printf '+ %q' "$@" >"$log"; printf '\n' >>"$log"
+  set +e
+  "$@" >>"$log" 2>&1
+  LAST_RC=$?
+  set -e
+  return 0
+}
+
+SHARED_L1_RC=""
+shared_windows_l1() {  # shared_windows_l1 <required-set> <gate> <output-dir>
+  local set_id="$1" gate="$2" output="$3"
+  local result="$RUN_DIR/logs/shared-windows-${set_id}.json"
+  [[ "$SHARED_ARTIFACTS_VALID" == "1" ]] || return 3
+  if ! python3 scripts/rust/gate_shared_evidence.py import-section \
+      --shared-evidence "$SHARED_EVIDENCE" --gate "$gate" --section "windows_l1:$set_id" \
+      --required-set "$set_id" --platform windows "${SHARED_ARTIFACT_ARGS[@]}" --out-dir "$output" \
+      >"$result" 2>"$RUN_DIR/logs/shared-windows-${set_id}.stderr"; then
+    return 3
+  fi
+  SHARED_L1_RC="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["exit_code"])' "$result")"
+  return 0
+}
+
+# §5.3 開工前凍結檢查（event_latency 凍結與審閱紀錄、無 pending_owner_decision）。
+python3 - "$ROOT/contracts/resource_limits.yaml" "$RUN_DIR/preflight.json" <<'PY'
+import json, sys
+import yaml
+
+src, out = sys.argv[1], sys.argv[2]
+reasons = []
+try:
+    doc = yaml.safe_load(open(src, encoding="utf-8")) or {}
+except Exception as exc:  # noqa: BLE001
+    doc = {}
+    reasons.append(f"resource_limits.yaml 無法讀取：{exc}")
+ev = doc.get("event_latency") or {}
+if ev.get("freeze_status") != "frozen":
+    reasons.append(f"event_latency.freeze_status={ev.get('freeze_status')!r}（須為 frozen）")
+for key in ("reviewed_by", "reviewed_at", "review_conclusion"):
+    if not ev.get(key):
+        reasons.append(f"event_latency.{key} 未附入")
+if ev.get("reviewed_by") and ev.get("reviewed_by") == ev.get("owner"):
+    reasons.append("event_latency.reviewed_by 不得等於 owner")
+def walk(node):
+    if isinstance(node, dict):
+        od = node.get("owner_decision")
+        if isinstance(od, dict) and od.get("status") == "pending_owner_decision":
+            yield node
+        for v in node.values():
+            yield from walk(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from walk(v)
+pending = list(walk(doc.get("limits") or {}))
+if pending:
+    reasons.append(f"limits 內仍有 {len(pending)} 列 owner_decision.status: pending_owner_decision（NC-P5-01）")
+json.dump({"event_latency_frozen": not reasons, "reasons": reasons}, open(out, "w", encoding="utf-8"),
+          ensure_ascii=False, indent=1)
+PY
+PREFLIGHT_OK="$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["event_latency_frozen"]))' "$RUN_DIR/preflight.json")"
+
+assemble() {  # assemble [額外 assemble 參數…]
+  local extra=()
+  [[ "$DRY_RUN" == "1" ]] && extra+=(--dry-run)
+  python3 "$JUDGE" assemble --run-dir "$RUN_DIR" --run-id "$RUN_ID" --started-at "$STARTED_AT" \
+    --candidate-commit "$CANDIDATE_COMMIT" --preflight "$RUN_DIR/preflight.json" "${extra[@]}" "$@"
+}
+
+exit_for_verdict() {
+  local v
+  v="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["verdict"])' "$RUN_DIR/report.json")"
+  echo "slice21_gate.sh: verdict=$v（$RUN_DIR/report.json）"
+  if [[ "$DRY_RUN" == "1" ]]; then exit 0; fi
+  case "$v" in
+    READY_FOR_OWNER_EVIDENCE) exit 0 ;;
+    FAIL) exit 1 ;;
+    *) exit 3 ;;
+  esac
+}
+
+com_reason="未提供 SW_TEST_COM_PAIR／--with-com-pair（BO-S21-01：擁有者 host COM20:COM21）"
+WIN_COM_PLAN_OK=1
+WIN_COM_ARGS=()
+WIN_COM_ARGV_TEXT="$(python3 "$JUDGE" windows-test-argv --section windows_cap_windows_com 2>/dev/null)" || WIN_COM_PLAN_OK=0
+if [[ "$WIN_COM_PLAN_OK" == "1" ]]; then
+  mapfile -t WIN_COM_ARGS <<<"$WIN_COM_ARGV_TEXT"
+fi
+WIN_COM_COMMAND='SW_TEST_CONSOLE_PAIR="${SW_TEST_CONSOLE_PAIR:-}" scripts/rust/win-test.sh'
+for arg in "${WIN_COM_ARGS[@]}"; do
+  printf -v quoted '%q' "$arg"
+  WIN_COM_COMMAND+=" $quoted"
+done
+
+if [[ "$DRY_RUN" == "1" || ( "$PREFLIGHT_OK" != "1" && "$EVIDENCE_RUN" != "1" ) ]]; then
+  why="dry-run：未執行"
+  [[ "$DRY_RUN" == "1" ]] || why="§5.3 開工前凍結檢查未通過：拒絕開跑（INSUFFICIENT_EVIDENCE）"
+  record cfg_boundary --reason "$why"
+  record linux_l1 --required-set s21_core --reason "$why"
+  record linux_cap_posix_pty --required-set s21_gate:linux_cap_posix_pty --reason "$why"
+  record linux_cap_posix_pty_workspace --required-set s21_gate:cap_posix_pty --reason "$why"
+  record linux_cap_sys_admin --required-set s21_gate:cap_sys_admin --reason "$why"
+  record linux_cap_supervisor_runtime --required-set s21_gate:cap_supervisor_runtime --reason "$why"
+  record py_parity --required-set s21_gate:py_parity_full --reason "$why"
+  record py_parity_windows --required-set s21_gate:py_parity --reason "$why；須以 shared-evidence --windows-l1 匯入原生 pytest L1"
+  record py_parity_76_80 --required-set s21_gate:py_parity_76_80 --reason "$why"
+  record windows_native_l1 --required-set s21_core --reason "$why；需原生 Windows（win-test.sh）"
+  if [[ "$WIN_COM_PLAN_OK" == "1" ]]; then
+    record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com --command "$WIN_COM_COMMAND" --reason "$com_reason"
+  else
+    record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com --reason "必要集合 selector 推導不出 windows_com argv（EVIDENCE_MISSING）"
+  fi
+  record windows_cap_windows_native --required-set s21_gate:cap_windows_native --reason "$why；需原生 Windows 本機證據（LOCAL-WINDOWS-TODO）"
+  record windows_cap_interactive_desktop --required-set s21_gate:cap_interactive_desktop --reason "$why；需原生 Windows 本機證據（LOCAL-WINDOWS-TODO）"
+  record windows_cap_supervisor_runtime --required-set s21_gate:cap_supervisor_runtime --reason "$why；需原生 Windows 本機證據（LOCAL-WINDOWS-TODO）"
+  record blackbox_python --required-set s21_gate:blackbox_python --reason "$why"
+  record blackbox_rust --required-set s21_gate:blackbox_rust --reason "$why"
+  record existing_suites_rust --required-set s21_gate:existing_suites_rust --reason "$why"
+  record l15_ab --reason "$why"
+  record event_latency --reason "$why"
+  record wal_s1w_perf --reason "$why；Windows 原生與 EDR 下正式量測屬 BO-S21-14"
+  record case_uptake --reason "$why"
+  record pytest_full --required-set s21_gate:pytest_full --reason "$why"
+  record policy_check --reason "$why"
+  assemble --cli-path "$RUST_CLI" --daemon-path "$RUST_D"
+  if [[ "$DRY_RUN" != "1" ]]; then
+    echo "slice21_gate.sh: INSUFFICIENT_EVIDENCE：$(python3 -c 'import json,sys; print("；".join(json.load(open(sys.argv[1]))["reasons"]))' "$RUN_DIR/preflight.json")" >&2
+  fi
+  exit_for_verdict
+fi
+
+# 1. cfg 邊界
+run_logged cfg_boundary python3 scripts/rust/check_cfg_boundary.py
+record cfg_boundary --command "python3 scripts/rust/check_cfg_boundary.py" --exit "$LAST_RC" \
+  --log logs/cfg_boundary.log --section-verdict "$([[ $LAST_RC == 0 ]] && echo PASS || echo FAIL)"
+
+# 2. Linux L1（s21_core）
+# F108（編排者裁決）：linux_l1 以非 root 執行。euid==0 時須以 SW_GATE_L1_USER（使用者名稱）經 setpriv 降權執行；
+# 無法降權即不執行、記 EVIDENCE_MISSING 並要求非 root 補跑（不得記 PASS，也不得以 root 專屬失敗記 FAIL）。
+# sol P5-54dd588-2：同一降權規則亦用於 linux_cap_posix_pty（其必要集合含 root 下必紅的 sw-pal 預設測試）。
+nonroot_cmd() {  # nonroot_cmd <輸出目錄> <命令…>：設定 NONROOT_CMD／NONROOT_EUID；euid==0 且無法降權回 1
+  local dir="$1"; shift
+  NONROOT_CMD=("$@")
+  NONROOT_EUID="$(id -u)"
+  [[ "$NONROOT_EUID" != 0 ]] && return 0
+  if [[ -n "${SW_GATE_L1_USER:-}" ]] && command -v setpriv >/dev/null 2>&1 && id -u "$SW_GATE_L1_USER" >/dev/null 2>&1; then
+    NONROOT_EUID="$(id -u "$SW_GATE_L1_USER")"
+    chown -R "$SW_GATE_L1_USER" "$dir"
+    NONROOT_CMD=(setpriv --reuid="$NONROOT_EUID" --regid="$(id -g "$SW_GATE_L1_USER")" --init-groups
+      env HOME="$(getent passwd "$SW_GATE_L1_USER" | cut -d: -f6)" "$@")
+    return 0
+  fi
+  return 1
+}
+mkdir -p "$RUN_DIR/linux_l1"
+if [[ -n "$SHARED_EVIDENCE" ]]; then
+  if [[ "$(id -u)" == 0 ]]; then
+    record linux_l1 --required-set s21_core --section-verdict EVIDENCE_MISSING --run-euid 0 \
+      --reason "共用 cargo 證據要求非 root 執行；本 gate 目前是 root，拒絕匯入或重跑"
+  elif [[ "$SHARED_ARTIFACTS_VALID" == "1" ]] && python3 scripts/rust/gate_shared_evidence.py import-section --shared-evidence "$SHARED_EVIDENCE" \
+      --gate slice21 --section cargo_fakes_filtered --required-set s21_core --platform linux \
+      "${SHARED_ARTIFACT_ARGS[@]}" --out-dir "$RUN_DIR/shared-import" \
+      >"$RUN_DIR/logs/shared-linux-l1-import.json" 2>"$RUN_DIR/logs/shared-linux-l1-import.stderr"; then
+    cp "$RUN_DIR/shared-import/s21_gate/linux-l1/l1-results.json" "$RUN_DIR/linux_l1/l1-results.json"
+    cp "$RUN_DIR/shared-import/logs/cargo-fakes-filtered.log" "$RUN_DIR/logs/linux_l1.log"
+    LAST_RC="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["exit_code"])' "$RUN_DIR/logs/shared-linux-l1-import.json")"
+    NONROOT_EUID="$(id -u)"
+    record linux_l1 --required-set s21_core --command "cargo_l1_results.py --platform linux -- --workspace --features test-fakes -- --skip cap_" \
+      --exit "$LAST_RC" --log logs/linux_l1.log --l1-results linux_l1/l1-results.json --run-euid "$NONROOT_EUID"
+  else
+    SHARED_REASON="$(python3 - "$RUN_DIR/logs/shared-linux-l1-import.json" "$RUN_DIR/logs/shared-linux-l1-import.stderr" <<'PY'
+import json, pathlib, sys
+try:
+    row=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+    print("；".join(row.get("reasons", [])) or row.get("status", "EVIDENCE_MISSING"))
+except (OSError, ValueError):
+    print(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8", errors="replace").strip() or "共用證據不可讀")
+PY
+    )"
+    record linux_l1 --required-set s21_core --section-verdict EVIDENCE_MISSING --run-euid "$(id -u)" \
+      --reason "共用證據拒收：$SHARED_REASON；未重跑"
+  fi
+elif nonroot_cmd "$RUN_DIR/linux_l1" python3 scripts/rust/cargo_l1_results.py --platform linux \
+    --out "$RUN_DIR/linux_l1/l1-results.json" -- --workspace --features test-fakes -- --skip cap_; then
+  run_logged linux_l1 "${NONROOT_CMD[@]}"
+  record linux_l1 --required-set s21_core --command "cargo_l1_results.py --platform linux -- --workspace --features test-fakes -- --skip cap_" \
+    --exit "$LAST_RC" --log logs/linux_l1.log --l1-results linux_l1/l1-results.json --run-euid "$NONROOT_EUID"
+else
+  record linux_l1 --required-set s21_core --section-verdict EVIDENCE_MISSING --run-euid 0 \
+    --reason "F108：gate 以 root 執行且無法降權（未設 SW_GATE_L1_USER 或無 setpriv）；linux_l1 須以非 root 補跑"
+fi
+
+# OD-53 --caps 推導（rulings/p5.md 第 7 輪：與 s22 gate 相同規則）：收集器的 --caps 與 argv 一律由鎖中該 section 必要集合的
+# selector 推導（`--ignored cap_<cap>__` → `--caps <cap>`；不含 ignored 篩選 → 不需 caps；argv＝required_set 的 selector），
+# 不在 gate 內手寫；推導不出即不執行、記 EVIDENCE_MISSING。sol P5-54dd588-2：計畫的 caps_only 為 true（每個必要集合都只選
+# ignored 能力列）時另帶 --caps-only，收集器略過預設 run、其餘收集列記 deselected。
+caps_args() {  # caps_args <section>：設定 CAPS_ARGV＝([--caps-only] --caps <cap>… -- <selector argv>)；推導不出回 1
+  local plan
+  plan="$(python3 "$JUDGE" caps-plan --section "$1" 2>/dev/null)" || return 1
+  mapfile -t CAPS_ARGV < <(python3 -c 'import json,sys; p=json.loads(sys.argv[1]); p["caps_only"] and print("--caps-only"); [print(x) for c in p["caps"] for x in ("--caps", c)]; print("--"); [print(a) for a in p["argv"]]' "$plan")
+}
+
+# 3. Linux cap_posix_pty
+#    sol P5-54dd588-2：必要集合含 sw-pal 預設測試（root 下數支必紅），比照 F108 以非 root 執行；無法降權即不執行、記 EVIDENCE_MISSING。
+mkdir -p "$RUN_DIR/linux_cap_posix_pty"
+if ! caps_args linux_cap_posix_pty; then
+  record linux_cap_posix_pty --required-set s21_gate:linux_cap_posix_pty --reason "必要集合的 selector 推導不出收集器 --caps（OD-53）"
+elif nonroot_cmd "$RUN_DIR/linux_cap_posix_pty" python3 scripts/rust/cargo_l1_results.py --platform linux \
+    --out "$RUN_DIR/linux_cap_posix_pty/l1-results.json" "${CAPS_ARGV[@]}"; then
+  run_logged linux_cap_posix_pty "${NONROOT_CMD[@]}"
+  record linux_cap_posix_pty --required-set s21_gate:linux_cap_posix_pty \
+    --command "cargo_l1_results.py --platform linux ${CAPS_ARGV[*]}" \
+    --exit "$LAST_RC" --log logs/linux_cap_posix_pty.log --l1-results linux_cap_posix_pty/l1-results.json --run-euid "$NONROOT_EUID"
+else
+  record linux_cap_posix_pty --required-set s21_gate:linux_cap_posix_pty --section-verdict EVIDENCE_MISSING --run-euid 0 \
+    --reason "F108／sol P5-54dd588-2：gate 以 root 執行且無法降權（未設 SW_GATE_L1_USER 或無 setpriv）；linux_cap_posix_pty 須以非 root 補跑"
+fi
+
+# 3a. 完整 workspace posix_pty 能力集合（slice21-01）：selector 逐字取 s21_gate:cap_posix_pty，涵蓋 sw-daemon 與 sw-pal。
+mkdir -p "$RUN_DIR/linux_cap_posix_pty_workspace"
+if ! caps_args linux_cap_posix_pty_workspace; then
+  record linux_cap_posix_pty_workspace --required-set s21_gate:cap_posix_pty --reason "必要集合 selector 推導不出收集器 --caps（OD-53）"
+elif nonroot_cmd "$RUN_DIR/linux_cap_posix_pty_workspace" python3 scripts/rust/cargo_l1_results.py --platform linux \
+    --out "$RUN_DIR/linux_cap_posix_pty_workspace/l1-results.json" "${CAPS_ARGV[@]}"; then
+  run_logged linux_cap_posix_pty_workspace "${NONROOT_CMD[@]}"
+  record linux_cap_posix_pty_workspace --required-set s21_gate:cap_posix_pty \
+    --command "cargo_l1_results.py --platform linux ${CAPS_ARGV[*]}" \
+    --exit "$LAST_RC" --log logs/linux_cap_posix_pty_workspace.log \
+    --l1-results linux_cap_posix_pty_workspace/l1-results.json --run-euid "$NONROOT_EUID"
+else
+  record linux_cap_posix_pty_workspace --required-set s21_gate:cap_posix_pty --section-verdict EVIDENCE_MISSING --run-euid 0 \
+    --reason "F108：gate 以 root 執行且無法降權（未設 SW_GATE_L1_USER 或無 setpriv）；linux_cap_posix_pty_workspace 須以非 root 補跑"
+fi
+
+# 3b. OD-55 linux 能力集合（P5 第 6 輪 SPEC-GAP #2，編排者裁決）：先探測能力，具備才以 --caps <cap> 實跑；
+#     否則記 EVIDENCE_MISSING 並附探測證據（所需能力、處置與實跑方式由 judge CAPABILITY_SECTIONS 補上），不得記 PASS。
+cap_probe() {  # cap_probe <cap>：印出 available:<證據> 或 unavailable:<證據>
+  local eff st
+  case "$1" in
+    sys_admin)
+      eff="$(awk '/^CapEff:/{print $2}' /proc/self/status 2>/dev/null || true)"
+      if [[ "$(id -u)" == 0 && -n "$eff" ]] && (( (16#$eff >> 21) & 1 )); then
+        echo "available:euid=0 CapEff=$eff"
+      else
+        echo "unavailable:euid=$(id -u) CapEff=${eff:-unknown}"
+      fi ;;
+    supervisor_runtime)
+      st="$(systemctl --user is-system-running 2>/dev/null || true)"
+      if [[ "$st" == running || "$st" == degraded ]]; then
+        echo "available:systemctl --user is-system-running=$st"
+      else
+        echo "unavailable:systemctl --user is-system-running=${st:-unavailable}"
+      fi ;;
+    *)
+      echo "unavailable:linux 主機（$(uname -s)）無法提供 cap_$1（需原生 Windows）" ;;
+  esac
+}
+# 擁有者裁決 2026-11-12（rulings/s2.md「OD-55 Windows 部分的完成方式」第 4 點）：windows_native／interactive_desktop 的 linux section 退役，改由 windows_cap_<cap> 承擔（見下方 LOCAL-WINDOWS 匯入）。
+for cap in sys_admin supervisor_runtime; do
+  sec="linux_cap_$cap"
+  # 編排者裁決 2026-11-17 第 3 點（slice21-04）：外部 root 容器證據須先核對 HEAD、鎖 selector 與 euid／CapEff；
+  # 環境變數有值但證據無效時只記 EVIDENCE_MISSING，不退回主機探測或執行，也不得把 sys_admin 改成可缺。
+  if [[ "$cap" == "sys_admin" && -n "${SW_GATE_SYS_ADMIN_RESULTS:-}" ]]; then
+    if ! python3 "$ROOT/scripts/rust/slice21_sys_admin_evidence.py" import-section \
+        --results "$SW_GATE_SYS_ADMIN_RESULTS" --run-dir "$RUN_DIR" --candidate-commit "$CANDIDATE_COMMIT" \
+        >"$RUN_DIR/logs/sys_admin_import.json" 2>"$RUN_DIR/logs/sys_admin_import.stderr"; then
+      IMPORT_REASON="匯入工具失敗：$(tr '\n' ' ' <"$RUN_DIR/logs/sys_admin_import.stderr")；拒絕作為 sys_admin 證據"
+      record "$sec" --required-set "s21_gate:cap_sys_admin" --section-verdict EVIDENCE_MISSING \
+        --capability-probe "sys_admin=unavailable:$IMPORT_REASON" --log logs/sys_admin_import.stderr --reason "$IMPORT_REASON"
+    fi
+    continue
+  fi
+  probe="$(cap_probe "$cap")"
+  if [[ "$probe" == available:* ]] && ! caps_args "$sec"; then
+    record "$sec" --required-set "s21_gate:cap_$cap" --capability-probe "$cap=$probe" \
+      --reason "必要集合的 selector 推導不出收集器 --caps（OD-53）"
+  elif [[ "$probe" == available:* ]]; then
+    mkdir -p "$RUN_DIR/$sec"
+    supervisor_before="$RUN_DIR/$sec/supervisor-runtime.before.json"
+    supervisor_after="$RUN_DIR/$sec/supervisor-runtime.after.json"
+    if [[ "$cap" == "supervisor_runtime" ]]; then
+      run_logged supervisor_runtime_before python3 "$JUDGE" supervisor-snapshot --out "$supervisor_before"
+      if [[ "$LAST_RC" -ne 0 ]]; then
+        record "$sec" --required-set "s21_gate:cap_$cap" --capability-probe "$cap=$probe" \
+          --exit "$LAST_RC" --log logs/supervisor_runtime_before.log --section-verdict EVIDENCE_MISSING \
+          --reason "OD-29 (3)：無法完整取得 supervisor_runtime 執行前的 systemctl 快照；未執行測試"
+        continue
+      fi
+    fi
+    run_logged "$sec" python3 scripts/rust/cargo_l1_results.py --platform linux \
+      --out "$RUN_DIR/$sec/l1-results.json" "${CAPS_ARGV[@]}"
+    supervisor_test_rc="$LAST_RC"
+    if [[ "$cap" == "supervisor_runtime" ]]; then
+      run_logged supervisor_runtime_after python3 "$JUDGE" supervisor-snapshot --out "$supervisor_after"
+      set +e
+      python3 "$JUDGE" supervisor-compare --before "$supervisor_before" --after "$supervisor_after" \
+        >"$RUN_DIR/logs/supervisor_runtime_guard.log" 2>&1
+      supervisor_guard_rc=$?
+      set -e
+      cat "$supervisor_before" "$supervisor_after" >>"$RUN_DIR/logs/supervisor_runtime_guard.log"
+      if [[ "$supervisor_guard_rc" -ne 0 ]]; then
+        record "$sec" --required-set "s21_gate:cap_$cap" --command "cargo_l1_results.py --platform linux ${CAPS_ARGV[*]}" \
+          --exit "$supervisor_test_rc" --log logs/supervisor_runtime_guard.log --section-verdict FAIL \
+          --reason "OD-29 (3)：supervisor_runtime 執行前後的 serialwrap* units／serialwrap.service MainPID 或 ActiveState 有變化；停止 gate"
+        assemble
+        exit 1
+      fi
+    fi
+    record "$sec" --required-set "s21_gate:cap_$cap" \
+      --command "cargo_l1_results.py --platform linux ${CAPS_ARGV[*]}" \
+      --exit "$supervisor_test_rc" --log "logs/$sec.log" --l1-results "$sec/l1-results.json" --capability-probe "$cap=$probe"
+  else
+    record "$sec" --required-set "s21_gate:cap_$cap" --capability-probe "$cap=$probe" \
+      --reason "能力探測：${probe#unavailable:}；未執行 --caps $cap"
+  fi
+done
+
+# 4／5. Windows 原生 L1 與 COM pair（win-test.sh；報告的 l1_results 複製進本 run）
+win_l1_into() {  # win_l1_into <section> <該次 win-test log>：只取本次命令輸出的 report path
+  local sec="$1" log="$2" rep l1
+  rep="$(python3 - "$RUN_DIR/$log" "$ROOT/target/win-test-report" <<'PY'
+import pathlib, sys
+log = pathlib.Path(sys.argv[1])
+root = pathlib.Path(sys.argv[2]).resolve()
+paths = []
+for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+    candidate = pathlib.Path(line.strip())
+    if not candidate.is_absolute() or candidate.parent.resolve() != root or not candidate.is_file():
+        continue
+    if candidate.name.startswith(("l1-results-", "summary-")) or not candidate.name.endswith(".json"):
+        continue
+    paths.append(candidate)
+print(paths[-1] if paths else "")
+PY
+)"
+  if [[ -z "$rep" ]]; then
+    WIN_IMPORT_REASON="本次 win-test log 未記錄可讀 report path"
+    return 1
+  fi
+  l1="$(python3 - "$rep" <<'PY'
+import json, pathlib, sys
+report = pathlib.Path(sys.argv[1])
+data = json.loads(report.read_text(encoding="utf-8"))
+name = data.get("l1_results")
+print(report.parent / name if isinstance(name, str) and name else "")
+PY
+)"
+  if [[ -z "$l1" || ! -f "$l1" ]]; then
+    WIN_IMPORT_REASON="本次 win-test report 沒有可讀 l1_results"
+    return 1
+  fi
+  if ! python3 "$JUDGE" check-windows-l1 --l1-results "$l1" --candidate-commit "$CANDIDATE_COMMIT" \
+      >"$RUN_DIR/logs/${sec}_provenance.log" 2>&1; then
+    WIN_IMPORT_REASON="$(tr '\n' ' ' <"$RUN_DIR/logs/${sec}_provenance.log")"
+    return 1
+  fi
+  cp "$l1" "$RUN_DIR/$sec/l1-results.json"
+  return 0
+}
+mkdir -p "$RUN_DIR/windows_native_l1" "$RUN_DIR/windows_cap_windows_com"
+if [[ -n "$SHARED_EVIDENCE" ]]; then
+  if shared_windows_l1 s21_core slice21 "$RUN_DIR/shared-import/windows-s21-core"; then
+    cp "$RUN_DIR/shared-import/windows-s21-core/l1-results.json" "$RUN_DIR/windows_native_l1/l1-results.json"
+    windows_native_rc="$SHARED_L1_RC"
+    if python3 "$JUDGE" check-windows-l1 --l1-results "$RUN_DIR/windows_native_l1/l1-results.json" \
+        --candidate-commit "$CANDIDATE_COMMIT" >"$RUN_DIR/logs/windows_native_l1-provenance.log" 2>&1; then
+      echo "已匯入 shared-evidence windows_l1:s21_core；未啟動 Windows runner。" >"$RUN_DIR/logs/windows_native_l1.log"
+      record windows_native_l1 --required-set s21_core --command "shared-evidence windows_l1:s21_core" \
+        --exit "$windows_native_rc" --log logs/windows_native_l1.log --l1-results windows_native_l1/l1-results.json
+    else
+      record windows_native_l1 --required-set s21_core --section-verdict EVIDENCE_MISSING \
+        --reason "共用 Windows L1 不符合候選 provenance；未重跑。" --log logs/windows_native_l1-provenance.log
+    fi
+  else
+    echo "EVIDENCE_MISSING：共用 s21_core Windows L1 拒收；本段不重跑。" >"$RUN_DIR/logs/windows_native_l1.log"
+    record windows_native_l1 --required-set s21_core --section-verdict EVIDENCE_MISSING \
+      --reason "共用 Windows L1 缺失或 provenance／selector 不符；未重跑。" --log logs/windows_native_l1.log
+  fi
+else
+  run_logged windows_native_l1 bash scripts/rust/win-test.sh --package sw-pal --package sw-core --package sw-daemon -- --features test-fakes -- --skip cap_
+  windows_native_rc="$LAST_RC"
+  win_l1_arg=()
+  if win_l1_into windows_native_l1 logs/windows_native_l1.log; then
+    win_l1_arg=(--l1-results windows_native_l1/l1-results.json)
+    record windows_native_l1 --required-set s21_core --command "scripts/rust/win-test.sh --package sw-pal --package sw-core --package sw-daemon" \
+      --exit "$windows_native_rc" --log logs/windows_native_l1.log "${win_l1_arg[@]}"
+  elif [[ "$windows_native_rc" -ne 0 ]]; then
+    record windows_native_l1 --required-set s21_core --command "scripts/rust/win-test.sh --package sw-pal --package sw-core --package sw-daemon" \
+      --exit "$windows_native_rc" --log logs/windows_native_l1.log --section-verdict FAIL --reason "$WIN_IMPORT_REASON"
+  else
+    record windows_native_l1 --required-set s21_core --command "scripts/rust/win-test.sh --package sw-pal --package sw-core --package sw-daemon" \
+      --exit 0 --log logs/windows_native_l1.log --section-verdict EVIDENCE_MISSING --reason "$WIN_IMPORT_REASON"
+  fi
+fi
+if [[ -n "$SHARED_EVIDENCE" ]]; then
+  if [[ "$WIN_COM_PLAN_OK" == "1" ]] && shared_windows_l1 s21_gate:windows_cap_windows_com slice21 "$RUN_DIR/shared-import/windows-s21-com"; then
+    cp "$RUN_DIR/shared-import/windows-s21-com/l1-results.json" "$RUN_DIR/windows_cap_windows_com/l1-results.json"
+    windows_com_rc="$SHARED_L1_RC"
+    echo "已匯入 shared-evidence windows_l1:s21_gate:windows_cap_windows_com；未啟動 Windows runner。" >"$RUN_DIR/logs/windows_cap_windows_com.log"
+    record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com --command "$WIN_COM_COMMAND" \
+      --exit "$windows_com_rc" --log logs/windows_cap_windows_com.log --l1-results windows_cap_windows_com/l1-results.json
+  else
+    echo "EVIDENCE_MISSING：共用 windows_com L1 缺失或 selector 不符；本段不重跑。" >"$RUN_DIR/logs/windows_cap_windows_com.log"
+    record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com --command "$WIN_COM_COMMAND" \
+      --section-verdict EVIDENCE_MISSING --reason "共用 Windows L1 缺失或 provenance／selector 不符；未重跑。" \
+      --log logs/windows_cap_windows_com.log
+  fi
+elif [[ "$WITH_COM_PAIR" == "1" && -n "${SW_TEST_COM_PAIR:-}" ]]; then
+  if [[ "$WIN_COM_PLAN_OK" != "1" ]]; then
+    record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com \
+      --reason "必要集合 selector 推導不出 windows_com argv（OD-53；EVIDENCE_MISSING）"
+  else
+    run_logged windows_cap_windows_com env "SW_TEST_CONSOLE_PAIR=${SW_TEST_CONSOLE_PAIR:-}" bash scripts/rust/win-test.sh "${WIN_COM_ARGS[@]}"
+    windows_com_rc="$LAST_RC"
+    if win_l1_into windows_cap_windows_com logs/windows_cap_windows_com.log; then
+      com_arg=(--l1-results windows_cap_windows_com/l1-results.json)
+      record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com --command "$WIN_COM_COMMAND" \
+        --exit "$windows_com_rc" --log logs/windows_cap_windows_com.log "${com_arg[@]}"
+    elif [[ "$windows_com_rc" -ne 0 ]]; then
+      record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com --command "$WIN_COM_COMMAND" \
+        --exit "$windows_com_rc" --log logs/windows_cap_windows_com.log --section-verdict FAIL --reason "$WIN_IMPORT_REASON"
+    else
+      record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com --command "$WIN_COM_COMMAND" \
+        --exit 0 --log logs/windows_cap_windows_com.log --section-verdict EVIDENCE_MISSING --reason "$WIN_IMPORT_REASON"
+    fi
+  fi
+else
+  if [[ "$WIN_COM_PLAN_OK" == "1" ]]; then
+    record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com --command "$WIN_COM_COMMAND" --reason "$com_reason"
+  else
+    record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com --reason "必要集合 selector 推導不出 windows_com argv（EVIDENCE_MISSING）"
+  fi
+fi
+# OD-55（Windows 部分）：windows 能力集合的證據只能於原生 Windows 本機產生，本 gate 不在 Linux 端代跑。
+#   以 SW_GATE_LOCAL_WINDOWS_DIR 匯入 <dir>/windows_cap_<cap>/l1-results.json（cargo_l1_results.py --platform windows
+#   --caps-only --caps <cap> 的輸出）；核對 provenance.git 起訖皆為乾淨的候選 commit；缺檔、版本不符、髒工作樹、
+#   非 windows 平台或 finished 非 true → 能力探測 unavailable →
+#   EVIDENCE_MISSING（LOCAL-WINDOWS-TODO），不得 PASS。
+for cap in windows_native interactive_desktop supervisor_runtime; do
+  sec="windows_cap_$cap"
+  src="${SW_GATE_LOCAL_WINDOWS_DIR:-$RUN_DIR/missing-local-windows}/$sec/l1-results.json"
+  if [[ -n "$SHARED_EVIDENCE" ]]; then
+    set_id="s21_gate:cap_$cap"
+    if shared_windows_l1 "$set_id" slice21 "$RUN_DIR/shared-import/windows-$cap"; then
+      src="$RUN_DIR/shared-import/windows-$cap/l1-results.json"
+    else
+      src="$RUN_DIR/missing-local-windows/$sec/l1-results.json"
+    fi
+  fi
+  python3 "$JUDGE" import-windows-section --run-dir "$RUN_DIR" --name "$sec" \
+    --candidate-commit "$CANDIDATE_COMMIT" --source "$src"
+done
+
+# 6. release artifact（identity 與黑箱用）
+# 方法審閱 [High]（2026-10-29）：建置前先移除舊 artifact，建置失敗時不得留下舊 binary 被後續 section 與量測證據
+# 綁到目前 HEAD；Linux／Windows 建置結果分開保存，建置成功當下記錄 daemon sha256（event_latency 量測核對用）。
+BUILT_D_SHA=""
+if [[ -n "$SHARED_EVIDENCE" ]]; then
+  if [[ "$SHARED_ARTIFACTS_VALID" == "1" ]]; then
+    BUILD_LINUX_RC=0
+    BUILT_D_SHA="$(sha256sum "$RUST_D" | cut -d' ' -f1)"
+    printf 'shared release artifacts\n' >"$RUN_DIR/logs/build_linux.log"
+  else
+    BUILD_LINUX_RC=3
+    RUST_CLI="$RUN_DIR/artifacts/missing-shared-cli"
+    RUST_D="$RUN_DIR/artifacts/missing-shared-daemon"
+    echo "EVIDENCE_MISSING：共用 artifact provenance 不符；不在本 gate 重建。" >"$RUN_DIR/logs/build_linux.log"
+  fi
+else
+  rm -f "$RUST_D" "$RUST_CLI"
+  run_logged build_linux cargo build --release -p sw-daemon -p sw-cli --target "$LINUX_TARGET"
+  BUILD_LINUX_RC="$LAST_RC"
+  if [[ "$BUILD_LINUX_RC" == 0 && -f "$RUST_D" ]]; then
+    BUILT_D_SHA="$(sha256sum "$RUST_D" | cut -d' ' -f1)"
+  fi
+fi
+run_logged build_windows cargo build --release -p sw-daemon -p sw-cli --target "$WIN_TARGET"
+BUILD_WINDOWS_RC="$LAST_RC"
+
+pytest_l1() {  # pytest_l1 <section> <log> <env…> -- <pytest 參數…>：帶 SW_RESOURCE_REPORT 與 junit
+  local sec="$1" log="$2"; shift 2
+  local envs=()
+  while [[ $# -gt 0 && "$1" != "--" ]]; do envs+=("$1"); shift; done
+  shift
+  mkdir -p "$RUN_DIR/$sec"
+  run_logged "$log" env "${envs[@]}" SW_RESOURCE_REPORT="$RUN_DIR/$sec/l1-results.json" \
+    python3 -m pytest "$@" --junitxml="$RUN_DIR/$sec/junit.xml"
+}
+
+# 7. 黑箱 A/B（Python 基線與 Rust）
+pytest_l1 blackbox_python blackbox_python -- -q tests/contract_blackbox/slice21 -m cap_posix_pty
+record blackbox_python --required-set s21_gate:blackbox_python --command "pytest -q tests/contract_blackbox/slice21 -m cap_posix_pty（Python）" \
+  --exit "$LAST_RC" --log logs/blackbox_python.log --l1-results blackbox_python/l1-results.json
+# Rust 標籤須以 ELF CLI 執行（contract_blackbox conftest 的 artifact 身分檢查；第三輪 gate 實跑 46/46 因此 fail）。
+if [[ -n "$SHARED_EVIDENCE" && "$SHARED_ARTIFACTS_VALID" != "1" ]]; then
+  record blackbox_rust --required-set s21_gate:blackbox_rust --section-verdict EVIDENCE_MISSING \
+    --reason "共用 artifact provenance 不符；未以本地重建替代候選 artifact"
+else
+  pytest_l1 blackbox_rust blackbox_rust SERIALWRAP_CLI_EXE="$RUST_CLI" SERIALWRAP_DAEMON_EXE="$RUST_D" SERIALWRAP_AB_LABEL=rust-s21 -- \
+    -q tests/contract_blackbox/slice21 -m cap_posix_pty
+  record blackbox_rust --required-set s21_gate:blackbox_rust --command "SERIALWRAP_CLI_EXE=<rust cli> SERIALWRAP_DAEMON_EXE=<rust> pytest -q tests/contract_blackbox/slice21 -m cap_posix_pty" \
+    --exit "$LAST_RC" --log logs/blackbox_rust.log --l1-results blackbox_rust/l1-results.json
+fi
+
+# 8. Task 20 既有套件改指 Rust（兩條 pytest 合併為一次收集＋三次單 case runner）
+if [[ -n "$SHARED_EVIDENCE" && "$SHARED_ARTIFACTS_VALID" != "1" ]]; then
+  record existing_suites_rust --required-set s21_gate:existing_suites_rust --section-verdict EVIDENCE_MISSING \
+    --reason "共用 artifact provenance 不符；未以本地重建替代候選 artifact"
+else
+  pytest_l1 existing_suites_rust existing_suites_rust SERIALWRAP_CLI_EXE="$RUST_CLI" SERIALWRAP_DAEMON_EXE="$RUST_D" -- \
+    -q tests/test_multiagent_e2e.py tests/test_human_agent_coexist.py \
+    -k "test_five_agents_three_rounds_no_conflict or t2_wal_reset_seq_resets_to_zero or t3_wal_current_seq_matches_live or t4_bind_idempotent_ready_session"
+  suites_rc="$LAST_RC"
+  extra_checks=()
+  for c in sm-01-attach-to-ready ha-05-concurrent-submit sm-04-device-unplug; do
+    run_logged "func_$c" env SERIALWRAP_CLI_EXE="$RUST_CLI" SERIALWRAP_DAEMON_EXE="$RUST_D" \
+      python3 func-test/runner.py --case "$c" --report-dir "$RUN_DIR/func/rust/$c"
+    extra_checks+=(--extra-check "func-test:$c=$LAST_RC")
+  done
+  record existing_suites_rust --required-set s21_gate:existing_suites_rust \
+    --command "Task 20 既有套件（pytest＋func-test/runner.py --case ×3）" --exit "$suites_rc" \
+    --log logs/existing_suites_rust.log --l1-results existing_suites_rust/l1-results.json "${extra_checks[@]}"
+fi
+
+# 9. Task 21 L1.5 與 event_latency
+# 自測報告須先符合 Task 8 資格；共用模式優先重用同一次 gate_shared 的 P7 A/B 報告，否則本 gate 自行產生。
+# 不合格仍記 EVIDENCE_MISSING，不得將自測失敗改判 PASS。
+bridge_report_qualified() {
+  local qualified
+  [[ -f "$1" ]] || return 1
+  qualified="$(python3 -c 'import sys; sys.path.insert(0, "func-test"); import runner; print(int(runner.evaluate_bridge_eligibility(sys.argv[1])[1]))' \
+    "$1" 2>/dev/null || echo 0)"
+  [[ "$qualified" == "1" ]]
+}
+bridge_selftest_report="${SERIALWRAP_L15_SELFTEST_REPORT:-}"
+bridge_selftest_source="explicit"
+if [[ -z "$bridge_selftest_report" ]]; then
+  bridge_selftest_source="generated"
+  if [[ -n "$SHARED_EVIDENCE" ]]; then
+    shared_bridge_report="$SHARED_EVIDENCE/work/p7-ab/bridge-selftest/selftest-report.json"
+    if bridge_report_qualified "$shared_bridge_report"; then
+      bridge_selftest_report="$shared_bridge_report"
+      bridge_selftest_source="shared"
+    fi
+  fi
+  if [[ -z "$bridge_selftest_report" ]]; then
+    bridge_selftest_dir="$RUN_DIR/bridge-selftest"
+    mkdir -p "$bridge_selftest_dir"
+    run_logged bridge_selftest env \
+      PYTHONPATH="$ROOT/tools/uart_stdio_bridge/src${PYTHONPATH:+:$PYTHONPATH}" \
+      python3 -m uart_stdio_bridge selftest --endpoint posix-pty --out "$bridge_selftest_dir"
+    if [[ -f "$bridge_selftest_dir/selftest-report.json" ]]; then
+      bridge_selftest_report="$bridge_selftest_dir/selftest-report.json"
+    fi
+  fi
+fi
+l15_qualified=0
+if [[ -n "$bridge_selftest_report" ]] && bridge_report_qualified "$bridge_selftest_report"; then
+  l15_qualified=1
+fi
+bridge_selftest_record_args=()
+if [[ -n "$bridge_selftest_report" ]]; then
+  bridge_selftest_record_args+=(--bridge-selftest-report "$bridge_selftest_report")
+fi
+bridge_selftest_reason="bridge_selftest_report source=$bridge_selftest_source path=${bridge_selftest_report:-<missing>} eligibility=$([[ "$l15_qualified" == "1" ]] && echo PASS || echo EVIDENCE_MISSING)"
+if [[ -n "$SHARED_EVIDENCE" && "$SHARED_ARTIFACTS_VALID" != "1" ]]; then
+  record l15_ab --section-verdict EVIDENCE_MISSING "${bridge_selftest_record_args[@]}" \
+    --reason "共用 artifact provenance 不符；L1.5 A/B 不以本地重建替代" --reason "$bridge_selftest_reason"
+elif [[ "$l15_qualified" != "1" ]]; then
+  record l15_ab --exit 0 --section-verdict EVIDENCE_MISSING "${bridge_selftest_record_args[@]}" \
+    --reason "bridge 自測報告不存在或未通過 Task 8 資格判定；L1.5 A/B 未執行" --reason "$bridge_selftest_reason"
+elif [[ -f tests/acceptance/l15/test_slice21_l15.py ]]; then
+  mkdir -p "$RUN_DIR/l15_ab"
+  # 逐案 outcome（l1-results.v1）供 case_verdicts 彙整（OD-60／OWNER-BATCH #8）。
+  run_logged l15_ab env SERIALWRAP_GATE=1 SERIALWRAP_L15_SELFTEST_REPORT="$bridge_selftest_report" \
+    SERIALWRAP_L15_PY_DAEMON="$ROOT/tests/contract_blackbox/bin/py-serialwrapd" \
+    SERIALWRAP_L15_RUST_DAEMON="$RUST_D" SW_RESOURCE_REPORT="$RUN_DIR/l15_ab/l1-results.json" \
+    python3 -m pytest -q tests/acceptance/l15/test_slice21_l15.py
+  # pytest 全綠但仍有 L1.5 待裁決缺口（情境斷言不完整，PA-OD-L15-*）時不計 PASS（審查 c0d221f #3）。
+  l15_rc="$LAST_RC"
+  l15_gaps="$(python3 -c 'import sys, yaml; d=yaml.safe_load(open(sys.argv[1])); print(",".join(x["id"] for x in d.get("pending_decisions") or [] if str(x.get("id","")).startswith("PA-OD-L15")))' \
+    tests/acceptance/slice21_gate_expect.yaml 2>/dev/null || echo "PA-OD-L15-?")"
+  if [[ "$l15_rc" != 0 ]]; then l15_verdict=FAIL; elif [[ -n "$l15_gaps" ]]; then l15_verdict=EVIDENCE_MISSING; else l15_verdict=PASS; fi
+  record l15_ab --command "SERIALWRAP_GATE=1 pytest -q tests/acceptance/l15/test_slice21_l15.py" --exit "$l15_rc" \
+    --log logs/l15_ab.log --section-verdict "$l15_verdict" --evidence l15_ab/l1-results.json \
+    "${bridge_selftest_record_args[@]}" --reason "$bridge_selftest_reason" \
+    ${l15_gaps:+--reason "L1.5 待裁決缺口未結：$l15_gaps（slice21-l15-gaps.md）"}
+else
+  record l15_ab "${bridge_selftest_record_args[@]}" --reason "tests/acceptance/l15/test_slice21_l15.py 不存在（P5-T21 未完成）" \
+    --reason "$bridge_selftest_reason"
+fi
+# OD-45：event_latency = L1 結構 gate（五事件 l1_gate 須在 linux_l1 passed）＋外部量測三項（RPC 送出 → RPC 回應；
+#        idle 與 flood 20000 B/s；Rust 為判定對象，Python 基線以診斷樣本數另記供對照，不計入判定）。
+mkdir -p "$RUN_DIR/event_latency"
+if [[ -n "$SHARED_EVIDENCE" && "$SHARED_ARTIFACTS_VALID" != "1" ]]; then
+  record event_latency --section-verdict EVIDENCE_MISSING \
+    --reason "共用 artifact provenance 不符；event_latency 未以本地重建替代候選 artifact"
+else
+evlat_bind=()
+# 只有本 run 建置成功且 artifact 仍為建置當下的 sha256 時，才明示建置來源（否則量測報告不綁來源 → 證據不足）。
+if [[ -n "$BUILT_D_SHA" ]]; then
+  evlat_bind=(--artifact-source-commit "$(git -C "$ROOT" rev-parse HEAD)" --artifact-build-run-id "$RUN_ID" --artifact-sha256 "$BUILT_D_SHA")
+fi
+run_logged event_latency python3 scripts/rust/event_latency_measure.py --daemon "$RUST_D" --cli "$RUST_CLI" --label rust \
+  --l1-results "$RUN_DIR/linux_l1/l1-results.json" --run-id "$RUN_ID" \
+  "${evlat_bind[@]}" --out "$RUN_DIR/event_latency/rust.json" --work-dir "$RUN_DIR/event_latency/work"
+evlat_rc="$LAST_RC"
+# 工具結束碼：PASS 0、FAIL 1、INSUFFICIENT_EVIDENCE 3。證據不足照實記 EVIDENCE_MISSING（exit 0），不得記成 FAIL 或 PASS。
+evlat_exit="$evlat_rc"; [[ "$evlat_rc" == 3 ]] && evlat_exit=0
+run_logged event_latency_python python3 scripts/rust/event_latency_measure.py --daemon "$ROOT/tests/contract_blackbox/bin/py-serialwrapd" \
+  --label python-diagnostic --samples "${SW_EVLAT_PY_SAMPLES:-50}" --l1-results "$RUN_DIR/linux_l1/l1-results.json" \
+  --out "$RUN_DIR/event_latency/python-diagnostic.json" --work-dir "$RUN_DIR/event_latency/work-py" || true
+evlat_verdict="$(python3 -c 'import json,sys; v=json.load(open(sys.argv[1]))["verdict"]; print({"PASS":"PASS","FAIL":"FAIL"}.get(v,"EVIDENCE_MISSING"))' \
+  "$RUN_DIR/event_latency/rust.json" 2>/dev/null || echo EVIDENCE_MISSING)"
+evlat_reason="$(python3 -c 'import json,sys; print("；".join(json.load(open(sys.argv[1])).get("reasons") or []) or "—")' \
+  "$RUN_DIR/event_latency/rust.json" 2>/dev/null || echo "rust.json 未產生")"
+rm -rf "$RUN_DIR/event_latency/work" "$RUN_DIR/event_latency/work-py"
+record event_latency --command "python3 scripts/rust/event_latency_measure.py --label rust --l1-results linux_l1/l1-results.json" \
+  --exit "$evlat_exit" --log logs/event_latency.log --section-verdict "$evlat_verdict" --evidence event_latency/rust.json \
+  --reason "OD-45（L1 結構 gate＋外部量測 stop_request／command_cancel／release_request）：$evlat_reason"
+fi
+
+# 9 補：§1.2 WAL 效能（超標記 FAIL 並保留樣本，不得改列觀察值）
+# OD-61：Linux 門檻以擁有者 WSL2 主機量測為準。編排者於本機量測後以
+#   SW_GATE_WAL_S1W_IMPORT=<wal_s1w.json> SW_GATE_WAL_S1W_HOST=<主機類型標註> 匯入；本機（雲端 vm）量測照跑但只作診斷。
+#   判定由 slice21_gate_judge.py wal-s1w-verdict 依可追溯性與主機類型決定（不得以雲端結果判 PASS／FAIL）。
+mkdir -p "$RUN_DIR/wal_s1w_perf"
+run_logged wal_s1w_perf cargo run --release -p sw-core --example wal_s1w -- --out "$RUN_DIR/wal_s1w_perf/wal_s1w.json" \
+  --wal-root "$RUN_DIR/wal_s1w_perf/walroot"
+s1w_rc="$LAST_RC"
+rm -rf "$RUN_DIR/wal_s1w_perf/walroot"
+s1w_args=()
+[[ -f "$RUN_DIR/wal_s1w_perf/wal_s1w.json" ]] && s1w_args+=(--local "$RUN_DIR/wal_s1w_perf/wal_s1w.json")
+s1w_evidence=wal_s1w_perf/wal_s1w.json
+# SW_GATE_WAL_S1W_IMPORT 可列多輪證據（以 : 分隔，如三輪），judge 取最差判定；OD-66：WSL2 證據另以
+# SW_GATE_WAL_S1W_PY_BASELINE 匯入同主機同時段的 Python 基線（wal_microbench.py），門檻依主機類型選並記入 verdict.json。
+if [[ -n "${SW_GATE_WAL_S1W_IMPORT:-}" ]]; then
+  s1w_n=0
+  IFS=':' read -r -a s1w_imports <<<"$SW_GATE_WAL_S1W_IMPORT"
+  for s1w_src in "${s1w_imports[@]}"; do
+    s1w_n=$((s1w_n + 1))
+    cp "$s1w_src" "$RUN_DIR/wal_s1w_perf/wal_s1w.imported-$s1w_n.json" 2>/dev/null || true
+    s1w_args+=(--import "$RUN_DIR/wal_s1w_perf/wal_s1w.imported-$s1w_n.json")
+  done
+  s1w_args+=(--host-label "${SW_GATE_WAL_S1W_HOST:-}")
+  s1w_evidence=wal_s1w_perf/verdict.json
+fi
+s1w_python_baseline=""
+s1w_baseline_source="missing"
+if [[ -n "${SW_GATE_WAL_S1W_PY_BASELINE:-}" ]]; then
+  imported_python_baseline="$RUN_DIR/wal_s1w_perf/python-baseline.imported.json"
+  if cp "$SW_GATE_WAL_S1W_PY_BASELINE" "$imported_python_baseline" 2>/dev/null; then
+    s1w_python_baseline="$imported_python_baseline"
+    s1w_baseline_source="explicit"
+  fi
+elif [[ -f "$RUN_DIR/wal_s1w_perf/wal_s1w.json" ]]; then
+  s1w_virtualization="$(python3 -c 'import json,sys; print((json.load(open(sys.argv[1])).get("env") or {}).get("virtualization", "unknown"))' \
+    "$RUN_DIR/wal_s1w_perf/wal_s1w.json" 2>/dev/null || echo unknown)"
+  if [[ "$s1w_virtualization" == "wsl2" ]]; then
+    auto_python_baseline="$RUN_DIR/wal_s1w_perf/python-baseline.auto.json"
+    python_wal_root="$RUN_DIR/wal_s1w_perf/python-walroot"
+    run_logged wal_s1w_python_baseline python3 scripts/stage0/wal_microbench.py \
+      --out "$auto_python_baseline" --wal-root "$python_wal_root"
+    s1w_python_baseline_rc="$LAST_RC"
+    if [[ "$s1w_python_baseline_rc" == "0" && -f "$auto_python_baseline" ]]; then
+      s1w_python_baseline="$auto_python_baseline"
+      s1w_baseline_source="generated"
+    fi
+    rm -rf "$python_wal_root"
+  fi
+fi
+if [[ -n "$s1w_python_baseline" ]]; then
+  s1w_args+=(--python-baseline "$s1w_python_baseline")
+fi
+python3 "$JUDGE" wal-s1w-verdict "${s1w_args[@]}" --out "$RUN_DIR/wal_s1w_perf/verdict.json" >/dev/null 2>>"$RUN_DIR/logs/wal_s1w_perf.log" || true
+s1w_verdict="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["verdict"])' "$RUN_DIR/wal_s1w_perf/verdict.json" 2>/dev/null || echo EVIDENCE_MISSING)"
+s1w_reason="$(python3 -c 'import json,sys; print("；".join(json.load(open(sys.argv[1]))["reasons"]) or "—")' "$RUN_DIR/wal_s1w_perf/verdict.json" 2>/dev/null || echo "wal-s1w-verdict 未產生")"
+s1w_exit="$s1w_rc"; [[ "$s1w_verdict" == EVIDENCE_MISSING ]] && s1w_exit=0
+record wal_s1w_perf --command "cargo run --release -p sw-core --example wal_s1w；Python baseline source=$s1w_baseline_source path=${s1w_python_baseline:-<missing>}" --exit "$s1w_exit" \
+  --log logs/wal_s1w_perf.log --section-verdict "$s1w_verdict" --evidence "$s1w_evidence" \
+  --reason "Linux 門檻依主機類型（OD-66：WSL2 另訂門檻＋不劣於 Python 基線；原生 §1.2）：$s1w_reason" \
+  --reason "Python baseline source=$s1w_baseline_source path=${s1w_python_baseline:-<missing>}" \
+  --reason "Windows 原生與 EDR 下正式量測屬 BO-S21-14（EVIDENCE_MISSING）"
+
+# 10. Windows 無 COM 黑箱（BO-S21-13 承接 Windows 全套；此處只保留紀錄，不計入 section）。
+#     注意：win-blackbox.ps1 目前仍為 P3 介面，-Suite／-Daemon 尚未支援；失敗只留 log，不影響判定。
+if command -v pwsh.exe >/dev/null 2>&1 && [[ -f "$WIN_D" ]]; then
+  run_logged windows_nocom pwsh.exe -File scripts/rust/win-blackbox.ps1 -Suite slice21-nocom -Daemon "$WIN_D"
+fi
+
+# 10b. Python 基線 parity（P5 第 6 輪 SPEC-GAP #1，編排者裁決）：以 s21_gate:py_parity_full 的完整 selector 實跑；
+#      舊集合 s21_gate:py_parity 不改不刪，仍由 pytest_full 承擔（兩者皆由 gate 執行）。
+mapfile -t pyp_argv < <(python3 -c 'import json,sys; print("\n".join(json.load(open(sys.argv[1]))["sets"]["s21_gate:py_parity_full"]["linux"]["selector"]["argv"]))' \
+  tests/acceptance/l1_required.lock.json 2>/dev/null || true)
+if [[ "${#pyp_argv[@]}" -gt 0 ]]; then
+  pytest_l1 py_parity py_parity -- "${pyp_argv[@]}"
+  record py_parity --required-set s21_gate:py_parity_full --command "pytest <s21_gate:py_parity_full selector.argv>" \
+    --exit "$LAST_RC" --log logs/py_parity.log --l1-results py_parity/l1-results.json
+else
+  record py_parity --required-set s21_gate:py_parity_full --reason "l1_required.lock.json 無 s21_gate:py_parity_full.linux selector"
+fi
+
+# 10b2. F-S19：Windows 原生 Python L1 只從共用證據匯入；缺少／拒收時保留 EVIDENCE_MISSING。
+if [[ -n "$SHARED_EVIDENCE" ]]; then
+  if shared_windows_l1 s21_gate:py_parity slice21 "$RUN_DIR/shared-import/windows-py-parity"; then
+    mkdir -p "$RUN_DIR/py_parity_windows"
+    cp "$RUN_DIR/shared-import/windows-py-parity/l1-results.json" "$RUN_DIR/py_parity_windows/l1-results.json"
+    echo "已匯入 shared-evidence windows_l1:s21_gate:py_parity；未啟動 Windows pytest runner。" \
+      >"$RUN_DIR/logs/py_parity_windows.log"
+    record py_parity_windows --required-set s21_gate:py_parity --command "shared-evidence windows_l1:s21_gate:py_parity" \
+      --exit "$SHARED_L1_RC" --log logs/py_parity_windows.log --l1-results py_parity_windows/l1-results.json
+  else
+    record py_parity_windows --required-set s21_gate:py_parity --section-verdict EVIDENCE_MISSING \
+      --reason "共用 Windows pytest L1 缺失或 provenance／selector 不符；未重跑。" --log logs/shared-windows-s21_gate:py_parity.stderr
+  fi
+else
+  record py_parity_windows --required-set s21_gate:py_parity --section-verdict EVIDENCE_MISSING \
+    --reason "Windows 原生 pytest parity 僅接受 shared-evidence --windows-l1 匯入；未代跑。"
+fi
+
+# 10c. 計畫 06 Task 0b #76～#80 Python 基線 parity（P5 第 8 輪 SPEC-GAP #1）：獨立 add-only 集合，保留兩個既有 py_parity 集合。
+mapfile -t pyp_76_80_argv < <(python3 -c 'import json,sys; print("\n".join(json.load(open(sys.argv[1]))["sets"]["s21_gate:py_parity_76_80"]["linux"]["selector"]["argv"]))' \
+  tests/acceptance/l1_required.lock.json 2>/dev/null || true)
+if [[ "${#pyp_76_80_argv[@]}" -gt 0 ]]; then
+  pytest_l1 py_parity_76_80 py_parity_76_80 -- "${pyp_76_80_argv[@]}"
+  record py_parity_76_80 --required-set s21_gate:py_parity_76_80 --command "pytest <s21_gate:py_parity_76_80 selector.argv>" \
+    --exit "$LAST_RC" --log logs/py_parity_76_80.log --l1-results py_parity_76_80/l1-results.json
+else
+  record py_parity_76_80 --required-set s21_gate:py_parity_76_80 --reason "l1_required.lock.json 無 s21_gate:py_parity_76_80.linux selector"
+fi
+
+# 11. 全套 pytest（N3；依 2026-11-12 rulings/s2.md 第 3 點，比照 CI 排除兩項 Stage 1 證據測試）
+if [[ -n "$SHARED_EVIDENCE" ]]; then
+  if [[ "$SHARED_ARTIFACTS_VALID" == "1" ]] && python3 scripts/rust/gate_shared_evidence.py import-section --shared-evidence "$SHARED_EVIDENCE" \
+      --gate slice21 --section pytest_full --required-set s21_gate:pytest_full --platform linux \
+      "${SHARED_ARTIFACT_ARGS[@]}" --out-dir "$RUN_DIR/shared-import" \
+      >"$RUN_DIR/logs/shared-pytest-import.json" 2>"$RUN_DIR/logs/shared-pytest-import.stderr"; then
+    mkdir -p "$RUN_DIR/pytest_full"
+    cp "$RUN_DIR/shared-import/s21_gate/pytest-full/l1-results.json" "$RUN_DIR/pytest_full/l1-results.json"
+    cp "$RUN_DIR/shared-import/s21_gate/pytest-full/junit.xml" "$RUN_DIR/pytest_full/junit.xml"
+    cp "$RUN_DIR/shared-import/logs/pytest-full.log" "$RUN_DIR/logs/pytest_full.log"
+    LAST_RC="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["exit_code"])' "$RUN_DIR/logs/shared-pytest-import.json")"
+    record pytest_full --required-set s21_gate:pytest_full --command "SW_RESOURCE_REPORT=… python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence" \
+      --exit "$LAST_RC" --log logs/pytest_full.log --l1-results pytest_full/l1-results.json
+  else
+    SHARED_REASON="$(python3 - "$RUN_DIR/logs/shared-pytest-import.json" "$RUN_DIR/logs/shared-pytest-import.stderr" <<'PY'
+import json, pathlib, sys
+try:
+    row=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+    print("；".join(row.get("reasons", [])) or row.get("status", "EVIDENCE_MISSING"))
+except (OSError, ValueError):
+    print(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8", errors="replace").strip() or "共用證據不可讀")
+PY
+    )"
+    record pytest_full --required-set s21_gate:pytest_full --section-verdict EVIDENCE_MISSING \
+      --reason "共用證據拒收：$SHARED_REASON；未重跑"
+  fi
+else
+  pytest_l1 pytest_full pytest_full -- -q tests/ \
+    --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native \
+    --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence
+  record pytest_full --required-set s21_gate:pytest_full --command "SW_RESOURCE_REPORT=… python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence" \
+    --exit "$LAST_RC" --log logs/pytest_full.log --l1-results pytest_full/l1-results.json
+fi
+
+# 11b. 承接率：case_verdicts.json 由 Task 20／21 的逐案證據（l15_ab 兩邊、移出 l15_ab 者的承擔測試、func-test）彙整，
+#     每案取最差判定（FAIL＞EVIDENCE_MISSING＞PASS），缺證據即 EVIDENCE_MISSING（OD-60／OWNER-BATCH #8）；須在承擔測試
+#     （pytest_full 等）之後彙整。此處的 PASS 只表示「輸入已備齊」；judge 另以 slice_breaker.evaluate 判定斷路器
+#     （tripped／OD-02 → FAIL、證據不足 → EVIDENCE_MISSING；審查 b7cd852 #1），assemble 於正式實跑附加本次快照。
+cv_args=()
+run_logged case_verdicts python3 "$JUDGE" case-verdicts --run-dir "$RUN_DIR"
+if [[ "$LAST_RC" == 0 && -f "$RUN_DIR/case_verdicts.json" ]]; then
+  record case_uptake --command "slice21_gate_judge.py case-verdicts＋slice_breaker.acceptance_rate" --exit 0 --section-verdict PASS \
+    --evidence case_verdicts.json --log logs/case_verdicts.log
+  cv_args=(--case-verdicts "$RUN_DIR/case_verdicts.json" --append-breaker-snapshot)
+else
+  record case_uptake --reason "case_verdicts.json 彙整失敗（exit $LAST_RC）" --section-verdict EVIDENCE_MISSING --exit 0 \
+    --log logs/case_verdicts.log
+fi
+
+# 12. policy check
+POLICY_LABEL="release:$(cat "$ROOT/VERSION")"
+run_logged policy_check python3 -m policy_check --repo . --pr-labels "$POLICY_LABEL"
+record policy_check --command "python3 -m policy_check --repo . --pr-labels $POLICY_LABEL" --exit "$LAST_RC" --log logs/policy_check.log \
+  --section-verdict "$([[ $LAST_RC == 0 ]] && echo PASS || echo FAIL)"
+
+# 9c. identity（CLI／daemon sha256、版本）＋判定
+# F139：serialwrapd 依 Python 1:1 不提供 --version；版本取自 throwaway daemon 的 daemon.status RPC 回應 `version`。
+daemon_version=""
+if [[ -x "$RUST_D" ]]; then
+  daemon_version="$(python3 scripts/rust/probe_daemon_version.py --daemon "$RUST_D" --cli "$RUST_CLI" \
+    --work-dir "$RUN_DIR/daemon_version" 2>>"$RUN_DIR/logs/daemon_version.log" | tail -n1 || true)"
+fi
+ver_args=()
+[[ -n "$daemon_version" ]] && ver_args=(--daemon-version "$daemon_version")
+assemble --cli-path "$RUST_CLI" --daemon-path "$RUST_D" "${ver_args[@]}" "${cv_args[@]}" \
+  --build-linux-exit "$BUILD_LINUX_RC" --build-windows-exit "$BUILD_WINDOWS_RC" --built-daemon-sha256 "$BUILT_D_SHA"
+exit_for_verdict

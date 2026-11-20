@@ -620,6 +620,60 @@ def test_shutdown_gate_blocks_hotplug_after_drain_start(tmp_path):
     assert r"/s/by-id/usb-NEW" not in mgr._sessions
 
 
+def test_clear_during_shutdown_raises_daemon_stopping(tmp_path):
+    """#97（parity-amendments-2026-10-26，#81 特性測試）：shutdown 中 session.clear → RuntimeError("daemon stopping")
+    （service framing 轉 EXCEPTION）；RELEASED 早退仍先於 stopping 判定。"""
+    mgr = make_manager(tmp_path, [make_profile(by_id=BY_ID)])
+    mgr.begin_shutdown()
+    with pytest.raises(RuntimeError, match="daemon stopping"):
+        mgr.clear_session("COM0")
+    s = mgr.get_session("COM0")
+    with mgr._lock:
+        s.state = "RELEASED"
+    res = mgr.clear_session("COM0")
+    assert res["ok"] is True and res["released"] is True
+
+
+def test_device_attach_during_shutdown_raises_daemon_stopping(tmp_path):
+    """#97（#81 特性測試）：shutdown 中 device.attach → RuntimeError("daemon stopping")，不 spawn attach。"""
+    mgr = make_manager(tmp_path, [make_profile(by_id=BY_ID)])
+    mgr.begin_shutdown()
+    with pytest.raises(RuntimeError, match="daemon stopping"):
+        mgr.attach_device("COM0")
+    assert BY_ID not in mgr._attach_inflight
+
+
+def test_dynamic_attach_skipped_during_shutdown_or_drain(tmp_path):
+    """#97（#81 特性測試）：shutdown 或該 by_id drain 中，動態 attach 不建立 session、不開埠。"""
+    from sw_core.config import ProfileTemplate
+    from sw_core.device_watcher import DeviceInfo
+    from sw_core.wal import WalWriter
+    from sw_core.session_manager import SessionManager
+
+    templates = [ProfileTemplate(profile_name="others-template", platform="passthrough", ready_probe="")]
+    for mode in ("shutdown", "drain"):
+        root = tmp_path / mode
+        root.mkdir()
+        mgr = SessionManager(
+            [],
+            WalWriter(wal_dir=str(root / "wal")),
+            templates=templates,
+            on_ready=lambda _s: None,
+            on_detached=lambda _s: None,
+            state_path=str(root / "state.json"),
+        )
+        by_id = "/dev/serial/by-id/usb-NEW"
+        with mgr._lock:
+            mgr._devices[by_id] = DeviceInfo(by_id=by_id, real_path=str(root / "missing-tty"))
+            if mode == "drain":
+                mgr._draining_by_ids[by_id] = object()
+        if mode == "shutdown":
+            mgr.begin_shutdown()
+        mgr._attach_by_id_dynamic(by_id)
+        assert mgr.list_sessions() == []
+        assert by_id not in mgr._attach_ops and by_id not in mgr._preopened_ports
+
+
 def test_shutdown_waits_inflight_attach_before_wal_close(tmp_path, monkeypatch):
     from sw_core.device_watcher import DeviceInfo
     import sw_core.uart_io as uart_io
@@ -746,6 +800,36 @@ def test_release_persist_failure_keeps_blocking(tmp_path, monkeypatch):
     assert BY_ID in mgr._released_by_ids
     mgr._spawn_attach(BY_ID)
     assert mgr.get_session("COM0").bridge is None
+
+
+def test_release_persist_failure_retried(tmp_path, monkeypatch):
+    """第一次 RELEASED state.json 寫入失敗後，下次 release 會接手重試。"""
+    mgr = make_manager(tmp_path, [make_profile(by_id=BY_ID)])
+    session = mgr.get_session("COM0")
+    original_save = mgr._save_state
+    save_calls = 0
+
+    def fail_once() -> None:
+        nonlocal save_calls
+        save_calls += 1
+        if save_calls == 1:
+            raise OSError("disk error")
+        original_save()
+
+    monkeypatch.setattr(mgr, "_save_state", fail_once)
+    with pytest.raises(OSError, match="disk error"):
+        mgr.release_device("COM0")
+
+    assert session.state == "RELEASED"
+    assert session._release_persist_pending is True
+    assert BY_ID in mgr._released_by_ids
+
+    response = mgr.release_device("COM0")
+    assert response["ok"] is True and response["already_released"] is True
+    assert session._release_persist_pending is False
+    assert save_calls == 2
+    saved = json.loads(Path(mgr._state_path).read_text(encoding="utf-8"))
+    assert saved["released"][session.session_id]["by_id"] == BY_ID
 
 
 def test_duplicate_release_waits_for_persist_completion(tmp_path, monkeypatch):

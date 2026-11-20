@@ -1,7 +1,7 @@
 """Expect 語法比對引擎。
 
 支援 YAML test case 中的 ``expect`` 區塊，
-包括精確匹配、巢狀欄位、contains、matches、has_keys 等。
+包括精確匹配、巢狀欄位、contains、list_contains、matches、has_keys 等。
 """
 from __future__ import annotations
 
@@ -67,6 +67,11 @@ def _check_value(path: str, expected: Any, actual: Any, errors: list[ExpectError
         if "contains" in expected:
             if not isinstance(actual, str) or expected["contains"] not in actual:
                 errors.append(ExpectError(path, f"包含 {expected['contains']!r}", actual))
+        elif "list_contains" in expected:
+            # list 中任一元素與期望值的字串形式相等（變數展開後為字串，回應內可能為 int；gaps #2）
+            want = str(expected["list_contains"])
+            if not isinstance(actual, list) or not any(str(item) == want for item in actual):
+                errors.append(ExpectError(path, f"list 含 {expected['list_contains']!r}", actual))
         elif "matches" in expected:
             if not isinstance(actual, str) or not re.search(expected["matches"], actual):
                 errors.append(ExpectError(path, f"匹配 {expected['matches']!r}", actual))

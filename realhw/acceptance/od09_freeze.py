@@ -5,7 +5,7 @@
 `thresholds.<key>.per_platform.<os>.<field>` 與凍結紀錄欄位。
 
 子命令（`python3 -m realhw.acceptance.od09_freeze`）：
-  stats             由單一平台的 48 h 基線 case 目錄計算統計，並執行基線違規檢查
+  stats             由單一平台的 24 h 基線 case 目錄（OD-94）計算統計，並執行基線違規檢查
   propose           依固定公式由兩平台基線統計產生凍結提案
   freeze            一次凍結兩平台延後項，改寫門檻檔並附加 owner-decisions addenda
   check             檢查門檻檔於指定 run 起點是否已凍結且欄位完整
@@ -265,7 +265,7 @@ def _event_span(events: list[dict[str, Any]]) -> tuple[float, float]:
 
 
 def baseline_stats(case_dir: Path, *, platform: str, release_manifest: Path) -> BaselineStats:
-    """由單一平台 48 h 基線 case 目錄計算統計（不做門檻判定；違規檢查見 validate_baseline）。
+    """由單一平台 24 h 基線 case 目錄（OD-94）計算統計（不做門檻判定；違規檢查見 validate_baseline）。
 
     時間基準與 gate 相同：時長取 `stop.t - start.t`，快照以相對 start 計，視窗為 `[0, duration]`；
     頭尾缺口（首快照前、末快照後）與相鄰間隔一併計入 `max_snapshot_gap_s`，與 gate 的觀測缺口判定一致。
@@ -422,7 +422,7 @@ def _read_baseline_gate(platform: str, path: Path) -> dict[str, Any]:
 
 
 def propose(linux: BaselineStats, windows: BaselineStats, *, baseline_gates: Mapping[str, Path],
-            acceptance_path: Path = DEFAULT_ACCEPTANCE) -> dict[str, Any]:
+            acceptance_path: Path = DEFAULT_ACCEPTANCE, generated_at: str | None = None) -> dict[str, Any]:
     """依 PROPOSAL_RULES 的固定公式產生凍結提案（不讀取門檻檔的延後項內容）。
 
     拒絕：統計 platform 標籤與位置不符、任一統計有基線違規、基線 gate 的平台／模式／判定錯配。
@@ -471,7 +471,7 @@ def propose(linux: BaselineStats, windows: BaselineStats, *, baseline_gates: Map
             for platform in PLATFORMS
         },
         "proposal_rules": dict(PROPOSAL_RULES),
-        "generated_at": _now_iso(),
+        "generated_at": generated_at or _now_iso(),  # 可注入：測試以固定時點產生提案
         "acceptance_revision": _baseline_revision(docs),
     }
     proposal["proposal_sha256"] = _proposal_digest(proposal)

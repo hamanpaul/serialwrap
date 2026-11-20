@@ -105,7 +105,8 @@
             "l15-scenario",
             "contract-blackbox",
             "windows-native",
-            "manual-procedure"
+            "manual-procedure",
+            "rust-l1"
           ]
         },
         "source_ref": {
@@ -132,7 +133,8 @@
             "longrun",
             "L15",
             "WIN",
-            "MANUAL"
+            "MANUAL",
+            "S24"
           ]
         },
         "title": {

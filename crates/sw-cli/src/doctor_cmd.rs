@@ -220,6 +220,23 @@ enum ManifestState {
     },
 }
 
+/// Stage 2 Windows daemon 是 Rust；Python runtime／PyYAML 仍供 CLI delegate 使用，pyserial 則不再是 daemon 需求。
+fn stage2_rust_daemon(state: &ManifestState) -> bool {
+    let ManifestState::Valid { manifest, .. } = state else {
+        return false;
+    };
+    if manifest.stage != "rust-2" {
+        return false;
+    }
+    let Some(PyValue::Dict(components)) = manifest.raw.get("components") else {
+        return false;
+    };
+    let Some(PyValue::Dict(daemon)) = components.get("daemon") else {
+        return false;
+    };
+    matches!(daemon.get("implementation"), Some(PyValue::Str(value)) if value == "rust")
+}
+
 /// `sw_proto::pypath` 所需的 home 查詢（與 `endpoint_resolve` 相同語意）。
 struct EnvHome<'a>(&'a dyn sw_pal::SysEnv);
 
@@ -1540,10 +1557,20 @@ pub fn run_doctor(ctx: &mut CliCtx) -> Vec<Check> {
     let windows = ctx.p.caps.path_flavor == PalPathFlavor::Windows;
     let state = manifest_state(ctx);
     let mut checks = if windows {
-        vec![
+        let mut windows_checks = vec![
             check_python(ctx, &state),
             check_module(ctx, &state, "pyyaml", PYYAML_CODE, FIX_PYYAML),
-            check_module(ctx, &state, "pyserial", PYSERIAL_CODE, FIX_PYSERIAL),
+        ];
+        if !stage2_rust_daemon(&state) {
+            windows_checks.push(check_module(
+                ctx,
+                &state,
+                "pyserial",
+                PYSERIAL_CODE,
+                FIX_PYSERIAL,
+            ));
+        }
+        windows_checks.extend([
             check_serialwrap_on_path(ctx, true),
             check_serialwrapd_on_path(ctx, true),
             check_other_installs(ctx),
@@ -1554,7 +1581,8 @@ pub fn run_doctor(ctx: &mut CliCtx) -> Vec<Check> {
             check_wal_writable(ctx),
             check_profile_bootloader_prompts(ctx),
             check_devices_windows(ctx),
-        ]
+        ]);
+        windows_checks
     } else {
         vec![
             check_python(ctx, &state),

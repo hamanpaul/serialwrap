@@ -1,0 +1,9 @@
+   Compiling sw-core v0.3.2 ($WORKTREE/crates/sw-core)
+error[E0425]: cannot find function `b64encode` in module `sw_proto::pycompat`
+   --> crates/sw-core/tests/drain_release_e2e.rs:268:48
+    |
+268 |     let expected_payload = sw_proto::pycompat::b64encode(markers.as_bytes());
+    |                                                ^^^^^^^^^ not found in `sw_proto::pycompat`
+
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `sw-core` (test "drain_release_e2e") due to 1 previous error

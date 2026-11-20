@@ -1,0 +1,26 @@
+warning: unused import: `posix::PosixDeviceSource`
+  --> crates/sw-pal/src/device_source/mod.rs:12:16
+   |
+12 | pub(crate) use posix::PosixDeviceSource;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `PosixDeviceSource` is never constructed
+  --> crates/sw-pal/src/device_source/posix.rs:49:19
+   |
+49 | pub(crate) struct PosixDeviceSource {
+   |                   ^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `new` is never used
+  --> crates/sw-pal/src/device_source/posix.rs:55:19
+   |
+54 | impl PosixDeviceSource {
+   | ---------------------- associated function in this implementation
+55 |     pub(crate) fn new(dirs: Vec<PathBuf>, allowlist: Option<Vec<String>>) -> Self {
+   |                   ^^^
+
+warning: `sw-pal` (lib) generated 3 warnings (run `cargo fix --lib -p sw-pal` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s

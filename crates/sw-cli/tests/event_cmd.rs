@@ -60,6 +60,8 @@ impl sw_pal::FsRead for DummyFs {
 
 struct DummyClock;
 impl sw_pal::Clock for DummyClock {
+    fn wall_unix_us(&self) -> i64 { 0 }
+    fn local_utc_offset_s(&self) -> i32 { 0 }
     fn mono_ns(&self) -> u64 { 0 }
     fn sleep(&self, _: std::time::Duration) {}
 }
@@ -87,6 +89,9 @@ fn event_params_and_dispatch_fail_until_implemented() {
         exec_replace: true,
         on_demand_autostart: false,
         console_kind: sw_pal::ConsoleKind::Pty,
+        native_device: sw_pal::DeviceBackendKind::Posix,
+        com0com_console: false,
+        flash_endpoint: true,
     };
     let p = sw_pal::ClientPlatform {
         env: std::sync::Arc::new(DummySysEnv),
@@ -98,6 +103,16 @@ fn event_params_and_dispatch_fail_until_implemented() {
         tunnel: sw_pal::fakes::FakeTunnel::new(false),
         service: sw_pal::fakes::FakeServiceCtl::new(Vec::new()),
         registry: sw_pal::fakes::FakeRegistry::new(Vec::new(), &[]),
+        serial: sw_pal::fakes::serial::FakeSerialBackend::new(),
+        uart_excl: std::sync::Arc::new(sw_pal::fakes::serial::FakeUartExclusive { report: Default::default() }),
+        devices: sw_pal::fakes::platform::unconfigured_devices(),
+        instance_lock: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("instance_lock")),
+        wal_fs: sw_pal::fakes::wal_fs::FakeWalFs::new(),
+        rpc_listen: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("rpc_listen")),
+        console: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("console")),
+        signals: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("signals")),
+        handlers: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("handlers")),
+        usb: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("usb")),
         caps,
     };
     let env = sw_proto::runtime_paths::EnvSnapshot::from_pairs(std::iter::empty());
@@ -114,6 +129,8 @@ fn event_params_and_dispatch_fail_until_implemented() {
         wal_dir: String::new(),
         log_dir: String::new(),
         config_yaml: String::new(),
+        system_config_path: String::new(),
+        ttymcu_path: String::new(),
     };
     let mut out = Vec::new();
     let mut err = Vec::new();

@@ -117,23 +117,20 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# 將版本庫已追蹤與未忽略的未追蹤檔複製到 Windows 本機磁碟。
+# 將版本庫已追蹤與未忽略的未追蹤檔複製到 Windows 本機磁碟（實作在 lib-stage-copy.sh，可單獨測試）。
 manifest="$run_dir/files.list"
 git -C "$repo" ls-files -z --cached --others --exclude-standard --deduplicate > "$manifest"
-(
-    cd "$repo"
-    while IFS= read -r -d '' path; do
-        if [[ ! -e "$path" && ! -L "$path" ]]; then
-            continue
-        fi
-        cp --parents --target-directory="$stage" -- "$path"
-    done < "$manifest"
-)
+# shellcheck source=scripts/stage0/lib-stage-copy.sh
+source "$repo/scripts/stage0/lib-stage-copy.sh"
+stage_copy_repo "$repo" "$stage" "$manifest"
 
 # Windows 原生測試會查詢提交歷史與工作樹差異；讓 staging 有完整的目前分支歷史。
 git -C "$stage" init -q
 git -C "$stage" config --local core.autocrlf false
 git -C "$stage" config --local core.filemode false
+# symlink 在 staging 以「內容＝連結目標」的一般檔呈現（同 Windows git 的 core.symlinks=false checkout），
+# 明確關閉 symlinks，避免 Windows git 把 AGENTS.md 等 symlink 判為已修改（provenance clean=false）。
+git -C "$stage" config --local core.symlinks false
 git -C "$stage" fetch -q --no-tags "$repo" HEAD
 git -C "$stage" update-ref HEAD FETCH_HEAD
 git -C "$stage" read-tree HEAD

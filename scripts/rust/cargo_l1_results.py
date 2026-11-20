@@ -27,6 +27,12 @@ from typing import Any, Sequence
 TEST_LINE = re.compile(r"^test (.*?)(?: - should panic)? \.\.\. (ok|FAILED|ignored)(?:,.*)?$")
 LIST_LINE = re.compile(r"^(.+?):\s+test\s*$")
 CAPABILITY_TEST = re.compile(r"^cap_([a-z0-9]+(?:_[a-z0-9]+)*)__")
+
+
+def capability_of(name: str) -> str | None:
+    """libtest 名稱 → 能力名稱（`cap_<cap>__*`）；以最後一段比對，lib 單元測試帶模組路徑者亦適用（P5 第 6 輪）。"""
+    matched = CAPABILITY_TEST.match(name.rsplit("::", 1)[-1])
+    return matched.group(1) if matched else None
 # 與 `git status` 的守門範圍一致：repo 根（本檔上兩層）。
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROVENANCE_SCHEMA = "cargo-l1-provenance.v1"
@@ -53,6 +59,10 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--runner", help="執行測試 exe 的 runner 路徑")
     parser.add_argument("--list-only", action="store_true", help="只輸出已收集的 nodeid")
     parser.add_argument("--caps", action="append", default=[], help="另執行 ignored 的指定資源測試，可重複")
+    parser.add_argument(
+        "--caps-only", action="store_true",
+        help="只執行 --caps 指定的能力測試（略過預設 run），其餘收集列記為 deselected；必要集合 selector 只選 ignored 能力列時使用",
+    )
     parser.add_argument("--timeout", type=float, default=900.0, help="每次測試執行的逾時秒數")
     parser.add_argument("--summary-out", help=argparse.SUPPRESS)
     parser.add_argument("--out", required=True, help="JSON 報告路徑")
@@ -282,8 +292,7 @@ def _parse_results(text: str, target: TargetRun) -> list[dict[str, Any]]:
             skip_kind = None
         else:
             outcome = "skipped"
-            capability = CAPABILITY_TEST.match(name)
-            skip_kind = "capability" if capability else "other"
+            skip_kind = "capability" if capability_of(name) else "other"
         parsed.append(
             {
                 "nodeid": _nodeid(target, name),
@@ -299,6 +308,33 @@ def _parse_results(text: str, target: TargetRun) -> list[dict[str, Any]]:
     return parsed
 
 
+_FAILURES_HEAD = re.compile(r"^failures:\s*$")
+
+
+def _failures_section(stdout: str) -> str:
+    """libtest stdout 的失敗段（第一個 `failures:` 起到結尾）；沒有即回空字串。"""
+    lines = stdout.splitlines()
+    for index, line in enumerate(lines):
+        if _FAILURES_HEAD.match(line.strip()):
+            return "\n".join(lines[index:]) + "\n"
+    return ""
+
+
+def _keep_failure_output(out_path: Path, target: TargetRun, label: str, rc: int, stdout: str, stderr: str) -> None:
+    """P5 第 7 輪：測試執行失敗（rc≠0）時，把 libtest stdout 的失敗段（panic 訊息）轉印到 stderr（gate log 可見），
+    並把完整 stdout／stderr 存到 `<報告>.failures/<crate>-<target>[-<label>].{stdout,stderr}.txt`。報告內容不變。"""
+    if rc == 0:
+        return
+    tag = f"{target.crate}-{target.target}" + (f"-{label}" if label else "")
+    section = _failures_section(stdout)
+    print(f"cargo_l1_results.py: {tag} 結束碼 {rc}；失敗段：\n{section or '(stdout 無 failures 段)'}", file=sys.stderr, end="")
+    keep = out_path.parent / f"{out_path.name}.failures"
+    keep.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", tag)
+    (keep / f"{safe}.stdout.txt").write_text(stdout, encoding="utf-8")
+    (keep / f"{safe}.stderr.txt").write_text(stderr, encoding="utf-8")
+
+
 def _read_report(path: str, value: dict[str, Any]) -> None:
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -308,6 +344,9 @@ def _read_report(path: str, value: dict[str, Any]) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     out_path = Path(args.out)
+    if args.caps_only and not args.caps:
+        print("cargo_l1_results.py: --caps-only 須至少指定一個 --caps", file=sys.stderr)
+        return 2
     manifest_error = _manifest_error(args.cargo_args)
     if manifest_error is not None:
         print(f"cargo_l1_results.py: {manifest_error}", file=sys.stderr)
@@ -413,29 +452,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not target.collected_names:
             continue
         runner_argv = [args.runner, target.executable] if args.runner else [target.executable]
-        run_rc, run_stdout, run_stderr, run_complete = _run(runner_argv, args.timeout)
-        target.exit_codes.append(run_rc)
-        if not run_complete:
-            finished = False
-        if run_stderr:
-            print(run_stderr, file=sys.stderr, end="" if run_stderr.endswith("\n") else "\n")
-        target.results = _parse_results(run_stdout, target)
-
-        available_caps = {
-            matched.group(1)
-            for name in target.ignored_names
-            if (matched := CAPABILITY_TEST.match(name)) is not None
-        }
+        available_caps = {cap for name in target.ignored_names if (cap := capability_of(name)) is not None}
         selected_caps = [cap for cap in args.caps if cap in available_caps]
+        if args.caps_only and not selected_caps:
+            continue                     # sol P5-54dd588-2：--caps-only 時不含所選能力的執行檔不執行（其收集列記 deselected）
+        if not args.caps_only:
+            run_rc, run_stdout, run_stderr, run_complete = _run(runner_argv, args.timeout)
+            target.exit_codes.append(run_rc)
+            if not run_complete:
+                finished = False
+            if run_stderr:
+                print(run_stderr, file=sys.stderr, end="" if run_stderr.endswith("\n") else "\n")
+            _keep_failure_output(out_path, target, "", run_rc, run_stdout, run_stderr)
+            target.results = _parse_results(run_stdout, target)
+
         for cap in selected_caps:
+            # P5 第 7 輪：能力測試以單執行緒執行。同執行檔平行測試 fork 子行程時，子行程在 exec 前暫時持有父行程全部 fd
+            # 的複本（含 CLOEXEC 者），會被其他測試的 /proc holder 掃描看成外部 holder（cap_posix_pty__* 並行間歇 Held）。
             cap_rc, cap_stdout, cap_stderr, cap_complete = _run(
-                runner_argv + ["--ignored", f"cap_{cap}__"], args.timeout
+                runner_argv + ["--ignored", f"cap_{cap}__", "--test-threads=1"], args.timeout
             )
             target.exit_codes.append(cap_rc)
             if not cap_complete:
                 finished = False
             if cap_stderr:
                 print(cap_stderr, file=sys.stderr, end="" if cap_stderr.endswith("\n") else "\n")
+            _keep_failure_output(out_path, target, f"cap_{cap}", cap_rc, cap_stdout, cap_stderr)
             cap_results = _parse_results(cap_stdout, target)
             replaced = {row["nodeid"]: row for row in cap_results}
             target.results = [replaced.get(row["nodeid"], row) for row in target.results]
@@ -467,6 +509,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"cargo_l1_results.py: 測試執行檔於執行期間被改寫或移除，拒絕視為完整證據：{changed}", file=sys.stderr)
 
     results = [row for target in targets for row in target.results]
+    # sol P5-54dd588-2：--caps-only 只執行能力測試；未執行的收集列記為 deselected（結果與收集一致，l1_judge 規則 8），
+    # 必要集合若含這些列即判 deselected required（不得當成已執行）。預設模式不 deselect 任何列。
+    deselected: list[str] = []
+    if args.caps_only:
+        ran = {row["nodeid"] for row in results}
+        deselected = [nodeid for nodeid in collected if nodeid not in ran]
     tally = {"passed": 0, "failed": 0, "skipped": 0}
     for result in results:
         outcome = result["outcome"]
@@ -486,7 +534,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "uart_kind": "native",
         "not_collected_platform": [],
         "collected": collected,
-        "deselected": [],
+        "deselected": deselected,
         "results": results,
         "exit_code": exit_code,
         "finished": finished,
@@ -497,10 +545,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _read_report(args.out, report)
     if args.summary_out:
         available_caps = {
-            matched.group(1)
-            for target in targets
-            for name in target.ignored_names
-            if (matched := CAPABILITY_TEST.match(name)) is not None
+            cap for target in targets for name in target.ignored_names if (cap := capability_of(name)) is not None
         }
         evidence_insufficient = {
             matched.group(1)

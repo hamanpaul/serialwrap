@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# S1X G3：以 WSL interop 在 Windows 本機磁碟執行 L1.5 bridge 情境（COM20:COM21），產出 stage1a_gate 的 `--l15-report windows=` 來源。
+# S1X G3／OD-31：以 WSL interop 在 Windows 本機磁碟執行 bridge func-test（固定 COM20:COM21）。Stage 2 bundle 直接啟動 Rust daemon。
 #
-# 每次呼叫於同一 staging、同一 bundle、同一自測報告下執行兩次 runner：
+# 一般呼叫於同一 staging、同一 bundle、同一自測報告下執行 scenarios 與 basic runner；--case 聚焦模式只執行 basic runner，避免 ev-01 被 scenario fallback 重跑：
 #   1. 情境（scenarios）：py -3.12 func-test/runner.py --mode bridge --scenarios --daemon-com COM20 --bridge-com COM21 \
 #        --transport-mode virtual_com0com --selftest-report <Windows 自測報告> --report-dir <run>\report
 #      報告：<report-dir>/func-test-report.json（plan 04 Step 5 的 Windows 形式，argv 不變）。
@@ -11,7 +11,7 @@
 #      gate 5c-iv 要求每個宣告平台都有列；只跑情境時 Windows 永遠缺這些列。
 # 只使用 COM20（serialwrap／受測端）與 COM21（bridge／測試端）；本 wrapper 不接受其他 COM 參數，
 # 也不接觸既有的隔離排程工作、其 serialwrapd，或其他 Windows 行程。
-# runner 的 SERIALWRAP_CLI_EXE 指向 staging 中複製的 bundle（<bundle>\bin\serialwrap.exe）。
+# runner 的 SERIALWRAP_CLI_EXE 指向 staging 中複製的 bundle（<bundle>\bin\serialwrap.exe）；Stage 2 時 SERIALWRAP_DAEMON_EXE 同樣指向該 bundle 的 serialwrapd.exe。
 # 編碼：只設定 PYTHONIOENCODING=utf-8（runner 自身的 stdio）；不設定 PYTHONUTF8，使 bridge 子行程呼叫 git／powershell
 # 時依系統 locale（Windows 為 cp950）解碼，避免 0xAA（Big5「版」）等位元組在 reader thread 拋出 UnicodeDecodeError。
 #
@@ -33,18 +33,23 @@ BRIDGE_COM=COM21
 TRANSPORT_MODE=virtual_com0com
 RUNNER_TIMEOUT_S="${SW_WIN_TIMEOUT:-5400}"
 RUNNER_ARGV=()
+CASE_FILTER=""
+BUNDLE_IDENTITY_JSON=""
+BUNDLE_STAGE=""
+BUNDLE_GIT_REVISION=""
 
 usage() {
   cat <<'USAGE'
 用法：
-  scripts/rust/win-func-test.sh --bundle <目錄> --selftest-report <JSON> --report-dir <目錄>
+  scripts/rust/win-func-test.sh --bundle <目錄> --selftest-report <JSON> --report-dir <目錄> [--case ev-01-spawn-handler]
   scripts/rust/win-func-test.sh --print-argv
   scripts/rust/win-func-test.sh --print-basic-argv
 
 選項：
-  --bundle <目錄>            G4 匯出的 Windows dev bundle（需含 bin/serialwrap.exe 與 bin/current-release.json）
+  --bundle <目錄>            Windows Stage 2 bundle（需含 Rust serialwrap.exe／serialwrapd.exe 與 bin/current-release.json）
   --selftest-report <檔案>   Windows bridge 自測報告（verdict PASS、win-serial、virtual_com0com、COM20:COM21）
   --report-dir <目錄>        輸出目錄（情境報告與 meta 於此；基本案例報告於 basic/；runner 日誌於 runner-logs/）
+  --case ev-01-spawn-handler 只執行 OD-31 的 Windows 案例（只跑 basic runner，避免重複）
   --print-argv               僅輸出情境 runner argv（JSON 陣列，路徑為佔位），不執行
   --print-basic-argv         僅輸出基本案例 runner argv（JSON 陣列，路徑為佔位），不執行
 USAGE
@@ -57,7 +62,9 @@ runner_argv() {
   if [[ "${3:-}" == basic ]]; then
     scenario_flag=()
   fi
-  RUNNER_ARGV=(-3.12 func-test/runner.py --mode bridge ${scenario_flag[@]+"${scenario_flag[@]}"}
+  RUNNER_ARGV=(-3.12 func-test/runner.py --mode bridge)
+  if [[ -n "$CASE_FILTER" ]]; then RUNNER_ARGV+=(--case "$CASE_FILTER"); fi
+  RUNNER_ARGV+=(${scenario_flag[@]+"${scenario_flag[@]}"}
     --daemon-com "$DAEMON_COM" --bridge-com "$BRIDGE_COM" --transport-mode "$TRANSPORT_MODE"
     --selftest-report "$1" --report-dir "$2")
 }
@@ -83,6 +90,10 @@ while [[ $# -gt 0 ]]; do
     --report-dir)
       [[ $# -ge 2 ]] || sw_win_die "--report-dir 缺少參數"
       report_dir="$2"; shift 2 ;;
+    --case)
+      [[ $# -ge 2 ]] || sw_win_die "--case 缺少參數"
+      [[ "$2" == "ev-01-spawn-handler" ]] || sw_win_die "--case 目前只接受 ev-01-spawn-handler"
+      CASE_FILTER="$2"; shift 2 ;;
     --print-argv) print_argv=1; shift ;;
     --print-basic-argv) print_basic=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -101,7 +112,7 @@ if [[ "$print_basic" -eq 1 ]]; then
   exit 0
 fi
 
-[[ -n "$bundle" ]] || sw_win_die "缺少 --bundle（G4 匯出的 Windows dev bundle）"
+[[ -n "$bundle" ]] || sw_win_die "缺少 --bundle（Windows Stage 2 bundle）"
 [[ -f "$bundle/bin/serialwrap.exe" && -f "$bundle/bin/current-release.json" ]] \
   || sw_win_die "bundle 不完整（需 bin/serialwrap.exe 與 bin/current-release.json）：$bundle"
 [[ -n "$selftest" && -f "$selftest" ]] || sw_win_die "找不到 Windows 自測報告：$selftest"
@@ -123,6 +134,12 @@ ok = (
 sys.exit(0 if ok else 2)
 PY
 
+if ! BUNDLE_IDENTITY_JSON="$(python3 "$ROOT/scripts/rust/p7_gate_report.py" windows-bundle-identity --bundle "$bundle")"; then
+  sw_win_die "無法核對 Windows bundle 身分／SHA-256：$bundle"
+fi
+BUNDLE_STAGE="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("stage") or "")' "$BUNDLE_IDENTITY_JSON")"
+BUNDLE_GIT_REVISION="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("git_revision") or "")' "$BUNDLE_IDENTITY_JSON")"
+
 sw_win_require_interop
 trap sw_win_cleanup EXIT
 trap 'exit 130' INT
@@ -130,9 +147,16 @@ trap 'exit 143' TERM
 
 run_id="$(date +%y%m%d-%H%M%S)-$$"
 sw_win_stage_create "$run_id"
+if [[ "$BUNDLE_STAGE" == "rust-2" && "$BUNDLE_GIT_REVISION" != "$SW_WIN_HEAD" ]]; then
+  sw_win_die "Stage 2 bundle HEAD=$BUNDLE_GIT_REVISION 與本次 staging HEAD=$SW_WIN_HEAD 不符"
+fi
 sw_win_write_launcher
 
 cp -a -- "$bundle" "$SW_WIN_RUN_UNIX/bundle"
+COPIED_BUNDLE_SHA="$(python3 "$ROOT/scripts/rust/p7_gate_report.py" windows-bundle-identity --bundle "$SW_WIN_RUN_UNIX/bundle" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["bundle_sha256"])')"
+SOURCE_BUNDLE_SHA="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["bundle_sha256"])' "$BUNDLE_IDENTITY_JSON")"
+[[ "$COPIED_BUNDLE_SHA" == "$SOURCE_BUNDLE_SHA" ]] || sw_win_die "staging 中的 Windows bundle SHA-256 與來源不符"
 cp -- "$selftest" "$SW_WIN_RUN_UNIX/selftest-report.json"
 mkdir -p -- "$SW_WIN_RUN_UNIX/report-basic"
 selftest_sha="$(sha256sum "$selftest" | cut -d' ' -f1)"
@@ -145,16 +169,26 @@ sw_win_write_env \
   "TEMP=$SW_WIN_RUN_WIN\\tmp" \
   "SERIALWRAP_CLI_EXE=$SW_WIN_RUN_WIN\\bundle\\bin\\serialwrap.exe" \
   "SERIALWRAP_TEST_DEVICE_ALLOWLIST=$DAEMON_COM"
+if [[ "$BUNDLE_STAGE" == "rust-2" ]]; then
+  printf '%s\n' "SERIALWRAP_DAEMON_EXE=${SW_WIN_RUN_WIN}\\bundle\\bin\\serialwrapd.exe" >> "$SW_WIN_RUN_UNIX/child-env.txt"
+fi
 
-echo "win-func-test: staging=$SW_WIN_RUN_UNIX（HEAD=$SW_WIN_HEAD，git_clean=$SW_WIN_GIT_CLEAN）"
+echo "win-func-test: staging=$SW_WIN_RUN_UNIX（HEAD=$SW_WIN_HEAD，git_clean=$SW_WIN_GIT_CLEAN；bundle_stage=$BUNDLE_STAGE）"
 
-# 第一次：情境（argv 與 plan 04 Step 5 Windows 形式逐字相同）。
-runner_argv "$SW_WIN_RUN_WIN\\selftest-report.json" "$SW_WIN_RUN_WIN\\report"
-scenario_argv=("${RUNNER_ARGV[@]}")
-sw_win_run_child "$RUNNER_TIMEOUT_S" "${RUNNER_ARGV[@]}"
-scenario_rc="$SW_WIN_CHILD_RC"
-sw_win_collect_child_logs "$SW_WIN_RUN_UNIX/logs/runner"
-echo "win-func-test: 情境執行結束 exit=$scenario_rc"
+# 第一次：完整模式執行情境；聚焦 --case 時只執行下一步 basic，避免 scenario fallback 重複執行同一案例。
+mkdir -p -- "$SW_WIN_RUN_UNIX/report"
+if [[ -z "$CASE_FILTER" ]]; then
+  runner_argv "$SW_WIN_RUN_WIN\\selftest-report.json" "$SW_WIN_RUN_WIN\\report"
+  scenario_argv=("${RUNNER_ARGV[@]}")
+  sw_win_run_child "$RUNNER_TIMEOUT_S" "${RUNNER_ARGV[@]}"
+  scenario_rc="$SW_WIN_CHILD_RC"
+  sw_win_collect_child_logs "$SW_WIN_RUN_UNIX/logs/runner"
+  echo "win-func-test: 情境執行結束 exit=$scenario_rc"
+else
+  scenario_rc=0
+  scenario_argv=()
+  echo "win-func-test: 聚焦案例模式略過 scenarios runner（避免重複執行 $CASE_FILTER）"
+fi
 
 # 第二次：基本案例（同一 staging；不因情境失敗而略過）。
 runner_argv "$SW_WIN_RUN_WIN\\selftest-report.json" "$SW_WIN_RUN_WIN\\report-basic" basic
@@ -175,17 +209,22 @@ for f in "$SW_WIN_RUN_UNIX"/logs/runner*.*; do
   fi
 done
 
+basic_report_sha=""
+[[ ! -f "$report_dir/basic/func-test-report.json" ]] || basic_report_sha="$(sha256sum "$report_dir/basic/func-test-report.json" | cut -d' ' -f1)"
 python3 - "$report_dir/win-func-test-meta.json" "$run_id" "$SW_WIN_HEAD" "$SW_WIN_TREE" "$SW_WIN_GIT_CLEAN" \
   "$selftest" "$selftest_sha" "$cli_sha" "$RUNNER_TIMEOUT_S" "$DAEMON_COM" "$BRIDGE_COM" \
-  "$TRANSPORT_MODE" "$scenario_rc" "$basic_rc" "$(json_array "${scenario_argv[@]}")" "$(json_array "${basic_argv[@]}")" <<'PY'
+  "$TRANSPORT_MODE" "$scenario_rc" "$basic_rc" "$(json_array "${scenario_argv[@]}")" "$(json_array "${basic_argv[@]}")" \
+  "$BUNDLE_IDENTITY_JSON" "$basic_report_sha" "$CASE_FILTER" "$([[ "$BUNDLE_STAGE" == "rust-2" ]] && echo true || echo false)" <<'PY'
 import datetime as dt
 import json
 import sys
 from pathlib import Path
 
 (out, run_id, head, tree, git_clean, selftest, selftest_sha, cli_sha, timeout_s,
- daemon_com, bridge_com, transport, scenario_rc, basic_rc, scenario_argv, basic_argv) = sys.argv[1:17]
+ daemon_com, bridge_com, transport, scenario_rc, basic_rc, scenario_argv, basic_argv,
+ bundle_identity_json, basic_report_sha, case_filter, daemon_exe_used) = sys.argv[1:21]
 selftest_doc = json.loads(Path(selftest).read_text(encoding="utf-8"))
+bundle_identity = json.loads(bundle_identity_json)
 meta = {
     "schema_version": "win-func-test-meta.v2",
     "run_id": run_id,
@@ -198,14 +237,26 @@ meta = {
     "selftest_report_sha256": selftest_sha,
     "tool_tree_sha256": (selftest_doc.get("tool") or {}).get("tree_sha256"),
     "cli_exe_sha256": cli_sha,
+    "daemon_exe_sha256": bundle_identity.get("daemon_sha256"),
+    "daemon_exe_used": daemon_exe_used == "true",
+    "bundle_sha256": bundle_identity.get("bundle_sha256"),
+    "bundle_stage": bundle_identity.get("stage"),
+    "bundle_version": bundle_identity.get("version"),
+    "bundle_git_revision": bundle_identity.get("git_revision"),
+    "bundle_manifest_sha256": bundle_identity.get("manifest_sha256"),
+    "basic_report_sha256": basic_report_sha or None,
+    "case_filter": case_filter or None,
     "runner_timeout_s": int(timeout_s),
     # 與 v1 相容的頂層欄位指向情境執行；完整兩次執行見 runs。
     "runner_argv": json.loads(scenario_argv),
     "runner_exit": int(scenario_rc),
+    "scenario_skipped": case_filter == "ev-01-spawn-handler",
     "runs": {
         "scenarios": {
             "runner_argv": json.loads(scenario_argv),
             "runner_exit": int(scenario_rc),
+            "skipped": case_filter == "ev-01-spawn-handler",
+            "skip_reason": "focused basic case only" if case_filter == "ev-01-spawn-handler" else None,
             "report": "func-test-report.json",
         },
         "basic": {
@@ -220,7 +271,7 @@ PY
 
 rc_scenario="$scenario_rc"
 rc_basic="$basic_rc"
-if [[ ! -f "$report_dir/func-test-report.json" ]]; then
+if [[ -z "$CASE_FILTER" && ! -f "$report_dir/func-test-report.json" ]]; then
   echo "win-func-test: 情境 runner 未產生 func-test-report.json（exit=$scenario_rc）" >&2
   [[ "$rc_scenario" -ne 0 ]] || rc_scenario=125
 fi

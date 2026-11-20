@@ -118,7 +118,13 @@ CARGO = [
 ]
 
 
-@pytest.mark.parametrize("toml, rule", CARGO)
+# P5 第 6 輪 SPEC-GAP #3（編排者裁決：明確 ids，不改斷言）：pytest 9.2 起過長的字串參數改以 `toml2` 類 id 呈現，
+# nodeid 隨 pytest 版本變動、無法穩定入鎖。明確 ids 沿用 pytest 9.0.3 的自動 id 形式（`<toml>-<rule>`），
+# 使已凍結的三個 nodeid 不變（無須移除）、第四個（target-section）在各版本皆穩定。
+CARGO_IDS = [f"{toml}-{rule}" for toml, rule in CARGO]
+
+
+@pytest.mark.parametrize("toml, rule", CARGO, ids=CARGO_IDS)
 def test_cargo_toml_bypass(tmp_path, toml, rule):
     _write(tmp_path, "crates/sw-core/src/lib.rs", "")
     _write(tmp_path, "crates/sw-core/Cargo.toml", toml)

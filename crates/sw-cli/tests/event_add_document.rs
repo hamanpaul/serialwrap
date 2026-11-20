@@ -44,6 +44,16 @@ fn platform(
         tunnel: sw_pal::fakes::FakeTunnel::new(false),
         service: sw_pal::fakes::FakeServiceCtl::new(Vec::new()),
         registry: sw_pal::fakes::FakeRegistry::new(Vec::new(), &[]),
+        serial: sw_pal::fakes::serial::FakeSerialBackend::new(),
+        uart_excl: std::sync::Arc::new(sw_pal::fakes::serial::FakeUartExclusive { report: Default::default() }),
+        devices: sw_pal::fakes::platform::unconfigured_devices(),
+        instance_lock: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("instance_lock")),
+        wal_fs: sw_pal::fakes::wal_fs::FakeWalFs::new(),
+        rpc_listen: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("rpc_listen")),
+        console: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("console")),
+        signals: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("signals")),
+        handlers: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("handlers")),
+        usb: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("usb")),
         caps: ClientCaps {
             path_flavor: PalPathFlavor::Posix,
             af_unix: true,
@@ -53,6 +63,9 @@ fn platform(
             exec_replace: true,
             on_demand_autostart: false,
             console_kind: sw_pal::ConsoleKind::Pty,
+            native_device: sw_pal::DeviceBackendKind::Posix,
+            com0com_console: false,
+            flash_endpoint: true,
         },
     };
     (p, conn)

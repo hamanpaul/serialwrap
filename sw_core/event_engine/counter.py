@@ -27,7 +27,7 @@ class Counter:
 class CounterStore:
     """Per-rule counter persisted under EVENTS_RUNTIME_DIR (tmpfs).
 
-    Files are atomic via tmp+rename. Missing file ⇒ zero counter.
+    Files are atomic via tmp+replace (DF-18: Windows-safe overwrite). Missing file ⇒ zero counter.
     """
 
     def __init__(self, root: str) -> None:
@@ -54,7 +54,7 @@ class CounterStore:
             json.dump(counter.to_json(), f)
             f.flush()
             os.fsync(f.fileno())
-        os.rename(tmp, path)
+        os.replace(tmp, path)
 
     def clear(self, rule_id: str) -> None:
         try:

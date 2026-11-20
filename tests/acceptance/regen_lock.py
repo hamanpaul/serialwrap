@@ -5,14 +5,21 @@
   python3 tests/acceptance/regen_lock.py --check --cases-only
                                                       # 只驗證案例鎖（供 func-test 執行器；不檢查 L1 鎖）
   python3 tests/acceptance/regen_lock.py --check --base <rev> [--allow-removal <set_id:platform:nodeid>…]
-                                                      # 另以 <rev> 的 L1 鎖為基準：基準已有的 (set, platform, nodeid) 消失或 selector 改變即 exit 1
+                                                      # 另以 <rev> 的 L1 鎖為基準；selector 僅接受 2026-11-13 N3 指定遷移
   python3 tests/acceptance/regen_lock.py --add-only   # 重算；既有 ID 從任何集合消失、被延後切片，或分母屬性被改動即 exit 1 且不寫檔，否則寫回
+  python3 tests/acceptance/regen_lock.py --add-only --authorize-deferral <case_id>:OD-<n> …
+                                                      # 擁有者裁決逐名授權的延後切片（OD-34 起）：只放行該案例 daemon_slice 往後移
+                                                      # 及因此自較早 slice_X 消失；其他屬性改動、其他案例或未對應實際延後的授權仍拒絕
+  python3 tests/acceptance/regen_lock.py --add-only --allow-defer <case_id>:<from>:<to>:<OD-NN> [...]
+                                                      # 擁有者裁決逐名核准的延後切片（OD-34 起）：只允許該案例 daemon_slice 由 from 改為較晚的 to，
+                                                      # 其餘屬性不得改；核准須與實際延後集合完全相符（多列、少列、OD 編號不合法皆拒絕且不寫檔）
   python3 tests/acceptance/regen_lock.py --l1-add-only --set <id> --platform <linux|windows> --collect <檔>
           (--selector <json檔> | --argv-json <json> [--paths-json <json>] [--markexpr <str>])
                                                       # L1 必要集合只增（P2-T13，R5-F3）；既有 nodeid 消失即 exit 1 且不寫檔；
                                                       # 經核准替換者須逐筆列 --allow-removal set_id:platform:nodeid，三元組須全部屬於本次 set／平台，
-                                                      # 且清單必須與該集合消失集合完全相符；新增 set／平台時必須給 selector（檔案或行內 JSON 皆可）
-                                                      # OD-24：collect JSON 的 ignored 名單（cargo_l1_results.py --list-only）新增時排除；
+                                                      # 且清單必須與該集合消失集合完全相符；既有 selector 僅 N3 指定遷移可改
+                                                      # 新增 set／平台時必須給 selector（檔案或行內 JSON 皆可）
+                                                      # OD-24：collect JSON 的 ignored 列新增時預設排除；明確 `-- --ignored cap_<cap>__` 僅納入同能力列；
                                                       # 鎖中既有 ignored 列仍屬 collected、不視為消失，只能逐名 --allow-removal 移除
   python3 tests/acceptance/regen_lock.py --p4-error-codes-add-only --allow-error-code <CODE>...
                                                       # P4 錯誤碼基線只接受逐名核准的新增；既有碼不得移除
@@ -59,6 +66,26 @@ SLICES = ("2.1", "2.2", "2.3", "2.4")
 ATTR_KEYS = ("suite", "layer", "platforms", "expected", "necessity", "daemon_slice", "cli_stage", "stage0_required")
 # 核准移除之粒度為 (set_id, platform, nodeid) 三元組：同名 nodeid 在不同集合／平台的核准互不相通。
 Approval = tuple[str, str, str]
+
+# 2026-11-13 擁有者裁決 N3：pytest_full 兩集合移出已收過的 Stage 1 證據測試，
+# gate selector 逐字對齊 CI。這是唯一允許改既有 selector 的遷移。
+_N3_REMOVALS = frozenset({
+    "tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native",
+    "tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
+})
+_N3_PYTEST_FULL_SETS = frozenset({
+    "s21_gate:pytest_full",
+    "p7_gate:python3-m-pytest-q-tests",
+})
+_N3_OLD_SELECTOR = {"argv": ["-q", "tests/"], "paths": ["tests/"], "markexpr": ""}
+_N3_NEW_SELECTOR = {
+    "argv": [
+        "-q", "tests/", "--deselect", "tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native",
+        "--deselect", "tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
+    ],
+    "paths": ["tests/"],
+    "markexpr": "",
+}
 
 
 def _configure_stdio() -> None:
@@ -197,7 +224,55 @@ def cmd_check(cases_path: pathlib.Path, lock_path: pathlib.Path) -> int:
     return 0
 
 
-def cmd_add_only(cases_path: pathlib.Path, lock_path: pathlib.Path) -> int:
+DEFERRAL_REF_RE = re.compile(r"^OD-\d+$")
+
+
+def parse_deferral_authorization(token: str) -> tuple[str, str]:
+    """`<case_id>:OD-<n>` → (case_id, decision_ref)；擁有者裁決編號以外的依據一律拒絕。"""
+    cid, sep, ref = token.rpartition(":")
+    if not sep or not cid or not DEFERRAL_REF_RE.match(ref):
+        raise ValueError(f"--authorize-deferral 須為 <case_id>:OD-<n>：{token!r}")
+    return cid, ref
+
+
+def _is_authorized_deferral(old_a: dict[str, Any] | None, new_a: dict[str, Any] | None) -> bool:
+    """只有 daemon_slice 往後移、其餘分母屬性完全不變才算可授權的延後。"""
+    if not old_a or not new_a:
+        return False
+    if {k for k in ATTR_KEYS if old_a.get(k) != new_a.get(k)} != {"daemon_slice"}:
+        return False
+    old_s, new_s = old_a.get("daemon_slice"), new_a.get("daemon_slice")
+    return isinstance(old_s, str) and isinstance(new_s, str) and _slice_tuple(new_s) > _slice_tuple(old_s)
+
+
+# 延後切片核准：(case_id, from_slice, to_slice, OD 編號)；OD 編號須為擁有者裁決 `OD-<數字>`。
+DeferApproval = tuple[str, str, str, str]
+_OD_RE = re.compile(r"^OD-\d+$")
+
+
+def parse_defer_approval(token: str) -> DeferApproval:
+    parts = token.split(":")
+    if len(parts) != 4 or not all(parts):
+        raise ValueError(f"--allow-defer 須為 case_id:from:to:OD-NN：{token!r}")
+    cid, src, dst, od = parts
+    if src not in SLICES or dst not in SLICES or _slice_key(dst) <= _slice_key(src):
+        raise ValueError(f"--allow-defer 的切片須為 {SLICES} 且 to 晚於 from：{token!r}")
+    if not _OD_RE.match(od):
+        raise ValueError(f"--allow-defer 須引用擁有者裁決 OD-NN：{token!r}")
+    return cid, src, dst, od
+
+
+def _slice_key(slice_id: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in slice_id.split("."))
+
+
+def cmd_add_only(cases_path: pathlib.Path, lock_path: pathlib.Path,
+                 defers: set[DeferApproval] | None = None,
+                 deferrals: dict[str, str] | None = None) -> int:
+    # 兩種逐名核准並存（合併 P5 `--allow-defer` 與 P6 `--authorize-deferral`）：前者明列 from／to，
+    # 後者由鎖與 cases 的 daemon_slice 推得；兩者皆只放行該案例 daemon_slice 往後移、其餘屬性不變。
+    defers = set(defers or ())
+    deferrals = deferrals or {}
     cases_data = _load_yaml(cases_path)
     new_sets = compute_sets(cases_data)
     new_attrs = compute_attrs(cases_data)
@@ -205,21 +280,51 @@ def cmd_add_only(cases_path: pathlib.Path, lock_path: pathlib.Path) -> int:
         old = json.loads(lock_path.read_text(encoding="utf-8"))
     else:
         old = _empty_lock(None)
+    old_attrs = old.get("case_attrs")
+    authorized = {cid for cid in deferrals
+                  if _is_authorized_deferral((old_attrs or {}).get(cid), new_attrs.get(cid))}
+    # 核准的延後：該案例只有 daemon_slice 由 from 改為 to；其從較早切片集合消失屬核准範圍。
+    approved: dict[str, DeferApproval] = {}
+    unused: list[str] = []
+    for item in sorted(defers):
+        cid, src, dst, od = item
+        old_a = (old_attrs or {}).get(cid)
+        new_a = new_attrs.get(cid)
+        if (old_a is None or new_a is None or old_a.get("daemon_slice") != src or new_a.get("daemon_slice") != dst
+                or {k: v for k, v in old_a.items() if k != "daemon_slice"}
+                != {k: v for k, v in new_a.items() if k != "daemon_slice"}):
+            unused.append(f"{cid}:{src}:{dst}:{od}（與實際變更不符或未使用）")
+            continue
+        approved[cid] = item
     removed: list[str] = []
     for name, old_ids in (old.get("sets") or {}).items():
         gone = sorted(set(old_ids) - set(new_sets.get(name, [])))
         for cid in gone:
+            if (cid in authorized and name.startswith("slice_")
+                    and _slice_tuple(name[len("slice_"):]) < _slice_tuple(new_attrs[cid]["daemon_slice"])):
+                continue
+            if cid in approved and name.startswith("slice_") and _slice_key(name[len("slice_"):]) < _slice_key(approved[cid][2]):
+                continue
             removed.append(f"{cid}（集合 {name}）")
     changed: list[str] = []
-    old_attrs = old.get("case_attrs")
     if old_attrs is not None:
         for cid, old_a in sorted(old_attrs.items()):
             if cid not in new_attrs:
                 removed.append(f"{cid}（案例已不存在）")
                 continue
-            if new_attrs[cid] != old_a:
+            if new_attrs[cid] != old_a and cid not in authorized and cid not in approved:
                 diff = {k: (old_a.get(k), new_attrs[cid].get(k)) for k in ATTR_KEYS if old_a.get(k) != new_attrs[cid].get(k)}
                 changed.append(f"{cid}（分母屬性變更：{diff}）")
+    stale = sorted(set(deferrals) - authorized)
+    if stale and not (removed or changed):
+        print("[regen_lock] REFUSED：--authorize-deferral 未對應任何實際延後（只允許 daemon_slice 往後移且其餘屬性不變）："
+              + "、".join(f"{cid}:{deferrals[cid]}" for cid in stale), file=sys.stderr)
+        return 1
+    if unused:
+        print("[regen_lock] REFUSED：--allow-defer 核准與實際延後不符，鎖檔未變更：", file=sys.stderr)
+        for line in unused:
+            print(f"  - {line}", file=sys.stderr)
+        return 1
     if removed or changed:
         print("[regen_lock] REFUSED：既有 case 從集合消失、被延後切片或分母屬性被改動，鎖檔未變更：", file=sys.stderr)
         for line in removed + changed:
@@ -240,7 +345,12 @@ def cmd_add_only(cases_path: pathlib.Path, lock_path: pathlib.Path) -> int:
     counts_path = lock_path.parent / COUNTS_NAME
     _write(counts_path, _dump_json(compute_counts(cases_data)))
     total_added = sum(len(v) for v in added.values())
+    for cid in sorted(authorized):
+        print(f"[regen_lock] AUTHORIZED 逐名延後：{cid} daemon_slice {old_attrs[cid]['daemon_slice']}→"
+              f"{new_attrs[cid]['daemon_slice']}（{deferrals[cid]}）")
     print(f"[regen_lock] wrote {lock_path.name} 與 {COUNTS_NAME}（新增集合條目 {total_added}）")
+    for cid, (_c, src, dst, od) in sorted(approved.items()):
+        print(f"[regen_lock] 核准延後切片：{cid} {src}→{dst}（{od}）")
     return 0
 
 
@@ -389,15 +499,46 @@ def _git_base_lock(lock_path: pathlib.Path, rev: str) -> tuple[dict[str, Any] | 
         return None, f"基準 {rev} 的鎖檔不是合法 JSON：{exc}"
 
 
-def parse_removal_approval(token: str) -> Approval:
-    """解析 `set_id:platform:nodeid` 三元組；不合法即拋 ValueError（不得靜默忽略）。
+def _n3_selector_migration_allowed(
+    set_id: str,
+    platform: str,
+    old_selector: dict[str, Any],
+    new_selector: dict[str, Any],
+    removed: set[str],
+    approved: set[str],
+    retained: set[str],
+) -> bool:
+    """只放行 N3 的精確 selector、集合與兩筆逐名移除。"""
+    paired_removal = _N3_REMOVALS.issubset(removed) and removed == approved
+    previously_approved_removal = not removed and not approved and _N3_REMOVALS.isdisjoint(retained)
+    return (
+        platform == "linux"
+        and set_id in _N3_PYTEST_FULL_SETS
+        and old_selector == _N3_OLD_SELECTOR
+        and new_selector == _N3_NEW_SELECTOR
+        and (paired_removal or previously_approved_removal)
+    )
 
-    以 maxsplit=2 切分，故 nodeid 內的 `::` 不影響切分；set_id 不含 `:`（由 SET_ID_RE 與切分共同保證）。
+
+def parse_removal_approval(token: str) -> Approval:
+    """解析 `set_id:platform:nodeid` 三元組；不合法或含糊即拋 ValueError。
+
+    set_id 可含冒號（例如 `s21_gate:py_parity`），因此以 `:linux:`／`:windows:` 邊界定位平台；
+    nodeid 也可含冒號與 `::`。多個有效切分一律拒絕，避免核准誤綁到另一個集合。
     """
-    parts = token.split(":", 2)
-    if len(parts) != 3 or not SET_ID_RE.match(parts[0]) or ":" in parts[0] or parts[1] not in L1_PLATFORMS or not parts[2]:
+    candidates: list[Approval] = []
+    for platform in L1_PLATFORMS:
+        marker = f":{platform}:"
+        start = 0
+        while (index := token.find(marker, start)) >= 0:
+            set_id = token[:index]
+            nodeid = token[index + len(marker):]
+            if set_id and SET_ID_RE.fullmatch(set_id) and nodeid:
+                candidates.append((set_id, platform, nodeid))
+            start = index + 1
+    if len(candidates) != 1:
         raise ValueError(f"--allow-removal 須為 set_id:platform:nodeid 三元組（platform ∈ linux|windows）：{token!r}")
-    return parts[0], parts[1], parts[2]
+    return candidates[0]
 
 
 def cmd_check_l1(lock_path: pathlib.Path, base: str | None, approvals: set[Approval]) -> int:
@@ -428,7 +569,7 @@ def cmd_check_l1(lock_path: pathlib.Path, base: str | None, approvals: set[Appro
 
 
 def _report_base_diff(base: dict[str, Any], head: dict[str, Any], approvals: set[Approval]) -> int:
-    """基準已有的 (set, platform, nodeid) 於 HEAD 消失者，須有同一三元組之核准；selector 改變一律拒絕。"""
+    """基準 nodeid 移除須逐名核准；selector 僅接受 N3 的精確兩集合遷移。"""
     rc = 0
     head_sets = head.get("sets", {})
     for set_id, plats in sorted(base.get("sets", {}).items()):
@@ -437,9 +578,11 @@ def _report_base_diff(base: dict[str, Any], head: dict[str, Any], approvals: set
             if head_spec is None:
                 gone = list(spec["nodeids"])
                 changed = False
+                new_selector = spec["selector"]
             else:
                 gone = sorted(set(spec["nodeids"]) - set(head_spec["nodeids"]))
-                changed = head_spec["selector"] != spec["selector"]
+                new_selector = head_spec["selector"]
+                changed = new_selector != spec["selector"]
             for nid in gone:
                 if (set_id, plat, nid) in approvals:
                     print(f"[regen_lock] 基準已有、HEAD 已消失（已以 --allow-removal 允許）：{set_id}.{plat} {nid}")
@@ -447,8 +590,18 @@ def _report_base_diff(base: dict[str, Any], head: dict[str, Any], approvals: set
                     print(f"[regen_lock] FAIL 基準已有、HEAD 已消失（須擁有者裁決並以 --allow-removal {set_id}:{plat}:{nid} 列名）：{set_id}.{plat} {nid}")
                     rc = 1
             if changed:
-                print(f"[regen_lock] FAIL selector 改變（基準 {spec['selector']}）：{set_id}.{plat}")
-                rc = 1
+                approved_for_set = {
+                    nid for sid, approval_platform, nid in approvals
+                    if sid == set_id and approval_platform == plat
+                }
+                if _n3_selector_migration_allowed(
+                    set_id, plat, spec["selector"], new_selector, set(gone), approved_for_set,
+                    set(head_spec["nodeids"]) if head_spec is not None else set(),
+                ):
+                    print(f"[regen_lock] selector 依 2026-11-13 N3 核准遷移：{set_id}.{plat}")
+                else:
+                    print(f"[regen_lock] FAIL selector 改變（基準 {spec['selector']}）：{set_id}.{plat}")
+                    rc = 1
     return rc
 
 
@@ -480,6 +633,28 @@ def _read_collect(path: pathlib.Path) -> tuple[list[str], set[str]]:
         if "::" in text:
             ids.append(text)
     return ids, set()
+
+
+_CAP_IGNORED_FILTER_RE = re.compile(r"cap_([a-z][a-z0-9]*(?:_[a-z0-9]+)*)__")
+
+
+def _explicit_ignored_capability_nodeids(selector: dict[str, Any] | None, ignored: set[str]) -> set[str]:
+    """只對精確的 `-- --ignored cap_<cap>__` selector 回傳同能力 ignored 列。"""
+    if not isinstance(selector, dict):
+        return set()
+    argv = selector.get("argv")
+    if not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv):
+        return set()
+    if argv.count("--") != 1:
+        return set()
+    libtest_args = argv[argv.index("--") + 1:]
+    if len(libtest_args) != 2 or libtest_args[0] != "--ignored":
+        return set()
+    match = _CAP_IGNORED_FILTER_RE.fullmatch(libtest_args[1])
+    if match is None:
+        return set()
+    prefix = f"cap_{match.group(1)}__"
+    return {nid for nid in ignored if nid.rsplit("::", 1)[-1].startswith(prefix)}
 
 
 def _selector_from_args(args: argparse.Namespace) -> tuple[dict[str, Any] | None, str | None]:
@@ -536,13 +711,14 @@ def cmd_l1_add_only(lock_path: pathlib.Path, set_id: str, platform: str, collect
         if approvals:
             print(f"[regen_lock] REFUSED 新增集合 {set_id}.{platform} 無既有 nodeid 可移除，--allow-removal 須為空，鎖檔未變更", file=sys.stderr)
             return 1
-        # OD-24：#[ignore] 列不由官方 selector 執行，新增時一律排除
-        new_spec = {"selector": selector, "nodeids": sorted(set(collected) - ignored)}
+        # OD-24：預設排除 #[ignore]；明確能力 selector 僅納入同能力列。
+        ignored_excluded = ignored - _explicit_ignored_capability_nodeids(selector, ignored)
+        new_spec = {"selector": selector, "nodeids": sorted(set(collected) - ignored_excluded)}
         added_count = len(new_spec["nodeids"])
     else:
-        if selector is not None and selector != spec["selector"]:
-            print(f"[regen_lock] REFUSED selector 與鎖檔不同：{set_id}.{platform}", file=sys.stderr)
-            return 1
+        requested_selector = selector if selector is not None else spec["selector"]
+        # selector 遷移以新 selector 判斷 ignored 列；一般既有集合仍使用鎖內 selector。
+        ignored_excluded = ignored - _explicit_ignored_capability_nodeids(requested_selector, ignored)
         allowed = {nid for _s, _p, nid in approvals}
         # 既有 ignored 列仍在 collected 內，不視為消失（plan 04 Task 17）；OD-24 起可逐名核准移除
         removed = sorted((set(spec["nodeids"]) - set(collected)) | (allowed & set(spec["nodeids"]) & ignored))
@@ -556,14 +732,31 @@ def cmd_l1_add_only(lock_path: pathlib.Path, set_id: str, platform: str, collect
                 print(f"  - 未消失 {set_id}.{platform} {nid}", file=sys.stderr)
             print("[regen_lock] 每筆移除都須對應已核准的案例／測試替換並於交付說明列明。", file=sys.stderr)
             return 1
-        added = sorted(set(collected) - set(spec["nodeids"]) - ignored)
-        if not added and not removed:
+        added = sorted(set(collected) - set(spec["nodeids"]) - ignored_excluded)
+        selector_changed = requested_selector != spec["selector"]
+        if selector_changed and not _n3_selector_migration_allowed(
+            set_id, platform, spec["selector"], requested_selector, set(removed), allowed,
+            set(added) | (set(spec["nodeids"]) - set(removed)),
+        ):
+            print(f"[regen_lock] REFUSED selector 與鎖檔不同且不符合 2026-11-13 N3：{set_id}.{platform}", file=sys.stderr)
+            return 1
+        if not added and not removed and not selector_changed:
             print(f"[regen_lock] {set_id}.{platform} 無新增 nodeid，鎖檔未變更")
             return 0
-        new_spec = {"selector": spec["selector"], "nodeids": sorted(set(added) | (set(spec["nodeids"]) - set(removed)))}
+        new_spec = {
+            "selector": requested_selector,
+            "nodeids": sorted(set(added) | (set(spec["nodeids"]) - set(removed))),
+        }
         added_count = len(added)
     lock["schema_version"] = 1
-    lock.setdefault("sets", {}).setdefault(set_id, {})[platform] = new_spec
+    platforms = lock.setdefault("sets", {}).setdefault(set_id, {})
+    if new_spec["nodeids"]:
+        platforms[platform] = new_spec
+    else:
+        # OD-68：若擁有者逐名核准移除該平台全部必要列，刪除空平台鍵；不留違反 schema 的空 nodeids。
+        platforms.pop(platform, None)
+        if not platforms:
+            lock["sets"].pop(set_id, None)
     problems = l1_shape_problems(lock)
     if problems:
         for problem in problems:
@@ -581,6 +774,8 @@ def main(argv: list[str] | None = None) -> int:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true", help="驗證案例鎖（若存在）與 L1 鎖結構")
     mode.add_argument("--add-only", action="store_true", help="重算並寫回；既有 ID 消失或分母屬性改動即拒絕")
+    parser.add_argument("--allow-defer", action="append", default=[], metavar="CASE:FROM:TO:OD-NN",
+                        help="--add-only：擁有者裁決逐名核准的延後切片（只改 daemon_slice；核准須與實際延後完全相符）")
     mode.add_argument("--l1-add-only", action="store_true", help="L1 必要集合只增登記；核准替換可逐名搭配 --allow-removal")
     mode.add_argument("--p4-error-codes-add-only", action="store_true", help="P4 錯誤碼基線只新增逐名核准的錯誤碼")
     parser.add_argument("--cases", type=pathlib.Path, default=DEFAULT_CASES, help="cases.yaml 路徑")
@@ -603,11 +798,15 @@ def main(argv: list[str] | None = None) -> int:
                         help="--l1-add-only：行內 selector.argv（JSON 字串陣列；產生該平台報告的完整命令）")
     parser.add_argument("--paths-json", default=None, help="--l1-add-only：行內 selector.paths（JSON 字串陣列）")
     parser.add_argument("--markexpr", default=None, help="--l1-add-only：行內 selector.markexpr")
+    parser.add_argument("--authorize-deferral", action="append", default=[], metavar="CASE_ID:OD-N",
+                        help="--add-only：擁有者裁決逐名授權的延後切片（只放行該案例 daemon_slice 往後移）")
     parser.add_argument("--cases-only", action="store_true",
                         help="--check：只驗證案例鎖（func-test 執行器用；不檢查 L1 鎖）")
     args = parser.parse_args(argv)
     try:
         approvals = {parse_removal_approval(token) for token in args.allow_removal}
+        defers = {parse_defer_approval(token) for token in args.allow_defer}
+        deferrals = dict(parse_deferral_authorization(token) for token in args.authorize_deferral)
     except ValueError as exc:
         print(f"[regen_lock] 用法錯誤：{exc}", file=sys.stderr)
         return 2
@@ -648,7 +847,10 @@ def main(argv: list[str] | None = None) -> int:
         # L1 鎖缺檔即失敗（P2-T13 審查修正）：刪除 l1_required.lock.json 不得讓 --check 通過。
         rc |= cmd_check_l1(args.lock_file, args.base, approvals)
         return 1 if rc else 0
-    return cmd_add_only(args.cases, args.lock)
+    if defers and not args.add_only:
+        print("[regen_lock] 用法錯誤：--allow-defer 只用於 --add-only", file=sys.stderr)
+        return 2
+    return cmd_add_only(args.cases, args.lock, defers, deferrals)
 
 
 if __name__ == "__main__":

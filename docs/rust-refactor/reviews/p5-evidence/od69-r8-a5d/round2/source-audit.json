@@ -1,0 +1,83 @@
+{
+  "head": "3bf93828d707ef2b7f277a7679fdbe7f97b3c4ed",
+  "rulings_ref": "e080d7775eaf56094731ec53f69e66ded6d094de",
+  "rulings": {
+    "p5": {
+      "git_object": "origin/docs/parity-amendments:docs/rust-refactor/reviews/rulings/p5.md",
+      "sha256": "6ba112c875dd3ac8af1d06434413540bd1bcba41e660a54b9153405e98d82816"
+    },
+    "s1": {
+      "git_object": "origin/docs/parity-amendments:docs/rust-refactor/reviews/rulings/s1.md",
+      "sha256": "ac5e1d5319e4f6539cd1ccf2cdcd7dfe13b0db1943c06827ca8814d54f3b7ace"
+    }
+  },
+  "review_a_1_to_8_fix_is_ancestor": true,
+  "unchanged_paths": [
+    {
+      "path": "crates/sw-core/src/actor.rs",
+      "baseline_sha256": "3c3741b4970b2ef8ebd50ee1c9eb2fb52f9110dcd8879be0a85d1c1cb09bd42e",
+      "current_sha256": "3c3741b4970b2ef8ebd50ee1c9eb2fb52f9110dcd8879be0a85d1c1cb09bd42e",
+      "unchanged": true
+    },
+    {
+      "path": "crates/sw-core/src/session_core.rs",
+      "baseline_sha256": "7e1c2332dcf04ed84ef6c659bc57b019dbe09af52b31932b1d9058cccc3e8b24",
+      "current_sha256": "7e1c2332dcf04ed84ef6c659bc57b019dbe09af52b31932b1d9058cccc3e8b24",
+      "unchanged": true
+    },
+    {
+      "path": "crates/sw-core/src/uart_bridge.rs",
+      "baseline_sha256": "11ef29000583683ce1123029b129e5488cd101c728b7a19065b53281ba407b24",
+      "current_sha256": "11ef29000583683ce1123029b129e5488cd101c728b7a19065b53281ba407b24",
+      "unchanged": true
+    },
+    {
+      "path": "crates/sw-core/src/session_manager.rs",
+      "baseline_sha256": "b2cb572641f8e03ec0a97af5d0f9d803e8257d461b0ce17c0a0fbb9ea7df217c",
+      "current_sha256": "b2cb572641f8e03ec0a97af5d0f9d803e8257d461b0ce17c0a0fbb9ea7df217c",
+      "unchanged": true
+    },
+    {
+      "path": "crates/sw-core/src/mailbox.rs",
+      "baseline_sha256": "0b418b25ec703c1bb7126bb6426174d7913fa9092916c8dacba111acd4f6b0f8",
+      "current_sha256": "0b418b25ec703c1bb7126bb6426174d7913fa9092916c8dacba111acd4f6b0f8",
+      "unchanged": true
+    },
+    {
+      "path": "crates/sw-core/tests/drain_release_e2e.rs",
+      "baseline_sha256": "b105e163d3a72029725bcade200ff79b58644e095a8b19db799fd8e022e08e85",
+      "current_sha256": "b105e163d3a72029725bcade200ff79b58644e095a8b19db799fd8e022e08e85",
+      "unchanged": true
+    },
+    {
+      "path": "contracts/resource_limits.yaml",
+      "baseline_sha256": "d633e2bd2945ad0059a610ca03264c61e2f35a6f39fbd3f8b8b4ff3d99837e04",
+      "current_sha256": "d633e2bd2945ad0059a610ca03264c61e2f35a6f39fbd3f8b8b4ff3d99837e04",
+      "unchanged": true
+    },
+    {
+      "path": "tests/acceptance/l1_required.lock.json",
+      "baseline_sha256": "fbf36ec8791f52c239254f9c6bb0d3c2eee41c5eb80fafd0ee73d0d0825cdd14",
+      "current_sha256": "fbf36ec8791f52c239254f9c6bb0d3c2eee41c5eb80fafd0ee73d0d0825cdd14",
+      "unchanged": true
+    }
+  ],
+  "all_runtime_test_source_unchanged": {
+    "argv": [
+      "git",
+      "diff",
+      "--quiet",
+      "3bf93828",
+      "--",
+      "crates",
+      "contracts",
+      "tests",
+      "scripts",
+      "sw_core",
+      "Cargo.toml",
+      "Cargo.lock",
+      "rust-toolchain.toml"
+    ],
+    "exit_code": 0
+  }
+}

@@ -56,6 +56,7 @@ from lib.daemon_harness import (
     resolve_daemon_argv,
 )
 from lib.expect_engine import check_expect
+from lib import scenario_actions
 from lib.target_config import TargetConfig
 from lib.yaml_loader import TestCase, discover_test_cases
 
@@ -355,6 +356,7 @@ class TestRunner:
         self._bridge_eligible = mode != "bridge"
         self._ops: dict[str, dict[str, Any]] = {}
         self._held_endpoints: dict[str, dict[str, Any]] = {}
+        self._external_holders: dict[str, scenario_actions.ExternalHolder] = {}
         self._corr_records: list[dict[str, Any]] = []
         self._bridge_tool: dict[str, Any] = {}
         self._secrets: list[bytes] = []
@@ -443,7 +445,11 @@ class TestRunner:
         if self.mode == "bridge":
             self.correlation = self._new_correlation()
         try:
-            self.harness.start()
+            pre_steps = list(getattr(self.tc, "pre_daemon_steps", None) or [])
+            if pre_steps:
+                self.harness.start(before_daemon=lambda: self._run_pre_daemon_steps(pre_steps))
+            else:
+                self.harness.start()
             self.variables["run"]["root"] = str(self.harness.root)
             self._daemon_device_path = self.daemon_com or str(self.harness.root / "by-id" / "fake-uart0")
             self._capture_live_daemon()
@@ -463,6 +469,9 @@ class TestRunner:
             # 釋放殘留端點
             for key in list(self._held_endpoints.keys()):
                 self._release_held_endpoint(key)
+            # 釋放殘留外部持有子行程（external_open 未配對 external_close 時）
+            for key in list(self._external_holders.keys()):
+                self._close_external_holder(key, step_idx=-1, strict=False)
             # 清理 console handles
             for handle in self.console_handles.values():
                 handle.close_fd()
@@ -494,6 +503,9 @@ class TestRunner:
                         )
             self._deployed_end = deployed_content.measure(cli_exe[0], daemon_argv=daemon_argv)
 
+        # 量測動作（measure_rpc_latency／measure_event_latency）只寫入量測欄位、不帶 verdict；
+        # 先取出，避免被當成「無 verdict 的 comparison」而判 INSUFFICIENT_EVIDENCE。
+        measurements = self._take_measurements()
         if self._harness_stop_failure is not None:
             # 關閉失敗的案例不得 PASS／gate_eligible；原本已 FAIL 者保留其判定與訊息，失敗原因僅記入診斷。
             self._harness_diagnostics.append({"kind": "harness_stop_failed", "error": self._harness_stop_failure})
@@ -509,6 +521,7 @@ class TestRunner:
                 if verdict != "PASS":
                     ok = False
                     message = f"bridge comparison {verdict}: {self.comparison.get('reasons', [])}"
+        self._store_measurements(measurements)
 
         if self._bridge_shutdown_failure:
             ok = False
@@ -1171,6 +1184,19 @@ class TestRunner:
             "assert_peer_closed": self._step_assert_peer_closed,
             "hold_endpoint": self._step_hold_endpoint,
             "release_endpoint": self._step_release_endpoint,
+            "external_open": self._step_external_open,
+            "external_close": self._step_external_close,
+            "measure_rpc_latency": self._step_measure_rpc_latency,
+            "measure_event_latency": self._step_measure_event_latency,
+            "wait_cli_until": self._step_wait_cli_until,
+            "assert_when": self._step_assert_when,
+            "assert_value": self._step_assert_value,
+            "assert_wire_offsets": self._step_assert_wire_offsets,
+            "assert_any": self._step_assert_any,
+            "assert_wal_tx_total": self._step_assert_wal_tx_total,
+            "assert_wire_tx_window": self._step_assert_wire_tx_window,
+            "assert_wal_window": self._step_assert_wal_window,
+            "query_dut_generation": self._step_query_dut_generation,
         }.get(action)
 
         if handler is None:
@@ -1302,6 +1328,8 @@ class TestRunner:
         settle = bool(step.get("settle", True))
         snap = self._bridge_snapshot(settle=settle)
         self._ops.setdefault(op_id, {})["start"] = snap
+        # OD-39 gaps #9：窗口以 CLOCK_MONOTONIC 記錄，供 assert_wal_window 對 WAL mono_ts_ns（同機同時鐘）
+        self._ops[op_id]["start_mono_ns"] = time.monotonic_ns()
         self._record_correlation_op("op_start", op_id, idx, snap)
         return {"op_id": op_id, "snapshot": snap}
 
@@ -1312,6 +1340,7 @@ class TestRunner:
         settle = bool(step.get("settle", True))
         snap = self._bridge_snapshot(settle=settle)
         self._ops[op_id]["end"] = snap
+        self._ops[op_id]["end_mono_ns"] = time.monotonic_ns()
         self._record_correlation_op("op_end", op_id, idx, snap)
         return {"op_id": op_id, "snapshot": snap}
 
@@ -1695,6 +1724,560 @@ class TestRunner:
         from_key = str(self._expand(step.get("from", "")))
         self._release_held_endpoint(from_key)
         return {"ok": True}
+
+    # -- P5 Task 21a：Slice 2.1 動作（外部持有、延遲量測、條件等待；控制只經協調器，§15.3） --
+
+    def _append_external_control(self, record: dict[str, Any]) -> None:
+        """外部持有動作的協調器紀錄。
+
+        `control.ndjson` 由 bridge 獨占寫入（control.v1、seq 連號且 checkpoint 以前綴 SHA-256 防竄改），
+        協調器不得插寫；故寫入同目錄的 `control.external.ndjson`（同樣逐行 NDJSON、含子行程 pid），
+        並由 correlation.ndjson 的 op_end response 交叉記錄。
+        """
+        path = self._evidence_dir_path() / "control.external.ndjson"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "schema_version": "control.external.v1",
+            "run_id": self.run_id,
+            "case_id": self.tc.name,
+            "mono_ts_ns": time.monotonic_ns(),
+            "wall_ts": datetime.now(timezone.utc).isoformat(),
+            **record,
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+
+    def _external_target_path(self, step: dict[str, Any], idx: int) -> str:
+        explicit = step.get("path")
+        if explicit:
+            return str(self._expand(explicit))
+        target = str(self._expand(step.get("target", "")))
+        if target not in scenario_actions.EXTERNAL_TARGETS:
+            raise StepError(
+                f"步驟 {idx}: external_open 的 target '{target}' 不支援，必須為 {sorted(scenario_actions.EXTERNAL_TARGETS)}"
+            )
+        if target == "session_slave":
+            slave = self._bridge_describe().get("slave_path")
+            if not slave:
+                raise StepError(f"步驟 {idx}: external_open target=session_slave 無法取得 bridge slave_path")
+            return str(slave)
+        if self.harness is None:
+            raise StepError(f"步驟 {idx}: external_open target=by_id_link 需要 harness")
+        link = self.harness.root / "by-id" / "fake-uart0"
+        if not (link.exists() or link.is_symlink()):
+            raise StepError(f"步驟 {idx}: external_open target=by_id_link 找不到 {link}")
+        return str(link)
+
+    def _step_external_open(self, step: dict[str, Any], idx: int) -> dict[str, Any]:
+        hold = str(self._expand(step.get("hold", "")))
+        if hold not in scenario_actions.EXTERNAL_HOLD_MODES:
+            raise StepError(
+                f"步驟 {idx}: external_open 的 hold '{hold}' 不支援，必須為 {sorted(scenario_actions.EXTERNAL_HOLD_MODES)}"
+            )
+        save_as = str(self._expand(step.get("save_as", "ext")))
+        if save_as in self._external_holders:
+            raise StepError(f"步驟 {idx}: external_open save_as '{save_as}' 仍在持有中，須先 external_close")
+        path = self._external_target_path(step, idx)
+        holder = scenario_actions.ExternalHolder(path, hold)
+        try:
+            result = holder.start(timeout_s=float(step.get("timeout_s", 5.0)))
+        except RuntimeError as exc:
+            raise StepError(f"步驟 {idx}: external_open 失敗：{exc}") from exc
+        if result["opened"]:
+            self._external_holders[save_as] = holder
+        self.variables[save_as] = {"opened": result["opened"], "errno": result["errno"], "pid": result["pid"]}
+        self._append_external_control({
+            "action": "external_open",
+            "step_index": idx,
+            "save_as": save_as,
+            "target": step.get("target"),
+            "path": path,
+            "hold": hold,
+            "result": dict(result),
+        })
+        # R0-F3：release 後的外部開啟得 EBUSY 表示 daemon 關閉前未解除獨占 → 情境 FAIL（不得轉 DEVICE_STILL_HELD 或 SKIP）
+        if not result["opened"] and result["errno"] == 16 and step.get("allow_ebusy") is not True:
+            raise StepError(
+                f"步驟 {idx}: external_open 得 EBUSY（errno 16）：端點仍被獨占，daemon 關閉前未解除 TIOCEXCL（R0-F3）"
+            )
+        expect = step.get("expect")
+        if isinstance(expect, dict):
+            for key in ("opened", "errno"):
+                if key in expect and self._expand(expect[key]) != result[key]:
+                    raise StepError(f"步驟 {idx}: external_open {key} 預期 {expect[key]!r}，實際 {result[key]!r}（{result}）")
+        return {"opened": result["opened"], "errno": result["errno"], "pid": result["pid"]}
+
+    def _close_external_holder(self, key: str, *, step_idx: int, strict: bool) -> dict[str, Any]:
+        holder = self._external_holders.pop(key, None)
+        if holder is None:
+            if strict:
+                raise StepError(f"步驟 {step_idx}: external_close 找不到持有中的 '{key}'")
+            return {"closed": True, "note": "not_held"}
+        try:
+            result = holder.close(timeout_s=5.0)
+        except RuntimeError as exc:
+            self._append_external_control({
+                "action": "external_close", "step_index": step_idx, "from": key, "pid": holder.pid,
+                "result": None, "error": str(exc),
+            })
+            if strict:
+                raise StepError(f"步驟 {step_idx}: external_close 失敗：{exc}") from exc
+            return {"closed": False, "error": str(exc)}
+        self._append_external_control({
+            "action": "external_close", "step_index": step_idx, "from": key, "pid": holder.pid, "result": result,
+        })
+        if isinstance(self.variables.get(key), dict):
+            self.variables[key] = {**self.variables[key], "closed": result.get("closed") is True}
+        if strict and result.get("closed") is not True:
+            raise StepError(f"步驟 {step_idx}: external_close 未確認 fd 已關或獨占已解除：{result}")
+        if strict and holder.hold == "flock_tiocexcl" and result.get("tiocnxcl") is not True:
+            raise StepError(f"步驟 {step_idx}: external_close 未成功 TIOCNXCL：{result}")
+        return result
+
+    def _step_external_close(self, step: dict[str, Any], idx: int) -> dict[str, Any]:
+        from_key = str(self._expand(step.get("from", "")))
+        if not from_key:
+            raise StepError(f"步驟 {idx}: external_close 缺少 from")
+        return self._close_external_holder(from_key, step_idx=idx, strict=True)
+
+    def _measurement_slot(self) -> dict[str, Any]:
+        if self.comparison is None:
+            self.comparison = {}
+        return self.comparison
+
+    def _take_measurements(self) -> dict[str, Any]:
+        """取出量測動作寫入的欄位；若 comparison 只有量測欄位（無 verdict），一併清空。"""
+        keys = ("latency_samples_ms", "event_latency", "latency_method")
+        if self.comparison is None:
+            return {}
+        taken = {k: self.comparison[k] for k in keys if k in self.comparison}
+        if "verdict" not in self.comparison:
+            self.comparison = None
+        return taken
+
+    def _store_measurements(self, measurements: dict[str, Any]) -> None:
+        """量測欄位併入 comparison.json；compare=none 時另寫 latency.json（不憑空產生 verdict）。"""
+        if not measurements:
+            return
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        if self.comparison is not None:
+            for key, value in measurements.items():
+                if isinstance(value, dict) and isinstance(self.comparison.get(key), dict):
+                    self.comparison[key].update(value)
+                else:
+                    self.comparison[key] = value
+            (self.run_dir / "comparison.json").write_text(
+                json.dumps(self.comparison, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        else:
+            (self.run_dir / "latency.json").write_text(
+                json.dumps(measurements, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+    def _rpc_endpoint(self) -> str:
+        if self.harness is None:
+            return ""
+        return str(getattr(self.harness, "endpoint", None) or getattr(self.harness, "socket_path", "") or "")
+
+    def _step_measure_rpc_latency(self, step: dict[str, Any], idx: int) -> dict[str, Any]:
+        method = str(self._expand(step.get("method", "")))
+        if not method:
+            raise StepError(f"步驟 {idx}: measure_rpc_latency 缺少 method")
+        samples = int(self._expand(step.get("samples", 0)))
+        if samples <= 0:
+            raise StepError(f"步驟 {idx}: measure_rpc_latency samples 必須為正整數")
+        save_as = str(self._expand(step.get("save_as", method)))
+        params = self._expand(step.get("params") or {})
+        endpoint = self._rpc_endpoint()
+        if not endpoint:
+            raise StepError(f"步驟 {idx}: measure_rpc_latency 需要 daemon endpoint")
+        timeout_s = float(step.get("timeout_s", 5.0))
+        values: list[float] = []
+        for n in range(samples):
+            try:
+                elapsed, resp = scenario_actions.rpc_roundtrip_ms(
+                    endpoint, method, params, timeout_s=timeout_s, req_id=f"lat-{save_as}-{n}"
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise StepError(f"步驟 {idx}: measure_rpc_latency 第 {n} 筆 RPC 失敗：{exc}") from exc
+            if step.get("require_ok", True) and resp.get("ok") is not True:
+                raise StepError(f"步驟 {idx}: measure_rpc_latency {method} 回應非 ok：{resp}")
+            values.append(elapsed)
+        slot = self._measurement_slot()
+        slot.setdefault("latency_samples_ms", {})[save_as] = values
+        slot.setdefault("latency_method", {})[save_as] = {
+            "kind": "rpc_roundtrip",
+            "method": method,
+            "transport": "direct_ndjson_socket",
+            "includes_connect": True,
+            "samples": samples,
+        }
+        return {"ok": True, "save_as": save_as, **scenario_actions.summarize_samples(values)}
+
+    def _daemon_timing_records(self, timing_path: str) -> list[dict[str, Any]] | None:
+        status = self._cli(["daemon", "status"], timeout=5.0)
+        value = scenario_actions.json_path_get(status, timing_path)
+        if scenario_actions.is_missing(value):
+            return None
+        if not isinstance(value, list):
+            raise StepError(f"measure_event_latency: daemon status {timing_path} 不是列表：{value!r}")
+        return [r for r in value if isinstance(r, dict)]
+
+    # -- OD-39：slice21-l15-gaps.md #1／#3／#4／#5／#8／#9 的 runner 擴充（不改 bridge 工具樹）--
+
+    PRE_DAEMON_ACTIONS = frozenset({"sleep", "op_begin", "external_open", "bridge_control", "dut_control"})
+    # assert_any 的替代分支只能放無副作用的檢查（失敗分支不得留下 UART／daemon 副作用）
+    _ASSERT_ANY_ACTIONS = frozenset({"assert_when", "assert_value", "assert_any", "assert_wal_tx_total", "assert_wal_window",
+                                     "assert_wire_tx_window",
+                                     "query_dut_generation", "assert_wal_meta", "assert_wal_marker",
+                                     "assert_wire_absent", "wait_cli_until", "wait_state"})
+
+    def _run_pre_daemon_steps(self, steps: list[dict[str, Any]]) -> None:
+        """daemon 啟動前步驟（gaps #1／#3／#8）：只接受不需 daemon 的動作，其餘 fail-closed。"""
+        for i, step in enumerate(steps):
+            action = step.get("action")
+            if action not in self.PRE_DAEMON_ACTIONS:
+                raise StepError(f"pre_daemon_steps[{i}]: 動作 '{action}' 需要 daemon，不可置於 pre_daemon_steps"
+                                f"（允許：{sorted(self.PRE_DAEMON_ACTIONS)}）")
+            self._exec_step(step, step_idx=9000 + i)
+
+    @staticmethod
+    def _condition_holds(value: Any, step: dict[str, Any], expand: Any) -> bool:
+        if "equals" in step:
+            return value == expand(step["equals"])
+        if "in" in step:
+            return value in expand(step["in"])
+        if "matches" in step:
+            return value is not None and re.search(str(expand(step["matches"])), str(value)) is not None
+        raise StepError("條件須提供 equals／in／matches 其一")
+
+    def _step_assert_when(self, step: dict[str, Any], idx: int) -> dict[str, Any]:
+        """條件式斷言（gaps #4）：依 `value`（已展開）是否符合條件，執行 `then` 或 `else` 分支。"""
+        raw = step.get("value")
+        value = self._lookup_var_path(raw[1:-1]) if isinstance(raw, str) and raw.startswith("{") and raw.endswith("}") \
+            else self._expand(raw)
+        branch = "then" if self._condition_holds(value, step, self._expand) else "else"
+        for i, sub in enumerate(step.get(branch) or []):
+            self._exec_step(sub, step_idx=idx * 100 + i)
+        return {"branch": branch, "value": value}
+
+    def _step_assert_value(self, step: dict[str, Any], idx: int) -> dict[str, Any]:
+        """值斷言（gaps #4）：`value`（`{var.path}` 取原型別）須符合 equals／in／matches。"""
+        raw = step.get("value")
+        value = self._lookup_var_path(raw[1:-1]) if isinstance(raw, str) and raw.startswith("{") and raw.endswith("}") \
+            else self._expand(raw)
+        if not self._condition_holds(value, step, self._expand):
+            raise StepError(f"步驟 {idx}: assert_value 不符：value={value!r}，條件="
+                            f"{ {k: step[k] for k in ('equals', 'in', 'matches') if k in step} }")
+        return {"value": value}
+
+    def _lookup_var_path(self, path: str) -> Any:
+        cur: Any = self.variables
+        for part in path.split("."):
+            if not isinstance(cur, dict) or part not in cur:
+                raise StepError(f"assert_when：變數 {path!r} 不存在")
+            cur = cur[part]
+        return cur
+
+    # assert_any 內 wait_cli_until 只允許的唯讀查詢（argv 前綴）
+    _ASSERT_ANY_READONLY_CLI = (("session", "list"), ("session", "get-state"), ("session", "get"), ("cmd", "status"),
+                                ("cmd", "get"), ("daemon", "status"))
+
+    @classmethod
+    def _assert_any_side_effects(cls, steps: Any) -> list[str]:
+        """遞迴列出 assert_any 分支（含 then／else／of 巢狀）中的副作用動作（sol P5-3c4e051-2）；空列表表示可執行。"""
+        bad: list[str] = []
+        for sub in steps if isinstance(steps, list) else [steps]:
+            if not isinstance(sub, dict):
+                bad.append(repr(sub))
+                continue
+            action = sub.get("action")
+            if action not in cls._ASSERT_ANY_ACTIONS:
+                bad.append(str(action))
+                continue
+            if action == "wait_cli_until":
+                argv = sub.get("argv")
+                head = tuple(str(a) for a in argv[:2]) if isinstance(argv, list) else ()
+                if head not in cls._ASSERT_ANY_READONLY_CLI:
+                    bad.append(f"wait_cli_until{list(head)}")
+            for key in ("then", "else"):
+                bad.extend(cls._assert_any_side_effects(sub.get(key) or []))
+            for alt in sub.get("of") or []:
+                bad.extend(cls._assert_any_side_effects(alt))
+        return bad
+
+    def _step_assert_any(self, step: dict[str, Any], idx: int) -> dict[str, Any]:
+        """OR 斷言（gaps #5）：`of` 中任一替代分支全部通過即通過；全部失敗列出各分支錯誤。"""
+        alternatives = step.get("of") or []
+        errors: list[str] = []
+        for a, alt in enumerate(alternatives):
+            bad = self._assert_any_side_effects(alt)
+            if bad:
+                raise StepError(f"步驟 {idx}: assert_any 分支 {a} 含有副作用動作 {bad}")
+        for a, alt in enumerate(alternatives):
+            try:
+                for i, sub in enumerate(alt):
+                    self._exec_step(sub, step_idx=idx * 100 + a * 10 + i)
+                return {"passed_alternative": a}
+            except StepError as exc:
+                errors.append(f"[{a}] {exc}")
+        raise StepError(f"步驟 {idx}: assert_any 所有替代分支皆失敗：{errors or '（無分支）'}")
+
+    def _wal_rows(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        wal_dir = self._wal_dir_path()
+        paths = sorted(p for p in wal_dir.glob("raw.wal.ndjson.*")) + [wal_dir / "raw.wal.ndjson"]
+        for path in paths:
+            if not path.is_file():
+                continue
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    try:
+                        rows.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        return rows
+
+    def _step_assert_wal_tx_total(self, step: dict[str, Any], idx: int) -> dict[str, Any]:
+        """聚合斷言（gaps #4）：同一 cmd_id 的 TX payload bytes 總和（含歸檔 WAL）與 lt／le／eq／ge／gt 比較。"""
+        import base64
+        import operator
+
+        cmd_id = str(self._expand(step.get("cmd_id", "")))
+        ops = {"lt": operator.lt, "le": operator.le, "eq": operator.eq, "ge": operator.ge, "gt": operator.gt}
+        given = [(k, ops[k]) for k in ops if k in step]
+        if not cmd_id or not given:
+            raise StepError(f"步驟 {idx}: assert_wal_tx_total 需 cmd_id 與至少一個比較子（{sorted(ops)}）")
+        total = sum(len(base64.b64decode(r.get("payload_b64") or "")) for r in self._wal_rows()
+                    if r.get("dir") == "TX" and r.get("cmd_id") == cmd_id)
+        for key, fn in given:
+            bound = int(self._expand(step[key]))
+            if not fn(total, bound):
+                raise StepError(f"步驟 {idx}: assert_wal_tx_total({cmd_id}) 總和 {total} 不符 {key} {bound}")
+        out = {"cmd_id": cmd_id, "tx_bytes": total}
+        if step.get("save_as"):
+            self.variables[str(step["save_as"])] = out
+        return out
+
+    def _step_assert_wire_tx_window(self, step: dict[str, Any], idx: int) -> dict[str, Any]:
+        """wire TX 窗口斷言（sol P5-3c4e051-1）：以 op 窗口兩端 settled 快照的 `serial_read` 差值獨立計量 daemon 實際
+        寫出的 bytes，要求等於該 cmd_id 的 WAL TX 總和（漏記／錯置 cmd_id 即紅），再以 wire 計量套 lt／le／eq／ge／gt。"""
+        import base64
+        import operator
+
+        op_id = str(self._expand(step.get("op_id", "")))
+        cmd_id = str(self._expand(step.get("cmd_id", "")))
+        ops = {"lt": operator.lt, "le": operator.le, "eq": operator.eq, "ge": operator.ge, "gt": operator.gt}
+        given = [(k, ops[k]) for k in ops if k in step]
+        if not op_id or not cmd_id:
+            raise StepError(f"步驟 {idx}: assert_wire_tx_window 需 op_id 與 cmd_id")
+        win = self._ops.get(op_id) or {}
+        if "start" not in win or "end" not in win:
+            raise StepError(f"步驟 {idx}: assert_wire_tx_window 找不到已結案的 op '{op_id}'")
+        offsets = []
+        for edge in ("start", "end"):
+            snap = win[edge] or {}
+            off = ((snap.get("wire") or {}).get("offsets") or {}).get("serial_read")
+            if snap.get("settled") is not True or not isinstance(off, int):
+                raise StepError(f"INSUFFICIENT_EVIDENCE: 步驟 {idx}: assert_wire_tx_window op '{op_id}' {edge} 快照未 settled：{snap}")
+            offsets.append(off)
+        wire_tx = offsets[1] - offsets[0]
+        wal_tx = sum(len(base64.b64decode(r.get("payload_b64") or "")) for r in self._wal_rows()
+                     if r.get("dir") == "TX" and r.get("cmd_id") == cmd_id)
+        if wire_tx != wal_tx:
+            raise StepError(f"步驟 {idx}: assert_wire_tx_window({op_id}) wire serial_read {wire_tx} bytes ≠ "
+                            f"cmd_id {cmd_id} 的 WAL TX {wal_tx} bytes")
+        for key, fn in given:
+            bound = int(self._expand(step[key]))
+            if not fn(wire_tx, bound):
+                raise StepError(f"步驟 {idx}: assert_wire_tx_window({op_id}) wire {wire_tx} bytes 不符 {key} {bound}")
+        out = {"cmd_id": cmd_id, "op_id": op_id, "wire_tx_bytes": wire_tx, "wal_tx_bytes": wal_tx}
+        if step.get("save_as"):
+            self.variables[str(step["save_as"])] = out
+        return out
+
+    def _step_assert_wal_window(self, step: dict[str, Any], idx: int) -> dict[str, Any]:
+        """WAL 窗口斷言（gaps #9）：op 窗口（CLOCK_MONOTONIC）內，指定 COM 不得有 `forbid_dirs` 方向的 WAL 紀錄。
+
+        Python 與 Rust daemon 皆不寫狀態轉移 META；「窗口內該 COM 無 RX／TX」即 daemon 未開埠、未進入
+        ATTACHING／READY 的必要證據（以 WAL 紀錄替代計畫所稱的狀態 META，見 slice21-l15-gaps.md #9）。
+        """
+        op_id = str(self._expand(step.get("op_id", "")))
+        win = self._ops.get(op_id) or {}
+        if "start_mono_ns" not in win or "end_mono_ns" not in win:
+            raise StepError(f"步驟 {idx}: assert_wal_window 找不到已結案的 op '{op_id}'")
+        com = str(self._expand(step.get("com", "COM0")))
+        dirs = set(self._expand(step.get("forbid_dirs") or ["RX", "TX"]))
+        hits = [r for r in self._wal_rows()
+                if r.get("com") == com and r.get("dir") in dirs
+                and win["start_mono_ns"] <= int(r.get("mono_ts_ns") or -1) <= win["end_mono_ns"]]
+        if hits:
+            raise StepError(f"步驟 {idx}: assert_wal_window({op_id}) 窗口內出現 {com} 的 {sorted(dirs)} 紀錄："
+                            f"seq={[r.get('seq') for r in hits][:10]}")
+        return {"op_id": op_id, "records": 0}
+
+    def _step_assert_wire_offsets(self, step: dict[str, Any], idx: int) -> dict[str, Any]:
+        """絕對 wire offset 斷言（gaps #1／#3）：取 settled 快照，`observation` 的累計 offset 須等於 `equals`。
+
+        窗口自 daemon 啟動前起算時（pre_daemon_steps），起點快照因 DUT 輸出暫存於 bridge 而無法 settled；
+        daemon 存在前不可能有 serial_read，故以「目前絕對 serial_read == 0」證明自 daemon 啟動起零 TX。
+        """
+        obs = str(self._expand(step.get("observation", "serial_read")))
+        want = int(self._expand(step.get("equals", 0)))
+        snap = self._bridge_snapshot(settle=True)
+        if not snap or snap.get("settled") is not True:
+            raise StepError(f"INSUFFICIENT_EVIDENCE: 步驟 {idx}: assert_wire_offsets 快照未 settled：{snap}")
+        got = ((snap.get("wire") or {}).get("offsets") or {}).get(obs)
+        if got != want:
+            raise StepError(f"步驟 {idx}: assert_wire_offsets {obs}={got}，期望 {want}")
+        return {"observation": obs, "offset": got}
+
+    def _step_query_dut_generation(self, step: dict[str, Any], idx: int) -> dict[str, Any]:
+        """DUT generation 查詢（gaps #5）：wire.ndjson 紀錄的最大 dut_generation；可附 expect。"""
+        wire = self._evidence_dir_path() / "wire.ndjson"
+        gens: list[int] = []
+        if wire.is_file():
+            for line in wire.read_text(encoding="utf-8").splitlines():
+                try:
+                    g = json.loads(line).get("dut_generation")
+                except (json.JSONDecodeError, AttributeError):
+                    continue
+                if isinstance(g, int) and not isinstance(g, bool):
+                    gens.append(g)
+        if not gens:
+            raise StepError(f"INSUFFICIENT_EVIDENCE: 步驟 {idx}: query_dut_generation 於 wire.ndjson 找不到 dut_generation")
+        out = {"dut_generation": max(gens)}
+        save_as = step.get("save_as")
+        if save_as:
+            self.variables[str(save_as)] = out
+        expect = step.get("expect")
+        if expect is not None:
+            errors = check_expect(out, self._expand(expect))
+            if errors:
+                raise StepError(f"步驟 {idx}: query_dut_generation 期望不符：{errors}")
+        return out
+
+    def _step_measure_event_latency(self, step: dict[str, Any], idx: int) -> dict[str, Any]:
+        event = str(self._expand(step.get("event", "")))
+        try:
+            contract = scenario_actions.load_event_latency_contract()
+        except (OSError, RuntimeError) as exc:
+            raise StepError(f"步驟 {idx}: measure_event_latency 無法讀取 event_latency 契約：{exc}") from exc
+        events = {str(e.get("event")): e for e in contract.get("events") or [] if isinstance(e, dict)}
+        if event not in events:
+            raise StepError(f"步驟 {idx}: measure_event_latency 的 event '{event}' 不在契約 {sorted(events)}")
+        spec = events[event]
+        load = str(self._expand(step.get("load", "idle")))
+        if load not in ("idle", "flood"):
+            raise StepError(f"步驟 {idx}: measure_event_latency load 必須為 idle 或 flood")
+        samples = int(self._expand(step.get("samples", contract.get("samples_per_run", 0))))
+        if samples <= 0:
+            raise StepError(f"步驟 {idx}: measure_event_latency samples 必須為正整數")
+        save_as = str(self._expand(step.get("save_as", f"{event}-{load}")))
+        if self.harness is None:
+            raise StepError(f"步驟 {idx}: measure_event_latency 需要 harness（daemon status 計時欄位）")
+        # daemon 端點：以 test-fakes build 的 daemon status 計時欄位取得 accept_point／complete_point（mono ns）
+        timing_path = str(self._expand(step.get("timing_path", f"test_fakes.event_latency.{event}")))
+        trigger = step.get("trigger") or []
+        sample_timeout_s = float(step.get("sample_timeout_s", 5.0))
+        load_before = scenario_actions.host_load()
+        values: list[float] = []
+        for n in range(samples):
+            before = self._daemon_timing_records(timing_path)
+            seen = len(before) if before is not None else 0
+            for si, sub in enumerate(trigger):
+                self._exec_step(sub, step_idx=idx * 100000 + n * 100 + si)
+            deadline = time.monotonic() + sample_timeout_s
+            records: list[dict[str, Any]] | None = before
+            while time.monotonic() < deadline:
+                records = self._daemon_timing_records(timing_path)
+                if records is not None and len(records) > seen:
+                    break
+                time.sleep(0.05)
+            if records is None:
+                raise StepError(
+                    f"步驟 {idx}: INSUFFICIENT_EVIDENCE: daemon status 無 {timing_path} 計時欄位（需 test-fakes build）"
+                )
+            if len(records) <= seen:
+                raise StepError(f"步驟 {idx}: measure_event_latency 第 {n} 筆在 {sample_timeout_s}s 內未出現新計時紀錄")
+            rec = records[-1]
+            accept, complete = rec.get("accept_mono_ns"), rec.get("complete_mono_ns")
+            if type(accept) is not int or type(complete) is not int or complete < accept:
+                raise StepError(f"步驟 {idx}: INSUFFICIENT_EVIDENCE: 計時紀錄格式無效：{rec}")
+            values.append((complete - accept) / 1_000_000)
+        load_after = scenario_actions.host_load()
+        summary = scenario_actions.summarize_samples(values)
+        limit = spec.get(f"max_ms_{load}")
+        cpu = load_after.get("cpu_count")
+        load1 = max(x for x in (load_before.get("loadavg_1min"), load_after.get("loadavg_1min"), 0.0) if x is not None)
+        overloaded = isinstance(cpu, int) and load1 > cpu
+        passed = (not overloaded) and isinstance(limit, (int, float)) and summary["max_ms"] is not None and summary["max_ms"] <= limit
+        slot = self._measurement_slot()
+        slot.setdefault("latency_samples_ms", {})[save_as] = values
+        slot.setdefault("event_latency", {})[save_as] = {
+            "event": event,
+            "load": load,
+            "method_revision": contract.get("method_revision"),
+            "freeze_status": contract.get("freeze_status"),
+            "gate_rule": contract.get("gate_rule"),
+            "accept_point": spec.get("accept_point"),
+            "complete_point": spec.get("complete_point"),
+            "timing_path": timing_path,
+            "max_ms_limit": limit,
+            "max_ms": summary["max_ms"],
+            "p99_ms": summary["p99_ms"],
+            "samples": summary["count"],
+            "host_load": {"before": load_before, "after": load_after},
+            "run_void": overloaded,
+            "passed": passed,
+        }
+        if overloaded:
+            raise StepError(
+                f"步驟 {idx}: INSUFFICIENT_EVIDENCE: 量測期間 loadavg {load1} > CPU 數 {cpu}，該輪作廢須重跑"
+            )
+        if not passed:
+            raise StepError(f"步驟 {idx}: measure_event_latency {event}/{load} 最大值 {summary['max_ms']} ms 超過上限 {limit} ms")
+        return {"ok": True, "save_as": save_as, **summary}
+
+    def _step_wait_cli_until(self, step: dict[str, Any], idx: int) -> dict[str, Any]:
+        argv = self._expand(step.get("argv") or [])
+        if not isinstance(argv, list) or not argv:
+            raise StepError(f"步驟 {idx}: wait_cli_until 缺少 argv")
+        json_path = str(self._expand(step.get("json_path", "")))
+        if not json_path:
+            raise StepError(f"步驟 {idx}: wait_cli_until 缺少 json_path")
+        if "equals" in step:
+            accepted = [self._expand(step["equals"])]
+        elif "in" in step:
+            accepted = list(self._expand(step["in"]))
+        else:
+            raise StepError(f"步驟 {idx}: wait_cli_until 須指定 equals 或 in")
+        if self.harness is None:
+            raise StepError(f"步驟 {idx}: wait_cli_until 需要 harness")
+        timeout_s = float(self._expand(step.get("timeout_s", 15.0)))
+        interval_s = float(self._expand(step.get("interval_s", 0.2)))
+        cli_timeout = float(step.get("cli_timeout_s", 5.0))
+        deadline = time.monotonic() + timeout_s
+        last: dict[str, Any] = {}
+        value: Any = None
+        while True:
+            last = self._cli([str(a) for a in argv], timeout=cli_timeout)
+            value = scenario_actions.json_path_get(last, json_path)
+            if not scenario_actions.is_missing(value) and value in accepted:
+                save_as = step.get("save_as")
+                if save_as:
+                    self.variables[str(save_as)] = last
+                return last
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(interval_s, remaining))
+        shown = "<缺少>" if scenario_actions.is_missing(value) else repr(value)
+        raise StepError(
+            f"步驟 {idx}: wait_cli_until 逾時 ({timeout_s}s)：{json_path} 期望 ∈ {accepted!r}，最後值 {shown}，最後回應：{last}"
+        )
 
     # -- 各 action 實作 --
 

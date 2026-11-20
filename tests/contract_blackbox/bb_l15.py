@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import errno
 import hashlib
 import json
 import os
@@ -25,6 +26,8 @@ from typing import Any
 from bb_harness import ab_env, repo_root
 
 ROOT = repo_root()
+OLD_BUNDLE_VERSION = "0.4.1"
+NEW_BUNDLE_VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
 BRIDGE_SRC = ROOT / "tools" / "uart_stdio_bridge" / "src"
 if str(BRIDGE_SRC) not in sys.path:
     sys.path.insert(0, str(BRIDGE_SRC))
@@ -79,7 +82,7 @@ def bundle_manifest_path(bundle: Path, expected_version: str | None = None) -> P
 
 
 def update_bundles() -> tuple[Path, Path]:
-    """建立本 pytest 行程共用的 0.4.0／0.4.1 test-hooks bundle。"""
+    """建立由上一個正式版 0.4.1 升至目前版本的 test-hooks bundle。"""
     global _bundle_work, _bundle_pair
     if _bundle_pair is not None:
         return _bundle_pair
@@ -90,7 +93,7 @@ def update_bundles() -> tuple[Path, Path]:
             raise AssertionError("SW_G5_BUNDLE_OLD 與 SW_G5_BUNDLE_NEW 必須同時設定")
         bundles = (Path(external_old).resolve(), Path(external_new).resolve())
         repo = ROOT.resolve()
-        for bundle, expected in zip(bundles, ("0.4.0", "0.4.1"), strict=True):
+        for bundle, expected in zip(bundles, (OLD_BUNDLE_VERSION, NEW_BUNDLE_VERSION), strict=True):
             if repo not in bundle.parents:
                 raise AssertionError(f"外部 G5 bundle 必須位於本 worktree：{bundle}")
             cli = bundle / "bin" / "serialwrap"
@@ -103,14 +106,13 @@ def update_bundles() -> tuple[Path, Path]:
         _bundle_pair = bundles
         return _bundle_pair
 
-    temp_root = ROOT / "target" / "g5-tmp"
-    temp_root.mkdir(parents=True, exist_ok=True)
-    _bundle_work = tempfile.TemporaryDirectory(prefix="serialwrap-g5-bundles-", dir=temp_root)
+    # 暫存 bundle 根須與 worktree 無關；避免長 worktree 路徑污染 daemon 的 AF_UNIX endpoint 長度。
+    _bundle_work = tempfile.TemporaryDirectory(prefix="sw-g5-bundles-", dir=tempfile.gettempdir())
     root = Path(_bundle_work.name)
     cargo_target = root / "cargo-target"
     script = ROOT / "scripts" / "rust" / "mkbundle.sh"
     outputs: list[Path] = []
-    for version in ("0.4.0", "0.4.1"):
+    for version in (OLD_BUNDLE_VERSION, NEW_BUNDLE_VERSION):
         out = root / f"bundle-{version}"
         env = dict(os.environ)
         env["CARGO_TARGET_DIR"] = str(cargo_target)
@@ -326,7 +328,213 @@ def prepare_profile(env: dict[str, str]) -> Path:
     return profile_dir
 
 
-def start_python_daemon(env: dict[str, str], profile_dir: Path, *, state: str = "READY"):
+def _probe_posix_open(device_path: str) -> dict[str, Any]:
+    """以 POSIX daemon 相同的開埠與 tty 設定 syscall 取得失敗階段／errno；不送 UART bytes。"""
+    if os.name != "posix":
+        return {"ok": False, "phase": "unsupported", "path": device_path}
+
+    import fcntl
+    import termios
+
+    fd: int | None = None
+    locked = False
+    exclusive = False
+    phase = "os.open"
+    try:
+        flags = os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(device_path, flags)
+        phase = "flock"
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        locked = True
+        phase = "TIOCEXCL"
+        fcntl.ioctl(fd, termios.TIOCEXCL)
+        exclusive = True
+        phase = "tcgetattr"
+        attrs = termios.tcgetattr(fd)
+        phase = "tcsetattr"
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        return {"ok": True, "phase": "complete", "path": device_path}
+    except OSError as exc:
+        return {
+            "ok": False,
+            "phase": phase,
+            "path": device_path,
+            "exception": f"{type(exc).__name__}: {exc}",
+            "errno": exc.errno,
+            "errno_name": errno.errorcode.get(exc.errno) if exc.errno is not None else None,
+        }
+    finally:
+        if fd is not None:
+            if exclusive:
+                try:
+                    fcntl.ioctl(fd, termios.TIOCNXCL)
+                except OSError:
+                    pass
+            if locked:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _tail_file(path: Path, limit: int = 6000) -> str:
+    try:
+        return path.read_bytes()[-limit:].decode("utf-8", "replace")
+    except OSError as exc:
+        return f"<讀取失敗：{type(exc).__name__}: {exc}>"
+
+
+def _add_exception_note(exc: BaseException, note: str) -> None:
+    add_note = getattr(exc, "add_note", None)
+    if callable(add_note):
+        add_note(note)
+    else:
+        exc.args = (f"{exc}\n{note}",)
+
+
+def _bridge_prompt_diagnostics(
+    evidence_dir: Path, ready_monotonic_ns: int, daemon_start_ns: int,
+) -> dict[str, Any]:
+    """由 bridge RX 證據判斷 DUT prompt 是否早於 Python daemon 啟動。"""
+    wire_path = evidence_dir / "wire.ndjson"
+    accumulated = bytearray()
+    first_rx: dict[str, Any] | None = None
+    prompt_rx: dict[str, Any] | None = None
+    endpoint_generation_at_bridge_start: int | None = None
+    try:
+        with wire_path.open("r", encoding="utf-8") as wire:
+            for line in wire:
+                try:
+                    row = json.loads(line)
+                    meta = row.get("meta")
+                    if (
+                        endpoint_generation_at_bridge_start is None
+                        and row.get("dir") == "META"
+                        and isinstance(meta, dict)
+                        and meta.get("event") == "bridge_start"
+                    ):
+                        endpoint_generation_at_bridge_start = row.get("endpoint_generation")
+                    if row.get("observation") != "dut_stdout_read":
+                        continue
+                    payload = base64.b64decode(row["payload_b64"], validate=True)
+                except (KeyError, ValueError, json.JSONDecodeError):
+                    continue
+                if first_rx is None:
+                    first_rx = row
+                accumulated.extend(payload)
+                if prompt_rx is None and b"root@fake:~# " in accumulated:
+                    prompt_rx = row
+    except OSError as exc:
+        return {"wire_path": str(wire_path), "read_error": f"{type(exc).__name__}: {exc}"}
+
+    prompt_mono_ns = prompt_rx.get("mono_ts_ns") if prompt_rx else None
+    return {
+        "wire_path": str(wire_path),
+        "endpoint_generation_at_bridge_start": endpoint_generation_at_bridge_start,
+        "first_dut_stdout_rx_mono_ts_ns": first_rx.get("mono_ts_ns") if first_rx else None,
+        "prompt_seen": prompt_rx is not None,
+        "prompt_rx_mono_ts_ns": prompt_mono_ns,
+        "prompt_rx_wall_ts": prompt_rx.get("wall_ts") if prompt_rx else None,
+        "prompt_after_bridge_ready_ms": (
+            round((prompt_mono_ns - ready_monotonic_ns) / 1_000_000, 3)
+            if isinstance(prompt_mono_ns, int) else None
+        ),
+        "prompt_before_python_daemon_start": (
+            prompt_mono_ns <= daemon_start_ns if isinstance(prompt_mono_ns, int) else None
+        ),
+        "prompt_relative_to_python_daemon_start_ms": (
+            round((prompt_mono_ns - daemon_start_ns) / 1_000_000, 3)
+            if isinstance(prompt_mono_ns, int) else None
+        ),
+    }
+
+
+def _startup_failure_diagnostics(
+    env: dict[str, str], daemon: Any, bridge: "BridgeTarget | None", daemon_start_ns: int,
+) -> dict[str, Any]:
+    """擷取隔離 Python daemon 前置失敗證據；不改狀態、不重啟、不重試 attach。"""
+    try:
+        response = rpc(env, "session.list")
+        session_row = next(
+            (row for row in response.get("sessions", []) if row.get("com") == "COM0"), None,
+        )
+    except Exception as exc:
+        session_row = {"diagnostic_error": f"session.list: {type(exc).__name__}: {exc}"}
+
+    result: dict[str, Any] = {
+        "session_row": session_row,
+        "python_daemon": {
+            "pid": daemon.proc.pid if daemon.proc is not None else None,
+            "returncode": daemon.proc.poll() if daemon.proc is not None else None,
+            "stderr_path": str(daemon.workdir / "daemon.stderr"),
+            "stderr_tail": _tail_file(daemon.workdir / "daemon.stderr"),
+        },
+    }
+
+    device_path = str(Path(env["SERIALWRAP_BY_ID_DIR"]) / "usb-FAKE_TARGET_0-if00")
+    link = Path(device_path)
+    try:
+        link_target = os.readlink(link)
+    except OSError as exc:
+        link_target = f"<readlink 失敗：{type(exc).__name__}: {exc}>"
+    slave_path = os.path.realpath(device_path)
+    result["pty"] = {
+        "by_id_link": device_path,
+        "by_id_is_symlink": link.is_symlink(),
+        "by_id_target": link_target,
+        "resolved_path": slave_path,
+        "resolved_exists": Path(slave_path).exists(),
+        "bridge_ready_slave_path": bridge.slave_path if bridge is not None else None,
+        "bridge_ready_slave_exists": (
+            Path(bridge.slave_path).exists() if bridge is not None else None
+        ),
+    }
+
+    if bridge is not None:
+        try:
+            bridge_status = bridge.control.call("status")
+        except Exception as exc:
+            bridge_status = {"diagnostic_error": f"status: {type(exc).__name__}: {exc}"}
+        try:
+            bridge.stderr_file.flush()
+        except Exception:
+            pass
+        result["bridge"] = {
+            "pid": bridge.process.pid,
+            "returncode": bridge.process.poll(),
+            "ready_monotonic_ns": bridge.ready_monotonic_ns,
+            "python_daemon_start_monotonic_ns": daemon_start_ns,
+            "ready_to_daemon_start_ms": round(
+                (daemon_start_ns - bridge.ready_monotonic_ns) / 1_000_000, 3,
+            ),
+            "status_at_failure": bridge_status,
+            "stderr_path": str(bridge.root / "bridge.stderr"),
+            "stderr_tail": _tail_file(bridge.root / "bridge.stderr"),
+            "dut_prompt": _bridge_prompt_diagnostics(
+                bridge.evidence_dir, bridge.ready_monotonic_ns, daemon_start_ns,
+            ),
+        }
+
+    if isinstance(session_row, dict) and (
+        session_row.get("state") == "DETACHED"
+        or str(session_row.get("last_error", "")).startswith("ATTACH_FAILED:")
+    ):
+        result["same_path_open_probe"] = _probe_posix_open(device_path)
+    else:
+        result["same_path_open_probe"] = {
+            "skipped": "失敗取樣的 session 並非 DETACHED／ATTACH_FAILED；避免佔用有效序列埠"
+        }
+    return result
+
+
+def start_python_daemon(
+    env: dict[str, str], profile_dir: Path, *, state: str = "READY",
+    bridge: "BridgeTarget | None" = None,
+):
     from bb_daemon import PyDaemon
 
     run_dir = Path(tempfile.mkdtemp(prefix="sw-"))
@@ -338,10 +546,24 @@ def start_python_daemon(env: dict[str, str], profile_dir: Path, *, state: str = 
         socket=str(run_dir / "serialwrapd.sock"),
         lock=run_dir / "serialwrapd.lock",
     )
+    daemon_start_ns = time.monotonic_ns()
     try:
         daemon.start(timeout_s=20.0)
         wait_session(env, state=state)
     except BaseException as exc:
+        try:
+            diagnostics = _startup_failure_diagnostics(env, daemon, bridge, daemon_start_ns)
+            _add_exception_note(
+                exc,
+                "Python 基線 daemon 前置失敗診斷（此處只取樣，沒有重試 attach）：\n"
+                + json.dumps(diagnostics, ensure_ascii=False, sort_keys=True, indent=2)
+            )
+        except Exception as diagnostic_error:
+            _add_exception_note(
+                exc,
+                "Python 基線 daemon 前置診斷擷取失敗："
+                f"{type(diagnostic_error).__name__}: {diagnostic_error}"
+            )
         try:
             stop_owned_python_daemon(daemon, env)
         except BaseException as cleanup_error:
@@ -629,6 +851,7 @@ class BridgeTarget:
     slave_path: str
     remote_root: Path
     stderr_file: Any
+    ready_monotonic_ns: int
 
     @classmethod
     def start(cls, root: Path, env: dict[str, str], *, delay_ms: int = 1) -> "BridgeTarget":
@@ -667,8 +890,18 @@ class BridgeTarget:
         )
         try:
             ready = _read_ready(proc)
+            ready_monotonic_ns = time.monotonic_ns()
             control = ControlClient(Path(ready["control_info"]), timeout_s=30.0)
-            return cls(root, evidence, proc, control, str(ready["slave_path"]), root / "remote-files", stderr_file)
+            return cls(
+                root=root,
+                evidence_dir=evidence,
+                process=proc,
+                control=control,
+                slave_path=str(ready["slave_path"]),
+                remote_root=root / "remote-files",
+                stderr_file=stderr_file,
+                ready_monotonic_ns=ready_monotonic_ns,
+            )
         except BaseException:
             if os.name == "posix":
                 try:

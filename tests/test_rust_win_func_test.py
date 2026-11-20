@@ -220,6 +220,20 @@ def test_basic_argv_omits_scenarios_and_keeps_com_pair() -> None:
     assert argv[argv.index("--report-dir") + 1] == "<RUN>\\report-basic"
 
 
+@pytest.mark.process_rpc
+def test_wrapper_supports_stage2_daemon_and_focused_ev01_run() -> None:
+    text = FUNC.read_text(encoding="utf-8")
+    assert "SERIALWRAP_DAEMON_EXE=" in text, "Stage 2 bundle 必須由 func-test harness 啟動 Rust daemon"
+    assert "bundle_sha256" in text and "bundle_stage" in text
+    assert "聚焦案例模式略過 scenarios runner" in text
+    out = _run(FUNC, "--print-basic-argv", "--case", "ev-01-spawn-handler")
+    assert out.returncode == 0, out.stdout + out.stderr
+    argv = json.loads(out.stdout)
+    assert argv[argv.index("--case") + 1] == "ev-01-spawn-handler"
+    assert argv[argv.index("--daemon-com") + 1] == "COM20"
+    assert argv[argv.index("--bridge-com") + 1] == "COM21"
+
+
 @pytest.mark.memory_only
 def test_wrapper_does_not_force_pythonutf8_and_sets_io_encoding() -> None:
     """S1X G3 (c)：不全域強制 PYTHONUTF8（bridge 子行程需依系統 locale 解碼）；runner 自身的 stdio 以 PYTHONIOENCODING 設定。"""

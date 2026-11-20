@@ -1,0 +1,4 @@
+[regen_lock] OK：鎖檔、案例屬性快照與統計檔與 cases.yaml 一致
+[regen_lock] FAIL 基準已有、HEAD 已消失（須擁有者裁決並以 --allow-removal s21_gate:cap_interactive_desktop:linux:cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c 列名）：s21_gate:cap_interactive_desktop.linux cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c
+[regen_lock] FAIL 基準已有、HEAD 已消失（須擁有者裁決並以 --allow-removal s21_gate:cap_windows_native:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem 列名）：s21_gate:cap_windows_native.linux cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem
+[regen_lock] FAIL 基準已有、HEAD 已消失（須擁有者裁決並以 --allow-removal s21_gate:cap_windows_native:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child 列名）：s21_gate:cap_windows_native.linux cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child

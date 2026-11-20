@@ -614,7 +614,9 @@ fn wait_stopped(
                 }
             }
             HolderScanStatus::Permission => reasons.push("holders_permission"),
-            HolderScanStatus::Unknown => reasons.push("holders_unknown"),
+            // `PartialOtherUid` 只屬 holder probe／開埠路徑（rulings/s2.md WP5-9），`HolderScan::status()` 不會回傳；
+            // 為窮舉起見與 `Unknown` 同樣不放行（fail-closed）。
+            HolderScanStatus::Unknown | HolderScanStatus::PartialOtherUid => reasons.push("holders_unknown"),
         }
         let scan = ctx.p.procs.serialwrapd_instances();
         if scan.is_err() {

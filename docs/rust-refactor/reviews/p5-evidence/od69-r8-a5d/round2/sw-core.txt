@@ -1,0 +1,663 @@
+   Compiling sw-core v0.3.2 ($WORKTREE/crates/sw-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.59s
+     Running unittests src/lib.rs (target/od69-r2-build/debug/deps/sw_core-4193b462eff7a85f)
+
+running 1 test
+test actor::probe_tests::probe_log_is_bounded_and_keeps_newest ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/arbiter.rs (target/od69-r2-build/debug/deps/arbiter-52648f4cafb9a9f7)
+
+running 26 tests
+test accepted_response_shape ... ok
+test complete_interactive_status ... ok
+test complete_ok_false ... ok
+test complete_ok_true_drops_error_code ... ok
+test cancel_semantics ... ok
+test cancel_queued_removes_from_heap ... ok
+test complete_on_canceled_keeps_canceled ... ok
+test length_counts_utf8_replace_bytes ... ok
+test flush_only_accepted ... ok
+test mark_running_skips_canceled_or_done ... ok
+test newline_rejected_cr_allowed_empty_allowed ... ok
+test aborted_mapping_bc03 ... ok
+test execution_mode_alias ... ok
+test priority_then_fifo ... ok
+test send_failed ... ok
+test unregistered_queue_not_ready ... ok
+test too_long_checked_before_newline_with_exact_response ... ok
+test warning_above_4096 ... ok
+test invalid_completion_regex_first ... ok
+test pending_excludes_interactive ... ok
+test record_key_order_matches_python ... ok
+test queue_full_counts_canceled_but_running ... ok
+test history_never_evicts_in_flight_canceled ... ok
+test mark_running_registers_in_flight_before_cancel ... ok
+test history_evicts_oldest_done_by_done_at_string ... ok
+test submit_cancel_loop_keeps_queue_bounded ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.46s
+
+     Running tests/command_exec.rs (target/od69-r2-build/debug/deps/command_exec-fb9111f4f43b78d8)
+
+running 69 tests
+test background_capture_truncates_head_keeps_one ... ok
+test passthrough_recover_no_probe ... ok
+test interactive_mode_command_tx_carries_cmd_id ... ok
+test completion_regex_meta_and_extraction ... ok
+test evict_removes_session_background_cmd_ids ... ok
+test passthrough_completion_regex_producer ... ok
+test bg_capture_count_evicts_finished_over_64 ... ok
+test echo_line_removed_repeatedly ... ok
+test interactive_mode_command_unknown_send_maps_aborted_in_flight_unknown ... ok
+test bg_capture_marked_done_on_finish ... ok
+test line_command_stdout_extraction_and_done ... ok
+test passthrough_reboot_is_plain_line ... ok
+test global_background_capture_limit_evicts_oldest_across_sessions ... ok
+test reboot_not_submitted_does_not_arm_quiet_e2e ... ok
+test evict_capture_event_drops_local_capture ... ok
+test passthrough_usable_prompt_completion ... ok
+test recover_no_bridge_reattach ... ok
+test interactive_mode_command_partial_send_maps_aborted_in_flight ... ok
+test outstanding_commands_counts_background_ids ... ok
+test background_capture_lifecycle ... ok
+test result_tail_fallback_from_registry ... ok
+test result_tail_negative_limit_exception ... ok
+test reboot_prompt_returns_quickly_ok_not_partial ... ok
+test passthrough_unusable_prompt_timeout_no_recovery ... ok
+test recover_released ... ok
+test recover_ready_path_returns_prompt_timeout_recovered ... ok
+test reboot_agent_enters_recovering_expect_reboot ... ok
+test reboot_flushes_commands_queued_behind_it ... ok
+test line_mode_terminates_existing_bg_capture ... ok
+test self_test_probe_in_flight_is_not_foreground_busy ... ok
+test ctrl_d_after_ctrl_c_fails ... ok
+test reboot_arms_quiet_only_after_tx_settled_e2e ... ok
+test wrapped_echo_busybox_newline_replacing_command_space_is_kept ... ok
+test wrapped_echo_busybox_wrap_is_stripped ... ok
+test wrapped_echo_busybox_insertions_closer_than_20_are_kept ... ok
+test submit_during_agent_lease_is_rejected_at_execute_time ... ok
+test wrapped_echo_not_starting_on_first_line_is_kept ... ok
+test wrapped_echo_long_output_missing_command_space_is_kept ... ok
+test wrapped_echo_output_equal_to_command_without_spaces_is_kept ... ok
+test wrapped_echo_insertion_before_first_char_or_too_close_is_kept ... ok
+test wrapped_echo_first_insertion_counts_first_line_column ... ok
+test wrapped_echo_prompt_prefix_on_first_echo_line ... ok
+test recover_while_foreground_command_sends_recover_keys ... ok
+test wrapped_echo_readline_space_wrap_is_stripped ... ok
+test wrapped_echo_plain_crlf_stdout_spelling_command_is_kept ... ok
+test passthrough_timeout_no_rescue_keys_no_downgrade ... ok
+test wrapped_echo_readline_wrap_before_command_space_is_stripped ... ok
+test wrapped_echo_short_output_split_like_command_is_kept ... ok
+test wrapped_echo_single_line_echo_not_stripped_twice ... ok
+test wrapped_echo_short_command_and_no_echo_unchanged ... ok
+test wrapped_echo_three_line_wrap_is_stripped ... ok
+test command_cancel_running_revokes_tx_op ... ok
+test self_test_while_foreground_command_sends_probe ... ok
+test wrapped_echo_readline_python_golden_cases ... ok
+test recover_key_other_reject_in_command_maps_aborted_in_flight ... ok
+test quiet_rechecked_before_each_recover_key ... ok
+test both_keys_fail_prompt_timeout_to_attached ... ok
+test recover_key_refused_frozen_maps_flushed_by_recovery ... ok
+test timeout_sends_ctrl_c_then_recovers_and_flushes_queue ... ok
+test reboot_recovery_waits_quiet_then_login_ready ... ok
+test recover_ready_path_force_fallbacks ... ok
+test rx_keeps_waiting_until_timeout ... ok
+test silence_breaks_wait_loop ... ok
+test reboot_recovery_timeout_to_attached ... ok
+test recover_force_timeout_after_10s ... ok
+test recover_keys_wal_source_system_recover ... ok
+test recover_attached_reprobe_bootloader_classification ... ok
+test recover_attached_reprobe_not_recovered_last_error_field ... ok
+test tx_ledger_bounded_over_long_session_without_reconnect ... ok
+
+test result: ok. 69 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.89s
+
+     Running tests/drain_release.rs (target/od69-r2-build/debug/deps/drain_release-f11a3c6a585e2886)
+
+running 67 tests
+test auto_attach_plain_external_holder_no_io ... ok
+test hotplug_held_is_detached_attach_failed ... ok
+test attach_access_denied_reports_holder_unknown ... ok
+test attach_during_drain_is_session_recovering ... ok
+test aborted_op_is_never_settled_during_drain ... ok
+test attach_other_open_error_detached_attach_failed ... ok
+test close_failure_keeps_recovering_and_no_success ... ok
+test already_attached ... ok
+test attach_open_held_reports_holder_unknown ... ok
+test device_removed_clears_real_path_before_manual_attach ... ok
+test cross_kind_request_during_drain_is_session_recovering ... ok
+test in_flight_unknown_is_send_failed ... ok
+test abort_mapping_independent_of_opfinished_order ... ok
+test pending_open_timeout_is_rearmed_with_opened_bridge_epoch ... ok
+test drain_timeout_marks_stalled_and_late_receipt_completes ... ok
+test missing_device_tick_keeps_released ... ok
+test full_write_aborted_meta_complete ... ok
+test attach_success_commits_then_attaching ... ok
+test attach_force_does_not_bypass_identified_external_holder ... ok
+test duplicate_pending_open_manual_attach_only_opens_once ... ok
+test attach_precheck_holder_still_held ... ok
+test rebound_receipt_sets_device_rebound_required_then_reopens ... ok
+test probe_stop_timeout_waits_late_receipt ... ok
+test clear_reopen_attaching_clears_last_error ... ok
+test duplicate_release_joins_same_stop_op ... ok
+test device_attach_dedup_same_by_id_inflight ... ok
+test attach_not_found_device_not_present ... ok
+test holder_unknown_is_true_when_no_pids_even_if_probe_flag_is_false ... ok
+test io_error_drain_then_reattach_when_present ... ok
+test late_receipt_persist_failure_sets_pending_and_retries ... ok
+test aborted_in_flight_with_unknown_tail_writes_unknown_outcome ... ok
+test release_during_pending_open_drain_stalled ... ok
+test login_failure_detaches_after_receipt ... ok
+test in_flight_zero_bytes_is_flushed_by_recovery ... ok
+test io_error_with_pending_auto_login_goes_recovering_not_attach ... ok
+test release_during_pending_open_reply_is_stalled_until_close_receipt ... ok
+test release_during_pending_open_bridge_closes_late_handle ... ok
+test session_attach_attaching_bridge_matches_python_response_shape ... ok
+test internal_events_during_drain_recorded_as_post_kind ... ok
+test session_attach_released_matches_python_without_opening ... ok
+test settle_emitted_once_at_terminal_point ... ok
+test release_of_released_session_cancels_inflight_device_attach ... ok
+test release_commit_failure_is_exception_but_memory_released ... ok
+test phase1_snapshot_sets_reason_and_clears_foreground ... ok
+test release_closed_console_count_comes_from_owner_and_is_platform_independent ... ok
+test release_retry_persists_after_commit_failure ... ok
+test shutdown_during_io_error_drain_never_reopens_device ... ok
+test release_during_released_attach_commit_restores_original_metadata ... ok
+test stale_bridge_opened_after_rebind_closed ... ok
+test shutdown_waits_for_opened_bridge_pending_state_commit ... ok
+test release_success_response_shape ... ok
+test missing_ledger_entry_maps_to_flushed ... ok
+test session_attach_with_release_request_session_recovering ... ok
+test session_attach_ready_matches_python_response_shape ... ok
+test single_release_persister_waiters_take_over ... ok
+test release_flushes_accepted_with_flushed_by_recovery ... ok
+test stale_bridge_opened_after_real_path_change_closed ... ok
+test release_waits_for_receipt_then_persists_and_maps_bc03 ... ok
+test worker_receipt_type_keeps_unsettled_only_ledger_shape ... ok
+test release_response_closed_consoles_and_aborted_cmd ... ok
+test tx_ledger_saturated_drains_as_io_error ... ok
+test shutdown_flushes_with_flushed_by_shutdown ... ok
+test wal_gap_lists_unrecorded_and_still_completes ... ok
+test stale_reply_context_rejected_after_release ... ok
+test release_preserves_last_error_released_on_all_completion_paths ... ok
+test stale_bridge_opened_epoch_after_released_attach_is_closed ... ok
+test stale_receipt_after_reattach_keeps_evidence_only ... ok
+
+test result: ok. 67 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/drain_release_e2e.rs (target/od69-r2-build/debug/deps/drain_release_e2e-9cace3de62f16a73)
+
+running 15 tests
+test actor_answers_get_state_while_drain_pending ... ok
+test release_waits_for_receipt_and_aborts_partial_in_flight ... ok
+test close_failure_keeps_recovering_and_no_success ... ok
+test wal_unwritable_does_not_block_close_but_lists_gap ... ok
+test old_epoch_tx_completion_after_reattach_keeps_evidence ... ok
+test in_flight_unknown_is_send_failed_no_resend ... ok
+test drain_receipt_dependency_wait_on_shutdown_within_od64_bound ... ok
+test drain_receipt_dependency_wait_on_release_within_od64_bound ... ok
+test drain_timeout_marks_stalled_and_release_reports_drain_stalled ... ok
+test in_flight_unknown_during_drain_is_send_failed_no_resend ... ok
+test shutdown_receipt_follows_queued_rx_capture_and_wal ... ok
+test shutdown_and_drain_receipt_handled_within_one_data_item_under_flood ... ok
+test release_receipt_follows_queued_rx_capture_and_wal ... ok
+test new_bridge_receipt_ignores_old_epoch_rx_progress ... ok
+test release_handled_within_one_data_item_under_flood ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.34s
+
+     Running tests/io_worker.rs (target/od69-r2-build/debug/deps/io_worker-935e91373af8f94b)
+
+running 9 tests
+test snapshot_serial_alive_and_running_semantics ... ok
+test idle_worker_finishes_with_receipt ... ok
+test close_failure_in_receipt ... ok
+test snapshot_tracks_handle_liveness_across_eof_error_and_stop ... ok
+test drain_completes_while_opctx_sender_alive ... ok
+test begin_stop_not_blocked_by_inflight_completion_wait ... ok
+test receipt_ledger_holds_only_unsettled_ops ... ok
+test wal_unwritable_during_drain_lists_gap ... ok
+test blocked_forever_writer_never_sends_receipt ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.02s
+
+     Running tests/lease_selftest.rs (target/od69-r2-build/debug/deps/lease_selftest-6492536efd90b7f7)
+
+running 34 tests
+test base64_non_ascii_message_matches_python_unicode_encode_error ... ok
+test lease_expiry_checks_current_deadline ... ok
+test lazy_expiry_keeps_tombstone_expired ... ok
+test lease_expiry_timer_is_strictly_after_deadline ... ok
+test selftest_passthrough_zero_tx ... ok
+test open_busy_foreground ... ok
+test log_capture_dir_not_creatable_is_exception ... ok
+test send_encodings ... ok
+test selftest_bridge_down_when_serial_dead ... ok
+test log_capture_open_failure ... ok
+test open_existing_agent_lease ... ok
+test selftest_device_rebound_required ... ok
+test lease_send_after_close_is_zero_tx ... ok
+test selftest_released_external_holder ... ok
+test selftest_vtty_stale ... ok
+test send_expired_closes ... ok
+test selftest_probe_other_reject_zero_tx_matches_python ... ok
+test open_ready_shape ... ok
+test selftest_quiet_armed_after_precheck_before_submit_zero_tx ... ok
+test log_capture_start_stop_status ... ok
+test lease_send_refused_at_commit_maps_codes ... ok
+test lease_send_after_expiry_or_quiet_is_zero_tx ... ok
+test tick_expires_lease_sc13 ... ok
+test selftest_during_reconfirm_pending_not_fenced ... ok
+test selftest_ok_confirms_ready ... ok
+test status_touches_and_returns_screen ... ok
+test selftest_order_table ... ok
+test selftest_quiet_armed_during_submit_counts_committed ... ok
+test open_attached_not_bootloader ... ok
+test open_attached_rescue_banner ... ok
+test rescue_lease_send_during_quiet_reaches_uart ... ok
+test open_attached_rescue_three_arms ... ok
+test selftest_unresponsive_counts_attempt ... ok
+test selftest_probe_drain_race_golden ... ok
+
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.66s
+
+     Running tests/login_quiet.rs (target/od69-r2-build/debug/deps/login_quiet-a7ac23f47c971055)
+
+running 35 tests
+test login_tx_failure_classified_like_login_tx_refused ... ok
+test parse_env_file_rules ... ok
+test produced_constants_are_frozen ... ok
+test prompt_timeout_codes_by_platform ... ok
+test rearm_does_not_extend_reconfirm_deadline ... ok
+test auth_reasons ... ok
+test attach_stale_result_not_from_quiet_still_ignored ... ok
+test reconfirm_exhausts_after_5_attempts ... ok
+test is_reboot_command_negative ... ok
+test passthrough_no_ready_probe_no_tx ... ok
+test probe_ready_sends_lf_and_matches_whole_window ... ok
+test credentials_unresolved_is_terminal_attached_and_sends_no_credentials ... ok
+test bootloader_prompt_tail_prevents_clear ... ok
+test human_prefixed_rpc_source_is_gated_like_agent_df02 ... ok
+test invalid_bootloader_regex_skipped ... ok
+test reconfirm_exhausts_after_300s_ready_unconfirmed ... ok
+test attach_settles_attached_after_quiet_revokes_probe ... ok
+test attach_login_tx_unknown_detaches_attach_failed ... ok
+test valid_completion_regex_rules ... ok
+test reboot_command_arms_quiet_at_dequeue ... ok
+test reboot_not_submitted_does_not_arm_quiet ... ok
+test unsupported_profile_no_auto_tx ... ok
+test uboot_template_no_probe_quiet_ready ... ok
+test banner_split_across_chunks_arms_quiet_and_blocks_agent_with_retry_after ... ok
+test reboot_command_arms_quiet_after_tx_submitted ... ok
+test passthrough_banner_does_not_arm_quiet ... ok
+test execute_time_gate_has_retry_after_sc03 ... ok
+test ensure_ready_login_sequence ... ok
+test rx_flood_reclassifies ... ok
+test attach_and_recover_reset_credentials_warned ... ok
+test quiet_blocks_login_probe_zero_tx ... ok
+test disk_full_blocks_login_probe_but_not_agent_cmd ... ok
+test login_error_detail_carries_rx_tail ... ok
+test flood_masking_exact_set ... ok
+test login_failure_code_table ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.99s
+
+     Running tests/mailbox.rs (target/od69-r2-build/debug/deps/mailbox-661a0189be724e06)
+
+running 22 tests
+test control_first_when_independent ... ok
+test op_finished_waits_for_dependent_rx ... ok
+test independent_control_served_while_dependent_stashed ... ok
+test full_dependency_stash_does_not_block_worker_receipt ... ok
+test receipt_without_dependency_has_zero_pre_dependency_data ... ok
+test data_lane_bounded_1024 ... ok
+test dependency_released_on_worker_stopped ... ok
+test control_lane_bounded_256 ... ok
+test stopped_receipt_records_pre_dependency_data ... ok
+test lane_witness_counts_data_returned_via_stopped_and_pending_paths ... ok
+test witness_counts_data_overtaking_stopped_receipt ... ok
+test control_waits_for_dependent_rx ... ok
+test full_dependency_stash_does_not_block_independent_release ... ok
+test request_timeout_returns_internal_timeout ... ok
+test pre_dependency_data_excludes_later_and_other_epoch_data ... ok
+test stale_epoch_dependency_released_immediately ... ok
+test stash_bounded_16 ... ok
+test actor_probe_records_pre_dependency_data_for_drain_receipt ... ok
+test zero_rx_dependency_is_ready_on_current_epoch ... ok
+test actor_ticks_passthrough_ready_without_followup_event ... ok
+test fake_clock_advance_wakes_timer_promptly ... ok
+test fake_clock_advance_observes_drain_timeout_in_session ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/rx_reader.rs (target/od69-r2-build/debug/deps/rx_reader-a1d6dd3bdbe6d7ca)
+
+running 23 tests
+test per_chunk_utf8_decode_replaces_split_multibyte ... ok
+test idle_counts_from_creation ... ok
+test reader_wait_error_reason_is_select_errno ... ok
+test rx_is_in_wal_before_actor_sees_it_with_exact_seq ... ok
+test op_finished_waits_for_reader_rx_match_watermark ... ok
+test rate_window_merge_oldest_keeps_byte_sum ... ok
+test read_error_reports_serial_read_errno ... ok
+test eof_does_not_report_bridge_down ... ok
+test rx_stats_window_prunes_strictly_older_than_10s ... ok
+test rx_window_trims_head_and_keeps_absolute_offsets ... ok
+test match_watermark_is_atomic_with_text ... ok
+test rx_rate_window_capped_4096 ... ok
+test rx_observer_panic_isolated_reader_continues ... ok
+test completion_cannot_overtake_its_rx_chunk ... ok
+test wait_for_regex_zero_timeout_is_false ... ok
+test wait_for_regex_does_not_hold_rx_mutex_during_search ... ok
+test sentinel_receives_raw_bytes_and_eagain_drops ... ok
+test woken_and_stop_flag_exits ... ok
+test wait_for_regex_from_recomputes_rel_after_trim ... ok
+test wait_for_regex_from_wakes_on_append ... ok
+test data_lane_backpressure_blocks_reader_after_wal ... ok
+test rx_handler_panic_skips_chunk_keeps_reader ... ok
+test sentinel_input_discarded ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+     Running tests/session_core.rs (target/od69-r2-build/debug/deps/session_core-b529332ecbb4331f)
+
+running 66 tests
+test attached_passthrough_submit_not_ready_with_ready_in ... ok
+test access_denied_maps_to_permission_error ... ok
+test boot_banner_invalidates_old_fsm_and_owner_generations ... ok
+test attaching_submit_not_ready ... ok
+test attached_non_capable_submit_profile_not_command_capable ... ok
+test attached_capable_submit_not_ready ... ok
+test banner_during_attach_login_ready_result_applied ... ok
+test actor_event_panic_isolated ... ok
+test detached_device_attached_opens_and_attaching ... ok
+test detached_submit_not_ready ... ok
+test device_removed_during_attach_uses_python_last_error ... ok
+test clear_without_bridge_with_device_reports_attaching_and_reattaches ... ok
+test last_error_change_clears_detail ... ok
+test flashing_submit_flashing_busy_sc02 ... ok
+test clear_without_bridge_without_device_stays_detached_cleared ... ok
+test aborted_op_is_settled_only_from_worker_receipt ... ok
+test bridge_opened_allocates_epoch_once ... ok
+test actor_repeated_panics_begin_io_error_drain ... ok
+test empty_env_file_values_remain_unresolved ... ok
+test credentials_env_file_accepts_export_comments_and_quotes ... ok
+test credential_gate_follows_command_capability_and_boot_quiet ... ok
+test banner_during_attach_login_failed_drains_detached ... ok
+test device_detached_starts_drain_removed ... ok
+test credentials_warning_uses_python_missing_path_placeholder ... ok
+test env_file_without_login_requirement_does_not_block_probe ... ok
+test interactive_open_allows_non_agent_owner ... ok
+test login_not_ready_attached_also_bumps_bridge_generation ... ok
+test passthrough_attach_no_login_no_probe ... ok
+test banner_during_attach_login_settles_attached ... ok
+test passthrough_quiet_blocked_by_drain_flash_released ... ok
+test interactive_open_rejects_foreground_and_existing_lease ... ok
+test boot_quiet_survives_clear_drain_and_blocks_reattach_probe ... ok
+test passthrough_io_error_recovers_and_requiets ... ok
+test passthrough_ready_not_demoted_by_rx_or_banner ... ok
+test release_during_nonrelease_drain_returns_session_recovering ... ok
+test passthrough_rx_restarts_quiet_window ... ok
+test public_console_endpoint_null_when_ctx_requests ... ok
+test passthrough_and_unresolved_bump_on_adoption ... ok
+test public_dict_key_order_with_sc04_fields ... ok
+test queued_commands_do_not_increase_outstanding_count ... ok
+test reconfirm_deadline_is_300s_from_first_banner_and_does_not_extend ... ok
+test ready_submit_admitted ... ok
+test activity_classification_thresholds ... ok
+test passthrough_quiet_tick_ready_at_30s ... ok
+test recover_during_pending_attach_returns_reattach ... ok
+test recovering_interactive_open_session_recovering ... ok
+test login_finished_stale_fsm_gen_ignored ... ok
+test release_while_flashing_includes_selector ... ok
+test login_ok_ready_and_bridge_generation_plus_one ... ok
+test stale_epoch_io_error_is_ignored ... ok
+test login_failed_detach_does_not_bump ... ok
+test recovering_submit_is_session_recovering_sc01 ... ok
+test wall_clock_jump_does_not_move_deadlines ... ok
+test stale_timer_ignored ... ok
+test stale_rx_chunk_no_state_effect ... ok
+test tick_expires_reconfirm_without_tx ... ok
+test release_while_bridge_open_is_pending_waits_for_drain_receipt ... ok
+test rx_window_resets_per_bridge ... ok
+test session_ready_note_marks_attach_run_only ... ok
+test released_submit_not_ready ... ok
+test reprobe_plan_ignores_pending_auto_login ... ok
+test credentials_warning_is_deduplicated_until_manual_recover ... ok
+test console_unlock_env_is_a_credential_source ... ok
+test released_device_attached_is_noop ... ok
+test queue_full_at_256 ... ok
+test wall_clock_jump_param ... ok
+
+test result: ok. 66 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+     Running tests/session_manager.rs (target/od69-r2-build/debug/deps/session_manager-6200637d54928353)
+
+running 65 tests
+test binding_override_cleanup_186 ... ok
+test attach_finish_respawns_when_state_requires ... ok
+test alias_set_reaches_actor_profile_for_get_state ... ok
+test detached_rebind_fallback_smallest_act_no ... ok
+test alias_set_persists_but_not_applied_after_restart ... ok
+test detect_skips_passthrough_console_unlock_and_unsupported ... ok
+test detect_probe_tx_goes_through_fence ... ok
+test detect_probe_fence_observes_wal_unhealthy_published_before_submit ... ok
+test alias_unassign_saves_before_check ... ok
+test dynamic_session_applies_template_uart_config ... ok
+test com_for_by_id_session_first_then_pending ... ok
+test manager_startup_always_rewrites_state_json ... ok
+test dynamic_session_naming ... ok
+test bind_to_online_device_live_state_attaching_before_reply ... ok
+test device_removed_drains_to_detached ... ok
+test interactive_routes_by_id_without_selector ... ok
+test log_filename_uses_local_time_by_default ... ok
+test management_ops_commit_failure_is_err ... ok
+test dynamic_probe_and_bridge_share_preopened_port ... ok
+test missing_explicit_target_marked_device_not_found ... ok
+test clear_during_shutdown_errors ... ok
+test dynamic_attach_skipped_during_shutdown_or_drain ... ok
+test pending_rank_pruned_on_removal ... ok
+test begin_shutdown_blocks_hotplug_open ... ok
+test device_attach_during_shutdown_errors ... ok
+test fanout_registers_every_session_fence ... ok
+test fallback_redetects_on_reattach ... ok
+test next_dynamic_com_for_hotplug ... ok
+test hotplug_invalidates_pending_attach_op_and_closes_unused_port ... ok
+test recover_released_during_stopping_returns_released ... ok
+test rank_excludes_released_explicit_bound ... ok
+test selector_resolution_order ... ok
+test released_dynamic_act_no_and_profile_source ... ok
+test rebind_drains_before_reopen ... ok
+test product_executor_blocked_release_commit_keeps_actor_responsive ... ok
+test pin_unpin_paths ... ok
+test release_persist_point_failure_fails_release_commit ... ok
+test rank_assigns_com_by_sorted_by_id_before_watcher_start ... ok
+test max_sessions_warning ... ok
+test clear_paths ... ok
+test release_commit_paused_then_bind_keeps_binding_without_stale_released_row ... ok
+test startup_save_failure_reports_python_exception_line ... ok
+test sentinel_pty_reported_in_public_and_release ... ok
+test selftest_fallback_passthrough_suggests_pin_profile ... ok
+test released_survives_two_restarts_dynamic ... ok
+test rematerialize_profile_recomputes_session_id_and_alias ... ok
+test released_dynamic_materialize_template_fallback ... ok
+test unresolvable_pin_falls_through ... ok
+test resolution_order_pin_sticky_detect_fallback ... ok
+test session_attach_paths ... ok
+test watcher_tick_services_deferred_wal_rotation ... ok
+test product_executor_blocked_open_keeps_actor_responsive_and_release_drain_stalled ... ok
+test sticky_persisted_only_when_ready_and_path_unchanged ... ok
+test shutdown_includes_inflight_attach ... ok
+test shutdown_gate_after_open_started_stops_bridge_without_tx ... ok
+test reattach_redetect_to_ready_does_not_write_sticky ... ok
+test release_partial_in_flight_command_writes_single_aborted_meta ... ok
+test bind_paths ... ok
+test probe_bridge_closed_with_receipt_before_real_open ... ok
+test pin_applies_on_reattach ... ok
+test pin_then_clear_on_attached_session_applies_pin ... ok
+test global_bg_capture_eviction_owner_routing_ignores_alias_collision ... ok
+test global_bg_capture_eviction_reaches_owner_session_via_manager ... ok
+test bind_with_inflight_attach_op_cancels_waits_3000ms ... ok
+test shutdown_budget_5s ... ok
+
+test result: ok. 65 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.32s
+
+     Running tests/slice21_prereqs.rs (target/od69-r2-build/debug/deps/slice21_prereqs-b6c984fc6235ec86)
+
+running 1 test
+test prereq_symbols_exist ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/state_store.rs (target/od69-r2-build/debug/deps/state_store-f8cc27aa299c243d)
+
+running 31 tests
+test alias_list_sorted_with_alias_key ... ok
+test alias_unassign_missing_false ... ok
+test alias_set_overwrites_in_place ... ok
+test corrupt_json_renamed_and_empty_state ... ok
+test double_bom_state_json_warning_matches_python ... ok
+test dynamic_released_rows_retained_across_snapshots ... ok
+test materialized_row_wins_over_loaded ... ok
+test model_deltas_update_sections ... ok
+test async_commit_reports_failure_then_retry_succeeds ... ok
+test missing_file_is_default ... ok
+test unreleased_removes_row ... ok
+test non_dict_json_is_empty_without_backup ... ok
+test corrupt_non_utf8_renamed ... ok
+test hooks_run_on_store_thread_around_write ... ok
+test python_bytes_roundtrip_exactly ... ok
+test profile_pins_and_detected_strip_tolerance ... ok
+test commit_file_mode_0600_and_trailing_newline ... ok
+test state_json_line_ending_follows_python_text_mode ... ok
+test unknown_keys_dropped_on_save ... ok
+test tolerant_fields ... ok
+test lone_surrogate_state_json_loads_and_reproduces_python_encode_error ... ok
+test unreadable_is_state_load_error_and_file_untouched ... ok
+test commit_failure_returns_error ... ok
+test utf16_and_utf32_state_json_load_like_python ... ok
+test utf16_utf32_decode_error_text_matches_python ... ok
+test released_materialize_failure_keeps_block ... ok
+test non_dict_json_not_backed_up ... ok
+test tmp_residue_ignored ... ok
+test aliases_not_dict_fails_startup_like_python ... ok
+test p4_atomic_write_semantics ... ok
+test startup_always_rewrites_state_json ... ok
+
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/tx_writer.rs (target/od69-r2-build/debug/deps/tx_writer-aaeeb9d6ed210994)
+
+running 42 tests
+test fence_sink_sets_wal_unhealthy ... ok
+test authorized_then_drain_freeze_before_os_submit_is_zero_tx ... ok
+test cancelled_ops_bounded_512_fifo ... ok
+test flash_probe_does_not_reuse_op_id_as_probe_identity ... ok
+test authorized_then_lease_owner_gen_bump_before_os_submit_is_zero_tx ... ok
+test authorized_then_quiet_before_os_submit_is_zero_tx ... ok
+test cancelled_inflight_command_later_tx_refused ... ok
+test gate_rules ... ok
+test log_false_secret_not_in_wal ... ok
+test job_queue_bounded_64 ... ok
+test lease_owner_job_after_owner_gen_bump_rejected ... ok
+test freeze_during_in_flight_counts_as_committed_and_next_is_rejected ... ok
+test login_probe_after_fsm_gen_bump_rejected ... ok
+test ledger_records_partial_and_unknown ... ok
+test interactive_open_cmd_after_owner_gen_bump_rejected ... ok
+test os_submit_always_inside_fence_critical_section ... ok
+test quiet_between_partial_submits_stops_tail ... ok
+test partial_write_records_only_confirmed_prefix ... ok
+test zero_progress_cancel_after_freeze_is_not_submitted_draining ... ok
+test reboot_tx_arms_quiet_before_next_job ... ok
+test reboot_tx_not_submitted_does_not_arm_quiet_in_writer ... ok
+test unknown_outcome_records_no_tx_and_reports_unknown ... ok
+test queued_jobs_after_stop_are_not_submitted_in_ledger ... ok
+test settle_queue_full_retains_entry ... ok
+test ledger_retire_racing_drain_preserves_bc03 ... ok
+test unknown_meta_wal_failure_is_recorded_as_evidence_gap ... ok
+test stop_ends_writer_while_other_senders_alive ... ok
+test unknown_with_log_false_writes_no_meta ... ok
+test writer_returned_on_shutdown ... ok
+test send_after_writer_join_is_disconnected ... ok
+test reply_receiver_gone_is_kept_in_ledger ... ok
+test unknown_with_log_writes_tx_outcome_unknown_meta ... ok
+test tx_wal_failure_reported_and_gap_listed ... ok
+test per_op_wal_gaps_capped ... ok
+test settle_unknown_or_already_settled_is_noop ... ok
+test settled_op_wal_gaps_move_to_unresolved_set ... ok
+test stale_epoch_is_not_submitted_and_never_calls_os_write ... ok
+test wal_order_equals_write_order ... ok
+test ledger_saturation_never_evicts_live_ops ... ok
+test unresolved_gaps_capped_with_overflow_summary ... ok
+test quiet_during_os_submit_waits_for_submit_and_counts_committed ... ok
+test ledger_retires_completed_ops_without_reconnect ... ok
+
+test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/wal_writer.rs (target/od69-r2-build/debug/deps/wal_writer-e26b232e317f0098)
+
+running 54 tests
+test directory_identity_recovers_after_transient_startup_error ... ok
+test damaged_first_nonempty_line_keeps_recreate_range_unknown ... ok
+test enospc_on_open_handle_trips_all_fences ... ok
+test health_keys_order ... ok
+test health_missing_file_after_writes_unhealthy ... ok
+test external_unlink_writes_recreate_meta_then_record ... ok
+test health_query_does_not_republish_an_old_fanout_snapshot ... ok
+test health_rotate_retry_counts_transient_rename_failure ... ok
+test identity_throttle_ignores_wall_jump ... ok
+test identity_query_error_at_rotate_threshold_keeps_current_file ... ok
+test identity_check_precedes_rotation_when_rotation_is_due ... ok
+test meta_empty_payload_and_sorted_meta_keys ... ok
+test meta_not_in_com0_tail ... ok
+test lazy_open_idle_file_absent ... ok
+test mirror_failure_retries_only_mirror ... ok
+test mirror_identity_reopened_without_meta ... ok
+test mirror_retry_failure_counts_write_failure ... ok
+test mirror_partial_write_completes_suffix_only ... ok
+test open_failure_at_startup_marks_unhealthy ... ok
+test mirror_unlink_is_checked_without_waiting_for_identity_interval ... ok
+test new_session_inherits_wal_unhealthy ... ok
+test replacement_at_rotate_threshold_keeps_meta_current ... ok
+test rotate_close_and_sync_dir_transient_errors_count ... ok
+test rotate_non_transient_error_clears_schedule ... ok
+test rotate_rename_failure_marks_record ... ok
+test recreate_meta_matches_contract_schema ... ok
+test reset_renames_nonempty_files_independent_suffix ... ok
+test shutdown_syncs_then_closes ... ok
+test rotate_deferred_warning_rate_limited_and_tick_completes ... ok
+test rotate_collision_adds_numeric_suffix ... ok
+test rotate_schedule_cancelled_when_file_shrinks_or_vanishes ... ok
+test rx_record_bytes_match_python_golden ... ok
+test wal_contract_golden_matches_p1 ... ok
+test rotate_retry_not_counted_before_next_at ... ok
+test recreate_retry_schedule_uses_monotonic_gaps ... ok
+test replacement_unterminated_tail_keeps_meta_parseable ... ok
+test second_unlink_range_starts_at_first_meta_seq ... ok
+test tail_latest_and_range_semantics ... ok
+test rows_to_text_lines_keeps_crlf_quirk ... ok
+test reset_rename_error_propagates_and_keeps_seq ... ok
+test startup_seq_is_max_int_seq_in_current_file ... ok
+test startup_unterminated_wal_tail_is_terminated_before_append ... ok
+test reopen_failure_marks_unhealthy_and_trips_sink ... ok
+test wal_write_failure_twice_sets_loss_flag_and_consumes_seq ... ok
+test wal_reopen_retry_partial_sets_dirty_tail ... ok
+test wall_ts_omits_zero_microseconds ... ok
+test wal_partial_write_suffix_failure_terminates_tail_next_record_parses ... ok
+test rotate_before_write_at_threshold_utc_suffix ... ok
+test wal_zero_sent_failure_rewrites_whole_line_after_reopen ... ok
+test zero_identity_and_unlinked_handle_classify_external_unlink ... ok
+test rotate_backoff_defers_after_three_transient_failures ... ok
+test wal_partial_write_then_failure_completes_suffix_only ... ok
+test wal_writer_replays_python_line_fixtures ... ok
+test health_fanout_serializes_register_and_status_notifications ... ok
+
+test result: ok. 54 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+   Doc-tests sw_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

@@ -1,0 +1,23 @@
+# P7 黑箱（Task 18）：宣告帳密但帳密檔不存在（env_file 指向 ${ENV_FILE}.unresolved，測試期間可事後補寫）。
+# 環境不帶 SW_P7_USER／SW_P7_PASS（isolated_env）；對應 F10 `f10-unresolved-creds-terminal`／`f10-creds-fixed-then-ready`。
+profiles:
+  p7-shell:
+    platform: shell
+    prompt_regex: ".*[$#] $"
+    login_regex: "(?mi)^.*login:\\s*$"
+    password_regex: "(?mi)^password:\\s*$"
+    user_env: SW_P7_USER
+    pass_env: SW_P7_PASS
+    env_file: "${ENV_FILE}.unresolved"
+    timeout_s: 10
+    uart:
+      baud: 115200
+      data_bits: 8
+      parity: N
+      stop_bits: 1
+      flow_control: none
+      xonxoff: false
+targets:
+  - profile: p7-shell
+    com: COM0
+    device_by_id: "${BY_ID}"

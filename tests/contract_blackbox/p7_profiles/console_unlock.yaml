@@ -1,0 +1,26 @@
+# P7 黑箱（Task 18A）：console lock（Smart4R 類）；secret 由 ${ENV_FILE} 的 SW_P7_CONSOLE_UNLOCK 提供。
+# 對應 FakeTarget(prompt="root@smart4r:~# ", console_lock={"secret": …, "idle_s": …})。只支援明確 targets 綁定。
+# ready_probe 省略＝採 config 預設（echo __READY__ 接 nonce 佔位）；代換後檔案不得殘留任何佔位語法。
+profiles:
+  p7-console-unlock:
+    platform: shell
+    prompt_regex: '(?m)^root@smart4r:[^\r\n#]*#[ \t]*'
+    login_regex: '$^'
+    password_regex: '$^'
+    console_unlock_env: SW_P7_CONSOLE_UNLOCK
+    console_unlock_idle_s: 1
+    env_file: "${ENV_FILE}"
+    timeout_s: 20
+    bootloader_prompts:
+      - '(?m)^CFE>\s*$'
+    uart:
+      baud: 115200
+      data_bits: 8
+      parity: N
+      stop_bits: 1
+      flow_control: none
+      xonxoff: false
+targets:
+  - profile: p7-console-unlock
+    com: COM0
+    device_by_id: "${BY_ID}"

@@ -1,0 +1,22 @@
+# 起點 9d35b01 全套 pytest 失敗清單（ubuntu 非 root，與 g1 並行執行；21 筆）
+FAILED tests/contract_blackbox/slice21/test_f2_backpressure.py::test_recovery_flushes_queue
+FAILED tests/contract_blackbox/slice21/test_f3_observability.py::test_device_error_names_selector
+FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_recovering_submit_session_recovering
+FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[AUTOBOOT_QUIET]
+FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[METHOD_NOT_FOUND]
+FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[READY_UNCONFIRMED]
+FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[SESSION_INTERACTIVE_BUSY]
+FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[SESSION_NOT_READY-ATTACHING]
+FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[SESSION_RECOVERING]
+FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_stale_context_not_replayed
+FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_two_daemons_same_tty
+FAILED tests/test_doctor.py::TestWindowsDoctor::test_pyserial_ok_when_importable
+FAILED tests/test_l1_judge.py::test_l1_lock_cargo_sets_exclude_ignored_tests
+FAILED tests/test_l1_judge.py::test_l1_lock_frozen_set_excludes_capability_gated
+FAILED tests/test_l1_judge.py::test_l1_lock_nodeids_subset_of_collect_only
+FAILED tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native
+FAILED tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence
+FAILED tests/test_stage0_tx_outcome.py::test_pyserial_port_write_maps_timeout_to_unknown
+FAILED tests/test_stage0_tx_permit.py::test_pyserial_chunked_write_drain_stops_after_inflight_chunk
+FAILED tests/test_stage0_tx_permit.py::test_pyserial_partial_cancel_keeps_cancelled_reason
+FAILED tests/test_stage0_uart_exclusive.py::TestManagerAttach::test_pyserial_access_denied_raises_device_held_unknown

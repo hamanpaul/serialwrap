@@ -1,0 +1,237 @@
+# s21_gate 集合登記紀錄（P5 第 6 輪，F50／F57，編排者裁決 add-only）
+
+- 收集來源：HEAD `5d7fb2f2`（非 root uid 1000、python3.12／pytest 9.2.0），以 `SW_RESOURCE_REPORT` 實跑取得逐列 outcome。
+- 登記＝實際收集的 nodeid 扣除本平台 skipped／xfailed 列（skipped 為必要列時 section 恆 INSUFFICIENT；failed 列照常登記，任何 failed 列 l1_judge 皆判 FAIL，不以排除清單把失敗轉為不計）。
+- 另排除 pytest 版本相依的 3 個參數化 id（9.2.0 與 9.0.3 產生不同 nodeid；見 SPEC-GAPS）。
+
+| 集合 | 收集 | 登記 | 排除（skip） |
+|---|---:|---:|---:|
+| s21_gate:blackbox_python | 49 | 45 | 4 |
+| s21_gate:blackbox_rust | 49 | 48 | 1 |
+| s21_gate:pytest_full | 5738 | 5530 | 205（＋3 版本相依 id） |
+
+## 排除列：bbpy
+
+```
+tests/contract_blackbox/slice21/test_f2_backpressure.py::test_recovery_flushes_queue
+tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[METHOD_NOT_FOUND]
+tests/contract_blackbox/slice21/test_safety_core.py::test_stale_context_not_replayed
+tests/contract_blackbox/slice21/test_slice_scope.py::test_deferred_methods
+```
+
+## 排除列：bbrs
+
+```
+tests/contract_blackbox/slice21/test_safety_core.py::test_stale_context_not_replayed
+```
+
+## 排除列：full
+
+```
+tests/acceptance/l15/test_slice21_l15.py::test_case[python-SERIALWRAP_L15_PY_DAEMON-l15-exclusive-open]
+tests/acceptance/l15/test_slice21_l15.py::test_case[python-SERIALWRAP_L15_PY_DAEMON-l15-half-prompt]
+tests/acceptance/l15/test_slice21_l15.py::test_case[python-SERIALWRAP_L15_PY_DAEMON-l15-multi-source-contention-cli]
+tests/acceptance/l15/test_slice21_l15.py::test_case[python-SERIALWRAP_L15_PY_DAEMON-l15-reboot-min-guard]
+tests/acceptance/l15/test_slice21_l15.py::test_case[python-SERIALWRAP_L15_PY_DAEMON-l15-reject-zero-tx]
+tests/acceptance/l15/test_slice21_l15.py::test_case[python-SERIALWRAP_L15_PY_DAEMON-l15-release-inflight]
+tests/acceptance/l15/test_slice21_l15.py::test_case[python-SERIALWRAP_L15_PY_DAEMON-l15-slow-reader-backpressure]
+tests/acceptance/l15/test_slice21_l15.py::test_case[python-SERIALWRAP_L15_PY_DAEMON-l15-stale-event-delay]
+tests/acceptance/l15/test_slice21_l15.py::test_case[python-SERIALWRAP_L15_PY_DAEMON-l15-transport-disconnect]
+tests/acceptance/l15/test_slice21_l15.py::test_case[python-SERIALWRAP_L15_PY_DAEMON-s21-credentials-unresolved]
+tests/acceptance/l15/test_slice21_l15.py::test_case[python-SERIALWRAP_L15_PY_DAEMON-s21-exclusive-conflict-plain-open]
+tests/acceptance/l15/test_slice21_l15.py::test_case[python-SERIALWRAP_L15_PY_DAEMON-s21-exclusive-conflict]
+tests/acceptance/l15/test_slice21_l15.py::test_case[python-SERIALWRAP_L15_PY_DAEMON-s21-partial-tx-abort]
+tests/acceptance/l15/test_slice21_l15.py::test_case[python-SERIALWRAP_L15_PY_DAEMON-s21-quiet-zero-tx]
+tests/acceptance/l15/test_slice21_l15.py::test_case[python-SERIALWRAP_L15_PY_DAEMON-s21-release-attach-handoff]
+tests/acceptance/l15/test_slice21_l15.py::test_case[python-SERIALWRAP_L15_PY_DAEMON-s21-wire-equals-wal]
+tests/acceptance/l15/test_slice21_l15.py::test_case[rust-SERIALWRAP_L15_RUST_DAEMON-l15-exclusive-open]
+tests/acceptance/l15/test_slice21_l15.py::test_case[rust-SERIALWRAP_L15_RUST_DAEMON-l15-half-prompt]
+tests/acceptance/l15/test_slice21_l15.py::test_case[rust-SERIALWRAP_L15_RUST_DAEMON-l15-multi-source-contention-cli]
+tests/acceptance/l15/test_slice21_l15.py::test_case[rust-SERIALWRAP_L15_RUST_DAEMON-l15-reboot-min-guard]
+tests/acceptance/l15/test_slice21_l15.py::test_case[rust-SERIALWRAP_L15_RUST_DAEMON-l15-reject-zero-tx]
+tests/acceptance/l15/test_slice21_l15.py::test_case[rust-SERIALWRAP_L15_RUST_DAEMON-l15-release-inflight]
+tests/acceptance/l15/test_slice21_l15.py::test_case[rust-SERIALWRAP_L15_RUST_DAEMON-l15-slow-reader-backpressure]
+tests/acceptance/l15/test_slice21_l15.py::test_case[rust-SERIALWRAP_L15_RUST_DAEMON-l15-stale-event-delay]
+tests/acceptance/l15/test_slice21_l15.py::test_case[rust-SERIALWRAP_L15_RUST_DAEMON-l15-transport-disconnect]
+tests/acceptance/l15/test_slice21_l15.py::test_case[rust-SERIALWRAP_L15_RUST_DAEMON-s21-credentials-unresolved]
+tests/acceptance/l15/test_slice21_l15.py::test_case[rust-SERIALWRAP_L15_RUST_DAEMON-s21-exclusive-conflict-plain-open]
+tests/acceptance/l15/test_slice21_l15.py::test_case[rust-SERIALWRAP_L15_RUST_DAEMON-s21-exclusive-conflict]
+tests/acceptance/l15/test_slice21_l15.py::test_case[rust-SERIALWRAP_L15_RUST_DAEMON-s21-partial-tx-abort]
+tests/acceptance/l15/test_slice21_l15.py::test_case[rust-SERIALWRAP_L15_RUST_DAEMON-s21-quiet-zero-tx]
+tests/acceptance/l15/test_slice21_l15.py::test_case[rust-SERIALWRAP_L15_RUST_DAEMON-s21-release-attach-handoff]
+tests/acceptance/l15/test_slice21_l15.py::test_case[rust-SERIALWRAP_L15_RUST_DAEMON-s21-wire-equals-wal]
+tests/contract_blackbox/slice21/test_f2_backpressure.py::test_recovery_flushes_queue
+tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[METHOD_NOT_FOUND]
+tests/contract_blackbox/slice21/test_safety_core.py::test_stale_context_not_replayed
+tests/contract_blackbox/slice21/test_slice_scope.py::test_deferred_methods
+tests/contract_blackbox/slice21/test_windows_nocom.py::test_config_yaml_socket_path_written
+tests/contract_blackbox/slice21/test_windows_nocom.py::test_deferred_methods_windows
+tests/contract_blackbox/slice21/test_windows_nocom.py::test_second_daemon_exit_2
+tests/contract_blackbox/slice21/test_windows_nocom.py::test_session_public_console_endpoint_null
+tests/contract_blackbox/slice21/test_windows_nocom.py::test_stop_exit_0
+tests/contract_blackbox/slice21/test_windows_nocom.py::test_tcp_endpoint_loopback_and_ping
+tests/contract_blackbox/slice21/test_windows_nocom.py::test_wal_share_delete_while_running
+tests/contract_blackbox/test_bb_delegation.py::test_exec_failure_runs_nothing_and_does_not_fall_back
+tests/contract_blackbox/test_bb_delegation.py::test_exec_replaces_process_and_sigterm_reaches_child
+tests/contract_blackbox/test_bb_delegation.py::test_missing_manifest
+tests/contract_blackbox/test_bb_delegation.py::test_never_searches_path
+tests/contract_blackbox/test_bb_delegation.py::test_no_output_before_delegation
+tests/contract_blackbox/test_bb_delegation.py::test_probe_receives_argv_env_stdin_and_exit_code[0]
+tests/contract_blackbox/test_bb_delegation.py::test_probe_receives_argv_env_stdin_and_exit_code[1]
+tests/contract_blackbox/test_bb_delegation.py::test_probe_receives_argv_env_stdin_and_exit_code[37]
+tests/contract_blackbox/test_bb_delegation.py::test_recursion_detected_when_entry_points_to_self
+tests/contract_blackbox/test_bb_delegation.py::test_windows_exec_or_wait_exit_code_and_terminate_propagation
+tests/contract_blackbox/test_bb_exit_codes.py::test_non_utf8_bench_echo
+tests/contract_blackbox/test_bb_skill.py::test_skill_default_platform_windows
+tests/contract_blackbox/test_cli_mgmt_ab_suite.py::test_cli_mgmt_ab_suite_execution
+tests/contract_blackbox/test_cli_mgmt_daemon.py::test_autostart_l15_tx_once
+tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_start_releases_caller_merged_stdio_pipe
+tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_start_releases_caller_stdio_pipes
+tests/contract_blackbox/test_cli_mgmt_l15.py::test_autostart_l15_tx_once
+tests/contract_blackbox/test_cli_mgmt_l15.py::test_restart_no_reopen_before_handoff
+tests/contract_blackbox/test_cli_mgmt_l15.py::test_update_busy_l15_zero_tx
+tests/contract_blackbox/test_cli_mgmt_l15.py::test_update_file_push_after_last_probe_l15
+tests/contract_blackbox/test_cli_mgmt_l15.py::test_update_push_after_freeze_zero_tx_l15
+tests/contract_blackbox/test_cli_mgmt_remote.py::test_remote_sigint_cleans_spawned_tunnel
+tests/contract_blackbox/test_cli_mgmt_remote.py::test_remote_topologies_docker
+tests/contract_blackbox/test_cli_mgmt_setup.py::test_supervision_set_rust_only
+tests/contract_blackbox/test_cli_mgmt_supervision_switch.py::test_supervision_set_flashing_l15
+tests/contract_blackbox/test_cli_mgmt_supervision_switch.py::test_supervision_set_force_push_continues_l15
+tests/contract_blackbox/test_cli_mgmt_supervision_switch.py::test_supervision_set_rust_only_switch
+tests/contract_blackbox/test_cli_mgmt_terminal.py::test_minicom_wrapper_attach_detach_via_rust_cli
+tests/contract_blackbox/test_cli_mgmt_terminal.py::test_minicom_wrapper_auto_start_daemon_on_demand
+tests/contract_blackbox/test_cli_mgmt_terminal.py::test_minicom_wrapper_sigterm_still_detaches
+tests/contract_blackbox/test_cli_mgmt_update.py::test_fresh_install_blackbox
+tests/contract_blackbox/test_cli_mgmt_update.py::test_revert_new_daemon_push_not_aborted_l15
+tests/contract_blackbox/test_cli_mgmt_update.py::test_update_background_triggers_zero_tx_in_drain_window_l15
+tests/contract_blackbox/test_cli_mgmt_update.py::test_update_busy_l15_zero_tx
+tests/contract_blackbox/test_cli_mgmt_update.py::test_update_file_push_after_last_probe_l15
+tests/contract_blackbox/test_cli_mgmt_update.py::test_update_push_after_freeze_zero_tx_l15
+tests/contract_blackbox/test_cli_mgmt_update.py::test_update_rollback_ab_isolated
+tests/contract_blackbox/test_cli_mgmt_update.py::test_update_systemd_exit1_not_relaunched_l15
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[--help]
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[--version]
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[alias list]
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[benches]
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[cmd submit --selector COM0 echo 1]
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[connect NOPE]
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[daemon status]
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[device list]
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[doctor]
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[event tail]
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[file push --selector COM0 --local nonexistent --remote x]
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[log status --selector COM0]
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[mcu status --selector COM0]
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[profile test --profile prpl-template]
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[remote status]
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[service status]
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[session console-attach --selector COM0]
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[session console-detach --selector COM0 --client-id c1]
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[session list]
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[setup --on-demand]
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[skill]
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[stream status --selector COM0]
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[supervision-mode]
+tests/contract_blackbox/test_cli_no_delegation.py::test_every_mgmt_group_is_native[wal tail --selector COM0]
+tests/test_concurrency_races.py::test_matcher_re2_falls_back_for_backreference
+tests/test_concurrency_races.py::test_matcher_re2_flags_and_groups
+tests/test_concurrency_races.py::test_matcher_re2_immune_to_polynomial_redos
+tests/test_docker_l15.py::test_docker_smoke_two_container
+tests/test_docker_upgrade.py::test_docker_upgrade_0_3_2_to_0_4_0
+tests/test_lock_win.py::test_stale_endpoint_acquires
+tests/test_lock_win.py::test_two_locks_same_path_second_raises
+tests/test_p1oc_drain_stalled.py::TestWindowsNativeDrainStalled::test_windows_guarded_write_stall_drain_stalled_native
+tests/test_rust_agent_perm_verifier.py::test_windows_owner_with_denied_write_is_not_blocked
+tests/test_rust_no_onefile_windows.py::test_windows_watcher_clean_cli_passes
+tests/test_rust_no_onefile_windows.py::test_windows_watcher_flags_create_then_delete
+tests/test_rust_p4_conftest.py::test_child_is_rust_round
+tests/test_rust_readme_trust_scope.py::test_no_same_user_isolation_claim_in_docs_and_help
+tests/test_rust_spike2_tools.py::test_whatif_schtasks_only_throwaway_task_name
+tests/test_rust_win_scripts.py::test_blackbox_pytest_argv_matches_frozen_l1_selectors
+tests/test_rust_win_scripts.py::test_blackbox_selector_keeps_purity_guards_in_every_required_platform_set
+tests/test_rust_win_scripts.py::test_contract_blackbox_xfails_are_explicitly_strict
+tests/test_rust_win_scripts.py::test_embedded_runtime_site_packages_include_pyserial
+tests/test_rust_win_scripts.py::test_runner_cleans_or_keeps_staging
+tests/test_rust_win_scripts.py::test_runner_forwards_serialwrap_env
+tests/test_rust_win_scripts.py::test_runner_propagates_nonzero_exit
+tests/test_rust_win_scripts.py::test_runner_stages_fixture_dir
+tests/test_rust_win_scripts.py::test_runner_version_uses_crlf
+tests/test_rust_win_scripts.py::test_win_dev_bundle_pointer_is_install_root_relative
+tests/test_rust_win_scripts.py::test_win_staging_covers_contract_blackbox_scripts_refs
+tests/test_rust_win_scripts.py::test_win_staging_covers_imports_of_staged_scripts_rust
+tests/test_rust_win_scripts.py::test_win_test_injects_runner_under_wsl
+tests/test_rust_win_scripts.py::test_win_test_report_schema
+tests/test_rust_win_scripts.py::test_windows_blackbox_copies_ab_suite_and_dev_bundle_to_outdir
+tests/test_rust_win_scripts.py::test_windows_blackbox_l1_is_staged_then_copied_to_outdir
+tests/test_rust_win_scripts.py::test_windows_blackbox_ps1_parses_under_windows_powershell
+tests/test_rust_win_scripts.py::test_windows_blackbox_staging_repo_has_exact_git_revision
+tests/test_rust_win_scripts.py::test_windows_com_autostart_case_pins_com20_profile
+tests/test_rust_win_scripts.py::test_windows_com_autostart_case_supplies_release_manifest
+tests/test_rust_win_scripts.py::test_windows_com_autostart_counts_only_its_own_tx
+tests/test_rust_win_scripts.py::test_windows_com_autostart_first_submit_success_is_single_request
+tests/test_rust_win_scripts.py::test_windows_com_autostart_rejected_request_delayed_tx_is_counted
+tests/test_rust_win_scripts.py::test_windows_com_autostart_rejects_unexpected_first_failure[not-json-False-\u53ea\u63a5\u53d7 session \u5c1a\u672a READY \u7684\u62d2\u7d55]
+tests/test_rust_win_scripts.py::test_windows_com_autostart_rejects_unexpected_first_failure[{"ok":false,"error_code":"SESSION_NOT_READY"}-True-\u88ab\u62d2\u7d55\u7684\u9996\u6b21\u8acb\u6c42\u4e0d\u5f97\u5728 DUT \u7aef\u7559\u4e0b\u4efb\u4f55 TX]
+tests/test_rust_win_scripts.py::test_windows_com_autostart_rejects_unexpected_first_failure[{"ok":false,"error_code":"TIMEOUT"}-False-\u53ea\u63a5\u53d7 session \u5c1a\u672a READY \u7684\u62d2\u7d55]
+tests/test_rust_win_scripts.py::test_windows_com_autostart_requires_autostart_evidence
+tests/test_rust_win_scripts.py::test_windows_com_autostart_waits_for_lagging_wire_record
+tests/test_rust_win_scripts.py::test_windows_com_autostart_waits_for_passthrough_ready_before_final_submit
+tests/test_rust_win_scripts.py::test_windows_com_bridge_evidence_is_local_scratch_with_verified_copy_back
+tests/test_rust_win_scripts.py::test_windows_com_bridge_stop_exception_still_copies_back_evidence
+tests/test_rust_win_scripts.py::test_windows_com_diagnostics_run_after_raw_pass_without_qualification
+tests/test_rust_win_scripts.py::test_windows_com_runner_is_confined_and_wires_the_frozen_case
+tests/test_rust_win_scripts.py::test_windows_dev_bundle_keeps_daemon_inside_install_tree
+tests/test_rust_win_scripts.py::test_windows_exit_code_null_is_failure_not_zero
+tests/test_rust_win_scripts.py::test_windows_process_handles_are_cached_after_start_process
+tests/test_rust_win_scripts.py::test_windows_selftest_out_is_local_scratch_with_verified_copy_back
+tests/test_rust_win_scripts.py::test_windows_selftest_qualification_failure_records_reason
+tests/test_rust_win_scripts.py::test_windows_selftest_writeback_retries_and_compares_both_logs
+tests/test_rust_win_startup_100.py::test_ambient_change_outside_isolation_is_recorded_not_failed
+tests/test_rust_win_startup_100.py::test_clean_cli_is_ok_with_isolated_environment
+tests/test_rust_win_startup_100.py::test_exe_dir_extract_still_fails
+tests/test_rust_win_startup_100.py::test_localappdata_unpack_dir_fails
+tests/test_rust_win_startup_100.py::test_temp_extract_dir_fails
+tests/test_rust_win_startup_100.py::test_temp_plain_file_fails_regardless_of_extension
+tests/test_rust_win_startup_100.py::test_varying_stdout_still_fails
+tests/test_serial_port.py::TestPySerialLoopback::test_alive
+tests/test_serial_port.py::TestPySerialLoopback::test_fileno_is_none
+tests/test_serial_port.py::TestPySerialLoopback::test_idle_read_returns_empty
+tests/test_serial_port.py::TestPySerialLoopback::test_loopback_roundtrip
+tests/test_serial_port.py::TestPySerialLoopback::test_set_baud
+tests/test_serial_port.py::TestUARTBridgeLoopback::test_binary_byte_exact_echo
+tests/test_serial_port.py::TestUARTBridgeLoopback::test_clean_stop_is_prompt
+tests/test_serial_port.py::TestUARTBridgeLoopback::test_command_echo_via_wait_for_regex
+tests/test_serial_port.py::TestUARTBridgeLoopback::test_snapshot_alive_running
+tests/test_slice21_scope.py::test_event_latency_contract_frozen_before_slice_start
+tests/test_spike1_remaining.py::TestSpike1NativeCom::test_spike1_console_pair_native
+tests/test_spike1_remaining.py::TestSpike1NativeCom::test_spike1_control_lines_native
+tests/test_spike1_remaining.py::TestSpike1NativeCom::test_spike1_peer_close_native
+tests/test_stage0_f12_oracle.py::test_native_reader_does_not_block_rotate
+tests/test_stage0_fakes.py::test_windows_native_marker_only_runs_on_nt
+tests/test_stage0_platform_mgmt.py::test_native_windows_lock_uses_lockfileex
+tests/test_stage0_remote_windows.py::test_native_filelock_windows_blocks_second_holder
+tests/test_stage0_remote_windows.py::test_native_spawn_alive_terminate_tree
+tests/test_stage0_uart_exclusive.py::TestWindowsNativeCom::test_native_second_open_access_denied
+tests/test_stage0_wal_av_sim.py::test_native_av_sim_helper_holds_wal_and_writer_completes
+tests/test_stage0_wal_av_sim.py::test_native_av_sim_oplock_variant_keeps_wal_writes_and_rotation_live
+tests/test_stage0_wal_handle.py::test_native_line_ending_is_lf_only
+tests/test_stage0_wal_rotate.py::test_native_rotate_blocked_by_reader_degrades
+tests/test_stage0_wal_rotate.py::test_native_rotate_with_open_handle_succeeds
+tests/test_stage0_wal_unlink.py::test_native_classic_delete_pending_with_external_reader
+tests/test_stage0_wal_unlink.py::test_native_posix_semantics_delete
+tests/test_stage0_wal_winfs.py::test_native_handle_allows_rename_and_delete_while_open
+tests/test_stage0_wal_winfs.py::test_native_identity_changes_after_replace
+tests/test_stage0_wal_winfs.py::test_native_lockfileex_conflicts_with_msvcrt_locking
+tests/test_stage0_wal_winfs.py::test_native_os_remove_semantics_recorded
+tests/test_stage0_wal_winfs.py::test_native_path_identity_missing_returns_none
+tests/test_stage0_wal_winfs.py::test_native_reader_without_share_delete_blocks_rename
+tests/test_stage0_wal_winfs.py::test_native_sync_dir_is_documented_noop
+tests/test_stage0_wal_winfs.py::test_native_sync_on_append_handle
+tests/test_stage0_wal_winfs.py::test_native_windows_walfs_unlinked_reports_delete_pending
+tests/test_win_cli_endpoint.py::TestLocalDefaultEndpoint::test_auto_on_windows_uses_default_endpoint
+tests/test_win_daemon_start.py::TestWindowsDetachFlags::test_popen_uses_detached_creationflags
+tests/test_win_task_throwaway.py::test_cleanup_removes_only_throwaway
+tests/test_win_task_throwaway.py::test_generated_launcher_redirects_stderr_and_obeys_deadline
+tests/test_win_task_throwaway.py::test_task_xml_whatif
+```
+

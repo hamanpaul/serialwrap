@@ -34,9 +34,7 @@ RUN_UPGRADE = REPO / "scripts" / "docker" / "run-upgrade.sh"
 DOCKERFILE = REPO / "tools" / "docker" / "upgrade.Dockerfile"
 SYSTEMD_DOCKERFILE = REPO / "tools" / "docker" / "systemd.Dockerfile"
 UPGRADE_CONTAINER = REPO / "scripts" / "docker" / "run_upgrade_container.py"
-# 升級驗證的新版候選即目前版本：run-upgrade.sh 直接讀 VERSION（dry-run 測試以 `--version-override` 驗證輸出，
-# test_run_upgrade_reads_new_version_from_version_file 防止寫死）；容器 driver 在容器內執行、讀不到 VERSION，
-# 保留常數，由 test_upgrade_driver_new_version_matches_version_file 驗證等於 VERSION。
+# 升級驗證的新版候選即目前版本：host runner 與容器 driver 都使用 VERSION，driver 由 runner 傳入並由此測試核對。
 NEW_VERSION = (REPO / "VERSION").read_text(encoding="utf-8").strip()
 
 sys.path.insert(0, str(REPO))
@@ -203,6 +201,152 @@ def _load_driver():
     return module
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_bundle_source_uses_proc_exe_for_symlinked_stage2_daemon(tmp_path, monkeypatch):
+    driver = _load_driver()
+    expected = tmp_path / "home" / ".local" / "share" / "serialwrap" / "versions" / driver.NEW_VERSION
+    exe = expected / "bin" / "serialwrapd"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("fake executable", encoding="utf-8")
+    launcher = tmp_path / "home" / ".local" / "bin" / "serialwrapd"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("symlink launcher placeholder", encoding="utf-8")
+
+    proc_root = tmp_path / "proc"
+    pid = 401
+    _proc(proc_root, pid, [str(launcher)])
+    proc_exe = proc_root / str(pid) / "exe"
+    proc_exe.write_text("proc exe placeholder", encoding="utf-8")
+    real_readlink = driver.os.readlink
+
+    def read_exe_target(path, *args, **kwargs):
+        if Path(path) == proc_exe:
+            return str(exe)
+        return real_readlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(driver.os, "readlink", read_exe_target)
+    argv = [str(launcher)]
+
+    # 舊判斷只看 argv，Stage 2 的 .local/bin symlink 不含 bundle 版本目錄。
+    assert not any(str(expected) in arg for arg in argv)
+    evidence = driver.bundle_source_evidence(pid, argv, proc_root=proc_root, expected_version_dir=expected)
+    assert evidence["from_bundle"] is True, evidence
+    assert evidence["exe_path"] == str(exe.resolve())
+    assert evidence["argv_mentions_bundle"] is False
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_bundle_source_rejects_exe_from_old_version(tmp_path, monkeypatch):
+    driver = _load_driver()
+    versions = tmp_path / "home" / ".local" / "share" / "serialwrap" / "versions"
+    expected = versions / driver.NEW_VERSION
+    old_exe = versions / "0.4.0" / "bin" / "serialwrapd"
+    old_exe.parent.mkdir(parents=True)
+    old_exe.write_text("old fake executable", encoding="utf-8")
+    launcher = tmp_path / "home" / ".local" / "bin" / "serialwrapd"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("symlink launcher placeholder", encoding="utf-8")
+
+    proc_root = tmp_path / "proc"
+    pid = 402
+    _proc(proc_root, pid, [str(launcher)])
+    proc_exe = proc_root / str(pid) / "exe"
+    proc_exe.write_text("proc exe placeholder", encoding="utf-8")
+    real_readlink = driver.os.readlink
+
+    def read_old_exe_target(path, *args, **kwargs):
+        if Path(path) == proc_exe:
+            return str(old_exe)
+        return real_readlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(driver.os, "readlink", read_old_exe_target)
+
+    evidence = driver.bundle_source_evidence(pid, [str(launcher)], proc_root=proc_root,
+                                             expected_version_dir=expected)
+    assert evidence["from_bundle"] is False, evidence
+    assert evidence["exe_path"] == str(old_exe.resolve())
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_bundle_source_fails_closed_when_proc_exe_remains_unreadable(tmp_path, monkeypatch):
+    driver = _load_driver()
+    expected = tmp_path / "home" / ".local" / "share" / "serialwrap" / "versions" / driver.NEW_VERSION
+    exe = expected / "bin" / "serialwrapd"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("fake executable", encoding="utf-8")
+    proc_root = tmp_path / "proc"
+    pid = 403
+    _proc(proc_root, pid, [str(exe)])
+    proc_exe = proc_root / str(pid) / "exe"
+    proc_exe.write_text("proc exe placeholder", encoding="utf-8")
+    real_readlink = driver.os.readlink
+
+    def denied_readlink(path, *args, **kwargs):
+        if Path(path) == proc_exe:
+            raise PermissionError("EACCES")
+        return real_readlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(driver.os, "readlink", denied_readlink)
+    monkeypatch.setattr(driver, "_read_proc_exe_as_user",
+                        lambda path, user: (_ for _ in ()).throw(PermissionError("EACCES")))
+
+    # argv 若仍被當成依據會錯誤通過；無法讀到 exe 時必須 fail-closed。
+    argv = [str(exe)]
+    assert any(str(expected) in arg for arg in argv)
+    assert driver.classify_bundle_source(None, argv, expected)["from_bundle"] is False
+    evidence = driver.bundle_source_evidence(pid, argv, proc_root=proc_root, expected_version_dir=expected)
+    assert evidence["from_bundle"] is False, evidence
+    assert evidence["exe_path"] is None
+    assert evidence["exe_read_error"]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_bundle_source_retries_proc_exe_as_daemon_user_on_eacces(tmp_path, monkeypatch):
+    driver = _load_driver()
+    expected = tmp_path / "home" / ".local" / "share" / "serialwrap" / "versions" / driver.NEW_VERSION
+    exe = expected / "bin" / "serialwrapd"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("fake executable", encoding="utf-8")
+    proc_root = tmp_path / "proc"
+    pid = 404
+    _proc(proc_root, pid, [str(tmp_path / "home" / ".local" / "bin" / "serialwrapd")])
+    proc_exe = proc_root / str(pid) / "exe"
+    proc_exe.write_text("proc exe placeholder", encoding="utf-8")
+    real_readlink = driver.os.readlink
+
+    def denied_readlink(path, *args, **kwargs):
+        if Path(path) == proc_exe:
+            raise PermissionError("EACCES")
+        return real_readlink(path, *args, **kwargs)
+
+    calls = []
+
+    def read_as_user(path, user):
+        calls.append((path, user))
+        return str(exe.resolve())
+
+    monkeypatch.setattr(driver.os, "readlink", denied_readlink)
+    monkeypatch.setattr(driver, "_read_proc_exe_as_user", read_as_user)
+
+    evidence = driver.bundle_source_evidence(pid, [str(driver.BIN / "serialwrapd")],
+                                             proc_root=proc_root, expected_version_dir=expected)
+    assert evidence["from_bundle"] is True, evidence
+    assert evidence["exe_path"] == str(exe.resolve())
+    assert calls == [(proc_exe, driver.USER)]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_proc_cmdline_parser_removes_trailing_nul():
+    driver = _load_driver()
+    argv = str(driver.BIN / "serialwrapd")
+    assert driver.parse_proc_cmdline(argv.encode() + b"\0\0") == [argv]
+
+
 class _FakeContainer:
     """容器內 0.3.2／新版（`NEW_VERSION`）行為的記憶體替身：假 /proc 與 socket；`daemon stop` 先刪 socket 並回應，舊行程延遲
     `exit_delay` 秒才結束（None＝永不結束）。行程未結束前 `daemon start` 回 DAEMON_ALREADY_RUNNING_ELSEWHERE、
@@ -363,7 +507,9 @@ def _row(driver: Any, check_id: str) -> dict[str, Any]:
     ("phase_seed", "seed_user_data", "0.3.2"),
     ("phase_upgrade_after_stop", "upgrade_after_stop", "0.3.2"),
     ("phase_install_sh", "old_daemon_stopped", "0.3.2"),
-    ("phase_downgrade", "downgrade_manual", NEW_VERSION),
+    # 保留凍結 lock 中舊參數 repr 的 nodeid；實際 cli 參數跟隨目前 VERSION。
+    pytest.param("phase_downgrade", "downgrade_manual", NEW_VERSION,
+                 id="phase_downgrade-downgrade_manual-0.4.1"),
     ("phase_reupgrade", "reupgrade", "0.3.2"),
 ])
 def test_driver_waits_for_old_daemon_exit_before_next_start(fake_driver, phase, check_id, cli):
@@ -385,7 +531,8 @@ def test_driver_waits_for_old_daemon_exit_before_next_start(fake_driver, phase, 
 @pytest.mark.parametrize("phase,check_id,cli", [
     ("phase_seed", "seed_user_data", "0.3.2"),
     ("phase_reupgrade", "reupgrade", "0.3.2"),
-    ("phase_downgrade", "downgrade_manual", NEW_VERSION),
+    pytest.param("phase_downgrade", "downgrade_manual", NEW_VERSION,
+                 id="phase_downgrade-downgrade_manual-0.4.1"),
 ])
 def test_driver_stop_wait_timeout_fails_and_is_recorded(fake_driver, phase, check_id, cli):
     """舊 daemon 在有界逾時內未結束：該步驟判 FAIL，detail 記錄殘留行程；seed 不得在逾時後硬起新 daemon。"""
@@ -879,15 +1026,109 @@ def test_upgrade_image_grants_swtest_sudo_for_system_mode():
     assert "swtest ALL=(ALL) NOPASSWD: ALL" in text
 
 
+def _dockerfile_instructions(text: str) -> list[tuple[str, str]]:
+    """Dockerfile → `(指令, 參數)` 序列：略過註解與空行，把行尾 `\\` 續行併成一個指令。"""
+    out: list[tuple[str, str]] = []
+    pending = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.endswith("\\"):
+            pending += line[:-1] + " "
+            continue
+        keyword, _, args = (pending + line).strip().partition(" ")
+        out.append((keyword.upper(), " ".join(args.split())))
+        pending = ""
+    assert not pending, f"Dockerfile 以續行結尾：{pending!r}"
+    return out
+
+
+def _shell_and_chain(command: str) -> list[str]:
+    """把 RUN 的 shell 命令依最外層 `&&` 切成依序執行的子命令（引號內的 `&&` 不切）。"""
+    parts: list[str] = []
+    current: list[str] = []
+    quote = ""
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif command.startswith("&&", i):
+            parts.append("".join(current).strip())
+            current = []
+            i += 2
+            continue
+        current.append(ch)
+        i += 1
+    parts.append("".join(current).strip())
+    return [part for part in parts if part]
+
+
+def _assert_apt_bootstraps_ca_over_https(path: Path) -> None:
+    """依 Dockerfile 的指令執行順序模擬 APT 設定狀態（不看字面行號／出現次數）。
+
+    要保護的意圖（PR #278 第 3 輪：hosted runner 連不到 archive.ubuntu.com:80）：
+    - 任何 `apt-get update` 之前，Ubuntu 套件源已改成 https（archive 與 security 都要）；
+    - 基底映像沒有 CA bundle，只在安裝 ca-certificates 的那一段暫時關閉 HTTPS 憑證鏈驗證；
+    - CA 裝好後移除該暫時設定並重新 `apt-get update`，其餘套件都在驗證開啟的狀態下安裝，映像最後不留該設定。
+    """
+    commands = [cmd for keyword, args in _dockerfile_instructions(path.read_text(encoding="utf-8"))
+                if keyword == "RUN" for cmd in _shell_and_chain(args)]
+    hosts = ("archive.ubuntu.com", "security.ubuntu.com")
+    https_hosts: set[str] = set()
+    bootstrap_file: str | None = None       # 目前生效的「關閉 Verify-Peer」設定檔
+    bootstrap_count = 0
+    ca_installed = False
+    updated_since_verify_restored = True     # 尚未關閉過驗證時不需要重新 update
+    updates = 0
+    for cmd in commands:
+        words = cmd.split()
+        if 'Acquire::https::Verify-Peer "false"' in cmd:
+            target = cmd.rsplit(">", 1)[-1].strip()
+            assert target.startswith("/etc/apt/apt.conf.d/"), (path, cmd)
+            assert updates == 0, f"{path}：暫時關閉 Verify-Peer 必須在第一次 apt-get update 之前"
+            bootstrap_file = target
+            bootstrap_count += 1
+        elif words[:2] == ["sed", "-i"] and "ubuntu.sources" in cmd:
+            for host in hosts:
+                if f"s|http://{host}/ubuntu|https://{host}/ubuntu|g" in cmd:
+                    https_hosts.add(host)
+        elif words[:2] == ["apt-get", "update"]:
+            assert https_hosts == set(hosts), f"{path}：apt-get update 之前必須先把 {hosts} 改成 https（目前 {sorted(https_hosts)}）"
+            updates += 1
+            if bootstrap_file is None:
+                updated_since_verify_restored = True
+        elif words[:2] == ["apt-get", "install"]:
+            assert updates >= 1, f"{path}：apt-get install 之前必須先 apt-get update"
+            if bootstrap_file is not None:
+                assert "ca-certificates" in words, f"{path}：Verify-Peer 關閉期間只能是安裝 CA bundle 的那一次 install：{cmd}"
+                ca_installed = True
+            else:
+                assert updated_since_verify_restored, f"{path}：恢復憑證鏈驗證後必須重新 apt-get update 才能安裝套件：{cmd}"
+        elif words[:1] == ["rm"] and bootstrap_file is not None and bootstrap_file in words:
+            assert ca_installed, f"{path}：CA bundle 裝好之前不得移除暫時設定（之後的 https 會全部失敗）"
+            bootstrap_file = None
+            updated_since_verify_restored = False
+    assert bootstrap_count == 1, f"{path}：暫時關閉 Verify-Peer 只能發生一次（實際 {bootstrap_count}）"
+    assert ca_installed and bootstrap_file is None, f"{path}：映像不得殘留關閉 Verify-Peer 的 APT 設定"
+    assert updated_since_verify_restored, f"{path}：恢復憑證鏈驗證後必須重新 apt-get update"
+
+
 @pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_upgrade_image_pins_same_base_as_systemd_image():
     """升級容器與 OD-16 (5) systemd 容器使用同一個 ubuntu:24.04 digest，且不放 repo 內容、不連網安裝依賴。"""
     def base(path: Path) -> str:
-        return next(line for line in path.read_text(encoding="utf-8").splitlines() if line.startswith("FROM "))
+        return next(args for keyword, args in _dockerfile_instructions(path.read_text(encoding="utf-8")) if keyword == "FROM")
     assert base(DOCKERFILE) == base(SYSTEMD_DOCKERFILE)
+    for path in (DOCKERFILE, SYSTEMD_DOCKERFILE):
+        _assert_apt_bootstraps_ca_over_https(path)
     text = DOCKERFILE.read_text(encoding="utf-8")
-    assert "COPY" not in text
+    assert not any(keyword in ("COPY", "ADD") for keyword, _ in _dockerfile_instructions(text))
     for pkg in ("pipx", "systemd", "dbus-user-session"):
         assert pkg in text, pkg
     assert "python3-yaml" not in text, "升級驗證映像不得以系統 PyYAML 遮住 bundle 缺少執行期依賴"
@@ -919,9 +1160,10 @@ def test_run_upgrade_dry_run_lists_both_modes_and_isolation(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     out = r.stdout
     assert "git archive v0.3.2" in out
-    assert f"--release-bundle --profile release --version-override {NEW_VERSION}" in out
+    assert f"--release-bundle --stage 2 --profile release --version-override {NEW_VERSION}" in out
     assert "pip download --only-binary=:all:" in out
     assert "--network none" in out
+    assert f"SW_UPGRADE_NEW_VERSION={NEW_VERSION}" in out
     for mode in ("systemd-user", "on-demand"):
         assert f"--mode {mode}" in out, out
     assert "/dev/ttyUSB" not in out and "--device" not in out
@@ -1093,7 +1335,7 @@ def test_run_upgrade_dry_run_builds_bundle_with_system_python312_venv(tmp_path):
     assert "pyyaml==6.0.3" in pip and "jsonschema==4.10.3" in pip, pip
     mk = next(line for line in lines if "mkbundle.sh" in line)
     assert mk.startswith(f"+ env PATH={work}/build-venv/bin:"), mk
-    assert f"--release-bundle --profile release --version-override {NEW_VERSION}" in mk
+    assert f"--release-bundle --stage 2 --profile release --version-override {NEW_VERSION}" in mk
     check = next(line for line in lines if "pyvenv.cfg" in line)
     assert "home = /usr/bin" in check and "include-system-site-packages = false" in check, check
     assert lines.index(check) > lines.index(mk)
@@ -1190,6 +1432,18 @@ def test_run_upgrade_refuses_existing_evidence(tmp_path):
     assert r.returncode == 2, r.stdout + r.stderr
 
 
+def _assert_bundle_source_report(report):
+    check = next(row for row in report["checks"] if row["id"] == "new_daemon_started")
+    detail = check["detail"]
+    expected = Path("/", "home", "swtest", ".local", "share", "serialwrap", "versions") / NEW_VERSION
+    exe_path = Path(detail["exe_path"])
+    assert detail["from_bundle"] is True, check
+    assert expected in exe_path.parents, check
+    assert detail["exe_read_method"] in {"proc_exe", "runuser:swtest"}, check
+    assert detail["exe_read_error"] is None, check
+    assert "" not in detail["argv"], check
+
+
 @pytest.mark.posix_only
 @pytest.mark.process_rpc
 @pytest.mark.supervisor_runtime
@@ -1215,6 +1469,7 @@ def test_docker_upgrade_0_3_2_to_0_4_0(tmp_path):
         assert rep["verdict"] == "PASS", diag
         assert rep["evidence_layer"] == "L1.5-docker"
         assert rep["old_version"] == "0.3.2" and rep["new_version"] == NEW_VERSION
+        _assert_bundle_source_report(rep)
 
 
 # ---------- OD-50：install.sh 升級路徑（0.3.2 pipx、daemon 已停止 → install.sh --bundle） ----------
@@ -1419,3 +1674,4 @@ def test_docker_install_sh_upgrade_from_0_3_2(tmp_path):
         assert rep["scenario"] == "install-sh"
         assert rep["verdict"] == "PASS", diag
         assert {c["id"] for c in rep["checks"]} >= set(uc.REQUIRED_INSTALL_SH_CHECKS)
+        _assert_bundle_source_report(rep)

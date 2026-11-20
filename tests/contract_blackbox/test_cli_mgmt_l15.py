@@ -16,6 +16,8 @@ import pytest
 
 from bb_harness import cli_prefix
 from bb_l15 import (
+    OLD_BUNDLE_VERSION,
+    NEW_BUNDLE_VERSION,
     BridgeTarget,
     HolderObserver,
     HolderObservationUnavailable,
@@ -166,7 +168,7 @@ def test_update_busy_l15_zero_tx(tmp_path: Path, env: dict[str, str]) -> None:
         assert data.get("error_code") == "SESSION_BUSY", data
         assert tx_bytes(bridge.evidence_dir) == tx_before
         assert daemon_pid(env) == daemon.proc.pid
-        assert installed_version(env) == "0.4.0"
+        assert installed_version(env) == OLD_BUNDLE_VERSION
     finally:
         if cmd_id:
             rpc(env, "command.cancel", {"cmd_id": cmd_id})
@@ -209,7 +211,7 @@ def test_update_file_push_after_last_probe_l15(tmp_path: Path, env: dict[str, st
         assert data.get("error_code") == "SESSION_BUSY", data
         assert data.get("handoff") == "refused", data
         assert daemon_pid(env) == old_pid
-        assert installed_version(env) == "0.4.0"
+        assert installed_version(env) == OLD_BUNDLE_VERSION
         assert current_release_path(Path(env["SERIALWRAP_INSTALL_ROOT"])).read_bytes() == current_bytes
         assert not any("shutdown" in json.dumps(row, ensure_ascii=False).lower() for row in wal_rows(env))
         push_thread.join(180.0)
@@ -264,7 +266,7 @@ def test_update_push_after_freeze_zero_tx_l15(tmp_path: Path, env: dict[str, str
         assert not update_thread.is_alive(), "setup update 未在 120 秒內結束"
         result = result_rows[0]
         assert result.returncode == 0, result.stdout + result.stderr
-        assert installed_version(env) == "0.4.1"
+        assert installed_version(env) == NEW_BUNDLE_VERSION
         assert wait_session(env)["state"] == "READY"
     finally:
         if update_thread.is_alive():

@@ -3,6 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use crate::proc_holders::posix::{same_tty, HolderFs, RealHolderFs, TtyStat};
 use crate::proc_scan::{
     extract_socket_arg, is_serialwrapd_argv, ArgvFlavor, DaemonProc, HolderScan, HolderScanOutcome,
     HolderScanStatus, ProcDetails, ProcIdentity, ProcScan, ScanFailure, UidMatch, UninspectableProc,
@@ -48,6 +50,62 @@ impl PosixProcScan {
     pub fn identity_alive(&self, id: &ProcIdentity) -> bool {
         <Self as ProcScan>::identity_alive(self, id)
     }
+
+    /// 外部行程持有、且與本 daemon 所見為同一 tty 的路徑字串集合（排除自身 pid）；`proc_root` 不可列舉時回
+    /// `None`（P6 Task 8；uart_io.py `_enumerate_all_held_paths` #R2 版）。見 [`held_tty_paths_with`]。
+    pub fn held_fd_targets(&self) -> Option<std::collections::HashSet<String>> {
+        held_tty_paths_with(
+            &self.proc_root,
+            &|path: &Path| fs::read_link(path),
+            &|path: &Path| crate::tty_identity::stat_identity(path),
+        )
+    }
+}
+
+/// console reaper 的 held 集合（#40／#64，Python `_enumerate_all_held_paths` #R2 版逐步對照）。
+///
+/// fd 的 readlink 字串只是「該行程 mount namespace 內」的路徑：一條 fd 只有在「fd 實際指向的 inode」
+/// （`stat(/proc/<pid>/fd/N)`）與「該字串於本 daemon 命名空間 stat 到的 inode」為同一 tty
+/// （`tty_identity::same_tty`）時才計入。非 `/dev/` 開頭的 link（pipe:／socket:／一般檔）不做 stat；
+/// 個別 pid／fd 讀取或任一 stat 失敗即略過該 fd（身分取不到不得計為 peer）。`proc_root` 不可列舉回 `None`。
+/// `readlink`／`stat` 以參數注入，使「字串相同、inode 不同」的他 namespace 情境可測。
+pub fn held_tty_paths_with(
+    proc_root: &Path,
+    readlink: &dyn Fn(&Path) -> std::io::Result<PathBuf>,
+    stat: &dyn Fn(&Path) -> std::io::Result<crate::tty_identity::TtyIdentity>,
+) -> Option<std::collections::HashSet<String>> {
+    let self_pid = std::process::id().to_string();
+    let mut held = std::collections::HashSet::new();
+    for entry in fs::read_dir(proc_root).ok()?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) || name == self_pid {
+            continue;
+        }
+        let Ok(fds) = fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let fd_path = fd.path();
+            let Ok(target) = readlink(&fd_path) else {
+                continue;
+            };
+            let target = target.to_string_lossy().into_owned();
+            if !target.starts_with("/dev/") {
+                continue;
+            }
+            let Ok(fd_id) = stat(&fd_path) else {
+                continue;
+            };
+            let Ok(target_id) = stat(Path::new(&target)) else {
+                continue;
+            };
+            if crate::tty_identity::same_tty(&fd_id, &target_id) {
+                held.insert(target);
+            }
+        }
+    }
+    Some(held)
 }
 
 impl ProcScan for PosixProcScan {
@@ -93,7 +151,33 @@ impl ProcScan for PosixProcScan {
             return (Vec::new(), HolderScanStatus::Unknown);
         };
         let pids = daemons.iter().map(|daemon| daemon.pid).collect::<Vec<_>>();
-        scan_fd_holders(&self.proc_root, &pids, paths)
+        #[cfg(unix)]
+        {
+            tty_holders_fail_closed_with(&RealHolderFs, &self.proc_root, &pids, paths)
+        }
+        // 非 unix 無 inode 身分可比（`/proc` 掃描器在 Windows 不會走到此處）：證據不足即 Unknown。
+        #[cfg(not(unix))]
+        {
+            let _ = (pids, paths);
+            (Vec::new(), HolderScanStatus::Unknown)
+        }
+    }
+
+    fn multi_open_tty_holders(&self, paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus) {
+        let Ok(daemons) = self.serialwrapd_instances() else {
+            return (Vec::new(), HolderScanStatus::Unknown);
+        };
+        let pids = daemons.iter().map(|daemon| daemon.pid).collect::<Vec<_>>();
+        #[cfg(unix)]
+        {
+            tty_holders_with(&RealHolderFs, &self.proc_root, &pids, paths)
+        }
+        // 非 unix 無 inode 身分可比（`/proc` 掃描器在 Windows 不會走到此處）：證據不足即 Unknown。
+        #[cfg(not(unix))]
+        {
+            let _ = (pids, paths);
+            (Vec::new(), HolderScanStatus::Unknown)
+        }
     }
 
     fn proc_details(&self, pid: u32) -> Option<ProcDetails> {
@@ -216,14 +300,6 @@ impl ProcScan for PosixProcScan {
     }
 }
 
-
-/// 掃描 `pids` 的 fd 是否指向 `paths` 中任一 tty（#R2 同一 tty 判準）。
-fn scan_fd_holders(proc_root: &Path, pids: &[u32], paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus) {
-    let scan = scan_fd(proc_root, pids, paths);
-    let status = scan.strict_status();
-    (scan.holders, status)
-}
-
 /// 讀取失敗的嚴重度（`Permission` 優先於 `Unknown`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ReadFailure {
@@ -231,8 +307,9 @@ enum ReadFailure {
     Permission,
 }
 
-/// [`scan_fd`] 的每一項發現。這是掃描結果唯一的失敗來源：兩種判定（[`FdScan::strict_status`]、
-/// [`FdScan::holder_outcome`]）都以窮舉 `match` 解讀，新增種類時編譯器會要求兩邊都處理，不會因漏設旗標而 fail-open。
+/// [`scan_fd`] 的每一項發現。這是掃描結果唯一的失敗來源：判定（[`FdScan::holder_outcome`]）以窮舉 `match` 解讀，
+/// 新增種類時編譯器會要求處理，不會因漏設旗標而 fail-open。`serialwrapd_tty_holders` 不經此處，走 fail-closed 的
+/// [`tty_holders_fail_closed_with`]（判準與原本的嚴格判定相同）。
 #[derive(Debug, Clone, Copy)]
 enum Finding {
     /// 目標 tty 的 metadata 讀不到（節點不存在以外的錯誤）。
@@ -264,23 +341,6 @@ fn worst_status(worst: Option<ReadFailure>) -> HolderScanStatus {
 }
 
 impl FdScan {
-    /// 原有判定（`serialwrapd_tty_holders`，行為不變）：任一 PermissionDenied（含整個無法檢查的行程）→ `Permission`；
-    /// 否則任一讀取失敗、目標節點不存在或行程在掃描中消失 → `Unknown`；否則 `Ok`。
-    fn strict_status(&self) -> HolderScanStatus {
-        let worst = self
-            .findings
-            .iter()
-            .map(|finding| match *finding {
-                Finding::TargetUnreadable(kind) | Finding::ProcFailed(kind) => kind,
-                Finding::ProcUninspectable(..) => ReadFailure::Permission,
-                Finding::TargetVanished | Finding::ProcListFailed | Finding::ProcVanished => {
-                    ReadFailure::Unknown
-                }
-            })
-            .max();
-        worst_status(worst)
-    }
-
     /// OD-48 D5.2（`uart_holders_same_uid`）：目標節點不存在與行程在掃描中消失不可能衝突，不算失敗。其餘失敗中，只有
     /// 「行程整個無法檢查」不在這一層擋下（不論四 uid 分類；放不放行由呼叫端以停止前快照決定，編排者裁決 2026-11-07）；
     /// 全部失敗都屬此類時回 `Partial`。有任何其他失敗時沿用原本的嚴重度判定（整個無法檢查的行程也計入，
@@ -385,7 +445,7 @@ fn scan_fd(proc_root: &Path, pids: &[u32], paths: &[PathBuf]) -> FdScan {
                 }
             };
             inspected += 1;
-            if targets.iter().any(|tty| same_tty(&fd_meta, tty)) {
+            if targets.iter().any(|tty| same_tty_metadata(&fd_meta, tty)) {
                 holders.insert(pid);
             }
         }
@@ -409,6 +469,18 @@ fn scan_fd(proc_root: &Path, pids: &[u32], paths: &[PathBuf]) -> FdScan {
         holders: holders.into_iter().collect(),
         findings,
     }
+}
+
+/// 同一 tty 判定（#R2）：轉成 [`TtyStat`] 後交給 `proc_holders::posix::same_tty`（Python `serial_port.same_tty` 逐字）。
+#[cfg(unix)]
+fn same_tty_metadata(fd: &fs::Metadata, tty: &fs::Metadata) -> bool {
+    same_tty(&TtyStat::from_metadata(fd), &TtyStat::from_metadata(tty))
+}
+
+/// 非 unix 無 `(dev, ino)` 身分可用；`PosixProcScan` 的 holder 判定僅於 unix 實際使用（Windows 走 `WindowsProcScan`）。
+#[cfg(not(unix))]
+fn same_tty_metadata(_fd: &fs::Metadata, _tty: &fs::Metadata) -> bool {
+    false
 }
 
 /// `/proc/<pid>/comm`（去掉行尾換行）；讀不到為 `None`。
@@ -506,31 +578,99 @@ fn read_proc_stat(root: &Path, pid: u32) -> ProcStatRead {
     })
 }
 
-/// 同一 tty 判定（#R2，與 Python `serial_port.same_tty` 一致）：`(dev, ino)` 相同；或兩邊皆為字元裝置、
-/// `rdev` 相等且非零、且 major 不在 devpts 範圍。devpts 各 instance 會重用 136:N，不以 rdev 判定。
 #[cfg(unix)]
-fn same_tty(fd: &fs::Metadata, tty: &fs::Metadata) -> bool {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
-
-    if fd.dev() == tty.dev() && fd.ino() == tty.ino() {
-        return true;
+/// `serialwrapd` fd 與 tty 的同一性比對（Python `multi_open.detect_multi_open` 的 holders 段；#R2／parity #64）。
+///
+/// 以 `stat`（跟隨 fd symlink）取得 inode 身分後經 [`same_tty`] 判定，不以 readlink 字串比對：跨 mount
+/// namespace 的同名 `/dev/pts/N` 字串相同卻非同一 tty。tty 本身 stat 失敗即略過該 tty（Python `tty_stat`
+/// 回 None）；fd stat 失敗略過該 fd；fd 目錄 PermissionError → `Permission`，其他錯誤 → `Unknown`。
+pub fn tty_holders_with(
+    fs: &dyn HolderFs,
+    proc_root: &Path,
+    pids: &[u32],
+    paths: &[PathBuf],
+) -> (Vec<u32>, HolderScanStatus) {
+    let tty_stats = paths
+        .iter()
+        .filter_map(|path| fs.stat(path).ok())
+        .collect::<Vec<TtyStat>>();
+    let mut holders = BTreeSet::new();
+    let mut status = HolderScanStatus::Ok;
+    for pid in pids {
+        let fd_dir = proc_root.join(pid.to_string()).join("fd");
+        let fds = match fs.list_dir(&fd_dir) {
+            Ok(fds) => fds,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                status = HolderScanStatus::Permission;
+                continue;
+            }
+            Err(_) => {
+                if status == HolderScanStatus::Ok {
+                    status = HolderScanStatus::Unknown;
+                }
+                continue;
+            }
+        };
+        for fd in fds {
+            let Ok(fd_stat) = fs.stat(&fd_dir.join(&fd)) else {
+                continue;
+            };
+            if tty_stats.iter().any(|tty| same_tty(&fd_stat, tty)) {
+                holders.insert(*pid);
+            }
+        }
     }
-    if !(fd.file_type().is_char_device() && tty.file_type().is_char_device()) {
-        return false;
-    }
-    let rdev = tty.rdev();
-    rdev != 0 && fd.rdev() == rdev && !is_devpts_major(rdev)
+    (holders.into_iter().collect(), status)
 }
 
-/// Linux `dev_t` 的 major（與 glibc `gnu_dev_major` 同一位元運算）落在 UNIX98 devpts 範圍 136–143。
 #[cfg(unix)]
-fn is_devpts_major(rdev: u64) -> bool {
-    let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff_u64);
-    (136..=143).contains(&major)
-}
-
-/// 非 unix 無 `(dev, ino)` 身分可用；`PosixProcScan` 的 holder 判定僅於 unix 實際使用（Windows 走 `WindowsProcScan`）。
-#[cfg(not(unix))]
-fn same_tty(_fd: &fs::Metadata, _tty: &fs::Metadata) -> bool {
-    false
+/// [`tty_holders_with`] 的 fail-closed 版（#R2／Codex P2；`serial_port.probe_holders` 語意）：目標 tty 取不到
+/// 身分時不得回「無 holder、Ok」（呼叫端會當成已確認可安全開啟）——PermissionDenied → `Permission`，其他 →
+/// `Unknown`；fd 在掃描期間消失（NotFound）屬正常競態而略過，fd 因權限讀不到 → `Permission`，其他 → `Unknown`。
+pub fn tty_holders_fail_closed_with(
+    fs: &dyn HolderFs,
+    proc_root: &Path,
+    pids: &[u32],
+    paths: &[PathBuf],
+) -> (Vec<u32>, HolderScanStatus) {
+    let mut status = HolderScanStatus::Ok;
+    let degrade = |status: &mut HolderScanStatus, error: &std::io::Error| {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            *status = HolderScanStatus::Permission;
+        } else if *status == HolderScanStatus::Ok {
+            *status = HolderScanStatus::Unknown;
+        }
+    };
+    let mut tty_stats = Vec::with_capacity(paths.len());
+    for path in paths {
+        match fs.stat(path) {
+            Ok(stat) => tty_stats.push(stat),
+            Err(error) => degrade(&mut status, &error),
+        }
+    }
+    let mut holders = BTreeSet::new();
+    for pid in pids {
+        let fd_dir = proc_root.join(pid.to_string()).join("fd");
+        let fds = match fs.list_dir(&fd_dir) {
+            Ok(fds) => fds,
+            Err(error) => {
+                degrade(&mut status, &error);
+                continue;
+            }
+        };
+        for fd in fds {
+            let fd_stat = match fs.stat(&fd_dir.join(&fd)) {
+                Ok(stat) => stat,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    degrade(&mut status, &error);
+                    continue;
+                }
+            };
+            if tty_stats.iter().any(|tty| same_tty(&fd_stat, tty)) {
+                holders.insert(*pid);
+            }
+        }
+    }
+    (holders.into_iter().collect(), status)
 }

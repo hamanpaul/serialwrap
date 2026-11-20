@@ -12,8 +12,20 @@ const FLAG_S: u32 = PyFlags::S;
 const FLAG_A: u32 = PyFlags::A;
 
 pub(super) fn translate(parsed: &ParsedPattern) -> Result<String, String> {
+    translate_inner(parsed, false)
+}
+
+/// UP-P7-02：保留全部擷取群組（engine 群組序號＝Python 群組序號），供 `PyRegex::search_groups`。
+pub(super) fn translate_capturing(parsed: &ParsedPattern) -> Result<String, String> {
+    translate_inner(parsed, true)
+}
+
+fn translate_inner(parsed: &ParsedPattern, keep_all_groups: bool) -> Result<String, String> {
     let mut used_groups = BTreeSet::new();
     collect_references(&parsed.expression, &mut used_groups);
+    if keep_all_groups {
+        collect_captures(&parsed.expression, &mut used_groups);
+    }
     let group_map: BTreeMap<usize, usize> = used_groups
         .into_iter()
         .enumerate()
@@ -179,6 +191,33 @@ fn write_repeat(
 ) -> Result<(), String> {
     if is_zero_width(body) {
         if min == 0 {
+            // 零寬本體重複至多一次有意義；本體含保留的擷取群組時不得省略，否則後續群組序號錯位
+            // （CPython：`()?` 參與為 ''、`()??` 不參與為 None、`(){0}` 不參與為 None）。以交替表達可選，
+            // 避免 `(?:(?=…))?` 這類「重複 lookaround」被 fancy-regex 拒收。
+            if !has_mapped_capture(body, group_map) {
+                return Ok(());
+            }
+            let possessive = matches!(mode, RepeatMode::Possessive);
+            if possessive {
+                out.push_str("(?>");
+            }
+            if max == Some(0) {
+                // 上限 0：群組保留但永不參與。
+                out.push_str("(?:|(?!)");
+                write_expr(body, group_map, flags, out)?;
+                out.push(')');
+            } else if matches!(mode, RepeatMode::Lazy) {
+                out.push_str("(?:|");
+                write_expr(body, group_map, flags, out)?;
+                out.push(')');
+            } else {
+                out.push_str("(?:");
+                write_expr(body, group_map, flags, out)?;
+                out.push_str("|)");
+            }
+            if possessive {
+                out.push(')');
+            }
             return Ok(());
         }
         return write_expr(body, group_map, flags, out);
@@ -253,6 +292,44 @@ fn is_zero_width(expr: &Expr) -> bool {
         | Expr::Category(_)
         | Expr::CharacterClass { .. }
         | Expr::Backreference { .. } => false,
+    }
+}
+
+fn has_mapped_capture(expr: &Expr, group_map: &BTreeMap<usize, usize>) -> bool {
+    let mut found = BTreeSet::new();
+    collect_captures(expr, &mut found);
+    found.iter().any(|index| group_map.contains_key(index))
+}
+
+fn collect_captures(expr: &Expr, used: &mut BTreeSet<usize>) {
+    match expr {
+        Expr::Capture { index, body } => {
+            used.insert(*index);
+            collect_captures(body, used);
+        }
+        Expr::Conditional { yes, no, .. } => {
+            collect_captures(yes, used);
+            collect_captures(no, used);
+        }
+        Expr::Sequence(items) | Expr::Alternation(items) => {
+            for item in items {
+                collect_captures(item, used);
+            }
+        }
+        Expr::NonCapture(body)
+        | Expr::Atomic(body)
+        | Expr::ScopedFlags { body, .. }
+        | Expr::Repeat { body, .. }
+        | Expr::LookAhead { body, .. }
+        | Expr::LookBehind { body, .. } => collect_captures(body, used),
+        Expr::Backreference { .. }
+        | Expr::Empty
+        | Expr::Literal(_)
+        | Expr::Dot
+        | Expr::Category(_)
+        | Expr::CharacterClass { .. }
+        | Expr::Anchor(_)
+        | Expr::WordBoundary { .. } => {}
     }
 }
 

@@ -2,6 +2,13 @@
 //! 平台實作放在 `posix`／`windows` 子模組，依目標平台擇一編譯。
 //!
 //! 原生寫入面由 P4-T5 的 POSIX 與 Windows 後端提供；測試替身可覆寫所需方法。
+
+/// Python 文字模式寫檔的換行（`open(..., "w")` 的 `newline=None` → `os.linesep`）：Windows `\r\n`、其餘 `\n`
+/// （state.json 尾端換行，審查 F55）。
+#[cfg(windows)]
+pub const TEXT_NEWLINE: &[u8] = b"\r\n";
+#[cfg(not(windows))]
+pub const TEXT_NEWLINE: &[u8] = b"\n";
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
@@ -18,6 +25,41 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 pub mod posix;
 #[cfg(windows)]
 pub mod windows;
+
+/// 將本機檔案讀寫錯誤轉成 Python 相容的 PAL 錯誤。
+///
+/// Windows 檔案 API 回報的 Win32 錯誤需先轉成 CRT errno，才能對齊 Python `open` 的 `OSError`。
+pub fn map_file_error(error: std::io::Error) -> PalError {
+    #[cfg(unix)]
+    {
+        match error.raw_os_error() {
+            Some(code) => crate::traits::posix_errno(code),
+            None => PalError::plain(PalErrorKind::Io, error.to_string()),
+        }
+    }
+    #[cfg(windows)]
+    {
+        windows::file_error(error)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        PalError::plain(PalErrorKind::Io, error.to_string())
+    }
+}
+
+/// 將建立目錄錯誤轉成 Python `os.makedirs` 相容的 PAL 錯誤。
+///
+/// Windows `os.makedirs` 保留 Win32 錯誤碼（例如 `[WinError 183]`），與 `open` 的 CRT errno 不同。
+pub fn map_mkdir_error(error: std::io::Error) -> PalError {
+    #[cfg(windows)]
+    {
+        windows::win32_error(error)
+    }
+    #[cfg(not(windows))]
+    {
+        map_file_error(error)
+    }
+}
 
 /// `symlink_or_copy_dir` 的結果（DF-16）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +101,81 @@ impl Drop for FileLockGuard {
             }
         }
         drop(self.file.take());
+    }
+}
+
+/// `FsOps::open_append` 的寫入端（P7 Task 0 凍結；Task 6 實作）。
+pub trait AppendFile: Send {
+    fn write_all_flush(&mut self, b: &[u8]) -> PalResult<()>;
+    fn sync(&mut self) -> PalResult<()>;
+}
+
+/// 原生 `AppendFile`：`std::fs::File`＋平台錯誤映射（P7 Task 6）。
+pub(crate) struct StdAppendFile {
+    pub(crate) file: std::fs::File,
+    pub(crate) map: fn(std::io::Error) -> crate::traits::PalError,
+}
+
+impl AppendFile for StdAppendFile {
+    fn write_all_flush(&mut self, b: &[u8]) -> PalResult<()> {
+        use std::io::Write;
+        self.file.write_all(b).map_err(self.map)?;
+        self.file.flush().map_err(self.map)
+    }
+
+    fn sync(&mut self) -> PalResult<()> {
+        self.file.sync_all().map_err(self.map)
+    }
+}
+
+/// Python `str(OSError)` 帶檔名的形式：`<訊息>: <repr(path)>`（P7 Task 6；`repr(str)` 規則同 `rpc_transport`）。
+pub(crate) fn with_filename(
+    mut error: crate::traits::PalError,
+    p: &Path,
+) -> crate::traits::PalError {
+    let s = p.to_string_lossy();
+    let quote = if s.contains('\'') && !s.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    let mut repr = String::with_capacity(s.len() + 2);
+    repr.push(quote);
+    for ch in s.chars() {
+        match ch {
+            '\\' => repr.push_str("\\\\"),
+            '\n' => repr.push_str("\\n"),
+            '\r' => repr.push_str("\\r"),
+            '\t' => repr.push_str("\\t"),
+            c if c == quote => {
+                repr.push('\\');
+                repr.push(c);
+            }
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                repr.push_str(&format!("\\x{:02x}", c as u32))
+            }
+            c => repr.push(c),
+        }
+    }
+    repr.push(quote);
+    error.py_message = format!("{}: {repr}", error.py_message);
+    error
+}
+
+/// Python 文字模式寫入的換行（`os.linesep`）的字串形：POSIX `\n`、Windows `\r\n`（審查 76de0cf_96b28dd c58e8d4-2）。
+/// 與 P5 的位元組形 [`TEXT_NEWLINE`] 同值（merge P5 47c7b25 時兩邊各自新增，P5 名稱保留給位元組形）。
+#[cfg(windows)]
+pub const TEXT_NEWLINE_STR: &str = "\r\n";
+/// Python 文字模式寫入的換行（`os.linesep`）的字串形：POSIX `\n`、Windows `\r\n`（審查 76de0cf_96b28dd c58e8d4-2）。
+#[cfg(not(windows))]
+pub const TEXT_NEWLINE_STR: &str = "\n";
+
+/// 文字模式寫入的位元組：每個 `\n` 換成 [`TEXT_NEWLINE_STR`]（UTF-8 編碼）。
+pub fn text_mode_bytes(text: &str) -> Vec<u8> {
+    if TEXT_NEWLINE_STR == "\n" {
+        text.as_bytes().to_vec()
+    } else {
+        text.replace('\n', TEXT_NEWLINE_STR).into_bytes()
     }
 }
 
@@ -129,5 +246,28 @@ pub trait FsOps: FsRead {
     /// 取得跨行程獨占鎖：POSIX `flock`，Windows `LockFileEx`；非阻塞取不到回 `WouldBlock`。
     fn file_lock_exclusive(&self, p: &Path, blocking: bool) -> PalResult<FileLockGuard> {
         unimplemented!("P4-T5")
+    }
+
+    // ---- P7 Task 6（08 Task 0 凍結）：寫入側增補；原生實作由 Task 6 交付 ----
+    /// `open(p, "ab")`：append 模式開啟（不存在則建立）；錯誤 `py_message` 照 `str(OSError)`（含 `: '<path>'`）。
+    fn open_append(&self, p: &Path) -> PalResult<Box<dyn AppendFile>> {
+        todo!("P7 Task 6")
+    }
+    /// `open(p, "w")` 截斷後寫入並 close（counter／registry 的 `<path>.tmp`：殘留 tmp 必須被覆寫，不得續寫）。
+    fn create_truncate(&self, p: &Path, bytes: &[u8]) -> PalResult<()> {
+        todo!("P7 Task 6")
+    }
+    /// `open(p, "w", encoding="utf-8")` 文字模式寫入：`\n` 依平台換行（Windows `\r\n`，`newline=None`）後截斷寫入。
+    fn create_truncate_text(&self, p: &Path, text: &str) -> PalResult<()> {
+        self.create_truncate(p, &text_mode_bytes(text))
+    }
+    // `os.path.isfile` 沿用既有 `FsRead::is_file`（P3），不在 FsOps 重複定義（08 Task 0 核對註記）。
+    /// 檔案大小；`None`＝不存在。
+    fn file_size(&self, p: &Path) -> PalResult<Option<u64>> {
+        todo!("P7 Task 6")
+    }
+    /// 刪除單一檔案；`false`＝不存在（P4 `remove_file` 簽章不變）。
+    fn remove_file_if_exists(&self, p: &Path) -> PalResult<bool> {
+        todo!("P7 Task 6")
     }
 }

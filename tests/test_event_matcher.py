@@ -180,5 +180,59 @@ class TestMatcherWorker(unittest.TestCase):
         self.assertEqual([f.rule.rule_id for f in self.ctx.fires], ["o.m"])
 
 
+def test_matcher_exception_converges_and_stop_warns_after_2s(caplog) -> None:
+    """parity #118（B:F-E05）：單一 item 求值例外收斂（matcher 不終止）；stop 等待逾 2 s 寫 WARNING。
+
+    Rust ``MatcherWorker`` 以同一語意承接（P7 Task 12 ``matcher_exception_converges_and_stop_warns_after_2s``）。
+    """
+    import logging
+    import threading
+
+    class _Boom(_FakeContext):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def counter_for(self, rule_id: str) -> Counter:
+            self.calls += 1
+            if self.calls == 1:
+                raise OSError("counter store I/O")
+            return Counter()
+
+    ctx = _Boom()
+    worker = MatcherWorker(rules=[_rule()], context=ctx, queue_max=4)
+    worker.start()
+    with caplog.at_level(logging.WARNING, logger="serialwrap"):
+        worker.feed_line("COM0", "panic 1", wal_seq=1)
+        worker.flush_for_test(timeout=1.0)
+        worker.feed_line("COM0", "panic 2", wal_seq=2)
+        worker.flush_for_test(timeout=1.0)
+    worker.stop()
+    assert [f.wal_seq for f in ctx.fires] == [2]
+    assert any(r.getMessage() == "event matcher 求值失敗，丟棄此 item（selector=COM0）" for r in caplog.records)
+
+    blocked, release = threading.Event(), threading.Event()
+
+    class _Stuck(_FakeContext):
+        def emit_fire(self, fire: MatcherFire) -> None:
+            blocked.set()
+            release.wait(10)
+
+    stuck = MatcherWorker(rules=[_rule()], context=_Stuck(), queue_max=4)
+    stuck.start()
+    stuck.feed_line("COM0", "panic", wal_seq=1)
+    assert blocked.wait(2)
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING, logger="sw_core.event_engine.matcher"):
+        stuck.stop()
+    elapsed = time.monotonic() - started
+    release.set()
+    assert 1.9 <= elapsed < 3.5
+    assert any(
+        r.getMessage() == "event-matcher thread did not exit within 2s; context may receive late callbacks"
+        for r in caplog.records
+    )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -11,8 +11,10 @@
 #     issues 為空，與 regression registry 逐筆對拍。
 #   - f10-release-*：補 posix_throwaway_daemon（經 _run_with_handoff 使用 POSIX-only 的 ThrowawayDaemon），與 f10-creds-* 同族。
 #   - win-wal-av-*：evidence 以 scripts/stage0/spike3_win_wal.py 實際產物 <case-id>.json 為準。
+#   - s24-*（P8 Task 1）：suite 新增 rust-l1、family 新增 S24（schema 列舉只增不改）；SC-33 依 OD-79 撤回，原列 SC-33 的案例改列 SC-03；
+#     s24-xfer-abort-on-release 依 OD-62 比照 BC-03；source_ref／evidence 中尚未建立的節點由承接 Task 依此命名建立。
 schema_version: 1
-revision: 2026-11-03.1
+revision: 2026-11-13.1
 spec: docs/rust-refactor/serialwrap-rust-spec-final.md
 invariant_ids: [zero_tx_on_reject, no_forbidden_interleave, no_stale_context_replay, no_reopen_before_handoff, no_auto_resend, insufficient_evidence_not_pass]
 features:
@@ -666,7 +668,7 @@ cases:
   prerequisites: [file_transfer]
   necessity: conditional
   issues: ['#21', '#161', '#166']
-  behavior_changes: []
+  behavior_changes: [DF-26]
   destructive: false
   expected: PASS
   sentinel: null
@@ -1435,8 +1437,8 @@ cases:
   invariants: []
   layer: L3
   platforms: [linux, windows]
-  windows_status: ported
-  windows_gap_reason: null
+  windows_status: gap
+  windows_gap_reason: 'Windows TCP console 不建立 human interactive lease，故 human_active／SESSION_INTERACTIVE_BUSY 行為未移植；依 2026-11-12 rulings/s2.md 第 8 點與 OD-85 登記 Windows gap。'
   capabilities: [physical_uart, human_frontend, two_boards]
   cli_stage: 1B
   daemon_slice: '2.2'
@@ -1460,8 +1462,8 @@ cases:
   invariants: []
   layer: L3
   platforms: [linux, windows]
-  windows_status: ported
-  windows_gap_reason: null
+  windows_status: gap
+  windows_gap_reason: 'Windows TCP console 不建立 human interactive lease，故 idle human lease soft preempt 行為未移植；依 2026-11-12 rulings/s2.md 第 8 點與 OD-85 登記 Windows gap。'
   capabilities: [physical_uart, human_frontend, two_boards]
   cli_stage: 1B
   daemon_slice: '2.2'
@@ -2174,7 +2176,7 @@ cases:
   platform_capabilities:
     windows: [windows_com, process_rpc]
   cli_stage: 1B
-  daemon_slice: '2.2'
+  daemon_slice: '2.3'
   stage0_required: true
   prerequisites: [arbiter, recovery_min, console_pty]
   necessity: required
@@ -2185,7 +2187,7 @@ cases:
   sentinel: null
   evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
   implemented_by: existing
-  cross_slice_reason: null
+  cross_slice_reason: 'OD-34（擁有者裁決 2026-10-28）：自 Slice 2.2 func-test gate 逐名移出、改列 Slice 2.3（regen_lock.py --authorize-deferral 逐名授權）'
 - case_id: ev-01-spawn-handler
   suite: func-test
   source_ref: func-test/cases/ev-01-spawn-handler.yaml
@@ -2496,7 +2498,7 @@ cases:
   platform_capabilities:
     windows: [windows_com, process_rpc]
   cli_stage: 1A
-  daemon_slice: '2.1'
+  daemon_slice: '2.3'  # OD-34（2026-10-28）：依賴 readiness reprobe（P7-T5），自 Slice 2.1 延至 2.3
   stage0_required: true
   prerequisites: [arbiter]
   necessity: required
@@ -3597,6 +3599,1315 @@ cases:
   - tests/contract_blackbox/test_bb_daemon_e2e.py
   implemented_by: 04-stage1a-rust-cli.md
   cross_slice_reason: null
+# --- P6 Slice 2.2 Task 0（07-slice22-console.md）追加：behavior_changes phases 含 P6 的案例、SC-28／SC-29／SC-31 與 Windows Telnet 四案（add-only） ---
+- case_id: bc02-deferred-overflow-clear
+  suite: contract-blackbox
+  source_ref: crates/sw-core/tests/deferred_bc02.rs::overflow_deletes_whole_entry_then_new_bytes_kept
+  family: L15
+  title: DeferredBuffer 單一 client 超過 262144 bytes 時刪除整個 entry，之後的 bytes 開新 entry 保留
+  contract: BC-02（07 D-07，P1 T09 規則 1）：附加後長度 > 262144 即刪除該 entry（連同本次 bytes）並寫 WARNING；之後同 client 的 bytes 開新 entry 照常保留，無 poison 狀態。
+  invariants: [no_stale_context_replay]
+  layer: L1
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [memory_only]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [deferred_buffer]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-02]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [crates/sw-core/tests/deferred_bc02.rs]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: bc02-deferred-context-switch-clear
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/slice22/test_console_bc02.py::test_banner_during_suspend_drops_deferred
+  family: L15
+  title: agent 命令期間出現 boot banner 時 deferred 按鍵整段失效、不回放
+  contract: BC-02（07 D-02）：BootBannerDetected／quiet 重新 arm／reboot／drain Phase 1／release／FlashSyncMatched 之後 input_epoch 遞增，失效前的 deferred 按鍵不得到達 UART。
+  invariants: [no_stale_context_replay]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [deferred_buffer, suspend_resume]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-02]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/slice22/test_console_bc02.py]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: bc02-mailbox-stale-input-not-replayed
+  suite: contract-blackbox
+  source_ref: crates/sw-core/tests/session_core_console.rs::stale_epoch_input_dropped_and_diagnosed
+  family: L15
+  title: mailbox 內帶舊 input_epoch 的 console 輸入一律丟棄並可診斷
+  contract: BC-02（07 D-02、D-19）：ConsoleInputBytes 帶擷取當下的 input_epoch，不等於現值即丟棄並寫限速 WARNING（reason=stale_epoch），不進 deferred、不產生 HumanTx。
+  invariants: [no_stale_context_replay, zero_tx_on_reject]
+  layer: L1
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [memory_only]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [deferred_buffer]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-02]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [crates/sw-core/tests/session_core_console.rs]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: bc02-normal-replay-53
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/slice22/test_console_bc02.py::test_normal_suspend_loses_no_keystroke
+  family: L15
+  title: 沒有上下文失效時 suspend／resume 不遺失、不重排任何按鍵（#53）
+  contract: BC-02（07 Review Focus 1）：沒有失效的 suspend／resume 與 soft preempt 不得遺失或重排任何按鍵；agent 命令結束後 deferred 依序回放。
+  invariants: [no_forbidden_interleave]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [deferred_buffer, suspend_resume]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-02]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/slice22/test_console_bc02.py]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: sc13-lease-expiry-tick
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/slice22/test_interactive_lease.py::test_expiry_tick_restores_without_access
+  family: L15
+  title: interactive lease 到期由 1 s tick 主動處理並保留可重複讀的 tombstone
+  contract: SC-13（07 D-08）：tick 到期後不需任何 RPC 存取即還原 stash 與回放；send／status／close 對 tombstone 一律回 INTERACTIVE_EXPIRED，FIFO 16 擠出後才是 INTERACTIVE_NOT_FOUND。
+  invariants: []
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [lease]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-13]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/slice22/test_interactive_lease.py]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: sc15-console-ring-drop-oldest
+  suite: contract-blackbox
+  source_ref: crates/sw-core/tests/out_ring.rs::drop_oldest_keeps_newest_within_cap
+  family: L15
+  title: 每 console 1 MiB 出向 ring 對慢速 console drop-oldest，不阻塞 UART／WAL
+  contract: SC-15（07 D-05）：Display 合計超過 1048576 bytes 時丟最舊整個 Display 元素（已部分寫出的 front 不丟、不切開 IAC IAC）；Control 不被丟棄。
+  invariants: []
+  layer: L1
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [memory_only]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [console_pty]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-15]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [crates/sw-core/tests/out_ring.rs]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: sc16-console-line-reject-log
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/slice22/test_console_pty.py::test_line_overflow_warning
+  family: L15
+  title: console line 超過 16385 bytes 或被 arbiter 拒絕時整行丟棄並寫 WARNING
+  contract: SC-16（07 D-06）：line editor 緩衝上限 16385 bytes；超過即整行丟棄且不回顯並寫 WARNING；arbiter 拒絕 CMD_TOO_LONG／SESSION_QUEUE_FULL／SESSION_NOT_READY 時寫 WARNING。
+  invariants: []
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [raw_line_mode]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-16]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/slice22/test_console_pty.py]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: sc28-console-backend-env
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/slice22/test_console_telnet.py::test_greeting_and_attach_shape
+  family: L15
+  title: SERIALWRAP_CONSOLE_BACKEND 選擇 console backend（auto／pty／tcp）
+  contract: SC-28（07 D-11）：auto／空／未知值有 PTY 用 Pty，否則 TcpTelnet；tcp 一律 TcpTelnet；pty 但平台無 PTY 退回 tcp 並寫 WARNING。
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: Rust-only 契約；Linux L1.5 以 SERIALWRAP_CONSOLE_BACKEND 驗證，Windows 原生由 07 Task 12 對應案例承接。
+  capabilities: [posix_pty]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [console_telnet]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-28]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/slice22/test_console_telnet.py]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: sc31-console-stale-context-rust
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/slice22/test_console_bc02.py::test_input_during_recovery_not_replayed
+  family: L15
+  title: Console 失效上下文與資源上限的 Rust-only 細化
+  contract: SC-31（07 D-13、D-16、D-05、D-18）：無 active epoch 的輸入丟棄並診斷；lease 上下文未還原時不回放該 client；Control 超過 64 KiB 關閉 console；Telnet console 達 32 暫停 accept。
+  invariants: [no_stale_context_replay]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: Rust-only 契約；Linux L1.5 以 SERIALWRAP_CONSOLE_BACKEND 驗證，Windows 原生由 07 Task 12 對應案例承接。
+  capabilities: [posix_pty]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [deferred_buffer, lease]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-31]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/slice22/test_console_bc02.py, tests/contract_blackbox/slice22/test_interactive_lease.py]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: sc29-com0com-serial-console
+  suite: windows-native
+  source_ref: crates/sw-pal/tests/console_conformance.rs::cap_windows_com__console_com0com_roundtrip
+  family: WIN
+  title: OD-01 選配 com0com Serial console（windows.serial_console）
+  contract: SC-29（07 D-12）：console-side 埠以 share mode 0 開啟並自動排除於裝置列舉；ownership 規則同 TCP accept；虛擬端控制線不轉送 DUT；開啟失敗只寫 WARNING。
+  invariants: []
+  layer: L1.5
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [console_telnet]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-29]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [target/win-test-report/<run_id>.json]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: win-telnet-raw-owner
+  suite: windows-native
+  source_ref: scripts/rust/win-blackbox.ps1 -Subset console::win-telnet-raw-owner
+  family: WIN
+  title: Windows Telnet console：第一個連線取得 raw ownership 並即時透傳
+  contract: '07 Task 12（BLOCKED-OWNER 總表 #1）：Windows 原生 Telnet console 第一個連線為 raw owner，Python 與 Rust daemon Sequential A/B 一致。'
+  invariants: [no_forbidden_interleave]
+  layer: L1.5
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [console_telnet, raw_line_mode]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [target/win-blackbox/<run_id>/python/junit.xml, target/win-blackbox/<run_id>/rust/junit.xml, ab_summary.json]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: win-telnet-linebuffer
+  suite: windows-native
+  source_ref: scripts/rust/win-blackbox.ps1 -Subset console::win-telnet-linebuffer
+  family: WIN
+  title: Windows Telnet console：第二個連線走 line-buffer（本地回顯與 backspace）
+  contract: '07 Task 12（BLOCKED-OWNER 總表 #1）：第二個 Telnet console 走 line-buffer，本地回顯與 backspace 編輯與 Python 位元組相同。'
+  invariants: []
+  layer: L1.5
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [console_telnet, raw_line_mode]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [target/win-blackbox/<run_id>/python/junit.xml, target/win-blackbox/<run_id>/rust/junit.xml, ab_summary.json]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: win-telnet-suspend-resume
+  suite: windows-native
+  source_ref: scripts/rust/win-blackbox.ps1 -Subset console::win-telnet-suspend-resume
+  family: WIN
+  title: Windows Telnet console：agent 命令期間 suspend raw、結束後 resume
+  contract: '07 Task 12（BLOCKED-OWNER 總表 #1）：agent 命令期間 human raw 暫停，結束後恢復 ownership，不遺失按鍵。'
+  invariants: [no_forbidden_interleave]
+  layer: L1.5
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [console_telnet, suspend_resume]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [target/win-blackbox/<run_id>/python/junit.xml, target/win-blackbox/<run_id>/rust/junit.xml, ab_summary.json]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: win-telnet-deferred
+  suite: windows-native
+  source_ref: scripts/rust/win-blackbox.ps1 -Subset console::win-telnet-deferred
+  family: WIN
+  title: Windows Telnet console：agent 命令期間的按鍵 deferred 後依序回放，失效上下文不回放
+  contract: '07 Task 12（BLOCKED-OWNER 總表 #1）：DeferredBuffer 依 BC-02 回放與失效，Python 與 Rust A/B 一致。'
+  invariants: [no_stale_context_replay]
+  layer: L1.5
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [console_telnet, deferred_buffer]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-02]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [target/win-blackbox/<run_id>/python/junit.xml, target/win-blackbox/<run_id>/rust/junit.xml, ab_summary.json]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: p7-login-unresolved-credentials-terminal-zero-empty-secret-tx
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_login.py::test_unresolved_credentials_terminal_zero_empty_secret_tx
+  family: L15
+  title: '宣告帳密但未解析：attach 停在 ATTACHED＋CREDENTIALS_UNRESOLVED，終態期間零 TX'
+  contract: '08 Task 18：env_file 不存在且環境無帳密時 attach 不得送任何 probe／login byte；跨多個 reprobe 週期仍零 TX；WAL META credentials_unresolved 恰 1 筆。'
+  invariants: [zero_tx_on_reject]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [login_full]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_login.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-login-creds-file-fixed-does-not-auto-probe-until-attach
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_login.py::test_creds_file_fixed_does_not_auto_probe_until_attach
+  family: L15
+  title: '只補帳密檔不自動解除 CREDENTIALS_UNRESOLVED，須 session attach 才重試'
+  contract: '08 Task 18（§9.3）：寫入 env_file 後 35 s 內零 TX、last_error 維持 CREDENTIALS_UNRESOLVED；session attach 後進 READY。'
+  invariants: [zero_tx_on_reject]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [login_full]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_login.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-login-platform-matrix
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_login.py::test_platform_matrix
+  family: L15
+  title: 'shell／prpl／bcm 標準登入進 READY'
+  contract: '08 Task 18：各平台標準登入（bcm：Login→Password→CM> 與 post_login_cmd sh）進 READY、last_error null、WAL TX 不含密碼；bcm 之後 cmd submit 成功。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [login_full]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_login.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-login-passthrough-uboot-quiet-ready-no-login
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_login.py::test_passthrough_uboot_quiet_ready_no_login
+  family: L15
+  title: 'passthrough（有 ready_probe）不登入、不 probe，30 s 安靜後轉 READY'
+  contract: 'SC-35：首個 cmd submit 前 target 收到 0 byte；進入 ATTACHED 後 30～32 s 內轉 READY；cmd submit 依 prompt => 完成。'
+  invariants: [zero_tx_on_reject]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [login_full]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-35]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_login.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-login-passthrough-others-quiet-ready
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_login.py::test_passthrough_others_quiet_ready
+  family: L15
+  title: 'passthrough others-template：RX 重新起算 30 s 安靜視窗'
+  contract: 'SC-35：第 10 s 雜訊行使安靜視窗重新起算；自該行起 30～32 s 內轉 READY；全程 last_error null、target 0 byte。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [login_full]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-35]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_login.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-login-passthrough-banner-no-quiet-gate
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_login.py::test_passthrough_banner_no_quiet_gate
+  family: L15
+  title: 'passthrough READY 後 boot banner 不 arm quiet、不擋 cmd submit'
+  contract: 'SC-35：boot_quiet_remaining_s null、ready_reconfirm_pending false、state 維持 READY；cmd submit 不回 AUTOBOOT_QUIET。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [login_full, quiet_reconfirm]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-35]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_login.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-login-creds-fixed-then-attach-ready
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_login.py::test_creds_fixed_then_attach_ready
+  family: L15
+  title: '補 env_file 後 session attach 進 READY'
+  contract: '08 Task 18：READY；WAL META credentials_unresolved 共 1 筆（修正前那筆）。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [login_full]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_login.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-login-console-unlock-smart4r-like
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_login.py::test_console_unlock_smart4r_like
+  family: L15
+  title: 'console unlock（smart4R 類）：CFE banner 不中止 unlock'
+  contract: '08 Task 18：READY（banner 不中止 unlock，SC-30 例外）；secret 不在 WAL；INFO log 不出現在 stderr。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [login_full]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_login.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-quiet-reconfirm-spontaneous-reboot-gates-agent
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_quiet_reconfirm.py::test_spontaneous_reboot_gates_agent
+  family: L15
+  title: 'READY 後自發 reboot：agent 命令回 AUTOBOOT_QUIET＋retry_after_s'
+  contract: '08 Task 18（SC-03）：U-Boot 倒數期間 cmd submit → AUTOBOOT_QUIET＋retry_after_s 浮點；target 收到 0 byte。'
+  invariants: [zero_tx_on_reject]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [quiet_reconfirm]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-03]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_quiet_reconfirm.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-quiet-reconfirm-attach-during-quiet-zero-tx
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_quiet_reconfirm.py::test_attach_during_quiet_zero_tx
+  family: L15
+  title: 'quiet 期間 session attach／recover 皆零 TX'
+  contract: '08 Task 18：皆 0 byte；ATTACHED 時 last_error=PROMPT_UNAVAILABLE；READY 時 last_error 維持 null。'
+  invariants: [zero_tx_on_reject]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [quiet_reconfirm]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_quiet_reconfirm.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-quiet-reconfirm-ready-bootloader-tail-terminal-d1
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_quiet_reconfirm.py::test_ready_bootloader_tail_terminal_d1
+  family: L15
+  title: 'READY 後停在 U-Boot：180 s 後 ready_reconfirm_failed、cmd submit 回 READY_UNCONFIRMED'
+  contract: '08 Task 18（D1）：state 仍 READY、last_error null；cmd submit → READY_UNCONFIRMED＋recommended_action self_test、無 retry_after_s；banner 之後 0 byte（slow，> 180 s，必要案例不得 SKIP）。'
+  invariants: [zero_tx_on_reject]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [quiet_reconfirm]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_quiet_reconfirm.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-quiet-reconfirm-attached-bootloader-probe-sets-stuck
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_quiet_reconfirm.py::test_attached_bootloader_probe_sets_stuck
+  family: L15
+  title: 'ATTACHED 停在 bootloader：recover 回 BOOTLOADER、之後 reprobe 失敗設 BOOTLOADER_STUCK'
+  contract: '08 Task 18：classification BOOTLOADER、matched_prompt ^=> $；自動 reprobe 失敗一次 → last_error BOOTLOADER_STUCK、reprobe_exhausted true。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [quiet_reconfirm, stall_recovery]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_quiet_reconfirm.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: sc30-quiet-mid-login-aborts
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_quiet_reconfirm.py::test_rust_quiet_mid_login_aborts_sc30
+  family: L15
+  title: 'attach 登入途中 boot banner：Rust 立即中止 run、之後零 TX'
+  contract: 'SC-30（08 §0.5，Rust-only）：banner 之後 target 收到 0 byte、ATTACHED＋PROMPT_UNAVAILABLE；Python 基線為平台限定 skip（非執行時 SKIP 取綠）。'
+  invariants: [zero_tx_on_reject, no_auto_resend]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [login_full, quiet_reconfirm]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-30]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_quiet_reconfirm.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-selftest-recover-selftest-classifications
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_selftest_recover.py::test_selftest_classifications
+  family: L15
+  title: 'self-test 分類：OK／BOOTLOADER／RX_FLOOD／PASSTHROUGH／RELEASED'
+  contract: '08 Task 18：classification 與 recommended_action 依情境；passthrough ATTACHED 為 console_attach 並帶 passthrough_ready_in_s、passthrough READY 為 none 且 target 0 byte（SC-35）。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [self_test_basic, rx_flood_classification]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-35]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_selftest_recover.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: sc34-attach-recover-last-error-field
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_selftest_recover.py::test_attach_recover_last_error_field
+  family: L15
+  title: 'session attach／recover 的 error_code 與 last_error 分離（SC-34）'
+  contract: 'SC-34：attach ok:false、error_code SESSION_NOT_READY、last_error 等於 session.last_error；recover ok:true、action REPROBE、recovered false、error_code SESSION_NOT_READY；兩者皆有 last_error_detail。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [login_full, stall_recovery]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-34]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_selftest_recover.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-selftest-recover-recover-force-timeout-attached
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_selftest_recover.py::test_recover_force_timeout_attached
+  family: L15
+  title: 'ATTACHED＋target 靜默：recover --force 回 FORCE_RECOVER_TIMEOUT'
+  contract: '08 Task 18：FORCE_RECOVER_TIMEOUT、action FORCE_CLEAR_REATTACH，耗時 10～13 s。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [stall_recovery]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_selftest_recover.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-selftest-recover-recover-force-on-ready-runs-keys-first
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_selftest_recover.py::test_recover_force_on_ready_runs_keys_first
+  family: L15
+  title: 'READY＋target 靜默：recover --force 先送 CTRL_C／CTRL_D'
+  contract: '08 Task 18：ok:false、PROMPT_TIMEOUT、partial true、recovery_action NONE，耗時 14～17 s；target 依序收到 \x03、\x04。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [stall_recovery]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_selftest_recover.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-selftest-recover-recover-ready-ctrl-c
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_selftest_recover.py::test_recover_ready_ctrl_c
+  family: L15
+  title: '命令 hang 後 CTRL_C 恢復 prompt'
+  contract: '08 Task 18：PROMPT_TIMEOUT_RECOVERED、recovery_action CTRL_C。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [stall_recovery]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_selftest_recover.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-stall-transport-stall-flip
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_stall.py::test_transport_stall_flip
+  family: L15
+  title: 'read-endpoint stall：recover 後 last_error=TRANSPORT_STALL、META 去重'
+  contract: '08 Task 18（GAP-G-09）：last_error TRANSPORT_STALL、last_error_detail 以「零 RX 」開頭；WAL META transport_stall_suspected 1 筆；收到非空 RX 後再 stall 共 2 筆。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [stall_recovery]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_stall.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-events-rule-fire-handler-payload
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_events.py::test_rule_fire_handler_payload
+  family: L15
+  title: '規則命中：handler stdin／env 與事件順序（rule_set 路徑）'
+  contract: '08 Task 18：handler stdin 與 env 鍵集合與 09 §3.6 一致；event tail 依序 com_enabled、rule_loaded、match_recorded、fire_completed。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [event_engine]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_events.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-events-start-load-order
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_events.py::test_start_load_order
+  family: L15
+  title: 'daemon 啟動載入既有規則：rule_loaded 在 com_enabled 之前'
+  contract: '08 Task 18：event tail 前兩筆依序 rule_loaded、com_enabled（engine.py:101-114）。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [event_engine]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_events.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-events-rule-crud-and-reload
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_events.py::test_rule_crud_and_reload
+  family: L15
+  title: 'event 規則 add／show／list／rm／reload 回應形狀'
+  contract: '08 Task 18：回應形狀與 02 §7.12 一致；reload 以集合比對（RPC-H-13）。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [event_engine]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_events.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-events-handler-timeout-kills-group
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_events.py::test_handler_timeout_kills_group
+  family: L15
+  title: 'handler 逾時終止整個 process group'
+  contract: '08 Task 18：fire_timeout；無殘留行程。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [event_engine]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_events.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-events-handler-no-inherited-fds
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_events.py::test_handler_no_inherited_fds
+  family: L15
+  title: 'handler 不繼承 daemon 的 fd（close_fds=True 等價）'
+  contract: '08 Task 18：除 0、1、2 與 listdir 自身目錄 fd 外無其他 fd（不得含 PTY master／slave 與 RPC socket）。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [event_engine]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_events.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-events-redos-rejected-no-re2
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_events.py::test_redos_rejected_no_re2
+  family: L15
+  title: 'ReDoS 可疑樣式（a+b+）在無 re2 基線被拒'
+  contract: '08 Task 18（EVT-D-S15）：exit 2、stdout INVALID_RULE_SCHEMA；Python 基線若可 import re2 為已登記變體 skip（baseline_variant_re2）。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [event_engine]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_events.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-log-capture-capture-skips-foreground
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_log_capture.py::test_capture_skips_foreground
+  family: L15
+  title: 'agent log capture 只記背景 RX、不含前景命令輸出'
+  contract: '08 Task 18（EVT-D-L1）：檔案含背景 RX、不含前景命令輸出。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [background_capture, login_full]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_log_capture.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-latency-noise-login-with-delay-and-noise
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_latency_noise.py::test_login_with_delay_and_noise
+  family: L15
+  title: '每步 800 ms 延遲＋背景 kernel noise 仍可登入'
+  contract: '08 Task 18：每步 800 ms 延遲＋每 50 ms 一行 noise 仍進 READY（timeout_s 15）。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [login_full]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_latency_noise.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-latency-noise-control-latency-under-flood-with-events
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_latency_noise.py::test_control_latency_under_flood_with_events
+  family: L15
+  title: 'RX 洪水＋ALL 規則下 control 延遲有界'
+  contract: 'OD-59／OD-71：一般 pytest／CI A/B 以 command_cancel 200、stop_request 20×1 輪作快速檢查，不宣稱達契約；P7 gate 專屬 A／B 列依 resource_limits.yaml event_latency.samples_per_run×repeats（500×3）實跑，兩事件每一輪最大值皆須 ≤ max_ms_flood 並通過負載與作廢規則；matcher event_dropped 有界出現；RSS 增量只作診斷值（OD-09）。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [event_engine, rx_flood_classification]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_latency_noise.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-invariants-rejected-requests-zero-tx
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_invariants.py::test_rejected_requests_zero_tx
+  family: L15
+  title: '§11.3-1：被拒請求零 TX'
+  contract: '08 Task 18：quiet gate submit、CREDENTIALS_UNRESOLVED、READY_UNCONFIRMED 被拒時 target 0 byte、WAL 無 TX。'
+  invariants: [zero_tx_on_reject]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [quiet_reconfirm, login_full]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_invariants.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-invariants-login-bytes-not-interleaved-with-agent-or-human
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_invariants.py::test_login_bytes_not_interleaved_with_agent_or_human
+  family: L15
+  title: '§11.3-2：login 窗口禁止 agent TX；human bytes 照 Python 可送並留 WAL'
+  contract: '08 Task 18：以 WAL seq／mono 檢查 username/login 至 nonce probe 後 READY；窗口內不得有 agent TX。human bytes 依 Python 可在登入期間送出，且須記錄其 WAL 位置並證明送達 target。'
+  invariants: [no_forbidden_interleave]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [login_full, console_pty]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_invariants.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-invariants-recovery-and-reboot-do-not-replay-stale-input
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_invariants.py::test_recovery_and_reboot_do_not_replay_stale_input
+  family: L15
+  title: '§11.3-3：recover --force／reboot recovery 不回放失效輸入'
+  contract: '08 Task 18：human 在 recover --force／reboot recovery 期間輸入，reattach／READY 後 target 不收到該輸入。'
+  invariants: [no_stale_context_replay]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [stall_recovery, console_pty, deferred_buffer]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_invariants.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-invariants-release-during-login-waits-for-handle-close
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_invariants.py::test_release_during_login_waits_for_handle_close
+  family: L15
+  title: '§11.3-4：登入中 device release 回成功時舊 handle 已關閉'
+  contract: '08 Task 18：release 回成功當下 daemon 已無指向 FakeTarget PTY slave 的 fd；device attach 前不出現新 open；recover 的 REATTACH 同樣只在舊 fd 消失後發生。'
+  invariants: [no_reopen_before_handoff]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [login_full, drain_release]
+  necessity: required
+  issues: []
+  behavior_changes: [DF-23]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_invariants.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-invariants-no-auto-resend-after-partial-or-timeout
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_invariants.py::test_no_auto_resend_after_partial_or_timeout
+  family: L15
+  title: '§11.3-5：逾時救援與 SC-30 中止後不自動重送'
+  contract: '08 Task 18：命令逾時救援、login 被 SC-30 中止後，target 收到的每個 payload 恰一次。'
+  invariants: [no_auto_resend]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [login_full, quiet_reconfirm]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-30]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_invariants.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: p7-invariants-evidence-insufficient-is-not-pass
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_invariants.py::test_evidence_insufficient_is_not_pass
+  family: L15
+  title: '§11.3-6：證據不足不得判 PASS'
+  contract: '08 Task 18：run_p7_ab.sh 在任何案例缺 evidence 檔時該列為 INCOMPLETE、整體 exit 非 0（以注入缺檔驗證）。'
+  invariants: [insufficient_evidence_not_pass]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [memory_only]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [login_full]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_invariants.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: df18-event-replace-overwrite
+  suite: contract-blackbox
+  source_ref: crates/sw-core/tests/event_store.rs::upsert_overwrites_existing_df18
+  family: L15
+  title: '同一事件規則／counter 連續寫入兩次皆成功（Windows 覆寫式取代）'
+  contract: 'DF-18（08 §0.5）：registry 與 counter 的 tmp→正式檔改名改用 FsOps::replace（Windows MoveFileExW(MOVEFILE_REPLACE_EXISTING)）；第二次 upsert／save 同一 rule 不得回 EXCEPTION。Python 側由 tests/test_event_replace_df18.py 覆蓋（13-py）。'
+  invariants: []
+  layer: L1
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [memory_only]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [event_engine]
+  necessity: required
+  issues: []
+  behavior_changes: [DF-18]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [crates/sw-core/tests/event_store.rs, tests/test_event_replace_df18.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: cap-windows-com--p7-login-ready
+  suite: windows-native
+  source_ref: crates/sw-daemon/tests/cap_windows_com_p7.rs::cap_windows_com__p7_login_ready
+  family: WIN
+  title: 'Windows 原生 COM：prpl 腳本登入到 READY 後 cmd submit 成功'
+  contract: '08 Task 19（B-06）：peer 收到 bytes 與 WAL TX 逐筆一致，secret 只在 peer 端、不在 WAL。'
+  invariants: []
+  layer: L1.5
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [windows_com, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [login_full]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [target/win-test-report/<run_id>.json]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: cap-windows-com--p7-quiet-banner-zero-tx
+  suite: windows-native
+  source_ref: crates/sw-daemon/tests/cap_windows_com_p7.rs::cap_windows_com__p7_quiet_banner_zero_tx
+  family: WIN
+  title: 'Windows 原生 COM：READY 後 U-Boot banner → AUTOBOOT_QUIET，banner 之後 0 byte'
+  contract: '08 Task 19（B-06）：submit 回 AUTOBOOT_QUIET；banner 之後 peer 收到 0 byte。'
+  invariants: [zero_tx_on_reject]
+  layer: L1.5
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [windows_com, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [quiet_reconfirm]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [target/win-test-report/<run_id>.json]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: cap-windows-com--p7-event-fire
+  suite: windows-native
+  source_ref: crates/sw-daemon/tests/cap_windows_com_p7.rs::cap_windows_com__p7_event_fire
+  family: WIN
+  title: 'Windows 原生 COM：contains 規則命中 → cmd.exe handler 執行、fire_completed'
+  contract: '08 Task 19（B-06，SC-26）：handler 經 cmd.exe shell 路徑執行並 fire_completed；Job 結束後無殘留行程。'
+  invariants: []
+  layer: L1.5
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [windows_com, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [event_engine]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-26]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [target/win-test-report/<run_id>.json]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
 
 # 凍結鎖增列理由：G4 為 29 個 data-plane 命令補上 Rust CLI→Python daemon FakeTarget E2E；依 P3-T18 逐函式登錄，使用 add-only，不移除或改動既有案例。
 - case_id: bb-alias-assign-persists-device-binding
@@ -4270,4 +5581,761 @@ cases:
   evidence:
   - tests/contract_blackbox/test_bb_daemon_e2e.py
   implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: df20-release-reattach-stale-interactive-id
+  suite: contract-blackbox
+  source_ref: crates/sw-daemon/tests/rpc_console.rs::od37_send_with_pre_release_id_after_reattach_not_found_zero_tx
+  family: L15
+  title: release 後重新 attach，以舊 interactive_id 的 interactive_send 回 INTERACTIVE_NOT_FOUND 且零 TX
+  contract: 'DF-20（OD-37）：device.release 使既有 interactive lease（agent 或 human console）失效；重新 attach 後以舊 id 呼叫 session.interactive_send 回 {ok:false, error_code:INTERACTIVE_NOT_FOUND, interactive_id}，不送任何 bytes。Python 現行照送，依 OD-37 不改。'
+  invariants: [zero_tx_on_reject]
+  layer: L1
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [memory_only]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [lease]
+  necessity: conditional
+  issues: []
+  behavior_changes: [DF-20]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [crates/sw-daemon/tests/rpc_console.rs]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+# --- P6 Slice 2.2 第五輪：DF-20 範圍（rulings/p6.md round4-cont OWNER-BATCH #4，落實 OD-37；add-only；Rust-only L1，conditional 不改變切片凍結分母） ---
+- case_id: df20-recover-reboot-stale-interactive-id
+  suite: contract-blackbox
+  source_ref: crates/sw-daemon/tests/rpc_console.rs::df20_send_with_pre_recover_or_reboot_id_not_found_zero_tx
+  family: L15
+  title: session recover 或 U-Boot banner 之後，以舊 agent interactive_id 的 interactive_send 回 INTERACTIVE_NOT_FOUND 且零 TX
+  contract: 'DF-20（OD-37 範圍）：受理的 session.recover 與觸發 boot quiet 的 U-Boot banner 使既有 agent interactive lease 失效；之後以舊 id 呼叫 session.interactive_send 回 {ok:false, error_code:INTERACTIVE_NOT_FOUND, interactive_id}，不送任何 bytes；新開 lease 換新 id。Python 現行照送，依 OD-37 不改。'
+  invariants: [zero_tx_on_reject]
+  layer: L1
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [memory_only]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [lease]
+  necessity: conditional
+  issues: []
+  behavior_changes: [DF-20]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [crates/sw-daemon/tests/rpc_console.rs]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+# --- P6 Slice 2.2 第五輪：#107（B:E-87）L1.5 func-test 0x08／0x7F 案例（rulings/p6.md OWNER-BATCH #5 案例設計；add-only；conditional 不改變切片凍結分母） ---
+- case_id: co-02-line-backspace
+  suite: func-test
+  source_ref: func-test/cases/co-02-line-backspace.yaml
+  family: L15
+  title: line-buffer console 的 0x08／0x7F 退格編輯後整行提交
+  contract: '#107：owner console 先 detach（關閉其 human lease）後，第二個 console 仍走 line-buffer；輸入含 0x08（BS）或 0x7F（DEL）的整行時，daemon 依 line editor 刪去前一字元，UART 只收到編輯後的整行（echo abc／echo def），target 回應照常 fan-out 到該 console。Python 基線 PASS。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [console_pty, raw_line_mode]
+  necessity: conditional
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, cli.ndjson, daemon.log, wal/]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+# --- P8 Slice 2.4 Task 1：s24-* 案例登記（09-slice24-transfer-flash.md Task 1；add-only）。擁有者裁決修正：SC-33 依 OD-79 撤回，s24-xfer-session-gates 改列 SC-03 並依 OD-74 列 DF-02；s24-xfer-abort-on-release 依 OD-62 比照 BC-03（不以 framing EXCEPTION 為契約）。L2／L3／手動一律引用 P2 個別案例，不另造聚合案例。 ---
+- case_id: s24-xfer-templates-golden
+  suite: rust-l1
+  source_ref: crates/sw-core/tests/file_transfer_golden.rs::every_golden_row_matches_python
+  family: S24
+  title: file transfer 板端命令樣板與 RX 判定 helper 與 Python golden 逐列一致
+  contract: 'Rust file_transfer::templates／rx_match 對 contracts/golden/file_transfer.ndjson（scripts/rust/capture_transfer_golden.py 由 Python 基線 sw_core.file_transfer 擷取）逐列一致：probe／chunk／md5／mv／cleanup 板端命令樣板、chunk 切分（空檔恰產生 1 個空 chunk）、base64 編碼無尾端換行與 RX 判定結果；golden 須與現行 Python 基線同步（新鮮度測試重跑擷取腳本須逐位元組相同）。'
+  invariants: []
+  layer: L1
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [memory_only]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [file_transfer]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['cargo:sw-core::file_transfer_golden::every_golden_row_matches_python', 'cargo:sw-core::file_transfer_golden::chunk_template_lengths_match_inventory', 'cargo:sw-core::file_transfer_golden::split_chunks_empty_file_yields_one_empty_chunk', 'cargo:sw-core::file_transfer_golden::b64encode_has_no_trailing_newline', 'tests/test_transfer_golden_fresh.py::test_file_transfer_golden_is_fresh']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-xfer-push-roundtrip
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_file_transfer.py::test_push_then_pull_roundtrip_md5
+  family: S24
+  title: file push 經部署 artifact 傳到 PTY DUT 後內容與 md5 一致、chunk 命令不重送
+  contract: 'READY 的 shell session 以 serialwrap file push 傳 5120 bytes（chunk 512）：回 {ok:true, bytes, chunks:10, md5, remote_path}；外部 oracle 為 shelltarget 端實際檔案位元組相同，且 DUT 收到的 SW_XFER_CHUNK 命令恰為 10 行（不重送）。同一案例先對 Python 基線、再對 Rust artifact 執行（A/B）。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 黑箱以 POSIX PTY shelltarget 模擬 DUT（posix_pty），Windows 無對應替身；Windows 實機傳輸由 P2 L2 f7-binary-roundtrip-md5 承接
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [file_transfer]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_file_transfer.py::test_push_then_pull_roundtrip_md5']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-xfer-pull-roundtrip
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_file_transfer.py::test_pull_roundtrip_md5
+  family: S24
+  title: file pull 自 PTY DUT 取回內容與 md5 一致並寫入本地路徑
+  contract: 'serialwrap file pull --remote <檔> --local <路徑> 回 {ok:true, bytes, md5, local_path}，取回檔與 DUT 端檔案逐位元組相同；未給 local_path 時寫入 daemon cwd 的 basename（EVT-D-S7：本地檔由 daemon 讀寫）。外部 oracle 為 shelltarget 端檔案與取回檔的位元組比對。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 黑箱以 POSIX PTY shelltarget 模擬 DUT（posix_pty），Windows 無對應替身；Windows 實機傳輸由 P2 L2 f7-binary-roundtrip-md5 承接
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [file_transfer]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_file_transfer.py::test_pull_roundtrip_md5']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-xfer-error-shapes
+  suite: rust-l1
+  source_ref: crates/sw-core/tests/file_transfer_engine.rs::push_invalid_ack_mode
+  family: S24
+  title: file transfer 引擎錯誤形狀與 Python 逐字一致且參數錯誤零 TX
+  contract: 'push_file／pull_file 對參數錯誤（ack_mode、chunk_size、console 行長上限、本地檔不存在、echo 不支援）回與 Python 相同的 {ok:false,error_code,…} 且 TX 數為 0（zero_tx_on_reject）；probe、decoder／encoder、chunk、md5、move、pull 解析與 base64 解碼各階段的錯誤碼與欄位逐字一致；MOVE_TIMEOUT／MOVE_FAILED 不 cleanup（EVT-D-F3）；傳輸中 TX 被拒依 OD-62 以 TxRejected 帶出進度，不自動重送。'
+  invariants: [zero_tx_on_reject]
+  layer: L1
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [memory_only]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [file_transfer]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['cargo:sw-core::file_transfer_engine::push_invalid_ack_mode', 'cargo:sw-core::file_transfer_engine::push_budget_zero', 'cargo:sw-core::file_transfer_engine::push_chunk_size_zero_direct_api', 'cargo:sw-core::file_transfer_engine::push_local_missing', 'cargo:sw-core::file_transfer_engine::push_echo_unsupported', 'cargo:sw-core::file_transfer_engine::push_budget_fixed_cmds', 'cargo:sw-core::file_transfer_engine::push_budget_raw_capacity_zero', 'cargo:sw-core::file_transfer_engine::push_probe_timeout', 'cargo:sw-core::file_transfer_engine::push_probe_shell_error', 'cargo:sw-core::file_transfer_engine::push_decoder_missing', 'cargo:sw-core::file_transfer_engine::push_chunk_timeout', 'cargo:sw-core::file_transfer_engine::push_decoder_failed', 'cargo:sw-core::file_transfer_engine::push_md5_unavailable', 'cargo:sw-core::file_transfer_engine::push_md5_mismatch', 'cargo:sw-core::file_transfer_engine::push_move_timeout_no_cleanup', 'cargo:sw-core::file_transfer_engine::push_move_failed_no_cleanup', 'cargo:sw-core::file_transfer_engine::push_bad_prompt_regex', 'cargo:sw-core::file_transfer_engine::pull_probe_timeout', 'cargo:sw-core::file_transfer_engine::pull_probe_shell_error', 'cargo:sw-core::file_transfer_engine::pull_encoder_missing', 'cargo:sw-core::file_transfer_engine::pull_timeout', 'cargo:sw-core::file_transfer_engine::pull_encoder_failed', 'cargo:sw-core::file_transfer_engine::pull_parse_failed', 'cargo:sw-core::file_transfer_engine::pull_b64_non_ascii', 'cargo:sw-core::file_transfer_engine::pull_b64_bad_padding', 'cargo:sw-core::file_transfer_engine::pull_md5_mismatch', 'cargo:sw-core::file_transfer_engine::pull_md5_unavailable', 'cargo:sw-core::file_transfer_engine::pull_local_write_error', 'cargo:sw-core::file_transfer_engine::pull_budget_pull_cmd', 'cargo:sw-core::file_transfer_engine::push_tx_rejected_quiet_first_chunk_gives_rejection_without_cleanup', 'cargo:sw-core::file_transfer_engine::push_tx_rejected_in_chunk_loop_carries_progress', 'cargo:sw-core::file_transfer_engine::pull_tx_rejected_has_no_progress']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-xfer-echo-stall
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_file_transfer.py::test_echo_stall_blackbox
+  family: S24
+  title: file push 的 echo-ACK 停滯只送一次 Ctrl-U 並回 TRANSFER_ECHO_STALL、不重送
+  contract: 'shelltarget 於第 100 個 echo 字元後停止回顯：push 回 {ok:false,error_code:TRANSFER_ECHO_STALL,…}；DUT 端 rx_log 中 \x15\n 恰出現 1 次，已送出的 chunk 不重送（no_auto_resend）。'
+  invariants: [no_auto_resend]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 黑箱以 POSIX PTY shelltarget 模擬 DUT（posix_pty），Windows 無對應替身；Windows 實機傳輸由 P2 L2 f7-binary-roundtrip-md5 承接
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [file_transfer]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_file_transfer.py::test_echo_stall_blackbox']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-xfer-session-gates
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet
+  family: S24
+  title: file.push／file.pull 的 session 閘門與 Python 基線一致且被拒時零 TX
+  contract: 'file.* 經 _resolve_session_id 與 manager gate 的拒絕形狀與 Python 基線一致，每列被拒時 DUT 端零新增 bytes（zero_tx_on_reject）：RECOVERING → SESSION_RECOVERING、FLASHING → FLASHING_BUSY（SC-02）；Quiet／Reconfirm pending → AUTOBOOT_QUIET＋retry_after_s（SC-03；傳輸中途 quiet arm 且被拒的那筆零寫出亦回此碼，push 附 chunks_sent／chunks_total，已部分寫出則為 COMMAND_ABORTED_IN_FLIGHT；原計畫 SC-33 依 OD-79 撤回）；READY_UNCONFIRMED、SESSION_INTERACTIVE_BUSY、SESSION_BUSY；passthrough 任何狀態回 PROFILE_NOT_COMMAND_CAPABLE（SC-35）；RPC 明寫 human:<x> 比照 agent、bare human 依 #240 視為 human（DF-02、OD-74），外部 system 前綴回 SOURCE_RESERVED；傳輸進行中 flash probe 不得授權（SC-14）；human raw lease 下 push 期間按鍵不夾入 chunk 行（no_forbidden_interleave），release 後不回放（no_stale_context_replay）。evidence 由 P8 Task 6 補齊。'
+  invariants: [zero_tx_on_reject, no_forbidden_interleave, no_stale_context_replay]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 黑箱以 POSIX PTY shelltarget 模擬 DUT 並注入 boot banner（posix_pty），Windows 無對應替身
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [file_transfer, quiet_reconfirm, lease]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-02, SC-03, SC-14, DF-02]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-xfer-abort-on-release
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+  family: S24
+  title: file push 進行中 device.release 中止傳輸、依 OD-62 回錯誤碼且不重送
+  contract: 'push 進行中（foreground_busy）送 device.release：release 回 ok、aborted_cmd:true、state RELEASED；push 依 OD-62 比照 BC-03 回非成功——尚未寫出任何 byte 為 FLUSHED_BY_RECOVERY，已寫出至少 1 byte 為 COMMAND_ABORTED_IN_FLIGHT（push 附 chunks_sent／chunks_total），並比照一般命令寫 WAL META command_aborted_in_flight（cmd_id 為該次傳輸前綴 ft-<8hex>，confirmed_tx_bytes 為整段累計）；外部 oracle：同一 chunk 命令不出現兩次（no_auto_resend）、RELEASED 後 DUT 端零新增 bytes（no_stale_context_replay）。'
+  invariants: [no_auto_resend, no_stale_context_replay]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 黑箱以 POSIX PTY shelltarget 模擬 DUT（posix_pty），Windows 無對應替身
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [file_transfer, drain_release]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-04, BC-03]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-xfer-no-retry-side-effect
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_no_retry.py::test_side_effect_methods_not_retried
+  family: S24
+  title: --retries 不重試 file.push／file.pull／device.release／device.attach
+  contract: 'StubDaemon 於收到請求後直接斷線：serialwrap --retries 3 對 file push、file pull、device release、device attach 各只送出 1 筆請求且 exit 非 0（§4.2：有副作用方法絕不重試）；對照組 mcu status 送出 4 筆（唯讀方法在 11 個重試白名單內）。'
+  invariants: [no_auto_resend]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [file_transfer, device_handoff_full]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_no_retry.py::test_side_effect_methods_not_retried']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-flash-silent-unbridged
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_flash_endpoint.py::test_ttymcu_silent_when_unbridged
+  family: S24
+  title: /dev/ttyMCU 未 bridge 時不主動寫出任何 bytes
+  contract: 'passthrough session ATTACHED 後 RUN_DIR/dev/ttyMCU 存在；外部開啟並 setraw 後 2.5 s 內端點零輸出，MCU 線（fakemcu）rx_log 為空（CLAUDE.md MCU 坑 1：支援清單只經 mcu patterns／mcu status 查詢，不經此端點）。'
+  invariants: [zero_tx_on_reject]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: /dev/ttyMCU PTY 端點為 POSIX-only（#84）；Windows 韌體升級改走 device release／attach 交接（s24-ho-windows-com）
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [mcu_flash]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_flash_endpoint.py::test_ttymcu_silent_when_unbridged']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-flash-sync-replay
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_flash_endpoint.py::test_sync_replay_pump_and_holder_gone
+  family: S24
+  title: 認線只轉送 flasher 自己的 sync bytes 並回放 MCU ACK 一次
+  contract: 'flasher 開 ttyMCU 送 55 55：MCU 線恰收到一次 55 55（不另注入 sync、不 double-sync），flasher 讀回 00 cc；session 轉 FLASHING，mcu.status 為 flashing:true、flashing_com:COM0；WAL 的 TX 全為 source=flash（CLAUDE.md MCU 坑 2；no_auto_resend）。'
+  invariants: [no_auto_resend]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: /dev/ttyMCU PTY 端點為 POSIX-only（#84）；Windows 韌體升級改走 device release／attach 交接（s24-ho-windows-com）
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [mcu_flash]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_flash_endpoint.py::test_sync_replay_pump_and_holder_gone']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-flash-holder-gone
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_flash_endpoint.py::test_two_flashes_same_daemon
+  family: S24
+  title: flasher 關閉端點後以 holder-probe 結束 pump 回 ATTACHED，同一 daemon 可連續燒錄
+  contract: 'flasher 寫入封包後關閉端點：holder-probe armed 後持有者歸零才結束 pump，session 回 ATTACHED、mcu.status 回 flashing:false、flashing_com:null、last_detect 為 matched／COM0／ti-cc26xx；同一 daemon 連續兩次 flash 皆能認線並回放 ACK，結束後端點 link 仍在（CLAUDE.md MCU 坑 3）。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: /dev/ttyMCU PTY 端點為 POSIX-only（#84）；Windows 韌體升級改走 device release／attach 交接（s24-ho-windows-com）
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [mcu_flash]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_flash_endpoint.py::test_two_flashes_same_daemon', 'tests/contract_blackbox/test_s24_flash_endpoint.py::test_sync_replay_pump_and_holder_gone']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-flash-baud-mirror
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_flash_endpoint.py::test_baud_mirrored_once_from_flasher
+  family: S24
+  title: flash 開始時鏡射 flasher 的 baud 一次、之後不再跟隨
+  contract: 'flasher 以 57600 開端點並送 sync：MCU 線 speed 變為 B57600；之後 flasher 改 9600 並寫入，MCU 線 speed 仍為 B57600（只在 flash 開始時鏡射一次）。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: /dev/ttyMCU PTY 端點為 POSIX-only（#84）；Windows 韌體升級改走 device release／attach 交接（s24-ho-windows-com）
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [mcu_flash]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_flash_endpoint.py::test_baud_mirrored_once_from_flasher']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-flash-arbitration
+  suite: rust-l1
+  source_ref: crates/sw-core/tests/flash_session_core.rs::probe_then_matched_enters_flashing_and_invalidates_human_input
+  family: S24
+  title: SessionCore FLASHING 仲裁：probe 授權、Matched 失效 human 輸入、FLASHING_BUSY 與 fence
+  contract: 'FlashSyncProbeStart 只在候選態、無前景操作且非 RELEASED／RECOVERING／drain 時授權（SC-14）；FlashSyncMatched 以同一 probe_id 轉 FLASHING 並依 BC-02 失效 human 輸入（input_epoch 遞增）；未匹配只解除同一 probe；FLASHING 期間 submit／interactive／release 回 FLASHING_BUSY（SC-02），非 Flash／FlashProbe class 的 TX 一律 NotSubmitted 且不落 WAL（zero_tx_on_reject）；probe 前排入的 console 輸入於 Matched 後不回放（no_stale_context_replay）。'
+  invariants: [zero_tx_on_reject, no_stale_context_replay]
+  layer: L1
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [memory_only]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [mcu_flash, deferred_buffer]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-02, SC-14, BC-02]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['cargo:sw-core::flash_session_core::probe_then_matched_enters_flashing_and_invalidates_human_input', 'cargo:sw-core::flash_session_core::probe_rejected_when_foreground_busy_sc14', 'cargo:sw-core::flash_session_core::unmatched_release_only_clears_same_probe']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-flash-ioerror-recovering
+  suite: rust-l1
+  source_ref: crates/sw-core/tests/flash_session_core.rs::io_error_during_flashing_drains_to_recovering
+  family: S24
+  title: Probe／FLASHING 期間 UART I/O 錯誤進 drain 轉 RECOVERING、by-id 消失延後 reconcile（SC-32）
+  contract: 'SC-32（Rust-only）：Probe／FLASHING 期間 UartIoError 進 Phase 1 drain 並轉 RECOVERING，handoff 回條前不重開 UART（no_reopen_before_handoff）；DeviceDetached 延後到 exit flashing 後再 reconcile（等價 Python 於 flash busy 時略過 _handle_bridge_down／_detach_by_id）；所有 flash 結束路徑無條件清 Fence.flash_mode 與 OwnershipState.flash_mode。'
+  invariants: [no_reopen_before_handoff]
+  layer: L1
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [memory_only]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [mcu_flash, recovery_min]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-32]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['cargo:sw-core::flash_session_core::io_error_during_flashing_drains_to_recovering', 'cargo:sw-core::flash_session_core::device_detached_during_flashing_is_deferred']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-mcu-rpc-shapes
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_mcu_rpc.py::test_patterns_exact_bytes
+  family: S24
+  title: mcu.patterns／mcu.status RPC 回應形狀與 Python 一致
+  contract: 'mcu.patterns 回 {ok:true,patterns:[{family:ti-cc26xx,probe:"55 55",expect:"00 cc",baud:115200}]}；mcu.status 回 {ok:true,candidates,flashing,flashing_com,last_detect}：candidates 依 session 順序取非 command_capable 且 READY／ATTACHED 者，real_path 查無為 null；probe 期間 flashing 即為 true（MCU-STATUS-01，KEEP）；無 flash 端點的平台 flashing:false、last_detect:null。兩方法皆在 --retries 唯讀白名單。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [mcu_flash]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_mcu_rpc.py::test_patterns_exact_bytes', 'tests/contract_blackbox/test_s24_mcu_rpc.py::test_status_idle_no_sessions']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-ho-ext-tool
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits
+  family: S24
+  title: release 後外部工具持有 tty 時 attach 回 DEVICE_STILL_HELD，工具退出後才可收回
+  contract: 'device.release 回條後外部工具（ExternalHolder）開啟該 tty：device.attach 回 DEVICE_STILL_HELD{pids,holder_unknown}、不清除 released 保護且零 TX（SC-05、BC-04）；工具退出後 attach 成功並恢復；以 HolderSampler 連續取樣證明 daemon 與外部工具從未同時持有（no_reopen_before_handoff）。'
+  invariants: [no_reopen_before_handoff]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 外部 holder 與連續取樣依 POSIX PTY（TIOCEXCL／flock、/proc 掃描）；Windows 交接由 s24-ho-windows-com 承接
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [device_handoff_full]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-05, BC-04]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-ho-second-daemon
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns
+  family: S24
+  title: 第二個 daemon 接手已 release 的裝置後歸還，原 daemon 再收回
+  contract: 'daemon A release 後，拋棄式 daemon B 取得同一裝置；B 持有期間 A 的 device.attach 回 DEVICE_STILL_HELD（SC-05）；B 停止後 A attach 成功；連續取樣證明兩個 daemon 從未同時持有該 tty（no_reopen_before_handoff）。'
+  invariants: [no_reopen_before_handoff]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 外部 holder 與連續取樣依 POSIX PTY（TIOCEXCL／flock、/proc 掃描）；Windows 交接由 s24-ho-windows-com 承接
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [device_handoff_full]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-05]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-ho-persist-restart
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_device_handoff.py::test_released_survives_two_restarts_and_replug
+  family: S24
+  title: RELEASED 跨兩次 daemon 重啟與裝置重新插拔仍保留
+  contract: '動態 session release 後 daemon 重啟兩次、裝置 unplug／replug：session 維持 RELEASED、不自動 attach（DF-04），只有明確 device attach 才收回。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 黑箱以 POSIX PTY shelltarget 與 by-id symlink 模擬插拔（posix_pty），Windows 無對應替身
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [device_handoff_full, state_persistence]
+  necessity: required
+  issues: []
+  behavior_changes: [DF-04]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_device_handoff.py::test_released_survives_two_restarts_and_replug']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-ho-windows-com
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown
+  family: S24
+  title: Windows 上 release 後外部程式獨占開 COM 時 attach 回 DEVICE_STILL_HELD（holder_unknown）
+  contract: 'SW_TEST_COM_PAIR 的 COM 經 device release 後，外部程式以 dwShareMode=0 開啟：device.attach 回 DEVICE_STILL_HELD、pids:[]、holder_unknown:true（不可視為可收回，BC-04）；外部關閉後 attach 成功。需原生 Windows COM（windows_com），WSL／記憶體替身不得計為此案例證據。'
+  invariants: [no_reopen_before_handoff]
+  layer: L1.5
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [windows_com, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [device_handoff_full]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-04]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-sup-systemd-runtime
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+  family: S24
+  title: systemd 監管下有序停止、on-failure 重啟保留 RELEASED 與 WAL seq
+  contract: 'transient systemd --user unit 監管 daemon：systemctl stop 走有序停止（SC-11）、ExecStopPost 為 exited:0、tty 無殘留 holder、socket 移除、WAL 最後一筆 CRC 正確；FLASHING 或 file push 進行中停止時 ttyMCU link 移除、已收到的 chunk 行都有對應 WAL TX，重啟後 DUT 端零新增（no_auto_resend）；SIGKILL 後 Restart=on-failure 拉起，session 維持 RELEASED、WAL seq 不倒退。'
+  invariants: [no_auto_resend]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: systemd 監管為 Linux-only；Windows 監管由 s24-sup-wintask-runtime 承接
+  capabilities: [supervisor_runtime, posix_pty]
+  cli_stage: 1B
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [supervision, file_transfer, mcu_flash]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-11]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown', 'tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-sup-wintask-runtime
+  suite: rust-l1
+  source_ref: crates/sw-pal/tests/wintask_runtime.rs::cap_supervisor_runtime__task_pt0s_restart_and_graceful_stop
+  family: S24
+  title: windows-task 監管 Rust daemon：PT0S、崩潰後 service start 恢復與有序停止
+  contract: 'windows-task 排程工作（SC-24）安裝後 XML 為 ExecutionTimeLimit=PT0S、MultipleInstancesPolicy=IgnoreNew、RestartOnFailure PT1M／999；依 OD-83，0.5.0 強制終止 daemon 後 90 s 內不得自動重新拉起，排程工作狀態不是 Running（Task Scheduler 將 action exit 1 記為完成）；正式 service start（/Run）須在 20 s 內恢復新 pid，並重新驗證三道 COM 隔離防線；service stop 經 P4 graceful_stop 正常結束時不執行 /End，停止後 WAL 最後一筆完整。已知限制：0.5.0 不提供崩潰自動重啟，長期須對齊 Linux；需擁有者 Windows host 授權（SW_TEST_ALLOW_SCHTASKS=1）執行，cap:supervisor_runtime。'
+  invariants: []
+  layer: L1.5
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [supervisor_runtime]
+  cli_stage: 1B
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [supervision]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-24]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['cargo:sw-pal::wintask_runtime::cap_supervisor_runtime__task_pt0s_restart_and_graceful_stop']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-upd-guards
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_refuses_while_push
+  family: S24
+  title: 更新／回滾守衛在 file push、flash 或 interactive 進行中拒絕且 --force 不覆寫
+  contract: 'Rust daemon 有 file push、FLASHING 或 interactive lease 進行中時，setup --rollback（含 --force）於交接安全檢查回 SESSION_BUSY／FLASHING_BUSY 並拒絕，--force 只記 force_ignored:true（SC-23）；push 完整完成、daemon pid 不變、監管未收到停止；以連續取樣證明新舊版本從未同時持有 UART（no_reopen_before_handoff）。'
+  invariants: [no_reopen_before_handoff]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 黑箱以 POSIX PTY shelltarget／fakemcu 製造忙碌狀態（posix_pty），Windows 無對應替身
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [supervision, file_transfer, mcu_flash, lease]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-23]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_refuses_while_push', 'tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_refuses_while_flashing', 'tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_force_refuses_while_push', 'tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_force_refuses_while_flashing', 'tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_refuses_while_interactive_send']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-upd-rollback-cross-stage
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_cross_stage_state_compat_released
+  family: S24
+  title: Rust 與 Stage 1 artifact 之間回滾時 RELEASED 狀態相容且 UART 不被雙方同時持有
+  contract: 'Rust daemon 與 Stage 1 Python artifact 之間 setup --rollback：state.json 的 RELEASED 雙向相容、回滾後仍為 RELEASED；READY session 回滾全程以連續取樣證明新舊 daemon 從未同時持有 UART（no_reopen_before_handoff），停止只經 daemon.handoff_stop 交接（SC-23）。'
+  invariants: [no_reopen_before_handoff]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 黑箱以 POSIX PTY shelltarget 與 /proc holder 取樣（posix_pty），Windows 無對應替身
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [supervision, device_handoff_full]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-23]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_cross_stage_state_compat_released', 'tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_cross_stage_ready_never_double_held']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-contract-coverage
+  suite: rust-l1
+  source_ref: tests/test_rust_contract_coverage.py::test_skipped_and_teardown_error_never_count
+  family: S24
+  title: 全部凍結契約的最終覆蓋判定不以 SKIP、證據不足或不完整執行計為通過
+  contract: 'scripts/rust/contract_coverage.py 對 error_code／last_error／rpc_method／cli_cmd／bc／schema／case 各 ID 逐平台判定：skipped、xfailed、setup／teardown error 不算 PASS；每個對應 nodeid 都須恰一列 call passed；未跑完、exit 非 0、重複列或未收集的結果不得滿足任何 ID；身分（artifact／cases／lock 雜湊）不一致即拒絕；需實機或原生 Windows 能力者只能列 blocked_owner，不得計入 covered（insufficient_evidence_not_pass）。'
+  invariants: [insufficient_evidence_not_pass]
+  layer: L1
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [memory_only]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/test_rust_contract_coverage.py::test_skipped_and_teardown_error_never_count', 'tests/test_rust_contract_coverage.py::test_blocked_owner_cases_are_reported_not_covered', 'tests/test_rust_contract_coverage.py::test_all_mapped_nodeids_required_not_any', 'tests/test_rust_contract_coverage.py::test_incomplete_run_cannot_satisfy', 'tests/test_rust_contract_coverage.py::test_duplicate_result_rows_not_best_of', 'tests/test_rust_contract_coverage.py::test_mapped_nodeid_not_collected_is_missing', 'tests/test_rust_contract_coverage.py::test_identity_mismatch_rejected']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+# --- P8 DF-27 登入後命令逾時重探黑箱案例（OD-81；add-only；conditional 不改變切片凍結分母） ---
+- case_id: df27-python-post-login-timeout-stays-detached
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_latency_noise.py::test_df27_python_post_login_timeout_stays_detached
+  family: L15
+  title: 'DF-27（OD-81）：Python 基線 POST_LOGIN_CMD_TIMEOUT 後維持 DETACHED 且不自動重探'
+  contract: 'OD-81／DF-27：Python 基線在 post_login_cmd 逾時後 session 轉入 DETACHED，在 40 秒觀察窗內維持 DETACHED、last_error POST_LOGIN_CMD_TIMEOUT 不變，且無新增重探 TX；期間被拒請求零 TX。'
+  invariants: [zero_tx_on_reject]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [login_full]
+  necessity: conditional
+  issues: []
+  behavior_changes: [DF-27]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_latency_noise.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+- case_id: df27-rust-post-login-timeout-reprobes-ready
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_p7_latency_noise.py::test_df27_rust_post_login_timeout_reprobes_ready
+  family: L15
+  title: 'DF-27（OD-81）：Rust 重構 POST_LOGIN_CMD_TIMEOUT 後依退避規則自動重探回到 READY'
+  contract: 'OD-81／DF-27：Rust daemon 在 post_login_cmd 逾時後將 POST_LOGIN_CMD_TIMEOUT 視為可重探錯誤，依既有退避間隔自動重新探測並成功推進至 READY、清除錯誤碼並完成 nonce 確認；期間被拒請求零 TX。'
+  invariants: [zero_tx_on_reject]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 'POSIX PTY FakeTarget 黑箱；Windows 原生登入／quiet／事件證據由 08 Task 19 cap_windows_com__p7_* 承接（B-06）'
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [login_full]
+  necessity: conditional
+  issues: []
+  behavior_changes: [DF-27]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/test_p7_latency_noise.py]
+  implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+# --- P8 DF-25 interactive cancel 存活 lease 黑箱案例（OD-77 B1；add-only；conditional 不改變切片凍結分母） ---
+- case_id: df25-interactive-cancel-preserves-lease
+  suite: contract-blackbox
+  source_ref: crates/sw-daemon/tests/dispatch.rs::df25_interactive_cancel_preserves_lease
+  family: L15
+  title: 'DF-25（OD-77 B1）：interactive 命令 TX 完成後的取消不撤銷存活 lease，後續 send 正常送達'
+  contract: 'OD-77 B1／DF-25：interactive 命令 TX 完整交 OS 並落 TX WAL、執行器返回前經 RPC 取消，只撤銷原命令前景 grant 的 op，存活 lease 不被撤銷，同一 lease 後續 interactive_send 皆 ok 送達且不回 SESSION_BUSY；取消本身的 status 為 canceled、回應與紀錄不被收尾或後續 send 覆寫。對照 Python test_s1m_b1_interactive_cancel.py。'
+  invariants: [zero_tx_on_reject]
+  layer: L1
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [memory_only]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [lease]
+  necessity: conditional
+  issues: []
+  behavior_changes: [DF-25]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [crates/sw-daemon/tests/dispatch.rs]
+  implemented_by: 07-slice22-console.md
   cross_slice_reason: null

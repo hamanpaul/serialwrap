@@ -17,6 +17,15 @@ test-fakes = []
 name = "serialwrap"
 path = "src/main.rs"
 
+# P8 Task 13：windows-task 實跑測試（sw-pal `wintask_runtime.rs`）以獨立行程執行正式 `service stop` 的 harness。
+# 只在 `--features test-fakes` 建置；正式 release／bundle 不含此執行檔。
+[[bin]]
+name = "wintask_stop_harness"
+path = "src/test_support/wintask_stop_harness.rs"
+test = false
+bench = false
+required-features = ["test-fakes"]
+
 [dependencies]
 sw-proto = { path = "../sw-proto" }
 sw-pal = { path = "../sw-pal" }
@@ -29,3 +38,9 @@ indexmap = { workspace = true }
 # 凍結的 `cargo test --workspace` 以行程內 override 編譯委派整合測試；正式 release 不含那些字串。
 sw-pal = { path = "../sw-pal", features = ["test-fakes"] }
 tempfile = { workspace = true }
+
+# P8 Task 13：正式停止路徑 harness 的 memory_only 測試（`sw_cli::wintask_harness` 只在 test-fakes 建置）。
+[[test]]
+name = "wintask_scoped_stop"
+path = "tests/wintask_scoped_stop.rs"
+required-features = ["test-fakes"]

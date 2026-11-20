@@ -6,6 +6,9 @@ use crate::pyjson::PyInt;
 use crate::pypath::{self, HomeLookup, PathFlavor};
 use std::collections::BTreeMap;
 
+// 以 NUL 結尾保留二進位中的環境變數 token 邊界，供 release bundle 逐名掃描。
+const TEST_SYSTEM_CONFIG_PATH_OVERRIDE: &std::ffi::CStr = c"SERIALWRAP_TEST_SYSTEM_CONFIG_PATH";
+
 /// 凍結的環境變數快照。
 ///
 /// 鍵大小寫由建構方式決定（sw-proto 不依平台分支，平台語意由呼叫端選擇）：
@@ -135,6 +138,11 @@ pub struct RuntimePaths {
     pub log_dir: String,
     /// `os.path.join(CONFIG_DIR, "config.yaml")`。
     pub config_yaml: String,
+    /// Python `SYSTEM_CONFIG_PATH`；`SERIALWRAP_TEST_SYSTEM_CONFIG_PATH` 存在時原樣採用，含空字串。
+    pub system_config_path: String,
+    /// `TTYMCU_PATH`＝`_env_path("SERIALWRAP_TTYMCU_PATH", os.path.join(RUN_DIR, "dev", "ttyMCU"))`（P8 Task 10；
+    /// Windows flavor 亦產生值但 daemon 不使用——`caps.flash_endpoint=false` 時不建端點）。
+    pub ttymcu_path: String,
 }
 
 /// 路徑解析錯誤。
@@ -278,6 +286,29 @@ impl RuntimePaths {
             &pypath::join(f, &user_home, &["b-log"]),
         );
         let config_yaml = pypath::join(f, &config_dir, &["config.yaml"]);
+        let system_config_path = match env.get(
+            TEST_SYSTEM_CONFIG_PATH_OVERRIDE
+                .to_str()
+                .expect("C 字串常值必為有效 UTF-8"),
+        ) {
+            Some(path) => path.to_string(),
+            None => match f {
+                PathFlavor::Posix => "/etc/serialwrap/config.yaml".to_string(),
+                PathFlavor::Windows => pypath::join(
+                    f,
+                    env.get("ProgramData").unwrap_or(r"C:\ProgramData"),
+                    &["serialwrap", "config.yaml"],
+                ),
+            },
+        };
+        // constants.py：`TTYMCU_PATH = _env_path("SERIALWRAP_TTYMCU_PATH", os.path.join(RUN_DIR, "dev", "ttyMCU"))`。
+        let ttymcu_path = env_path(
+            env,
+            f,
+            home,
+            "SERIALWRAP_TTYMCU_PATH",
+            &pypath::join(f, &run_dir, &["dev", "ttyMCU"]),
+        );
 
         Ok(RuntimePaths {
             config_dir,
@@ -292,6 +323,8 @@ impl RuntimePaths {
             wal_dir,
             log_dir,
             config_yaml,
+            system_config_path,
+            ttymcu_path,
         })
     }
 }
@@ -336,12 +369,12 @@ pub fn benches_yaml_path(
 ///
 /// 1. `$SERIALWRAP_CONFIG` strip 後非空 → `expanduser` 後原樣回傳（即使檔案不存在）；
 /// 2. `CONFIG_DIR/config.yaml` 存在 → 它；
-/// 3. `<system_config_dir>/config.yaml` 存在 → 它；
+/// 3. `SYSTEM_CONFIG_PATH` 存在 → 它；
 /// 4. 否則 `CONFIG_DIR/config.yaml`。
 pub fn resolve_config_path(
     env: &EnvSnapshot,
     paths: &RuntimePaths,
-    system_config_dir: &str,
+    system_config_path: &str,
     f: PathFlavor,
     home: &dyn HomeLookup,
     exists: &dyn Fn(&str) -> bool,
@@ -354,9 +387,126 @@ pub fn resolve_config_path(
     if exists(&paths.config_yaml) {
         return paths.config_yaml.clone();
     }
-    let system_yaml = pypath::join(f, system_config_dir, &["config.yaml"]);
-    if exists(&system_yaml) {
-        return system_yaml;
+    if exists(system_config_path) {
+        return system_config_path.to_string();
     }
     paths.config_yaml.clone()
+}
+
+/// daemon 目錄集合（Task 0c；依 `EnvSnapshot` 解析，arch §3.x／規格 §3.2）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DaemonDirs {
+    pub by_id_dir: String,
+    pub by_path_dir: String,
+    pub events_dir: String,
+    pub events_runtime_dir: String,
+    /// `SERIALWRAP_EVENTS_LOG_PATH`（預設 `<events_runtime_dir>/events.ndjson`；P7 Task 13，parity #5）。
+    pub events_log_path: String,
+}
+
+/// 解析 daemon 目錄（Task 0c）。
+pub fn resolve_daemon_dirs(env: &EnvSnapshot) -> DaemonDirs {
+    let flavor = if std::path::MAIN_SEPARATOR == '\\' {
+        PathFlavor::Windows
+    } else {
+        PathFlavor::Posix
+    };
+    resolve_daemon_dirs_for_flavor(env, flavor)
+}
+
+fn resolve_daemon_dirs_for_flavor(env: &EnvSnapshot, flavor: PathFlavor) -> DaemonDirs {
+    let home = daemon_home(env, flavor);
+    let home_root = home.as_deref().unwrap_or("~");
+    let state_home_default = pypath::join(flavor, home_root, &[".local", "state"]);
+    let state_home = env
+        .get("XDG_STATE_HOME")
+        .filter(|path| !py_strip(path).is_empty())
+        .unwrap_or(&state_home_default);
+    let state_default = pypath::join(flavor, state_home, &["serialwrap"]);
+    let state_dir = daemon_env_path(env, "SERIALWRAP_STATE_DIR", &state_default, flavor);
+    let events_default = pypath::join(flavor, home_root, &[".serialwrap", "events.d"]);
+    let events_dir = daemon_env_path(env, "SERIALWRAP_EVENTS_DIR", &events_default, flavor);
+    let events_runtime_default = pypath::join(flavor, &state_dir, &["events"]);
+    let events_runtime_dir = daemon_env_path(
+        env,
+        "SERIALWRAP_EVENTS_RUNTIME_DIR",
+        &events_runtime_default,
+        flavor,
+    );
+    let events_log_default = pypath::join(flavor, &events_runtime_dir, &["events.ndjson"]);
+    let events_log_path = daemon_env_path(
+        env,
+        "SERIALWRAP_EVENTS_LOG_PATH",
+        &events_log_default,
+        flavor,
+    );
+    DaemonDirs {
+        by_id_dir: daemon_env_path(env, "SERIALWRAP_BY_ID_DIR", "/dev/serial/by-id", flavor),
+        by_path_dir: daemon_env_path(env, "SERIALWRAP_BY_PATH_DIR", "/dev/serial/by-path", flavor),
+        events_dir,
+        events_runtime_dir,
+        events_log_path,
+    }
+}
+
+struct NoDaemonHome;
+
+impl HomeLookup for NoDaemonHome {
+    fn current_user_home(&self) -> Option<String> {
+        None
+    }
+
+    fn user_home(&self, _user: &str) -> Option<String> {
+        None
+    }
+}
+
+fn daemon_home(env: &EnvSnapshot, flavor: PathFlavor) -> Option<String> {
+    let home = pypath::expanduser(flavor, "~", env, &NoDaemonHome);
+    (home != "~").then_some(home)
+}
+
+fn daemon_env_path(env: &EnvSnapshot, key: &str, default: &str, flavor: PathFlavor) -> String {
+    let value = env
+        .get(key)
+        .filter(|value| !py_strip(value).is_empty())
+        .unwrap_or(default);
+    pypath::expanduser(flavor, value, env, &NoDaemonHome)
+}
+
+#[cfg(test)]
+mod daemon_dirs_tests {
+    use super::*;
+
+    #[test]
+    fn daemon_dirs_windows_home_matches_ntpath_precedence() {
+        let env = EnvSnapshot::from_pairs_fold_upper([
+            ("HOME".into(), r"C:\other".into()),
+            ("USERPROFILE".into(), r"C:\Users\p".into()),
+            ("HOMEDRIVE".into(), "D:".into()),
+            ("HOMEPATH".into(), r"\u\me".into()),
+            ("XDG_STATE_HOME".into(), "~/state-root".into()),
+            ("SERIALWRAP_BY_ID_DIR".into(), "~/serial".into()),
+        ]);
+        let dirs = resolve_daemon_dirs_for_flavor(&env, PathFlavor::Windows);
+        assert_eq!(dirs.by_id_dir, r"C:\Users\p/serial");
+        assert_eq!(dirs.events_dir, r"C:\Users\p\.serialwrap\events.d");
+        assert_eq!(
+            dirs.events_runtime_dir,
+            r"C:\Users\p/state-root\serialwrap\events"
+        );
+
+        let fallback = EnvSnapshot::from_pairs_fold_upper([
+            ("HOME".into(), r"C:\ignored".into()),
+            ("HOMEDRIVE".into(), "D:".into()),
+            ("HOMEPATH".into(), r"\u\me".into()),
+        ]);
+        let dirs = resolve_daemon_dirs_for_flavor(&fallback, PathFlavor::Windows);
+        assert_eq!(dirs.events_dir, r"D:\u\me\.serialwrap\events.d");
+
+        let no_home = EnvSnapshot::from_pairs_fold_upper([]);
+        let dirs = resolve_daemon_dirs_for_flavor(&no_home, PathFlavor::Windows);
+        assert_eq!(dirs.events_dir, r"~\.serialwrap\events.d");
+        assert_eq!(dirs.events_runtime_dir, r"~\.local\state\serialwrap\events");
+    }
 }

@@ -6,6 +6,7 @@ stdlib-only，不得 import sw_core／serialwrap／serialwrapd。
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -98,6 +99,25 @@ def cli_prefix() -> list[str]:
     return [cli]
 
 
+def rust_daemon_code_fingerprint() -> str:
+    """讀取受測 Rust CLI 所屬候選 bundle 的 daemon digest，不接受格式推測或 Python digest。"""
+    prefix = cli_prefix()
+    if len(prefix) != 1:
+        raise AssertionError(f"Rust 候選 CLI 必須是單一執行檔：{prefix!r}")
+    executable = Path(prefix[0]).resolve(strict=True)
+    manifest = executable.parent.parent / "release-manifest.json"
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AssertionError(f"受測 Rust bundle manifest 不可讀：{manifest}: {exc}") from exc
+    daemon = data.get("components", {}).get("daemon", {}) if isinstance(data, dict) else {}
+    fingerprint = daemon.get("code_fingerprint") if isinstance(daemon, dict) else None
+    if not isinstance(fingerprint, str) or len(fingerprint) != 12 \
+            or any(char not in "0123456789abcdef" for char in fingerprint):
+        raise AssertionError(f"受測 Rust bundle 缺少有效 daemon.code_fingerprint：{manifest}")
+    return fingerprint
+
+
 def daemon_prefix() -> list[str]:
     d = ab_env().get("SERIALWRAP_DAEMON_EXE")
     if d:
@@ -115,6 +135,9 @@ def isolated_env(tmp: Path, **overrides: str | None) -> dict[str, str]:
     for k in list(e.keys()):
         if k.startswith("SERIALWRAP_"):
             del e[k]
+    # SC-28（P6 Task 0，07 D-11）：console backend 選擇 env 明列於刪除清單，前綴規則日後若放寬仍不得穿透
+    for k in ("SERIALWRAP_CONSOLE_BACKEND",):
+        e.pop(k, None)
 
     # 設置 9 個目錄變數
     dirs = {

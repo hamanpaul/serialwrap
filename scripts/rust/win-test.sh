@@ -57,25 +57,6 @@ else
   unset CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER || true
 fi
 
-if [[ "$is_wsl" == "1" && " ${PACKAGES[*]} " == *" sw-daemon "* ]]; then
-  daemon_exe="$ROOT/target/x86_64-pc-windows-gnu/debug/serialwrapd.exe"
-  if [[ -n "${SW_WIN_EXTRA_FILES:-}" ]]; then
-    export SW_WIN_EXTRA_FILES="$SW_WIN_EXTRA_FILES:$daemon_exe"
-  else
-    export SW_WIN_EXTRA_FILES="$daemon_exe"
-  fi
-fi
-
-collector_args=(--platform windows)
-if [[ "$is_wsl" == "1" ]]; then
-  collector_args+=(--runner "$RUNNER")
-fi
-for cap in "${CAPS[@]}"; do
-  [[ -n "$cap" ]] && collector_args+=(--caps "$cap")
-done
-collector_args+=("${PACKAGES[@]}")
-collector_args+=("${CARGO_ARGS[@]}")
-
 if [[ "$DRY_RUN" == "1" ]]; then
   printf 'L1 set: %s\n' "$L1_SET"
   if [[ "$is_wsl" == "1" ]]; then
@@ -92,6 +73,68 @@ if [[ "$DRY_RUN" == "1" ]]; then
   printf '\n'
   exit 0
 fi
+
+if [[ "$is_wsl" == "1" && " ${PACKAGES[*]} " == *" sw-daemon "* ]]; then
+  daemon_exe="$ROOT/target/x86_64-pc-windows-gnu/debug/serialwrapd.exe"
+  if [[ -n "${SW_WIN_EXTRA_FILES:-}" ]]; then
+    export SW_WIN_EXTRA_FILES="$SW_WIN_EXTRA_FILES:$daemon_exe"
+  else
+    export SW_WIN_EXTRA_FILES="$daemon_exe"
+  fi
+
+  # handoff_stop 需由獨立 Windows CLI 子行程驗證正式設定範圍；把兩種 CLI 與 mkbundle 產物
+  # 交給 win-runner 只 staging 到 handoff_stop 測試執行檔，避免每個 daemon target 重複複製 bundle。
+  target_dir="${CARGO_TARGET_DIR:-$ROOT/target}"
+  (cd "$ROOT" && CARGO_TARGET_DIR="$target_dir" cargo build \
+    --package sw-cli --features test-fakes --bin serialwrap \
+    --target x86_64-pc-windows-gnu)
+  feature_cli="$target_dir/x86_64-pc-windows-gnu/debug/serialwrap.exe"
+  no_fakes_target="$ROOT/target/s2-par/gpz/i22/win-no-fakes-target"
+  (cd "$ROOT" && CARGO_TARGET_DIR="$no_fakes_target" cargo build \
+    --package sw-cli --no-default-features --bin serialwrap \
+    --target x86_64-pc-windows-gnu)
+  no_fakes_cli="$no_fakes_target/x86_64-pc-windows-gnu/debug/serialwrap.exe"
+  no_fakes_staged="$ROOT/target/s2-par/gpz/i22/serialwrap-no-fakes.exe"
+  mkdir -p "$(dirname "$no_fakes_staged")"
+  cp -- "$no_fakes_cli" "$no_fakes_staged"
+  bundle="$ROOT/target/s2-par/gpz/prereqs/bundle"
+  base_bundle="$ROOT/target/s2-par/gpz/prereqs/base-bundle"
+  for source in "$feature_cli" "$no_fakes_staged" "$bundle" "$base_bundle"; do
+    if [[ ! -e "$source" ]]; then
+      echo "win-test.sh: handoff_stop staging 項目不存在：$source" >&2
+      exit 2
+    fi
+  done
+  export SW_WIN_HANDOFF_FILES="$feature_cli:$no_fakes_staged:$bundle:$base_bundle"
+fi
+
+if [[ "$is_wsl" == "1" && " ${PACKAGES[*]} " == *" sw-pal "* ]]; then
+  needs_test_fakes=0
+  for arg in "${CARGO_ARGS[@]}"; do
+    if [[ "$arg" == *test-fakes* ]]; then
+      needs_test_fakes=1
+      break
+    fi
+  done
+  if [[ "$needs_test_fakes" == "1" ]]; then
+    signal_harness="$ROOT/target/x86_64-pc-windows-gnu/debug/signal_wait_harness.exe"
+    if [[ -n "${SW_WIN_SIGNAL_FILES:-}" ]]; then
+      export SW_WIN_SIGNAL_FILES="$SW_WIN_SIGNAL_FILES:$signal_harness"
+    else
+      export SW_WIN_SIGNAL_FILES="$signal_harness"
+    fi
+  fi
+fi
+
+collector_args=(--platform windows)
+if [[ "$is_wsl" == "1" ]]; then
+  collector_args+=(--runner "$RUNNER")
+fi
+for cap in "${CAPS[@]}"; do
+  [[ -n "$cap" ]] && collector_args+=(--caps "$cap")
+done
+collector_args+=("${PACKAGES[@]}")
+collector_args+=("${CARGO_ARGS[@]}")
 
 cd "$ROOT"
 python3 "$ROOT/scripts/rust/check_cfg_boundary.py"

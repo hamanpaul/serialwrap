@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "cases_revision": "2026-11-03.1",
+  "cases_revision": "2026-11-13.1",
   "sets": {
     "stage0": [
       "brcm-01-login-flow",
@@ -133,6 +133,12 @@
       "bb-session-self-test-reports-live-health",
       "bb-wal-reset-rotates-and-resets-sequence",
       "brcm-01-login-flow",
+      "cap-windows-com--p7-event-fire",
+      "cap-windows-com--p7-login-ready",
+      "cap-windows-com--p7-quiet-banner-zero-tx",
+      "df18-event-replace-overwrite",
+      "df27-python-post-login-timeout-stays-detached",
+      "df27-rust-post-login-timeout-reprobes-ready",
       "ev-01-spawn-handler",
       "f1-cmdid-survives-timeout",
       "f1-near-limit-no-logout",
@@ -187,7 +193,59 @@
       "p1-hp-cycle",
       "p1-rst-bootwindow",
       "p1-rst-recover",
+      "p7-events-handler-no-inherited-fds",
+      "p7-events-handler-timeout-kills-group",
+      "p7-events-redos-rejected-no-re2",
+      "p7-events-rule-crud-and-reload",
+      "p7-events-rule-fire-handler-payload",
+      "p7-events-start-load-order",
+      "p7-invariants-evidence-insufficient-is-not-pass",
+      "p7-invariants-no-auto-resend-after-partial-or-timeout",
+      "p7-invariants-rejected-requests-zero-tx",
+      "p7-invariants-release-during-login-waits-for-handle-close",
+      "p7-latency-noise-control-latency-under-flood-with-events",
+      "p7-latency-noise-login-with-delay-and-noise",
+      "p7-log-capture-capture-skips-foreground",
+      "p7-login-console-unlock-smart4r-like",
+      "p7-login-creds-file-fixed-does-not-auto-probe-until-attach",
+      "p7-login-creds-fixed-then-attach-ready",
+      "p7-login-passthrough-banner-no-quiet-gate",
+      "p7-login-passthrough-others-quiet-ready",
+      "p7-login-passthrough-uboot-quiet-ready-no-login",
+      "p7-login-platform-matrix",
+      "p7-login-unresolved-credentials-terminal-zero-empty-secret-tx",
+      "p7-quiet-reconfirm-attach-during-quiet-zero-tx",
+      "p7-quiet-reconfirm-attached-bootloader-probe-sets-stuck",
+      "p7-quiet-reconfirm-ready-bootloader-tail-terminal-d1",
+      "p7-quiet-reconfirm-spontaneous-reboot-gates-agent",
+      "p7-selftest-recover-recover-force-on-ready-runs-keys-first",
+      "p7-selftest-recover-recover-force-timeout-attached",
+      "p7-selftest-recover-recover-ready-ctrl-c",
+      "p7-selftest-recover-selftest-classifications",
+      "p7-stall-transport-stall-flip",
       "pt-quiet-ready",
+      "s24-contract-coverage",
+      "s24-flash-arbitration",
+      "s24-flash-baud-mirror",
+      "s24-flash-holder-gone",
+      "s24-flash-ioerror-recovering",
+      "s24-flash-silent-unbridged",
+      "s24-flash-sync-replay",
+      "s24-ho-ext-tool",
+      "s24-ho-persist-restart",
+      "s24-ho-second-daemon",
+      "s24-ho-windows-com",
+      "s24-mcu-rpc-shapes",
+      "s24-xfer-abort-on-release",
+      "s24-xfer-echo-stall",
+      "s24-xfer-error-shapes",
+      "s24-xfer-no-retry-side-effect",
+      "s24-xfer-pull-roundtrip",
+      "s24-xfer-push-roundtrip",
+      "s24-xfer-session-gates",
+      "s24-xfer-templates-golden",
+      "sc30-quiet-mid-login-aborts",
+      "sc34-attach-recover-last-error-field",
       "sm-01-attach-to-ready",
       "sm-04-device-unplug",
       "win-com-cancel-close",
@@ -231,9 +289,23 @@
       "bb-session-reaches-ready",
       "bb-session-self-test-reports-live-health",
       "bb-wal-reset-rotates-and-resets-sequence",
+      "bc02-deferred-context-switch-clear",
+      "bc02-deferred-overflow-clear",
+      "bc02-mailbox-stale-input-not-replayed",
+      "bc02-normal-replay-53",
       "brcm-01-login-flow",
+      "cap-windows-com--p7-event-fire",
+      "cap-windows-com--p7-login-ready",
+      "cap-windows-com--p7-quiet-banner-zero-tx",
       "co-01-line-buffering",
+      "co-02-line-backspace",
       "cowork-01-agent-bad-cmd",
+      "df18-event-replace-overwrite",
+      "df20-recover-reboot-stale-interactive-id",
+      "df20-release-reattach-stale-interactive-id",
+      "df25-interactive-cancel-preserves-lease",
+      "df27-python-post-login-timeout-stays-detached",
+      "df27-rust-post-login-timeout-reprobes-ready",
       "ev-01-spawn-handler",
       "f1-cmdid-survives-timeout",
       "f1-limits-queryable",
@@ -330,6 +402,38 @@
       "p1-wal-fullrun",
       "p1-wal-reset",
       "p2-1-mcu-flash-manual",
+      "p7-events-handler-no-inherited-fds",
+      "p7-events-handler-timeout-kills-group",
+      "p7-events-redos-rejected-no-re2",
+      "p7-events-rule-crud-and-reload",
+      "p7-events-rule-fire-handler-payload",
+      "p7-events-start-load-order",
+      "p7-invariants-evidence-insufficient-is-not-pass",
+      "p7-invariants-login-bytes-not-interleaved-with-agent-or-human",
+      "p7-invariants-no-auto-resend-after-partial-or-timeout",
+      "p7-invariants-recovery-and-reboot-do-not-replay-stale-input",
+      "p7-invariants-rejected-requests-zero-tx",
+      "p7-invariants-release-during-login-waits-for-handle-close",
+      "p7-latency-noise-control-latency-under-flood-with-events",
+      "p7-latency-noise-login-with-delay-and-noise",
+      "p7-log-capture-capture-skips-foreground",
+      "p7-login-console-unlock-smart4r-like",
+      "p7-login-creds-file-fixed-does-not-auto-probe-until-attach",
+      "p7-login-creds-fixed-then-attach-ready",
+      "p7-login-passthrough-banner-no-quiet-gate",
+      "p7-login-passthrough-others-quiet-ready",
+      "p7-login-passthrough-uboot-quiet-ready-no-login",
+      "p7-login-platform-matrix",
+      "p7-login-unresolved-credentials-terminal-zero-empty-secret-tx",
+      "p7-quiet-reconfirm-attach-during-quiet-zero-tx",
+      "p7-quiet-reconfirm-attached-bootloader-probe-sets-stuck",
+      "p7-quiet-reconfirm-ready-bootloader-tail-terminal-d1",
+      "p7-quiet-reconfirm-spontaneous-reboot-gates-agent",
+      "p7-selftest-recover-recover-force-on-ready-runs-keys-first",
+      "p7-selftest-recover-recover-force-timeout-attached",
+      "p7-selftest-recover-recover-ready-ctrl-c",
+      "p7-selftest-recover-selftest-classifications",
+      "p7-stall-transport-stall-flip",
       "pt-quiet-ready",
       "rc-01-interactive-mode-switch",
       "rm-live-cycle",
@@ -340,6 +444,38 @@
       "rm-topo-dual-nat",
       "rm-topo-gwports",
       "rm-topo-nat-host",
+      "s24-contract-coverage",
+      "s24-flash-arbitration",
+      "s24-flash-baud-mirror",
+      "s24-flash-holder-gone",
+      "s24-flash-ioerror-recovering",
+      "s24-flash-silent-unbridged",
+      "s24-flash-sync-replay",
+      "s24-ho-ext-tool",
+      "s24-ho-persist-restart",
+      "s24-ho-second-daemon",
+      "s24-ho-windows-com",
+      "s24-mcu-rpc-shapes",
+      "s24-sup-systemd-runtime",
+      "s24-sup-wintask-runtime",
+      "s24-upd-guards",
+      "s24-upd-rollback-cross-stage",
+      "s24-xfer-abort-on-release",
+      "s24-xfer-echo-stall",
+      "s24-xfer-error-shapes",
+      "s24-xfer-no-retry-side-effect",
+      "s24-xfer-pull-roundtrip",
+      "s24-xfer-push-roundtrip",
+      "s24-xfer-session-gates",
+      "s24-xfer-templates-golden",
+      "sc13-lease-expiry-tick",
+      "sc15-console-ring-drop-oldest",
+      "sc16-console-line-reject-log",
+      "sc28-console-backend-env",
+      "sc29-com0com-serial-console",
+      "sc30-quiet-mid-login-aborts",
+      "sc31-console-stale-context-rust",
+      "sc34-attach-recover-last-error-field",
       "sm-01-attach-to-ready",
       "sm-04-device-unplug",
       "win-com-cancel-close",
@@ -351,6 +487,10 @@
       "win-task-logon-trigger",
       "win-task-restart-on-failure",
       "win-task-single-instance",
+      "win-telnet-deferred",
+      "win-telnet-linebuffer",
+      "win-telnet-raw-owner",
+      "win-telnet-suspend-resume",
       "win-wal-av-reader-handle",
       "win-wal-av-rotate",
       "win-wal-av-unlink",
@@ -375,7 +515,6 @@
       "f4-activity-classification",
       "f4-background-result-tail-consistent",
       "ha-05-concurrent-submit",
-      "l15-delayed-reply",
       "l15-exclusive-open",
       "l15-half-prompt",
       "l15-multi-source-contention-cli",
@@ -408,8 +547,11 @@
       "win-wal-f12-progress"
     ],
     "slice_2.2": [
+      "bc02-deferred-context-switch-clear",
+      "bc02-deferred-overflow-clear",
+      "bc02-mailbox-stale-input-not-replayed",
+      "bc02-normal-replay-53",
       "co-01-line-buffering",
-      "cowork-01-agent-bad-cmd",
       "f1-cmdid-survives-timeout",
       "f1-limits-queryable",
       "f1-near-limit-no-logout",
@@ -444,7 +586,6 @@
       "hk-03-deferred-input-flush",
       "hk-04-minicom-exit-cleanup",
       "l15-context-switch-deferred-input",
-      "l15-delayed-reply",
       "l15-exclusive-open",
       "l15-half-prompt",
       "l15-multi-source-contention-cli",
@@ -480,20 +621,38 @@
       "p1-wal-fullrun",
       "p1-wal-reset",
       "rc-01-interactive-mode-switch",
+      "sc13-lease-expiry-tick",
+      "sc15-console-ring-drop-oldest",
+      "sc16-console-line-reject-log",
+      "sc28-console-backend-env",
+      "sc29-com0com-serial-console",
+      "sc31-console-stale-context-rust",
       "sm-01-attach-to-ready",
       "sm-04-device-unplug",
       "win-com-cancel-close",
       "win-com-open-exclusive",
       "win-com-txrx-bridge",
+      "win-telnet-deferred",
+      "win-telnet-linebuffer",
+      "win-telnet-raw-owner",
+      "win-telnet-suspend-resume",
       "win-wal-av-reader-handle",
       "win-wal-av-rotate",
       "win-wal-av-unlink",
       "win-wal-f12-progress"
     ],
     "slice_2.3": [
+      "bc02-deferred-context-switch-clear",
+      "bc02-deferred-overflow-clear",
+      "bc02-mailbox-stale-input-not-replayed",
+      "bc02-normal-replay-53",
       "brcm-01-login-flow",
+      "cap-windows-com--p7-event-fire",
+      "cap-windows-com--p7-login-ready",
+      "cap-windows-com--p7-quiet-banner-zero-tx",
       "co-01-line-buffering",
       "cowork-01-agent-bad-cmd",
+      "df18-event-replace-overwrite",
       "ev-01-spawn-handler",
       "f1-cmdid-survives-timeout",
       "f1-limits-queryable",
@@ -574,6 +733,38 @@
       "p1-rst-recover",
       "p1-wal-fullrun",
       "p1-wal-reset",
+      "p7-events-handler-no-inherited-fds",
+      "p7-events-handler-timeout-kills-group",
+      "p7-events-redos-rejected-no-re2",
+      "p7-events-rule-crud-and-reload",
+      "p7-events-rule-fire-handler-payload",
+      "p7-events-start-load-order",
+      "p7-invariants-evidence-insufficient-is-not-pass",
+      "p7-invariants-login-bytes-not-interleaved-with-agent-or-human",
+      "p7-invariants-no-auto-resend-after-partial-or-timeout",
+      "p7-invariants-recovery-and-reboot-do-not-replay-stale-input",
+      "p7-invariants-rejected-requests-zero-tx",
+      "p7-invariants-release-during-login-waits-for-handle-close",
+      "p7-latency-noise-control-latency-under-flood-with-events",
+      "p7-latency-noise-login-with-delay-and-noise",
+      "p7-log-capture-capture-skips-foreground",
+      "p7-login-console-unlock-smart4r-like",
+      "p7-login-creds-file-fixed-does-not-auto-probe-until-attach",
+      "p7-login-creds-fixed-then-attach-ready",
+      "p7-login-passthrough-banner-no-quiet-gate",
+      "p7-login-passthrough-others-quiet-ready",
+      "p7-login-passthrough-uboot-quiet-ready-no-login",
+      "p7-login-platform-matrix",
+      "p7-login-unresolved-credentials-terminal-zero-empty-secret-tx",
+      "p7-quiet-reconfirm-attach-during-quiet-zero-tx",
+      "p7-quiet-reconfirm-attached-bootloader-probe-sets-stuck",
+      "p7-quiet-reconfirm-ready-bootloader-tail-terminal-d1",
+      "p7-quiet-reconfirm-spontaneous-reboot-gates-agent",
+      "p7-selftest-recover-recover-force-on-ready-runs-keys-first",
+      "p7-selftest-recover-recover-force-timeout-attached",
+      "p7-selftest-recover-recover-ready-ctrl-c",
+      "p7-selftest-recover-selftest-classifications",
+      "p7-stall-transport-stall-flip",
       "pt-quiet-ready",
       "rc-01-interactive-mode-switch",
       "rm-live-cycle",
@@ -584,20 +775,40 @@
       "rm-topo-dual-nat",
       "rm-topo-gwports",
       "rm-topo-nat-host",
+      "sc13-lease-expiry-tick",
+      "sc15-console-ring-drop-oldest",
+      "sc16-console-line-reject-log",
+      "sc28-console-backend-env",
+      "sc29-com0com-serial-console",
+      "sc30-quiet-mid-login-aborts",
+      "sc31-console-stale-context-rust",
+      "sc34-attach-recover-last-error-field",
       "sm-01-attach-to-ready",
       "sm-04-device-unplug",
       "win-com-cancel-close",
       "win-com-open-exclusive",
       "win-com-txrx-bridge",
+      "win-telnet-deferred",
+      "win-telnet-linebuffer",
+      "win-telnet-raw-owner",
+      "win-telnet-suspend-resume",
       "win-wal-av-reader-handle",
       "win-wal-av-rotate",
       "win-wal-av-unlink",
       "win-wal-f12-progress"
     ],
     "slice_2.4": [
+      "bc02-deferred-context-switch-clear",
+      "bc02-deferred-overflow-clear",
+      "bc02-mailbox-stale-input-not-replayed",
+      "bc02-normal-replay-53",
       "brcm-01-login-flow",
+      "cap-windows-com--p7-event-fire",
+      "cap-windows-com--p7-login-ready",
+      "cap-windows-com--p7-quiet-banner-zero-tx",
       "co-01-line-buffering",
       "cowork-01-agent-bad-cmd",
+      "df18-event-replace-overwrite",
       "ev-01-spawn-handler",
       "f1-cmdid-survives-timeout",
       "f1-limits-queryable",
@@ -683,6 +894,38 @@
       "p1-wal-fullrun",
       "p1-wal-reset",
       "p2-1-mcu-flash-manual",
+      "p7-events-handler-no-inherited-fds",
+      "p7-events-handler-timeout-kills-group",
+      "p7-events-redos-rejected-no-re2",
+      "p7-events-rule-crud-and-reload",
+      "p7-events-rule-fire-handler-payload",
+      "p7-events-start-load-order",
+      "p7-invariants-evidence-insufficient-is-not-pass",
+      "p7-invariants-login-bytes-not-interleaved-with-agent-or-human",
+      "p7-invariants-no-auto-resend-after-partial-or-timeout",
+      "p7-invariants-recovery-and-reboot-do-not-replay-stale-input",
+      "p7-invariants-rejected-requests-zero-tx",
+      "p7-invariants-release-during-login-waits-for-handle-close",
+      "p7-latency-noise-control-latency-under-flood-with-events",
+      "p7-latency-noise-login-with-delay-and-noise",
+      "p7-log-capture-capture-skips-foreground",
+      "p7-login-console-unlock-smart4r-like",
+      "p7-login-creds-file-fixed-does-not-auto-probe-until-attach",
+      "p7-login-creds-fixed-then-attach-ready",
+      "p7-login-passthrough-banner-no-quiet-gate",
+      "p7-login-passthrough-others-quiet-ready",
+      "p7-login-passthrough-uboot-quiet-ready-no-login",
+      "p7-login-platform-matrix",
+      "p7-login-unresolved-credentials-terminal-zero-empty-secret-tx",
+      "p7-quiet-reconfirm-attach-during-quiet-zero-tx",
+      "p7-quiet-reconfirm-attached-bootloader-probe-sets-stuck",
+      "p7-quiet-reconfirm-ready-bootloader-tail-terminal-d1",
+      "p7-quiet-reconfirm-spontaneous-reboot-gates-agent",
+      "p7-selftest-recover-recover-force-on-ready-runs-keys-first",
+      "p7-selftest-recover-recover-force-timeout-attached",
+      "p7-selftest-recover-recover-ready-ctrl-c",
+      "p7-selftest-recover-selftest-classifications",
+      "p7-stall-transport-stall-flip",
       "pt-quiet-ready",
       "rc-01-interactive-mode-switch",
       "rm-live-cycle",
@@ -693,6 +936,38 @@
       "rm-topo-dual-nat",
       "rm-topo-gwports",
       "rm-topo-nat-host",
+      "s24-contract-coverage",
+      "s24-flash-arbitration",
+      "s24-flash-baud-mirror",
+      "s24-flash-holder-gone",
+      "s24-flash-ioerror-recovering",
+      "s24-flash-silent-unbridged",
+      "s24-flash-sync-replay",
+      "s24-ho-ext-tool",
+      "s24-ho-persist-restart",
+      "s24-ho-second-daemon",
+      "s24-ho-windows-com",
+      "s24-mcu-rpc-shapes",
+      "s24-sup-systemd-runtime",
+      "s24-sup-wintask-runtime",
+      "s24-upd-guards",
+      "s24-upd-rollback-cross-stage",
+      "s24-xfer-abort-on-release",
+      "s24-xfer-echo-stall",
+      "s24-xfer-error-shapes",
+      "s24-xfer-no-retry-side-effect",
+      "s24-xfer-pull-roundtrip",
+      "s24-xfer-push-roundtrip",
+      "s24-xfer-session-gates",
+      "s24-xfer-templates-golden",
+      "sc13-lease-expiry-tick",
+      "sc15-console-ring-drop-oldest",
+      "sc16-console-line-reject-log",
+      "sc28-console-backend-env",
+      "sc29-com0com-serial-console",
+      "sc30-quiet-mid-login-aborts",
+      "sc31-console-stale-context-rust",
+      "sc34-attach-recover-last-error-field",
       "sm-01-attach-to-ready",
       "sm-04-device-unplug",
       "win-com-cancel-close",
@@ -702,6 +977,10 @@
       "win-task-logon-trigger",
       "win-task-restart-on-failure",
       "win-task-single-instance",
+      "win-telnet-deferred",
+      "win-telnet-linebuffer",
+      "win-telnet-raw-owner",
+      "win-telnet-suspend-resume",
       "win-wal-av-reader-handle",
       "win-wal-av-rotate",
       "win-wal-av-unlink",
@@ -1105,6 +1384,58 @@
       "cli_stage": "1A",
       "stage0_required": false
     },
+    "bc02-deferred-context-switch-clear": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "bc02-deferred-overflow-clear": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "bc02-mailbox-stale-input-not-replayed": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "bc02-normal-replay-53": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
     "brcm-01-login-flow": {
       "suite": "func-test",
       "layer": "L1.5",
@@ -1117,6 +1448,42 @@
       "daemon_slice": "2.3",
       "cli_stage": "1A",
       "stage0_required": true
+    },
+    "cap-windows-com--p7-event-fire": {
+      "suite": "windows-native",
+      "layer": "L1.5",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "cap-windows-com--p7-login-ready": {
+      "suite": "windows-native",
+      "layer": "L1.5",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "cap-windows-com--p7-quiet-banner-zero-tx": {
+      "suite": "windows-native",
+      "layer": "L1.5",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
     },
     "co-01-line-buffering": {
       "suite": "func-test",
@@ -1131,6 +1498,19 @@
       "cli_stage": "1B",
       "stage0_required": true
     },
+    "co-02-line-backspace": {
+      "suite": "func-test",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "conditional",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
     "cowork-01-agent-bad-cmd": {
       "suite": "func-test",
       "layer": "L1.5",
@@ -1140,9 +1520,85 @@
       ],
       "expected": "PASS",
       "necessity": "required",
-      "daemon_slice": "2.2",
+      "daemon_slice": "2.3",
       "cli_stage": "1B",
       "stage0_required": true
+    },
+    "df18-event-replace-overwrite": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "df20-recover-reboot-stale-interactive-id": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "conditional",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "df20-release-reattach-stale-interactive-id": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "conditional",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "df25-interactive-cancel-preserves-lease": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "conditional",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "df27-python-post-login-timeout-stays-detached": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "conditional",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "df27-rust-post-login-timeout-reprobes-ready": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "conditional",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
     },
     "ev-01-spawn-handler": {
       "suite": "func-test",
@@ -1828,7 +2284,7 @@
       ],
       "expected": "PASS",
       "necessity": "required",
-      "daemon_slice": "2.1",
+      "daemon_slice": "2.3",
       "cli_stage": "1A",
       "stage0_required": true
     },
@@ -2390,6 +2846,390 @@
       "cli_stage": "1B",
       "stage0_required": false
     },
+    "p7-events-handler-no-inherited-fds": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-events-handler-timeout-kills-group": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-events-redos-rejected-no-re2": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-events-rule-crud-and-reload": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-events-rule-fire-handler-payload": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-events-start-load-order": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-invariants-evidence-insufficient-is-not-pass": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-invariants-login-bytes-not-interleaved-with-agent-or-human": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "p7-invariants-no-auto-resend-after-partial-or-timeout": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-invariants-recovery-and-reboot-do-not-replay-stale-input": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "p7-invariants-rejected-requests-zero-tx": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-invariants-release-during-login-waits-for-handle-close": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-latency-noise-control-latency-under-flood-with-events": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-latency-noise-login-with-delay-and-noise": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-log-capture-capture-skips-foreground": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-login-console-unlock-smart4r-like": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-login-creds-file-fixed-does-not-auto-probe-until-attach": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-login-creds-fixed-then-attach-ready": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-login-passthrough-banner-no-quiet-gate": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-login-passthrough-others-quiet-ready": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-login-passthrough-uboot-quiet-ready-no-login": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-login-platform-matrix": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-login-unresolved-credentials-terminal-zero-empty-secret-tx": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-quiet-reconfirm-attach-during-quiet-zero-tx": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-quiet-reconfirm-attached-bootloader-probe-sets-stuck": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-quiet-reconfirm-ready-bootloader-tail-terminal-d1": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-quiet-reconfirm-spontaneous-reboot-gates-agent": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-selftest-recover-recover-force-on-ready-runs-keys-first": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-selftest-recover-recover-force-timeout-attached": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-selftest-recover-recover-ready-ctrl-c": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-selftest-recover-selftest-classifications": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "p7-stall-transport-stall-flip": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
     "pt-quiet-ready": {
       "suite": "regression",
       "layer": "L2",
@@ -2518,6 +3358,400 @@
       "necessity": "required",
       "daemon_slice": "2.3",
       "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "s24-contract-coverage": {
+      "suite": "rust-l1",
+      "layer": "L1",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-flash-arbitration": {
+      "suite": "rust-l1",
+      "layer": "L1",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-flash-baud-mirror": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-flash-holder-gone": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-flash-ioerror-recovering": {
+      "suite": "rust-l1",
+      "layer": "L1",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-flash-silent-unbridged": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-flash-sync-replay": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-ho-ext-tool": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-ho-persist-restart": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-ho-second-daemon": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-ho-windows-com": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-mcu-rpc-shapes": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-sup-systemd-runtime": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "s24-sup-wintask-runtime": {
+      "suite": "rust-l1",
+      "layer": "L1.5",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "s24-upd-guards": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "s24-upd-rollback-cross-stage": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "s24-xfer-abort-on-release": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-xfer-echo-stall": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-xfer-error-shapes": {
+      "suite": "rust-l1",
+      "layer": "L1",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-xfer-no-retry-side-effect": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-xfer-pull-roundtrip": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-xfer-push-roundtrip": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-xfer-session-gates": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-xfer-templates-golden": {
+      "suite": "rust-l1",
+      "layer": "L1",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "sc13-lease-expiry-tick": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "sc15-console-ring-drop-oldest": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "sc16-console-line-reject-log": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "sc28-console-backend-env": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "sc29-com0com-serial-console": {
+      "suite": "windows-native",
+      "layer": "L1.5",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "sc30-quiet-mid-login-aborts": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "sc31-console-stale-context-rust": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "sc34-attach-recover-last-error-field": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
       "stage0_required": false
     },
     "sm-01-attach-to-ready": {
@@ -2651,6 +3885,54 @@
       "expected": "PASS",
       "necessity": "required",
       "daemon_slice": "2.4",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "win-telnet-deferred": {
+      "suite": "windows-native",
+      "layer": "L1.5",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "win-telnet-linebuffer": {
+      "suite": "windows-native",
+      "layer": "L1.5",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "win-telnet-raw-owner": {
+      "suite": "windows-native",
+      "layer": "L1.5",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "win-telnet-suspend-resume": {
+      "suite": "windows-native",
+      "layer": "L1.5",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
       "cli_stage": "1B",
       "stage0_required": false
     },

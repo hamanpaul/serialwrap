@@ -1,0 +1,24 @@
+# P7 黑箱（Task 18A）：generic Linux login。${BY_ID}＝FakeTarget by-id symlink；${ENV_FILE}＝帳密檔
+# （SW_P7_USER／SW_P7_PASS），由 bb_p7.p7_profile_dir 代換。對應 FakeTarget 預設（login: → Password: → root@fake:~# ）。
+# ready_probe 省略＝採 config 預設（echo __READY__ 接 nonce 佔位）；代換後檔案不得殘留任何佔位語法。
+profiles:
+  p7-shell:
+    platform: shell
+    prompt_regex: ".*[$#] $"
+    login_regex: "(?mi)^.*login:\\s*$"
+    password_regex: "(?mi)^password:\\s*$"
+    user_env: SW_P7_USER
+    pass_env: SW_P7_PASS
+    env_file: "${ENV_FILE}"
+    timeout_s: 10
+    uart:
+      baud: 115200
+      data_bits: 8
+      parity: N
+      stop_bits: 1
+      flow_control: none
+      xonxoff: false
+targets:
+  - profile: p7-shell
+    com: COM0
+    device_by_id: "${BY_ID}"

@@ -111,7 +111,7 @@
             "code_fingerprint": {
               "type": "string",
               "pattern": "^[0-9a-f]{12}$",
-              "description": "同 bundle 內 Python daemon 的 sw_core 程式碼指紋；舊 manifest 可省略"
+              "description": "12 位小寫十六進位。Stage 1 取同 bundle 內 Python daemon 的 sw_core 程式碼指紋；Stage 2 取 Rust daemon launcher 檔案 SHA-256 的前 12 位（等於 launcher.sha256 的前 12 位）。setup 發現 daemon 指紋不符時會警告，並在受管理的 systemd 模式自動重啟 daemon；舊 manifest 可省略。"
             },
             "state_schema": {
               "type": "string",

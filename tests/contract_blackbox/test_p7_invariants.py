@@ -1,0 +1,473 @@
+"""P7 Task 18（08-slice23-login-events.md）：§11.3 安全不變量黑箱（外部 CLI＋FakeTarget＋/proc 觀測）。
+
+本檔承接：
+- `test_rejected_requests_zero_tx`（§11.3-1）：quiet gate、`CREDENTIALS_UNRESOLVED`、`READY_UNCONFIRMED` 被拒時 target
+  0 byte、WAL 無 TX（READY_UNCONFIRMED 子案經 180 s quiet，為慢案、不得 SKIP）。
+- `test_release_during_login_waits_for_handle_close`（§11.3-4）。
+- `test_no_auto_resend_after_partial_or_timeout`（§11.3-5；SC-30 子案 Rust-only，cases.yaml 平台限定）。
+`test_evidence_insufficient_is_not_pass`（§11.3-6）：以合成 junit 驗證 `scripts/rust/p7_ab_report.py`（`run_p7_ab.sh` 的判定器）
+缺證據時該列 INCOMPLETE、整體結束碼非 0。
+stdlib＋PyYAML＋PTY，不得 import sw_core／serialwrap／serialwrapd。
+"""
+from __future__ import annotations
+
+import base64
+import os
+import threading
+import time
+
+import pytest
+
+from bb_faketarget import FakeTarget
+from bb_harness import is_rust
+from bb_p7 import P7Rig, wait_state
+from p7_login_oracle import assert_login_window, login_window_bounds
+
+pytestmark = [pytest.mark.posix_only, pytest.mark.posix_pty, pytest.mark.process_rpc]
+
+BANNER = "\r\nU-Boot 2024.04 (Jan 01 2024 - 00:00:00 +0000)\r\nHit any key to stop autoboot:  3"
+
+
+def _row(p7, sel: str = "COM0") -> dict:
+    rc, j = p7.cli("session", "list")
+    assert rc == 0 and j, (rc, j)
+    return [x for x in j["sessions"] if x["com"] == sel][0]
+
+
+def _tx_count(p7) -> int:
+    return sum(1 for r in p7.wal_records("COM0", limit=5000) if r.get("dir") == "TX")
+
+
+def _tx_bytes(p7) -> bytes:
+    return b"".join(base64.b64decode(r.get("payload_b64") or "") for r in p7.wal_records("COM0", limit=5000)
+                    if r.get("dir") == "TX")
+
+
+def _daemon_fds_to(p7, path: str) -> int:
+    pid = p7.daemon.proc.pid
+    n = 0
+    try:
+        names = os.listdir(f"/proc/{pid}/fd")
+    except OSError:
+        return 0
+    for name in names:
+        try:
+            if os.readlink(f"/proc/{pid}/fd/{name}") == path:
+                n += 1
+        except OSError:
+            continue
+    return n
+
+
+def _attach_human_vtty(p7, label: str) -> tuple[int, dict]:
+    from bb_daemon import _send_rpc
+    from bb_p7 import SOCKET_ENV
+
+    response = _send_rpc(p7.env[SOCKET_ENV], "session.console_attach", {"selector": "COM0", "label": label})
+    assert response and response.get("ok") is True and response.get("interactive_owner") is True \
+        and response.get("vtty"), response
+    fd = os.open(response["vtty"], os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    return fd, response
+
+
+def _wait_target_rx(tgt, needle: bytes, timeout_s: float = 15.0, *, mark: int = 0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while needle not in tgt.rx_log_since(mark):
+        assert time.monotonic() < deadline, f"FakeTarget 未收到 {needle!r}；目前 {tgt.rx_log_since(mark)!r}"
+        time.sleep(0.01)
+
+
+def _wait_command_done(p7, cmd_id: str, timeout_s: float = 30.0) -> dict:
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while time.monotonic() < deadline:
+        _, status = p7.cli("cmd", "status", "--cmd-id", cmd_id)
+        last = (status or {}).get("command")
+        if isinstance(last, dict) and last.get("done_at"):
+            return last
+        time.sleep(0.1)
+    raise AssertionError(f"命令 {cmd_id} 未於 {timeout_s}s 內完成：{last!r}")
+
+
+def test_login_bytes_not_interleaved_with_agent_or_human(p7, tmp_path):
+    """OD-86：手動 recover 登入窗口禁止 agent TX；human raw bytes 依 Python 允許且不得遺失。"""
+    human = b"HUMAN_DURING_LOGIN_P7\n"
+    tgt = FakeTarget(
+        tmp_path / "t0",
+        delay_ms=1000,
+        login_steps=[
+            {"expect": "", "respond": "\r\nfake login: "},
+            {"expect": "root", "respond": "\r\nPassword: "},
+            {"expect": "pw", "respond": "\r\nroot@fake:~# "},
+        ],
+    )
+    p7.start("shell_unresolved", [tgt])
+    wait_state(p7.env, "COM0", "ATTACHED", timeout_s=30.0)
+    deadline = time.monotonic() + 15.0
+    while _row(p7).get("last_error") != "CREDENTIALS_UNRESOLVED":
+        assert time.monotonic() < deadline, _row(p7)
+        time.sleep(0.1)
+    console_fd, _ = _attach_human_vtty(p7, "s23-login-window")
+    try:
+        env_file = p7.tmp / "p7.env.unresolved"
+        env_file.write_text("SW_P7_USER=root\nSW_P7_PASS=pw\n", encoding="utf-8")
+        before = p7.wal_records("COM0", limit=5000)
+        after_seq = max((int(row.get("seq") or 0) for row in before), default=0)
+        rx_mark = tgt.rx_mark()
+        result: dict = {}
+
+        def recover() -> None:
+            result["response"] = p7.cli("session", "recover", "--selector", "COM0", timeout_s=60.0)
+
+        worker = threading.Thread(target=recover, daemon=True)
+        worker.start()
+        _wait_target_rx(tgt, b"pw\n", mark=rx_mark)
+        agent_rc, agent_response = p7.cli(
+            "cmd", "submit", "--selector", "COM0", "--source", "agent:p7",
+            "--cmd", "echo FORBIDDEN_DURING_LOGIN_P7",
+        )
+        assert agent_rc != 0 and agent_response and agent_response.get("ok") is False, (agent_rc, agent_response)
+        os.write(console_fd, human)
+        _wait_target_rx(tgt, human, mark=rx_mark)
+        worker.join(timeout=65.0)
+        assert not worker.is_alive(), "手動 session recover 未在期限內結束"
+        rc, response = result["response"]
+        assert rc == 0 and response and response.get("ok") is True, (rc, response)
+        wait_state(p7.env, "COM0", "READY", timeout_s=10.0)
+
+        rows = [row for row in p7.wal_records("COM0", limit=5000) if int(row.get("seq") or 0) > after_seq]
+        start, ready = login_window_bounds(
+            rows,
+            after_seq=after_seq,
+            username=b"root\n",
+            ready_prompt=b"root@fake:~# ",
+        )
+        assert_login_window(rows, login_start_seq=start, ready_seq=ready, human_payload=human)
+        human_seqs = [int(row["seq"]) for row in rows if row.get("dir") == "TX"
+                      and str(row.get("source", "")).startswith("human:")
+                      and human in base64.b64decode(row.get("payload_b64") or "")]
+        assert tgt.rx_log_since(rx_mark).count(human) == 1, f"human bytes 必須恰一次送達 target：{tgt.rx_log_since(rx_mark)!r}"
+        human_mono = [row.get("mono_ts_ns") for row in rows if int(row.get("seq") or 0) in human_seqs]
+        print(f"P7 login WAL window seq={start}..{ready}; human TX seq={human_seqs} mono_ts_ns={human_mono}")
+    finally:
+        os.close(console_fd)
+
+
+def test_recovery_and_reboot_do_not_replay_stale_input(p7, tmp_path):
+    """§11.3-3：重開機前的人類 raw 輸入可已上線，但 recovery 後不得重播。"""
+    tgt = FakeTarget(
+        tmp_path / "t0",
+        login_steps=[
+            {"expect": "", "respond": "\r\nfake login: "},
+            {"expect": "root", "respond": "\r\nPassword: "},
+            {"expect": "pw", "respond": "\r\nroot@fake:~# "},
+        ],
+        commands={"overrides": {"reboot": {"response": ""}, "STALE_HUMAN_P7": {"response": ""}}},
+    )
+    p7.start("shell", [tgt])
+    wait_state(p7.env, "COM0", "READY", timeout_s=30.0)
+    console_fd, _ = _attach_human_vtty(p7, "s23-no-replay")
+    try:
+        before = p7.wal_records("COM0", limit=5000)
+        seq_before = max((int(r.get("seq") or 0) for r in before), default=0)
+        rc, submitted = p7.cli("cmd", "submit", "--selector", "COM0", "--source", "agent:p7", "--cmd", "reboot",
+                               "--cmd-timeout", "2")
+        assert rc == 0 and submitted and submitted.get("ok") is True, (rc, submitted)
+        _wait_target_rx(tgt, b"reboot\n")
+        os.write(console_fd, b"STALE_HUMAN_P7\n")
+        _wait_command_done(p7, submitted["cmd_id"], timeout_s=15.0)
+
+        # target reboot 後由 daemon reboot recovery 重新登入；登入結果仍由 RPC/WAL 對外觀察。
+        tgt.boot([(0.0, "\r\nfake login: ")])
+        deadline = time.monotonic() + 15.0
+        boot_seq = None
+        while time.monotonic() < deadline:
+            rows = p7.wal_records("COM0", limit=5000)
+            boot_rows = [r for r in rows if int(r.get("seq") or 0) > seq_before and r.get("dir") == "RX"
+                         and b"fake login:" in base64.b64decode(r.get("payload_b64") or "")]
+            if boot_rows:
+                boot_seq = min(int(r["seq"]) for r in boot_rows)
+                break
+            time.sleep(0.05)
+        assert boot_seq is not None, "WAL 未記錄重開機後的 login prompt"
+        wait_state(p7.env, "COM0", "READY", timeout_s=60.0)
+        rc, after = p7.cli("cmd", "submit", "--selector", "COM0", "--source", "agent:p7", "--cmd", "echo AFTER_P7")
+        assert rc == 0 and after and after.get("ok") is True, (rc, after)
+        _wait_target_rx(tgt, b"echo AFTER_P7\n")
+        rows = p7.wal_records("COM0", limit=5000)
+        replay = [r for r in rows if int(r.get("seq") or 0) > boot_seq and r.get("dir") == "TX"
+                  and b"STALE_HUMAN_P7" in base64.b64decode(r.get("payload_b64") or "")]
+        assert not replay, f"重開機與 recovery 後不得重播舊 human input：{replay}"
+    finally:
+        os.close(console_fd)
+
+
+def _reject_zero_tx(p7, tgt, want: str) -> None:
+    mark, tx_before = tgt.rx_mark(), _tx_count(p7)
+    rc, j = p7.cli("cmd", "submit", "--selector", "COM0", "--cmd", "echo must-not-send")
+    assert rc == 2 and j["ok"] is False and j["error_code"] == want, (rc, j)
+    time.sleep(1.0)
+    assert tgt.rx_log_since(mark) == b"", f"{want}：被拒請求不得送任何 byte"
+    assert _tx_count(p7) == tx_before, f"{want}：被拒請求 WAL 不得有 TX"
+
+
+def test_rejected_requests_zero_tx(p7, tmp_path):
+    tgt = FakeTarget(tmp_path / "t0", prompt="root@prplOS:~# ", commands={"overrides": {"": {"response": "\r\n=> "}}})
+    p7.start("prpl", [tgt])
+    wait_state(p7.env, "COM0", "READY", timeout_s=60.0)
+    tgt.emit(BANNER + "\r\n=> ")
+    time.sleep(1.0)
+    _reject_zero_tx(p7, tgt, "AUTOBOOT_QUIET")
+    t0 = time.monotonic()
+    while not _row(p7)["ready_reconfirm_failed"]:   # quiet 180 s 結束、D1 判定（慢案）
+        assert time.monotonic() - t0 <= 185.0
+        time.sleep(1.0)
+    _reject_zero_tx(p7, tgt, "READY_UNCONFIRMED")
+
+
+def test_rejected_requests_zero_tx_credentials_unresolved(p7, tmp_path):
+    """同列（§11.3-1）的 CREDENTIALS_UNRESOLVED 子案：ATTACHED 終態下 submit 被拒、0 byte、WAL 無 TX。"""
+    tgt = FakeTarget(tmp_path / "t0", prompt="root@op3:~# ", login_steps=[{"expect": "", "respond": "\r\nop3 login: "}])
+    p7.start("shell_unresolved", [tgt])
+    wait_state(p7.env, "COM0", "ATTACHED")
+    deadline = time.monotonic() + 15.0
+    while _row(p7)["last_error"] != "CREDENTIALS_UNRESOLVED":
+        assert time.monotonic() < deadline
+        time.sleep(0.2)
+    _reject_zero_tx(p7, tgt, "SESSION_NOT_READY")
+    assert tgt.rx_log() == b"" and _tx_count(p7) == 0
+
+
+def test_release_during_login_waits_for_handle_close(p7, tmp_path):
+    """登入進行中 `device release`：回成功的當下 daemon 已無指向該 tty 的 fd；`device attach` 之前不重開；
+    `session recover --force` 的 REATTACH 任何時刻至多持有一個 fd（舊 fd 關閉後才重開）。
+
+    DF-23（OD-57，2026-10-29）：Python 基線於本情境 `device attach` 後落 DETACHED＋`ATTACH_FAILED:TxIncompleteError`
+    且不再自動重試（擁有者視為 Python 缺陷），Rust 回到 READY；收斂結果依 DF-23 分別判定（`ab_participation: diff`），
+    §11.3-4 的 handle 時序兩邊同斷言。"""
+    tgt = FakeTarget(tmp_path / "t0", delay_ms=1500)       # 每個回應延遲 1.5 s：login 進行中可插入 release
+    p7.start("shell", [tgt])
+    deadline = time.monotonic() + 20.0
+    while b"\n" not in tgt.rx_log():
+        assert time.monotonic() < deadline, "daemon 未開始 login probe"
+        time.sleep(0.05)
+    # 固定在 FakeTarget 已收到 probe、但尚未送回 login prompt 的窗口內 release；避免排程延遲
+    # 讓舊回應在 reattach 後抵達，將案例變成完整登入並誤判為未重現 Python 的中斷行為。
+    tgt.hold_reply(True)
+    slave = tgt.slave_path
+    assert _daemon_fds_to(p7, slave) >= 1, "login 進行中 daemon 應持有 tty"
+    rc, j = p7.cli("device", "release", "--selector", "COM0", "--source", "agent:p7", "--reason", "flash")
+    assert rc == 0 and j["ok"] is True, (rc, j)
+    assert _daemon_fds_to(p7, slave) == 0, "release 回成功的當下 daemon 不得再持有該 tty 的 fd"
+    t_end = time.monotonic() + 6.0
+    while time.monotonic() < t_end:
+        assert _daemon_fds_to(p7, slave) == 0, "device attach 之前不得重新開啟"
+        time.sleep(0.1)
+    rc, j = p7.cli("device", "attach", "--selector", "COM0")
+    assert rc == 0 and j["ok"] is True, (rc, j)
+    deadline = time.monotonic() + 10.0
+    while _daemon_fds_to(p7, slave) == 0:
+        assert time.monotonic() < deadline, "device attach 後應重新開啟 tty"
+        time.sleep(0.05)
+    tgt.hold_reply(False)
+    # DF-23：attach 之後的收斂結果（Rust 回 READY；Python 落 DETACHED＋ATTACH_FAILED:TxIncompleteError 且不自動重試）
+    if is_rust():
+        s = wait_state(p7.env, "COM0", "READY", timeout_s=60.0)
+        assert s["last_error"] is None, s
+    else:
+        s = wait_state(p7.env, "COM0", "DETACHED", timeout_s=60.0)
+        assert str(s["last_error"]).startswith("ATTACH_FAILED:TxIncompleteError"), s
+        t_end = time.monotonic() + 10.0
+        while time.monotonic() < t_end:                     # 不自動重試：維持 DETACHED
+            _, j = p7.cli("session", "list")
+            row = [x for x in (j or {}).get("sessions", []) if x["com"] == "COM0"][0]
+            assert row["state"] == "DETACHED", row
+            time.sleep(0.5)
+
+    # REATTACH：另一個 rig（READY 起手），RX 凍結下 recover --force，取樣 daemon 對 tty 的 fd 數峰值。
+    rig = P7Rig(tmp_path / "p7-reattach")
+    try:
+        tgt2 = FakeTarget(tmp_path / "t1")
+        rig.start("shell", [tgt2])
+        wait_state(rig.env, "COM0", "READY", timeout_s=60.0)
+        slave2 = tgt2.slave_path
+        peak = [0]
+        stop = threading.Event()
+
+        def sample() -> None:
+            while not stop.is_set():
+                peak[0] = max(peak[0], _daemon_fds_to(rig, slave2))
+                time.sleep(0.005)
+
+        th = threading.Thread(target=sample, daemon=True)
+        th.start()
+        try:
+            tgt2.freeze_rx()
+            rig.cli("session", "recover", "--selector", "COM0", "--force", timeout_s=60.0)
+        finally:
+            stop.set()
+            th.join(timeout=5.0)
+        assert peak[0] == 1, f"REATTACH 期間不得同時持有新舊 fd（且應持有過）：peak={peak[0]}"
+    finally:
+        rig.stop()
+
+
+def test_force_recover_attached_closes_before_reopen(p7, tmp_path):
+    """§11.3-4／§5.2.4（審查 P7-f9e90a9-5）：ATTACHED＋CREDENTIALS_UNRESOLVED 起手的 `session recover --force`
+    （FORCE_CLEAR_REATTACH）必須實際關閉並重開恰一次，且任何時刻至多持有一個指向該 tty 的 fd（舊 fd 關閉回條後才重開）。
+
+    fd 層級 oracle：以 5 ms 取樣 daemon 的 fd 數峰值（Rust 實測舊 worker close 與重開只隔約 1.6 ms，bridge 的
+    peer_state 50 ms 取樣看不到，故不以 wire peer_state 判順序）；重開以 `bridge_generation` 1→2 證明（no-op 實作必紅）。"""
+    tgt = FakeTarget(tmp_path / "t0", prompt="root@op3:~# ", login_steps=[{"expect": "", "respond": "\r\nop3 login: "}])
+    p7.start("shell_unresolved", [tgt])
+    s = wait_state(p7.env, "COM0", "ATTACHED")
+    deadline = time.monotonic() + 15.0
+    while s["last_error"] != "CREDENTIALS_UNRESOLVED":
+        assert time.monotonic() < deadline, s
+        time.sleep(0.2)
+        s = wait_state(p7.env, "COM0", "ATTACHED")
+    assert s["bridge_generation"] == 1, s
+    slave = tgt.slave_path
+    assert _daemon_fds_to(p7, slave) == 1, "ATTACHED 時 daemon 應恰持有一個 tty fd"
+    peak = [0]
+    stop = threading.Event()
+
+    def sample() -> None:
+        while not stop.is_set():
+            peak[0] = max(peak[0], _daemon_fds_to(p7, slave))
+            time.sleep(0.005)
+
+    th = threading.Thread(target=sample, daemon=True)
+    th.start()
+    try:
+        rc, j = p7.cli("session", "recover", "--selector", "COM0", "--force", timeout_s=60.0)
+    finally:
+        stop.set()
+        th.join(timeout=5.0)
+    assert (j or {}).get("action") == "FORCE_CLEAR_REATTACH", (rc, j)
+    assert peak[0] == 1, f"REATTACH 期間不得同時持有新舊 fd：peak={peak[0]}"
+    s = wait_state(p7.env, "COM0", "ATTACHED", timeout_s=15.0)
+    assert s["bridge_generation"] == 2, f"force recover 須實際關閉並重開恰一次：{s!r}"
+    assert _daemon_fds_to(p7, slave) == 1
+    assert tgt.rx_log() == b"", "帳密未解析：force reattach 不得送任何 byte"
+
+
+def test_no_auto_resend_after_partial_or_timeout(p7, tmp_path):
+    tgt = FakeTarget(tmp_path / "t0")
+    p7.start("shell", [tgt])
+    wait_state(p7.env, "COM0", "READY", timeout_s=60.0)
+    mark = tgt.rx_mark()
+    rc, sub = p7.cli("cmd", "submit", "--selector", "COM0", "--cmd", "sleep 60", "--cmd-timeout", "2")
+    assert sub and sub["ok"] is True, (rc, sub)
+    deadline = time.monotonic() + 20.0
+    while not ((p7.cli("cmd", "status", "--cmd-id", sub["cmd_id"])[1] or {}).get("command") or {}).get("done_at"):
+        assert time.monotonic() < deadline
+        time.sleep(0.3)
+    time.sleep(10.0)                                          # 救援後不得自動重送
+    sent = tgt.rx_log_since(mark)
+    assert sent.count(b"sleep 60") == 1, f"逾時救援後 payload 必須恰一次：{sent!r}"
+    assert _tx_bytes(p7).count(b"sleep 60") == 1
+    if is_rust():
+        # SC-30（Rust-only）：login 被 quiet banner 中止後，帳號只送一次、secret 不送、之後不重送。
+        rig = P7Rig(tmp_path / "p7-sc30")
+        try:
+            tgt2 = FakeTarget(tmp_path / "t1", login_steps=[{"expect": "", "respond": "\r\nfake login: "},
+                                                           {"expect": "root", "respond": BANNER}])
+            rig.start("shell", [tgt2])
+            deadline = time.monotonic() + 20.0
+            while b"root" not in tgt2.rx_log():
+                assert time.monotonic() < deadline
+                time.sleep(0.05)
+            time.sleep(10.0)
+            log = tgt2.rx_log()
+            assert log.count(b"root") == 1 and tgt2.password.encode() not in log, log
+        finally:
+            rig.stop()
+
+
+def _nodeids(cases):
+    """合成的 collect-only 清單：每案一個節點；platform_matrix 另含三個參數節點（審查 P7-c5f0fc9-5）。"""
+    out = []
+    for c in cases:
+        if c["source_ref"].endswith("::test_platform_matrix"):
+            out += [f"{c['source_ref']}[{p}]" for p in ("shell", "prpl", "bcm")]
+        else:
+            out.append(c["source_ref"])
+    return out
+
+
+def _junit(path, nodeids, drop=(), fail=()):
+    import xml.sax.saxutils as su
+    rows = []
+    for nid in nodeids:
+        if nid in drop:
+            continue
+        file, name = nid.split("::", 1)
+        cls = file[:-3].replace("/", ".")
+        body = '<failure message="boom"/>' if nid in fail else ""
+        rows.append(f'<testcase classname="{su.escape(cls)}" name="{su.escape(name)}" time="0.1">{body}</testcase>')
+    path.write_text('<?xml version="1.0"?><testsuites><testsuite name="pytest">' + "".join(rows)
+                    + "</testsuite></testsuites>", encoding="utf-8")
+
+
+def test_evidence_insufficient_is_not_pass(tmp_path):
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    import yaml
+
+    root = Path(__file__).resolve().parents[2]
+    script = root / "scripts/rust/p7_ab_report.py"
+    cases = [c for c in yaml.safe_load((root / "tests/acceptance/cases.yaml").read_text(encoding="utf-8"))["cases"]
+             if c.get("suite") == "contract-blackbox" and str(c.get("source_ref", "")).startswith("tests/contract_blackbox/test_p7_")]
+    assert len(cases) >= 30, len(cases)
+    nodes = _nodeids(cases)
+    extra = "tests/contract_blackbox/test_p7_invariants.py::test_unmapped_extra_case"
+    collected = tmp_path / "collected.txt"
+    collected.write_text("\n".join(nodes + [extra]) + "\n", encoding="utf-8")
+    full = tmp_path / "full.xml"
+    _junit(full, nodes + [extra])
+    # 必要節點取自預先凍結的 L1 鎖集合（審查 P7-c5f0fc9-5 第二輪），以合成鎖提供（A＝B＝合成節點）。
+    lock = tmp_path / "l1.json"
+    frozen = {"nodeids": nodes + [extra]}
+    lock.write_text(json.dumps({"sets": {"p7_gate:contract-blackbox-p7-a": {"linux": frozen},
+                                         "p7_gate:contract-blackbox-p7-b": {"linux": frozen}}}), encoding="utf-8")
+
+    def run(a, b, rc_b="0", col=collected):
+        out = tmp_path / "ab.md"
+        r = subprocess.run([sys.executable, str(script), "--run-id", "t", "--junit-a", str(a), "--junit-b", str(b),
+                            "--collected", str(col), "--rc-a", "0", "--rc-b", rc_b, "--out", str(out),
+                            "--l1-lock", str(lock)],
+                           capture_output=True, text=True)
+        return r.returncode, out.read_text(encoding="utf-8")
+
+    rc, md = run(full, full)
+    assert rc == 0 and "結論：PASS" in md, md
+    rc, md = run(full, tmp_path / "missing-b.xml")                       # B 證據缺檔
+    assert rc == 3 and "| INCOMPLETE |" in md and "結論：INCOMPLETE" in md, md
+    one = cases[0]["case_id"]
+    partial = tmp_path / "partial.xml"
+    _junit(partial, nodes + [extra], drop={cases[0]["source_ref"]})
+    rc, md = run(full, partial)                                          # B 缺一案
+    assert rc == 3 and f"| {one} | PASS | INCOMPLETE |" in md, md
+    param = tmp_path / "param.xml"                                       # 參數化案例缺參數節點
+    pm = next(c for c in cases if c["source_ref"].endswith("::test_platform_matrix"))
+    _junit(param, nodes + [extra], drop={pm["source_ref"] + "[prpl]"})
+    rc, md = run(full, param)
+    assert rc == 3 and f"| {pm['case_id']} | PASS | INCOMPLETE |" in md, md
+    # 審查 P7-c5f0fc9-5 第二輪重播：collect-only 與 junit 都只有 [shell]（缺凍結的 [prpl]／[bcm]）→ 不得 PASS
+    shell_only = [n for n in nodes + [extra] if not (n.startswith(pm["source_ref"] + "[") and not n.endswith("[shell]"))]
+    col2 = tmp_path / "collected-shell.txt"
+    col2.write_text("\n".join(shell_only) + "\n", encoding="utf-8")
+    only = tmp_path / "shell-only.xml"
+    _junit(only, shell_only)
+    rc, md = run(only, only, col=col2)
+    assert rc == 3 and f"| {pm['case_id']} | INCOMPLETE | INCOMPLETE |" in md, md
+    bad = tmp_path / "unmapped-fail.xml"                                 # 未映射節點失敗必須阻擋（審查 P7-c5f0fc9-4）
+    _junit(bad, nodes + [extra], fail={extra})
+    rc, md = run(full, bad, rc_b="1")
+    assert rc == 1 and "結論：FAIL" in md and "test_unmapped_extra_case" in md, md
+    rc, md = run(full, full, rc_b="1")                                   # pytest 結束碼非 0 但 junit 全綠 → 不得 PASS
+    assert rc == 3 and "結論：INCOMPLETE" in md, md

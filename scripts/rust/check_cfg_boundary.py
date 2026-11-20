@@ -4,7 +4,8 @@
 掃描 `crates/*`（排除 `crates/sw-pal/`）中以下違規寫法：
 
 - ``cfg-predicate``：``#[cfg(``、``#![cfg(``、``#[cfg_attr(``、``cfg!`` 巨集（``()``、``[]``、``{}`` 任一定界符）
-  的謂詞不是由 ``test``、``feature = "test-fakes"`` 與 ``all``／``any``／``not`` 組成；``cfg_attr`` 之後的屬性
+  的謂詞不是由 ``test``、``feature = "test-fakes"`` 與 ``all``／``any``／``not`` 組成；整合測試檔另允許
+  精確的 ``#[cfg(all(test, unix))]``，供 OD-95 排除 POSIX-only 測試；``cfg_attr`` 之後的屬性
   與其中的巢狀 ``cfg``／``cfg_attr`` 同樣逐一檢查。``#`` 與 ``[`` 之間的合法空白一律視為屬性開頭。
 - ``os-module``：``std::os::unix``、``std::os::windows``（含 ``use std::{…, os::unix::…}`` 群組寫法）。
 - ``os-name``：``std::env::consts::OS``、``FAMILY``（執行期平台名稱比較，arch §2.1 禁止）。
@@ -256,12 +257,25 @@ def _cfg_call_ok(code: str, open_idx: int, is_attr: bool, strings: list[str]) ->
     return predicate_ok(pred, strings)
 
 
-def cfg_violations(code: str, strings: list[str]) -> list[int]:
+def _is_posix_test_gate(pred: str) -> bool:
+    """整合測試唯一額外允許的平台條件；只接受 test 與 unix 的直接 conjunction。"""
+    toks = _tokenize(pred)
+    return toks in (
+        [("id", "all"), ("p", "("), ("id", "test"), ("p", ","), ("id", "unix"), ("p", ")")],
+        [("id", "all"), ("p", "("), ("id", "unix"), ("p", ","), ("id", "test"), ("p", ")")],
+    )
+
+
+def cfg_violations(code: str, strings: list[str], allow_posix_test_gate: bool = False) -> list[int]:
     """回傳違規的 offset 清單（cfg 相關巨集的起始位置）。"""
     hits: set[int] = set()
     for m in CFG_ATTR_RE.finditer(code):
         is_attr = m.group(1) == "cfg_attr"
         open_idx = m.end() - 1
+        if allow_posix_test_gate and not is_attr:
+            close_idx = _matching_close(code, open_idx)
+            if close_idx != -1 and _is_posix_test_gate(code[open_idx + 1:close_idx]):
+                continue
         if not _cfg_call_ok(code, open_idx, is_attr, strings):
             hits.add(m.start())
             continue
@@ -292,7 +306,7 @@ def check_rust_file(rel: str, src: str, crate: str, is_test_file: bool, is_commo
         out.append(f"{rel}:{line}: {rule}: {text}")
 
     if crate != PAL_CRATE:
-        for off in cfg_violations(code, strings):
+        for off in cfg_violations(code, strings, allow_posix_test_gate=is_test_file):
             report(_line_of(code, off), "cfg-predicate")
         for m in OS_MODULE_RE.finditer(code):
             report(_line_of(code, m.start()), "os-module")

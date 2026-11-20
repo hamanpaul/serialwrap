@@ -4,12 +4,15 @@ on:
   push:
     tags:
       - "v*"
+  # RC 由擁有者工具先建立並上傳 gate 候選資產；只在 release published 後驗證，避免 tag push 時資產尚未就緒。
+  release:
+    types: [published]
   # OD-78：對既有 tag 補傳 Windows bundle zip。只會執行 publish-windows-bundle；其餘 job 僅在 tag push 時執行，
   # 補傳不會重建 wheel／PyInstaller exe／Linux bundle，也不會建立 release。
   workflow_dispatch:
     inputs:
       tag:
-        description: "已存在的 release tag（例如 v0.4.0）；其 GitHub Release 須已含 Linux bundle 與 SHA256SUMS"
+        description: "已存在的 Stage 2 release tag（v0.5.0 或之後版本）；其 GitHub Release 須已有 Linux bundle 與 SHA256SUMS"
         required: true
         type: string
 
@@ -18,17 +21,220 @@ permissions:
 
 jobs:
   project-policy:
-    if: ${{ github.event_name == 'push' }}
+    if: ${{ github.event_name == 'push' && needs.classify-tag.outputs.kind == 'release' }}
+    needs: classify-tag
     uses: hamanpaul/paulsha-conventions/.github/workflows/reusable-policy-check.yml@2dcf2f815afeddc477c1cacc33df9beb06ae14fb # v1.0.19
     with:
       policy_profile: flat
       policy_version: "1.0.19"
       policy_engine_ref: 2dcf2f815afeddc477c1cacc33df9beb06ae14fb
 
+  classify-tag:
+    if: ${{ github.event_name == 'push' || github.event_name == 'release' }}
+    runs-on: ubuntu-24.04
+    outputs:
+      kind: ${{ steps.classify.outputs.kind }}
+      version: ${{ steps.classify.outputs.version }}
+      rc_number: ${{ steps.classify.outputs.rc_number }}
+    steps:
+      - name: Check out tagged source and history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.3"
+      - name: Parse release tag and verify VERSION
+        id: classify
+        env:
+          TAG_NAME: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
+        run: python3 scripts/rust/release_assets.py check-tag --tag "$TAG_NAME" --version-file VERSION --github-output "$GITHUB_OUTPUT"
+
+  find-rc-assets:
+    if: ${{ github.event_name == 'push' && needs.classify-tag.outputs.kind == 'release' }}
+    needs: classify-tag
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      has_rc: ${{ steps.search.outputs.has_rc }}
+      rc_tag: ${{ steps.search.outputs.rc_tag }}
+      rc_commit: ${{ steps.search.outputs.rc_commit }}
+    steps:
+      - name: Check out tags and release source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.3"
+      - name: Find newest same-version RC whose assets validate
+        id: search
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release list --json tagName,isPrerelease,isDraft --limit 100 > "$RUNNER_TEMP/releases.json"
+          python3 scripts/rust/release_assets.py list-rc --version-file VERSION --releases-json "$RUNNER_TEMP/releases.json" > "$RUNNER_TEMP/rc-tags.txt"
+          while IFS= read -r rc_tag; do
+            [ -n "$rc_tag" ] || continue
+            rc_dir="$RUNNER_TEMP/rc-assets"
+            rm -rf "$rc_dir"
+            mkdir -p "$rc_dir"
+            is_prerelease="$(gh release view "$rc_tag" --json isPrerelease --jq .isPrerelease 2>/dev/null || true)"
+            if [ "$is_prerelease" != true ]; then
+              echo "::error::最新同版 RC 已不存在或不再是 prerelease，拒絕退回舊 RC：$rc_tag"
+              exit 1
+            fi
+            if ! gh release download "$rc_tag" --dir "$rc_dir"; then
+              echo "::error::最新同版 RC 資產下載失敗，拒絕退回舊 RC 或重建：$rc_tag"
+              exit 1
+            fi
+            rc_commit="$(git rev-parse --verify "refs/tags/${rc_tag}^{commit}" 2>/dev/null || true)"
+            if [ -z "$rc_commit" ] || ! python3 scripts/rust/release_assets.py validate-assets \
+              --tag "$rc_tag" --version-file VERSION --tag-commit "$rc_commit" --assets-dir "$rc_dir"; then
+              echo "::error::最新同版 RC 資產未通過 SHA256／Stage 2／版本／tag commit 驗證，拒絕退回舊 RC 或重建：$rc_tag"
+              exit 1
+            fi
+            echo "has_rc=true" >> "$GITHUB_OUTPUT"
+            echo "rc_tag=$rc_tag" >> "$GITHUB_OUTPUT"
+            echo "rc_commit=$rc_commit" >> "$GITHUB_OUTPUT"
+            exit 0
+          done < "$RUNNER_TEMP/rc-tags.txt"
+          echo "has_rc=false" >> "$GITHUB_OUTPUT"
+          echo "rc_tag=" >> "$GITHUB_OUTPUT"
+          echo "rc_commit=" >> "$GITHUB_OUTPUT"
+
+  validate-rc-assets:
+    if: ${{ github.event_name == 'release' && needs.classify-tag.outputs.kind == 'rc' }}
+    needs: classify-tag
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.3"
+      - name: Validate published RC only (no build or upload)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          is_prerelease="$(gh release view "$TAG_NAME" --json isPrerelease --jq .isPrerelease)"
+          if [ "$is_prerelease" != true ]; then
+            echo "::error::RC tag 的 GitHub Release 必須標記為 prerelease"
+            exit 1
+          fi
+          assets="$RUNNER_TEMP/rc-assets"
+          mkdir -p "$assets"
+          gh release download "$TAG_NAME" --dir "$assets"
+          tag_commit="$(git rev-parse --verify "refs/tags/${TAG_NAME}^{commit}")"
+          python3 scripts/rust/release_assets.py validate-assets \
+            --tag "$TAG_NAME" --version-file VERSION --tag-commit "$tag_commit" --assets-dir "$assets"
+
+  promote-rc-assets:
+    if: ${{ github.event_name == 'push' && needs.classify-tag.outputs.kind == 'release' && needs.find-rc-assets.outputs.has_rc == 'true' }}
+    needs: [classify-tag, find-rc-assets, project-policy]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release and RC tag history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.3"
+      - name: Download and revalidate the selected RC assets
+        id: verify-rc
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RC_TAG: ${{ needs.find-rc-assets.outputs.rc_tag }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          is_prerelease="$(gh release view "$RC_TAG" --json isPrerelease --jq .isPrerelease)"
+          if [ "$is_prerelease" != true ]; then
+            echo "::error::選定的 RC 已不是 prerelease：$RC_TAG"
+            exit 1
+          fi
+          rc_commit="$(git rev-parse --verify "refs/tags/${RC_TAG}^{commit}")"
+          if [ "$rc_commit" != "${{ needs.find-rc-assets.outputs.rc_commit }}" ]; then
+            echo "::error::RC tag commit 在選取後改變：$RC_TAG"
+            exit 1
+          fi
+          release_commit="$(git rev-parse --verify "refs/tags/${TAG_NAME}^{commit}")"
+          python3 scripts/rust/release_promote_guard.py \
+            --repo . --rc-commit "$rc_commit" --release-commit "$release_commit"
+          assets="$RUNNER_TEMP/promote-assets"
+          mkdir -p "$assets"
+          gh release download "$RC_TAG" --dir "$assets"
+          python3 scripts/rust/release_assets.py validate-assets \
+            --tag "$RC_TAG" --version-file VERSION --tag-commit "$rc_commit" --assets-dir "$assets"
+          echo "rc_commit=$rc_commit" >> "$GITHUB_OUTPUT"
+      - name: Create formal draft release and upload RC bundle bytes with release instructions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+          RC_TAG: ${{ needs.find-rc-assets.outputs.rc_tag }}
+          RC_COMMIT: ${{ needs.find-rc-assets.outputs.rc_commit }}
+          VERSION: ${{ needs.classify-tag.outputs.version }}
+        run: |
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            echo "::error::正式 release 已存在，拒絕覆寫：$TAG_NAME"
+            exit 1
+          fi
+          assets="$RUNNER_TEMP/promote-assets"
+          formal_assets="$RUNNER_TEMP/formal-assets"
+          python3 scripts/rust/release_assets.py prepare-formal-assets \
+            --rc-tag "$RC_TAG" --rc-commit "$RC_COMMIT" --tag "$TAG_NAME" \
+            --version-file VERSION --assets-dir "$assets" \
+            --guide docs/rust-refactor/stage2-release-install.md --out-dir "$formal_assets"
+          gh release create "$TAG_NAME" --verify-tag --draft --title "$TAG_NAME" --generate-notes
+          gh release upload "$TAG_NAME" \
+            "$formal_assets/serialwrap-${VERSION}-linux-x86_64.tar.gz" \
+            "$formal_assets/serialwrap-${VERSION}-windows-x86_64.zip" \
+            "$formal_assets/SHA256SUMS" "$formal_assets/RELEASE-INSTALL.md"
+
+      - name: Download and validate uploaded draft bytes before publication
+        id: verify-promoted
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+          RC_COMMIT: ${{ needs.find-rc-assets.outputs.rc_commit }}
+        run: |
+          verify="$RUNNER_TEMP/promoted-assets"
+          mkdir -p "$verify"
+          gh release download "$TAG_NAME" --dir "$verify"
+          python3 scripts/rust/release_assets.py validate-assets \
+            --tag "$TAG_NAME" --version-file VERSION --tag-commit "$RC_COMMIT" --assets-dir "$verify"
+
+      - name: Publish validated formal release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release edit "$TAG_NAME" --draft=false
+          is_prerelease="$(gh release view "$TAG_NAME" --json isPrerelease --jq .isPrerelease)"
+          if [ "$is_prerelease" != false ]; then
+            echo "::error::正式 release 被標成 prerelease：$TAG_NAME"
+            exit 1
+          fi
+
   publish:
-    if: ${{ github.event_name == 'push' }}
+    # OD-104：RC／promote 不走本 job；wheel 只保留無有效 RC 的 legacy fallback。
+    # 0.4.0 release plan §2 明列 wheel 延續發佈、PyInstaller 維持；Stage 2 對 0.5.0 是否移除尚未裁定，先保留。
+    if: ${{ github.event_name == 'push' && needs.classify-tag.outputs.kind == 'release' && needs.find-rc-assets.outputs.has_rc == 'false' }}
     runs-on: ubuntu-24.04  # 與 tests.yml 的 pytest job 相同；ubuntu-latest 沒有釘死的 3.12.3
-    needs: project-policy
+    needs: [project-policy, classify-tag, find-rc-assets]
 
     steps:
       - name: Check out repository
@@ -85,11 +291,12 @@ jobs:
         run: gh release upload "$TAG_NAME" dist/*.whl --clobber
 
   publish-windows-exe:
+    # OD-104：PyInstaller exe 只保留無有效 RC 的 legacy fallback；0.4.0 release plan §2 明列 0.4.0 續發，未裁定 0.5.0 是否移除。
+    if: ${{ github.event_name == 'push' && needs.classify-tag.outputs.kind == 'release' && needs.find-rc-assets.outputs.has_rc == 'false' }}
     # 在 windows-latest 以 PyInstaller 打 one-file exe，附加到同一個 release（#84 PORT-4）。
-    # needs: publish —— 等 publish job 建好 GitHub Release 後才上傳 exe。
-    if: ${{ github.event_name == 'push' }}
+    # 僅無可驗證 RC、走正式版回退建置流程時保留既有 Stage 1 專用 exe 附件。
     runs-on: windows-latest
-    needs: publish
+    needs: [publish, classify-tag, find-rc-assets]
 
     steps:
       - name: Check out repository
@@ -130,15 +337,15 @@ jobs:
         run: gh release upload "$env:TAG_NAME" dist/serialwrap.exe dist/serialwrapd.exe --clobber
 
   publish-linux-bundle:
+    if: ${{ github.event_name == 'push' && needs.classify-tag.outputs.kind == 'release' && needs.find-rc-assets.outputs.has_rc == 'false' }}
     # Linux x86_64 Rust bundle（RELEASE-TODO-01；docs/rust-refactor/release-0.4.0-plan.md §2）：
     # cargo build --release＋mkbundle 正式候選（不含 sw-cli/test-fakes）→ tar.gz＋SHA256SUMS → 解開後 smoke → 附加到同一個 release。
-    # needs: publish —— 等 publish job 建好 GitHub Release 後才上傳。
+    # 僅無可驗證 RC、走正式版回退建置流程時建置 Stage 2 Linux bundle。
     # Windows bundle 由 publish-windows-bundle job 建置（OD-78，hosted windows-latest），等本 job 成功後才合併 SHA256SUMS。
     # OD-50：Linux 使用者皆為 Ubuntu 24.04 以上，bundle 內附 Python runtime 綁定 /usr/bin/python3.12；
     # 故釘 ubuntu-24.04 並以系統 Python 建 runtime，不用 actions/setup-python（hosted toolcache 不可搬移，S1-3185c6d-1）。
-    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-24.04
-    needs: publish
+    needs: [publish, classify-tag, find-rc-assets]
     timeout-minutes: 60
 
     steps:
@@ -198,7 +405,7 @@ jobs:
 
       - name: Build release bundle
         id: mkbundle
-        run: scripts/rust/mkbundle.sh --release-bundle --profile release --out "$RUNNER_TEMP/bundle/serialwrap-${VERSION}-linux-x86_64"
+        run: scripts/rust/mkbundle.sh --release-bundle --stage 2 --profile release --out "$RUNNER_TEMP/bundle/serialwrap-${VERSION}-linux-x86_64"
 
       - name: Package bundle and SHA256SUMS
         id: package
@@ -276,13 +483,9 @@ jobs:
             exit 1
           fi
 
-          # 正式候選不得編入測試鉤子（crates/sw-cli/src/lib.rs、rollback.rs）。
-          for marker in SERIALWRAP_TEST_ SW_TEST_UPDATE_PAUSE_AFTER SW_TEST_UPDATE_FORCE_VERIFY_FAIL; do
-            if grep -rlaF "$marker" "$version_dir/bin"; then
-              echo "::error::bundle binaries contain test hook ${marker}"
-              exit 1
-            fi
-          done
+          # 共用檢查器依逐名核准的 parity 鉤子 allowlist 審核 CLI／daemon 標記；任何未列名的測試鉤子均拒絕。
+          python3 scripts/rust/check_test_hook_markers.py \
+            --binary "$version_dir/bin/serialwrap" --binary "$version_dir/bin/serialwrapd"
           if find "$root" -name 'delegate_sentinel*' | grep -q .; then
             echo "::error::bundle contains delegate sentinel test entry"
             exit 1
@@ -371,9 +574,9 @@ jobs:
     # 解開後 smoke，再把 zip 列併入 Linux job 已上傳的 SHA256SUMS 後上傳。
     # needs: publish-linux-bundle —— 兩個 job 都會改寫同一個 SHA256SUMS，必須序列化。
     # workflow_dispatch：Linux job 被略過時仍執行，對 inputs.tag 補傳 zip（腳本取自觸發 ref，原始碼取自 tag）。
-    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.publish-linux-bundle.result == 'success') }}
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && needs.classify-tag.outputs.kind == 'release' && needs.find-rc-assets.outputs.has_rc == 'false' && needs.publish-linux-bundle.result == 'success')) }}
     runs-on: windows-latest
-    needs: publish-linux-bundle
+    needs: [publish-linux-bundle, classify-tag, find-rc-assets]
     timeout-minutes: 60
     env:
       # rust-toolchain.toml 只釘 channel；windows-latest 的 rustup 預設 host 為 MSVC，強制 GNU host（與 rust.yml 相同）。
@@ -414,8 +617,30 @@ jobs:
             Write-Error "Cargo.toml [workspace.package] version does not match VERSION $fileVersion"
             exit 1
           }
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch' -and [version]$fileVersion -lt [version]'0.5.0') {
+            Write-Error "Stage 2 bundle 補傳不得指定低於 v0.5.0 的 Stage 1 tag：$env:TAG_NAME"
+            exit 1
+          }
           Write-Output "release tag $env:TAG_NAME matches VERSION $fileVersion"
           "VERSION=$fileVersion" | Add-Content -LiteralPath $env:GITHUB_ENV
+
+      - name: Refuse workflow_dispatch if the Windows bundle is already attached
+        id: refuse-dispatch-overwrite
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ inputs.tag }}
+        run: |
+          zip_name="serialwrap-${VERSION}-windows-x86_64.zip"
+          if ! asset_names="$(gh release view "$TAG_NAME" --json assets --jq '.assets[].name')"; then
+            echo "::error::無法確認 release $TAG_NAME 現有資產；拒絕 workflow_dispatch"
+            exit 1
+          fi
+          if printf '%s\n' "$asset_names" | grep -Fqx "$zip_name"; then
+            echo "::error::release $TAG_NAME 已有 $zip_name；拒絕覆寫或重建已發佈 bundle"
+            exit 1
+          fi
 
       - name: Set up Python 3.12.3 (build host)
         uses: actions/setup-python@v5
@@ -488,7 +713,7 @@ jobs:
           New-Item -ItemType Directory -Path dist -Force | Out-Null
           $name = "serialwrap-$env:VERSION-windows-x86_64"
           $out = Join-Path $env:RUNNER_TEMP "bundle\$name"
-          .\scripts\rust\mkbundle-windows.ps1 -Out $out -SourceRoot $env:SOURCE_DIR -HostPython python -ZipPath "dist\$name.zip"
+          .\scripts\rust\mkbundle-windows.ps1 -Stage 2 -Out $out -SourceRoot $env:SOURCE_DIR -HostPython python -ZipPath "dist\$name.zip"
           if (-not $?) { exit 1 }
           # 二進位只允許 allowlist 內的系統 DLL（不得帶 MinGW runtime DLL）。
           python scripts/rust/check_win_imports.py "$out\bin\serialwrap.exe" "$out\bin\serialwrapd.exe"
@@ -499,7 +724,7 @@ jobs:
         shell: pwsh
         run: |
           # 在 throwaway 根目錄解開實際要發佈的 zip：--version／--help、內層 SHA256SUMS、manifest 版本、._pth 無絕對路徑、
-          # 測試鉤子字串、runtime 隔離（yaml／serial／sw_core 皆由 bundle 載入）、setup／doctor、daemon start／status／stop。
+          # 共用 validator 的逐名測試鉤子政策、runtime 隔離（yaml／serial／sw_core 皆由 bundle 載入）、setup／doctor、daemon start／status／stop。
           # 全程使用隔離目錄與 SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM999，不開任何 COM 埠。
           .\scripts\rust\smoke-windows-bundle.ps1 -Zip "dist\serialwrap-$env:VERSION-windows-x86_64.zip" -Version $env:VERSION -HostPython python -SourceRoot $env:SOURCE_DIR
           if (-not $?) { exit 1 }

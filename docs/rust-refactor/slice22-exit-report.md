@@ -1,0 +1,95 @@
+# Slice 2.2（P6）出口報告
+
+> 依 rulings/p6.md（`docs/parity-amendments` 分支 `docs/rust-refactor/reviews/rulings/p6.md`）P6 OWNER-BATCH #4：流程項 #185 的證據寫入本報告；
+> `tests/acceptance/slice22_evidence_map.yaml` 的 `parity_rows['#185']` 以 `PROCESS-EVIDENCE` 引用下方段落（`scripts/rust/s22_gate_check.py` 檢查段落、commit 與紅／綠燈紀錄）。
+> 出口 gate 的逐輪實跑數字見 `docs/rust-refactor/reviews/p6-fix-responses.md` 與各輪雲端回報。
+
+## #185 T0 commit 單獨紅燈與終態綠燈
+
+- 稽核：parity-amendments-2026-10-26 #185（P6 審查 F3）：T0 commit `ae33e28`（`chore(contracts): 登記 Slice 2.2 Rust-only 契約並凍結案例集合`）單獨為紅燈；修補分散在後續的 `e5e2c56`（`tests/test_contracts_slice22.py` 補平台／資源 marker）與 `5516137`（`tests/test_slice21_skeleton_guards.py` 的 MIRROR 追加 `resource_limits` 九列）。依計畫不重寫歷史，於此明載「T0 單獨為紅燈、終態綠燈」。
+- 紅燈紀錄（2026-10-29 第 5 輪，於 `ae33e28` 的獨立 worktree，以一般使用者執行）：
+  - 命令：`python3 -m pytest -q tests/test_resource_markers.py tests/test_slice21_skeleton_guards.py`
+  - 結果：**4 failed、9 passed**——
+    - `tests/test_resource_markers.py::test_every_item_has_exactly_one_platform_marker`
+    - `tests/test_resource_markers.py::test_every_item_has_resource_marker_and_memory_only_is_exclusive`
+    - `tests/test_resource_markers.py::test_detected_resources_are_marked`（`('test_contracts_slice22.py', 'test_slice22_case_set_frozen_and_mapped', ['process_rpc'])` 等 marker 缺漏）
+    - `tests/test_slice21_skeleton_guards.py::test_resource_limit_rust_mirrors_equal_yaml`（`resource_limits.yaml` 新增 9 列未鏡像）
+- 綠燈紀錄（同日，分支 `feature/rust-refactor-p6` HEAD `5ade76c`，同一命令）：**13 passed、0 failed**；HEAD `2184235` 重跑同一命令亦 13 passed、退出碼 0。
+- 結論：T0 單獨為紅燈、終態綠燈；紅燈原因皆為 T0 之後兩個 commit 已修的測試基礎設施（marker／鏡像），非產品行為。
+- 結構化證據（`scripts/rust/s22_gate_check.py` 只依此區塊判定；第 5 輪以一般使用者重跑兩端取得退出碼，綠燈 commit 為重跑當下的分支 HEAD）：
+
+```json process-evidence
+{
+ "red": {
+  "commit": "ae33e28",
+  "command": "python3 -m pytest -q tests/test_resource_markers.py tests/test_slice21_skeleton_guards.py",
+  "exit_code": 1,
+  "passed": 9,
+  "failed": 4,
+  "failed_tests": [
+   "tests/test_resource_markers.py::test_every_item_has_exactly_one_platform_marker",
+   "tests/test_resource_markers.py::test_every_item_has_resource_marker_and_memory_only_is_exclusive",
+   "tests/test_resource_markers.py::test_detected_resources_are_marked",
+   "tests/test_slice21_skeleton_guards.py::test_resource_limit_rust_mirrors_equal_yaml"
+  ]
+ },
+ "green": {
+  "commit": "2184235",
+  "command": "python3 -m pytest -q tests/test_resource_markers.py tests/test_slice21_skeleton_guards.py",
+  "exit_code": 0,
+  "passed": 13,
+  "failed": 0
+ }
+}
+```
+
+## 出口 gate 實跑紀錄（第 5 輪，2026-10-29）
+
+- 環境：非 root（一般使用者，CapEff=0）、Rust 1.96.1、Python 3.12.3＋pytest 9.0.3＋PyYAML 6.0.3＋jsonschema 4.10.3；報告目錄 `target/s22-gate/r5-261029-051754`（未提交）。
+- `s22_gate_check.py` result = **FAIL**：
+
+| 集合 | 判定 | 數字／原因 |
+|---|---|---|
+| `s22_gate:cargo_workspace`/linux | PASS | 2132 passed、38 skipped |
+| `s22_gate:console_conformance_pty`/linux | PASS | 31 passed、3 skipped（`--caps posix_pty`） |
+| `s22_gate:py_parity`/linux | PASS | 12 passed |
+| `s22_gate:parity_py`/linux | PASS | 34 passed（指紋 [2.1]／[2.2] 依 OD-52 轉綠） |
+| `s22_gate:blackbox_rust`/linux | FAIL | 116 passed、1 failed、8 skipped；唯一失敗 `slice21/test_safety_core.py::test_two_daemons_same_tty`（P5 harness，SPEC-GAP） |
+| `s22_gate:win_test`/windows | INSUFFICIENT | 未登記（LOCAL-WINDOWS-TODO） |
+
+- 逐案 93：PASS 31／BLOCKED-OWNER 62／FAIL 0／INSUFFICIENT 0；parity_rows 23：PASS 22／BLOCKED-OWNER 1（#108）；map 覆蓋 PASS（93）；prereqs PASS。
+
+## 出口 gate 實跑紀錄（第 6 輪，2026-10-29）
+
+- 環境：非 root（uid 1000）、Rust 1.96.1、Python 3.12.3＋pytest 9.0.3＋PyYAML 6.0.3＋jsonschema 4.10.3；HEAD `c74f158`（含主線 `8963d07` 與 P5 `86b54d8`）；報告目錄 `target/s22-gate/r6-261029-133213`（未提交）。cargo 集合的收集命令取自 `s22_gate_check.py --plan`（OD-53：由 selector 推導 `--caps`）。loadavg 開跑 0.25／0.41／0.48、結束 0.51／0.30／0.39。
+- `s22_gate_check.py` result = **FAIL**：
+
+| 集合 | 判定 | 數字／原因 |
+|---|---|---|
+| `s22_gate:cargo_workspace`/linux | FAIL | 2184 passed、1 failed、38 skipped；唯一失敗 `sw-pal::serial::posix::tests::invalid_serial_fd_is_a_poll_wait_error`（P5 檔案，fd 重用競態；同範圍重跑兩次皆 2185 passed、0 failed） |
+| `s22_gate:console_conformance_pty`/linux | PASS | 31 passed、3 skipped（`--caps posix_pty`） |
+| `s22_gate:py_parity`/linux | PASS | 12 passed |
+| `s22_gate:parity_py`/linux | PASS | 34 passed |
+| `s22_gate:blackbox_rust`/linux | PASS | 117 passed、8 skipped（`test_two_daemons_same_tty` 依 P5 `4f8acdf` 轉綠） |
+| `s22_gate:win_test`/windows | INSUFFICIENT | 未登記（LOCAL-WINDOWS-TODO） |
+
+- 逐案 93：PASS 31／BLOCKED-OWNER 62／FAIL 0／INSUFFICIENT 0；L1.5／func-test 22 個參照於 Rust release artifact 全 PASS；parity_rows 23：PASS 22／BLOCKED-OWNER 1（#108）；map 覆蓋 PASS（93）；prereqs PASS。
+
+## 出口 gate 實跑紀錄（第 7 輪，2026-10-29）
+
+- 環境：非 root（uid 1000、CapEff=0、乾淨 PATH）、Rust 1.96.1、Python 3.12.3＋pytest 9.0.3＋PyYAML 6.0.3＋jsonschema 4.10.3；cargo 集合的收集命令取自 `s22_gate_check.py --plan`；pytest 集合依 L1 鎖 selector 以 `SW_RESOURCE_REPORT` 收集；L1.5／func-test 22 個參照逐一以 Rust release artifact 執行（bridge 參照帶 `--selftest-report`）。報告目錄未提交。
+- 兩次實跑（release artifact 相同：daemon sha256 `ba7b7f4d7b00…`，CLI `63e281ccde61…`；26 份 manifest 皆 `artifacts.daemon.implementation=rust`）：
+
+| 集合 | `r7-261029-163920`（HEAD `eb34a01`） | `r7b-261029-170104`（HEAD `09115d7`） |
+|---|---|---|
+| `s22_gate:cargo_workspace`/linux | PASS（2194 passed、38 skipped） | **FAIL**（2193 passed、1 failed、38 skipped；`sw-core::lease_selftest::selftest_probe_drain_race_golden`） |
+| `s22_gate:console_conformance_pty`/linux | PASS（31 passed、3 skipped，`--caps posix_pty`） | PASS（同左） |
+| `s22_gate:blackbox_rust`/linux | PASS（117 passed、8 skipped） | PASS（同左） |
+| `s22_gate:py_parity`/linux | PASS（12 passed） | PASS（同左） |
+| `s22_gate:parity_py`/linux | PASS（34 passed） | PASS（同左） |
+| `s22_gate:win_test`/windows | INSUFFICIENT（未登記，LOCAL-WINDOWS-TODO） | INSUFFICIENT（同左） |
+| result | **INSUFFICIENT** | **FAIL** |
+
+- 兩次皆：逐案 93：PASS 31／BLOCKED-OWNER 62／FAIL 0／INSUFFICIENT 0；L1.5 22 參照全 PASS；parity_rows 23：PASS 22（含 #185 PROCESS-EVIDENCE）／BLOCKED-OWNER 1（#108）；map 覆蓋 PASS（93）；prereqs PASS。
+- `r7b` 的唯一失敗為 P5 測試的間歇失敗（release 回 `ok=false`，第 ~250 輪即中止）：同一收集命令重跑兩次皆 2194 passed／0 failed；該測試執行檔單獨連跑 60 次、4 路並行連跑 140 次（每次 1000 輪）皆 0 敗；跑前無洩漏的 serialwrapd，開跑至結束 loadavg ≤ 0.64。根因未定，不作放行理由；`r7b` 的 result 維持 FAIL。
+- loadavg：`r7` 開跑 0.70／0.85／0.92（16:39:20Z）、結束 0.24／0.23／0.52（16:56:24Z），步驟邊界最高 1.46；`r7b` 開跑 0.84／0.55／0.57（17:01:04Z）、結束 0.36／0.32／0.40（17:16:58Z），步驟邊界最高 0.64。

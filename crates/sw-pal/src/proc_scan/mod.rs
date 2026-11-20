@@ -78,6 +78,7 @@ pub enum ArgvFlavor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HolderScanStatus {
     Ok,
+    PartialOtherUid,
     Permission,
     Unknown,
     Unsupported,
@@ -91,10 +92,11 @@ pub enum HolderScanStatus {
 }
 
 impl HolderScanStatus {
-    /// 報告欄位 `holders_status` 的字串。
+    /// 報告欄位 `holders_status` 的字串（OD-48 legacy 停止報告；與 [`HolderScanStatus::py_name`] 同一組字串）。
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ok => "ok",
+            Self::PartialOtherUid => "partial_other_uid",
             Self::Permission => "permission",
             Self::Unknown => "unknown",
             Self::Unsupported => "unsupported",
@@ -200,13 +202,16 @@ pub struct HolderScan {
 }
 
 impl HolderScan {
-    /// 由舊式 `(holders, status)` 組成（無「無法檢查」清單）。`Partial` 沒有清單即不成立，轉為 `Unknown`（fail-closed）。
+    /// 由舊式 `(holders, status)` 組成（無「無法檢查」清單）。`Partial` 沒有清單即不成立，轉為 `Unknown`（fail-closed）；
+    /// `PartialOtherUid` 只屬 holder probe／開埠路徑（rulings/s2.md WP5-9），出現在此處同樣以 `Unknown` 處理（fail-closed）。
     pub fn from_pair((holders, status): (Vec<u32>, HolderScanStatus)) -> Self {
         let outcome = match status {
             HolderScanStatus::Ok => HolderScanOutcome::Ok,
             HolderScanStatus::Unsupported => HolderScanOutcome::Unsupported,
             HolderScanStatus::Permission => HolderScanOutcome::Permission(Vec::new()),
-            HolderScanStatus::Unknown | HolderScanStatus::Partial => HolderScanOutcome::Unknown(Vec::new()),
+            HolderScanStatus::Unknown | HolderScanStatus::Partial | HolderScanStatus::PartialOtherUid => {
+                HolderScanOutcome::Unknown(Vec::new())
+            }
         };
         Self { holders, outcome }
     }
@@ -275,6 +280,14 @@ impl UninspectableSnapshot {
             Self::Taken(_) => "ok",
             Self::Failed => "failed",
         }
+    }
+}
+
+impl HolderScanStatus {
+    /// Python holder probe 的狀態字串；health 掃描另將 `PartialOtherUid` 正規化為 `permission`。
+    /// `Partial` 只由 OD-48 的 `uart_holders_same_uid` 產生，不會出現在 holder probe。
+    pub fn py_name(self) -> &'static str {
+        self.as_str()
     }
 }
 
@@ -476,7 +489,14 @@ fn is_python_image(image: &str) -> bool {
 /// 行程掃描抽象 trait。
 pub trait ProcScan: Send + Sync {
     fn serialwrapd_instances(&self) -> Result<Vec<DaemonProc>, ScanFailure>;
+    /// fail-closed 版（CLI 更新／回滾確認釋放用；Python `serial_port.probe_holders` 語意）：目標 tty 取不到
+    /// 身分、或 fd 因權限／其他錯誤讀不到時，不得推論「無 holder」，status 回 `Permission`／`Unknown`。
     fn serialwrapd_tty_holders(&self, paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus);
+    /// daemon status／doctor 的多開偵測版（Python `multi_open.detect_multi_open` 語意）：tty 本身 stat 失敗即
+    /// 略過該 tty、fd stat 失敗略過該 fd，只有 fd 目錄讀不到才降級 status。預設沿用 fail-closed 版（替身）。
+    fn multi_open_tty_holders(&self, paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus) {
+        self.serialwrapd_tty_holders(paths)
+    }
     fn pid_alive(&self, pid: u32) -> bool;
     fn identity_alive(&self, id: &ProcIdentity) -> bool;
     /// OD-48 D1／D3：指定 pid 的辨識資訊；行程不存在或平台不支援 → `None`。

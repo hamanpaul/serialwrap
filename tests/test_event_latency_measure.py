@@ -1,0 +1,490 @@
+"""OD-45：event_latency 外部量測判定（`scripts/rust/event_latency_measure.py` 的純函式；不啟動 daemon）。"""
+from __future__ import annotations
+
+import importlib.util
+import pathlib
+
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+_spec = importlib.util.spec_from_file_location("event_latency_measure", ROOT / "scripts" / "rust" / "event_latency_measure.py")
+elm = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(elm)
+
+IDLE = {"loadavg_1min": 0.5, "cpu_count": 4}
+BUSY = {"loadavg_1min": 9.0, "cpu_count": 4}
+
+
+def _run(rep: int, load: str, event: str, verdict: str = "PASS") -> dict:
+    return {"repeat": rep, "load": load, "event": event, "verdict": verdict, "max_ms": 1.0, "limit_ms": 50}
+
+
+def _report(**kw) -> dict:
+    runs = [_run(r, ld, ev) for r in (1, 2, 3) for ld in ("idle", "flood") for ev in elm.EXTERNAL_EVENTS]
+    contract = elm.load_contract()
+    l1 = {n: "passed" for ev in contract["events"] for n in ev["l1_gate"]}
+    base = {"runs": runs, "repeats_required": 3, "diagnostic": False, "l1_gate": l1, "freeze_status": "frozen",
+            "method_revision": "x", "identity": {"daemon_sha256": "a" * 64, "source_commit": "b" * 40, "source_tree_dirty": False,
+                                             "artifact_source_commit": "c" * 40}}
+    base.update(kw)
+    return base
+
+
+def test_judge_run_limits_and_void():
+    assert elm.judge_run([1.0, 49.9], want=2, limit=50, load_before=IDLE, load_after=IDLE, errors=[])["verdict"] == "PASS"
+    assert elm.judge_run([1.0, 50.1], want=2, limit=50, load_before=IDLE, load_after=IDLE, errors=[])["verdict"] == "FAIL"
+    # 樣本數不足、有錯誤、host 過載（loadavg > CPU 數）皆不得 PASS／FAIL 放行
+    assert elm.judge_run([1.0], want=2, limit=50, load_before=IDLE, load_after=IDLE, errors=[])["verdict"] == "INSUFFICIENT_EVIDENCE"
+    assert elm.judge_run([1.0, 2.0], want=2, limit=50, load_before=IDLE, load_after=IDLE,
+                         errors=["x"])["verdict"] == "INSUFFICIENT_EVIDENCE"
+    r = elm.judge_run([1.0, 2.0], want=2, limit=50, load_before=IDLE, load_after=BUSY, errors=[])
+    assert r["void"] is True and r["verdict"] == "INSUFFICIENT_EVIDENCE"
+    assert elm.judge_run([1.0], want=1, limit=None, load_before=IDLE, load_after=IDLE, errors=[])["verdict"] == "INSUFFICIENT_EVIDENCE"
+
+
+def test_overall_verdict_requires_full_coverage_l1_gate_and_freeze():
+    assert elm.overall_verdict(_report()) == ("PASS", [])
+    rep = _report()
+    rep["runs"][4]["verdict"] = "FAIL"
+    assert elm.overall_verdict(rep)[0] == "FAIL"
+    rep = _report()
+    first = next(iter(rep["l1_gate"]))
+    rep["l1_gate"][first] = "failed"
+    assert elm.overall_verdict(rep)[0] == "FAIL"
+    for kw in ({"freeze_status": "pending_review_record"}, {"diagnostic": True}, {"l1_gate": {}},
+               {"runs": _report()["runs"][:-1]}, {"identity": {}},
+               {"identity": {"daemon_sha256": "a" * 64, "source_commit": "b" * 40, "source_tree_dirty": True}}):
+        v, reasons = elm.overall_verdict(_report(**kw))
+        assert v == "INSUFFICIENT_EVIDENCE" and reasons, kw
+    rep = _report()
+    rep["l1_gate"][first] = "missing"
+    assert elm.overall_verdict(rep)[0] == "INSUFFICIENT_EVIDENCE"
+
+
+def test_l1_gate_status_reads_outcomes_from_l1_results():
+    contract = elm.load_contract()
+    nids = {n for ev in contract["events"] for n in ev["l1_gate"]}
+    assert len(nids) >= 2
+    one = sorted(nids)[0]
+    st = elm.l1_gate_status(contract, {"results": [{"nodeid": one, "outcome": "passed"}]})
+    assert st[one] == "passed" and all(v == "missing" for k, v in st.items() if k != one)
+    assert set(elm.l1_gate_status(contract, None).values()) == {"missing"}
+
+
+def test_only_external_events_are_measured():
+    contract = elm.load_contract()
+    ext = {e["event"] for e in contract["events"] if e.get("measure") == "external"}
+    assert ext == set(elm.EXTERNAL_EVENTS)
+
+
+_IDLE_SESSION = {"ok": True, "session": {"state": "READY", "foreground_busy": False, "recovering": False}}
+_BUSY_SESSION = {"ok": True, "session": {"state": "READY", "foreground_busy": True, "recovering": False}}
+
+
+class _FakeRpc:
+    """記憶體替身：可控制 `command.get`／session 回應，取消回 `cancel_reply`。
+
+    `session_replies` 依序回應 `session.get_state`（用完後重複最後一筆）；未給時固定回 `session_reply`，
+    預設為已收尾的 READY session（`foreground_busy: false`，Python／Rust `session.get_state` 皆提供此欄）。"""
+
+    def __init__(self, cancel_reply: dict, status_after_cancel: str = "canceled", *,
+                 command_get_replies: list[dict] | None = None, session_reply: dict | None = None,
+                 session_replies: list[dict] | None = None, session_error: Exception | None = None) -> None:
+        self.cancel_reply = cancel_reply
+        self.status_after_cancel = status_after_cancel
+        self.command_get_replies = command_get_replies
+        self.session_reply = session_reply if session_reply is not None else _IDLE_SESSION
+        self.session_replies = session_replies
+        self.session_error = session_error
+        self.cancelled = False
+        self.command_get_calls = 0
+        self.session_get_calls = 0
+        self.session_get_calls_after_cancel = 0
+        self.timed_calls = 0
+        self.submit_calls = 0
+
+    def call(self, method: str, params: dict) -> dict:
+        if method == "command.submit":
+            self.submit_calls += 1
+            return {"ok": True, "cmd_id": "c1"}
+        if method == "command.get":
+            self.command_get_calls += 1
+            if self.command_get_replies is not None:
+                return self.command_get_replies[min(self.command_get_calls - 1, len(self.command_get_replies) - 1)]
+            status = self.status_after_cancel if self.cancelled else "running"
+            return {"ok": True, "command": {"status": status, "done_at": "t" if self.cancelled else None}}
+        if method == "session.get_state":
+            self.session_get_calls += 1
+            if self.cancelled:
+                self.session_get_calls_after_cancel += 1
+            if self.session_error is not None:
+                raise self.session_error
+            if self.session_replies is not None:
+                return self.session_replies[min(self.session_get_calls - 1, len(self.session_replies) - 1)]
+            return self.session_reply
+        raise AssertionError(method)
+
+    def timed(self, method: str, params: dict) -> tuple[float, dict]:
+        assert method == "command.cancel"
+        self.timed_calls += 1
+        self.cancelled = True
+        return 0.5, dict(self.cancel_reply)
+
+
+class _DeadlineClock:
+    """單次 sleep 就越過 10 秒期限，讓取消樣本逾時測試保持快速且確定。"""
+
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += 10.001
+
+
+def test_cancel_sample_accepted_timeout_reports_stage_and_state(monkeypatch):
+    clock = _DeadlineClock()
+    monkeypatch.setattr(elm, "time", clock)
+    rpc = _FakeRpc(
+        {"ok": True, "cmd_id": "c1", "status": "canceled"},
+        command_get_replies=[{"ok": True, "command": {
+            "cmd_id": "c1", "status": "accepted", "done_at": None,
+        }}],
+        session_reply={"ok": True, "session": {
+            "state": "ATTACHED", "foreground_busy": True, "recovering": False,
+        }},
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        elm._sample_cancel(rpc)
+
+    message = str(caught.value)
+    assert "stage=wait_running" in message
+    assert "cmd_id='c1'" in message
+    assert (
+        "last_command_response={'ok': True, 'command': {'cmd_id': 'c1', 'status': 'accepted', 'done_at': None}}"
+        in message
+    )
+    assert "elapsed=10.001s" in message
+    assert "session.state='ATTACHED'" in message
+    assert "foreground_busy=True" in message
+    assert "recovering=False" in message
+    assert "命令未進入 running（accepted）" in message
+    assert rpc.session_get_calls == 1 and rpc.timed_calls == 0
+
+
+def test_cancel_timeout_diagnostic_failure_preserves_original_error(monkeypatch):
+    monkeypatch.setattr(elm, "time", _DeadlineClock())
+    rpc = _FakeRpc(
+        {"ok": True, "cmd_id": "c1", "status": "canceled"},
+        command_get_replies=[{"ok": True, "command": {"status": "accepted"}}],
+        session_error=OSError("狀態診斷 RPC 失敗"),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        elm._sample_cancel(rpc)
+
+    message = str(caught.value)
+    assert "命令未進入 running（accepted）" in message
+    assert "stage=wait_running" in message and "cmd_id='c1'" in message
+    assert "elapsed=10.001s" in message
+    assert "session_state_diagnostic_error=OSError: 狀態診斷 RPC 失敗" in message
+    assert rpc.session_get_calls == 1 and rpc.timed_calls == 0
+
+
+def test_cancel_sample_keeps_command_get_failures_distinct(monkeypatch):
+    cases = [
+        ({"ok": False, "error_code": "RPC_FAILED"}, "command.get 非 ok"),
+        ({"ok": True}, "command.get 缺少 command"),
+        ({"ok": True, "command": {"status": "done"}}, "命令於進入 running 前已終止"),
+    ]
+    for response, expected in cases:
+        monkeypatch.setattr(elm, "time", _DeadlineClock())
+        rpc = _FakeRpc(
+            {"ok": True, "cmd_id": "c1", "status": "canceled"},
+            command_get_replies=[response],
+        )
+        with pytest.raises(RuntimeError) as caught:
+            elm._sample_cancel(rpc)
+        assert expected in str(caught.value)
+        assert "命令未進入 running（accepted）" not in str(caught.value)
+        assert rpc.session_get_calls == 0 and rpc.timed_calls == 0
+
+
+def test_cancel_sample_rejects_refused_cancel():
+    """sol P5-3084388-1：running → 自然完成 → 取消被拒（CMD_NOT_CANCELABLE）不得算有效取消樣本。"""
+    with pytest.raises(RuntimeError):
+        elm._sample_cancel(_FakeRpc({"ok": False, "error_code": "CMD_NOT_CANCELABLE", "cmd_id": "c1"}, "done"))
+    # 回 ok 但命令最終不是 canceled（例如自然完成）也不算
+    with pytest.raises(RuntimeError):
+        elm._sample_cancel(_FakeRpc({"ok": True, "cmd_id": "c1", "status": "canceled"}, "done"))
+    assert elm._sample_cancel(_FakeRpc({"ok": True, "cmd_id": "c1", "status": "canceled"})) == 0.5
+
+
+class _StepClock:
+    """sleep 只推進虛擬時間、不真的等待：收尾屏障在既有 15 秒期限內輪詢時保持快速且確定。"""
+
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def test_cancel_sample_does_not_finish_while_foreground_busy(monkeypatch):
+    """S2-PAR-fixlat 第 4 項：取消成功與 `done_at` 只代表命令記錄已終結——Python `CommandArbiter.cancel()` 與
+    Rust `CommandRegistry::cancel()` 都在回覆前寫入 `done_at`，worker 仍可能在等該命令的 prompt。session 仍 READY、
+    `foreground_busy` 仍為 true 時不得結束樣本，否則下一筆的 accepted 等待會吃到前一筆的 worker 收尾時間
+    （target/s2-par/S2-PAR-fixlat-4/probe-*：Python 200／200、Rust 32／200 筆於忙碌中返回）。"""
+    monkeypatch.setattr(elm, "time", _StepClock())
+    replies = [_BUSY_SESSION, _BUSY_SESSION, _BUSY_SESSION, _IDLE_SESSION]
+    rpc = _FakeRpc({"ok": True, "cmd_id": "c1", "status": "canceled"}, session_replies=replies)
+
+    assert elm._sample_cancel(rpc) == 0.5            # 計時仍只取 command.cancel 的 RPC 送出 → 回應
+    assert rpc.submit_calls == 1 and rpc.timed_calls == 1
+    # `_wait_state(READY)` 先取第一筆（READY＋忙碌），之後須一路輪詢到 foreground_busy 解除才返回
+    assert rpc.session_get_calls_after_cancel == len(replies)
+
+
+def test_cancel_sample_errors_when_foreground_busy_outlives_deadline(monkeypatch):
+    """既有 15 秒期限內 worker 仍未收尾：該樣本記錯（整輪不得 PASS），不延長期限、不重送、不丟棄。"""
+    monkeypatch.setattr(elm, "time", _DeadlineClock())
+    rpc = _FakeRpc({"ok": True, "cmd_id": "c1", "status": "canceled"}, session_reply=_BUSY_SESSION)
+
+    with pytest.raises(RuntimeError) as caught:
+        elm._sample_cancel(rpc)
+
+    message = str(caught.value)
+    assert "被取消的在途命令 worker 未收尾" in message
+    assert "stage=wait_drain" in message and "cmd_id='c1'" in message
+    assert "session.state='READY'" in message and "foreground_busy=True" in message
+    assert "命令未進入 running（accepted）" not in message
+    assert rpc.submit_calls == 1 and rpc.timed_calls == 1
+
+
+def test_cancel_sample_drain_requires_reported_idle_ready_session(monkeypatch):
+    """缺 `foreground_busy` 欄位或 session 已不在 READY，都不能當作 worker 已收尾。"""
+    for reply, state, busy in (
+        ({"ok": True, "session": {"state": "READY"}}, "'READY'", "None"),
+        ({"ok": True, "session": {"state": "RECOVERING", "foreground_busy": False, "recovering": True}},
+         "'RECOVERING'", "False"),
+    ):
+        monkeypatch.setattr(elm, "time", _DeadlineClock())
+        rpc = _FakeRpc({"ok": True, "cmd_id": "c1", "status": "canceled"}, session_replies=[_IDLE_SESSION, reply])
+        with pytest.raises(RuntimeError) as caught:
+            elm._sample_cancel(rpc)
+        message = str(caught.value)
+        assert "stage=wait_drain" in message, reply
+        assert f"session.state={state}" in message and f"foreground_busy={busy}" in message, reply
+
+
+def test_cancel_sample_drain_rpc_failure_is_distinct(monkeypatch):
+    """收尾輪詢的 `session.get_state` 非 ok 立即記錯，不被當成仍忙碌而等到期限。"""
+    monkeypatch.setattr(elm, "time", _StepClock())
+    rpc = _FakeRpc({"ok": True, "cmd_id": "c1", "status": "canceled"},
+                   session_replies=[_IDLE_SESSION, {"ok": False, "error_code": "RPC_FAILED"}])
+
+    with pytest.raises(RuntimeError) as caught:
+        elm._sample_cancel(rpc)
+
+    message = str(caught.value)
+    assert "session.get_state 非 ok" in message and "stage=wait_drain" in message
+    assert rpc.session_get_calls_after_cancel == 2
+
+
+def test_cancel_sample_refused_or_not_canceled_fails_before_drain():
+    """取消被拒與最終非 canceled 仍各自明確失敗，不進收尾屏障（也不被屏障的等待取代）。"""
+    refused = _FakeRpc({"ok": False, "error_code": "CMD_NOT_CANCELABLE", "cmd_id": "c1"}, "done",
+                       session_reply=_BUSY_SESSION)
+    with pytest.raises(RuntimeError, match="command.cancel 未成功取消在途命令"):
+        elm._sample_cancel(refused)
+    assert refused.session_get_calls_after_cancel == 0
+
+    finished = _FakeRpc({"ok": True, "cmd_id": "c1", "status": "canceled"}, "done", session_reply=_BUSY_SESSION)
+    with pytest.raises(RuntimeError, match="取消後命令最終狀態不是 canceled"):
+        elm._sample_cancel(finished)
+    assert finished.session_get_calls_after_cancel == 1      # 只有 `_wait_state(READY)`，未進收尾輪詢
+
+
+def test_report_identity_binds_artifact_commit_tool_and_run(tmp_path):
+    """sol P5-3084388-2：報告須可追溯受測 artifact（sha256）、來源 commit、工具／契約 revision 與 run ID。"""
+    exe = tmp_path / "serialwrapd"
+    exe.write_bytes(b"\x7fELF-fake")
+    ident = elm.report_identity(str(exe), run_id="r-test")
+    import hashlib
+
+    assert ident["daemon_sha256"] == hashlib.sha256(b"\x7fELF-fake").hexdigest()
+    assert ident["run_id"] == "r-test"
+    assert len(ident["source_commit"]) == 40 and isinstance(ident["source_tree_dirty"], bool)
+    assert len(ident["tool_sha256"]) == 64 and len(ident["contract_sha256"]) == 64
+    assert ident["method_revision"] == elm.load_contract()["method_revision"]
+    assert "/" not in ident["daemon"] or not ident["daemon"].startswith("/")   # 不落本機絕對路徑（R-21）
+
+
+def test_sha256_file_works_without_hashlib_file_digest(tmp_path, monkeypatch):
+    """sol P5-2472f78-1：Python 3.10 沒有 `hashlib.file_digest`；雜湊須以分塊 update 計算。"""
+    import hashlib
+
+    monkeypatch.delattr(hashlib, "file_digest", raising=False)
+    f = tmp_path / "x.bin"
+    f.write_bytes(b"a" * 300000)
+    assert elm._sha256_file(str(f)) == hashlib.sha256(b"a" * 300000).hexdigest()
+
+
+def test_identity_binds_artifact_to_build_report(tmp_path):
+    """sol P5-3084388-2（第 3 輪）：來源 commit 須是受測 artifact 的建置來源，不得只取工具工作樹 HEAD。
+    以建置紀錄（gate report.json 的 identity.daemon_sha256＋git_revision）核對 artifact sha256；不符或未提供即不得 PASS。"""
+    import hashlib
+    import json
+
+    exe = tmp_path / "serialwrapd"
+    exe.write_bytes(b"\x7fELF-fake")
+    sha = hashlib.sha256(b"\x7fELF-fake").hexdigest()
+    good = tmp_path / "report.json"
+    good.write_text(json.dumps({"run_id": "g1", "git_revision": "c" * 40, "identity": {"daemon_sha256": sha}}))
+    ident = elm.report_identity(str(exe), run_id="r", build_report=str(good))
+    assert ident["artifact_source_commit"] == "c" * 40 and ident["artifact_build_run_id"] == "g1"
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"run_id": "g2", "git_revision": "d" * 40, "identity": {"daemon_sha256": "0" * 64}}))
+    assert elm.report_identity(str(exe), run_id="r", build_report=str(bad))["artifact_source_commit"] is None
+    assert elm.overall_verdict(_report())[0] == "PASS"
+    no_bind = _report()
+    no_bind["identity"]["artifact_source_commit"] = None
+    assert elm.overall_verdict(no_bind)[0] == "INSUFFICIENT_EVIDENCE"
+
+
+# --------------------------------------------------------------------------- 方法審閱（Codex gpt-6.1-sol，2026-10-29，rejected）
+
+class _EmitTarget:
+    """flood 替身：`emit` 依 `fail` 拋出 OSError，或正常吞下 bytes。"""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.fail = fail
+        self.bytes = 0
+
+    def emit(self, body: bytes) -> None:
+        if self.fail:
+            raise OSError("EIO")
+        self.bytes += len(body)
+
+
+def test_flood_emit_failure_is_reported_as_invalid_load():
+    """審閱 [High]：flood 送出失敗被吞掉時，量測不得當成有效 flood。"""
+    with elm._Flood(_EmitTarget(fail=True), 20000, 256) as fl:
+        import time
+
+        time.sleep(0.15)
+    stats = fl.stats()
+    assert stats["emit_errors"] > 0 and stats["sent"] == 0
+    problems = elm.flood_problems(stats, bytes_per_s=20000, min_seconds=0.1)
+    assert problems and any("送出失敗" in p for p in problems)
+
+
+def test_flood_requires_actual_rate_and_duration():
+    """審閱 [High]：須驗證實際速率與持續時間（`flood_load.seconds`），不得只看 context 正常結束。"""
+    ok = {"sent": 20000 * 30, "seconds": 30.0, "emit_errors": 0, "first_error": None, "thread_alive": True}
+    assert elm.flood_problems(ok, bytes_per_s=20000, min_seconds=30) == []
+    assert elm.flood_problems({**ok, "sent": 20000 * 10}, bytes_per_s=20000, min_seconds=30)        # 速率不足
+    assert elm.flood_problems({**ok, "seconds": 5.0, "sent": 20000 * 5}, bytes_per_s=20000, min_seconds=30)  # 時間不足
+    assert elm.flood_problems({**ok, "thread_alive": False}, bytes_per_s=20000, min_seconds=30)     # 送出端中途結束
+    with elm._Flood(_EmitTarget(), 20000, 256) as fl:
+        import time
+
+        time.sleep(0.3)
+    st = fl.stats()
+    assert st["emit_errors"] == 0 and st["sent"] > 0 and st["thread_alive"] is True
+    assert elm.flood_problems(st, bytes_per_s=20000, min_seconds=0.2) == []
+
+
+def test_flood_run_judged_insufficient_when_load_invalid_but_over_limit_still_fails():
+    """flood 無效 → 證據不足；但有效樣本已超限仍為 FAIL（不得被負載問題降級）。"""
+    ok = elm.judge_run([1.0, 2.0], want=2, limit=100, load_before=IDLE, load_after=IDLE, errors=[],
+                       load_problems=["flood 送出失敗 3 次"])
+    assert ok["verdict"] == "INSUFFICIENT_EVIDENCE" and ok["load_problems"]
+    bad = elm.judge_run([1.0, 120.0], want=2, limit=100, load_before=IDLE, load_after=IDLE, errors=[],
+                        load_problems=["flood 送出失敗 3 次"])
+    assert bad["verdict"] == "FAIL"
+
+
+def test_over_limit_sample_is_not_downgraded_by_errors():
+    """審閱 [Medium]：有效樣本 80 ms／上限 50 ms 為 FAIL；同輪加一筆取消被拒不得變成 INSUFFICIENT_EVIDENCE。"""
+    assert elm.judge_run([80.0], want=1, limit=50, load_before=IDLE, load_after=IDLE, errors=[])["verdict"] == "FAIL"
+    r = elm.judge_run([80.0], want=2, limit=50, load_before=IDLE, load_after=IDLE,
+                      errors=["command_cancel #1: RuntimeError: command.cancel 未成功取消在途命令"])
+    assert r["verdict"] == "FAIL"
+    # 明確作廢（host 過載）的輪次才不判 FAIL
+    v = elm.judge_run([80.0], want=1, limit=50, load_before=IDLE, load_after=BUSY, errors=[])
+    assert v["void"] is True and v["verdict"] == "INSUFFICIENT_EVIDENCE"
+
+
+class _ReleaseRpc:
+    def __init__(self, attach_ok: bool) -> None:
+        self.attach_ok = attach_ok
+
+    def timed(self, method: str, params: dict) -> tuple[float, dict]:
+        assert method == "device.release"
+        return 7.5, {"ok": True}
+
+    def call(self, method: str, params: dict) -> dict:
+        if method == "device.attach":
+            return {"ok": self.attach_ok, "error_code": None if self.attach_ok else "ATTACH_FAILED"}
+        if method == "session.get_state":
+            return {"ok": True, "session": {"state": "READY"}}
+        raise AssertionError(method)
+
+
+def test_release_timing_is_kept_when_reattach_fails():
+    """審閱 [Medium]：已取得 release 耗時後重新 attach 失敗，不得遺失該耗時（另記準備錯誤）。"""
+    assert elm._sample_release(_ReleaseRpc(True)) == (7.5, None)
+    ms, err = elm._sample_release(_ReleaseRpc(False))
+    assert ms == 7.5 and err and "device.attach" in err
+
+
+def test_host_void_uses_mid_run_peak_and_missing_monitoring_is_insufficient():
+    """審閱 [Medium]：作廢規則須看量測期間取樣的峰值；監測資料缺失時判證據不足，不得 PASS。"""
+    r = elm.judge_run([1.0], want=1, limit=50, load_before=IDLE, load_after=IDLE, errors=[],
+                      host_samples=[IDLE, BUSY, IDLE])
+    assert r["void"] is True and r["verdict"] == "INSUFFICIENT_EVIDENCE"
+    assert r["host_load"]["peak_loadavg_1min"] == 9.0
+    none = {"loadavg_1min": None, "cpu_count": None}
+    m = elm.judge_run([1.0], want=1, limit=50, load_before=none, load_after=none, errors=[], host_samples=[])
+    assert m["verdict"] == "INSUFFICIENT_EVIDENCE" and m["host_monitor_missing"] is True
+    mon = elm._HostMonitor(interval=0.02)
+    with mon:
+        import time
+
+        time.sleep(0.1)
+    assert len(mon.samples) >= 2
+
+
+def test_identity_requires_build_sha_for_explicit_artifact_source(tmp_path):
+    """審閱 [High]：gate 明示來源 commit 時須同時給出建置當下的 artifact sha256；不符（例如建置失敗留下舊 binary）
+    或未給即不得綁定來源。"""
+    import hashlib
+
+    exe = tmp_path / "serialwrapd"
+    exe.write_bytes(b"\x7fELF-new")
+    sha = hashlib.sha256(b"\x7fELF-new").hexdigest()
+    ok = elm.report_identity(str(exe), run_id="r", artifact_source_commit="c" * 40, artifact_build_run_id="g",
+                             artifact_sha256=sha)
+    assert ok["artifact_source_commit"] == "c" * 40 and ok["artifact_build_mismatch"] is None
+    stale = elm.report_identity(str(exe), run_id="r", artifact_source_commit="c" * 40, artifact_build_run_id="g",
+                                artifact_sha256="0" * 64)
+    assert stale["artifact_source_commit"] is None and stale["artifact_build_mismatch"]
+    unbound = elm.report_identity(str(exe), run_id="r", artifact_source_commit="c" * 40, artifact_build_run_id="g")
+    assert unbound["artifact_source_commit"] is None and unbound["artifact_build_mismatch"]
+
+
+def test_contract_applies_od58_release_limits():
+    """OD-58：release_request 上限 idle 250／flood 300 ms；stop_request／command_cancel 維持 50／100 ms。"""
+    rows = {e["event"]: e for e in elm.load_contract()["events"]}
+    assert (rows["release_request"]["max_ms_idle"], rows["release_request"]["max_ms_flood"]) == (250, 300)
+    for ev in ("stop_request", "command_cancel"):
+        assert (rows[ev]["max_ms_idle"], rows[ev]["max_ms_flood"]) == (50, 100)

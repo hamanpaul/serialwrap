@@ -272,6 +272,12 @@ impl ProcessCtl for NativeProcessCtl {
         }
         let mut process_info = PROCESS_INFORMATION::default();
 
+        // 與 event handler 的 pipe 建立／CreateProcessW 互斥：bInheritHandles=TRUE 且無 HANDLE_LIST 時，
+        // 不得繼承 handler 的可繼承子端 pipe（審查 96b28dd_06c61d0 L3）。
+        let _spawn_guard = super::WIN_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // 鎖序固定 WIN_SPAWN_LOCK → STD_INHERIT_LOCK（StdOutputInheritGuard 只取後者），不會反向等待。
         // 傳入的是原始標準 handle：與 StdOutputInheritGuard 串行，避免在其暫時取消繼承旗標時建立行程。
         let inherit_lock = STD_INHERIT_LOCK
             .lock()
@@ -516,7 +522,7 @@ fn terminate_and_close(info: &PROCESS_INFORMATION, job: HANDLE) {
     }
 }
 
-fn quote_command_line(argv: &[OsString]) -> Vec<u16> {
+pub(super) fn quote_command_line(argv: &[OsString]) -> Vec<u16> {
     let mut result = Vec::new();
     for (index, arg) in argv.iter().enumerate() {
         if index > 0 {

@@ -150,7 +150,7 @@ build_bundle_with_system_python() {
         echo "build venv 的基底直譯器位於 $base，應為 /usr/bin：不回退使用其他 python" >&2
         exit 3
     fi
-    BUNDLE="$(env "PATH=$venv/bin:$PATH" "$REPO_ROOT/scripts/rust/mkbundle.sh" --release-bundle --profile release \
+    BUNDLE="$(env "PATH=$venv/bin:$PATH" "$REPO_ROOT/scripts/rust/mkbundle.sh" --release-bundle --stage 2 --profile release \
         --version-override "$NEW_VERSION" --out "$WORK/bundle-$NEW_VERSION" --print-dir | tail -1)"
 }
 
@@ -175,7 +175,7 @@ if ((DRY_RUN)); then
     print_command python3 -m pip wheel --no-deps --no-build-isolation -w "$WORK/wheels" "$WORK/src-$OLD_VERSION"
     print_command "$SYSTEM_PYTHON" -m venv "$WORK/build-venv"
     print_command "$WORK/build-venv/bin/python3" -m pip install --quiet --disable-pip-version-check "${BUILD_PIP_PINS[@]}"
-    print_command env "PATH=$WORK/build-venv/bin:$PATH" "$REPO_ROOT/scripts/rust/mkbundle.sh" --release-bundle --profile release \
+    print_command env "PATH=$WORK/build-venv/bin:$PATH" "$REPO_ROOT/scripts/rust/mkbundle.sh" --release-bundle --stage 2 --profile release \
         --version-override "$NEW_VERSION" --out "$WORK/bundle-$NEW_VERSION"
     echo "+ require ${BUNDLE:-$WORK/bundle-$NEW_VERSION}/versions/$NEW_VERSION/py/pyvenv.cfg: home = /usr/bin, include-system-site-packages = false"
     print_command python3 -m pip download --only-binary=:all: "${OLD_WHEEL_TARGET[@]}" --dest "$WORK/wheels" 'PyYAML>=6'
@@ -187,7 +187,7 @@ if ((DRY_RUN)); then
     for mode in "${MODES[@]}"; do
         container_run "$mode" "$WORK/wheels" "${BUNDLE:-$WORK/bundle-$NEW_VERSION}"
         print_command "${run_cmd[@]}"
-        print_command docker exec "sw-upgrade-$RUN_ID-$mode" python3 /opt/sw-driver/run_upgrade_container.py \
+        print_command docker exec -e "SW_UPGRADE_NEW_VERSION=$NEW_VERSION" "sw-upgrade-$RUN_ID-$mode" python3 /opt/sw-driver/run_upgrade_container.py \
             --mode "$mode" --wheel "/opt/sw-old/serialwrap-$OLD_VERSION-py3-none-any.whl" --bundle /opt/sw-new --out /evidence \
             ${EXTRA_DRIVER_ARGS[@]+"${EXTRA_DRIVER_ARGS[@]}"}
     done
@@ -291,6 +291,7 @@ for mode in "${MODES[@]}"; do
     rc=0
     docker exec -e SW_HOST_UID="$(id -u)" -e SW_HOST_GID="$(id -g)" -e SW_UPGRADE_IMAGE="$IMAGE" \
         -e SW_UPGRADE_IMAGE_ID="$IMAGE_ID" -e SW_UPGRADE_DRIVER_REVISION="$SOURCE_REVISION" \
+        -e SW_UPGRADE_NEW_VERSION="$NEW_VERSION" \
         "$name" python3 /opt/sw-driver/run_upgrade_container.py \
         --mode "$mode" --wheel "/opt/sw-old/$(basename "$WHEEL")" --bundle /opt/sw-new --out /evidence \
         ${EXTRA_DRIVER_ARGS[@]+"${EXTRA_DRIVER_ARGS[@]}"} || rc=$?

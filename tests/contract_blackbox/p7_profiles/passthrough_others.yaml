@@ -1,0 +1,19 @@
+# P7 黑箱（Task 18A）：passthrough 未知設備觀察（ready_probe 空字串）。
+profiles:
+  p7-others:
+    platform: passthrough
+    prompt_regex: ".*"
+    login_regex: "$^"
+    password_regex: "$^"
+    ready_probe: ""
+    uart:
+      baud: 115200
+      data_bits: 8
+      parity: N
+      stop_bits: 1
+      flow_control: none
+      xonxoff: false
+targets:
+  - profile: p7-others
+    com: COM0
+    device_by_id: "${BY_ID}"

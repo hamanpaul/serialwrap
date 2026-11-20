@@ -16,6 +16,10 @@ crates/*/tests/golden/** text eol=lf
 crates/sw-proto/src/pyre/unicode_names.tsv text eol=lf
 sw_core/assets/** text eol=lf
 crates/sw-pal/tests/golden/serialwrap.task.xml -text
+# golden 以位元組比對（Python 新鮮度測試與 Rust include_str!），Windows 檢出不得轉 CRLF（parity-amendments-2026-10-26 #181）；
+# 37_bom_crlf 為刻意保存 CRLF 的 profiles fixture，須維持原位元組。
+contracts/golden/** text eol=lf
+contracts/golden/profiles_fixtures/37_bom_crlf/** -text
 # 證據檔以位元組雜湊登錄（stage0_evidence_index.yaml 之 sha256），跨平台檢出不得做 EOL 轉換（CRLF 原樣保留）
 evidence/** -text
 # 擁有者 Windows 原生證據逐字保存（含 CRLF），不做行尾轉換也不做空白檢查（OD-29 (4)）

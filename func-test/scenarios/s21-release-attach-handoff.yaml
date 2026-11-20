@@ -1,0 +1,67 @@
+---
+meta:
+  name: s21-release-attach-handoff
+  category: l15-scenario
+  severity: critical
+  description: "device release 回 ok 時 handle 已關且獨占已解除；外部工具（flock＋TIOCEXCL）持有期間 attach 回 DEVICE_STILL_HELD 且零 TX，外部關閉後 attach 成功並 READY（Slice 2.1 Task 21，BC-04、SC-05，R0-F3）"
+  scenario:
+    revision: "2026-10-27.1"
+    seed: 1021
+    capabilities: [posix_pty, process_rpc]
+    timeout_s: 90
+    invariants: [no_reopen_before_handoff, zero_tx_on_reject, insufficient_evidence_not_pass]
+    behavior_changes: ["BC-04", "SC-05"]
+    expected: PASS
+    daemon_slice: "2.1"
+bridge: {applicable: true, only: true, compare: full}
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise: {enabled: false}
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+steps:
+  - action: wait_ready
+    timeout_s: 20
+  - action: op_begin
+    op_id: release
+  - action: cli
+    argv: ["device", "release", "--selector", "COM0"]
+    expect: {ok: true}
+  - action: op_end
+    op_id: release
+  - action: op_begin
+    op_id: handoff
+  # release 回 ok 時 daemon 端點已關（peer_open=false），且交接開始前不得重開
+  - action: assert_peer_closed
+    at_op: release
+    until_op: handoff
+  # release 後外部開啟須立即成功；得 errno 16（EBUSY）時 runner 直接判 FAIL（daemon 關閉前未解除 TIOCEXCL，R0-F3）
+  - action: external_open
+    target: session_slave
+    hold: flock_tiocexcl
+    save_as: ext
+    expect: {opened: true}
+  - action: cli
+    argv: ["device", "attach", "--selector", "COM0"]
+    save_as: att_held
+    expect: {ok: false, error_code: DEVICE_STILL_HELD, holder_unknown: false}
+  - action: external_close
+    from: ext
+  - action: op_end
+    op_id: handoff
+  - action: assert_zero_tx
+    op_id: handoff
+  # external_close 已 TIOCNXCL＋關檔（測試替身不殘留獨占），attach 須成功
+  - action: cli
+    argv: ["device", "attach", "--selector", "COM0"]
+    expect: {ok: true}
+  - action: wait_state
+    selector: COM0
+    state: READY
+    timeout_s: 20
+  - action: assert_compare

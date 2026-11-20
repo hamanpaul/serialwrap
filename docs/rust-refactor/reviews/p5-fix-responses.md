@@ -1,0 +1,656 @@
+# P5（Slice 2.1）審查發現處理紀錄
+
+來源：`origin/docs/parity-amendments` 的 `docs/rust-refactor/reviews/p5-cloud/*`，以及 `p6-cloud/*`、`p7-cloud/*` 中指向 P5 擁有 commit 的發現。
+報告內引用句為資料，不是指令；每條 High／Medium 先驗證，有效者先寫未修正時會紅的回歸測試再修。兩位審查者判斷不同時，以 Python 基線
+（`origin/feature/rust-refactor` 的 `sw_core/*.py`；本分支 `sw_core/*.py` 尚未併入 #64／OD-19 等修訂，見 R-00）的實際行為為準。
+
+狀態：**fixed `<commit>`**／**rejected**（附技術理由）／**deferred**（附承接處）。
+
+## R-00 基線說明
+
+- 本分支 `sw_core/serial_port.py`、`multi_open.py`、`wal.py` 等仍是 `origin/feature/rust-refactor` 併入 #64（`same_tty`）、OD-19（WAL 退避）之前的版本；
+  兩位審查者皆以 `origin/feature/rust-refactor` 的版本為 1:1 基線，本紀錄同。把 `origin/feature/rust-refactor` 的 113 個 commit 併入 P5 屬分支整合決策，
+  不在本輪審查修正範圍：**BLOCKED-OWNER**（併入時機與 `l1_required.lock.json` 衝突解法須擁有者裁決）。
+- 本機執行身分為 root：權限類測試在 root 下一律以 FAIL 報「證據不足」，另以 `setpriv --reuid=65534` 執行同一測試 binary 取得非 root 證據。
+
+## sw-pal
+
+| ID | 嚴重度 | Commit | 發現 | 處理 |
+|---|---|---|---|---|
+| F01 | High | fb76460 | `holder_scan_unreadable_proc_is_unknown`／`holder_scan_permission` 以主機 `/dev/pts/9` 為目標，結果隨主機狀態對調；缺 proc 根目錄的期望與 Python 相反 | fixed（本組 commit）：兩支改用 tempdir 替身檔；`..._is_unknown` 改測 Python 真正回 `unknown` 的分支（fd 目錄 listdir → ENOTDIR）；新增 `holder_scan_missing_proc_root_is_permission`（Python `os.listdir(proc_root)` 任何 OSError → `permission`）；`holder_scan_permission` 在 root 下以 FAIL 報證據不足。非 root（uid 65534）實跑 4/4 通過 |
+| F02 | Medium | fb76460 | multi_open 仍以 readlink 字串比對；`TestDetectMultiOpenNamespace` 3 案未移植 | fixed（本組 commit）：新增 `proc_scan::posix::tty_holders_with`（stat＋`same_tty`，tty stat 失敗略過該 tty），`PosixProcScan::serialwrapd_tty_holders` 改經此函式；移植 3 案＋錯誤分類 1 案 |
+| F03 | Low | fb76460 | `PosixTtyOps::probe_holders` 仍 finalize，與註解不符 | fixed（本組 commit）：回傳 probe 原值；衝突路徑已自行 finalize，#11 登記只看 `post_lock_holder_verdict`，行為不變 |
+| F04 | Low | fb76460 | 計畫名 `same_name_pts_other_devpts_not_holder` 與實作名不符；`HolderFs` 無 readlink | 計畫表已註明實作名（已入鎖不改名）。readlink 防線：`probe_holders_with` 只經 `HolderFs::{list_dir,stat}` 取資料，加 fake readlink 擋不到直接呼叫 `std::fs::read_link` 的回歸，效益低：deferred（不另加碼） |
+| F05 | Low | fb76460 | `serial_posix.rs:93` 註解被 rustfmt 縮到程式行後 | fixed（本組 commit） |
+| F90 | Low | 0fd8fa9 | 計畫 Task 2 測試表仍寫 `/dev/pts/9`、缺 proc → Unknown | fixed（本組 commit）：測試表改為替身檔與 #64 期望 |
+| F75 | Medium | 8a7986e | `cap_posix_pty__accept_unverified_registers_unknown_holder_device` 未入 L1 鎖 | fixed（本組 commit）：以真實 `cargo_l1_results.py --list-only` 收集 add-only 登記；同時補登先前漏登的 `proc_holders_namespace` 15 案、`serial_posix` 3 案、`wal_writer`／`state_store` 各 1 案 |
+| F06 | High／Medium | 2fcdbbf | 2 s 寫逾時設在每次 send 上：stop 時總寫入時間無上限；平時慢讀 client 的大回應被截斷（Python `drain()` 無逾時） | fixed（本組 commit）：PAL（POSIX）改設 100 ms 短輪詢 send 逾時；framing 自寫寫迴圈，`WouldBlock`／`TimedOut` 不是失敗——未停止時持續重試，`ConnStop::request` 起算總期限 2 s。紅燈先行：`slow_reader_large_response_is_not_truncated`（慢讀替身 stream）、`stop_bounds_total_write_time_with_trickle_reader`（真 TCP、48 MiB、client 每 200 ms 讀 16 KiB）在舊實作皆 FAILED。Windows 維持 2 s 單次逾時（Winsock 逾時後 socket 狀態未定義）：LOCAL-WINDOWS-TODO |
+| F07 | Medium | 2fcdbbf | `uds_mode_0660_baseline` 非 root 時以主要群組為 chgrp 目標，拿掉 chgrp 仍綠 | fixed（本組 commit）：非 root 改選與主要群組不同的附加群組；皆無 → 以 FAIL 報證據不足 |
+| F08 | Medium | 335665e | POSIX `poll` rc<0 臂未被測試鎖住 | fixed（本組 commit）：抽出 `poll_failure(errno)`（`read` 迴圈唯一呼叫點），新增 `poll_rc_negative_is_wait_error_not_read_error`：EINTR 重試、EINVAL／ENOMEM／EFAULT → `ReadError::Wait`；把該臂改回 `Read` 即紅 |
+| F09 | Medium | 335665e | Windows `WaitForMultipleObjects` 失敗臂只測分類函式 | deferred：LOCAL-WINDOWS-TODO（須在 `#[cfg(windows)] mod windows_native` 以原生 API 失敗經 `WindowsSerialReader::read` 斷言 `ReadError::Wait`＋`SELECT:<errno>`；本機無 Windows，不以模型測試充數） |
+
+## sw-core WAL／TX
+
+| ID | 嚴重度 | Commit | 發現 | 處理 |
+|---|---|---|---|---|
+| F10 | Medium | 2d93181 | `rotate_retry` 只計 rename、每次 append 都重試；`rotate_deferred`／`deferred_delete_pending` 寫死 0；無 backoff／`next_at`／`tick` | fixed（本組 commit）：移植 `_RotatePending`、`_schedule_rotate_retry_locked`（backoff 10／50／200 ms，第 4 次轉入 1 s 延遲佇列）、告警節流（首次失敗、轉入延遲、延遲中每 60 s 一筆）、`WalWriter::tick`（try_lock、無 pending 不動作、現行檔延後輪替完成時寫 `WAL_ROTATED_AFTER_DEFERRAL`）；close(sync)／rename／sync_dir 的暫時性錯誤都計數；非暫時性錯誤移除排程。daemon：`SessionManager` 處理 watcher `Tick` 時呼叫 `wal.tick()`（Python `Service._on_watcher_tick`）。期望值以 Python oracle（`origin/feature/rust-refactor` `wal.py`＋可控時鐘、注入 EACCES 的 fs 包裝）實跑取得：四次 EACCES → `4/1/1`；未到 next_at 連 5 次 append → `1/0/0`；截短後 → `4/1/0`；告警 3 筆；tick 完成後新現行檔僅一筆 META、`archived_through_seq` 為輪替前 seq |
+| F11 | Low | 2d93181 | 本分支 `contracts/rpc_schema.json` 與 `sw_core/wal.py` 仍為 11 鍵 | deferred：BLOCKED-OWNER（同 R-00，須併入 `origin/feature/rust-refactor` 的 OD-19 契約與 Python 變更） |
+| F12 | Medium | 7c084ef | #88 `rotate_schedule_cancelled_when_file_shrinks_or_vanishes` 不存在 | fixed（本組 commit）：Rust 測試補上（含移除後重新從第 1 段退避）；Python 側對應案例屬 `origin/feature/rust-refactor` 的 `tests/test_wal.py`（本分支無 OD-19 Python 實作，同 R-00），未在本分支新增 |
+| F13 | Medium | 50345ea | #38 `cancelled_ops_bounded_512_fifo`、#52 `cancelled_inflight_command_later_tx_refused` 未實作；`cancelled` 無上限且產品碼從不寫入 | fixed（本組 commit）：`FenceState.cancelled` 改為 `CancelledOps`（上限 512、FIFO 淘汰、重複撤銷移到最新，Python `_revoke_ops_locked`）；新增 `Fence::revoke_ops`；`command.cancel` 的 `CancelQueued` 若命中前景命令即撤銷其 TX op（Python `revoke_tx_op`）。`contracts/resource_limits.yaml` add-only 登記 `fence_cancelled_ops_max: 512`（`test_slice21_scope.py` 同步加斷言）。紅燈先行：`command_cancel_running_revokes_tx_op`（接線前尾段仍交 OS）。既有 4 處「撤銷 0..4096」測試改為撤銷 `0..CANCELLED_OPS_MAX`（rig 的 op id 皆 < 512，意圖不變）。interactive lease 的 op（Python `interactive:<id>`）撤銷：deferred 至 P7 lease fence（Rust lease TX 尚無獨立 op id） |
+| F14 | Medium | 0a187c1 | reboot quiet 要等 actor 處理 `UartTxCompleted` 才生效 | fixed（本組 commit）：`FenceState.reboot_arm_op`（actor 啟動 reboot 命令時設定）；TxWriter 在記錄結果的同一次 `Fence::with` 內，對該 op 的 Command TX 已提交或 Unknown 時設 `quiet_active`／`reconfirm_pending` 並清除；actor 之後照舊同步 `QuietState`／世代。紅燈先行：`reboot_tx_arms_quiet_before_next_job`（緊接的 LoginProbe 必須被 Quiet 拒絕） |
+| F22 | Medium | 0a187c1 | reboot 測試降為 sans-IO | 已由 8b8a40f 的 ActorRig 版 `reboot_arms_quiet_only_after_tx_settled_e2e`／`reboot_not_submitted_does_not_arm_quiet_e2e` 覆蓋（真 OpRunner／TxWriter，op_id 一致性由前者端到端驗證）；本組另補 TxWriter 層 F14 測試 |
+| F35 | Low | 8b8a40f | `assert_eq!(os_submits(), os_submits())` 恆真 | fixed（本組 commit）：暫停點先記下提交數，最後斷言不變 |
+
+## 登入／quiet（0a187c1）
+
+| ID | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| F15 | High | attach 登入中收到 boot banner：quiet arm 推進 `fsm_gen`，該次 run 的 `LoginFinished` 被丟棄，session 永久 `ATTACHING`、`SessionAttach` 仍 `ok:true` | fixed（本組 commit）：`LoginRun` 記下自己的 `fsm_gen`，attach run 的完成事件以 run 身分比對（quiet arm 不是新 run），結果照 Python 套用（NotReady→ATTACHED、Ready→READY＋confirm_ready、Failed→drain DETACHED）；`fsm_gen + 99` 等不屬現行 run 的事件仍丟棄。兩位審查者建議不同（grok p6 主張 arm 當下以 SC-30 語意立即結束 run）：SC-30 屬 P7（Slice 2.3）登記的 Rust-only 差異，Slice 2.1 以 Python 基線為準——Python `arm_boot_quiet` 只讓後續 TX 以 `stale_login_gen` 被拒，attach thread 照常寫終態（Ready 時 `confirm_ready` 清 quiet）。紅燈先行：`banner_during_attach_login_{settles_attached,ready_result_applied,failed_drains_detached}`。既有 `boot_banner_invalidates_old_fsm_and_owner_generations` 末段斷言「停在 ATTACHING」鎖住的是缺陷，依 Python 改為 READY（期望值變更，送 §10.4 獨立審閱） |
+| F16 | Medium | 任何非完整 `Completed` 的登入 TX 都收斂為 `PROMPT_UNAVAILABLE` | fixed（本組 commit）：`LoginIo.tx` 改回傳 `TxReport`；新增 `classify_login_tx_failure`：只有 Quiet／ReconfirmPending（`quiet`）與 FsmMismatch（`stale_login_gen`）→ `PROMPT_UNAVAILABLE`；WalUnhealthy → `WalUnavailableError("tx incomplete: not_submitted 0/N WAL_UNHEALTHY")`；Unknown → `TxUnknownError`；其餘 → `TxIncompleteError`。新增 `LoginOutcome::Raised`：attach → DETACHED＋`ATTACH_FAILED:<ExcType>`；再探 → RPC `EXCEPTION`（state、last_error 不變）；reboot recovery → `RECOVERY_ERROR`。`disk_full_blocks_login_probe_but_not_agent_cmd` 前半依 Python 改為斷言 `EXCEPTION`＋state／last_error 不變（舊斷言 `PROMPT_UNAVAILABLE` 與 Python 衝突，期望值變更送 §10.4 審閱）。順帶修正 `tx_incomplete_message` 的 outcome 字面值：部分寫出為 Python 的 `completed`（舊版寫成不存在的 `partial`） |
+| F92 | — | 本輪新發現：`selftest_probe_drain_race_golden` 偶發失敗（第 863 輪 `tx incomplete: completed 0/23 [Errno 125] Operation canceled` ≠ golden `not_submitted 0/23 draining`） | fixed（本組 commit）：drain 先凍結 fence 再 cancel，PAL 於提交前看到 cancel 回 `Completed(0)`＋Cancelled；TxWriter 新增 `reclassify_unsubmitted`：0 byte 且無 fence 原因時重驗授權，fence 已拒絕即收斂為 `NotSubmitted`＋該原因（Python 提交點 `_tx_frozen` → `draining`）；已有確認 bytes 者不改寫（BC-03）。單元測試 `zero_progress_cancel_after_freeze_is_not_submitted_draining` |
+
+## 命令執行／救援／self-test（8b8a40f）
+
+| ID | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| F25 | High | READY 且前景命令在等 prompt 時，`session.recover`／`session.self_test` 回 `SESSION_BUSY`、零 TX | fixed（本組 commit）：OpRunner 增並行 lane（`OpSpec::runs_beside_foreground`：READY recover、self-test probe），session 以 `side_ops` 追蹤、不佔前景槽；epoch 結束時清空，遲到完成以 stale 回覆。TX 仍經同一 epoch 的 TxWriter（單一寫入者不變）。parity #58 原排 P8-T5 的 recover 對齊一併提前完成。紅燈先行：`recover_while_foreground_command_sends_recover_keys`、`self_test_while_foreground_command_sends_probe` |
+| F27 | Medium | self-test／recover／interactive send 進行中 `foreground_busy` 為 true、agent log 不寫 RX；interactive_send 並行回 `SESSION_BUSY` | fixed（本組 commit）：新增 `foreground_busy()`（只有命令／mode=interactive 命令算前景 operation），用於 `foreground_busy`、`outstanding_commands`、agent log RX 閘與 release `aborted_cmd`；`outstanding_commands` 補上 Python 的 `len(background_cmd_ids)`（同為本輪發現的差異）。紅燈先行：`self_test_probe_in_flight_is_not_foreground_busy`、`outstanding_commands_counts_background_ids`。interactive_send 並行 `SESSION_BUSY` 屬 D-22(2) 已核准差異，維持 |
+| F29 | Medium | 裝置在、bridge 開檔中呼叫 recover 回 `SESSION_NOT_READY` | fixed（本組 commit）：attach 進行中回 `{ok:true, recovering:false, action:"REATTACH"}`、`last_error=null`、state ATTACHING，不重複發 `OpenBridge`。紅燈先行：`recover_during_pending_attach_returns_reattach` |
+| F30 | Medium | self-test `attached_vtty` 恆 null | fixed（本組 commit，與 F43 同組）：bridge 開成時記下哨兵 vtty；OK／PASSTHROUGH／ATTACHED 子分類／VTTY_STALE 的 `attached_vtty` 回該路徑（無哨兵為 null）；`vtty_alive` 未注入時依 Python `os.path.exists(primary)` 判定 |
+| F31 | Medium | fallback passthrough 缺 `pin_profile`／`suggested_profile`／`hint` | fixed（本組 commit）：移植 `_suggest_profile_from_rx`（`clean_text(rx_tail(512))` 依序比對非 passthrough template 的 `prompt_regex`），manager 經 `SelfTestProbes.templates` 注入全部 template；`profile_source=="fallback"` 命中時改 `pin_profile` 並附 `suggested_profile` 與 Python 同字 hint。紅燈先行：`session_manager::selftest_fallback_passthrough_suggests_pin_profile` |
+| F32 | Medium | epoch 在、serial 已死仍送 probe | fixed（本組 commit）：`SelfTestProbes.bridge_snapshot`（manager 以共用 workers 表提供 `IoWorker::snapshot`）；running／serial_alive 為假 → `BRIDGE_DOWN`／`recover`、零 probe。紅燈先行：`lease_selftest::selftest_bridge_down_when_serial_dead` |
+| F33 | Medium | RELEASED 的 `/proc` holder 掃描在 actor 執行緒 | 部分修正／deferred：本輪發現產品路徑原本**完全沒有**注入 holder 掃描（`SelfTestProbes.holders` 只在測試設定，RELEASED self-test 一律視為無 holder，與 Python 不同），本組 commit 由 manager 注入 `uart_excl`。掃描仍在該 session 的 actor 內同步執行：RELEASED 狀態沒有 IoWorker（無 RX、無 banner、無 quiet arm、無 TX），只延後送往同一 session 的其他 RPC（Python 註解關切的是持 manager 全域鎖阻塞所有 RPC，Rust 每 session 一個 actor 不會）；移出 actor 需新增 effect／事件往返，延後至 P6 console reaper（同樣需要 `/proc` 掃描的 2.2 路徑）一併處理 |
+| F34 | Medium | 未注入 clock 時 log 檔名用 UTC | fixed（本組 commit）：manager 建 session 時以平台 Clock 注入 `CaptureEnv`（`local_utc_offset_s` → `strftime_local`）。紅燈先行：`session_manager::log_filename_uses_local_time_by_default`（舊實作得 UTC 系統時間） |
+| F36 | Low | `LeaseExpiry` timer 以 `>=` 關閉 | fixed（本組 commit）：嚴格大於（Python `now - last > timeout`）；恰在期限時改排期限後 1 ns 再檢查。新增 `lease_expiry_timer_is_strictly_after_deadline`；`wall_clock_jump_param` 的 lease 段同步改為「恰在 20 s 仍 active、再 1 ms 才收回」（期望值依 Python 更正） |
+| F39 | Low | `selftest_probe_drain_race_golden` 不保證兩分支都出現 | fixed（本組 commit）：加 `committed > 0 && refused > 0`（不足即 FAIL 報證據不足）；F92 修正後實跑 committed=840／refused=160 |
+
+## drain（afe4853／b73da42）
+
+| ID | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| F43 | Medium | POSIX 自然開啟後 release 的 `closed_consoles` 為 0（產品路徑從未建哨兵） | fixed（本組 commit）：`ManagerExec::open_bridge` 以 `ConsoleTransportFactory::create_pty` 建 internal 哨兵 primary（master 交 IoWorker reader、slave keepalive 隨 worker 收尾釋放；Windows `Unsupported` 不建）；`OpenedBridge.vtty` 傳給 core，`console_count`＝1、`vtty`＝`/dev/pts/N`，release `closed_consoles`＝1，bridge 結束後 0／null（Python `to_public_dict`）。`public()` 各處改由 `public_ctx()` 取現行 bridge 的 console 欄位（原本一律傳空 context）。紅燈先行：`session_manager::sentinel_pty_reported_in_public_and_release`（以真 PTY；無 PTY 平台斷言 0／null） |
+
+## RX／mailbox
+
+| ID | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| F51 | Medium | 同一 `RxShared` 跨 attach 存活，上一條連線的速率被沿用（可誤判 `RX_FLOOD`） | fixed（本組 commit）：每次 `OpenBridge` 成功建新的 `RxShared::new(131_072, now)` 交該 epoch 的 reader，`OpenedBridge.rx` 帶回，core 於 adopt 時替換 `deps.rx`；executor 的 login／op 也改用新視窗；舊 reader 持舊 Arc。紅燈先行：`session_core::rx_window_resets_per_bridge` |
+
+## session_manager（73634db／7a84168）
+
+| ID | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| F59 | High | 動態偵測 session 的 template UART 設定未套用：PROBE 以預設設定開啟的 port 直接交給正式 bridge | fixed（本組 commit）：PAL `CloseImpl`／`CloseToken` 新增 `configure(&SerialConfig)`（POSIX 以 termios 重設、Windows 以 `configure_port`、fake 記錄每次設定；預設 `Unsupported`），`ManagerExec::open_bridge` 收用預開 handle 前呼叫（Python bridge 啟動時 `port.configure(self.profile)`）；`Unsupported` 沿用開啟時設定，其餘錯誤關閉 handle 並回開啟失敗。紅燈先行：`session_manager::dynamic_session_applies_template_uart_config`（舊實作 fake 只記到 PROBE 的預設 115200） |
+| F60 | High | 缺 Python `_mark_missing_devices_locked`：explicit target 的裝置不在快照中時，session 不會標為 `DETACHED`／`DEVICE_NOT_FOUND` | fixed（本組 commit）：`update_devices` 在 detach／attach 之前，對 `device_by_id` 非空且不在快照的 session 送 `ControlEvent::DeviceMissing`；core 的 `mark_missing_device` 依 Python 條件（非 RELEASED、無 bridge、非 drain 中）設 `DETACHED`，`last_error` 與 `detached_at` 僅在為 null 時填入。具體輸入：targets 綁 `COM0→usb-missing`、快照為空 → Python `session.get_state` 為 `state:"DETACHED"`、`last_error:"DEVICE_NOT_FOUND"`；舊 Rust 停在 `DETACHED`／`last_error:null`。紅燈先行：`session_manager::missing_explicit_target_marked_device_not_found`（註解掉送出行即 FAIL，已實測） |
+| F61 | High | 無 bridge 的 `session.clear`（裝置在線）回 `DETACHED`＋`CLEARED`；Python 回覆前即 `ATTACHING`＋`last_error:null` | fixed（本組 commit）：core 無 worker 的 Clear 收尾經 `request_reattach`：裝置在線（且非 shutdown）→ 活 session 設 `ATTACHING`、`last_error=None` 後才回覆，並發 `Effect::Reattach`；不在線維持 `DETACHED`＋`CLEARED`（Python `clear_session` `has_device` 分支）。具體輸入：開埠 AccessDenied（`ATTACH_FAILED:PermissionError`、DETACHED、裝置在線）→ clear → Python／Rust 皆回 `state:"ATTACHING"`、`last_error:null`。紅燈先行：`session_core::clear_without_bridge_with_device_reports_attaching_and_reattaches`；另加 `clear_without_bridge_without_device_stays_detached_cleared` |
+| F62 | High | `session pin` + `session clear` 不套用 pin（#32／#181）：drain 後 core 直接以舊 profile `OpenBridge` | fixed（本組 commit）：Clear 收尾不再由 core 直接開埠，改發 `Effect::Reattach{by_id, real_path}`（state ATTACHING、`reattach_pending`）；`ManagerExec` 以 `spawn_attach_with(by_id, after_clear=true)` 走與 Python `_spawn_attach` → `_attach_by_id` 相同的開埠前再解析（pin 可解析即 rematerialize＋`profile_source:"pin"`、零 PROBE；fallback 再偵測），完成後送 `DeviceAttached`；core 在 `reattach_pending` 的 ATTACHING 接受該事件並開埠。紅燈先行：`session_manager::pin_then_clear_on_attached_session_applies_pin`（舊實作 sid 停在 `others-template:COM0`）。期望值變更（送 §10.4 審閱）：`drain_release::clear_reopen_attaching_clears_last_error` 與 `session_core::rx_window_resets_per_bridge` 由「drain 收尾即 OpenBridge」改為「先 `Reattach`、`DeviceAttached` 後 OpenBridge」，仍斷言重新開埠。deferred：opus 另指出 recover／io_error 收尾的再 attach 在 Python 同樣經 `_spawn_attach` 再解析；Rust 這兩條仍由 core `reopen_known_device` 直接開埠（pin 要等熱插才生效），需改寫 drain_release／session_core 約 15 個 sans-IO 開埠期望，列為 Slice 2.1 後續項（不影響 #32 指定的 pin+clear） |
+| F63 | High | 非終態 drain 把 `QuietState` 歸零、fence `quiet_active` 清掉：boot quiet 中重新 attach 會送登入 probe／fallback 再偵測 `\n`，可能中斷 autoboot | fixed（本組 commit）：drain 收尾不再重設 `QuietState`（Python `boot_quiet_until`／`ready_reconfirm_pending` 掛在 `SessionRuntime`，`_complete_drain` 只 `reset_reprobe_progress`）；`adopt_opened_bridge` 依 Python `_push_tx_gate` 把 quiet 與 reconfirm 推回新 epoch 的 fence，quiet 仍有效時為新 epoch 排 `BootQuietExpired`；passthrough 重掛照 Python `reset_passthrough_boot_gate` 清 quiet。具體輸入：READY shell session 收 `U-Boot 2024.01` → clear → 重新 attach：Python／Rust 皆 `boot_quiet_remaining_s` 非 null、`ready_reconfirm_pending:true`、不送 probe、ATTACHED＋`PROMPT_UNAVAILABLE`；舊 Rust drain 後兩欄歸零並送 probe。紅燈先行：`session_core::boot_quiet_survives_clear_drain_and_blocks_reattach_probe`。manager 端 `reattach_existing` 以公開 `boot_quiet_remaining_s` 判斷不偵測，drain 後該欄已保留，故 fallback 再偵測同受保護；預設 fallback 為 passthrough（Python 與 Rust 皆不對 passthrough arm quiet），manager 層 `no_redetect_during_quiet` 只在非 passthrough fallback template 下可達，見 F67 |
+| F64 | Medium | #26 bind 等舊 attach op 逾時只改回應副本（活 session 仍 DETACHED、submit 回 SESSION_NOT_READY）；ATTACHING 且 actor 開埠中時立即回 SESSION_RECOVERING（Python 取消後等待重試） | 部分修正：新增 `SessionRequest::MarkAttachStalled{epoch}`，逾時時寫入活 session（state RECOVERING、`drain_stalled:true`、`drain_timeout_epoch`），回應取自寫入後的 session；之後 `session.get_state` 同為 RECOVERING＋drain_stalled、`command.submit` 回 SESSION_RECOVERING（Python `_resolve_session_id` 先判 RECOVERING），下一次成功 bind 才離開。紅燈先行：`bind_with_inflight_attach_op_cancels_waits_3000ms` 加活 session 與 submit 斷言（舊實作活 session 為 DETACHED）。deferred：「actor 自身開埠中（ATTACHING）時取消並等待後重試」需讓 core 的 pending open 參與 #26 等待（目前直接回 SESSION_RECOVERING，屬可重試錯誤、零 TX），排入 Slice 2.1 後續 |
+| F66 | Medium | #29 斷言在 begin_shutdown 之後才熱插，`update_devices` 早退，修正前也綠 | fixed（本組 commit）：新增 `shutdown_gate_after_open_started_stops_bridge_without_tx`：open 已越過 gate 並阻塞 → begin_shutdown → 放行 → session DETACHED、零 TX（Python `_attach_by_id` 於 `bridge.start()` 後持鎖檢查 `_shutting_down` 並收掉 bridge）。突變驗證：停用 `open_bridge` 的 open 後 stopping 檢查（session_manager.rs `open 返回時已進 stopping`）時此案 FAIL（已實測）；產品行為原已正確 |
+| F68 | Low | stopping 期間對 RELEASED session 做 `session.recover` 回 `Err("daemon stopping")` | fixed（本組 commit）：route 對 Recover 先判 RELEASED（state 或 released_by_ids），是則交 actor 回 `{"ok":true,"released":true,"recommended_action":"device_attach",…}`（Python `recover_session` 順序）。紅燈先行：`recover_released_during_stopping_returns_released` |
+| F65 | Medium | sticky（`profile_detected`）在動態偵測後的任何 READY 都寫入 | fixed（本組 commit）：`ManagerNote::SessionReady` 增 `via_attach`（attach 登入 run 本身到 READY 為 true；reprobe、passthrough 安靜升 READY、reboot recovery 為 false）；manager 只對 true 寫 sticky，偵測紀錄（`probe_paths`）只消費一次、session detach 即移除；`reattach_existing` 的再偵測不再登記（Python `_maybe_persist_sticky` 只在 `_attach_by_id_dynamic` 呼叫）。具體輸入：偵測命中後 attach 停在 ATTACHED（nonce 未回）→ `session.attach` 到 READY：Python `profile_detected:{}`；舊 Rust 寫入 sticky。紅燈先行：`session_core::session_ready_note_marks_attach_run_only`（manager 層等價案例受 F95 rig 異常影響無法到 READY，改於 core 層鎖定旗標；`sticky_persisted_only_when_ready_and_path_unchanged` 仍覆蓋 manager 寫入端） |
+| F70 | Low | bind 成功（裝置在線）時活 session 先為 DETACHED＋DEVICE_NOT_FOUND，manager 只改回應副本再以 control lane 非同步送 DeviceAttached | fixed（本組 commit）：新增 `SessionRequest::DeviceOnline{by_id, real_path}`（經請求通道套用 `device_attached` 並先回覆套用後的活 session，再執行 OpenBridge）；bind 以其回覆取代回應副本（alias 以 manager 鏡像覆寫，同 `session_public`），回覆時活 session 即 ATTACHING＋`last_error:null`（Python `bind_session` 回覆前設定）。新增 `bind_to_online_device_live_state_attaching_before_reply`（RELEASED 改綁回在線原 by_id）。註：舊實作的不一致取決於 lane 排程（請求通道的 GetState 可能先於 control lane 的 DeviceAttached），該案在舊實作上非決定性紅燈 |
+| F71 | Medium | PROBE TX 被拒後 `detect_template` 仍睡 3 s 再比對 RX（DUT 自吐 prompt 會被判 detected） | fixed（本組 commit）：`probe_send` 回傳是否完整送出；未完整（Fence 拒絕：frozen／WAL 不健康等）時 `detect_template` 立即回 `None`，不睡、不比對（Python `send_command("")` 拋例外 → 兩個呼叫端 `except: detected = None`）。紅燈先行：`detect_probe_tx_goes_through_fence` 凍結半段加「不得有 3.0 s sleep」（舊實作 `sleeps_s()==[3.0]`） |
+| F72 | Low | 未凍結半段沒鎖住恰一次提交與 payload | fixed（本組 commit）：斷言 PROBE 唯一 TX 的 WAL `payload_b64=="Cg=="`，且裝置收到的第一筆提交以 `\n` 起頭（裝置總提交數含正式 bridge 的登入 probe，不以 `os_submits()==1` 斷言） |
+| F95 | — | 本輪新發現（待查）：ManagerRig 中 ATTACHED（READY_NONCE_TIMEOUT）session 經 `SessionAttach` 回覆 `state:READY`（`last_ready_at` 有值），其後 `GetState` 卻為 ATTACHED＋`PROMPT_UNAVAILABLE`、`last_ready_at:null`、`last_state_change_at` 早於該回覆——同一 core 不可能出現，疑為 rig 內有第二個 core／回覆來源，或 reprobe 回覆組裝問題；與先前 F51 記錄的「ManagerRig clear→READY 不成立」同型 | deferred：Slice 2.1 內追查（需判定 rig 假象或產品缺陷）；F65 的 manager 層案例暫以 core 層旗標測試取代 |
+| F96 | — | 本輪新發現：`command_exec::reboot_flushes_commands_queued_behind_it` 負載下 1/8 失敗（reboot TX 在 q1／q2 submit 前已結算、session 轉 RECOVERING，submit 被拒）——F14 改為 TxWriter 同步 arm quiet 後結算變快而浮現的測試競態 | fixed（本組 commit）：reboot TX 以 `FakeWriteStep::PauseBeforeSubmit` 停在提交前，q1／q2 排入後才放行；斷言不變。6/6 連跑通過 |
+
+## daemon（2fcdbbf／8a7986e／3938032／edfc741）
+
+| ID | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| F73 | High | `session.interactive_open` 查無 session 回 `SESSION_NOT_FOUND` | fixed（本組 commit）：該分支 resolve 失敗回 Python `interactive_open` 的 `{"ok":false,"error_code":"SESSION_NOT_READY","selector":<原 selector>}`（契約 `SESSION_NOT_READY` 已列此 method 與 `selector` 欄位，不需改 contracts）。具體輸入 `{"selector":"NOSUCH"}` → Python／Rust 皆 `{"ok":false,"error_code":"SESSION_NOT_READY","selector":"NOSUCH","version":v}`。紅燈先行：`dispatch::interactive_open_unknown_selector_session_not_ready`（全文比對） |
+| F74 | Medium | `command_cancel_queued_command` 沒有斷言佇列實體減 1 | fixed（本組 commit）：test-fakes `SessionRequest::QueueLensForTest`／`SessionManager::session_queue_lens`；測試在前景阻塞時斷言 cancel 後 `len`／`physical_len` 皆減 1。突變驗證：停用 `service.rs` 的 `CancelQueued` 路由時該測試 FAIL（已實測）。註：Python 以 `_count_pending_locked`（accepted/running 紀錄數）計額度、不從 PriorityQueue 實體移除；Rust 的實體移除只是記憶體界限（`compact` 亦會回收），RPC 可觀察行為兩者相同 |
+| F76 | Medium | `command.result_tail` 命令紀錄的 session_id 對不上時，依 session 順序第一個回 ok 者即結束；沒有 capture 的 session 以登錄表 fallback 回空 chunks | fixed（本組 commit）：新增只查本 session capture 的 `SessionRequest::BackgroundResult`（查無回 CMD_NOT_FOUND）；service 依 Python `get_background_result` 全域查（命令紀錄的 session 優先、再其餘），全部查無才呼叫新的純函式 `bg_fallback_from_registry`（＝`_bg_fallback_from_arbiter`）。`result.tail` 帶 cmd_id 的路徑共用。具體輸入：COM0／COM1，背景 `sleep 100` 在 COM1 running，紀錄 session_id 改為 `t:GONE` → Python 回 COM1 capture（含 `dropped_chunks`）；舊 Rust 由 COM0 回 `{"ok":true,…,"chunks":[]}`。紅燈先行：`dispatch::result_tail_stale_owner_finds_capture_in_other_session`（test-fakes `CommandRegistry::set_session_id_for_test` 模擬 rematerialize 後的舊 session_id） |
+| F81 | Medium | root 下 `return`／`continue` 被 cargo 記成 PASS；`wal_fault_after_ready_splits_agent_and_auto_tx` 先 `chmod 555` 再刪檔，非 root 必 EACCES | fixed（本組 commit）：`endpoint_written_after_bind`、`wal_dir_readonly_at_start_blocks_login_probe`、`wal_fault_after_ready_splits_agent_and_auto_tx` 於 root 改 `assert!(!is_root(), "證據不足…")`（FAIL，非 PASS）；`unreadable_config_isolated_fail_closed` 無 setpriv 時 `panic!`；刪檔與 chmod 對調。非 root 證據：以 `setpriv --reuid=65534` 執行測試 binary，四案 2/2 PASS。非 root 實跑另揭露兩個期望值與 Python 不符（計畫值），依 Python 更正（送 §10.4 審閱）：(a) `unhealthy_reason` 於第一筆 append 失敗後為 Python 的 `write_failed`（`sw_core/wal.py` append 失敗分支），非計畫的 `dir_unwritable`；(b) WAL 不健康時 attach 終態為 Python 的 DETACHED＋`ATTACH_FAILED:WalUnavailableError`（`_login_tx_refused` 只吞 quiet／stale_login_gen，`WalUnavailableError` 穿出 `_attach_by_id` 的 except），非計畫的 ATTACHED＋`PROMPT_UNAVAILABLE`；零 TX 斷言不變且成立。root 環境下這三案現為 FAIL（證據不足），列入 root 基準 |
+| F82 | High（grok）／Medium（opus） | `implementation: rust` 的 manifest 仍走 Stage 1 拒絕（exit 2），計畫 Task 19 要求切換 | fixed（本組 commit）：兩位審查者判斷不同（grok：依計畫切換；opus：列 BLOCKED-OWNER）。此項無 Python 對應行為，依計畫（parity-amendments 修訂版 06 §Task 19 Files 與 main.rs 規格：`"python"` → launcher；`"rust"` 或無 manifest → `daemon_main::run`）實作：新增 `launcher::dispatch_to_rust_daemon`（開發 build 或 `implementation == "rust"` → true；python、其他值、manifest 不可讀／懸空／解析失敗 → false，fail-closed），`main.rs` 改用之；`launcher_argv` 仍拒絕 rust（exec 路徑只承接 python）。紅燈先行：`launcher::dispatch_to_rust_daemon_for_dev_build_and_rust_manifest`；鎖定案例 `launcher_rejects_rust_implementation_in_stage1` 單元半段不變，端到端半段依計畫改為「rust bundle 以 `--bogus` 進入本體：首行 `usage: serialwrapd`、末行 `serialwrapd: error: unrecognized arguments: --bogus`、exit 2」（期望值變更，送 §10.4 審閱；nodeid 保留） |
+| F87 | High（grok）／Medium（opus） | Review Focus 5 斷言被自行反轉、Python 實測腳本未提交、失去「停機與 handler 並行」覆蓋 | fixed（本組 commit）：兩位審查者判斷不同，依規則以 Python 基線實測為準，並提交實測：`tests/contract_blackbox/slice21/test_safety_core.py::test_pipelined_stop_after_client_gone_not_processed`（Python 輪 2/2 PASS：同連線 recover --force＋daemon.stop 後斷線 → 救援 TX 恰 `system:recover` `\x03`、11 s 後 daemon 仍存活、socket 保留、新連線 stop exit 0）。Rust `daemon_stop_during_force_recover_with_client_gone` 收緊為同一組斷言（以 WAL 救援 TX `Aw==` 為收斂訊號、等過 force recover 上限 11 s 再判存活；移除無效的 `target_mute`）。新增「停機與 handler 並行」：`test_daemon_stop_from_second_connection_during_force_recover`（Python 2/2 PASS，stop→exit 約 8.2 s）與 Rust `daemon_stop_from_second_connection_during_force_recover`（假 DUT 經新增 `PAUSE` 指令以 `pause_responding(8)` 靜默）。後者揭露真實差異：Rust `SERVER_STOP_BUDGET` 10 s 短於 Python 實際 handler（READY 路徑救援鍵約 4 s＋`_force_recover` 10 × 1 s；登入型 DUT 不回 READY 時約 14 s，Python `server.stop()` 無上限等待後 exit 0），Rust 報 `shutdown incomplete: rpc handlers did not converge` exit 1；修正為 20 s 並註明推導（計畫「最長約 10 s」的前提與 Python 不符）。計畫 Review Focus 5 文字與本處理的差異仍需擁有者確認（BLOCKED-OWNER：「管線中的 stop 不被處理」依 Python 1:1，非計畫字面） |
+| F88 | Medium | 收斂條件接受起始的 READY | fixed（本組 commit，與 F87 同改）：改以 WAL 出現救援 TX 為收斂，並等過 11 s（force recover 上限＋餘裕）才斷言存活 |
+| F93 | — | 本輪新發現：計畫指定的 `unhealthy_reason="dir_unwritable"`（`WalWriter::open` 時評估）在 Python 不存在（Python 在任何 append 前為 `None`、首筆失敗後 `write_failed`） | BLOCKED-OWNER：屬計畫指定、未登記 SC／NC 的對外差異（`health.status.wal.unhealthy_reason`）；Slice 2.1 期間維持計畫值，daemon 層測試已依 Python 斷言 append 後的 `write_failed`。需擁有者決定登記 NC 或改為 Python 1:1 |
+| F94 | — | 本輪新發現（環境）：基準起點跑 `test_reject_paths_zero_tx`／`test_history_bounded` 洩漏的兩個 Python daemon（root，pid 11219／12236）的 by-id 連結皆指向 `/dev/pts/0`，watcher 每秒重開該路徑；任何新 PTY 假 DUT 只要拿到 pts/0 就被搶開並以 fixture 帳密登入（實測 `\nroot\npw\n` 打進非本 daemon 的 DUT），即本輪與基準的 `ATTACH_FAILED:DeviceHeldError`／QUEUE_FULL 類 flake 根因 | 處置：終止洩漏行程被權限分類器拒絕，未重試；改以 scratchpad 的佔位 PTY 持有 pts/0 讓測試 PTY 落在 pts/6 以後（無副作用、可撤），之後的 PTY 測試結果不再受汙染。需擁有者於機器上清除這兩個行程 |
+| F78 | Medium | 後端 env 檢查早於 argparse／SC-19 allowlist／ensure_runtime_dirs，exit code 與 Python 不同 | fixed（本組 commit）：`check_backend_env` 改為單一變數，呼叫點對齊 Python 第一次選擇該後端處：DEVICE 於 `load_profiles`／`no profiles loaded` 之後（`select_device_backend()`）、LOCK 於取鎖前（`_build_lock`）、RPC 於 SessionManager 建構後、掃描／attach 前（`_build_server`；失敗時收尾並釋放鎖，exit 1）。紅燈先行：`backend_env_checked_where_python_selects_it`（opus 表三列：RPC=bogus＋`--bogus` → rc 2＋usage；LOCK=bogus＋非隔離＋allowlist → rc 2＋TEST_DEVICE_ALLOWLIST_REJECTED；DEVICE=bogus → 目錄已建、stderr 以 `no profiles loaded` 起頭、rc 1）。計畫 Task 19 Step 3 的舊順序以本修正為準（Python 1:1） |
+| F79 | Medium | 隔離判定未先 strip，`"…/run "` 被 Python 拒絕、Rust 放行 | fixed（本組 commit）：`isolation_reason` 以 `py_strip(raw)` 正規化（Python `_isolation_reason`：`(env.get(var) or "").strip()`）；Stage 0 kill／pause 鉤子共用同一判定。紅燈先行：`allowlist_rejected_reasons_exact` 增 (2b) 前後空白案例（舊實作 daemon 照常啟動） |
+| F80 | Medium | 4 種壞 config.yaml 的例外類別名與 Python 不同 | fixed（本組 commit）：依 Python 基線實測修正對照：timestamp regex 不符（Rust `invalid timestamp format`）→ AttributeError；未知 bool（`invalid bool value`）→ KeyError（原誤為 ConstructorError）；重複 anchor → ComposerError；不相容／重複 `%YAML` 指令 → ParserError。4 列以 add-only 追加至 `gen_allowlist_unreadable_config.py` 的 `CASES` 並重新產生 `contracts/golden/allowlist_unreadable_config.tsv`（既有 13 列逐位元組不變；contracts 變更送 §10.4 獨立審閱）；紅燈：`unreadable_config_isolated_fail_closed` 於新 golden 下首列即 FAIL（`ValueError` ≠ `AttributeError`） |
+| F84 | Low | golden 產生器無 `--out`、未登記新鮮度檢查 | fixed（本組 commit）：產生器加 `--out`；`tests/test_rust_goldens_fresh.py` 的 `GENERATORS` 登記（permission 列於 root 以 setpriv 降權，保留既有寫法）；`-k allowlist` 實跑 PASS |
+| F85 | Low | `release_persist_point` 吞掉 mkdirs／寫 `arrived` 錯誤 | fixed（本組 commit）：`PersistObserver::before_release_commit` 改回 `Result`；錯誤時 `commit_sync_kind` 不 commit、release 持久化失敗（Python 例外穿出 `_save_release_state`）。紅燈先行：`session_manager::release_persist_point_failure_fails_release_commit` |
+| F86 | Low | 計畫 Step 4 `cargo build --release --target x86_64-unknown-linux-gnu` 未執行 | fixed（本輪實跑，無程式變更）：`cargo build --release --target x86_64-unknown-linux-gnu -p sw-daemon --bin serialwrapd` 成功（33 MB），`--help` rc 0、`--bogus` 末行 `serialwrapd: error: unrecognized arguments: --bogus`；Windows release build 屬 LOCAL-WINDOWS-TODO |
+
+## 第二輪報告（p5-cloud `edfc741_1f5aafa`、`1f5aafa_b7bf34a`、`b7bf34a_e36089f`）
+
+| ID | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| F97 | Medium（opus 三輪、grok） | 有 bridge 的 `session.clear` 回應 `last_error:null`；Python `_complete_drain` 於鎖內設 `ATTACHING`＋`CLEARED` 後才 `_spawn_attach`，`clear_session` 於 `_await_drain` 後立即組回應（黑箱 Python 3/3 `CLEARED`）；9363d9b 帶入的回覆前清除為回歸 | fixed（本組 commit）：移除 drain 收尾 Clear 分支的回覆前 `set_last_error(None)`；`last_error` 於再解析後接受 `DeviceAttached`（開埠前，對應 Python `_attach_by_id`）才清。無 bridge 分支維持 None（Python 該分支即 None）。紅燈先行：`drain_release::clear_reopen_attaching_clears_last_error` 斷言回應與 receipt 後皆 `CLEARED`、`DeviceAttached` 後 null（nodeid 名稱仍成立）。契約 `session_last_errors.yaml` 的 `CLEARED.states` add-only 補 `ATTACHING`（送 §10.4 獨立審閱；SKILL 受管區塊不含 states，無需重產） |
+| F98 | Low（opus，b7bf34a_e36089f 21de0db #2／#3、9fdd89d #1、d46c323 #2／#3／#4） | (a) manager `clear` 在回 DETACHED 時直接 `send_attached` 繞過再解析；(b) `Effect::Reattach` 遇在途 op 即 return，after_clear 遺失；(c) `result_tail` 迴圈中任一 session `Err` 使整個 RPC 失敗；(d) Rust 停機並行案例情境與 Python 對照不同且未輸出耗時；(e) 鎖定 nodeid 名稱與行為相反；(f) 唯讀 WAL 案例負載下 SHORT 期限可能先到 | fixed（本組 commit）：(a) 改經 `spawn_attach`（再解析；裝置不在線為 no-op）；(b) `AttachOp.after_clear` 改 `Arc<AtomicBool>`，在途時 OR 進既有 op；Python `retry_after_worker`（worker 結束後 ATTACHING 且無 bridge 再 spawn 一次）deferred，與 F62 的 recover／io_error 再解析同列 Slice 2.1 後續；(c) 個別 `Err` 改 `continue`，全部查無仍走 `bg_fallback_from_registry`；(d) 測試輸出 `stop→exit` 耗時並註明登入型 DUT 情境（Python 對照為 shell DUT）；(e) 函式 doc 註明名稱沿用 Stage 1；(f) 等待改 LONG |
+| F99 | High（grok）／Medium（opus） | 18abb03：quiet 撤銷的 attach 結果被丟棄、下一個 Tick 一律 ATTACHED＋PROMPT_UNAVAILABLE（舊世代 Ready 也不升 READY、Failed 不 drain） | fixed 177dfd9＋992a42b：本分支 F15 以 `LoginRun.fsm_gen` 辨識 run 身分、結果立即依 Python `_attach_by_id` 套用（Ready→READY＋confirm_ready；NotReady→ATTACHED＋原碼；Failed→drain DETACHED＋原碼）；合併 992a42b 時移除 `quiet_bumps`／`revoked_by_quiet`／`settle_quiet_revoked_attach`，`attach_settles_attached_after_quiet_revokes_probe` 依 Python 改為 NotReady 立即 ATTACHED、Ready 升 READY；Failed 由 `banner_during_attach_login_failed_drains_detached` 覆蓋 |
+| F100 | Low（opus d46c323 #1） | `SERVER_STOP_BUDGET` 10→20 s 偏離 06 計畫 `:4457` 寫死值，未正式登記 | BLOCKED-OWNER：需在 parity-amendments（非本分支可寫）登記 06 計畫 `:4457` 與 Review Focus 5「最長約 10 s」更正為 20 s（推導：救援鍵約 4 s＋clear drain ≤3 s＋10 × 1 s；Python `server.stop()` 無上限等待）；本分支 F87 列為推導出處 |
+| F101 | Medium（opus 18358a5） | F02 的產品接線 `PosixProcScan::serialwrapd_tty_holders`（inode 比對）沒有測試鎖住；改回 readlink 字串比對不會紅 | fixed（本組 commit）：`proc_holders_namespace::posix_proc_scan_tty_holders_matches_alias_by_inode`（tempdir：tty 以 symlink 別名傳入、serialwrapd fd 指向真實檔 → `([pid], Ok)`）；突變驗證：接線改回 readlink 比對時 FAIL（`left: []`，已實測） |
+| F102 | Medium（opus c43bb3e） | Windows send 逾時（`WSAETIMEDOUT`→`TimedOut`）後 framing 仍從原 offset 重試，Winsock 規定此時 socket 狀態未定義，JSON 行可能重複或毀損；commit 說「維持 2 s 單次逾時」與實際不符 | fixed（本組 commit，Windows 部分 LOCAL-WINDOWS-TODO）：sw-pal 新增 `rpc_transport::SEND_TIMEOUT_RETRYABLE`（unix true、windows false）；framing `write_line_with` 只在可重試時把 `TimedOut` 當短輪詢，Windows 逾時即關閉連線（2 s 單次逾時，與 F06 修正前的 Windows 行為相同）。紅燈先行：`framing::tests::send_timeout_retry_follows_pal_retryability`。F06 列的 Windows 面改標：Windows 平時慢讀大回應仍會於 2 s 截斷（Python 無逾時）——LOCAL-WINDOWS-TODO：改 non-blocking＋`WSAPoll` 並補原生慢讀大回應案例 |
+
+## state_store（c96a91c）
+
+| ID | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| F54 | Medium | 只剝 UTF-8 BOM 後嚴格 UTF-8 解碼；Python `json.loads(bytes)` 依 `json.detect_encoding` 自動判斷 UTF-16／32，UTF-16 改寫的 state.json 會被 Rust 當損毀、RELEASED 遺失 | fixed（本組 commit）：移植 `detect_encoding`（BOM：utf-32 → utf-16 → utf-8-sig；無 BOM 依前 2／4 bytes NUL 樣式）並嚴格解碼。紅燈先行：`state_store::utf16_and_utf32_state_json_load_like_python`（utf-16 BOM、utf-16-be、utf-32-le、utf-32 BOM 四種；舊實作改名 `.corrupt`）。已知限制：Python `surrogatepass` 可承載孤立 surrogate，Rust 字串不能，該類輸入維持解碼錯誤 |
+| F55 | Medium | Python 文字模式寫 state.json，Windows 尾端為 `\r\n`；Rust 一律 `\n`，無 BC 登記 | fixed（本組 commit，Windows 原生驗證 LOCAL-WINDOWS-TODO）：sw-pal `fs_ops::TEXT_NEWLINE`（windows `\r\n`、其餘 `\n`，平台 cfg 僅在 sw-pal）；`serialize_state` 以之為尾端換行（JSON 字串內換行一律跳脫，結構換行只有尾端一處，與 Python 文字模式的 `\n` 轉換逐位元組相同）；讀取端兩種皆接受。紅燈先行：`state_store::state_json_line_ending_follows_python_text_mode`（`serialize_state_with(…, b"\r\n")` 與平台常數） |
+| F56 | Medium | `startup_always_rewrites_state_json`（#13）只驗 store 自身 commit，不證明 daemon 啟動會重寫 | fixed（本組 commit）：新增 `session_manager::manager_startup_always_rewrites_state_json`（SessionManager 建構後 `state_writes() >= 1`）；突變驗證：移除 `bootstrap_sessions` 尾端啟動存檔時 FAIL（已實測） |
+| F57 | Medium | `s21_gate:py_parity.linux` 新登記 nodeid 不在 selector（僅 `test_stage0_session_drain.py::test_release_persist_failure_retried`）內，gate 依 `l1_judge.py` 永遠無法 PASS（T15 +9、T16 +4、T18 +1；與 F50 同源） | BLOCKED-OWNER：擴大 selector 屬凍結鎖的 gate 定義變更，需擁有者核可（parity §2.1 檔案清單）；本分支不自行改 selector |
+| F58 | Low | 雙重 BOM 時 WARNING 尾段 Python 為 `Expecting value`、Rust 為 `Unexpected UTF-8 BOM`；RecursionError 訊息缺 `while decoding…`；`aliases` 為 list 列時 Python 存檔排序失敗 rc 1 | 部分修正：雙重 BOM 依 CPython `json.loads(bytes)`（bytes 路徑不做 str 的 BOM 檢查）回 `Expecting value: line 1 column 1 (char 0)`；紅燈先行（突變驗證）：`state_store::double_bom_state_json_warning_matches_python`。RecursionError 全文與 aliases list 列的存檔失敗 deferred（皆為人為構造輸入；屬 stderr 文字與非契約失敗型態，列 Slice 2.1 後續） |
+
+## 登入／quiet 其餘（0a187c1）與 daemon 其餘
+
+| ID | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| F17 | Medium | 再探把 `pending_auto_login` 算進 `require_login`；Python `_probe_existing_bridge` 只看 `login_regex or console_unlock_env` | fixed（本組 commit）：再探改以 `choose_plan_with(false, …)` 選計畫（attach 路徑維持 `pending_auto_login`，Python `_attach_by_id` 的 `require_login` 含此旗標）。具體輸入：`login_regex: '  '`（Python config `or` 後 strip 成空字串）、宣告 user_env／pass_env 未解析、ATTACHED 且 pending_auto_login=true → 再探：Python probe_ready；舊 Rust CREDENTIALS_UNRESOLVED。紅燈先行：`session_core::reprobe_plan_ignores_pending_auto_login` |
+| F21 | Medium | `start_next` 出列不看 quiet、`login_quiet` 2 支失敗（T14 ActorRig StartOp executor 未實作、`wait_running` 讀 `state`） | fixed 8b8a40f（T14 實作 executor 與出列 execute-time gate）：`login_quiet::execute_time_gate_has_retry_after_sc03` 與 `disk_full_blocks_login_probe_but_not_agent_cmd` 本輪實跑 PASS（`login_quiet` 全檔 35 passed） |
+| F83 | Medium（grok） | 真行程 SIGTERM 測試不再觀察 command 紀錄的 `FLUSHED_BY_SHUTDOWN` | rejected：該碼在停機第 ③ 步（`manager.shutdown` drain）才寫入，第 ① 步已停 RPC server；Python 同序（`daemon.py` `await server.stop()` 後 `service.stop()`，`service.py:601` 才 `flush_session(…, "FLUSHED_BY_SHUTDOWN")`），兩邊都無法經 RPC 觀察停機後的終態，「最後一次 `command.get` 必為 FLUSHED_BY_SHUTDOWN」不可實作。該語意由 in-process `sigterm_graceful_exit_0_and_flushes_queue`（`TraceEvent::SessionsDrained.flushed` 列出被沖刷的 cmd_id）鎖住；真行程案例保留 exit 0、WAL 完整、socket 移除、新 daemon 取鎖 |
+| F26 | Medium | 命令逾時後救援鍵遇 Frozen／StaleEpoch／Cancelled／Quiet 以外的拒絕（Flash、WalUnhealthy），Rust 回 `SEND_FAILED` 且無 META；Python `_map_aborted_result` 以命令累計 bytes 回 `COMMAND_ABORTED_IN_FLIGHT`＋META | fixed（本組 commit）：`recover_after_failure` 增 `aborted: Option<(cmd_id, 命令已確認 bytes)>`；命令路徑遇其他拒絕且 bytes > 0 時寫 META `{"event":"command_aborted_in_flight","confirmed_tx_bytes":N,"tx_outcome":"partial"}`（救援鍵 Unknown → `unknown`）並回 `COMMAND_ABORTED_IN_FLIGHT`；READY recover（None）維持例外。具體輸入：READY、`sleep 20`（timeout 1 s）送出後 fence `wal_unhealthy=true` → Python／Rust：META confirmed 9、partial、COMMAND_ABORTED_IN_FLIGHT、CTRL_C 零 TX。紅燈先行：`command_exec::recover_key_other_reject_in_command_maps_aborted_in_flight`（舊實作 SEND_FAILED）；`session_core.rs` 的「→ SEND_FAILED」註解更正 |
+| F28 | Medium | background capture 64 筆上限為每 session 計算；Python `SessionManager._background` 全域、依全域 `created_at` 淘汰 | fixed（本組 commit）：新增 `capture::BackgroundIndex`（manager 建一個、經 `CoreDeps.bg_index` 共用；記擁有者 COM、`created_at`、插入序、active）；capture 建立時登錄並依 Python 規則淘汰全域最舊的已終結者，本 session 者就地丟棄、其他 session 者經 `ManagerNote::EvictCapture` → manager pump → 擁有者 `ControlEvent::EvictCapture`（淘汰決定於 actor thread 做出，只送通知通道、不取 manager 鎖）；capture `status` 變動處同步 active。擁有者以 COM 標識（rematerialize 不變）。紅燈：`command_exec::global_background_capture_limit_evicts_oldest_across_sessions`（COM1 64 筆舊的已終結＋COM0 新 1 筆 → 淘汰 `(COM1, old00)`；突變驗證：不轉送遠端淘汰時 FAIL）、`evict_capture_event_drops_local_capture`（淘汰後 `CMD_NOT_FOUND`） |
+| F42 | Medium | drain 中止收據在 `confirmed_bytes > 0` 且帳本 `unknown` 時，META `tx_outcome` 只分 complete／partial；Python `_map_aborted_result` 以 `unknown` 優先 | fixed（本組 commit）：`apply_aborted_receipt` 先判 `op.unknown` 寫 `"unknown"`，其餘維持 complete／partial。具體輸入：命令已確認 3 bytes、尾段 write 結果不明（帳本 unknown）時 release drain → Python META `tx_outcome:"unknown"`；舊 Rust `"partial"`。紅燈先行：`drain_release::aborted_in_flight_with_unknown_tail_writes_unknown_outcome` |
+| F41 | Medium | 有 bridge 的 release／clear／bind 在 Phase 1 只設 `RECOVERING`；`last_error`、前景欄位、capture 要到回條後才變，drain 中 `GetState` 與 `DRAIN_STALLED.session` 為舊快照 | fixed（本組 commit）：`begin_stop` 兩條路徑（有 bridge、open 中）於排 `DrainTimeout` 前呼叫 `phase1_detach`：Release（非 already_released）→ `RELEASED`、Clear → `CLEARED`、Bind → `REBOUND`（Removed／Rebound／IoError 由呼叫端先設），一律清 `foreground` 並 `detach_captures()`；`aborted_op` 已抄進 stop，BC-03 不變。具體輸入：READY、`last_error=LOGIN_REQUIRED`／detail `keep-me`、前景 `sleep 20` 進行中，寫入堵住後 release → Python drain 中與 3000 ms `DRAIN_STALLED.session`：`last_error=RELEASED`、detail null、`foreground_busy=false`、`outstanding_commands=0`、`fg_cmd_expected_duration_s=null`；舊 Rust 仍 `LOGIN_REQUIRED`／true／1。紅燈先行：`drain_release::phase1_snapshot_sets_reason_and_clears_foreground`（三種 kind）。契約 `session_last_errors.yaml` 的 RELEASED／CLEARED／REBOUND `states` add-only 補 `RECOVERING`（Python 基線本即如此；需 §10.4 獨立審閱） |
+| F44 | Medium | `in_flight_unknown_is_send_failed_no_resend` 的 Unknown 在 release 前已結案（`aborted_cmd:false`），沒驗到 drain 的 Unknown 路徑；RELEASED 下「不重送」必然成立 | fixed（本組 commit）：sw-pal fake 增 `FakeWriteStep::BlockUntilCancelThenUnknown { confirmed, error }`（經 gate 提交後等 cancel 才回 Unknown；`fakes_selftest::block_until_cancel_then_unknown_reports_unknown_after_cancel`）；新增 `drain_release_e2e::in_flight_unknown_during_drain_is_send_failed_no_resend`：release 前命令 `running`、回應 `aborted_cmd:true`、命令 `SEND_FAILED`（Python `_map_aborted_result` confirmed 0＋unknown），`device.attach` 回 READY 後 TX 不含 `sleep 20`。突變驗證：拿掉 `AbortClass::Unknown` 分支 → 新案例 FAIL（`FLUSHED_BY_RECOVERY`）。原案例保留（writer 立即 Unknown 路徑） |
+| F45 | Medium | `wait_tx_in_flight` 後的 `release_block` 可能落在 fake 重設旗標前的空窗而遺失，`actor_answers_get_state_while_drain_pending` 間歇 Timeout | fixed（本組 commit）：fake `BlockForever` 改於交 OS（`gate.submit`）之前重設 `blocked_release`，`os_submits` 增加後的 `release_block` 必被看見。紅燈先行：`fakes_selftest::block_forever_release_during_submit_window_is_not_lost`（於 `os_submit` 閉包內呼叫 `release_block`；舊實作 5 s 逾時） |
+| F46 | Medium／Low | `release_waits_for_receipt_and_aborts_partial_in_flight` 的中間態放寬成 `RECOVERING \|\| RELEASED` | fixed（本組 commit）：fake 增 `FakeDevice::pause_next_close()`（下一次 close 停在既有暫停點；`fakes_selftest::pause_next_close_holds_close_until_released`）；案例改為 close 停住時嚴格斷言 `state=RECOVERING`、`last_error=RELEASED`、`foreground_busy=false`、release 尚未回覆，`release_pause` 後維持原有最終斷言（刪除 20 ms 取樣與 `\|\|`，僅加嚴） |
+| F47 | Low | drain timeout 端到端回覆未斷言 `ok:false`、`drain_timeout_epoch` | fixed（本組 commit）：`drain_timeout_marks_stalled_and_release_reports_drain_stalled` 補 `ok:false`、`drain_timeout_epoch == release 前 bridge_generation`、逾時當下 `RECOVERING`；`close_failure_keeps_recovering_and_no_success` 補 epoch |
+| F48 | Low | flood 案例偵測機率性；`command_cancel` 對應 `CancelQueued`；`drain_receipt` 無案例 | deferred：需同 rig 重複 ≥10 輪與 `data_backlog > 0` 前提，屬強化非缺陷；高負載機（load 27–34）上新增機率性斷言會引入雜訊，待 P6 latency 收斂時一併處理 |
+| F49 | Low | `ActorLatencyProbe.log` 無上限 | fixed（本組 commit）：改為 `VecDeque`，上限 `PROBE_LOG_MAX = 4096`，超過丟最舊；`actor::probe_tests::probe_log_is_bounded_and_keeps_newest` |
+| F52 | Medium | `OpFinished{after_rx_seq}` 的 RX 依賴屏障無經 `Mailbox` 的測試（刪掉該分支仍全綠） | fixed（本組 commit）：新增 `mailbox::op_finished_waits_for_dependent_rx`（control 先送 `OpFinished{after_rx_seq:5}`，再送 Data 1..6 → 取出序 D1..D5、C、D6）。突變驗證：刪掉 `dependency()` 的 `OpFinished` 分支 → FAIL（`C` 先出） |
+| F67 | Medium | `tests/session_manager.rs` 缺 parity #32 `no_redetect_during_quiet` 與 #31「新 sid 衝突時不動作」測試 | rejected（經公開輸入不可達；語意已於 core 層鎖住）：① Python `_reresolve_profile_on_reattach` 的 `boot_quiet_active()` 分支只對 `profile_source == "fallback"` 的 session 生效，而後備 template 一律取自 `_default_passthrough_template`（platform passthrough）；passthrough 不會武裝 quiet——`_update_boot_quiet_locked` 開頭 `if platform == "passthrough": return`，`_handle_reboot_command` 只在 `not passthrough` 時呼叫。本輪以 ManagerRig 實測兩條武裝路徑（RX banner、passthrough 自動 READY 後 `reboot`），`boot_quiet_remaining_s` 皆維持 null，與 Python 相同。drain 保留 quiet、重新 attach 不送偵測 TX 的語意由 F63 的 `session_core::boot_quiet_survives_clear_drain_and_blocks_reattach_probe`（測試掛鉤設 deadline）鎖住。② #31 衝突條件為 `new_sid = f"{tpl}:{com}"` 已被**另一個** session 佔用，需兩個 session 同 COM；explicit target、RELEASED 列與 dynamic rank（#100 排除已佔 COM）皆不產生重複 COM。Rust `rematerialize` 保留同一衝突 guard（1:1），未另立不可達的測試 |
+| F38 | Low | base64 payload 非 ASCII 的例外訊息與 Python `UnicodeEncodeError` 不同 | fixed（本組 commit）：`ascii_encode_error_message` 依 Python 規則回報第一段連續非 ASCII（單字元附 `\xNN`／`\uNNNN`／`\UNNNNNNNN` repr，多字元 `position S-E`）。`lease_selftest::base64_non_ascii_message_matches_python_unicode_encode_error` 6 組期望值為 Python 3.12 實跑 |
+| F37 | Low | ATTACHED 下 `interactive_open` 帶 `command` 而前景忙時 Rust 不送 command，Python 直接寫 bridge | deferred：僅 ATTACHED 分支可達（READY 前景忙已回 `SESSION_BUSY`）；Python 此時與進行中的登入／再探 TX 交錯寫入同一 UART，Rust actor 單前景 grant 是 BC-03／單寫入者的刻意設計，補上需新增並行 TX 例外，列入 P6 對外差異清單待擁有者裁決 |
+| F40 | Low | `mode=interactive` 命令在已有 agent lease 時覆蓋 lease，舊 id 回 `INTERACTIVE_NOT_FOUND`（Python 舊 lease 仍 active、send 回 `INTERACTIVE_EXPIRED`） | deferred：需多 lease 並存的資料結構（Rust 每 session 一個 `lease`），影響 lease tombstone 與 fence `lease` 旗標，超出本修正輪範圍；P6 lease 多重性一併處理 |
+| F18 | Low | quiet gate 判斷未排除 `console_unlock_env` | deferred：僅影響設定 `console_unlock_env` 且 quiet 中的登入計畫選擇；待 P6 quiet／login 收斂一併補 characterization |
+| F19 | Low | 再探 `LoginFinished` 在 state≠ATTACHED 時未取用 run | deferred：drain 已於 `begin_stop` 取走 `login_run`（等待者回 SESSION_RECOVERING），剩餘窗口為非 drain 的狀態轉換，無已知可達輸入 |
+| F20 | Low | 並發再探合併（Python 排隊各自執行） | deferred：Rust 合併等待者、只送一次探測，TX 次數較 Python 少（不會多送）；回應內容一致，屬 OD 對外差異候選 |
+| F23 | Low | `flood_masking_exact_set` 斷言偏弱 | deferred：與 F48 同屬機率性強化，P6 latency 收斂時處理 |
+| F24 | Low | Python characterization 測試命名／追溯 | deferred：命名調整不影響行為，避免動已入 L1 lock 的 nodeid（lock 僅 add-only） |
+| F53 | Low | `wall_clock_jump` 未經真 OpRunner | deferred：現有 core 層斷言 mono 不受 wall 跳變影響；真 OpRunner 版本待 P6 |
+| F69 | Low | ATTACHING 於開埠前可見；stopping gate 拒絕寫 `ATTACH_FAILED:OSError` | deferred：commit 已揭露的暫態差異；ATTACHING 早可見不改最終狀態，gate 拒絕僅出現在 daemon 停止中（其後程序結束），列入 P6 對外差異清單 |
+| F77 | Low | `foreign_holders` 排序；`from_seq` inf | deferred：排序依 `/proc` 掃描序，Python 同為未排序；`from_seq=inf` 需 JSON 非標準數值輸入，待 P6 framing 邊界案例 |
+| F89 | Low | FakeTarget 自測與寫入鎖 | deferred：test-only 基礎設施強化 |
+| F50 | Medium | py_parity selector 僅單一 nodeid | 同 F57（BLOCKED-OWNER：selector 登記需擁有者核可） |
+| F103 | Medium | 1f5aafa（Task 20）commit 訊息「驗證」段證據不可追溯（「見交付報告」無路徑、未列仍失敗 nodeid），且用 `target/debug` 而非 §15.9.1 規定的 release artifact；HEAD 實測 `test_reject_paths_zero_tx` 兩輪皆有失敗 | | 部分完成（第三輪）：以 release artifact（`target/x86_64-unknown-linux-gnu/release/serialwrap{,d}`，sha256 與命令見報告）重跑黑箱 A/B 各兩輪、既有套件與 func-test 3 案，逐 nodeid 結果與失敗分類寫入 `docs/rust-refactor/reviews/p5-t20-blackbox-report.md`：Python 33/10/3、Rust 36/8/2（兩輪失敗集合各自相同）；既有套件與 func-test 兩邊全 PASS。11 個失敗案例皆已實測定位（無 Rust 對 Python 的待修差異：7 案兩邊一致、Python 獨有 3 案中 1 案為基線缺陷候選），列待裁決 `PA-OD-T20`。Task 20 在裁決前仍**未完成** |
+| F104 | Medium | `contracts/ab_normalization.yaml` 未規定 null／型別保留，一邊 null、一邊時間戳會被同一占位符抹平 | fixed（本組 commit；§10.4 待獨立審閱）：檔頭新增規則「值為 null 或型別不符時保留原值並照常比對」，每條映射加 `apply_to`（`mono_ts_ns`／`pid`／`existing_pid` 為 `non_null_int`，其餘 `non_null_string`），`approved_revision` 1 → 2，`reviewed_by` 仍空（審閱前視為提案）。目前無程式讀取本檔（比較器尚未實作），故無既有測試語意改變 |
+| F105 | Low | `ab_normalization.yaml` 的 `nonce` 映射在 Python 對外 JSON 不作用；未涵蓋 `existing_pid` | fixed（本組 commit）：`nonce` 的 reason 註明只在 TX／WAL payload、不作用於 payload 內容；追加 `existing_pid`（`non_null_int`，add-only） |
+| F106 | Low | `changelog.d/rust-s21-blackbox.md` 仍描述 18abb03 的單一 ATTACHED＋`PROMPT_UNAVAILABLE` 語意與 clear 的 `last_error` 清除時點 | fixed（本組 commit）：改寫為撤銷 → ATTACHED＋`PROMPT_UNAVAILABLE`、Ready → READY、Failed → DETACHED，clear 回應帶 `CLEARED`、其後再解析才清 |
+| F107 | Low | F60 只有「啟動快照為空」一案，RELEASED 跳過／有 bridge 跳過／既有 last_error、detached_at 不覆寫未鎖；Rust 多 `stop.is_some()` 條件未說明 | deferred：`stop.is_some()` 對應 Python 條件 `session.bridge is None`（drain 期間 `session.bridge` 仍非 None，`_complete_drain` 才清）；其餘 4 案為強化，排入下一輪 |
+| F108 | Low | root 下 L1 收集時 `holder_scan_permission` 固定紅燈；`cargo_l1_results.py` 未偵測 euid==0 | deferred（BLOCKED-OWNER）：L1 收集規則（「L1 linux 必須非 root」與整體證據不足標記）屬 06 計畫／收集腳本規格變更，需擁有者核可；本環境非 root 證據以 `setpriv --reuid=65534` 補跑 |
+| F91 | — | c43bb3e 驗證段引用的偶發失敗：`daemon_process::daemon_stop_during_force_recover_with_client_gone` 一次於 30 s 內未 READY，其後 2 次 28/28 通過 | | fixed（第三輪，9b81d9a）：根因已查明：外部行程持有假 DUT 的 PTY slave 時，daemon 的 holder probe 依 #82 拒開（`ATTACH_FAILED:DeviceHeldError`、DETACHED），`wait_ready` 30 s 逾時——是產品正確行為，非 daemon 缺陷。受控重現：以 scratchpad `hijack.py`（對新出現的 `/dev/pts/N` 開啟並讀走資料，模擬 F94 洩漏 daemon）同時執行，該案 1/1 失敗，訊息為 `last_error：ATTACH_FAILED:DeviceHeldError，/dev/pts/0 的持有者：[(pid, "python3 …hijack.py")]`；無干擾時單獨連跑 12/12＋3/3 通過、全量 sw-daemon 兩次失敗集合相同（僅 root 證據不足 3 支）。修正（測試支援，未放寬斷言）：`wait_ready` 逾時訊息附 `last_error` 與 PTY 外部持有者（`path_holders` 掃 `/proc/*/fd`），日後同類干擾可由失敗訊息直接辨識。環境端清理（洩漏 daemon）仍見 F94 |
+| F109 | Medium（p6 grok 3938032 #2 後半） | Linux 上 `SERIALWRAP_RPC_BACKEND=win`：Python `select_rpc_backend` 回 `win` 並在 Linux 建 `TcpRpcServer`；Rust 回 `backend 'win' is not available in this build`、exit 1 | BLOCKED-OWNER：parity-amendments 只列為候選 SC-37（未核准）；Python 1:1 需在 Linux build 提供 TCP RPC listener（sw-pal 目前僅 Windows 有 `listener_windows`），屬對外行為裁決。前半（檢查早於 argparse、`--help` exit code）已由 F78 修正 |
+| F110 | Low（p6 grok 7a84168 #2） | PROBE writer thread `join()` 失敗時 `parts.writer` 留在 `DetachedWriter` | deferred：僅 TxWriter thread panic 才可達；`DetachedWriter` 一律回 `NotSubmitted`（零 TX），後續登入 probe 失敗收斂為 `PROMPT_UNAVAILABLE`／drain，不會誤寫 UART。改為 join 失敗即關閉 open 排入下一輪 |
+| F111 | — | 本輪新觀察：`restart_after_commit::kill_before_commit_restores_previous_state` 第一次全量 sw-daemon 執行失敗（子行程遺留為孤兒、持有輸出管線） | | fixed（第三輪，9b81d9a）：根因已查明：同 F91——`wait_ready` 因外部持有者被拒開而逾時（同一 `hijack.py` 受控重現 1/1，訊息同上），測試 panic 後以 `S21_CHILD` 啟動的子 daemon 未被回收，成為孤兒並持有 cargo 輸出管線，使整個 `cargo test` 卡住（重現時亦卡住，手動終止孤兒後才結束）。修正：新增 `support::ChildGuard`，`restart_after_commit.rs` 兩支子行程案例改經守衛，panic 時 kill＋wait；同一受控重現改為 30.3 s 內失敗結束、無孤兒。無干擾時單獨連跑 12/12＋1/1 通過 |
+| F112 | Medium（e36089f..d2d29a6 opus） | 3afdc4f 誤提交 F79 修正前紅燈執行殘留的 `crates/sw-daemon/  /tmp/…/run /serialwrapd.lock`（前導空白、目錄名以空白結尾，Windows checkout 會失敗） | fixed（本組 commit）：`git rm` 該檔並清除本機殘留（含同目錄的失效 socket）；`allowlist_rejected_reasons_exact` (2b) 後加斷言 cwd 下不得出現 `"  "` 目錄（未 strip 的 RUN_DIR 被當相對路徑建立即紅；清除殘留前此斷言實際轉紅） |
+| F113 | Medium（同上） | F65 的 manager 層 sticky 閘門無回歸測試 | fixed（本組 commit）：新增 `session_manager::reattach_redetect_to_ready_does_not_write_sticky`（既有 fallback session 重插再偵測命中 `t` 並 READY → `profile_detected` 為空，Python `_attach_by_id` 不寫 sticky）。突變驗證：於 reattach 再偵測路徑補回 `probe_paths.insert` → FAIL |
+| F114 | Medium（同上） | 有 bridge 的 `session.clear` 回應 `last_error` 為 null（Python `CLEARED`） | 已於審查範圍之後的 b069633 修正（F97）：drain 收尾 Clear 分支先以 `CLEARED` 回覆、接受 `DeviceAttached` 後才清；`drain_release::clear_reopen_attaching_clears_last_error` 斷言回覆 `CLEARED`、其後 null |
+| F115 | Low（同上，4 項） | `bind_to_online_device_live_state_*` 斷言、`session_manager.rs:2286` 分支、`yaml_exc_name` 與 resolve 對應、`backend_env_checked_where_python_selects_it` 涵蓋、`release_persist_point` 錯誤傳遞 | deferred：皆為測試強化或註解對齊，無已知行為差異；排入下一輪 |
+
+## 第三輪（2026-10-28 cloud session）
+
+### 上游缺口 U-01：func-test `cowork-01-agent-bad-cmd`（P6 回報）
+
+| 項目 | 內容 |
+|---|---|
+| 現象 | Rust daemon 於步驟 4 `wait_ready`（40 s）逾時：PROMPT_TIMEOUT 後停在 `ATTACHED`／`last_error:PROMPT_TIMEOUT`、`reprobe_attempts:0`、`next_reprobe_at:null`；Python 基線同案 PASS |
+| 實跑對照（本 session，P5 tip 7af6567 debug artifact） | 兩邊 WAL 至救援段**逐 byte 相同**：`bad-hang\n` → 5 s 後 `system:recover` `\x03` → 2 s 後 `\x04` → 轉 `ATTACHED`／`PROMPT_TIMEOUT`。差異只在其後：Python 於轉 ATTACHED 後約 0.7 s 由 `system` 送 `\n`（readiness reprobe），DUT 回 `$ ` 後送 `echo __READY__<nonce>\n` 升 READY；Rust 之後零 TX |
+| 根因 | Python 的回 READY 路徑是 `SessionManager.reconcile_readiness()`（DeviceWatcher 週期 tick → `_prepare_reprobe_locked` 對 `ATTACHED`＋`PROMPT_TIMEOUT` 排 probe → `_spawn_reprobe_probe`），**不是**命令執行／recover 路徑。readiness reprobe 依 `docs/rust-refactor/plans/08-slice23-login-events.md` 屬 **Slice 2.3 P7-T5**（新檔 `crates/sw-core/src/reprobe.rs`）；P5 的 `session_manager.rs` 已註明「Slice 2.1 無 readiness 自動重探（Phase 08）」。P5 擁有的救援段已由 `command_exec::both_keys_fail_prompt_timeout_to_attached` 鎖住且與 Python 一致 |
+| 佐證 | 拋棄式 worktree 建 `origin/feature/rust-refactor-p7`（a0cad06，含 bc82b94 `reprobe.rs`）以同一 runner 執行：步驟 4 `wait_ready` 轉綠、步驟 5～7 通過，止於步驟 8 `session.console_attach` → `METHOD_NOT_FOUND`（console 屬 P6，P7 未疊在 P6 上）。P6＋P7 試合併衝突 16 檔，未在本 session 解 |
+| 影響範圍（T21 實跑補充） | 同一缺口也使 **Slice 2.1 的 P2 凍結 L1.5 情境 `l15-delayed-reply`**（PROMPT_TIMEOUT 後下一筆命令 `SESSION_NOT_READY`）與 `s21-reboot-minimal-guard`（#162 `ready_reconfirm_pending` 永不解除，agent 命令持續 `AUTOBOOT_QUIET`）在 Rust 失敗、Python PASS；故不只是 2.2 gate 問題，Slice 2.1 出口亦受阻 |
+| 處理 | **BLOCKED-OWNER**（未在 P5 修；裁決項 `PA-OD-REPROBE`）：在 P5 重做 `reprobe.rs` 會與 P7 已交付的同名新檔重複並在 P7 併回時衝突，且越出 06 計畫範圍；為此在 P5 加一支恆紅的回歸測試則違反「不得引入新的失敗」。需擁有者裁決其一：(a) 將 `cowork-01-agent-bad-cmd` 自 Slice 2.2 func-test gate 移至 Slice 2.3（依賴 08 Task 5）；(b) 核准把 P7-T5 `reprobe.rs` 及其 tick 接線 backport 到 P5／P6。Slice 2.2 gate 在裁決前此案必紅（P6 的 7/8 為此） |
+
+### F91／F111：sw-daemon 間歇失敗
+
+見上表 F91、F111 兩列（根因：外部行程持有測試 PTY；產品依 #82 正確拒開；測試支援補診斷訊息與子行程守衛）。
+
+### 報告 `p5-cloud/d2d29a6_7af6567-opus.md`（High 0、Medium 8、Low 15）
+
+| ID | 嚴重度 | Commit | 發現 | 處理 |
+|---|---|---|---|---|
+| F116 | Medium | 47c7b25 #1 | state.json 含孤立 surrogate：Python surrogatepass 載入成功、`_save_state` 拋 `UnicodeEncodeError` → rc 1、原檔不動；Rust 改名 `.corrupt`、丟掉 RELEASED 並 attach 到 READY | fixed（本組 commit）：`json_bytes_to_text` 改 surrogatepass（UTF-8 完整 `ED A0..BF xx`、UTF-16／32 孤立單元）並以 `U+10F800+(u−0xD800)` 標記承載；JSON 字串內孤立 `\uXXXX` 跳脫依 `py_scanstring` 配對規則改寫為同一標記（改寫後解析失敗時以原文取錯誤訊息）；`LoadedState.lone_surrogates` 為真時，manager 在建構子尾端啟動存檔前序列化 payload，含標記即記錄 Python 例外末行並跳過寫檔，daemon 印 traceback 首末行、exit 1、不掃描不 attach。紅燈先行：`tests/contract_blackbox/slice21/test_state_file_compat.py` 新增 `test_lone_surrogate_in_persisted_row_fails_startup_like_python[surrogatepass_bytes／json_escape]`（期望末行取自同輸入的 Python 基線實跑，位置含自動 alias 列）、`test_lone_surrogate_in_unknown_key_starts_normally[…]`：修正前 Rust 3 failed／1 passed、Python 4 passed；修正後兩邊皆通過。Rust 單元 `state_store::lone_surrogate_state_json_loads_and_reproduces_python_encode_error`。已知限制：同一檔案同時含孤立 surrogate 與 U+10F800..U+10FFFF 真實字元時，後者會被視為 surrogate |
+| F117 | Low | 47c7b25 #2 | UTF-16／32 解碼錯誤訊息位置未含 BOM、UTF-32 缺 `position S-E` | fixed（本組 commit）：位置一律以原始 bytes 計，UTF-32 依 CPython 單／多 byte 格式；`state_store::utf16_utf32_decode_error_text_matches_python`（7 組，期望值取自 python3.12 實跑） |
+| F118 | Medium | 3b5927a #1 | F28 跨 session 淘汰的 manager 接線（`ManagerNote::EvictCapture`）無回歸 | fixed（本組 commit）：`session_manager::global_bg_capture_eviction_reaches_owner_session_via_manager`（兩個 READY session；COM1 完成 64 筆 bg capture、推進時鐘使其 quiet window 終結，COM0 再完成 1 筆 → COM1 最舊者 `result_tail` 轉 `CMD_NOT_FOUND`、次舊者與 COM0 新者保留）。突變驗證：把 manager 的 `EvictCapture` 分支改為 no-op 時該案 FAIL（已實測，已還原）。ManagerRig 新增 `reg`（manager 的命令登錄）供等待命令完成 |
+| F119 | Medium | b7cd852 #1 | `case_uptake` 只要 case_verdicts 存在即 PASS，未呼叫斷路器 | fixed（本組 commit）：judge 新增 `judge_breaker`（`slice_breaker.evaluate`＋分母核對）：tripped／od02_resubmit → FAIL、insufficient_evidence／輸入缺漏／格式錯誤 → EVIDENCE_MISSING；assemble／judge CLI 由 `slice21_gate_expect.yaml` 的 `breaker_snapshots_file`、`stage2_estimate_weeks`（擁有者填值；null → EVIDENCE_MISSING，不以 0 放行）組輸入；報告 `case_uptake.breaker` 附 evaluate 結果。紅燈先行 5 支：`test_case_uptake_tripped_is_fail`、`…od02_resubmit_is_fail`、`…insufficient_evidence_is_missing`、`…without_breaker_inputs_is_missing`、`…rate_zero_reported_in_reasons` |
+| F120 | Medium | b7cd852 #2 | L1.5 未檢查 `SERIALWRAP_L15_SELFTEST_REPORT`，證據缺失記成 FAIL；`l15-wal-interference` 結構上不可能 PASS 未列裁決 | fixed（本組 commit）：gate 第 9 段先以 `func-test/runner.py` 的 `evaluate_bridge_eligibility`（Task 8 正式資格判定）核對自測報告，未設或不合格即 `l15_ab` EVIDENCE_MISSING；runbook 共通規則補該環境變數與命令；`pending_decisions` 新增 `PA-OD-L15-WAL` |
+| F121 | Low | b7cd852 #3 | 非測試 section 缺 `section_verdict` 預設 PASS | fixed（本組 commit）：預設改 EVIDENCE_MISSING；`test_non_test_section_requires_explicit_verdict`。既有正向夾具改為明確帶 `section_verdict: PASS`（判定更嚴，斷言未放寬） |
+| F122 | Low | b7cd852 #4 | `win_l1_into` 取最新報告未綁定本次 run | deferred：LOCAL-WINDOWS-TODO（`win-test.sh` 報告格式無 run_id；於擁有者 Windows host 實跑 gate 時一併改為傳 `--run-id` 並只取該檔） |
+| F123 | Low | b7cd852 #5 | event_latency 判定器未實作且未追蹤 | `pending_decisions` 新增 `PA-OD-EVLAT`（同時涵蓋 c0d221f #1 的 Rust 計時欄位缺口） |
+| F124 | Medium | 4920d90 #1 | `#32` 改 OWNER-DECISION-PENDING 但無對應裁決項；judge 無條件接受 | fixed（本組 commit）：`pending_decisions` 新增 `PA-OD-F67`，`#32` 列加 `decision: PA-OD-F67`；judge 要求 `decision` 存在於報告 `pending_decisions`，否則 INCOMPLETE（`test_owner_decision_pending_requires_registered_decision`，紅燈先行）；狀態檔檔頭規則補一行 |
+| F125 | Low | 4920d90 #2 | 狀態檔檔頭「P5-T19～T21 未完成」與內容矛盾 | fixed（本組 commit） |
+| F126 | Medium | c0d221f #1 | s21-event-latency flood 輪實為 idle 量測；Rust 無 `test_fakes.event_latency` 欄位 | 實跑證實（第三輪）：Python 與 Rust 兩個 label 皆在步驟 1 以 INSUFFICIENT_EVIDENCE 結束（兩邊 daemon 都沒有計時欄位，非只有 Rust）；flood 窗口、`stop_request`、計時欄位皆列 `slice21-l15-gaps.md` #6，裁決項 `PA-OD-EVLAT`。未以近似量測冒充 |
+| F127 | Medium | c0d221f #2 | 「從未進 ATTACHING／READY」以單點取樣表達 | fixed（註解如實改為「單點取樣」並登記 gaps #9 待裁決，`PA-OD-L15-GAPS`）；不另造近似斷言 |
+| F128 | Medium | c0d221f #3 | gaps #1～#6 未連結 gate，情境仍 `expected: PASS` | fixed：gate 第 9 段在 `PA-OD-L15-*` 待裁決項仍存在時，L1.5 pytest 即使全綠也把 `l15_ab` 記為 EVIDENCE_MISSING（不計 PASS）；gaps #2 以 runner `list_contains` 補齊（兩 label PASS），其餘逐項列裁決 |
+| F129 | Low | 2af2554 #1／#2 | `load: flood` 不驗 flood 在途；INSUFFICIENT_EVIDENCE 與 FAIL 共用 StepError | deferred：併入 gaps #6（`PA-OD-EVLAT`），計時欄位缺失前 runner 量不到任何樣本，flood 檢查無從驗證 |
+| F130 | Low | b069633 #1 | F98 (a)(b)(c) 無回歸 | deferred：測試強化（(b) 需在途 op 與 Reattach 同時、(c) 需 actor 已結束的 owner；無已知外部行為差異），排入下一輪 |
+| F131 | Low | 7536870 #1 | `pending_open_stop` 的 Phase 1 快照無測試；Clear／Bind 於開埠窗口 Python 走 `_detach_session_locked`（ATTACHING／null） | deferred：需 test-fakes 暫停 open 的黑箱 A/B 取得 Python 實際行為後裁決（可能為 BC）；未取得實測前不改產品 |
+| F132 | Low | 68fd9bf #1～#3 | 校準報告時區、P2 凍結情境數、「flake」措辭 | fixed（T22 組 commit，校準報告更新） |
+| F133 | Low | 7af6567 #1 | 防再生斷言事後偵測，紅燈實作仍污染工作樹 | deferred：拒絕路徑改 `current_dir(tempdir)` 屬測試支援重構，排入下一輪（F112 斷言仍有效） |
+| F134 | Low | 7af6567 #2 | sticky 否定斷言靠 200 ms sleep | deferred：同上 |
+| F135 | Low | 7af6567 #3（F115 拆項） | F115 中 3 項實為行為差異 | 拆項：(1) e95c5e9 #2 `DeviceOnline` 失敗時不 `send_attached`——deferred：需讓 actor 回覆逾時的 fault hook 才能先紅，未有前不改；可達條件為 actor 已結束或 5 s 內未處理 control（daemon 異常狀態）。(2) 3afdc4f #2 YAML 例外類別名 5 種不同——deferred：須追加 golden 產生器 CASES 並經 §10.4 審閱，排入下一輪。(3) 3afdc4f #4 EXCEPTION message 為 Debug 格式——fixed（本組 commit）：`release_persist_point` 的 OSError 附失敗路徑（`os.makedirs` 第一個不存在層級），session_core／manager 的 commit 失敗 message 改用 `py_message`；紅燈先行 `test_state_file_compat.py::test_release_persist_oserror_message_like_python`（Python 1 passed、修正前 Rust FAIL：`state.json commit failed: PalError { … }`） |
+
+### 本輪全套 pytest 新增失敗的取證
+
+- `tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_ab_shared_checks`：本組 G2 全套與同範圍（`tests/contract_blackbox --ignore slice21`）重跑皆失敗（3/3），與起點基準不同；把本組變更 `git stash` 後以 9b81d9a 重建仍失敗，非本組造成。根因：前一個檔 `test_cli_mgmt_daemon.py::test_daemon_restart_ab` 收尾只送 `daemon stop` 未等重啟後的 Python `serialwrapd.py`（ppid 1）離開，doctor 測試開始時 `/proc` 仍有該行程（以 pytest 插件在 setup 時列出：`pid=… cmd=… test_daemon_restart_ab0 …`），Python doctor 與 Rust CLI 兩次掃描間該行程結束 → `single_daemon` 1≠0。修正（測試收尾，未放寬斷言）：收尾等重啟後 pid 自 `/proc` 消失（上限 15 s）；同範圍重跑 1/1、兩檔合跑 2/2 通過，失敗集合回到起點基準。
+
+### T21 L1.5 A/B（第三輪）
+
+實跑與逐案結果見 `docs/rust-refactor/slice21-l15-gaps.md`「第三輪 A/B 實跑」：21 個情境中 Python 18 PASS／3 非 PASS（`l15-wal-interference`、`s21-wal-unlink-under-traffic`、`s21-event-latency`）、
+Rust 16 PASS／5 非 PASS；Rust 獨有的 2 項（`l15-delayed-reply`、`s21-reboot-minimal-guard`）皆為 readiness reprobe 缺口（`PA-OD-REPROBE`），其餘兩邊相同。
+情境修正：`s21-reboot-minimal-guard` 依 #162 等待再確認後才送 AFTER（兩邊未修正前皆 `AUTOBOOT_QUIET`）；exclusive-conflict 兩情境加 `pids` 斷言。
+gate：新增 `--evidence-run`（凍結檢查未過仍執行各 section，judge 仍判 INCOMPLETE；`test_preflight_not_frozen_never_ready`）。
+
+### T22 gate 實跑與期間新報告（第三輪）
+
+| ID | 嚴重度 | Commit | 發現 | 處理 |
+|---|---|---|---|---|
+| F136 | — | — | `sw-pal::lock::lock_conformance_suite` 在 `cargo_l1_results.py` 收集中失敗 1 次（同範圍下一次通過；直接連跑 idle 300＋4 核滿載 300 次 0 失敗） | open：失敗集合不同已取證，但 collector 不保留 panic 輸出、無法定位；前一輪審查亦見同案於併發 cargo 下失敗一次（`stale_socket_reclaimed`: AlreadyRunning）。下一輪讓 collector 保留失敗輸出後追查，不以 flaky 放行 |
+| F137 | Medium（本輪自查） | 測試支援 | sw-daemon 測試以 cwd 相對路徑找 FakeTarget 與 `slice21_scope.yaml`，gate 的 collector 下 10 支假性失敗 | fixed（本組 commit）：新增 `crates/sw-daemon/tests/common/mod.rs::data_root()`（`CARGO_MANIFEST_DIR` 只出現於此，符合 cfg 邊界規則），`FakeTargetProc::start`、`repo_file`、`dispatch.rs` 改經此定位；先以 `/tmp` 為 cwd 執行測試 binary 重現 `ModuleNotFoundError`（紅），修正後同條件通過、collector 重跑 6 failed（僅 root 證據不足） |
+| F138 | Medium（本輪自查） | b7cd852 | gate 的 blackbox_rust 未設 Rust CLI，conftest 身分檢查使 46/46 fail | fixed（本組 commit）：gate 加 `SERIALWRAP_CLI_EXE="$RUST_CLI"` |
+| F139 | Low | b7cd852 | gate identity 以 `serialwrapd --version` 取版本，但 Python／Rust daemon 皆不支援該旗標 | deferred：改由隔離 daemon 的 `daemon status.version` 取得，需在 gate 起一個 throwaway daemon，排入下一輪；目前 identity 缺漏照實使 verdict 不得 READY |
+| F140 | Low | 9b81d9a #1 | F91／F111 列超出 4 欄表頭，渲染後不可見 | fixed：兩列與 F103 列改為單一「處理」儲存格 |
+| F141 | Low | 9b81d9a #2 | `hijack.py` 未入庫 | fixed：`docs/rust-refactor/reviews/p5-evidence/f91-hijack-pts.py`（附用法與期望訊息） |
+| F142 | Low | 9b81d9a #3 | `path_holders` 對 symlink 路徑找不到持有者 | fixed：比對前 `canonicalize` |
+
+gate 逐 section 判定見 `docs/rust-refactor/reviews/p5-t22-gate-run.md`。
+
+## 第四輪（2026-10-28 cloud session，排程第四輪）
+
+### 報告 `sol-backfill/p5-20261028.md`（Codex sol 額度中斷期間補審；High 2、Medium 6）
+
+所有項目皆先寫會紅的回歸、確認修正前 FAIL，再修產品（以 Python 基線實際行為為準）。
+
+| ID | 嚴重度 | Commit | 發現 | 處理 |
+|---|---|---|---|---|
+| F143 | High | 73634db（sol #2） | 產品 executor 在 actor 執行緒同步等開埠與 state commit：開埠卡住時 actor 無法回 GetState、release 的 3 s 排空計時器失效；release 持久化暫停鉤子同樣卡住 actor | fixed：`ManagerExec` 新增兩個 actor 外的有界 FIFO 工作者（`JobQueue`，容量 16、延遲建立）：`OpenBridge` 的開埠與 `Persist` 的 commit 等待移出 actor，完成以 `BridgeOpened`／`StateCommitted` 回報；佇列滿即以失敗結果回報、不阻塞。新 bridge 的 RX 視窗暫存於 `opened_rx`，`AdoptBridge` 時接手（原本開埠當下就改 `self.rx`）；actor 已結束時開埠結果就地 `finish_async` 關閉 handle。紅燈先行（ManagerRig，經產品 executor）：`session_manager::product_executor_blocked_open_keeps_actor_responsive_and_release_drain_stalled`（`block_open` 後 GetState 須回覆、release 推進 3001 ms 須回 `DRAIN_STALLED`）、`…_blocked_release_commit_keeps_actor_responsive`（persist observer 卡在 `before_release_commit` 時 GetState 須回覆）；修正前兩案皆於 GetState 逾時 FAIL |
+| F144 | High | 7a84168（sol #6） | PROBE fence 未註冊 WAL 健康 fanout：快照讀到健康後才發布的 unhealthy 送不到，WAL 已失效仍送出 `\n` | fixed：`probe_send` 初始化 fence 後 `self.fanout.register(fence.clone())`（序列化註冊協定取得最新狀態）。紅燈先行：`session_manager::detect_probe_fence_observes_wal_unhealthy_published_before_submit`（test-fakes 鉤子 `set_probe_pre_submit_hook_for_test` 於 fence 建立後、提交前發布 unhealthy；斷言 fallback、零 OS 提交、零 PROBE TX WAL）；修正前 `detected` FAIL |
+| F145 | Medium | 8b8a40f（sol #1） | interactive 模式命令的 TX WAL 不帶 cmd_id；部分送出收成 `SEND_FAILED`、無 META | fixed：`OpSpec::InteractiveOpenCmd` 的 `lease_send` 帶 `grant.cmd_id`；已確認 >0 bytes、Unknown 或無 reject 的未完整送出改以 `map_send_failure` 結算（`COMMAND_ABORTED_IN_FLIGHT`＋`command_aborted_in_flight` META），`PendingOp::InteractiveCmd` 接受 `CommandResult`；Fence 拒絕且零 bytes 維持原 `lease_refused_command_code`。紅燈先行：`command_exec::interactive_mode_command_tx_carries_cmd_id`、`…_partial_send_maps_aborted_in_flight`（4 bytes、partial）、`…_unknown_send_maps_aborted_in_flight_unknown`（confirmed 2、unknown） |
+| F146 | Medium | 73634db（sol #3） | `alias.set` 只改 manager 鏡像，actor 的 GetState 仍回舊 alias | fixed：新增 `SessionRequest::SetAlias`（任何狀態原地更新 actor profile，回活 session），`alias_set` 更新鏡像後送出並等確認、再 commit（與 Python 先改 profile 再 `_save_state` 同序）。紅燈先行：`session_manager::alias_set_reaches_actor_profile_for_get_state` |
+| F147 | Medium | 73634db（sol #4） | 啟動存檔失敗（EACCES／ENOSPC）只 warn，仍掃描／attach | fixed：建構子尾端 commit 失敗即記錄 Python 例外末行（`py_exc_name: py_message`）於 `startup_error()`，daemon 走既有 traceback＋rc 1 路徑。Python 基線實測（非 root、state 目錄 555）：mkstemp 拋 `PermissionError: [Errno 13] Permission denied: '<state>/state.json.tmp.XXXX'`、rc 1。紅燈先行：`session_manager::startup_save_failure_reports_python_exception_line`（EACCES／ENOSPC、零開埠）、`daemon_process::unwritable_state_dir_startup_save_exits_1_before_attach`（rc 1、traceback、DUT 零 bytes、state 目錄無檔；非 root 執行） |
+| F148 | Medium | 3938032（sol #5） | 裸 `--` 被丟掉，`serialwrapd --` 啟動 daemon | fixed：`--` 保留於 extras（Python 3.12 argparse：無 positional 時不消耗）。Python 實測 `--`、`--profile-dir x --`、`-- -h`、`-- --bogus` 皆 rc 2、`unrecognized arguments: -- …`。紅燈先行：`daemon_process::bare_double_dash_is_unrecognized_exit_2`（rc、stderr 末行、未 bind socket、未寫 state.json） |
+| F149 | Medium | 3b5927a（sol #7） | capture 淘汰以 alias-aware `resolve()` 找 owner，alias 與他人 COM 同名時找錯 session | fixed：`ManagerNote::EvictCapture` 以 `profile.com == com` 精確比對。紅燈先行：`session_manager::global_bg_capture_eviction_owner_routing_ignores_alias_collision`（COM0 alias 設為 `COM1`，其餘同 F118） |
+| F150 | Medium | b7cd852（sol #8） | `judge` 子命令未載入 parity，重新判定把 INCOMPLETE 放寬成 READY | fixed：抽出 `build_expect()` 供 `assemble`／`judge` 共用（鎖、凍結檔、斷路器、#104 parity 狀態與來源一律由檔案重新載入；狀態檔或來源缺失仍帶入 → INCOMPLETE）；`judge` 另讀報告的 `blocked_owner` 與可選 `--case-verdicts`。紅燈先行：`test_slice21_gate_judge.py::test_cmd_judge_reloads_parity_like_assemble`（修正前 `READY_FOR_OWNER_EVIDENCE`） |
+
+### 報告 `p5-cloud/9b81d9a_c66f65e-opus.md`（High 0、Medium 1、Low 2）
+
+| ID | 嚴重度 | Commit | 發現 | 處理 |
+|---|---|---|---|---|
+| F151 | Medium | 2be8982 #1 | `test_recovery_flushes_queue`：Python 先送 q0、Rust 全 flush，卻寫成無差異 | 擁有者 OD-37 已裁決：Rust 採 DF 行為（recover 原子 flush），Python 輪逐列標記 DF 差異並登記 `contracts/behavior_changes.yaml`；見本輪 OD 段 |
+| F152 | Low | 2be8982 #2 | ATTACHING 案 RPC 回覆與 probe TX 先後 | 併入 OD-36（該案零 TX 窗口排除合法 attach 登入序列）；見本輪 OD 段 |
+| F153 | Low | 4f4082f #1 | 孤立 surrogate 位於鍵且同層有 ≥U+E000 鍵時，`position N` 與 Python 不同 | deferred：Low，僅影響錯誤末行的位置數字（rc、traceback、原檔不動皆一致），排入下一輪 |
+
+### 報告 `p5-cloud/c66f65e_1393573-sol.md`（Codex sol incr；本輪 merge 審查）
+
+| ID | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| — | A 1～8 | 前輪 sol-backfill 8 項未修（審查時點為 1393573） | 已於 `25ad3900` 修正（F143～F150） |
+| F154 | High | P5-1393573-1：PR 237 折行回顯修正未接上 Rust（逐行 `ends_with`） | fixed：`op_runner::strip_wrapped_command_echo`／`match_wrapped_echo` 承接修正後語意（origin/fix/wrapped-echo-false-positive 34c3a84b；擁有者指定不採主線現行 s1v13 版）。紅燈先行：`command_exec::wrapped_echo_*` 11 案，修正前 BusyBox／三行／readline／prompt 前綴 4 案 FAIL；審查反例 `cmd[:65]+"\r\r\n"+cmd[65:]+"\r\nOUT"` 即 `wrapped_echo_busybox_wrap_is_stripped`。CHG-S21-PR237-ECHO-01 |
+| F155 | Medium | P5-1393573-2：合入主線 cases.yaml 後凍結 provenance 不符 | fixed：OD-34 凍結修訂 #1（`d8ac988c`；`slice_2.1.amendments.json` 記錄當下 provenance，凍結檔本體與窗口不動，cases revision 升 `2026-10-28.1`），未刪雜湊斷言 |
+
+### 報告 `p5-cloud/1393573_5cc4623-sol.md`／`p5-cloud/5cc4623_70f6ce7-sol.md`（Codex sol incr；High 2、Medium 1）
+
+| ID | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| F156 | High | P5-5cc4623-1：`Persist` 把整個 model delta 延到工作者才套用；release 卡在 `before_release_commit` 時 bind 到離線裝置 B 成功，恢復後舊 `Released{A}` 被回放落盤，重啟又成 RELEASED | fixed：`ManagerExec` 處理 `Effect::Persist` 時依 actor 順序**同步** `model_apply(delta)`，工作者只跑 release 暫停鉤子並提交當下快照（`commit_sync_kind(|_| {}, release)`）；Python `_save_release_state` 暫停後重建當前快照、不回放 delta。紅燈先行：`session_manager::release_commit_paused_then_bind_keeps_binding_without_stale_released_row`（修正前 `released` 仍含 `t:COM0 → usb-A`；修正後 binding B 落盤、無 released 列）。F143 的 actor 不阻塞性質不變（`…_blocked_release_commit_keeps_actor_responsive` 仍綠） |
+| F157 | Medium | P5-5cc4623-2：Python readline 折行點接命令空白時，貪婪消耗空白導致回顯殘留 | fixed（Python 主線 `842c014`，本輪 merge 併入）：標記 `" \r"` 優先於命令字元比對。Rust 同語意承接，回歸 `command_exec::wrapped_echo_readline_wrap_before_command_space_is_stripped`（前置 `\n`／`\r\n`、cuts 30/79） |
+| F158 | High | P5-70f6ce7-1：Rust 在 `clean_text()` 後無條件拼接，遺失原始折行證據；echo 關閉時 `cat` 印出恰為命令兩段的普通 CRLF stdout 被刪 | fixed：改為逐句承接 Python 主線（842c014）——BusyBox 拼接僅於原始串流含 `\r\r\n` 時進行（`_strip_wrapped_command_echo`：只接合行、前綴短於第一行）；readline 僅於原始串流含 `" \r"` 時，於原始文字首個非空行以 `_match_readline_wrapped_echo` 比對（首段自命令起點計 ≥20、結束於行尾），去標記後重新 `clean_text`／prompt 截斷再判定首行。Python 基線實跑反例 → `cmd[:40]+"\n"+cmd[40:]+"\nOUT"`。紅燈先行：`command_exec::wrapped_echo_plain_crlf_stdout_spelling_command_is_kept`（修正前只剩 `OUT`）、`…_readline_python_golden_cases`（Python `test_wrapped_echo_strip.py` 其餘 readline 案；修正前「prompt 前綴不計距離」案 FAIL）。原 11 案（F154）全數仍綠。注意：F154 依擁有者指示採 `34c3a84b` 語意，該 matcher 本身即有此誤刪；本輪以合入後的 Python 基線（主線 842c014）為 1:1 依據，CHG-S21-PR237-ECHO-01 同步改記 |
+
+### 報告 `p5-cloud/70f6ce7_3c4e051-sol.md`（Codex sol incr；Medium 2；A 段三項未修）
+
+| ID | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| — | A：P5-5cc4623-1／-2、P5-70f6ce7-1 | 審查時點 3c4e051 仍未修 | 已於 `3988f07e`（merge 842c014）與 `0a7d0929` 修正（F156～F158） |
+| F159 | Medium | P5-3c4e051-1：`s21-partial-tx-abort` 以產品寫的 `cmd_id` 計 WAL TX 再選錯誤碼，錯置 `cmd_id: null` 的錯誤 daemon（已送完整 16001 bytes）會被判 0 bytes 而通過 | fixed：新增 runner 動作 `assert_wire_tx_window`——以 op 窗口兩端 settled 快照的 `serial_read` 差值獨立計量 wire TX，要求等於該 cmd_id 的 WAL TX 總和（不符即紅；快照未 settled → INSUFFICIENT_EVIDENCE），再以 wire 計量套 `lt 16001`；情境改以 `{big_wire.wire_tx_bytes}` 判定 `FLUSHED_BY_RECOVERY`／`COMMAND_ABORTED_IN_FLIGHT`。紅燈先行：`func-test/tests/test_s21_actions.py::test_assert_wire_tx_window_counts_wire_independently_of_cmd_id`（審查反例：wire 16001、WAL `cmd_id:null` → 必紅；正確歸屬但完整送出 → 必紅；4096 部分送出 → 通過）。L1.5 實跑 Python／Rust 皆 PASS（兩邊 wire＝WAL＝15360 bytes，`COMMAND_ABORTED_IN_FLIGHT`） |
+| F160 | Medium | P5-3c4e051-2：`assert_any` 只檢查分支第一層，`assert_when` 的 `then`／`else` 可夾帶副作用（CLI 已被呼叫後失敗分支被吞） | fixed：`_assert_any_side_effects` 遞迴檢查 `then`／`else`／`of`，`wait_cli_until` 限唯讀查詢前綴（`session list／get-state／get`、`cmd status／get`、`daemon status`），全部在執行任何分支前驗證。紅燈先行：`test_assert_any_rejects_nested_side_effects_before_running_any_branch`（審查反例 CLI 呼叫次數 0；`cmd submit` 的 wait_cli_until 拒絕；巢狀 `dut_control` 拒絕；唯讀 `session list` 照常）。現有情境（`s21-reboot-minimal-guard`）逐分支驗證無副作用 |
+| F161 | Medium（自查） | 核對 F159 實跑時發現：Rust release 中止部分送出命令時寫出兩筆相同的 `command_aborted_in_flight` META（op runner `map_send_failure` 與 drain 回條 `apply_aborted_receipt` 各一；Python 只由 worker `_map_aborted_result` 寫一筆） | fixed：`CommandRegistry::claim_abort_meta(cmd_id)`（FIFO ≤ `CMD_HISTORY_MAX`）為兩方共用的一次性寫入權，`OpCtx` 帶入 registry。紅燈先行：`session_manager::release_partial_in_flight_command_writes_single_aborted_meta`（產品 executor；修正前 seq 6／7 兩筆）；L1.5 `s21-partial-tx-abort` Rust WAL META 2 → 1 筆，與 Python 相同 |
+
+### 第五輪（2026-10-29）：編排者裁決 `rulings/p5.md` 與 OD-45～OD-47
+
+| # | 嚴重度 | finding／裁決 | 處置 |
+|---|---|---|---|
+| F162 | High | P5-5cc4623-1（改修法、必修）：release commit 須依當下狀態重算、不重放失效 delta；回歸以 `before_release_commit` 暫停點，含重啟後實體化 | 實作沿用 F156（`0a7d0929`）：`Effect::Persist` 於 actor 順序同步 `model_apply(delta)`，工作者只跑暫停鉤子並提交 commit 當下快照——暫停期間 bind B 的 Unreleased＋新 binding 已在 model 內，commit 依當下狀態重建，舊 `Released{A}` 不會被重新插入。本輪補齊裁決要求的「重啟後實體化」：`session_manager::release_commit_paused_then_bind_keeps_binding_without_stale_released_row` 追加 `restart()`＋`bootstrap_attach()`，斷言 COM0 非 RELEASED、`device_by_id`＝B、重啟後無 released 列。紅燈證明：把 delta 改回工作者內 `commit_sync_kind(move \|m\| m.apply(delta), …)`（F156 前行為）即紅（`released` 含 `t:COM0 → usb-A`） |
+| F163 | High | P5-70f6ce7-1（照修）：`op_runner.rs` line mode 回顯剝除改依修正 PR 語意 | `extract_command_stdout` 改為修正 PR `34c3a84` 的 `_match_wrapped_echo`／`_strip_wrapped_command_echo` 逐字元比對（命令字元含空白依序全中、僅跳過換行或多一個空白、插入點 ≥20 且第一個以首行欄位計、首字前不得插入、須從首行開始並止於行尾），並依裁決回歸「CRLF 一般 stdout 不被剝」保留原始串流證據：換行插入只在 raw 含 `\r\r\n`、空白插入只在 raw 含 `" \r"` 時允許。原 842c014 專屬的 readline 重抽路徑移除。紅燈先行（舊實作 FAIL）：`command_exec::wrapped_echo_first_insertion_counts_first_line_column`（prompt 15 欄＋10 字元＝第 25 欄折行應剝）、`…_busybox_insertions_closer_than_20_are_kept`（有 `\r\r\n` 證據但插入點 <20 不剝）；另加 `…_busybox_newline_replacing_command_space_is_kept`。裁決列出的回歸（CRLF 一般 stdout、`cat file`→`catfile`、短輸出拆兩段、長輸出少空白、BusyBox 96 字元第 65 字元 `\r\r\n`、readline `" \r"`、prompt 前綴）皆有對應案且全綠。**oracle 變更揭露**：`…_readline_python_golden_cases` 末段原依 842c014 斷言「殘留 prompt 不計入距離（不剝）」，與裁決「第一個以首行欄位計」相反，該段改移至新案以裁決語意斷言（剝除）；其餘斷言不變。Python `sw_core/session_manager.py` 該段依 P5-5cc4623-2 延後裁決未改 |
+| — | Medium×2 | P5-3c4e051-1／-2 | 已於 `cca5ba8` 修正（F159／F160）；最新 sol 報告 `33863d5_cca5ba8-sol.md` A 段標「已修」、B 段 NO FINDINGS。本輪不另改 |
+| — | Medium | P5-5cc4623-2 | 依裁決延後（修正 PR 合入 main 後的下一次 merge），未改 Python 折行段 |
+| F164 | — | OD-45 L1 結構 gate 五事件齊備 | 探針（test-fakes）新增 `Shutdown`、`WorkerStopped` 標籤；新增 `drain_release_e2e::shutdown_and_drain_receipt_handled_within_one_data_item_under_flood`（stop_request、drain_receipt），`release_handled_within_one_data_item_under_flood` 追加 release 排空回條的 `WorkerStopped` 斷言。紅燈：探針無此標籤時「探針應記錄 Shutdown／WorkerStopped」FAIL。command_cancel 的 actor 路徑為 `CancelQueued`（既有）；在途命令的 `command.cancel` 只改命令登錄表（Python 同），不經 mailbox |
+| F165 | High | sol P5-3084388-1：`command_cancel` 樣本只檢查回應有 `ok` 欄位；命令已自然完成而回 `CMD_NOT_CANCELABLE` 時仍計為有效樣本 | fixed `2472f78`：須 `ok:true`、`status: canceled` 且命令最終為 canceled，否則記錯誤（該輪 INSUFFICIENT_EVIDENCE）。紅燈先行 `tests/test_event_latency_measure.py::test_cancel_sample_rejects_refused_cancel` |
+| F166 | Medium | sol P5-3084388-2：量測證據無受測身分 | fixed `2472f78`：報告 `identity`（run ID、daemon sha256、來源 commit 與工作樹乾淨與否、工具／契約 sha256、method_revision），身分不全或工作樹不乾淨不得 PASS；紅燈 `test_report_identity_binds_artifact_commit_tool_and_run`。舊證據檔（無身分、且第 1 輪與全套 pytest 並行）移除，改以 `p5-evidence/event-latency-od45-rust-evlat-r5-2472f78.json`（`2472f78` 乾淨樹、daemon sha256 `8aae8fc3…f6cf6`）取代：18 輪全 PASS（max：stop 0.44～2.47、cancel 0.76～3.97、release 6.82～26.16 ms） |
+| F167 | Medium | sol P5-3084388-3：證據檔含本機絕對路徑（R-21 FAIL） | fixed `464adec`（sol `3084388_464adec` 確認） |
+| — | — | 新裁決 P6 SPEC-GAP #4（非 root holder 掃描 fail-closed，P5 擁有） | 裁決交付點為「P5 第六輪」，本輪未動 |
+| F168 | Medium | sol P5-2472f78-1：`hashlib.file_digest` 需 Python 3.11+，3.10 下量測報告寫不出 | fixed `c4cfb96`：分塊 `hashlib.sha256().update`；紅燈 `test_sha256_file_works_without_hashlib_file_digest` |
+| F169 | Medium | sol P5-3084388-2（第 3 輪）：`source_commit` 取工具工作樹 HEAD，無法證明 binary 由該 commit 建置；已提交證據未重採 | fixed `c4cfb96`：identity 新增 `artifact_source_commit`（以建置該 artifact 的 gate `report.json` 核對 `daemon_sha256` 後取 `git_revision`，或 gate 同 run 建置時明示），未綁定不得 PASS；紅燈 `test_identity_binds_artifact_to_build_report`。證據改為 `p5-evidence/event-latency-od45-rust-evlat-r5-c4cfb96.json`（artifact 建置於 gate `r5b-261029`＠`464adec5`，sha256 `8aae8fc3…` 相符；量測工具 `c4cfb96` 乾淨樹）：18 輪全 PASS（max：stop 0.66～7.80、cancel 1.94～15.62、release 6.35～22.34 ms），取代 `…-2472f78.json` |
+
+### 第六輪（2026-10-29）：sol `2472f78_c4cfb96`、event_latency 方法審閱（rejected）、rulings/p5.md 末 10 列
+
+| # | 嚴重度 | finding／裁決 | 處置 |
+|---|---|---|---|
+| F170 | Medium | P5-3084388-2（sol 累計 4 輪）：已提交的重採報告缺 `artifact_source_commit`／`artifact_build_run_id` | 已於 `110bd58` 修正（sol 審查時點為 `c4cfb96`，早於 `110bd58`）：`110bd58` 起 `p5-evidence/` 只剩 `event-latency-od45-rust-evlat-r5-c4cfb96.json`，其 identity 帶 `artifact_source_commit=464adec5…`、`artifact_build_run_id=r5b-261029`、`artifact_build_mismatch=null`；舊 `…-2472f78.json` 已刪除。本輪 method_revision 改為 `2026-10-29.2`（見 F171～F176），該證據的工具／契約 sha256 與新版不符而失效，改由本輪 gate 同 run 量測取代（證據身分改由 gate judge 核對，F173） |
+| F171 | High | 方法審閱：flood 失效（`emit()` 錯誤被吞、無實際速率／持續時間驗證、`flood_load.seconds` 未用、stop 只暖機 50 ms）仍可判 flood PASS | fixed：`_Flood` 計數送出失敗並保留第一筆、記錄起訖與送出端是否存活；`flood_problems()` 驗證送出失敗、送出端中途停止、實際速率 ≥ 90%、持續時間（release／cancel 每輪 ≥ `seconds`，不足時延長 flood；stop 每樣本暖機 `stop_warmup_s`=1.0 s 並驗證該段）；無效即 `load_problems` → 證據不足。紅燈：`test_flood_emit_failure_is_reported_as_invalid_load`、`test_flood_requires_actual_rate_and_duration`、`test_flood_run_judged_insufficient_when_load_invalid_but_over_limit_still_fails` |
+| F172 | High | 方法審閱：drain_receipt 的 L1 探針漏算（`WorkerStopped` 移入 `stopped` 後 `control_waiting()` 看不到；共用計數被其他 control 事件歸零） | fixed：探針改逐事件見證數——mailbox（test-fakes）以影子佇列追蹤 control／safety lane 的 FIFO 位置、以平行佇列追蹤 `stopped` 中的 receipt，回傳 data 時對仍在等待的每個事件加一（`Mailbox::take_control_witness`）；timer／tick 以「到期後才開始處理的 data 數」計；`control_waiting()` 納入 `stopped`。紅燈：`tests/mailbox.rs::witness_counts_data_overtaking_stopped_receipt`（D,D,D,L,W 情境 receipt 見證數須為 3；去掉 `stopped` 計數即紅）。L1 gate 兩支 flood 測試以新探針仍綠（該情境無同 epoch 依賴，receipt 不進 `stopped`）。**契約衝突**：同 epoch 有依賴等待時 receipt 必在該 epoch 已讀 RX 全數處理後才處理（與 Python 同序，見 OWNER-BATCH），`drain_receipt` 的 `at_most_one_data_item_before_control` 在此情境不成立，列 OWNER-BATCH |
+| F173 | High | 方法審閱：release 建置失敗後舊 binary 仍被綁到目前 HEAD；judge 不讀 event_latency 證據（`evidence: missing.json` 可判 PASS） | fixed：gate 建置前 `rm -f` 舊 artifact、Linux／Windows 建置 rc 分存、建置成功當下記錄 daemon sha256，只在成功時傳 `--artifact-source-commit／--artifact-build-run-id／--artifact-sha256`；工具要求明示來源必附建置當下 sha256 且等於受測 binary；assemble 記 `identity.build`，judge 對 Linux 建置失敗或建置當下 sha256 不符判 FAIL；judge 讀 `evidence` 量測 JSON，以其 verdict 判定並核對 daemon_sha256、artifact_source_commit（＝report git_revision）、artifact_build_run_id／run_id（＝report run_id）、tool／contract sha256、method_revision。紅燈：`test_identity_requires_build_sha_for_explicit_artifact_source`、`test_event_latency_section_requires_readable_evidence`、`test_event_latency_evidence_identity_must_match_run`（8 參數）、`test_event_latency_evidence_verdict_drives_section`、`test_release_build_failure_is_fail_and_build_sha_must_match`、`test_gate_script_removes_stale_artifact_and_binds_build_sha` |
+| F174 | Medium | 方法審閱：已確認超限被錯誤樣本降成證據不足；release 重新 attach 失敗遺失已取得耗時 | fixed：`judge_run` 先判作廢，未作廢且有效樣本 > 上限即 FAIL，其餘問題才判證據不足；`_sample_release` 回 (耗時, 準備錯誤)，耗時照記、準備錯誤另記。紅燈：`test_over_limit_sample_is_not_downgraded_by_errors`、`test_release_timing_is_kept_when_reattach_fails` |
+| F175 | Medium | 方法審閱：契約未套用 OD-58 | fixed：`release_request` 改 idle 250／flood 300 ms（`stop_request`／`command_cancel` 維持 50／100），附 `retest_before: "0.5.0"`、`owner_decision_ref: OD-58` 與 0.5.0 前同工具重測三輪、重新提交擁有者確認的註記。紅燈：`test_contract_applies_od58_release_limits`。審閱結論 rejected → 維持 `freeze_status: pending_review_record`、三個審閱欄位保持 null（approved 時才填），審閱歷程記於契約註解；方法修正後 method_revision 改 `2026-10-29.2`，待編排者重新提交獨立審閱 |
+| F176 | Medium | 方法審閱：作廢規則只看輪次兩端、監測資料缺失仍放行 | fixed：`_HostMonitor` 量測期間每秒取樣，作廢看峰值；cpu 或 loadavg 皆取不到即 `host_monitor_missing` → 證據不足。紅燈：`test_host_void_uses_mid_run_peak_and_missing_monitoring_is_insufficient` |
+| F177 | — | OD-55（擁有者裁決 (a)）：`s21_core` 中 selector 帶 `--skip cap_` 而從不執行的 `#[ignore]` 列 | linux：以 `cargo_l1_results.py --list-only -- --workspace --features test-fakes -- --skip cap_` 實際收集，ignored 28 筆中屬 s21_core.linux 者 27 筆。能力列 24 筆依 cap 新增 `s21_gate:cap_{posix_pty 19, sys_admin 1, windows_native 2, interactive_desktop 1, supervisor_runtime 1}.linux`（`regen_lock --l1-add-only`，selector `["--workspace","--features","test-fakes","--","--ignored","cap_<cap>__"]`；該 selector 實際執行者即該 cap 的 ignored 測試，故 collect 檔 collected＝該 cap 的 ignored 名單），再以 `--allow-removal` 逐名自 `s21_core.linux` 移除 27 筆（含非能力列 `serial_posix::plain_holder_child`、`mgmt_layout::real_mkbundle_dev_output_verifies`〔由 `tests/test_rust_release_manifest_schema.py` 承擔〕、`mgmt_layout::windows_switch_running_exe_rename`〔LOCAL-WINDOWS-TODO 原生集合〕）；同次收集 add-only 登記本輪新增 `sw-core::mailbox::witness_counts_data_overtaking_stopped_receipt`。`regen_lock --check --base HEAD --allow-removal …` 通過。**數目差異揭露**：裁決列 linux 23 筆，實際收集為 24 筆——`sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c` 有 `#[cfg(not(windows))]` 版本，linux 亦收集；依裁決原則（能力列移能力集合）一併移入 `s21_gate:cap_interactive_desktop`。`test_l1_judge.py` 移植 P6 的 OD-53 能力集合豁免（`_selector_explicit_caps`／`_ignored_lock_rows`，與 P6 同碼以利合併），未放寬其他集合；新增 `test_s21_core_linux_capability_rows_moved_to_cap_sets_od55`（登記前紅）。gate：`linux_cap_posix_pty` 以 `additional_required_sets` 承擔 `s21_gate:cap_posix_pty`。windows：裁決要求原生收集，s21_core.windows 13 列未動（`test_l1_lock_cargo_sets_exclude_ignored_tests`／`test_l1_lock_frozen_set_excludes_capability_gated` 仍照報 windows 列缺測），LOCAL-WINDOWS-TODO |
+| F178 | — | OD-58：`s21-event-latency` 自 l15_ab 逐名移出（情境檔保留，改由 event_latency section 承擔） | `L15_AB_EXCLUDED` 加 `s21-event-latency: OD-58`；`slice21_gate_expect.yaml` `l15_ab_excluded` 新列（`covered_by_sections: [event_latency]`＋L1 gate 兩支 linux_l1 節點）；judge 支援 `covered_by_sections`（承擔 section 非 PASS → l15_ab EVIDENCE_MISSING）。紅燈：`test_l15_ab_excluded_case_covered_by_section_requires_section_pass`、`test_case_list_matches_freeze`。該情境不在 `cases.lock.json`／`l1_required.lock.json`（OD-46 同），`regen_lock --allow-removal` 無凍結列可移除——逐名移出以 l15_ab 判定清單執行 |
+| F179 | — | OD-60＋OWNER-BATCH #8（編排者裁決）：`stage2_estimate_weeks`＝6；`case_verdicts.json` 彙整規則；斷路器快照每次正式實跑附加 | `slice21_gate_expect.yaml` `stage2_estimate_weeks: 6`。judge 新增 `worst_verdict`／`aggregate_case_verdicts`／`append_breaker_snapshot` 與 `case-verdicts` 子命令：證據為 l15_ab 逐案 outcome（gate 以 `SW_RESOURCE_REPORT` 產生 `l15_ab/l1-results.json`，python 與 rust 兩列皆須恰一列 passed）、`l15_ab_excluded` 的 `covered_by` nodeid（各 section l1-results）與 `covered_by_sections`、`existing_suites_rust` 的 `func-test:<case>` exit；每案取最差，無證據即 EVIDENCE_MISSING；另寫 `case_verdicts.detail.json`。gate 於 pytest_full 之後彙整，`assemble --append-breaker-snapshot`（非 dry-run）於判定前附加快照（`slice_breaker._check_snapshot_denominators` 可驗證）。紅燈：`tests/test_slice21_case_verdicts.py` 7 案 |
+| F180 | — | OWNER-BATCH #3（F50／F57，編排者裁決 add-only 登記）第一批 | `s21_gate:linux_cap_posix_pty.linux` 336 筆（`cargo_l1_results.py --list-only -- -p sw-pal --features test-fakes`，collected 359 − ignored 23；能力測試由 `s21_gate:cap_posix_pty` 承擔）、`s21_gate:existing_suites_rust.linux` 4 筆（`pytest --collect-only` 與 gate 同參數），皆 `regen_lock --l1-add-only` 新增集合。blackbox_python／blackbox_rust／pytest_full 見 F182（須排除本平台 skip 列，否則 section 恆 INSUFFICIENT）。`s21_gate:py_parity` 的「完整 selector」：`regen_lock` 拒絕變更既有 selector（`REFUSED selector 與鎖檔不同`；`--check --base` 亦判 FAIL），add-only 無法達成 → SPEC-GAP |
+| F181 | — | F108（OWNER-BATCH #4，編排者裁決）＋F139＋F100 | gate：`id -u`＝0 時以 `SW_GATE_L1_USER` 經 setpriv 降權跑 linux_l1，無法降權則不執行並記 EVIDENCE_MISSING；`record-section --run-euid`；judge 對 `linux_l1` 的 `run_euid` 非正整數（含 0、缺）一律 EVIDENCE_MISSING（覆蓋 PASS 與 root 專屬 FAIL）。紅燈：`test_linux_l1_run_as_root_is_evidence_missing`、`test_gate_script_linux_l1_non_root_and_daemon_version_from_rpc`。F139：新增 `scripts/rust/probe_daemon_version.py`（throwaway daemon＋`daemon.status` RPC 的 `version`），gate 不再呼叫不存在的 `serialwrapd --version`；紅燈 `tests/test_probe_daemon_version.py`（含實際起 Python 基線 daemon 對照 `VERSION`）。F100：計畫 06 Review Focus 5 與 SC-11 ① 的 `server.stop` 改 20 s 並附勘誤說明 |
+| F183 | — | OD-61：wal_s1w_perf 由編排者在擁有者 WSL2 量測，P5 只確認 gate 能接受外部匯入證據（附主機類型標註） | 原 gate 只採本機量測、無匯入介面 → 補：`SW_GATE_WAL_S1W_IMPORT`／`SW_GATE_WAL_S1W_HOST`（gate 複製為 `wal_s1w_perf/wal_s1w.imported.json`）＋judge `wal-s1w-verdict`／`wal_s1w_verdict()`：schema `wal_s1w.v1`、`thresholds.platform=linux`、`params`＝`slice21_gate_expect.yaml` `wal_s1w.formal_params`、`env.virtualization` ∈ {wsl2, native}、標註非空、`env.git_revision` 為本分支歷史且其後 `wal_s1w.relevant_paths`（WAL writer、wal_fs、fs_ops、example、Cargo.lock、toolchain）未變更；不符 → EVIDENCE_MISSING。無匯入時本機雲端（`vm:*`）量測只作診斷 → EVIDENCE_MISSING（原為 FAIL；依 OD-61「雲端 virtio 結果只作診斷」）。紅燈：`tests/test_slice21_wal_s1w_import.py` 10 案。編排者命令見本輪回報 §7 |
+| F184 | — | P6 SPEC-GAP #4（rulings/p5.md 照修、最優先）：非 root 下 holder 掃描對他人行程 EACCES 使開埠 fail-closed | 對照：Python `serial_port.py` `probe_holders`（pids 空且 status 非 ok → `holder_unknown`）與開埠路徑 `open()`（`report.pids` 非空才 `DeviceHeldError`；status 非 ok 只警告「無法確認 … 的外部 holder」並 `_set_holder_unknown`）；Rust 現行 `sw_pal::serial::posix::open_sequence` 的 `post_lock_holder_verdict`（Permission／Unknown → `AcceptUnverified`＋同字樣警告＋`set_holder_unknown`）、`session_manager::open_bridge` 的 precheck（只在 pids 非空時 Held）已與 Python 相同；fail-closed 的 `serialwrapd_tty_holders` 只用於 `sw-cli` rollback（P7-71fe017-4 的分離原則）。重現：本機非 root（uid 1000，PID 1 等 root 行程 fd 目錄 EACCES）以 P5 HEAD release 跑 P6 所列 7 案（`l15-wal-interference` 已依 OD-40 移出）Rust 側 **7/7 PASS**；P6 分支 HEAD（`f0149022`）release 跑 `l15-half-prompt`／`l15-exclusive-open` 亦 2/2 PASS——P6 第 4 輪的 8 案非 root FAIL 在現行碼無法重現（見回報「不成立主張」）。依裁決補非 root 回歸：`sw-daemon::daemon_process::non_root_holder_scan_permission_does_not_block_open`（root 下 FAIL＝證據不足；前置斷言至少一個他人行程 fd 目錄 EACCES；斷言 READY、stderr 警告 `status=Permission`、`foreign_holders` 含 `holder_unknown`）。紅燈證明：把 `post_lock_holder_verdict` 的 Permission 改為 Reject（fail-closed）即紅（30 s 未 READY）。已 add-only 登記 `s21_core.linux` |
+| F182 | — | OWNER-BATCH #3 第二批：`s21_gate:{blackbox_python, blackbox_rust, pytest_full}` | 依本輪非 root 實跑（`SW_RESOURCE_REPORT`）逐列 outcome 登記：blackbox_python 45／49、blackbox_rust 48／49、pytest_full 5530／5738；排除者只有 skipped／xfailed 列（blackbox 為 OD-37／38 的 A/B 逐列標記 `not_applicable_python`／`df_difference_python`／`deferred_rust_s21`）與 3 個 pytest 版本相依的參數化 id；failed 列照常登記。逐名清單 `p5-evidence/s21-gate-set-registration-r6.md`。`test_l1_lock_nodeids_subset_of_collect_only` 在 pytest 9.0.3 下通過（新登記 id 兩版本皆穩定） |
+| F185 | Medium（自查，gate `r6-261029`） | `cargo_l1_results.py` 以名稱開頭比對 `cap_*`：lib 單元測試（模組路徑）從未被 `--caps` 執行、skip_kind 記 other；OD-55 移入 `s21_gate:cap_posix_pty` 的 4 個 lib 測試因而恆 skipped | fixed：`capability_of()` 取最後一段，三處判定共用。紅燈：`tests/test_rust_cargo_l1_results.py::test_capability_matched_on_last_path_segment`（未修即紅）。修正後 gate 外重跑 `--caps posix_pty -- -p sw-pal --features test-fakes`：355 passed／0 failed，cap_posix_pty 全數 passed |
+| F186 | — | T22 gate 第六輪實跑 `r6-261029`（非 root、`c2f68820`） | 紀錄見 `p5-t22-gate-run.md` 第六輪；event_latency 證據改為 `p5-evidence/event-latency-od45-rust-r6-261029.json`（method_revision 2026-10-29.2；舊 `…-evlat-r5-c4cfb96.json` 屬已審閱 rejected 的 2026-10-29.1，工具／契約 sha256 與現行不符而刪除，git 歷史保留），Python 診斷另存；gate 附加的斷路器快照一併提交 |
+| F187 | High（rulings/p5.md OD-61 WSL2 實測，編排者裁決照修） | WAL rotate 最大停頓約 855 ms（Python 基線同主機 132 ms） | 根因（實證）：非跨流共用鎖——每流各自一個 `WalWriter`；rotate 的 `close(sync=true)` 與 Python 相同為 fsync→rename→sync_dir，但 Rust append 快約 47 倍，預填 60 MiB 後立即輪替時整檔髒頁未回寫，四流同時 fsync。實驗：預填後臨時 `sync(2)` 即由 368～440 ms 降到 22～24 ms。修正：`sw_pal::wal_fs::posix::PosixWalFile` 每 1 MiB 以 `sync_file_range(SYNC_FILE_RANGE_WRITE)` 啟動非同步回寫（Linux，`cfg(target_os="linux")` 只在 sw-pal；不等待、不改「append 不 fsync、rotate 前 fsync」的持久性語意）。紅燈：`sw-pal::sw_pal::wal_fs::posix::tests::writes_initiate_async_writeback_every_chunk`（未修不能編譯／無回寫啟動；以啟動次數斷言、不依賴計時），已 add-only 登記 s21_core.linux。cloud 同主機（診斷）：修正後 rotate max 64.9／65.2／66.4 ms，同主機 Python 基線 221～360 ms，append p50 不變（p99 0.064～0.083 ms，略升）。證據 `p5-evidence/wal-rotate-writeback-r6/`。**需編排者於 WSL2 以新 commit 重測三輪**（`110bd58` 的 WSL2 證據因 `crates/sw-pal/src/wal_fs` 變更已不代表受測版本，gate 匯入會判 EVIDENCE_MISSING） |
+| F188 | — | 編排者裁決照修（P6 第 5 輪 SPEC-GAP #1）：`test_two_daemons_same_tty` harness 缺陷 | `harness.start_daemon` 新增 `share_tty_with`：沿用第一個 daemon 的 by-id 目錄與 FakeTarget，不另建、不改寫 symlink，`Slice21Daemon.owns_targets=False` 使 stop 不關閉共用 FakeTarget；`test_two_daemons_same_tty` 改以 `share_tty_with=shell_daemon` 啟動第二個 daemon（期望 `ATTACH_FAILED:DeviceHeldError`、零 TX 不變）。紅燈：`tests/test_slice21_harness_shared_tty.py::test_second_daemon_sharing_tty_keeps_first_by_id_link`（未修即紅）；起點基準與 gate `r6-261029` 兩邊皆 FAIL 的 `test_two_daemons_same_tty` 修正後 Python 基線與 Rust（release `ba8bf0f4`）皆 passed。新 nodeid add-only 登記 `s21_gate:pytest_full` |
+| F189 | —（自查） | 終點全套揭露：`289f757` 新增的 `test_capability_matched_on_last_path_segment` 標 `memory_only`，與該檔其他測試的 `process_rpc` 混用，`test_resource_markers.py` 兩支 FAIL | fixed：改標 `process_rpc`（與檔內一致）；`test_resource_markers.py`＋該檔 24 passed |
+
+### 報告 `p5-cloud/c4cfb96_4f8acdf-sol.md`（雲端 Opus xhigh 代理 sol 單審；High 1、Medium 2、Low 4）
+
+| ID | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| F190 | High | P5-4f8acdf-1：OD-55 移出的 linux 能力集合 `s21_gate:cap_{sys_admin,windows_native,interactive_desktop,supervisor_runtime}` 無任何 section 承擔，`linux_l1` PASS 後 gate 可在這 5 列從未執行下 READY | fixed（修法 2）：judge 收集所有 section 的 `required_set` 與 `additional_required_sets`，鎖中未被承擔的 `s21_gate:*` 集合列入 verdict_reasons 並使 verdict 為 INCOMPLETE（不得 READY）。紅燈 `test_uncarried_gate_set_blocks_ready`。以新判定器重判 `r6-261029`：列出上述 4 個集合。這些能力在雲端無法執行（CAP_SYS_ADMIN／原生 Windows／互動桌面／systemd 執行期），新增 section 與 BO／runbook 步驟屬計畫變更 → 維持 SPEC-GAP #2，現由判定器保證不會被默默放行 |
+| F191 | Medium | P5-4f8acdf-2：OD-61 匯入只依 `env.git_revision`，未記工作樹乾淨與否；`relevant_paths` 缺 `Cargo.toml` | fixed：`wal_s1w` 的 env 新增 `source_tree_dirty`（`git status --porcelain --untracked-files=no`；取不到為 "unknown"）；judge 要求為 false；`relevant_paths` 加 `Cargo.toml`、`crates/sw-core/Cargo.toml`、`crates/sw-pal/Cargo.toml`。紅燈：`test_imported_evidence_requires_clean_source_tree`（true／缺／unknown 三案）、`test_relevant_paths_cover_build_profile_manifests`、`test_wal_s1w_example_records_source_tree_dirty`。附註：`wal-rotate-writeback-r6/rust-fix*.json` 為診斷證據（README 已揭露於未提交工作樹量測），不作 gate 匯入 |
+| F192 | Medium | P5-4f8acdf-3：Rust WARNING 印 `status=Permission`（enum 名稱），Python 為 `status=permission`；新回歸測試鎖住偏差 | fixed：`HolderScanStatus::py_name()`，`open_sequence` 的 WARNING 改用之；`daemon_process::non_root_holder_scan_permission_does_not_block_open` 改斷言 `（status=permission），BC-04 僅保證 serialwrap 實例互斥`。紅燈 `sw-pal serial::posix::tests::accept_unverified_warning_matches_python_template`（Permission／Unknown 逐字比對，並核對 `daemon_logging.yaml` 模板字串；修正前 FAIL），已 add-only 登記 s21_core.linux |
+| — | Low×4 | P5-4f8acdf-4～7 | 依收斂規則 Low 不修，記入 low-backlog（由編排者彙整） |
+
+## 第七輪（2026-10-29 cloud session）
+
+### 報告 `p5-cloud/4f8acdf_86b54d8-sol.md`（雲端 Opus xhigh 代理 sol 單審；Medium 2、Low 3）
+
+| ID | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| F193 | Medium | P5-86b54d8-1：未承擔集合判定只看集合 id——(a) 不分平台（windows section 承擔同名集合即視 linux 列已承擔）、(b) 非測試類 section 片段自帶 `additional_required_sets` 亦算承擔 | fixed（本組 commit）：`carried` 改為（集合, 平台）對，只自 `TEST_SECTIONS` 內的 section 收集（`required_set`、expect `additional_required_sets[name]`、片段 `additional_required_sets`），平台取 `TEST_SECTIONS[name]`；`uncarried` 列 `set.platform`。紅燈先行：`test_uncarried_gate_set_is_judged_per_platform`、`test_non_test_section_fragment_cannot_carry_gate_set`（修正前兩支皆得 READY） |
+| F194 | Medium | P5-86b54d8-2：`wal_s1w.relevant_paths` 未涵蓋 sw-proto（append 熱路徑的 `crc32_hex`、`WalRecord::to_line`／pyjson、pycompat） | fixed（本組 commit）：`relevant_paths` 加入整個 `crates/sw-proto`。紅燈先行：`test_relevant_paths_cover_build_profile_manifests` 補 sw-proto 四路徑；新增 `tests/test_slice21_wal_s1w_import_git.py`（臨時 git repo 實跑：量測 commit 後只改 `sw-proto/src/wal_types.rs`／`pyjson.rs`／`sw-pal/src/wal_fs/posix.rs` → EVIDENCE_MISSING，只改無關檔 → PASS；修正前 sw-proto 兩案得 PASS）。該檔以子行程執行 git，依模組層資源 marker 不混用規則與原檔分開（process_rpc） |
+| — | Low×3 | P5-86b54d8-3～5 | 依收斂規則不修（交 low-backlog） |
+
+### OD-64／OD-65（rulings/p5.md）與 event_latency 第 2 次獨立審閱（`event-latency-method-review-2-20261029.md`，approved-with-conditions）
+
+| ID | 項目 | 處理 |
+|---|---|---|
+| F195 | OD-64＋審閱 2 C1／C2：drain_receipt 界限改為「receipt 送出後至多處理同 epoch 於依賴等待前已讀入 mailbox 的 data，再加 1 筆」，探針同時記錄依賴等待前已讀入筆數；排空順序維持 D,D,D,L,W | 契約 drain_receipt `l1_bound: at_most_pre_dependency_data_plus_one_after_receipt`＋`owner_decision_ref: OD-64`＋`l1_bound_rule`＋`l1_bound_definition`（N_pre＝receipt 移入 `stopped` 當下 data lane 的同 epoch 筆數；界限 ≤ N_pre＋1；跨 epoch／等待後才到者計入「＋1」）。mailbox（test-fakes）`Witness.stopped_pre` 於 `note_stopped_push(epoch)` 記下當下 data lane 筆數、之後依 FIFO 逐筆核對 epoch，`take_control_pre_dependency_data()` 取出；actor `ProbeEntry::pre_dependency_data`。排空順序未改（`dependency_released_on_worker_stopped` 仍 D,D,D,L,W）。紅燈先行：`mailbox::{stopped_receipt_records_pre_dependency_data, pre_dependency_data_excludes_later_and_other_epoch_data, receipt_without_dependency_has_zero_pre_dependency_data, actor_probe_records_pre_dependency_data_for_drain_receipt}`（未實作即不能編譯）、`test_slice21_scope.py::test_event_latency_od64_od65_records`／`::test_event_latency_contract_values`（契約未改即 FAIL）。**oracle 變更揭露**：`test_event_latency_contract_values` 原斷言五事件皆 `at_most_one_data_item_before_control`，依 OD-64 改為 drain_receipt 用新識別字、其餘四事件不變 |
+| F196 | 審閱 2 C3：依賴情境 L1 gate | `drain_release_e2e::drain_receipt_dependency_wait_on_{release,shutdown}_within_od64_bound`：CoreHarness READY＋在途命令（`start_foreground_command`），mailbox 預置該命令的 `OpFinished{after_rx_seq: backlog}`、1 筆舊 epoch data＋backlog 筆同 epoch data、排空請求；executor 於 `BeginDrain` 以同 (epoch, stop_id) 送 receipt。斷言 N_pre＝backlog（確實走到 `stopped`）、見證數＝backlog＋1、OpFinished 先於 receipt，各 20 輪。加入 drain_receipt `l1_gate`、add-only 登記 s21_core.linux。變異 M3／M6／M7 皆紅（`p5-evidence/evlat-review2-conditions-r7/`） |
+| F197 | 審閱 2 C4：偵測力 | 兩支 flood gate 改為每段（release、cancel、lease、shutdown）各 20 輪；新增 `mailbox::lane_witness_counts_data_returned_via_stopped_and_pending_paths`（L-10），列入 stop_request／command_cancel／release_request／drain_receipt 的 `l1_gate`。變異 M1 5/5 紅、M5 5/5 紅、M2 由 L-10 自測抓到（審閱時 M5 1/6、M2 靜默） |
+| F198 | OD-65＋審閱 2 C5 | release_request 維持 250／300，註解與 `freeze_note` 記 Python r6 idle 三輪 max 154.4／255.4／157.7 ms、Rust r6 最大 42.7 ms、0.5.0 前重測（`retest_before` 保留）；stop_request 註解與 `external_scope_note` 記外部值止於 accept_point（L-1） |
+| F199 | 審閱紀錄欄位 | 依報告填入 `reviewed_by: cloud-claude-opus-xhigh`、`reviewed_at: "2026-10-29"`、`review_conclusion: approved-with-conditions`，審閱歷程附報告路徑；依編排者指示 `freeze_status` 維持 `pending_review_record`，待編排者核對 C1～C5 後改 `frozen`。method_revision 維持 `2026-10-29.2`（外部量測口徑未改；本審閱涵蓋 `.2`＋C1～C5 增量）。審閱 Low L-2～L-9 依收斂規則不修 |
+
+### OD-66（rulings/p5.md 最新列；編排者追加 2026-10-29 21:30）與 OD-61 WSL2 重測證據匯入
+
+| ID | 項目 | 處理 |
+|---|---|---|
+| F200 | OD-66：WSL2 證據改用固定門檻 append p50 ≤ 0.050／p95 ≤ 0.100／p99 ≤ 0.200 ms、rotate ≤ 100 ms，且每項不劣於同主機同時段 Python 基線（一併匯入）；§1.2 原門檻保留給原生；gate 依主機類型選門檻並標明 | judge `WAL_S1W_HOST_THRESHOLDS`（與 expect `wal_s1w.host_thresholds` 一致，測試核對）、`wal_s1w_thresholds(host)`；`wal_s1w_verdict` 以證據數值重算（不採證據自報的 §1.2 verdict）、WSL2 要求 `python_baseline`（缺或不同主機〔virtualization／cpu／cpu_count／memory_bytes／os_build／storage_device／fs_type〕／不同工作量〔total_records／rotate_bytes／prefill_bytes〕→ EVIDENCE_MISSING；任一項劣於基線 → FAIL）、可匯入多輪取最差；第一個原因與 `verdict.json` 的 `thresholds` 標明所用門檻。gate：`SW_GATE_WAL_S1W_IMPORT` 可列多輪（`:` 分隔）、新增 `SW_GATE_WAL_S1W_PY_BASELINE`。紅燈先行：`tests/test_slice21_wal_s1w_import.py` 新增 13 案（修正前 19 案 FAIL，含既有 2 案因 OD-66 改附基線）。**oracle 變更揭露**：`test_imported_wsl2_evidence_is_formal`／`test_cli_and_gate_wiring` 原以未附基線的 WSL2 證據判 PASS，依 OD-66 改附 Python 基線；`_doc` 夾具的 FAIL 數值改為同時超出 §1.2 與 OD-66（原夾具 FAIL 與 PASS 數值相同、只靠自報 verdict）；`test_slice21_wal_s1w_import_git.py` 改用原生主機證據（該檔只驗可追溯性） |
+| F201 | OD-61 WSL2 重測證據（`86b54d8`，三輪＋同時段 Python 基線） | 複本存 `p5-evidence/od61-wal-s1w-wsl2-86b54d8/`（自 `origin/docs/parity-amendments` 原樣複製）。以新判定器重判：三輪皆 PASS（append p50 0.0211～0.0216、p95 0.0291～0.0331、p99 0.0505～0.0591 ms，rotate 41.3～55.2 ms；Python 基線 p50 1.010／p95 2.251／p99 3.207 ms、rotate 902.3 ms），`86b54d8..HEAD` 間 `relevant_paths` 無變更；`test_od66_rejudge_86b54d8_wsl2_evidence` 固定此判定。併入 T22 gate 見第七輪 gate 紀錄 |
+
+### rulings/p5.md：P5 第 6 輪 SPEC-GAP #1～#3（編排者裁決）
+
+| ID | 裁決 | 處理 |
+|---|---|---|
+| F202 | SPEC-GAP #1：新增 `s21_gate:py_parity_full`（完整 selector 與實際收集），gate 的 py_parity section 改用新集合；舊集合保留、仍須 PASS | `regen_lock --l1-add-only --set s21_gate:py_parity_full --platform linux`：selector `argv＝["-q", <舊集合 18 筆 nodeid>]`、`paths`＝同 18 筆（`pytest --collect-only` 實際收集 18 筆、實跑 18 passed）；舊 `s21_gate:py_parity`（selector 1 筆）不改不刪，仍為 `pytest_full` 的 `additional_required_sets`。gate 新增 test section `py_parity`（自鎖讀 selector argv 實跑，`SW_RESOURCE_REPORT`）。紅燈先行：`test_py_parity_full_has_complete_selector_and_keeps_old_set`（集合不存在即 FAIL）、`test_capability_sections_and_py_parity_match_expect_and_lock`、`test_gate_script_runs_capability_and_py_parity_sections`。範圍揭露：計畫 06 Task 0b 的 py_parity 定義另列 #76～#80 檔案（`test_holder_probe_namespace.py` 等），現行 py_parity 只有 #81 類 18 筆；本輪「完整 selector」以現有 18 筆為準，#76～#80 是否補入列 SPEC-GAPS |
+| F203 | SPEC-GAP #2：為 `s21_gate:cap_{sys_admin, windows_native, interactive_desktop, supervisor_runtime}` 補 gate section；無能力記 EVIDENCE_MISSING＋所需能力，不得 PASS | judge `TEST_SECTIONS`／`SECTION_ORDER` 新增 `linux_cap_{sys_admin,windows_native,interactive_desktop,supervisor_runtime}`，`CAPABILITY_SECTIONS` 記所需能力、處置（sys_admin／supervisor_runtime → BLOCKED-OWNER；windows_native／interactive_desktop → LOCAL-WINDOWS-TODO）與實跑方式；section 片段須帶 `capability_probe{cap, available:true}` 才依 l1 結果判定，否則一律 EVIDENCE_MISSING（即使 l1 全 passed；具備能力而失敗仍 FAIL）。gate `cap_probe`（euid 0＋CapEff bit 21；`systemctl --user is-system-running`；linux 主機恆不具 Windows 能力）＋`record-section --capability-probe`；schema、expect、runbook（新節）同步。現行鎖中所有（s21_gate 集合, 平台）皆有 section 承擔。紅燈先行：`test_capability_section_never_passes_without_capability_probe`（4 參數）、`test_capability_section_failure_with_capability_is_fail` 等。既有 `test_uncarried_gate_set_blocks_ready` 的資料改用未承擔的 `s21_gate:cap_uncarried`（`cap_sys_admin` 現由 section 承擔；斷言不變） |
+| F204 | SPEC-GAP #3：三支參數化測試給明確 `ids=`（不改斷言），依規定登記新 id；涉及 s0／s1 鎖者先查擁有權 | 擁有權：`test_classify_pyserial_open_error`（`s0_bc.linux/windows`、`s0_win_pytest.windows`）與 `test_invalid_regex_rpc_and_arbiter_reject_without_enqueue`（`s0_win_pytest.windows`）屬主線 Stage 0 鎖 → **不改，列 SPEC-GAPS**。`test_cargo_toml_bypass`（只在 P5 的 `s21_gate:pytest_full.linux`）：`ids=CARGO_IDS`（`<toml>-<rule>`，即 pytest 9.0.3 自動 id 形式），已凍結的 3 個 nodeid 不變（無須移除、不需擁有者授權），第 4 個（target-section）以 pytest 9.0.3 與 9.2.0 收集皆相同，add-only 登記 `s21_gate:pytest_full.linux`（以全套 `--collect-only` 核對鎖中 5531 筆無一消失） |
+
+### 既有失敗追根因（第 6 輪回報 §6 既有碼待辦、sol `4f8acdf_86b54d8` 既有碼待辦 1／2）
+
+| ID | 項目 | 根因（實測） | 處理 |
+|---|---|---|---|
+| F205 | `tests/contract_blackbox/slice21/test_f2_backpressure.py::test_queue_full_backpressure`（Python 基線恆失敗） | **測試前提錯**（非 Python 基線行為）：以暫時探針實測 Python 基線（非 root、乾淨樹），每次 `serialwrap cmd submit` CLI 行程 0.12～0.18 s，300 筆約 37～40 s；前景 `sleep 30` 於約 30 s 結束後佇列即開始消化，pending 永遠到不了 `CMD_PENDING_MAX`＝256（Python `arbiter.py` 的 `pending >= CMD_PENDING_MAX`）。Rust CLI 為原生 binary、送出快而通過——判定只取決於 CLI 啟動速度 | 依案例設計修正（編排者裁決允許）：前景期間改以 `command.submit` RPC（參數同 CLI 預設 `source/mode/priority/timeout_s`）填佇列，斷言不變（至少一筆 SESSION_QUEUE_FULL、pending／limit 256），另加 CLI 層溢位回應斷言（`echo over` 經 CLI 回 SESSION_QUEUE_FULL、256／256）。修正後 Python 基線 passed（36.5 s）；Rust 由本輪 gate blackbox_rust 實跑 |
+| F206 | `sw-pal::lock::lock_conformance_suite`（r6 gate cap section 失敗一次、無輸出） | **重現 145/2000**（`lock` 測試執行檔連跑；`--test-threads=1` 0/1000、單獨 `--exact` 0/1000）：失敗皆為 `[stale_socket_reclaimed] … AlreadyRunning`。lock_suite 以 `UnixListener::bind`→drop 製造失效 socket，同執行檔平行測試 spawn 子行程時，子行程在 exec 前持有 listener 複本，drop 後仍在 listen，探測連線成功。產品端探測語意與 Python 同（可連即視為執行中），不受影響 | 失效 socket 改為只 bind、不 listen（`bind_without_listen`；不論有無複本連線皆 ECONNREFUSED，與 daemon 結束後殘留 socket 相同）。紅燈先行：`sw-pal::lock::lock_conformance_suite_survives_concurrent_spawns`（另一執行緒持續 spawn、lock_suite 1000 輪；修正前 5/5 紅）。修正後原重現迴圈 0/2000 |
+| F207 | `cargo_l1_results.py` 失敗時只解析 stdout、不轉印（gate log 看不到 panic；sol 既有碼待辦 2） | — | 測試執行（含能力執行）rc≠0 時，把 libtest stdout 的 `failures:` 段轉印到 stderr，並把完整 stdout／stderr 存到 `<報告>.failures/<crate>-<target>[-cap_<cap>].{stdout,stderr}.txt`（報告格式不變）。紅燈：`tests/test_rust_cargo_l1_results.py::test_failure_output_is_echoed_and_saved`；對照 `test_passing_run_saves_no_failure_output` |
+| F208 | `cap_posix_pty__*` 並行負載下間歇 `Held(pids:[同執行檔子行程])`（sol 既有碼待辦 1；`s21_gate:cap_posix_pty` 為 gate 必要集合） | **重現 11/180**（serial_posix 能力測試 3 路並行各 60 次）。兩層：(1) 夾具 `posix_pty_pair` 以 `openpty` 建立的 fd 不帶 CLOEXEC，平行測試 spawn 的子行程永久繼承；(2) 即使帶 CLOEXEC，fork 後 exec 前的子行程仍暫時持有全部 fd 複本，被其他測試的 /proc holder 掃描看成外部 holder。產品開埠以 O_CLOEXEC、daemon 開埠時不並行 fork 測試子行程，不受影響 | (1) 夾具改 `posix_openpt(O_CLOEXEC)`＋`open(O_CLOEXEC)`（Linux；其他 POSIX 以 openpty＋FD_CLOEXEC）：紅燈 `sw-pal::sw_pal::conformance::pty_fd_tests::pty_pair_fds_are_not_inherited_by_spawned_children`（修正前 master flags=0）；修正後 5/180。(2) `cargo_l1_results.py` 的能力執行加 `--test-threads=1`（預設執行不變）：紅燈 `test_capability_runs_are_single_threaded`；單執行緒 0/180。新 cargo nodeid add-only 登記 `s21_core.linux` 與 `s21_gate:linux_cap_posix_pty.linux`（主線帶入、由 s1a／s1b 承擔的 49 筆不登記） |
+
+### 報告 `p5-cloud/86b54d8_b9ae1d2-sol.md`、`p5-cloud/b9ae1d2_5d5314e-sol.md`（本輪期間發佈的增量審查；雲端 Opus xhigh）
+
+| ID | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| F209 | High | P5-5d5314e-1：OD-66 以數值重算後只比 4 個延遲值（＋WSL2 基線），丟掉 wal_s1w 自報 FAIL 的 `write_failures > 0` 與「有流未跨越 rotate」（§1.1.3）——全數寫入失敗時延遲更漂亮而 PASS（FAIL 轉 PASS） | fixed（本組 commit）：`_wal_s1w_health`：`write_failures` 須為非 bool 整數（缺／型別錯 → EVIDENCE_MISSING，>0 → FAIL）、`rotations_per_stream` 須為長度＝`params.streams` 的整數串列（缺／長度不符 → EVIDENCE_MISSING，任一 0 → FAIL）；匯入與本機兩路徑皆適用；docstring／expect 註解改為「不採自報 verdict 只限延遲門檻」。紅燈先行：`test_recompute_keeps_write_failure_and_rotation_conditions`（native／wsl2 × 6 案）、`test_all_writes_failed_with_pretty_latency_is_fail`（`5d5314e` judge 下皆得 PASS）；兩支 `_doc` 夾具補 `write_failures: 0`、`rotations_per_stream: [1,1,1,1]`。86b54d8 三輪證據（皆 0 與 [1,1,1,1]）重判仍 PASS |
+| F210 | Medium | P5-b9ae1d2-1：`relevant_paths` 缺 sw-pal 的 `clock`（每筆 append 的 `mono_ns`／`wall_unix_us`）、`lib.rs`（`native()` 組裝 WalFs／Clock）、`traits.rs` | fixed（本組 commit）：加入 `crates/sw-pal/src/clock.rs`、`crates/sw-pal/src/clock`、`crates/sw-pal/src/lib.rs`、`crates/sw-pal/src/traits.rs`。紅燈：`test_relevant_paths_cover_build_profile_manifests` 補四路徑、`test_import_rejected_after_wal_dependency_change_in_real_repo` 補 `clock/posix.rs`、`lib.rs` 兩案（修正前得 PASS）。`86b54d8..HEAD` 在全部 `relevant_paths` 皆無變更，WSL2 證據仍有效 |
+| — | Low×5 | P5-b9ae1d2-2、P5-5d5314e-2～5 | 依收斂規則不修（P5-b9ae1d2-3 審查者確認已於 `5d5314e` 消失）。另：審查列的既有碼待辦 1／2（`posix_pty_pair` CLOEXEC、`cargo_l1_results` 失敗段轉印）已於 `54dd588` 依既有失敗追根因處理（F207／F208） |
+
+### OD-67（擁有者裁決；編排者追加 2026-10-29 23:05）
+
+| ID | 項目 | 處理 |
+|---|---|---|
+| F211 | OD-67：三支參數化測試改用明確 `ids=`、add-only 登記新 id；本分支擁有的 pytest 集合中舊自動 id 可 `--allow-removal` 逐名移除；每集合列「舊 id → 新 id」並確認實際收集數不變；主線 s0／s1 集合不改 | `test_invalid_regex_rpc_and_arbiter_reject_without_enqueue`、`test_classify_pyserial_open_error` 給明確 ids（沿用 pytest 9.0.3 自動 id 形式；`test_cargo_toml_bypass` 已於 `7facc75`）。鎖內凍結 nodeid 全數不變（舊→新為恆等），任何集合皆無須 `--allow-removal`；pytest 9.2.0 與 9.0.3 收集逐字相同（5／4／4，與修改前收集數相同；13 passed）。P5 的 `s21_gate:pytest_full.linux` add-only 新增 2 筆（原 9.2 下為 `invalid2`、`msg2-expected2` 而無法入鎖者）。主線 `s0_bc.linux/windows`、`s0_win_pytest.windows` 未改且無需任何動作。附帶：`test_l1_judge.py::test_l1_lock_nodeids_subset_of_collect_only` 在 pytest 9.2.0 由 FAIL 轉為 passed。逐集合對照表：`p5-evidence/od67-param-ids-r7.md` |
+
+### rulings/p5.md 最新列：sw-pal 測試競態（P6 第 6 輪 §7 實測）與 gate `--caps` 推導（編排者追加 2026-10-29 23:15）
+
+| ID | 項目 | 根因（實測） | 處理 |
+|---|---|---|---|
+| F212 | `sw-pal::sw_pal::serial::posix::tests::invalid_serial_fd_is_a_poll_wait_error`（P6：lib 100 次 5 敗） | **本機重現 16/200**：測試以 pipe 開啟後 close 製造無效 fd，同執行檔他執行緒隨即取得同號 fd，poll 不再回 POLLNVAL | 改用 `c_int::MAX`（Linux `fs.nr_open` 上限 ≤ INT_MAX & -BITS_PER_LONG，永不可能配置）並以 `fcntl(F_GETFD)`＝-1／EBADF 前置確認；POLLNVAL→`ReadError::Wait(EBADF)` 斷言原樣保留。修正後 **0/200**；sw-pal lib 整體連跑 300 次 0 失敗 |
+| F213 | `sw-pal::lock::lock_conformance_suite` `[stale_socket_reclaimed]`（P6：150 次 2 敗） | 已於 `54dd588` 查明並修正（F206：同執行檔他測試 fork 後 exec 前持有 listener 複本）。本輪連跑時另揭露：`54dd588` 新增的並行 spawn 壓力測試會放大同執行檔其他測試的同類時窗——`stale_socket_is_unlinked_then_acquired`（bind→drop，AlreadyRunning）與 `socket_probe_eacces_is_socket_unavailable`（第二次取得被 fork 時窗的 lock fd 複本擋住），lock 執行檔 5/200 | conformance 公開 `bind_stale_unix_socket`，`stale_socket_is_unlinked_then_acquired` 改用之；`socket_probe_eacces_is_socket_unavailable` 的斷言一律在 `--test-threads=1` 子行程執行（root 時另降權，斷言不變）；壓力測試改在重入的單執行緒子行程內進行（仍對舊 bind→drop 實作 3/3 紅）。修正後 lock 執行檔 **0/200**、`lock_conformance_suite --exact` **0/200** |
+| F214 | `slice21_gate.sh` 的 `--caps` 改用與 s22 gate 相同的 OD-53 推導規則（P6 第 6 輪 SPEC-GAP #3） | — | judge 新增 `derive_caps`（與 P6 `s22_gate_check.derive_caps` 同規則）、`caps_plan`（section 全部必要集合推導的 caps 聯集＋required_set 的 selector argv）與 `caps-plan` 子命令；gate 的 `linux_cap_posix_pty` 與四個能力 section 一律以推導結果執行（推導不出 → 不執行、EVIDENCE_MISSING）；judge 對必要集合 selector 推導不出者判 EVIDENCE_MISSING。現行鎖 s21 集合皆可推導（`linux_cap_posix_pty` → `--caps posix_pty -- -p sw-pal --features test-fakes`，與先前手寫相同）。紅燈：`test_derive_caps_matches_s22_rule`、`test_real_lock_s21_sets_caps_derivable_and_gate_plan`、`test_underivable_caps_selector_is_evidence_missing`、`test_gate_script_derives_caps_from_lock` |
+
+### sol `5d5314e_54dd588-sol.md`（雲端 Opus 代理 sol 單審；Medium 2、Low 4）
+
+| ID | 嚴重度 | 項目 | 處理 |
+|---|---|---|---|
+| F215 | Medium | P5-54dd588-1：`lock_conformance_suite_survives_concurrent_spawns` 在共用行程內連續 spawn，放大同檔 `stale_socket_is_unlinked_then_acquired`（bind→drop）與 `socket_probe_eacces_is_socket_unavailable` 的 fork→exec 時窗（整檔 4/300） | 已於 `8d824b3`（F213）依確切修法的做法一處理：壓力測試改在重入自身的單執行緒子行程（`S21_SPAWN_STRESS_CHILD`）執行，spawner 執行緒只存在於子行程；conformance 公開 `bind_stale_unix_socket`（只 bind 不 listen），`stale_socket_is_unlinked_then_acquired` 改用之；EACCES 斷言一律於子行程執行。驗證：lock 執行檔整檔連跑次數與結果見第 7 輪回報 |
+| F216 | Medium | P5-54dd588-2：能力 section 的收集器命令先跑預設 run，root 下 sw-pal 有 3 支預設測試必紅（`holder_scan_permission` 等）→ `linux_cap_sys_admin` 具備能力時亦必 FAIL，無 PASS 路徑；凍結 selector 只選能力列，與實際命令不一致 | fixed（本組 commit）：`cargo_l1_results.py` 新增 `--caps-only`（須搭配 `--caps`）：略過預設 run，只跑 `--ignored cap_<cap>__ --test-threads=1`，不含所選能力的執行檔不執行，其餘收集列記 deselected（結果與收集一致；必要集合含這些列即 deselected required、不得 PASS）；報告 argv 為呼叫端交付的鎖 selector argv。judge `caps_plan` 新增 `caps_only`（每個必要集合的 selector 都只選 ignored 能力列才為 true），gate 依此帶 `--caps-only`（四個能力 section 為 true；`linux_cap_posix_pty` 的必要集合含預設列，為 false）。`CAPABILITY_SECTIONS.how_to_run`、runbook 單獨執行命令與 expect 命令文字改帶 `--caps-only`。審查附帶指出的 `linux_cap_posix_pty` 以 root 執行同樣必紅：gate 的 F108 降權抽成 `nonroot_cmd`，`linux_l1` 與 `linux_cap_posix_pty` 共用（euid 0 時以 `SW_GATE_L1_USER` 經 setpriv 降權，無法降權即不執行、記 EVIDENCE_MISSING），judge `NON_ROOT_SECTIONS` 加入 `linux_cap_posix_pty`。紅燈：`test_caps_only_skips_default_run_and_deselects_other_rows`、`test_caps_only_target_without_selected_cap_is_not_run`、`test_caps_only_requires_caps`、`test_caps_plan_caps_only_when_every_set_selects_only_ignored_caps`、`test_linux_cap_posix_pty_run_as_root_is_evidence_missing`、`test_capability_how_to_run_uses_caps_only`、`test_gate_script_capability_sections_caps_only_and_posix_pty_non_root`；失敗情境以 `test_caps_without_caps_only_runs_default_tests_and_fails` 固定。**oracle 變更揭露**：`test_real_lock_s21_sets_caps_derivable_and_gate_plan` 的計畫等式加 `caps_only` 欄（擴充，原 caps／argv 不變）；夾具 `linux_cap_posix_pty` 加 `run_euid: 1000`。附帶：假 libtest 改由自身記錄參數（`argv.log`）、Windows `.cmd` 對齊 POSIX 語意（`--ignored` 非 `--list` 時為能力 run），`test_capability_runs_are_single_threaded` 移除 `os.name == "nt"` 的平台條件 SKIP（本檔為 core_portable，不得有平台條件 SKIP；Windows 實跑屬 LOCAL-WINDOWS-TODO） |
+| — | Low | P5-54dd588-3～6 | 不修（收斂規則） |
+
+
+### 第八輪子項 P5-r8-a5d（2026-11-03）：OD-69 整體驗收
+
+起點 `9d8e31bc` 已有 `200c10fd` 的 barrier 接線；依編排者「只做整體驗收」維持產品、mailbox 依賴排空順序與 event_latency 凍結契約不變。actor 在同步 `rx_chunk`／capture 與效果 dispatch 完成後才更新 `(epoch, rx_seq)`，finisher 等該 epoch 的 barrier ack 後送 receipt；bridge／RxShared 採既有正確接線，沒有新增第二套完成介面。
+
+- 補齊 release、shutdown、新 bridge／舊 epoch 隔離各 20 輪；每輪八個標記先完成 agent log／WAL，release 的 background capture 亦保留全部標記。無依賴 N_pre＝0、receipt 後 data ≤1、無逾時／證據缺口。保留原 OD-64 兩支依賴 gate 各 20 輪與 flood 四段各 20 輪的所有前提及斷言，只加逐輪輸出。
+- 起點原 release 與兩支 OD-64 對照逐支重跑皆綠；沒有虛構起點紅燈。隔離 archive 變異略過 barrier 時三條 OD-69 路徑均轉紅（保留原失敗斷言）；正常產品 `drain_release_e2e` 15 passed、mailbox 22 passed、sw-core 560 passed、workspace 1790 passed／4 ignored／26 filtered。
+- workspace 最初 23 支 daemon_process 因隔離 socket 路徑過長失敗；在 866 個 build／test／contract blob 與起點相同的 archive 重現完全相同集合。以本 worktree 根目錄作 TMPDIR 後同組 33 passed、workspace 重跑通過；沒有修改產品或放寬測試。完整失敗 id、建置隔離失誤與作廢結果均留存。
+- regen_lock add-only 登記三列（s21_core.linux 1739 → 1742，無移除／改 selector）。Windows cross-check、cfg 邊界、契約（0 findings）、政策（25 pass／0 fail／2 warn）及本輪基準鎖檢查通過。對 8c0c942 的無核准參數原命令仍為 FAIL（三列已核准 OD-68 移除）；逐名帶既有 OD-68 核准參數後通過，未修改該裁決或鎖分母。
+
+完整 file:line 接線核對、前審 28 條 High／Medium 的 already fixed／裁決延後處置、命令／HEAD／exit code／逐輪原始輸出及 SPEC-GAPS：[OD-69 驗收證據](p5-evidence/od69-r8-a5d/README.md)。未跑全套 pytest、slice gate、Docker 或出口 driver（依專項編排者註另派）；Windows 原生／能力證據未取得，owner／硬體項仍 BLOCKED-OWNER。不宣稱 T22、Slice 2.1 出口、push／PR／merge 或部署完成。
+
+### P5-r8-a5d 第 2 輪（2026-11-03）：起點 3bf93828 的當前驗收
+
+前審 A 段八項（Medium 1／3／4／5／7／8、High 2／6）逐項核對均為 already fixed `25ad3900`；B 段 NO FINDINGS，無本輪需要修正的 High／Medium，沒有不成立主張。保留既有產品接線與測試，沒有新增 nodeid、改凍結契約、改鎖或修其他子項。
+
+- 當前 drain 15 passed、mailbox 22 passed、sw-core 560 passed；OD-69 三路徑各 20 輪（N_pre=0、見證數≤1、480 標記全部先入 capture／WAL、無缺口），OD-64 兩條各 20 輪（N_pre=backlog、見證數=backlog+1、OpFinished 先於 receipt），flood 四段各 20 輪全綠。
+- workspace `--features test-fakes --no-fail-fast` 為 1791 passed／0 failed／29 ignored；預設 `--no-fail-fast` 為 1161 passed／0 failed／29 ignored；兩者皆 0 filtered，未執行 ignored 能力列。Windows cross-check、cfg 與契約通過，政策 25 pass／0 fail／2 warn；未取得 Windows 原生／能力證據。
+- 鎖結構與相對本輪起點檢查通過。相對 `8c0c942` 的原命令仍 exit 1（三筆 OD-68 列），逐名帶既有核准參數後 exit 0；與起點鎖及 regen 程式無差異，並非本輪新失敗。原 FAIL 與核准對照均保留。
+- 全套 pytest **未執行**：`tests/conftest.py:31`～`:41` 在 collection 前讀 production state／WAL／config 並探測 live daemon，與本輪明示嚴格邊界衝突。沒有改 guard 或以隔離變數假稱免探測，也沒有把缺測記成 PASS；Python 產品及測試均未改。Windows／硬體及出口 driver 亦未執行，owner／硬體項維持 BLOCKED-OWNER。
+
+逐項 file:line、當前命令／HEAD／exit code／摘要與 SHA-256、180 輪輸出、原失敗 id 與 SPEC-GAPS：[第 2 輪驗收](p5-evidence/od69-r8-a5d/round2/README.md)。本輪交付僅為 OD-69 局部驗收紀錄，不宣稱 T22、Slice 2.1 出口、push／PR／merge 或部署完成。
+
+### 第八輪子項 P5-r8-d4c（2026-11-03）：holder 重掃接線與整體驗收
+
+起點為 `12de01a8f9f3ff3cec9bd1d75c8ec78c2f3ba0c8`、分支 `feature/rust-refactor-p5`，起始工作樹乾淨。裁決依 `origin/docs/parity-amendments` 的 `reviews/rulings/p5.md:16,40`：attach 權限不足維持 Python 相容；鎖後重掃排除 daemon 自身行程樹，同時保留外部 holder 阻斷。最新前審 `p5-cloud/3bf93828_12de01a8-sol.md:3-18` 的 A 段八項均已修於 `25ad3900`，B 段 `NO FINDINGS`；沒有待處理 High／Medium，也沒有不成立主張。
+
+#### 正式接線核對
+
+| 核對點 | 結果 |
+|---|---|
+| 正式平台組裝 | `crates/sw-pal/src/lib.rs:201-205` 的 `native().serial` 使用 `PosixSerialBackend::new()`，`native().uart_excl` 使用 `PosixUartExclusive`。 |
+| POSIX serial constructor／鎖後掃描 | `crates/sw-pal/src/serial/posix.rs:25-31` 的 constructor 注入 `PosixUartExclusive`；`:308-345` 顯示開啟序列為 open → flock → TIOCEXCL → 鎖後重掃 → termios，外部 holder 被拒絕；`:486-490` 呼叫正式 scanner 並保存原始結果。 |
+| attach 委派 | `crates/sw-core/src/session_manager.rs:1014-1028` 的 `gated_open()` 通過 gate 後呼叫 `self.serial.open_exclusive()`，未繞過正式 serial backend；manager 未重構。 |
+| 自身行程樹與外部衝突契約 | `crates/sw-pal/src/proc_holders/posix.rs:89-96,183-219` 由正式 scanner 排除目前 PID 的後代。`contracts/behavior_changes.yaml:116,278` 仍要求鎖後重掃、拒絕已識別外部 holder、零 TX。以上檔案相對起點均無差異。 |
+
+#### 回歸、鎖與先紅證據
+
+- brief 指定的 `crates/sw-pal/tests/attach_spawn.rs` 與 `cap_posix_pty__native_attach_spawn_wiring` 在起點不存在；初始指定命令退出 101：`no test target named attach_spawn`。既有 `serial_posix.rs:296-372` 有 fork 暫停替身回歸，並以 `with_uart_exclusive` 測 scanner；它不鎖住 `native().serial` 的正式 constructor 接線。起點已有產品修正，故沒有宣稱目前起點的產品回歸轉紅。
+- 曾在限定測試檔建立一支暫存的 native constructor 回歸，直接呼叫 `native().uart_excl` 與 `native().serial.open_exclusive()`；修正該測試自身的 Rust move 編譯錯誤後，測試實跑 `1 passed`。此測試未保留，也未做 20 輪，因為正式鎖程序無法 add-only 登記此新增 `#[ignore]` 能力列：`regen_lock.py:544` 對所有新增列扣除 `ignored`。以實際 collector nodeid 配對現有 `s21_gate:cap_posix_pty.linux` 後，21 列全為 ignored，regen 命令回報「無新增 nodeid」，鎖檔不變。沒有手改鎖、改 selector、改 judge 或使用 `--allow-removal`。
+- 有一次把全 workspace 收集清單誤用於能力集合 regen，造成 regen 暫時新增 1,791 列；立即只還原該次自己產生的鎖檔差異至乾淨起點。最終 `l1_required.lock.json` 相對 `12de01a8` 無差異，`regen_lock.py --check` 與 `--check --base 12de01a` 均通過。此錯誤輸入不作驗收證據。
+- `regen_lock.py --check --base 8c0c942` 保留 FAIL，列出三筆既有消失列（`cap_interactive_desktop` 一筆、`cap_windows_native` 兩筆）；沒有以舊基準上的移除替代本輪 add-only 核對，也未使用 `--allow-removal`。
+
+#### 本輪命令結果
+
+| 命令 | 結果 |
+|---|---|
+| `cargo test -p sw-pal --features test-fakes` | exit 0：354 passed、0 failed、24 ignored。 |
+| `cargo test -p sw-pal --features test-fakes --test serial_posix cap_posix_pty__own_child_inherited_tty_is_not_foreign_holder -- --ignored --exact --test-threads=1 --nocapture` | exit 0：1 passed；輸出 `status=permission` 警告，開埠相容路徑通過。 |
+| `cargo test -p sw-pal --features test-fakes -- --ignored cap_posix_pty__ --test-threads=1` | exit 101：PAL unit 能力列 4 passed；`serial_posix` 9 passed、1 failed。失敗 `cap_posix_pty__external_plain_open_before_daemon_is_held`（`serial_posix.rs:79`）實際得到 `Ok` 而非預期 `Held`；該替身 holder 是 test runner 的子行程，現行 scanner 會排除整個 runner 行程樹。未改斷言或把 FAIL 改成 PASS。 |
+| `cargo test --workspace --features test-fakes -- --skip cap_` | exit 101；`sw-daemon::daemon_process` 有 31 passed、2 failed：`sigterm_graceful_exit_0_and_flushes_queue`（shutdown event 少一筆 session）及 `wal_dir_readonly_at_start_blocks_login_probe`（30 秒未觀察到 `write_failed`）。執行時 HEAD 仍是起點；兩支 source/test 與起點逐檔相同，依本 brief 列為起點既有失敗。 |
+| `cargo test --workspace` | exit 0，預設 workspace 執行完成，無 failed nodeid。 |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0；sw-pal 有 3 個既有 unused／dead_code warnings；這不是 Windows 原生執行證據。 |
+| `python3 scripts/rust/check_cfg_boundary.py` | exit 0，無違規輸出。 |
+| `python3 -m tools.contracts check` | exit 0，`ok=true`、`findings=[]`。 |
+| `python3 tests/acceptance/regen_lock.py --check`、`--check --base 12de01a` | 均 exit 0；鎖結構與起點比對通過。 |
+| `python3 tests/acceptance/regen_lock.py --check --base 8c0c942` | exit 1；上述三筆較舊基準列仍列為 FAIL，無豁免。 |
+| `python3 -m pytest -q tests/` | 未執行。`tests/conftest.py:32-41` 會讀 live state/WAL/config 並探測 daemon；`tests/liveguard.py:71-115` 會呼叫 systemd 與 live `session.list` RPC。這會碰觸嚴格禁區中的 production daemon/config/state，故未執行、未停用 guard，也未宣稱 PASS。 |
+| `python3 -m policy_check --repo .` | exit 0：25 pass、0 fail、2 warn（R-19 workflow 解析警告、R-22 既有懸空文件引用）。 |
+
+#### SPEC-GAPS
+
+1. 缺少指定的 `attach_spawn` 回歸 target；新能力測試是 ignored PTY nodeid，但既有 `regen_lock.py` add-only 將 ignored 列扣除，無法在不改 generator／不用非正式輸入的前提下登記到凍結能力集合。需擁有者裁決如何允許能力集合新增 ignored nodeid；目前維持 `BLOCKED-OWNER`，不擴改凍結鎖工具或 judge。
+2. 全套 pytest 與嚴格 production 不接觸規則衝突，缺少可在不讀取 live 設定／狀態、不探測 daemon 下執行完整 suite 的核准程序；本輪維持未執行。
+
+#### 既有碼待辦
+
+- `serial_posix.rs::cap_posix_pty__external_plain_open_before_daemon_is_held` 的直接子行程替身與「排除自身整個行程樹」語意衝突，當前能力集合因此有真實 FAIL；需另在允許範圍內用不屬於 scanner root 後代的外部 holder harness 重新驗證，不得放寬 `Held` 斷言。
+- 起點 `12de01a8` 已重現 workspace `daemon_process` 的上述兩項失敗；本輪未修改其 source/test，不以重跑結果改寫狀態。
+
+本輪沒有保留程式碼、測試或鎖檔變更；未使用其他 worktree、production daemon/config/state、實體序列埠、com0com、Docker 或出口 driver。驗收未完成，不宣稱 P5-r8-d4c 通過。
+
+REMAINING: owner 裁決 ignored PTY nodeid 的正式 add-only 登記方式；建立並登記 `cap_posix_pty__native_attach_spawn_wiring` 後執行指定 20 輪；解決或按起點證據追蹤三個 Rust 測試失敗（capability 1 項、workspace 2 項）；在不觸碰 production 資源的核准條件下補全 pytest。
+
+### P5-r8-d4c 第 2 輪（2026-11-03）：起點 d1b41822 的接線與整體驗收
+
+起點為 `d1b41822783cee2f261eb39fc3823aca384d7ad4`，分支 `feature/rust-refactor-p5`，工作樹乾淨。`12de01a8..d1b41822` 在 Rust source、測試、L1 鎖與鎖生成器皆無差異；`d1b41822` 僅新增本報告。依編排者註，本輪只核對本 brief 範圍，不跑全套 pytest、slice gate、Docker 或出口 driver。
+
+#### 前審 High／Medium 處理
+
+前審 A-1～A-8 的 2 項 High 與 6 項 Medium 已在 `25ad3900` 修正；本輪未發現新增 High／Medium，也沒有不成立主張。B 段為 `NO FINDINGS`。處理項目為 interactive lease 的 `cmd_id` 傳遞、manager actor 非阻塞工作佇列、alias actor profile 同步、startup save 錯誤回報、argparse 裸 `--` 相容、WAL unhealthy fence 註冊、capture eviction owner 精確路由，以及 slice21 judge 重載 parity 輸入；逐項回歸與前審說明沿用前一節已存證據。
+
+#### 正式接線核對
+
+| 核對點 | 結果 |
+|---|---|
+| `native()` 組裝 | `crates/sw-pal/src/lib.rs:204-205` 分別以 `PosixSerialBackend::new()` 與 `PosixUartExclusive` 組裝 serial 和 holder scanner。 |
+| 正式 constructor／鎖後重掃 | `crates/sw-pal/src/serial/posix.rs:27-31` constructor 使用 `PosixUartExclusive`；`:308-345` 維持 open → flock → TIOCEXCL → 重掃 → termios，已識別 holder 回 `Held`；`:486-490` 鎖後掃描使用 `self.excl.probe_holders()` 並保存結果。 |
+| attach 委派 | `crates/sw-core/src/session_manager.rs:1014-1028` 的 `gated_open()` 通過有效性 gate 後呼叫 `self.serial.open_exclusive()`；manager 未重構。 |
+| 自身行程樹與外部衝突 | `crates/sw-pal/src/proc_holders/posix.rs:89-96,183-219` 的正式 scanner 排除目前 PID 的後代。`contracts/behavior_changes.yaml:116,278` 仍要求鎖後重掃、拒絕已識別外部 holder 與零 TX；attach 權限不足維持 Python 相容語意（`origin/docs/parity-amendments:docs/rust-refactor/reviews/rulings/p5.md:16,40`）。 |
+
+#### 回歸與鎖檔
+
+- 指定命令 `cargo test -p sw-pal --features test-fakes --test attach_spawn -- --ignored --test-threads=1` 實跑 exit 101：`sw-pal` 沒有 `attach_spawn` target。`crates/sw-pal/tests/attach_spawn.rs` 與 `cap_posix_pty__native_attach_spawn_wiring` 在起點均不存在。
+- 本輪未新增替身回歸。現有 `s21_gate:cap_posix_pty.linux` selector 明確含 `--ignored cap_posix_pty__`；但 `tests/acceptance/regen_lock.py:544` 對既有集合的 add-only 差集會扣除所有 ignored nodeid。故新的 PTY 回歸不能依目前工具登記到凍結能力集合。此矛盾超出本 brief 允許的測試檔／鎖檔修改方式，需 owner 補充裁決或擴定生成器的允許變更範圍；維持 `BLOCKED-OWNER`，未手改鎖、未改 selector、未改 generator，也未使用 `--allow-removal`。
+- `cargo test -p sw-pal --features test-fakes -- --ignored cap_posix_pty__ --test-threads=1` exit 101：PAL unit 能力列 4 passed；`serial_posix` 9 passed、1 failed。唯一失敗為 `cap_posix_pty__external_plain_open_before_daemon_is_held`，`crates/sw-pal/tests/serial_posix.rs:70-80` 的 holder 是 test runner 子行程；scanner 排除自身行程樹後沒有可識別 PID，回 `Ok`。此 FAIL 在起點 d1b41822 重現，未改斷言、未把 FAIL 轉 PASS；它與本輪缺少的 attach＋spawn 正式接線回歸分開記錄。
+- 本輪沒有新增 nodeid 或鎖檔變更。`regen_lock.py --check` 與 `--check --base d1b41822` 均 exit 0；`--check --base 8c0c942` exit 1，僅列出既有 OD-68 核准移除的 3 個 Linux 能力列：`cap_interactive_desktop` 1 筆、`cap_windows_native` 2 筆。此舊基準差異不是本輪刪列，未用豁免掩蓋。
+- 指定 20 輪未執行：其 nodeid 尚不存在，不能把其他測試替代為此回歸或宣稱命中兩條 spawn 暫停點。
+
+#### 本輪測試與 gate
+
+| 命令 | 結果 |
+|---|---|
+| `cargo test -p sw-pal --features test-fakes` | exit 0；所有已執行 test target 通過，ignored 能力列未計 PASS。 |
+| `cargo test --workspace --features test-fakes -- --skip cap_` | exit 0；workspace 已選取測試全部通過，0 failed。`daemon_process` 33 passed、0 failed；前輪曾紅的 `sigterm_graceful_exit_0_and_flushes_queue` 與 `wal_dir_readonly_at_start_blocks_login_probe` 本輪均通過，故不列為本輪失敗。 |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0；sw-pal 有 3 個 unused／dead_code warning；僅為 cross-check，不是 Windows 原生執行證據。 |
+| `python3 scripts/rust/check_cfg_boundary.py` | exit 0，無違規輸出。 |
+| `python3 -m tools.contracts check` | exit 0，`ok=true`、`findings=[]`。 |
+| `python3 tests/acceptance/regen_lock.py --check`、`--check --base d1b41822` | 均 exit 0；鎖結構與本輪起點一致。 |
+| `python3 tests/acceptance/regen_lock.py --check --base 8c0c942` | exit 1；只列上述 3 筆既有 OD-68 核准移除，未變更鎖檔。 |
+| `python3 -m policy_check --repo .` | exit 0：25 pass、0 fail、2 warn（R-19 workflow test-gate 解析、R-22 既有懸空文件引用）。 |
+| `python3 -m pytest -q tests/` | 未執行，依本輪編排者註。另 `tests/conftest.py:32-41` 會在 env 隔離前讀取 live state/WAL/config 並探測 daemon，與本訊息嚴格 production 禁區衝突；沒有停用 guard 或宣稱 PASS。未修改 Python source/test，因此沒有觸及的 Python 測試。 |
+
+#### SPEC-GAPS 與既有碼待辦
+
+1. `regen_lock.py:544` 排除 ignored nodeid 與 P5 能力集合要求登記 ignored PTY 回歸不相容。需要 owner 補充正式 add-only 登記方式或明確擴大生成器修改範圍；在此之前無法交付並鎖定指定 `attach_spawn` 測試，20 輪驗收維持 `BLOCKED-OWNER`。
+2. `cap_posix_pty__external_plain_open_before_daemon_is_held` 仍有上述真實 FAIL；需由允許範圍另以 test runner 行程樹以外的 holder harness 驗證，保持 `Held` 斷言。
+3. 全套 pytest、Windows 原生執行與硬體實測未執行；不宣稱其證據或 Slice 2.1／P5 出口通過。
+
+本輪僅完成文件證據更新，未修改 production code、測試、鎖檔或 Python 檔案；未碰 production daemon/config/state、實體序列埠、com0com、Docker、其他 worktree 或 checkout。P5-r8-d4c 尚未完成。
+
+REMAINING: owner 裁決／範圍授權解決 ignored PTY nodeid 的 add-only 登記；新增並登記正式 `attach_spawn` 回歸後，實跑指定 20 輪；修正或以允許範圍處理 `cap_posix_pty__external_plain_open_before_daemon_is_held` 的真實失敗。
+
+### P5-r8-d5e 第 1 輪（2026-11-03）：attach／spawn 接線與整體驗收
+
+起點為 `1ef9a637a32f2f2e3c43b360dfd3aa0dab83096a`，分支 `feature/rust-refactor-p5`。本輪未修改 production code、Python 測試或鎖檔；驗收輸出與逐輪記錄存於 `p5-evidence/p5-r8-d5e-native-attach-spawn/`。
+
+#### 前審 High／Medium 處理
+
+最新前審 `p5-cloud/a68d042d_1ef9a637-sol.md` 的 A-1～A-8 均為 already fixed `25ad3900`；B 段 `NO FINDINGS`。本輪沒有待修 High／Medium，也沒有不成立主張。此處只核對前審處置，未重做其程式審查。
+
+#### 正式接線核對
+
+| 核對點 | 結果 |
+|---|---|
+| `native()` 組裝 | `crates/sw-pal/src/lib.rs:202-205` 仍組裝正式 `NativeProcessTunnel`、`PosixSerialBackend` 與 `PosixUartExclusive`。 |
+| 鎖後 holder 重掃 | `crates/sw-pal/src/serial/posix.rs:308-345,486-490` 仍於 TIOCEXCL 後、termios 前呼叫正式 scanner；已識別外部 holder 仍拒絕開埠。 |
+| attach 委派 | `crates/sw-core/src/session_manager.rs:1014-1028` 的 `gated_open()` 仍委派至 `self.serial.open_exclusive()`。 |
+| 外部 holder 與零 TX 契約 | `contracts/behavior_changes.yaml:116,278` 的外部 holder 阻斷及零 TX 條件不變。 |
+
+#### 能力集合登記
+
+- 起點鎖檔已包含兩個完整 nodeid：`cargo:sw-pal::serial_posix::cap_posix_pty__native_attach_spawn_sysenv` 與 `cargo:sw-pal::serial_posix::cap_posix_pty__native_attach_spawn_process_tunnel`，都只出現在 `s21_gate:cap_posix_pty.linux`（`tests/acceptance/l1_required.lock.json:11170-11171`）。一般及其他能力集合均不含這兩列。
+- 實際收集命令：`python3 scripts/rust/cargo_l1_results.py --platform linux --list-only --caps posix_pty --out docs/rust-refactor/reviews/p5-evidence/p5-r8-d5e-native-attach-spawn/cargo-l1-raw.json`。原始報告為 1,193 collected／31 ignored；依最後一段 `cap_posix_pty__` 同步篩選 collected 與 ignored 後為 22／22。原始與篩選報告分別保留為 `cargo-l1-raw.json`、`cargo-l1-cap-posix-pty-filtered.json`，兩個指定 nodeid 都在兩份篩選結果中。
+- 指定 `python3 tests/acceptance/regen_lock.py --l1-add-only --set s21_gate:cap_posix_pty --platform linux --collect docs/rust-refactor/reviews/p5-evidence/p5-r8-d5e-native-attach-spawn/cargo-l1-cap-posix-pty-filtered.json` exit 0，回報「無新增 nodeid，鎖檔未變更」。selector 未變；`--check --base 38525fc8` 與 `--check --base 1ef9a637` 均 exit 0。
+- 因兩列在起點已存在，沒有製造刪列來讓新哨兵先紅；本輪也未新增 `test_native_attach_spawn_regressions_registered_in_cap_set`，因此不宣稱該 Python 哨兵有紅／綠證據。後續狀態列於 SPEC-GAPS。
+
+#### 20 輪回歸
+
+命令依 brief 原樣逐輪執行並保留完整輸出：
+
+```bash
+cargo test -p sw-pal --features test-fakes --test serial_posix cap_posix_pty__native_attach_spawn_ -- --ignored --test-threads=1 --nocapture
+```
+
+20／20 輪皆恰有兩支指定測試 passed，每輪 2 passed、0 failed、0 ignored、15 filtered；累計 40 passed，沒有 `EVIDENCE_MISSING`。逐輪輸出為 `native-attach-spawn-20-rounds.txt`。兩種繼承見證都有斷言且 20 輪均通過：sysenv 子行程在暫停點仍存活，`/proc/<pid>/fd` 中存在與 PTY slave 相同 device／inode 的 fd（`serial_posix.rs:355-385,450`）；process_tunnel 先確認 fd 非 CLOEXEC，再核對子行程同編號 fd 指向相同 inode（`:491-506,551-555,580-582`）。測試只使用自行建立的 PTY，沒有開啟真實序列埠。每輪有 `status=permission` holder 警告；它沒有使測試跳過，兩支測試的開埠與零 TX 斷言均通過。
+
+#### 驗收命令與結果
+
+| 命令 | 結果 |
+|---|---|
+| `cargo test -p sw-pal --features test-fakes` | exit 0：355 passed、0 failed、26 ignored。 |
+| `cargo test --workspace --features test-fakes -- --skip cap_` | exit 0：1,791 passed、0 failed、4 ignored。 |
+| `cargo test --workspace` | exit 0：1,162 passed、0 failed、31 ignored。 |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0；3 個既有 sw-pal unused／dead-code warnings，僅為 cross-check，不是 Windows 原生執行證據。 |
+| `python3 scripts/rust/check_cfg_boundary.py` | exit 0，無違規輸出。 |
+| `python3 -m tools.contracts check` | exit 0，`ok=true`、`findings=[]`。 |
+| `python3 tests/acceptance/regen_lock.py --check --base 38525fc8`、`--check --base 1ef9a637` | 均 exit 0；結構及起點比對通過，無移除。 |
+| `python3 -m policy_check --repo .` | exit 0：25 pass、0 fail、2 warn（R-19 workflow gate 解析、R-22 文件懸空引用）。 |
+| `python3 -m pytest -q tests/test_l1_judge.py`、`python3 -m pytest -q tests/` | 未執行。`tests/conftest.py:32-41` 在測試隔離前讀 live state／WAL／config 並呼叫 daemon 快照；`tests/liveguard.py:71-115` 會查 systemd 並對候選 live socket 發 `session.list` RPC。這違反本輪「絕不碰 production daemon/config/state」的硬限制；未停用 guard，也沒有宣稱 pytest 通過。 |
+
+#### SPEC-GAPS
+
+1. `test_native_attach_spawn_regressions_registered_in_cap_set` 尚未新增，故不能依實際 pytest 收集輸出把新 Python nodeid add-only 登記至 `s1_pytest_full.linux` 與 `s21_gate:pytest_full.linux`。本輪未執行 pytest 或 collection，因為 conftest 的 live snapshot／daemon probe 會觸及明文禁止的 production 資源；需要擁有者指定可用的隔離驗收方式，或明確解除此唯讀探測限制。此項維持 `BLOCKED-OWNER`。
+2. 起點前已存在的 `cap_posix_pty__external_plain_open_before_daemon_is_held` 拓撲問題依 `origin/docs/parity-amendments:docs/rust-refactor/reviews/rulings/p5.md:48` 由 d3d 承擔；本輪沒有執行該案例、改其拓撲／斷言或把它計入本輪通過數。
+
+#### 既有碼待辦
+
+- `cap_posix_pty__external_plain_open_before_daemon_is_held` 仍依上述裁決由 d3d 處理；本輪不接手。
+- 沒有其他由本輪實際執行命令觀察到的失敗 nodeid。
+
+本輪未完成 Python 哨兵與 Python pytest gates；因此不宣稱 P5-r8-d5e 或 P5 出口全綠，也沒有執行 slice gate、出口證據 driver、Docker、push、PR、部署或實體 UART 操作。
+
+REMAINING: 新增並以 pytest 驗證 `test_native_attach_spawn_regressions_registered_in_cap_set`，依實際收集結果 add-only 登記 Python nodeid；在不觸碰 production daemon/config/state 的方式下完成 `tests/test_l1_judge.py` 與全套 pytest。
+
+### P5-r8-d5e 第 2 輪（2026-11-03）：能力集合哨兵與 Python 鎖列
+
+起點為 `49f572812d56c1af1482a51b5097c60a0ef64912`，分支 `feature/rust-refactor-p5`。僅修改 `tests/test_l1_judge.py`、`tests/acceptance/l1_required.lock.json` 與本回覆文件；未改 production code、合約、selector 或既有 Rust 案例。
+
+#### 前審 High／Medium
+
+- 前審 A-1～A-8 依上一輪審查報告均為 already fixed `25ad3900`；B 段為 `NO FINDINGS`。本輪沒有新的 High／Medium 或不成立主張。
+
+#### 哨兵、收集與鎖檔
+
+- 新增 `test_native_attach_spawn_regressions_registered_in_cap_set`，標記 `memory_only`。它要求 `native_attach_spawn_sysenv` 與 `native_attach_spawn_process_tunnel` 的完整 cargo nodeid 位於 `s21_gate:cap_posix_pty.linux`，且不重複出現在任何其他集合。
+- 49f57281 起點鎖檔已含兩個 Rust nodeid，且只在上述能力集合；因此 brief 預期的真實「先紅」條件不存在。本輪沒有手動移除凍結列或偽造紅燈。新增哨兵直接 pytest 實跑為 `1 passed`。
+- 兩個既有 pytest selector 的 `--collect-only -q tests/` 實際收集均為 5,867 個唯一 nodeid；新哨兵各收集一次，`s1_pytest_full.linux` 原有 15 列、`s21_gate:pytest_full.linux` 原有 5,534 列均在報告中。為保留既有必要集合分母，將各 selector 的實際收集報告與其既有必要列相交，再把完整舊列及新 nodeid 交給 add-only generator。
+- `regen_lock.py --l1-add-only` 分別更新 `s1_pytest_full.linux` 與 `s21_gate:pytest_full.linux`：各新增 1 列、移除 0 列；selector 未變。Rust 能力集合未改動。無 production code 變更，故不需 changelog fragment。
+
+#### 第 1 輪證據沿用
+
+- 正式接線核對仍見 `crates/sw-pal/src/lib.rs:202-205` 組裝 native tunnel、serial backend 與 scanner；`crates/sw-pal/src/serial/posix.rs:308-345,486-490` 在 TIOCEXCL 後、termios 前執行正式 scanner；`crates/sw-core/src/session_manager.rs:1014-1028` 的 attach 委派到 serial backend；`contracts/behavior_changes.yaml:116,278` 的外部 holder 阻斷與零 TX 契約不變。
+- 指定兩條 native attach/spawn 回歸上一輪已逐輪跑 20/20：每輪恰為 2 passed、0 failed、0 ignored，累計 40 passed。完整輸出仍在 `p5-evidence/p5-r8-d5e-native-attach-spawn/native-attach-spawn-20-rounds.txt`；原始與能力篩選收集分別在同目錄 `cargo-l1-raw.json`、`cargo-l1-cap-posix-pty-filtered.json`。本輪沒有重跑這 20 輪。
+
+#### 驗收
+
+| 命令 | 結果 |
+|---|---|
+| `python3 -m pytest -q tests/test_l1_judge.py::test_native_attach_spawn_regressions_registered_in_cap_set` | exit 0：1 passed；live guard 使用工作樹隔離 XDG 與私有不可連線 bus，daemon 維度為 SKIP，未連 production daemon。 |
+| `python3 -m pytest -q tests/test_l1_judge.py` | exit 1：36 passed、3 failed。三個失敗均為起點既存的 `test_l1_lock_frozen_set_excludes_capability_gated`、`test_l1_lock_cargo_sets_exclude_ignored_tests`、`test_s21_core_linux_capability_rows_moved_to_cap_sets_od55`；前兩者仍指出 `s21_core.windows` 的 13 個 ignored 能力列，第三者斷言 22、實際計得 24。49f57281 的斷言／Rust lock 列與本輪相同；本輪 diff 只新增哨兵與兩個 Python nodeid，未改失敗點。 |
+| `python3 -m pytest -q tests/` | exit 1：5,684 passed、158 skipped、1 xfailed、24 failed、98 subtests passed、14 warnings，53:16。首次隔離命令另有 19 個環境設定造成的失敗（daemon 被指向 `.py` shebang、隔離 HOME 未指定 Rustup/Cargo home）；以正確來源 daemon 預設與 `RUSTUP_HOME`／`CARGO_HOME` 重跑相關案例為 `20 passed`。其餘 5 個為上述 3 個起點失敗，以及 P4 evidence 缺失 2 個案例，詳見 SPEC-GAPS。故本命令不記 PASS。 |
+| `cargo test -p sw-pal --features test-fakes` | exit 0：355 passed、0 failed、26 ignored。 |
+| `cargo test --workspace --features test-fakes -- --skip cap_` | exit 0：1,791 passed、0 failed、4 ignored、28 filtered。 |
+| `cargo test --workspace` | exit 0：1,162 passed、0 failed、31 ignored。 |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0；3 個 sw-pal unused/dead-code warnings；不是 Windows 原生執行證據。 |
+| `python3 scripts/rust/check_cfg_boundary.py` | exit 0，無違規。 |
+| `python3 -m tools.contracts check` | exit 0，`ok=true`、`findings=[]`。 |
+| `python3 tests/acceptance/regen_lock.py --check`、`--check --base 38525fc8` | 均 exit 0；結構與既有起點比對通過。 |
+| `python3 -m policy_check --repo .` | exit 0：25 pass、0 fail、2 warn（R-19 workflow test gate 解析、R-22 既有懸空文件引用）。 |
+
+#### SPEC-GAPS 與既有碼待辦
+
+1. `tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native` 找不到 `target/p4-evidence/l1/windows/cargo/resource-report.json`；`tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence` 回報 28 項 P4 evidence 缺檔。依本輪明令未執行出口證據 driver，未生成或偽造這些文件；兩項保持 evidence-incomplete，不能計 PASS。
+2. 三個 `tests/test_l1_judge.py` 失敗如上，在起點 49f57281 已存在；本輪不改 judge、硬編碼斷言、Windows 能力列或 gate 分母。
+3. `cap_posix_pty__external_plain_open_before_daemon_is_held` 仍由 d3d 依最新 ruling 承擔；本輪未執行、接手或改斷言。
+
+本輪沒有操作 production daemon/config/state、`/dev/ttyUSB*`、真實序列埠、com0com、Docker container、其他 worktree 或 checkout；全套 pytest 使用臨時 Docker stub，Docker 能力仍以 SKIP 計。未跑出口證據 driver、slice gate、部署、push 或 PR。
+
+REMAINING: Windows 原生 L1／P4 evidence artifacts 尚缺且依本 brief 不執行 evidence driver；三個起點既存的 L1 judge 測試失敗待其所屬治理處理；external_plain_open_before_daemon_is_held 由 d3d 承擔。

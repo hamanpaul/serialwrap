@@ -1,0 +1,74 @@
+   Compiling sw-core v0.3.2 ($WORKTREE/crates/sw-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.96s
+     Running tests/drain_release_e2e.rs (target/debug/deps/drain_release_e2e-9cace3de62f16a73)
+
+running 7 tests
+test drain_receipt_dependency_wait_on_release_within_od64_bound ... ok
+test drain_receipt_dependency_wait_on_shutdown_within_od64_bound ... ok
+test new_bridge_receipt_ignores_old_epoch_rx_progress ... OD69 round=0 shutdown=false reattach=true markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=1 shutdown=false reattach=true markers=8 capture=true wal=true N_pre=0 witness=1 gaps=0
+OD69 round=2 shutdown=false reattach=true markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=3 shutdown=false reattach=true markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=4 shutdown=false reattach=true markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=5 shutdown=false reattach=true markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=6 shutdown=false reattach=true markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=7 shutdown=false reattach=true markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=8 shutdown=false reattach=true markers=8 capture=true wal=true N_pre=0 witness=1 gaps=0
+OD69 round=9 shutdown=false reattach=true markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=10 shutdown=false reattach=true markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=11 shutdown=false reattach=true markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=12 shutdown=false reattach=true markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=13 shutdown=false reattach=true markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=14 shutdown=false reattach=true markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=15 shutdown=false reattach=true markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=16 shutdown=false reattach=true markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=17 shutdown=false reattach=true markers=8 capture=true wal=true N_pre=0 witness=1 gaps=0
+OD69 round=18 shutdown=false reattach=true markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=19 shutdown=false reattach=true markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+ok
+test release_receipt_follows_queued_rx_capture_and_wal ... OD69 round=0 shutdown=false reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=1 shutdown=false reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=2 shutdown=false reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=3 shutdown=false reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=4 shutdown=false reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=5 shutdown=false reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=6 shutdown=false reattach=false markers=8 capture=true wal=true N_pre=0 witness=1 gaps=0
+OD69 round=7 shutdown=false reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=8 shutdown=false reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=9 shutdown=false reattach=false markers=8 capture=true wal=true N_pre=0 witness=1 gaps=0
+OD69 round=10 shutdown=false reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=11 shutdown=false reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=12 shutdown=false reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=13 shutdown=false reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=14 shutdown=false reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=15 shutdown=false reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=16 shutdown=false reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=17 shutdown=false reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=18 shutdown=false reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=19 shutdown=false reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+ok
+test release_waits_for_receipt_and_aborts_partial_in_flight ... ok
+test shutdown_and_drain_receipt_handled_within_one_data_item_under_flood ... ok
+test shutdown_receipt_follows_queued_rx_capture_and_wal ... OD69 round=0 shutdown=true reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=1 shutdown=true reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=2 shutdown=true reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=3 shutdown=true reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=4 shutdown=true reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=5 shutdown=true reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=6 shutdown=true reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=7 shutdown=true reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=8 shutdown=true reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=9 shutdown=true reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=10 shutdown=true reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=11 shutdown=true reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=12 shutdown=true reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=13 shutdown=true reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=14 shutdown=true reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=15 shutdown=true reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=16 shutdown=true reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=17 shutdown=true reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=18 shutdown=true reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+OD69 round=19 shutdown=true reattach=false markers=8 capture=true wal=true N_pre=0 witness=0 gaps=0
+ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 2.49s

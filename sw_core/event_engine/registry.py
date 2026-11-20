@@ -106,7 +106,7 @@ class RuleRegistry:
             json.dump(dict(rule.raw), f, ensure_ascii=False, indent=2, sort_keys=True)
             f.flush()
             os.fsync(f.fileno())
-        os.rename(tmp, path)
+        os.replace(tmp, path)
         self._cache[rule.rule_id] = rule
         return rule
 

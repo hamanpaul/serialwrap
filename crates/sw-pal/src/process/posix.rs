@@ -164,7 +164,7 @@ impl ProcessCtl for NativeProcessCtl {
     }
 }
 
-fn max_open_fd() -> io::Result<libc::c_int> {
+pub(super) fn max_open_fd() -> io::Result<libc::c_int> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -176,7 +176,7 @@ fn max_open_fd() -> io::Result<libc::c_int> {
     Ok(limit.rlim_cur.min(libc::c_int::MAX as libc::rlim_t) as libc::c_int)
 }
 
-fn mark_inherited_fds_cloexec(max_fd: libc::c_int) -> io::Result<()> {
+pub(super) fn mark_inherited_fds_cloexec(max_fd: libc::c_int) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;

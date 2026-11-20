@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use sw_pal::fakes::{FakeClock, FakeConn, FakeEnv, MemFs, RecordingProcess, ScriptedConnector};
 use sw_pal::{
-    BackendKind, ClientCaps, ClientPlatform, Clock, PalPathFlavor, RpcConnector, SkillPlatform,
+    BackendKind, ClientCaps, ClientPlatform, Clock, DeviceBackendKind, PalPathFlavor, RpcConnector,
+    SkillPlatform,
 };
 
 const SOURCE_HINT: &str = "`system` 與 `system:*` 是 daemon 內部保留的來源前綴（WAL 歸因與內部恢復旗標），外部呼叫不可使用。自動化請用 `agent:<名>`，人工操作請用 `human:<名>`；逾時行為差異見 skill「`--source` 的語意」。";
@@ -26,6 +27,16 @@ fn platform(script: Vec<FakeConn>) -> (ClientPlatform, Arc<ScriptedConnector>) {
         tunnel: sw_pal::fakes::FakeTunnel::new(false),
         service: sw_pal::fakes::FakeServiceCtl::new(Vec::new()),
         registry: sw_pal::fakes::FakeRegistry::new(Vec::new(), &[]),
+        serial: sw_pal::fakes::serial::FakeSerialBackend::new(),
+        uart_excl: Arc::new(sw_pal::fakes::serial::FakeUartExclusive { report: Default::default() }),
+        devices: sw_pal::fakes::platform::unconfigured_devices(),
+        instance_lock: Arc::new(sw_pal::fakes::platform::Unconfigured("instance_lock")),
+        wal_fs: sw_pal::fakes::wal_fs::FakeWalFs::new(),
+        rpc_listen: Arc::new(sw_pal::fakes::platform::Unconfigured("rpc_listen")),
+        console: Arc::new(sw_pal::fakes::platform::Unconfigured("console")),
+        signals: Arc::new(sw_pal::fakes::platform::Unconfigured("signals")),
+        handlers: Arc::new(sw_pal::fakes::platform::Unconfigured("handlers")),
+        usb: Arc::new(sw_pal::fakes::platform::Unconfigured("usb")),
         caps: ClientCaps {
             path_flavor: PalPathFlavor::Posix,
             af_unix: true,
@@ -35,6 +46,9 @@ fn platform(script: Vec<FakeConn>) -> (ClientPlatform, Arc<ScriptedConnector>) {
             exec_replace: true,
             on_demand_autostart: false,
             console_kind: sw_pal::ConsoleKind::Pty,
+            native_device: DeviceBackendKind::Posix,
+            com0com_console: false,
+            flash_endpoint: true,
         },
     };
     (p, conn)

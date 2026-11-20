@@ -4,6 +4,10 @@
 //! 與 `FakeRpcConnector::refuse_from_connect(ep, n)` 同一計數，故「ping 翻為 refused」與「pid 不存活」在同一輪詢翻轉。
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::io;
+#[cfg(unix)]
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -11,7 +15,123 @@ use super::rpc::FakeRpcConnector;
 use crate::proc_scan::{
     DaemonProc, HolderScan, HolderScanStatus, ProcDetails, ProcIdentity, ProcScan, ScanFailure,
 };
-use crate::traits::Clock;
+use crate::traits::{Clock, PalResult, SerialBackend, UartExclusive};
+#[cfg(not(unix))]
+use crate::traits::{PalError, PalErrorKind};
+
+/// 以注入的 holder 掃描建立測試用序列埠後端；非 POSIX 平台明確回報 Unsupported。
+pub fn serial_backend_with_uart_exclusive(
+    excl: Arc<dyn UartExclusive>,
+) -> PalResult<Arc<dyn SerialBackend>> {
+    #[cfg(unix)]
+    {
+        Ok(Arc::new(
+            crate::serial::posix::PosixSerialBackend::with_uart_exclusive(excl),
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = excl;
+        Err(PalError::plain(
+            PalErrorKind::Unsupported,
+            "POSIX serial backend is unavailable on this platform",
+        ))
+    }
+}
+
+/// 建立 POSIX 測試 PTY，並持有 master 對端直到此 guard 離開作用域。
+pub struct PosixPtyDevice {
+    pub device: crate::traits::DevicePath,
+    #[cfg(unix)]
+    _peer: crate::conformance::PtyPeer,
+}
+
+/// 跨平台 PTY 建構入口；非 POSIX 平台明確回報 Unsupported。
+pub fn posix_pty_device() -> PalResult<PosixPtyDevice> {
+    #[cfg(unix)]
+    {
+        let (device, peer) = crate::conformance::posix_pty_pair();
+        Ok(PosixPtyDevice {
+            device,
+            _peer: peer,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Err(PalError::plain(
+            PalErrorKind::Unsupported,
+            "POSIX PTY is unavailable on this platform",
+        ))
+    }
+}
+
+/// 假 `/proc` 檔案系統：獨立供 POSIX holder probe 注入目錄、stat 與 UID 資訊。
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub struct FakeHolderFs {
+    dirs: BTreeMap<PathBuf, Result<Vec<String>, io::ErrorKind>>,
+    stats: BTreeMap<PathBuf, Result<crate::proc_holders::posix::TtyStat, io::ErrorKind>>,
+    current_uid: Option<u32>,
+    process_uids: BTreeMap<u32, Option<u32>>,
+}
+
+#[cfg(unix)]
+impl FakeHolderFs {
+    pub fn set_dir(&mut self, path: impl Into<PathBuf>, entries: Vec<String>) {
+        self.dirs.insert(path.into(), Ok(entries));
+    }
+
+    pub fn fail_dir(&mut self, path: impl Into<PathBuf>, kind: io::ErrorKind) {
+        self.dirs.insert(path.into(), Err(kind));
+    }
+
+    pub fn set_stat(
+        &mut self,
+        path: impl Into<PathBuf>,
+        stat: crate::proc_holders::posix::TtyStat,
+    ) {
+        self.stats.insert(path.into(), Ok(stat));
+    }
+
+    pub fn fail_stat(&mut self, path: impl Into<PathBuf>, kind: io::ErrorKind) {
+        self.stats.insert(path.into(), Err(kind));
+    }
+
+    pub fn set_current_uid(&mut self, uid: Option<u32>) {
+        self.current_uid = uid;
+    }
+
+    pub fn set_process_uid(&mut self, pid: u32, uid: Option<u32>) {
+        self.process_uids.insert(pid, uid);
+    }
+}
+
+#[cfg(unix)]
+impl crate::proc_holders::posix::HolderFs for FakeHolderFs {
+    fn list_dir(&self, path: &Path) -> io::Result<Vec<String>> {
+        match self.dirs.get(path) {
+            Some(Ok(entries)) => Ok(entries.clone()),
+            Some(Err(kind)) => Err(io::Error::from(*kind)),
+            None => Err(io::Error::from(io::ErrorKind::NotFound)),
+        }
+    }
+
+    fn stat(&self, path: &Path) -> io::Result<crate::proc_holders::posix::TtyStat> {
+        match self.stats.get(path) {
+            Some(Ok(stat)) => Ok(*stat),
+            Some(Err(kind)) => Err(io::Error::from(*kind)),
+            None => Err(io::Error::from(io::ErrorKind::NotFound)),
+        }
+    }
+
+    fn current_uid(&self) -> Option<u32> {
+        self.current_uid
+    }
+
+    fn process_uid(&self, _proc_root: &Path, pid: u32) -> Option<u32> {
+        self.process_uids.get(&pid).copied().flatten()
+    }
+}
 
 #[derive(Debug, Clone)]
 enum GateKind {
@@ -48,6 +168,8 @@ pub struct FakeProcScan {
     gates: Mutex<BTreeMap<u32, ConnectGate>>,
     holders: Mutex<(Vec<u32>, Option<HolderScanStatus>)>,
     holders_script: Mutex<Vec<(Vec<u32>, HolderScanStatus)>>,
+    /// `multi_open_tty_holders` 的獨立結果（未設定時沿用 `serialwrapd_tty_holders`，與 trait 預設相同）。
+    multi_open_holders: Mutex<Option<(Vec<u32>, HolderScanStatus)>>,
     replacement: Mutex<Option<(Arc<super::clock::FakeClock>, u64, u32, DaemonProc)>>,
     rpc_relaunch: Mutex<Option<(Arc<super::rpc::FakeRpcConnector>, String)>>,
     details: Mutex<BTreeMap<u32, ProcDetails>>,
@@ -211,6 +333,15 @@ impl FakeProcScan {
         self.holders(v.to_vec(), HolderScanStatus::Ok);
     }
 
+    /// 讓 `multi_open_tty_holders`（Python `detect_multi_open` 語意）與 fail-closed 的
+    /// `serialwrapd_tty_holders` 回不同結果，用以區分兩條正式呼叫路徑（rulings/p7.md P7-71fe017-4）。
+    pub fn set_multi_open_holders(&self, v: Vec<u32>, st: HolderScanStatus) {
+        *self
+            .multi_open_holders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((v, st));
+    }
+
     /// 在 FakeClock 指定時間以新的 PID 與 start_ticks 取代目前 daemon identity。
     pub fn replace_identity_after(
         &self,
@@ -312,6 +443,18 @@ impl ProcScan for FakeProcScan {
         }
         let guard = self.holders.lock().unwrap_or_else(|e| e.into_inner());
         (guard.0.clone(), guard.1.unwrap_or(HolderScanStatus::Ok))
+    }
+
+    fn multi_open_tty_holders(&self, paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus) {
+        let preset = self
+            .multi_open_holders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match preset {
+            Some(v) => v,
+            None => self.serialwrapd_tty_holders(paths),
+        }
     }
 
     fn pid_alive(&self, pid: u32) -> bool {

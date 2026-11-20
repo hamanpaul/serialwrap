@@ -100,7 +100,8 @@ def _new_env(tmp_path: Path, **kwargs):
 
 def _make_proposal(env):
     od09 = _od09()
-    return od09.propose(env.linux_stats, env.windows_stats, baseline_gates=env.baseline_gates)
+    return od09.propose(env.linux_stats, env.windows_stats, baseline_gates=env.baseline_gates,
+                        generated_at=fakes_od09.ts(20, 8))
 
 
 def _freeze(env, *, overrides=None, now=None, proposal=None):
@@ -164,7 +165,8 @@ def test_stage0_chain_without_later_phases(tmp_path):
         env = fakes_od09.od09_env(Path({str(tmp_path)!r}))
         assert not (env.repo / "tests" / "acceptance" / "stage_exits.json").exists()
         assert not (env.repo / "docs" / "rust-refactor" / "evidence" / "index.json").exists()
-        prop = od09_freeze.propose(env.linux_stats, env.windows_stats, baseline_gates=env.baseline_gates)
+        prop = od09_freeze.propose(env.linux_stats, env.windows_stats, baseline_gates=env.baseline_gates,
+                                   generated_at=fakes_od09.ts(20, 8))
         od09_freeze.freeze(env.acceptance, prop, decision_id="OD-09-F1", approved_by="owner", overrides={{}},
                            stage0_index=env.stage0_index, evidence_root=env.evidence_root, ledger_path=env.ledger,
                            addenda_path=env.addenda, now=fakes_od09.ts(20, 9))
@@ -296,7 +298,10 @@ def test_baseline_stats_from_lr_mixed(tmp_path):
         release_manifest=env.linux_manifest,
     )
     workload = od09.workload(env.acceptance)
-    assert stats.duration_s == workload["min_continuous_duration_s"]
+    start_t = next(row["t"] for row in env.linux_run.events if row.get("kind") == "start")
+    stop_t = next(row["t"] for row in env.linux_run.events if row.get("kind") == "stop")
+    assert stats.duration_s == int(stop_t - start_t)
+    assert stats.duration_s >= workload["min_continuous_duration_s"]
     assert stats.hourly_done["COM0|agent:rhw0"]["hours"] == 48
 
 
@@ -866,7 +871,10 @@ def test_baseline_stats_accepts_non_grid_snapshot_times(tmp_path):
     rows = run.snapshots[:-1]
     run.set_snapshots([dict(row, t=1 + index * 300.5) for index, row in enumerate(rows)])
     stats = od09.baseline_stats(env.linux_case_dir, platform="linux", release_manifest=env.linux_manifest)
-    assert stats.duration_s == od09.workload(env.acceptance)["min_continuous_duration_s"]
+    start_t = next(row["t"] for row in run.events if row.get("kind") == "start")
+    stop_t = next(row["t"] for row in run.events if row.get("kind") == "stop")
+    assert stats.duration_s == int(stop_t - start_t)
+    assert stats.duration_s >= od09.workload(env.acceptance)["min_continuous_duration_s"]
     assert od09.validate_baseline(stats, acceptance_path=env.acceptance) == []
 
 

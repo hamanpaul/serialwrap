@@ -164,7 +164,7 @@ Bridge._handle_serial_rx ──► WAL.append(RX)               (現有，零改
 ### Counter 寫入
 
 - 每次 fire → 更新 `fire_count`、`last_fire_ts`；達 `max_fires` 設 `exhausted: true`。
-- 寫法：write tmp file → `os.rename` 原子覆蓋；確保 daemon crash 不留半寫狀態。
+- 寫法：write tmp file → `os.replace` 原子覆蓋（DF-18：Windows 目標已存在時 `os.rename` 會失敗）；確保 daemon crash 不留半寫狀態。
 - handler 失敗（exit != 0、timeout、spawn 錯）**仍然計入** fire_count，避免重試風暴。
 
 ### Counter 清除（對應前述 D 結論）
@@ -233,6 +233,22 @@ per-line 長度上限 16 KB；超出視為「split 後比對」（簡化：直�
 - handler 不繼承 daemon 的 stdin / stdout / stderr。
 - stdin：daemon 寫入 JSON payload 後 close（handler 一次 read 完即可）。
 - stdout / stderr：daemon 收走，rotate buffer 取最後 ~4KB 寫入 `fire_completed`。
+
+### Windows handler 語意（SC-26，Rust daemon）
+
+- `handler.exec`：argv 依 MSVC 引號規則組成 command line，`CreateProcessW` 啟動；`handler.shell`：command line 逐字為
+  `cmd.exe /d /s /c "<shell>"`（`/s` 只剝最外層引號，`<shell>` 內的引號原樣交給 cmd，不套 MSVC 跳脫）。
+- 子行程放入 Job Object（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）；逾時或 daemon 關機中止時 `TerminateJobObject`
+  終止整個 Job（含孫行程），等同 POSIX 的 `killpg(SIGTERM)`→1 s→`killpg(SIGKILL)`。
+- 只繼承三條 stdio pipe（`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`），不繼承 daemon 的其他 handle；`CREATE_NO_WINDOW`。
+- 環境白名單：POSIX 五鍵（`PATH`、`HOME`、`USER`、`LANG`、`LC_ALL`）再加 Windows 六鍵（`SYSTEMROOT`、`COMSPEC`、
+  `PATHEXT`、`TEMP`、`TMP`、`USERPROFILE`），以及所有 `SERIALWRAP_EVENT_*`。
+- `fire_completed.exit_code`：同 Python `Popen.returncode`，Windows 為 `GetExitCodeProcess` 的不帶號 DWORD
+  （例：NTSTATUS `0xC0000005` 呈現為 `3221225477`）。
+- 判定 shell 形：argv 恰為 `["cmd.exe", "/d", "/s", "/c", X]` 即以 shell 形逐字組 command line——`handler.exec`
+  寫成同樣五元素時亦等同 `handler.shell: X`（不套 MSVC 跳脫）。
+- 信任範圍（OD-12）：handler 以 daemon 使用者身分執行；Windows 的 RPC 信任範圍為整機本機使用者（TCP loopback），
+  **不**宣稱同使用者間的隔離。
 
 ### Payload（stdin JSON）
 

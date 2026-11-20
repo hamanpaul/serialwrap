@@ -1,0 +1,11 @@
+{
+  "head": "9d8e31bc604e5d1593a60aa0ee012a933a232125",
+  "verified_git_blobs": 866,
+  "paths": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates/",
+    "contracts/"
+  ],
+  "method": "Git blob SHA-1 與 ls-tree 逐檔相等；git archive 副本不含 .git，位於本 worktree 的 target/。"
+}

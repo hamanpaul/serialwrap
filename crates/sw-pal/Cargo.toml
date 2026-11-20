@@ -7,6 +7,8 @@ publish.workspace = true
 
 # 唯一允許平台相依 cfg 的 crate（arch §2.1）。不依賴 sw-proto（arch §1.3）。
 [dependencies]
+# Slice 2.1（arch §4.3 DeviceWatcher、§9.1 fakes subscribe）。
+crossbeam-channel = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -22,6 +24,8 @@ windows-sys = { workspace = true, features = [
     "Win32_Networking_WinSock",
     "Win32_System_Console",
     "Win32_System_JobObjects",
+    # P7 Task 14：event handler 的 stdio pipe（CreatePipe）。
+    "Win32_System_Pipes",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_Security",
     "Win32_Security_Cryptography",
@@ -39,5 +43,23 @@ windows-sys = { workspace = true, features = [
 # 記憶體替身（arch §4）；僅供測試，不得在產品路徑啟用。
 test-fakes = []
 
+[[bin]]
+name = "signal_wait_harness"
+path = "src/test_support/signal_wait_harness.rs"
+test = false
+bench = false
+required-features = ["test-fakes"]
+
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[[test]]
+name = "flash_pty"
+path = "tests/flash_pty.rs"
+required-features = ["test-fakes"]
+
+# P8 Task 13：windows-task 實跑測試的 COM 防線與 support 自測（memory_only；`FakeSysEnv`）。
+[[test]]
+name = "wintask_staging"
+path = "tests/wintask_staging.rs"
+required-features = ["test-fakes"]

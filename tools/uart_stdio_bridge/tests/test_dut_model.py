@@ -134,7 +134,7 @@ def test_from_yaml_same_semantics_as_legacy():
 
     legacy = _load_legacy_module()
     cases = sorted(CASES_DIR.glob("*.yaml"))
-    assert len(cases) == 13
+    assert len(cases) == 14
     for case in cases:
         target = (yaml.safe_load(case.read_text(encoding="utf-8")) or {}).get("target")
         old = _normalize(legacy.TargetConfig.from_yaml(target))

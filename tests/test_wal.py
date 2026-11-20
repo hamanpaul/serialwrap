@@ -219,3 +219,48 @@ class TestWalWindowsDirFsync(unittest.TestCase):
             with mock.patch("os.name", "posix"), mock.patch("os.open", side_effect=_spy):
                 wal.reset()
         self.assertIn(str(Path(td)), opened)
+
+
+@pytest.mark.posix_only
+@pytest.mark.memory_only
+def test_rotate_schedule_cancelled_on_shrink(tmp_path, monkeypatch):
+    """暫時輪替失敗後檔案縮至門檻以下，須清除排程且不得建立歸檔。"""
+    import errno
+
+    class Clock:
+        def __init__(self) -> None:
+            self.now = 1000.0
+
+        def __call__(self) -> float:
+            return self.now
+
+        def advance(self, seconds: float) -> None:
+            self.now += seconds
+
+    clock = Clock()
+    wal = WalWriter(wal_dir=str(tmp_path), rotate_bytes=200, clock=clock)
+    with closing(wal):
+        wal.append(com="COM0", direction="RX", source="test", payload=b"x" * 400)
+        assert Path(wal.wal_path).stat().st_size >= 200
+
+        real_rename = wal._fs.rename_noreplace_or_suffix
+        attempts = 0
+
+        def fail_first_wal_rename(src: str, base_dst: str) -> str:
+            nonlocal attempts
+            if src == wal.wal_path and attempts == 0:
+                attempts += 1
+                raise PermissionError(errno.EACCES, "injected temporary lock")
+            return real_rename(src, base_dst)
+
+        monkeypatch.setattr(wal._fs, "rename_noreplace_or_suffix", fail_first_wal_rename)
+        record = wal.append(com="COM0", direction="RX", source="test", payload=b"")
+        assert record.get("rotation_failed") is True
+        assert attempts == 1
+        assert "wal" in wal._rotate_pending
+
+        Path(wal.wal_path).write_bytes(b"below threshold")
+        clock.advance(0.02)  # 10 ms 的首段退避已到期；若未取消，tick 會嘗試並歸檔。
+        assert wal.tick() is False
+        assert "wal" not in wal._rotate_pending
+        assert list(tmp_path.glob("raw.wal.ndjson.*")) == []

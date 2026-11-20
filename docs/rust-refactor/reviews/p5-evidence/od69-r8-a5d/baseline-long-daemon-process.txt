@@ -1,0 +1,199 @@
+   Compiling fancy-regex v0.16.2
+   Compiling sw-proto v0.3.2 ($WORKTREE/target/od69-r8-a5d/mutation/crates/sw-proto)
+   Compiling sw-core v0.3.2 ($WORKTREE/target/od69-r8-a5d/mutation/crates/sw-core)
+   Compiling sw-daemon v0.3.2 ($WORKTREE/target/od69-r8-a5d/mutation/crates/sw-daemon)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.98s
+     Running tests/daemon_process.rs (target/od69-r8-a5d/mutation-target/debug/deps/daemon_process-7832ed3b7ec94059)
+
+running 33 tests
+test shutdown_wal_sync_failure_exits_1 ... FAILED
+test allowlist_rejected_before_runtime_dirs_and_lock ... ok
+test shutdown_with_stalled_drain_exits_1_with_diagnostic ... FAILED
+test backend_env_invalid_exit_1 ... ok
+test uncaught_panic_exit_1 ... ok
+test unknown_arg_exit_2_usage ... ok
+test backend_env_checked_where_python_selects_it ... ok
+test bare_double_dash_is_unrecognized_exit_2 ... ok
+test allowlist_rejected_reasons_exact ... ok
+test unreadable_state_json_exits_3_and_releases_lock ... ok
+test unwritable_state_dir_startup_save_exits_1_before_attach ... ok
+test unreadable_config_isolated_fail_closed ... ok
+test allowlist_env_overrides_config ... FAILED
+test endpoint_written_after_bind ... FAILED
+test handler_panic_does_not_kill_daemon ... FAILED
+test startup_order_scan_rank_watch ... FAILED
+test no_profiles_message_and_continue ... FAILED
+test sigterm_graceful_exit_0_and_flushes_queue ... FAILED
+test second_daemon_same_lock_exits_2_with_stderr ... FAILED
+test serialwrap_config_env_read_and_write_target ... FAILED
+test no_args_uses_env_paths ... FAILED
+test unreadable_config_env_allowlist_wins ... FAILED
+test non_root_holder_scan_permission_does_not_block_open ... FAILED
+test unreadable_config_non_isolated_unchanged ... FAILED
+test wal_dir_readonly_at_start_blocks_login_probe ... FAILED
+test daemon_stop_from_second_connection_during_force_recover ... FAILED
+test real_sigterm_to_started_daemon_exits_0_after_flush ... FAILED
+test shutdown_releases_tty_before_exit ... FAILED
+test release_kill_hook_env_isolated_only ... FAILED
+test sigterm_sigint_orderly_stop ... FAILED
+test daemon_stop_during_force_recover_with_client_gone ... FAILED
+test release_pause_hook_env_isolated_only ... FAILED
+test wal_fault_after_ready_splits_agent_and_auto_tx ... FAILED
+
+failures:
+
+---- shutdown_wal_sync_failure_exits_1 stdout ----
+
+thread 'shutdown_wal_sync_failure_exits_1' (441200) panicked at crates/sw-daemon/tests/daemon_process.rs:447:5:
+path must be shorter than SUN_LEN
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- shutdown_with_stalled_drain_exits_1_with_diagnostic stdout ----
+
+thread 'shutdown_with_stalled_drain_exits_1_with_diagnostic' (441201) panicked at crates/sw-daemon/tests/daemon_process.rs:419:5:
+path must be shorter than SUN_LEN
+
+
+---- allowlist_env_overrides_config stdout ----
+
+thread 'allowlist_env_overrides_config' (441180) panicked at crates/sw-daemon/tests/support/mod.rs:515:13:
+daemon 未在 10s 內就緒：$WORKTREE/target/t/sw21-441179-0-13dfaa75/run/serialwrapd.sock
+
+---- endpoint_written_after_bind stdout ----
+
+thread 'endpoint_written_after_bind' (441188) panicked at crates/sw-daemon/tests/support/mod.rs:515:13:
+daemon 未在 10s 內就緒：$WORKTREE/target/t/sw21-441179-8-13eda837/run/serialwrapd.sock
+
+---- handler_panic_does_not_kill_daemon stdout ----
+
+thread 'handler_panic_does_not_kill_daemon' (441189) panicked at crates/sw-daemon/tests/support/mod.rs:515:13:
+daemon 未在 10s 內就緒：$WORKTREE/target/t/sw21-441179-9-13ee94b4/run/serialwrapd.sock
+
+---- startup_order_scan_rank_watch stdout ----
+path must be shorter than SUN_LEN
+
+thread '<unnamed>' (441223) panicked at crates/sw-daemon/tests/support/mod.rs:515:13:
+daemon 未在 10s 內就緒：$WORKTREE/target/t/sw21-441179-21-1433833a/run/serialwrapd.sock
+
+thread 'startup_order_scan_rank_watch' (441204) panicked at crates/sw-daemon/tests/daemon_process.rs:269:30:
+client thread: Any { .. }
+
+---- no_profiles_message_and_continue stdout ----
+
+thread 'no_profiles_message_and_continue' (441191) panicked at crates/sw-daemon/tests/support/mod.rs:515:13:
+daemon 未在 10s 內就緒：$WORKTREE/target/t/sw21-441179-11-13f11329/run/serialwrapd.sock
+
+---- sigterm_graceful_exit_0_and_flushes_queue stdout ----
+path must be shorter than SUN_LEN
+
+thread '<unnamed>' (441230) panicked at crates/sw-daemon/tests/support/mod.rs:515:13:
+daemon 未在 10s 內就緒：$WORKTREE/target/t/sw21-441179-18-1424ec16/run/serialwrapd.sock
+
+thread 'sigterm_graceful_exit_0_and_flushes_queue' (441202) panicked at crates/sw-daemon/tests/daemon_process.rs:326:34:
+client thread: Any { .. }
+
+---- second_daemon_same_lock_exits_2_with_stderr stdout ----
+
+thread 'second_daemon_same_lock_exits_2_with_stderr' (441197) panicked at crates/sw-daemon/tests/support/mod.rs:515:13:
+daemon 未在 10s 內就緒：$WORKTREE/target/t/sw21-441179-15-13fa3a15/run/serialwrapd.sock
+
+---- serialwrap_config_env_read_and_write_target stdout ----
+
+thread 'serialwrap_config_env_read_and_write_target' (441198) panicked at crates/sw-daemon/tests/support/mod.rs:515:13:
+daemon 未在 10s 內就緒：$WORKTREE/target/t/sw21-441179-20-1431cc2d/run/serialwrapd.sock
+
+---- no_args_uses_env_paths stdout ----
+
+thread 'no_args_uses_env_paths' (441190) panicked at crates/sw-daemon/tests/support/mod.rs:515:13:
+daemon 未在 10s 內就緒：$WORKTREE/target/t/sw21-441179-10-13efe776/run/serialwrapd.sock
+
+---- unreadable_config_env_allowlist_wins stdout ----
+
+thread 'unreadable_config_env_allowlist_wins' (441362) panicked at crates/sw-daemon/tests/support/mod.rs:515:13:
+daemon 未在 10s 內就緒：$WORKTREE/target/t/sw21-441179-48-187d294f/run/serialwrapd.sock
+
+---- non_root_holder_scan_permission_does_not_block_open stdout ----
+
+thread 'non_root_holder_scan_permission_does_not_block_open' (441192) panicked at crates/sw-daemon/tests/support/mod.rs:515:13:
+daemon 未在 10s 內就緒：$WORKTREE/target/t/sw21-441179-32-1511a3d6/run/serialwrapd.sock
+
+---- unreadable_config_non_isolated_unchanged stdout ----
+
+thread 'unreadable_config_non_isolated_unchanged' (441445) panicked at crates/sw-daemon/tests/support/mod.rs:515:13:
+daemon 未在 10s 內就緒：$WORKTREE/target/t/sw21-441179-57-1b6c36d2/run/serialwrapd.sock
+
+---- wal_dir_readonly_at_start_blocks_login_probe stdout ----
+
+thread 'wal_dir_readonly_at_start_blocks_login_probe' (441582) panicked at crates/sw-daemon/tests/support/mod.rs:515:13:
+daemon 未在 10s 內就緒：$WORKTREE/target/t/sw21-441179-68-2088e9a6/run/serialwrapd.sock
+
+---- daemon_stop_from_second_connection_during_force_recover stdout ----
+
+thread 'daemon_stop_from_second_connection_during_force_recover' (441187) panicked at crates/sw-daemon/tests/support/mod.rs:537:13:
+COM0 未在 30 s 內進入 READY，最後狀態：Null，last_error：Null，/dev/pts/13 的持有者：[]
+
+---- real_sigterm_to_started_daemon_exits_0_after_flush stdout ----
+
+thread 'real_sigterm_to_started_daemon_exits_0_after_flush' (441193) panicked at crates/sw-daemon/tests/support/mod.rs:537:13:
+COM0 未在 30 s 內進入 READY，最後狀態：Null，last_error：Null，/dev/pts/18 的持有者：[]
+
+---- shutdown_releases_tty_before_exit stdout ----
+
+thread 'shutdown_releases_tty_before_exit' (441199) panicked at crates/sw-daemon/tests/support/mod.rs:537:13:
+COM0 未在 30 s 內進入 READY，最後狀態：Null，last_error：Null，/dev/pts/16 的持有者：[]
+
+---- release_kill_hook_env_isolated_only stdout ----
+
+thread 'release_kill_hook_env_isolated_only' (441194) panicked at crates/sw-daemon/tests/support/mod.rs:537:13:
+COM0 未在 30 s 內進入 READY，最後狀態：Null，last_error：Null，/dev/pts/17 的持有者：[]
+
+---- sigterm_sigint_orderly_stop stdout ----
+
+thread 'sigterm_sigint_orderly_stop' (441203) panicked at crates/sw-daemon/tests/support/mod.rs:537:13:
+COM0 未在 30 s 內進入 READY，最後狀態：Null，last_error：Null，/dev/pts/19 的持有者：[]
+
+---- daemon_stop_during_force_recover_with_client_gone stdout ----
+
+thread 'daemon_stop_during_force_recover_with_client_gone' (441186) panicked at crates/sw-daemon/tests/support/mod.rs:537:13:
+COM0 未在 30 s 內進入 READY，最後狀態：Null，last_error：Null，/dev/pts/12 的持有者：[]
+
+---- release_pause_hook_env_isolated_only stdout ----
+
+thread 'release_pause_hook_env_isolated_only' (441196) panicked at crates/sw-daemon/tests/support/mod.rs:537:13:
+COM0 未在 30 s 內進入 READY，最後狀態：Null，last_error：Null，/dev/pts/21 的持有者：[]
+
+---- wal_fault_after_ready_splits_agent_and_auto_tx stdout ----
+
+thread 'wal_fault_after_ready_splits_agent_and_auto_tx' (441604) panicked at crates/sw-daemon/tests/support/mod.rs:537:13:
+COM0 未在 30 s 內進入 READY，最後狀態：Null，last_error：Null，/dev/pts/26 的持有者：[]
+
+
+failures:
+    allowlist_env_overrides_config
+    daemon_stop_during_force_recover_with_client_gone
+    daemon_stop_from_second_connection_during_force_recover
+    endpoint_written_after_bind
+    handler_panic_does_not_kill_daemon
+    no_args_uses_env_paths
+    no_profiles_message_and_continue
+    non_root_holder_scan_permission_does_not_block_open
+    real_sigterm_to_started_daemon_exits_0_after_flush
+    release_kill_hook_env_isolated_only
+    release_pause_hook_env_isolated_only
+    second_daemon_same_lock_exits_2_with_stderr
+    serialwrap_config_env_read_and_write_target
+    shutdown_releases_tty_before_exit
+    shutdown_wal_sync_failure_exits_1
+    shutdown_with_stalled_drain_exits_1_with_diagnostic
+    sigterm_graceful_exit_0_and_flushes_queue
+    sigterm_sigint_orderly_stop
+    startup_order_scan_rank_watch
+    unreadable_config_env_allowlist_wins
+    unreadable_config_non_isolated_unchanged
+    wal_dir_readonly_at_start_blocks_login_probe
+    wal_fault_after_ready_splits_agent_and_auto_tx
+
+test result: FAILED. 10 passed; 23 failed; 0 ignored; 0 measured; 0 filtered out; finished in 30.46s
+
+error: test failed, to rerun pass `-p sw-daemon --test daemon_process`

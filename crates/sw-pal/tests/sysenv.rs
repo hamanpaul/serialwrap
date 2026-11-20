@@ -2,6 +2,32 @@
 use sw_pal::native_client;
 
 #[test]
+fn sysenv_test_system_config_path_overrides() {
+    use std::path::Path;
+    use sw_pal::{fakes::FakeSysEnv, SysEnv};
+
+    let default = FakeSysEnv::builder()
+        .system_config_dir(Path::new("/isolated/system"))
+        .build();
+    let expected = Path::new("/isolated/system")
+        .join("config.yaml")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(default.system_config_path(), expected);
+
+    let explicit = FakeSysEnv::builder()
+        .var("SERIALWRAP_TEST_SYSTEM_CONFIG_PATH", "~/chosen/system.yaml")
+        .system_config_dir(Path::new("/ignored"))
+        .build();
+    assert_eq!(explicit.system_config_path(), "~/chosen/system.yaml");
+
+    let empty = FakeSysEnv::builder()
+        .var("SERIALWRAP_TEST_SYSTEM_CONFIG_PATH", "")
+        .build();
+    assert_eq!(empty.system_config_path(), "");
+}
+
+#[test]
 fn var_reads_process_environment() {
     let key = "SW_PAL_T9_VAR_PROBE";
     std::env::set_var(key, "probe-value");
@@ -93,5 +119,48 @@ fn realpath_resolves_symlinks() {
     assert_eq!(
         native_client().env.realpath(&link).unwrap(),
         std::fs::canonicalize(&link).unwrap()
+    );
+}
+
+#[cfg(all(unix, feature = "test-fakes"))]
+#[test]
+fn native_sysenv_spawn_pause_is_reached_and_released() {
+    use std::sync::mpsc::TryRecvError;
+    use std::time::Duration;
+    use sw_pal::conformance::SysenvSpawnPauseCall;
+    use sw_pal::native;
+
+    let mut call = SysenvSpawnPauseCall::spawn(Duration::from_secs(5), || {
+        native()
+            .env
+            .run(&["/bin/true".to_string()], Some(Duration::from_secs(8)))
+    })
+    .expect("建立 sysenv spawn 暫停呼叫");
+
+    let child_pid = call
+        .wait_for_pre_exec(Duration::from_secs(2))
+        .expect("未收到子行程進入 pre-exec 的 PID 通知");
+    assert!(
+        matches!(call.try_result(), Err(TryRecvError::Empty)),
+        "release 前 native().env.run() 不得完成；子行程 PID={child_pid}"
+    );
+
+    call.release().expect("放行 pre-exec 子行程");
+    let output = call
+        .recv_timeout(Duration::from_secs(5))
+        .expect("release 後 native().env.run() 未完成")
+        .expect("native().env.run() 失敗");
+    assert_eq!(output.rc, 0, "子行程 PID={child_pid} 應以 rc=0 結束");
+    call.join().expect("回收 sysenv 呼叫執行緒");
+
+    let mut status = 0;
+    // SAFETY: 只查詢由本回歸啟動且已由 SysEnv::run 等待的子行程。
+    let wait_result =
+        unsafe { libc::waitpid(child_pid as libc::pid_t, &mut status, libc::WNOHANG) };
+    assert_eq!(wait_result, -1, "sysenv 子行程應已由 run() 回收");
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD),
+        "不得留下未回收的 sysenv 子行程"
     );
 }

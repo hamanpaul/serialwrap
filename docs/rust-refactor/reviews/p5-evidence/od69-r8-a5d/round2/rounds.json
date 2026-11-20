@@ -1,0 +1,30 @@
+{
+  "source": "drain-release.txt",
+  "OD69": {
+    "rounds": 60,
+    "per_path": 20,
+    "markers": 480,
+    "N_pre_values": [
+      0
+    ],
+    "witness_values": [
+      0,
+      1
+    ],
+    "gaps": 0
+  },
+  "OD64": {
+    "rounds": 40,
+    "per_path": 20,
+    "N_pre_equals_backlog": true,
+    "witness_equals_backlog_plus_one": true,
+    "OpFinished_before_receipt": true
+  },
+  "flood": {
+    "rounds": 80,
+    "per_path": 20,
+    "lane_full": true,
+    "flowing": 200,
+    "bound": 1
+  }
+}

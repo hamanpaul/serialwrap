@@ -34,19 +34,26 @@ jobs:
         # P4 證據測試要讀出口 driver 產生的 target/p4-evidence，CI 沒有；出口 driver 的 pytest_full_junit 步驟照常強制
         run: python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence
       - name: 安裝 google-re2（[redos] 可選依賴）
+        # 第一遍紅時仍安裝 re2 並跑第二遍與鎖檢查（PR #278：十輪內第二遍只執行 4 次、鎖檢查 0 次，一輪只露一層）。
+        # `!cancelled()` 只取代預設的 `success()`：失敗步驟的結論不變，job 仍以失敗結束（不是 continue-on-error）。
+        if: ${{ !cancelled() }}
         run: python3 -m pip install --disable-pip-version-check google-re2
       - name: 執行測試套件（含 re2 線性引擎）
+        if: ${{ !cancelled() }}
         # 覆蓋 #91 re2 路徑：matcher 以 re2 線性引擎求值、免疫所有 catastrophic backtracking。
         # P4 證據測試要讀出口 driver 產生的 target/p4-evidence，CI 沒有；出口 driver 的 pytest_full_junit 步驟照常強制
         run: python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence
       - name: L1 必要集合鎖只增檢查（對 PR base，P2-T13 R5-F3）
-        if: github.event_name == 'pull_request'
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         # 基準 rev 的鎖檔中既有的 (set, platform, nodeid) 三元組消失或 selector 改變即失敗；移除須 --allow-removal set_id:platform:nodeid（逐筆）並於 PR 說明。
         # 核准粒度為三元組（收緊，2026-10-23；sol d82d146）：同名 nodeid 於其他集合／平台的核准不相通。
         # 清單與來源逐列對應真實移除事件（git 歷史 parent diff）：d82d146＝OD-16 (1)(2) RM-01～06（505）；61919dd＝OD-17 RM-01～03（4）；
         # 1e24d68＝Linux 占位 12＋12（核准只涵蓋 Linux，見 owner-decisions-s1x-g-list.md）；1ea2bdc＝s1b_cargo.linux 舊名 2；e25aec0＝舊 10 筆 docker／stage0 裁決保留（s0_win_pytest.windows）。
         # 1e24d68（24）、1ea2bdc（2）、e25aec0（10）三組共 36 個三元組由 OD-23（2026-10-27）逐名補授權；清單見 docs/rust-refactor/reviews/s1x-unauthorized-removals.md。
         # OD-24（2026-10-27）：s1b_cargo 的 5 筆 #[ignore] 列（68d0941 夾帶新增）逐名移除；承擔者見 owner-decisions-2026-10-15.md OD-24 列。
+        # OD-68（2026-10-30）：逐名核准 windows-only 能力集合的 3 筆 linux 列移除；Windows 承擔列與 LOCAL-WINDOWS-TODO 見 slice21-owner-runbook.md。
+        # OD-56（2026-10-29，rulings/p7.md P7-BO-1）：僅核准 s21_core.linux 兩個舊 nodeid，由替換測試承擔；windows 集合待原生一對一替換。
+        # OD-95（2026-11-15）與編排者 2026-11-16 補記：逐名撤回 F2/F3 的 17 個 POSIX 專屬 Windows nodeid；8 個屬凍結必要列，另 9 個撤回本批新增登記。
         # 其他移除仍由鎖檢查拒絕；逐列理由見 docs/rust-refactor/owner-decisions-addenda.md。
         run: >-
           python3 tests/acceptance/regen_lock.py --check --base "origin/$GITHUB_BASE_REF" --allow-removal
@@ -600,6 +607,28 @@ jobs:
           's1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_grandchild_entry'
           's1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_launcher_entry'
           's1b_cargo:windows:cargo:sw-pal::service_ctl::cap_supervisor_runtime__windows_task_roundtrip'
+          's21_gate:cap_windows_native:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem'
+          's21_gate:cap_windows_native:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child'
+          's21_gate:cap_interactive_desktop:linux:cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c'
+          's21_core:linux:cargo:sw-core::login_quiet::unsupported_profile_no_auto_tx'
+          's21_core:linux:cargo:sw-core::session_manager::detect_skips_passthrough_console_unlock_and_unsupported'
+          's21_core:windows:cargo:sw-daemon::daemon_process::daemon_stop_during_force_recover_with_client_gone'
+          's21_core:windows:cargo:sw-daemon::daemon_process::daemon_stop_from_second_connection_during_force_recover'
+          's21_core:windows:cargo:sw-daemon::daemon_process::real_sigterm_to_started_daemon_exits_0_after_flush'
+          's21_core:windows:cargo:sw-daemon::daemon_process::shutdown_releases_tty_before_exit'
+          's21_core:windows:cargo:sw-daemon::daemon_process::wal_dir_readonly_at_start_blocks_login_probe'
+          's21_core:windows:cargo:sw-daemon::daemon_process::wal_fault_after_ready_splits_agent_and_auto_tx'
+          's21_core:windows:cargo:sw-daemon::daemon_process::non_root_holder_scan_permission_does_not_block_open'
+          's21_core:windows:cargo:sw-daemon::daemon_process::release_kill_hook_env_isolated_only'
+          's21_core:windows:cargo:sw-daemon::daemon_process::release_pause_hook_env_isolated_only'
+          's21_core:windows:cargo:sw-daemon::daemon_process::sigterm_sigint_orderly_stop'
+          's21_core:windows:cargo:sw-daemon::daemon_process::unwritable_state_dir_startup_save_exits_1_before_attach'
+          's21_core:windows:cargo:sw-daemon::daemon_process::endpoint_written_after_bind'
+          's21_core:windows:cargo:sw-daemon::restart_after_commit::kill_before_commit_restores_previous_state'
+          's21_core:windows:cargo:sw-daemon::restart_after_commit::kill_between_commit_and_reply_keeps_released_after_restart'
+          's21_core:windows:cargo:sw-daemon::handoff_stop::handoff_drain_window_background_triggers_zero_tx'
+          's21_core:windows:cargo:sw-daemon::handoff_stop::handoff_then_successor_never_double_held'
+          's21_core:windows:cargo:sw-daemon::shutdown_order::second_sigterm_real_signal_exits_0'
 
   bridge-tools:
     if: github.event.action != 'labeled'

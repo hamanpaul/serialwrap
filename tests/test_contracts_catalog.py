@@ -1368,14 +1368,27 @@ def test_bc_real_bc_case_ids_frozen() -> None:
     assert "OD-13" in by_id["BC-01"].related_decisions
 
 
+# 整合主線 feature/rust-refactor-p8（2e642648）contracts/behavior_changes.yaml 實際讀檔所得的 SC 集合（35 項，非推算範圍）：
+# SC-01～SC-31 扣 SC-08（OD-14 #3 撤回、編號不重用）；SC-30 由 P7 Task 0 登記（08 §0.5）；SC-34／SC-35 由 P1-OC（02b）登記；
+# SC-36 由 P4 Task 19 登記（OD-15）；SC-37 依 OD-21 登記；SC-39 依 OD-48 登記。SC-33 依擁有者 OD-79 撤回、SC-38 未佔用。
+_MAINLINE_SC_AT_2E642648 = frozenset({
+    "SC-01", "SC-02", "SC-03", "SC-04", "SC-05", "SC-06", "SC-07", "SC-09", "SC-10", "SC-11", "SC-12", "SC-13",
+    "SC-14", "SC-15", "SC-16", "SC-17", "SC-18", "SC-19", "SC-20", "SC-21", "SC-22", "SC-23", "SC-24", "SC-25",
+    "SC-26", "SC-27", "SC-28", "SC-29", "SC-30", "SC-31", "SC-34", "SC-35", "SC-36", "SC-37", "SC-39",
+})
+
+
 def test_bc_real_sc_df_ranges() -> None:
-    """SC 範圍合併 OD-14 與 P4 的 SC-36、OD-48 的 SC-39，且撤回 SC-08。"""
+    """SC 集合＝整合主線（2e642648）實際目錄 ∪ P8 Task 1 新增的 SC-32；SC-33（OD-79 撤回）與 SC-08（OD-14 #3）不得出現。"""
     changes, _, _ = _bc()
     by_id = {c.id: c for c in changes}
     sc_ids = {c.id for c in changes if c.kind == "SC"}
-    assert sc_ids == {f"SC-{i:02d}" for i in range(1, 28)} - {"SC-08"} | {"SC-34", "SC-35", "SC-36", "SC-39"}
+    assert sc_ids == _MAINLINE_SC_AT_2E642648 | {"SC-32"}
+    assert "SC-33" not in sc_ids and "SC-08" not in sc_ids
     df_ids = {c.id for c in changes if c.kind == "DF"}
-    assert df_ids == {f"DF-{i:02d}" for i in range(1, 18)} | {"DF-19", "DF-20", "DF-21", "DF-22", "DF-25"}
+    # DF-19 由 P0 登記、P1 T20 實作（R5-F2）；DF-18 由 P7 Task 0 登記；DF-20～DF-22 依 OD-34～OD-44 登記；
+    # DF-23／DF-24 依 OD-57／OD-73（P7）登記；DF-25 依 OD-77 登記；DF-26 依 OD-80 登記；DF-27 依 OD-81 登記。
+    assert df_ids == {f"DF-{i:02d}" for i in range(1, 28)}
 
     df19 = by_id["DF-19"]
     assert df19.scope == "both"
@@ -1383,6 +1396,14 @@ def test_bc_real_sc_df_ranges() -> None:
     assert df19.case_ids == ("df19-self-test-probe-quiet-fence",)
     assert "SES-16.6-08" in df19.reconciliation_refs
     assert df19.applies_rust_stage == "slice-2.1"
+
+    # PA-OD-1／OD-21 (1)：SC-37 daemon 端 backend env 強制非原生後端 → Rust exit 1（parity #6／#71）。
+    sc37 = by_id["SC-37"]
+    assert sc37.scope == "rust_only" and sc37.applies_python_min is None
+    assert sc37.applies_rust_stage == "slice-2.1"
+    assert sc37.ab_participation == "absolute_only"
+    assert "OD-21" in sc37.related_decisions
+    assert "exit 1" in sc37.compatibility_impact and "SERIALWRAP_RPC_BACKEND" in sc37.compatibility_impact
 
     df20 = by_id["DF-20"]
     assert df20.scope == "both" and df20.applies_python_min == "0.4.0"
@@ -1398,6 +1419,15 @@ def test_bc_real_sc_df_ranges() -> None:
     assert "OD-37" in df21.related_decisions
     assert "FLUSHED_BY_RECOVERY" in df21.compatibility_impact and "UART TX 為零" in df21.compatibility_impact
 
+    df24 = by_id["DF-24"]
+    assert df24.status == "IMPLEMENTED" and df24.scope == "both" and df24.applies_python_min == "0.4.0"
+    assert df24.applies_rust_stage == "slice-2.3" and df24.ab_participation == "diff"
+    assert list(df24.phases) == ["P7"]
+    assert df24.case_ids == ("p7-selftest-recover-recover-force-timeout-attached",)
+    assert "OD-73" in df24.related_decisions
+    assert "6 秒" in df24.compatibility_impact and "session list" in df24.compatibility_impact
+    assert "不把 Python 的長時間 lock 行為複製到 Rust" in df24.compatibility_impact
+
     df22 = by_id["DF-22"]
     assert df22.scope == "rust_only" and df22.applies_python_min is None
     assert df22.applies_rust_stage == "slice-2.1"
@@ -1405,17 +1435,53 @@ def test_bc_real_sc_df_ranges() -> None:
     assert "OD-43" in df22.related_decisions
     assert "merge_oldest" in df22.compatibility_impact and "不得低估" in df22.compatibility_impact
 
+    df26 = by_id["DF-26"]
+    assert df26.status in {"APPROVED", "IMPLEMENTED", "VERIFIED"} and df26.scope == "both" and df26.applies_python_min == "0.4.1"
+    assert df26.applies_rust_stage == "slice-2.4" and df26.ab_participation == "diff"
+    assert list(df26.phases) == ["P8"]
+    assert df26.approval.decision_ref == "OD-80"
+    assert df26.approval.date == "2026-11-06"
+    assert "OD-80" in df26.related_decisions
+    assert "131072" in df26.compatibility_impact
+    assert "PULL_PARSE_FAILED" in df26.compatibility_impact
+    assert "Python" in df26.compatibility_impact and "Rust" in df26.compatibility_impact
+    assert df26.case_ids == ("f7-larger-file-not-truncated",)
+
+    df27 = by_id["DF-27"]
+    assert df27.status in {"APPROVED", "IMPLEMENTED", "VERIFIED"} and df27.scope == "both" and df27.applies_python_min == "0.4.1"
+    assert df27.applies_rust_stage == "slice-2.3" and df27.ab_participation == "diff"
+    assert list(df27.phases) == ["P7"]
+    assert df27.approval.decision_ref == "OD-81"
+    assert df27.approval.date == "2026-11-08"
+    assert "OD-81" in df27.related_decisions
+    assert "POST_LOGIN_CMD_TIMEOUT" in df27.compatibility_impact
+    assert "DETACHED" in df27.compatibility_impact and "READY" in df27.compatibility_impact
+    assert "Python" in df27.compatibility_impact and "Rust" in df27.compatibility_impact
+    assert df27.case_ids == (
+        "df27-python-post-login-timeout-stays-detached",
+        "df27-rust-post-login-timeout-reprobes-ready",
+    )
+
 
 def test_bc_real_rust_only_python_null() -> None:
-    """scope 為 rust_only 者 applies_python_min 為 None，特定 SC 項目為 rust_only（含 P4-T19 的 SC-36）。"""
+    """scope 為 rust_only 者 applies_python_min 為 None，特定 SC 項目為 rust_only（含 P4-T19 的 SC-36、P8-T1 的 SC-32）。"""
     changes, _, _ = _bc()
     by_id = {c.id: c for c in changes}
     for c in changes:
         if c.scope == "rust_only":
             assert c.applies_python_min is None, f"{c.id} applies_python_min 應為 None"
-    for sc_id in ("SC-15", "SC-17", "SC-18", "SC-22", "SC-23", "SC-24", "SC-26", "SC-36"):
+    for sc_id in ("SC-15", "SC-17", "SC-18", "SC-22", "SC-23", "SC-24", "SC-26", "SC-28", "SC-29", "SC-30", "SC-31", "SC-32", "SC-36"):
+        assert sc_id in by_id, f"{sc_id} 未登記"
         assert by_id[sc_id].scope == "rust_only", f"{sc_id} scope 應為 rust_only"
     assert by_id["SC-25"].scope in {"rust_only", "python_when_manifest_present"}
+
+
+def test_sc33_withdrawn_per_od79() -> None:
+    """SC-33 依 OD-79 撤回：整筆自登記移除、編號保留不重用，其案例改列 SC-03，pending item 8 移除。"""
+    changes, confirmations, _ = _bc()
+    assert "SC-33" not in {c.id for c in changes}
+    assert all(o.item != 8 for o in confirmations)
+    assert not any("SC-33" in c.case_ids for c in changes)
 
 
 def test_bc_real_sc22_switch_guard_not_force_overridable() -> None:
