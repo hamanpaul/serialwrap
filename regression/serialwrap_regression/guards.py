@@ -144,6 +144,29 @@ def throwaway_env(workdir: Path, by_id_dir: Path, run_dir: Path) -> dict[str, st
     return env
 
 
+def _live_process_group_members(pgid: int, proc_root: Path = Path("/proc")) -> list[int]:
+    """列出 process group 內仍存活的行程；不把尚未回收的 zombie 算成存活。"""
+    members: list[int] = []
+    for entry in proc_root.iterdir():
+        if not entry.name.isdecimal():
+            continue
+        try:
+            stat = (entry / "stat").read_text(encoding="ascii")
+        except FileNotFoundError:
+            continue
+        fields = stat[stat.rfind(")") + 1 :].split()
+        if len(fields) < 3:
+            raise RuntimeError(f"無法解析 /proc/{entry.name}/stat")
+        state = fields[0]
+        try:
+            process_pgid = int(fields[2])
+        except ValueError as exc:
+            raise RuntimeError(f"無法解析 /proc/{entry.name}/stat 的 pgrp") from exc
+        if process_pgid == pgid and state not in {"Z", "X", "x"}:
+            members.append(int(entry.name))
+    return sorted(members)
+
+
 class ThrowawayDaemon:
     """throwaway serialwrapd context manager：獨立 XDG/socket/by-id sandbox，prod 零接觸。
 
@@ -158,6 +181,7 @@ class ThrowawayDaemon:
         self._profile_yaml = profile_yaml
         self._env: dict[str, str] = {}
         self._proc_pgid: int | None = None
+        self._proc: subprocess.Popen | None = None
         self._run_dir: Path | None = None
 
     def __enter__(self) -> "ThrowawayDaemon":
@@ -183,6 +207,7 @@ class ThrowawayDaemon:
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
+        self._proc = proc
         self._proc_pgid = proc.pid
         try:
             deadline = time.monotonic() + 20
@@ -196,6 +221,15 @@ class ThrowawayDaemon:
             raise
         self.__exit__(None, None, None)
         raise RuntimeError(f"throwaway daemon 未在 20s 內就緒（log：{self._workdir}/daemon.log）")
+
+    def wait_for_exit(self, *, timeout_s: float = 15.0,
+                      proc_root: Path = Path("/proc")) -> tuple[int, list[int]]:
+        """有界等待並回收 daemon，再檢查其行程群是否仍有存活成員。"""
+        if self._proc is None or self._proc_pgid is None:
+            raise RuntimeError("throwaway daemon 尚未啟動")
+        exit_code = self._proc.wait(timeout=timeout_s)
+        live_members = _live_process_group_members(self._proc_pgid, proc_root=proc_root)
+        return exit_code, live_members
 
     def run(self, *args: str, timeout: float = 30.0) -> dict:
         """以 throwaway env 呼叫 pinned CLI（JSON 解析同 SwCli 慣例）。"""
@@ -271,12 +305,28 @@ class ThrowawayDaemon:
         return "\n".join(parts)
 
     def __exit__(self, *exc: Any) -> None:
-        self.run("daemon", "stop", timeout=15)
-        if self._proc_pgid:
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                self.run("daemon", "stop", timeout=15)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if proc is not None and proc.poll() is None and self._proc_pgid:
             try:
                 os.killpg(self._proc_pgid, 15)
             except (ProcessLookupError, PermissionError):
                 pass
+        if proc is not None:
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                if self._proc_pgid:
+                    try:
+                        os.killpg(self._proc_pgid, 9)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                proc.wait(timeout=5)
+        self._proc = None
         # workdir（state/wal/daemon.log）保留當 evidence；短路徑 run dir 清掉不留 socket。
         if self._run_dir is not None:
             import shutil

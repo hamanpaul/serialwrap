@@ -9,7 +9,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "regression"))
 
-from serialwrap_regression import core, harness  # noqa: E402
+from serialwrap_regression import core, guards, harness  # noqa: E402
+from serialwrap_regression.cases import f07_file_transfer as f07  # noqa: E402
 
 pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
@@ -164,3 +165,141 @@ def test_case_dict_pending_issue_false_for_issue_bound_case():
     meta = dicts[0]["metadata"]
     assert meta["pending_issue"] is False
     assert meta["issues"] == ["#94"]
+
+
+def _write_proc_stat(proc_root: Path, pid: int, state: str, pgid: int) -> None:
+    proc_dir = proc_root / str(pid)
+    proc_dir.mkdir()
+    (proc_dir / "stat").write_text(
+        f"{pid} (throwaway worker with spaces) {state} 1 {pgid} 0 0 0\n",
+        encoding="ascii",
+    )
+
+
+def test_throwaway_wait_reaps_daemon_and_ignores_zombie_group_members(tmp_path):
+    class _FinishedProcess:
+        pid = 410
+
+        def __init__(self):
+            self.wait_timeout = None
+
+        def wait(self, *, timeout):
+            self.wait_timeout = timeout
+            return 0
+
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    _write_proc_stat(proc_root, 420, "Z", 410)
+    daemon = guards.ThrowawayDaemon("/bin/serialwrap", tmp_path / "ta", tmp_path / "byid", "")
+    daemon._proc = _FinishedProcess()
+    daemon._proc_pgid = 410
+
+    exit_code, live_members = daemon.wait_for_exit(timeout_s=0.75, proc_root=proc_root)
+
+    assert daemon._proc.wait_timeout == 0.75
+    assert exit_code == 0
+    assert live_members == []
+
+    _write_proc_stat(proc_root, 421, "S", 410)
+    _, live_members = daemon.wait_for_exit(timeout_s=0.75, proc_root=proc_root)
+    assert live_members == [421]
+
+
+def _wal_record(seq: int, direction: str, payload: bytes, cmd_id: str | None = None) -> str:
+    import base64
+    import json
+
+    return json.dumps({
+        "seq": seq,
+        "dir": direction,
+        "payload_b64": base64.b64encode(payload).decode("ascii"),
+        "cmd_id": cmd_id,
+    })
+
+
+def test_i282_midline_oracle_requires_busy_echo_stall_and_two_prior_chunks():
+    marker = "I282_ECHO_OFF_test"
+    rows = [
+        _wal_record(1, "RX", f"{marker}\n".encode()),
+        _wal_record(2, "TX", b"printf '%s' 'first' && SW_XFER_CHUNK_42\n", "ft-12345678-0"),
+        _wal_record(3, "TX", b"printf '%s' 'second' && SW_XFER_CHUNK_42\n", "ft-12345678-1"),
+        _wal_record(4, "TX", b"printf '%s' 'YWJj", "ft-12345678-2"),
+    ]
+    wal_text = "\n".join(rows)
+
+    assert f07._midline_push_observed(
+        wal_text, echo_off_marker=marker, foreground_busy=True,
+    ) is True
+    assert f07._midline_push_observed(
+        wal_text, echo_off_marker=marker, foreground_busy=False,
+    ) is False
+    assert f07._midline_push_observed(
+        "\n".join(rows[1:]), echo_off_marker=marker, foreground_busy=True,
+    ) is False
+    one_complete_chunk = "\n".join([rows[0], rows[1], rows[3]])
+    assert f07._midline_push_observed(
+        one_complete_chunk, echo_off_marker=marker, foreground_busy=True,
+    ) is False
+    complete_line = "\n".join(rows[:3] + [
+        _wal_record(4, "TX", b"printf '%s' 'YWJj\n", "ft-12345678-2"),
+    ])
+    assert f07._midline_push_observed(
+        complete_line, echo_off_marker=marker, foreground_busy=True,
+    ) is False
+
+
+def test_i282_post_restart_temp_growth_is_detected():
+    before = {"/tmp/.sw_upload_0123456789ab": 512}
+
+    assert f07._changed_upload_temps(before, dict(before)) == []
+    assert f07._changed_upload_temps(
+        before, {"/tmp/.sw_upload_0123456789ab": 768},
+    ) == ["/tmp/.sw_upload_0123456789ab"]
+    assert f07._changed_upload_temps(
+        before,
+        {
+            "/tmp/.sw_upload_0123456789ab": 512,
+            "/tmp/.sw_upload_fedcba987654": 256,
+        },
+    ) == ["/tmp/.sw_upload_fedcba987654"]
+
+
+def test_i282_upload_size_marker_is_parsed_from_dut_rx():
+    marker = "I282_PRE_test_TEMP"
+    wal_text = "\n".join([
+        _wal_record(1, "RX", f"{marker} /tmp/.sw_upload_0123456789ab 1024\n".encode()),
+        _wal_record(2, "RX", b"I282_PRE_test_TEMP /tmp/not-an-upload 55\n"),
+        _wal_record(3, "TX", f"{marker} /tmp/.sw_upload_fedcba987654 9999\n".encode()),
+    ])
+
+    assert f07._upload_size_markers(wal_text, marker=marker) == {
+        "/tmp/.sw_upload_0123456789ab": 1024,
+    }
+
+
+def test_i282_echo_watcher_waits_for_restore_signal_and_has_fallback_cleanup():
+    script = f07._echo_stall_watcher_script(nonce="test")
+
+    assert "done_path=/tmp/.i282-echo-watcher-test.done" in script
+    assert "trap cleanup EXIT" in script
+    assert "target_size=1024" in script
+    assert '[ ! -e "$done_path" ]' in script
+    assert '[ "$elapsed" -lt 180 ]' in script
+    assert 'stty echo </dev/tty >/dev/null 2>&1 || :' in script
+    assert 'stty -echo </dev/tty || exit 1' in script
+    assert "I282_ECHO_RESTORED_%s" in script
+    assert "'test'" in script
+
+
+def test_i282_case_uses_midline_and_post_restart_temp_oracles():
+    import inspect
+
+    source = inspect.getsource(f07._body_push_stop_midline_clean_restart)
+    assert "_midline_push_observed(" in source
+    assert "_upload_size_markers(" in source
+    assert "_changed_upload_temps(" in source
+    assert "daemon_exit_code != 0" in source
+    assert "clear_count != 1" in source
+    assert "extra_chunk_commands != 0" in source
+    assert "ta.wait_for_exit(timeout_s=15.0)" in source
+    assert "touch {shlex.quote(watcher_done_path)}; sleep 2; stty echo" in source
