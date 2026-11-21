@@ -21,6 +21,10 @@ secret_scan:
     # OD-33 升級驗證報告原文：容器內 swtest 測試帳號 home 下的 pipx／入口路徑（僅存在於一次性升級容器），
     # 非真人開發者的本機個人路徑；證據須保留原文供雜湊核對，允許放行。
     - "evidence/stage1/upgrade-docker/**"
+    # OD-09 凍結依據的兩平台基線判定檔（release-gate.json）原文：Linux 那份記錄了實機長跑當時受測 CLI 的實際
+    # 安裝路徑（測試機使用者 home 下的 serialwrap 安裝目錄），不含帳密。檔案雜湊被凍結提案、證據索引與門檻檔
+    # 三處釘住，不得改寫內容；擁有者 2026-11-21 同意放行（OD-109）。
+    - "evidence/stage0/baseline/**"
 code_paths:
   - "sw_core/**"
   - "tools/**"
