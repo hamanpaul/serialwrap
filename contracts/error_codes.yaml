@@ -155,7 +155,7 @@ codes:
     uart_tx: none
     agent_action: "縮短命令內容；limit 是 profile 的 console 單行上限時，做不到就把內容寫成腳本，以 file push 傳到 target 後執行。超過 4096 bytes 的軟上限仍會成功，但會附 CMD_LENGTH_WARNING 警告（非錯誤碼）"
     extra_fields: ["cmd_length", "limit", "hint"]
-    contract_tests: ["tests/test_issue27_newline_reject.py::TestNewlineReject::test_command_too_long_takes_priority", "tests/test_submit_console_line_limit.py::TestArbiterConsoleLineLimit::test_over_limit_rejected_without_enqueue", "tests/test_submit_console_line_limit.py::TestServiceUsesProfileLimit::test_profile_limit_rejects_with_zero_tx"]
+    contract_tests: ["tests/test_issue27_newline_reject.py::TestNewlineReject::test_command_too_long_takes_priority"]
     behavior_change: []
     sources: ["sw_core/arbiter.py:143"]
   - code: COMMAND_ABORTED_IN_FLIGHT
