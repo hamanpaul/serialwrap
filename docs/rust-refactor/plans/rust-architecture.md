@@ -1110,6 +1110,7 @@ Stage 0 測試鉤子（P5-T19，parity #3／#4／#68）：產品 build 亦讀 `S
 
 1. `server.stop_accept()`：停 accept 並 close listener、對全部連線設停止旗標，**不等**進行中的 handler（避免 600 s 的 `file.push` 卡住停止序）；閒置／半行連線 100 ms 內結束，handler 內的連線寫完該筆回應後結束。
    - 1a. `manager.begin_shutdown()`：stopping gate。之後熱插 Delta／Tick reattach、`RequestAttach`、bootstrap、bind／clear／recover／device.attach 重開一律不開 UART、不建 session 或 worker（RPC 路徑回 EXCEPTION `daemon stopping`）；已越過 gate 的在途 attach 納入第 3 步的 drain 集合；也擋住第 2 步 flash 結束時 SC-32 延後的 DeviceDetached reconcile 重開（R1-F2）。
+     - issue 282：若 echo-paced 傳輸持有尚未送行尾的命令列，先設待凍結並喚醒該傳輸；持有者最多用 750 ms 完成行尾，否則送 `\x15\n` 清行。所有 session 共用最多 1250 ms；實耗時間自第 3～5 步共用的 5 s drain 預算扣除。其他取消來源不變。
    - 1b. `watcher.stop()`：送停止訊號並最多等待 2 s；thread 收斂則 join，逾時輸出 WARNING 並 detach；channel 殘留的 Delta 由 1a gate 丟棄（gate 先於 watcher.stop，watcher 最後一輪送出的 Delta 也被擋下）。
    - 1c. `engine.close_intake()`：matcher 停止、dispatcher 不再 spawn handler；已在跑的 handler 不中斷，與第 3～5 步並行（P7 Task 15；P1 Python 為 engine.stop → watcher.stop → drain，Rust 把 engine 拆成 1c 關 intake 與 5a 有界收斂，handler 與 drain 並行而不先耗盡 5 s）。
 2. `flash_endpoint.stop()`：設 `EndpointShutdown`（唯一設定點）並喚醒本次 `FlashRunCancel`，join 端點 thread 2.0 s（Python `FlashEndpoint.stop` 的 join 值），pump 結束送 `FlashHolderGone`，unlink `/dev/ttyMCU`。位於 drain 之前，避免 pump 與 drain 同時持有 fence。回條 `joined==false` 或 `unlinked==false` → `incomplete` 記 `flash endpoint stop incomplete: <stalled_threads 以 , 串接>`。無端點（Windows）視為收斂。

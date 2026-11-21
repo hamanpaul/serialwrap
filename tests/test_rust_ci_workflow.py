@@ -175,6 +175,71 @@ def _assert_supervision_restart_sync_points(source: str) -> None:
         names = {c.id for c in ast.walk(node.test) if isinstance(c, ast.Name)}
         assert sliced_name in names, "chunk sentinel 的判定對象必須是位移之後的 bytes，不得改回整段 rx_log"
 
+    # issue 282：停機後輸入列必須已收尾，重啟殘留四項都採零容忍硬斷言。
+    assertions = {
+        ast.dump(node.test, include_attributes=False)
+        for node in ast.walk(func) if isinstance(node, ast.Assert)
+    }
+    strict_expressions = (
+        'not rx_at_restart or rx_at_restart.endswith(b"\\n")',
+        'residue["residual_input_bytes"] == 0',
+        'residue["residual_submitted_after_restart"] is False',
+        'residue["extra_chunk_commands"] == 0',
+        'residue["prompt_unavailable_seen"] is False',
+    )
+    for expression in strict_expressions:
+        expected = ast.dump(ast.parse(expression, mode="eval").body, include_attributes=False)
+        assert expected in assertions, f"停止後殘留判準必須保留嚴格斷言：{expression}"
+    calls = [node for node in ast.walk(func) if isinstance(node, ast.Call)]
+    assert not any(_call_name(node) == "warnings.warn" for node in calls), "issue 282 判準不得降級為 warning"
+    loose_bound = ast.dump(
+        ast.parse('residue["extra_chunk_commands"] <= 1', mode="eval").body,
+        include_attributes=False,
+    )
+    assert loose_bound not in assertions, "issue 282 不得接受一個額外 chunk"
+
+
+def test_restart_residue_report_with_fake_observations():
+    """以替身 bytes／command list 驗證殘留 helper，不啟動 daemon 或 DUT。"""
+    source = (REPO_ROOT / "tests/contract_blackbox/test_s24_supervision_systemd.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    helper = next(
+        (node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_restart_residue_report"),
+        None,
+    )
+    assert helper is not None, "test_s24_supervision_systemd.py 缺少純計算 helper"
+    namespace: dict[str, Any] = {}
+    module = ast.Module(body=[helper], type_ignores=[])
+    exec(compile(module, "test_s24_supervision_systemd.py", "exec"), namespace)
+    report = namespace["_restart_residue_report"]
+
+    clean = report(b"chunk\n", b"\n$ ", 2, ["SW_XFER_CHUNK_0", "SW_XFER_CHUNK_1"], [])
+    assert clean["residual_input_bytes"] == 0
+    assert clean["residual_submitted_after_restart"] is False
+    assert clean["extra_chunk_commands"] == 0
+    assert clean["prompt_unavailable_seen"] is False
+
+    dirty = report(
+        b"chunk\nprintf '%s' 'partial", b"\n$ ", 2,
+        ["SW_XFER_CHUNK_0", "SW_XFER_CHUNK_1", "SW_XFER_CHUNK_2"], ["PROMPT_UNAVAILABLE"],
+    )
+    assert dirty["residual_input_bytes"] > 0
+    assert dirty["residual_submitted_after_restart"] is True
+    assert dirty["extra_chunk_commands"] == 1
+    assert dirty["prompt_unavailable_seen"] is True
+
+    cleared = report(b"chunk\nprintf '%s' 'partial", b"\x15\n$ ", 2,
+                     ["SW_XFER_CHUNK_0", "SW_XFER_CHUNK_1"], [])
+    assert cleared["residual_submitted_after_restart"] is False
+
+
+def test_midline_blackbox_cutpoint_matches_unquoted_chunk_prefix():
+    source = (REPO_ROOT / "tests/contract_blackbox/test_s24_supervision_systemd.py").read_text(encoding="utf-8")
+    expected_prefix = "rb\"printf '%s' [A-Za-z0-9+/=]+\""
+    old_prefix = "b\"printf '%s' '"
+    assert expected_prefix in source
+    assert old_prefix not in source
+
 
 def test_rust_workflow_exists_and_triggers_on_pull_request():
     """驗證 .github/workflows/rust.yml 存在且觸發條件含 pull_request。"""

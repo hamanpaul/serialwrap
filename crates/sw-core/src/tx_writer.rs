@@ -17,6 +17,7 @@ use sw_pal::{
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 
 use crate::mailbox::ControlEvent;
+use crate::uart_bridge::RunCancel;
 use crate::wal::{WalAppend, WalAppendReq, WalHealthSink, WalWriter};
 
 /// 未結算 op 上限；滿時新 op 一律不提交（見 saturation）。
@@ -126,6 +127,10 @@ pub struct FenceState {
     /// 者）。manager 的 shutdown 據此不略過 DETACHED／RELEASED 但仍有退休 bridge 未確認關閉的 session（DR-4 b）。不影響
     /// `admit`。
     pub retired_drains_pending: bool,
+    /// issue 282：正在送一行 echo-paced 命令本文的檔案傳輸 op。
+    pub transfer_line: Option<OpId>,
+    /// issue 282：停機凍結等待持有中的傳輸行收尾。
+    pub shutdown_freeze_pending: bool,
 }
 
 /// P8 Task 14：[`Fence::freeze_for_handoff`] 的結果。
@@ -137,6 +142,13 @@ pub enum HandoffFreeze {
     InFlight,
     /// OS 提交持 fence 鎖直到期限，旗標未設（不需撤銷）。
     Locked,
+}
+
+/// issue 282：停機凍結是否需等待目前持有中的傳輸行。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownFreeze {
+    Frozen,
+    PendingLine,
 }
 
 /// 撤銷 op 的 tombstone 上限（Python `uart_io._TX_ACCOUNT_MAX`；parity-amendments-2026-10-26 #38）。
@@ -201,8 +213,61 @@ impl FenceState {
 }
 
 /// TX fence：`0` 為 fence 狀態（OS 提交在其鎖內進行，見 [`FenceSubmitGate`]）；`1` 為 `handoff_frozen` 的不取鎖鏡像
-/// （每次 [`Fence::with`]／[`Fence::try_with`] 結束前於鎖內發布，見 [`Fence::handoff_frozen_published`]）。
-pub struct Fence(Mutex<FenceState>, AtomicBool, AtomicBool, Mutex<()>);
+/// （每次 [`Fence::with`]／[`Fence::try_with`] 結束前於鎖內發布，見 [`Fence::handoff_frozen_published`]）；`4` 是 issue 282
+/// 待凍結時用來喚醒傳輸行持有者的軟旗標。
+pub struct Fence(Mutex<FenceState>, AtomicBool, AtomicBool, Mutex<()>, Mutex<Option<RunCancel>>);
+
+#[cfg(test)]
+mod shutdown_publication_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn settling_shutdown_publishes_only_after_acquiring_fence_state_lock() {
+        let fence = Fence::new();
+        let rx = crate::uart_bridge::RxShared::new(1024, 0);
+        assert!(fence.open_transfer_line(OpId(11), RunCancel::new(&rx)));
+
+        // 模擬傳送閘門持有 fence 狀態鎖時停機到達；停機旗標必須等到同一把鎖，
+        // 才能與 pending/frozen 狀態一起發布。
+        let state_guard = fence.0.lock().unwrap();
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        let stop_fence = fence.clone();
+        let stop = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            stop_fence.freeze_for_shutdown_settling()
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "停機執行緒未進入 fence 狀態鎖的等待"
+            );
+            assert!(
+                !fence.shutdown_started_published(),
+                "取得 fence 狀態鎖前不得先發布停機旗標"
+            );
+            match fence.3.try_lock() {
+                Ok(start_guard) => drop(start_guard),
+                Err(TryLockError::Poisoned(poisoned)) => drop(poisoned.into_inner()),
+                Err(TryLockError::WouldBlock) => break,
+            }
+            std::thread::yield_now();
+        }
+
+        // 舊順序會在持有 fence 狀態鎖時先發布原子旗標；讓執行緒越過該步後
+        // 再確認旗標仍未發布，避免只觀察到剛啟動的瞬間。
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            !fence.shutdown_started_published(),
+            "停機旗標不得早於待凍結／凍結狀態發布"
+        );
+        drop(state_guard);
+        assert_eq!(stop.join().unwrap(), ShutdownFreeze::PendingLine);
+    }
+}
 
 impl Fence {
     pub fn new() -> Arc<Fence> {
@@ -228,10 +293,13 @@ impl Fence {
                 bridge_passthrough: false,
                 handoff_frozen: false,
                 retired_drains_pending: false,
+                transfer_line: None,
+                shutdown_freeze_pending: false,
             }),
             AtomicBool::new(false),
             AtomicBool::new(false),
             Mutex::new(()),
+            Mutex::new(None),
         ))
     }
 
@@ -249,6 +317,86 @@ impl Fence {
             self.2.store(true, Ordering::SeqCst);
         }
         self.with(|state| state.frozen = true);
+    }
+
+    /// issue 282：有傳輸行持有時先發布待凍結並軟喚醒持有者；否則立即凍結。
+    pub fn freeze_for_shutdown_settling(&self) -> ShutdownFreeze {
+        let start = self.lock_command_start();
+        let (result, settle) = self.with(|state| {
+            // 與 FenceSubmitGate 共用同一把狀態鎖發布旗標和 pending/frozen，
+            // 避免持有者在旗標已設、待凍結狀態尚未可見的窗口被誤拒。
+            self.2.store(true, Ordering::SeqCst);
+            if state.transfer_line.is_some() && !state.frozen && !state.handoff_frozen {
+                let settle = self
+                    .4
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                if let Some(settle) = settle {
+                    state.shutdown_freeze_pending = true;
+                    return (ShutdownFreeze::PendingLine, Some(settle));
+                }
+            }
+            state.shutdown_freeze_pending = false;
+            state.frozen = true;
+            (ShutdownFreeze::Frozen, None)
+        });
+        drop(start);
+
+        if let Some(settle) = settle {
+            settle.trigger();
+        }
+        result
+    }
+
+    /// issue 282：等待期限到時，清除 pending 並強制凍結。
+    pub fn force_shutdown_freeze(&self) {
+        {
+            let _start = self.lock_command_start();
+            self.2.store(true, Ordering::SeqCst);
+        }
+        self.with(|state| {
+            state.shutdown_freeze_pending = false;
+            state.frozen = true;
+        });
+    }
+
+    /// 登記目前由 `op` 持有的 echo-paced 傳輸行。凍結或已有人持有時拒絕登記。
+    pub fn open_transfer_line(&self, op: OpId, settle: RunCancel) -> bool {
+        self.with(|state| {
+            if self.2.load(Ordering::SeqCst)
+                || state.frozen
+                || state.handoff_frozen
+                || state.shutdown_freeze_pending
+                || state.transfer_line.is_some()
+            {
+                return false;
+            }
+            state.transfer_line = Some(op);
+            *self
+                .4
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(settle);
+            true
+        })
+    }
+
+    /// 解除 `op` 的行持有；若停機正在等待，於同一 fence 臨界區內完成凍結。
+    pub fn close_transfer_line(&self, op: OpId) {
+        self.with(|state| {
+            if state.transfer_line != Some(op) {
+                return;
+            }
+            state.transfer_line = None;
+            *self
+                .4
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            if state.shutdown_freeze_pending {
+                state.shutdown_freeze_pending = false;
+                state.frozen = true;
+            }
+        });
     }
 
     /// 不取 fence 鎖讀取停機 gate，供 SessionCore 在 `start_next` 同步阻止新命令出列。
@@ -325,6 +473,11 @@ impl Fence {
 
     pub fn admit(st: &FenceState, p: &TxPermit) -> Result<(), FenceReject> {
         if st.frozen || st.handoff_frozen {
+            return Err(FenceReject::Frozen);
+        }
+        if st.shutdown_freeze_pending
+            && !(p.class == TxClass::FileTransfer && st.transfer_line == Some(p.op_id))
+        {
             return Err(FenceReject::Frozen);
         }
         if st.active_epoch != Some(p.epoch) {
@@ -449,7 +602,10 @@ impl SubmitGate for FenceSubmitGate<'_> {
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.fence.shutdown_started_published() {
+        let pending_line_holder = state.shutdown_freeze_pending
+            && self.permit.class == TxClass::FileTransfer
+            && state.transfer_line == Some(self.permit.op_id);
+        if self.fence.shutdown_started_published() && !pending_line_holder {
             self.last_reject.set(Some(FenceReject::Frozen));
             return Err(SubmitRevoked);
         }
@@ -638,6 +794,16 @@ impl TxWriterHandle {
     /// 分類「此刻送出會被拒的原因」；不是授權——真正的授權仍在每次 OS 提交的 gate 內重驗。
     pub fn fence_verdict(&self, permit: &TxPermit) -> Result<(), FenceReject> {
         self.fence.with(|state| Fence::admit(state, permit))
+    }
+
+    /// issue 282：將目前 echo-paced 行的取消／軟喚醒旗標登記到 Fence。
+    pub fn open_transfer_line(&self, op: OpId, settle: RunCancel) -> bool {
+        self.fence.open_transfer_line(op, settle)
+    }
+
+    /// issue 282：解除目前 echo-paced 行在 Fence 上的持有。
+    pub fn close_transfer_line(&self, op: OpId) {
+        self.fence.close_transfer_line(op);
     }
 
     /// 非阻塞（actor executor 呼叫）：try_send；Full 時回 false 並 settle_dropped+=1。

@@ -1987,6 +1987,7 @@ def test_released_survives_two_restarts_and_replug(sw_env, shell_target):
   1a. manager.begin_shutdown()          # P5 Task 16 stopping gate（R1-F2）：持 manager 鎖設 stopping；之後熱插 Delta／Tick reattach、RequestAttach、bootstrap、
                                         #   bind／clear／recover／device.attach 重開一律不 open、不建 session／worker（RPC 路徑回 EXCEPTION `daemon stopping`）；
                                         #   已越過 gate 的 inflight attach 納入步驟 3 的 drain 集合；也擋住步驟 2 flash 結束時 SC-32 延後的 DeviceDetached reconcile 觸發重開
+                                        #   issue 282：有 echo-paced 行持有時待凍結並喚醒持有者；750 ms 內完成行尾，否則送 `\x15\n`；所有 session 共用最多 1250 ms，實耗自步驟 3～5 的 5 s 預算扣除
   1b. watcher.stop()                    # P5 ②：停 DeviceWatcher thread 並 join；channel 殘留 Delta 由 1a gate 丟棄
   1c. engine.close_intake()             # P7 Task 15：matcher 停、dispatcher 不再 spawn handler；已在跑的 handler 不中斷，與步驟 3～5 並行
   2. flash_endpoint.stop()              # 設 EndpointShutdown（唯一設定點）＋wake 本次 FlashRunCancel + join 2.0 s；pump 結束 → FlashHolderGone；unlink ttyMCU（Task 9 receipt）

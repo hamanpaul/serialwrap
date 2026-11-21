@@ -117,6 +117,8 @@ pub fn device_sort_key(by_id: &str, by_path: Option<&str>) -> (String, String) {
 
 /// actor 請求的一般等待上限（manager 內部查詢）。
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+/// issue 282：停機最多等待 echo-paced 命令列收尾的共用期限。
+const SHUTDOWN_LINE_SETTLE_BUDGET: Duration = Duration::from_millis(1250);
 /// `SessionManager::attach_released_placeholder` 的回覆上限（佔位開埠可能阻塞；同 sw-daemon 的 RPC 路由上限）。
 const PLACEHOLDER_ATTACH_TIMEOUT: Duration = Duration::from_secs(60);
 /// 動態偵測的 probe 等待（`detect_template(probe_timeout_s=3.0)`）。
@@ -725,6 +727,8 @@ struct Shared {
     probe_tx_frozen: AtomicBool,
     /// P8 Task 14：在途 PROBE fence 與交接凍結旗標（見 [`HandoffProbes`]）。
     handoff_probes: Mutex<HandoffProbes>,
+    /// issue 282：`begin_shutdown` 等待傳輸行收尾所耗時間，供 daemon 從 drain 預算扣除。
+    shutdown_line_settle_spent: Mutex<Duration>,
     /// P7 Task 16-wire：RX 觀察者（Python `add_rx_observer`）；每個 session bridge 的 reader 建立時取快照。
     rx_observers: Mutex<Vec<Arc<dyn crate::uart_bridge::RxObserver>>>,
     /// P6（sol 補審 #2）：human line mode basename 的路徑風格（`caps.path_flavor`）。
@@ -6635,6 +6639,7 @@ impl SessionManager {
             persist_observer: Mutex::new(None),
             probe_tx_frozen: AtomicBool::new(false),
             handoff_probes: Mutex::new(HandoffProbes::default()),
+            shutdown_line_settle_spent: Mutex::new(Duration::ZERO),
             rx_observers: Mutex::new(Vec::new()),
             path_flavor: caps.path_flavor,
             #[cfg(feature = "test-fakes")]
@@ -8507,12 +8512,19 @@ impl SessionManager {
             probes.frozen = true;
             probes.live.clone()
         };
+        let mut pending = Vec::new();
         for (_, _, fence) in &entries {
-            fence.freeze_for_shutdown();
+            if fence.freeze_for_shutdown_settling() == crate::tx_writer::ShutdownFreeze::PendingLine {
+                pending.push(fence.clone());
+            }
         }
         for fence in &probes {
-            fence.freeze_for_shutdown();
+            if fence.freeze_for_shutdown_settling() == crate::tx_writer::ShutdownFreeze::PendingLine {
+                pending.push(fence.clone());
+            }
         }
+        let settle_spent = wait_shutdown_line_settle(pending, SHUTDOWN_LINE_SETTLE_BUDGET);
+        *lock(&self.shared.shutdown_line_settle_spent) = settle_spent;
 
         // safety lane 讓停機沖刷越過一般控制佇列；回條確認 queue 已清，且目前前景工作仍可正常收尾。
         let deadline = Instant::now() + QUERY_TIMEOUT;
@@ -8532,6 +8544,11 @@ impl SessionManager {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let _ = rx.recv_timeout(remaining);
         }
+    }
+
+    /// issue 282：`begin_shutdown` 等待待凍結傳輸行的耗時，daemon 以此扣除 Phase 1～2 的 drain 預算。
+    pub fn shutdown_line_settle_spent(&self) -> Duration {
+        *lock(&self.shared.shutdown_line_settle_spent)
     }
 
     /// P8 Task 14：交接停止成立前凍結背景來源與既有 bridge 的新 TX（Python `SessionManager.freeze_for_handoff`）。
@@ -9201,6 +9218,30 @@ impl Drop for SessionManager {
     }
 }
 
+/// 等待所有待凍結 fence 共用同一個期限；逾時者在返回前強制凍結。
+fn wait_shutdown_line_settle(mut pending: Vec<Arc<Fence>>, budget: Duration) -> Duration {
+    if pending.is_empty() {
+        return Duration::ZERO;
+    }
+
+    let started = Instant::now();
+    let deadline = started + budget;
+    loop {
+        pending.retain(|fence| fence.try_with(|state| state.frozen) != Some(true));
+        if pending.is_empty() || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    for fence in &pending {
+        fence.force_shutdown_freeze();
+    }
+    started.elapsed()
+}
+
+
+
 /// Event Engine 查詢（`session_manager.py:1499-1519`）：讀 manager 鏡像與 actor 發布到 fence 的 `foreground_busy`，
 /// 不經 actor mailbox。`active_cmd_id_for` 只回字面 `"foreground"`（EVT-D-E3 KEEP）。
 impl crate::event_engine::BridgeQueries for SessionManager {
@@ -9229,5 +9270,74 @@ impl crate::event_engine::BridgeQueries for SessionManager {
             .collect();
         coms.sort();
         coms
+    }
+}
+
+#[cfg(test)]
+mod shutdown_line_settle_tests {
+    use super::*;
+    use crate::uart_bridge::{RunCancel, RxShared};
+    use crate::tx_writer::{OpId, ShutdownFreeze};
+
+    fn pending_fence(op: u64) -> Arc<Fence> {
+        let fence = Fence::new();
+        let rx = RxShared::new(1024, 0);
+        assert!(fence.open_transfer_line(OpId(op), RunCancel::new(&rx)));
+        assert_eq!(fence.freeze_for_shutdown_settling(), ShutdownFreeze::PendingLine);
+        fence
+    }
+
+    #[test]
+    fn line_settle_wait_returns_when_line_closes() {
+        let fence = pending_fence(1);
+        let close_fence = fence.clone();
+        let close = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            close_fence.close_transfer_line(OpId(1));
+        });
+
+        let started = Instant::now();
+        let spent = wait_shutdown_line_settle(vec![fence.clone()], SHUTDOWN_LINE_SETTLE_BUDGET);
+        close.join().unwrap();
+
+        assert!(spent < Duration::from_millis(1_000), "等待應在期限前返回：{spent:?}");
+        assert!(started.elapsed() < Duration::from_millis(1_000));
+        fence.with(|state| {
+            assert!(state.frozen);
+            assert!(!state.shutdown_freeze_pending);
+        });
+    }
+
+    #[test]
+    fn line_settle_wait_forces_freeze_after_budget() {
+        let fence = pending_fence(2);
+        let spent = wait_shutdown_line_settle(vec![fence.clone()], SHUTDOWN_LINE_SETTLE_BUDGET);
+
+        assert!(
+            (SHUTDOWN_LINE_SETTLE_BUDGET..=Duration::from_millis(2_500)).contains(&spent),
+            "等待應在 1250 ms 到 2.5 s 間結束：{spent:?}"
+        );
+        fence.with(|state| {
+            assert!(state.frozen);
+            assert!(!state.shutdown_freeze_pending);
+        });
+    }
+
+    #[test]
+    fn line_settle_wait_shares_one_deadline() {
+        let first = pending_fence(3);
+        let second = pending_fence(4);
+        let spent = wait_shutdown_line_settle(vec![first.clone(), second.clone()], SHUTDOWN_LINE_SETTLE_BUDGET);
+
+        assert!(
+            (SHUTDOWN_LINE_SETTLE_BUDGET..=Duration::from_millis(2_500)).contains(&spent),
+            "兩個 fence 必須共用 1250 ms deadline：{spent:?}"
+        );
+        for fence in [first, second] {
+            fence.with(|state| {
+                assert!(state.frozen);
+                assert!(!state.shutdown_freeze_pending);
+            });
+        }
     }
 }
