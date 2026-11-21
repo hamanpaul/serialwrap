@@ -350,8 +350,9 @@ def validate_baseline(stats: BaselineStats, *, acceptance_path: Path) -> list[st
     limit = (float(wl["max_observation_gap_factor"]) * stats.snapshot_interval_s
              + float(wl["observation_gap_tolerance_s"]))
     if stats.max_snapshot_gap_s > limit:
-        problems.append(f"snapshot gap {stats.max_snapshot_gap_s}s 超過 {wl['max_observation_gap_factor']}×"
-                        f"{stats.snapshot_interval_s}s（不得拼接 segments）")
+        problems.append(f"snapshot gap {stats.max_snapshot_gap_s}s 超過上限 {limit:g}s"
+                        f"（{wl['max_observation_gap_factor']}×{stats.snapshot_interval_s}s"
+                        f"＋容差 {wl['observation_gap_tolerance_s']}s；不得拼接 segments）")
     for key in sorted(stats.hourly_done):
         if int(stats.hourly_done[key]["min"]) == 0:
             problems.append(f"{key} 有完整小時 completed 為 0（load stop）")
