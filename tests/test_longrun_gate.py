@@ -531,6 +531,31 @@ def test_observation_gap_insufficient(tmp_path):
     assert check["detail"]["gaps"]
 
 
+@pytest.mark.parametrize(("extra_s", "expected"), [(0.5, "PASS"), (1.0, "PASS"), (1.5, "INSUFFICIENT_EVIDENCE")])
+def test_observation_gap_tolerates_one_second_measurement_error(tmp_path, extra_s, expected):
+    """OD-107（2026-11-20）：缺口超出 max_observation_gap_factor × interval 不超過 1 秒視為量測誤差。
+
+    漏一筆取樣的間隔是 20 s 加減抖動（Windows 長跑實測 20.017／20.019 s 被判缺口、19.987 s 不判）；
+    超出 1 秒以上（例如漏一筆再加 1.5 s）仍是缺口。
+    """
+    gate = _gate()
+    run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")
+    rows = []
+    for row in run.observer:
+        if row.get("kind") == "sample":
+            t = row.get("t_mono", -1)
+            if t == 3610:
+                continue  # 漏一筆：3600 → 3620 的間隔為 20 s
+            if t == 3620:
+                # gate 以 wall_ts 換算相對時間（無 wall_ts 才用 t_mono），兩者一起後移
+                row = dict(row, t_mono=3620 + extra_s,
+                           wall_ts=(run.started + timedelta(seconds=3620 + extra_s)).isoformat())
+        rows.append(row)
+    run.set_observer(rows)
+    out = gate.evaluate(run.inputs(mode="baseline"))
+    assert _check(out, "observation_gaps")["result"] == expected
+
+
 def test_unresolved_stays_in_denominator(tmp_path):
     gate = _gate()
     run = LongrunFixture(tmp_path).healthy(hours=48, platform="linux")

@@ -44,6 +44,7 @@
         "snapshot_interval_s",
         "observer_interval_s",
         "max_observation_gap_factor",
+        "observation_gap_tolerance_s",
         "windows_excl_probe_interval_s"
       ],
       "additionalProperties": false,
@@ -78,6 +79,11 @@
         "max_observation_gap_factor": {
           "type": "number",
           "minimum": 1
+        },
+        "observation_gap_tolerance_s": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 5
         },
         "windows_excl_probe_interval_s": {
           "type": "integer",
