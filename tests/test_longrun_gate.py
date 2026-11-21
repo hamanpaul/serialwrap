@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+import fakes_od09
+
 
 pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
@@ -88,14 +90,15 @@ class LongrunFixture:
             "evidence": {"analysis": "synthetic"},
         }
         self.deployed_content = None
-        self._acceptance = _yaml().safe_load(ACCEPTANCE_SOURCE.read_text(encoding="utf-8"))
+        # 起點一律是「延後項尚未凍結」的門檻內容：由真門檻檔衍生，不受真檔是否已凍結影響。
+        self._acceptance = fakes_od09.deferred_acceptance()
         self._excl_path = self.excl_dir
 
     def healthy(self, *, hours: int = 48, platform: str = "linux", started_at: str | None = None):
         self.platform = platform
         self.started = datetime.fromisoformat(started_at) if started_at else START
         self.duration_s = hours * 3600
-        self._acceptance = _yaml().safe_load(ACCEPTANCE_SOURCE.read_text(encoding="utf-8"))
+        self._acceptance = fakes_od09.deferred_acceptance()
         self._write_acceptance(self._acceptance)
 
         start_event = self._event("start", 0)

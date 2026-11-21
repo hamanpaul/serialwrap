@@ -6,9 +6,12 @@ import ast
 import copy
 import json
 import re
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
+
+import fakes_od09
 
 
 pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
@@ -29,6 +32,36 @@ def _load_acceptance_and_schema():
 
 def _validate_rejected(validator, schema, value):
     assert list(validator(schema).iter_errors(value))
+
+
+def _assert_deferred_item(threshold, fields, state):
+    """延後項在指定狀態下的形狀：deferred 時值全為 null 且沒有凍結紀錄；frozen 時值全非 null 且凍結紀錄齊備。"""
+    assert threshold["status"] == state
+    assert set(threshold["per_platform"]) == {"linux", "windows"}
+    for platform in ("linux", "windows"):
+        values = threshold["per_platform"][platform]
+        assert set(values) == fields
+        if state == "deferred":
+            assert all(value is None for value in values.values())
+        else:
+            assert all(value is not None for value in values.values())
+    record_fields = set(fakes_od09.FREEZE_RECORD_FIELDS) if state == "frozen" else set()
+    assert set(threshold) == fakes_od09.DEFERRED_ITEM_KEYS | record_fields
+
+
+def _assert_single_freeze_record(thresholds, keys):
+    """三個延後項由同一次凍結寫入：時點為 UTC、凍結紀錄三項一致、overrides 記錄的值就是生效值。"""
+    first = thresholds[keys[0]]
+    assert datetime.fromisoformat(first["frozen_at"]).utcoffset() == timedelta(0)
+    for key in keys:
+        item = thresholds[key]
+        for field in ("frozen_at", "decision_id", "approved_by", "proposal_sha256", "baseline_evidence"):
+            assert item[field] == first[field], (key, field)
+        assert item["decision_id"].strip() and item["approved_by"].strip()
+        for path, value in item["overrides"].items():
+            section, per_platform, platform, field = path.split(".")
+            assert (section, per_platform) == (key, "per_platform")
+            assert item["per_platform"][platform][field] == value
 
 
 def test_acceptance_file_schema():
@@ -53,49 +86,57 @@ def test_acceptance_file_schema():
             "max_reruns",
         },
     }
+    # 真門檻檔的延後項只有兩種合法狀態，凍結前後都必須成立其一：三項皆 deferred（值全為 null），
+    # 或三項由同一次凍結寫入（值全非 null、凍結紀錄齊備）。三項狀態不一致即失敗。
+    state = fakes_od09.acceptance_freeze_state(acceptance)
+    deferred = fakes_od09.deferred_acceptance(acceptance)
     for key, fields in deferred_fields.items():
-        threshold = thresholds[key]
-        assert threshold["status"] == "deferred"
-        assert set(threshold["per_platform"]) == {"linux", "windows"}
-        for platform in ("linux", "windows"):
-            values = threshold["per_platform"][platform]
-            assert set(values) == fields
-            assert all(value is None for value in values.values())
+        _assert_deferred_item(thresholds[key], fields, state)
+        _assert_deferred_item(deferred["thresholds"][key], fields, "deferred")
+    if state == "frozen":
+        _assert_single_freeze_record(thresholds, tuple(deferred_fields))
 
-        for platform in ("linux", "windows"):
-            missing_platform = copy.deepcopy(acceptance)
-            del missing_platform["thresholds"][key]["per_platform"][platform]
-            _validate_rejected(validator, schema, missing_platform)
+    # schema 的拒絕案例對真檔與衍生的 deferred 內容各跑一次：真檔凍結後，兩種形狀都仍驗得到。
+    for document in (acceptance, deferred):
+        validator(schema).validate(document)
+        for key, fields in deferred_fields.items():
+            for platform in ("linux", "windows"):
+                missing_platform = copy.deepcopy(document)
+                del missing_platform["thresholds"][key]["per_platform"][platform]
+                _validate_rejected(validator, schema, missing_platform)
 
-        scalar_platform = copy.deepcopy(acceptance)
-        scalar_platform["thresholds"][key]["per_platform"]["linux"] = 123
-        _validate_rejected(validator, schema, scalar_platform)
+            scalar_platform = copy.deepcopy(document)
+            scalar_platform["thresholds"][key]["per_platform"]["linux"] = 123
+            _validate_rejected(validator, schema, scalar_platform)
 
-        scalar_threshold = copy.deepcopy(acceptance)
-        scalar_threshold["thresholds"][key]["per_platform"] = 123
-        _validate_rejected(validator, schema, scalar_threshold)
+            scalar_threshold = copy.deepcopy(document)
+            scalar_threshold["thresholds"][key]["per_platform"] = 123
+            _validate_rejected(validator, schema, scalar_threshold)
 
-        extra_field = copy.deepcopy(acceptance)
-        extra_field["thresholds"][key]["per_platform"]["linux"]["unexpected"] = 1
-        _validate_rejected(validator, schema, extra_field)
+            extra_field = copy.deepcopy(document)
+            extra_field["thresholds"][key]["per_platform"]["linux"]["unexpected"] = 1
+            _validate_rejected(validator, schema, extra_field)
 
-        direct_numeric_field = copy.deepcopy(acceptance)
-        direct_numeric_field["thresholds"][key][next(iter(fields))] = 1
-        _validate_rejected(validator, schema, direct_numeric_field)
+            direct_numeric_field = copy.deepcopy(document)
+            direct_numeric_field["thresholds"][key][next(iter(fields))] = 1
+            _validate_rejected(validator, schema, direct_numeric_field)
 
-    tolerance_subtree = copy.deepcopy(acceptance)
-    tolerance_subtree["thresholds"]["comparison_uncertainty"]["tolerance"] = {"value": 0.1}
-    _validate_rejected(validator, schema, tolerance_subtree)
+        tolerance_subtree = copy.deepcopy(document)
+        tolerance_subtree["thresholds"]["comparison_uncertainty"]["tolerance"] = {"value": 0.1}
+        _validate_rejected(validator, schema, tolerance_subtree)
 
-    frozen_with_null = copy.deepcopy(acceptance)
-    frozen_with_null["thresholds"]["resources"]["status"] = "frozen"
-    _validate_rejected(validator, schema, frozen_with_null)
+        # 只翻 status、不動數值：deferred 內容標成 frozen（值仍為 null），或 frozen 內容標回 deferred
+        # （值仍非 null），schema 都必須拒絕。
+        flipped_status = copy.deepcopy(document)
+        resources = flipped_status["thresholds"]["resources"]
+        resources["status"] = "frozen" if resources["status"] == "deferred" else "deferred"
+        _validate_rejected(validator, schema, flipped_status)
 
-    scalar_min_load = copy.deepcopy(acceptance)
-    scalar_min_load["thresholds"]["min_effective_load"]["per_platform"]["linux"][
-        "min_completed_per_board_source"
-    ] = 100
-    _validate_rejected(validator, schema, scalar_min_load)
+        scalar_min_load = copy.deepcopy(document)
+        scalar_min_load["thresholds"]["min_effective_load"]["per_platform"]["linux"][
+            "min_completed_per_board_source"
+        ] = 100
+        _validate_rejected(validator, schema, scalar_min_load)
 
 
 def test_allowed_source_regex_matches_engine():
