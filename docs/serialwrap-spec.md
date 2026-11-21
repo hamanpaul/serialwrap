@@ -321,7 +321,7 @@ Agent 收到 sentinel 後應短暫 sleep 後重試，而非視為錯誤。
 
 #### `_recover_after_failure` 語義
 
-當前景命令因 `PROMPT_TIMEOUT` 失敗後，`_recover_after_failure()` 會嘗試透過 `Ctrl-C` / `Ctrl-D` 恢復 prompt。若成功恢復：
+當前景命令因 `PROMPT_TIMEOUT` 失敗後，`_recover_after_failure()` 會嘗試透過 `Ctrl-C` / `Ctrl-D` 恢復 prompt（實際送哪些鍵依 profile 的 `timeout_recovery_keys`，預設兩者依序都送；出貨 `prpl-template` 只送 `Ctrl-C`）。若成功恢復：
 
 - 回傳 `ok: true`（表示 session 已回到可用狀態）
 - 保留 `error_code: PROMPT_TIMEOUT_RECOVERED`
@@ -883,6 +883,7 @@ targets:
     - "^BCM\\d+>> $"  # Broadcom BCM 系列 bootloader
   ```
 - `boot_done_regex`：開機完成訊號 regex（字串，預設空＝不設）。boot quiet window 期間 RX 命中即提早解除，與 `login_regex`／`prompt_regex` 同列判定，同樣受 `bootloader_prompts` 尾行例外約束；**不參與登入流程**（不會因命中而送帳密）。target 可覆寫。出貨 `prpl-template` 設為 `"Please press Enter to activate this console"`。
+- `timeout_recovery_keys`：命令逾時（以及 `READY` 時的 `session recover`）由 `_recover_after_failure` 依序送出的恢復按鍵，YAML list，元素只能是 `CTRL_C`、`CTRL_D` 且不得重複，內部以 `tuple[str, ...]` 儲存；預設 `[CTRL_C, CTRL_D]`（既有行為）；出貨 `prpl-template` 設為 `[CTRL_C]`。`[CTRL_C]` 不送 `CTRL_D`（避免把已登入的 shell 登出），`[]` 完全不送；清單內的鍵都救不回 prompt 時照既有收尾（`PROMPT_TIMEOUT`、session 轉 `ATTACHED`，`system:recover` 來源再走 force clear＋reattach）。省略或 `null` 取預設，target 省略或 `null` 繼承 template；未知鍵名、重複或非 list 在載入時拋 `ValueError`。boot quiet window、passthrough 與 bare human 來源的既有例外不變。
 
 ### 13.3 Platform 行為
 
