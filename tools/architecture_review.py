@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -97,18 +98,31 @@ def main():
         actual = hashlib.sha256((root / name).read_bytes()).hexdigest()
         if actual != toolchain["sha256"][name]:
             raise ValueError(f"交付檔案 hash 漂移：{name}")
+    if toolchain["source_revision"] != result["source_revision"]:
+        raise ValueError("toolchain 的來源 revision 與 facts 不一致")
+    # CI 重建用的引擎必須與 toolchain 釘的是同一個 commit，且必須關閉 Archify 的連網更新檢查。
+    workflow = (repo / ".github/workflows/architecture-html.yml").read_text(encoding="utf-8")
+    if f"ref: {toolchain['archify_revision']}" not in workflow or "ARCHIFY_UPDATE_CHECK_DISABLED: '1'" not in workflow:
+        raise ValueError("CI workflow 的 Archify 釘選或更新檢查設定與 toolchain 不一致")
     if args.archify_root:
         engine = args.archify_root.resolve()
         pin = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=engine, text=True).strip()
         if pin != toolchain["archify_revision"]:
             raise ValueError("原生 Archify 版本不符")
+        release = load(engine / "skill-release.json")
+        if release.get("version") != toolchain["archify_version"]:
+            raise ValueError("原生 Archify release 版本不符")
+        # Archify 3.x 的 deliver 內含更新檢查（會連上游 manifest）；重建必須離線且可重現，以官方環境變數關閉。
+        env = {**os.environ, "ARCHIFY_UPDATE_CHECK_DISABLED": "1"}
         with tempfile.TemporaryDirectory(prefix="serialwrap-architecture-") as td:
             output = Path(td) / "architecture.html"
-            cp = subprocess.run(["node", str(engine / "bin/archify.mjs"), "deliver", "architecture", str(root / "architecture.json"), str(output), "--repo-root", str(repo), "--quality", "showcase", "--json"], capture_output=True, text=True, check=True, timeout=120)
+            cp = subprocess.run(["node", str(engine / "bin/archify.mjs"), "deliver", "architecture", str(root / "architecture.json"), str(output), "--repo-root", str(repo), "--quality", "showcase", "--json"], capture_output=True, text=True, check=True, timeout=120, env=env)
             receipt = json.loads(cp.stdout)
             gate = receipt["validation"]
             if gate["checksPassed"] != 9 or gate["checkCount"] != 9 or gate["errors"] or gate["warnings"]:
                 raise ValueError("原生 9/9 gate 未通過")
+            if receipt["update"].get("reason") != "disabled" or receipt["update"].get("noticeRequired"):
+                raise ValueError("重建時 Archify 更新檢查未關閉")
             if output.read_bytes() != (root / "architecture.html").read_bytes():
                 raise ValueError("HTML 並非此 IR 的逐位元組原生輸出")
             result["native_delivery"] = receipt

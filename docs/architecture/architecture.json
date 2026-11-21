@@ -2,79 +2,77 @@
   "schema_version": 1,
   "diagram_type": "architecture",
   "meta": {
-    "title": "serialwrap｜命令、Session 與 UART",
+    "title": "serialwrap 0.5.0｜命令、Session 與 UART",
+    "locale": "zh-TW",
+    "output": "docs/architecture/architecture.html",
     "quality_profile": "showcase",
     "repository": {
       "url": "https://github.com/hamanpaul/serialwrap",
-      "revision": "cf2aaba9004c18a82a6a5e4e0dcc66ea7211aeb1",
+      "revision": "85a16533a329a2a7d76b025de3762a82a4cd0472",
       "provider": "github"
-    },
-    "viewBox": [
-      1386,
-      828
-    ]
+    }
   },
   "components": [
     {
       "id": "arbiter",
       "type": "messagebus",
       "label": "3 命令排程",
-      "sublabel": "CommandArbiter",
+      "sublabel": "Registry＋SessionQueue",
       "sources": [
         {
-          "path": "sw_core/arbiter.py",
-          "line": 36,
-          "end_line": 56
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 228,
+          "end_line": 322
         },
         {
-          "path": "sw_core/arbiter.py",
-          "line": 125,
-          "end_line": 213
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 646,
+          "end_line": 680
         },
         {
-          "path": "sw_core/arbiter.py",
-          "line": 260,
-          "end_line": 318
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3411,
+          "end_line": 3509
         }
       ],
       "pos": [
-        441.6,
-        295.8
+        532,
+        290
       ],
       "size": [
-        133.2,
-        56.4
+        136,
+        56
       ]
     },
     {
       "id": "bridge",
       "type": "backend",
-      "label": "5 UARTBridge",
-      "sublabel": "單一 owner；TX／RX",
+      "label": "5 UART bridge",
+      "sublabel": "IoWorker：termios｜COM",
       "sources": [
         {
-          "path": "sw_core/uart_io.py",
-          "line": 240,
-          "end_line": 276
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 883,
+          "end_line": 971
         },
         {
-          "path": "sw_core/uart_io.py",
-          "line": 659,
-          "end_line": 674
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 482,
+          "end_line": 566
         },
         {
-          "path": "sw_core/uart_io.py",
-          "line": 859,
-          "end_line": 891
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 651,
+          "end_line": 665
         }
       ],
       "pos": [
-        925.8,
-        295.8
+        1008,
+        290
       ],
       "size": [
-        133.2,
-        56.4
+        160,
+        56
       ]
     },
     {
@@ -84,54 +82,59 @@
       "sublabel": "後續 RX／result-tail",
       "sources": [
         {
-          "path": "sw_core/session_manager.py",
-          "line": 192,
-          "end_line": 226
+          "path": "crates/sw-core/src/capture.rs",
+          "line": 117,
+          "end_line": 136
         },
         {
-          "path": "sw_core/session_manager.py",
-          "line": 3551,
-          "end_line": 3679
+          "path": "crates/sw-core/src/capture.rs",
+          "line": 181,
+          "end_line": 189
         },
         {
-          "path": "sw_core/session_manager.py",
-          "line": 4566,
-          "end_line": 4591
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 812,
+          "end_line": 821
         }
       ],
       "pos": [
-        498.0,
-        630.6
+        518,
+        536
       ],
       "size": [
-        133.2,
-        56.4
+        136,
+        56
       ]
     },
     {
       "id": "cli",
       "type": "frontend",
       "label": "1 CLI／Agent",
-      "sublabel": "RPC 呼叫／查詢結果",
+      "sublabel": "serialwrap（Rust）",
       "sources": [
         {
-          "path": "sw_core/client.py",
-          "line": 9,
-          "end_line": 44
+          "path": "crates/sw-cli/src/client.rs",
+          "line": 62,
+          "end_line": 74
         },
         {
-          "path": "sw_core/client.py",
-          "line": 107,
-          "end_line": 153
+          "path": "crates/sw-cli/src/client.rs",
+          "line": 194,
+          "end_line": 239
+        },
+        {
+          "path": "crates/sw-cli/src/client.rs",
+          "line": 319,
+          "end_line": 343
         }
       ],
       "pos": [
-        21.6,
-        295.8
+        24,
+        290
       ],
       "size": [
-        133.2,
-        56.4
+        136,
+        56
       ]
     },
     {
@@ -141,49 +144,121 @@
       "sublabel": "accepted→running→終態",
       "sources": [
         {
-          "path": "sw_core/arbiter.py",
-          "line": 36,
-          "end_line": 44
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 81,
+          "end_line": 98
         },
         {
-          "path": "sw_core/arbiter.py",
-          "line": 241,
-          "end_line": 246
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 269,
+          "end_line": 298
         },
         {
-          "path": "sw_core/arbiter.py",
-          "line": 260,
-          "end_line": 318
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 324,
+          "end_line": 353
         }
       ],
       "pos": [
-        328.2,
-        466.8
+        416,
+        416
       ],
       "size": [
-        133.2,
-        56.4
+        136,
+        56
+      ]
+    },
+    {
+      "id": "console-hub",
+      "type": "backend",
+      "label": "ConsoleHub",
+      "sublabel": "PTY｜TCP Telnet",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 1,
+          "end_line": 5
+        },
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 875,
+          "end_line": 900
+        },
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 964,
+          "end_line": 1000
+        }
+      ],
+      "pos": [
+        1004,
+        536
+      ],
+      "size": [
+        136,
+        56
+      ]
+    },
+    {
+      "id": "daemon-main",
+      "type": "backend",
+      "label": "serialwrapd 主流程",
+      "sublabel": "鎖：flock｜LockFileEx",
+      "sources": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1219,
+          "end_line": 1233
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1384,
+          "end_line": 1392
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1428,
+          "end_line": 1463
+        }
+      ],
+      "pos": [
+        24,
+        156
+      ],
+      "size": [
+        136,
+        56
       ]
     },
     {
       "id": "event-handler",
       "type": "external",
       "label": "外部 handler",
-      "sublabel": "subprocess／timeout",
+      "sublabel": "子行程／timeout",
       "sources": [
         {
-          "path": "sw_core/event_engine/dispatcher.py",
-          "line": 153,
-          "end_line": 235
+          "path": "crates/sw-core/src/event_engine/dispatcher.rs",
+          "line": 1,
+          "end_line": 6
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/dispatcher.rs",
+          "line": 392,
+          "end_line": 414
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 138,
+          "end_line": 139
         }
       ],
       "pos": [
-        1104.0,
-        709.8
+        1168,
+        656
       ],
       "size": [
-        133.2,
-        56.4
+        136,
+        56
       ]
     },
     {
@@ -193,101 +268,152 @@
       "sublabel": "RX → matcher → handler",
       "sources": [
         {
-          "path": "sw_core/event_engine/engine.py",
-          "line": 46,
-          "end_line": 105
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 1,
+          "end_line": 4
         },
         {
-          "path": "sw_core/event_engine/engine.py",
-          "line": 274,
-          "end_line": 288
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 115,
+          "end_line": 154
         },
         {
-          "path": "sw_core/service.py",
-          "line": 297,
-          "end_line": 304
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 355,
+          "end_line": 379
         }
       ],
       "pos": [
-        869.4,
-        709.8
+        1168,
+        536
       ],
       "size": [
-        133.2,
-        56.4
+        136,
+        56
       ]
     },
     {
       "id": "execute",
       "type": "backend",
       "label": "4 命令執行",
-      "sublabel": "execute_command",
+      "sublabel": "OpRunner 前景 lane",
       "sources": [
         {
-          "path": "sw_core/session_manager.py",
-          "line": 3486,
-          "end_line": 3549
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 1,
+          "end_line": 9
         },
         {
-          "path": "sw_core/session_manager.py",
-          "line": 3551,
-          "end_line": 3679
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 117,
+          "end_line": 157
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 710,
+          "end_line": 771
         }
       ],
       "pos": [
-        684.6,
-        295.8
+        756,
+        290
       ],
       "size": [
-        133.2,
-        56.4
+        136,
+        56
+      ]
+    },
+    {
+      "id": "fence",
+      "type": "security",
+      "label": "TX Fence",
+      "sublabel": "送出前授權",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 86,
+          "end_line": 129
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 326,
+          "end_line": 414
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 429,
+          "end_line": 434
+        }
+      ],
+      "pos": [
+        1020,
+        156
+      ],
+      "size": [
+        136,
+        56
       ]
     },
     {
       "id": "file-transfer",
       "type": "backend",
       "label": "file.push／pull",
-      "sublabel": "分段 base64／ACK",
+      "sublabel": "分段 base64／echo-ACK",
       "sources": [
         {
-          "path": "sw_core/session_manager.py",
-          "line": 4692,
-          "end_line": 4779
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 434,
+          "end_line": 464
         },
         {
-          "path": "sw_core/session_manager.py",
-          "line": 4781,
-          "end_line": 4847
+          "path": "crates/sw-core/src/session_core/file_xfer.rs",
+          "line": 1,
+          "end_line": 9
+        },
+        {
+          "path": "crates/sw-core/src/session_core/file_xfer.rs",
+          "line": 39,
+          "end_line": 63
         }
       ],
       "pos": [
-        798.0,
-        10.8
+        110,
+        536
       ],
       "size": [
-        133.2,
-        56.4
+        136,
+        56
       ]
     },
     {
       "id": "flasher",
       "type": "external",
       "label": "外部 flasher",
-      "sublabel": "ttyMCU／已釋出裝置",
+      "sublabel": "ttyMCU｜已釋出裝置",
       "sources": [
         {
-          "path": "README.md",
-          "line": 1685,
-          "end_line": 1728
+          "path": "crates/sw-cli/src/cli_spec.rs",
+          "line": 71,
+          "end_line": 71
+        },
+        {
+          "path": "crates/sw-cli/src/cli_spec.rs",
+          "line": 89,
+          "end_line": 89
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint.rs",
+          "line": 1,
+          "end_line": 10
         }
       ],
       "pos": [
-        1097.4,
-        89.4
+        1256,
+        10
       ],
       "size": [
-        133.2,
-        56.4
+        136,
+        56
       ]
     },
     {
@@ -297,54 +423,59 @@
       "sublabel": "FLASHING ≠ RELEASED",
       "sources": [
         {
-          "path": "sw_core/service.py",
-          "line": 378,
-          "end_line": 462
+          "path": "crates/sw-core/src/flash_endpoint.rs",
+          "line": 1,
+          "end_line": 10
         },
         {
-          "path": "sw_core/session_manager.py",
-          "line": 1732,
-          "end_line": 1756
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 1,
+          "end_line": 14
         },
         {
-          "path": "sw_core/session_manager.py",
-          "line": 1815,
-          "end_line": 1832
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 432,
+          "end_line": 466
         }
       ],
       "pos": [
-        904.8,
-        155.4
+        1256,
+        156
       ],
       "size": [
-        133.2,
-        56.4
+        136,
+        56
       ]
     },
     {
       "id": "human",
       "type": "frontend",
       "label": "Human console",
-      "sublabel": "minicom／PTY／TCP",
+      "sublabel": "minicom｜Telnet 終端",
       "sources": [
         {
-          "path": "sw_core/uart_io.py",
-          "line": 730,
-          "end_line": 781
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 602,
+          "end_line": 638
         },
         {
-          "path": "sw_core/uart_io.py",
-          "line": 1131,
-          "end_line": 1157
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 833,
+          "end_line": 859
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7697,
+          "end_line": 7743
         }
       ],
       "pos": [
-        1111.2,
-        523.8
+        1004,
+        656
       ],
       "size": [
-        133.2,
-        56.4
+        136,
+        56
       ]
     },
     {
@@ -354,23 +485,59 @@
       "sublabel": "InteractiveLease",
       "sources": [
         {
-          "path": "sw_core/session_manager.py",
-          "line": 3862,
-          "end_line": 4040
+          "path": "crates/sw-core/src/lease.rs",
+          "line": 16,
+          "end_line": 30
         },
         {
-          "path": "sw_core/uart_io.py",
-          "line": 1212,
-          "end_line": 1251
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 6086,
+          "end_line": 6093
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7295,
+          "end_line": 7313
         }
       ],
       "pos": [
-        847.8,
-        523.8
+        904,
+        416
       ],
       "size": [
-        133.2,
-        56.4
+        136,
+        56
+      ]
+    },
+    {
+      "id": "pal",
+      "type": "backend",
+      "label": "sw-pal 平台後端",
+      "sublabel": "A｜B＝Linux｜Windows",
+      "sources": [
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 1,
+          "end_line": 4
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 108,
+          "end_line": 143
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 183,
+          "end_line": 293
+        }
+      ],
+      "pos": [
+        24,
+        10
+      ],
+      "size": [
+        136,
+        56
       ]
     },
     {
@@ -380,18 +547,28 @@
       "sublabel": "prompt／probe／UART",
       "sources": [
         {
-          "path": "sw_core/config.py",
-          "line": 21,
-          "end_line": 78
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1185,
+          "end_line": 1200
+        },
+        {
+          "path": "crates/sw-proto/src/config_types.rs",
+          "line": 17,
+          "end_line": 71
+        },
+        {
+          "path": "crates/sw-proto/src/config_types.rs",
+          "line": 73,
+          "end_line": 82
         }
       ],
       "pos": [
-        235.2,
-        110.4
+        466,
+        10
       ],
       "size": [
-        133.2,
-        56.4
+        136,
+        56
       ]
     },
     {
@@ -401,106 +578,152 @@
       "sublabel": "Ctrl-C → Ctrl-D → 降階",
       "sources": [
         {
-          "path": "sw_core/session_manager.py",
-          "line": 3681,
-          "end_line": 3787
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 109,
+          "end_line": 114
         },
         {
-          "path": "sw_core/session_manager.py",
-          "line": 4431,
-          "end_line": 4516
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 772,
+          "end_line": 791
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 887,
+          "end_line": 965
         }
       ],
       "pos": [
-        649.2,
-        466.8
+        650,
+        416
       ],
       "size": [
-        133.2,
-        56.4
+        136,
+        56
       ]
     },
     {
       "id": "service",
       "type": "backend",
       "label": "2 RPC／Service",
-      "sublabel": "selector／READY gate",
+      "sublabel": "AF_UNIX｜TCP loopback",
       "sources": [
         {
-          "path": "sw_core/daemon.py",
-          "line": 128,
-          "end_line": 198
+          "path": "crates/sw-daemon/src/framing.rs",
+          "line": 409,
+          "end_line": 485
         },
         {
-          "path": "sw_core/service.py",
-          "line": 614,
-          "end_line": 684
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1,
+          "end_line": 11
         },
         {
-          "path": "sw_core/service.py",
-          "line": 885,
-          "end_line": 922
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 731,
+          "end_line": 765
         }
       ],
       "pos": [
-        220.2,
-        295.8
+        290,
+        290
       ],
       "size": [
-        133.2,
-        56.4
+        136,
+        56
+      ]
+    },
+    {
+      "id": "session-actor",
+      "type": "backend",
+      "label": "Session actor",
+      "sublabel": "SessionCore＋雙 lane",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/actor.rs",
+          "line": 1,
+          "end_line": 5
+        },
+        {
+          "path": "crates/sw-core/src/mailbox.rs",
+          "line": 1,
+          "end_line": 5
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 142,
+          "end_line": 152
+        }
+      ],
+      "pos": [
+        532,
+        156
+      ],
+      "size": [
+        136,
+        56
       ]
     },
     {
       "id": "sessions",
       "type": "backend",
       "label": "SessionManager",
-      "sublabel": "attach／probe／狀態",
+      "sublabel": "裝置／rank／selector",
       "sources": [
         {
-          "path": "sw_core/session_manager.py",
-          "line": 622,
-          "end_line": 713
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7,
+          "end_line": 16
         },
         {
-          "path": "sw_core/session_manager.py",
-          "line": 2132,
-          "end_line": 2160
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6746,
+          "end_line": 6785
         },
         {
-          "path": "sw_core/session_manager.py",
-          "line": 2427,
-          "end_line": 2631
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6796,
+          "end_line": 6822
         }
       ],
       "pos": [
-        441.6,
-        182.4
+        290,
+        156
       ],
       "size": [
-        133.2,
-        56.4
+        136,
+        56
       ]
     },
     {
       "id": "state-store",
       "type": "database",
       "label": "state.json",
-      "sublabel": "綁定／pin／RELEASED",
+      "sublabel": "StateStore 單一寫入者",
       "sources": [
         {
-          "path": "sw_core/session_manager.py",
-          "line": 785,
-          "end_line": 843
+          "path": "crates/sw-core/src/state_store.rs",
+          "line": 1,
+          "end_line": 11
+        },
+        {
+          "path": "crates/sw-core/src/state_store.rs",
+          "line": 570,
+          "end_line": 601
+        },
+        {
+          "path": "crates/sw-core/src/state_store.rs",
+          "line": 704,
+          "end_line": 728
         }
       ],
       "pos": [
-        655.8,
-        60.6
+        642,
+        10
       ],
       "size": [
-        133.2,
-        56.4
+        136,
+        56
       ]
     },
     {
@@ -510,23 +733,28 @@
       "sublabel": "raw bytes／prompt",
       "sources": [
         {
-          "path": "sw_core/session_manager.py",
-          "line": 3551,
-          "end_line": 3679
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 522,
+          "end_line": 528
         },
         {
-          "path": "sw_core/uart_io.py",
-          "line": 954,
-          "end_line": 958
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 744,
+          "end_line": 771
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 812,
+          "end_line": 821
         }
       ],
       "pos": [
-        1140.6,
-        295.8
+        1256,
+        290
       ],
       "size": [
-        133.2,
-        56.4
+        136,
+        56
       ]
     },
     {
@@ -536,150 +764,124 @@
       "sublabel": "bytes／seq／source",
       "sources": [
         {
-          "path": "sw_core/uart_io.py",
-          "line": 659,
-          "end_line": 674
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 958,
+          "end_line": 971
         },
         {
-          "path": "sw_core/uart_io.py",
-          "line": 859,
-          "end_line": 891
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 494,
+          "end_line": 502
         },
         {
-          "path": "sw_core/wal.py",
-          "line": 104,
-          "end_line": 162
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 466,
+          "end_line": 472
         }
       ],
       "pos": [
-        1162.2,
-        395.4
+        1256,
+        416
       ],
       "size": [
-        133.2,
-        56.4
+        136,
+        56
       ]
     },
     {
       "id": "watcher",
       "type": "backend",
       "label": "DeviceWatcher",
-      "sublabel": "added／removed／tick",
+      "sublabel": "by-id｜SERIALCOMM",
       "sources": [
         {
-          "path": "sw_core/device_watcher.py",
-          "line": 52,
-          "end_line": 68
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7804,
+          "end_line": 7807
         },
         {
-          "path": "sw_core/service.py",
-          "line": 264,
-          "end_line": 270
+          "path": "crates/sw-pal/src/device_source/windows.rs",
+          "line": 14,
+          "end_line": 14
+        },
+        {
+          "path": "crates/sw-pal/src/device_watcher.rs",
+          "line": 37,
+          "end_line": 76
         }
       ],
       "pos": [
-        441.6,
-        75.6
+        290,
+        10
       ],
       "size": [
-        133.2,
-        56.4
+        136,
+        56
       ]
     }
   ],
   "boundaries": [],
   "connections": [
     {
+      "id": "arbiter-to-capture",
+      "from": "arbiter",
+      "to": "capture",
+      "label": "background 建立",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
       "id": "arbiter-to-command-records",
       "from": "arbiter",
       "to": "command-records",
       "label": "cmd_id／status",
       "variant": "default",
-      "fromSide": "bottom",
-      "toSide": "top",
-      "via": [
-        [
-          508.2,
-          397.2
-        ],
-        [
-          394.8,
-          397.2
-        ]
-      ],
-      "labelAt": [
-        445.8,
-        382.2
-      ]
+      "fromSide": "left",
+      "toSide": "top"
     },
     {
       "id": "arbiter-to-execute",
       "from": "arbiter",
       "to": "execute",
-      "label": "worker → running",
+      "label": "StartOp",
       "variant": "emphasis"
+    },
+    {
+      "id": "arbiter-to-lease",
+      "from": "arbiter",
+      "to": "lease",
+      "label": "出列再驗 lease",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "bottom"
+    },
+    {
+      "id": "bridge-to-console-hub",
+      "from": "bridge",
+      "to": "console-hub",
+      "label": "RX tap",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top"
     },
     {
       "id": "bridge-to-events",
       "from": "bridge",
       "to": "events",
-      "label": "RX 觀測 → line",
+      "label": "RX observer",
       "variant": "dashed",
-      "fromSide": "right",
-      "toSide": "top",
-      "via": [
-        [
-          1080.0,
-          324.0
-        ],
-        [
-          1080.0,
-          466
-        ],
-        [
-          1326.0,
-          466
-        ],
-        [
-          1326.0,
-          677.4
-        ],
-        [
-          936.0,
-          677.4
-        ]
-      ],
-      "labelAt": [
-        1236.6,
-        664.2
-      ]
+      "fromSide": "bottom",
+      "toSide": "top"
     },
     {
-      "id": "bridge-to-human",
+      "id": "bridge-to-session-actor",
       "from": "bridge",
-      "to": "human",
-      "label": "廣播 RX",
-      "variant": "dashed",
-      "fromSide": "right",
-      "toSide": "top",
-      "via": [
-        [
-          1086.6,
-          324.0
-        ],
-        [
-          1086.6,
-          466.8
-        ],
-        [
-          1177.8,
-          466.8
-        ]
-      ],
-      "labelAt": [
-        1123,
-        431
-      ]
+      "to": "session-actor",
+      "label": "RX chunk／IoError",
+      "variant": "default",
+      "fromSide": "top",
+      "toSide": "bottom"
     },
     {
       "id": "bridge-to-target",
@@ -694,26 +896,8 @@
       "to": "wal",
       "label": "RX／TX ＋ seq",
       "variant": "default",
-      "fromSide": "right",
-      "toSide": "top",
-      "via": [
-        [
-          1115.4,
-          324.0
-        ],
-        [
-          1115.4,
-          375.0
-        ],
-        [
-          1228.8,
-          375.0
-        ]
-      ],
-      "labelAt": [
-        1228.2,
-        385.8
-      ]
+      "fromSide": "bottom",
+      "toSide": "top"
     },
     {
       "id": "capture-to-service",
@@ -722,25 +906,7 @@
       "label": "result.tail 查詢",
       "variant": "dashed",
       "fromSide": "left",
-      "toSide": "bottom",
-      "via": [
-        [
-          214.8,
-          658.8
-        ],
-        [
-          214.8,
-          393.0
-        ],
-        [
-          286.8,
-          393.0
-        ]
-      ],
-      "labelAt": [
-        361.8,
-        645.0
-      ]
+      "toSide": "bottom"
     },
     {
       "id": "cli-to-service",
@@ -755,113 +921,67 @@
       "to": "service",
       "label": "command.get 回讀",
       "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "console-hub-to-human",
+      "from": "console-hub",
+      "to": "human",
+      "label": "RX fan-out",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "console-hub-to-lease",
+      "from": "console-hub",
+      "to": "lease",
+      "label": "ConsoleInput",
+      "variant": "default",
       "fromSide": "left",
-      "toSide": "bottom",
-      "via": [
-        [
-          286.8,
-          495.0
-        ],
-        [
-          286.8,
-          371.4
-        ]
-      ],
-      "labelAt": [
-        285.0,
-        422.4
-      ]
+      "toSide": "bottom"
+    },
+    {
+      "id": "daemon-main-to-service",
+      "from": "daemon-main",
+      "to": "service",
+      "label": "bind／stop_accept",
+      "variant": "default",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "daemon-main-to-sessions",
+      "from": "daemon-main",
+      "to": "sessions",
+      "label": "bootstrap／drain",
+      "variant": "default",
+      "fromSide": "right",
+      "toSide": "left"
     },
     {
       "id": "events-to-event-handler",
       "from": "events",
       "to": "event-handler",
       "label": "命中規則才啟動",
-      "variant": "dashed"
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top"
     },
     {
       "id": "execute-to-arbiter",
       "from": "execute",
       "to": "arbiter",
-      "label": "回傳執行結果",
-      "variant": "default",
-      "fromSide": "top",
-      "toSide": "top",
-      "via": [
-        [
-          751.2,
-          267.6
-        ],
-        [
-          508.2,
-          267.6
-        ]
-      ],
-      "labelAt": [
-        615.6,
-        255.0
-      ]
+      "label": "OpFinished",
+      "variant": "default"
     },
     {
       "id": "execute-to-bridge",
       "from": "execute",
       "to": "bridge",
-      "label": "送 raw／等 prompt",
+      "label": "TX／等 prompt",
       "variant": "emphasis"
-    },
-    {
-      "id": "execute-to-capture",
-      "from": "execute",
-      "to": "capture",
-      "label": "background 分支",
-      "variant": "dashed",
-      "fromSide": "bottom",
-      "toSide": "right",
-      "via": [
-        [
-          751.2,
-          408.0
-        ],
-        [
-          790.8,
-          408.0
-        ],
-        [
-          790.8,
-          658.8
-        ]
-      ],
-      "labelAt": [
-        790.8,
-        602.4
-      ]
-    },
-    {
-      "id": "execute-to-lease",
-      "from": "execute",
-      "to": "lease",
-      "label": "互斥／暫停／恢復",
-      "variant": "dashed",
-      "fromSide": "bottom",
-      "toSide": "left",
-      "via": [
-        [
-          751.2,
-          375.6
-        ],
-        [
-          834.0,
-          375.6
-        ],
-        [
-          834.0,
-          552.0
-        ]
-      ],
-      "labelAt": [
-        853.2,
-        444.0
-      ]
     },
     {
       "id": "execute-to-recovery",
@@ -870,223 +990,121 @@
       "label": "prompt 未返回",
       "variant": "dashed",
       "fromSide": "bottom",
-      "toSide": "top",
-      "via": [
-        [
-          751.2,
-          391.8
-        ],
-        [
-          715.8,
-          391.8
-        ]
-      ],
-      "labelAt": [
-        710,
-        366
-      ]
+      "toSide": "top"
     },
     {
-      "id": "file-transfer-to-bridge",
-      "from": "file-transfer",
+      "id": "fence-to-bridge",
+      "from": "fence",
       "to": "bridge",
-      "label": "分段傳輸",
+      "label": "放行／拒絕 TX",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "file-transfer-to-execute",
+      "from": "file-transfer",
+      "to": "execute",
+      "label": "佔前景槽",
       "variant": "dashed",
-      "fromSide": "right",
-      "toSide": "top",
-      "via": [
-        [
-          1290.6,
-          39.0
-        ],
-        [
-          1290.6,
-          240.0
-        ],
-        [
-          1011.0,
-          240.0
-        ],
-        [
-          992.4,
-          240.0
-        ]
-      ],
-      "labelAt": [
-        1290.6,
-        184.8
-      ]
+      "fromSide": "bottom",
+      "toSide": "bottom"
     },
     {
       "id": "flasher-to-handoff",
       "from": "flasher",
       "to": "handoff",
-      "label": "認線／顯式交接",
+      "label": "sync bytes｜release",
       "variant": "dashed",
-      "fromSide": "left",
-      "toSide": "top",
-      "via": [
-        [
-          1069.2,
-          117.6
-        ],
-        [
-          1069.2,
-          133.8
-        ],
-        [
-          971.4,
-          133.8
-        ]
-      ],
-      "labelAt": [
-        1019.4,
-        123.0
-      ]
+      "fromSide": "bottom",
+      "toSide": "top"
     },
     {
       "id": "handoff-to-bridge",
       "from": "handoff",
       "to": "bridge",
-      "label": "排他 TX／釋出 FD",
+      "label": "Flash／Probe TX",
       "variant": "dashed",
       "fromSide": "bottom",
-      "toSide": "top",
-      "via": [
-        [
-          971.4,
-          267.0
-        ],
-        [
-          1026.0,
-          267.0
-        ],
-        [
-          1026.0,
-          285.0
-        ],
-        [
-          992.4,
-          285.0
-        ]
-      ],
-      "labelAt": [
-        1019,
-        228
-      ]
+      "toSide": "top"
     },
     {
-      "id": "handoff-to-sessions",
+      "id": "handoff-to-session-actor",
       "from": "handoff",
-      "to": "sessions",
+      "to": "session-actor",
       "label": "FLASHING／RELEASED",
       "variant": "dashed",
       "fromSide": "left",
-      "toSide": "right",
+      "toSide": "top",
       "via": [
         [
-          599.4,
-          183.6
+          1206,
+          184
         ],
         [
-          599.4,
-          210.6
+          1206,
+          140
+        ],
+        [
+          600,
+          140
         ]
-      ],
-      "labelAt": [
-        741,
-        168
       ]
     },
     {
-      "id": "human-to-lease",
+      "id": "human-to-console-hub",
       "from": "human",
-      "to": "lease",
-      "label": "raw owner／暫存",
-      "variant": "default"
+      "to": "console-hub",
+      "label": "按鍵",
+      "variant": "default",
+      "fromSide": "top",
+      "toSide": "bottom"
     },
     {
       "id": "lease-to-bridge",
       "from": "lease",
       "to": "bridge",
-      "label": "授權 raw TX",
+      "label": "HumanRaw／Lease TX",
       "variant": "dashed",
       "fromSide": "top",
-      "toSide": "bottom",
-      "via": [
-        [
-          914.4,
-          469.8
-        ],
-        [
-          914.4,
-          422.4
-        ],
-        [
-          992.4,
-          422.4
-        ]
-      ],
-      "labelAt": [
-        933.0,
-        418.8
-      ]
+      "toSide": "bottom"
+    },
+    {
+      "id": "pal-to-daemon-main",
+      "from": "pal",
+      "to": "daemon-main",
+      "label": "native() 後端",
+      "variant": "default",
+      "fromSide": "bottom",
+      "toSide": "top"
     },
     {
       "id": "profiles-to-sessions",
       "from": "profiles",
       "to": "sessions",
-      "label": "套用 profile",
+      "label": "載入 profile",
       "variant": "default",
-      "fromSide": "right",
-      "toSide": "left",
-      "via": [
-        [
-          402.6,
-          138.6
-        ],
-        [
-          402.6,
-          210.6
-        ]
-      ],
-      "labelAt": [
-        429.6,
-        153.6
-      ]
+      "fromSide": "bottom",
+      "toSide": "top"
     },
     {
       "id": "recovery-to-arbiter",
       "from": "recovery",
       "to": "arbiter",
-      "label": "清列；不自動重送",
+      "label": "清列；不重送",
       "variant": "dashed",
       "fromSide": "left",
       "toSide": "bottom",
-      "via": [
-        [
-          572.4,
-          495.0
-        ],
-        [
-          572.4,
-          380.4
-        ],
-        [
-          508.2,
-          380.4
-        ]
-      ],
       "labelAt": [
-        597.0,
-        427.8
+        672,
+        408
       ]
     },
     {
       "id": "service-to-arbiter",
       "from": "service",
       "to": "arbiter",
-      "label": "入列 accepted",
+      "label": "Submit 入列",
       "variant": "emphasis"
     },
     {
@@ -1095,85 +1113,53 @@
       "to": "file-transfer",
       "label": "file.push／pull",
       "variant": "dashed",
-      "fromSide": "top",
-      "toSide": "left",
-      "via": [
-        [
-          286.8,
-          271.2
-        ],
-        [
-          175.2,
-          271.2
-        ],
-        [
-          175.2,
-          39.0
-        ]
-      ],
-      "labelAt": [
-        538.8,
-        25.8
-      ]
+      "fromSide": "bottom",
+      "toSide": "top"
     },
     {
       "id": "service-to-sessions",
       "from": "service",
       "to": "sessions",
-      "label": "attach／recover",
+      "label": "resolve／route",
       "variant": "dashed",
       "fromSide": "top",
-      "toSide": "left",
-      "via": [
-        [
-          286.8,
-          210.6
-        ]
-      ],
-      "labelAt": [
-        329.4,
-        231.0
-      ]
+      "toSide": "bottom"
     },
     {
-      "id": "sessions-to-arbiter",
-      "from": "sessions",
+      "id": "session-actor-to-arbiter",
+      "from": "session-actor",
       "to": "arbiter",
       "label": "READY 註冊；detach 清列",
       "variant": "dashed",
       "fromSide": "bottom",
-      "toSide": "top",
-      "labelAt": [
-        502.2,
-        252.6
-      ]
+      "toSide": "top"
     },
     {
-      "id": "sessions-to-bridge",
-      "from": "sessions",
+      "id": "session-actor-to-bridge",
+      "from": "session-actor",
       "to": "bridge",
-      "label": "建立／關閉 bridge",
+      "label": "開埠／登入／drain",
       "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "session-actor-to-fence",
+      "from": "session-actor",
+      "to": "fence",
+      "label": "發布閘狀態",
+      "variant": "default",
       "fromSide": "right",
-      "toSide": "top",
-      "via": [
-        [
-          754.8,
-          210.6
-        ],
-        [
-          754.8,
-          249.6
-        ],
-        [
-          992.4,
-          249.6
-        ]
-      ],
-      "labelAt": [
-        826.2,
-        236.4
-      ]
+      "toSide": "left"
+    },
+    {
+      "id": "sessions-to-session-actor",
+      "from": "sessions",
+      "to": "session-actor",
+      "label": "spawn／route",
+      "variant": "default",
+      "fromSide": "right",
+      "toSide": "left"
     },
     {
       "id": "sessions-to-state-store",
@@ -1181,26 +1167,8 @@
       "to": "state-store",
       "label": "原子儲存指定欄位",
       "variant": "default",
-      "fromSide": "right",
-      "toSide": "bottom",
-      "via": [
-        [
-          600.6,
-          210.6
-        ],
-        [
-          600.6,
-          143.4
-        ],
-        [
-          722.4,
-          143.4
-        ]
-      ],
-      "labelAt": [
-        683.4,
-        128.4
-      ]
+      "fromSide": "top",
+      "toSide": "bottom"
     },
     {
       "id": "target-to-bridge",
@@ -1208,33 +1176,16 @@
       "to": "bridge",
       "label": "RX bytes",
       "variant": "default",
-      "fromSide": "bottom",
-      "toSide": "bottom",
-      "via": [
-        [
-          1207.2,
-          363.0
-        ],
-        [
-          992.4,
-          363.0
-        ]
-      ],
-      "labelAt": [
-        1133,
-        391
-      ]
+      "labelDy": 12
     },
     {
       "id": "watcher-to-sessions",
       "from": "watcher",
       "to": "sessions",
-      "label": "裝置變更／重探",
+      "label": "Delta／Tick",
       "variant": "default",
-      "labelAt": [
-        508.2,
-        159.0
-      ]
+      "fromSide": "bottom",
+      "toSide": "top"
     }
   ],
   "cards": []

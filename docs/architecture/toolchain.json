@@ -1,13 +1,14 @@
 {
   "schema_version": 1,
-  "source_revision": "cf2aaba9004c18a82a6a5e4e0dcc66ea7211aeb1",
+  "source_revision": "85a16533a329a2a7d76b025de3762a82a4cd0472",
   "skill_repository": "hamanpaul/custom-skills",
-  "skill_revision": "c9510a2299b44a9fc6b6c75186ef2aa533abb6ef",
+  "skill_revision": "bb22c2ca2221330c437616230a5d294e10bdee87",
   "archify_repository": "tt-a1i/archify",
-  "archify_revision": "a07fa1d5b2a10cbea110c5a2be2817397a301cdc",
+  "archify_version": "3.2.0",
+  "archify_revision": "208acba8d412335185b2056fedf54b3405df43fb",
   "sha256": {
-    "facts.json": "b04c3256b7174fac1f47a35d8ad91c5884e06a72840fb31578be407860b49f0d",
-    "architecture.json": "5f3ecc9018ca96f4bf693a8f9c964f2f16f12dab9c0333b905163aca11806dff",
-    "architecture.html": "6fd2c9551c2caebaed2929979a701393af2394b10092ba9a148744df8aed689c"
+    "facts.json": "323978f5426d6509fb752c6fce89f0d6224c0c78a879a977cdfe61b8f040ebc9",
+    "architecture.json": "56b0dbb19fb48128e37e0838cd317934989599ae9e3222766bb7e59e74470693",
+    "architecture.html": "80c1c0f784ed238828096cdd7ecaee7146c2fb02c600ccf41edabe427a5861fe"
   }
 }
