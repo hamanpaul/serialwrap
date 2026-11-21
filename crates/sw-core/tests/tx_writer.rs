@@ -9,6 +9,7 @@ use std::{
 };
 
 use sw_core::{mailbox::ControlEvent, tx_writer::*, wal::*};
+use sw_core::uart_bridge::{RunCancel, RxShared};
 use sw_pal::{
     fakes::{clock::FakeClock, serial::*, wal_fs::FakeWalFs},
     *,
@@ -176,6 +177,146 @@ fn wal_lines(r: &Rig) -> Vec<String> {
         .lines()
         .map(str::to_string)
         .collect()
+}
+
+fn shutdown_permit(op: u64, class: TxClass) -> TxPermit {
+    TxPermit {
+        op_id: OpId(op),
+        epoch: 7,
+        owner_gen: 0,
+        fsm_gen: 0,
+        class,
+        source: "agent:x".into(),
+        cmd_id: None,
+        log: true,
+        input_epoch: None,
+        replay_hold: None,
+        probe_id: None,
+    }
+}
+
+#[test]
+fn shutdown_freeze_without_line_freezes_immediately() {
+    let fence = Fence::new();
+
+    assert_eq!(fence.freeze_for_shutdown_settling(), ShutdownFreeze::Frozen);
+    fence.with(|state| assert!(state.frozen));
+    assert!(fence.shutdown_started_published());
+}
+
+#[test]
+fn shutdown_freeze_with_open_line_defers_and_wakes_holder() {
+    let fence = Fence::new();
+    let rx = RxShared::new(1024, 0);
+    let settle = RunCancel::new(&rx);
+
+    assert!(fence.open_transfer_line(OpId(11), settle.clone()));
+    assert_eq!(fence.freeze_for_shutdown_settling(), ShutdownFreeze::PendingLine);
+    fence.with(|state| {
+        assert!(!state.frozen);
+        assert!(state.shutdown_freeze_pending);
+        assert_eq!(state.transfer_line, Some(OpId(11)));
+    });
+    assert!(settle.is_triggered());
+    assert!(fence.shutdown_started_published());
+}
+
+#[test]
+fn pending_admits_only_line_holder() {
+    let fence = Fence::new();
+    fence.with(|state| state.active_epoch = Some(7));
+    let rx = RxShared::new(1024, 0);
+    assert!(fence.open_transfer_line(OpId(11), RunCancel::new(&rx)));
+    assert_eq!(fence.freeze_for_shutdown_settling(), ShutdownFreeze::PendingLine);
+
+    fence.with(|state| {
+        assert_eq!(Fence::admit(state, &shutdown_permit(11, TxClass::FileTransfer)), Ok(()));
+        for (op, class) in [
+            (12, TxClass::FileTransfer),
+            (13, TxClass::Command),
+            (14, TxClass::HumanRaw),
+            (15, TxClass::SelfTestProbe),
+            (16, TxClass::SystemRecoverKey),
+            (17, TxClass::LoginProbe),
+        ] {
+            assert_eq!(
+                Fence::admit(state, &shutdown_permit(op, class)),
+                Err(FenceReject::Frozen),
+                "待凍結 fence 必須拒絕 {class:?} op {op}"
+            );
+        }
+    });
+}
+
+#[test]
+fn close_line_while_pending_freezes_atomically() {
+    let fence = Fence::new();
+    let rx = RxShared::new(1024, 0);
+    assert!(fence.open_transfer_line(OpId(11), RunCancel::new(&rx)));
+    assert_eq!(fence.freeze_for_shutdown_settling(), ShutdownFreeze::PendingLine);
+
+    fence.close_transfer_line(OpId(99));
+    fence.with(|state| {
+        assert!(!state.frozen);
+        assert!(state.shutdown_freeze_pending);
+        assert_eq!(state.transfer_line, Some(OpId(11)));
+    });
+
+    fence.close_transfer_line(OpId(11));
+    fence.with(|state| {
+        assert!(state.frozen);
+        assert!(!state.shutdown_freeze_pending);
+        assert_eq!(state.transfer_line, None);
+    });
+}
+
+#[test]
+fn force_shutdown_freeze_clears_pending() {
+    let fence = Fence::new();
+    let rx = RxShared::new(1024, 0);
+    assert!(fence.open_transfer_line(OpId(11), RunCancel::new(&rx)));
+    assert_eq!(fence.freeze_for_shutdown_settling(), ShutdownFreeze::PendingLine);
+
+    fence.force_shutdown_freeze();
+    fence.with(|state| {
+        assert!(state.frozen);
+        assert!(!state.shutdown_freeze_pending);
+    });
+}
+
+#[test]
+fn open_line_refused_when_frozen_or_pending() {
+    let rx = RxShared::new(1024, 0);
+    let settle = RunCancel::new(&rx);
+
+    let frozen = Fence::new();
+    frozen.with(|state| state.frozen = true);
+    assert!(!frozen.open_transfer_line(OpId(11), settle.clone()));
+    frozen.with(|state| assert_eq!(state.transfer_line, None));
+
+    let handoff = Fence::new();
+    handoff.with(|state| state.handoff_frozen = true);
+    assert!(!handoff.open_transfer_line(OpId(12), settle.clone()));
+    handoff.with(|state| assert_eq!(state.transfer_line, None));
+
+    let pending = Fence::new();
+    assert!(pending.open_transfer_line(OpId(13), settle.clone()));
+    assert_eq!(pending.freeze_for_shutdown_settling(), ShutdownFreeze::PendingLine);
+    assert!(!pending.open_transfer_line(OpId(14), settle));
+    pending.with(|state| assert_eq!(state.transfer_line, Some(OpId(13))));
+}
+
+#[test]
+fn run_cancel_also_flag_of() {
+    let rx = RxShared::new(1024, 0);
+    let cancel = RunCancel::new(&rx);
+    let other = RunCancel::new(&rx);
+    let combined = cancel.also_flag_of(&other);
+
+    other.trigger();
+
+    assert!(combined.is_triggered());
+    assert!(!cancel.is_triggered(), "合成旗標不得改動原本 cancel");
 }
 
 fn enospc() -> sw_pal::PalError {
