@@ -1,6 +1,7 @@
 """#155 regression plugin harness／core 純邏輯單測——不 import testpilot、不碰 live。"""
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -203,6 +204,60 @@ def test_throwaway_wait_reaps_daemon_and_ignores_zombie_group_members(tmp_path):
     _write_proc_stat(proc_root, 421, "S", 410)
     _, live_members = daemon.wait_for_exit(timeout_s=0.75, proc_root=proc_root)
     assert live_members == [421]
+
+
+class _UnreapableProcess:
+    """wait 一律逾時、poll 一律回報仍在執行的替身（模擬 SIGKILL 後仍收不回來的 daemon）。"""
+
+    pid = 510
+
+    def __init__(self):
+        self.wait_calls = 0
+
+    def poll(self):
+        return None
+
+    def wait(self, *, timeout):
+        self.wait_calls += 1
+        raise subprocess.TimeoutExpired(cmd="serialwrapd", timeout=timeout)
+
+
+def _unreapable_daemon(tmp_path, monkeypatch):
+    daemon = guards.ThrowawayDaemon("/bin/serialwrap", tmp_path / "ta", tmp_path / "byid", "")
+    daemon._proc = _UnreapableProcess()
+    daemon._proc_pgid = 510
+    daemon._run_dir = tmp_path / "run"
+    daemon._run_dir.mkdir()
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(guards.os, "killpg", lambda pgid, sig: signals.append((pgid, sig)))
+    monkeypatch.setattr(daemon, "run", lambda *args, **kwargs: None)
+    return daemon, signals
+
+
+def test_throwaway_exit_keeps_original_exception_when_daemon_is_unreapable(tmp_path, monkeypatch):
+    daemon, signals = _unreapable_daemon(tmp_path, monkeypatch)
+    proc = daemon._proc
+    run_dir = daemon._run_dir
+
+    with pytest.warns(RuntimeWarning, match="仍未被回收"):
+        daemon.__exit__(ValueError, ValueError("原始錯誤"), None)
+
+    assert proc.wait_calls == 2
+    assert signals == [(510, 15), (510, 9)]
+    assert daemon._proc is None
+    assert not run_dir.exists()
+
+
+def test_throwaway_exit_reports_unreapable_daemon_after_cleanup(tmp_path, monkeypatch):
+    daemon, signals = _unreapable_daemon(tmp_path, monkeypatch)
+    run_dir = daemon._run_dir
+
+    with pytest.raises(RuntimeError, match="pid=510"):
+        daemon.__exit__(None, None, None)
+
+    assert signals == [(510, 15), (510, 9)]
+    assert daemon._proc is None
+    assert not run_dir.exists()
 
 
 def _wal_record(seq: int, direction: str, payload: bytes, cmd_id: str | None = None) -> str:

@@ -10,6 +10,7 @@ import re
 import shlex
 import subprocess
 import time
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -316,6 +317,7 @@ class ThrowawayDaemon:
                 os.killpg(self._proc_pgid, 15)
             except (ProcessLookupError, PermissionError):
                 pass
+        unreaped_pid: int | None = None
         if proc is not None:
             try:
                 proc.wait(timeout=5)
@@ -325,13 +327,27 @@ class ThrowawayDaemon:
                         os.killpg(self._proc_pgid, 9)
                     except (ProcessLookupError, PermissionError):
                         pass
-                proc.wait(timeout=5)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    # SIGKILL 後仍未回收：收尾不得在這裡中斷（否則 run dir 不清、也會蓋掉 with 區塊內原本的例外）。
+                    unreaped_pid = getattr(proc, "pid", None)
         self._proc = None
         # workdir（state/wal/daemon.log）保留當 evidence；短路徑 run dir 清掉不留 socket。
         if self._run_dir is not None:
             import shutil
 
             shutil.rmtree(self._run_dir, ignore_errors=True)
+        if unreaped_pid is not None:
+            message = (
+                f"throwaway daemon（pid={unreaped_pid}，pgid={self._proc_pgid}）在 SIGKILL 後 5 秒內仍未被回收，"
+                f"請人工確認是否殘留（log：{self._workdir}/daemon.log）"
+            )
+            if exc and exc[0] is not None:
+                # with 區塊內已有例外在傳遞：保留原例外，殘留行程以警告揭露。
+                warnings.warn(message, RuntimeWarning, stacklevel=2)
+            else:
+                raise RuntimeError(message)
 
 
 def sh_quote(text: str) -> str:
