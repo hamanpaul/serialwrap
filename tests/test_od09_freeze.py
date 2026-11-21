@@ -304,8 +304,8 @@ def test_stage0_index_od09_item_ids():
     # 門檻檔凍結時記下的基線證據，必須就是索引登記的那一份（凍結後不得換檔或改登記）。
     if state == "frozen":
         for platform, item_id in od09.BASELINE_ITEMS.items():
-            if item_id not in present:
-                continue
+            # 凍結以兩平台基線證據已登記為前提：門檻檔已凍結而索引仍是 blocked_owner，代表凍結 commit 漏了索引或證據檔。
+            assert item_id in present, f"門檻檔已凍結，但索引的 {item_id} 尚未登記為 present"
             for key in od09.DEFERRED_KEYS:
                 assert acceptance["thresholds"][key]["baseline_evidence"][platform] == {
                     "item_id": item_id,
