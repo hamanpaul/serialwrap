@@ -184,6 +184,7 @@ fn linux_check_order_and_advisory_stamp() {
             "wal_dir",
             "wal_writable",
             "profile_bootloader_prompts",
+            "profile_template_fields",
             "devices",
             "wsl_systemd",
             "version_pairing"
@@ -247,6 +248,7 @@ fn windows_check_order() {
             "wal_dir",
             "wal_writable",
             "profile_bootloader_prompts",
+            "profile_template_fields",
             "devices",
             "version_pairing"
         ]
@@ -681,6 +683,66 @@ fn bootloader_prompts_not_materialized() {
     assert_eq!(rc, 0);
     let doc = json(&out);
     let check = find_check(&doc, "profile_bootloader_prompts");
+    assert!(b(check, "ok"));
+    assert_eq!(
+        s(check, "detail"),
+        format!(
+            "線上 profile 未物化（{}），略過",
+            posix_flavor_profile_path(&t)
+        )
+    );
+}
+
+#[test]
+fn profile_template_fields_drift() {
+    let t = TestEnv::posix();
+    let live_path = t.config_dir().join("profiles").join("default.yaml");
+    t.write_file(
+        &live_path,
+        b"profiles:\n  prpl-template:\n    platform: prpl\n    prompt_regex: \"x\"\n",
+    );
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "profile_template_fields");
+    assert!(!b(check, "ok"));
+    let detail = s(check, "detail");
+    let prefix = format!(
+        "線上 {} 缺出貨資產已有的欄位：prpl-template（",
+        posix_flavor_profile_path(&t)
+    );
+    assert!(detail.starts_with(&prefix), "{detail}");
+    // 依名稱排序；platform、prompt_regex 線上已有，不得列入。
+    assert!(detail.contains("boot_done_regex、bootloader_prompts、"), "{detail}");
+    assert!(!detail.contains("platform") && !detail.contains("prompt_regex"), "{detail}");
+    assert!(s(check, "fix").starts_with("setup 不覆寫既有 profile"));
+}
+
+#[test]
+fn profile_template_fields_matches_shipped_asset() {
+    let t = TestEnv::posix();
+    let live_path = t.config_dir().join("profiles").join("default.yaml");
+    let asset = sw_cli::assets::PROFILE_ASSETS
+        .iter()
+        .find(|asset| asset.rel == "profiles/default.yaml")
+        .expect("出貨 profile 資產");
+    t.write_file(&live_path, asset.bytes);
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "profile_template_fields");
+    assert!(b(check, "ok"));
+    assert_eq!(s(check, "detail"), "與出貨資產一致");
+    assert_eq!(s(check, "fix"), "");
+}
+
+#[test]
+fn profile_template_fields_not_materialized() {
+    let t = TestEnv::posix();
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "profile_template_fields");
     assert!(b(check, "ok"));
     assert_eq!(
         s(check, "detail"),
