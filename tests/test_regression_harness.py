@@ -344,6 +344,53 @@ def test_i282_uart_rx_observer_detaches_if_capture_file_cannot_open(tmp_path):
     assert [call[0][1] for call in ta.calls] == ["console-attach", "console-detach"]
 
 
+def test_i282_observer_creation_failure_stops_echo_watcher(tmp_path, monkeypatch):
+    commands = []
+
+    class _ThrowawayCli:
+        _workdir = tmp_path
+
+        def run(self, *args, **kwargs):
+            if "file" in args and "push" in args:
+                return {"ok": True}
+            raise AssertionError(f"未預期的 throwaway CLI 呼叫：{args!r}")
+
+        def wal_text(self):
+            return ""
+
+    class _Context:
+        case_dir = tmp_path
+
+        def note(self, *_args):
+            pass
+
+    def _line_command(_ta, _com, command, *, timeout_s=15.0):
+        commands.append(command)
+        if "for f in /tmp/*" in command:
+            return {
+                "status": "done",
+                "stdout": "I282_42_BEGIN\nI282_42_DEST_ABSENT\nI282_42_END\n",
+            }
+        return {"status": "done", "stdout": ""}
+
+    def _observer_unavailable(*_args, **_kwargs):
+        raise RuntimeError("observer unavailable")
+
+    monkeypatch.setattr(f07, "_throwaway_line_command", _line_command)
+    monkeypatch.setattr(f07, "_UartRxObserver", _observer_unavailable)
+
+    result = f07._body_push_stop_midline_clean_restart(
+        _Context(), _ThrowawayCli(), "COM0", {"serial": "board-i282"},
+    )
+
+    assert result.reason_code == "bridge_observer_unavailable"
+    assert any(
+        command.startswith("touch /tmp/.i282-echo-watcher-")
+        and ".done; sleep 2; stty echo; rm -f " in command
+        for command in commands
+    ), "observer 建立失敗離場前必須通知 DUT watcher 停止並復原 echo"
+
+
 def test_i282_post_restart_temp_growth_is_detected():
     before = {"/tmp/.sw_upload_0123456789ab": 512}
 

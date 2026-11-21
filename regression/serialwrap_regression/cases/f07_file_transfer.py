@@ -707,6 +707,11 @@ def _body_push_stop_midline_clean_restart(ctx: Any, ta: Any, ta_com: str, board:
         try:
             uart_observer = _UartRxObserver(ta, ta_com, uart_rx_path)
         except (OSError, RuntimeError) as exc:
+            if not restore_target_echo(ta_com, expect_marker=False):
+                return CaseResult(
+                    "FAIL", reason="bridge observer 建立失敗後，DUT echo watcher 未確認停止與復原",
+                    category="test", reason_code="echo_state_restore_unconfirmed",
+                )
             return CaseResult("SKIP", reason=f"無法建立 throwaway console bridge byte observer：{exc!r}",
                               category="environment", reason_code="bridge_observer_unavailable")
 
