@@ -32,5 +32,6 @@
   "feature/rust-refactor-p8": "579afa9",
   "fix/legacy-handoff-takeover": "6b36a38",
   "feature/rust-refactor-p8x": "ef8172f",
-  "feature/release-0.4.1": "120cc8a"
+  "feature/release-0.4.1": "120cc8a",
+  "fix/282-stop-push-residual-line": "5e3f726"
 }
