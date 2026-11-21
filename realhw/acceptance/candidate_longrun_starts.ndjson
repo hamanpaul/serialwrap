@@ -1,0 +1,2 @@
+{"acceptance_revision":"2026-11-21.1","acceptance_sha256":"e647d9080b8d19c66e78d9aff3e9d4379a2db6aaa3a2f278704d28389be5efe7","item_id":"S24-L3-LRMIXED-48H-WINDOWS","platform":"windows","run_id":"s24-win-rc1-20261121","started_at":"2026-11-21T10:46:00+00:00"}
+{"acceptance_revision":"2026-11-21.1","acceptance_sha256":"e647d9080b8d19c66e78d9aff3e9d4379a2db6aaa3a2f278704d28389be5efe7","item_id":"S24-L3-LRMIXED-48H-LINUX","platform":"linux","run_id":"s24-linux-rc1-20261121","started_at":"2026-11-21T10:46:00+00:00"}
