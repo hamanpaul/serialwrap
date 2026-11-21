@@ -23,6 +23,7 @@ import json
 import os
 import sys
 import time
+import warnings
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -555,6 +556,11 @@ def test_df27_wal_zero_tx_assertion_negative_test():
     assert_no_wal_tx_leak([clean_rec], marker)
 
 
+def _python_login_timeout_code(code: str) -> bool:
+    """Python 登入 FSM 的逾時類錯誤碼：POST_LOGIN_CMD_TIMEOUT，以及各階段的 *_PROMPT_TIMEOUT。"""
+    return code == "POST_LOGIN_CMD_TIMEOUT" or code.endswith("_PROMPT_TIMEOUT")
+
+
 def test_login_with_delay_and_noise(p7, tmp_path):
     tgt = FakeTarget(
         tmp_path / "t0",
@@ -618,7 +624,27 @@ def test_login_with_delay_and_noise(p7, tmp_path):
     )
     # 通過時也留下走的是 READY 還是逾時路徑（pytest 只在失敗或 -rP／junit 時顯示）。
     print("login_delay_noise_diag", diag)
-    assert s is not None and (s.get("state") == "READY" or python_timeout), (
+    assert s is not None, f"期限內完全取不到 session 列：{diag}"
+    if not is_rust:
+        # 擁有者裁決（2026-11-21）：Python 輪只觀察。Python 0.4.x 是凍結的基線，雜訊每 50 ms 一行、prompt 取樣也是
+        # 50 ms，prompt 停在緩衝尾端的時間不足一個取樣週期，登入 FSM 會回 *_PROMPT_TIMEOUT 並在約 3 秒後自動重探
+        # （sw_core/session_manager.py 的 _is_reprobe_prompt_error），可能重探到期限仍未收斂（PR 278 第 1、4、7、10 輪
+        # 與 PR 283 hosted 的變化序列、本機 22 次重現）。結果取決於主機排程，逾時後的語意由 DF-27 的確定性案例驗證。
+        # 這裡仍然把關：整段期間出現過的錯誤碼必須全部屬於登入逾時類，出現其他錯誤（RX_FLOOD、SEND_FAILED、
+        # 帳密類等）照樣失敗。
+        seen_errors = sorted({row[3] for row in history if len(row) > 3 and row[3]})
+        unexpected = [code for code in seen_errors if not _python_login_timeout_code(code)]
+        assert not unexpected, (
+            f"Python 基線在延遲雜訊登入期間出現登入逾時類以外的錯誤碼 {unexpected}（看過的錯誤碼：{seen_errors}）：{s!r}\n{diag}"
+        )
+        if not (s.get("state") == "READY" or python_timeout):
+            warnings.warn(
+                f"Python 基線在 300 s 內仍在重探迴圈，未收斂到 READY 或 POST_LOGIN_CMD_TIMEOUT（只觀察，不判失敗）；"
+                f"看過的錯誤碼：{seen_errors}",
+                stacklevel=1,
+            )
+            return
+    assert s.get("state") == "READY" or python_timeout, (
         f"延遲雜訊登入未在期限內到達允許的終態；Rust 必須回 READY，Python 可依 OD-81 停在逾時 DETACHED：{s!r}\n{diag}"
     )
     if s["state"] == "READY":
