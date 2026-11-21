@@ -909,7 +909,7 @@ def _observation_gaps_check(observer_samples: list[dict[str, Any]] | None, snaps
                 gaps.append({"source": label, "from_t": _num(left), "to_t": _num(right)})
 
     def null_pid_runs(label: str, rows: list[tuple[float, Any]]) -> None:
-        """daemon pid 連續為 null 超過 factor × snapshot_interval_s 即為觀測缺口（無法辨識 daemon）。"""
+        """daemon pid 連續為 null 超過 factor × snapshot_interval_s ＋ observation_gap_tolerance_s 即為觀測缺口（無法辨識 daemon）。"""
         limit = factor * float(workload["snapshot_interval_s"]) + tolerance
         ordered = sorted((t, pid) for t, pid in rows if in_window(t))
         run_start: float | None = None
