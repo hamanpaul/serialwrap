@@ -616,6 +616,72 @@ fn shutdown_settle_finishes_open_line_then_freezes() {
 }
 
 #[test]
+fn shutdown_publication_race_never_leaves_half_line() {
+    // 注入第三個 slice 的 echo，讓傳輸嘗試送下一個 slice；持有 fence 鎖時啟動停機。
+    // 舊順序可能先發布停機旗標，讓持有者在 pending 狀態建立前被拒。
+    for attempt in 0..32 {
+        let rig = PortRig::new("COM0", FakeDut::echo_first_n_chars(128));
+        let body = "r".repeat(300);
+        let task = paced(
+            &rig,
+            &body,
+            "ft-282-publish-race",
+            64,
+            Duration::from_secs(30),
+        );
+        rig.dut.wait_bytes(192);
+
+        let freeze = rig.fence.clone();
+        let stop = rig.fence.with(|_| {
+            // 這是第三個 slice 的 echo；傳輸醒來後會在 fence 鎖處等待下一次 submit。
+            rig.push_rx(&"r".repeat(64).into_bytes());
+            std::thread::sleep(Duration::from_millis(5));
+
+            let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+            let stop = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                freeze.freeze_for_shutdown_settling()
+            });
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let deadline = Instant::now() + Duration::from_millis(10);
+            while !rig.fence.shutdown_started_published() && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            stop
+        });
+        let _ = stop.join().unwrap();
+        rig.pump_clock_until(Duration::from_millis(100), || task.is_finished());
+        let result = task.join_within(Duration::from_secs(2));
+        assert!(
+            matches!(result, Err(TransferAbort::TxRejected { rej: ref reject, .. }) if reject.reason == RejectReason::Draining),
+            "attempt={attempt}: {result:?}"
+        );
+
+        let bytes = rig.dut.bytes();
+        assert!(
+            bytes.ends_with(b"\n"),
+            "attempt={attempt}: DUT 留下半行：{bytes:?}"
+        );
+        let kills = bytes.iter().filter(|byte| **byte == 0x15).count();
+        if kills == 1 {
+            assert!(
+                bytes.ends_with(b"\x15\n"),
+                "attempt={attempt}: 清行位元組不完整：{bytes:?}"
+            );
+            assert_eq!(kills, 1, "attempt={attempt}: 清行只能一次");
+            assert!(bytes[..bytes.len() - 2].iter().all(|byte| *byte == b'r'));
+        } else {
+            assert_eq!(kills, 0, "attempt={attempt}: 清行不得重複");
+            assert_eq!(bytes, [body.as_bytes(), b"\n"].concat());
+        }
+        assert!(
+            rig.fence.with(|state| state.frozen),
+            "attempt={attempt}: fence 必須凍結"
+        );
+    }
+}
+
+#[test]
 fn shutdown_settle_kills_line_when_echo_stalls() {
     let rig = PortRig::new("COM0", FakeDut::echo_first_n_chars(128));
     let task = paced(

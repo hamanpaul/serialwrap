@@ -217,6 +217,58 @@ impl FenceState {
 /// 待凍結時用來喚醒傳輸行持有者的軟旗標。
 pub struct Fence(Mutex<FenceState>, AtomicBool, AtomicBool, Mutex<()>, Mutex<Option<RunCancel>>);
 
+#[cfg(test)]
+mod shutdown_publication_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn settling_shutdown_publishes_only_after_acquiring_fence_state_lock() {
+        let fence = Fence::new();
+        let rx = crate::uart_bridge::RxShared::new(1024, 0);
+        assert!(fence.open_transfer_line(OpId(11), RunCancel::new(&rx)));
+
+        // 模擬傳送閘門持有 fence 狀態鎖時停機到達；停機旗標必須等到同一把鎖，
+        // 才能與 pending/frozen 狀態一起發布。
+        let state_guard = fence.0.lock().unwrap();
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        let stop_fence = fence.clone();
+        let stop = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            stop_fence.freeze_for_shutdown_settling()
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "停機執行緒未進入 fence 狀態鎖的等待"
+            );
+            assert!(
+                !fence.shutdown_started_published(),
+                "取得 fence 狀態鎖前不得先發布停機旗標"
+            );
+            match fence.3.try_lock() {
+                Ok(start_guard) => drop(start_guard),
+                Err(TryLockError::Poisoned(poisoned)) => drop(poisoned.into_inner()),
+                Err(TryLockError::WouldBlock) => break,
+            }
+            std::thread::yield_now();
+        }
+
+        // 舊順序會在持有 fence 狀態鎖時先發布原子旗標；讓執行緒越過該步後
+        // 再確認旗標仍未發布，避免只觀察到剛啟動的瞬間。
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            !fence.shutdown_started_published(),
+            "停機旗標不得早於待凍結／凍結狀態發布"
+        );
+        drop(state_guard);
+        assert_eq!(stop.join().unwrap(), ShutdownFreeze::PendingLine);
+    }
+}
+
 impl Fence {
     pub fn new() -> Arc<Fence> {
         Arc::new(Fence(
@@ -269,12 +321,11 @@ impl Fence {
 
     /// issue 282：有傳輸行持有時先發布待凍結並軟喚醒持有者；否則立即凍結。
     pub fn freeze_for_shutdown_settling(&self) -> ShutdownFreeze {
-        {
-            let _start = self.lock_command_start();
-            self.2.store(true, Ordering::SeqCst);
-        }
-
+        let start = self.lock_command_start();
         let (result, settle) = self.with(|state| {
+            // 與 FenceSubmitGate 共用同一把狀態鎖發布旗標和 pending/frozen，
+            // 避免持有者在旗標已設、待凍結狀態尚未可見的窗口被誤拒。
+            self.2.store(true, Ordering::SeqCst);
             if state.transfer_line.is_some() && !state.frozen && !state.handoff_frozen {
                 let settle = self
                     .4
@@ -290,6 +341,7 @@ impl Fence {
             state.frozen = true;
             (ShutdownFreeze::Frozen, None)
         });
+        drop(start);
 
         if let Some(settle) = settle {
             settle.trigger();
