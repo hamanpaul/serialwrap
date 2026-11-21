@@ -15,6 +15,7 @@ use support::{ActorRig, PASSTHROUGH_PROFILE, SHELL_PROFILE};
 use sw_core::file_transfer::templates as t;
 use sw_core::file_transfer::{FileTransferKind, FileTransferRequest};
 use sw_core::session_core::{SessionRequest, SessionState};
+use sw_core::tx_writer::ShutdownFreeze;
 use sw_pal::fakes::serial::FakeWriteStep;
 use sw_pal::traits::Clock;
 use sw_proto::pycompat::PyOsError;
@@ -623,4 +624,99 @@ fn release_during_push_discards_deferred_human_bytes() {
     std::thread::sleep(Duration::from_millis(150));
     assert_eq!(x.peer.tx_len(), after, "RELEASED 後 DUT 零新增 bytes");
     assert!(!x.peer.dut_bytes().windows(4).any(|w| w == b"KEYZ"), "deferred 按鍵不得於 release 後回放");
+}
+
+#[test]
+fn shutdown_settle_midline_stall_kills_line_and_aborts() {
+    let x = XferRig::ready(SHELL_PROFILE, ShellCaps::busybox_base64());
+    let rx = push_held_in_chunk_loop(&x);
+    x.wait_peer_holding();
+
+    assert_eq!(
+        x.rig.fence.freeze_for_shutdown_settling(),
+        ShutdownFreeze::PendingLine
+    );
+    let response = rx
+        .recv_timeout(XFER_WAIT)
+        .expect("傳輸中止回覆")
+        .expect("回覆字典");
+    assert_eq!(
+        code(&response).as_deref(),
+        Some("COMMAND_ABORTED_IN_FLIGHT"),
+        "{response:?}"
+    );
+    assert_eq!(
+        (
+            int_of(&response, "chunks_sent"),
+            int_of(&response, "chunks_total")
+        ),
+        (Some(1), Some(3))
+    );
+
+    let bytes = x.peer.dut_bytes();
+    assert!(
+        bytes.ends_with(b"\x15\n"),
+        "清行位元組必須收尾：{:?}",
+        &bytes[bytes.len().saturating_sub(72)..]
+    );
+    assert_eq!(bytes.windows(2).filter(|w| *w == b"\x15\n").count(), 1);
+    x.rig.fence.with(|state| {
+        assert!(state.frozen);
+        assert!(!state.shutdown_freeze_pending);
+        assert_eq!(state.transfer_line, None);
+    });
+    let aborted: Vec<_> = x
+        .rig
+        .wal_meta_events()
+        .into_iter()
+        .filter(|meta| meta.get("event") == Some(&PyValue::from("command_aborted_in_flight")))
+        .collect();
+    assert_eq!(aborted.len(), 1);
+    let after_reply = x.peer.tx_len();
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(x.peer.tx_len(), after_reply, "停機凍結後不得新增 TX");
+
+    x.peer.release_hold();
+    assert_eq!(
+        x.peer.lines_containing("SW_XFER_CHUNK_"),
+        1,
+        "清行後不得執行被中止的 chunk"
+    );
+}
+
+#[test]
+fn shutdown_settle_midline_never_leaves_half_line() {
+    let x = XferRig::ready(SHELL_PROFILE, ShellCaps::busybox_base64());
+    let rx = push_held_in_chunk_loop(&x);
+    x.wait_peer_holding();
+
+    assert_eq!(
+        x.rig.fence.freeze_for_shutdown_settling(),
+        ShutdownFreeze::PendingLine
+    );
+    x.peer.release_hold();
+    let response = rx
+        .recv_timeout(XFER_WAIT)
+        .expect("傳輸中止回覆")
+        .expect("回覆字典");
+    assert_eq!(
+        code(&response).as_deref(),
+        Some("COMMAND_ABORTED_IN_FLIGHT"),
+        "{response:?}"
+    );
+
+    let bytes = x.peer.dut_bytes();
+    assert!(bytes.ends_with(b"\n"), "輸入列必須以 LF 結尾");
+    x.rig.fence.with(|state| assert!(state.frozen));
+    let after_reply = x.peer.tx_len();
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(x.peer.tx_len(), after_reply, "停機凍結後零 TX");
+
+    if !bytes.contains(&0x15) {
+        assert_eq!(x.peer.lines_containing("SW_XFER_CHUNK_"), 2);
+        assert_eq!(int_of(&response, "chunks_sent"), Some(2));
+    } else {
+        assert_eq!(bytes.windows(2).filter(|w| *w == b"\x15\n").count(), 1);
+        assert_eq!(int_of(&response, "chunks_sent"), Some(1));
+    }
 }
