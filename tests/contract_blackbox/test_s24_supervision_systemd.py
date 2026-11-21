@@ -14,7 +14,7 @@ BY_PATH／CONFIG 全部隔離（`SwEnv.isolated_env()`），by-id 目錄只放 s
 
 SC-11 為 `ab_participation: diff`：Rust 停止序先取消進行中的長 RPC（Phase 1）再 join handler（Task 12），
 Python 基線 `server.stop()` 先等 handler 自然結束；故 push 進行中停止的「回覆碼」與「停機耗時上限」只對 Rust 斷言，
-其餘不變量（exit 0、WAL 完整、已收到的 chunk 都有 WAL TX、重啟後零重送）兩側相同。
+其餘不變量（exit 0、WAL 完整、已收到的 chunk 都有 WAL TX、停機後輸入列收尾、重啟後零殘留與零重送）兩側相同。
 外部 oracle：DUT 端 `shell_target.commands()`／`rx_log()`；WAL 只作關聯。stdlib＋pytest＋PTY，不得 import 產品碼。
 """
 from __future__ import annotations
@@ -27,7 +27,6 @@ import signal
 import subprocess
 import time
 import types
-import warnings
 import zlib
 
 import pytest
@@ -124,14 +123,8 @@ def _settled_rx_len(shell_target, quiet_s: float = 2.0, timeout_s: float = 10.0)
     raise AssertionError(f"DUT RX 在 {timeout_s:.1f}s 內未靜定：{len(shell_target.rx_log())} bytes")
 
 
-# 測試觀察上限（非產品期限）。hosted runner 上本檔從啟動到 READY 實測不到 3 s（PR #278 第 3、7 輪 junit：
-# test_sigterm_ordered_shutdown 0.13～0.47 s、test_restart_on_failure_… 2.3～2.9 s），啟動與登入並不慢。
-# 會超過 20 s 的只有 test_stop_during_push_flushes_wal「重啟後」那一次等待，原因是產品行為（issue #282，
-# 擁有者裁決 0.5.1 修、不阻擋 0.5.0）：push 進行中停機時，echo-paced 已送出、尚未送行尾的 chunk 命令本文留在
-# DUT 輸入列；新 daemon attach 後的第一個探測換行把殘留內容送進 shell。殘留若停在引號內，shell 進入續行、
-# 探測得不到 prompt（PR #278 第 6 輪傾印：ATTACHED、last_error=PROMPT_UNAVAILABLE、reprobe_attempts=0），
-# 要等 reprobe（RX 閒置 3 s、退避 2 s 起）才回 READY。60 s 是把這段恢復延遲算進去的上限；#282 修正後應改回 20 s。
-READY_WAIT_S = 60
+# 測試觀察上限（非產品期限）；本檔從啟動到 READY 的正常觀察應在 20 s 內完成。
+READY_WAIT_S = 20
 
 
 def _wait_ready_observing(sw_env, com: str, timeout: float) -> list[str]:
@@ -236,10 +229,12 @@ def test_stop_during_push_flushes_wal(sw_env, shell_target, transient_unit, tmp_
             assert line.encode() in tx_payloads, f"DUT 已收到的 chunk 必有對應 WAL TX：{line[:80]}"
         # 重啟後不自動重送（no_auto_resend）：重啟後到達 DUT 的 bytes 不得含任何 chunk 命令。
         # 以 DUT 端位元組位移切出「重啟後才收到」的部分（判準仍是 DUT 端，不用受測 daemon 自己寫的 WAL）：
-        # 停機時寫到一半、尚無行尾的 chunk 行，會被新 daemon 的第一個換行補成完整行；舊的「完整行數」比對因此會
-        # 把它誤算成重送（PR #278 第七輪 hosted CI：39 vs 38）。新 daemon 若真的重送，chunk sentinel 必出現在位移之後。
+        # 新 daemon 若真的重送，chunk sentinel 必出現在位移之後。
         rx_before_restart = _settled_rx_len(shell_target)
         rx_at_restart = shell_target.rx_log()[:rx_before_restart]
+        assert not rx_at_restart or rx_at_restart.endswith(b"\n"), (
+            f"停機靜定後 DUT 輸入列不得留半行：{rx_at_restart[-160:]!r}"
+        )
         transient_unit.start()
         errors_seen = _wait_ready_observing(sw_env, "COM0", READY_WAIT_S)
         # 保留原有 1 秒 no-auto-resend 觀察窗，再排空 relay 後檢查重啟後收到的 bytes。
@@ -248,24 +243,80 @@ def test_stop_during_push_flushes_wal(sw_env, shell_target, transient_unit, tmp_
         after_restart = shell_target.rx_log()[rx_before_restart:]
         assert b"SW_XFER_CHUNK" not in after_restart, f"重啟後不得重送 chunk：{after_restart[:240]!r}"
         assert b"base64 -d >>" not in after_restart, f"重啟後不得重送 chunk 資料：{after_restart[:240]!r}"
-        # issue #282（0.5.1 修）：上面的位移判準看不到「停機殘留的半行被新 daemon 的探測換行送出」。這裡把它記成
-        # 可觀察量（junit property＋warning），並限制在已知現象的範圍內：殘留至多一行，所以重啟後 DUT 至多多執行
-        # 一個 chunk 命令；超過 1 就不是 #282，而是真的重送。
         residue = _restart_residue_report(
             rx_at_restart, after_restart, len(received), shell_target.commands(), errors_seen,
         )
         for key, value in residue.items():
-            record_property(f"issue282_{key}", value)
-        if (residue["residual_submitted_after_restart"] or residue["extra_chunk_commands"]
-                or residue["prompt_unavailable_seen"]):
-            warnings.warn(
-                f"#282：push 進行中停機後 DUT 輸入列殘留被重啟後的探測換行送出（{residue}）", stacklevel=1,
-            )
-        assert residue["extra_chunk_commands"] <= 1, (
-            f"重啟後 DUT 多執行 {residue['extra_chunk_commands']} 個 chunk 命令，超出 #282 已知的至多 1 個：{residue}"
-        )
+            record_property(f"shutdown_residue_{key}", value)
+        assert residue["residual_input_bytes"] == 0, residue
+        assert residue["residual_submitted_after_restart"] is False, residue
+        assert residue["extra_chunk_commands"] == 0, residue
+        assert residue["prompt_unavailable_seen"] is False, residue
     finally:
         # 中止的 push 不送 cleanup（OD-62）：自行移除 shelltarget（本機 /bin/sh）留下的上傳暫存檔與目的檔。
+        Path(remote).unlink(missing_ok=True)
+        for name in set(re.findall(rb"/tmp/\.sw_upload_[0-9a-f]{12}", shell_target.rx_log())):
+            Path(name.decode("ascii")).unlink(missing_ok=True)
+
+
+def test_stop_during_push_midline_leaves_clean_input_line(sw_env, shell_target, transient_unit, tmp_path):
+    """固定停在 echo 等待中的命令本文，確認停機會完成或清掉該 DUT 輸入列。"""
+    sw_env.prepare(targets={"COM0": shell_target})
+    transient_unit.start()
+    sw_env.wait_state("COM0", "READY", timeout=READY_WAIT_S)
+    src = tmp_path / "push-midline.bin"
+    src.write_bytes(bytes(range(256)) * 256)               # 64 KiB
+    remote = f"/tmp/sw-p8-midline-{os.getpid()}.bin"
+    fut = sw_env.rpc_async("file.push", {
+        "selector": "COM0", "local_path": str(src), "remote_path": remote,
+    })
+    try:
+        sw_env.wait_until(
+            lambda: sum("SW_XFER_CHUNK" in c for c in shell_target.commands()) >= 2,
+            timeout=30,
+        )
+        shell_target.arm(echo_stall_after=200)
+        stall_offset = len(shell_target.rx_log())
+        _settled_rx_len(shell_target, quiet_s=0.5)
+
+        rx_at_stall = shell_target.rx_log()
+        open_line = rx_at_stall[rx_at_stall.rfind(b"\n") + 1:]
+        assert len(open_line) > 0, f"echo 停滯切點必須落在本文與行尾之間：{open_line!r}"
+        assert b"printf '%s' '" in open_line, f"切點必須落在 chunk 命令本文：{open_line[-160:]!r}"
+        assert sw_env.session("COM0")["foreground_busy"] is True, "傳輸須仍在進行，尚未自行走到 echo 逾時"
+
+        took = transient_unit.stop()
+        assert transient_unit.last_status() == "exited:0", (transient_unit.last_status(), took)
+        reply = fut.result(timeout=30)
+        assert reply.get("ok") is False, reply
+        if is_rust():
+            assert took <= STOP_CAP_S, f"停止耗時 {took:.2f}s 超過 2.0 s＋5 s"
+            assert reply.get("error_code") in OD62_ABORT_CODES, reply
+
+        settled_after_stop = _settled_rx_len(shell_target, quiet_s=0.5)
+        rx_after_stop = shell_target.rx_log()[:settled_after_stop]
+        assert rx_after_stop.endswith(b"\n"), f"停機靜定後 DUT 輸入列必須有行尾：{rx_after_stop[-160:]!r}"
+        stop_bytes = rx_after_stop[stall_offset:]
+        assert stop_bytes.count(b"\x15\n") == 1, f"停機收尾須恰清行一次：{stop_bytes[-240:]!r}"
+
+        before_restart_commands = [c for c in shell_target.commands() if "SW_XFER_CHUNK" in c]
+        rx_at_restart = rx_after_stop
+        shell_target.arm()
+        transient_unit.start()
+        errors_seen = _wait_ready_observing(sw_env, "COM0", READY_WAIT_S)
+        assert "PROMPT_UNAVAILABLE" not in errors_seen, errors_seen
+        time.sleep(1.0)
+        _settled_rx_len(shell_target, quiet_s=0.5)
+        after_restart = shell_target.rx_log()[settled_after_stop:]
+        assert b"SW_XFER_CHUNK" not in after_restart, after_restart[-240:]
+        assert b"base64 -d >>" not in after_restart, after_restart[-240:]
+
+        residue = _restart_residue_report(
+            rx_at_restart, after_restart, len(before_restart_commands),
+            shell_target.commands(), errors_seen,
+        )
+        assert residue["extra_chunk_commands"] == 0, residue
+    finally:
         Path(remote).unlink(missing_ok=True)
         for name in set(re.findall(rb"/tmp/\.sw_upload_[0-9a-f]{12}", shell_target.rx_log())):
             Path(name.decode("ascii")).unlink(missing_ok=True)

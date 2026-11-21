@@ -313,3 +313,183 @@ def f7_binary_roundtrip_md5(ctx):
               "SKIP（待 follow-up issue）。",))
 def f7_larger_file_not_truncated(ctx):
     return _run_on_boards(ctx, _larger_file_on, case_tag="big")
+
+def _throwaway_line_command(ta: Any, com: str, command: str, *, timeout_s: float = 15.0) -> dict[str, Any]:
+    """在 throwaway session 執行一條 line command，回傳終態 command 欄位。"""
+    import time
+    submitted = ta.run(
+        "cmd", "submit", "--selector", com, "--cmd", command,
+        "--cmd-timeout", str(timeout_s), timeout=20.0,
+    )
+    cmd_id = submitted.get("cmd_id")
+    if not submitted.get("ok") or not cmd_id:
+        return {"status": "submit_failed", "response": submitted}
+    deadline = time.monotonic() + timeout_s + 5.0
+    while time.monotonic() < deadline:
+        result = ta.run("cmd", "status", "--cmd-id", str(cmd_id), timeout=10.0)
+        command_result = result.get("command") or {}
+        if command_result.get("status") in {"done", "error", "timeout", "canceled"}:
+            return command_result
+        time.sleep(0.1)
+    return {"status": "wait_timeout", "cmd_id": str(cmd_id)}
+
+
+def _chunk_tx_count(ta: Any) -> int:
+    """計算 throwaway WAL 中已完成的 chunk 命令數。"""
+    import base64
+    import json
+
+    count = 0
+    for line in ta.wal_text().splitlines():
+        try:
+            record = json.loads(line)
+            payload = base64.b64decode(record.get("payload_b64") or "", validate=True)
+        except (ValueError, TypeError):
+            continue
+        if record.get("dir") == "TX" and b"SW_XFER_CHUNK" in payload:
+            count += 1
+    return count
+
+
+def _body_push_stop_midline_clean_restart(ctx: Any, ta: Any, ta_com: str, board: dict[str, Any]) -> CaseResult:
+    """在真板 push 進行中 SIGTERM，重啟後以 READY/self-test 與目的檔狀態驗收。"""
+    import re
+    import signal
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    from .f10_login_creds import _session_by_com, _ta_com, _wait_dynamic_sessions, _wait_state
+
+    local_path = ctx.case_dir / "f7-stop-midline.bin"
+    remote_path = f"/tmp/swreg-i282-{os.getpid()}-{time.monotonic_ns()}.bin"
+    current_com = ta_com
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path.write_bytes(os.urandom(64 * 1024))
+
+    def temp_snapshot() -> tuple[set[str], bool, str]:
+        command = (
+            "printf 'I282_'$((6*7))'_BEGIN\\n'; "
+            "for f in /tmp/* /tmp/.[!.]* /tmp/..?*; do [ -f \"$f\" ] && printf '%s\\n' \"$f\"; done; "
+            f"if [ ! -e {remote_path} ]; then printf 'I282_'$((6*7))'_DEST_ABSENT\\n'; fi; "
+            "printf 'I282_'$((6*7))'_END\\n'"
+        )
+        result = _throwaway_line_command(ta, current_com, command)
+        output = str(result.get("stdout") or "")
+        begin, end = "I282_42_BEGIN", "I282_42_END"
+        if result.get("status") != "done" or begin not in output or end not in output:
+            return set(), False, output
+        section = output.split(begin, 1)[1].split(end, 1)[0]
+        lines = [line.strip() for line in section.splitlines() if line.strip()]
+        paths = {line for line in lines if line.startswith("/tmp/")}
+        return paths, "I282_42_DEST_ABSENT" in lines, output
+
+    try:
+        before_temps, before_dest_absent, before_output = temp_snapshot()
+        if not before_dest_absent:
+            return CaseResult("SKIP", reason=f"目的路徑已存在或板端快照不完整：{before_output!r}",
+                              category="environment", reason_code="remote_path_not_clean")
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            push = pool.submit(
+                ta.run,
+                "--timeout", "180", "file", "push", "--selector", ta_com,
+                "--local", str(local_path), "--remote", remote_path,
+                timeout=210.0,
+            )
+            deadline = time.monotonic() + 30.0
+            observed_inflight = False
+            while time.monotonic() < deadline and not push.done():
+                session = _session_by_com(ta.run("session", "list", timeout=10.0), ta_com)
+                if session.get("foreground_busy") is True and _chunk_tx_count(ta) >= 2:
+                    observed_inflight = True
+                    break
+                time.sleep(0.1)
+            if not observed_inflight:
+                if push.done():
+                    push.result()
+                    return CaseResult("SKIP", reason="push 未進入兩個已送達 chunk 的在途狀態，未觸發停機",
+                                      category="environment", reason_code="push_not_observed_inflight")
+                # 限時內未取得 chunk 證據時停止 throwaway，避免留下背景傳輸。
+                os.killpg(int(ta._proc_pgid), signal.SIGTERM)
+                push.result(timeout=150.0)
+                return CaseResult("SKIP", reason="30 秒內未觀察到兩個已送達 chunk，案例證據不足",
+                                  category="environment", reason_code="push_progress_not_observed")
+
+            old_pgid = int(ta._proc_pgid)
+            os.killpg(old_pgid, signal.SIGTERM)
+            push_reply = push.result(timeout=150.0)
+
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(old_pgid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            return CaseResult("FAIL", reason="SIGTERM 後 throwaway daemon 行程群仍存活",
+                              category="test", reason_code="daemon_stop_timeout")
+
+        ctx.note("f7-stop-midline-push-reply.json", str(push_reply))
+        if push_reply.get("ok") is True:
+            stop_observed = False
+        else:
+            stop_observed = push_reply.get("error_code") in {
+                "COMMAND_ABORTED_IN_FLIGHT", "FLUSHED_BY_RECOVERY",
+            }
+
+        # 清理已退出的第一個 run dir，再用相同隔離 workdir 啟動 throwaway。
+        ta.__exit__(None, None, None)
+        ta.__enter__()
+        listing = _wait_dynamic_sessions(ta, timeout_s=30.0, poll_s=0.5)
+        restarted_com = _ta_com(listing, str(board.get("serial") or ""))
+        current_com = restarted_com
+        ready = _wait_state(ta, restarted_com, "READY", timeout_s=90.0, poll_s=0.5)
+        ctx.note("f7-stop-midline-restarted-session.json", str(ready))
+        if ready.get("state") != "READY":
+            return CaseResult("FAIL", reason=f"SIGTERM 重啟後 session 未回 READY：{ready!r}",
+                              category="test", reason_code="restart_not_ready")
+
+        self_test = ta.run("session", "self-test", "--selector", restarted_com, timeout=60.0)
+        ctx.note("f7-stop-midline-self-test.json", str(self_test))
+        if self_test.get("ok") is not True:
+            return CaseResult("FAIL", reason=f"重啟後 self-test 未通過：{self_test!r}",
+                              category="test", reason_code="restart_self_test_failed")
+
+        after_temps, after_dest_absent, after_output = temp_snapshot()
+        new_temps = after_temps - before_temps
+        ctx.note("f7-stop-midline-temp-files.txt", after_output)
+        if not after_dest_absent:
+            return CaseResult("FAIL", reason="中止的 push 不得建立目的檔",
+                              category="test", reason_code="partial_push_destination_created")
+        if any(not re.fullmatch(r"/tmp/\.sw_upload_[0-9a-f]{12}", path) for path in new_temps):
+            return CaseResult("FAIL", reason=f"DUT 出現非 push 暫存檔：{sorted(new_temps)}",
+                              category="test", reason_code="unexpected_remote_file")
+
+        if new_temps:
+            cleanup = "rm -f " + " ".join(new_temps)
+            _throwaway_line_command(ta, restarted_com, cleanup)
+        if not stop_observed:
+            return CaseResult("SKIP", reason=f"push 未回報在途中止碼：{push_reply!r}；restart/self-test 已通過",
+                              category="environment", reason_code="midline_abort_not_observed")
+        return CaseResult("PASS", reason="push 在途 SIGTERM 後 throwaway 重啟、自我測試通過，未見目的檔或非暫存輸出")
+    finally:
+        _cleanup_local(local_path)
+
+
+@_case(
+    "f7-push-stop-midline-clean-restart",
+    "push 進行中 SIGTERM 後重啟回 READY，DUT 不執行殘留命令",
+    issues=("#282",),
+    requires=("posix_throwaway_daemon",),
+    destructive=True,
+    hints=(
+        "只在擁有者 bench 執行：以 throwaway daemon 對真板 push 64 KiB，至少觀察兩個已送達 chunk 後送 SIGTERM，再重啟並驗 self-test。",
+        "檢查目的檔不存在，新增檔案僅允許 `/tmp/.sw_upload_*`；此項涵蓋真實 shell 對 Ctrl-U 的反應與 750 ms 行收尾期限。",
+        "此 case 會先由既有 F10 交接骨架 release 正式 session，finally 以 device attach 收回；需 allow_destructive: true。",
+    ),
+)
+def f7_push_stop_midline_clean_restart(ctx: Any) -> CaseResult:
+    """#282 真機差異：Ctrl-U 相容性與實體線路行收尾期限。"""
+    from .f10_device_handoff import _run_with_handoff
+
+    return _run_with_handoff(ctx, "f7-push-stop-midline-clean-restart", _body_push_stop_midline_clean_restart)
