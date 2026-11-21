@@ -229,7 +229,8 @@ def _unreapable_daemon(tmp_path, monkeypatch):
     daemon._run_dir = tmp_path / "run"
     daemon._run_dir.mkdir()
     signals: list[tuple[int, int]] = []
-    monkeypatch.setattr(guards.os, "killpg", lambda pgid, sig: signals.append((pgid, sig)))
+    # Windows 的 os 沒有 killpg：raising=False 讓替身在兩個平台都裝得上（收尾邏輯本身與平台無關）。
+    monkeypatch.setattr(guards.os, "killpg", lambda pgid, sig: signals.append((pgid, sig)), raising=False)
     monkeypatch.setattr(daemon, "run", lambda *args, **kwargs: None)
     return daemon, signals
 
