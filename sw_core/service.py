@@ -1251,6 +1251,8 @@ class SerialwrapService:
             if err is not None:
                 return err
             assert session_id is not None
+            # session 可能在解析後就被移除（None）；取不到 profile 時視為未設上限。
+            profile = getattr(self._sessions.get_session(session_id), "profile", None)
             result = self._arbiter.submit(
                 session_id=session_id,
                 command=cmd,
@@ -1263,6 +1265,7 @@ class SerialwrapService:
                 admission_com=self._admission_com(params),
                 trusted_human=trusted_human,
                 expect_reboot=expect_reboot is True,
+                max_console_line_chars=getattr(profile, "max_console_line_chars", None),
             )
             if result.get("ok") and expect_reboot is not True and mode != "interactive":
                 segment = find_chained_reboot_segment(cmd)

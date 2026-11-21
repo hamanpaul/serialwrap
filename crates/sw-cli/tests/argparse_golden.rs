@@ -5,7 +5,7 @@ use sw_cli::argparse::{parse_args, ParseResult};
 use sw_cli::cli_spec::{root_spec, SpecDefaults};
 
 /// `contracts/cli_help/linux` 以 Python 基線固定的 daemon 指紋；不是 Rust 執行檔雜湊。
-const PYTHON_BASELINE_FINGERPRINT: &str = "dde486cbcbb5";
+const PYTHON_BASELINE_FINGERPRINT: &str = "bcb9ce2d5eb9";
 
 #[derive(Debug)]
 struct Case {
