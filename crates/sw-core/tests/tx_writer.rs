@@ -2002,3 +2002,124 @@ fn zero_progress_cancel_after_freeze_is_not_submitted_draining() {
     assert_eq!(result.outcome, TxOutcome::Completed(2), "已有確認 bytes 者不改寫（BC-03）");
     assert_eq!(reject, None);
 }
+
+#[test]
+fn submit_gate_allows_pending_line_holder() {
+    let fence = Fence::new();
+    fence.with(|state| state.active_epoch = Some(7));
+    let rx = RxShared::new(1024, 0);
+    assert!(fence.open_transfer_line(OpId(11), RunCancel::new(&rx)));
+    assert_eq!(
+        fence.freeze_for_shutdown_settling(),
+        ShutdownFreeze::PendingLine
+    );
+
+    let permit = shutdown_permit(11, TxClass::FileTransfer);
+    let gate = FenceSubmitGate {
+        fence: &fence,
+        permit: &permit,
+        last_reject: std::cell::Cell::new(None),
+    };
+    let mut submits = 0;
+    let result = gate.submit(&mut || {
+        submits += 1;
+        SubmitStep::Accepted(1)
+    });
+    assert!(matches!(result, Ok(SubmitStep::Accepted(1))));
+    assert_eq!(submits, 1);
+    assert_eq!(gate.last_reject.get(), None);
+}
+
+#[test]
+fn submit_gate_rejects_non_holder_while_line_pending() {
+    let fence = Fence::new();
+    fence.with(|state| state.active_epoch = Some(7));
+    let rx = RxShared::new(1024, 0);
+    assert!(fence.open_transfer_line(OpId(11), RunCancel::new(&rx)));
+    assert_eq!(
+        fence.freeze_for_shutdown_settling(),
+        ShutdownFreeze::PendingLine
+    );
+
+    let permit = shutdown_permit(12, TxClass::FileTransfer);
+    let gate = FenceSubmitGate {
+        fence: &fence,
+        permit: &permit,
+        last_reject: std::cell::Cell::new(None),
+    };
+    let mut submits = 0;
+    assert!(gate
+        .submit(&mut || {
+            submits += 1;
+            SubmitStep::Accepted(1)
+        })
+        .is_err());
+    assert_eq!(submits, 0, "非持有者不應呼叫 OS submit");
+    assert_eq!(gate.last_reject.get(), Some(FenceReject::Frozen));
+}
+
+#[test]
+fn submit_gate_rejects_original_holder_after_close_or_force_freeze() {
+    for force in [false, true] {
+        let fence = Fence::new();
+        fence.with(|state| state.active_epoch = Some(7));
+        let rx = RxShared::new(1024, 0);
+        assert!(fence.open_transfer_line(OpId(11), RunCancel::new(&rx)));
+        assert_eq!(
+            fence.freeze_for_shutdown_settling(),
+            ShutdownFreeze::PendingLine
+        );
+        if force {
+            fence.force_shutdown_freeze();
+        } else {
+            fence.close_transfer_line(OpId(11));
+        }
+
+        let permit = shutdown_permit(11, TxClass::FileTransfer);
+        let gate = FenceSubmitGate {
+            fence: &fence,
+            permit: &permit,
+            last_reject: std::cell::Cell::new(None),
+        };
+        let mut submits = 0;
+        assert!(gate
+            .submit(&mut || {
+                submits += 1;
+                SubmitStep::Accepted(1)
+            })
+            .is_err());
+        assert_eq!(submits, 0, "force={force}: 凍結後不得呼叫 OS submit");
+        assert_eq!(gate.last_reject.get(), Some(FenceReject::Frozen));
+    }
+}
+
+#[test]
+fn submit_gate_rejects_every_class_when_shutdown_has_no_open_line() {
+    let fence = Fence::new();
+    assert_eq!(fence.freeze_for_shutdown_settling(), ShutdownFreeze::Frozen);
+
+    for (op, class) in [
+        (11, TxClass::FileTransfer),
+        (12, TxClass::Command),
+        (13, TxClass::HumanRaw),
+        (14, TxClass::SelfTestProbe),
+        (15, TxClass::SystemRecoverKey),
+        (16, TxClass::LoginProbe),
+    ] {
+        let permit = shutdown_permit(op, class);
+        let gate = FenceSubmitGate {
+            fence: &fence,
+            permit: &permit,
+            last_reject: std::cell::Cell::new(None),
+        };
+        let mut submits = 0;
+        assert!(gate
+            .submit(&mut || {
+                submits += 1;
+                SubmitStep::Accepted(1)
+            })
+            .is_err());
+        assert_eq!(submits, 0, "{class:?} 不得呼叫 OS submit");
+        assert_eq!(gate.last_reject.get(), Some(FenceReject::Frozen));
+    }
+}

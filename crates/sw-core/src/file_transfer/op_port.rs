@@ -3,7 +3,7 @@
 //! 對照 `uart_io.py` 的 `send_command`、`send_command_echo_paced`、`_await_echo_progress`、`cancel_input_line`、
 //! `rx_snapshot_len`／`rx_text_from`／`wait_for_regex_from`。TX 一律經該 epoch 的 `TxWriterHandle`
 //! （`TxClass::FileTransfer`、permit 的 `op_id` 為授權 grant 的 `op_id`；OD-62 整個傳輸共用一個 TX operation）；
-//! RX 讀 `RxShared`。等待一律走 `RxShared::wait_for_regex_cancellable`（注入的 `Clock` 與同一個 `RunCancel`）。
+//! RX 讀 `RxShared`。等待使用注入的 `Clock`；echo 等待合併硬取消與停機軟喚醒，其餘等待沿用硬取消旗標。
 //!
 //! 中止（brief 不符 #2、#3、#5）：被拒那筆不重送，回 [`TransferAbort::TxRejected`]（只填 `rej`，`chunks`／
 //! `transfer_cmd_id` 由引擎補齊）；等待被取消時以一次零 TX 的 `Fence::admit` 判定「此刻送出會被拒的原因」。
@@ -21,12 +21,25 @@ use crate::session_core::OpGrant;
 use crate::tx_writer::{AggregateKey, AggregateOp, FenceReject, TxClass, TxJob, TxPermit, TxReport};
 use crate::uart_bridge::{RunCancel, WaitOutcome};
 
+/// 停機時允許目前 echo-paced 行收尾的最長時間。
+const LINE_SETTLE_FINISH_BUDGET: Duration = Duration::from_millis(750);
+/// 停機行期限到時是否送 Ctrl-U 與換行清除半行。
+const LINE_SETTLE_KILL_LINE: bool = true;
+
 /// 前景檔案傳輸的 UART 介面。
 pub struct OpTransferPort<'a> {
     ctx: &'a OpCtx,
     grant: OpGrant,
     /// 呼叫端的取消旗標（同一 flag／login 世代），另監看 drain Phase 1 的檔案傳輸取消世代（brief 不符 #1）。
     cancel: RunCancel,
+    /// 停機待凍結時的軟喚醒旗標；不會取消一般 echo 等待。
+    settle: RunCancel,
+    /// 等待任一硬取消或停機軟喚醒時使用。
+    cancel_or_settle: RunCancel,
+    /// 首次觀察到軟喚醒時的注入時鐘時間。
+    settle_seen: std::cell::Cell<Option<u64>>,
+    /// 本 port 是否成功向 fence 登記目前 echo-paced 行。
+    line_open: bool,
     /// 「有任何新 RX」的等待條件（echo 進度以新 RX 喚醒後重算）。
     any_rx: PyRegex,
     /// P8 Task 6：本次傳輸（同一 grant 的 TX operation）累計 OS 確認寫出的 bytes（含聚合的 echo slice；與該 op 的
@@ -94,12 +107,23 @@ fn nanos(d: Duration) -> u64 {
     d.as_nanos().min(u64::MAX as u128) as u64
 }
 
+fn kill_line_payload(enabled: bool) -> Option<&'static [u8]> {
+    enabled.then_some(&b"\x15\n"[..])
+}
+
 impl<'a> OpTransferPort<'a> {
     pub fn new(ctx: &'a OpCtx, grant: &OpGrant, cancel: &'a RunCancel) -> Self {
+        let cancel = cancel.watching_transfers();
+        let settle = RunCancel::new(&ctx.rx);
+        let cancel_or_settle = cancel.also_flag_of(&settle);
         OpTransferPort {
             ctx,
             grant: grant.clone(),
-            cancel: cancel.watching_transfers(),
+            cancel,
+            settle,
+            cancel_or_settle,
+            settle_seen: std::cell::Cell::new(None),
+            line_open: false,
             any_rx: compile(r"[\s\S]", PyFlags(0)).expect("固定 pattern 必可編譯"),
             confirmed: std::cell::Cell::new(0),
         }
@@ -108,6 +132,33 @@ impl<'a> OpTransferPort<'a> {
     /// P8 Task 6：本次傳輸累計已確認寫出的 bytes（OpRunner 依此做 OD-62 的中止映射）。
     pub fn confirmed_bytes(&self) -> usize {
         self.confirmed.get()
+    }
+
+    fn open_line(&mut self) {
+        self.line_open = self
+            .ctx
+            .tx
+            .open_transfer_line(self.grant.op_id, self.settle.clone());
+    }
+
+    fn close_line(&mut self) {
+        if self.line_open {
+            self.ctx.tx.close_transfer_line(self.grant.op_id);
+            self.line_open = false;
+        }
+    }
+
+    fn note_settle(&self) {
+        if self.line_open && self.settle_seen.get().is_none() && self.settle.is_triggered() {
+            self.settle_seen.set(Some(self.ctx.clock.mono_ns()));
+        }
+    }
+
+    fn settle_due(&self) -> bool {
+        self.note_settle();
+        self.settle_seen.get().is_some_and(|seen| {
+            self.ctx.clock.mono_ns() >= seen.saturating_add(nanos(LINE_SETTLE_FINISH_BUDGET))
+        })
     }
 
     fn permit(&self, source: &str, cmd_id: Option<&str>, log: bool) -> TxPermit {
@@ -172,6 +223,7 @@ impl<'a> OpTransferPort<'a> {
         let clock = &*self.ctx.clock;
         let deadline = clock.mono_ns().saturating_add(nanos(timeout));
         loop {
+            self.note_settle();
             // 先取長度再讀文字：之後抵達的 RX 一定在 `seen` 之後，喚醒不會遺失。
             let seen = self.ctx.rx.snapshot_len();
             let text: String = strip_ansi(&self.ctx.rx.text_from(from))
@@ -180,14 +232,32 @@ impl<'a> OpTransferPort<'a> {
                 .collect();
             let (acked, complete) = echo_progress(&text, expected);
             let now = clock.mono_ns();
-            if complete || now >= deadline {
+            let settle_deadline = self
+                .settle_seen
+                .get()
+                .map(|at| at.saturating_add(nanos(LINE_SETTLE_FINISH_BUDGET)));
+            if settle_deadline.is_some_and(|at| now >= at) || complete || now >= deadline {
                 return Ok(acked);
             }
-            let remaining = Duration::from_nanos(deadline - now);
-            if self.ctx.rx.wait_for_regex_cancellable(&self.any_rx, Some(seen), remaining, clock, &self.cancel)
-                == WaitOutcome::Cancelled
+            let next_deadline = settle_deadline.map_or(deadline, |at| at.min(deadline));
+            let remaining = Duration::from_nanos(next_deadline.saturating_sub(now));
+            let wait_cancel = if self.settle_seen.get().is_some() {
+                &self.cancel
+            } else {
+                &self.cancel_or_settle
+            };
+            if self.ctx.rx.wait_for_regex_cancellable(
+                &self.any_rx,
+                Some(seen),
+                remaining,
+                clock,
+                wait_cancel,
+            ) == WaitOutcome::Cancelled
             {
-                return Err(self.cancelled());
+                if self.cancel.is_triggered() {
+                    return Err(self.cancelled());
+                }
+                self.note_settle();
             }
         }
     }
@@ -230,10 +300,20 @@ impl TransferPort for OpTransferPort<'_> {
         let pre = self.ctx.rx.snapshot_len();
         let mut sent_chars = 0usize;
         let mut acked_chars = 0usize;
+        self.open_line();
         for (idx, piece) in pieces.iter().enumerate() {
+            self.note_settle();
+            if self.settle_seen.get().is_some() && sent_chars == 0 {
+                self.close_line();
+                return Err(self.cancelled());
+            }
+            if self.settle_due() {
+                return Err(self.kill_line(&key, source));
+            }
             let report = self.submit(piece.as_bytes(), source, cmd_id, false, append());
             if !fully_sent(&report, piece.len()) {
                 self.finish(&key);
+                self.close_line();
                 return Err(rejection(&report));
             }
             sent_chars += piece.chars().count();
@@ -241,17 +321,34 @@ impl TransferPort for OpTransferPort<'_> {
                 Ok(acked) => acked,
                 Err(abort) => {
                     self.finish(&key);
+                    self.close_line();
                     return Err(abort);
                 }
             };
+            self.note_settle();
+            if self.settle_due() {
+                return Err(self.kill_line(&key, source));
+            }
             if acked_chars < sent_chars {
+                if self.settle_seen.get().is_some() {
+                    return Err(self.kill_line(&key, source));
+                }
                 // echo 停滯：換行未送出、命令未執行；只記實際確認的 bytes。
                 self.finish(&key);
                 return Ok(EchoPaced { ok: false, acked_chars, sent_chars });
             }
         }
+        self.note_settle();
+        if self.settle_seen.get().is_some() && sent_chars == 0 {
+            self.close_line();
+            return Err(self.cancelled());
+        }
+        if self.settle_due() {
+            return Err(self.kill_line(&key, source));
+        }
         let report = self.submit(b"\n", source, cmd_id, false, append());
         self.finish(&key);
+        self.close_line();
         if !fully_sent(&report, 1) {
             return Err(rejection(&report));
         }
@@ -260,6 +357,7 @@ impl TransferPort for OpTransferPort<'_> {
 
     fn cancel_input_line(&mut self, source: &str) -> Result<(), TransferAbort> {
         let report = self.submit(b"\x15\n", source, None, true, None);
+        self.close_line();
         if fully_sent(&report, 2) { Ok(()) } else { Err(rejection(&report)) }
     }
 
@@ -281,5 +379,33 @@ impl TransferPort for OpTransferPort<'_> {
             WaitOutcome::TimedOut => Ok(false),
             WaitOutcome::Cancelled => Err(self.cancelled()),
         }
+    }
+}
+
+impl OpTransferPort<'_> {
+    fn kill_line(&mut self, key: &AggregateKey, source: &str) -> TransferAbort {
+        self.finish(key);
+        if let Some(payload) = kill_line_payload(LINE_SETTLE_KILL_LINE) {
+            let _ = self.submit(payload, source, None, true, None);
+        }
+        self.close_line();
+        self.cancelled()
+    }
+}
+
+impl Drop for OpTransferPort<'_> {
+    fn drop(&mut self) {
+        self.close_line();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kill_line_payload;
+
+    #[test]
+    fn kill_line_payload_respects_enabled_and_disabled_setting() {
+        assert_eq!(kill_line_payload(true), Some(&b"\x15\n"[..]));
+        assert_eq!(kill_line_payload(false), None);
     }
 }

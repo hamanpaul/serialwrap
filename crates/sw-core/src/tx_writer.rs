@@ -550,7 +550,10 @@ impl SubmitGate for FenceSubmitGate<'_> {
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.fence.shutdown_started_published() {
+        let pending_line_holder = state.shutdown_freeze_pending
+            && self.permit.class == TxClass::FileTransfer
+            && state.transfer_line == Some(self.permit.op_id);
+        if self.fence.shutdown_started_published() && !pending_line_holder {
             self.last_reject.set(Some(FenceReject::Frozen));
             return Err(SubmitRevoked);
         }
