@@ -282,7 +282,9 @@ def test_stop_during_push_midline_leaves_clean_input_line(sw_env, shell_target, 
         rx_at_stall = shell_target.rx_log()
         open_line = rx_at_stall[rx_at_stall.rfind(b"\n") + 1:]
         assert len(open_line) > 0, f"echo 停滯切點必須落在本文與行尾之間：{open_line!r}"
-        assert b"printf '%s' '" in open_line, f"切點必須落在 chunk 命令本文：{open_line[-160:]!r}"
+        assert re.search(rb"printf '%s' [A-Za-z0-9+/=]+", open_line), (
+            f"切點必須落在未加引號的 base64 chunk 命令本文：{open_line[-160:]!r}"
+        )
         assert sw_env.session("COM0")["foreground_busy"] is True, "傳輸須仍在進行，尚未自行走到 echo 逾時"
 
         took = transient_unit.stop()

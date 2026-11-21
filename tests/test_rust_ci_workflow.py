@@ -233,6 +233,14 @@ def test_restart_residue_report_with_fake_observations():
     assert cleared["residual_submitted_after_restart"] is False
 
 
+def test_midline_blackbox_cutpoint_matches_unquoted_chunk_prefix():
+    source = (REPO_ROOT / "tests/contract_blackbox/test_s24_supervision_systemd.py").read_text(encoding="utf-8")
+    expected_prefix = "rb\"printf '%s' [A-Za-z0-9+/=]+\""
+    old_prefix = "b\"printf '%s' '"
+    assert expected_prefix in source
+    assert old_prefix not in source
+
+
 def test_rust_workflow_exists_and_triggers_on_pull_request():
     """驗證 .github/workflows/rust.yml 存在且觸發條件含 pull_request。"""
     doc = _load_yaml(RUST_YML)

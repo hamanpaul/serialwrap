@@ -218,34 +218,130 @@ def _wal_record(seq: int, direction: str, payload: bytes, cmd_id: str | None = N
 
 
 def test_i282_midline_oracle_requires_busy_echo_stall_and_two_prior_chunks():
+    import base64
+
+    from sw_core.file_transfer import _chunk_command
+
     marker = "I282_ECHO_OFF_test"
+    path = "/tmp/.sw_upload_0123456789ab"
+    encoded = base64.b64encode(bytes(range(256)) * 2).decode("ascii")
+    first = _chunk_command(encoded, "base64", ">", path)
+    second = _chunk_command(encoded, "base64", ">>", path)
     rows = [
-        _wal_record(1, "RX", f"{marker}\n".encode()),
-        _wal_record(2, "TX", b"printf '%s' 'first' && SW_XFER_CHUNK_42\n", "ft-12345678-0"),
-        _wal_record(3, "TX", b"printf '%s' 'second' && SW_XFER_CHUNK_42\n", "ft-12345678-1"),
-        _wal_record(4, "TX", b"printf '%s' 'YWJj", "ft-12345678-2"),
+        _wal_record(1, "TX", (first + "\n").encode("ascii"), "ft-12345678-0"),
+        _wal_record(2, "TX", (second + "\n").encode("ascii"), "ft-12345678-1"),
     ]
     wal_text = "\n".join(rows)
+    partial_line = second.encode("ascii")[:200]
+    bridge_rx = (
+        first.encode("ascii") + b"\r\nSW_XFER_CHUNK_42\r\n"
+        + second.encode("ascii") + b"\r\nSW_XFER_CHUNK_42\r\n"
+        + partial_line + b"\r\n" + marker.encode("ascii") + b"\r\n"
+    )
 
     assert f07._midline_push_observed(
-        wal_text, echo_off_marker=marker, foreground_busy=True,
+        wal_text, bridge_rx_bytes=bridge_rx, echo_off_marker=marker, foreground_busy=True,
     ) is True
     assert f07._midline_push_observed(
-        wal_text, echo_off_marker=marker, foreground_busy=False,
+        wal_text, bridge_rx_bytes=bridge_rx, echo_off_marker=marker, foreground_busy=False,
     ) is False
     assert f07._midline_push_observed(
-        "\n".join(rows[1:]), echo_off_marker=marker, foreground_busy=True,
+        rows[1], bridge_rx_bytes=bridge_rx,
+        echo_off_marker=marker, foreground_busy=True,
     ) is False
-    one_complete_chunk = "\n".join([rows[0], rows[1], rows[3]])
+    one_complete_chunk = rows[1]
     assert f07._midline_push_observed(
-        one_complete_chunk, echo_off_marker=marker, foreground_busy=True,
+        one_complete_chunk, bridge_rx_bytes=bridge_rx,
+        echo_off_marker=marker, foreground_busy=True,
     ) is False
-    complete_line = "\n".join(rows[:3] + [
-        _wal_record(4, "TX", b"printf '%s' 'YWJj\n", "ft-12345678-2"),
-    ])
+    complete_line = bridge_rx.replace(
+        partial_line + b"\r\n", second.encode("ascii") + b"\r\n\r\n",
+    )
     assert f07._midline_push_observed(
-        complete_line, echo_off_marker=marker, foreground_busy=True,
+        wal_text, bridge_rx_bytes=complete_line, echo_off_marker=marker, foreground_busy=True,
     ) is False
+
+
+def test_i282_midline_oracle_rejects_shutdown_without_line_clear():
+    import base64
+
+    from sw_core.file_transfer import _chunk_command
+
+    marker = "I282_ECHO_OFF_no_clear"
+    path = "/tmp/.sw_upload_0123456789ab"
+    encoded = base64.b64encode(bytes(range(256)) * 2).decode("ascii")
+    first = _chunk_command(encoded, "base64", ">", path)
+    second = _chunk_command(encoded, "base64", ">>", path)
+    rows = [
+        _wal_record(1, "TX", (first + "\n").encode("ascii"), "ft-12345678-0"),
+        _wal_record(2, "TX", (second + "\n").encode("ascii"), "ft-12345678-1"),
+    ]
+    bridge_rx = (
+        second.encode("ascii")[:200]
+        + marker.encode("ascii") + b"\r\n"
+    )
+
+    assert f07._midline_push_observed(
+        "\n".join(rows), bridge_rx_bytes=bridge_rx,
+        echo_off_marker=marker, foreground_busy=True,
+    ) is True
+    verdict = f07._midline_shutdown_verdict(clear_count=0)
+    assert verdict is not None
+    assert verdict.verdict == "FAIL"
+    assert verdict.reason_code == "midline_clear_count_mismatch"
+
+
+def test_i282_uart_rx_observer_reads_only_throwaway_console_pty(tmp_path, monkeypatch):
+    class _ThrowawayCli:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            if args[1] == "console-attach":
+                return {"ok": True, "vtty": "/dev/pts/47", "client_id": "client-i282"}
+            return {"ok": True}
+
+    class _ReaderProcess:
+        def poll(self):
+            return 0
+
+    ta = _ThrowawayCli()
+
+    def _fake_popen(argv, **kwargs):
+        assert argv == ["cat", "/dev/pts/47"]
+        kwargs["stdout"].write(b"UART bridge RX bytes")
+        return _ReaderProcess()
+
+    monkeypatch.setattr(f07.subprocess, "Popen", _fake_popen)
+    path = tmp_path / "bridge-rx.bin"
+    observer = f07._UartRxObserver(ta, "COM0", path)
+    try:
+        assert observer.bytes() == b"UART bridge RX bytes"
+    finally:
+        observer.close()
+
+    assert [call[0][1] for call in ta.calls] == ["console-attach", "console-detach"]
+
+
+def test_i282_uart_rx_observer_detaches_if_capture_file_cannot_open(tmp_path):
+    class _ThrowawayCli:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            if args[1] == "console-attach":
+                return {"ok": True, "vtty": "/dev/pts/47", "client_id": "client-i282"}
+            return {"ok": True}
+
+    ta = _ThrowawayCli()
+    missing_parent_path = tmp_path / "missing" / "bridge-rx.bin"
+
+    with pytest.raises(FileNotFoundError):
+        f07._UartRxObserver(ta, "COM0", missing_parent_path)
+
+    assert [call[0][1] for call in ta.calls] == ["console-attach", "console-detach"]
 
 
 def test_i282_post_restart_temp_growth_is_detected():
@@ -296,10 +392,12 @@ def test_i282_case_uses_midline_and_post_restart_temp_oracles():
 
     source = inspect.getsource(f07._body_push_stop_midline_clean_restart)
     assert "_midline_push_observed(" in source
+    assert "bridge_rx_bytes=uart_observer.bytes()" in source
+    assert "console-attach" in inspect.getsource(f07._UartRxObserver)
     assert "_upload_size_markers(" in source
     assert "_changed_upload_temps(" in source
     assert "daemon_exit_code != 0" in source
-    assert "clear_count != 1" in source
+    assert "_midline_shutdown_verdict(clear_count)" in source
     assert "extra_chunk_commands != 0" in source
     assert "ta.wait_for_exit(timeout_s=15.0)" in source
     assert "touch {shlex.quote(watcher_done_path)}; sleep 2; stty echo" in source

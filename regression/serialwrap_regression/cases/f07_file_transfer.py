@@ -36,6 +36,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -382,11 +383,35 @@ def _rx_payload(wal_text: str) -> bytes:
     )
 
 
+def _uart_partial_chunk_echo(bridge_rx_bytes: bytes, marker: str) -> bytes | None:
+    """由 console bridge 的原始 RX bytes 取出 echo 關閉前最後一條未結束 chunk 行。"""
+    marker_at = bridge_rx_bytes.find(marker.encode("ascii"))
+    if marker_at < 0:
+        return None
+    prefix = b"printf '%s' "
+    start = bridge_rx_bytes.rfind(prefix, 0, marker_at)
+    if start < 0:
+        return None
+    partial = bridge_rx_bytes[start:marker_at]
+    # watcher 在 marker 前固定輸出一個換行；只剝除此一個 delimiter，半行內仍不得含行尾。
+    if partial.endswith(b"\r\n"):
+        partial = partial[:-2]
+    elif partial.endswith(b"\n"):
+        partial = partial[:-1]
+    if b"\n" in partial or b"\r" in partial:
+        return None
+    # 正式 chunk 樣板經 shlex.quote(encoded) 產生未加引號的 base64；至少需觀察一個
+    # base64 字元，避免只有 shell 前綴或被截在 payload 起點前就宣稱半行已成立。
+    if re.match(rb"^printf '%s' [A-Za-z0-9+/=]+", partial) is None:
+        return None
+    return partial
+
+
 def _midline_push_observed(
-    wal_text: str, *, echo_off_marker: str, foreground_busy: bool,
+    wal_text: str, *, bridge_rx_bytes: bytes, echo_off_marker: str, foreground_busy: bool,
 ) -> bool:
-    """要求兩個完整 chunk 後，echo 已關且目前 chunk 行確實停在半行。"""
-    if not foreground_busy or echo_off_marker.encode("ascii") not in _rx_payload(wal_text):
+    """以 WAL 確認兩個完整 chunk，再由 console bridge RX bytes 確認目前半行。"""
+    if not foreground_busy or _uart_partial_chunk_echo(bridge_rx_bytes, echo_off_marker) is None:
         return False
 
     chunks: dict[str, bytearray] = {}
@@ -404,21 +429,80 @@ def _midline_push_observed(
 
     if not order:
         return False
-    current_id = order[-1]
-    prefix = current_id.rsplit("-", 1)[0]
-    completed_before = {
-        cmd_id for cmd_id in order[:-1]
-        if cmd_id.rsplit("-", 1)[0] == prefix and b"SW_XFER_CHUNK_" in chunks[cmd_id]
+    transfer_prefix = order[-1].rsplit("-", 1)[0]
+    completed = {
+        cmd_id for cmd_id in order
+        if cmd_id.rsplit("-", 1)[0] == transfer_prefix
+        and b"SW_XFER_CHUNK_" in chunks[cmd_id]
+        and b"\n" in chunks[cmd_id]
     }
-    if len(completed_before) < 2:
-        return False
+    return len(completed) >= 2
 
-    current_line = bytes(chunks[current_id])
-    return (
-        current_line.startswith(b"printf '%s' '")
-        and len(current_line) > len(b"printf '%s' '")
-        and b"\n" not in current_line
-    )
+
+def _midline_shutdown_verdict(clear_count: int) -> CaseResult | None:
+    """停機半行的硬判準；收尾位元組缺失時必須讓 F7 回歸紅燈。"""
+    if clear_count != 1:
+        return CaseResult("FAIL", reason=f"停機半行清除位元組次數為 {clear_count}，期望恰一次",
+                          category="test", reason_code="midline_clear_count_mismatch")
+    return None
+
+
+class _UartRxObserver:
+    """讀取 daemon 提供的 console PTY RX bytes，不直接開啟任何 serial device。"""
+
+    def __init__(self, ta: Any, com: str, path: Path) -> None:
+        self._ta = ta
+        self._com = com
+        self._path = path
+        self._client_id: str | None = None
+        self._proc: subprocess.Popen | None = None
+        self._file = None
+        attached = ta.run("session", "console-attach", "--selector", com,
+                          "--label", "f7-i282-byte-observer")
+        endpoint = attached.get("vtty")
+        client_id = attached.get("client_id")
+        if attached.get("ok") is not True or not isinstance(endpoint, str) or not endpoint.startswith("/dev/pts/"):
+            raise RuntimeError(f"無法取得 throwaway daemon console PTY：{attached!r}")
+        self._client_id = str(client_id) if client_id else None
+        try:
+            self._file = path.open("wb", buffering=0)
+            self._proc = subprocess.Popen(
+                ["cat", endpoint], stdin=subprocess.DEVNULL,
+                stdout=self._file, stderr=subprocess.DEVNULL, start_new_session=True,
+            )
+        except BaseException:
+            self.close()
+            raise
+
+    def bytes(self) -> bytes:
+        return self._path.read_bytes()
+
+    def close(self) -> None:
+        if self._client_id:
+            try:
+                self._ta.run("session", "console-detach", "--selector", self._com,
+                             "--client-id", self._client_id, timeout=10.0)
+            except Exception:
+                pass
+            self._client_id = None
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=2.0)
+        self._proc = None
+        if self._file is not None:
+            self._file.close()
+            self._file = None
 
 
 def _upload_size_markers(wal_text: str, *, marker: str) -> dict[str, int]:
@@ -515,6 +599,8 @@ def _body_push_stop_midline_clean_restart(ctx: Any, ta: Any, ta_com: str, board:
     watcher_remote_path = f"/tmp/.i282-echo-watcher-{nonce}.sh"
     watcher_done_path = f"/tmp/.i282-echo-watcher-{nonce}.done"
     remote_path = f"/tmp/swreg-i282-{os.getpid()}-{time.monotonic_ns()}.bin"
+    uart_rx_path = ta._workdir / f"f7-i282-uart-rx-{nonce}.bin"
+    uart_observer: _UartRxObserver | None = None
     chunk_size = 512
     current_com = ta_com
     local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -618,6 +704,12 @@ def _body_push_stop_midline_clean_restart(ctx: Any, ta: Any, ta_com: str, board:
             return CaseResult("SKIP", reason=f"watcher 安裝後目的路徑快照不完整：{before_output!r}",
                               category="environment", reason_code="remote_path_not_clean")
 
+        try:
+            uart_observer = _UartRxObserver(ta, ta_com, uart_rx_path)
+        except (OSError, RuntimeError) as exc:
+            return CaseResult("SKIP", reason=f"無法建立 throwaway console bridge byte observer：{exc!r}",
+                              category="environment", reason_code="bridge_observer_unavailable")
+
         with ThreadPoolExecutor(max_workers=1) as pool:
             push = pool.submit(
                 ta.run,
@@ -632,10 +724,24 @@ def _body_push_stop_midline_clean_restart(ctx: Any, ta: Any, ta_com: str, board:
                 session = _session_by_com(ta.run("session", "list", timeout=10.0), ta_com)
                 if _midline_push_observed(
                     ta.wal_text(),
+                    bridge_rx_bytes=uart_observer.bytes(),
                     echo_off_marker=f"I282_ECHO_OFF_{nonce}",
                     foreground_busy=session.get("foreground_busy") is True,
                 ):
                     observed_inflight = True
+                    partial_line = _uart_partial_chunk_echo(
+                        uart_observer.bytes(), f"I282_ECHO_OFF_{nonce}",
+                    )
+                    ctx.note(
+                        "f7-stop-midline-uart-cutpoint.json",
+                        json.dumps({
+                            "observer": "throwaway console PTY RX",
+                            "captured_bytes": len(uart_observer.bytes()),
+                            "partial_line_bytes": len(partial_line or b""),
+                            "echo_off_marker_seen": True,
+                            "foreground_busy": True,
+                        }, ensure_ascii=False, sort_keys=True),
+                    )
                     break
                 time.sleep(0.1)
             if not observed_inflight:
@@ -714,12 +820,12 @@ def _body_push_stop_midline_clean_restart(ctx: Any, ta: Any, ta_com: str, board:
             if row.get("dir") == "TX"
         )
         clear_count = tx_stream.count(b"\x15\n")
-        if clear_count != 1:
+        clear_verdict = _midline_shutdown_verdict(clear_count)
+        if clear_verdict is not None:
             restarted_com, ready = restart_throwaway()
             if restarted_com is not None:
                 restore_target_echo(restarted_com, expect_marker=False)
-            return CaseResult("FAIL", reason=f"停機半行清除位元組次數為 {clear_count}，期望恰一次",
-                              category="test", reason_code="midline_clear_count_mismatch")
+            return clear_verdict
 
         chunks_before_restart = _chunk_tx_count(ta)
         # 清理已退出的第一個 run dir，再用相同隔離 workdir 啟動 throwaway。
@@ -767,6 +873,9 @@ def _body_push_stop_midline_clean_restart(ctx: Any, ta: Any, ta_com: str, board:
                               category="environment", reason_code="midline_abort_not_observed")
         return CaseResult("PASS", reason="push 停在兩個完整 chunk 後的半行；SIGTERM 恰清行一次，重啟後無暫存檔增長或額外 chunk")
     finally:
+        if uart_observer is not None:
+            uart_observer.close()
+        uart_rx_path.unlink(missing_ok=True)
         _cleanup_local(local_path, watcher_local_path)
 
 

@@ -151,10 +151,10 @@ def _live_process_group_members(pgid: int, proc_root: Path = Path("/proc")) -> l
         if not entry.name.isdecimal():
             continue
         try:
-            stat = (entry / "stat").read_text(encoding="ascii")
+            stat = (entry / "stat").read_bytes()
         except FileNotFoundError:
             continue
-        fields = stat[stat.rfind(")") + 1 :].split()
+        fields = stat[stat.rfind(b")") + 1 :].split()
         if len(fields) < 3:
             raise RuntimeError(f"無法解析 /proc/{entry.name}/stat")
         state = fields[0]
@@ -162,7 +162,7 @@ def _live_process_group_members(pgid: int, proc_root: Path = Path("/proc")) -> l
             process_pgid = int(fields[2])
         except ValueError as exc:
             raise RuntimeError(f"無法解析 /proc/{entry.name}/stat 的 pgrp") from exc
-        if process_pgid == pgid and state not in {"Z", "X", "x"}:
+        if process_pgid == pgid and state not in {b"Z", b"X", b"x"}:
             members.append(int(entry.name))
     return sorted(members)
 
