@@ -5,7 +5,7 @@
   ],
   "columns": 80,
   "rc": 0,
-  "stdout": "serialwrap 0.5.0 (code dde486cbcbb5)\n",
+  "stdout": "serialwrap 0.5.0 (code a63bf9fb5ba1)\n",
   "stderr": "",
   "native": true,
   "post_parse_effects": false
