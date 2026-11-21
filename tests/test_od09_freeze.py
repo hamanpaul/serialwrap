@@ -6,6 +6,7 @@ import ast
 import copy
 import hashlib
 import json
+import re
 import shlex
 import subprocess
 import sys
@@ -284,8 +285,33 @@ def test_stage0_index_od09_item_ids():
     index_path = ROOT / "tests" / "acceptance" / "stage0_evidence_index.yaml"
     index = _load_yaml(index_path)
     items = {item["id"]: item for item in index["items"]}
+    # 三個項目只有兩種合法登記：尚待擁有者（blocked_owner、沒有 sha256）或已登記證據（present、有 sha256）。
     for item_id in (*od09.BASELINE_ITEMS.values(), od09.FREEZE_ITEM):
-        assert items[item_id]["status"] == "blocked_owner"
+        item = items[item_id]
+        assert item["status"] in {"blocked_owner", "present"}, (item_id, item["status"])
+        if item["status"] == "present":
+            assert re.fullmatch(r"[0-9a-f]{64}", str(item["sha256"])), item_id
+        else:
+            assert item["sha256"] is None, item_id
+
+    # 凍結以兩平台基線已登記為前提，凍結報告只會在門檻檔凍結之後產生：順序不得顛倒。
+    acceptance = fakes_od09.load_acceptance_source()
+    state = fakes_od09.acceptance_freeze_state(acceptance)
+    present = {item_id for item_id in items if items[item_id]["status"] == "present"}
+    if od09.FREEZE_ITEM in present:
+        assert set(od09.BASELINE_ITEMS.values()) <= present
+        assert state == "frozen"
+    # 門檻檔凍結時記下的基線證據，必須就是索引登記的那一份（凍結後不得換檔或改登記）。
+    if state == "frozen":
+        for platform, item_id in od09.BASELINE_ITEMS.items():
+            if item_id not in present:
+                continue
+            for key in od09.DEFERRED_KEYS:
+                assert acceptance["thresholds"][key]["baseline_evidence"][platform] == {
+                    "item_id": item_id,
+                    "artifact_path": items[item_id]["artifact_path"],
+                    "sha256": items[item_id]["sha256"],
+                }, (key, platform)
 
 
 @pytest.mark.memory_only
