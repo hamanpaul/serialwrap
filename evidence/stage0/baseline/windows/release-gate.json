@@ -1,0 +1,637 @@
+{
+  "acceptance": {
+    "effective_content": {
+      "authority": "發版長跑門檻唯一來源（spec §15.11.4、§14.2、OD-09、OD-94、OD-103）；其他前端不得維護另一份數值",
+      "counting": {
+        "definitions": {
+          "accepted": "submitted - expected_rejects",
+          "bg_lost": "kind == bg_lost（產品 history 淘汰前測試端未取得結果；不是終態，該 pair 計入 unresolved，並使 background_result_coverage 判 INSUFFICIENT_EVIDENCE）",
+          "completed": "kind == done，或 kind == bg_result 且 status == done（background 以執行期收斂即時寫入的 bg_result 為準；submit_accepted 不算完成；bg_lost 不算完成）",
+          "effective_duration_s": "events stop.t - start.t，扣除 observer 判定該板非 READY 的確定區間（兩端樣本皆非 READY）；逐板計算",
+          "effective_hour": "effective_duration_s / 3600（逐板）；throughput = completed / effective_hour",
+          "error_rate": "(unexpected_errors + unresolved) / accepted",
+          "expected_rejects": "kind in expected_reject_kinds，或 kind == error 且 error_code/detail 屬 expected_reject_error_codes，或 mode 的 expected_reject_by_mode[mode] 含 error_code/detail（OD-103：interactive 的 SESSION_BUSY 為預期拒絕）",
+          "submitted": "kind == submit",
+          "unexpected_errors": "kind == error 且非 expected reject；加上 kind == bg_result 且 status ∈ {error, canceled}；加上 worker_error（每個 (source, round) 至多計 1 次）",
+          "unresolved": "submit 之後同 (source, round) 沒有 done／error／busy／worker_error／bg_result 終態（bg_lost、bg_slow、bg_poll_error、bg_drain 都不是終態；已計入 worker_error 的 pair 不再計 unresolved，避免分子重複）"
+        },
+        "expected_reject_by_mode": {
+          "interactive": [
+            "SESSION_BUSY"
+          ]
+        },
+        "expected_reject_error_codes": [
+          "SESSION_INTERACTIVE_BUSY"
+        ],
+        "expected_reject_kinds": [
+          "busy"
+        ],
+        "frozen_at": "2026-10-15T00:00:00+00:00",
+        "pair_key": [
+          "source",
+          "round"
+        ],
+        "status": "frozen",
+        "unresolved_policy": "count_as_unexpected_error",
+        "worker_error_policy": "count_as_unexpected_error"
+      },
+      "evidence": {
+        "context_time_tolerance_s": 2.0,
+        "require_engine_report": true,
+        "require_fault_retention_attestation": true,
+        "require_observer": true,
+        "require_pinned_cli": true,
+        "require_wal_dir": true,
+        "require_windows_exclusive_evidence": true
+      },
+      "liveness": {
+        "frozen_at": "2026-10-15T00:00:00+00:00",
+        "pid_generation_change": 0,
+        "status": "frozen",
+        "unexpected_daemon_exit": 0,
+        "unexpected_restart": 0,
+        "worker_heartbeat_max_gap_s": 600
+      },
+      "owner_decisions": [
+        "OD-09",
+        "OD-10",
+        "OD-13",
+        "OD-94",
+        "OD-103",
+        "OD-107"
+      ],
+      "revision": "2026-11-20.1",
+      "safety": {
+        "allowed_tx_source_regex": "^(agent:rhw[0-9]+|human:[A-Za-z0-9._:-]+|system|system:[a-z_]+)$",
+        "cross_context_replay": 0,
+        "dangerous_auto_resend": 0,
+        "forbidden_double_holder": 0,
+        "frozen_at": "2026-10-15T00:00:00+00:00",
+        "status": "frozen",
+        "unauthorized_tx": 0,
+        "waivable": false
+      },
+      "schema_version": 1,
+      "thresholds": {
+        "comparison_uncertainty": {
+          "decision": "OD-09",
+          "freeze_deadline": "同 resources",
+          "per_platform": {
+            "linux": {
+              "error_rate_abs_tolerance": null,
+              "max_reruns": null,
+              "stuck_s_tolerance": null,
+              "throughput_ratio_tolerance": null
+            },
+            "windows": {
+              "error_rate_abs_tolerance": null,
+              "max_reruns": null,
+              "stuck_s_tolerance": null,
+              "throughput_ratio_tolerance": null
+            }
+          },
+          "status": "deferred"
+        },
+        "effective_throughput": {
+          "decision": "OD-09",
+          "frozen_at": "2026-10-15T00:00:00+00:00",
+          "granularity": [
+            "platform",
+            "board",
+            "source"
+          ],
+          "metric": "completed per effective hour",
+          "min_ratio_of_baseline": 0.95,
+          "status": "frozen"
+        },
+        "min_effective_load": {
+          "decision": "OD-09",
+          "freeze_deadline": "同 resources",
+          "per_platform": {
+            "linux": {
+              "max_idle_gap_s": null,
+              "min_completed_per_board_source": null
+            },
+            "windows": {
+              "max_idle_gap_s": null,
+              "min_completed_per_board_source": null
+            }
+          },
+          "status": "deferred"
+        },
+        "resources": {
+          "decision": "OD-09",
+          "freeze_deadline": "OD-94：Stage 0 修正後 Python 每平台 24h 基線完成後、任何 Rust 候選長跑開始前",
+          "per_platform": {
+            "linux": {
+              "rss_peak_kb": null,
+              "rss_slope_kb_per_h": null,
+              "rss_steady_kb": null
+            },
+            "windows": {
+              "rss_peak_kb": null,
+              "rss_slope_kb_per_h": null,
+              "rss_steady_kb": null
+            }
+          },
+          "status": "deferred"
+        },
+        "stuck_attached": {
+          "bounds_rule": "候選上界 ≤ 基線下界 → PASS；候選下界 > 基線上界 → FAIL；其餘 INSUFFICIENT_EVIDENCE",
+          "decision": "OD-09",
+          "frozen_at": "2026-10-15T00:00:00+00:00",
+          "granularity": [
+            "platform",
+            "board"
+          ],
+          "longest_s": "not_higher_than_baseline",
+          "status": "frozen",
+          "total_s": "not_higher_than_baseline"
+        },
+        "unexpected_cmd_error_rate": {
+          "decision": "OD-09",
+          "frozen_at": "2026-10-15T00:00:00+00:00",
+          "granularity": [
+            "platform",
+            "board",
+            "source"
+          ],
+          "max_ratio": 0.01,
+          "relative": "not_higher_than_baseline",
+          "status": "frozen"
+        }
+      },
+      "workload": {
+        "allow_segment_stitching": false,
+        "engine_case": "lr-mixed",
+        "engine_files": [
+          "realhw/cases/longrun.py"
+        ],
+        "max_observation_gap_factor": 2.0,
+        "min_continuous_duration_s": 86400,
+        "observation_gap_tolerance_s": 1.0,
+        "observer_interval_s": 10,
+        "snapshot_interval_s": 300,
+        "windows_excl_probe_interval_s": 300
+      }
+    },
+    "git_blob_sha1": "cb9b3157da7e1ea33cbe6727a3517cae36ea37c5",
+    "path": "realhw/acceptance/longrun_acceptance.yaml",
+    "revision": "2026-11-20.1",
+    "sha256": "8a8179d3816d85250e0ff624be7e32ddc4eb99c17fc382e4d881dc5e891438a4",
+    "workload_contract_sha256": "0494ffe96326225c9c6e9027574674d293b5da0899436f5c0f5fb214fc1aabc0"
+  },
+  "baseline_result": "PASS",
+  "checks": [
+    {
+      "detail": {
+        "problems": []
+      },
+      "group": "evidence",
+      "id": "evidence_parse",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "id": "lr-mixed"
+      },
+      "group": "evidence",
+      "id": "engine_report_present",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "pinned": true
+      },
+      "group": "evidence",
+      "id": "pinned_cli",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "verdict": "PASS"
+      },
+      "group": "engine",
+      "id": "engine_verdict",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {},
+      "group": "evidence",
+      "id": "observation_gaps",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {},
+      "group": "evidence",
+      "id": "pre_frozen",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {},
+      "group": "evidence",
+      "id": "frozen_after_baseline",
+      "result": "NOT_APPLICABLE_BASELINE",
+      "status": "not_applicable"
+    },
+    {
+      "detail": {
+        "auto_restart_disabled": true
+      },
+      "group": "evidence",
+      "id": "fault_retention_attested",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "workers": [
+          "agent:rhw0",
+          "agent:rhw1",
+          "agent:rhw2",
+          "agent:rhw3",
+          "bg_resolver",
+          "human",
+          "orchestrator"
+        ]
+      },
+      "group": "evidence",
+      "id": "worker_liveness",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "bg_backpressure_s": 0,
+        "bg_drain_remaining": 0,
+        "bg_lost": 0,
+        "bg_slow": 0
+      },
+      "group": "evidence",
+      "id": "background_result_coverage",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "duration_s": 86402,
+        "sigint": false,
+        "starts": 1,
+        "stops": 1
+      },
+      "group": "integrity",
+      "id": "continuous_duration",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "records": 360117
+      },
+      "group": "safety",
+      "id": "safety_unauthorized_tx",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "events": 0,
+        "holder_unknown_samples": 0
+      },
+      "group": "safety",
+      "id": "safety_double_holder",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {},
+      "group": "safety",
+      "id": "safety_cross_context_replay",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {},
+      "group": "safety",
+      "id": "safety_dangerous_auto_resend",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {},
+      "group": "liveness",
+      "id": "liveness_daemon_exit",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "changes": 0
+      },
+      "group": "liveness",
+      "id": "liveness_restart",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "limit": 0.01,
+        "rates": {
+          "*": 0.0,
+          "COM0|agent:rhw0": 0.0,
+          "COM0|agent:rhw1": 0.0,
+          "COM0|agent:rhw2": 0.0,
+          "COM0|agent:rhw3": 0.0
+        }
+      },
+      "group": "load",
+      "id": "error_rate_absolute",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "calibration": {
+          "max_idle_gap_s": {
+            "COM0|agent:rhw0": 12,
+            "COM0|agent:rhw1": 12,
+            "COM0|agent:rhw2": 12,
+            "COM0|agent:rhw3": 12
+          },
+          "per_board_hour": {
+            "COM0|agent:rhw0": {
+              "completed": 20551,
+              "effective_hour": 24.000555555555554
+            },
+            "COM0|agent:rhw1": {
+              "completed": 20534,
+              "effective_hour": 24.000555555555554
+            },
+            "COM0|agent:rhw2": {
+              "completed": 20586,
+              "effective_hour": 24.000555555555554
+            },
+            "COM0|agent:rhw3": {
+              "completed": 20538,
+              "effective_hour": 24.000555555555554
+            }
+          }
+        },
+        "per_platform": {
+          "linux": {
+            "max_idle_gap_s": null,
+            "min_completed_per_board_source": null
+          },
+          "windows": {
+            "max_idle_gap_s": null,
+            "min_completed_per_board_source": null
+          }
+        }
+      },
+      "group": "load",
+      "id": "min_effective_load",
+      "result": "NOT_APPLICABLE_BASELINE",
+      "status": "not_applicable"
+    },
+    {
+      "detail": {
+        "calibration": {
+          "expected_last_24h": 288,
+          "first_kb": 37064,
+          "last_kb": 30868,
+          "peak_kb": 38404.0,
+          "slope_kb_per_h": -233.10592286877457,
+          "steady_kb": 30868.0,
+          "valid_last_24h": 287
+        }
+      },
+      "group": "resources",
+      "id": "resources",
+      "result": "NOT_APPLICABLE_BASELINE",
+      "status": "not_applicable"
+    },
+    {
+      "detail": {},
+      "group": "relative",
+      "id": "error_rate_relative",
+      "result": "NOT_APPLICABLE_BASELINE",
+      "status": "not_applicable"
+    },
+    {
+      "detail": {},
+      "group": "relative",
+      "id": "throughput_relative",
+      "result": "NOT_APPLICABLE_BASELINE",
+      "status": "not_applicable"
+    },
+    {
+      "detail": {},
+      "group": "relative",
+      "id": "stuck_relative",
+      "result": "NOT_APPLICABLE_BASELINE",
+      "status": "not_applicable"
+    },
+    {
+      "detail": {},
+      "group": "relative",
+      "id": "comparison_uncertainty",
+      "result": "NOT_APPLICABLE_BASELINE",
+      "status": "not_applicable"
+    },
+    {
+      "detail": {},
+      "group": "evidence",
+      "id": "baseline_compatible",
+      "result": "NOT_APPLICABLE_BASELINE",
+      "status": "not_applicable"
+    }
+  ],
+  "counts": {
+    "*": {
+      "accepted": 82209,
+      "bg_lost": 0,
+      "completed": 82209,
+      "effective_hour": 24.000555555555554,
+      "error_rate": 0.0,
+      "expected_rejects": 3768,
+      "failed": 0,
+      "submitted": 85977,
+      "unexpected_errors": 0,
+      "unresolved": 0
+    },
+    "COM0|agent:rhw0": {
+      "accepted": 20551,
+      "bg_lost": 0,
+      "completed": 20551,
+      "effective_hour": 24.000555555555554,
+      "error_rate": 0.0,
+      "expected_rejects": 943,
+      "failed": 0,
+      "submitted": 21494,
+      "throughput_per_h": 856.2718455591306,
+      "unexpected_errors": 0,
+      "unresolved": 0
+    },
+    "COM0|agent:rhw1": {
+      "accepted": 20534,
+      "bg_lost": 0,
+      "completed": 20534,
+      "effective_hour": 24.000555555555554,
+      "error_rate": 0.0,
+      "expected_rejects": 937,
+      "failed": 0,
+      "submitted": 21471,
+      "throughput_per_h": 855.5635286220227,
+      "unexpected_errors": 0,
+      "unresolved": 0
+    },
+    "COM0|agent:rhw2": {
+      "accepted": 20586,
+      "bg_lost": 0,
+      "completed": 20586,
+      "effective_hour": 24.000555555555554,
+      "error_rate": 0.0,
+      "expected_rejects": 924,
+      "failed": 0,
+      "submitted": 21510,
+      "throughput_per_h": 857.7301451355294,
+      "unexpected_errors": 0,
+      "unresolved": 0
+    },
+    "COM0|agent:rhw3": {
+      "accepted": 20538,
+      "bg_lost": 0,
+      "completed": 20538,
+      "effective_hour": 24.000555555555554,
+      "error_rate": 0.0,
+      "expected_rejects": 964,
+      "failed": 0,
+      "submitted": 21502,
+      "throughput_per_h": 855.730191430754,
+      "unexpected_errors": 0,
+      "unresolved": 0
+    }
+  },
+  "created_at": "2026-11-21T00:12:09+00:00",
+  "engine_result": {
+    "category": "",
+    "duration_s": 86402.90599999996,
+    "evidence": {
+      "analysis": "lr-mixed\\longrun-analysis.md",
+      "events": "lr-mixed\\events.ndjson",
+      "snapshots": "lr-mixed\\snapshots.ndjson"
+    },
+    "reason": "長跑完成、無重大事件",
+    "reason_code": "",
+    "verdict": "PASS"
+  },
+  "evidence_hashes": {
+    "events.ndjson": "44d24cac736011cd88b4a412a34e9dcc37fea17a0c9be7c39043bf313f0b83bc",
+    "observer.ndjson": "02393a08844e516a03f6c3cd416bb302dc135f4f677940bc9fec903a4c804728",
+    "report.json": "69c4289fd94af0381398fc94194d18cb4ea6688be2c0920ba582ddfc24b37cf0",
+    "snapshots.ndjson": "d7d4019226135969df4ed6b81b6f1570ad65bcce58301b2df618c9af76937e2d",
+    "wal": {
+      "raw.mirror.log": "f14cd55fdd96242be71d7c1be54b74a80b1a008fd2f1bb2c7144c1c2e9e37a5c",
+      "raw.wal.ndjson": "941cee76c43cef1bd4486237a2c3896cb99ccd08b4d47d2281ab53e341350e5e",
+      "raw.wal.ndjson.20261120-174455": "413ea2bfbea1aeee3cf23753423e52fcbbbe215cefe291d3c52c1e7107b63c14"
+    }
+  },
+  "excl_evidence_hashes": {
+    "handoff.ndjson": "6d3dc9b5baaf8fa8eb956d2225ed0a708ae52f4c01357fe484b9b46e1bbccdf1",
+    "probes.ndjson": "ef28c58cd0672187da240ee5eec3f78333bd0aa32b0d129f0a44be3152f4b5ba"
+  },
+  "mode": "baseline",
+  "platform": "windows",
+  "release_gate_result": "NOT_APPLICABLE_BASELINE",
+  "run": {
+    "cases_yaml_sha256": "6d26ac8993a3ba7df567f56b0ea348e7e239ab537d933fd3b22c633b824c190c",
+    "cli_identity": {
+      "configured": "C:\\Users\\haman\\AppData\\Local\\Programs\\serialwrap\\versions\\0.4.1\\bin\\serialwrap.exe",
+      "pinned": true,
+      "resolved": "C:\\Users\\haman\\AppData\\Local\\Programs\\serialwrap\\versions\\0.4.1\\bin\\serialwrap.exe",
+      "sha256": "e03d2c4a078a8444198dcf6aec7173ce742a6e5e86f4ec363aabfaac7c4044fc"
+    },
+    "contract_revision": null,
+    "daemon_version": "0.4.1",
+    "deployed_content": {
+      "daemon_live": [
+        {
+          "error": null,
+          "image_path": "C:\\Users\\haman\\AppData\\Local\\Programs\\serialwrap\\versions\\0.4.1\\py\\python.exe",
+          "image_sha256": "15b41a488c356c0e331facdea6c836a6cec021f12d5fde9844e7ca4a1aa0361a",
+          "in_install": false,
+          "pid": 22440
+        }
+      ],
+      "end": {
+        "bundle_tree_sha256": null,
+        "cli_configured": "C:\\Users\\haman\\AppData\\Local\\Programs\\serialwrap\\versions\\0.4.1\\bin\\serialwrap.exe",
+        "cli_resolved": "C:\\Users\\haman\\AppData\\Local\\Programs\\serialwrap\\versions\\0.4.1\\bin\\serialwrap.exe",
+        "cli_sha256": null,
+        "daemon_configured": null,
+        "daemon_resolved": null,
+        "daemon_sha256": null,
+        "entry_dir_sha256": null,
+        "error": "unresolved",
+        "install_dir": null,
+        "measured_at": "2026-11-21T00:10:55.210535+00:00",
+        "release_manifest_sha256": null,
+        "runtime_tree_sha256": null,
+        "schema_version": "deployed-content.v1"
+      },
+      "start": {
+        "bundle_tree_sha256": null,
+        "cli_configured": "C:\\Users\\haman\\AppData\\Local\\Programs\\serialwrap\\versions\\0.4.1\\bin\\serialwrap.exe",
+        "cli_resolved": "C:\\Users\\haman\\AppData\\Local\\Programs\\serialwrap\\versions\\0.4.1\\bin\\serialwrap.exe",
+        "cli_sha256": null,
+        "daemon_configured": null,
+        "daemon_resolved": null,
+        "daemon_sha256": null,
+        "entry_dir_sha256": null,
+        "error": "unresolved",
+        "install_dir": null,
+        "measured_at": "2026-11-20T00:10:53.728237+00:00",
+        "release_manifest_sha256": null,
+        "runtime_tree_sha256": null,
+        "schema_version": "deployed-content.v1"
+      }
+    },
+    "duration_s": 86402.0,
+    "ended_at_utc": "2026-11-21T00:10:54.618656+00:00",
+    "engine_files_sha256": {
+      "realhw/cases/longrun.py": "ee4fc30d734748aaba8f2834749737ae05715115c642b53ec075a4eca95a7b58"
+    },
+    "started_at_utc": "2026-11-20T00:10:53.728237+00:00"
+  },
+  "schema_version": "release-gate.v1",
+  "stuck": {
+    "COM0": {
+      "longest_lower_s": 0,
+      "longest_upper_s": 0,
+      "segments": [],
+      "total_lower_s": 0,
+      "total_upper_s": 0
+    }
+  },
+  "walscan": {
+    "context_missing": false,
+    "cross_context_replay": [],
+    "dangerous_auto_resend": [],
+    "files": [
+      "raw.wal.ndjson.20261120-174455",
+      "raw.wal.ndjson"
+    ],
+    "loss_flags": [],
+    "problems": [],
+    "records": 360117,
+    "rotation_failed": [],
+    "unauthorized_tx": [],
+    "uncertain": []
+  }
+}
