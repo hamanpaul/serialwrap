@@ -474,7 +474,9 @@ def _windows_double_holder(inputs: GateInputs, acceptance: dict[str, Any], obser
     handoffs = handoffs or []
     probes = probes or []
     interval = float(acceptance["workload"]["windows_excl_probe_interval_s"])
-    max_gap = float(acceptance["workload"]["max_observation_gap_factor"]) * interval
+    # OD-107：超出 factor × interval 不超過 observation_gap_tolerance_s 視為量測誤差
+    max_gap = (float(acceptance["workload"]["max_observation_gap_factor"]) * interval
+               + float(acceptance["workload"]["observation_gap_tolerance_s"]))
     samples = observer_samples
 
     # (1) pre／post handoff 存在且時序正確
@@ -885,6 +887,7 @@ def _per_board_hour(counts_out: dict[str, dict[str, Any]]) -> dict[str, Any]:
 def _observation_gaps_check(observer_samples: list[dict[str, Any]] | None, snapshots: list[dict[str, Any]],
                             duration_s: float | None, workload: dict[str, Any]) -> dict[str, Any]:
     factor = float(workload["max_observation_gap_factor"])
+    tolerance = float(workload["observation_gap_tolerance_s"])  # OD-107：1 秒內為量測誤差
     gaps: list[dict[str, Any]] = []
     missing: list[str] = []
 
@@ -892,7 +895,7 @@ def _observation_gaps_check(observer_samples: list[dict[str, Any]] | None, snaps
         return 0.0 <= t <= float(duration_s) if duration_s is not None else True
 
     def scan(label: str, times: list[float], interval: float) -> None:
-        limit = factor * interval
+        limit = factor * interval + tolerance
         times = [t for t in times if in_window(t)]
         if not times:
             missing.append(label)
@@ -906,8 +909,8 @@ def _observation_gaps_check(observer_samples: list[dict[str, Any]] | None, snaps
                 gaps.append({"source": label, "from_t": _num(left), "to_t": _num(right)})
 
     def null_pid_runs(label: str, rows: list[tuple[float, Any]]) -> None:
-        """daemon pid 連續為 null 超過 factor × snapshot_interval_s 即為觀測缺口（無法辨識 daemon）。"""
-        limit = factor * float(workload["snapshot_interval_s"])
+        """daemon pid 連續為 null 超過 factor × snapshot_interval_s ＋ observation_gap_tolerance_s 即為觀測缺口（無法辨識 daemon）。"""
+        limit = factor * float(workload["snapshot_interval_s"]) + tolerance
         ordered = sorted((t, pid) for t, pid in rows if in_window(t))
         run_start: float | None = None
         for t, pid in ordered:

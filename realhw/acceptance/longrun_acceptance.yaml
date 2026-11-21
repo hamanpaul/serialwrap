@@ -1,7 +1,7 @@
 schema_version: 1
-revision: "2026-11-17.1"  # OD-103：依裁決修訂凍結的 counting。
+revision: "2026-11-20.1"  # OD-107：觀測缺口加 1 秒量測誤差容差（前一版 2026-11-17.1：OD-103 counting）。
 authority: "發版長跑門檻唯一來源（spec §15.11.4、§14.2、OD-09、OD-94、OD-103）；其他前端不得維護另一份數值"
-owner_decisions: [OD-09, OD-10, OD-13, OD-94, OD-103]
+owner_decisions: [OD-09, OD-10, OD-13, OD-94, OD-103, OD-107]
 workload:
   engine_case: lr-mixed
   engine_files: [realhw/cases/longrun.py]
@@ -10,6 +10,7 @@ workload:
   snapshot_interval_s: 300
   observer_interval_s: 10
   max_observation_gap_factor: 2.0
+  observation_gap_tolerance_s: 1.0  # OD-107（2026-11-20）：缺口超出 factor × interval 不超過此秒數視為量測誤差（漏一筆取樣的間隔是 20 s 加減抖動）
   windows_excl_probe_interval_s: 300   # Windows 長跑期間第二開啟探測週期（winexcl）；屬 workload 契約，A/B 兩側須相同（計入 workload_contract_sha256）
 counting:
   status: frozen

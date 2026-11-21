@@ -2874,7 +2874,7 @@ def main(argv: list[str] | None = None) -> int
 | `engine_report_present` | evidence | `report.json` 有 `id=="lr-mixed"` 的結果 | 缺 → INSUFFICIENT_EVIDENCE |
 | `pinned_cli` | evidence | `report.json.meta.cli_identity.pinned`（Task 14） | false 或缺 → INSUFFICIENT_EVIDENCE |
 | `continuous_duration` | integrity | events `start`／`stop` 各恰一筆、無 `sigint`、`stop.t - start.t ≥ min_continuous_duration_s` | 不足 → FAIL；`start` 多於一筆（拼接）→ FAIL |
-| `observation_gaps` | evidence | snapshots 與 observer 相鄰間隔 > `factor × interval` 的區段 | 有 → INSUFFICIENT_EVIDENCE（列出區段） |
+| `observation_gaps` | evidence | snapshots 與 observer 相鄰間隔 > `factor × interval + observation_gap_tolerance_s`（OD-107，1 秒量測誤差）的區段 | 有 → INSUFFICIENT_EVIDENCE（列出區段） |
 | `pre_frozen` | evidence | 每個 `status: frozen` 項目的 `frozen_at` < `meta.started_at_utc` | 違反者其相依 check 改 BLOCKED（`detail.reason="NOT_PRE_FROZEN"`） |
 | `frozen_after_baseline` | evidence | candidate：每個原為 deferred、現為 frozen 的項目（該平台）`frozen_at` > baseline gate 的 `run.ended_at_utc` | 違反（基線前或與基線同時凍結）→ 相依 check BLOCKED（`detail.reason="FROZEN_BEFORE_BASELINE"`）；baseline 模式 → NOT_APPLICABLE_BASELINE |
 | `fault_retention_attested` | evidence | observer header `supervision.auto_restart_disabled is True`（§15.11.2、Spike 8） | null 或缺 header → INSUFFICIENT_EVIDENCE；false → INSUFFICIENT_EVIDENCE（故障可能被自動重啟掩蓋） |

@@ -346,10 +346,13 @@ def validate_baseline(stats: BaselineStats, *, acceptance_path: Path) -> list[st
         problems.append(f"daemon_implementation={stats.daemon_implementation!r}，基線必須為 python")
     if stats.duration_s < int(wl["min_continuous_duration_s"]):
         problems.append(f"duration_s={stats.duration_s} 小於 min_continuous_duration_s={wl['min_continuous_duration_s']}")
-    limit = float(wl["max_observation_gap_factor"]) * stats.snapshot_interval_s
+    # OD-107：超出 factor × interval 不超過 observation_gap_tolerance_s 視為量測誤差
+    limit = (float(wl["max_observation_gap_factor"]) * stats.snapshot_interval_s
+             + float(wl["observation_gap_tolerance_s"]))
     if stats.max_snapshot_gap_s > limit:
-        problems.append(f"snapshot gap {stats.max_snapshot_gap_s}s 超過 {wl['max_observation_gap_factor']}×"
-                        f"{stats.snapshot_interval_s}s（不得拼接 segments）")
+        problems.append(f"snapshot gap {stats.max_snapshot_gap_s}s 超過上限 {limit:g}s"
+                        f"（{wl['max_observation_gap_factor']}×{stats.snapshot_interval_s}s"
+                        f"＋容差 {wl['observation_gap_tolerance_s']}s；不得拼接 segments）")
     for key in sorted(stats.hourly_done):
         if int(stats.hourly_done[key]["min"]) == 0:
             problems.append(f"{key} 有完整小時 completed 為 0（load stop）")
