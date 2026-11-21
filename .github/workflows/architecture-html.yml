@@ -11,8 +11,12 @@ permissions:
   contents: read
 jobs:
   native-html:
-    runs-on: ubuntu-24.04  # ubuntu-latest 的新版 Chrome 讓 archify 的 CDP 呼叫逾時
+    # ubuntu-latest 的新版 Chrome 曾讓 archify（2.17 開發版）的 CDP 呼叫逾時；升到 v3.2.0 後尚未在 ubuntu-latest 重驗，維持此釘選。
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      # Archify 3.x 的 deliver／finalize 內含更新檢查（連上游 manifest）；重建與驗收一律離線，以官方環境變數關閉。
+      ARCHIFY_UPDATE_CHECK_DISABLED: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -21,7 +25,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: tt-a1i/archify
-          ref: a07fa1d5b2a10cbea110c5a2be2817397a301cdc
+          ref: 208acba8d412335185b2056fedf54b3405df43fb  # v3.2.0；須與 docs/architecture/toolchain.json 的 archify_revision 相同
           path: .archify-engine
           persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
@@ -40,12 +44,10 @@ jobs:
         run: |
           python tools/architecture_browser.py --html docs/architecture/architecture.html --output /tmp/serialwrap-architecture-review
           export ARCHIFY_CHROME="$(command -v google-chrome)"
-          node .archify-engine/archify/bin/archify.mjs visual-check docs/architecture/architecture.html --json > /tmp/serialwrap-architecture-review/visual-check.json
+          node .archify-engine/archify/bin/archify.mjs visual-check docs/architecture/architecture.html --json --out-dir /tmp/serialwrap-architecture-review/visual-check > /tmp/serialwrap-architecture-review/visual-check.json
       - uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
         if: always()
         with:
           name: serialwrap-architecture-review
           retention-days: 14
-          path: |
-            /tmp/serialwrap-architecture-review
-            docs/architecture/architecture.visual-check*
+          path: /tmp/serialwrap-architecture-review
