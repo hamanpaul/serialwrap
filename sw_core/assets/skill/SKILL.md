@@ -107,7 +107,7 @@ serialwrap 另提供原生 MCU flash 端點（與上面 device handoff 互補）
 - **靜默上限＝`min(--cmd-timeout, 30s)`**：以此為窗長，一個等待窗內完全沒有新 RX 即視為靜默，同樣進恢復流程。命令回顯本身算 RX，所以完全靜默的命令約在最後一次輸出後 1～2 個窗長觸發。
 - **`--expected-duration <秒>` 只延長總期限，靜默上限不變**；它不會暫停 prompt timeout。只對持續有輸出的命令有用；會靜默的命令（如 `sleep 60`）光加它沒用，仍在 1～2 個窗長內被打斷（預設 `--cmd-timeout 10` 即 10～20s）。持續輸出的長命令：`--cmd-timeout 30 --expected-duration 300`。
 - **逾時恢復**：依序送 Ctrl-C，在 `min(--cmd-timeout, 2s)` 內比對 profile 的 `prompt_regex`；比不到再送 Ctrl-D，同樣等 `min(--cmd-timeout, 2s)`。任一次比到 prompt 回 `ok: true`、`error_code: PROMPT_TIMEOUT_RECOVERED`、`partial: true`、`recovery_action: CTRL_C|CTRL_D`；都比不到 session 轉 `ATTACHED`，回 `ok: false`、`error_code: PROMPT_TIMEOUT`。開機靜默窗（下節）內不送這兩個 byte。
-- **送哪些鍵看 profile 的 `timeout_recovery_keys`**：預設 `[CTRL_C, CTRL_D]`；設 `[CTRL_C]` 不送 Ctrl-D，設 `[]` 完全不送，救不回 prompt 時一樣回 `PROMPT_TIMEOUT`、session 轉 `ATTACHED`。`READY` 時的 `session recover` 用同一份清單。
+- **送哪些鍵看 profile 的 `timeout_recovery_keys`**：預設 `[CTRL_C, CTRL_D]`，出貨的 `prpl-template` 只送 `[CTRL_C]`；設 `[CTRL_C]` 不送 Ctrl-D，設 `[]` 完全不送，救不回 prompt 時一樣回 `PROMPT_TIMEOUT`、session 轉 `ATTACHED`。`READY` 時的 `session recover` 用同一份清單。
 - **Ctrl-C 會中斷前景程式；Ctrl-D 落在已登入 shell 的空提示符上＝EOF＝登出**，console 變回 login 畫面、session 要重新登入——所以別讓會靜默的命令走到恢復流程。
 - **建議做法**：長時間或會靜默的命令，不要靠 `--cmd-timeout`／`--expected-duration` 硬撐；在板上丟背景（新 session 不吃 Ctrl-C、輸出不灌 console），再用短命令輪詢：
   ```bash

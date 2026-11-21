@@ -1,8 +1,8 @@
 """profile 的 timeout_recovery_keys：命令逾時後送哪些恢復按鍵。
 
 預設 [CTRL_C, CTRL_D]，與既有行為相同。CTRL_D 落在已登入 shell 的空提示符上＝EOF＝
-登出（prplOS 的 askconsole 之後要人按 Enter），所以 profile 可設 [CTRL_C] 只送 CTRL_C，
-或 [] 完全不送；兩種情況救不回 prompt 時都照既有收尾（PROMPT_TIMEOUT、session 轉 ATTACHED）。
+登出（prplOS 的 askconsole 之後要人按 Enter），所以 profile 可設 [CTRL_C] 只送 CTRL_C
+（出貨 prpl-template 即如此），或 [] 完全不送；兩種情況救不回 prompt 時都照既有收尾（PROMPT_TIMEOUT、session 轉 ATTACHED）。
 """
 from __future__ import annotations
 
@@ -42,12 +42,14 @@ class TestConfigParsing(unittest.TestCase):
             result = _load(td, "profiles:\n  p:\n    platform: shell\ntargets: []\n")
         self.assertEqual(result.templates[0].timeout_recovery_keys, ("CTRL_C", "CTRL_D"))
 
-    def test_shipped_templates_keep_default(self) -> None:
-        """出貨 profile 不改預設：升級後行為不變。"""
+    def test_shipped_prpl_template_sends_ctrl_c_only(self) -> None:
+        """出貨 prpl-template 逾時只送 CTRL_C（CTRL_D 打在已登入 ash 會登出）；其餘 template 維持預設。"""
         result = load_profiles(str(ASSET_PROFILES))
-        self.assertTrue(result.templates)
-        for tpl in result.templates:
-            self.assertEqual(tpl.timeout_recovery_keys, ("CTRL_C", "CTRL_D"), tpl.profile_name)
+        keys = {tpl.profile_name: tpl.timeout_recovery_keys for tpl in result.templates}
+        self.assertEqual(keys.pop("prpl-template"), ("CTRL_C",))
+        self.assertTrue(keys)
+        for name, value in keys.items():
+            self.assertEqual(value, ("CTRL_C", "CTRL_D"), name)
 
     def test_template_values(self) -> None:
         for raw, expected in (
