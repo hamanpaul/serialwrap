@@ -1,0 +1,487 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "serialwrap｜人類 console 共用",
+    "locale": "zh-TW",
+    "output": "docs/architecture/features/04-human-console.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/hamanpaul/serialwrap",
+      "provider": "github",
+      "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347"
+    },
+    "subtitle": "人類透過 PTY 或 TCP Telnet 共用 UART；raw owner、行模式、前景暫存回放與互動租約各有邊界，並揭露 #294 的人類行在途弱點。"
+  },
+  "participants": [
+    {
+      "id": "human",
+      "type": "frontend",
+      "label": "人類 console",
+      "sublabel": "終端與接入 CLI",
+      "sources": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 78,
+          "end_line": 92
+        },
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 965,
+          "end_line": 982
+        }
+      ]
+    },
+    {
+      "id": "service",
+      "type": "backend",
+      "label": "RPC／Service",
+      "sources": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1003,
+          "end_line": 1014
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7721,
+          "end_line": 7747
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7783,
+          "end_line": 7799
+        }
+      ]
+    },
+    {
+      "id": "hub",
+      "type": "backend",
+      "label": "ConsoleHub",
+      "sublabel": "多 console 多工",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 619,
+          "end_line": 652
+        },
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 837,
+          "end_line": 855
+        },
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 875,
+          "end_line": 895
+        }
+      ]
+    },
+    {
+      "id": "session",
+      "type": "backend",
+      "label": "Session actor",
+      "sublabel": "效果執行",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 33,
+          "end_line": 55
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 388,
+          "end_line": 409
+        },
+        {
+          "path": "crates/sw-core/src/session_core/lease_p6.rs",
+          "line": 101,
+          "end_line": 120
+        }
+      ]
+    },
+    {
+      "id": "runner",
+      "type": "backend",
+      "label": "命令執行",
+      "sublabel": "OpRunner",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 117,
+          "end_line": 132
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 383,
+          "end_line": 385
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 405,
+          "end_line": 412
+        }
+      ]
+    },
+    {
+      "id": "bridge",
+      "type": "backend",
+      "label": "UART bridge",
+      "sublabel": "單一寫入者",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 526,
+          "end_line": 535
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1372,
+          "end_line": 1386
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 600,
+          "end_line": 617
+        }
+      ]
+    },
+    {
+      "id": "target",
+      "type": "external",
+      "label": "UART／DUT",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1079,
+          "end_line": 1089
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 482,
+          "end_line": 492
+        }
+      ]
+    },
+    {
+      "id": "agent",
+      "type": "frontend",
+      "label": "CLI／Agent",
+      "sources": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 141,
+          "end_line": 159
+        },
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 93,
+          "end_line": 120
+        }
+      ]
+    }
+  ],
+  "segments": [
+    {
+      "from": 160,
+      "to": 408,
+      "label": "端點接入與 ownership"
+    },
+    {
+      "from": 422,
+      "to": 662,
+      "label": "raw 輸入與共享輸出"
+    },
+    {
+      "from": 676,
+      "to": 1103,
+      "label": "條件：agent 插入與前景暫存"
+    },
+    {
+      "from": 1117,
+      "to": 1247,
+      "label": "條件：有效暫存回放"
+    },
+    {
+      "from": 1261,
+      "to": 1468,
+      "label": "條件：其他 console 行模式"
+    },
+    {
+      "from": 1482,
+      "to": 1928,
+      "label": "條件：interactive lease"
+    }
+  ],
+  "messages": [
+    {
+      "id": "console-attach",
+      "from": "human",
+      "to": "service",
+      "y": 176,
+      "label": "請求 console 接入",
+      "variant": "default"
+    },
+    {
+      "id": "attach-route",
+      "from": "service",
+      "to": "session",
+      "y": 206,
+      "label": "預建端點並路由接入",
+      "variant": "default",
+      "note": "Linux｜Windows： PTY｜TCP Telnet（預設）"
+    },
+    {
+      "id": "adopt-pty",
+      "from": "session",
+      "to": "hub",
+      "y": 250,
+      "label": "收養已預建的 PTY",
+      "variant": "default",
+      "note": "條件： PTY 後端；無既有 lease 才開 human lease"
+    },
+    {
+      "id": "attach-endpoint",
+      "from": "service",
+      "to": "human",
+      "y": 305,
+      "label": "回傳端點與接入結果",
+      "variant": "default",
+      "note": "PTY 回 slave 路徑； TCP 回 listener 端點"
+    },
+    {
+      "id": "stream-accepted",
+      "from": "hub",
+      "to": "session",
+      "y": 349,
+      "label": "接受連線並登記 owner",
+      "variant": "default",
+      "note": "條件： TCP client 連上；授予 raw ownership，不等於 lease"
+    },
+    {
+      "id": "raw-input",
+      "from": "hub",
+      "to": "session",
+      "y": 438,
+      "label": "轉送 owner 輸入",
+      "variant": "default",
+      "note": "條件： raw owner； Telnet 協商先過濾"
+    },
+    {
+      "id": "human-raw-tx",
+      "from": "session",
+      "to": "bridge",
+      "y": 482,
+      "label": "提交 HumanRaw 工作",
+      "variant": "default",
+      "note": "Enter 也只是 bytes；不佔前景槽、不等 prompt"
+    },
+    {
+      "id": "human-write",
+      "from": "bridge",
+      "to": "target",
+      "y": 526,
+      "label": "寫入人類位元組",
+      "variant": "default",
+      "note": "與 agent 共用 writer，只保證提交順序"
+    },
+    {
+      "id": "rx-to-hub",
+      "from": "bridge",
+      "to": "hub",
+      "y": 570,
+      "label": "分送 DUT 的 RX",
+      "variant": "default",
+      "note": "可反覆發生；#294 時 human 行的 prompt 尚未到"
+    },
+    {
+      "id": "display-all",
+      "from": "hub",
+      "to": "human",
+      "y": 614,
+      "label": "向多個 console 顯示",
+      "variant": "default",
+      "note": "每個 console 獨立輸出 ring；慢讀者可能漏畫面"
+    },
+    {
+      "id": "agent-submit",
+      "from": "agent",
+      "to": "service",
+      "y": 692,
+      "label": "插入 agent 命令",
+      "variant": "default",
+      "note": "條件（#294）： human 已按 Enter、 prompt 未回"
+    },
+    {
+      "id": "agent-route",
+      "from": "service",
+      "to": "session",
+      "y": 769,
+      "label": "路由並受理 agent 命令",
+      "variant": "default",
+      "note": "沒有「human 行在等 prompt」的閘門"
+    },
+    {
+      "id": "agent-start",
+      "from": "session",
+      "to": "runner",
+      "y": 813,
+      "label": "暫停 raw 並開始命令",
+      "variant": "default",
+      "note": "admission 先關；有 human lease 才 suspend"
+    },
+    {
+      "id": "agent-tx",
+      "from": "runner",
+      "to": "bridge",
+      "y": 857,
+      "label": "提交 agent TX",
+      "variant": "default",
+      "note": "完成搜尋從 TX 前的 RX offset 開始"
+    },
+    {
+      "id": "agent-write",
+      "from": "bridge",
+      "to": "target",
+      "y": 901,
+      "label": "寫入 agent 命令",
+      "variant": "default",
+      "note": "不代表下一個 prompt 屬於這條命令"
+    },
+    {
+      "id": "defer-during-agent",
+      "from": "hub",
+      "to": "session",
+      "y": 945,
+      "label": "暫存前景期間的按鍵",
+      "variant": "default",
+      "note": "條件： agent 前景中的新按鍵，先暫存"
+    },
+    {
+      "id": "late-human-prompt",
+      "from": "bridge",
+      "to": "runner",
+      "y": 989,
+      "label": "人類 prompt 可能滿足等待",
+      "variant": "default",
+      "note": "條件（#294）： human 的 prompt 符合樣式即提早完成（ Python 0.4.x 每 50 ms 輪詢）"
+    },
+    {
+      "id": "agent-finished",
+      "from": "runner",
+      "to": "session",
+      "y": 1044,
+      "label": "回報結果並結束前景",
+      "variant": "default",
+      "note": "#294 時回 done 但 stdout 可能為空；恢復 human 與回放"
+    },
+    {
+      "id": "replay-submit",
+      "from": "session",
+      "to": "bridge",
+      "y": 1133,
+      "label": "保留回放並提交暫存",
+      "variant": "default",
+      "note": "條件：有有效暫存；依 client 首次插入序回放"
+    },
+    {
+      "id": "replay-receipt",
+      "from": "bridge",
+      "to": "session",
+      "y": 1199,
+      "label": "回傳 TX 回條並結算回放",
+      "variant": "default",
+      "note": "只有 NotSubmitted 會放回重送"
+    },
+    {
+      "id": "line-input",
+      "from": "hub",
+      "to": "session",
+      "y": 1277,
+      "label": "以行編輯器累積輸入",
+      "variant": "default",
+      "note": "條件：非 raw owner； LineEditor 累積到 Enter"
+    },
+    {
+      "id": "line-echo",
+      "from": "session",
+      "to": "hub",
+      "y": 1354,
+      "label": "送回本地編輯回顯",
+      "variant": "default",
+      "note": "只回給該 client，與 DUT RX fan-out 分開"
+    },
+    {
+      "id": "line-dispatch",
+      "from": "session",
+      "to": "runner",
+      "y": 1420,
+      "label": "排隊後執行人類整行",
+      "variant": "default",
+      "note": "整行走共用命令佇列與前景槽"
+    },
+    {
+      "id": "lease-open-request",
+      "from": "agent",
+      "to": "service",
+      "y": 1498,
+      "label": "請求互動租約",
+      "variant": "default",
+      "note": "條件： session.interactive_open"
+    },
+    {
+      "id": "lease-open-route",
+      "from": "service",
+      "to": "session",
+      "y": 1564,
+      "label": "路由開啟並判斷搶占",
+      "variant": "default",
+      "note": "活躍 human 或其他 owner 回 SESSION_INTERACTIVE_BUSY；閒置 human lease 可 soft preempt"
+    },
+    {
+      "id": "lease-open-reply",
+      "from": "session",
+      "to": "service",
+      "y": 1674,
+      "label": "回傳租約與搶占結果",
+      "variant": "default",
+      "note": "回 interactive_id； human ownership 不等於 lease"
+    },
+    {
+      "id": "lease-send-or-status",
+      "from": "service",
+      "to": "session",
+      "y": 1751,
+      "label": "路由租約傳送或查詢",
+      "variant": "default",
+      "note": "status 讀共享 RX 尾端； send 在前景忙時拒絕"
+    },
+    {
+      "id": "lease-send-op",
+      "from": "session",
+      "to": "runner",
+      "y": 1795,
+      "label": "執行租約位元組傳送",
+      "variant": "default",
+      "note": "send 有自己的前景 grant"
+    },
+    {
+      "id": "lease-owner-tx",
+      "from": "runner",
+      "to": "bridge",
+      "y": 1850,
+      "label": "以 LeaseOwner 提交 TX",
+      "variant": "default",
+      "note": "只確認 TX，不等 DUT prompt"
+    },
+    {
+      "id": "lease-close",
+      "from": "service",
+      "to": "session",
+      "y": 1894,
+      "label": "關閉並評估還原 human",
+      "variant": "default",
+      "note": "soft preempt 後才評估還原 human"
+    }
+  ]
+}
