@@ -195,23 +195,23 @@
   ],
   "segments": [
     {
-      "from": 158,
-      "to": 422,
+      "from": 160,
+      "to": 446,
       "label": "規則管理"
     },
     {
-      "from": 424,
-      "to": 568,
+      "from": 454,
+      "to": 620,
       "label": "COM 開關"
     },
     {
-      "from": 570,
-      "to": 766,
+      "from": 628,
+      "to": 846,
       "label": "RX 比對"
     },
     {
-      "from": 768,
-      "to": 1073,
+      "from": 854,
+      "to": 1181,
       "label": "handler 派送"
     }
   ],
@@ -220,56 +220,56 @@
       "id": "start-load",
       "from": "engine",
       "to": "files",
-      "y": 174,
+      "y": 198,
       "label": "start：load_all 載入規則檔"
     },
     {
       "id": "rule-set-rpc",
       "from": "cli",
       "to": "service",
-      "y": 204,
+      "y": 228,
       "label": "event.rule_set（add <規則檔>）"
     },
     {
       "id": "rule-set",
       "from": "service",
       "to": "engine",
-      "y": 234,
+      "y": 258,
       "label": "rule_set（先取 admission ticket）"
     },
     {
       "id": "rule-upsert",
       "from": "engine",
       "to": "files",
-      "y": 264,
+      "y": 288,
       "label": "upsert：驗證 → tmp → replace"
     },
     {
       "id": "rule-recompile",
       "from": "engine",
       "to": "matcher",
-      "y": 294,
+      "y": 318,
       "label": "replace_rules（重新編譯 pattern）"
     },
     {
       "id": "rule-loaded-log",
       "from": "engine",
       "to": "files",
-      "y": 324,
+      "y": 348,
       "label": "記 rule_loaded（及 com_enabled）"
     },
     {
       "id": "rule-set-reply",
       "from": "service",
       "to": "cli",
-      "y": 354,
+      "y": 378,
       "label": "ok＋規則內容"
     },
     {
       "id": "rule-other",
       "from": "service",
       "to": "engine",
-      "y": 384,
+      "y": 408,
       "label": "rule_delete／list／get／reload／reset／tail",
       "note": "條件：其餘規則子指令"
     },
@@ -277,21 +277,21 @@
       "id": "com-rpc",
       "from": "cli",
       "to": "service",
-      "y": 440,
+      "y": 492,
       "label": "event.com_enable／disable／status"
     },
     {
       "id": "com-switch",
       "from": "service",
       "to": "engine",
-      "y": 470,
+      "y": 522,
       "label": "com_enable／com_disable"
     },
     {
       "id": "com-disable-reset",
       "from": "engine",
       "to": "files",
-      "y": 500,
+      "y": 552,
       "label": "清除受影響規則的 counter",
       "note": "條件：只在 com_disable"
     },
@@ -299,14 +299,14 @@
       "id": "com-log",
       "from": "engine",
       "to": "files",
-      "y": 556,
+      "y": 608,
       "label": "記 com_enabled／com_disabled"
     },
     {
       "id": "rx-notify",
       "from": "bridge",
       "to": "engine",
-      "y": 586,
+      "y": 666,
       "label": "on_rx(com, data, wal_seq)",
       "note": "前提：啟動時已註冊 observer"
     },
@@ -314,7 +314,7 @@
       "id": "feed-line",
       "from": "engine",
       "to": "matcher",
-      "y": 642,
+      "y": 722,
       "label": "feed_line（逐行入列）",
       "note": "條件：COM 已啟用"
     },
@@ -322,14 +322,14 @@
       "id": "read-counter",
       "from": "matcher",
       "to": "files",
-      "y": 698,
+      "y": 778,
       "label": "讀 counter（max_fires／cooldown）"
     },
     {
       "id": "match-recorded",
       "from": "matcher",
       "to": "files",
-      "y": 728,
+      "y": 808,
       "label": "記 match_recorded",
       "note": "條件：四道閘門全過"
     },
@@ -337,14 +337,14 @@
       "id": "dispatch",
       "from": "matcher",
       "to": "dispatcher",
-      "y": 784,
+      "y": 892,
       "label": "dispatch(fire)"
     },
     {
       "id": "dropped",
       "from": "dispatcher",
       "to": "files",
-      "y": 814,
+      "y": 922,
       "label": "記 event_dropped",
       "note": "條件：同規則忙碌或已滿 8 個"
     },
@@ -352,30 +352,30 @@
       "id": "spawn",
       "from": "dispatcher",
       "to": "handler",
-      "y": 870,
+      "y": 978,
       "label": "啟動子行程：stdin JSON＋環境變數",
-      "note": "Linux｜Windows：/bin/sh -c｜cmd.exe /d /s /c"
+      "note": "Linux｜Windows： /bin/sh -c ｜ cmd.exe /d /s /c"
     },
     {
       "id": "outcome",
       "from": "handler",
       "to": "dispatcher",
-      "y": 949,
+      "y": 1057,
       "label": "exit code＋輸出尾段，或逾時",
-      "note": "Linux｜Windows：逾時 killpg｜TerminateJobObject"
+      "note": "Linux｜Windows： 逾時 killpg ｜ 逾時終止整個 Job"
     },
     {
       "id": "fire-log",
       "from": "dispatcher",
       "to": "files",
-      "y": 1005,
+      "y": 1113,
       "label": "記 fire_completed／timeout／failed"
     },
     {
       "id": "counter-update",
       "from": "dispatcher",
       "to": "files",
-      "y": 1035,
+      "y": 1143,
       "label": "更新 fires／last_fire_ts",
       "note": "條件：結果事件已寫入"
     }
