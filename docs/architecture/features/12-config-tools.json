@@ -1,0 +1,327 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "serialwrap｜設定與工具",
+    "locale": "zh-TW",
+    "output": "docs/architecture/features/12-config-tools.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/hamanpaul/serialwrap",
+      "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347",
+      "provider": "github"
+    }
+  },
+  "participants": [
+    {
+      "id": "operator",
+      "type": "external",
+      "label": "使用者／Agent",
+      "sublabel": "下指令的一方",
+      "sources": [
+        {
+          "path": "crates/sw-cli/src/commands/mod.rs",
+          "line": 32,
+          "end_line": 37
+        }
+      ]
+    },
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "CLI",
+      "sublabel": "profile test／skill",
+      "sources": [
+        {
+          "path": "crates/sw-cli/src/commands/profile_cmd.rs",
+          "line": 1,
+          "end_line": 3
+        },
+        {
+          "path": "crates/sw-cli/src/commands/profile_cmd.rs",
+          "line": 52,
+          "end_line": 53
+        },
+        {
+          "path": "crates/sw-cli/src/commands/skill_cmd.rs",
+          "line": 1,
+          "end_line": 3
+        }
+      ]
+    },
+    {
+      "id": "assets",
+      "type": "database",
+      "label": "內嵌資產",
+      "sublabel": "編譯進 CLI",
+      "sources": [
+        {
+          "path": "crates/sw-cli/src/assets.rs",
+          "line": 1,
+          "end_line": 4
+        },
+        {
+          "path": "crates/sw-cli/src/assets.rs",
+          "line": 11,
+          "end_line": 20
+        },
+        {
+          "path": "crates/sw-cli/src/assets.rs",
+          "line": 33,
+          "end_line": 52
+        }
+      ]
+    },
+    {
+      "id": "profdir",
+      "type": "database",
+      "label": "profile 目錄",
+      "sublabel": "*.yaml＋env 檔",
+      "sources": [
+        {
+          "path": "crates/sw-proto/src/config_types.rs",
+          "line": 760,
+          "end_line": 772
+        },
+        {
+          "path": "crates/sw-proto/src/config_types.rs",
+          "line": 39,
+          "end_line": 64
+        },
+        {
+          "path": "crates/sw-proto/src/config_types.rs",
+          "line": 49,
+          "end_line": 53
+        }
+      ]
+    },
+    {
+      "id": "loader",
+      "type": "backend",
+      "label": "load_profiles",
+      "sublabel": "sw-proto",
+      "sources": [
+        {
+          "path": "crates/sw-proto/src/config_types.rs",
+          "line": 746,
+          "end_line": 747
+        },
+        {
+          "path": "crates/sw-proto/src/config_types.rs",
+          "line": 84,
+          "end_line": 90
+        },
+        {
+          "path": "crates/sw-proto/src/config_types.rs",
+          "line": 92,
+          "end_line": 96
+        }
+      ]
+    },
+    {
+      "id": "daemon",
+      "type": "backend",
+      "label": "daemon 主流程",
+      "sublabel": "serialwrapd",
+      "sources": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1191,
+          "end_line": 1200
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1280,
+          "end_line": 1299
+        }
+      ]
+    },
+    {
+      "id": "sessions",
+      "type": "backend",
+      "label": "Session 管理",
+      "sublabel": "SessionManager",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 1970,
+          "end_line": 1975
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 4349,
+          "end_line": 4357
+        }
+      ]
+    },
+    {
+      "id": "actor",
+      "type": "backend",
+      "label": "Session actor",
+      "sublabel": "SessionCore",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 5505,
+          "end_line": 5511
+        },
+        {
+          "path": "crates/sw-core/src/session_auth.rs",
+          "line": 1,
+          "end_line": 3
+        },
+        {
+          "path": "crates/sw-core/src/session_auth.rs",
+          "line": 125,
+          "end_line": 131
+        }
+      ]
+    }
+  ],
+  "segments": [
+    {
+      "from": 158,
+      "to": 246,
+      "label": "資產落地"
+    },
+    {
+      "from": 248,
+      "to": 490,
+      "label": "daemon 載入與使用"
+    },
+    {
+      "from": 492,
+      "to": 666,
+      "label": "測試與檢查"
+    },
+    {
+      "from": 668,
+      "to": 756,
+      "label": "skill"
+    }
+  ],
+  "messages": [
+    {
+      "id": "setup-cmd",
+      "from": "operator",
+      "to": "cli",
+      "y": 174,
+      "label": "setup"
+    },
+    {
+      "id": "assets-read",
+      "from": "cli",
+      "to": "assets",
+      "y": 204,
+      "label": "取內嵌的 profiles／skill／tools"
+    },
+    {
+      "id": "assets-write",
+      "from": "cli",
+      "to": "profdir",
+      "y": 234,
+      "label": "寫入 default.yaml（既有檔不覆寫）"
+    },
+    {
+      "id": "load-call",
+      "from": "daemon",
+      "to": "loader",
+      "y": 264,
+      "label": "load_profiles(profile_dir)"
+    },
+    {
+      "id": "load-read",
+      "from": "loader",
+      "to": "profdir",
+      "y": 294,
+      "label": "依檔名排序讀 *.yaml／*.yml"
+    },
+    {
+      "id": "load-result",
+      "from": "loader",
+      "to": "daemon",
+      "y": 324,
+      "label": "templates＋targets＋max_sessions",
+      "note": "Linux｜Windows：不另加 template｜注入 passthrough"
+    },
+    {
+      "id": "hand-over",
+      "from": "daemon",
+      "to": "sessions",
+      "y": 392,
+      "label": "ManagerDeps：交付 load"
+    },
+    {
+      "id": "pick-template",
+      "from": "sessions",
+      "to": "actor",
+      "y": 422,
+      "label": "建立 session：選定 template"
+    },
+    {
+      "id": "resolve-auth",
+      "from": "actor",
+      "to": "profdir",
+      "y": 452,
+      "label": "登入時讀 env 檔解析帳密",
+      "note": "條件：template 宣告了帳密來源"
+    },
+    {
+      "id": "test-cmd",
+      "from": "operator",
+      "to": "cli",
+      "y": 508,
+      "label": "profile test --profile … --sample …"
+    },
+    {
+      "id": "test-load",
+      "from": "cli",
+      "to": "loader",
+      "y": 538,
+      "label": "load_profiles(--profile-dir)"
+    },
+    {
+      "id": "test-read",
+      "from": "loader",
+      "to": "profdir",
+      "y": 568,
+      "label": "讀 YAML（與 daemon 同一套規則）"
+    },
+    {
+      "id": "test-result",
+      "from": "cli",
+      "to": "operator",
+      "y": 598,
+      "label": "checks：五組 regex 的命中行或錯誤"
+    },
+    {
+      "id": "doctor-profile",
+      "from": "cli",
+      "to": "profdir",
+      "y": 628,
+      "label": "doctor：比對 bootloader_prompts",
+      "note": "條件：操作者執行 doctor"
+    },
+    {
+      "id": "skill-cmd",
+      "from": "operator",
+      "to": "cli",
+      "y": 684,
+      "label": "skill"
+    },
+    {
+      "id": "skill-read",
+      "from": "cli",
+      "to": "assets",
+      "y": 714,
+      "label": "取 SKILL.md｜SKILL_WINDOWS.md"
+    },
+    {
+      "id": "skill-out",
+      "from": "cli",
+      "to": "operator",
+      "y": 744,
+      "label": "輸出說明文字"
+    }
+  ]
+}
