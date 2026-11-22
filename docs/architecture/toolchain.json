@@ -1,14 +1,14 @@
 {
   "schema_version": 2,
   "skill_repository": "hamanpaul/custom-skills",
-  "skill_revision": "74c2052c72b31c99008be4ae7e5ab22067bb0e0f",
+  "skill_revision": "6a6dd412cabc2c0a04f8e2696046005263c72c0b",
   "archify_repository": "tt-a1i/archify",
   "archify_version": "3.2.0",
   "archify_revision": "208acba8d412335185b2056fedf54b3405df43fb",
   "overlay": {
     "tool": "tools/architecture_overlay.py",
     "skill_path": "architecture-fact-layer/scripts/viewer_overlay.py",
-    "skill_revision": "74c2052c72b31c99008be4ae7e5ab22067bb0e0f",
+    "skill_revision": "6a6dd412cabc2c0a04f8e2696046005263c72c0b",
     "version": 1,
     "sha256": "878517dbf71d9418ea43ad2eb0e9487a04cbd5ec9df3b381cbdd5ba76e21bbf7"
   },
