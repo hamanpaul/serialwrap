@@ -9924,22 +9924,25 @@ fn wp73_rpc_reboot_clears_rx_for_console_unlock_service_rig() {
         if state == Some(PyValue::from("READY")) {
             break;
         }
-        let snapshot = session.as_ref().map(j).unwrap_or_else(|| "<無 session 列>".to_string());
-        let tx = String::from_utf8_lossy(&dev.tx_since(tx_mark)).into_owned();
         // recovery 期限到期後的終態：ATTACHED 且帶 last_error。此後不會再自動回到 READY，直接失敗並印出現場。
         let terminal = state == Some(PyValue::from("ATTACHED"))
             && !matches!(
                 session.as_ref().and_then(|session| session.get("last_error")),
                 None | Some(PyValue::Null)
             );
-        assert!(
-            !terminal,
-            "reboot recovery 以非 READY 終態結束：{snapshot}；reboot 之後的 TX：{tx:?}"
-        );
-        assert!(
-            Instant::now() < recovery_deadline,
-            "等待逾時（10s）：session 恢復 READY；最後狀態：{snapshot}；reboot 之後的 TX：{tx:?}"
-        );
+        let timed_out = Instant::now() >= recovery_deadline;
+        if terminal || timed_out {
+            // 現場字串只在真的要失敗時才建構，迴圈的正常路徑不做多餘的配置與 TX 複製。
+            let snapshot = session
+                .as_ref()
+                .map(j)
+                .unwrap_or_else(|| "<無 session 列>".to_string());
+            let tx = String::from_utf8_lossy(&dev.tx_since(tx_mark)).into_owned();
+            if terminal {
+                panic!("reboot recovery 以非 READY 終態結束：{snapshot}；reboot 之後的 TX：{tx:?}");
+            }
+            panic!("等待逾時（10s）：session 恢復 READY；最後狀態：{snapshot}；reboot 之後的 TX：{tx:?}");
+        }
         std::thread::sleep(Duration::from_millis(2));
     }
 
