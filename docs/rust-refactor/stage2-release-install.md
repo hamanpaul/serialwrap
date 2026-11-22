@@ -54,3 +54,26 @@
   - Windows PowerShell：`& "$env:LOCALAPPDATA\Programs\serialwrap\bin\serialwrap.exe" setup --rollback`
 - 回滾後以 `--version`、`doctor` 與 `daemon status` 確認回到 0.4.1 且 CLI／daemon 配對正常。若 0.5.0 是新機首次安裝、沒有上一個 bundle，`setup --rollback` 沒有可回復的 0.4.1；Linux 可用 `./install.sh --version 0.4.1 -- --user` 安裝（將 `--user` 換成原監管模式）；Windows 請取得官方 0.4.1 zip，再執行其版本目錄中的 `serialwrap.exe setup --windows-task`（依原監管模式調整）。
 - 不要手動刪除安裝目錄或直接覆蓋 daemon 執行檔；完整 bundle 回滾會一起切換 CLI、daemon、資產與監管設定。
+
+## 已知問題
+
+以下問題已確認存在於 0.5.0，預定於 0.5.1 修正（括號內為 GitHub issue 編號）。
+
+1. **檔案推送進行中停止或重啟 daemon**（#282、#296）
+   - DUT 的輸入列可能殘留沒送完的半行。重啟後 session 可能停在 `ATTACHED`／`PROMPT_UNAVAILABLE`，需要手動送 Ctrl-C 清除。
+   - 進行中的 `file push`／`file pull` 偶爾回 `EXCEPTION`（`session actor stopped`），而不是 `COMMAND_ABORTED_IN_FLIGHT`／`FLUSHED_BY_RECOVERY`。
+   - 避免方式：推送進行中不要停止或重啟 daemon。
+2. **停機時進行中的 `session self-test`、`session recover`、interactive 操作會回 `EXCEPTION`**（#297）。呼叫端請視為已中止，daemon 重新啟動後再重試。
+3. **human 與 agent 同時操作同一個 session**（#294）
+   - human 送出一行、該行的 prompt 還沒回來時，若 agent 命令剛好送出，agent 命令可能回 `done`，但輸出是空的，或只含 human 那一行的殘餘輸出。DUT 仍會執行該命令。
+   - 避免方式：agent 命令加 `--completion-regex` 並在命令中輸出唯一記號。
+   - 不帶行尾錨點的 `prompt_regex`（例如 prpl、Speedport 範本）尚未驗證，風險可能較高。
+4. **USB 序列埠短暫斷線又回來後，不會自動接回**（#300）
+   - 裝置在 1 秒內斷線又回來（例如 USB 重新列舉）時，session 停在 `DETACHED`，`last_error` 為 `ATTACH_FAILED:FileNotFoundError`，之後不會自動接回。0.4.x 也有同樣的限制。
+   - 恢復方式：`serialwrap session attach --selector <COM>`。
+5. **升級安裝**
+   - Linux：有互動 console（例如 minicom）連著時，`setup` 會回 `SESSION_BUSY`，而且只列出第一個 session。請先關閉 console 再升級。
+   - Windows：daemon 沒有在執行時，`setup` 可能回 `TIMEOUT`。
+   - Windows：`setup` 的安全檢查不會讀取 `config.yaml` 的 `socket_path`。使用非預設埠時，請以環境變數 `SERIALWRAP_TCP_PORT` 指定。
+   - 若曾在解壓後的 bundle 目錄裡直接執行 `doctor`，產生的 `__pycache__` 會讓 checksum 驗證失敗。刪除該目錄後再安裝。
+6. **Windows 發佈 zip 不含 com0com 選用元件**，延到 0.5.1 提供。
