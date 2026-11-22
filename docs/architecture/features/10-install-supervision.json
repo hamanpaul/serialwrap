@@ -1,0 +1,362 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "serialwrap｜安裝與監管",
+    "locale": "zh-TW",
+    "output": "docs/architecture/features/10-install-supervision.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/hamanpaul/serialwrap",
+      "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347",
+      "provider": "github"
+    }
+  },
+  "participants": [
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "CLI",
+      "sublabel": "setup／service／doctor",
+      "sources": [
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 1738,
+          "end_line": 1745
+        },
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 410,
+          "end_line": 435
+        },
+        {
+          "path": "crates/sw-cli/src/commands/service_cmd.rs",
+          "line": 16,
+          "end_line": 19
+        }
+      ]
+    },
+    {
+      "id": "bundle",
+      "type": "external",
+      "label": "發行 bundle",
+      "sublabel": "manifest＋SHA256SUMS",
+      "sources": [
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 1521,
+          "end_line": 1544
+        },
+        {
+          "path": "crates/sw-cli/src/install_layout.rs",
+          "line": 863,
+          "end_line": 866
+        },
+        {
+          "path": "crates/sw-cli/src/install_layout.rs",
+          "line": 703,
+          "end_line": 703
+        }
+      ]
+    },
+    {
+      "id": "root",
+      "type": "database",
+      "label": "安裝根",
+      "sublabel": "versions／journal／備份",
+      "sources": [
+        {
+          "path": "crates/sw-cli/src/install_layout.rs",
+          "line": 1,
+          "end_line": 1
+        },
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 1786,
+          "end_line": 1788
+        },
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 696,
+          "end_line": 709
+        }
+      ]
+    },
+    {
+      "id": "userdir",
+      "type": "database",
+      "label": "使用者目錄",
+      "sublabel": "config.yaml＋資產",
+      "sources": [
+        {
+          "path": "crates/sw-pal/src/service_ctl.rs",
+          "line": 24,
+          "end_line": 26
+        },
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 103,
+          "end_line": 125
+        },
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 1611,
+          "end_line": 1615
+        }
+      ]
+    },
+    {
+      "id": "supervisor",
+      "type": "external",
+      "label": "監管者",
+      "sublabel": "systemd｜工作排程",
+      "sources": [
+        {
+          "path": "crates/sw-pal/src/service_ctl.rs",
+          "line": 562,
+          "end_line": 564
+        },
+        {
+          "path": "crates/sw-pal/src/service_ctl.rs",
+          "line": 655,
+          "end_line": 657
+        },
+        {
+          "path": "crates/sw-pal/src/service_ctl/systemd.rs",
+          "line": 15,
+          "end_line": 16
+        }
+      ]
+    },
+    {
+      "id": "daemon",
+      "type": "backend",
+      "label": "serialwrapd",
+      "sublabel": "被監管的 daemon",
+      "sources": [
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 595,
+          "end_line": 634
+        },
+        {
+          "path": "crates/sw-cli/src/graceful_stop.rs",
+          "line": 798,
+          "end_line": 810
+        },
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 2371,
+          "end_line": 2388
+        }
+      ]
+    }
+  ],
+  "segments": [
+    {
+      "from": 158,
+      "to": 646,
+      "label": "安裝／更新／回滾"
+    },
+    {
+      "from": 648,
+      "to": 815,
+      "label": "一般 setup"
+    },
+    {
+      "from": 817,
+      "to": 965,
+      "label": "切換監管模式"
+    },
+    {
+      "from": 967,
+      "to": 1137,
+      "label": "日常操作與診斷"
+    }
+  ],
+  "messages": [
+    {
+      "id": "lock",
+      "from": "cli",
+      "to": "root",
+      "y": 174,
+      "label": "取 .install.lock、復原殘留 journal"
+    },
+    {
+      "id": "rollback-target",
+      "from": "cli",
+      "to": "root",
+      "y": 204,
+      "label": "--rollback：以 previous 版本為目標",
+      "note": "條件：setup --rollback"
+    },
+    {
+      "id": "verify",
+      "from": "cli",
+      "to": "bundle",
+      "y": 260,
+      "label": "驗證 manifest 與 SHA256SUMS"
+    },
+    {
+      "id": "stage",
+      "from": "cli",
+      "to": "root",
+      "y": 290,
+      "label": "stage_version：放入 versions/<版本>"
+    },
+    {
+      "id": "safety",
+      "from": "cli",
+      "to": "daemon",
+      "y": 320,
+      "label": "safety_check：health.ping＋mcu.status"
+    },
+    {
+      "id": "hold",
+      "from": "cli",
+      "to": "supervisor",
+      "y": 350,
+      "label": "hold_autostart：抑制自動拉起",
+      "note": "Linux｜Windows：systemd drop-in｜schtasks /DISABLE"
+    },
+    {
+      "id": "handoff",
+      "from": "cli",
+      "to": "daemon",
+      "y": 406,
+      "label": "daemon.handoff_stop（交接停止）",
+      "note": "條件：舊 daemon 正在執行"
+    },
+    {
+      "id": "released",
+      "from": "cli",
+      "to": "daemon",
+      "y": 462,
+      "label": "confirm_released：行程已退出、tty 已釋放"
+    },
+    {
+      "id": "switch",
+      "from": "cli",
+      "to": "root",
+      "y": 492,
+      "label": "備份狀態 → 切換穩定入口",
+      "note": "Linux｜Windows：symlink 原子覆蓋｜複製後改名"
+    },
+    {
+      "id": "start",
+      "from": "cli",
+      "to": "supervisor",
+      "y": 548,
+      "label": "Start 新版"
+    },
+    {
+      "id": "verify-new",
+      "from": "cli",
+      "to": "daemon",
+      "y": 578,
+      "label": "health.ping＋版本配對"
+    },
+    {
+      "id": "revert",
+      "from": "cli",
+      "to": "root",
+      "y": 608,
+      "label": "失敗：還原入口與備份",
+      "note": "條件：切換或驗證失敗"
+    },
+    {
+      "id": "probe",
+      "from": "cli",
+      "to": "daemon",
+      "y": 664,
+      "label": "health.ping＋mcu.status（現況）"
+    },
+    {
+      "id": "assets",
+      "from": "cli",
+      "to": "userdir",
+      "y": 694,
+      "label": "物化資產：profiles／skill／tools"
+    },
+    {
+      "id": "install-def",
+      "from": "cli",
+      "to": "supervisor",
+      "y": 724,
+      "label": "安裝監管定義並啟用",
+      "note": "條件：非 on-demand。Linux｜Windows：systemd unit｜工作排程 XML"
+    },
+    {
+      "id": "write-mode",
+      "from": "cli",
+      "to": "userdir",
+      "y": 803,
+      "label": "寫回 supervision_mode 與 socket"
+    },
+    {
+      "id": "sw-hold",
+      "from": "cli",
+      "to": "supervisor",
+      "y": 833,
+      "label": "supervision-mode set：hold 舊模式"
+    },
+    {
+      "id": "sw-stop",
+      "from": "cli",
+      "to": "daemon",
+      "y": 863,
+      "label": "交接停止舊 daemon"
+    },
+    {
+      "id": "sw-install",
+      "from": "cli",
+      "to": "supervisor",
+      "y": 893,
+      "label": "安裝新模式定義並啟動"
+    },
+    {
+      "id": "sw-mode",
+      "from": "cli",
+      "to": "userdir",
+      "y": 923,
+      "label": "寫入新的 supervision_mode"
+    },
+    {
+      "id": "sw-release",
+      "from": "cli",
+      "to": "supervisor",
+      "y": 953,
+      "label": "release hold"
+    },
+    {
+      "id": "service",
+      "from": "cli",
+      "to": "supervisor",
+      "y": 983,
+      "label": "service start／stop／restart／status",
+      "note": "Linux｜Windows：systemctl｜stop 前先 graceful stop"
+    },
+    {
+      "id": "autostart",
+      "from": "cli",
+      "to": "daemon",
+      "y": 1039,
+      "label": "on-demand：連不上時自動啟動",
+      "note": "Linux｜Windows：不自動啟動｜on-demand 時自動啟動"
+    },
+    {
+      "id": "doctor-daemon",
+      "from": "cli",
+      "to": "daemon",
+      "y": 1095,
+      "label": "doctor：endpoint、code 指紋、版本配對"
+    },
+    {
+      "id": "doctor-local",
+      "from": "cli",
+      "to": "userdir",
+      "y": 1125,
+      "label": "doctor：監管模式、WAL 目錄、profile"
+    }
+  ]
+}
