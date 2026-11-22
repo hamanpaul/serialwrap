@@ -180,23 +180,23 @@
   ],
   "segments": [
     {
-      "from": 158,
-      "to": 246,
+      "from": 160,
+      "to": 270,
       "label": "資產落地"
     },
     {
-      "from": 248,
-      "to": 490,
+      "from": 278,
+      "to": 553,
       "label": "daemon 載入與使用"
     },
     {
-      "from": 492,
-      "to": 666,
+      "from": 561,
+      "to": 757,
       "label": "測試與檢查"
     },
     {
-      "from": 668,
-      "to": 756,
+      "from": 765,
+      "to": 875,
       "label": "skill"
     }
   ],
@@ -205,64 +205,64 @@
       "id": "setup-cmd",
       "from": "operator",
       "to": "cli",
-      "y": 174,
+      "y": 198,
       "label": "setup"
     },
     {
       "id": "assets-read",
       "from": "cli",
       "to": "assets",
-      "y": 204,
+      "y": 228,
       "label": "取內嵌的 profiles／skill／tools"
     },
     {
       "id": "assets-write",
       "from": "cli",
       "to": "profdir",
-      "y": 234,
+      "y": 258,
       "label": "寫入 default.yaml（既有檔不覆寫）"
     },
     {
       "id": "load-call",
       "from": "daemon",
       "to": "loader",
-      "y": 264,
+      "y": 316,
       "label": "load_profiles(profile_dir)"
     },
     {
       "id": "load-read",
       "from": "loader",
       "to": "profdir",
-      "y": 294,
+      "y": 346,
       "label": "依檔名排序讀 *.yaml／*.yml"
     },
     {
       "id": "load-result",
       "from": "loader",
       "to": "daemon",
-      "y": 324,
+      "y": 376,
       "label": "templates＋targets＋max_sessions",
-      "note": "Linux｜Windows：不另加 template｜注入 passthrough"
+      "note": "Linux｜Windows： 不另加 template ｜ 注入 passthrough"
     },
     {
       "id": "hand-over",
       "from": "daemon",
       "to": "sessions",
-      "y": 392,
+      "y": 455,
       "label": "ManagerDeps：交付 load"
     },
     {
       "id": "pick-template",
       "from": "sessions",
       "to": "actor",
-      "y": 422,
+      "y": 485,
       "label": "建立 session：選定 template"
     },
     {
       "id": "resolve-auth",
       "from": "actor",
       "to": "profdir",
-      "y": 452,
+      "y": 515,
       "label": "登入時讀 env 檔解析帳密",
       "note": "條件：template 宣告了帳密來源"
     },
@@ -270,35 +270,35 @@
       "id": "test-cmd",
       "from": "operator",
       "to": "cli",
-      "y": 508,
+      "y": 599,
       "label": "profile test --profile … --sample …"
     },
     {
       "id": "test-load",
       "from": "cli",
       "to": "loader",
-      "y": 538,
+      "y": 629,
       "label": "load_profiles(--profile-dir)"
     },
     {
       "id": "test-read",
       "from": "loader",
       "to": "profdir",
-      "y": 568,
+      "y": 659,
       "label": "讀 YAML（與 daemon 同一套規則）"
     },
     {
       "id": "test-result",
       "from": "cli",
       "to": "operator",
-      "y": 598,
+      "y": 689,
       "label": "checks：五組 regex 的命中行或錯誤"
     },
     {
       "id": "doctor-profile",
       "from": "cli",
       "to": "profdir",
-      "y": 628,
+      "y": 719,
       "label": "doctor：比對 bootloader_prompts",
       "note": "條件：操作者執行 doctor"
     },
@@ -306,21 +306,21 @@
       "id": "skill-cmd",
       "from": "operator",
       "to": "cli",
-      "y": 684,
+      "y": 803,
       "label": "skill"
     },
     {
       "id": "skill-read",
       "from": "cli",
       "to": "assets",
-      "y": 714,
+      "y": 833,
       "label": "取 SKILL.md｜SKILL_WINDOWS.md"
     },
     {
       "id": "skill-out",
       "from": "cli",
       "to": "operator",
-      "y": 744,
+      "y": 863,
       "label": "輸出說明文字"
     }
   ]
