@@ -342,8 +342,9 @@ pub fn wait_until(what: &str, cond: impl FnMut() -> bool) {
     wait_until_within(what, Duration::from_secs(10), cond);
 }
 
-/// 同 [`wait_until`]，由呼叫端指定真實時間上限。只給有實際逾時紀錄的個別等待點使用，呼叫處須註明證據；
-/// 不得因單次失敗就把共用上限全域放寬（PR #278 十輪審查：10→60 秒曾一次套用到全部呼叫者）。
+/// 同 [`wait_until`]，由呼叫端指定真實時間上限。目前沒有需要較長上限的呼叫點（原本唯一的 60 秒例外，根因是
+/// 測試推 FakeClock 的節奏而非等待太短，已改掉）。等待逾時先查「測試推時鐘的節奏是否把產品的假時間預算吃掉」，
+/// 不要因單次失敗就放寬上限（PR #278 十輪審查：10→60 秒曾一次套用到全部呼叫者）。
 pub fn wait_until_within(what: &str, limit: Duration, mut cond: impl FnMut() -> bool) {
     let deadline = Instant::now() + limit;
     while !cond() {

@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 
 use support::{
     BY_ID_A, BY_ID_B, REAL_A, REAL_B, RIG_PID, RigSpec, ServiceRig, json_string, wait_until,
-    wait_until_within,
 };
 use sw_core::state_store::{LoadedState, ReleasedRow};
 use sw_pal::fakes::{FakeDevice, FakeEnv, FakeSerialBackend};
@@ -9906,16 +9905,46 @@ fn wp73_rpc_reboot_clears_rx_for_console_unlock_service_rig() {
     );
 
     // 推進時鐘等待 recovery 完成並回到 READY。
-    // 這是 sw-daemon 測試中唯一有逾時紀錄的等待點：PR #278 第 4 輪 hosted rust-linux 在共用 10 秒上限下於此逾時一次
-    // （同一上限下第 2、3 輪整個 crate 全過）。本機單跑整支測試約 0.4 秒（限 2 核亦同），所以 hosted 那次超過 10 秒的
-    // 原因並未查明；在查明之前只保留這一處 60 秒的觀察上限（不是產品期限），其餘等待維持共用 10 秒。
-    // 若這裡在 60 秒仍逾時，請當成真的卡住來查，不要再加長。
-    wait_until_within("session 恢復 READY", Duration::from_secs(60), || {
-        r.clock.advance(Duration::from_millis(200));
-        r.session("COM0")
-            .and_then(|session| session.get("state").cloned())
-            == Some(PyValue::from("READY"))
-    });
+    //
+    // 每圈只推 10 ms 假時間（先前是 200 ms）。根因（PR #278 第 4 輪、PR #291 hosted rust-linux 兩次逾時）：
+    // 這個迴圈每 2 ms 實時就把 FakeClock 往前推，與產品執行緒的進度無關；`ensure_console_unlocked` 整段只有
+    // `timeout_s`＝2 s 假時間的預算，其中「送空行等 prompt」固定吃掉約 1 s。每圈推 200 ms 時，產品端編譯
+    // prompt regex 的幾毫秒實時就等於 0.2～0.75 s 假時間，慢的 runner 上兩者相加超過 2 s，每一次解鎖嘗試都在
+    // 送出密鑰之前以 `CONSOLE_UNLOCK_IDLE_TIMEOUT` 失敗；60 s 假時間的 recovery 期限到期後 session 落在 ATTACHED，
+    // 該錯誤碼不在自動重探之列（與 Python 基線相同），所以不論等 10 秒或 60 秒實時都等不到 READY。
+    // 這是測試推時鐘的節奏問題，不是產品在真實時鐘下的行為：真實時鐘下毫秒級的編譯時間吃不掉 2 秒預算。
+    // 以放大產品端 regex 編譯成本 1／3／6 倍驗證：每圈 10 ms 時第一次解鎖嘗試即成功。
+    let recovery_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        r.clock.advance(Duration::from_millis(10));
+        let session = r.session("COM0");
+        let state = session
+            .as_ref()
+            .and_then(|session| session.get("state").cloned());
+        if state == Some(PyValue::from("READY")) {
+            break;
+        }
+        // recovery 期限到期後的終態：ATTACHED 且帶 last_error。此後不會再自動回到 READY，直接失敗並印出現場。
+        let terminal = state == Some(PyValue::from("ATTACHED"))
+            && !matches!(
+                session.as_ref().and_then(|session| session.get("last_error")),
+                None | Some(PyValue::Null)
+            );
+        let timed_out = Instant::now() >= recovery_deadline;
+        if terminal || timed_out {
+            // 現場字串只在真的要失敗時才建構，迴圈的正常路徑不做多餘的配置與 TX 複製。
+            let snapshot = session
+                .as_ref()
+                .map(j)
+                .unwrap_or_else(|| "<無 session 列>".to_string());
+            let tx = String::from_utf8_lossy(&dev.tx_since(tx_mark)).into_owned();
+            if terminal {
+                panic!("reboot recovery 以非 READY 終態結束：{snapshot}；reboot 之後的 TX：{tx:?}");
+            }
+            panic!("等待逾時（10s）：session 恢復 READY；最後狀態：{snapshot}；reboot 之後的 TX：{tx:?}");
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
 
     let reboot_tx = String::from_utf8_lossy(&dev.tx_since(tx_mark)).into_owned();
     assert!(
