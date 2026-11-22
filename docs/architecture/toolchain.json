@@ -26,6 +26,20 @@
         "delivery": "5a5bb73e5d20b01681b4b19a6e27cadf37c02f6d5564402ce4cd3d94ca7b9898",
         "html": "483faa7a1f1170446768e0f9dc095aba7bc9ae5637a9be09811c48db99f744c1"
       }
+    },
+    "01-command-exec": {
+      "diagram_type": "sequence",
+      "source_revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347",
+      "facts": "features/01-command-exec.facts.json",
+      "ir": "features/01-command-exec.json",
+      "html": "features/01-command-exec.html",
+      "overlay_version": 1,
+      "sha256": {
+        "facts": "b8f2f6888b1e041324930bf2755eefcae011c62e5b5a1e38b695f7179daf1745",
+        "ir": "36a44fece4dbb9f7fac1908d75c0d7026496934873f1203a634f135e73ff9bd8",
+        "delivery": "45047ee239e57e35598d2fa2d6da74010dbf0fd058836f5049a87f5621e811b0",
+        "html": "1c2c5da7f08598e8867d9f12ace6b2933ed6a8909878bad61859874f6d102a01"
+      }
     }
   }
 }
