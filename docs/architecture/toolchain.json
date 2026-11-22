@@ -180,6 +180,20 @@
         "delivery": "b8457ba46687b6c5e872d60afb05cdd8223a16091187bb8c2e17f49899583618",
         "html": "a64cfc302c826a9cdc52c10064578a141234e31fd0c346968e15c2f80b659760"
       }
+    },
+    "12-config-tools": {
+      "diagram_type": "sequence",
+      "source_revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347",
+      "facts": "features/12-config-tools.facts.json",
+      "ir": "features/12-config-tools.json",
+      "html": "features/12-config-tools.html",
+      "overlay_version": 2,
+      "sha256": {
+        "facts": "3fcd281cd542928097d75e876aa0eed86c9a0ed241fea062219dcd94bbc468f7",
+        "ir": "db64a095cd647c6b83f3f5af83b80fd6ee25a716a8cdb8768bb7d73237629624",
+        "delivery": "402a4339dabb03fa76ab94d4a6ef1db7c14bea1038e344a0a1520bec577a6e1a",
+        "html": "d859bc5eb7467d6b61f2c160e7670b8017281afb8fcd44d0d9b7beeb9ace9be4"
+      }
     }
   }
 }
