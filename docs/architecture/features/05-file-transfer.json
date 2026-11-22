@@ -205,7 +205,7 @@
     },
     {
       "from": 1761,
-      "to": 2075,
+      "to": 2107,
       "label": "條件式停機行收尾"
     }
   ],
@@ -478,7 +478,7 @@
       "y": 2041,
       "label": "凍結並取消剩餘傳輸等待",
       "variant": "default",
-      "note": "條件： drain Phase 1；不等整份 push"
+      "note": "條件： drain Phase 1。回覆可能偶發 EXCEPTION（#296）"
     }
   ]
 }

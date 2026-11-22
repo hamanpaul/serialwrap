@@ -1409,9 +1409,51 @@
           "end_line": 48,
           "excerpt_sha256": "cf7e3f1fdd5daaf789f8dc0e7f2362359c9d5ad8f677686c3449b084d7f5198f",
           "claim": "worker 停止回條先於 WAL 關閉，包含 echo 聚合紀錄排空。"
+        },
+        {
+          "path": "crates/sw-core/src/mailbox.rs",
+          "line": 728,
+          "end_line": 741,
+          "excerpt_sha256": "f01536e813a6ff97ab8bc319d00418679c83689d0438190ca813eb7eccf0ed77",
+          "claim": "mailbox 以 select_biased! 優先取 safety lane；WorkerStopped 由此進入停止回條佇列。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 6548,
+          "end_line": 6553,
+          "excerpt_sha256": "65c6ea76f7bef0816b982a28dd33a4252ff7fd79783c5e210f6836a8591dbdd3",
+          "claim": "worker_stopped 比對目前 stop 的 id 與 epoch，處理 drain 收尾回條。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 2373,
+          "end_line": 2375,
+          "excerpt_sha256": "baf26ef1ac9edef1a7b22a42480639c07407cc54d107537506dba15b99e76b02",
+          "claim": "Shutdown 類停止收尾時設 shutdown_complete=true。"
+        },
+        {
+          "path": "crates/sw-core/src/actor.rs",
+          "line": 839,
+          "end_line": 839,
+          "excerpt_sha256": "869dc31b0b4f4332bcd65e36538cd4348471374b6310628850bce85a60f5efac",
+          "claim": "dispatch 回傳 core.shutdown_complete()。"
+        },
+        {
+          "path": "crates/sw-core/src/actor.rs",
+          "line": 515,
+          "end_line": 516,
+          "excerpt_sha256": "1e2ffa2cdc8380f234514497453be8b3f49957a1499db374473b786677961473",
+          "claim": "dispatch 回傳 true 時 actor 迴圈 break，結束執行緒。"
+        },
+        {
+          "path": "crates/sw-core/src/actor.rs",
+          "line": 343,
+          "end_line": 351,
+          "excerpt_sha256": "ecf0c0f8c485908255ae6718b76487c551004b79263a54ac0c11c6e214cbd8ad",
+          "claim": "回覆通道斷線且 actor 已結束時，RPC 端得到 session actor stopped。"
         }
       ],
-      "note": "actor 的 drain Phase 1 凍結並失效世代，再取消殘餘 prompt／傳輸等待；不等整份 push 跑完。runner 結果沿傳輸結果收尾路徑返回；writer 未結聚合在 worker 停止回條前排空，daemon 之後才關 WAL。完整 worker／daemon 停止序不在本頁展開。",
+      "note": "actor 的 drain Phase 1 凍結並失效世代，再取消殘餘 prompt／傳輸等待；不等整份 push 跑完。runner 結果沿傳輸結果收尾路徑返回；writer 未結聚合在 worker 停止回條前排空，daemon 之後才關 WAL。完整 worker／daemon 停止序不在本頁展開。停機時傳輸的 RPC 回覆可能偶發回 EXCEPTION（session actor stopped），而非 OD-62 碼（issue #296；修正 PR #298 不在 12eb9a0e）：safety lane 的 WorkerStopped 若先於 control lane 的 OpFinished 被處理，Shutdown 收尾即設 shutdown_complete，actor 迴圈結束，PendingOp::FileTransfer 的回覆通道隨之斷線。",
       "condition": "daemon 停機進入該 session 的 drain Phase 1。"
     }
   ],
