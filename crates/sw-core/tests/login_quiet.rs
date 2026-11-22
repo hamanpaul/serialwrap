@@ -966,12 +966,25 @@ fn login_error_detail_carries_rx_tail() {
     assert!(detail.contains("BOOT-NOISE"));
     assert!(!detail.contains('\u{1b}'), "detail 不得含 ANSI 控制碼");
 
-    // 非表列碼（PROMPT_UNAVAILABLE）：last_error_detail 為 null。
+    // 非表列碼（PROMPT_UNAVAILABLE）且自 attach 起零 RX：detail 為分收發方向的提示（Python `never_rx_hint`），
+    // last_error 不變。
     let silent = ActorRig::new(SHELL_PROFILE).attach();
     silent.wait_state("ATTACHED");
     let s2 = silent.get_state();
     assert_eq!(pget(&s2, "last_error"), PyValue::from("PROMPT_UNAVAILABLE"));
-    assert_eq!(pget(&s2, "last_error_detail"), PyValue::Null);
+    assert_eq!(
+        pget(&s2, "last_error_detail"),
+        PyValue::from(sw_core::transport_stall::never_rx_hint(Some(REAL_PATH)))
+    );
+
+    // probe 期間有 RX（但沒有 prompt）：不是「從未收到 RX」，detail 維持 null。
+    let noisy = ActorRig::new(SHELL_PROFILE);
+    noisy.dev.on_tx_reply(b"\n", b"\r\n");
+    let noisy = noisy.attach();
+    noisy.wait_state("ATTACHED");
+    let s3 = noisy.get_state();
+    assert_eq!(pget(&s3, "last_error"), PyValue::from("PROMPT_UNAVAILABLE"));
+    assert_eq!(pget(&s3, "last_error_detail"), PyValue::Null);
 }
 
 #[test]
