@@ -200,13 +200,13 @@
   ],
   "segments": [
     {
-      "from": 158,
-      "to": 671,
+      "from": 160,
+      "to": 706,
       "label": "組裝（行程啟動）"
     },
     {
-      "from": 673,
-      "to": 919,
+      "from": 714,
+      "to": 982,
       "label": "使用（只經 trait）"
     }
   ],
@@ -215,113 +215,113 @@
       "id": "native",
       "from": "biz",
       "to": "platform",
-      "y": 174,
+      "y": 198,
       "label": "sw_pal::native_client()"
     },
     {
       "id": "build-files",
       "from": "platform",
       "to": "files",
-      "y": 204,
+      "y": 228,
       "label": "建立 FsOps／WalFs／ProcScan",
-      "note": "Linux｜Windows：/proc 掃描｜行程快照"
+      "note": "Linux｜Windows： /proc 掃描 ｜ 行程快照"
     },
     {
       "id": "build-rpc",
       "from": "platform",
       "to": "rpc",
-      "y": 272,
+      "y": 296,
       "label": "建立 RpcConnector／RpcListenerFactory",
-      "note": "Linux｜Windows：AF_UNIX（也支援 TCP）｜TCP loopback"
+      "note": "Linux｜Windows： AF_UNIX（也支援 TCP） ｜ TCP loopback"
     },
     {
       "id": "build-lock",
       "from": "platform",
       "to": "lock",
-      "y": 351,
+      "y": 375,
       "label": "建立 InstanceLockFactory",
-      "note": "Linux｜Windows：flock｜LockFileEx"
+      "note": "Linux｜Windows： flock ｜ LockFileEx"
     },
     {
       "id": "build-devices",
       "from": "platform",
       "to": "devices",
-      "y": 407,
+      "y": 431,
       "label": "建立裝置來源工廠",
-      "note": "Linux｜Windows：/dev/serial/by-id｜SERIALCOMM 登錄"
+      "note": "Linux｜Windows： by-id／by-path ｜ SERIALCOMM 登錄"
     },
     {
       "id": "build-serial",
       "from": "platform",
       "to": "serial",
-      "y": 486,
+      "y": 510,
       "label": "建立 SerialBackend",
-      "note": "Linux｜Windows：termios｜overlapped COM"
+      "note": "Linux｜Windows： termios ｜ overlapped COM"
     },
     {
       "id": "build-console",
       "from": "platform",
       "to": "console",
-      "y": 542,
+      "y": 566,
       "label": "建立 ConsoleTransportFactory",
-      "note": "Linux｜Windows：PTY｜TCP＋Telnet，可選 com0com"
+      "note": "Linux｜Windows： PTY ｜ TCP＋Telnet， 可選 com0com"
     },
     {
       "id": "bundle",
       "from": "platform",
       "to": "biz",
-      "y": 610,
+      "y": 645,
       "label": "Platform＋Capabilities",
-      "note": "Linux｜Windows：flash 端點 有｜無、com0com console 否｜是"
+      "note": "Linux｜Windows： flash 端點 有｜無、 com0com console 否｜是"
     },
     {
       "id": "use-lock",
       "from": "biz",
       "to": "lock",
-      "y": 689,
+      "y": 752,
       "label": "acquire(lock 路徑, endpoint)"
     },
     {
       "id": "use-files",
       "from": "biz",
       "to": "files",
-      "y": 719,
+      "y": 782,
       "label": "WAL／state 寫入、行程掃描"
     },
     {
       "id": "use-devices",
       "from": "biz",
       "to": "devices",
-      "y": 749,
+      "y": 812,
       "label": "建立裝置來源並定期 scan"
     },
     {
       "id": "use-serial",
       "from": "biz",
       "to": "serial",
-      "y": 779,
+      "y": 842,
       "label": "open_exclusive／讀寫"
     },
     {
       "id": "use-console",
       "from": "biz",
       "to": "console",
-      "y": 809,
+      "y": 872,
       "label": "開埠時建立 console 端點",
-      "note": "Linux｜Windows：預建哨兵 PTY｜綁本機 listener"
+      "note": "Linux｜Windows： 預建哨兵 PTY ｜ 綁本機 listener"
     },
     {
       "id": "use-rpc",
       "from": "biz",
       "to": "rpc",
-      "y": 877,
+      "y": 940,
       "label": "bind listener／connect"
     },
     {
       "id": "use-caps",
       "from": "biz",
       "to": "platform",
-      "y": 907,
+      "y": 970,
       "label": "讀 Capabilities 決定分支"
     }
   ]
