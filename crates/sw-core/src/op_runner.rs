@@ -881,6 +881,8 @@ fn run_reboot(
 
 /// `_recover_after_failure`（agent／system:recover 分支；人類來源不適用，DF-02）。
 /// passthrough 不送救援鍵（SC-35）；quiet 由 fence 在每次寫入前重驗（`Quiet` 拒絕即停止）。
+/// 救援鍵依 profile 的 `timeout_recovery_keys` 依序送出（預設 CTRL_C、CTRL_D）；空清單＝不送，直接落到
+/// `PromptTimeout` 收尾，與全部按鍵都救不回時相同（命令轉 ATTACHED；READY recover 接 auto-fallback Force）。
 /// `aborted`：命令路徑的 `(cmd_id, 命令本身已確認的 TX bytes)`，救援鍵遇其他拒絕時依 Python `_map_aborted_result`
 /// 結算（審查 F26）；READY recover 為 `None`（維持例外）。
 #[allow(clippy::too_many_arguments)]
@@ -900,12 +902,13 @@ fn recover_after_failure(
         };
     }
     let prompt_re = compile_or_never(prompt_regex);
-    for (name, key) in [("CTRL_C", b"\x03"), ("CTRL_D", b"\x04")] {
+    for recovery_key in &ctx.profile.template.timeout_recovery_keys {
+        let name = recovery_key.name();
         let offset = ctx.rx.snapshot_len();
         let report = send(
             ctx,
             grant,
-            key,
+            recovery_key.payload(),
             TxClass::SystemRecoverKey,
             "system:recover",
             None,

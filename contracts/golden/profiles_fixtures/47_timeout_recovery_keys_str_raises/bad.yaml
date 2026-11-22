@@ -1,0 +1,7 @@
+# 字串（不是 list）一律拒絕，不得退回預設
+profiles:
+  p:
+    platform: prpl
+    timeout_recovery_keys: CTRL_C
+targets:
+  - {profile: p, device_by_id: d1}

@@ -1,0 +1,7 @@
+# 未知鍵名（大小寫不同也算）拒絕
+profiles:
+  p:
+    platform: prpl
+    timeout_recovery_keys: [CTRL_C, ctrl_d]
+targets:
+  - {profile: p, device_by_id: d1}

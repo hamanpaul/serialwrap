@@ -23,7 +23,8 @@ pub enum RecoverPlan {
     Reprobe,
     /// ATTACHED／非 READY 的 force：begin_stop(Clear) 後輪詢。
     Force,
-    /// READY：CTRL_C／CTRL_D，兩鍵失敗後自動 Force。
+    /// READY：依 profile 的 `timeout_recovery_keys` 送救援鍵（預設 CTRL_C、CTRL_D；空清單不送），
+    /// 全部救不回後自動 Force。
     ReadyKeys,
 }
 
