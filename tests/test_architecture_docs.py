@@ -174,9 +174,13 @@ def _tamper(kind):
     elif kind == "outside-block":
         changed = html.replace(b"<title>", b"<title>edited ", 1)
     elif kind == "dead-link":
-        # 導覽列指向尚未整合的頁面：以「多一頁可點」的清單重新產生加工區塊
-        fake = set(toolchain["pages"]) | {"02-session-lifecycle"}
-        changed = OVERLAY.apply(OVERLAY.remove(html), REVIEW.overlay_manifest(pages, fake), "overview")
+        # 導覽列指向不存在的頁面：以「多一個可點續頁」的清單重新產生加工區塊（不依賴目前已整合幾頁）
+        fake_pages = copy.deepcopy(pages)
+        ghost = f"{fake_pages['features'][0]['id']}-2"
+        fake_pages["features"][0]["continuations"] = [ghost]
+        changed = OVERLAY.apply(OVERLAY.remove(html), REVIEW.overlay_manifest(fake_pages, set(toolchain["pages"]) | {ghost}),
+                                "overview")
+        assert f"{ghost}.html".encode() in changed and not (ARCH/"features"/f"{ghost}.html").exists()
     else:
         raise AssertionError(kind)
     assert changed != html
