@@ -194,6 +194,20 @@
         "delivery": "402a4339dabb03fa76ab94d4a6ef1db7c14bea1038e344a0a1520bec577a6e1a",
         "html": "d859bc5eb7467d6b61f2c160e7670b8017281afb8fcd44d0d9b7beeb9ace9be4"
       }
+    },
+    "13-cross-platform": {
+      "diagram_type": "sequence",
+      "source_revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347",
+      "facts": "features/13-cross-platform.facts.json",
+      "ir": "features/13-cross-platform.json",
+      "html": "features/13-cross-platform.html",
+      "overlay_version": 2,
+      "sha256": {
+        "facts": "014310de9649aaf8f8866ae36bdf8eec73f48af54bad887de638731078ab9e95",
+        "ir": "ab7fcc210740c60acd8e45b24ff847fdacd2683f07a44d90a000efa88bf9f29e",
+        "delivery": "df01623df85ff431e351be3cb08279282c45d116549e8ad021a53bf210bf5fd9",
+        "html": "d5edbde9d3ee74e6045a1a30fa8d2700de0900efd99eae28c95dc16f2ec6cdb8"
+      }
     }
   }
 }
