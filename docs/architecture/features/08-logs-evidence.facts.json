@@ -1,0 +1,835 @@
+{
+  "schema_version": 1,
+  "document_type": "feature-facts",
+  "feature": {
+    "id": "08-logs-evidence",
+    "order": 8,
+    "title": "紀錄與證據",
+    "summary": "UART 上每一段收發怎麼被記成可查的證據：WAL 雙軌寫入與輪替、讀取介面、per-session 的文字 log，以及 session 的活動分類。"
+  },
+  "repository": {
+    "url": "https://github.com/hamanpaul/serialwrap",
+    "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347"
+  },
+  "diagram_type": "sequence",
+  "scope": {
+    "includes": [
+      "WAL 雙軌寫入：reader 的 RX 與 TxWriter 的 TX 經 WalWriter 寫入 raw.wal.ndjson 與 raw.mirror.log",
+      "輪替與自癒：64 MiB 輪替、延後重試、檔案或目錄被刪除後的重建、健康狀態通知 Fence",
+      "讀取與重置：log.tail_raw／log.tail_text／wal.range／wal.reset",
+      "per-session capture：session.log_start／log_stop／log_status 與 reader 的寫入條件",
+      "activity：session.activity 的分類依據"
+    ],
+    "excludes": [
+      "背景命令的 BackgroundCapture 與 command.result_tail（屬於 01-command-exec）",
+      "事件引擎的 events.ndjson（屬於 07-event-engine）",
+      "WAL 紀錄的逐欄序列化格式與 CRC 計算細節",
+      "daemon 停止序中的 WAL shutdown（屬於 09-daemon-mgmt）；`wal.current_seq` 只回目前序號，未另畫步驟",
+      "SessionManager、OpRunner 與 daemon 主流程寫入的其他 WAL 紀錄（例如傳輸中止的 META）"
+    ]
+  },
+  "participants": [
+    {
+      "id": "cli",
+      "label": "CLI／Agent",
+      "type": "frontend",
+      "overview_component": "cli",
+      "responsibility": "讀取與管理紀錄的入口：`log tail-raw`／`log tail-text`、`wal export`／`wal reset`／`wal current-seq`、`session log-start`／`log-stop`／`log-status`、`session activity`，各自對應一個 RPC。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 181,
+          "end_line": 182,
+          "excerpt_sha256": "4d391ea2d81b40a968122fd7b2120a8963b8ad6b9eaa4edb563d791b8dfedf06",
+          "claim": "log tail-raw／tail-text 對應 log.tail_raw／log.tail_text。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 212,
+          "end_line": 221,
+          "excerpt_sha256": "8ed74e3cf217c48146b801f44bc9ed793916b3168ba584f4c07fa596f11fadc7",
+          "claim": "wal export／reset／current-seq 對應 wal.range／wal.reset／wal.current_seq。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 122,
+          "end_line": 124,
+          "excerpt_sha256": "351121c5692fa8fbc808503a2d07c1309c3bb24ea05d10f710ddf49e8b1f7f00",
+          "claim": "session log-start／log-stop／log-status 對應 session.log_*。"
+        }
+      ],
+      "sublabel": "log／wal／session"
+    },
+    {
+      "id": "service",
+      "label": "RPC／Service",
+      "type": "backend",
+      "overview_component": "service",
+      "responsibility": "`log.tail_*`、`wal.range`、`wal.reset`、`wal.current_seq` 直接呼叫 WalWriter；`session.log_*` 與 `session.activity` 轉成 SessionRequest 送給該 session 的 actor。回應一律附上 WAL 路徑與檔案是否存在。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1284,
+          "end_line": 1330,
+          "excerpt_sha256": "cef32ee23cc1907c3004fb5be8357111def748089d029e585e0930882e5a7b9f",
+          "claim": "log.tail_raw／log.tail_text：解析 from_seq 與 limit、查 WAL 健康、呼叫 tail_raw_with_meta、組回應。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1331,
+          "end_line": 1370,
+          "excerpt_sha256": "90259427691116837cc1f8406c4c231017465ab74229af950f0cdae9325a396a",
+          "claim": "wal.range／wal.reset／wal.current_seq 的處理。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1372,
+          "end_line": 1383,
+          "excerpt_sha256": "a4746b4aeb488d404e1854ffb131779ab37b0d2238d8e974b83005823748bae9",
+          "claim": "session.log_start／log_stop／log_status 轉成 SessionRequest 後 route 到 session。"
+        }
+      ],
+      "sublabel": "Service::rpc"
+    },
+    {
+      "id": "actor",
+      "label": "Session actor",
+      "type": "backend",
+      "overview_component": "session-actor",
+      "responsibility": "每個 session 一條 actor 執行緒上的 SessionCore：處理 LogStart／LogStop／LogStatus（決定 log 目錄與檔名、開檔、把 CaptureObserver 掛到 RX），並在 session 公開狀態裡算出 activity_classification。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3375,
+          "end_line": 3377,
+          "excerpt_sha256": "309ae93da8d745c0e17d91be3d3028995ee2543519fba7c3b069ade08869f83f",
+          "claim": "SessionRequest::LogStart／LogStop／LogStatus 的處理入口。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7737,
+          "end_line": 7783,
+          "excerpt_sha256": "43c7196089d09ace1e7b6833c7876e1d86e1f401b7ddb3783bc85b292dddf3da",
+          "claim": "log_start：已有 active capture 直接回覆；否則建目錄、開檔、install CaptureObserver、set_capture。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 9005,
+          "end_line": 9019,
+          "excerpt_sha256": "7a7a99123b21f349be974f09f67e569961a37e3661818599bfc7fa9f74d970fe",
+          "claim": "activity_classification：offline／newly-attached／active／idle-healthy／quiet-suspicious。"
+        }
+      ],
+      "sublabel": "SessionCore"
+    },
+    {
+      "id": "bridge",
+      "label": "UART bridge",
+      "type": "backend",
+      "overview_component": "bridge",
+      "responsibility": "IoWorker 的 reader 與 TxWriter 兩條執行緒是 WAL 的主要寫入者：reader 每讀到一段 RX 就 append 一筆；TxWriter 在位元組確認送出後 append TX。reader 同時把 RX 交給 session 的 RX 視窗，掛著 capture 時順手寫進 session log 檔。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 491,
+          "end_line": 502,
+          "excerpt_sha256": "922a819c27ececf351386ff6ee34a75740cdc2ad15a808577fc4e97ddd8a3b43",
+          "claim": "reader：讀到資料即以 dir=RX、source=device append 到 WAL。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1113,
+          "end_line": 1134,
+          "excerpt_sha256": "ef4ccb19a404bc6dce0ee39b42456207be5541825a8df23d87ddc9cfbd049c46",
+          "claim": "TxWriter：只把已確認送出的 bytes 寫成 TX 紀錄；檔案傳輸的 Append 先進聚合緩衝。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 170,
+          "end_line": 195,
+          "excerpt_sha256": "5778ed8ca9f7a950a7c3f20e6eb88ab7065093b285bbd741259884827f7fa2ac",
+          "claim": "RxShared::append：更新 RX 視窗後，若掛著 capture 就呼叫 capture.write_rx。"
+        }
+      ],
+      "sublabel": "reader＋TxWriter"
+    },
+    {
+      "id": "fence",
+      "label": "TX Fence",
+      "type": "security",
+      "overview_component": "fence",
+      "responsibility": "每個 session 一個的 TX 閘門，也是 WAL 健康狀態的接收端：WAL 不健康時，拒絕自動登入探測、ready 再確認、救援鍵與 self-test 探測這幾類 TX（原因 wal_unhealthy）。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 582,
+          "end_line": 586,
+          "excerpt_sha256": "7159d2a062c314c959d14650d7086d36611ff281811d07c7de373f400b1b3084",
+          "claim": "Fence 實作 WalHealthSink：set_wal_unhealthy 寫入閘門狀態。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 514,
+          "end_line": 531,
+          "excerpt_sha256": "2d3c1ce9459887a770aa44a10635c45d86b8097e7ddf8178ce1c72d1bec9f2ea",
+          "claim": "LoginProbe／ReadyReconfirm／SystemRecoverKey／SelfTestProbe 在 wal_unhealthy 時被拒。"
+        }
+      ],
+      "sublabel": "WalHealthSink"
+    },
+    {
+      "id": "wal",
+      "label": "WalWriter",
+      "type": "backend",
+      "overview_component": "wal",
+      "responsibility": "全 daemon 唯一的 WAL 寫入器：一把鎖內配序號、組紀錄、依序寫權威 WAL 與 mirror；每次 append 前檢查檔案是否還在、是否該輪替；維護健康快照並通知各 session 的 Fence。寫入失敗仍消耗序號並回 loss_flag，不重試該筆。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 329,
+          "end_line": 343,
+          "excerpt_sha256": "a7d4a0fd6e9ca9c83192dd9a2301d1e8f04235915cec19e40ad71a36c83941ba",
+          "claim": "WalWriter：權威 WAL 與 best-effort mirror，各有常駐檔案 handle。"
+        },
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 466,
+          "end_line": 467,
+          "excerpt_sha256": "0ff06dfe42360f416638b372124dc6515b8e892e93cefa4622c7c9969ab6bb18",
+          "claim": "append：失敗時仍消耗序號，但不保留待寫資料。"
+        },
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 1530,
+          "end_line": 1576,
+          "excerpt_sha256": "c5cca34747d781c5ed2939d1a0495af1d1498fe68b148d957bf03d85cd19aca6",
+          "claim": "refresh_health_locked：算出 healthy 並經 notify_health 通知 sink。"
+        }
+      ],
+      "sublabel": "append／rotate"
+    },
+    {
+      "id": "walfiles",
+      "label": "WAL 檔案",
+      "type": "database",
+      "overview_component": null,
+      "responsibility": "WAL 目錄下的兩個現行檔與其歸檔：`raw.wal.ndjson`（每筆一行 JSON，含 seq、時間、COM、方向、來源、cmd_id、長度、CRC32、base64 payload、loss_flag）與 `raw.mirror.log`（payload 的可讀文字）。輪替或 reset 時改名為帶 UTC 時戳的歸檔。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 350,
+          "end_line": 351,
+          "excerpt_sha256": "fc73dbc606ca9b889b0bb602add407b19d37549435d11c172462311f58a8b4e5",
+          "claim": "現行檔名：raw.wal.ndjson 與 raw.mirror.log。"
+        },
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 553,
+          "end_line": 567,
+          "excerpt_sha256": "88c4775b128e69cd8e8e81c3fd9d95770cdf08e5dc118b63c5c41f9e8a61f120",
+          "claim": "一筆 WAL 紀錄的欄位。"
+        },
+        {
+          "path": "crates/sw-proto/src/constants.rs",
+          "line": 100,
+          "end_line": 101,
+          "excerpt_sha256": "8fd741a13049a60d2adf4dc6fdf9bbebbca4e37d3ad16ffe61ba08629baefcf9",
+          "claim": "輪替門檻 64 MiB（條件 size >= R）。"
+        }
+      ],
+      "sublabel": "ndjson＋mirror"
+    },
+    {
+      "id": "logfile",
+      "label": "Session log 檔",
+      "type": "database",
+      "overview_component": null,
+      "responsibility": "`session log-start` 開啟的 per-session 文字檔，檔名 `<COM>_<時戳>.log`，位置依序取 profile 的 log_dir、daemon 預設、環境變數 SERIALWRAP_LOG_DIR。只收 RX、只在非前景命令期間寫入，內容是清理過的文字。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7741,
+          "end_line": 7756,
+          "excerpt_sha256": "20b01827689e998432470993c8a04341b88ad17949fd950de3e77bcf1852b86d",
+          "claim": "log 目錄與檔名的決定。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7701,
+          "end_line": 7710,
+          "excerpt_sha256": "d400b1c0e96c9feb4fbf7cd3af3c17d91e94c3ba45c7402f0892efd1787d61d2",
+          "claim": "resolve_log_dir 的來源順序。"
+        },
+        {
+          "path": "crates/sw-core/src/capture.rs",
+          "line": 350,
+          "end_line": 375,
+          "excerpt_sha256": "986d3c1cb877205a84d7f8113c2ce2a9d50846dda697280abdd3e47eb5402ed9",
+          "claim": "write_rx：前景命令期間不寫；clean_text 後非空才 append＋flush，並累計位元組與行數。"
+        }
+      ],
+      "sublabel": "<COM>_<時戳>.log"
+    }
+  ],
+  "steps": [
+    {
+      "id": "rx-append",
+      "from": "bridge",
+      "to": "wal",
+      "label": "append（RX，source=device）",
+      "phase": "雙軌寫入",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 491,
+          "end_line": 502,
+          "excerpt_sha256": "922a819c27ececf351386ff6ee34a75740cdc2ad15a808577fc4e97ddd8a3b43",
+          "claim": "reader 每次讀到資料就 append 一筆 RX。"
+        }
+      ],
+      "note": "RX 以 reader 每次 read 取得的一段為一筆，不依行切分。寫入失敗（loss_flag）時 reader 把這段記成 evidence gap。"
+    },
+    {
+      "id": "tx-append",
+      "from": "bridge",
+      "to": "wal",
+      "label": "append（TX，已確認送出的 bytes）",
+      "phase": "雙軌寫入",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1113,
+          "end_line": 1134,
+          "excerpt_sha256": "ef4ccb19a404bc6dce0ee39b42456207be5541825a8df23d87ddc9cfbd049c46",
+          "claim": "一般 TX：確認送出的部分立即寫一筆 TX（permit.log 為真時）。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 930,
+          "end_line": 945,
+          "excerpt_sha256": "341f4062e6b04d640cfd6d5bbc79d88aefa0cdda99eb34419d6773ef2eefe7b1",
+          "claim": "聚合 TX：檔案傳輸各段先進緩衝，收尾時整段寫成一筆 TX。"
+        }
+      ],
+      "note": "只記錄已確認寫到 UART 的 bytes；被 Fence 拒絕的 TX 沒有送出，也就沒有 TX 紀錄。"
+    },
+    {
+      "id": "wal-line",
+      "from": "wal",
+      "to": "walfiles",
+      "label": "寫 raw.wal.ndjson（權威，一行 JSON）",
+      "phase": "雙軌寫入",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 552,
+          "end_line": 586,
+          "excerpt_sha256": "eda5a37d75ff7a4996bfbe4ccc9d3982d404a2e2ba744874af306d3318e7a0b7",
+          "claim": "配序號、組 WalRecord、寫入 WAL 現行檔；失敗時記 write_failed 並告警。"
+        }
+      ]
+    },
+    {
+      "id": "mirror-line",
+      "from": "wal",
+      "to": "walfiles",
+      "label": "寫 raw.mirror.log（可讀文字）",
+      "phase": "雙軌寫入",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 588,
+          "end_line": 603,
+          "excerpt_sha256": "f8c77e1f755311b3550d65781854ee033329cda31977d05736ee3c4bfbd83696",
+          "claim": "payload 非空時把 to_printable 的結果寫入 mirror；失敗只計數與告警。"
+        },
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 329,
+          "end_line": 329,
+          "excerpt_sha256": "216097ae35c3eb3a32dfe5f371c95a2070862cec43098710118be5ea62001274",
+          "claim": "mirror 是 best-effort。"
+        }
+      ],
+      "note": "mirror 寫入失敗不影響 WAL 行內的 loss_flag，也不讓 WAL 變成不健康。"
+    },
+    {
+      "id": "append-result",
+      "from": "wal",
+      "to": "bridge",
+      "label": "回 seq／ok／loss_flag",
+      "phase": "雙軌寫入",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 605,
+          "end_line": 614,
+          "excerpt_sha256": "a3819d1e109accd2e5ca9751cd44c9594d89a3fbd739a042b51b799d634cc59f",
+          "claim": "回傳 seq、ok（WAL 與 mirror 都成功）、loss_flag（原值或 WAL 寫入失敗）。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 503,
+          "end_line": 518,
+          "excerpt_sha256": "5a5f9576b88fffa445690e60922ef5450216e201a0e380f3ebccc15f3b5e599c",
+          "claim": "reader 對 loss_flag 的處理：記一筆 RX evidence gap。"
+        }
+      ]
+    },
+    {
+      "id": "rotate",
+      "from": "wal",
+      "to": "walfiles",
+      "label": "輪替：改名為帶時戳的歸檔",
+      "phase": "輪替與自癒",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 516,
+          "end_line": 529,
+          "excerpt_sha256": "082e796957f7c2862cbdb8c26650cbd657e02da2b93c3f2e07114dc9cd7dff0c",
+          "claim": "append 前先量兩檔大小，任一達門檻即進輪替流程。"
+        },
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 1190,
+          "end_line": 1261,
+          "excerpt_sha256": "c9b92521a80f174c10505d2baaee68ed0d55adce5bef81dfeb32fee938f4558f",
+          "claim": "rotate_if_needed_locked：關檔（sync）→ no-replace 改名 → sync 目錄；失敗則續用既有檔並排程重試。"
+        },
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 1311,
+          "end_line": 1330,
+          "excerpt_sha256": "4cfe538b193afb610cc8c66891fe30a5690100ed7ca12496a49c5f211910db19",
+          "claim": "tick：非阻塞地服務到期的延後輪替，完成後補寫連續性 META。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2398,
+          "end_line": 2402,
+          "excerpt_sha256": "db74f7a3c0950d589e049e18ee94a38f8cf550f28f6985370616f43b4329520d",
+          "claim": "SessionManager 在 watcher 的每個 Tick 呼叫 wal.tick()。"
+        }
+      ],
+      "condition": "現行 WAL 或 mirror 達 64 MiB",
+      "note": "Linux｜Windows：改名遇 EACCES／EBUSY｜winerror 5／32 視為暫時性錯誤，短暫退避後轉入延後佇列，由 SessionManager 的 watcher tick 呼叫 wal.tick() 重試；寫入路徑不睡眠。"
+    },
+    {
+      "id": "recreate",
+      "from": "wal",
+      "to": "walfiles",
+      "label": "重建現行檔並寫 META 紀錄",
+      "phase": "輪替與自癒",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 914,
+          "end_line": 931,
+          "excerpt_sha256": "fc874db7253b1bf228278e26202003f382501d9ec37b32acdaec8c273de84c65",
+          "claim": "check_identity_locked：目錄不見記 dir_missing、檔案不見記 external_unlink。"
+        },
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 1036,
+          "end_line": 1060,
+          "excerpt_sha256": "c9ac7b8140762c302ba6920c2c5fbbefcd4cede601a0126fc591a94194cfac30",
+          "claim": "begin_recreate_locked：關閉舊 handle、記下原因與先前身分。"
+        },
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 1116,
+          "end_line": 1128,
+          "excerpt_sha256": "27d5f67457f6968b00247f70d7f565b0d3a0139c3baedda7a544cc34b7b5c772",
+          "claim": "重建成功後寫一筆 META 紀錄（原因、先前身分、舊檔的 seq 範圍）。"
+        }
+      ],
+      "condition": "WAL 檔或目錄被外部刪除／置換",
+      "note": "重建尚未成功期間，每次 append 都消耗序號並回 loss_flag，不健康原因為 recreate_failed。"
+    },
+    {
+      "id": "health-fanout",
+      "from": "wal",
+      "to": "fence",
+      "label": "set_wal_unhealthy（health fanout）",
+      "phase": "輪替與自癒",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 1572,
+          "end_line": 1576,
+          "excerpt_sha256": "773087d2f60298fb15ae655b0163cdcf188041a897655dfd8b48879ece0ca5d6",
+          "claim": "notify_health：把健康狀態送給 health sink。"
+        },
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 95,
+          "end_line": 115,
+          "excerpt_sha256": "4e9f4bc5f8a579fccb443f06a5cb236d09a98143795760333aa02e96961341ac",
+          "claim": "WalHealthFanout：轉發給所有已註冊的 session sink。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 582,
+          "end_line": 586,
+          "excerpt_sha256": "7159d2a062c314c959d14650d7086d36611ff281811d07c7de373f400b1b3084",
+          "claim": "各 session 的 Fence 是接收端。"
+        }
+      ],
+      "condition": "WAL 寫入失敗、重建失敗或目錄不可寫",
+      "note": "每次 append 後都會重算健康狀態並通知；恢復正常時同一條路徑把 wal_unhealthy 設回 false。"
+    },
+    {
+      "id": "tail-rpc",
+      "from": "cli",
+      "to": "service",
+      "label": "log.tail_raw／tail_text／wal.range",
+      "phase": "讀取與重置",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 181,
+          "end_line": 182,
+          "excerpt_sha256": "4d391ea2d81b40a968122fd7b2120a8963b8ad6b9eaa4edb563d791b8dfedf06",
+          "claim": "log tail-raw／tail-text。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 212,
+          "end_line": 219,
+          "excerpt_sha256": "979828d1b8ad9c1f4b579d4bf06c309325d0b45936f79444ac34afde358ae7c4",
+          "claim": "wal export 對應 wal.range（from_seq、to_seq、limit）。"
+        }
+      ]
+    },
+    {
+      "id": "tail-call",
+      "from": "service",
+      "to": "wal",
+      "label": "tail_raw_with_meta（from_seq、COM、limit）",
+      "phase": "讀取與重置",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1299,
+          "end_line": 1306,
+          "excerpt_sha256": "914f02a4dc49923495c2f62bff20ed87fa8f5316c7f63600f6c9a884e71a6da3",
+          "claim": "先取 WAL 健康快照，WAL 檔不存在時直接回覆，否則呼叫 tail_raw_with_meta。"
+        },
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 736,
+          "end_line": 773,
+          "excerpt_sha256": "682ccf188959ca0a0d7d778b92fefab9e72e130e6cd3e7b5c26488460a11b96c",
+          "claim": "tail_raw_with_meta：未帶 from_seq 取最後 limit 筆；帶 from_seq 取其後最多 limit 筆。"
+        }
+      ]
+    },
+    {
+      "id": "tail-read",
+      "from": "wal",
+      "to": "walfiles",
+      "label": "讀現行 raw.wal.ndjson",
+      "phase": "讀取與重置",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 742,
+          "end_line": 744,
+          "excerpt_sha256": "e8083ba5d23da3629e01246d71de91215fa4fc8a054a0d8a3c85e602265e6dbc",
+          "claim": "只讀現行檔；檔案不存在回空結果。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1351,
+          "end_line": 1359,
+          "excerpt_sha256": "b7538b8270844ea7330a8f73f115264be303b235544d0918e235995012df8f90",
+          "claim": "wal.range 以 available_from_seq 判定要求的範圍是否已被輪替出去（rotated_out）。"
+        }
+      ],
+      "note": "歸檔不會被讀取；要求的 seq 早於現行檔第一筆時，wal.range 以 rotated_out 告知。"
+    },
+    {
+      "id": "tail-reply",
+      "from": "service",
+      "to": "cli",
+      "label": "records 或 lines＋current_seq",
+      "phase": "讀取與重置",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1311,
+          "end_line": 1329,
+          "excerpt_sha256": "0a7ca87df1058b370e3e416890a68c623695fce9c0e7f89baa2221e68077ff46",
+          "claim": "tail_raw 回 records，tail_text 回 lines；另附 from_seq、last_seq、current_seq、truncated、wal_path。"
+        }
+      ]
+    },
+    {
+      "id": "reset-rpc",
+      "from": "cli",
+      "to": "service",
+      "label": "wal.reset",
+      "phase": "讀取與重置",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 220,
+          "end_line": 220,
+          "excerpt_sha256": "0941afca0a985674512cd0c4873ada02cccb216d8ab385234642d39ac256d6d1",
+          "claim": "wal reset 對應 wal.reset。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 84,
+          "end_line": 84,
+          "excerpt_sha256": "ec7a318c486b817d501b6eca6c81fa88d0b163dc7cfc24aa8288c9a67244aaeb",
+          "claim": "wal.reset 在 ADMISSION_METHODS 內，分派前先取 admission ticket。"
+        }
+      ],
+      "condition": "操作者要求重置 WAL"
+    },
+    {
+      "id": "reset-call",
+      "from": "service",
+      "to": "wal",
+      "label": "reset",
+      "phase": "讀取與重置",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1362,
+          "end_line": 1369,
+          "excerpt_sha256": "2f7fa6856feb1a73bd915361a59ddcdaa94133c24c1f18721357d0e8dfa3a07f",
+          "claim": "wal.reset：呼叫 WalWriter::reset，回 previous_seq 與 rotated_suffix。"
+        }
+      ]
+    },
+    {
+      "id": "reset-archive",
+      "from": "wal",
+      "to": "walfiles",
+      "label": "歸檔兩個現行檔，seq 歸零",
+      "phase": "讀取與重置",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 646,
+          "end_line": 734,
+          "excerpt_sha256": "d897c5e1712f199d9df9601a8970e508ca86da03609c40007865cc2829ecf318",
+          "claim": "reset：sync 並關閉兩個 handle → 非空的現行檔各自改名歸檔 → sync 目錄 → seq 歸零。"
+        }
+      ]
+    },
+    {
+      "id": "log-rpc",
+      "from": "cli",
+      "to": "service",
+      "label": "session.log_start／log_stop／log_status",
+      "phase": "Session log",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 122,
+          "end_line": 124,
+          "excerpt_sha256": "351121c5692fa8fbc808503a2d07c1309c3bb24ea05d10f710ddf49e8b1f7f00",
+          "claim": "三個子指令與其 RPC。"
+        }
+      ]
+    },
+    {
+      "id": "log-route",
+      "from": "service",
+      "to": "actor",
+      "label": "LogStart／LogStop／LogStatus",
+      "phase": "Session log",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1372,
+          "end_line": 1383,
+          "excerpt_sha256": "a4746b4aeb488d404e1854ffb131779ab37b0d2238d8e974b83005823748bae9",
+          "claim": "依 method 選 SessionRequest 後 route 到 selector 指定的 session。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3375,
+          "end_line": 3377,
+          "excerpt_sha256": "309ae93da8d745c0e17d91be3d3028995ee2543519fba7c3b069ade08869f83f",
+          "claim": "actor 端的處理入口。"
+        }
+      ]
+    },
+    {
+      "id": "log-open",
+      "from": "actor",
+      "to": "logfile",
+      "label": "開檔（append）並掛上 capture",
+      "phase": "Session log",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7737,
+          "end_line": 7783,
+          "excerpt_sha256": "43c7196089d09ace1e7b6833c7876e1d86e1f401b7ddb3783bc85b292dddf3da",
+          "claim": "log_start：建目錄、開檔、install CaptureObserver、set_capture。"
+        },
+        {
+          "path": "crates/sw-core/src/capture.rs",
+          "line": 312,
+          "end_line": 321,
+          "excerpt_sha256": "0529ae00c51d092c1de9e95ea54c2ac9cf5bbe2a84c1bb8e5578151c41d7321d",
+          "claim": "CaptureObserver::install：開始寫入該檔並回傳計數器。"
+        }
+      ],
+      "condition": "log_start 且目前沒有 active capture",
+      "note": "開檔失敗回 LOG_OPEN_FAILED；log_stop 取同一把鎖卸下 capture，回最後的行數與位元組數。"
+    },
+    {
+      "id": "log-write",
+      "from": "bridge",
+      "to": "logfile",
+      "label": "寫入清理後的 RX 文字",
+      "phase": "Session log",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 184,
+          "end_line": 193,
+          "excerpt_sha256": "0ffaf639eb18d813b9e696ed8a428b0495aaf740ff48b3940eb04852ca186ebb",
+          "claim": "reader 把 RX 交給 RX 視窗時，若掛著 capture 就呼叫 write_rx。"
+        },
+        {
+          "path": "crates/sw-core/src/capture.rs",
+          "line": 350,
+          "end_line": 375,
+          "excerpt_sha256": "986d3c1cb877205a84d7f8113c2ce2a9d50846dda697280abdd3e47eb5402ed9",
+          "claim": "write_rx：前景命令期間略過；clean_text 後非空才寫入並 flush。"
+        }
+      ],
+      "condition": "capture 啟用，且不在前景命令期間",
+      "note": "寫入失敗被吞掉、不計數。這份檔案只有 RX 文字，沒有 TX、時戳或 seq；完整證據仍以 WAL 為準。"
+    },
+    {
+      "id": "activity-rpc",
+      "from": "cli",
+      "to": "service",
+      "label": "session.activity",
+      "phase": "Activity",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 69,
+          "end_line": 69,
+          "excerpt_sha256": "859445c9346059a3a23d955ad9824352adb6d9c8473a74bcb60175ef7dcff696",
+          "claim": "session activity 對應 session.activity。"
+        }
+      ]
+    },
+    {
+      "id": "activity-route",
+      "from": "service",
+      "to": "actor",
+      "label": "GetState",
+      "phase": "Activity",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 915,
+          "end_line": 922,
+          "excerpt_sha256": "4b00a14fd968ea7e1a5ca5f07beadfd0c77119717c397257e8b13a76b0b72f21",
+          "claim": "session.activity 與 session.get_state 走同一條路：get_state。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 793,
+          "end_line": 795,
+          "excerpt_sha256": "d7990de7c1baa423062a72b963b643451771d879148f865955570bafdf9a9758",
+          "claim": "get_state：route(SessionRequest::GetState)。"
+        }
+      ]
+    },
+    {
+      "id": "activity-reply",
+      "from": "actor",
+      "to": "service",
+      "label": "session 狀態＋activity_classification",
+      "phase": "Activity",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 1840,
+          "end_line": 1843,
+          "excerpt_sha256": "6003cbf5976090f2c3091fb39b2b87ecc7182cef65c48e86e5a6e2647e16d899",
+          "claim": "session 公開欄位含 activity_classification。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 9000,
+          "end_line": 9019,
+          "excerpt_sha256": "ed62e95b90afe03dd27b5ed9a39c177dd7e21c8b1f0f00c8dc51d4e4b9f34f26",
+          "claim": "分類依據：session 狀態與距離最後一次 RX／TX 的毫秒數（5 秒、60 秒兩個門檻）。"
+        }
+      ],
+      "note": "非 READY／ATTACHED 為 offline；尚無任何 RX／TX 為 newly-attached；閒置不到 5 秒 active、不到 60 秒 idle-healthy、其餘 quiet-suspicious。"
+    }
+  ],
+  "unknowns": [
+    {
+      "id": "windows-not-executed",
+      "question": "Windows 上 WAL 輪替遇到檔案被其他行程開啟（winerror 5／32）時，延後佇列的實際行為是否與程式碼一致？",
+      "impact": "本頁 Windows 一側只依錯誤碼判定式與註解判讀，沒有在 Windows 上觸發輪替；rotate 步驟的 Windows 描述未經實機驗證。"
+    },
+    {
+      "id": "command-tx-when-unhealthy",
+      "question": "WAL 不健康時，agent 的一般命令 TX 是否在 Fence 以外的地方被擋？",
+      "impact": "Fence 內只看到四類探測／救援 TX 檢查 wal_unhealthy（tx_writer.rs:514-531），Command 與 FileTransfer 的分支沒有這項檢查；本頁沒有逐一追查命令受理路徑是否另有 WAL 健康條件，所以 health-fanout 的影響範圍只寫到這四類。"
+    },
+    {
+      "id": "python-baseline-not-compared",
+      "question": "各步驟與 Python 0.4.x 基線的行為差異是否都已標出？",
+      "impact": "本頁描述的是 Rust 實作，只在撰寫時實際對照過 sw_core 的地方於步驟 note 標註差異或相同；沒有逐步比對 Python 實作，所以沒有標註不代表沒有差異。"
+    }
+  ],
+  "conflicts": [
+    {
+      "id": "rotate-deferred-doc-vs-code",
+      "subject": "WalHealth 的 rotate_deferred 與 deferred_delete_pending 是否恆為 0",
+      "claims": [
+        "crates/sw-core/src/wal.rs:148-150 的欄位註解寫「Rust 尚無延遲佇列，恆 0」。",
+        "crates/sw-core/src/wal.rs:1554-1561 的 refresh_health_locked 以 inner.rotate_deferred 與 rotate_pending 中 deferred 的筆數填入這兩個欄位，同檔 1291-1310 的 schedule_rotate_retry_locked 實作了轉入延後佇列。"
+      ],
+      "resolution": "以程式碼為準：延後佇列已實作，欄位註解是過期的說明。本頁 rotate 步驟照程式碼描述。"
+    }
+  ]
+}
