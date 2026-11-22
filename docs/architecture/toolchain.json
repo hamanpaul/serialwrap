@@ -40,6 +40,20 @@
         "delivery": "45047ee239e57e35598d2fa2d6da74010dbf0fd058836f5049a87f5621e811b0",
         "html": "1c2c5da7f08598e8867d9f12ace6b2933ed6a8909878bad61859874f6d102a01"
       }
+    },
+    "02-session-lifecycle": {
+      "diagram_type": "sequence",
+      "source_revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347",
+      "facts": "features/02-session-lifecycle.facts.json",
+      "ir": "features/02-session-lifecycle.json",
+      "html": "features/02-session-lifecycle.html",
+      "overlay_version": 1,
+      "sha256": {
+        "facts": "fdbdaa2cfbd5be4cb32c2cdb91151451196fd5285fc2e5f9de0fa73a5414e306",
+        "ir": "af32246317ad6b5707f7609a4a9f5de4a48d6429ac3498d7e65e7376e289837e",
+        "delivery": "b04d903ae5c2855e28322d8ed55fa5ad86e6e7542b21177ddf4737c790e991b9",
+        "html": "c189bd4b4dad4b225bc01c8d5261c045725fc5603193ea3136558b380e114761"
+      }
     }
   }
 }
