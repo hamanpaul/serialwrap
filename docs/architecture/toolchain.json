@@ -68,6 +68,20 @@
         "delivery": "92414c53627388d19e93755e7d2165bb62cf9edde8af83d01a2706a4a4353acd",
         "html": "53eb12638e9ef5062cc7fa98525c2157f068c4b1b6809f3f8037f4c85fc32520"
       }
+    },
+    "04-human-console": {
+      "diagram_type": "sequence",
+      "source_revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347",
+      "facts": "features/04-human-console.facts.json",
+      "ir": "features/04-human-console.json",
+      "html": "features/04-human-console.html",
+      "overlay_version": 1,
+      "sha256": {
+        "facts": "356dc4d6fa4d6f4558c469254dc0a5a28c4d8afc63027561363741cb6314157c",
+        "ir": "e5406cb84223f23e8115bb32ea4aaa2dbd509ab3018ec99c0db40d0d3db87fc1",
+        "delivery": "21a7abd1d8a6952935963632953c828ddf98c29e59648cdcd9f3a4b8a78b7892",
+        "html": "3eb1697b4db39daf31b721a64a7290d965252765b5b9b3a7deb994a64a456b4a"
+      }
     }
   }
 }
