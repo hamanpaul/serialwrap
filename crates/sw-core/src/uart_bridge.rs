@@ -118,6 +118,8 @@ pub struct RxShared {
     /// P8 Task 5：檔案傳輸等待的取消世代。drain Phase 1（`SessionCore::begin_stop`，所有 `StopKind`）遞增；
     /// 只影響以 [`RunCancel::watching_transfers`] 建立的取消旗標，login run（SC-30）不受影響。
     transfer_cancel_gen: AtomicU64,
+    /// issue 297：daemon Shutdown 專用、單向的 RX 等待取消狀態；不與 login／transfer 世代共用。
+    shutdown_waits_cancelled: AtomicBool,
 }
 
 impl RxShared {
@@ -134,6 +136,7 @@ impl RxShared {
             capture: Mutex::new(None),
             run_cancel_gen: AtomicU64::new(0),
             transfer_cancel_gen: AtomicU64::new(0),
+            shutdown_waits_cancelled: AtomicBool::new(false),
         })
     }
 
@@ -150,12 +153,18 @@ impl RxShared {
         self.wake_all();
     }
 
+    /// issue 297：Phase 1 凍結 Shutdown RX 等待；狀態只會由 false 轉為 true。
+    pub fn cancel_shutdown_waits(&self) {
+        self.shutdown_waits_cancelled.store(true, Ordering::Release);
+        self.wake_all();
+    }
+
     /// P7 Task 10：掛上／卸下 agent log 寫入者（SessionCore 於 log_start／stop／bridge 交接時呼叫）。
     pub fn set_capture(&self, capture: Option<Arc<crate::capture::CaptureObserver>>) {
         *self.capture.lock().unwrap_or_else(|e| e.into_inner()) = capture;
     }
 
-    /// 喚醒所有 `wait_for_regex_cancellable` 等待者（容量 1、滿則略過；已斷線者移除）。
+    /// 喚醒所有可取消的 regex 等待者（容量 1、滿則略過；已斷線者移除）。
     fn wake_all(&self) {
         self.changed.notify_all();
         let mut wakers = self.wakers.lock().unwrap_or_else(|error| error.into_inner());
@@ -1056,6 +1065,61 @@ impl RxShared {
                 continue;
             }
             clock.wait_until_or_cancel(deadline, &wake_rx);
+        }
+    }
+
+    /// 從絕對偏移等待 regex，並只監看本 bridge 的單向 Shutdown 取消狀態。
+    /// 此介面刻意不使用 [`RunCancel`]，以免改變 login／file-transfer 既有取消範圍。
+    pub fn wait_for_regex_from_shutdown_cancellable(
+        &self,
+        re: &PyRegex,
+        from: u64,
+        timeout: Duration,
+        clock: &dyn Clock,
+    ) -> WaitOutcome {
+        if self.shutdown_waits_cancelled.load(Ordering::Acquire) {
+            return WaitOutcome::Cancelled;
+        }
+        let timeout_ns = timeout.as_nanos().min(u64::MAX as u128) as u64;
+        let deadline = clock.mono_ns().saturating_add(timeout_ns);
+        let (wake_tx, wake_rx) = bounded(1);
+        self.wakers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(wake_tx);
+
+        loop {
+            if self.shutdown_waits_cancelled.load(Ordering::Acquire) {
+                return WaitOutcome::Cancelled;
+            }
+            let (snapshot, revision) = {
+                let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+                (window.text_from(from).to_string(), window.revision)
+            };
+            if re.search(&snapshot).is_some() {
+                return if self.shutdown_waits_cancelled.load(Ordering::Acquire) {
+                    WaitOutcome::Cancelled
+                } else {
+                    WaitOutcome::Matched
+                };
+            }
+            if self.shutdown_waits_cancelled.load(Ordering::Acquire) {
+                return WaitOutcome::Cancelled;
+            }
+            if clock.mono_ns() >= deadline {
+                return WaitOutcome::TimedOut;
+            }
+            while wake_rx.try_recv().is_ok() {}
+            let changed = self
+                .inner
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .revision
+                != revision;
+            if changed || self.shutdown_waits_cancelled.load(Ordering::Acquire) {
+                continue;
+            }
+            let _ = clock.wait_until_or_cancel(deadline, &wake_rx);
         }
     }
 
