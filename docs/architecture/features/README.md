@@ -69,7 +69,9 @@
 ## IR 規則
 
 - `meta.title`：`serialwrap｜<功能名>`；`meta.locale`：`zh-TW`；`meta.output`：`docs/architecture/features/<NN>-<slug>.html`；`meta.quality_profile`：`showcase`；`meta.repository` 與 facts 相同（加 `"provider": "github"`）。
-- sequence：`participants` 的 id／label 與 facts 相同；`messages` 依序逐一對應 `facts.steps`（id、from、to、label 逐字相同）；`segments` 的 label 只能用 facts 出現過的 `phase`。participant 的 `sources` 填該參與者的 evidence 位置。
+- sequence：`participants` 的 id／label 與 facts 相同；`messages` 依序逐一對應 `facts.steps`（id、from、to、label 逐字相同），每筆必填 `y`（垂直位置）；`segments` 的 `from`／`to` 是 y 座標範圍（不是 message id），`label` 只能用 facts 出現過的 `phase`。participant 的 `sources`（最多 3 筆，`{"path","line","end_line"}`）填該參與者的 evidence 位置。官方範例：Archify 的 `archify/examples/cache-miss-request.sequence.json`。
+- workflow 用 `nodes`／`edges`，architecture 用 `components`／`connections`；schema 只強制邊的 `from`／`to`，本規格另要求每條邊帶 `id` 與 `label` 並與 step 逐字對應。
+- 不開瀏覽器的快速檢查：`archify.mjs validate <type> <ir.json> --quality showcase --repo-root . --json`（不到一秒）。
 - workflow／architecture：節點 id 集合等於 participants、邊 id 集合等於 steps。
 - 版面只調整位置與間距；不得為了排版刪掉有意義的步驟或改寫標籤。
 
