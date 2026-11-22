@@ -1,0 +1,873 @@
+{
+  "acceptance": {
+    "effective_content": {
+      "authority": "發版長跑門檻唯一來源（spec §15.11.4、§14.2、OD-09、OD-94、OD-103）；其他前端不得維護另一份數值",
+      "counting": {
+        "definitions": {
+          "accepted": "submitted - expected_rejects",
+          "bg_lost": "kind == bg_lost（產品 history 淘汰前測試端未取得結果；不是終態，該 pair 計入 unresolved，並使 background_result_coverage 判 INSUFFICIENT_EVIDENCE）",
+          "completed": "kind == done，或 kind == bg_result 且 status == done（background 以執行期收斂即時寫入的 bg_result 為準；submit_accepted 不算完成；bg_lost 不算完成）",
+          "effective_duration_s": "events stop.t - start.t，扣除 observer 判定該板非 READY 的確定區間（兩端樣本皆非 READY）；逐板計算",
+          "effective_hour": "effective_duration_s / 3600（逐板）；throughput = completed / effective_hour",
+          "error_rate": "(unexpected_errors + unresolved) / accepted",
+          "expected_rejects": "kind in expected_reject_kinds，或 kind == error 且 error_code/detail 屬 expected_reject_error_codes，或 mode 的 expected_reject_by_mode[mode] 含 error_code/detail（OD-103：interactive 的 SESSION_BUSY 為預期拒絕）",
+          "submitted": "kind == submit",
+          "unexpected_errors": "kind == error 且非 expected reject；加上 kind == bg_result 且 status ∈ {error, canceled}；加上 worker_error（每個 (source, round) 至多計 1 次）",
+          "unresolved": "submit 之後同 (source, round) 沒有 done／error／busy／worker_error／bg_result 終態（bg_lost、bg_slow、bg_poll_error、bg_drain 都不是終態；已計入 worker_error 的 pair 不再計 unresolved，避免分子重複）"
+        },
+        "expected_reject_by_mode": {
+          "interactive": [
+            "SESSION_BUSY"
+          ]
+        },
+        "expected_reject_error_codes": [
+          "SESSION_INTERACTIVE_BUSY"
+        ],
+        "expected_reject_kinds": [
+          "busy"
+        ],
+        "frozen_at": "2026-10-15T00:00:00+00:00",
+        "pair_key": [
+          "source",
+          "round"
+        ],
+        "status": "frozen",
+        "unresolved_policy": "count_as_unexpected_error",
+        "worker_error_policy": "count_as_unexpected_error"
+      },
+      "evidence": {
+        "context_time_tolerance_s": 2.0,
+        "require_engine_report": true,
+        "require_fault_retention_attestation": true,
+        "require_observer": true,
+        "require_pinned_cli": true,
+        "require_wal_dir": true,
+        "require_windows_exclusive_evidence": true
+      },
+      "liveness": {
+        "frozen_at": "2026-10-15T00:00:00+00:00",
+        "pid_generation_change": 0,
+        "status": "frozen",
+        "unexpected_daemon_exit": 0,
+        "unexpected_restart": 0,
+        "worker_heartbeat_max_gap_s": 600
+      },
+      "owner_decisions": [
+        "OD-09",
+        "OD-10",
+        "OD-13",
+        "OD-94",
+        "OD-103",
+        "OD-107"
+      ],
+      "revision": "2026-11-21.1",
+      "safety": {
+        "allowed_tx_source_regex": "^(agent:rhw[0-9]+|human:[A-Za-z0-9._:-]+|system|system:[a-z_]+)$",
+        "cross_context_replay": 0,
+        "dangerous_auto_resend": 0,
+        "forbidden_double_holder": 0,
+        "frozen_at": "2026-10-15T00:00:00+00:00",
+        "status": "frozen",
+        "unauthorized_tx": 0,
+        "waivable": false
+      },
+      "schema_version": 1,
+      "thresholds": {
+        "comparison_uncertainty": {
+          "approved_by": "hamanpaul",
+          "baseline_evidence": {
+            "linux": {
+              "artifact_path": "evidence/stage0/baseline/linux/release-gate.json",
+              "item_id": "S0-L3-BASELINE-LINUX-48H",
+              "sha256": "ef3deac32cbbb2a85ede8ae7c62d72671f5b312da6ec5cdcd346606d3ad28c8e"
+            },
+            "windows": {
+              "artifact_path": "evidence/stage0/baseline/windows/release-gate.json",
+              "item_id": "S0-L3-BASELINE-WINDOWS-48H",
+              "sha256": "8543e5a196f4f998e97c5987b00f539ef61e2dd94a5978ffb852036e07b995df"
+            }
+          },
+          "decision": "OD-09",
+          "decision_id": "OD-109",
+          "freeze_deadline": "同 resources",
+          "frozen_at": "2026-11-21T10:44:35+00:00",
+          "overrides": {},
+          "per_platform": {
+            "linux": {
+              "error_rate_abs_tolerance": 0.002,
+              "max_reruns": 1,
+              "stuck_s_tolerance": 300,
+              "throughput_ratio_tolerance": 0.02
+            },
+            "windows": {
+              "error_rate_abs_tolerance": 0.002,
+              "max_reruns": 1,
+              "stuck_s_tolerance": 300,
+              "throughput_ratio_tolerance": 0.02
+            }
+          },
+          "proposal_sha256": "0f7bf5d910e8c658e106b66c89981655ecee3697901862afcf60d9703d5f4cb2",
+          "status": "frozen"
+        },
+        "effective_throughput": {
+          "decision": "OD-09",
+          "frozen_at": "2026-10-15T00:00:00+00:00",
+          "granularity": [
+            "platform",
+            "board",
+            "source"
+          ],
+          "metric": "completed per effective hour",
+          "min_ratio_of_baseline": 0.95,
+          "status": "frozen"
+        },
+        "min_effective_load": {
+          "approved_by": "hamanpaul",
+          "baseline_evidence": {
+            "linux": {
+              "artifact_path": "evidence/stage0/baseline/linux/release-gate.json",
+              "item_id": "S0-L3-BASELINE-LINUX-48H",
+              "sha256": "ef3deac32cbbb2a85ede8ae7c62d72671f5b312da6ec5cdcd346606d3ad28c8e"
+            },
+            "windows": {
+              "artifact_path": "evidence/stage0/baseline/windows/release-gate.json",
+              "item_id": "S0-L3-BASELINE-WINDOWS-48H",
+              "sha256": "8543e5a196f4f998e97c5987b00f539ef61e2dd94a5978ffb852036e07b995df"
+            }
+          },
+          "decision": "OD-09",
+          "decision_id": "OD-109",
+          "freeze_deadline": "同 resources",
+          "frozen_at": "2026-11-21T10:44:35+00:00",
+          "overrides": {},
+          "per_platform": {
+            "linux": {
+              "max_idle_gap_s": 3600,
+              "min_completed_per_board_source": {
+                "COM0|agent:rhw0": 7424,
+                "COM0|agent:rhw1": 7933,
+                "COM0|agent:rhw2": 7433,
+                "COM0|agent:rhw3": 7926,
+                "COM1|agent:rhw0": 7944,
+                "COM1|agent:rhw1": 7849,
+                "COM1|agent:rhw2": 7948,
+                "COM1|agent:rhw3": 7845
+              }
+            },
+            "windows": {
+              "max_idle_gap_s": 3600,
+              "min_completed_per_board_source": {
+                "COM0|agent:rhw0": 10275,
+                "COM0|agent:rhw1": 10267,
+                "COM0|agent:rhw2": 10293,
+                "COM0|agent:rhw3": 10269
+              }
+            }
+          },
+          "proposal_sha256": "0f7bf5d910e8c658e106b66c89981655ecee3697901862afcf60d9703d5f4cb2",
+          "status": "frozen"
+        },
+        "resources": {
+          "approved_by": "hamanpaul",
+          "baseline_evidence": {
+            "linux": {
+              "artifact_path": "evidence/stage0/baseline/linux/release-gate.json",
+              "item_id": "S0-L3-BASELINE-LINUX-48H",
+              "sha256": "ef3deac32cbbb2a85ede8ae7c62d72671f5b312da6ec5cdcd346606d3ad28c8e"
+            },
+            "windows": {
+              "artifact_path": "evidence/stage0/baseline/windows/release-gate.json",
+              "item_id": "S0-L3-BASELINE-WINDOWS-48H",
+              "sha256": "8543e5a196f4f998e97c5987b00f539ef61e2dd94a5978ffb852036e07b995df"
+            }
+          },
+          "decision": "OD-09",
+          "decision_id": "OD-109",
+          "freeze_deadline": "OD-94：Stage 0 修正後 Python 每平台 24h 基線完成後、任何 Rust 候選長跑開始前",
+          "frozen_at": "2026-11-21T10:44:35+00:00",
+          "overrides": {},
+          "per_platform": {
+            "linux": {
+              "rss_peak_kb": 40390,
+              "rss_slope_kb_per_h": 256,
+              "rss_steady_kb": 40325
+            },
+            "windows": {
+              "rss_peak_kb": 48005,
+              "rss_slope_kb_per_h": 256,
+              "rss_steady_kb": 38585
+            }
+          },
+          "proposal_sha256": "0f7bf5d910e8c658e106b66c89981655ecee3697901862afcf60d9703d5f4cb2",
+          "status": "frozen"
+        },
+        "stuck_attached": {
+          "bounds_rule": "候選上界 ≤ 基線下界 → PASS；候選下界 > 基線上界 → FAIL；其餘 INSUFFICIENT_EVIDENCE",
+          "decision": "OD-09",
+          "frozen_at": "2026-10-15T00:00:00+00:00",
+          "granularity": [
+            "platform",
+            "board"
+          ],
+          "longest_s": "not_higher_than_baseline",
+          "status": "frozen",
+          "total_s": "not_higher_than_baseline"
+        },
+        "unexpected_cmd_error_rate": {
+          "decision": "OD-09",
+          "frozen_at": "2026-10-15T00:00:00+00:00",
+          "granularity": [
+            "platform",
+            "board",
+            "source"
+          ],
+          "max_ratio": 0.01,
+          "relative": "not_higher_than_baseline",
+          "status": "frozen"
+        }
+      },
+      "workload": {
+        "allow_segment_stitching": false,
+        "engine_case": "lr-mixed",
+        "engine_files": [
+          "realhw/cases/longrun.py"
+        ],
+        "max_observation_gap_factor": 2.0,
+        "min_continuous_duration_s": 86400,
+        "observation_gap_tolerance_s": 1.0,
+        "observer_interval_s": 10,
+        "snapshot_interval_s": 300,
+        "windows_excl_probe_interval_s": 300
+      }
+    },
+    "git_blob_sha1": "f7db65aaf41b8d6a59d46ded41d474bfaba4c57d",
+    "path": "realhw/acceptance/longrun_acceptance.yaml",
+    "revision": "2026-11-21.1",
+    "sha256": "e647d9080b8d19c66e78d9aff3e9d4379a2db6aaa3a2f278704d28389be5efe7",
+    "workload_contract_sha256": "0494ffe96326225c9c6e9027574674d293b5da0899436f5c0f5fb214fc1aabc0"
+  },
+  "baseline_result": null,
+  "checks": [
+    {
+      "detail": {
+        "problems": []
+      },
+      "group": "evidence",
+      "id": "evidence_parse",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "id": "lr-mixed"
+      },
+      "group": "evidence",
+      "id": "engine_report_present",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "pinned": true
+      },
+      "group": "evidence",
+      "id": "pinned_cli",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "verdict": "PASS"
+      },
+      "group": "engine",
+      "id": "engine_verdict",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {},
+      "group": "evidence",
+      "id": "observation_gaps",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {},
+      "group": "evidence",
+      "id": "pre_frozen",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {},
+      "group": "evidence",
+      "id": "frozen_after_baseline",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "auto_restart_disabled": true
+      },
+      "group": "evidence",
+      "id": "fault_retention_attested",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "workers": [
+          "agent:rhw0",
+          "agent:rhw1",
+          "agent:rhw2",
+          "agent:rhw3",
+          "bg_resolver",
+          "human",
+          "orchestrator"
+        ]
+      },
+      "group": "evidence",
+      "id": "worker_liveness",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "bg_backpressure_s": 0,
+        "bg_drain_remaining": 0,
+        "bg_lost": 0,
+        "bg_slow": 0
+      },
+      "group": "evidence",
+      "id": "background_result_coverage",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "duration_s": 86402,
+        "sigint": false,
+        "starts": 1,
+        "stops": 1
+      },
+      "group": "integrity",
+      "id": "continuous_duration",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "records": 302992
+      },
+      "group": "safety",
+      "id": "safety_unauthorized_tx",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "events": 0,
+        "holder_unknown_samples": 8648
+      },
+      "group": "safety",
+      "id": "safety_double_holder",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {},
+      "group": "safety",
+      "id": "safety_cross_context_replay",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {},
+      "group": "safety",
+      "id": "safety_dangerous_auto_resend",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {},
+      "group": "liveness",
+      "id": "liveness_daemon_exit",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "changes": 0
+      },
+      "group": "liveness",
+      "id": "liveness_restart",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "limit": 0.01,
+        "rates": {
+          "*": 7.965905922651054e-05,
+          "COM0|agent:rhw0": 0.00013341338136215063,
+          "COM0|agent:rhw1": 0.0001257387149503332,
+          "COM0|agent:rhw2": 0.00020013342228152102,
+          "COM0|agent:rhw3": 0.00018815855494229804,
+          "COM1|agent:rhw0": 0.0,
+          "COM1|agent:rhw1": 0.0,
+          "COM1|agent:rhw2": 0.0,
+          "COM1|agent:rhw3": 0.0
+        }
+      },
+      "group": "load",
+      "id": "error_rate_absolute",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "keys": [
+          "COM0|agent:rhw0",
+          "COM0|agent:rhw1",
+          "COM0|agent:rhw2",
+          "COM0|agent:rhw3",
+          "COM1|agent:rhw0",
+          "COM1|agent:rhw1",
+          "COM1|agent:rhw2",
+          "COM1|agent:rhw3"
+        ]
+      },
+      "group": "load",
+      "id": "min_effective_load",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "limits": {
+          "rss_peak_kb": 40390,
+          "rss_slope_kb_per_h": 256,
+          "rss_steady_kb": 40325
+        },
+        "over": [],
+        "stats": {
+          "expected_last_24h": 288,
+          "first_kb": 14224,
+          "last_kb": 22128,
+          "peak_kb": 22428.0,
+          "slope_kb_per_h": 55.171372169551276,
+          "steady_kb": 22032.0,
+          "valid_last_24h": 287
+        }
+      },
+      "group": "resources",
+      "id": "resources",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {},
+      "group": "evidence",
+      "id": "baseline_compatible",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "tolerance": {
+          "error_rate_abs_tolerance": 0.002,
+          "max_reruns": 1,
+          "stuck_s_tolerance": 300,
+          "throughput_ratio_tolerance": 0.02
+        }
+      },
+      "group": "relative",
+      "id": "comparison_uncertainty",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "*": {
+          "baseline": 0.00015245737211634904,
+          "candidate": 7.965905922651054e-05,
+          "result": "PASS"
+        },
+        "COM0|agent:rhw0": {
+          "baseline": 0.00033663233016898944,
+          "candidate": 0.00013341338136215063,
+          "result": "PASS"
+        },
+        "COM0|agent:rhw1": {
+          "baseline": 0.0003150400100812803,
+          "candidate": 0.0001257387149503332,
+          "result": "PASS"
+        },
+        "COM0|agent:rhw2": {
+          "baseline": 0.00020174848688634834,
+          "candidate": 0.00020013342228152102,
+          "result": "PASS"
+        },
+        "COM0|agent:rhw3": {
+          "baseline": 0.00037835792659856227,
+          "candidate": 0.00018815855494229804,
+          "result": "PASS"
+        },
+        "COM1|agent:rhw0": {
+          "baseline": 0.0,
+          "candidate": 0.0,
+          "result": "PASS"
+        },
+        "COM1|agent:rhw1": {
+          "baseline": 0.0,
+          "candidate": 0.0,
+          "result": "PASS"
+        },
+        "COM1|agent:rhw2": {
+          "baseline": 0.0,
+          "candidate": 0.0,
+          "result": "PASS"
+        },
+        "COM1|agent:rhw3": {
+          "baseline": 0.0,
+          "candidate": 0.0,
+          "result": "PASS"
+        }
+      },
+      "group": "relative",
+      "id": "error_rate_relative",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "COM0|agent:rhw0": {
+          "ratio": 1.009507912161945,
+          "result": "PASS"
+        },
+        "COM0|agent:rhw1": {
+          "ratio": 1.0024066601420143,
+          "result": "PASS"
+        },
+        "COM0|agent:rhw2": {
+          "ratio": 1.0080832351269893,
+          "result": "PASS"
+        },
+        "COM0|agent:rhw3": {
+          "ratio": 1.0056260722964943,
+          "result": "PASS"
+        },
+        "COM1|agent:rhw0": {
+          "ratio": 1.0024033436830901,
+          "result": "PASS"
+        },
+        "COM1|agent:rhw1": {
+          "ratio": 1.0131972796331494,
+          "result": "PASS"
+        },
+        "COM1|agent:rhw2": {
+          "ratio": 1.0021505014300554,
+          "result": "PASS"
+        },
+        "COM1|agent:rhw3": {
+          "ratio": 1.0160729451636605,
+          "result": "PASS"
+        }
+      },
+      "group": "relative",
+      "id": "throughput_relative",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "COM0|longest": {
+          "baseline": [
+            0.0,
+            0.0
+          ],
+          "candidate": [
+            0.0,
+            0.0
+          ],
+          "result": "PASS"
+        },
+        "COM0|total": {
+          "baseline": [
+            0.0,
+            0.0
+          ],
+          "candidate": [
+            0.0,
+            0.0
+          ],
+          "result": "PASS"
+        },
+        "COM1|longest": {
+          "baseline": [
+            0.0,
+            0.0
+          ],
+          "candidate": [
+            0.0,
+            0.0
+          ],
+          "result": "PASS"
+        },
+        "COM1|total": {
+          "baseline": [
+            0.0,
+            0.0
+          ],
+          "candidate": [
+            0.0,
+            0.0
+          ],
+          "result": "PASS"
+        }
+      },
+      "group": "relative",
+      "id": "stuck_relative",
+      "result": "PASS",
+      "status": "evaluated"
+    }
+  ],
+  "counts": {
+    "*": {
+      "accepted": 125535,
+      "bg_lost": 0,
+      "completed": 125525,
+      "effective_hour": 24.000555555555554,
+      "error_rate": 7.965905922651054e-05,
+      "expected_rejects": 1876,
+      "failed": 10,
+      "submitted": 127411,
+      "unexpected_errors": 10,
+      "unresolved": 0
+    },
+    "COM0|agent:rhw0": {
+      "accepted": 14991,
+      "bg_lost": 0,
+      "completed": 14989,
+      "effective_hour": 24.000555555555554,
+      "error_rate": 0.00013341338136215063,
+      "expected_rejects": 935,
+      "failed": 2,
+      "submitted": 15926,
+      "throughput_per_h": 624.5272100182866,
+      "unexpected_errors": 2,
+      "unresolved": 0
+    },
+    "COM0|agent:rhw1": {
+      "accepted": 15906,
+      "bg_lost": 0,
+      "completed": 15904,
+      "effective_hour": 24.000555555555554,
+      "error_rate": 0.0001257387149503332,
+      "expected_rejects": 0,
+      "failed": 2,
+      "submitted": 15906,
+      "throughput_per_h": 662.6513275155668,
+      "unexpected_errors": 2,
+      "unresolved": 0
+    },
+    "COM0|agent:rhw2": {
+      "accepted": 14990,
+      "bg_lost": 0,
+      "completed": 14987,
+      "effective_hour": 24.000555555555554,
+      "error_rate": 0.00020013342228152102,
+      "expected_rejects": 940,
+      "failed": 3,
+      "submitted": 15930,
+      "throughput_per_h": 624.443878613921,
+      "unexpected_errors": 3,
+      "unresolved": 0
+    },
+    "COM0|agent:rhw3": {
+      "accepted": 15944,
+      "bg_lost": 0,
+      "completed": 15941,
+      "effective_hour": 24.000555555555554,
+      "error_rate": 0.00018815855494229804,
+      "expected_rejects": 0,
+      "failed": 3,
+      "submitted": 15944,
+      "throughput_per_h": 664.1929584963311,
+      "unexpected_errors": 3,
+      "unresolved": 0
+    },
+    "COM1|agent:rhw0": {
+      "accepted": 15926,
+      "bg_lost": 0,
+      "completed": 15926,
+      "effective_hour": 24.000555555555554,
+      "error_rate": 0.0,
+      "expected_rejects": 0,
+      "failed": 0,
+      "submitted": 15926,
+      "throughput_per_h": 663.5679729635889,
+      "unexpected_errors": 0,
+      "unresolved": 0
+    },
+    "COM1|agent:rhw1": {
+      "accepted": 15906,
+      "bg_lost": 0,
+      "completed": 15906,
+      "effective_hour": 24.000555555555554,
+      "error_rate": 0.0,
+      "expected_rejects": 0,
+      "failed": 0,
+      "submitted": 15906,
+      "throughput_per_h": 662.7346589199325,
+      "unexpected_errors": 0,
+      "unresolved": 0
+    },
+    "COM1|agent:rhw2": {
+      "accepted": 15930,
+      "bg_lost": 0,
+      "completed": 15930,
+      "effective_hour": 24.000555555555554,
+      "error_rate": 0.0,
+      "expected_rejects": 0,
+      "failed": 0,
+      "submitted": 15930,
+      "throughput_per_h": 663.7346357723201,
+      "unexpected_errors": 0,
+      "unresolved": 0
+    },
+    "COM1|agent:rhw3": {
+      "accepted": 15942,
+      "bg_lost": 0,
+      "completed": 15942,
+      "effective_hour": 24.000555555555554,
+      "error_rate": 0.0,
+      "expected_rejects": 1,
+      "failed": 0,
+      "submitted": 15943,
+      "throughput_per_h": 664.234624198514,
+      "unexpected_errors": 0,
+      "unresolved": 0
+    }
+  },
+  "created_at": "2026-11-22T10:54:10+00:00",
+  "engine_result": {
+    "category": "",
+    "duration_s": 86403.64018589398,
+    "evidence": {
+      "analysis": "lr-mixed/longrun-analysis.md",
+      "events": "lr-mixed/events.ndjson",
+      "snapshots": "lr-mixed/snapshots.ndjson"
+    },
+    "reason": "長跑完成、無重大事件",
+    "reason_code": "",
+    "verdict": "PASS"
+  },
+  "evidence_hashes": {
+    "events.ndjson": "677263300f37759f384c6d4abaeb90f05baf6a208e784a5971987c0627a748db",
+    "observer.ndjson": "4ecb4c6bff1a86c4858c69c8f1e13ad40fa605254a0a345c10ea409edb94a5e1",
+    "report.json": "b4c52c08c60fce781d58eb9aa9c339955ffa8095a840bf2d86c1413dc2308526",
+    "snapshots.ndjson": "218957c1cee301644fa59d553a4e87054effbcfa93624e9011ec09430cf521bd",
+    "wal": {
+      "raw.mirror.log": "064c5d8d8ea57cecfd0515a54bea2c1462b8c3742d2a08c13d3eddd5edc1f71e",
+      "raw.wal.ndjson": "ecc67cd2d14155c6c1fa30dae2a8b8581775306b6fdfdda30a0d20150b64e827",
+      "raw.wal.ndjson.20261122-063527": "1a76141e8c79c32630a6f3a48ba0f3ec29b50bc9d538e1467664bbad2a037a72"
+    }
+  },
+  "excl_evidence_hashes": {},
+  "mode": "candidate",
+  "platform": "linux",
+  "release_gate_result": "PASS",
+  "run": {
+    "cases_yaml_sha256": "6d26ac8993a3ba7df567f56b0ea348e7e239ab537d933fd3b22c633b824c190c",
+    "cli_identity": {
+      "configured": "/home/paul_chen/.local/share/serialwrap/versions/0.5.0/bin/serialwrap",
+      "pinned": true,
+      "resolved": "/home/paul_chen/.local/share/serialwrap/versions/0.5.0/bin/serialwrap",
+      "sha256": "8628274502943a46bd2709a77ba95fab92583bfcc4180364790fee41b7175263"
+    },
+    "contract_revision": null,
+    "daemon_version": "0.5.0",
+    "deployed_content": {
+      "daemon_live": [
+        {
+          "error": null,
+          "image_path": "/home/paul_chen/.local/share/serialwrap/versions/0.5.0/bin/serialwrapd",
+          "image_sha256": "a7b023335a248677dfb4fca72296ea365bdf9e32220de171999f5c1a10dc57ce",
+          "in_install": true,
+          "pid": 2319631
+        }
+      ],
+      "end": {
+        "bundle_tree_sha256": "c83ce1ba866642567c843c3b3a36878eb9aee73972819b1a489e7e11af207076",
+        "cli_configured": "/home/paul_chen/.local/share/serialwrap/versions/0.5.0/bin/serialwrap",
+        "cli_resolved": "/home/paul_chen/.local/share/serialwrap/versions/0.5.0/bin/serialwrap",
+        "cli_sha256": "8628274502943a46bd2709a77ba95fab92583bfcc4180364790fee41b7175263",
+        "daemon_configured": null,
+        "daemon_resolved": null,
+        "daemon_sha256": null,
+        "entry_dir_sha256": null,
+        "error": null,
+        "install_dir": "/home/paul_chen/.local/share/serialwrap/versions/0.5.0",
+        "measured_at": "2026-11-22T10:52:44.754972+00:00",
+        "release_manifest_sha256": "96e2529b64f0d4076b9cbdfef221e0ed3ed5b553fa484030cfb4a7e9e0e88f7f",
+        "runtime_tree_sha256": "8d511639060173709d18adde16020f54bea07e3bdf95f51039db8a55a6c9853f",
+        "schema_version": "deployed-content.v1"
+      },
+      "start": {
+        "bundle_tree_sha256": "c83ce1ba866642567c843c3b3a36878eb9aee73972819b1a489e7e11af207076",
+        "cli_configured": "/home/paul_chen/.local/share/serialwrap/versions/0.5.0/bin/serialwrap",
+        "cli_resolved": "/home/paul_chen/.local/share/serialwrap/versions/0.5.0/bin/serialwrap",
+        "cli_sha256": "8628274502943a46bd2709a77ba95fab92583bfcc4180364790fee41b7175263",
+        "daemon_configured": null,
+        "daemon_resolved": null,
+        "daemon_sha256": null,
+        "entry_dir_sha256": null,
+        "error": null,
+        "install_dir": "/home/paul_chen/.local/share/serialwrap/versions/0.5.0",
+        "measured_at": "2026-11-21T10:52:40.867823+00:00",
+        "release_manifest_sha256": "96e2529b64f0d4076b9cbdfef221e0ed3ed5b553fa484030cfb4a7e9e0e88f7f",
+        "runtime_tree_sha256": "8d511639060173709d18adde16020f54bea07e3bdf95f51039db8a55a6c9853f",
+        "schema_version": "deployed-content.v1"
+      }
+    },
+    "duration_s": 86402.0,
+    "ended_at_utc": "2026-11-22T10:52:43.523554+00:00",
+    "engine_files_sha256": {
+      "realhw/cases/longrun.py": "ee4fc30d734748aaba8f2834749737ae05715115c642b53ec075a4eca95a7b58"
+    },
+    "started_at_utc": "2026-11-21T10:52:40.867710+00:00"
+  },
+  "schema_version": "release-gate.v1",
+  "stuck": {
+    "COM0": {
+      "longest_lower_s": 0,
+      "longest_upper_s": 0,
+      "segments": [],
+      "total_lower_s": 0,
+      "total_upper_s": 0
+    },
+    "COM1": {
+      "longest_lower_s": 0,
+      "longest_upper_s": 0,
+      "segments": [],
+      "total_lower_s": 0,
+      "total_upper_s": 0
+    }
+  },
+  "walscan": {
+    "context_missing": false,
+    "cross_context_replay": [],
+    "dangerous_auto_resend": [],
+    "files": [
+      "raw.wal.ndjson.20261122-063527",
+      "raw.wal.ndjson"
+    ],
+    "loss_flags": [],
+    "problems": [],
+    "records": 302992,
+    "rotation_failed": [],
+    "unauthorized_tx": [],
+    "uncertain": []
+  }
+}
