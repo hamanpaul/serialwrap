@@ -1,0 +1,484 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "serialwrap｜檔案傳輸",
+    "locale": "zh-TW",
+    "output": "docs/architecture/features/05-file-transfer.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/hamanpaul/serialwrap",
+      "provider": "github",
+      "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347"
+    },
+    "subtitle": "Rust push／pull 經前景槽與單一 writer 傳輸，push 逐片等回顯、雙向以 MD5 校驗；停機先收目前行，必要時嘗試 Ctrl-U 清列。"
+  },
+  "participants": [
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "CLI／Agent",
+      "sources": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 183,
+          "end_line": 210
+        }
+      ]
+    },
+    {
+      "id": "service",
+      "type": "backend",
+      "label": "RPC／Service",
+      "sources": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 855,
+          "end_line": 867
+        }
+      ]
+    },
+    {
+      "id": "manager",
+      "type": "backend",
+      "label": "Session 管理",
+      "sublabel": "SessionManager",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6874,
+          "end_line": 6893
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8515,
+          "end_line": 8539
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8733,
+          "end_line": 8746
+        }
+      ]
+    },
+    {
+      "id": "session",
+      "type": "backend",
+      "label": "Session actor",
+      "sublabel": "效果執行",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/session_core/file_xfer.rs",
+          "line": 39,
+          "end_line": 62
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5326,
+          "end_line": 5348
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7911,
+          "end_line": 7923
+        }
+      ]
+    },
+    {
+      "id": "transfer",
+      "type": "backend",
+      "label": "檔案傳輸",
+      "sublabel": "OpTransferPort",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 444,
+          "end_line": 463
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 164,
+          "end_line": 176
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 184,
+          "end_line": 204
+        }
+      ]
+    },
+    {
+      "id": "bridge",
+      "type": "backend",
+      "label": "UART bridge",
+      "sublabel": "單一寫入者",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1372,
+          "end_line": 1388
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 600,
+          "end_line": 617
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 491,
+          "end_line": 502
+        }
+      ]
+    },
+    {
+      "id": "target",
+      "type": "external",
+      "label": "UART／DUT",
+      "sublabel": "板端 shell",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/file_transfer/templates.rs",
+          "line": 50,
+          "end_line": 69
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/templates.rs",
+          "line": 89,
+          "end_line": 109
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/templates.rs",
+          "line": 116,
+          "end_line": 125
+        }
+      ]
+    },
+    {
+      "id": "files",
+      "type": "database",
+      "label": "本機檔案",
+      "sublabel": "daemon 所在主機",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 91,
+          "end_line": 100
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 114,
+          "end_line": 124
+        }
+      ]
+    }
+  ],
+  "segments": [
+    {
+      "from": 160,
+      "to": 411,
+      "label": "請求與前景授權"
+    },
+    {
+      "from": 425,
+      "to": 610,
+      "label": "push 準備與工具探測"
+    },
+    {
+      "from": 624,
+      "to": 1051,
+      "label": "push 分段與回顯節流"
+    },
+    {
+      "from": 1065,
+      "to": 1195,
+      "label": "push 校驗與落定"
+    },
+    {
+      "from": 1209,
+      "to": 1537,
+      "label": "條件式 pull 分支"
+    },
+    {
+      "from": 1551,
+      "to": 1747,
+      "label": "傳輸結果與前景收尾"
+    },
+    {
+      "from": 1761,
+      "to": 2107,
+      "label": "條件式停機行收尾"
+    }
+  ],
+  "messages": [
+    {
+      "id": "submit",
+      "from": "cli",
+      "to": "service",
+      "y": 176,
+      "label": "送出 file.push／file.pull",
+      "variant": "default",
+      "note": "Linux｜Windows： Unix socket｜TCP"
+    },
+    {
+      "id": "dispatch",
+      "from": "service",
+      "to": "manager",
+      "y": 231,
+      "label": "驗證參數並交給 manager",
+      "variant": "default",
+      "note": "push 的 ack_mode： auto、 echo 或 none"
+    },
+    {
+      "id": "route",
+      "from": "manager",
+      "to": "session",
+      "y": 297,
+      "label": "解析 selector 並等待 actor",
+      "variant": "default",
+      "note": "admission ticket 持有到實際終態"
+    },
+    {
+      "id": "start-transfer",
+      "from": "session",
+      "to": "transfer",
+      "y": 352,
+      "label": "取得前景槽並啟動傳輸",
+      "variant": "default",
+      "note": "需 READY 與空前景槽；忙碌回 SESSION_BUSY，不排隊"
+    },
+    {
+      "id": "read-local",
+      "from": "transfer",
+      "to": "files",
+      "y": 441,
+      "label": "讀取本機檔案",
+      "variant": "default",
+      "note": "整檔讀入並算 MD5；預設 chunk 512 bytes"
+    },
+    {
+      "id": "probe-decoder",
+      "from": "transfer",
+      "to": "bridge",
+      "y": 507,
+      "label": "探測板端解碼工具",
+      "variant": "default",
+      "note": "優先 base64 -d，次選 openssl"
+    },
+    {
+      "id": "decoder-result",
+      "from": "bridge",
+      "to": "transfer",
+      "y": 562,
+      "label": "回傳探測 RX 與 prompt",
+      "variant": "default",
+      "note": "缺工具回 TARGET_DECODER_MISSING"
+    },
+    {
+      "id": "send-slice",
+      "from": "transfer",
+      "to": "bridge",
+      "y": 640,
+      "label": "分段提交 chunk 本文",
+      "variant": "default",
+      "note": "每 64 字元一片，先不送換行"
+    },
+    {
+      "id": "write-slice",
+      "from": "bridge",
+      "to": "target",
+      "y": 695,
+      "label": "以單一 writer 寫 UART",
+      "variant": "default",
+      "note": "writer 在提交點重驗 fence"
+    },
+    {
+      "id": "target-echo",
+      "from": "target",
+      "to": "bridge",
+      "y": 750,
+      "label": "回傳本文回顯",
+      "variant": "default",
+      "note": "DUT 不回顯時走停滯分支"
+    },
+    {
+      "id": "echo-ack",
+      "from": "bridge",
+      "to": "transfer",
+      "y": 794,
+      "label": "回傳 RX 供回顯比對",
+      "variant": "default",
+      "note": "回顯完整才送下一片（ Python 0.4.x 每 10 ms 輪詢）"
+    },
+    {
+      "id": "echo-stall",
+      "from": "transfer",
+      "to": "bridge",
+      "y": 860,
+      "label": "清除停滯輸入並清暫存",
+      "variant": "default",
+      "note": "條件：回顯不足；送 Ctrl-U 加換行，回 TRANSFER_ECHO_STALL"
+    },
+    {
+      "id": "line-newline",
+      "from": "transfer",
+      "to": "bridge",
+      "y": 948,
+      "label": "全片確認後送行尾換行",
+      "variant": "default",
+      "note": "全片確認後才送換行"
+    },
+    {
+      "id": "chunk-result",
+      "from": "bridge",
+      "to": "transfer",
+      "y": 1003,
+      "label": "回傳 chunk 的 RX",
+      "variant": "default",
+      "note": "每 chunk 等 prompt 與 SW_XFER_CHUNK_42"
+    },
+    {
+      "id": "verify-and-move",
+      "from": "transfer",
+      "to": "bridge",
+      "y": 1081,
+      "label": "校驗 MD5 後搬移到目的路徑",
+      "variant": "default",
+      "note": "MD5 相符才 mv；不符回 CHECKSUM_MISMATCH"
+    },
+    {
+      "id": "push-result",
+      "from": "bridge",
+      "to": "transfer",
+      "y": 1147,
+      "label": "回傳搬移命令的 RX",
+      "variant": "default",
+      "note": "須見 SW_XFER_MV_42"
+    },
+    {
+      "id": "pull-start",
+      "from": "transfer",
+      "to": "bridge",
+      "y": 1225,
+      "label": "探測編碼工具並請求檔案",
+      "variant": "default",
+      "note": "條件： file.pull；不用逐片 echo ACK"
+    },
+    {
+      "id": "pull-data",
+      "from": "bridge",
+      "to": "transfer",
+      "y": 1291,
+      "label": "分段回傳拉取資料",
+      "variant": "default",
+      "note": "條件： file.pull；每輪最多等 250 ms"
+    },
+    {
+      "id": "pull-md5",
+      "from": "transfer",
+      "to": "bridge",
+      "y": 1357,
+      "label": "請求板端原檔 MD5",
+      "variant": "default",
+      "note": "條件： file.pull；落檔前先查板端 MD5"
+    },
+    {
+      "id": "pull-md5-result",
+      "from": "bridge",
+      "to": "transfer",
+      "y": 1423,
+      "label": "回傳板端 MD5 輸出",
+      "variant": "default",
+      "note": "條件： file.pull；不符不寫本機檔"
+    },
+    {
+      "id": "write-local",
+      "from": "transfer",
+      "to": "files",
+      "y": 1489,
+      "label": "截斷寫入本機目的檔",
+      "variant": "default",
+      "note": "條件： MD5 相符；截斷寫入、非原子"
+    },
+    {
+      "id": "transfer-done",
+      "from": "transfer",
+      "to": "session",
+      "y": 1567,
+      "label": "回報傳輸結果或中止分類",
+      "variant": "default",
+      "note": "依累計確認量分 COMMAND_ABORTED_IN_FLIGHT 或 FLUSHED_BY_RECOVERY"
+    },
+    {
+      "id": "actor-reply",
+      "from": "session",
+      "to": "manager",
+      "y": 1655,
+      "label": "釋放前景並回覆等待者",
+      "variant": "default",
+      "note": "先重開 human admission 與回放，再回覆"
+    },
+    {
+      "id": "rpc-reply",
+      "from": "service",
+      "to": "cli",
+      "y": 1699,
+      "label": "回傳傳輸結果與來源",
+      "variant": "default",
+      "note": "push 回 bytes、 chunks、 md5"
+    },
+    {
+      "id": "shutdown-settle",
+      "from": "manager",
+      "to": "bridge",
+      "y": 1777,
+      "label": "先要求目前行收尾再凍結",
+      "variant": "default",
+      "note": "條件（#282）：停機；所有行共用 1250 ms 預算"
+    },
+    {
+      "id": "settle-wake",
+      "from": "bridge",
+      "to": "transfer",
+      "y": 1821,
+      "label": "軟喚醒行持有者",
+      "variant": "default",
+      "note": "條件：有 echo-paced 行；行期限 750 ms"
+    },
+    {
+      "id": "finish-line",
+      "from": "transfer",
+      "to": "bridge",
+      "y": 1887,
+      "label": "完成目前行並送換行",
+      "variant": "default",
+      "note": "條件：期限內取得回顯；只完成目前這一行"
+    },
+    {
+      "id": "kill-line",
+      "from": "transfer",
+      "to": "bridge",
+      "y": 1953,
+      "label": "嘗試 Ctrl-U 加換行清列",
+      "variant": "default",
+      "note": "條件：期限到或回顯不足；送 Ctrl-U 加換行"
+    },
+    {
+      "id": "shutdown-drain",
+      "from": "manager",
+      "to": "session",
+      "y": 1997,
+      "label": "行等待結束後通知 drain",
+      "variant": "default",
+      "note": "條件：行收尾結束後才 drain"
+    },
+    {
+      "id": "cancel-waits",
+      "from": "session",
+      "to": "bridge",
+      "y": 2041,
+      "label": "凍結並取消剩餘傳輸等待",
+      "variant": "default",
+      "note": "條件： drain Phase 1。回覆可能偶發 EXCEPTION（#296）"
+    }
+  ]
+}

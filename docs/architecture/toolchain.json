@@ -82,6 +82,20 @@
         "delivery": "21a7abd1d8a6952935963632953c828ddf98c29e59648cdcd9f3a4b8a78b7892",
         "html": "3eb1697b4db39daf31b721a64a7290d965252765b5b9b3a7deb994a64a456b4a"
       }
+    },
+    "05-file-transfer": {
+      "diagram_type": "sequence",
+      "source_revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347",
+      "facts": "features/05-file-transfer.facts.json",
+      "ir": "features/05-file-transfer.json",
+      "html": "features/05-file-transfer.html",
+      "overlay_version": 1,
+      "sha256": {
+        "facts": "e13c8fc518a9fcaa99145d5d327fb9aac2b39c0a0acc04c23ace0c5eda3db85c",
+        "ir": "5d3535ea37eedaa7bffa2b47903a3e1feff2d24fbea17292d0b8ae6f9b56370a",
+        "delivery": "1da6337262ed187e1706cb840210fe8e7a426f90d7af98f0d7ece097d69bbc52",
+        "html": "d02fec7608a3e3bce6f0b90f0086de0001fedb717798b2444dc767c0223f156e"
+      }
     }
   }
 }
