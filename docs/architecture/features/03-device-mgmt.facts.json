@@ -1,0 +1,1747 @@
+{
+  "schema_version": 1,
+  "document_type": "feature-facts",
+  "feature": {
+    "id": "03-device-mgmt",
+    "order": 3,
+    "title": "裝置管理",
+    "summary": "依平台列舉 UART、以啟動快照確定 COM 預配，將熱插與設定交給 session actor，並以關閉回條及狀態落盤完成 release／attach 交接。"
+  },
+  "repository": {
+    "url": "https://github.com/hamanpaul/serialwrap",
+    "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347"
+  },
+  "diagram_type": "sequence",
+  "scope": {
+    "includes": [
+      "Rust 平台裝置列舉、初掃與輪詢快照、熱插拔／改指、動態 session 的確定性 COM 預配與空槽沿用。",
+      "bind、session alias 與裝置 alias、profile pin 的責任差異及 state.json 持久化。",
+      "一般 session 的 device.release／device.attach，含 custody、關閉回條、落盤與 RELEASED 自動重接防線；OD-63 佔位特例以相鄰 note 說明。"
+    ],
+    "excludes": [
+      "登入 FSM、ready probe／quiet 及 recover 的完整生命週期。",
+      "MCU FLASHING／ttyMCU 協定、人類 console 端點與外部燒錄工具的執行。",
+      "OD-63 佔位退休的完整取消／重試時序、daemon 更新的 legacy_handoff.rs 舊版停止協定。",
+      "實際建置、測試、daemon 或實體 USB／Windows COM 驗證；本頁只有固定 revision 的讀碼證據。"
+    ]
+  },
+  "participants": [
+    {
+      "id": "cli",
+      "label": "CLI／Agent",
+      "type": "frontend",
+      "overview_component": "cli",
+      "responsibility": "把裝置交接、session 綁定／profile pin、alias 操作組成 RPC；只透過 daemon 操作受管 UART。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 27,
+          "end_line": 42,
+          "excerpt_sha256": "badcb9013ee0cd44e7467124e12032dc4f956ef2391ffebbdc15c40a47802467",
+          "claim": "CLI 把 device list／release／attach 映射為 RPC。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 45,
+          "end_line": 59,
+          "excerpt_sha256": "0262151c20d5b3f54c4507594560c66901fa951adca013164ba81e0a60262424",
+          "claim": "CLI 把 session bind／pin／unpin 映射為 RPC。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 125,
+          "end_line": 140,
+          "excerpt_sha256": "98d22701313b66f4c022d1a36dae13ed29be89b272a2119c68104ca72c58f6b3",
+          "claim": "CLI 將 alias list／set／assign／unassign 映射為 RPC。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 273,
+          "end_line": 280,
+          "excerpt_sha256": "f93b0f25c6e80a65352f3d3ca4621c1b2aadceeaae3ebd7a4acb8421a01508b8",
+          "claim": "CLI 以解析後的 endpoint、method 與 params 呼叫 RPC client。"
+        }
+      ]
+    },
+    {
+      "id": "daemon",
+      "label": "serialwrapd",
+      "sublabel": "主流程、Service",
+      "type": "backend",
+      "overview_component": "service",
+      "responsibility": "本頁合併 daemon_main 的初始掃描／watcher 啟動與 Service 的外部 RPC 分派；兩者呼叫者仍分別在步驟說明。Service 驗證參數，再向 SessionManager 路由。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1383,
+          "end_line": 1392,
+          "excerpt_sha256": "d44822b12616d27d19f08b52a7a629704ef8d11382f8dc2a169d4cebb67449b3",
+          "claim": "daemon_main 依序初掃、預配 COM、更新裝置、bootstrap attach，再啟動 watcher。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 880,
+          "end_line": 908,
+          "excerpt_sha256": "1a00c2f311a3cd6880469acc2f718d4d569c836e0bc4d89864f0fbe44d18cb85",
+          "claim": "Service 將 release／attach 轉為 SessionRequest，保留 source、reason 與 force。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 972,
+          "end_line": 994,
+          "excerpt_sha256": "d5ab0841c6244f0fbab8921a6c4e8a6f803b2f31c9603834ea70f5f47154e5ae",
+          "claim": "Service 的 bind／pin／unpin 呼叫 manager 的對應方法。"
+        }
+      ]
+    },
+    {
+      "id": "watcher",
+      "label": "裝置監看",
+      "sublabel": "DeviceWatcher",
+      "type": "backend",
+      "overview_component": "watcher",
+      "responsibility": "以輪詢比較 by_id 與 real_path；快照 Delta 需 consumer 確認，才更新 previous；掃描失敗不以空清單覆寫基線。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/device_watcher.rs",
+          "line": 37,
+          "end_line": 58,
+          "excerpt_sha256": "4b26d38f082b331c35ed564cc2eb918be13215b220a54c219ed569b2cf54a7e3",
+          "claim": "watcher 由傳入 baseline 開始，執行可取消的輪詢。"
+        },
+        {
+          "path": "crates/sw-pal/src/device_watcher.rs",
+          "line": 136,
+          "end_line": 147,
+          "excerpt_sha256": "b42dd7aa916e9438c370ca3e3090d9e7fbdc67adb64929c2495a78abbf656a6e",
+          "claim": "scan 失敗只發 ScanFailed；成功才計算快照差異。"
+        },
+        {
+          "path": "crates/sw-pal/src/device_watcher.rs",
+          "line": 151,
+          "end_line": 170,
+          "excerpt_sha256": "716ff407b5f939c04bf7ee299a50317e5dd3a9ed3c1b3ad50e11e2205fbf6d25",
+          "claim": "有差異時送含 snapshot 與 ack 的 Delta，等 accepted 才更新 previous。"
+        }
+      ]
+    },
+    {
+      "id": "devices",
+      "label": "裝置來源",
+      "sublabel": "sw-pal 平台後端",
+      "type": "backend",
+      "overview_component": "pal-devices",
+      "responsibility": "回傳裝置識別與實體路徑。Linux 掃描 by-id 再 by-path，依 real_path 去重；Windows 讀 SERIALCOMM，排除藍牙與指定 COM。USB busid 另由 sysfs topology helper 解析，並非掃描器用來選 profile 的 USB VID／PID 屬性查詢。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 149,
+          "end_line": 175,
+          "excerpt_sha256": "c7f6be855f918acf13d214515006b227f81a21d7327e3dcbf8645abca0b69903",
+          "claim": "原生工廠在 Linux 使用 by-id／by-path 來源，在 Windows 注入 WinRegistryView。"
+        },
+        {
+          "path": "crates/sw-pal/src/device_source/posix.rs",
+          "line": 16,
+          "end_line": 42,
+          "excerpt_sha256": "5ad44b826c9a7d21a28b7ce5548797e22dfdf9fb143a6d0d40425961867356d4",
+          "claim": "Linux 逐目錄排序、解析 symlink、依 real_path 去重並套 allowlist。"
+        },
+        {
+          "path": "crates/sw-pal/src/device_source/windows.rs",
+          "line": 42,
+          "end_line": 63,
+          "excerpt_sha256": "4c5109efa8dcc757e433d1265b2ce820ff71961de2575c6141a9f23cd5d020f5",
+          "claim": "Windows 從 SERIALCOMM 列舉，快取藍牙埠並進行排除。"
+        },
+        {
+          "path": "crates/sw-pal/src/device_source/windows.rs",
+          "line": 65,
+          "end_line": 80,
+          "excerpt_sha256": "5332bdd92daeebfe2d1ae95877912acee7c3bc6f9f7bf64530e2608c339701f6",
+          "claim": "Windows 以 COM 名稱為 by_id，實體路徑為 Windows 裝置名稱。"
+        },
+        {
+          "path": "crates/sw-pal/src/device_source/usb_posix.rs",
+          "line": 137,
+          "end_line": 153,
+          "excerpt_sha256": "171c73ffa49ccaccf0e5563a6dbcf9aa0ffa7992466b00ec7632dac23b776755",
+          "claim": "USB topology 從 sysfs tty device 解析路徑並找出 busid。"
+        },
+        {
+          "path": "crates/sw-pal/src/device_source/mod.rs",
+          "line": 25,
+          "end_line": 35,
+          "excerpt_sha256": "6d1fc620bb770503a99120ea701963151cbf3b9cad7cc3d921f79ef4e91ad107",
+          "claim": "原生 topology 在 Linux 讀 sysfs，在 Windows 回 None。"
+        }
+      ]
+    },
+    {
+      "id": "manager",
+      "label": "Session 管理",
+      "sublabel": "SessionManager",
+      "type": "backend",
+      "overview_component": "sessions",
+      "responsibility": "管理裝置快照、COM 預配、session 索引、綁定與持久化；本參與者包含 attach／open／persist worker 與 ManagerExec，呼叫 bridge 的是這些實際效果執行者。CustodyLedger 是本參與者內的 handle 保管帳本，追蹤 token、取消與關閉終態；不是 state.json。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6753,
+          "end_line": 6775,
+          "excerpt_sha256": "089a3698b9a60d13fa859f9863ae58936348ff6e1c10e1d1d9e7942b5b4a95cc",
+          "claim": "預配先收集已用 COM，排除 released、binding 與既有 session。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6776,
+          "end_line": 6790,
+          "excerpt_sha256": "289b76b137d4f2af23974a834515d58a98de3043dc92931bc93685bae3e0a6c6",
+          "claim": "按識別鍵排序，依序分配未使用的 COM，寫入 pending_com。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2882,
+          "end_line": 2894,
+          "excerpt_sha256": "0a9d10ab3ad97761c9a39700950370bf52b2c68898980049fef1af772da397f2",
+          "claim": "attach worker 優先處理既有 by_id 對應 session。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2896,
+          "end_line": 2919,
+          "excerpt_sha256": "5f2cfc2ced3a7b028d7b21c95227aba4701bca3a064833a74f89a87f13d77fba",
+          "claim": "否則選離線且 DETACHED、act_no 最小的空槽改綁。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2922,
+          "end_line": 2934,
+          "excerpt_sha256": "0588fb7ad4e8af16b36e69f01fff1349fde38e278909b5ad56e48976f2968bc4",
+          "claim": "無空槽時檢查模板與數量上限，再走動態接入。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6072,
+          "end_line": 6085,
+          "excerpt_sha256": "73b9d676144a969b9fa208f96619dc2b01316b5af1b87b7710d5fc923e61df1b",
+          "claim": "ManagerExec 把 OpenBridge／ClaimCustody 交給 open worker。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6231,
+          "end_line": 6249,
+          "excerpt_sha256": "f11df580ac4e890e3e2ec9bb594b6694b9119a330419bf62cd5522e4d1f6b09a",
+          "claim": "executor 套用狀態 delta，bind 的 persist worker 提交後向 actor 回 StateCommitted。"
+        },
+        {
+          "path": "crates/sw-core/src/custody.rs",
+          "line": 538,
+          "end_line": 549,
+          "excerpt_sha256": "ece39ec1292b746889a1a4add124abfe0d467173e525123f8c22add17e77a8fa",
+          "claim": "CustodyLedger 以未確認關閉與 CloseFailed 判斷 Failed barrier，其餘回紀錄快照。"
+        },
+        {
+          "path": "crates/sw-core/src/custody.rs",
+          "line": 722,
+          "end_line": 737,
+          "excerpt_sha256": "9913ee0004c473d8cb80cfbd9297aca42f1d50e8ad0e3ae476b48f8e455612c6",
+          "claim": "release 以匹配 token 認領 held handle，轉 Closing 並記取消。"
+        }
+      ]
+    },
+    {
+      "id": "session",
+      "label": "Session actor",
+      "sublabel": "SessionCore",
+      "type": "backend",
+      "overview_component": "session-actor",
+      "responsibility": "序列化每個 session 的裝置事件、bind、release 與 attach；決定凍結、排空、開埠及落盤效果，接收 BridgeOpened、WorkerStopped、StateCommitted。實際 I/O 與持久化由 ManagerExec／worker 執行。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3999,
+          "end_line": 4015,
+          "excerpt_sha256": "58a84a561255a4f43a5507d0db8b2920d2769c9e3d9e40240e3b84b49d765674",
+          "claim": "actor 驗證 by_id、停機與 RELEASED／DETACHED 狀態，更新在線路徑。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 4042,
+          "end_line": 4050,
+          "excerpt_sha256": "09d5dc2ffd328df48f8c7f510008cba1cea51cc2260327edfcfa8e2e7dc13217",
+          "claim": "actor 轉 ATTACHING 並產生 OpenBridge。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 2244,
+          "end_line": 2268,
+          "excerpt_sha256": "331e96f3830a88c3b7e70835199f41da3be1397c9567268b1618296d9a787b52",
+          "claim": "actor 凍結 fence、取消傳輸、清命令與 lease 並轉 RECOVERING。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 2269,
+          "end_line": 2274,
+          "excerpt_sha256": "48cca8c083035ff67ee43ee6fe2eabaf61795f057e86f2fc1ee978ace36ba9cb",
+          "claim": "actor 產生 BeginDrain 與配對的 DrainTimeout 計時。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3957,
+          "end_line": 3972,
+          "excerpt_sha256": "a55b56cd6d3bc77fe64ae7ef0fd975d0de6b15dea634fc107c300a11c8dead2d",
+          "claim": "actor 為 bind 建立 pending commit 與 Persist 效果。"
+        }
+      ]
+    },
+    {
+      "id": "state",
+      "label": "狀態儲存",
+      "sublabel": "StateStore",
+      "type": "database",
+      "overview_component": "state-store",
+      "responsibility": "合併記憶體狀態模型、AliasRegistry 與 state.json 的單一寫入者。保存 aliases、bindings、released、profile_pins、profile_detected；提交快照後回傳成功或失敗。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/state_store.rs",
+          "line": 69,
+          "end_line": 74,
+          "excerpt_sha256": "4ba3748e9a9f516274f2f3bd7d38da4b35da59bd805b10579c8c9a0da1fdcaec",
+          "claim": "載入狀態包含 alias、binding、released、pin 與 detected 五類持久化資料。"
+        },
+        {
+          "path": "crates/sw-core/src/state_store.rs",
+          "line": 623,
+          "end_line": 645,
+          "excerpt_sha256": "a3a0c839918cc4c394424da1182743bfc1a3c2344b5b8559e62c355e4d3a4565",
+          "claim": "狀態模型套用 released／unreleased／binding／bind，Bind 同時清 released。"
+        },
+        {
+          "path": "crates/sw-core/src/state_store.rs",
+          "line": 646,
+          "end_line": 655,
+          "excerpt_sha256": "f2b0c956b3c04904f9634a291fa8b31c2362e0f4522b5b14bdd3cbf3d1505e71",
+          "claim": "Pin 依 profile 是否存在而新增或移除裝置 pin。"
+        },
+        {
+          "path": "crates/sw-core/src/state_store.rs",
+          "line": 657,
+          "end_line": 666,
+          "excerpt_sha256": "e0645dd84ce482c68df04664404c86c6aba59b9221e00593e3c2bfce3d7fe774",
+          "claim": "StateModel 套用 detected 與 alias delta。"
+        },
+        {
+          "path": "crates/sw-core/src/state_store.rs",
+          "line": 750,
+          "end_line": 764,
+          "excerpt_sha256": "5dd372026e4b8c07d4b4609fe92c2d91110a72ab280a42044addb158aac7e31c",
+          "claim": "StateStore 單一 thread 序列化快照、寫檔並透過 done 回傳結果。"
+        },
+        {
+          "path": "crates/sw-core/src/state_store.rs",
+          "line": 713,
+          "end_line": 724,
+          "excerpt_sha256": "8742f8845b3e6e566dfdae17df69cdb7621d59a4925ca943c51dc21ef40f0745",
+          "claim": "state.json 使用 atomic_write；父目錄缺失則建立後重試。"
+        },
+        {
+          "path": "crates/sw-core/src/alias_registry.rs",
+          "line": 40,
+          "end_line": 57,
+          "excerpt_sha256": "8ab7ad809d2b63155406612f21456d7c3e4f841826d11996590a157d41ed8291",
+          "claim": "AliasRegistry 區分 session_id alias 與 device_by_id alias，後者可含 profile。"
+        }
+      ]
+    },
+    {
+      "id": "bridge",
+      "label": "UART bridge",
+      "sublabel": "IoWorker",
+      "type": "backend",
+      "overview_component": "bridge",
+      "responsibility": "持有正式 UART 的 reader／writer；由開埠 worker 建立。停止時非同步 join、關閉 handle、等 RX dispatch，再送 WorkerStopped。此參與者包含 IoWorker 自己啟動的 drain finisher，沒有代替 manager 發起開埠決策。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5183,
+          "end_line": 5199,
+          "excerpt_sha256": "f319accb338a0fdd35c31e4a6881b17b05e1b14dfee38c69e1ab3c860d631bed",
+          "claim": "open worker 以既有 handle 建立 IoWorker，注入 WAL、RX、Fence 與資料通道。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 844,
+          "end_line": 864,
+          "excerpt_sha256": "9190e2274c7fd2f4b12508b794f5b039eae032860ba1d66cead1f3dac93b05a0",
+          "claim": "IoWorker finish_async 先停止，再啟動 drain finisher join reader／writer。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 865,
+          "end_line": 877,
+          "excerpt_sha256": "881fe9de1b2c95e6bd22dd6735cbf2879fd0db9d6d1b10f490488c7a414a8d91",
+          "claim": "join 成功後以 close.close 關閉 reader／writer handle。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 925,
+          "end_line": 934,
+          "excerpt_sha256": "46aee944a1e63f8d15567ca3508d96cf4c2a22c6d87b6d240513905e8d61be7b",
+          "claim": "finisher 送 WorkerStopped，帶 handle_closed 與 close_error。"
+        }
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "id": "initial-scan",
+      "from": "daemon",
+      "to": "devices",
+      "label": "初次列舉裝置",
+      "phase": "啟動掃描與預配",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1368,
+          "end_line": 1384,
+          "excerpt_sha256": "726922734277f80bb2c8fa02f6ed276095232a2f8bd2f86a6ee2164a95d918fd",
+          "claim": "daemon_main 建立平台裝置來源，呼叫 initial_scan；初掃錯誤降為空快照。"
+        },
+        {
+          "path": "crates/sw-pal/src/device_watcher.rs",
+          "line": 85,
+          "end_line": 87,
+          "excerpt_sha256": "929781087c3b9767454cabd0e0c11526aaf3cbfd7f49f216ac5479fbb29ca444",
+          "claim": "initial_scan 直接呼叫來源的 scan。"
+        },
+        {
+          "path": "crates/sw-proto/src/runtime_paths.rs",
+          "line": 444,
+          "end_line": 445,
+          "excerpt_sha256": "ea788c06e47bb27c6817687d7b96472666a4a6067589465194867fabe8bac22c",
+          "claim": "預設 Linux 掃描目錄為 /dev/serial/by-id 與 /dev/serial/by-path，可由環境覆寫。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 149,
+          "end_line": 175,
+          "excerpt_sha256": "c7f6be855f918acf13d214515006b227f81a21d7327e3dcbf8645abca0b69903",
+          "claim": "工廠依平台建立 POSIX 掃描器或 Windows 登錄掃描器。"
+        },
+        {
+          "path": "crates/sw-pal/src/device_source/posix.rs",
+          "line": 16,
+          "end_line": 42,
+          "excerpt_sha256": "5ad44b826c9a7d21a28b7ce5548797e22dfdf9fb143a6d0d40425961867356d4",
+          "claim": "POSIX 依序掃描、排序、解析 symlink、按實體路徑去重。"
+        },
+        {
+          "path": "crates/sw-pal/src/device_source/windows.rs",
+          "line": 42,
+          "end_line": 63,
+          "excerpt_sha256": "4c5109efa8dcc757e433d1265b2ce820ff71961de2575c6141a9f23cd5d020f5",
+          "claim": "Windows 列舉 SERIALCOMM，並以藍牙快取進行過濾。"
+        },
+        {
+          "path": "crates/sw-pal/src/device_source/windows.rs",
+          "line": 65,
+          "end_line": 80,
+          "excerpt_sha256": "5332bdd92daeebfe2d1ae95877912acee7c3bc6f9f7bf64530e2608c339701f6",
+          "claim": "Windows 套用 allowlist 並回 COM 名稱及裝置路徑。"
+        },
+        {
+          "path": "crates/sw-pal/src/device_source/windows_model.rs",
+          "line": 8,
+          "end_line": 9,
+          "excerpt_sha256": "834304a258cf0e6d595f6b573c061c99398f7459998a0559ebed3b1716bef3d8",
+          "claim": "SERIALCOMM 鍵位於 HKLM HARDWARE DEVICEMAP。"
+        },
+        {
+          "path": "crates/sw-pal/src/device_source/windows_model.rs",
+          "line": 75,
+          "end_line": 84,
+          "excerpt_sha256": "42773f5b4353872896fa4c1dc377f7765c40a7efcca6b9a29ac77b7f653efc4e",
+          "claim": "Windows 同時排除 BTHENUM 埠、手動清單與 bthmodem 名稱，並去重。"
+        },
+        {
+          "path": "crates/sw-pal/src/device_source/windows_registry.rs",
+          "line": 24,
+          "end_line": 44,
+          "excerpt_sha256": "9e725c230ece0d5fb3fd5ab6128c28e6cd61ba8fab155775df81b91d92c2d448",
+          "claim": "Windows 原生 RegistryView 逐項解碼登錄 REG_SZ 並回列舉結果。"
+        }
+      ],
+      "note": "Linux｜Windows：/dev/serial/by-id 再 /dev/serial/by-path 的 symlink｜HKLM\\HARDWARE\\DEVICEMAP\\SERIALCOMM。Windows 排除 BTHENUM、bthmodem 與設定的 exclude_coms；by_id 為系統 COM 名稱，real_path 為 \\\\.\\COMx。這個系統 COM 名稱與下一步 serialwrap 的邏輯 COM 編號分開。"
+    },
+    {
+      "id": "rank-bootstrap",
+      "from": "daemon",
+      "to": "manager",
+      "label": "預配 COM 並排程初始接入",
+      "phase": "啟動掃描與預配",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1384,
+          "end_line": 1390,
+          "excerpt_sha256": "c432412d4c741a312531cf4c1aa228dd1f9d25d74c145a3bd6480b73b4881ac5",
+          "claim": "同一份初掃先傳 prepare_dynamic_rank，再 update_devices 與 bootstrap_attach。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6753,
+          "end_line": 6775,
+          "excerpt_sha256": "089a3698b9a60d13fa859f9863ae58936348ff6e1c10e1d1d9e7942b5b4a95cc",
+          "claim": "預配排除 released、binding 與已有 session 的裝置，跳過已用與 pending COM。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6776,
+          "end_line": 6790,
+          "excerpt_sha256": "289b76b137d4f2af23974a834515d58a98de3043dc92931bc93685bae3e0a6c6",
+          "claim": "按 device_sort_key 排序，逐一分配最小可用 COM 並保存 pending_com。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 114,
+          "end_line": 116,
+          "excerpt_sha256": "6aa646e4daa555c11ece7fd92d8162c2cb4796d5f9c785eb705d0adce63a4d84",
+          "claim": "排序鍵是 by_id 與選填 by_path；本次呼叫傳 None。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6808,
+          "end_line": 6820,
+          "excerpt_sha256": "9e6d89e3dbee1c8f6e2fd2c845461258cebe2a85fbc9d4034eece74558276ee9",
+          "claim": "bootstrap 對裝置快照各 by_id 排程 spawn_attach。"
+        }
+      ],
+      "note": "排序在並行 attach worker 前完成，避免以完成順序決定 COM。實際排序呼叫傳 by_path=None，第二鍵為空；不是 USB 列舉順序。既有 YAML target／binding／RELEASED 所保留的 COM 不參與重排。update_devices 已會排程新增裝置，bootstrap 重送由在途去重處理。"
+    },
+    {
+      "id": "watcher-start",
+      "from": "daemon",
+      "to": "watcher",
+      "label": "以同一快照啟動輪詢",
+      "phase": "啟動掃描與預配",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1388,
+          "end_line": 1392,
+          "excerpt_sha256": "13b4a714d98498f35b2d1cea03323be61ba5fec01856d4bd3fdc56bb0d3f98fc",
+          "claim": "bootstrap 排程後才用 initial 快照啟動 watcher。"
+        },
+        {
+          "path": "crates/sw-pal/src/device_watcher.rs",
+          "line": 37,
+          "end_line": 58,
+          "excerpt_sha256": "4b26d38f082b331c35ed564cc2eb918be13215b220a54c219ed569b2cf54a7e3",
+          "claim": "watcher 接受 baseline 並把它作為 previous，開始可取消輪詢。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2784,
+          "end_line": 2790,
+          "excerpt_sha256": "c1e8681eee62408388db2c42f851086644bf5d755dec9e304dbbfb4f37903d06",
+          "claim": "attach 作業先登記 inflight，再放鎖啟動 worker。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2727,
+          "end_line": 2739,
+          "excerpt_sha256": "cbb266f2a4742dd9b0f9a714ab442016fdbc5b4b4da17b189d680bed3a45bf95",
+          "claim": "已有 inflight 作業就早退，不再重複啟動 attach worker。"
+        }
+      ],
+      "note": "這裡只保證啟動／排程順序，不等待各 session 登入或 attach 完成。後續 session 建立與開埠也可能在 watcher 啟動前發生；圖中的相鄰步驟不表示跨執行緒全域屏障。"
+    },
+    {
+      "id": "poll-source",
+      "from": "watcher",
+      "to": "devices",
+      "label": "重掃相同裝置來源",
+      "phase": "熱插拔與 session 對應",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/device_watcher.rs",
+          "line": 136,
+          "end_line": 147,
+          "excerpt_sha256": "b42dd7aa916e9438c370ca3e3090d9e7fbdc67adb64929c2495a78abbf656a6e",
+          "claim": "每輪呼叫 scan；錯誤不更新 previous，也不進 diff。"
+        },
+        {
+          "path": "crates/sw-pal/src/device_watcher.rs",
+          "line": 69,
+          "end_line": 73,
+          "excerpt_sha256": "24419bc77a99727dc6bb48f0ca2cb61a73bc8b3f2ce5ff713eb030447719b76b",
+          "claim": "每輪依 poll 間隔等待，且可取消。"
+        }
+      ],
+      "note": "來源沿用 initial-scan 的平台規則。掃描失敗保留舊基線，避免把暫時讀取錯誤當成全部裝置拔除。"
+    },
+    {
+      "id": "device-delta",
+      "from": "watcher",
+      "to": "manager",
+      "label": "送出差異與完整快照",
+      "phase": "熱插拔與 session 對應",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/device_watcher.rs",
+          "line": 94,
+          "end_line": 108,
+          "excerpt_sha256": "dee856fb6e421cb72f48890107ef5fc5fba6ba46e1734c5e36bc25f1453e599b",
+          "claim": "BTreeMap 依 by_id 排序；新增或 real_path 改變進 added。"
+        },
+        {
+          "path": "crates/sw-pal/src/device_watcher.rs",
+          "line": 113,
+          "end_line": 127,
+          "excerpt_sha256": "cce3228afe3a952af4c41c4a4dbb7fd75502c180475885083a1a0ccb64a4087a",
+          "claim": "移除或 real_path 改變進 removed，最後附加 changed 集合。"
+        },
+        {
+          "path": "crates/sw-pal/src/device_watcher.rs",
+          "line": 151,
+          "end_line": 170,
+          "excerpt_sha256": "716ff407b5f939c04bf7ee299a50317e5dd3a9ed3c1b3ad50e11e2205fbf6d25",
+          "claim": "有差異時送含 snapshot 與 ack 的 Delta，等 accepted 才更新 previous。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2384,
+          "end_line": 2403,
+          "excerpt_sha256": "fd07748fa4f0c9d7915b4a334730248be45ed42674a283baacb57a8c5ea4085e",
+          "claim": "manager 消費 Delta 時用完整快照更新裝置；失敗回 ack=false，Tick 另服務 WAL。"
+        }
+      ],
+      "note": "manager 依 snapshot 重算差異，不直接逐筆採用事件的 added／removed。更新呼叫返回後才 ack；consumer panic 保留差異供下輪重送。ack 表示快照消費成功，不表示非同步 attach 已完成。"
+    },
+    {
+      "id": "device-detach",
+      "from": "manager",
+      "to": "session",
+      "label": "通知缺席與舊路徑移除",
+      "phase": "熱插拔與 session 對應",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2410,
+          "end_line": 2436,
+          "excerpt_sha256": "aa659c7743887da3b08508c1b3a27d0ac1b6ffbf90f18a8255b57ab68fdeede9",
+          "claim": "更新快照時 stopping 直接返回；正常路徑替換裝置表並撤銷舊路徑送達義務。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2453,
+          "end_line": 2473,
+          "excerpt_sha256": "44249dfce163085a8a77eb3b8abb38573539902bb1750d07a98b7fe41e90c7db",
+          "claim": "離線或改指的在途 attach 作業被取消。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2491,
+          "end_line": 2494,
+          "excerpt_sha256": "0a8f3fe925268ee51fa4b59f25e6edb8c60c7c9bbf6d1e76329d9dc352a0a2c2",
+          "claim": "離線 by_id 的 pending COM 被釋出。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2518,
+          "end_line": 2532,
+          "excerpt_sha256": "acca2da2ba641e20e992ace09515107943e30b9ab92d3ea5ad29e88daccb01c8",
+          "claim": "缺席的已綁定裝置先送 DeviceMissing。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2548,
+          "end_line": 2556,
+          "excerpt_sha256": "c493774175230718035ea4d5a08ce1d7415dadebff3af259cb14320785b6f871",
+          "claim": "先對 removed 與 changed detach，再對 added 與 changed 排程 attach。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2563,
+          "end_line": 2580,
+          "excerpt_sha256": "9353f4f41c5ac909259cf45dabf511e270a40ecddf33ab80ff0c175c19197980",
+          "claim": "detach_by_id 取消／收尾 custody，並向 actor 送 DeviceDetached 及原因。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 2684,
+          "end_line": 2699,
+          "excerpt_sha256": "7974b8cdceba63c7ee628a0ef8afb3c57e5e8fe637137a5b64985f56793f8cb3",
+          "claim": "actor 比對 by_id 與狀態，設定拔除／改指錯誤，再開始停止。"
+        }
+      ],
+      "condition": "輪詢發現裝置離線，或同一 by_id 改指不同 real_path。",
+      "note": "一般拔除保留 session 與邏輯 COM 供重插或空槽改綁；不是把每個離線 session 從索引刪除。停止／排空仍非同步，下一步排程重接不代表可立即再開同一 handle。"
+    },
+    {
+      "id": "device-session",
+      "from": "manager",
+      "to": "session",
+      "label": "沿用、改綁或建立 session",
+      "phase": "熱插拔與 session 對應",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2548,
+          "end_line": 2556,
+          "excerpt_sha256": "c493774175230718035ea4d5a08ce1d7415dadebff3af259cb14320785b6f871",
+          "claim": "added／changed 在舊路徑 detach 後排程 spawn_attach。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2752,
+          "end_line": 2771,
+          "excerpt_sha256": "18070202e041ad09a0f6cc20bf64ef7214a9d07b2fa53a40c6721c178ffa8db1",
+          "claim": "既有 session 不需再解析 profile 時，manager 直接送 DeviceAttached。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2896,
+          "end_line": 2919,
+          "excerpt_sha256": "5f2cfc2ced3a7b028d7b21c95227aba4701bca3a064833a74f89a87f13d77fba",
+          "claim": "無既有對應時，取離線且 DETACHED 的最小 act_no session 改綁。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2934,
+          "end_line": 2947,
+          "excerpt_sha256": "92670c182e5cd1b24964ea189df4d37d787b714819ba9020a9189ed12ada6cfc",
+          "claim": "無空槽走動態 attach；空槽改綁以 Bind 請求交 actor。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 3369,
+          "end_line": 3388,
+          "excerpt_sha256": "40757a7a972157285f2773518cc22ca9471f314a9f81ec49547f9062af213d01",
+          "claim": "動態 profile 選擇先 pin，再 sticky detected。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 3444,
+          "end_line": 3457,
+          "excerpt_sha256": "503e6069e9ec8ceee9edfb805b4f90ad9fb2f7ad14a0712a8a87e0c8a19b7c44",
+          "claim": "其後以 UART probe 偵測，最後退到預設 passthrough；無模板就關閉。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2356,
+          "end_line": 2375,
+          "excerpt_sha256": "1b3784371459dc158b311b946d9e3dd23f77f4e8026d7c072280e3cd25551735",
+          "claim": "新動態 session 優先消費 pending COM，否則取空號，並建立預設 alias 列。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 3479,
+          "end_line": 3507,
+          "excerpt_sha256": "c0ed54227082a97a64c7533dd249e48563082b78fb236ee624256ef5eef1461b",
+          "claim": "動態建立 actor 並交預開 handle；未出生接管時送 DeviceAttached。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2612,
+          "end_line": 2629,
+          "excerpt_sha256": "38de01cdacdcb5163a0e0549762f4f7171a9cc8ba5b30cef08e465354925c985",
+          "claim": "未確認關閉或 custody 仍阻擋開埠時，Rust 不再排程接入。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2640,
+          "end_line": 2664,
+          "excerpt_sha256": "41b33f54c164c9491edc0f528adfc379277eeb1ba6d748b6ee97f98c7b567cf0",
+          "claim": "RELEASED 佔位或持久化 released 的 by_id 阻止自動 attach。"
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 4045,
+          "end_line": 4063,
+          "excerpt_sha256": "1a536667a51f1a7c7378251b5d54d986237cd5a3721b843aa4d6400e4c74d274",
+          "claim": "Python 先移出未消費的預開作業，再於鎖外呼叫 finish_attach_op。"
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 4079,
+          "end_line": 4082,
+          "excerpt_sha256": "414ec6b9a87f6ef87514d669fd32c18b20ac2d515af7279ce08919cba4813b52",
+          "claim": "Python 隨後對新增／改指裝置直接呼叫 spawn_attach。"
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 4320,
+          "end_line": 4332,
+          "excerpt_sha256": "076bfede65d807b56f0af95ed1becf8f3eaad3276efef3758469f5712bedf4f3",
+          "claim": "Python 未消費 handle close 失敗時回 False，update_devices 呼叫處未檢查回傳值。"
+        }
+      ],
+      "condition": "新增、重插或改指裝置；啟動快照也走這套接入邏輯，且通過 stopping／released／在途／關閉閘門。",
+      "note": "pin → sticky → UART prompt／login 偵測 → passthrough fallback；這不是依 USB VID／PID 選 profile。新建才消費預配 COM；執行期可沿用 DETACHED 空槽，不重新排序全部 session。Python 0.4.x 對照僅限未消費預開 handle 的 update_devices 收尾：Python 呼叫 _finish_attach_op 後仍續排 attach；Rust 在 custody 未確認關閉前阻擋重開。worker 建立／送 DeviceAttached 可與 watcher 的 ack 交錯。"
+    },
+    {
+      "id": "auto-open-effect",
+      "from": "session",
+      "to": "manager",
+      "label": "提出接入開埠效果",
+      "phase": "接入與正式 bridge",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3999,
+          "end_line": 4015,
+          "excerpt_sha256": "58a84a561255a4f43a5507d0db8b2920d2769c9e3d9e40240e3b84b49d765674",
+          "claim": "actor 只接受當前綁定且允許接入狀態的 DeviceAttached。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 4026,
+          "end_line": 4040,
+          "excerpt_sha256": "86d402eee0b236d82c671dd14c564eeefce7660182c0065fddf41ebd1564720e",
+          "claim": "已有 custody 就認領同一 handle；舊 bridge 未關閉則延後重開。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 4042,
+          "end_line": 4050,
+          "excerpt_sha256": "09d5dc2ffd328df48f8c7f510008cba1cea51cc2260327edfcfa8e2e7dc13217",
+          "claim": "一般路徑產生 OpenBridge，轉 ATTACHING。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6072,
+          "end_line": 6085,
+          "excerpt_sha256": "73b9d676144a969b9fa208f96619dc2b01316b5af1b87b7710d5fc923e61df1b",
+          "claim": "executor 將 OpenBridge／ClaimCustody 分派給開埠工作者。"
+        }
+      ],
+      "condition": "接入事件已可套用；舊 handle 已確認關閉，或可認領同一預開 handle。",
+      "note": "RELEASED 不因熱插自動離開；本頁的 manager 含 ManagerExec，actor 只提出效果。已存在的預開 handle 應沿用，不為正式 bridge 另開第二個 UART。"
+    },
+    {
+      "id": "open-bridge",
+      "from": "manager",
+      "to": "bridge",
+      "label": "建立正式 UART bridge",
+      "phase": "接入與正式 bridge",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5058,
+          "end_line": 5073,
+          "excerpt_sha256": "81081628784de56770e5d5f6faccabf9e386db30d3bb17b07e5830044a342d5b",
+          "claim": "相同路徑的預開 handle 套用正式串口設定後沿用。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5088,
+          "end_line": 5100,
+          "excerpt_sha256": "a6e82f4df358f0c78aff378d9750a04adef7bee563ec40dd240f8d922b0c691c",
+          "claim": "需要新開時可先探測 holder，再呼叫 serial.open_exclusive。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5183,
+          "end_line": 5199,
+          "excerpt_sha256": "f319accb338a0fdd35c31e4a6881b17b05e1b14dfee38c69e1ab3c860d631bed",
+          "claim": "開埠 worker 以 handle 建立 IoWorker。"
+        },
+        {
+          "path": "crates/sw-pal/src/serial/posix.rs",
+          "line": 341,
+          "end_line": 357,
+          "excerpt_sha256": "5aa4b1b4a3ae85c56f05a278a0665ecc36aa21263cf20db39add4ffb20b519a1",
+          "claim": "Linux 開埠依序取得 flock 與 TIOCEXCL。"
+        },
+        {
+          "path": "crates/sw-pal/src/serial/posix.rs",
+          "line": 364,
+          "end_line": 375,
+          "excerpt_sha256": "968086eafd3d05aa1a521b75230830a2f782b81d78e908589490a7312379a1e4",
+          "claim": "Linux 獨佔後重掃 holder，拒絕衝突或告警未確認狀態。"
+        },
+        {
+          "path": "crates/sw-pal/src/serial/windows.rs",
+          "line": 72,
+          "end_line": 79,
+          "excerpt_sha256": "6610c12cd3105919f7d079789e64a27e97231baf37e27d0c21504633c63faee4",
+          "claim": "Windows CreateFile 參數指定 share_mode=0。"
+        },
+        {
+          "path": "crates/sw-pal/src/serial/windows.rs",
+          "line": 123,
+          "end_line": 148,
+          "excerpt_sha256": "c578c230655522e622b6cb0b9a053fa4dcad05251743c7348d6d4a6bf23256d9",
+          "claim": "Windows 用 CreateFileW 開裝置，AccessDenied 帶未知 holder 報告。"
+        }
+      ],
+      "note": "通過實際執行時的 stopping／取消／路徑／custody 重驗後才建立。Linux｜Windows：tty 的 flock＋TIOCEXCL，獨佔後重掃 holder｜COM 的 CreateFileW share_mode=0。Linux 的 holder 不可確認情況可能告警後接受，不能把「開埠成功」概括為已證明沒有任何外部 holder。"
+    },
+    {
+      "id": "bridge-opened",
+      "from": "manager",
+      "to": "session",
+      "label": "回報 BridgeOpened",
+      "phase": "接入與正式 bridge",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5479,
+          "end_line": 5486,
+          "excerpt_sha256": "87ca6441b6fdcf82790d2723ca19260c943c19a056d5d18e665fa9a11357d407",
+          "claim": "開埠 worker 將結果送回 actor；actor 已退出時轉交回收。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 4187,
+          "end_line": 4203,
+          "excerpt_sha256": "32c6e6b153adcc8b833f082b8d5ccacc24746a7b533c1b55b3c1996a27622871",
+          "claim": "無待處理 device.attach 時直接 adopt bridge；有待處理 attach 則先要求 Unreleased 落盤。"
+        }
+      ],
+      "note": "actor 驗證目前狀態與世代後才接手；登入／ready probe 屬生命週期頁。本頁後段的顯式 device.attach 會在接手前走 Unreleased 提交。"
+    },
+    {
+      "id": "config-request",
+      "from": "cli",
+      "to": "daemon",
+      "label": "送出綁定或命名設定",
+      "phase": "條件：設定變更",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 45,
+          "end_line": 59,
+          "excerpt_sha256": "0262151c20d5b3f54c4507594560c66901fa951adca013164ba81e0a60262424",
+          "claim": "CLI 將 bind／pin／unpin 參數送往 session RPC。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 125,
+          "end_line": 140,
+          "excerpt_sha256": "98d22701313b66f4c022d1a36dae13ed29be89b272a2119c68104ca72c58f6b3",
+          "claim": "CLI 將 alias 參數送往 alias RPC。"
+        }
+      ],
+      "condition": "操作者要求 session.bind、alias.* 或 session.pin／unpin；不是熱插的必然後續。",
+      "note": "三類設定為替代分支：bind 改裝置綁定，alias 命名，pin 固定動態裝置下次解析的 profile。"
+    },
+    {
+      "id": "config-dispatch",
+      "from": "daemon",
+      "to": "manager",
+      "label": "分派設定操作",
+      "phase": "條件：設定變更",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 972,
+          "end_line": 994,
+          "excerpt_sha256": "d5ab0841c6244f0fbab8921a6c4e8a6f803b2f31c9603834ea70f5f47154e5ae",
+          "claim": "Service 驗證 bind／pin／unpin 必要參數後呼叫 manager。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1112,
+          "end_line": 1130,
+          "excerpt_sha256": "433656a36b3c9495a793c39017c40a6d2604f38706d559c78e886aa839edbb4a",
+          "claim": "Service 分派 alias list／set／assign／unassign。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7532,
+          "end_line": 7555,
+          "excerpt_sha256": "0b4ed911e67c991930c337eea2b7ab3ab972e509ae42ef3baf7dfabff56e2b25",
+          "claim": "pin 驗證模板與裝置 key，拒絕 explicit target，提交 Pin delta。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7558,
+          "end_line": 7577,
+          "excerpt_sha256": "5ba04aae773bcf9c89e830186001a4494fa25bafe5fc5e2461bf856ab50e0ac7",
+          "claim": "unpin 刪除相同裝置 key 的 pin，亦拒絕 explicit target。"
+        }
+      ],
+      "condition": "設定 RPC 通過參數驗證。",
+      "note": "pin／unpin 只保存裝置 key 的 profile 選擇，不立即開埠或改變目前 session profile；下次動態接入／再解析才使用。"
+    },
+    {
+      "id": "config-actor",
+      "from": "manager",
+      "to": "session",
+      "label": "改綁或同步目前 alias",
+      "phase": "條件：設定變更",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7301,
+          "end_line": 7318,
+          "excerpt_sha256": "567bf4554a3050888b3b454e918e280b274cbec2e8b06601475d92588a9dafcc",
+          "claim": "bind 經 actor request 送 BindWithAck 或 Bind。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7183,
+          "end_line": 7208,
+          "excerpt_sha256": "38e4035ac8b5f178c7ca663a987b632bde1ef2ab91ee1a484fad32a102e8f6c6",
+          "claim": "RELEASED 佔位的 bind 在持久化前直接回 released 與 device_attach 指引。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7213,
+          "end_line": 7221,
+          "excerpt_sha256": "823d0e9c2870e8ffa39ef2586729eadd5bf61ec03b52cc7aded2c0208eb5be44",
+          "claim": "FLASHING 或 flash 臨界區禁止 rebind。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7602,
+          "end_line": 7628,
+          "excerpt_sha256": "28728160f81a19fc198d74c80529d0921448768a4e712104f9c581f44689cd63",
+          "claim": "alias.set 先更新 manager profile，再送 SetAlias 等 actor 確認。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7659,
+          "end_line": 7668,
+          "excerpt_sha256": "1f9ad40a4ebbd11d0147fac0315473d1e9a3d22d8606787df3e8b0c5a1d34a0f",
+          "claim": "alias.assign 只建立 device_by_id 列並持久化，不送 actor 即時改名。"
+        }
+      ],
+      "condition": "session.bind 或 alias.set；pin／unpin、alias.assign／unassign 不走此 actor 步驟。",
+      "note": "bind 會處理舊開埠／bridge 排空與衝突；RELEASED 佔位不允許以 bind 繞過 device.attach。alias.set 即時同步目前 session；alias.assign 保存裝置列，不等於立即改名。"
+    },
+    {
+      "id": "bind-persist-effect",
+      "from": "session",
+      "to": "manager",
+      "label": "發布綁定並要求保存",
+      "phase": "條件：設定變更",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3934,
+          "end_line": 3947,
+          "excerpt_sha256": "03d8c6298a5854aa49e7ff9b479357eee1178cdc2255bc676a6f0b9fe22117f4",
+          "claim": "bind 套用目標後清 release 來源資訊，先成 DETACHED 並發布綁定。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3957,
+          "end_line": 3972,
+          "excerpt_sha256": "a55b56cd6d3bc77fe64ae7ef0fd975d0de6b15dea634fc107c300a11c8dead2d",
+          "claim": "bind 等待持久化，送出 Bind delta 與 commit_id。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6231,
+          "end_line": 6249,
+          "excerpt_sha256": "f11df580ac4e890e3e2ec9bb594b6694b9119a330419bf62cd5522e4d1f6b09a",
+          "claim": "executor 按 actor 順序套入 delta，worker 提交當下快照。"
+        }
+      ],
+      "condition": "需要改綁並持久化的 bind，且舊資源停止條件已滿足；alias／pin 不產生此效果。",
+      "note": "Bind delta 同時移除該 sid 的 released 並寫入新 binding。alias.set 的 actor 確認後，由 manager 直接產生 AliasSet 提交。"
+    },
+    {
+      "id": "config-save",
+      "from": "manager",
+      "to": "state",
+      "label": "提交綁定、alias 或 pin",
+      "phase": "條件：設定變更",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2004,
+          "end_line": 2015,
+          "excerpt_sha256": "76d5f4f385ed6140157be9f395aa7ab8e022d5b574db1cbbb8c52a965adec42a",
+          "claim": "manager 在 model 鎖內排入快照，等待 StateStore 回傳結果。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7547,
+          "end_line": 7554,
+          "excerpt_sha256": "887cc8df565b499830b4a16053d47255bc383c5b36890581b2b9ac5704dce243",
+          "claim": "pin 以同步 commit 保存 Pin delta。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7570,
+          "end_line": 7576,
+          "excerpt_sha256": "81d8936cbd6c503db3bbbc6ed344af727d65aeca80c71436dd72b7807b38cb1a",
+          "claim": "unpin 提交 profile=None。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7640,
+          "end_line": 7650,
+          "excerpt_sha256": "a69e1412dcc6ca43d89bc1829c5fb9302d4f9a096788ef89d71d270b45d5438d",
+          "claim": "alias.set 在重驗相同 session 仍存活後同步提交 AliasSet。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7659,
+          "end_line": 7682,
+          "excerpt_sha256": "0fe247737274c1f08bd4da09721673eacaefe43df999e13566a5cfff6fe01539",
+          "claim": "alias.assign／unassign 也透過同步 commit 更新 alias 列。"
+        },
+        {
+          "path": "crates/sw-core/src/state_store.rs",
+          "line": 641,
+          "end_line": 666,
+          "excerpt_sha256": "a4b825b558d11c4f3d51435127ac40ebe2901c0f1f3989e5f773db0162ff9845",
+          "claim": "Bind 清 released 並改 binding；Pin、AliasSet 分別新增或移除對應列。"
+        },
+        {
+          "path": "crates/sw-core/src/state_store.rs",
+          "line": 750,
+          "end_line": 764,
+          "excerpt_sha256": "5dd372026e4b8c07d4b4609fe92c2d91110a72ab280a42044addb158aac7e31c",
+          "claim": "狀態寫入者序列化快照、寫檔後回報結果。"
+        },
+        {
+          "path": "crates/sw-core/src/state_store.rs",
+          "line": 713,
+          "end_line": 724,
+          "excerpt_sha256": "8742f8845b3e6e566dfdae17df69cdb7621d59a4925ca943c51dc21ef40f0745",
+          "claim": "設定提交亦走 StateStore 的 atomic_write，父目錄不存在時建立後重試。"
+        }
+      ],
+      "condition": "設定確實改動狀態；alias.list 只有讀取，不落盤。",
+      "note": "alias.set 保存 session_id，alias.assign 保存 device_by_id 與選填 profile；不能把兩者視為同一種重啟命名保證。StateStore 單一寫入者以原子寫檔提交 state.json。"
+    },
+    {
+      "id": "config-committed",
+      "from": "manager",
+      "to": "session",
+      "label": "回報綁定提交結果",
+      "phase": "條件：設定變更",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6244,
+          "end_line": 6249,
+          "excerpt_sha256": "db3975d0b35559a7461f23505107771a341a5ec2ede773a22f863c8f0d6c4579",
+          "claim": "bind persist worker 送 StateCommitted 給 actor。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 2484,
+          "end_line": 2506,
+          "excerpt_sha256": "0f11dc18765ec14722f514cb515091a3a88b75d2f9266968b9e9c86fec5d3da8",
+          "claim": "actor 依 bind 提交結果回覆成功 session 或例外。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7383,
+          "end_line": 7397,
+          "excerpt_sha256": "4eda6670438dbe2aed7fc4c7039604fc83d5f40e9f829f5f281c59e4c24d66cf",
+          "claim": "bind 目標在線時，manager 隨後送 DeviceOnline 並等待套用活 session。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7406,
+          "end_line": 7413,
+          "excerpt_sha256": "2ccd5966bc4efd66725cc3cba284101ce732358446a1e28e292427809303e4e1",
+          "claim": "DeviceOnline 未確認時，重驗後登記送達義務重試。"
+        }
+      ],
+      "condition": "bind 的狀態提交返回；alias／pin 為 manager 同步返回，不發此 StateCommitted。",
+      "note": "在線目標續送 DeviceOnline 進 ATTACHING；離線則保留 DETACHED。回覆或送達逾時不表示可跳過世代與路徑檢查。"
+    },
+    {
+      "id": "custody-request",
+      "from": "cli",
+      "to": "daemon",
+      "label": "送出裝置釋放或接回",
+      "phase": "條件：外部交接請求",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 28,
+          "end_line": 42,
+          "excerpt_sha256": "87641ab87e6737ad09b23d317662d47d61d0399fe81d959da948449dc2cb41f0",
+          "claim": "CLI 將 device release 與 device attach 映射成 RPC，帶 selector、source／reason 或 force。"
+        }
+      ],
+      "condition": "操作者要把 UART 交給外部工具，或外部工具用完要求接回。",
+      "note": "以下 release 與 attach 是兩種替代請求的分支；實際交接通常先 release，外部工具關閉裝置後另送 device.attach。"
+    },
+    {
+      "id": "custody-dispatch",
+      "from": "daemon",
+      "to": "manager",
+      "label": "解析 selector 並路由交接",
+      "phase": "條件：外部交接請求",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 880,
+          "end_line": 908,
+          "excerpt_sha256": "1a00c2f311a3cd6880469acc2f718d4d569c836e0bc4d89864f0fbe44d18cb85",
+          "claim": "Service 驗證 selector 與 source，轉成 Release 或 DeviceAttach 請求。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 777,
+          "end_line": 789,
+          "excerpt_sha256": "545b5280245b7045798edfa8667c21b28cb098d3d6d78bef409c2f661319e8ba",
+          "claim": "Service 解析 selector，再呼叫 manager.route_with_selector；查無回 SESSION_NOT_FOUND。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 668,
+          "end_line": 674,
+          "excerpt_sha256": "115a2035492ba83c403df42da12e6a358cb7a4ea3a98e1ebdffa583e971f6028",
+          "claim": "selector 可為 session_id、邏輯 COM 或目前 profile alias。"
+        }
+      ],
+      "condition": "device.release 或 device.attach 的參數通過驗證。",
+      "note": "device.attach 的 force 為 RPC truthiness；force 影響 holder 預檢，不是解除 OS 獨佔或忽略未確認關閉的授權。"
+    },
+    {
+      "id": "custody-route",
+      "from": "manager",
+      "to": "session",
+      "label": "由 actor 序列化交接",
+      "phase": "條件：外部交接請求",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6930,
+          "end_line": 6947,
+          "excerpt_sha256": "b7cdd126cd94b0b5351618973edaad57b33429840e9d75d8b4d244113acbfd89",
+          "claim": "DeviceAttach 以目前裝置快照包成 DeviceAttachRouted 再分派。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6965,
+          "end_line": 6984,
+          "excerpt_sha256": "fca92e292bfd358a2bbc92af2d948ca2db2ed4eb2a7a26c3f6df44322e3c6986",
+          "claim": "release 一律交 actor，成功後取消尚未送達的 DeviceAttached 義務。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3016,
+          "end_line": 3023,
+          "excerpt_sha256": "8787a3bf6ec087a44e857240d8d3c6900ad886f1613c5b8e3a31c5aefaf27cf0",
+          "claim": "actor 先要求 by_id 的 release 認領，否則進 release_request_inner。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3531,
+          "end_line": 3534,
+          "excerpt_sha256": "c74a4ffa5fdc11b18cd4faa43b237d543f32aec5b275bf05de23ea833e286c44",
+          "claim": "device.attach 在一般接入前拒絕未確認關閉。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3574,
+          "end_line": 3580,
+          "excerpt_sha256": "f90dc6436425902ebd6494c5d028c7ff82748b412efaaf3640ef9bc63e599bb7",
+          "claim": "排空、RECOVERING、bind 或 release 提交中皆拒絕 attach。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3663,
+          "end_line": 3675,
+          "excerpt_sha256": "460095d3f2206b9627ac53f6f4c55c7ea657ccbf482d21eaeac67b304b6ff0c1",
+          "claim": "已有 bridge 的 device.attach 可回 attach 進行中或 already_attached。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7040,
+          "end_line": 7056,
+          "excerpt_sha256": "7f5133b2d27e510b26dd32225c70484f99d282b410ed3ec7def54ee619d129e7",
+          "claim": "manager 對 release 送 ReleaseWithAck，其餘請求以 shared.request 交 actor。"
+        }
+      ],
+      "condition": "selector 解析到目前存在的 session。",
+      "note": "不是直接開／關 tty：actor 負責 release 的首次期限、在途取消與遲到收斂。未確認關閉或停止／落盤中回 SESSION_RECOVERING；既有 bridge 可冪等回 already_attached。"
+    },
+    {
+      "id": "release-drain-effect",
+      "from": "session",
+      "to": "manager",
+      "label": "凍結並要求釋放資源",
+      "phase": "條件：釋放分支",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 2999,
+          "end_line": 3019,
+          "excerpt_sha256": "c714c01177802c67f1092241552b314b99794adf16a93cfda1567ff4e05bbe72",
+          "claim": "首次 release 先以 ClaimByIdForRelease 認領 by_id 在途與 custody 紀錄。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 2244,
+          "end_line": 2268,
+          "excerpt_sha256": "331e96f3830a88c3b7e70835199f41da3be1397c9567268b1618296d9a787b52",
+          "claim": "actor 凍結 fence、取消傳輸、清命令與 lease 並轉 RECOVERING。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 2269,
+          "end_line": 2274,
+          "excerpt_sha256": "48cca8c083035ff67ee43ee6fe2eabaf61795f057e86f2fc1ee978ace36ba9cb",
+          "claim": "actor 產生 BeginDrain 與配對的 DrainTimeout 計時。"
+        },
+        {
+          "path": "crates/sw-core/src/custody.rs",
+          "line": 722,
+          "end_line": 737,
+          "excerpt_sha256": "9913ee0004c473d8cb80cfbd9297aca42f1d50e8ad0e3ae476b48f8e455612c6",
+          "claim": "held handle 以 token 認領、轉 Closing，由回收方持有。"
+        },
+        {
+          "path": "crates/sw-core/src/custody.rs",
+          "line": 815,
+          "end_line": 826,
+          "excerpt_sha256": "eec08552bc25963634d6f753c6e57d52a4ef164e3aff64ce6ca0751a4fd6d0ef",
+          "claim": "帳本沿用首次 release deadline；沒有記錄時建立 3000 ms 期限。"
+        }
+      ],
+      "condition": "device.release 需停止目前 bridge 或在途開埠／預開 handle；已 RELEASED 的冪等路徑可省略 I/O。",
+      "note": "停止期間禁止新 TX。持有中的 custody 由 manager／回收者取消或認領關閉，actor 等其終態；不能只看 handle 已不在某個表中就宣稱釋放。"
+    },
+    {
+      "id": "release-stop",
+      "from": "manager",
+      "to": "bridge",
+      "label": "停止並非同步關閉 UART",
+      "phase": "條件：釋放分支",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6173,
+          "end_line": 6191,
+          "excerpt_sha256": "173da180f9e85bd1a6fc54ca8be57826b789a09324bd382707ff6c3b8b54c3e9",
+          "claim": "executor 移除 runner／pump、取得 worker 並 finish_async，另收尾 custody。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 829,
+          "end_line": 834,
+          "excerpt_sha256": "15cf0af6c682f887b3a9102a63d2161a353b9c56dd0daf99c85e9a55dbaac0af",
+          "claim": "IoWorker 停 reader、writer 並取消 I/O。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 844,
+          "end_line": 864,
+          "excerpt_sha256": "9190e2274c7fd2f4b12508b794f5b039eae032860ba1d66cead1f3dac93b05a0",
+          "claim": "finish_async 的 drain thread join reader／writer。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 865,
+          "end_line": 877,
+          "excerpt_sha256": "881fe9de1b2c95e6bd22dd6735cbf2879fd0db9d6d1b10f490488c7a414a8d91",
+          "claim": "join 成功後關閉 handle。"
+        }
+      ],
+      "condition": "release 的 BeginDrain 對應到正式 IoWorker；預開 handle 另由 custody closer 收尾。",
+      "note": "finish_async 是啟動關閉工作，不是已完成釋放；完成須等下一步回條與全部 custody／retired drain 收斂。"
+    },
+    {
+      "id": "release-receipt",
+      "from": "bridge",
+      "to": "session",
+      "label": "送回關閉回條與證據",
+      "phase": "條件：釋放分支",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 905,
+          "end_line": 934,
+          "excerpt_sha256": "cf78928cd794d7d8e1563b5f18ce2e942505453da6626bee53b62cdd61c686d7",
+          "claim": "finisher 等 RX dispatch，回送含 WAL 狀態、ledger、handle_closed 與 close_error 的 WorkerStopped。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 6548,
+          "end_line": 6565,
+          "excerpt_sha256": "742e23c2f398918a2d4268dcb0e69cd3bba54625e1858297328800e2c7a6cc90",
+          "claim": "actor 以 stop_id 與 epoch 配對，非目前停止則交 retired drain 收尾。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 6568,
+          "end_line": 6589,
+          "excerpt_sha256": "c1f40318ebf8874c8693d16271cca43b41c8e8a9e66787ce4070e2732723cf15",
+          "claim": "handle_closed=false 登記未確認關閉，有其他 retired drain 時保留至期限收斂。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 6592,
+          "end_line": 6613,
+          "excerpt_sha256": "905b8d0901b49813543100225b68cdb36dfc0e999a2890108d4c986e99d52b5e",
+          "claim": "不安全回條標 stalled，release waiter 可收到 DRAIN_STALLED 形狀。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 6658,
+          "end_line": 6687,
+          "excerpt_sha256": "591863640aeba017fc96e1b2de12a91642774ac7c88992fcb413f08073b2f534",
+          "claim": "自身 bridge 關閉後若仍有 retired drain，release 繼續等待，不提前完成。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 6708,
+          "end_line": 6717,
+          "excerpt_sha256": "217d6fabc5d3c0263a87d1d4fb364301802af7228e1d296828b9b56a2e8ce494",
+          "claim": "首次 release 收斂後 finish_release，再 persist_release。"
+        }
+      ],
+      "condition": "release 的正式 worker 關閉工作送回配對回條；沒有正式 bridge 時改等 custody 終態。",
+      "note": "只有自身與其他待關閉資源全部確認後才完成 RELEASED。未確認關閉保留阻擋，回 DRAIN_STALLED 或等待首次期限；不以逾時當作 handle 已關閉。"
+    },
+    {
+      "id": "reclaim-open-effect",
+      "from": "session",
+      "to": "manager",
+      "label": "檢查在線並要求接回",
+      "phase": "條件：接回分支",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3678,
+          "end_line": 3692,
+          "excerpt_sha256": "e1d10329786e5c61daa6d78064134a62edaa5edad558d3379d38feee3e093a53",
+          "claim": "無 bridge 的 device.attach 拒絕 release 落盤中或裝置不在快照。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3694,
+          "end_line": 3723,
+          "excerpt_sha256": "d740e7e28d53ad9e95e3715d3b2c3d9f6d6b6fa35a6bf2f78be60d9bc7d99d71",
+          "claim": "actor 保存本次接回的實體路徑、世代、回覆與佔位資訊。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3724,
+          "end_line": 3726,
+          "excerpt_sha256": "9ebc3a0a8432d4a8fc07bff3c8ebb95db6d957e9286e71ec465e708127a06fe8",
+          "claim": "OD-63 佔位先要求 PrepareHandoffWorker，不立即 OpenBridge。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3728,
+          "end_line": 3732,
+          "excerpt_sha256": "9852a819885d19fb5621f63bb49c15f287941aae960645207a44142c068bbeb4",
+          "claim": "一般接回產生 OpenBridge，precheck_holders 為 !force。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3547,
+          "end_line": 3556,
+          "excerpt_sha256": "032e89ac9ca75692dfdbf7fca2ffcfdaa5fb717441a5ebea125b1299b180b724",
+          "claim": "session.attach 遇 RELEASED 只回 device_attach 指引，不能代替 device.attach。"
+        }
+      ],
+      "condition": "device.attach 的一般 session，裝置在線、無 bridge，且無未確認關閉／排空／提交衝突。",
+      "note": "force 只略過 holder 預檢，仍受 OS 開埠與 custody gate 約束。session.attach 不解除 RELEASED。OD-63 佔位另先準備交接 worker，再開 raw handle、退休舊佔位，不能套用一般接回的 Unreleased＋adopt 路徑。"
+    },
+    {
+      "id": "reclaim-open",
+      "from": "manager",
+      "to": "bridge",
+      "label": "依獨佔規則開埠",
+      "phase": "條件：接回分支",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6072,
+          "end_line": 6083,
+          "excerpt_sha256": "3a95dda519617ed88f1ecc51724768e6f226ca2bf0958710189cd78dba7025cd",
+          "claim": "executor 將一般 OpenBridge 效果交給 open worker。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5039,
+          "end_line": 5053,
+          "excerpt_sha256": "db2a2321c1688f4b71133b1a948208c284285566dc94a042a8003274e2d797f3",
+          "claim": "實際開埠時重查未確認關閉，必要時拒絕並結算。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5088,
+          "end_line": 5108,
+          "excerpt_sha256": "fc0400ac5730aa1052e6217119911cfffd004789212c664d6b6f707f7c7d9055",
+          "claim": "非 force 時先查 holder；新開仍使用 open_exclusive。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5183,
+          "end_line": 5199,
+          "excerpt_sha256": "f319accb338a0fdd35c31e4a6881b17b05e1b14dfee38c69e1ab3c860d631bed",
+          "claim": "通過閘門後建立正式 IoWorker。"
+        }
+      ],
+      "condition": "一般 device.attach 的開埠效果通過執行時重驗。",
+      "note": "沿用 open-bridge 步驟列出的兩平台獨佔機制。即使 force=true，也沒有強制終止外部工具或解除它持有的 handle。"
+    },
+    {
+      "id": "reclaim-opened",
+      "from": "manager",
+      "to": "session",
+      "label": "回報開埠並等待接手",
+      "phase": "條件：接回分支",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5479,
+          "end_line": 5486,
+          "excerpt_sha256": "87ca6441b6fdcf82790d2723ca19260c943c19a056d5d18e665fa9a11357d407",
+          "claim": "開埠 worker 回 BridgeOpened，actor 已退出則轉回收。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 4187,
+          "end_line": 4203,
+          "excerpt_sha256": "32c6e6b153adcc8b833f082b8d5ccacc24746a7b533c1b55b3c1996a27622871",
+          "claim": "待處理 attach 開埠成功後先建立 PendingCommit::Attach 與 Unreleased Persist，未立刻 adopt。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 3305,
+          "end_line": 3323,
+          "excerpt_sha256": "d0f42b6e7c789a0350b2825084e8a21b7a13c20c9ef6221f8e9edd7262ca8bb8",
+          "claim": "OD-63 佔位退休會移除舊 entry，並把原 COM 放回該 by_id 的 pending_com。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 3326,
+          "end_line": 3328,
+          "excerpt_sha256": "a2e8e201ef330115baf4cfa7e26b9f43a5c664d9970a1fb9bce091005b8b1fdc",
+          "claim": "佔位退休清除舊 released／binding／aliases，保留 pin／detected。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5752,
+          "end_line": 5773,
+          "excerpt_sha256": "b2bb4b6d9d2ad90ecaf8178b05b9abf57b20a91220e344a8b471c489ad226f10",
+          "claim": "佔位退休把 handle 紀錄交給 worker，保存退休狀態成功後才放行 worker。"
+        }
+      ],
+      "condition": "一般 device.attach 開埠成功且世代／路徑仍有效；失敗不進後續成功提交。",
+      "note": "一般接回在 Unreleased 落盤前尚未正式接手。佔位退休的移除是特例：保留原 COM 給後續接入，與普通拔除保留 session 不同；完整退休取消／重試協定不在本頁展開。"
+    },
+    {
+      "id": "custody-persist-effect",
+      "from": "session",
+      "to": "manager",
+      "label": "要求保存交接狀態",
+      "phase": "交接落盤與回覆",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 6915,
+          "end_line": 6932,
+          "excerpt_sha256": "984f562e7714ed2291aad410924193502073899582a38b025dca10cc8ae09763",
+          "claim": "首次 release 保存來源、時間、reason 與 RELEASED 狀態。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 2433,
+          "end_line": 2452,
+          "excerpt_sha256": "e430c431bf0764ca1d4fa9a91af49d0b552348a94b88769303253e1cac338706",
+          "claim": "release 把當前欄位包為 ReleasedRow 並產生 Persist。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 4187,
+          "end_line": 4201,
+          "excerpt_sha256": "90bccf41cab2f5267877c0c405085dabe5200eb527edff30ce8549a0925bdd2e",
+          "claim": "一般 attach 開埠成功後產生 Unreleased delta。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6231,
+          "end_line": 6239,
+          "excerpt_sha256": "7676242f7f4489ea295d746f2f390af88ad680e49fd374c5a650c5147e07198d",
+          "claim": "executor 先按 actor 順序套入 delta，再啟動提交工作。"
+        }
+      ],
+      "condition": "release 已確認資源安全關閉，或一般 device.attach 已成功開埠；兩者為替代收尾路徑。",
+      "note": "release 寫 released 列；attach 移除同一 sid 的 released 列。圖上接回分支後的位置是共用收尾：release 不必等到另一次 attach 才保存。"
+    },
+    {
+      "id": "custody-save",
+      "from": "manager",
+      "to": "state",
+      "label": "原子提交交接快照",
+      "phase": "交接落盤與回覆",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2004,
+          "end_line": 2015,
+          "excerpt_sha256": "76d5f4f385ed6140157be9f395aa7ab8e022d5b574db1cbbb8c52a965adec42a",
+          "claim": "persist worker 排入當前 model 快照，等待 StateStore 結果。"
+        },
+        {
+          "path": "crates/sw-core/src/state_store.rs",
+          "line": 625,
+          "end_line": 632,
+          "excerpt_sha256": "905c86b1ad79d4f02a488af7a327ef1bf21f793bfb719d90d61a989ca3fb45f6",
+          "claim": "Released 新增列；Unreleased 同時移除已載入與目前 released 列。"
+        },
+        {
+          "path": "crates/sw-core/src/state_store.rs",
+          "line": 713,
+          "end_line": 724,
+          "excerpt_sha256": "8742f8845b3e6e566dfdae17df69cdb7621d59a4925ca943c51dc21ef40f0745",
+          "claim": "狀態檔走 atomic_write。"
+        },
+        {
+          "path": "crates/sw-core/src/state_store.rs",
+          "line": 750,
+          "end_line": 764,
+          "excerpt_sha256": "5dd372026e4b8c07d4b4609fe92c2d91110a72ab280a42044addb158aac7e31c",
+          "claim": "StateStore 序列化、寫檔後透過 done 回成功或失敗。"
+        }
+      ],
+      "condition": "交接 Persist 效果已交 executor。",
+      "note": "提交的是當下快照，非延後重放舊 delta；寫檔失敗不能當成交接成功。"
+    },
+    {
+      "id": "custody-committed",
+      "from": "manager",
+      "to": "session",
+      "label": "回報提交並完成狀態",
+      "phase": "交接落盤與回覆",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6262,
+          "end_line": 6265,
+          "excerpt_sha256": "19560168d9a515d97e1940b41fbfaff4495ef9aa25e8fac7dfa31a05f8dee5c4",
+          "claim": "persist worker 等提交後送 StateCommitted。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 2523,
+          "end_line": 2535,
+          "excerpt_sha256": "50b02d9537b118ff76f1617a2faf117855f1465c248b2c2f616f088357112105",
+          "claim": "release 提交成功才清 pending 標記並回覆各 waiter。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 2537,
+          "end_line": 2555,
+          "excerpt_sha256": "523b04e123d499ac03102e676fb9bffefd9a75d090a31516caaeec857347bac1",
+          "claim": "提交失敗保留 pending、回錯誤或由下一個 waiter 重試。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 2589,
+          "end_line": 2603,
+          "excerpt_sha256": "8595183c091f5101f66151b84b3cfc670b06b8a19ca06d982a8f8858ae5d8f5f",
+          "claim": "一般 attach 提交成功才清 release 資訊、轉 ATTACHING、adopt bridge，將回覆排在登入前。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 2615,
+          "end_line": 2618,
+          "excerpt_sha256": "d96d248f85cd459efe446fc5bf660ed2a85db08ae6a26d8827f9e3e0e8f26753",
+          "claim": "一般 attach 提交失敗還原先前狀態並退休已開 bridge。"
+        }
+      ],
+      "condition": "StateStore 已回傳 release 或一般 attach 的提交結果。",
+      "note": "release 持久化失敗仍保留 RELEASED 阻擋並可重試。一般 attach 成功回 ATTACHING，不表示 READY；登入由後續生命週期推進。"
+    },
+    {
+      "id": "custody-reply",
+      "from": "daemon",
+      "to": "cli",
+      "label": "回傳交接結果",
+      "phase": "交接落盤與回覆",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 893,
+          "end_line": 908,
+          "excerpt_sha256": "525b121d838cae5a7478f8ebd46b9e613c1b82a5b13be68516cb04aa402cf29b",
+          "claim": "Service 回傳路由的 Release／DeviceAttach 結果，release 另附 source 註記。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 784,
+          "end_line": 788,
+          "excerpt_sha256": "dc771d8bd8e7f4fee4a2c9e715fe22330db48cf985a8461963da31e010c9b4aa",
+          "claim": "路由函式直接返回 manager 的 actor 請求結果。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 2531,
+          "end_line": 2535,
+          "excerpt_sha256": "4de859d4f66195bab361ed694380694c4ac62c16ca41c134f0c63cd648db679a",
+          "claim": "release 提交成功後才產生各 waiter 的回覆效果。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 2595,
+          "end_line": 2603,
+          "excerpt_sha256": "f71b9d5a140d1ed7c147feb8f1e292cb9dfb11825f5acae83b542cb96846bf96",
+          "claim": "一般 attach 回覆於 adopt 後且登入效果前排入。"
+        }
+      ],
+      "condition": "對應 RPC 的 actor 路徑已產生回覆；早退、逾時或提交失敗則回該分支結果。",
+      "note": "成功 release 後才交給外部工具使用；接回成功只表示已受理且進入 ATTACHING。外部工具的執行與完成不由此 RPC 代辦。"
+    }
+  ],
+  "unknowns": [
+    {
+      "id": "runtime-platform-evidence",
+      "question": "本次未執行 daemon、測試或實機；無法確認不同 USB 晶片的 by-id 唯一性、實際列舉延遲、Windows 登錄更新速度及交接耗時。",
+      "impact": "靜態證據只證明分支與呼叫順序，不提供實體 UART、Windows 原生或熱插負載下的成功率。"
+    },
+    {
+      "id": "python-baseline-not-compared",
+      "question": "本頁僅對照 sw_core/session_manager.py 的 update_devices、_spawn_attach 與 _finish_attach_op，核對未消費預開 handle 收尾後續排 attach 的差異；其餘裝置來源、COM 預配、alias／bind／pin 與 release／attach 沒有逐步比對 Python 0.4.x。",
+      "impact": "未標註 Python 差異的步驟只陳述 Rust，不能據此認定兩者完全相同。"
+    }
+  ],
+  "conflicts": []
+}
