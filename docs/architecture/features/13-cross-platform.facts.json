@@ -1,0 +1,765 @@
+{
+  "schema_version": 1,
+  "document_type": "feature-facts",
+  "feature": {
+    "id": "13-cross-platform",
+    "order": 13,
+    "title": "跨平台",
+    "summary": "同一份業務程式碼怎麼同時跑在 Linux 與 Windows：平台差異全部收在 sw-pal，業務 crate 只拿到一包 trait 物件與一份能力值。"
+  },
+  "repository": {
+    "url": "https://github.com/hamanpaul/serialwrap",
+    "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347"
+  },
+  "diagram_type": "sequence",
+  "scope": {
+    "includes": [
+      "採用 sequence：參與者是六個平台接縫，各自的 sublabel 直接並列 Linux｜Windows 的後端；兩個階段（啟動時組裝、執行時只經 trait 呼叫）有明確先後，用循序圖能同時表達「誰建立後端」與「誰使用後端」",
+      "行程入口取得 Platform 能力包的組裝點",
+      "六個接縫的 Linux｜Windows 後端：檔案與行程、RPC transport、實例鎖、裝置來源、序列埠、console 端點",
+      "Capabilities 能力值與業務碼的使用方式",
+      "cfg 邊界的檢查工具"
+    ],
+    "excludes": [
+      "Platform 內其餘能力的細節：時鐘、環境、行程控制、隧道行程（見 11-remote-bench）、監管控制（見 10-install-supervision）、event handler（見 07-event-engine）、停止訊號、USB 拓撲",
+      "各後端的實作細節（termios 參數、overlapped I/O、Telnet 協商等）",
+      "conformance 測試套件的內容：同一套斷言分別跑在替身、POSIX PTY 與 Windows COM pair 上",
+      "com0com 選用元件的安裝與設定"
+    ]
+  },
+  "participants": [
+    {
+      "id": "biz",
+      "label": "業務 crate",
+      "type": "backend",
+      "overview_component": null,
+      "responsibility": "sw-cli、sw-daemon、sw-core 三個業務 crate。它們不含任何平台相依的 cfg，也不比較作業系統名稱：行程入口向 sw-pal 要一包平台能力，之後只透過 trait 物件呼叫，需要分歧時只看 Capabilities 的值。這條邊界由 `check_cfg_boundary.py` 掃描把關。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/main.rs",
+          "line": 1,
+          "end_line": 8,
+          "excerpt_sha256": "f854f32f9d9fd6ff71fd3d7b633dffadb1a227bfacf66a6e89ff8fa7c3ae2b0f",
+          "claim": "serialwrap 入口：平台選擇只在此組裝點呼叫 sw_pal::native_client()。"
+        },
+        {
+          "path": "crates/sw-daemon/src/main.rs",
+          "line": 11,
+          "end_line": 16,
+          "excerpt_sha256": "f55758a014730c0ec37c5c0ee688c901bbfaf5bbc668459ebb7a2506a5a3e5fc",
+          "claim": "serialwrapd 入口同樣先取得平台能力包。"
+        },
+        {
+          "path": "scripts/rust/check_cfg_boundary.py",
+          "line": 1,
+          "end_line": 14,
+          "excerpt_sha256": "abc31b1a46c0914d9add24781458431075f2c73884335103d7c3835325e78c3a",
+          "claim": "cfg 邊界檢查：sw-pal 以外的 crate 不得出現平台 cfg、std::os::unix／windows、OS 名稱比較、libc／windows_sys。"
+        }
+      ],
+      "sublabel": "cli／daemon／core"
+    },
+    {
+      "id": "platform",
+      "label": "Platform",
+      "type": "backend",
+      "overview_component": null,
+      "responsibility": "sw-pal 的組裝點。`native()` 依編譯目標（cfg(unix) 或 cfg(windows)）建立完整的能力包：各接縫的 trait 物件加上一份 Capabilities。除了本頁畫出的六個接縫，能力包還有時鐘、環境、行程控制、隧道行程、監管控制、event handler、停止訊號與 USB 拓撲。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 1,
+          "end_line": 3,
+          "excerpt_sha256": "cfe7b03445233e63c89c039c0eeaa24a2570d599ae4edd2424c5719999a69842",
+          "claim": "平台相依 cfg 只允許出現在本 crate；業務 crate 只看 Capabilities 的值。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 111,
+          "end_line": 143,
+          "excerpt_sha256": "1ac1fed15566f8b7ae9a27fa4e32137bd05257cff440083c13e2f59d5cb6d6fc",
+          "claim": "Platform：組裝點共用的平台能力包，列出全部欄位。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 182,
+          "end_line": 196,
+          "excerpt_sha256": "b02431d0580f29384482496340ec6237968e7b9ce0c34ad66a5a68f767319f83",
+          "claim": "native()：依目前平台建立完整能力包。"
+        }
+      ],
+      "sublabel": "sw-pal 組裝點"
+    },
+    {
+      "id": "files",
+      "label": "檔案與行程",
+      "type": "backend",
+      "overview_component": "pal-files",
+      "responsibility": "檔案層與行程掃描：FsOps（原子寫入、跨行程檔案鎖、目錄連結）、WalFs（WAL 的常駐 handle、身分核對、不覆蓋改名）、ProcScan（找出本機的 serialwrapd 與 tty 持有者）。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/fs_ops.rs",
+          "line": 1,
+          "end_line": 2,
+          "excerpt_sha256": "72df133d62b86760a49423a32425955bb10375d50f924e62df6d763be249087c",
+          "claim": "FsOps：寫入面、目錄連結與跨行程檔案鎖，平台實作分在 posix／windows 子模組。"
+        },
+        {
+          "path": "crates/sw-pal/src/traits.rs",
+          "line": 983,
+          "end_line": 986,
+          "excerpt_sha256": "3962e8171423a88912decc1337e1752588efbbc43a53491c303ecef15558c9c9",
+          "claim": "WalFs::open_append 的平台差異。"
+        },
+        {
+          "path": "crates/sw-pal/src/proc_scan/mod.rs",
+          "line": 1,
+          "end_line": 1,
+          "excerpt_sha256": "3a725de36f911409aa2a747434b2db3a0c58987efa02a64f76f32fcceb302e22",
+          "claim": "ProcScan：行程掃描抽象與 serialwrapd 實例偵測。"
+        }
+      ],
+      "sublabel": "POSIX｜Win32"
+    },
+    {
+      "id": "rpc",
+      "label": "RPC transport",
+      "type": "backend",
+      "overview_component": "pal-rpc",
+      "responsibility": "RPC 的連線與監聽：client 端的 RpcConnector 與 server 端的 RpcListenerFactory。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/rpc_transport.rs",
+          "line": 1,
+          "end_line": 2,
+          "excerpt_sha256": "401289b5a67c6c6d1cf0c7afd7462280fbad07f6c1f6083dfc8fe748bca1b547",
+          "claim": "client 實作依平台擇一編譯；listener：POSIX 為 AF_UNIX＋TCP loopback，Windows 為 TCP loopback。"
+        },
+        {
+          "path": "crates/sw-pal/src/traits.rs",
+          "line": 1062,
+          "end_line": 1065,
+          "excerpt_sha256": "1beb6601f2b24083ea3a20abb5da8878e48596f87eff48559e7f28c34dd1343f",
+          "claim": "RpcListenerFactory::bind。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 225,
+          "end_line": 225,
+          "excerpt_sha256": "b1f39918870604c35d5c3f259651746e575eccd48977369220dcf137359e4c0e",
+          "claim": "POSIX 的 af_unix 為 true。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 280,
+          "end_line": 280,
+          "excerpt_sha256": "110083e19038def60576514e9daf43c9cb04e3810a8d16521303a40c3d80ff04",
+          "claim": "Windows 的 af_unix 為 false。"
+        }
+      ],
+      "sublabel": "AF_UNIX｜TCP"
+    },
+    {
+      "id": "lock",
+      "label": "實例鎖",
+      "type": "security",
+      "overview_component": "pal-lock",
+      "responsibility": "保證同一組 (lock 路徑, socket) 只有一個 daemon：InstanceLockFactory::acquire 先探測既有 endpoint 是否還活著，再取檔案鎖。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/lock.rs",
+          "line": 1,
+          "end_line": 3,
+          "excerpt_sha256": "4437ecef41cc3c7fe1842762ddbc1a9b68ceae696dc8ced564328b92ad3caeb9",
+          "claim": "Tier 1 實例鎖：同一 (lock_path, socket) 只允許一個 daemon。"
+        },
+        {
+          "path": "crates/sw-pal/src/lock.rs",
+          "line": 28,
+          "end_line": 38,
+          "excerpt_sha256": "56d8149c1964e92154fbb1b3ecdd291b05c470c7b1f80082aaf4fac354b287e9",
+          "claim": "acquire 的平台差異：POSIX 非阻塞 flock 加 socket 試連；Windows 先試連 endpoint 再 LockFileEx。"
+        },
+        {
+          "path": "crates/sw-pal/src/lock/posix.rs",
+          "line": 1,
+          "end_line": 1,
+          "excerpt_sha256": "89616ab8684919816c83494a63d443c45fd51bfab23b86ccc86784f4e364e81b",
+          "claim": "POSIX flock 實例鎖。"
+        },
+        {
+          "path": "crates/sw-pal/src/lock/windows.rs",
+          "line": 1,
+          "end_line": 1,
+          "excerpt_sha256": "32d1aeebab24eeefa5d63d82427180e7184993e99ed31e25dacdb4f3dcbe7d93",
+          "claim": "Windows LockFileEx 實例鎖。"
+        }
+      ],
+      "sublabel": "flock｜LockFileEx"
+    },
+    {
+      "id": "devices",
+      "label": "裝置來源",
+      "type": "backend",
+      "overview_component": "pal-devices",
+      "responsibility": "列出目前接著的 UART 裝置：DeviceSource::scan 回傳保留順序的裝置清單，由 DeviceWatcher 執行緒定期呼叫。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/device_source/mod.rs",
+          "line": 1,
+          "end_line": 4,
+          "excerpt_sha256": "301eccdd24174145b32c81d0abc2736f921a28042b6a6375440df2f234697cc0",
+          "claim": "POSIX 掃描 by-id／by-path；Windows 讀 SERIALCOMM 登錄並排除藍牙與套用 allowlist。"
+        },
+        {
+          "path": "crates/sw-pal/src/traits.rs",
+          "line": 624,
+          "end_line": 627,
+          "excerpt_sha256": "76b8b24ff28b0c0be41b22f7280c1d4e4d57d9b5368dbda8726b3dd917c0397e",
+          "claim": "DeviceSource::scan：保留列舉順序。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 148,
+          "end_line": 176,
+          "excerpt_sha256": "8ddef8cb9943e951b57d4bd378fe05d91f8de616114221e644f238ea12c13011",
+          "claim": "native_devices：依平台建立裝置來源工廠。"
+        }
+      ],
+      "sublabel": "by-id｜registry"
+    },
+    {
+      "id": "serial",
+      "label": "序列埠",
+      "type": "backend",
+      "overview_component": "pal-serial",
+      "responsibility": "UART 的開啟與讀寫：SerialBackend::open_exclusive 以獨占方式開埠並套用設定，另有 UartExclusive 提供「誰佔著這個埠」的診斷。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/serial.rs",
+          "line": 1,
+          "end_line": 3,
+          "excerpt_sha256": "d426f4519c56758309f9c109075d863af476f4f93715540da03d721a74c58a1b",
+          "claim": "序列埠後端；跨平台 trait 定義於 traits。"
+        },
+        {
+          "path": "crates/sw-pal/src/traits.rs",
+          "line": 845,
+          "end_line": 848,
+          "excerpt_sha256": "60b24a465d5a25f5597d52252f899beefd4d19a52c35c23040a47581aed9ab7b",
+          "claim": "SerialBackend::open_exclusive：以獨占方式開啟並完成設定。"
+        },
+        {
+          "path": "crates/sw-pal/src/serial/posix.rs",
+          "line": 1,
+          "end_line": 1,
+          "excerpt_sha256": "c049362a6ee31ef4a6762fd4dc07e360434f748eeb721c61c2e848aef06c2a42",
+          "claim": "POSIX 序列埠後端。"
+        },
+        {
+          "path": "crates/sw-pal/src/serial/windows.rs",
+          "line": 1,
+          "end_line": 1,
+          "excerpt_sha256": "d1bdcb894e5ce5589f6e9bc5950cf2b9b9cb946887913693448543da76bb4743",
+          "claim": "Windows 序列埠後端。"
+        }
+      ],
+      "sublabel": "termios｜COM"
+    },
+    {
+      "id": "console",
+      "label": "console 端點",
+      "type": "backend",
+      "overview_component": "pal-console",
+      "responsibility": "給人用的 console 端點：ConsoleTransportFactory 依 console 種類建立 PTY 或本機 TCP＋Telnet listener，ConsoleMux 讓一條執行緒同時等待多個端點。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/console_pty.rs",
+          "line": 1,
+          "end_line": 4,
+          "excerpt_sha256": "005f83576d6844ccaf8de99aebd73426578a2949fead21eae632678179d5f4e4",
+          "claim": "human console 承接工廠：組裝 POSIX PTY、TCP console、ConsoleMux 與（Windows）com0com console。"
+        },
+        {
+          "path": "crates/sw-pal/src/console_tcp.rs",
+          "line": 1,
+          "end_line": 2,
+          "excerpt_sha256": "a1535cd6cc2971402540422ac0e5c00a6fb76576976bbc81b9aac8cbdac092ef",
+          "claim": "TCP＋Telnet console listener：只綁 127.0.0.1，accept 後設 TCP_NODELAY。"
+        },
+        {
+          "path": "crates/sw-pal/src/console_mux.rs",
+          "line": 1,
+          "end_line": 3,
+          "excerpt_sha256": "59f61f40d37d0d2b62463e60e8ec063f35d7edd1a16540a634ed76f6673edac6",
+          "claim": "ConsoleMux：POSIX 用 poll＋eventfd，Windows 用 WSAPoll＋loopback socket pair。"
+        }
+      ],
+      "sublabel": "PTY｜TCP＋Telnet"
+    }
+  ],
+  "steps": [
+    {
+      "id": "native",
+      "from": "biz",
+      "to": "platform",
+      "label": "sw_pal::native_client()",
+      "phase": "組裝（行程啟動）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/main.rs",
+          "line": 3,
+          "end_line": 8,
+          "excerpt_sha256": "1390ce56e2183e25faa7bb1ad32873d3fd1e640bfe72657f62d888e5d8e8287b",
+          "claim": "CLI 入口。"
+        },
+        {
+          "path": "crates/sw-daemon/src/main.rs",
+          "line": 11,
+          "end_line": 16,
+          "excerpt_sha256": "f55758a014730c0ec37c5c0ee688c901bbfaf5bbc668459ebb7a2506a5a3e5fc",
+          "claim": "daemon 入口。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 306,
+          "end_line": 309,
+          "excerpt_sha256": "e6a112b9edd45959d9b5f102cfb9cd4608b53e451af3e9c3764b4eebabf68120",
+          "claim": "native_client 等同 native。"
+        }
+      ],
+      "note": "兩個執行檔各自在 main 的第一步取得能力包，之後整個行程共用同一份。"
+    },
+    {
+      "id": "build-files",
+      "from": "platform",
+      "to": "files",
+      "label": "建立 FsOps／WalFs／ProcScan",
+      "phase": "組裝（行程啟動）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 197,
+          "end_line": 198,
+          "excerpt_sha256": "a5ef88a6cfbfeb99565d911cf017e83bd9702c5a34f8d707ecebeb2ce3f0ed4c",
+          "claim": "POSIX：NativeFsOps。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 210,
+          "end_line": 210,
+          "excerpt_sha256": "c6523e1ed99439e073d170de23c461b2f64cad8045662e3dba1c10aa49d25882",
+          "claim": "POSIX：PosixProcScan。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 265,
+          "end_line": 265,
+          "excerpt_sha256": "e4ffb65e3e5ae57bdff4f4c77d32840a3e687118aba8b091fc960a897a7b812b",
+          "claim": "Windows：WindowsProcScan。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 217,
+          "end_line": 217,
+          "excerpt_sha256": "be30ad1943196403bc50e8a8e51578a001fc8437b5df7633cc823776565926b8",
+          "claim": "WalFs 的原生實作。"
+        }
+      ],
+      "note": "Linux｜Windows：POSIX 檔案 API 與 /proc 掃描｜Win32 檔案 API 與行程快照。"
+    },
+    {
+      "id": "build-rpc",
+      "from": "platform",
+      "to": "rpc",
+      "label": "建立 RpcConnector／RpcListenerFactory",
+      "phase": "組裝（行程啟動）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 208,
+          "end_line": 208,
+          "excerpt_sha256": "3129247b2792d36a08025d2e80e5cb1ed9013125cc0b4796447f3ef7a92b3460",
+          "claim": "RpcConnector。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 218,
+          "end_line": 218,
+          "excerpt_sha256": "584b9262b31d12927d0eeed27b0b891039f5356b29c265d1df80b35218cd4a7a",
+          "claim": "RpcListenerFactory。"
+        },
+        {
+          "path": "crates/sw-pal/src/rpc_transport.rs",
+          "line": 1,
+          "end_line": 2,
+          "excerpt_sha256": "401289b5a67c6c6d1cf0c7afd7462280fbad07f6c1f6083dfc8fe748bca1b547",
+          "claim": "listener 的平台差異。"
+        }
+      ],
+      "note": "Linux｜Windows：AF_UNIX socket（也支援 TCP loopback）｜只有 TCP loopback。"
+    },
+    {
+      "id": "build-lock",
+      "from": "platform",
+      "to": "lock",
+      "label": "建立 InstanceLockFactory",
+      "phase": "組裝（行程啟動）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 216,
+          "end_line": 216,
+          "excerpt_sha256": "0990f2aa3cfac36b5ff0b60eacc941624c1ba9c0bf424fdcbc45477110e854ae",
+          "claim": "實例鎖工廠。"
+        },
+        {
+          "path": "crates/sw-pal/src/lock.rs",
+          "line": 28,
+          "end_line": 38,
+          "excerpt_sha256": "56d8149c1964e92154fbb1b3ecdd291b05c470c7b1f80082aaf4fac354b287e9",
+          "claim": "acquire 的平台差異。"
+        }
+      ],
+      "note": "Linux｜Windows：flock｜LockFileEx。"
+    },
+    {
+      "id": "build-devices",
+      "from": "platform",
+      "to": "devices",
+      "label": "建立裝置來源工廠",
+      "phase": "組裝（行程啟動）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 148,
+          "end_line": 176,
+          "excerpt_sha256": "8ddef8cb9943e951b57d4bd378fe05d91f8de616114221e644f238ea12c13011",
+          "claim": "native_devices：POSIX 用 PosixDeviceSource 掃 by-id／by-path；Windows 用 WindowsDeviceSource 讀登錄。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 215,
+          "end_line": 215,
+          "excerpt_sha256": "f193a66d093a6d3378afcaae6dec0576162b93b70f1f4f2f12455049e1fa2717",
+          "claim": "放進能力包。"
+        }
+      ],
+      "note": "Linux｜Windows：掃 /dev/serial/by-id 與 by-path｜讀 SERIALCOMM 登錄、排除藍牙埠。"
+    },
+    {
+      "id": "build-serial",
+      "from": "platform",
+      "to": "serial",
+      "label": "建立 SerialBackend",
+      "phase": "組裝（行程啟動）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 213,
+          "end_line": 213,
+          "excerpt_sha256": "6eb1e582adde1b2d949a91b5d30ee8a01d7d087cc9eb64440a56f5f979f47497",
+          "claim": "POSIX 序列埠後端。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 268,
+          "end_line": 268,
+          "excerpt_sha256": "f69cfdbff89f82306d8b7025f5cb639d350dc0a65f30545c401d4fcefb58ce55",
+          "claim": "Windows 序列埠後端。"
+        }
+      ],
+      "note": "Linux｜Windows：termios｜overlapped COM。"
+    },
+    {
+      "id": "build-console",
+      "from": "platform",
+      "to": "console",
+      "label": "建立 ConsoleTransportFactory",
+      "phase": "組裝（行程啟動）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 219,
+          "end_line": 219,
+          "excerpt_sha256": "7084ba101dee78a742989e6041e55c4c4dbb50a5f4e063e8f2cbff07513245a7",
+          "claim": "console 工廠依 console 種類建立。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 295,
+          "end_line": 304,
+          "excerpt_sha256": "b363b18405af7160b450686e2c23e05f61f1aec8423d871b421f82e6d4bfdb80",
+          "claim": "console 種類由 SERIALWRAP_CONSOLE_BACKEND 與平台是否有 PTY 決定，只在這裡讀取。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 72,
+          "end_line": 75,
+          "excerpt_sha256": "d285cddd88646da3274f7e9e131c563b59e428c4ae3b4aaf061b49f4a819861f",
+          "claim": "ConsoleKind：Pty 或 TcpTelnet。"
+        }
+      ],
+      "note": "Linux｜Windows：PTY｜127.0.0.1 的 TCP＋Telnet，另可選 com0com 序列埠對。"
+    },
+    {
+      "id": "bundle",
+      "from": "platform",
+      "to": "biz",
+      "label": "Platform＋Capabilities",
+      "phase": "組裝（行程啟動）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 84,
+          "end_line": 106,
+          "excerpt_sha256": "07fd5b2a69a6289e9eaa78f5a19a76e759b61b4cb61e170bb38368abd2523e6e",
+          "claim": "Capabilities：業務碼唯一可見的平台能力值。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 223,
+          "end_line": 235,
+          "excerpt_sha256": "3b40348b8b2f64190d7611cd307ea751198ba134ab8321ecaf2c5da8a345ae47",
+          "claim": "POSIX 的能力值。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 278,
+          "end_line": 290,
+          "excerpt_sha256": "707d0057977ff32ca86abf848eff0607ddf79be1fda219c4f75797af25b7051c",
+          "claim": "Windows 的能力值。"
+        }
+      ],
+      "note": "Linux｜Windows 的能力值：路徑風格 Posix｜Windows、換行 \\n｜\\r\\n、exec 取代行程 是｜否、on-demand 自動啟動 否｜是、com0com console 否｜是、/dev/ttyMCU flash 端點 有｜無。"
+    },
+    {
+      "id": "use-lock",
+      "from": "biz",
+      "to": "lock",
+      "label": "acquire(lock 路徑, endpoint)",
+      "phase": "使用（只經 trait）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1219,
+          "end_line": 1233,
+          "excerpt_sha256": "cfa431d65b9858b755a114d4add674242b3e1198c0edc6bab2e5bc467dfc3408",
+          "claim": "daemon 啟動時取實例鎖；已有 daemon 回 DAEMON_ALREADY_RUNNING。"
+        }
+      ]
+    },
+    {
+      "id": "use-files",
+      "from": "biz",
+      "to": "files",
+      "label": "WAL／state 寫入、行程掃描",
+      "phase": "使用（只經 trait）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1246,
+          "end_line": 1253,
+          "excerpt_sha256": "5484b794b7744d48112c0a1e16c69cf13d2a466930743fe3e8eefac3416277c8",
+          "claim": "WalWriter 以能力包的 wal_fs 與 clock 建立。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1292,
+          "end_line": 1292,
+          "excerpt_sha256": "feae0b8e6fbdf385a5ba06583dfd1d8ea29d54a13182dd7084d2b66cb06d5149",
+          "claim": "StateStore 以能力包的 fs 建立。"
+        },
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 3004,
+          "end_line": 3004,
+          "excerpt_sha256": "00f766cc595b1c717f15bd353384d1ecaab2f5776cf4a7cfe701aaa0835b31ae",
+          "claim": "CLI 更新流程以能力包的 procs 掃描仍持有 tty 的 serialwrapd。"
+        }
+      ]
+    },
+    {
+      "id": "use-devices",
+      "from": "biz",
+      "to": "devices",
+      "label": "建立裝置來源並定期 scan",
+      "phase": "使用（只經 trait）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1368,
+          "end_line": 1370,
+          "excerpt_sha256": "0358fbfe5436d1498aec058e7951a4f82a64f862364a6d543f15bd547f0656b7",
+          "claim": "daemon 以能力包的裝置工廠建立裝置來源。"
+        },
+        {
+          "path": "crates/sw-pal/src/traits.rs",
+          "line": 624,
+          "end_line": 627,
+          "excerpt_sha256": "76b8b24ff28b0c0be41b22f7280c1d4e4d57d9b5368dbda8726b3dd917c0397e",
+          "claim": "之後由 watcher 呼叫 scan。"
+        }
+      ]
+    },
+    {
+      "id": "use-serial",
+      "from": "biz",
+      "to": "serial",
+      "label": "open_exclusive／讀寫",
+      "phase": "使用（只經 trait）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1280,
+          "end_line": 1283,
+          "excerpt_sha256": "e3b3385128d68997e637b27edac4e9780e1618cabae8a7bc3cf748b9fbb26610",
+          "claim": "SessionManager 的依賴取自能力包的 serial、uart_excl、console。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 4948,
+          "end_line": 4950,
+          "excerpt_sha256": "27afee3a3055615b9cb41350e0a936b43ec7ffe5fcabed82fe55154e83e9b529",
+          "claim": "SessionManager 開埠。"
+        }
+      ]
+    },
+    {
+      "id": "use-console",
+      "from": "biz",
+      "to": "console",
+      "label": "開埠時建立 console 端點",
+      "phase": "使用（只經 trait）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 4536,
+          "end_line": 4541,
+          "excerpt_sha256": "c88465196edeb624e092d92cc0c64dd2f3913e672ad6175655a9c790b8da5fa8",
+          "claim": "console 種類為 Pty 時，開埠工作預建哨兵 PTY。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 4561,
+          "end_line": 4568,
+          "excerpt_sha256": "8c2d7d04d9aad4d8d6e2cda2633e7500f81974a2fb743cd4970b0e28f320d587",
+          "claim": "console 種類為 TcpTelnet 時，每次開埠綁一個新的 127.0.0.1 listener。"
+        },
+        {
+          "path": "crates/sw-pal/src/console_pty.rs",
+          "line": 117,
+          "end_line": 122,
+          "excerpt_sha256": "394d7f298d9639cb642dbefeb4f70f519cb8e4ba63b1bd30f2fd3b266b067fb0",
+          "claim": "工廠方法有預設實作（回 Unsupported），只實作部分方法的後端仍可編譯。"
+        }
+      ],
+      "note": "Linux｜Windows 的預設 console 種類：Pty（預建哨兵 PTY）｜TcpTelnet（綁本機 listener）。業務碼以 console.kind() 的值分支，不看作業系統。"
+    },
+    {
+      "id": "use-rpc",
+      "from": "biz",
+      "to": "rpc",
+      "label": "bind listener／connect",
+      "phase": "使用（只經 trait）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1428,
+          "end_line": 1428,
+          "excerpt_sha256": "a9fc924c7809be6f8dc5bca00ec78fef18fdb1bf417ee1b87cc58e33f290770a",
+          "claim": "daemon 以 rpc_listen 綁定 endpoint。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 116,
+          "end_line": 116,
+          "excerpt_sha256": "0ec5ef2ddf4573b7995f79989c09109a157e77f81f80e044242f8ea407aedce9",
+          "claim": "CLI 端用能力包的 rpc 連線。"
+        }
+      ]
+    },
+    {
+      "id": "use-caps",
+      "from": "biz",
+      "to": "platform",
+      "label": "讀 Capabilities 決定分支",
+      "phase": "使用（只經 trait）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1205,
+          "end_line": 1207,
+          "excerpt_sha256": "9e03a009a218a3cf7c27c79e7afb15174376e87547059bdf01309280bcaefcd5",
+          "claim": "例：native_device 為 Win 時注入 passthrough template。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 717,
+          "end_line": 717,
+          "excerpt_sha256": "2fc2c18e3e36ebbd1c3e906cfd60e0303f36a93f79e7cdcd70763fb8ae8c290d",
+          "claim": "例：on_demand_autostart 決定 CLI 是否自動啟動 daemon。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 84,
+          "end_line": 86,
+          "excerpt_sha256": "0cdbcaad376c7f3eb1eb501d19d1c4a3b392ce6cbaaaa58e92a00b86a2d89360",
+          "claim": "業務碼不得比較 OS 名稱。"
+        }
+      ],
+      "note": "平台分歧一律寫成「這個能力有沒有」，不是「現在是哪個作業系統」。"
+    }
+  ],
+  "unknowns": [
+    {
+      "id": "windows-not-executed",
+      "question": "Windows 後端的實際行為是否與原始碼一致？",
+      "impact": "本頁 Windows 一側全部依 cfg(windows) 分支、trait 註解與能力值判讀，沒有在 Windows 上執行；各 build-* 與 use-console 步驟的 Windows 描述未經實機驗證。"
+    },
+    {
+      "id": "conformance-coverage",
+      "question": "conformance 套件實際涵蓋了六個接縫中的哪些，原生平台上的執行結果如何？",
+      "impact": "原始碼有 serial、lock、rpc、wal_fs、console、handler 六組 suite，並註明在替身上通過不得計為原生 gate（conformance/mod.rs:1-2）；本頁沒有核對各 suite 的斷言範圍與 CI 上的原生執行紀錄，所以沒有把「兩個平台行為一致」當成已驗證的事實。"
+    },
+    {
+      "id": "python-baseline-not-compared",
+      "question": "各步驟與 Python 0.4.x 基線的行為差異是否都已標出？",
+      "impact": "本頁描述的是 Rust 實作，只在撰寫時實際對照過 sw_core 的地方於步驟 note 標註差異或相同；沒有逐步比對 Python 實作，所以沒有標註不代表沒有差異。"
+    }
+  ],
+  "conflicts": [
+    {
+      "id": "conformance-doc-stale",
+      "subject": "conformance 模組註解所描述的 PAL 實作狀態",
+      "claims": [
+        "crates/sw-pal/src/conformance/mod.rs:4-5 的註解說被測的 PAL 行為（PosixSerialBackend 等）仍為 unimplemented! 骨架。",
+        "crates/sw-pal/src/lib.rs:213 與 268 在產品組裝點直接使用 PosixSerialBackend 與 WindowsSerialBackend，daemon 以它們開埠（crates/sw-core/src/session_manager.rs:4948）。"
+      ],
+      "resolution": "以組裝點與呼叫點為準：兩個序列埠後端已是產品路徑的一部分，conformance 模組的那段註解是早期階段留下的說明。"
+    }
+  ]
+}

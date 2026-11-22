@@ -1,0 +1,328 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "serialwrap｜跨平台",
+    "locale": "zh-TW",
+    "output": "docs/architecture/features/13-cross-platform.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/hamanpaul/serialwrap",
+      "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347",
+      "provider": "github"
+    }
+  },
+  "participants": [
+    {
+      "id": "biz",
+      "type": "backend",
+      "label": "業務 crate",
+      "sublabel": "cli／daemon／core",
+      "sources": [
+        {
+          "path": "crates/sw-cli/src/main.rs",
+          "line": 1,
+          "end_line": 8
+        },
+        {
+          "path": "crates/sw-daemon/src/main.rs",
+          "line": 11,
+          "end_line": 16
+        },
+        {
+          "path": "scripts/rust/check_cfg_boundary.py",
+          "line": 1,
+          "end_line": 14
+        }
+      ]
+    },
+    {
+      "id": "platform",
+      "type": "backend",
+      "label": "Platform",
+      "sublabel": "sw-pal 組裝點",
+      "sources": [
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 1,
+          "end_line": 3
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 111,
+          "end_line": 143
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 182,
+          "end_line": 196
+        }
+      ]
+    },
+    {
+      "id": "files",
+      "type": "backend",
+      "label": "檔案與行程",
+      "sublabel": "POSIX｜Win32",
+      "sources": [
+        {
+          "path": "crates/sw-pal/src/fs_ops.rs",
+          "line": 1,
+          "end_line": 2
+        },
+        {
+          "path": "crates/sw-pal/src/traits.rs",
+          "line": 983,
+          "end_line": 986
+        },
+        {
+          "path": "crates/sw-pal/src/proc_scan/mod.rs",
+          "line": 1,
+          "end_line": 1
+        }
+      ]
+    },
+    {
+      "id": "rpc",
+      "type": "backend",
+      "label": "RPC transport",
+      "sublabel": "AF_UNIX｜TCP",
+      "sources": [
+        {
+          "path": "crates/sw-pal/src/rpc_transport.rs",
+          "line": 1,
+          "end_line": 2
+        },
+        {
+          "path": "crates/sw-pal/src/traits.rs",
+          "line": 1062,
+          "end_line": 1065
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 225,
+          "end_line": 225
+        }
+      ]
+    },
+    {
+      "id": "lock",
+      "type": "security",
+      "label": "實例鎖",
+      "sublabel": "flock｜LockFileEx",
+      "sources": [
+        {
+          "path": "crates/sw-pal/src/lock.rs",
+          "line": 1,
+          "end_line": 3
+        },
+        {
+          "path": "crates/sw-pal/src/lock.rs",
+          "line": 28,
+          "end_line": 38
+        },
+        {
+          "path": "crates/sw-pal/src/lock/posix.rs",
+          "line": 1,
+          "end_line": 1
+        }
+      ]
+    },
+    {
+      "id": "devices",
+      "type": "backend",
+      "label": "裝置來源",
+      "sublabel": "by-id｜registry",
+      "sources": [
+        {
+          "path": "crates/sw-pal/src/device_source/mod.rs",
+          "line": 1,
+          "end_line": 4
+        },
+        {
+          "path": "crates/sw-pal/src/traits.rs",
+          "line": 624,
+          "end_line": 627
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 148,
+          "end_line": 176
+        }
+      ]
+    },
+    {
+      "id": "serial",
+      "type": "backend",
+      "label": "序列埠",
+      "sublabel": "termios｜COM",
+      "sources": [
+        {
+          "path": "crates/sw-pal/src/serial.rs",
+          "line": 1,
+          "end_line": 3
+        },
+        {
+          "path": "crates/sw-pal/src/traits.rs",
+          "line": 845,
+          "end_line": 848
+        },
+        {
+          "path": "crates/sw-pal/src/serial/posix.rs",
+          "line": 1,
+          "end_line": 1
+        }
+      ]
+    },
+    {
+      "id": "console",
+      "type": "backend",
+      "label": "console 端點",
+      "sublabel": "PTY｜TCP＋Telnet",
+      "sources": [
+        {
+          "path": "crates/sw-pal/src/console_pty.rs",
+          "line": 1,
+          "end_line": 4
+        },
+        {
+          "path": "crates/sw-pal/src/console_tcp.rs",
+          "line": 1,
+          "end_line": 2
+        },
+        {
+          "path": "crates/sw-pal/src/console_mux.rs",
+          "line": 1,
+          "end_line": 3
+        }
+      ]
+    }
+  ],
+  "segments": [
+    {
+      "from": 158,
+      "to": 671,
+      "label": "組裝（行程啟動）"
+    },
+    {
+      "from": 673,
+      "to": 919,
+      "label": "使用（只經 trait）"
+    }
+  ],
+  "messages": [
+    {
+      "id": "native",
+      "from": "biz",
+      "to": "platform",
+      "y": 174,
+      "label": "sw_pal::native_client()"
+    },
+    {
+      "id": "build-files",
+      "from": "platform",
+      "to": "files",
+      "y": 204,
+      "label": "建立 FsOps／WalFs／ProcScan",
+      "note": "Linux｜Windows：/proc 掃描｜行程快照"
+    },
+    {
+      "id": "build-rpc",
+      "from": "platform",
+      "to": "rpc",
+      "y": 272,
+      "label": "建立 RpcConnector／RpcListenerFactory",
+      "note": "Linux｜Windows：AF_UNIX（也支援 TCP）｜TCP loopback"
+    },
+    {
+      "id": "build-lock",
+      "from": "platform",
+      "to": "lock",
+      "y": 351,
+      "label": "建立 InstanceLockFactory",
+      "note": "Linux｜Windows：flock｜LockFileEx"
+    },
+    {
+      "id": "build-devices",
+      "from": "platform",
+      "to": "devices",
+      "y": 407,
+      "label": "建立裝置來源工廠",
+      "note": "Linux｜Windows：/dev/serial/by-id｜SERIALCOMM 登錄"
+    },
+    {
+      "id": "build-serial",
+      "from": "platform",
+      "to": "serial",
+      "y": 486,
+      "label": "建立 SerialBackend",
+      "note": "Linux｜Windows：termios｜overlapped COM"
+    },
+    {
+      "id": "build-console",
+      "from": "platform",
+      "to": "console",
+      "y": 542,
+      "label": "建立 ConsoleTransportFactory",
+      "note": "Linux｜Windows：PTY｜TCP＋Telnet，可選 com0com"
+    },
+    {
+      "id": "bundle",
+      "from": "platform",
+      "to": "biz",
+      "y": 610,
+      "label": "Platform＋Capabilities",
+      "note": "Linux｜Windows：flash 端點 有｜無、com0com console 否｜是"
+    },
+    {
+      "id": "use-lock",
+      "from": "biz",
+      "to": "lock",
+      "y": 689,
+      "label": "acquire(lock 路徑, endpoint)"
+    },
+    {
+      "id": "use-files",
+      "from": "biz",
+      "to": "files",
+      "y": 719,
+      "label": "WAL／state 寫入、行程掃描"
+    },
+    {
+      "id": "use-devices",
+      "from": "biz",
+      "to": "devices",
+      "y": 749,
+      "label": "建立裝置來源並定期 scan"
+    },
+    {
+      "id": "use-serial",
+      "from": "biz",
+      "to": "serial",
+      "y": 779,
+      "label": "open_exclusive／讀寫"
+    },
+    {
+      "id": "use-console",
+      "from": "biz",
+      "to": "console",
+      "y": 809,
+      "label": "開埠時建立 console 端點",
+      "note": "Linux｜Windows：預建哨兵 PTY｜綁本機 listener"
+    },
+    {
+      "id": "use-rpc",
+      "from": "biz",
+      "to": "rpc",
+      "y": 877,
+      "label": "bind listener／connect"
+    },
+    {
+      "id": "use-caps",
+      "from": "biz",
+      "to": "platform",
+      "y": 907,
+      "label": "讀 Capabilities 決定分支"
+    }
+  ]
+}
