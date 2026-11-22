@@ -1,0 +1,487 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "serialwrap｜daemon 管理",
+    "locale": "zh-TW",
+    "output": "docs/architecture/features/09-daemon-mgmt.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/hamanpaul/serialwrap",
+      "provider": "github",
+      "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347"
+    },
+    "subtitle": "Rust daemon 的啟動、健康與同機偵測、有序停機；包含 #282 行收尾及尚存的 #296／#297 pending RPC 回覆窗口。"
+  },
+  "participants": [
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "CLI／Agent",
+      "sources": [
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 87,
+          "end_line": 111
+        },
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 222,
+          "end_line": 229
+        },
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 334,
+          "end_line": 343
+        }
+      ]
+    },
+    {
+      "id": "daemon",
+      "type": "backend",
+      "label": "daemon 主流程",
+      "sublabel": "Rust 啟動與停止序",
+      "sources": [
+        {
+          "path": "crates/sw-daemon/src/main.rs",
+          "line": 11,
+          "end_line": 20
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1219,
+          "end_line": 1233
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1499,
+          "end_line": 1515
+        }
+      ]
+    },
+    {
+      "id": "lock",
+      "type": "security",
+      "label": "實例鎖",
+      "sublabel": "平台檔鎖與端點探測",
+      "sources": [
+        {
+          "path": "crates/sw-pal/src/lock/posix.rs",
+          "line": 46,
+          "end_line": 64
+        },
+        {
+          "path": "crates/sw-pal/src/lock/windows.rs",
+          "line": 42,
+          "end_line": 46
+        },
+        {
+          "path": "crates/sw-pal/src/lock/windows.rs",
+          "line": 77,
+          "end_line": 90
+        }
+      ]
+    },
+    {
+      "id": "service",
+      "type": "backend",
+      "label": "RPC／Service",
+      "sublabel": "含 framing",
+      "sources": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1411,
+          "end_line": 1428
+        },
+        {
+          "path": "crates/sw-daemon/src/framing.rs",
+          "line": 254,
+          "end_line": 260
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1510,
+          "end_line": 1517
+        }
+      ]
+    },
+    {
+      "id": "manager",
+      "type": "backend",
+      "label": "Session 管理",
+      "sublabel": "SessionManager",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6808,
+          "end_line": 6819
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8492,
+          "end_line": 8505
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8515,
+          "end_line": 8539
+        }
+      ]
+    },
+    {
+      "id": "actor",
+      "type": "backend",
+      "label": "Session actor",
+      "sublabel": "效果執行",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/actor.rs",
+          "line": 478,
+          "end_line": 494
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 1435,
+          "end_line": 1442
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6173,
+          "end_line": 6186
+        }
+      ]
+    },
+    {
+      "id": "worker",
+      "type": "backend",
+      "label": "UART 收尾",
+      "sublabel": "IoWorker、Fence",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 323,
+          "end_line": 349
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 844,
+          "end_line": 864
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 865,
+          "end_line": 877
+        }
+      ]
+    },
+    {
+      "id": "runner",
+      "type": "backend",
+      "label": "操作執行",
+      "sublabel": "OpRunner",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 117,
+          "end_line": 132
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 383,
+          "end_line": 412
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 303,
+          "end_line": 317
+        }
+      ]
+    }
+  ],
+  "segments": [
+    {
+      "from": 160,
+      "to": 477,
+      "label": "啟動與綁定"
+    },
+    {
+      "from": 491,
+      "to": 632,
+      "label": "健康與同機偵測"
+    },
+    {
+      "from": 646,
+      "to": 1125,
+      "label": "停止接收與行收尾"
+    },
+    {
+      "from": 1139,
+      "to": 1324,
+      "label": "各 session 排空"
+    },
+    {
+      "from": 1338,
+      "to": 1743,
+      "label": "完成通知與停機窗口"
+    },
+    {
+      "from": 1757,
+      "to": 2037,
+      "label": "等待收斂與釋放"
+    }
+  ],
+  "messages": [
+    {
+      "id": "spawn-daemon",
+      "from": "cli",
+      "to": "daemon",
+      "y": 176,
+      "label": "啟動背景行程",
+      "variant": "default",
+      "note": "Linux｜Windows： setsid｜DETACHED_PROCESS 新行程群組"
+    },
+    {
+      "id": "acquire-lock",
+      "from": "daemon",
+      "to": "lock",
+      "y": 231,
+      "label": "取得單一實例鎖",
+      "variant": "default",
+      "note": "Linux｜Windows： flock 加 Unix socket 探測｜LockFileEx 加 TCP 探測"
+    },
+    {
+      "id": "create-manager",
+      "from": "daemon",
+      "to": "manager",
+      "y": 319,
+      "label": "載入狀態並建立管理器",
+      "variant": "default",
+      "note": "state.json 載入失敗即中止"
+    },
+    {
+      "id": "bootstrap-devices",
+      "from": "daemon",
+      "to": "manager",
+      "y": 363,
+      "label": "初掃、排序並啟動掛接",
+      "variant": "default",
+      "note": "只啟動 attach，不等 READY 才綁 RPC"
+    },
+    {
+      "id": "bind-rpc",
+      "from": "daemon",
+      "to": "service",
+      "y": 429,
+      "label": "建立服務並綁定 RPC",
+      "variant": "default",
+      "note": "Linux｜Windows： Unix socket｜loopback TCP"
+    },
+    {
+      "id": "query-health",
+      "from": "cli",
+      "to": "service",
+      "y": 507,
+      "label": "探測健康與查詢狀態",
+      "variant": "default",
+      "note": "每輪等 200 ms； Linux｜Windows： 15｜50 次"
+    },
+    {
+      "id": "health-result",
+      "from": "service",
+      "to": "cli",
+      "y": 573,
+      "label": "回傳健康與同機多開資訊",
+      "variant": "default",
+      "note": "pong 不代表 UART READY； Linux｜Windows： /proc 掃描｜多開回未知"
+    },
+    {
+      "id": "stop-request",
+      "from": "cli",
+      "to": "service",
+      "y": 692,
+      "label": "要求停止 daemon",
+      "variant": "default",
+      "note": "daemon.stop 的 RPC timeout 2 s"
+    },
+    {
+      "id": "stop-ack",
+      "from": "service",
+      "to": "cli",
+      "y": 736,
+      "label": "先回覆已受理停止",
+      "variant": "default",
+      "note": "先回 stopping:true，不代表已停止"
+    },
+    {
+      "id": "notify-stop",
+      "from": "service",
+      "to": "daemon",
+      "y": 780,
+      "label": "通知主流程停止",
+      "variant": "default",
+      "note": "Linux｜Windows： SIGINT／SIGTERM｜Ctrl+C／console 事件"
+    },
+    {
+      "id": "freeze-admission",
+      "from": "daemon",
+      "to": "service",
+      "y": 857,
+      "label": "凍結 admission 並停止接收",
+      "variant": "default",
+      "note": "新操作回 FLUSHED_BY_SHUTDOWN（ handoff_frozen）"
+    },
+    {
+      "id": "begin-shutdown",
+      "from": "daemon",
+      "to": "manager",
+      "y": 934,
+      "label": "封鎖新掛接入口",
+      "variant": "default",
+      "note": "stopping gate 封鎖新 attach 與 hotplug"
+    },
+    {
+      "id": "settle-fences",
+      "from": "manager",
+      "to": "worker",
+      "y": 978,
+      "label": "發布待凍結並等待目前行",
+      "variant": "default",
+      "note": "所有行共用 1250 ms，逾時強制凍結"
+    },
+    {
+      "id": "settle-push-line",
+      "from": "runner",
+      "to": "worker",
+      "y": 1022,
+      "label": "完成目前行或嘗試清行",
+      "variant": "default",
+      "note": "條件（#282）： file.push 持有行； 750 ms 內收尾，否則送 Ctrl-U"
+    },
+    {
+      "id": "shutdown-gate",
+      "from": "manager",
+      "to": "actor",
+      "y": 1077,
+      "label": "以 safety lane 沖刷排隊命令",
+      "variant": "default",
+      "note": "排隊命令回 FLUSHED_BY_SHUTDOWN"
+    },
+    {
+      "id": "drain-phase1",
+      "from": "daemon",
+      "to": "manager",
+      "y": 1155,
+      "label": "啟動 Phase 1 排空",
+      "variant": "default",
+      "note": "Phase 1 到 Phase 2 共用 5 s，扣除行收尾耗時"
+    },
+    {
+      "id": "shutdown-actors",
+      "from": "manager",
+      "to": "actor",
+      "y": 1199,
+      "label": "逐一送出 Shutdown",
+      "variant": "default",
+      "note": "begin_stop(Shutdown)：凍結 fence、取消傳檔"
+    },
+    {
+      "id": "begin-drain",
+      "from": "actor",
+      "to": "worker",
+      "y": 1276,
+      "label": "交由背景執行緒關閉 UART",
+      "variant": "default",
+      "note": "背景執行緒依序 join writer、 reader 再關埠"
+    },
+    {
+      "id": "op-finished-first",
+      "from": "runner",
+      "to": "actor",
+      "y": 1354,
+      "label": "先回報操作完成供結算",
+      "variant": "default",
+      "note": "條件： OpFinished 先到；傳檔回 COMMAND_ABORTED_IN_FLIGHT 或 FLUSHED_BY_RECOVERY"
+    },
+    {
+      "id": "worker-stopped",
+      "from": "worker",
+      "to": "actor",
+      "y": 1453,
+      "label": "以 safety lane 回傳排空回條",
+      "variant": "default",
+      "note": "safety lane 優先於 control lane；可能搶在 OpFinished 前（#296）"
+    },
+    {
+      "id": "drain-reply",
+      "from": "actor",
+      "to": "manager",
+      "y": 1541,
+      "label": "回報 session 排空並結束 actor",
+      "variant": "default",
+      "note": "設 shutdown_complete， actor 迴圈結束"
+    },
+    {
+      "id": "op-finished-late",
+      "from": "runner",
+      "to": "actor",
+      "y": 1585,
+      "label": "嘗試送出遲到的操作完成",
+      "variant": "default",
+      "note": "條件（#296）： WorkerStopped 先完成， OpFinished 遲到"
+    },
+    {
+      "id": "pending-rpc-error",
+      "from": "manager",
+      "to": "service",
+      "y": 1640,
+      "label": "回傳 pending RPC 斷線錯誤",
+      "variant": "default",
+      "note": "條件：#296 傳檔；#297 推論 self-test、 recover、 interactive"
+    },
+    {
+      "id": "framing-exception",
+      "from": "service",
+      "to": "cli",
+      "y": 1695,
+      "label": "回傳 framing 例外",
+      "variant": "default",
+      "note": "條件：回 EXCEPTION（ session actor stopped）"
+    },
+    {
+      "id": "join-rpc-handlers",
+      "from": "daemon",
+      "to": "service",
+      "y": 1773,
+      "label": "在剩餘期限等待 RPC handler",
+      "variant": "default",
+      "note": "Phase 1 後才 join，只用剩餘期限"
+    },
+    {
+      "id": "drain-phase2",
+      "from": "daemon",
+      "to": "manager",
+      "y": 1839,
+      "label": "等待 Phase 2 回條與 actor 退出",
+      "variant": "default",
+      "note": "只認 ok:true， DRAIN_STALLED 不算成功"
+    },
+    {
+      "id": "drain-report",
+      "from": "manager",
+      "to": "daemon",
+      "y": 1905,
+      "label": "回報收斂與未完成項目",
+      "variant": "default",
+      "note": "有失敗即 shutdown incomplete，仍繼續收尾"
+    },
+    {
+      "id": "release-lock",
+      "from": "daemon",
+      "to": "lock",
+      "y": 1971,
+      "label": "完成 WAL 收尾後釋放鎖",
+      "variant": "default",
+      "note": "先 WAL sync 再釋放鎖； Linux｜Windows： LOCK_UN｜UnlockFileEx"
+    }
+  ]
+}

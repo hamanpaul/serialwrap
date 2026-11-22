@@ -110,6 +110,20 @@
         "delivery": "440354206942ca5bca5636c3e3d1eabe897c0062c19708bb885ad4b2963fc3a6",
         "html": "1094815de8ca7675b999db29cd2b0b2119249773e58c3e27e2e723f418cd98ee"
       }
+    },
+    "09-daemon-mgmt": {
+      "diagram_type": "sequence",
+      "source_revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347",
+      "facts": "features/09-daemon-mgmt.facts.json",
+      "ir": "features/09-daemon-mgmt.json",
+      "html": "features/09-daemon-mgmt.html",
+      "overlay_version": 1,
+      "sha256": {
+        "facts": "5899d16043c68c422e99716e875933e5e4d553d4bf6678cbe1a508656eadd077",
+        "ir": "c5d05ff5d863f7a4a39b1b6bc82ebef8fd9c5c0ec4842e0bf20b40466f5d486d",
+        "delivery": "e35b2310e1d2772d72a782cc7b0bbcf1424d0c115fda3dfb8c8d4269d751bce9",
+        "html": "63ca9d6ab1a4013fab0df3ab117fa4ffc06a93bc28d86106bdfa01922223b83b"
+      }
     }
   }
 }

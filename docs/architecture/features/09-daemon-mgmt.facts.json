@@ -1,0 +1,1783 @@
+{
+  "schema_version": 1,
+  "document_type": "feature-facts",
+  "feature": {
+    "id": "09-daemon-mgmt",
+    "order": 9,
+    "title": "daemon 管理",
+    "summary": "Rust daemon 的啟動、健康與同機偵測、有序停機；包含 #282 行收尾及尚存的 #296／#297 pending RPC 回覆窗口。"
+  },
+  "repository": {
+    "url": "https://github.com/hamanpaul/serialwrap",
+    "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347"
+  },
+  "diagram_type": "sequence",
+  "scope": {
+    "includes": [
+      "固定 revision 的 Rust on-demand 背景啟動主路徑：profiles／鎖／state／manager／初掃／bootstrap／RPC，以及健康查詢。",
+      "停止受理、admission 與 attach 凍結、#282 行收尾、兩階段 drain、handler／事件／WAL 收斂及釋放鎖。",
+      "條件分支：推送行在途、OpFinished 先結算、WorkerStopped 搶先造成 #296／#297 回覆窗口。通知可並行，圖中早到與遲到 OpFinished 是互斥的示例交錯，不是每次停機都依序執行兩次。",
+      "跨平台的啟動、實例鎖、RPC 端點、停止通知與同機偵測；非主角 transport／ProcScan／WAL 以責任說明與 note 附證據。"
+    ],
+    "excludes": [
+      "systemd／Windows 工作排程／service 的完整啟停、安裝更新與交接排空窗口，另見 10-install-supervision。",
+      "完整 attach／登入／命令執行／file.push／pull／flash 流程，分見 02、01、05、06 功能頁。",
+      "任何建置、daemon 執行、pytest、實體 UART 或 Windows 原生實測；本頁只讀固定 revision 的原始碼。"
+    ]
+  },
+  "participants": [
+    {
+      "id": "cli",
+      "label": "CLI／Agent",
+      "type": "frontend",
+      "overview_component": "cli",
+      "responsibility": "執行 Rust daemon start／stop／status；on-demand 主路徑由 PAL 啟動背景行程，先探測健康與掃描其他 daemon。受監管模式的 service 路由、graceful_stop 與更新交接完整流程另見 10-install-supervision。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 87,
+          "end_line": 111,
+          "excerpt_sha256": "fb807b24d1ed6c3d9bcb248aba859a38357f052a3485e6e22a3c640b3ef0c490",
+          "claim": "啟動前以 health.ping 判斷是否可直接回 already_running。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 222,
+          "end_line": 229,
+          "excerpt_sha256": "390e6ff89d01e46837dc7b1c9982393f30654893f1dd7e907a63b26880a3a77a",
+          "claim": "CLI 透過 ProcessCtl::spawn_daemon 啟動背景 daemon。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 334,
+          "end_line": 343,
+          "excerpt_sha256": "dc3af7a7f54798abc9391e419843792447b33ab1f3f6b0393da88188e7722522",
+          "claim": "CLI 把停止請求送成 daemon.stop RPC。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 366,
+          "end_line": 380,
+          "excerpt_sha256": "01fcc7510c5922632b7c0a0cf0555a5ee017ff27077c7925ebbe80556c4f1dac",
+          "claim": "daemon status 只查 health.status，不經首次需求啟動。"
+        }
+      ]
+    },
+    {
+      "id": "daemon",
+      "label": "daemon 主流程",
+      "sublabel": "Rust 啟動與停止序",
+      "type": "backend",
+      "overview_component": "daemon-main",
+      "responsibility": "serialwrapd 的 Rust 入口安裝訊號處理，取得實例鎖後組裝 manager、WAL、事件引擎與 RPC；主流程掌握停止序、共同期限及最終退出碼。watcher、flash 端點、事件引擎與 WAL 在本頁以附屬工作的 note 呈現。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/main.rs",
+          "line": 11,
+          "end_line": 20,
+          "excerpt_sha256": "0cf8b72247ad1c11101403f61b50c6cfdcf583eb2bfb3ffc710040a5443a4684",
+          "claim": "入口選擇 Rust daemon 後，先安裝停止訊號處理。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1219,
+          "end_line": 1233,
+          "excerpt_sha256": "cfa431d65b9858b755a114d4add674242b3e1198c0edc6bab2e5bc467dfc3408",
+          "claim": "主流程取得實例鎖，失敗依類型退出。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1499,
+          "end_line": 1515,
+          "excerpt_sha256": "4bc0f686804e74645e9c5cae896f3cc72824bc71c78495e68d3a7c350d9d8e30",
+          "claim": "主流程先發起 Phase 1，再 join RPC handler，最後等待 Phase 2。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1547,
+          "end_line": 1570,
+          "excerpt_sha256": "f98ca59d1d40747fea57894e204750ffd96dbedb296c2ae0a2ce3fc589528126",
+          "claim": "主流程最後停止事件引擎、關 WAL、釋放鎖，未收斂則 exit 1。"
+        }
+      ]
+    },
+    {
+      "id": "lock",
+      "label": "實例鎖",
+      "sublabel": "平台檔鎖與端點探測",
+      "type": "security",
+      "overview_component": "pal-lock",
+      "responsibility": "PAL 實例鎖同時檢查鎖檔與端點；不構成跨所有鎖檔、所有端點的全機全域互斥，同機多開另由 CLI preflight 與 health 掃描回報。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/lock/posix.rs",
+          "line": 46,
+          "end_line": 64,
+          "excerpt_sha256": "759c6410aa9201b1388c1801647bde7deabc13546543a5a456227a9b06cfb241",
+          "claim": "POSIX 使用非阻塞排他 flock，並探測 Unix socket。"
+        },
+        {
+          "path": "crates/sw-pal/src/lock/windows.rs",
+          "line": 42,
+          "end_line": 46,
+          "excerpt_sha256": "68f1a5cfde9bf7d5979a89a26abc793cc157a6f8801614396548ba953cbe5a4c",
+          "claim": "Windows 先以 TCP 端點存活探測拒絕已有 daemon。"
+        },
+        {
+          "path": "crates/sw-pal/src/lock/windows.rs",
+          "line": 77,
+          "end_line": 90,
+          "excerpt_sha256": "93cf54e8c2956ab7b755e8a7a23374db80103f89cdd106364656e8e90aa19c62",
+          "claim": "Windows 用 LockFileEx 非阻塞鎖定一個位元組。"
+        }
+      ]
+    },
+    {
+      "id": "service",
+      "label": "RPC／Service",
+      "sublabel": "含 framing",
+      "type": "backend",
+      "overview_component": "service",
+      "responsibility": "合併 Service、ServiceHandler、framing 的 RpcServer 與 PAL listener（總覽另列 pal-rpc）；負責 RPC 收送、健康組裝、admission 凍結及停止通知。health 透過注入的 ProcScan（總覽 pal-files）掃描同機 daemon；不把掃描畫成實例鎖的動作。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1411,
+          "end_line": 1428,
+          "excerpt_sha256": "3c7d410485bd02906aefd857a2bab8509712b941197555b1016264415b7e861a",
+          "claim": "建立 Service 並注入 manager、WAL、registry、ProcScan，接著 bind PAL listener。"
+        },
+        {
+          "path": "crates/sw-daemon/src/framing.rs",
+          "line": 254,
+          "end_line": 260,
+          "excerpt_sha256": "1c1f26c6bf75f0a3ad9c1f4c0da93c85aa266906309a28b5a6cfde7ba8944af9",
+          "claim": "framing 寫出停止回應後呼叫 request_stop。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1510,
+          "end_line": 1517,
+          "excerpt_sha256": "0b0ad635519e8975d1a2302bd3c3682a03ef12b9730f8375ddbdf51b410f8615",
+          "claim": "ServiceHandler 分派 RPC，並透過 channel 通知主流程停止。"
+        },
+        {
+          "path": "crates/sw-daemon/src/health.rs",
+          "line": 133,
+          "end_line": 149,
+          "excerpt_sha256": "59c1618644b69176597d17273708680230aab56f59af2140acb2ee2a6b467c25",
+          "claim": "health 組裝 multi_open、foreign_holders 與 multi_open_detail。"
+        }
+      ]
+    },
+    {
+      "id": "manager",
+      "label": "Session 管理",
+      "sublabel": "SessionManager",
+      "type": "backend",
+      "overview_component": "sessions",
+      "responsibility": "管理 session、啟動 attach、設定 stopping gate、等待傳輸行收尾、送 ShutdownGate 與 Shutdown，並收集兩階段 drain 和在途 attach 的結果。RPC thread 經 manager 等待 actor 的回覆；回覆斷線的錯誤由該等待端回傳 Service。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6808,
+          "end_line": 6819,
+          "excerpt_sha256": "4a0e62cd30eaed176e1b80f6a36016d57c7c57f5e206ff1467f31abaae0836ba",
+          "claim": "bootstrap_attach 對已知裝置啟動 attach，stopping 時直接返回。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8492,
+          "end_line": 8505,
+          "excerpt_sha256": "5e86f3432ef98da547799c4d60128dffe0a2fe92ad609eaa64932373fca24741",
+          "claim": "begin_shutdown 設 stopping 並取得 session、actor 與 fence 快照。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8515,
+          "end_line": 8539,
+          "excerpt_sha256": "d30f5b4f24709b6c5aa224264a955cd1061e910c06ea6b564796605a8da42af0",
+          "claim": "manager 發布待凍結並等待行收尾，再以 safety lane 發 ShutdownGate。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8733,
+          "end_line": 8752,
+          "excerpt_sha256": "fe4ddc5417e2bd60d2f1a569d617b1d88a02f5cc3d762cbc12cf4fc12229d201",
+          "claim": "manager 送 Shutdown，並以 control lane 查詢作為 Phase 1 屏障。"
+        }
+      ]
+    },
+    {
+      "id": "actor",
+      "label": "Session actor",
+      "sublabel": "效果執行",
+      "type": "backend",
+      "overview_component": "session-actor",
+      "responsibility": "每 session 一條 actor 執行 SessionCore；本參與者包括注入的 effect executor。actor 保有 pending RPC 回覆通道；executor 實際啟動 IoWorker 的 drain 收尾。Shutdown 的完成旗標會結束 actor 迴圈，沒有等待所有 pending op 的護欄。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/actor.rs",
+          "line": 478,
+          "end_line": 494,
+          "excerpt_sha256": "53d91c3f7e042e224b357fc9db14d34681fc9a414dc76cc639e5256075f30da7",
+          "claim": "為 session 建立 actor thread，啟動效果交 executor 執行。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 1435,
+          "end_line": 1442,
+          "excerpt_sha256": "08e030cbc0076563cd70878a57349e759d922ae99445ef9fcc1c43241da3f251",
+          "claim": "ShutdownGate 清排隊命令，Shutdown 進入 begin_stop(Shutdown)。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6173,
+          "end_line": 6186,
+          "excerpt_sha256": "3f9a4680a6cadf29a6cd3350c1568ee57d95df52ac726d1a84eb712ba8c4ba22",
+          "claim": "BeginDrain executor 移除 runner，取得 worker 並呼叫 finish_async。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 9036,
+          "end_line": 9059,
+          "excerpt_sha256": "8dfbbdfbd683aa4640c75bbad4e61899e4bab6bc1c3eaf4508c2b848890b79fa",
+          "claim": "Recover、SelfTest、InteractiveSend、InteractiveOpen 與 FileTransfer 的 pending op 保存回覆通道。"
+        }
+      ]
+    },
+    {
+      "id": "worker",
+      "label": "UART 收尾",
+      "sublabel": "IoWorker、Fence",
+      "type": "backend",
+      "overview_component": "bridge",
+      "responsibility": "合併 UART bridge 的 Fence、TxWriter、reader 與非同步 drain finisher。Fence 允許目前傳輸行在待凍結窗口內收尾；IoWorker join writer／reader、確認 handle 關閉與 RX barrier 後，以 safety lane 回 WorkerStopped。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 323,
+          "end_line": 349,
+          "excerpt_sha256": "5bf140d42d85a69e6e1aa2c15df0394f6b7f5760771c9556a8f4235678a0c624",
+          "claim": "Fence 發布停機 gate，已有傳輸行時設定 pending 並觸發軟收尾通知。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 844,
+          "end_line": 864,
+          "excerpt_sha256": "9190e2274c7fd2f4b12508b794f5b039eae032860ba1d66cead1f3dac93b05a0",
+          "claim": "finish_async 先停止 worker，於背景 finisher 依序 join writer 與 reader。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 865,
+          "end_line": 877,
+          "excerpt_sha256": "881fe9de1b2c95e6bd22dd6735cbf2879fd0db9d6d1b10f490488c7a414a8d91",
+          "claim": "writer 與 reader 成功返回後，才呼叫 close.close 關閉 UART handle。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 925,
+          "end_line": 934,
+          "excerpt_sha256": "46aee944a1e63f8d15567ca3508d96cf4c2a22c6d87b6d240513905e8d61be7b",
+          "claim": "drain finisher 以傳入的 channel 發 WorkerStopped 回條。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6183,
+          "end_line": 6185,
+          "excerpt_sha256": "e0d5c233412189fdf4e09581f22c475e54ca2c5e2094fa1e5ee308c17bd10320",
+          "claim": "executor 將 safety sender 傳給 worker.finish_async。"
+        }
+      ]
+    },
+    {
+      "id": "runner",
+      "label": "操作執行",
+      "sublabel": "OpRunner",
+      "type": "backend",
+      "overview_component": "execute",
+      "responsibility": "OpRunner lane 執行傳輸、recover、self-test 與互動 TX，執行完以 control lane 回 OpFinished。本頁只引用 file.push 目前行的有限收尾；完整傳檔流程在 05-file-transfer。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 117,
+          "end_line": 132,
+          "excerpt_sha256": "fd8bfcf900606e0c41513a0018a2b7e8509353b062c5693a7fed685d5fe72bfa",
+          "claim": "操作 lane 執行工作後，把 OpFinished 送往 control sender。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 383,
+          "end_line": 412,
+          "excerpt_sha256": "c0a18aa7e7ee420e39e849bb435c8800a961ee68952ec033254427a4143dbab0",
+          "claim": "execute 分派 Command、Recover、SelfTestProbe、InteractiveOpenCmd 與 LeaseSend。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 303,
+          "end_line": 317,
+          "excerpt_sha256": "241022d2988039da0675d85ab09a40ae2aba1f90e042181bd9ab12963d7bab92",
+          "claim": "echo-paced 傳輸行收到軟收尾後停止開新行，超過期限走 kill_line。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 385,
+          "end_line": 392,
+          "excerpt_sha256": "c72393ce49f6dbfbf86ca69f3e090170ec9f31fcd54b5607f968fd6e1be19e0d",
+          "claim": "kill_line 嘗試送清行 payload，然後解除行持有並回傳中止。"
+        }
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "id": "spawn-daemon",
+      "from": "cli",
+      "to": "daemon",
+      "label": "啟動背景行程",
+      "phase": "啟動與綁定",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 91,
+          "end_line": 111,
+          "excerpt_sha256": "1cc1e3be4a8a9d3ad3b8714ecb13fbd5d5d08297f66585b37196e84e133acdcc",
+          "claim": "health.ping 成功時回 already_running，不再啟動。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 122,
+          "end_line": 144,
+          "excerpt_sha256": "7c993d1493e9b3f7e4dc8b87b47f32e72324416e0d4efee64107c399583588e7",
+          "claim": "未加 force_spawn 時，CLI 掃描不同端點的 daemon 並準備拒絕第二個行程。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 148,
+          "end_line": 157,
+          "excerpt_sha256": "402f86909d862e218772f15b48530a5440639839b225270db5bce2583d38abe9",
+          "claim": "不同端點衝突以 DAEMON_ALREADY_RUNNING_ELSEWHERE 回 existing_pid／socket 並 exit 2。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 214,
+          "end_line": 229,
+          "excerpt_sha256": "d4884cab0f5bb86eec4207655e9d3f3a296bbf5c85189d617f34bc563d94c447",
+          "claim": "前景模式直接執行；本頁背景主路徑用 spawn_daemon。"
+        },
+        {
+          "path": "crates/sw-pal/src/process/posix.rs",
+          "line": 80,
+          "end_line": 100,
+          "excerpt_sha256": "cbe429363978ac56ca300964be7da30cab3785bcee677437c507e56ddf740041",
+          "claim": "背景 POSIX 行程以 setsid 建立新 session 並把 stdout／stderr 指向 null。"
+        },
+        {
+          "path": "crates/sw-pal/src/process/windows.rs",
+          "line": 406,
+          "end_line": 423,
+          "excerpt_sha256": "d7972d563fbd2265ad5cb6cbf8cc3789fbdcd97aa616a132b96456afa3638043",
+          "claim": "Windows 背景行程用 DETACHED_PROCESS 與 CREATE_NEW_PROCESS_GROUP，並抑制 stdout／stderr handle 繼承。"
+        },
+        {
+          "path": "crates/sw-daemon/src/launcher.rs",
+          "line": 255,
+          "end_line": 269,
+          "excerpt_sha256": "041c30d9fe138e6669d4f5a48ce77a7002cb4176c910d63106d2ba8bc90141fa",
+          "claim": "開發 build 沒有 manifest，或 implementation 為 rust 時進 Rust daemon。"
+        },
+        {
+          "path": "crates/sw-daemon/src/main.rs",
+          "line": 14,
+          "end_line": 20,
+          "excerpt_sha256": "dbe6332a4e2b64e29f08113eb84d559e93853a51730dca36388bc005ddae9934",
+          "claim": "Rust 入口先安裝訊號處理，才進入主流程。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 65,
+          "end_line": 84,
+          "excerpt_sha256": "21fa28f6fca16c2512dd35d3de2ad8f3d6c1c82dc6e9b8707d54f836fc63e812",
+          "claim": "非 on-demand 的 daemon start 改路由 service start。"
+        }
+      ],
+      "note": "主路徑為 on-demand、背景啟動且 launcher 已選 Rust。CLI 先 ping；健康即 already_running。不同端點的已存活 daemon 預設回 DAEMON_ALREADY_RUNNING_ELSEWHERE；--force-spawn 可略過此掃描護欄，仍須取得實例鎖。Linux｜Windows：setsid 建立新會話｜以 DETACHED_PROCESS 與 CREATE_NEW_PROCESS_GROUP 建立新行程群組並背景分離。受監管模式改走 service start，詳見 10-install-supervision。"
+    },
+    {
+      "id": "acquire-lock",
+      "from": "daemon",
+      "to": "lock",
+      "label": "取得單一實例鎖",
+      "phase": "啟動與綁定",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1176,
+          "end_line": 1196,
+          "excerpt_sha256": "45bbecb15f01342b7689f6f0e83d83b0b75ec5ff9c8494668a0c4d2438c92f34",
+          "claim": "allowlist 檢查通過才建 runtime 目錄並載入 profiles。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1219,
+          "end_line": 1233,
+          "excerpt_sha256": "cfa431d65b9858b755a114d4add674242b3e1198c0edc6bab2e5bc467dfc3408",
+          "claim": "取得鎖；已有實例回 DAEMON_ALREADY_RUNNING，端點無法確認回 SOCKET_UNAVAILABLE，皆 exit 2。"
+        },
+        {
+          "path": "crates/sw-pal/src/lock/posix.rs",
+          "line": 46,
+          "end_line": 64,
+          "excerpt_sha256": "759c6410aa9201b1388c1801647bde7deabc13546543a5a456227a9b06cfb241",
+          "claim": "Linux 先 flock，再檢查 Unix socket 是否可連。"
+        },
+        {
+          "path": "crates/sw-pal/src/lock/windows.rs",
+          "line": 42,
+          "end_line": 46,
+          "excerpt_sha256": "68f1a5cfde9bf7d5979a89a26abc793cc157a6f8801614396548ba953cbe5a4c",
+          "claim": "Windows 先探測 TCP 端點。"
+        },
+        {
+          "path": "crates/sw-pal/src/lock/windows.rs",
+          "line": 77,
+          "end_line": 99,
+          "excerpt_sha256": "3c27f712d38b67997510ff7a4107dea09fffc64980a1d58277822b0f7c0ae853",
+          "claim": "Windows 取得非阻塞 LockFileEx 位元組鎖後寫入 PID。"
+        }
+      ],
+      "note": "allowlist 驗證、runtime 目錄與 profile 載入先於取鎖。Linux｜Windows：flock 整檔鎖加 Unix socket 探測｜LockFileEx 單一位元組（1 B）檔鎖加 TCP 探測；鎖檔與端點任一顯示已有實例即拒絕。不同鎖檔及端點仍可能另起 daemon，不能將這一層當全機唯一保證。"
+    },
+    {
+      "id": "create-manager",
+      "from": "daemon",
+      "to": "manager",
+      "label": "載入狀態並建立管理器",
+      "phase": "啟動與綁定",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1237,
+          "end_line": 1253,
+          "excerpt_sha256": "35b915558eca740fc8301ce5180caf457613d0a15b0c0cd3d709d0810f384d6a",
+          "claim": "取鎖後載入 state.json，失敗釋放鎖；接著開啟 WAL。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1280,
+          "end_line": 1299,
+          "excerpt_sha256": "87a3aec7cf2917aba015e13fc771832167e8b13eb7de2063817e9408d46f3564",
+          "claim": "將 profiles、loaded state、WAL、registry 與 StateStore 注入 manager。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6705,
+          "end_line": 6718,
+          "excerpt_sha256": "b821a3fc9d14b189e4906b4083a0ea5d8f9223fcd70b08be7e485dca1c3058c9",
+          "claim": "manager 建構期間 bootstrap 已設定的 profiles，並持有背景執行緒。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2295,
+          "end_line": 2302,
+          "excerpt_sha256": "bb7f66cb3cddfd43240f9734e84af890530486ffc27e1ad75ebf7bb247e1fe86",
+          "claim": "manager 的 session 建立路徑實際 spawn actor。"
+        }
+      ],
+      "note": "state.json 載入失敗即中止，避免以空狀態覆寫；成功後建立 WAL、命令登錄與 StateStore，再建立 manager。已設定的 session 於建構期間 bootstrap；actor 的登入／開埠另見 02-session-lifecycle。"
+    },
+    {
+      "id": "bootstrap-devices",
+      "from": "daemon",
+      "to": "manager",
+      "label": "初掃、排序並啟動掛接",
+      "phase": "啟動與綁定",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1326,
+          "end_line": 1336,
+          "excerpt_sha256": "9f8f3a8f7a04829cb3cb165936fb8402ee2b3f6791252a1d25e695dfd0d7cb2b",
+          "claim": "flash RX observer 的協調者在 bootstrap attach 前建立。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1364,
+          "end_line": 1366,
+          "excerpt_sha256": "324fdbe2f927ae59a886abee7dca6a9d6e60461681259e9472bfeb9331a3de12",
+          "claim": "Event Engine 成功建立後，其 RX observer 在初掃前註冊。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1383,
+          "end_line": 1392,
+          "excerpt_sha256": "d44822b12616d27d19f08b52a7a629704ef8d11382f8dc2a169d4cebb67449b3",
+          "claim": "初掃後先排 dynamic rank、update devices、bootstrap attach，再啟動 watcher。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6808,
+          "end_line": 6819,
+          "excerpt_sha256": "4a0e62cd30eaed176e1b80f6a36016d57c7c57f5e206ff1467f31abaae0836ba",
+          "claim": "bootstrap_attach 對已知裝置啟動 attach。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 426,
+          "end_line": 429,
+          "excerpt_sha256": "1bba3c83060e4fb90d7a20ce96e70e3eaa17d0d2b126c656d1d3238c5e2704fd",
+          "claim": "FlashCoordinator 建構時實際將 CoordRx observer 登記到 manager。"
+        }
+      ],
+      "note": "flash 協調者與事件 RX observer 先完成註冊；初掃 → dynamic rank → update → bootstrap attach → watcher 啟動。此處只啟動 attach，不等待每個 session READY 才綁 RPC。"
+    },
+    {
+      "id": "bind-rpc",
+      "from": "daemon",
+      "to": "service",
+      "label": "建立服務並綁定 RPC",
+      "phase": "啟動與綁定",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1393,
+          "end_line": 1398,
+          "excerpt_sha256": "b0726472c67ac7e5049c51d4b3c9d0138fafda17136767005133e814b435f7e0",
+          "claim": "watcher 後捕捉程式身分，再建立平台支援的 flash 端點。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1411,
+          "end_line": 1428,
+          "excerpt_sha256": "3c7d410485bd02906aefd857a2bab8509712b941197555b1016264415b7e861a",
+          "claim": "建立 Service、注入程式指紋與路徑，然後 bind RPC listener。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1457,
+          "end_line": 1459,
+          "excerpt_sha256": "bd48d70f8c80676dab6467d681a929df27114968d5969a5f9bd908bc458d4507",
+          "claim": "啟動 RPC server 後才寫 config 的有效 socket_path。"
+        },
+        {
+          "path": "crates/sw-daemon/src/code_identity.rs",
+          "line": 19,
+          "end_line": 29,
+          "excerpt_sha256": "1e985ab2bf94a6be12f8be47e6b22746919c620bae12cbf04e91e0325254ce99",
+          "claim": "指紋只從啟動時 manifest 取得，code_path 取 executable 的兩層父目錄。"
+        },
+        {
+          "path": "crates/sw-pal/src/rpc_transport/listener_posix.rs",
+          "line": 22,
+          "end_line": 25,
+          "excerpt_sha256": "54e4e1bccf59c0a1b4b756feca055b17ab1c0db16686f43fb47b5ac0bdcd4091",
+          "claim": "POSIX listener 支援 Unix 與 TCP 端點。"
+        },
+        {
+          "path": "crates/sw-pal/src/rpc_transport/listener_posix.rs",
+          "line": 41,
+          "end_line": 48,
+          "excerpt_sha256": "4edce861890d7525ef2e53e8929234578be218dac9c4221c031345255673ec8e",
+          "claim": "Unix socket 綁定後設定非阻塞及權限。"
+        },
+        {
+          "path": "crates/sw-pal/src/rpc_transport/listener_windows.rs",
+          "line": 19,
+          "end_line": 40,
+          "excerpt_sha256": "f3583f7e17b6524751936c140a9eb741d2de3ee893485845900858efc19f1943",
+          "claim": "Windows 拒絕 Unix endpoint，驗證 loopback 後綁 TCP。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1589,
+          "end_line": 1600,
+          "excerpt_sha256": "c3ae7df834caf6bd503edc3f7d4a092ee120f9920b613f04ae95ccaabcf882b2",
+          "claim": "設定 socket_path 後寫 config.yaml；失敗只印非致命訊息，函式不傳回錯誤。"
+        }
+      ],
+      "note": "先建立可用的 flash 端點與 Service，再綁 listener、啟動 RpcServer，最後寫 config.yaml 的 socket_path（寫入失敗非致命）。Linux｜Windows：Unix socket（UDS，亦支援 TCP）｜loopback TCP。code_fingerprint 來自啟動時讀取的 manifest，缺失則為 null；不以健康查詢即時重算。"
+    },
+    {
+      "id": "query-health",
+      "from": "cli",
+      "to": "service",
+      "label": "探測健康與查詢狀態",
+      "phase": "健康與同機偵測",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 241,
+          "end_line": 257,
+          "excerpt_sha256": "4d77ed625ed4eba843bb4d01fa1b76a6bfe61d5f8990192937f085cdae8c3fd3",
+          "claim": "啟動後每輪先等待 200 ms，再查子行程退出並以 0.5 秒 timeout 呼叫 health.ping；Windows 50 次、其他平台 15 次。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 272,
+          "end_line": 295,
+          "excerpt_sha256": "f3c28122bc1ae0c3a90c7a5eb3a7c3194db8d9a04731c1a1759dd737a1b3811d",
+          "claim": "啟動成功後查 health.status 並攜回 warnings。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 366,
+          "end_line": 380,
+          "excerpt_sha256": "01fcc7510c5922632b7c0a0cf0555a5ee017ff27077c7925ebbe80556c4f1dac",
+          "claim": "daemon status 直接查 health.status，不觸發首次需求啟動。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 298,
+          "end_line": 303,
+          "excerpt_sha256": "6e6a88afdc94ccd960efa014a59b8872352c7333c243f2134f99626e124c53ae",
+          "claim": "所有啟動探測用盡後，回 DAEMON_NOT_READY 與 pid。"
+        }
+      ],
+      "note": "啟動驗證每輪先等待 200 ms 再探測，單次 ping timeout 0.5 s；Linux｜Windows：15 次｜50 次。成功後再查 health.status 取 warnings；子行程退出回 DAEMON_EXITED，探測用盡回 DAEMON_NOT_READY。日常 daemon status 為唯讀，不會自動啟動 daemon。"
+    },
+    {
+      "id": "health-result",
+      "from": "service",
+      "to": "cli",
+      "label": "回傳健康與同機多開資訊",
+      "phase": "健康與同機偵測",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 870,
+          "end_line": 874,
+          "excerpt_sha256": "3f7151811e79d4bf49fa7cd3945d4573f228c85b9b5e57b8117c2dac8489328a",
+          "claim": "health.ping 回 pong，health.status 進入 health 組裝。"
+        },
+        {
+          "path": "crates/sw-daemon/src/health.rs",
+          "line": 88,
+          "end_line": 113,
+          "excerpt_sha256": "dd5d49c6b8673da45a8e192ccbb714f720965843c0e76d52e057515e273fd9c2",
+          "claim": "health 讀取 session／device／WAL，加入缺 profile／device 警告，並回 PID、版本、程式身分與 running。"
+        },
+        {
+          "path": "crates/sw-daemon/src/health.rs",
+          "line": 114,
+          "end_line": 119,
+          "excerpt_sha256": "6e44efbebe0af5ba268debb74baa628baec6f64d1e6ca29bb9cda598c51a3bc9",
+          "claim": "health 回 session／device／command 數量與 WAL 路徑及健康。"
+        },
+        {
+          "path": "crates/sw-daemon/src/health.rs",
+          "line": 45,
+          "end_line": 49,
+          "excerpt_sha256": "6aa2f5f27e375f414bfa6fde94712430c8b7fb96ed7584141fc8ded1745913b2",
+          "claim": "多開判定取 serialwrapd_instances 數量大於一。"
+        },
+        {
+          "path": "crates/sw-daemon/src/health.rs",
+          "line": 66,
+          "end_line": 83,
+          "excerpt_sha256": "cf3afc4b360e38583829436f3fa739ba3b9625a924e338a61219b2fcb51504cf",
+          "claim": "掃描 tty holder 並合併可見性；Unsupported 時回 false、空集合與 unknown。"
+        },
+        {
+          "path": "crates/sw-daemon/src/health.rs",
+          "line": 133,
+          "end_line": 149,
+          "excerpt_sha256": "59c1618644b69176597d17273708680230aab56f59af2140acb2ee2a6b467c25",
+          "claim": "status 輸出 multi_open、foreign_holders 與 holders_status，含 holder_unknown 補記。"
+        },
+        {
+          "path": "crates/sw-pal/src/proc_scan/posix.rs",
+          "line": 112,
+          "end_line": 138,
+          "excerpt_sha256": "ca6298011473a516f45f65fe414674fd37458704d256eed27c30fd3db50112bc",
+          "claim": "POSIX 列舉 /proc、解析 cmdline 並擷取 daemon 的 socket。"
+        },
+        {
+          "path": "crates/sw-pal/src/proc_scan/posix.rs",
+          "line": 166,
+          "end_line": 174,
+          "excerpt_sha256": "65567a42cb3b558b4a4ac4fe4224c357ce9eba0e7dcdde5456dac5a7d503dc87",
+          "claim": "POSIX health holder 掃描限 serialwrapd 實例持有的 tty。"
+        },
+        {
+          "path": "crates/sw-pal/src/proc_scan/windows.rs",
+          "line": 53,
+          "end_line": 58,
+          "excerpt_sha256": "5b9f8c97958780926a8575d5c728e43e1fc576a9e1501d772f1d551125bbb450",
+          "claim": "Windows 行程列舉使用 Toolhelp32 snapshot。"
+        },
+        {
+          "path": "crates/sw-pal/src/proc_scan/windows.rs",
+          "line": 108,
+          "end_line": 109,
+          "excerpt_sha256": "92de7063345e46790ae7428717cc66bae867575b3322e76bbde538cbf21c0ba7",
+          "claim": "Windows tty holder 掃描回 Unsupported。"
+        },
+        {
+          "path": "crates/sw-pal/src/proc_scan/mod.rs",
+          "line": 494,
+          "end_line": 499,
+          "excerpt_sha256": "3c6b6500b7d3ee9bacf954f098cc3f58f1274a7680040eb71c95abbeb7d296a2",
+          "claim": "multi_open_tty_holders 預設呼叫 serialwrapd_tty_holders，Windows 因而得到 Unsupported。"
+        }
+      ],
+      "note": "ping 的 pong 僅確認 RPC 可回應，不代表 UART READY。status 的 ok 固定為 true，需另看 running、WAL health 及 no_profiles_loaded／no_devices_found。同機多開為被動診斷，不自動 kill。Linux｜Windows：/proc 掃描｜health 的多開掃描因 tty holder Unsupported 而回未知（multi_open:false、daemons 與掃描所得 holders 空、holders_status:unknown；之後仍補記 holder_unknown 裝置）；Windows CLI 的啟動 preflight 仍可使用 Toolhelp32 列舉，不能用 health 的 false 推論全機無多開。"
+    },
+    {
+      "id": "stop-request",
+      "from": "cli",
+      "to": "service",
+      "label": "要求停止 daemon",
+      "phase": "停止接收與行收尾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 320,
+          "end_line": 343,
+          "excerpt_sha256": "5b439fc54326b3b0d5c7dac774aafd60d4d2e18531afb3d0446150007a00b3e5",
+          "claim": "沒有明確 endpoint 且為監管模式時轉 service stop，其餘送 daemon.stop。"
+        },
+        {
+          "path": "crates/sw-cli/src/graceful_stop.rs",
+          "line": 222,
+          "end_line": 237,
+          "excerpt_sha256": "76e965048ac620f70b269b81a9f4df7ea12e12ab93af647bc39869f554e2b1a1",
+          "claim": "graceful_stop 額外送 daemon.stop 並等待行程消失，與單純 daemon stop 回應不同。"
+        }
+      ],
+      "note": "主路徑為明確連到 daemon 或 on-demand 的 daemon.stop，RPC timeout 2 s。未明確指定端點的監管模式先 route service stop。單純 daemon stop 的回覆是受理停止；需要等待行程樹消失的 service／更新操作使用 graceful_stop，詳見 10-install-supervision。"
+    },
+    {
+      "id": "stop-ack",
+      "from": "service",
+      "to": "cli",
+      "label": "先回覆已受理停止",
+      "phase": "停止接收與行收尾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/framing.rs",
+          "line": 254,
+          "end_line": 260,
+          "excerpt_sha256": "1c1f26c6bf75f0a3ad9c1f4c0da93c85aa266906309a28b5a6cfde7ba8944af9",
+          "claim": "framing 組 ok:true、stopping:true，寫回後才呼叫 request_stop。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 361,
+          "end_line": 363,
+          "excerpt_sha256": "bea508b61b35ea6c9a6227bb3d15b25d537cb2e7517373b5d337f080a32efb5c",
+          "claim": "CLI 根據 daemon.stop 的 ok 回傳結果，沒有在此等待所有收尾完成。"
+        }
+      ],
+      "note": "回 {ok:true,stopping:true} 的寫出嘗試先於 request_stop；這不是 UART 已關閉、WAL 已同步或行程已退出的證明。即使回應寫入失敗也會 request_stop。"
+    },
+    {
+      "id": "notify-stop",
+      "from": "service",
+      "to": "daemon",
+      "label": "通知主流程停止",
+      "phase": "停止接收與行收尾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1514,
+          "end_line": 1517,
+          "excerpt_sha256": "40cce723ab251393b27adde68e2fe39b817fe7b376417f783b4f8cedecc4cd71",
+          "claim": "ServiceHandler 先設定 stop_accept 旗標，再往 stop channel 發通知。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1462,
+          "end_line": 1470,
+          "excerpt_sha256": "d5d886db394c2a8bca1f16e7ec4b17eb9f40e087234a8fdd79da368b0dae0ecb",
+          "claim": "主流程等到停止來源後設定 running:false 並凍結 admission。"
+        },
+        {
+          "path": "crates/sw-pal/src/signal/posix.rs",
+          "line": 42,
+          "end_line": 51,
+          "excerpt_sha256": "38626e2c88eca38fbc424ff063b3baaff4a133bcadffa154a0a6cb75ee012eef",
+          "claim": "POSIX wait_stop 同時等待平台內部訊號與 RPC channel。"
+        },
+        {
+          "path": "crates/sw-pal/src/signal/posix.rs",
+          "line": 80,
+          "end_line": 89,
+          "excerpt_sha256": "c6f2622ea70228c0e066e01781b8e69aeabda32594e19332ee0a68f225c19df1",
+          "claim": "POSIX 安裝 SIGINT／SIGTERM 的訊號集合。"
+        },
+        {
+          "path": "crates/sw-pal/src/signal/windows.rs",
+          "line": 39,
+          "end_line": 56,
+          "excerpt_sha256": "02f9cf129289e7bfe4f26a48503b67f5e86a99bcd4b333d06195cfafc0d2f40d",
+          "claim": "Windows 同時等待 RPC channel 與 Ctrl+C／Break／Close 控制事件。"
+        }
+      ],
+      "note": "此箭頭是 ServiceHandler 的 channel 通知，且它先設停止 accept 的旗標。平台通知是另一個同等入口：Linux｜Windows：SIGINT／SIGTERM 訊號｜Ctrl+C／Ctrl+Break／console 關閉事件；兩者都喚醒同一主流程停止序。"
+    },
+    {
+      "id": "freeze-admission",
+      "from": "daemon",
+      "to": "service",
+      "label": "凍結 admission 並停止接收",
+      "phase": "停止接收與行收尾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1467,
+          "end_line": 1475,
+          "excerpt_sha256": "fe105a35028191bf99cb884a22480e8ab953174d4c104c9bc650cead9006feb7",
+          "claim": "主流程 running:false、shutdown_freeze 後呼叫 server.stop_accept。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 503,
+          "end_line": 506,
+          "excerpt_sha256": "2aac70b95c624cdae0ab74e98fa84fed18490985736d5a80e3c2253ebb0dff0c",
+          "claim": "shutdown_freeze 呼叫 admission.freeze。"
+        },
+        {
+          "path": "crates/sw-core/src/admission.rs",
+          "line": 216,
+          "end_line": 220,
+          "excerpt_sha256": "85f3573aeb7f0b192e0e0d74e0ae95da488094b88b75231c2d3f1ae20a1bcc30",
+          "claim": "admit 在 gate 已凍結時不發 ticket。"
+        },
+        {
+          "path": "crates/sw-core/src/admission.rs",
+          "line": 251,
+          "end_line": 257,
+          "excerpt_sha256": "5f5d3fab5e9e24efb1a870120ea0ed934fa257817afc42a9e826093d7b9d163b",
+          "claim": "一般停機的 freeze 清除可撤銷的 idle token，使交接回滾無法撤銷此凍結。"
+        },
+        {
+          "path": "crates/sw-daemon/src/framing.rs",
+          "line": 489,
+          "end_line": 498,
+          "excerpt_sha256": "4b42a6d44506dfdf3846bf2dcda6273822bcb01a61f2060f333511b551de90ee",
+          "claim": "stop_accept 等 acceptor 結束並通知既有連線停止，沒有 join handler。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 127,
+          "end_line": 129,
+          "excerpt_sha256": "b6bf0c5486a7817aefbcc26633c32c81979e84e23102fe553c05b30fae58290c",
+          "claim": "admission 凍結回應明確包含 FLUSHED_BY_SHUTDOWN 與 reason:handoff_frozen。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 735,
+          "end_line": 743,
+          "excerpt_sha256": "16b9ddc64b94425606cbdb7583e73bd53a5d4b69586b6cb8ae04ad7784850b08",
+          "claim": "Service 在副作用前取得 ticket，拿不到時回凍結回應。"
+        }
+      ],
+      "note": "主流程將 running 設 false，永久凍結新副作用 admission；凍結後的新操作回 FLUSHED_BY_SHUTDOWN 並帶 reason:handoff_frozen。RPC 停止路徑已先設 accept 旗標，此時 stop_accept 完成 acceptor join；既有 handler 留待 Phase 1 後再 join，避免長 file.push 阻塞取消。"
+    },
+    {
+      "id": "begin-shutdown",
+      "from": "daemon",
+      "to": "manager",
+      "label": "封鎖新掛接入口",
+      "phase": "停止接收與行收尾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1477,
+          "end_line": 1478,
+          "excerpt_sha256": "635482c1647afa3da6129f10c369b80d7ceac6cbad13e7f54035bf968f7acb9c",
+          "claim": "stop_accept 後呼叫 manager.begin_shutdown。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8492,
+          "end_line": 8505,
+          "excerpt_sha256": "5e86f3432ef98da547799c4d60128dffe0a2fe92ad609eaa64932373fca24741",
+          "claim": "begin_shutdown 設 stopping 與 shutdown_started，再取得每個 actor、fence 的快照。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8507,
+          "end_line": 8514,
+          "excerpt_sha256": "0346fe00befd677b8ab174883fb77c9cc1a619fd84e8c2189ff29ca82b5b0785",
+          "claim": "發布 probe_tx_frozen，並凍結 handoff probe 登記入口。"
+        }
+      ],
+      "note": "manager 的 stopping gate 先阻止新的 attach／hotplug／後置重開；同時發布 probe TX 停機旗標並取得 live fences，之後才等待已持有的傳輸行收尾。此處尚未對各 actor 執行 begin_stop(Shutdown)。"
+    },
+    {
+      "id": "settle-fences",
+      "from": "manager",
+      "to": "worker",
+      "label": "發布待凍結並等待目前行",
+      "phase": "停止接收與行收尾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8515,
+          "end_line": 8527,
+          "excerpt_sha256": "dbe2a0dee14de3fcfe42a42790256603f01b94f7269c7ca4034ee30f9274890f",
+          "claim": "對 session 與 probe fence 發布待凍結，pending 行共用行收尾預算。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 119,
+          "end_line": 121,
+          "excerpt_sha256": "04ca1e19fde84ffc3894f09520872d09dfaf5020429d8832b02542ec9ff8c171",
+          "claim": "manager 行收尾共用預算為 1250 ms。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 9227,
+          "end_line": 9239,
+          "excerpt_sha256": "728f7c571477f6de6f355ae0a04a4a44a64d0318d9c5d98de82cae36fd426af0",
+          "claim": "等待所有 pending fence；到期限仍未凍結者強制凍結。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 323,
+          "end_line": 349,
+          "excerpt_sha256": "5bf140d42d85a69e6e1aa2c15df0394f6b7f5760771c9556a8f4235678a0c624",
+          "claim": "存在傳輸行時軟喚醒持有者並暫設 pending，沒有行則立即 frozen。"
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 1122,
+          "end_line": 1125,
+          "excerpt_sha256": "857f9169683d8df4024121f753d22ba5ab52d447713c5dfb60f57548d48bae4c",
+          "claim": "Python begin_shutdown 只設 _shutting_down 旗標。"
+        }
+      ],
+      "note": "一般 TX 停止准入；已有 echo-paced 傳輸行可先收尾，沒有行則立即凍結。manager 對所有 pending fences 共用 1250 ms，屆時 force_shutdown_freeze；此等待與下一步操作執行並行。Python 0.4.x 對照：begin_shutdown 只設 _shutting_down，本 revision Rust 另處理行收尾與後續 ShutdownGate；僅就此函式直接比對。"
+    },
+    {
+      "id": "settle-push-line",
+      "from": "runner",
+      "to": "worker",
+      "label": "完成目前行或嘗試清行",
+      "phase": "停止接收與行收尾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 24,
+          "end_line": 27,
+          "excerpt_sha256": "f05948fb758116d3d1cf514331f389132c738980abc8f84a265b817275413ca7",
+          "claim": "軟收尾期限 750 ms，逾時清行功能啟用。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 151,
+          "end_line": 160,
+          "excerpt_sha256": "5a58494a86b6e364f5a4aea060d9f8e8669aeb8ccd7ba977dcd20b8047a19f43",
+          "claim": "傳輸端首次看到 settle 通知才起算 750 ms。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 303,
+          "end_line": 311,
+          "excerpt_sha256": "36b44c8e86e97e48ba446399d2ca867a54bbcf4f6d4dbeeaa91d2e4a72e454bc",
+          "claim": "還沒送任何字元時直接取消，不開新行；已有行遇期限則 kill_line。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 328,
+          "end_line": 351,
+          "excerpt_sha256": "a2ef12e51c54067dbb7e66c3e9dc2b3e60ef1b50bbcc170ed6b4147505727c0d",
+          "claim": "目前行能完成時提交換行，期限到或 echo 不足時改 kill_line。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 110,
+          "end_line": 111,
+          "excerpt_sha256": "ecd6013a42e1f996666e39caecc9fd635ed93fc7d58a225cff856cd495f596af",
+          "claim": "kill_line 的 payload 為 Ctrl-U 加換行（0x15 0x0a）。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 385,
+          "end_line": 392,
+          "excerpt_sha256": "c72393ce49f6dbfbf86ca69f3e090170ec9f31fcd54b5607f968fd6e1be19e0d",
+          "claim": "kill_line 嘗試提交清行 payload，不等待成功保證，再解除行持有。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 384,
+          "end_line": 399,
+          "excerpt_sha256": "730145d5ebc43045f65ecbb36e38e6ada3078e353ea0467076911990bcfe7c4f",
+          "claim": "解除行持有時，若有 pending shutdown 就在同一臨界區完成凍結。"
+        }
+      ],
+      "note": "issue #282 已合入：只讓目前行收尾，不把整次 push 跑完。傳輸端首次看見通知後最多 750 ms；順利則送行尾換行，等不到／echo 不足則嘗試送 Ctrl-U＋換行。manager 的 1250 ms 上限仍可強制凍結，且 kill_line 忽略 submit 回條，不能保證 DUT 一定收到清行。詳細傳檔分片與回顯見 05-file-transfer。",
+      "condition": "停機時 file.push 已持有 echo-paced 行；此步在前一步等待窗口內與 manager 並行。"
+    },
+    {
+      "id": "shutdown-gate",
+      "from": "manager",
+      "to": "actor",
+      "label": "以 safety lane 沖刷排隊命令",
+      "phase": "停止接收與行收尾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8529,
+          "end_line": 8545,
+          "excerpt_sha256": "0d8e5800b50b5c0f467845533e5cb5977305dd9e4c84b379f709241fcfe88e30",
+          "claim": "行收尾等待後逐個透過 safety lane 送 ShutdownGate，再等待回覆。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 1435,
+          "end_line": 1437,
+          "excerpt_sha256": "fbac207b59bc5eff39a0f788d05272117a569c28433801718eb5ce247bd70fa8",
+          "claim": "actor 收到 ShutdownGate 先 flush_shutdown_queue，然後回 ok。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7528,
+          "end_line": 7533,
+          "excerpt_sha256": "5b7436e6994c2ec12524fb974385d456252cb4ec2ac5ad97e1ceb0bb002bb842",
+          "claim": "flush_shutdown_queue 清 queue、終止 parked command，將 accepted 登錄設 FLUSHED_BY_SHUTDOWN。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1479,
+          "end_line": 1487,
+          "excerpt_sha256": "5ea44f52a6a6fd3538a33b4a4682f243a891bd053c8c0927d5b7a33682fbe2d0",
+          "claim": "begin_shutdown 返回後主流程再 flush registry，接著停 watcher、關閉事件 intake。"
+        }
+      ],
+      "note": "先完成行收尾等待，再送 ShutdownGate；只沖刷排隊命令，在途工作保留正常結算機會。begin_shutdown 返回後主流程也 flush accepted 登錄，再停 watcher、關事件 intake。command.submit 的排隊結果是 FLUSHED_BY_SHUTDOWN，不依賴 pending RPC 回覆存活。"
+    },
+    {
+      "id": "drain-phase1",
+      "from": "daemon",
+      "to": "manager",
+      "label": "啟動 Phase 1 排空",
+      "phase": "各 session 排空",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1484,
+          "end_line": 1497,
+          "excerpt_sha256": "423033fbec748ffbc5ba4f9f7f58f7ce1a926d107efb97fc8dd310a7adda03ff",
+          "claim": "先停 watcher、關事件 intake，然後停止 flash 端點；無端點視為收斂。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1499,
+          "end_line": 1502,
+          "excerpt_sha256": "221fba4e04a0fd9b6c5bc8744795cea1860b66e6eeaf19c0c89ca4a12d4e94cc",
+          "claim": "行收尾耗時自共用 drain 預算扣除，再啟動 shutdown_phase1。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 78,
+          "end_line": 82,
+          "excerpt_sha256": "ff074e898aff55c23492e74de972c25a627410f6687237b858e678ce55f59b8e",
+          "claim": "drain Phase 1、handler join、Phase 2 與 event handler 共用 5 秒期限。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8651,
+          "end_line": 8665,
+          "excerpt_sha256": "9f259a053e321eacc957e537b69e7ec6a7b2d9952a398104f52a9423d1864e41",
+          "claim": "Phase 1 再確認 begin_shutdown、停背景工作並取消在途 attach。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 223,
+          "end_line": 235,
+          "excerpt_sha256": "3b40348b8b2f64190d7611cd307ea751198ba134ab8321ecaf2c5da8a345ae47",
+          "claim": "原生 Linux 平台的 flash_endpoint 能力啟用。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 278,
+          "end_line": 290,
+          "excerpt_sha256": "707d0057977ff32ca86abf848eff0607ddf79be1fda219c4f75797af25b7051c",
+          "claim": "原生 Windows 平台的 flash_endpoint 能力關閉。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint.rs",
+          "line": 62,
+          "end_line": 70,
+          "excerpt_sha256": "c47a87ec81945904dac245d31ef583f25b9b788ada43f1ff2b46223c6a66d0d4",
+          "claim": "flash_endpoint 能力關閉時不建立端點。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint.rs",
+          "line": 33,
+          "end_line": 36,
+          "excerpt_sha256": "8efd15e243906a908a378d7a8a48ef832fde77e27be1a77dcdbc9bfebe5b6a80",
+          "claim": "FlashEndpoint stop 的 join 上限為 2 秒。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint.rs",
+          "line": 123,
+          "end_line": 139,
+          "excerpt_sha256": "b35ec3f1e16d2d3e50c6b7204496c0826455bebcc9b6b58d1d5eda0abab28e6d",
+          "claim": "stop 發 shutdown 通知，有限等待端點 thread，然後嘗試 unlink。"
+        }
+      ],
+      "note": "本步之前依序停 watcher、關事件 intake、處理 flash 端點：Linux｜Windows：停止 /dev/ttyMCU 並 unlink｜無此端點；有端點時 join 上限 2 s。接著停止背景工作、取消在途 attach。Phase 1／handler join／Phase 2／事件 handler 共用 5 s，並扣除行收尾耗時；不是每個 session 各給 5 s。"
+    },
+    {
+      "id": "shutdown-actors",
+      "from": "manager",
+      "to": "actor",
+      "label": "逐一送出 Shutdown",
+      "phase": "各 session 排空",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8733,
+          "end_line": 8752,
+          "excerpt_sha256": "fe4ddc5417e2bd60d2f1a569d617b1d88a02f5cc3d762cbc12cf4fc12229d201",
+          "claim": "對需要 drain 的 actor 走 control lane 送 Shutdown，並用同 lane 查詢作屏障。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 1439,
+          "end_line": 1442,
+          "excerpt_sha256": "7107afb94bf8027096236fe379634ec8860b3ba7d20b4f13302c6eadcc9ea69d",
+          "claim": "Shutdown 直接呼叫 begin_stop(Shutdown)。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 2244,
+          "end_line": 2270,
+          "excerpt_sha256": "3b344f9392946ea981a5524f49b12385392e73243dc16fca8ff4900f4ed13afd",
+          "claim": "Phase 1 凍結 fence、失效世代、取消傳檔等待、沖刷命令與 interactive，再發 BeginDrain。"
+        }
+      ],
+      "note": "DETACHED／RELEASED 且沒有退休 bridge 待回條者略過；仍有退休 bridge 者也送 Shutdown。actor 的 begin_stop(Shutdown) 凍結 fence、取消傳檔 RunCancel、flush 排隊命令並清 interactive。control lane 的查詢屏障確認 Phase 1 已執行或 actor 已結束；不是完整 drain 回條。"
+    },
+    {
+      "id": "begin-drain",
+      "from": "actor",
+      "to": "worker",
+      "label": "交由背景執行緒關閉 UART",
+      "phase": "各 session 排空",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6173,
+          "end_line": 6186,
+          "excerpt_sha256": "3f9a4680a6cadf29a6cd3350c1568ee57d95df52ac726d1a84eb712ba8c4ba22",
+          "claim": "actor executor 收 BeginDrain 後移除 runner、停止 pump，呼叫 worker.finish_async 並傳 safety sender。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 844,
+          "end_line": 864,
+          "excerpt_sha256": "9190e2274c7fd2f4b12508b794f5b039eae032860ba1d66cead1f3dac93b05a0",
+          "claim": "finish_async 先停止 worker，於背景 finisher 依序 join writer 與 reader。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 865,
+          "end_line": 877,
+          "excerpt_sha256": "881fe9de1b2c95e6bd22dd6735cbf2879fd0db9d6d1b10f490488c7a414a8d91",
+          "claim": "writer 與 reader 成功返回後，才呼叫 close.close 關閉 UART handle。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 905,
+          "end_line": 915,
+          "excerpt_sha256": "a3c4e87144295de1be80bc50e168453b1ba0fa0048705a88426f5871fe85fdef",
+          "claim": "取得 reader 序號後等待 RX dispatch barrier，再組回條。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 102,
+          "end_line": 107,
+          "excerpt_sha256": "7a3783a7c32628597b15ca4c4884fce84dbadffba48c8183d5eb819e6553e14a",
+          "claim": "OpRunner 只持有兩個工作 sender，沒有 JoinHandle。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 117,
+          "end_line": 136,
+          "excerpt_sha256": "57473feb65225ca0967f207cc9e69d108472f66520350be81e07483579a98d9b",
+          "claim": "工作 thread 保留執行中的 execute，返回後仍嘗試送 OpFinished；spawn 不保存 join handle。"
+        }
+      ],
+      "note": "箭頭的實際呼叫者是 actor 附屬 effect executor。移除 OpRunner 控制物件不等於等它的每個工作返回；UART drain finisher 另起執行緒，依序 join writer → join reader → close handle → RX dispatch barrier，再準備 WorkerStopped。OpFinished 與這條回條路徑可並行。"
+    },
+    {
+      "id": "op-finished-first",
+      "from": "runner",
+      "to": "actor",
+      "label": "先回報操作完成供結算",
+      "phase": "完成通知與停機窗口",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 124,
+          "end_line": 132,
+          "excerpt_sha256": "8f27d3d0aa3b12bd455181479630b51f1bb86d4d5aa65f23470c8eef9e09f734",
+          "claim": "操作執行完以 control lane 發送 OpFinished。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 474,
+          "end_line": 488,
+          "excerpt_sha256": "1cc8222c26c31506c47c3f66afcb232bb2650f1d2b0ad7e3fce25accfce22f7a",
+          "claim": "drain／取消等拒絕依整段已確認 bytes 映射為 COMMAND_ABORTED_IN_FLIGHT 或 FLUSHED_BY_RECOVERY。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8045,
+          "end_line": 8050,
+          "excerpt_sha256": "1991b29fe77529d1e3513469c8b8c4a4dfa32538094859f16371a979b4814168",
+          "claim": "FileTransfer 已失去 current 世代時，仍透過 answer_stale_op 回傳結果與釋放 admission。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7911,
+          "end_line": 7922,
+          "excerpt_sha256": "8feed12c2e8c431953a45008aa93a682351e95c4567e697236ced973b6e8a89c",
+          "claim": "current FileTransfer 結算前景與 admission 後回覆 RPC。"
+        },
+        {
+          "path": "contracts/behavior_changes.yaml",
+          "line": 89,
+          "end_line": 92,
+          "excerpt_sha256": "02d98b33dc98955a63c75febd09b5f0ad43b2568f2c6ee81fcfa47012cdfc6a2",
+          "claim": "OD-62 要求傳輸至少已送出 1 byte 後被 drain 中止時，回 COMMAND_ABORTED_IN_FLIGHT。"
+        },
+        {
+          "path": "contracts/behavior_changes.yaml",
+          "line": 250,
+          "end_line": 254,
+          "excerpt_sha256": "85a5f3a817fc5ef51833f71e2c024c90f8b5a27ae76c91d2c46da62869c2fdcf",
+          "claim": "OD-62 要求尚未送出任何 byte 的中止傳輸回 FLUSHED_BY_RECOVERY。"
+        }
+      ],
+      "note": "此為能保住正常回覆的交錯：傳檔因凍結／drain 中止後，已確認寫出至少 1 byte 回 COMMAND_ABORTED_IN_FLIGHT，零 byte 回 FLUSHED_BY_RECOVERY；stale op 仍可只回覆、不套新世代副作用。回應經 manager／Service 返回原請求者；若下步 WorkerStopped 搶先使 actor 結束，則走 #296 分支。",
+      "condition": "停機仍有已受理操作，且 OpFinished 在完成 Shutdown 的 WorkerStopped 之前被 actor 處理。"
+    },
+    {
+      "id": "worker-stopped",
+      "from": "worker",
+      "to": "actor",
+      "label": "以 safety lane 回傳排空回條",
+      "phase": "完成通知與停機窗口",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6183,
+          "end_line": 6185,
+          "excerpt_sha256": "e0d5c233412189fdf4e09581f22c475e54ca2c5e2094fa1e5ee308c17bd10320",
+          "claim": "finish_async 的參數明確使用 safety sender。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 925,
+          "end_line": 934,
+          "excerpt_sha256": "46aee944a1e63f8d15567ca3508d96cf4c2a22c6d87b6d240513905e8d61be7b",
+          "claim": "WorkerStopped 回條包含 ledger、WAL 錯誤與 handle_closed。"
+        },
+        {
+          "path": "crates/sw-core/src/mailbox.rs",
+          "line": 728,
+          "end_line": 745,
+          "excerpt_sha256": "69ecaa3b051c75822dd02db205777875cbfe650723bb5f2392ae14083fc69ab3",
+          "claim": "mailbox 的 select_biased 優先 safety lane，WorkerStopped 可依 RX dependency 暫存或直接成為控制事件。"
+        },
+        {
+          "path": "crates/sw-core/src/mailbox.rs",
+          "line": 752,
+          "end_line": 754,
+          "excerpt_sha256": "01106bc5b542dd704ae5c76a644469c91ee7c49bc088fa4131ce992bfac6deed",
+          "claim": "control lane 排在 safety lane 之後選取。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 6548,
+          "end_line": 6553,
+          "excerpt_sha256": "65c6ea76f7bef0816b982a28dd33a4252ff7fd79783c5e210f6836a8591dbdd3",
+          "claim": "worker_stopped 先比對 stop_id 與 epoch。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 6616,
+          "end_line": 6618,
+          "excerpt_sha256": "3782ed8c324e18de59bce01f633f003c54bd9e36d8a3ee0679054eefbf7d6de6",
+          "claim": "匹配且 handle 已確認關閉的回條先用 ledger 結算 aborted command。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 6827,
+          "end_line": 6838,
+          "excerpt_sha256": "1558eac625d5d5df9fb6ebbe671a12807d83afcd67b1bb4f7678a1ebdd52be5d",
+          "claim": "在途一般命令依確認 bytes 與 unknown 狀態分類結算。"
+        },
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 408,
+          "end_line": 415,
+          "excerpt_sha256": "b3049995a122b0f9016a7a3f47c9208b0ea088fe52145b2b9187ebf06e603105",
+          "claim": "BC-03 在途命令依類別得到 COMMAND_ABORTED_IN_FLIGHT、FLUSHED_BY_RECOVERY 或 SEND_FAILED。"
+        }
+      ],
+      "note": "主路徑確認 handle_closed 與 RX barrier 後結算；關閉不明時不能當成功。此通知走 safety lane，OpFinished 走 control lane，mailbox 優先取 safety；RX dependency 可能延後 WorkerStopped，卻不保證等 OpFinished。#296 的競態正是它可能搶先；一般 command.submit 在途紀錄由本回條按 BC-03 結算，與 pending RPC 斷線不同。"
+    },
+    {
+      "id": "drain-reply",
+      "from": "actor",
+      "to": "manager",
+      "label": "回報 session 排空並結束 actor",
+      "phase": "完成通知與停機窗口",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 6720,
+          "end_line": 6724,
+          "excerpt_sha256": "7785f2f7d04dc041d6f0365920ee5d034b303160abe410af65b49e902969825d",
+          "claim": "Shutdown 正常收尾設 DETACHED 並回覆 drain waiter。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 6798,
+          "end_line": 6804,
+          "excerpt_sha256": "18daaf34ef6e621e1d851aaa12e7c22a16b71a03381e8d7e6fceb2a3131932c2",
+          "claim": "shutdown_requested 且無待提交持久化時設 shutdown_complete，未檢查 pending op。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 2412,
+          "end_line": 2414,
+          "excerpt_sha256": "746c599d613fd449eb62775ed2a291d45d666b440d89b631bbd8f240e15efbb2",
+          "claim": "shutdown_complete 只回傳布林旗標。"
+        },
+        {
+          "path": "crates/sw-core/src/actor.rs",
+          "line": 503,
+          "end_line": 516,
+          "excerpt_sha256": "5c632cc21911207f8da5141962b853c2a3f0ccedea1cbc26b5614cf0a1d10e31",
+          "claim": "actor dispatch 回 true 時結束迴圈。"
+        },
+        {
+          "path": "crates/sw-core/src/actor.rs",
+          "line": 837,
+          "end_line": 839,
+          "excerpt_sha256": "459b7ea42d0c55a018f05fc273ba6ffd655285052125d01c26ae28196f0bbc95",
+          "claim": "dispatch 的停止回傳值取 core.shutdown_complete。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 2370,
+          "end_line": 2375,
+          "excerpt_sha256": "05d7ee8cebbb9c520228e86ea2241db52b67be9be83995fb3c5df06cfcae4c23",
+          "claim": "無需 worker 的 Shutdown 收尾路徑同樣可直接設 shutdown_complete。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 2294,
+          "end_line": 2307,
+          "excerpt_sha256": "cff2e0862e9f1465e320c7d060bdf196731513120d6f0213290e26ebff753fe2",
+          "claim": "finish_stop_without_worker 的 Shutdown 分支先等待已觀測 custody；不需 worker 的實際收尾在本函式內。"
+        }
+      ],
+      "note": "有 bridge 的主路徑在 WorkerStopped 正常收尾時回覆 Shutdown waiter，設 shutdown_complete 並退出 actor。現有 gate 只顧 pending commit，未等 PendingOp::FileTransfer 等回覆通道；無需 worker 的收尾分支也能直接設旗標。因此 drain 已成功不能推出每個原 RPC 都收到應有錯誤碼。"
+    },
+    {
+      "id": "op-finished-late",
+      "from": "runner",
+      "to": "actor",
+      "label": "嘗試送出遲到的操作完成",
+      "phase": "完成通知與停機窗口",
+      "basis": "inferred",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 124,
+          "end_line": 132,
+          "excerpt_sha256": "8f27d3d0aa3b12bd455181479630b51f1bb86d4d5aa65f23470c8eef9e09f734",
+          "claim": "操作只在 execute 返回後送 OpFinished，send 失敗被忽略。"
+        },
+        {
+          "path": "crates/sw-core/src/mailbox.rs",
+          "line": 728,
+          "end_line": 745,
+          "excerpt_sha256": "69ecaa3b051c75822dd02db205777875cbfe650723bb5f2392ae14083fc69ab3",
+          "claim": "safety lane 的 WorkerStopped 可先被取出。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 6798,
+          "end_line": 6804,
+          "excerpt_sha256": "18daaf34ef6e621e1d851aaa12e7c22a16b71a03381e8d7e6fceb2a3131932c2",
+          "claim": "Shutdown 完成旗標沒有等待 pending op。"
+        },
+        {
+          "path": "crates/sw-core/src/actor.rs",
+          "line": 503,
+          "end_line": 516,
+          "excerpt_sha256": "5c632cc21911207f8da5141962b853c2a3f0ccedea1cbc26b5614cf0a1d10e31",
+          "claim": "完成旗標讓 actor 迴圈結束。"
+        }
+      ],
+      "note": "讀碼推論的 #296 交錯：safety lane 的 WorkerStopped 先於 control lane 的 OpFinished 完成 Shutdown；此時 OpFinished 可能還在執行、排在 control lane 未讀，或送往已關閉 mailbox。箭頭只代表完成通知的送出嘗試，不能表示 actor 仍會處理。圖中選擇「actor 結束後再嘗試通知」這個可能交錯；與下一步的 RPC 等待端斷線可並行。PR #298 未合入固定 revision，不能套用其等待修正。",
+      "condition": "WorkerStopped 已先完成 Shutdown，且操作在 daemon 後續收尾期間才返回並嘗試送出 OpFinished。"
+    },
+    {
+      "id": "pending-rpc-error",
+      "from": "manager",
+      "to": "service",
+      "label": "回傳 pending RPC 斷線錯誤",
+      "phase": "完成通知與停機窗口",
+      "basis": "inferred",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 9036,
+          "end_line": 9059,
+          "excerpt_sha256": "8dfbbdfbd683aa4640c75bbad4e61899e4bab6bc1c3eaf4508c2b848890b79fa",
+          "claim": "self-test、recover、interactive send／open 與傳檔 pending op 直接持有回覆通道。"
+        },
+        {
+          "path": "crates/sw-core/src/actor.rs",
+          "line": 333,
+          "end_line": 351,
+          "excerpt_sha256": "b450bf717710024131d864a8b8bcd2129ce97c29b615a0379f51996f7d3d7fe4",
+          "claim": "等待回覆的 ActorHandle 遇通道斷線並確認 actor 結束後產生 session actor stopped。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2044,
+          "end_line": 2046,
+          "excerpt_sha256": "ccbc9b43427ab31b46ee82d6e036072fa22df153360965b29f6d5f776c693419",
+          "claim": "manager 的 request 直接回傳 ActorHandle::request 結果。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6875,
+          "end_line": 6886,
+          "excerpt_sha256": "b8060e5be04887ab77d6fb67e4317577b8bcc263c61d63f04aaae04d186051ae",
+          "claim": "file_transfer_with_admission 將已受理傳檔 route 到 actor 並等待。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 865,
+          "end_line": 867,
+          "excerpt_sha256": "9c25eb62c545c095db13694ea2391833daa57862c7157fe8fb04d0cdd3d1ff3c",
+          "claim": "Service 呼叫 manager 傳檔方法，僅 map 成功結果而保留錯誤。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 587,
+          "end_line": 591,
+          "excerpt_sha256": "653b978cd9bec8b5a10a41e058bb69908cf5fa023cf2e697028b0e7f05095470",
+          "claim": "self-test／recover 共用 wait_regex_from，走非 cancellable regex 等待。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 956,
+          "end_line": 959,
+          "excerpt_sha256": "b944202d0cac6f1dce624cd26134ab9644e20f9cb13d8beb1af1cc221b963458",
+          "claim": "READY recover 送控制鍵後以 wait_regex_from 等 prompt。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 999,
+          "end_line": 1008,
+          "excerpt_sha256": "09e74d46c6dc0a39254c934c3b0260eaacae3a040fd7844408a745f9b5866249",
+          "claim": "self-test 以 wait_regex_from 等 nonce 及 prompt。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 349,
+          "end_line": 375,
+          "excerpt_sha256": "97e4f7c483f6bd61a167971789066b8596239f9b79e8acb7f0f80f285997ec57",
+          "claim": "一般 regex 等待只檢查匹配與期限，未讀 drain cancellation。"
+        }
+      ],
+      "note": "已知 #296：FileTransfer 回覆通道隨 actor 丟棄而斷線，manager 的等待端回 PyErr: session actor stopped，無法回 OD-62 中止碼。#297 為讀碼推論、未實測：self-test、READY recover、interactive send／open 同樣持有 pending 回覆；self-test／recover 的 wait_regex_from 不被 drain 取消，若停機時仍在等待且未先匹配／逾時，推論幾乎必定落入此窗口。所需錯誤碼與處置待擁有者裁決，不能當成實測機率。",
+      "condition": "actor 在對應 pending op 回覆前已結束；FileTransfer 為 #296 已知窗口，其他操作為 #297 未實測推論。"
+    },
+    {
+      "id": "framing-exception",
+      "from": "service",
+      "to": "cli",
+      "label": "回傳 framing 例外",
+      "phase": "完成通知與停機窗口",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/framing.rs",
+          "line": 292,
+          "end_line": 299,
+          "excerpt_sha256": "e1c668d1e2a7e323c356aa909f3c8fbf29d86ea188e7b5ff4ef083baeacabc02",
+          "claim": "handler 的 PyErr 由 framing 轉 exception_result，並嘗試寫回原連線。"
+        },
+        {
+          "path": "crates/sw-daemon/src/framing.rs",
+          "line": 201,
+          "end_line": 206,
+          "excerpt_sha256": "826f2cbad285e49efa56ffa220339ba45e98499cda4c15956a56ead2097dab06",
+          "claim": "exception_result 回 ok:false、error_code:EXCEPTION 與 message。"
+        },
+        {
+          "path": "crates/sw-core/src/actor.rs",
+          "line": 343,
+          "end_line": 351,
+          "excerpt_sha256": "ecf0c0f8c485908255ae6718b76487c551004b79263a54ac0c11c6e214cbd8ad",
+          "claim": "actor 結束後的斷線訊息為 session actor stopped。"
+        }
+      ],
+      "note": "原先進行中的 file.push／pull 或 #297 涵蓋的 RPC（不是先前的 daemon.stop 受理回覆）可能收到 error_code:EXCEPTION、message:session actor stopped。這是固定 revision 尚未修好的回覆窗口；行收尾的 #282 已修正，不代表此問題也已修正。",
+      "condition": "前一步 PyErr 已返回 framing，且原 RPC 連線仍可寫入。"
+    },
+    {
+      "id": "join-rpc-handlers",
+      "from": "daemon",
+      "to": "service",
+      "label": "在剩餘期限等待 RPC handler",
+      "phase": "等待收斂與釋放",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1501,
+          "end_line": 1511,
+          "excerpt_sha256": "fa64d246480de6be9b92a5e07bbc18c8340bd071f9422c66ad86d6ff35e61b94",
+          "claim": "Phase 1 後以同一 drain_deadline join handlers，未收斂記 method 與 incomplete。"
+        },
+        {
+          "path": "crates/sw-daemon/src/framing.rs",
+          "line": 501,
+          "end_line": 525,
+          "excerpt_sha256": "8c50c4e4e7a36f4ca5767604225a3b796a656e5cd2d2126f8a5cf2693a02a836",
+          "claim": "join_handlers 到期即返回仍未結束的方法，不再等待該 thread。"
+        },
+        {
+          "path": "sw_core/daemon.py",
+          "line": 303,
+          "end_line": 314,
+          "excerpt_sha256": "9bfc110521fd8676c882ec90d7dba45e810b1d5d7a775d4de6618fe214116171",
+          "claim": "Python daemon finally 先 await server.stop，再同步 service.stop 並釋放鎖。"
+        },
+        {
+          "path": "sw_core/rpc_posix.py",
+          "line": 128,
+          "end_line": 135,
+          "excerpt_sha256": "ca628ea4d3937b1ab38988ec8d935831b6d1657641309f4361c475d9cccaa128",
+          "claim": "Python POSIX server.stop 關 listener、await wait_closed 並移除 socket。"
+        },
+        {
+          "path": "sw_core/service.py",
+          "line": 609,
+          "end_line": 615,
+          "excerpt_sha256": "ce578f32f38a7cdffb46b11800da94329ff9ebb3fcc6fc0d8414a66ca364db62",
+          "claim": "Python service.stop 才執行 admission freeze、begin_shutdown 與 shutdown_drain。"
+        }
+      ],
+      "note": "此呼叫在各 actor Phase 1 屏障後；上一段兩種通知與 RPC 回覆可能與這個等待並行。只用共同 deadline 的剩餘時間，未結束 handler detach 並記錄方法，不會阻止後續 Phase 2 與 WAL 收尾。Python 0.4.x 對照：Python 先 await server.stop() 才 service.stop()；Rust 的 handler join 明確在 drain Phase 1 後。本次僅比較原始碼呼叫順序，不推定 wait_closed 在不同 Python runtime 的 handler 等待細節。"
+    },
+    {
+      "id": "drain-phase2",
+      "from": "daemon",
+      "to": "manager",
+      "label": "等待 Phase 2 回條與 actor 退出",
+      "phase": "等待收斂與釋放",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1513,
+          "end_line": 1524,
+          "excerpt_sha256": "baae38640077cf32d9b94f72432638f0205d462d5c435bf4b3cc73a34f44cf81",
+          "claim": "join handler 後呼叫 shutdown_phase2，並再次 flush accepted 命令。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8761,
+          "end_line": 8776,
+          "excerpt_sha256": "ca7616eeced837151d01e8bbf91f36fbaa54fa5937d2194c07f3cdac976e2626",
+          "claim": "Phase 2 以同一期限等待回條，只有 ok:true 算 drained。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8778,
+          "end_line": 8789,
+          "excerpt_sha256": "5611b2d7e7512feadbf98999dbded1aa516367e4bf5ff190296fcaf31ad83dcf",
+          "claim": "Phase 2 同時等待 actor 執行緒結束；逾時將該 session 標未收斂。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8792,
+          "end_line": 8812,
+          "excerpt_sha256": "3b108e582474f52e677767ffd34085eb3c6cd95c7ff6b206503c1b8ac94e1ebb",
+          "claim": "Phase 2 也等待在途 attach 與 custody handle 關閉，CloseFailed 直接失敗。"
+        }
+      ],
+      "note": "逐個等待 Shutdown 回條及 actor join，並檢查在途 attach／custody handle；只認 ok:true，DRAIN_STALLED 不算成功。沿用同一絕對期限，不重設每個等待的額度；Phase 1 之後才登錄的 accepted 命令也在此後再次沖刷。"
+    },
+    {
+      "id": "drain-report",
+      "from": "manager",
+      "to": "daemon",
+      "label": "回報收斂與未完成項目",
+      "phase": "等待收斂與釋放",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8770,
+          "end_line": 8786,
+          "excerpt_sha256": "057b79ff49b4b5813d99230b2b79d2fc28e1518a7ee250e5e977452e584d641d",
+          "claim": "manager 收集每個 session 的 drained 布林值，actor 未退出則降為失敗。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8814,
+          "end_line": 8820,
+          "excerpt_sha256": "49e75af62e4c3cee8f17c88c24439aa466b700a5e4ea50fda5ad391c2824566b",
+          "claim": "初始在途 attach 逐個等待並把收斂布林值加入結果。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1514,
+          "end_line": 1518,
+          "excerpt_sha256": "c2550292b170a2301fd948bcab844e020b77c36416bdfebc1cc97c331d3e780e",
+          "claim": "主流程從 Phase 2 結果取得 stalled 清單。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1539,
+          "end_line": 1545,
+          "excerpt_sha256": "66a6e2e6a99f0cf3b8a6412974c05c7cfb8069e03aa78f868d35eb74e222dee9",
+          "claim": "任何 stalled 都累積為 incomplete，仍會進行後續停止步驟。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8841,
+          "end_line": 8854,
+          "excerpt_sha256": "21bf23d522f839f14231606ec16772d80171937534e90677d19566b90e27e8cf",
+          "claim": "custody 記錄遇 CloseFailed 或等到共用期限，即標示未收斂。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8869,
+          "end_line": 8890,
+          "excerpt_sha256": "4e8ba1b476733e8a59b3978219086c8df380aaf852913b91908712a26763f876",
+          "claim": "再次收集遲到 attach，只有 actor 與 attach 收斂才容許 reaper 退出，最後加入背景工作回報。"
+        }
+      ],
+      "note": "回傳的是排空目標及其收斂狀態；失敗清單導致 shutdown incomplete，仍繼續停止事件 handler、關閉 WAL 與釋放鎖。這份成功回條不保證 #296／#297 的原始 RPC 回覆語意正確。"
+    },
+    {
+      "id": "release-lock",
+      "from": "daemon",
+      "to": "lock",
+      "label": "完成 WAL 收尾後釋放鎖",
+      "phase": "等待收斂與釋放",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1547,
+          "end_line": 1570,
+          "excerpt_sha256": "f98ca59d1d40747fea57894e204750ffd96dbedb296c2ae0a2ce3fc589528126",
+          "claim": "先停止事件 handler，再關閉 WAL、釋放 flash guard 與實例鎖；完整成功 exit 0，其餘 exit 1。"
+        },
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 793,
+          "end_line": 811,
+          "excerpt_sha256": "0e0f8fae20a00d6ad179a6e38270577a852a331cddce0b8d69eddf3b490cbb14",
+          "claim": "WAL shutdown 標 closed，同步關閉 WAL 與 mirror 常駐 handle，回第一個錯誤。"
+        },
+        {
+          "path": "crates/sw-pal/src/lock/posix.rs",
+          "line": 100,
+          "end_line": 107,
+          "excerpt_sha256": "f599dd70199f8cb7b19030265bf3a9064af97991f6f9f9d0ce2dc04cd7842d75",
+          "claim": "POSIX release 以 LOCK_UN 解 flock，隨後關檔。"
+        },
+        {
+          "path": "crates/sw-pal/src/lock/windows.rs",
+          "line": 107,
+          "end_line": 115,
+          "excerpt_sha256": "b1ae61b143122842dfc52998dbdcbd0b3fc222e360e4dfc58f8c590a888dd6fc",
+          "claim": "Windows release 以 UnlockFileEx 解除一個位元組鎖並關檔。"
+        },
+        {
+          "path": "sw_core/daemon.py",
+          "line": 311,
+          "end_line": 316,
+          "excerpt_sha256": "089779cd69b3b153b06423e3d4795fefde5755698798e11e71a0d0b50c2c4807",
+          "claim": "Python 正常 finally 執行完成後回 0，沒有 Rust 的 incomplete 累積退出邏輯。"
+        },
+        {
+          "path": "sw_core/service.py",
+          "line": 626,
+          "end_line": 634,
+          "excerpt_sha256": "cd922a07a7fa406cb6b9a8e7d14da6595709390d788385693e88c414d343d938",
+          "claim": "Python drain 不優雅時記 error log 並同步 WAL，優雅時 close WAL。"
+        }
+      ],
+      "note": "釋放鎖之前先等事件 handler（沿用共同期限，逾時終止其 process group／Job），再 WAL flush／sync／close。Linux｜Windows：LOCK_UN｜UnlockFileEx；兩邊都關閉鎖檔 handle。任一步未收斂或 WAL 同步失敗仍完成後續步驟，最後印 shutdown incomplete 並 exit 1；全部收斂 exit 0。Python 0.4.x 對照：Python 此不優雅 drain 分支以 log／graceful 揭露，finally 正常完成仍 return 0；Rust 額外以 exit 1 揭露。"
+    }
+  ],
+  "unknowns": [
+    {
+      "id": "python-baseline-not-compared",
+      "question": "已直接對照 serialwrapd.py 薄 shim、sw_core/daemon.py 的 finally／return、sw_core/service.py 的 stop、sw_core/rpc_posix.py 的 stop，以及 sw_core/session_manager.py 的 begin_shutdown；note 只在行收尾 gate、handler join 次序與最終退出碼標示差異。啟動、實例鎖、health／多開、Windows 後端、傳檔行收尾內部與 #296／#297 的 Python 同情境均未逐步比對。",
+      "impact": "不能由本頁推定 Rust 與 Python 0.4.x 的其他步驟相同，也不能推定 Python 有相同 pending RPC 窗口。"
+    },
+    {
+      "id": "shutdown-pending-ops-ruling",
+      "question": "issue #297 為讀碼推論、未實測；self-test、READY recover、interactive send／open 停機時應回何碼、取消等待或有限等待，仍待擁有者裁決。",
+      "impact": "本頁只揭露可能的 EXCEPTION；「幾乎必定」僅限操作仍在不可取消等待且 actor 先退出的推論，沒有量測機率或承諾修法。"
+    },
+    {
+      "id": "runtime-and-line-cleanup",
+      "question": "未啟動 daemon 或測試任何平台；Windows 行為只由 cfg 後端讀碼。#282 的 Ctrl-U 清行是 submit 嘗試，強制凍結、I/O 錯誤與 DUT 設定下是否收到並清掉行，未以實機驗證。",
+      "impact": "source-level 順序不是停機時限、Windows 原生行為或 DUT 清行成功率的執行證據。"
+    }
+  ],
+  "conflicts": [
+    {
+      "id": "od62-shutdown-reply-window",
+      "subject": "OD-62 傳檔中止碼與固定 revision 的停機回覆窗口（issue #296）",
+      "claims": [
+        "contracts/behavior_changes.yaml 的 BC-03／SC-04 要求 drain 中止傳輸依整段已確認 bytes，回 COMMAND_ABORTED_IN_FLIGHT 或 FLUSHED_BY_RECOVERY；op-finished-first 的 evidence 同時錨定契約與映射實作。",
+        "worker-stopped、drain-reply、op-finished-late 與 pending-rpc-error 的 evidence 顯示 safety 回條可能先結束 actor，遺失 pending FileTransfer 回覆；framing-exception 會改回 EXCEPTION（session actor stopped）。"
+      ],
+      "resolution": "未解決：依固定 revision 如實保留 #296 窗口。issue #296 仍 OPEN，修正 PR #298 未合入本 revision；#282 的已合入行收尾不修復此回覆契約衝突。"
+    }
+  ]
+}
