@@ -166,6 +166,20 @@
         "delivery": "33f05d5d7fdd7a60f88605fd3efafabf8e40d95692ee284793b3a78130dd33b1",
         "html": "b5b91beff7f793d7afebf49ddf233cc7ee130e973866a2fada3ea16419d4b62f"
       }
+    },
+    "11-remote-bench": {
+      "diagram_type": "sequence",
+      "source_revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347",
+      "facts": "features/11-remote-bench.facts.json",
+      "ir": "features/11-remote-bench.json",
+      "html": "features/11-remote-bench.html",
+      "overlay_version": 1,
+      "sha256": {
+        "facts": "c0611c1482101ad741804af67abdc67e0d249c1a564b3e4dae0dbeef45df9306",
+        "ir": "ae34308fb2ca1981cbcbbc5dcec222c307a21a299d5b250f7b8aeb890a6473b8",
+        "delivery": "b8457ba46687b6c5e872d60afb05cdd8223a16091187bb8c2e17f49899583618",
+        "html": "d013898b55c05cf5c58a70e9ab862bf6e0bb6c18f187b65d84fd5d92101cc033"
+      }
     }
   }
 }
