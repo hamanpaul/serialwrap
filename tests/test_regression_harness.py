@@ -1,6 +1,7 @@
 """#155 regression plugin harness／core 純邏輯單測——不 import testpilot、不碰 live。"""
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -9,7 +10,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "regression"))
 
-from serialwrap_regression import core, harness  # noqa: E402
+from serialwrap_regression import core, guards, harness  # noqa: E402
+from serialwrap_regression.cases import f07_file_transfer as f07  # noqa: E402
 
 pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
@@ -164,3 +166,341 @@ def test_case_dict_pending_issue_false_for_issue_bound_case():
     meta = dicts[0]["metadata"]
     assert meta["pending_issue"] is False
     assert meta["issues"] == ["#94"]
+
+
+def _write_proc_stat(proc_root: Path, pid: int, state: str, pgid: int) -> None:
+    proc_dir = proc_root / str(pid)
+    proc_dir.mkdir()
+    (proc_dir / "stat").write_text(
+        f"{pid} (throwaway worker with spaces) {state} 1 {pgid} 0 0 0\n",
+        encoding="ascii",
+    )
+
+
+def test_throwaway_wait_reaps_daemon_and_ignores_zombie_group_members(tmp_path):
+    class _FinishedProcess:
+        pid = 410
+
+        def __init__(self):
+            self.wait_timeout = None
+
+        def wait(self, *, timeout):
+            self.wait_timeout = timeout
+            return 0
+
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    _write_proc_stat(proc_root, 420, "Z", 410)
+    daemon = guards.ThrowawayDaemon("/bin/serialwrap", tmp_path / "ta", tmp_path / "byid", "")
+    daemon._proc = _FinishedProcess()
+    daemon._proc_pgid = 410
+
+    exit_code, live_members = daemon.wait_for_exit(timeout_s=0.75, proc_root=proc_root)
+
+    assert daemon._proc.wait_timeout == 0.75
+    assert exit_code == 0
+    assert live_members == []
+
+    _write_proc_stat(proc_root, 421, "S", 410)
+    _, live_members = daemon.wait_for_exit(timeout_s=0.75, proc_root=proc_root)
+    assert live_members == [421]
+
+
+class _UnreapableProcess:
+    """wait 一律逾時、poll 一律回報仍在執行的替身（模擬 SIGKILL 後仍收不回來的 daemon）。"""
+
+    pid = 510
+
+    def __init__(self):
+        self.wait_calls = 0
+
+    def poll(self):
+        return None
+
+    def wait(self, *, timeout):
+        self.wait_calls += 1
+        raise subprocess.TimeoutExpired(cmd="serialwrapd", timeout=timeout)
+
+
+def _unreapable_daemon(tmp_path, monkeypatch):
+    daemon = guards.ThrowawayDaemon("/bin/serialwrap", tmp_path / "ta", tmp_path / "byid", "")
+    daemon._proc = _UnreapableProcess()
+    daemon._proc_pgid = 510
+    daemon._run_dir = tmp_path / "run"
+    daemon._run_dir.mkdir()
+    signals: list[tuple[int, int]] = []
+    # Windows 的 os 沒有 killpg：raising=False 讓替身在兩個平台都裝得上（收尾邏輯本身與平台無關）。
+    monkeypatch.setattr(guards.os, "killpg", lambda pgid, sig: signals.append((pgid, sig)), raising=False)
+    monkeypatch.setattr(daemon, "run", lambda *args, **kwargs: None)
+    return daemon, signals
+
+
+def test_throwaway_exit_keeps_original_exception_when_daemon_is_unreapable(tmp_path, monkeypatch):
+    daemon, signals = _unreapable_daemon(tmp_path, monkeypatch)
+    proc = daemon._proc
+    run_dir = daemon._run_dir
+
+    with pytest.warns(RuntimeWarning, match="仍未被回收"):
+        daemon.__exit__(ValueError, ValueError("原始錯誤"), None)
+
+    assert proc.wait_calls == 2
+    assert signals == [(510, 15), (510, 9)]
+    assert daemon._proc is None
+    assert not run_dir.exists()
+
+
+def test_throwaway_exit_reports_unreapable_daemon_after_cleanup(tmp_path, monkeypatch):
+    daemon, signals = _unreapable_daemon(tmp_path, monkeypatch)
+    run_dir = daemon._run_dir
+
+    with pytest.raises(RuntimeError, match="pid=510"):
+        daemon.__exit__(None, None, None)
+
+    assert signals == [(510, 15), (510, 9)]
+    assert daemon._proc is None
+    assert not run_dir.exists()
+
+
+def _wal_record(seq: int, direction: str, payload: bytes, cmd_id: str | None = None) -> str:
+    import base64
+    import json
+
+    return json.dumps({
+        "seq": seq,
+        "dir": direction,
+        "payload_b64": base64.b64encode(payload).decode("ascii"),
+        "cmd_id": cmd_id,
+    })
+
+
+def test_i282_midline_oracle_requires_busy_echo_stall_and_two_prior_chunks():
+    import base64
+
+    from sw_core.file_transfer import _chunk_command
+
+    marker = "I282_ECHO_OFF_test"
+    path = "/tmp/.sw_upload_0123456789ab"
+    encoded = base64.b64encode(bytes(range(256)) * 2).decode("ascii")
+    first = _chunk_command(encoded, "base64", ">", path)
+    second = _chunk_command(encoded, "base64", ">>", path)
+    rows = [
+        _wal_record(1, "TX", (first + "\n").encode("ascii"), "ft-12345678-0"),
+        _wal_record(2, "TX", (second + "\n").encode("ascii"), "ft-12345678-1"),
+    ]
+    wal_text = "\n".join(rows)
+    partial_line = second.encode("ascii")[:200]
+    bridge_rx = (
+        first.encode("ascii") + b"\r\nSW_XFER_CHUNK_42\r\n"
+        + second.encode("ascii") + b"\r\nSW_XFER_CHUNK_42\r\n"
+        + partial_line + b"\r\n" + marker.encode("ascii") + b"\r\n"
+    )
+
+    assert f07._midline_push_observed(
+        wal_text, bridge_rx_bytes=bridge_rx, echo_off_marker=marker, foreground_busy=True,
+    ) is True
+    assert f07._midline_push_observed(
+        wal_text, bridge_rx_bytes=bridge_rx, echo_off_marker=marker, foreground_busy=False,
+    ) is False
+    assert f07._midline_push_observed(
+        rows[1], bridge_rx_bytes=bridge_rx,
+        echo_off_marker=marker, foreground_busy=True,
+    ) is False
+    one_complete_chunk = rows[1]
+    assert f07._midline_push_observed(
+        one_complete_chunk, bridge_rx_bytes=bridge_rx,
+        echo_off_marker=marker, foreground_busy=True,
+    ) is False
+    complete_line = bridge_rx.replace(
+        partial_line + b"\r\n", second.encode("ascii") + b"\r\n\r\n",
+    )
+    assert f07._midline_push_observed(
+        wal_text, bridge_rx_bytes=complete_line, echo_off_marker=marker, foreground_busy=True,
+    ) is False
+
+
+def test_i282_midline_oracle_rejects_shutdown_without_line_clear():
+    import base64
+
+    from sw_core.file_transfer import _chunk_command
+
+    marker = "I282_ECHO_OFF_no_clear"
+    path = "/tmp/.sw_upload_0123456789ab"
+    encoded = base64.b64encode(bytes(range(256)) * 2).decode("ascii")
+    first = _chunk_command(encoded, "base64", ">", path)
+    second = _chunk_command(encoded, "base64", ">>", path)
+    rows = [
+        _wal_record(1, "TX", (first + "\n").encode("ascii"), "ft-12345678-0"),
+        _wal_record(2, "TX", (second + "\n").encode("ascii"), "ft-12345678-1"),
+    ]
+    bridge_rx = (
+        second.encode("ascii")[:200]
+        + marker.encode("ascii") + b"\r\n"
+    )
+
+    assert f07._midline_push_observed(
+        "\n".join(rows), bridge_rx_bytes=bridge_rx,
+        echo_off_marker=marker, foreground_busy=True,
+    ) is True
+    verdict = f07._midline_shutdown_verdict(clear_count=0)
+    assert verdict is not None
+    assert verdict.verdict == "FAIL"
+    assert verdict.reason_code == "midline_clear_count_mismatch"
+
+
+def test_i282_uart_rx_observer_reads_only_throwaway_console_pty(tmp_path, monkeypatch):
+    class _ThrowawayCli:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            if args[1] == "console-attach":
+                return {"ok": True, "vtty": "/dev/pts/47", "client_id": "client-i282"}
+            return {"ok": True}
+
+    class _ReaderProcess:
+        def poll(self):
+            return 0
+
+    ta = _ThrowawayCli()
+
+    def _fake_popen(argv, **kwargs):
+        assert argv == ["cat", "/dev/pts/47"]
+        kwargs["stdout"].write(b"UART bridge RX bytes")
+        return _ReaderProcess()
+
+    monkeypatch.setattr(f07.subprocess, "Popen", _fake_popen)
+    path = tmp_path / "bridge-rx.bin"
+    observer = f07._UartRxObserver(ta, "COM0", path)
+    try:
+        assert observer.bytes() == b"UART bridge RX bytes"
+    finally:
+        observer.close()
+
+    assert [call[0][1] for call in ta.calls] == ["console-attach", "console-detach"]
+
+
+def test_i282_uart_rx_observer_detaches_if_capture_file_cannot_open(tmp_path):
+    class _ThrowawayCli:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            if args[1] == "console-attach":
+                return {"ok": True, "vtty": "/dev/pts/47", "client_id": "client-i282"}
+            return {"ok": True}
+
+    ta = _ThrowawayCli()
+    missing_parent_path = tmp_path / "missing" / "bridge-rx.bin"
+
+    with pytest.raises(FileNotFoundError):
+        f07._UartRxObserver(ta, "COM0", missing_parent_path)
+
+    assert [call[0][1] for call in ta.calls] == ["console-attach", "console-detach"]
+
+
+def test_i282_observer_creation_failure_stops_echo_watcher(tmp_path, monkeypatch):
+    commands = []
+
+    class _ThrowawayCli:
+        _workdir = tmp_path
+
+        def run(self, *args, **kwargs):
+            if "file" in args and "push" in args:
+                return {"ok": True}
+            raise AssertionError(f"未預期的 throwaway CLI 呼叫：{args!r}")
+
+        def wal_text(self):
+            return ""
+
+    class _Context:
+        case_dir = tmp_path
+
+        def note(self, *_args):
+            pass
+
+    def _line_command(_ta, _com, command, *, timeout_s=15.0):
+        commands.append(command)
+        if "for f in /tmp/*" in command:
+            return {
+                "status": "done",
+                "stdout": "I282_42_BEGIN\nI282_42_DEST_ABSENT\nI282_42_END\n",
+            }
+        return {"status": "done", "stdout": ""}
+
+    def _observer_unavailable(*_args, **_kwargs):
+        raise RuntimeError("observer unavailable")
+
+    monkeypatch.setattr(f07, "_throwaway_line_command", _line_command)
+    monkeypatch.setattr(f07, "_UartRxObserver", _observer_unavailable)
+
+    result = f07._body_push_stop_midline_clean_restart(
+        _Context(), _ThrowawayCli(), "COM0", {"serial": "board-i282"},
+    )
+
+    assert result.reason_code == "bridge_observer_unavailable"
+    assert any(
+        command.startswith("touch /tmp/.i282-echo-watcher-")
+        and ".done; sleep 2; stty echo; rm -f " in command
+        for command in commands
+    ), "observer 建立失敗離場前必須通知 DUT watcher 停止並復原 echo"
+
+
+def test_i282_post_restart_temp_growth_is_detected():
+    before = {"/tmp/.sw_upload_0123456789ab": 512}
+
+    assert f07._changed_upload_temps(before, dict(before)) == []
+    assert f07._changed_upload_temps(
+        before, {"/tmp/.sw_upload_0123456789ab": 768},
+    ) == ["/tmp/.sw_upload_0123456789ab"]
+    assert f07._changed_upload_temps(
+        before,
+        {
+            "/tmp/.sw_upload_0123456789ab": 512,
+            "/tmp/.sw_upload_fedcba987654": 256,
+        },
+    ) == ["/tmp/.sw_upload_fedcba987654"]
+
+
+def test_i282_upload_size_marker_is_parsed_from_dut_rx():
+    marker = "I282_PRE_test_TEMP"
+    wal_text = "\n".join([
+        _wal_record(1, "RX", f"{marker} /tmp/.sw_upload_0123456789ab 1024\n".encode()),
+        _wal_record(2, "RX", b"I282_PRE_test_TEMP /tmp/not-an-upload 55\n"),
+        _wal_record(3, "TX", f"{marker} /tmp/.sw_upload_fedcba987654 9999\n".encode()),
+    ])
+
+    assert f07._upload_size_markers(wal_text, marker=marker) == {
+        "/tmp/.sw_upload_0123456789ab": 1024,
+    }
+
+
+def test_i282_echo_watcher_waits_for_restore_signal_and_has_fallback_cleanup():
+    script = f07._echo_stall_watcher_script(nonce="test")
+
+    assert "done_path=/tmp/.i282-echo-watcher-test.done" in script
+    assert "trap cleanup EXIT" in script
+    assert "target_size=1024" in script
+    assert '[ ! -e "$done_path" ]' in script
+    assert '[ "$elapsed" -lt 180 ]' in script
+    assert 'stty echo </dev/tty >/dev/null 2>&1 || :' in script
+    assert 'stty -echo </dev/tty || exit 1' in script
+    assert "I282_ECHO_RESTORED_%s" in script
+    assert "'test'" in script
+
+
+def test_i282_case_uses_midline_and_post_restart_temp_oracles():
+    import inspect
+
+    source = inspect.getsource(f07._body_push_stop_midline_clean_restart)
+    assert "_midline_push_observed(" in source
+    assert "bridge_rx_bytes=uart_observer.bytes()" in source
+    assert "console-attach" in inspect.getsource(f07._UartRxObserver)
+    assert "_upload_size_markers(" in source
+    assert "_changed_upload_temps(" in source
+    assert "daemon_exit_code != 0" in source
+    assert "_midline_shutdown_verdict(clear_count)" in source
+    assert "extra_chunk_commands != 0" in source
+    assert "ta.wait_for_exit(timeout_s=15.0)" in source
+    assert "touch {shlex.quote(watcher_done_path)}; sleep 2; stty echo" in source

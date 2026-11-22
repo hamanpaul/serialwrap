@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import shutil
@@ -12,12 +13,93 @@ from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
+ACCEPTANCE_SOURCE = ROOT / "realhw" / "acceptance" / "longrun_acceptance.yaml"
+ACCEPTANCE_SCHEMA = ROOT / "realhw" / "acceptance" / "longrun_acceptance.schema.json"
+# od09_freeze 凍結時寫進每個延後項的紀錄欄位（realhw/acceptance/od09_freeze.py 的 _freeze_locked 第 5 步）。
+FREEZE_RECORD_FIELDS = (
+    "frozen_at",
+    "decision_id",
+    "approved_by",
+    "overrides",
+    "proposal_sha256",
+    "baseline_evidence",
+)
+# 尚未凍結的延後項只有這四個鍵。schema 在 deferred 時不禁止凍結紀錄欄位，所以由衍生 helper 自行把關。
+DEFERRED_ITEM_KEYS = frozenset({"status", "decision", "freeze_deadline", "per_platform"})
 
 
 def _yaml():
     import yaml
 
     return yaml
+
+
+def _deferred_keys() -> tuple[str, ...]:
+    from realhw.acceptance import od09_freeze
+
+    return od09_freeze.DEFERRED_KEYS
+
+
+def load_acceptance_source() -> dict:
+    """讀取 repo 內的真門檻檔（門檻唯一來源）；它可能尚未凍結，也可能已凍結。"""
+    return _yaml().safe_load(ACCEPTANCE_SOURCE.read_text(encoding="utf-8"))
+
+
+def acceptance_freeze_state(content: dict) -> str:
+    """回傳三個延後項的共同狀態：`deferred` 或 `frozen`。
+
+    od09_freeze 一次凍結三項，所以合法狀態只有「三項皆 deferred」與「三項皆 frozen」；
+    三項不一致或出現其他值即失敗。
+    """
+    statuses = {key: content["thresholds"][key]["status"] for key in _deferred_keys()}
+    distinct = set(statuses.values())
+    if len(distinct) != 1 or not distinct <= {"deferred", "frozen"}:
+        raise AssertionError(f"延後項狀態不一致或不合法：{statuses}")
+    return distinct.pop()
+
+
+def deferred_acceptance(content: dict | None = None) -> dict:
+    """由真門檻檔衍生「延後項尚未凍結」的內容，給需要凍結前起點的夾具使用。
+
+    真門檻檔凍結前後都走同一條路徑：三個延後項的 status 設回 deferred、per_platform 各欄位設回 null、
+    移除凍結紀錄欄位；revision 與其他內容原樣保留。門檻唯一來源仍是真檔，這裡不另存副本。
+    衍生結果須通過 longrun_acceptance.schema.json；真檔尚未凍結時，衍生結果須與真檔內容相同。
+    """
+    from jsonschema import Draft202012Validator
+
+    source = load_acceptance_source() if content is None else content
+    source_state = acceptance_freeze_state(source)
+    value = copy.deepcopy(source)
+    for key in _deferred_keys():
+        item = value["thresholds"][key]
+        item["status"] = "deferred"
+        for field in FREEZE_RECORD_FIELDS:
+            item.pop(field, None)
+        item["per_platform"] = {
+            platform: {field: None for field in fields}
+            for platform, fields in item["per_platform"].items()
+        }
+        if set(item) != DEFERRED_ITEM_KEYS:
+            raise AssertionError(f"thresholds.{key} 的 deferred 形狀不符：{sorted(item)}")
+
+    schema = json.loads(ACCEPTANCE_SCHEMA.read_text(encoding="utf-8"))
+    errors = sorted(Draft202012Validator(schema).iter_errors(value), key=lambda error: list(error.path))
+    if errors:
+        details = "；".join(
+            f"{'/'.join(str(part) for part in error.path) or '<root>'}: {error.message}" for error in errors[:5]
+        )
+        raise AssertionError(f"衍生的 deferred 門檻內容不符 schema：{details}")
+    if source_state == "deferred" and value != source:
+        raise AssertionError("真門檻檔尚未凍結，衍生結果卻與真檔內容不同")
+    return value
+
+
+def write_deferred_acceptance(target: Path) -> None:
+    """把衍生的 deferred 門檻內容寫成檔案；序列化方式與 od09_freeze 改寫門檻檔時相同。"""
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", encoding="utf-8", newline="\n") as stream:
+        stream.write(_yaml().safe_dump(deferred_acceptance(), sort_keys=False, allow_unicode=True))
 
 
 def _longrun_api():
@@ -102,7 +184,6 @@ def od09_env(
     root = Path(root)
     repo = root / "repo"
     source_files = (
-        "realhw/acceptance/longrun_acceptance.yaml",
         "realhw/acceptance/longrun_acceptance.schema.json",
         "tests/acceptance/stage0_evidence_index.yaml",
         "tests/acceptance/check_evidence_index.py",
@@ -117,6 +198,9 @@ def od09_env(
         shutil.copy2(source, target)
 
     acceptance = repo / "realhw" / "acceptance" / "longrun_acceptance.yaml"
+    # 門檻檔不直接複製：真檔可能已凍結，替身 repo 一律從「延後項尚未凍結」的衍生內容起步。
+    # 必須早於下方的基線 gate 判定（freeze 會比對基線 gate 記錄的 acceptance.sha256）。
+    write_deferred_acceptance(acceptance)
     stage0_index = repo / "tests" / "acceptance" / "stage0_evidence_index.yaml"
     evidence_root = repo / "evidence"
     ledger = repo / "realhw" / "acceptance" / "candidate_longrun_starts.ndjson"

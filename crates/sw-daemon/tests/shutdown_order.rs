@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 use support::*;
 use sw_core::mailbox::{ControlEvent, DetachReason};
 use sw_core::session_manager::SessionManager;
+use sw_core::tx_writer::OpId;
+use sw_core::uart_bridge::{RunCancel, RxShared};
 use sw_pal::traits::{
     DeviceInfo, DevicePath, OpenError, PalError, PalResult, SerialBackend, SerialConfig, SerialHandle, SignalWait,
     WatcherEvent,
@@ -731,6 +733,152 @@ fn long_file_push_does_not_block_stop() {
         ["COMMAND_ABORTED_IN_FLIGHT", "FLUSHED_BY_RECOVERY"].contains(&code.as_str()),
         "OD-62：停止中止的傳輸回 COMMAND_ABORTED_IN_FLIGHT／FLUSHED_BY_RECOVERY：{reply:?}"
     );
+}
+
+#[test]
+fn shutdown_gate_waits_for_open_transfer_line() {
+    let env = isolated_env();
+    let (platform, handles) = in_process_platform_with_handles(
+        &env.vars,
+        vec![device("usb-SER-A-if00", "/fake/serial-s2-shutdown-settle")],
+        Fixture::ReadyShell,
+    );
+    let dev = handles.devices[0].clone();
+    let manager_slot: Arc<Mutex<Option<Arc<SessionManager>>>> = Arc::new(Mutex::new(None));
+    let manager_for_hook = manager_slot.clone();
+    let trace: Arc<Mutex<Vec<TraceEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let trace_for_hook = trace.clone();
+    let tx_at_gate = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+    let tx_at_gate_for_hook = tx_at_gate.clone();
+    let dev_for_hook = dev.clone();
+    let hooks = DaemonHooks {
+        on_manager: Some(Box::new(move |manager| {
+            *manager_for_hook.lock().unwrap() = Some(manager);
+        })),
+        trace: Some(Box::new(move |event| {
+            if event == TraceEvent::ShutdownGate {
+                tx_at_gate_for_hook.store(dev_for_hook.tx_len(), Ordering::SeqCst);
+            }
+            trace_for_hook.lock().unwrap().push(event);
+        })),
+        ..DaemonHooks::default()
+    };
+
+    let socket = env.socket.clone();
+    let client_manager = manager_slot.clone();
+    let client_trace = trace.clone();
+    let client = spawn_stop_guarded_client(socket.clone(), move || {
+        wait_socket(&socket, SHORT);
+        wait_state(&socket, "COM0", "READY");
+        let manager = client_manager.lock().unwrap().clone().expect("on_manager 已提供 manager");
+        let fence = manager.fence_for_test("COM0").expect("COM0 有 session fence");
+        let rx = RxShared::new(1024, 0);
+        let settle = RunCancel::new(&rx);
+        let op = OpId(282);
+        assert!(fence.open_transfer_line(op, settle.clone()), "測試先建立未收尾行持有");
+
+        let stop_socket = socket.clone();
+        let stop = thread::spawn(move || rpc_once(&stop_socket, STOP));
+        let gate_before_close = poll(Duration::from_millis(300), || {
+            client_trace.lock().unwrap().contains(&TraceEvent::ShutdownGate)
+        });
+        let settle_triggered = settle.is_triggered();
+        fence.close_transfer_line(op);
+        let gate_after_close = poll(Duration::from_secs(1), || {
+            client_trace.lock().unwrap().contains(&TraceEvent::ShutdownGate)
+        });
+        let stop_reply = stop.join().expect("daemon.stop RPC thread");
+        (gate_before_close, settle_triggered, gate_after_close, stop_reply)
+    });
+
+    let code = run_with_hooks(vec!["serialwrapd".to_string()], platform, hooks);
+    let (gate_before_close, settle_triggered, gate_after_close, stop_reply) =
+        client.join().expect("stop client thread");
+    let trace = trace.lock().unwrap().clone();
+    assert!(!gate_before_close, "close_transfer_line 前不得出現 ShutdownGate：{trace:?}");
+    assert!(settle_triggered, "begin_shutdown 必須喚醒行持有者");
+    assert!(gate_after_close, "close_transfer_line 後 ShutdownGate 應隨即出現");
+    assert_eq!(code, 0, "全部步驟收斂應 exit 0；stop reply={stop_reply}");
+    assert_eq!(steps(&trace), STEPS.to_vec(), "{trace:?}");
+    let tx_len_at_gate = tx_at_gate.load(Ordering::SeqCst);
+    assert_ne!(tx_len_at_gate, usize::MAX, "trace 應觀察到 ShutdownGate");
+    assert!(dev.tx_since(tx_len_at_gate).is_empty(), "ShutdownGate 後不得再有 TX");
+}
+
+#[test]
+fn shutdown_gate_forces_freeze_after_line_settle_budget() {
+    let env = isolated_env();
+    let (platform, handles) = in_process_platform_with_handles(
+        &env.vars,
+        vec![device("usb-SER-A-if00", "/fake/serial-s2-shutdown-settle-timeout")],
+        Fixture::ReadyShell,
+    );
+    let dev = handles.devices[0].clone();
+    let manager_slot: Arc<Mutex<Option<Arc<SessionManager>>>> = Arc::new(Mutex::new(None));
+    let manager_for_hook = manager_slot.clone();
+    let trace: Arc<Mutex<Vec<TraceEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let trace_for_hook = trace.clone();
+    let gate_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    let gate_at_for_hook = gate_at.clone();
+    let tx_at_gate = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+    let tx_at_gate_for_hook = tx_at_gate.clone();
+    let dev_for_hook = dev.clone();
+    let hooks = DaemonHooks {
+        on_manager: Some(Box::new(move |manager| {
+            *manager_for_hook.lock().unwrap() = Some(manager);
+        })),
+        trace: Some(Box::new(move |event| {
+            if event == TraceEvent::ShutdownGate {
+                *gate_at_for_hook.lock().unwrap() = Some(Instant::now());
+                tx_at_gate_for_hook.store(dev_for_hook.tx_len(), Ordering::SeqCst);
+            }
+            trace_for_hook.lock().unwrap().push(event);
+        })),
+        ..DaemonHooks::default()
+    };
+
+    let stop_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    let stop_at_for_client = stop_at.clone();
+    let socket = env.socket.clone();
+    let client_manager = manager_slot.clone();
+    let client = spawn_stop_guarded_client(socket.clone(), move || {
+        wait_socket(&socket, SHORT);
+        wait_state(&socket, "COM0", "READY");
+        let manager = client_manager.lock().unwrap().clone().expect("on_manager 已提供 manager");
+        let fence = manager.fence_for_test("COM0").expect("COM0 有 session fence");
+        let rx = RxShared::new(1024, 0);
+        let settle = RunCancel::new(&rx);
+        assert!(fence.open_transfer_line(OpId(283), settle), "測試先建立未收尾行持有");
+        *stop_at_for_client.lock().unwrap() = Some(Instant::now());
+        rpc_once(&socket, STOP)
+    });
+
+    let code = run_with_hooks(vec!["serialwrapd".to_string()], platform, hooks);
+    let stop_reply = client.join().expect("stop client thread");
+    let stop_started = stop_at.lock().unwrap().expect("STOP 時刻已記錄");
+    let trace = trace.lock().unwrap().clone();
+    let gate_elapsed = gate_at.lock().unwrap().expect("ShutdownGate 時刻已記錄") - stop_started;
+    assert!(
+        (Duration::from_millis(1_250)..=Duration::from_millis(2_500)).contains(&gate_elapsed),
+        "ShutdownGate 應在 1.25～2.5 s 出現，實際 {gate_elapsed:?}"
+    );
+    let manager = manager_slot.lock().unwrap().clone().expect("on_manager 已提供 manager");
+    let fence = manager.fence_for_test("COM0").expect("COM0 有 session fence");
+    fence.with(|state| {
+        assert!(state.frozen, "期限到後 fence 必須 frozen");
+        assert!(!state.shutdown_freeze_pending, "期限到後 pending 必須清除");
+    });
+    assert_eq!(code, 0, "全部步驟收斂應 exit 0；stop reply={stop_reply}");
+    assert_eq!(steps(&trace), STEPS.to_vec(), "{trace:?}");
+    let stalled = trace.iter().find_map(|event| match event {
+        TraceEvent::DrainPhase2 { stalled, .. } => Some(stalled),
+        _ => None,
+    });
+    assert_eq!(stalled, Some(&Vec::new()), "DrainPhase2 不得 stalled：{trace:?}");
+    assert!(stop_started.elapsed() <= STOP_CAP, "自 STOP 到返回不得超過 STOP_CAP");
+    let tx_len_at_gate = tx_at_gate.load(Ordering::SeqCst);
+    assert_ne!(tx_len_at_gate, usize::MAX, "trace 應觀察到 ShutdownGate");
+    assert!(dev.tx_since(tx_len_at_gate).is_empty(), "ShutdownGate 後不得再有 TX");
 }
 
 /// 停止訊號替身：`wait_stop` 等測試注入的訊號或 `daemon.stop`。

@@ -68,3 +68,13 @@ def test_throwaway_env_isolates_all_dirs(tmp_path):
     # 把 PROD 在用的裝置撈進偵測池（two-reader 風險）
     assert env["SERIALWRAP_BY_PATH_DIR"] == str(tmp_path / "wd" / "bypath")
     assert "SERIALWRAP_ENDPOINT" not in env
+
+
+def test_process_group_scan_ignores_non_ascii_comm_in_other_group(tmp_path):
+    stat_dir = tmp_path / "proc" / "420"
+    stat_dir.mkdir(parents=True)
+    (stat_dir / "stat").write_bytes(
+        "420 (serialwrap 測試 helper) S 1 999 0 0 0\n".encode("utf-8")
+    )
+
+    assert guards._live_process_group_members(410, proc_root=tmp_path / "proc") == []

@@ -5,7 +5,7 @@
 
 mod support;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use support::fake_shell::{FixedIds, MemFiles};
 use support::transfer_port::{FakeDut, PortRig, EPOCH, OP};
@@ -17,7 +17,8 @@ use sw_core::file_transfer::{
 use sw_core::mailbox::ControlEvent;
 use sw_core::session_core::SessionRequest;
 use sw_core::tx_writer::{
-    AggregateKey, AggregateOp, FlashMode, TxClass, TxJob, TxPermit, TX_AGGREGATE_OPEN_MAX,
+    AggregateKey, AggregateOp, FlashMode, ShutdownFreeze, TxClass, TxJob, TxPermit,
+    TX_AGGREGATE_OPEN_MAX,
 };
 use sw_core::uart_bridge::RunCancel;
 use sw_pal::traits::{PalError, TxOutcome};
@@ -563,4 +564,367 @@ fn begin_stop_cancels_transfer_waits_for_every_stop_kind() {
         assert!(transfer.is_triggered(), "{name}：drain Phase 1 必須取消傳輸等待");
         assert!(!login.is_triggered(), "{name}：不得改 P7 login run 的取消行為");
     }
+}
+
+#[test]
+fn shutdown_settle_finishes_open_line_then_freezes() {
+    let rig = PortRig::new("COM0", FakeDut::echo_first_n_chars(128));
+    let body = "s".repeat(300);
+    let task = paced(&rig, &body, "ft-282-finish", 64, Duration::from_secs(30));
+    rig.dut.wait_bytes(192);
+
+    assert_eq!(
+        rig.fence.freeze_for_shutdown_settling(),
+        ShutdownFreeze::PendingLine
+    );
+    rig.push_rx(&"s".repeat(64).into_bytes());
+    rig.dut.wait_bytes(256);
+    rig.push_rx(&"s".repeat(64).into_bytes());
+    rig.dut.wait_bytes(300);
+    rig.push_rx(&"s".repeat(44).into_bytes());
+    rig.dut.wait_bytes(301);
+
+    assert_eq!(
+        task.join_within(Duration::from_secs(2)),
+        Ok(EchoPaced {
+            ok: true,
+            acked_chars: 300,
+            sent_chars: 300
+        })
+    );
+    assert_eq!(rig.dut.bytes(), [body.as_bytes(), b"\n"].concat());
+    assert!(!rig.dut.bytes().contains(&0x15));
+    rig.fence.with(|state| {
+        assert!(state.frozen);
+        assert!(!state.shutdown_freeze_pending);
+        assert_eq!(state.transfer_line, None);
+    });
+    let tx = rig.tx_records();
+    assert_eq!(tx.len(), 1);
+    assert_eq!(tx[0].cmd_id.as_deref(), Some("ft-282-finish"));
+    assert_eq!(tx[0].payload, [body.as_bytes(), b"\n"].concat());
+
+    assert_eq!(
+        send(&rig, "after shutdown", Some("ft-282-after")),
+        Err(rejected(RejectReason::Draining, 0, false))
+    );
+    assert_eq!(
+        rig.dut.bytes(),
+        [body.as_bytes(), b"\n"].concat(),
+        "凍結後不得再送出 bytes"
+    );
+}
+
+#[test]
+fn shutdown_publication_race_never_leaves_half_line() {
+    // 注入第三個 slice 的 echo，讓傳輸嘗試送下一個 slice；持有 fence 鎖時啟動停機。
+    // 舊順序可能先發布停機旗標，讓持有者在 pending 狀態建立前被拒。
+    for attempt in 0..32 {
+        let rig = PortRig::new("COM0", FakeDut::echo_first_n_chars(128));
+        let body = "r".repeat(300);
+        let task = paced(
+            &rig,
+            &body,
+            "ft-282-publish-race",
+            64,
+            Duration::from_secs(30),
+        );
+        rig.dut.wait_bytes(192);
+
+        let freeze = rig.fence.clone();
+        let stop = rig.fence.with(|_| {
+            // 這是第三個 slice 的 echo；傳輸醒來後會在 fence 鎖處等待下一次 submit。
+            rig.push_rx(&"r".repeat(64).into_bytes());
+            std::thread::sleep(Duration::from_millis(5));
+
+            let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+            let stop = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                freeze.freeze_for_shutdown_settling()
+            });
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let deadline = Instant::now() + Duration::from_millis(10);
+            while !rig.fence.shutdown_started_published() && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            stop
+        });
+        let _ = stop.join().unwrap();
+        rig.pump_clock_until(Duration::from_millis(100), || task.is_finished());
+        let result = task.join_within(Duration::from_secs(2));
+        assert!(
+            matches!(result, Err(TransferAbort::TxRejected { rej: ref reject, .. }) if reject.reason == RejectReason::Draining),
+            "attempt={attempt}: {result:?}"
+        );
+
+        let bytes = rig.dut.bytes();
+        assert!(
+            bytes.ends_with(b"\n"),
+            "attempt={attempt}: DUT 留下半行：{bytes:?}"
+        );
+        let kills = bytes.iter().filter(|byte| **byte == 0x15).count();
+        if kills == 1 {
+            assert!(
+                bytes.ends_with(b"\x15\n"),
+                "attempt={attempt}: 清行位元組不完整：{bytes:?}"
+            );
+            assert_eq!(kills, 1, "attempt={attempt}: 清行只能一次");
+            assert!(bytes[..bytes.len() - 2].iter().all(|byte| *byte == b'r'));
+        } else {
+            assert_eq!(kills, 0, "attempt={attempt}: 清行不得重複");
+            assert_eq!(bytes, [body.as_bytes(), b"\n"].concat());
+        }
+        assert!(
+            rig.fence.with(|state| state.frozen),
+            "attempt={attempt}: fence 必須凍結"
+        );
+    }
+}
+
+#[test]
+fn shutdown_settle_kills_line_when_echo_stalls() {
+    let rig = PortRig::new("COM0", FakeDut::echo_first_n_chars(128));
+    let task = paced(
+        &rig,
+        &"s".repeat(300),
+        "ft-282-stall",
+        64,
+        Duration::from_secs(30),
+    );
+    rig.dut.wait_bytes(192);
+
+    assert_eq!(
+        rig.fence.freeze_for_shutdown_settling(),
+        ShutdownFreeze::PendingLine
+    );
+    rig.pump_clock_until(Duration::from_millis(750), || task.is_finished());
+
+    assert_eq!(
+        task.join_within(Duration::from_secs(2)),
+        Err(rejected(RejectReason::Draining, 0, false))
+    );
+    assert_eq!(
+        rig.dut.bytes(),
+        [b"s".repeat(192), b"\x15\n".to_vec()].concat()
+    );
+    assert_eq!(
+        rig.dut
+            .writes()
+            .iter()
+            .filter(|w| w.as_slice() == b"\x15\n")
+            .count(),
+        1
+    );
+    rig.fence.with(|state| {
+        assert!(state.frozen);
+        assert!(!state.shutdown_freeze_pending);
+        assert_eq!(state.transfer_line, None);
+    });
+    let tx = rig.tx_records();
+    assert_eq!(tx.len(), 2);
+    assert_eq!(tx[0].cmd_id.as_deref(), Some("ft-282-stall"));
+    assert_eq!(tx[0].payload, b"s".repeat(192));
+    assert_eq!(
+        (tx[1].cmd_id.as_deref(), tx[1].payload.as_slice()),
+        (None, b"\x15\n".as_slice())
+    );
+    assert!(tx[0].seq < tx[1].seq, "已送本文的聚合 WAL 必須先於清行 TX");
+
+    assert_eq!(
+        send(&rig, "after shutdown", Some("ft-282-after-stall")),
+        Err(rejected(RejectReason::Draining, 0, false))
+    );
+    assert_eq!(
+        rig.dut.bytes(),
+        [b"s".repeat(192), b"\x15\n".to_vec()].concat(),
+        "凍結後不得再送出 bytes"
+    );
+}
+
+#[test]
+fn shutdown_settle_kills_line_when_budget_expires_between_slices() {
+    let rig = PortRig::new("COM0", FakeDut::echo_first_n_chars(128));
+    let task = paced(
+        &rig,
+        &"b".repeat(300),
+        "ft-282-between",
+        64,
+        Duration::from_secs(30),
+    );
+    rig.dut.wait_bytes(192);
+
+    assert_eq!(
+        rig.fence.freeze_for_shutdown_settling(),
+        ShutdownFreeze::PendingLine
+    );
+    let settle_wait_deadline = Instant::now() + Duration::from_secs(2);
+    while !rig
+        .clock
+        .sleeps
+        .lock()
+        .unwrap()
+        .contains(&Duration::from_millis(750))
+    {
+        assert!(
+            Instant::now() < settle_wait_deadline,
+            "port 沒有開始等待 750 ms 收尾期限"
+        );
+        std::thread::yield_now();
+    }
+    // 把期限推過 750 ms，再補上目前 slice 的 echo；下一個 slice 不得因此越過期限送出。
+    rig.clock.advance(Duration::from_millis(751));
+    rig.push_rx(&"b".repeat(64).into_bytes());
+
+    assert_eq!(
+        task.join_within(Duration::from_secs(2)),
+        Err(rejected(RejectReason::Draining, 0, false))
+    );
+    assert_eq!(
+        rig.dut.bytes(),
+        [b"b".repeat(192), b"\x15\n".to_vec()].concat()
+    );
+    assert_eq!(
+        rig.dut
+            .writes()
+            .iter()
+            .filter(|w| w.as_slice() == b"\x15\n")
+            .count(),
+        1
+    );
+    rig.fence.with(|state| {
+        assert!(state.frozen);
+        assert!(!state.shutdown_freeze_pending);
+        assert_eq!(state.transfer_line, None);
+    });
+    let tx = rig.tx_records();
+    assert_eq!(tx.len(), 2);
+    assert_eq!(tx[0].payload, b"b".repeat(192));
+    assert_eq!(tx[1].payload, b"\x15\n");
+}
+
+#[test]
+fn hard_cancel_during_settle_sends_nothing_more() {
+    let rig = PortRig::new("COM0", FakeDut::echo_first_n_chars(128));
+    let task = paced(
+        &rig,
+        &"h".repeat(300),
+        "ft-282-hard-cancel",
+        64,
+        Duration::from_secs(30),
+    );
+    rig.dut.wait_bytes(192);
+
+    assert_eq!(
+        rig.fence.freeze_for_shutdown_settling(),
+        ShutdownFreeze::PendingLine
+    );
+    rig.phase1();
+
+    assert_eq!(
+        task.join_within(Duration::from_secs(2)),
+        Err(rejected(RejectReason::Draining, 0, false))
+    );
+    assert_eq!(rig.dut.bytes(), b"h".repeat(192));
+    assert!(!rig.dut.bytes().contains(&0x15));
+    rig.fence.with(|state| {
+        assert!(state.frozen);
+        assert_eq!(state.transfer_line, None);
+    });
+}
+
+#[test]
+fn echo_stall_then_shutdown_cancel_line_closes_and_freezes() {
+    let rig = PortRig::new("COM0", FakeDut::echo_first_n_chars(128));
+    let (stalled_tx, stalled_rx) = crossbeam_channel::bounded(1);
+    let (continue_tx, continue_rx) = crossbeam_channel::bounded(1);
+    let task = rig.spawn(move |port| {
+        let result = port.send_command_echo_paced(
+            &"e".repeat(300),
+            "agent",
+            Some("ft-282-stall-then-cancel"),
+            64,
+            Duration::from_millis(50),
+        );
+        stalled_tx.send(result).unwrap();
+        continue_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        port.cancel_input_line("agent")
+    });
+    rig.dut.wait_bytes(192);
+    rig.pump_clock_until(Duration::from_millis(50), || !stalled_rx.is_empty());
+    assert_eq!(
+        stalled_rx.recv().unwrap(),
+        Ok(EchoPaced {
+            ok: false,
+            acked_chars: 128,
+            sent_chars: 192
+        })
+    );
+    assert_eq!(rig.fence.with(|state| state.transfer_line), Some(OP));
+
+    assert_eq!(
+        rig.fence.freeze_for_shutdown_settling(),
+        ShutdownFreeze::PendingLine
+    );
+    continue_tx.send(()).unwrap();
+    assert_eq!(task.join_within(Duration::from_secs(2)), Ok(()));
+
+    assert_eq!(
+        rig.dut.bytes(),
+        [b"e".repeat(192), b"\x15\n".to_vec()].concat()
+    );
+    assert!(rig.fence.with(|state| state.frozen));
+    assert_eq!(rig.fence.with(|state| state.transfer_line), None);
+    let tx = rig.tx_records();
+    assert_eq!(tx.len(), 2);
+    assert_eq!(tx[0].payload, b"e".repeat(192));
+    assert_eq!(tx[1].payload, b"\x15\n");
+    assert_eq!(tx[1].cmd_id, None);
+}
+
+#[test]
+fn port_drop_releases_line_hold() {
+    let rig = PortRig::new("COM0", FakeDut::echo_first_n_chars(128));
+    let task = paced(
+        &rig,
+        &"d".repeat(300),
+        "ft-282-drop",
+        64,
+        Duration::from_secs(30),
+    );
+    rig.dut.wait_bytes(192);
+    rig.fence.with(|state| {
+        state.quiet_active = true;
+        state.reconfirm_pending = true;
+    });
+    rig.push_rx(&"d".repeat(64).into_bytes());
+    assert_eq!(
+        task.join_within(Duration::from_secs(2)),
+        Err(rejected(RejectReason::Quiet, 0, false))
+    );
+    assert_eq!(rig.fence.with(|state| state.transfer_line), None);
+    assert_eq!(rig.dut.bytes(), b"d".repeat(192), "quiet 拒絕不追加 bytes");
+
+    let stalled = PortRig::new("COM0", FakeDut::echo_first_n_chars(64));
+    let task = paced(
+        &stalled,
+        &"d".repeat(150),
+        "ft-282-drop-stalled",
+        64,
+        Duration::from_millis(50),
+    );
+    stalled.dut.wait_bytes(128);
+    stalled.pump_clock_until(Duration::from_millis(50), || task.is_finished());
+    assert_eq!(
+        task.join_within(Duration::from_secs(2)),
+        Ok(EchoPaced {
+            ok: false,
+            acked_chars: 64,
+            sent_chars: 128
+        })
+    );
+    assert_eq!(
+        stalled.fence.with(|state| state.transfer_line),
+        None,
+        "半行退出後由 Drop 釋放行持有"
+    );
 }

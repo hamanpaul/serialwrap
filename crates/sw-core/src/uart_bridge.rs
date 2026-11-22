@@ -948,6 +948,8 @@ pub struct RunCancel {
     start_gen: u64,
     /// P8 Task 5：`Some(建立當下的 transfer_cancel_gen)` 表示另監看檔案傳輸取消（drain Phase 1）。
     transfer_gen: Option<u64>,
+    /// issue 282：額外監看軟喚醒旗標；不合併其世代或喚醒來源。
+    also_flag: Option<Arc<AtomicBool>>,
 }
 
 impl RunCancel {
@@ -957,6 +959,7 @@ impl RunCancel {
             rx: Arc::clone(rx),
             start_gen: rx.run_cancel_gen.load(Ordering::Acquire),
             transfer_gen: None,
+            also_flag: None,
         }
     }
 
@@ -970,6 +973,18 @@ impl RunCancel {
             transfer_gen: self
                 .transfer_gen
                 .or_else(|| Some(self.rx.transfer_cancel_gen.load(Ordering::Acquire))),
+            also_flag: self.also_flag.clone(),
+        }
+    }
+
+    /// 回傳一個也會在 `other` 自身旗標觸發時取消的 run；不改動任一原始旗標或合併 `other` 的世代。
+    pub fn also_flag_of(&self, other: &RunCancel) -> RunCancel {
+        RunCancel {
+            flag: Arc::clone(&self.flag),
+            rx: Arc::clone(&self.rx),
+            start_gen: self.start_gen,
+            transfer_gen: self.transfer_gen,
+            also_flag: Some(Arc::clone(&other.flag)),
         }
     }
     /// 設旗標並喚醒等待中的 `wait_for_regex_cancellable`（P7 Task 3 先行；Task 7 由 `Effect::CancelLogin` 觸發）。
@@ -983,6 +998,10 @@ impl RunCancel {
             || self
                 .transfer_gen
                 .is_some_and(|start| self.rx.transfer_cancel_gen.load(Ordering::Acquire) != start)
+            || self
+                .also_flag
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
     }
 }
 

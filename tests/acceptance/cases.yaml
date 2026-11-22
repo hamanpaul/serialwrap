@@ -14,7 +14,7 @@
 #   - s24-*（P8 Task 1）：suite 新增 rust-l1、family 新增 S24（schema 列舉只增不改）；SC-33 依 OD-79 撤回，原列 SC-33 的案例改列 SC-03；
 #     s24-xfer-abort-on-release 依 OD-62 比照 BC-03；source_ref／evidence 中尚未建立的節點由承接 Task 依此命名建立。
 schema_version: 1
-revision: 2026-11-13.1
+revision: 2026-11-21.3
 spec: docs/rust-refactor/serialwrap-rust-spec-final.md
 invariant_ids: [zero_tx_on_reject, no_forbidden_interleave, no_stale_context_replay, no_reopen_before_handoff, no_auto_resend, insufficient_evidence_not_pass]
 features:
@@ -670,6 +670,31 @@ cases:
   issues: ['#21', '#161', '#166']
   behavior_changes: [DF-26]
   destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
+- case_id: f7-push-stop-midline-clean-restart
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f07_file_transfer.py:894
+  family: F7
+  title: 64KiB push 停在半行時停機清除並重啟回 READY
+  contract: echo-paced push 停在第二個完整 chunk 後的未結束命令半行時送 SIGTERM；停機 UART TX 恰有一次 Ctrl-U＋換行，重啟後 session 回 READY 且 self-test 通過，DUT 沒有目的檔、暫存檔未增長，也沒有額外 chunk。
+  invariants: [no_auto_resend]
+  layer: L2
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: ThrowawayDaemon 與 console PTY byte observer 為 POSIX-only，需 Linux/WSL 真板 UART
+  capabilities: [physical_uart, posix_throwaway_daemon, target_b64_tool]
+  cli_stage: 1B
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [file_transfer]
+  necessity: conditional
+  issues: ['#282']
+  behavior_changes: []
+  destructive: true
   expected: PASS
   sentinel: null
   evidence: [report.json, report.md]
