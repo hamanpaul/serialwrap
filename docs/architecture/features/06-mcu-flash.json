@@ -1,0 +1,486 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "serialwrap｜MCU 燒錄",
+    "locale": "zh-TW",
+    "output": "docs/architecture/features/06-mcu-flash.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/hamanpaul/serialwrap",
+      "provider": "github",
+      "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347"
+    },
+    "subtitle": "Linux raw PTY 以 flasher sync 自動認線，唯一命中後沿用 UART bridge 進入 FLASHING；holder watch 偵測斷線並釋放仲裁。Windows 停用此端點，com0com 屬人類 console。"
+  },
+  "participants": [
+    {
+      "id": "daemon",
+      "type": "backend",
+      "label": "daemon 主流程",
+      "sublabel": "組裝與啟動",
+      "sources": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1326,
+          "end_line": 1335
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1390,
+          "end_line": 1398
+        }
+      ]
+    },
+    {
+      "id": "flasher",
+      "type": "external",
+      "label": "外部燒錄程式",
+      "sublabel": "經 PTY slave",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/flash_endpoint.rs",
+          "line": 189,
+          "end_line": 203
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 591,
+          "end_line": 599
+        }
+      ]
+    },
+    {
+      "id": "flash",
+      "type": "backend",
+      "label": "燒錄端點",
+      "sublabel": "FlashCoordinator",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/flash_endpoint.rs",
+          "line": 68,
+          "end_line": 92
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 333,
+          "end_line": 350
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 562,
+          "end_line": 599
+        }
+      ]
+    },
+    {
+      "id": "sessions",
+      "type": "backend",
+      "label": "Session 管理",
+      "sublabel": "SessionManager 路由",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7867,
+          "end_line": 7887
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7936,
+          "end_line": 7951
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7954,
+          "end_line": 7969
+        }
+      ]
+    },
+    {
+      "id": "actor",
+      "type": "backend",
+      "label": "Session actor",
+      "sublabel": "FLASHING 與 Fence",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/session_core/flash.rs",
+          "line": 85,
+          "end_line": 98
+        },
+        {
+          "path": "crates/sw-core/src/session_core/flash.rs",
+          "line": 146,
+          "end_line": 152
+        },
+        {
+          "path": "crates/sw-core/src/session_core/flash.rs",
+          "line": 157,
+          "end_line": 176
+        }
+      ]
+    },
+    {
+      "id": "bridge",
+      "type": "backend",
+      "label": "UART bridge",
+      "sublabel": "單一寫入者",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1079,
+          "end_line": 1087
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 490,
+          "end_line": 498
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 520,
+          "end_line": 528
+        }
+      ]
+    },
+    {
+      "id": "target",
+      "type": "external",
+      "label": "MCU／DUT",
+      "sublabel": "實體 UART",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/mcu_patterns.rs",
+          "line": 13,
+          "end_line": 18
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 486,
+          "end_line": 492
+        }
+      ]
+    },
+    {
+      "id": "holders",
+      "type": "backend",
+      "label": "持有者掃描",
+      "sublabel": "/proc 掃描",
+      "sources": [
+        {
+          "path": "crates/sw-pal/src/proc_holders/posix.rs",
+          "line": 19,
+          "end_line": 22
+        },
+        {
+          "path": "crates/sw-pal/src/proc_holders/posix.rs",
+          "line": 95,
+          "end_line": 114
+        }
+      ]
+    }
+  ],
+  "segments": [
+    {
+      "from": 160,
+      "to": 312,
+      "label": "建立端點"
+    },
+    {
+      "from": 326,
+      "to": 786,
+      "label": "認線探測"
+    },
+    {
+      "from": 800,
+      "to": 908,
+      "label": "條件式：認線失敗"
+    },
+    {
+      "from": 922,
+      "to": 1140,
+      "label": "切換 FLASHING"
+    },
+    {
+      "from": 1154,
+      "to": 1581,
+      "label": "雙向燒錄"
+    },
+    {
+      "from": 1595,
+      "to": 1776,
+      "label": "自動釋放"
+    }
+  ],
+  "messages": [
+    {
+      "id": "create-coordinator",
+      "from": "daemon",
+      "to": "flash",
+      "y": 176,
+      "label": "建立燒錄協調者",
+      "variant": "default",
+      "note": "先於 bootstrap attach"
+    },
+    {
+      "id": "register-rx",
+      "from": "flash",
+      "to": "sessions",
+      "y": 220,
+      "label": "登記 RX 觀察者",
+      "variant": "default",
+      "note": "bridge 建立前登記 RX"
+    },
+    {
+      "id": "start-endpoint",
+      "from": "daemon",
+      "to": "flash",
+      "y": 264,
+      "label": "啟動燒錄端點",
+      "variant": "default",
+      "note": "Linux｜Windows： raw PTY｜停用"
+    },
+    {
+      "id": "flasher-sync",
+      "from": "flasher",
+      "to": "flash",
+      "y": 342,
+      "label": "寫入首批 sync",
+      "variant": "default",
+      "note": "Linux 主路徑；首批最多讀 4096 bytes"
+    },
+    {
+      "id": "collect-candidates",
+      "from": "flash",
+      "to": "sessions",
+      "y": 386,
+      "label": "標記並收集候選",
+      "variant": "default",
+      "note": "臨界區回 FLASHING_BUSY"
+    },
+    {
+      "id": "request-probe",
+      "from": "flash",
+      "to": "sessions",
+      "y": 441,
+      "label": "請求 probe 授權",
+      "variant": "default",
+      "note": "actor 回覆上限 2 秒"
+    },
+    {
+      "id": "route-probe",
+      "from": "sessions",
+      "to": "actor",
+      "y": 496,
+      "label": "轉送 probe 控制事件",
+      "variant": "default",
+      "note": "重驗前景槽與有效 epoch"
+    },
+    {
+      "id": "probe-grant",
+      "from": "actor",
+      "to": "flash",
+      "y": 551,
+      "label": "回覆 probe 判定",
+      "variant": "default",
+      "note": "Probe 期間丟棄 human 輸入"
+    },
+    {
+      "id": "submit-sync",
+      "from": "flash",
+      "to": "bridge",
+      "y": 595,
+      "label": "提交認線探測資料",
+      "variant": "default",
+      "note": "優先沿用 flasher sync"
+    },
+    {
+      "id": "uart-sync",
+      "from": "bridge",
+      "to": "target",
+      "y": 639,
+      "label": "送出 UART sync",
+      "variant": "default",
+      "note": "只放行同一 probe_id"
+    },
+    {
+      "id": "probe-rx",
+      "from": "target",
+      "to": "bridge",
+      "y": 694,
+      "label": "回傳 MCU 探測回應",
+      "variant": "default",
+      "note": "RX 先記 WAL"
+    },
+    {
+      "id": "buffer-probe-ack",
+      "from": "bridge",
+      "to": "flash",
+      "y": 738,
+      "label": "通知 RX 並保留 ACK",
+      "variant": "default",
+      "note": "命中後仍掃其餘候選"
+    },
+    {
+      "id": "release-unselected",
+      "from": "flash",
+      "to": "sessions",
+      "y": 816,
+      "label": "釋放未選定 probe",
+      "variant": "default",
+      "note": "條件： none 或 ambiguous；不進 FLASHING"
+    },
+    {
+      "id": "clear-probe-gate",
+      "from": "sessions",
+      "to": "actor",
+      "y": 860,
+      "label": "解除同一 probe 閘門",
+      "variant": "default",
+      "note": "條件：只解除同一 probe_id"
+    },
+    {
+      "id": "request-flashing",
+      "from": "flash",
+      "to": "sessions",
+      "y": 938,
+      "label": "唯一命中後請求切換",
+      "variant": "default",
+      "note": "唯一命中才進 FLASHING"
+    },
+    {
+      "id": "route-flashing",
+      "from": "sessions",
+      "to": "actor",
+      "y": 982,
+      "label": "轉送唯一命中事件",
+      "variant": "default",
+      "note": "重驗同一 Probe 模式"
+    },
+    {
+      "id": "flashing-confirmed",
+      "from": "actor",
+      "to": "flash",
+      "y": 1037,
+      "label": "確認已進 FLASHING",
+      "variant": "default",
+      "note": "沿用同一 UART handle"
+    },
+    {
+      "id": "unmark-candidates",
+      "from": "flash",
+      "to": "sessions",
+      "y": 1092,
+      "label": "解除候選臨界標記",
+      "variant": "default",
+      "note": "其他 COM 解除臨界標記"
+    },
+    {
+      "id": "watch-holders",
+      "from": "flash",
+      "to": "holders",
+      "y": 1170,
+      "label": "輪詢外部端點持有者",
+      "variant": "default",
+      "note": "每 0.5 秒掃描持有者，最長 1800 秒"
+    },
+    {
+      "id": "mirror-baud",
+      "from": "flash",
+      "to": "bridge",
+      "y": 1214,
+      "label": "鏡射端點 baud",
+      "variant": "default",
+      "note": "B0 改採 pattern baud"
+    },
+    {
+      "id": "replay-ack",
+      "from": "flash",
+      "to": "flasher",
+      "y": 1258,
+      "label": "回放探測回應",
+      "variant": "default",
+      "note": "不重送首批 sync"
+    },
+    {
+      "id": "flasher-payload",
+      "from": "flasher",
+      "to": "flash",
+      "y": 1302,
+      "label": "寫入後續燒錄資料",
+      "variant": "default",
+      "note": "每批最多 4096 bytes"
+    },
+    {
+      "id": "submit-flash-bytes",
+      "from": "flash",
+      "to": "bridge",
+      "y": 1346,
+      "label": "提交 Flash 資料",
+      "variant": "default",
+      "note": "完整送出該批才繼續"
+    },
+    {
+      "id": "uart-flash-bytes",
+      "from": "bridge",
+      "to": "target",
+      "y": 1390,
+      "label": "送出韌體協定資料",
+      "variant": "default",
+      "note": "FLASHING 僅放行 Flash"
+    },
+    {
+      "id": "uart-flash-rx",
+      "from": "target",
+      "to": "bridge",
+      "y": 1445,
+      "label": "回傳燒錄回應",
+      "variant": "default",
+      "note": "回應先寫 RX WAL"
+    },
+    {
+      "id": "forward-flash-rx",
+      "from": "bridge",
+      "to": "flash",
+      "y": 1489,
+      "label": "通知燒錄 RX 觀察者",
+      "variant": "default",
+      "note": "只轉送 active_com"
+    },
+    {
+      "id": "flasher-read-rx",
+      "from": "flash",
+      "to": "flasher",
+      "y": 1533,
+      "label": "轉送 MCU 回應",
+      "variant": "default",
+      "note": "RX 寫入失敗不重試"
+    },
+    {
+      "id": "holder-gone-detected",
+      "from": "holders",
+      "to": "flash",
+      "y": 1611,
+      "label": "回報持有者掃描結果",
+      "variant": "default",
+      "note": "armed 後歸零才判斷線；不代表燒錄成功"
+    },
+    {
+      "id": "request-holder-gone",
+      "from": "flash",
+      "to": "sessions",
+      "y": 1677,
+      "label": "送出燒錄結束事件",
+      "variant": "default",
+      "note": "HolderGone 回覆上限 2 秒"
+    },
+    {
+      "id": "restore-session",
+      "from": "sessions",
+      "to": "actor",
+      "y": 1721,
+      "label": "清除閘門並還原狀態",
+      "variant": "default",
+      "note": "還原原狀態並補做 detach；不保證 READY"
+    }
+  ]
+}

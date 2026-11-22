@@ -1,0 +1,1314 @@
+{
+  "schema_version": 1,
+  "document_type": "feature-facts",
+  "feature": {
+    "id": "06-mcu-flash",
+    "order": 6,
+    "title": "MCU 燒錄",
+    "summary": "Linux raw PTY 以 flasher sync 自動認線，唯一命中後沿用 UART bridge 進入 FLASHING；holder watch 偵測斷線並釋放仲裁。Windows 停用此端點，com0com 屬人類 console。"
+  },
+  "repository": {
+    "url": "https://github.com/hamanpaul/serialwrap",
+    "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347"
+  },
+  "diagram_type": "sequence",
+  "scope": {
+    "includes": [
+      "固定 revision 的 Rust FlashEndpoint、sync-probe、唯一命中、FLASHING 仲裁、雙向 pump 與 holder 斷線後釋放。",
+      "建立端點段同時交代 Linux 與 Windows；其後探測、燒錄及釋放主路徑均描述 Linux 啟用的 PTY 端點。holder watch 與 RX observer 為並行工作，圖中依建立／交接次序表達，資料箭頭可重複。",
+      "最重要分支：probe 拒絕或逾時、none／ambiguous 靜默釋放、Matched 判定不明以 HolderGone 收回，以及 holder 逾時或 pump 錯誤共用收尾。"
+    ],
+    "excludes": [
+      "Windows device.release／device.attach 完整交接流程、人類 console 的 com0com 運作、MCU 家族 pattern 的管理 RPC。",
+      "完整 hotplug／恢復狀態機、daemon 停機序、UART 實體燒錄協定與韌體格式。",
+      "建置、測試、daemon 操作及實機驗證；本頁只依固定 revision 讀碼。"
+    ]
+  },
+  "participants": [
+    {
+      "id": "daemon",
+      "label": "daemon 主流程",
+      "sublabel": "組裝與啟動",
+      "type": "backend",
+      "overview_component": "daemon-main",
+      "responsibility": "先建立 FlashCoordinator 使 RX observer 趕在 bootstrap attach 前登記，再於 bootstrap attach 與 watcher 啟動後呼叫 FlashEndpoint::start。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1326,
+          "end_line": 1335,
+          "excerpt_sha256": "683174faf59b0f30d0fb251a56763fbac7d1e260a3099654f189aae34bbf8228",
+          "claim": "daemon 在 bootstrap attach 前建立 coordinator 並注入 manager、pattern registry 與平台依賴。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1390,
+          "end_line": 1398,
+          "excerpt_sha256": "38f5841c8f5f4d3a938409dc66ca61f8e17f56460bc21b8d650b7a4ecfad960d",
+          "claim": "daemon 在 bootstrap attach 與 watcher 啟動後建立 flash 端點。"
+        }
+      ]
+    },
+    {
+      "id": "flasher",
+      "label": "外部燒錄程式",
+      "sublabel": "經 PTY slave",
+      "type": "external",
+      "overview_component": "flasher",
+      "responsibility": "外部程式寫入 PTY slave 的 sync 與韌體資料，從同一端點讀取 ACK 與 MCU 回應；本頁不指定廠牌工具或韌體格式。",
+      "basis": "inferred",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/flash_endpoint.rs",
+          "line": 189,
+          "end_line": 203,
+          "excerpt_sha256": "9972291f621e00406f16ae7bc2accf82c273e52c77dd25c7d7a982e966bedec9",
+          "claim": "端點從 master 讀取外部 client 的首批資料，交給 on_flash_open。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 591,
+          "end_line": 599,
+          "excerpt_sha256": "e773e8b1a2f0c7aab4ad2b1e4288451db5936a93a82e01a22428daf328a5dab2",
+          "claim": "coordinator 回放 ACK 到端點，後續從端點 pump 資料到 MCU。"
+        }
+      ]
+    },
+    {
+      "id": "flash",
+      "label": "燒錄端點",
+      "sublabel": "FlashCoordinator",
+      "type": "backend",
+      "overview_component": "handoff",
+      "responsibility": "包含端點 thread、FlashCoordinator、BridgeProbe、pump 與 holder watch thread。透過 ConsoleTransportFactory 建立 raw PTY 與連結；先以 flasher sync 認線，經 SessionManager 送 actor 控制事件，以現有 bridge 的 TxWriter 轉送資料。holder watch 與 RX observer 為並行工作，並非一條依序執行的呼叫鏈。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/flash_endpoint.rs",
+          "line": 68,
+          "end_line": 92,
+          "excerpt_sha256": "9be97c76d3dbd4fe97a810e80a7958f9435b43f70ae34f64edc759d30abcde15",
+          "claim": "FlashEndpoint 建立 raw PTY、連結、keepalive 並啟動端點 thread。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 333,
+          "end_line": 350,
+          "excerpt_sha256": "624d210bc8bef850af0337f6df7acb97a6d9fe72f91b8b76ce077764fd9e31d7",
+          "claim": "BridgeProbe 取得 actor 授權後透過現有 bridge 送 sync。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 562,
+          "end_line": 599,
+          "excerpt_sha256": "17b01da22820a30300ab457a31628114e3db20d3e79689dbbbc07e9796bd1242",
+          "claim": "coordinator 啟動 holder watch、鏡射 baud、回放 ACK 並 pump 後續資料。"
+        }
+      ]
+    },
+    {
+      "id": "sessions",
+      "label": "Session 管理",
+      "sublabel": "SessionManager 路由",
+      "type": "backend",
+      "overview_component": "sessions",
+      "responsibility": "收集並標記非 command_capable 的候選，查詢 actor 快照，提供現有 bridge 的 TX 與 line-control handle，將 flash 控制事件送入 COM 對應 actor。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7867,
+          "end_line": 7887,
+          "excerpt_sha256": "3ffe292ed1a456b98dc73970cdb8b18ac414a6cfb55e4e89ec30dbf9da4f70a3",
+          "claim": "manager 先標 flash-critical 再取快照，篩選 READY／ATTACHED、無前景與無未收斂關閉的候選。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7936,
+          "end_line": 7951,
+          "excerpt_sha256": "398ac40cc1436158f943ca7b909ce36667eac7f23affe58f6027b69323fa7aa8",
+          "claim": "manager 取得目前 bridge 的 TxWriter 與 line-control handle。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7954,
+          "end_line": 7969,
+          "excerpt_sha256": "fea87d3d1fe1a16a1a546a7cda8e555f2dd80cae8f0427008ad2a2d8a4aba923",
+          "claim": "manager 依 COM 找 actor 並把控制事件送進其 control lane。"
+        }
+      ]
+    },
+    {
+      "id": "actor",
+      "label": "Session actor",
+      "sublabel": "FLASHING 與 Fence",
+      "type": "backend",
+      "overview_component": "session-actor",
+      "responsibility": "驗證 probe 授權，設定 Fence 與 human flash gate，同一 bridge 上切換 FLASHING，結束時還原狀態並補做延後的 detach。Fence 與 human ownership 是本頁未獨立畫出的 actor 相依元件。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core/flash.rs",
+          "line": 85,
+          "end_line": 98,
+          "excerpt_sha256": "e9b82b98f752ef3ece29ef1d954d3162a4fe9aace3f14f80e0e0d1f0162bd282",
+          "claim": "actor 驗證後發布 Probe 模式與 human flash gate，再經 reply channel 回覆授權。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/flash.rs",
+          "line": 146,
+          "end_line": 152,
+          "excerpt_sha256": "b38f6aa20eaf07b88c2de6abd37a792de95d29f2f46c2f00c822112345e4cf3e",
+          "claim": "actor 轉入 FLASHING、更新 Fence 並使舊 human input 失效。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/flash.rs",
+          "line": 157,
+          "end_line": 176,
+          "excerpt_sha256": "6b3bf54692664881e145eed745e3df75307ccbc356dbdbf31a8db4f9bbe65617",
+          "claim": "同一 probe 結束時 actor 清除模式並還原先前狀態。"
+        }
+      ]
+    },
+    {
+      "id": "bridge",
+      "label": "UART bridge",
+      "sublabel": "單一寫入者",
+      "type": "backend",
+      "overview_component": "bridge",
+      "responsibility": "維持實體 UART handle；TxWriter 是唯一序列寫入者，依 Fence 驗證 FlashProbe 或 Flash。RX reader 先寫 WAL 再通知 observer；line-control 直接作用於現有 bridge handle。WAL、Fence 與序列埠 PAL 在此責任內附證據，不另增箭頭。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1079,
+          "end_line": 1087,
+          "excerpt_sha256": "76fe0d163b1f0e658f7ab7c04531403e657c8887ff5f87c53dbafe349f1a63b3",
+          "claim": "TxWriter 以 FenceSubmitGate 將 job payload 送入 SerialWriter::write_gated。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 490,
+          "end_line": 498,
+          "excerpt_sha256": "088d330f240e7f6ce012d2d85f6e070758b76f04d75ccabbf52f9cc711dbb933",
+          "claim": "Fence 僅在同一 Probe 身分放行 FlashProbe，FLASHING 只放行 Flash，其他類別拒絕。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 520,
+          "end_line": 528,
+          "excerpt_sha256": "17145ec4c35834be4fe28557d3fcfca6a47f895039e03462f6e5ed765f0a9d03",
+          "claim": "RX reader 在 WAL append 後通知 observers，之後才寫 RX ring。"
+        }
+      ]
+    },
+    {
+      "id": "target",
+      "label": "MCU／DUT",
+      "sublabel": "實體 UART",
+      "type": "external",
+      "overview_component": "target",
+      "responsibility": "接收認線與燒錄位元組，傳回 ACK 及燒錄協定回應；預設 pattern 為 TI CC26xx，實際硬體與燒錄結果未經本次驗證。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/mcu_patterns.rs",
+          "line": 13,
+          "end_line": 18,
+          "excerpt_sha256": "6e28cfb844d24990d77adcb8f53f1fa5733dae3f6e13db08614ed5b2139ee32b",
+          "claim": "預設 TI CC26xx sync 為 55 55、ACK 為 00 cc、baud 115200、等待 500 ms。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 486,
+          "end_line": 492,
+          "excerpt_sha256": "3fb37b96f55c4d0ead7487d3e95e7633aac5c07c42a7d1c35c91ad02811e240e",
+          "claim": "bridge reader 接收序列埠回應資料。"
+        }
+      ]
+    },
+    {
+      "id": "holders",
+      "label": "持有者掃描",
+      "sublabel": "/proc 掃描",
+      "type": "backend",
+      "overview_component": "pal-serial",
+      "responsibility": "PosixUartExclusive 掃描端點 slave 的外部持有者；排除 daemon 自身行程樹，以 tty 身分而非僅路徑文字判斷，供 holder watch 偵測斷線。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/proc_holders/posix.rs",
+          "line": 19,
+          "end_line": 22,
+          "excerpt_sha256": "52a9f312bdedf32df7de2d975e122a73f5c38b20f29145ba6148658223d366be",
+          "claim": "POSIX UartExclusive 以 /proc 為根掃描持有者。"
+        },
+        {
+          "path": "crates/sw-pal/src/proc_holders/posix.rs",
+          "line": 95,
+          "end_line": 114,
+          "excerpt_sha256": "dcda8157942f7d260c6a75c2ebfa19221da0a108a3bb11a59d36bce5e53af633",
+          "claim": "同 tty 以 inode 或實體裝置識別判斷，掃描時排除自身行程樹。"
+        }
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "id": "create-coordinator",
+      "from": "daemon",
+      "to": "flash",
+      "label": "建立燒錄協調者",
+      "phase": "建立端點",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1326,
+          "end_line": 1335,
+          "excerpt_sha256": "683174faf59b0f30d0fb251a56763fbac7d1e260a3099654f189aae34bbf8228",
+          "claim": "daemon 在 bootstrap attach 前以預設 registry 建立 FlashCoordinator。"
+        },
+        {
+          "path": "crates/sw-core/src/mcu_patterns.rs",
+          "line": 13,
+          "end_line": 18,
+          "excerpt_sha256": "6e28cfb844d24990d77adcb8f53f1fa5733dae3f6e13db08614ed5b2139ee32b",
+          "claim": "預設家族為 ti-cc26xx。"
+        }
+      ],
+      "note": "RX observer 必須在 bootstrap attach 前登記；預設載入 ti-cc26xx pattern。"
+    },
+    {
+      "id": "register-rx",
+      "from": "flash",
+      "to": "sessions",
+      "label": "登記 RX 觀察者",
+      "phase": "建立端點",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 403,
+          "end_line": 410,
+          "excerpt_sha256": "fce73be7ef2bb7e644f1760f29fb86b1cb70738ba8f72390fe01ce41e489b1ec",
+          "claim": "coordinator 建立函式接收 manager 與其他平台依賴。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 424,
+          "end_line": 429,
+          "excerpt_sha256": "43672a1c43bbb5582884616e601f8db6a50c490bc56095b9690f5bd57148dd93",
+          "claim": "coordinator 向 manager 登記弱參照 RX observer。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 313,
+          "end_line": 320,
+          "excerpt_sha256": "c3dde7d174a7130af7f9b64971871195b46348a8196f2ac42d985d6a5477b7b8",
+          "claim": "CoordRx 的 on_rx 將資料交給 coordinator.rx_observer。"
+        }
+      ],
+      "note": "coordinator 呼叫 add_rx_observer；bridge 建立時取 observer 快照，CoordRx 將 RX 轉交 coordinator。"
+    },
+    {
+      "id": "start-endpoint",
+      "from": "daemon",
+      "to": "flash",
+      "label": "啟動燒錄端點",
+      "phase": "建立端點",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1390,
+          "end_line": 1398,
+          "excerpt_sha256": "38f5841c8f5f4d3a938409dc66ca61f8e17f56460bc21b8d650b7a4ecfad960d",
+          "claim": "bootstrap attach 與 watcher 啟動後，daemon 才呼叫 FlashEndpoint::start。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint.rs",
+          "line": 68,
+          "end_line": 85,
+          "excerpt_sha256": "e329ff3a22dcc02c99506c9472b30fc9c58771890b3d98604077ae0214b0ce0a",
+          "claim": "能力停用時不建端點；啟用則建立 raw PTY、連結與 slave keepalive。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 231,
+          "end_line": 234,
+          "excerpt_sha256": "7a9084c0c69c1811886f64edfa0e09bd19db2006955d9e8faaf06ac96195770f",
+          "claim": "POSIX 原生平台宣告 flash_endpoint=true。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 286,
+          "end_line": 289,
+          "excerpt_sha256": "d842a472ee672c5e498f2460390aa2f0feebecbb978cee123b839758d22bcaef",
+          "claim": "Windows 同時宣告 com0com_console=true 與 flash_endpoint=false，兩者是不同能力。"
+        },
+        {
+          "path": "crates/sw-pal/src/console_com0com.rs",
+          "line": 13,
+          "end_line": 22,
+          "excerpt_sha256": "c1bdd803a260a5b3458d9d6df2bbd8b84085bc50d872a40a075104658a0f7b99",
+          "claim": "com0com 開啟函式明確為 console-side 埠。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 880,
+          "end_line": 897,
+          "excerpt_sha256": "20a847b637514ef6b7f5e14e322a936899e568435f15ec2a773fb49d515e0a80",
+          "claim": "device.release 將釋放請求路由給 session。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 900,
+          "end_line": 907,
+          "excerpt_sha256": "8a0cb849bb964e3567c3bbc3e95582c4c2ae9d6cc1d4a7c2e9ba5b62214e5803",
+          "claim": "device.attach 將重接請求路由給 session。"
+        },
+        {
+          "path": "crates/sw-proto/src/runtime_paths.rs",
+          "line": 304,
+          "end_line": 311,
+          "excerpt_sha256": "867f9873a4fd703f28cc3ea4de3a636f539ec01d282b64d7be549c7d8ef30d0c",
+          "claim": "ttyMCU 路徑由環境變數覆寫，預設拼接 run_dir/dev/ttyMCU。"
+        },
+        {
+          "path": "sw_core/flash_endpoint.py",
+          "line": 118,
+          "end_line": 135,
+          "excerpt_sha256": "5262bbe3203a54ace55582cef2687ac27f13ca6040dd9d9661426c20038e377d",
+          "claim": "Python start 於 Windows 缺 PTY 時返回，其餘建立 PTY 並把 slave 設 raw。"
+        }
+      ],
+      "note": "Linux｜Windows：PTY｜停用。Linux 端點由 ConsoleTransportFactory 建立 raw slave 與 symlink，daemon 保留 slave keepalive；Windows flash_endpoint=false，start 回 Ok(None)，com0com 僅為 console 能力，沒有接入此燒錄端點。Windows 另有 device.release／device.attach 交接 RPC，完整交接流程不在本頁。端點路徑預設為 RUN_DIR/dev/ttyMCU，可由 SERIALWRAP_TTYMCU_PATH 覆寫，並非固定 /dev/ttyMCU。Python 0.4.x 對照：同樣 raw PTY，Windows start 為 no-op。"
+    },
+    {
+      "id": "flasher-sync",
+      "from": "flasher",
+      "to": "flash",
+      "label": "寫入首批 sync",
+      "phase": "認線探測",
+      "basis": "inferred",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/flash_endpoint.rs",
+          "line": 34,
+          "end_line": 37,
+          "excerpt_sha256": "90dee57bb903d8a91cf7aad11bcc72f45ccaac733abd40fe0932c107b00125df",
+          "claim": "FIRST_READ_MAX 為 4096 bytes。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint.rs",
+          "line": 189,
+          "end_line": 207,
+          "excerpt_sha256": "82a443ee60ef5c9383008798b80b8399ddd3c8ef86b54894ff9f0684dfd6e1de",
+          "claim": "端點讀外部 client 首批資料，通過 admission 才執行 on_flash_open，之後歸還 ticket。"
+        }
+      ],
+      "note": "此步至本頁收尾描述 Linux 啟用的 PTY 主路徑；外部程式寫 slave 後 master 可讀，端點最多讀 4096 bytes。sync-probe 先取得 admission；凍結時保持沉默、零 MCU TX。"
+    },
+    {
+      "id": "collect-candidates",
+      "from": "flash",
+      "to": "sessions",
+      "label": "標記並收集候選",
+      "phase": "認線探測",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 448,
+          "end_line": 451,
+          "excerpt_sha256": "3b5f44a7bb93532a727b618c085f09a6a956fa844ad036c606063d651b0f8693",
+          "claim": "coordinator 呼叫 manager 收集候選並標記臨界區。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7860,
+          "end_line": 7866,
+          "excerpt_sha256": "3764fbfc4b01b73d04264b989bc5494d34bd2986d2f3028a4d9e72819106a935",
+          "claim": "先標記後快照可阻擋 destructive 操作，actor 仍須最後重驗。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7875,
+          "end_line": 7887,
+          "excerpt_sha256": "e299241f37bf93540b3abe3256221ac87bbd1f1b39f2b902463c663851fb127a",
+          "claim": "候選依 actor 快照的狀態、foreground_busy、drain_stalled 與未確認關閉資料篩選。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7073,
+          "end_line": 7079,
+          "excerpt_sha256": "c0868ad8d386a9198861f471a10eada4289c053c4d59ec4622aa7317d28d288e",
+          "claim": "clear 在 FLASHING 或 flash-critical 時直接返回 FLASHING_BUSY。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3152,
+          "end_line": 3155,
+          "excerpt_sha256": "ca82a34564f79d5d16958d1bf5c3d9996fb7047ab39aff24fe3dad0e913b769d",
+          "claim": "actor 對 release 的 flash busy 判定直接回覆拒絕。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3764,
+          "end_line": 3767,
+          "excerpt_sha256": "77a24edbb88b80d66e5b60509a8331f5e90ee234d15e6d526736c596f45e5b9a",
+          "claim": "bind_request 在 flash busy 時直接回覆拒絕。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/flash.rs",
+          "line": 31,
+          "end_line": 48,
+          "excerpt_sha256": "5aeacf2a60a2f29e5fa2fc1f8ab9c8a95d48817a046b2dc34b1a3dc924d38104",
+          "claim": "flash busy 包含 FLASHING、Probe 與 flash-critical，拒絕回覆帶 FLASHING_BUSY。"
+        }
+      ],
+      "note": "manager 先設 flash-critical，再向 actor 取快照；只保留非 command_capable、READY 或 ATTACHED、無前景作業且無未收斂關閉的候選。臨界期間的 clear／release／bind 會回 FLASHING_BUSY。候選與回覆由此呼叫返回，之後仍需 actor 最終授權。"
+    },
+    {
+      "id": "request-probe",
+      "from": "flash",
+      "to": "sessions",
+      "label": "請求 probe 授權",
+      "phase": "認線探測",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/flash_endpoint/detect.rs",
+          "line": 47,
+          "end_line": 60,
+          "excerpt_sha256": "17fdc28028f14c1476d4dc057807a831f6c2334170c3fea62a11869e46a43eac",
+          "claim": "detect_mcu_line 過濾 command_capable 與缺 by_id 候選，逐 pattern 探測並在該候選命中後 break。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 628,
+          "end_line": 647,
+          "excerpt_sha256": "d30f26d48f1c318e840d14f3125fa9a87b4e19b62866ab245540816e2404b7fc",
+          "claim": "coordinator 透過 manager 送 FlashSyncProbeStart，取消或等待逾時補送 Released。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 51,
+          "end_line": 54,
+          "excerpt_sha256": "4de22a0be8a0916c4a80e6d8ec1f9f8139c5c9125f3002914130b20e2bc96e40",
+          "claim": "REPLY_WAIT 為 2 秒。"
+        }
+      ],
+      "note": "逐候選逐 pattern 嘗試；無 by_id 者略過，同一候選首個命中後換下一候選。以 FlashSyncProbeStart 送往 manager，等 actor 回覆最多 2 秒，取消或逾時則補送 Released。"
+    },
+    {
+      "id": "route-probe",
+      "from": "sessions",
+      "to": "actor",
+      "label": "轉送 probe 控制事件",
+      "phase": "認線探測",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7957,
+          "end_line": 7969,
+          "excerpt_sha256": "40b640692163ad2c6d50e3e24809c06f63ca7c9df9a0b4af5e25153af9f99623",
+          "claim": "manager 找出 COM 的 actor，使用有界 control lane 送事件。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/flash.rs",
+          "line": 52,
+          "end_line": 79,
+          "excerpt_sha256": "47430ed7bbe0ba1166f32ae3f67fd6cd8e74072297f006482215cad73de51a03",
+          "claim": "actor 依序驗證 command_capable、狀態、釋放、recovering、drain、前景槽、模式與 epoch。"
+        }
+      ],
+      "note": "SessionManager 依 COM 送到 actor control lane；actor 會重驗狀態、released／recovering／drain、前景槽與有效 epoch，並非只信候選快照。"
+    },
+    {
+      "id": "probe-grant",
+      "from": "actor",
+      "to": "flash",
+      "label": "回覆 probe 判定",
+      "phase": "認線探測",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core/flash.rs",
+          "line": 83,
+          "end_line": 98,
+          "excerpt_sha256": "e9c6fe905c60821edf17ef5f5e3d63bad324dc1575c2168f0e4e1b7c880e3828",
+          "claim": "actor 成功時先發布 Probe 模式、probe_id 與 human flash gate，再回覆授權或拒絕。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 343,
+          "end_line": 350,
+          "excerpt_sha256": "48ab7edb207e1623b72a21546c7d9e18d3296a5d8fb4d8074ce90173616dcb82",
+          "claim": "未取得授權會直接返回 false，取得後才送 probe。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 634,
+          "end_line": 638,
+          "excerpt_sha256": "acc46beeab1c314fad00e33738b774a1c14c6d80ce28f985200ec274df3c7a1d",
+          "claim": "coordinator 將非成功授權視為 None。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/flash.rs",
+          "line": 7,
+          "end_line": 10,
+          "excerpt_sha256": "dbdc355bab3708e5cd7b822c93b908911cf8da74ebba40ae9d5c413d6a795770",
+          "claim": "Probe 與 FLASHING 期間 human console 輸入丟棄；模式切換沿用同一 bridge。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/ownership.rs",
+          "line": 188,
+          "end_line": 192,
+          "excerpt_sha256": "f05577a8147f15111442dfb3d92c8845e73302480b27b8a95781c3b754945bae",
+          "claim": "human ownership 的輸入路由在 flash_mode 時直接回 DropFlash。"
+        }
+      ],
+      "note": "授權時先設 Probe(probe_id) 與 human flash gate，再回 ProbeGrant；拒絕則回 FlashReject，coordinator 對該次 probe 回 false，不送探測資料。Probe 期間 human 輸入丟棄，state 仍為 READY 或 ATTACHED。"
+    },
+    {
+      "id": "submit-sync",
+      "from": "flash",
+      "to": "bridge",
+      "label": "提交認線探測資料",
+      "phase": "認線探測",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 347,
+          "end_line": 355,
+          "excerpt_sha256": "6d73dcbb724e3fc1fefc450bf7e28c0d8a7d1f40d06289a3d7a90c201dbcffcc",
+          "claim": "probe 使用 flasher sync 或空資料時的 pattern probe，依授權 epoch 與 probe_id 送出 FlashProbe。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 695,
+          "end_line": 709,
+          "excerpt_sha256": "5f7d166c5e459ab06727d6779f7614796cc39877673b23033e44d190bad6e461",
+          "claim": "flash TX permit 帶 class、epoch、source=flash、log=true 與 probe_id。"
+        },
+        {
+          "path": "crates/sw-core/src/mcu_patterns.rs",
+          "line": 13,
+          "end_line": 18,
+          "excerpt_sha256": "6e28cfb844d24990d77adcb8f53f1fa5733dae3f6e13db08614ed5b2139ee32b",
+          "claim": "預設 TI CC26xx probe、ACK 與等待時間。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 39,
+          "end_line": 42,
+          "excerpt_sha256": "637acca73d1f979c34b387318253db03bb1b4e93091292123dbd1704a3cd68f6",
+          "claim": "PROBE_POLL 為 20 ms。"
+        }
+      ],
+      "note": "優先使用 flasher 自己的首批 sync，只有空資料才退回 pattern probe；透過現有 TxWriter 提交 FlashProbe，附 probe_id 與 epoch，source=flash 且記 WAL。預設 probe 55 55、expect 00 cc、等待 500 ms；每 20 ms 檢查 RX。"
+    },
+    {
+      "id": "uart-sync",
+      "from": "bridge",
+      "to": "target",
+      "label": "送出 UART sync",
+      "phase": "認線探測",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1079,
+          "end_line": 1087,
+          "excerpt_sha256": "76fe0d163b1f0e658f7ab7c04531403e657c8887ff5f87c53dbafe349f1a63b3",
+          "claim": "TxWriter 透過含 permit 的 FenceSubmitGate 呼叫 writer.write_gated。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 490,
+          "end_line": 498,
+          "excerpt_sha256": "088d330f240e7f6ce012d2d85f6e070758b76f04d75ccabbf52f9cc711dbb933",
+          "claim": "Probe 模式只允許相同 probe_id 的 FlashProbe，其他類別拒絕。"
+        }
+      ],
+      "note": "唯一 TxWriter 經 write_gated 寫入既有 UART handle；Fence 只放行相同 probe_id 的 FlashProbe，其他 TX 類別在 Probe 期間拒絕。"
+    },
+    {
+      "id": "probe-rx",
+      "from": "target",
+      "to": "bridge",
+      "label": "回傳 MCU 探測回應",
+      "phase": "認線探測",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 486,
+          "end_line": 502,
+          "excerpt_sha256": "4fa6dafc0b90c78a23fbe3b3940fdc3b929e0f5658ff78de65efd5389a4d4ea2",
+          "claim": "reader 讀到 bytes 後先呼叫 WAL append。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 520,
+          "end_line": 524,
+          "excerpt_sha256": "48fedbf27871fd84310b4f5d92cad54e7d621d7a3a2e78d720e13864b9e23a2a",
+          "claim": "WAL 完成後才呼叫 RX observers。"
+        }
+      ],
+      "note": "bridge reader 接收二進位 RX，先 append WAL，再通知 observer；本步表示軟體接收點，不宣稱實板必然回 ACK。"
+    },
+    {
+      "id": "buffer-probe-ack",
+      "from": "bridge",
+      "to": "flash",
+      "label": "通知 RX 並保留 ACK",
+      "phase": "認線探測",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 520,
+          "end_line": 524,
+          "excerpt_sha256": "48fedbf27871fd84310b4f5d92cad54e7d621d7a3a2e78d720e13864b9e23a2a",
+          "claim": "bridge reader 直接呼叫 observers。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 316,
+          "end_line": 320,
+          "excerpt_sha256": "6c678af3a18c8edfc64d77bb3366b3120753e0646c35edec2532f5a34ac91053",
+          "claim": "CoordRx 將 callback 送入 coordinator。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 758,
+          "end_line": 767,
+          "excerpt_sha256": "f5629e264846f00f03748776680fdafa57f8638c17a955cefc73182eab948856",
+          "claim": "coordinator 將 RX 累積到候選 buffer 並保留最後 4096 bytes。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 360,
+          "end_line": 369,
+          "excerpt_sha256": "ad7d6f379ee8ff976f2383d16c691bd53155bd251b01c1ba584ff213a6f1bfdb",
+          "claim": "expect 命中時保留回應及 Held，不解除 gate。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/detect.rs",
+          "line": 55,
+          "end_line": 74,
+          "excerpt_sha256": "22b08bead942c07e3f6bd28044d47635534a55e17a6d96ed80b747133826e71d",
+          "claim": "一候選命中後繼續其他候選，依總命中數判定 matched 或 ambiguous。"
+        }
+      ],
+      "note": "CoordRx 在 bridge reader thread 轉交 RX；probe buffer 保留最後 4096 bytes。expect 子序列命中時保存整段 RX 回應並保持該候選 gate，繼續掃完其餘候選以排除多義，不立即選第一條線。"
+    },
+    {
+      "id": "release-unselected",
+      "from": "flash",
+      "to": "sessions",
+      "label": "釋放未選定 probe",
+      "phase": "條件式：認線失敗",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/flash_endpoint/detect.rs",
+          "line": 63,
+          "end_line": 74,
+          "excerpt_sha256": "7d3d8606232feb12babdf293c0b87747cde49cb31aee2bb2398e4cfbe1357f8f",
+          "claim": "零命中為 none，多命中為 ambiguous，不任選其中一條。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 508,
+          "end_line": 510,
+          "excerpt_sha256": "b15f9186d54d0847f8526cee8a0277f27724f4760251751039ad4463e341f3dc",
+          "claim": "非 matched 或本次取消時直接返回。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 453,
+          "end_line": 458,
+          "excerpt_sha256": "7bf487840f3a6b4cee34f2aaa2ae2acf2fa4714a975b61d2bc25c771e9520e4f",
+          "claim": "外層 finally 釋放 held 並解除全部候選的 flash-critical。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 668,
+          "end_line": 678,
+          "excerpt_sha256": "6e3c699285353007f1d0a5cf2d3b64198d7b18c0ae5532060250c0f025563ae1",
+          "claim": "釋放 held 時透過 manager 送 FlashProbeReleased。"
+        }
+      ],
+      "note": "偵測結果不是 matched 時保持沉默，不回放 ACK、不進 FLASHING；外層 finally 釋放全部 held 並解除候選 flash-critical。零命中且無 held 時只需解除標記。本步也代表其他早退路徑對仍持有 gate 的收尾。",
+      "condition": "Linux 認線結果為 none 或 ambiguous；只有仍持有 probe gate 時才送以下釋放事件。"
+    },
+    {
+      "id": "clear-probe-gate",
+      "from": "sessions",
+      "to": "actor",
+      "label": "解除同一 probe 閘門",
+      "phase": "條件式：認線失敗",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7957,
+          "end_line": 7969,
+          "excerpt_sha256": "40b640692163ad2c6d50e3e24809c06f63ca7c9df9a0b4af5e25153af9f99623",
+          "claim": "manager 把釋放控制事件送往 actor。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/flash.rs",
+          "line": 102,
+          "end_line": 120,
+          "excerpt_sha256": "3e210c667b056afc72dfe0c61431fbec17dfa5fedf98a1b1ef28be6ed5ad4636",
+          "claim": "actor 忽略舊 probe 或已 FLASHING 的 Released，其餘清除模式及 human gate 並 reconcile detach。"
+        }
+      ],
+      "note": "FlashProbeReleased 只解除相同 probe_id 的 Probe 模式與 human flash gate；不解除已進 FLASHING 者。actor 隨後補做延後 detach。",
+      "condition": "Linux 認線結果為 none 或 ambiguous；只有仍持有 probe gate 時才送以下釋放事件。"
+    },
+    {
+      "id": "request-flashing",
+      "from": "flash",
+      "to": "sessions",
+      "label": "唯一命中後請求切換",
+      "phase": "切換 FLASHING",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 508,
+          "end_line": 530,
+          "excerpt_sha256": "b2af21b5a9a96409aeca16bbd5197d06491664de995a95842fba73fecc7d3725",
+          "claim": "只有唯一命中且未取消才送 matched；拒絕返回，結果不明則送 HolderGone。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 651,
+          "end_line": 665,
+          "excerpt_sha256": "e6b2b42b4a85033a5156af9c4791b27ad9a9574beba21fbf7d9f48a2c4a75515",
+          "claim": "coordinator 經 manager 送 FlashSyncMatched 並區分成功、拒絕、未知。"
+        }
+      ],
+      "note": "主路徑續接唯一命中且未取消的結果；coordinator 以該 Held 的 probe_id 送 FlashSyncMatched。actor 拒絕時走外層 Released 收尾；若等回覆結果不明，改送 HolderGone，避免殘留已切換的狀態。"
+    },
+    {
+      "id": "route-flashing",
+      "from": "sessions",
+      "to": "actor",
+      "label": "轉送唯一命中事件",
+      "phase": "切換 FLASHING",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7957,
+          "end_line": 7969,
+          "excerpt_sha256": "40b640692163ad2c6d50e3e24809c06f63ca7c9df9a0b4af5e25153af9f99623",
+          "claim": "manager 轉送控制事件。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/flash.rs",
+          "line": 131,
+          "end_line": 145,
+          "excerpt_sha256": "94b4e2c730efa986b7e7c9353d697d359ac6e4d6a24fc3e42fd5828f8d49576e",
+          "claim": "actor 重驗相同 probe、允許狀態與 by_id 是否仍在排空。"
+        }
+      ],
+      "note": "manager 送入 control lane；actor 要求 probe_id 與 Probe 模式一致，重驗 READY 或 ATTACHED 與 by_id 關閉收斂狀態。"
+    },
+    {
+      "id": "flashing-confirmed",
+      "from": "actor",
+      "to": "flash",
+      "label": "確認已進 FLASHING",
+      "phase": "切換 FLASHING",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core/flash.rs",
+          "line": 123,
+          "end_line": 124,
+          "excerpt_sha256": "9c0ac87e352ec359fa850ffc66c6927cc4b5ed5fe28ed436f16a437908f5c653",
+          "claim": "Matched 切換在同 handle 上完成，不開新 bridge 或 drain，conn_epoch 不變。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/flash.rs",
+          "line": 146,
+          "end_line": 152,
+          "excerpt_sha256": "b38f6aa20eaf07b88c2de6abd37a792de95d29f2f46c2f00c822112345e4cf3e",
+          "claim": "actor 保存舊狀態並切 FLASHING、更新 Fence、作廢 human input，再送成功回覆。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 492,
+          "end_line": 498,
+          "excerpt_sha256": "3c4340fae91a8e74e5208b73cb9ab6543686faa838354e7231d5198b2ba2ecca",
+          "claim": "FLASHING 僅允許 Flash 類別的 TX。"
+        }
+      ],
+      "note": "actor 保存原狀態，切至 FLASHING、發布 Fence::Flashing 並使舊 human input 失效後回覆成功；沿用同一 UART handle，不 reopen，不變更 conn_epoch。此後 Fence 只允許 Flash TX。"
+    },
+    {
+      "id": "unmark-candidates",
+      "from": "flash",
+      "to": "sessions",
+      "label": "解除候選臨界標記",
+      "phase": "切換 FLASHING",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 533,
+          "end_line": 539,
+          "excerpt_sha256": "a7fb02b6b7025b0df78d1c975fd3701d9d1965f4b88b8a5dc8c6629ab975c11a",
+          "claim": "coordinator 移除命中 held、釋放其餘 held 並解除所有候選標記，再進 flash_session。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7922,
+          "end_line": 7928,
+          "excerpt_sha256": "f96dc1e07be05d8fe19843a44a2d7729e3c93bec238e6117819511bae2179376",
+          "claim": "manager 清除 COM 臨界集合與 Fence 的 flash_critical。"
+        }
+      ],
+      "note": "切換成功後，命中線由 FLASHING 狀態守護；先釋放其餘 held，再解除全部候選 flash-critical，避免長時間 pump 誤擋其他 COM 的 destructive 操作。"
+    },
+    {
+      "id": "watch-holders",
+      "from": "flash",
+      "to": "holders",
+      "label": "輪詢外部端點持有者",
+      "phase": "雙向燒錄",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 562,
+          "end_line": 574,
+          "excerpt_sha256": "c84becc701853958430e4bf4bf6db0c59f6a56589faac2f806fbd19bbde1874b",
+          "claim": "coordinator 設 active_com 並啟動獨立 holder watch thread，傳入 slave 路徑。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 43,
+          "end_line": 46,
+          "excerpt_sha256": "ff01b23672739c27f23e2a1d1c9f3bb37986ec19cadfebd16b3427b12697b9ba",
+          "claim": "holder poll 為 500 ms，最長 1800 秒。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/holder_watch.rs",
+          "line": 69,
+          "end_line": 84,
+          "excerpt_sha256": "1cef4c7f8f2506611bed9114a68bf0be157209dd88af66600b257fa8039acabc",
+          "claim": "watcher 反覆掃描 holder，經可取消等待，最後只取消本次 run。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 222,
+          "end_line": 228,
+          "excerpt_sha256": "22a6e8164404a6dbeb215f9d5e3431b059b86648c2b09a2c8d488833466cd83e",
+          "claim": "wait_until 可因取消提早結束。"
+        },
+        {
+          "path": "sw_core/service.py",
+          "line": 552,
+          "end_line": 567,
+          "excerpt_sha256": "77520a32a03387ce976b05fa1ee2b5ec2327a7692f7fd9e091eb33a7718d56d0",
+          "claim": "Python 使用同樣 0.5 秒、1800 秒與 armed 判定，但等待使用 time.sleep。"
+        }
+      ],
+      "note": "coordinator 取得 master writer 並設定 active_com 後啟動 holder watch；每 0.5 秒查 slave 的外部持有者，最長 1800 秒，與下列 pump／RX 轉送並行。因 daemon 保留 slave keepalive，不能依賴 master EOF。Python 0.4.x 對照：輪詢間隔與上限相同；Rust 使用可由本次取消喚醒的等待，Python 使用 time.sleep。"
+    },
+    {
+      "id": "mirror-baud",
+      "from": "flash",
+      "to": "bridge",
+      "label": "鏡射端點 baud",
+      "phase": "雙向燒錄",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 587,
+          "end_line": 590,
+          "excerpt_sha256": "44ff6e33fad0e8e102a0f7d5739715f401dfae08d2a491b42b8f12970e379d6e",
+          "claim": "coordinator 取得既有 line-control 並在 ACK 回放前鏡射 slave termios。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7944,
+          "end_line": 7951,
+          "excerpt_sha256": "ad54ea4767027b422a226b17ad75ef32f78a12c59a1a23ca09338b6b85becfab",
+          "claim": "line-control 來自目前 epoch 的 IoWorker。"
+        },
+        {
+          "path": "crates/sw-pal/src/serial/posix.rs",
+          "line": 219,
+          "end_line": 244,
+          "excerpt_sha256": "97dc360774b72b8c7318628951df95801040d13565500df92dc45b35f07fc038",
+          "claim": "termios mirror 套用 slave 速率或 fallback baud，fallback 失敗忽略。"
+        },
+        {
+          "path": "crates/sw-pal/src/traits.rs",
+          "line": 911,
+          "end_line": 919,
+          "excerpt_sha256": "f877a424df8a68845873d472a58fdcceef54a1ebaf6a58d93399c191f3378e50",
+          "claim": "slave 任一方向速率為 B0 或讀取失敗時，使用 fallback baud；無 fallback 時忽略。"
+        }
+      ],
+      "note": "認線成功後才把 PTY slave 速率套到既有 bridge 的 line-control；B0 視為未設，採命中 pattern baud 作 fallback，錯誤忽略。此動作在 ACK 回放與 pump 前進行。"
+    },
+    {
+      "id": "replay-ack",
+      "from": "flash",
+      "to": "flasher",
+      "label": "回放探測回應",
+      "phase": "雙向燒錄",
+      "basis": "inferred",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 519,
+          "end_line": 521,
+          "excerpt_sha256": "244b3696d1184eac97f2081608031c3dc2cd6de03ba4c6457fd588a3ae6a4cd7",
+          "claim": "coordinator 取出 probe 保存的 ACK 回應。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 591,
+          "end_line": 599,
+          "excerpt_sha256": "e773e8b1a2f0c7aab4ad2b1e4288451db5936a93a82e01a22428daf328a5dab2",
+          "claim": "coordinator 往 master 回放 ACK，再 pump 後續資料，first 不重送。"
+        }
+      ],
+      "note": "經 PTY master 把 probe 保存的整段 MCU 回應（含 ACK）回放一次；first 已在 probe 送過，不重送。ACK try_write 的錯誤與部分寫入忽略，不能保證外部程式一定收到完整 ACK。"
+    },
+    {
+      "id": "flasher-payload",
+      "from": "flasher",
+      "to": "flash",
+      "label": "寫入後續燒錄資料",
+      "phase": "雙向燒錄",
+      "basis": "inferred",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/flash_endpoint/pump.rs",
+          "line": 24,
+          "end_line": 36,
+          "excerpt_sha256": "680cf1c9ba706f259c79d287f260b3832b20abe1311aef5c695cb055e0709b64",
+          "claim": "pump 等可讀並讀一個 chunk 後送 sink。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 47,
+          "end_line": 50,
+          "excerpt_sha256": "26eeb171774775cc282437845b678e38f89bd9286d3613c2859f66e197121e9c",
+          "claim": "PUMP_CHUNK 為 4096，PUMP_SELECT 為 200 ms。"
+        }
+      ],
+      "note": "外部程式後續寫入 PTY slave，pump 等 master 可讀後每次讀最多 4096 bytes，送入 sink；等可讀間隔 0.2 秒。此為傳輸管線，不檢查韌體映像內容。"
+    },
+    {
+      "id": "submit-flash-bytes",
+      "from": "flash",
+      "to": "bridge",
+      "label": "提交 Flash 資料",
+      "phase": "雙向燒錄",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 596,
+          "end_line": 599,
+          "excerpt_sha256": "3e8d658648c7a8e5d94035926a9501adc93e8cfc8bbc3643672902146f032a73",
+          "claim": "pump sink 依既有 epoch 呼叫 send_tx，類別為 Flash。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 697,
+          "end_line": 721,
+          "excerpt_sha256": "76f49588695ccd04b20d492533a8e8fba1c49cf9ae7c6db982fa415a913b119a",
+          "claim": "send_tx 建 job、設 source 與記錄旗標，送交 TxWriter 後等 report 並 settle，僅完整送出視為成功。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/pump.rs",
+          "line": 33,
+          "end_line": 36,
+          "excerpt_sha256": "8e92c2b49cb02131be5ddba3e28f3c34efe2e1704f8ccd7237221d4d772bc308",
+          "claim": "sink 回 false 時 pump 結束。"
+        }
+      ],
+      "note": "pump sink 呼叫 send_tx，使用 Held 的 epoch 與 TxClass::Flash；source=flash 且記 WAL。送出後等待 TX report 並 settle，只有完整送出該批才回 true；拒絕或 TX 失敗會讓 pump 返回。"
+    },
+    {
+      "id": "uart-flash-bytes",
+      "from": "bridge",
+      "to": "target",
+      "label": "送出韌體協定資料",
+      "phase": "雙向燒錄",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 490,
+          "end_line": 498,
+          "excerpt_sha256": "088d330f240e7f6ce012d2d85f6e070758b76f04d75ccabbf52f9cc711dbb933",
+          "claim": "FLASHING 僅放行 Flash，其他 class 拒絕。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1079,
+          "end_line": 1085,
+          "excerpt_sha256": "205c2baddd95e399989ecd02e8fd4db8cf118269a23b96c61db6979081456eee",
+          "claim": "TxWriter 呼叫既有 writer 寫 job payload。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/flash.rs",
+          "line": 123,
+          "end_line": 124,
+          "excerpt_sha256": "9c0ac87e352ec359fa850ffc66c6927cc4b5ed5fe28ed436f16a437908f5c653",
+          "claim": "FLASHING 切換維持同一 handle 與 epoch，不 OpenBridge 或 drain。"
+        }
+      ],
+      "note": "Flash TX 仍經同一 TxWriter 與 Fence，FLASHING 期間不允許 command、human 或其他類別混入；實體 UART 不交給外部 flasher 重新開啟。"
+    },
+    {
+      "id": "uart-flash-rx",
+      "from": "target",
+      "to": "bridge",
+      "label": "回傳燒錄回應",
+      "phase": "雙向燒錄",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 486,
+          "end_line": 502,
+          "excerpt_sha256": "4fa6dafc0b90c78a23fbe3b3940fdc3b929e0f5658ff78de65efd5389a4d4ea2",
+          "claim": "reader 接收資料後 append RX/device WAL。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 520,
+          "end_line": 524,
+          "excerpt_sha256": "48fedbf27871fd84310b4f5d92cad54e7d621d7a3a2e78d720e13864b9e23a2a",
+          "claim": "WAL 後通知 observers。"
+        }
+      ],
+      "note": "同一 reader 持續讀取 MCU RX，先寫入 WAL 的 RX/device 記錄，再通知 observer。此步與 TX pump 並行且可重複。"
+    },
+    {
+      "id": "forward-flash-rx",
+      "from": "bridge",
+      "to": "flash",
+      "label": "通知燒錄 RX 觀察者",
+      "phase": "雙向燒錄",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 520,
+          "end_line": 524,
+          "excerpt_sha256": "48fedbf27871fd84310b4f5d92cad54e7d621d7a3a2e78d720e13864b9e23a2a",
+          "claim": "reader 呼叫 observer.on_rx。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 316,
+          "end_line": 320,
+          "excerpt_sha256": "6c678af3a18c8edfc64d77bb3366b3120753e0646c35edec2532f5a34ac91053",
+          "claim": "CoordRx 直接呼叫 coordinator.rx_observer。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 769,
+          "end_line": 774,
+          "excerpt_sha256": "5651fd6e9670ea03a5c118052150c198d33aadbe709cc9eace0b79703ad1f6e6",
+          "claim": "只有 active_com 相符才往端點 master 寫入資料。"
+        }
+      ],
+      "note": "reader thread 直接呼叫 CoordRx，再轉交 coordinator；active_com 只指向命中線，其他 COM 的 RX 不送進燒錄端點。"
+    },
+    {
+      "id": "flasher-read-rx",
+      "from": "flash",
+      "to": "flasher",
+      "label": "轉送 MCU 回應",
+      "phase": "雙向燒錄",
+      "basis": "inferred",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 769,
+          "end_line": 774,
+          "excerpt_sha256": "5651fd6e9670ea03a5c118052150c198d33aadbe709cc9eace0b79703ad1f6e6",
+          "claim": "active COM 的 RX 經 master writer try_write，錯誤忽略且不重試。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint.rs",
+          "line": 73,
+          "end_line": 83,
+          "excerpt_sha256": "61bd0253c742908d5af3daeb32e6d4bb977a011290051a6012471167b62f459c",
+          "claim": "端點 master 與 slave 來自同一 PTY pair。"
+        }
+      ],
+      "note": "coordinator 在 RX observer 中透過 PTY master 原樣 try_write MCU bytes，供外部程式從 slave 讀取；錯誤忽略、不重試、不阻塞，不保證每一回應完整交付。"
+    },
+    {
+      "id": "holder-gone-detected",
+      "from": "holders",
+      "to": "flash",
+      "label": "回報持有者掃描結果",
+      "phase": "自動釋放",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/flash_endpoint/holder_watch.rs",
+          "line": 69,
+          "end_line": 84,
+          "excerpt_sha256": "1cef4c7f8f2506611bed9114a68bf0be157209dd88af66600b257fa8039acabc",
+          "claim": "watcher 消費掃描 pids，先 armed 再歸零才 break；上限或取消也會結束並取消本次 run。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 43,
+          "end_line": 46,
+          "excerpt_sha256": "ff01b23672739c27f23e2a1d1c9f3bb37986ec19cadfebd16b3427b12697b9ba",
+          "claim": "holder 最大等待為 1800 秒。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/pump.rs",
+          "line": 24,
+          "end_line": 44,
+          "excerpt_sha256": "b3ae456520e09b1b140975d87d3998685b83643a12bcd538fa839848d4e31b61",
+          "claim": "pump 遇取消、等待錯誤、sink 失敗、EOF 或讀取錯誤會返回。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 601,
+          "end_line": 602,
+          "excerpt_sha256": "f53c0b2aba3980ecc1c87c6a5a1e1a1931229788bbc569a7b3e63f71f144aff5",
+          "claim": "pump 返回後 coordinator 取消本次 run。"
+        },
+        {
+          "path": "crates/sw-pal/src/proc_holders/posix.rs",
+          "line": 19,
+          "end_line": 22,
+          "excerpt_sha256": "52a9f312bdedf32df7de2d975e122a73f5c38b20f29145ba6148658223d366be",
+          "claim": "持有者掃描器回傳 /proc 掃描報告；armed 與取消不在掃描器中執行。"
+        }
+      ],
+      "note": "箭頭代表持有者掃描回覆；以下 armed 判定與取消由燒錄子系統內的 holder watch 執行。holder watch 只有曾看見非空 pids（armed）後再變空才視為斷線；尚未 armed 則繼續等到 1800 秒上限。掃描只取 pids，未檢查 HolderScanStatus；回報空集合不等於已證明燒錄成功。斷線、逾時或取消都只取消本次 FlashRunCancel，不停止常駐端點。pump I/O 錯誤或 TX 失敗也會提早進相同收尾。"
+    },
+    {
+      "id": "request-holder-gone",
+      "from": "flash",
+      "to": "sessions",
+      "label": "送出燒錄結束事件",
+      "phase": "自動釋放",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 601,
+          "end_line": 621,
+          "excerpt_sha256": "7f97cf4736692ea2acfeab17ace90706942d85a3054dc07430b9491cf017af00",
+          "claim": "finally 取消 run、限時 join holder、記 stalled，清 active 與 writer 後呼叫 holder_gone。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 681,
+          "end_line": 687,
+          "excerpt_sha256": "f13064ab3d8bb022e5915980b2ac0418d1433d9e21b598d39ad51949d23b7dc4",
+          "claim": "holder_gone 經 manager 送控制事件並限時等待回覆。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 51,
+          "end_line": 54,
+          "excerpt_sha256": "4de22a0be8a0916c4a80e6d8ec1f9f8139c5c9125f3002914130b20e2bc96e40",
+          "claim": "actor 回覆與 holder join 上限皆為 2 秒。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint/coordinator.rs",
+          "line": 453,
+          "end_line": 466,
+          "excerpt_sha256": "d43c640b40122f7b76a81a31b5081749dc924504117a397e6483f7b528b3c2e0",
+          "claim": "on_flash_open 外層 finally 解除候選標記並清 current_run。"
+        },
+        {
+          "path": "crates/sw-core/src/flash_endpoint.rs",
+          "line": 201,
+          "end_line": 207,
+          "excerpt_sha256": "89a11698680b4a1ca7f367b6f314175fd84385174979ff137b37ac17039c044f",
+          "claim": "端點 run 返回後清 active 並歸還 admission ticket，未停止端點 thread。"
+        }
+      ],
+      "note": "flash_session finally 先取消 run，等 holder thread 最多 2 秒；若未結束則記 stalled，不宣稱已 join。清 active_com、probe buffer 與 master writer 後，經 manager 送 FlashHolderGone，等 actor 回覆最多 2 秒。外層 finally 最後解除剩餘標記；端點 loop 清 active、歸還 admission ticket 並繼續服務下一次寫入。"
+    },
+    {
+      "id": "restore-session",
+      "from": "sessions",
+      "to": "actor",
+      "label": "清除閘門並還原狀態",
+      "phase": "自動釋放",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7954,
+          "end_line": 7969,
+          "excerpt_sha256": "fea87d3d1fe1a16a1a546a7cda8e555f2dd80cae8f0427008ad2a2d8a4aba923",
+          "claim": "manager 在 bridge 失效後仍會轉送結束事件，供 actor 清狀態。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/flash.rs",
+          "line": 157,
+          "end_line": 176,
+          "excerpt_sha256": "6b3bf54692664881e145eed745e3df75307ccbc356dbdbf31a8db4f9bbe65617",
+          "claim": "actor 同 probe 時清 flash 模式、還原狀態，回覆後 reconcile detach。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/flash.rs",
+          "line": 214,
+          "end_line": 226,
+          "excerpt_sha256": "7f3a774f6d69c7a8d5453d872780e308bf28fb4d379f330d23fe657c876fca30",
+          "claim": "延後 detach 依裝置存在與實體路徑是否改變決定是否執行。"
+        }
+      ],
+      "note": "manager 依 COM 送 FlashHolderGone；actor 只對相同 probe 清 Fence 與 human flash gate。若仍 FLASHING 則還原先前 READY 或 ATTACHED，沒有原狀態時才依 bridge 有無選 READY 或 DETACHED，再回覆 coordinator 並補做延後 detach；若裝置仍不在或實體路徑改變，可能進 detach，而非保證 READY。這是解除 FLASHING 仲裁，不是保證韌體燒錄成功，也不是進 RELEASED。"
+    }
+  ],
+  "unknowns": [
+    {
+      "id": "python-baseline-not-compared",
+      "question": "本頁實際對照 Python sw_core/flash_endpoint.py 的 start／raw PTY／Windows no-op 與 detect_mcu_line，以及 sw_core/service.py 的 sync／ACK 回放／pump／holder watch 組裝。除端點平台步驟與 holder watch 等待方式明示對照外，其餘 Rust actor、Fence、候選原子性、TX report／settle、錯誤恢復及停止路徑未與 Python 0.4.x 逐步比對；亦未另核對 0.4.x 發行 tag。",
+      "impact": "不得據本頁推論未對照部分與 Python 0.4.x 完全等價。"
+    },
+    {
+      "id": "physical-flash-not-verified",
+      "question": "未執行外部 flasher 或實體 MCU 驗證，無法由讀碼確認 sync 時序、實際初始 baud、ACK 完整送達與韌體升級成功。",
+      "impact": "圖中完成的是管線與仲裁釋放流程，不能當作燒錄成功證據。"
+    },
+    {
+      "id": "windows-runtime-not-verified",
+      "question": "Windows 的 flash_endpoint=false、com0com 僅作 console 與交接 RPC 只依 cfg／能力與分派原始碼判讀，未執行 Windows 原生驗證。",
+      "impact": "不能宣稱已驗證 Windows 外部燒錄工具對 COM 的獨佔開啟與回收。"
+    },
+    {
+      "id": "holder-scan-observability",
+      "question": "holder watch 只讀掃描結果 pids，不讀 HolderScanStatus；未實測 /proc 權限受限、短暫開關端點或掃描失敗時的可見性，無法保證每次都先觀察到非空持有者。",
+      "impact": "未 armed 時可能等滿 1800 秒才收尾；armed 後空結果也可能源於掃描問題，不能只據此認定真實 flasher 已完成。"
+    }
+  ],
+  "conflicts": []
+}
