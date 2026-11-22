@@ -1,0 +1,492 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "serialwrap｜命令執行",
+    "locale": "zh-TW",
+    "output": "docs/architecture/features/01-command-exec.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/hamanpaul/serialwrap",
+      "provider": "github",
+      "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347"
+    },
+    "subtitle": "命令經 READY 閘門與優先佇列，由單一 TX writer 送往 DUT；依模式取得結果，並揭露 human prompt 誤判完成的 #294 風險。"
+  },
+  "participants": [
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "CLI／Agent",
+      "sources": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 141,
+          "end_line": 170
+        },
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 400,
+          "end_line": 414
+        },
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 417,
+          "end_line": 436
+        }
+      ]
+    },
+    {
+      "id": "service",
+      "type": "backend",
+      "label": "RPC／Service",
+      "sources": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1137,
+          "end_line": 1160
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1174,
+          "end_line": 1193
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1222,
+          "end_line": 1247
+        }
+      ]
+    },
+    {
+      "id": "registry",
+      "type": "database",
+      "label": "命令登錄",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 269,
+          "end_line": 292
+        },
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 325,
+          "end_line": 352
+        },
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 387,
+          "end_line": 402
+        }
+      ]
+    },
+    {
+      "id": "session",
+      "type": "backend",
+      "label": "Session actor",
+      "sublabel": "效果執行",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/actor.rs",
+          "line": 478,
+          "end_line": 494
+        },
+        {
+          "path": "crates/sw-core/src/actor.rs",
+          "line": 777,
+          "end_line": 788
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3482,
+          "end_line": 3508
+        }
+      ]
+    },
+    {
+      "id": "runner",
+      "type": "backend",
+      "label": "命令執行",
+      "sublabel": "OpRunner",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 117,
+          "end_line": 132
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 383,
+          "end_line": 408
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 754,
+          "end_line": 771
+        }
+      ]
+    },
+    {
+      "id": "bridge",
+      "type": "backend",
+      "label": "UART bridge",
+      "sublabel": "單一寫入者",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 691,
+          "end_line": 715
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1372,
+          "end_line": 1388
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 600,
+          "end_line": 617
+        }
+      ]
+    },
+    {
+      "id": "target",
+      "type": "external",
+      "label": "UART／DUT",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1079,
+          "end_line": 1089
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 482,
+          "end_line": 492
+        }
+      ]
+    },
+    {
+      "id": "human",
+      "type": "frontend",
+      "label": "人類 console",
+      "sublabel": "ConsoleHub",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 977,
+          "end_line": 998
+        },
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 1053,
+          "end_line": 1063
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 611,
+          "end_line": 636
+        }
+      ]
+    }
+  ],
+  "segments": [
+    {
+      "from": 160,
+      "to": 345,
+      "label": "人類命令在途（#294 前提）"
+    },
+    {
+      "from": 359,
+      "to": 632,
+      "label": "送出與受理"
+    },
+    {
+      "from": 646,
+      "to": 831,
+      "label": "排程與模式分流"
+    },
+    {
+      "from": 845,
+      "to": 983,
+      "label": "單一寫入者送出"
+    },
+    {
+      "from": 997,
+      "to": 1446,
+      "label": "完成判定與收尾"
+    },
+    {
+      "from": 1460,
+      "to": 1667,
+      "label": "查詢狀態與輸出"
+    },
+    {
+      "from": 1681,
+      "to": 1885,
+      "label": "取消分支"
+    }
+  ],
+  "messages": [
+    {
+      "id": "human-input",
+      "from": "human",
+      "to": "session",
+      "y": 176,
+      "label": "轉送人類整行輸入",
+      "variant": "default",
+      "note": "條件：human 行已送出、prompt 未回。Linux｜Windows：PTY｜TCP Telnet"
+    },
+    {
+      "id": "human-tx",
+      "from": "session",
+      "to": "bridge",
+      "y": 253,
+      "label": "以 HumanRaw 提交人類輸入",
+      "variant": "default",
+      "note": "走 HumanRaw lane，不佔前景槽"
+    },
+    {
+      "id": "human-write",
+      "from": "bridge",
+      "to": "target",
+      "y": 297,
+      "label": "寫入人類命令位元組",
+      "variant": "default",
+      "note": "與 agent 共用 writer，但不等 prompt"
+    },
+    {
+      "id": "submit",
+      "from": "cli",
+      "to": "service",
+      "y": 375,
+      "label": "送出 command.submit",
+      "variant": "default",
+      "note": "mode 為 line、background 或 interactive"
+    },
+    {
+      "id": "route-submit",
+      "from": "service",
+      "to": "session",
+      "y": 419,
+      "label": "驗證參數並路由 Submit",
+      "variant": "default",
+      "note": "驗證參數後解析 selector"
+    },
+    {
+      "id": "admit",
+      "from": "session",
+      "to": "registry",
+      "y": 463,
+      "label": "登錄 accepted 命令",
+      "variant": "default",
+      "note": "過長、含換行或額度滿即拒絕"
+    },
+    {
+      "id": "submit-reply",
+      "from": "session",
+      "to": "service",
+      "y": 518,
+      "label": "回覆 accepted 或拒絕碼",
+      "variant": "default",
+      "note": "非 READY 或 quiet 中即回錯誤碼；通過才入列"
+    },
+    {
+      "id": "submit-ack",
+      "from": "service",
+      "to": "cli",
+      "y": 584,
+      "label": "回傳 cmd_id 或錯誤碼",
+      "variant": "default",
+      "note": "accepted 只表示已入列，未必已送出"
+    },
+    {
+      "id": "dequeue",
+      "from": "session",
+      "to": "registry",
+      "y": 662,
+      "label": "出列並標記 running",
+      "variant": "default",
+      "note": "priority 小者先、同級 FIFO；不等 human 的 prompt"
+    },
+    {
+      "id": "start-command",
+      "from": "session",
+      "to": "runner",
+      "y": 728,
+      "label": "啟動 line／background 執行",
+      "variant": "default",
+      "note": "條件：line 或 background"
+    },
+    {
+      "id": "start-interactive",
+      "from": "session",
+      "to": "runner",
+      "y": 783,
+      "label": "建立 lease 並啟動 interactive 初始命令",
+      "variant": "default",
+      "note": "條件：interactive；TX 後即回，不等 prompt"
+    },
+    {
+      "id": "submit-tx",
+      "from": "runner",
+      "to": "bridge",
+      "y": 861,
+      "label": "提交帶許可的 TxJob",
+      "variant": "default"
+    },
+    {
+      "id": "write-command",
+      "from": "bridge",
+      "to": "target",
+      "y": 891,
+      "label": "Fence 重驗後寫入命令",
+      "variant": "default",
+      "note": "Fence 在提交點重驗許可"
+    },
+    {
+      "id": "tx-report",
+      "from": "bridge",
+      "to": "runner",
+      "y": 935,
+      "label": "回傳 TxReport",
+      "variant": "default",
+      "note": "未完整送出即失敗"
+    },
+    {
+      "id": "wait-completion",
+      "from": "runner",
+      "to": "bridge",
+      "y": 1013,
+      "label": "從 TX 前偏移等待完成樣式",
+      "variant": "default",
+      "note": "樣式為 completion_regex 或 prompt_regex"
+    },
+    {
+      "id": "human-prompt-rx",
+      "from": "target",
+      "to": "bridge",
+      "y": 1079,
+      "label": "人類命令的 prompt 先到（#294）",
+      "variant": "default",
+      "note": "條件：human 行在途。命中樣式即提早 done，stdout 可能為空"
+    },
+    {
+      "id": "receive-rx",
+      "from": "target",
+      "to": "bridge",
+      "y": 1156,
+      "label": "回傳本命令的回顯、輸出與 prompt",
+      "variant": "default",
+      "note": "RX 不帶 cmd_id"
+    },
+    {
+      "id": "wake-waiter",
+      "from": "bridge",
+      "to": "runner",
+      "y": 1200,
+      "label": "更新 RX 視窗並喚醒等待者",
+      "variant": "default",
+      "note": "每筆 RX 都重查，首次命中即完成（Python 0.4.x 每 50 ms 輪詢）"
+    },
+    {
+      "id": "capture-rx",
+      "from": "bridge",
+      "to": "session",
+      "y": 1277,
+      "label": "分送 RX 並累積背景擷取",
+      "variant": "default",
+      "note": "條件：background；不依 cmd_id 過濾"
+    },
+    {
+      "id": "op-finished",
+      "from": "runner",
+      "to": "session",
+      "y": 1343,
+      "label": "整理結果並回報 OpFinished",
+      "variant": "default",
+      "note": "裁掉 prompt 與回顯；逾時送 Ctrl-C、Ctrl-D 救援"
+    },
+    {
+      "id": "complete-record",
+      "from": "session",
+      "to": "registry",
+      "y": 1398,
+      "label": "結算命令紀錄與終態",
+      "variant": "default",
+      "note": "釋放前景、恢復 human，再 start_next"
+    },
+    {
+      "id": "query-result",
+      "from": "cli",
+      "to": "service",
+      "y": 1476,
+      "label": "查詢 command.get／command.result_tail",
+      "variant": "default",
+      "note": "受理後可反覆查詢"
+    },
+    {
+      "id": "get-record",
+      "from": "service",
+      "to": "registry",
+      "y": 1520,
+      "label": "讀取命令狀態與 stdout",
+      "variant": "default",
+      "note": "條件：command.get"
+    },
+    {
+      "id": "get-capture",
+      "from": "service",
+      "to": "session",
+      "y": 1564,
+      "label": "路由 BackgroundResult 並讀取分段",
+      "variant": "default",
+      "note": "條件：command.result_tail"
+    },
+    {
+      "id": "query-reply",
+      "from": "service",
+      "to": "cli",
+      "y": 1619,
+      "label": "回傳紀錄或 capture 分段",
+      "variant": "default",
+      "note": "next_chunk 供下一輪 from_chunk"
+    },
+    {
+      "id": "cancel",
+      "from": "cli",
+      "to": "service",
+      "y": 1697,
+      "label": "送出 command.cancel",
+      "variant": "default",
+      "note": "條件：accepted 或 running"
+    },
+    {
+      "id": "cancel-record",
+      "from": "service",
+      "to": "registry",
+      "y": 1752,
+      "label": "標記 canceled 紀錄",
+      "variant": "default",
+      "note": "只改紀錄，不撤回已送出的位元組"
+    },
+    {
+      "id": "cancel-queued",
+      "from": "service",
+      "to": "session",
+      "y": 1807,
+      "label": "盡力路由 CancelQueued",
+      "variant": "default",
+      "note": "條件：取消成功；結果不影響回應"
+    },
+    {
+      "id": "revoke-tx",
+      "from": "session",
+      "to": "bridge",
+      "y": 1851,
+      "label": "撤銷該前景 op 的後續 TX",
+      "variant": "default",
+      "note": "條件：仍是前景 op；後續 TX 被拒"
+    }
+  ]
+}
