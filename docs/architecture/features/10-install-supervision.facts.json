@@ -1,0 +1,971 @@
+{
+  "schema_version": 1,
+  "document_type": "feature-facts",
+  "feature": {
+    "id": "10-install-supervision",
+    "order": 10,
+    "title": "安裝與監管",
+    "summary": "一個版本怎麼被裝上、換掉與退回，daemon 由誰負責常駐，以及出問題時怎麼診斷。"
+  },
+  "repository": {
+    "url": "https://github.com/hamanpaul/serialwrap",
+    "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347"
+  },
+  "diagram_type": "sequence",
+  "scope": {
+    "includes": [
+      "安裝／更新／回滾：setup 帶 journal 的固定步驟與失敗時的還原",
+      "一般 setup：資產物化與監管狀態 reconcile",
+      "監管模式：on-demand、systemd-user、systemd-system、windows-task、windows-service 的切換（supervision-mode set）",
+      "service 子命令與 on-demand 的自動啟動",
+      "doctor 的檢查清單"
+    ],
+    "excludes": [
+      "install.sh 與 Windows 安裝腳本取得、解壓 bundle 的過程（本頁從 CLI 的 setup 開始）",
+      "com0com 選用元件的安裝與移除（setup --with-com0com／--remove-com0com）",
+      "從 0.3.x 舊安裝交接的細節（legacy handoff）",
+      "daemon 自己的啟動序與停止序（屬於 09-daemon-mgmt）；本頁只畫 CLI 對它發出的探測與停止要求",
+      "journal 每個步驟的 crash 復原分支"
+    ]
+  },
+  "participants": [
+    {
+      "id": "cli",
+      "label": "CLI",
+      "type": "frontend",
+      "overview_component": "cli",
+      "responsibility": "安裝、更新、回滾、監管切換與診斷的邏輯全部在 CLI 行程內執行：`setup`（含 `--rollback`）、`supervision-mode [set MODE]`、`service <動作>`、`doctor`。更新與回滾是一條有 journal 的固定步驟：lock → verify → safety_check → stop_supervisor → confirm_released → backup_and_switch → start_and_verify，失敗時 revert_to_previous。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 1738,
+          "end_line": 1745,
+          "excerpt_sha256": "fee935d26b5384e8de502b145fcf551355d5c3d0a1ce671df0b64883014f0fd8",
+          "claim": "run_setup 的入口。"
+        },
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 410,
+          "end_line": 435,
+          "excerpt_sha256": "36e20ea418f67c385bd1586d33cba416150fb9c76dcc39d8bf3b463ba8e98efa",
+          "claim": "更新／回滾報告的八個步驟名稱。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/service_cmd.rs",
+          "line": 16,
+          "end_line": 19,
+          "excerpt_sha256": "147931947138aab4ffa4efc47c0873115e887a56a4add1fd338c39c8a8324213",
+          "claim": "run_service 的入口。"
+        },
+        {
+          "path": "crates/sw-cli/src/doctor_cmd.rs",
+          "line": 1628,
+          "end_line": 1629,
+          "excerpt_sha256": "fa10289dc3dc55189143dd42eef54cb79d1726c3ac2667da6e64dd0284d11d83",
+          "claim": "serialwrap doctor：印出 checks 與整體 ok，exit 恆為 0。"
+        }
+      ],
+      "sublabel": "setup／service／doctor"
+    },
+    {
+      "id": "bundle",
+      "label": "發行 bundle",
+      "type": "external",
+      "overview_component": null,
+      "responsibility": "要安裝的版本來源：release manifest 加上內容雜湊清單。CLI 先確認 state schema 與現行版本相容，再逐檔驗證，任何差異都以 CHECKSUM_VERIFY_FAILED 拒絕。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 1521,
+          "end_line": 1544,
+          "excerpt_sha256": "b668609aa3ea18cab6b97a67ee4016a9bc02e32f6180fb21d2c5f56648e70942",
+          "claim": "載入 bundle manifest、檢查 state schema 相容、呼叫 verify_bundle；差異回 ChecksumVerifyFailed。"
+        },
+        {
+          "path": "crates/sw-cli/src/install_layout.rs",
+          "line": 863,
+          "end_line": 866,
+          "excerpt_sha256": "44113e7ad4fe7f37613915804ab3d0b38fd6f6c5ec4254e2a4624ff20a874007",
+          "claim": "verify_bundle 的入口。"
+        },
+        {
+          "path": "crates/sw-cli/src/install_layout.rs",
+          "line": 703,
+          "end_line": 703,
+          "excerpt_sha256": "ca8779af622865f6a51a24b225064c2579a8c7d8af119c770ede4044dfe4d35b",
+          "claim": "SHA256SUMS 驗證。"
+        }
+      ],
+      "sublabel": "manifest＋SHA256SUMS"
+    },
+    {
+      "id": "root",
+      "label": "安裝根",
+      "type": "database",
+      "overview_component": null,
+      "responsibility": "安裝佈局：`versions/<版本>/`、記錄 current 與 previous 的檔案、穩定入口（指向現行版本的 serialwrap／serialwrapd）、`.install.lock`、`install-journal.json` 與每次更新的備份目錄。journal 逐步落盤，CLI 中斷後下次 setup 會在鎖內復原。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/install_layout.rs",
+          "line": 1,
+          "end_line": 1,
+          "excerpt_sha256": "d45db31216fac7c0ff94c1803249fa3c28250000652ab52496a216823e538c4d",
+          "claim": "安裝佈局：versions/<v> 與穩定入口。"
+        },
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 1786,
+          "end_line": 1788,
+          "excerpt_sha256": "61a197e4ce7083c4cc4a625d1afeb0756f70ff00754ddd0ac849d8e3ccb00880",
+          "claim": "安裝根的 .install.lock 與 install-journal.json。"
+        },
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 696,
+          "end_line": 709,
+          "excerpt_sha256": "798a214db4a8d43e76a179b1001082f7c673f7649754424fbe4ad526eeec6db6",
+          "claim": "journal 記錄的步驟。"
+        }
+      ],
+      "sublabel": "versions／journal／備份"
+    },
+    {
+      "id": "userdir",
+      "label": "使用者目錄",
+      "type": "database",
+      "overview_component": null,
+      "responsibility": "使用者層的設定與資產：`config.yaml`（`supervision_mode` 是監管模式的單一事實來源，另記 socket）、profiles、skill 檔與工具腳本。setup 把內嵌資產物化到這裡，已存在的檔案除非 `--force` 否則不覆寫。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/service_ctl.rs",
+          "line": 24,
+          "end_line": 26,
+          "excerpt_sha256": "86a8d6269bf5dfebc9565e02139033eb8a8734512560c0f65ab525af8e638075",
+          "claim": "監管模式的單一事實來源是 config.yaml 的 supervision_mode。"
+        },
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 103,
+          "end_line": 125,
+          "excerpt_sha256": "4720ae534e641c9bd2a7afe342226351a82600529ea6db04b5faec8a39d172f0",
+          "claim": "materialize_assets：profiles 目錄與已存在即略過（除非 force）。"
+        },
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 1611,
+          "end_line": 1615,
+          "excerpt_sha256": "bb24c1087bcf1b2d5b9be5c85363e11eaced863de12f981f4f206cce6ab5b780",
+          "claim": "reconcile 最後把目標模式與 socket 寫回 config.yaml。"
+        }
+      ],
+      "sublabel": "config.yaml＋資產"
+    },
+    {
+      "id": "supervisor",
+      "label": "監管者",
+      "type": "external",
+      "overview_component": null,
+      "responsibility": "負責讓 daemon 常駐的系統服務管理員。CLI 經 sw-pal 的 ServiceCtl 介面操作它：安裝／移除定義、啟用、start／stop／restart／status、交接前的 autostart hold。Linux 支援 on-demand、systemd-user、systemd-system；Windows 支援 on-demand、windows-task、windows-service。on-demand 沒有監管項。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/service_ctl.rs",
+          "line": 562,
+          "end_line": 564,
+          "excerpt_sha256": "5baa0d28f889b7346fd1631273c6a22ba84cf8667e1a9ccfa948f421f447a731",
+          "claim": "ServiceCtl：監管控制介面。"
+        },
+        {
+          "path": "crates/sw-pal/src/service_ctl.rs",
+          "line": 655,
+          "end_line": 657,
+          "excerpt_sha256": "8e63567019e35c9714bee325e19c28d20eb1f0e5e269136ce6183913e20647d8",
+          "claim": "各平台支援的模式清單。"
+        },
+        {
+          "path": "crates/sw-pal/src/service_ctl/systemd.rs",
+          "line": 15,
+          "end_line": 16,
+          "excerpt_sha256": "73bc0769ea21429650ac0b0651efa956089248db1d059d6692f08117cc54405b",
+          "claim": "systemd 的 update hold 是一個 drop-in：RefuseManualStart=yes、Restart=no。"
+        }
+      ],
+      "sublabel": "systemd｜工作排程"
+    },
+    {
+      "id": "daemon",
+      "label": "serialwrapd",
+      "type": "backend",
+      "overview_component": "daemon-main",
+      "responsibility": "被安裝與監管的對象。CLI 以 RPC 探測它的健康與 flash 狀態、要求它交接停止，並在新版啟動後核對它回報的版本與程式碼指紋。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 595,
+          "end_line": 634,
+          "excerpt_sha256": "e9e3dff6b8f5c41a304d7db5e6accf9111dfc456a186b6754d0621ba8540d386",
+          "claim": "safety_check：health 三態，只有確認不存在或健康才繼續。"
+        },
+        {
+          "path": "crates/sw-cli/src/graceful_stop.rs",
+          "line": 798,
+          "end_line": 810,
+          "excerpt_sha256": "5cf9db0f230c4ccecb640ad8c811099c36dd31ad4dd54178878d988c36d2ede7",
+          "claim": "交接停止的 RPC 是 daemon.handoff_stop。"
+        },
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 2371,
+          "end_line": 2388,
+          "excerpt_sha256": "13e89cfe641a174ff64e5eadf4a8cffe001115029dd8fe8257809464a6b958c6",
+          "claim": "新版啟動後輪詢 health.ping。"
+        }
+      ],
+      "sublabel": "被監管的 daemon"
+    }
+  ],
+  "steps": [
+    {
+      "id": "lock",
+      "from": "cli",
+      "to": "root",
+      "label": "取 .install.lock、復原殘留 journal",
+      "phase": "安裝／更新／回滾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 1786,
+          "end_line": 1796,
+          "excerpt_sha256": "22047307ad529401b89e59903e3ecbaeab887cace797f13e64a86f010ff0a5bf",
+          "claim": "安裝類請求，或安裝根已有鎖檔／殘留 journal 時，先取安裝鎖。"
+        },
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 1803,
+          "end_line": 1803,
+          "excerpt_sha256": "e147dbf8d20fac08bb09fa83ecfd645ba5ef6376b2839b93da20e30017f2a8b5",
+          "claim": "鎖內先處理上次中斷留下的 journal。"
+        },
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 1546,
+          "end_line": 1558,
+          "excerpt_sha256": "1b61dc5c0e0e81b009e71a1266641ea7c58b65a338861224e2781bed04fe1eb6",
+          "claim": "建立本次 journal 並記下 lock 步驟。"
+        }
+      ],
+      "note": "從安裝根以外的位置執行、且旁邊有 release manifest 的 CLI 才視為安裝類請求：已有 current 走 update，沒有走首次安裝。之後每一步都先寫 journal 再動作。"
+    },
+    {
+      "id": "rollback-target",
+      "from": "cli",
+      "to": "root",
+      "label": "--rollback：以 previous 版本為目標",
+      "phase": "安裝／更新／回滾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 1830,
+          "end_line": 1846,
+          "excerpt_sha256": "0e56f27f65e7c21f51ab8491637138fdb3ab205e5a3f033bb83bb40ea0995ae5",
+          "claim": "setup --rollback 走 run_rollback_locked。"
+        },
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 1405,
+          "end_line": 1412,
+          "excerpt_sha256": "8c95a3b92690cac278367ab3d676ef75637ec1749386bce503c66c23af250aa5",
+          "claim": "execute_rollback：從 current 讀出 previous；沒有就回 rollback_unavailable。"
+        }
+      ],
+      "condition": "操作者下 setup --rollback",
+      "note": "回滾與更新走同一組步驟，差別只在目標版本取自 previous，並還原該版本當時的備份。"
+    },
+    {
+      "id": "verify",
+      "from": "cli",
+      "to": "bundle",
+      "label": "驗證 manifest 與 SHA256SUMS",
+      "phase": "安裝／更新／回滾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 1521,
+          "end_line": 1544,
+          "excerpt_sha256": "b668609aa3ea18cab6b97a67ee4016a9bc02e32f6180fb21d2c5f56648e70942",
+          "claim": "state schema 相容檢查與 verify_bundle。"
+        },
+        {
+          "path": "crates/sw-cli/src/install_layout.rs",
+          "line": 863,
+          "end_line": 866,
+          "excerpt_sha256": "44113e7ad4fe7f37613915804ab3d0b38fd6f6c5ec4254e2a4624ff20a874007",
+          "claim": "verify_bundle。"
+        }
+      ]
+    },
+    {
+      "id": "stage",
+      "from": "cli",
+      "to": "root",
+      "label": "stage_version：放入 versions/<版本>",
+      "phase": "安裝／更新／回滾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 1564,
+          "end_line": 1564,
+          "excerpt_sha256": "bbea0d4cb634b164aa7c4be1946191353d8d9ce417b270eec84f41f4f7cd95a6",
+          "claim": "把 bundle 放進安裝根的 versions。"
+        },
+        {
+          "path": "crates/sw-cli/src/install_layout.rs",
+          "line": 1008,
+          "end_line": 1012,
+          "excerpt_sha256": "29393410b6cc150d9662a78499e4f0ac472430170fbb3105a433f51990a1a575",
+          "claim": "stage_version：先複製到 .staging、驗證後改名；已存在且驗證通過則冪等。"
+        }
+      ]
+    },
+    {
+      "id": "safety",
+      "from": "cli",
+      "to": "daemon",
+      "label": "safety_check：health.ping＋mcu.status",
+      "phase": "安裝／更新／回滾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 1593,
+          "end_line": 1593,
+          "excerpt_sha256": "2b11f658228516f86271e74ae34940322d720377ffbd1b13ab26ca160231bfea",
+          "claim": "以舊模式的 endpoint 做 safety_check。"
+        },
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 595,
+          "end_line": 640,
+          "excerpt_sha256": "0c1cc0851a31ff1ad646fff6b0eaf7a1db7a7c087b6dc173911714d84210db8c",
+          "claim": "健康不明一律拒絕；flash 進行中拒絕（--force 不適用）。"
+        }
+      ],
+      "note": "連線被拒或端點不存在時，還要行程掃描確認沒有同 uid 的 serialwrapd 才算「沒有 daemon」；逾時或壞回應視為健康不明而中止。"
+    },
+    {
+      "id": "hold",
+      "from": "cli",
+      "to": "supervisor",
+      "label": "hold_autostart：抑制自動拉起",
+      "phase": "安裝／更新／回滾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 2068,
+          "end_line": 2093,
+          "excerpt_sha256": "3e3dbe3966876a0e14f9b83692aea9f1dc4ca57048b29a9a509a086d9830a91b",
+          "claim": "監管模式呼叫 ServiceCtl::hold_autostart；on-demand 改取 autostart.lock。"
+        },
+        {
+          "path": "crates/sw-pal/src/service_ctl.rs",
+          "line": 598,
+          "end_line": 603,
+          "excerpt_sha256": "30544fab9e88ff61570d26dfc223676c9e88e7ca8c3faac3d6fb9ee077e1e4ee",
+          "claim": "hold_autostart：交接前抑制監管拉起，持久、跨 CLI 中斷有效。"
+        },
+        {
+          "path": "crates/sw-pal/src/service_ctl/systemd.rs",
+          "line": 15,
+          "end_line": 16,
+          "excerpt_sha256": "73bc0769ea21429650ac0b0651efa956089248db1d059d6692f08117cc54405b",
+          "claim": "systemd 的 hold drop-in 內容。"
+        },
+        {
+          "path": "crates/sw-pal/src/service_ctl/windows_task.rs",
+          "line": 150,
+          "end_line": 157,
+          "excerpt_sha256": "acd51058ea81b10c7111b853acdff88dda66e53280a46c0c82bcb366e5f568ba",
+          "claim": "Windows 工作排程以 schtasks /Change /DISABLE 停用工作。"
+        }
+      ],
+      "note": "Linux｜Windows：寫入 systemd drop-in（RefuseManualStart=yes、Restart=no）｜schtasks /Change /DISABLE。on-demand 沒有監管項，改以 autostart.lock 加上 install-journal.json 的存在擋住 CLI 的自動啟動。"
+    },
+    {
+      "id": "handoff",
+      "from": "cli",
+      "to": "daemon",
+      "label": "daemon.handoff_stop（交接停止）",
+      "phase": "安裝／更新／回滾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 2105,
+          "end_line": 2121,
+          "excerpt_sha256": "3a95809a4d76967e80dc84a2263f60a699f185364bbf963bf8902250f36cade7",
+          "claim": "舊 daemon 在執行時，以既有的 hold 做 graceful stop（原因為 update 或 rollback）。"
+        },
+        {
+          "path": "crates/sw-cli/src/graceful_stop.rs",
+          "line": 315,
+          "end_line": 333,
+          "excerpt_sha256": "cb50b6993aa541fe635aaf8b45192adf9c61b65c5732481928fd5adc8c51db0a",
+          "claim": "Handoff 與 UpdateHandoff 兩種停止方式都走 request_handoff；被重新拉起時會沿著 handoff chain 再試。"
+        },
+        {
+          "path": "crates/sw-cli/src/graceful_stop.rs",
+          "line": 802,
+          "end_line": 812,
+          "excerpt_sha256": "62c2f59b69e9a7dc68045544be85aa52113f25edd162e440cff96bb96d20c5f0",
+          "claim": "request_handoff 送出的 RPC 是 daemon.handoff_stop，逾時 2 秒。"
+        }
+      ],
+      "condition": "舊 daemon 正在執行",
+      "note": "update 與 rollback 都用交接式停止（daemon.handoff_stop）；一般的 `daemon stop` 才送 daemon.stop。"
+    },
+    {
+      "id": "released",
+      "from": "cli",
+      "to": "daemon",
+      "label": "confirm_released：行程已退出、tty 已釋放",
+      "phase": "安裝／更新／回滾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 1686,
+          "end_line": 1686,
+          "excerpt_sha256": "412f16c84c347f77f8804108868d8886a43ce5c07e3fb853189ccc6b61d8db80",
+          "claim": "confirm_released 步驟。"
+        },
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 2987,
+          "end_line": 3008,
+          "excerpt_sha256": "0f20481513fc17840064c83aaa4f8e4a95060b665ff9e90578b16da63ba4cca3",
+          "claim": "endpoint 仍可連線或無法確認即失敗；再掃描先前掛載的 tty 是否仍被 serialwrapd 持有。"
+        }
+      ]
+    },
+    {
+      "id": "switch",
+      "from": "cli",
+      "to": "root",
+      "label": "備份狀態 → 切換穩定入口",
+      "phase": "安裝／更新／回滾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 1710,
+          "end_line": 1710,
+          "excerpt_sha256": "f97991f2e6775964dd11fae9b11f347c4abf616a48f3ac8aa3f008fcc5008d8c",
+          "claim": "先把現況備份到本次的備份目錄。"
+        },
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 2340,
+          "end_line": 2340,
+          "excerpt_sha256": "f33e5a78c266b648f1431f9f51b823848a2f37cffe6867fd5ce3961e5457b4c3",
+          "claim": "切換穩定入口。"
+        },
+        {
+          "path": "crates/sw-cli/src/install_layout.rs",
+          "line": 1193,
+          "end_line": 1198,
+          "excerpt_sha256": "a92f798353d2b3dda854265e50f5f07a466c3351f505f5709a89f1927b35e69c",
+          "claim": "switch_entries：Windows 複製＋改名保存；POSIX symlink 原子覆蓋。"
+        }
+      ],
+      "note": "Linux｜Windows：穩定入口是 symlink，原子覆蓋｜複製新檔後改名保存舊檔。"
+    },
+    {
+      "id": "start",
+      "from": "cli",
+      "to": "supervisor",
+      "label": "Start 新版",
+      "phase": "安裝／更新／回滾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 2360,
+          "end_line": 2369,
+          "excerpt_sha256": "8dbc0a83c323854f44dcb433a9da02065878d2794d4e23652c4cb10049a0fc99",
+          "claim": "監管模式經 ServiceCtl 的 Start；on-demand 取 autostart.lock 後直接 spawn daemon。"
+        }
+      ],
+      "note": "on-demand 沒有監管者，由 CLI 直接啟動新版 daemon 行程。"
+    },
+    {
+      "id": "verify-new",
+      "from": "cli",
+      "to": "daemon",
+      "label": "health.ping＋版本配對",
+      "phase": "安裝／更新／回滾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 2371,
+          "end_line": 2388,
+          "excerpt_sha256": "13e89cfe641a174ff64e5eadf4a8cffe001115029dd8fe8257809464a6b958c6",
+          "claim": "輪詢 health.ping（Windows 50 次、其餘 15 次，每次間隔 200 ms）。"
+        },
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 2414,
+          "end_line": 2438,
+          "excerpt_sha256": "af6b29a86c653d9cdb7a4cfbff328debc113c68592c41bf8318da13843ede57e",
+          "claim": "已切換的 CLI 與新版 daemon 回報的版本都必須等於目標 bundle 版本，再做 pairing 檢查。"
+        }
+      ]
+    },
+    {
+      "id": "revert",
+      "from": "cli",
+      "to": "root",
+      "label": "失敗：還原入口與備份",
+      "phase": "安裝／更新／回滾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 2499,
+          "end_line": 2520,
+          "excerpt_sha256": "3b68fa454cf0ebfe027ac19474e9956cd4892b804b3993ed4d1edbca98d68177",
+          "claim": "revert_after_failure：記下失敗原因後還原。"
+        },
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 1947,
+          "end_line": 1947,
+          "excerpt_sha256": "eb525bdc190b70d59f136f3260a0877ec5055eb19bcb5366817125ae4238097a",
+          "claim": "start_and_verify 失敗時走 revert_after_failure。"
+        },
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 411,
+          "end_line": 420,
+          "excerpt_sha256": "2bd5e50e5d7a8bba0304dcbe59aa7c0a15d4350f63d94da6ed2fecd2fdff3cd6",
+          "claim": "步驟清單含 RevertToPrevious。"
+        },
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 3504,
+          "end_line": 3504,
+          "excerpt_sha256": "a6de3b16546a92278ce7bb7fea023b8ef01024184f70a48870e25d70eca8a8dc",
+          "claim": "還原入口與備份的函式。"
+        },
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 3560,
+          "end_line": 3560,
+          "excerpt_sha256": "e845527fada17a036ab0a9633c856aa4401941e7a211d4c454ea314e72f0e727",
+          "claim": "還原監管登錄與 daemon 的函式。"
+        }
+      ],
+      "condition": "切換或啟動驗證失敗",
+      "note": "還原的範圍包含穩定入口、備份的狀態與原本的監管登錄；失敗原因寫進備份目錄的 failure.json。"
+    },
+    {
+      "id": "probe",
+      "from": "cli",
+      "to": "daemon",
+      "label": "health.ping＋mcu.status（現況）",
+      "phase": "一般 setup",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 1939,
+          "end_line": 1958,
+          "excerpt_sha256": "80ae8ebff17c1fe7dba538516e96192aeaf342ff6c8de1490cdf527a23f4b967",
+          "claim": "取 daemon 是否在執行、程式碼指紋、是否 flash 中；flash 中且未 --force 即拒絕。"
+        }
+      ],
+      "note": "這是已安裝的 CLI 執行 setup（不帶 bundle）的路徑：不換版本，只把資產與監管狀態調整到位。"
+    },
+    {
+      "id": "assets",
+      "from": "cli",
+      "to": "userdir",
+      "label": "物化資產：profiles／skill／tools",
+      "phase": "一般 setup",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 1966,
+          "end_line": 1969,
+          "excerpt_sha256": "c802bc01a47f80f86ae2a315b4224035451814ae0559f1e65788360f27885395",
+          "claim": "setup 呼叫 materialize_assets。"
+        },
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 116,
+          "end_line": 125,
+          "excerpt_sha256": "d810fcc275ce402e7b72b65472dea3a91f6c8e10aeeb3caa155a31b2d0c361b9",
+          "claim": "profiles：已存在且未 force 則略過。"
+        },
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 135,
+          "end_line": 136,
+          "excerpt_sha256": "0de02e21918f2d04e0cd183032cb6cadc5841e21c29a002cca1acc08e9461053",
+          "claim": "skill 資產。"
+        },
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 219,
+          "end_line": 220,
+          "excerpt_sha256": "8a57e698fddb348fa9be002e312bd068594a868b601adb6e895763ae4e8a9b93",
+          "claim": "tools 資產。"
+        }
+      ]
+    },
+    {
+      "id": "install-def",
+      "from": "cli",
+      "to": "supervisor",
+      "label": "安裝監管定義並啟用",
+      "phase": "一般 setup",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 1581,
+          "end_line": 1581,
+          "excerpt_sha256": "a6a2c8ae4c1926203bd0fe253a0ca58ccf912f18f804f244dda38ff45fdea4b8",
+          "claim": "reconcile 呼叫 start_new。"
+        },
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 1379,
+          "end_line": 1400,
+          "excerpt_sha256": "c1314a3014187e65307bc491bed56c1ecbd0961b8d5ee1d5cb4498c74fea5f5a",
+          "claim": "systemd-user：寫 unit 檔後經 ServiceCtl::install 安裝。"
+        },
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 1444,
+          "end_line": 1462,
+          "excerpt_sha256": "a325b0c54742c6343dc97ba6d731be41ec74147b727645943cfd784e3250be58",
+          "claim": "windows-task：安裝工作定義，模式變更時再 Start。"
+        },
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 1971,
+          "end_line": 1972,
+          "excerpt_sha256": "46ead1599de37db9256ce234a9febc429a3b0a6b370dd38e6b6d194773e7f2f0",
+          "claim": "WSL 上先確認 systemd 已啟用，需要重啟 WSL 時提前結束並提示。"
+        }
+      ],
+      "condition": "目標模式不是 on-demand",
+      "note": "Linux｜Windows：寫 systemd unit、install、enable｜以 XML 建立工作排程後 Start。在 WSL 上若 systemd 尚未啟用，setup 先改設定並要求重啟 WSL，這一步留到下次執行。"
+    },
+    {
+      "id": "write-mode",
+      "from": "cli",
+      "to": "userdir",
+      "label": "寫回 supervision_mode 與 socket",
+      "phase": "一般 setup",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 1611,
+          "end_line": 1615,
+          "excerpt_sha256": "bb24c1087bcf1b2d5b9be5c85363e11eaced863de12f981f4f206cce6ab5b780",
+          "claim": "載入 config、set_mode、存檔。"
+        }
+      ]
+    },
+    {
+      "id": "sw-hold",
+      "from": "cli",
+      "to": "supervisor",
+      "label": "supervision-mode set：hold 舊模式",
+      "phase": "切換監管模式",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/supervision_cmd.rs",
+          "line": 82,
+          "end_line": 134,
+          "excerpt_sha256": "74cf9fb814f6c4c55d21e219a9d98281beaa929adea96d65760bb87731ac34c6",
+          "claim": "驗證 MODE 適用於本平台後交給 run_supervision_switch。"
+        },
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 4300,
+          "end_line": 4315,
+          "excerpt_sha256": "fc6e5759ca2898f43ea727bee1d78a1e7d86eb2c3d7fae831e465ede8b11466e",
+          "claim": "對舊模式 hold_autostart，並確認 hold 狀態為 Held。"
+        }
+      ],
+      "note": "hold 的內容先寫成紀錄檔再動作；CLI 中斷時，下次 setup 或 supervision-mode 會依紀錄復原。"
+    },
+    {
+      "id": "sw-stop",
+      "from": "cli",
+      "to": "daemon",
+      "label": "交接停止舊 daemon",
+      "phase": "切換監管模式",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 4332,
+          "end_line": 4340,
+          "excerpt_sha256": "66dbe8e4eb09725eced331c582ccb73bebf3443e41534ea36200a74c3d612515",
+          "claim": "以既有 hold 做交接式 graceful stop（StopRpc::Handoff，原因 supervision_set）。"
+        },
+        {
+          "path": "crates/sw-cli/src/graceful_stop.rs",
+          "line": 1,
+          "end_line": 1,
+          "excerpt_sha256": "6ad8577c288a3f3df218ab3a4db214ffc8ccffbc5e4e9e99df7c02d0233654ce",
+          "claim": "graceful stop：先抑制監管重拉，再送停止 RPC 並等待行程樹結束。"
+        }
+      ]
+    },
+    {
+      "id": "sw-install",
+      "from": "cli",
+      "to": "supervisor",
+      "label": "安裝新模式定義並啟動",
+      "phase": "切換監管模式",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 4391,
+          "end_line": 4392,
+          "excerpt_sha256": "9833a5007267dc9ed32267dc3134f5d047bb63e701e7086c80733e804d6338c8",
+          "claim": "把交接結果帶進 reconcile。"
+        },
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 1539,
+          "end_line": 1581,
+          "excerpt_sha256": "9311403ec3a27d106344e958e044ec29c37c79f73e8b90b04215f472bc3d52ce",
+          "claim": "reconcile：停舊、等舊 daemon 消失（10 秒）、搬移 state、start_new。"
+        },
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 1578,
+          "end_line": 1581,
+          "excerpt_sha256": "8ef3cab3a9c1ade3bebd01f915e84022d071751358ecdf0a4badf411820ac3d6",
+          "claim": "模式不同時先搬移 state，再安裝並啟動新模式。"
+        }
+      ],
+      "note": "reconcile 內的順序：收尾舊模式 → 等舊 daemon 消失（最多 10 秒）→ 搬移 state → 安裝新模式的定義並啟動。"
+    },
+    {
+      "id": "sw-mode",
+      "from": "cli",
+      "to": "userdir",
+      "label": "寫入新的 supervision_mode",
+      "phase": "切換監管模式",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 1611,
+          "end_line": 1615,
+          "excerpt_sha256": "bb24c1087bcf1b2d5b9be5c85363e11eaced863de12f981f4f206cce6ab5b780",
+          "claim": "新模式啟動後才把 supervision_mode 與 socket 寫回 config.yaml。"
+        }
+      ]
+    },
+    {
+      "id": "sw-release",
+      "from": "cli",
+      "to": "supervisor",
+      "label": "release hold",
+      "phase": "切換監管模式",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/rollback.rs",
+          "line": 4403,
+          "end_line": 4409,
+          "excerpt_sha256": "d12f796a2894fcfe6508ae9775ce76f91bbe53d309d032de58a1be2d52f9bfaf",
+          "claim": "依 reconcile 結果決定是否還原 enabled，然後釋放 hold。"
+        },
+        {
+          "path": "crates/sw-pal/src/service_ctl.rs",
+          "line": 604,
+          "end_line": 610,
+          "excerpt_sha256": "6bf8bc9b48f45f9fccbe53269cdd3d26ea7404a1f17c60335c1e95a8ec808e5c",
+          "claim": "release_autostart：冪等，hold 不存在也成功。"
+        }
+      ]
+    },
+    {
+      "id": "service",
+      "from": "cli",
+      "to": "supervisor",
+      "label": "service start／stop／restart／status",
+      "phase": "日常操作與診斷",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/service_cmd.rs",
+          "line": 63,
+          "end_line": 68,
+          "excerpt_sha256": "77a4efc5656e83c15b7127d48bc792b00bfcd934d7446a03a0414db17a76677d",
+          "claim": "監管模式才呼叫 ServiceCtl::action；on-demand 或未知模式不呼叫任何監管後端。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/service_cmd.rs",
+          "line": 50,
+          "end_line": 62,
+          "excerpt_sha256": "43546d105da174cb7fa570d6ac39a7e0ff302a74adc6f6eeaed2b35bbd8e315e",
+          "claim": "windows-task／windows-service 的 stop 與 restart 另走 service_action_response。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/service_cmd.rs",
+          "line": 120,
+          "end_line": 135,
+          "excerpt_sha256": "1739d03d0a57d519d9c266008097ae0f90a1df28db56b5fcb5b7c5f22db7c636",
+          "claim": "該路徑先做 graceful stop 再處理監管項。"
+        }
+      ],
+      "note": "Linux｜Windows：直接下 systemctl 對應動作｜stop／restart 先對 daemon 做 graceful stop。模式為 on-demand 時回 NO_SYSTEMD 形狀的結果。"
+    },
+    {
+      "id": "autostart",
+      "from": "cli",
+      "to": "daemon",
+      "label": "on-demand：連不上時自動啟動",
+      "phase": "日常操作與診斷",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 709,
+          "end_line": 747,
+          "excerpt_sha256": "8f4072bee9c6fe2fbbc9143cd2f1004b195bb28a63f679cb81b2b6c434aee541",
+          "claim": "只在具 on_demand_autostart 能力、預設本機 endpoint、連線被拒或不存在、且模式為 on-demand 時成立。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 748,
+          "end_line": 792,
+          "excerpt_sha256": "231337ad2b62d2b56396ba57425c9327ed56dd131dc0e10fe715c9ff6ed4d6df",
+          "claim": "取 autostart.lock（最多等 15 秒）→ 再 ping 一次 → install-journal 存在則暫停 → 啟動 daemon。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 230,
+          "end_line": 230,
+          "excerpt_sha256": "fe029113d936144e9ed192103fd5fb6115af7f2e007dc8293270370eb19adcde",
+          "claim": "POSIX 的能力旗標為 false。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 285,
+          "end_line": 285,
+          "excerpt_sha256": "9dd0bb7fcff8b2841269c311f7deb1e678fd05da85ad6000865156e51e0488f7",
+          "claim": "Windows native 的能力旗標為 true。"
+        }
+      ],
+      "condition": "Windows、on-demand 模式、預設 endpoint、連線被拒",
+      "note": "Linux｜Windows：不自動啟動，需明確下 daemon start｜一般 RPC 連不上時由 CLI 自動啟動。health.ping、health.status、daemon.stop 不觸發。"
+    },
+    {
+      "id": "doctor-daemon",
+      "from": "cli",
+      "to": "daemon",
+      "label": "doctor：endpoint、code 指紋、版本配對",
+      "phase": "日常操作與診斷",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/doctor_cmd.rs",
+          "line": 1556,
+          "end_line": 1626,
+          "excerpt_sha256": "ff7a38b7cd949a2bcf6479c1b2971f90499bc8381ac5e13fcff2d4c877ef64e9",
+          "claim": "run_doctor：依平台組檢查清單，最後加上 version_pairing 並標記 advisory。"
+        },
+        {
+          "path": "crates/sw-cli/src/doctor_cmd.rs",
+          "line": 1628,
+          "end_line": 1629,
+          "excerpt_sha256": "fa10289dc3dc55189143dd42eef54cb79d1726c3ac2667da6e64dd0284d11d83",
+          "claim": "輸出 checks 與整體 ok，exit 恆為 0。"
+        }
+      ]
+    },
+    {
+      "id": "doctor-local",
+      "from": "cli",
+      "to": "userdir",
+      "label": "doctor：監管模式、WAL 目錄、profile",
+      "phase": "日常操作與診斷",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/doctor_cmd.rs",
+          "line": 1602,
+          "end_line": 1611,
+          "excerpt_sha256": "2ebc0dba6b5c8a2a79bca4ff29ae8afcb415ba20f9d2735458f28f364b0b04e4",
+          "claim": "Linux 清單：systemd、supervision_mode、單一 daemon、endpoint、WAL 目錄與可寫、profile、裝置、WSL systemd。"
+        },
+        {
+          "path": "crates/sw-cli/src/doctor_cmd.rs",
+          "line": 1573,
+          "end_line": 1584,
+          "excerpt_sha256": "8a49c9272b53d0dc45890bb6d0637574ae9fbcba5145c5f15b81c7fff1ea6cf4",
+          "claim": "Windows 清單：PATH、其他安裝、supervision_mode、daemon endpoint、WAL、profile、裝置。"
+        }
+      ],
+      "note": "Linux｜Windows：多檢查 dialout 群組、minicom／jq、systemd 與 WSL systemd｜改查 Windows 的裝置清單，且不查這幾項。"
+    }
+  ],
+  "unknowns": [
+    {
+      "id": "windows-not-executed",
+      "question": "Windows 的工作排程與 windows-service 路徑實際行為是否與原始碼一致？",
+      "impact": "本頁 Windows 一側只依原始碼判讀，沒有在 Windows 上執行 setup、supervision-mode 或 service；hold、install-def、service 三步的 Windows 描述未經實機驗證。"
+    },
+    {
+      "id": "windows-service-definition",
+      "question": "windows-service 模式的監管定義由哪一段程式安裝？",
+      "impact": "setup 的 start_new 對 WindowsService 沒有任何動作（setup_cmd.rs:1464），但 supervision-mode set 在 Windows 上允許這個模式（supervision_cmd.rs:107-111）。本頁沒有找到安裝 windows-service 定義的呼叫點，install-def 與 sw-install 的 Windows 描述只涵蓋 windows-task。"
+    },
+    {
+      "id": "installer-scripts",
+      "question": "install.sh 與 Windows 安裝腳本在呼叫 setup 之前做了哪些事？",
+      "impact": "本頁沒有讀安裝腳本，lock 步驟的 note 只描述 CLI 如何判定「安裝類請求」；腳本若另有前置檢查或權限處理，本頁沒有涵蓋。"
+    },
+    {
+      "id": "python-baseline-not-compared",
+      "question": "各步驟與 Python 0.4.x 基線的行為差異是否都已標出？",
+      "impact": "本頁描述的是 Rust 實作，只在撰寫時實際對照過 sw_core 的地方於步驟 note 標註差異或相同；沒有逐步比對 Python 實作，所以沒有標註不代表沒有差異。"
+    }
+  ],
+  "conflicts": [
+    {
+      "id": "render-unit-duplicated",
+      "subject": "systemd unit 文字由哪個函式產生",
+      "claims": [
+        "crates/sw-cli/src/supervisor_defs.rs:1-3 的模組註解說本檔目前只承接 mode_str 輔助函式，但同檔 7-19 行定義了 render_user_unit 與 render_system_unit。",
+        "crates/sw-cli/src/setup_cmd.rs:367-371 也定義了同名的 render_user_unit 與 render_system_unit，setup 的 start_new 在同模組內呼叫的是這一份（setup_cmd.rs:1386）。"
+      ],
+      "resolution": "以實際呼叫點為準：安裝 systemd-user unit 時用的是 setup_cmd.rs 的版本。supervisor_defs.rs 的模組註解與內容不一致，本頁不引用它。"
+    }
+  ]
+}

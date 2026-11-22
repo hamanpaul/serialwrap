@@ -152,6 +152,20 @@
         "delivery": "e35b2310e1d2772d72a782cc7b0bbcf1424d0c115fda3dfb8c8d4269d751bce9",
         "html": "63ca9d6ab1a4013fab0df3ab117fa4ffc06a93bc28d86106bdfa01922223b83b"
       }
+    },
+    "10-install-supervision": {
+      "diagram_type": "sequence",
+      "source_revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347",
+      "facts": "features/10-install-supervision.facts.json",
+      "ir": "features/10-install-supervision.json",
+      "html": "features/10-install-supervision.html",
+      "overlay_version": 1,
+      "sha256": {
+        "facts": "5dc9af0317320b9603effc083d113a8ab33766c74f02d87fcf150b5f327558f2",
+        "ir": "bf185ebf52ba5ffc13226eac2d37c2c38dd425b82af38a87d07c8b9c74c9b207",
+        "delivery": "33f05d5d7fdd7a60f88605fd3efafabf8e40d95692ee284793b3a78130dd33b1",
+        "html": "b5b91beff7f793d7afebf49ddf233cc7ee130e973866a2fada3ea16419d4b62f"
+      }
     }
   }
 }
