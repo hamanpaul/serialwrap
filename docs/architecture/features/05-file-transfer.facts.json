@@ -1,0 +1,1436 @@
+{
+  "schema_version": 1,
+  "document_type": "feature-facts",
+  "feature": {
+    "id": "05-file-transfer",
+    "order": 5,
+    "title": "檔案傳輸",
+    "summary": "Rust push／pull 經前景槽與單一 writer 傳輸，push 逐片等回顯、雙向以 MD5 校驗；停機先收目前行，必要時嘗試 Ctrl-U 清列。"
+  },
+  "repository": {
+    "url": "https://github.com/hamanpaul/serialwrap",
+    "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347"
+  },
+  "diagram_type": "sequence",
+  "scope": {
+    "includes": [
+      "Rust file.push 為主路徑：參數、前景 admission、本機讀檔、工具探測、Base64 chunk、逐片 echo、prompt／sentinel、MD5 與搬移。",
+      "file.pull 分支：工具探測、分段 RX 收集、Base64 解碼、MD5 校驗後寫入 daemon 主機。",
+      "一般 echo 停滯與傳輸中止；issue #282／PR #291 修正後的停機行收尾、Ctrl-U 與 fence 凍結。"
+    ],
+    "excludes": [
+      "登入與 READY 完整狀態機、一般命令佇列、console 端點與 human 回放的完整流程。",
+      "daemon 的完整停止序與全部 drain 回條治理，另見 09-daemon-mgmt；MCU 燒錄另見 06-mcu-flash。",
+      "建置、daemon 執行、測試與實機驗證；本檔只提供固定 revision 的讀碼證據。"
+    ]
+  },
+  "participants": [
+    {
+      "id": "cli",
+      "label": "CLI／Agent",
+      "type": "frontend",
+      "overview_component": "cli",
+      "responsibility": "把本機與板端路徑、selector、ack_mode 等參數轉成 file.push／file.pull RPC；檔案內容不經 RPC 傳送。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 183,
+          "end_line": 210,
+          "excerpt_sha256": "0129625c40b02647f51472c002ee62f235f7ccd234f814bd8ee17544ad6406dd",
+          "claim": "CLI 只組合路徑、selector 與傳輸參數，對應 file.push 或 file.pull。"
+        }
+      ]
+    },
+    {
+      "id": "service",
+      "label": "RPC／Service",
+      "type": "backend",
+      "overview_component": "service",
+      "responsibility": "解析 FileTransferRequest、檢查來源並呼叫 manager；回應時加上來源標註。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 855,
+          "end_line": 867,
+          "excerpt_sha256": "02b0d0a17c7ccf07af9f159e8f597d13087c1eccee4d3929a1bd6f56aba209ec",
+          "claim": "Service 解析請求，轉交 file_transfer_with_admission，並標註回應來源。"
+        }
+      ]
+    },
+    {
+      "id": "manager",
+      "label": "Session 管理",
+      "sublabel": "SessionManager",
+      "type": "backend",
+      "overview_component": "sessions",
+      "responsibility": "解析 selector、路由 actor 並等待回覆；停機時先協調現行 echo-paced 行收尾，再通知 actor drain。daemon 主流程只作相鄰 note 的前提，不另畫。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6874,
+          "end_line": 6893,
+          "excerpt_sha256": "6461c3e98ecac05845888abc759895c329cfdbf0e8fa95019b1ae6491096a13d",
+          "claim": "manager 解析 selector 並以 FileTransferAdmitted 或 FileTransfer 路由 actor。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8515,
+          "end_line": 8539,
+          "excerpt_sha256": "d30f5b4f24709b6c5aa224264a955cd1061e910c06ea6b564796605a8da42af0",
+          "claim": "begin_shutdown 先要求 fence 行收尾並等候，再發 ShutdownGate。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8733,
+          "end_line": 8746,
+          "excerpt_sha256": "898e6418edb36fb4372310451e1af46c5da9b7f8a288d17986accfd621daab76",
+          "claim": "shutdown_phase1 向仍需 drain 的 actor 發 Shutdown。"
+        }
+      ]
+    },
+    {
+      "id": "session",
+      "label": "Session actor",
+      "sublabel": "效果執行",
+      "type": "backend",
+      "overview_component": "session-actor",
+      "responsibility": "在同一事件檢查 READY、quiet、lease 與前景槽；接受後產生 StartOp，完成後還原 human admission 並回覆。此參與者含 SessionExecutor 效果執行；實際呼叫 OpRunner.run 的是 executor，不是 RPC 層。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core/file_xfer.rs",
+          "line": 39,
+          "end_line": 62,
+          "excerpt_sha256": "e7015a4bb7c1525224554f0717cf57a770cc52fbd5fef25620bc2cf69139cc83",
+          "claim": "actor 通過 admission 後取得前景槽並產生 FileTransfer 的 StartOp。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5326,
+          "end_line": 5348,
+          "excerpt_sha256": "ec8fdc62aa8381726044b6acf5f23da7f60b917bb7e6431b4713363670e7dd44",
+          "claim": "SessionExecutor 為該 epoch 建立 OpRunner 並呼叫 run。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7911,
+          "end_line": 7923,
+          "excerpt_sha256": "47ef2b209304f1222b2a1fb7d5b2704290776c99172aad7dfba18c240068cb00",
+          "claim": "actor 收斂傳輸結果、恢復前景 admission，並回覆等待者。"
+        }
+      ]
+    },
+    {
+      "id": "transfer",
+      "label": "檔案傳輸",
+      "sublabel": "OpTransferPort",
+      "type": "backend",
+      "overview_component": "file-transfer",
+      "responsibility": "合併傳輸引擎、板端命令樣板與 OpTransferPort：讀寫本機檔案、Base64 分塊、逐段等回顯、MD5 校驗與停機行收尾。傳輸共用一個 grant，所有 TX 透過 bridge 的 writer。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 444,
+          "end_line": 463,
+          "excerpt_sha256": "194e8383a412a6f19dab80d9942b85bd870958589fdc2edb5c356823447e98b6",
+          "claim": "OpRunner 以 OpTransferPort 執行 push_file 或 pull_file，並依確認寫出量映射中止。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 164,
+          "end_line": 176,
+          "excerpt_sha256": "0e81ceeb40c05bb00339bbe8d83a14bcac78a034167a7d439bc3bda404141e6d",
+          "claim": "每筆 permit 使用同一 grant 的 op_id／epoch，class 為 FileTransfer。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 184,
+          "end_line": 204,
+          "excerpt_sha256": "d7e5c2031192ca6068886927b828d56efdd483d4174832ed71b21a7bd9d42c5a",
+          "claim": "OpTransferPort 將 TxJob 送 writer 並等待回條。"
+        }
+      ]
+    },
+    {
+      "id": "bridge",
+      "label": "UART bridge",
+      "sublabel": "單一寫入者",
+      "type": "backend",
+      "overview_component": "bridge",
+      "responsibility": "合併單一 TX writer、fence 與 RX 共享視窗；在 OS 提交點重驗 permit，接收 DUT 位元組並喚醒傳輸等待者。WAL 是附屬證據儲存：echo slice 聚合為行紀錄；本頁不展開 WAL 的完整生命週期。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1372,
+          "end_line": 1388,
+          "excerpt_sha256": "dbf498ec47899a39de97d1b2aea0f74004938b20f160fd069487f365729e67f3",
+          "claim": "TX writer 是唯一呼叫 SerialWriter.write_gated 的執行緒。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 600,
+          "end_line": 617,
+          "excerpt_sha256": "0332cc6dc71f17cacdc8d29909bea55955fde0031741686ce6f1cdabd265346d",
+          "claim": "提交 gate 持 fence 鎖重驗停機與 permit，才呼叫 OS 提交。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 491,
+          "end_line": 502,
+          "excerpt_sha256": "922a819c27ececf351386ff6ee34a75740cdc2ad15a808577fc4e97ddd8a3b43",
+          "claim": "reader 收到 DUT RX 後寫入 WAL。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 526,
+          "end_line": 528,
+          "excerpt_sha256": "629dca43fa3d921f7a88dfdf24539c5679f48eef7e9665e5519528f444cc4e03",
+          "claim": "reader 把 RX 放進 RxShared。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 207,
+          "end_line": 210,
+          "excerpt_sha256": "3eb22cb6e7883bfaea88b0eef069594ee0e71ed516ca6a0de88eb305d24ced0a",
+          "claim": "echo-paced 行以 AggregateOp.Finish 結束 TX 聚合。"
+        }
+      ]
+    },
+    {
+      "id": "target",
+      "label": "UART／DUT",
+      "sublabel": "板端 shell",
+      "type": "external",
+      "overview_component": "target",
+      "responsibility": "接收 shell 命令，成功路徑需有本文回顯、prompt、執行期 sentinel 與 md5sum；Base64 工具可選 base64 或 openssl。主機原始碼只證明命令樣板與預期回應，不能保證特定 DUT 支援這些行為。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/file_transfer/templates.rs",
+          "line": 50,
+          "end_line": 69,
+          "excerpt_sha256": "65d2e0359ee0bb7c4097af0683491510d3e58612f92e2140d6e766ce9460d986",
+          "claim": "板端探測以實際編解碼結果選 base64 或 openssl。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/templates.rs",
+          "line": 89,
+          "end_line": 109,
+          "excerpt_sha256": "0c0c2f08b594fb767fecb3217b6cb6c044346b098149397cb8cd31b45d662eeb",
+          "claim": "push 命令解碼到檔案，MD5 與搬移以 shell 命令和成功 sentinel 表示。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/templates.rs",
+          "line": 116,
+          "end_line": 125,
+          "excerpt_sha256": "de78a7434694fc3d786ee961114d023b378bc0bb94cb85672dca804c687e8109",
+          "claim": "pull 命令以 BEGIN／END marker 包住編碼輸出，失敗另印 sentinel。"
+        }
+      ]
+    },
+    {
+      "id": "files",
+      "label": "本機檔案",
+      "sublabel": "daemon 所在主機",
+      "type": "database",
+      "overview_component": "pal-files",
+      "responsibility": "StdLocalFiles 直接使用 std::fs 讀完整檔或截斷寫入；資料 I/O 不走 NativeFsOps.atomic_write。路徑是 daemon 所在主機的路徑，相對路徑以 daemon cwd 為準；PAL 僅用於此處的檔案錯誤轉譯。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 91,
+          "end_line": 100,
+          "excerpt_sha256": "5708b1ae06e1935729fc5b094bc455f23f88b628fa4b40734d96febc751125ee",
+          "claim": "LocalFiles 介面將 write_truncate 定義為非原子、不建立目錄；StdLocalFiles 的相對路徑以 daemon cwd 為準。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 114,
+          "end_line": 124,
+          "excerpt_sha256": "c75b8aec549967bf2cdab97c9b2ea05e8a1ca848a29115f2d485ce884611b288",
+          "claim": "StdLocalFiles 直接呼叫 std::fs.read／write，錯誤透過 fs_ops.map_file_error 轉譯。"
+        }
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "id": "submit",
+      "from": "cli",
+      "to": "service",
+      "label": "送出 file.push／file.pull",
+      "phase": "請求與前景授權",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 183,
+          "end_line": 210,
+          "excerpt_sha256": "0129625c40b02647f51472c002ee62f235f7ccd234f814bd8ee17544ad6406dd",
+          "claim": "CLI 將 file push／pull 轉成對應 RPC，傳遞路徑與參數。"
+        },
+        {
+          "path": "crates/sw-cli/src/endpoint_resolve.rs",
+          "line": 71,
+          "end_line": 81,
+          "excerpt_sha256": "c780d7ea538aabc7097b40efb9157ef08b79290672016803b13099b573be9c3d",
+          "claim": "Win RPC 後端的本機預設 endpoint 為 loopback TCP。"
+        },
+        {
+          "path": "crates/sw-cli/src/endpoint_resolve.rs",
+          "line": 82,
+          "end_line": 85,
+          "excerpt_sha256": "46029fbc8f5a626350bcac7e493bcddc4181abcab4254410dfa612b336286726",
+          "claim": "POSIX RPC 後端的本機預設 endpoint 使用 Unix socket 路徑。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 99,
+          "end_line": 100,
+          "excerpt_sha256": "bf764be8ed116c93fa46267fb8e78ab7375360a112a4eab55120a7654cab6345",
+          "claim": "相對檔案路徑以 daemon cwd 為準；I/O 在 daemon 端進行。"
+        }
+      ],
+      "note": "Linux｜Windows：Unix｜TCP（原生預設 RPC；Unix 指 Unix socket，TCP 為 loopback；後端與 endpoint 可覆寫）。本機路徑屬於 daemon 主機，RPC 不夾帶檔案內容。以下以 push 為主路徑，pull 另列條件分支。"
+    },
+    {
+      "id": "dispatch",
+      "from": "service",
+      "to": "manager",
+      "label": "驗證參數並交給 manager",
+      "phase": "請求與前景授權",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 861,
+          "end_line": 867,
+          "excerpt_sha256": "de7bba6dfec06ca34f4a7be26ff078b0a27fbce79473b5a895753465ab84f93c",
+          "claim": "Service 解析請求，失敗立即回應，成功呼叫 manager.file_transfer_with_admission。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/request.rs",
+          "line": 114,
+          "end_line": 141,
+          "excerpt_sha256": "d53473557269b80f2736fef9c549cdce8acb0bf174b8a9ef6fd54ff8d35d5bbe",
+          "claim": "RPC 將 push chunk_size 夾到至少 1，檢查 ack_mode 白名單、source 與必填值。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/request.rs",
+          "line": 143,
+          "end_line": 155,
+          "excerpt_sha256": "faa86c798cbe2ecb898ee8336213013149c3fed8cba34cf819d5b030a466d2ff",
+          "claim": "pull 驗證 ack_mode 後固定存 auto，不轉傳使用者的 ACK 模式。"
+        }
+      ],
+      "note": "push 支援 auto、echo、none；pull 的 ack_mode 僅驗證，不控制拉取節流。無效參數回 INVALID_ARGS；保留來源依 check_source 拒絕。"
+    },
+    {
+      "id": "route",
+      "from": "manager",
+      "to": "session",
+      "label": "解析 selector 並等待 actor",
+      "phase": "請求與前景授權",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6874,
+          "end_line": 6893,
+          "excerpt_sha256": "6461c3e98ecac05845888abc759895c329cfdbf0e8fa95019b1ae6491096a13d",
+          "claim": "manager resolve selector 後路由 actor，找不到回 SESSION_NOT_FOUND。"
+        }
+      ],
+      "note": "admission ticket 交給 pending op 持有到實際終態，RPC 路由等待逾時不會提早解除交接 admission。"
+    },
+    {
+      "id": "start-transfer",
+      "from": "session",
+      "to": "transfer",
+      "label": "取得前景槽並啟動傳輸",
+      "phase": "請求與前景授權",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core/file_xfer.rs",
+          "line": 104,
+          "end_line": 125,
+          "excerpt_sha256": "30be25430dec34428629094c55c9fd6c12e178aa68cf6df61e2d9058699f27a8",
+          "claim": "passthrough 不可傳檔；非 READY 依狀態回 PROFILE_NOT_COMMAND_CAPABLE、SESSION_RECOVERING、FLASHING_BUSY 或 SESSION_NOT_READY。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/file_xfer.rs",
+          "line": 127,
+          "end_line": 148,
+          "excerpt_sha256": "218c250819e79adcaf736c956c69c1e58a5f339bf3d7e7bd3422a0bb370cc788",
+          "claim": "檢查 quiet、連線世代、recovering 與非 human lease。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/file_xfer.rs",
+          "line": 150,
+          "end_line": 158,
+          "excerpt_sha256": "0b92bce7870b603d8451bc9cd4e4dcc0e4bc3b89247bcdf9033468a2cb2523eb",
+          "claim": "前景槽忙碌回 SESSION_BUSY，不排隊。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/file_xfer.rs",
+          "line": 46,
+          "end_line": 62,
+          "excerpt_sha256": "7d02ce6555061ab8fabb5cce11ac0c7cfbcc3abfb5fdf9a46fd842371ae1875d",
+          "claim": "通過者關閉 human admission、取得 grant 並產生 StartOp。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5326,
+          "end_line": 5348,
+          "excerpt_sha256": "ec8fdc62aa8381726044b6acf5f23da7f60b917bb7e6431b4713363670e7dd44",
+          "claim": "效果執行器以該 epoch 的 OpRunner.run 啟動工作。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/file_xfer.rs",
+          "line": 170,
+          "end_line": 198,
+          "excerpt_sha256": "340ee5d3a3e2f11124e73d7a7db9e00211a1f77866998d021254a738c2e383cf",
+          "claim": "push 的 chunk／echo 與 pull timeout 從 profile 推導；pull 帶入平台路徑風格。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 33,
+          "end_line": 45,
+          "excerpt_sha256": "369125f4099cf717d66363574fb2d52ae57ffb5dccb8a650abb365fb4f257971",
+          "claim": "前景開始時關閉 human admission；agent 遇 human lease 則 suspend ownership。"
+        }
+      ],
+      "note": "必須 READY、通過 quiet 且前景槽可用；忙碌直接回 SESSION_BUSY，不走命令佇列。human lease 可暫停，其他 lease 回 SESSION_INTERACTIVE_BUSY。executor 實際啟動前景 OpRunner；push chunk timeout 預設 max(profile.timeout_s, 5 s)，echo timeout 同樣至少 5 s；pull 預設至少 30 s，chunk_timeout_s 可覆寫 chunk／pull 等待。"
+    },
+    {
+      "id": "read-local",
+      "from": "transfer",
+      "to": "files",
+      "label": "讀取本機檔案",
+      "phase": "push 準備與工具探測",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 325,
+          "end_line": 345,
+          "excerpt_sha256": "98bca296025cf9624b976917d7476e90d749f8c345e4c1d17d3c31e96b31900a",
+          "claim": "push 驗證本機檔案，讀取全部資料、計算預期 MD5，建立 /tmp/.sw_upload_ 暫存路徑並檢查固定命令行長。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 351,
+          "end_line": 369,
+          "excerpt_sha256": "8ef726d5d6eb6e8bf44bc9f0cc00229c5d42b79915e49c5293d27cd5188355de",
+          "claim": "依行長預算及 Base64 膨脹推導原始資料容量。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 385,
+          "end_line": 398,
+          "excerpt_sha256": "9b415ad7ed4356086842163511bda0ff87cbab7c9628603b6df4db5c775ae03b",
+          "claim": "有效 chunk 大小是要求大小與行長容量的較小值，再檢查實際樣板長度。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 118,
+          "end_line": 123,
+          "excerpt_sha256": "261f5e4cf597fc28eda859389207669a0aa8645cbe7ecfd1f1214d263bfee11c",
+          "claim": "本機 I/O 直接呼叫 std::fs.read／write。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/templates.rs",
+          "line": 17,
+          "end_line": 20,
+          "excerpt_sha256": "958fa1db4aa260c911f464041e4c40766af906f7de7f1a3360c8fd89bfe3b9ea",
+          "claim": "RPC 的預設 chunk 大小為 512 bytes，echo slice 為 64 字元。"
+        }
+      ],
+      "note": "先整檔讀入記憶體並算 MD5；板端先寫 /tmp/.sw_upload_<12 位十六進位 id>。RPC 預設 chunk_size 為 512 bytes；實際大小還受 max_console_line_chars 的命令 UTF-8 bytes 預算限制，過小回 CONSOLE_LINE_LIMIT_TOO_SMALL。"
+    },
+    {
+      "id": "probe-decoder",
+      "from": "transfer",
+      "to": "bridge",
+      "label": "探測板端解碼工具",
+      "phase": "push 準備與工具探測",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 380,
+          "end_line": 383,
+          "excerpt_sha256": "33ee097fd2fbd9dda2a518e133a92e2cb29d8a24f2e4c580384ed57a8ef8905c",
+          "claim": "push 在傳 chunk 前探測 decoder。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 275,
+          "end_line": 301,
+          "excerpt_sha256": "dceccc1b57b00491e3093a29cda4955476b43dc73864322c62a5202a8753579c",
+          "claim": "依執行期 sentinel 選 base64 或 openssl；探測逾時、shell 錯誤或工具缺失回相應錯誤。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/templates.rs",
+          "line": 50,
+          "end_line": 58,
+          "excerpt_sha256": "81965b8b982fb9a8e1a716c4817ec8f61bfea6bc2eaea53773db345ff905010b",
+          "claim": "decoder 探測以實際解碼 sw-probe 驗證工具可用性。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 251,
+          "end_line": 258,
+          "excerpt_sha256": "403651610e59d2288b48dd5e8816a059ff1cd562ce8f216445375308238ccae8",
+          "claim": "一般命令先記 RX 起點、送出命令並等 prompt，再讀本次輸出。"
+        }
+      ],
+      "note": "送實際解碼探測；優先 base64 -d，次選 openssl enc -base64 -d -A。一般短命令經 writer 補換行並等 prompt；後續 MD5、搬移與 pull 命令共用這條送出路徑。"
+    },
+    {
+      "id": "decoder-result",
+      "from": "bridge",
+      "to": "transfer",
+      "label": "回傳探測 RX 與 prompt",
+      "phase": "push 準備與工具探測",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 372,
+          "end_line": 380,
+          "excerpt_sha256": "0539e9c573c25ea4b634f12a0686ab26580e4f5df0c63a0d20942d93a549713c",
+          "claim": "bridge 的 RxShared 等待從指定偏移開始的 prompt regex，回命中、逾時或取消。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 289,
+          "end_line": 301,
+          "excerpt_sha256": "21d81d33200a9661c6a383116cbc320a748a4430c778eaf1409680f1ea97149a",
+          "claim": "引擎取得 RX 後區分有效工具、TRANSFER_TIMEOUT、TRANSFER_PROBE_FAILED 與工具缺失。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/rx_match.rs",
+          "line": 25,
+          "end_line": 30,
+          "excerpt_sha256": "5f3ba3d61ef4ab9a5a9c277558a6f841e1ef1eb6e7e57c98cc75056c469bd099",
+          "claim": "成功 sentinel 必須在去除命令 echo 後獨立成行。"
+        }
+      ],
+      "note": "RX 由 reader 寫入共享視窗，OpTransferPort 讀取並回引擎判定；箭頭是讀取／等待的回傳，不代表 bridge 執行 decoder。缺工具回 TARGET_DECODER_MISSING；引擎依去除命令 echo 後獨立成行的 sentinel 判工具成功。"
+    },
+    {
+      "id": "send-slice",
+      "from": "transfer",
+      "to": "bridge",
+      "label": "分段提交 chunk 本文",
+      "phase": "push 分段與回顯節流",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 330,
+          "end_line": 335,
+          "excerpt_sha256": "ea2eadb70f4b44271c349be3109be317c61d4c664a90aeaef55321d94ec50603",
+          "claim": "Rust port 支援 echo-paced，因此 auto／echo 使用節流，none 改走整行送出。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 401,
+          "end_line": 418,
+          "excerpt_sha256": "d2981d6da04c6cbbbea857882de638ff53c70baeaafbec531da18adfd0efcf38",
+          "claim": "每個 chunk 編成 Base64 解碼命令，第一段用 >、其餘用 >>，echo-paced 路徑呼叫 port。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 288,
+          "end_line": 313,
+          "excerpt_sha256": "e750d77f22fc928d43f50d4a20e268aa931b64806afbfe927242bd478c2a34b4",
+          "claim": "移除行尾 CR／LF、切字元片段、登記目前行持有者，然後提交本文片段。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/templates.rs",
+          "line": 17,
+          "end_line": 20,
+          "excerpt_sha256": "958fa1db4aa260c911f464041e4c40766af906f7de7f1a3360c8fd89bfe3b9ea",
+          "claim": "ACK 模式為 auto／echo／none，預設 chunk 512、echo slice 64 字元。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 164,
+          "end_line": 176,
+          "excerpt_sha256": "0e81ceeb40c05bb00339bbe8d83a14bcac78a034167a7d439bc3bda404141e6d",
+          "claim": "所有片段沿用同一 grant，TX class 為 FileTransfer。"
+        }
+      ],
+      "note": "auto／echo：每 64 字元一片，先登記行持有者，再逐片送本文，尚不送換行。首個 chunk 覆寫暫存檔，其後追加；所有片段沿用同一 op_id。ack_mode=none 則繞過回顯等待，以一般 send_command 一次送完整行與換行。"
+    },
+    {
+      "id": "write-slice",
+      "from": "bridge",
+      "to": "target",
+      "label": "以單一 writer 寫 UART",
+      "phase": "push 分段與回顯節流",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 198,
+          "end_line": 204,
+          "excerpt_sha256": "3105d51a5067758aa0652f19b993d2dd5a033eace1f1e8a48c000c13f236db7f",
+          "claim": "OpTransferPort 送 TxJob 並等待 writer 回條。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1079,
+          "end_line": 1089,
+          "excerpt_sha256": "4f9ac4854148b640598ecc0af9b2f08cfbbdff05001d33f3c9fa91eb53ab6c83",
+          "claim": "writer 呼叫 write_gated 寫 payload，之後重驗 fence 並分類提交結果。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 600,
+          "end_line": 617,
+          "excerpt_sha256": "0332cc6dc71f17cacdc8d29909bea55955fde0031741686ce6f1cdabd265346d",
+          "claim": "OS 提交與 fence 驗證在同一臨界區內進行。"
+        }
+      ],
+      "note": "此箭頭代表所有板端命令共用的 UART 寫入邊界；writer 依 permit 重驗 fence。回條證明 OS 確認寫出量，不能取代 DUT echo 或 chunk 成功 sentinel。"
+    },
+    {
+      "id": "target-echo",
+      "from": "target",
+      "to": "bridge",
+      "label": "回傳本文回顯",
+      "phase": "push 分段與回顯節流",
+      "basis": "inferred",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 486,
+          "end_line": 498,
+          "excerpt_sha256": "4779005736b8a022da062f72530d66700fdb77be9a790e56150c9df939f0733d",
+          "claim": "reader 自序列埠讀取來自 DUT 的 RX bytes。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 319,
+          "end_line": 327,
+          "excerpt_sha256": "8c2c52f8d5285a136990865560212d723baf33a943d04ef1997a843292dc8bae",
+          "claim": "送出一片後，引擎等候累計片段回顯。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 526,
+          "end_line": 528,
+          "excerpt_sha256": "629dca43fa3d921f7a88dfdf24539c5679f48eef7e9665e5519528f444cc4e03",
+          "claim": "收到的資料追加到 RxShared。"
+        }
+      ],
+      "note": "這是 echo-paced 成功路徑要求的 DUT 逐片回顯；若 DUT 不回顯，會走停滯分支。主機讀碼不能證實特定 DUT 的實際 echo 內容。"
+    },
+    {
+      "id": "echo-ack",
+      "from": "bridge",
+      "to": "transfer",
+      "label": "回傳 RX 供回顯比對",
+      "phase": "push 分段與回顯節流",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 221,
+          "end_line": 242,
+          "excerpt_sha256": "de848012ef0bce49ee3c050efef57e0ef2b8710ce2eb15513d17f9d812269cf6",
+          "claim": "讀 RX、去 ANSI 與 CR／LF 後計算依序片段匹配與期限。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 244,
+          "end_line": 260,
+          "excerpt_sha256": "640466a175112152082ed1ca55191ea28ff8244cd1f9f5ebd379500ace7d9c86",
+          "claim": "等待新 RX 或取消；軟喚醒只記錄停機行期限，硬取消才回中止。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 90,
+          "end_line": 104,
+          "excerpt_sha256": "a01dd3fc2da97569048f7dadce0883d51bf8361b6de057d712e50fafb6b331a0",
+          "claim": "依序 find 每段，段間允許雜訊，回累計已確認字元。"
+        },
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 2517,
+          "end_line": 2537,
+          "excerpt_sha256": "938bcd42bbc87fadf0d21e4249218483d7303015dfe90d04e861b4a87e3279af",
+          "claim": "Python 的 echo 等待每 10 ms 輪詢，並檢查取消與期限。"
+        }
+      ],
+      "note": "從該行 RX 起點依序比對所有已送片段，允許片段間有雜訊；去 ANSI、CR、LF。回顯完整才續送下一片。Python 0.4.x 的 _await_echo_progress 每 10 ms 輪詢；此處 Rust 透過 RxShared 等新 RX／期限／取消喚醒並重算進度。"
+    },
+    {
+      "id": "echo-stall",
+      "from": "transfer",
+      "to": "bridge",
+      "label": "清除停滯輸入並清暫存",
+      "phase": "push 分段與回顯節流",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 332,
+          "end_line": 338,
+          "excerpt_sha256": "93d54082f0bd8c913abf8b18cb55c13bd708f0e3d5f7c00e23d41b5cd0bb6b82",
+          "claim": "非停機的回顯不足回 ok=false，未送行尾換行。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 419,
+          "end_line": 425,
+          "excerpt_sha256": "26b42fd8071c2887a705f369aca6b493285f87dba2886cd0f68089a8efdd25c6",
+          "claim": "引擎清輸入列並清暫存檔，回 TRANSFER_ECHO_STALL 與字元／chunk 進度。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 358,
+          "end_line": 361,
+          "excerpt_sha256": "7007ac43e4648dd8755b67b83222c07c1656a38243f8e5ad318dc4ea67375c69",
+          "claim": "cancel_input_line 透過 writer 送 Ctrl-U 加換行。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 261,
+          "end_line": 264,
+          "excerpt_sha256": "dda89ef1087c46839e84394c6790767ac5ddd656261a27b11d721ada4dccb400",
+          "claim": "cleanup 盡力送 rm，TX 被拒仍須上拋。"
+        }
+      ],
+      "note": "本文未執行；送 Ctrl-U 加換行，再盡力 rm 暫存檔。成功送出清理後回 TRANSFER_ECHO_STALL、acked_chars、sent_chars 與 chunk 進度；清理 TX 若被 fence 拒絕，改走傳輸中止映射，不再繼續 cleanup。",
+      "condition": "一般 push 的 echo-paced 回顯不足，且未觀察到停機軟喚醒；此分支結束本次傳輸。"
+    },
+    {
+      "id": "line-newline",
+      "from": "transfer",
+      "to": "bridge",
+      "label": "全片確認後送行尾換行",
+      "phase": "push 分段與回顯節流",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 319,
+          "end_line": 338,
+          "excerpt_sha256": "02765cc1c3d9a84617629046d9316d7b7b884ab6a64d03d669498407598d17e3",
+          "claim": "每片均等待回顯；不足時提早返回，不送正常換行。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 341,
+          "end_line": 355,
+          "excerpt_sha256": "853f9f9a580b31ca0077c1c497b84a208379e09d819af1d1feb3fc99b37601a8",
+          "claim": "所有片段完成後提交換行、結束聚合並關閉行持有。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 207,
+          "end_line": 210,
+          "excerpt_sha256": "3eb22cb6e7883bfaea88b0eef069594ee0e71ed516ca6a0de88eb305d24ced0a",
+          "claim": "Finish 結束本行的聚合 WAL 紀錄。"
+        }
+      ],
+      "note": "auto／echo 的正常路徑在全片確認後才送換行，讓 DUT 執行 chunk 命令；關閉行持有，TX slice 聚合為一筆行紀錄。none 已直接送整行，不執行這個分段收尾。"
+    },
+    {
+      "id": "chunk-result",
+      "from": "bridge",
+      "to": "transfer",
+      "label": "回傳 chunk 的 RX",
+      "phase": "push 分段與回顯節流",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 427,
+          "end_line": 438,
+          "excerpt_sha256": "7123778231e4bbcb200ef2448b59b04e32435d93ddebbe10f31bab3101dfdb15",
+          "claim": "不論 paced 或一般行送出後都等 prompt，且須見 chunk runtime sentinel；失敗回 timeout 或 decoder failed。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/templates.rs",
+          "line": 89,
+          "end_line": 96,
+          "excerpt_sha256": "8f766d7b5fe52070dc2dca0d6fa481a7a35848b56c5660d1412c5b93dfe8d34d",
+          "claim": "chunk 樣板只有解碼命令成功才印 SW_XFER_CHUNK_42。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 372,
+          "end_line": 380,
+          "excerpt_sha256": "0539e9c573c25ea4b634f12a0686ab26580e4f5df0c63a0d20942d93a549713c",
+          "claim": "prompt 等待使用 RxShared，取消時回中止。"
+        }
+      ],
+      "note": "每個 chunk 都必須等 prompt 並看到 SW_XFER_CHUNK_42，然後才送下一個 chunk。prompt 逾時回 TRANSFER_TIMEOUT；缺成功 sentinel 回 TARGET_DECODER_FAILED；兩者都先嘗試清暫存。"
+    },
+    {
+      "id": "verify-and-move",
+      "from": "transfer",
+      "to": "bridge",
+      "label": "校驗 MD5 後搬移到目的路徑",
+      "phase": "push 校驗與落定",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 266,
+          "end_line": 271,
+          "excerpt_sha256": "37426042d9fae0f3c8767e3a13a21c771f943828ce13f01b03ae62b588d5f862",
+          "claim": "remote_md5 發送 md5sum 命令並解析本次 RX。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 441,
+          "end_line": 466,
+          "excerpt_sha256": "9078412e64d21440aac30f5fa638c749d381752d7b0bd4e49abffd76830ce3a4",
+          "claim": "查暫存檔 MD5，無法驗證或不符即清暫存並返回；相符才送 mv 並驗證結果。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/templates.rs",
+          "line": 99,
+          "end_line": 109,
+          "excerpt_sha256": "bfa88794b186a590279d7ffe0547ce88204391ea9231989b61c6b03a4940df1f",
+          "claim": "md5sum 與 mv 命令各附執行期成功 sentinel。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/rx_match.rs",
+          "line": 78,
+          "end_line": 85,
+          "excerpt_sha256": "4ee837c6cf33aade1f5dd3c82d24bb71dd9afc2d14cde8748a59c4cb3d0adadf",
+          "claim": "MD5 解析先要求 MD5 sentinel，再取其之前的 digest。"
+        }
+      ],
+      "note": "此箭頭收合依序發送的 md5sum 與 mv：先等 MD5 回應、和本機 digest 相符才送 mv。無法取 digest 回 CHECKSUM_VERIFY_FAILED；不符回 CHECKSUM_MISMATCH 並帶 expected／actual，皆先清暫存。"
+    },
+    {
+      "id": "push-result",
+      "from": "bridge",
+      "to": "transfer",
+      "label": "回傳搬移命令的 RX",
+      "phase": "push 校驗與落定",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 461,
+          "end_line": 474,
+          "excerpt_sha256": "9ea13a6d393a95b40f6968d30c727033b7991f87c4220c6035caf98e38e70a42",
+          "claim": "搬移逾時回 MOVE_TIMEOUT、缺 sentinel 回 MOVE_FAILED；成功建立 bytes／chunks／md5／remote_path 結果。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 372,
+          "end_line": 380,
+          "excerpt_sha256": "0539e9c573c25ea4b634f12a0686ab26580e4f5df0c63a0d20942d93a549713c",
+          "claim": "板端命令的 prompt 等待回傳匹配／逾時／中止。"
+        }
+      ],
+      "note": "須等 prompt 並見 SW_XFER_MV_42 才組成功結果；搬移逾時為 MOVE_TIMEOUT，缺成功標記為 MOVE_FAILED。"
+    },
+    {
+      "id": "pull-start",
+      "from": "transfer",
+      "to": "bridge",
+      "label": "探測編碼工具並請求檔案",
+      "phase": "條件式 pull 分支",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 520,
+          "end_line": 540,
+          "excerpt_sha256": "c19fffe63a8e1d9c63bc3ebd20618fdb362905bfb5bde67e71eda41d2720c7dd",
+          "claim": "pull 先決定本機檔名並檢查 probe、md5、pull 各候選命令行長。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 552,
+          "end_line": 565,
+          "excerpt_sha256": "1f59fe42cdf6a92472ee9051f32c3462d22e00215b0b95a79afb8e9890669773",
+          "claim": "先探測 encoder，成功後送出 pull 命令並分段收集到 prompt。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/templates.rs",
+          "line": 61,
+          "end_line": 69,
+          "excerpt_sha256": "ecf2972f6e78366c178f485342f3e9995b927591e6d7baa3aa93e2b48e9dfbc4",
+          "claim": "encoder 實測 sw-probe 編碼，優先 base64，次選 openssl。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/templates.rs",
+          "line": 116,
+          "end_line": 125,
+          "excerpt_sha256": "de78a7434694fc3d786ee961114d023b378bc0bb94cb85672dca804c687e8109",
+          "claim": "pull 命令由 BEGIN／END marker 夾住編碼輸出。"
+        }
+      ],
+      "note": "取代 push 的讀檔、送 chunk 與搬移流程。先實測 base64 或 openssl encoder；缺工具回 TARGET_ENCODER_MISSING。再發送 marker 包住的 Base64 輸出命令；pull 不使用 push 的逐片 echo ACK。",
+      "condition": "請求為 file.pull；以下 pull 步驟在共用前景授權後執行。"
+    },
+    {
+      "id": "pull-data",
+      "from": "bridge",
+      "to": "transfer",
+      "label": "分段回傳拉取資料",
+      "phase": "條件式 pull 分支",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 157,
+          "end_line": 162,
+          "excerpt_sha256": "64496e23ee1d9aa581481e22429b3971e5711f34f3667a8ad7bd6278af47fcf1",
+          "claim": "pull 每輪最多等待 250 ms，無換行片段過 65536 字元時強制搬離視窗。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 482,
+          "end_line": 508,
+          "excerpt_sha256": "03050021d6ddcd5ceb53c60c61eea3a9b0e14f0e7abb93e882f6e532c03d635b",
+          "claim": "按 RX 絕對偏移把完整行搬進本地累積緩衝，保留未完成行與 prompt。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 563,
+          "end_line": 580,
+          "excerpt_sha256": "e874b09d4074b9e16bc40e0be56b5d6119f805ae9e3e40fdd0a7e1ccb366c3d1",
+          "claim": "等待 prompt 後抽取 marker，分別回 encoder、解析或 Base64 解碼錯誤。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/rx_match.rs",
+          "line": 47,
+          "end_line": 59,
+          "excerpt_sha256": "7593002cf9497646564bcbbe309ea839f9c3c6259a6d29a239b6121196371285",
+          "claim": "取最後一組 BEGIN／END 之間內容，去 ANSI 與空白。"
+        }
+      ],
+      "note": "每輪最多等 250 ms，把完整行搬入本地緩衝，避免整份輸出受 RX 視窗大小限制；無換行片段超過 65536 字元則整段搬走。見 prompt 後取最後一組 marker、去 ANSI／空白並解碼。輪詢追不上 RX 仍可能遺失資料，需靠後續 MD5 檢出。",
+      "condition": "請求為 file.pull，且 encoder 探測與命令送出成功。"
+    },
+    {
+      "id": "pull-md5",
+      "from": "transfer",
+      "to": "bridge",
+      "label": "請求板端原檔 MD5",
+      "phase": "條件式 pull 分支",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 582,
+          "end_line": 590,
+          "excerpt_sha256": "c5fcde603a5743a5f9ed8bd8a34a47efebb93e8eeacc78686bdcf7d1805abae1",
+          "claim": "解碼後算本機 MD5，再要求板端 remote_md5；無 digest 或不符就返回失敗。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 266,
+          "end_line": 271,
+          "excerpt_sha256": "37426042d9fae0f3c8767e3a13a21c771f943828ce13f01b03ae62b588d5f862",
+          "claim": "remote_md5 透過 run 送 md5sum，再解析其輸出。"
+        }
+      ],
+      "note": "解碼資料先算本機 MD5，再讀板端原檔 digest；尚未寫入本機目的檔。",
+      "condition": "file.pull 已成功解析並解碼內容。"
+    },
+    {
+      "id": "pull-md5-result",
+      "from": "bridge",
+      "to": "transfer",
+      "label": "回傳板端 MD5 輸出",
+      "phase": "條件式 pull 分支",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/file_transfer/rx_match.rs",
+          "line": 78,
+          "end_line": 85,
+          "excerpt_sha256": "4ee837c6cf33aade1f5dd3c82d24bb71dd9afc2d14cde8748a59c4cb3d0adadf",
+          "claim": "板端 MD5 輸出必須有成功 sentinel 才能解析 digest。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 582,
+          "end_line": 593,
+          "excerpt_sha256": "204010d294fa266599281fc092f47015b30c6971a4946cad6c9dc07afd6349c8",
+          "claim": "MD5 無法驗證回 CHECKSUM_VERIFY_FAILED；不符回 CHECKSUM_MISMATCH，只有相符才寫檔。"
+        }
+      ],
+      "note": "CHECKSUM_MISMATCH 的 expected 是板端 digest，actual 是本機解碼資料 digest；失敗不寫本機目的檔。",
+      "condition": "file.pull 已請求板端 MD5；若無有效 digest 或 digest 不符，提前結束。"
+    },
+    {
+      "id": "write-local",
+      "from": "transfer",
+      "to": "files",
+      "label": "截斷寫入本機目的檔",
+      "phase": "條件式 pull 分支",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 593,
+          "end_line": 600,
+          "excerpt_sha256": "a70019aaa20d18552d265c0b2bb3cd92966acfaec5b97781e9b3dba5020494bb",
+          "claim": "校驗通過才 write_truncate，成功回 bytes／md5／local_path。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 91,
+          "end_line": 100,
+          "excerpt_sha256": "5708b1ae06e1935729fc5b094bc455f23f88b628fa4b40734d96febc751125ee",
+          "claim": "寫入非原子、不建目錄；相對路徑以 daemon cwd 為準。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 118,
+          "end_line": 124,
+          "excerpt_sha256": "9d6749b3023406e65880cfa93f9561fbdc277e6b9cf0f50cc616a291729ae478",
+          "claim": "實際落檔使用 std::fs.write。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 520,
+          "end_line": 523,
+          "excerpt_sha256": "1b568abd3236c0050e555806f2f49cced15d240206fc9608b278ffa7a77df3b3",
+          "claim": "未指定 local_path 時由平台 basename 取得預設檔名。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/file_xfer.rs",
+          "line": 185,
+          "end_line": 198,
+          "excerpt_sha256": "75f58b245eb4f90d3bb5707deb556093af403c9714cd47d41eacdb0916835836",
+          "claim": "pull 計畫由平台 PalPathFlavor 選 Posix 或 Windows。"
+        },
+        {
+          "path": "crates/sw-proto/src/pypath.rs",
+          "line": 68,
+          "end_line": 71,
+          "excerpt_sha256": "11b2186690517496a33973f27707d3ce1ef512c57603973bbc065e63bba8513c",
+          "claim": "basename 轉交相應路徑風格的 split。"
+        },
+        {
+          "path": "crates/sw-proto/src/pypath.rs",
+          "line": 139,
+          "end_line": 148,
+          "excerpt_sha256": "7ba2a13bb3d36c659674ce33eea5d743318d5b145f5d5c16ae7d15b5db43b056",
+          "claim": "POSIX 路徑以 / 分割 basename。"
+        },
+        {
+          "path": "crates/sw-proto/src/pypath.rs",
+          "line": 228,
+          "end_line": 251,
+          "excerpt_sha256": "c9faa843aa9a0fb70ad3937c949eca6b949edc989759264f5f76df4ed8621cc6",
+          "claim": "Windows split 依磁碟與正反斜線解析 basename，split 按 PathFlavor 選擇。"
+        }
+      ],
+      "note": "只在 MD5 相符後寫檔；直接截斷寫入、非原子、不建立目錄。未提供 local_path 時取 remote_path 的 basename：Linux｜Windows：Posix｜Windows（主機路徑風格）。相對目的路徑以 daemon cwd 為準，與 RPC client cwd 無關。",
+      "condition": "file.pull 的 MD5 校驗相符。"
+    },
+    {
+      "id": "transfer-done",
+      "from": "transfer",
+      "to": "session",
+      "label": "回報傳輸結果或中止分類",
+      "phase": "傳輸結果與前景收尾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 124,
+          "end_line": 132,
+          "excerpt_sha256": "8f27d3d0aa3b12bd455181479630b51f1bb86d4d5aa65f23470c8eef9e09f734",
+          "claim": "runner 執行完成後發 OpFinished 給 actor。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 444,
+          "end_line": 463,
+          "excerpt_sha256": "194e8383a412a6f19dab80d9942b85bd870958589fdc2edb5c356823447e98b6",
+          "claim": "runner 取得 port 累計已確認寫出量，映射 TxRejected。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 474,
+          "end_line": 488,
+          "excerpt_sha256": "1cc8222c26c31506c47c3f66afcb232bb2650f1d2b0ad7e3fce25accfce22f7a",
+          "claim": "quiet 零寫出交 actor；取消、世代或 drain 依已寫出量回 COMMAND_ABORTED_IN_FLIGHT 或 FLUSHED_BY_RECOVERY，其餘 TRANSFER_TIMEOUT。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 491,
+          "end_line": 497,
+          "excerpt_sha256": "9c7e163f463907b7a68be00011c0cf92f6260f0695c4702ef094a6e2953275a7",
+          "claim": "chunk 迴圈中的中止保留 chunks_sent／chunks_total。"
+        }
+      ],
+      "note": "push 或 pull 終態都回 actor。quiet 且被拒那筆零寫出交 actor 產生 AUTOBOOT_QUIET；取消／世代失效／drain 則以整次傳輸累計確認量區分 COMMAND_ABORTED_IN_FLIGHT 與 FLUSHED_BY_RECOVERY；其他拒絕為 TRANSFER_TIMEOUT。不自動重送已拒的 TX。"
+    },
+    {
+      "id": "actor-reply",
+      "from": "session",
+      "to": "manager",
+      "label": "釋放前景並回覆等待者",
+      "phase": "傳輸結果與前景收尾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7911,
+          "end_line": 7923,
+          "excerpt_sha256": "47ef2b209304f1222b2a1fb7d5b2704290776c99172aad7dfba18c240068cb00",
+          "claim": "actor 先收斂傳輸、command_fg_finish，再回覆；回放 hold 未結束時保留 admission ticket。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/file_xfer.rs",
+          "line": 206,
+          "end_line": 231,
+          "excerpt_sha256": "80dbf4d65eabcdd4a105db06d0f7c96be1553470bdf0774745bc3789b56ae09d",
+          "claim": "actor 原樣回傳結果；quiet 零寫出加 selector／retry_after_s，本機 I/O 或 regex 錯誤轉 PyErr。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6880,
+          "end_line": 6887,
+          "excerpt_sha256": "0a0c9998bb92d5383a62683a012d4b92ceca9c8b82c1de0e3251005e40a1d9ad",
+          "claim": "manager 等待 actor 的路由結果。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 48,
+          "end_line": 55,
+          "excerpt_sha256": "cfd58e9090a3eadce939f8d33db7931027647d93c3e426cddec880c070ef4461",
+          "claim": "前景收尾恢復被暫停的 human，再重開 admission 並觸發回放。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/file_xfer.rs",
+          "line": 234,
+          "end_line": 236,
+          "excerpt_sha256": "263d81b96e5ef64d59d703e8e0cbcbab13dc34c0330d04660546244461cc20ae",
+          "claim": "本機 I/O 與 prompt regex 錯誤轉為 PyErr。"
+        }
+      ],
+      "note": "先執行前景收尾、重開 human admission 並啟動回放，再產生回覆；若非同步回放仍有 hold，ticket 持有到回放收斂。本機 I/O 或 prompt regex 錯誤交 RPC framing，並非傳輸成功結果。"
+    },
+    {
+      "id": "rpc-reply",
+      "from": "service",
+      "to": "cli",
+      "label": "回傳傳輸結果與來源",
+      "phase": "傳輸結果與前景收尾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 861,
+          "end_line": 867,
+          "excerpt_sha256": "de7bba6dfec06ca34f4a7be26ff078b0a27fbce79473b5a895753465ab84f93c",
+          "claim": "Service 取得 manager 結果後 annotate_source 並回傳。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 468,
+          "end_line": 474,
+          "excerpt_sha256": "82f4241aefde89b77c4fe9bc271bdd0440a054906d963e3af1e0e69bb0f0ede3",
+          "claim": "push 成功結果包含 bytes、chunks、md5、remote_path。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer.rs",
+          "line": 595,
+          "end_line": 600,
+          "excerpt_sha256": "21c6734003fb3de57073300787c8a56fbe92cc8556ca1b7c0f73918f5585f4cf",
+          "claim": "pull 成功結果包含 bytes、md5、local_path。"
+        }
+      ],
+      "note": "manager 的路由結果返回 Service 後才加來源標註；push 回 bytes、chunks、md5、remote_path，pull 回 bytes、md5、local_path。傳輸失敗沿上述分支回錯誤，不代表部分暫存已自動撤回。"
+    },
+    {
+      "id": "shutdown-settle",
+      "from": "manager",
+      "to": "bridge",
+      "label": "先要求目前行收尾再凍結",
+      "phase": "條件式停機行收尾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1467,
+          "end_line": 1478,
+          "excerpt_sha256": "67c48eb6670ab23ba9e02689e7acb56253aafb811bcfce142e972808c810af13",
+          "claim": "daemon 先凍結 admission、停 accept，再呼叫 manager.begin_shutdown，不先等傳檔 handler。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8515,
+          "end_line": 8527,
+          "excerpt_sha256": "dbe2a0dee14de3fcfe42a42790256603f01b94f7269c7ca4034ee30f9274890f",
+          "claim": "manager 對 fence 呼叫 freeze_for_shutdown_settling，收集 PendingLine 並共用期限等待。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 120,
+          "end_line": 121,
+          "excerpt_sha256": "706ef5537bd08912dea5bf769a94135c68be6bfa040f6d1900812ce1a6d0551c",
+          "claim": "manager 行收尾共用預算為 1250 ms。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 323,
+          "end_line": 342,
+          "excerpt_sha256": "972bc0c59c004ef8506d4e32d80ed66924ac38cdbbabf76e41df3fc38729f6e5",
+          "claim": "有現行行持有者且可收尾時標記 shutdown_freeze_pending，否則立即 frozen。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 474,
+          "end_line": 487,
+          "excerpt_sha256": "ddd68fa61591d81674fd6252e11b7ec48255180e8cebe13377f181afcb0db744",
+          "claim": "pending 時只允許目前行的 FileTransfer op，其他 TX 拒絕；epoch／取消仍須通過。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 9221,
+          "end_line": 9240,
+          "excerpt_sha256": "b76425353e3f5165957183d9fd3426f21aa782b80e523c6483c2043430e1b7f1",
+          "claim": "所有 pending fence 共用期限；逾時仍未 frozen 者強制凍結。"
+        }
+      ],
+      "note": "此段為 issue #282 修正（PR #291，已合入 12eb9a0e）後的行為。此段可插入前面的傳輸等待期間，並非成功回應後必然發生。daemon 主流程先停 accept，不等待整份 push 完成。manager 先發布 stopping／待凍結；有行持有時僅放行該 op 的 FileTransfer TX，其他來源拒絕。所有行共用 1250 ms 等待預算；逾時仍未收斂則強制凍結。此保護專屬停機，不延伸到 release／recover。",
+      "condition": "daemon 停機；本頁僅展開進行中傳檔的收尾，完整停止序見 09-daemon-mgmt。"
+    },
+    {
+      "id": "settle-wake",
+      "from": "bridge",
+      "to": "transfer",
+      "label": "軟喚醒行持有者",
+      "phase": "條件式停機行收尾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 329,
+          "end_line": 347,
+          "excerpt_sha256": "748432de1feb8c770c3fc212df6c4556ec20e6b20dc8015e6bcbfe87c5140f9d",
+          "claim": "fence 取出現行行的 settle flag，標記 pending 後 trigger 軟喚醒。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 151,
+          "end_line": 161,
+          "excerpt_sha256": "644f22be78bc325adc4d9853c0629ba722be5dd6bc415cbbb88857197a0f1b34",
+          "claim": "port 首次看到 settle 才記錄行期限起點。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 24,
+          "end_line": 27,
+          "excerpt_sha256": "f05948fb758116d3d1cf514331f389132c738980abc8f84a265b817275413ca7",
+          "claim": "行持有者的完成預算為 750 ms，允許逾時時清列。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 244,
+          "end_line": 260,
+          "excerpt_sha256": "640466a175112152082ed1ca55191ea28ff8244cd1f9f5ebd379500ace7d9c86",
+          "claim": "echo 等待收到軟喚醒不直接中止；只有硬取消才返回 TransferAbort。"
+        }
+      ],
+      "note": "軟喚醒不等於立即 cancel；port 自首次觀察軟喚醒起計 750 ms，繼續處理目前行。若尚未送出任何本文便看到停機，直接關行返回，不開始新行。",
+      "condition": "停機時存在已登記的 echo-paced push 行，fence 進入 PendingLine。"
+    },
+    {
+      "id": "finish-line",
+      "from": "transfer",
+      "to": "bridge",
+      "label": "完成目前行並送換行",
+      "phase": "條件式停機行收尾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 303,
+          "end_line": 335,
+          "excerpt_sha256": "5c8d147d589dee2c64f09b3284f7a6b1639040962967fa7c8cece40f5ba3591b",
+          "claim": "停機軟喚醒後仍可繼續目前行的片段，期限到或回顯不足則改 kill_line。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 341,
+          "end_line": 355,
+          "excerpt_sha256": "853f9f9a580b31ca0077c1c497b84a208379e09d819af1d1feb3fc99b37601a8",
+          "claim": "期限內完成時提交換行、Finish 聚合並關行。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 384,
+          "end_line": 398,
+          "excerpt_sha256": "60f41c5c7de628c6adfdebc9fa0bdbf616562553c11d270e77cb470d536de69e",
+          "claim": "關閉 pending 行時在同一 fence 臨界區設 frozen。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 605,
+          "end_line": 617,
+          "excerpt_sha256": "bf8d547d3caf16b9d1611c155bf30105349045c6f56cd3bc21a06aaf864240b0",
+          "claim": "OS 提交 gate 只為 pending 的目前行持有者保留提交權。"
+        }
+      ],
+      "note": "只完成正在推送的那一行；全片回顯確認後送換行、結束 WAL 聚合並關行，關行同時凍結，不能開始下一行或下一 chunk。這不等於完成整份檔案推送。",
+      "condition": "停機軟喚醒後，目前行已開始送出，在 750 ms 行期限內取得所需回顯，且 TX 持續獲准。"
+    },
+    {
+      "id": "kill-line",
+      "from": "transfer",
+      "to": "bridge",
+      "label": "嘗試 Ctrl-U 加換行清列",
+      "phase": "條件式停機行收尾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 310,
+          "end_line": 335,
+          "excerpt_sha256": "a93ba396269d2ea00781dcfc302c91b389c85f63bce74bb3f7b2d4f84d32ef6a",
+          "claim": "停機行期限到，或軟喚醒後回顯不足，都轉 kill_line。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 385,
+          "end_line": 392,
+          "excerpt_sha256": "c72393ce49f6dbfbf86ca69f3e090170ec9f31fcd54b5607f968fd6e1be19e0d",
+          "claim": "kill_line 先結束聚合，嘗試送清列 payload，再關行並返回中止；提交結果被忽略。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 110,
+          "end_line": 112,
+          "excerpt_sha256": "1faaafc58494d751fe1668e8253042e763189ee63cfc7fbfd26288812252822e",
+          "claim": "清列 payload 是 Ctrl-U（0x15）後接換行。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 384,
+          "end_line": 398,
+          "excerpt_sha256": "60f41c5c7de628c6adfdebc9fa0bdbf616562553c11d270e77cb470d536de69e",
+          "claim": "關行時若 pending，就完成 frozen。"
+        }
+      ],
+      "note": "替代前一步的正常行收尾：先 Finish 聚合，嘗試送 0x15 加換行（Ctrl-U），再關行並凍結。不送未完成本文的正常執行換行、不做後續 chunk 或 cleanup。清列提交結果被忽略；硬取消、其他 fence 拒絕或 manager 強制凍結仍可能使清列失敗，不能宣稱 DUT 必已清空。",
+      "condition": "停機軟喚醒後，750 ms 行期限已到，或 echo 等待返回時累計回顯仍不足；替代 finish-line。"
+    },
+    {
+      "id": "shutdown-drain",
+      "from": "manager",
+      "to": "session",
+      "label": "行等待結束後通知 drain",
+      "phase": "條件式停機行收尾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8526,
+          "end_line": 8539,
+          "excerpt_sha256": "bc4eeddc7d9cc0e4203ed25f56fcdeb768bf57fb8ef22b4bdd7ed1119f01fc28",
+          "claim": "begin_shutdown 等待行收尾後再送 ShutdownGate。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1499,
+          "end_line": 1505,
+          "excerpt_sha256": "4c4676baa113a1141de27403bdc0460678dcd7b49267e80b67155fbd81a0ad80",
+          "claim": "行等待耗時從共用 drain 預算扣除，Phase 1 取消後才 join RPC handler。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8733,
+          "end_line": 8746,
+          "excerpt_sha256": "898e6418edb36fb4372310451e1af46c5da9b7f8a288d17986accfd621daab76",
+          "claim": "shutdown_phase1 實際向 actor 控制 lane 發 Shutdown。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 1439,
+          "end_line": 1442,
+          "excerpt_sha256": "7107afb94bf8027096236fe379634ec8860b3ba7d20b4f13302c6eadcc9ea69d",
+          "claim": "actor 收到 Shutdown 後執行 begin_stop(Shutdown)。"
+        }
+      ],
+      "note": "manager 行等待返回（自然凍結或逾時強制凍結）後，daemon 才推進 shutdown Phase 1，透過 manager 通知 actor。行收尾耗時會扣除後續 drain 共用預算；RPC handler 是 Phase 1 之後才 join。",
+      "condition": "daemon 停機的 begin_shutdown 已結束，且 session 仍需 drain。"
+    },
+    {
+      "id": "cancel-waits",
+      "from": "session",
+      "to": "bridge",
+      "label": "凍結並取消剩餘傳輸等待",
+      "phase": "條件式停機行收尾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 2244,
+          "end_line": 2254,
+          "excerpt_sha256": "3b9697450ffe8112b704ee117d25d2c4b18a6085bb943810bbef011f88eb8d26",
+          "claim": "actor 凍結 fence、使 epoch 失效，然後 cancel_transfer_runs 喚醒傳輸等待。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 372,
+          "end_line": 380,
+          "excerpt_sha256": "0539e9c573c25ea4b634f12a0686ab26580e4f5df0c63a0d20942d93a549713c",
+          "claim": "一般 prompt 等待收到硬取消回 TransferAbort。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 474,
+          "end_line": 488,
+          "excerpt_sha256": "1cc8222c26c31506c47c3f66afcb232bb2650f1d2b0ad7e3fce25accfce22f7a",
+          "claim": "傳輸拒絕依確認量映射中止錯誤；非正常繼續傳送。"
+        },
+        {
+          "path": "crates/sw-core/src/drain.rs",
+          "line": 43,
+          "end_line": 48,
+          "excerpt_sha256": "cf7e3f1fdd5daaf789f8dc0e7f2362359c9d5ad8f677686c3449b084d7f5198f",
+          "claim": "worker 停止回條先於 WAL 關閉，包含 echo 聚合紀錄排空。"
+        }
+      ],
+      "note": "actor 的 drain Phase 1 凍結並失效世代，再取消殘餘 prompt／傳輸等待；不等整份 push 跑完。runner 結果沿傳輸結果收尾路徑返回；writer 未結聚合在 worker 停止回條前排空，daemon 之後才關 WAL。完整 worker／daemon 停止序不在本頁展開。",
+      "condition": "daemon 停機進入該 session 的 drain Phase 1。"
+    }
+  ],
+  "unknowns": [
+    {
+      "id": "dut-line-clear-not-verified",
+      "question": "特定 DUT 是否將 Ctrl-U 解讀為清除整個輸入列，以及停機時這兩個 bytes 是否實際送達並生效？本次未執行 daemon 或實機。",
+      "impact": "原始碼只保證嘗試提交 0x15 加換行；kill_line 忽略提交結果，不能把此頁當作所有 DUT 無殘留的執行期保證。"
+    },
+    {
+      "id": "pull-rx-throughput-not-measured",
+      "question": "不同 baudrate、主機排程與大量非檔案 RX 下，250 ms 分段收集是否能持續快於 RX 視窗被填滿？",
+      "impact": "原始碼揭露慢於 RX 的遺失風險；本頁不提供吞吐或大型檔案成功率的量測。"
+    },
+    {
+      "id": "python-baseline-not-compared",
+      "question": "僅逐步對照 sw_core/uart_io.py 的 echo 等待（Python 每 10 ms 輪詢，Rust 等 RX／期限／取消喚醒）；另檢視 Python 傳輸入口與 daemon／RPC 停機程式，但未完成其 handler 等待保證的交叉驗證，其餘步驟沒有逐步比對 Python 0.4.x。",
+      "impact": "除 echo-ack 的明示差異外，其他步驟僅描述 Rust；未標差異不代表與 Python 0.4.x 相同，也不採 issue 歷史敘述替代本頁證據。"
+    }
+  ],
+  "conflicts": []
+}
