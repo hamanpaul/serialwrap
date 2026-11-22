@@ -1,0 +1,775 @@
+{
+  "acceptance": {
+    "effective_content": {
+      "authority": "發版長跑門檻唯一來源（spec §15.11.4、§14.2、OD-09、OD-94、OD-103）；其他前端不得維護另一份數值",
+      "counting": {
+        "definitions": {
+          "accepted": "submitted - expected_rejects",
+          "bg_lost": "kind == bg_lost（產品 history 淘汰前測試端未取得結果；不是終態，該 pair 計入 unresolved，並使 background_result_coverage 判 INSUFFICIENT_EVIDENCE）",
+          "completed": "kind == done，或 kind == bg_result 且 status == done（background 以執行期收斂即時寫入的 bg_result 為準；submit_accepted 不算完成；bg_lost 不算完成）",
+          "effective_duration_s": "events stop.t - start.t，扣除 observer 判定該板非 READY 的確定區間（兩端樣本皆非 READY）；逐板計算",
+          "effective_hour": "effective_duration_s / 3600（逐板）；throughput = completed / effective_hour",
+          "error_rate": "(unexpected_errors + unresolved) / accepted",
+          "expected_rejects": "kind in expected_reject_kinds，或 kind == error 且 error_code/detail 屬 expected_reject_error_codes，或 mode 的 expected_reject_by_mode[mode] 含 error_code/detail（OD-103：interactive 的 SESSION_BUSY 為預期拒絕）",
+          "submitted": "kind == submit",
+          "unexpected_errors": "kind == error 且非 expected reject；加上 kind == bg_result 且 status ∈ {error, canceled}；加上 worker_error（每個 (source, round) 至多計 1 次）",
+          "unresolved": "submit 之後同 (source, round) 沒有 done／error／busy／worker_error／bg_result 終態（bg_lost、bg_slow、bg_poll_error、bg_drain 都不是終態；已計入 worker_error 的 pair 不再計 unresolved，避免分子重複）"
+        },
+        "expected_reject_by_mode": {
+          "interactive": [
+            "SESSION_BUSY"
+          ]
+        },
+        "expected_reject_error_codes": [
+          "SESSION_INTERACTIVE_BUSY"
+        ],
+        "expected_reject_kinds": [
+          "busy"
+        ],
+        "frozen_at": "2026-10-15T00:00:00+00:00",
+        "pair_key": [
+          "source",
+          "round"
+        ],
+        "status": "frozen",
+        "unresolved_policy": "count_as_unexpected_error",
+        "worker_error_policy": "count_as_unexpected_error"
+      },
+      "evidence": {
+        "context_time_tolerance_s": 2.0,
+        "require_engine_report": true,
+        "require_fault_retention_attestation": true,
+        "require_observer": true,
+        "require_pinned_cli": true,
+        "require_wal_dir": true,
+        "require_windows_exclusive_evidence": true
+      },
+      "liveness": {
+        "frozen_at": "2026-10-15T00:00:00+00:00",
+        "pid_generation_change": 0,
+        "status": "frozen",
+        "unexpected_daemon_exit": 0,
+        "unexpected_restart": 0,
+        "worker_heartbeat_max_gap_s": 600
+      },
+      "owner_decisions": [
+        "OD-09",
+        "OD-10",
+        "OD-13",
+        "OD-94",
+        "OD-103",
+        "OD-107"
+      ],
+      "revision": "2026-11-21.1",
+      "safety": {
+        "allowed_tx_source_regex": "^(agent:rhw[0-9]+|human:[A-Za-z0-9._:-]+|system|system:[a-z_]+)$",
+        "cross_context_replay": 0,
+        "dangerous_auto_resend": 0,
+        "forbidden_double_holder": 0,
+        "frozen_at": "2026-10-15T00:00:00+00:00",
+        "status": "frozen",
+        "unauthorized_tx": 0,
+        "waivable": false
+      },
+      "schema_version": 1,
+      "thresholds": {
+        "comparison_uncertainty": {
+          "approved_by": "hamanpaul",
+          "baseline_evidence": {
+            "linux": {
+              "artifact_path": "evidence/stage0/baseline/linux/release-gate.json",
+              "item_id": "S0-L3-BASELINE-LINUX-48H",
+              "sha256": "ef3deac32cbbb2a85ede8ae7c62d72671f5b312da6ec5cdcd346606d3ad28c8e"
+            },
+            "windows": {
+              "artifact_path": "evidence/stage0/baseline/windows/release-gate.json",
+              "item_id": "S0-L3-BASELINE-WINDOWS-48H",
+              "sha256": "8543e5a196f4f998e97c5987b00f539ef61e2dd94a5978ffb852036e07b995df"
+            }
+          },
+          "decision": "OD-09",
+          "decision_id": "OD-109",
+          "freeze_deadline": "同 resources",
+          "frozen_at": "2026-11-21T10:44:35+00:00",
+          "overrides": {},
+          "per_platform": {
+            "linux": {
+              "error_rate_abs_tolerance": 0.002,
+              "max_reruns": 1,
+              "stuck_s_tolerance": 300,
+              "throughput_ratio_tolerance": 0.02
+            },
+            "windows": {
+              "error_rate_abs_tolerance": 0.002,
+              "max_reruns": 1,
+              "stuck_s_tolerance": 300,
+              "throughput_ratio_tolerance": 0.02
+            }
+          },
+          "proposal_sha256": "0f7bf5d910e8c658e106b66c89981655ecee3697901862afcf60d9703d5f4cb2",
+          "status": "frozen"
+        },
+        "effective_throughput": {
+          "decision": "OD-09",
+          "frozen_at": "2026-10-15T00:00:00+00:00",
+          "granularity": [
+            "platform",
+            "board",
+            "source"
+          ],
+          "metric": "completed per effective hour",
+          "min_ratio_of_baseline": 0.95,
+          "status": "frozen"
+        },
+        "min_effective_load": {
+          "approved_by": "hamanpaul",
+          "baseline_evidence": {
+            "linux": {
+              "artifact_path": "evidence/stage0/baseline/linux/release-gate.json",
+              "item_id": "S0-L3-BASELINE-LINUX-48H",
+              "sha256": "ef3deac32cbbb2a85ede8ae7c62d72671f5b312da6ec5cdcd346606d3ad28c8e"
+            },
+            "windows": {
+              "artifact_path": "evidence/stage0/baseline/windows/release-gate.json",
+              "item_id": "S0-L3-BASELINE-WINDOWS-48H",
+              "sha256": "8543e5a196f4f998e97c5987b00f539ef61e2dd94a5978ffb852036e07b995df"
+            }
+          },
+          "decision": "OD-09",
+          "decision_id": "OD-109",
+          "freeze_deadline": "同 resources",
+          "frozen_at": "2026-11-21T10:44:35+00:00",
+          "overrides": {},
+          "per_platform": {
+            "linux": {
+              "max_idle_gap_s": 3600,
+              "min_completed_per_board_source": {
+                "COM0|agent:rhw0": 7424,
+                "COM0|agent:rhw1": 7933,
+                "COM0|agent:rhw2": 7433,
+                "COM0|agent:rhw3": 7926,
+                "COM1|agent:rhw0": 7944,
+                "COM1|agent:rhw1": 7849,
+                "COM1|agent:rhw2": 7948,
+                "COM1|agent:rhw3": 7845
+              }
+            },
+            "windows": {
+              "max_idle_gap_s": 3600,
+              "min_completed_per_board_source": {
+                "COM0|agent:rhw0": 10275,
+                "COM0|agent:rhw1": 10267,
+                "COM0|agent:rhw2": 10293,
+                "COM0|agent:rhw3": 10269
+              }
+            }
+          },
+          "proposal_sha256": "0f7bf5d910e8c658e106b66c89981655ecee3697901862afcf60d9703d5f4cb2",
+          "status": "frozen"
+        },
+        "resources": {
+          "approved_by": "hamanpaul",
+          "baseline_evidence": {
+            "linux": {
+              "artifact_path": "evidence/stage0/baseline/linux/release-gate.json",
+              "item_id": "S0-L3-BASELINE-LINUX-48H",
+              "sha256": "ef3deac32cbbb2a85ede8ae7c62d72671f5b312da6ec5cdcd346606d3ad28c8e"
+            },
+            "windows": {
+              "artifact_path": "evidence/stage0/baseline/windows/release-gate.json",
+              "item_id": "S0-L3-BASELINE-WINDOWS-48H",
+              "sha256": "8543e5a196f4f998e97c5987b00f539ef61e2dd94a5978ffb852036e07b995df"
+            }
+          },
+          "decision": "OD-09",
+          "decision_id": "OD-109",
+          "freeze_deadline": "OD-94：Stage 0 修正後 Python 每平台 24h 基線完成後、任何 Rust 候選長跑開始前",
+          "frozen_at": "2026-11-21T10:44:35+00:00",
+          "overrides": {},
+          "per_platform": {
+            "linux": {
+              "rss_peak_kb": 40390,
+              "rss_slope_kb_per_h": 256,
+              "rss_steady_kb": 40325
+            },
+            "windows": {
+              "rss_peak_kb": 48005,
+              "rss_slope_kb_per_h": 256,
+              "rss_steady_kb": 38585
+            }
+          },
+          "proposal_sha256": "0f7bf5d910e8c658e106b66c89981655ecee3697901862afcf60d9703d5f4cb2",
+          "status": "frozen"
+        },
+        "stuck_attached": {
+          "bounds_rule": "候選上界 ≤ 基線下界 → PASS；候選下界 > 基線上界 → FAIL；其餘 INSUFFICIENT_EVIDENCE",
+          "decision": "OD-09",
+          "frozen_at": "2026-10-15T00:00:00+00:00",
+          "granularity": [
+            "platform",
+            "board"
+          ],
+          "longest_s": "not_higher_than_baseline",
+          "status": "frozen",
+          "total_s": "not_higher_than_baseline"
+        },
+        "unexpected_cmd_error_rate": {
+          "decision": "OD-09",
+          "frozen_at": "2026-10-15T00:00:00+00:00",
+          "granularity": [
+            "platform",
+            "board",
+            "source"
+          ],
+          "max_ratio": 0.01,
+          "relative": "not_higher_than_baseline",
+          "status": "frozen"
+        }
+      },
+      "workload": {
+        "allow_segment_stitching": false,
+        "engine_case": "lr-mixed",
+        "engine_files": [
+          "realhw/cases/longrun.py"
+        ],
+        "max_observation_gap_factor": 2.0,
+        "min_continuous_duration_s": 86400,
+        "observation_gap_tolerance_s": 1.0,
+        "observer_interval_s": 10,
+        "snapshot_interval_s": 300,
+        "windows_excl_probe_interval_s": 300
+      }
+    },
+    "git_blob_sha1": "f7db65aaf41b8d6a59d46ded41d474bfaba4c57d",
+    "path": "realhw/acceptance/longrun_acceptance.yaml",
+    "revision": "2026-11-21.1",
+    "sha256": "e647d9080b8d19c66e78d9aff3e9d4379a2db6aaa3a2f278704d28389be5efe7",
+    "workload_contract_sha256": "0494ffe96326225c9c6e9027574674d293b5da0899436f5c0f5fb214fc1aabc0"
+  },
+  "baseline_result": null,
+  "checks": [
+    {
+      "detail": {
+        "problems": []
+      },
+      "group": "evidence",
+      "id": "evidence_parse",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "id": "lr-mixed"
+      },
+      "group": "evidence",
+      "id": "engine_report_present",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "pinned": true
+      },
+      "group": "evidence",
+      "id": "pinned_cli",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "verdict": "FAIL"
+      },
+      "group": "engine",
+      "id": "engine_verdict",
+      "result": "FAIL",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "gaps": [
+          {
+            "from_t": 67181.281212,
+            "source": "observer",
+            "to_t": 68125
+          },
+          {
+            "from_t": 66925,
+            "source": "snapshots",
+            "to_t": 68125
+          }
+        ]
+      },
+      "group": "evidence",
+      "id": "observation_gaps",
+      "result": "INSUFFICIENT_EVIDENCE",
+      "status": "evaluated"
+    },
+    {
+      "detail": {},
+      "group": "evidence",
+      "id": "pre_frozen",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {},
+      "group": "evidence",
+      "id": "frozen_after_baseline",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "auto_restart_disabled": true
+      },
+      "group": "evidence",
+      "id": "fault_retention_attested",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "gaps": [],
+        "missing": [],
+        "premature_stop": [
+          "agent:rhw0",
+          "agent:rhw1",
+          "agent:rhw2",
+          "agent:rhw3",
+          "bg_resolver",
+          "human",
+          "orchestrator"
+        ]
+      },
+      "group": "evidence",
+      "id": "worker_liveness",
+      "result": "INSUFFICIENT_EVIDENCE",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "bg_backpressure_s": 0,
+        "bg_drain_remaining": 0,
+        "bg_lost": 0,
+        "bg_slow": 0
+      },
+      "group": "evidence",
+      "id": "background_result_coverage",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "duration_s": 68125,
+        "reason": "too_short",
+        "sigint": false,
+        "starts": 1,
+        "stops": 1
+      },
+      "group": "integrity",
+      "id": "continuous_duration",
+      "result": "FAIL",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "records": 276660
+      },
+      "group": "safety",
+      "id": "safety_unauthorized_tx",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "events": 0,
+        "gaps": [
+          {
+            "com": "COM0",
+            "from_t": 67444.711212,
+            "to_t": 67825
+          }
+        ],
+        "holder_unknown_samples": 0,
+        "reason": "probe_gap"
+      },
+      "group": "safety",
+      "id": "safety_double_holder",
+      "result": "INSUFFICIENT_EVIDENCE",
+      "status": "evaluated"
+    },
+    {
+      "detail": {},
+      "group": "safety",
+      "id": "safety_cross_context_replay",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {},
+      "group": "safety",
+      "id": "safety_dangerous_auto_resend",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {},
+      "group": "liveness",
+      "id": "liveness_daemon_exit",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "changes": 0
+      },
+      "group": "liveness",
+      "id": "liveness_restart",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "limit": 0.01,
+        "rates": {
+          "*": 6.216585851050602e-05,
+          "COM0|agent:rhw0": 0.0,
+          "COM0|agent:rhw1": 0.00012401562596887208,
+          "COM0|agent:rhw2": 0.0,
+          "COM0|agent:rhw3": 0.00012454851164528583
+        }
+      },
+      "group": "load",
+      "id": "error_rate_absolute",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "keys": [
+          "COM0|agent:rhw0",
+          "COM0|agent:rhw1",
+          "COM0|agent:rhw2",
+          "COM0|agent:rhw3"
+        ]
+      },
+      "group": "load",
+      "id": "min_effective_load",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "limits": {
+          "rss_peak_kb": 48005,
+          "rss_slope_kb_per_h": 256,
+          "rss_steady_kb": 38585
+        },
+        "over": [],
+        "stats": {
+          "expected_last_24h": 288,
+          "first_kb": 11816,
+          "last_kb": 34020,
+          "peak_kb": 35396.0,
+          "slope_kb_per_h": 31.938662247113236,
+          "steady_kb": 33906.0,
+          "valid_last_24h": 224
+        }
+      },
+      "group": "resources",
+      "id": "resources",
+      "result": "INSUFFICIENT_EVIDENCE",
+      "status": "evaluated"
+    },
+    {
+      "detail": {},
+      "group": "evidence",
+      "id": "baseline_compatible",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "tolerance": {
+          "error_rate_abs_tolerance": 0.002,
+          "max_reruns": 1,
+          "stuck_s_tolerance": 300,
+          "throughput_ratio_tolerance": 0.02
+        }
+      },
+      "group": "relative",
+      "id": "comparison_uncertainty",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "*": {
+          "baseline": 0.0,
+          "candidate": 6.216585851050602e-05,
+          "result": "INSUFFICIENT_EVIDENCE"
+        },
+        "COM0|agent:rhw0": {
+          "baseline": 0.0,
+          "candidate": 0.0,
+          "result": "PASS"
+        },
+        "COM0|agent:rhw1": {
+          "baseline": 0.0,
+          "candidate": 0.00012401562596887208,
+          "result": "INSUFFICIENT_EVIDENCE"
+        },
+        "COM0|agent:rhw2": {
+          "baseline": 0.0,
+          "candidate": 0.0,
+          "result": "PASS"
+        },
+        "COM0|agent:rhw3": {
+          "baseline": 0.0,
+          "candidate": 0.00012454851164528583,
+          "result": "INSUFFICIENT_EVIDENCE"
+        }
+      },
+      "group": "relative",
+      "id": "error_rate_relative",
+      "result": "INSUFFICIENT_EVIDENCE",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "COM0|agent:rhw0": {
+          "ratio": 0.9908814094628757,
+          "result": "PASS"
+        },
+        "COM0|agent:rhw1": {
+          "ratio": 0.9959635529526772,
+          "result": "PASS"
+        },
+        "COM0|agent:rhw2": {
+          "ratio": 0.992092358840113,
+          "result": "PASS"
+        },
+        "COM0|agent:rhw3": {
+          "ratio": 0.9915086106666452,
+          "result": "PASS"
+        }
+      },
+      "group": "relative",
+      "id": "throughput_relative",
+      "result": "PASS",
+      "status": "evaluated"
+    },
+    {
+      "detail": {
+        "COM0|longest": {
+          "baseline": [
+            0.0,
+            0.0
+          ],
+          "candidate": [
+            0.0,
+            0.0
+          ],
+          "result": "PASS"
+        },
+        "COM0|total": {
+          "baseline": [
+            0.0,
+            0.0
+          ],
+          "candidate": [
+            0.0,
+            0.0
+          ],
+          "result": "PASS"
+        }
+      },
+      "group": "relative",
+      "id": "stuck_relative",
+      "result": "PASS",
+      "status": "evaluated"
+    }
+  ],
+  "counts": {
+    "*": {
+      "accepted": 64344,
+      "bg_lost": 0,
+      "completed": 64340,
+      "effective_hour": 18.92361111111111,
+      "error_rate": 6.216585851050602e-05,
+      "expected_rejects": 1843,
+      "failed": 2,
+      "submitted": 66187,
+      "unexpected_errors": 2,
+      "unresolved": 2
+    },
+    "COM0|agent:rhw0": {
+      "accepted": 16056,
+      "bg_lost": 0,
+      "completed": 16056,
+      "effective_hour": 18.92361111111111,
+      "error_rate": 0.0,
+      "expected_rejects": 467,
+      "failed": 0,
+      "submitted": 16523,
+      "throughput_per_h": 848.4638532110092,
+      "unexpected_errors": 0,
+      "unresolved": 0
+    },
+    "COM0|agent:rhw1": {
+      "accepted": 16127,
+      "bg_lost": 0,
+      "completed": 16125,
+      "effective_hour": 18.92361111111111,
+      "error_rate": 0.00012401562596887208,
+      "expected_rejects": 451,
+      "failed": 1,
+      "submitted": 16578,
+      "throughput_per_h": 852.1100917431193,
+      "unexpected_errors": 1,
+      "unresolved": 1
+    },
+    "COM0|agent:rhw2": {
+      "accepted": 16103,
+      "bg_lost": 0,
+      "completed": 16103,
+      "effective_hour": 18.92361111111111,
+      "error_rate": 0.0,
+      "expected_rejects": 457,
+      "failed": 0,
+      "submitted": 16560,
+      "throughput_per_h": 850.9475229357798,
+      "unexpected_errors": 0,
+      "unresolved": 0
+    },
+    "COM0|agent:rhw3": {
+      "accepted": 16058,
+      "bg_lost": 0,
+      "completed": 16056,
+      "effective_hour": 18.92361111111111,
+      "error_rate": 0.00012454851164528583,
+      "expected_rejects": 468,
+      "failed": 1,
+      "submitted": 16526,
+      "throughput_per_h": 848.4638532110092,
+      "unexpected_errors": 1,
+      "unresolved": 1
+    }
+  },
+  "created_at": "2026-11-22T08:41:14+00:00",
+  "engine_result": {
+    "category": "test",
+    "duration_s": 68126.93699999992,
+    "evidence": {
+      "analysis": "lr-mixed\\longrun-analysis.md",
+      "events": "lr-mixed\\events.ndjson",
+      "snapshots": "lr-mixed\\snapshots.ndjson"
+    },
+    "reason": "重大事件：both_boards_stuck@t=68125s；板卡長時間非 READY（≥900s）：[{'com': 'COM0', 'from_t': 67225, 'to_t': 68125, 'duration_s': 900}]",
+    "reason_code": "both_boards_stuck",
+    "verdict": "FAIL"
+  },
+  "evidence_hashes": {
+    "events.ndjson": "637dd8b5d11442fbd48b0d9ec148e2e468c3e9e51821d945a27262f09bbf7f38",
+    "observer.ndjson": "f835a7ad7a6deebba743e6e6490183d0556b862c96c2f385f4d3cd4993e9c06e",
+    "report.json": "b562692ba9d13a68eb8886e08588c51c39e4a9404feda77af56fc624430189dc",
+    "snapshots.ndjson": "de1c7a7fc9245f4d913da647770f3960c2abac3762a67f6d62dd415523192b4c",
+    "wal": {
+      "raw.mirror.log": "fc21a54e1bb4d1f2c73b50faec954cd55c02800ae074c5ef63ca57ea2c4dcc16",
+      "raw.wal.ndjson": "3dac1d20da08ef56947f98e3e35e1bc7f8d63b522f957f57e3d8454abc42e37f",
+      "raw.wal.ndjson.20261122-043344": "538b858c11c67e13381f86aa783ffc7d8b53b002866a4a7f106625dfa225880a"
+    }
+  },
+  "excl_evidence_hashes": {
+    "handoff.ndjson": "8aa77b275900dd2f8c8d0df4cc3e099715e3a0affefe88534d09beb9eb21b66f",
+    "probes.ndjson": "7f30b747176323c64d722b650a793741fd72631b904f0f0ab3438e00e5de55d8"
+  },
+  "mode": "candidate",
+  "platform": "windows",
+  "release_gate_result": "FAIL",
+  "run": {
+    "cases_yaml_sha256": "6d26ac8993a3ba7df567f56b0ea348e7e239ab537d933fd3b22c633b824c190c",
+    "cli_identity": {
+      "configured": "C:\\Users\\haman\\AppData\\Local\\Temp\\sw-rc1-bundle-20261121\\serialwrap-0.5.0-windows-x86_64\\versions\\0.5.0\\bin\\serialwrap.exe",
+      "pinned": true,
+      "resolved": "C:\\Users\\haman\\AppData\\Local\\Temp\\sw-rc1-bundle-20261121\\serialwrap-0.5.0-windows-x86_64\\versions\\0.5.0\\bin\\serialwrap.exe",
+      "sha256": "a26bb73ac31071a9722d1c4786c80da666ac97b8340c029fc2e4049e27c4ff4c"
+    },
+    "contract_revision": null,
+    "daemon_version": "0.5.0",
+    "deployed_content": {
+      "daemon_live": [
+        {
+          "error": null,
+          "image_path": "C:\\Users\\haman\\AppData\\Local\\Temp\\sw-rc1-bundle-20261121\\serialwrap-0.5.0-windows-x86_64\\versions\\0.5.0\\bin\\serialwrapd.exe",
+          "image_sha256": "328cccd04d31875db46219263c9fe2875d0aa6348d2915f3ad15c7b21d9c8699",
+          "in_install": false,
+          "pid": 15720
+        }
+      ],
+      "end": {
+        "bundle_tree_sha256": null,
+        "cli_configured": "C:\\Users\\haman\\AppData\\Local\\Temp\\sw-rc1-bundle-20261121\\serialwrap-0.5.0-windows-x86_64\\versions\\0.5.0\\bin\\serialwrap.exe",
+        "cli_resolved": "C:\\Users\\haman\\AppData\\Local\\Temp\\sw-rc1-bundle-20261121\\serialwrap-0.5.0-windows-x86_64\\versions\\0.5.0\\bin\\serialwrap.exe",
+        "cli_sha256": null,
+        "daemon_configured": null,
+        "daemon_resolved": null,
+        "daemon_sha256": null,
+        "entry_dir_sha256": null,
+        "error": "unresolved",
+        "install_dir": null,
+        "measured_at": "2026-11-22T05:45:03.865329+00:00",
+        "release_manifest_sha256": null,
+        "runtime_tree_sha256": null,
+        "schema_version": "deployed-content.v1"
+      },
+      "start": {
+        "bundle_tree_sha256": null,
+        "cli_configured": "C:\\Users\\haman\\AppData\\Local\\Temp\\sw-rc1-bundle-20261121\\serialwrap-0.5.0-windows-x86_64\\versions\\0.5.0\\bin\\serialwrap.exe",
+        "cli_resolved": "C:\\Users\\haman\\AppData\\Local\\Temp\\sw-rc1-bundle-20261121\\serialwrap-0.5.0-windows-x86_64\\versions\\0.5.0\\bin\\serialwrap.exe",
+        "cli_sha256": null,
+        "daemon_configured": null,
+        "daemon_resolved": null,
+        "daemon_sha256": null,
+        "entry_dir_sha256": null,
+        "error": "unresolved",
+        "install_dir": null,
+        "measured_at": "2026-11-21T10:49:33.081237+00:00",
+        "release_manifest_sha256": null,
+        "runtime_tree_sha256": null,
+        "schema_version": "deployed-content.v1"
+      }
+    },
+    "duration_s": 68125.0,
+    "ended_at_utc": "2026-11-22T05:44:57.552856+00:00",
+    "engine_files_sha256": {
+      "realhw/cases/longrun.py": "ee4fc30d734748aaba8f2834749737ae05715115c642b53ec075a4eca95a7b58"
+    },
+    "started_at_utc": "2026-11-21T10:49:33.079871+00:00"
+  },
+  "schema_version": "release-gate.v1",
+  "stuck": {
+    "COM0": {
+      "longest_lower_s": 0,
+      "longest_upper_s": 0,
+      "segments": [],
+      "total_lower_s": 0,
+      "total_upper_s": 0
+    }
+  },
+  "walscan": {
+    "context_missing": false,
+    "cross_context_replay": [],
+    "dangerous_auto_resend": [],
+    "files": [
+      "raw.wal.ndjson.20261122-043344",
+      "raw.wal.ndjson"
+    ],
+    "loss_flags": [],
+    "problems": [],
+    "records": 276660,
+    "rotation_failed": [],
+    "unauthorized_tx": [],
+    "uncertain": []
+  }
+}

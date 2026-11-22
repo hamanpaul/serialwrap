@@ -25,6 +25,9 @@ secret_scan:
     # 安裝路徑（測試機使用者 home 下的 serialwrap 安裝目錄），不含帳密。檔案雜湊被凍結提案、證據索引與門檻檔
     # 三處釘住，不得改寫內容；擁有者 2026-11-21 同意放行（OD-109）。
     - "evidence/stage0/baseline/**"
+    # rc.1 候選長跑判定檔（release-gate.json）與 OD-110 重算原文：記錄實機長跑當時受測 CLI／daemon 的實際安裝
+    # 路徑（測試機使用者目錄），不含帳密；雜湊由 OD-110 紀錄與證據 README 釘住，不得改寫；擁有者 2026-11-22 同意放行（OD-110）。
+    - "evidence/stage2/longrun/**"
 code_paths:
   - "sw_core/**"
   - "tools/**"

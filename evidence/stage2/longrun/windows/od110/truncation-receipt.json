@@ -1,0 +1,46 @@
+{
+ "cutoff": "2026-11-22T05:29:16+00:00",
+ "excluded_event_kinds": [
+  "bg_result",
+  "busy",
+  "done",
+  "error",
+  "submit",
+  "submit_accepted",
+  "tick"
+ ],
+ "lr-mixed/events.ndjson": {
+  "dropped": 5726,
+  "dst_sha256": "637dd8b5d11442fbd48b0d9ec148e2e468c3e9e51821d945a27262f09bbf7f38",
+  "kept": 154075,
+  "src_lines": 159801,
+  "src_sha256": "6dbeefe685f2f8744faaa29dea2bc0752019707975078a64e0f26678d6c0a156"
+ },
+ "lr-mixed/longrun-analysis.md": {
+  "copied_unchanged": true,
+  "sha256": "58aafba9bf1079a13cabdb3fe6748c2f8b00af137297b827c04024bbfd9cef8b"
+ },
+ "lr-mixed/snapshots.ndjson": {
+  "dropped": 4,
+  "dst_sha256": "de1c7a7fc9245f4d913da647770f3960c2abac3762a67f6d62dd415523192b4c",
+  "kept": 224,
+  "src_lines": 228,
+  "src_sha256": "3c879aa65ce054cec138df1a2b836af97923fbd8110ff9d550a0a30c5a9ba50b"
+ },
+ "observer.ndjson": {
+  "dropped": 1137,
+  "dst_sha256": "f835a7ad7a6deebba743e6e6490183d0556b862c96c2f385f4d3cd4993e9c06e",
+  "kept": 6726,
+  "src_lines": 7863,
+  "src_sha256": "cc89e90ea9826f2d37056d0a8ec2914c1d4e67a9aa41ccdfc8c9258870e1af74"
+ },
+ "report.json": {
+  "copied_unchanged": true,
+  "sha256": "b562692ba9d13a68eb8886e08588c51c39e4a9404feda77af56fc624430189dc"
+ },
+ "supervision-attest.json": {
+  "copied_unchanged": true,
+  "sha256": "7be0d0cd8a6810d4e4d60e7c98c75e6123fd95a5624642b18dc0b15188554167"
+ },
+ "window_end": "2026-11-22T05:44:58.842000+00:00"
+}
