@@ -92,16 +92,17 @@ def test_serialwrap_does_not_invent_cortex_roles():
     assert not [name for name in ("CommandArbiter", "UARTBridge", "execute_command", "SerialwrapService") if name in shown]
     assert "委派集合為空" in nodes["cli"]["responsibility"]
     assert [c["resolution"]["state"] for c in facts["conflicts"] if c["id"] == "bundle-python-fields"] == ["resolved"]
-    # 四個真實的行程／函式庫／外部邊界；每個元件至多屬於一個邊界，profiles 不屬於任何邊界。
+    # 四個真實的行程／函式庫／外部邊界；每個元件恰好屬於一個邊界（profiles 依原始碼歸 daemon，見 conflicts）。
     bounds = {b["id"]: b for b in facts["boundaries"]}
     assert set(bounds) == {"daemon-process", "external", "pal-layer", "user-side"}
     assert all(b["kind"] == "region" for b in facts["boundaries"])
     assert set(bounds["user-side"]["wraps"]) == {"cli", "human"}
     assert set(bounds["external"]["wraps"]) == {"target", "flasher", "event-handler"}
     assert set(bounds["pal-layer"]["wraps"]) == PAL_NODES
-    assert {"service", "bridge", "state-store", "wal", "watcher"} <= set(bounds["daemon-process"]["wraps"])
+    assert {"service", "bridge", "state-store", "wal", "watcher", "profiles"} <= set(bounds["daemon-process"]["wraps"])
     wrapped = [w for b in facts["boundaries"] for w in b["wraps"]]
-    assert len(wrapped) == len(set(wrapped)) and set(nodes) - set(wrapped) == {"profiles"}
+    assert len(wrapped) == len(set(wrapped)) and set(wrapped) == set(nodes)
+    assert [c["resolution"]["state"] for c in facts["conflicts"] if c["id"] == "profiles-ownership"] == ["resolved"]
     assert [b["label"] for b in ir["boundaries"]] == [b["label"] for b in facts["boundaries"]]
     # 平台差異「Linux｜Windows」只寫在平台層節點的 sublabel；每個平台能力都至少被一個元件使用。
     for identity, node in nodes.items():

@@ -21,14 +21,14 @@
 | 邊界 | 成員 | 依據 |
 |---|---|---|
 | 使用者端 | CLI／Agent、Human console | CLI 是使用者或 agent 啟動的 `serialwrap` 行程；人工終端程式經 daemon 交出的 PTY slave 或 127.0.0.1 端點接入 |
-| serialwrapd（daemon 行程） | Service、命令排程、命令執行、UART bridge、SessionManager、Session actor、TX Fence、ConsoleHub、互動租約、Timeout／Recovery、Command records、BackgroundCapture、file.push／pull、Flash／交接、Event Engine、DeviceWatcher、serialwrapd 主流程、state.json、WAL／mirror | `serialwrapd` 執行檔內的元件 |
+| serialwrapd（daemon 行程） | Service、命令排程、命令執行、UART bridge、SessionManager、Session actor、TX Fence、ConsoleHub、互動租約、Timeout／Recovery、Command records、BackgroundCapture、file.push／pull、Flash／交接、Event Engine、DeviceWatcher、serialwrapd 主流程、Profiles／契約、state.json、WAL／mirror | `serialwrapd` 執行檔內的元件 |
 | 平台層 sw-pal（CLI 與 daemon 共用的函式庫） | 序列埠、RPC transport、console 端點、實例鎖、裝置來源、檔案層／行程掃描 | 平台相依 cfg 只出現在 sw-pal，兩個執行檔都以 `sw_pal::native_client()` 組出 Platform |
 | 外部 | UART／DUT、外部 flasher、外部 handler | serialwrap 以外的裝置與程式 |
 
 歸屬有疑義的元件依原始碼判斷，理由寫在各元件的 `responsibility`：
 
 - **state.json、WAL／mirror 畫在 daemon 邊界內**：節點代表 daemon 行程內唯一的寫入者（`StateStore` 執行緒、`WalWriter`）與它們獨占寫入的檔案；檔案 I/O 經平台層的檔案層。
-- **Profiles 不在任何邊界內**：profile YAML 是 daemon 啟動時讀取的設定檔，不屬於任何行程或函式庫。
+- **Profiles／契約畫在 daemon 邊界內**：節點代表 serialwrapd 啟動時以 `load_profiles` 載入、交給 SessionManager 套用的 profile 集合。CLI 的 `profile test` 也會離線讀同一份 YAML 做 regex 檢查，但不參與執行期，不畫成關係；兩邊的來源與裁定記在 `facts.json` 的 `conflicts`（`profiles-ownership`）。
 - **DeviceWatcher 畫在 daemon 邊界內**：程式碼位於 sw-pal（`device_watcher.rs`），但它是 daemon 啟動的執行緒、本身沒有平台差異；平台相依的掃描在平台層的「裝置來源」。
 
 和 Python 版不同的地方照 Rust 原始碼畫：
@@ -62,14 +62,14 @@ flash 的 `/dev/ttyMCU` 端點只在 Linux；Windows 由外部工具走 device r
 
 - 來源 revision 改釘 `12eb9a0e`，每條 evidence 重新核對：185 條內容與行號不變、19 條內容不變只移了行號、6 條因 issue 282 內容改變而重寫（`FenceState`、`Fence::admit`、`FenceSubmitGate`、停止序步驟 3～5）。
 - 新增四個邊界（前一版沒有邊界）。
-- `pal`（sw-pal 平台後端）依原始碼拆成 `pal-serial`、`pal-rpc`、`pal-console`、`pal-lock`、`pal-devices`、`pal-files` 六個節點（平台能力的身分改變，依「Preserve stable IDs」改用新 id，舊 id 不再出現）；原本的 `pal-to-daemon-main`（native() 後端）由八條「使用者 → 平台能力」的關係取代：`bridge-to-pal-serial`、`cli-to-pal-rpc`、`daemon-main-to-pal-rpc`、`sessions-to-pal-console`、`daemon-main-to-pal-lock`、`watcher-to-pal-devices`、`state-store-to-pal-files`、`wal-to-pal-files`。`flasher-to-handoff` 的標籤由「sync bytes｜release」改為「sync bytes／release」（「｜」只用於 Linux｜Windows）。
-- 其他元件 id 都保留；`service`、`bridge`、`console-hub`、`daemon-main`、`watcher`、`human`、`flasher` 的 sublabel 拿掉平台字樣。
+- `pal`（sw-pal 平台後端）依原始碼拆成 `pal-serial`、`pal-rpc`、`pal-console`、`pal-lock`、`pal-devices`、`pal-files` 六個節點（平台能力的身分改變，依「Preserve stable IDs」改用新 id，舊 id 不再出現）；原本的 `pal-to-daemon-main`（native() 後端）由九條「使用者 → 平台能力」的關係取代：`bridge-to-pal-serial`、`cli-to-pal-rpc`、`cli-to-pal-files`、`daemon-main-to-pal-rpc`、`sessions-to-pal-console`、`daemon-main-to-pal-lock`、`watcher-to-pal-devices`、`state-store-to-pal-files`、`wal-to-pal-files`。RpcServer 在 listener 上 accept、ConsoleHub 以 console 能力建立多工也是事實，寫在平台層節點的 responsibility；圖上以實際 bind listener 的 serialwrapd 主流程、實際建 PTY 的 SessionManager 為箭頭起點（加這兩條會讓線穿過其他節點，v3.2.0 無法排出）。`flasher-to-handoff` 的標籤由「sync bytes｜release」改為「sync bytes／release」（「｜」只用於 Linux｜Windows）。
+- 其他元件 id 都保留；`service`、`bridge`、`console-hub`、`daemon-main`、`watcher`、`human`、`flasher` 的 sublabel 拿掉平台字樣；`profiles` 的 type 由 external 改為 database（daemon 載入的設定資料），並歸入 daemon 邊界。新增 conflict `profiles-ownership` 記錄 daemon 載入與 CLI 離線 `profile test` 兩邊的來源與裁定。
 - `meta.title` 不再寫版本號，改為描述性標題「serialwrap 架構總覽｜命令、Session 與 UART」。
 
 ## 讀圖時已知的限制
 
-- 加上邊界與平台層後，跨邊界的長線變多。Archify 的交付回條列出 11 處交叉，全部由 Archify 以 crossover 標記解開（`properCrossings` 為 0），並建議人工看圖，不算錯誤：命令排程附近只剩 1 處（`arbiter→lease` 與 `file-transfer→execute`，前一版是 4 處）；Session 控制區 6 處（`daemon-main`、`sessions`、`state.json`、`profiles` 之間的折線與 `sessions→session-actor`、`service→sessions` 相交）；UART bridge 下方 3 處（`handoff→session-actor` 與 `bridge→pal-serial`、`bridge→wal`，以及 `session-actor→bridge` 與 `session-actor→fence`）；另 1 處是 `bridge→session-actor` 與 `session-actor→bridge` 這一對往返線彼此相交。命令紀錄類節點（Command records、Timeout／Recovery、file.push／pull）放在主線上方，Session 控制放在主線下方、緊鄰平台層。人工終端與 ConsoleHub 之間的兩條線從使用者端繞過 daemon 邊界上方。
-- 圖比前一版寬（31 個節點、4 個邊界），1440×900 時最小的節點文字約 6.3 px（Archify 的 desktop-readability 檢查通過），1920×1080 以上較易閱讀；也可以把指標移到圖上用滾輪放大。
+- 加上邊界與平台層後，跨邊界的長線變多。Archify 的交付回條列出 16 處交叉（前一版是 3 處加 1 處回條不計的），全部由 Archify 以 crossover 標記解開（`properCrossings` 為 0），並建議人工看圖，不算錯誤：命令排程附近 4 處（`arbiter→lease` 與 `execute→recovery`、`file-transfer→execute`；`daemon-main→service` 與 `arbiter→command-records`、`command-records→service`）；Session 控制與平台層之間 6 處（`daemon-main`、`sessions`、`watcher`、`state.json` 的折線與往平台層的線相交）；UART bridge 周圍 4 處（`handoff→session-actor` 與 `bridge→pal-serial`、`bridge→wal`；`fence→bridge` 與 bridge／Session actor 的往返線）；人工終端與 ConsoleHub 的線和 file.push／pull 的兩條線 2 處。命令紀錄類節點（Command records 以外的 BackgroundCapture、Timeout／Recovery、file.push／pull）放在主線上方，Session 控制放在主線下方、緊鄰平台層；人工終端與 ConsoleHub 之間的兩條線從使用者端繞過 daemon 邊界上方，CLI 往平台層的兩條線繞過平台層下方。
+- 圖比前一版大（31 個節點、48 條關係、4 個邊界），visual-check 量到的最小投影字級：1440×900 為 6.55 px（前一版 7.52 px）、1600×1000 為 7.33 px、1920×1080 與 2048×1320 為 8 px；Archify 的 desktop-readability 檢查通過。1440 寬時可以把指標移到圖上用滾輪放大。
 - 圖下方的「節點索引」是 Archify 3.x Reader 的固定側欄，排在圖之後；第一屏是完整的圖，往下捲才是索引。
 
 ## 語言

@@ -997,9 +997,9 @@
     {
       "id": "profiles",
       "label": "Profiles／契約",
-      "type": "external",
+      "type": "database",
       "sublabel": "prompt／probe／UART",
-      "responsibility": "sw-proto 的 UartProfile／ProfileTemplate／SessionProfile 定義登入、prompt、ready_probe、UART 與 timeout，daemon 啟動時由 profile 目錄載入。它是設定契約，不是 Persona，也不是派工進度。只有非空白 ready_probe 的 template 才 command_capable。profile YAML 是 daemon 啟動時讀取的設定檔，不屬於任何行程或函式庫，因此不放在任何邊界內。",
+      "responsibility": "sw-proto 的 UartProfile／ProfileTemplate／SessionProfile 定義登入、prompt、ready_probe、UART 與 timeout，daemon 啟動時由 profile 目錄載入。它是設定契約，不是 Persona，也不是派工進度。只有非空白 ready_probe 的 template 才 command_capable。節點代表 serialwrapd 啟動時以 load_profiles 載入、交給 SessionManager 的 profile 集合；CLI 的 profile test 會離線讀同一份 YAML 做 regex 檢查，但不參與執行期，因此節點歸在 daemon 行程邊界（見 conflicts 的 profiles-ownership）。",
       "basis": "observed",
       "evidence": [
         {
@@ -1008,6 +1008,13 @@
           "end_line": 1200,
           "excerpt_sha256": "cdaa288c421f32a36f29a73624784cf8284a9166bd0897b4b29e12a92a9fc09f",
           "claim": "daemon 啟動時以 load_profiles 載入 profile 目錄。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1280,
+          "end_line": 1299,
+          "excerpt_sha256": "87a3aec7cf2917aba015e13fc771832167e8b13eb7de2063817e9408d46f3564",
+          "claim": "SessionManager 以載入的 profile（loaded、load）組裝。"
         },
         {
           "path": "crates/sw-proto/src/config_types.rs",
@@ -1369,6 +1376,7 @@
         "file-transfer",
         "handoff",
         "lease",
+        "profiles",
         "recovery",
         "service",
         "session-actor",
@@ -1749,6 +1757,30 @@
           "end_line": 851,
           "excerpt_sha256": "4e76d47ad970ae0d1cd5ea6117f0039f47c605963777fb339d0c858dbcc062ed",
           "claim": "result_tail：先問各 session 的 capture，全部查無才回退命令紀錄。"
+        }
+      ]
+    },
+    {
+      "id": "cli-to-pal-files",
+      "from": "cli",
+      "to": "pal-files",
+      "label": "掃描 daemon 行程",
+      "variant": "dashed",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 122,
+          "end_line": 128,
+          "excerpt_sha256": "1d2f271e80ca0196a9a6b73909952ce6a980f29b0f9363f7f90b6eb6393dd633",
+          "claim": "daemon start 以 procs 掃描既有 serialwrapd。"
+        },
+        {
+          "path": "crates/sw-cli/src/doctor_cmd.rs",
+          "line": 413,
+          "end_line": 418,
+          "excerpt_sha256": "1267fa7cfdae9ef66aa91626a05b36123bd0fa269655e77bc6e219de88616645",
+          "claim": "doctor 掃描本機 serialwrapd 實例。"
         }
       ]
     },
@@ -2667,6 +2699,49 @@
             "end_line": 656,
             "excerpt_sha256": "f1b42cb4a30bda4dbc3e21bc0d487254979dca638666d64c9b94323df4e612ba",
             "claim": "stage 2：保留結構相容欄位，但 implementation=rust，不使用 Python daemon entry。"
+          }
+        ]
+      }
+    },
+    {
+      "id": "profiles-ownership",
+      "subject": "Profiles／契約 歸屬哪個邊界：daemon 啟動時載入，CLI 的 profile test 也會離線讀取同一份 YAML",
+      "claims": [
+        {
+          "claim": "serialwrapd 啟動時以 load_profiles 載入 profile 目錄，交給 SessionManager 套用到各 session。",
+          "evidence": [
+            {
+              "path": "crates/sw-daemon/src/daemon_main.rs",
+              "line": 1191,
+              "end_line": 1197,
+              "excerpt_sha256": "64ec29429d91040365dd4aa829e69287270840ba4b7f3c73f0ac56edc5d2899a",
+              "claim": "daemon 以 load_profiles 載入 profile 目錄。"
+            }
+          ]
+        },
+        {
+          "claim": "CLI 的 profile test 離線呼叫同一個 load_profiles，只做 regex 檢查、不連 daemon。",
+          "evidence": [
+            {
+              "path": "crates/sw-cli/src/commands/profile_cmd.rs",
+              "line": 52,
+              "end_line": 67,
+              "excerpt_sha256": "b2a12618f72c58f13dd665d63e5667ba3b07c795bfaca1ac1f4ef9cc82fee362",
+              "claim": "profile test：load_profiles → 找 template → 讀 sample → regex 檢查。"
+            }
+          ]
+        }
+      ],
+      "resolution": {
+        "state": "resolved",
+        "decision": "總覽描述執行期；節點代表 daemon 載入並套用的 profile 集合，畫在 serialwrapd 邊界內。CLI 的 profile test 是離線工具，不畫成執行期關係。",
+        "evidence": [
+          {
+            "path": "crates/sw-daemon/src/daemon_main.rs",
+            "line": 1280,
+            "end_line": 1299,
+            "excerpt_sha256": "87a3aec7cf2917aba015e13fc771832167e8b13eb7de2063817e9408d46f3564",
+            "claim": "SessionManager 以載入的 profile 組裝。"
           }
         ]
       }

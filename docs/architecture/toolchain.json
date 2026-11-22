@@ -21,10 +21,10 @@
       "html": "architecture.html",
       "overlay_version": 1,
       "sha256": {
-        "facts": "7b55c2d00c36a288f33f5ef7fa3ee73f0fcb6903137043594c287c0ea3c58e2b",
-        "ir": "176dc9e5e40f7c9a71be455d6a1d1c319675653fe96383f44e03f8fda72aae50",
-        "delivery": "78d773e353c1ea9485b46306557950a5a95f3fbb77623da048f11c8598816641",
-        "html": "325f944cce5550332ebad7c657c8f59c8f13e49aa29e72aebcbdfdc80c86427a"
+        "facts": "f6e695feae8a540d76e7075502ec5fae274f1b7173d24d26a9dbb9f3123432e9",
+        "ir": "c427f6e4e4f1cd976985a52c130cbe20c9017c841b32fd9cfd959da3514eb614",
+        "delivery": "5a5bb73e5d20b01681b4b19a6e27cadf37c02f6d5564402ce4cd3d94ca7b9898",
+        "html": "483faa7a1f1170446768e0f9dc095aba7bc9ae5637a9be09811c48db99f744c1"
       }
     }
   }

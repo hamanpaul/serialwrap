@@ -99,7 +99,7 @@
       ],
       "pos": [
         407,
-        410
+        150
       ],
       "size": [
         134,
@@ -161,7 +161,7 @@
       ],
       "pos": [
         407,
-        150
+        410
       ],
       "size": [
         134,
@@ -409,7 +409,7 @@
       ],
       "pos": [
         1453,
-        40
+        540
       ],
       "size": [
         134,
@@ -533,7 +533,7 @@
       ],
       "pos": [
         263,
-        700
+        688
       ],
       "size": [
         134,
@@ -563,8 +563,8 @@
         }
       ],
       "pos": [
-        407,
-        700
+        695,
+        688
       ],
       "size": [
         134,
@@ -595,7 +595,7 @@
       ],
       "pos": [
         983,
-        700
+        688
       ],
       "size": [
         134,
@@ -625,8 +625,8 @@
         }
       ],
       "pos": [
-        839,
-        700
+        551,
+        688
       ],
       "size": [
         134,
@@ -656,8 +656,8 @@
         }
       ],
       "pos": [
-        551,
-        700
+        839,
+        688
       ],
       "size": [
         134,
@@ -687,8 +687,8 @@
         }
       ],
       "pos": [
-        1271,
-        700
+        1127,
+        688
       ],
       "size": [
         134,
@@ -697,7 +697,7 @@
     },
     {
       "id": "profiles",
-      "type": "external",
+      "type": "database",
       "label": "Profiles／契約",
       "sublabel": "prompt／probe／UART",
       "sources": [
@@ -707,18 +707,18 @@
           "end_line": 1200
         },
         {
-          "path": "crates/sw-proto/src/config_types.rs",
-          "line": 17,
-          "end_line": 71
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1280,
+          "end_line": 1299
         },
         {
           "path": "crates/sw-proto/src/config_types.rs",
-          "line": 73,
-          "end_line": 82
+          "line": 17,
+          "end_line": 71
         }
       ],
       "pos": [
-        37,
+        263,
         410
       ],
       "size": [
@@ -935,7 +935,7 @@
         }
       ],
       "pos": [
-        1127,
+        983,
         540
       ],
       "size": [
@@ -992,6 +992,7 @@
         "file-transfer",
         "handoff",
         "lease",
+        "profiles",
         "recovery",
         "service",
         "session-actor",
@@ -1090,7 +1091,9 @@
       "from": "bridge",
       "to": "session-actor",
       "label": "RX chunk／IoError",
-      "variant": "default"
+      "variant": "default",
+      "fromSide": "bottom",
+      "toSide": "top"
     },
     {
       "id": "bridge-to-target",
@@ -1114,25 +1117,44 @@
       "variant": "dashed"
     },
     {
+      "id": "cli-to-pal-files",
+      "from": "cli",
+      "to": "pal-files",
+      "label": "掃描 daemon 行程",
+      "variant": "dashed",
+      "fromSide": "left",
+      "toSide": "bottom",
+      "via": [
+        [
+          10,
+          308
+        ],
+        [
+          10,
+          782
+        ],
+        [
+          1050,
+          782
+        ]
+      ]
+    },
+    {
       "id": "cli-to-pal-rpc",
       "from": "cli",
       "to": "pal-rpc",
       "label": "connect",
       "variant": "default",
-      "fromSide": "left",
+      "fromSide": "bottom",
       "toSide": "bottom",
       "via": [
         [
-          8,
-          308
+          104,
+          768
         ],
         [
-          8,
-          800
-        ],
-        [
-          618,
-          800
+          906,
+          768
         ]
       ]
     },
@@ -1234,7 +1256,9 @@
       "from": "file-transfer",
       "to": "execute",
       "label": "佔前景槽",
-      "variant": "dashed"
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "top"
     },
     {
       "id": "flasher-to-handoff",
@@ -1297,7 +1321,9 @@
       "from": "service",
       "to": "file-transfer",
       "label": "file.push／pull",
-      "variant": "dashed"
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "left"
     },
     {
       "id": "service-to-sessions",
@@ -1318,7 +1344,9 @@
       "from": "session-actor",
       "to": "bridge",
       "label": "開埠／登入／drain",
-      "variant": "dashed"
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom"
     },
     {
       "id": "session-actor-to-fence",
