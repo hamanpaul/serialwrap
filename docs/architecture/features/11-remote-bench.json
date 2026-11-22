@@ -1,0 +1,314 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "serialwrap｜遠端與測試台",
+    "locale": "zh-TW",
+    "output": "docs/architecture/features/11-remote-bench.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/hamanpaul/serialwrap",
+      "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347",
+      "provider": "github"
+    }
+  },
+  "participants": [
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "CLI",
+      "sublabel": "remote／connect",
+      "sources": [
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 682,
+          "end_line": 683
+        },
+        {
+          "path": "crates/sw-cli/src/commands/connect_cmd.rs",
+          "line": 1,
+          "end_line": 4
+        },
+        {
+          "path": "crates/sw-cli/src/commands/benches_cmd.rs",
+          "line": 1,
+          "end_line": 3
+        }
+      ]
+    },
+    {
+      "id": "benchcfg",
+      "type": "database",
+      "label": "bench 設定",
+      "sublabel": "yaml＋state.json",
+      "sources": [
+        {
+          "path": "crates/sw-cli/src/bench_state.rs",
+          "line": 1,
+          "end_line": 5
+        },
+        {
+          "path": "crates/sw-proto/src/bench_registry.rs",
+          "line": 230,
+          "end_line": 234
+        },
+        {
+          "path": "crates/sw-cli/src/bench_state.rs",
+          "line": 128,
+          "end_line": 133
+        }
+      ]
+    },
+    {
+      "id": "registry",
+      "type": "database",
+      "label": "隧道 registry",
+      "sublabel": "<run_dir>/remote",
+      "sources": [
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 295,
+          "end_line": 318
+        },
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 143,
+          "end_line": 144
+        },
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 982,
+          "end_line": 997
+        }
+      ]
+    },
+    {
+      "id": "ssh",
+      "type": "external",
+      "label": "ssh 行程",
+      "sublabel": "ssh／autossh",
+      "sources": [
+        {
+          "path": "crates/sw-pal/src/process_tunnel/mod.rs",
+          "line": 33,
+          "end_line": 44
+        },
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 200,
+          "end_line": 206
+        },
+        {
+          "path": "crates/sw-pal/src/process_tunnel/mod.rs",
+          "line": 26,
+          "end_line": 31
+        }
+      ]
+    },
+    {
+      "id": "relay",
+      "type": "external",
+      "label": "遠端主機",
+      "sublabel": "relay／測試台",
+      "sources": [
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 233,
+          "end_line": 250
+        },
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 906,
+          "end_line": 915
+        }
+      ]
+    },
+    {
+      "id": "daemon",
+      "type": "backend",
+      "label": "serialwrapd RPC",
+      "sublabel": "health.ping／一般 RPC",
+      "sources": [
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 786,
+          "end_line": 798
+        },
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 970,
+          "end_line": 979
+        }
+      ]
+    }
+  ],
+  "segments": [
+    {
+      "from": 158,
+      "to": 388,
+      "label": "expose（remote -R）"
+    },
+    {
+      "from": 390,
+      "to": 594,
+      "label": "connect（bench 代號）"
+    },
+    {
+      "from": 596,
+      "to": 684,
+      "label": "使用與查詢"
+    },
+    {
+      "from": 686,
+      "to": 898,
+      "label": "關閉"
+    }
+  ],
+  "messages": [
+    {
+      "id": "ex-lock",
+      "from": "cli",
+      "to": "registry",
+      "y": 174,
+      "label": "取鎖、查同 port 的既有隧道"
+    },
+    {
+      "id": "ex-spawn",
+      "from": "cli",
+      "to": "ssh",
+      "y": 204,
+      "label": "spawn_detached：ssh -N -T -R …",
+      "note": "Linux｜Windows：有 ControlMaster｜無"
+    },
+    {
+      "id": "ex-forward",
+      "from": "ssh",
+      "to": "relay",
+      "y": 260,
+      "label": "建立 -R 轉送：遠端 127.0.0.1:port"
+    },
+    {
+      "id": "ex-state",
+      "from": "cli",
+      "to": "registry",
+      "y": 290,
+      "label": "寫入 state（pid、identity）"
+    },
+    {
+      "id": "ex-bind-check",
+      "from": "cli",
+      "to": "relay",
+      "y": 320,
+      "label": "ss -ltnH：確認只綁 loopback",
+      "note": "條件：-R 且未指定遠端 socket"
+    },
+    {
+      "id": "ex-ready",
+      "from": "cli",
+      "to": "registry",
+      "y": 376,
+      "label": "更新狀態：active 或 starting"
+    },
+    {
+      "id": "co-resolve",
+      "from": "cli",
+      "to": "benchcfg",
+      "y": 406,
+      "label": "讀 benches.yaml，解析代號"
+    },
+    {
+      "id": "co-open",
+      "from": "cli",
+      "to": "ssh",
+      "y": 436,
+      "label": "open_tunnel：ssh -N -T -L …"
+    },
+    {
+      "id": "co-forward",
+      "from": "ssh",
+      "to": "relay",
+      "y": 466,
+      "label": "建立 -L 轉送：本機 port → 遠端 daemon"
+    },
+    {
+      "id": "co-ping",
+      "from": "cli",
+      "to": "daemon",
+      "y": 496,
+      "label": "health.ping（經本機轉送埠）"
+    },
+    {
+      "id": "co-remember",
+      "from": "cli",
+      "to": "benchcfg",
+      "y": 526,
+      "label": "remember：代號 → tcp://127.0.0.1:port"
+    },
+    {
+      "id": "co-rollback",
+      "from": "cli",
+      "to": "ssh",
+      "y": 556,
+      "label": "terminate 剛開的隧道",
+      "note": "條件：記憶寫入失敗"
+    },
+    {
+      "id": "use-resolve",
+      "from": "cli",
+      "to": "benchcfg",
+      "y": 612,
+      "label": "--bench：查記住的 endpoint"
+    },
+    {
+      "id": "use-rpc",
+      "from": "cli",
+      "to": "daemon",
+      "y": 642,
+      "label": "一般 RPC（tcp://127.0.0.1:port）"
+    },
+    {
+      "id": "use-status",
+      "from": "cli",
+      "to": "registry",
+      "y": 672,
+      "label": "remote status／benches：列出並清理"
+    },
+    {
+      "id": "cl-port",
+      "from": "cli",
+      "to": "benchcfg",
+      "y": 702,
+      "label": "connect --close：查記住的 port"
+    },
+    {
+      "id": "cl-match",
+      "from": "cli",
+      "to": "registry",
+      "y": 732,
+      "label": "確認同 port 隧道的 identity 相符"
+    },
+    {
+      "id": "cl-terminate",
+      "from": "cli",
+      "to": "ssh",
+      "y": 762,
+      "label": "terminate（寬限 5 秒）",
+      "note": "Linux｜Windows：行程群組 SIGTERM｜行程樹 TerminateProcess"
+    },
+    {
+      "id": "cl-remove",
+      "from": "cli",
+      "to": "registry",
+      "y": 830,
+      "label": "移除 state"
+    },
+    {
+      "id": "cl-forget",
+      "from": "cli",
+      "to": "benchcfg",
+      "y": 860,
+      "label": "forget：清除 endpoint 記憶",
+      "note": "條件：隧道確實已消失"
+    }
+  ]
+}
