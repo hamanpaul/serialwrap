@@ -24,7 +24,7 @@
         "facts": "f6e695feae8a540d76e7075502ec5fae274f1b7173d24d26a9dbb9f3123432e9",
         "ir": "c427f6e4e4f1cd976985a52c130cbe20c9017c841b32fd9cfd959da3514eb614",
         "delivery": "5a5bb73e5d20b01681b4b19a6e27cadf37c02f6d5564402ce4cd3d94ca7b9898",
-        "html": "ecb695a2a67c30c859bb57640d7a0045e1166d7033f058b740e94ae6d67b3b44"
+        "html": "c0e80e45c65ce89fbeca60345ef50155593df3a5b0b6c32b7eea568df739a3a8"
       }
     },
     "01-command-exec": {
@@ -38,7 +38,7 @@
         "facts": "b8f2f6888b1e041324930bf2755eefcae011c62e5b5a1e38b695f7179daf1745",
         "ir": "36a44fece4dbb9f7fac1908d75c0d7026496934873f1203a634f135e73ff9bd8",
         "delivery": "45047ee239e57e35598d2fa2d6da74010dbf0fd058836f5049a87f5621e811b0",
-        "html": "eed281e56319901973fb1d8e696a644a98169db138ef3a9c37341a74beab6f82"
+        "html": "32003ab6f572f42ee7a640cca55cbd7ca40794b786e311d28fb5aac2c39f7898"
       }
     },
     "02-session-lifecycle": {
@@ -52,7 +52,7 @@
         "facts": "fdbdaa2cfbd5be4cb32c2cdb91151451196fd5285fc2e5f9de0fa73a5414e306",
         "ir": "af32246317ad6b5707f7609a4a9f5de4a48d6429ac3498d7e65e7376e289837e",
         "delivery": "b04d903ae5c2855e28322d8ed55fa5ad86e6e7542b21177ddf4737c790e991b9",
-        "html": "09a076d260df12ed4b3500951f7273daa457978db9979a4a7c24fbb0bcb122ab"
+        "html": "98e62579d84f31791b507d0a22c0fbedd015a1459b318ff22c8e1bfd1a3184d6"
       }
     },
     "03-device-mgmt": {
@@ -66,7 +66,7 @@
         "facts": "c7d2ffd549e415960b5563393e62d59bfb3d2166ee99ba4e1e4674714aefe24e",
         "ir": "4ec701427415830f63dc2612fd0d16cfba7f7581d78e9e4dff745087ffc02217",
         "delivery": "92414c53627388d19e93755e7d2165bb62cf9edde8af83d01a2706a4a4353acd",
-        "html": "6585c727e59caf598dcf577a792774a6ca860ccde56566ed17c8d0271ab0d843"
+        "html": "a95611887705131105f9f61e9fa66f880ef6e250bb17b986d82cc6a027892d54"
       }
     },
     "04-human-console": {
@@ -80,7 +80,7 @@
         "facts": "356dc4d6fa4d6f4558c469254dc0a5a28c4d8afc63027561363741cb6314157c",
         "ir": "e5406cb84223f23e8115bb32ea4aaa2dbd509ab3018ec99c0db40d0d3db87fc1",
         "delivery": "21a7abd1d8a6952935963632953c828ddf98c29e59648cdcd9f3a4b8a78b7892",
-        "html": "0157d34ae70d4bcc2adcd136a7862cfeaffa2bc161cf5e796d03af10e32644da"
+        "html": "bbd1d3535b6b6f736306ac0024c2bd0cf5019af1bf3407c96788545e442f763d"
       }
     },
     "05-file-transfer": {
@@ -94,7 +94,7 @@
         "facts": "e13c8fc518a9fcaa99145d5d327fb9aac2b39c0a0acc04c23ace0c5eda3db85c",
         "ir": "5d3535ea37eedaa7bffa2b47903a3e1feff2d24fbea17292d0b8ae6f9b56370a",
         "delivery": "1da6337262ed187e1706cb840210fe8e7a426f90d7af98f0d7ece097d69bbc52",
-        "html": "7d08e5183cc64d0d9532fd3cebc6d1ccea1d98193dc4e5a68059546042790207"
+        "html": "9130ecd0ae50f01f3eccc3384099028e95ff2c9aa4bcd38e9854ce0891f427c5"
       }
     },
     "06-mcu-flash": {
@@ -108,7 +108,7 @@
         "facts": "3d55bbc84511f332f5cdba0b05c7b73736d32029d64cde2a8a56656e3bb7b9bb",
         "ir": "075a25b3bcf68eaacf9c646f3b09c85ab6c700fac841ffafb951c71f082b01f9",
         "delivery": "440354206942ca5bca5636c3e3d1eabe897c0062c19708bb885ad4b2963fc3a6",
-        "html": "1c4e9dd1f02ed9b9c719020a347fbd1f94371399676bec43c2e0823aec305a3b"
+        "html": "3b9e5a17b5874e61bec87307505057b9a6d665a77e9ba2b02633a00303d72e40"
       }
     },
     "07-event-engine": {
@@ -122,7 +122,7 @@
         "facts": "1d178af4690debaa5ebbace7d21068f911666e7644f9bd1d25069755be2724b6",
         "ir": "769414e50513d58036c991d544eda2d36ee33b96270aa1e560505e75c8880b7e",
         "delivery": "f67bf4f6489646f72ba91e030fa987b763c04cb44d729813a25f5128000d06c5",
-        "html": "b9c60dab6dc8e73a303d4dedf62e929e91702e739041d48284927d7996ac95d0"
+        "html": "0737a2dd47d518145e8fff20f0e118b14ba60378ecc2b8360f81cea273aa7a01"
       }
     },
     "08-logs-evidence": {
@@ -136,7 +136,7 @@
         "facts": "a49df401a80627e93ebd4bb5ef0417d4bf6c933118e8c0a82d191209eedfa5f4",
         "ir": "a54ad2a77526a42b5f7563648d47187e4f01cf308dfbe3ba004e418a7b074c95",
         "delivery": "970886d357971a5235de2c2c13882076814977397b66a72a69d81ecb464956ba",
-        "html": "922d702c0473fb99c70f584c173ff5e18278a82ec2fe71260f3c60d62c79a5da"
+        "html": "afd8b548b08ffdaff92d15f6caacf3f2166bfa19de07035a7720ae5e0a8e7960"
       }
     },
     "09-daemon-mgmt": {
@@ -150,7 +150,7 @@
         "facts": "5899d16043c68c422e99716e875933e5e4d553d4bf6678cbe1a508656eadd077",
         "ir": "c5d05ff5d863f7a4a39b1b6bc82ebef8fd9c5c0ec4842e0bf20b40466f5d486d",
         "delivery": "e35b2310e1d2772d72a782cc7b0bbcf1424d0c115fda3dfb8c8d4269d751bce9",
-        "html": "c992a1d51d3f64a26845234a30a1c01dd8aa8c3449bc4f4c0225b53521bc1cba"
+        "html": "6b79708e7ae6e615b0396c05399fb4d0fa231f9f33441ca696b26f4d32ab07f5"
       }
     },
     "10-install-supervision": {
@@ -164,7 +164,7 @@
         "facts": "5dc9af0317320b9603effc083d113a8ab33766c74f02d87fcf150b5f327558f2",
         "ir": "bf185ebf52ba5ffc13226eac2d37c2c38dd425b82af38a87d07c8b9c74c9b207",
         "delivery": "33f05d5d7fdd7a60f88605fd3efafabf8e40d95692ee284793b3a78130dd33b1",
-        "html": "2d7c01eb66ebbc39695902e228280e5a15a4d809c038da15f277e1676e43ad4e"
+        "html": "1b6fdcc3b67f05020455fc75dada040918c18d974492db4613941e975fe6c9e5"
       }
     },
     "11-remote-bench": {
@@ -178,7 +178,7 @@
         "facts": "c0611c1482101ad741804af67abdc67e0d249c1a564b3e4dae0dbeef45df9306",
         "ir": "ae34308fb2ca1981cbcbbc5dcec222c307a21a299d5b250f7b8aeb890a6473b8",
         "delivery": "b8457ba46687b6c5e872d60afb05cdd8223a16091187bb8c2e17f49899583618",
-        "html": "a64cfc302c826a9cdc52c10064578a141234e31fd0c346968e15c2f80b659760"
+        "html": "8dd031628beed46e4a206df48221f203d075c3df313ec21897754344f221ffe2"
       }
     },
     "12-config-tools": {
@@ -192,7 +192,7 @@
         "facts": "3fcd281cd542928097d75e876aa0eed86c9a0ed241fea062219dcd94bbc468f7",
         "ir": "db64a095cd647c6b83f3f5af83b80fd6ee25a716a8cdb8768bb7d73237629624",
         "delivery": "402a4339dabb03fa76ab94d4a6ef1db7c14bea1038e344a0a1520bec577a6e1a",
-        "html": "d859bc5eb7467d6b61f2c160e7670b8017281afb8fcd44d0d9b7beeb9ace9be4"
+        "html": "7cc0fcbe3601ce9be165351ac8183cfb96d25db127da9055e5e5dba0e4a592dd"
       }
     },
     "13-cross-platform": {
