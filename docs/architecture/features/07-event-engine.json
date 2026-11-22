@@ -1,0 +1,383 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "serialwrap｜事件引擎",
+    "locale": "zh-TW",
+    "output": "docs/architecture/features/07-event-engine.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/hamanpaul/serialwrap",
+      "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347",
+      "provider": "github"
+    }
+  },
+  "participants": [
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "CLI／Agent",
+      "sublabel": "serialwrap event",
+      "sources": [
+        {
+          "path": "crates/sw-cli/src/commands/event_cmd.rs",
+          "line": 28,
+          "end_line": 40
+        },
+        {
+          "path": "crates/sw-cli/src/commands/event_cmd.rs",
+          "line": 47,
+          "end_line": 70
+        },
+        {
+          "path": "crates/sw-cli/src/commands/event_cmd.rs",
+          "line": 118,
+          "end_line": 126
+        }
+      ]
+    },
+    {
+      "id": "service",
+      "type": "backend",
+      "label": "RPC／Service",
+      "sublabel": "event_rpc",
+      "sources": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 666,
+          "end_line": 716
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1388,
+          "end_line": 1395
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 731,
+          "end_line": 747
+        }
+      ]
+    },
+    {
+      "id": "engine",
+      "type": "backend",
+      "label": "Event Engine",
+      "sublabel": "EventEngine",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 169,
+          "end_line": 178
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 77,
+          "end_line": 83
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 654,
+          "end_line": 659
+        }
+      ]
+    },
+    {
+      "id": "files",
+      "type": "database",
+      "label": "事件檔案",
+      "sublabel": "規則／counter／日誌",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/event_engine/registry.rs",
+          "line": 140,
+          "end_line": 163
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/counter.rs",
+          "line": 94,
+          "end_line": 100
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/event_log.rs",
+          "line": 54,
+          "end_line": 67
+        }
+      ]
+    },
+    {
+      "id": "bridge",
+      "type": "backend",
+      "label": "UART bridge",
+      "sublabel": "reader 執行緒",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 520,
+          "end_line": 525
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 1070,
+          "end_line": 1074
+        }
+      ]
+    },
+    {
+      "id": "matcher",
+      "type": "backend",
+      "label": "Matcher",
+      "sublabel": "event-matcher",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/event_engine/matcher.rs",
+          "line": 303,
+          "end_line": 349
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/matcher.rs",
+          "line": 381,
+          "end_line": 404
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/matcher.rs",
+          "line": 352,
+          "end_line": 379
+        }
+      ]
+    },
+    {
+      "id": "dispatcher",
+      "type": "backend",
+      "label": "Dispatcher",
+      "sublabel": "event-dispatch-N",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/event_engine/dispatcher.rs",
+          "line": 392,
+          "end_line": 432
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/dispatcher.rs",
+          "line": 206,
+          "end_line": 243
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 83,
+          "end_line": 85
+        }
+      ]
+    },
+    {
+      "id": "handler",
+      "type": "external",
+      "label": "外部 handler",
+      "sublabel": "exec 或 shell",
+      "sources": [
+        {
+          "path": "crates/sw-pal/src/process.rs",
+          "line": 159,
+          "end_line": 167
+        },
+        {
+          "path": "crates/sw-pal/src/process/handler_posix.rs",
+          "line": 1,
+          "end_line": 4
+        },
+        {
+          "path": "crates/sw-pal/src/process/handler_windows.rs",
+          "line": 1,
+          "end_line": 4
+        }
+      ]
+    }
+  ],
+  "segments": [
+    {
+      "from": 160,
+      "to": 446,
+      "label": "規則管理"
+    },
+    {
+      "from": 454,
+      "to": 620,
+      "label": "COM 開關"
+    },
+    {
+      "from": 628,
+      "to": 846,
+      "label": "RX 比對"
+    },
+    {
+      "from": 854,
+      "to": 1181,
+      "label": "handler 派送"
+    }
+  ],
+  "messages": [
+    {
+      "id": "start-load",
+      "from": "engine",
+      "to": "files",
+      "y": 198,
+      "label": "start：load_all 載入規則檔"
+    },
+    {
+      "id": "rule-set-rpc",
+      "from": "cli",
+      "to": "service",
+      "y": 228,
+      "label": "event.rule_set（add <規則檔>）"
+    },
+    {
+      "id": "rule-set",
+      "from": "service",
+      "to": "engine",
+      "y": 258,
+      "label": "rule_set（先取 admission ticket）"
+    },
+    {
+      "id": "rule-upsert",
+      "from": "engine",
+      "to": "files",
+      "y": 288,
+      "label": "upsert：驗證 → tmp → replace"
+    },
+    {
+      "id": "rule-recompile",
+      "from": "engine",
+      "to": "matcher",
+      "y": 318,
+      "label": "replace_rules（重新編譯 pattern）"
+    },
+    {
+      "id": "rule-loaded-log",
+      "from": "engine",
+      "to": "files",
+      "y": 348,
+      "label": "記 rule_loaded（及 com_enabled）"
+    },
+    {
+      "id": "rule-set-reply",
+      "from": "service",
+      "to": "cli",
+      "y": 378,
+      "label": "ok＋規則內容"
+    },
+    {
+      "id": "rule-other",
+      "from": "service",
+      "to": "engine",
+      "y": 408,
+      "label": "rule_delete／list／get／reload／reset／tail",
+      "note": "條件：其餘規則子指令"
+    },
+    {
+      "id": "com-rpc",
+      "from": "cli",
+      "to": "service",
+      "y": 492,
+      "label": "event.com_enable／disable／status"
+    },
+    {
+      "id": "com-switch",
+      "from": "service",
+      "to": "engine",
+      "y": 522,
+      "label": "com_enable／com_disable"
+    },
+    {
+      "id": "com-disable-reset",
+      "from": "engine",
+      "to": "files",
+      "y": 552,
+      "label": "清除受影響規則的 counter",
+      "note": "條件：只在 com_disable"
+    },
+    {
+      "id": "com-log",
+      "from": "engine",
+      "to": "files",
+      "y": 608,
+      "label": "記 com_enabled／com_disabled"
+    },
+    {
+      "id": "rx-notify",
+      "from": "bridge",
+      "to": "engine",
+      "y": 666,
+      "label": "on_rx(com, data, wal_seq)",
+      "note": "前提：啟動時已註冊 observer"
+    },
+    {
+      "id": "feed-line",
+      "from": "engine",
+      "to": "matcher",
+      "y": 722,
+      "label": "feed_line（逐行入列）",
+      "note": "條件：COM 已啟用"
+    },
+    {
+      "id": "read-counter",
+      "from": "matcher",
+      "to": "files",
+      "y": 778,
+      "label": "讀 counter（max_fires／cooldown）"
+    },
+    {
+      "id": "match-recorded",
+      "from": "matcher",
+      "to": "files",
+      "y": 808,
+      "label": "記 match_recorded",
+      "note": "條件：四道閘門全過"
+    },
+    {
+      "id": "dispatch",
+      "from": "matcher",
+      "to": "dispatcher",
+      "y": 892,
+      "label": "dispatch(fire)"
+    },
+    {
+      "id": "dropped",
+      "from": "dispatcher",
+      "to": "files",
+      "y": 922,
+      "label": "記 event_dropped",
+      "note": "條件：同規則忙碌或已滿 8 個"
+    },
+    {
+      "id": "spawn",
+      "from": "dispatcher",
+      "to": "handler",
+      "y": 978,
+      "label": "啟動子行程：stdin JSON＋環境變數",
+      "note": "Linux｜Windows： /bin/sh -c ｜ cmd.exe /d /s /c"
+    },
+    {
+      "id": "outcome",
+      "from": "handler",
+      "to": "dispatcher",
+      "y": 1057,
+      "label": "exit code＋輸出尾段，或逾時",
+      "note": "Linux｜Windows： 逾時 killpg ｜ 逾時終止整個 Job"
+    },
+    {
+      "id": "fire-log",
+      "from": "dispatcher",
+      "to": "files",
+      "y": 1113,
+      "label": "記 fire_completed／timeout／failed"
+    },
+    {
+      "id": "counter-update",
+      "from": "dispatcher",
+      "to": "files",
+      "y": 1143,
+      "label": "更新 fires／last_fire_ts",
+      "note": "條件：結果事件已寫入"
+    }
+  ]
+}

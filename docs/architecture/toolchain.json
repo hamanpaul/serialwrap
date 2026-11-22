@@ -111,6 +111,20 @@
         "html": "d740f6c7498dfc180e6b6ed62285ce0fa16e52e2e5f3d043bbf0e96ad7be9e0f"
       }
     },
+    "07-event-engine": {
+      "diagram_type": "sequence",
+      "source_revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347",
+      "facts": "features/07-event-engine.facts.json",
+      "ir": "features/07-event-engine.json",
+      "html": "features/07-event-engine.html",
+      "overlay_version": 1,
+      "sha256": {
+        "facts": "1d178af4690debaa5ebbace7d21068f911666e7644f9bd1d25069755be2724b6",
+        "ir": "769414e50513d58036c991d544eda2d36ee33b96270aa1e560505e75c8880b7e",
+        "delivery": "f67bf4f6489646f72ba91e030fa987b763c04cb44d729813a25f5128000d06c5",
+        "html": "af259c7dbec556af946468ab0bcefd68f811a0aa91bef9eb301e457f212d1ef8"
+      }
+    },
     "09-daemon-mgmt": {
       "diagram_type": "sequence",
       "source_revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347",
