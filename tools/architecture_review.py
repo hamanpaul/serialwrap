@@ -188,8 +188,8 @@ def page_files(page_id):
 
 # ---------------------------------------------------------------- toolchain 與各頁驗證
 
-def verify_pages(repo=REPO, toolchain=None, pages=None, read=None):
-    """核對 toolchain 記錄的每一頁：檔案雜湊、加工區塊、事實檢查；回傳每頁摘要。"""
+def verify_pages(repo=REPO, toolchain=None, pages=None, read=None, only=None):
+    """核對 toolchain 記錄的每一頁：檔案雜湊、加工區塊、事實檢查；回傳每頁摘要。only 指定時只核對該頁（整合途中用）。"""
     repo = Path(repo).resolve()
     root = repo / ARCH
     read = read or (lambda rel: (root / rel).read_bytes())
@@ -215,7 +215,11 @@ def verify_pages(repo=REPO, toolchain=None, pages=None, read=None):
     manifest_available = set(recorded)
     summary = {}
     feature_check = _import("serialwrap_architecture_feature_check", repo / "tools/architecture_feature_check.py")
+    if only is not None and only not in recorded:
+        raise ValueError(f"toolchain 沒有記錄 {only}")
     for page_id, entry in recorded.items():
+        if only is not None and page_id != only:
+            continue
         files = page_files(page_id)
         if {k: entry[k] for k in ("facts", "ir", "html")} != files:
             raise ValueError(f"{page_id}：toolchain 的檔案路徑必須是 {files}")
@@ -272,13 +276,15 @@ def check_engine(engine: Path, toolchain) -> None:
         raise ValueError("原生 Archify release 版本不符")
 
 
-def rebuild(repo: Path, engine: Path, toolchain, pages):
+def rebuild(repo: Path, engine: Path, toolchain, pages, only=None):
     """每一頁重新交付；原版交付雜湊與「原版＋加工」都必須和已提交的檔案一致。"""
     root = repo / ARCH
     available = set(toolchain["pages"])
     receipts = {}
     with tempfile.TemporaryDirectory(prefix="serialwrap-architecture-") as td:
         for page_id, entry in toolchain["pages"].items():
+            if only is not None and page_id != only:
+                continue
             out = Path(td) / f"{page_id}.html"
             receipt = deliver(engine, repo, entry["diagram_type"], root / entry["ir"], out)
             delivered = out.read_bytes()
@@ -296,13 +302,16 @@ def main():
     parser.add_argument("--repo-root", type=Path, default=Path("."))
     parser.add_argument("--archify-root", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--page", help="只核對這一頁（整合途中、--refresh-nav 之前用；完整驗收請不帶此參數）")
     args = parser.parse_args()
     repo = args.repo_root.resolve()
     root = repo / ARCH
     toolchain = load(root / "toolchain.json")
     pages = load_pages(repo)
-    result = {"ok": True, "pages": verify_pages(repo, toolchain, pages)}
-    if toolchain["pages"]["overview"]["source_revision"] != result["pages"]["overview"]["source_revision"]:
+    result = {"ok": True, "pages": verify_pages(repo, toolchain, pages, only=args.page)}
+    if args.page:
+        result["partial"] = args.page
+    elif toolchain["pages"]["overview"]["source_revision"] != result["pages"]["overview"]["source_revision"]:
         raise ValueError("toolchain 的來源 revision 與總覽 facts 不一致")
     # CI 重建用的引擎必須與 toolchain 釘的是同一個 commit，且必須關閉 Archify 的連網更新檢查。
     workflow = (repo / ".github/workflows/architecture-html.yml").read_text(encoding="utf-8")
@@ -311,7 +320,7 @@ def main():
     if args.archify_root:
         engine = args.archify_root.resolve()
         check_engine(engine, toolchain)
-        result["native_delivery"] = rebuild(repo, engine, toolchain, pages)
+        result["native_delivery"] = rebuild(repo, engine, toolchain, pages, only=args.page)
         result["exact_html"] = True
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
