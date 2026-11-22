@@ -16,7 +16,7 @@ OD-102 規定的 rc.1 候選 24 小時 `lr-mixed` 長跑判定結果。兩平台
 
 **OD-110（擁有者 2026-11-22 裁決）**：排除擾動區間後重算，接受有效的 18.66 小時，不重跑。
 
-- 重算方式：`windows/od110/truncate.py` 由原始證據產生截斷副本——`events.ndjson` 只刪除 `[2026-11-22T05:29:16Z, 05:44:58.842Z]` 內的命令層事件（`submit`、`submit_accepted`、`done`、`error`、`busy`、`bg_result`、`tick`），生命週期事件（start、stop、worker_*、major）保留；`snapshots.ndjson` 與 `observer.ndjson` 截在 05:29:16Z 之前；`report.json`、WAL 與排他性證據不截、不改（WAL 安全掃描仍為全量）。各檔原始與截斷後的 sha256 見 `windows/od110/truncation-receipt.json`。原始證據未改動。
+- 重算方式：`windows/od110/truncate.py` 由原始證據產生截斷副本——`events.ndjson` 只刪除 `[2026-11-22T05:29:16Z, 05:44:58.842Z]` 內的命令層事件（`submit`、`submit_accepted`、`done`、`error`、`busy`、`bg_result`、`tick`），生命週期事件（start、stop、worker_*、major）保留；`snapshots.ndjson` 與 `observer.ndjson` 截在 05:29:16Z 之前；`report.json`、WAL 與排他性證據不截、不改（WAL 安全掃描仍為全量）。各檔原始與截斷後的 sha256 見 `windows/od110/truncation-receipt.json`。原始證據未改動。腳本保留實際執行時的原樣（不另行修改，以維持「存檔腳本＝產生收據的腳本」）；它不建立目的目錄，重跑方式為 `mkdir -p <DST>/lr-mixed && python3 -I windows/od110/truncate.py <候選報告目錄> <DST>`，產物雜湊應與收據相同。
 - 重算結果：`error_rate_absolute`（2 筆，6.2e-05）、`min_effective_load`、`throughput_relative`、`stuck_relative`、`comparison_uncertainty`、`baseline_compatible` 與全部安全、liveness 檢查 PASS。
 - OD-110 豁免的項目：
   - `engine_verdict`、`continuous_duration`（68125 s＜86400 s）、`worker_liveness`（引擎自行停止）、`observation_gaps` 與 `safety_double_holder`（缺口都在排除區間內）——皆由擾動與其後的引擎停止造成。
