@@ -62,6 +62,14 @@ impl SessionCore {
         }]
     }
 
+    /// 仍有 file.push／file.pull 的 RPC 回覆在等 OpRunner 的結果（`OpFinished` 尚未處理）；停機時 actor 須等它回覆後
+    /// 才結束（見 [`SessionCore::shutdown_complete`]）。前景槽可能已被 drain 清除，故看 `pending_ops` 而非 `foreground`。
+    pub(super) fn awaits_transfer_reply(&self) -> bool {
+        self.pending_ops
+            .values()
+            .any(|op| matches!(op, PendingOp::FileTransfer { .. }))
+    }
+
     /// 前景槽是否由 file transfer 持有（`_foreground_operation.kind == "file"`）。
     pub(super) fn file_transfer_in_foreground(&self) -> bool {
         self.foreground.as_ref().is_some_and(|grant| {

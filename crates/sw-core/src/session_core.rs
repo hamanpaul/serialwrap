@@ -2409,8 +2409,13 @@ impl SessionCore {
         self.retired
     }
 
+    /// actor 迴圈據此結束，結束時丟棄 core 與其持有的回覆通道。停機已排空，但 file.push／file.pull 的回覆仍在等
+    /// OpRunner 的 `OpFinished` 時不結束：drain 收尾執行緒的 `WorkerStopped`（safety lane，mailbox 優先取）可能先於
+    /// 傳輸 op 的 `OpFinished`（control lane）被處理，此時結束會讓 RPC 端只拿到「session actor stopped」
+    /// （framing `EXCEPTION`），違反 OD-62。傳輸的等待已由 Phase 1 的 `cancel_transfer_runs` 喚醒、之後的 TX 一律被
+    /// 凍結拒絕，`OpFinished` 隨即抵達；萬一未抵達，由停止序步驟 5 的期限判定未收斂。退休的佔位 actor 不承接傳輸，照舊結束。
     pub fn shutdown_complete(&self) -> bool {
-        self.shutdown_complete
+        self.shutdown_complete && (self.retired || !self.awaits_transfer_reply())
     }
 
     fn next_commit(&mut self) -> u64 {

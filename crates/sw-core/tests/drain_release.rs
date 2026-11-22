@@ -1179,6 +1179,66 @@ fn shutdown_flushes_with_flushed_by_shutdown() {
     assert!(h.core.shutdown_complete());
 }
 
+/// CI 293（`shutdown_order::long_file_push_does_not_block_stop` 偶發 `EXCEPTION: session actor stopped`）的交錯：
+/// 停機時 drain 收尾執行緒的 `WorkerStopped`（safety lane）先於傳輸 op 的 `OpFinished`（control lane）被 actor 處理。
+/// 回條只結算 worker，傳輸的回覆仍掛在 `pending_ops`；此時 actor 若結束，回覆通道隨 core 丟棄，RPC 端只拿到
+/// 通用錯誤。OD-62：停機中止的傳輸必須以 OpRunner 映射的 COMMAND_ABORTED_IN_FLIGHT／FLUSHED_BY_RECOVERY 回覆。
+#[test]
+fn shutdown_receipt_before_transfer_op_finished_keeps_actor_until_reply() {
+    use sw_core::file_transfer::{FileTransferKind, FileTransferRequest};
+    use sw_proto::pydict;
+    use sw_proto::pyjson::PyInt;
+
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let req = FileTransferRequest {
+        kind: FileTransferKind::Push,
+        selector: "COM0".into(),
+        source: "agent:t".into(),
+        local_path: Some("/l".into()),
+        remote_path: "/r".into(),
+        chunk_size: 512,
+        chunk_timeout_s: None,
+        ack_mode: "auto".into(),
+    };
+    let (transfer, effects) = h.rpc_deferred(SessionRequest::FileTransfer(req));
+    let grant = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp { grant, .. } => Some(grant.clone()),
+            _ => None,
+        })
+        .expect("file.push 應取得前景槽並產生 StartOp");
+    let (reply, shutdown) = crossbeam_channel::bounded(1);
+    h.feed(ControlEvent::Shutdown { reply });
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).feed();
+    assert!(
+        shutdown.try_recv().unwrap().unwrap()["ok"].as_bool().unwrap(),
+        "Shutdown 的等待者照常於回條時回覆"
+    );
+    assert!(transfer.try_recv().is_err(), "傳輸的 OpFinished 未到前不得回覆");
+    assert!(
+        !h.core.shutdown_complete(),
+        "傳輸回覆仍待 OpFinished 時 actor 不得結束（結束會丟棄回覆通道）"
+    );
+
+    let aborted = pydict! {
+        "ok" => false,
+        "error_code" => "COMMAND_ABORTED_IN_FLIGHT",
+        "chunks_sent" => PyValue::Int(PyInt::Small(1)),
+        "chunks_total" => PyValue::Int(PyInt::Small(3)),
+    };
+    h.feed(ControlEvent::OpFinished {
+        op_id: grant.op_id,
+        epoch: grant.epoch,
+        outcome: OpOutcome::FileTransfer(Ok(aborted.clone())),
+        after_rx_seq: None,
+    });
+    assert_eq!(transfer.try_recv().unwrap().unwrap(), aborted, "OpRunner 的 OD-62 映射原樣回給 RPC");
+    assert!(h.core.shutdown_complete(), "傳輸回覆送出後 shutdown 收斂");
+}
+
 #[test]
 fn stale_reply_context_rejected_after_release() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
