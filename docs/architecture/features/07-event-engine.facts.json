@@ -1,0 +1,901 @@
+{
+  "schema_version": 1,
+  "document_type": "feature-facts",
+  "feature": {
+    "id": "07-event-engine",
+    "order": 7,
+    "title": "事件引擎",
+    "summary": "UART 上出現指定文字時，自動執行外部 handler：規則怎麼管、RX 怎麼比對、handler 怎麼被啟動與限流。"
+  },
+  "repository": {
+    "url": "https://github.com/hamanpaul/serialwrap",
+    "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347"
+  },
+  "diagram_type": "sequence",
+  "scope": {
+    "includes": [
+      "規則管理：`event.rule_set` 的完整路徑，以及 rule_delete／rule_list／rule_get／reload／reset／tail 的入口",
+      "各 COM 開關：com_enable／com_disable／com_status，以及 com_disable 清 counter 的副作用",
+      "RX 比對：reader 的 observer 通知、切行、matcher 佇列、scope／profile／max_fires／cooldown 四道閘門",
+      "外部 handler：dispatcher 的 per-rule 與 per-daemon 限流、子行程啟動（Linux｜Windows）、結果事件與 counter 更新",
+      "啟動時的規則載入；RX observer 的註冊寫在 rx-notify 的前提（實際呼叫者是 daemon 主流程，不是本頁參與者）"
+    ],
+    "excludes": [
+      "daemon 停止序中的 engine.close_intake／engine.stop（屬於 09-daemon-mgmt）",
+      "WAL 的寫入與輪替（屬於 08-logs-evidence）；本頁只用到 RX 事件帶的 wal_seq",
+      "規則檔 schema 的逐欄驗證細節與 CLI 的錯誤輸出格式",
+      "flash 認線協調者（另一個 RX observer，屬於 06-mcu-flash）"
+    ]
+  },
+  "participants": [
+    {
+      "id": "cli",
+      "label": "CLI／Agent",
+      "type": "frontend",
+      "overview_component": "cli",
+      "responsibility": "`serialwrap event <子指令>`：把 add／rm／list／show／enable／disable／status／reset／reload／tail 對應到 10 個 `event.*` RPC，組好 params 後經 RPC client 送出。add 會先讀規則檔並解析成 JSON。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/event_cmd.rs",
+          "line": 28,
+          "end_line": 40,
+          "excerpt_sha256": "5798141d82c4cb430671a2a52590dcff1c9936bc687ddf9a13bab1cdf82788cc",
+          "claim": "子指令名到 RPC method 的對照表，共 10 項。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/event_cmd.rs",
+          "line": 47,
+          "end_line": 70,
+          "excerpt_sha256": "a3b74274c761008f1068c03f02ca4c4d40dd31553de2d4556906f679405bc072",
+          "claim": "各子指令的 params 組裝；add 走 read_rule_file 讀規則檔。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/event_cmd.rs",
+          "line": 118,
+          "end_line": 126,
+          "excerpt_sha256": "fc4d5aa105e285812c8da3dfd67315d7bb5ce703e944554bf12926a47c100d32",
+          "claim": "以 client::call_with_failure_origin 把 method 與 params 送到解析出的 endpoint。"
+        }
+      ],
+      "sublabel": "serialwrap event"
+    },
+    {
+      "id": "service",
+      "label": "RPC／Service",
+      "type": "backend",
+      "overview_component": "service",
+      "responsibility": "在 RPC 連線 thread 上直接呼叫 EventEngine（不經 session actor）。6 個會改變狀態的 `event.*` 方法在分派前先取 admission ticket；engine 未掛上時 `event.*` 回 METHOD_NOT_FOUND。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 666,
+          "end_line": 716,
+          "excerpt_sha256": "ac1467f250968ae0cc3ddfd6e20dd87c7e0893c8a68f3c6d8bc688bc1fd0d950",
+          "claim": "event_rpc：10 個 event.* 方法各自對應的 engine 呼叫與回應形狀。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1388,
+          "end_line": 1395,
+          "excerpt_sha256": "cf3a7e43e945339fe126cec5c44d21a346d1ae1c13f736a3732ba2cad227ad42",
+          "claim": "分派表：engine 已掛上時才進 event_rpc。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 731,
+          "end_line": 747,
+          "excerpt_sha256": "87d8ec88772c1bb58119bd1c2e2d708fc7ff28a53f512408ab1025c71dec37eb",
+          "claim": "rpc：ADMISSION_METHODS 內的方法先取 admission ticket，凍結時回 handoff_frozen。"
+        }
+      ],
+      "sublabel": "event_rpc"
+    },
+    {
+      "id": "engine",
+      "label": "Event Engine",
+      "type": "backend",
+      "overview_component": "events",
+      "responsibility": "組裝 registry／counter／event log／matcher／dispatcher。持有規則集合與已啟用的 COM 集合（同一把鎖），以及每個 COM 一個永不重設的 LineBuffer；實作 RxObserver，把 reader 送來的 RX 切行後交給 matcher。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 169,
+          "end_line": 178,
+          "excerpt_sha256": "23f331774319ef59b600e447d78ece0db4618bcba5f6aabadfee0413e4d50fb6",
+          "claim": "EventEngine 的欄位：core、registry、inner（規則與 enabled）、matcher、buffers。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 77,
+          "end_line": 83,
+          "excerpt_sha256": "1c4024e29e95e40995bd0959a495c3338c90aa88a7c3a3c4fb1dd6446066fab9",
+          "claim": "Inner：rules、enabled、started、intake_closed。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 654,
+          "end_line": 659,
+          "excerpt_sha256": "204c08ad8e93358980c038ccb09555b10db1b0d785632c8a6bdba85d678fcbfc",
+          "claim": "EventEngine 實作 RxObserver，on_rx 轉呼 feed_rx。"
+        }
+      ],
+      "sublabel": "EventEngine"
+    },
+    {
+      "id": "files",
+      "label": "事件檔案",
+      "type": "database",
+      "overview_component": null,
+      "responsibility": "三類檔案。規則檔：RuleRegistry 把每條規則存成 `EVENTS_DIR/<rule_id>.json`（驗證後寫 tmp 再 replace）。counter：CounterStore 把每條規則的 fires／last_fire_ts／exhausted 存在 `EVENTS_RUNTIME_DIR`，缺檔視為歸零，有 write-through 快取。事件日誌 events.ndjson：每筆事件一行 JSON，超過 10 MiB 輪替、保留 3 份，每筆 append 後 fsync。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/event_engine/registry.rs",
+          "line": 140,
+          "end_line": 163,
+          "excerpt_sha256": "feb5ba5e33e6359d06eed229dc23b96b39247e45225d776787579178db628c93",
+          "claim": "規則檔 upsert：驗證 → 寫 <path>.tmp → sync → replace。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/counter.rs",
+          "line": 94,
+          "end_line": 100,
+          "excerpt_sha256": "74ea9ef72fa81fce45e27d50d1d5de4d1436c8b754e49a584ce0a5a6c6ef0091",
+          "claim": "CounterStore：存放於 EVENTS_RUNTIME_DIR，缺檔＝歸零，寫入經 tmp＋replace，write-through 快取。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/event_log.rs",
+          "line": 54,
+          "end_line": 67,
+          "excerpt_sha256": "cb3a687a10a6ef65e75cbec4b89217c529d5a6585e2b35d5ba096f4cc05b3a7d",
+          "claim": "事件日誌 write：補 ts → 判定輪替 → append → sync。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/event_log.rs",
+          "line": 15,
+          "end_line": 16,
+          "excerpt_sha256": "becd424f0fbf9974e32aa45ba8c4f1ec30d33360e3909b7fb5c375fdad449eaa",
+          "claim": "輪替門檻 10 MiB、備份 3 份。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/registry.rs",
+          "line": 165,
+          "end_line": 171,
+          "excerpt_sha256": "9002d8e40fe3d6cf71e4aebde716867663c49ee588abf4911bc9c35010427a0a",
+          "claim": "規則檔 delete：rule_id 不合法直接回 false，否則刪檔。"
+        }
+      ],
+      "sublabel": "規則／counter／日誌"
+    },
+    {
+      "id": "bridge",
+      "label": "UART bridge",
+      "type": "backend",
+      "overview_component": "bridge",
+      "responsibility": "IoWorker 的 reader 執行緒：每筆 RX 先寫 WAL，再依序呼叫 RX observer（帶 COM、資料與 WAL seq）；observer 的 panic 被攔下，不影響 reader。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 520,
+          "end_line": 525,
+          "excerpt_sha256": "d774abc9e0ad4c3b1f7573c9a86c5f5105f716d718162bd12c1412ead2bf4038",
+          "claim": "reader：WAL append 之後依序通知 observer，catch_unwind 包住。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 1070,
+          "end_line": 1074,
+          "excerpt_sha256": "7c802d9b93508cc7105a991f0e4ddf6fb2b609cc8fea4d5cae786947c04835a8",
+          "claim": "RxObserver trait：reader 在 WAL append 後呼叫，不得阻塞、不得回呼 SessionManager。"
+        }
+      ],
+      "sublabel": "reader 執行緒"
+    },
+    {
+      "id": "matcher",
+      "label": "Matcher",
+      "type": "backend",
+      "overview_component": null,
+      "responsibility": "執行緒 `event-matcher`：有界佇列（1024），滿載時丟最舊的一筆並記 event_dropped。逐條規則求值：selector 相符 → pattern 命中 → 依序過 scope、profile、max_fires、cooldown 四道閘門，全過才觸發。scope 與 profile 兩道閘門的依據來自 SessionManager（該 COM 有沒有前景命令、套用哪個 profile）。單筆求值 panic 只丟棄該筆。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/event_engine/matcher.rs",
+          "line": 303,
+          "end_line": 349,
+          "excerpt_sha256": "d7b69829b9d11c7f93778d77322b6a884a91975438cdf1b3b29ef98199492422",
+          "claim": "evaluate：selector、pattern、四道閘門、match_skipped（debug）與 emit_fire。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/matcher.rs",
+          "line": 381,
+          "end_line": 404,
+          "excerpt_sha256": "47e4b50049e89a84538dbc45be044c89f746a76747c82a29f727375d2ba4aa4e",
+          "claim": "feed_line：佇列未滿入列，滿載時 drop-oldest 並發 event_dropped。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/matcher.rs",
+          "line": 352,
+          "end_line": 379,
+          "excerpt_sha256": "3a03a31e3a833c36a8b98308e9a04658f0b82b9412be8a94070a0004e7d1dc08",
+          "claim": "MatcherWorker::start：編譯規則並啟動 event-matcher 執行緒。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 9247,
+          "end_line": 9263,
+          "excerpt_sha256": "5f3bd341e1bd8b3733161f09fd0b89fd600d1b14d7bc5865d855a23c0fa11f07",
+          "claim": "SessionManager 實作 BridgeQueries：active_cmd_id_for 在前景忙碌時回 \"foreground\"、否則 None；profile_for 回 profile 名稱。"
+        }
+      ],
+      "sublabel": "event-matcher"
+    },
+    {
+      "id": "dispatcher",
+      "label": "Dispatcher",
+      "type": "backend",
+      "overview_component": null,
+      "responsibility": "handler 派送：同一條規則同時只跑一個 handler，全 daemon 上限 8 個（超過即丟棄並記 event_dropped）。worker 執行緒 `event-dispatch-N` 組 payload 與環境、產生子行程、記錄結果事件，最後更新 counter。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/event_engine/dispatcher.rs",
+          "line": 392,
+          "end_line": 432,
+          "excerpt_sha256": "64f7f5e5987528e0d962a2ad278cdbbac3bea7bad442a478e7fc2bfcc8170a5f",
+          "claim": "dispatch：closed、per_rule_busy、per_daemon_saturated 的判定與送入 job channel。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/dispatcher.rs",
+          "line": 206,
+          "end_line": 243,
+          "excerpt_sha256": "b9657390795fb91556e06a3d49ad68307e750630dfd67a18c54ffd5c78c6dc80",
+          "claim": "run_inner：讀 counter、組 payload／env／argv、登記 abort 後呼叫 spawner.run。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 83,
+          "end_line": 85,
+          "excerpt_sha256": "a3b05f719b68d62eb44e226c4c2a0d2414f716e257974c0346e5b15c6cb56fef",
+          "claim": "matcher 佇列上限 1024、per-daemon handler 上限 8。"
+        }
+      ],
+      "sublabel": "event-dispatch-N"
+    },
+    {
+      "id": "handler",
+      "label": "外部 handler",
+      "type": "external",
+      "overview_component": "event-handler",
+      "responsibility": "規則指定的外部程式（`exec` argv 或 `shell` 字串）。以獨立子行程執行，stdin 收到一行 JSON payload，環境只有白名單變數加 `SERIALWRAP_EVENT_*`；逾時或 daemon 停止時整個行程群組／Job 被終止。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/process.rs",
+          "line": 159,
+          "end_line": 167,
+          "excerpt_sha256": "8dfe0106771166465d3d255725bd988f90626813caae818ac9c2030aad97bda1",
+          "claim": "HandlerSpawner trait：POSIX fork/exec＋process group；Windows CreateProcessW＋Job。"
+        },
+        {
+          "path": "crates/sw-pal/src/process/handler_posix.rs",
+          "line": 1,
+          "end_line": 4,
+          "excerpt_sha256": "f1bc003cb7834535079de4f3a28de5cbf19ce8d00d3781f0da136b789f605e2f",
+          "claim": "POSIX：setsid、close_fds、env 只放 spec、三條 stdio pipe；逾時 killpg(SIGTERM) → 1.0 s → killpg(SIGKILL)。"
+        },
+        {
+          "path": "crates/sw-pal/src/process/handler_windows.rs",
+          "line": 1,
+          "end_line": 4,
+          "excerpt_sha256": "0b8cb5f10891e33644cfeadaf56a2bfef2fcf88ea78789458589593d103dc3a9",
+          "claim": "Windows：CreateProcessW（CREATE_SUSPENDED）→ Job Object（KILL_ON_JOB_CLOSE）→ ResumeThread；逾時或 abort 時 TerminateJobObject。"
+        }
+      ],
+      "sublabel": "exec 或 shell"
+    }
+  ],
+  "steps": [
+    {
+      "id": "start-load",
+      "from": "engine",
+      "to": "files",
+      "label": "start：load_all 載入規則檔",
+      "phase": "規則管理",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 264,
+          "end_line": 305,
+          "excerpt_sha256": "72e2bbe606402e72ba05f049e21dd3d4fe69d4acc52eb87f6eb3eaccb2f9c4bb",
+          "claim": "start：建立 dispatcher → registry.load_all → 逐條記 rule_loaded 並 auto enable → 啟動 matcher。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1337,
+          "end_line": 1354,
+          "excerpt_sha256": "0522a13688a3db68ef2331a09305c69b11cc621da02235191218fd243175dfa2",
+          "claim": "serialwrapd 主流程建立 EventEngine 後立即 start（先於 bootstrap attach）。"
+        }
+      ],
+      "note": "由 serialwrapd 主流程在啟動時呼叫；規則的 auto_enable_com_on_load 為真時，selector 所列的 COM（`ALL` 展開為當下已知的 COM）一併啟用。"
+    },
+    {
+      "id": "rule-set-rpc",
+      "from": "cli",
+      "to": "service",
+      "label": "event.rule_set（add <規則檔>）",
+      "phase": "規則管理",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/event_cmd.rs",
+          "line": 28,
+          "end_line": 40,
+          "excerpt_sha256": "5798141d82c4cb430671a2a52590dcff1c9936bc687ddf9a13bab1cdf82788cc",
+          "claim": "add 對應 event.rule_set。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/event_cmd.rs",
+          "line": 47,
+          "end_line": 49,
+          "excerpt_sha256": "f00d645a335dad6e5b5dab0653453777b621e9aac3cb4f9b61a3dff11160ef7b",
+          "claim": "add：params 就是規則檔的內容。"
+        }
+      ]
+    },
+    {
+      "id": "rule-set",
+      "from": "service",
+      "to": "engine",
+      "label": "rule_set（先取 admission ticket）",
+      "phase": "規則管理",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 681,
+          "end_line": 689,
+          "excerpt_sha256": "5a87b252273812475cb7d663691985e52eb81e35885d263fa0e165b89aa6e2a6",
+          "claim": "event.rule_set：呼叫 engine.rule_set；schema 錯誤回 INVALID_RULE_SCHEMA。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 52,
+          "end_line": 65,
+          "excerpt_sha256": "4154e62fea4256e9510f343d760e275f4bc0197fd85c6ede336bfd0259b78656",
+          "claim": "ADMISSION_METHODS 含 event.com_disable／com_enable／reload／reset／rule_delete／rule_set。"
+        }
+      ],
+      "note": "停機或交接凍結後不再發 ticket，回 FLUSHED_BY_SHUTDOWN＋reason:handoff_frozen，沒有副作用。"
+    },
+    {
+      "id": "rule-upsert",
+      "from": "engine",
+      "to": "files",
+      "label": "upsert：驗證 → tmp → replace",
+      "phase": "規則管理",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 381,
+          "end_line": 402,
+          "excerpt_sha256": "9d8fc9c7409def7c8506ea455e2dd8132beda12a13f02de1c80e479bef3068c7",
+          "claim": "rule_set：registry.upsert → 更新規則集合 → 換 matcher 規則 → auto enable → 記 rule_loaded。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/registry.rs",
+          "line": 140,
+          "end_line": 163,
+          "excerpt_sha256": "feb5ba5e33e6359d06eed229dc23b96b39247e45225d776787579178db628c93",
+          "claim": "upsert 的寫檔順序。"
+        }
+      ]
+    },
+    {
+      "id": "rule-recompile",
+      "from": "engine",
+      "to": "matcher",
+      "label": "replace_rules（重新編譯 pattern）",
+      "phase": "規則管理",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 242,
+          "end_line": 251,
+          "excerpt_sha256": "bddd0871d37c8aa9c98f32a24091084bd1c7f6d1202ba65ff2eea5fcf7c7029d",
+          "claim": "replace_matcher_rules：把新的規則集合交給 matcher。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/matcher.rs",
+          "line": 406,
+          "end_line": 412,
+          "excerpt_sha256": "fcc9274c3226f0e7e84ef07a925f3f2efa52e5e885589efef5b25e904864ddcc",
+          "claim": "replace_rules：先換規則再重建編譯結果。"
+        }
+      ]
+    },
+    {
+      "id": "rule-loaded-log",
+      "from": "engine",
+      "to": "files",
+      "label": "記 rule_loaded（及 com_enabled）",
+      "phase": "規則管理",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 395,
+          "end_line": 400,
+          "excerpt_sha256": "9eb83fb5d07cafeb4e79a6de94f285a0baa39432df38214e04c62439087e45e8",
+          "claim": "rule_set 最後寫入 rule_loaded 事件。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 213,
+          "end_line": 223,
+          "excerpt_sha256": "51c3c16a7ea94d406cb1b90709b99e3340f5fa9dbd264f2cbbdbff03a84a9493",
+          "claim": "mark_enabled：COM 首次啟用時寫 com_enabled（triggered_by）。"
+        }
+      ]
+    },
+    {
+      "id": "rule-set-reply",
+      "from": "service",
+      "to": "cli",
+      "label": "ok＋規則內容",
+      "phase": "規則管理",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 681,
+          "end_line": 683,
+          "excerpt_sha256": "8fe741a153a8204a2a9d9704987c0ac09ef1b6fc92286197aaa2359610e51eaa",
+          "claim": "成功時回 {ok: true, **rule.raw}。"
+        }
+      ]
+    },
+    {
+      "id": "rule-other",
+      "from": "service",
+      "to": "engine",
+      "label": "rule_delete／list／get／reload／reset／tail",
+      "phase": "規則管理",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 690,
+          "end_line": 714,
+          "excerpt_sha256": "72ffc3fe2616b2647809bfafe3957fb93f80d6b71ec6807a2c9080bd022141b5",
+          "claim": "其餘規則類方法各自呼叫 engine 的對應函式。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 404,
+          "end_line": 423,
+          "excerpt_sha256": "e3528a1db38f7166be2613a602f1f1929a804777e2aea8a7d841ea28354311cd",
+          "claim": "rule_delete：刪檔成功才清 counter、更新 matcher、記 rule_unloaded。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 487,
+          "end_line": 528,
+          "excerpt_sha256": "a99160927b77bf9c245d87d09b3a7fd3c979a52c14667b80765d0c8bdfae83c4",
+          "claim": "reload：與磁碟比對後重新載入；移除者清 counter、新增者 auto enable，不會停用 COM。"
+        }
+      ],
+      "condition": "CLI 送 rm／list／show／reload／reset／tail",
+      "note": "list／show／tail 是唯讀查詢，不取 admission ticket；tail 只讀 events.ndjson 現行檔。"
+    },
+    {
+      "id": "com-rpc",
+      "from": "cli",
+      "to": "service",
+      "label": "event.com_enable／disable／status",
+      "phase": "COM 開關",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/event_cmd.rs",
+          "line": 34,
+          "end_line": 36,
+          "excerpt_sha256": "d6c052b2746627a6bca6c93fa2243b5c8af4e7818c6a17bb6fb2b7ed249cfdb7",
+          "claim": "enable／disable／status 對應的 RPC method。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/event_cmd.rs",
+          "line": 55,
+          "end_line": 55,
+          "excerpt_sha256": "5a512804530e7dcad60499548092d6507311be9b2731a3f166b46a6ebf6413a0",
+          "claim": "三者的 params 都只有 selector。"
+        }
+      ]
+    },
+    {
+      "id": "com-switch",
+      "from": "service",
+      "to": "engine",
+      "label": "com_enable／com_disable",
+      "phase": "COM 開關",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 702,
+          "end_line": 704,
+          "excerpt_sha256": "8383d795d4fa00477436c98e28583a8144f43252243c82e7b813008264ef4921",
+          "claim": "三個 COM 方法呼叫 engine 的 com_enable／com_disable／com_status。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 530,
+          "end_line": 536,
+          "excerpt_sha256": "ea10004e1f90dc6ec2f02e1621824c181460a5e0e741e4ac3e81069fd087eacc",
+          "claim": "com_enable：把 COM 加進 enabled 後回 com_status。"
+        }
+      ]
+    },
+    {
+      "id": "com-disable-reset",
+      "from": "engine",
+      "to": "files",
+      "label": "清除受影響規則的 counter",
+      "phase": "COM 開關",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 538,
+          "end_line": 560,
+          "excerpt_sha256": "b85ae156ff3435308f9931291bd9ab6180e4f1aa843406eb96b92407058d76ba",
+          "claim": "com_disable：先把 COM 移出 enabled，對 selector 命中的規則逐一 counter_reset，再記 com_disabled。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 562,
+          "end_line": 571,
+          "excerpt_sha256": "58c630b50c1622e0cb696f066b8afcac7290d3041d3629784ff0a538cd86ac70",
+          "claim": "counter_reset：清 counter 並寫 counter_reset 事件（previous_fires、triggered_by）。"
+        }
+      ],
+      "condition": "只在 com_disable"
+    },
+    {
+      "id": "com-log",
+      "from": "engine",
+      "to": "files",
+      "label": "記 com_enabled／com_disabled",
+      "phase": "COM 開關",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 213,
+          "end_line": 223,
+          "excerpt_sha256": "51c3c16a7ea94d406cb1b90709b99e3340f5fa9dbd264f2cbbdbff03a84a9493",
+          "claim": "com_enabled 只在 COM 原本未啟用時寫入。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 554,
+          "end_line": 558,
+          "excerpt_sha256": "6d4f2f19b8661a3ca067535b48cb105c687a238dc485e262773d6b6aa3357ff6",
+          "claim": "com_disabled 一律寫入，即使原本未啟用。"
+        }
+      ]
+    },
+    {
+      "id": "rx-notify",
+      "from": "bridge",
+      "to": "engine",
+      "label": "on_rx(com, data, wal_seq)",
+      "phase": "RX 比對",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 520,
+          "end_line": 525,
+          "excerpt_sha256": "d774abc9e0ad4c3b1f7573c9a86c5f5105f716d718162bd12c1412ead2bf4038",
+          "claim": "reader 在 WAL append 之後呼叫 observer。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 654,
+          "end_line": 659,
+          "excerpt_sha256": "204c08ad8e93358980c038ccb09555b10db1b0d785632c8a6bdba85d678fcbfc",
+          "claim": "EventEngine::on_rx 轉呼 feed_rx。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1366,
+          "end_line": 1366,
+          "excerpt_sha256": "dedb2550beaa634d040f301c88c5c0bdd901ee260d2da1e0386a8d4d89125c73",
+          "claim": "主流程把 engine 註冊為 SessionManager 的 RX observer。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7125,
+          "end_line": 7127,
+          "excerpt_sha256": "965488f3b5e1016ee72b142db6d30d8686f8603c736c6d504fb7aa4fd737c73c",
+          "claim": "add_rx_observer：把 observer 加進清單，之後建立的 session bridge reader 依序通知。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5183,
+          "end_line": 5183,
+          "excerpt_sha256": "635352a617105026bb72d69f30c442abfc01df411c15457fa53513f348ca3fb0",
+          "claim": "建立 session bridge 時複製目前的 rx_observers 交給 reader。"
+        }
+      ],
+      "note": "前提：daemon 主流程啟動時以 `add_rx_observer` 把 engine 註冊到 SessionManager 的 RX observer 清單，bridge reader 由此通知 engine；必須在 bootstrap attach 之前註冊，因為 reader 建立時才取清單快照。通知在 reader 執行緒上執行；flash 認線協調者的 observer 排在 Event Engine 之前。"
+    },
+    {
+      "id": "feed-line",
+      "from": "engine",
+      "to": "matcher",
+      "label": "feed_line（逐行入列）",
+      "phase": "RX 比對",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 355,
+          "end_line": 379,
+          "excerpt_sha256": "d7db7b64005d8a856c5e9e99d51f694dd165577303366bbaf4bacab90a3e7c01",
+          "claim": "feed_rx：per-COM LineBuffer 切行；intake 已關或 COM 未啟用則略過，否則 matcher.feed_line。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/line_buffer.rs",
+          "line": 1,
+          "end_line": 5,
+          "excerpt_sha256": "33e09155690a5884554e05f40f3aaca4d90ebafaf0f585d0d3aebf2fe2d38966",
+          "claim": "LineBuffer：依 \\n 切行、去尾端 \\r、超過上限截斷並加 ...truncated、解碼後去 ANSI。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/matcher.rs",
+          "line": 381,
+          "end_line": 404,
+          "excerpt_sha256": "47e4b50049e89a84538dbc45be044c89f746a76747c82a29f727375d2ba4aa4e",
+          "claim": "feed_line：佇列滿載時丟最舊一筆並發 event_dropped。"
+        }
+      ],
+      "condition": "該 COM 已啟用且 intake 未關閉",
+      "note": "每行上限 16 KiB；未啟用的 COM 仍會切行，只是不送 matcher。"
+    },
+    {
+      "id": "read-counter",
+      "from": "matcher",
+      "to": "files",
+      "label": "讀 counter（max_fires／cooldown）",
+      "phase": "RX 比對",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/event_engine/matcher.rs",
+          "line": 303,
+          "end_line": 333,
+          "excerpt_sha256": "97f5541212e425254fe583de71eea0a9f9e77ef014872eef8f65988fe3a5a751",
+          "claim": "閘門順序：scope → profile → max_fires → cooldown。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 158,
+          "end_line": 163,
+          "excerpt_sha256": "4155b72e828037c1c50a901365d82aedb530905a3e8a0f6662f1397fefcd55d1",
+          "claim": "counter_for：從 CounterStore 載入該規則的 counter。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/matcher.rs",
+          "line": 313,
+          "end_line": 316,
+          "excerpt_sha256": "a17abecf3912ec6f114065c5ac5448d400cccf741de39e326f69d46283fda4a9",
+          "claim": "evaluate 先取 counter、現在時刻、active_cmd_id 與 COM 的 profile。"
+        }
+      ],
+      "note": "scope 閘門只用到「該 COM 有沒有前景命令」（SessionManager 回 \"foreground\" 或 None），不是實際的 cmd_id；Python 0.4.x 的 SessionManager 同樣如此。"
+    },
+    {
+      "id": "match-recorded",
+      "from": "matcher",
+      "to": "files",
+      "label": "記 match_recorded",
+      "phase": "RX 比對",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 115,
+          "end_line": 129,
+          "excerpt_sha256": "2058de0184c2c8519fd03a182808699450366934751204c14b0dd0aaad437e7c",
+          "claim": "emit_fire：先寫 match_recorded（rule_id、selector、wal_seq、matched_text）。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/matcher.rs",
+          "line": 334,
+          "end_line": 347,
+          "excerpt_sha256": "98910de023f84d5badbf89ebb04a3e04bd26a7ab219d45d2012182c0344fbf9c",
+          "claim": "被擋下且規則 debug 為真時發 match_skipped；通過則 emit_fire。"
+        }
+      ],
+      "condition": "pattern 命中且四道閘門全過",
+      "note": "被閘門擋下時，只有 debug 為真的規則會記 match_skipped（附原因）；其餘不留紀錄。"
+    },
+    {
+      "id": "dispatch",
+      "from": "matcher",
+      "to": "dispatcher",
+      "label": "dispatch(fire)",
+      "phase": "handler 派送",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/event_engine/mod.rs",
+          "line": 130,
+          "end_line": 153,
+          "excerpt_sha256": "9ed9dab468b01fe5f0bd9abbdd92a0f4a8f8d899462441688899ee3e545e1d8e",
+          "claim": "emit_fire：達到 max_fires 時先把 counter 標為 exhausted，再呼叫 dispatcher.dispatch。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/dispatcher.rs",
+          "line": 392,
+          "end_line": 432,
+          "excerpt_sha256": "64f7f5e5987528e0d962a2ad278cdbbac3bea7bad442a478e7fc2bfcc8170a5f",
+          "claim": "dispatch：登記 busy／inflight 後以 try_send 送入 job channel。"
+        }
+      ]
+    },
+    {
+      "id": "dropped",
+      "from": "dispatcher",
+      "to": "files",
+      "label": "記 event_dropped",
+      "phase": "handler 派送",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/event_engine/dispatcher.rs",
+          "line": 399,
+          "end_line": 414,
+          "excerpt_sha256": "d347f8023931ee22cab118f2556a2e81c977b1c87985a277841ddd8666dc0dc9",
+          "claim": "per_rule_busy 與 per_daemon_saturated 兩種丟棄原因。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/dispatcher.rs",
+          "line": 1,
+          "end_line": 3,
+          "excerpt_sha256": "a8c53a8a3076ff169f7cadb17d0c37c55b5e67080109f0c9f1dc334faadc1f99",
+          "claim": "per-rule 併發 1、per-daemon 上限 per_daemon_max。"
+        }
+      ],
+      "condition": "同規則 handler 仍在跑，或全 daemon 已滿 8 個"
+    },
+    {
+      "id": "spawn",
+      "from": "dispatcher",
+      "to": "handler",
+      "label": "啟動子行程：stdin JSON＋環境變數",
+      "phase": "handler 派送",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/event_engine/dispatcher.rs",
+          "line": 206,
+          "end_line": 243,
+          "excerpt_sha256": "b9657390795fb91556e06a3d49ad68307e750630dfd67a18c54ffd5c78c6dc80",
+          "claim": "run_inner：payload、白名單環境加 SERIALWRAP_EVENT_*、argv（exec 或 shell）、timeout，交給 spawner.run。"
+        },
+        {
+          "path": "crates/sw-pal/src/process.rs",
+          "line": 172,
+          "end_line": 182,
+          "excerpt_sha256": "16abac0a60768f7d4434093c3f60ad5f3209eaf042b8067a02c71663b708028b",
+          "claim": "shell 字串依平台轉成 argv（cfg(unix)｜cfg(windows)）。"
+        },
+        {
+          "path": "crates/sw-pal/src/process/handler_posix.rs",
+          "line": 139,
+          "end_line": 141,
+          "excerpt_sha256": "59deabe09ba0ae483c14194f6cb076a9afb15c1c511b5d230ce0dc26ae5b3736",
+          "claim": "POSIX：/bin/sh -c <shell>。"
+        },
+        {
+          "path": "crates/sw-pal/src/process/handler_windows.rs",
+          "line": 51,
+          "end_line": 57,
+          "excerpt_sha256": "31aa9e58e49a7dc79f87eca9e8142fc230a7b59065a68c67a369c36ed55cbcc9",
+          "claim": "Windows：cmd.exe /d /s /c <shell>。"
+        }
+      ],
+      "note": "Linux｜Windows：`/bin/sh -c`、setsid 新 session｜`cmd.exe /d /s /c`、Job Object。規則用 exec 時直接以 argv 啟動，不經 shell。"
+    },
+    {
+      "id": "outcome",
+      "from": "handler",
+      "to": "dispatcher",
+      "label": "exit code＋輸出尾段，或逾時",
+      "phase": "handler 派送",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/event_engine/dispatcher.rs",
+          "line": 246,
+          "end_line": 309,
+          "excerpt_sha256": "f668ab02c32bcc0744360b802ed95e88c9002295081736ff68833944adec3081",
+          "claim": "三種結果：SpawnFailed、Completed（exit_code、stdout／stderr tail）、TimedOut。"
+        },
+        {
+          "path": "crates/sw-pal/src/process/handler_posix.rs",
+          "line": 262,
+          "end_line": 285,
+          "excerpt_sha256": "1a5f7c0ae6d16b2f9e10eec5bc8c400c8884c530bc22500e56f83bf6fa0880c7",
+          "claim": "POSIX 逾時：killpg(SIGTERM) → 等寬限 → killpg(SIGKILL) → 讀完輸出並回收。"
+        }
+      ],
+      "note": "Linux｜Windows：逾時時 killpg(SIGTERM) 後 SIGKILL｜TerminateJobObject。stdout／stderr 各只保留最後 4096 bytes。"
+    },
+    {
+      "id": "fire-log",
+      "from": "dispatcher",
+      "to": "files",
+      "label": "記 fire_completed／timeout／failed",
+      "phase": "handler 派送",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/event_engine/dispatcher.rs",
+          "line": 246,
+          "end_line": 309,
+          "excerpt_sha256": "f668ab02c32bcc0744360b802ed95e88c9002295081736ff68833944adec3081",
+          "claim": "依結果寫 fire_failed、fire_completed 或 fire_timeout。"
+        }
+      ]
+    },
+    {
+      "id": "counter-update",
+      "from": "dispatcher",
+      "to": "files",
+      "label": "更新 fires／last_fire_ts",
+      "phase": "handler 派送",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/event_engine/dispatcher.rs",
+          "line": 310,
+          "end_line": 323,
+          "excerpt_sha256": "c1fafe32534bcb15f86a90db268a66983787e5947e76c7f26b62311bdb4ac5ac",
+          "claim": "結果事件寫入成功後才 post_fire_counter_update：重讀 counter、寫回 fires 與完成時刻。"
+        }
+      ],
+      "condition": "結果事件已寫入 events.ndjson",
+      "note": "cooldown 從 handler 完成時刻起算，不是從比對時刻。"
+    }
+  ],
+  "unknowns": [
+    {
+      "id": "windows-not-executed",
+      "question": "Windows 的 handler 啟動與終止路徑（CreateProcessW、Job Object、TerminateJobObject）實際行為是否與原始碼註解一致？",
+      "impact": "本頁 Windows 一側只依 cfg(windows) 分支與模組註解判讀，沒有在 Windows 上執行 handler；若實作與註解不一致，spawn 與 outcome 兩步的 Windows 描述會不準。"
+    },
+    {
+      "id": "recompile-failure-ignored",
+      "question": "rule_set／rule_delete／reload 呼叫 matcher.replace_rules 時忽略回傳值；若重建編譯結果失敗，matcher 的規則清單與編譯結果會不會不一致？",
+      "impact": "registry.upsert 已先驗證規則，推測編譯失敗不會發生，但本頁沒有逐一核對 validate_rule_dict 是否涵蓋 pattern 可編譯性；若會發生，新規則可能已寫檔卻不會被比對。"
+    },
+    {
+      "id": "python-baseline-not-compared",
+      "question": "各步驟與 Python 0.4.x 基線的行為差異是否都已標出？",
+      "impact": "本頁描述的是 Rust 實作，只在撰寫時實際對照過 sw_core 的地方於步驟 note 標註差異或相同；沒有逐步比對 Python 實作，所以沒有標註不代表沒有差異。"
+    }
+  ],
+  "conflicts": []
+}
