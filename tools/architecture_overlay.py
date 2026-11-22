@@ -225,9 +225,12 @@ def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _check_path(path: str, where: str) -> str:
+def _check_path(path, where: str) -> str:
+    # 先確認型別：非字串值交給 normpath 會丟 TypeError，繞過 CLI 的 JSON 錯誤回報。
+    if not isinstance(path, str):
+        raise OverlayError(f'{where}: path must be a string')
     pure = posixpath.normpath(path)
-    if (not isinstance(path, str) or not path.endswith('.html') or path.startswith('/') or '\\' in path
+    if (not path.endswith('.html') or path.startswith('/') or '\\' in path
             or pure != path or pure.startswith('..') or '//' in path or ':' in path):
         raise OverlayError(f'{where}: path must be a relative POSIX .html path')
     return path
@@ -261,7 +264,7 @@ def load_pages(data: dict) -> dict:
         if not isinstance(page['available'], bool):
             raise OverlayError(f'{where}.available: must be boolean')
         _check_path(page['path'], where)
-        if 'parent' in page and page['parent'] not in seen:
+        if 'parent' in page and (not isinstance(page['parent'], str) or page['parent'] not in seen):
             raise OverlayError(f'{where}.parent: must name an earlier top-level page')
         seen.add(page['id'])
         out.append(dict(page))
