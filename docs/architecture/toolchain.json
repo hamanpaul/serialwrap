@@ -125,6 +125,20 @@
         "html": "af259c7dbec556af946468ab0bcefd68f811a0aa91bef9eb301e457f212d1ef8"
       }
     },
+    "08-logs-evidence": {
+      "diagram_type": "sequence",
+      "source_revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347",
+      "facts": "features/08-logs-evidence.facts.json",
+      "ir": "features/08-logs-evidence.json",
+      "html": "features/08-logs-evidence.html",
+      "overlay_version": 1,
+      "sha256": {
+        "facts": "a49df401a80627e93ebd4bb5ef0417d4bf6c933118e8c0a82d191209eedfa5f4",
+        "ir": "a54ad2a77526a42b5f7563648d47187e4f01cf308dfbe3ba004e418a7b074c95",
+        "delivery": "970886d357971a5235de2c2c13882076814977397b66a72a69d81ecb464956ba",
+        "html": "2eab5e00afb3b27f9caa998ceddca68e7188308d4386a6998858c3bf91e0b427"
+      }
+    },
     "09-daemon-mgmt": {
       "diagram_type": "sequence",
       "source_revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347",
