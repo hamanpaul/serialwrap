@@ -54,6 +54,20 @@
         "delivery": "b04d903ae5c2855e28322d8ed55fa5ad86e6e7542b21177ddf4737c790e991b9",
         "html": "c189bd4b4dad4b225bc01c8d5261c045725fc5603193ea3136558b380e114761"
       }
+    },
+    "03-device-mgmt": {
+      "diagram_type": "sequence",
+      "source_revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347",
+      "facts": "features/03-device-mgmt.facts.json",
+      "ir": "features/03-device-mgmt.json",
+      "html": "features/03-device-mgmt.html",
+      "overlay_version": 1,
+      "sha256": {
+        "facts": "c7d2ffd549e415960b5563393e62d59bfb3d2166ee99ba4e1e4674714aefe24e",
+        "ir": "4ec701427415830f63dc2612fd0d16cfba7f7581d78e9e4dff745087ffc02217",
+        "delivery": "92414c53627388d19e93755e7d2165bb62cf9edde8af83d01a2706a4a4353acd",
+        "html": "53eb12638e9ef5062cc7fa98525c2157f068c4b1b6809f3f8037f4c85fc32520"
+      }
     }
   }
 }
