@@ -90,7 +90,7 @@ flash 的 `/dev/ttyMCU` 端點只在 Linux；Windows 由外部工具走 device r
 功能頁分支（`feature/arch-feature-<NN>-<slug>`）交付 facts、IR 與**原版** Archify HTML 三個檔。收到後：
 
 1. **合入三個檔**：把分支 merge 進 `feature/architecture-features`（只會新增 `docs/architecture/features/<NN>-<slug>.*`）。續頁要先列進 `pages.json` 該功能的 `continuations`。
-2. **整合該頁**：`python3 tools/architecture_integrate.py <NN>-<slug> --archify-root <archify>/archify`。它依序：以 `tools/architecture_feature_check.py` 驗事實與投影（0 錯誤才繼續）；以釘選的 Archify 重新交付 IR，確認提交的 HTML 是原版輸出（逐位元組相同，沒有被手改）；套用加工；在 `toolchain.json` 記下該頁的 facts／IR／原版交付／最終 HTML sha256 與加工版本。這一步只寫該頁的 HTML 與 `toolchain.json` 的該頁項目，不碰別頁。
+2. **整合該頁**：`python3 tools/architecture_integrate.py <NN>-<slug> --archify-root <archify>/archify`。它依序：以 `tools/architecture_feature_check.py` 驗事實與投影（0 錯誤才繼續）；以釘選的 Archify 重新交付 IR，確認提交的 HTML 是原版輸出（逐位元組相同，沒有被手改）；套用加工；在 `toolchain.json` 記下該頁的 facts／IR／原版交付／最終 HTML sha256 與加工版本。這一步只寫該頁的 HTML 與 `toolchain.json` 的該頁項目，不碰別頁。此時可以用 `python3 tools/architecture_review.py --page <NN>-<slug> --archify-root <archify>/archify` 與 `python3 tools/architecture_browser.py --html docs/architecture/features/<NN>-<slug>.html --output <dir>` 單獨驗這一頁（別頁導覽列尚未更新，完整核對要等第 3 步）。
 3. **更新導覽列**：所有要整合的頁都做完第 2 步後，執行 `python3 tools/architecture_integrate.py --refresh-nav`，依目前已整合的頁面重新產生每一頁（含總覽）的加工區塊，讓導覽列上新整合的頁面變成可點的連結。只替換加工區塊，原版交付不變（工具會先核對移除加工後的雜湊）。
 4. **驗證**：跑下一節的 review、browser、visual-check 與 pytest。
 
