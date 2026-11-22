@@ -30,3 +30,11 @@ codegen-units = 1
 panic = "unwind"
 debug = 1
 strip = "none"
+
+# dev profile 只把 sha2 以最佳化編譯（test profile 繼承 dev；release profile 不讀此區段，產物不變）。
+# `mkbundle.sh --dev` 的 debug bundle 約 230 MiB；`setup` 在預檢（safety_check）之前要驗來源與 staging 各一次，
+# 大檔各算兩遍，共約 850 MiB 的 SHA-256。opt-level 0 的 sha2 只有約 60 MiB/s（無 SHA 指令集時的軟體後端約 30 MiB/s），
+# 這一步就要 13 s 以上，貼近黑箱更新測試 20 s／30 s 的等待上限，hosted runner 較慢時 6 支測試成批逾時。
+# 最佳化後約 2400 MiB/s（軟體後端約 570 MiB/s），同一段降到 1 s 左右。
+[profile.dev.package.sha2]
+opt-level = 3
