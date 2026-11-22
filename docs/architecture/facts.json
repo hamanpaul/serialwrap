@@ -3,19 +3,19 @@
   "document_type": "architecture-facts",
   "repository": {
     "url": "https://github.com/hamanpaul/serialwrap",
-    "revision": "85a16533a329a2a7d76b025de3762a82a4cd0472"
+    "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347"
   },
   "scope": {
-    "name": "serialwrap 0.5.0（Stage 2）：Rust CLI＋Rust daemon 的命令主線、Session 控制、human 共用與 I/O 支線",
+    "name": "serialwrap 架構總覽（main 12eb9a0e，Rust CLI＋Rust daemon）：命令主線、Session 控制、human 共用、I/O 支線與平台層",
     "includes": [
       "以 line 命令呈現主要呼叫鏈；節點 1–6 是實際呼叫順序，不是 Cortex WorkflowRun",
       "Rust daemon 的實際執行單位：RPC 連線執行緒、SessionManager、每 session 的 actor、OpRunner、IoWorker（reader＋TxWriter）、ConsoleHub",
       "command、session、lease、background capture 分開建模；state.json 只列實際持久化的五個 key",
-      "sw-pal 的 Linux｜Windows 後端差異以元件 sublabel 與邊標籤呈現（RPC、序列埠、console、實例鎖、裝置來源）",
-      "human console、WAL、事件觸發、檔案傳輸、flash／裝置交接支線，以及 serialwrapd 的啟動與停止序"
+      "四個邊界都是實際的行程／函式庫／外部邊界：使用者端（CLI 行程與人工終端程式）、serialwrapd 行程、sw-pal 函式庫、serialwrap 以外的裝置與程式；Linux｜Windows 差異集中寫在平台層節點的 sublabel",
+      "human console、WAL、事件觸發、檔案傳輸、flash／裝置交接支線，以及 serialwrapd 的啟動與停止序（含 issue 282 停機時的傳輸行收尾）"
     ],
     "excludes": [
-      "repo 內的 Python daemon（sw_core/）是凍結的行為基線；Stage 2 bundle 的 daemon implementation 為 rust，不畫成執行期元件",
+      "repo 內的 Python daemon（sw_core/）是凍結的行為基線；release bundle 的 daemon implementation 為 rust，不畫成執行期元件",
       "bundle manifest 的 python_cli_delegate 與 Python runtime 欄位：委派集合為空，不畫成執行期元件（見 conflicts）",
       "未合併的分支與計畫（含 Stage 3 與待修 issue 的修正分支）不提升為既有實作",
       "installer／更新與回退、systemd／Windows 工作排程、SSH／遠端通道可達性細節",
@@ -67,14 +67,14 @@
       "id": "bridge",
       "label": "5 UART bridge",
       "type": "backend",
-      "sublabel": "IoWorker：termios｜COM",
-      "responsibility": "IoWorker 把獨占開啟的 SerialHandle 拆成一條 reader 執行緒與唯一的 TxWriter 執行緒。reader：讀取 → WAL RX → RX observer → RX 視窗 → ConsoleHub tap → actor data lane。TxWriter：出列先查 Fence，OS 提交時在 Fence 鎖內重驗，確認寫出的 bytes 才記 WAL TX。序列埠後端由 sw-pal 提供：Linux termios｜Windows overlapped COM。",
+      "sublabel": "IoWorker：reader＋TxWriter",
+      "responsibility": "IoWorker 把獨占開啟的 SerialHandle 拆成一條 reader 執行緒與唯一的 TxWriter 執行緒。reader：讀取 → WAL RX → RX observer → RX 視窗 → ConsoleHub tap → actor data lane。TxWriter：出列先查 Fence，OS 提交時在 Fence 鎖內重驗，確認寫出的 bytes 才記 WAL TX。開埠由 SessionManager 的執行器經平台層序列埠能力完成。",
       "basis": "observed",
       "evidence": [
         {
           "path": "crates/sw-core/src/tx_writer.rs",
-          "line": 883,
-          "end_line": 971,
+          "line": 1049,
+          "end_line": 1137,
           "excerpt_sha256": "4dfc84764f35487ff1ee670669a6a6c88889f53a63c196637e2d3b12adc31259",
           "claim": "TxWriter：Fence 出列檢查、write_gated 提交、確認寫出的 bytes 才記 WAL TX。"
         },
@@ -98,13 +98,6 @@
           "end_line": 734,
           "excerpt_sha256": "6cb899ecb6f729fc3fbd36e2a1f45e7325b27b766009e78f2a1ac79ae043d330",
           "claim": "start_observed：split SerialHandle，啟動 reader 與 TxWriter。"
-        },
-        {
-          "path": "crates/sw-pal/src/lib.rs",
-          "line": 183,
-          "end_line": 293,
-          "excerpt_sha256": "5d31e3bf3998d2a38ea71ba7ea3a6cd906ceee2c0e18d9c23f944c339fbd8b01",
-          "claim": "native()：unix 組 PosixSerialBackend，windows 組 WindowsSerialBackend。"
         }
       ]
     },
@@ -158,7 +151,7 @@
       "label": "1 CLI／Agent",
       "type": "frontend",
       "sublabel": "serialwrap（Rust）",
-      "responsibility": "Rust CLI（sw-cli）以 sw-proto 的單行 JSON 請求經 sw-pal RpcConnector 連 daemon：Linux 預設 AF_UNIX，Windows 為 TCP loopback。委派集合為空，0.5.0 的子命令全由 Rust 處理。只有唯讀白名單方法遇暫態錯誤才退避重試；command.submit 等寫入不自動重送，TIMEOUT 不代表目標命令已取消。",
+      "responsibility": "Rust CLI（sw-cli）以 sw-proto 的單行 JSON 請求經 sw-pal RpcConnector 連 daemon：Linux 預設 AF_UNIX，Windows 為 TCP loopback。委派集合為空，子命令全由 Rust 處理。只有唯讀白名單方法遇暫態錯誤才退避重試；command.submit 等寫入不自動重送，TIMEOUT 不代表目標命令已取消。",
       "basis": "observed",
       "evidence": [
         {
@@ -261,8 +254,8 @@
       "id": "console-hub",
       "label": "ConsoleHub",
       "type": "backend",
-      "sublabel": "PTY｜TCP Telnet",
-      "responsibility": "每個 session 一條不阻塞的 hub 執行緒：把 reader tap 來的 RX fan-out 給各 console，把 console 輸入以 ConsoleInputBytes 送進 actor 的 data lane；Telnet 協商與 peer 掃描也在這裡。承接方式由 sw-pal 決定：Linux 為 PTY，無 PTY 的 Windows 為 127.0.0.1 TCP＋Telnet（另可選 com0com）。hub 不決定 ownership，也不直接寫 UART。",
+      "sublabel": "RX fan-out／console 輸入",
+      "responsibility": "每個 session 一條不阻塞的 hub 執行緒：把 reader tap 來的 RX fan-out 給各 console，把 console 輸入以 ConsoleInputBytes 送進 actor 的 data lane；Telnet 協商與 peer 掃描也在這裡。console 端點由平台層的 console 能力提供。hub 不決定 ownership，也不直接寫 UART。",
       "basis": "observed",
       "evidence": [
         {
@@ -288,24 +281,10 @@
         },
         {
           "path": "crates/sw-core/src/session_manager.rs",
-          "line": 7697,
-          "end_line": 7743,
+          "line": 7702,
+          "end_line": 7748,
           "excerpt_sha256": "f8016b26369950a0bae46d93fba07cade4b428443cca12af795f186d9412558c",
           "claim": "console_attach：PTY 後端先建 PTY 再交 hub；非 PTY 後端不建。"
-        },
-        {
-          "path": "crates/sw-pal/src/console_tcp.rs",
-          "line": 1,
-          "end_line": 2,
-          "excerpt_sha256": "a1535cd6cc2971402540422ac0e5c00a6fb76576976bbc81b9aac8cbdac092ef",
-          "claim": "TCP＋Telnet console listener 只綁 127.0.0.1。"
-        },
-        {
-          "path": "crates/sw-pal/src/lib.rs",
-          "line": 70,
-          "end_line": 75,
-          "excerpt_sha256": "d6f7a115e1a71f6e2604242cbe03fe740470aa305e1db62b3ab0c4a070796601",
-          "claim": "ConsoleKind：POSIX 為 PTY，無 PTY 平台為 127.0.0.1 TCP。"
         }
       ]
     },
@@ -313,16 +292,30 @@
       "id": "daemon-main",
       "label": "serialwrapd 主流程",
       "type": "backend",
-      "sublabel": "鎖：flock｜LockFileEx",
-      "responsibility": "serialwrapd 入口依 manifest 的 implementation 分派；rust（或開發 build）走 daemon_main。啟動序：allowlist → profiles → 實例鎖 → state.json／WAL → SessionManager → Event Engine → 初次掃描／rank／bootstrap → watcher → ttyMCU 端點 → RPC bind。停止序：停 accept、stopping gate、停 watcher 與事件受理、停 ttyMCU、session Phase 1、join handler、Phase 2、event handler 收斂、WAL flush＋close、釋放實例鎖；任一步逾時不跳過後續步驟。",
+      "sublabel": "啟動序／停止序",
+      "responsibility": "serialwrapd 入口依 manifest 的 implementation 分派；rust（或開發 build）走 daemon_main。入口以 sw_pal::native_client() 建立 Platform，再把各平台能力注入 WAL、SessionManager、watcher 與 RPC listener。啟動序：allowlist → profiles → 實例鎖 → state.json／WAL → SessionManager → Event Engine → 初次掃描／rank／bootstrap → watcher → ttyMCU 端點 → RPC bind。停止序：停 accept、stopping gate（各 session 的 TX Fence 此時凍結；有檔案傳輸的命令列正在送時先等它收尾，最多 1250 ms）、停 watcher 與事件受理、停 ttyMCU、session Phase 1、join handler、Phase 2、event handler 收斂、WAL flush＋close、釋放實例鎖。行收尾耗時從 Phase 1～2 共用的 5 s 預算扣除；任一步逾時不跳過後續步驟。",
       "basis": "observed",
       "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8515,
+          "end_line": 8527,
+          "excerpt_sha256": "dbe2a0dee14de3fcfe42a42790256603f01b94f7269c7ca4034ee30f9274890f",
+          "claim": "begin_shutdown：各 Fence 停機凍結；有待收尾的傳輸行時共用一個期限等待，記下耗時。"
+        },
         {
           "path": "crates/sw-daemon/src/daemon_main.rs",
           "line": 1219,
           "end_line": 1233,
           "excerpt_sha256": "cfa431d65b9858b755a114d4add674242b3e1198c0edc6bab2e5bc467dfc3408",
           "claim": "取得實例鎖；已有 daemon 回 DAEMON_ALREADY_RUNNING。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1280,
+          "end_line": 1299,
+          "excerpt_sha256": "87a3aec7cf2917aba015e13fc771832167e8b13eb7de2063817e9408d46f3564",
+          "claim": "SessionManager 以 Platform 的 serial／uart_excl／console／fs／clock 與 WAL、StateStore 組裝。"
         },
         {
           "path": "crates/sw-daemon/src/daemon_main.rs",
@@ -349,8 +342,8 @@
           "path": "crates/sw-daemon/src/daemon_main.rs",
           "line": 1499,
           "end_line": 1514,
-          "excerpt_sha256": "dd0d22373a512ca271cd537b9a9d5121176c82171429263a6c52f68f2a64c709",
-          "claim": "session Phase 1 → join handler → Phase 2，共用同一期限。"
+          "excerpt_sha256": "d4ec7241f749deb03cbf8b8302e08f2527937ee63c7c7a44dd074aa9244d7a56",
+          "claim": "步驟 3～5：1a 行收尾耗時自 5 s drain 預算扣除後，session Phase 1 → join handler → Phase 2。"
         },
         {
           "path": "crates/sw-daemon/src/daemon_main.rs",
@@ -367,18 +360,11 @@
           "claim": "dispatch_to_rust_daemon：implementation 為 rust 或無 manifest 的開發 build 才進 Rust daemon。"
         },
         {
-          "path": "crates/sw-pal/src/lock/posix.rs",
-          "line": 46,
-          "end_line": 46,
-          "excerpt_sha256": "728c8065594cfd763fbcf487d1124557dee2d25451a95fc3de310f33024bd440",
-          "claim": "POSIX 實例鎖以 flock(LOCK_EX|LOCK_NB) 取得。"
-        },
-        {
-          "path": "crates/sw-pal/src/lock/windows.rs",
-          "line": 79,
-          "end_line": 91,
-          "excerpt_sha256": "a46332706b42d4400ed2d96bbd820df64132a3681e5bc4d0c2af0539b2795cf8",
-          "claim": "Windows 實例鎖以 LockFileEx（獨占、立即失敗）取得；取不到即 AlreadyRunning。"
+          "path": "crates/sw-daemon/src/main.rs",
+          "line": 11,
+          "end_line": 16,
+          "excerpt_sha256": "f55758a014730c0ec37c5c0ee688c901bbfaf5bbc668459ebb7a2506a5a3e5fc",
+          "claim": "入口以 sw_pal::native_client() 建立 Platform，再依 manifest 分派。"
         }
       ]
     },
@@ -494,36 +480,43 @@
       "label": "TX Fence",
       "type": "security",
       "sublabel": "送出前授權",
-      "responsibility": "每個 session 一把 TX 閘。SessionCore 發布 active_epoch、owner_gen／fsm_gen、quiet／reconfirm、flash_mode、frozen 與 human admission；TxWriter 依 TxClass 判定，拒絕即零 TX。flash probe／FLASHING 期間只放行對應類別；交接或關機凍結後一律拒絕。WAL 不健康也會反映在這裡。",
+      "responsibility": "每個 session 一把 TX 閘。SessionCore 發布 active_epoch、owner_gen／fsm_gen、quiet／reconfirm、flash_mode、frozen 與 human admission；TxWriter 依 TxClass 判定，拒絕即零 TX。flash probe／FLASHING 期間只放行對應類別；交接或關機凍結後一律拒絕。停機時若有 file.push／pull 的 echo-paced 命令列持有 Fence，先進入待凍結，只放行該 op 的 FileTransfer TX 讓那一行收尾，收尾或逾時後才凍結（issue 282）。WAL 不健康也會反映在這裡。",
       "basis": "observed",
       "evidence": [
         {
           "path": "crates/sw-core/src/tx_writer.rs",
-          "line": 86,
-          "end_line": 129,
-          "excerpt_sha256": "fd24f37108f885c9e7b64dbe162bd416225a9ca3dd927284e975ccaead6e3d3a",
-          "claim": "FenceState：epoch、世代、quiet／reconfirm、flash_mode、frozen、human admission 等欄位。"
+          "line": 87,
+          "end_line": 134,
+          "excerpt_sha256": "1bd5c778cd7a701fa9755e4b9e4475375f91205d685fa6cb8136f0289a261717",
+          "claim": "FenceState：epoch、世代、quiet／reconfirm、flash_mode、frozen、human admission，以及 issue 282 的 transfer_line 與 shutdown_freeze_pending。"
         },
         {
           "path": "crates/sw-core/src/tx_writer.rs",
-          "line": 326,
-          "end_line": 414,
-          "excerpt_sha256": "6bdf957a96de98773ec2a5429a8140342133fac56d8aa181fffceb38477218f2",
-          "claim": "Fence::admit：依 TxClass 與 fence 狀態決定放行或拒絕原因。"
+          "line": 322,
+          "end_line": 400,
+          "excerpt_sha256": "8c62cb227bc82377e57e597415a30e4292b10fcaff0e5bebf565d60a3b715c0d",
+          "claim": "freeze_for_shutdown_settling／force_shutdown_freeze／open_transfer_line／close_transfer_line：待凍結、軟喚醒持有者、收尾後凍結。"
         },
         {
           "path": "crates/sw-core/src/tx_writer.rs",
-          "line": 429,
-          "end_line": 434,
+          "line": 474,
+          "end_line": 567,
+          "excerpt_sha256": "3a480511e3ac780beb50b72d49b99ed4b491986dcbf392b43bc683840a277e01",
+          "claim": "Fence::admit：frozen 一律拒絕；待凍結時只放行持有傳輸行的 FileTransfer op；其餘依 TxClass 與 fence 狀態判定。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 582,
+          "end_line": 587,
           "excerpt_sha256": "91b346e7dd5f2969a41dc2acbccfaf72a2a7ed9bcb23885b597b3f547e851b19",
           "claim": "Fence 同時是 WAL 健康狀態的接收端。"
         },
         {
           "path": "crates/sw-core/src/tx_writer.rs",
-          "line": 436,
-          "end_line": 476,
-          "excerpt_sha256": "0a9c1721eea90a35faa59b0f3713cfdb1f60c9a64c0f3a5bfc754487807b558c",
-          "claim": "FenceSubmitGate：每次 OS 提交在 Fence 鎖內重驗。"
+          "line": 588,
+          "end_line": 632,
+          "excerpt_sha256": "92ef801c8d614778fa7a569e232013a5c51ba75a139e016a0769c7a2c8e1f9d5",
+          "claim": "FenceSubmitGate：每次 OS 提交在 Fence 鎖內重驗；停機已發布時只放行待凍結中的傳輸行持有者。"
         }
       ]
     },
@@ -532,9 +525,30 @@
       "label": "file.push／pull",
       "type": "backend",
       "sublabel": "分段 base64／echo-ACK",
-      "responsibility": "獨立的 RPC 操作：session 閘門在 actor 內一次判定，通過後佔用前景槽，以 OpSpec::FileTransfer 交 OpRunner 前景 lane，經 OpTransferPort 與同一個 TxWriter 分段傳輸。不進 command.submit 佇列；傳輸期間出列的命令以 SESSION_BUSY 結束。",
+      "responsibility": "獨立的 RPC 操作：session 閘門在 actor 內一次判定，通過後佔用前景槽，以 OpSpec::FileTransfer 交 OpRunner 前景 lane，經 OpTransferPort 與同一個 TxWriter 分段傳輸。不進 command.submit 佇列；傳輸期間出列的命令以 SESSION_BUSY 結束。停機時（issue 282）：正在送的命令列若一個字元都還沒送就直接取消；已送出部分則在 750 ms 內續送並等 echo，完成才補換行，逾時或 echo 停滯就送 Ctrl-U＋換行清掉半行後取消。",
       "basis": "observed",
       "evidence": [
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 24,
+          "end_line": 27,
+          "excerpt_sha256": "f05948fb758116d3d1cf514331f389132c738980abc8f84a265b817275413ca7",
+          "claim": "停機行收尾期限 750 ms；期限到時以 Ctrl-U＋換行清除半行。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 303,
+          "end_line": 355,
+          "excerpt_sha256": "b5b38747bbd6883e29cc70a8b69568bf4484110fcc9a0154028d0f9057a11fd6",
+          "claim": "echo-paced 送一行：登記傳輸行；停機軟喚醒後未送任何字元即取消，逾時或 echo 停滯則清除半行，完成才補換行。"
+        },
+        {
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 385,
+          "end_line": 393,
+          "excerpt_sha256": "5baab2d3f4e0ab7a5de367102ae4ad7a53776e117d04c35dfcf01f4e137da859",
+          "claim": "kill_line：送 Ctrl-U＋換行後解除行持有並以取消結束。"
+        },
         {
           "path": "crates/sw-core/src/op_runner.rs",
           "line": 434,
@@ -576,7 +590,7 @@
       "id": "flasher",
       "label": "外部 flasher",
       "type": "external",
-      "sublabel": "ttyMCU｜已釋出裝置",
+      "sublabel": "ttyMCU 或已釋出的裝置",
       "responsibility": "外部燒錄工具。Linux 可開 daemon 提供的 ttyMCU 端點，由 daemon 維持 UART 唯一 owner；或在任一平台先 device release，自己獨占 raw 裝置（Windows 只有這條路），燒完須顯式 device attach 收回。",
       "basis": "observed",
       "evidence": [
@@ -673,8 +687,8 @@
       "id": "human",
       "label": "Human console",
       "type": "frontend",
-      "sublabel": "minicom｜Telnet 終端",
-      "responsibility": "人工終端經 broker 的 console 端點接入：Linux 開 PTY slave，Windows 以 Telnet 連 127.0.0.1。持有 raw ownership 的 console 按鍵直達 UART；agent 前景操作期間輸入進 DeferredBuffer 暫存後回放，不與 agent TX 交錯；行模式 console 的整行以 HumanConsole 來源入列。flash 期間輸入丟棄。human 不是 Session 狀態 writer。",
+      "sublabel": "終端程式",
+      "responsibility": "人工終端程式經 broker 的 console 端點接入：Linux 開 PTY slave，Windows 以 Telnet 連 127.0.0.1。持有 raw ownership 的 console 按鍵直達 UART；agent 前景操作期間輸入進 DeferredBuffer 暫存後回放，不與 agent TX 交錯；行模式 console 的整行以 HumanConsole 來源入列。flash 期間輸入丟棄。human 不是 Session 狀態 writer。",
       "basis": "observed",
       "evidence": [
         {
@@ -693,8 +707,8 @@
         },
         {
           "path": "crates/sw-core/src/session_manager.rs",
-          "line": 7697,
-          "end_line": 7743,
+          "line": 7702,
+          "end_line": 7748,
           "excerpt_sha256": "f8016b26369950a0bae46d93fba07cade4b428443cca12af795f186d9412558c",
           "claim": "PTY 後端的 attach：建立 PTY 並回 slave 路徑。"
         },
@@ -753,34 +767,165 @@
       ]
     },
     {
-      "id": "pal",
-      "label": "sw-pal 平台後端",
+      "id": "pal-console",
+      "label": "console 端點",
       "type": "backend",
-      "sublabel": "A｜B＝Linux｜Windows",
-      "responsibility": "唯一允許平台 cfg 的 crate。native() 依平台組出 Platform：序列埠（termios｜overlapped COM）、RPC transport（AF_UNIX＋TCP｜TCP loopback）、console（PTY｜TCP Telnet、com0com）、實例鎖（flock｜LockFileEx）、裝置來源（by-id／by-path｜SERIALCOMM registry）、行程掃描、檔案與 WAL 檔案層。業務 crate 只看 Capabilities 的值，不比較 OS 名稱。圖上「A｜B」一律表示 Linux｜Windows。",
+      "sublabel": "PTY｜127.0.0.1 Telnet",
+      "responsibility": "ConsoleTransportFactory：human console 的承接方式。Linux 建 PTY（minicom 開 slave），沒有 PTY 的 Windows 改為只綁 127.0.0.1 的 TCP＋Telnet listener（另可選 com0com）；ConsoleKind 由平台決定，業務碼不比較 OS 名稱。",
       "basis": "observed",
       "evidence": [
         {
-          "path": "crates/sw-pal/src/lib.rs",
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 288,
+          "end_line": 305,
+          "excerpt_sha256": "ed0293c2171f004ba620cd5735b88c12a390f4a14abf768f847dce782dbc0644",
+          "claim": "ConsoleHub 以 platform.console 建立 console 多工。"
+        },
+        {
+          "path": "crates/sw-pal/src/console_pty.rs",
           "line": 1,
           "end_line": 4,
-          "excerpt_sha256": "3e34403f6060e8ace13debbf0b48708a78c37afb76bfa0080a2a2cf8a23578c1",
-          "claim": "sw-pal 是平台抽象層；平台相依 cfg 只允許出現在本 crate，業務 crate 只看 Capabilities。"
+          "excerpt_sha256": "005f83576d6844ccaf8de99aebd73426578a2949fead21eae632678179d5f4e4",
+          "claim": "console 承接工廠組裝 POSIX PTY、TCP console 與 Windows com0com。"
+        },
+        {
+          "path": "crates/sw-pal/src/console_tcp.rs",
+          "line": 1,
+          "end_line": 2,
+          "excerpt_sha256": "a1535cd6cc2971402540422ac0e5c00a6fb76576976bbc81b9aac8cbdac092ef",
+          "claim": "TCP＋Telnet console listener 只綁 127.0.0.1。"
         },
         {
           "path": "crates/sw-pal/src/lib.rs",
-          "line": 108,
-          "end_line": 143,
-          "excerpt_sha256": "a5fc73f9004322461ddbb68cb51c9cfc663e6cea5bd1d137878054df283cf61f",
-          "claim": "Platform：env／fs／rpc／procs／serial／devices／instance_lock／wal_fs／rpc_listen／console 等能力包。"
+          "line": 70,
+          "end_line": 75,
+          "excerpt_sha256": "d6f7a115e1a71f6e2604242cbe03fe740470aa305e1db62b3ab0c4a070796601",
+          "claim": "ConsoleKind：POSIX 為 PTY，無 PTY 平台為 127.0.0.1 TCP。"
+        }
+      ]
+    },
+    {
+      "id": "pal-devices",
+      "label": "裝置來源",
+      "type": "backend",
+      "sublabel": "by-id／by-path｜SERIALCOMM",
+      "responsibility": "DeviceSource：列舉序列埠裝置。Linux 依序掃 /dev/serial/by-id 與 by-path 目錄；Windows 讀 HKLM SERIALCOMM registry，排除藍牙與設定中指定的 COM。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/device_source/posix.rs",
+          "line": 8,
+          "end_line": 12,
+          "excerpt_sha256": "e38b225f76019c8c4fadf00bb5a7238d11338a46a4beb2ac3a6aa31a279d8b30",
+          "claim": "POSIX：依序掃描 by-id／by-path 目錄。"
+        },
+        {
+          "path": "crates/sw-pal/src/device_source/windows.rs",
+          "line": 14,
+          "end_line": 14,
+          "excerpt_sha256": "b5dd11c5ebc92dfd3aaada99b58e0291e5f74e4f7ca8024983f3c42071038293",
+          "claim": "Windows 裝置來源：SERIALCOMM 加藍牙排除。"
         },
         {
           "path": "crates/sw-pal/src/lib.rs",
-          "line": 183,
-          "end_line": 293,
-          "excerpt_sha256": "5d31e3bf3998d2a38ea71ba7ea3a6cd906ceee2c0e18d9c23f944c339fbd8b01",
-          "claim": "native()：unix 與 windows 各組一套後端與 Capabilities。"
+          "line": 148,
+          "end_line": 177,
+          "excerpt_sha256": "7dbb639869e30706562b7d3af59bac8f1fad0e3c8b74221189109e5c00d22142",
+          "claim": "native_devices：unix 掃 by-id／by-path，windows 讀 registry 並套用排除清單。"
+        }
+      ]
+    },
+    {
+      "id": "pal-files",
+      "label": "檔案層／行程掃描",
+      "type": "backend",
+      "sublabel": "原子寫檔；/proc｜Toolhelp32",
+      "responsibility": "FsOps 與 WalFs：state.json 的 atomic_write（暫存檔、fsync 後取代；Linux rename＋目錄 fsync｜Windows 取代並重試）與 WAL 檔案的建立、附加與輪替。ProcScan：列舉本機 serialwrapd 行程，Linux 掃 /proc｜Windows 用 Toolhelp32 快照；CLI 的 daemon start／status 與 doctor 以它偵測同機多開。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 122,
+          "end_line": 128,
+          "excerpt_sha256": "1d2f271e80ca0196a9a6b73909952ce6a980f29b0f9363f7f90b6eb6393dd633",
+          "claim": "daemon start 先以 procs 掃描既有 serialwrapd，避免衝突。"
         },
+        {
+          "path": "crates/sw-cli/src/doctor_cmd.rs",
+          "line": 413,
+          "end_line": 418,
+          "excerpt_sha256": "1267fa7cfdae9ef66aa91626a05b36123bd0fa269655e77bc6e219de88616645",
+          "claim": "doctor 掃描本機 serialwrapd 實例。"
+        },
+        {
+          "path": "crates/sw-pal/src/fs_ops/posix.rs",
+          "line": 42,
+          "end_line": 55,
+          "excerpt_sha256": "ca379eac4b09ada03a4bc7ef693a641660d323ee96bd73b28b282dc866ce4b68",
+          "claim": "POSIX atomic_write：暫存檔、fsync、rename、目錄 fsync。"
+        },
+        {
+          "path": "crates/sw-pal/src/fs_ops/windows.rs",
+          "line": 81,
+          "end_line": 91,
+          "excerpt_sha256": "ac5de395b2b7ea22bb0f4b9fa37539760af72720e2f4f2053b8d598ebfd36696",
+          "claim": "Windows atomic_write：暫存檔、fsync 後取代，權限衝突重試。"
+        },
+        {
+          "path": "crates/sw-pal/src/proc_scan/mod.rs",
+          "line": 1,
+          "end_line": 16,
+          "excerpt_sha256": "5aae923f2bde9f01a7845aed454e2ac7c2150b6595b9bc12dacad9ca7c780f5c",
+          "claim": "ProcScan：Linux 為 /proc 掃描，Windows 為 Toolhelp32 快照。"
+        },
+        {
+          "path": "crates/sw-pal/src/wal_fs.rs",
+          "line": 1,
+          "end_line": 19,
+          "excerpt_sha256": "f0cc524775258e9333483a128265ba0a2fb320560d27055055e69b376302d020",
+          "claim": "WAL 檔案層：POSIX 與 Windows 各一個 NativeWalFs。"
+        }
+      ]
+    },
+    {
+      "id": "pal-lock",
+      "label": "實例鎖",
+      "type": "security",
+      "sublabel": "flock｜LockFileEx",
+      "responsibility": "InstanceLockFactory：每個 (lock, endpoint) 一把獨占鎖。Linux 以 flock(LOCK_EX|LOCK_NB)，Windows 以 LockFileEx （獨占、立即失敗）；取不到即 DAEMON_ALREADY_RUNNING。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1219,
+          "end_line": 1233,
+          "excerpt_sha256": "cfa431d65b9858b755a114d4add674242b3e1198c0edc6bab2e5bc467dfc3408",
+          "claim": "daemon 啟動時取得實例鎖；已有 daemon 回 DAEMON_ALREADY_RUNNING。"
+        },
+        {
+          "path": "crates/sw-pal/src/lock/posix.rs",
+          "line": 46,
+          "end_line": 46,
+          "excerpt_sha256": "728c8065594cfd763fbcf487d1124557dee2d25451a95fc3de310f33024bd440",
+          "claim": "POSIX 實例鎖以 flock(LOCK_EX|LOCK_NB) 取得。"
+        },
+        {
+          "path": "crates/sw-pal/src/lock/windows.rs",
+          "line": 79,
+          "end_line": 91,
+          "excerpt_sha256": "a46332706b42d4400ed2d96bbd820df64132a3681e5bc4d0c2af0539b2795cf8",
+          "claim": "Windows 實例鎖以 LockFileEx（獨占、立即失敗）取得。"
+        }
+      ]
+    },
+    {
+      "id": "pal-rpc",
+      "label": "RPC transport",
+      "type": "backend",
+      "sublabel": "AF_UNIX＋TCP｜TCP loopback",
+      "responsibility": "RpcConnector 與 RpcListenerFactory：CLI 端 connect、daemon 端 bind／accept。Linux 支援 AF_UNIX（預設）與 TCP loopback；Windows 只有 TCP loopback，unix endpoint 回 Unsupported。",
+      "basis": "observed",
+      "evidence": [
         {
           "path": "crates/sw-pal/src/rpc_transport/listener_posix.rs",
           "line": 22,
@@ -794,6 +939,44 @@
           "end_line": 26,
           "excerpt_sha256": "7188fca1228f13b29ec5eebb4ce9e14807044bd80fd612fce875794c72307b10",
           "claim": "Windows bind：非 tcp endpoint 回 Unsupported，host 必須是 loopback。"
+        },
+        {
+          "path": "crates/sw-pal/src/rpc_transport/posix.rs",
+          "line": 52,
+          "end_line": 67,
+          "excerpt_sha256": "d6e6039beb4f24b41e0bcc709ccff603e6ec16b7b3d833a8f9d8c32570173e8f",
+          "claim": "POSIX connect：unix 或 tcp。"
+        },
+        {
+          "path": "crates/sw-pal/src/rpc_transport/windows.rs",
+          "line": 51,
+          "end_line": 66,
+          "excerpt_sha256": "e955203fc1ba1707ddc8de1e5fbb870e125c1ee0088fb3b7a1a32eb1c5d2ff12",
+          "claim": "Windows connect：沒有 AF_UNIX，只接受 tcp。"
+        }
+      ]
+    },
+    {
+      "id": "pal-serial",
+      "label": "序列埠",
+      "type": "backend",
+      "sublabel": "termios｜overlapped COM",
+      "responsibility": "SerialBackend：open_exclusive 獨占開埠並回傳 SerialHandle（Linux termios｜Windows CreateFileW＋overlapped I/O）；UartExclusive 在開埠前做 holder 診斷（Linux 掃 /proc 找持有該 tty 的行程｜Windows 回 holder_unknown）。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 4942,
+          "end_line": 4952,
+          "excerpt_sha256": "dd3b157ab6b0b6ef2adb0f18fc00f6cbf8507c9f90df4d0c22f0ea6f5250d006",
+          "claim": "SessionManager 執行器先做 holder 診斷，再以 serial.open_exclusive 開埠並拆分 handle。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 122,
+          "end_line": 125,
+          "excerpt_sha256": "3d20219e619760282a0ea24ccb6c37dfef070fb87078d06852cadeae121e16d6",
+          "claim": "Platform.serial 與 uart_excl：序列埠後端與 holder 診斷。"
         },
         {
           "path": "crates/sw-pal/src/serial/posix.rs",
@@ -816,7 +999,7 @@
       "label": "Profiles／契約",
       "type": "external",
       "sublabel": "prompt／probe／UART",
-      "responsibility": "sw-proto 的 UartProfile／ProfileTemplate／SessionProfile 定義登入、prompt、ready_probe、UART 與 timeout，daemon 啟動時由 profile 目錄載入。它是設定契約，不是 Persona，也不是派工進度。只有非空白 ready_probe 的 template 才 command_capable。",
+      "responsibility": "sw-proto 的 UartProfile／ProfileTemplate／SessionProfile 定義登入、prompt、ready_probe、UART 與 timeout，daemon 啟動時由 profile 目錄載入。它是設定契約，不是 Persona，也不是派工進度。只有非空白 ready_probe 的 template 才 command_capable。profile YAML 是 daemon 啟動時讀取的設定檔，不屬於任何行程或函式庫，因此不放在任何邊界內。",
       "basis": "observed",
       "evidence": [
         {
@@ -891,8 +1074,8 @@
       "id": "service",
       "label": "2 RPC／Service",
       "type": "backend",
-      "sublabel": "AF_UNIX｜TCP loopback",
-      "responsibility": "RpcServer 以 acceptor＋每連線一條執行緒逐行處理 JSON 請求；Service::rpc 對有副作用的方法先取 AdmissionGate ticket（交接／關機凍結後回 handoff_frozen），再做參數轉型與 selector 解析，查無回 SESSION_NOT_FOUND。READY／quiet 等 Session 閘門不在這層，由 SessionCore::submit 判定。Linux listener 支援 AF_UNIX 與 TCP loopback，Windows 只有 TCP loopback。",
+      "sublabel": "RpcServer／admission",
+      "responsibility": "RpcServer 以 acceptor＋每連線一條執行緒逐行處理 JSON 請求；listener 由 daemon 主流程經平台層 RPC transport bind 後交給它 accept。Service::rpc 對有副作用的方法先取 AdmissionGate ticket（交接／關機凍結後回 handoff_frozen），再做參數轉型與 selector 解析，查無回 SESSION_NOT_FOUND。READY／quiet 等 Session 閘門不在這層，由 SessionCore::submit 判定。",
       "basis": "observed",
       "evidence": [
         {
@@ -922,20 +1105,6 @@
           "end_line": 1193,
           "excerpt_sha256": "fa728112aaee93ca1fac813ef26515c352c14484f6361770216a249e4ef5608f",
           "claim": "command.submit：驗參數與來源、解析 selector，組 SubmitReq 交 manager.route。"
-        },
-        {
-          "path": "crates/sw-pal/src/rpc_transport/listener_posix.rs",
-          "line": 22,
-          "end_line": 27,
-          "excerpt_sha256": "649a8544796aa73d30edf5d100b3f9fc01cf6c166e8922350365164e6eed4d20",
-          "claim": "POSIX bind：unix endpoint 走 bind_unix，tcp endpoint 走 bind_tcp。"
-        },
-        {
-          "path": "crates/sw-pal/src/rpc_transport/listener_windows.rs",
-          "line": 19,
-          "end_line": 26,
-          "excerpt_sha256": "7188fca1228f13b29ec5eebb4ce9e14807044bd80fd612fce875794c72307b10",
-          "claim": "Windows bind：非 tcp endpoint 回 Unsupported，host 必須是 loopback。"
         }
       ]
     },
@@ -1008,22 +1177,22 @@
         },
         {
           "path": "crates/sw-core/src/session_manager.rs",
-          "line": 6746,
-          "end_line": 6785,
+          "line": 6751,
+          "end_line": 6790,
           "excerpt_sha256": "9f6fcd7634373ab7c30507cefaf0b51ea6111bfad781936256e794f990124afc",
           "claim": "prepare_dynamic_rank：依 device_sort_key 預先排定動態 COM。"
         },
         {
           "path": "crates/sw-core/src/session_manager.rs",
-          "line": 6796,
-          "end_line": 6822,
+          "line": 6801,
+          "end_line": 6827,
           "excerpt_sha256": "3ba429fa8c657a0d1eacb518691e0b2ee3de2531298bc479cdca7b6cd5e92e19",
           "claim": "update_devices、bootstrap_attach 與 selector 解析。"
         },
         {
           "path": "crates/sw-core/src/session_manager.rs",
-          "line": 6891,
-          "end_line": 6899,
+          "line": 6896,
+          "end_line": 6904,
           "excerpt_sha256": "f5bbd14cb64d4902149603f6534b33cd60dc22c73cf0a48b33aeb7c1b950d757",
           "claim": "route：把 session 請求路由到對應 actor 並等待回覆。"
         },
@@ -1041,7 +1210,7 @@
       "label": "state.json",
       "type": "database",
       "sublabel": "StateStore 單一寫入者",
-      "responsibility": "只持久化 aliases、bindings、released、profile_pins、profile_detected 五個 key；所有寫入經同一條 store 執行緒依序 atomic_write。不是命令佇列、命令歷程或瞬時 Session 狀態的資料庫。",
+      "responsibility": "只持久化 aliases、bindings、released、profile_pins、profile_detected 五個 key；所有寫入經同一條 store 執行緒依序 atomic_write。不是命令佇列、命令歷程或瞬時 Session 狀態的資料庫。StateStore 執行緒在 daemon 行程內、是 state.json 唯一的寫入者，因此節點畫在 daemon 邊界內；原子寫入由平台層的檔案層完成。",
       "basis": "observed",
       "evidence": [
         {
@@ -1103,13 +1272,13 @@
       "label": "WAL／mirror",
       "type": "database",
       "sublabel": "bytes／seq／source",
-      "responsibility": "WalWriter 以 seq、COM、dir、source、cmd_id、crc32 記 RX／TX／META；raw WAL 是可追溯的 byte 記錄，mirror 是文字投影。寫入失敗仍消耗序號並標 loss。它不派工，也不能單憑有 log 宣告命令成功。WAL 檔案層由 sw-pal 提供。",
+      "responsibility": "WalWriter 以 seq、COM、dir、source、cmd_id、crc32 記 RX／TX／META；raw WAL 是可追溯的 byte 記錄，mirror 是文字投影。寫入失敗仍消耗序號並標 loss。它不派工，也不能單憑有 log 宣告命令成功。WalWriter 在 daemon 行程內，raw.wal.ndjson 與 mirror 只由它寫入，因此節點畫在 daemon 邊界內；檔案 I/O 經平台層的 WAL 檔案層。",
       "basis": "observed",
       "evidence": [
         {
           "path": "crates/sw-core/src/tx_writer.rs",
-          "line": 958,
-          "end_line": 971,
+          "line": 1124,
+          "end_line": 1137,
           "excerpt_sha256": "23f79112d5520709229bcd735f08e181ef743894064c8d9f5635dd2fb3faa0d9",
           "claim": "TxWriter 只把已確認寫出的 bytes 記為 TX。"
         },
@@ -1119,6 +1288,13 @@
           "end_line": 502,
           "excerpt_sha256": "9a6e0d9df9f9fbc5cb3dbf3c6860bc8f6f17166a55f8f4c99ebfb277d3a5e83c",
           "claim": "reader 每個 chunk 先記 RX。"
+        },
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 345,
+          "end_line": 350,
+          "excerpt_sha256": "f9aecca7133fb513fab6792495212afe52f98667d18c4b052f31abce1bd769a7",
+          "claim": "WalWriter::open 以注入的 WalFs 建目錄、載入現行檔序號。"
         },
         {
           "path": "crates/sw-core/src/wal.rs",
@@ -1133,13 +1309,6 @@
           "end_line": 615,
           "excerpt_sha256": "97550fc5b9d5c79574299e546ebb1731ec42b6b98839ac2c4d3e1aae02e9b96c",
           "claim": "WalRecord 欄位、WAL 與 mirror 寫入、loss_flag。"
-        },
-        {
-          "path": "crates/sw-pal/src/lib.rs",
-          "line": 130,
-          "end_line": 131,
-          "excerpt_sha256": "82a2920dd013e1a5ade0178870f8bec953c3573d2ab60449f38b6407787c8932",
-          "claim": "Platform.wal_fs：WAL 檔案層。"
         }
       ]
     },
@@ -1147,23 +1316,23 @@
       "id": "watcher",
       "label": "DeviceWatcher",
       "type": "backend",
-      "sublabel": "by-id｜SERIALCOMM",
-      "responsibility": "sw-pal 的 watcher 執行緒輪詢裝置來源（Linux 掃 by-id／by-path 目錄｜Windows 讀 SERIALCOMM registry 並排除藍牙與指定 COM），把 Delta 與 Tick 送到 manager 執行緒。啟動時先做一次初次掃描供 rank 與 bootstrap。Watcher 不執行命令，也不擁有 Session 狀態；readiness 重探由各 actor 自己的 Tick 驅動。",
+      "sublabel": "Delta／Tick",
+      "responsibility": "DeviceWatcher 執行緒由 serialwrapd 啟動、只在 daemon 行程內執行；程式碼位於 sw-pal（device_watcher.rs），但本身沒有平台差異，平台相依的掃描在平台層的裝置來源，因此節點歸在 daemon 行程邊界。它輪詢裝置來源，把 Delta 與 Tick 送到 manager 執行緒。啟動時先做一次初次掃描供 rank 與 bootstrap。Watcher 不執行命令，也不擁有 Session 狀態；readiness 重探由各 actor 自己的 Tick 驅動。",
       "basis": "observed",
       "evidence": [
         {
           "path": "crates/sw-core/src/session_manager.rs",
-          "line": 7804,
-          "end_line": 7807,
+          "line": 7809,
+          "end_line": 7812,
           "excerpt_sha256": "97edc7dfe83938f0acac41af9ff612734c4669d9674cae57ea9d7c0e9b2ee353",
           "claim": "manager 的 on_tick 只處理已排入的事件，不做 readiness 重探。"
         },
         {
-          "path": "crates/sw-pal/src/device_source/windows.rs",
-          "line": 14,
-          "end_line": 14,
-          "excerpt_sha256": "b5dd11c5ebc92dfd3aaada99b58e0291e5f74e4f7ca8024983f3c42071038293",
-          "claim": "Windows 裝置來源：SERIALCOMM 加藍牙排除。"
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1392,
+          "end_line": 1392,
+          "excerpt_sha256": "daaf97fcb7febc02b224b44daaaaeaf50c35d1b3048dd54e1f0a4afe02b56373",
+          "claim": "daemon 以初次掃描結果為基準啟動 DeviceWatcher 執行緒。"
         },
         {
           "path": "crates/sw-pal/src/device_watcher.rs",
@@ -1178,18 +1347,167 @@
           "end_line": 173,
           "excerpt_sha256": "819a0d01232e0572a354d3b68efcbb27f6f8ad9d1e59a037a9a3bd3c2af6724e",
           "claim": "poll_once：差異送 Delta，每輪送 Tick。"
-        },
-        {
-          "path": "crates/sw-pal/src/lib.rs",
-          "line": 148,
-          "end_line": 177,
-          "excerpt_sha256": "7dbb639869e30706562b7d3af59bac8f1fad0e3c8b74221189109e5c00d22142",
-          "claim": "native_devices：unix 掃 by-id／by-path，windows 讀 registry 並套用排除清單。"
         }
       ]
     }
   ],
-  "boundaries": [],
+  "boundaries": [
+    {
+      "id": "daemon-process",
+      "kind": "region",
+      "label": "serialwrapd（daemon 行程）",
+      "wraps": [
+        "arbiter",
+        "bridge",
+        "capture",
+        "command-records",
+        "console-hub",
+        "daemon-main",
+        "events",
+        "execute",
+        "fence",
+        "file-transfer",
+        "handoff",
+        "lease",
+        "recovery",
+        "service",
+        "session-actor",
+        "sessions",
+        "state-store",
+        "wal",
+        "watcher"
+      ],
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1280,
+          "end_line": 1299,
+          "excerpt_sha256": "87a3aec7cf2917aba015e13fc771832167e8b13eb7de2063817e9408d46f3564",
+          "claim": "daemon 主流程在同一行程內組裝 SessionManager、WAL、StateStore 與 registry。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1392,
+          "end_line": 1392,
+          "excerpt_sha256": "daaf97fcb7febc02b224b44daaaaeaf50c35d1b3048dd54e1f0a4afe02b56373",
+          "claim": "DeviceWatcher 執行緒由 daemon 主流程啟動。"
+        },
+        {
+          "path": "crates/sw-daemon/src/main.rs",
+          "line": 11,
+          "end_line": 16,
+          "excerpt_sha256": "f55758a014730c0ec37c5c0ee688c901bbfaf5bbc668459ebb7a2506a5a3e5fc",
+          "claim": "serialwrapd 是獨立執行檔；rust 實作在本行程內執行 daemon_main。"
+        }
+      ]
+    },
+    {
+      "id": "external",
+      "kind": "region",
+      "label": "外部",
+      "wraps": [
+        "event-handler",
+        "flasher",
+        "target"
+      ],
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/cli_spec.rs",
+          "line": 71,
+          "end_line": 71,
+          "excerpt_sha256": "b3c58ccd98ff074e2311bb386597e94e2250240402ab1ebf606e650e966026cc",
+          "claim": "device release 把 raw 裝置交給外部工具獨佔。"
+        },
+        {
+          "path": "crates/sw-core/src/event_engine/dispatcher.rs",
+          "line": 1,
+          "end_line": 6,
+          "excerpt_sha256": "46618f53b575af87c5160dbdddf31e4345d5e9adc335950d36a889df25027b06",
+          "claim": "handler 由 dispatcher 以子行程啟動。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 522,
+          "end_line": 528,
+          "excerpt_sha256": "cd71996b80c06dbfdc856c94e2b1639540600112a27c48324ceef64afb1ac75b",
+          "claim": "命令以原始 bytes 送到 UART 對端，由裝置執行。"
+        }
+      ]
+    },
+    {
+      "id": "pal-layer",
+      "kind": "region",
+      "label": "平台層 sw-pal（CLI 與 daemon 共用的函式庫）",
+      "wraps": [
+        "pal-console",
+        "pal-devices",
+        "pal-files",
+        "pal-lock",
+        "pal-rpc",
+        "pal-serial"
+      ],
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/main.rs",
+          "line": 1,
+          "end_line": 9,
+          "excerpt_sha256": "573b6ce81fc9827a7caa56eb3f79f023c4fdb7a34bf9854253edf22ddfa3223d",
+          "claim": "serialwrap 執行檔在組裝點呼叫 sw_pal::native_client()。"
+        },
+        {
+          "path": "crates/sw-daemon/src/main.rs",
+          "line": 11,
+          "end_line": 16,
+          "excerpt_sha256": "f55758a014730c0ec37c5c0ee688c901bbfaf5bbc668459ebb7a2506a5a3e5fc",
+          "claim": "serialwrapd 入口同樣以 sw_pal::native_client() 建立 Platform。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 1,
+          "end_line": 4,
+          "excerpt_sha256": "3e34403f6060e8ace13debbf0b48708a78c37afb76bfa0080a2a2cf8a23578c1",
+          "claim": "平台相依 cfg 只允許出現在 sw-pal；業務 crate 只看 Capabilities。"
+        }
+      ]
+    },
+    {
+      "id": "user-side",
+      "kind": "region",
+      "label": "使用者端",
+      "wraps": [
+        "cli",
+        "human"
+      ],
+      "basis": "inferred",
+      "reasoning": "CLI 是使用者或 agent 自己啟動的 serialwrap 行程；human console 是使用者的終端程式，經 daemon 交出的 PTY slave 或 127.0.0.1 端點接入。兩者都在 daemon 行程之外、由使用者端發起。",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/main.rs",
+          "line": 1,
+          "end_line": 9,
+          "excerpt_sha256": "573b6ce81fc9827a7caa56eb3f79f023c4fdb7a34bf9854253edf22ddfa3223d",
+          "claim": "serialwrap 是獨立的 CLI 執行檔。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 833,
+          "end_line": 859,
+          "excerpt_sha256": "3e404b048073a9404e199ff7eb78b4bdfee00fdba1c4e177c222096b3330c714",
+          "claim": "TCP console 後端的 attach 回應端點，由外部終端連入。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7702,
+          "end_line": 7712,
+          "excerpt_sha256": "0b14b6e5de747f3545fb35e9322e9275a3fa154f650fed435298fce3211a5a2e",
+          "claim": "PTY 後端 attach：建立 PTY 並回 slave 路徑給終端程式開啟。"
+        }
+      ]
+    }
+  ],
   "relations": [
     {
       "id": "arbiter-to-capture",
@@ -1249,8 +1567,8 @@
         },
         {
           "path": "crates/sw-core/src/session_manager.rs",
-          "line": 5322,
-          "end_line": 5345,
+          "line": 5326,
+          "end_line": 5349,
           "excerpt_sha256": "361afab15b3fe893d4ce9b78e35bd6078bb6cd5987e710a8063ff0f6734eca6b",
           "claim": "executor 把 StartOp 交給該 epoch 的 OpRunner。"
         }
@@ -1322,6 +1640,30 @@
       ]
     },
     {
+      "id": "bridge-to-pal-serial",
+      "from": "bridge",
+      "to": "pal-serial",
+      "label": "讀寫 handle",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 4948,
+          "end_line": 4952,
+          "excerpt_sha256": "e6d5ab07c2c8728cf038f30572a6030fc24b795236a29d39da08a594340a4768",
+          "claim": "執行器以 open_exclusive 取得 handle 後拆分交給 IoWorker。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 482,
+          "end_line": 566,
+          "excerpt_sha256": "e162cc461c43316f5cbe9e7cf991eb4dea4542ea752a8e195bab51800dd6a2f5",
+          "claim": "reader 迴圈自 handle 讀取。"
+        }
+      ]
+    },
+    {
       "id": "bridge-to-session-actor",
       "from": "bridge",
       "to": "session-actor",
@@ -1355,8 +1697,8 @@
       "evidence": [
         {
           "path": "crates/sw-core/src/tx_writer.rs",
-          "line": 913,
-          "end_line": 919,
+          "line": 1079,
+          "end_line": 1085,
           "excerpt_sha256": "205c2baddd95e399989ecd02e8fd4db8cf118269a23b96c61db6979081456eee",
           "claim": "TxWriter 經 SerialWriter::write_gated 寫出。"
         },
@@ -1379,8 +1721,8 @@
       "evidence": [
         {
           "path": "crates/sw-core/src/tx_writer.rs",
-          "line": 958,
-          "end_line": 971,
+          "line": 1124,
+          "end_line": 1137,
           "excerpt_sha256": "23f79112d5520709229bcd735f08e181ef743894064c8d9f5635dd2fb3faa0d9",
           "claim": "TxWriter 記 TX。"
         },
@@ -1407,6 +1749,23 @@
           "end_line": 851,
           "excerpt_sha256": "4e76d47ad970ae0d1cd5ea6117f0039f47c605963777fb339d0c858dbcc062ed",
           "claim": "result_tail：先問各 session 的 capture，全部查無才回退命令紀錄。"
+        }
+      ]
+    },
+    {
+      "id": "cli-to-pal-rpc",
+      "from": "cli",
+      "to": "pal-rpc",
+      "label": "connect",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/client.rs",
+          "line": 358,
+          "end_line": 358,
+          "excerpt_sha256": "226681dff6b226f6d7801e587cdebf0cfc9b2a9cb33e5600b5c91260e7ddd4fe",
+          "claim": "CLI 經 p.rpc.connect 連線 daemon endpoint。"
         }
       ]
     },
@@ -1493,6 +1852,78 @@
       ]
     },
     {
+      "id": "console-hub-to-pal-console",
+      "from": "console-hub",
+      "to": "pal-console",
+      "label": "端點讀寫",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 288,
+          "end_line": 305,
+          "excerpt_sha256": "ed0293c2171f004ba620cd5735b88c12a390f4a14abf768f847dce782dbc0644",
+          "claim": "hub 以 platform.console 建立 console 多工。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7702,
+          "end_line": 7712,
+          "excerpt_sha256": "0b14b6e5de747f3545fb35e9322e9275a3fa154f650fed435298fce3211a5a2e",
+          "claim": "console_attach：PTY 後端先建 PTY 再交 hub。"
+        }
+      ]
+    },
+    {
+      "id": "daemon-main-to-pal-lock",
+      "from": "daemon-main",
+      "to": "pal-lock",
+      "label": "取得／釋放",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1219,
+          "end_line": 1233,
+          "excerpt_sha256": "cfa431d65b9858b755a114d4add674242b3e1198c0edc6bab2e5bc467dfc3408",
+          "claim": "啟動時取得實例鎖。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1564,
+          "end_line": 1564,
+          "excerpt_sha256": "c56d87a5566cd904d1f363acd5edb6194113d350100cc5e3e23a2e7aeb0c8384",
+          "claim": "停止序最後一步釋放實例鎖。"
+        }
+      ]
+    },
+    {
+      "id": "daemon-main-to-pal-rpc",
+      "from": "daemon-main",
+      "to": "pal-rpc",
+      "label": "bind listener",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1428,
+          "end_line": 1432,
+          "excerpt_sha256": "36b29be40af0d0a8c1d2df6a8a63a51b1d5bd4a8d2fd7483e5588e5556c3b2dd",
+          "claim": "daemon 主流程以 p.rpc_listen.bind 建立 listener，之後交給 RpcServer accept。"
+        },
+        {
+          "path": "crates/sw-daemon/src/framing.rs",
+          "line": 409,
+          "end_line": 485,
+          "excerpt_sha256": "6412a240e1fb336871b7534ab726fa349bb0ba267b5da63a23f069220efc7c40",
+          "claim": "RpcServer 的 acceptor thread 在該 listener 上 accept。"
+        }
+      ]
+    },
+    {
       "id": "daemon-main-to-service",
       "from": "daemon-main",
       "to": "service",
@@ -1542,8 +1973,8 @@
           "path": "crates/sw-daemon/src/daemon_main.rs",
           "line": 1499,
           "end_line": 1514,
-          "excerpt_sha256": "dd0d22373a512ca271cd537b9a9d5121176c82171429263a6c52f68f2a64c709",
-          "claim": "停止：shutdown_phase1 與 shutdown_phase2。"
+          "excerpt_sha256": "d4ec7241f749deb03cbf8b8302e08f2527937ee63c7c7a44dd074aa9244d7a56",
+          "claim": "停止：扣除 1a 行收尾耗時後 shutdown_phase1、join handler、shutdown_phase2。"
         }
       ]
     },
@@ -1646,15 +2077,15 @@
       "evidence": [
         {
           "path": "crates/sw-core/src/tx_writer.rs",
-          "line": 436,
-          "end_line": 476,
-          "excerpt_sha256": "0a9c1721eea90a35faa59b0f3713cfdb1f60c9a64c0f3a5bfc754487807b558c",
-          "claim": "OS 提交時在 Fence 鎖內重驗。"
+          "line": 588,
+          "end_line": 632,
+          "excerpt_sha256": "92ef801c8d614778fa7a569e232013a5c51ba75a139e016a0769c7a2c8e1f9d5",
+          "claim": "OS 提交時在 Fence 鎖內重驗；停機待凍結時只放行持有傳輸行的 op。"
         },
         {
           "path": "crates/sw-core/src/tx_writer.rs",
-          "line": 890,
-          "end_line": 897,
+          "line": 1056,
+          "end_line": 1063,
           "excerpt_sha256": "046320819fce69c1742afe7a4d578a78f297269e56e17935475dab70a5dba948",
           "claim": "出列時先以 Fence::admit 快速拒絕。"
         }
@@ -1688,7 +2119,7 @@
       "id": "flasher-to-handoff",
       "from": "flasher",
       "to": "handoff",
-      "label": "sync bytes｜release",
+      "label": "sync bytes／release",
       "variant": "dashed",
       "basis": "observed",
       "evidence": [
@@ -1725,8 +2156,8 @@
         },
         {
           "path": "crates/sw-core/src/tx_writer.rs",
-          "line": 337,
-          "end_line": 345,
+          "line": 490,
+          "end_line": 498,
           "excerpt_sha256": "088d330f240e7f6ce012d2d85f6e070758b76f04d75ccabbf52f9cc711dbb933",
           "claim": "Fence 只在對應 flash 模式放行 FlashProbe／Flash。"
         }
@@ -1808,30 +2239,6 @@
           "end_line": 410,
           "excerpt_sha256": "9779a4358cffe85c15372f7fec9a235a636fa1ad9f76130272319c6f4eeeb239",
           "claim": "human 輸入以 Effect::HumanTx 交 human TX pump。"
-        }
-      ]
-    },
-    {
-      "id": "pal-to-daemon-main",
-      "from": "pal",
-      "to": "daemon-main",
-      "label": "native() 後端",
-      "variant": "default",
-      "basis": "observed",
-      "evidence": [
-        {
-          "path": "crates/sw-daemon/src/daemon_main.rs",
-          "line": 1280,
-          "end_line": 1299,
-          "excerpt_sha256": "87a3aec7cf2917aba015e13fc771832167e8b13eb7de2063817e9408d46f3564",
-          "claim": "daemon 把 Platform 的後端注入 SessionManager。"
-        },
-        {
-          "path": "crates/sw-daemon/src/main.rs",
-          "line": 11,
-          "end_line": 16,
-          "excerpt_sha256": "f55758a014730c0ec37c5c0ee688c901bbfaf5bbc668459ebb7a2506a5a3e5fc",
-          "claim": "入口先以 sw_pal::native_client() 建立 Platform。"
         }
       ]
     },
@@ -1982,15 +2389,15 @@
         },
         {
           "path": "crates/sw-core/src/session_manager.rs",
-          "line": 5179,
-          "end_line": 5200,
+          "line": 5183,
+          "end_line": 5204,
           "excerpt_sha256": "1f27319ee160a853947a0c44e44028ff181d1b2ef74250f3cc4ab6fd3ba9a326",
           "claim": "開埠後 executor 以該 handle 啟動 IoWorker。"
         },
         {
           "path": "crates/sw-core/src/session_manager.rs",
-          "line": 6169,
-          "end_line": 6182,
+          "line": 6173,
+          "end_line": 6186,
           "excerpt_sha256": "3f9a4680a6cadf29a6cd3350c1568ee57d95df52ac726d1a84eb712ba8c4ba22",
           "claim": "BeginDrain：停 OpRunner 並交 worker 非同步收尾。"
         }
@@ -2037,15 +2444,15 @@
       "evidence": [
         {
           "path": "crates/sw-core/src/session_manager.rs",
-          "line": 2291,
-          "end_line": 2298,
+          "line": 2295,
+          "end_line": 2302,
           "excerpt_sha256": "bb7f66cb3cddfd43240f9734e84af890530486ffc27e1ad75ebf7bb247e1fe86",
           "claim": "manager 為 session 建立 actor。"
         },
         {
           "path": "crates/sw-core/src/session_manager.rs",
-          "line": 6891,
-          "end_line": 6899,
+          "line": 6896,
+          "end_line": 6904,
           "excerpt_sha256": "f5bbd14cb64d4902149603f6534b33cd60dc22c73cf0a48b33aeb7c1b950d757",
           "claim": "route 把請求送到 actor 並等待回覆。"
         }
@@ -2061,8 +2468,8 @@
       "evidence": [
         {
           "path": "crates/sw-core/src/session_manager.rs",
-          "line": 6227,
-          "end_line": 6268,
+          "line": 6231,
+          "end_line": 6272,
           "excerpt_sha256": "4f1ea133461006512b7e45542df67c2c265b01a9be60bd1a46df86e58af30aa4",
           "claim": "Persist 效果：delta 套入 model 後提交目前快照。"
         },
@@ -2072,6 +2479,23 @@
           "end_line": 728,
           "excerpt_sha256": "9d090c6070b67b8fb03b7d3a6c37a879676b7185e9f0adbcd035eb30a2586fe5",
           "claim": "所有寫入經同一 thread 依序 atomic_write。"
+        }
+      ]
+    },
+    {
+      "id": "state-store-to-pal-files",
+      "from": "state-store",
+      "to": "pal-files",
+      "label": "atomic_write",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/state_store.rs",
+          "line": 704,
+          "end_line": 728,
+          "excerpt_sha256": "9d090c6070b67b8fb03b7d3a6c37a879676b7185e9f0adbcd035eb30a2586fe5",
+          "claim": "StateStore thread 依序 atomic_write。"
         }
       ]
     },
@@ -2089,6 +2513,54 @@
           "end_line": 492,
           "excerpt_sha256": "dbfcac5ea643d6aba303b9a335ba7f2148c6147ae741341c13b450f86b41c50b",
           "claim": "reader 自序列埠讀取 bytes。"
+        }
+      ]
+    },
+    {
+      "id": "wal-to-pal-files",
+      "from": "wal",
+      "to": "pal-files",
+      "label": "寫檔／輪替",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 345,
+          "end_line": 350,
+          "excerpt_sha256": "f9aecca7133fb513fab6792495212afe52f98667d18c4b052f31abce1bd769a7",
+          "claim": "WalWriter 以注入的 WalFs 建目錄並開檔。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1246,
+          "end_line": 1253,
+          "excerpt_sha256": "5484b794b7744d48112c0a1e16c69cf13d2a466930743fe3e8eefac3416277c8",
+          "claim": "daemon 以 p.wal_fs 開啟 WalWriter。"
+        }
+      ]
+    },
+    {
+      "id": "watcher-to-pal-devices",
+      "from": "watcher",
+      "to": "pal-devices",
+      "label": "輪詢",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1368,
+          "end_line": 1368,
+          "excerpt_sha256": "d9cc9d9854d97db39494dc43ee02f0072b58cbe953056af1cc53bc7dccffaf44",
+          "claim": "daemon 以 p.devices 建立裝置來源。"
+        },
+        {
+          "path": "crates/sw-pal/src/device_watcher.rs",
+          "line": 130,
+          "end_line": 173,
+          "excerpt_sha256": "819a0d01232e0572a354d3b68efcbb27f6f8ad9d1e59a037a9a3bd3c2af6724e",
+          "claim": "poll_once：掃描裝置來源，差異送 Delta。"
         }
       ]
     },
@@ -2125,7 +2597,7 @@
     },
     {
       "id": "shipped-bundle-contents",
-      "question": "未下載或解開 0.5.0 release 資產核對 release-manifest.json 的實際內容。",
+      "question": "未下載或解開任何 release 資產核對 release-manifest.json 的實際內容。",
       "impact": "bundle 組成只依 mkbundle 腳本與 release workflow 判讀；實際出貨檔案是否與腳本一致未經本文件驗證。"
     },
     {
@@ -2137,7 +2609,7 @@
   "conflicts": [
     {
       "id": "bundle-python-fields",
-      "subject": "Stage 2 bundle manifest 仍宣告 python_cli_delegate 與 Python daemon runtime 欄位，執行期是否委派 Python",
+      "subject": "release bundle manifest（Stage 2） 仍宣告 python_cli_delegate 與 Python daemon runtime 欄位，執行期是否委派 Python",
       "claims": [
         {
           "claim": "mkbundle 產生的 manifest 帶有 python_cli_delegate.entry，以及 daemon 的 Python runtime／package 欄位。",
@@ -2173,7 +2645,7 @@
       ],
       "resolution": {
         "state": "resolved",
-        "decision": "以 --stage 2 建置的 0.5.0 bundle 由 Rust CLI 與 Rust daemon 處理執行期；Python 欄位是凍結 manifest schema 的相容欄位，python_cli_delegate 機制僅供緊急回退，因此不畫成執行期元件。",
+        "decision": "以 --stage 2 建置的 release bundle 由 Rust CLI 與 Rust daemon 處理執行期；Python 欄位是凍結 manifest schema 的相容欄位，python_cli_delegate 機制僅供緊急回退，因此不畫成執行期元件。",
         "evidence": [
           {
             "path": ".github/workflows/release.yml",
