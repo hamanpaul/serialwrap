@@ -154,23 +154,23 @@
   ],
   "segments": [
     {
-      "from": 158,
-      "to": 646,
+      "from": 160,
+      "to": 670,
       "label": "安裝／更新／回滾"
     },
     {
-      "from": 648,
-      "to": 815,
+      "from": 678,
+      "to": 867,
       "label": "一般 setup"
     },
     {
-      "from": 817,
-      "to": 965,
+      "from": 875,
+      "to": 1045,
       "label": "切換監管模式"
     },
     {
-      "from": 967,
-      "to": 1137,
+      "from": 1053,
+      "to": 1245,
       "label": "日常操作與診斷"
     }
   ],
@@ -179,14 +179,14 @@
       "id": "lock",
       "from": "cli",
       "to": "root",
-      "y": 174,
+      "y": 198,
       "label": "取 .install.lock、復原殘留 journal"
     },
     {
       "id": "rollback-target",
       "from": "cli",
       "to": "root",
-      "y": 204,
+      "y": 228,
       "label": "--rollback：以 previous 版本為目標",
       "note": "條件：setup --rollback"
     },
@@ -194,36 +194,36 @@
       "id": "verify",
       "from": "cli",
       "to": "bundle",
-      "y": 260,
+      "y": 284,
       "label": "驗證 manifest 與 SHA256SUMS"
     },
     {
       "id": "stage",
       "from": "cli",
       "to": "root",
-      "y": 290,
+      "y": 314,
       "label": "stage_version：放入 versions/<版本>"
     },
     {
       "id": "safety",
       "from": "cli",
       "to": "daemon",
-      "y": 320,
+      "y": 344,
       "label": "safety_check：health.ping＋mcu.status"
     },
     {
       "id": "hold",
       "from": "cli",
       "to": "supervisor",
-      "y": 350,
+      "y": 374,
       "label": "hold_autostart：抑制自動拉起",
-      "note": "Linux｜Windows：systemd drop-in｜schtasks /DISABLE"
+      "note": "Linux｜Windows： systemd drop-in ｜ schtasks /DISABLE"
     },
     {
       "id": "handoff",
       "from": "cli",
       "to": "daemon",
-      "y": 406,
+      "y": 430,
       "label": "daemon.handoff_stop（交接停止）",
       "note": "條件：舊 daemon 正在執行"
     },
@@ -231,36 +231,36 @@
       "id": "released",
       "from": "cli",
       "to": "daemon",
-      "y": 462,
+      "y": 486,
       "label": "confirm_released：行程已退出、tty 已釋放"
     },
     {
       "id": "switch",
       "from": "cli",
       "to": "root",
-      "y": 492,
+      "y": 516,
       "label": "備份狀態 → 切換穩定入口",
-      "note": "Linux｜Windows：symlink 原子覆蓋｜複製後改名"
+      "note": "Linux｜Windows： symlink 原子覆蓋 ｜ 複製後改名"
     },
     {
       "id": "start",
       "from": "cli",
       "to": "supervisor",
-      "y": 548,
+      "y": 572,
       "label": "Start 新版"
     },
     {
       "id": "verify-new",
       "from": "cli",
       "to": "daemon",
-      "y": 578,
+      "y": 602,
       "label": "health.ping＋版本配對"
     },
     {
       "id": "revert",
       "from": "cli",
       "to": "root",
-      "y": 608,
+      "y": 632,
       "label": "失敗：還原入口與備份",
       "note": "條件：切換或驗證失敗"
     },
@@ -268,94 +268,94 @@
       "id": "probe",
       "from": "cli",
       "to": "daemon",
-      "y": 664,
+      "y": 716,
       "label": "health.ping＋mcu.status（現況）"
     },
     {
       "id": "assets",
       "from": "cli",
       "to": "userdir",
-      "y": 694,
+      "y": 746,
       "label": "物化資產：profiles／skill／tools"
     },
     {
       "id": "install-def",
       "from": "cli",
       "to": "supervisor",
-      "y": 724,
+      "y": 776,
       "label": "安裝監管定義並啟用",
-      "note": "條件：非 on-demand。Linux｜Windows：systemd unit｜工作排程 XML"
+      "note": "條件：非 on-demand。 Linux｜Windows： systemd unit ｜ 工作排程 XML"
     },
     {
       "id": "write-mode",
       "from": "cli",
       "to": "userdir",
-      "y": 803,
+      "y": 855,
       "label": "寫回 supervision_mode 與 socket"
     },
     {
       "id": "sw-hold",
       "from": "cli",
       "to": "supervisor",
-      "y": 833,
+      "y": 913,
       "label": "supervision-mode set：hold 舊模式"
     },
     {
       "id": "sw-stop",
       "from": "cli",
       "to": "daemon",
-      "y": 863,
+      "y": 943,
       "label": "交接停止舊 daemon"
     },
     {
       "id": "sw-install",
       "from": "cli",
       "to": "supervisor",
-      "y": 893,
+      "y": 973,
       "label": "安裝新模式定義並啟動"
     },
     {
       "id": "sw-mode",
       "from": "cli",
       "to": "userdir",
-      "y": 923,
+      "y": 1003,
       "label": "寫入新的 supervision_mode"
     },
     {
       "id": "sw-release",
       "from": "cli",
       "to": "supervisor",
-      "y": 953,
+      "y": 1033,
       "label": "release hold"
     },
     {
       "id": "service",
       "from": "cli",
       "to": "supervisor",
-      "y": 983,
+      "y": 1091,
       "label": "service start／stop／restart／status",
-      "note": "Linux｜Windows：systemctl｜stop 前先 graceful stop"
+      "note": "Linux｜Windows： systemctl ｜ stop 前先 graceful stop"
     },
     {
       "id": "autostart",
       "from": "cli",
       "to": "daemon",
-      "y": 1039,
+      "y": 1147,
       "label": "on-demand：連不上時自動啟動",
-      "note": "Linux｜Windows：不自動啟動｜on-demand 時自動啟動"
+      "note": "Linux｜Windows： 不自動啟動 ｜ on-demand 時自動啟動"
     },
     {
       "id": "doctor-daemon",
       "from": "cli",
       "to": "daemon",
-      "y": 1095,
+      "y": 1203,
       "label": "doctor：endpoint、code 指紋、版本配對"
     },
     {
       "id": "doctor-local",
       "from": "cli",
       "to": "userdir",
-      "y": 1125,
+      "y": 1233,
       "label": "doctor：監管模式、WAL 目錄、profile"
     }
   ]
