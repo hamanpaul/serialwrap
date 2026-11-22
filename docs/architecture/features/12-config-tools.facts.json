@@ -1,0 +1,704 @@
+{
+  "schema_version": 1,
+  "document_type": "feature-facts",
+  "feature": {
+    "id": "12-config-tools",
+    "order": 12,
+    "title": "設定與工具",
+    "summary": "profile YAML 從哪來、被誰載入、怎麼在不碰板子的情況下驗證，以及 CLI 內建給 agent 看的操作說明。"
+  },
+  "repository": {
+    "url": "https://github.com/hamanpaul/serialwrap",
+    "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347"
+  },
+  "diagram_type": "sequence",
+  "scope": {
+    "includes": [
+      "採用 sequence：這個功能雖然偏結構，但三條使用路徑（setup 落地、daemon 載入、離線測試）都有明確的先後與呼叫者，用循序圖比元件圖更能說明「同一個 load_profiles 被 daemon 與 CLI 共用」",
+      "預設 profile、skill 文件與工具腳本如何從內嵌資產落到使用者目錄",
+      "daemon 啟動時的 profile 載入、template 選擇與登入時的帳密解析",
+      "profile test 的離線 regex 檢查與 doctor 的 profile 檢查",
+      "skill 子命令"
+    ],
+    "excludes": [
+      "config.yaml（supervision_mode、socket_path、windows 區段）的讀寫，屬於 10-install-supervision",
+      "template 各欄位在登入狀態機、ready probe、quiet 判定中的實際用法（屬於 02-session-lifecycle）",
+      "session.bind 的 pin 與 profile 自動偵測流程（屬於 03-device-mgmt）",
+      "minicom 工具腳本本身的行為（屬於 04-human-console）"
+    ]
+  },
+  "participants": [
+    {
+      "id": "operator",
+      "label": "使用者／Agent",
+      "type": "external",
+      "overview_component": null,
+      "responsibility": "下指令的人或 agent：`setup` 把預設 profile 與工具放到位、`profile test` 離線驗證 profile 的 regex、`doctor` 檢查線上 profile、`skill` 取得給 agent 讀的操作說明。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/mod.rs",
+          "line": 32,
+          "end_line": 37,
+          "excerpt_sha256": "4ff60db8597c7c13e99e831232930b753359e19efd7b7cab793002269ec50e70",
+          "claim": "CLI 分派表：skill、setup、doctor、profile test 各自的入口。"
+        }
+      ],
+      "sublabel": "下指令的一方"
+    },
+    {
+      "id": "cli",
+      "label": "CLI",
+      "type": "frontend",
+      "overview_component": "cli",
+      "responsibility": "`profile test` 與 `skill` 都是唯讀、不連 daemon、不碰 UART 的本機命令。`profile test` 載入 profile、讀樣本檔、對五組 regex 逐一檢查；`skill` 依平台印出內嵌的說明文件。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/profile_cmd.rs",
+          "line": 1,
+          "end_line": 3,
+          "excerpt_sha256": "14e25de1fc04d64082e75f1a25717380e60f1d64617b5a213ac67317555ce641",
+          "claim": "profile test：離線 regex 診斷，純讀檔，正常路徑 exit code 恆為 0。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/profile_cmd.rs",
+          "line": 52,
+          "end_line": 53,
+          "excerpt_sha256": "f721a46bb98db4d01255bf8acce9012d5d2f95548f270a41a86698ca82d718b2",
+          "claim": "run_profile_test：load_profiles → 找 template → 讀 sample → 各 regex 檢查 → stdout JSON。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/skill_cmd.rs",
+          "line": 1,
+          "end_line": 3,
+          "excerpt_sha256": "59519ad44013dab0d67bac351740f127bf55b3fa3d43103b9bab6912c26c961e",
+          "claim": "skill：唯讀、不需 daemon，--platform auto 依能力旗標選擇。"
+        }
+      ],
+      "sublabel": "profile test／skill"
+    },
+    {
+      "id": "assets",
+      "label": "內嵌資產",
+      "type": "database",
+      "overview_component": null,
+      "responsibility": "編譯進 CLI 執行檔的檔案：預設 profile（default.yaml 與帳密 env 範例）、兩份 skill 文件（Linux 與 Windows）、三支 minicom 工具腳本。這是資產的唯一定義處，setup 與 skill 都從這裡取。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/assets.rs",
+          "line": 1,
+          "end_line": 4,
+          "excerpt_sha256": "2b9e23d7105091cf688695a73a322aa4e4b754f99353e4b68dbe2d0761675444",
+          "claim": "內嵌資產的唯一定義處；SKILL_MD 與 SKILL_WINDOWS_MD。"
+        },
+        {
+          "path": "crates/sw-cli/src/assets.rs",
+          "line": 11,
+          "end_line": 20,
+          "excerpt_sha256": "c1378d50238b8091c511df1fc8feed7ec2747813332717048a46c28d8eb32b09",
+          "claim": "PROFILE_ASSETS：default.yaml 與 brcm.env.example。"
+        },
+        {
+          "path": "crates/sw-cli/src/assets.rs",
+          "line": 33,
+          "end_line": 52,
+          "excerpt_sha256": "862a5164187152b2c42b50a110a0d2ac60939494c92e906ed24f72dc1e8b6ab4",
+          "claim": "TOOL_ASSETS 與安裝後的工具名稱對照。"
+        }
+      ],
+      "sublabel": "編譯進 CLI"
+    },
+    {
+      "id": "profdir",
+      "label": "profile 目錄",
+      "type": "database",
+      "overview_component": "profiles",
+      "responsibility": "profile 的實際來源：目錄下的 `*.yaml`／`*.yml`，內容分 `defaults`、`profiles`（template：prompt／login／password regex、ready probe、UART 參數、逾時、bootloader prompts 等）與 `targets`（把特定裝置綁到 template）。帳密不寫在 YAML 裡，template 只記環境變數名稱與 env 檔路徑。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-proto/src/config_types.rs",
+          "line": 760,
+          "end_line": 772,
+          "excerpt_sha256": "6080c319e83978f0ab52d2b4491b5289089420030ef951236cbad144ae7c064b",
+          "claim": "列出目錄、排序、只取 .yaml／.yml，UTF-8 strict 解碼後 safe_load。"
+        },
+        {
+          "path": "crates/sw-proto/src/config_types.rs",
+          "line": 39,
+          "end_line": 64,
+          "excerpt_sha256": "dc972400f0f19ad92e2c9e5a9945d7c767a6c6743cf309af367bc451b15b3d28",
+          "claim": "ProfileTemplate 的欄位。"
+        },
+        {
+          "path": "crates/sw-proto/src/config_types.rs",
+          "line": 49,
+          "end_line": 53,
+          "excerpt_sha256": "ac4ca1879ee69b82616278f2463dedd02ed087375a5b2ddf0e4a73fa75eec2f8",
+          "claim": "帳密以 user_env／pass_env／env_file 間接指定。"
+        }
+      ],
+      "sublabel": "*.yaml＋env 檔"
+    },
+    {
+      "id": "loader",
+      "label": "load_profiles",
+      "type": "backend",
+      "overview_component": null,
+      "responsibility": "sw-proto 的 profile 載入器，daemon 與 CLI 共用同一份：逐檔讀 YAML，取 defaults（log_dir、max_sessions）、建立 template、把 targets 逐筆套用覆寫成 SessionProfile。YAML 語法錯、讀檔失敗、解碼失敗各有錯誤分類。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-proto/src/config_types.rs",
+          "line": 746,
+          "end_line": 747,
+          "excerpt_sha256": "4518e4dccff1a15670834ad9506f3c9f6d46f7ba550083c35727c733be4bb58b",
+          "claim": "load_profiles 的入口。"
+        },
+        {
+          "path": "crates/sw-proto/src/config_types.rs",
+          "line": 84,
+          "end_line": 90,
+          "excerpt_sha256": "96975f9984c4813b0df42f8c5e0a9ceb8513b6b9dcefc7fbf37dd06b4b72574f",
+          "claim": "回傳 profiles（targets）、templates 與 max_sessions。"
+        },
+        {
+          "path": "crates/sw-proto/src/config_types.rs",
+          "line": 92,
+          "end_line": 96,
+          "excerpt_sha256": "ededc0844844b5f32ba20946d2c4b073db4df7f50410f430708bfb117f733d4f",
+          "claim": "錯誤分類：Yaml／Value／Os／Decode。"
+        }
+      ],
+      "sublabel": "sw-proto"
+    },
+    {
+      "id": "daemon",
+      "label": "daemon 主流程",
+      "type": "backend",
+      "overview_component": "daemon-main",
+      "responsibility": "啟動序的第一步就是載入 profile；載入失敗直接以 exit 1 結束，沒有任何 profile 只印警告。之後把載入結果連同其他依賴交給 SessionManager。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1191,
+          "end_line": 1200,
+          "excerpt_sha256": "7b0d9c1ebcf0f873651ee49ea8fb55ad507ee15830a101c793d6005b61722735",
+          "claim": "load_profiles 失敗 exit 1；profiles 與 templates 皆空時印 no profiles loaded。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1280,
+          "end_line": 1299,
+          "excerpt_sha256": "87a3aec7cf2917aba015e13fc771832167e8b13eb7de2063817e9408d46f3564",
+          "claim": "建立 SessionManager 時把 load 交進去。"
+        }
+      ],
+      "sublabel": "serialwrapd"
+    },
+    {
+      "id": "sessions",
+      "label": "Session 管理",
+      "type": "backend",
+      "overview_component": "sessions",
+      "responsibility": "保存 templates，替每個裝置決定用哪個 template：先看使用者釘選（profile_pins），再看先前偵測到的結果（profile_detected），最後才用其他來源。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 1970,
+          "end_line": 1975,
+          "excerpt_sha256": "4220d79cad4e486190af04faabda4e59661256061183a7a89f5e7031b1b6b883",
+          "claim": "template_by_name：依名稱在已載入的 templates 中查找。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 4349,
+          "end_line": 4357,
+          "excerpt_sha256": "567649a370ed5a31bc331c8050e16daee9f00e0bb6754250a5b4f3df6a83f4de",
+          "claim": "template 名稱的優先序：pinned → detected → session id 內的 profile 名。"
+        }
+      ],
+      "sublabel": "SessionManager"
+    },
+    {
+      "id": "actor",
+      "label": "Session actor",
+      "type": "backend",
+      "overview_component": "session-actor",
+      "responsibility": "真正用到 profile 內容的地方：登入、ready 探測、quiet 判定都照 template 的 regex 與逾時執行。需要帳密時才依 template 指定的環境變數與 env 檔解析，解析結果只留在記憶體。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 5505,
+          "end_line": 5511,
+          "excerpt_sha256": "61726907f19b23b6ff7984654c7e28be33865568cddc36b3838df7fa5327fad3",
+          "claim": "決定登入計畫前解析帳密。"
+        },
+        {
+          "path": "crates/sw-core/src/session_auth.rs",
+          "line": 1,
+          "end_line": 3,
+          "excerpt_sha256": "1316fffc7d4fb0ecb4f3bca7f4cd81efb0a1c698946ae6c5b6db70310a55c6d7",
+          "claim": "帳密值只存在於 SessionAuth，不得輸出到日誌或 RPC 回應。"
+        },
+        {
+          "path": "crates/sw-core/src/session_auth.rs",
+          "line": 125,
+          "end_line": 131,
+          "excerpt_sha256": "bbe7f96d47e2e5870b17115fb64aca46c98b601ed55e48656df56a45cc1f946f",
+          "claim": "由 env_file／user_env／pass_env 與環境變數解析帳密。"
+        }
+      ],
+      "sublabel": "SessionCore"
+    }
+  ],
+  "steps": [
+    {
+      "id": "setup-cmd",
+      "from": "operator",
+      "to": "cli",
+      "label": "setup",
+      "phase": "資產落地",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/mod.rs",
+          "line": 34,
+          "end_line": 34,
+          "excerpt_sha256": "9055167ea52295fd70ab851ce1a0bed70bc687348d9c96d8e72b48f61255c15f",
+          "claim": "setup 的入口。"
+        }
+      ]
+    },
+    {
+      "id": "assets-read",
+      "from": "cli",
+      "to": "assets",
+      "label": "取內嵌的 profiles／skill／tools",
+      "phase": "資產落地",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 116,
+          "end_line": 125,
+          "excerpt_sha256": "d810fcc275ce402e7b72b65472dea3a91f6c8e10aeeb3caa155a31b2d0c361b9",
+          "claim": "逐一處理 PROFILE_ASSETS。"
+        },
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 135,
+          "end_line": 136,
+          "excerpt_sha256": "0de02e21918f2d04e0cd183032cb6cadc5841e21c29a002cca1acc08e9461053",
+          "claim": "SKILL_ASSETS。"
+        },
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 219,
+          "end_line": 220,
+          "excerpt_sha256": "8a57e698fddb348fa9be002e312bd068594a868b601adb6e895763ae4e8a9b93",
+          "claim": "TOOL_ASSETS。"
+        }
+      ]
+    },
+    {
+      "id": "assets-write",
+      "from": "cli",
+      "to": "profdir",
+      "label": "寫入 default.yaml（既有檔不覆寫）",
+      "phase": "資產落地",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/setup_cmd.rs",
+          "line": 108,
+          "end_line": 125,
+          "excerpt_sha256": "6a134a0095bbc968d7cd0039c8022035147e13de3687f062b4553528e17eabac",
+          "claim": "建立 profiles 目錄；目的檔已存在且未 --force 就略過。"
+        },
+        {
+          "path": "crates/sw-cli/src/assets.rs",
+          "line": 48,
+          "end_line": 52,
+          "excerpt_sha256": "f24f9fb0c931626207ae31586af6522543cd52e2d63cbae299a3a2d1cd52a9a1",
+          "claim": "工具腳本安裝後的名稱：serialwrap-minicom、serialwrap-minicom-broker、serialwrap-minicom-raw。"
+        }
+      ],
+      "note": "使用者改過的 profile 不會被 setup 蓋掉；skill 文件與三支 minicom 工具腳本也在同一步放到使用者目錄。"
+    },
+    {
+      "id": "load-call",
+      "from": "daemon",
+      "to": "loader",
+      "label": "load_profiles(profile_dir)",
+      "phase": "daemon 載入與使用",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1191,
+          "end_line": 1197,
+          "excerpt_sha256": "64ec29429d91040365dd4aa829e69287270840ba4b7f3c73f0ac56edc5d2899a",
+          "claim": "啟動時載入 profile 目錄；失敗即結束。"
+        }
+      ]
+    },
+    {
+      "id": "load-read",
+      "from": "loader",
+      "to": "profdir",
+      "label": "依檔名排序讀 *.yaml／*.yml",
+      "phase": "daemon 載入與使用",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-proto/src/config_types.rs",
+          "line": 752,
+          "end_line": 772,
+          "excerpt_sha256": "68d495e8218c093c5a6f35541f80463313409673bf14617af1afc02abfac8d66",
+          "claim": "目錄不存在回空結果；否則排序後逐檔讀取並解析。"
+        },
+        {
+          "path": "crates/sw-proto/src/config_types.rs",
+          "line": 524,
+          "end_line": 557,
+          "excerpt_sha256": "fa78a81431ac2a09a14334490c033530682dc3637cb9fc36d5d1b29075172f44",
+          "claim": "template 的預設名稱取自檔內 profile_name 或檔名；profiles 區段逐筆建立 template。"
+        }
+      ]
+    },
+    {
+      "id": "load-result",
+      "from": "loader",
+      "to": "daemon",
+      "label": "templates＋targets＋max_sessions",
+      "phase": "daemon 載入與使用",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-proto/src/config_types.rs",
+          "line": 804,
+          "end_line": 815,
+          "excerpt_sha256": "4ca5236f56658125714aef5eaeedb7331c7bf04becec47ca0232f515f04c288c",
+          "claim": "每個檔案建立 templates；targets 區段省略時該檔全部走動態偵測。"
+        },
+        {
+          "path": "crates/sw-proto/src/config_types.rs",
+          "line": 894,
+          "end_line": 898,
+          "excerpt_sha256": "3d36b00ba3f2bdcb1748fe588856b1802194ba57349adf8298532b817bb085eb",
+          "claim": "回傳 LoadResult。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1205,
+          "end_line": 1207,
+          "excerpt_sha256": "9e03a009a218a3cf7c27c79e7afb15174376e87547059bdf01309280bcaefcd5",
+          "claim": "Windows 原生裝置後端會另外注入 passthrough template。"
+        }
+      ],
+      "note": "目錄內有多個 YAML 時，targets 會累加，但 templates 以排序後最後一個檔的內容為準（每處理一個檔就整批取代）。Linux｜Windows：不另加 template｜額外注入 passthrough template。"
+    },
+    {
+      "id": "hand-over",
+      "from": "daemon",
+      "to": "sessions",
+      "label": "ManagerDeps：交付 load",
+      "phase": "daemon 載入與使用",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1280,
+          "end_line": 1299,
+          "excerpt_sha256": "87a3aec7cf2917aba015e13fc771832167e8b13eb7de2063817e9408d46f3564",
+          "claim": "SessionManager::new 的依賴包含 load。"
+        }
+      ]
+    },
+    {
+      "id": "pick-template",
+      "from": "sessions",
+      "to": "actor",
+      "label": "建立 session：選定 template",
+      "phase": "daemon 載入與使用",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 4349,
+          "end_line": 4357,
+          "excerpt_sha256": "567649a370ed5a31bc331c8050e16daee9f00e0bb6754250a5b4f3df6a83f4de",
+          "claim": "pinned 優先於 detected。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 1970,
+          "end_line": 1975,
+          "excerpt_sha256": "4220d79cad4e486190af04faabda4e59661256061183a7a89f5e7031b1b6b883",
+          "claim": "以名稱取出 template。"
+        }
+      ],
+      "note": "這段 evidence 取自還原已釋放 session 的路徑；一般裝置偵測路徑同樣以 profile_pins 與 profile_detected 決定 template，本頁沒有逐一列出各呼叫點。"
+    },
+    {
+      "id": "resolve-auth",
+      "from": "actor",
+      "to": "profdir",
+      "label": "登入時讀 env 檔解析帳密",
+      "phase": "daemon 載入與使用",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 5505,
+          "end_line": 5511,
+          "excerpt_sha256": "61726907f19b23b6ff7984654c7e28be33865568cddc36b3838df7fa5327fad3",
+          "claim": "需要登入計畫時呼叫 resolve_session_auth。"
+        },
+        {
+          "path": "crates/sw-core/src/session_auth.rs",
+          "line": 137,
+          "end_line": 145,
+          "excerpt_sha256": "11321eae8ea7c639ae937b9788e2bd5f994cfda68eefc5c66b761a446e623ace",
+          "claim": "env_file 以 expanduser 展開後讀取。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8512,
+          "end_line": 8520,
+          "excerpt_sha256": "4dca79e7cfcb54c453484a3f858bfdb3c0207583cbfe81ea069bee81881a37d0",
+          "claim": "已宣告帳密卻解析不到時發出一次性警告。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 554,
+          "end_line": 554,
+          "excerpt_sha256": "0e8f7e51d1ee5fd1f06f5a40e21bbf78d572ece16259c0336e203e83491e5370",
+          "claim": "帳密解析用的 env 於 attach／recover 時重新讀取。"
+        }
+      ],
+      "condition": "template 宣告了 user_env／pass_env／env_file",
+      "note": "帳密在 attach／recover 時重新解析。帳密值不進日誌、不進 RPC 回應；解析不到時只記原因。"
+    },
+    {
+      "id": "test-cmd",
+      "from": "operator",
+      "to": "cli",
+      "label": "profile test --profile … --sample …",
+      "phase": "測試與檢查",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/mod.rs",
+          "line": 37,
+          "end_line": 37,
+          "excerpt_sha256": "43d0a08ad794b499bce04c65f75fe788993724ac86b84fc8e2c6ce084a88a18f",
+          "claim": "profile test 的入口。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/profile_cmd.rs",
+          "line": 54,
+          "end_line": 59,
+          "excerpt_sha256": "4b1e8ac49f7a4a2f820043e4db2ceee59c433dbbc22385bf71f65c624cdd2708",
+          "claim": "參數：template 名稱、樣本檔、profile 目錄（未指定用預設目錄）。"
+        }
+      ]
+    },
+    {
+      "id": "test-load",
+      "from": "cli",
+      "to": "loader",
+      "label": "load_profiles(--profile-dir)",
+      "phase": "測試與檢查",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/profile_cmd.rs",
+          "line": 61,
+          "end_line": 72,
+          "excerpt_sha256": "910f41eaacec9e959ba20a32f0a38b48e9e733535fdd4559f4fd61fbb9c3acd6",
+          "claim": "CLI 以同一個 load_profiles 載入；載入錯誤收斂成一行後以 exit 1 結束。"
+        }
+      ]
+    },
+    {
+      "id": "test-read",
+      "from": "loader",
+      "to": "profdir",
+      "label": "讀 YAML（與 daemon 同一套規則）",
+      "phase": "測試與檢查",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-proto/src/config_types.rs",
+          "line": 746,
+          "end_line": 747,
+          "excerpt_sha256": "4518e4dccff1a15670834ad9506f3c9f6d46f7ba550083c35727c733be4bb58b",
+          "claim": "同一個函式。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/profile_cmd.rs",
+          "line": 74,
+          "end_line": 87,
+          "excerpt_sha256": "c5f9ef340c7218a966322c552e74d35574141a6b8aca89d60a4bd4ba287a9a3c",
+          "claim": "找不到指定的 template 時回 UNKNOWN_PROFILE 並列出可用名稱。"
+        }
+      ]
+    },
+    {
+      "id": "test-result",
+      "from": "cli",
+      "to": "operator",
+      "label": "checks：五組 regex 的命中行或錯誤",
+      "phase": "測試與檢查",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/profile_cmd.rs",
+          "line": 160,
+          "end_line": 182,
+          "excerpt_sha256": "2b130f505fa7cb4a488c112c9056f32a2fafe21ec182f95dca5928d2161189e2",
+          "claim": "依序檢查 prompt、login、password、boot_done 與 bootloader prompts。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/profile_cmd.rs",
+          "line": 89,
+          "end_line": 105,
+          "excerpt_sha256": "2db4fe1531dc208687e4dd226174db7ca3a13146491eb9f0fe727db82139987c",
+          "claim": "樣本檔讀不到回 SAMPLE_READ_FAILED；讀到後以 replace 解碼並正規化換行。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/profile_cmd.rs",
+          "line": 206,
+          "end_line": 209,
+          "excerpt_sha256": "a08c457583fefe80a6abb7181f7d90132aca44dcd5f5c7f836b7c662f1e09731",
+          "claim": "bootloader pattern 只對樣本最後一個非空白行檢查。"
+        }
+      ],
+      "note": "每組回報 pattern、命中處所在的完整一行，或 regex 編譯錯誤。空 pattern 不編譯、視為未命中。"
+    },
+    {
+      "id": "doctor-profile",
+      "from": "cli",
+      "to": "profdir",
+      "label": "doctor：比對 bootloader_prompts",
+      "phase": "測試與檢查",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/doctor_cmd.rs",
+          "line": 1295,
+          "end_line": 1300,
+          "excerpt_sha256": "599b35694611959f33b9b8173e5fd398d94db8ed25ff46bcaf33785689a7e4f8",
+          "claim": "profile_bootloader_prompts（advisory）：線上 profile 是否漏了出貨資產的 bootloader_prompts。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/mod.rs",
+          "line": 35,
+          "end_line": 35,
+          "excerpt_sha256": "694b1f2a533f595a393fceff6d928af7f69c5798bda0e17b3ab9114b848db318",
+          "claim": "doctor 的入口。"
+        }
+      ],
+      "condition": "操作者執行 doctor",
+      "note": "setup 不覆寫既有 profile，所以舊的線上檔可能缺少新版資產加入的 bootloader prompts；doctor 以建議項目提醒。"
+    },
+    {
+      "id": "skill-cmd",
+      "from": "operator",
+      "to": "cli",
+      "label": "skill",
+      "phase": "skill",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/mod.rs",
+          "line": 32,
+          "end_line": 32,
+          "excerpt_sha256": "44110889ef79d3b24efa34530c8b668cc0944fc54660e93b6842a29fef013bdc",
+          "claim": "skill 的入口。"
+        }
+      ]
+    },
+    {
+      "id": "skill-read",
+      "from": "cli",
+      "to": "assets",
+      "label": "取 SKILL.md｜SKILL_WINDOWS.md",
+      "phase": "skill",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/skill_cmd.rs",
+          "line": 14,
+          "end_line": 22,
+          "excerpt_sha256": "efe77a86ef1c1b32532aead4ae0560ae96af7b93c32b7be902edef8cc77cded7",
+          "claim": "--platform auto 依 default_skill 選擇，windows 與其他值可明確指定。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 227,
+          "end_line": 227,
+          "excerpt_sha256": "264643f10a606f1a2642577ecf70a640b82d7b6eefb5e57dc0f596512f314a46",
+          "claim": "POSIX 的 default_skill 是 Linux。"
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 282,
+          "end_line": 282,
+          "excerpt_sha256": "f47a7440e4975bdea93e4e336757ca8a9233a5ec319daf3100b21c762948b445",
+          "claim": "Windows 的 default_skill 是 Windows。"
+        }
+      ],
+      "note": "Linux｜Windows：預設輸出 SKILL.md｜預設輸出 SKILL_WINDOWS.md；可用 --platform 明確指定。"
+    },
+    {
+      "id": "skill-out",
+      "from": "cli",
+      "to": "operator",
+      "label": "輸出說明文字",
+      "phase": "skill",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/skill_cmd.rs",
+          "line": 20,
+          "end_line": 22,
+          "excerpt_sha256": "19d0fa2c3c80323dcbae3a026c84cadc7b954b8e62e84f0a81bcd3dae6aa134f",
+          "claim": "正規化換行後寫到 stdout，exit 0。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/skill_cmd.rs",
+          "line": 4,
+          "end_line": 6,
+          "excerpt_sha256": "cf403b3a2388e21135c4b78b230ba7118bd11615f55c235a135f2b29dfe8f36f",
+          "claim": "Windows 上輸出時 \\n 轉為 \\r\\n；內嵌檔若含 CRLF 先正規化，避免重複的 \\r。"
+        }
+      ]
+    }
+  ],
+  "unknowns": [
+    {
+      "id": "template-pick-general-path",
+      "question": "一般的裝置偵測路徑是否在每個呼叫點都採用與 pick-template 相同的優先序（pin → detected → 其他）？",
+      "impact": "本頁 pick-template 的 evidence 只取自還原已釋放 session 的那一段（session_manager.rs:4349-4357）；其餘使用 profile_pins／profile_detected 的呼叫點（同檔 2597、3373、3736 附近）沒有逐一核對，若優先序不同，本頁對 template 選擇的描述就不完整。"
+    },
+    {
+      "id": "multi-file-templates",
+      "question": "profile 目錄放多個 YAML 檔時，templates 只留最後一個檔，是刻意的行為還是沿襲 Python 基線的結果？",
+      "impact": "load_profiles 每處理一個檔就以該檔的 templates 取代先前的（config_types.rs:804-806），targets 則累加。本頁照程式碼描述，沒有查到說明這個差別用意的文件；若使用者把 template 拆到多個檔，前面檔案的 template 會查不到。"
+    },
+    {
+      "id": "python-baseline-not-compared",
+      "question": "各步驟與 Python 0.4.x 基線的行為差異是否都已標出？",
+      "impact": "本頁描述的是 Rust 實作，只在撰寫時實際對照過 sw_core 的地方於步驟 note 標註差異或相同；沒有逐步比對 Python 實作，所以沒有標註不代表沒有差異。"
+    }
+  ],
+  "conflicts": []
+}

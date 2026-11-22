@@ -1,0 +1,1493 @@
+{
+  "schema_version": 1,
+  "document_type": "feature-facts",
+  "feature": {
+    "id": "01-command-exec",
+    "order": 1,
+    "title": "命令執行",
+    "summary": "命令經 READY 閘門與優先佇列，由單一 TX writer 送往 DUT；依模式取得結果，並揭露 human prompt 誤判完成的 #294 風險。"
+  },
+  "repository": {
+    "url": "https://github.com/hamanpaul/serialwrap",
+    "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347"
+  },
+  "diagram_type": "sequence",
+  "scope": {
+    "includes": [
+      "Rust 的 line／background／interactive 命令提交、READY 與 quiet 閘門、優先佇列、單一寫入者。",
+      "完成樣式、輸出清理、background capture、狀態與分段結果查詢、取消。",
+      "human raw 行在途時，agent line／background 可能誤用 human prompt 完成（issue #294）。"
+    ],
+    "excludes": [
+      "登入、ready probe、重開機後重新登入的完整狀態機，另見 Session 生命週期。",
+      "console 端點建立、lease 全部操作、檔案傳輸與 MCU 燒錄的完整流程。",
+      "建置、執行期測試或實機驗證；本頁只描述固定 revision 的原始碼。"
+    ]
+  },
+  "participants": [
+    {
+      "id": "cli",
+      "label": "CLI／Agent",
+      "type": "frontend",
+      "overview_component": "cli",
+      "responsibility": "將 cmd submit／status／result-tail／cancel 轉為 command.* RPC；CLI 也會先檢查 completion_regex 與 interactive 的 expect_reboot 相容性。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 141,
+          "end_line": 170,
+          "excerpt_sha256": "9270adf1fd85eddc6403358c56d40d35cc466f64c54c1f9e1e051426589d3738",
+          "claim": "CLI 將命令提交、狀態、結果與取消映射至對應 command.* RPC。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 400,
+          "end_line": 414,
+          "excerpt_sha256": "f3fe29d7b96d7e9aac9371f540c6effb17d5b08d15a4cf94be7cea45659a780f",
+          "claim": "CLI 的 completion_regex 無效時輸出錯誤並結束。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 417,
+          "end_line": 436,
+          "excerpt_sha256": "a37e1bc52f200903fd7dc6cecb50c2db354d9129fb70fe97928987d9d13447ff",
+          "claim": "CLI 拒絕 interactive 搭配 expect_reboot。"
+        }
+      ]
+    },
+    {
+      "id": "service",
+      "label": "RPC／Service",
+      "type": "backend",
+      "overview_component": "service",
+      "responsibility": "驗證外部參數、透過 SessionManager 解析 selector 與路由 actor；直接查詢及取消命令登錄，並路由 capture 查詢。SessionManager 為本頁省略的路由助手，不代替 actor 執行命令。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1137,
+          "end_line": 1160,
+          "excerpt_sha256": "19f19021e4ef9c660f074789627b2aec471c0188ec0633f2e914799efe1c64a5",
+          "claim": "Service 在解析 selector 前依序檢查 completion_regex、source 與 expect_reboot／mode 相容性。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1174,
+          "end_line": 1193,
+          "excerpt_sha256": "e8cabf29515fb4bd4bd273ab176f3da6c9e8eb7aa858a7a5f5368d4a547d8554",
+          "claim": "Service 解析 selector，組成 SubmitReq，再由 manager.route 送往 session。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1222,
+          "end_line": 1247,
+          "excerpt_sha256": "127dd943b519047c06d3d80a730c49ca7690b1a11caa57aba9a148e143e4d0d7",
+          "claim": "command.get 查 registry，result_tail 走結果查詢，cancel 先呼叫 registry.cancel。"
+        }
+      ]
+    },
+    {
+      "id": "registry",
+      "label": "命令登錄",
+      "type": "database",
+      "overview_component": "command-records",
+      "responsibility": "CommandRegistry 保存 accepted／running／done／error／interactive／canceled 紀錄、在途指標與 admission；SessionQueue 本體歸 session 管理。這是記憶體登錄，不是持久化資料庫。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 269,
+          "end_line": 292,
+          "excerpt_sha256": "43030f9e1f4d67fa419ab39ac1bf4fad96f946edda7b0a914fd7604f9a76e71e",
+          "claim": "admit 建立包含模式、時間、狀態與輸出欄位的 accepted 紀錄。"
+        },
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 325,
+          "end_line": 352,
+          "excerpt_sha256": "a21f30ed7bea38b02412416f9f69433ed7d0312ef082fb67fa6192ab54279796",
+          "claim": "mark_running 只允許尚未終結的 accepted 紀錄轉 running，並登記在途命令。"
+        },
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 387,
+          "end_line": 402,
+          "excerpt_sha256": "4294af8769c45509fab16b13613d552b00aadce1f2cd8f58c81f6aafc90ffb53",
+          "claim": "complete 依失敗、互動或一般成功結果，分別記 error／interactive／done。"
+        },
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 418,
+          "end_line": 418,
+          "excerpt_sha256": "cd63b90038246608b12186e721c4106fac02b25a3dd6f1b707901e1ef7eb555f",
+          "claim": "未取消紀錄結算時寫入 done_at。"
+        },
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 428,
+          "end_line": 455,
+          "excerpt_sha256": "13ea606855d2fe74afc30be7d105269d0786990dc5f2ae8118e0dba2289ea2fd",
+          "claim": "cancel 寫 canceled 與 done_at；done／error 不可取消。"
+        },
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 82,
+          "end_line": 99,
+          "excerpt_sha256": "d5e0f2daaf7176a3000135536a60708eda429439c74308ce648c95c4f54f49c9",
+          "claim": "CommandRegistry 以 Mutex 保護記憶體內的命令紀錄與在途索引。"
+        }
+      ]
+    },
+    {
+      "id": "session",
+      "label": "Session actor",
+      "type": "backend",
+      "overview_component": "session-actor",
+      "responsibility": "每 session 一條 actor thread 管理 READY／quiet、SessionQueue、前景槽、lease 與 background capture；效果由注入的 executor 執行。本頁將其 StartOp 轉送與 HumanTxPump 輔助工作寫在此參與者內，實際送 TxWriter 的分別是 executor 啟動的 OpRunner 或 HumanTxPump。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/actor.rs",
+          "line": 478,
+          "end_line": 494,
+          "excerpt_sha256": "53d91c3f7e042e224b357fc9db14d34681fc9a414dc76cc639e5256075f30da7",
+          "claim": "每個 session 建立命名 actor thread，startup effects 交 executor。"
+        },
+        {
+          "path": "crates/sw-core/src/actor.rs",
+          "line": 777,
+          "end_line": 788,
+          "excerpt_sha256": "fbea542809495e1a4007532de51670dbe7a5b10c318e64f5ce7bc00dc9b7f6a8",
+          "claim": "actor 處理事件後，依序把非定時效果交 executor 執行。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3482,
+          "end_line": 3508,
+          "excerpt_sha256": "2aa155e0b61fc3c64bfbf0dc3940738b890af926bad4f9b0b4730d71c587c892",
+          "claim": "actor 呼叫 registry.admit、將命令入列並嘗試 start_next。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5326,
+          "end_line": 5347,
+          "excerpt_sha256": "7ab2ae92169a24d947067bf72db6864d0023fbd035008491efd1cd7e96c0efee",
+          "claim": "StartOp executor 建立或取得該 epoch 的 OpRunner 並呼叫 run。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5287,
+          "end_line": 5301,
+          "excerpt_sha256": "128b4c78004f2a271eeb8ae8ea8e596ff94757aa815c6af53e05f8cba4352c27",
+          "claim": "HumanTx executor 取得該 epoch 的 writer，建立 pump 並 try_submit。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/human_tx.rs",
+          "line": 225,
+          "end_line": 246,
+          "excerpt_sha256": "48f057fc31dc38341376bca164a63f36bd443f0dc6b54d4c3b00b7b757e24929",
+          "claim": "HumanTxPump 接收工作後組成 TxJob，送往 TxWriter 並等待回條。"
+        }
+      ],
+      "sublabel": "效果執行"
+    },
+    {
+      "id": "runner",
+      "label": "命令執行",
+      "type": "backend",
+      "overview_component": "execute",
+      "responsibility": "執行 line／background 的 TX、完成等待與 stdout 清理；interactive 初始命令走 lease_send；以 OpFinished 回 actor，狀態收尾由 actor 負責。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 117,
+          "end_line": 132,
+          "excerpt_sha256": "fd8bfcf900606e0c41513a0018a2b7e8509353b062c5693a7fed685d5fe72bfa",
+          "claim": "OpRunner 執行工作後送出帶 RX watermark 的 OpFinished。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 383,
+          "end_line": 408,
+          "excerpt_sha256": "eaae468d63f097561c3beb2b0910507dd2197de3a76c0145d8354ad3f97ffb0d",
+          "claim": "普通 Command 走 run_command；InteractiveOpenCmd 則補換行後走 lease_send。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 754,
+          "end_line": 771,
+          "excerpt_sha256": "23802bf8263cf42288646c2629430e5d97825689e2e803e617d09ccb3e67f533",
+          "claim": "run_command 依完成 regex、期限與 RX 活動判定是否完成。"
+        }
+      ],
+      "sublabel": "OpRunner"
+    },
+    {
+      "id": "bridge",
+      "label": "UART bridge",
+      "type": "backend",
+      "overview_component": "bridge",
+      "responsibility": "合併 IoWorker、TxWriter、Fence 與 RxShared：writer 序列化 TX，Fence 在 OS 提交點重驗許可；reader 寫 RX WAL、更新共享視窗、喚醒等待者並發送 actor RX 事件。WAL 為附屬證據儲存，不另畫參與者。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 691,
+          "end_line": 715,
+          "excerpt_sha256": "22c17df2ec107df5c8b17d4006d7fc8bc2d4a72316facf390e366baa37735ee3",
+          "claim": "IoWorker 拆分序列埠讀寫 handle，並建立 reader 與 TX writer。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1372,
+          "end_line": 1388,
+          "excerpt_sha256": "dbf498ec47899a39de97d1b2aea0f74004938b20f160fd069487f365729e67f3",
+          "claim": "spawn_tx_writer 建立唯一呼叫 SerialWriter::write_gated 的 writer 與有界工作通道。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 600,
+          "end_line": 617,
+          "excerpt_sha256": "0332cc6dc71f17cacdc8d29909bea55955fde0031741686ce6f1cdabd265346d",
+          "claim": "FenceSubmitGate 在同一把鎖內重驗許可後才呼叫 OS 提交。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 491,
+          "end_line": 502,
+          "excerpt_sha256": "922a819c27ececf351386ff6ee34a75740cdc2ad15a808577fc4e97ddd8a3b43",
+          "claim": "reader 收到資料後以 device 來源、無 cmd_id 寫入 RX WAL。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 526,
+          "end_line": 535,
+          "excerpt_sha256": "d2fce80e8193eaa6eb168d75cb3b5330be3c3359a8cd97f07e434fbbcee6b8ae",
+          "claim": "reader 更新 RxShared，再把 RX 推往 console hub。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 546,
+          "end_line": 557,
+          "excerpt_sha256": "00af6379dae6dc13d8d1494cda1bbe8c7e46c14e264d6b6de7baf85e979b2632",
+          "claim": "reader 將帶序號與位元組的 UartRxChunk 發往 actor data lane。"
+        }
+      ],
+      "sublabel": "單一寫入者"
+    },
+    {
+      "id": "target",
+      "label": "UART／DUT",
+      "type": "external",
+      "overview_component": "target",
+      "responsibility": "經序列埠接收 TX 並輸出回顯、命令結果或 prompt；程式碼只能證明主機讀寫位元組，不能證明每筆 RX 屬於哪一條命令。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1079,
+          "end_line": 1089,
+          "excerpt_sha256": "4f9ac4854148b640598ecc0af9b2f08cfbbdff05001d33f3c9fa91eb53ab6c83",
+          "claim": "放行後由 SerialWriter::write_gated 提交 payload，並重查 fence 拒絕原因。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 482,
+          "end_line": 492,
+          "excerpt_sha256": "dbfcac5ea643d6aba303b9a335ba7f2148c6147ae741341c13b450f86b41c50b",
+          "claim": "reader 從 SerialReader 取得 DUT RX 位元組。"
+        }
+      ]
+    },
+    {
+      "id": "human",
+      "label": "人類 console",
+      "type": "frontend",
+      "overview_component": "human",
+      "responsibility": "人類透過 console 輸入；ConsoleHub 在此參與者內負責實際讀取及轉送 ConsoleInputBytes。raw owner 輸入經 session 的 HumanTxPump 送 writer，不會成為 agent 的前景命令；此交錯是 #294 的前提。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 977,
+          "end_line": 998,
+          "excerpt_sha256": "353a7b98bcf0d0c336bca7b65fc18c597f8cd034d3721d55019139c2e1db3105",
+          "claim": "ConsoleHub 取出 console bytes，產生帶 client 與 input_epoch 的 ConsoleInputBytes。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 1053,
+          "end_line": 1063,
+          "excerpt_sha256": "746a532cb87cd93406eb137d08417a91c53c8b4bb6e6f7cf45f060cd6f1b6db7",
+          "claim": "ConsoleHub 實際將待送 data／control 事件發往 session。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 611,
+          "end_line": 636,
+          "excerpt_sha256": "e79d2a2d64d53e8cbabdafc3d5caa2a2caf39a3ab35708b8ae4a17530f28893f",
+          "claim": "raw 輸入進 HumanRaw TX lane；defer 暫存；只有 line 分支交 console_line_input。"
+        }
+      ],
+      "sublabel": "ConsoleHub"
+    }
+  ],
+  "steps": [
+    {
+      "id": "human-input",
+      "from": "human",
+      "to": "session",
+      "label": "轉送人類整行輸入",
+      "phase": "人類命令在途（#294 前提）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 991,
+          "end_line": 998,
+          "excerpt_sha256": "9d76083b933b49a91395ec9e8016bb3dfccd37844c5ef313401ce127a4171d76",
+          "claim": "console bytes 被包成 ConsoleInputBytes。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 1053,
+          "end_line": 1063,
+          "excerpt_sha256": "746a532cb87cd93406eb137d08417a91c53c8b4bb6e6f7cf45f060cd6f1b6db7",
+          "claim": "ConsoleHub 將該事件送到 session data lane。"
+        },
+        {
+          "path": "crates/sw-pal/src/console_mux.rs",
+          "line": 73,
+          "end_line": 84,
+          "excerpt_sha256": "3961e29aa1b70bb62731ef481dbd58cf9bc7016ec9a11f74c137451a142117eb",
+          "claim": "console 種類：平台有 PTY 時自動選 PTY，否則（或設 tcp 時）用 TCP Telnet。"
+        },
+        {
+          "path": "crates/sw-pal/src/console_pty/windows.rs",
+          "line": 1,
+          "end_line": 1,
+          "excerpt_sha256": "898bdf8e3a68749c398c77609ed9e7444e4e5ab19319fcbd61bb2b43fd34c986",
+          "claim": "Windows 沒有 PTY，human console 改走 TCP＋Telnet。"
+        }
+      ],
+      "condition": "選擇性前提：raw owner 已送出整行並按 Enter，該行的 prompt 尚未回來時，agent 命令才進 actor。",
+      "note": "實際送出者是此參與者內的 ConsoleHub。console 端點依平台不同，Linux｜Windows：PTY｜TCP Telnet。若 agent 命令已開始，前景期間的 human 輸入會先暫存，不在此路徑。"
+    },
+    {
+      "id": "human-tx",
+      "from": "session",
+      "to": "bridge",
+      "label": "以 HumanRaw 提交人類輸入",
+      "phase": "人類命令在途（#294 前提）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 611,
+          "end_line": 626,
+          "excerpt_sha256": "1bf7d7d527e68b70ed5b9a1b1ac92a9f49eb0e677307b65d2fecf546f2fbd067",
+          "claim": "raw owner 無待回放資料時呼叫 lane_submit，類別為 HumanRaw。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 388,
+          "end_line": 409,
+          "excerpt_sha256": "0116e9be96aa510a62fba145982154cc85de1aa21382633774de3d5a249a15ad",
+          "claim": "actor 建立 cmd_id 為 None 的 permit，產生 HumanTx 效果。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/human_tx.rs",
+          "line": 231,
+          "end_line": 246,
+          "excerpt_sha256": "54b2de8062b7154385ef98aaea8728709dab3fce581a2a4d2e25f83f2423ad42",
+          "claim": "實際由 HumanTxPump 把 TxJob 送往 writer，等待 TxReport。"
+        }
+      ],
+      "condition": "延續前一步，raw 輸入可立即送出。",
+      "note": "箭頭代表 session 附屬的 HumanTxPump；raw 路徑未把該行註冊成 command.submit 前景工作。"
+    },
+    {
+      "id": "human-write",
+      "from": "bridge",
+      "to": "target",
+      "label": "寫入人類命令位元組",
+      "phase": "人類命令在途（#294 前提）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1079,
+          "end_line": 1089,
+          "excerpt_sha256": "4f9ac4854148b640598ecc0af9b2f08cfbbdff05001d33f3c9fa91eb53ab6c83",
+          "claim": "通過 fence 的工作由單一 writer 呼叫 write_gated。"
+        }
+      ],
+      "condition": "延續人類輸入分支，TX 許可有效。",
+      "note": "human TX 與後面的 agent TX 共用 writer；序列化寫入不代表會等待 human 命令的 prompt。"
+    },
+    {
+      "id": "submit",
+      "from": "cli",
+      "to": "service",
+      "label": "送出 command.submit",
+      "phase": "送出與受理",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 141,
+          "end_line": 159,
+          "excerpt_sha256": "19304e916218521f6bd2b32bc09f1c5ea375370c2c3c3313de26dbde5a963934",
+          "claim": "CLI 帶 selector、命令、來源、模式、優先序、期限與選用完成參數，映射為 command.submit。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 400,
+          "end_line": 414,
+          "excerpt_sha256": "f3fe29d7b96d7e9aac9371f540c6effb17d5b08d15a4cf94be7cea45659a780f",
+          "claim": "CLI 先檢查 completion_regex。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 420,
+          "end_line": 436,
+          "excerpt_sha256": "bf291cbcfc4e38779635b17b481ea396439c7088e4513cd0bdfedffcc1f942c1",
+          "claim": "interactive 搭配 expect_reboot 在 CLI 本地拒絕。"
+        }
+      ],
+      "note": "mode 為 line／background／interactive。"
+    },
+    {
+      "id": "route-submit",
+      "from": "service",
+      "to": "session",
+      "label": "驗證參數並路由 Submit",
+      "phase": "送出與受理",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1137,
+          "end_line": 1157,
+          "excerpt_sha256": "c8e88c3f93aadcde2ca3c4903834199e5658659d01dbe95019c5fe823565070f",
+          "claim": "RPC 驗證順序為 completion_regex、source、mode／expect_reboot 相容性。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1171,
+          "end_line": 1193,
+          "excerpt_sha256": "6b12bafc69fc84077608978e7b33621f80104dd5642637ab4816c10512e0c388",
+          "claim": "非空 selector 解析成功後，manager.route 送出 SessionRequest::Submit。"
+        }
+      ],
+      "note": "驗證失敗即回錯誤；有效參數才進 actor。此箭頭由 Service 透過 SessionManager 路由，不由命令登錄發送。"
+    },
+    {
+      "id": "admit",
+      "from": "session",
+      "to": "registry",
+      "label": "登錄 accepted 命令",
+      "phase": "送出與受理",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3482,
+          "end_line": 3502,
+          "excerpt_sha256": "fb73867a5bd21b7d07d77f3b192b6029cb07c9b29f62cc3c3c5dbe34852ba0df",
+          "claim": "actor 產生 cmd_id 並呼叫 registry.admit；失敗直接回應。"
+        },
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 174,
+          "end_line": 190,
+          "excerpt_sha256": "68e9793bee396c5dcc7d1861afcf82740d3d0526ddbf7ddb4cdc93aa259af388",
+          "claim": "登錄拒絕超過硬上限的命令，超過軟上限則附警告。"
+        },
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 194,
+          "end_line": 218,
+          "excerpt_sha256": "57fe191812078a09564c2e15b520cb09023e88793a196d6c057c6253699aa341",
+          "claim": "登錄拒絕換行，並向 admission gate 申請 ticket。"
+        },
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 228,
+          "end_line": 247,
+          "excerpt_sha256": "25ccd8f903b540b2929edbc35b24945bb937bb19f4af5591fe3070d7d8c1ad68",
+          "claim": "登錄檢查 queue_registered 與每 session pending 上限。"
+        },
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 269,
+          "end_line": 292,
+          "excerpt_sha256": "43030f9e1f4d67fa419ab39ac1bf4fad96f946edda7b0a914fd7604f9a76e71e",
+          "claim": "通過後寫入 accepted 紀錄。"
+        }
+      ],
+      "note": "先通過 READY／quiet 閘門才登錄；命令過長、含換行、admission 拒絕或 pending 額度滿時不入列。"
+    },
+    {
+      "id": "submit-reply",
+      "from": "session",
+      "to": "service",
+      "label": "回覆 accepted 或拒絕碼",
+      "phase": "送出與受理",
+      "basis": "observed",
+      "note": "閘門：RECOVERING 回 SESSION_RECOVERING、FLASHING 回 FLASHING_BUSY、其他非 READY 回 SESSION_NOT_READY（ATTACHED 且 profile 不可下命令時回 PROFILE_NOT_COMMAND_CAPABLE）；非可信來源另過 quiet gate。通過閘門且登錄成功才推入 SessionQueue 並回 accepted，同一輪接著嘗試 start_next。",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3411,
+          "end_line": 3427,
+          "excerpt_sha256": "4c3367446c356713f00b513cb0fb36624131624ec8ca6a7a54ce12a0b8cbfe6e",
+          "claim": "RECOVERING 回 SESSION_RECOVERING、FLASHING 回 FLASHING_BUSY，其他非 READY 走拒絕路徑。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3429,
+          "end_line": 3434,
+          "excerpt_sha256": "d578c6f9d69a4a365fa11cb3c62c482045cb7468052e83509a332eec3be7c21e",
+          "claim": "ATTACHED 且非 command-capable profile 回 PROFILE_NOT_COMMAND_CAPABLE。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3444,
+          "end_line": 3451,
+          "excerpt_sha256": "52ea5dc7c89465773ddf78410d18f87180f67fcfa79bd3fe36a6f0d0e41b2f3e",
+          "claim": "passthrough 尚在 ATTACHED 時回 SESSION_NOT_READY 並附 ready_in。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3461,
+          "end_line": 3478,
+          "excerpt_sha256": "7f0c968d8de6c26531fd6376dccac0f4178b31015807d279700976a590562810",
+          "claim": "其餘非 READY 回 SESSION_NOT_READY；非 passthrough 的不可信請求另經 quiet gate。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3504,
+          "end_line": 3508,
+          "excerpt_sha256": "70b98ce132a657d66790d427beb77cf33ea5d00a2c83292a2196ea451b603b0e",
+          "claim": "actor 推入 SessionQueue，先安排 accepted 回覆，再呼叫 start_next。"
+        }
+      ]
+    },
+    {
+      "id": "submit-ack",
+      "from": "service",
+      "to": "cli",
+      "label": "回傳 cmd_id 或錯誤碼",
+      "phase": "送出與受理",
+      "basis": "observed",
+      "note": "accepted 只表示已受理並入列，不代表已送出或完成；命令在 &&／||／;／& 之後含 reboot 而未帶 --expect-reboot 時另附 CHAINED_REBOOT_WARNING。",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1192,
+          "end_line": 1220,
+          "excerpt_sha256": "6cd36a7faf6071ef3e07b88dcbcd5028a99fc3b0f7da3403707cf6326ef7c682",
+          "claim": "Service 取得 actor 的回覆後，成功時視命令內容附 CHAINED_REBOOT_WARNING，最後標註來源再回給呼叫端。"
+        },
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 301,
+          "end_line": 306,
+          "excerpt_sha256": "9395c1cb285a1d0e55c436b489d0bbff1b5a39eebf93218e3bc6dbda1a6e7977",
+          "claim": "受理回應帶 ok、cmd_id、status=accepted 與 session_id。"
+        }
+      ]
+    },
+    {
+      "id": "dequeue",
+      "from": "session",
+      "to": "registry",
+      "label": "出列並標記 running",
+      "phase": "排程與模式分流",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7323,
+          "end_line": 7331,
+          "excerpt_sha256": "cfd7974244692523cf9e549f69222424a6d3e0194d2565677c4ed1594e10d14c",
+          "claim": "前景檔案傳輸會拒絕佇列命令，其他前景忙或非 READY 時先不出列。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7341,
+          "end_line": 7365,
+          "excerpt_sha256": "a1eab0be6043c3bb2d47cad4affd6fa77781e122885b60ccbe118dde0199d0f5",
+          "claim": "出列後 mark_running，重查 execute-time gate；必要時停放至回放 hold 結束。"
+        },
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 325,
+          "end_line": 352,
+          "excerpt_sha256": "a21f30ed7bea38b02412416f9f69433ed7d0312ef082fb67fa6192ab54279796",
+          "claim": "只有仍 accepted 且未終結者能轉 running；其餘略過。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7295,
+          "end_line": 7311,
+          "excerpt_sha256": "7fabc9a05338a4d5287a3e97d7b317e3e34530048cbc3513f2502e571c91ed7b",
+          "claim": "執行時重查 lease；非 interactive 遇 lease 時，僅 agent 遇 human lease 可放行。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7257,
+          "end_line": 7272,
+          "excerpt_sha256": "0856b6d4376e339caf41980836de96f2c2b9f78f9369b3d8ba8973e096018782",
+          "claim": "execute-time 再驗 completion_regex、FLASHING、READY 與連線 epoch。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7273,
+          "end_line": 7292,
+          "excerpt_sha256": "24250ff1d6c415d3a5961243537dd1c5707b32676802c206adf6fecfc9d19a95",
+          "claim": "execute-time 對非 passthrough、未具可信 human 資格的請求重查 quiet，並檢查 recovering。"
+        },
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 314,
+          "end_line": 320,
+          "excerpt_sha256": "aea755386c7655b5671d244623548acff61cd2af581dc4cd11b0c44579e38794",
+          "claim": "佇列排序鍵為 priority 與單調增加的 counter。"
+        },
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 662,
+          "end_line": 678,
+          "excerpt_sha256": "d17bd8151272ecb71f4906fd478e55906650d1720d9b921bfb6efdd17889abd3",
+          "claim": "Reverse heap 依 priority、counter 由小到大出列。"
+        }
+      ],
+      "note": "priority 較小者先出列，同優先序依登錄先後；前景槽忙或非 READY 時不出列。出列後重查執行期條件，受理成功不保證一定 TX；這裡沒有等待 human 行 prompt 的檢查。"
+    },
+    {
+      "id": "start-command",
+      "from": "session",
+      "to": "runner",
+      "label": "啟動 line／background 執行",
+      "phase": "排程與模式分流",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7445,
+          "end_line": 7455,
+          "excerpt_sha256": "3e59db74745fef31ed1cd02735006953a63f6f0f363762a6cb3318ba5ce6457b",
+          "claim": "判定 reboot；非 reboot 的 background 建立 capture；命令開始時關閉 human admission。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7463,
+          "end_line": 7481,
+          "excerpt_sha256": "cd0f4a7c0711fb75779709dd7a241e689b7f612c66b3c84ec2bdb2004f9a9944",
+          "claim": "actor 保存 PendingOp::Command、佔前景槽，發出 StartOp::Command。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5326,
+          "end_line": 5347,
+          "excerpt_sha256": "7ab2ae92169a24d947067bf72db6864d0023fbd035008491efd1cd7e96c0efee",
+          "claim": "executor 取得該 epoch 的 runner，實際呼叫 run。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 1022,
+          "end_line": 1038,
+          "excerpt_sha256": "4cea630eca92aeeac5bf61c36af44abfed166e7eed8c9864958418b02d872f65",
+          "claim": "前景開始保存來源並透過 fg_begin 管理 human admission／suspend。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 33,
+          "end_line": 45,
+          "excerpt_sha256": "369125f4099cf717d66363574fb2d52ae57ffb5dccb8a650abb365fb4f257971",
+          "claim": "fg_begin 關 human admission；agent 遇 human lease 時 suspend。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 641,
+          "end_line": 646,
+          "excerpt_sha256": "7886f209dc7135a4e106586ad7a335f75687048eb7feeb3bb09a4ba0d2c82771",
+          "claim": "執行模式將 fg 正規化為 line、bg 正規化為 background。"
+        }
+      ],
+      "condition": "mode 為 line／background（fg／bg 分別正規化）。",
+      "note": "background 也會占前景槽等待完成樣式，不是跳過排程立即完成。agent 執行期間新 human 輸入可暫存，但已送出去的 human 行仍可能回傳 prompt。"
+    },
+    {
+      "id": "start-interactive",
+      "from": "session",
+      "to": "runner",
+      "label": "建立 lease 並啟動 interactive 初始命令",
+      "phase": "排程與模式分流",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7389,
+          "end_line": 7410,
+          "excerpt_sha256": "8a17ae4ca2f5cb683624b4f5fdfd82cb58c794f569014bef3e309a21959eec4c",
+          "claim": "interactive 先關 admission，建立至少 hard_timeout_s 的 lease，預存 interactive 結果。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7411,
+          "end_line": 7419,
+          "excerpt_sha256": "4c4eac7c2f6a38b4aa50f1c5c9cba081d241bc5d02d5d6130c9ce1800502b87e",
+          "claim": "空命令直接結算 interactive，並恢復前景 admission，繼續處理佇列。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7421,
+          "end_line": 7439,
+          "excerpt_sha256": "005ea232d413956946273dd8789986c991b6442b5f9d0dc26bba0782b95c9ac7",
+          "claim": "非空命令保存 InteractiveCmd 並發出 InteractiveOpenCmd 工作。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7011,
+          "end_line": 7027,
+          "excerpt_sha256": "b451ff7725ec230ee0c69dbfddeaaebc81fc2c245e0d840b5de59b967ac44aec",
+          "claim": "open_lease 保存租約、增加 owner 世代並設定互動 owner。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 405,
+          "end_line": 411,
+          "excerpt_sha256": "36c2febc8e90f7b2c6e74dab10018e0f1b6ff813141cbea5697c817b6b0b6737",
+          "claim": "InteractiveOpenCmd 使用 command_payload 與 lease_send，與後續 InteractiveSend 分開。"
+        }
+      ],
+      "condition": "mode 為 interactive；僅非空初始命令進 OpRunner。",
+      "note": "此為上一個啟動步驟的替代分支。空命令不 TX，直接回 interactive_session_id；非空初始命令補換行，TX 成功後回 interactive，不等待 prompt。後續 interactive.send／close 的完整流程不在本頁。"
+    },
+    {
+      "id": "submit-tx",
+      "from": "runner",
+      "to": "bridge",
+      "label": "提交帶許可的 TxJob",
+      "phase": "單一寫入者送出",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 522,
+          "end_line": 527,
+          "excerpt_sha256": "93a8432ee8c09df2d5bb86cd2c56b00f54de008609172290bb34f0724d524c12",
+          "claim": "命令 payload 缺換行時補 LF。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 540,
+          "end_line": 549,
+          "excerpt_sha256": "a5e7bc13266150f98359a5755ad98ffd120b479bda9dec1533ec8850c7b9eaa9",
+          "claim": "permit 帶 op、連線與 owner／FSM 世代、類別、source、cmd_id。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 565,
+          "end_line": 574,
+          "excerpt_sha256": "465cd43c66c45d8763cbead04d5f7b7016766342296a57de574ddd2decbe9d1c",
+          "claim": "OpRunner 送 TxJob 到 writer 工作通道並等待回條。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 710,
+          "end_line": 715,
+          "excerpt_sha256": "ab630d41ee1af62da5832e6606e2657d7ecab959212f5318d1fb14c0adbb8453",
+          "claim": "普通命令在 TX 前記錄 pre_offset，完成樣式優先使用 completion_regex。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 1024,
+          "end_line": 1028,
+          "excerpt_sha256": "6a21f8303e89204ef5735289419fe0d7595794e2d9474f80eace7abb8939b946",
+          "claim": "interactive 的 lease_send 同樣呼叫 send，完整送出即回 Sent。"
+        }
+      ],
+      "note": "line／background 走 run_command；interactive 走 InteractiveOpenCmd 的 lease_send。兩者都用同一 writer，不由 CLI 或 actor 直接寫 UART。"
+    },
+    {
+      "id": "write-command",
+      "from": "bridge",
+      "to": "target",
+      "label": "Fence 重驗後寫入命令",
+      "phase": "單一寫入者送出",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 998,
+          "end_line": 1017,
+          "excerpt_sha256": "c7d01f665d4412ad15d3d6e2a6d96e86d4e539b2899db3100fb155477be7b207",
+          "claim": "writer 逐筆取得工作並處理。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 474,
+          "end_line": 488,
+          "excerpt_sha256": "eeecbf16b262e17c3bd21b101f55ce335c9367ba0be25d0f869503c6232ac5dc",
+          "claim": "frozen、連線世代失效或 op 已取消時 Fence 拒絕。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 600,
+          "end_line": 617,
+          "excerpt_sha256": "0332cc6dc71f17cacdc8d29909bea55955fde0031741686ce6f1cdabd265346d",
+          "claim": "每次 OS 提交在 Fence 鎖內重驗許可後才提交。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1079,
+          "end_line": 1089,
+          "excerpt_sha256": "4f9ac4854148b640598ecc0af9b2f08cfbbdff05001d33f3c9fa91eb53ab6c83",
+          "claim": "writer 呼叫 write_gated，並以回條記錄結果及拒絕原因。"
+        }
+      ],
+      "note": "單一寫入者防止並行提交 UART 位元組；它不提供 RX 與命令的因果對應。"
+    },
+    {
+      "id": "tx-report",
+      "from": "bridge",
+      "to": "runner",
+      "label": "回傳 TxReport",
+      "phase": "單一寫入者送出",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1211,
+          "end_line": 1221,
+          "excerpt_sha256": "2aa006310e00975509d8d3f4a9bd1daf6f2dfc248f3fab411fbf5d3c6bfa5ad8",
+          "claim": "writer 將實際 TX 結果、WAL 與拒絕原因送入 job.reply。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 730,
+          "end_line": 741,
+          "excerpt_sha256": "11089d2de8c790475812e89a1290e11d6c873d656708d4e684a0d48111b0f421",
+          "claim": "普通命令未完整送出時直接映射失敗，不進完成等待。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 1024,
+          "end_line": 1041,
+          "excerpt_sha256": "4ff04f8f640b2a9457758b60b1de321c61ddbf120f445fb11dd879a5768ed8b7",
+          "claim": "interactive 完整送出回 Sent，其他情況映射命令失敗或許可拒絕。"
+        }
+      ],
+      "note": "成功 TX 後 interactive 直接走 OpFinished；只有普通 line／background 進下面的 regex 等待。"
+    },
+    {
+      "id": "wait-completion",
+      "from": "runner",
+      "to": "bridge",
+      "label": "從 TX 前偏移等待完成樣式",
+      "phase": "完成判定與收尾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 649,
+          "end_line": 655,
+          "excerpt_sha256": "52064de45da28f38aa0814cad556ec58887fa88e43ad835b8e075ccff00a4242",
+          "claim": "passthrough 的完成樣式依序選 completion_regex、有效 prompt 或無可用樣式。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 710,
+          "end_line": 715,
+          "excerpt_sha256": "ab630d41ee1af62da5832e6606e2657d7ecab959212f5318d1fb14c0adbb8453",
+          "claim": "一般 profile 用 completion_regex 或 prompt_regex，並保存 TX 前 pre_offset。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 744,
+          "end_line": 771,
+          "excerpt_sha256": "9b213b25ddfec5fb2e5c0505ab3cc4c45bc2f79271db44c94e91213b3622f34f",
+          "claim": "有效總期限為 timeout 與 expected_duration 較大者；分段以至多 30 秒靜默限制等待，RX 有進展才繼續。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 588,
+          "end_line": 591,
+          "excerpt_sha256": "3e418b47cdcd8faed6ddb7faaf431b97c1b13f84ada961a55f5b9337f57b692a",
+          "claim": "OpRunner 實際呼叫 RxShared.wait_for_regex_from。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 696,
+          "end_line": 708,
+          "excerpt_sha256": "67ea1a471f265ce1adbdecb21bc6e37099e0205d4d00cb4190e7e1d1bd4513ac",
+          "claim": "expect_reboot 或非 passthrough 猜中的單獨 reboot 先分流 run_reboot。"
+        }
+      ],
+      "condition": "line／background，TX 完整成功，且不是 reboot 分支。",
+      "note": "expect_reboot 優先於 completion_regex；其完整恢復流程在 Session 生命週期頁。未提供有效完成樣式的 passthrough 會等待至逾時，而不憑任意 RX 判成功。RX 若已在 TX 回條前抵達，仍會由 pre_offset 之後的共享視窗比對。"
+    },
+    {
+      "id": "human-prompt-rx",
+      "from": "target",
+      "to": "bridge",
+      "label": "人類命令的 prompt 先到（#294）",
+      "phase": "完成判定與收尾",
+      "basis": "inferred",
+      "condition": "issue #294：human 整行已送出，agent TX 後先收到 human prompt，且該 prompt 符合本次完成樣式。",
+      "note": "已知問題 https://github.com/hamanpaul/serialwrap/issues/294：line／background 可提早回 done，stdout 為空或只含 human 殘餘輸出，DUT 隨後仍執行 agent 命令。此步描述條件式風險，不宣稱每次交錯都失敗。Python 0.4.x 也沒有命令歸屬閘門，但送出後查一次、其後每 50 ms 輪詢；Rust 每次 RX 喚醒就重查，因此較容易在 agent 自己輸出到達前命中 human prompt。唯一 completion_regex 可避開不符合它的普通 human prompt，並不改變兩版共有的弱點。",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 486,
+          "end_line": 502,
+          "excerpt_sha256": "4fa6dafc0b90c78a23fbe3b3940fdc3b929e0f5658ff78de65efd5389a4d4ea2",
+          "claim": "reader 收到的 RX 以 source=device、cmd_id=None 寫入 WAL，RX 本身不帶命令歸屬。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 710,
+          "end_line": 715,
+          "excerpt_sha256": "ab630d41ee1af62da5832e6606e2657d7ecab959212f5318d1fb14c0adbb8453",
+          "claim": "完成等待的起點只記 TX 前 RX 長度，未建立命令自身回顯的完成前提。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 754,
+          "end_line": 766,
+          "excerpt_sha256": "6ae2d59f4e3845b03b9fc6a9646207cc395bc856f9ff895d94ba6bd111c3e79e",
+          "claim": "從 pre_offset 命中完成 regex 就直接 matched=true 並結束等待。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 349,
+          "end_line": 373,
+          "excerpt_sha256": "f6638fe602e73c9a62e98c10c5c005ee4c62f6c039a9e3564a98aef8b1da148e",
+          "claim": "RX 快照只要符合樣式就回匹配，新增 RX 會使等待者重查。"
+        },
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 2635,
+          "end_line": 2648,
+          "excerpt_sha256": "f1f1a2f3fb389d19ef2aded5b9329b5ffc9ecc3732fa5e3ec1e5560795b6e7ea",
+          "claim": "Python 同樣搜尋偏移後的 regex，但每次未命中後固定 sleep 0.05 秒。"
+        }
+      ]
+    },
+    {
+      "id": "receive-rx",
+      "from": "target",
+      "to": "bridge",
+      "label": "回傳本命令的回顯、輸出與 prompt",
+      "phase": "完成判定與收尾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 486,
+          "end_line": 502,
+          "excerpt_sha256": "4fa6dafc0b90c78a23fbe3b3940fdc3b929e0f5658ff78de65efd5389a4d4ea2",
+          "claim": "序列埠 reader 收到位元組後以 source=device、cmd_id=None 寫 RX WAL。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 526,
+          "end_line": 528,
+          "excerpt_sha256": "629dca43fa3d921f7a88dfdf24539c5679f48eef7e9665e5519528f444cc4e03",
+          "claim": "RX 帶連線 epoch 與序號加入共享視窗。"
+        }
+      ],
+      "note": "這些 RX 可能來自先前的 human 命令；RX WAL 的 cmd_id=None，不能單憑接收時間確認命令歸屬。"
+    },
+    {
+      "id": "wake-waiter",
+      "from": "bridge",
+      "to": "runner",
+      "label": "更新 RX 視窗並喚醒等待者",
+      "phase": "完成判定與收尾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 170,
+          "end_line": 183,
+          "excerpt_sha256": "4579db73b5a5de9e6d4a6efbbf5df4b59841cde72663556bcb09e1dc992a5fe4",
+          "claim": "每次 append 都增加 revision，將新 RX 解碼後加入視窗。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 190,
+          "end_line": 194,
+          "excerpt_sha256": "f65b0c2d4c7d8e1859d36ffeee2354acf6bf3b3a11cd626196264d73c6c6f0d0",
+          "claim": "append 最後喚醒等待者。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 349,
+          "end_line": 373,
+          "excerpt_sha256": "f6638fe602e73c9a62e98c10c5c005ee4c62f6c039a9e3564a98aef8b1da148e",
+          "claim": "等待者比對快照；revision 改變立即重查，否則以 condvar 等候。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 754,
+          "end_line": 766,
+          "excerpt_sha256": "6ae2d59f4e3845b03b9fc6a9646207cc395bc856f9ff895d94ba6bd111c3e79e",
+          "claim": "從 pre_offset 命中完成 regex 就直接 matched=true 並結束等待。"
+        },
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 2635,
+          "end_line": 2648,
+          "excerpt_sha256": "f1f1a2f3fb389d19ef2aded5b9329b5ffc9ecc3732fa5e3ec1e5560795b6e7ea",
+          "claim": "Python 同樣搜尋偏移後的 regex，但每次未命中後固定 sleep 0.05 秒。"
+        }
+      ],
+      "condition": "line／background 正在等待完成樣式。",
+      "note": "每筆 RX 都喚醒等待者重查，從 pre_offset 之後第一個符合完成樣式的位置判完成，不檢查那段 RX 是否屬於本命令。Rust 逐筆 RX 重查，Python 0.4.x 送出後每 50 ms 輪詢一次。RX 送 actor 與喚醒 runner 是不同通道，圖中不主張兩者先後。"
+    },
+    {
+      "id": "capture-rx",
+      "from": "bridge",
+      "to": "session",
+      "label": "分送 RX 並累積背景擷取",
+      "phase": "完成判定與收尾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 546,
+          "end_line": 557,
+          "excerpt_sha256": "00af6379dae6dc13d8d1494cda1bbe8c7e46c14e264d6b6de7baf85e979b2632",
+          "claim": "reader 實際發送帶 epoch、RX／WAL 序號及 bytes 的 UartRxChunk。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 5848,
+          "end_line": 5856,
+          "excerpt_sha256": "bed99876bd80e6af221cfad7d55bc6b4fc947c97dc3a3fae5f1faca7457b76c7",
+          "claim": "actor 接收 RX 的路徑呼叫 capture_rx。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7607,
+          "end_line": 7618,
+          "excerpt_sha256": "92b7373aae9ffdf5de543d4d3fc6cc85a4315c7405dd71cf2827d153fc585499",
+          "claim": "所有 active background capture 累積該段 RX，更新最後活動時間與 WAL 序號。"
+        }
+      ],
+      "condition": "background 已在 TX 前建立 capture；其他模式也收到 RX 事件，但沒有本命令的 background capture。",
+      "note": "capture 累積 session RX，並非由 cmd_id 過濾的專屬輸出；不以 OpRunner 命中 prompt 作為 capture 的唯一終止條件。"
+    },
+    {
+      "id": "op-finished",
+      "from": "runner",
+      "to": "session",
+      "label": "整理結果並回報 OpFinished",
+      "phase": "完成判定與收尾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 160,
+          "end_line": 176,
+          "excerpt_sha256": "4b943b196efc6404ef40cd6c918c4ba18f1d77e580edd2ff46f80a8e2942b961",
+          "claim": "stdout 清理先裁 prompt，再去除一般命令回顯。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 177,
+          "end_line": 192,
+          "excerpt_sha256": "41fc6b3145a5f1d8429eb3fdc4df8d88986c4c503b43fd528dd44e5a4faba245",
+          "claim": "只有原始串流有折行證據時才移除折行回顯，最後拼成 stdout。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 793,
+          "end_line": 821,
+          "excerpt_sha256": "5b7cacf57ef653c566a72fff53b2e2130ab8b8be02ff371ecd29459db8ed8e6c",
+          "claim": "成功匹配後擷取 stdout，background 回 background_capture_id；passthrough 無有效 prompt 時可裁到完成標記。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 117,
+          "end_line": 132,
+          "excerpt_sha256": "fd8bfcf900606e0c41513a0018a2b7e8509353b062c5693a7fed685d5fe72bfa",
+          "claim": "runner 回送 OpFinished，帶上 RX watermark 以表達已觀察的 RX 序號。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 897,
+          "end_line": 913,
+          "excerpt_sha256": "4220e9666ecd937e39938287d9c026de1695877466634d2d17a8936f0804d2df",
+          "claim": "一般 agent 逾時嘗試 Ctrl-C／Ctrl-D；passthrough 逾時不送救援鍵。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 956,
+          "end_line": 964,
+          "excerpt_sha256": "1a3f467edfa714fa78814a383b11b4513cb9463fde7a6b2eb8cf1a63337d7e1f",
+          "claim": "救援重新等 prompt，成功回 Recovered 含 partial 輸出，否則 PromptTimeout。"
+        }
+      ],
+      "note": "line／background 成功時清理輸出；interactive 初始 TX 成功只回 Sent，不擷取 stdout 或等 prompt。逾時可走救援分支；reboot 則走 RebootExpected 等專用結果，皆由 actor 收尾。"
+    },
+    {
+      "id": "complete-record",
+      "from": "session",
+      "to": "registry",
+      "label": "結算命令紀錄與終態",
+      "phase": "完成判定與收尾",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8066,
+          "end_line": 8081,
+          "excerpt_sha256": "fcf816fb1ddd68a298415e7047b9681fc88a2e0f49eafefb009379a98087566e",
+          "claim": "一般 CommandResult 轉為 CmdOutcome；SendFailed 另行分類。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8082,
+          "end_line": 8096,
+          "excerpt_sha256": "5291022a47f60fa498269ee36a192e9d9f617dc2c4289563ff5b11805e0672a9",
+          "claim": "Recovered 終結 capture、清空排隊命令並回 partial=true 與 recovery_action。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8104,
+          "end_line": 8109,
+          "excerpt_sha256": "9264f16fbd2876575f074367f172ada0a3555104eeb623b329e642316ad995d6",
+          "claim": "agent PromptTimeout 終結 capture；非 passthrough 退回 ATTACHED。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8140,
+          "end_line": 8148,
+          "excerpt_sha256": "8e730f49cd14c263d23ff748793f8433cba8c4e0dab3dac87295893242c9aa73",
+          "claim": "actor 以 registry.complete 結算命令。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7888,
+          "end_line": 7906,
+          "excerpt_sha256": "dd245c177a5353983789b2dfe6fd6010e543617e3c4c8005604f0997df2efa3f",
+          "claim": "interactive 初始 TX 成功用預存 interactive 結果結算；失敗關閉本次 lease 並映射錯誤。"
+        },
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 368,
+          "end_line": 385,
+          "excerpt_sha256": "ccc013dace1fd08e46491c8cd48fdc8427088d1f2802fdca05faf0d724027087",
+          "claim": "complete 不覆寫 canceled 紀錄，其他紀錄複製 stdout 與模式等結果欄位。"
+        },
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 387,
+          "end_line": 402,
+          "excerpt_sha256": "4294af8769c45509fab16b13613d552b00aadce1f2cd8f58c81f6aafc90ffb53",
+          "claim": "complete 依失敗、互動或一般成功結果，分別記 error／interactive／done。"
+        },
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 418,
+          "end_line": 418,
+          "excerpt_sha256": "cd63b90038246608b12186e721c4106fac02b25a3dd6f1b707901e1ef7eb555f",
+          "claim": "未取消紀錄結算時寫入 done_at。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7869,
+          "end_line": 7878,
+          "excerpt_sha256": "df2c77ce3da06e5c7b877e21462e56de108c1105e0df79990ee6e3a3a5b407b0",
+          "claim": "actor 先取出目前前景 grant，再結算對應命令結果。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7940,
+          "end_line": 7945,
+          "excerpt_sha256": "fb17a3959874d34f500e65614f61f3a8f63640040314158140b6063561c0c9dc",
+          "claim": "收尾執行 command_fg_finish、SettleTx，並呼叫 start_next。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 1041,
+          "end_line": 1050,
+          "excerpt_sha256": "18fdd42ab4780668d264fc4848a8bc498437f2f6ba757eef29d3a1e1c4e595fe",
+          "claim": "command_fg_finish 取回前景 admission 狀態並呼叫 fg_finish。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 48,
+          "end_line": 55,
+          "excerpt_sha256": "cfd58e9090a3eadce939f8d33db7931027647d93c3e426cddec880c070ef4461",
+          "claim": "fg_finish 恢復被 suspend 的 human，開 admission 並觸發回放。"
+        }
+      ],
+      "note": "interactive 結果帶 interactive_session_id、stdout 為空，lease 仍可供後續操作。background 命令紀錄可已 done 而 capture 仍 active，兩者狀態要分開看。結算後 actor 釋放前景槽、恢復 human admission 與回放，再呼叫 start_next 取下一筆；回放 hold 或 session 狀態仍可能讓下一筆暫停。"
+    },
+    {
+      "id": "query-result",
+      "from": "cli",
+      "to": "service",
+      "label": "查詢 command.get／command.result_tail",
+      "phase": "查詢狀態與輸出",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 161,
+          "end_line": 168,
+          "excerpt_sha256": "a133e9a234d1fb95334bc7ccc677d7837bb3bb82bae86dd568b359821c8bf093",
+          "claim": "cmd status 對應 command.get；cmd result-tail 帶 cmd_id、from_chunk、limit。"
+        }
+      ],
+      "note": "這是可在命令受理後反覆進行的查詢，不要求先完成。command.get 查命令紀錄；command.result_tail 分段取 capture。"
+    },
+    {
+      "id": "get-record",
+      "from": "service",
+      "to": "registry",
+      "label": "讀取命令狀態與 stdout",
+      "phase": "查詢狀態與輸出",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1222,
+          "end_line": 1234,
+          "excerpt_sha256": "a786d0ca1444c666d4b416558c87f09e76f51d5acf4b665950e1ae7f9f6f413e",
+          "claim": "Service 直接從 registry.get 取得紀錄，回 ok／command 並附 source_class。"
+        }
+      ],
+      "condition": "查詢 command.get。"
+    },
+    {
+      "id": "get-capture",
+      "from": "service",
+      "to": "session",
+      "label": "路由 BackgroundResult 並讀取分段",
+      "phase": "查詢狀態與輸出",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 822,
+          "end_line": 843,
+          "excerpt_sha256": "52de085ac4da1011396f8b1c569677556edd6d24cc8b994589e8f77cde38e84a",
+          "claim": "Service 先問命令擁有 session，再問其他 session 的 capture。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 846,
+          "end_line": 850,
+          "excerpt_sha256": "db9532085177973a2ea3fcd5fdbdb9a3a941cdad1d4c428b3f417a7283074625",
+          "claim": "都查無時從 registry fallback。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7630,
+          "end_line": 7635,
+          "excerpt_sha256": "b7b18986a7a617832f3ea9bd1aafd8f7f05fd0bcfb4cb804fd3d20b1a33d3952",
+          "claim": "actor 有 capture 就呼叫 result，否則從 registry fallback。"
+        },
+        {
+          "path": "crates/sw-core/src/capture.rs",
+          "line": 181,
+          "end_line": 205,
+          "excerpt_sha256": "9aaccf36e8a016cbc416580570a2ad6281d01a44e3530d02fb434d5572caf36b",
+          "claim": "查詢時可依 quiet_window_s 轉 done，並將 from_chunk 換算成保留視窗內的游標。"
+        },
+        {
+          "path": "crates/sw-core/src/capture.rs",
+          "line": 226,
+          "end_line": 233,
+          "excerpt_sha256": "f7c1d6daa7725865c9ad36a254f0abf9f5862fb613bed6a014d75d1e14db6bbc",
+          "claim": "capture 回 from_seq、last_seq、next_chunk、dropped_chunks、lost 與 chunks。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7370,
+          "end_line": 7377,
+          "excerpt_sha256": "8844ee5c4ccc7fddf24b40bcab31d766e71579a7999c5601f75549cefd6106d0",
+          "claim": "同 session 開始非 background 命令時將既有 background capture 標 done。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7638,
+          "end_line": 7645,
+          "excerpt_sha256": "bc028fe48cb11dea13153d7fa4325f78675b40f0c6bfe265232ee46035c43d29",
+          "claim": "detach 終結背景 capture 並清空相關命令 id。"
+        }
+      ],
+      "condition": "查詢 command.result_tail。",
+      "note": "capture 在靜默達 quiet_window_s、非 background 命令開始、detach 或命令錯誤等路徑終結。它是 session RX 分段累積，command.get.stdout 則是本次完成等待時整理出的輸出。"
+    },
+    {
+      "id": "query-reply",
+      "from": "service",
+      "to": "cli",
+      "label": "回傳紀錄或 capture 分段",
+      "phase": "查詢狀態與輸出",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1224,
+          "end_line": 1234,
+          "excerpt_sha256": "bdf7da7128001d6290e7e5bd639e45b9af07c5c2b0382e01b31ec1c3f14c2378",
+          "claim": "command.get 以 ok／command 回紀錄或 CMD_NOT_FOUND。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1236,
+          "end_line": 1243,
+          "excerpt_sha256": "77fe8b89458abf8752f981a3bb680e5d24641575bfc48f2397e9a33a0294ad50",
+          "claim": "command.result_tail 回傳 result_tail 查詢結果。"
+        },
+        {
+          "path": "crates/sw-core/src/capture.rs",
+          "line": 226,
+          "end_line": 233,
+          "excerpt_sha256": "f7c1d6daa7725865c9ad36a254f0abf9f5862fb613bed6a014d75d1e14db6bbc",
+          "claim": "capture 回應帶 next_chunk、dropped_chunks、lost 及 chunks，供增量讀取。"
+        }
+      ],
+      "note": "capture 的 next_chunk 可用於下一輪 from_chunk；lost／dropped_chunks 表示保留視窗已丟棄較早的片段。"
+    },
+    {
+      "id": "cancel",
+      "from": "cli",
+      "to": "service",
+      "label": "送出 command.cancel",
+      "phase": "取消分支",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 170,
+          "end_line": 170,
+          "excerpt_sha256": "f7d14b6c1404b50f977e45d19a327994ed76c312251697d057026503cd99c97b",
+          "claim": "cmd cancel 對應 command.cancel，帶 cmd_id。"
+        }
+      ],
+      "condition": "可在 accepted／running 等可取消階段插入；不是主路徑完成後必然執行。"
+    },
+    {
+      "id": "cancel-record",
+      "from": "service",
+      "to": "registry",
+      "label": "標記 canceled 紀錄",
+      "phase": "取消分支",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1245,
+          "end_line": 1248,
+          "excerpt_sha256": "b2523fdfa624760555ab013cca1d15ba9142e17af614e4636b387041336ffb27",
+          "claim": "Service 先呼叫 registry.cancel，再依成功結果決定是否通知 actor。"
+        },
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 428,
+          "end_line": 455,
+          "excerpt_sha256": "13ea606855d2fe74afc30be7d105269d0786990dc5f2ae8118e0dba2289ea2fd",
+          "claim": "cancel 只改紀錄，不中止 worker；查無回 CMD_NOT_FOUND，done／error 回 CMD_NOT_CANCELABLE。"
+        }
+      ],
+      "note": "成功取消寫 canceled 與 done_at；這不表示已送往 DUT 的命令被撤回。"
+    },
+    {
+      "id": "cancel-queued",
+      "from": "service",
+      "to": "session",
+      "label": "盡力路由 CancelQueued",
+      "phase": "取消分支",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1248,
+          "end_line": 1260,
+          "excerpt_sha256": "34c07ceae85547b51c5e9b645761b6278524ca160ecc9922c132738b738c141e",
+          "claim": "取消登錄成功後，Service 找命令擁有者並 best-effort 路由 CancelQueued；路由結果不影響取消回應。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3206,
+          "end_line": 3217,
+          "excerpt_sha256": "1109bd88a101c42904eba782daf4ba93ef66fa79d597bfc9ce1eb027f50578a5",
+          "claim": "actor 移除佇列項目；若命令正是前景 op，則撤銷其 TX。"
+        }
+      ],
+      "condition": "registry.cancel 成功且查到命令擁有 session。",
+      "note": "取消分支回 RPC 的結果以 registry.cancel 為準；不是 actor 移除結果。"
+    },
+    {
+      "id": "revoke-tx",
+      "from": "session",
+      "to": "bridge",
+      "label": "撤銷該前景 op 的後續 TX",
+      "phase": "取消分支",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3208,
+          "end_line": 3215,
+          "excerpt_sha256": "1132737bd385a3a8bc0e296d2d0f1a48606e5833c10b2391a6d40dfb5073cf17",
+          "claim": "只有 cmd_id 對上目前前景 grant 時，actor 呼叫 fence.revoke_ops。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 455,
+          "end_line": 462,
+          "excerpt_sha256": "a9c68595dec49ce0ea9b53097c2ce75dd9c909ae96d4787986f6251cdaae8d87",
+          "claim": "revoke_ops 將 op 加入 cancelled 集合，後續提交重驗會拒絕。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 483,
+          "end_line": 488,
+          "excerpt_sha256": "5ae9456f28a12911e8ca8bca91612f64f19b7e3a2c7391da5ef1367299c82c95",
+          "claim": "Fence 在 epoch 與取消集合檢查中回 Cancelled。"
+        },
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 368,
+          "end_line": 372,
+          "excerpt_sha256": "04752e32ebed32d3e228d8ffe3b9141429a0567bbb7e6859aae2759977eb148a",
+          "claim": "worker 之後 complete 不覆寫 canceled 紀錄。"
+        }
+      ],
+      "condition": "被取消命令仍是目前前景 op。",
+      "note": "已提交的 bytes 不會撤回；取消不直接終止執行中的 runner 或 DUT 命令。runner 仍可能等到匹配或期限才收尾，之後的救援鍵或尾段 TX 受撤銷限制。"
+    }
+  ],
+  "unknowns": [
+    {
+      "id": "runtime-interleavings",
+      "question": "本次未執行 daemon、測試或實機長跑，無法量測各平台下 #294 交錯的實際發生率與 stdout 內容。",
+      "impact": "條件式風險有原始碼與 issue 分析支持，但本檔不提供新的執行期重現證據。"
+    },
+    {
+      "id": "prefix-prompt-window",
+      "question": "prefix 型、未帶行尾錨點的 prompt_regex 在不同 DUT 的 #294 觸發視窗有多大？",
+      "impact": "issue #294 將此列為待實測；本頁只陳述可誤判的條件，不宣稱已確認其頻率或窗口長度。"
+    },
+    {
+      "id": "python-baseline-not-compared",
+      "question": "除了 #294 的完成判定檢查點（Rust 逐筆 RX、Python 每 50 ms 輪詢）之外，本頁沒有逐步比對 Python 0.4.x 的行為。",
+      "impact": "其他步驟只描述 Rust 實作；未標註差異不代表與 Python 0.4.x 相同。"
+    }
+  ],
+  "conflicts": []
+}

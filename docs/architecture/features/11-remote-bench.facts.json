@@ -1,0 +1,698 @@
+{
+  "schema_version": 1,
+  "document_type": "feature-facts",
+  "feature": {
+    "id": "11-remote-bench",
+    "order": 11,
+    "title": "遠端與測試台",
+    "summary": "不在同一台機器上時怎麼連到 daemon：用 SSH 隧道把 RPC endpoint 轉出去或接進來，並以 bench 代號記住常用的測試台。"
+  },
+  "repository": {
+    "url": "https://github.com/hamanpaul/serialwrap",
+    "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347"
+  },
+  "diagram_type": "sequence",
+  "scope": {
+    "includes": [
+      "remote -R（expose）：把本機 daemon 的 RPC endpoint 轉到 relay，並驗證遠端只綁 loopback",
+      "connect <代號>：依 benches.yaml 開 -L 隧道、確認 daemon 可達、記住 endpoint",
+      "--bench 的 endpoint 解析與之後的 RPC",
+      "remote status、benches 的查詢，以及 connect --close／remote close 的拆除"
+    ],
+    "excludes": [
+      "`remote -L`（不經 bench 代號的手動 connect）：隧道建立與 connect 相同，只是不讀 benches.yaml、不寫記憶",
+      "SSH 金鑰、known_hosts 與遠端主機上的帳號設定",
+      "RPC 協定本身與 daemon 端的處理（屬於 01-command-exec 等功能頁）",
+      "autossh 自己的重連行為"
+    ]
+  },
+  "participants": [
+    {
+      "id": "cli",
+      "label": "CLI",
+      "type": "frontend",
+      "overview_component": "cli",
+      "responsibility": "`remote`（-R 把本機 daemon 轉出去、-L 接到遠端、status、close）、`connect <代號>`（依 benches.yaml 開 -L 隧道並記住 endpoint）、`benches`（列出代號與存活狀態）。隧道的建立、驗證與拆除都在 CLI 行程內完成，daemon 不參與。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 682,
+          "end_line": 683,
+          "excerpt_sha256": "ff90ecf12a68b4fa8ca6e44635dfb719c937a9a3785cd5cf12fd180c552e9fd5",
+          "claim": "remote 分派：無參數或 status 列表、close／stop 關閉，其餘開通隧道。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/connect_cmd.rs",
+          "line": 1,
+          "end_line": 4,
+          "excerpt_sha256": "1235a5fb1683a3a6ac82a704cce3acb81f9971a9ebe765ea3bdb41739469bf88",
+          "claim": "connect：以 benches.yaml 的代號解析 SSH 目標，重用 remote -L 的隧道核心，並把 endpoint 記憶寫入 benches.state.json。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/benches_cmd.rs",
+          "line": 1,
+          "end_line": 3,
+          "excerpt_sha256": "a95bd6c9829e8e470483095821793cf39a812522cf902f8d36ce67944f1d6997",
+          "claim": "benches：非 RPC、不連 daemon。"
+        }
+      ],
+      "sublabel": "remote／connect"
+    },
+    {
+      "id": "benchcfg",
+      "label": "bench 設定",
+      "type": "database",
+      "overview_component": null,
+      "responsibility": "兩個檔案：`benches.yaml` 定義每個代號的 SSH 目標、本機 port、是否用 autossh、額外 ssh 選項與遠端 socket；`benches.state.json` 記住代號對應的 endpoint。記憶檔的讀改寫以 `<path>.lock` 的跨行程鎖包住，原子寫入。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/bench_state.rs",
+          "line": 1,
+          "end_line": 5,
+          "excerpt_sha256": "e4830cf06b25bdd391c39bb9aa8199f11f9e31f15f285a7718880124091ae7ef",
+          "claim": "benches.state.json 與 benches.yaml 的存取、鎖與原子寫入。"
+        },
+        {
+          "path": "crates/sw-proto/src/bench_registry.rs",
+          "line": 230,
+          "end_line": 234,
+          "excerpt_sha256": "d52c06795231d9cc74b1ee258701776e3a3f4b067ab1a7f4494dd6f25b862280",
+          "claim": "依代號取出 bench；未知代號回 UNKNOWN_BENCH_CODE。"
+        },
+        {
+          "path": "crates/sw-cli/src/bench_state.rs",
+          "line": 128,
+          "end_line": 133,
+          "excerpt_sha256": "8529dc61593fbb3f59cd72264eebb4646175e8d950a8f4fc52453dd67a494c8d",
+          "claim": "remember：寫入代號對應的 endpoint。"
+        }
+      ],
+      "sublabel": "yaml＋state.json"
+    },
+    {
+      "id": "registry",
+      "label": "隧道 registry",
+      "type": "database",
+      "overview_component": null,
+      "responsibility": "`<run_dir>/remote/` 下每個 listen port 一份 state（pid、identity、role、control path、狀態）與一份 log，另有一把 registry 鎖。identity 是隧道規格各欄位串接後的 SHA-256，用來判斷同一個 port 上的隧道是不是同一條。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 295,
+          "end_line": 318,
+          "excerpt_sha256": "b2d9a1b26cf8a239abc94eb482749e37f22e2e96e00302d5d9b010cf156ddd88",
+          "claim": "Registry：<run_dir>/remote/<port>.json，操作前取排他鎖。"
+        },
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 143,
+          "end_line": 144,
+          "excerpt_sha256": "e7f33dcf33768827b1f4867f8bfa9aa0b026421af3335013cd719ab62d004f09",
+          "claim": "identity 的算法。"
+        },
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 982,
+          "end_line": 997,
+          "excerpt_sha256": "5329fdea369a2916a122d7ec40d62c08b4690ab15da0da2a72a1737821205468",
+          "claim": "state 內記錄 role 與 via。"
+        }
+      ],
+      "sublabel": "<run_dir>/remote"
+    },
+    {
+      "id": "ssh",
+      "label": "ssh 行程",
+      "type": "external",
+      "overview_component": null,
+      "responsibility": "實際承載隧道的 `ssh`（或 `autossh -M 0`）行程，以 `-N -T` 啟動、與 CLI 分離、不使用 pipe，stdout／stderr 寫到 registry 的 log。CLI 只保存它的 pid 與啟動時間，之後靠這兩者判斷是否還活著、是否仍是同一個行程。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-pal/src/process_tunnel/mod.rs",
+          "line": 33,
+          "end_line": 44,
+          "excerpt_sha256": "ee94b804eec8daefdcf973fe9045c7a088b6738ecdcf5345e16938a5be82b7ff",
+          "claim": "ProcessTunnel：spawn_detached、alive、terminate、stderr_tail、supports_control_master。"
+        },
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 200,
+          "end_line": 206,
+          "excerpt_sha256": "4332918b5796ecbfbfa62eaa849f00c33bcbc36fffdc43da982b6735c3a5301d",
+          "claim": "argv 以 ssh 或 autossh -M 0 開頭，接 -N -T。"
+        },
+        {
+          "path": "crates/sw-pal/src/process_tunnel/mod.rs",
+          "line": 26,
+          "end_line": 31,
+          "excerpt_sha256": "517b2a728cdc16d3e420c5249152dbbac8de4d84f9908243b152ecfa557ad407",
+          "claim": "終止範圍：POSIX 為行程群組；Windows 收集整棵行程樹。"
+        }
+      ],
+      "sublabel": "ssh／autossh"
+    },
+    {
+      "id": "relay",
+      "label": "遠端主機",
+      "type": "external",
+      "overview_component": null,
+      "responsibility": "SSH 的對端。-R 時它是 relay：在自己的 127.0.0.1:port（或指定的 socket）上監聽，把連線轉回本機 daemon；-L 時它是測試台主機：本機轉送埠的連線在這裡接到該主機上的 daemon。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 233,
+          "end_line": 250,
+          "excerpt_sha256": "d9f6151830a9d4aa251b0cccf984a9f248d37e014fb3bad4203f057bf4551eca",
+          "claim": "-R 綁在 127.0.0.1:port 或遠端 socket；-L 目的地是 localhost:port 或遠端 socket。"
+        },
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 906,
+          "end_line": 915,
+          "excerpt_sha256": "8319bd1c895c1e4f04be01ed4ed5bca8eaa1cca63da59084691490bc0d8af015",
+          "claim": "在遠端執行 ss -ltnH 檢查監聽位址。"
+        }
+      ],
+      "sublabel": "relay／測試台"
+    },
+    {
+      "id": "daemon",
+      "label": "serialwrapd RPC",
+      "type": "backend",
+      "overview_component": "service",
+      "responsibility": "RPC 的服務端。expose 時是本機 daemon，它的 endpoint（Unix socket 路徑或 127.0.0.1:port）是 -R 的轉送來源；connect 時是遠端主機上的 daemon，CLI 經本機轉送埠對它發 RPC。daemon 本身不知道隧道存在。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 786,
+          "end_line": 798,
+          "excerpt_sha256": "c1a462c1dfcf4c037a73630803ebc9823cded2ee6faaee76794c916fe9bee133",
+          "claim": "expose 的轉送來源取自解析出的本機 endpoint：Unix 路徑或 127.0.0.1:port。"
+        },
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 970,
+          "end_line": 979,
+          "excerpt_sha256": "903168a8735a326d04557e307311d1f721f761a5908560a4518bb57b839a8352",
+          "claim": "connect 的就緒探測：對 tcp://127.0.0.1:<local> 發 health.ping。"
+        }
+      ],
+      "sublabel": "health.ping／一般 RPC"
+    }
+  ],
+  "steps": [
+    {
+      "id": "ex-lock",
+      "from": "cli",
+      "to": "registry",
+      "label": "取鎖、查同 port 的既有隧道",
+      "phase": "expose（remote -R）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 439,
+          "end_line": 465,
+          "excerpt_sha256": "deb186d390a8be2be021a84f0d88abfba4bc4af76860ef2c1596d8944473f2c2",
+          "claim": "鎖內讀 state：同 identity 且存活回 already_running；不同 identity 且存活回 TUNNEL_CONFLICT；已死則移除。"
+        }
+      ],
+      "note": "同一個 listen port 只允許一條隧道；規格相同的重複請求是冪等的。"
+    },
+    {
+      "id": "ex-spawn",
+      "from": "cli",
+      "to": "ssh",
+      "label": "spawn_detached：ssh -N -T -R …",
+      "phase": "expose（remote -R）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 467,
+          "end_line": 473,
+          "excerpt_sha256": "ea73d97b10608397051e6b3724d30cd3b1679e1e6cf20543eaf62c0c44ef2c5d",
+          "claim": "組 argv 後以 ProcessTunnel::spawn_detached 啟動。"
+        },
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 200,
+          "end_line": 226,
+          "excerpt_sha256": "c978ed386da8dbd2192c614d5afe640b863381e855e258db7801f0825067fdc0",
+          "claim": "預設選項含 BatchMode、ExitOnForwardFailure、ServerAlive；不支援 ControlMaster 的平台省略 Control* 三組。"
+        },
+        {
+          "path": "crates/sw-pal/src/process_tunnel/posix.rs",
+          "line": 193,
+          "end_line": 195,
+          "excerpt_sha256": "6180b936865008189d124f4d5a141b80ba111a6f5c2f459d7738b33e96270015",
+          "claim": "POSIX 支援 ControlMaster。"
+        },
+        {
+          "path": "crates/sw-pal/src/process_tunnel/windows.rs",
+          "line": 248,
+          "end_line": 250,
+          "excerpt_sha256": "d39336c5049ba03f0690b683270ffa2b0830ac894a8b342e9474e4d75fc970e5",
+          "claim": "Windows 不支援 ControlMaster。"
+        }
+      ],
+      "note": "Linux｜Windows：帶 ControlMaster=auto 與專屬 ControlPath｜Win32-OpenSSH 沒有 ControlMaster，省略這三個選項。"
+    },
+    {
+      "id": "ex-forward",
+      "from": "ssh",
+      "to": "relay",
+      "label": "建立 -R 轉送：遠端 127.0.0.1:port",
+      "phase": "expose（remote -R）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 233,
+          "end_line": 241,
+          "excerpt_sha256": "168d273ae9182104b7d9a3d8b0576e0b98dc252d9693e47e4b914ceb143d85f1",
+          "claim": "-R 的 bind 預設為 127.0.0.1:<port>，可改為遠端 socket；來源是本機 daemon 的 endpoint。"
+        },
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 786,
+          "end_line": 798,
+          "excerpt_sha256": "c1a462c1dfcf4c037a73630803ebc9823cded2ee6faaee76794c916fe9bee133",
+          "claim": "轉送來源取自本機 endpoint。"
+        }
+      ]
+    },
+    {
+      "id": "ex-state",
+      "from": "cli",
+      "to": "registry",
+      "label": "寫入 state（pid、identity）",
+      "phase": "expose（remote -R）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 474,
+          "end_line": 489,
+          "excerpt_sha256": "f0420e38f15d6761d808acff060e0b7aa677661fe3324e6679242e3cb9c59601",
+          "claim": "啟動後立刻把 state 寫進 registry。"
+        }
+      ]
+    },
+    {
+      "id": "ex-bind-check",
+      "from": "cli",
+      "to": "relay",
+      "label": "ss -ltnH：確認只綁 loopback",
+      "phase": "expose（remote -R）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 898,
+          "end_line": 915,
+          "excerpt_sha256": "35e29cd89ee18ad0d6ada9129f6095239528d888e55cfb6c23747120b9d5b0c3",
+          "claim": "未指定遠端 socket 時，在遠端執行 ss -ltnH 檢查該 port。"
+        },
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 944,
+          "end_line": 956,
+          "excerpt_sha256": "269eb0ccf542dee83fdb8fb6a4c6a2239b8b4d6e289e1c54a9d87b92eb699422",
+          "claim": "無法驗證或綁在非 loopback 位址即回 REMOTE_BIND_UNVERIFIED。"
+        }
+      ],
+      "condition": "-R 且未指定遠端 socket",
+      "note": "Linux｜Windows：沿用 ControlMaster 連線執行｜另開一條 BatchMode 的 ssh 執行。驗證失敗時剛啟動的隧道會被拆掉並清除 state。"
+    },
+    {
+      "id": "ex-ready",
+      "from": "cli",
+      "to": "registry",
+      "label": "更新狀態：active 或 starting",
+      "phase": "expose（remote -R）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 857,
+          "end_line": 880,
+          "excerpt_sha256": "dd145eadc1e80a6d578bd4bcf8726d6f20bbd887306d70a27ec0649403894466",
+          "claim": "ssh 就緒且角色探測通過為 active；超過 ready_timeout 仍未通過記為 starting。"
+        },
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 527,
+          "end_line": 535,
+          "excerpt_sha256": "45b235cc527b1be4a3064e7f3a32425c712e4e248edf202a41385b8dadd48380",
+          "claim": "鎖內把狀態寫回 state。"
+        }
+      ]
+    },
+    {
+      "id": "co-resolve",
+      "from": "cli",
+      "to": "benchcfg",
+      "label": "讀 benches.yaml，解析代號",
+      "phase": "connect（bench 代號）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/connect_cmd.rs",
+          "line": 60,
+          "end_line": 71,
+          "excerpt_sha256": "931977b553283fc49b554d5147109071e3cc16f00a0eb03740893de2fcf33070",
+          "claim": "載入設定、依代號取出 bench，決定用 ssh 或 autossh。"
+        },
+        {
+          "path": "crates/sw-proto/src/bench_registry.rs",
+          "line": 230,
+          "end_line": 234,
+          "excerpt_sha256": "d52c06795231d9cc74b1ee258701776e3a3f4b067ab1a7f4494dd6f25b862280",
+          "claim": "未知代號回 UNKNOWN_BENCH_CODE。"
+        }
+      ]
+    },
+    {
+      "id": "co-open",
+      "from": "cli",
+      "to": "ssh",
+      "label": "open_tunnel：ssh -N -T -L …",
+      "phase": "connect（bench 代號）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/connect_cmd.rs",
+          "line": 76,
+          "end_line": 78,
+          "excerpt_sha256": "988617be768005575ec49ce2a3abfdf59119d237be50a1bb403a19fec0044f1e",
+          "claim": "以 bench 的設定組 TunnelSpec（role=connect）後呼叫 open_tunnel。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/connect_cmd.rs",
+          "line": 112,
+          "end_line": 125,
+          "excerpt_sha256": "fc2b929b7a37d325f970e4d7c03b7c9adafc9c84aa76be7c462d7fb47e0d04d3",
+          "claim": "bench_spec：listen port 即 bench 的 local_port，ready_timeout 10 秒。"
+        }
+      ],
+      "note": "registry 的取鎖、查重與寫 state 與 expose 相同，這裡不重畫。"
+    },
+    {
+      "id": "co-forward",
+      "from": "ssh",
+      "to": "relay",
+      "label": "建立 -L 轉送：本機 port → 遠端 daemon",
+      "phase": "connect（bench 代號）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 242,
+          "end_line": 249,
+          "excerpt_sha256": "fbb4dfd72928508b7d8417188194f9ab2ca7128993397b776e9c81f1e61adf44",
+          "claim": "-L 綁本機 127.0.0.1:<local>，目的地是遠端的 localhost:<port> 或遠端 socket。"
+        }
+      ]
+    },
+    {
+      "id": "co-ping",
+      "from": "cli",
+      "to": "daemon",
+      "label": "health.ping（經本機轉送埠）",
+      "phase": "connect（bench 代號）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 894,
+          "end_line": 897,
+          "excerpt_sha256": "486b6ce1a87f4e7998ef42305433e9d93ac004490d6ce54a0f171a779b39e494",
+          "claim": "connect 的就緒條件是真的 ping 得到 daemon。"
+        },
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 970,
+          "end_line": 979,
+          "excerpt_sha256": "903168a8735a326d04557e307311d1f721f761a5908560a4518bb57b839a8352",
+          "claim": "對 tcp://127.0.0.1:<local> 發 health.ping。"
+        }
+      ]
+    },
+    {
+      "id": "co-remember",
+      "from": "cli",
+      "to": "benchcfg",
+      "label": "remember：代號 → tcp://127.0.0.1:port",
+      "phase": "connect（bench 代號）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/connect_cmd.rs",
+          "line": 83,
+          "end_line": 86,
+          "excerpt_sha256": "6b69f77daebbbaf400af17ebc518722f3f3c5d3b08676344453b366f1adfd108",
+          "claim": "把 endpoint 記進 benches.state.json。"
+        },
+        {
+          "path": "crates/sw-cli/src/bench_state.rs",
+          "line": 128,
+          "end_line": 133,
+          "excerpt_sha256": "8529dc61593fbb3f59cd72264eebb4646175e8d950a8f4fc52453dd67a494c8d",
+          "claim": "remember 在跨行程鎖內讀改寫。"
+        }
+      ]
+    },
+    {
+      "id": "co-rollback",
+      "from": "cli",
+      "to": "ssh",
+      "label": "terminate 剛開的隧道",
+      "phase": "connect（bench 代號）",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/connect_cmd.rs",
+          "line": 86,
+          "end_line": 107,
+          "excerpt_sha256": "b5b1500d2091e53277cd81b52220db29a15a90d29e327cd1bb00e09992f49a9c",
+          "claim": "記憶寫入失敗時，若隧道是這次開的就 rollback，並回 INVALID_BENCH_STATE 或 BENCH_STATE_IO_ERROR。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/connect_cmd.rs",
+          "line": 219,
+          "end_line": 240,
+          "excerpt_sha256": "20ab54771f43e4896784a6cb602b7097dc1969e129dbe87605381db8164b4ea4",
+          "claim": "rollback 以 remote close 拆除，並回報是否真的關掉。"
+        }
+      ],
+      "condition": "記憶寫入失敗，且隧道是本次開的"
+    },
+    {
+      "id": "use-resolve",
+      "from": "cli",
+      "to": "benchcfg",
+      "label": "--bench：查記住的 endpoint",
+      "phase": "使用與查詢",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/endpoint_resolve.rs",
+          "line": 245,
+          "end_line": 289,
+          "excerpt_sha256": "32ebf862669cc3140cd246a5ab2200a794e8ad8dbe7b6e114ac486e48c54f2e1",
+          "claim": "--bench 從 benches.state.json 取 endpoint；沒記住回 BENCH_ENDPOINT_NOT_REMEMBERED。"
+        },
+        {
+          "path": "crates/sw-cli/src/endpoint_resolve.rs",
+          "line": 231,
+          "end_line": 244,
+          "excerpt_sha256": "4626fe153e8de8f4947e7b621ef34d273f182f426fb5353518ffd79b4dab7f0b",
+          "claim": "--endpoint 與 --socket 的優先序在 --bench 之前。"
+        }
+      ],
+      "note": "endpoint 的來源順序：--endpoint、--socket、--bench、config.yaml 的 socket、本機預設。"
+    },
+    {
+      "id": "use-rpc",
+      "from": "cli",
+      "to": "daemon",
+      "label": "一般 RPC（tcp://127.0.0.1:port）",
+      "phase": "使用與查詢",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/event_cmd.rs",
+          "line": 87,
+          "end_line": 91,
+          "excerpt_sha256": "33486d73687af82d674708a9fd559f3b2acd2ed5022ba32c6d5dbe7cccfca44c",
+          "claim": "子指令把 --bench 交給 endpoint 解析。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/event_cmd.rs",
+          "line": 118,
+          "end_line": 126,
+          "excerpt_sha256": "fc4d5aa105e285812c8da3dfd67315d7bb5ce703e944554bf12926a47c100d32",
+          "claim": "之後以解析出的 endpoint 發 RPC。"
+        }
+      ],
+      "note": "連線先到本機的 ssh 轉送埠，再由隧道送到遠端主機上的 daemon；對 CLI 而言只是一個 TCP endpoint。"
+    },
+    {
+      "id": "use-status",
+      "from": "cli",
+      "to": "registry",
+      "label": "remote status／benches：列出並清理",
+      "phase": "使用與查詢",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 557,
+          "end_line": 562,
+          "excerpt_sha256": "ec942b07ede35b31e8ca8ec99942e4183e5f16dccbb8baa561224efef48bc222",
+          "claim": "status：列出隧道、清掉已死亡的 state、回報沒有 state 的 ControlPath 檔。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/benches_cmd.rs",
+          "line": 65,
+          "end_line": 92,
+          "excerpt_sha256": "b2c721c44807a36e27dc9e408e2e4a69945348409b404fe619a4b95a6f8d0662",
+          "claim": "benches：把設定的代號、記住的 endpoint 與存活的 connect 隧道 port 對起來，算出 alive。"
+        }
+      ]
+    },
+    {
+      "id": "cl-port",
+      "from": "cli",
+      "to": "benchcfg",
+      "label": "connect --close：查記住的 port",
+      "phase": "關閉",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/connect_cmd.rs",
+          "line": 127,
+          "end_line": 146,
+          "excerpt_sha256": "0d4f5f2bb0cee2b704c408370f5842f49e295862c86bd7fbfd6ae7ad296f287d",
+          "claim": "優先用記憶中 endpoint 的 port，沒有才用設定的 local_port。"
+        }
+      ]
+    },
+    {
+      "id": "cl-match",
+      "from": "cli",
+      "to": "registry",
+      "label": "確認同 port 隧道的 identity 相符",
+      "phase": "關閉",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/connect_cmd.rs",
+          "line": 148,
+          "end_line": 149,
+          "excerpt_sha256": "6e419144f3064f94e9e9ea713247328f7908eb4eb160a2d5ced5e0c3b5519029",
+          "claim": "關閉前先比對。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/connect_cmd.rs",
+          "line": 164,
+          "end_line": 190,
+          "excerpt_sha256": "9bef57d48c1f9183ae25ad4bb9a96be0510853577ad84976ae7bba43acddf795",
+          "claim": "同 port 的 stateful 隧道必須是相同 identity 的 connect 隧道，否則回 TUNNEL_CONFLICT。"
+        }
+      ]
+    },
+    {
+      "id": "cl-terminate",
+      "from": "cli",
+      "to": "ssh",
+      "label": "terminate（寬限 5 秒）",
+      "phase": "關閉",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 653,
+          "end_line": 660,
+          "excerpt_sha256": "eccc9f9ff12fc6a0f09a01ec17d66120cc96b3d7675d566c314d8ea0892cc520",
+          "claim": "行程仍存活才終止，寬限 5 秒。"
+        },
+        {
+          "path": "crates/sw-pal/src/process_tunnel/mod.rs",
+          "line": 36,
+          "end_line": 39,
+          "excerpt_sha256": "c5093c917810017fc57367c2a4d3487fa855b6e804f7532df640e22624372a7b",
+          "claim": "alive 以 pid 加啟動時間核對身分；terminate 先溫和終止，逾時才強制。"
+        }
+      ],
+      "note": "Linux｜Windows：對行程群組送 SIGTERM，逾時強制終止｜對整棵行程樹 TerminateProcess。`remote close <port>` 與 `remote close all` 走同一段。"
+    },
+    {
+      "id": "cl-remove",
+      "from": "cli",
+      "to": "registry",
+      "label": "移除 state",
+      "phase": "關閉",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/remote_tunnel.rs",
+          "line": 661,
+          "end_line": 675,
+          "excerpt_sha256": "ab0ae382c1494521f548e477c0c67a407e0d288f916be6c5d5b20dda7dd883b0",
+          "claim": "終止失敗把狀態標成 error 並保留；成功才移除 state 並列入 closed。"
+        }
+      ]
+    },
+    {
+      "id": "cl-forget",
+      "from": "cli",
+      "to": "benchcfg",
+      "label": "forget：清除 endpoint 記憶",
+      "phase": "關閉",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/connect_cmd.rs",
+          "line": 150,
+          "end_line": 160,
+          "excerpt_sha256": "e8e2dedbb1523bc53c52c4bdbca44f55287b62d72fc6212e9e5387a8f9ba7308",
+          "claim": "close 成功且該 port 已無任何隧道才清除記憶；仍存在回 TUNNEL_STILL_ACTIVE。"
+        },
+        {
+          "path": "crates/sw-cli/src/bench_state.rs",
+          "line": 135,
+          "end_line": 140,
+          "excerpt_sha256": "7c444c6e06bcd5e93dfa640a152a1c2cd443972427619de3606d0a7a31ea8276",
+          "claim": "forget 在跨行程鎖內移除該代號。"
+        }
+      ],
+      "condition": "該 port 的隧道確實已消失"
+    }
+  ],
+  "unknowns": [
+    {
+      "id": "windows-not-executed",
+      "question": "Windows（Win32-OpenSSH）上的隧道啟動、存活判定與整棵行程樹終止，實際行為是否與原始碼一致？",
+      "impact": "本頁 Windows 一側只依原始碼與 trait 註解判讀，沒有在 Windows 上開過隧道；ex-spawn、ex-bind-check、cl-terminate 的 Windows 描述未經實機驗證。"
+    },
+    {
+      "id": "relay-side-requirements",
+      "question": "relay 上需要哪些條件才能通過 loopback 驗證（例如 ss 是否存在、sshd 的 GatewayPorts 設定）？",
+      "impact": "CLI 只檢查 ss 的輸出；relay 沒有 ss 或輸出格式不同時會回 REMOTE_BIND_UNVERIFIED。本頁沒有查到原始碼以外對 relay 環境的要求說明。"
+    },
+    {
+      "id": "python-baseline-not-compared",
+      "question": "各步驟與 Python 0.4.x 基線的行為差異是否都已標出？",
+      "impact": "本頁描述的是 Rust 實作，只在撰寫時實際對照過 sw_core 的地方於步驟 note 標註差異或相同；沒有逐步比對 Python 實作，所以沒有標註不代表沒有差異。"
+    }
+  ],
+  "conflicts": []
+}

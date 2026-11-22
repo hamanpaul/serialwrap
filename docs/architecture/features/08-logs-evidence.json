@@ -1,0 +1,385 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "serialwrap｜紀錄與證據",
+    "locale": "zh-TW",
+    "output": "docs/architecture/features/08-logs-evidence.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/hamanpaul/serialwrap",
+      "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347",
+      "provider": "github"
+    }
+  },
+  "participants": [
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "CLI／Agent",
+      "sublabel": "log／wal／session",
+      "sources": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 181,
+          "end_line": 182
+        },
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 212,
+          "end_line": 221
+        },
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 122,
+          "end_line": 124
+        }
+      ]
+    },
+    {
+      "id": "service",
+      "type": "backend",
+      "label": "RPC／Service",
+      "sublabel": "Service::rpc",
+      "sources": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1284,
+          "end_line": 1330
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1331,
+          "end_line": 1370
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1372,
+          "end_line": 1383
+        }
+      ]
+    },
+    {
+      "id": "actor",
+      "type": "backend",
+      "label": "Session actor",
+      "sublabel": "SessionCore",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3375,
+          "end_line": 3377
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7737,
+          "end_line": 7783
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 9005,
+          "end_line": 9019
+        }
+      ]
+    },
+    {
+      "id": "bridge",
+      "type": "backend",
+      "label": "UART bridge",
+      "sublabel": "reader＋TxWriter",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 491,
+          "end_line": 502
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1113,
+          "end_line": 1134
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 170,
+          "end_line": 195
+        }
+      ]
+    },
+    {
+      "id": "fence",
+      "type": "security",
+      "label": "TX Fence",
+      "sublabel": "WalHealthSink",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 582,
+          "end_line": 586
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 514,
+          "end_line": 531
+        }
+      ]
+    },
+    {
+      "id": "wal",
+      "type": "backend",
+      "label": "WalWriter",
+      "sublabel": "append／rotate",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 329,
+          "end_line": 343
+        },
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 466,
+          "end_line": 467
+        },
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 1530,
+          "end_line": 1576
+        }
+      ]
+    },
+    {
+      "id": "walfiles",
+      "type": "database",
+      "label": "WAL 檔案",
+      "sublabel": "ndjson＋mirror",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 350,
+          "end_line": 351
+        },
+        {
+          "path": "crates/sw-core/src/wal.rs",
+          "line": 553,
+          "end_line": 567
+        },
+        {
+          "path": "crates/sw-proto/src/constants.rs",
+          "line": 100,
+          "end_line": 101
+        }
+      ]
+    },
+    {
+      "id": "logfile",
+      "type": "database",
+      "label": "Session log 檔",
+      "sublabel": "<COM>_<時戳>.log",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7741,
+          "end_line": 7756
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7701,
+          "end_line": 7710
+        },
+        {
+          "path": "crates/sw-core/src/capture.rs",
+          "line": 350,
+          "end_line": 375
+        }
+      ]
+    }
+  ],
+  "segments": [
+    {
+      "from": 160,
+      "to": 330,
+      "label": "雙軌寫入"
+    },
+    {
+      "from": 338,
+      "to": 571,
+      "label": "輪替與自癒"
+    },
+    {
+      "from": 579,
+      "to": 835,
+      "label": "讀取與重置"
+    },
+    {
+      "from": 843,
+      "to": 1035,
+      "label": "Session log"
+    },
+    {
+      "from": 1043,
+      "to": 1153,
+      "label": "Activity"
+    }
+  ],
+  "messages": [
+    {
+      "id": "rx-append",
+      "from": "bridge",
+      "to": "wal",
+      "y": 198,
+      "label": "append（RX，source=device）"
+    },
+    {
+      "id": "tx-append",
+      "from": "bridge",
+      "to": "wal",
+      "y": 228,
+      "label": "append（TX，已確認送出的 bytes）"
+    },
+    {
+      "id": "wal-line",
+      "from": "wal",
+      "to": "walfiles",
+      "y": 258,
+      "label": "寫 raw.wal.ndjson（權威，一行 JSON）"
+    },
+    {
+      "id": "mirror-line",
+      "from": "wal",
+      "to": "walfiles",
+      "y": 288,
+      "label": "寫 raw.mirror.log（可讀文字）"
+    },
+    {
+      "id": "append-result",
+      "from": "wal",
+      "to": "bridge",
+      "y": 318,
+      "label": "回 seq／ok／loss_flag"
+    },
+    {
+      "id": "rotate",
+      "from": "wal",
+      "to": "walfiles",
+      "y": 376,
+      "label": "輪替：改名為帶時戳的歸檔",
+      "note": "條件：現行檔達 64 MiB。 Linux｜Windows： EACCES／EBUSY ｜ winerror 5／32 時延後重試"
+    },
+    {
+      "id": "recreate",
+      "from": "wal",
+      "to": "walfiles",
+      "y": 477,
+      "label": "重建現行檔並寫 META 紀錄",
+      "note": "條件：檔案或目錄被外部刪除"
+    },
+    {
+      "id": "health-fanout",
+      "from": "wal",
+      "to": "fence",
+      "y": 533,
+      "label": "set_wal_unhealthy（health fanout）",
+      "note": "條件：寫入或重建失敗"
+    },
+    {
+      "id": "tail-rpc",
+      "from": "cli",
+      "to": "service",
+      "y": 617,
+      "label": "log.tail_raw／tail_text／wal.range"
+    },
+    {
+      "id": "tail-call",
+      "from": "service",
+      "to": "wal",
+      "y": 647,
+      "label": "tail_raw_with_meta（from_seq、COM、limit）"
+    },
+    {
+      "id": "tail-read",
+      "from": "wal",
+      "to": "walfiles",
+      "y": 677,
+      "label": "讀現行 raw.wal.ndjson"
+    },
+    {
+      "id": "tail-reply",
+      "from": "service",
+      "to": "cli",
+      "y": 707,
+      "label": "records 或 lines＋current_seq"
+    },
+    {
+      "id": "reset-rpc",
+      "from": "cli",
+      "to": "service",
+      "y": 737,
+      "label": "wal.reset",
+      "note": "條件：操作者要求重置"
+    },
+    {
+      "id": "reset-call",
+      "from": "service",
+      "to": "wal",
+      "y": 793,
+      "label": "reset"
+    },
+    {
+      "id": "reset-archive",
+      "from": "wal",
+      "to": "walfiles",
+      "y": 823,
+      "label": "歸檔兩個現行檔，seq 歸零"
+    },
+    {
+      "id": "log-rpc",
+      "from": "cli",
+      "to": "service",
+      "y": 881,
+      "label": "session.log_start／log_stop／log_status"
+    },
+    {
+      "id": "log-route",
+      "from": "service",
+      "to": "actor",
+      "y": 911,
+      "label": "LogStart／LogStop／LogStatus"
+    },
+    {
+      "id": "log-open",
+      "from": "actor",
+      "to": "logfile",
+      "y": 941,
+      "label": "開檔（append）並掛上 capture",
+      "note": "條件：log_start 且無 active capture"
+    },
+    {
+      "id": "log-write",
+      "from": "bridge",
+      "to": "logfile",
+      "y": 997,
+      "label": "寫入清理後的 RX 文字",
+      "note": "條件：capture 啟用且非前景命令期間"
+    },
+    {
+      "id": "activity-rpc",
+      "from": "cli",
+      "to": "service",
+      "y": 1081,
+      "label": "session.activity"
+    },
+    {
+      "id": "activity-route",
+      "from": "service",
+      "to": "actor",
+      "y": 1111,
+      "label": "GetState"
+    },
+    {
+      "id": "activity-reply",
+      "from": "actor",
+      "to": "service",
+      "y": 1141,
+      "label": "session 狀態＋activity_classification"
+    }
+  ]
+}

@@ -1,0 +1,1689 @@
+{
+  "schema_version": 1,
+  "document_type": "feature-facts",
+  "feature": {
+    "id": "04-human-console",
+    "order": 4,
+    "title": "人類 console 共用",
+    "summary": "人類透過 PTY 或 TCP Telnet 共用 UART；raw owner、行模式、前景暫存回放與互動租約各有邊界，並揭露 #294 的人類行在途弱點。"
+  },
+  "repository": {
+    "url": "https://github.com/hamanpaul/serialwrap",
+    "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347"
+  },
+  "diagram_type": "sequence",
+  "scope": {
+    "includes": [
+      "Rust console 接入與預設 Linux PTY／Windows TCP Telnet、raw ownership、多 console 行模式與共享 RX。",
+      "agent 前景期間 owner 輸入的暫存、有效性檢查、TX 回條與回放 hold。",
+      "從 human raw 整行已送出且 prompt 未回的角度描述 issue #294；人類行未占前景、無在途 prompt 閘門。",
+      "interactive lease 的 READY 開啟、閒置 human soft preempt、send／status／close 與 stash 還原。"
+    ],
+    "excludes": [
+      "登入、裝置偵測、bridge 建立／停機與 peer 掃描的完整生命週期。",
+      "ATTACHED bootloader 救援、重開機及 MCU flash 的完整分支；本頁只標示 flash 輸入丟棄與暫存失效。",
+      "完整 agent 排程、stdout 清理及背景 capture，另見 01-command-exec。",
+      "執行期測試、建置與實機驗證；本頁只讀固定 revision 原始碼。"
+    ]
+  },
+  "participants": [
+    {
+      "id": "human",
+      "label": "人類 console",
+      "type": "frontend",
+      "overview_component": "human",
+      "sublabel": "終端與接入 CLI",
+      "responsibility": "操作者以 CLI 請求 console_attach，再以終端讀寫端點；多個 console 的實際 I/O 由獨立的 ConsoleHub 負責。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 78,
+          "end_line": 92,
+          "excerpt_sha256": "86e3cb5e3d0bb0411fe5dd5c9800bdeddc3dae39b84d25643a5b24beb7b72640",
+          "claim": "console-attach、detach、list 映射成 session.console_* RPC。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 965,
+          "end_line": 982,
+          "excerpt_sha256": "972f89b2dcdb460ec3aee48709e961705d0debaa2cd984a796e525b746cfc2aa",
+          "claim": "Hub 從端點讀取人類輸入；Telnet 先過濾，PTY 使用原 bytes。"
+        }
+      ]
+    },
+    {
+      "id": "service",
+      "label": "RPC／Service",
+      "type": "backend",
+      "overview_component": "service",
+      "responsibility": "驗證 RPC 參數並呼叫 SessionManager 路由；本頁將管理器的 RPC thread、PTY 預建與 interactive_id 索引查找併入此參與者，actor 決策另列。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1003,
+          "end_line": 1014,
+          "excerpt_sha256": "7fec74f6a76a711f014c7a4df811cb2a47f1ce2ad80a74167c2386bc9b89eb15",
+          "claim": "console_attach 驗證 selector 與 label 後呼叫 manager.console_attach。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7721,
+          "end_line": 7747,
+          "excerpt_sha256": "ddfefe34049644b6aa0aabe125ba27ce21fc18989f8dc14e0233bcce1ebbdeea",
+          "claim": "管理器在 RPC thread 預建 PTY，再把 ConsoleAttach 送給 session。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7783,
+          "end_line": 7799,
+          "excerpt_sha256": "6d0b387e7f2a82a0bbd1e51f614cf2158c2dfffcedf17ccb3fdea3f7d4186d2f",
+          "claim": "管理器以 interactive_id 查 session，路由請求，並在成功 close 後移除索引。"
+        }
+      ]
+    },
+    {
+      "id": "hub",
+      "label": "ConsoleHub",
+      "type": "backend",
+      "overview_component": "console-hub",
+      "sublabel": "多 console 多工",
+      "responsibility": "多工讀寫 PTY master 或 TCP Telnet，處理協商、每 client 輸出 ring 與 RX fan-out；PAL 的傳輸工廠與 mux 為附屬平台實作。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 619,
+          "end_line": 652,
+          "excerpt_sha256": "f7dd1694e3812c9e4f3a26779019afcc97ca6b91199d61b6cd100a9c8c469c68",
+          "claim": "Hub 收養 PTY master 與 slave keepalive，登記 per-client ring。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 837,
+          "end_line": 855,
+          "excerpt_sha256": "b1d6501b66446f883ee80359499543a308b18b8036ba1988ab1de157b3124ad7",
+          "claim": "TCP accept 建立 client、TelnetFilter 與 ring，先送 greeting 再加入 client 集合。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 875,
+          "end_line": 895,
+          "excerpt_sha256": "ce15becc1710a4381babaa9cb49f1affd3c308dde1b220b9a07ce9721fd47dad",
+          "claim": "Hub 對所有 client fan-out，Telnet 額外做 IAC 逸出。"
+        },
+        {
+          "path": "crates/sw-pal/src/console_mux.rs",
+          "line": 73,
+          "end_line": 84,
+          "excerpt_sha256": "3961e29aa1b70bb62731ef481dbd58cf9bc7016ec9a11f74c137451a142117eb",
+          "claim": "auto 依平台是否有 PTY 選擇 PTY 或 TCP Telnet；tcp 可顯式覆寫，無 PTY 卻指定 pty 時降級。"
+        },
+        {
+          "path": "crates/sw-pal/src/console_pty/windows.rs",
+          "line": 5,
+          "end_line": 10,
+          "excerpt_sha256": "f9f902a1d991888faac0637a04267ce4e1487e6bde1bb439bee6913b84403808",
+          "claim": "Windows create_pty 回 Unsupported，不能建立 PTY。"
+        },
+        {
+          "path": "crates/sw-pal/src/console_pty/posix.rs",
+          "line": 435,
+          "end_line": 450,
+          "excerpt_sha256": "3344bd62c9b9b43f409836777649af0937925bfc1669e83f096f2e988dec50b7",
+          "claim": "POSIX 的 create_pty 實際呼叫 libc::openpty 建立 master 與 slave。"
+        }
+      ]
+    },
+    {
+      "id": "session",
+      "label": "Session actor",
+      "type": "backend",
+      "overview_component": "session-actor",
+      "sublabel": "效果執行",
+      "responsibility": "持有 console 名冊、raw ownership、DeferredBuffer、human TX lane、回放 hold、命令前景槽與 interactive lease。相鄰箭頭中實際呼叫 Hub 或 OpRunner 的是附屬 executor；送 writer 的是附屬 HumanTxPump。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 33,
+          "end_line": 55,
+          "excerpt_sha256": "3eb243bcf27a0a2815c2f4f7af43e4a3df57e4beba1ecd96a1cec1de4a533891",
+          "claim": "actor 在 fg_begin 關 admission 並 suspend human；fg_finish 恢復與回放。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 388,
+          "end_line": 409,
+          "excerpt_sha256": "0116e9be96aa510a62fba145982154cc85de1aa21382633774de3d5a249a15ad",
+          "claim": "actor 建立 HumanTx permit 與 human lane 在途記錄，並產生 HumanTx 效果。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/lease_p6.rs",
+          "line": 101,
+          "end_line": 120,
+          "excerpt_sha256": "63d870b3cd372b8f600faaf41d1c35a51ec23eb990003e3b9047cd02d2d4536d",
+          "claim": "關閉搶占租約時，actor 依 stash 是否有效還原 human lease 或丟棄上下文。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5326,
+          "end_line": 5347,
+          "excerpt_sha256": "7ab2ae92169a24d947067bf72db6864d0023fbd035008491efd1cd7e96c0efee",
+          "claim": "session 附屬 executor 取得該 epoch 的 OpRunner，實際呼叫 run 執行 StartOp。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5287,
+          "end_line": 5301,
+          "excerpt_sha256": "128b4c78004f2a271eeb8ae8ea8e596ff94757aa815c6af53e05f8cba4352c27",
+          "claim": "session 附屬 executor 取得 writer、建立 HumanTxPump 並 try_submit。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/human_tx.rs",
+          "line": 231,
+          "end_line": 246,
+          "excerpt_sha256": "54b2de8062b7154385ef98aaea8728709dab3fce581a2a4d2e25f83f2423ad42",
+          "claim": "HumanTxPump 把 permit 與 payload 組成 TxJob 送往 writer，等待回條後發 HumanTxCompleted。"
+        }
+      ]
+    },
+    {
+      "id": "runner",
+      "label": "命令執行",
+      "type": "backend",
+      "overview_component": "execute",
+      "sublabel": "OpRunner",
+      "responsibility": "執行排隊的行命令，提交 TX 並依共享 RX 等待完成；interactive send 只等待 TX 結果，透過 OpFinished 回 actor。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 117,
+          "end_line": 132,
+          "excerpt_sha256": "fd8bfcf900606e0c41513a0018a2b7e8509353b062c5693a7fed685d5fe72bfa",
+          "claim": "runner 執行工作後回送含 RX watermark 的 OpFinished。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 383,
+          "end_line": 385,
+          "excerpt_sha256": "3b658b67c3b47980e8918d30d017c437d1257c42bc1f10fd0fd5e8f19edcd27f",
+          "claim": "Command 交 run_command。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 405,
+          "end_line": 412,
+          "excerpt_sha256": "2ef0aaaa26a41a349e689ec903de065b0ac7ee5dc7450af198d3f72bf7e12616",
+          "claim": "互動初始命令與後續 send 分別走 InteractiveOpenCmd 與 LeaseOwner 的 lease_send。"
+        }
+      ]
+    },
+    {
+      "id": "bridge",
+      "label": "UART bridge",
+      "type": "backend",
+      "overview_component": "bridge",
+      "sublabel": "單一寫入者",
+      "responsibility": "IoWorker 接收 DUT RX 並更新共享視窗、推送 Hub；TxWriter 序列化所有 TX，Fence 在 OS 提交點重驗許可。WAL 為附屬記錄，不另畫參與者。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 526,
+          "end_line": 535,
+          "excerpt_sha256": "d2fce80e8193eaa6eb168d75cb3b5330be3c3359a8cd97f07e434fbbcee6b8ae",
+          "claim": "reader 更新共享 RX 視窗，再推送 console hub。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1372,
+          "end_line": 1386,
+          "excerpt_sha256": "22007532dc01da03768e800d8ce1653eb4c73e76a00e58bf6f69ddea3c8a7001",
+          "claim": "spawn_tx_writer 啟動唯一呼叫 SerialWriter::write_gated 的 writer，接收有界 TX 工作。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 600,
+          "end_line": 617,
+          "excerpt_sha256": "0332cc6dc71f17cacdc8d29909bea55955fde0031741686ce6f1cdabd265346d",
+          "claim": "FenceSubmitGate 持有 fence 鎖重驗許可後才呼叫 OS submit。"
+        }
+      ]
+    },
+    {
+      "id": "target",
+      "label": "UART／DUT",
+      "type": "external",
+      "overview_component": "target",
+      "responsibility": "接收經 writer 提交的位元組，回送 echo、輸出及 prompt；主機只看到 RX bytes，無法由本頁原始碼證明每個 prompt 的命令歸屬。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1079,
+          "end_line": 1089,
+          "excerpt_sha256": "4f9ac4854148b640598ecc0af9b2f08cfbbdff05001d33f3c9fa91eb53ab6c83",
+          "claim": "TxWriter 通過 precheck 後呼叫 SerialWriter::write_gated 提交 payload，並重查 fence。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 482,
+          "end_line": 492,
+          "excerpt_sha256": "dbfcac5ea643d6aba303b9a335ba7f2148c6147ae741341c13b450f86b41c50b",
+          "claim": "reader 從 SerialReader 讀取 DUT 的 RX bytes。"
+        }
+      ]
+    },
+    {
+      "id": "agent",
+      "label": "CLI／Agent",
+      "type": "frontend",
+      "overview_component": "cli",
+      "responsibility": "透過 command.submit 插入 line／background 命令，或透過 session.interactive_* 開啟、傳送、查詢及關閉互動租約。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 141,
+          "end_line": 159,
+          "excerpt_sha256": "19304e916218521f6bd2b32bc09f1c5ea375370c2c3c3313de26dbde5a963934",
+          "claim": "CLI 將 cmd submit 參數映射為 command.submit。"
+        },
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 93,
+          "end_line": 120,
+          "excerpt_sha256": "0c53cc6955732f8b64ecb7f1f5a7d1b2e9ec8524a6db305189ae8df6effef887",
+          "claim": "CLI 將 interactive-open、send、status、close 映射為 session.interactive_* RPC。"
+        }
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "id": "console-attach",
+      "from": "human",
+      "to": "service",
+      "label": "請求 console 接入",
+      "phase": "端點接入與 ownership",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 78,
+          "end_line": 84,
+          "excerpt_sha256": "7c95c113aa66b26e6b69fc4efc2d95ada2bdac72a02b03a484ff7d38893595a8",
+          "claim": "CLI 以 selector 與選用 label 呼叫 session.console_attach。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1003,
+          "end_line": 1014,
+          "excerpt_sha256": "7fec74f6a76a711f014c7a4df811cb2a47f1ce2ad80a74167c2386bc9b89eb15",
+          "claim": "Service 驗證參數後呼叫 manager.console_attach。"
+        }
+      ]
+    },
+    {
+      "id": "attach-route",
+      "from": "service",
+      "to": "session",
+      "label": "預建端點並路由接入",
+      "phase": "端點接入與 ownership",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7721,
+          "end_line": 7747,
+          "excerpt_sha256": "ddfefe34049644b6aa0aabe125ba27ce21fc18989f8dc14e0233bcce1ebbdeea",
+          "claim": "管理器只在 PTY 後端 create_pty、暫存 pair，並將資訊以 ConsoleAttach 送往 actor。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 833,
+          "end_line": 858,
+          "excerpt_sha256": "f8607b12922dcabadac6b9491beea679a4dab5c6f0ee821682feb4c87455e278",
+          "claim": "TCP attach 僅回傳既有 endpoint，client_id 為 null，transport=tcp、protocol=telnet。"
+        },
+        {
+          "path": "crates/sw-pal/src/console_mux.rs",
+          "line": 73,
+          "end_line": 84,
+          "excerpt_sha256": "3961e29aa1b70bb62731ef481dbd58cf9bc7016ec9a11f74c137451a142117eb",
+          "claim": "auto 依平台是否有 PTY 選擇 PTY 或 TCP Telnet；tcp 可顯式覆寫，無 PTY 卻指定 pty 時降級。"
+        },
+        {
+          "path": "crates/sw-pal/src/console_pty/windows.rs",
+          "line": 5,
+          "end_line": 10,
+          "excerpt_sha256": "f9f902a1d991888faac0637a04267ce4e1487e6bde1bb439bee6913b84403808",
+          "claim": "Windows create_pty 回 Unsupported，不能建立 PTY。"
+        },
+        {
+          "path": "crates/sw-pal/src/console_pty/posix.rs",
+          "line": 435,
+          "end_line": 450,
+          "excerpt_sha256": "3344bd62c9b9b43f409836777649af0937925bfc1669e83f096f2e988dec50b7",
+          "claim": "POSIX 的 create_pty 實際呼叫 libc::openpty 建立 master 與 slave。"
+        }
+      ],
+      "note": "Linux｜Windows：PTY｜TCP Telnet。這是預設；SERIALWRAP_CONSOLE_BACKEND=tcp 可在 Linux 選 Telnet。PTY 由此參與者內的管理器預建；TCP listener 已隨 bridge 建立，這次請求只讀取端點。"
+    },
+    {
+      "id": "adopt-pty",
+      "from": "session",
+      "to": "hub",
+      "label": "收養已預建的 PTY",
+      "phase": "端點接入與 ownership",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 868,
+          "end_line": 879,
+          "excerpt_sha256": "b497edda1d9cd6d7620f5ba39314c769fe36020d3d7ee4e290e7e405aa12c428",
+          "claim": "PTY 接入須有 conn_epoch 且處於 READY 或 ATTACHED；tick_close_hold 期間拒絕。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 908,
+          "end_line": 929,
+          "excerpt_sha256": "26d70066133f195754486ce42ff4734810ad12eb551eeb49ca04c071328397f0",
+          "claim": "actor 產生 ConsoleAdopt；刷新 lease 後若無 lease，開 human lease，回報是否取得 ownership。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6316,
+          "end_line": 6336,
+          "excerpt_sha256": "5bd836b86be898882825278b011adc8f2fa9c12213c901ecddf4f4a070c34296",
+          "claim": "實際由 session executor 取出暫存 PTY，送 HubCmd::AdoptPty 並喚醒 hub。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 625,
+          "end_line": 650,
+          "excerpt_sha256": "385563c19e7464775606f8a9354ff31c9b89ab8a998f614219ba106a66df8390",
+          "claim": "Hub 將 PTY master 加入 mux，保存 per-client ring 與 keepalive。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/ownership.rs",
+          "line": 32,
+          "end_line": 44,
+          "excerpt_sha256": "67195d9dbc369a263af6aa2a9ca12d5be4aa3d9bed9acc8e4ee6c3ca1b370120",
+          "claim": "human owner 在 admission 關閉時只記 pending，不立即授予 raw。"
+        }
+      ],
+      "condition": "PTY 後端且接入驗證通過；TCP 不走此步。",
+      "note": "ConsoleAdopt 的送出者是 session 附屬 executor。沒有既有 lease 才開 human lease；前景忙時新 human owner 先 pending。後續 console 不會一律取得 raw ownership。"
+    },
+    {
+      "id": "attach-endpoint",
+      "from": "service",
+      "to": "human",
+      "label": "回傳端點與接入結果",
+      "phase": "端點接入與 ownership",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7740,
+          "end_line": 7747,
+          "excerpt_sha256": "a0433cd6d818d98273e74b8fa4cad3b21d4db07f1607a4aa4a498e6e58cfdd40",
+          "claim": "管理器等 ConsoleAttach 結果，清理未收養的暫存 PTY，再回傳結果。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 914,
+          "end_line": 932,
+          "excerpt_sha256": "ffc9efe9dd039085adce05db0602fde584f9b095e99af8c2fa65c557108d330b",
+          "claim": "PTY 結果含 client_id、label、vtty；開新 lease 時另帶 interactive_session_id 與 interactive_owner。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 848,
+          "end_line": 858,
+          "excerpt_sha256": "43be167cb2520943bc2d1107de0917af0382184183da2adeef3fd843e758d620",
+          "claim": "TCP 結果為 endpoint／vtty、transport=tcp、protocol=telnet，client_id 為 null。"
+        },
+        {
+          "path": "crates/sw-pal/src/console_mux.rs",
+          "line": 73,
+          "end_line": 84,
+          "excerpt_sha256": "3961e29aa1b70bb62731ef481dbd58cf9bc7016ec9a11f74c137451a142117eb",
+          "claim": "auto 依平台是否有 PTY 選擇 PTY 或 TCP Telnet；tcp 可顯式覆寫，無 PTY 卻指定 pty 時降級。"
+        },
+        {
+          "path": "crates/sw-pal/src/console_pty/windows.rs",
+          "line": 5,
+          "end_line": 10,
+          "excerpt_sha256": "f9f902a1d991888faac0637a04267ce4e1487e6bde1bb439bee6913b84403808",
+          "claim": "Windows create_pty 回 Unsupported，不能建立 PTY。"
+        },
+        {
+          "path": "crates/sw-pal/src/console_pty/posix.rs",
+          "line": 435,
+          "end_line": 450,
+          "excerpt_sha256": "3344bd62c9b9b43f409836777649af0937925bfc1669e83f096f2e988dec50b7",
+          "claim": "POSIX 的 create_pty 實際呼叫 libc::openpty 建立 master 與 slave。"
+        }
+      ],
+      "note": "Linux｜Windows：PTY｜TCP Telnet。PTY 回 slave 路徑；TCP 回既有 listener 端點，這時尚未建立這條連線的 client 或 lease。"
+    },
+    {
+      "id": "stream-accepted",
+      "from": "hub",
+      "to": "session",
+      "label": "接受連線並登記 owner",
+      "phase": "端點接入與 ownership",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 837,
+          "end_line": 855,
+          "excerpt_sha256": "b1d6501b66446f883ee80359499543a308b18b8036ba1988ab1de157b3124ad7",
+          "claim": "Hub 為新 TCP 連線建立 client 與 TelnetFilter，先送 greeting。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 863,
+          "end_line": 871,
+          "excerpt_sha256": "64d65a8c637ab3315930b2b9b066d5f2ecbd70c9166c30ddb672495ac2f01fc2",
+          "claim": "Hub 產生帶 client_lifetime 的 ConsoleConnected。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 1060,
+          "end_line": 1063,
+          "excerpt_sha256": "652477db0b66520f7612c786ef6bb6205ae989839baacca0450887b14135eb09",
+          "claim": "Hub 實際把 ConsoleConnected 送進 session control lane。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 738,
+          "end_line": 745,
+          "excerpt_sha256": "434e21a351c514bec1bacf0609373e2f8edb024f1adb6cf41a1326d195b2d7e8",
+          "claim": "actor 記 primary 與 peer，呼叫 on_stream_accept 更新 ownership。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/ownership.rs",
+          "line": 119,
+          "end_line": 131,
+          "excerpt_sha256": "2001f7d93b3bfb23cf02c16fc6d254779c8945003e82e5d05858c501f6484f4e",
+          "claim": "stream accept 在無 owner 且未 suspend 時授 raw 或記 pending；suspend 且無 suspended owner 時記入該欄。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 724,
+          "end_line": 737,
+          "excerpt_sha256": "da5cf7e417c0da171237f0131f107fe52351b311f5ca6d57dbdb9dbc06f074a7",
+          "claim": "actor 收到連線事件後登記含 lifetime 與獨立 LineEditor 的 ConsoleRecord。"
+        }
+      ],
+      "condition": "TCP Telnet client 實際連線並被 accept；可重複接受其他 console。",
+      "note": "這條路徑授予 raw ownership，不等同於建立 InteractiveLease；已有 owner 時不會把每條新連線都變成 raw owner。"
+    },
+    {
+      "id": "raw-input",
+      "from": "hub",
+      "to": "session",
+      "label": "轉送 owner 輸入",
+      "phase": "raw 輸入與共享輸出",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 977,
+          "end_line": 998,
+          "excerpt_sha256": "353a7b98bcf0d0c336bca7b65fc18c597f8cd034d3721d55019139c2e1db3105",
+          "claim": "Hub 對 Telnet bytes 先過濾協商，將資料包成含 client_lifetime 與 input_epoch 的 ConsoleInputBytes。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 1053,
+          "end_line": 1063,
+          "excerpt_sha256": "746a532cb87cd93406eb137d08417a91c53c8b4bb6e6f7cf45f060cd6f1b6db7",
+          "claim": "Hub 實際將 ConsoleInputBytes 等 data 事件與 control 事件送往 session mailbox。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 564,
+          "end_line": 575,
+          "excerpt_sha256": "94aa0edacb89c448926c2cffd46b4f9be786d35dacebac1f8be2ec3606dfbe15",
+          "claim": "actor 先驗 input_epoch、client_lifetime 與 active epoch；失效輸入丟棄。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/ownership.rs",
+          "line": 179,
+          "end_line": 203,
+          "excerpt_sha256": "a372fb8ce83bffb5db4178744035e5a9e769ffbeb40889bf8423266ffbd0aefa",
+          "claim": "只有 raw 路徑更新 last_human_input_at；owner 被 admission 擋下或 suspended owner 在 agent 期間則 defer，其餘 line。"
+        }
+      ],
+      "condition": "client 是 raw owner，admission 開放且未處於 flash；輸入可包含整行與 Enter。",
+      "note": "Hub 是實際讀取並轉送 bytes 的元件。Telnet 協商先被過濾，不進 UART；raw 不經 LineEditor。FLASHING 時資料輸入丟棄。"
+    },
+    {
+      "id": "human-raw-tx",
+      "from": "session",
+      "to": "bridge",
+      "label": "提交 HumanRaw 工作",
+      "phase": "raw 輸入與共享輸出",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 611,
+          "end_line": 636,
+          "excerpt_sha256": "e79d2a2d64d53e8cbabdafc3d5caa2a2caf39a3ab35708b8ae4a17530f28893f",
+          "claim": "raw 且無待回放資料時直接 lane_submit HumanRaw；有舊 deferred 時先追加並嘗試回放；line 才交 LineEditor。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 388,
+          "end_line": 409,
+          "excerpt_sha256": "0116e9be96aa510a62fba145982154cc85de1aa21382633774de3d5a249a15ad",
+          "claim": "HumanRaw 建立 cmd_id=None 的 permit，只登記 human lane 在途並發 HumanTx。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 115,
+          "end_line": 130,
+          "excerpt_sha256": "7e291b7be853da6351a9c4b6b19d20c8429cd3a19343c0c0dde75f9283475dc5",
+          "claim": "命令前景槽依 foreground／pending_ops 與 replay hold 判斷，human lane 不在此判定內。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5287,
+          "end_line": 5301,
+          "excerpt_sha256": "128b4c78004f2a271eeb8ae8ea8e596ff94757aa815c6af53e05f8cba4352c27",
+          "claim": "session 附屬 executor 取得 writer、建立 HumanTxPump 並 try_submit。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/human_tx.rs",
+          "line": 231,
+          "end_line": 246,
+          "excerpt_sha256": "54b2de8062b7154385ef98aaea8728709dab3fce581a2a4d2e25f83f2423ad42",
+          "claim": "HumanTxPump 把 permit 與 payload 組成 TxJob 送往 writer，等待回條後發 HumanTxCompleted。"
+        },
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 1861,
+          "end_line": 1875,
+          "excerpt_sha256": "5b08f451babb2e9f4554586f0a8c27e87b8bf65690ba43b4af56b63af9a327d8",
+          "claim": "Python raw owner 同樣直接建立 human_raw permit 並呼叫 send bytes，cmd_id=None。"
+        }
+      ],
+      "condition": "raw owner 的輸入沒有更早的 deferred bytes 要先回放。",
+      "note": "箭頭的實際送出者是 session 附屬 HumanTxPump。Enter 也是 bytes，不建立 command.submit 的前景工作，不等這一行的 prompt。Python 0.4.x 對照處同樣直接 raw TX、不占命令前景槽。"
+    },
+    {
+      "id": "human-write",
+      "from": "bridge",
+      "to": "target",
+      "label": "寫入人類位元組",
+      "phase": "raw 輸入與共享輸出",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1079,
+          "end_line": 1089,
+          "excerpt_sha256": "4f9ac4854148b640598ecc0af9b2f08cfbbdff05001d33f3c9fa91eb53ab6c83",
+          "claim": "TxWriter 通過 precheck 後呼叫 SerialWriter::write_gated 提交 payload，並重查 fence。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 600,
+          "end_line": 617,
+          "excerpt_sha256": "0332cc6dc71f17cacdc8d29909bea55955fde0031741686ce6f1cdabd265346d",
+          "claim": "在 OS submit 前仍持鎖重驗 fence 與 permit。"
+        }
+      ],
+      "condition": "HumanRaw 工作通過提交時的 fence。",
+      "note": "human 與 agent 共用單一 writer；TX 序列化只保證提交順序，不代表會等人類命令完成或 prompt 回來。"
+    },
+    {
+      "id": "rx-to-hub",
+      "from": "bridge",
+      "to": "hub",
+      "label": "分送 DUT 的 RX",
+      "phase": "raw 輸入與共享輸出",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 482,
+          "end_line": 492,
+          "excerpt_sha256": "dbfcac5ea643d6aba303b9a335ba7f2148c6147ae741341c13b450f86b41c50b",
+          "claim": "IoWorker reader 從序列埠取得 RX。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 526,
+          "end_line": 535,
+          "excerpt_sha256": "d2fce80e8193eaa6eb168d75cb3b5330be3c3359a8cd97f07e434fbbcee6b8ae",
+          "claim": "reader 先 append 共享 RX，再經 HubTap.push 將資料送往 Hub。"
+        }
+      ],
+      "condition": "有 DUT RX 時可反覆發生；若後續走 #294 分支，這裡尚未收到該人類整行的完成 prompt。",
+      "note": "此為可重複的 RX 旁路，不代表每次輸入後立即收到完成 prompt。RX 更新共享視窗與送 Hub 是 reader 的工作。"
+    },
+    {
+      "id": "display-all",
+      "from": "hub",
+      "to": "human",
+      "label": "向多個 console 顯示",
+      "phase": "raw 輸入與共享輸出",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 875,
+          "end_line": 895,
+          "excerpt_sha256": "ce15becc1710a4381babaa9cb49f1affd3c308dde1b220b9a07ce9721fd47dad",
+          "claim": "Hub 遍歷所有 client，把 RX 加到各自的 ring；Telnet display 額外做 IAC 逸出。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 1092,
+          "end_line": 1100,
+          "excerpt_sha256": "06c013bcc2bef297587f1c3be93a3defbdd5194702c8aa957b89062ca679489a",
+          "claim": "Hub 使用 mux.try_write 寫 ring，部分寫出則保留餘下 bytes 並登記 write interest。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/out_ring.rs",
+          "line": 88,
+          "end_line": 105,
+          "excerpt_sha256": "95510ac5fc656152543c9d8f64f9498cfc2dd43057a432ca2aecbd8cb0a562d1",
+          "claim": "display 超過 cap 時丟整個元素，已部分寫出的 front 受保護，可能丟到最新項。"
+        }
+      ],
+      "condition": "Hub 收到 RX 且 client 仍連線。",
+      "note": "每個 console 有獨立輸出 ring；慢讀者可能失去較早 display，部分寫出的 front 受保護，並非保證所有端點永不漏畫面。"
+    },
+    {
+      "id": "agent-submit",
+      "from": "agent",
+      "to": "service",
+      "label": "插入 agent 命令",
+      "phase": "條件：agent 插入與前景暫存",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 141,
+          "end_line": 159,
+          "excerpt_sha256": "19304e916218521f6bd2b32bc09f1c5ea375370c2c3c3313de26dbde5a963934",
+          "claim": "cmd submit 將 command、source、mode 等參數送為 command.submit。"
+        }
+      ],
+      "condition": "#294 交錯前提：raw owner 已送出整行與 Enter，但那一行的 prompt 尚未回來；agent 此時提交 line 或 background。",
+      "note": "這是條件分支，不是每次 human 輸入後必然發生；後面另行描述 agent 已開始後新增按鍵的暫存。"
+    },
+    {
+      "id": "agent-route",
+      "from": "service",
+      "to": "session",
+      "label": "路由並受理 agent 命令",
+      "phase": "條件：agent 插入與前景暫存",
+      "basis": "inferred",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1174,
+          "end_line": 1193,
+          "excerpt_sha256": "e8cabf29515fb4bd4bd273ab176f3da6c9e8eb7aa858a7a5f5368d4a547d8554",
+          "claim": "Service 解析 selector、建立 SubmitReq，再呼叫 manager.route。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3482,
+          "end_line": 3508,
+          "excerpt_sha256": "2aa155e0b61fc3c64bfbf0dc3940738b890af926bad4f9b0b4730d71c587c892",
+          "claim": "actor admit 命令、排入 queue、回 accepted 並嘗試 start_next。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 388,
+          "end_line": 409,
+          "excerpt_sha256": "0116e9be96aa510a62fba145982154cc85de1aa21382633774de3d5a249a15ad",
+          "claim": "human raw 僅登記 human lane，不建立命令的前景 grant。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7328,
+          "end_line": 7331,
+          "excerpt_sha256": "c6456b0a49222e29592ee9ff84a2265245220f8681bad27fbdfd5d4fb56493ff",
+          "claim": "start_next 以 fg_slot_busy 與 READY 決定是否開始出列。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7295,
+          "end_line": 7312,
+          "excerpt_sha256": "dfa3bce0446cabaf66b42b0b72babdad30b42bf5bf9a21252d8a2e3bc03b3900",
+          "claim": "execute-time lease 檢查讓非 human 的 line／background 在 human lease 存在時通過。"
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 6573,
+          "end_line": 6599,
+          "excerpt_sha256": "08bfef825e29dbb9b59b700d8899e4c4dd4df881a47d177b745e0f09b07b668c",
+          "claim": "Python 執行期檢查 quiet、recovering、前景與 lease；agent 遇 human lease 記 suspend 後取得前景。"
+        }
+      ],
+      "condition": "延續 #294 交錯，其他 READY、前景、quiet 與 lease 閘門均允許執行。",
+      "note": "這些路徑沒有「raw owner 的整行仍在等 prompt」的閘門；人類行在途並不占 foreground。Python 0.4.x 對照的命令開始路徑也沒有等待人類行 prompt 的判定。"
+    },
+    {
+      "id": "agent-start",
+      "from": "session",
+      "to": "runner",
+      "label": "暫停 raw 並開始命令",
+      "phase": "條件：agent 插入與前景暫存",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 33,
+          "end_line": 45,
+          "excerpt_sha256": "369125f4099cf717d66363574fb2d52ae57ffb5dccb8a650abb365fb4f257971",
+          "claim": "fg_begin 撤銷舊回放並關 admission；來源為 agent 且有 human lease 時 suspend owner。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 1022,
+          "end_line": 1029,
+          "excerpt_sha256": "71fd399621a10ac408eb6f7ec683bb97d76f0788129ff916dff4aa9154b2739c",
+          "claim": "非 HumanConsole 且非 interactive 命令視為 agent，進 fg_begin 並保存 admission 狀態。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/ownership.rs",
+          "line": 63,
+          "end_line": 70,
+          "excerpt_sha256": "d3d86f24d66346004de1a169323cc76d12af4c20e8f13ea8e5f69703492175f9",
+          "claim": "suspend 最外層保存 owner、清目前 owner 並設 agent_active；支援巢狀 depth。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7453,
+          "end_line": 7455,
+          "excerpt_sha256": "0aa4412ce8bfe3dd4ad0d61605243f3c8a4659f78ea1aac2bf6e1cde2b702e55",
+          "claim": "一般命令出列時呼叫 command_fg_begin_req。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7463,
+          "end_line": 7482,
+          "excerpt_sha256": "05c497ab18e6106ad465caf4d1d1e85ee3bdcab3f67c7856a86f1720237b5a06",
+          "claim": "actor 建立 foreground grant 與 PendingOp::Command，產生 StartOp。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5326,
+          "end_line": 5347,
+          "excerpt_sha256": "7ab2ae92169a24d947067bf72db6864d0023fbd035008491efd1cd7e96c0efee",
+          "claim": "session 附屬 executor 取得該 epoch 的 OpRunner，實際呼叫 run 執行 StartOp。"
+        }
+      ],
+      "condition": "延續 #294 分支的 line／background；一般 agent 命令也使用此開始路徑。",
+      "note": "由 session 附屬 executor 實際呼叫 OpRunner。admission 一律先關；有 human lease 才 suspend，TCP raw owner 即使沒有 lease，也會因 admission 關閉改走 defer。"
+    },
+    {
+      "id": "agent-tx",
+      "from": "runner",
+      "to": "bridge",
+      "label": "提交 agent TX",
+      "phase": "條件：agent 插入與前景暫存",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 710,
+          "end_line": 715,
+          "excerpt_sha256": "ab630d41ee1af62da5832e6606e2657d7ecab959212f5318d1fb14c0adbb8453",
+          "claim": "一般命令以 completion_regex 或 prompt_regex 作完成樣式，TX 前記 pre_offset。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 730,
+          "end_line": 741,
+          "excerpt_sha256": "11089d2de8c790475812e89a1290e11d6c873d656708d4e684a0d48111b0f421",
+          "claim": "run_command 送含換行的 payload 並要求完整 TX；不完整回 send failure。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 565,
+          "end_line": 574,
+          "excerpt_sha256": "465cd43c66c45d8763cbead04d5f7b7016766342296a57de574ddd2decbe9d1c",
+          "claim": "OpRunner 實際把 TxJob 送入 TxWriter jobs，等待 report。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 522,
+          "end_line": 528,
+          "excerpt_sha256": "cd71996b80c06dbfdc856c94e2b1639540600112a27c48324ceef64afb1ac75b",
+          "claim": "command_payload 將命令轉 bytes，若未以 LF 結尾則補 LF。"
+        }
+      ],
+      "condition": "延續 agent line／background 執行。",
+      "note": "完成搜尋使用 TX 前取得的 RX offset；此 offset 不標記人類行或 agent 行的因果歸屬。"
+    },
+    {
+      "id": "agent-write",
+      "from": "bridge",
+      "to": "target",
+      "label": "寫入 agent 命令",
+      "phase": "條件：agent 插入與前景暫存",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1079,
+          "end_line": 1089,
+          "excerpt_sha256": "4f9ac4854148b640598ecc0af9b2f08cfbbdff05001d33f3c9fa91eb53ab6c83",
+          "claim": "TxWriter 通過 precheck 後呼叫 SerialWriter::write_gated 提交 payload，並重查 fence。"
+        }
+      ],
+      "condition": "延續交錯且 agent TX 通過 fence，先前人類行的 prompt 仍未到達。",
+      "note": "agent bytes 已提交 DUT，仍不表示後續第一個 prompt 必定屬於這條 agent 命令。"
+    },
+    {
+      "id": "defer-during-agent",
+      "from": "hub",
+      "to": "session",
+      "label": "暫存前景期間的按鍵",
+      "phase": "條件：agent 插入與前景暫存",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 977,
+          "end_line": 998,
+          "excerpt_sha256": "353a7b98bcf0d0c336bca7b65fc18c597f8cd034d3721d55019139c2e1db3105",
+          "claim": "Hub 對 Telnet bytes 先過濾協商，將資料包成含 client_lifetime 與 input_epoch 的 ConsoleInputBytes。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 1053,
+          "end_line": 1063,
+          "excerpt_sha256": "746a532cb87cd93406eb137d08417a91c53c8b4bb6e6f7cf45f060cd6f1b6db7",
+          "claim": "Hub 實際將 ConsoleInputBytes 等 data 事件與 control 事件送往 session mailbox。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/ownership.rs",
+          "line": 189,
+          "end_line": 203,
+          "excerpt_sha256": "8f649e2d895dbb3d4216dd141efcd02fbe8821e1e6736a39d38a6c71e07078e6",
+          "claim": "目前 raw owner 被 admission 擋住或 suspended owner 在 agent_active 期間均回 Defer；其他 client 為 Line。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 628,
+          "end_line": 636,
+          "excerpt_sha256": "c2e4e7a706f9a0ebbd806028cba1a0aea7991f5330ea79c3df701e36997f0844",
+          "claim": "Defer 將 bytes 附加至 DeferredBuffer，不直接送 writer。"
+        },
+        {
+          "path": "crates/sw-core/src/deferred.rs",
+          "line": 90,
+          "end_line": 107,
+          "excerpt_sha256": "262c6041c0b06a58390e6f3f4055fa95b5c8bcaeb39e2093f012afb53c23625d",
+          "claim": "相同 client、lifetime 與 epoch 合併；超過 cap 移除整個 client entry 並回 Overflowed。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 526,
+          "end_line": 531,
+          "excerpt_sha256": "c4827812f3cae8b0632d67984c207bfb7ecf3843afefb104a9b4991e9197bfe6",
+          "claim": "DeferredBuffer 溢位時產生含 dropped bytes 的 WARNING。"
+        }
+      ],
+      "condition": "可選旁支：agent 前景執行中，受阻擋的 raw owner 或 suspended owner 又輸入 bytes。",
+      "note": "此處暫存的是 agent 開始後的新按鍵，與 #294 中已送到 UART 的人類整行不同；不能把先前已提交的 bytes 收回。其他 console 的非 owner 輸入仍走行模式。"
+    },
+    {
+      "id": "late-human-prompt",
+      "from": "bridge",
+      "to": "runner",
+      "label": "人類 prompt 可能滿足等待",
+      "phase": "條件：agent 插入與前景暫存",
+      "basis": "inferred",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 526,
+          "end_line": 528,
+          "excerpt_sha256": "629dca43fa3d921f7a88dfdf24539c5679f48eef7e9665e5519528f444cc4e03",
+          "claim": "每次 reader 收 RX 都 append 到同一共享視窗。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 170,
+          "end_line": 181,
+          "excerpt_sha256": "4a34297aff69254f1d0220fd909b6ef13816a4fd30eaa4f81db88d802c24be61",
+          "claim": "append 把 bytes 解碼後加到共享文字視窗，增加 revision。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 194,
+          "end_line": 195,
+          "excerpt_sha256": "acbb204f52ecb4c3f1acfd91a4c62106aa9d881773aa8d2518e4574b00fdc4aa",
+          "claim": "append 結尾喚醒等待者。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 158,
+          "end_line": 160,
+          "excerpt_sha256": "25f68334c79ac5688eadf009ea7374b94304e9d1bc7c9652e15b9d1b0faf622d",
+          "claim": "wake_all 使用 Condvar notify_all。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 349,
+          "end_line": 373,
+          "excerpt_sha256": "f6638fe602e73c9a62e98c10c5c005ee4c62f6c039a9e3564a98aef8b1da148e",
+          "claim": "等待者對 offset 後 snapshot 檢查匹配，revision 有變立即重查，否則等 Condvar。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 754,
+          "end_line": 766,
+          "excerpt_sha256": "6ae2d59f4e3845b03b9fc6a9646207cc395bc856f9ff895d94ba6bd111c3e79e",
+          "claim": "wait_regex_from 命中完成樣式即 matched=true 並結束迴圈。"
+        },
+        {
+          "path": "sw_core/uart_io.py",
+          "line": 2635,
+          "end_line": 2648,
+          "excerpt_sha256": "f1f1a2f3fb389d19ef2aded5b9329b5ffc9ecc3732fa5e3ec1e5560795b6e7ea",
+          "claim": "Python 同樣搜尋 offset 後文字，但未匹配時固定 sleep 0.05 秒。"
+        }
+      ],
+      "condition": "#294：先前人類行的 prompt 在 agent TX 後到達，且符合目前 agent 的完成樣式。",
+      "note": "這是 RxShared 喚醒 OpRunner 的真實跨元件關係；不是 DUT 直接呼叫 runner。共享 RX 不驗 prompt 的命令歸屬，故可過早完成。Rust 對每筆 RX 喚醒重查；Python 0.4.x 未命中後每 50 ms 輪詢，兩者共有此弱點，Rust 檢查較密而較容易曝險；本次未量測發生率。"
+    },
+    {
+      "id": "agent-finished",
+      "from": "runner",
+      "to": "session",
+      "label": "回報結果並結束前景",
+      "phase": "條件：agent 插入與前景暫存",
+      "basis": "inferred",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 793,
+          "end_line": 821,
+          "excerpt_sha256": "5b7cacf57ef653c566a72fff53b2e2130ab8b8be02ff371ecd29459db8ed8e6c",
+          "claim": "匹配後整理 stdout 並回成功 CommandResult，background 帶 capture id。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 124,
+          "end_line": 132,
+          "excerpt_sha256": "8f27d3d0aa3b12bd455181479630b51f1bb86d4d5aa65f23470c8eef9e09f734",
+          "claim": "runner 把結果與 RX watermark 以 OpFinished 送 actor。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8142,
+          "end_line": 8145,
+          "excerpt_sha256": "1587af692ab8545cd16de47e468d434aae25bc2ca16c1175d7e2e1684b3ea886",
+          "claim": "命令結果由 actor 呼叫 registry.complete 結算。"
+        },
+        {
+          "path": "crates/sw-core/src/arbiter.rs",
+          "line": 387,
+          "end_line": 402,
+          "excerpt_sha256": "4294af8769c45509fab16b13613d552b00aadce1f2cd8f58c81f6aafc90ffb53",
+          "claim": "registry 依成功、互動或失敗結果設定 done、interactive 或 error。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7940,
+          "end_line": 7944,
+          "excerpt_sha256": "67c732371aa3d904d616bd2fa0abecba1f841e90f4c61c982ad34821d15d16c0",
+          "claim": "前景收尾呼叫 command_fg_finish、SettleTx 再 start_next。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 48,
+          "end_line": 55,
+          "excerpt_sha256": "cfd58e9090a3eadce939f8d33db7931027647d93c3e426cddec880c070ef4461",
+          "claim": "fg_finish resume human，開 admission 並觸發回放。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7869,
+          "end_line": 7878,
+          "excerpt_sha256": "df2c77ce3da06e5c7b877e21462e56de108c1105e0df79990ee6e3a3a5b407b0",
+          "claim": "actor 先取出 foreground grant，再對普通命令呼叫 finish_command。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8066,
+          "end_line": 8080,
+          "excerpt_sha256": "eb88def672dac3512805c7ac10898afff3cb7eac57ec07fed0a67a344d8de186",
+          "claim": "CommandResult 被轉為 CmdOutcome::Result 交後續結算。"
+        }
+      ],
+      "condition": "延續匹配成功路徑；若由 #294 的 human prompt 滿足，仍以成功結果結算。",
+      "note": "#294 可回 done 但 stdout 為空或僅有殘餘，DUT 上的 agent 命令仍可能繼續執行；程式碼只支持此可能性，不保證每次交錯都出錯。結算會恢復 human 與回放，並不等待 DUT 上另一個 prompt。"
+    },
+    {
+      "id": "replay-submit",
+      "from": "session",
+      "to": "bridge",
+      "label": "保留回放並提交暫存",
+      "phase": "條件：有效暫存回放",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 48,
+          "end_line": 55,
+          "excerpt_sha256": "cfd58e9090a3eadce939f8d33db7931027647d93c3e426cddec880c070ef4461",
+          "claim": "前景完成恢復 human 並開 admission，觸發 replay_point。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 218,
+          "end_line": 226,
+          "excerpt_sha256": "0922f3df8313104174b0afd7ea2169aaee560f59ad389326755e7938e758b1d6",
+          "claim": "replay_point 若仍有 revoked hold 則延後，否則取當前 epoch 的 replay。"
+        },
+        {
+          "path": "crates/sw-core/src/deferred.rs",
+          "line": 122,
+          "end_line": 129,
+          "excerpt_sha256": "94780bc1e41993cb7b9d28b582fd5cec72bbfc49e20a2d809745185c7fe7ac08",
+          "claim": "DeferredBuffer 依 client 首次插入序取出，僅保留 epoch 相同、client 存活且非空項。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/mod.rs",
+          "line": 120,
+          "end_line": 125,
+          "excerpt_sha256": "0425f584a7a5dc7b4563475e2dff13e6b90f8ab61bc0610002c3158bcd1ee121",
+          "claim": "client 存活判定另核對 client_lifetime。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 249,
+          "end_line": 270,
+          "excerpt_sha256": "6c8608844d1694c8925680509bb1752f75a73a3aaa3e104e6040d7c35622f82a",
+          "claim": "建立 replay hold、發布 replay_auth，將 bytes 以 HumanReplay 交 human lane。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 127,
+          "end_line": 134,
+          "excerpt_sha256": "9acd9973b678ee1d902b98d41b79ce4f3d6dc470e8d691f8a10e053b5aa99a34",
+          "claim": "fg_slot_busy 把未撤銷的 replay hold 算入，供出列與 open 等判斷。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5287,
+          "end_line": 5301,
+          "excerpt_sha256": "128b4c78004f2a271eeb8ae8ea8e596ff94757aa815c6af53e05f8cba4352c27",
+          "claim": "session 附屬 executor 取得 writer、建立 HumanTxPump 並 try_submit。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/human_tx.rs",
+          "line": 231,
+          "end_line": 246,
+          "excerpt_sha256": "54b2de8062b7154385ef98aaea8728709dab3fce581a2a4d2e25f83f2423ad42",
+          "claim": "HumanTxPump 把 permit 與 payload 組成 TxJob 送往 writer，等待回條後發 HumanTxCompleted。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 186,
+          "end_line": 205,
+          "excerpt_sha256": "41024dc6d43a066bedc32c55fda3e2c37af8d5ee916246942da7c2d4b07a62b7",
+          "claim": "invalidate_input 遞增並發布 input_epoch，清空 deferred、丟棄 stale lane 並結算被丟回放。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 985,
+          "end_line": 991,
+          "excerpt_sha256": "496ca05d77c6374552c5b847e718aa2f9b2f7f68e12a1146b732fe603f092139",
+          "claim": "停止階段以 release 或 recovery 理由使輸入上下文失效並重設 lane。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7456,
+          "end_line": 7462,
+          "excerpt_sha256": "4b49653e30bfb861be0d66940f9758542c68a80161f42f6ec690f7a4bd056485",
+          "claim": "reboot 命令在送出前以 RebootCommand 使 deferred 上下文失效。"
+        }
+      ],
+      "condition": "前景結束或 resume 後有仍有效的 deferred bytes，且沒有尚待結算的 revoked hold。",
+      "note": "實際送 writer 的仍是 HumanTxPump。按 client 首次插入序回放各 client 累積 bytes，不主張跨 client 的每個按鍵全域交錯順序。hold 尚有效時阻止下一個前景搶先；reboot／recovery 等失效點可清暫存。"
+    },
+    {
+      "id": "replay-receipt",
+      "from": "bridge",
+      "to": "session",
+      "label": "回傳 TX 回條並結算回放",
+      "phase": "條件：有效暫存回放",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1211,
+          "end_line": 1219,
+          "excerpt_sha256": "e6dcf138cae4f5622803e4428405defb32229f5eb05331cbe465ac1f5a03d3be",
+          "claim": "writer 將 TxReport 送往工作附帶的 reply channel。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/human_tx.rs",
+          "line": 239,
+          "end_line": 246,
+          "excerpt_sha256": "32f024f651051fde20a22e448b34c5743f69e04d90dd8e28bd1fead09a0e5b00",
+          "claim": "session 附屬 HumanTxPump 等 writer 回條，再發 HumanTxCompleted 給 actor。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 473,
+          "end_line": 495,
+          "excerpt_sha256": "798a71cedd2b21d8e46e22abd98262e422a3d9d85b461ba6281bd6d7ca4690f2",
+          "claim": "完整 TX 不重送；部分或 unknown 只警告；NotSubmitted 的 replay 放回前端，仍有效 raw 可轉 deferred。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 503,
+          "end_line": 515,
+          "excerpt_sha256": "6af28abc555cc51291a7ef2bb80cc54ee8f232cc84082ea82ab284ce9f661e79",
+          "claim": "actor 結算 hold、推進 human lane；hold 釋放且無其他前景時嘗試 start_next。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 296,
+          "end_line": 316,
+          "excerpt_sha256": "0146c651c701afa22bb37079053378496f20a901fd8372de9329dc8e3a6061b9",
+          "claim": "hold 剩餘數降為零時清 replay_auth、hold 與相關 admission。"
+        }
+      ],
+      "condition": "延續回放，writer 已產生提交結果。",
+      "note": "箭頭接收端是 session 附屬 HumanTxPump，actor 通知屬此參與者內部轉送。在回條處理中，只有 NotSubmitted 可把 replay 放回前端；部分或 unknown 不盲目重送。回條是 TX 結算，不代表 DUT 已執行完。"
+    },
+    {
+      "id": "line-input",
+      "from": "hub",
+      "to": "session",
+      "label": "以行編輯器累積輸入",
+      "phase": "條件：其他 console 行模式",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 977,
+          "end_line": 998,
+          "excerpt_sha256": "353a7b98bcf0d0c336bca7b65fc18c597f8cd034d3721d55019139c2e1db3105",
+          "claim": "Hub 對 Telnet bytes 先過濾協商，將資料包成含 client_lifetime 與 input_epoch 的 ConsoleInputBytes。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 1053,
+          "end_line": 1063,
+          "excerpt_sha256": "746a532cb87cd93406eb137d08417a91c53c8b4bb6e6f7cf45f060cd6f1b6db7",
+          "claim": "Hub 實際將 ConsoleInputBytes 等 data 事件與 control 事件送往 session mailbox。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/ownership.rs",
+          "line": 189,
+          "end_line": 203,
+          "excerpt_sha256": "8f649e2d895dbb3d4216dd141efcd02fbe8821e1e6736a39d38a6c71e07078e6",
+          "claim": "不屬於 raw owner 或 suspended owner defer 的 client，改走 Line。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 640,
+          "end_line": 663,
+          "excerpt_sha256": "71fe95493d5450ec941c0b1069c76fc2695da5a031e1e1a4a0531000eaf0ad05",
+          "claim": "actor 用每 console 的 LineEditor.consume；先產生 echo 效果，再逐行 submit。"
+        },
+        {
+          "path": "crates/sw-core/src/human_console/line_editor.rs",
+          "line": 47,
+          "end_line": 69,
+          "excerpt_sha256": "8d3bc45713c5e6c3794979723163693d27e39a29a714ec696ed11b79ad01dc4e",
+          "claim": "行編輯器處理 backspace／DEL，CR 或 LF 產生完整行並清緩衝。"
+        }
+      ],
+      "condition": "client 不是目前 raw owner，也不是應 defer 的 suspended owner；flash 時不走此支。",
+      "note": "可有多個非 owner console，各自持有 LineEditor；Enter 完成整行後才提交，不是 raw 逐 bytes TX。"
+    },
+    {
+      "id": "line-echo",
+      "from": "session",
+      "to": "hub",
+      "label": "送回本地編輯回顯",
+      "phase": "條件：其他 console 行模式",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 653,
+          "end_line": 664,
+          "excerpt_sha256": "6a8e69e12c1532c85a81f065599d40794a8b1c58f663b2f2e82d412ad4323627",
+          "claim": "ConsoleOut 先加入效果清單，再對完整行呼叫 submit_console_line。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6301,
+          "end_line": 6304,
+          "excerpt_sha256": "b1b181598bc9197c600c8defc11f6c0b9279c01d3540ba2d3f579bd8a9f49424",
+          "claim": "session executor 實際呼叫 hub.out，送往指定 client。"
+        }
+      ],
+      "condition": "延續行模式且此次編輯產生 echo bytes。",
+      "note": "箭頭代表 session 附屬 executor。這是指定 client 的本地回顯，與 DUT RX 向所有 console 的 fan-out 分開。"
+    },
+    {
+      "id": "line-dispatch",
+      "from": "session",
+      "to": "runner",
+      "label": "排隊後執行人類整行",
+      "phase": "條件：其他 console 行模式",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 667,
+          "end_line": 695,
+          "excerpt_sha256": "6cd05d1747ba19e6c183bf7e33c85864e4e9fdff682cd3c9401a1192c2b8a6e2",
+          "claim": "人類整行依 human_console_mode 選模式，帶 trusted_human=true、HumanConsole origin、priority=100、timeout=30，admit 後進 queue。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 1022,
+          "end_line": 1029,
+          "excerpt_sha256": "71fd399621a10ac408eb6f7ec683bb97d76f0788129ff916dff4aa9154b2739c",
+          "claim": "HumanConsole origin 不視為 agent，因此 command_fg_begin 不 suspend human。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7328,
+          "end_line": 7331,
+          "excerpt_sha256": "c6456b0a49222e29592ee9ff84a2265245220f8681bad27fbdfd5d4fb56493ff",
+          "claim": "佇列出列須前景空閒且 READY。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7295,
+          "end_line": 7312,
+          "excerpt_sha256": "dfa3bce0446cabaf66b42b0b72babdad30b42bf5bf9a21252d8a2e3bc03b3900",
+          "claim": "非 interactive 的 human 命令遇既有 lease 會回 SESSION_INTERACTIVE_BUSY。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7389,
+          "end_line": 7409,
+          "excerpt_sha256": "6925b6af2dd14949a2a060cb725b8f77d188df9ea1f35998b9e8f3cd3b5b2502",
+          "claim": "interactive 模式開 lease 並預存 interactive 成功結果。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 405,
+          "end_line": 408,
+          "excerpt_sha256": "7bde31898ac84d8723a18d153c688b0972237686e4441ccb3fd376153a5514bd",
+          "claim": "interactive 初始命令補換行後透過 lease_send。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7478,
+          "end_line": 7482,
+          "excerpt_sha256": "19660ce83f773e5e1ac9536a96d516512c1d245c241b83219469b89e9dcef71f",
+          "claim": "普通命令產生 StartOp::Command。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5326,
+          "end_line": 5347,
+          "excerpt_sha256": "7ab2ae92169a24d947067bf72db6864d0023fbd035008491efd1cd7e96c0efee",
+          "claim": "session 附屬 executor 取得該 epoch 的 OpRunner，實際呼叫 run 執行 StartOp。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 1016,
+          "end_line": 1028,
+          "excerpt_sha256": "b68d8d7024df93f821dd5dcf1043699fe8e3e5abecb8bf2df6588583b8f8c91a",
+          "claim": "lease_send 在完整 TX 後直接回 Sent bytes，沒有等待 prompt。"
+        }
+      ],
+      "condition": "完整行已受理並排到可執行位置，且 READY 與 lease 等執行期檢查通過；不是非 owner 每行都保證執行。",
+      "note": "一般行使用共用命令佇列與前景槽；HumanConsole origin 不觸發 agent 式 suspend。判成 interactive 的命令會開 human lease，初始 TX 不等 prompt；普通 human line 若碰上既有 lease 可被拒絕。"
+    },
+    {
+      "id": "lease-open-request",
+      "from": "agent",
+      "to": "service",
+      "label": "請求互動租約",
+      "phase": "條件：interactive lease",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 93,
+          "end_line": 102,
+          "excerpt_sha256": "c2b532f010fdbab10b9d8263023d9fb4a5d5603a869e58750a87d01608185209",
+          "claim": "interactive-open 映射為 session.interactive_open，含 owner、timeout、command 與 allow_attached。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1031,
+          "end_line": 1043,
+          "excerpt_sha256": "82e50c025596a0135ed66a210e3b09d79e74780f1628fa021344e6771bb3fd00",
+          "claim": "Service 驗 owner、timeout、command、allow_attached 與 selector。"
+        }
+      ],
+      "condition": "選擇性租約分支：呼叫端請求 interactive_open；下列主例使用 READY、非 human owner 且初始 command 為空。",
+      "note": "此支與普通 agent line／background 不同；重點是 idle human lease 的 soft preempt 與 close 還原。"
+    },
+    {
+      "id": "lease-open-route",
+      "from": "service",
+      "to": "session",
+      "label": "路由開啟並判斷搶占",
+      "phase": "條件：interactive lease",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1050,
+          "end_line": 1059,
+          "excerpt_sha256": "ef2fa24b343c0c108f979415649960a22c054037def2a8c417d88cc80a39c93d",
+          "claim": "Service 將 InteractiveOpen 路由到 session。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/lease_p6.rs",
+          "line": 339,
+          "end_line": 355,
+          "excerpt_sha256": "e83184377c18709cdc2e6b5bfb0b8f9c2ba7e1d4dbd6f5ac1a9ce2d0c1328586",
+          "claim": "READY open 在 tick close hold 或 foreground／replay hold 忙時拒絕，refresh 後再檢查。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/lease_p6.rs",
+          "line": 357,
+          "end_line": 390,
+          "excerpt_sha256": "fd0cc1ab9abd462d7998ac13b8f144c9846ad33922789791170f3e9d6edab967",
+          "claim": "既有 human lease 不活躍且請求 owner 非 human 時 stash／suspend 並 soft preempt；否則 busy；無 lease 時直接開。"
+        },
+        {
+          "path": "crates/sw-core/src/lease.rs",
+          "line": 165,
+          "end_line": 175,
+          "excerpt_sha256": "22a0d56b3dc92a5cc084ef46c94de0b3ecada6a5b68bc742ce2fe897b3955791",
+          "claim": "human_active 依 human lease 與最近一次真實 raw 輸入是否在 HUMAN_ACTIVE_WINDOW_S 內判定。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/lease_p6.rs",
+          "line": 319,
+          "end_line": 329,
+          "excerpt_sha256": "ac4a44723a839aefad1f9d200e2025dfd0a947b0826e0199d40d05e0101827da",
+          "claim": "stash 移除原索引、保存 human lease，並 suspend ownership。"
+        }
+      ],
+      "condition": "延續 READY 的 interactive_open；既有 lease 若是活躍 human 或其他 owner，回 SESSION_INTERACTIVE_BUSY。",
+      "note": "soft preempt 的依據是最近 raw 輸入時間，不是 human 行是否已回 prompt。無 lease 直接開；閒置 human lease 才保存原租約並 suspend，待關閉後評估還原。"
+    },
+    {
+      "id": "lease-open-reply",
+      "from": "session",
+      "to": "service",
+      "label": "回傳租約與搶占結果",
+      "phase": "條件：interactive lease",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core/lease_p6.rs",
+          "line": 368,
+          "end_line": 390,
+          "excerpt_sha256": "d14121b61cdce230fde3235bbd08694528c07b601c94ecb02303e443a2cfd90c",
+          "claim": "成功 open 結果含 interactive_id、recovery_mode=false，soft preempt 另帶 soft_preempted=true。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7012,
+          "end_line": 7027,
+          "excerpt_sha256": "7f3bf7903d7801353384f313d3dee941275967e81613977e04a0bad2b2c137e9",
+          "claim": "開 lease 設 active、owner generation、ownership 並產生 LeaseIndex insert。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/lease_p6.rs",
+          "line": 55,
+          "end_line": 64,
+          "excerpt_sha256": "d272a37f6242f8cc96c845f7c52785ad601203b056e93b4602394eb036bf83e0",
+          "claim": "LeaseIndex 效果排在 Reply 與 StartOp 前。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7090,
+          "end_line": 7097,
+          "excerpt_sha256": "1a40e6db666c88419e1ebd737ff8dda12dd15865598f9226d6a3744372560d3a",
+          "claim": "開啟後產生通知與 timer；command 空時直接 Reply。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7099,
+          "end_line": 7111,
+          "excerpt_sha256": "7e1d9f85ae546f52b0f49f6f32a38f6ca6aefa4e01dab5970c158eb9b55a2f61",
+          "claim": "有非空初始 command 且無 foreground 時建立 InteractiveOpen 前景工作，等待初始 TX 收尾再回應。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/console.rs",
+          "line": 738,
+          "end_line": 745,
+          "excerpt_sha256": "434e21a351c514bec1bacf0609373e2f8edb024f1adb6cf41a1326d195b2d7e8",
+          "claim": "TCP Connected 只更新 primary、peer 與 stream ownership，直接返回，沒有在此建立 lease。"
+        }
+      ],
+      "condition": "延續開啟成功且初始 command 空的主例；拒絕也以 Reply 回錯誤。",
+      "note": "human ownership 與 InteractiveLease 是不同狀態；TCP accept 可只有前者。這裡回的是租約 interactive_id。若另帶初始 command，會以 StartOp 執行初始 TX 後才回應。"
+    },
+    {
+      "id": "lease-send-or-status",
+      "from": "service",
+      "to": "session",
+      "label": "路由租約傳送或查詢",
+      "phase": "條件：interactive lease",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1066,
+          "end_line": 1081,
+          "excerpt_sha256": "68ba904730685faf21f1b576730e7dcc622b14a8b899bb762dd6ffdb4a790632",
+          "claim": "interactive_send 按 interactive_id 路由 data 與 encoding。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1083,
+          "end_line": 1096,
+          "excerpt_sha256": "4f7ee50f360d85796c3ef8b323c3b65506503445f348d9ba9c95c12e4577f4ab",
+          "claim": "interactive_status 按 interactive_id 路由 screen_chars。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7783,
+          "end_line": 7793,
+          "excerpt_sha256": "673cd58d189c6aa26f268ff9e56ac58984568b657920f7dec71252e86093dd4a",
+          "claim": "管理器查 interactive_id 對應 session，更新 console scan 並送請求。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7151,
+          "end_line": 7179,
+          "excerpt_sha256": "484bd59774b4b77b633577899c31d80f29b39d336a998f90b703551f04b603a9",
+          "claim": "send 先檢查 id、到期、連線、flash 與 foreground 忙。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7209,
+          "end_line": 7238,
+          "excerpt_sha256": "abdef14af40e074b38bad87f1cd58f6eb73b4527e5d60d702a067841827cbd1a",
+          "claim": "status 驗 id 與 agent lease 到期，touch 活動時間並回共享 RX 尾端 screen。"
+        }
+      ],
+      "condition": "租約已開啟，可反覆 send 或 status；由 agent 呼叫後，Service 實際路由。",
+      "note": "status 是共享 RX 尾端畫面且會 touch 租約；不是等待命令專屬結果。查不到 id 或已到期會回錯誤；send 在前景／回放 hold 忙時拒絕。"
+    },
+    {
+      "id": "lease-send-op",
+      "from": "session",
+      "to": "runner",
+      "label": "執行租約位元組傳送",
+      "phase": "條件：interactive lease",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7182,
+          "end_line": 7206,
+          "excerpt_sha256": "5e059877a0525242d4231885ceedc5d11abc7f6102dd44db4b84f09fb4ad7522",
+          "claim": "send 編碼 payload、取得 lease owner，建立前景 grant 與 StartOp::InteractiveSend。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5326,
+          "end_line": 5347,
+          "excerpt_sha256": "7ab2ae92169a24d947067bf72db6864d0023fbd035008491efd1cd7e96c0efee",
+          "claim": "session 附屬 executor 取得該 epoch 的 OpRunner，實際呼叫 run 執行 StartOp。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 410,
+          "end_line": 412,
+          "excerpt_sha256": "4554f36913999f3e90d915ec0dc8248fc62b1ad8c54bc6e0852028ec0f3f7170",
+          "claim": "InteractiveSend 用 LeaseOwner 類別呼叫 lease_send。"
+        }
+      ],
+      "condition": "前一步選擇 send，且 id、到期、前景與編碼等檢查通過。",
+      "note": "此 send 有自己的前景 grant；與 human console raw 不占命令前景的路徑不同。"
+    },
+    {
+      "id": "lease-owner-tx",
+      "from": "runner",
+      "to": "bridge",
+      "label": "以 LeaseOwner 提交 TX",
+      "phase": "條件：interactive lease",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 410,
+          "end_line": 412,
+          "excerpt_sha256": "4554f36913999f3e90d915ec0dc8248fc62b1ad8c54bc6e0852028ec0f3f7170",
+          "claim": "InteractiveSend 把 owner、payload 與 LeaseOwner 類別交 lease_send。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 1016,
+          "end_line": 1028,
+          "excerpt_sha256": "b68d8d7024df93f821dd5dcf1043699fe8e3e5abecb8bf2df6588583b8f8c91a",
+          "claim": "lease_send 送 TX，完整提交即回 Sent bytes，不等待 prompt。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 565,
+          "end_line": 574,
+          "excerpt_sha256": "465cd43c66c45d8763cbead04d5f7b7016766342296a57de574ddd2decbe9d1c",
+          "claim": "send 由 OpRunner 送 TxJob 到 writer 並等 TX report。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7979,
+          "end_line": 8001,
+          "excerpt_sha256": "148beb63978696539382a65115c5310b2e6d272b72d72bf3beed684b1c4f399e",
+          "claim": "actor 收到 InteractiveSend 的 Sent 後 touch lease 並 Reply bytes；拒絕與錯誤另行映射。"
+        }
+      ],
+      "condition": "延續互動 send；writer 仍須通過 fence。",
+      "note": "只確認 TX bytes，不等待 DUT prompt；OpFinished 後 actor touch lease 並回 bytes，RX 仍依共用 fan-out 顯示或由 status 讀取。"
+    },
+    {
+      "id": "lease-close",
+      "from": "service",
+      "to": "session",
+      "label": "關閉並評估還原 human",
+      "phase": "條件：interactive lease",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 1098,
+          "end_line": 1109,
+          "excerpt_sha256": "e27f5e54cfa27e72d587c0f5d7c8c36bb54df17a9a30ac49e81929721702827a",
+          "claim": "interactive_close 由 Service 帶 interactive_id 路由。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7241,
+          "end_line": 7246,
+          "excerpt_sha256": "53219acd8566f93df0caafbed1622bb809cdd2fb35f9954257d5e5f48a10c403",
+          "claim": "close 驗 id 後 close_lease(false) 並回成功。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/lease_p6.rs",
+          "line": 77,
+          "end_line": 95,
+          "excerpt_sha256": "9cef5905da7b578df8210ba38ee49fe23e76ef82c53e6ff4011c5229b76c622e",
+          "claim": "關 lease 移除索引；若未 suspend human，清 owner 後結束。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/lease_p6.rs",
+          "line": 101,
+          "end_line": 120,
+          "excerpt_sha256": "63d870b3cd372b8f600faaf41d1c35a51ec23eb990003e3b9047cd02d2d4536d",
+          "claim": "若 stash 未到期且 peer 仍在，還原 human lease 與索引；否則不還原。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/lease_p6.rs",
+          "line": 123,
+          "end_line": 151,
+          "excerpt_sha256": "854fcff99dfb1d67c33ec8fd3a32141cfdca126bcd18183866a8fbde7455b6d2",
+          "claim": "stash 未還原先刪該 client 暫存，resume 後按需要清 owner；有效上下文可觸發回放。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/lease_p6.rs",
+          "line": 197,
+          "end_line": 201,
+          "excerpt_sha256": "7a5d4ff724fbd0dec364938464687198259a29ad987e7fb66d911738f1d9d607",
+          "claim": "refresh 發現非 human lease 到期時以 expired=true 關閉。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core/lease_p6.rs",
+          "line": 83,
+          "end_line": 91,
+          "excerpt_sha256": "c0a262b1d6c5b259d77fbb2ba6c409ae2cf770e9028fa3e50dc3ec28b31f922c",
+          "claim": "expired 關閉留下 expired tombstone；一般 close 移除租約索引。"
+        }
+      ],
+      "condition": "呼叫端選擇關閉有效租約；到期也可走相同的內部清理與還原邏輯。",
+      "note": "soft preempt 後只有仍有效且有 peer 的 stash 才還原 human；有效暫存沿前述回放路徑送出，失效 stash 的暫存先丟棄。一般 close 不留 expired tombstone；到期以 expired 狀態記錄。"
+    }
+  ],
+  "unknowns": [
+    {
+      "id": "runtime-interleavings",
+      "question": "本次未執行 daemon、測試或實機負載；各平台 #294 交錯的發生率、TX 分段與 stdout 內容未重新驗證。",
+      "impact": "#294 以 issue 分析與原始碼支持條件式可能性，不提供新的長跑或實機證據。"
+    },
+    {
+      "id": "prefix-prompt-window",
+      "question": "未帶行尾錨點的 prefix 型 prompt_regex 在不同 DUT 上，會把 #294 觸發視窗擴大到何種程度？",
+      "impact": "issue #294 將此列為待實測；本頁不宣稱特定 DUT 的窗口長度或必然誤判。"
+    },
+    {
+      "id": "python-baseline-not-compared",
+      "question": "只對照 Python 0.4.x 的 raw owner 直接送 bytes、agent 開始前的前景／lease 檢查，以及 offset 後 regex 搜尋的 50 ms 輪詢；端點接入、多 console 行編輯、deferred 回放及 interactive lease 其餘步驟未逐步比對。",
+      "impact": "未標示差異的步驟僅描述 Rust，不能據此認定與 Python 0.4.x 完全相同。"
+    }
+  ],
+  "conflicts": []
+}

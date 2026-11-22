@@ -1,0 +1,488 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "serialwrap｜Session 生命週期",
+    "locale": "zh-TW",
+    "output": "docs/architecture/features/02-session-lifecycle.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/hamanpaul/serialwrap",
+      "provider": "github",
+      "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347"
+    },
+    "subtitle": "Rust session 由開埠、登入與 nonce 驗證進入 READY；以 quiet、重探、自測與救援管理開機及失去 prompt 後的恢復。"
+  },
+  "participants": [
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "CLI／Agent",
+      "sources": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 60,
+          "end_line": 77
+        }
+      ]
+    },
+    {
+      "id": "service",
+      "type": "backend",
+      "label": "RPC／Service",
+      "sources": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 777,
+          "end_line": 789
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 923,
+          "end_line": 938
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 952,
+          "end_line": 963
+        }
+      ]
+    },
+    {
+      "id": "sessions",
+      "type": "backend",
+      "label": "Session 管理",
+      "sublabel": "SessionManager",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2295,
+          "end_line": 2302
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5434,
+          "end_line": 5458
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5364,
+          "end_line": 5392
+        }
+      ]
+    },
+    {
+      "id": "session",
+      "type": "backend",
+      "label": "狀態機",
+      "sublabel": "SessionCore、actor",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/actor.rs",
+          "line": 478,
+          "end_line": 494
+        },
+        {
+          "path": "crates/sw-core/src/actor.rs",
+          "line": 543,
+          "end_line": 558
+        },
+        {
+          "path": "crates/sw-core/src/actor.rs",
+          "line": 777,
+          "end_line": 788
+        }
+      ]
+    },
+    {
+      "id": "login",
+      "type": "backend",
+      "label": "登入工作",
+      "sublabel": "login_fsm",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/login_fsm.rs",
+          "line": 148,
+          "end_line": 158
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5392,
+          "end_line": 5414
+        },
+        {
+          "path": "crates/sw-core/src/login_run.rs",
+          "line": 1,
+          "end_line": 3
+        }
+      ]
+    },
+    {
+      "id": "runner",
+      "type": "backend",
+      "label": "操作工作",
+      "sublabel": "OpRunner",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 124,
+          "end_line": 132
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 383,
+          "end_line": 404
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 413,
+          "end_line": 415
+        }
+      ]
+    },
+    {
+      "id": "bridge",
+      "type": "backend",
+      "label": "UART bridge",
+      "sublabel": "單一寫入者",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 691,
+          "end_line": 715
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1079,
+          "end_line": 1089
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 526,
+          "end_line": 535
+        }
+      ]
+    },
+    {
+      "id": "target",
+      "type": "external",
+      "label": "UART／DUT",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1079,
+          "end_line": 1085
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 486,
+          "end_line": 492
+        }
+      ]
+    }
+  ],
+  "segments": [
+    {
+      "from": 160,
+      "to": 466,
+      "label": "附掛與開埠"
+    },
+    {
+      "from": 480,
+      "to": 852,
+      "label": "登入與就緒驗證"
+    },
+    {
+      "from": 866,
+      "to": 1095,
+      "label": "條件分支：靜默與自動重探"
+    },
+    {
+      "from": 1109,
+      "to": 1338,
+      "label": "條件分支：顯式救援"
+    },
+    {
+      "from": 1352,
+      "to": 1570,
+      "label": "條件分支：健康自測"
+    },
+    {
+      "from": 1584,
+      "to": 1898,
+      "label": "條件分支：重開機後恢復"
+    }
+  ],
+  "messages": [
+    {
+      "id": "attach",
+      "from": "cli",
+      "to": "service",
+      "y": 176,
+      "label": "送出 session.attach",
+      "variant": "default",
+      "note": "Linux｜Windows： Unix socket｜TCP"
+    },
+    {
+      "id": "resolve-attach",
+      "from": "service",
+      "to": "sessions",
+      "y": 220,
+      "label": "解析並路由附掛",
+      "variant": "default",
+      "note": "selector 查無時不建立 session"
+    },
+    {
+      "id": "dispatch-attach",
+      "from": "sessions",
+      "to": "session",
+      "y": 275,
+      "label": "傳遞 SessionAttach",
+      "variant": "default",
+      "note": "已附掛不重開； RELEASED 改用 device.attach"
+    },
+    {
+      "id": "open-bridge",
+      "from": "session",
+      "to": "sessions",
+      "y": 341,
+      "label": "委派 OpenBridge",
+      "variant": "default",
+      "note": "Linux｜Windows： flock 加 TIOCEXCL｜零分享 CreateFileW"
+    },
+    {
+      "id": "bridge-opened",
+      "from": "sessions",
+      "to": "session",
+      "y": 418,
+      "label": "回報 BridgeOpened",
+      "variant": "default",
+      "note": "開埠成功不等於 READY；回 ok 不表示已登入"
+    },
+    {
+      "id": "start-login",
+      "from": "session",
+      "to": "sessions",
+      "y": 496,
+      "label": "委派 StartLogin",
+      "variant": "default",
+      "note": "條件：非 passthrough 且 quiet 不擋"
+    },
+    {
+      "id": "launch-login",
+      "from": "sessions",
+      "to": "login",
+      "y": 562,
+      "label": "啟動登入計畫",
+      "variant": "default",
+      "note": "登入執行緒不經 OpRunner"
+    },
+    {
+      "id": "login-io",
+      "from": "login",
+      "to": "bridge",
+      "y": 606,
+      "label": "探測、登入及驗證",
+      "variant": "default",
+      "note": "依序：找 prompt、帳密、 post_login_cmd、 nonce"
+    },
+    {
+      "id": "write-login",
+      "from": "bridge",
+      "to": "target",
+      "y": 661,
+      "label": "提交登入位元組",
+      "variant": "default",
+      "note": "登入 TX 共用唯一 writer"
+    },
+    {
+      "id": "read-login",
+      "from": "target",
+      "to": "bridge",
+      "y": 716,
+      "label": "接收回應並更新視窗",
+      "variant": "default",
+      "note": "在共享 RX 視窗比對 nonce 與 prompt"
+    },
+    {
+      "id": "login-finished",
+      "from": "login",
+      "to": "session",
+      "y": 760,
+      "label": "回報 LoginFinished",
+      "variant": "default",
+      "note": "Ready 轉 READY； NotReady 留 ATTACHED"
+    },
+    {
+      "id": "ready-notify",
+      "from": "session",
+      "to": "sessions",
+      "y": 804,
+      "label": "通報 SessionReady",
+      "variant": "default",
+      "note": "之後的命令見 01-command-exec"
+    },
+    {
+      "id": "boot-rx",
+      "from": "bridge",
+      "to": "session",
+      "y": 882,
+      "label": "轉送 RX 並更新靜默",
+      "variant": "default",
+      "note": "條件：偵測到 boot banner； quiet 180 秒"
+    },
+    {
+      "id": "passthrough-ready",
+      "from": "session",
+      "to": "sessions",
+      "y": 926,
+      "label": "靜默後通報就緒",
+      "variant": "default",
+      "note": "條件： passthrough 連續 30 秒無 RX"
+    },
+    {
+      "id": "auto-reprobe",
+      "from": "session",
+      "to": "sessions",
+      "y": 992,
+      "label": "委派重探或重新附掛",
+      "variant": "default",
+      "note": "條件： RX 安靜 3 秒；退避 2 秒倍增至 15 秒、最多 10 次"
+    },
+    {
+      "id": "reprobe-finished",
+      "from": "login",
+      "to": "session",
+      "y": 1047,
+      "label": "回報重探驗證結果",
+      "variant": "default",
+      "note": "成功清 quiet；失敗進退避"
+    },
+    {
+      "id": "recover-route",
+      "from": "service",
+      "to": "sessions",
+      "y": 1125,
+      "label": "路由 session.recover",
+      "variant": "default",
+      "note": "條件：另行呼叫 session.recover"
+    },
+    {
+      "id": "recover-dispatch",
+      "from": "sessions",
+      "to": "session",
+      "y": 1180,
+      "label": "傳遞 Recover 並選計畫",
+      "variant": "default",
+      "note": "依狀態選重新附掛、重探、 clear 或救援鍵"
+    },
+    {
+      "id": "recover-effects",
+      "from": "session",
+      "to": "sessions",
+      "y": 1246,
+      "label": "委派救援計畫效果",
+      "variant": "default",
+      "note": "READY 救援： Ctrl-C 再 Ctrl-D，各等至多 2 秒"
+    },
+    {
+      "id": "recover-finished",
+      "from": "runner",
+      "to": "session",
+      "y": 1290,
+      "label": "回報救援鍵結果",
+      "variant": "default",
+      "note": "成功回 PROMPT_TIMEOUT_RECOVERED，不重送命令"
+    },
+    {
+      "id": "self-test-route",
+      "from": "service",
+      "to": "sessions",
+      "y": 1368,
+      "label": "路由 session.self_test",
+      "variant": "default",
+      "note": "條件：另行呼叫 session.self_test"
+    },
+    {
+      "id": "self-test-classify",
+      "from": "sessions",
+      "to": "session",
+      "y": 1423,
+      "label": "傳遞 SelfTest 並分類",
+      "variant": "default",
+      "note": "多數狀態零 TX 直接回分類"
+    },
+    {
+      "id": "self-test-probe",
+      "from": "session",
+      "to": "sessions",
+      "y": 1478,
+      "label": "委派 SelfTestProbe",
+      "variant": "default",
+      "note": "條件：分類為 NeedProbe"
+    },
+    {
+      "id": "self-test-finished",
+      "from": "runner",
+      "to": "session",
+      "y": 1522,
+      "label": "回報自測分類結果",
+      "variant": "default",
+      "note": "失敗回 RX_FLOOD 或 TARGET_UNRESPONSIVE"
+    },
+    {
+      "id": "reboot-tx",
+      "from": "runner",
+      "to": "bridge",
+      "y": 1600,
+      "label": "提交重開機命令",
+      "variant": "default",
+      "note": "條件：命令走 run_reboot（見 01-command-exec）"
+    },
+    {
+      "id": "reboot-tx-settled",
+      "from": "bridge",
+      "to": "session",
+      "y": 1666,
+      "label": "回報 UartTxCompleted",
+      "variant": "default",
+      "note": "actor 設 180 秒 quiet 與再確認"
+    },
+    {
+      "id": "reboot-expected",
+      "from": "runner",
+      "to": "session",
+      "y": 1721,
+      "label": "回報重開機等待結果",
+      "variant": "default",
+      "note": "未回 prompt： status=recovering，清佇列"
+    },
+    {
+      "id": "reboot-relogin",
+      "from": "session",
+      "to": "sessions",
+      "y": 1765,
+      "label": "委派重開機後登入",
+      "variant": "default",
+      "note": "條件： RECOVERING 且 quiet 不擋；重用登入執行緒"
+    },
+    {
+      "id": "reboot-login-finished",
+      "from": "login",
+      "to": "session",
+      "y": 1820,
+      "label": "回報恢復登入結果",
+      "variant": "default",
+      "note": "成功回 READY；期限到留 ATTACHED 或 DETACHED"
+    },
+    {
+      "id": "reboot-ready",
+      "from": "session",
+      "to": "sessions",
+      "y": 1864,
+      "label": "通報恢復完成",
+      "variant": "default",
+      "note": "已清掉的命令不會自動重送"
+    }
+  ]
+}

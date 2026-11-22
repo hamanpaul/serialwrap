@@ -1,0 +1,506 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "serialwrap｜裝置管理",
+    "locale": "zh-TW",
+    "output": "docs/architecture/features/03-device-mgmt.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/hamanpaul/serialwrap",
+      "provider": "github",
+      "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347"
+    },
+    "subtitle": "依平台列舉 UART、以啟動快照確定 COM 預配，將熱插與設定交給 session actor，並以關閉回條及狀態落盤完成 release／attach 交接。"
+  },
+  "participants": [
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "CLI／Agent",
+      "sources": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 27,
+          "end_line": 42
+        },
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 45,
+          "end_line": 59
+        },
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 125,
+          "end_line": 140
+        }
+      ]
+    },
+    {
+      "id": "daemon",
+      "type": "backend",
+      "label": "serialwrapd",
+      "sublabel": "主流程、Service",
+      "sources": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1383,
+          "end_line": 1392
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 880,
+          "end_line": 908
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 972,
+          "end_line": 994
+        }
+      ]
+    },
+    {
+      "id": "watcher",
+      "type": "backend",
+      "label": "裝置監看",
+      "sublabel": "DeviceWatcher",
+      "sources": [
+        {
+          "path": "crates/sw-pal/src/device_watcher.rs",
+          "line": 37,
+          "end_line": 58
+        },
+        {
+          "path": "crates/sw-pal/src/device_watcher.rs",
+          "line": 136,
+          "end_line": 147
+        },
+        {
+          "path": "crates/sw-pal/src/device_watcher.rs",
+          "line": 151,
+          "end_line": 170
+        }
+      ]
+    },
+    {
+      "id": "devices",
+      "type": "backend",
+      "label": "裝置來源",
+      "sublabel": "sw-pal 平台後端",
+      "sources": [
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 149,
+          "end_line": 175
+        },
+        {
+          "path": "crates/sw-pal/src/device_source/posix.rs",
+          "line": 16,
+          "end_line": 42
+        },
+        {
+          "path": "crates/sw-pal/src/device_source/windows.rs",
+          "line": 42,
+          "end_line": 63
+        }
+      ]
+    },
+    {
+      "id": "manager",
+      "type": "backend",
+      "label": "Session 管理",
+      "sublabel": "SessionManager",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6753,
+          "end_line": 6775
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6776,
+          "end_line": 6790
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2882,
+          "end_line": 2894
+        }
+      ]
+    },
+    {
+      "id": "session",
+      "type": "backend",
+      "label": "Session actor",
+      "sublabel": "SessionCore",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3999,
+          "end_line": 4015
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 4042,
+          "end_line": 4050
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 2244,
+          "end_line": 2268
+        }
+      ]
+    },
+    {
+      "id": "state",
+      "type": "database",
+      "label": "狀態儲存",
+      "sublabel": "StateStore",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/state_store.rs",
+          "line": 69,
+          "end_line": 74
+        },
+        {
+          "path": "crates/sw-core/src/state_store.rs",
+          "line": 623,
+          "end_line": 645
+        },
+        {
+          "path": "crates/sw-core/src/state_store.rs",
+          "line": 646,
+          "end_line": 655
+        }
+      ]
+    },
+    {
+      "id": "bridge",
+      "type": "backend",
+      "label": "UART bridge",
+      "sublabel": "IoWorker",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5183,
+          "end_line": 5199
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 844,
+          "end_line": 864
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 865,
+          "end_line": 877
+        }
+      ]
+    }
+  ],
+  "segments": [
+    {
+      "from": 160,
+      "to": 367,
+      "label": "啟動掃描與預配"
+    },
+    {
+      "from": 381,
+      "to": 621,
+      "label": "熱插拔與 session 對應"
+    },
+    {
+      "from": 635,
+      "to": 853,
+      "label": "接入與正式 bridge"
+    },
+    {
+      "from": 867,
+      "to": 1195,
+      "label": "條件：設定變更"
+    },
+    {
+      "from": 1209,
+      "to": 1361,
+      "label": "條件：外部交接請求"
+    },
+    {
+      "from": 1375,
+      "to": 1538,
+      "label": "條件：釋放分支"
+    },
+    {
+      "from": 1552,
+      "to": 1748,
+      "label": "條件：接回分支"
+    },
+    {
+      "from": 1762,
+      "to": 1977,
+      "label": "交接落盤與回覆"
+    }
+  ],
+  "messages": [
+    {
+      "id": "initial-scan",
+      "from": "daemon",
+      "to": "devices",
+      "y": 176,
+      "label": "初次列舉裝置",
+      "variant": "default",
+      "note": "Linux｜Windows： /dev/serial/by-id 再 by-path｜登錄檔 SERIALCOMM"
+    },
+    {
+      "id": "rank-bootstrap",
+      "from": "daemon",
+      "to": "manager",
+      "y": 253,
+      "label": "預配 COM 並排程初始接入",
+      "variant": "default",
+      "note": "並行 attach 前先排序， COM 不依完成順序決定"
+    },
+    {
+      "id": "watcher-start",
+      "from": "daemon",
+      "to": "watcher",
+      "y": 319,
+      "label": "以同一快照啟動輪詢",
+      "variant": "default",
+      "note": "不等各 session 登入或 attach 完成"
+    },
+    {
+      "id": "poll-source",
+      "from": "watcher",
+      "to": "devices",
+      "y": 397,
+      "label": "重掃相同裝置來源",
+      "variant": "default",
+      "note": "掃描失敗保留舊基線"
+    },
+    {
+      "id": "device-delta",
+      "from": "watcher",
+      "to": "manager",
+      "y": 452,
+      "label": "送出差異與完整快照",
+      "variant": "default",
+      "note": "依完整快照重算差異；更新返回後才 ack"
+    },
+    {
+      "id": "device-detach",
+      "from": "manager",
+      "to": "session",
+      "y": 496,
+      "label": "通知缺席與舊路徑移除",
+      "variant": "default",
+      "note": "條件：裝置離線或 by_id 改指；保留 session 與 COM"
+    },
+    {
+      "id": "device-session",
+      "from": "manager",
+      "to": "session",
+      "y": 562,
+      "label": "沿用、改綁或建立 session",
+      "variant": "default",
+      "note": "profile： pin → sticky → prompt 偵測 → passthrough"
+    },
+    {
+      "id": "auto-open-effect",
+      "from": "session",
+      "to": "manager",
+      "y": 651,
+      "label": "提出接入開埠效果",
+      "variant": "default",
+      "note": "條件：舊 handle 已確認關閉； RELEASED 不自動接回"
+    },
+    {
+      "id": "open-bridge",
+      "from": "manager",
+      "to": "bridge",
+      "y": 728,
+      "label": "建立正式 UART bridge",
+      "variant": "default",
+      "note": "Linux｜Windows： flock 加 TIOCEXCL｜零分享 CreateFileW"
+    },
+    {
+      "id": "bridge-opened",
+      "from": "manager",
+      "to": "session",
+      "y": 805,
+      "label": "回報 BridgeOpened",
+      "variant": "default",
+      "note": "驗證狀態與世代後才接手"
+    },
+    {
+      "id": "config-request",
+      "from": "cli",
+      "to": "daemon",
+      "y": 883,
+      "label": "送出綁定或命名設定",
+      "variant": "default",
+      "note": "條件： session.bind、 alias.* 或 session.pin"
+    },
+    {
+      "id": "config-dispatch",
+      "from": "daemon",
+      "to": "manager",
+      "y": 927,
+      "label": "分派設定操作",
+      "variant": "default",
+      "note": "pin 只保存選擇，下次接入才用"
+    },
+    {
+      "id": "config-actor",
+      "from": "manager",
+      "to": "session",
+      "y": 971,
+      "label": "改綁或同步目前 alias",
+      "variant": "default",
+      "note": "條件： bind 或 alias.set"
+    },
+    {
+      "id": "bind-persist-effect",
+      "from": "session",
+      "to": "manager",
+      "y": 1026,
+      "label": "發布綁定並要求保存",
+      "variant": "default",
+      "note": "條件： bind；移除 released、寫入新 binding"
+    },
+    {
+      "id": "config-save",
+      "from": "manager",
+      "to": "state",
+      "y": 1092,
+      "label": "提交綁定、alias 或 pin",
+      "variant": "default",
+      "note": "StateStore 原子寫入 state.json"
+    },
+    {
+      "id": "config-committed",
+      "from": "manager",
+      "to": "session",
+      "y": 1147,
+      "label": "回報綁定提交結果",
+      "variant": "default",
+      "note": "條件： bind；在線即續送 DeviceOnline"
+    },
+    {
+      "id": "custody-request",
+      "from": "cli",
+      "to": "daemon",
+      "y": 1225,
+      "label": "送出裝置釋放或接回",
+      "variant": "default",
+      "note": "條件： device.release 或 device.attach"
+    },
+    {
+      "id": "custody-dispatch",
+      "from": "daemon",
+      "to": "manager",
+      "y": 1269,
+      "label": "解析 selector 並路由交接",
+      "variant": "default",
+      "note": "force 只略過 holder 預檢"
+    },
+    {
+      "id": "custody-route",
+      "from": "manager",
+      "to": "session",
+      "y": 1313,
+      "label": "由 actor 序列化交接",
+      "variant": "default",
+      "note": "未確認關閉時回 SESSION_RECOVERING"
+    },
+    {
+      "id": "release-drain-effect",
+      "from": "session",
+      "to": "manager",
+      "y": 1391,
+      "label": "凍結並要求釋放資源",
+      "variant": "default",
+      "note": "條件： release；停止期間禁止新 TX"
+    },
+    {
+      "id": "release-stop",
+      "from": "manager",
+      "to": "bridge",
+      "y": 1446,
+      "label": "停止並非同步關閉 UART",
+      "variant": "default",
+      "note": "只是啟動關閉，尚未完成釋放"
+    },
+    {
+      "id": "release-receipt",
+      "from": "bridge",
+      "to": "session",
+      "y": 1490,
+      "label": "送回關閉回條與證據",
+      "variant": "default",
+      "note": "全部資源確認關閉才 RELEASED；逾時不算已關閉"
+    },
+    {
+      "id": "reclaim-open-effect",
+      "from": "session",
+      "to": "manager",
+      "y": 1568,
+      "label": "檢查在線並要求接回",
+      "variant": "default",
+      "note": "條件： device.attach、裝置在線、無 bridge"
+    },
+    {
+      "id": "reclaim-open",
+      "from": "manager",
+      "to": "bridge",
+      "y": 1645,
+      "label": "依獨佔規則開埠",
+      "variant": "default",
+      "note": "force 也不會終止外部工具"
+    },
+    {
+      "id": "reclaim-opened",
+      "from": "manager",
+      "to": "session",
+      "y": 1700,
+      "label": "回報開埠並等待接手",
+      "variant": "default",
+      "note": "Unreleased 落盤前尚未正式接手"
+    },
+    {
+      "id": "custody-persist-effect",
+      "from": "session",
+      "to": "manager",
+      "y": 1778,
+      "label": "要求保存交接狀態",
+      "variant": "default",
+      "note": "release 寫 released 列； attach 移除"
+    },
+    {
+      "id": "custody-save",
+      "from": "manager",
+      "to": "state",
+      "y": 1844,
+      "label": "原子提交交接快照",
+      "variant": "default",
+      "note": "寫檔失敗不算交接成功"
+    },
+    {
+      "id": "custody-committed",
+      "from": "manager",
+      "to": "session",
+      "y": 1899,
+      "label": "回報提交並完成狀態",
+      "variant": "default",
+      "note": "attach 成功為 ATTACHING，不等於 READY"
+    },
+    {
+      "id": "custody-reply",
+      "from": "daemon",
+      "to": "cli",
+      "y": 1943,
+      "label": "回傳交接結果",
+      "variant": "default",
+      "note": "release 成功後才交給外部工具"
+    }
+  ]
+}

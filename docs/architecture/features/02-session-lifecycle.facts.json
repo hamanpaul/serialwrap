@@ -1,0 +1,1709 @@
+{
+  "schema_version": 1,
+  "document_type": "feature-facts",
+  "feature": {
+    "id": "02-session-lifecycle",
+    "order": 2,
+    "title": "Session 生命週期",
+    "summary": "Rust session 由開埠、登入與 nonce 驗證進入 READY；以 quiet、重探、自測與救援管理開機及失去 prompt 後的恢復。"
+  },
+  "repository": {
+    "url": "https://github.com/hamanpaul/serialwrap",
+    "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347"
+  },
+  "diagram_type": "sequence",
+  "scope": {
+    "includes": [
+      "既有已綁定 session 的 session.attach、actor 與開埠工作者、登入計畫、帳密或 console 解鎖、post_login_cmd、ready probe 與結果收斂。",
+      "quiet、READY 再確認、passthrough 連續安靜就緒、自動重探及重開埠；內部 Tick 與狀態轉換記在相鄰跨參與者步驟的 note。",
+      "顯式 recover、自測與 reboot 後恢復四組條件分支；各分支依自己的 condition 插入，不表示主路徑必然依序觸發。"
+    ],
+    "excludes": [
+      "裝置偵測、動態分類、COM 指派、bind／pin、release／flash 與完整關閉保管流程，另見裝置管理與 MCU 燒錄頁。",
+      "一般命令提交、排程、完成判定及輸出擷取，另見 01-command-exec；只引用 reboot 或 prompt 逾時對 session 的影響。",
+      "console 端點與 lease 完整操作、WAL 持久化；這些附屬元件僅在相關 note 說明。",
+      "執行 serialwrap、測試、建置或實機驗收；本頁為固定 revision 的靜態讀碼事實。"
+    ]
+  },
+  "participants": [
+    {
+      "id": "cli",
+      "label": "CLI／Agent",
+      "type": "frontend",
+      "overview_component": "cli",
+      "responsibility": "把 session attach、recover、self-test 轉為對應 RPC，帶入 selector 與救援或探測參數。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 60,
+          "end_line": 77,
+          "excerpt_sha256": "6834adfe69a83ea433fed966feed356dab1a2c512294db836d4caa7de82f4294",
+          "claim": "CLI 映射 session.attach、session.self_test、session.recover，並傳入各自參數。"
+        }
+      ]
+    },
+    {
+      "id": "service",
+      "label": "RPC／Service",
+      "type": "backend",
+      "overview_component": "service",
+      "responsibility": "驗證 selector 與 RPC 參數，透過 SessionManager 解析及路由；查無 session 回 SESSION_NOT_FOUND。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 777,
+          "end_line": 789,
+          "excerpt_sha256": "545b5280245b7045798edfa8667c21b28cb098d3d6d78bef409c2f661319e8ba",
+          "claim": "Service::route 解析 selector，再呼叫 manager.route_with_selector；查無回 SESSION_NOT_FOUND。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 923,
+          "end_line": 938,
+          "excerpt_sha256": "d3cfe9bede455614e2315482ba4c7f92c052755bed2416f914c4147fc3b0276c",
+          "claim": "self-test 解析 timeout_s、strict_human_lock 並路由 SelfTest。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 952,
+          "end_line": 963,
+          "excerpt_sha256": "d7923cf47572b76b6640a3814a0a4d37554135807e30c857397938333217d4c7",
+          "claim": "recover 解析 timeout_s、force 並路由 Recover。"
+        }
+      ]
+    },
+    {
+      "id": "sessions",
+      "label": "Session 管理",
+      "sublabel": "SessionManager",
+      "type": "backend",
+      "overview_component": "sessions",
+      "responsibility": "建立並路由 actor；本參與者包含該模組的效果執行器與開埠工作者。OpenBridge 在 actor 外開埠並建立 IoWorker；StartLogin 啟動獨立登入執行緒；StartOp 交給 OpRunner；Reply 寫回等待通道。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2295,
+          "end_line": 2302,
+          "excerpt_sha256": "bb7f66cb3cddfd43240f9734e84af890530486ffc27e1ad75ebf7bb247e1fe86",
+          "claim": "manager 建立 session actor，並注入效果執行器。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5434,
+          "end_line": 5458,
+          "excerpt_sha256": "8236023c011e7704ed056cc9273f3598b2e18344cef7fc2140f01cd99f53d905",
+          "claim": "效果執行器將 OpenBridge 交給開埠工作佇列。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5364,
+          "end_line": 5392,
+          "excerpt_sha256": "8a218a55b6c36ecb1963b450621964fa91a229e5342bb9fd1c1447e9daf7fbfa",
+          "claim": "start_login 取得 writer 並建立獨立登入執行緒。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5326,
+          "end_line": 5347,
+          "excerpt_sha256": "7ab2ae92169a24d947067bf72db6864d0023fbd035008491efd1cd7e96c0efee",
+          "claim": "start_op 建立或取得該 epoch 的 OpRunner，呼叫 run。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6054,
+          "end_line": 6057,
+          "excerpt_sha256": "301d5a1fd9d2652d2196c34e63c3b70888303b0bef3df28cf7f2887b9d40b8b0",
+          "claim": "Reply 效果由執行器寫回請求的回覆通道。"
+        }
+      ]
+    },
+    {
+      "id": "session",
+      "label": "狀態機",
+      "sublabel": "SessionCore、actor",
+      "type": "backend",
+      "overview_component": "session-actor",
+      "responsibility": "每個 session 的 actor 管理連線世代、狀態、quiet、READY 再確認與救援計畫；內部每秒 Tick 及計時器觸發後續效果。狀態轉換只在此處收斂，外部工作回報 LoginFinished 或 OpFinished。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/actor.rs",
+          "line": 478,
+          "end_line": 494,
+          "excerpt_sha256": "53d91c3f7e042e224b357fc9db14d34681fc9a414dc76cc639e5256075f30da7",
+          "claim": "每 session 一條 actor thread；先執行啟動效果，再進入事件迴圈。"
+        },
+        {
+          "path": "crates/sw-core/src/actor.rs",
+          "line": 543,
+          "end_line": 558,
+          "excerpt_sha256": "f6771d4cd2557e68a202667d5d1fac32a5a06b6b51d10ca29798c886cbfd6d4d",
+          "claim": "actor 迴圈每秒自行派送 Tick，並非 SessionManager 傳入。"
+        },
+        {
+          "path": "crates/sw-core/src/actor.rs",
+          "line": 777,
+          "end_line": 788,
+          "excerpt_sha256": "fbea542809495e1a4007532de51670dbe7a5b10c318e64f5ce7bc00dc9b7f6a8",
+          "claim": "SessionCore 處理事件後，actor 依序將非 Schedule 效果交給執行器。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 1556,
+          "end_line": 1580,
+          "excerpt_sha256": "81fa4890b43203ef73c91e41b33d5b118f16393d28e5f4103e623d443e4c0c2f",
+          "claim": "OpFinished、LoginFinished、Timer 與 Tick 各自交給對應的狀態收斂函式。"
+        }
+      ]
+    },
+    {
+      "id": "login",
+      "label": "登入工作",
+      "sublabel": "login_fsm",
+      "type": "backend",
+      "overview_component": null,
+      "responsibility": "執行 Probe 或 EnsureReady：prompt 探測、帳密登入或 console 解鎖、post_login_cmd、nonce 與 prompt 驗證；共用 bridge 的 RX 視窗與 writer，完成直接回報 actor。login_run.rs 提供協調型別，實際結果收斂在 SessionCore。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/login_fsm.rs",
+          "line": 148,
+          "end_line": 158,
+          "excerpt_sha256": "e2f6b3ab20d58c8082e423ec64d9b8adcec17796ab6625a23253b4b8366121a4",
+          "claim": "run_login_plan 分派 probe_ready 或 ensure_ready；無計畫或帳密未解析時不 TX。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5392,
+          "end_line": 5414,
+          "excerpt_sha256": "871ec89cfe3ee4f158697c084abb1eb14d45f16086a9d2a335628dff079ebd86",
+          "claim": "登入執行緒建立 LoginIo，以 LoginProbe 執行計畫，再送 LoginFinished。"
+        },
+        {
+          "path": "crates/sw-core/src/login_run.rs",
+          "line": 1,
+          "end_line": 3,
+          "excerpt_sha256": "beb9ffc861dc646792441ac8404e3c972ded97141eee7eef2886eb80ab409c91",
+          "claim": "login_run 模組提供協調型別；收斂位於 SessionCore 的 login_finished 與 auto_reprobe_converge。"
+        }
+      ]
+    },
+    {
+      "id": "runner",
+      "label": "操作工作",
+      "sublabel": "OpRunner",
+      "type": "backend",
+      "overview_component": "execute",
+      "responsibility": "執行 READY recover 的救援鍵、self-test nonce probe 與 reboot 命令，透過同一 TxWriter 送出；完成以 OpFinished 回 actor。reboot 後重新登入由 actor 的登入工作負責，OpRunner 不承接 RebootRecovery。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 124,
+          "end_line": 132,
+          "excerpt_sha256": "8f27d3d0aa3b12bd455181479630b51f1bb86d4d5aa65f23470c8eef9e09f734",
+          "claim": "操作工作執行完畢後，將 outcome 與 RX watermark 以 OpFinished 回報。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 383,
+          "end_line": 404,
+          "excerpt_sha256": "32e3f6e536ce79d9429f34e6b7203d406091f0c6c2fd5a20efa060a43a5803cd",
+          "claim": "Recover 走 recover_after_failure，SelfTestProbe 走 run_self_test_probe。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 413,
+          "end_line": 415,
+          "excerpt_sha256": "fb681b004aa9ed17f4fb2a76647536aa431488c8d4470a42320834f3e91a4044",
+          "claim": "RebootRecovery 不由 OpRunner 承接，明確交由 actor 的登入 run 驅動。"
+        }
+      ]
+    },
+    {
+      "id": "bridge",
+      "label": "UART bridge",
+      "sublabel": "單一寫入者",
+      "type": "backend",
+      "overview_component": "bridge",
+      "responsibility": "合併 reader、單一 TX writer、Fence 與共享 RX 視窗；埠由 SessionManager 開啟，bridge 接手 handle 後承接所有登入、探測與救援 I/O。WAL 與 console fan-out 屬附屬路徑，本頁不另畫參與者。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 691,
+          "end_line": 715,
+          "excerpt_sha256": "22c17df2ec107df5c8b17d4006d7fc8bc2d4a72316facf390e366baa37735ee3",
+          "claim": "IoWorker 拆分讀寫 handle，啟動 reader 與 TxWriter。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1079,
+          "end_line": 1089,
+          "excerpt_sha256": "4f9ac4854148b640598ecc0af9b2f08cfbbdff05001d33f3c9fa91eb53ab6c83",
+          "claim": "writer 以 FenceSubmitGate 呼叫 write_gated，提交時重驗許可。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 526,
+          "end_line": 535,
+          "excerpt_sha256": "d2fce80e8193eaa6eb168d75cb3b5330be3c3359a8cd97f07e434fbbcee6b8ae",
+          "claim": "reader 更新 RxShared 並將 RX 推往 console hub。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 546,
+          "end_line": 557,
+          "excerpt_sha256": "00af6379dae6dc13d8d1494cda1bbe8c7e46c14e264d6b6de7baf85e979b2632",
+          "claim": "reader 將 UartRxChunk 送往 actor 的 data lane。"
+        }
+      ]
+    },
+    {
+      "id": "target",
+      "label": "UART／DUT",
+      "type": "external",
+      "overview_component": "target",
+      "responsibility": "經序列埠接收 TX，輸出 prompt、nonce 回應與開機文字；evidence 證明主機端位元組讀寫，不保證 DUT 的實際狀態或 RX 的因果歸屬。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1079,
+          "end_line": 1085,
+          "excerpt_sha256": "205c2baddd95e399989ecd02e8fd4db8cf118269a23b96c61db6979081456eee",
+          "claim": "主機 writer 將 payload 寫往 SerialWriter。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 486,
+          "end_line": 492,
+          "excerpt_sha256": "3fb37b96f55c4d0ead7487d3e95e7633aac5c07c42a7d1c35c91ad02811e240e",
+          "claim": "主機 reader 自序列埠讀取裝置 RX。"
+        }
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "id": "attach",
+      "from": "cli",
+      "to": "service",
+      "label": "送出 session.attach",
+      "phase": "附掛與開埠",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 60,
+          "end_line": 67,
+          "excerpt_sha256": "f1bed5b0f5736b451f8549020b2c55162313dd4749c3e80faa071192641fe027",
+          "claim": "session attach 對應 session.attach；self-test 是獨立入口。"
+        },
+        {
+          "path": "crates/sw-pal/src/rpc_transport/posix.rs",
+          "line": 52,
+          "end_line": 65,
+          "excerpt_sha256": "3d67d02e39b0099875b3a97786b0f8cc1d2bb79d91485ff584c5b98eb9efe060",
+          "claim": "POSIX RPC connector 可連 Unix socket 或 TCP。"
+        },
+        {
+          "path": "crates/sw-pal/src/rpc_transport/windows.rs",
+          "line": 51,
+          "end_line": 68,
+          "excerpt_sha256": "7234530656f2aa1aa3c8f86e0389a363b1ac74572e14a33323ec3477ee25e3fb",
+          "claim": "Windows RPC connector 僅接受 TCP，Unix endpoint 回 Unsupported。"
+        },
+        {
+          "path": "crates/sw-cli/src/lib.rs",
+          "line": 124,
+          "end_line": 129,
+          "excerpt_sha256": "80cce65fe70aaa3c8a41c73a2428f8899aae4172bacea30da94d9b2f3a69b768",
+          "claim": "CLI 以 native_backend 是否為 Win 決定預設 endpoint 是否 TCP，再解析 RuntimePaths。"
+        },
+        {
+          "path": "crates/sw-proto/src/runtime_paths.rs",
+          "line": 247,
+          "end_line": 264,
+          "excerpt_sha256": "472c22712830e243372eadea7bd2e6327bc798a18f35c292a4a1b1c0c5680397",
+          "claim": "預設 socket 路徑為 serialwrapd.sock；明確 endpoint 優先，Windows 預設 loopback TCP，其餘用 socket。"
+        }
+      ],
+      "note": "主路徑從已存在且有裝置綁定的 session 出發。預設本機傳輸為 Linux｜Windows：Unix socket｜TCP；POSIX 也支援 TCP，實際 endpoint 可由設定覆寫。裝置偵測與新 session 分類另見裝置管理頁。"
+    },
+    {
+      "id": "resolve-attach",
+      "from": "service",
+      "to": "sessions",
+      "label": "解析並路由附掛",
+      "phase": "附掛與開埠",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 995,
+          "end_line": 1000,
+          "excerpt_sha256": "05f774372b39a134192fe93bb7f9552e99de2207017b73ee82a4aa55d176d084",
+          "claim": "session.attach 檢查 selector 後建立 SessionAttach 請求。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 777,
+          "end_line": 789,
+          "excerpt_sha256": "545b5280245b7045798edfa8667c21b28cb098d3d6d78bef409c2f661319e8ba",
+          "claim": "Service 實際呼叫 manager.resolve 與 route_with_selector；查無則回 SESSION_NOT_FOUND。"
+        }
+      ],
+      "note": "selector 必須非空且可解析；查無時不建立 session。"
+    },
+    {
+      "id": "dispatch-attach",
+      "from": "sessions",
+      "to": "session",
+      "label": "傳遞 SessionAttach",
+      "phase": "附掛與開埠",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2044,
+          "end_line": 2052,
+          "excerpt_sha256": "37a9eee2c62817aa8a84d396b966606fd418a459360b089fa9359b30a2cc69f2",
+          "claim": "manager 取得該 session 的 actor，呼叫 actor.request。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3257,
+          "end_line": 3259,
+          "excerpt_sha256": "ca6327b6524c5684d1b4265945fb0542f43e5bae9ce6d0f625b30f7ed1d02eaa",
+          "claim": "SessionAttach 清帳密告警旗標，再呼叫 attach_request。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3536,
+          "end_line": 3556,
+          "excerpt_sha256": "17ce792eb89f735d6655f655f9f44aab8c2c27e129c216b6ba76b79265c17d13",
+          "claim": "未綁裝置回 DEVICE_NOT_BOUND；RELEASED 的 session.attach 回 released 並建議 device_attach。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3558,
+          "end_line": 3580,
+          "excerpt_sha256": "32b93f41d7c169bd428d6d5be35961c7fd9c0ff70b4b0c3f6e59cf9b396bb1d7",
+          "claim": "FLASHING 與 drain 等恢復中狀態分別拒絕為 FLASHING_BUSY 或 SESSION_RECOVERING。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3649,
+          "end_line": 3661,
+          "excerpt_sha256": "3278a34317d2897a931f7f7d2a73abaed3fce9773f8538c8bd06900fc12bcd0a",
+          "claim": "既有 bridge 的 ATTACHED 非 passthrough 且無 human lease 時重探；其餘按狀態回覆。"
+        }
+      ],
+      "note": "本頁主路徑為無 bridge、裝置在線且可開埠。已附掛時不重開：ATTACHED 可進既有 bridge 重探；passthrough 不 probe。RELEASED 要改用 device.attach；FLASHING 與 drain 中不進此開埠路徑。"
+    },
+    {
+      "id": "open-bridge",
+      "from": "session",
+      "to": "sessions",
+      "label": "委派 OpenBridge",
+      "phase": "附掛與開埠",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3681,
+          "end_line": 3697,
+          "excerpt_sha256": "694f33ba30034b5cdd936a59bf5ca34f8b1305832c802aa2ffb279a2ded64ea1",
+          "claim": "session.attach 的裝置不在線時轉 DETACHED 並回 DEVICE_NOT_FOUND；在線才取實際路徑。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 3710,
+          "end_line": 3732,
+          "excerpt_sha256": "7edf61892f9a8298afc9753e5fbe64ae8e04914b2de96ee4a39a7928d202ecfa",
+          "claim": "actor 記錄 pending attach 與世代，再發出 OpenBridge。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6072,
+          "end_line": 6083,
+          "excerpt_sha256": "3a95dda519617ed88f1ecc51724768e6f226ca2bf0958710189cd78dba7025cd",
+          "claim": "執行器接 OpenBridge 後提交開埠工作。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5088,
+          "end_line": 5107,
+          "excerpt_sha256": "212bdb5d99f52a5691f3ddf866541b27f6f383611b7d50c195b8a7807a708b05",
+          "claim": "開埠工作先檢查 holder，再呼叫 serial.open_exclusive。"
+        },
+        {
+          "path": "crates/sw-pal/src/serial/posix.rs",
+          "line": 339,
+          "end_line": 358,
+          "excerpt_sha256": "33bf21683173085255757a22654d4b9547b3fb969adb77f1f54c58b50329b037",
+          "claim": "POSIX 開埠依序 open、flock、TIOCEXCL。"
+        },
+        {
+          "path": "crates/sw-pal/src/serial/windows.rs",
+          "line": 72,
+          "end_line": 78,
+          "excerpt_sha256": "9798c9902a2fbeeac6a7cde25dc38b56f94080bcc7bc677f94fadc9001a6cb8c",
+          "claim": "Windows CreateFile 參數使用零分享與 overlapped。"
+        },
+        {
+          "path": "crates/sw-pal/src/serial/windows.rs",
+          "line": 118,
+          "end_line": 136,
+          "excerpt_sha256": "c81daea2195e9000df88beb32525b1ebd71c221962142a190b82490188215f4b",
+          "claim": "Windows open_exclusive 將裝置路徑轉為 Win32 名稱並呼叫 CreateFileW。"
+        }
+      ],
+      "note": "主路徑前提：無 bridge、裝置在線，且沒有重複 attach、drain、關閉未確認等阻擋開埠的工作。 實際開埠者是 SessionManager 模組的工作者，actor 不直接開 UART。Linux｜Windows：flock 加 TIOCEXCL｜零分享 CreateFileW。"
+    },
+    {
+      "id": "bridge-opened",
+      "from": "sessions",
+      "to": "session",
+      "label": "回報 BridgeOpened",
+      "phase": "附掛與開埠",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5183,
+          "end_line": 5204,
+          "excerpt_sha256": "1f27319ee160a853947a0c44e44028ff181d1b2ef74250f3cc4ab6fd3ba9a326",
+          "claim": "開埠工作建立新 RX 視窗，使用已開 handle 啟動 IoWorker。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5479,
+          "end_line": 5482,
+          "excerpt_sha256": "6cb2ccdabe85ed65b913bd52284629a5c5bb42b4d22196a00ecb15758ac5a147",
+          "claim": "開埠工作者送 BridgeOpened，帶回成功或失敗結果。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 5368,
+          "end_line": 5370,
+          "excerpt_sha256": "be31eb64df6f51ce8616838942afc8d4456ba1f3278b5e5f132d7c4d3483fce1",
+          "claim": "actor 接手 console endpoint 並記錄目前 conn_epoch。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 5423,
+          "end_line": 5427,
+          "excerpt_sha256": "ef9b43fb8b13023ce742f8471f4a8fb0ceabc0787f37acb7009ffcff174cd05c",
+          "claim": "passthrough 或非 command-capable profile 接上 bridge 後停 ATTACHED。"
+        },
+        {
+          "path": "crates/sw-proto/src/config_types.rs",
+          "line": 68,
+          "end_line": 70,
+          "excerpt_sha256": "ada69edc4778c3688c2f00604544ad62c65d2ad330f11c386ccc7f334a5c6b79",
+          "claim": "command_capable 由 ready_probe 去除空白後是否非空決定。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 4187,
+          "end_line": 4203,
+          "excerpt_sha256": "32c6e6b153adcc8b833f082b8d5ccacc24746a7b533c1b55b3c1996a27622871",
+          "claim": "有 pending attach 的 BridgeOpened 先發 Persist(Unreleased)，不立即採用 bridge。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6262,
+          "end_line": 6270,
+          "excerpt_sha256": "cc50d7016cae2d97e95210543dfa1a63fcf05bed3ef42746a76dcf5d98e91678",
+          "claim": "持久化工作者提交後，實際以 StateCommitted 回報 actor。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 2589,
+          "end_line": 2603,
+          "excerpt_sha256": "8595183c091f5101f66151b84b3cfc670b06b8a19ca06d982a8f8858ae5d8f5f",
+          "claim": "落盤成功才轉 ATTACHING、採用 bridge，且將原 RPC 回覆插在 StartLogin 效果之前。"
+        }
+      ],
+      "condition": "前一步的開埠工作已結束；後續登入僅在成功建立 bridge 時繼續。",
+      "note": "開埠成功不等於 READY。顯式 session.attach 成功開埠後，先由執行器落盤 Unreleased，等 StateCommitted 才轉 ATTACHING、採用 bridge；原 RPC 的成功回覆排在 StartLogin 之前，因此回 ok 不表示登入已完成。passthrough 或未設定有效 ready_probe 的 profile 停 ATTACHED、略過以下登入主路徑；RX 與 console 可先開始工作。"
+    },
+    {
+      "id": "start-login",
+      "from": "session",
+      "to": "sessions",
+      "label": "委派 StartLogin",
+      "phase": "登入與就緒驗證",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 5436,
+          "end_line": 5458,
+          "excerpt_sha256": "26a939e9de33c17f136585b8742cf2cbfa5a6458d0f8caf60b850ef6225d5067",
+          "claim": "quiet 擋住時不 probe，帳密未解析時留 ATTACHED 並告警。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 5461,
+          "end_line": 5473,
+          "excerpt_sha256": "99fe03b9aab0e5f97f6aaba5cdb62314776134090d2c77bb1a716f5267b5e14c",
+          "claim": "有效登入計畫記錄 LoginRun 與世代，產生 StartLogin 效果。"
+        },
+        {
+          "path": "crates/sw-core/src/login_fsm.rs",
+          "line": 127,
+          "end_line": 144,
+          "excerpt_sha256": "e3bc9a3319a38738858ea54f1f01f4db2ccfeb59823b46614d9ee7c8b86626c0",
+          "claim": "需要登入且帳密可用時選 EnsureReady，否則選 Probe；宣告但未解析的帳密另行早退。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6210,
+          "end_line": 6214,
+          "excerpt_sha256": "c8a25f2ec21e22e6d7af96cb9392afa208beb2872b470d7bebbe8f0f2ff9eb3e",
+          "claim": "StartLogin 效果由執行器轉給 start_login。"
+        }
+      ],
+      "condition": "bridge 已接手、profile 可執行命令且非 passthrough，quiet 或帳密狀態未阻止登入。",
+      "note": "依計畫選 Probe 或 EnsureReady；quiet 合成 PROMPT_UNAVAILABLE，帳密缺漏為 CREDENTIALS_UNRESOLVED，兩者均零 probe TX、停 ATTACHED。console unlock 對 quiet 的例外見後續靜默分支。"
+    },
+    {
+      "id": "launch-login",
+      "from": "sessions",
+      "to": "login",
+      "label": "啟動登入計畫",
+      "phase": "登入與就緒驗證",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5384,
+          "end_line": 5407,
+          "excerpt_sha256": "52bf6d10af6ed6fe72a98eea60aa7388525014c8096720b65da4cde03ac0809a",
+          "claim": "執行器建立登入 thread，以 LoginProbe 類別呼叫 run_login_plan。"
+        },
+        {
+          "path": "crates/sw-core/src/login_fsm.rs",
+          "line": 148,
+          "end_line": 157,
+          "excerpt_sha256": "50cbec273aa5cc6def651cb0ae6bbf596a62fd8d44cec7da1d6fbd08d725bebb",
+          "claim": "登入工作依計畫分派 Probe 或 EnsureReady。"
+        }
+      ],
+      "condition": "前一步產生有效的 StartLogin。",
+      "note": "此登入執行緒由效果執行器直接啟動，不經 OpRunner；自動重探及 reboot recovery 共用此入口。"
+    },
+    {
+      "id": "login-io",
+      "from": "login",
+      "to": "bridge",
+      "label": "探測、登入及驗證",
+      "phase": "登入與就緒驗證",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/login_fsm.rs",
+          "line": 520,
+          "end_line": 524,
+          "excerpt_sha256": "fb9d13b1f6e8b94d5aa1bb6a7f9a74f0f30c9f42276e0d7fff795e845c0bd7e7",
+          "claim": "prompt probe 清 RX 後送空行，等待 prompt_regex。"
+        },
+        {
+          "path": "crates/sw-core/src/login_fsm.rs",
+          "line": 254,
+          "end_line": 274,
+          "excerpt_sha256": "f3905fe93a75603b305a8f2cb0e66536e10e123ef1324ab3ef4636c782f3f079",
+          "claim": "EnsureReady 先處理 console unlock，否則探測 prompt、必要時登入，再 finalize_ready。"
+        },
+        {
+          "path": "crates/sw-core/src/login_fsm.rs",
+          "line": 630,
+          "end_line": 649,
+          "excerpt_sha256": "d89d359db5d2ee21ef3d067085762f78cb07ca11f041a3f58c1483515a4a71b2",
+          "claim": "登入依 login_regex 送 username，依 password_regex 送密碼並等待 prompt。"
+        },
+        {
+          "path": "crates/sw-core/src/login_fsm.rs",
+          "line": 503,
+          "end_line": 505,
+          "excerpt_sha256": "b773e2c0012f2d9ca34f26af3a3dca12800651e72e4aa7a0c3dca9d705b22c56",
+          "claim": "密碼使用 system:secret，log=false。"
+        },
+        {
+          "path": "crates/sw-core/src/login_fsm.rs",
+          "line": 539,
+          "end_line": 552,
+          "excerpt_sha256": "3a254f0349e2d95d21200119ffbac2e64c69187fc9155fe2e383a39edcd82dab",
+          "claim": "post_login_cmd 前檢查是否仍在 login，送出後等 prompt，逾時回 POST_LOGIN_CMD_TIMEOUT。"
+        },
+        {
+          "path": "crates/sw-core/src/login_fsm.rs",
+          "line": 554,
+          "end_line": 576,
+          "excerpt_sha256": "c7bc5c1c515c6dc78cd7293ab82bafcf2ad9dbc171a95810655778dd7e66b534",
+          "claim": "ready_probe 置換 nonce，等待 nonce 再等 prompt；預設 console unlock probe 使用整行 nonce 樣式。"
+        },
+        {
+          "path": "crates/sw-core/src/login_fsm.rs",
+          "line": 696,
+          "end_line": 715,
+          "excerpt_sha256": "a8317e522f3aa4d5c636ca3109fe4c14d3d8049ea52c3f56a21ad4c86ba2f73e",
+          "claim": "console unlock 先等靜默、排除 bootloader，再決定是否送辨識空行。"
+        },
+        {
+          "path": "crates/sw-core/src/login_fsm.rs",
+          "line": 721,
+          "end_line": 730,
+          "excerpt_sha256": "a4541003ffba706bf54abc490be0b25c75902f86436d434e258d368252999205",
+          "claim": "無可用 prompt 且仍靜默時才送解鎖秘密，最後進 finalize_ready。"
+        },
+        {
+          "path": "crates/sw-core/src/login_fsm.rs",
+          "line": 361,
+          "end_line": 366,
+          "excerpt_sha256": "8bc326e65c921a37e5b9c9f4f383bc2c03eb63190779a36045e09ca4feef7c42",
+          "claim": "登入 TX 將工作送 writer，等待回條並 settle。"
+        }
+      ],
+      "condition": "登入計畫執行中；帳密登入、post_login_cmd、console unlock 各依 profile 與 RX 判定是否需要。",
+      "note": "箭頭概括多輪 TX 與 RX 等待。一般路徑先空行找 prompt，必要時帳密登入，然後 post_login_cmd、nonce、prompt；秘密不寫 TX payload 日誌。console unlock 先被動等靜默且排除 bootloader；既有 prompt 可直接進驗證，否則才空行辨識或送解鎖秘密。"
+    },
+    {
+      "id": "write-login",
+      "from": "bridge",
+      "to": "target",
+      "label": "提交登入位元組",
+      "phase": "登入與就緒驗證",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1079,
+          "end_line": 1089,
+          "excerpt_sha256": "4f9ac4854148b640598ecc0af9b2f08cfbbdff05001d33f3c9fa91eb53ab6c83",
+          "claim": "writer 經提交閘門執行 SerialWriter::write_gated。"
+        },
+        {
+          "path": "crates/sw-core/src/login_fsm.rs",
+          "line": 474,
+          "end_line": 490,
+          "excerpt_sha256": "8b9c47c9c1e50febc5e5e7ee8396391dce82aa0073a6a8271ced4714b9e6a334",
+          "claim": "登入 payload 補換行，未提交、取消及 fence 拒絕分別收斂，不把失敗視為成功 TX。"
+        }
+      ],
+      "condition": "登入工作送出 TX，且 Fence 與埠 I/O 允許提交。",
+      "note": "所有登入及探測 TX 共用唯一 writer；此箭頭與下一個 RX 箭頭會隨登入步驟重複。"
+    },
+    {
+      "id": "read-login",
+      "from": "target",
+      "to": "bridge",
+      "label": "接收回應並更新視窗",
+      "phase": "登入與就緒驗證",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 486,
+          "end_line": 502,
+          "excerpt_sha256": "4fa6dafc0b90c78a23fbe3b3940fdc3b929e0f5658ff78de65efd5389a4d4ea2",
+          "claim": "reader 讀取裝置 bytes 並先寫 RX WAL。"
+        },
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 526,
+          "end_line": 535,
+          "excerpt_sha256": "d2fce80e8193eaa6eb168d75cb3b5330be3c3359a8cd97f07e434fbbcee6b8ae",
+          "claim": "reader append RX 到 RxShared，再推送 console。"
+        },
+        {
+          "path": "crates/sw-core/src/login_fsm.rs",
+          "line": 508,
+          "end_line": 516,
+          "excerpt_sha256": "3fafaf015de6800633dc7f11460322adc27bdc2cbc63928dca04895e682182e7",
+          "claim": "登入工作在共享 RX 視窗等待 regex，可因匹配、逾時或取消結束。"
+        }
+      ],
+      "condition": "裝置有 RX；若沒有符合的回應，登入工作以等待逾時收斂。",
+      "note": "登入在共享 RX 視窗判定 nonce 與 prompt；圖上不將每筆 RX 宣稱為該次 TX 的專屬回應。RX 同時另送 actor，靜默分支說明其用途。"
+    },
+    {
+      "id": "login-finished",
+      "from": "login",
+      "to": "session",
+      "label": "回報 LoginFinished",
+      "phase": "登入與就緒驗證",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5404,
+          "end_line": 5414,
+          "excerpt_sha256": "8cff514ed195c9d3b7ad0ae39b1377d0bf65fc6d11aa3d42b8ede7ca5a6bed44",
+          "claim": "登入工作完成後直接送 LoginFinished，附 epoch、fsm_gen 與 RX watermark。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 5586,
+          "end_line": 5594,
+          "excerpt_sha256": "aecf519deb8c906d053afd9fdd113cf496c664faf4c3cd6daa6ff945e430ae17",
+          "claim": "actor 只接受與目前 login_run 的 epoch、fsm_gen 相符的結果。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 5673,
+          "end_line": 5697,
+          "excerpt_sha256": "3c098a6a77909031f531a708711256c743658f7274ce507515a9271d4f67ff1d",
+          "claim": "attach 的例外走 LoginFailed 停止；Ready 採用 bridge、轉 READY、註冊佇列並確認就緒。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 5699,
+          "end_line": 5721,
+          "excerpt_sha256": "d99c9438d42bedbcef565e995e5fb23ed31259c1a1836ceb22130fc2d17fb45c",
+          "claim": "NotReady 留 ATTACHED；完整登入 Failed 的 attach 路徑停止 bridge，既有 bridge 重探失敗仍留 ATTACHED。"
+        }
+      ],
+      "condition": "本次登入工作結束，且結果尚屬有效世代。",
+      "note": "Ready 才轉 READY；NotReady 留 ATTACHED 並保留錯誤。attach 的完整登入失敗或例外走關閉流程，與既有 bridge 重探失敗留 ATTACHED 不同；遲到的舊工作不再改狀態。"
+    },
+    {
+      "id": "ready-notify",
+      "from": "session",
+      "to": "sessions",
+      "label": "通報 SessionReady",
+      "phase": "登入與就緒驗證",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 5682,
+          "end_line": 5697,
+          "excerpt_sha256": "6306e337780fd7de82712fbc434f04b1b8b3620d13b18888b8f59160526a2f41",
+          "claim": "成功後轉 READY、註冊佇列、重置 reprobe、confirm_ready，產生 SessionReady 通知。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 6429,
+          "end_line": 6437,
+          "excerpt_sha256": "2b247c81d8050b5deb338521fdf386b66cec92176e7a9ca3816cfb65f3cf942b",
+          "claim": "confirm_ready 同步清 Fence 的 quiet 與 reconfirm_pending。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6273,
+          "end_line": 6275,
+          "excerpt_sha256": "6024d7cddf0fce2c54ce2fcd10fd406cbc38dba549dc70efc0349a0effb1eb2d",
+          "claim": "效果執行器把 ManagerNote 送往 manager 的 note 通道。"
+        }
+      ],
+      "condition": "登入或 probe 已成功驗證就緒。",
+      "note": "此為 manager 內部通知；READY 之後命令的排程與完成判定見 01-command-exec。"
+    },
+    {
+      "id": "boot-rx",
+      "from": "bridge",
+      "to": "session",
+      "label": "轉送 RX 並更新靜默",
+      "phase": "條件分支：靜默與自動重探",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/uart_bridge.rs",
+          "line": 546,
+          "end_line": 557,
+          "excerpt_sha256": "00af6379dae6dc13d8d1494cda1bbe8c7e46c14e264d6b6de7baf85e979b2632",
+          "claim": "reader 直接向 actor data lane 送 UartRxChunk。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 5841,
+          "end_line": 5865,
+          "excerpt_sha256": "aa81aa70d9404fd281d8935e61a0cf3f25441d3842263d375fed2ca86a65ec1e",
+          "claim": "passthrough RX 只重設安靜視窗；其他 RX 進 quiet 判定，banner 撤銷輸入並套用 quiet。"
+        },
+        {
+          "path": "crates/sw-core/src/quiet_gate.rs",
+          "line": 174,
+          "end_line": 193,
+          "excerpt_sha256": "cb054e92a783f52fb08e2e3a984c9ad1d4e2131149ca21e2926c9f5fd6635704",
+          "claim": "非 passthrough 的 RX 見 boot banner 就解除證據等待並 arm quiet。"
+        },
+        {
+          "path": "crates/sw-core/src/quiet_gate.rs",
+          "line": 200,
+          "end_line": 218,
+          "excerpt_sha256": "59dcb44a1be69edfdba90bff87245a20b32ffa8a652540c668159fd747fa53a9",
+          "claim": "先排除 bootloader prompt，再以 login、prompt 或 boot_done_regex 解除 quiet。"
+        },
+        {
+          "path": "crates/sw-core/src/quiet_gate.rs",
+          "line": 74,
+          "end_line": 100,
+          "excerpt_sha256": "5522601862e108729cf2d268c64bdd5ec6a977aa82bf5ed2eafa72ccb2afa190",
+          "claim": "arm 為 180 秒 quiet、首次 pending 起算 300 秒再確認；重臂不延期限，clear_quiet 不清 pending。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 5884,
+          "end_line": 5908,
+          "excerpt_sha256": "9903d9b991b8a36d105be5855b6e9c0f03d2c4849cc035c8fea2c980b31f8288",
+          "claim": "quiet 同步至 Fence，阻擋 probe 時呼叫 sc30_cancel_login_run。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 5933,
+          "end_line": 5951,
+          "excerpt_sha256": "028c777712bee4a55ded87732900e9fd786b4542c3ba0ba1525f7d46b141acc4",
+          "claim": "SC-30 取消登入等待並立即收斂，移除 attach／reprobe run 或收斂 auto／reboot run。"
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 675,
+          "end_line": 692,
+          "excerpt_sha256": "3a2411001da1a315eae5ef4c46c6955f0e5455cc0e7d3005a25e5690d65d5266",
+          "claim": "Python quiet arm 遞增 login_gen 並推送 probe／TX gate，沒有 Rust 的立即取消與 run 收斂。"
+        },
+        {
+          "path": "crates/sw-core/src/quiet_gate.rs",
+          "line": 24,
+          "end_line": 31,
+          "excerpt_sha256": "824a3d94ca2a3a0f0ff0d4740d0fe1dc1abc69f09dbf9c0c8a911c1cbd7bd2ca",
+          "claim": "quiet 為 180 秒、再確認期限 300 秒、最多 5 次，boot evidence 寬限為 60 秒。"
+        }
+      ],
+      "condition": "埠已開啟時收到 RX；quiet arm 僅限非 passthrough 且偵測到 boot banner，清除僅在既有 quiet 的完成訊號成立時。",
+      "note": "quiet 為 180 秒，READY 再確認首次起算 300 秒或最多 5 次；quiet 清除不等於解除 pending。Rust 在 quiet 阻擋 probe 時立即取消並收斂舊 run；實際對照的 Python 0.4.x arm 只遞增 login_gen、推 gate，沒有這個立即收斂動作。passthrough 不 arm quiet，RX 只重設其安靜起點。"
+    },
+    {
+      "id": "passthrough-ready",
+      "from": "session",
+      "to": "sessions",
+      "label": "靜默後通報就緒",
+      "phase": "條件分支：靜默與自動重探",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 6101,
+          "end_line": 6117,
+          "excerpt_sha256": "85c483c70bc9140740f90dcc2d939cfafc8b3cf4274f893627a4552050865e4a",
+          "claim": "passthrough 在 ATTACHED、有 bridge、無 stop、flash 關閉且安靜滿額時轉 READY，發 SessionReady。"
+        },
+        {
+          "path": "crates/sw-proto/src/constants.rs",
+          "line": 105,
+          "end_line": 106,
+          "excerpt_sha256": "64b51185fa74875e41b53f6c1072c271628df0028fc1f8502b7df19a3638b1f2",
+          "claim": "passthrough 安靜升級門檻為 30 秒。"
+        },
+        {
+          "path": "crates/sw-core/src/actor.rs",
+          "line": 543,
+          "end_line": 558,
+          "excerpt_sha256": "f6771d4cd2557e68a202667d5d1fac32a5a06b6b51d10ca29798c886cbfd6d4d",
+          "claim": "actor 自身每秒派送 Tick，觸發安靜門檻判定。"
+        }
+      ],
+      "condition": "替代分支：passthrough 停 ATTACHED，連續 30 秒沒有 RX、有 bridge、無 stop，且不在 flash probe／critical 期間。",
+      "note": "actor 的內部 Tick 進行轉態後，由效果執行器送 manager 通知。這是零登入、零 nonce probe 的就緒路徑，與下方非 passthrough 自動重探互斥。"
+    },
+    {
+      "id": "auto-reprobe",
+      "from": "session",
+      "to": "sessions",
+      "label": "委派重探或重新附掛",
+      "phase": "條件分支：靜默與自動重探",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 6094,
+          "end_line": 6095,
+          "excerpt_sha256": "c2103972d28ce56626a94347644a2814e3533c9cc6bc03711286504440ac058f",
+          "claim": "actor Tick 驅動 reboot_recovery_tick 與 reprobe_tick。"
+        },
+        {
+          "path": "crates/sw-core/src/reprobe.rs",
+          "line": 107,
+          "end_line": 128,
+          "excerpt_sha256": "51c051efd3cf24b0d0154f95c2450fd45f9c87624c50e432291d0fbe74cf73d2",
+          "claim": "重探排除裝置缺漏、RELEASED／FLASHING／ATTACHING／RECOVERING、passthrough 既有連線與未解析帳密。"
+        },
+        {
+          "path": "crates/sw-core/src/reprobe.rs",
+          "line": 130,
+          "end_line": 150,
+          "excerpt_sha256": "78e46b0a05abdadc140cc7c4d853544946c19b296bbedcc0f6fee1dc86c4bbf2",
+          "claim": "重探額度耗盡、退避未到、quiet、boot evidence 等待或錯誤不符合時早退。"
+        },
+        {
+          "path": "crates/sw-core/src/reprobe.rs",
+          "line": 152,
+          "end_line": 169,
+          "excerpt_sha256": "0fec515bf37d8abcc18ab36c4bc719493744d368b74102fd4e9814c2fd41b340",
+          "claim": "RX 未空閒或 human 活躍時不重探；有 bridge 排 Probe，DETACHED 排 Attach。"
+        },
+        {
+          "path": "crates/sw-core/src/reprobe.rs",
+          "line": 50,
+          "end_line": 68,
+          "excerpt_sha256": "a89c173ee96112919aa08aa8ebe1c5e02082c463b7ca8a6ed74999d71fc0ee52",
+          "claim": "RX idle 門檻 3 秒；退避由 2 秒倍增、上限 15 秒，最多 10 次。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 6180,
+          "end_line": 6186,
+          "excerpt_sha256": "0e0da67627b6ce9a49621201dad346e33ffc572d39a6b99ac491723b61ca3f3d",
+          "claim": "已有登入工作或前景工作時，本輪不啟動新的重探。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 6216,
+          "end_line": 6224,
+          "excerpt_sha256": "07dbe096ca7dc47e4bbc5fde583f3b05b1fb2dafc697a63ccfe092138c2e7cbf",
+          "claim": "DETACHED 重探分支轉 ATTACHING，再發 OpenBridge。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 6281,
+          "end_line": 6293,
+          "excerpt_sha256": "0ba4c78e8c046cd07c078a5b9b016496b3ed8a90b01287c47d94899c8df5621a",
+          "claim": "既有 bridge 重探建立 AutoReprobe run，再發 StartLogin。"
+        },
+        {
+          "path": "crates/sw-core/src/reprobe.rs",
+          "line": 76,
+          "end_line": 88,
+          "excerpt_sha256": "c998a8de803abf1b70e0f00c63abac0e0f0edd61129767ba55470439818d5497",
+          "claim": "Rust 將 POST_LOGIN_CMD_TIMEOUT 精確列入 ATTACHED／DETACHED 的重探資格。"
+        },
+        {
+          "path": "sw_core/session_manager.py",
+          "line": 2120,
+          "end_line": 2136,
+          "excerpt_sha256": "36e8d925e70a0235e98dfbdd06acc0cb6624f8a3462455e911a87adc981b7c49",
+          "claim": "Python 重探錯誤清單不含 POST_LOGIN_CMD_TIMEOUT。"
+        },
+        {
+          "path": "crates/sw-core/src/quiet_gate.rs",
+          "line": 297,
+          "end_line": 305,
+          "excerpt_sha256": "2ca1f2c6271efff7244583bf3ae7207e156bfbe90e15163f247746a1708ace72",
+          "claim": "console_unlock_env 只豁免登入 probe 的 boot quiet。"
+        }
+      ],
+      "condition": "內部 Tick 判定重探資格成立，且沒有前景或登入工作占用；這不是每次 Tick 都會送出的效果。",
+      "note": "一般需 RX 安靜 3 秒且 human 不活躍；退避 2 秒倍增至上限 15 秒、最多 10 次。READY 僅 pending 且 quiet 不擋時再確認；console unlock 只豁免登入 probe 的 quiet，不豁免 boot evidence 等待。DETACHED 重走開埠主路徑，有 bridge 則由執行器重用前述登入入口。實際對照的 Python 0.4.x 不會自動重探 POST_LOGIN_CMD_TIMEOUT；Rust 會。"
+    },
+    {
+      "id": "reprobe-finished",
+      "from": "login",
+      "to": "session",
+      "label": "回報重探驗證結果",
+      "phase": "條件分支：靜默與自動重探",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5408,
+          "end_line": 5414,
+          "excerpt_sha256": "b9b6bb071480d2b48f1d5d1b3f839ed39708217b4ca088a308a7a261b0056d12",
+          "claim": "同一登入 thread 以 LoginFinished 回報自動重探結果。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 6369,
+          "end_line": 6394,
+          "excerpt_sha256": "60d21c18efaaccaadfe19f7b33eccb05de55f8391580185dbee03c7ac59f114a",
+          "claim": "自動重探成功轉 READY 並確認，失敗回 ATTACHED，再進 finish_auto_reprobe。"
+        },
+        {
+          "path": "crates/sw-core/src/reprobe.rs",
+          "line": 255,
+          "end_line": 275,
+          "excerpt_sha256": "2426bfaf097a432ed6f9c7f979621f0d5d73ed5b1468db53fd459c730164f3c1",
+          "claim": "成功清重探進度；失敗記次數，pending 加確認次數，bootloader 證據使 BOOTLOADER_STUCK 並耗盡。"
+        },
+        {
+          "path": "crates/sw-core/src/quiet_gate.rs",
+          "line": 105,
+          "end_line": 119,
+          "excerpt_sha256": "0056c667e00dc8888a83cc20791c7d1b5af158e9ef9d3da1c8b54bb0a40d386a",
+          "claim": "再確認逾時或次數耗盡時清 pending、標記 failed。"
+        },
+        {
+          "path": "crates/sw-core/src/quiet_gate.rs",
+          "line": 342,
+          "end_line": 353,
+          "excerpt_sha256": "016b2ed1f886bd2c24c0b018a3493faad27c6bd8bb2dfd99c940ab3adb5468f6",
+          "claim": "failed 的對外命令 gate 回 READY_UNCONFIRMED，建議 self_test。"
+        }
+      ],
+      "condition": "前一步走既有 bridge 的自動重探，登入 thread 已結束且 run 有效；重新開埠分支則重走附掛及登入主路徑。",
+      "note": "成功清 quiet 與再確認 gate；失敗進退避，bootloader 證據可收斂為 BOOTLOADER_STUCK。READY 再確認達 300 秒或 5 次未成功會標 failed，agent 命令回 READY_UNCONFIRMED 並建議 self-test。"
+    },
+    {
+      "id": "recover-route",
+      "from": "service",
+      "to": "sessions",
+      "label": "路由 session.recover",
+      "phase": "條件分支：顯式救援",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 70,
+          "end_line": 76,
+          "excerpt_sha256": "0a551ced048b446d667d0943e3da22602c89db5167ee224ce74e53e3cdab11cf",
+          "claim": "操作端 recover 對應 session.recover，傳 timeout 與 force。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 952,
+          "end_line": 963,
+          "excerpt_sha256": "d7923cf47572b76b6640a3814a0a4d37554135807e30c857397938333217d4c7",
+          "claim": "Service 處理 session.recover，建立 Recover 請求。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 783,
+          "end_line": 788,
+          "excerpt_sha256": "4da83898b007b386b0db298986989966dfe8792e11c85951ffca96790e445e3b",
+          "claim": "Service 實際透過 manager 解析及路由。"
+        }
+      ],
+      "condition": "操作端另行呼叫 session.recover，可在需要救援時插入，不要求先走完自動重探。",
+      "note": "這是獨立 RPC 分支，CLI 呼叫方式由本頁操作端責任涵蓋；force 的意義由目前狀態決定。"
+    },
+    {
+      "id": "recover-dispatch",
+      "from": "sessions",
+      "to": "session",
+      "label": "傳遞 Recover 並選計畫",
+      "phase": "條件分支：顯式救援",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2044,
+          "end_line": 2052,
+          "excerpt_sha256": "37a9eee2c62817aa8a84d396b966606fd418a459360b089fa9359b30a2cc69f2",
+          "claim": "manager 將 Recover 請求送入對應 actor。"
+        },
+        {
+          "path": "crates/sw-core/src/recover.rs",
+          "line": 47,
+          "end_line": 63,
+          "excerpt_sha256": "5b5725bc94bcd5bda723e1af30c74cd2180c4c5f3751b916ad6960edb40dd9da",
+          "claim": "drain、RELEASED、FLASHING 優先回各自狀態，不啟動救援工作。"
+        },
+        {
+          "path": "crates/sw-core/src/recover.rs",
+          "line": 64,
+          "end_line": 78,
+          "excerpt_sha256": "83269fdc5f671086022737342a4b123aefe83ad3c3e9ffc5b06677abb67e30ba",
+          "claim": "無 bridge 依裝置存在與否重新附掛；ATTACHED 依 force 選清除或重探；READY 一律先送救援鍵。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8200,
+          "end_line": 8203,
+          "excerpt_sha256": "d06a5188f38ce1b1633641e0efa77de0cbb95e6785d4cbd8ab3cffb64b8643b0",
+          "claim": "通過早退分類的人工 recover 重置重探進度與帳密告警。"
+        }
+      ],
+      "condition": "recover selector 可解析。",
+      "note": "drain 中回 SESSION_RECOVERING；RELEASED 建議 device.attach；FLASHING 回 FLASHING_BUSY。無 bridge 且裝置在線選重新附掛；ATTACHED 非 force 選重探、force 選 clear；READY 即使 force=true 也先走救援鍵。"
+    },
+    {
+      "id": "recover-effects",
+      "from": "session",
+      "to": "sessions",
+      "label": "委派救援計畫效果",
+      "phase": "條件分支：顯式救援",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8263,
+          "end_line": 8285,
+          "excerpt_sha256": "90ee0aaa4860816fd3b70f361f31edffdbe72fd92f0d9bee8c9a3404806a531b",
+          "claim": "重新附掛發 OpenBridge；Force 撤銷舊 agent lease 後 clear；Reprobe 撤銷舊 lease 後重探。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8287,
+          "end_line": 8298,
+          "excerpt_sha256": "74bcb3c96848d311df273fcba34b29a7a2d5c269894a5e4061a84b1fa6c0a9fb",
+          "claim": "READY recover 撤銷舊 agent lease，建立 side op 並發 StartOp(Recover)。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 5790,
+          "end_line": 5797,
+          "excerpt_sha256": "fa9bc37d0115296eb9786c4697ae2c34779847bb998d445264567acc4aa14cc4",
+          "claim": "既有 bridge 重探在 quiet 或 boot evidence 等待中零 TX 回覆。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 5815,
+          "end_line": 5827,
+          "excerpt_sha256": "43ef858b6512ffc08d0b5f1d360549627b2976c518f099340f13baaf0148c04b",
+          "claim": "既有 bridge 重探產生 StartLogin 並保留等待回覆者。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5326,
+          "end_line": 5347,
+          "excerpt_sha256": "7ab2ae92169a24d947067bf72db6864d0023fbd035008491efd1cd7e96c0efee",
+          "claim": "StartOp 執行器取得或建立 OpRunner 並呼叫 run。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 903,
+          "end_line": 916,
+          "excerpt_sha256": "4230079105abb6470777ef37913aba4d1a0115de7aa93154b4d890d3ddec3bb6",
+          "claim": "READY 救援依序送 CTRL_C、CTRL_D，quiet 或再確認 gate 拒絕時停止。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 956,
+          "end_line": 964,
+          "excerpt_sha256": "1a3f467edfa714fa78814a383b11b4513cb9463fde7a6b2eb8cf1a63337d7e1f",
+          "claim": "每鍵等至多 min(timeout_s,2 秒)，prompt 回來算 Recovered，否則 PromptTimeout。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 897,
+          "end_line": 900,
+          "excerpt_sha256": "befea1bbdf93ed6069ba84030d6e45b6fff96924e131b436491079b7696e3e38",
+          "claim": "passthrough 不送救援鍵，直接回 PromptTimeout。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8334,
+          "end_line": 8346,
+          "excerpt_sha256": "075c58a80f28fce08c2748867284a9473ee313413a9a69d645fce31945cccda2",
+          "claim": "force recover 啟動 clear drain，等待 clear 收尾後才開始輪詢。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8380,
+          "end_line": 8391,
+          "excerpt_sha256": "2cd13abbc144f8122a32916524635d373a13d487bea2370f3065c2e879eae678",
+          "claim": "force recover 輪詢 READY，達輪詢上限回終態。"
+        },
+        {
+          "path": "crates/sw-proto/src/constants.rs",
+          "line": 109,
+          "end_line": 112,
+          "excerpt_sha256": "7d5508a31642501f43058bc5e02ba5da496702503053c5f5c8dace38e9f26546",
+          "claim": "force recover 輪詢上限 10 次、間隔 1 秒。"
+        }
+      ],
+      "condition": "選定的計畫需要開埠、登入重探、clear 或 READY 救援操作。",
+      "note": "實際執行者仍是執行器啟動的開埠工作、登入 thread 或 OpRunner；TX/RX 共用主路徑。READY 救援先 Ctrl-C 再 Ctrl-D，各等至多 2 秒；passthrough 不送鍵。force 走 clear／重新附掛，clear 返回後每秒查 READY、最多 10 次；quiet 或 boot evidence 等待會讓既有 bridge 重探零 TX 返回。"
+    },
+    {
+      "id": "recover-finished",
+      "from": "runner",
+      "to": "session",
+      "label": "回報救援鍵結果",
+      "phase": "條件分支：顯式救援",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 124,
+          "end_line": 132,
+          "excerpt_sha256": "8f27d3d0aa3b12bd455181479630b51f1bb86d4d5aa65f23470c8eef9e09f734",
+          "claim": "OpRunner 實際發送 OpFinished。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8304,
+          "end_line": 8326,
+          "excerpt_sha256": "de5773d969b47445cc3b94b379d5b92c7b255f493a940e0c31817d6505a6db1b",
+          "claim": "救援鍵成功清佇列、回 PROMPT_TIMEOUT_RECOVERED 與 partial；兩鍵失敗的非 passthrough 轉 ATTACHED 並 force clear。"
+        },
+        {
+          "path": "crates/sw-core/src/recover.rs",
+          "line": 127,
+          "end_line": 146,
+          "excerpt_sha256": "a53a74d941bd24e98e2bd57eaff414d75e59194e83692ba5e478bfa8627921b8",
+          "claim": "直接 force 的回覆為 FORCE_CLEAR_REATTACH，未就緒時回 FORCE_RECOVER_TIMEOUT。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8428,
+          "end_line": 8442,
+          "excerpt_sha256": "b548c4e1d03cc34e6adaf5735430276ed30ed2c9f7f68ed3efcf8fb415e6febd",
+          "claim": "既有 bridge 重探的 recover 回覆帶 REPROBE、recovered 與未就緒時的 last_error。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8152,
+          "end_line": 8165,
+          "excerpt_sha256": "888e3a7be9d29008f57ae1bbdaebba8357697e8fb1cec583105c63b9b2c91fb0",
+          "claim": "恢復清列會 drain 佇列並以 FLUSHED_BY_RECOVERY 終結，detach 另解除佇列註冊。"
+        }
+      ],
+      "condition": "此箭頭只代表 READY 救援鍵的 OpRunner 完成事件；重探用 LoginFinished，force 由內部輪詢收斂。",
+      "note": "成功為 PROMPT_TIMEOUT_RECOVERED、partial=true，清掉等待命令而不重送。兩鍵失敗的非 passthrough 轉 ATTACHED，再 clear／重新附掛；直接 force 逾時回 FORCE_RECOVER_TIMEOUT。其他計畫的回覆由 actor 發 Reply，交執行器寫回原 RPC 等待通道。"
+    },
+    {
+      "id": "self-test-route",
+      "from": "service",
+      "to": "sessions",
+      "label": "路由 session.self_test",
+      "phase": "條件分支：健康自測",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-cli/src/commands/rpc_cmds.rs",
+          "line": 61,
+          "end_line": 67,
+          "excerpt_sha256": "57f2dc5611a840708158387f977ccfa23f9f1952ffe15699118841b014085dee",
+          "claim": "self-test CLI 映射 session.self_test 並傳探測 timeout 與 strict_human_lock。"
+        },
+        {
+          "path": "crates/sw-daemon/src/service.rs",
+          "line": 923,
+          "end_line": 938,
+          "excerpt_sha256": "d3cfe9bede455614e2315482ba4c7f92c052755bed2416f914c4147fc3b0276c",
+          "claim": "Service resolve selector 後呼叫 manager.route(SelfTest)。"
+        }
+      ],
+      "condition": "操作端另行要求 self-test；不要求先執行 recover。",
+      "note": "這是獨立的診斷 RPC；strict_human_lock 會影響 human lease 的前置分類。"
+    },
+    {
+      "id": "self-test-classify",
+      "from": "sessions",
+      "to": "session",
+      "label": "傳遞 SelfTest 並分類",
+      "phase": "條件分支：健康自測",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 2044,
+          "end_line": 2052,
+          "excerpt_sha256": "37a9eee2c62817aa8a84d396b966606fd418a459360b089fa9359b30a2cc69f2",
+          "claim": "manager 實際向 actor 發請求。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8725,
+          "end_line": 8727,
+          "excerpt_sha256": "d498ecd19e1df0098983d242d9e99c20319a81a1760f55f0f49187b0cab548fc",
+          "claim": "self-test 前置分類能決定結果時，直接 Reply；否則才需要 probe。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8772,
+          "end_line": 8796,
+          "excerpt_sha256": "d88c6b2d87f863e5bda239d2335bcf5a7a8be7d12863c24ea637478023869105",
+          "claim": "RELEASED 回 holder 與 reclaimable，未知 holder 不可視為可收回。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8810,
+          "end_line": 8828,
+          "excerpt_sha256": "4f6593f83c8525c24afde5b84c0b932fdb8c504cf1ccaa5f7ae8f6d8d6adcc64",
+          "claim": "恢復中、strict human lock 與裝置缺漏均在 probe 前分類。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8842,
+          "end_line": 8858,
+          "excerpt_sha256": "146479a41808df5afeaf8e96e396506a3fac680342e2741da9f7883e2f34ac82",
+          "claim": "缺 bridge 或 bridge 不活躍時回 BRIDGE_DOWN，不 probe。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8911,
+          "end_line": 8914,
+          "excerpt_sha256": "7388f32b8ba4b674913dc889d62219a558aba479b3c49d14d9b620a0749be2ec",
+          "claim": "ATTACHED 的 LOGIN_REQUIRED 與 REBOOTING 依 last_error 直接分類。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8932,
+          "end_line": 8957,
+          "excerpt_sha256": "135ddb700fc113dc4172c2a505f81a9ce0b6a301c73bd0864f3d21e14113b2a7",
+          "claim": "ATTACHED 將 bootloader、RX_FLOOD 或 ATTACHED_NOT_READY 直接回報。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8959,
+          "end_line": 8975,
+          "excerpt_sha256": "5d42c963f1278c3c6d68840cc5cd8757dbdc161b93cdeecb7294b36f9fb17b57",
+          "claim": "quiet 或 boot evidence 等待中回 AUTOBOOT_QUIET，否則才回 NeedProbe。"
+        }
+      ],
+      "condition": "self-test selector 可解析。",
+      "note": "self-test 不等於附掛或登入：RELEASED、恢復中、裝置缺漏、bridge down、ATTACHED 與 quiet 等均可零 TX 回分類。ATTACHED 的 bootloader／登入需求會建議適當操作，不在此直接升 READY。"
+    },
+    {
+      "id": "self-test-probe",
+      "from": "session",
+      "to": "sessions",
+      "label": "委派 SelfTestProbe",
+      "phase": "條件分支：健康自測",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8728,
+          "end_line": 8744,
+          "excerpt_sha256": "0f9a2e5cffe69fb4b9f5d3cd8e8f14d0a4642682765049094d935777842815f9",
+          "claim": "需要 probe 才建立 nonce、置換 ready_probe、取得 side op，並暫停 human raw。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8745,
+          "end_line": 8763,
+          "excerpt_sha256": "1b0ee5dfbb30501b94f2058f64b1caa0a8e402c8cd02fc8c65ccb7792006c61d",
+          "claim": "actor 保存等待者與 suspend 資訊，發出 StartOp(SelfTestProbe)。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5326,
+          "end_line": 5347,
+          "excerpt_sha256": "7ab2ae92169a24d947067bf72db6864d0023fbd035008491efd1cd7e96c0efee",
+          "claim": "執行器把 StartOp 交給 OpRunner。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 975,
+          "end_line": 985,
+          "excerpt_sha256": "0643066e8385c0cd5b7720bd9f80a300f9496ff28228410d4fcd140d1e8adfc2",
+          "claim": "OpRunner 以 SelfTestProbe 類別送 ready_probe，來源 system:self_test。"
+        }
+      ],
+      "condition": "前置分類回 NeedProbe，才由效果執行器啟動 OpRunner。",
+      "note": "可與前景命令並行；有 human raw 時只暫停該次 probe 所需的輸入模式。這是 OpRunner 的診斷 side op，與登入 thread 的 Probe 不同。"
+    },
+    {
+      "id": "self-test-finished",
+      "from": "runner",
+      "to": "session",
+      "label": "回報自測分類結果",
+      "phase": "條件分支：健康自測",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 999,
+          "end_line": 1009,
+          "excerpt_sha256": "bce423b5186eca306548afbdb1f611af0c39c08e78a627f9257d21b318daf821",
+          "claim": "self-test 等 nonce，逾時記 probe_ok=false；nonce 成功後雖等 prompt，但忽略結果並回 probe_ok=true。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 124,
+          "end_line": 132,
+          "excerpt_sha256": "8f27d3d0aa3b12bd455181479630b51f1bb86d4d5aa65f23470c8eef9e09f734",
+          "claim": "OpRunner 實際將結果透過 OpFinished 發回 actor。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8025,
+          "end_line": 8043,
+          "excerpt_sha256": "e9e2a0138de7d52f3557b54572b49f6aa581932bd9a6465bd1ec065ec0f30321",
+          "claim": "quiet 拒絕回 AUTOBOOT_QUIET；有效 probe 成功 confirm_ready，最後 Reply 自測分類。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8648,
+          "end_line": 8659,
+          "excerpt_sha256": "9d0d0b1a5f5aed360f3601c321ae237f7cdd0880ef2d6a285e1dacf9ecfbd652",
+          "claim": "probe 成功回分類 OK。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8665,
+          "end_line": 8686,
+          "excerpt_sha256": "b6cc60e82d94567a41aa943ad8fe6d5ceedd551f21568bba21ae54e5afef65c9",
+          "claim": "nonce 失敗依 RX 量分 RX_FLOOD 或 TARGET_UNRESPONSIVE。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 7843,
+          "end_line": 7856,
+          "excerpt_sha256": "c8d1b55771d7cdcbcc6eec23828fa3634eedf70ca585f3cdb345445c003673d2",
+          "claim": "side op 完成後只恢復自己暫停的 human，settle TX 並嘗試後續命令。"
+        }
+      ],
+      "condition": "SelfTestProbe 已完成；只有有效當前 op 的成功結果可以 confirm_ready。",
+      "note": "nonce 成功後的 prompt 等待結果被忽略，所以 OK 不代表該次已匹配 prompt。成功會清再確認 gate；失敗依 RX 量回 RX_FLOOD 或 TARGET_UNRESPONSIVE。actor 回覆分類並恢復本次暫停的 human；此路徑不執行登入狀態機。"
+    },
+    {
+      "id": "reboot-tx",
+      "from": "runner",
+      "to": "bridge",
+      "label": "提交重開機命令",
+      "phase": "條件分支：重開機後恢復",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 828,
+          "end_line": 851,
+          "excerpt_sha256": "94d743138ebfd8890e47f739812a4648b2e5e7f8004c9bae98404754bd7a66ba",
+          "claim": "run_reboot 以原命令組 payload，經 send 提交到 writer。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 565,
+          "end_line": 574,
+          "excerpt_sha256": "465cd43c66c45d8763cbead04d5f7b7016766342296a57de574ddd2decbe9d1c",
+          "claim": "send 實際向 writer jobs 通道送 TxJob 並等回條。"
+        },
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1091,
+          "end_line": 1107,
+          "excerpt_sha256": "942cda296f322548337ede1e8eeebaac3f4d8dc3e4825e849df9d12d9efd27d5",
+          "claim": "reboot arm op 的 Command 或 HumanLine 確認有提交或 Unknown 時，writer 同鎖發布 quiet 與 reconfirm_pending。"
+        }
+      ],
+      "condition": "已經 01-command-exec 的命令排程進入 run_reboot，例如獨立 reboot 命令或 expect_reboot；本頁不重畫提交與出列。",
+      "note": "writer 在已提交 bytes 或結果不明時先發布 gate，避免 actor 尚未處理事件前又有危險 TX；零提交不 arm。完整命令 TX 與結果錯誤映射見命令執行頁。"
+    },
+    {
+      "id": "reboot-tx-settled",
+      "from": "bridge",
+      "to": "session",
+      "label": "回報 UartTxCompleted",
+      "phase": "條件分支：重開機後恢復",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/tx_writer.rs",
+          "line": 1205,
+          "end_line": 1218,
+          "excerpt_sha256": "dc6a02c09d13e1e8f07d06b607dc8a652b4e7f4a41ce919f490455b5e324e94b",
+          "claim": "writer 先送 UartTxCompleted 給 actor，再把 TxReport 回原 sender。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 5966,
+          "end_line": 5983,
+          "excerpt_sha256": "2a5d668cea9d5b2bdfe6a25d4795fbd0c70cc3183f6671ec1eef23fac017eb6a",
+          "claim": "actor 核對目前前景 reboot op；有確認 bytes 或 Unknown 才 arm quiet、使舊輸入失效並同步 gate。"
+        }
+      ],
+      "condition": "前景 reboot 的 TX 結算事件屬於當前 epoch 與 op，且有確認提交 bytes 或結果不明。",
+      "note": "180 秒 quiet 與再確認由 actor 完整設時；writer 的先行 gate 與此事件共同封住提交點至事件收斂間的空窗。"
+    },
+    {
+      "id": "reboot-expected",
+      "from": "runner",
+      "to": "session",
+      "label": "回報重開機等待結果",
+      "phase": "條件分支：重開機後恢復",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 860,
+          "end_line": 879,
+          "excerpt_sha256": "e6234b931723ac5d3a26c1bb24c406a06cf82bf3dcb2096d7e75e698dbcc1edb",
+          "claim": "run_reboot 在指定等待期間 prompt 回來則一般成功，否則回 RebootExpected。"
+        },
+        {
+          "path": "crates/sw-core/src/op_runner.rs",
+          "line": 124,
+          "end_line": 132,
+          "excerpt_sha256": "8f27d3d0aa3b12bd455181479630b51f1bb86d4d5aa65f23470c8eef9e09f734",
+          "claim": "OpRunner 以 OpFinished 回報 outcome。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8111,
+          "end_line": 8138,
+          "excerpt_sha256": "0c828abca9902b7c59386d50d768f365317be5606838fe69be66fe423a195f94",
+          "claim": "可信 human 的 RebootExpected 改人類互動；其他來源轉 RECOVERING、清列並建立有期限的 reboot recovery。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8066,
+          "end_line": 8078,
+          "excerpt_sha256": "d9f258bd4e81f7bdd58e829cc7c239a154f85ee4e0e7a6ae8fb1f0549adef2a3",
+          "claim": "reboot 命令一般成功時只 clear_quiet 並解除 quiet fence；ready reconfirm 保留。"
+        },
+        {
+          "path": "crates/sw-core/src/quiet_gate.rs",
+          "line": 148,
+          "end_line": 161,
+          "excerpt_sha256": "032eafbb6e0c8bd5a1c958db37db198cc738eabc2326d9e63efe5e0ad49474cd",
+          "claim": "begin_boot_evidence_wait 設 60 秒寬限；banner 清等待；寬限不延長再確認期限。"
+        },
+        {
+          "path": "crates/sw-core/src/quiet_gate.rs",
+          "line": 30,
+          "end_line": 31,
+          "excerpt_sha256": "3bb93cbdd2260d5af2ccd94b97a92d1238f2f3ac293b672de75d691001559ffa",
+          "claim": "BOOT_EVIDENCE_GRACE_NS 取 BOOT_EVIDENCE_GRACE_S。"
+        },
+        {
+          "path": "crates/sw-proto/src/constants.rs",
+          "line": 183,
+          "end_line": 184,
+          "excerpt_sha256": "3c4df5accef27c85e4f92b07dd6def1401793eb65ab127b825d8111f22ab22ff",
+          "claim": "非同步 reboot 的 boot evidence 寬限為 60 秒。"
+        }
+      ],
+      "condition": "reboot TX 完整成功且 prompt 等待結束；只有非可信 human 的 RebootExpected 進入下方自動恢復。",
+      "note": "期限內 prompt 回來可先回一般成功，但只清 TX quiet、保留再確認，並開始 60 秒 boot evidence 等待；重探及 self-test 等 banner 或寬限到期，避免舊 shell 被誤認為已重開。未回 prompt 的 agent 命令回 partial=true、status=recovering，session 進 RECOVERING 並清佇列。可信 human 分支改交人類 lease，不進此自動登入。"
+    },
+    {
+      "id": "reboot-relogin",
+      "from": "session",
+      "to": "sessions",
+      "label": "委派重開機後登入",
+      "phase": "條件分支：重開機後恢復",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8487,
+          "end_line": 8508,
+          "excerpt_sha256": "8b011afa4bbc80798241bb69cfca76abafabd504b47c8c4c08cbc065f72bf17c",
+          "claim": "reboot recovery 有效且無停止或登入在途才進行；quiet 可延長 deadline 至 cap，非 quiet 時每秒排一次嘗試。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8512,
+          "end_line": 8537,
+          "excerpt_sha256": "0f490f45ee9f4a409ab232e95625f6574d7ce9709126b62868d448512db3d427",
+          "claim": "每次解析帳密；未解析時收尾，否則建立 RebootRecovery run，發 EnsureReady 的 StartLogin。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6210,
+          "end_line": 6214,
+          "excerpt_sha256": "c8a25f2ec21e22e6d7af96cb9392afa208beb2872b470d7bebbe8f0f2ff9eb3e",
+          "claim": "執行器接 StartLogin 並啟動共用登入入口。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8122,
+          "end_line": 8129,
+          "excerpt_sha256": "30d3aa17ed827d5b285751b6d30e0264457d494c8739e540eec0da734c1c7004",
+          "claim": "初始 deadline 為 hard_timeout，cap 為 quiet window 加 hard_timeout。"
+        }
+      ],
+      "condition": "仍在 RECOVERING，quiet 不擋登入、無停止與登入在途、未達期限且下次嘗試已到；可由收尾當下或後續內部 Tick 觸發。",
+      "note": "執行器重用 launch-login 所示的登入 thread；不是 OpRunner::RebootRecovery。quiet 可把恢復期限延至 quiet 結束後再給 hard_timeout，但最多到最初的 180 秒加 hard_timeout；其餘失敗可在期限內繼續嘗試。"
+    },
+    {
+      "id": "reboot-login-finished",
+      "from": "login",
+      "to": "session",
+      "label": "回報恢復登入結果",
+      "phase": "條件分支：重開機後恢復",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 5408,
+          "end_line": 5414,
+          "excerpt_sha256": "b9b6bb071480d2b48f1d5d1b3f839ed39708217b4ca088a308a7a261b0056d12",
+          "claim": "登入 thread 以 LoginFinished 回 actor。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8546,
+          "end_line": 8548,
+          "excerpt_sha256": "ba7141585a765988705cb17785a801114eff6bb9b7ba758fa77b812a76a6502e",
+          "claim": "reboot 登入完成先清 run，只收當前 epoch 且仍在 RECOVERING 的結果。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8570,
+          "end_line": 8594,
+          "excerpt_sha256": "042025a42993773695d0b3b19dd0deb2ca62f95849645b502943c7628d32e4da",
+          "claim": "成功轉 READY 並確認；失敗保留錯誤，取消繼續等待而不記錯。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8550,
+          "end_line": 8568,
+          "excerpt_sha256": "466a530a0931efba0b1031b23323540ef2dc0772a2eac5e825e12ff08ad89ff6",
+          "claim": "reboot recovery 的登入例外設 RECOVERY_ERROR 並告警，繼續等待逾時。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8598,
+          "end_line": 8611,
+          "excerpt_sha256": "87e66faf70232a2fbd4e538560c6fbc407d8e3f92124cad0fc144035e5cb7f02",
+          "claim": "恢復逾時時，有 bridge 回 ATTACHED，無 bridge 回 DETACHED，必要時記 RECOVERY_TIMEOUT。"
+        }
+      ],
+      "condition": "本次 reboot recovery 登入工作結束；未成功且仍有期限時回到上一個條件式嘗試。",
+      "note": "成功才回 READY 並解除 quiet／再確認；例外記 RECOVERY_ERROR 後可續試。整體期限到時，有 bridge 留 ATTACHED、無 bridge 留 DETACHED；僅在尚無其他錯誤時補 RECOVERY_TIMEOUT（無 bridge 一律設此碼）。"
+    },
+    {
+      "id": "reboot-ready",
+      "from": "session",
+      "to": "sessions",
+      "label": "通報恢復完成",
+      "phase": "條件分支：重開機後恢復",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8571,
+          "end_line": 8584,
+          "excerpt_sha256": "de2015dc84e9285152433fb3415a961a5c86880ca49d70c3637a594cfc2a4d48",
+          "claim": "reboot 登入成功清 recovering、pending_auto_login，註冊佇列並通報 SessionReady。"
+        },
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 6273,
+          "end_line": 6275,
+          "excerpt_sha256": "6024d7cddf0fce2c54ce2fcd10fd406cbc38dba549dc70efc0349a0effb1eb2d",
+          "claim": "SessionReady 由效果執行器送 manager note 通道。"
+        },
+        {
+          "path": "crates/sw-core/src/session_core.rs",
+          "line": 8152,
+          "end_line": 8165,
+          "excerpt_sha256": "888e3a7be9d29008f57ae1bbdaebba8357697e8fb1cec583105c63b9b2c91fb0",
+          "claim": "重開機時清佇列是移除及終結等待命令，沒有恢復後重送機制。"
+        }
+      ],
+      "condition": "reboot recovery 登入成功，狀態已回 READY。",
+      "note": "manager 收到內部 SessionReady；先前已清掉的等待命令不會因恢復成功而自動重送。"
+    }
+  ],
+  "unknowns": [
+    {
+      "id": "python-baseline-not-compared",
+      "question": "本頁僅實際對照 Python 0.4.x 的 _is_reprobe_prompt_error 錯誤資格、arm_boot_quiet 與 _update_boot_quiet_locked 的 quiet／世代處理；其餘 attach、帳密登入、解鎖、自測、recover 與 reboot recovery 沒有逐步比對。",
+      "impact": "未註記差異的步驟只代表 Rust 實作，不代表已證明與 Python 0.4.x 相同。"
+    },
+    {
+      "id": "runtime-and-dut-not-verified",
+      "question": "本次僅讀固定 revision，未在 Linux、原生 Windows 或實際 DUT 執行附掛、登入、重開機及救援，也未執行測試或 daemon。",
+      "impact": "平台與流程結論是原始碼證據，不能用作執行期時序、真實登入成功率或實機恢復完成的證據。"
+    },
+    {
+      "id": "rx-causal-attribution",
+      "question": "nonce 與 prompt 是共享 RX 視窗的 regex 比對；本次未量測回顯、舊 prompt、人類輸入及開機 RX 交錯對具體 DUT 的影響。",
+      "impact": "登入或自測的成功表示程式所需比對成立；不額外保證 RX 因果歸屬或裝置整體健康。"
+    }
+  ],
+  "conflicts": []
+}

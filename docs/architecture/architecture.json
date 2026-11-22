@@ -2,13 +2,13 @@
   "schema_version": 1,
   "diagram_type": "architecture",
   "meta": {
-    "title": "serialwrap 0.5.0｜命令、Session 與 UART",
+    "title": "serialwrap 架構總覽｜命令、Session 與 UART",
     "locale": "zh-TW",
     "output": "docs/architecture/architecture.html",
     "quality_profile": "showcase",
     "repository": {
       "url": "https://github.com/hamanpaul/serialwrap",
-      "revision": "85a16533a329a2a7d76b025de3762a82a4cd0472",
+      "revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347",
       "provider": "github"
     }
   },
@@ -36,11 +36,11 @@
         }
       ],
       "pos": [
-        532,
-        290
+        551,
+        280
       ],
       "size": [
-        136,
+        134,
         56
       ]
     },
@@ -48,12 +48,12 @@
       "id": "bridge",
       "type": "backend",
       "label": "5 UART bridge",
-      "sublabel": "IoWorker：termios｜COM",
+      "sublabel": "IoWorker：reader＋TxWriter",
       "sources": [
         {
           "path": "crates/sw-core/src/tx_writer.rs",
-          "line": 883,
-          "end_line": 971
+          "line": 1049,
+          "end_line": 1137
         },
         {
           "path": "crates/sw-core/src/uart_bridge.rs",
@@ -67,11 +67,11 @@
         }
       ],
       "pos": [
-        1008,
-        290
+        1094,
+        280
       ],
       "size": [
-        160,
+        200,
         56
       ]
     },
@@ -98,11 +98,11 @@
         }
       ],
       "pos": [
-        518,
-        536
+        407,
+        150
       ],
       "size": [
-        136,
+        134,
         56
       ]
     },
@@ -129,11 +129,11 @@
         }
       ],
       "pos": [
-        24,
-        290
+        37,
+        280
       ],
       "size": [
-        136,
+        134,
         56
       ]
     },
@@ -160,11 +160,11 @@
         }
       ],
       "pos": [
-        416,
-        416
+        407,
+        410
       ],
       "size": [
-        136,
+        134,
         56
       ]
     },
@@ -172,7 +172,7 @@
       "id": "console-hub",
       "type": "backend",
       "label": "ConsoleHub",
-      "sublabel": "PTY｜TCP Telnet",
+      "sublabel": "RX fan-out／輸入",
       "sources": [
         {
           "path": "crates/sw-core/src/human_console/hub.rs",
@@ -191,11 +191,11 @@
         }
       ],
       "pos": [
-        1004,
-        536
+        983,
+        40
       ],
       "size": [
-        136,
+        134,
         56
       ]
     },
@@ -203,8 +203,13 @@
       "id": "daemon-main",
       "type": "backend",
       "label": "serialwrapd 主流程",
-      "sublabel": "鎖：flock｜LockFileEx",
+      "sublabel": "啟動序／停止序",
       "sources": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 8515,
+          "end_line": 8527
+        },
         {
           "path": "crates/sw-daemon/src/daemon_main.rs",
           "line": 1219,
@@ -212,21 +217,16 @@
         },
         {
           "path": "crates/sw-daemon/src/daemon_main.rs",
-          "line": 1384,
-          "end_line": 1392
-        },
-        {
-          "path": "crates/sw-daemon/src/daemon_main.rs",
-          "line": 1428,
-          "end_line": 1463
+          "line": 1280,
+          "end_line": 1299
         }
       ],
       "pos": [
-        24,
-        156
+        551,
+        540
       ],
       "size": [
-        136,
+        134,
         56
       ]
     },
@@ -253,11 +253,11 @@
         }
       ],
       "pos": [
-        1168,
-        656
+        1453,
+        150
       ],
       "size": [
-        136,
+        134,
         56
       ]
     },
@@ -284,11 +284,11 @@
         }
       ],
       "pos": [
-        1168,
-        536
+        1271,
+        150
       ],
       "size": [
-        136,
+        134,
         56
       ]
     },
@@ -315,11 +315,11 @@
         }
       ],
       "pos": [
-        756,
-        290
+        839,
+        280
       ],
       "size": [
-        136,
+        134,
         56
       ]
     },
@@ -331,26 +331,26 @@
       "sources": [
         {
           "path": "crates/sw-core/src/tx_writer.rs",
-          "line": 86,
-          "end_line": 129
+          "line": 87,
+          "end_line": 134
         },
         {
           "path": "crates/sw-core/src/tx_writer.rs",
-          "line": 326,
-          "end_line": 414
+          "line": 322,
+          "end_line": 400
         },
         {
           "path": "crates/sw-core/src/tx_writer.rs",
-          "line": 429,
-          "end_line": 434
+          "line": 474,
+          "end_line": 567
         }
       ],
       "pos": [
-        1020,
-        156
+        983,
+        410
       ],
       "size": [
-        136,
+        134,
         56
       ]
     },
@@ -361,27 +361,27 @@
       "sublabel": "分段 base64／echo-ACK",
       "sources": [
         {
-          "path": "crates/sw-core/src/op_runner.rs",
-          "line": 434,
-          "end_line": 464
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 24,
+          "end_line": 27
         },
         {
-          "path": "crates/sw-core/src/session_core/file_xfer.rs",
-          "line": 1,
-          "end_line": 9
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 303,
+          "end_line": 355
         },
         {
-          "path": "crates/sw-core/src/session_core/file_xfer.rs",
-          "line": 39,
-          "end_line": 63
+          "path": "crates/sw-core/src/file_transfer/op_port.rs",
+          "line": 385,
+          "end_line": 393
         }
       ],
       "pos": [
-        110,
-        536
+        551,
+        40
       ],
       "size": [
-        136,
+        134,
         56
       ]
     },
@@ -389,7 +389,7 @@
       "id": "flasher",
       "type": "external",
       "label": "外部 flasher",
-      "sublabel": "ttyMCU｜已釋出裝置",
+      "sublabel": "ttyMCU 或已釋出的裝置",
       "sources": [
         {
           "path": "crates/sw-cli/src/cli_spec.rs",
@@ -408,11 +408,11 @@
         }
       ],
       "pos": [
-        1256,
-        10
+        1453,
+        540
       ],
       "size": [
-        136,
+        134,
         56
       ]
     },
@@ -439,11 +439,11 @@
         }
       ],
       "pos": [
-        1256,
-        156
+        1271,
+        410
       ],
       "size": [
-        136,
+        134,
         56
       ]
     },
@@ -451,7 +451,7 @@
       "id": "human",
       "type": "frontend",
       "label": "Human console",
-      "sublabel": "minicom｜Telnet 終端",
+      "sublabel": "終端程式",
       "sources": [
         {
           "path": "crates/sw-core/src/session_core/console.rs",
@@ -465,16 +465,16 @@
         },
         {
           "path": "crates/sw-core/src/session_manager.rs",
-          "line": 7697,
-          "end_line": 7743
+          "line": 7702,
+          "end_line": 7748
         }
       ],
       "pos": [
-        1004,
-        656
+        37,
+        150
       ],
       "size": [
-        136,
+        134,
         56
       ]
     },
@@ -501,48 +501,203 @@
         }
       ],
       "pos": [
-        904,
-        416
+        983,
+        150
       ],
       "size": [
-        136,
+        134,
         56
       ]
     },
     {
-      "id": "pal",
+      "id": "pal-console",
       "type": "backend",
-      "label": "sw-pal 平台後端",
-      "sublabel": "A｜B＝Linux｜Windows",
+      "label": "console 端點",
+      "sublabel": "PTY｜127.0.0.1 Telnet",
       "sources": [
         {
-          "path": "crates/sw-pal/src/lib.rs",
+          "path": "crates/sw-core/src/human_console/hub.rs",
+          "line": 288,
+          "end_line": 305
+        },
+        {
+          "path": "crates/sw-pal/src/console_pty.rs",
           "line": 1,
           "end_line": 4
         },
         {
-          "path": "crates/sw-pal/src/lib.rs",
-          "line": 108,
-          "end_line": 143
-        },
-        {
-          "path": "crates/sw-pal/src/lib.rs",
-          "line": 183,
-          "end_line": 293
+          "path": "crates/sw-pal/src/console_tcp.rs",
+          "line": 1,
+          "end_line": 2
         }
       ],
       "pos": [
-        24,
-        10
+        263,
+        688
       ],
       "size": [
-        136,
+        134,
+        56
+      ]
+    },
+    {
+      "id": "pal-devices",
+      "type": "backend",
+      "label": "裝置來源",
+      "sublabel": "by-id｜SERIALCOMM",
+      "sources": [
+        {
+          "path": "crates/sw-pal/src/device_source/posix.rs",
+          "line": 8,
+          "end_line": 12
+        },
+        {
+          "path": "crates/sw-pal/src/device_source/windows.rs",
+          "line": 14,
+          "end_line": 14
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 148,
+          "end_line": 177
+        }
+      ],
+      "pos": [
+        695,
+        688
+      ],
+      "size": [
+        134,
+        56
+      ]
+    },
+    {
+      "id": "pal-files",
+      "type": "backend",
+      "label": "檔案層／行程掃描",
+      "sublabel": "/proc｜Toolhelp32",
+      "sources": [
+        {
+          "path": "crates/sw-cli/src/commands/daemon_cmd.rs",
+          "line": 122,
+          "end_line": 128
+        },
+        {
+          "path": "crates/sw-cli/src/doctor_cmd.rs",
+          "line": 413,
+          "end_line": 418
+        },
+        {
+          "path": "crates/sw-pal/src/fs_ops/posix.rs",
+          "line": 42,
+          "end_line": 55
+        }
+      ],
+      "pos": [
+        983,
+        688
+      ],
+      "size": [
+        134,
+        56
+      ]
+    },
+    {
+      "id": "pal-lock",
+      "type": "security",
+      "label": "實例鎖",
+      "sublabel": "flock｜LockFileEx",
+      "sources": [
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1219,
+          "end_line": 1233
+        },
+        {
+          "path": "crates/sw-pal/src/lock/posix.rs",
+          "line": 46,
+          "end_line": 46
+        },
+        {
+          "path": "crates/sw-pal/src/lock/windows.rs",
+          "line": 79,
+          "end_line": 91
+        }
+      ],
+      "pos": [
+        551,
+        688
+      ],
+      "size": [
+        134,
+        56
+      ]
+    },
+    {
+      "id": "pal-rpc",
+      "type": "backend",
+      "label": "RPC transport",
+      "sublabel": "AF_UNIX／TCP｜TCP",
+      "sources": [
+        {
+          "path": "crates/sw-pal/src/rpc_transport/listener_posix.rs",
+          "line": 22,
+          "end_line": 27
+        },
+        {
+          "path": "crates/sw-pal/src/rpc_transport/listener_windows.rs",
+          "line": 19,
+          "end_line": 26
+        },
+        {
+          "path": "crates/sw-pal/src/rpc_transport/posix.rs",
+          "line": 52,
+          "end_line": 67
+        }
+      ],
+      "pos": [
+        839,
+        688
+      ],
+      "size": [
+        134,
+        56
+      ]
+    },
+    {
+      "id": "pal-serial",
+      "type": "backend",
+      "label": "序列埠",
+      "sublabel": "termios｜overlapped COM",
+      "sources": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 4942,
+          "end_line": 4952
+        },
+        {
+          "path": "crates/sw-pal/src/lib.rs",
+          "line": 122,
+          "end_line": 125
+        },
+        {
+          "path": "crates/sw-pal/src/serial/posix.rs",
+          "line": 54,
+          "end_line": 60
+        }
+      ],
+      "pos": [
+        1127,
+        688
+      ],
+      "size": [
+        134,
         56
       ]
     },
     {
       "id": "profiles",
-      "type": "external",
+      "type": "database",
       "label": "Profiles／契約",
       "sublabel": "prompt／probe／UART",
       "sources": [
@@ -552,22 +707,22 @@
           "end_line": 1200
         },
         {
-          "path": "crates/sw-proto/src/config_types.rs",
-          "line": 17,
-          "end_line": 71
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1280,
+          "end_line": 1299
         },
         {
           "path": "crates/sw-proto/src/config_types.rs",
-          "line": 73,
-          "end_line": 82
+          "line": 17,
+          "end_line": 71
         }
       ],
       "pos": [
-        466,
-        10
+        263,
+        410
       ],
       "size": [
-        136,
+        134,
         56
       ]
     },
@@ -594,11 +749,11 @@
         }
       ],
       "pos": [
-        650,
-        416
+        695,
+        150
       ],
       "size": [
-        136,
+        134,
         56
       ]
     },
@@ -606,7 +761,7 @@
       "id": "service",
       "type": "backend",
       "label": "2 RPC／Service",
-      "sublabel": "AF_UNIX｜TCP loopback",
+      "sublabel": "RpcServer／admission",
       "sources": [
         {
           "path": "crates/sw-daemon/src/framing.rs",
@@ -625,11 +780,11 @@
         }
       ],
       "pos": [
-        290,
-        290
+        263,
+        280
       ],
       "size": [
-        136,
+        134,
         56
       ]
     },
@@ -656,11 +811,11 @@
         }
       ],
       "pos": [
-        532,
-        156
+        695,
+        410
       ],
       "size": [
-        136,
+        134,
         56
       ]
     },
@@ -677,21 +832,21 @@
         },
         {
           "path": "crates/sw-core/src/session_manager.rs",
-          "line": 6746,
-          "end_line": 6785
+          "line": 6751,
+          "end_line": 6790
         },
         {
           "path": "crates/sw-core/src/session_manager.rs",
-          "line": 6796,
-          "end_line": 6822
+          "line": 6801,
+          "end_line": 6827
         }
       ],
       "pos": [
-        290,
-        156
+        263,
+        540
       ],
       "size": [
-        136,
+        134,
         56
       ]
     },
@@ -718,11 +873,11 @@
         }
       ],
       "pos": [
-        642,
-        10
+        839,
+        540
       ],
       "size": [
-        136,
+        134,
         56
       ]
     },
@@ -749,11 +904,11 @@
         }
       ],
       "pos": [
-        1256,
-        290
+        1453,
+        280
       ],
       "size": [
-        136,
+        134,
         56
       ]
     },
@@ -765,8 +920,8 @@
       "sources": [
         {
           "path": "crates/sw-core/src/tx_writer.rs",
-          "line": 958,
-          "end_line": 971
+          "line": 1124,
+          "end_line": 1137
         },
         {
           "path": "crates/sw-core/src/uart_bridge.rs",
@@ -775,16 +930,16 @@
         },
         {
           "path": "crates/sw-core/src/wal.rs",
-          "line": 466,
-          "end_line": 472
+          "line": 345,
+          "end_line": 350
         }
       ],
       "pos": [
-        1256,
-        416
+        983,
+        540
       ],
       "size": [
-        136,
+        134,
         56
       ]
     },
@@ -792,17 +947,17 @@
       "id": "watcher",
       "type": "backend",
       "label": "DeviceWatcher",
-      "sublabel": "by-id｜SERIALCOMM",
+      "sublabel": "Delta／Tick",
       "sources": [
         {
           "path": "crates/sw-core/src/session_manager.rs",
-          "line": 7804,
-          "end_line": 7807
+          "line": 7809,
+          "end_line": 7812
         },
         {
-          "path": "crates/sw-pal/src/device_source/windows.rs",
-          "line": 14,
-          "end_line": 14
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1392,
+          "end_line": 1392
         },
         {
           "path": "crates/sw-pal/src/device_watcher.rs",
@@ -811,34 +966,90 @@
         }
       ],
       "pos": [
-        290,
-        10
+        407,
+        540
       ],
       "size": [
-        136,
+        134,
         56
       ]
     }
   ],
-  "boundaries": [],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "serialwrapd（daemon 行程）",
+      "wraps": [
+        "arbiter",
+        "bridge",
+        "capture",
+        "command-records",
+        "console-hub",
+        "daemon-main",
+        "events",
+        "execute",
+        "fence",
+        "file-transfer",
+        "handoff",
+        "lease",
+        "profiles",
+        "recovery",
+        "service",
+        "session-actor",
+        "sessions",
+        "state-store",
+        "wal",
+        "watcher"
+      ],
+      "pad": 16
+    },
+    {
+      "kind": "region",
+      "label": "外部",
+      "wraps": [
+        "event-handler",
+        "flasher",
+        "target"
+      ],
+      "pad": 16
+    },
+    {
+      "kind": "region",
+      "label": "平台層 sw-pal（CLI 與 daemon 共用的函式庫）",
+      "wraps": [
+        "pal-console",
+        "pal-devices",
+        "pal-files",
+        "pal-lock",
+        "pal-rpc",
+        "pal-serial"
+      ],
+      "pad": 16
+    },
+    {
+      "kind": "region",
+      "label": "使用者端",
+      "wraps": [
+        "cli",
+        "human"
+      ],
+      "pad": 16
+    }
+  ],
   "connections": [
     {
       "id": "arbiter-to-capture",
       "from": "arbiter",
       "to": "capture",
       "label": "background 建立",
-      "variant": "dashed",
-      "fromSide": "bottom",
-      "toSide": "top"
+      "variant": "dashed"
     },
     {
       "id": "arbiter-to-command-records",
       "from": "arbiter",
       "to": "command-records",
       "label": "cmd_id／status",
-      "variant": "default",
-      "fromSide": "left",
-      "toSide": "top"
+      "variant": "default"
     },
     {
       "id": "arbiter-to-execute",
@@ -852,27 +1063,28 @@
       "from": "arbiter",
       "to": "lease",
       "label": "出列再驗 lease",
-      "variant": "dashed",
-      "fromSide": "bottom",
-      "toSide": "bottom"
+      "variant": "dashed"
     },
     {
       "id": "bridge-to-console-hub",
       "from": "bridge",
       "to": "console-hub",
       "label": "RX tap",
-      "variant": "dashed",
-      "fromSide": "bottom",
-      "toSide": "top"
+      "variant": "dashed"
     },
     {
       "id": "bridge-to-events",
       "from": "bridge",
       "to": "events",
       "label": "RX observer",
-      "variant": "dashed",
-      "fromSide": "bottom",
-      "toSide": "top"
+      "variant": "dashed"
+    },
+    {
+      "id": "bridge-to-pal-serial",
+      "from": "bridge",
+      "to": "pal-serial",
+      "label": "讀寫 handle",
+      "variant": "default"
     },
     {
       "id": "bridge-to-session-actor",
@@ -880,8 +1092,8 @@
       "to": "session-actor",
       "label": "RX chunk／IoError",
       "variant": "default",
-      "fromSide": "top",
-      "toSide": "bottom"
+      "fromSide": "bottom",
+      "toSide": "top"
     },
     {
       "id": "bridge-to-target",
@@ -895,18 +1107,56 @@
       "from": "bridge",
       "to": "wal",
       "label": "RX／TX ＋ seq",
-      "variant": "default",
-      "fromSide": "bottom",
-      "toSide": "top"
+      "variant": "default"
     },
     {
       "id": "capture-to-service",
       "from": "capture",
       "to": "service",
       "label": "result.tail 查詢",
+      "variant": "dashed"
+    },
+    {
+      "id": "cli-to-pal-files",
+      "from": "cli",
+      "to": "pal-files",
+      "label": "掃描 daemon 行程",
       "variant": "dashed",
       "fromSide": "left",
-      "toSide": "bottom"
+      "toSide": "bottom",
+      "via": [
+        [
+          10,
+          308
+        ],
+        [
+          10,
+          782
+        ],
+        [
+          1050,
+          782
+        ]
+      ]
+    },
+    {
+      "id": "cli-to-pal-rpc",
+      "from": "cli",
+      "to": "pal-rpc",
+      "label": "connect",
+      "variant": "default",
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "via": [
+        [
+          104,
+          768
+        ],
+        [
+          906,
+          768
+        ]
+      ]
     },
     {
       "id": "cli-to-service",
@@ -920,36 +1170,42 @@
       "from": "command-records",
       "to": "service",
       "label": "command.get 回讀",
-      "variant": "dashed",
-      "fromSide": "top",
-      "toSide": "bottom"
+      "variant": "dashed"
     },
     {
       "id": "console-hub-to-human",
       "from": "console-hub",
       "to": "human",
       "label": "RX fan-out",
-      "variant": "dashed",
-      "fromSide": "bottom",
-      "toSide": "top"
+      "variant": "dashed"
     },
     {
       "id": "console-hub-to-lease",
       "from": "console-hub",
       "to": "lease",
       "label": "ConsoleInput",
-      "variant": "default",
-      "fromSide": "left",
-      "toSide": "bottom"
+      "variant": "default"
+    },
+    {
+      "id": "daemon-main-to-pal-lock",
+      "from": "daemon-main",
+      "to": "pal-lock",
+      "label": "取得／釋放",
+      "variant": "default"
+    },
+    {
+      "id": "daemon-main-to-pal-rpc",
+      "from": "daemon-main",
+      "to": "pal-rpc",
+      "label": "bind listener",
+      "variant": "default"
     },
     {
       "id": "daemon-main-to-service",
       "from": "daemon-main",
       "to": "service",
       "label": "bind／stop_accept",
-      "variant": "default",
-      "fromSide": "bottom",
-      "toSide": "top"
+      "variant": "default"
     },
     {
       "id": "daemon-main-to-sessions",
@@ -957,17 +1213,15 @@
       "to": "sessions",
       "label": "bootstrap／drain",
       "variant": "default",
-      "fromSide": "right",
-      "toSide": "left"
+      "fromSide": "top",
+      "toSide": "top"
     },
     {
       "id": "events-to-event-handler",
       "from": "events",
       "to": "event-handler",
       "label": "命中規則才啟動",
-      "variant": "dashed",
-      "fromSide": "bottom",
-      "toSide": "top"
+      "variant": "dashed"
     },
     {
       "id": "execute-to-arbiter",
@@ -988,18 +1242,14 @@
       "from": "execute",
       "to": "recovery",
       "label": "prompt 未返回",
-      "variant": "dashed",
-      "fromSide": "bottom",
-      "toSide": "top"
+      "variant": "dashed"
     },
     {
       "id": "fence-to-bridge",
       "from": "fence",
       "to": "bridge",
       "label": "放行／拒絕 TX",
-      "variant": "security",
-      "fromSide": "bottom",
-      "toSide": "top"
+      "variant": "security"
     },
     {
       "id": "file-transfer-to-execute",
@@ -1007,98 +1257,57 @@
       "to": "execute",
       "label": "佔前景槽",
       "variant": "dashed",
-      "fromSide": "bottom",
-      "toSide": "bottom"
+      "fromSide": "right",
+      "toSide": "top"
     },
     {
       "id": "flasher-to-handoff",
       "from": "flasher",
       "to": "handoff",
-      "label": "sync bytes｜release",
-      "variant": "dashed",
-      "fromSide": "bottom",
-      "toSide": "top"
+      "label": "sync bytes／release",
+      "variant": "dashed"
     },
     {
       "id": "handoff-to-bridge",
       "from": "handoff",
       "to": "bridge",
       "label": "Flash／Probe TX",
-      "variant": "dashed",
-      "fromSide": "bottom",
-      "toSide": "top"
+      "variant": "dashed"
     },
     {
       "id": "handoff-to-session-actor",
       "from": "handoff",
       "to": "session-actor",
       "label": "FLASHING／RELEASED",
-      "variant": "dashed",
-      "fromSide": "left",
-      "toSide": "top",
-      "via": [
-        [
-          1206,
-          184
-        ],
-        [
-          1206,
-          140
-        ],
-        [
-          600,
-          140
-        ]
-      ]
+      "variant": "dashed"
     },
     {
       "id": "human-to-console-hub",
       "from": "human",
       "to": "console-hub",
       "label": "按鍵",
-      "variant": "default",
-      "fromSide": "top",
-      "toSide": "bottom"
+      "variant": "default"
     },
     {
       "id": "lease-to-bridge",
       "from": "lease",
       "to": "bridge",
       "label": "HumanRaw／Lease TX",
-      "variant": "dashed",
-      "fromSide": "top",
-      "toSide": "bottom"
-    },
-    {
-      "id": "pal-to-daemon-main",
-      "from": "pal",
-      "to": "daemon-main",
-      "label": "native() 後端",
-      "variant": "default",
-      "fromSide": "bottom",
-      "toSide": "top"
+      "variant": "dashed"
     },
     {
       "id": "profiles-to-sessions",
       "from": "profiles",
       "to": "sessions",
       "label": "載入 profile",
-      "variant": "default",
-      "fromSide": "bottom",
-      "toSide": "top"
+      "variant": "default"
     },
     {
       "id": "recovery-to-arbiter",
       "from": "recovery",
       "to": "arbiter",
       "label": "清列；不重送",
-      "variant": "dashed",
-      "fromSide": "left",
-      "toSide": "bottom",
-      "labelAt": [
-        672,
-        408
-      ]
+      "variant": "dashed"
     },
     {
       "id": "service-to-arbiter",
@@ -1113,26 +1322,22 @@
       "to": "file-transfer",
       "label": "file.push／pull",
       "variant": "dashed",
-      "fromSide": "bottom",
-      "toSide": "top"
+      "fromSide": "top",
+      "toSide": "left"
     },
     {
       "id": "service-to-sessions",
       "from": "service",
       "to": "sessions",
       "label": "resolve／route",
-      "variant": "dashed",
-      "fromSide": "top",
-      "toSide": "bottom"
+      "variant": "dashed"
     },
     {
       "id": "session-actor-to-arbiter",
       "from": "session-actor",
       "to": "arbiter",
       "label": "READY 註冊；detach 清列",
-      "variant": "dashed",
-      "fromSide": "bottom",
-      "toSide": "top"
+      "variant": "dashed"
     },
     {
       "id": "session-actor-to-bridge",
@@ -1140,43 +1345,64 @@
       "to": "bridge",
       "label": "開埠／登入／drain",
       "variant": "dashed",
-      "fromSide": "bottom",
-      "toSide": "top"
+      "fromSide": "top",
+      "toSide": "bottom"
     },
     {
       "id": "session-actor-to-fence",
       "from": "session-actor",
       "to": "fence",
       "label": "發布閘狀態",
-      "variant": "default",
-      "fromSide": "right",
-      "toSide": "left"
+      "variant": "default"
+    },
+    {
+      "id": "sessions-to-pal-console",
+      "from": "sessions",
+      "to": "pal-console",
+      "label": "建立 PTY",
+      "variant": "default"
     },
     {
       "id": "sessions-to-session-actor",
       "from": "sessions",
       "to": "session-actor",
       "label": "spawn／route",
-      "variant": "default",
-      "fromSide": "right",
-      "toSide": "left"
+      "variant": "default"
     },
     {
       "id": "sessions-to-state-store",
       "from": "sessions",
       "to": "state-store",
       "label": "原子儲存指定欄位",
-      "variant": "default",
-      "fromSide": "top",
-      "toSide": "bottom"
+      "variant": "default"
+    },
+    {
+      "id": "state-store-to-pal-files",
+      "from": "state-store",
+      "to": "pal-files",
+      "label": "atomic_write",
+      "variant": "default"
     },
     {
       "id": "target-to-bridge",
       "from": "target",
       "to": "bridge",
       "label": "RX bytes",
-      "variant": "default",
-      "labelDy": 12
+      "variant": "default"
+    },
+    {
+      "id": "wal-to-pal-files",
+      "from": "wal",
+      "to": "pal-files",
+      "label": "寫檔／輪替",
+      "variant": "default"
+    },
+    {
+      "id": "watcher-to-pal-devices",
+      "from": "watcher",
+      "to": "pal-devices",
+      "label": "輪詢",
+      "variant": "default"
     },
     {
       "id": "watcher-to-sessions",
@@ -1185,7 +1411,7 @@
       "label": "Delta／Tick",
       "variant": "default",
       "fromSide": "bottom",
-      "toSide": "top"
+      "toSide": "bottom"
     }
   ],
   "cards": []
