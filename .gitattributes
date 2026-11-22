@@ -29,3 +29,6 @@ evidence/stage1/od31-ev01-win/** -text -whitespace
 
 # pyre oracle 明確拒絕 CRLF；Windows checkout 必須維持語料位元組。
 scripts/rust/goldens/pyre_corpus.txt text eol=lf
+# 架構文件以位元組雜湊與逐位元組重建驗證（docs/architecture/toolchain.json）；加工工具與 skill 副本以 sha256 比對。跨平台檢出不得轉換行尾
+docs/architecture/** -text
+tools/architecture_overlay.py -text

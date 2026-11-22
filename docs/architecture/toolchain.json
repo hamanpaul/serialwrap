@@ -1,14 +1,31 @@
 {
-  "schema_version": 1,
-  "source_revision": "85a16533a329a2a7d76b025de3762a82a4cd0472",
+  "schema_version": 2,
   "skill_repository": "hamanpaul/custom-skills",
-  "skill_revision": "d27039296c8b6c1969ce2e8a68d899fd817237a7",
+  "skill_revision": "8fa377417445c503cf5f0db4f9b7ba50beb39b79",
   "archify_repository": "tt-a1i/archify",
   "archify_version": "3.2.0",
   "archify_revision": "208acba8d412335185b2056fedf54b3405df43fb",
-  "sha256": {
-    "facts.json": "323978f5426d6509fb752c6fce89f0d6224c0c78a879a977cdfe61b8f040ebc9",
-    "architecture.json": "56b0dbb19fb48128e37e0838cd317934989599ae9e3222766bb7e59e74470693",
-    "architecture.html": "80c1c0f784ed238828096cdd7ecaee7146c2fb02c600ccf41edabe427a5861fe"
+  "overlay": {
+    "tool": "tools/architecture_overlay.py",
+    "skill_path": "architecture-fact-layer/scripts/viewer_overlay.py",
+    "skill_revision": "8fa377417445c503cf5f0db4f9b7ba50beb39b79",
+    "version": 1,
+    "sha256": "44e5aaf4a028b4e28e54e2f8b6026a98e87449cde5b337fd71ee19cf632ce4aa"
+  },
+  "pages": {
+    "overview": {
+      "diagram_type": "architecture",
+      "source_revision": "12eb9a0ebead674a74bca58ffb0cd462074f0347",
+      "facts": "facts.json",
+      "ir": "architecture.json",
+      "html": "architecture.html",
+      "overlay_version": 1,
+      "sha256": {
+        "facts": "7b55c2d00c36a288f33f5ef7fa3ee73f0fcb6903137043594c287c0ea3c58e2b",
+        "ir": "176dc9e5e40f7c9a71be455d6a1d1c319675653fe96383f44e03f8fda72aae50",
+        "delivery": "78d773e353c1ea9485b46306557950a5a95f3fbb77623da048f11c8598816641",
+        "html": "325f944cce5550332ebad7c657c8f59c8f13e49aa29e72aebcbdfdc80c86427a"
+      }
+    }
   }
 }

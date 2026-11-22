@@ -254,7 +254,7 @@
       "id": "console-hub",
       "label": "ConsoleHub",
       "type": "backend",
-      "sublabel": "RX fan-out／console 輸入",
+      "sublabel": "RX fan-out／輸入",
       "responsibility": "每個 session 一條不阻塞的 hub 執行緒：把 reader tap 來的 RX fan-out 給各 console，把 console 輸入以 ConsoleInputBytes 送進 actor 的 data lane；Telnet 協商與 peer 掃描也在這裡。console 端點由平台層的 console 能力提供。hub 不決定 ownership，也不直接寫 UART。",
       "basis": "observed",
       "evidence": [
@@ -771,7 +771,7 @@
       "label": "console 端點",
       "type": "backend",
       "sublabel": "PTY｜127.0.0.1 Telnet",
-      "responsibility": "ConsoleTransportFactory：human console 的承接方式。Linux 建 PTY（minicom 開 slave），沒有 PTY 的 Windows 改為只綁 127.0.0.1 的 TCP＋Telnet listener（另可選 com0com）；ConsoleKind 由平台決定，業務碼不比較 OS 名稱。",
+      "responsibility": "ConsoleTransportFactory：human console 的承接方式；SessionManager 的 console_attach 以它建 PTY，ConsoleHub 以它建立 console 多工。Linux 建 PTY（minicom 開 slave），沒有 PTY 的 Windows 改為只綁 127.0.0.1 的 TCP＋Telnet listener（另可選 com0com）；ConsoleKind 由平台決定，業務碼不比較 OS 名稱。",
       "basis": "observed",
       "evidence": [
         {
@@ -808,7 +808,7 @@
       "id": "pal-devices",
       "label": "裝置來源",
       "type": "backend",
-      "sublabel": "by-id／by-path｜SERIALCOMM",
+      "sublabel": "by-id｜SERIALCOMM",
       "responsibility": "DeviceSource：列舉序列埠裝置。Linux 依序掃 /dev/serial/by-id 與 by-path 目錄；Windows 讀 HKLM SERIALCOMM registry，排除藍牙與設定中指定的 COM。",
       "basis": "observed",
       "evidence": [
@@ -839,7 +839,7 @@
       "id": "pal-files",
       "label": "檔案層／行程掃描",
       "type": "backend",
-      "sublabel": "原子寫檔；/proc｜Toolhelp32",
+      "sublabel": "/proc｜Toolhelp32",
       "responsibility": "FsOps 與 WalFs：state.json 的 atomic_write（暫存檔、fsync 後取代；Linux rename＋目錄 fsync｜Windows 取代並重試）與 WAL 檔案的建立、附加與輪替。ProcScan：列舉本機 serialwrapd 行程，Linux 掃 /proc｜Windows 用 Toolhelp32 快照；CLI 的 daemon start／status 與 doctor 以它偵測同機多開。",
       "basis": "observed",
       "evidence": [
@@ -922,7 +922,7 @@
       "id": "pal-rpc",
       "label": "RPC transport",
       "type": "backend",
-      "sublabel": "AF_UNIX＋TCP｜TCP loopback",
+      "sublabel": "AF_UNIX／TCP｜TCP",
       "responsibility": "RpcConnector 與 RpcListenerFactory：CLI 端 connect、daemon 端 bind／accept。Linux 支援 AF_UNIX（預設）與 TCP loopback；Windows 只有 TCP loopback，unix endpoint 回 Unsupported。",
       "basis": "observed",
       "evidence": [
@@ -1852,30 +1852,6 @@
       ]
     },
     {
-      "id": "console-hub-to-pal-console",
-      "from": "console-hub",
-      "to": "pal-console",
-      "label": "端點讀寫",
-      "variant": "default",
-      "basis": "observed",
-      "evidence": [
-        {
-          "path": "crates/sw-core/src/human_console/hub.rs",
-          "line": 288,
-          "end_line": 305,
-          "excerpt_sha256": "ed0293c2171f004ba620cd5735b88c12a390f4a14abf768f847dce782dbc0644",
-          "claim": "hub 以 platform.console 建立 console 多工。"
-        },
-        {
-          "path": "crates/sw-core/src/session_manager.rs",
-          "line": 7702,
-          "end_line": 7712,
-          "excerpt_sha256": "0b14b6e5de747f3545fb35e9322e9275a3fa154f650fed435298fce3211a5a2e",
-          "claim": "console_attach：PTY 後端先建 PTY 再交 hub。"
-        }
-      ]
-    },
-    {
       "id": "daemon-main-to-pal-lock",
       "from": "daemon-main",
       "to": "pal-lock",
@@ -2431,6 +2407,30 @@
           "end_line": 14,
           "excerpt_sha256": "500941cfb8832c14ef291b34db0d36631493b282fe500154fbec0ad7a82e944c",
           "claim": "probe／FLASHING 期間由 actor 設定 Fence 的 flash_mode，結束時無條件清除。"
+        }
+      ]
+    },
+    {
+      "id": "sessions-to-pal-console",
+      "from": "sessions",
+      "to": "pal-console",
+      "label": "建立 PTY",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "crates/sw-core/src/session_manager.rs",
+          "line": 7702,
+          "end_line": 7712,
+          "excerpt_sha256": "0b14b6e5de747f3545fb35e9322e9275a3fa154f650fed435298fce3211a5a2e",
+          "claim": "console_attach：PTY 後端在 RPC thread 先建 PTY，再交給 hub。"
+        },
+        {
+          "path": "crates/sw-daemon/src/daemon_main.rs",
+          "line": 1280,
+          "end_line": 1299,
+          "excerpt_sha256": "87a3aec7cf2917aba015e13fc771832167e8b13eb7de2063817e9408d46f3564",
+          "claim": "SessionManager 由 daemon 注入 Platform 的 console 工廠。"
         }
       ]
     },

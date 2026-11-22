@@ -3,9 +3,14 @@ on:
   pull_request:
     paths:
       - 'docs/architecture/**'
+      - 'docs/architecture/features/**'
+      - 'docs/architecture/pages.json'
       - 'tools/architecture_*.py'
+      - 'tools/architecture_overlay.py'
+      - 'tools/architecture_feature_check.py'
       - 'tests/test_architecture_docs.py'
       - 'README.md'
+      - '.gitattributes'
       - '.github/workflows/architecture-html.yml'
 permissions:
   contents: read
@@ -36,15 +41,25 @@ jobs:
       - run: python -m pip install pytest pyyaml playwright==1.64.1
       - run: python -m playwright install --with-deps chromium
       - run: sudo apt-get install -y fonts-noto-cjk
-      - name: 來源、語意負控制及逐位元組重建
+      - name: 來源、語意負控制、功能頁事實及逐位元組重建（原版交付＋加工）
         run: |
           python -m pytest -q tests/test_architecture_docs.py
+          python tools/architecture_feature_check.py --all
           python tools/architecture_review.py --archify-root .archify-engine/archify --output /tmp/serialwrap-architecture-review/delivery.json
-      - name: 實際 file 開啟與原生瀏覽器驗收
+      - name: 實際 file 開啟與原生瀏覽器驗收（總覽與已整合的功能頁；含滾輪與導覽列）
         run: |
-          python tools/architecture_browser.py --html docs/architecture/architecture.html --output /tmp/serialwrap-architecture-review
+          python tools/architecture_browser.py --all --output /tmp/serialwrap-architecture-review
           export ARCHIFY_CHROME="$(command -v google-chrome)"
-          node .archify-engine/archify/bin/archify.mjs visual-check docs/architecture/architecture.html --json --out-dir /tmp/serialwrap-architecture-review/visual-check > /tmp/serialwrap-architecture-review/visual-check.json
+          python - <<'PY'
+          import json, subprocess
+          pages = json.load(open('docs/architecture/toolchain.json', encoding='utf-8'))['pages']
+          for page_id, entry in pages.items():
+              out = f'/tmp/serialwrap-architecture-review/visual-check/{page_id}'
+              cp = subprocess.run(['node', '.archify-engine/archify/bin/archify.mjs', 'visual-check', f"docs/architecture/{entry['html']}",
+                                   '--json', '--out-dir', out], capture_output=True, text=True)
+              open(f'/tmp/serialwrap-architecture-review/visual-check-{page_id}.json', 'w').write(cp.stdout)
+              assert cp.returncode == 0, (page_id, cp.stdout[-2000:], cp.stderr[-2000:])
+          PY
       - uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
         if: always()
         with:

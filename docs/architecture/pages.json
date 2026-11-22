@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "labels": {
+    "nav": "功能導覽",
+    "wheel": "滾輪縮放",
+    "alt_wheel": "Alt＋滾輪縮放",
+    "missing": "尚未提供"
+  },
+  "overview": {
+    "id": "overview",
+    "title": "架構總覽",
+    "nav": "總覽",
+    "path": "architecture.html"
+  },
+  "features": [
+    {
+      "id": "01-command-exec",
+      "order": 1,
+      "title": "命令執行",
+      "nav": "命令",
+      "continuations": []
+    },
+    {
+      "id": "02-session-lifecycle",
+      "order": 2,
+      "title": "Session 生命週期",
+      "nav": "Session",
+      "continuations": []
+    },
+    {
+      "id": "03-device-mgmt",
+      "order": 3,
+      "title": "裝置管理",
+      "nav": "裝置",
+      "continuations": []
+    },
+    {
+      "id": "04-human-console",
+      "order": 4,
+      "title": "人類 console 共用",
+      "nav": "console",
+      "continuations": []
+    },
+    {
+      "id": "05-file-transfer",
+      "order": 5,
+      "title": "檔案傳輸",
+      "nav": "傳輸",
+      "continuations": []
+    },
+    {
+      "id": "06-mcu-flash",
+      "order": 6,
+      "title": "MCU 燒錄",
+      "nav": "燒錄",
+      "continuations": []
+    },
+    {
+      "id": "07-event-engine",
+      "order": 7,
+      "title": "事件引擎",
+      "nav": "事件",
+      "continuations": []
+    },
+    {
+      "id": "08-logs-evidence",
+      "order": 8,
+      "title": "紀錄與證據",
+      "nav": "紀錄",
+      "continuations": []
+    },
+    {
+      "id": "09-daemon-mgmt",
+      "order": 9,
+      "title": "daemon 管理",
+      "nav": "daemon",
+      "continuations": []
+    },
+    {
+      "id": "10-install-supervision",
+      "order": 10,
+      "title": "安裝與監管",
+      "nav": "安裝",
+      "continuations": []
+    },
+    {
+      "id": "11-remote-bench",
+      "order": 11,
+      "title": "遠端與測試台",
+      "nav": "遠端",
+      "continuations": []
+    },
+    {
+      "id": "12-config-tools",
+      "order": 12,
+      "title": "設定與工具",
+      "nav": "設定",
+      "continuations": []
+    },
+    {
+      "id": "13-cross-platform",
+      "order": 13,
+      "title": "跨平台",
+      "nav": "跨平台",
+      "continuations": []
+    }
+  ]
+}

@@ -5,7 +5,11 @@
 1. facts 結構（鍵集合、id 唯一、型別）。
 2. 每一條 evidence 在 repository.revision 上逐位元組成立（path、行範圍、excerpt_sha256；不得引用 docs/architecture/）。
 3. 每個 step 的 from／to 都是已宣告的 participant；participant 的 overview_component 必須是總覽 facts.json 的元件 id 或 null。
-4. IR 是 facts 的投影：
+4. 規格上限與禁止事項（docs/architecture/features/README.md）：參與者最多 8 個、步驟最多 30 個、每個 phase 至少兩則
+   訊息、sequence 的 variant 一律 default、不畫自畫箭頭（from == to）、IR 不設 meta.viewBox、頁面 id 必須列在
+   docs/architecture/pages.json（續頁 <NN>-<slug>-2 要列進該功能的 continuations）。
+   警告（不擋）：參與者 label 超過約 15 個寬度單位（CJK 算 2）；label／note／condition 出現「｜」但不是 Linux｜Windows 描述。
+5. IR 是 facts 的投影：
    - sequence：participants 的 id／label 與 facts 相同；messages 依序對應 facts.steps（id、from、to、label 逐字相同）；
      segments 的 label 必須是 facts.steps 用到的 phase。
    - workflow／architecture：節點 id 集合等於 participants、邊 id 集合等於 steps（from／to／label 逐字相同）。
@@ -14,7 +18,7 @@
 用法：
   python3 tools/architecture_feature_check.py docs/architecture/features/01-command-exec.facts.json
   python3 tools/architecture_feature_check.py --all
-退出碼：0 全部通過；1 有錯誤（逐條印出）。
+退出碼：0 全部通過（警告只印出、不擋）；1 有錯誤（逐條印出）。
 """
 from __future__ import annotations
 
@@ -29,6 +33,10 @@ from pathlib import Path, PurePosixPath
 REPO = Path(__file__).resolve().parents[1]
 FEATURES = REPO / "docs" / "architecture" / "features"
 OVERVIEW_FACTS = REPO / "docs" / "architecture" / "facts.json"
+PAGES = REPO / "docs" / "architecture" / "pages.json"
+MAX_PARTICIPANTS = 8
+MAX_STEPS = 30
+MAX_LABEL_UNITS = 15
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 REV_RE = re.compile(r"^[0-9a-f]{40}$")
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
@@ -39,8 +47,33 @@ DIAGRAM_TYPES = {"sequence", "workflow", "architecture"}
 
 
 class Problems(list):
+    """錯誤清單；warnings 另存，不影響退出碼。"""
+
+    def __init__(self):
+        super().__init__()
+        self.warnings: list[str] = []
+
     def add(self, where: str, msg: str) -> None:
         self.append(f"{where}: {msg}")
+
+    def warn(self, where: str, msg: str) -> None:
+        self.warnings.append(f"{where}: {msg}")
+
+
+def _units(text: str) -> int:
+    return sum(2 if ord(ch) > 0x2E80 else 1 for ch in text)
+
+
+def _bar_without_platform(text) -> bool:
+    return isinstance(text, str) and "｜" in text and "Linux" not in text and "Windows" not in text
+
+
+def _page_ids() -> set[str]:
+    try:
+        doc = json.loads(PAGES.read_text(encoding="utf-8"))
+        return {f["id"] for f in doc["features"]} | {c for f in doc["features"] for c in f["continuations"]}
+    except (OSError, ValueError, KeyError, TypeError):
+        return set()
 
 
 def _keys(obj, required: set[str], optional: set[str], where: str, probs: Problems) -> bool:
@@ -115,6 +148,9 @@ def check(facts_path: Path) -> Problems:
         probs.add(where, "檔名必須是 <兩位數序號>-<slug>.facts.json")
         return probs
     stem = facts_path.name[: -len(".facts.json")]
+    pages = _page_ids()
+    if pages and stem not in pages:
+        probs.add(where, "頁面 id 不在 docs/architecture/pages.json（續頁 <NN>-<slug>-2 要列進該功能的 continuations）")
     try:
         facts = json.loads(facts_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -155,6 +191,8 @@ def check(facts_path: Path) -> Problems:
         parts[p["id"]] = p
         if p["type"] not in TYPES:
             probs.add(w, f"type 必須是 {sorted(TYPES)} 之一")
+        if isinstance(p["label"], str) and _units(p["label"]) > MAX_LABEL_UNITS:
+            probs.warn(w, f"label 約 {_units(p['label'])} 個寬度單位，超過 {MAX_LABEL_UNITS}；細節請移到 sublabel")
         if p["overview_component"] is not None and overview and p["overview_component"] not in overview:
             probs.add(w, f"overview_component {p['overview_component']!r} 不在總覽 facts.json 的元件中")
         if p["basis"] not in BASES:
@@ -163,6 +201,8 @@ def check(facts_path: Path) -> Problems:
             _check_evidence(p["evidence"], revision, w, probs)
     if not parts:
         probs.add(f"{where}.participants", "不得為空")
+    if len(parts) > MAX_PARTICIPANTS:
+        probs.add(f"{where}.participants", f"{len(parts)} 個參與者，超過 {MAX_PARTICIPANTS}；合併儲存類參與者或拆成 <NN>-<slug>-2 續頁")
 
     steps: list[dict] = []
     seen: set[str] = set()
@@ -177,6 +217,13 @@ def check(facts_path: Path) -> Problems:
         for end in ("from", "to"):
             if s[end] not in parts:
                 probs.add(w, f"{end}={s[end]!r} 不是已宣告的 participant")
+        if s["from"] == s["to"]:
+            probs.add(w, "不畫自畫箭頭（from == to）：改用真實的回覆箭頭，或併進相鄰步驟的 note")
+        if facts["diagram_type"] == "sequence" and s.get("variant", "default") != "default":
+            probs.add(w, "sequence 的 variant 一律用 default")
+        for key in ("label", "note", "condition"):
+            if _bar_without_platform(s.get(key)):
+                probs.warn(w, f"{key} 有「｜」但不是 Linux｜Windows 描述；其他並列用「／」或「或」")
         if s["basis"] not in BASES:
             probs.add(w, "basis 必須是 observed 或 inferred")
         if s["basis"] == "inferred" and len(s["evidence"]) < 2:
@@ -186,6 +233,15 @@ def check(facts_path: Path) -> Problems:
         steps.append(s)
     if not steps:
         probs.add(f"{where}.steps", "不得為空")
+    if len(steps) > MAX_STEPS:
+        probs.add(f"{where}.steps", f"{len(steps)} 個步驟，超過 {MAX_STEPS}；拆成 <NN>-<slug>-2 續頁")
+    if facts["diagram_type"] == "sequence":
+        counts: dict[str, int] = {}
+        for s in steps:
+            counts[s.get("phase")] = counts.get(s.get("phase"), 0) + 1
+        for phase, n in counts.items():
+            if n < 2:
+                probs.add(f"{where}.steps", f"phase {phase!r} 只有 {n} 則訊息；每個 phase 至少兩則（否則 segment 標籤會重疊）")
 
     ir_path = facts_path.with_name(f"{stem}.json")
     if not ir_path.is_file():
@@ -204,6 +260,8 @@ def check(facts_path: Path) -> Problems:
         probs.add(f"{w}.meta.repository.revision", "必須等於 facts.repository.revision")
     if meta.get("locale") != "zh-TW":
         probs.add(f"{w}.meta.locale", "必須是 zh-TW")
+    if "viewBox" in meta:
+        probs.add(f"{w}.meta.viewBox", "不設 viewBox（v3.2.0 會觸發 desktop-readability／viewport-height）")
     want_out = f"docs/architecture/features/{stem}.html"
     if meta.get("output") != want_out:
         probs.add(f"{w}.meta.output", f"必須是 {want_out}")
@@ -221,6 +279,10 @@ def check(facts_path: Path) -> Problems:
             for k in ("from", "to", "label"):
                 if msg.get(k) != s[k]:
                     probs.add(w, f"message {s['id']} 的 {k} 與 facts 不同")
+            if msg.get("variant", "default") != "default":
+                probs.add(w, f"message {s['id']} 的 variant 必須是 default")
+            if _bar_without_platform(msg.get("note")):
+                probs.warn(w, f"message {s['id']} 的 note 有「｜」但不是 Linux｜Windows 描述")
         phases = {s["phase"] for s in steps}
         for seg in ir.get("segments", []):
             if seg.get("label") not in phases:
@@ -249,13 +311,16 @@ def main() -> int:
     targets = sorted(FEATURES.glob("*.facts.json")) if args.all else [p.resolve() for p in args.facts]
     if not targets:
         print("沒有要檢查的檔案", file=sys.stderr)
-        return 1
+        return 0 if args.all else 1
     total = Problems()
     for t in targets:
         probs = check(t)
-        print(f"{'OK ' if not probs else 'NG '} {t.name}" + ("" if not probs else f"（{len(probs)} 項）"))
+        print(f"{'OK ' if not probs else 'NG '} {t.name}" + ("" if not probs else f"（{len(probs)} 項）")
+              + ("" if not probs.warnings else f"，警告 {len(probs.warnings)} 項"))
         for p in probs:
             print(f"   - {p}")
+        for p in probs.warnings:
+            print(f"   ! {p}")
         total.extend(probs)
     return 1 if total else 0
 
