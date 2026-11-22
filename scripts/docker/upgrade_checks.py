@@ -87,8 +87,11 @@ ATTACHED_LEGACY_MAX_SETUP_S = 120.0
 
 PIPX_UNINSTALL_HINT = "pipx uninstall serialwrap"
 
-# 容器內沒有序列硬體（OD-15／OD-16 禁止把真實裝置帶進容器），doctor 的 devices advisory 必然為 0；其餘 advisory 須全綠。
-ALLOWED_ADVISORY_FAILURES = frozenset({"devices"})
+# 容器內沒有序列硬體（OD-15／OD-16 禁止把真實裝置帶進容器），doctor 的 devices advisory 必然為 0。
+# profile_template_fields：升級保留舊版 setup 寫下的線上 profile（setup 不覆寫），舊版缺的出貨欄位
+# （0.3.2 的 prpl-template 缺 boot_done_regex）在升級後必然被這個 advisory 列出——這正是它要提醒的情境，
+# 不是升級失敗。其餘 advisory 須全綠。
+ALLOWED_ADVISORY_FAILURES = frozenset({"devices", "profile_template_fields"})
 
 _DAEMON_NAMES = frozenset({"serialwrapd", "serialwrapd.exe", "serialwrapd.py"})
 

@@ -785,6 +785,12 @@ def test_doctor_green_requires_non_advisory_and_pairing():
     other_adv = json.loads(json.dumps(ok))
     other_adv["checks"].append({"check": "jq_on_path", "ok": False, "advisory": True})
     assert uc.judge_doctor("doctor_green_new", other_adv, require_pairing=True)["verdict"] == "FAIL"
+    # 升級保留舊版線上 profile：缺出貨欄位的 advisory 是預期提醒，不算升級失敗；改成非 advisory 仍 FAIL。
+    stale_profile = json.loads(json.dumps(ok))
+    stale_profile["checks"].append({"check": "profile_template_fields", "ok": False, "advisory": True})
+    assert uc.judge_doctor("doctor_green_new", stale_profile, require_pairing=True)["verdict"] == "PASS"
+    stale_profile["checks"][-1]["advisory"] = False
+    assert uc.judge_doctor("doctor_green_new", stale_profile, require_pairing=True)["verdict"] == "FAIL"
 
 
 # ---------- 整體 verdict ----------
