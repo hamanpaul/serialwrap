@@ -110,6 +110,6 @@ python3 tools/architecture_browser.py --all --output /tmp/serialwrap-architectur
 node /path/to/archify/archify/bin/archify.mjs visual-check docs/architecture/architecture.html --json --out-dir /tmp/serialwrap-architecture-review/visual-check
 ```
 
-`tools/architecture_review.py` 核對每一頁的雜湊、加工區塊與事實，並以同一份 IR 重新交付、套用加工後逐位元組比對。`tools/architecture_browser.py` 以 `file://` 開啟每一頁，核對節點與方向箭頭和 IR 一致；總覽在 1440×900、1600×1000、1920×1080、2048×1320 檢查沒有水平溢出、整張圖落在第一屏（Archify 3.x 的節點索引側欄不計入，與上游 `visual-check` 相同），功能頁檢查第一屏看得到標題、全部參與者表頭與第一個 phase；並驗滾輪縮放（或長頁的捲動與 `Alt`＋滾輪）、導覽列每個連結的目標檔存在、灰色項目不可點，最後實際點一次導覽列連結。
+`tools/architecture_review.py` 核對每一頁的雜湊、加工區塊與事實，並以同一份 IR 重新交付、套用加工後逐位元組比對。`tools/architecture_browser.py` 以 `file://` 開啟每一頁，核對節點與方向箭頭和 IR 一致；總覽在 1440×900、1600×1000、1920×1080、2048×1320 檢查沒有水平溢出、整張圖落在第一屏（Archify 3.x 的節點索引側欄不計入，與上游 `visual-check` 相同），功能頁檢查第一屏看得到標題、全部參與者表頭與第一個 phase；並驗導覽列依定位規則嵌入或退回一般區塊（見 [`features/README.md`](features/README.md)「HTML 加工規則」）且不蓋到標題、工具列與圖、滾輪縮放（或長頁的捲動與 `Alt`＋滾輪）、導覽列每個連結的目標檔存在、灰色項目不可點，最後實際點一次導覽列連結。
 
 來源／投影 gate、原生 9/9 delivery、逐位元組重建、file 瀏覽器驗證、看過像素、使用者驗收、實際 DUT 端到端測試是不同的宣稱。此文件不操作實際 UART，不以文件測試宣稱實機流程成功。永久 CI 僅具 `contents: read`。

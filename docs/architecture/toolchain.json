@@ -1,16 +1,16 @@
 {
   "schema_version": 2,
   "skill_repository": "hamanpaul/custom-skills",
-  "skill_revision": "6a6dd412cabc2c0a04f8e2696046005263c72c0b",
+  "skill_revision": "304eab04e158c126b977480888cea04e6ae86b14",
   "archify_repository": "tt-a1i/archify",
   "archify_version": "3.2.0",
   "archify_revision": "208acba8d412335185b2056fedf54b3405df43fb",
   "overlay": {
     "tool": "tools/architecture_overlay.py",
     "skill_path": "architecture-fact-layer/scripts/viewer_overlay.py",
-    "skill_revision": "6a6dd412cabc2c0a04f8e2696046005263c72c0b",
-    "version": 1,
-    "sha256": "878517dbf71d9418ea43ad2eb0e9487a04cbd5ec9df3b381cbdd5ba76e21bbf7"
+    "skill_revision": "304eab04e158c126b977480888cea04e6ae86b14",
+    "version": 2,
+    "sha256": "98f19daf61c2878cca401e60e3c70b842c2f7737a6aee3f26a293666b014c3dc"
   },
   "pages": {
     "overview": {
@@ -19,12 +19,12 @@
       "facts": "facts.json",
       "ir": "architecture.json",
       "html": "architecture.html",
-      "overlay_version": 1,
+      "overlay_version": 2,
       "sha256": {
         "facts": "f6e695feae8a540d76e7075502ec5fae274f1b7173d24d26a9dbb9f3123432e9",
         "ir": "c427f6e4e4f1cd976985a52c130cbe20c9017c841b32fd9cfd959da3514eb614",
         "delivery": "5a5bb73e5d20b01681b4b19a6e27cadf37c02f6d5564402ce4cd3d94ca7b9898",
-        "html": "a9195b8f1c58eac533135bec0ad85bbab733dc7cae4ee0e87d92fd6253e797ce"
+        "html": "ecb695a2a67c30c859bb57640d7a0045e1166d7033f058b740e94ae6d67b3b44"
       }
     },
     "01-command-exec": {
@@ -33,12 +33,12 @@
       "facts": "features/01-command-exec.facts.json",
       "ir": "features/01-command-exec.json",
       "html": "features/01-command-exec.html",
-      "overlay_version": 1,
+      "overlay_version": 2,
       "sha256": {
         "facts": "b8f2f6888b1e041324930bf2755eefcae011c62e5b5a1e38b695f7179daf1745",
         "ir": "36a44fece4dbb9f7fac1908d75c0d7026496934873f1203a634f135e73ff9bd8",
         "delivery": "45047ee239e57e35598d2fa2d6da74010dbf0fd058836f5049a87f5621e811b0",
-        "html": "899650b016ec7b10dbc3e19ee6cf433a800296c3a1e2a37587938dca6cd30f2d"
+        "html": "eed281e56319901973fb1d8e696a644a98169db138ef3a9c37341a74beab6f82"
       }
     },
     "02-session-lifecycle": {
@@ -47,12 +47,12 @@
       "facts": "features/02-session-lifecycle.facts.json",
       "ir": "features/02-session-lifecycle.json",
       "html": "features/02-session-lifecycle.html",
-      "overlay_version": 1,
+      "overlay_version": 2,
       "sha256": {
         "facts": "fdbdaa2cfbd5be4cb32c2cdb91151451196fd5285fc2e5f9de0fa73a5414e306",
         "ir": "af32246317ad6b5707f7609a4a9f5de4a48d6429ac3498d7e65e7376e289837e",
         "delivery": "b04d903ae5c2855e28322d8ed55fa5ad86e6e7542b21177ddf4737c790e991b9",
-        "html": "ab4ef59eebe04c6f2c3341eb0c2968bd307587be1ea5f24463ff753564bb9524"
+        "html": "09a076d260df12ed4b3500951f7273daa457978db9979a4a7c24fbb0bcb122ab"
       }
     },
     "03-device-mgmt": {
@@ -61,12 +61,12 @@
       "facts": "features/03-device-mgmt.facts.json",
       "ir": "features/03-device-mgmt.json",
       "html": "features/03-device-mgmt.html",
-      "overlay_version": 1,
+      "overlay_version": 2,
       "sha256": {
         "facts": "c7d2ffd549e415960b5563393e62d59bfb3d2166ee99ba4e1e4674714aefe24e",
         "ir": "4ec701427415830f63dc2612fd0d16cfba7f7581d78e9e4dff745087ffc02217",
         "delivery": "92414c53627388d19e93755e7d2165bb62cf9edde8af83d01a2706a4a4353acd",
-        "html": "927b349f9b23d717a90ed2cde5e47b9c509613921a9dacdb788e68efbbe6a18c"
+        "html": "6585c727e59caf598dcf577a792774a6ca860ccde56566ed17c8d0271ab0d843"
       }
     },
     "04-human-console": {
@@ -75,12 +75,12 @@
       "facts": "features/04-human-console.facts.json",
       "ir": "features/04-human-console.json",
       "html": "features/04-human-console.html",
-      "overlay_version": 1,
+      "overlay_version": 2,
       "sha256": {
         "facts": "356dc4d6fa4d6f4558c469254dc0a5a28c4d8afc63027561363741cb6314157c",
         "ir": "e5406cb84223f23e8115bb32ea4aaa2dbd509ab3018ec99c0db40d0d3db87fc1",
         "delivery": "21a7abd1d8a6952935963632953c828ddf98c29e59648cdcd9f3a4b8a78b7892",
-        "html": "d2e719e0f087877a20b252e9ac025bc5c84c659a8981315ca96473deb0ac949a"
+        "html": "0157d34ae70d4bcc2adcd136a7862cfeaffa2bc161cf5e796d03af10e32644da"
       }
     },
     "05-file-transfer": {
@@ -89,12 +89,12 @@
       "facts": "features/05-file-transfer.facts.json",
       "ir": "features/05-file-transfer.json",
       "html": "features/05-file-transfer.html",
-      "overlay_version": 1,
+      "overlay_version": 2,
       "sha256": {
         "facts": "e13c8fc518a9fcaa99145d5d327fb9aac2b39c0a0acc04c23ace0c5eda3db85c",
         "ir": "5d3535ea37eedaa7bffa2b47903a3e1feff2d24fbea17292d0b8ae6f9b56370a",
         "delivery": "1da6337262ed187e1706cb840210fe8e7a426f90d7af98f0d7ece097d69bbc52",
-        "html": "cad672b34af3e2a0bfac16e6ffa9ad5f53a2435c35b5e919e920d1ad81691817"
+        "html": "7d08e5183cc64d0d9532fd3cebc6d1ccea1d98193dc4e5a68059546042790207"
       }
     },
     "06-mcu-flash": {
@@ -103,12 +103,12 @@
       "facts": "features/06-mcu-flash.facts.json",
       "ir": "features/06-mcu-flash.json",
       "html": "features/06-mcu-flash.html",
-      "overlay_version": 1,
+      "overlay_version": 2,
       "sha256": {
         "facts": "3d55bbc84511f332f5cdba0b05c7b73736d32029d64cde2a8a56656e3bb7b9bb",
         "ir": "075a25b3bcf68eaacf9c646f3b09c85ab6c700fac841ffafb951c71f082b01f9",
         "delivery": "440354206942ca5bca5636c3e3d1eabe897c0062c19708bb885ad4b2963fc3a6",
-        "html": "d740f6c7498dfc180e6b6ed62285ce0fa16e52e2e5f3d043bbf0e96ad7be9e0f"
+        "html": "1c4e9dd1f02ed9b9c719020a347fbd1f94371399676bec43c2e0823aec305a3b"
       }
     },
     "07-event-engine": {
@@ -117,12 +117,12 @@
       "facts": "features/07-event-engine.facts.json",
       "ir": "features/07-event-engine.json",
       "html": "features/07-event-engine.html",
-      "overlay_version": 1,
+      "overlay_version": 2,
       "sha256": {
         "facts": "1d178af4690debaa5ebbace7d21068f911666e7644f9bd1d25069755be2724b6",
         "ir": "769414e50513d58036c991d544eda2d36ee33b96270aa1e560505e75c8880b7e",
         "delivery": "f67bf4f6489646f72ba91e030fa987b763c04cb44d729813a25f5128000d06c5",
-        "html": "af259c7dbec556af946468ab0bcefd68f811a0aa91bef9eb301e457f212d1ef8"
+        "html": "b9c60dab6dc8e73a303d4dedf62e929e91702e739041d48284927d7996ac95d0"
       }
     },
     "08-logs-evidence": {
@@ -131,12 +131,12 @@
       "facts": "features/08-logs-evidence.facts.json",
       "ir": "features/08-logs-evidence.json",
       "html": "features/08-logs-evidence.html",
-      "overlay_version": 1,
+      "overlay_version": 2,
       "sha256": {
         "facts": "a49df401a80627e93ebd4bb5ef0417d4bf6c933118e8c0a82d191209eedfa5f4",
         "ir": "a54ad2a77526a42b5f7563648d47187e4f01cf308dfbe3ba004e418a7b074c95",
         "delivery": "970886d357971a5235de2c2c13882076814977397b66a72a69d81ecb464956ba",
-        "html": "2eab5e00afb3b27f9caa998ceddca68e7188308d4386a6998858c3bf91e0b427"
+        "html": "922d702c0473fb99c70f584c173ff5e18278a82ec2fe71260f3c60d62c79a5da"
       }
     },
     "09-daemon-mgmt": {
@@ -145,12 +145,12 @@
       "facts": "features/09-daemon-mgmt.facts.json",
       "ir": "features/09-daemon-mgmt.json",
       "html": "features/09-daemon-mgmt.html",
-      "overlay_version": 1,
+      "overlay_version": 2,
       "sha256": {
         "facts": "5899d16043c68c422e99716e875933e5e4d553d4bf6678cbe1a508656eadd077",
         "ir": "c5d05ff5d863f7a4a39b1b6bc82ebef8fd9c5c0ec4842e0bf20b40466f5d486d",
         "delivery": "e35b2310e1d2772d72a782cc7b0bbcf1424d0c115fda3dfb8c8d4269d751bce9",
-        "html": "63ca9d6ab1a4013fab0df3ab117fa4ffc06a93bc28d86106bdfa01922223b83b"
+        "html": "c992a1d51d3f64a26845234a30a1c01dd8aa8c3449bc4f4c0225b53521bc1cba"
       }
     },
     "10-install-supervision": {
@@ -159,12 +159,12 @@
       "facts": "features/10-install-supervision.facts.json",
       "ir": "features/10-install-supervision.json",
       "html": "features/10-install-supervision.html",
-      "overlay_version": 1,
+      "overlay_version": 2,
       "sha256": {
         "facts": "5dc9af0317320b9603effc083d113a8ab33766c74f02d87fcf150b5f327558f2",
         "ir": "bf185ebf52ba5ffc13226eac2d37c2c38dd425b82af38a87d07c8b9c74c9b207",
         "delivery": "33f05d5d7fdd7a60f88605fd3efafabf8e40d95692ee284793b3a78130dd33b1",
-        "html": "b5b91beff7f793d7afebf49ddf233cc7ee130e973866a2fada3ea16419d4b62f"
+        "html": "2d7c01eb66ebbc39695902e228280e5a15a4d809c038da15f277e1676e43ad4e"
       }
     },
     "11-remote-bench": {
@@ -173,12 +173,12 @@
       "facts": "features/11-remote-bench.facts.json",
       "ir": "features/11-remote-bench.json",
       "html": "features/11-remote-bench.html",
-      "overlay_version": 1,
+      "overlay_version": 2,
       "sha256": {
         "facts": "c0611c1482101ad741804af67abdc67e0d249c1a564b3e4dae0dbeef45df9306",
         "ir": "ae34308fb2ca1981cbcbbc5dcec222c307a21a299d5b250f7b8aeb890a6473b8",
         "delivery": "b8457ba46687b6c5e872d60afb05cdd8223a16091187bb8c2e17f49899583618",
-        "html": "d013898b55c05cf5c58a70e9ab862bf6e0bb6c18f187b65d84fd5d92101cc033"
+        "html": "a64cfc302c826a9cdc52c10064578a141234e31fd0c346968e15c2f80b659760"
       }
     }
   }

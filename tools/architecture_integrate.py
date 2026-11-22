@@ -96,6 +96,7 @@ def refresh_nav(toolchain: dict, pages: dict) -> list[str]:
         if final != current:
             path.write_bytes(final)
             changed.append(f"docs/architecture/{entry['html']}")
+        entry["overlay_version"] = OVERLAY.VERSION
         entry["sha256"]["html"] = REVIEW.sha256(final)
     return changed
 

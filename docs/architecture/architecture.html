@@ -5085,7 +5085,7 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
   </style>
 </head>
 <body>
-<!-- SW-OVERLAY:START viewer-overlay/1 page=overview original-sha256=5a5bb73e5d20b01681b4b19a6e27cadf37c02f6d5564402ce4cd3d94ca7b9898 -->
+<!-- SW-OVERLAY:START viewer-overlay/2 page=overview original-sha256=5a5bb73e5d20b01681b4b19a6e27cadf37c02f6d5564402ce4cd3d94ca7b9898 -->
 <style id="sw-overlay-style">
 #sw-overlay-nav{box-sizing:border-box;display:flex;align-items:center;gap:6px;margin:8px 16px 0;font-family:inherit;font-size:10.5px;font-weight:500;line-height:1.2;color:var(--toolbar-text,var(--text,#e2e8f0));z-index:5}
 #sw-overlay-nav.is-docked{position:absolute;margin:0}
@@ -5101,7 +5101,7 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
 html[data-present="true"] #sw-overlay-nav,html[data-embed="true"] #sw-overlay-nav{display:none}
 @media print{#sw-overlay-nav{display:none}}
 </style>
-<nav id="sw-overlay-nav" aria-label="功能導覽" data-sw-overlay="1"><span class="sw-ov-hint" id="sw-overlay-hint" data-wheel-text="滾輪縮放" data-alt-text="Alt＋滾輪縮放" data-wheel-mode="wheel">滾輪縮放</span><ol class="sw-ov-list"><li><span class="sw-ov-item is-current" aria-current="page" title="架構總覽">總覽</span></li><li><a class="sw-ov-item" href="features/01-command-exec.html" title="01 命令執行">01 命令</a></li><li><a class="sw-ov-item" href="features/02-session-lifecycle.html" title="02 Session 生命週期">02 Session</a></li><li><a class="sw-ov-item" href="features/03-device-mgmt.html" title="03 裝置管理">03 裝置</a></li><li><a class="sw-ov-item" href="features/04-human-console.html" title="04 人類 console 共用">04 console</a></li><li><a class="sw-ov-item" href="features/05-file-transfer.html" title="05 檔案傳輸">05 傳輸</a></li><li><a class="sw-ov-item" href="features/06-mcu-flash.html" title="06 MCU 燒錄">06 燒錄</a></li><li><span class="sw-ov-item is-missing" aria-disabled="true" title="07 事件引擎（尚未提供）">07 事件</span></li><li><span class="sw-ov-item is-missing" aria-disabled="true" title="08 紀錄與證據（尚未提供）">08 紀錄</span></li><li><a class="sw-ov-item" href="features/09-daemon-mgmt.html" title="09 daemon 管理">09 daemon</a></li><li><span class="sw-ov-item is-missing" aria-disabled="true" title="10 安裝與監管（尚未提供）">10 安裝</span></li><li><span class="sw-ov-item is-missing" aria-disabled="true" title="11 遠端與測試台（尚未提供）">11 遠端</span></li><li><span class="sw-ov-item is-missing" aria-disabled="true" title="12 設定與工具（尚未提供）">12 設定</span></li><li><span class="sw-ov-item is-missing" aria-disabled="true" title="13 跨平台（尚未提供）">13 跨平台</span></li></ol></nav>
+<nav id="sw-overlay-nav" aria-label="功能導覽" data-sw-overlay="2"><span class="sw-ov-hint" id="sw-overlay-hint" data-wheel-text="滾輪縮放" data-alt-text="Alt＋滾輪縮放" data-wheel-mode="wheel">滾輪縮放</span><ol class="sw-ov-list"><li><span class="sw-ov-item is-current" aria-current="page" title="架構總覽">總覽</span></li><li><a class="sw-ov-item" href="features/01-command-exec.html" title="01 命令執行">01 命令</a></li><li><a class="sw-ov-item" href="features/02-session-lifecycle.html" title="02 Session 生命週期">02 Session</a></li><li><a class="sw-ov-item" href="features/03-device-mgmt.html" title="03 裝置管理">03 裝置</a></li><li><a class="sw-ov-item" href="features/04-human-console.html" title="04 人類 console 共用">04 console</a></li><li><a class="sw-ov-item" href="features/05-file-transfer.html" title="05 檔案傳輸">05 傳輸</a></li><li><a class="sw-ov-item" href="features/06-mcu-flash.html" title="06 MCU 燒錄">06 燒錄</a></li><li><a class="sw-ov-item" href="features/07-event-engine.html" title="07 事件引擎">07 事件</a></li><li><a class="sw-ov-item" href="features/08-logs-evidence.html" title="08 紀錄與證據">08 紀錄</a></li><li><a class="sw-ov-item" href="features/09-daemon-mgmt.html" title="09 daemon 管理">09 daemon</a></li><li><a class="sw-ov-item" href="features/10-install-supervision.html" title="10 安裝與監管">10 安裝</a></li><li><a class="sw-ov-item" href="features/11-remote-bench.html" title="11 遠端與測試台">11 遠端</a></li><li><span class="sw-ov-item is-missing" aria-disabled="true" title="12 設定與工具（尚未提供）">12 設定</span></li><li><span class="sw-ov-item is-missing" aria-disabled="true" title="13 跨平台（尚未提供）">13 跨平台</span></li></ol></nav>
 <script id="sw-overlay-script">
 (function () {
   'use strict';
@@ -5189,27 +5189,58 @@ html[data-present="true"] #sw-overlay-nav,html[data-embed="true"] #sw-overlay-na
     range.selectNodeContents(el);
     return range.getBoundingClientRect().right;
   }
+  // 定位規則（可測）：
+  // 1. 視窗寬 >= 1200 且標題文字右緣到工具列左緣（各留 20px）至少 160px 時嘗試嵌入，寬度就是這段空間。
+  // 2. 先試工具列帶（與工具列同高同位置）；導覽列換行後的高度放得下就嵌入（與先前版本相同的位置）。
+  // 3. 放不下時改試空白帶：以工具列垂直中心為中心，向上可到頁頂 2px、向下可到圖容器上緣 6px（取兩側較小者）；
+  //    放得下（例如窄容器版面的三列）就嵌入。
+  // 4. 仍放不下才退回圖上方的一般區塊，並下移到工具列下方，不蓋標題、工具列或圖。
+  // 結果寫在 data-placement（docked｜block）、data-band（最後嘗試的嵌入帶高度）、data-need（嵌入時內容高度）、
+  // data-overflow（嵌入時水平溢出的 px）。退回一般區塊的原因因此可判定：沒有嵌入帶（data-band 缺）、高度放不下或水平溢出。
   function place() {
     if (!nav) return;
-    nav.classList.remove('is-docked');
     nav.style.left = nav.style.top = nav.style.width = nav.style.height = nav.style.marginTop = '';
+    nav.setAttribute('data-placement', 'block');
+    nav.removeAttribute('data-band');
+    nav.removeAttribute('data-need');
+    nav.removeAttribute('data-overflow');
+    // 先讓導覽列脫離文件流（絕對定位）再量標題、工具列與圖容器，量到的是未加工時的原始版面。
+    nav.classList.add('is-docked');
     var title = document.querySelector('.container h1') || document.querySelector('h1');
     var bar = document.querySelector('.toolbar');
     var barBox = bar ? bar.getBoundingClientRect() : null;
+    var bands = [];
+    var left = 0, right = 0;
     if (title && barBox && window.innerWidth >= 1200) {
-      var left = textRight(title) + 20, right = barBox.left - 20;
-      if (right - left >= 160) {
-        nav.classList.add('is-docked');
+      left = textRight(title) + 20;
+      right = barBox.left - 20;
+      bands.push([barBox.top, barBox.height]);
+      var center = (barBox.top + barBox.bottom) / 2;
+      var box = document.querySelector('.diagram-container');
+      var below = box ? box.getBoundingClientRect().top - 6 - center : 0;
+      var half = Math.min(center - 2, below);
+      if (2 * half > barBox.height) bands.push([center - half, 2 * half]);
+    }
+    if (right - left >= 160) {
+      var list = nav.querySelector('.sw-ov-list');
+      for (var i = 0; i < bands.length; i++) {
         nav.style.left = (left + window.scrollX) + 'px';
-        nav.style.top = (barBox.top + window.scrollY) + 'px';
+        nav.style.top = (bands[i][0] + window.scrollY) + 'px';
         nav.style.width = (right - left) + 'px';
-        nav.style.height = barBox.height + 'px';
-        var list = nav.querySelector('.sw-ov-list');
-        if (nav.scrollWidth <= right - left + 1 && (!list || list.scrollHeight <= barBox.height + 1)) return;
-        nav.classList.remove('is-docked');
-        nav.style.left = nav.style.top = nav.style.width = nav.style.height = '';
+        nav.style.height = bands[i][1] + 'px';
+        var need = list ? list.scrollHeight : 0;
+        nav.setAttribute('data-band', String(Math.round(bands[i][1])));
+        var overflow = Math.max(0, Math.ceil(nav.scrollWidth - (right - left)));
+        nav.setAttribute('data-need', String(need));
+        nav.setAttribute('data-overflow', String(overflow));
+        if (overflow <= 1 && need <= bands[i][1] + 1) {
+          nav.setAttribute('data-placement', 'docked');
+          return;
+        }
       }
     }
+    nav.classList.remove('is-docked');
+    nav.style.left = nav.style.top = nav.style.width = nav.style.height = '';
     if (barBox) {
       var gap = barBox.bottom + window.scrollY + 6 - (nav.getBoundingClientRect().top + window.scrollY);
       if (gap > 0) nav.style.marginTop = (8 + gap) + 'px';

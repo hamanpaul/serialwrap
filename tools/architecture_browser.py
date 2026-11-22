@@ -45,13 +45,15 @@ FIT_JS = """(() => {
     overflowY: [root, document.body].map(e => getComputedStyle(e).overflowY)};
 })()"""
 
-# 導覽列位置與內容：不得蓋到標題文字、工具列或圖。
+# 導覽列位置與內容：不得蓋到標題文字、工具列或圖。placement／band／need 是加工腳本依定位規則寫下的結果
+# （先試工具列帶、再試頁頂到圖容器上緣的空白帶，都放不下才退回工具列下方的一般區塊）。
 NAV_JS = """(() => {
   const box = e => { const r = e.getBoundingClientRect(); return {left: r.left, top: r.top + scrollY, right: r.right, bottom: r.bottom + scrollY}; };
   const nav = document.getElementById('sw-overlay-nav');
   const title = document.querySelector('h1'); const range = document.createRange(); range.selectNodeContents(title);
   const t = range.getBoundingClientRect();
-  return {nav: box(nav), docked: nav.classList.contains('is-docked'), title: {left: t.left, top: t.top + scrollY, right: t.right, bottom: t.bottom + scrollY},
+  return {nav: box(nav), docked: nav.classList.contains('is-docked'), placement: nav.dataset.placement || null,
+    band: Number(nav.dataset.band || 0), need: Number(nav.dataset.need || 0), overflow: Number(nav.dataset.overflow || 0), title: {left: t.left, top: t.top + scrollY, right: t.right, bottom: t.bottom + scrollY},
     toolbar: box(document.querySelector('.toolbar')), container: box(document.querySelector('.diagram-container')),
     links: [...nav.querySelectorAll('a')].map(a => ({href: a.href, raw: a.getAttribute('href')})),
     disabled: [...nav.querySelectorAll('[aria-disabled="true"]')].map(e => ({tag: e.tagName, href: e.getAttribute('href'), cursor: getComputedStyle(e).cursor})),
@@ -209,10 +211,18 @@ def review_page(browser, html: Path, output: Path, one_screen: bool, expected_it
         assert m["railTop"] is None or m["railTop"] >= m["svgBottom"], m
         if w >= 1440:
             nav = page.evaluate(NAV_JS)
-            assert nav["docked"], ("desktop 導覽列應嵌在標題與工具列之間", w, nav["nav"])
+            placement = nav["placement"]
+            if placement == "docked":
+                assert nav["docked"] and nav["need"] <= nav["band"] + 1 and nav["overflow"] <= 1, ("嵌入的導覽列超出嵌入帶", w, nav)
+            else:
+                # 只有沒有嵌入帶、高度放不下或水平溢出時才可以退回一般區塊，且要在工具列下方。
+                assert placement == "block" and not nav["docked"], ("導覽列定位結果不明", w, nav)
+                assert nav["band"] == 0 or nav["need"] > nav["band"] + 1 or nav["overflow"] > 1, ("嵌入帶放得下卻退回一般區塊", w, nav)
+                assert nav["nav"]["top"] >= nav["toolbar"]["bottom"], ("一般區塊的導覽列應在工具列下方", w, nav)
             for other in ("title", "toolbar", "container"):
                 assert not _overlap(nav["nav"], nav[other]), ("導覽列蓋到", other, w, nav["nav"], nav[other])
             m["nav"] = nav["nav"]
+            m["nav_placement"] = placement
             if one_screen:
                 assert m["firstScreenHeight"] <= h and 0 <= m["svgTop"] and m["svgBottom"] <= h, m
             else:
