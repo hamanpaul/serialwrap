@@ -54,9 +54,11 @@ class StubSwCli:
         raise AssertionError(f"observer 使用了非唯讀或未核准命令：{args!r}")
 
 
-def _run(observer, sw, out: Path, *, interval_s: float = 0.05, duration_s: float = 0.3, **kwargs):
+def _run(observer, sw, out: Path, *, interval_s: float = 0.05, duration_s: float | None = 0.3,
+         stop=None, **kwargs):
     return observer.run_observer(sw, ["COM0", "COM1"], interval_s=interval_s, out=out,
-                                 stop=threading.Event(), duration_s=duration_s, **kwargs)
+                                 stop=stop if stop is not None else threading.Event(),
+                                 duration_s=duration_s, **kwargs)
 
 
 def _read_rows(path: Path):
@@ -72,13 +74,36 @@ def test_observer_readonly_calls(tmp_path):
     assert "interactive-status" not in source
 
 
-def test_observer_writes_samples(tmp_path):
+def test_observer_writes_samples(tmp_path, monkeypatch):
     observer = _observer()
     out = tmp_path / "observer.ndjson"
-    _run(observer, StubSwCli(), out)
+    now = [0.0]
+
+    class FakeStop:
+        """以同一虛擬時鐘等待，完成第六次取樣後停止 observer。"""
+
+        def __init__(self):
+            self.waits = 0
+            self.stopped = False
+
+        def is_set(self):
+            return self.stopped
+
+        def wait(self, timeout):
+            now[0] += timeout
+            self.waits += 1
+            if self.waits == 6:
+                self.stopped = True
+            return self.stopped
+
+    stop = FakeStop()
+    monkeypatch.setattr(observer.time, "monotonic", lambda: now[0])
+    _run(observer, StubSwCli(), out, duration_s=None, stop=stop)
     rows = _read_rows(out)
     samples = [row for row in rows if row.get("kind") == "sample"]
     assert len(samples) >= 4
+    assert len(samples) == 6
+    assert stop.waits == 6
     assert all("wall_ts" in row and "pid" in row["daemon"] and "sessions" in row for row in samples)
 
 
