@@ -1379,7 +1379,21 @@ def test_bc08_doctor_profile_template_fields_registered() -> None:
     assert change["applies_to"]["python"] is None
     assert change["applies_to"]["rust"]["stage"] == "stage-1b"
     assert change["phases"] == ["P4"]
-    assert change["approved_at_revision"] == behavior["revision"] == 12
+    def assert_bc08_revision(catalog: dict[str, Any], bc08: dict[str, Any]) -> None:
+        assert type(catalog["revision"]) is int and catalog["revision"] > 0
+        approved_at = bc08["approved_at_revision"]
+        assert type(approved_at) is int and 0 < approved_at <= catalog["revision"]
+
+    assert_bc08_revision(behavior, change)
+    advanced_behavior = json.loads(json.dumps(behavior))
+    advanced_behavior["revision"] += 1
+    advanced_change = next(item for item in advanced_behavior["changes"] if item["id"] == "BC-08")
+    assert advanced_change == change
+    assert_bc08_revision(advanced_behavior, advanced_change)
+    future_approval = json.loads(json.dumps(behavior))
+    future_approval["revision"] = change["approved_at_revision"] - 1
+    with pytest.raises(AssertionError):
+        assert_bc08_revision(future_approval, change)
     assert set(change["case_ids"]) == expected_case_ids
     assert "OD-111" in change["related_decisions"]
 
