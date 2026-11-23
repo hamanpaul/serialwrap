@@ -88,7 +88,7 @@ pub fn run_service(ns: &Namespace, ctx: &mut CliCtx) -> i32 {
             request.with_sudo,
             request.context,
         );
-        return finish_service_action_response(ctx, response, request, |_| None);
+        return finish_service_action_response(ctx, response, request, |_, _, _, _| None);
     }
     // on-demand／未知模式不呼叫任何監管後端（Python `service_action` 亦不呼叫 systemctl）；結果與 NO_SYSTEMD 相同。
     let result = if mode.is_supervised() {
@@ -138,11 +138,11 @@ pub fn run_service_action_with_mode_value(
             routed_to,
             raw_mode,
         },
-        |_| None,
+        |_, _, _, _| None,
     )
 }
 
-/// 監管模式重讀後需重新分派時，交回原始 daemon start 入口處理新設定。
+/// 監管模式重讀後，將鎖內解析結果交回 daemon start 原入口分派一次。
 pub fn run_service_action_with_mode_value_and_on_demand_fallback<F>(
     ctx: &mut CliCtx<'_>,
     mode: &SupervisionMode,
@@ -151,7 +151,12 @@ pub fn run_service_action_with_mode_value_and_on_demand_fallback<F>(
     fallback: F,
 ) -> i32
 where
-    F: FnOnce(&mut CliCtx<'_>) -> i32,
+    F: FnOnce(
+        &mut CliCtx<'_>,
+        Option<&SupervisionMode>,
+        Option<&PyValue>,
+        Option<&str>,
+    ) -> Option<i32>,
 {
     run_service_action_with_request(
         ctx,
@@ -163,7 +168,7 @@ where
             routed_to: Some("service start"),
             raw_mode,
         },
-        |ctx| Some(fallback(ctx)),
+        fallback,
     )
 }
 
@@ -173,7 +178,12 @@ fn run_service_action_with_request<F>(
     fallback: F,
 ) -> i32
 where
-    F: FnOnce(&mut CliCtx<'_>) -> Option<i32>,
+    F: FnOnce(
+        &mut CliCtx<'_>,
+        Option<&SupervisionMode>,
+        Option<&PyValue>,
+        Option<&str>,
+    ) -> Option<i32>,
 {
     let response = service_action_response(
         ctx,
@@ -300,7 +310,12 @@ fn finish_service_action_response<F>(
     fallback: F,
 ) -> i32
 where
-    F: FnOnce(&mut CliCtx<'_>) -> Option<i32>,
+    F: FnOnce(
+        &mut CliCtx<'_>,
+        Option<&SupervisionMode>,
+        Option<&PyValue>,
+        Option<&str>,
+    ) -> Option<i32>,
 {
     match response {
         ServiceActionResponse::Response(response, code) => emit_service_action_response(
@@ -313,7 +328,7 @@ where
         ),
         ServiceActionResponse::Reported(code) => code,
         ServiceActionResponse::ModeSerializationFailed(message) => {
-            if let Some(code) = fallback(ctx) {
+            if let Some(code) = fallback(ctx, None, None, Some(&message)) {
                 return code;
             }
             let public_message = message.strip_prefix("TypeError: ").unwrap_or(&message);
@@ -324,7 +339,7 @@ where
             raw_mode: reloaded_raw_mode,
         } => {
             if matches!(mode, SupervisionMode::OnDemand) {
-                if let Some(code) = fallback(ctx) {
+                if let Some(code) = fallback(ctx, Some(&mode), reloaded_raw_mode.as_ref(), None) {
                     return code;
                 }
             }

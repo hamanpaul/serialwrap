@@ -44,7 +44,8 @@ type EnvOp = Box<dyn Fn(FakeSysEnvBuilder) -> FakeSysEnvBuilder>;
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// `health.ping` 的成功回應（與 P3 client 的 JSON 形狀一致）。
-const OK_PING: &str = r#"{"ok":true,"pid":1234,"version":"test"}"#;
+const OK_PING: &str = r#"{"ok":true,"pong":true}"#;
+const OK_HEALTH_STATUS: &str = r#"{"ok":true,"pid":1234,"version":"test"}"#;
 /// `session.list` 的成功回應（空清單）。
 const OK_SESSION_LIST: &str = r#"{"ok":true,"sessions":[]}"#;
 /// 通用成功回應。
@@ -92,14 +93,35 @@ pub const LEGACY_CRASH_POINTS: &[&str] = &[
 struct EventFs {
     inner: Arc<dyn FsOps>,
     events: Arc<Mutex<Vec<(u64, String)>>>,
+    config_rewrite_on_read: Arc<Mutex<Option<ConfigRewriteOnRead>>>,
+}
+
+struct ConfigRewriteOnRead {
+    path: PathBuf,
+    read_number: usize,
+    read_count: usize,
+    contents: Vec<u8>,
+    applied: bool,
 }
 
 impl EventFs {
-    fn wrap(inner: Arc<dyn FsOps>) -> (Arc<dyn FsOps>, Arc<Mutex<Vec<(u64, String)>>>) {
+    fn wrap(
+        inner: Arc<dyn FsOps>,
+    ) -> (
+        Arc<dyn FsOps>,
+        Arc<Mutex<Vec<(u64, String)>>>,
+        Arc<Mutex<Option<ConfigRewriteOnRead>>>,
+    ) {
         let events = Arc::new(Mutex::new(Vec::new()));
+        let config_rewrite_on_read = Arc::new(Mutex::new(None));
         (
-            Arc::new(Self { inner, events: Arc::clone(&events) }),
+            Arc::new(Self {
+                inner,
+                events: Arc::clone(&events),
+                config_rewrite_on_read: Arc::clone(&config_rewrite_on_read),
+            }),
             events,
+            config_rewrite_on_read,
         )
     }
 
@@ -135,7 +157,30 @@ impl EventFs {
 }
 
 impl FsRead for EventFs {
-    fn read(&self, path: &Path) -> PalResult<Vec<u8>> { self.inner.read(path) }
+    fn read(&self, path: &Path) -> PalResult<Vec<u8>> {
+        let rewrite = {
+            let mut script = self
+                .config_rewrite_on_read
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            script.as_mut().and_then(|script| {
+                if script.path != path {
+                    return None;
+                }
+                script.read_count += 1;
+                if script.read_count == script.read_number && !script.applied {
+                    script.applied = true;
+                    Some(script.contents.clone())
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(contents) = rewrite {
+            self.inner.write_file(path, &contents)?;
+        }
+        self.inner.read(path)
+    }
     fn exists(&self, path: &Path) -> bool {
         let exists = self.inner.exists(path);
         match path.file_name().and_then(|name| name.to_str()) {
@@ -355,6 +400,7 @@ pub struct TestEnv {
     env: Arc<FakeSysEnv>,
     fs: Arc<dyn FsOps>,
     fs_events: Arc<Mutex<Vec<(u64, String)>>>,
+    config_rewrite_on_read: Arc<Mutex<Option<ConfigRewriteOnRead>>>,
     clock: Arc<FakeClock>,
     rpc: Arc<FakeRpcConnector>,
     procs: Arc<FakeProcScan>,
@@ -428,7 +474,7 @@ impl TestEnv {
 
     fn new(windows: bool) -> Self {
         let tmp_dir = tempfile::tempdir().expect("tempdir 建立失敗");
-        let (fs, fs_events) = EventFs::wrap(real_fs());
+        let (fs, fs_events, config_rewrite_on_read) = EventFs::wrap(real_fs());
         let mut t = Self {
             tmp_dir,
             windows,
@@ -436,6 +482,7 @@ impl TestEnv {
             env: FakeSysEnv::builder().build(),
             fs,
             fs_events,
+            config_rewrite_on_read,
             clock: FakeClock::new(),
             rpc: FakeRpcConnector::new(),
             procs: FakeProcScan::new(Vec::new()),
@@ -576,6 +623,29 @@ impl TestEnv {
     pub fn with_config(self, s: &str) -> Self {
         std::fs::write(self.config_path(), s).expect("config.yaml 寫入失敗");
         self
+    }
+
+    /// 在指定次 config.yaml 讀取前套用新內容，模擬重讀競態中的設定切換。
+    pub fn with_config_rewritten_on_nth_read(self, read_number: usize, contents: &[u8]) -> Self {
+        *self
+            .config_rewrite_on_read
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(ConfigRewriteOnRead {
+            path: self.config_path(),
+            read_number,
+            read_count: 0,
+            contents: contents.to_vec(),
+            applied: false,
+        });
+        self
+    }
+
+    pub fn config_rewrite_applied(&self) -> bool {
+        self.config_rewrite_on_read
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .is_some_and(|script| script.applied)
     }
 
     pub fn with_var(self, k: &str, v: &str) -> Self {
@@ -775,6 +845,7 @@ impl TestEnv {
         for method in methods {
             let line = match *method {
                 "health.ping" => OK_PING,
+                "health.status" => OK_HEALTH_STATUS,
                 "session.list" => OK_SESSION_LIST,
                 _ => OK_EMPTY,
             };
@@ -817,7 +888,7 @@ impl TestEnv {
     /// 綁定同一計數器，故 `pid_alive` 與 ping 在同一次輪詢轉為不存活。
     pub fn with_daemon_alive_then_gone(mut self, ep: &str, pid: u32, n: usize) -> Self {
         let ep = self.isolated_endpoint(ep);
-        self.rpc.respond(&ep, "health.ping", &health_response(pid));
+        self.rpc.respond(&ep, "health.ping", OK_PING);
         self.rpc
             .respond(&ep, "health.status", &health_response(pid));
         self.rpc.respond(&ep, "session.list", OK_SESSION_LIST);
@@ -832,7 +903,7 @@ impl TestEnv {
 
     pub fn with_daemon_alive_forever(mut self, ep: &str, pid: u32) -> Self {
         let ep = self.isolated_endpoint(ep);
-        self.rpc.respond(&ep, "health.ping", &health_response(pid));
+        self.rpc.respond(&ep, "health.ping", OK_PING);
         self.rpc
             .respond(&ep, "health.status", &health_response(pid));
         let token = &sha256_hex(&format!("handoff-{pid}"))[..32];
@@ -858,7 +929,7 @@ impl TestEnv {
         self.ensure_process();
         self.ensure_test_service(false);
         let ep = self.isolated_endpoint(ep);
-        self.rpc.respond(&ep, "health.ping", &health_response(pid));
+        self.rpc.respond(&ep, "health.ping", OK_PING);
         self.rpc
             .respond(&ep, "health.status", &health_response(pid));
         self.rpc.respond(&ep, "session.list", OK_SESSION_LIST);
@@ -1821,7 +1892,7 @@ impl TestEnv {
     pub fn with_restart_cycle(mut self, ep: &str, old_pid: u32, new_pid: u32) -> Self {
         let ep = self.isolated_endpoint(ep);
         self.rpc
-            .respond(&ep, "health.ping", &health_response(old_pid));
+            .respond(&ep, "health.ping", OK_PING);
         self.rpc
             .respond(&ep, "health.status", &health_response(old_pid));
         self.rpc

@@ -20,8 +20,9 @@ use sw_pal::proc_scan::{is_serialwrapd_argv, extract_socket_arg, ArgvFlavor, Dae
 use sw_pal::PalErrorKind;
 use sw_proto::pyjson::{PyInt, PyValue};
 
-/// `health.ping` 與 `health.status` 的成功回應（pid 與版本欄位即可）。
-const PING_OK: &str = r#"{"ok":true,"pid":4321,"version":"0.4.0"}"#;
+/// 正式 `health.ping` 成功回應；PID 只由 `health.status` 提供。
+const PING_OK: &str = r#"{"ok":true,"pong":true}"#;
+const HEALTH_STATUS_OK: &str = r#"{"ok":true,"pid":4321,"version":"0.4.0"}"#;
 /// `session list` 的成功回應（與 P3 client 形狀一致）。
 const SESSION_LIST_OK: &str = r#"{"id":1,"ok":true,"sessions":[],"version":"0.4.0"}"#;
 /// `env -0` 的 bash 呼叫（與 P4-T7 `load_daemon_env` 的 POSIX 路徑逐字一致）。
@@ -1375,6 +1376,43 @@ fn p277_daemon_start_rechecks_mode_after_transaction_wait() {
         "重讀到 on-demand 後不得呼叫排程工作：{:?}",
         t.calls()
     );
+
+    // 第一次讀取是入口模式；第二次在鎖內讀到 on-demand。若釋鎖後再次讀設定，
+    // 測試替身會在那次讀取前切成 windows-task，確保本次命令仍沿用鎖內結果。
+    let interleaved = TestEnv::windows()
+        .with_install_root()
+        .with_config("supervision_mode: windows-task\n")
+        .with_real_service()
+        .with_install_lock_holder_switching_to_on_demand(3.0)
+        .with_rpc_ok(endpoint, "health.ping", PING_OK)
+        .with_config_rewritten_on_nth_read(3, b"supervision_mode: windows-task\n");
+    let raced = interleaved.run(&["--endpoint", endpoint, "daemon", "start"]);
+
+    assert_eq!(raced, expected, "不得在鎖外重讀並改派至 windows-task");
+    assert_eq!(
+        interleaved
+            .event_order()
+            .count_prefix("fs:install-lock:acquired"),
+        1,
+        "鎖內讀到 on-demand 後不得再次取得安裝鎖"
+    );
+    assert!(
+        !interleaved.config_rewrite_applied(),
+        "本次分派不得讀取鎖外切成 windows-task 的設定"
+    );
+    assert_eq!(
+        interleaved.config_bytes(),
+        b"supervision_mode: on-demand\n",
+        "鎖內重讀後的模式應維持本次分派依據"
+    );
+    assert!(
+        !interleaved
+            .calls()
+            .iter()
+            .any(|call| { call.iter().any(|arg| arg == "/ENABLE" || arg == "/Run") }),
+        "重新分派不得呼叫 /ENABLE 或 /Run：{:?}",
+        interleaved.calls()
+    );
 }
 
 #[test]
@@ -1462,7 +1500,8 @@ fn p277_nested_autostart_waits_for_windows_task_daemon_readiness() {
             "",
         )
         .with_rpc_refused_then_ok(endpoint, "session.list", SESSION_LIST_OK)
-        .with_rpc_ok(endpoint, "health.ping", r#"{"ok":false}"#);
+        .with_rpc_ok(endpoint, "health.ping", r#"{"ok":false}"#)
+        .with_rpc_ok(endpoint, "health.status", HEALTH_STATUS_OK);
     t.rpc().respond_at(
         endpoint,
         "health.ping",
@@ -1474,13 +1513,21 @@ fn p277_nested_autostart_waits_for_windows_task_daemon_readiness() {
     let (rc, out, err) = t.run(&["session", "list"]);
 
     assert_eq!(rc, 0, "daemon ready 後才重送原 RPC：out={out}, err={err}");
-    assert!(err.contains("pid=4321"), "應使用 health.ping 確認的 PID：{err}");
+    assert!(
+        err.contains("pid=4321"),
+        "PID 應另由 health.status 取得：{err}"
+    );
     assert!(
         t.clock().elapsed() >= Duration::from_secs(5),
         "應等待到排程 daemon 回報 ready：{:?}",
         t.clock().elapsed()
     );
     assert_eq!(rpc_count(&t, "session.list"), 1, "ready 前不得重送原 RPC");
+    assert_eq!(
+        rpc_count(&t, "health.status"),
+        1,
+        "PID 應由 health.status 查詢"
+    );
     assert_eq!(
         t.calls(),
         vec![
