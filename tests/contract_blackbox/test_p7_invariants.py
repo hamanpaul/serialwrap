@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import errno
 import os
+import sys
 import threading
 import time
 
@@ -179,85 +180,60 @@ def test_daemon_tty_holder_scanner_fails_closed_on_realpath_permission_race(monk
         os.close(fd)
 
 
-def test_python_tty_holder_guard_rejects_new_fd() -> None:
-    """掃描觀察期間實際新開的 PTY fd 必須被 baseline 判準拒絕。"""
-    master_fd, baseline_fd = os.openpty()
-    baseline_open = True
-    new_fd = None
-    try:
-        path = os.ttyname(baseline_fd)
-
-        class _Proc:
-            pid = os.getpid()
-
-        class _Daemon:
-            proc = _Proc()
-
-        class _Rig:
-            daemon = _Daemon()
-
-        baseline_holders = _daemon_tty_holders(_Rig(), path)
-        baseline_fds = _holder_fd_numbers(baseline_holders)
-        assert str(baseline_fd) in baseline_fds, baseline_holders
-        disappeared_fds: set[str] = set()
-
-        new_fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-        current_holders = _daemon_tty_holders(_Rig(), path)
-        assert str(new_fd) in _holder_fd_numbers(current_holders), current_holders
-        with pytest.raises(AssertionError, match="baseline 以外"):
-            _assert_no_new_tty_holder_fds(current_holders, baseline_fds, disappeared_fds)
-    finally:
-        if new_fd is not None:
-            os.close(new_fd)
-        if baseline_open:
-            os.close(baseline_fd)
-        os.close(master_fd)
+def _df23_observer_snapshot() -> dict:
+    return {
+        "state": "DETACHED",
+        "last_error": "LOGIN_PROMPT_TIMEOUT",
+        "reprobe_attempts": 0,
+        "next_reprobe_at": None,
+        "reprobe_exhausted": False,
+        "bridge_generation": 1,
+        "last_state_change_at": "2026-11-23T08:05:24.654773+00:00",
+        "last_probe_at": None,
+        "last_tx_at": None,
+    }
 
 
-def test_python_tty_holder_guard_rejects_reopened_baseline_fd() -> None:
-    """baseline PTY fd 取樣確認消失後，以相同 fd 編號重開仍必須被拒絕。"""
-    master_fd, baseline_fd = os.openpty()
-    baseline_open = True
-    replacement_fd = None
-    try:
-        path = os.ttyname(baseline_fd)
+def _fake_df23_observer(monkeypatch, holder_samples: list[list[str]]):
+    class _Proc:
+        pid = 987654
 
-        class _Proc:
-            pid = os.getpid()
+    class _Daemon:
+        proc = _Proc()
 
-        class _Daemon:
-            proc = _Proc()
+    class _Rig:
+        daemon = _Daemon()
 
-        class _Rig:
-            daemon = _Daemon()
+    snapshot = _df23_observer_snapshot()
+    samples = iter(holder_samples)
 
-        baseline_holders = _daemon_tty_holders(_Rig(), path)
-        baseline_fds = _holder_fd_numbers(baseline_holders)
-        assert str(baseline_fd) in baseline_fds, baseline_holders
-        disappeared_fds: set[str] = set()
+    def scan_holders(_p7, _path):
+        return next(samples, holder_samples[-1])
 
-        os.close(baseline_fd)
-        baseline_open = False
-        after_close = _daemon_tty_holders(_Rig(), path)
-        _assert_no_new_tty_holder_fds(after_close, baseline_fds, disappeared_fds)
-        assert str(baseline_fd) in disappeared_fds
+    monkeypatch.setattr(os.path, "isdir", lambda path: path == "/proc")
+    monkeypatch.setattr(sys.modules[__name__], "_row", lambda _p7: dict(snapshot))
+    monkeypatch.setattr(sys.modules[__name__], "_daemon_tty_holders", scan_holders)
+    return _Rig(), snapshot
 
-        replacement_fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-        if replacement_fd != baseline_fd:
-            os.dup2(replacement_fd, baseline_fd)
-            os.close(replacement_fd)
-        replacement_fd = None
-        baseline_open = True
-        current_holders = _daemon_tty_holders(_Rig(), path)
-        assert str(baseline_fd) in _holder_fd_numbers(current_holders), current_holders
-        with pytest.raises(AssertionError, match="已消失的 baseline"):
-            _assert_no_new_tty_holder_fds(current_holders, baseline_fds, disappeared_fds)
-    finally:
-        if replacement_fd is not None:
-            os.close(replacement_fd)
-        if baseline_open:
-            os.close(baseline_fd)
-        os.close(master_fd)
+
+def test_python_tty_holder_guard_rejects_new_fd(monkeypatch) -> None:
+    """DF-23 觀察迴圈取樣到 baseline 以外的新 holder fd 時必須失敗。"""
+    p7, baseline = _fake_df23_observer(
+        monkeypatch,
+        [["7->/dev/pts/fake"], ["7->/dev/pts/fake", "8->/dev/pts/fake"]],
+    )
+    with pytest.raises(AssertionError, match="baseline 以外"):
+        _observe_python_df23_terminal(p7, "/dev/pts/fake", baseline, observe_s=1.1)
+
+
+def test_python_tty_holder_guard_rejects_reopened_baseline_fd(monkeypatch) -> None:
+    """DF-23 觀察迴圈確認 baseline fd 消失後再次出現時必須失敗。"""
+    p7, baseline = _fake_df23_observer(
+        monkeypatch,
+        [["7->/dev/pts/fake"], [], ["7->/dev/pts/fake"]],
+    )
+    with pytest.raises(AssertionError, match="已消失的 baseline"):
+        _observe_python_df23_terminal(p7, "/dev/pts/fake", baseline, observe_s=1.1)
 
 
 def _attach_human_vtty(p7, label: str) -> tuple[int, dict]:
@@ -506,6 +482,27 @@ def _wait_stable_python_baseline(p7, timeout_s: float = 60.0) -> tuple[dict, dic
     raise AssertionError("Python 分支未在觀察窗內穩定到 DF-23 的核准 DETACHED baseline")
 
 
+def _observe_python_df23_terminal(
+    p7, path: str, baseline: dict, *, observe_s: float = 10.0
+) -> None:
+    """執行 DF-23 Python 終態觀察窗，baseline holder 與逐次檢查共用此路徑。"""
+    has_proc = os.path.isdir("/proc")
+    baseline_holders = _daemon_tty_holders(p7, path) if has_proc else []
+    baseline_holder_fds = _holder_fd_numbers(baseline_holders)
+    disappeared_holder_fds: set[str] = set()
+    if has_proc:
+        print(f"DF-23 Python baseline tty holders: {baseline_holders!r}")
+
+    t_end = time.monotonic() + observe_s
+    while time.monotonic() < t_end:
+        row = _row(p7)
+        _assert_python_detached_terminal_state(row, baseline)
+        if has_proc:
+            holders = _daemon_tty_holders(p7, path)
+            _assert_no_new_tty_holder_fds(holders, baseline_holder_fds, disappeared_holder_fds)
+        time.sleep(0.5)
+
+
 def test_rejected_requests_zero_tx(p7, tmp_path):
     tgt = FakeTarget(tmp_path / "t0", prompt="root@prplOS:~# ", commands={"overrides": {"": {"response": "\r\n=> "}}})
     p7.start("prpl", [tgt])
@@ -591,19 +588,7 @@ def test_release_during_login_waits_for_handle_close(p7, tmp_path):
     else:
         s, baseline = _wait_stable_python_baseline(p7)
         _assert_python_detached_terminal_state(s, baseline)
-        baseline_holders = _daemon_tty_holders(p7, slave) if os.path.isdir("/proc") else []
-        baseline_holder_fds = _holder_fd_numbers(baseline_holders)
-        disappeared_holder_fds: set[str] = set()
-        if os.path.isdir("/proc"):
-            print(f"DF-23 Python baseline tty holders: {baseline_holders!r}")
-        t_end = time.monotonic() + 10.0
-        while time.monotonic() < t_end:                     # 不自動重試：終態、重試欄位及持久事件時間戳均不變。
-            row = _row(p7)
-            _assert_python_detached_terminal_state(row, baseline)
-            if os.path.isdir("/proc"):
-                holders = _daemon_tty_holders(p7, slave)
-                _assert_no_new_tty_holder_fds(holders, baseline_holder_fds, disappeared_holder_fds)
-            time.sleep(0.5)
+        _observe_python_df23_terminal(p7, slave, baseline)
 
     # REATTACH：另一個 rig（READY 起手），RX 凍結下 recover --force，取樣 daemon 對 tty 的 fd 數峰值。
     rig = P7Rig(tmp_path / "p7-reattach")
