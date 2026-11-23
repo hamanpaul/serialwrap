@@ -44,7 +44,9 @@ use crate::quiet_gate::{
 use crate::self_test::{NeedProbe, SelfTestBase, SelfTestCtx, SelfTestProbes};
 use crate::session_auth::resolve_session_auth;
 use crate::state_store::{ReleasedRow, StateDelta};
-use crate::tx_writer::{Fence, FenceReject, FlashMode, OpId, TX_LEDGER_LIVE_MAX, TxPermit};
+use crate::tx_writer::{
+    Fence, FenceReject, FlashMode, OpId, TxClass, TxPermit, TX_LEDGER_LIVE_MAX,
+};
 use crate::uart_bridge::RxShared;
 use crate::wal::WalWriter;
 
@@ -8916,12 +8918,7 @@ impl SessionCore {
             || self.replay_parked.is_some()
             || self.queue.has_accepted(&self.deps.registry)
             || self.pending_ops.iter().any(|(op_id, op)| {
-                matches!(op, PendingOp::Recover { .. })
-                    && self.side_ops.get(op_id).is_some_and(|grant| {
-                        grant.op_id == *op_id
-                            && self.generations.conn_epoch == Some(grant.epoch)
-                            && self.generations.fsm_gen == grant.fsm_gen
-                    })
+                matches!(op, PendingOp::Recover { .. }) && self.recover_side_op_can_submit(*op_id)
             })
             || self
                 .background_cmd_ids
@@ -8932,6 +8929,41 @@ impl SessionCore {
             return true;
         }
         false
+    }
+
+    /// Recover side-op 仍登錄且救援鍵可提交時，self-test 才將 Recover 判為忙碌。
+    /// `self_test_pre_probe` 已先確認目前 bridge snapshot 健康。
+    fn recover_side_op_can_submit(&self, op_id: OpId) -> bool {
+        let Some(grant) = self
+            .side_ops
+            .get(&op_id)
+            .filter(|grant| grant.op_id == op_id)
+        else {
+            return false;
+        };
+        if self.generations.conn_epoch != Some(grant.epoch)
+            || self.deps.fence.shutdown_started_published()
+        {
+            return false;
+        }
+
+        // 依 Recover 的 SystemRecoverKey permit 檢查 epoch、撤銷、凍結、quiet、WAL 與 flash gate；此 TX class 不要求 fsm_gen 相同。
+        let permit = TxPermit {
+            op_id: grant.op_id,
+            epoch: grant.epoch,
+            owner_gen: grant.owner_gen,
+            fsm_gen: grant.fsm_gen,
+            class: TxClass::SystemRecoverKey,
+            source: "system:recover".into(),
+            cmd_id: None,
+            log: true,
+            input_epoch: None,
+            replay_hold: None,
+            probe_id: None,
+        };
+        self.deps
+            .fence
+            .with(|fence| Fence::admit(fence, &permit).is_ok())
     }
 
     pub(crate) fn self_test_pre_probe(&self, ctx: &SelfTestCtx) -> Result<PyDict, NeedProbe> {

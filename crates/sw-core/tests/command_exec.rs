@@ -3405,8 +3405,32 @@ fn command_cancel_running_revokes_tx_op() {
 // ---------------------------------------------------------------------------
 // 審查 F25（High，8b8a40f）／F27（Medium）：Python `recover_session`／`self_test` 不看 `foreground_busy`——
 // READY 且前景命令仍在等 prompt 時，recover 照送 `\x03`／`\x04`、self-test 照送 nonce probe；兩者都不是
-// Python 的前景 operation，不設 `foreground_busy`、不擋 agent log RX。
+// Python 的前景 operation，不設 `foreground_busy`、不擋 agent log RX。Rust 0.5.1 起 self-test 依 BC-13
+// 在前景忙碌時被動回報；recover 仍照 F25 行為送救援鍵。
 // ---------------------------------------------------------------------------
+
+const PRPL_BOOT_DONE_PROFILE: &str = "profiles:\n  r:\n    platform: prpl\n    prompt_regex: '(?m)^root@prplOS:.*# '\n    boot_done_regex: 'Please press Enter to activate this console'\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: r, act_no: 1, alias: r+1, device_by_id: /s/by-id/usb-A}\n";
+
+fn ready_prpl_with_boot_done() -> ActorRig {
+    let h = ActorRig::new(PRPL_BOOT_DONE_PROFILE);
+    h.dev.on_tx_reply(b"\n", b"root@prplOS:~# ");
+    h.dev.on_tx_match(
+        r"__READY__[0-9a-f]+",
+        Box::new(|line: &[u8]| {
+            let text = String::from_utf8_lossy(line).into_owned();
+            let token = text
+                .split("__READY__")
+                .nth(1)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            format!("__READY__{token}\r\nroot@prplOS:~# ").into_bytes()
+        }),
+    );
+    let h = h.attach();
+    h.wait_state("READY");
+    h
+}
 
 fn ready_with_hung_command() -> (ActorRig, String) {
     let h = ActorRig::new(SHELL_PROFILE).ready();
@@ -3436,6 +3460,7 @@ fn recover_while_foreground_command_sends_recover_keys() {
 
 #[test]
 fn self_test_while_foreground_command_sends_probe() {
+    // `sends_probe` 是歷史名稱；依 BC-13，這個忙碌情境現在必須被動回覆。
     let (h, _id) = ready_with_hung_command();
     h.wait_for("前景命令 TX 完整提交", |h| {
         h.dev.os_submits() > 0 && h.dev.tx_since(0).ends_with(b"sleep 20\n")
@@ -3467,6 +3492,92 @@ fn self_test_while_foreground_command_sends_probe() {
     assert_eq!(h.dev.write_calls(), before_writes, "前景命令在途時不得新增 UART write");
     assert_eq!(h.dev.os_submits(), before_submits, "前景命令在途時不得新增 OS submit");
     assert_eq!(tx_rows(&h).len(), before_wal_tx, "前景命令在途時不得新增 WAL TX");
+}
+
+#[test]
+fn self_test_during_recover_after_boot_done_is_passive() {
+    let h = ready_prpl_with_boot_done();
+    h.dev.on_tx_reply(b"\x03", BANNER);
+    h.dev.on_tx_reply(b"\x04", b"\r\nroot@prplOS:~# ");
+
+    let recover = h.request_async(SessionRequest::Recover {
+        timeout_s: 2.0,
+        force: false,
+    });
+    h.wait_for("Recover Ctrl-C 後 U-Boot quiet 已 arm", |h| {
+        tx_rows(h)
+            .iter()
+            .any(|row| b64(row) == b"\x03" && row["source"] == "system:recover")
+            && h.get_state()
+                .get("boot_quiet_remaining_s")
+                .is_some_and(|remaining| !remaining.is_null())
+    });
+
+    h.inject_rx(b"\r\nPlease press Enter to activate this console\r\n");
+    h.wait_for(
+        "boot_done_regex 解除 quiet 且仍等待 READY 再確認",
+        |h| {
+            let session = h.get_state();
+            session.get("boot_quiet_remaining_s") == Some(&PyValue::Null)
+                && session.get("ready_reconfirm_pending") == Some(&PyValue::Bool(true))
+        },
+    );
+
+    let before_bytes = h.dev.tx_len();
+    let before_writes = h.dev.write_calls();
+    let before_submits = h.dev.os_submits();
+    let before_wal_tx = tx_rows(&h).len();
+    let self_test = h.request_async(SessionRequest::SelfTest {
+        timeout_s: 2.0,
+        strict_human_lock: false,
+    });
+    let passive_reply = self_test.recv_timeout(Duration::from_secs(1));
+    let after_self_test = (
+        h.dev.tx_len(),
+        h.dev.write_calls(),
+        h.dev.os_submits(),
+        tx_rows(&h).len(),
+    );
+
+    // FakeClock 仍停在原時刻時，Recover 的首鍵等待不會自行逾時；推進後須照常送 Ctrl-D。
+    h.advance(Duration::from_secs(2));
+    let recovered = recover
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Recover 回覆")
+        .expect("Recover ok");
+    assert_eq!(
+        recovered["error_code"],
+        PyValue::from("PROMPT_TIMEOUT_RECOVERED")
+    );
+    assert_eq!(recovered["recovery_action"], PyValue::from("CTRL_D"));
+    assert!(wal_tx_has(&h, b"\x04"), "Recover 後續鍵 Ctrl-D 應照常送出");
+
+    assert!(
+        passive_reply.is_ok(),
+        "self-test 必須在 Recover 後續鍵送出前被動回覆，實際為 {passive_reply:?}"
+    );
+    let result = passive_reply
+        .expect("已收到被動 self-test 回覆")
+        .expect("self-test ok");
+    assert_eq!(result["classification"], PyValue::from("SESSION_BUSY"));
+    assert_eq!(result["recommended_action"], PyValue::from("wait"));
+    assert!(result.get("probe_ok").is_none(), "{result:?}");
+    assert_eq!(
+        after_self_test.0, before_bytes,
+        "Recover 等待中 self-test 不得新增 UART bytes"
+    );
+    assert_eq!(
+        after_self_test.1, before_writes,
+        "Recover 等待中 self-test 不得新增 UART write"
+    );
+    assert_eq!(
+        after_self_test.2, before_submits,
+        "Recover 等待中 self-test 不得新增 OS submit"
+    );
+    assert_eq!(
+        after_self_test.3, before_wal_tx,
+        "Recover 等待中 self-test 不得新增 WAL TX"
+    );
 }
 
 #[test]
