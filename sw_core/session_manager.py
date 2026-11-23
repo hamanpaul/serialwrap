@@ -68,7 +68,12 @@ from .login_fsm import (
     matches_login_or_password,
     probe_ready,
 )
-from .transport_stall import classify_probe_failure, transport_stall_hint
+from .transport_stall import (
+    classify_probe_failure,
+    is_never_rx_probe_failure,
+    never_rx_hint,
+    transport_stall_hint,
+)
 from .serial_port import SerialPort, TxResult
 from .uart_io import (
     PreservedConsoles,
@@ -2056,7 +2061,9 @@ class SessionManager:
         回傳 ``(err, detail)``：翻轉為 TRANSPORT_STALL 時 detail 帶 host 層復原提示，
         並做一次性 log + WAL META 告警（``transport_stall_warned`` 去重、RX 恢復重臂）；
         未翻轉但 ``err`` 屬 login FSM 失敗碼（``LOGIN_FSM_DETAIL_ERRORS``，#174）時，
-        detail 帶失敗當下的 rx tail（截尾去控制碼），取代恆為 null 的現況；其餘原樣
+        detail 帶失敗當下的 rx tail（截尾去控制碼），取代恆為 null 的現況；未翻轉的
+        PROMPT_UNAVAILABLE 若自 attach 起從未收到 RX、probe 期間也零 RX，detail 帶
+        ``never_rx_hint``（分收發方向的提示，last_error 不變）；其餘原樣
         直通、detail=None。**只在真的送過 probe 後呼叫**——boot-quiet 合成的
         PROMPT_UNAVAILABLE（沒送 probe、且 quiet 代表剛有 RX）不得經此。不得在持有
         self._lock 時呼叫（內部會取鎖做去重）。
@@ -2076,6 +2083,10 @@ class SessionManager:
         if not flipped:
             if err in LOGIN_FSM_DETAIL_ERRORS:
                 return err, _login_fsm_rx_tail_detail(bridge)
+            if is_never_rx_probe_failure(
+                err, rx_delta=rx_after - rx_before, last_rx_mono=session.last_rx_mono
+            ):
+                return err, never_rx_hint(getattr(bridge, "device_path", None))
             return err, None
         rx_age_s = now - session.last_rx_mono
         real_path = getattr(bridge, "device_path", None)
