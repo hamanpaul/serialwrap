@@ -699,23 +699,46 @@ fn profile_template_fields_drift() {
     let live_path = t.config_dir().join("profiles").join("default.yaml");
     t.write_file(
         &live_path,
-        b"profiles:\n  prpl-template:\n    platform: prpl\n    prompt_regex: \"x\"\n",
+        b"profiles:\n  prpl-template:\n    platform: prpl\n    prompt_regex: \"x\"\n    login_regex: \"\"\n    password_regex: \"\"\n    ready_probe: \"\"\n    uart: {}\n",
     );
     let (rc, out, _) = t.run(&["doctor"]);
     assert_eq!(rc, 0);
     let doc = json(&out);
     let check = find_check(&doc, "profile_template_fields");
     assert!(!b(check, "ok"));
-    let detail = s(check, "detail");
-    let prefix = format!(
-        "線上 {} 缺出貨資產已有的欄位：prpl-template（",
-        posix_flavor_profile_path(&t)
+    assert!(b(check, "advisory"));
+    assert_eq!(s(check, "comparison_status"), "missing_fields");
+    assert_eq!(
+        check.get_key("missing_fields"),
+        Some(&PyValue::Dict(PyDict::from_pairs(vec![(
+            "prpl-template".into(),
+            PyValue::List(vec![
+                PyValue::Str("boot_done_regex".into()),
+                PyValue::Str("bootloader_prompts".into()),
+            ]),
+        )])))
     );
-    assert!(detail.starts_with(&prefix), "{detail}");
-    // 依名稱排序；platform、prompt_regex 線上已有，不得列入。
-    assert!(detail.contains("boot_done_regex、bootloader_prompts、"), "{detail}");
-    assert!(!detail.contains("platform") && !detail.contains("prompt_regex"), "{detail}");
-    assert!(s(check, "fix").starts_with("setup 不覆寫既有 profile"));
+    assert_eq!(
+        check.get_key("compared_templates"),
+        Some(&PyValue::List(vec![PyValue::Str("prpl-template".into())]))
+    );
+    assert_eq!(check.get_key("reason"), Some(&PyValue::Null));
+    let detail = s(check, "detail");
+    assert_eq!(
+        detail,
+        format!(
+            "線上 {} 的共同 template 缺出貨資產已有的頂層欄位：prpl-template（boot_done_regex、bootloader_prompts）",
+            posix_flavor_profile_path(&t)
+        )
+    );
+    assert!(s(check, "fix").contains("p290 的受控補欄例外由 setup 處理"));
+    assert_eq!(
+        list(&doc, "checks")
+            .iter()
+            .filter(|item| s(item, "check") == "profile_template_fields")
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -732,7 +755,24 @@ fn profile_template_fields_matches_shipped_asset() {
     let doc = json(&out);
     let check = find_check(&doc, "profile_template_fields");
     assert!(b(check, "ok"));
-    assert_eq!(s(check, "detail"), "與出貨資產一致");
+    assert_eq!(s(check, "comparison_status"), "matched");
+    assert_eq!(
+        check.get_key("missing_fields"),
+        Some(&PyValue::Dict(PyDict::new()))
+    );
+    assert_eq!(
+        check.get_key("compared_templates"),
+        Some(&PyValue::List(vec![
+            PyValue::Str("brcm-template".into()),
+            PyValue::Str("op3-template".into()),
+            PyValue::Str("others-template".into()),
+            PyValue::Str("prpl-template".into()),
+            PyValue::Str("smart4R-profile".into()),
+            PyValue::Str("uboot-template".into()),
+        ]))
+    );
+    assert_eq!(check.get_key("reason"), Some(&PyValue::Null));
+    assert_eq!(s(check, "detail"), "共同 template 的頂層欄位無缺漏");
     assert_eq!(s(check, "fix"), "");
 }
 
@@ -743,13 +783,343 @@ fn profile_template_fields_not_materialized() {
     assert_eq!(rc, 0);
     let doc = json(&out);
     let check = find_check(&doc, "profile_template_fields");
-    assert!(b(check, "ok"));
+    assert!(!b(check, "ok"));
+    assert!(b(check, "advisory"));
+    assert_eq!(s(check, "comparison_status"), "not_materialized");
     assert_eq!(
-        s(check, "detail"),
-        format!(
-            "線上 profile 未物化（{}），略過",
-            posix_flavor_profile_path(&t)
-        )
+        check.get_key("reason"),
+        Some(&PyValue::Str("live_not_found".to_string()))
+    );
+    assert_eq!(check.get_key("missing_fields"), Some(&PyValue::Null));
+    assert_eq!(
+        check.get_key("compared_templates"),
+        Some(&PyValue::List(vec![]))
+    );
+}
+
+#[test]
+fn profile_template_fields_invalid_yaml_is_unavailable() {
+    let t = TestEnv::posix();
+    let live_path = t.config_dir().join("profiles").join("default.yaml");
+    t.write_file(&live_path, b"profiles: [secret-profile-value\n");
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "profile_template_fields");
+    assert!(!b(check, "ok"));
+    assert_eq!(s(check, "comparison_status"), "unavailable");
+    assert_eq!(s(check, "reason"), "live_yaml");
+    assert_eq!(check.get_key("missing_fields"), Some(&PyValue::Null));
+    assert_eq!(
+        check.get_key("compared_templates"),
+        Some(&PyValue::List(vec![]))
+    );
+    assert!(!out.contains("secret-profile-value"));
+}
+
+#[test]
+fn profile_template_fields_invalid_structure_is_unavailable() {
+    let t = TestEnv::posix();
+    let live_path = t.config_dir().join("profiles").join("default.yaml");
+    for malformed in [
+        b"[]".as_slice(),
+        b"profiles: 42\n".as_slice(),
+        b"profiles:\n  prpl-template: null\n".as_slice(),
+        b"profiles:\n  prpl-template: 42\n".as_slice(),
+    ] {
+        t.write_file(&live_path, malformed);
+        let (rc, out, _) = t.run(&["doctor"]);
+        assert_eq!(rc, 0);
+        let doc = json(&out);
+        let check = find_check(&doc, "profile_template_fields");
+        assert!(!b(check, "ok"));
+        assert_eq!(s(check, "comparison_status"), "unavailable");
+        assert_eq!(s(check, "reason"), "live_structure");
+        assert_eq!(check.get_key("missing_fields"), Some(&PyValue::Null));
+    }
+}
+
+#[test]
+fn profile_template_fields_unreadable_is_unavailable() {
+    let t = TestEnv::posix().with_fs_fault_read_suffix("default.yaml");
+    let live_path = t.config_dir().join("profiles").join("default.yaml");
+    t.write_file(
+        &live_path,
+        b"profiles:\n  prpl-template:\n    platform: prpl\n    prompt_regex: \"x\"\n    login_regex: \"\"\n    password_regex: \"\"\n    ready_probe: \"\"\n    uart: {}\n",
+    );
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "profile_template_fields");
+    assert!(!b(check, "ok"));
+    assert_eq!(s(check, "comparison_status"), "unavailable");
+    assert_eq!(s(check, "reason"), "live_unreadable");
+    assert_eq!(check.get_key("missing_fields"), Some(&PyValue::Null));
+
+    let t = TestEnv::posix().with_fs_read_error_suffix("default.yaml", PalErrorKind::NotFound);
+    let live_path = t.config_dir().join("profiles").join("default.yaml");
+    t.write_file(
+        &live_path,
+        b"profiles:\n  prpl-template:\n    platform: prpl\n    prompt_regex: \"x\"\n    login_regex: \"\"\n    password_regex: \"\"\n    ready_probe: \"\"\n    uart: {}\n",
+    );
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "profile_template_fields");
+    assert_eq!(s(check, "comparison_status"), "not_materialized");
+    assert_eq!(s(check, "reason"), "live_not_found");
+    assert_eq!(check.get_key("missing_fields"), Some(&PyValue::Null));
+}
+
+#[test]
+fn profile_template_fields_invalid_utf8_is_unavailable() {
+    let t = TestEnv::posix();
+    let live_path = t.config_dir().join("profiles").join("default.yaml");
+    let bytes = vec![0xff, 0xfe, 0xfd, b'\n'];
+    t.write_file(&live_path, &bytes);
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "profile_template_fields");
+    assert!(!b(check, "ok"));
+    assert_eq!(s(check, "comparison_status"), "unavailable");
+    assert_eq!(s(check, "reason"), "live_encoding");
+    assert_eq!(check.get_key("missing_fields"), Some(&PyValue::Null));
+}
+
+#[test]
+fn profile_template_fields_presence_only() {
+    let t = TestEnv::posix();
+    let live_path = t.config_dir().join("profiles").join("default.yaml");
+    t.write_file(
+        &live_path,
+        b"profiles:\n  prpl-template:\n    platform: null\n    prompt_regex: \"x\"\n    login_regex: \"\"\n    password_regex: null\n    ready_probe: []\n    bootloader_prompts: []\n    boot_done_regex: \"\"\n    uart:\n      baud: 115200\n      data_bits: 8\n      parity: N\n      stop_bits: 1\n      flow_control: none\n      xonxoff: false\n",
+    );
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "profile_template_fields");
+    assert!(b(check, "ok"));
+    assert_eq!(s(check, "comparison_status"), "matched");
+    assert_eq!(
+        check.get_key("missing_fields"),
+        Some(&PyValue::Dict(PyDict::new()))
+    );
+    assert_eq!(check.get_key("reason"), Some(&PyValue::Null));
+}
+
+#[test]
+fn profile_template_fields_custom_templates_and_no_common() {
+    let t = TestEnv::posix();
+    let live_path = t.config_dir().join("profiles").join("default.yaml");
+    t.write_file(
+        &live_path,
+        b"profiles:\n  custom-template:\n    platform: prpl\n    prompt_regex: \"x\"\n  prpl-template:\n    platform: prpl\n    prompt_regex: \"x\"\n",
+    );
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "profile_template_fields");
+    assert!(!b(check, "ok"));
+    assert_eq!(s(check, "comparison_status"), "missing_fields");
+    assert_eq!(
+        check.get_key("compared_templates"),
+        Some(&PyValue::List(vec![PyValue::Str("prpl-template".into())]))
+    );
+    assert!(!check
+        .get_key("missing_fields")
+        .unwrap()
+        .as_dict()
+        .contains_key("custom-template"));
+
+    t.write_file(
+        &live_path,
+        b"profiles:\n  custom-template:\n    platform: prpl\n    prompt_regex: \"x\"\n",
+    );
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "profile_template_fields");
+    assert!(!b(check, "ok"));
+    assert_eq!(s(check, "comparison_status"), "no_common_templates");
+    assert_eq!(s(check, "reason"), "no_common_templates");
+    assert_eq!(check.get_key("missing_fields"), Some(&PyValue::Null));
+    assert_eq!(
+        check.get_key("compared_templates"),
+        Some(&PyValue::List(vec![]))
+    );
+}
+
+#[test]
+fn profile_template_fields_windows_payload() {
+    let t = TestEnv::windows()
+        .with_fake_registry(FakeRegistry::new(vec![], &[]))
+        .with_doctor_bundle("3.12.7");
+    let live_path = t.config_dir().join("profiles").join("default.yaml");
+    t.write_file(
+        &live_path,
+        b"profiles:\n  prpl-template:\n    platform: prpl\n    prompt_regex: \"x\"\n    login_regex: \"\"\n    password_regex: \"\"\n    ready_probe: \"\"\n    uart: {}\n",
+    );
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "profile_template_fields");
+    assert!(!b(check, "ok"));
+    assert!(b(check, "advisory"));
+    assert_eq!(s(check, "comparison_status"), "missing_fields");
+    assert_eq!(check.get_key("reason"), Some(&PyValue::Null));
+    assert_eq!(
+        check.get_key("compared_templates"),
+        Some(&PyValue::List(vec![PyValue::Str("prpl-template".into())]))
+    );
+    assert_eq!(
+        check.get_key("missing_fields"),
+        Some(&PyValue::Dict(PyDict::from_pairs(vec![(
+            "prpl-template".into(),
+            PyValue::List(vec![
+                PyValue::Str("boot_done_regex".into()),
+                PyValue::Str("bootloader_prompts".into()),
+            ]),
+        )])))
+    );
+    assert_eq!(
+        list(&doc, "checks")
+            .iter()
+            .filter(|item| s(item, "check") == "profile_template_fields")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn profile_template_fields_p290_transition() {
+    let asset_before_p290 = r#"profiles:
+  prpl-template:
+    platform: prpl
+    prompt_regex: "x"
+    boot_done_regex: "done"
+    bootloader_prompts:
+      - "press any key"
+"#;
+    let asset_with_p290 = r#"profiles:
+  prpl-template:
+    platform: prpl
+    prompt_regex: "x"
+    boot_done_regex: "done"
+    bootloader_prompts:
+      - "press any key"
+    timeout_recovery_keys:
+      - CTRL_C
+"#;
+    let live_old_profile = r#"profiles:
+  prpl-template:
+    platform: prpl
+    prompt_regex: "x"
+    bootloader_prompts:
+      - "press any key"
+"#;
+    let live_before_migration = r#"profiles:
+  prpl-template:
+    platform: prpl
+    prompt_regex: "x"
+    bootloader_prompts:
+      - "press any key"
+"#;
+    let live_after_migration = r#"profiles:
+  prpl-template:
+    platform: prpl
+    prompt_regex: "x"
+    bootloader_prompts:
+      - "press any key"
+    timeout_recovery_keys:
+      - CTRL_C
+"#;
+    let old_asset = sw_cli::doctor_cmd::compare_profile_template_fields(
+        Some(asset_before_p290),
+        Some(live_old_profile),
+    );
+    let before_migration = sw_cli::doctor_cmd::compare_profile_template_fields(
+        Some(asset_with_p290),
+        Some(live_before_migration),
+    );
+    let after_migration = sw_cli::doctor_cmd::compare_profile_template_fields(
+        Some(asset_with_p290),
+        Some(live_after_migration),
+    );
+    assert_eq!(old_asset.comparison_status(), "missing_fields");
+    assert_eq!(before_migration.comparison_status(), "missing_fields");
+    assert_eq!(after_migration.comparison_status(), "missing_fields");
+    assert_eq!(
+        old_asset
+            .missing_fields()
+            .get("prpl-template")
+            .unwrap()
+            .as_slice(),
+        &["boot_done_regex".to_string()]
+    );
+    assert_eq!(
+        before_migration
+            .missing_fields()
+            .get("prpl-template")
+            .unwrap()
+            .as_slice(),
+        &[
+            "boot_done_regex".to_string(),
+            "timeout_recovery_keys".to_string(),
+        ]
+    );
+    assert_eq!(
+        after_migration
+            .missing_fields()
+            .get("prpl-template")
+            .unwrap()
+            .as_slice(),
+        &["boot_done_regex".to_string()]
+    );
+}
+
+#[test]
+fn profile_template_fields_is_read_only() {
+    let t = TestEnv::posix()
+        .with_supervisor_state("on-demand", true, true)
+        .with_process()
+        .with_uart_operation_recording();
+    let live_path = t.config_dir().join("profiles").join("default.yaml");
+    t.write_file(
+        &live_path,
+        b"profiles:\n  prpl-template:\n    platform: prpl\n    prompt_regex: \"x\"\n",
+    );
+    let bytes_before = std::fs::read(&live_path).expect("profile 測試檔讀取");
+    let mutations_before = t.fs_mutations();
+    let service_actions_before = t.service().actions();
+    let (rc, _out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    assert_eq!(
+        std::fs::read(&live_path).expect("profile 測試檔讀取"),
+        bytes_before
+    );
+    assert_eq!(t.fs_mutations(), mutations_before);
+    assert_eq!(t.service().actions(), service_actions_before);
+    assert_eq!(t.process().spawn_count(), 0);
+    assert!(t.process().elevated_spawns().is_empty());
+    assert!(t.calls().is_empty());
+    assert_eq!(t.uart_operation_count(), 0);
+}
+
+#[test]
+fn profile_template_asset_errors_are_unavailable() {
+    assert!(sw_cli::doctor_cmd::profile_template_asset_errors_are_unavailable(None));
+    assert!(sw_cli::doctor_cmd::profile_template_asset_errors_are_unavailable(Some(&[0xff, 0xfe])));
+    assert!(
+        sw_cli::doctor_cmd::profile_template_asset_errors_are_unavailable(Some(b"profiles: [\n"))
+    );
+    assert!(
+        sw_cli::doctor_cmd::profile_template_asset_errors_are_unavailable(Some(
+            b"profiles:\n  template: 42\n"
+        ))
+    );
+    assert!(
+        !sw_cli::doctor_cmd::profile_template_asset_errors_are_unavailable(Some(b"profiles: {}\n"))
     );
 }
 

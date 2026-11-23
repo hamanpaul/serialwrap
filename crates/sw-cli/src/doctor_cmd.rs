@@ -5,7 +5,7 @@
 //! `python`／`pyyaml`／`pyserial` 的檢查對象改為 release manifest 的 daemon runtime（Rust CLI 本身不是 Python；
 //! 登記為 SC-25 附註，見 `contracts/behavior_changes.yaml`）。
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -18,7 +18,7 @@ use crate::install_layout::{self, LayoutError};
 use crate::output;
 use crate::pairing::{pairing_item, safe_component_path};
 use sw_pal::device_source::windows_model::{exclude_bluetooth, read_bt_ports, SERIALCOMM_KEY};
-use sw_pal::PalPathFlavor;
+use sw_pal::{PalErrorKind, PalPathFlavor};
 use sw_proto::pycompat::py_strip;
 use sw_proto::pyfmt::py_str;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
@@ -198,11 +198,11 @@ const FIX_PROFILE_PROMPTS: &str = concat!(
     "重新物化資產或手動補上：備份現有檔後執行 `serialwrap setup`，",
     "或把 sw_core/assets/profiles/default.yaml 對應 template 的 bootloader_prompts 段落補進線上檔",
 );
-/// `profile_template_fields`：缺欄位 fix（逐字照 Python `_check_profile_template_fields`）。
+/// `profile_template_fields`：缺欄位 fix（逐字照 Python `_check_profile_template_fields`；p290 的受控補欄例外另行處理）。
 const FIX_PROFILE_TEMPLATE_FIELDS: &str = concat!(
     "setup 不覆寫既有 profile，升級後新增的欄位要手動補：備份線上檔後，參照出貨資產 ",
-    "sw_core/assets/profiles/default.yaml 把缺的欄位補進對應 template，再 ",
-    "serialwrap service restart（on-demand：daemon stop 後 daemon start）；",
+    "sw_core/assets/profiles/default.yaml 把缺的欄位補進對應 template；p290 的受控補欄例外由 setup 處理，",
+    "其餘欄位仍需手動補，再 serialwrap service restart（on-demand：daemon stop 後 daemon start）；",
     "刻意不用的欄位可忽略本項",
 );
 // ---- Rust 側契約字串（07 §7.3 之外）----
@@ -1263,6 +1263,12 @@ fn profiles_entries(root: &YValue) -> Option<Vec<(YValue, YValue)>> {
     }
 }
 
+fn profile_entries_are_mapping(entries: &[(YValue, YValue)]) -> bool {
+    entries
+        .iter()
+        .all(|(_, template)| matches!(template, YValue::Map(_)))
+}
+
 /// 純函式：出貨資產有 `bootloader_prompts` 而線上檔沒有的 template 名單（排序後）。
 fn profile_templates_missing_bootloader_prompts(asset_text: &str, live_text: &str) -> Vec<String> {
     let (Ok(asset), Ok(live)) = (yaml11::safe_load(asset_text), yaml11::safe_load(live_text))
@@ -1359,35 +1365,258 @@ fn check_profile_bootloader_prompts(ctx: &CliCtx) -> Check {
     }
 }
 
+/// 比較狀態，限制為 doctor 公開契約定義的五種結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileTemplateComparisonStatus {
+    Matched,
+    MissingFields,
+    NotMaterialized,
+    Unavailable,
+    NoCommonTemplates,
+}
+
+impl ProfileTemplateComparisonStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Matched => "matched",
+            Self::MissingFields => "missing_fields",
+            Self::NotMaterialized => "not_materialized",
+            Self::Unavailable => "unavailable",
+            Self::NoCommonTemplates => "no_common_templates",
+        }
+    }
+}
+
+/// 共同 template 頂層欄位比較結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileTemplateComparison {
+    comparison_status: ProfileTemplateComparisonStatus,
+    missing_fields: BTreeMap<String, Vec<String>>,
+    compared_templates: Vec<String>,
+    reason: Option<&'static str>,
+}
+
+impl ProfileTemplateComparison {
+    fn with_status(
+        comparison_status: ProfileTemplateComparisonStatus,
+        missing_fields: BTreeMap<String, Vec<String>>,
+        compared_templates: Vec<String>,
+        reason: Option<&'static str>,
+    ) -> Self {
+        Self {
+            comparison_status,
+            missing_fields,
+            compared_templates,
+            reason,
+        }
+    }
+
+    pub fn comparison_status(&self) -> &str {
+        self.comparison_status.as_str()
+    }
+
+    pub fn missing_fields(&self) -> &BTreeMap<String, Vec<String>> {
+        &self.missing_fields
+    }
+
+    pub fn compared_templates(&self) -> &[String] {
+        &self.compared_templates
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        self.reason
+    }
+
+    fn to_extra(&self) -> PyDict {
+        let mut extra = PyDict::new();
+        extra.insert(
+            "comparison_status",
+            PyValue::Str(self.comparison_status.as_str().to_string()),
+        );
+        extra.insert(
+            "missing_fields",
+            match self.comparison_status {
+                ProfileTemplateComparisonStatus::Matched => PyValue::Dict(PyDict::new()),
+                ProfileTemplateComparisonStatus::MissingFields => {
+                    PyValue::Dict(PyDict::from_pairs(
+                        self.missing_fields
+                            .iter()
+                            .map(|(name, fields)| {
+                                (
+                                    name.clone(),
+                                    PyValue::List(
+                                        fields.iter().cloned().map(PyValue::Str).collect(),
+                                    ),
+                                )
+                            })
+                            .collect(),
+                    ))
+                }
+                ProfileTemplateComparisonStatus::NotMaterialized
+                | ProfileTemplateComparisonStatus::Unavailable
+                | ProfileTemplateComparisonStatus::NoCommonTemplates => PyValue::Null,
+            },
+        );
+        extra.insert(
+            "compared_templates",
+            PyValue::List(
+                self.compared_templates
+                    .iter()
+                    .cloned()
+                    .map(PyValue::Str)
+                    .collect(),
+            ),
+        );
+        extra.insert(
+            "reason",
+            match self.reason {
+                Some(reason) => PyValue::Str(reason.to_string()),
+                None => PyValue::Null,
+            },
+        );
+        extra
+    }
+}
+
 /// 純函式：出貨資產 template 有、線上同名 template 沒有的頂層欄位（依名稱排序）。
 ///
 /// 只比對兩邊都存在的 template、只看欄位是否存在（值為空或 null 算有設定），不比對值也不看
-/// 巢狀欄位；YAML 解析失敗或結構不是 mapping 一律回空清單（同 Python `_profile_templates_missing_fields`）。
-fn profile_templates_missing_fields(asset_text: &str, live_text: &str) -> Vec<(String, Vec<String>)> {
-    let (Ok(asset), Ok(live)) = (yaml11::safe_load(asset_text), yaml11::safe_load(live_text))
-    else {
-        return Vec::new();
+/// 巢狀欄位；YAML 解析失敗、讀取失敗或結構不是 mapping 時以型別比較結果包住，不回空清單。
+pub fn compare_profile_template_fields(
+    asset_text: Option<&str>,
+    live_text: Option<&str>,
+) -> ProfileTemplateComparison {
+    let Some(asset_text) = asset_text else {
+        return ProfileTemplateComparison::with_status(
+            ProfileTemplateComparisonStatus::Unavailable,
+            BTreeMap::new(),
+            Vec::new(),
+            Some("asset_missing"),
+        );
     };
-    let (Some(asset_profiles), Some(live_profiles)) =
-        (profiles_entries(&asset), profiles_entries(&live))
-    else {
-        return Vec::new();
+    let parsed_asset = match yaml11::safe_load(asset_text) {
+        Ok(value) => value,
+        Err(_) => {
+            return ProfileTemplateComparison::with_status(
+                ProfileTemplateComparisonStatus::Unavailable,
+                BTreeMap::new(),
+                Vec::new(),
+                Some("asset_yaml"),
+            );
+        }
     };
-    let mut drifted: Vec<(String, Vec<String>)> = Vec::new();
-    for (name, template) in &asset_profiles {
-        let YValue::Map(template) = template else {
-            continue;
-        };
-        let Some((_, YValue::Map(live_template))) =
-            live_profiles.iter().find(|(key, _)| key == name)
+    let Some(asset_profiles) = profiles_entries(&parsed_asset) else {
+        return ProfileTemplateComparison::with_status(
+            ProfileTemplateComparisonStatus::Unavailable,
+            BTreeMap::new(),
+            Vec::new(),
+            Some("asset_structure"),
+        );
+    };
+    if !profile_entries_are_mapping(&asset_profiles) {
+        return ProfileTemplateComparison::with_status(
+            ProfileTemplateComparisonStatus::Unavailable,
+            BTreeMap::new(),
+            Vec::new(),
+            Some("asset_structure"),
+        );
+    }
+    let Some(live_text) = live_text else {
+        return ProfileTemplateComparison::with_status(
+            ProfileTemplateComparisonStatus::NotMaterialized,
+            BTreeMap::new(),
+            Vec::new(),
+            Some("live_not_found"),
+        );
+    };
+    let parsed_live = match yaml11::safe_load(live_text) {
+        Ok(value) => value,
+        Err(_) => {
+            return ProfileTemplateComparison::with_status(
+                ProfileTemplateComparisonStatus::Unavailable,
+                BTreeMap::new(),
+                Vec::new(),
+                Some("live_yaml"),
+            );
+        }
+    };
+    let Some(live_profiles) = profiles_entries(&parsed_live) else {
+        return ProfileTemplateComparison::with_status(
+            ProfileTemplateComparisonStatus::Unavailable,
+            BTreeMap::new(),
+            Vec::new(),
+            Some("live_structure"),
+        );
+    };
+    if !profile_entries_are_mapping(&live_profiles) {
+        return ProfileTemplateComparison::with_status(
+            ProfileTemplateComparisonStatus::Unavailable,
+            BTreeMap::new(),
+            Vec::new(),
+            Some("live_structure"),
+        );
+    }
+
+    let common_names = asset_profiles
+        .iter()
+        .map(|(name, _)| py_str_of(name))
+        .collect::<HashSet<_>>()
+        .intersection(
+            &live_profiles
+                .iter()
+                .map(|(name, _)| py_str_of(name))
+                .collect::<HashSet<_>>(),
+        )
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut common_names_sorted = common_names;
+    common_names_sorted.sort();
+    if common_names_sorted.is_empty() {
+        return ProfileTemplateComparison::with_status(
+            ProfileTemplateComparisonStatus::NoCommonTemplates,
+            BTreeMap::new(),
+            Vec::new(),
+            Some("no_common_templates"),
+        );
+    }
+
+    let mut drifted: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut compared_templates: Vec<String> = Vec::new();
+    for name in &common_names_sorted {
+        compared_templates.push(name.clone());
+        let Some((_, asset_template)) = asset_profiles
+            .iter()
+            .find(|(template_name, _)| py_str_of(template_name) == *name)
         else {
             continue;
         };
-        let mut missing: Vec<String> = template
+        let YValue::Map(asset_map) = asset_template else {
+            return ProfileTemplateComparison::with_status(
+                ProfileTemplateComparisonStatus::Unavailable,
+                BTreeMap::new(),
+                Vec::new(),
+                Some("asset_structure"),
+            );
+        };
+        let Some((_, live_template)) = live_profiles
+            .iter()
+            .find(|(template_name, _)| py_str_of(template_name) == *name)
+        else {
+            continue;
+        };
+        let YValue::Map(live_map) = live_template else {
+            return ProfileTemplateComparison::with_status(
+                ProfileTemplateComparisonStatus::Unavailable,
+                BTreeMap::new(),
+                Vec::new(),
+                Some("live_structure"),
+            );
+        };
+        let mut missing: Vec<String> = asset_map
             .0
             .iter()
             .filter_map(|(key, _)| match key {
-                YValue::Str(key) if !live_template.contains_str(key) => Some(key.clone()),
+                YValue::Str(key) if !live_map.contains_str(key) => Some(key.clone()),
                 _ => None,
             })
             .collect();
@@ -1395,55 +1624,164 @@ fn profile_templates_missing_fields(asset_text: &str, live_text: &str) -> Vec<(S
             continue;
         }
         missing.sort();
-        drifted.push((py_str_of(name), missing));
+        drifted.insert(name.clone(), missing);
     }
-    drifted.sort();
-    drifted
+    if drifted.is_empty() {
+        return ProfileTemplateComparison::with_status(
+            ProfileTemplateComparisonStatus::Matched,
+            BTreeMap::new(),
+            compared_templates,
+            None,
+        );
+    }
+    ProfileTemplateComparison::with_status(
+        ProfileTemplateComparisonStatus::MissingFields,
+        drifted,
+        compared_templates,
+        None,
+    )
+}
+
+fn profile_asset_text(asset_bytes: Option<&[u8]>) -> Result<&str, &'static str> {
+    let Some(bytes) = asset_bytes else {
+        return Err("asset_missing");
+    };
+    std::str::from_utf8(bytes).map_err(|_| "asset_encoding")
+}
+
+pub fn profile_template_asset_errors_are_unavailable(asset_bytes: Option<&[u8]>) -> bool {
+    let Ok(asset_text) = profile_asset_text(asset_bytes) else {
+        return true;
+    };
+    matches!(
+        compare_profile_template_fields(Some(asset_text), Some("profiles: {}\n")).comparison_status,
+        ProfileTemplateComparisonStatus::Unavailable
+    )
 }
 
 /// `profile_template_fields`（advisory）：線上 profile 的 template 是否缺出貨資產已有的欄位。
 fn check_profile_template_fields(ctx: &CliCtx) -> Check {
-    let asset_text = PROFILE_ASSETS
+    let asset_bytes = PROFILE_ASSETS
         .iter()
         .find(|asset| asset.rel == "profiles/default.yaml")
-        .and_then(|asset| String::from_utf8(asset.bytes.to_vec()).ok());
-    let live_path = pypath::join(flavor_of(ctx), &ctx.paths.profile_dir, &["default.yaml"]);
-    let ok_with = |detail: String| Check {
-        check: "profile_template_fields",
-        ok: true,
-        detail,
-        fix: Some(String::new()),
-        advisory: false,
-        extra: PyDict::new(),
+        .map(|asset| asset.bytes);
+    let raw_live_path = pypath::join(flavor_of(ctx), &ctx.paths.profile_dir, &["default.yaml"]);
+    let mut live_path = raw_live_path.clone();
+    let asset_text = match profile_asset_text(asset_bytes) {
+        Ok(text) => text,
+        Err(reason) => {
+            let result = ProfileTemplateComparison::with_status(
+                ProfileTemplateComparisonStatus::Unavailable,
+                BTreeMap::new(),
+                Vec::new(),
+                Some(reason),
+            );
+            return Check {
+                check: "profile_template_fields",
+                ok: false,
+                detail: format!("線上 {live_path} 的模板欄位不可比較（{reason}），略過"),
+                fix: Some(String::new()),
+                advisory: true,
+                extra: result.to_extra(),
+            };
+        }
     };
-    let Some(asset_text) = asset_text else {
-        return ok_with(DETAIL_ASSET_UNREADABLE.to_string());
-    };
-    let live_text = ctx
-        .p
-        .fs
-        .read(Path::new(&live_path))
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok());
-    let Some(live_text) = live_text else {
-        return ok_with(format!("線上 profile 未物化（{live_path}），略過"));
-    };
-    let drifted = profile_templates_missing_fields(&asset_text, &live_text);
-    if drifted.is_empty() {
-        return ok_with(DETAIL_MATCHES_ASSET.to_string());
+    let asset_validation = compare_profile_template_fields(Some(asset_text), None);
+    if asset_validation.comparison_status == ProfileTemplateComparisonStatus::Unavailable {
+        let reason = asset_validation.reason.unwrap_or("asset_unavailable");
+        return Check {
+            check: "profile_template_fields",
+            ok: false,
+            detail: format!("出貨 profile 資產不可比較（{reason}），略過"),
+            fix: Some(String::new()),
+            advisory: true,
+            extra: asset_validation.to_extra(),
+        };
     }
-    let listed = drifted
-        .iter()
-        .map(|(name, keys)| format!("{name}（{}）", keys.join("、")))
-        .collect::<Vec<_>>()
-        .join("；");
+    let mut live_path_candidates = vec![PathBuf::from(raw_live_path.as_str())];
+    let alt_live_path = raw_live_path.replace('\\', "/");
+    if alt_live_path != raw_live_path {
+        live_path_candidates.push(PathBuf::from(alt_live_path));
+    }
+    let mut live_bytes = None;
+    for candidate in live_path_candidates {
+        match ctx.p.fs.read(&candidate) {
+            Ok(bytes) => {
+                live_path = candidate.to_string_lossy().into_owned();
+                live_bytes = Some(bytes);
+                break;
+            }
+            Err(error) if error.kind == PalErrorKind::NotFound => {}
+            Err(_) => {
+                live_path = candidate.to_string_lossy().into_owned();
+                let result = ProfileTemplateComparison::with_status(
+                    ProfileTemplateComparisonStatus::Unavailable,
+                    BTreeMap::new(),
+                    Vec::new(),
+                    Some("live_unreadable"),
+                );
+                return Check {
+                    check: "profile_template_fields",
+                    ok: false,
+                    detail: format!("線上 {live_path} 的模板欄位不可比較（live_unreadable），略過"),
+                    fix: Some(String::new()),
+                    advisory: true,
+                    extra: result.to_extra(),
+                };
+            }
+        }
+    }
+    let comparison = match live_bytes {
+        None => ProfileTemplateComparison::with_status(
+            ProfileTemplateComparisonStatus::NotMaterialized,
+            BTreeMap::new(),
+            Vec::new(),
+            Some("live_not_found"),
+        ),
+        Some(bytes) => match String::from_utf8(bytes) {
+            Ok(live_text) => compare_profile_template_fields(Some(asset_text), Some(&live_text)),
+            Err(_) => ProfileTemplateComparison::with_status(
+                ProfileTemplateComparisonStatus::Unavailable,
+                BTreeMap::new(),
+                Vec::new(),
+                Some("live_encoding"),
+            ),
+        },
+    };
+    let detail = match comparison.comparison_status {
+        ProfileTemplateComparisonStatus::Matched => "共同 template 的頂層欄位無缺漏".to_string(),
+        ProfileTemplateComparisonStatus::MissingFields => {
+            let listed = comparison
+                .missing_fields
+                .iter()
+                .map(|(name, keys)| format!("{name}（{}）", keys.join("、")))
+                .collect::<Vec<_>>()
+                .join("；");
+            format!("線上 {live_path} 的共同 template 缺出貨資產已有的頂層欄位：{listed}")
+        }
+        ProfileTemplateComparisonStatus::NotMaterialized => {
+            format!("線上 profile 未物化（{live_path}），略過")
+        }
+        ProfileTemplateComparisonStatus::NoCommonTemplates => {
+            format!("線上 {live_path} 與出貨資產沒有共同 template，略過")
+        }
+        ProfileTemplateComparisonStatus::Unavailable => format!(
+            "線上 {live_path} 的模板欄位不可比較（{}），略過",
+            comparison.reason.unwrap_or("unknown")
+        ),
+    };
+    let fix = if comparison.comparison_status == ProfileTemplateComparisonStatus::MissingFields {
+        Some(FIX_PROFILE_TEMPLATE_FIELDS.to_string())
+    } else {
+        Some(String::new())
+    };
     Check {
         check: "profile_template_fields",
-        ok: false,
-        detail: format!("線上 {live_path} 缺出貨資產已有的欄位：{listed}"),
-        fix: Some(FIX_PROFILE_TEMPLATE_FIELDS.to_string()),
-        advisory: false,
-        extra: PyDict::new(),
+        ok: comparison.comparison_status == ProfileTemplateComparisonStatus::Matched,
+        detail,
+        fix,
+        advisory: true,
+        extra: comparison.to_extra(),
     }
 }
 
@@ -1741,4 +2079,20 @@ pub fn run_doctor_cmd(_ns: &Namespace, ctx: &mut CliCtx) -> i32 {
     doc.insert("ok", PyValue::Bool(overall));
     let _ = output::print_json(&mut ctx.io, &doc);
     0
+}
+
+#[cfg(test)]
+mod profile_template_fields_tests {
+    use super::profile_template_asset_errors_are_unavailable as asset_errors_are_unavailable;
+
+    #[test]
+    fn profile_template_asset_errors_are_unavailable() {
+        assert!(asset_errors_are_unavailable(None));
+        assert!(asset_errors_are_unavailable(Some(&[0xff, 0xfe])));
+        assert!(asset_errors_are_unavailable(Some(b"profiles: [\n")));
+        assert!(asset_errors_are_unavailable(Some(
+            b"profiles:\n  prpl-template: null\n"
+        )));
+        assert!(!asset_errors_are_unavailable(Some(b"profiles: {}\n")));
+    }
 }
