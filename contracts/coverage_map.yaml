@@ -29,6 +29,23 @@ entries:
     - cargo:sw-cli::mgmt_remote::windows_argv_drops_control_master_but_identity_unchanged
     - cargo:sw-cli::mgmt_remote::windows_connect_ready_via_ping
     owner_phase: P4
+  bc:BC-08:
+    nodeids:
+    - cargo:sw-cli::mgmt_doctor::profile_template_asset_errors_are_unavailable
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_custom_templates_and_no_common
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_drift
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_invalid_structure_is_unavailable
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_invalid_utf8_is_unavailable
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_invalid_yaml_is_unavailable
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_is_read_only
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_matches_shipped_asset
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_not_materialized
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_p290_transition
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_presence_only
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_unreadable_is_unavailable
+    - cargo:sw-cli::mgmt_doctor::profile_template_fields_windows_payload
+    - cargo:sw-cli::sw_cli::doctor_cmd::profile_template_fields_tests::profile_template_asset_errors_are_unavailable
+    owner_phase: P4
   bc:DF-01:
     nodeids:
     - cargo:sw-core::event_store::reset_with_invalid_rule_id_counts_zero_df01
@@ -2647,6 +2664,7 @@ l1_only_approvals:
   "bc:BC-03": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:BC-03 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:BC-04": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:BC-04 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:BC-05": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:BC-05 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:BC-08": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-08 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:DF-01": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-01 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:DF-02": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-02 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:DF-03": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-03 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}

@@ -465,7 +465,9 @@ def fake_driver(tmp_path, monkeypatch):
     drv = _load_driver()
     made: list[_FakeContainer] = []
 
-    def make(*, cli_version: str, exit_delay: float | None = 0.4, stop_wait_s: float = 10.0):
+    def make(*, cli_version: str, exit_delay: float | None = 0.4, stop_wait_s: float = 10.0,
+             mode: str = "on-demand", scenario: str = "upgrade",
+             profile_policies: dict[str, dict[str, Any]] | None = None):
         fake = _FakeContainer(tmp_path, drv, cli_version=cli_version, exit_delay=exit_delay)
         made.append(fake)
         monkeypatch.setattr(drv, "CONFIG", fake.config)
@@ -473,14 +475,35 @@ def fake_driver(tmp_path, monkeypatch):
         # phase_seed 以 subprocess.run 執行 chown：只替換 driver 模組看到的 subprocess，不動全域
         monkeypatch.setattr(drv, "subprocess", types.SimpleNamespace(
             run=lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""), CompletedProcess=subprocess.CompletedProcess,
-            TimeoutExpired=subprocess.TimeoutExpired))
+            TimeoutExpired=subprocess.TimeoutExpired, SubprocessError=subprocess.SubprocessError))
         out = tmp_path / "out"
         out.mkdir(exist_ok=True)
-        driver = drv.Driver("on-demand", tmp_path / "w.whl", tmp_path / "bundle", out,
-                            installer=tmp_path / "install.sh", bundle_tarball=tmp_path / "t.tar.gz")
+        default_policies, policy_evidence = drv.select_upgrade_profile_policies()
+        selected_policies = profile_policies or default_policies
+        driver = drv.Driver(mode, tmp_path / "w.whl", tmp_path / "bundle", out, scenario=scenario,
+                            installer=tmp_path / "install.sh", bundle_tarball=tmp_path / "t.tar.gz",
+                            profile_policies=selected_policies,
+                            profile_policy_evidence=policy_evidence)
+        driver._upgrade_checks = drv.uc
+        driver._driver_module = drv
         driver.proc_root = fake.proc
         driver.stop_wait_s = stop_wait_s
-        driver.sw = fake.sw
+
+        def sw(*args, **kwargs):
+            if args == ("doctor",):
+                if fake.cli == NEW_VERSION or drv.uc.cli_version_identifies(fake.cli, NEW_VERSION):
+                    doctor = _doctor_with_profile_policy(driver.profile_policies["new"])
+                else:
+                    doctor = {"ok": True, "checks": [
+                        {"check": "dialout", "ok": True, "advisory": False},
+                        {"check": "devices", "ok": False, "advisory": True},
+                    ]}
+                return subprocess.CompletedProcess(
+                    ["serialwrap", "doctor"], 0, json.dumps(doctor, ensure_ascii=False) + "\n", "",
+                )
+            return fake.sw(*args, **kwargs)
+
+        driver.sw = sw
         driver.run = fake.run
         orig_wait = driver.wait_daemon
         driver.wait_daemon = lambda *, version, timeout=60.0: orig_wait(version=version, timeout=min(timeout, 2.0))
@@ -494,6 +517,98 @@ def fake_driver(tmp_path, monkeypatch):
     yield make
     for fake in made:
         fake.close()
+
+
+@pytest.mark.posix_only
+@pytest.mark.memory_only
+@pytest.mark.parametrize(("phase", "mode", "scenario", "cli_version", "policy_key", "expected_phase"), [
+    ("upgrade", "on-demand", "upgrade", NEW_VERSION, "new", "migrated"),
+    ("upgrade-missing-timeout", "on-demand", "upgrade", NEW_VERSION, "new", "migrated"),
+    ("install-sh", "on-demand", "install-sh", NEW_VERSION, "new", "migrated"),
+    ("system", "systemd-system", "upgrade", NEW_VERSION, "new", "migrated"),
+    ("reupgrade", "on-demand", "upgrade", "0.3.2", "new", "migrated"),
+    ("old", "on-demand", "upgrade", "0.3.2", "old", "legacy_0_3_2"),
+    ("downgrade", "on-demand", "upgrade", NEW_VERSION, "downgrade", "downgrade"),
+])
+def test_upgrade_driver_passes_profile_expectation_policy(
+    fake_driver, monkeypatch, phase, mode, scenario, cli_version, policy_key, expected_phase,
+):
+    policies, policy_evidence = _load_driver().select_upgrade_profile_policies()
+    driver, _fake = fake_driver(
+        cli_version=cli_version, mode=mode, scenario=scenario, profile_policies=policies,
+    )
+    assert driver.profile_policy_evidence == policy_evidence
+    policy_source = driver._driver_module.uc.PROFILE_EXPECTATIONS_PATH.read_bytes()
+    assert policy_evidence == {
+        "policy_id": "od33-profile-template-fields-v1",
+        "policy_sha256": hashlib.sha256(policy_source).hexdigest(),
+        "migration_policy_id": "p290-template-migration-v1",
+        "selected_phases": {
+            "old": "legacy_0_3_2", "new": "migrated", "downgrade": "downgrade",
+        },
+    }
+    selected = policies[policy_key]
+    if selected["supported"]:
+        missing_fields = {"prpl-template": ["timeout_recovery_keys"]} \
+            if phase == "upgrade-missing-timeout" else None
+        doctor_payload = _doctor_with_profile_policy(
+            selected, missing_fields=missing_fields,
+            profile_ok=False if missing_fields is not None else None,
+        )
+    else:
+        doctor_payload = {"ok": True, "checks": [
+            {"check": "dialout", "ok": True, "advisory": False},
+            {"check": "devices", "ok": False, "advisory": True},
+        ]}
+    real_sw = driver.sw
+
+    def sw(*args, **kwargs):
+        if args == ("doctor",):
+            return subprocess.CompletedProcess(
+                ["serialwrap", "doctor"], 0, json.dumps(doctor_payload, ensure_ascii=False) + "\n", "",
+            )
+        return real_sw(*args, **kwargs)
+
+    driver.sw = sw
+    calls: list[tuple[str, dict[str, Any] | None]] = []
+    real_judge = driver._upgrade_checks.judge_doctor
+
+    def judge(check_id, doctor, *, require_pairing, profile_policy=None):
+        calls.append((check_id, profile_policy))
+        return real_judge(check_id, doctor, require_pairing=require_pairing, profile_policy=profile_policy)
+
+    monkeypatch.setattr(driver._upgrade_checks, "judge_doctor", judge)
+    if phase in {"upgrade", "upgrade-missing-timeout", "install-sh", "system"}:
+        monkeypatch.setattr(driver._upgrade_checks, "scan_daemon_instances", lambda _root: [4242])
+        monkeypatch.setattr(driver._driver_module, "bundle_source_evidence", lambda *_a, **_k: {
+            "from_bundle": True, "exe_path": "/tmp/serialwrap", "exe_read_method": "test",
+            "exe_read_error": None, "argv_mentions_bundle": True,
+        })
+
+    if phase in {"upgrade", "upgrade-missing-timeout", "install-sh"}:
+        driver.phase_new_running()
+        expected_check = "doctor_green_new"
+    elif phase == "system":
+        driver.phase_new_running_system()
+        expected_check = "doctor_green_new"
+    elif phase == "reupgrade":
+        driver.phase_reupgrade()
+        expected_check = "reupgrade_doctor"
+    elif phase == "old":
+        driver.phase_seed()
+        expected_check = "doctor_green_old"
+    else:
+        driver.phase_downgrade()
+        expected_check = "doctor_green_downgrade"
+
+    assert calls == [(expected_check, selected)]
+    assert selected["phase"] == expected_phase
+    expected_profile_dir = "/etc/serialwrap/profiles" if mode == "systemd-system" \
+        else str(driver._driver_module.CONFIG / "profiles")
+    assert driver.env["SERIALWRAP_PROFILE_DIR"] == expected_profile_dir
+    assert driver.doctor_evidence[-1]["profile_path"] == expected_profile_dir
+    if phase == "upgrade-missing-timeout":
+        assert _row(driver, "doctor_green_new")["verdict"] == "FAIL"
 
 
 def _row(driver: Any, check_id: str) -> dict[str, Any]:
@@ -552,7 +667,7 @@ _VERSION_WITH_FP = f"serialwrap {NEW_VERSION} (code {_BASELINE_FP})"
 
 def _with_baseline_fingerprint(fake, driver):
     """新版的 `--version` 改成 Python 基線整行；0.3.2 維持純版本。"""
-    orig = fake.sw
+    orig = driver.sw
 
     def sw(*args, **kwargs):
         proc = orig(*args, **kwargs)

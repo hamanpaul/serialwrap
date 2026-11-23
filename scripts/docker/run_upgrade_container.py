@@ -211,11 +211,19 @@ ATTACHED_BY_ID = pathlib.Path("/dev/serial/by-id/usb-UPGRADE_ATTACHED-if00-port0
 class Driver:
     def __init__(self, mode: str, wheel: pathlib.Path, bundle: pathlib.Path, out: pathlib.Path, *,
                  scenario: str = "upgrade", installer: pathlib.Path | None = None,
-                 bundle_tarball: pathlib.Path | None = None) -> None:
+                 bundle_tarball: pathlib.Path | None = None,
+                 profile_policies: dict[str, dict[str, Any]],
+                 profile_policy_evidence: dict[str, Any]) -> None:
+        if set(profile_policies) != {"old", "new", "downgrade"}:
+            raise ValueError("Driver 必須保存 old/new/downgrade 三種明確 profile policy")
         self.mode = mode
         self.scenario = scenario
         self.installer = installer
         self.bundle_tarball = bundle_tarball
+        self.profile_policies = profile_policies
+        self.profile_policy_evidence = profile_policy_evidence
+        self.doctor_profile_dir = SYSTEM_PROFILE_DIR if mode == "systemd-system" else CONFIG / "profiles"
+        self.doctor_evidence: list[dict[str, Any]] = []
         self.flag = {"systemd-user": "--user", "systemd-system": "--system"}.get(mode, "--on-demand")
         self.setup_args = [self.flag, "--with-sudo"] if mode == "systemd-system" else [self.flag]
         self.wheel = wheel
@@ -233,6 +241,7 @@ class Driver:
             "HOME": str(HOME), "USER": USER, "LOGNAME": USER, "SHELL": "/bin/bash", "LANG": "C.UTF-8",
             "XDG_RUNTIME_DIR": "/run/user/1000", "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
             "PATH": f"{BIN}:/usr/local/bin:/usr/bin:/bin",
+            "SERIALWRAP_PROFILE_DIR": str(self.doctor_profile_dir),
         }
 
     # ---------- 基礎 ----------
@@ -350,8 +359,22 @@ class Driver:
         sessions = self.parse(self.sw("session", "list", label="session list")) or {}
         return {"aliases": aliases.get("aliases") or [], "sessions": sessions.get("sessions") or []}
 
-    def doctor(self, label: str) -> dict[str, Any] | None:
+    def doctor(self, label: str, profile_policy: dict[str, Any]) -> dict[str, Any] | None:
+        self.doctor_evidence.append({
+            "label": label,
+            "profile_path": str(self.doctor_profile_dir),
+            "policy_id": profile_policy.get("policy_id"),
+            "policy_phase": profile_policy.get("phase"),
+            "migration_policy_id": profile_policy.get("migration_policy_id"),
+        })
         return self.parse(self.sw("doctor", label=label))
+
+    def judge_doctor(self, check_id: str, label: str, *, require_pairing: bool,
+                     profile_policy: dict[str, Any]) -> dict[str, Any]:
+        result = uc.judge_doctor(check_id, self.doctor(label, profile_policy),
+                                 require_pairing=require_pairing, profile_policy=profile_policy)
+        result.setdefault("detail", {})["doctor_profile_path"] = str(self.doctor_profile_dir)
+        return result
 
     def systemctl_user(self, *args: str) -> subprocess.CompletedProcess[str]:
         return self.run(["systemctl", "--user", *args], label="systemctl --user " + " ".join(args), timeout=30)
@@ -454,7 +477,8 @@ class Driver:
         if self.mode == "on-demand":
             seed["detail"]["stop_wait"] = seed_wait
         self.add(seed)
-        self.add(uc.judge_doctor("doctor_green_old", self.doctor("0.3.2 doctor"), require_pairing=False))
+        self.add(self.judge_doctor("doctor_green_old", "0.3.2 doctor", require_pairing=False,
+                                   profile_policy=self.profile_policies["old"]))
 
     def _site(self) -> dict[str, Any]:
         return {"daemon_pids": uc.scan_daemon_instances(self.proc_root), "entries": self.entries(),
@@ -601,7 +625,8 @@ class Driver:
                         multi_open=status.get("multi_open"), instances=pids, argv=argv[:6], **evidence))
         self._check_supervision("supervision_reconciled", status.get("pid"))
         self.add(uc.judge_state_compatible(self.baseline, self.state_view(), "state_compatible_upgrade"))
-        self.add(uc.judge_doctor("doctor_green_new", self.doctor(f"{NEW_VERSION} doctor"), require_pairing=True))
+        self.add(self.judge_doctor("doctor_green_new", f"{NEW_VERSION} doctor", require_pairing=True,
+                                   profile_policy=self.profile_policies["new"]))
 
     def phase_new_running_system(self) -> None:
         """systemd-system：新 daemon 已由 setup 啟動（不得由 driver 代啟），驗證來源、監管收斂、狀態與 doctor。"""
@@ -636,7 +661,8 @@ class Driver:
                         mode_in_config=mode_line, active=active, enabled=enabled, main_pid=main_pid,
                         daemon_pid=status.get("pid"), dropins=dropins))
         self.add(uc.judge_state_compatible(self.baseline, self.state_view(), "state_compatible_upgrade"))
-        self.add(uc.judge_doctor("doctor_green_new", self.doctor(f"{NEW_VERSION} doctor"), require_pairing=True))
+        self.add(self.judge_doctor("doctor_green_new", f"{NEW_VERSION} doctor", require_pairing=True,
+                                   profile_policy=self.profile_policies["new"]))
         self.run(["sudo", "systemctl", "stop", "serialwrap"], label="收尾 sudo systemctl stop")
         self.wait_no_daemon()
 
@@ -700,7 +726,8 @@ class Driver:
                         stop_wait=wait))
         self.add(uc.judge_files_preserved("config_preserved_downgrade", self.cfg_before, uc.snapshot_files(CONFIG)))
         self.add(uc.judge_state_compatible(self.baseline, self.state_view(), "state_compatible_downgrade"))
-        self.add(uc.judge_doctor("doctor_green_downgrade", self.doctor("0.3.2 doctor（降級）"), require_pairing=False))
+        self.add(self.judge_doctor("doctor_green_downgrade", "0.3.2 doctor（降級）", require_pairing=False,
+                                   profile_policy=self.profile_policies["downgrade"]))
 
     def phase_reupgrade(self) -> None:
         stop, wait = self.stop_daemon("0.3.2 daemon stop（重新升級）")
@@ -713,16 +740,19 @@ class Driver:
             else self.stop_wait_failed(f"{NEW_VERSION} start（重新升級）", wait)
         status = self.wait_daemon(version=NEW_VERSION) or {}
         version = self.cli_version()
+        doctor = self.judge_doctor("reupgrade_doctor", f"{NEW_VERSION} doctor（重新升級）",
+                                   require_pairing=True, profile_policy=self.profile_policies["new"])
         ok = stop.returncode == 0 and gone and proc.returncode == 0 and body.get("ok") is True \
             and start.returncode == 0 and status.get("version") == NEW_VERSION \
-            and uc.cli_version_identifies(version, NEW_VERSION)
+            and uc.cli_version_identifies(version, NEW_VERSION) and doctor["verdict"] == "PASS"
         if op.get("from_version") not in (None, OLD_VERSION):
             self.observations.append({"id": "OBS-UPGRADE-STALE-CURRENT", "phase": "reupgrade",
                                       "op": op.get("op"), "from_version": op.get("from_version"),
                                       "note": f"手動降級後 current-release.json 仍記 {NEW_VERSION}，重新升級被記為 {NEW_VERSION}→{NEW_VERSION} update"})
         self.add(uc.row("reupgrade", "PASS" if ok else "FAIL", None if ok else "降級後重新升級失敗",
                         setup_rc=proc.returncode, op=op.get("op"), from_version=op.get("from_version"),
-                        daemon_version=status.get("version"), cli_version=version, stop_wait=wait))
+                        daemon_version=status.get("version"), cli_version=version, stop_wait=wait,
+                        doctor=doctor, doctor_profile_path=str(self.doctor_profile_dir)))
         self.sw("daemon", "stop", label="收尾 daemon stop")
         self.wait_no_daemon()
 
@@ -842,6 +872,29 @@ def _sha256(path: pathlib.Path) -> str | None:
         return None
 
 
+def select_upgrade_profile_policies() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """在升級 phase 前，從受版控矩陣固定各入口政策並留下來源摘要。"""
+    phases = {"old": "legacy_0_3_2", "new": "migrated", "downgrade": "downgrade"}
+    document = uc.load_profile_expectations()
+    policies = {key: uc.select_profile_policy(phase) for key, phase in phases.items()}
+    raw = uc.PROFILE_EXPECTATIONS_PATH.read_bytes()
+    if json.loads(raw.decode("utf-8")) != document:
+        raise ValueError("profile expectation policy 在載入與摘要期間改變")
+    if policies["new"]["phase"] != "migrated" \
+            or "timeout_recovery_keys" in policies["new"]["expected_missing_fields"].get("prpl-template", []) \
+            or policies["new"]["allowed_migration_fields"] != ["timeout_recovery_keys"]:
+        raise ValueError("升級完成入口必須選用 p290 遷移後政策，且不得預期缺少 timeout_recovery_keys")
+    if policies["old"]["supported"] or policies["downgrade"]["supported"]:
+        raise ValueError("舊版與降級入口不得要求新版 profile_template_fields")
+    evidence = {
+        "policy_id": document["policy_id"],
+        "policy_sha256": hashlib.sha256(raw).hexdigest(),
+        "migration_policy_id": document["target_asset"]["migration_policy_id"],
+        "selected_phases": phases,
+    }
+    return policies, evidence
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", required=True, choices=("systemd-user", "on-demand", "systemd-system"))
@@ -869,12 +922,15 @@ def main() -> int:
     except (OSError, ValueError):
         pass
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    profile_policies, profile_policy_evidence = select_upgrade_profile_policies()
     # 於執行 phase 前記錄容器實際載入的來源；只輸出檔名，避免洩露宿主掛載路徑。
     driver_sha256 = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                      for path in (pathlib.Path(__file__), pathlib.Path(uc.__file__))}
     driver = Driver(args.mode, wheel, bundle, out, scenario=args.scenario,
                     installer=pathlib.Path(args.installer) if args.installer else None,
-                    bundle_tarball=pathlib.Path(args.bundle_tarball) if args.bundle_tarball else None)
+                    bundle_tarball=pathlib.Path(args.bundle_tarball) if args.bundle_tarball else None,
+                    profile_policies=profile_policies,
+                    profile_policy_evidence=profile_policy_evidence)
     error = None
     try:
         driver.execute()
@@ -889,6 +945,8 @@ def main() -> int:
         "producer": "scripts/docker/run-upgrade.sh",
         "driver_sha256": driver_sha256,
         "driver_git_revision": os.environ.get("SW_UPGRADE_DRIVER_REVISION"),
+        "profile_expectation_policy": driver.profile_policy_evidence,
+        "doctor_profile_evidence": driver.doctor_evidence,
         "old_version": OLD_VERSION,
         "new_version": NEW_VERSION,
         "wheel": wheel.name,

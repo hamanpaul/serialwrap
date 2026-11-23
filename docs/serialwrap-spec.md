@@ -693,7 +693,19 @@ background mode 的 `command.result_tail` 在 capture 尚未建立時，會回�
 - **`doctor` 的 `daemon_code_current`**（advisory）：以 `health.ping` 取 daemon 指紋與本行程
   比對；daemon 沒回報 `code_fingerprint` 視為舊 build（不一致）；daemon 連不上或本行程算不出
   指紋 → informational ok。
-- **`doctor` 的 `profile_template_fields`**（advisory）：比對出貨資產 `profiles/default.yaml` 與線上 `PROFILE_DIR/default.yaml`，對兩邊都有的 template 列出「資產有、線上沒有」的頂層欄位（只看是否存在，值為空或 `null` 算有設定；不比對值、不看 `uart.*` 等巢狀欄位；線上自行多加的欄位或 template 不算）。線上檔未物化、資產不可讀或 YAML 無法解析時 ok。`setup` 不覆寫既有 profile，舊安裝因此拿不到新版 template 新增的欄位（例如 #234 的 `boot_done_regex`）；`profile_bootloader_prompts` 只看單一欄位，兩項並存。
+- **Rust-only `doctor` 檢查 `profile_template_fields`（BC-08，advisory）**：比較編譯時出貨資產 `profiles/default.yaml` 與指定 `PROFILE_DIR/default.yaml` 這兩個磁碟檔案；只對兩邊共同 template 比較頂層欄位存在性，不比較值、不比較 `uart.*` 等巢狀欄位，也不納入線上額外 template 或欄位。空字串、`null`、空集合等值只要 key 存在就算存在。Python 0.4.x 基線不新增此 check；`profile_bootloader_prompts` 維持原判準。
+
+  `check.extra` 將四個欄位攤平輸出：`comparison_status`、`missing_fields`、`compared_templates`、`reason`。狀態與 invariant 如下：
+
+  | `comparison_status` | `check.ok` | `missing_fields` | 語意 |
+  |---|---:|---|---|
+  | `matched` | `true` | `{}` | 已完成比較且沒有缺漏 |
+  | `missing_fields` | `false` | 排序後的 template → 欄位清單 | 已完成比較且有缺漏 |
+  | `not_materialized` | `false` | `null` | 線上檔案不存在 |
+  | `unavailable` | `false` | `null` | 讀取、UTF-8、YAML 或結構錯誤 |
+  | `no_common_templates` | `false` | `null` | 兩端沒有共同 template |
+
+  `compared_templates` 與每個缺漏欄位清單皆排序；成功比較時 `reason=null`，不可比較時提供穩定原因分類，不回顯 YAML 原文或值。此 check 是 advisory：不可比較時 check 自身 `ok=false`，但不改 doctor 整體 `ok` 或 exit code，也不表示 daemon 已載入或重新讀取 profile。OD-33 升級判定另依執行前從受版控情境資料選定的政策，要求唯一且可比較的 check、正確 payload，以及實測缺漏映射與固定預期完全相等；不可比較或任何額外／缺少欄位一律 FAIL，不從結果反選政策。p290 的 `p290-template-migration-v1` 僅於管理 profile 目錄中 `platform: prpl` 且 template 缺 `timeout_recovery_keys` 時精確補 `[CTRL_C]`；其他 profile 欄位沿用既有處理，遷移後預期缺漏不含 `timeout_recovery_keys`。
 
 **`serialwrap setup` 的行為**（`cli._run_setup` + `setup_cmd.reconcile(restart_daemon=…)`）：
 以既有的 `health.ping` 探測回應取 daemon 指紋（不多一次 RPC），與本行程（＝剛安裝的版本）比對：

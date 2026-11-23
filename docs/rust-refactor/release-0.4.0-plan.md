@@ -100,6 +100,16 @@ scripts/docker/run-upgrade.sh --mode systemd-user --bundle <release bundle 目�
   - systemd-system：計畫限定的 direct-setup 範圍 13/13 **PASS**；legacy handoff 使用 `systemctl_stop`、等待 5,073 ms；1,344 次取樣、0 次重疊。`legacy_handoff_direct_setup` 三模式均確認舊行程樹結束且新 0.4.0 daemon 由 setup 啟動。
   - 證據（3 份原始 `upgrade-report.json`、過濾後的 `bundle-pyvenv.txt`、`SHA256SUMS`）位於 `evidence/stage1/upgrade-docker/rel040-29772118/`；`test_upgrade_evidence_only_container_home_paths` 1 passed。§6 補列本輪觀察到的既有 systemd-system 行為。
 
+### 4.1.1 OD-111 後續驗收修訂（2026-11-23，BC-08）
+
+以下是 0.5.1 Rust-only doctor 檢查的後續判準；上方 0.4.0 歷史結果與 19 項 OD-33 基線紀錄保留原樣，不重新解讀為 BC-08 證據。
+
+- Python 0.4.x doctor 維持原 19 項。Rust doctor 僅新增一項 `profile_template_fields` advisory，緊接 `profile_bootloader_prompts`；其餘 19 項仍逐項比對。
+- 新 check 比較出貨與線上單一 `default.yaml` 的共同 template 頂層 key 是否存在，並輸出五種 `comparison_status`、`missing_fields`、`compared_templates`、`reason`。不可比較時 check 自身 `ok=false`，但不改整體 doctor 結果或 exit code；這不證明 daemon 已載入或重讀 profile。
+- OD-33 執行前從受版控的 `upgrade_profile_expectations.json` 選擇固定階段政策。一般 advisory 豁免仍只有 `devices`；新 check 必須唯一、可比較、payload 正確，且缺漏映射與固定預期完整相等，否則 FAIL。不得由 doctor 結果選政策。
+- p290 遷移政策識別為 `p290-template-migration-v1`：只在管理目錄中 `platform: prpl` 且缺 `timeout_recovery_keys` 時精確補 `[CTRL_C]`。遷移後政策預期不再缺該欄；其他 profile 內容保存仍由 p290 驗證。
+- 實作驗收涵蓋 Rust-only 黑箱的精確 payload、無效 YAML、未物化；`test_doctor_ab_version_pairing_in_bundle` 保留其 nodeid 與 version pairing，並只容許上述單一 Rust 差分。正式 OD-33 容器、整合與 Windows 原生收集另列待辦，不以歷史 release 報告替代。
+
 ### 4.2 Windows（LOCAL-WINDOWS-TODO）
 
 0.3.2 在 Windows 的正式安裝為 PyInstaller one-file exe（或 pip 安裝）；0.4.0 為 bundle 安裝到 `%LOCALAPPDATA%\Programs\serialwrap`。升級驗證需要：throwaway 隔離根（`SERIALWRAP_INSTALL_ROOT`、隔離的 config／state／run 目錄、device allowlist 只有 COM20）、windows-task 監管的 0.3.2→0.4.0 交接。OD-28 的排程工作授權時機在 P8 Rust daemon bundle 完成後（plan 09 Task 13），因此本項列 **LOCAL-WINDOWS-TODO**（OD-78 之後仍由擁有者以 hosted job 產出的 zip 做一次原生驗收；hosted 與 WSL 交叉編譯的結果不能代替）：on-demand 模式的 Windows 升級可在 OD-28 範圍內先以 throwaway 隔離根實跑；windows-task 模式待 OD-28 時機。不得以 Linux 結果代替。

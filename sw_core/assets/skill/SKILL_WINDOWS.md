@@ -33,6 +33,14 @@ Windows 版 doctor 檢查：`python`／`pyyaml`／`pyserial`／exe 是否在 PAT
 `supervision_mode`／daemon endpoint 是否可連／SERIALCOMM COM 裝置列舉
 （藍牙 COM 自動排除）。
 
+Rust 0.5.1 的 `profile_template_fields` 是 Rust-only advisory：比較出貨資產與單一線上
+`profiles/default.yaml` 的共同 template 頂層 key 是否存在，不比較值或巢狀欄位。結果為
+`matched`、`missing_fields`、`not_materialized`、`unavailable` 或 `no_common_templates`；
+不可比較時 check 為 `ok=false`，但不改 doctor 整體 `ok` 或 exit code，也不表示 daemon
+已載入／重讀 profile。OD-33 升級 gate 依事前選定的受版控政策精確比對缺漏，任何不可比較或集合差異均 FAIL。
+p290 的 `p290-template-migration-v1` 僅在管理目錄的 `platform: prpl` template 缺
+`timeout_recovery_keys` 時補 `[CTRL_C]`；其他欄位依既有 setup 行為處理。
+
 ## 2. 啟動 daemon
 
 ```powershell

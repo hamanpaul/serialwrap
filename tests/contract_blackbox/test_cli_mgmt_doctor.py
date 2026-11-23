@@ -129,6 +129,47 @@ def _wait_no_serialwrapd(timeout_s: float = 15.0) -> None:
         time.sleep(0.2)
 
 
+def _profile_tree_snapshot(config_dir: Path) -> tuple[tuple[str, bool, bytes | None], ...]:
+    """擷取隔離設定目錄的相對路徑、目錄型態與檔案 bytes。"""
+    if not config_dir.exists():
+        return ()
+    return tuple(
+        sorted(
+            (
+                item.relative_to(config_dir).as_posix(),
+                item.is_dir(),
+                None if item.is_dir() else item.read_bytes(),
+            )
+            for item in config_dir.rglob("*")
+        )
+    )
+
+
+def _run_rust_doctor_with_profile(work: Path, profile_bytes: bytes | None) -> tuple[dict, dict, subprocess.CompletedProcess[str]]:
+    """執行指定 Rust artifact；doctor 只讀隔離設定目錄，不啟動 daemon。"""
+    assert is_rust(), "此 blackbox 必須以 SERIALWRAP_AB_LABEL=rust-p289 執行"
+    env = isolated_env(work)
+    config_dir = Path(env["SERIALWRAP_CONFIG_DIR"])
+    if profile_bytes is not None:
+        profile_dir = config_dir / "profiles"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        (profile_dir / "default.yaml").write_bytes(profile_bytes)
+    before = _profile_tree_snapshot(config_dir)
+    proc = subprocess.run(
+        cli_prefix() + ["doctor"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, f"Rust doctor exit={proc.returncode}: {proc.stderr}"
+    result = json.loads(proc.stdout)
+    checks = [item for item in result["checks"] if item.get("check") == "profile_template_fields"]
+    assert len(checks) == 1, checks
+    assert _profile_tree_snapshot(config_dir) == before, "doctor 不得改寫 profile 或其目錄內容"
+    return result, checks[0], proc
+
+
 @pytest.mark.case("sc25-release-manifest-version-pairing")
 def test_doctor_ab_shared_checks(tmp_path: Path) -> None:
     work_py = tmp_path / "py"
@@ -180,12 +221,22 @@ def test_doctor_ab_shared_checks(tmp_path: Path) -> None:
     assert not any(c.get("check") == "version_pairing" for c in py_checks)
     assert not any(c.get("check") == "version_pairing" for c in cli_checks)
 
-    # Linux 清單含 daemon_code_current、profile_template_fields，共 20 項（python／pyyaml 的 detail 除外，見上方 SC-25 附註）
-    assert len(py_checks) == 20
-    assert len(cli_checks) == 20
-    assert [c["check"] for c in cli_checks] == [c["check"] for c in py_checks]
+    # Python 基線固定 19 項；Rust 依 BC-08 只額外插入一個 profile_template_fields。
+    assert len(py_checks) == 19
+    if is_rust():
+        profile_checks = [c for c in cli_checks if c.get("check") == "profile_template_fields"]
+        assert len(profile_checks) == 1, profile_checks
+        profile_index = next(i for i, item in enumerate(cli_checks) if item["check"] == "profile_template_fields")
+        assert cli_checks[profile_index - 1]["check"] == "profile_bootloader_prompts"
+        assert profile_checks[0]["advisory"] is True
+        cli_shared_checks = [c for c in cli_checks if c["check"] != "profile_template_fields"]
+        assert len(cli_checks) == 20
+    else:
+        assert len(cli_checks) == 19
+        cli_shared_checks = cli_checks
+    assert [c["check"] for c in cli_shared_checks] == [c["check"] for c in py_checks]
 
-    for py_item, cli_item in zip(py_checks, cli_checks):
+    for py_item, cli_item in zip(py_checks, cli_shared_checks):
         chk = py_item["check"]
         assert cli_item["check"] == chk
         assert cli_item["advisory"] == py_item["advisory"], f"check={chk} advisory mismatch"
@@ -201,6 +252,70 @@ def test_doctor_ab_shared_checks(tmp_path: Path) -> None:
         py_detail = str(py_item["detail"]).replace(str(work_py), "<WORK>")
         cli_detail = str(cli_item["detail"]).replace(str(work_cli), "<WORK>")
         assert cli_detail == py_detail, f"check={chk} detail mismatch"
+
+
+@pytest.mark.rust_only
+@pytest.mark.case("bc08-doctor-profile-template-fields")
+def test_doctor_profile_template_fields_exact_payload(tmp_path: Path) -> None:
+    profile = (
+        b"profiles:\n"
+        b"  prpl-template:\n"
+        b"    platform: prpl\n"
+        b"    prompt_regex: x\n"
+        b"    login_regex: ''\n"
+        b"    password_regex: ''\n"
+        b"    ready_probe: ''\n"
+        b"    uart: {}\n"
+    )
+    result, check, _ = _run_rust_doctor_with_profile(tmp_path, profile)
+    assert check["ok"] is False
+    assert check["advisory"] is True
+    assert {
+        key: check.get(key)
+        for key in ("comparison_status", "missing_fields", "compared_templates", "reason")
+    } == {
+        "comparison_status": "missing_fields",
+        "missing_fields": {"prpl-template": ["boot_done_regex", "bootloader_prompts"]},
+        "compared_templates": ["prpl-template"],
+        "reason": None,
+    }
+    assert isinstance(result.get("ok"), bool)
+
+
+@pytest.mark.rust_only
+@pytest.mark.case("bc08-doctor-profile-unavailable")
+def test_doctor_profile_template_fields_invalid_yaml(tmp_path: Path) -> None:
+    profile = b"profiles: [SW_SECRET_PROFILE_SENTINEL\n"
+    _, check, proc = _run_rust_doctor_with_profile(tmp_path, profile)
+    assert check["ok"] is False
+    assert check["advisory"] is True
+    assert {
+        key: check.get(key)
+        for key in ("comparison_status", "missing_fields", "compared_templates", "reason")
+    } == {
+        "comparison_status": "unavailable",
+        "missing_fields": None,
+        "compared_templates": [],
+        "reason": "live_yaml",
+    }
+    assert "SW_SECRET_PROFILE_SENTINEL" not in proc.stdout + proc.stderr
+
+
+@pytest.mark.rust_only
+@pytest.mark.case("bc08-doctor-profile-unavailable")
+def test_doctor_profile_template_fields_not_materialized(tmp_path: Path) -> None:
+    _, check, _ = _run_rust_doctor_with_profile(tmp_path, None)
+    assert check["ok"] is False
+    assert check["advisory"] is True
+    assert {
+        key: check.get(key)
+        for key in ("comparison_status", "missing_fields", "compared_templates", "reason")
+    } == {
+        "comparison_status": "not_materialized",
+        "missing_fields": None,
+        "compared_templates": [],
+        "reason": "live_not_found",
+    }
 
 
 @pytest.mark.case("sc25-release-manifest-version-pairing")
@@ -229,8 +344,16 @@ def test_doctor_ab_version_pairing_in_bundle(tmp_path: Path) -> None:
         return json.loads(py_res.stdout)["checks"], json.loads(rust_res.stdout)["checks"]
 
     def _assert_same_checks(py_checks: list[dict], rust_checks: list[dict], state: str) -> None:
-        assert [c["check"] for c in rust_checks] == [c["check"] for c in py_checks], f"{state}: 項目順序不一致（證據 {evidence}）"
-        for py_item, rust_item in zip(py_checks, rust_checks):
+        assert len(py_checks) == 19, f"{state}: Python 基線應維持 19 項（證據 {evidence}）"
+        assert len(rust_checks) == 20, f"{state}: Rust 應為 19 項基線加唯一 BC-08（證據 {evidence}）"
+        profile_checks = [c for c in rust_checks if c.get("check") == "profile_template_fields"]
+        assert len(profile_checks) == 1, f"{state}: Rust profile_template_fields 必須恰好一項（證據 {evidence}）"
+        profile_index = next(i for i, item in enumerate(rust_checks) if item["check"] == "profile_template_fields")
+        assert rust_checks[profile_index - 1]["check"] == "profile_bootloader_prompts", f"{state}: BC-08 插入位置錯誤（證據 {evidence}）"
+        assert profile_checks[0]["advisory"] is True, f"{state}: BC-08 必須為 advisory（證據 {evidence}）"
+        shared_rust_checks = [item for item in rust_checks if item["check"] != "profile_template_fields"]
+        assert [c["check"] for c in shared_rust_checks] == [c["check"] for c in py_checks], f"{state}: Python 19 項順序或集合不一致（證據 {evidence}）"
+        for py_item, rust_item in zip(py_checks, shared_rust_checks):
             name = py_item["check"]
             if not full_oracle and name in _RUNTIME_CHECK_NAMES:
                 # 基線 interpreter 與 artifact 內的 runtime 可能不同，只比名稱與 advisory。

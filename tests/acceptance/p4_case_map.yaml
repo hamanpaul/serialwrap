@@ -350,6 +350,51 @@ cases:
   necessity: required
   skip_registered:
     python: rust-only 契約（behavior_changes 已登記）
+- case_id: bc08-doctor-profile-template-fields
+  invariants:
+  - comparison_status_matches_exact_missing_fields
+  - doctor_advisory_does_not_change_exit_status
+  layer: L1
+  platforms:
+  - linux
+  capabilities: []
+  artifact: rust-cli-bundle
+  tests:
+  - sw-cli::mgmt_doctor::profile_template_fields_drift
+  - sw-cli::mgmt_doctor::profile_template_fields_matches_shipped_asset
+  - sw-cli::mgmt_doctor::profile_template_fields_presence_only
+  - sw-cli::mgmt_doctor::profile_template_fields_windows_payload
+  - sw-cli::mgmt_doctor::profile_template_fields_p290_transition
+  - sw-cli::mgmt_doctor::profile_template_fields_is_read_only
+  - tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_profile_template_fields_exact_payload
+  evidence: target/p4-evidence/bc08-doctor-profile-template-fields.json
+  necessity: required
+  skip_registered:
+    python: Rust-only BC-08；Python 0.4.x 基線不新增此 check
+- case_id: bc08-doctor-profile-unavailable
+  invariants:
+  - unavailable_comparison_never_reports_matched
+  - no_common_template_is_not_comparable
+  layer: L1
+  platforms:
+  - linux
+  capabilities: []
+  artifact: rust-cli-bundle
+  tests:
+  - sw-cli::mgmt_doctor::profile_template_fields_custom_templates_and_no_common
+  - sw-cli::mgmt_doctor::profile_template_asset_errors_are_unavailable
+  - sw-cli::mgmt_doctor::profile_template_fields_invalid_structure_is_unavailable
+  - sw-cli::mgmt_doctor::profile_template_fields_invalid_utf8_is_unavailable
+  - sw-cli::mgmt_doctor::profile_template_fields_invalid_yaml_is_unavailable
+  - sw-cli::mgmt_doctor::profile_template_fields_not_materialized
+  - sw-cli::mgmt_doctor::profile_template_fields_unreadable_is_unavailable
+  - sw-cli::sw_cli::doctor_cmd::profile_template_fields_tests::profile_template_asset_errors_are_unavailable
+  - tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_profile_template_fields_invalid_yaml
+  - tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_profile_template_fields_not_materialized
+  evidence: target/p4-evidence/bc08-doctor-profile-unavailable.json
+  necessity: required
+  skip_registered:
+    python: Rust-only BC-08；Python 0.4.x 基線不新增此 check
 - case_id: sc27-windows-connect-benches
   invariants: []
   layer: L1

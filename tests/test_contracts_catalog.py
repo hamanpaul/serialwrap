@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import importlib
 import sys
 import textwrap
@@ -1341,7 +1342,7 @@ def _bc_by_id():
 
 # 0.5.1 依 OD-111 新增的 Rust-only BC（rulings/v051.md「0.5.1 行為差異登錄規則」第 1、8 點；
 # 編號由編排者指派，各工作包只把自己的編號加進這個集合）。
-_V051_BC_IDS: frozenset[str] = frozenset()
+_V051_BC_IDS: frozenset[str] = frozenset({"BC-08"})
 
 
 def test_bc_real_five_bcs_registered() -> None:
@@ -1360,6 +1361,71 @@ def test_bc_real_five_bcs_registered() -> None:
             assert c.approval.decision_ref == "OD-111"
             assert c.scope == "rust_only"
             assert "OD-111" in c.related_decisions
+
+
+def test_bc08_doctor_profile_template_fields_registered() -> None:
+    """BC-08、P4 案例與 doctor 機器介面依裁決一致。"""
+    behavior = yaml.safe_load((ROOT / "contracts" / "behavior_changes.yaml").read_text(encoding="utf-8"))
+    change = next(item for item in behavior["changes"] if item["id"] == "BC-08")
+    expected_case_ids = {
+        "bc08-doctor-profile-template-fields",
+        "bc08-doctor-profile-unavailable",
+    }
+    assert change["kind"] == "BC"
+    assert change["status"] == "IMPLEMENTED"
+    assert change["approval"]["decision_ref"] == "OD-111"
+    assert change["scope"] == "rust_only"
+    assert change["ab_participation"] == "absolute_only"
+    assert change["applies_to"]["python"] is None
+    assert change["phases"] == ["P4"]
+    assert change["approved_at_revision"] == behavior["revision"] == 12
+    assert set(change["case_ids"]) == expected_case_ids
+    assert "OD-111" in change["related_decisions"]
+
+    cli_schema = json.loads((ROOT / "contracts" / "cli_schema.json").read_text(encoding="utf-8"))
+    doctor_check = cli_schema["x-doctor-checks"]["profile_template_fields"]
+    assert doctor_check["advisory"] is True
+    assert doctor_check["comparison_status"] == [
+        "matched",
+        "missing_fields",
+        "not_materialized",
+        "unavailable",
+        "no_common_templates",
+    ]
+    assert set(doctor_check["extra_fields"]) == {
+        "comparison_status",
+        "missing_fields",
+        "compared_templates",
+        "reason",
+    }
+    assert doctor_check["invariants"] == [
+        "matched: ok=true, missing_fields={}",
+        "missing_fields: ok=false, missing_fields is non-empty",
+        "not_materialized|unavailable|no_common_templates: ok=false, missing_fields=null",
+        "compared_templates and each missing_fields key list are sorted",
+    ]
+
+    coverage = yaml.safe_load((ROOT / "contracts" / "coverage_map.yaml").read_text(encoding="utf-8"))
+    coverage_entry = coverage["entries"]["bc:BC-08"]
+    assert coverage_entry["owner_phase"] == "P4"
+    assert coverage_entry["nodeids"]
+    assert all(nodeid.startswith("cargo:") for nodeid in coverage_entry["nodeids"])
+    l1_lock = json.loads((ROOT / "tests" / "acceptance" / "l1_required.lock.json").read_text(encoding="utf-8"))
+    locked_cargo_nodeids = {
+        nodeid
+        for set_id in ("p7_gate:cargo-test-workspace", "s21_core", "s22_gate:cargo_workspace")
+        for nodeid in l1_lock["sets"][set_id]["linux"]["nodeids"]
+    }
+    assert set(coverage_entry["nodeids"]) <= locked_cargo_nodeids
+    approval = coverage["l1_only_approvals"]["bc:BC-08"]
+    assert approval == {
+        "l1_only": True,
+        "reason": "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-08 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。",
+    }
+
+    p4_cases = yaml.safe_load((ROOT / "tests" / "acceptance" / "p4_case_map.yaml").read_text(encoding="utf-8"))
+    mapped_case_ids = {item["case_id"] for item in p4_cases["cases"]}
+    assert expected_case_ids <= mapped_case_ids
 
 
 def test_bc_real_approval_owner_by_basis() -> None:

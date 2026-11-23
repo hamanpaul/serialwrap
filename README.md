@@ -245,8 +245,22 @@ every other command prints a one-line warning on stderr (stdout JSON is unchange
 `serialwrap doctor` reports it as the advisory check `daemon_code_current`.
 Setup never overwrites an existing profile, so fields that a later release adds
 to the shipped templates are missing from an older live `profiles/default.yaml`;
-the advisory doctor check `profile_template_fields` lists them per template
-(only keys that are absent; an empty or `null` value counts as set).
+Rust 0.5.1 adds the Rust-only advisory doctor check `profile_template_fields`.
+It compares the shipped `profiles/default.yaml` with the single on-disk
+`PROFILE_DIR/default.yaml`, and checks only top-level key presence for templates
+present in both files; values and nested fields are not compared. Empty and
+`null` values count as present. Its structured status is `matched`,
+`missing_fields`, `not_materialized`, `unavailable`, or `no_common_templates`;
+the payload also reports `missing_fields`, `compared_templates`, and `reason`.
+An unavailable comparison sets this check's `ok` to false, while the advisory
+does not change the overall doctor result or exit code. This check does not
+report whether a running daemon has loaded or reloaded the file. OD-33 uses a
+version-controlled scenario policy selected before doctor runs and passes only
+when one comparable check has the exact expected missing-field mapping;
+unavailable results and every unexpected difference fail the upgrade gate.
+Under migration policy `p290-template-migration-v1`, setup adds only
+`timeout_recovery_keys: [CTRL_C]` to a managed `platform: prpl` template when
+that key is absent; other profile fields keep their existing handling.
 When the systemd service is active and the fingerprints differ, `serialwrap setup`
 restarts the service for you and prints a `daemon_code` field with the result.
 For systemd-system, `setup` only lists `sudo systemctl restart serialwrap` in
@@ -1925,7 +1939,7 @@ serialwrap doctor                # 驗證環境
 - 離線安裝：把 release tarball 帶到目標機（請自行以 `sha256sum -c --ignore-missing SHA256SUMS` 驗證；`--bundle` 不下載也不檢查 `SHA256SUMS`），執行 `./install.sh --bundle serialwrap-0.4.1-linux-x86_64.tar.gz`；`--bundle` 也接受已解開的 bundle 目錄。
 - 本機開發安裝：先由 checkout 建 bundle 再安裝——`scripts/rust/mkbundle.sh --release-bundle --profile release --out /tmp/sw-bundle && ./install.sh --bundle /tmp/sw-bundle`；單純 `./install.sh` 安裝的是已發佈的 release，不是 checkout。
 - 舊版 0.3.x（pipx）使用者升級：直接執行新的 `install.sh` 即可，不需 pipx 步驟。可在 0.3.x daemon 仍在執行時升級，並明確帶入目前的監管模式（`--user`、`--system --with-sudo`、`--on-demand`）。先以 `serialwrap daemon stop` 停止再升級亦可，但 setup 不會代為啟動原本已停止的 daemon：請以 `serialwrap service start`（systemd）或 `serialwrap daemon start`（on-demand）啟動後執行 `serialwrap doctor`。setup 會接管 `~/.local/bin/serialwrap` 與 `serialwrapd` 入口，保留 `config.yaml`、profiles 與 `state.json`。偵測到舊 pipx 安裝時，安裝程式會提示可執行 `pipx uninstall serialwrap`，不會自動移除。
-- **升級與確認 daemon 跑的是哪份程式碼**：bundle 安裝會執行 `serialwrap setup`；版本字串（例如 `0.4.1`）在 release 與分支 build 間相同，所以 `serialwrap --version` 另印程式碼指紋，例如 `serialwrap 0.4.1 (code 1a2b3c4d5e6f)`。`serialwrap daemon status` 的 `code_fingerprint` 與 `code_path` 說明 daemon 啟動時載入的程式碼及位置。指紋不一致時，CLI 於 stderr 警告，`doctor` 回報 advisory `daemon_code_current`。setup 不覆寫既有 profile，新版出貨 template 新增的欄位不會出現在舊安裝的線上 `profiles/default.yaml`；`doctor` 的 advisory `profile_template_fields` 逐 template 列出缺的欄位（只看欄位在不在，值為空或 `null` 算有設定）。systemd 服務 active 且指紋不同時，setup 依狀態自動 restart，輸出 `daemon_code`；systemd-system 未帶 `--with-sudo` 時把指令列入 `pending_sudo`。`--no-restart`、flash、模式轉換、service inactive 與 on-demand 條件不會觸發自動 restart。細節見[規格 §8.7](docs/serialwrap-spec.md)。
+- **升級與確認 daemon 跑的是哪份程式碼**：bundle 安裝會執行 `serialwrap setup`；版本字串（例如 `0.4.1`）在 release 與分支 build 間相同，所以 `serialwrap --version` 另印程式碼指紋，例如 `serialwrap 0.4.1 (code 1a2b3c4d5e6f)`。`serialwrap daemon status` 的 `code_fingerprint` 與 `code_path` 說明 daemon 啟動時載入的程式碼及位置。指紋不一致時，CLI 於 stderr 警告，`doctor` 回報 advisory `daemon_code_current`。Rust 0.5.1 新增 Rust-only advisory `profile_template_fields`；它只比對出貨 `profiles/default.yaml` 與指定目錄的單一 `default.yaml`，對共同 template 比較頂層欄位是否存在，不比較值與巢狀欄位，空值與 `null` 仍算存在。結果以 `matched`、`missing_fields`、`not_materialized`、`unavailable`、`no_common_templates` 表示，另帶 `missing_fields`、`compared_templates`、`reason`；不可比較時該 check 為 `ok=false`，但 advisory 不改整體 doctor 結果或 exit code，也不代表 daemon 已載入／重讀檔案。OD-33 依執行前選定的受版控情境，只在 check 唯一、可比較且缺漏映射精確相等時放行。p290 的 `p290-template-migration-v1` 只在管理目錄中 `platform: prpl` 且缺 `timeout_recovery_keys` 時補 `[CTRL_C]`，其他欄位仍依既有方式處理。systemd 服務 active 且指紋不同時，setup 依狀態自動 restart，輸出 `daemon_code`；systemd-system 未帶 `--with-sudo` 時把指令列入 `pending_sudo`。`--no-restart`、flash、模式轉換、service inactive 與 on-demand 條件不會觸發自動 restart。細節見[規格 §8.7](docs/serialwrap-spec.md)。
 - 既有 on-demand TCP 客戶端請用 `serialwrap setup --on-demand` 或 `./install.sh --on-demand` 保存 endpoint；auto 安裝可能切換至 systemd，詳見[適用範圍與限制](docs/setup-tcp-endpoint.md)。
 - 設定讀取順序為 `SERIALWRAP_CONFIG` → `~/.config/serialwrap/config.yaml` → 存在時的 `/etc/serialwrap/config.yaml`；系統設定檔唯讀，寫入落在 `SERIALWRAP_CONFIG` 或使用者設定檔。
 - 新建執行期目錄權限依 process umask 決定；Unix socket 維持 `0660`，可設定 `SERIALWRAP_SOCKET_GROUP` 指定 socket 群組。

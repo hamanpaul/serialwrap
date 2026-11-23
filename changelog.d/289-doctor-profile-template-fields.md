@@ -3,4 +3,4 @@ type: feat
 scope: doctor
 ---
 
-Rust CLI 的 `serialwrap doctor` 新增 advisory 檢查 `profile_template_fields`：比對出貨資產與線上 `profiles/default.yaml`，僅在兩邊都存在同名 template 時比較頂層欄位，列出出貨資產有、線上缺少的欄位；不比較值與巢狀欄位。不可讀、不可解析、結構錯誤、未物化或沒有共同 template 時明確標示不可比較，不會冒稱一致。`serialwrap setup` 不覆寫既有 profile，舊安裝可能缺少新欄位，這種 drift 只做 advisory 提醒，不影響 doctor 整體 `ok`。OD-33 升級驗收使用受版控的固定階段政策，僅豁免 devices advisory，並嚴格核對 Rust check 的頂層結構化 payload、共同 template 與完整缺漏集合。本項僅在 Rust CLI 與升級判定 harness 實作，Python 產品基線維持原樣。
+Rust CLI 的 `serialwrap doctor` 新增 Rust-only advisory 檢查 `profile_template_fields`：比較出貨資產與線上單一 `profiles/default.yaml` 中共同 template 的頂層欄位存在性，不比較值與巢狀欄位。check.extra 提供 `comparison_status`、`missing_fields`、`compared_templates`、`reason`；未物化、不可讀、不可解析、結構錯誤或沒有共同 template 時明確標示不可比較且 check `ok=false`，但不改整體 doctor 結果或 exit code。OD-33 只豁免一般 `devices` advisory；新 check 依執行前選定的受版控情境政策嚴格核對唯一性、可比較狀態、payload 與完整缺漏集合。p290 政策識別 `p290-template-migration-v1` 僅對管理目錄中缺欄的 `platform: prpl` template 補 `timeout_recovery_keys: [CTRL_C]`，其他 profile 保存由 p290 負責。本項保留 Python 19 項基線，僅增加 Rust 行為與 Rust-only 黑箱證據。
