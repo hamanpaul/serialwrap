@@ -225,11 +225,16 @@ def test_human_line_interactive_mode_opens_lease(console_daemon) -> None:
 
 def test_line_overflow_warning(console_daemon) -> None:
     d, target = console_daemon
-    d.sw("session", "console-attach", "--selector", "COM0", "--label", "h1")
-    a2 = d.sw("session", "console-attach", "--selector", "COM0", "--label", "h2")
-    d.sw("session", "console-detach", "--selector", "COM0", "--client-id", _consoles(d)[0]["client_id"])
-    fd2 = open_vtty(a2["vtty"])
+    # 直接走既有 RPC 減少受限 runner 上 CLI 子行程排隊期間的未連入窗口。
+    a1 = d.rpc("session.console_attach", {"selector": "COM0", "label": "h1"})
+    # 先持有兩個 PTY，避免慢 runner 在明確 detach 前回收尚未連入的 console。
+    fd1 = open_vtty(a1["vtty"])
+    fd2 = None
     try:
+        a2 = d.rpc("session.console_attach", {"selector": "COM0", "label": "h2"})
+        fd2 = open_vtty(a2["vtty"])
+        detached = d.rpc("session.console_detach", {"selector": "COM0", "client_id": a1["client_id"]})
+        assert detached["ok"] is True, detached
         payload = b"a" * 16390 + b"\r"
         view = memoryview(payload)
         while view:
@@ -243,7 +248,9 @@ def test_line_overflow_warning(console_daemon) -> None:
         assert not wait_rx_contains(target, b"aaaa", 2.0)
         assert wait_for(lambda: a2["client_id"] in d._stderr_tail(20000), 3.0), d._stderr_tail()
     finally:
-        os.close(fd2)
+        if fd2 is not None:
+            os.close(fd2)
+        os.close(fd1)
 
 
 def test_last_line_before_disconnect_submitted(console_daemon) -> None:

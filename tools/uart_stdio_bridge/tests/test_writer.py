@@ -748,9 +748,18 @@ def test_writer_close_slow_progress_exceeds_stall_timeout(tmp_path):
     """排空時間可超過停滯期限，只要每次寫入都持續前進。"""
     first_write_entered = threading.Event()
     release_first_write = threading.Event()
+    injected_schedule_delay = threading.Event()
     close_started = threading.Event()
     write_calls = {"n": 0}
     close_result = {}
+    write_finished_at = []
+    close_started_at = []
+    close_finished_at = []
+    close_join_timeout_s = 5.0
+    close_timeout_s = 0.3
+    step_wait_s = 0.1
+    injected_schedule_delay_s = 0.04
+    initial_release_wait_s = 0.1
 
     def slow_write(fd, data):
         write_calls["n"] += 1
@@ -758,37 +767,72 @@ def test_writer_close_slow_progress_exceeds_stall_timeout(tmp_path):
             first_write_entered.set()
             release_first_write.wait()
         else:
-            time.sleep(0.01)
-        return os.write(fd, data)
+            injected_schedule_delay.wait(injected_schedule_delay_s)
+            time.sleep(step_wait_s)
+        result = os.write(fd, data)
+        write_finished_at.append(time.monotonic())
+        return result
 
     path = tmp_path / "wire.ndjson"
-    w = _writer(path, os_write=slow_write, close_timeout_s=0.03)
+    w = _writer(path, os_write=slow_write, close_timeout_s=close_timeout_s)
     w.start()
-    for index in range(8):
-        _emit(w, payload=f"record-{index}".encode())
-    assert first_write_entered.wait(5.0)
-
-    def close_writer():
-        close_started.set()
-        close_result["summary"] = w.close()
-
-    close_thread = threading.Thread(target=close_writer)
-    close_thread.start()
-    assert close_started.wait(1.0)
-    time.sleep(0.01)
-    release_first_write.set()
-    close_thread.join(timeout=3.0)
+    close_thread = None
     try:
+        for index in range(8):
+            _emit(w, payload=f"record-{index}".encode())
+        assert first_write_entered.wait(5.0)
+
+        def close_writer():
+            close_started.set()
+            close_started_at.append(time.monotonic())
+            close_result["summary"] = w.close()
+            close_finished_at.append(time.monotonic())
+
+        close_thread = threading.Thread(target=close_writer)
+        close_thread.start()
+        assert close_started.wait(1.0)
+        time.sleep(initial_release_wait_s)
+        release_first_write.set()
+        close_thread.join(timeout=close_join_timeout_s)
         assert not close_thread.is_alive(), "close 未在持續進度下完成"
-        assert w.failure is None
+        failure_detail = getattr(w, "_failure_detail", None)
+        assert w.failure is None, f"failure={w.failure!r} detail={failure_detail!r}"
+        assert len(write_finished_at) == 8, write_finished_at
+        max_write_interval_s = max(
+            later - earlier for earlier, later in zip(write_finished_at, write_finished_at[1:])
+        )
+        close_elapsed_s = close_finished_at[0] - close_started_at[0]
+        assert close_elapsed_s > close_timeout_s, (
+            f"close total time {close_elapsed_s:.3f}s did not exceed stall timeout {close_timeout_s:.3f}s; "
+            f"max write interval={max_write_interval_s:.3f}s; "
+            f"failure detail={failure_detail!r}"
+        )
         assert close_result["summary"]["records"] == 8
         assert len(_lines(path)) == 8
     finally:
         release_first_write.set()
-        close_thread.join(timeout=3.0)
-        if w._thread is not None:
-            w._thread.join(timeout=3.0)
-        w.close()
+        injected_schedule_delay.set()
+        if close_thread is not None:
+            close_thread.join(timeout=close_join_timeout_s)
+        if close_thread is None or not close_thread.is_alive():
+            w.close()
+            if w._thread is not None:
+                w._thread.join(timeout=close_join_timeout_s)
+        max_write_interval_s = max(
+            (later - earlier for earlier, later in zip(write_finished_at, write_finished_at[1:])),
+            default=None,
+        )
+        total_drain_s = (
+            close_finished_at[0] - close_started_at[0]
+            if close_started_at and close_finished_at else None
+        )
+        print(
+            f"close_timeout_s={close_timeout_s:.3f} step_wait_s={step_wait_s:.3f} "
+            f"injected_schedule_delay_s={injected_schedule_delay_s:.3f} "
+            f"max_write_interval_s={max_write_interval_s!r} total_drain_s={total_drain_s!r} "
+            f"failure={w.failure!r} failure_detail={getattr(w, '_failure_detail', None)!r} "
+            f"completed_writes={len(write_finished_at)}"
+        )
 
 
 def test_writer_flush_slow_progress_exceeds_stall_timeout(tmp_path):

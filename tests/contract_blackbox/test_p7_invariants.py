@@ -11,8 +11,10 @@ stdlib＋PyYAML＋PTY，不得 import sw_core／serialwrap／serialwrapd。
 """
 from __future__ import annotations
 
+import ast
 import base64
 import errno
+import inspect
 import os
 import sys
 import threading
@@ -194,9 +196,14 @@ def _df23_observer_snapshot() -> dict:
     }
 
 
-def _fake_df23_observer(monkeypatch, holder_samples: list[list[str]]):
+def test_python_tty_holder_guard_rejects_new_fd(monkeypatch) -> None:
+    """DF-23 正式觀察函式以真實 PTY 掃描出新增 fd，不能只驗模擬的 holder 字串。"""
+    master_fd, baseline_fd = os.openpty()
+    path = os.ttyname(baseline_fd)
+    opened_fds = [baseline_fd]
+
     class _Proc:
-        pid = 987654
+        pid = os.getpid()
 
     class _Daemon:
         proc = _Proc()
@@ -204,36 +211,84 @@ def _fake_df23_observer(monkeypatch, holder_samples: list[list[str]]):
     class _Rig:
         daemon = _Daemon()
 
-    snapshot = _df23_observer_snapshot()
-    samples = iter(holder_samples)
+    baseline = _df23_observer_snapshot()
+    calls = 0
 
-    def scan_holders(_p7, _path):
-        return next(samples, holder_samples[-1])
+    def add_tty_fd(_p7):
+        nonlocal calls
+        if calls == 0:
+            opened_fds.append(os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK))
+        calls += 1
+        return dict(baseline)
 
-    monkeypatch.setattr(os.path, "isdir", lambda path: path == "/proc")
-    monkeypatch.setattr(sys.modules[__name__], "_row", lambda _p7: dict(snapshot))
-    monkeypatch.setattr(sys.modules[__name__], "_daemon_tty_holders", scan_holders)
-    return _Rig(), snapshot
-
-
-def test_python_tty_holder_guard_rejects_new_fd(monkeypatch) -> None:
-    """DF-23 觀察迴圈取樣到 baseline 以外的新 holder fd 時必須失敗。"""
-    p7, baseline = _fake_df23_observer(
-        monkeypatch,
-        [["7->/dev/pts/fake"], ["7->/dev/pts/fake", "8->/dev/pts/fake"]],
-    )
-    with pytest.raises(AssertionError, match="baseline 以外"):
-        _observe_python_df23_terminal(p7, "/dev/pts/fake", baseline, observe_s=1.1)
+    monkeypatch.setattr(sys.modules[__name__], "_row", add_tty_fd)
+    try:
+        with pytest.raises(AssertionError, match="baseline 以外"):
+            _observe_python_df23_terminal(_Rig(), path, baseline, observe_s=1.1)
+        assert len(opened_fds) == 2 and opened_fds[0] != opened_fds[1]
+    finally:
+        for fd in opened_fds:
+            os.close(fd)
+        os.close(master_fd)
 
 
 def test_python_tty_holder_guard_rejects_reopened_baseline_fd(monkeypatch) -> None:
-    """DF-23 觀察迴圈確認 baseline fd 消失後再次出現時必須失敗。"""
-    p7, baseline = _fake_df23_observer(
-        monkeypatch,
-        [["7->/dev/pts/fake"], [], ["7->/dev/pts/fake"]],
+    """DF-23 正式觀察函式須抓到真實 PTY fd 關閉後以同一 fd 編號重開。"""
+    master_fd, baseline_fd = os.openpty()
+    path = os.ttyname(baseline_fd)
+
+    class _Proc:
+        pid = os.getpid()
+
+    class _Daemon:
+        proc = _Proc()
+
+    class _Rig:
+        daemon = _Daemon()
+
+    baseline = _df23_observer_snapshot()
+    current_fd: int | None = baseline_fd
+    calls = 0
+
+    def close_then_reopen_tty(_p7):
+        nonlocal calls, current_fd
+        if calls == 0:
+            os.close(baseline_fd)
+            current_fd = None
+        elif calls == 1:
+            current_fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+            assert current_fd == baseline_fd, (current_fd, baseline_fd)
+        calls += 1
+        return dict(baseline)
+
+    monkeypatch.setattr(sys.modules[__name__], "_row", close_then_reopen_tty)
+    try:
+        with pytest.raises(AssertionError, match="已消失的 baseline"):
+            _observe_python_df23_terminal(_Rig(), path, baseline, observe_s=2.0)
+    finally:
+        if current_fd is not None:
+            os.close(current_fd)
+        os.close(master_fd)
+
+
+def test_df23_formal_python_branch_calls_terminal_observer() -> None:
+    """防止正式 DF-23 案例脫離 no-retry 與 holder 觀察路徑。"""
+    tree = ast.parse(inspect.getsource(test_release_during_login_waits_for_handle_close))
+    function = next(node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)))
+    rust_branch = next(
+        node for node in ast.walk(function)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Call)
+        and isinstance(node.test.func, ast.Name)
+        and node.test.func.id == "is_rust"
     )
-    with pytest.raises(AssertionError, match="已消失的 baseline"):
-        _observe_python_df23_terminal(p7, "/dev/pts/fake", baseline, observe_s=1.1)
+    python_calls = {
+        node.func.id
+        for statement in rust_branch.orelse
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "_observe_python_df23_terminal" in python_calls
 
 
 def _attach_human_vtty(p7, label: str) -> tuple[int, dict]:

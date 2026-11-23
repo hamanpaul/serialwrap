@@ -4,9 +4,12 @@
 """
 from __future__ import annotations
 
+import ctypes
 import json
 import os
+import select
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -58,9 +61,123 @@ BUSY_FIRST_ACK_DELAY_MS = 20000
 BUSY_CHUNK_TIMEOUT_S = BUSY_FIRST_ACK_DELAY_MS / 1000 + 40
 # 交接排空窗口長度（sw_core/daemon.py `HANDOFF_DRAIN_GRACE_S`）；黑箱不得 import sw_core，故於此重述。
 HANDOFF_DRAIN_GRACE_S = 3.0
-# DeviceWatcher 預設輪詢間隔 1.0 s（sw_core/device_watcher.py）。每次連結變動後等待略大於一個週期，
-# 確保至少一次重探已看見該變動（連結移除與復原皆然）。
-DEVICE_RESCAN_WAIT_S = 1.1
+
+
+class _ByIdScanObserver:
+    """只觀察本測試 rig 的 by-id 目錄變更與目錄本身的 open/close。"""
+
+    _EVENT = struct.Struct("iIII")
+    _IN_OPEN = 0x00000020
+    _IN_CLOSE_NOWRITE = 0x00000010
+    _IN_CREATE = 0x00000100
+    _IN_DELETE = 0x00000200
+    _IN_ONLYDIR = 0x01000000
+    _IN_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+    _IN_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+    _IN_Q_OVERFLOW = 0x00004000
+
+    def __init__(self, directory: Path, link_name: str) -> None:
+        self.directory = Path(directory)
+        self.link_name = link_name
+        self.events: list[dict[str, int | str]] = []
+        self._libc = ctypes.CDLL(None, use_errno=True)
+        self._libc.inotify_init1.argtypes = [ctypes.c_int]
+        self._libc.inotify_init1.restype = ctypes.c_int
+        self._libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        self._libc.inotify_add_watch.restype = ctypes.c_int
+        self._fd = self._libc.inotify_init1(self._IN_CLOEXEC | self._IN_NONBLOCK)
+        if self._fd < 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), "inotify_init1")
+        mask = self._IN_OPEN | self._IN_CLOSE_NOWRITE | self._IN_CREATE | self._IN_DELETE | self._IN_ONLYDIR
+        self._watch = self._libc.inotify_add_watch(self._fd, os.fsencode(self.directory), mask)
+        if self._watch < 0:
+            error = ctypes.get_errno()
+            os.close(self._fd)
+            raise OSError(error, os.strerror(error), str(self.directory))
+
+    def close(self) -> None:
+        if self._fd >= 0:
+            os.close(self._fd)
+            self._fd = -1
+
+    def _drain(self) -> None:
+        while select.select([self._fd], [], [], 0)[0]:
+            data = os.read(self._fd, 65536)
+            offset = 0
+            while offset + self._EVENT.size <= len(data):
+                _watch, mask, _cookie, name_len = self._EVENT.unpack_from(data, offset)
+                offset += self._EVENT.size
+                raw_name = data[offset : offset + name_len]
+                offset += name_len
+                if mask & self._IN_Q_OVERFLOW:
+                    raise AssertionError("by-id 目錄 inotify queue overflow")
+                name = os.fsdecode(raw_name.split(b"\0", 1)[0]) if raw_name else ""
+                self.events.append({
+                    "sequence": len(self.events) + 1,
+                    "mask": mask,
+                    "name": name,
+                    "observed_ns": time.monotonic_ns(),
+                })
+
+    def mark(self) -> int:
+        """先排空先前事件，再回傳本次 bridge action 的序列基準。"""
+        self._drain()
+        return len(self.events)
+
+    def _wait_for(self, predicate, *, timeout_s: float, deadline_ns: int | None, label: str):
+        local_deadline = time.monotonic() + timeout_s
+        while True:
+            self._drain()
+            result = predicate()
+            if result is not None:
+                if deadline_ns is None or all(event["observed_ns"] <= deadline_ns for event in result):
+                    return result
+                raise TimeoutError(f"{label} 事件在 handoff 排空窗口截止後才被觀察到：{result!r}")
+            remaining = local_deadline - time.monotonic()
+            if deadline_ns is not None:
+                remaining = min(remaining, (deadline_ns - time.monotonic_ns()) / 1_000_000_000)
+            if remaining <= 0:
+                raise TimeoutError(f"等待 {label} 逾時；events={self.events!r}")
+            select.select([self._fd], [], [], remaining)
+
+    def wait_link_event(
+        self, *, after_seq: int, action: str, timeout_s: float, deadline_ns: int | None = None,
+    ) -> dict[str, int | str]:
+        wanted_mask = self._IN_DELETE if action == "remove" else self._IN_CREATE
+
+        def find():
+            return next((event for event in self.events
+                         if event["sequence"] > after_seq and event["name"] == self.link_name
+                         and int(event["mask"]) & wanted_mask), None)
+
+        return self._wait_for(
+            lambda: (event,) if (event := find()) is not None else None,
+            timeout_s=timeout_s, deadline_ns=deadline_ns, label=f"symlink {action}",
+        )[0]
+
+    def wait_scan_after(
+        self, *, after_seq: int, timeout_s: float, deadline_ns: int | None = None,
+    ) -> tuple[dict[str, int | str], dict[str, int | str]]:
+        def find():
+            opened = None
+            for event in self.events:
+                if event["sequence"] <= after_seq or event["name"]:
+                    continue
+                if int(event["mask"]) & self._IN_OPEN:
+                    opened = event
+                elif opened is not None and int(event["mask"]) & self._IN_CLOSE_NOWRITE:
+                    return opened, event
+            return None
+
+        return self._wait_for(
+            find, timeout_s=timeout_s, deadline_ns=deadline_ns, label="symlink 變更後的 by-id 目錄掃描",
+        )
+
+
+def _scan_by_id_directory(directory: Path) -> None:
+    with os.scandir(directory) as entries:
+        list(entries)
 
 
 def _install_old(tmp_path: Path, env: dict[str, str], bundle: Path) -> tuple[Path, Path]:
@@ -85,6 +202,62 @@ def _start_rig(tmp_path: Path, env: dict[str, str], *, delay_ms: int = 1):
 
 def _stop_rig(bridge: BridgeTarget, daemon, cli: Path, env: dict[str, str]) -> None:
     finish_test_rig(bridge, daemon, cli, env)
+
+
+@pytest.mark.memory_only
+def test_by_id_scan_observer_rejects_a_pre_change_scan_and_times_out_without_new_scan(tmp_path: Path) -> None:
+    directory = tmp_path / "by-id"
+    directory.mkdir()
+    target = tmp_path / "device"
+    target.touch()
+    link = directory / "usb-FAKE_TARGET_0-if00"
+    link.symlink_to(target)
+    observer = _ByIdScanObserver(directory, link.name)
+    try:
+        before_change = observer.mark()
+        _scan_by_id_directory(directory)
+        old_scan = observer.wait_scan_after(after_seq=before_change, timeout_s=1.0)
+
+        before_remove = observer.mark()
+        link.unlink()
+        removed = observer.wait_link_event(after_seq=before_remove, action="remove", timeout_s=1.0)
+        assert old_scan[1]["sequence"] < removed["sequence"]
+        with pytest.raises(TimeoutError, match="等待 symlink 變更後的 by-id 目錄掃描 逾時"):
+            observer.wait_scan_after(after_seq=int(removed["sequence"]), timeout_s=0.05)
+    finally:
+        observer.close()
+
+
+@pytest.mark.memory_only
+def test_by_id_scan_observer_requires_a_separate_scan_after_link_restore(tmp_path: Path) -> None:
+    directory = tmp_path / "by-id"
+    directory.mkdir()
+    target = tmp_path / "device"
+    target.touch()
+    link = directory / "usb-FAKE_TARGET_0-if00"
+    link.symlink_to(target)
+    observer = _ByIdScanObserver(directory, link.name)
+    try:
+        before_remove = observer.mark()
+        link.unlink()
+        removed = observer.wait_link_event(after_seq=before_remove, action="remove", timeout_s=1.0)
+        _scan_by_id_directory(directory)
+        remove_scan = observer.wait_scan_after(after_seq=int(removed["sequence"]), timeout_s=1.0)
+
+        before_restore = observer.mark()
+        link.symlink_to(target)
+        restored = observer.wait_link_event(after_seq=before_restore, action="restore", timeout_s=1.0)
+        assert remove_scan[1]["sequence"] < restored["sequence"]
+        with pytest.raises(TimeoutError, match="等待 symlink 變更後的 by-id 目錄掃描 逾時"):
+            observer.wait_scan_after(after_seq=int(restored["sequence"]), timeout_s=0.05)
+
+        _scan_by_id_directory(directory)
+        restore_scan = observer.wait_scan_after(after_seq=int(restored["sequence"]), timeout_s=1.0)
+        assert restored["sequence"] < restore_scan[0]["sequence"]
+        assert remove_scan[0]["sequence"] < remove_scan[1]["sequence"]
+        assert restore_scan[0]["sequence"] < restore_scan[1]["sequence"]
+    finally:
+        observer.close()
 
 
 @pytest.mark.rust_only
@@ -390,8 +563,9 @@ def test_update_background_triggers_zero_tx_in_drain_window_l15(tmp_path: Path, 
     """handoff_stop 回 ok 後的排空窗口內，背景來源不得產生 DUT TX（OD-16 (3) 所需之 L1.5 證據）。
 
     與 `test_update_push_after_freeze_zero_tx_l15`（只驗 file.push 路徑）不同：本案例窗口內不送任何 RPC，
-    觸發全部來自背景引擎，依序為既有 console 輸入一行、DeviceWatcher 重探（by-id 連結移除後等待一次重探、
-    復原後再等待一次重探）。
+    觸發全部來自背景引擎，依序為既有 console 輸入一行、DeviceWatcher 在 by-id 連結移除與復原後各自重探。
+    inotify 以該私有 by-id 目錄的 symlink 事件分隔兩階段，再等待事件之後的目錄 open/close；不使用 device.list
+    代替掃描完成訊號。
 
     時序與窗口邊界：窗口自 daemon 寫出 `handoff_stop` 回覆起算，長度為 HANDOFF_DRAIN_GRACE_S；CLI 於收到回覆後
     才寫出暫停點，故暫停點觀察到的時刻不早於窗口起點。斷言分兩段：
@@ -410,6 +584,9 @@ def test_update_background_triggers_zero_tx_in_drain_window_l15(tmp_path: Path, 
     bridge, daemon = _start_rig(tmp_path, env)
     new_cli = select_bundle(env, new)
     pause_dir = tmp_path / "pause-drain-window"
+    scan_observer = _ByIdScanObserver(
+        Path(env["SERIALWRAP_BY_ID_DIR"]), "usb-FAKE_TARGET_0-if00",
+    )
     env.update({"SW_TEST_UPDATE_PAUSE_AFTER": "handoff_stop:replied", "SW_TEST_UPDATE_PAUSE_DIR": str(pause_dir)})
     update_rows = []
     update_thread = RaisingThread(
@@ -421,27 +598,75 @@ def test_update_background_triggers_zero_tx_in_drain_window_l15(tmp_path: Path, 
         primary = next((row for row in consoles if row.get("label") == "primary"), None)
         assert primary is not None and primary.get("vtty"), consoles
         vtty = primary["vtty"]
+        marker = f"DRAIN_WINDOW_{time.time_ns()}"
         update_thread.start()
-        wait_pause(pause_dir, "handoff_stop:replied")
+        pause_marker = wait_pause(pause_dir, "handoff_stop:replied")
+        # pause marker 寫在 handoff_stop 回覆之後；以檔案時間還原 monotonic 時刻並往前留 50 ms，
+        # 避免把 hook 回覆到 marker 建立之間的時間誤算成窗口餘裕。
+        window_started_ns = pause_marker.stat().st_mtime_ns + (time.monotonic_ns() - time.time_ns()) - 50_000_000
+        window_deadline_ns = window_started_ns + int(HANDOFF_DRAIN_GRACE_S * 1_000_000_000)
         bridge.mark("handoff-frozen", os.getpid())
         tx_at_freeze = tx_bytes(bridge.evidence_dir)
         frozen_pid = daemon.proc.pid
         console_fd = os.open(vtty, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         # 1) 既有 console 輸入一行（不經 RPC）。
-        marker = f"DRAIN_WINDOW_{time.time_ns()}"
         os.write(console_fd, f"echo {marker}\n".encode())
-        # 2) by-id 連結移除後等待一次重探，復原後再等待一次重探。
-        bridge.control.call("by_id_link_remove", {})
-        time.sleep(DEVICE_RESCAN_WAIT_S)
-        bridge.control.call("by_id_link_add", {})
-        time.sleep(DEVICE_RESCAN_WAIT_S)
+
+        scan_trace = []
+
+        def trigger_and_wait_scan(action: str, change: str) -> None:
+            action_mark = scan_observer.mark()
+            action_started_ns = time.monotonic_ns()
+            bridge.control.call(action, {})
+            action_completed_ns = time.monotonic_ns()
+            link_event = scan_observer.wait_link_event(
+                after_seq=action_mark,
+                action=change,
+                timeout_s=HANDOFF_DRAIN_GRACE_S,
+                deadline_ns=window_deadline_ns,
+            )
+            scan_open, scan_close = scan_observer.wait_scan_after(
+                after_seq=int(link_event["sequence"]),
+                timeout_s=HANDOFF_DRAIN_GRACE_S,
+                deadline_ns=window_deadline_ns,
+            )
+            scan_trace.append({
+                "action": action,
+                "action_started_ns": action_started_ns,
+                "action_completed_ns": action_completed_ns,
+                "link_event_sequence": link_event["sequence"],
+                "link_event_observed_ns": link_event["observed_ns"],
+                "scan_open_sequence": scan_open["sequence"],
+                "scan_open_observed_ns": scan_open["observed_ns"],
+                "scan_close_sequence": scan_close["sequence"],
+                "scan_close_observed_ns": scan_close["observed_ns"],
+            })
+
+        # 2) 每次都以連結變更事件為分界，且只接受其後新開始的目錄掃描。
+        trigger_and_wait_scan("by_id_link_remove", "remove")
+        trigger_and_wait_scan("by_id_link_add", "restore")
         # 3) 窗口仍開啟的證明：舊 daemon 尚未停止且仍回應 health.ping（不經 service lock）。
         assert daemon.proc.pid == frozen_pid and daemon.proc.poll() is None, (
             f"{HANDOFF_DRAIN_GRACE_S:g} s 排空窗口已結束，背景觸發未位於窗口內，須調整時序"
         )
+        ping_started_ns = time.monotonic_ns()
         ping = rpc(env, "health.ping")
+        ping_completed_ns = time.monotonic_ns()
+        assert ping_completed_ns <= window_deadline_ns, "最後 health.ping 未於 3 秒排空窗口內完成"
         assert ping.get("ok") is True and ping.get("pong") is True, ping
         assert tx_bytes(bridge.evidence_dir) == tx_at_freeze, "排空窗口內背景觸發產生 DUT TX"
+        assert len(scan_trace) == 2, scan_trace
+        assert scan_trace[0]["action"] == "by_id_link_remove"
+        assert scan_trace[1]["action"] == "by_id_link_add"
+        assert int(scan_trace[0]["scan_close_sequence"]) < int(scan_trace[1]["link_event_sequence"]), scan_trace
+        assert int(scan_trace[1]["scan_close_observed_ns"]) <= ping_started_ns, scan_trace
+        print(json.dumps({
+            "window_started_ns": window_started_ns,
+            "window_deadline_ns": window_deadline_ns,
+            "scan_trace": scan_trace,
+            "ping_started_ns": ping_started_ns,
+            "ping_completed_ns": ping_completed_ns,
+        }, sort_keys=True))
         # 4) 整段窗口：舊 daemon 停止即窗口結束；以 bridge mark 作為擷取排空屏障後，全段 TX 須零增量。
         deadline = time.monotonic() + HANDOFF_DRAIN_GRACE_S + 10.0
         while daemon.proc.poll() is None and time.monotonic() < deadline:
@@ -459,6 +684,7 @@ def test_update_background_triggers_zero_tx_in_drain_window_l15(tmp_path: Path, 
     finally:
         if console_fd is not None:
             os.close(console_fd)
+        scan_observer.close()
         if update_thread.is_alive():
             resume_pause(pause_dir, "handoff_stop:replied")
             update_thread.join(15.0)
