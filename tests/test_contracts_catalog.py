@@ -731,6 +731,20 @@ STRUCTURAL_CASES = [
         id="bc_bc_requires_od04",
     ),
     pytest.param(
+        "bc_bc01_rejects_od111",
+        "behavior_change",
+        GOOD_BC.replace("decision_ref: OD-04", "decision_ref: OD-111"),
+        "必須為 OD-04",
+        id="bc_bc01_rejects_od111",
+    ),
+    pytest.param(
+        "bc_bc06_requires_od111",
+        "behavior_change",
+        GOOD_BC.replace("BC-01", "BC-06"),
+        "必須為 OD-111",
+        id="bc_bc06_requires_od111",
+    ),
+    pytest.param(
         "bc_owner_matches_basis",
         "behavior_change",
         GOOD_BC.replace("owner: spec-reconciliation", "owner: hamanpaul"),
@@ -1325,17 +1339,26 @@ def _bc_by_id():
     return {c.id: c for c in _bc_changes()}
 
 
+# 0.5.1 依 OD-111 新增的 Rust-only BC；編號由編排者指派，各工作包只加自己的 ID。
+_V051_BC_IDS: frozenset[str] = frozenset({"BC-07"})
+
+
 def test_bc_real_five_bcs_registered() -> None:
-    """原有五項 BC 與本包 BC-07 均登記，核准資訊與狀態符合契約規則。"""
+    """原有五項 BC 維持 OD-04；明列的 0.5.1 BC 依 OD-111 登記。"""
     changes, _, _ = _bc()
     bc_entries = [c for c in changes if c.kind == "BC"]
-    assert {c.id for c in bc_entries} == {"BC-01", "BC-02", "BC-03", "BC-04", "BC-05", "BC-07"}
+    original = {"BC-01", "BC-02", "BC-03", "BC-04", "BC-05"}
+    assert {c.id for c in bc_entries} == original | _V051_BC_IDS
     for c in bc_entries:
         assert c.status != "PROPOSED"
-        assert c.approval.decision_ref == "OD-04"
-        expected_date = "2026-11-23" if c.id == "BC-07" else "2026-10-15"
-        assert c.approval.date == expected_date
         assert c.approval.owner == "hamanpaul"
+        if c.id in original:
+            assert c.approval.decision_ref == "OD-04"
+            assert c.approval.date == "2026-10-15"
+        else:
+            assert c.approval.decision_ref == "OD-111"
+            assert c.scope == "rust_only"
+            assert "OD-111" in c.related_decisions
 
 
 def test_bc_real_approval_owner_by_basis() -> None:
