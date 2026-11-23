@@ -211,101 +211,75 @@ def _reject_zero_tx(p7, tgt, want: str) -> None:
     assert _tx_count(p7) == tx_before, f"{want}：被拒請求 WAL 不得有 TX"
 
 
-def _assert_python_detached_terminal_state(state: dict, baseline: dict | None = None) -> None:
-    """Python 分支 DF-23 的終態 oracle：接受 `DETACHED`／`ATTACHING` 的短暫過渡，以及穩定且不自動重試的 `READY` 收斂，
-    但只接受兩個已觀察登入失敗結局與 `last_error is None` 的穩定完成；任何自動重試欄位變化都拒絕。"""
-    state_name = str(state.get("state") or "")
-    if baseline is None:
-        baseline = state
-        assert state_name in {"DETACHED", "READY"}, state
-    else:
-        assert state_name in {"DETACHED", "ATTACHING", "READY"}, state
-
-    err = state.get("last_error")
-    if state_name == "READY":
-        assert err is None, state
-    else:
-        err_str = str(err)
-        accepted = {"ATTACH_FAILED:TxIncompleteError", "LOGIN_PROMPT_TIMEOUT"}
-        assert err_str in accepted or err_str.startswith("ATTACH_FAILED:TxIncompleteError") or err is None, state
-    for key in ("reprobe_attempts", "next_reprobe_at", "reprobe_exhausted", "bridge_generation"):
-        assert key in state and key in baseline, (key, state, baseline)
-        assert state.get(key) == baseline.get(key), (key, state, baseline)
+def _assert_python_detached_terminal_state(state: dict, baseline: dict) -> None:
+    """DF-23 Python oracle：baseline 與每個觀察樣本都須是核准的 DETACHED 終態，且重試欄位須與 baseline 相同。"""
+    accepted = {"ATTACH_FAILED:TxIncompleteError", "LOGIN_PROMPT_TIMEOUT"}
+    keys = ("reprobe_attempts", "next_reprobe_at", "reprobe_exhausted", "bridge_generation")
+    for snapshot in (baseline, state):
+        for key in keys:
+            assert key in snapshot, (key, snapshot)
+    for key in keys:
+        assert state[key] == baseline[key], (key, state, baseline)
+    for snapshot in (baseline, state):
+        assert snapshot.get("state") == "DETACHED", snapshot
+        assert snapshot.get("last_error") in accepted, snapshot
 
 
 def test_python_detached_terminal_state_oracle_accepts_the_two_observed_states() -> None:
-    """DF-23：兩個已觀測 Python 失敗終態應接受；安靜收斂到 `READY` 且不自動重試也接受；其他錯誤與任何重試行為均拒絕。"""
-    baseline_one = {
-        "state": "DETACHED",
-        "last_error": "ATTACH_FAILED:TxIncompleteError",
+    """DF-23 oracle 僅接受兩種完整錯誤值；起始與觀察樣本均須維持 DETACHED 且不得重試。"""
+    fields = {
         "reprobe_attempts": 0,
         "next_reprobe_at": None,
         "reprobe_exhausted": False,
         "bridge_generation": 1,
     }
-    _assert_python_detached_terminal_state(baseline_one, baseline_one)
-    _assert_python_detached_terminal_state({**baseline_one, "state": "ATTACHING"}, baseline_one)
-    _assert_python_detached_terminal_state({**baseline_one, "state": "READY", "last_error": None}, baseline_one)
+    for error in ("ATTACH_FAILED:TxIncompleteError", "LOGIN_PROMPT_TIMEOUT"):
+        baseline = {"state": "DETACHED", "last_error": error, **fields}
+        _assert_python_detached_terminal_state(baseline, baseline)
+        _assert_python_detached_terminal_state(dict(baseline), baseline)
 
-    baseline_two = {
-        "state": "DETACHED",
-        "last_error": "LOGIN_PROMPT_TIMEOUT",
-        "reprobe_attempts": 0,
-        "next_reprobe_at": None,
-        "reprobe_exhausted": False,
-        "bridge_generation": 1,
-    }
-    _assert_python_detached_terminal_state(baseline_two, baseline_two)
-    _assert_python_detached_terminal_state({**baseline_two, "state": "ATTACHING"}, baseline_two)
-    _assert_python_detached_terminal_state({**baseline_two, "state": "READY", "last_error": None}, baseline_two)
+        for bad in (
+            {**baseline, "last_error": "OTHER_ERROR"},
+            {**baseline, "last_error": "ATTACH_FAILED:TxIncompleteError:extra"},
+            {**baseline, "last_error": None},
+            {**baseline, "state": "ATTACHING"},
+            {**baseline, "state": "READY", "last_error": None},
+            {key: value for key, value in baseline.items() if key != "reprobe_attempts"},
+            {**baseline, "reprobe_attempts": 1},
+            {**baseline, "next_reprobe_at": 123.0},
+            {**baseline, "reprobe_exhausted": True},
+            {**baseline, "bridge_generation": 2},
+        ):
+            with pytest.raises(AssertionError):
+                _assert_python_detached_terminal_state(bad, baseline)
 
-    for bad in (
-        {**baseline_one, "last_error": "OTHER_ERROR"},
-        {**baseline_one, "reprobe_attempts": 1},
-        {**baseline_one, "bridge_generation": 2},
-        {**baseline_two, "next_reprobe_at": 123.0},
-        {**baseline_one, "state": "ATTACHING", "reprobe_attempts": 1},
-        {**baseline_one, "state": "READY", "last_error": "OTHER_ERROR"},
+    for bad_baseline in (
+        {"state": "READY", "last_error": None, **fields},
+        {"state": "ATTACHING", "last_error": "LOGIN_PROMPT_TIMEOUT", **fields},
+        {"state": "DETACHED", "last_error": None, **fields},
     ):
         with pytest.raises(AssertionError):
-            _assert_python_detached_terminal_state(bad, baseline_one if bad.get("last_error") != "LOGIN_PROMPT_TIMEOUT" else baseline_two)
+            _assert_python_detached_terminal_state(bad_baseline, bad_baseline)
 
 
 def _wait_stable_python_baseline(p7, timeout_s: float = 60.0) -> tuple[dict, dict]:
-    """以穩定快照建立 DF-23 baseline：只在 session 位於 `DETACHED`／`READY` 且重試欄位連續一段時間不變時採樣，
-    避免在手動 attach 仍在收斂時被短暫 `ATTACHING` 狀態或 stale prompt 造成假陽性。"""
+    """等手動 attach 收斂後才建立 DF-23 baseline；baseline 與下一筆快照都必須是核准的 DETACHED 終態。"""
     keys = ("reprobe_attempts", "next_reprobe_at", "reprobe_exhausted", "bridge_generation")
+    accepted = {"ATTACH_FAILED:TxIncompleteError", "LOGIN_PROMPT_TIMEOUT"}
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         row = _row(p7)
-        state_name = str(row.get("state") or "")
-        err = row.get("last_error")
-        accepted = {"ATTACH_FAILED:TxIncompleteError", "LOGIN_PROMPT_TIMEOUT"}
-        if state_name == "READY":
-            if err is not None:
-                time.sleep(0.2)
-                continue
-        elif state_name != "DETACHED" or str(err) not in accepted:
+        if row.get("state") != "DETACHED" or row.get("last_error") not in accepted:
             time.sleep(0.2)
             continue
 
-        baseline = {k: row.get(k) for k in keys}
+        _assert_python_detached_terminal_state(row, row)
+        baseline = {key: row[key] for key in ("state", "last_error", *keys)}
         time.sleep(0.5)
         stable = _row(p7)
-        stable_name = str(stable.get("state") or "")
-        stable_err = stable.get("last_error")
-        if stable_name == "READY":
-            if stable_err is not None:
-                time.sleep(0.2)
-                continue
-        elif stable_name != "DETACHED" or str(stable_err) not in accepted:
-            time.sleep(0.2)
-            continue
-        if all(stable.get(k) == baseline.get(k) for k in keys):
-            _assert_python_detached_terminal_state(stable, baseline)
-            return stable, baseline
-        time.sleep(0.2)
-    raise AssertionError("Python 分支未在觀察窗內穩定到 DF-23 的 DETACHED/READY baseline")
+        _assert_python_detached_terminal_state(stable, baseline)
+        return stable, baseline
+    raise AssertionError("Python 分支未在觀察窗內穩定到 DF-23 的核准 DETACHED baseline")
 
 
 def test_rejected_requests_zero_tx(p7, tmp_path):
@@ -339,10 +313,11 @@ def test_release_during_login_waits_for_handle_close(p7, tmp_path):
     """登入進行中 `device release`：回成功的當下 daemon 已無指向該 tty 的 fd；`device attach` 之前不重開；
     `session recover --force` 的 REATTACH 任何時刻至多持有一個 fd（舊 fd 關閉後才重開）。
 
-    2026-11-23 編排者裁決：DF-23 Python 分支接受 `DETACHED` + `{ATTACH_FAILED:TxIncompleteError, LOGIN_PROMPT_TIMEOUT}`
-    兩個已觀察終態；在之後 10 s 內，已確立的 `DETACHED` baseline 必須維持，且不得因自動重試改變
-    `reprobe_attempts`、`next_reprobe_at`、`reprobe_exhausted`、`bridge_generation`；短暫 `ATTACHING` 只作為
-    手動 attach 期間的過渡，不得視為自動重試。Rust 分支與 §11.3-4 的 handle 時序斷言不改。"""
+    2026-11-23 編排者裁決（rulings/v051.md 補登，72334366）：Python 分支只接受 `DETACHED` +
+    `ATTACH_FAILED:TxIncompleteError` 或 `LOGIN_PROMPT_TIMEOUT`；baseline 與之後 10 s 的每個樣本都須維持
+    `DETACHED`，且 `reprobe_attempts`、`next_reprobe_at`、`reprobe_exhausted`、`bridge_generation` 不變。
+    `READY`、`ATTACHING`、空錯誤、錯誤前綴匹配及首次 attach 失敗後重試均不核准。Rust 分支與 §11.3-4
+    的 handle 時序斷言不改。"""
     tgt = FakeTarget(tmp_path / "t0", delay_ms=1500)       # 每個回應延遲 1.5 s：login 進行中可插入 release
     p7.start("shell", [tgt])
     deadline = time.monotonic() + 20.0
@@ -361,14 +336,8 @@ def test_release_during_login_waits_for_handle_close(p7, tmp_path):
     while time.monotonic() < t_end:
         assert _daemon_fds_to(p7, slave) == 0, "device attach 之前不得重新開啟"
         time.sleep(0.1)
-    attach_deadline = time.monotonic() + 15.0
-    while True:
-        rc, j = p7.cli("device", "attach", "--selector", "COM0")
-        if rc == 0 and j.get("ok") is True:
-            break
-        assert rc == 2 and j.get("error_code") == "DEVICE_STILL_HELD", (rc, j)
-        assert time.monotonic() < attach_deadline, (rc, j)
-        time.sleep(0.2)
+    rc, j = p7.cli("device", "attach", "--selector", "COM0")
+    assert rc == 0 and j["ok"] is True, (rc, j)
     deadline = time.monotonic() + 10.0
     while _daemon_fds_to(p7, slave) == 0:
         assert time.monotonic() < deadline, "device attach 後應重新開啟 tty"
@@ -392,7 +361,7 @@ def test_release_during_login_waits_for_handle_close(p7, tmp_path):
         s, baseline = _wait_stable_python_baseline(p7)
         _assert_python_detached_terminal_state(s, baseline)
         t_end = time.monotonic() + 10.0
-        while time.monotonic() < t_end:                     # 不自動重試：穩定收斂到 DETACHED/READY，且重試欄位不變。
+        while time.monotonic() < t_end:                     # 不自動重試：維持 DETACHED，且重試欄位不變。
             row = _row(p7)
             _assert_python_detached_terminal_state(row, baseline)
             time.sleep(0.5)
