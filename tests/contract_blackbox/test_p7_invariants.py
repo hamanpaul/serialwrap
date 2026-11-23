@@ -59,6 +59,26 @@ def _daemon_fds_to(p7, path: str) -> int:
     return n
 
 
+def _daemon_tty_holders(p7, path: str) -> list[str]:
+    pid = p7.daemon.proc.pid
+    target = os.path.realpath(path)
+    proc_fd = f"/proc/{pid}/fd"
+    try:
+        names = os.listdir(proc_fd)
+    except OSError as exc:
+        raise AssertionError(f"無法掃描 daemon fd 目錄 {proc_fd}: {exc}") from exc
+    holders = []
+    for name in names:
+        fd_path = f"{proc_fd}/{name}"
+        try:
+            linked = os.readlink(fd_path)
+            if os.path.realpath(fd_path) == target:
+                holders.append(f"{name}->{linked}")
+        except OSError:
+            continue
+    return holders
+
+
 def _attach_human_vtty(p7, label: str) -> tuple[int, dict]:
     from bb_daemon import _send_rpc
     from bb_p7 import SOCKET_ENV
@@ -341,7 +361,8 @@ def test_release_during_login_waits_for_handle_close(p7, tmp_path):
     `DETACHED`，且 `reprobe_attempts`、`next_reprobe_at`、`reprobe_exhausted`、`bridge_generation` 不變；
     `last_state_change_at`、`last_probe_at`、`last_tx_at` 也須存在且不變，以捕捉兩次輪詢間失敗後回到 DETACHED 的 attach 嘗試。
     `READY`、`ATTACHING`、空錯誤、錯誤前綴匹配及首次 attach 失敗後重試均不核准。Rust 分支與 §11.3-4
-    的 handle 時序斷言不改。"""
+    的 handle 時序斷言不改。觀察期在有 `/proc` 的平台亦逐次檢查 daemon fd 是否指向目標 tty；沒有 `/proc`
+    的平台只保留既有欄位判準，無法偵測尚未公開狀態的開埠嘗試，且不因此 skip。"""
     tgt = FakeTarget(tmp_path / "t0", delay_ms=1500)       # 每個回應延遲 1.5 s：login 進行中可插入 release
     p7.start("shell", [tgt])
     deadline = time.monotonic() + 20.0
@@ -388,6 +409,9 @@ def test_release_during_login_waits_for_handle_close(p7, tmp_path):
         while time.monotonic() < t_end:                     # 不自動重試：終態、重試欄位及持久事件時間戳均不變。
             row = _row(p7)
             _assert_python_detached_terminal_state(row, baseline)
+            if os.path.isdir("/proc"):
+                holders = _daemon_tty_holders(p7, slave)
+                assert not holders, f"Python 觀察期 daemon 再次持有目標 tty，視為新的 attach 嘗試：{holders}"
             time.sleep(0.5)
 
     # REATTACH：另一個 rig（READY 起手），RX 凍結下 recover --force，取樣 daemon 對 tty 的 fd 數峰值。
