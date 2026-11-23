@@ -93,7 +93,7 @@ fn assert_shutdown_cancels_self_test_wait(prompt_wait: bool) {
     let tx_at_shutdown = rig.dev.tx_len();
     rig.dev.pause_next_close();
     let (shutdown_tx, shutdown_rx) = bounded(1);
-    let controls_before_shutdown = rig.actor_probe().entries("Control").len();
+    let op_finished_before_shutdown = rig.actor_probe().op_finished_count();
     rig.send_control(ControlEvent::Shutdown { reply: shutdown_tx });
     let self_test_reply = self_test.recv_timeout(Duration::from_millis(400)).ok();
     let close_paused = rig.dev.wait_paused(Duration::from_millis(400));
@@ -101,8 +101,8 @@ fn assert_shutdown_cancels_self_test_wait(prompt_wait: bool) {
     let deadline = std::time::Instant::now() + Duration::from_millis(400);
     let mut runner_finished = false;
     while std::time::Instant::now() < deadline {
-        // OpFinished 沿用 actor probe 既有的泛型 Control 標籤，不能改寫共用觀測契約。
-        if rig.actor_probe().entries("Control").len() > controls_before_shutdown {
+        // 只接受此 self-test 的 OpFinished；其他控制事件不能證明 RX 等待已收尾。
+        if rig.actor_probe().op_finished_count() > op_finished_before_shutdown {
             runner_finished = true;
             break;
         }
@@ -173,7 +173,7 @@ fn shutdown_cancels_ready_recover_wait_without_second_key() {
 
     // 關閉動作暫停於回條前：此時可觀察 Phase 1 的 RPC 回覆與 OpRunner 等待是否已收斂。
     let tx_at_shutdown = rig.dev.tx_len();
-    let controls_before_shutdown = rig.actor_probe().entries("Control").len();
+    let op_finished_before_shutdown = rig.actor_probe().op_finished_count();
     rig.dev.pause_next_close();
     let (shutdown_tx, shutdown_rx) = bounded(1);
     rig.send_control(ControlEvent::Shutdown { reply: shutdown_tx });
@@ -183,8 +183,8 @@ fn shutdown_cancels_ready_recover_wait_without_second_key() {
     let deadline = std::time::Instant::now() + Duration::from_millis(400);
     let mut runner_finished = false;
     while std::time::Instant::now() < deadline {
-        // OpFinished 使用 actor probe 的泛型 Control 標籤；Shutdown 與 WorkerStopped 各有專屬標籤。
-        if rig.actor_probe().entries("Control").len() > controls_before_shutdown {
+        // 只接受 READY recover 的 OpFinished；UartTxCompleted 等控制事件不算等待已收尾。
+        if rig.actor_probe().op_finished_count() > op_finished_before_shutdown {
             runner_finished = true;
             break;
         }

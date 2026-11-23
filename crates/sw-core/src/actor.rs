@@ -54,6 +54,7 @@ pub struct ActorLatencyProbe {
 #[derive(Default)]
 struct ProbeInner {
     data_items: u64,
+    op_finished: u64,
     /// 最近處理的 data item 之開始時刻（單調 ns；上限 `PROBE_LOG_MAX`），timer／tick 見證數用。
     data_started: std::collections::VecDeque<u64>,
     log: std::collections::VecDeque<ProbeEntry>,
@@ -103,6 +104,14 @@ impl ActorLatencyProbe {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).data_items
     }
 
+    /// actor 已完成分派的 `OpFinished` 事件數。
+    pub fn op_finished_count(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .op_finished
+    }
+
     /// 指定標籤的紀錄（`Release`、`CancelQueued`、`LeaseExpiry`、`Shutdown`、`WorkerStopped`、`Request`、`Timer`、`Tick`、`Control`）。
     pub fn entries(&self, label: &str) -> Vec<ProbeEntry> {
         self.inner
@@ -122,6 +131,11 @@ impl ActorLatencyProbe {
             g.data_started.pop_front();
         }
         g.data_started.push_back(started_ns);
+    }
+
+    fn after_op_finished(&self) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.op_finished = g.op_finished.saturating_add(1);
     }
 
     /// actor 內部 timer／tick：到期時刻 `due_ns` 之後才開始處理的 data item 數。
@@ -588,6 +602,9 @@ pub fn try_spawn_actor_with_reaper(
                 #[cfg(feature = "test-fakes")]
                 let label = probe_label(&item);
                 #[cfg(feature = "test-fakes")]
+                let is_op_finished =
+                    matches!(&item, MailboxItem::Control(ControlEvent::OpFinished { .. }));
+                #[cfg(feature = "test-fakes")]
                 let pause_label = probe_pause_label(&item);
                 #[cfg(feature = "test-fakes")]
                 let data_started = clock.mono_ns();
@@ -624,6 +641,10 @@ pub fn try_spawn_actor_with_reaper(
                     &mut panic_count,
                     &mut immediate_feedback,
                 );
+                #[cfg(feature = "test-fakes")]
+                if is_op_finished {
+                    thread_probe.after_op_finished();
+                }
                 if let Some(mark) = data_mark {
                     // 依賴事件只會在 current epoch 時判定；保留舊 epoch 的 dispatch watermark，
                     // 讓 OD-69 drain barrier 在 release 已清除 conn_epoch 後仍能確認 reader RX 已處理。
