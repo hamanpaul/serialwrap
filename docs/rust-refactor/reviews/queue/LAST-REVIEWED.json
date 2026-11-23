@@ -35,5 +35,6 @@
   "feature/release-0.4.1": "120cc8a",
   "fix/282-stop-push-residual-line": "4c145af",
   "fix/297-shutdown-pending-ops-flush": "8ce904e",
-  "fix/276-windows-task-start-hold": "ddd642a"
+  "fix/276-windows-task-start-hold": "ddd642a",
+  "fix/ci-thin-timing-margins": "585d03b"
 }
