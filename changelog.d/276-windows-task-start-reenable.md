@@ -7,4 +7,4 @@ scope: cli
 
 SC-18 的巢狀 autostart 若等待 `autostart.lock` 期間切成 `windows-task`，`/Run` 成功只代表排程已接受；CLI 最多等待 10 秒，以正式 `health.ping` 回應的 `ok`／`pong` 判定 daemon 就緒，另以 `health.status` 取得 PID 後重送原 RPC。若 status 沒有可用 PID，仍依 ping 結果處理且不虛報 PID；逾時回既有 `DAEMON_NOT_READY` 且不重送。
 
-BC-07 的核准來源依 0.5.1 登錄規則使用 OD-111；契約檢查器仍要求 BC-01～BC-05 使用 OD-04，並拒絕不符合編號範圍的來源。
+這項 Rust 與 Python 的行為差異登錄為 BC-07（OD-111，Rust-only）。
