@@ -960,6 +960,15 @@ fn profile_template_fields_custom_templates_and_no_common() {
         "\n  custom-template: null\n\n# targets 區段為可選：",
         1,
     );
+    assert_ne!(
+        live_with_unshared_invalid_template.as_str(),
+        asset_text,
+        "非共同 template fixture 的替換錨點必須存在"
+    );
+    assert!(
+        live_with_unshared_invalid_template.contains("custom-template: null"),
+        "非共同 template fixture 必須含 custom-template: null"
+    );
     t.write_file(&live_path, live_with_unshared_invalid_template.as_bytes());
     let (rc, out, _) = t.run(&["doctor"]);
     assert_eq!(rc, 0);
