@@ -2002,10 +2002,32 @@ impl SessionCore {
         self.reopen_after_retired = false;
         // P8 Task 8（SC-32）：停止是 flash 結束路徑之一，無條件清 Fence／Ownership 的 flash_mode。
         self.flash_end_for_stop();
-        // 再探進行中被 drain 搶進：等待者照 Python `attach_session` 的 pending drain 分支回 SESSION_RECOVERING。
-        if let Some(run) = self.login_run.take() {
-            for (waiter, _) in run.waiters {
-                effects.push(Effect::Reply(waiter, Ok(self.session_recovering_reply(now))));
+        // 再探進行中被 drain 搶進：Attach waiter 照 Python `attach_session` 的 pending drain 分支回 SESSION_RECOVERING。
+        // Shutdown 只先取走 Attach waiter；Recover waiter 留待 Fence 凍結後以 FLUSHED_BY_SHUTDOWN 沖刷。
+        if kind == StopKind::Shutdown {
+            let recovering_reply = self.session_recovering_reply(now);
+            if let Some(run) = self.login_run.as_mut() {
+                let mut index = 0;
+                while index < run.waiters.len() {
+                    if matches!(&run.waiters[index].1, ReprobeWaiter::Attach) {
+                        let (waiter, _) = run.waiters.remove(index);
+                        effects.push(Effect::Reply(
+                            waiter,
+                            Ok(recovering_reply.clone()),
+                        ));
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+        } else {
+            if let Some(run) = self.login_run.take() {
+                for (waiter, _) in run.waiters {
+                    effects.push(Effect::Reply(
+                        waiter,
+                        Ok(self.session_recovering_reply(now)),
+                    ));
+                }
             }
         }
         self.reboot_recovery = None;
@@ -2014,8 +2036,8 @@ impl SessionCore {
             self.shutdown_requested = true;
         }
         if kind == StopKind::Shutdown && (self.stop.is_some() || self.pending_open_stop.is_some()) {
-            // 既有 stop／pending-open 分支的 Fence 已在首次 Phase 1 凍結；仍須在早退前沖刷 self-test waiter。
-            self.flush_shutdown_self_test_ops(&mut effects.0);
+            // 既有 stop／pending-open 分支的 Fence 已在首次 Phase 1 凍結；仍須在早退前沖刷 Shutdown waiters。
+            self.flush_shutdown_phase1_waiters(&mut effects.0);
         }
         if let Some(stop) = &mut self.stop {
             if kind == stop.kind || kind == StopKind::Shutdown {
@@ -2130,7 +2152,7 @@ impl SessionCore {
                 // P8 Task 5：與 fence 凍結同處喚醒檔案傳輸等待（不動 login run 的取消世代）。
                 self.deps.rx.cancel_transfer_runs();
                 if kind == StopKind::Shutdown {
-                    self.flush_shutdown_self_test_ops(&mut effects.0);
+                    self.flush_shutdown_phase1_waiters(&mut effects.0);
                 }
                 if !already_released && (kind != StopKind::Shutdown || self.state != SessionState::Released) {
                     self.set_state(SessionState::Recovering, now);
@@ -2221,8 +2243,8 @@ impl SessionCore {
             }
             let mut stop_effects = Vec::new();
             if kind == StopKind::Shutdown {
-                // 其他 drain 完成後再停機會走無 worker 分支；仍須凍結 Fence 並沖刷 self-test waiter。
-                self.flush_shutdown_self_test_ops(&mut stop_effects);
+                // 其他 drain 完成後再停機會走無 worker 分支；仍須凍結 Fence 並沖刷 Shutdown waiters。
+                self.flush_shutdown_phase1_waiters(&mut stop_effects);
             }
             stop_effects.extend(self.finish_stop_without_worker(
                 kind,
@@ -2266,7 +2288,7 @@ impl SessionCore {
         // 其 TX 已由上方凍結擋下；不呼叫 `cancel_login_runs`（P7 login 行為不變）。
         self.deps.rx.cancel_transfer_runs();
         if kind == StopKind::Shutdown {
-            self.flush_shutdown_self_test_ops(&mut effects.0);
+            self.flush_shutdown_phase1_waiters(&mut effects.0);
         }
         let code = if kind == StopKind::Shutdown {
             "FLUSHED_BY_SHUTDOWN"
@@ -2291,9 +2313,9 @@ impl SessionCore {
         effects
     }
 
-    /// Shutdown Phase 1：Fence 已凍結後才取消 self-test RX 等待、移除 op 登錄並回覆 RPC。
-    /// 不等待 OpFinished；晚到事件因 pending／side 登錄已移除而無副作用。
-    fn flush_shutdown_self_test_ops(&mut self, effects: &mut Vec<Effect>) {
+    /// Shutdown Phase 1：先凍結 Fence，再取消 RX 等待、移除需立即沖刷的 op／recover waiter 並回覆 RPC。
+    /// 不等待 OpFinished 或 force-recover timer；晚到事件因 pending／side 登錄或等待者已移除而無副作用。
+    fn flush_shutdown_phase1_waiters(&mut self, effects: &mut Vec<Effect>) {
         if !self.deps.fence.with(|fence| fence.frozen) {
             self.generations.owner_gen = self.generations.owner_gen.saturating_add(1);
             self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
@@ -2309,21 +2331,44 @@ impl SessionCore {
             .pending_ops
             .iter()
             .filter_map(|(op_id, pending)| {
-                matches!(pending, PendingOp::SelfTest { .. }).then_some(*op_id)
+                matches!(
+                    pending,
+                    PendingOp::SelfTest { .. } | PendingOp::Recover { .. }
+                )
+                .then_some(*op_id)
             })
             .collect();
         for op_id in op_ids {
-            let Some(PendingOp::SelfTest { reply, .. }) = self.pending_ops.remove(&op_id) else {
+            let Some(pending) = self.pending_ops.remove(&op_id) else {
                 continue;
             };
             self.side_ops.remove(&op_id);
+            let reply = match pending {
+                PendingOp::SelfTest { reply, .. } | PendingOp::Recover { reply } => reply,
+                _ => unreachable!("只沖刷 self-test 與 READY recover"),
+            };
+            effects.push(Effect::Reply(reply, Ok(flushed_by_shutdown_reply())));
+        }
+
+        // Force recover 不在 pending_ops：清 drain 回條後的輪詢與等待者各自存於兩個欄位。
+        self.force_poll_after_clear.clear();
+        for pending in std::mem::take(&mut self.force_recover) {
             effects.push(Effect::Reply(
-                reply,
-                Ok(pydict! {
-                    "ok" => false,
-                    "error_code" => "FLUSHED_BY_SHUTDOWN",
-                }),
+                pending.reply,
+                Ok(flushed_by_shutdown_reply()),
             ));
+        }
+
+        // Attach waiter 已沿用既有 stop 路徑回覆；此處只沖刷並取走 Recover waiter。
+        // take LoginRun 令晚到 LoginFinished 失效，但不會清除或改寫 Attach waiter 的既有回覆。
+        if let Some(mut run) = self.login_run.take() {
+            debug_assert!(run
+                .waiters
+                .iter()
+                .all(|(_, waiter)| matches!(waiter, ReprobeWaiter::Recover { .. })));
+            for (reply, _) in run.waiters.drain(..) {
+                effects.push(Effect::Reply(reply, Ok(flushed_by_shutdown_reply())));
+            }
         }
     }
 
@@ -9174,6 +9219,13 @@ fn prompt_timeout_none() -> PyDict {
         "error_code" => "PROMPT_TIMEOUT",
         "partial" => true,
         "recovery_action" => "NONE",
+    }
+}
+
+fn flushed_by_shutdown_reply() -> PyDict {
+    pydict! {
+        "ok" => false,
+        "error_code" => "FLUSHED_BY_SHUTDOWN",
     }
 }
 

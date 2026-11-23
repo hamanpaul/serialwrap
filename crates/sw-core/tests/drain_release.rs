@@ -1240,6 +1240,180 @@ fn shutdown_self_test_reply_precedes_worker_receipt() {
 }
 
 #[test]
+fn shutdown_ready_recover_reply_precedes_worker_receipt() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let (recover, effects) = h.rpc_deferred(SessionRequest::Recover {
+        timeout_s: 60.0,
+        force: false,
+    });
+    let grant = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp {
+                grant,
+                spec: sw_core::op_runner::OpSpec::Recover { .. },
+            } => Some(grant.clone()),
+            _ => None,
+        })
+        .expect("READY recover 應產生獨立 Recover op");
+
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    h.feed(ControlEvent::Shutdown { reply: shutdown_tx });
+    assert!(
+        h.fence.with(|fence| fence.frozen),
+        "Shutdown Phase 1 必須先凍結 Fence"
+    );
+    assert!(
+        !h.core.shutdown_complete(),
+        "WorkerStopped 前 actor 尚未結束"
+    );
+    let result = recover
+        .try_recv()
+        .expect("Phase 1 必須在 WorkerStopped 前回覆 READY recover")
+        .expect("recover 應收到 RPC dict，而不是 framing EXCEPTION");
+    assert_eq!(result.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(
+        result.get("error_code"),
+        Some(&PyValue::from("FLUSHED_BY_SHUTDOWN"))
+    );
+
+    // safety lane 的 WorkerStopped 先於 control lane 的 OpFinished；recover RPC 已由 Phase 1 結清。
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).feed();
+    assert!(shutdown_rx.try_recv().unwrap().unwrap()["ok"]
+        .as_bool()
+        .unwrap());
+    assert!(h.core.shutdown_complete());
+    let late = h.feed(ControlEvent::OpFinished {
+        op_id: grant.op_id,
+        epoch: grant.epoch,
+        outcome: OpOutcome::PromptTimeout {
+            stdout: String::new(),
+        },
+        after_rx_seq: None,
+    });
+    assert!(late.is_empty(), "晚到 recover 結果不得再 clear 或回覆");
+    assert!(recover.try_recv().is_err(), "recover 只能回覆一次");
+}
+
+#[test]
+fn shutdown_force_recover_waiter_is_flushed() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_attached(Some("READY_NONCE_TIMEOUT"));
+    let (recover, effects) = h.rpc_deferred(SessionRequest::Recover {
+        timeout_s: 60.0,
+        force: true,
+    });
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::BeginDrain { .. })),
+        "ATTACHED force recover 應先 clear drain"
+    );
+    let (clear_epoch, clear_stop) = h.pending_stop();
+    h.receipt(clear_epoch, clear_stop).feed();
+    assert!(recover.try_recv().is_err(), "force recover 等待 READY 輪詢");
+
+    // 先讓第一個 ForceRecoverPoll 發生並排下一個 timer，再於輪詢等待中停機。
+    let first_poll = h.advance(Duration::from_secs(1));
+    assert!(
+        first_poll.iter().all(|effect| !matches!(
+            effect,
+            Effect::BeginDrain { .. } | Effect::StartLogin { .. } | Effect::OpenBridge { .. }
+        )),
+        "force timer 輪詢不得重開或重新 clear"
+    );
+    assert!(
+        recover.try_recv().is_err(),
+        "force timer 未達上限前仍在等待"
+    );
+
+    let (shutdown_tx, _shutdown_rx) = bounded(1);
+    h.feed(ControlEvent::Shutdown { reply: shutdown_tx });
+    let result = recover
+        .try_recv()
+        .expect("Shutdown Phase 1 必須取走 force_recover waiter")
+        .expect("force recover 應收到 RPC dict");
+    assert_eq!(result.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(
+        result.get("error_code"),
+        Some(&PyValue::from("FLUSHED_BY_SHUTDOWN"))
+    );
+
+    let late_poll = h.advance(Duration::from_secs(1));
+    assert!(
+        late_poll.iter().all(|effect| !matches!(
+            effect,
+            Effect::BeginDrain { .. } | Effect::StartLogin { .. } | Effect::OpenBridge { .. }
+        )),
+        "被沖刷的 force timer 不得重新 clear／attach"
+    );
+    assert!(recover.try_recv().is_err(), "晚到 force timer 不得重複回覆");
+}
+
+#[test]
+fn shutdown_reprobe_recover_waiter_is_flushed() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_attached(Some("READY_NONCE_TIMEOUT"));
+    let (attach, attach_effects) = h.rpc_deferred(SessionRequest::SessionAttach);
+    let (login_epoch, login_fsm_gen) = attach_effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartLogin { epoch, fsm_gen, .. } => Some((*epoch, *fsm_gen)),
+            _ => None,
+        })
+        .expect("attach 應啟動 reprobe login run");
+    let (recover, recover_effects) = h.rpc_deferred(SessionRequest::Recover {
+        timeout_s: 60.0,
+        force: false,
+    });
+    assert!(
+        recover_effects.is_empty(),
+        "recover 應加入現有 reprobe waiter"
+    );
+
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    h.feed(ControlEvent::Shutdown { reply: shutdown_tx });
+    let recover_result = recover
+        .try_recv()
+        .expect("Shutdown Phase 1 必須取走 ReprobeWaiter::Recover")
+        .expect("recover 應收到 RPC dict");
+    assert_eq!(recover_result.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(
+        recover_result.get("error_code"),
+        Some(&PyValue::from("FLUSHED_BY_SHUTDOWN"))
+    );
+    let attach_result = attach
+        .try_recv()
+        .expect("Attach waiter 應保留既有 drain 回覆")
+        .expect("attach 應收到 RPC dict");
+    assert_eq!(
+        attach_result.get("error_code"),
+        Some(&PyValue::from("SESSION_RECOVERING"))
+    );
+    assert!(
+        !h.core.shutdown_complete(),
+        "WorkerStopped 前 actor 尚未結束"
+    );
+
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).feed();
+    assert!(shutdown_rx.try_recv().unwrap().unwrap()["ok"]
+        .as_bool()
+        .unwrap());
+    let late = h.feed(ControlEvent::LoginFinished {
+        epoch: login_epoch,
+        fsm_gen: login_fsm_gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    assert!(late.is_empty(), "晚到 reprobe 不得重新 attach");
+    assert_ne!(h.core.state(), SessionState::Ready);
+    assert!(recover.try_recv().is_err(), "reprobe recover 只能回覆一次");
+}
+
+#[test]
 fn shutdown_self_test_late_op_finished_is_ignored() {
     use sw_proto::pydict;
 

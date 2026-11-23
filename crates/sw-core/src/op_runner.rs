@@ -395,6 +395,7 @@ fn execute(ctx: &OpCtx, grant: &OpGrant, spec: OpSpec) -> OpOutcome {
                 pre_offset,
                 t.platform == "passthrough",
                 None,
+                true,
             )
         }
         OpSpec::SelfTestProbe {
@@ -788,6 +789,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
             pre_offset,
             passthrough,
             Some((cmd_id, confirmed_of(&report))),
+            false,
         );
     }
     let raw = ctx.rx.text_from(pre_offset);
@@ -893,6 +895,7 @@ fn recover_after_failure(
     pre_offset: u64,
     passthrough: bool,
     aborted: Option<(&str, usize)>,
+    shutdown_cancellable: bool,
 ) -> OpOutcome {
     if passthrough {
         return OpOutcome::PromptTimeout {
@@ -953,7 +956,25 @@ fn recover_after_failure(
                 }
             }
         }
-        if wait_regex_from(ctx, &prompt_re, offset, timeout_s.min(2.0)) {
+        let matched = if shutdown_cancellable {
+            match ctx.rx.wait_for_regex_from_shutdown_cancellable(
+                &prompt_re,
+                offset,
+                secs(timeout_s.min(2.0)),
+                &*ctx.clock,
+            ) {
+                WaitOutcome::Matched => true,
+                WaitOutcome::TimedOut => false,
+                WaitOutcome::Cancelled => {
+                    return OpOutcome::CommandResult(
+                        pydict! { "ok" => false, "error_code" => "FLUSHED_BY_SHUTDOWN" },
+                    );
+                }
+            }
+        } else {
+            wait_regex_from(ctx, &prompt_re, offset, timeout_s.min(2.0))
+        };
+        if matched {
             let raw = ctx.rx.text_from(pre_offset);
             let stdout = extract_command_stdout(&raw, command, &prompt_re, None);
             return OpOutcome::Recovered { key: name, stdout };

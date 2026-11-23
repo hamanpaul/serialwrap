@@ -149,6 +149,85 @@ fn shutdown_cancels_self_test_nonce_and_prompt_waits() {
 }
 
 #[test]
+fn shutdown_cancels_ready_recover_wait_without_second_key() {
+    let rig = ActorRig::new(SELF_TEST_PROFILE).ready();
+    rig.dev.clear_replies();
+    let tx_start = rig.dev.tx_len();
+    let wait_start = rig.rx.regex_wait_starts_for_test();
+    let recover = rig.request_async(SessionRequest::Recover {
+        timeout_s: 60.0,
+        force: false,
+    });
+
+    rig.wait_for("READY recover 第一個救援鍵", |actor| {
+        actor.dev.tx_len() > tx_start
+    });
+    assert_eq!(
+        rig.dev.tx_since(tx_start),
+        b"\x03",
+        "READY recover 第一鍵應為 Ctrl-C"
+    );
+    rig.wait_for("READY recover prompt 等待", |actor| {
+        actor.rx.regex_wait_starts_for_test() > wait_start
+    });
+
+    // 關閉動作暫停於回條前：此時可觀察 Phase 1 的 RPC 回覆與 OpRunner 等待是否已收斂。
+    let tx_at_shutdown = rig.dev.tx_len();
+    let controls_before_shutdown = rig.actor_probe().entries("Control").len();
+    rig.dev.pause_next_close();
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    rig.send_control(ControlEvent::Shutdown { reply: shutdown_tx });
+    let recover_reply = recover.recv_timeout(Duration::from_millis(400)).ok();
+    let close_paused = rig.dev.wait_paused(Duration::from_millis(400));
+
+    let deadline = std::time::Instant::now() + Duration::from_millis(400);
+    let mut runner_finished = false;
+    while std::time::Instant::now() < deadline {
+        // OpFinished 使用 actor probe 的泛型 Control 標籤；Shutdown 與 WorkerStopped 各有專屬標籤。
+        if rig.actor_probe().entries("Control").len() > controls_before_shutdown {
+            runner_finished = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    rig.dev.release_pause();
+    let shutdown_reply = shutdown_rx.recv_timeout(Duration::from_secs(2)).ok();
+
+    let flushed = recover_reply
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .is_some_and(|dict| {
+            dict.get("ok").and_then(sw_proto::pyjson::PyValue::as_bool) == Some(false)
+                && dict
+                    .get("error_code")
+                    .and_then(sw_proto::pyjson::PyValue::as_str)
+                    == Some("FLUSHED_BY_SHUTDOWN")
+        });
+    let shutdown_completed = shutdown_reply
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .is_some_and(|dict| {
+            dict.get("ok").and_then(sw_proto::pyjson::PyValue::as_bool) == Some(true)
+        });
+
+    assert!(close_paused, "Shutdown drain 應在 WorkerStopped 回條前暫停");
+    assert!(
+        flushed,
+        "READY recover Phase 1 應立即回 FLUSHED_BY_SHUTDOWN"
+    );
+    assert!(
+        runner_finished,
+        "Shutdown 應取消 READY recover 的 prompt 等待"
+    );
+    assert_eq!(
+        rig.dev.tx_len(),
+        tx_at_shutdown,
+        "停機取消後不得再送 Ctrl-D 或其他救援鍵"
+    );
+    assert!(shutdown_completed, "釋放 fake close 後 Shutdown 應收斂");
+}
+
+#[test]
 fn shutdown_wait_times_out_before_matching_expired_buffered_rx() {
     let rx = RxShared::new(64, 0);
     rx.append(b"ready", 0, 1, 1);
