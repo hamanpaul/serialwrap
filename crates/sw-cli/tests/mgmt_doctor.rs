@@ -948,6 +948,67 @@ fn profile_template_fields_custom_templates_and_no_common() {
         check.get_key("compared_templates"),
         Some(&PyValue::List(vec![]))
     );
+
+    let live_path = t.config_dir().join("profiles").join("default.yaml");
+    let asset = sw_cli::assets::PROFILE_ASSETS
+        .iter()
+        .find(|asset| asset.rel == "profiles/default.yaml")
+        .expect("出貨 profile 資產");
+    let asset_text = std::str::from_utf8(asset.bytes).expect("出貨 profile 資產為 UTF-8");
+    let live_with_unshared_invalid_template = asset_text.replacen(
+        "\n# targets 區段為可選：",
+        "\n  custom-template: null\n\n# targets 區段為可選：",
+        1,
+    );
+    t.write_file(&live_path, live_with_unshared_invalid_template.as_bytes());
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "profile_template_fields");
+    let compared_templates = match check.get_key("compared_templates") {
+        Some(PyValue::List(names)) => names,
+        _ => panic!("compared_templates 應是陣列"),
+    };
+    let extra_template_result = (
+        s(check, "comparison_status").to_string(),
+        b(check, "ok"),
+        check.get_key("reason").cloned(),
+        compared_templates
+            .iter()
+            .any(|name| name == &PyValue::Str("custom-template".into())),
+    );
+
+    let mut malformed_profiles_results = Vec::new();
+    for profiles in ["[]", "null", "false"] {
+        t.write_file(&live_path, format!("profiles: {profiles}\n").as_bytes());
+        let (rc, out, _) = t.run(&["doctor"]);
+        assert_eq!(rc, 0);
+        let doc = json(&out);
+        let check = find_check(&doc, "profile_template_fields");
+        malformed_profiles_results.push((
+            s(check, "comparison_status").to_string(),
+            b(check, "ok"),
+            s(check, "reason").to_string(),
+            check.get_key("missing_fields") == Some(&PyValue::Null),
+        ));
+    }
+
+    assert_eq!(
+        (extra_template_result, malformed_profiles_results),
+        (
+            ("matched".to_string(), true, Some(PyValue::Null), false,),
+            vec![
+                (
+                    "unavailable".to_string(),
+                    false,
+                    "live_structure".to_string(),
+                    true
+                );
+                3
+            ],
+        ),
+        "只比較有效的共同 template，且 profiles 非 mapping 時須回 unavailable/live_structure"
+    );
 }
 
 #[test]

@@ -1263,10 +1263,16 @@ fn profiles_entries(root: &YValue) -> Option<Vec<(YValue, YValue)>> {
     }
 }
 
-fn profile_entries_are_mapping(entries: &[(YValue, YValue)]) -> bool {
-    entries
-        .iter()
-        .all(|(_, template)| matches!(template, YValue::Map(_)))
+/// 新版欄位比較要求 `profiles` 若存在就必須是 mapping；不改既有 bootloader helper 的假值語意。
+fn profile_templates_for_field_comparison(root: &YValue) -> Option<Vec<(YValue, YValue)>> {
+    let YValue::Map(map) = root else {
+        return None;
+    };
+    match map.get_str("profiles") {
+        None => Some(Vec::new()),
+        Some(YValue::Map(profiles)) => Some(profiles.0.clone()),
+        Some(_) => None,
+    }
 }
 
 /// 純函式：出貨資產有 `bootloader_prompts` 而線上檔沒有的 template 名單（排序後）。
@@ -1505,7 +1511,7 @@ pub fn compare_profile_template_fields(
             );
         }
     };
-    let Some(asset_profiles) = profiles_entries(&parsed_asset) else {
+    let Some(asset_profiles) = profile_templates_for_field_comparison(&parsed_asset) else {
         return ProfileTemplateComparison::with_status(
             ProfileTemplateComparisonStatus::Unavailable,
             BTreeMap::new(),
@@ -1513,14 +1519,6 @@ pub fn compare_profile_template_fields(
             Some("asset_structure"),
         );
     };
-    if !profile_entries_are_mapping(&asset_profiles) {
-        return ProfileTemplateComparison::with_status(
-            ProfileTemplateComparisonStatus::Unavailable,
-            BTreeMap::new(),
-            Vec::new(),
-            Some("asset_structure"),
-        );
-    }
     let Some(live_text) = live_text else {
         return ProfileTemplateComparison::with_status(
             ProfileTemplateComparisonStatus::NotMaterialized,
@@ -1540,7 +1538,7 @@ pub fn compare_profile_template_fields(
             );
         }
     };
-    let Some(live_profiles) = profiles_entries(&parsed_live) else {
+    let Some(live_profiles) = profile_templates_for_field_comparison(&parsed_live) else {
         return ProfileTemplateComparison::with_status(
             ProfileTemplateComparisonStatus::Unavailable,
             BTreeMap::new(),
@@ -1548,15 +1546,6 @@ pub fn compare_profile_template_fields(
             Some("live_structure"),
         );
     };
-    if !profile_entries_are_mapping(&live_profiles) {
-        return ProfileTemplateComparison::with_status(
-            ProfileTemplateComparisonStatus::Unavailable,
-            BTreeMap::new(),
-            Vec::new(),
-            Some("live_structure"),
-        );
-    }
-
     let common_names = asset_profiles
         .iter()
         .map(|(name, _)| py_str_of(name))
@@ -1654,7 +1643,11 @@ pub fn profile_template_asset_errors_are_unavailable(asset_bytes: Option<&[u8]>)
         return true;
     };
     matches!(
-        compare_profile_template_fields(Some(asset_text), Some("profiles: {}\n")).comparison_status,
+        compare_profile_template_fields(
+            Some(asset_text),
+            Some("profiles:\n  prpl-template: {}\n  template: {}\n"),
+        )
+        .comparison_status,
         ProfileTemplateComparisonStatus::Unavailable
     )
 }
