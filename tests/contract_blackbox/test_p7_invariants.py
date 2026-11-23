@@ -62,7 +62,10 @@ def _daemon_fds_to(p7, path: str) -> int:
 
 def _daemon_tty_holders(p7, path: str) -> list[str]:
     pid = p7.daemon.proc.pid
-    target = os.path.realpath(path)
+    try:
+        target = os.path.realpath(path, strict=True)
+    except OSError as exc:
+        raise AssertionError(f"無法解析目標 tty 路徑 {path}: {exc}") from exc
     proc_fd = f"/proc/{pid}/fd"
     try:
         names = os.listdir(proc_fd)
@@ -73,13 +76,34 @@ def _daemon_tty_holders(p7, path: str) -> list[str]:
         fd_path = f"{proc_fd}/{name}"
         try:
             linked = os.readlink(fd_path)
-            if os.path.realpath(fd_path) == target:
-                holders.append(f"{name}->{linked}")
         except OSError as exc:
             if exc.errno == errno.ENOENT:
                 continue
             raise AssertionError(f"無法讀取 daemon fd symlink {fd_path}: {exc}") from exc
+        try:
+            resolved = os.path.realpath(fd_path, strict=True)
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                continue
+            raise AssertionError(f"無法解析 daemon fd 路徑 {fd_path}: {exc}") from exc
+        if resolved == target:
+            holders.append(f"{name}->{linked}")
     return holders
+
+
+def _holder_fd_numbers(holders: list[str]) -> set[str]:
+    return {holder.partition("->")[0] for holder in holders}
+
+
+def _assert_no_new_tty_holder_fds(
+    current_holders: list[str], baseline_fds: set[str], disappeared_fds: set[str]
+) -> None:
+    current_fds = _holder_fd_numbers(current_holders)
+    new_fds = current_fds - baseline_fds
+    assert not new_fds, f"觀察期出現 baseline 以外的 tty holder fd：{sorted(new_fds)}"
+    reappeared_fds = current_fds & disappeared_fds
+    assert not reappeared_fds, f"已消失的 baseline tty holder fd 再次出現：{sorted(reappeared_fds)}"
+    disappeared_fds.update(baseline_fds - current_fds)
 
 
 def test_daemon_tty_holder_scanner_fails_closed_on_unreadable_fd(monkeypatch) -> None:
@@ -108,6 +132,132 @@ def test_daemon_tty_holder_scanner_fails_closed_on_unreadable_fd(monkeypatch) ->
 
     monkeypatch.setattr(os, "readlink", fd_disappeared)
     assert _daemon_tty_holders(_Rig(), "/dev/null") == []
+
+
+def test_daemon_tty_holder_scanner_fails_closed_on_realpath_permission_race(monkeypatch) -> None:
+    """readlink 已成功後，fd 路徑解析遇到 EACCES 仍須失敗，不得回報為無 holder。"""
+    fd = os.open("/dev/null", os.O_RDONLY)
+    try:
+        pid = os.getpid()
+        proc_fd = f"/proc/{pid}/fd"
+        fd_path = f"{proc_fd}/{fd}"
+        events: list[str] = []
+
+        class _Proc:
+            pass
+
+        _Proc.pid = pid
+
+        class _Daemon:
+            proc = _Proc()
+
+        class _Rig:
+            daemon = _Daemon()
+
+        monkeypatch.setattr(os, "listdir", lambda path: [str(fd)] if path == proc_fd else [])
+
+        def readlink_succeeds(path: str) -> str:
+            assert path == fd_path
+            events.append("readlink")
+            return "/dev/null"
+
+        real_lstat = os.lstat
+
+        def deny_fd_resolution(path, *args, **kwargs):
+            if path == fd_path:
+                assert events == ["readlink"]
+                events.append("lstat:EACCES")
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "readlink", readlink_succeeds)
+        monkeypatch.setattr(os, "lstat", deny_fd_resolution)
+        with pytest.raises(AssertionError, match="無法解析 daemon fd 路徑"):
+            _daemon_tty_holders(_Rig(), "/dev/null")
+        assert events == ["readlink", "lstat:EACCES"]
+    finally:
+        os.close(fd)
+
+
+def test_python_tty_holder_guard_rejects_new_fd() -> None:
+    """掃描觀察期間實際新開的 PTY fd 必須被 baseline 判準拒絕。"""
+    master_fd, baseline_fd = os.openpty()
+    baseline_open = True
+    new_fd = None
+    try:
+        path = os.ttyname(baseline_fd)
+
+        class _Proc:
+            pid = os.getpid()
+
+        class _Daemon:
+            proc = _Proc()
+
+        class _Rig:
+            daemon = _Daemon()
+
+        baseline_holders = _daemon_tty_holders(_Rig(), path)
+        baseline_fds = _holder_fd_numbers(baseline_holders)
+        assert str(baseline_fd) in baseline_fds, baseline_holders
+        disappeared_fds: set[str] = set()
+
+        new_fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        current_holders = _daemon_tty_holders(_Rig(), path)
+        assert str(new_fd) in _holder_fd_numbers(current_holders), current_holders
+        with pytest.raises(AssertionError, match="baseline 以外"):
+            _assert_no_new_tty_holder_fds(current_holders, baseline_fds, disappeared_fds)
+    finally:
+        if new_fd is not None:
+            os.close(new_fd)
+        if baseline_open:
+            os.close(baseline_fd)
+        os.close(master_fd)
+
+
+def test_python_tty_holder_guard_rejects_reopened_baseline_fd() -> None:
+    """baseline PTY fd 取樣確認消失後，以相同 fd 編號重開仍必須被拒絕。"""
+    master_fd, baseline_fd = os.openpty()
+    baseline_open = True
+    replacement_fd = None
+    try:
+        path = os.ttyname(baseline_fd)
+
+        class _Proc:
+            pid = os.getpid()
+
+        class _Daemon:
+            proc = _Proc()
+
+        class _Rig:
+            daemon = _Daemon()
+
+        baseline_holders = _daemon_tty_holders(_Rig(), path)
+        baseline_fds = _holder_fd_numbers(baseline_holders)
+        assert str(baseline_fd) in baseline_fds, baseline_holders
+        disappeared_fds: set[str] = set()
+
+        os.close(baseline_fd)
+        baseline_open = False
+        after_close = _daemon_tty_holders(_Rig(), path)
+        _assert_no_new_tty_holder_fds(after_close, baseline_fds, disappeared_fds)
+        assert str(baseline_fd) in disappeared_fds
+
+        replacement_fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        if replacement_fd != baseline_fd:
+            os.dup2(replacement_fd, baseline_fd)
+            os.close(replacement_fd)
+        replacement_fd = None
+        baseline_open = True
+        current_holders = _daemon_tty_holders(_Rig(), path)
+        assert str(baseline_fd) in _holder_fd_numbers(current_holders), current_holders
+        with pytest.raises(AssertionError, match="已消失的 baseline"):
+            _assert_no_new_tty_holder_fds(current_holders, baseline_fds, disappeared_fds)
+    finally:
+        if replacement_fd is not None:
+            os.close(replacement_fd)
+        if baseline_open:
+            os.close(baseline_fd)
+        os.close(master_fd)
 
 
 def _attach_human_vtty(p7, label: str) -> tuple[int, dict]:
@@ -387,13 +537,18 @@ def test_release_during_login_waits_for_handle_close(p7, tmp_path):
     """登入進行中 `device release`：回成功的當下 daemon 已無指向該 tty 的 fd；`device attach` 之前不重開；
     `session recover --force` 的 REATTACH 任何時刻至多持有一個 fd（舊 fd 關閉後才重開）。
 
+    OD-111 凍結的 Python 基線在核准的 DETACHED 終態仍持有目標 tty；ci-thin-i2-L2
+    實測 holder 為 `9->/dev/pts/12`。觀察期開始時記錄 baseline fd 集合（可為空）；之後每次取樣只允許
+    baseline fd，且 baseline fd 一旦消失不得再出現。無法分辨同一 fd 在兩次取樣之間關閉後以相同編號重開，
+    這是 holder 取樣的限制。
+
     2026-11-23 編排者裁決（rulings/v051.md 補登，72334366）：Python 分支只接受 `DETACHED` +
     `ATTACH_FAILED:TxIncompleteError` 或 `LOGIN_PROMPT_TIMEOUT`；baseline 與之後 10 s 的每個樣本都須維持
     `DETACHED`，且 `reprobe_attempts`、`next_reprobe_at`、`reprobe_exhausted`、`bridge_generation` 不變；
     `last_state_change_at`、`last_probe_at`、`last_tx_at` 也須存在且不變，以捕捉兩次輪詢間失敗後回到 DETACHED 的 attach 嘗試。
     `READY`、`ATTACHING`、空錯誤、錯誤前綴匹配及首次 attach 失敗後重試均不核准。Rust 分支與 §11.3-4
-    的 handle 時序斷言不改。觀察期在有 `/proc` 的平台亦逐次檢查 daemon fd 是否指向目標 tty；沒有 `/proc`
-    的平台只保留既有欄位判準，無法偵測尚未公開狀態的開埠嘗試，且不因此 skip。"""
+    的 handle 時序斷言不改。觀察期在有 `/proc` 的平台逐次檢查 daemon fd；沒有 `/proc` 的平台只保留既有欄位
+    判準，無法偵測尚未公開狀態的開埠嘗試，且不因此 skip。"""
     tgt = FakeTarget(tmp_path / "t0", delay_ms=1500)       # 每個回應延遲 1.5 s：login 進行中可插入 release
     p7.start("shell", [tgt])
     deadline = time.monotonic() + 20.0
@@ -436,13 +591,18 @@ def test_release_during_login_waits_for_handle_close(p7, tmp_path):
     else:
         s, baseline = _wait_stable_python_baseline(p7)
         _assert_python_detached_terminal_state(s, baseline)
+        baseline_holders = _daemon_tty_holders(p7, slave) if os.path.isdir("/proc") else []
+        baseline_holder_fds = _holder_fd_numbers(baseline_holders)
+        disappeared_holder_fds: set[str] = set()
+        if os.path.isdir("/proc"):
+            print(f"DF-23 Python baseline tty holders: {baseline_holders!r}")
         t_end = time.monotonic() + 10.0
         while time.monotonic() < t_end:                     # 不自動重試：終態、重試欄位及持久事件時間戳均不變。
             row = _row(p7)
             _assert_python_detached_terminal_state(row, baseline)
             if os.path.isdir("/proc"):
                 holders = _daemon_tty_holders(p7, slave)
-                assert not holders, f"Python 觀察期 daemon 再次持有目標 tty，視為新的 attach 嘗試：{holders}"
+                _assert_no_new_tty_holder_fds(holders, baseline_holder_fds, disappeared_holder_fds)
             time.sleep(0.5)
 
     # REATTACH：另一個 rig（READY 起手），RX 凍結下 recover --force，取樣 daemon 對 tty 的 fd 數峰值。
