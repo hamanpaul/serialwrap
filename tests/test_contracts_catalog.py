@@ -988,6 +988,21 @@ def test_ec_rec_codes() -> None:
         assert "rec" in by[code].scope.interfaces
 
 
+def test_flushed_by_shutdown_retryability_distinguishes_queued_and_in_flight() -> None:
+    """排隊未送出的命令可重送，在途操作則先確認副作用。"""
+    entry = _ec_by_code()["FLUSHED_BY_SHUTDOWN"]
+    assert entry.retryable == "conditional"
+    assert "尚未執行" in entry.meaning
+    assert "排隊" in entry.meaning
+    assert "可能已送出" in entry.meaning
+    assert "尚未送出" in entry.agent_action
+    assert "READY" in entry.agent_action
+    assert "可重送" in entry.agent_action
+    assert "可能已送出" in entry.agent_action
+    assert "確認實際副作用" in entry.agent_action
+    assert "不得只憑此錯誤碼自動重送" in entry.agent_action
+
+
 def test_ec_frame_codes() -> None:
     """RPC framing 錯誤碼之 interfaces 必須包含 rpc_frame。"""
     by = _ec_by_code()
@@ -1326,9 +1341,9 @@ def _bc_by_id():
 
 
 def test_bc_real_five_bcs_registered() -> None:
-    """五項 BC 全部登記，核准資訊與狀態符合 OD-04 決策。"""
+    """五項雙向 BC 全部登記，核准資訊與狀態符合 OD-04 決策。"""
     changes, _, _ = _bc()
-    bc_entries = [c for c in changes if c.kind == "BC"]
+    bc_entries = [c for c in changes if c.kind == "BC" and c.scope == "both"]
     assert {c.id for c in bc_entries} == {"BC-01", "BC-02", "BC-03", "BC-04", "BC-05"}
     for c in bc_entries:
         assert c.status != "PROPOSED"

@@ -17,6 +17,7 @@ pytestmark = [pytest.mark.core_portable, pytest.mark.process_rpc]
 
 ROOT = Path(__file__).resolve().parents[1]
 CURRENT_VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+_V051_ADDED_CONTRACT_IDS = frozenset({"bc:BC-06"})
 TOOL = ROOT / "scripts" / "rust" / "contract_coverage.py"
 REV = {
     "contract_revision": "r",
@@ -2466,7 +2467,8 @@ def test_stage2_contract_ids_have_locked_rust_coverage_not_stage1_python():
         # OD-88 的 269 個靜態缺口含 DF-26；保留其既有 P8 phase 歸屬。
         or contract_id == "bc:DF-26"
     }
-    assert len(stage2_targets) == 269, f"OD-88 靜態 universe 數量改變：{len(stage2_targets)}"
+    assert len(stage2_targets) == 269 + len(_V051_ADDED_CONTRACT_IDS), f"OD-88 靜態 universe 數量改變：{len(stage2_targets)}"
+    assert _V051_ADDED_CONTRACT_IDS <= set(stage2_targets)
     missing = sorted(
         contract_id for contract_id, item in stage2_targets.items()
         if not item.get("nodeids") and not cc._is_owner_blocked(item)
