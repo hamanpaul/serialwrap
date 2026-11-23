@@ -15,6 +15,8 @@ crates/*/tests/golden/** text eol=lf
 # Rust 以原始位元組內嵌名稱表與安裝資產；CRLF 會破壞十六進位解析及 stdout 換行契約
 crates/sw-proto/src/pyre/unicode_names.tsv text eol=lf
 sw_core/assets/** text eol=lf
+# 位元組雜湊驗證用的舊版 profiles fixture，跨平台檢出必須維持 LF。
+tests/fixtures/serialwrap-v0.3.2-default-profiles.yaml text eol=lf
 crates/sw-pal/tests/golden/serialwrap.task.xml -text
 # golden 以位元組比對（Python 新鮮度測試與 Rust include_str!），Windows 檢出不得轉 CRLF（parity-amendments-2026-10-26 #181）；
 # 37_bom_crlf 為刻意保存 CRLF 的 profiles fixture，須維持原位元組。
