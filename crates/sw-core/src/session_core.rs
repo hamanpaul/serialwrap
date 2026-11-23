@@ -8874,6 +8874,23 @@ impl SessionCore {
     }
 
     /// 05 §11 順序 0–15 的 probe 前分類（`classify_pre_probe` 的本體）。
+    fn self_test_busy(&self, now: Mono) -> bool {
+        if self.fg_slot_busy()
+            || self.login_run.is_some()
+            || self.pending_auto_login
+            || self.replay_parked.is_some()
+            || self.queue.has_accepted(&self.deps.registry)
+            || self
+                .background_cmd_ids
+                .iter()
+                .any(|id| self.background.get(id).is_some_and(|capture| capture.status == "active"))
+            || self.lease.as_ref().is_some_and(|lease| !lease.is_human() && !lease.expired(now))
+        {
+            return true;
+        }
+        false
+    }
+
     pub(crate) fn self_test_pre_probe(&self, ctx: &SelfTestCtx) -> Result<PyDict, NeedProbe> {
         let now = ctx.now;
         let session = self.session_value(now);
@@ -8933,6 +8950,9 @@ impl SessionCore {
         }
         if !ctx.device_present {
             return Ok(simple("DEVICE_MISSING", "check_cable_or_bind", Vec::new()));
+        }
+        if self.self_test_busy(now) {
+            return Ok(simple("SESSION_BUSY", "wait", Vec::new()));
         }
         let current = option_string(ctx.by_id_realpath.as_deref());
         if let Some(attached) = self.attached_real_path.as_deref() {
