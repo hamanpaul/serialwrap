@@ -44,7 +44,6 @@ BASELINE_LINUX_CHECKS = [
     "wal_dir",
     "wal_writable",
     "profile_bootloader_prompts",
-    "profile_template_fields",
     "devices",
     "wsl_systemd",
 ]
@@ -62,7 +61,6 @@ BASELINE_WINDOWS_CHECKS = [
     "wal_dir",
     "wal_writable",
     "profile_bootloader_prompts",
-    "profile_template_fields",
     "devices",
 ]
 
