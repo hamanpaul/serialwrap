@@ -1181,10 +1181,7 @@ fn shutdown_flushes_with_flushed_by_shutdown() {
     assert!(h.core.shutdown_complete());
 }
 
-/// CI 293（`shutdown_order::long_file_push_does_not_block_stop` 偶發 `EXCEPTION: session actor stopped`）的交錯：
-/// 停機時 drain 收尾執行緒的 `WorkerStopped`（safety lane）先於傳輸 op 的 `OpFinished`（control lane）被 actor 處理。
-/// 回條只結算 worker，傳輸的回覆仍掛在 `pending_ops`；此時 actor 若結束，回覆通道隨 core 丟棄，RPC 端只拿到
-/// 通用錯誤。OD-62：停機中止的傳輸必須以 OpRunner 映射的 COMMAND_ABORTED_IN_FLIGHT／FLUSHED_BY_RECOVERY 回覆。
+/// i297：SelfTest waiter 在 WorkerStopped 前先由 Shutdown Phase 1 沖刷；actor 仍須等待原 drain 回條。
 #[test]
 fn shutdown_self_test_reply_precedes_worker_receipt() {
     let mut h = CoreHarness::new(SELF_TEST_PROFILE);
@@ -1739,6 +1736,97 @@ fn shutdown_after_completed_release_drain_flushes_self_test() {
     assert!(self_test.try_recv().is_err(), "self-test 只可回覆一次");
 }
 
+/// Release drain 尚未收到 WorkerStopped 時，Shutdown 仍須先沖刷在途 self-test；晚到 OpFinished 不得再回覆或改狀態。
+#[test]
+fn shutdown_arriving_before_release_receipt_flushes_self_test() {
+    use sw_proto::pydict;
+
+    let mut h = CoreHarness::new(SELF_TEST_PROFILE);
+    h.to_ready();
+    let (self_test, effects) = h.rpc_deferred(SessionRequest::SelfTest {
+        timeout_s: 60.0,
+        strict_human_lock: false,
+    });
+    let grant = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp { grant, .. } => Some(grant.clone()),
+            _ => None,
+        })
+        .expect("self-test 應產生 StartOp");
+
+    let (release, _) = h.rpc_deferred(release());
+    assert!(h.core.drain_in_progress(), "Release drain 應仍在途");
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    h.feed(ControlEvent::Shutdown { reply: shutdown_tx });
+
+    let result = self_test
+        .try_recv()
+        .expect("WorkerStopped 前應收到 self-test 回覆")
+        .expect("self-test 應收到 RPC dict");
+    assert_eq!(result.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(
+        result.get("error_code"),
+        Some(&PyValue::from("FLUSHED_BY_SHUTDOWN"))
+    );
+    assert!(release.try_recv().is_err(), "Release waiter 仍須等 WorkerStopped");
+    assert!(shutdown_rx.try_recv().is_err(), "Shutdown waiter 仍須等 WorkerStopped");
+    assert!(!h.core.shutdown_complete(), "WorkerStopped 前 actor 不得結束");
+
+    let late = h.feed(ControlEvent::OpFinished {
+        op_id: grant.op_id,
+        epoch: grant.epoch,
+        outcome: OpOutcome::SelfTest(pydict! {
+            "probe_ok" => true,
+            "rx_bytes_last_10s" => 0,
+        }),
+        after_rx_seq: None,
+    });
+    assert!(late.is_empty(), "晚到 self-test 不得產生副作用");
+    assert!(self_test.try_recv().is_err(), "self-test 只能回覆一次");
+    assert_ne!(h.core.state(), SessionState::Ready);
+}
+
+/// force recover 的 Clear drain 尚未收到 WorkerStopped 時，Shutdown 須沖刷 Recover waiter 並忽略晚到輪詢。
+#[test]
+fn shutdown_arriving_before_clear_receipt_flushes_force_recover() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_attached(Some("READY_NONCE_TIMEOUT"));
+    let (recover, effects) = h.rpc_deferred(SessionRequest::Recover {
+        timeout_s: 60.0,
+        force: true,
+    });
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::BeginDrain { .. })),
+        "force recover 應發起 Clear drain"
+    );
+    assert!(h.core.drain_in_progress(), "Clear drain 應仍在途");
+
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    h.feed(ControlEvent::Shutdown { reply: shutdown_tx });
+    let result = recover
+        .try_recv()
+        .expect("WorkerStopped 前應收到 force recover 回覆")
+        .expect("force recover 應收到 RPC dict");
+    assert_eq!(result.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(
+        result.get("error_code"),
+        Some(&PyValue::from("FLUSHED_BY_SHUTDOWN"))
+    );
+    assert!(shutdown_rx.try_recv().is_err(), "Shutdown waiter 仍須等 WorkerStopped");
+    assert!(!h.core.shutdown_complete(), "WorkerStopped 前 actor 不得結束");
+
+    let late = h.feed(ControlEvent::Timer(TimerEvent::ForceRecoverPoll { id: 1, n: 1 }));
+    assert!(late.is_empty(), "已沖刷的 force-recover 輪詢不得產生副作用");
+    assert!(recover.try_recv().is_err(), "force recover 只能回覆一次");
+}
+
+/// CI 293（`shutdown_order::long_file_push_does_not_block_stop` 偶發 `EXCEPTION: session actor stopped`）的交錯：
+/// 停機時 drain 收尾執行緒的 `WorkerStopped`（safety lane）先於傳輸 op 的 `OpFinished`（control lane）被 actor 處理。
+/// 回條只結算 worker，傳輸的回覆仍掛在 `pending_ops`；此時 actor 若結束，回覆通道隨 core 丟棄，RPC 端只拿到
+/// 通用錯誤。OD-62：停機中止的傳輸必須以 OpRunner 映射的 COMMAND_ABORTED_IN_FLIGHT／FLUSHED_BY_RECOVERY 回覆。
 #[test]
 fn shutdown_receipt_before_transfer_op_finished_keeps_actor_until_reply() {
     use sw_core::file_transfer::{FileTransferKind, FileTransferRequest};
