@@ -1644,6 +1644,27 @@ impl ActorRig {
             .fail_next_writes(&self.wal.wal_path(), WAL_FAIL_FOREVER, err);
     }
 
+    /// 只讓下一筆 WAL append 失敗，供暫時健康狀態回復的交錯測試使用。
+    pub fn fail_next_wal_write(&self, err: PalError) {
+        // WalWriter 首次失敗會關閉並重開 handle 重試；兩次失敗才代表同一 append 失敗。
+        self.wfs.fail_next_writes(&self.wal.wal_path(), 2, err);
+    }
+
+    /// 直接追加測試用 WAL 記錄，以驗證 WAL health sink 的失敗與恢復通知。
+    pub fn append_wal_for_test(&self, dir: &str, source: &str, payload: &[u8]) -> bool {
+        self.wal
+            .append(WalAppendReq {
+                com: "COM0",
+                dir,
+                source,
+                payload,
+                cmd_id: None,
+                loss_flag: false,
+                meta: Some(PyDict::new()),
+            })
+            .ok
+    }
+
     /// WAL 累計寫入失敗次數（`WalWriter::health().write_failures`；Review Focus 3 同步點）。
     pub fn wal_write_failures(&self) -> u64 {
         self.wal.health().write_failures

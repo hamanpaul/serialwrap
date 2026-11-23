@@ -45,7 +45,7 @@ use crate::self_test::{NeedProbe, SelfTestBase, SelfTestCtx, SelfTestProbes};
 use crate::session_auth::resolve_session_auth;
 use crate::state_store::{ReleasedRow, StateDelta};
 use crate::tx_writer::{
-    Fence, FenceReject, FlashMode, OpId, TxClass, TxPermit, TX_LEDGER_LIVE_MAX,
+    Fence, FenceReject, FlashMode, OpId, TxPermit, TX_LEDGER_LIVE_MAX,
 };
 use crate::uart_bridge::RxShared;
 use crate::wal::WalWriter;
@@ -8918,7 +8918,7 @@ impl SessionCore {
             || self.replay_parked.is_some()
             || self.queue.has_accepted(&self.deps.registry)
             || self.pending_ops.iter().any(|(op_id, op)| {
-                matches!(op, PendingOp::Recover { .. }) && self.recover_side_op_can_submit(*op_id)
+                matches!(op, PendingOp::Recover { .. }) && self.recover_side_op_may_submit(*op_id)
             })
             || self
                 .background_cmd_ids
@@ -8931,9 +8931,9 @@ impl SessionCore {
         false
     }
 
-    /// Recover side-op 仍登錄且救援鍵可提交時，self-test 才將 Recover 判為忙碌。
-    /// `self_test_pre_probe` 已先確認目前 bridge snapshot 健康。
-    fn recover_side_op_can_submit(&self, op_id: OpId) -> bool {
+    /// Recover 尚未撤銷且 bridge epoch 有效時維持 busy；暫時的 Fence admission 限制不代表資格已撤銷。
+    /// `self_test_pre_probe` 已先確認目前 bridge snapshot 健康；此處不得等待 OS submit 持有的 Fence lock。
+    fn recover_side_op_may_submit(&self, op_id: OpId) -> bool {
         let Some(grant) = self
             .side_ops
             .get(&op_id)
@@ -8947,23 +8947,17 @@ impl SessionCore {
             return false;
         }
 
-        // 依 Recover 的 SystemRecoverKey permit 檢查 epoch、撤銷、凍結、quiet、WAL 與 flash gate；此 TX class 不要求 fsm_gen 相同。
-        let permit = TxPermit {
-            op_id: grant.op_id,
-            epoch: grant.epoch,
-            owner_gen: grant.owner_gen,
-            fsm_gen: grant.fsm_gen,
-            class: TxClass::SystemRecoverKey,
-            source: "system:recover".into(),
-            cmd_id: None,
-            log: true,
-            input_epoch: None,
-            replay_hold: None,
-            probe_id: None,
-        };
-        self.deps
-            .fence
-            .with(|fence| Fence::admit(fence, &permit).is_ok())
+        // `SystemRecoverKey` 的資格只在連線 epoch 失效、op 被撤銷或 shutdown 開始時消失。
+        // quiet、WAL unhealthy、暫時凍結等 admission gate 可能在 Recover 後續鍵提交前解除，不能提前讓 probe 插隊。
+        match self.deps.fence.try_with(|fence| {
+            !self.deps.fence.shutdown_started_published()
+                && fence.active_epoch == Some(grant.epoch)
+                && !fence.cancelled.contains(&op_id)
+        }) {
+            Some(eligible) => eligible,
+            // FenceSubmitGate 在 OS 提交期間持鎖；把未知的即時快照保守視為仍有效，避免阻塞 actor。
+            None => !self.deps.fence.shutdown_started_published(),
+        }
     }
 
     pub(crate) fn self_test_pre_probe(&self, ctx: &SelfTestCtx) -> Result<PyDict, NeedProbe> {
