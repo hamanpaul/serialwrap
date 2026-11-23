@@ -108,10 +108,14 @@ def test_observer_writes_samples(tmp_path, monkeypatch):
     assert stop.waits == 6
     # 邊界反例：`t_mono == 0.3` 等於窗口終點，不算在該 0.3 秒窗口內完成；原迴圈在 sample 前先檢查
     # `elapsed >= duration_s`，因此如果下次取樣剛好等於 deadline，必須當作「已過界」而不是「已內含」.
+    deadline = started + sample_window_s
     boundary_samples = [{"t_mono": t} for t in (0.0, 0.05, 0.25, 0.30)]
-    assert boundary_samples[3]["t_mono"] >= started + sample_window_s
-    assert not (boundary_samples[3]["t_mono"] < started + sample_window_s)
-    assert samples[3]["t_mono"] < started + sample_window_s
+    assert boundary_samples[3]["t_mono"] == deadline
+    assert not (boundary_samples[3]["t_mono"] < deadline)
+    # 直接檢查窗口邊界：`t_mono == 0.3` 必須被判定為「已過界」，不能算在 0.3 秒窗口內完工。
+    # 若回退成 `<=` 判準，本條件會轉紅，因為最終樣本會以 deadline 本身被算為有效樣本。
+    assert all(row["t_mono"] < deadline for row in samples)
+    assert not any(row["t_mono"] == deadline for row in samples)
     assert all("wall_ts" in row and "pid" in row["daemon"] and "sessions" in row for row in samples)
 
 
