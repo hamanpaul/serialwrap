@@ -60,7 +60,6 @@ fn assert_shutdown_cancels_self_test_wait(prompt_wait: bool) {
     rig.dev.clear_replies();
     let tx_start = rig.dev.tx_len();
     let wait_start = rig.rx.regex_wait_starts_for_test();
-    let controls_before = rig.actor_probe().entries("Control").len();
     let self_test = rig.request_async(SessionRequest::SelfTest {
         timeout_s: 60.0,
         strict_human_lock: false,
@@ -94,6 +93,7 @@ fn assert_shutdown_cancels_self_test_wait(prompt_wait: bool) {
     let tx_at_shutdown = rig.dev.tx_len();
     rig.dev.pause_next_close();
     let (shutdown_tx, shutdown_rx) = bounded(1);
+    let controls_before_shutdown = rig.actor_probe().entries("Control").len();
     rig.send_control(ControlEvent::Shutdown { reply: shutdown_tx });
     let self_test_reply = self_test.recv_timeout(Duration::from_millis(400)).ok();
     let close_paused = rig.dev.wait_paused(Duration::from_millis(400));
@@ -102,7 +102,7 @@ fn assert_shutdown_cancels_self_test_wait(prompt_wait: bool) {
     let mut runner_finished = false;
     while std::time::Instant::now() < deadline {
         // OpFinished 沿用 actor probe 既有的泛型 Control 標籤，不能改寫共用觀測契約。
-        if rig.actor_probe().entries("Control").len() > controls_before {
+        if rig.actor_probe().entries("Control").len() > controls_before_shutdown {
             runner_finished = true;
             break;
         }
