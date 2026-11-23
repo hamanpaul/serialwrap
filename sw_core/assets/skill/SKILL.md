@@ -249,7 +249,7 @@ serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wir
 - 長流命令（`logread -f`、`tcpdump`、kernel debug）：`--mode background` 不會讓命令脫離 `--cmd-timeout` 期限，到點（或靜默超過上限）一樣被 Ctrl-C 結束，期間也佔住該 session 的命令佇列。限時抓取可用 `--mode background` 並把 `--cmd-timeout` 設成想抓的時長；要長時間或可能靜默的，改在板上丟背景（見「`cmd submit` 的期限語意」）。
 - 每筆自動化命令必填 `--source`，不可省略，確保追蹤性。
 - 卡住時先 `serialwrap session self-test`，再決定是否 `serialwrap session recover`（可加 `--force`）。recover 成功恢復 prompt 時回 `ok: true`（附 `error_code: PROMPT_TIMEOUT_RECOVERED`, `partial: true`），表示 session 可繼續使用。
-- session 於命令排隊期間發生 recovery/re-attach（掉出 `READY`）時，尚未啟動的排隊命令會被終結為 `status=error`、`error_code=FLUSHED_BY_RECOVERY`（#128）——代表該命令**未執行**，等 session 回 `READY` 後重送即可；執行中的命令不受影響，仍以真實結果收尾。所有 detach 類路徑（含 clear/release/熱拔/re-attach）皆用 `FLUSHED_BY_RECOVERY`；daemon shutdown 則用 `FLUSHED_BY_SHUTDOWN`，語意相同＝命令未執行、可於 `READY` 後重送。
+- session 於命令排隊期間發生 recovery/re-attach（掉出 `READY`）時，尚未啟動的排隊命令會被終結為 `status=error`、`error_code=FLUSHED_BY_RECOVERY`（#128）——代表該命令**未執行**，等 session 回 `READY` 後重送即可；執行中的命令不受影響，仍以真實結果收尾。所有 detach 類路徑（含 clear/release/熱拔/re-attach）皆用 `FLUSHED_BY_RECOVERY`；daemon shutdown 則用 `FLUSHED_BY_SHUTDOWN`。Rust 0.5.1 起，排隊中、未送出的命令可在 `READY` 後重送；停機時在途的 `self_test`、`recover`、`interactive open`／`send` 也可能回此碼，bytes 可能已送出，須先確認副作用，不得只憑此碼自動重送（BC-06）。
 
 ## `--source` 的語意
 `--source`（`cmd submit`／`file push`／`file pull`／`device release`）與 `session interactive-open --owner` 的字串**不只是追蹤標籤**：daemon 用它的**前綴**決定命令逾時（沒等到 prompt）時怎麼處理。
