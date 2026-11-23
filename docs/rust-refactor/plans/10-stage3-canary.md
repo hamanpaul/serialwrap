@@ -52,7 +52,7 @@
 | P2 | Task 16 `realhw/acceptance/od09_freeze.py`（延後項唯一寫入者，Stage 0 交付，R4-F2）：`DEFERRED_KEYS`、`PER_PLATFORM_FIELDS`、`BASELINE_ITEMS`、`FREEZE_ITEM`、`CANDIDATE_LONGRUN_ITEMS`、`LEDGER_PATH`（`realhw/acceptance/candidate_longrun_starts.ndjson`）、`OD09_CODES`、`Od09Error`、`check_frozen_before`、`register_candidate_start`；`freeze --out` 報告 `od09-freeze.json`；`docs/rust-refactor/owner-decisions-addenda.md`、`docs/rust-refactor/procedures/od09-deferred-freeze.md`；替身 `tests/fakes_od09.py` | Task 6 L3 A/B 的凍結守門與 B 側開跑登記；Task 15 `od09-freeze` 報告判定與 `od09 check` 唯讀委派；Task 12 addenda 只附加列。本計畫**不得**寫延後項、不得提供 `stats`／`propose`／`freeze` |
 | P2 | `tests/acceptance/cases.yaml`（`invariant_ids` 六項、每案 `case_id`、`suite`、`layer`、`platforms`、`invariants`、`necessity`、`destructive`、`expected: PASS\|XFAIL`、`sentinel: null\|{issue,signature,expires}`、`stage0_required`、`cli_stage`、`daemon_slice`）、`tests/acceptance/cases.lock.json`（`sets.{stage0,cli_1A,cli_1B,slice_2.1,…,slice_2.4}`） | 必要案例集合、XFAIL 核准來源、六項不變量案例完整性（Task 3、7、7B、14B）；`f4-background-result-tail-consistent` 依 TST-D-6 目前為 `expected: PASS`，本計畫不另列手寫 XFAIL 清單 |
 | P2 | Task 13：`tests/acceptance/l1_required.lock.json`（`sets.<set_id>.<platform>.{selector,nodeids}`）、`l1_results.schema.json`（`SW_RESOURCE_REPORT` v2＝`l1-results.v1`：`collected`、`deselected`、`results[{nodeid,outcome,skip_kind,phases}]`、`exit_code`、`finished`）、`l1_judge.py`（`judge`、`required_for`、`set_sha256`、`L1_VERDICTS`）、`l1_judge_vectors.json`、`regen_lock.py --l1-add-only` | L1 出口的必要 nodeid 分母與完整性判定（R5-F3）：Task 14B `junit` 推導**以 `importlib.util.spec_from_file_location` 依路徑載入 `l1_judge.py`**，不另寫判定；Task 14 item_status 以 `l1_set_sha256` 使集合變動後的舊證據過期 |
-| P2 | L1.5：`python3 func-test/runner.py --mode bridge --dut-mode local-process\|docker --report-dir DIR --selftest-report PATH [--scenarios]`，以 env `SERIALWRAP_CLI_EXE`／`SERIALWRAP_DAEMON_EXE`（arch §9.2）選 artifact；**runner 每個 case 自行啟停 daemon 與 bridge 拉起的 DUT**，證據目錄 `<report-dir>/<case_id>/<mode>/<run_index>/`：`manifest.json`（`l15-manifest.v1`：`transport.mode`、`artifacts.{cli.sha256,daemon.implementation,daemon.sha256,daemon.tree_sha256,release_manifest_sha256}`、`tool.tree_sha256`、`dut.{mode,image_id}`）、`comparison.json`（`comparison.v1`：`verdict`（含 `INSUFFICIENT_EVIDENCE`）、`streams[]`、`invariants[]`）、`bridge-manifest.json`（`closed_cleanly`、`failure`）、`wire.ndjson`（`dut_generation`）、`cli.ndjson`、`daemon.log`、`wal/` | L1.5 suite adapter（Task 5B）與 A/B 差分（Task 7B）；**P2 沒有獨立的模擬器 launch／stop／state-digest CLI，也沒有 A/B 比較器**——P2 的比較器是單次 run 的 WAL↔wire 工具（`comparison.v1`），A/B 編排與差分由本計畫的 `tools/stage3/ab_diff.py`（Task 7B）提供（P2 第 29 行） |
+| P2 | L1.5：`python3 func-test/runner.py --mode bridge --dut-mode local-process\|docker --report-dir DIR --selftest-report PATH [--case CASE ...] [--scenario-case CASE ...] [--scenarios]`；`--case`、`--scenario-case` 可重複選取同一 invocation 的案例／情境，兩者不可與全情境 `--scenarios` 並用；以 env `SERIALWRAP_CLI_EXE`／`SERIALWRAP_DAEMON_EXE`（arch §9.2）選 artifact；**runner 每個 case 自行啟停 daemon 與 bridge 拉起的 DUT**，證據目錄 `<report-dir>/<case_id>/<mode>/<run_index>/`：`manifest.json`（`l15-manifest.v1`：`transport.mode`、`artifacts.{cli.sha256,daemon.implementation,daemon.sha256,daemon.tree_sha256,release_manifest_sha256}`、`tool.tree_sha256`、`dut.{mode,image_id}`）、`comparison.json`（`comparison.v1`：`verdict`（含 `INSUFFICIENT_EVIDENCE`）、`streams[]`、`invariants[]`）、`bridge-manifest.json`（`closed_cleanly`、`failure`）、`wire.ndjson`（`dut_generation`）、`cli.ndjson`、`daemon.log`、`wal/` | L1.5 suite adapter（Task 5B）與 A/B 差分（Task 7B）；**P2 沒有獨立的模擬器 launch／stop／state-digest CLI，也沒有 A/B 比較器**——P2 的比較器是單次 run 的 WAL↔wire 工具（`comparison.v1`），A/B 編排與差分由本計畫的 `tools/stage3/ab_diff.py`（Task 7B）提供（P2 第 29 行） |
 | P2 | L2：`testpilot run serialwrap_regression`（testbed `serialwrap_exe`、`bench_lock_path`；報告目錄由引擎自選 `~/b-log/regression-reports/tp-<ts>/report.json`，不接受外部 report dir，盤點 08 §3.1）；L3：`python3 -m realhw --tier <t> --report-dir DIR`（`realhw/config.json` 的 `serialwrap_exe`、#154 版本 gate TST-D-10；`report.json.meta.cli_identity.{resolved,sha256,pinned}`、`meta.started_at_utc`；`lr-mixed` PID 取 `daemon status.pid`，TST-D-12） | L2／L3 suite adapter（Task 5B）指向各側 artifact 並核對實際受測身分 |
 | P2 | Task 10 `realhw/deployed_content.py`（`SCHEMA="deployed-content.v1"`、`measure(cli_exe, *, daemon_argv)`、`live_daemon(pid, install)`、`entry_dir_check`、`tree_digests(bundle_dir)`、`bracket(start,end,*,live)`（daemon 映像與 Windows 穩定 bin 為 R5 審查後續）、CLI `python3 -m realhw.deployed_content --cli --out`）；各產生端的寫入位置：func-test `manifest.json.artifacts.deployed_content`、`SW_RESOURCE_REPORT` 頂層 `deployed_content`（未設 `SERIALWRAP_CLI_EXE` 時 null）、realhw／TestPilot `report.json.meta.deployed_content`、`release-gate.json.run.deployed_content`，皆為 `{"start","end"}`（R5-F4） | Task 5B `verify_run_identity` 核對 suite 實際量測內容＝該側凍結 tree；Task 14B 所有執行 artifact 的 kind 由報告取得受測內容指紋，不以 target 回填 |
 | P0／P2 | 測試檔平台／資源分類＝P0 01 Task 14 的**檔內** `pytestmark`（恰一個平台 marker `core_portable`／`posix_only`／`windows_native`＋至少一個資源 marker `memory_only`、`process_rpc`、`posix_pty`、`windows_com`、`physical_uart`、`supervisor_runtime`、`interactive_desktop`；同檔混合時放 class／函式層），由 `tests/test_resource_markers.py` 稽核；P2 03 Task 13 **不建立** `tests/platform_resources.yaml`（只產 `SW_RESOURCE_REPORT` 與 Windows `pytest_ignore_collect`）。`tests/acceptance/*.schema.json` 必含 `"$schema": "https://json-schema.org/draft/2020-12/schema"` 與 `$id`（`https://serialwrap.local/schemas/<name>`） | 每個 Task 新增測試檔時在檔頭寫對應 `pytestmark`；下文各 Task 的「Marker」行即該檔應帶的 class／resources（跨計畫審查：原稿寫成登錄 `tests/platform_resources.yaml`，該檔不存在），平台不同的測試拆成不同檔 |
@@ -69,7 +69,7 @@
 | 輪次 | 內容 |
 |---|---|
 | 第一輪（測試先行） | Task 1、Task 2 完整執行（Step 1～5：契約檔、基礎模組與**只含基礎替身**的共用替身是其他測試的前置，必須先能 import 且全綠）；其餘 Task 只執行 Step 1～2（寫測試與該 Task 自己的替身檔 `tests/fakes_*.py`→執行→確認紅燈且紅燈原因是「模組／符號不存在」或斷言失敗，不是語法錯或 fixture 錯）。第一輪不得 commit 任何紅燈測試：紅燈測試只留在工作目錄，於該 Task 第二輪 Step 5 與實作一起 commit |
-| 第二輪（實作） | 依相依順序執行各 Task 的 Step 3～5：3 → 4 → 5 → 5B → 7B → 7 → 14 → 15 → 14B → 6 → 8 → 10 → 11 → 9 → 12 → 13 → 16 → 17（Task 10、11 先於 Task 9：collector zipapp 需打包 `canary_classify`、`canary_incidents`，`collector_main` 的 `note`／`incident` 子命令也依賴 Task 11） |
+| 第二輪（實作） | 依相依順序執行各 Task 的 Step 3～5：3 → 4 → 5 → 5B → 7B → 7 → 14 → 15 → 6 → 8 → 10 → 11 → 9 → 12 → 13 → 14B → 16 → 17（Task 10、11 先於 Task 9：collector zipapp 需打包 `canary_classify`、`canary_incidents`，`collector_main` 的 `note`／`incident` 子命令也依賴 Task 11；Task 14B 消費 Task 6 A/B、Task 12 canary ledger 與 Task 13 drill 報告，因此排在三者之後） |
 | 收尾 | 全套 `python3 -m pytest -q tests/`、`cargo test --workspace`、`scripts/rust/check_cfg_boundary.py`、`python3 -m policy_check --repo .`；Phase 層級雙審（sonnet max＋codex gpt-6.1-sol medium，master plan §1）；高風險 Task 4、5B、6、7B、8、10、13、14B、16 另各做一次單審（見 §2） |
 
 第一輪結束時須提交一個「全部紅燈清單」紀錄（各測試檔的失敗數與原因摘要）到 PR 描述，供審查者確認測試先於實作存在。
@@ -118,8 +118,8 @@
 - 不建立 `docs/rust-refactor/owner-decisions-addenda.md`：該附加式紀錄檔由 P2 Task 16 建立（Stage 0 的 OD-09 凍結已附加一列）；本計畫 Task 12 的 Canary policy 凍結只附加列，不重建、不改寫既有列（R4-F2）
 - Create: `packaging/python_daemon_retirement.json`
 - Modify: `tests/acceptance/l1_required.lock.json`（只以 P2 `regen_lock.py --l1-add-only --set s3_release_contract --platform linux|windows` 登記，不手改；R5-F3）
-- Marker（P0 T14 檔內 `pytestmark`，非 YAML 登錄）：（登錄下列三個測試檔，皆 `{class: core_portable, resources: [memory_only]}`）
-- Test: `tests/test_stage3_contracts.py`、`tests/test_stage3_base.py`、`tests/test_stage3_consumes.py`
+- Marker（P0 T14 檔內 `pytestmark`，非 YAML 登錄）：登錄下列五個測試檔：`tests/test_stage3_contracts.py`、`tests/test_stage3_base.py`、`tests/test_stage3_consumes.py` 皆 `{class: core_portable, resources: [memory_only]}`；`tests/test_stage3_base_proc.py` 為模組層 `core_portable`＋函式層 `process_rpc`（`proc.spawn`，`l3_realhw` 在 Windows 亦使用，故不得放在 POSIX 檔）；`tests/test_stage3_base_posix.py` 為模組層 `posix_only`＋函式層資源 marker
+- Test: `tests/test_stage3_contracts.py`、`tests/test_stage3_base.py`、`tests/test_stage3_base_proc.py`、`tests/test_stage3_base_posix.py`、`tests/test_stage3_consumes.py`
 
 四個新 schema（`ab_manifest`、`canary_policy`、`canary_ledger_record`、`stage3_evidence_index`）皆為 draft 2020-12，帶 `"$schema": "https://json-schema.org/draft/2020-12/schema"` 與 `"$id": "https://serialwrap.local/schemas/<檔名去掉 .schema.json>"`（P2 `test_all_acceptance_schemas_are_valid_draft2020`）。
 
@@ -170,7 +170,7 @@ class HarnessError(Exception):
 QUOTA_FLOOR: Mapping[str, int] = {"active_days": 14, "submits": 5000, "cycles_total": 50}   # OD-10，不可下修
 CYCLE_TYPES: tuple[str, ...] = ("handoff_release_attach", "hotplug_reattach", "dut_reboot", "recovery", "human_agent_coexist", "flash", "planned_restart")
 MIN_TYPES_WITH_QUOTA: int = 3        # §12.2「不能全部以同一種容易的 Recovery 取代」
-ARBITER_CMD_ID_REGEX: str = "^[0-9a-f]{32}$"   # sw_core/arbiter.py:166 uuid4().hex；排除 file_transfer 的 "ft-<8hex>-<suffix>"
+ARBITER_CMD_ID_REGEX: str = "^[0-9a-f]{32}$"   # sw_core/arbiter.py:226 uuid4().hex；排除 file_transfer 的 "ft-<8hex>-<suffix>"
 @dataclass(frozen=True)
 class PlatformQuota:
     active_days: int
@@ -215,7 +215,7 @@ def load_policy(path: Path, *, addenda_path: Path | None = None) -> CanaryPolicy
 def assert_frozen_before(policy: CanaryPolicy, first_counted_wall_ts: str) -> None   # 未凍結或 frozen_at > ts → HarnessError("HARNESS_CANARY_POLICY_NOT_FROZEN")
 ```
 
-`load_policy` 的拒絕規則：任一平台 `active_days`／`submits`／`cycles_total` 低於 `QUOTA_FLOOR`；`cycles_min_per_type` 含 `CYCLE_TYPES` 以外的鍵；`sum(cycles_min_per_type) > cycles_total`；`cycles_min_per_type` 中值 ≥1 的類型少於 `MIN_TYPES_WITH_QUOTA`；`cycles_max_type_share` 不在 `(0, 0.5]`；任一類型的 `cycles_min_per_type[t] > floor(cycles_max_type_share × cycles_total)`；`windows.cycles_min_per_type.flash > 0`（Windows 不適用 `/dev/ttyMCU`）；`cmd_id_regex != ARBITER_CMD_ID_REGEX`；`allowed_tx_source_regex` 無法編譯；`status == "frozen"` 但 `frozen_by`／`frozen_at`／`decision_ref` 任一為 null；`platforms.*.evidence_owner` 在 `frozen` 時為 null；`utc_offset_minutes` 或任一 `utc_offset_changes` 值不在 `-720..840`、`from` 非升冪或為 naive 時間。
+`load_policy` 的拒絕規則：任一平台 `active_days`／`submits`／`cycles_total` 低於 `QUOTA_FLOOR`；`cycles_min_per_type` 含 `CYCLE_TYPES` 以外的鍵；`sum(cycles_min_per_type) > cycles_total`；`cycles_min_per_type` 中值 ≥1 的類型少於 `MIN_TYPES_WITH_QUOTA`；`cycles_max_type_share` 不在 `(0, 0.5]`；任一類型的 `cycles_min_per_type[t] > floor(cycles_max_type_share × cycles_total)`；`windows.cycles_min_per_type.flash > 0`（Windows 不適用 `/dev/ttyMCU`）；`cmd_id_regex != ARBITER_CMD_ID_REGEX`；`allowed_tx_source_regex` 無法編譯；`safety.resend_window_s` 低於 1（0 只剩同秒才判重送，實質停用安全訊號）；`status == "frozen"` 但 `frozen_by`／`frozen_at`／`decision_ref` 任一為 null；`platforms.*.evidence_owner` 在 `frozen` 時為 null；`utc_offset_minutes` 或任一 `utc_offset_changes` 值不在 `-720..840`、`from` 非升冪或為 naive 時間。
 
 **`tests/acceptance/canary_policy.json`（draft 預設值，擁有者可在凍結前修改，凍結後不得改；凍結只經 Task 12 的 `canary policy freeze`）：**
 
@@ -241,7 +241,7 @@ def assert_frozen_before(policy: CanaryPolicy, first_counted_wall_ts: str) -> No
 
 時區以固定 `utc_offset_minutes` 加上預先列出的 `utc_offset_changes` 表達（Windows 的 stdlib `zoneinfo` 沒有 tzdata，不可依賴）；已知限制：未事先列出的 DST／時區變更會把該日紀錄歸到錯誤的本地日期，`canary.md` 須要求擁有者在凍結前列出 Canary 期間的所有變更日。
 
-**`tools/stage3/stage3_reason_codes.json`**：`{"schema_version":1,"codes":{...}}`，每碼 `{"meaning":"…","action":"…"}`，初始集合恰為：`HARNESS_MANIFEST_INVALID`、`HARNESS_MANIFEST_DRIFT`、`HARNESS_RELEASE_UNCONFIRMED`、`HARNESS_DUT_NOT_CLEAN`、`HARNESS_SUITE_INFRA_ERROR`、`HARNESS_COMPARATOR_ERROR`、`HARNESS_BASELINE_INVALID`、`HARNESS_OD09_NOT_FROZEN`、`HARNESS_FAILURE_RETENTION_UNVERIFIED`、`HARNESS_ABORTED`、`HARNESS_ARTIFACT_MISMATCH`、`HARNESS_CASE_SET_INCOMPLETE`、`HARNESS_AUTHORIZATION_MISSING`、`HARNESS_CANARY_POLICY_INVALID`、`HARNESS_CANARY_POLICY_NOT_FROZEN`、`HARNESS_CANARY_POLICY_CHANGED`、`HARNESS_LEDGER_CORRUPT`、`HARNESS_INCIDENT_INVALID_CLOSE`、`HARNESS_EVIDENCE_UNKNOWN_ITEM`、`HARNESS_EVIDENCE_DUPLICATE`、`HARNESS_EVIDENCE_INGEST_INVALID`、`HARNESS_OD09_BASELINE_INVALID`、`HARNESS_OD09_TOO_LATE`、`HARNESS_DRILL_PRECONDITION`、`HARNESS_DRILL_STEP_FAILED`、`HARNESS_DRILL_INCOMPLETE`、`HARNESS_RETIREMENT_NOT_APPROVED`、`HARNESS_RETIREMENT_INCONSISTENT`（28 碼）。
+**`tools/stage3/stage3_reason_codes.json`**：`{"schema_version":1,"codes":{...}}`，每碼 `{"meaning":"…","action":"…"}`，初始集合恰為：`HARNESS_MANIFEST_INVALID`、`HARNESS_MANIFEST_DRIFT`、`HARNESS_RELEASE_UNCONFIRMED`、`HARNESS_DUT_NOT_CLEAN`、`HARNESS_SUITE_INFRA_ERROR`、`HARNESS_COMPARATOR_ERROR`、`HARNESS_BASELINE_INVALID`、`HARNESS_OD09_NOT_FROZEN`、`HARNESS_FAILURE_RETENTION_UNVERIFIED`、`HARNESS_ABORTED`、`HARNESS_ARTIFACT_MISMATCH`、`HARNESS_CASE_SET_INCOMPLETE`、`HARNESS_AUTHORIZATION_MISSING`、`HARNESS_CANARY_POLICY_INVALID`、`HARNESS_CANARY_POLICY_NOT_FROZEN`、`HARNESS_CANARY_POLICY_CHANGED`、`HARNESS_LEDGER_CORRUPT`、`HARNESS_INCIDENT_INVALID_CLOSE`、`HARNESS_EVIDENCE_UNKNOWN_ITEM`、`HARNESS_EVIDENCE_DUPLICATE`、`HARNESS_EVIDENCE_INGEST_INVALID`、`HARNESS_OD09_BASELINE_INVALID`、`HARNESS_OD09_TOO_LATE`、`HARNESS_DRILL_PRECONDITION`、`HARNESS_DRILL_STEP_FAILED`、`HARNESS_DRILL_INCOMPLETE`、`HARNESS_RETIREMENT_NOT_APPROVED`、`HARNESS_RETIREMENT_INCONSISTENT`（28 碼）；審查補登 2 碼，使登錄表與程式實際發出的原因碼一致（共 30 碼）：`HARNESS_CLI_ERROR`（`tools/stage3/collector_main.py` 的 CLI 失敗回報）與 `HARNESS_BUILD_UNAVAILABLE`（Task 16 `scripts/rust/mkbundle.sh` 占位稿；真正 bundle builder 落地後隨占位稿移除，須同步更新 `tests/test_stage3_retirement_posix.py`）。
 
 **`tests/acceptance/ab_manifest.schema.json` 欄位**（draft 2020-12，`additionalProperties:false`）。FrozenFile＝`{"path":str,"sha256":64hex}`；FrozenTree＝`{"path":str,"tree_sha256":64hex}`（演算法同 arch §10.1：sorted `"<relpath>\0<sha256>\n"` 的 sha256，排除 `__pycache__`、`*.pyc`）：
 
@@ -364,9 +364,9 @@ def assert_frozen_before(policy: CanaryPolicy, first_counted_wall_ts: str) -> No
 |---|---|---|
 | `snapshot` | Task 9 | `t_wall`、`boot_id`（str\|null）、`daemon_ok`、`daemon_pid`、`daemon_version`、`daemon_exe_sha256`（str\|null）、`artifact_id`（str\|null）、`artifact_check`（`"verified"`\|`"cli_mismatch"`\|`"daemon_mismatch"`\|`"version_mismatch"`\|`"tree_invalid"`\|`"unresolved"`）、`bundle_tree_sha256`（64hex\|null）、`runtime_tree_sha256`（64hex\|null；兩者為 collector 對實際部署 bundle 目錄重算的內容指紋，`artifact_check=="verified"` 時必為非 null，R4-F1）、`bundle_version`、`daemon_implementation`、`wal_dir`、`wal_healthy`、`multi_open`、`sessions`（`[{com,state,bridge_generation,boot_quiet_remaining_s,ready_reconfirm_pending,ready_reconfirm_failed,command_capable,platform,profile,last_error,last_ready_at}]`）、`error`（str\|null） |
 | `submit` | Task 9 | `cmd_id`（符合 `cmd_id_regex`）、`com`、`source`、`wall_ts`、`seq`、`wal_file` |
-| `submit_result` | Task 9 | `cmd_id`、`status`（`"done"`\|`"error"`\|`"timeout"`\|`"unknown"`）、`error_code`（str\|null）、`t_wall` |
+| `submit_result` | Task 9 | `cmd_id`、`status`（`"done"`\|`"error"`\|`"timeout"`\|`"unknown"`）、`error_code`（str\|null）、`t_wall`；選填 `reason`（`"CMD_NOT_FOUND"`＝history 淘汰後查無結果，`"STALE_NON_TERMINAL"`＝非終態逾 24 h 收斂） |
 | `wal_signal` | Task 9 | `kind`（Task 8 `WalSignal.kind`）、`com`、`wall_ts`、`seq`、`source`、`detail`（object，不含 payload） |
-| `harvest_anomaly` | Task 9 | `detail`（Task 8 anomaly 字串）、`t_wall` |
+| `harvest_anomaly` | Task 9 | `detail`（Task 8 anomaly 字串）、`t_wall`；選填 `kind`（`"result_evicted"`）與 `cmd_id`（32 hex），兩者必須同時出現或同時不出現（`result_evicted` 對應 `CMD_NOT_FOUND` 淘汰） |
 | `note` | Task 11 | `kind`（`planned_restart`\|`planned_downtime`）、`from`、`to`、`reason`、`author`、`t_wall` |
 | `incident_open` | Task 11 | `incident_id`、`kind`、`artifact_id`、`opened_at`、`detected_by`（`"manual"`；自動事故不寫紀錄、每次重算）、`summary`、`evidence`（[str]） |
 | `incident_close` | Task 11 | `incident_id`、`resolution`、`issue_ref`（str\|null）、`note`、`closed_by`、`closed_at` |
@@ -423,7 +423,7 @@ def test_ledger_example_records_validate():
     assert not any("payload_b64" in line for line in lines)
 
 
-@pytest.mark.parametrize("name", ["ab_manifest", "canary_policy", "canary_ledger_record", "evidence_index"])
+@pytest.mark.parametrize("name", ["ab_manifest", "canary_policy", "canary_ledger_record", "stage3_evidence_index"])
 def test_new_schemas_have_schema_and_id(name):
     doc = _load(ACC / f"{name}.schema.json")
     assert doc["$schema"] == "https://json-schema.org/draft/2020-12/schema"
@@ -553,7 +553,8 @@ pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 def test_p2_gate_api():
     from realhw.acceptance import gate
     assert [f.name for f in dataclasses.fields(gate.GateInputs)] == [
-        "report_dir", "case_dir", "acceptance_path", "platform", "mode", "observer_path", "wal_dir", "baseline_gate_path"]
+        "report_dir", "case_dir", "acceptance_path", "platform", "mode", "observer_path", "wal_dir", "baseline_gate_path",
+        "excl_evidence_path"]    # 第 9 欄為 P2 既定介面（R1-F7，預設 None），原稿漏列，依 §0 Consumes 同步
     assert callable(gate.evaluate) and callable(gate.main)
     assert gate.RESULTS == ("PASS", "FAIL", "INSUFFICIENT_EVIDENCE", "BLOCKED", "NOT_APPLICABLE_BASELINE")
     doc, meta = gate.load_acceptance(ROOT / "realhw" / "acceptance" / "longrun_acceptance.yaml")
@@ -632,7 +633,8 @@ Expected: PASS。
 - [ ] **Step 5：commit**
 
 ```bash
-git add tools/__init__.py tools/stage3/ tests/acceptance/ docs/rust-refactor/evidence/index.json packaging/python_daemon_retirement.json tests/test_stage3_contracts.py tests/test_stage3_base.py tests/test_stage3_consumes.py changelog.d/rust-p9-01-stage3-contracts.md
+# 只列 Task 1 自身路徑（`tools/stage3/` 目錄內另有 Task 3～16 的未提交工作，不得整目錄加入）；本計畫檔的 Task 1 段修訂以 `git add -p` 只選 Task 1 的 hunk，其餘 hunk 屬其他 Task
+git add .gitattributes tools/__init__.py tools/stage3/__init__.py tools/stage3/jsonio.py tools/stage3/proc.py tools/stage3/reason_codes.py tools/stage3/canary_policy.py tools/stage3/stage3_reason_codes.json tests/acceptance/ab_manifest.schema.json tests/acceptance/examples/ab_manifest.l15.example.json tests/acceptance/examples/ab_manifest.l2.example.json tests/acceptance/examples/ab_manifest.l3.example.json tests/acceptance/canary_policy.json tests/acceptance/canary_policy.schema.json tests/acceptance/canary_ledger_record.schema.json tests/acceptance/examples/canary_records.example.ndjson tests/acceptance/stage_exits.json tests/acceptance/stage3_evidence_index.schema.json tests/acceptance/l1_required.lock.json docs/rust-refactor/evidence/index.json packaging/python_daemon_retirement.json tests/test_stage3_contracts.py tests/test_stage3_base.py tests/test_stage3_base_proc.py tests/test_stage3_base_posix.py tests/test_stage3_consumes.py changelog.d/rust-p9-01-stage3-contracts.md
 git commit -m "feat(stage3): 新增 Stage 3 契約檔、schema 與基礎模組" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
 
@@ -1235,8 +1237,10 @@ L1.5 的 DUT 與 daemon 由 func-test runner 每個 case 自行啟停（P2 Task 
 
 **Files:**
 - Create: `tools/stage3/dut_state.py`
-- Marker（P0 T14 檔內 `pytestmark`，非 YAML 登錄）：（`test_stage3_dut_state.py: {class: core_portable, resources: [memory_only]}`）
-- Test: `tests/test_stage3_dut_state.py`
+- Marker（P0 T14 檔內 `pytestmark`，非 YAML 登錄）：（`test_stage3_dut_state.py: {class: core_portable, resources: [memory_only]}`；POSIX 專屬的 `test_cleanup_removes_tmp_run_dir` 與其餘 POSIX 案例分出至 `tests/test_stage3_dut_state_posix.py: {class: posix_only, resources: [memory_only]}`，因 core_portable 檔不得含平台 skip（`test_core_portable_items_have_no_platform_skip`））
+- Test: `tests/test_stage3_dut_state.py`、`tests/test_stage3_dut_state_posix.py`
+
+> 實作補充（P9-T5 審查）：l1.5 另移除 `SERIALWRAP_CONFIG`、`SERIALWRAP_RELEASE_MANIFEST`、`SERIALWRAP_TEST_KILL_AFTER_SAVE`、`SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE` 並把 `SERIALWRAP_TEST_SYSTEM_CONFIG_PATH` 指向實例內；`verify_clean` 增 keyword-only `repo_root`／`out_dir`（供 `{repo_root}`／`{out_dir}` 模板，Task 6 須傳入 `repo_root`）；`expected_fingerprint` 非空時無論是否設定 `fingerprint_argv` 皆逐鍵判定，指紋命令失敗且未宣告 expected 時回報 `fingerprint unavailable`。
 
 **Interfaces — Consumes:** `ab_manifest.AbManifest`／`AbSide`／`render_argv`、`proc.Runner`。
 **Interfaces — Produces:**
@@ -1320,12 +1324,14 @@ def test_b_instance_never_reuses_a_root(tmp_path):
 
 **Files:**
 - Create: `tools/stage3/suites/__init__.py`、`tools/stage3/suites/l15_functest.py`、`tools/stage3/suites/l2_regression.py`、`tools/stage3/suites/l3_realhw.py`
+- Modify: `func-test/lib/yaml_loader.py`、`func-test/runner.py`（支援同一 invocation 重複選取 case／scenario case）
 - Create: `tests/fakes_suites.py`（L1.5 報告樹、TestPilot `tp-*` 目錄、realhw 報告與 release-gate.json 的產生器，供 `RecordingRunner.on` 使用；另提供 Task 6 用的 `ab_env(root, *, layer="l1.5", a_functest_rc=0, b_functest_rc=0, functest_identity="per_env"|"python_default", a_pid=4101, b_pid=4202, **manifest_overrides) -> AbEnv`，`AbEnv` 屬性 `repo`、`manifest`、`m`（已載入的 `AbManifest`）、`runner`、`a_daemon_pid`、`b_daemon_pid`、`recorded()`；所有產生器預設以 P2 `realhw.deployed_content.measure(<該側 cli_exe>)` 寫入真實量測的 `deployed_content` start／end（R5-F4），故 happy path 的 `verify_run_identity` 仍為 `[]`；`deployed_content=None` 參數可省略該鍵供負向測試）
-- Modify: `tools/stage3/stage3_reason_codes.json`（無新碼；沿用 `HARNESS_ARTIFACT_MISMATCH`、`HARNESS_SUITE_INFRA_ERROR`、`HARNESS_FAILURE_RETENTION_UNVERIFIED`）
-- Marker（P0 T14 檔內 `pytestmark`，非 YAML 登錄）：（`test_stage3_suites.py: {class: core_portable, resources: [memory_only]}`）
-- Test: `tests/test_stage3_suites.py`
+- Consumes: `tools/stage3/stage3_reason_codes.json` 的既有 `HARNESS_ARTIFACT_MISMATCH`、`HARNESS_SUITE_INFRA_ERROR`、`HARNESS_FAILURE_RETENTION_UNVERIFIED`（不新增或修改 reason code）
+- Modify: `tests/acceptance/examples/ab_manifest.l3.example.json`（longrun `timeout_s` 必須涵蓋 acceptance 的 frozen minimum）
+- Marker（P0 T14 檔內 `pytestmark`，非 YAML 登錄）：`test_stage3_suites.py`、`test_func_test_runner_selection.py` 皆 `{class: core_portable, resources: [memory_only]}`
+- Test: `tests/test_stage3_suites.py`、`tests/test_func_test_runner_selection.py`
 
-**Interfaces — Consumes:** Task 3、5；P2 func-test／TestPilot／realhw／`realhw.acceptance.{observer,gate}` 的 CLI（§0 表）。
+**Interfaces — Consumes:** Task 3、5；P2 func-test／TestPilot／realhw／`realhw.acceptance.{observer,gate}` 的 CLI（§0 表）。P2 引擎本身及其 `realhw`／regression plugin source 由 P2 任務維護；T5B 只消費其 CLI 與報告契約，不把既有 P2 source diff 收進本 Task 檔案或 changelog。
 **Interfaces — Produces:**
 
 ```python
@@ -1337,7 +1343,7 @@ class SuiteRun:
     report_dir: Path             # 本側證據根目錄（adapter 保證所有引擎產出都在這裡）
     identity: Mapping[str, Any]  # 實際受測身分（自引擎報告讀出）
     notes: tuple[str, ...]
-def run_side(m: AbManifest, side: AbSide, inst: Instance, *, run: Runner, spawn: Spawner, now: Callable[[], str]) -> SuiteRun
+def run_side(m: AbManifest, side: AbSide, inst: Instance, *, run: Runner, spawn: Spawner, now: Callable[[], str], repo_root: Path | None = None) -> SuiteRun
     # 依 m.suite.adapter 分派到下列三個模組
 def verify_run_identity(m: AbManifest, side: AbSide, run: SuiteRun, *, expected_trees: Mapping[str, str]) -> list[str]
     # 比對 run.identity 與 side.manifest_doc.components；違規字串：
@@ -1347,19 +1353,19 @@ def verify_run_identity(m: AbManifest, side: AbSide, run: SuiteRun, *, expected_
 REPORT_ENDPOINTS = "endpoints.json"   # 由 adapter 寫在 report_dir：{"endpoints":[…],"device_paths":[…],"lock_paths":[…]}
 
 # l15_functest.py
-def run(m, side, inst, *, run, spawn, now) -> SuiteRun
+def run(m, side, inst, *, run, spawn, now, repo_root: Path | None = None) -> SuiteRun
 # l2_regression.py
-def run(m, side, inst, *, run, spawn, now) -> SuiteRun
+def run(m, side, inst, *, run, spawn, now, repo_root: Path | None = None) -> SuiteRun
 # l3_realhw.py
-def run(m, side, inst, *, run, spawn, now) -> SuiteRun
+def run(m, side, inst, *, run, spawn, now, repo_root: Path | None = None) -> SuiteRun
 ```
 
 各 adapter 行為：
-- **L1.5 的 docker 兩容器拓樸（OD-15）**：`m.dut.kind == "docker"` 時可改用 P2 Task 17 的 `tools/docker/compose.l15.yaml`（`serialwrap` ⇄ bridge ⇄ `dut-sim`，假 COM 為 socat PTY pair，`SERIALWRAP_BY_ID_DIR` 指向只放假 by-id 的 sandbox），以 `scripts/docker/run-l15.sh` 執行同一批案例；兩側都必須同為 docker 拓樸且 `image_digest` 記入 manifest（`docker_without_digest` 規則照舊），報告寫 `evidence_layer:"L1.5-docker"`，只滿足 L1.5 項。
-- **L1.5（`l15_functest`）**：`run([sys.executable, repo/"func-test/runner.py", "--mode", "bridge", "--dut-mode", <docker 時 "docker" 否則 "local-process">, "--report-dir", report_dir, "--selftest-report", m.suite.selftest_report.path, *case 選擇旗標, *extra_args], env=inst.env, timeout=m.suite.timeout_s)`；rc 0→PASS、1→FAIL、其他或逾時→INFRA_ERROR。之後四項檢查（任一不符→INFRA_ERROR，notes 列出）：(1) leaked-daemon 掃描——以 Task 4 `pids_by_exe([side.daemon_exe, side.cli_exe 的 realpath, 及 entry 腳本])` 為空；(2) 每個 `<case>/<mode>/<n>/bridge-manifest.json` 的 `closed_cleanly is True` 且 `failure is None`；(3) 每個 case 的 `wire.ndjson` 中 `dut_generation` 只出現 1（該 case 宣告 DUT restart／reboot 的除外：`cases.yaml` 的 case 屬性決定），即 DUT 為每 case 全新；(4) 收集所有 `manifest.json.transport.port_id`／daemon socket 路徑寫入 `report_dir/endpoints.json` 供 Task 4 `snapshot_from_endpoints`。`identity`：所有 case `manifest.json.artifacts` 必須一致，取 `cli.sha256`、`daemon.implementation`、`daemon.sha256`、`daemon.tree_sha256`、`release_manifest_sha256`、`transport.mode`、`tool.tree_sha256`。
-- **L2（`l2_regression`）**：從 `m.suite.testbed_template` 產生本側 `inst.root/testbed.yaml`（只覆寫 `serialwrap_exe=side.cli_exe`、`bench_lock_path`；其他鍵原樣）；記錄 `~/b-log/regression-reports/` 下既有 `tp-*` 清單；`run(["testpilot","run","serialwrap_regression","--testbed",testbed, *case 選擇旗標, *extra_args], env=inst.env, timeout=...)`；結束後找出**新出現且唯一**的 `tp-*` 目錄（0 或 >1 個 → INFRA_ERROR `"testpilot report dir ambiguous"`），整個複製到 `report_dir/testpilot/`。status 依 `report.json` 逐案判定交給 Task 7（rc 只作 INFRA 判斷：非 0 且無 report.json → INFRA_ERROR）。`identity`：`report.json.meta.cli_identity`（`resolved`、`sha256`、`pinned`）與 preflight 記錄的 `daemon status.version`。
-- **L3（`l3_realhw`）**：依 P2 Task 15 README 的固定程序：(1) 從 `m.suite.realhw_config_template` 產生 `inst.root/realhw-config.json`（覆寫 `serialwrap_exe`、`endpoint=m.endpoint`、`bench_lock_path`）；(2) 監管檢查——`[cli,"supervision-mode"]` stdout 必須為 `on-demand`，且 `[cli,"service","status"]` 回報無已註冊監管（Linux 無 systemd unit 啟用；Windows 另以 `schtasks /Query /TN serialwrap*` 確認無工作），否則 `HARNESS_FAILURE_RETENTION_UNVERIFIED`；全部 RPC 類 CLI 呼叫（`daemon`／`session`／`cmd`）與引擎設定皆帶明確 `--endpoint m.endpoint`，使 SC-18 首次需求自動啟動不觸發（死掉的 daemon 不會被 worker 下一個命令救活）；(3) `spawn([sys.executable,"-m","realhw.acceptance.observer","--serialwrap-exe",side.cli_exe,"--boards",",".join(m.dut.boards),"--interval-s",str(workload.observer_interval_s),"--out",report_dir/"observer.ndjson"])`（`m.platform=="windows"` 另加 `"--excl-dir",report_dir/"excl","--excl-probe-interval-s",str(workload.windows_excl_probe_interval_s)`）；(3a) Windows：`run([sys.executable,"-m","realhw.acceptance.winexcl","handoff","--phase","pre","--serialwrap-exe",side.cli_exe,"--boards",…,"--observer-header",report_dir/"observer.ndjson","--excl-dir",report_dir/"excl"])`，exit 0 才進 (4)；exit 1（`violated`）→ 不跑 (4)、證據照存並直接執行 (7)，由 gate 判 `safety_double_holder` FAIL；exit 4 → `INFRA_ERROR`（不得跳過 pre 直接長跑）（P2 Task 15 Windows 獨占證據契約，R1-F7）；(4) `run([sys.executable,"-m","realhw","--config",cfg,"--tier",m.suite.tier,"--report-dir",report_dir/"realhw", *extra_args], timeout=m.suite.timeout_s)`；(4a) Windows：同 (3a) 但 `--phase post`，結果照存（判定交給 gate）；(5) 停止 observer（terminate→wait 10 s→kill）；(6) 複製 daemon `wal_path` 所在目錄到 `report_dir/wal/`；(7) `run([sys.executable,"-m","realhw.acceptance.gate","--report-dir",report_dir/"realhw","--case-dir",<lr-mixed case dir>,"--acceptance",m.acceptance.path,"--platform",m.platform,"--mode","baseline" if side.role=="baseline" else "candidate","--observer",…,"--wal-dir",…,("--baseline-gate",<A 側 release-gate.json>) 僅 B 側,("--excl-evidence",report_dir/"excl") 僅 Windows,"--out",report_dir/"release-gate.json"])`。gate exit 0／1／4／5 皆屬正常完成（判定交給 Task 7），其他 → INFRA_ERROR。`identity`：`report.json.meta.cli_identity` 與 `release-gate.json.run.{cli_identity,daemon_version}`；報告記錄 `"explicit_endpoint": m.endpoint`、`"supervisor_absent": true`。`m.suite.tier` 不是 `longrun`（例如 `p0,p1,remote`）時跳過 (3)、(3a)、(4a)、(6)、(7)，供 `S3-L3-P0P1-REMOTE-*` 以 `evidence ingest --kind realhw-report` 登錄。
-- `verify_run_identity`：`identity.cli.sha256 != components.cli.sha256` → `"cli sha256 mismatch"`；L1.5 的 `daemon.implementation` 或 `daemon.sha256`（Rust：等於 `components.daemon.launcher.sha256`；Python：`daemon.tree_sha256` 等於 `components.daemon.package.tree_sha256`）不符 → 對應字串；L2／L3 `pinned is not True` → `"cli not pinned"`；`release_manifest_sha256`（有記錄時）≠ `side.release_manifest.sha256` → `"release manifest mismatch"`。**實際部署內容（R5-F4）**：`identity.deployed_content` 為 suite 產生端自己的量測（L1.5 取所有 case run 的 `manifest.json.artifacts.deployed_content`、L2／L3 取 `report.json.meta.deployed_content`，adapter 原樣放入 `identity`，L1.5 為各 run 的清單）；任一 start／end 缺漏、`error` 非 None 或 digest 為 None → `"deployed content unmeasured"`；同一 bracket 的 start 與 end（或 L1.5 各 run 之間）`bundle_tree_sha256`／`runtime_tree_sha256` 不同 → `"deployed content changed during suite"`；與 `expected_trees` 不同 → `"deployed tree mismatch"`（L2／L3 的 `activate_argv` 可能把 bundle 安裝到另一個 `versions/<v>/` 目錄再執行，`side.bundle_dir` 的指紋不能代表那份安裝；旁載檔只在這裡現形）。
+- **L1.5 的 docker 兩容器拓樸（OD-15）**：`m.dut.kind == "docker"` 時可改用 P2 Task 17 的 `tools/docker/compose.l15.yaml`（`serialwrap` ⇄ bridge ⇄ `dut-sim`，假 COM 為 socat PTY pair，`SERIALWRAP_BY_ID_DIR` 指向只放假 by-id 的 sandbox），以 `scripts/docker/run-l15.sh` 執行同一批案例；兩側都必須同為 docker 拓樸且 `image_digest` 記入 manifest（`docker_without_digest` 規則照舊），`SuiteRun.identity.evidence_layer` 設為 `"L1.5-docker"`，Task 6 寫入 `ab-report.json.sides[*].evidence_layer`，只滿足 L1.5 項。
+- **L1.5（`l15_functest`）**：每側只呼叫一次 `run([sys.executable, repo/"func-test/runner.py", "--mode", "bridge", "--dut-mode", <docker 時 "docker" 否則 "local-process">, "--report-dir", report_dir, "--selftest-report", m.suite.selftest_report.path, *case／scenario 選擇旗標, *extra_args], env=inst.env, timeout=m.suite.timeout_s)`；重複傳入 `--case` 與 `--scenario-case` 以涵蓋該側完整案例，func-test CLI 支援同次選取並禁止與全情境 `--scenarios` 混用。Docker 另傳 digest-pinned `--dut-image`；Windows `com_pair` 依 `daemon_side`／`bridge_side` mapping 值分別傳給 `--daemon-com`／`--bridge-com`，缺值回 INFRA_ERROR。runner rc 必須與每案 `comparison.json.verdict` 一致（全部 PASS→0、含 FAIL 且其餘只為 PASS／FAIL→1）；SKIP、`INSUFFICIENT_EVIDENCE`、缺報告、rc 不符、非 0/1、逾時均為 INFRA_ERROR。之後四項檢查（任一不符→INFRA_ERROR，notes 列出）：(1) leaked-daemon 掃描——以 Task 4 `pids_by_exe([side.daemon_exe, side.cli_exe 的 realpath, 及 entry 腳本])` 為空；(2) 每個 `<case>/<mode>/<n>/bridge-manifest.json` 的 `closed_cleanly is True` 且 `failure is None`；(3) 每個 case 的 `wire.ndjson` 中 `dut_generation` 只出現 1（該 case 宣告 DUT restart／reboot 的除外：`cases.yaml` 的 case 屬性決定），即 DUT 為每 case 全新；(4) 收集所有 `manifest.json.transport.port_id`／daemon socket 路徑寫入 `report_dir/endpoints.json` 供 Task 4 `snapshot_from_endpoints`。`identity`：所有 case `manifest.json.artifacts` 必須一致，取 `cli.sha256`、`daemon.sha256`、`daemon.tree_sha256`、`release_manifest_sha256`、`transport.mode`、`tool.tree_sha256`；Python launcher 亦核對 `daemon.launcher.sha256`，Python package tree 以 R5-F4 實際部署內容量測驗證。`win-wal-av-rotate`、`win-wal-av-unlink`、`win-wal-av-reader-handle` 的 `source_ref` 是計畫文件而非 func-test case／scenario；adapter 保留 unsupported 並回 INFRA_ERROR，不可移除必要案例或合成 PASS，`scripts/stage0/spike3_win_wal.py` 可產生這些 case 的 Windows Python 基線 Spike 3 證據，但不產生 A/B 每側 artifact 身分與 func-test 報告；Task 7B／14B 須明確決定如何處理此跨來源證據與案例歸屬，故 `S3-L15-RELEASE-AB-WINDOWS` 維持 BLOCKED-OWNER。
+- **L2（`l2_regression`）**：從 `m.suite.testbed_template` 產生本側 `inst.root/testbed.yaml`；覆寫 `serialwrap_exe=side.cli_exe`、存在時的 manifest endpoint、展開為實際使用者 HOME 的 `bench_lock_path`、`allow_destructive` 與 `authorized_boards`（來自 manifest 授權；其餘鍵原樣），不改 HOME／USERPROFILE。記錄呼叫使用者 `~/b-log/regression-reports/` 下既有 `tp-*` 清單；`run(["testpilot","run","serialwrap_regression","--testbed",testbed, *case 選擇旗標, *extra_args], env=inst.env, timeout=...)`；結束後找出**新出現且唯一**的 `tp-*` 目錄（0 或 >1 個 → INFRA_ERROR `"testpilot report dir ambiguous"`），整個複製到 `report_dir/testpilot/`。status 依 `report.json` 逐案判定交給 Task 7（rc 只作 INFRA 判斷：非 0 且無 report.json → INFRA_ERROR）；複製後必須核對 `report.json.meta.allow_destructive`／`authorized_boards` 與 manifest 授權完全相同，不符視為 INFRA_ERROR，避免舊安裝的 plugin 忽略隔離 testbed；這兩欄是 P2 plugin 的報告契約，缺欄即 fail closed。`identity`：`report.json.meta.cli_identity`（`resolved`、`sha256`、`pinned`）與 preflight 記錄的 `daemon status.version`。 P2 plugin 將 testbed 全部 `boards` 放入各 case 的 `topology.devices`，目前破壞性案例因此使用完整 topology board 集合作為授權需求；部分授權會記為 SKIP，Task 7 的必要案例比較將回 INCOMPLETE，不能成為 PASS。需要按案例限定板卡時，須另定 case-to-board 契約；本 adapter 保留既有 fail-closed 行為。
+- **L3（`l3_realhw`）**：依 P2 Task 15 README 的固定程序。(1) 長跑前驗證 workload 所需欄位與選取執行時長不低於 frozen minimum，suite timeout 必須涵蓋此時長；candidate 須先找到有效 A 側 `release-gate.json`，否則在啟動 observer／realhw 前回 INFRA_ERROR。(2) 從 `m.suite.realhw_config_template` 產生 `inst.root/realhw-config.json`（覆寫 `serialwrap_exe`、`endpoint=m.endpoint`、`bench_lock_path`）。(3) 監管檢查——`[cli,"supervision-mode"]` stdout 必須為 `on-demand`，且 `[cli,"service","status"]` 回報無已註冊監管；Linux 查 system／user unit files，只把 `enabled`、`enabled-runtime`、`static` 視為已註冊，明確的「System has not been booted with systemd」視為無 supervisor，其餘查詢錯誤或未知狀態 fail closed；Windows 以 `schtasks /Query /FO CSV /NH` 完整查詢並精確過濾。否則回 `HARNESS_FAILURE_RETENTION_UNVERIFIED`。(4) 全部 RPC 類 CLI 呼叫與引擎設定帶明確 `--endpoint m.endpoint`；`spawn([sys.executable,"-m","realhw.acceptance.observer", ...])` 後須在 deadline 內等到完整、有效且含所需 `device_binding` 的 header，Windows 另要求各 board path 非空；observer 提前退出或逾時則 INFRA_ERROR，不執行 pre-handoff／長跑。(5) Windows `winexcl handoff --phase pre` exit 0 才進 realhw；exit 1 留存證據並交 gate 判安全 FAIL，exit 4 或其他異常回 INFRA_ERROR；長跑後執行 post。(6) 執行 `realhw`，停止 observer（terminate→wait 10 s→kill）。(7) WAL 只複製 `raw.wal.ndjson*` 與 `raw.mirror.log*`；輸出目錄位於來源樹內時拒絕。非 longrun tier 省略 observer／gate，但 `realhw/report.json` 缺漏或格式錯誤仍回 INFRA_ERROR。(8) longrun 依 `daemon status.wal_path` 擷取 WAL，執行 gate；exit code 必須與 `release_gate_result` 一致（PASS／NOT_APPLICABLE_BASELINE=0、FAIL=1、INSUFFICIENT_EVIDENCE=4、BLOCKED=5），`NOT_APPLICABLE_BASELINE` 只可由 baseline 側回傳，其餘 status 依 gate verdict 判定。`identity`：`report.json.meta.cli_identity` 與 `release-gate.json.run.{cli_identity,daemon_version}`；保留報告內 `evidence_layer`，Task 6 將 `SuiteRun.identity.evidence_layer` 提升至 `ab-report.json.sides[*].evidence_layer` 供 Task 14B ingest；另記錄 `explicit_endpoint` 與 `supervisor_absent`。
+- `verify_run_identity`：`identity.cli.sha256 != components.cli.sha256` → `"cli sha256 mismatch"`；L1.5 的 daemon launcher SHA 必須等於 `components.daemon.launcher.sha256`（Python 與 Rust 都核對；只有預期 Rust 時另要求 `daemon.implementation=="rust"`）；Python package tree 不取 func-test 的 argv 分類結果，改由 R5-F4 實際部署內容量測核對；L2／L3 `pinned is not True` → `"cli not pinned"`；`release_manifest_sha256`（有記錄時）≠ `side.release_manifest.sha256` → `"release manifest mismatch"`。**實際部署內容（R5-F4）**：`identity.deployed_content` 為 suite 產生端自己的量測（L1.5 取所有 case run 的 `manifest.json.artifacts.deployed_content`、L2／L3 取 `report.json.meta.deployed_content`，adapter 原樣放入 `identity`，L1.5 為各 run 的清單）；任一 start／end 缺漏、`error` 非 None 或 digest 為 None → `"deployed content unmeasured"`；同一 bracket 的 start 與 end（或 L1.5 各 run 之間）`bundle_tree_sha256`／`runtime_tree_sha256` 不同 → `"deployed content changed during suite"`；與 `expected_trees` 不同 → `"deployed tree mismatch"`（L2／L3 的 `activate_argv` 可能把 bundle 安裝到另一個 `versions/<v>/` 目錄再執行，`side.bundle_dir` 的指紋不能代表那份安裝；旁載檔只在這裡現形）。
 
 **Steps:**
 
@@ -1367,26 +1373,32 @@ def run(m, side, inst, *, run, spawn, now) -> SuiteRun
 
 | 測試名 | 斷言 |
 |---|---|
-| `test_l15_passes_artifact_env_and_report_dir` | functest 呼叫的 env 含兩側各自的 `SERIALWRAP_CLI_EXE`／`SERIALWRAP_DAEMON_EXE`，argv 含 `--report-dir <inst.report_dir>` |
-| `test_l15_identity_mismatch_detected` | 替身 functest 一律寫 Python 基線身分（模擬兩側都跑到預設 Python）→ B 側 `verify_run_identity` 含 `"daemon implementation mismatch"` |
+| `test_l15_passes_artifact_env_and_report_dir` | 每側 runner 只呼叫一次；argv 含該側所有 `--case`／`--scenario-case` 選取旗標、`--report-dir <inst.report_dir>`，env 含兩側各自的 `SERIALWRAP_CLI_EXE`／`SERIALWRAP_DAEMON_EXE` |
+| `test_l15_docker_passes_digest_pinned_image`、`test_l15_windows_com_pair_uses_manifest_values` | Docker argv 帶 digest-pinned `--dut-image`；Windows `--daemon-com`／`--bridge-com` 取 manifest mapping 對應值 |
+| `test_l15_unsupported_case_source_is_infra` | 計畫文件來源的必要 Windows WAL 案例保留在 required set；adapter 不合成 func-test 結果並回 INFRA_ERROR |
+| `test_l15_identity_mismatch_detected` | 替身寫出預設 Python daemon 身分 → B 側 `verify_run_identity` 含 `"daemon sha256 mismatch"` |
 | `test_l15_unclean_bridge_is_infra` | 某 case `bridge-manifest.json.closed_cleanly=false` → `status == "INFRA_ERROR"` |
 | `test_l15_reused_dut_is_infra` | 某 case `wire.ndjson` 出現 `dut_generation: 2` 且該 case 未宣告 restart → INFRA_ERROR |
 | `test_l15_leaked_daemon_is_infra` | FakeProbe `by_exe` 回 `(91,)` → INFRA_ERROR、notes 含 `leaked daemon` |
 | `test_l15_writes_endpoints_json` | `report_dir/endpoints.json` 存在且列出 case 的 socket 路徑 |
 | `test_l2_copies_new_tp_dir` | 替身在 `regression-reports/` 新建 `tp-1`（既有 `tp-0`）→ `report_dir/testpilot/report.json` 存在，且 `tp-0` 未被複製 |
 | `test_l2_ambiguous_tp_dir` | 新建兩個 `tp-*` → INFRA_ERROR `"testpilot report dir ambiguous"` |
-| `test_l2_testbed_pins_side_exe` | 產生的 `testbed.yaml` 的 `serialwrap_exe == str(side.cli_exe)`，其餘鍵與模板相同 |
-| `test_l3_runs_observer_engine_wal_gate_in_order` | 呼叫序：`supervision-mode` → `service status` → observer spawn → `realhw` → observer terminate → gate；B 側 gate argv 含 `--baseline-gate` 指向 A 側檔案；`m.platform=="linux"` 時 argv 皆不含 `winexcl`／`--excl-dir`／`--excl-evidence` |
+| `test_l2_testbed_pins_side_exe` | 產生的 `testbed.yaml` 只改允許的 artifact／endpoint／bench lock／授權鍵，其餘鍵與模板相同 |
+| `test_l2_preserves_shared_home_and_expands_bench_lock`、`test_l2_stale_plugin_authorization_is_infra` | 不改 HOME／USERPROFILE，鎖定實際呼叫者共用 bench lock；舊 plugin 未回報或回報不符授權時 INFRA_ERROR |
+| `test_l3_runs_observer_engine_wal_gate_in_order` | 呼叫序與 baseline gate 如左；L3 亦須確認 workload、執行時長、observer header、候選 baseline gate 均在長跑前有效；Linux argv 不含 Windows 獨占參數 |
 | `test_l3_windows_exclusive_evidence_steps`（R1-F7） | `m.platform=="windows"`：呼叫序為 observer spawn（argv 含 `--excl-dir <report>/excl` 與 `--excl-probe-interval-s 300`）→ `winexcl handoff --phase pre` → `realhw` → `winexcl handoff --phase post` → observer terminate → gate（argv 含 `--excl-evidence <report>/excl`）；pre exit 4 → 結果 `INFRA_ERROR` 且 `realhw` 未被呼叫；pre exit 1 → `realhw` 未被呼叫、gate 仍被呼叫 |
 | `test_l3_explicit_endpoint_everywhere` | 所有 `daemon`／`session`／`cmd` 類 `cli` 呼叫 argv 含 `--endpoint m.endpoint`；`realhw-config.json.endpoint == m.endpoint` |
 | `test_l3_supervisor_present_refused` | `service status` 回已註冊 unit → `HARNESS_FAILURE_RETENTION_UNVERIFIED`，不執行 realhw |
+| `test_l3_non_on_demand_supervision_mode_is_refused`、`test_l3_system_without_systemd_still_checks_user_units` | 非 on-demand 或 user scope 有已註冊 unit 時不執行 realhw；system scope 無 systemd 不得略過 user scope 查詢 |
+| `test_l3_non_longrun_without_report_is_infra`、`test_l3_gate_exit_code_must_match_report_verdict` | 非長跑缺少有效 `realhw/report.json`，或 gate exit code 與 JSON verdict 不一致，均為 INFRA_ERROR |
+| `test_l3_windows_handoff_waits_for_delayed_observer_header`、`test_l3_observer_exit_before_header_is_infra` | Windows pre-handoff 前須等到完整有效 header；observer 提前退出時不執行 handoff 或 realhw |
 | `test_l3_unpinned_cli_mismatch` | `report.json.meta.cli_identity.pinned=false` → `verify_run_identity` 含 `"cli not pinned"` |
 | `test_suite_deployed_tree_sideload_detected`（R5-F4，failing-first） | `b = make_bundle(...)`、`expected = {"bundle_tree_sha256": ab_manifest.bundle_tree_sha256(b), "runtime_tree_sha256": ab_manifest.runtime_tree_sha256(b)}`；替身 activate 把 b 複製到 `inst.root/"versions"/"v"` 並加寫 `bin/version.dll`（manifest、`bin/serialwrap` 位元組不變），替身 realhw 以 P2 `realhw.deployed_content.measure(<該安裝>/bin/serialwrap)` 寫 `meta.deployed_content` → `verify_run_identity(m, side, suite, expected_trees=expected) == ["deployed tree mismatch"]`（`cli sha256`／`release manifest` 皆相符，不產生其他字串）；同法對 L1.5（`manifest.json.artifacts.deployed_content`）與 L2（TestPilot `report.json.meta.deployed_content`）各一次得相同結果；未加旁載檔 → `[]` |
 | `test_suite_deployed_content_missing_or_unstable`（R5-F4） | `meta.deployed_content` 鍵刪除、`start.error=="unresolved"`、或 `end` 為 None → 含 `"deployed content unmeasured"`；start 與 end 的 `bundle_tree_sha256` 不同（suite 期間有人加檔）→ 含 `"deployed content changed during suite"`；L1.5 兩個 case run 的 tree 不同 → 同一字串；`verify_run_identity(m, side, suite)` 未傳 `expected_trees` → `TypeError` |
 | `test_l3_p0p1_tier_skips_gate` | `tier="p0,p1,remote"` → 無 observer、無 gate 呼叫 |
 
-- [ ] **Step 2：Run** `python3 -m pytest -q tests/test_stage3_suites.py` → Expected: FAIL（`ImportError`）。
-- [ ] **Step 3：實作**（luna）依行為；`case 選擇旗標` 依各引擎既有參數（func-test `--case`、TestPilot 的 case filter、realhw `--case`）由 `m.case_ids` 產生，引擎無單案選擇時改以完整集合執行並在 notes 記錄。依 P0 T14 在測試檔頭寫 `pytestmark`。
+- [ ] **Step 2：Run** `python3 -m pytest -q tests/test_stage3_suites.py` 與 func-test selector 測試 → Expected: FAIL（重複 runner 呼叫、選取 CLI、身分、HOME／COM mapping 或 L3 證據檢查斷言失敗）
+- [ ] **Step 3：實作**（luna）依行為；L1.5 func-test `--case`／`--scenario-case` 可在同次 invocation 重複選取；TestPilot／realhw 依 manifest 欄位產生 argv，無單案選擇時使用完整集合並在 notes 記錄。依 P0 T14 在兩個測試檔頭寫 `pytestmark`。
 - [ ] **Step 4：Run** 同上 → Expected: PASS。
 - [ ] **Step 5：commit** `feat(stage3): 新增 L1.5／L2／L3 suite adapter 與實際受測身分核對`（files 含 `tests/fakes_suites.py`）。
 
@@ -1459,12 +1471,12 @@ def run_ab(manifest_path: Path, *, out_dir: Path, repo_root: Path, run: Runner =
    5. 無 abort 時 `suite = suites.run_side(m, side, inst, ...)`（L3 的監管檢查在 adapter 內，失敗回 `HARNESS_FAILURE_RETENTION_UNVERIFIED`）；`identity_violations = suites.verify_run_identity(m, side, suite, expected_trees=trees[label])`，非空 → `abort_code = "HARNESS_ARTIFACT_MISMATCH"`（兩側都跑到預設 Python 基線屬此類；suite 實際執行的安裝含旁載檔而與第 2 步凍結 tree 不同亦屬此類，R5-F4）。
    6. 不論前面成敗（`try/finally`）：`l1.5` → `pre = snapshot_from_endpoints(inst.report_dir/"endpoints.json", m.release, match_paths=…)`（檔案不存在時只用 spec，並在 notes 記 `"endpoints.json missing"`）；`l2`／`l3` → `pre = capture_pre_stop(..., endpoint=m.endpoint)` 後執行 `deactivate_argv`；`rel = verify_released(pre, m.release, ...)`；`cleanup = dut_state.cleanup_instance(inst)`。
    7. `rel.released is False` 或 `cleanup` 非空 → `abort_code = "HARNESS_RELEASE_UNCONFIRMED"`（若已有 abort_code，保留原碼並在 notes 加 `"release unconfirmed"`）。
-   8. 有 `abort_code` → **不啟動下一側**、不跑比較；但已取得的產品結果不得遺失：若本輪任一已完成側為 candidate 且 `suite.status == "FAIL"`，或該側自身證據已有安全違規（L1.5 任一 `comparison.json.invariants[*].result == "FAIL"`；L3 `release-gate.json` 的 safety check FAIL），最終 verdict 為 `FAIL`、`reason_code` 為該 abort 碼、notes 加 `"aborted after product failure"`；否則 verdict `INFRA_ERROR`。
+   8. 有 `abort_code` → **不啟動下一側**、不跑比較；但已取得的產品結果不得遺失：若本輪任一已完成側為 candidate 且 `suite.status == "FAIL"`，或該側自身證據已有安全違規（L1.5 任一 `comparison.json.invariants[*].verdict == "FAIL"`，可直接呼叫 `ab_diff.safety_tokens(report_dir, label)`；L3 `release-gate.json` 的 safety check FAIL），最終 verdict 為 `FAIL`、`reason_code` 為該 abort 碼、notes 加 `"aborted after product failure"`；否則 verdict `INFRA_ERROR`。
    9. `KeyboardInterrupt`：仍完成第 6 步的停止與釋放驗證，verdict `ABORTED`、`HARNESS_ABORTED`（若已有第 8 步的產品 FAIL，verdict 仍為 `FAIL`），然後重新拋出。
 6. 每輪兩側完成後產生差分：`l1.5` → `ab_diff.diff_l15(a.report_dir, b.report_dir, registered=…, required_case_ids=…)`（Task 7B）；`l2` → `ab_verdict.compare_l2_reports(a_report, b_report, required_case_ids=…, cases=…, registered_case_changes=…, now=now())`（`a_report`／`b_report` 為各側 `report_dir/testpilot/report.json`）；`l3` → `ab_verdict.compare_l3(a.report_dir/"release-gate.json", b.report_dir/"release-gate.json")`。差分工具丟 `HarnessError` → `INFRA_ERROR`、`HARNESS_COMPARATOR_ERROR`。
 7. `round.verdict, reason, notes = ab_verdict.combine(m.layer, a_status=a.suite.status, b_status=b.suite.status, diff=<第 6 步輸出>, registered=load_registered_changes(repo_root / m.allowed_differences.path))`；`required_case_ids, cases = ab_manifest.required_cases(m, repo_root=repo_root)`；`registered_case_changes` 為 `behavior_changes.yaml` 中 `scope=="both"` 條目的 `case_ids` 展開（case_id → change_id）。
 8. 最終 verdict：所有輪 PASS 才 PASS；否則依 `VERDICT_PRECEDENCE` 取最嚴重者（FAIL 不被 INFRA 遮蔽）。
-9. 寫 `ab-report.json`（`dumps_report`），鍵：`ab_manifest_sha256`、`run_id`、`layer`、`platform`、`stage`、`contract_revision`、`case_list_sha256`、`case_lock_sha256`、`required_case_set`、`case_ids`、`tools`（每項 path 與 sha256／tree_sha256）、`tool_revision`（`git rev-parse HEAD`）、`tools_stage3_tree_sha256`、`dut`（kind、transport、com_pair、image、image_digest、boards）、`authorization`、`endpoint`、`host`（`platform.platform()`、`platform.machine()`、hostname 的 sha256 前 16 hex）、`sides`（每側：`label`、`role`、`release_manifest_sha256`（artifact 身分）、`runtime_digest`、`bundle_tree_sha256`、`runtime_tree_sha256`（第 2 步記錄、第 5.1 步與釋放後皆已核對不變的實際受測內容指紋，R3-F2；Task 14B ingest 以它核對 target）、`cli_exe` realpath、`cli_sha256`（實算）、`daemon_exe` realpath、`daemon_sha256`（實算）、`bundle_version`、`daemon_status_version`（suite 期間觀測）、`suite.status`、`suite.rc`、`suite.identity`、`identity_violations`、`clean_violations`、`release.released`、`release.checks`、`cleanup_violations`）、`rounds`、`verdict`、`reason_code`、`started_at`、`finished_at`。鍵名一律 snake_case，報告與測試使用同一鍵 `release_manifest_sha256`。
+9. 寫 `ab-report.json`（`dumps_report`），鍵：`ab_manifest_sha256`、`run_id`、`layer`、`platform`、`stage`、`contract_revision`、`case_list_sha256`、`case_lock_sha256`、`required_case_set`、`case_ids`、`tools`（每項 path 與 sha256／tree_sha256）、`tool_revision`（`git rev-parse HEAD`）、`tools_stage3_tree_sha256`、`dut`（kind、transport、com_pair、image、image_digest、boards）、`authorization`、`endpoint`、`host`（`platform.platform()`、`platform.machine()`、hostname 的 sha256 前 16 hex）、`sides`（每側：`label`、`role`、`release_manifest_sha256`（artifact 身分）、`runtime_digest`、`bundle_tree_sha256`、`runtime_tree_sha256`（第 2 步記錄、第 5.1 步與釋放後皆已核對不變的實際受測內容指紋，R3-F2；Task 14B ingest 以它核對 target）、`cli_exe` realpath、`cli_sha256`（實算）、`daemon_exe` realpath、`daemon_sha256`（實算）、`bundle_version`、`daemon_status_version`（suite 期間觀測）、`suite.status`、`suite.rc`、`suite.identity`、`evidence_layer`（若 `suite.identity.evidence_layer` 存在則原樣提升，供 Task 14B ingest 判斷 L1.5 Docker 證據層級）、`identity_violations`、`clean_violations`、`release.released`、`release.checks`、`cleanup_violations`）、`rounds`、`verdict`、`reason_code`、`started_at`、`finished_at`。鍵名一律 snake_case，報告與測試使用同一鍵 `release_manifest_sha256`。
 
 **Steps:**
 
@@ -1600,7 +1612,7 @@ def diff_l15(a_dir: Path, b_dir: Path, *, registered: Mapping[str, str], case_ch
 
 規則：
 - **完整性**（每側獨立）：每個 `required_case_ids` 恰出現（至少一個 run_index，取全部 repeat）；每個 run 的 `comparison.json.verdict != "INSUFFICIENT_EVIDENCE"`、`bridge-manifest.json.closed_cleanly is True`、`manifest.json` 存在；任一不符 → 該側 `integrity=false` 並列入 `integrity_problems`。
-- **安全**：任一側任一 run 的 `comparison.json.invariants[*].result == "FAIL"` → `safety_violations` 加 `"<A|B>:<case>:<invariant_id>"`（Python 與 Rust 同時違反仍是違反，§11.3）。
+- **安全**：任一側任一 run 的 `comparison.json.invariants[*].verdict == "FAIL"`（comparison.v1 欄位為 `verdict`，見 `tests/acceptance/comparison.schema.json`） → `safety_violations` 加 `"<A|B>:<case>:<invariant_id>"`（Python 與 Rust 同時違反仍是違反，§11.3）。
 - **差異**：同一 case 兩側 `comparison.json.verdict` 不同 → `{"kind":"verdict","path":"comparison.verdict"}`；`cli.ndjson` 中第 i 次 CLI 呼叫的 `rc` 不同 → `kind:"rc"`、stdout 解析成 JSON 後經 `normalize_response` 仍不同 → `kind:"value"`、`path` 為第一個不同的 JSON 點路徑（`call[<i>].<dotted>`）；`registered_change` 為 `case_changes.get(case)`（`behavior_changes.yaml` 的 `case_ids` 反查）。比較只用 `contracts/ab_normalization.yaml` 的規則，不得另寫寬鬆比對（arch §9.3）。
 - `ok = integrity.a and integrity.b and not safety_violations and not differences`。
 
@@ -1677,6 +1689,10 @@ def compare_l3(a_gate_path: Path, b_gate_path: Path) -> dict
 | `layer=="l3"` 且 `b_release_gate_result == "INSUFFICIENT_EVIDENCE"` 或 `b_baseline_compatible is not True` | INFRA_ERROR | `HARNESS_SUITE_INFRA_ERROR` |
 | `layer=="l3"` 且 `b_release_gate_result != "PASS"` | FAIL | None |
 | 其他 | PASS | None |
+
+實作註記（P9-T7 雙審後，刻意偏離列序）：
+- `layer=="l2"` 一列刻意先於「`diff.integrity` 為 False」列判定。`compare_l2_reports` 在 INCOMPLETE 時必同時標記 integrity=false；若依列序先判 integrity，l2 INCOMPLETE 的 `HARNESS_SUITE_INFRA_ERROR` 對真實輸出永不生效（第 3 列與第 4 列互相矛盾）。
+- L2 安全不變量：案例 `invariants` 非空者，B 側 FAIL／XFAIL 產生 `B:<case>:<invariant>` 列入 `safety_violations`，由第一列直接判 FAIL（即使其他必要案例 INCOMPLETE）；此類案例不得由哨兵豁免（§11.3、§14.2）。
 
 `compare_l2_reports` 規則（先完整性，後判定）：
 1. 每側：`results` 為空、`id` 重複、`verdict` 不在 `L2_VERDICTS`、`required_case_ids` 中有缺項、必要案例為 `SKIP` 或 `ERROR` → 列入對應欄位且該側 `integrity=false`、verdict `INCOMPLETE`（§11.4：必要能力缺失、案例未完整執行不得 PASS）。
@@ -1998,10 +2014,12 @@ def deployed_tree_digests(bundle_dir: Path) -> tuple[str, str]
     # symlink（檔案或目錄）或其他非一般檔 → HarnessError("HARNESS_ARTIFACT_MISMATCH", "non-regular file: <relpath>")。
     # 每次快照都重算全樹，不得以 (size, mtime) 快取略過重新雜湊（旁載檔可保留 mtime）；Stage 3 bundle 不含 Python runtime（Task 16 build plan），成本有界
 def resolve_artifact(cli_exe: Path, *, daemon_pid: int | None, daemon_version: str | None,
-                     daemon_sha: Callable[[int], str | None] = daemon_exe_sha256
+                     daemon_sha: Callable[[int], str | None] = daemon_exe_sha256,
+                     layout: str | None = None
                      ) -> tuple[str | None, dict | None, str, tuple[str, str] | None]
     # 位置：Linux realpath(cli_exe).parent.parent / "release-manifest.json"；Windows cli_exe.parent / "current-release.json" 的 "dir" / "release-manifest.json"；
     # 該 manifest 所在目錄即「實際部署 bundle 目錄」（arch §10.2 versions/<v>/）
+    # Windows 穩定入口 cli_exe.parent 僅允許 serialwrap.exe、serialwrapd.exe、current-release.json 三個一般檔；缺檔、非一般檔或有其他項目皆回 tree_invalid，避免漏看 versions/<v>/ 以外可載入的 side-load 檔（R4-F1）。
     # 找不到 → (None, None, "unresolved", None)；sha256(realpath(cli_exe)) != components.cli.sha256 → (None, m, "cli_mismatch", None)；
     # daemon_version != bundle_version → (None, m, "version_mismatch", None)（arch §10.3：配對不符只警告不阻擋 RPC，因此新 CLI 可能連到舊 daemon）；
     # daemon_sha(pid) != components.daemon.launcher.sha256（Python 基線無 launcher 時比 runtime.sha256）或為 None → (None, m, "daemon_mismatch", None)；
@@ -2014,16 +2032,17 @@ def collect_once(cli_exe: Path, ledger_dir: Path, policy: CanaryPolicy, *, platf
                  now: Callable[[], str] = jsonio.utc_now_iso) -> dict
     # policy.status != "frozen" → HarnessError("HARNESS_CANARY_POLICY_NOT_FROZEN")（draft policy 不得開始收集）；
     # 附加 snapshot、新 submit、submit_result、wal_signal、harvest_anomaly 紀錄到 ledger_dir/"ledger.ndjson"；cursor 存 ledger_dir/"cursor.json"；
-    # 已見 cmd_id 集合存 ledger_dir/"seen.txt"（每行一個，附加寫入）；待查結果存 ledger_dir/"pending_results.json"；
+    # 已見 cmd_id 集合存 ledger_dir/"seen.txt"（每行一個，附加寫入）；待查結果存 ledger_dir/"pending_results.json"；輪詢游標與本輪已查 cmd_id 存 ledger_dir/"pending_poll_state.json"；host_id/platform 快取存 ledger_dir/"collector_context.json"；
+    # 收割 submit／wal_signal 時只接受 wall_ts >= policy.frozen_at；collector 自身讀帳本會略過壞行並記一筆 malformed_ledger_line:<行號>，供 incidents 擋住不完整證據；tally 與人工 incident 讀取仍嚴格拒絕壞帳本；
     # 回 {"snapshot_ok":bool,"new_submits":int,"results":int,"signals":int,"anomalies":int}
 def drain_results_once(cli_exe: Path, ledger_dir: Path, policy: CanaryPolicy, *, run: Runner = run_cmd,
                        now: Callable[[], str] = jsonio.utc_now_iso) -> int
-    # 只做結果收斂（不取 snapshot、不 harvest）：依 first_seen 先後對至多 result_poll_max_per_cycle 個 pending 查 `cmd status`；回剩餘 pending 數
+    # 只讀 pending_results.json 與 collector_context.json（不重讀完整 ledger、不取 snapshot、不 harvest）：依 first_seen 循環輪詢至多 result_poll_max_per_cycle 個 pending 查 `cmd status`，以 pending_poll_state.json 保存游標；回剩餘 pending 數
 def collect_loop(cli_exe: Path, ledger_dir: Path, policy: CanaryPolicy, *, platform: str, stop: threading.Event,
-                 run: Runner = run_cmd, now: Callable[[], str] = jsonio.utc_now_iso, sleep: Callable[[float], None] = time.sleep) -> None
-    # 每 collector_interval_s 一次 collect_once；pending 仍 > 0 時，在下一次 collect 前連續呼叫 drain_results_once（每次之間 sleep 1 s），
-    # 直到 pending 清空或下一次 collect 到期（產品 history 只留 512 筆，backlog 不得累積到被淘汰）
-def collector_revision() -> str      # 由 zipapp 執行時為 .pyz 檔 sha256；repo 內執行為 `git rev-parse HEAD`（失敗 "unknown"）
+                 run: Runner = run_cmd, now: Callable[[], str] = jsonio.utc_now_iso, sleep: Callable[[float], None] = time.sleep,
+                 monotonic: Callable[[], float] = time.monotonic) -> None
+    # 以 monotonic 計 collector_interval_s；每次 collect 後繼續呼叫 drain_results_once，最多每秒一批；每筆 pending 在該 collect 間隔最多查一次，全部查過後等下個週期，避免永久非終態項目重複佔用批次與 CLI 啟動；下個週期依游標公平輪替。
+def collector_revision() -> str      # CLI main 啟動時計算並程序內快取；由 zipapp 執行時為 .pyz 檔 sha256，repo 內執行為 `git rev-parse HEAD`（失敗 "unknown"）
 def write_policy_ref(ledger_dir: Path, policy: CanaryPolicy, *, now: Callable[[], str] = jsonio.utc_now_iso) -> None
     # type="policy_ref" 紀錄（policy_sha256、status、frozen_at、decision_ref、collector_revision）；collect_once 在 policy sha 或 revision 與帳本最後一筆 policy_ref 不同時自動寫入
 
@@ -2037,13 +2056,15 @@ def pack(out: Path) -> Path    # zipapp：tools/__init__.py＋tools/stage3/ 的�
 
 `python3 -m tools.stage3 canary …`（Task 17）與 zipapp 共用 `collector_main` 的同一組函式。
 
-結果收斂：每個新 submit 加入 `pending_results.json`（`{cmd_id: first_seen_wall}`）；每次 `collect_once` 依 first_seen 先後對至多 `policy.result_poll_max_per_cycle` 個呼叫 `[cli,"cmd","status","--cmd-id",id]`（timeout 10 s、不帶 `--retries`）；`command.status ∈ TERMINAL_RESULTS` → 寫 `submit_result` 並移出 pending；回應為 not-found 類錯誤，或 first_seen 已超過 24 h 仍非終態 → 寫 `status:"unknown"` 並移出。`require_terminal_result` 為 true 時只有終態結果的 submit 計入配額（Task 12），`unknown` 不計但保留紀錄（§12.2「每筆累計須關聯結果」）。
+結果收斂：每個新 submit 加入 `pending_results.json`（`{cmd_id: first_seen_wall}`）；每次 `collect_once` 依 first_seen 輪詢至多 `policy.result_poll_max_per_cycle` 個 `[cli,"cmd","status","--cmd-id",id]`（timeout 10 s、不帶 `--retries`），`drain_results_once` 用持久游標公平輪詢下一批；只將精確 `CMD_NOT_FOUND` 視為 history 淘汰。`command.status ∈ TERMINAL_RESULTS` → 寫 `submit_result` 並移出 pending；`canceled`／`interactive` → 寫 `status:"unknown"`、以其原狀態作 `error_code` 並移出；其他非終態、查詢失敗或逾時在 first_seen 超過 24 h 後寫 `status:"unknown"`、`reason:"STALE_NON_TERMINAL"` 並移出。`require_terminal_result` 為 true 時只有終態結果的 submit 計入配額（Task 12），`unknown` 不計但保留紀錄（§12.2「每筆累計須關聯結果」）。
 
 **history 淘汰約束**：daemon 只保留 `CMD_HISTORY_MAX=512` 筆命令紀錄，並依 `done_at` 淘汰最舊的已完成者（`sw_core/arbiter.py:233-251`；Rust 照搬），淘汰後查詢回 `CMD_NOT_FOUND`。因此結果必須在執行期持續收斂，不得累積 backlog 後才補查。
 
 - `collect_once` 本身仍受 `result_poll_max_per_cycle` 限制（`test_result_poll_rate_limited` 不變）。
-- `collect_loop` 在兩次 collect 之間以 `drain_results_once` 連續清 backlog。
+- `collect_loop` 在兩次 collect 之間以 `drain_results_once` 循環檢查尚未輪詢的 pending；整批查過後等下一 collect，避免重複 CLI spawn。
 - not-found 寫 `submit_result{status:"unknown", reason:"CMD_NOT_FOUND"}`，另寫一筆 `harvest_anomaly{kind:"result_evicted", cmd_id}`。24 h 逾時寫 `reason:"STALE_NON_TERMINAL"`。
+- `canceled` 與 `interactive` 不屬終態集合；為避免長期 pending，記錄 `submit_result{status:"unknown", error_code:"CANCELED"|"INTERACTIVE"}` 後移出 pending。命令查詢例外仍記錄 `cmd_status_error:<例外類型>`，並照 24 h 規則收斂。
+- 舊 WAL 中 `wall_ts < policy.frozen_at` 的 submit 與 signal 不匯入計數帳本；首輪仍推進 WAL cursor。
 - Task 12 `tally` 把 `reason=="CMD_NOT_FOUND"` 的筆數另列 `submits_result_evicted`，它是 `submits_unknown_result` 的子集。這些筆數不計入 `submits`，也**不得**視為完成。
 - 不得調大產品 history 來遷就 collector。
 
@@ -2079,10 +2100,16 @@ def test_collector_never_calls_lease_touching_commands(tmp_path):
 | `test_collect_twice_no_duplicate_submit` | 連跑兩次 `collect_once` → 第二次 `new_submits == 0`；`ledger.ndjson` 中 `type=="submit"` 只有 1 筆 |
 | `test_submit_result_recorded` | `cmd status` 回 `done` → 一筆 `submit_result{status:"done"}`；回 not-found → `status:"unknown"` |
 | `test_result_poll_rate_limited` | 一次 120 個新 submit、`result_poll_max_per_cycle=50` → 該次只 50 個 `cmd status` 呼叫 |
+| `test_pending_poll_rotates_past_old_nonterminal_commands`、`test_pending_poll_cursor_survives_collect_state_reset` | 舊非終態命令不阻塞較新結果；跨 drain 與 collect 重設後游標仍公平輪替 |
+| `test_canceled_and_interactive_results_do_not_stay_pending` | `canceled`／`interactive` 各寫 unknown 結果並移出 pending |
+| `test_expired_pending_is_removed_after_cli_exception` | CLI 查詢例外仍記 anomaly，逾 24 h 的項目寫 `STALE_NON_TERMINAL` 並移出 pending |
+| `test_prepfreeze_wal_submits_are_not_counted` | frozen_at 前的 WAL submit 不計入；凍結後 submit 正常匯入 |
+| `test_torn_ledger_line_does_not_stop_collector` | collector 略過壞行、續收集並記錄供 incidents 阻擋的完整性 anomaly |
 | `test_canary_results_survive_history_eviction` | 注入 `run` 為測試端 fake `EvictingCmdStore(history_max=512)`，行為與 P2 Task 14 同名 fake 相同：照 `sw_core/arbiter.py:233-251`，依 `done_at` 淘汰最舊已完成者，淘汰後回 `CMD_NOT_FOUND`。WAL 每個 collect 週期新增 300 個相異 agent `cmd_id`，這些命令於 store 中立即 `done`；每週期之間 store 另完成 100 筆非 canary 命令。`result_poll_max_per_cycle=50`、`collector_interval_s=30`；`sleep` 以假時鐘推進。跑 4 個週期（共 1,200 筆 canary submit），每週期之間依 `collect_loop` 規則呼叫 `drain_results_once`。斷言：`store.evicted_count >= 1600 - 512`；1,200 筆皆有 `submit_result{status:"done"}`；`reason=="CMD_NOT_FOUND"` 的紀錄 0 筆；每週期結束時 `pending_results.json` 為空。對照組：同負載但只呼叫 `collect_once`、不 drain → 出現 `reason:"CMD_NOT_FOUND"` 的 `unknown`，且每筆都有對應的 `harvest_anomaly{kind:"result_evicted"}`；Task 12 `tally` 將這些筆數計入 `submits_result_evicted`，不計入 `submits` |
 | `test_daemon_down_snapshot_recorded` | `daemon status` rc=2 → snapshot `daemon_ok is False`、`error` 非空、不呼叫 harvest（ledger 無 submit） |
 | `test_resolve_artifact_linux_symlink_verified` | `make_bundle` 後建立 `~/.local/bin/serialwrap` symlink 指向 bundle `bin/serialwrap`；`daemon_sha` 回 launcher sha、version 相符 → `(sha256_file(bundle/"release-manifest.json"), m, "verified", (ab_manifest.bundle_tree_sha256(bundle), ab_manifest.runtime_tree_sha256(bundle)))` |
 | `test_resolve_artifact_windows_current_release` | 模擬 `bin/current-release.json` `{"bundle_version":"0.9.0","dir":"<bundle>"}`（純函式，`layout="windows"`）→ 同上 |
+| `test_windows_entry_directory_rejects_sideloaded_files` | Windows 穩定 `bin` 只含兩個 exe 與 `current-release.json` 時 verified；加入 `version.dll` → `tree_invalid` |
 | `test_deployed_tree_matches_task3_algorithm`（R4-F1） | `make_bundle(tmp/"b")` 後另放 `assets/x.bin`、`py/__pycache__/m.cpython-312.pyc` → `canary_collect.deployed_tree_digests(b) == (ab_manifest.bundle_tree_sha256(b), ab_manifest.runtime_tree_sha256(b))`（兩實作獨立、結果逐字相同）；只改根目錄 `SHA256SUMS` 一個位元組 → 第 0 項改變、第 1 項不變 |
 | `test_sideloaded_install_same_manifest_changes_snapshot_tree`（R4-F1，failing-first） | `b = make_bundle(...)`，記 `t0 = deployed_tree_digests(b)`；於 `b/"bin"/"version.dll"` 寫入任意位元組（manifest、`bin/serialwrap`、`bin/serialwrapd` 皆不動）後 `resolve_artifact` → `artifact_check == "verified"`、`artifact_id == sha256_file(b/"release-manifest.json")`（與旁載前相同），但回傳 tree `!= t0` 且 `== (ab_manifest.bundle_tree_sha256(b), ab_manifest.runtime_tree_sha256(b))`；`take_snapshot` 寫入帳本的 snapshot 紀錄 `bundle_tree_sha256`／`runtime_tree_sha256` 等於該新值（證明 collector 量測的是實際部署內容，而非 manifest 宣告） |
 | `test_deployed_tree_rehashed_each_snapshot`（R4-F1） | 連續兩次 `take_snapshot` 之間以 `os.utime` 保留原 mtime 的方式改寫 `bin/version.dll` 內容 → 兩筆 snapshot 的 `bundle_tree_sha256` 不同（不得以 size／mtime 快取） |
@@ -2094,6 +2121,8 @@ def test_collector_never_calls_lease_touching_commands(tmp_path):
 | `test_host_id_stable` | 連續兩次相同、長度 16 |
 | `test_policy_ref_written_with_revision` | 第一次 collect 後帳本第一筆為 `policy_ref`，`policy_sha256 == pol.sha256`、`collector_revision` 非空；policy 不變再 collect 不重寫 |
 | `test_pack_collector_runs_outside_repo` | `pack(tmp/"sw-canary.pyz")`；以 `cwd=tmp_path/"elsewhere"` 執行 `[sys.executable, pyz, "collect", "--help"]` rc 0；再執行 `collect --once --policy <draft policy> …` → rc 2 且 stdout JSON `reason_code == "HARNESS_CANARY_POLICY_NOT_FROZEN"`（證明 zip 內原因碼登錄表可讀）；zip 內不含 `ab_runner.py`、不含任何 `sw_core` 路徑 |
+| `test_pack_collector_uses_reproducible_zip_metadata`、`test_collector_revision_hash_is_computed_once_per_process` | 同來源連續封裝位元組相同且 ZIP 時間／權限固定；revision 每個程序只計算一次 |
+| `test_cli_value_and_file_errors_are_json`、`test_cli_output_uses_utf8_with_cp1252_console` | 無效值／檔案錯誤以 JSON exit 2 回報；重導向至舊編碼時仍輸出 UTF-8 |
 | `test_collector_modules_stdlib_only` | 以 AST 掃 `COLLECTOR_MODULES` 的 import，頂層模組名全屬 `sys.stdlib_module_names` 或 `tools` |
 
 `tests/test_stage3_canary_collect_windows.py`（`pytestmark = [windows_native, memory_only]`）：`test_boot_id_from_kernel_boot_event`（回傳非 None，且連續兩次相同）、`test_boot_id_not_tick_derived`（monkeypatch `time.time` 前進 0.6 s → 值不變）、`test_daemon_exe_sha256_of_child`（子程序 python.exe 的 sha 等於 `sys.executable` 的 sha）、`test_host_id_reads_machine_guid`。
@@ -2346,7 +2375,7 @@ def current_incidents(records: Sequence[dict], detected: Sequence[Incident]) -> 
 | `stuck_attached` | 同 com、同 daemon pid，連續 `canary_classify.steady(sess)` 為 false 的快照（排除 state `RELEASED`、`FLASHING`、`DETACHED`；passthrough／`command_capable=false` 的 ATTACHED 已由 `steady` 視為穩態；passthrough 30 s 安靜後轉 READY（SC-35）同為穩態）的 `last_t - first_t ≥ stuck_incident_s` | com＋段起點 |
 | `wal_unhealthy` | `wal_healthy is False` 段的第一個快照 | 段起點 |
 | `wal_loss` | `wal_loss` 或 `wal_recreated` 訊號（Task 8 已保證同一筆 META 只出一個訊號） | `f"{kind}:{seq}:{wall_ts}"` |
-| `harvest_integrity` | `harvest_anomaly` 紀錄中 `malformed_line`、`crc_mismatch`、`seq_regress`、`truncated`、`replaced`、`vanished` 任一（擷取異常是證據完整性問題，不可只記錄後忽略） | anomaly `detail` |
+| `harvest_integrity` | `harvest_anomaly` 紀錄中 `malformed_line`、`crc_mismatch`、`seq_regress`、`truncated`、`replaced`、`vanished`、`malformed_ledger_line`、`wal_path_missing`、`harvest_error`、`collector_exception` 任一（收割或帳本擷取失敗是證據完整性問題，不可只記錄後忽略）；單筆 cmd status 的暫時性 `cmd_status_error` 不單獨開事故 | anomaly `detail` |
 | `multi_open` | `multi_open is True` 段的第一個快照 | 段起點 |
 | `collector_gap` | 同 boot 相鄰快照間隔 > `gap_incident_s` | gap 起點 |
 | `safety_violation`（auto） | (a) `unauthorized_tx` 訊號；(b) `resend_suspect` 訊號，且前次與本次之間該 com 有任一快照 state 為 `RECOVERING`／`RELEASED`／`DETACHED`、`bridge_generation` 與前次之前的值不同，或 daemon pid 變更；(c) `human_replay_suspect` 訊號，且兩次之間該 com 有 `RECOVERING` 或 `RELEASED` 快照（§11.3、§14.2；P2 `walscan` 的同義規則） | `f"{signal kind}:{seq}:{wall_ts}"` |
@@ -3077,9 +3106,15 @@ class Derived:
     l1_set_sha256: str | None       # 僅 junit（R5-F3）：P2 l1_judge 回傳的 required_sha256（該 item.required_l1_set 該平台凍結 nodeids）；其他 kind None
     l1_verdict: Mapping[str, Any] | None   # 僅 junit：P2 l1_judge.judge 的完整回傳（missing／skipped_required／duplicates…），原樣寫入 entry.note 摘要並複製為 evidence 檔 l1-verdict.json
     note: str
+    detail: tuple[str, ...] = ()    # R-T15（P9-T15 審查修正）：FAIL／INSUFFICIENT 的違規或缺漏清單；預設空；`od09-freeze` 的 `note` 只記違規數量，清單由 Task 14B `ingest` 併入 entry note 一次（避免重複）
+    # 定義位置（R-T15）：`@dataclass(frozen=True) class Derived` 實體位於 `tools/stage3/derived.py`（P9-T15 交付，避免 od09_consume↔evidence_ingest 循環匯入）；
+    # `evidence_ingest` 以 `from tools.stage3.derived import Derived` 再匯出，不得另定義同名型別。
 def derive(kind: str, report: Path, *, item: ExitItem, cases: Mapping[str, dict], lock: Mapping[str, Any],
-           release_manifest: Path | None, platform: str, l1_lock: Mapping[str, Any] | None = None) -> Derived
+           release_manifest: Path | None, platform: str, l1_lock: Mapping[str, Any] | None = None,
+           index_doc: Mapping[str, Any] | None = None, now: str | None = None) -> Derived
     # l1_lock：P2 tests/acceptance/l1_required.lock.json 內容（None 時讀 repo 該檔）；只有 kind=="junit" 使用
+    # index_doc（P9-T15）：證據索引內容；kind=="od09-freeze" 必填，缺漏即 HARNESS_EVIDENCE_INGEST_INVALID（fail closed，不得退化為「無候選」而 PASS）；其他 kind 不使用
+    # now（P9-T15）：ingest 的參考時刻；只有 suite 報告（regression／realhw／gate）的時效判定使用，None 時取現在時刻
 def ingest(index_path: Path, *, kind: str, item_id: str, platform: str, report: Path, evidence_root: Path,
            catalog: Mapping[str, ExitItem], cases: Mapping[str, dict], lock: Mapping[str, Any], environment: Path,
            release_manifest: Path | None = None, reuse_of: str | None = None, now: str,
@@ -3090,15 +3125,15 @@ def ingest(index_path: Path, *, kind: str, item_id: str, platform: str, report: 
 
 | kind | 讀取 | result |
 |---|---|---|
-| `junit` | junit XML＋同目錄 `resource-report.json`（`SW_RESOURCE_REPORT` v2＝P2 `l1-results.v1`；cargo 類 L1 為 P3 `cargo_l1_results.py` 的同格式輸出，無 junit 時 junit 計數核對略過） | **R5-F3：不再以 `tests>0`／無 failure 判定**（只跑一個成功案例、或 `tests=1, skipped=1` 都會滿足）。`item.required_l1_set` 為 None → INGEST_INVALID；`required = l1_judge.required_for(l1_lock, item.required_l1_set, platform)`（KeyError → INSUFFICIENT，reasons `"no frozen l1 set"`）；`v = l1_judge.judge(report, required, platform=platform, junit=<junit 根元素 tests／failures／errors／skipped>)`：`PASS`→PASS、`FAIL`→FAIL、`INSUFFICIENT`→INSUFFICIENT（缺案、重複、必要案例任何 SKIP／xfail／deselected／未執行、runner `exit_code≠0`、`finished` 不為 true、平台 SKIP 閘門）、`INVALID`→INGEST_INVALID（junit 與報告計數不一致＝兩檔非同一次執行、格式錯、平台不符）；`Derived.l1_set_sha256 = v["required_sha256"]`、`l1_verdict = v`（寫成 `l1-verdict.json` 併入 `files`）；`Derived.case_list_sha256 = None`（L1 不用 cases.lock） |
-| `functest-report` | func-test `--report-dir` 樹 | 每個 `required_case_set` 中適用 L1.5 案例都有 run，且全部 `comparison.json.verdict=="PASS"`、`bridge-manifest.closed_cleanly` → PASS；任一 FAIL／invariant FAIL → FAIL；缺案例或 `INSUFFICIENT_EVIDENCE` → INSUFFICIENT |
-| `bridge-selftest` | P2 bridge 自測報告 | 自測報告 `qualified is True` → PASS；否則 FAIL |
-| `regression-report`／`realhw-report` | TestPilot／realhw `report.json` | 以 Task 7 `compare_l2_reports` 的單側完整性規則（缺項、重複、未知 verdict、必要 SKIP → INSUFFICIENT）；B 側邏輯判 FAIL／XFAIL；全部必要案例 PASS（或核准 XFAIL）→ PASS |
-| `gate-report` | P2 `release-gate.json` | baseline 模式：`baseline_result`（PASS／FAIL／INSUFFICIENT_EVIDENCE→INSUFFICIENT）；candidate 模式：`release_gate_result`（PASS→PASS、FAIL→FAIL、INSUFFICIENT_EVIDENCE／BLOCKED→INSUFFICIENT）；`engine_result.verdict=="FAIL"` 一律 FAIL；artifact 由 `--release-manifest` 提供，且其 `components.cli.sha256` 必須等於 `run.cli_identity.sha256` |
-| `ab-report` | Task 6 `ab-report.json` | `verdict` PASS→PASS、FAIL→FAIL、其他→INFRA_ERROR；artifact＝B 側 `release_manifest_sha256`；`bundle_tree_sha256`／`runtime_tree_sha256`＝B 側同名欄位（R3-F2，缺 → INGEST_INVALID）；`layer` 必須對應 item.layer、`platform` 相符 |
+| `junit` | junit XML＋同目錄 `resource-report.json`（`SW_RESOURCE_REPORT` v2＝P2 `l1-results.v1`；cargo 類 L1 為 P3 `cargo_l1_results.py` 的同格式輸出；只有 `runner=="cargo"` 可略過 junit 計數） | **R5-F3：不再以 `tests>0`／無 failure 判定**（只跑一個成功案例、或 `tests=1, skipped=1` 都會滿足）。`item.required_l1_set` 為 None → INGEST_INVALID；`required = l1_judge.required_for(l1_lock, item.required_l1_set, platform)`（KeyError → INSUFFICIENT，reasons `"no frozen l1 set"`）；pytest 必須提供 junit XML，讀根／子 `testsuite` 計數與最早有時區 timestamp；`started_at` 依序取 resource report `started_at`、`deployed_content.start.measured_at`、XML timestamp、resource report UTC mtime；`v = l1_judge.judge(report, required, platform=platform, junit=<XML tests／failures／errors／skipped>)`：`PASS`→PASS、`FAIL`→FAIL、`INSUFFICIENT`→INSUFFICIENT、`INVALID`→INGEST_INVALID；`Derived.l1_set_sha256 = v["required_sha256"]`、`l1_verdict = v`（寫成 `l1-verdict.json` 併入 `files`）；`Derived.case_list_sha256 = None`（L1 不用 cases.lock） |
+| `functest-report` | func-test `--report-dir` 樹 | 每個 `required_case_set` 中適用 L1.5 案例都有 run，且全部 `comparison.json.verdict=="PASS"`、`bridge-manifest.closed_cleanly` → PASS；任一 FAIL／invariant FAIL → FAIL；缺案例或 `INSUFFICIENT_EVIDENCE` → INSUFFICIENT。`started_at` 取 `func-test-report.json.started_at`，缺少時取各 run manifest `created_at` 的最早值；各 manifest 記錄的 `contract_revision` 須一致並交由 target 核對，`cases_yaml_sha256` 須一致且等於 repo 現行 `tests/acceptance/cases.yaml` |
+| `bridge-selftest` | P2 `bridge-selftest.v1` 自測報告 | 以 P2 `selftest.runner.is_qualified(report, endpoint, tool_tree_sha256, platform_os, approved=load_approved_revision())` 判定；`created_at` 為開始時間；報告不得以自訂 `qualified` 欄位宣稱 PASS |
+| `regression-report`／`realhw-report` | TestPilot／realhw `report.json` | 以 Task 7 `compare_l2_reports` 的單側完整性規則（缺項、重複、未知 verdict、必要 SKIP → INSUFFICIENT）；B 側邏輯判 FAIL／XFAIL；全部必要案例 PASS（或核准 XFAIL）→ PASS。realhw 依 `meta.tiers` 篩選 frozen cases 的 `family`；`windows_status: gap` 仍屬必要案例。`contract_revision`（若記錄）須等於 target；`cases_yaml_sha256`（若記錄）須等於 repo 現行 `tests/acceptance/cases.yaml`。`started_at` 取 `meta.started_at_utc`，其次 `meta.deployed_content.start.measured_at` |
+| `gate-report` | P2 `release-gate.json` | baseline 模式：`baseline_result`（PASS／FAIL／INSUFFICIENT_EVIDENCE→INSUFFICIENT）；candidate 模式：`release_gate_result`（PASS→PASS、FAIL→FAIL、INSUFFICIENT_EVIDENCE／BLOCKED→INSUFFICIENT）；`engine_result.verdict=="FAIL"` 一律 FAIL；artifact 由 `--release-manifest` 提供，且其 `components.cli.sha256` 必須等於 `run.cli_identity.sha256`。`engine_files_sha256` 必須是涵蓋 `acceptance.effective_content.workload.engine_files` 的完整非 null digest mapping，依檔案順序計算 workload sha；`run.contract_revision`（若記錄）須等於 target，`run.cases_yaml_sha256`（若記錄）須等於 repo 現行 cases.yaml；`started_at` 取 `run.started_at_utc` |
+| `ab-report` | Task 6 `ab-report.json` | `verdict` PASS→PASS、FAIL→FAIL、其他→INFRA_ERROR；artifact＝B 側 `release_manifest_sha256`；`bundle_tree_sha256`／`runtime_tree_sha256`＝B 側同名欄位（R3-F2，缺 → INGEST_INVALID）；`case_list_sha256` 驗證 repo 現行 `cases.yaml`，`case_lock_sha256` 必須等於 target `case_list_sha256`；報告沒有 workload 欄位，不在 ingest 推導 workload；`layer` 必須對應 item.layer、`platform` 相符 |
 | `canary-report` | `canary report` JSON | `S3-CANARY-*`：PASS→PASS、FAIL→FAIL、其他→INSUFFICIENT；`S3-INCIDENTS-CLOSED`：`tally.open_incidents==[]` 且 `tally.failing_incidents==[]` 且 `result ∉ {POLICY_NOT_FROZEN, POLICY_CHANGED}` → PASS，有 failing → FAIL，否則 INSUFFICIENT。報告必帶 `ledger_through`／`ledger_records`（Task 12 帳本版本），原樣寫入 `Derived` 與 entry；`Derived.started_at`＝`tally.first_counted_wall`（None 時改用 `ledger_through`，兩者皆 None → INGEST_INVALID）；`bundle_tree_sha256`／`runtime_tree_sha256`＝報告頂層同名鍵（`CanaryGate` 計數所用的內容指紋；缺 → INGEST_INVALID，R4-F1：只靠時刻規則無法分辨與 target 同 manifest、同 binary 但多旁載檔的工作站安裝）；Task 14 步驟 3a 只以帳本版本最新的報告判定兩類項目，故後續報告的 INSUFFICIENT 會撤銷先前 PASS（R3-F1） |
 | `drill-report` | Task 13 `drill-report.json` | PASS→PASS、FAIL→FAIL、PRECONDITION_FAILED／INCOMPLETE→INSUFFICIENT；artifact＝報告 `current_release_manifest_sha256`；`bundle_tree_sha256`／`runtime_tree_sha256`＝報告 `current_bundle_tree_sha256`／`current_runtime_tree_sha256`（D1 對實際部署目錄量測；缺 → INGEST_INVALID，R4-F1） |
-| `od09-freeze` | P2 Task 16 `freeze --out` 報告（`od09-freeze.json`） | 一律呼叫 Task 15 `od09_consume.derive_freeze_report`：報告 `acceptance_sha256` 須等於現行 acceptance（否則 INGEST_INVALID）；三個延後項皆 `frozen` 且 `check_frozen_before(acceptance, min(P2 候選開跑 ledger, 本索引 candidate_longrun entry 的 started_at))` 為空 → PASS；否則 FAIL |
+| `od09-freeze` | P2 Task 16 `freeze --out` 報告（`od09-freeze.json`） | 一律以模組屬性呼叫 Task 15 `od09_consume.derive_freeze_report`（`from tools.stage3 import od09_consume` 後呼叫 `od09_consume.derive_freeze_report(...)`，不得以 `from … import` 綁定函式，因 `test_ingest_od09_freeze_kind_uses_consumer` 以 monkeypatch 替換）：報告 `acceptance_sha256` 須等於現行 acceptance（否則 INGEST_INVALID）；三個延後項皆 `frozen` 且 `check_frozen_before(acceptance, min(P2 候選開跑 ledger, 本索引 candidate_longrun entry 的 started_at))` 為空 → PASS；否則 FAIL |
 | `manual-procedure` | 程序紀錄 JSON `{procedure_path, procedure_sha256, result, executed_by, executed_at, artifacts:[…]}` | 原樣取 `result`，但 `procedure_sha256` 必須等於現行程序檔 sha256；只允許 `evidence_kind=="manual-procedure"` 的項目 |
 
 **受測內容量測的讀取位置（R5-F4；`deployed_tree` 的 brackets 來源，鍵缺漏 → INGEST_INVALID "report lacks deployed_content: <kind>"）**：`junit`＝`resource-report.json` 頂層 `deployed_content`（P2 Task 13；`null` 表示未設 `SERIALWRAP_CLI_EXE`）；`functest-report`＝每個 `<case>/<mode>/<n>/manifest.json` 的 `artifacts.deployed_content`（P2 Task 10；全部 run 合併為一組 brackets，cli 身分對 `artifacts.cli.sha256`）；`regression-report`／`realhw-report`＝`report.json.meta.deployed_content`（P2 Task 14；cli 身分對 `meta.cli_identity.sha256`）；`gate-report`＝`release-gate.json.run.deployed_content`（P2 Task 15 自 `report.json` 原樣複製；cli 身分對 `run.cli_identity.sha256`）；`manual-procedure`＝紀錄新增必填鍵 `deployed_content: {"start","end"}`，兩者為擁有者在程序執行前、後各跑一次 `python3 -m realhw.deployed_content --cli <受測 CLI> --out …` 的輸出內容（兩個輸出檔同時列入 `artifacts` 並複製；程序未涉及 serialwrap 安裝時填 `null`）。這些值只由產生端量測寫入，`derive` 不重新量測任何目錄（ingest 的執行環境不是受測安裝）。
@@ -3171,6 +3206,8 @@ def ingest(index_path: Path, *, kind: str, item_id: str, platform: str, report: 
 
 **Files:**
 - Create: `tools/stage3/od09_consume.py`
+- Create: `tools/stage3/derived.py`（`Derived` 型別獨立成模組；Task 14B `evidence_ingest` 以 `from tools.stage3.derived import Derived` 再匯出）
+- Modify: `tools/stage3/evidence_ingest.py`（T15 增量：`_derive_od09` 掛載點與 `derive()` 的 `index_doc`、`now` 參數；`_LEDGER_PATH` 與 `_ACCEPTANCE_PATH` 同為模組常數）
 - Marker（P0 T14 檔內 `pytestmark`，非 YAML 登錄）：`test_stage3_od09.py: {class: core_portable, resources: [memory_only]}`
 - Test: `tests/test_stage3_od09.py`（替身沿用 P2 Task 16 的 `tests/fakes_od09.py`，不另建）
 
@@ -3183,6 +3220,7 @@ def earliest_candidate_start(index: dict, *, ledger_path: Path = od09_freeze.LED
 def derive_freeze_report(report_path: Path, *, acceptance_path: Path, index: dict,
                          ledger_path: Path = od09_freeze.LEDGER_PATH) -> Derived
     # Task 14B `od09-freeze` kind 的唯一實作：report.acceptance_sha256 != sha256(acceptance_path) → INGEST_INVALID（凍結後 acceptance 又被改）；
+    # 三個延後項皆已凍結（現行 acceptance）時，report 的 revision、thresholds 鍵集合（恰為 DEFERRED_KEYS）與 frozen_at 必須與現行 acceptance 一致，否則 INGEST_INVALID（堵住「只附正確 sha 的偽造報告」）；數值比對不在此做，交由 check_frozen_before
     # ts = earliest_candidate_start(...) 或（None 時）"9999-12-31T00:00:00+00:00"；od09_freeze.check_frozen_before(acceptance_path, ts) == [] → PASS，否則 FAIL（detail＝違規清單）
 def check_main(argv: Sequence[str]) -> int     # `od09 check --acceptance PATH --run-started-at ISO`：只呼叫 od09_freeze.check_frozen_before；[] → 0，否則 1
 ```

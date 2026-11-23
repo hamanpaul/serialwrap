@@ -1,0 +1,131 @@
+{
+  "schema_version": 1,
+  "run_id": "example-l2-linux",
+  "layer": "l2",
+  "platform": "linux",
+  "stage": "3",
+  "contract_revision": "0000000000000000000000000000000000000000",
+  "case_list": {
+    "path": "tests/acceptance/cases.yaml",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "case_lock": {
+    "path": "tests/acceptance/cases.lock.json",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "required_case_set": "slice_2.4",
+  "case_ids": [
+    "f5-deferred-dropped-after-reboot"
+  ],
+  "tools": [
+    {
+      "path": "tools/stage3",
+      "tree_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "path": "regression",
+      "tree_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "allowed_differences": {
+    "path": "contracts/behavior_changes.yaml",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "acceptance": null,
+  "profile_files": [],
+  "seed": 0,
+  "platform_settings": {
+    "example_only": true
+  },
+  "dut": {
+    "kind": "hardware",
+    "transport": "physical-usb-uart",
+    "com_pair": null,
+    "image": null,
+    "image_digest": null,
+    "boards": [
+      "board-a",
+      "board-b"
+    ],
+    "reset_argv": [],
+    "fingerprint_argv": [],
+    "expected_fingerprint": {}
+  },
+  "authorization": {
+    "allow_destructive": true,
+    "decision_ref": "OD-EXAMPLE-DESTRUCTIVE",
+    "boards": [
+      "board-a"
+    ]
+  },
+  "test_device_allowlist": [],
+  "sides": [
+    {
+      "label": "A",
+      "role": "baseline",
+      "bundle_dir": "bundles/A",
+      "release_manifest": {
+        "path": "bundles/A/release-manifest.json",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "cli_exe": "bundles/A/bin/serialwrap",
+      "daemon_exe": "bundles/A/bin/serialwrapd",
+      "activate_argv": [
+        "bundles/A/bin/serialwrap",
+        "setup"
+      ],
+      "deactivate_argv": [
+        "bundles/A/bin/serialwrap",
+        "setup",
+        "--rollback"
+      ]
+    },
+    {
+      "label": "B",
+      "role": "candidate",
+      "bundle_dir": "bundles/B",
+      "release_manifest": {
+        "path": "bundles/B/release-manifest.json",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "cli_exe": "bundles/B/bin/serialwrap",
+      "daemon_exe": "bundles/B/bin/serialwrapd",
+      "activate_argv": [
+        "bundles/B/bin/serialwrap",
+        "setup"
+      ],
+      "deactivate_argv": [
+        "bundles/B/bin/serialwrap",
+        "setup",
+        "--rollback"
+      ]
+    }
+  ],
+  "suite": {
+    "adapter": "l2_regression",
+    "timeout_s": 7200,
+    "selftest_report": null,
+    "testbed_template": {"path": "regression/serialwrap_regression/testbed.yaml.example", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
+    "realhw_config_template": null,
+    "tier": null,
+    "extra_args": []
+  },
+  "endpoint": null,
+  "release": {
+    "timeout_s": 120,
+    "poll_s": 1,
+    "endpoints": [],
+    "device_paths": [],
+    "lock_paths": [],
+    "device_open_probe": true,
+    "accept_unreadable_holders": false
+  },
+  "reverify": {
+    "enabled": true,
+    "order": [
+      "B",
+      "A"
+    ]
+  },
+  "failure_retention": null
+}

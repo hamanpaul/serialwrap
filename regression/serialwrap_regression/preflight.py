@@ -102,7 +102,7 @@ def _run_preflight_windows(cfg: dict[str, Any]) -> dict[str, Any]:
     if lock_fd is None:
         problems.append("bench.lock 已被其他測試持有")
     try:
-        sw = drivers.SwCli(exe=str(exe))
+        sw = drivers.SwCli(exe=str(exe), endpoint=cfg.get("endpoint"))
         daemon = sw.run("daemon", "status")
         if not daemon.get("ok") or not daemon.get("running"):
             problems.append("serialwrap daemon 未運行")
@@ -147,6 +147,7 @@ def _run_preflight_windows(cfg: dict[str, Any]) -> dict[str, Any]:
             "notes": notes,
             "missing_caps": rp.platform_missing_caps(frontend_ok=frontend_ok, cfg=cfg),
             "deployed_version": cli_version,
+            "daemon_version": str(daemon.get("version") or daemon_version_probe(sw)).strip(),
             "daemon_pid": daemon.get("pid"),
             "benchlock_fd": lock_fd,
             "cross_os_guard": cross_os_guard,
@@ -166,7 +167,7 @@ def run_preflight(cfg: dict[str, Any]) -> dict[str, Any]:
     from realhw import drivers, frontends, preflight as rp
 
     exe, _identity = rp.resolve_serialwrap_exe(cfg)
-    sw = drivers.SwCli(exe=exe)
+    sw = drivers.SwCli(exe=exe, endpoint=cfg.get("endpoint"))
     lock_fd = rp.acquire_benchlock(rp.bench_lock_path(cfg))
     try:
         boards_expected = [b["com"] for b in cfg["boards"]]
@@ -204,7 +205,7 @@ def run_preflight(cfg: dict[str, Any]) -> dict[str, Any]:
         path_exe = shutil.which("serialwrap")
         if path_exe and os.path.realpath(path_exe) != os.path.realpath(exe):
             path_version = str(
-                drivers.SwCli(exe=path_exe).run("--version").get("_raw", "")
+                drivers.SwCli(exe=path_exe, endpoint=cfg.get("endpoint")).run("--version").get("_raw", "")
             ).strip()
             note = stale_client_note(path_version, cli_version)
             if note:
@@ -218,6 +219,7 @@ def run_preflight(cfg: dict[str, Any]) -> dict[str, Any]:
                 frontend_ok=frontends.frontend_capability(cfg)[0], cfg=cfg
             ),
             "deployed_version": cli_version,
+            "daemon_version": str(daemon.get("version") or daemon_version_probe(sw)).strip(),
             "daemon_pid": daemon.get("pid"),
             "benchlock_fd": lock_fd,
             "cross_os_guard": cross_os_guard,

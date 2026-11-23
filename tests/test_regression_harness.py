@@ -101,6 +101,14 @@ def test_runtime_skip_broken_by_and_requires():
     assert core.runtime_skip({}, {}, None, allow_destructive=False) is None
 
 
+def test_runtime_skip_destructive_requires_board_authorization():
+    got = core.runtime_skip({"destructive": True}, {}, None, allow_destructive=True,
+                            authorized_boards={"COM0"}, required_boards={"COM0", "COM1"})
+    assert got is not None and got[0] == "destructive_gated"
+    assert core.runtime_skip({"destructive": True}, {}, None, allow_destructive=True,
+                             authorized_boards={"COM0", "COM1"}, required_boards={"COM0", "COM1"}) is None
+
+
 def test_failure_payload_fills_category():
     assert core.failure_payload({"verdict": "PASS"}) is None
     fail = core.failure_payload({"verdict": "FAIL", "reason": "x", "category": "",

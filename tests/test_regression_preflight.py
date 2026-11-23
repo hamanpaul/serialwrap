@@ -7,7 +7,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "regression"))
 
-from serialwrap_regression import preflight  # noqa: E402
+from serialwrap_regression import core, preflight  # noqa: E402
 import pytest
 
 pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
@@ -60,3 +60,15 @@ def test_daemon_version_probe_ignores_blank_version_field():
     """version 欄位存在但為空字串／全空白 → 視為缺席，落回 fallback（pid 缺失時回空字串）。"""
     sw = _StubSw({"ok": True, "version": "   "})
     assert preflight.daemon_version_probe(sw) == ""
+
+
+def test_load_testbed_honors_stage3_path_override(tmp_path, monkeypatch):
+    override = tmp_path / "stage3-testbed.yaml"
+    override.write_text("serialwrap_exe: /stage3/bin/serialwrap\nallow_destructive: true\n", encoding="utf-8")
+    monkeypatch.setenv("SERIALWRAP_REGRESSION_TESTBED", str(override))
+
+    loaded = core.load_testbed(Path("/plugin/testbed.yaml.example"))
+
+    assert loaded["serialwrap_exe"] == "/stage3/bin/serialwrap"
+    assert loaded["allow_destructive"] is True
+    assert loaded["_testbed_source"] == str(override)

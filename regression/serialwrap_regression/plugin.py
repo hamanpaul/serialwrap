@@ -73,7 +73,7 @@ class Plugin(PluginBase):
 
         from realhw import deployed_content, preflight as realhw_preflight
 
-        exe, _identity = realhw_preflight.resolve_serialwrap_exe(cfg)
+        exe, cli_identity = realhw_preflight.resolve_serialwrap_exe(cfg)
         deployed_start = deployed_content.measure(exe)
         install = Path(str(deployed_start.get("install_dir") or "")) if deployed_start.get("install_dir") else None
         pid = pf.get("daemon_pid")
@@ -87,6 +87,8 @@ class Plugin(PluginBase):
         ).stdout.strip()
         self.run_meta = {
             "version": str(pf["deployed_version"]).strip(),
+            "cli_identity": cli_identity,
+            "daemon_identity": {"version": str(pf.get("daemon_version") or "").strip()},
             "git": head,
             "tiers": "regression",
             "started_at": dt.datetime.now().strftime("%y%m%d-%H%M%S"),
@@ -94,6 +96,7 @@ class Plugin(PluginBase):
             "cross_os_guard": pf.get("cross_os_guard", "unconfigured"),
             "cross_os_detail": pf.get("cross_os_detail"),
             "allow_destructive": bool(cfg.get("allow_destructive")),
+            "authorized_boards": list(cfg.get("authorized_boards") or []),
             "deployed_content_start": deployed_start,
             "deployed_content_live": live,
             "daemon_pid": pid,
@@ -127,11 +130,16 @@ class Plugin(PluginBase):
         case_id = str(case.get("id", "?"))
         meta = dict(case.get("metadata") or {})
         started = time.monotonic()
+        cfg = self._load_cfg()
+        devices = ((case.get("topology") or {}).get("devices") or {})
+        authorized_boards = set(map(str, cfg["authorized_boards"])) if "authorized_boards" in cfg else None
         skip = core.runtime_skip(
             meta,
             self._missing_caps,
             self._broken_by,
-            allow_destructive=bool(self._load_cfg().get("allow_destructive")),
+            allow_destructive=bool(cfg.get("allow_destructive")),
+            authorized_boards=authorized_boards,
+            required_boards=set(map(str, devices)),
         )
         if skip is not None:
             reason_code, comment = skip

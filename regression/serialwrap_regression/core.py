@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -26,8 +27,14 @@ def load_testbed(path: Path) -> dict[str, Any]:
     """讀 testbed.yaml（缺檔退 example）；補預設、展開 serialwrap_exe 的 ~。"""
     import yaml
 
-    real = path.with_name("testbed.yaml")
-    src = real if real.is_file() else path
+    override = os.environ.get("SERIALWRAP_REGRESSION_TESTBED", "").strip()
+    if override:
+        src = Path(override).expanduser()
+        if not src.is_file():
+            raise FileNotFoundError(f"Stage 3 testbed override 不存在：{src}")
+    else:
+        real = path.with_name("testbed.yaml")
+        src = real if real.is_file() else path
     cfg: dict[str, Any] = yaml.safe_load(src.read_text(encoding="utf-8")) or {}
     for key, val in _TESTBED_DEFAULTS.items():
         cfg.setdefault(key, val)
@@ -92,10 +99,15 @@ def runtime_skip(
     broken_by: str | None,
     *,
     allow_destructive: bool,
+    authorized_boards: set[str] | None = None,
+    required_boards: set[str] | None = None,
 ) -> tuple[str, str] | None:
     """執行期 SKIP 判定：destructive gate → bench 破損 → 能力缺項。"""
     if case_meta.get("destructive") and not allow_destructive:
         return ("destructive_gated", "破壞性 case 未解鎖（testbed allow_destructive: false）")
+    if case_meta.get("destructive") and authorized_boards is not None:
+        if not required_boards or not required_boards.issubset(authorized_boards):
+            return ("destructive_gated", "破壞性 case 使用的板卡未列入授權")
     requires = [str(req) for req in (case_meta.get("requires") or [])]
     if broken_by and (case_meta.get("destructive") or requires):
         return (f"broken_by:{broken_by}", f"前置不滿足（{broken_by} 後板卡未恢復）")
@@ -147,7 +159,8 @@ def build_ctx(cfg: dict[str, Any], report_dir: Path) -> Any:
     from realhw import drivers, frontends
     from realhw.harness import Ctx
 
-    sw = drivers.SwCli(exe=str(cfg.get("serialwrap_exe") or "serialwrap"))
+    sw = drivers.SwCli(exe=str(cfg.get("serialwrap_exe") or "serialwrap"),
+                       endpoint=cfg.get("endpoint"))
     tmux = drivers.TmuxCtl(str(cfg.get("tmux_prefix") or "swreg"))
     return Ctx(
         cfg=cfg,

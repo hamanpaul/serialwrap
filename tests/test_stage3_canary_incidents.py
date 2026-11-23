@@ -92,17 +92,28 @@ def test_planned_note_suppresses(pol):
     s0 = _snap(_fakes().ts(3, 1, 0, 0), pid=100)
     s1 = _snap(_fakes().ts(3, 1, 0, 30), pid=101)
     note = {"type": "note", "kind": "planned_restart", "from": _fakes().ts(3, 0, 55),
-            "to": _fakes().ts(3, 1, 5), "host_id": "h1"}
+            "to": _fakes().ts(3, 1, 5), "t_wall": _fakes().ts(3, 0, 50), "host_id": "h1"}
     assert _ci().detect([s0, s1], [], [note], pol) == []
 
 
-def test_note_written_by_write_note_suppresses(tmp_path, pol):
+def test_note_written_by_write_note_suppresses(tmp_path, pol, monkeypatch):
+    # write_note 的 t_wall 取自系統時鐘；固定為窗口開始前，避免測試隨實際日期變化。
+    monkeypatch.setattr(_jsonio(), "utc_now_iso", lambda: _at(-600))
     s0 = _snap(_at(0), pid=100)
     s1 = _snap(_at(30), pid=101)
     note = _ci().write_note(tmp_path, kind="planned_restart", start=_at(-300), end=_at(300),
                             reason="韌體升級", author="owner", host_id="h1", platform="linux")
     assert note["type"] == "note" and len(note["record_id"]) == 20
     assert _ci().detect([s0, s1], [], [note], pol) == []
+
+
+def test_retroactive_restart_note_does_not_suppress(pol):
+    # canary.md §6：note 須在計畫性重啟前寫入。事後 10 天才補寫的 note 不得抹除 PID 變更事故。
+    s0 = _snap(_at(0), pid=100)
+    s1 = _snap(_at(30), pid=101)
+    note = {"type": "note", "kind": "planned_restart", "from": _at(-300), "to": _at(300),
+            "t_wall": _at(10 * 24 * 3600), "host_id": "h1"}
+    assert _kinds(_ci().detect([s0, s1], [], [note], pol)) == ["unexpected_restart"]
 
 
 def test_safety_violation_cannot_close_as_environment(tmp_path, pol):
@@ -152,6 +163,13 @@ def test_pid_reuse_after_not_running(pol):
     assert _kinds(_ci().detect([s0, dead, s2], [], [], pol)) == ["unexplained_pid_change"]
 
 
+def test_pid_reuse_after_connect_refused(pol):
+    s0 = _snap(_at(0), pid=100)
+    dead = _with_error(_snap(_at(30), pid=None, ok=False, sessions=()), "connect_refused")
+    s2 = _snap(_at(60), pid=100)
+    assert _kinds(_ci().detect([s0, dead, s2], [], [], pol)) == ["unexplained_pid_change"]
+
+
 def test_harvest_anomaly_is_incident(pol):
     anomalies = [_anomaly("crc_mismatch:raw.wal.ndjson:120", _at(0))]
     inc = _ci().detect([], [], [], pol, anomalies=anomalies)
@@ -159,8 +177,23 @@ def test_harvest_anomaly_is_incident(pol):
     assert inc[0].incident_id == _ci().detect([], [], [], pol, anomalies=anomalies)[0].incident_id
 
 
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "wal_path_missing",
+        "harvest_error:PermissionError",
+        "collector_exception:HARNESS_LEDGER_CORRUPT",
+        "malformed_ledger_line:12",
+    ],
+)
+def test_collector_capture_failures_are_integrity_incidents(detail, pol):
+    inc = _ci().detect([], [], [], pol, anomalies=[_anomaly(detail, _at(0))])
+    assert _kinds(inc) == ["harvest_integrity"]
+    assert detail in inc[0].summary
+
+
 def test_non_integrity_anomaly_is_not_incident(pol):
-    anomalies = [_anomaly("result_evicted:cmd-abc", _at(0))]
+    anomalies = [_anomaly("result_evicted:cmd-abc", _at(0)), _anomaly("cmd_status_error:TimeoutError", _at(1))]
     assert _ci().detect([], [], [], pol, anomalies=anomalies) == []
 
 
@@ -249,7 +282,8 @@ def test_down_entirely_inside_grace_is_not_unreachable(pol):
 def test_planned_downtime_ends_then_outage_continues_is_unreachable(pol):
     """計畫停機窗結束後 daemon 仍持續不可達：窗外的失聯須獨立開事故。"""
     s0 = _snap(_at(0), pid=100)
-    note = {"type": "note", "kind": "planned_downtime", "from": _at(0), "to": _at(600), "host_id": "h1"}
+    note = {"type": "note", "kind": "planned_downtime", "from": _at(0), "to": _at(600), "t_wall": _at(-60),
+            "host_id": "h1"}
     downs = [_snap(_at(t), pid=None, ok=False, sessions=()) for t in range(30, 1201, 30)]
     back = _snap(_at(1230), pid=100)
     assert _kinds(_ci().detect([s0, *downs, back], [], [note], pol)) == ["daemon_unreachable"]
@@ -257,7 +291,8 @@ def test_planned_downtime_ends_then_outage_continues_is_unreachable(pol):
 
 def test_planned_downtime_partial_cover_still_incident(pol):
     s0 = _snap(_at(0), pid=100)
-    note = {"type": "note", "kind": "planned_downtime", "from": _at(90), "to": _at(200), "host_id": "h1"}
+    note = {"type": "note", "kind": "planned_downtime", "from": _at(90), "to": _at(200), "t_wall": _at(0),
+            "host_id": "h1"}
     downs = [_snap(_at(t), pid=None, ok=False, sessions=()) for t in range(100, 3701, 30)]
     back = _snap(_at(3730), pid=100)
     assert _kinds(_ci().detect([s0, *downs, back], [], [note], pol)) == ["daemon_unreachable"]
@@ -265,10 +300,21 @@ def test_planned_downtime_partial_cover_still_incident(pol):
 
 def test_planned_downtime_full_cover_is_not_incident(pol):
     s0 = _snap(_at(0), pid=100)
-    note = {"type": "note", "kind": "planned_downtime", "from": _at(90), "to": _at(3800), "host_id": "h1"}
+    note = {"type": "note", "kind": "planned_downtime", "from": _at(90), "to": _at(3800), "t_wall": _at(0),
+            "host_id": "h1"}
     downs = [_snap(_at(t), pid=None, ok=False, sessions=()) for t in range(100, 3701, 30)]
     back = _snap(_at(3730), pid=100)
     assert _ci().detect([s0, *downs, back], [], [note], pol) == []
+
+
+def test_retroactive_downtime_note_does_not_suppress(pol):
+    # 失聯之後才寫入的 planned_downtime note 不得抑制不可達事故（written_at 晚於觀測時刻）。
+    s0 = _snap(_at(0), pid=100)
+    note = {"type": "note", "kind": "planned_downtime", "from": _at(0), "to": _at(3800), "t_wall": _at(7200),
+            "host_id": "h1"}
+    downs = [_snap(_at(t), pid=None, ok=False, sessions=()) for t in range(100, 3701, 30)]
+    back = _snap(_at(3730), pid=100)
+    assert _kinds(_ci().detect([s0, *downs, back], [], [note], pol)) == ["daemon_unreachable"]
 
 
 def test_later_boot_does_not_hide_supervisor_failure(pol):

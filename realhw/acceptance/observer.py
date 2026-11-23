@@ -294,6 +294,7 @@ def _load_supervision(path: str | None) -> dict[str, Any] | None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="長跑唯讀 observer（只讀 daemon status／session list）")
     parser.add_argument("--serialwrap-exe", default="serialwrap")
+    parser.add_argument("--endpoint", default=None, help="明確指定 serialwrap RPC endpoint")
     parser.add_argument("--boards", required=True, help="逗號分隔的受測 COM，例如 COM0,COM1")
     parser.add_argument("--interval-s", type=float, default=10.0)
     parser.add_argument("--out", required=True, type=Path)
@@ -322,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
         signal.signal(signal.SIGTERM, _on_signal)
     try:
         return run_observer(
-            SwCli(args.serialwrap_exe), boards,
+            SwCli(args.serialwrap_exe, endpoint=args.endpoint), boards,
             interval_s=args.interval_s, out=args.out, stop=stop,
             duration_s=_parse_duration(args.duration),
             supervision=supervision,

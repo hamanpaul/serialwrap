@@ -50,7 +50,20 @@ _STUCK_EXCLUDED_STATES = frozenset({"RELEASED", "FLASHING", "DETACHED"})
 _RESEND_DISRUPTED_STATES = frozenset({"RECOVERING", "RELEASED", "DETACHED"})
 _REPLAY_DISRUPTED_STATES = frozenset({"RECOVERING", "RELEASED"})
 # 擷取異常的完整性類別：只記錄而不開事故即屬忽略證據完整性問題。
-_INTEGRITY_KINDS = frozenset({"malformed_line", "crc_mismatch", "seq_regress", "truncated", "replaced", "vanished"})
+_INTEGRITY_KINDS = frozenset(
+    {
+        "malformed_line",
+        "crc_mismatch",
+        "seq_regress",
+        "truncated",
+        "replaced",
+        "vanished",
+        "malformed_ledger_line",
+        "wal_path_missing",
+        "harvest_error",
+        "collector_exception",
+    }
+)
 _WAL_LOSS_SIGNALS = frozenset({"wal_loss", "wal_recreated"})
 # 會產生事故的 WAL 訊號種類；其餘（如 human_tx）僅供帳本記錄，不必解析快照即可略過。
 _SIGNAL_INCIDENT_KINDS = _WAL_LOSS_SIGNALS | frozenset({"unauthorized_tx", "resend_suspect", "human_replay_suspect"})
@@ -75,7 +88,8 @@ class Incident:
     note: str | None
 
 
-Window = tuple[datetime, datetime]
+# (from, to, written_at)：written_at 為 note 的寫入時刻（t_wall）；缺漏或無法解析者為 None，不得覆蓋任何觀測。
+Window = tuple[datetime, datetime, datetime | None]
 
 
 @dataclass(frozen=True)
@@ -167,12 +181,19 @@ def _windows(notes: Sequence[Mapping[str, Any]], host_id: str, kind: str) -> lis
         start, end = _parse_or_none(note.get("from")), _parse_or_none(note.get("to"))
         if start is None or end is None or end < start:
             continue
-        out.append((start, end))
+        out.append((start, end, _parse_or_none(note.get("t_wall"))))
     return out
 
 
 def _covered(windows: Sequence[Window], when: datetime) -> bool:
-    return any(start <= when <= end for start, end in windows)
+    """`when` 落在某個 note 的 [from, to] 內，且該 note 在 `when` 當時或之前已寫入。
+
+    canary.md §6：計畫性重啟或停機前必須寫入 note；事後補寫的 note 不得抹除已發生的 PID 變更或失聯事故。
+    """
+    return any(
+        start <= when <= end and written is not None and written <= when
+        for start, end, written in windows
+    )
 
 
 def _group_snapshots(snapshots: Sequence[Mapping[str, Any]]) -> dict[str, _Host]:

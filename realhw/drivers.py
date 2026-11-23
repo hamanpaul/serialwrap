@@ -113,11 +113,16 @@ class SwCli:
     exe 可注入絕對路徑以 pin 部署版（#154 防線）；預設 "serialwrap" 走 PATH，行為不變。
     """
 
-    def __init__(self, exe: str = "serialwrap") -> None:
+    def __init__(self, exe: str = "serialwrap", *, endpoint: str | None = None) -> None:
         self._exe = exe
+        self._endpoint = str(endpoint).strip() if endpoint else ""
 
     def run(self, *args: str, timeout: float = 30.0) -> dict:
-        cp = _run([self._exe, *args], timeout=timeout)
+        argv = [self._exe]
+        if self._endpoint:
+            argv.extend(("--endpoint", self._endpoint))
+        argv.extend(args)
+        cp = _run(argv, timeout=timeout)
         out = cp.stdout.strip()
         try:
             data = json.loads(out) if out else {}

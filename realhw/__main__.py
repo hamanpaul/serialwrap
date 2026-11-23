@@ -60,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
     ts = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
     report_dir = Path(args.report_dir or Path.home() / "b-log" / "realhw-reports" / ts)
     resolved, exe_identity = preflight.resolve_serialwrap_exe(cfg)
-    sw = drivers.SwCli(exe=resolved)
+    sw = drivers.SwCli(exe=resolved, endpoint=cfg.get("endpoint"))
     win = drivers.WinSwCli(cfg.get("win_serialwrap_exe", ""))
     tmux = drivers.TmuxCtl(cfg["tmux_prefix"])
     human_factory = frontends.make_frontend_factory(cfg, tmux=tmux, sw=sw)

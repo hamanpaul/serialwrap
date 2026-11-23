@@ -1,0 +1,450 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serialwrap.local/schemas/stage3_evidence_index",
+  "title": "Stage 0～3 證據索引（stage3）",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "entries",
+    "schema_version",
+    "stage_targets",
+    "target_history"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "entry_id",
+          "item_id",
+          "platform",
+          "result",
+          "artifact_id",
+          "runtime_digest",
+          "bundle_tree_sha256",
+          "runtime_tree_sha256",
+          "contract_revision",
+          "tool_revision",
+          "case_list_sha256",
+          "l1_set_sha256",
+          "workload_sha256",
+          "environment_id",
+          "produced_at",
+          "started_at",
+          "producer",
+          "files",
+          "xfail_cases",
+          "reuse_of",
+          "note",
+          "ledger_through",
+          "ledger_records"
+        ],
+        "properties": {
+          "entry_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{20}$"
+          },
+          "item_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "platform": {
+            "enum": [
+              "linux",
+              "windows"
+            ]
+          },
+          "result": {
+            "enum": [
+              "PASS",
+              "FAIL",
+              "XFAIL",
+              "SKIP",
+              "INFRA_ERROR",
+              "INSUFFICIENT",
+              "XPASS"
+            ]
+          },
+          "artifact_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "runtime_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "bundle_tree_sha256": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "runtime_tree_sha256": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "contract_revision": {
+            "type": "string",
+            "minLength": 1
+          },
+          "tool_revision": {
+            "type": "string",
+            "minLength": 1
+          },
+          "case_list_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "l1_set_sha256": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "workload_sha256": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "environment_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "produced_at": {
+            "type": "string",
+            "minLength": 1
+          },
+          "started_at": {
+            "type": "string",
+            "minLength": 1
+          },
+          "producer": {
+            "pattern": "^(ingest:[a-z0-9-]+|manual)$",
+            "type": "string"
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "path",
+                "sha256"
+              ],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(^|/)\\.\\.(/|$))[^\\\\]+$"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              }
+            }
+          },
+          "xfail_cases": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "reuse_of": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{20}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "note": {
+            "type": "string"
+          },
+          "ledger_through": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ledger_records": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "producer": {
+                  "const": "ingest:junit"
+                }
+              },
+              "required": [
+                "producer"
+              ]
+            },
+            "then": {
+              "properties": {
+                "l1_set_sha256": {
+                  "type": "string"
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "l1_set_sha256": {
+                  "type": "null"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "result": {
+                  "enum": [
+                    "PASS",
+                    "XFAIL"
+                  ]
+                }
+              },
+              "required": [
+                "result"
+              ]
+            },
+            "then": {
+              "properties": {
+                "files": {
+                  "minItems": 1
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "stage_targets": {
+      "type": "object",
+      "propertyNames": {
+        "enum": [
+          "0",
+          "1A",
+          "1B",
+          "2.1",
+          "2.2",
+          "2.3",
+          "2.4",
+          "3"
+        ]
+      },
+      "additionalProperties": {
+        "type": "object",
+        "propertyNames": {
+          "enum": [
+            "linux",
+            "windows"
+          ]
+        },
+        "additionalProperties": {
+          "$ref": "#/$defs/Target"
+        }
+      },
+      "properties": {
+        "3": {
+          "type": "object",
+          "propertyNames": {
+            "enum": [
+              "linux",
+              "windows"
+            ]
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/Target",
+            "required": [
+              "bundle_tree_sha256",
+              "runtime_tree_sha256"
+            ]
+          }
+        }
+      }
+    },
+    "target_history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "artifact_id",
+          "runtime_digest",
+          "contract_revision",
+          "tool_revision",
+          "case_list_sha256",
+          "set_by",
+          "set_at",
+          "stage",
+          "platform"
+        ],
+        "properties": {
+          "artifact_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "runtime_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "contract_revision": {
+            "type": "string",
+            "minLength": 1
+          },
+          "tool_revision": {
+            "type": "string",
+            "minLength": 1
+          },
+          "case_list_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "set_by": {
+            "type": "string",
+            "minLength": 1
+          },
+          "set_at": {
+            "type": "string",
+            "minLength": 1
+          },
+          "bundle_tree_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "runtime_tree_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "stage": {
+            "enum": [
+              "0",
+              "1A",
+              "1B",
+              "2.1",
+              "2.2",
+              "2.3",
+              "2.4",
+              "3"
+            ]
+          },
+          "platform": {
+            "enum": [
+              "linux",
+              "windows"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "Target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_id",
+        "runtime_digest",
+        "contract_revision",
+        "tool_revision",
+        "case_list_sha256",
+        "set_by",
+        "set_at"
+      ],
+      "properties": {
+        "artifact_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "runtime_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "contract_revision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tool_revision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "case_list_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "set_by": {
+          "type": "string",
+          "minLength": 1
+        },
+        "set_at": {
+          "type": "string",
+          "minLength": 1
+        },
+        "bundle_tree_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "runtime_tree_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "dependentRequired": {
+        "bundle_tree_sha256": [
+          "runtime_tree_sha256"
+        ],
+        "runtime_tree_sha256": [
+          "bundle_tree_sha256"
+        ]
+      }
+    }
+  }
+}

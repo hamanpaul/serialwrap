@@ -41,6 +41,22 @@ def test_swcli_exe_injectable(monkeypatch):
     assert captured["argv"][0] == "serialwrap"
 
 
+def test_swcli_endpoint_is_a_global_option(monkeypatch):
+    import subprocess
+
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(argv, timeout=30.0):
+        captured["argv"] = list(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(drivers, "_run", fake_run)
+    drivers.SwCli(exe="/stage3/bin/serialwrap", endpoint="unix:///tmp/stage3.sock").run("daemon", "status")
+
+    assert captured["argv"] == ["/stage3/bin/serialwrap", "--endpoint", "unix:///tmp/stage3.sock",
+                                "daemon", "status"]
+
+
 def test_strip_ansi():
     assert drivers.strip_ansi("a\x1b[31mred\x1b[0mb\x1b(B") == "aredb"
 

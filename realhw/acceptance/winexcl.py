@@ -436,6 +436,7 @@ def main(argv: list[str] | None = None) -> int:
     handoff = commands.add_parser("handoff", help="執行一次 release→hold→attach→probe 循環")
     handoff.add_argument("--phase", choices=["pre", "post"], required=True)
     handoff.add_argument("--serialwrap-exe", default="serialwrap")
+    handoff.add_argument("--endpoint", default=None, help="明確指定 serialwrap RPC endpoint")
     handoff.add_argument("--boards", required=True, help="逗號分隔的受測 COM")
     handoff.add_argument("--observer-header", required=True, type=Path)
     handoff.add_argument("--excl-dir", required=True, type=Path)
@@ -450,7 +451,7 @@ def main(argv: list[str] | None = None) -> int:
 
     boards = [item.strip() for item in args.boards.split(",") if item.strip()]
     binding = _observer_binding(args.observer_header)
-    sw = SwCli(args.serialwrap_exe)
+    sw = SwCli(args.serialwrap_exe, endpoint=args.endpoint)
     lock = ProbeLock(args.excl_dir / _LOCK_NAME)
     verdicts: list[str] = []
     for com in boards:
