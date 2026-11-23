@@ -28,7 +28,7 @@ REV = {
 }
 
 # 0.5.1 依 OD-111 新增、owner_phase 在 P0～P7 的契約 ID（例如 bc:BC-06）；各工作包只加入自己的 ID，多包合併取聯集。
-_V051_ADDED_CONTRACT_IDS: frozenset[str] = frozenset()
+_V051_ADDED_CONTRACT_IDS: frozenset[str] = frozenset({"bc:BC-07"})
 
 
 def _module():

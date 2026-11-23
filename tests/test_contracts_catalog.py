@@ -1341,7 +1341,8 @@ def _bc_by_id():
 
 # 0.5.1 依 OD-111 新增的 Rust-only BC（rulings/v051.md「0.5.1 行為差異登錄規則」第 1、8 點；
 # 編號由編排者指派，各工作包只把自己的編號加進這個集合）。
-_V051_BC_IDS: frozenset[str] = frozenset()
+_V051_BC_IDS: frozenset[str] = frozenset({"BC-07"})
+_V051_BC_APPROVAL_DATES: dict[str, str] = {"BC-07": "2026-11-23"}
 
 
 def test_bc_real_five_bcs_registered() -> None:
@@ -1350,6 +1351,7 @@ def test_bc_real_five_bcs_registered() -> None:
     bc_entries = [c for c in changes if c.kind == "BC"]
     original = {"BC-01", "BC-02", "BC-03", "BC-04", "BC-05"}
     assert {c.id for c in bc_entries} == original | _V051_BC_IDS
+    assert set(_V051_BC_APPROVAL_DATES) == _V051_BC_IDS
     for c in bc_entries:
         assert c.status != "PROPOSED"
         assert c.approval.owner == "hamanpaul"
@@ -1358,6 +1360,7 @@ def test_bc_real_five_bcs_registered() -> None:
             assert c.approval.date == "2026-10-15"
         else:
             assert c.approval.decision_ref == "OD-111"
+            assert c.approval.date == _V051_BC_APPROVAL_DATES[c.id]
             assert c.scope == "rust_only"
             assert "OD-111" in c.related_decisions
 

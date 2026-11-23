@@ -1,5 +1,5 @@
 # 行為變更登記（BC／SC／DF）。由 P0-T5 建立，對應 docs/rust-refactor/plans/01-stage0-contracts.md T5 與調和表 spec-reconciliation.md §1。
-# BC-01～BC-05 依 OD-04 核准；SC-01～SC-37（SC-08 已依 OD-14 #3 撤回、SC-33 已依 OD-79 撤回；SC-37 依 OD-21）、SC-39（OD-48）、DF-01～DF-27 依定稿規格、調和表與相關 OD 推導；SC-30、DF-18 由 P7 Task 0 登記（08 §0.5）；DF-23 依 OD-57、DF-24 依 OD-73 由 P7 登記；DF-25 依 OD-77 登記；DF-26 依 OD-80 登記；DF-27 依 OD-81 登記；SC-32 由 P8 Task 1 登記（09 §0.4，Rust-only）。
+# BC-01～BC-05 依 OD-04 核准；BC-07 依 OD-111／rulings v051（p277）；SC-01～SC-37（SC-08 已依 OD-14 #3 撤回、SC-33 已依 OD-79 撤回；SC-37 依 OD-21）、SC-39（OD-48）、DF-01～DF-27 依定稿規格、調和表與相關 OD 推導；SC-30、DF-18 由 P7 Task 0 登記（08 §0.5）；DF-23 依 OD-57、DF-24 依 OD-73 由 P7 登記；DF-25 依 OD-77 登記；DF-26 依 OD-80 登記；DF-27 依 OD-81 登記；SC-32 由 P8 Task 1 登記（09 §0.4，Rust-only）。
 # SC-33 依擁有者 OD-79 撤回（傳輸中途被拒回 AUTOBOOT_QUIET／COMMAND_ABORTED_IN_FLIGHT），編號保留不重用，亦不新增 pending owner item 8（原列案例改列 SC-03）；DF-26 依 OD-80 登記，SC-38 未佔用。
 # SC-08 依 OD-14 #3 撤回（UDS 維持 0660），編號保留不重用。
 # SC-11 交接排空窗口依 OD-16 (3) 擁有者接受（2026-10-22）：related_decisions、spec_refs、approval_conditions 已載明；owner_confirmation 維持 not_required、owner_item 不指派（擁有者佇列編號未定，見 spec-reconciliation SC-11 列），故不改動 pending 佇列與 tests/test_p1oc_catalog.py 釘定的 confirmed 清單。
@@ -7,7 +7,7 @@
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 11
+revision: 13
 changes:
   - id: "BC-01"
     kind: "BC"
@@ -144,6 +144,32 @@ changes:
     compatibility_impact: "Windows 上 remote -R／-L 由 REMOTE_NOT_SUPPORTED 改為可用（以非阻塞轉接實作；範圍以盤點 07 §8.6 的 POSIX-only 依賴清單為準：fcntl registry／bench 鎖、ControlMaster／ControlPath、setsid／killpg、os.kill(pid,0)、/proc starttime；基線實無 pipe（PLT-D-08））；remote 程序的停止與重啟納入生命週期管理。POSIX 行為不變。既有三種拓樸不變。"
     approval_conditions: "移除 POSIX-only pipe 依賴；驗證非阻塞轉接、程序生命週期、停止、重啟及既有三拓樸"
     related_decisions: ["OD-04"]
+  - id: "BC-07"
+    kind: "BC"
+    title: "Windows Task 顯式 start 在生命週期 hold 下保留停用狀態"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-11-23"
+      decision_ref: "OD-111"
+      basis: "owner_decision"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 13
+    spec_refs: ["OD-111", "v051.md p277"]
+    reconciliation_refs: []
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P4"]
+    case_ids: ["bc07-service-start-journal-after-wait", "bc07-daemon-start-journal-after-wait", "bc07-start-locks-through-enable-run", "bc07-daemon-start-interrupted-update-journal", "bc07-start-install-lock-contention", "bc07-start-enable-failure-unlocks"]
+    compatibility_impact: "Rust windows-task 的 service start（daemon start 轉送亦同）只有在 autostart-hold.json 與 install-journal.json 都不存在時才先 /ENABLE 再 /Run；任一 hold 存在時只執行 /Run，原 JSON 回應與 exit code 不變，stderr 另說明 hold。start 會在生命週期交易內取得安裝鎖與 autostart 鎖；安裝鎖最多等待 5 s、autostart 鎖最多等待 15 s。鎖逾時維持 exit code 2 與 TIMEOUT（或鎖錯誤傳出的碼），並保留 message：安裝鎖沿用 lock_error 的 phase=install_lock，autostart 鎖沿用 rollback.rs 的 phase=update_autostart_hold 與 reason=autostart_lock_timeout；兩者都不以 hint 取代 message，也不執行 /Run。取得兩把鎖後會重讀 config.yaml；若監管模式已不是 windows-task，先釋放本次取得的生命週期鎖，再依鎖內重讀到的模式重新分派原命令一次；daemon start 轉送重讀為 on-demand 時會繼續走 daemon 啟動路徑。SC-18 巢狀 autostart 若在等待 autostart.lock 期間切成 windows-task，/Run 成功只代表排程已接受；CLI 最多等待 10 s，以 health.ping 的 ok/pong 判定 daemon 就緒，並另查 health.status 取得 PID 後重送原 RPC；若 status 未提供 PID，仍依 ping 就緒結果處理、不虛報 PID，逾時回既有 DAEMON_NOT_READY 且不重送。supervision-mode set 只要涉及 windows-task 也會取得安裝鎖，逾時可能回 TIMEOUT（phase=install_lock）。"
+    approval_conditions: "依 OD-111 只修 Rust 並保留 Python 基線；依 v051 p277 裁決，journal hold 與 switch hold 共用只 /Run 分支，新增 service／daemon 入口與鎖交錯測試；Windows 原生驗證不得預標 PASS。"
+    related_decisions: ["OD-111"]
   - id: "SC-01"
     kind: "SC"
     title: "RECOVERING 下 submit 與 open 回 SESSION_RECOVERING"

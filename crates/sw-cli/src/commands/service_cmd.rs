@@ -12,6 +12,25 @@ use sw_proto::error_codes::ErrorCode;
 use sw_proto::pyjson::{repr_float, PyDict, PyInt, PyValue};
 use sw_proto::yaml11::{py_str_of, py_truthy_of, YMap, YValue};
 
+enum ServiceActionResponse {
+    Response(PyDict, i32),
+    Reported(i32),
+    ModeSerializationFailed(String),
+    Reroute {
+        mode: SupervisionMode,
+        raw_mode: Option<PyValue>,
+    },
+}
+
+struct ServiceActionRequest<'a> {
+    mode: &'a SupervisionMode,
+    action: ServiceAction,
+    with_sudo: bool,
+    context: &'a str,
+    routed_to: Option<&'a str>,
+    raw_mode: Option<PyValue>,
+}
+
 /// 執行 `service <action> [--with-sudo]`；exit `0`（ok）／`2`（監管動作失敗）／`1`（config 解析失敗，DF-07）。
 pub fn run_service(ns: &Namespace, ctx: &mut CliCtx) -> i32 {
     let action_text = ns.str("action").unwrap_or("").to_string();
@@ -47,18 +66,29 @@ pub fn run_service(ns: &Namespace, ctx: &mut CliCtx) -> i32 {
         },
     };
     let mode = SupervisionMode::parse(&mode_name);
-    if matches!(
+    // windows-task 的 Start 也走 service_action_response：先恢復啟用再 /Run（#276），與 daemon start 轉送一致。
+    if (matches!(
         mode,
         SupervisionMode::WindowsTask | SupervisionMode::WindowsService
-    ) && matches!(action, ServiceAction::Stop | ServiceAction::Restart)
+    ) && matches!(action, ServiceAction::Stop | ServiceAction::Restart))
+        || (matches!(mode, SupervisionMode::WindowsTask) && action == ServiceAction::Start)
     {
-        let (mut resp, code) = service_action_response(ctx, &mode, action, with_sudo, &context);
-        if let Some(raw) = raw_mode_json {
-            resp.insert("mode", raw);
-        }
-        let _ = output::print_json(&mut ctx.io, &resp);
-        let _ = output::mirror_err(&mut ctx.io, &resp, Some(&context));
-        return code;
+        let request = ServiceActionRequest {
+            mode: &mode,
+            action,
+            with_sudo,
+            context: &context,
+            routed_to: None,
+            raw_mode: raw_mode_json,
+        };
+        let response = service_action_response(
+            ctx,
+            request.mode,
+            request.action,
+            request.with_sudo,
+            request.context,
+        );
+        return finish_service_action_response(ctx, response, request, |_, _, _, _| None);
     }
     // on-demand／未知模式不呼叫任何監管後端（Python `service_action` 亦不呼叫 systemctl）；結果與 NO_SYSTEMD 相同。
     let result = if mode.is_supervised() {
@@ -98,19 +128,271 @@ pub fn run_service_action_with_mode_value(
     routed_to: Option<&str>,
     raw_mode: Option<PyValue>,
 ) -> i32 {
-    let (mut resp, code) = service_action_response(ctx, mode, action, with_sudo, context);
-    if let Some(raw_mode) = raw_mode {
-        resp.insert("mode", raw_mode);
-    }
-    if let Some(route) = routed_to {
-        resp.insert("_routed_to", PyValue::Str(route.to_string()));
-    }
-    let _ = output::print_json(&mut ctx.io, &resp);
-    let _ = output::mirror_err(&mut ctx.io, &resp, Some(context));
-    code
+    run_service_action_with_request(
+        ctx,
+        ServiceActionRequest {
+            mode,
+            action,
+            with_sudo,
+            context,
+            routed_to,
+            raw_mode,
+        },
+        |_, _, _, _| None,
+    )
+}
+
+/// 監管模式重讀後，將鎖內解析結果交回 daemon start 原入口分派一次。
+pub fn run_service_action_with_mode_value_and_on_demand_fallback<F>(
+    ctx: &mut CliCtx<'_>,
+    mode: &SupervisionMode,
+    with_sudo: bool,
+    raw_mode: Option<PyValue>,
+    fallback: F,
+) -> i32
+where
+    F: FnOnce(
+        &mut CliCtx<'_>,
+        Option<&SupervisionMode>,
+        Option<&PyValue>,
+        Option<&str>,
+    ) -> Option<i32>,
+{
+    run_service_action_with_request(
+        ctx,
+        ServiceActionRequest {
+            mode,
+            action: ServiceAction::Start,
+            with_sudo,
+            context: "daemon start",
+            routed_to: Some("service start"),
+            raw_mode,
+        },
+        fallback,
+    )
+}
+
+fn run_service_action_with_request<F>(
+    ctx: &mut CliCtx<'_>,
+    request: ServiceActionRequest<'_>,
+    fallback: F,
+) -> i32
+where
+    F: FnOnce(
+        &mut CliCtx<'_>,
+        Option<&SupervisionMode>,
+        Option<&PyValue>,
+        Option<&str>,
+    ) -> Option<i32>,
+{
+    let response = service_action_response(
+        ctx,
+        request.mode,
+        request.action,
+        request.with_sudo,
+        request.context,
+    );
+    finish_service_action_response(ctx, response, request, fallback)
 }
 
 fn service_action_response(
+    ctx: &mut CliCtx<'_>,
+    mode: &SupervisionMode,
+    action: ServiceAction,
+    with_sudo: bool,
+    context: &str,
+) -> ServiceActionResponse {
+    if matches!(mode, SupervisionMode::WindowsTask) && action == ServiceAction::Start {
+        return service_action_response_with_lifecycle_locks(ctx, mode, action, with_sudo, context);
+    }
+    let (response, code) = service_action_response_unlocked(ctx, mode, action, with_sudo, context);
+    ServiceActionResponse::Response(response, code)
+}
+
+/// windows-task start 與更新、回滾及監管切換共用既有交易鎖。
+/// 先取安裝鎖，再取 autostart 鎖；兩者都保留到 hold 檢查及 `/ENABLE`／`/Run` 完成。
+fn service_action_response_with_lifecycle_locks(
+    ctx: &mut CliCtx<'_>,
+    mode: &SupervisionMode,
+    action: ServiceAction,
+    with_sudo: bool,
+    context: &str,
+) -> ServiceActionResponse {
+    let root = crate::install_layout::resolve_install_root(ctx);
+    let install_lock = match crate::install_layout::install_lock(ctx, &root) {
+        Ok(lock) => lock,
+        Err(mut detail) => {
+            detail.insert("mode", PyValue::Str(mode.as_str().to_string()));
+            detail.insert("action", PyValue::Str(action.as_str().to_string()));
+            return ServiceActionResponse::Response(detail, 2);
+        }
+    };
+
+    let already_had_autostart_lock = ctx
+        .autostart_lock
+        .as_ref()
+        .is_some_and(|guard| guard.is_held());
+    if let Err(code) = crate::rollback::acquire_switch_autostart_lock(ctx) {
+        if !already_had_autostart_lock {
+            ctx.autostart_lock.take();
+        }
+        drop(install_lock);
+        let (response, exit_code) = autostart_lock_failure(mode, action, code.as_str());
+        return ServiceActionResponse::Response(response, exit_code);
+    }
+
+    let config = match load_config_or_report(
+        ctx,
+        ConfigErrorReport::JsonInternalError(context.to_string()),
+    ) {
+        Ok(config) => config,
+        Err(code) => {
+            if !already_had_autostart_lock {
+                ctx.autostart_lock.take();
+            }
+            drop(install_lock);
+            return ServiceActionResponse::Reported(code);
+        }
+    };
+    let configured_mode = config.mode().filter(|value| py_truthy_of(value));
+    let (mode_name, raw_mode) = match configured_mode {
+        None => ("on-demand".to_string(), None),
+        Some(YValue::Str(value)) => (value.clone(), None),
+        Some(value) => match yvalue_to_pyvalue(value) {
+            Ok(raw) => (py_str_of(value), Some(raw)),
+            Err(message) => {
+                if !already_had_autostart_lock {
+                    ctx.autostart_lock.take();
+                }
+                drop(install_lock);
+                return ServiceActionResponse::ModeSerializationFailed(message);
+            }
+        },
+    };
+    let reloaded_mode = SupervisionMode::parse(&mode_name);
+    if !matches!(reloaded_mode, SupervisionMode::WindowsTask) {
+        if !already_had_autostart_lock {
+            ctx.autostart_lock.take();
+        }
+        drop(install_lock);
+        return ServiceActionResponse::Reroute {
+            mode: reloaded_mode,
+            raw_mode,
+        };
+    }
+
+    let result = service_action_response_unlocked(ctx, mode, action, with_sudo, context);
+    if !already_had_autostart_lock {
+        ctx.autostart_lock.take();
+    }
+    drop(install_lock);
+    ServiceActionResponse::Response(result.0, result.1)
+}
+
+fn finish_service_action_response<F>(
+    ctx: &mut CliCtx<'_>,
+    response: ServiceActionResponse,
+    request: ServiceActionRequest<'_>,
+    fallback: F,
+) -> i32
+where
+    F: FnOnce(
+        &mut CliCtx<'_>,
+        Option<&SupervisionMode>,
+        Option<&PyValue>,
+        Option<&str>,
+    ) -> Option<i32>,
+{
+    match response {
+        ServiceActionResponse::Response(response, code) => emit_service_action_response(
+            ctx,
+            response,
+            code,
+            request.context,
+            request.raw_mode,
+            request.routed_to,
+        ),
+        ServiceActionResponse::Reported(code) => code,
+        ServiceActionResponse::ModeSerializationFailed(message) => {
+            if let Some(code) = fallback(ctx, None, None, Some(&message)) {
+                return code;
+            }
+            let public_message = message.strip_prefix("TypeError: ").unwrap_or(&message);
+            output::print_internal_error(&mut ctx.io, request.context, public_message)
+        }
+        ServiceActionResponse::Reroute {
+            mode,
+            raw_mode: reloaded_raw_mode,
+        } => {
+            if matches!(mode, SupervisionMode::OnDemand) {
+                if let Some(code) = fallback(ctx, Some(&mode), reloaded_raw_mode.as_ref(), None) {
+                    return code;
+                }
+            }
+            let (response, code) = service_action_response_unlocked(
+                ctx,
+                &mode,
+                request.action,
+                request.with_sudo,
+                request.context,
+            );
+            emit_service_action_response(
+                ctx,
+                response,
+                code,
+                request.context,
+                reloaded_raw_mode,
+                request.routed_to,
+            )
+        }
+    }
+}
+
+fn emit_service_action_response(
+    ctx: &mut CliCtx<'_>,
+    mut response: PyDict,
+    code: i32,
+    context: &str,
+    raw_mode: Option<PyValue>,
+    routed_to: Option<&str>,
+) -> i32 {
+    if let Some(raw_mode) = raw_mode {
+        response.insert("mode", raw_mode);
+    }
+    if let Some(route) = routed_to {
+        response.insert("_routed_to", PyValue::Str(route.to_string()));
+    }
+    let _ = output::print_json(&mut ctx.io, &response);
+    let _ = output::mirror_err(&mut ctx.io, &response, Some(context));
+    code
+}
+
+fn autostart_lock_failure(
+    mode: &SupervisionMode,
+    action: ServiceAction,
+    error_code: &'static str,
+) -> (PyDict, i32) {
+    let mut result = PyDict::new();
+    result.insert("ok", PyValue::Bool(false));
+    result.insert("mode", PyValue::Str(mode.as_str().to_string()));
+    result.insert("action", PyValue::Str(action.as_str().to_string()));
+    result.insert("error_code", PyValue::Str(error_code.to_string()));
+    result.insert(
+        "reason",
+        PyValue::Str("autostart_lock_timeout".to_string()),
+    );
+    result.insert(
+        "message",
+        PyValue::Str("無法取得 autostart.lock；請稍後重試".to_string()),
+    );
+    result.insert(
+        "phase",
+        PyValue::Str("update_autostart_hold".to_string()),
+    );
+    (result, 2)
+}
+
+fn service_action_response_unlocked(
     ctx: &mut CliCtx<'_>,
     mode: &SupervisionMode,
     action: ServiceAction,
@@ -197,6 +479,34 @@ fn service_action_response(
                 resp.insert("graceful", PyValue::Bool(false));
                 return (resp, 2);
             }
+        }
+    }
+
+    // windows-task 的 stop 中途被打斷會留下停用狀態；一般 start 先恢復啟用（#276）。
+    // 更新／回滾 journal 與監管切換 hold 都代表停用狀態仍受保護：保留 /Run 行為並只補 stderr 說明。
+    let hold_reason =
+        if matches!(mode, SupervisionMode::WindowsTask) && action == ServiceAction::Start {
+            crate::rollback::autostart_hold_present(ctx)
+        } else {
+            None
+        };
+    if let Some(reason) = hold_reason {
+        let message = match reason {
+            crate::rollback::AutostartHoldReason::SupervisionSwitch => {
+                "serialwrap: windows-task start 保留停用狀態：監管模式切換進行中（autostart-hold.json 存在），請待 serialwrap setup 完成或依切換流程恢復\n"
+            }
+            crate::rollback::AutostartHoldReason::InstallJournal => {
+                "serialwrap: windows-task start 保留停用狀態：更新／回滾進行中（install-journal.json 存在），請待 serialwrap setup 完成\n"
+            }
+        };
+        let _ = ctx.io.err_str(message);
+    } else if matches!(mode, SupervisionMode::WindowsTask) && action == ServiceAction::Start {
+        let enabled = ctx.p.service.set_enabled(mode, true, with_sudo);
+        if enabled.iter().any(|command| command.rc != 0) {
+            return (
+                service_failure(mode, action, "恢復啟用排程工作失敗", "service_enable"),
+                2,
+            );
         }
     }
 
