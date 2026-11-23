@@ -104,25 +104,25 @@ struct ConfigRewriteOnRead {
     applied: bool,
 }
 
+struct EventFsHarness {
+    fs: Arc<dyn FsOps>,
+    events: Arc<Mutex<Vec<(u64, String)>>>,
+    config_rewrite_on_read: Arc<Mutex<Option<ConfigRewriteOnRead>>>,
+}
+
 impl EventFs {
-    fn wrap(
-        inner: Arc<dyn FsOps>,
-    ) -> (
-        Arc<dyn FsOps>,
-        Arc<Mutex<Vec<(u64, String)>>>,
-        Arc<Mutex<Option<ConfigRewriteOnRead>>>,
-    ) {
+    fn wrap(inner: Arc<dyn FsOps>) -> EventFsHarness {
         let events = Arc::new(Mutex::new(Vec::new()));
         let config_rewrite_on_read = Arc::new(Mutex::new(None));
-        (
-            Arc::new(Self {
+        EventFsHarness {
+            fs: Arc::new(Self {
                 inner,
                 events: Arc::clone(&events),
                 config_rewrite_on_read: Arc::clone(&config_rewrite_on_read),
             }),
             events,
             config_rewrite_on_read,
-        )
+        }
     }
 
     fn record_write(&self, path: &Path, bytes: &[u8]) {
@@ -474,15 +474,15 @@ impl TestEnv {
 
     fn new(windows: bool) -> Self {
         let tmp_dir = tempfile::tempdir().expect("tempdir 建立失敗");
-        let (fs, fs_events, config_rewrite_on_read) = EventFs::wrap(real_fs());
+        let event_fs = EventFs::wrap(real_fs());
         let mut t = Self {
             tmp_dir,
             windows,
             ops: Vec::new(),
             env: FakeSysEnv::builder().build(),
-            fs,
-            fs_events,
-            config_rewrite_on_read,
+            fs: event_fs.fs,
+            fs_events: event_fs.events,
+            config_rewrite_on_read: event_fs.config_rewrite_on_read,
             clock: FakeClock::new(),
             rpc: FakeRpcConnector::new(),
             procs: FakeProcScan::new(Vec::new()),
