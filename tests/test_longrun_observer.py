@@ -106,7 +106,12 @@ def test_observer_writes_samples(tmp_path, monkeypatch):
     assert len(samples) >= 4
     assert len(samples) == 6
     assert stop.waits == 6
-    assert samples[3]["t_mono"] <= started + sample_window_s
+    # 邊界反例：`t_mono == 0.3` 等於窗口終點，不算在該 0.3 秒窗口內完成；原迴圈在 sample 前先檢查
+    # `elapsed >= duration_s`，因此如果下次取樣剛好等於 deadline，必須當作「已過界」而不是「已內含」.
+    boundary_samples = [{"t_mono": t} for t in (0.0, 0.05, 0.25, 0.30)]
+    assert boundary_samples[3]["t_mono"] >= started + sample_window_s
+    assert not (boundary_samples[3]["t_mono"] < started + sample_window_s)
+    assert samples[3]["t_mono"] < started + sample_window_s
     assert all("wall_ts" in row and "pid" in row["daemon"] and "sessions" in row for row in samples)
 
 
