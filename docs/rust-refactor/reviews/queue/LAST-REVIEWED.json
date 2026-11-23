@@ -34,5 +34,6 @@
   "feature/rust-refactor-p8x": "ef8172f",
   "feature/release-0.4.1": "120cc8a",
   "fix/282-stop-push-residual-line": "4c145af",
-  "fix/297-shutdown-pending-ops-flush": "9130685"
+  "fix/297-shutdown-pending-ops-flush": "9130685",
+  "fix/276-windows-task-start-hold": "b6f1dd6"
 }
