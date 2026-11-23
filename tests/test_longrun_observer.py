@@ -78,6 +78,8 @@ def test_observer_writes_samples(tmp_path, monkeypatch):
     observer = _observer()
     out = tmp_path / "observer.ndjson"
     now = [0.0]
+    sample_window_s = 0.3
+    started = now[0]
 
     class FakeStop:
         """以同一虛擬時鐘等待，完成第六次取樣後停止 observer。"""
@@ -98,12 +100,13 @@ def test_observer_writes_samples(tmp_path, monkeypatch):
 
     stop = FakeStop()
     monkeypatch.setattr(observer.time, "monotonic", lambda: now[0])
-    _run(observer, StubSwCli(), out, duration_s=None, stop=stop)
+    _run(observer, StubSwCli(), out, interval_s=0.05, duration_s=None, stop=stop)
     rows = _read_rows(out)
     samples = [row for row in rows if row.get("kind") == "sample"]
     assert len(samples) >= 4
     assert len(samples) == 6
     assert stop.waits == 6
+    assert samples[3]["t_mono"] <= started + sample_window_s
     assert all("wall_ts" in row and "pid" in row["daemon"] and "sessions" in row for row in samples)
 
 
