@@ -17,7 +17,6 @@ pytestmark = [pytest.mark.core_portable, pytest.mark.process_rpc]
 
 ROOT = Path(__file__).resolve().parents[1]
 CURRENT_VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
-_V051_ADDED_CONTRACT_IDS = frozenset({"bc:BC-06"})
 TOOL = ROOT / "scripts" / "rust" / "contract_coverage.py"
 REV = {
     "contract_revision": "r",
@@ -29,7 +28,7 @@ REV = {
 }
 
 # 0.5.1 依 OD-111 新增、owner_phase 在 P0～P7 的契約 ID（例如 bc:BC-06）；各工作包只加入自己的 ID，多包合併取聯集。
-_V051_ADDED_CONTRACT_IDS: frozenset[str] = frozenset()
+_V051_ADDED_CONTRACT_IDS: frozenset[str] = frozenset({"bc:BC-06"})
 
 
 def _module():
