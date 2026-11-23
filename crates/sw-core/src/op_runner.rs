@@ -1061,7 +1061,7 @@ fn run_self_test_probe(
     if String::from_utf8_lossy(&payload).contains(&expected_marker) {
         return OpOutcome::SelfTest(self_test_evidence_outcome(false, false, false, false, 0));
     }
-    let marker_re = compile_or_never(&format!("(?m)^__SW_ST_{nonce}_OK__\\r?$"));
+    let marker_re = compile_or_never(&format!(r"(?m)^__SW_ST_{nonce}_OK__\r?\n"));
     let report = send(
         ctx,
         grant,

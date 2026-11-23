@@ -892,6 +892,53 @@ fn echo_only_never_confirms_ready() {
 }
 
 #[test]
+fn echo_of_complete_probe_payload_never_confirms_ready() {
+    for segmented in [false, true] {
+        for with_prompt in [false, true] {
+            let h = ActorRig::new(SHELL_PROFILE).ready();
+            h.dev.clear_replies();
+            let tx_start = h.dev.tx_len();
+            let pending = h.request_async(self_test_req());
+            let (payload, nonce) = read_self_test_probe(&h, tx_start);
+            assert!(payload.ends_with('\n'));
+            assert!(payload.contains(&format!("__READY__{nonce}")));
+            assert!(!payload.contains(&format!("__SW_ST_{nonce}_OK__")));
+
+            if segmented {
+                let split = payload.len() / 2;
+                h.inject_rx(&payload.as_bytes()[..split]);
+                h.inject_rx(&payload.as_bytes()[split..]);
+            } else {
+                h.inject_rx(payload.as_bytes());
+            }
+            if with_prompt {
+                h.inject_rx(b"root@t:/# ");
+            }
+
+            let reply = receive_self_test_after_deadline(&h, pending);
+            assert_eq!(
+                reply["probe_ok"],
+                PyValue::Bool(false),
+                "完整 TX 回顯不得冒充執行成功；segmented={segmented}, with_prompt={with_prompt}: {reply:?}"
+            );
+            assert_eq!(reply["probe_evidence"]["tx_complete"], PyValue::Bool(true));
+            assert_eq!(
+                reply["probe_evidence"]["execution_marker"],
+                PyValue::Bool(false)
+            );
+            assert_eq!(
+                reply["probe_evidence"]["probe_rc_zero"],
+                PyValue::Bool(false)
+            );
+            assert_eq!(
+                reply["probe_evidence"]["prompt_after_marker"],
+                PyValue::Bool(false)
+            );
+        }
+    }
+}
+
+#[test]
 fn execution_marker_requires_following_prompt() {
     for response in [0, 1, 2, 3] {
         let h = ActorRig::new(SHELL_PROFILE).ready();
@@ -923,6 +970,46 @@ fn execution_marker_requires_following_prompt() {
 }
 
 #[test]
+fn execution_marker_requires_terminated_line_before_prompt() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.clear_replies();
+    let wait_start = h.rx.regex_wait_starts_for_test();
+    let tx_start = h.dev.tx_len();
+    let pending = h.request_async(self_test_req());
+    let (_, nonce) = read_self_test_probe(&h, tx_start);
+    h.wait_for("marker regex wait", |rig| {
+        rig.rx.regex_wait_starts_for_test() > wait_start
+    });
+
+    // 分兩次交付：marker 暫時位於 RX snapshot 尾端，接著同一行直接出現 prompt。
+    // 未收到換行以前，marker 還不是一個獨立完整輸出行。
+    h.inject_rx(format!("__SW_ST_{nonce}_OK__").as_bytes());
+    let prompt_wait_deadline = std::time::Instant::now() + Duration::from_millis(100);
+    while h.rx.regex_wait_starts_for_test() < wait_start + 2
+        && std::time::Instant::now() < prompt_wait_deadline
+    {
+        std::thread::yield_now();
+    }
+    h.inject_rx(b"root@t:/# ");
+
+    let reply = receive_self_test_after_deadline(&h, pending);
+    assert_eq!(reply["probe_ok"], PyValue::Bool(false), "{reply:?}");
+    assert_eq!(reply["probe_evidence"]["tx_complete"], PyValue::Bool(true));
+    assert_eq!(
+        reply["probe_evidence"]["execution_marker"],
+        PyValue::Bool(false)
+    );
+    assert_eq!(
+        reply["probe_evidence"]["probe_rc_zero"],
+        PyValue::Bool(false)
+    );
+    assert_eq!(
+        reply["probe_evidence"]["prompt_after_marker"],
+        PyValue::Bool(false)
+    );
+}
+
+#[test]
 fn marker_and_prompt_in_same_chunk_confirm_ready() {
     let h = ActorRig::new(SHELL_PROFILE).ready();
     install_executing_shell_target(&h);
@@ -948,6 +1035,45 @@ fn marker_and_prompt_in_same_chunk_confirm_ready() {
             "prompt_after_marker" => true,
         })
     );
+}
+
+#[test]
+fn marker_and_prompt_split_after_unicode_trim_confirm_ready() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.clear_replies();
+    let prefix = format!("root@t:/#\r\n{}noise before probe\r\n", "甲".repeat(131_400));
+    let prefix_end = h.rx.snapshot_len() + prefix.chars().count() as u64;
+    h.inject_rx(prefix.as_bytes());
+    h.wait_for("Unicode RX 填滿並裁切視窗", |rig| {
+        rig.rx.snapshot_len() >= prefix_end
+    });
+    assert!(h.rx.trimmed() > 0, "前置 Unicode 輸出必須裁切 RX 視窗");
+    // 讓大量的準備輸出離開 10 秒 rate window，避免它被誤判為本次 probe 的 RX flood。
+    h.clock.advance(Duration::from_secs(20));
+
+    let tx_start = h.dev.tx_len();
+    let probe_offset = h.rx.snapshot_len();
+    let pending = h.request_async(self_test_req());
+    let (_, nonce) = read_self_test_probe(&h, tx_start);
+    assert!(
+        h.rx.trimmed() > 0 && probe_offset > h.rx.trimmed(),
+        "probe 應從已裁切的 Unicode RX 視窗之後開始：trimmed={}, probe_offset={probe_offset}",
+        h.rx.trimmed()
+    );
+
+    h.inject_rx(format!("__SW_ST_{nonce}_").as_bytes());
+    h.inject_rx(b"OK__\r");
+    h.inject_rx(b"\nroot@t:/");
+    h.inject_rx(b"# ");
+
+    let reply = pending
+        .recv_timeout(Duration::from_secs(2))
+        .expect("跨 chunk marker／prompt 應完成")
+        .expect("self-test RPC 應回字典");
+    assert_eq!(reply["probe_ok"], PyValue::Bool(true), "{reply:?}");
+    assert_eq!(reply["probe_evidence"]["execution_marker"], PyValue::Bool(true));
+    assert_eq!(reply["probe_evidence"]["probe_rc_zero"], PyValue::Bool(true));
+    assert_eq!(reply["probe_evidence"]["prompt_after_marker"], PyValue::Bool(true));
 }
 
 #[test]
