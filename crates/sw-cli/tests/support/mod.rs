@@ -1304,6 +1304,12 @@ impl TestEnv {
         self
     }
 
+    /// 將目前的 fake supervisor 替換為實際 PAL 控制器，保留同一個測試檔案系統與命令替身。
+    pub fn use_real_service(&mut self) {
+        self.service = None;
+        self.real_service = true;
+    }
+
     fn real_service_ctl(&self) -> Arc<dyn sw_pal::service_ctl::ServiceCtl> {
         let env: Arc<dyn SysEnv> = self.env.clone();
         let fs: Arc<dyn FsOps> = self.fs.clone();

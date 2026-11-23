@@ -202,13 +202,25 @@ fn service_action_response(
         }
     }
 
-    // windows-task 的 stop 先停用排程工作、停完才恢復；中途被打斷會留下停用狀態，
-    // 而 `schtasks /Run` 對停用的工作一律失敗。沒有更新／監管切換 hold 時先恢復啟用
-    // （`/ENABLE` 冪等，與 Restart 路徑一致）；有 hold 時停用屬於 hold，維持原行為（#276）。
-    if matches!(mode, SupervisionMode::WindowsTask)
-        && action == ServiceAction::Start
-        && !crate::rollback::autostart_hold_present(ctx)
-    {
+    // windows-task 的 stop 中途被打斷會留下停用狀態；一般 start 先恢復啟用（#276）。
+    // 更新／回滾 journal 與監管切換 hold 都代表停用狀態仍受保護：保留 /Run 行為並只補 stderr 說明。
+    let hold_reason =
+        if matches!(mode, SupervisionMode::WindowsTask) && action == ServiceAction::Start {
+            crate::rollback::autostart_hold_present(ctx)
+        } else {
+            None
+        };
+    if let Some(reason) = hold_reason {
+        let message = match reason {
+            crate::rollback::AutostartHoldReason::SupervisionSwitch => {
+                "serialwrap: windows-task start 保留停用狀態：監管模式切換進行中（autostart-hold.json 存在），請待 serialwrap setup 完成或依切換流程恢復\n"
+            }
+            crate::rollback::AutostartHoldReason::InstallJournal => {
+                "serialwrap: windows-task start 保留停用狀態：更新／回滾進行中（install-journal.json 存在），請待 serialwrap setup 完成\n"
+            }
+        };
+        let _ = ctx.io.err_str(message);
+    } else if matches!(mode, SupervisionMode::WindowsTask) && action == ServiceAction::Start {
         let enabled = ctx.p.service.set_enabled(mode, true, with_sudo);
         if enabled.iter().any(|command| command.rc != 0) {
             return (

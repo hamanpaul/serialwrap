@@ -117,6 +117,142 @@ fn service_windows_task_start_keeps_disabled_under_autostart_hold() {
 }
 
 #[test]
+fn p277_service_start_preserves_interrupted_update_hold() {
+    let mut t = TestEnv::windows()
+        .with_install_root()
+        .with_installed("0.4.0")
+        .with_current("0.4.0", None)
+        .with_bundle(CURRENT_VERSION)
+        .with_supervisor_state("windows-task", true, true)
+        .with_idle_daemon(TestEnv::win_endpoint(), 4242)
+        .with_new_daemon_reporting_version(CURRENT_VERSION)
+        .with_crash_at("stop_supervisor:after_hold")
+        .with_command(
+            &["schtasks", "/Run", "/TN", "serialwrap"],
+            1,
+            "",
+            "ERROR: The task is disabled.\n",
+        );
+
+    let (setup_rc, _, setup_err) = t.run_from_bundle(&["setup"]);
+    assert_eq!(
+        setup_rc, 137,
+        "setup 未在 hold 後的 crash point 中斷：{setup_err}"
+    );
+
+    let journal_before = t.journal_bytes().expect("setup 中斷後必須留下真實 journal");
+    assert_eq!(t.journal_json().unwrap()["step"], "stop_supervisor");
+    let hold_path = t.state_dir().join("autostart-hold.json");
+    assert!(
+        !hold_path.exists(),
+        "windows-task update hold 不使用 switch 檔"
+    );
+    let supervisor = std::sync::Arc::clone(t.service());
+    assert_eq!(
+        supervisor.hold_state_now(),
+        sw_pal::service_ctl::HoldState::Held
+    );
+    let calls_before_start = t.calls().len();
+
+    t.clear_crash();
+    t.use_real_service();
+    let (rc, out, err) = t.run(&["service", "start"]);
+
+    assert_eq!(rc, 2, "停用的工作 /Run 失敗仍須沿用 exit 2：{out}");
+    assert!(out.contains("\"ok\":false"));
+    assert!(out.contains("\"action\":\"start\""));
+    assert!(out.contains("\"rc\":1"));
+    assert!(!out.contains("\"phase\""), "不得新增 phase：{out}");
+    assert!(
+        !out.contains("install-journal.json"),
+        "提示只寫入 stderr：{out}"
+    );
+    assert_eq!(
+        &t.calls()[calls_before_start..],
+        vec![vec!["schtasks", "/Run", "/TN", "serialwrap"]],
+        "update hold 下只可 /Run，不得 /ENABLE"
+    );
+    assert!(err.contains("UNKNOWN_ERROR"), "沿用既有錯誤輸出：{err}");
+    assert!(
+        err.contains("更新／回滾進行中"),
+        "stderr 缺少更新 hold 說明：{err}"
+    );
+    assert!(
+        err.contains("install-journal.json"),
+        "stderr 缺少 journal 名稱：{err}"
+    );
+    assert!(
+        err.contains("請待 serialwrap setup 完成"),
+        "stderr 缺少等待提示：{err}"
+    );
+    assert_eq!(
+        err.matches("install-journal.json").count(),
+        1,
+        "journal hold 提示應只輸出一次：{err}"
+    );
+    assert_eq!(
+        t.journal_bytes().as_deref(),
+        Some(journal_before.as_slice()),
+        "start 不得改寫 journal"
+    );
+    assert_eq!(
+        supervisor.hold_state_now(),
+        sw_pal::service_ctl::HoldState::Held,
+        "start 不得釋放停用 hold"
+    );
+}
+
+#[test]
+fn p277_service_start_reports_switch_hold() {
+    let t = TestEnv::windows()
+        .with_config("supervision_mode: windows-task\n")
+        .with_real_service()
+        .with_command(
+            &["schtasks", "/Run", "/TN", "serialwrap"],
+            0,
+            "SUCCESS: Attempted to run the scheduled task \"serialwrap\".\n",
+            "",
+        );
+    t.write_file(
+        &t.state_dir().join("autostart-hold.json"),
+        b"{\"schema_version\":1,\"op\":\"supervision_set\"}",
+    );
+
+    let (rc, out, err) = t.run(&["service", "start"]);
+
+    assert_eq!(rc, 0, "switch hold 下沿用原 /Run 結果：{out}");
+    assert!(
+        !out.contains("\"hint\""),
+        "hold 說明不得增加 JSON 欄位：{out}"
+    );
+    assert!(
+        !out.contains("監管模式切換進行中"),
+        "hold 說明只寫入 stderr：{out}"
+    );
+    assert!(
+        err.contains("監管模式切換進行中"),
+        "stderr 缺少 switch hold 說明：{err}"
+    );
+    assert!(
+        err.contains("autostart-hold.json"),
+        "stderr 缺少 switch 檔名：{err}"
+    );
+    assert!(
+        err.contains("請待 serialwrap setup 完成"),
+        "stderr 缺少等待提示：{err}"
+    );
+    assert_eq!(
+        err.matches("autostart-hold.json").count(),
+        1,
+        "switch hold 提示應只輸出一次：{err}"
+    );
+    assert_eq!(
+        t.calls(),
+        vec![vec!["schtasks", "/Run", "/TN", "serialwrap"]]
+    );
+}
+
+#[test]
 fn service_windows_task_start_enable_failure_skips_run() {
     let t = TestEnv::windows()
         .with_config("supervision_mode: windows-task\n")

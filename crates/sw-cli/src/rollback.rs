@@ -4483,10 +4483,25 @@ fn autostart_hold_path(ctx: &CliCtx<'_>) -> PathBuf {
     ctx.env.get("SERIALWRAP_STATE_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(&ctx.paths.state_dir)).join("autostart-hold.json")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AutostartHoldReason {
+    SupervisionSwitch,
+    InstallJournal,
+}
+
 /// 是否有更新或監管模式切換留下的 autostart hold（進行中或中斷皆算）。
 /// 有 hold 時監管項的停用狀態屬於 hold 的一部分，呼叫端不得自行恢復啟用（#276）。
-pub(crate) fn autostart_hold_present(ctx: &CliCtx<'_>) -> bool {
-    ctx.p.fs.exists(&autostart_hold_path(ctx))
+pub(crate) fn autostart_hold_present(ctx: &CliCtx<'_>) -> Option<AutostartHoldReason> {
+    if ctx.p.fs.exists(&autostart_hold_path(ctx)) {
+        return Some(AutostartHoldReason::SupervisionSwitch);
+    }
+    let journal = crate::install_layout::resolve_install_root(ctx)
+        .root
+        .join("install-journal.json");
+    ctx.p
+        .fs
+        .exists(&journal)
+        .then_some(AutostartHoldReason::InstallJournal)
 }
 
 fn acquire_switch_autostart_lock(ctx: &mut CliCtx<'_>) -> Result<(), ErrorCode> {
