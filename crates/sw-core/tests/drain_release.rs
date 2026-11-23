@@ -1298,6 +1298,210 @@ fn shutdown_ready_recover_reply_precedes_worker_receipt() {
 }
 
 #[test]
+fn shutdown_interactive_open_reply_precedes_worker_receipt() {
+    use sw_core::op_runner::OpSpec;
+
+    let mut h = CoreHarness::new(SELF_TEST_PROFILE);
+    h.to_ready();
+    let (interactive, effects) = h.rpc_deferred(SessionRequest::InteractiveOpen {
+        owner: "agent:i297-open".into(),
+        timeout_s: 60.0,
+        command: "echo __I297_OPEN__".into(),
+        allow_attached: false,
+    });
+    let grant = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp {
+                grant,
+                spec: OpSpec::InteractiveOpenCmd { .. },
+            } => Some(grant.clone()),
+            _ => None,
+        })
+        .expect("interactive open 的非空 command 應建立 pending op");
+    assert!(interactive.try_recv().is_err(), "open 要等 TX 結果");
+    assert!(h.core.active_lease().is_some(), "pending open 已先建立 lease");
+    let tx_before_shutdown = h.tx_effect_count();
+
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    h.feed(ControlEvent::Shutdown { reply: shutdown_tx });
+    assert!(h.fence.with(|fence| fence.frozen), "Phase 1 必須先凍結 Fence");
+    assert_eq!(h.tx_effect_count(), tx_before_shutdown, "Fence 凍結後不可新增 TX");
+    assert!(!h.core.shutdown_complete(), "WorkerStopped 前 actor 不得結束");
+    assert!(shutdown_rx.try_recv().is_err(), "Shutdown waiter 仍須等待 worker 回條");
+    let result = interactive
+        .try_recv()
+        .expect("Phase 1 必須在 WorkerStopped 前回覆 interactive open")
+        .expect("open 應收到 RPC dict，而不是 framing EXCEPTION");
+    assert_eq!(
+        h.wire(&result),
+        r#"{"ok":false,"error_code":"FLUSHED_BY_SHUTDOWN"}"#
+    );
+    assert!(!h.core.shutdown_complete(), "回覆送出後仍須等 worker 回條");
+    assert!(h.core.active_lease().is_none(), "Phase 1 清除 open 建立的 lease");
+
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).feed();
+    assert!(shutdown_rx.try_recv().unwrap().unwrap()["ok"]
+        .as_bool()
+        .unwrap());
+    assert!(h.core.shutdown_complete(), "回條後 actor 可結束");
+
+    let late = h.feed(ControlEvent::OpFinished {
+        op_id: grant.op_id,
+        epoch: grant.epoch,
+        outcome: OpOutcome::Sent { bytes: 18 },
+        after_rx_seq: None,
+    });
+    assert!(late.is_empty(), "晚到 open 成功不得再回覆或重建 lease");
+    assert!(interactive.try_recv().is_err(), "open 只能回覆一次");
+    assert!(h.core.active_lease().is_none(), "晚到 open 不得重建 lease");
+}
+
+#[test]
+fn shutdown_interactive_send_reply_precedes_worker_receipt() {
+    use sw_core::op_runner::OpSpec;
+
+    let mut h = CoreHarness::new(SELF_TEST_PROFILE);
+    h.to_ready();
+    let opened = h
+        .rpc(SessionRequest::InteractiveOpen {
+            owner: "agent:i297-send".into(),
+            timeout_s: 60.0,
+            command: String::new(),
+            allow_attached: false,
+        })
+        .expect("interactive open 應同步建立有效 lease");
+    assert_eq!(opened.get("ok"), Some(&PyValue::Bool(true)));
+    let interactive_id = h
+        .core
+        .active_lease()
+        .expect("send 前應有有效 lease")
+        .interactive_id
+        .clone();
+    let (interactive, effects) = h.rpc_deferred(SessionRequest::InteractiveSend {
+        interactive_id,
+        data: "payload".into(),
+        encoding: "plain".into(),
+    });
+    let grant = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp {
+                grant,
+                spec: OpSpec::InteractiveSend { .. },
+            } => Some(grant.clone()),
+            _ => None,
+        })
+        .expect("send 應建立 pending op");
+    assert!(interactive.try_recv().is_err(), "send 要等 TX 結果");
+    let tx_before_shutdown = h.tx_effect_count();
+
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    h.feed(ControlEvent::Shutdown { reply: shutdown_tx });
+    assert!(h.fence.with(|fence| fence.frozen), "Phase 1 必須先凍結 Fence");
+    assert_eq!(h.tx_effect_count(), tx_before_shutdown, "Fence 凍結後不可新增 TX");
+    assert!(!h.core.shutdown_complete(), "WorkerStopped 前 actor 不得結束");
+    assert!(shutdown_rx.try_recv().is_err(), "Shutdown waiter 仍須等待 worker 回條");
+    let result = interactive
+        .try_recv()
+        .expect("Phase 1 必須在 WorkerStopped 前回覆 interactive send")
+        .expect("send 應收到 RPC dict，而不是 framing EXCEPTION");
+    assert_eq!(
+        h.wire(&result),
+        r#"{"ok":false,"error_code":"FLUSHED_BY_SHUTDOWN"}"#
+    );
+    assert!(!h.core.shutdown_complete(), "回覆送出後仍須等 worker 回條");
+    assert!(h.core.active_lease().is_none(), "Phase 1 清除 send 使用的 lease");
+
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).feed();
+    assert!(shutdown_rx.try_recv().unwrap().unwrap()["ok"]
+        .as_bool()
+        .unwrap());
+    assert!(h.core.shutdown_complete(), "回條後 actor 可結束");
+
+    let late = h.feed(ControlEvent::OpFinished {
+        op_id: grant.op_id,
+        epoch: grant.epoch,
+        outcome: OpOutcome::Sent { bytes: 7 },
+        after_rx_seq: None,
+    });
+    assert!(late.is_empty(), "晚到 send 成功不得再回覆或 touch lease");
+    assert!(interactive.try_recv().is_err(), "send 只能回覆一次");
+    assert!(h.core.active_lease().is_none(), "晚到 send 不得重建 lease");
+}
+
+#[test]
+fn shutdown_interactive_late_completion_does_not_restore_lease() {
+    use sw_core::op_runner::OpSpec;
+
+    let mut h = CoreHarness::new(SELF_TEST_PROFILE);
+    h.to_ready();
+    h.rpc(SessionRequest::InteractiveOpen {
+        owner: "agent:i297-late".into(),
+        timeout_s: 60.0,
+        command: String::new(),
+        allow_attached: false,
+    })
+    .expect("interactive open 應同步建立有效 lease");
+    let lease = h.core.active_lease().expect("send 前應有有效 lease");
+    let interactive_id = lease.interactive_id.clone();
+    let activity_before_send = lease.last_activity;
+    let (interactive, effects) = h.rpc_deferred(SessionRequest::InteractiveSend {
+        interactive_id,
+        data: "late".into(),
+        encoding: "plain".into(),
+    });
+    let grant = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp {
+                grant,
+                spec: OpSpec::InteractiveSend { .. },
+            } => Some(grant.clone()),
+            _ => None,
+        })
+        .expect("send 應建立 pending op");
+    assert!(interactive.try_recv().is_err());
+    let tx_before_shutdown = h.tx_effect_count();
+
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    h.feed(ControlEvent::Shutdown { reply: shutdown_tx });
+    assert!(h.fence.with(|fence| fence.frozen), "Phase 1 必須先凍結 Fence");
+    assert_eq!(h.tx_effect_count(), tx_before_shutdown, "Fence 凍結後不可新增 TX");
+    let result = interactive
+        .try_recv()
+        .expect("Phase 1 必須在回條前沖刷 send")
+        .expect("send 應收到 RPC dict");
+    assert_eq!(
+        h.wire(&result),
+        r#"{"ok":false,"error_code":"FLUSHED_BY_SHUTDOWN"}"#
+    );
+    assert!(h.core.active_lease().is_none(), "Phase 1 既有清理已移除 lease");
+    assert_eq!(activity_before_send, h.clock.mono_ns());
+
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).feed();
+    assert!(shutdown_rx.try_recv().unwrap().unwrap()["ok"]
+        .as_bool()
+        .unwrap());
+    h.clock.advance(Duration::from_secs(5));
+    let lease_ops_before_late = h.lease_index_ops();
+    let late = h.feed(ControlEvent::OpFinished {
+        op_id: grant.op_id,
+        epoch: grant.epoch,
+        outcome: OpOutcome::Sent { bytes: 4 },
+        after_rx_seq: None,
+    });
+    assert!(late.is_empty(), "晚到成功只可忽略，不得再產生副作用");
+    assert!(interactive.try_recv().is_err(), "Phase 1 已唯一回覆 send");
+    assert!(h.core.active_lease().is_none(), "晚到成功不得重建或 touch lease");
+    assert_eq!(h.lease_index_ops(), lease_ops_before_late, "晚到成功不得重插 lease 索引");
+    assert!(h.core.shutdown_complete());
+}
+
+#[test]
 fn shutdown_force_recover_waiter_is_flushed() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
     h.to_attached(Some("READY_NONCE_TIMEOUT"));

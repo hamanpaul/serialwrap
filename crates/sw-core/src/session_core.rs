@@ -2313,7 +2313,7 @@ impl SessionCore {
         effects
     }
 
-    /// Shutdown Phase 1：先凍結 Fence，再取消 RX 等待、移除需立即沖刷的 op／recover waiter 並回覆 RPC。
+    /// Shutdown Phase 1：先凍結 Fence，再取消 RX 等待、移除需立即沖刷的 op／recover／interactive waiter 並回覆 RPC。
     /// 不等待 OpFinished 或 force-recover timer；晚到事件因 pending／side 登錄或等待者已移除而無副作用。
     fn flush_shutdown_phase1_waiters(&mut self, effects: &mut Vec<Effect>) {
         if !self.deps.fence.with(|fence| fence.frozen) {
@@ -2333,7 +2333,10 @@ impl SessionCore {
             .filter_map(|(op_id, pending)| {
                 matches!(
                     pending,
-                    PendingOp::SelfTest { .. } | PendingOp::Recover { .. }
+                    PendingOp::SelfTest { .. }
+                        | PendingOp::Recover { .. }
+                        | PendingOp::InteractiveOpen { .. }
+                        | PendingOp::InteractiveSend { .. }
                 )
                 .then_some(*op_id)
             })
@@ -2344,8 +2347,11 @@ impl SessionCore {
             };
             self.side_ops.remove(&op_id);
             let reply = match pending {
-                PendingOp::SelfTest { reply, .. } | PendingOp::Recover { reply } => reply,
-                _ => unreachable!("只沖刷 self-test 與 READY recover"),
+                PendingOp::SelfTest { reply, .. }
+                | PendingOp::Recover { reply }
+                | PendingOp::InteractiveOpen { reply, .. }
+                | PendingOp::InteractiveSend { reply, .. } => reply,
+                _ => unreachable!("只沖刷 self-test、recover 與 interactive op"),
             };
             effects.push(Effect::Reply(reply, Ok(flushed_by_shutdown_reply())));
         }
