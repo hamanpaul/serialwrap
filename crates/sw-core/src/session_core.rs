@@ -8880,7 +8880,15 @@ impl SessionCore {
             || self.pending_auto_login
             || self.replay_parked.is_some()
             || self.queue.has_accepted(&self.deps.registry)
-            || self.pending_ops.values().any(|op| matches!(op, PendingOp::Recover { .. }))
+            || self.pending_ops.iter().any(|(op_id, op)| {
+                matches!(op, PendingOp::Recover { .. })
+                    && self.side_ops.get(op_id).is_some_and(|grant| {
+                        grant.op_id == *op_id
+                            && self.generations.conn_epoch == Some(grant.epoch)
+                            && self.generations.owner_gen == grant.owner_gen
+                            && self.generations.fsm_gen == grant.fsm_gen
+                    })
+            })
             || self
                 .background_cmd_ids
                 .iter()

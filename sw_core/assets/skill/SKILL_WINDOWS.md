@@ -61,7 +61,7 @@ serialwrap cmd submit --selector COM0 --cmd "cat /proc/version" --source agent:d
 > 不是 Windows 裝置管理員的實體 `COM5`/`COM7`；對應關係看 `session list`
 > 的 `attached_real_path`（如 `\\.\COM5`）。
 
-> `session self-test` 在忙碌狀態時會以被動 `SESSION_BUSY` 回覆：不送 probe、不新增 UART TX、不 suspend human、不 confirm ready，也不清除 readiness pending。前景操作、有效 queue、login／recover、agent lease 及進行中的 background capture 都屬此類 busy；此時 `recommended_action` 為 `wait`，不代表故障。等前景工作完成，或 capture 結束後再重跑即可；若仍需要立即處理，可依既有規則用下一個命令讓 capture 自動結束。
+> `session self-test` 在忙碌狀態時會被動回覆：一般前景操作、有效 queue、login／recover 或進行中的 background capture 回 `SESSION_BUSY`；有效 agent interactive lease 回 `SESSION_INTERACTIVE_BUSY`。回應的 `recommended_action` 為 `wait`，不送 probe、不新增 UART TX、不 suspend human、不確認 ready，也不清除 readiness pending。忙碌不代表故障。等前景工作或 capture 結束後重跑即可；也可依既有規則由下一個命令終結 capture。
 
 ## 4. Profile 設定
 

@@ -30,7 +30,7 @@ description: 透過 serialwrap broker + CLI 進行多 agent UART 存取，提供
 1. 健康檢查：`serialwrap daemon status`。
 2. 探測資源：`serialwrap session list`、`serialwrap device list`。
 3. 鎖定目標：`serialwrap session self-test --selector COM0`（回報 classification 與 recommended_action）。
-   - **忙碌時的 self-test 是被動式回應，不發 probe、不送 TX**：若前景槽仍有在途命令、有效 queue、login／recover、agent lease 或進行中的 background capture，回應直接 `ok: true`、`classification: "SESSION_BUSY"`、`recommended_action: "wait"`，**不附 `probe_ok`**，也不更新 `last_probe_at`、不 suspend human、不中斷 readiness pending；操作者應等待該前景操作結束，或等 capture 完成後再重跑 self-test。這種 busy 不代表故障，而是「當下不適合探測」的健康狀態。
+   - **忙碌時的 self-test 是被動式回應，不發 probe、不送 TX**：若前景槽仍有在途命令、有效 queue、login／recover 或進行中的 background capture，回應為 `ok: true`、`classification: "SESSION_BUSY"`、`recommended_action: "wait"`；有效 agent interactive lease 則回 `classification: "SESSION_INTERACTIVE_BUSY"`。兩種回應都**不附 `probe_ok`**，也不更新 `last_probe_at`、不 suspend human、不確認 ready、不清除 readiness pending。操作者應等待前景操作或 capture 結束後重跑 self-test；也可依既有規則由下一個命令終結 background capture。忙碌不代表故障，只表示當下不適合探測。
 4. 若 session 未 READY、tty 已變更、或 bridge stale：
    - tty 變更／需重綁：`serialwrap session bind --selector COM0 --device-by-id <by-id>` → `serialwrap session attach --selector COM0`。
    - 不健康／`TARGET_UNRESPONSIVE`：`serialwrap session recover --selector COM0`（非 device attach；可加 `--force` 做 clear+reattach+wait-ready）。
