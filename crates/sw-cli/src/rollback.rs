@@ -4507,6 +4507,24 @@ fn autostart_hold_path(ctx: &CliCtx<'_>) -> PathBuf {
     ctx.env.get("SERIALWRAP_STATE_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(&ctx.paths.state_dir)).join("autostart-hold.json")
 }
 
+/// switch hold 涉及 windows-task 時，setup 復原前須加入安裝交易鎖。
+pub(crate) fn autostart_hold_involves_windows_task(ctx: &CliCtx<'_>) -> bool {
+    let path = autostart_hold_path(ctx);
+    let Ok(bytes) = ctx.p.fs.read(&path) else {
+        return false;
+    };
+    let Ok(PyValue::Dict(record)) = pyjson::loads(&String::from_utf8_lossy(&bytes)) else {
+        return false;
+    };
+    if record.get("op").and_then(as_str) != Some("supervision_set") {
+        return false;
+    }
+    let old_mode = record.get("old_mode").or_else(|| record.get("mode")).and_then(as_str);
+    let target_mode = record.get("target_mode").and_then(as_str);
+    old_mode == Some(SupervisionMode::WindowsTask.as_str())
+        || target_mode == Some(SupervisionMode::WindowsTask.as_str())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AutostartHoldReason {
     SupervisionSwitch,

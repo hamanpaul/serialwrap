@@ -7,6 +7,7 @@
 mod support;
 
 use support::*;
+use std::time::Duration;
 
 const EP: &str = "tcp://127.0.0.1:48700";
 const IDLE_LIST: &str = "{\"ok\":true,\"sessions\":[{\"com\":\"COM0\",\"state\":\"READY\",\"foreground_busy\":false,\"outstanding_commands\":0,\"interactive_session_id\":null,\"recovering\":false}]}";
@@ -926,4 +927,83 @@ fn supervision_set_release_failure_keeps_hold_record() {
     assert_eq!(response["reason"], "autostart_release_failed");
     assert!(response.get("autostart_release_error").is_some());
     assert!(t.state_dir().join("autostart-hold.json").exists());
+}
+
+#[test]
+fn p277_windows_task_switch_waits_for_install_transaction() {
+    let mut t = TestEnv::windows()
+        .with_supervisor_state("windows-task", true, true)
+        .with_install_lock_blocker_without_lock_file(Some(5.2));
+    let install_lock = t.install_root().join(".install.lock");
+    let hold_path = t.state_dir().join("autostart-hold.json");
+    let config_before = t.config_bytes();
+    let service_before = t.service().query_now();
+    assert!(!install_lock.exists(), "競爭者尚未建立 lock path");
+
+    let (rc, out, _) = t.run(&["supervision-mode", "set", "on-demand"]);
+
+    assert_eq!(rc, 2, "未取得安裝交易鎖不得開始切換：{out}");
+    let response = json(&out);
+    assert_eq!(s(&response, "error_code"), "TIMEOUT");
+    assert_eq!(s(&response, "phase"), "install_lock");
+    assert!(t.calls().is_empty(), "取得鎖前不得 DISABLE 或操作監管項");
+    assert!(t.service().actions().is_empty(), "取得鎖前不得變更監管狀態");
+    assert!(t.rpc().requests().is_empty(), "取得鎖前不得 handoff");
+    assert!(!hold_path.exists(), "取得鎖前不得建立 switch hold");
+    assert_eq!(t.config_bytes(), config_before, "取得鎖前不得寫 config");
+    assert_eq!(t.service().query_now(), service_before, "取得鎖前監管狀態須不變");
+    assert!(!install_lock.exists(), "fake 競爭者不得建立實體 lock path");
+
+    t.with_cli_ctx(|ctx| ctx.p.clock.sleep(Duration::from_millis(200)));
+    t.acquire_install_lock();
+}
+
+#[test]
+fn p277_windows_task_hold_recovery_waits_for_install_transaction() {
+    let t = TestEnv::windows().with_supervisor_state("windows-task", true, true);
+    let hold_path = t.state_dir().join("autostart-hold.json");
+    t.write_file(
+        &hold_path,
+        b"{\"schema_version\":1,\"op\":\"supervision_set\",\"old_mode\":\"windows-task\",\"target_mode\":\"on-demand\",\"prior_enabled\":true,\"with_sudo\":false,\"kind\":\"task_disabled\"}\n",
+    );
+    let hold_before = std::fs::read(&hold_path).unwrap();
+    let config_before = t.config_bytes();
+    let service_before = t.service().query_now();
+    let mut t = t.with_install_lock_blocker_without_lock_file(Some(5.2));
+    let install_lock = t.install_root().join(".install.lock");
+    assert!(!install_lock.exists(), "hold recovery 開始前尚無 lock path");
+
+    let (rc, out, _) = t.run(&["setup"]);
+
+    assert_eq!(rc, 2, "setup 不得在安裝交易鎖外復原 switch hold：{out}");
+    let response = json(&out);
+    assert_eq!(s(&response, "error_code"), "TIMEOUT");
+    assert_eq!(s(&response, "phase"), "install_lock");
+    assert_eq!(std::fs::read(&hold_path).unwrap(), hold_before, "hold bytes 不得變更");
+    assert!(t.calls().is_empty(), "未取得鎖前不得 release／ENABLE");
+    assert!(t.service().actions().is_empty(), "未取得鎖前不得 release hold");
+    assert_eq!(t.config_bytes(), config_before, "未取得鎖前不得寫 config");
+    assert_eq!(t.service().query_now(), service_before, "未取得鎖前監管狀態須不變");
+    assert!(!install_lock.exists(), "fake 競爭者不得建立實體 lock path");
+
+    t.with_cli_ctx(|ctx| ctx.p.clock.sleep(Duration::from_millis(200)));
+    t.acquire_install_lock();
+}
+
+#[test]
+fn p277_windows_task_switch_releases_install_lock_after_success_and_refusal() {
+    let mut success = wintask_env().with_idle_daemon(EP, 4242);
+    let (success_rc, success_out, _) = success.run(&["supervision-mode", "set", "on-demand"]);
+    assert_eq!(success_rc, 0, "windows-task 切換應成功：{success_out}");
+    success.acquire_install_lock();
+
+    let mut refused = wintask_env()
+        .with_rpc_ok(EP, "health.ping", "{\"ok\":true}")
+        .with_rpc_ok(EP, "mcu.status", "{\"flashing\":true,\"ok\":true}")
+        .with_rpc_ok(EP, "session.list", FLASHING_LIST);
+    let (refused_rc, refused_out, _) =
+        refused.run(&["supervision-mode", "set", "on-demand", "--force"]);
+    assert_eq!(refused_rc, 2, "flash 中切換應拒絕：{refused_out}");
+    assert_eq!(s(&json(&refused_out), "error_code"), "FLASHING_BUSY");
+    refused.acquire_install_lock();
 }

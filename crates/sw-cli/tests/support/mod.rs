@@ -1210,6 +1210,23 @@ impl TestEnv {
         self
     }
 
+    /// 模擬安裝鎖競爭但鎖檔尚未建立，驗證呼叫端不能只靠 `.install.lock` 是否存在決定是否取鎖。
+    pub fn with_install_lock_blocker_without_lock_file(
+        mut self,
+        release_at_s: Option<f64>,
+    ) -> Self {
+        let lock_path = self.install_root().join(".install.lock");
+        let release_at_ns = release_at_s.map(|seconds| {
+            (seconds.max(0.0) * 1_000_000_000.0)
+                .ceil()
+                .min(u64::MAX as f64) as u64
+        });
+        let gate = FaultFs::wrap(Arc::clone(&self.fs));
+        gate.block_lock_until(&lock_path, Arc::clone(&self.clock), release_at_ns);
+        self.fs = gate;
+        self
+    }
+
     /// 持有安裝交易鎖，於釋放時建立 journal，模擬 update／rollback 先取得鎖再記錄交易狀態。
     pub fn with_install_lock_holder_creating_journal(mut self, release_at_s: f64) -> Self {
         let lock_path = self.install_root().join(".install.lock");
