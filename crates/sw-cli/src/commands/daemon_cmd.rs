@@ -73,17 +73,20 @@ pub fn run_daemon_start(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
             },
             None => PyValue::Str("on-demand".to_string()),
         };
-        return service_cmd::run_service_action_with_mode_value(
+        return service_cmd::run_service_action_with_mode_value_and_on_demand_fallback(
             ctx,
             &mode,
-            ServiceAction::Start,
             flag(ns, "with_sudo"),
-            "daemon start",
-            Some("service start"),
             Some(raw_mode),
+            |ctx| run_daemon_start_on_demand(ns, ctx),
         );
     }
 
+    run_daemon_start_on_demand(ns, ctx)
+}
+
+fn run_daemon_start_on_demand(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
+    let is_win = crate::endpoint_resolve::rpc_backend_is_win(ctx);
     let resolved = match resolve_local(ns, ctx) {
         Ok(value) => value,
         Err(error) => return report_resolve_failure(ctx, error, "daemon start"),
@@ -494,7 +497,7 @@ pub fn run_daemon_restart(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
     start_ns
         .vals
         .insert("force_spawn".to_string(), ArgValue::Bool(false));
-    let (_start_rc, start_resp, start_stderr) = capture_start(ctx, &start_ns);
+    let (_start_rc, start_resp, start_stderr) = capture_start(ctx, &start_ns, None);
     if !start_stderr.is_empty() {
         let text = String::from_utf8_lossy(&start_stderr).replace("\r\n", "\n");
         let _ = ctx.io.err_str(&text);
@@ -510,7 +513,11 @@ pub fn run_daemon_restart(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
     code
 }
 
-fn capture_start(ctx: &mut CliCtx<'_>, ns: &Namespace) -> (i32, PyDict, Vec<u8>) {
+fn capture_start(
+    ctx: &mut CliCtx<'_>,
+    ns: &Namespace,
+    autostart_lock: Option<sw_pal::fs_ops::FileLockGuard>,
+) -> (i32, PyDict, Vec<u8>) {
     let mut out = Vec::new();
     let mut err = Vec::new();
     let newline = ctx.p.caps.text_newline;
@@ -521,7 +528,7 @@ fn capture_start(ctx: &mut CliCtx<'_>, ns: &Namespace) -> (i32, PyDict, Vec<u8>)
         io: crate::ctx::TextIo::new(&mut out, &mut err, newline),
         verbose: ctx.verbose,
         cli_version: ctx.cli_version,
-        autostart_lock: None,
+        autostart_lock,
     };
     let rc = run_daemon_start(ns, &mut nested);
     drop(nested);
@@ -788,8 +795,7 @@ pub fn maybe_autostart_on_demand(
     start_ns
         .vals
         .insert("foreground".to_string(), ArgValue::Bool(false));
-    let (start_rc, start_resp, _) = capture_start(ctx, &start_ns);
-    drop(lock);
+    let (start_rc, start_resp, _) = capture_start(ctx, &start_ns, Some(lock));
     if start_resp.get_truthy("already_running") {
         return AutostartDecision::AlreadyUp;
     }

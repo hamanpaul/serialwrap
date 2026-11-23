@@ -1296,8 +1296,14 @@ fn p277_daemon_start_preserves_interrupted_update_hold() {
         !hold_path.exists(),
         "windows-task update hold 不使用 switch 檔"
     );
-    let supervisor = std::sync::Arc::clone(t.service());
-    assert_eq!(supervisor.hold_state_now(), HoldState::Held);
+    assert!(
+        !t.calls().iter().any(|call| {
+            call.first().is_some_and(|arg| arg == "schtasks")
+                && call.get(1).is_some_and(|arg| arg == "/Change")
+                && call.last().is_some_and(|arg| arg == "/ENABLE")
+        }),
+        "interrupted update hold 下不得 /ENABLE"
+    );
 
     let calls_before_start = t.calls().len();
     t.clear_crash();
@@ -1330,9 +1336,82 @@ fn p277_daemon_start_preserves_interrupted_update_hold() {
         Some(journal_before.as_slice()),
         "daemon start 不得改寫 journal"
     );
+    assert!(
+        !t.calls().iter().any(|call| {
+            call.first().is_some_and(|arg| arg == "schtasks")
+                && call.get(1).is_some_and(|arg| arg == "/Change")
+                && call.last().is_some_and(|arg| arg == "/ENABLE")
+        }),
+        "interrupted update hold 下 daemon start 不得 /ENABLE"
+    );
+}
+
+#[test]
+fn p277_daemon_start_rechecks_mode_after_transaction_wait() {
+    let endpoint = TestEnv::win_endpoint();
+    let t = TestEnv::windows()
+        .with_install_root()
+        .with_config("supervision_mode: windows-task\n")
+        .with_real_service()
+        .with_install_lock_holder_switching_to_on_demand(3.0)
+        .with_rpc_ok(endpoint, "health.ping", PING_OK);
+
+    let actual = t.run(&["--endpoint", endpoint, "daemon", "start"]);
+    let expected = TestEnv::windows()
+        .with_config("supervision_mode: on-demand\n")
+        .with_rpc_ok(endpoint, "health.ping", PING_OK)
+        .run(&["--endpoint", endpoint, "daemon", "start"]);
+
+    assert_eq!(actual, expected, "鎖釋放後須依 on-demand 重新分派");
+    assert_eq!(t.config_bytes(), b"supervision_mode: on-demand\n");
+    assert!(
+        !t.state_dir().join("autostart-hold.json").exists(),
+        "交錯期間不得建立 hold 檔"
+    );
+    assert!(
+        !t.calls()
+            .iter()
+            .any(|call| { call.iter().any(|arg| arg == "/ENABLE" || arg == "/Run") }),
+        "重讀到 on-demand 後不得呼叫排程工作：{:?}",
+        t.calls()
+    );
+}
+
+#[test]
+fn p277_nested_autostart_passes_held_lock_to_windows_task_start() {
+    let endpoint = TestEnv::win_endpoint();
+    let t = TestEnv::windows()
+        .with_install_root()
+        .with_config("supervision_mode: on-demand\n")
+        .with_autostart_lock_holder_switching_to_windows_task(3.0)
+        .with_real_service()
+        .with_command(
+            &["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"],
+            0,
+            "SUCCESS: Changed scheduled task \"serialwrap\".\n",
+            "",
+        )
+        .with_command(
+            &["schtasks", "/Run", "/TN", "serialwrap"],
+            0,
+            "SUCCESS: Attempted to run the scheduled task \"serialwrap\".\n",
+            "",
+        )
+        .with_rpc_refused_kind(endpoint, PalErrorKind::ConnectionRefused);
+
+    let (rc, out, err) = t.run(&["session", "list"]);
+
+    assert_eq!(t.config_bytes(), b"supervision_mode: windows-task\n");
+    assert!(
+        !out.contains("TIMEOUT") && !err.contains("TIMEOUT"),
+        "nested start 不得因重取同一把鎖而逾時：rc={rc}, out={out}, err={err}"
+    );
     assert_eq!(
-        supervisor.hold_state_now(),
-        HoldState::Held,
-        "daemon start 不得釋放停用 hold"
+        t.calls(),
+        vec![
+            argv(&["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"]),
+            argv(&["schtasks", "/Run", "/TN", "serialwrap"]),
+        ],
+        "nested start 應沿用外層持有的 autostart.lock，並完成 windows-task 動作"
     );
 }

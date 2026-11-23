@@ -1498,6 +1498,25 @@ impl TestEnv {
         self
     }
 
+    /// 持有安裝交易鎖，於釋放時將監管模式切為 on-demand。
+    pub fn with_install_lock_holder_switching_to_on_demand(mut self, release_at_s: f64) -> Self {
+        let lock_path = self.install_root().join(".install.lock");
+        let config_path = self.config_path();
+        let release_at_ns = (release_at_s.max(0.0) * 1_000_000_000.0)
+            .ceil()
+            .min(u64::MAX as f64) as u64;
+        let gate = FaultFs::wrap(Arc::clone(&self.fs));
+        gate.block_lock_until_and_create_file(
+            &lock_path,
+            Arc::clone(&self.clock),
+            release_at_ns,
+            &config_path,
+            b"supervision_mode: on-demand\n",
+        );
+        self.fs = gate;
+        self
+    }
+
     /// 持有安裝交易鎖，於釋放時建立切換 hold，模擬監管模式交易先完成 hold 再讓 start 繼續。
     pub fn with_install_lock_holder_creating_switch_hold(mut self, release_at_s: f64) -> Self {
         let lock_path = self.install_root().join(".install.lock");
@@ -1712,6 +1731,28 @@ impl TestEnv {
             release_at_ns,
             &journal_path,
             br#"{"step":"backup_complete"}"#,
+        );
+        self.fs = gate;
+        self
+    }
+
+    /// 持有自動啟動鎖，於釋放時將監管模式切為 windows-task。
+    pub fn with_autostart_lock_holder_switching_to_windows_task(
+        mut self,
+        release_at_s: f64,
+    ) -> Self {
+        let lock_path = self.run_dir().join("autostart.lock");
+        let config_path = self.config_path();
+        let release_at_ns = (release_at_s.max(0.0) * 1_000_000_000.0)
+            .ceil()
+            .min(u64::MAX as f64) as u64;
+        let gate = FaultFs::wrap(Arc::clone(&self.fs));
+        gate.block_lock_until_and_create_file(
+            &lock_path,
+            Arc::clone(&self.clock),
+            release_at_ns,
+            &config_path,
+            b"supervision_mode: windows-task\n",
         );
         self.fs = gate;
         self

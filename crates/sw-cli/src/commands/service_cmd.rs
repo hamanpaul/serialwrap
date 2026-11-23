@@ -12,6 +12,24 @@ use sw_proto::error_codes::ErrorCode;
 use sw_proto::pyjson::{repr_float, PyDict, PyInt, PyValue};
 use sw_proto::yaml11::{py_str_of, py_truthy_of, YMap, YValue};
 
+enum ServiceActionResponse {
+    Response(PyDict, i32),
+    Reported(i32),
+    Reroute {
+        mode: SupervisionMode,
+        raw_mode: Option<PyValue>,
+    },
+}
+
+struct ServiceActionRequest<'a> {
+    mode: &'a SupervisionMode,
+    action: ServiceAction,
+    with_sudo: bool,
+    context: &'a str,
+    routed_to: Option<&'a str>,
+    raw_mode: Option<PyValue>,
+}
+
 /// 執行 `service <action> [--with-sudo]`；exit `0`（ok）／`2`（監管動作失敗）／`1`（config 解析失敗，DF-07）。
 pub fn run_service(ns: &Namespace, ctx: &mut CliCtx) -> i32 {
     let action_text = ns.str("action").unwrap_or("").to_string();
@@ -54,13 +72,22 @@ pub fn run_service(ns: &Namespace, ctx: &mut CliCtx) -> i32 {
     ) && matches!(action, ServiceAction::Stop | ServiceAction::Restart))
         || (matches!(mode, SupervisionMode::WindowsTask) && action == ServiceAction::Start)
     {
-        let (mut resp, code) = service_action_response(ctx, &mode, action, with_sudo, &context);
-        if let Some(raw) = raw_mode_json {
-            resp.insert("mode", raw);
-        }
-        let _ = output::print_json(&mut ctx.io, &resp);
-        let _ = output::mirror_err(&mut ctx.io, &resp, Some(&context));
-        return code;
+        let request = ServiceActionRequest {
+            mode: &mode,
+            action,
+            with_sudo,
+            context: &context,
+            routed_to: None,
+            raw_mode: raw_mode_json,
+        };
+        let response = service_action_response(
+            ctx,
+            request.mode,
+            request.action,
+            request.with_sudo,
+            request.context,
+        );
+        return finish_service_action_response(ctx, response, request, |_| None);
     }
     // on-demand／未知模式不呼叫任何監管後端（Python `service_action` 亦不呼叫 systemctl）；結果與 NO_SYSTEMD 相同。
     let result = if mode.is_supervised() {
@@ -100,16 +127,61 @@ pub fn run_service_action_with_mode_value(
     routed_to: Option<&str>,
     raw_mode: Option<PyValue>,
 ) -> i32 {
-    let (mut resp, code) = service_action_response(ctx, mode, action, with_sudo, context);
-    if let Some(raw_mode) = raw_mode {
-        resp.insert("mode", raw_mode);
-    }
-    if let Some(route) = routed_to {
-        resp.insert("_routed_to", PyValue::Str(route.to_string()));
-    }
-    let _ = output::print_json(&mut ctx.io, &resp);
-    let _ = output::mirror_err(&mut ctx.io, &resp, Some(context));
-    code
+    run_service_action_with_request(
+        ctx,
+        ServiceActionRequest {
+            mode,
+            action,
+            with_sudo,
+            context,
+            routed_to,
+            raw_mode,
+        },
+        |_| None,
+    )
+}
+
+/// 監管模式重讀成 on-demand 時，交由原始 daemon start 入口繼續執行。
+pub fn run_service_action_with_mode_value_and_on_demand_fallback<F>(
+    ctx: &mut CliCtx<'_>,
+    mode: &SupervisionMode,
+    with_sudo: bool,
+    raw_mode: Option<PyValue>,
+    fallback: F,
+) -> i32
+where
+    F: FnOnce(&mut CliCtx<'_>) -> i32,
+{
+    run_service_action_with_request(
+        ctx,
+        ServiceActionRequest {
+            mode,
+            action: ServiceAction::Start,
+            with_sudo,
+            context: "daemon start",
+            routed_to: Some("service start"),
+            raw_mode,
+        },
+        |ctx| Some(fallback(ctx)),
+    )
+}
+
+fn run_service_action_with_request<F>(
+    ctx: &mut CliCtx<'_>,
+    request: ServiceActionRequest<'_>,
+    fallback: F,
+) -> i32
+where
+    F: FnOnce(&mut CliCtx<'_>) -> Option<i32>,
+{
+    let response = service_action_response(
+        ctx,
+        request.mode,
+        request.action,
+        request.with_sudo,
+        request.context,
+    );
+    finish_service_action_response(ctx, response, request, fallback)
 }
 
 fn service_action_response(
@@ -118,13 +190,12 @@ fn service_action_response(
     action: ServiceAction,
     with_sudo: bool,
     context: &str,
-) -> (PyDict, i32) {
+) -> ServiceActionResponse {
     if matches!(mode, SupervisionMode::WindowsTask) && action == ServiceAction::Start {
-        return service_action_response_with_lifecycle_locks(
-            ctx, mode, action, with_sudo, context,
-        );
+        return service_action_response_with_lifecycle_locks(ctx, mode, action, with_sudo, context);
     }
-    service_action_response_unlocked(ctx, mode, action, with_sudo, context)
+    let (response, code) = service_action_response_unlocked(ctx, mode, action, with_sudo, context);
+    ServiceActionResponse::Response(response, code)
 }
 
 /// windows-task start 與更新、回滾及監管切換共用既有交易鎖。
@@ -135,7 +206,7 @@ fn service_action_response_with_lifecycle_locks(
     action: ServiceAction,
     with_sudo: bool,
     context: &str,
-) -> (PyDict, i32) {
+) -> ServiceActionResponse {
     let root = crate::install_layout::resolve_install_root(ctx);
     let install_lock = match crate::install_layout::install_lock(ctx, &root) {
         Ok(lock) => lock,
@@ -150,7 +221,8 @@ fn service_action_response_with_lifecycle_locks(
                 Some(PyValue::Str(value)) => value.as_str(),
                 _ => "無法取得安裝交易鎖；請稍後重試",
             };
-            return lifecycle_lock_failure(mode, action, code, message);
+            let (response, exit_code) = lifecycle_lock_failure(mode, action, code, message);
+            return ServiceActionResponse::Response(response, exit_code);
         }
     };
 
@@ -163,12 +235,58 @@ fn service_action_response_with_lifecycle_locks(
             ctx.autostart_lock.take();
         }
         drop(install_lock);
-        return lifecycle_lock_failure(
+        let (response, exit_code) = lifecycle_lock_failure(
             mode,
             action,
             code.as_str(),
             "無法取得 autostart.lock；請稍後重試",
         );
+        return ServiceActionResponse::Response(response, exit_code);
+    }
+
+    let config = match load_config_or_report(
+        ctx,
+        ConfigErrorReport::JsonInternalError(context.to_string()),
+    ) {
+        Ok(config) => config,
+        Err(code) => {
+            if !already_had_autostart_lock {
+                ctx.autostart_lock.take();
+            }
+            drop(install_lock);
+            return ServiceActionResponse::Reported(code);
+        }
+    };
+    let configured_mode = config.mode().filter(|value| py_truthy_of(value));
+    let (mode_name, raw_mode) = match configured_mode {
+        None => ("on-demand".to_string(), None),
+        Some(YValue::Str(value)) => (value.clone(), None),
+        Some(value) => match yvalue_to_pyvalue(value) {
+            Ok(raw) => (py_str_of(value), Some(raw)),
+            Err(message) => {
+                if !already_had_autostart_lock {
+                    ctx.autostart_lock.take();
+                }
+                drop(install_lock);
+                let public_message = message.strip_prefix("TypeError: ").unwrap_or(&message);
+                return ServiceActionResponse::Reported(output::print_internal_error(
+                    &mut ctx.io,
+                    context,
+                    public_message,
+                ));
+            }
+        },
+    };
+    let reloaded_mode = SupervisionMode::parse(&mode_name);
+    if !matches!(reloaded_mode, SupervisionMode::WindowsTask) {
+        if !already_had_autostart_lock {
+            ctx.autostart_lock.take();
+        }
+        drop(install_lock);
+        return ServiceActionResponse::Reroute {
+            mode: reloaded_mode,
+            raw_mode,
+        };
     }
 
     let result = service_action_response_unlocked(ctx, mode, action, with_sudo, context);
@@ -176,7 +294,73 @@ fn service_action_response_with_lifecycle_locks(
         ctx.autostart_lock.take();
     }
     drop(install_lock);
-    result
+    ServiceActionResponse::Response(result.0, result.1)
+}
+
+fn finish_service_action_response<F>(
+    ctx: &mut CliCtx<'_>,
+    response: ServiceActionResponse,
+    request: ServiceActionRequest<'_>,
+    fallback: F,
+) -> i32
+where
+    F: FnOnce(&mut CliCtx<'_>) -> Option<i32>,
+{
+    match response {
+        ServiceActionResponse::Response(response, code) => emit_service_action_response(
+            ctx,
+            response,
+            code,
+            request.context,
+            request.raw_mode,
+            request.routed_to,
+        ),
+        ServiceActionResponse::Reported(code) => code,
+        ServiceActionResponse::Reroute {
+            mode,
+            raw_mode: reloaded_raw_mode,
+        } => {
+            if matches!(mode, SupervisionMode::OnDemand) {
+                if let Some(code) = fallback(ctx) {
+                    return code;
+                }
+            }
+            let (response, code) = service_action_response_unlocked(
+                ctx,
+                &mode,
+                request.action,
+                request.with_sudo,
+                request.context,
+            );
+            emit_service_action_response(
+                ctx,
+                response,
+                code,
+                request.context,
+                reloaded_raw_mode,
+                request.routed_to,
+            )
+        }
+    }
+}
+
+fn emit_service_action_response(
+    ctx: &mut CliCtx<'_>,
+    mut response: PyDict,
+    code: i32,
+    context: &str,
+    raw_mode: Option<PyValue>,
+    routed_to: Option<&str>,
+) -> i32 {
+    if let Some(raw_mode) = raw_mode {
+        response.insert("mode", raw_mode);
+    }
+    if let Some(route) = routed_to {
+        response.insert("_routed_to", PyValue::Str(route.to_string()));
+    }
+    let _ = output::print_json(&mut ctx.io, &response);
+    let _ = output::mirror_err(&mut ctx.io, &response, Some(context));
+    code
 }
 
 fn lifecycle_lock_failure(

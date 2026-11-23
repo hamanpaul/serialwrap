@@ -147,10 +147,13 @@ fn p277_service_start_preserves_interrupted_update_hold() {
         !hold_path.exists(),
         "windows-task update hold 不使用 switch 檔"
     );
-    let supervisor = std::sync::Arc::clone(t.service());
-    assert_eq!(
-        supervisor.hold_state_now(),
-        sw_pal::service_ctl::HoldState::Held
+    assert!(
+        !t.calls().iter().any(|call| {
+            call.first().is_some_and(|arg| arg == "schtasks")
+                && call.get(1).is_some_and(|arg| arg == "/Change")
+                && call.last().is_some_and(|arg| arg == "/ENABLE")
+        }),
+        "interrupted update hold 下不得 /ENABLE"
     );
     let calls_before_start = t.calls().len();
 
@@ -195,10 +198,13 @@ fn p277_service_start_preserves_interrupted_update_hold() {
         Some(journal_before.as_slice()),
         "start 不得改寫 journal"
     );
-    assert_eq!(
-        supervisor.hold_state_now(),
-        sw_pal::service_ctl::HoldState::Held,
-        "start 不得釋放停用 hold"
+    assert!(
+        !t.calls().iter().any(|call| {
+            call.first().is_some_and(|arg| arg == "schtasks")
+                && call.get(1).is_some_and(|arg| arg == "/Change")
+                && call.last().is_some_and(|arg| arg == "/ENABLE")
+        }),
+        "interrupted update hold 下 start 不得 /ENABLE"
     );
 
     let calls_before_daemon_start = t.calls().len();
@@ -217,6 +223,34 @@ fn p277_service_start_preserves_interrupted_update_hold() {
         t.journal_bytes().as_deref(),
         Some(journal_before.as_slice()),
         "daemon start 不得改寫 journal"
+    );
+}
+
+#[test]
+fn p277_service_start_rechecks_mode_after_transaction_wait() {
+    let t = TestEnv::windows()
+        .with_install_root()
+        .with_config("supervision_mode: windows-task\n")
+        .with_real_service()
+        .with_install_lock_holder_switching_to_on_demand(3.0);
+
+    let actual = t.run(&["service", "start"]);
+    let expected = TestEnv::windows()
+        .with_config("supervision_mode: on-demand\n")
+        .run(&["service", "start"]);
+
+    assert_eq!(actual, expected, "鎖釋放後須依 on-demand 重新分派");
+    assert_eq!(t.config_bytes(), b"supervision_mode: on-demand\n");
+    assert!(
+        !t.state_dir().join("autostart-hold.json").exists(),
+        "交錯期間不得建立 hold 檔"
+    );
+    assert!(
+        !t.calls()
+            .iter()
+            .any(|call| { call.iter().any(|arg| arg == "/ENABLE" || arg == "/Run") }),
+        "重讀到 on-demand 後不得呼叫排程工作：{:?}",
+        t.calls()
     );
 }
 
