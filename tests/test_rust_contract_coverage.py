@@ -28,6 +28,9 @@ REV = {
     "finished_at": "y",
 }
 
+# 0.5.1 依 OD-111 新增、owner_phase 在 P0～P7 的契約 ID（例如 bc:BC-06）；各工作包只加入自己的 ID，多包合併取聯集。
+_V051_ADDED_CONTRACT_IDS: frozenset[str] = frozenset()
+
 
 def _module():
     spec = importlib.util.spec_from_file_location("contract_coverage_under_test", TOOL)
@@ -2467,8 +2470,9 @@ def test_stage2_contract_ids_have_locked_rust_coverage_not_stage1_python():
         # OD-88 的 269 個靜態缺口含 DF-26；保留其既有 P8 phase 歸屬。
         or contract_id == "bc:DF-26"
     }
+    # 0.5.1 依 OD-111 新增的契約 ID 以 _V051_ADDED_CONTRACT_IDS 逐項 add-only 計入；269 不變（rulings/v051.md 登錄規則第 4 點）。
     assert len(stage2_targets) == 269 + len(_V051_ADDED_CONTRACT_IDS), f"OD-88 靜態 universe 數量改變：{len(stage2_targets)}"
-    assert _V051_ADDED_CONTRACT_IDS <= set(stage2_targets)
+    assert _V051_ADDED_CONTRACT_IDS <= set(stage2_targets), sorted(_V051_ADDED_CONTRACT_IDS - set(stage2_targets))
     missing = sorted(
         contract_id for contract_id, item in stage2_targets.items()
         if not item.get("nodeids") and not cc._is_owner_blocked(item)

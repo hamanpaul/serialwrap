@@ -7,7 +7,7 @@
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 15
+revision: 16
 changes:
   - id: "BC-01"
     kind: "BC"
@@ -151,7 +151,7 @@ changes:
     approval:
       owner: "hamanpaul"
       date: "2026-11-22"
-      decision_ref: "OD-04"
+      decision_ref: "OD-111"
       basis: "owner_decision"
     owner_confirmation: "not_required"
     owner_item: null
@@ -160,7 +160,7 @@ changes:
       python: null
       rust:
         stage: "slice-2.1"
-    approved_at_revision: 15
+    approved_at_revision: 16
     spec_refs: ["§5.5"]
     reconciliation_refs: ["issue-297"]
     scope: "rust_only"
