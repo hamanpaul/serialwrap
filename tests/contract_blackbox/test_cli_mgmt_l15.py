@@ -80,6 +80,14 @@ def _finish_test_rig(bridge: BridgeTarget, daemon, cli: Path, env: dict[str, str
     finish_test_rig(bridge, daemon, cli, env)
 
 
+def _wait_bridge_quiet(bridge: BridgeTarget) -> None:
+    """等 TX 的兩個 bridge 觀測點都落盤，再取穩定的零 TX 快照。"""
+    result = bridge.control.call(
+        "barrier", {"mode": "passive", "quiet_ms": 500, "timeout_ms": 10000},
+    )
+    assert result.get("settled") is True, f"UART bridge 未在期限內靜止：{result!r}"
+
+
 def _serialwrapd_pids() -> set[int]:
     """掃描 /proc 中 cmdline 含 serialwrapd 的行程；非 Linux（無 /proc）回傳空集合。"""
     proc_root = Path("/proc")
@@ -160,9 +168,11 @@ def test_update_busy_l15_zero_tx(tmp_path: Path, env: dict[str, str]) -> None:
         cmd_id = submitted["cmd_id"]
         # daemon 送出的行尾依平台而異：POSIX 為 LF，Windows 為 CR（與 TX 實際位元組一致）。
         wait_wire_contains(bridge.evidence_dir, b"hold\n" if os.name != "nt" else b"hold\r")
+        _wait_bridge_quiet(bridge)
         tx_before = tx_bytes(bridge.evidence_dir)
 
         result = run_cli(new_cli, ["setup", "--on-demand"], env, timeout_s=120.0)
+        _wait_bridge_quiet(bridge)
         data = json_stdout(result)
         assert result.returncode == 2, result.stdout + result.stderr
         assert data.get("error_code") == "SESSION_BUSY", data
