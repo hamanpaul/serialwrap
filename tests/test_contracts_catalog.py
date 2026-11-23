@@ -1326,14 +1326,15 @@ def _bc_by_id():
 
 
 def test_bc_real_five_bcs_registered() -> None:
-    """五項 BC 全部登記，核准資訊與狀態符合 OD-04 決策。"""
+    """原有五項 BC 與本包 BC-07 均登記，核准資訊與狀態符合契約規則。"""
     changes, _, _ = _bc()
     bc_entries = [c for c in changes if c.kind == "BC"]
-    assert {c.id for c in bc_entries} == {"BC-01", "BC-02", "BC-03", "BC-04", "BC-05"}
+    assert {c.id for c in bc_entries} == {"BC-01", "BC-02", "BC-03", "BC-04", "BC-05", "BC-07"}
     for c in bc_entries:
         assert c.status != "PROPOSED"
         assert c.approval.decision_ref == "OD-04"
-        assert c.approval.date == "2026-10-15"
+        expected_date = "2026-11-23" if c.id == "BC-07" else "2026-10-15"
+        assert c.approval.date == expected_date
         assert c.approval.owner == "hamanpaul"
 
 
