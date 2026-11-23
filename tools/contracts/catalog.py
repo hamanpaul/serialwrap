@@ -838,10 +838,13 @@ def _check_changes(p: _Problems, changes: list[Any], file_rev: int | None) -> No
 
 
 def bc_decision_ref(cid: object) -> str:
-    """BC-01～BC-05 依 OD-04；Python 凍結後的 BC-06 起依 OD-111。"""
+    """BC 的核准來源：BC-01～BC-05 由 OD-04 核准；BC-06 起為 OD-111（2026-11-22，Python 凍結後的 Rust-only 行為差異）。
+
+    依 rulings/v051.md「0.5.1 行為差異登錄規則」第 8 點（2026-11-23）。id 不合格式時沿用 OD-04，由 id 檢查另行報錯。
+    """
     if isinstance(cid, str):
-        match = re.fullmatch(r"BC-(\d{2})", cid)
-        if match is not None and int(match.group(1)) >= 6:
+        m = re.fullmatch(r"BC-(\d{2})", cid)
+        if m is not None and int(m.group(1)) >= 6:
             return "OD-111"
     return "OD-04"
 
@@ -873,10 +876,7 @@ def _check_approval(p: _Problems, loc: str, approval: object, kind: object, cid:
             p.add(f"{loc}.basis", "kind 為 BC 時 basis 必須為 owner_decision")
         expected_ref = bc_decision_ref(cid)
         if decision_ref != expected_ref:
-            p.add(
-                f"{loc}.decision_ref",
-                f"kind 為 BC 時 decision_ref 必須為 {expected_ref}（BC-01～BC-05 依 OD-04；BC-06 起依 OD-111）",
-            )
+            p.add(f"{loc}.decision_ref", f"kind 為 BC 時 decision_ref 必須為 {expected_ref}（BC-01～BC-05 依 OD-04；BC-06 起依 OD-111）")
     elif kind == "DF" and basis != "reconciliation":
         p.add(f"{loc}.basis", "kind 為 DF 時 basis 必須為 reconciliation")
 

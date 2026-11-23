@@ -740,7 +740,7 @@ STRUCTURAL_CASES = [
     pytest.param(
         "bc_bc06_requires_od111",
         "behavior_change",
-        GOOD_BC.replace("BC-01", "BC-06"),
+        GOOD_BC.replace("id: BC-01\n    kind: BC", "id: BC-06\n    kind: BC"),
         "必須為 OD-111",
         id="bc_bc06_requires_od111",
     ),
@@ -1339,13 +1339,14 @@ def _bc_by_id():
     return {c.id: c for c in _bc_changes()}
 
 
-# 0.5.1 依 OD-111 新增的 Rust-only BC；編號由編排者指派，各工作包只加自己的 ID。
+# 0.5.1 依 OD-111 新增的 Rust-only BC（rulings/v051.md「0.5.1 行為差異登錄規則」第 1、8 點；
+# 編號由編排者指派，各工作包只把自己的編號加進這個集合）。
 _V051_BC_IDS: frozenset[str] = frozenset({"BC-07"})
 _V051_BC_APPROVAL_DATES: dict[str, str] = {"BC-07": "2026-11-23"}
 
 
 def test_bc_real_five_bcs_registered() -> None:
-    """原有五項 BC 維持 OD-04；明列的 0.5.1 BC 依 OD-111 登記。"""
+    """五項 BC 全部登記，核准資訊與狀態符合 OD-04 決策；BC-06 起只能是 _V051_BC_IDS 明列、依 OD-111 的 Rust-only 項目。"""
     changes, _, _ = _bc()
     bc_entries = [c for c in changes if c.kind == "BC"]
     original = {"BC-01", "BC-02", "BC-03", "BC-04", "BC-05"}
