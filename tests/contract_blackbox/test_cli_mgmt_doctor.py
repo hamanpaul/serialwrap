@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from bb_harness import (
+    ab_env,
     cli_prefix,
     is_rust,
     isolated_env,
@@ -63,7 +64,7 @@ def _specified_rust_bundle() -> Path | None:
     """`SERIALWRAP_CLI_EXE`（即 `SW_BUNDLE/bin/serialwrap`）指定的受測 Rust artifact 所在 bundle 根；未指定或非 Rust 回 None。"""
     if not is_rust():
         return None
-    cli = os.environ.get("SERIALWRAP_CLI_EXE", "")
+    cli = ab_env().get("SERIALWRAP_CLI_EXE", "")
     if not cli or cli == "/bin/serialwrap":
         return None
     cli_path = Path(cli)
@@ -344,8 +345,10 @@ def test_doctor_ab_version_pairing_in_bundle(tmp_path: Path) -> None:
         return json.loads(py_res.stdout)["checks"], json.loads(rust_res.stdout)["checks"]
 
     def _assert_same_checks(py_checks: list[dict], rust_checks: list[dict], state: str) -> None:
-        assert len(py_checks) == 19, f"{state}: Python 基線應維持 19 項（證據 {evidence}）"
-        assert len(rust_checks) == 20, f"{state}: Rust 應為 19 項基線加唯一 BC-08（證據 {evidence}）"
+        py_version_pairing = [c for c in py_checks if c.get("check") == "version_pairing"]
+        assert len(py_version_pairing) == 1, f"{state}: Python bundle 應保留唯一 version_pairing（證據 {evidence}）"
+        assert len(py_checks) == 20, f"{state}: Python 應為 19 項基線加 version_pairing（證據 {evidence}）"
+        assert len(rust_checks) == 21, f"{state}: Rust 應為 19 項基線、version_pairing 加唯一 BC-08（證據 {evidence}）"
         profile_checks = [c for c in rust_checks if c.get("check") == "profile_template_fields"]
         assert len(profile_checks) == 1, f"{state}: Rust profile_template_fields 必須恰好一項（證據 {evidence}）"
         profile_index = next(i for i, item in enumerate(rust_checks) if item["check"] == "profile_template_fields")
