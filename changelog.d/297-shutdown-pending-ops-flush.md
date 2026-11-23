@@ -2,4 +2,4 @@
 type: fix
 scope: rust-daemon
 ---
-新增 Shutdown 專用的 RX regex 等待取消狀態與喚醒介面，供 issue 297 後續停機操作使用；一般 RX 等待與 login／file-transfer 取消路徑維持原行為。
+issue 297：Shutdown Phase 1 凍結 Fence 後立即取消在途 self-test 的 nonce／prompt RX 等待，並在 WorkerStopped 前以 `FLUSHED_BY_SHUTDOWN` 回覆；probe 已送出時仍使用同一錯誤碼，不延長停機上限。

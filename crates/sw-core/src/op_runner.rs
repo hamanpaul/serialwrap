@@ -29,7 +29,7 @@ use crate::mailbox::ControlEvent;
 use crate::quiet_gate::is_reboot_command;
 use crate::session_core::OpGrant;
 use crate::tx_writer::{FenceReject, TxClass, TxJob, TxPermit, TxReport, TxWriterHandle};
-use crate::uart_bridge::{RunCancel, RxShared};
+use crate::uart_bridge::{RunCancel, RxShared, WaitOutcome};
 use crate::wal::{WalAppendReq, WalWriter};
 
 /// 前景 op 的種類（`Effect::StartOp` 內容）。
@@ -997,15 +997,34 @@ fn run_self_test_probe(
         }
     }
     let nonce_re = compile_or_never(nonce);
-    if !wait_regex_from(ctx, &nonce_re, offset, timeout_s) {
-        let (flood, _) = ctx.rx.rx_stats(ctx.clock.mono_ns());
-        return OpOutcome::SelfTest(pydict! {
-            "probe_ok" => false,
-            "rx_bytes_last_10s" => py_int(flood as i128),
-        });
+    match ctx.rx.wait_for_regex_from_shutdown_cancellable(
+        &nonce_re,
+        offset,
+        secs(timeout_s),
+        &*ctx.clock,
+    ) {
+        WaitOutcome::Matched => {}
+        WaitOutcome::TimedOut => {
+            let (flood, _) = ctx.rx.rx_stats(ctx.clock.mono_ns());
+            return OpOutcome::SelfTest(pydict! {
+                "probe_ok" => false,
+                "rx_bytes_last_10s" => py_int(flood as i128),
+            });
+        }
+        WaitOutcome::Cancelled => {
+            return OpOutcome::SelfTestRefused(FenceReject::Cancelled);
+        }
     }
     let prompt_re = compile_or_never(&ctx.profile.template.prompt_regex);
-    let _ = wait_regex_from(ctx, &prompt_re, offset, timeout_s);
+    if ctx.rx.wait_for_regex_from_shutdown_cancellable(
+        &prompt_re,
+        offset,
+        secs(timeout_s),
+        &*ctx.clock,
+    ) == WaitOutcome::Cancelled
+    {
+        return OpOutcome::SelfTestRefused(FenceReject::Cancelled);
+    }
     OpOutcome::SelfTest(pydict! { "probe_ok" => true })
 }
 

@@ -120,6 +120,9 @@ pub struct RxShared {
     transfer_cancel_gen: AtomicU64,
     /// issue 297：daemon Shutdown 專用、單向的 RX 等待取消狀態；不與 login／transfer 世代共用。
     shutdown_waits_cancelled: AtomicBool,
+    /// 測試觀察：記錄 regex 等待入口，供 self-test nonce／prompt 等待的決定性同步。
+    #[cfg(feature = "test-fakes")]
+    regex_wait_starts: AtomicU64,
 }
 
 impl RxShared {
@@ -137,7 +140,14 @@ impl RxShared {
             run_cancel_gen: AtomicU64::new(0),
             transfer_cancel_gen: AtomicU64::new(0),
             shutdown_waits_cancelled: AtomicBool::new(false),
+            #[cfg(feature = "test-fakes")]
+            regex_wait_starts: AtomicU64::new(0),
         })
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn regex_wait_starts_for_test(&self) -> u64 {
+        self.regex_wait_starts.load(Ordering::Acquire)
     }
 
     /// P8 Task 5：取消本 bridge 上進行中的檔案傳輸等待（watching_transfers 的 `RunCancel` 轉真）並喚醒等待者。
@@ -349,6 +359,8 @@ impl RxShared {
     where
         F: Fn(&str) -> bool,
     {
+        #[cfg(feature = "test-fakes")]
+        self.regex_wait_starts.fetch_add(1, Ordering::AcqRel);
         let timeout_ns = timeout.as_nanos().min(u64::MAX as u128) as u64;
         let deadline = clock.mono_ns().saturating_add(timeout_ns);
         if clock.mono_ns() >= deadline {
@@ -1077,6 +1089,8 @@ impl RxShared {
         timeout: Duration,
         clock: &dyn Clock,
     ) -> WaitOutcome {
+        #[cfg(feature = "test-fakes")]
+        self.regex_wait_starts.fetch_add(1, Ordering::AcqRel);
         if self.shutdown_waits_cancelled.load(Ordering::Acquire) {
             return WaitOutcome::Cancelled;
         }

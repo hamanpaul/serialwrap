@@ -1,15 +1,19 @@
 #![cfg(feature = "test-fakes")]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{bounded, Receiver, Sender};
+mod support;
+use support::ActorRig;
+use sw_core::mailbox::ControlEvent;
+use sw_core::session_core::SessionRequest;
 use sw_core::uart_bridge::{RxShared, WaitOutcome};
 use sw_pal::fakes::clock::FakeClock;
 use sw_pal::traits::Clock;
-use sw_proto::pyre::{PyFlags, compile};
+use sw_proto::pyre::{compile, PyFlags};
 
 struct WaitNotifyingClock {
     inner: Arc<FakeClock>,
@@ -47,6 +51,101 @@ fn notifying_clock() -> (Arc<dyn Clock>, Arc<FakeClock>, Receiver<()>) {
         wait_started: wait_started_tx,
     });
     (clock, fake, wait_started_rx)
+}
+
+const SELF_TEST_PROFILE: &str = "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    ready_probe: 'echo __READY__${nonce}'\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: t, act_no: 1, alias: t+1, device_by_id: /s/by-id/usb-A}\n";
+
+fn assert_shutdown_cancels_self_test_wait(prompt_wait: bool) {
+    let rig = ActorRig::new(SELF_TEST_PROFILE).ready();
+    rig.dev.clear_replies();
+    let tx_start = rig.dev.tx_len();
+    let wait_start = rig.rx.regex_wait_starts_for_test();
+    let controls_before = rig.actor_probe().entries("Control").len();
+    let self_test = rig.request_async(SessionRequest::SelfTest {
+        timeout_s: 60.0,
+        strict_human_lock: false,
+    });
+
+    rig.wait_for("self-test nonce probe TX", |actor| {
+        actor.dev.tx_len() > tx_start
+    });
+    let probe = String::from_utf8_lossy(&rig.dev.tx_since(tx_start)).into_owned();
+    let nonce = probe
+        .split("__READY__")
+        .nth(1)
+        .expect("self-test probe 應帶 nonce")
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect::<String>();
+    assert_eq!(nonce.len(), 8, "self-test nonce 應為 8 位十六進位");
+
+    rig.wait_for("self-test nonce regex wait", |actor| {
+        actor.rx.regex_wait_starts_for_test() > wait_start
+    });
+    if prompt_wait {
+        let nonce_wait_count = rig.rx.regex_wait_starts_for_test();
+        rig.inject_rx(format!("__READY__{nonce}\r\n").as_bytes());
+        rig.wait_for("self-test prompt regex wait", |actor| {
+            actor.rx.regex_wait_starts_for_test() > nonce_wait_count
+        });
+    }
+
+    // Worker close 暫停在回條前，讓測試能確認 OpRunner 已因 Shutdown 取消等待並送出 OpFinished。
+    let tx_at_shutdown = rig.dev.tx_len();
+    rig.dev.pause_next_close();
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    rig.send_control(ControlEvent::Shutdown { reply: shutdown_tx });
+    let self_test_reply = self_test.recv_timeout(Duration::from_millis(400)).ok();
+    let close_paused = rig.dev.wait_paused(Duration::from_millis(400));
+
+    let deadline = std::time::Instant::now() + Duration::from_millis(400);
+    let mut runner_finished = false;
+    while std::time::Instant::now() < deadline {
+        // OpFinished 沿用 actor probe 既有的泛型 Control 標籤，不能改寫共用觀測契約。
+        if rig.actor_probe().entries("Control").len() > controls_before {
+            runner_finished = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    rig.dev.release_pause();
+    let shutdown_reply = shutdown_rx.recv_timeout(Duration::from_secs(2)).ok();
+
+    let flushed = self_test_reply
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .is_some_and(|dict| {
+            dict.get("ok").and_then(sw_proto::pyjson::PyValue::as_bool) == Some(false)
+                && dict
+                    .get("error_code")
+                    .and_then(sw_proto::pyjson::PyValue::as_str)
+                    == Some("FLUSHED_BY_SHUTDOWN")
+        });
+    let shutdown_completed = shutdown_reply
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .is_some_and(|dict| {
+            dict.get("ok").and_then(sw_proto::pyjson::PyValue::as_bool) == Some(true)
+        });
+
+    assert!(close_paused, "停機 drain 應在 WorkerStopped 回條前暫停");
+    assert!(flushed, "停機時 self-test 應立即回 FLUSHED_BY_SHUTDOWN");
+    assert!(
+        runner_finished,
+        "Shutdown 應取消 self-test 的 RX 等待並收尾 OpRunner"
+    );
+    assert_eq!(
+        rig.dev.tx_len(),
+        tx_at_shutdown,
+        "Fence 凍結後 self-test 不得再送 TX"
+    );
+    assert!(shutdown_completed, "釋放 fake close 後 Shutdown 應收斂");
+}
+
+#[test]
+fn shutdown_cancels_self_test_nonce_and_prompt_waits() {
+    assert_shutdown_cancels_self_test_wait(false);
+    assert_shutdown_cancels_self_test_wait(true);
 }
 
 #[test]

@@ -10,7 +10,7 @@ use sw_core::drain::{StopId, WorkerStoppedReceipt};
 use sw_core::login_fsm::{LoginOutcome, LoginPlan};
 use sw_core::mailbox::{ControlEvent, DetachReason, OpenFailure, TimerEvent};
 use sw_core::op_runner::OpOutcome;
-use sw_core::session_core::{Effect, SessionRequest};
+use sw_core::session_core::{Effect, SessionRequest, SessionState};
 use sw_core::tx_writer::{EvidenceGap, OpId, TxLedger, TxOpLedger};
 use sw_pal::traits::{HolderReport, HolderScanStatus, PalError};
 use sw_proto::pyjson::{dumps, PyDict, PyValue, RPC_WIRE};
@@ -21,6 +21,8 @@ fn release() -> SessionRequest {
         reason: PyValue::Null,
     }
 }
+
+const SELF_TEST_PROFILE: &str = "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    ready_probe: 'echo __READY__${nonce}'\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: t, act_no: 1, alias: t+1, device_by_id: /s/by-id/usb-A}\n";
 
 fn wp510r_i24_barrier(phase: sw_core::custody::CustodyPhaseSnapshot) -> sw_core::custody::CustodyBarrier {
     sw_core::custody::CustodyBarrier::Pending(sw_core::custody::CustodySnapshot {
@@ -1183,6 +1185,111 @@ fn shutdown_flushes_with_flushed_by_shutdown() {
 /// 停機時 drain 收尾執行緒的 `WorkerStopped`（safety lane）先於傳輸 op 的 `OpFinished`（control lane）被 actor 處理。
 /// 回條只結算 worker，傳輸的回覆仍掛在 `pending_ops`；此時 actor 若結束，回覆通道隨 core 丟棄，RPC 端只拿到
 /// 通用錯誤。OD-62：停機中止的傳輸必須以 OpRunner 映射的 COMMAND_ABORTED_IN_FLIGHT／FLUSHED_BY_RECOVERY 回覆。
+#[test]
+fn shutdown_self_test_reply_precedes_worker_receipt() {
+    let mut h = CoreHarness::new(SELF_TEST_PROFILE);
+    h.to_ready();
+    let (self_test, effects) = h.rpc_deferred(SessionRequest::SelfTest {
+        timeout_s: 60.0,
+        strict_human_lock: false,
+    });
+    let grant = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp { grant, .. } => Some(grant.clone()),
+            _ => None,
+        })
+        .expect("self-test 應產生 StartOp");
+
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    h.feed(ControlEvent::Shutdown { reply: shutdown_tx });
+    assert!(
+        h.fence.with(|fence| fence.frozen),
+        "回覆前 Fence 必須已凍結"
+    );
+    assert!(
+        shutdown_rx.try_recv().is_err(),
+        "Shutdown waiter 仍須等 WorkerStopped 回條"
+    );
+    assert!(
+        !h.core.shutdown_complete(),
+        "WorkerStopped 前 actor 不得結束"
+    );
+
+    let result = self_test
+        .try_recv()
+        .expect("Phase 1 必須在 WorkerStopped 前回覆 self-test")
+        .expect("self-test 應收到 RPC dict，而不是 framing EXCEPTION");
+    assert_eq!(result.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(
+        result.get("error_code"),
+        Some(&PyValue::from("FLUSHED_BY_SHUTDOWN"))
+    );
+    assert!(
+        result.get("reason").is_none(),
+        "一般 Shutdown 不得偽稱 handoff_frozen"
+    );
+
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).feed();
+    assert!(shutdown_rx.try_recv().unwrap().unwrap()["ok"]
+        .as_bool()
+        .unwrap());
+    assert!(h.core.shutdown_complete(), "回覆送出後 actor 可於回條收斂");
+    let _ = grant;
+}
+
+#[test]
+fn shutdown_self_test_late_op_finished_is_ignored() {
+    use sw_proto::pydict;
+
+    let mut h = CoreHarness::new(SELF_TEST_PROFILE);
+    h.to_ready();
+    let (self_test, effects) = h.rpc_deferred(SessionRequest::SelfTest {
+        timeout_s: 60.0,
+        strict_human_lock: false,
+    });
+    let grant = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp { grant, .. } => Some(grant.clone()),
+            _ => None,
+        })
+        .expect("self-test 應產生 StartOp");
+
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    h.feed(ControlEvent::Shutdown { reply: shutdown_tx });
+    let late_effects = h.feed(ControlEvent::OpFinished {
+        op_id: grant.op_id,
+        epoch: grant.epoch,
+        outcome: OpOutcome::SelfTest(pydict! {
+            "probe_ok" => true,
+            "rx_bytes_last_10s" => 0,
+        }),
+        after_rx_seq: None,
+    });
+    assert!(late_effects.is_empty(), "晚到成功結果不得套用 op 副作用");
+    assert_ne!(h.core.state(), SessionState::Ready);
+    let result = self_test
+        .try_recv()
+        .expect("Phase 1 必須在 WorkerStopped 前送出 RPC 回覆")
+        .expect("回覆為 dict");
+    assert_eq!(result.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(
+        result.get("error_code"),
+        Some(&PyValue::from("FLUSHED_BY_SHUTDOWN"))
+    );
+
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).feed();
+    assert!(self_test.try_recv().is_err(), "晚到結果不得再次回覆 RPC");
+    assert!(shutdown_rx.try_recv().unwrap().unwrap()["ok"]
+        .as_bool()
+        .unwrap());
+    assert_ne!(h.core.state(), SessionState::Ready);
+    assert!(h.core.shutdown_complete());
+}
+
 #[test]
 fn shutdown_receipt_before_transfer_op_finished_keeps_actor_until_reply() {
     use sw_core::file_transfer::{FileTransferKind, FileTransferRequest};

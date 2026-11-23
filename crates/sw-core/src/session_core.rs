@@ -2013,6 +2013,10 @@ impl SessionCore {
         if kind == StopKind::Shutdown {
             self.shutdown_requested = true;
         }
+        if kind == StopKind::Shutdown && (self.stop.is_some() || self.pending_open_stop.is_some()) {
+            // 既有 stop／pending-open 分支的 Fence 已在首次 Phase 1 凍結；仍須在早退前沖刷 self-test waiter。
+            self.flush_shutdown_self_test_ops(&mut effects.0);
+        }
         if let Some(stop) = &mut self.stop {
             if kind == stop.kind || kind == StopKind::Shutdown {
                 if kind == StopKind::Release && stop.stalled {
@@ -2252,6 +2256,9 @@ impl SessionCore {
         // P8 Task 5（brief 不符 #1）：drain Phase 1 喚醒進行中的檔案傳輸等待（`RunCancel::watching_transfers`），
         // 其 TX 已由上方凍結擋下；不呼叫 `cancel_login_runs`（P7 login 行為不變）。
         self.deps.rx.cancel_transfer_runs();
+        if kind == StopKind::Shutdown {
+            self.flush_shutdown_self_test_ops(&mut effects.0);
+        }
         let code = if kind == StopKind::Shutdown {
             "FLUSHED_BY_SHUTDOWN"
         } else {
@@ -2273,6 +2280,32 @@ impl SessionCore {
             ev: TimerEvent::DrainTimeout { epoch, stop_id },
         });
         effects
+    }
+
+    /// Shutdown Phase 1：Fence 已凍結後才取消 self-test RX 等待、移除 op 登錄並回覆 RPC。
+    /// 不等待 OpFinished；晚到事件因 pending／side 登錄已移除而無副作用。
+    fn flush_shutdown_self_test_ops(&mut self, effects: &mut Vec<Effect>) {
+        self.deps.rx.cancel_shutdown_waits();
+        let op_ids: Vec<OpId> = self
+            .pending_ops
+            .iter()
+            .filter_map(|(op_id, pending)| {
+                matches!(pending, PendingOp::SelfTest { .. }).then_some(*op_id)
+            })
+            .collect();
+        for op_id in op_ids {
+            let Some(PendingOp::SelfTest { reply, .. }) = self.pending_ops.remove(&op_id) else {
+                continue;
+            };
+            self.side_ops.remove(&op_id);
+            effects.push(Effect::Reply(
+                reply,
+                Ok(pydict! {
+                    "ok" => false,
+                    "error_code" => "FLUSHED_BY_SHUTDOWN",
+                }),
+            ));
+        }
     }
 
     /// Python `_begin_drain_locked` Phase 1（等回條前）：非 shutdown 設 `last_error=<reason>`（Removed／Rebound／
