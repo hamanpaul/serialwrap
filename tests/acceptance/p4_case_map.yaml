@@ -388,7 +388,6 @@ cases:
   - sw-cli::mgmt_doctor::profile_template_fields_invalid_yaml_is_unavailable
   - sw-cli::mgmt_doctor::profile_template_fields_not_materialized
   - sw-cli::mgmt_doctor::profile_template_fields_unreadable_is_unavailable
-  - sw-cli::sw_cli::doctor_cmd::profile_template_fields_tests::profile_template_asset_errors_are_unavailable
   - tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_profile_template_fields_invalid_yaml
   - tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_profile_template_fields_not_materialized
   evidence: target/p4-evidence/bc08-doctor-profile-unavailable.json

@@ -1377,6 +1377,7 @@ def test_bc08_doctor_profile_template_fields_registered() -> None:
     assert change["scope"] == "rust_only"
     assert change["ab_participation"] == "absolute_only"
     assert change["applies_to"]["python"] is None
+    assert change["applies_to"]["rust"]["stage"] == "stage-1b"
     assert change["phases"] == ["P4"]
     assert change["approved_at_revision"] == behavior["revision"] == 12
     assert set(change["case_ids"]) == expected_case_ids

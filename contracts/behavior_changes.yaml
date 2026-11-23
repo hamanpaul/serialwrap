@@ -159,7 +159,7 @@ changes:
     applies_to:
       python: null
       rust:
-        stage: "stage-2"
+        stage: "stage-1b"
     approved_at_revision: 12
     spec_refs: ["§8.7"]
     reconciliation_refs: ["issue-289"]
