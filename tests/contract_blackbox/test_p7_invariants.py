@@ -212,9 +212,17 @@ def _reject_zero_tx(p7, tgt, want: str) -> None:
 
 
 def _assert_python_detached_terminal_state(state: dict, baseline: dict) -> None:
-    """DF-23 Python oracle：baseline 與每個觀察樣本都須是核准的 DETACHED 終態，且重試欄位須與 baseline 相同。"""
+    """DF-23 Python oracle：維持核准的 DETACHED 終態、重試欄位與 attach／probe／TX 事件時間戳。"""
     accepted = {"ATTACH_FAILED:TxIncompleteError", "LOGIN_PROMPT_TIMEOUT"}
-    keys = ("reprobe_attempts", "next_reprobe_at", "reprobe_exhausted", "bridge_generation")
+    keys = (
+        "reprobe_attempts",
+        "next_reprobe_at",
+        "reprobe_exhausted",
+        "bridge_generation",
+        "last_state_change_at",
+        "last_probe_at",
+        "last_tx_at",
+    )
     for snapshot in (baseline, state):
         for key in keys:
             assert key in snapshot, (key, snapshot)
@@ -232,6 +240,9 @@ def test_python_detached_terminal_state_oracle_accepts_the_two_observed_states()
         "next_reprobe_at": None,
         "reprobe_exhausted": False,
         "bridge_generation": 1,
+        "last_state_change_at": "2026-11-23T08:05:24.654773+00:00",
+        "last_probe_at": None,
+        "last_tx_at": None,
     }
     for error in ("ATTACH_FAILED:TxIncompleteError", "LOGIN_PROMPT_TIMEOUT"):
         baseline = {"state": "DETACHED", "last_error": error, **fields}
@@ -249,6 +260,10 @@ def test_python_detached_terminal_state_oracle_accepts_the_two_observed_states()
             {**baseline, "next_reprobe_at": 123.0},
             {**baseline, "reprobe_exhausted": True},
             {**baseline, "bridge_generation": 2},
+            # 兩次輪詢間 ATTACHING→DETACHED 失敗後，重試欄位與終態都可能復原；持久事件時間仍須揭露該次嘗試。
+            {**baseline, "last_state_change_at": "2026-11-23T08:05:25.000000+00:00"},
+            {**baseline, "last_probe_at": "2026-11-23T08:05:25.000000+00:00"},
+            {**baseline, "last_tx_at": "2026-11-23T08:05:25.000000+00:00"},
         ):
             with pytest.raises(AssertionError):
                 _assert_python_detached_terminal_state(bad, baseline)
@@ -263,8 +278,16 @@ def test_python_detached_terminal_state_oracle_accepts_the_two_observed_states()
 
 
 def _wait_stable_python_baseline(p7, timeout_s: float = 60.0) -> tuple[dict, dict]:
-    """等手動 attach 收斂後才建立 DF-23 baseline；baseline 與下一筆快照都必須是核准的 DETACHED 終態。"""
-    keys = ("reprobe_attempts", "next_reprobe_at", "reprobe_exhausted", "bridge_generation")
+    """手動 attach 收斂後建立 baseline，並帶上偵測取樣間 attach／probe／TX 的持久時間戳。"""
+    keys = (
+        "reprobe_attempts",
+        "next_reprobe_at",
+        "reprobe_exhausted",
+        "bridge_generation",
+        "last_state_change_at",
+        "last_probe_at",
+        "last_tx_at",
+    )
     accepted = {"ATTACH_FAILED:TxIncompleteError", "LOGIN_PROMPT_TIMEOUT"}
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -315,7 +338,8 @@ def test_release_during_login_waits_for_handle_close(p7, tmp_path):
 
     2026-11-23 編排者裁決（rulings/v051.md 補登，72334366）：Python 分支只接受 `DETACHED` +
     `ATTACH_FAILED:TxIncompleteError` 或 `LOGIN_PROMPT_TIMEOUT`；baseline 與之後 10 s 的每個樣本都須維持
-    `DETACHED`，且 `reprobe_attempts`、`next_reprobe_at`、`reprobe_exhausted`、`bridge_generation` 不變。
+    `DETACHED`，且 `reprobe_attempts`、`next_reprobe_at`、`reprobe_exhausted`、`bridge_generation` 不變；
+    `last_state_change_at`、`last_probe_at`、`last_tx_at` 也須存在且不變，以捕捉兩次輪詢間失敗後回到 DETACHED 的 attach 嘗試。
     `READY`、`ATTACHING`、空錯誤、錯誤前綴匹配及首次 attach 失敗後重試均不核准。Rust 分支與 §11.3-4
     的 handle 時序斷言不改。"""
     tgt = FakeTarget(tmp_path / "t0", delay_ms=1500)       # 每個回應延遲 1.5 s：login 進行中可插入 release
@@ -361,7 +385,7 @@ def test_release_during_login_waits_for_handle_close(p7, tmp_path):
         s, baseline = _wait_stable_python_baseline(p7)
         _assert_python_detached_terminal_state(s, baseline)
         t_end = time.monotonic() + 10.0
-        while time.monotonic() < t_end:                     # 不自動重試：維持 DETACHED，且重試欄位不變。
+        while time.monotonic() < t_end:                     # 不自動重試：終態、重試欄位及持久事件時間戳均不變。
             row = _row(p7)
             _assert_python_detached_terminal_state(row, baseline)
             time.sleep(0.5)
