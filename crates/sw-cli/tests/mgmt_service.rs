@@ -255,6 +255,31 @@ fn p277_service_start_rechecks_mode_after_transaction_wait() {
 }
 
 #[test]
+fn p277_service_start_preserves_non_serializable_mode_after_transaction_wait() {
+    let contents = b"supervision_mode: 2020-01-01\n";
+    let t = TestEnv::windows()
+        .with_install_root()
+        .with_config("supervision_mode: windows-task\n")
+        .with_real_service()
+        .with_install_lock_holder_writing_config(1.0, contents);
+
+    let actual = t.run(&["service", "start"]);
+    let expected = TestEnv::windows()
+        .with_config("supervision_mode: 2020-01-01\n")
+        .with_real_service()
+        .run(&["service", "start"]);
+
+    assert_eq!(actual, expected, "鎖釋放後需保留 service start 直接解析新模式的輸出");
+    assert!(
+        !t.calls().iter().any(|call| {
+            call.iter().any(|arg| arg == "/ENABLE" || arg == "/Run")
+        }),
+        "不可序列化模式不得呼叫排程工作：{:?}",
+        t.calls()
+    );
+}
+
+#[test]
 fn p277_service_start_reports_switch_hold() {
     let t = TestEnv::windows()
         .with_config("supervision_mode: windows-task\n")

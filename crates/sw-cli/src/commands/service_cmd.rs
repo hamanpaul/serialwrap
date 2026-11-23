@@ -15,6 +15,7 @@ use sw_proto::yaml11::{py_str_of, py_truthy_of, YMap, YValue};
 enum ServiceActionResponse {
     Response(PyDict, i32),
     Reported(i32),
+    ModeSerializationFailed(String),
     Reroute {
         mode: SupervisionMode,
         raw_mode: Option<PyValue>,
@@ -141,7 +142,7 @@ pub fn run_service_action_with_mode_value(
     )
 }
 
-/// 監管模式重讀成 on-demand 時，交由原始 daemon start 入口繼續執行。
+/// 監管模式重讀後需重新分派時，交回原始 daemon start 入口處理新設定。
 pub fn run_service_action_with_mode_value_and_on_demand_fallback<F>(
     ctx: &mut CliCtx<'_>,
     mode: &SupervisionMode,
@@ -268,12 +269,7 @@ fn service_action_response_with_lifecycle_locks(
                     ctx.autostart_lock.take();
                 }
                 drop(install_lock);
-                let public_message = message.strip_prefix("TypeError: ").unwrap_or(&message);
-                return ServiceActionResponse::Reported(output::print_internal_error(
-                    &mut ctx.io,
-                    context,
-                    public_message,
-                ));
+                return ServiceActionResponse::ModeSerializationFailed(message);
             }
         },
     };
@@ -316,6 +312,13 @@ where
             request.routed_to,
         ),
         ServiceActionResponse::Reported(code) => code,
+        ServiceActionResponse::ModeSerializationFailed(message) => {
+            if let Some(code) = fallback(ctx) {
+                return code;
+            }
+            let public_message = message.strip_prefix("TypeError: ").unwrap_or(&message);
+            output::print_internal_error(&mut ctx.io, request.context, public_message)
+        }
         ServiceActionResponse::Reroute {
             mode,
             raw_mode: reloaded_raw_mode,

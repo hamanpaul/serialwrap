@@ -78,7 +78,7 @@ pub fn run_daemon_start(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
             &mode,
             flag(ns, "with_sudo"),
             Some(raw_mode),
-            |ctx| run_daemon_start_on_demand(ns, ctx),
+            |ctx| run_daemon_start(ns, ctx),
         );
     }
 
@@ -800,12 +800,13 @@ pub fn maybe_autostart_on_demand(
         return AutostartDecision::AlreadyUp;
     }
     if start_resp.get_truthy("ok") {
-        let pid = start_resp
-            .get("pid")
-            .and_then(int_as_i64)
-            .unwrap_or_default()
-            .max(0) as u32;
-        return AutostartDecision::Started { pid };
+        if let Some(pid) = positive_pid(&start_resp) {
+            return AutostartDecision::Started { pid };
+        }
+        if let Some(pid) = wait_for_daemon_ready(ctx, resolved) {
+            return AutostartDecision::Started { pid };
+        }
+        return AutostartDecision::Failed(output::error_resp(ErrorCode::DaemonNotReady, None));
     }
     if ping(ctx, &resolved.endpoint, 0.5) {
         return AutostartDecision::AlreadyUp;
@@ -821,6 +822,51 @@ pub fn maybe_autostart_on_demand(
         failure.insert("ok", PyValue::Bool(false));
     }
     AutostartDecision::Failed(failure)
+}
+
+/// 排程 `/Run` 回成功只代表工作已接受；在既有 Windows 啟動期限內等 health.ping 回報正 PID。
+fn wait_for_daemon_ready(ctx: &mut CliCtx<'_>, resolved: &ResolvedEndpoint) -> Option<u32> {
+    const WAIT_LIMIT: Duration = Duration::from_secs(10);
+    const POLL_INTERVAL: Duration = Duration::from_millis(200);
+    let started_ns = ctx.p.clock.mono_ns();
+    loop {
+        let elapsed_ns = ctx.p.clock.mono_ns().saturating_sub(started_ns);
+        if elapsed_ns >= WAIT_LIMIT.as_nanos() as u64 {
+            return None;
+        }
+        if let Some(outcome) = rpc(
+            ctx,
+            resolved,
+            "health.ping",
+            0.5,
+            &PyValue::Dict(PyDict::new()),
+        ) {
+            trace(
+                ctx,
+                resolved,
+                "health.ping",
+                0.5,
+                &outcome.resp,
+                &outcome.meta,
+            );
+            if outcome.resp.get_truthy("ok") {
+                if let Some(pid) = positive_pid(&outcome.resp) {
+                    return Some(pid);
+                }
+            }
+        }
+        let elapsed_ns = ctx.p.clock.mono_ns().saturating_sub(started_ns);
+        if elapsed_ns >= WAIT_LIMIT.as_nanos() as u64 {
+            return None;
+        }
+        let remaining = Duration::from_nanos(WAIT_LIMIT.as_nanos() as u64 - elapsed_ns);
+        ctx.p.clock.sleep(POLL_INTERVAL.min(remaining));
+    }
+}
+
+fn positive_pid(response: &PyDict) -> Option<u32> {
+    let pid = response.get("pid").and_then(int_as_i64)?;
+    u32::try_from(pid).ok().filter(|pid| *pid > 0)
 }
 
 #[derive(Debug)]

@@ -1378,6 +1378,31 @@ fn p277_daemon_start_rechecks_mode_after_transaction_wait() {
 }
 
 #[test]
+fn p277_daemon_start_preserves_non_serializable_mode_after_transaction_wait() {
+    let contents = b"supervision_mode: 2020-01-01\n";
+    let t = TestEnv::windows()
+        .with_install_root()
+        .with_config("supervision_mode: windows-task\n")
+        .with_real_service()
+        .with_install_lock_holder_writing_config(1.0, contents);
+
+    let actual = t.run(&["daemon", "start"]);
+    let expected = TestEnv::windows()
+        .with_config("supervision_mode: 2020-01-01\n")
+        .with_real_service()
+        .run(&["daemon", "start"]);
+
+    assert_eq!(actual, expected, "鎖釋放後需保留 daemon start 直接解析新模式的輸出");
+    assert!(
+        !t.calls().iter().any(|call| {
+            call.iter().any(|arg| arg == "/ENABLE" || arg == "/Run")
+        }),
+        "不可序列化模式不得呼叫排程工作：{:?}",
+        t.calls()
+    );
+}
+
+#[test]
 fn p277_nested_autostart_passes_held_lock_to_windows_task_start() {
     let endpoint = TestEnv::win_endpoint();
     let t = TestEnv::windows()
@@ -1413,5 +1438,92 @@ fn p277_nested_autostart_passes_held_lock_to_windows_task_start() {
             argv(&["schtasks", "/Run", "/TN", "serialwrap"]),
         ],
         "nested start 應沿用外層持有的 autostart.lock，並完成 windows-task 動作"
+    );
+}
+
+#[test]
+fn p277_nested_autostart_waits_for_windows_task_daemon_readiness() {
+    let endpoint = TestEnv::win_endpoint();
+    let t = TestEnv::windows()
+        .with_install_root()
+        .with_config("supervision_mode: on-demand\n")
+        .with_autostart_lock_holder_switching_to_windows_task(3.0)
+        .with_real_service()
+        .with_command(
+            &["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"],
+            0,
+            "SUCCESS: Changed scheduled task \"serialwrap\".\n",
+            "",
+        )
+        .with_command(
+            &["schtasks", "/Run", "/TN", "serialwrap"],
+            0,
+            "SUCCESS: Attempted to run the scheduled task \"serialwrap\".\n",
+            "",
+        )
+        .with_rpc_refused_then_ok(endpoint, "session.list", SESSION_LIST_OK)
+        .with_rpc_ok(endpoint, "health.ping", r#"{"ok":false}"#);
+    t.rpc().respond_at(
+        endpoint,
+        "health.ping",
+        t.clock().clone(),
+        Duration::from_secs(5),
+        PING_OK,
+    );
+
+    let (rc, out, err) = t.run(&["session", "list"]);
+
+    assert_eq!(rc, 0, "daemon ready 後才重送原 RPC：out={out}, err={err}");
+    assert!(err.contains("pid=4321"), "應使用 health.ping 確認的 PID：{err}");
+    assert!(
+        t.clock().elapsed() >= Duration::from_secs(5),
+        "應等待到排程 daemon 回報 ready：{:?}",
+        t.clock().elapsed()
+    );
+    assert_eq!(rpc_count(&t, "session.list"), 1, "ready 前不得重送原 RPC");
+    assert_eq!(
+        t.calls(),
+        vec![
+            argv(&["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"]),
+            argv(&["schtasks", "/Run", "/TN", "serialwrap"]),
+        ]
+    );
+}
+
+#[test]
+fn p277_nested_autostart_fails_when_windows_task_daemon_never_becomes_ready() {
+    let endpoint = TestEnv::win_endpoint();
+    let t = TestEnv::windows()
+        .with_install_root()
+        .with_config("supervision_mode: on-demand\n")
+        .with_autostart_lock_holder_switching_to_windows_task(3.0)
+        .with_real_service()
+        .with_command(
+            &["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"],
+            0,
+            "SUCCESS: Changed scheduled task \"serialwrap\".\n",
+            "",
+        )
+        .with_command(
+            &["schtasks", "/Run", "/TN", "serialwrap"],
+            0,
+            "SUCCESS: Attempted to run the scheduled task \"serialwrap\".\n",
+            "",
+        )
+        .with_rpc_refused_then_ok(endpoint, "session.list", SESSION_LIST_OK)
+        .with_rpc_ok(endpoint, "health.ping", r#"{"ok":false}"#);
+
+    let (rc, out, err) = t.run(&["session", "list"]);
+
+    assert_ne!(rc, 0, "daemon 未 ready 不得回成功：out={out}, err={err}");
+    assert!(err.contains("DAEMON_NOT_READY"), "須回既有 not-ready 錯誤：{err}");
+    assert!(!err.contains("pid=0"), "不得以 pid=0 宣稱已啟動：{err}");
+    assert_eq!(rpc_count(&t, "session.list"), 0, "daemon ready 前不得重送原 RPC");
+    assert_eq!(
+        t.calls(),
+        vec![
+            argv(&["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"]),
+            argv(&["schtasks", "/Run", "/TN", "serialwrap"]),
+        ]
     );
 }
