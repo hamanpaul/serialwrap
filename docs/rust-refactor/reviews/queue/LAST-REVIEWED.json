@@ -36,5 +36,5 @@
   "fix/282-stop-push-residual-line": "4c145af",
   "fix/297-shutdown-pending-ops-flush": "d502c35",
   "fix/276-windows-task-start-hold": "b245cbb",
-  "fix/ci-thin-timing-margins": "62ebe61"
+  "fix/ci-thin-timing-margins": "1a3a50e"
 }
