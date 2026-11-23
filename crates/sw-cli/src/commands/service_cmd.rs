@@ -221,19 +221,10 @@ fn service_action_response_with_lifecycle_locks(
     let root = crate::install_layout::resolve_install_root(ctx);
     let install_lock = match crate::install_layout::install_lock(ctx, &root) {
         Ok(lock) => lock,
-        Err(detail) => {
-            let code = match detail.get("error_code") {
-                Some(PyValue::Str(value)) if value == ErrorCode::Timeout.as_str() => {
-                    ErrorCode::Timeout.as_str()
-                }
-                _ => ErrorCode::InternalError.as_str(),
-            };
-            let message = match detail.get("message") {
-                Some(PyValue::Str(value)) => value.as_str(),
-                _ => "無法取得安裝交易鎖；請稍後重試",
-            };
-            let (response, exit_code) = lifecycle_lock_failure(mode, action, code, message);
-            return ServiceActionResponse::Response(response, exit_code);
+        Err(mut detail) => {
+            detail.insert("mode", PyValue::Str(mode.as_str().to_string()));
+            detail.insert("action", PyValue::Str(action.as_str().to_string()));
+            return ServiceActionResponse::Response(detail, 2);
         }
     };
 
@@ -246,12 +237,7 @@ fn service_action_response_with_lifecycle_locks(
             ctx.autostart_lock.take();
         }
         drop(install_lock);
-        let (response, exit_code) = lifecycle_lock_failure(
-            mode,
-            action,
-            code.as_str(),
-            "無法取得 autostart.lock；請稍後重試",
-        );
+        let (response, exit_code) = autostart_lock_failure(mode, action, code.as_str());
         return ServiceActionResponse::Response(response, exit_code);
     }
 
@@ -381,24 +367,29 @@ fn emit_service_action_response(
     code
 }
 
-fn lifecycle_lock_failure(
+fn autostart_lock_failure(
     mode: &SupervisionMode,
     action: ServiceAction,
     error_code: &'static str,
-    message: &str,
 ) -> (PyDict, i32) {
-    let result = ServiceResult {
-        ok: false,
-        mode: mode.as_str().to_string(),
-        action: action.as_str().to_string(),
-        rc: None,
-        stdout: None,
-        stderr: None,
-        error_code: Some(error_code),
-        hint: Some(message.to_string()),
-        phase: None,
-    };
-    (result_to_pydict(&result), 2)
+    let mut result = PyDict::new();
+    result.insert("ok", PyValue::Bool(false));
+    result.insert("mode", PyValue::Str(mode.as_str().to_string()));
+    result.insert("action", PyValue::Str(action.as_str().to_string()));
+    result.insert("error_code", PyValue::Str(error_code.to_string()));
+    result.insert(
+        "reason",
+        PyValue::Str("autostart_lock_timeout".to_string()),
+    );
+    result.insert(
+        "message",
+        PyValue::Str("無法取得 autostart.lock；請稍後重試".to_string()),
+    );
+    result.insert(
+        "phase",
+        PyValue::Str("update_autostart_hold".to_string()),
+    );
+    (result, 2)
 }
 
 fn service_action_response_unlocked(

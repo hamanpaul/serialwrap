@@ -341,6 +341,19 @@ fn p277_start_entries_wait_for_autostart_lock() {
 
         assert_eq!(rc, 2, "{args:?} 持鎖逾時應失敗：{out}");
         assert!(out.contains("\"error_code\":\"TIMEOUT\""), "{out}");
+        assert!(
+            out.contains("\"phase\":\"update_autostart_hold\""),
+            "{args:?} autostart 鎖逾時應保留既有 phase：{out}"
+        );
+        assert!(
+            out.contains("\"message\":\"無法取得 autostart.lock；請稍後重試\""),
+            "{args:?} autostart 鎖逾時應回傳既有 message：{out}"
+        );
+        assert!(
+            out.contains("\"reason\":\"autostart_lock_timeout\""),
+            "{args:?} autostart 鎖逾時應保留既有 reason：{out}"
+        );
+        assert!(!out.contains("\"hint\":"), "{args:?} 不得以 hint 取代 message：{out}");
         assert!(t.calls().is_empty(), "{args:?} 未取得生命週期鎖不得執行 schtasks");
         assert!(err.contains("TIMEOUT"), "{err}");
     }
@@ -690,6 +703,15 @@ fn p277_start_install_lock_contention_skips_supervisor() {
 
     assert_eq!(rc, 2, "持有安裝鎖時 start 應逾時：{out}");
     assert!(out.contains("\"error_code\":\"TIMEOUT\""), "{out}");
+    assert!(
+        out.contains("\"phase\":\"install_lock\""),
+        "安裝鎖逾時應保留既有 phase：{out}"
+    );
+    assert!(
+        out.contains("\"message\":\"另一個 setup／更新／回滾正在進行（"),
+        "安裝鎖逾時應保留既有 message：{out}"
+    );
+    assert!(!out.contains("\"hint\":"), "安裝鎖逾時不得以 hint 取代 message：{out}");
     assert!(t.calls().is_empty(), "未取得安裝鎖不得呼叫 schtasks");
     assert!(!t.install_lock_available(), "測試中的交易持有者仍須持鎖");
     assert!(err.contains("TIMEOUT"), "{err}");
