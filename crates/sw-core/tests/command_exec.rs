@@ -3437,6 +3437,9 @@ fn recover_while_foreground_command_sends_recover_keys() {
 #[test]
 fn self_test_while_foreground_command_sends_probe() {
     let (h, _id) = ready_with_hung_command();
+    h.wait_for("前景命令 TX 完整提交", |h| {
+        h.dev.os_submits() > 0 && h.dev.tx_since(0).ends_with(b"sleep 20\n")
+    });
     let before_bytes = h.dev.tx_len();
     let before_writes = h.dev.write_calls();
     let before_submits = h.dev.os_submits();

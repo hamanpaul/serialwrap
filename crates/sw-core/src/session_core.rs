@@ -7766,6 +7766,23 @@ impl SessionCore {
         self.self_test_probes = probes;
     }
 
+    /// 只供 test-fakes：在沒有前景槽持有者時建立一筆有效的 accepted queue 項目。
+    #[cfg(feature = "test-fakes")]
+    #[doc(hidden)]
+    pub fn seed_accepted_command_queue_for_test(
+        &mut self,
+        mut req: SubmitReq,
+        cmd_id: String,
+    ) -> Result<(), PyDict> {
+        req.session_id = self.profile.com.clone();
+        let admitted = self
+            .deps
+            .registry
+            .admit(req, true, cmd_id, &self.wall_iso())?;
+        self.queue.push(admitted.queued, &self.deps.registry);
+        Ok(())
+    }
+
     fn vtty_alive(&self) -> Option<bool> {
         if let Some(probe) = self.self_test_probes.vtty_alive.as_ref() {
             return probe();
@@ -8742,6 +8759,21 @@ impl SessionCore {
         out
     }
 
+    fn busy_self_test(&self, now: Mono) -> PyDict {
+        let interactive_lease = self
+            .lease
+            .as_ref()
+            .is_some_and(|lease| !lease.is_human() && !lease.expired(now));
+        let mut out = pydict! {
+            "ok" => true,
+            "classification" => if interactive_lease { "SESSION_INTERACTIVE_BUSY" } else { "SESSION_BUSY" },
+            "session" => self.session_value(now),
+            "recommended_action" => "wait",
+        };
+        Self::extend_pairs(&mut out, self.lease_ctx());
+        self.finish_self_test(out)
+    }
+
     fn probe_self_test_result(
         &self,
         ok: bool,
@@ -8832,8 +8864,11 @@ impl SessionCore {
         };
         match self.self_test_pre_probe(&ctx) {
             Ok(result) => vec![Effect::Reply(reply, Ok(self.finish_self_test(result)))],
+            Err(_) if self.self_test_busy(now) => {
+                vec![Effect::Reply(reply, Ok(self.busy_self_test(now)))]
+            }
             Err(need) => {
-                // Python `self_test` 不看前景：nonce probe 與在途命令並行（審查 F25）。
+                // 只有原分類需要 probe 時才套用 busy 守衛；被動回覆不建立 op 或更新 probe 時間。
                 let rng = self.deps.rng.clone();
                 let sequence = self.next_op_id;
                 let mut fill = |bytes: &mut [u8]| {
@@ -8885,7 +8920,6 @@ impl SessionCore {
                     && self.side_ops.get(op_id).is_some_and(|grant| {
                         grant.op_id == *op_id
                             && self.generations.conn_epoch == Some(grant.epoch)
-                            && self.generations.owner_gen == grant.owner_gen
                             && self.generations.fsm_gen == grant.fsm_gen
                     })
             })
@@ -8959,14 +8993,6 @@ impl SessionCore {
         }
         if !ctx.device_present {
             return Ok(simple("DEVICE_MISSING", "check_cable_or_bind", Vec::new()));
-        }
-        if let Some(lease) = self.lease.as_ref() {
-            if !lease.is_human() && !lease.expired(now) {
-                return Ok(simple("SESSION_INTERACTIVE_BUSY", "wait", Vec::new()));
-            }
-        }
-        if self.self_test_busy(now) {
-            return Ok(simple("SESSION_BUSY", "wait", Vec::new()));
         }
         let current = option_string(ctx.by_id_realpath.as_deref());
         if let Some(attached) = self.attached_real_path.as_deref() {

@@ -3,13 +3,16 @@
 mod common;
 mod support;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use support::*;
 use sw_core::mailbox::{ControlEvent, DetachReason};
 use sw_core::op_runner::OpOutcome;
 use sw_core::op_runner::OpSpec;
+use sw_core::self_test::SelfTestProbes;
 use sw_core::session_core::{Effect, SessionRequest};
+use sw_core::uart_bridge::WorkerSnapshot;
 use sw_pal::traits::TxOutcome;
 use sw_proto::pyjson::{PyDict, PyValue};
 
@@ -274,6 +277,119 @@ fn agent_lease_busy_self_test_is_passive() {
 
     let close = h.request(close_interactive(&interactive_id));
     assert_eq!(close["ok"], PyValue::Bool(true));
+}
+
+#[test]
+fn recover_waiter_remains_busy_after_human_console_attach() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let tx_offset = h.dev.tx_len();
+    let recover = h.request_async(SessionRequest::Recover {
+        timeout_s: 30.0,
+        force: false,
+    });
+    h.wait_for("Recover 救援鍵 TX", |h| {
+        h.dev.tx_since(tx_offset).contains(&0x03)
+    });
+
+    let _console = h.attach_pty_console("human-recover");
+    assert!(
+        !h.get_state()["interactive_session_id"].is_null(),
+        "human console attach 必須建立 lease 並推進 owner 世代"
+    );
+
+    let before_bytes = h.dev.tx_len();
+    let before_writes = h.dev.write_calls();
+    let before_submits = h.dev.os_submits();
+    let before_wal = tx_row_count(&h);
+    let before_state = h.get_state();
+    let reply = h.request(self_test_req());
+
+    assert_busy_reply(&reply, "SESSION_BUSY");
+    assert_eq!(h.dev.tx_len(), before_bytes, "有效 Recover 期間不得新增 UART bytes");
+    assert_eq!(h.dev.write_calls(), before_writes, "有效 Recover 期間不得新增 UART write");
+    assert_eq!(h.dev.os_submits(), before_submits, "有效 Recover 期間不得新增 OS submit");
+    assert_eq!(tx_row_count(&h), before_wal, "有效 Recover 期間不得新增 WAL TX");
+    assert_eq!(
+        h.get_state()["last_probe_at"],
+        before_state["last_probe_at"],
+        "有效 Recover 期間不得更新 probe 時間"
+    );
+    assert!(recover.try_recv().is_err(), "self-test 不得結束 Recover waiter");
+}
+
+#[test]
+fn agent_lease_does_not_override_passthrough_classification() {
+    let mut h = CoreHarness::new(PASSTHROUGH_PROFILE);
+    h.to_attached(None);
+    h.force_state(sw_core::session_core::SessionState::Ready);
+    let opened = h.rpc(open_interactive("agent:passthrough")).unwrap();
+    assert_eq!(opened["ok"], PyValue::Bool(true));
+
+    let (reply, effects) = h.rpc_full(self_test_req());
+    let reply = reply.expect("passthrough 分類");
+    assert_eq!(reply["classification"], PyValue::from("PASSTHROUGH"));
+    assert_eq!(reply["recommended_action"], PyValue::from("none"));
+    assert!(!has_self_test_probe(&effects), "PASSTHROUGH 不得建立 probe");
+}
+
+#[test]
+fn agent_lease_does_not_override_quiet_classification() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.rx(b"U-Boot 2024.01\r\n");
+    let opened = h.rpc(open_interactive("agent:quiet")).unwrap();
+    assert_eq!(opened["ok"], PyValue::Bool(true));
+
+    let (reply, effects) = h.rpc_full(self_test_req());
+    let reply = reply.expect("quiet 分類");
+    assert_eq!(reply["classification"], PyValue::from("AUTOBOOT_QUIET"));
+    assert_eq!(reply["recommended_action"], PyValue::from("wait"));
+    assert!(!has_self_test_probe(&effects), "AUTOBOOT_QUIET 不得建立 probe");
+}
+
+#[test]
+fn agent_lease_does_not_override_bridge_down_classification() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let opened = h.rpc(open_interactive("agent:bridge-down")).unwrap();
+    assert_eq!(opened["ok"], PyValue::Bool(true));
+    h.core.set_self_test_probes(SelfTestProbes {
+        bridge_snapshot: Some(Arc::new(|_| {
+            Some(WorkerSnapshot {
+                serial_alive: false,
+                running: false,
+            })
+        })),
+        ..SelfTestProbes::default()
+    });
+
+    let (reply, effects) = h.rpc_full(self_test_req());
+    let reply = reply.expect("bridge 異常分類");
+    assert_eq!(reply["classification"], PyValue::from("BRIDGE_DOWN"));
+    assert_eq!(reply["recommended_action"], PyValue::from("recover"));
+    assert!(!has_self_test_probe(&effects), "BRIDGE_DOWN 不得建立 probe");
+}
+
+#[test]
+fn accepted_queue_blocks_self_test_without_foreground_slot() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let cmd_id = "accepted-queue-only".to_string();
+    h.core
+        .seed_accepted_command_queue_for_test(agent_submit("echo queued"), cmd_id.clone())
+        .expect("建立有效 accepted queue 項目");
+    let command = h.reg.get(&cmd_id).expect("queue 命令登錄");
+    assert_eq!(command["status"], PyValue::from("accepted"));
+    assert_eq!(h.core.state(), sw_core::session_core::SessionState::Ready);
+    assert!(!h.core.foreground_busy(), "測試時不得有前景槽持有者");
+
+    let before = h.public()["last_probe_at"].clone();
+    let (reply_rx, effects) = h.rpc_deferred(self_test_req());
+    assert!(!has_self_test_probe(&effects), "有效 queue 不得被 probe 插隊");
+    let reply = reply_rx.try_recv().expect("accepted queue busy").unwrap();
+    assert_busy_reply(&reply, "SESSION_BUSY");
+    assert_eq!(h.fake_device.tx_len(), 0, "有效 queue 期間不得新增 UART TX");
+    assert_eq!(h.public()["last_probe_at"], before, "有效 queue 不得更新 probe 時間");
 }
 
 #[test]
