@@ -3758,8 +3758,10 @@ fn self_test_and_get_state_do_not_wait_for_recover_tx_fence() {
 
 #[test]
 fn self_test_probe_in_flight_is_not_foreground_busy() {
-    // F27：nonce probe 等待中（裝置不回 nonce）：`foreground_busy` 為 false、`outstanding_commands` 為 0。
+    // F27：完整執行 probe 未獲回應時，仍在途且不計入 foreground_busy／outstanding_commands。
     let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.clear_replies();
+    let wait_start = h.rx.regex_wait_starts_for_test();
     let rx = h.request_async(SessionRequest::SelfTest {
         timeout_s: 2.0,
         strict_human_lock: false,
@@ -3769,6 +3771,10 @@ fn self_test_probe_in_flight_is_not_foreground_busy() {
             .iter()
             .any(|r| String::from_utf8_lossy(&b64(r)).contains("__READY__"))
     });
+    h.wait_for("self-test 等待 marker", |h| {
+        h.rx.regex_wait_starts_for_test() > wait_start
+    });
+    assert!(rx.is_empty(), "probe 等待執行證據時 RPC 必須尚未完成");
     let s = h.get_state();
     assert_eq!(s["foreground_busy"], PyValue::Bool(false));
     assert_eq!(s["outstanding_commands"], PyValue::from(0));

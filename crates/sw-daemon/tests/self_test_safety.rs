@@ -226,6 +226,106 @@ fn rpc_echo_only_target_remains_unconfirmed() {
 }
 
 #[test]
+fn rpc_probe_evidence_reports_failure_scenarios_and_pending_state() {
+    for scenario in [0, 1, 2, 3] {
+        let rig = Arc::new(ServiceRig::ready_shell());
+        let dev = rig.device(REAL_A);
+        dev.clear_replies();
+        let pending_before = rig.session("COM0").unwrap()["ready_reconfirm_pending"].clone();
+        let tx_start = dev.tx_len();
+        let rpc_rig = Arc::clone(&rig);
+        let handle = thread::spawn(move || {
+            rpc_rig.call(
+                "session.self_test",
+                r#"{"selector":"COM0","timeout_s":0.5}"#,
+            )
+        });
+        wait_for("RPC probe TX", || dev.tx_len() > tx_start);
+        let tx = dev.tx_since(tx_start);
+        let tx_text = String::from_utf8_lossy(&tx).into_owned();
+        let nonce = tx_text
+            .split("__READY__")
+            .nth(1)
+            .unwrap_or("")
+            .chars()
+            .take_while(char::is_ascii_hexdigit)
+            .collect::<String>();
+        assert_eq!(nonce.len(), 8, "probe TX 應含完整 nonce：{tx_text:?}");
+        let expected_tx = format!(
+            "( echo __READY__{nonce} ) && printf '\\n__SW_ST_%s_OK__\\n' '{nonce}'\n"
+        );
+        assert_eq!(tx_text, expected_tx, "測試 DUT 只依完整 shell 框架回覆");
+        assert!(!tx_text.contains(&format!("__SW_ST_{nonce}_OK__")));
+
+        let response = match scenario {
+            // 完整實際 TX 回顯、分兩段抵達，不能把 printf 格式字串當執行標記。
+            0 => tx.clone(),
+            // marker 有完整行界，但 marker 後沒有 prompt。
+            1 => format!("__SW_ST_{nonce}_OK__\r\n").into_bytes(),
+            // nonce 回顯後，執行標記被其他輸出插斷，並帶有 prompt。
+            2 => format!(
+                "__READY__{nonce}\r\n__SW_ST_{nonce}_\r\nnoise_OK__\r\nroot@t:/# "
+            )
+            .into_bytes(),
+            // marker 前後雜訊不影響完整 marker 與後續 prompt。
+            _ => format!(
+                "noise before\r\n__SW_ST_{nonce}_OK__\r\nnoise after\r\nroot@t:/# "
+            )
+            .into_bytes(),
+        };
+        if scenario == 0 {
+            let split = response.len() / 2;
+            dev.push_rx(&response[..split]);
+            dev.push_rx(&response[split..]);
+        } else {
+            dev.push_rx(&response);
+        }
+        thread::sleep(Duration::from_millis(30));
+
+        let expected = match scenario {
+            0 | 2 => [true, false, false, false],
+            1 => [true, true, true, false],
+            _ => [true, true, true, true],
+        };
+        if expected.iter().all(|value| *value) {
+            assert!(handle.is_finished(), "完整 marker 與後續 prompt 應完成 RPC");
+        } else {
+            advance_clock_until(&rig, &handle, "RPC self-test evidence scenario");
+        }
+        let reply = handle.join().unwrap();
+        assert_eq!(
+            reply["probe_ok"],
+            PyValue::Bool(expected.iter().all(|value| *value)),
+            "scenario={scenario}: {reply:?}"
+        );
+        let evidence = match &reply["probe_evidence"] {
+            PyValue::Dict(evidence) => evidence,
+            other => panic!("probe_evidence object：{other:?}"),
+        };
+        for (name, expected_value) in [
+            "tx_complete",
+            "execution_marker",
+            "probe_rc_zero",
+            "prompt_after_marker",
+        ]
+        .into_iter()
+        .zip(expected)
+        {
+            assert_eq!(
+                evidence.get(name),
+                Some(&PyValue::Bool(expected_value)),
+                "scenario={scenario}, field={name}: {reply:?}"
+            );
+        }
+        assert_eq!(
+            rig.session("COM0").unwrap()["ready_reconfirm_pending"],
+            pending_before,
+            "scenario={scenario} 不得錯誤清除或建立 readiness pending"
+        );
+    }
+}
+
+#[test]
 fn rpc_self_test_busy_has_zero_probe_tx() {
     // 前景 line command。
     {
