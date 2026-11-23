@@ -4203,6 +4203,30 @@ pub fn run_supervision_switch(
     with_sudo: bool,
     force_requested: bool,
 ) -> i32 {
+    let old_mode = configured_mode_checked(ctx).ok();
+    let needs_lifecycle_lock = target == &SupervisionMode::WindowsTask
+        || old_mode.as_ref() == Some(&SupervisionMode::WindowsTask);
+    if !needs_lifecycle_lock {
+        return run_supervision_switch_unlocked(ctx, target, with_sudo, force_requested);
+    }
+
+    // windows-task start 也持有此既有安裝交易鎖；在 hold recovery／建立 hold 前先序列化。
+    let root = install_layout::resolve_install_root(ctx);
+    let install_lock = match install_layout::install_lock(ctx, &root) {
+        Ok(lock) => lock,
+        Err(response) => return emit(ctx, response, "supervision-mode", 2),
+    };
+    let result = run_supervision_switch_unlocked(ctx, target, with_sudo, force_requested);
+    drop(install_lock);
+    result
+}
+
+fn run_supervision_switch_unlocked(
+    ctx: &mut CliCtx<'_>,
+    target: &SupervisionMode,
+    with_sudo: bool,
+    force_requested: bool,
+) -> i32 {
     let recovered = match recover_autostart_hold(ctx) {
         Ok(value) => value,
         Err(response) => return emit(ctx, response, "supervision-mode", 2),
@@ -4504,7 +4528,9 @@ pub(crate) fn autostart_hold_present(ctx: &CliCtx<'_>) -> Option<AutostartHoldRe
         .then_some(AutostartHoldReason::InstallJournal)
 }
 
-fn acquire_switch_autostart_lock(ctx: &mut CliCtx<'_>) -> Result<(), ErrorCode> {
+pub(crate) fn acquire_switch_autostart_lock(
+    ctx: &mut CliCtx<'_>,
+) -> Result<(), ErrorCode> {
     if ctx.autostart_lock.as_ref().is_some_and(|guard| guard.is_held()) {
         return Ok(());
     }

@@ -200,6 +200,24 @@ fn p277_service_start_preserves_interrupted_update_hold() {
         sw_pal::service_ctl::HoldState::Held,
         "start 不得釋放停用 hold"
     );
+
+    let calls_before_daemon_start = t.calls().len();
+    let (daemon_rc, daemon_out, daemon_err) = t.run(&["daemon", "start"]);
+    assert_eq!(daemon_rc, 2, "daemon start 必須沿用停用工作 /Run 結果：{daemon_out}");
+    assert!(daemon_out.contains("\"ok\":false"));
+    assert!(daemon_out.contains("\"action\":\"start\""));
+    assert!(!daemon_out.contains("\"phase\""), "不得新增 phase：{daemon_out}");
+    assert_eq!(
+        &t.calls()[calls_before_daemon_start..],
+        vec![vec!["schtasks", "/Run", "/TN", "serialwrap"]],
+        "daemon start 在 journal hold 下只可 /Run，不得 /ENABLE"
+    );
+    assert!(daemon_err.contains("install-journal.json"));
+    assert_eq!(
+        t.journal_bytes().as_deref(),
+        Some(journal_before.as_slice()),
+        "daemon start 不得改寫 journal"
+    );
 }
 
 #[test]
@@ -250,6 +268,89 @@ fn p277_service_start_reports_switch_hold() {
         t.calls(),
         vec![vec!["schtasks", "/Run", "/TN", "serialwrap"]]
     );
+}
+
+#[test]
+fn p277_start_entries_wait_for_autostart_lock() {
+    for args in [&["service", "start"][..], &["daemon", "start"][..]] {
+        let t = TestEnv::windows()
+            .with_config("supervision_mode: windows-task\n")
+            .with_real_service()
+            .with_autostart_lock_holder(None);
+
+        let (rc, out, err) = t.run(args);
+
+        assert_eq!(rc, 2, "{args:?} 持鎖逾時應失敗：{out}");
+        assert!(out.contains("\"error_code\":\"TIMEOUT\""), "{out}");
+        assert!(t.calls().is_empty(), "{args:?} 未取得生命週期鎖不得執行 schtasks");
+        assert!(err.contains("TIMEOUT"), "{err}");
+    }
+}
+
+#[test]
+fn p277_service_start_waits_for_update_lock_then_checks_journal() {
+    let t = TestEnv::windows()
+        .with_install_root()
+        .with_config("supervision_mode: windows-task\n")
+        .with_real_service()
+        .with_install_lock_holder_creating_journal(3.0)
+        .with_command(
+            &["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"],
+            0,
+            "SUCCESS: Changed scheduled task \"serialwrap\".\n",
+            "",
+        )
+        .with_command(
+            &["schtasks", "/Run", "/TN", "serialwrap"],
+            1,
+            "",
+            "ERROR: The task is disabled.\n",
+        );
+
+    let (rc, out, err) = t.run(&["service", "start"]);
+
+    assert_eq!(rc, 2, "停用工作的 /Run 結果須維持原樣：{out}");
+    assert!(out.contains("\"rc\":1"), "{out}");
+    assert!(!out.contains("\"phase\""), "hold 路徑不得新增 phase：{out}");
+    assert_eq!(
+        t.calls(),
+        vec![vec!["schtasks", "/Run", "/TN", "serialwrap"]],
+        "start 取得安裝鎖後必須重查 journal，且不得 ENABLE"
+    );
+    assert!(t.journal_bytes().is_some(), "持鎖交易應在釋放前建立 journal");
+    assert!(err.contains("UNKNOWN_ERROR"), "沿用既有錯誤提示：{err}");
+    assert!(err.contains("install-journal.json"));
+}
+
+#[test]
+fn p277_service_start_waits_for_switch_lock_then_checks_hold() {
+    let t = TestEnv::windows()
+        .with_config("supervision_mode: windows-task\n")
+        .with_real_service()
+        .with_install_lock_holder_creating_switch_hold(3.0)
+        .with_command(
+            &["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"],
+            0,
+            "SUCCESS: Changed scheduled task \"serialwrap\".\n",
+            "",
+        )
+        .with_command(
+            &["schtasks", "/Run", "/TN", "serialwrap"],
+            0,
+            "SUCCESS: Attempted to run the scheduled task \"serialwrap\".\n",
+            "",
+        );
+
+    let (rc, out, err) = t.run(&["service", "start"]);
+
+    assert_eq!(rc, 0, "switch hold 下沿用 /Run 結果：{out}");
+    assert_eq!(
+        t.calls(),
+        vec![vec!["schtasks", "/Run", "/TN", "serialwrap"]],
+        "start 等待監管切換交易後必須重查 hold"
+    );
+    assert!(t.state_dir().join("autostart-hold.json").exists());
+    assert!(err.contains("autostart-hold.json"));
 }
 
 #[test]

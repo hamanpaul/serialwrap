@@ -1210,6 +1210,44 @@ impl TestEnv {
         self
     }
 
+    /// 持有安裝交易鎖，於釋放時建立 journal，模擬 update／rollback 先取得鎖再記錄交易狀態。
+    pub fn with_install_lock_holder_creating_journal(mut self, release_at_s: f64) -> Self {
+        let lock_path = self.install_root().join(".install.lock");
+        let journal_path = self.install_root().join("install-journal.json");
+        let release_at_ns = (release_at_s.max(0.0) * 1_000_000_000.0)
+            .ceil()
+            .min(u64::MAX as f64) as u64;
+        let gate = FaultFs::wrap(Arc::clone(&self.fs));
+        gate.block_lock_until_and_create_file(
+            &lock_path,
+            Arc::clone(&self.clock),
+            release_at_ns,
+            &journal_path,
+            br#"{"step":"stop_supervisor"}"#,
+        );
+        self.fs = gate;
+        self
+    }
+
+    /// 持有安裝交易鎖，於釋放時建立切換 hold，模擬監管模式交易先完成 hold 再讓 start 繼續。
+    pub fn with_install_lock_holder_creating_switch_hold(mut self, release_at_s: f64) -> Self {
+        let lock_path = self.install_root().join(".install.lock");
+        let hold_path = self.state_dir().join("autostart-hold.json");
+        let release_at_ns = (release_at_s.max(0.0) * 1_000_000_000.0)
+            .ceil()
+            .min(u64::MAX as f64) as u64;
+        let gate = FaultFs::wrap(Arc::clone(&self.fs));
+        gate.block_lock_until_and_create_file(
+            &lock_path,
+            Arc::clone(&self.clock),
+            release_at_ns,
+            &hold_path,
+            br#"{"schema_version":1,"op":"supervision_set"}"#,
+        );
+        self.fs = gate;
+        self
+    }
+
     pub fn acquire_install_lock(&mut self) {
         let lock_path = self.install_root().join(".install.lock");
         let guard = self.fs.file_lock_exclusive(&lock_path, false).expect("測試安裝鎖取得失敗");

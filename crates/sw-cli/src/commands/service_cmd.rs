@@ -119,6 +119,93 @@ fn service_action_response(
     with_sudo: bool,
     context: &str,
 ) -> (PyDict, i32) {
+    if matches!(mode, SupervisionMode::WindowsTask) && action == ServiceAction::Start {
+        return service_action_response_with_lifecycle_locks(
+            ctx, mode, action, with_sudo, context,
+        );
+    }
+    service_action_response_unlocked(ctx, mode, action, with_sudo, context)
+}
+
+/// windows-task start 與更新、回滾及監管切換共用既有交易鎖。
+/// 先取安裝鎖，再取 autostart 鎖；兩者都保留到 hold 檢查及 `/ENABLE`／`/Run` 完成。
+fn service_action_response_with_lifecycle_locks(
+    ctx: &mut CliCtx<'_>,
+    mode: &SupervisionMode,
+    action: ServiceAction,
+    with_sudo: bool,
+    context: &str,
+) -> (PyDict, i32) {
+    let root = crate::install_layout::resolve_install_root(ctx);
+    let install_lock = match crate::install_layout::install_lock(ctx, &root) {
+        Ok(lock) => lock,
+        Err(detail) => {
+            let code = match detail.get("error_code") {
+                Some(PyValue::Str(value)) if value == ErrorCode::Timeout.as_str() => {
+                    ErrorCode::Timeout.as_str()
+                }
+                _ => ErrorCode::InternalError.as_str(),
+            };
+            let message = match detail.get("message") {
+                Some(PyValue::Str(value)) => value.as_str(),
+                _ => "無法取得安裝交易鎖；請稍後重試",
+            };
+            return lifecycle_lock_failure(mode, action, code, message);
+        }
+    };
+
+    let already_had_autostart_lock = ctx
+        .autostart_lock
+        .as_ref()
+        .is_some_and(|guard| guard.is_held());
+    if let Err(code) = crate::rollback::acquire_switch_autostart_lock(ctx) {
+        if !already_had_autostart_lock {
+            ctx.autostart_lock.take();
+        }
+        drop(install_lock);
+        return lifecycle_lock_failure(
+            mode,
+            action,
+            code.as_str(),
+            "無法取得 autostart.lock；請稍後重試",
+        );
+    }
+
+    let result = service_action_response_unlocked(ctx, mode, action, with_sudo, context);
+    if !already_had_autostart_lock {
+        ctx.autostart_lock.take();
+    }
+    drop(install_lock);
+    result
+}
+
+fn lifecycle_lock_failure(
+    mode: &SupervisionMode,
+    action: ServiceAction,
+    error_code: &'static str,
+    message: &str,
+) -> (PyDict, i32) {
+    let result = ServiceResult {
+        ok: false,
+        mode: mode.as_str().to_string(),
+        action: action.as_str().to_string(),
+        rc: None,
+        stdout: None,
+        stderr: None,
+        error_code: Some(error_code),
+        hint: Some(message.to_string()),
+        phase: None,
+    };
+    (result_to_pydict(&result), 2)
+}
+
+fn service_action_response_unlocked(
+    ctx: &mut CliCtx<'_>,
+    mode: &SupervisionMode,
+    action: ServiceAction,
+    with_sudo: bool,
+    context: &str,
+) -> (PyDict, i32) {
     if matches!(
         mode,
         SupervisionMode::WindowsTask | SupervisionMode::WindowsService
