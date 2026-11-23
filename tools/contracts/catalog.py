@@ -786,7 +786,7 @@ def _check_changes(p: _Problems, changes: list[Any], file_rev: int | None) -> No
         if "status" in raw:
             _check_enum(p, f"{loc}.status", raw["status"], CHANGE_STATUS)
         if "approval" in raw:
-            _check_approval(p, f"{loc}.approval", raw["approval"], kind)
+            _check_approval(p, f"{loc}.approval", raw["approval"], kind, cid)
         oc = raw.get("owner_confirmation")
         oi = raw.get("owner_item")
         dip = raw.get("default_if_pending")
@@ -837,7 +837,19 @@ def _check_changes(p: _Problems, changes: list[Any], file_rev: int | None) -> No
             _check_str_list(p, f"{loc}.related_decisions", raw["related_decisions"])
 
 
-def _check_approval(p: _Problems, loc: str, approval: object, kind: object) -> None:
+def bc_decision_ref(cid: object) -> str:
+    """BC 的核准來源：BC-01～BC-05 由 OD-04 核准；BC-06 起為 OD-111（2026-11-22，Python 凍結後的 Rust-only 行為差異）。
+
+    依 rulings/v051.md「0.5.1 行為差異登錄規則」第 8 點（2026-11-23）。id 不合格式時沿用 OD-04，由 id 檢查另行報錯。
+    """
+    if isinstance(cid, str):
+        m = re.fullmatch(r"BC-(\d{2})", cid)
+        if m is not None and int(m.group(1)) >= 6:
+            return "OD-111"
+    return "OD-04"
+
+
+def _check_approval(p: _Problems, loc: str, approval: object, kind: object, cid: object = None) -> None:
     if not _require_mapping(p, loc, approval):
         return
     assert isinstance(approval, dict)
@@ -862,8 +874,9 @@ def _check_approval(p: _Problems, loc: str, approval: object, kind: object) -> N
     if kind == "BC":
         if basis != "owner_decision":
             p.add(f"{loc}.basis", "kind 為 BC 時 basis 必須為 owner_decision")
-        if decision_ref != "OD-04":
-            p.add(f"{loc}.decision_ref", "kind 為 BC 時 decision_ref 必須為 OD-04")
+        expected_ref = bc_decision_ref(cid)
+        if decision_ref != expected_ref:
+            p.add(f"{loc}.decision_ref", f"kind 為 BC 時 decision_ref 必須為 {expected_ref}（BC-01～BC-05 依 OD-04；BC-06 起依 OD-111）")
     elif kind == "DF" and basis != "reconciliation":
         p.add(f"{loc}.basis", "kind 為 DF 時 basis 必須為 reconciliation")
 
