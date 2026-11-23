@@ -365,8 +365,8 @@ def _validate_profile_expectation_entry(name: str, entry: Any, *, supported: boo
         template: _canonicalize_field_list(fields, label=f"{name}.expected_missing_fields[{template!r}]")
         for template, fields in missing.items()
     }
-    if set(normalized_missing) != set(common):
-        raise ValueError(f"{name}.expected_missing_fields 的 template 集合必須等於 expected_common_templates")
+    if not set(normalized_missing) <= set(common) or any(not fields for fields in normalized_missing.values()):
+        raise ValueError(f"{name}.expected_missing_fields 只能列出有缺漏的共同 template")
     _canonicalize_field_list(entry.get("allowed_migration_fields"), label=f"{name}.allowed_migration_fields")
     if supported:
         if not common or type(entry.get("target_asset_revision")) is not str:
@@ -446,25 +446,24 @@ def _validate_profile_policy(profile_policy: Any) -> tuple[bool, list[str], dict
     common = _canonicalize_field_list(profile_policy["expected_common_templates"],
                                       label="expected_common_templates")
     missing = profile_policy["expected_missing_fields"]
+    if type(missing) is not dict or any(type(template) is not str for template in missing):
+        raise ValueError("expected_missing_fields 必須為 object[str, list[str]]")
     normalized_missing = {
         template: _canonicalize_field_list(fields, label=f"expected_missing_fields[{template!r}]")
         for template, fields in missing.items()
     }
-    if set(normalized_missing) != set(common):
-        raise ValueError("expected_missing_fields 必須完整列出每個共同 template")
+    if not set(normalized_missing) <= set(common) or any(not fields for fields in normalized_missing.values()):
+        raise ValueError("expected_missing_fields 只能列出有缺漏的共同 template")
     _canonicalize_field_list(profile_policy["allowed_migration_fields"], label="allowed_migration_fields")
     return supported, common, normalized_missing
 
 
 def _profile_check_payload_error(profile_check: dict[str, Any], *, expected_common: list[str],
                                  expected_missing: dict[str, list[str]]) -> str | None:
-    extra = profile_check.get("extra")
-    if type(extra) is not dict:
-        return "profile_template_fields 缺少 extra payload"
     required = ("comparison_status", "missing_fields", "compared_templates", "reason")
-    if any(key not in extra for key in required):
+    if any(key not in profile_check for key in required):
         return "profile_template_fields payload 缺必要欄位"
-    status = extra["comparison_status"]
+    status = profile_check["comparison_status"]
     if type(status) is not str:
         return "profile_template_fields.comparison_status 必須為字串"
     if status not in {"matched", "missing_fields", "not_materialized", "unavailable", "no_common_templates"}:
@@ -477,18 +476,18 @@ def _profile_check_payload_error(profile_check: dict[str, Any], *, expected_comm
         return "profile_template_fields.ok 必須為真 boolean"
     if type(profile_check.get("advisory")) is not bool or profile_check["advisory"] is not True:
         return "profile_template_fields.advisory 必須為 True"
-    if extra["reason"] is not None and type(extra["reason"]) is not str:
+    if profile_check["reason"] is not None and type(profile_check["reason"]) is not str:
         return "profile_template_fields.reason 必須為字串或 null"
-    if extra["reason"] is not None:
+    if profile_check["reason"] is not None:
         return "可比較的 profile_template_fields.reason 必須為 null"
     try:
-        compared = _canonicalize_field_list(extra["compared_templates"],
+        compared = _canonicalize_field_list(profile_check["compared_templates"],
                                             label="profile_template_fields.compared_templates")
     except ValueError as exc:
         return str(exc)
     if compared != expected_common:
         return f"compared_templates 不符預期: got={compared}, expected={expected_common}"
-    missing = extra["missing_fields"]
+    missing = profile_check["missing_fields"]
     if type(missing) is not dict or any(type(template) is not str for template in missing):
         return "profile_template_fields.missing_fields 必須為 object[str, list[str]]"
     try:

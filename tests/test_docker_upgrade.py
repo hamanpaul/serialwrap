@@ -781,10 +781,12 @@ def _doctor_with_profile_policy(policy: dict[str, Any], *, status: str | None = 
         {"check": "version_pairing", "ok": True, "advisory": False},
         {"check": "devices", "ok": False, "advisory": True},
         {"check": "profile_template_fields", "ok": profile_result, "advisory": True,
-         "extra": {"comparison_status": profile_status,
-                   "missing_fields": fields,
-                   "compared_templates": list(policy["expected_common_templates"]),
-                   "reason": None}},
+         "detail": "共同 template 的頂層欄位無缺漏",
+         "fix": "參照出貨 profile 處理缺漏欄位",
+         "comparison_status": profile_status,
+         "missing_fields": fields,
+         "compared_templates": list(policy["expected_common_templates"]),
+         "reason": None},
     ]}
 
 
@@ -833,16 +835,16 @@ def test_doctor_profile_missing_fields_mismatch_fails():
     valid = _doctor_with_profile_policy(policy)
     invalid_results = []
     too_many = json.loads(json.dumps(valid))
-    too_many["checks"][-1]["extra"]["missing_fields"]["prpl-template"].append("timeout_recovery_keys")
+    too_many["checks"][-1]["missing_fields"]["prpl-template"].append("timeout_recovery_keys")
     invalid_results.append(too_many)
     too_few = json.loads(json.dumps(valid))
-    too_few["checks"][-1]["extra"]["missing_fields"]["prpl-template"] = []
+    too_few["checks"][-1]["missing_fields"]["prpl-template"] = []
     invalid_results.append(too_few)
     wrong_template = json.loads(json.dumps(valid))
-    wrong_template["checks"][-1]["extra"]["missing_fields"] = {"other-template": ["boot_done_regex"]}
+    wrong_template["checks"][-1]["missing_fields"] = {"other-template": ["boot_done_regex"]}
     invalid_results.append(wrong_template)
     wrong_common = json.loads(json.dumps(valid))
-    wrong_common["checks"][-1]["extra"]["compared_templates"] = ["other-template"]
+    wrong_common["checks"][-1]["compared_templates"] = ["other-template"]
     invalid_results.append(wrong_common)
     for doctor in invalid_results:
         row = uc.judge_doctor("doctor_green_new", doctor, require_pairing=True, profile_policy=policy)
@@ -855,10 +857,10 @@ def test_doctor_profile_unavailable_fails():
     policy = uc.select_profile_policy("before_asset_addition")
     for status in ("unavailable", "not_materialized", "no_common_templates"):
         doctor = _doctor_with_profile_policy(policy, status=status, missing_fields=None, profile_ok=False)
-        extra = doctor["checks"][-1]["extra"]
-        extra["missing_fields"] = None
-        extra["compared_templates"] = list(policy["expected_common_templates"])
-        extra["reason"] = "live_structure"
+        profile = doctor["checks"][-1]
+        profile["missing_fields"] = None
+        profile["compared_templates"] = list(policy["expected_common_templates"])
+        profile["reason"] = "live_structure"
         row = uc.judge_doctor("doctor_green_new", doctor, require_pairing=True, profile_policy=policy)
         assert row["verdict"] == "FAIL", (status, row)
 
@@ -870,7 +872,9 @@ def test_doctor_profile_invalid_payload_fails():
     no_payload = {"ok": True, "checks": [{"check": "dialout", "ok": True, "advisory": False},
                                           {"check": "version_pairing", "ok": True, "advisory": False},
                                           {"check": "devices", "ok": False, "advisory": True},
-                                          {"check": "profile_template_fields", "ok": False, "advisory": True}]}
+                                          {"check": "profile_template_fields", "ok": False, "advisory": True,
+                                           "detail": "共同 template 的頂層欄位無缺漏",
+                                           "fix": "參照出貨 profile 處理缺漏欄位"}]}
     invalid_rows = [no_payload]
     duplicate = _doctor_with_profile_policy(policy)
     duplicate["checks"].append(json.loads(json.dumps(duplicate["checks"][-1])))
@@ -879,28 +883,28 @@ def test_doctor_profile_invalid_payload_fails():
     wrong_ok_type["checks"][-1]["ok"] = 1
     invalid_rows.append(wrong_ok_type)
     missing_key = _doctor_with_profile_policy(policy)
-    del missing_key["checks"][-1]["extra"]["compared_templates"]
+    del missing_key["checks"][-1]["compared_templates"]
     invalid_rows.append(missing_key)
     missing_check = _doctor_with_profile_policy(policy)
     missing_check["checks"] = missing_check["checks"][:-1]
     invalid_rows.append(missing_check)
     duplicate_field = _doctor_with_profile_policy(policy)
-    duplicate_field["checks"][-1]["extra"]["missing_fields"]["prpl-template"].append("boot_done_regex")
+    duplicate_field["checks"][-1]["missing_fields"]["prpl-template"].append("boot_done_regex")
     invalid_rows.append(duplicate_field)
     wrong_advisory_type = _doctor_with_profile_policy(policy)
     wrong_advisory_type["checks"][-1]["advisory"] = 1
     invalid_rows.append(wrong_advisory_type)
     wrong_status_type = _doctor_with_profile_policy(policy)
-    wrong_status_type["checks"][-1]["extra"]["comparison_status"] = True
+    wrong_status_type["checks"][-1]["comparison_status"] = True
     invalid_rows.append(wrong_status_type)
     wrong_missing_type = _doctor_with_profile_policy(policy)
-    wrong_missing_type["checks"][-1]["extra"]["missing_fields"] = None
+    wrong_missing_type["checks"][-1]["missing_fields"] = None
     invalid_rows.append(wrong_missing_type)
     wrong_compared_type = _doctor_with_profile_policy(policy)
-    wrong_compared_type["checks"][-1]["extra"]["compared_templates"] = "prpl-template"
+    wrong_compared_type["checks"][-1]["compared_templates"] = "prpl-template"
     invalid_rows.append(wrong_compared_type)
     wrong_reason_type = _doctor_with_profile_policy(policy)
-    wrong_reason_type["checks"][-1]["extra"]["reason"] = True
+    wrong_reason_type["checks"][-1]["reason"] = True
     invalid_rows.append(wrong_reason_type)
     inconsistent = _doctor_with_profile_policy(policy, status="matched", profile_ok=True)
     invalid_rows.append(inconsistent)
@@ -918,8 +922,8 @@ def test_doctor_profile_expectation_policy_p290_phases():
     document = uc.load_profile_expectations()
     assert document["schema_version"] == 1
     assert document["policy_id"] == "od33-profile-template-fields-v1"
-    assert document["source"] == {
-        "fixture_id": "serialwrap-v0.3.2-default-profile-prpl-template",
+    source_expected = {
+        "fixture_id": "serialwrap-v0.3.2-default-profiles",
         "fixture_kind": "tagged_release_asset",
         "source_version": "0.3.2",
         "source_ref": "v0.3.2",
@@ -931,15 +935,49 @@ def test_doctor_profile_expectation_policy_p290_phases():
         "asset_path": "sw_core/assets/profiles/default.yaml",
         "migration_policy_id": "p290-template-migration-v1",
     }
+    source = document["source"]
+    source_bytes = subprocess.run(
+        ["git", "show", f"{source['source_ref']}:{source['source_path']}"],
+        cwd=REPO,
+        check=True,
+        capture_output=True,
+    ).stdout
+    assert hashlib.sha256(source_bytes).hexdigest() == source["source_sha256"]
+    import yaml
+
+    source_profiles = yaml.safe_load(source_bytes)["profiles"]
+    target_profiles = yaml.safe_load(
+        (REPO / document["target_asset"]["asset_path"]).read_text(encoding="utf-8")
+    )["profiles"]
+    legacy_common = sorted(set(source_profiles) & set(target_profiles))
+    fully_materialized = sorted(target_profiles)
+    assert legacy_common == ["brcm-template", "op3-template", "others-template", "prpl-template", "uboot-template"]
+    assert fully_materialized == [
+        "brcm-template", "op3-template", "others-template", "prpl-template", "smart4R-profile", "uboot-template",
+    ]
     expected = {
         "before_asset_addition": {"prpl-template": ["boot_done_regex"]},
         "asset_added_not_migrated": {"prpl-template": ["boot_done_regex", "timeout_recovery_keys"]},
         "migrated": {"prpl-template": ["boot_done_regex"]},
-        "materialized": {"prpl-template": []},
+        "materialized": {},
     }
+    policy_shape_errors = []
+    if source != source_expected:
+        policy_shape_errors.append({"source": source})
+    for phase, expected_missing in expected.items():
+        policy_entry = document["phases"][phase]
+        expected_common = fully_materialized if phase == "materialized" else legacy_common
+        if policy_entry["expected_missing_fields"] != expected_missing:
+            policy_shape_errors.append({phase: {"expected_missing_fields": policy_entry["expected_missing_fields"]}})
+        if policy_entry["expected_common_templates"] != expected_common:
+            policy_shape_errors.append({phase: {"expected_common_templates": policy_entry["expected_common_templates"]}})
+    assert not policy_shape_errors, policy_shape_errors
+
     for phase, expected_missing in expected.items():
         policy = uc.select_profile_policy(phase)
         assert policy["expected_missing_fields"] == expected_missing
+        expected_common = fully_materialized if phase == "materialized" else legacy_common
+        assert policy["expected_common_templates"] == expected_common
         doctor = _doctor_with_profile_policy(policy)
         row = uc.judge_doctor("doctor_green_new", doctor, require_pairing=True, profile_policy=policy)
         assert row["verdict"] == "PASS", (phase, row)

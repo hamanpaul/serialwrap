@@ -3,7 +3,7 @@
   "policy_id": "od33-profile-template-fields-v1",
   "description": "OD-33 固定 profile_template_fields 政策；僅由明確情境階段選擇，不依 doctor 輸出切換。",
   "source": {
-    "fixture_id": "serialwrap-v0.3.2-default-profile-prpl-template",
+    "fixture_id": "serialwrap-v0.3.2-default-profiles",
     "fixture_kind": "tagged_release_asset",
     "source_version": "0.3.2",
     "source_ref": "v0.3.2",
@@ -21,7 +21,11 @@
       "phase": "before_asset_addition",
       "target_asset_revision": "pre-p290",
       "expected_common_templates": [
-        "prpl-template"
+        "brcm-template",
+        "op3-template",
+        "others-template",
+        "prpl-template",
+        "uboot-template"
       ],
       "expected_missing_fields": {
         "prpl-template": [
@@ -35,7 +39,11 @@
       "phase": "asset_added_not_migrated",
       "target_asset_revision": "p290",
       "expected_common_templates": [
-        "prpl-template"
+        "brcm-template",
+        "op3-template",
+        "others-template",
+        "prpl-template",
+        "uboot-template"
       ],
       "expected_missing_fields": {
         "prpl-template": [
@@ -50,7 +58,11 @@
       "phase": "migrated",
       "target_asset_revision": "p290",
       "expected_common_templates": [
-        "prpl-template"
+        "brcm-template",
+        "op3-template",
+        "others-template",
+        "prpl-template",
+        "uboot-template"
       ],
       "expected_missing_fields": {
         "prpl-template": [
@@ -66,11 +78,14 @@
       "phase": "materialized",
       "target_asset_revision": "p290",
       "expected_common_templates": [
-        "prpl-template"
+        "brcm-template",
+        "op3-template",
+        "others-template",
+        "prpl-template",
+        "smart4R-profile",
+        "uboot-template"
       ],
-      "expected_missing_fields": {
-        "prpl-template": []
-      },
+      "expected_missing_fields": {},
       "allowed_migration_fields": []
     }
   },
