@@ -211,6 +211,51 @@ def _reject_zero_tx(p7, tgt, want: str) -> None:
     assert _tx_count(p7) == tx_before, f"{want}：被拒請求 WAL 不得有 TX"
 
 
+def _assert_python_detached_terminal_state(state: dict, baseline: dict | None = None) -> None:
+    """Python 分支 DF-23 的終態 oracle：只接受 DETACHED＋已觀察的兩個登入失敗結局，且 10 s 內不自動重試。"""
+    err = str(state.get("last_error"))
+    accepted = {"ATTACH_FAILED:TxIncompleteError", "LOGIN_PROMPT_TIMEOUT"}
+    assert state.get("state") == "DETACHED", state
+    assert err in accepted or err.startswith("ATTACH_FAILED:TxIncompleteError"), state
+    if baseline is None:
+        baseline = state
+    for key in ("reprobe_attempts", "next_reprobe_at", "reprobe_exhausted", "bridge_generation"):
+        assert key in state and key in baseline, (key, state, baseline)
+        assert state.get(key) == baseline.get(key), (key, state, baseline)
+
+
+def test_python_detached_terminal_state_oracle_accepts_the_two_observed_states() -> None:
+    """DF-23：兩個已觀測 Python 終態應接受；其他錯誤與任何重試行為均拒絕。"""
+    baseline_one = {
+        "state": "DETACHED",
+        "last_error": "ATTACH_FAILED:TxIncompleteError",
+        "reprobe_attempts": 0,
+        "next_reprobe_at": None,
+        "reprobe_exhausted": False,
+        "bridge_generation": 1,
+    }
+    _assert_python_detached_terminal_state(baseline_one, baseline_one)
+
+    baseline_two = {
+        "state": "DETACHED",
+        "last_error": "LOGIN_PROMPT_TIMEOUT",
+        "reprobe_attempts": 0,
+        "next_reprobe_at": None,
+        "reprobe_exhausted": False,
+        "bridge_generation": 1,
+    }
+    _assert_python_detached_terminal_state(baseline_two, baseline_two)
+
+    for bad in (
+        {**baseline_one, "last_error": "OTHER_ERROR"},
+        {**baseline_one, "reprobe_attempts": 1},
+        {**baseline_one, "bridge_generation": 2},
+        {**baseline_two, "next_reprobe_at": 123.0},
+    ):
+        with pytest.raises(AssertionError):
+            _assert_python_detached_terminal_state(bad, baseline_one if bad.get("last_error") != "LOGIN_PROMPT_TIMEOUT" else baseline_two)
+
+
 def test_rejected_requests_zero_tx(p7, tmp_path):
     tgt = FakeTarget(tmp_path / "t0", prompt="root@prplOS:~# ", commands={"overrides": {"": {"response": "\r\n=> "}}})
     p7.start("prpl", [tgt])
@@ -242,9 +287,9 @@ def test_release_during_login_waits_for_handle_close(p7, tmp_path):
     """登入進行中 `device release`：回成功的當下 daemon 已無指向該 tty 的 fd；`device attach` 之前不重開；
     `session recover --force` 的 REATTACH 任何時刻至多持有一個 fd（舊 fd 關閉後才重開）。
 
-    DF-23（OD-57，2026-10-29）：Python 基線於本情境 `device attach` 後落 DETACHED＋`ATTACH_FAILED:TxIncompleteError`
-    且不再自動重試（擁有者視為 Python 缺陷），Rust 回到 READY；收斂結果依 DF-23 分別判定（`ab_participation: diff`），
-    §11.3-4 的 handle 時序兩邊同斷言。"""
+    2026-11-23 編排者裁決：DF-23 Python 分支接受 `DETACHED` + `{ATTACH_FAILED:TxIncompleteError, LOGIN_PROMPT_TIMEOUT}`
+    兩個已觀察終態，且必須在之後 10 s 內維持 DETACHED、不自動重試；任何 `reprobe_attempts`、`next_reprobe_at`、
+    `reprobe_exhausted`、`bridge_generation` 變化都判失敗。Rust 分支與 §11.3-4 的 handle 時序斷言不改。"""
     tgt = FakeTarget(tmp_path / "t0", delay_ms=1500)       # 每個回應延遲 1.5 s：login 進行中可插入 release
     p7.start("shell", [tgt])
     deadline = time.monotonic() + 20.0
@@ -270,18 +315,20 @@ def test_release_during_login_waits_for_handle_close(p7, tmp_path):
         assert time.monotonic() < deadline, "device attach 後應重新開啟 tty"
         time.sleep(0.05)
     tgt.hold_reply(False)
-    # DF-23：attach 之後的收斂結果（Rust 回 READY；Python 落 DETACHED＋ATTACH_FAILED:TxIncompleteError 且不自動重試）
+    # DF-23：attach 之後的收斂結果（Rust 回 READY；Python 落 DETACHED 且不自動重試，終態限
+    # `ATTACH_FAILED:TxIncompleteError` 或 `LOGIN_PROMPT_TIMEOUT` 兩種已觀察值）。
     if is_rust():
         s = wait_state(p7.env, "COM0", "READY", timeout_s=60.0)
         assert s["last_error"] is None, s
     else:
         s = wait_state(p7.env, "COM0", "DETACHED", timeout_s=60.0)
-        assert str(s["last_error"]).startswith("ATTACH_FAILED:TxIncompleteError"), s
+        baseline = {k: s.get(k) for k in ("reprobe_attempts", "next_reprobe_at", "reprobe_exhausted", "bridge_generation")}
+        _assert_python_detached_terminal_state(s, baseline)
         t_end = time.monotonic() + 10.0
-        while time.monotonic() < t_end:                     # 不自動重試：維持 DETACHED
+        while time.monotonic() < t_end:                     # 不自動重試：維持 DETACHED，且重試欄位不變.
             _, j = p7.cli("session", "list")
             row = [x for x in (j or {}).get("sessions", []) if x["com"] == "COM0"][0]
-            assert row["state"] == "DETACHED", row
+            _assert_python_detached_terminal_state(row, baseline)
             time.sleep(0.5)
 
     # REATTACH：另一個 rig（READY 起手），RX 凍結下 recover --force，取樣 daemon 對 tty 的 fd 數峰值。
