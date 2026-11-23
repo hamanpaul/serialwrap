@@ -3437,6 +3437,10 @@ fn recover_while_foreground_command_sends_recover_keys() {
 #[test]
 fn self_test_while_foreground_command_sends_probe() {
     let (h, _id) = ready_with_hung_command();
+    let before_bytes = h.dev.tx_len();
+    let before_writes = h.dev.write_calls();
+    let before_submits = h.dev.os_submits();
+    let before_wal_tx = tx_rows(&h).len();
     h.dev.on_tx_match(
         r"__READY__[0-9a-f]+",
         Box::new(|line: &[u8]| {
@@ -3456,6 +3460,10 @@ fn self_test_while_foreground_command_sends_probe() {
     assert_eq!(r["classification"], PyValue::from("SESSION_BUSY"));
     assert_eq!(r["recommended_action"], PyValue::from("wait"));
     assert!(r.get("probe_ok").is_none(), "{r:?}");
+    assert_eq!(h.dev.tx_len(), before_bytes, "前景命令在途時不得新增 UART bytes");
+    assert_eq!(h.dev.write_calls(), before_writes, "前景命令在途時不得新增 UART write");
+    assert_eq!(h.dev.os_submits(), before_submits, "前景命令在途時不得新增 OS submit");
+    assert_eq!(tx_rows(&h).len(), before_wal_tx, "前景命令在途時不得新增 WAL TX");
 }
 
 #[test]
