@@ -38,5 +38,5 @@
   "fix/276-windows-task-start-hold": "006a6a4",
   "fix/ci-thin-timing-margins": "5944d0c",
   "fix/289-doctor-profile-template-fields": "cb6bea1",
-  "fix/306-self-test-probe-safety": "423803a"
+  "fix/306-self-test-probe-safety": "d32e47c"
 }
