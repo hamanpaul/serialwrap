@@ -12,6 +12,7 @@ stdlib＋PyYAML＋PTY，不得 import sw_core／serialwrap／serialwrapd。
 from __future__ import annotations
 
 import base64
+import errno
 import os
 import threading
 import time
@@ -74,9 +75,39 @@ def _daemon_tty_holders(p7, path: str) -> list[str]:
             linked = os.readlink(fd_path)
             if os.path.realpath(fd_path) == target:
                 holders.append(f"{name}->{linked}")
-        except OSError:
-            continue
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                continue
+            raise AssertionError(f"無法讀取 daemon fd symlink {fd_path}: {exc}") from exc
     return holders
+
+
+def test_daemon_tty_holder_scanner_fails_closed_on_unreadable_fd(monkeypatch) -> None:
+    """掃描期間 fd 消失可忽略；fd symlink 權限錯誤不可被當成無 holder。"""
+    class _Proc:
+        pid = 987654
+
+    class _Daemon:
+        proc = _Proc()
+
+    class _Rig:
+        daemon = _Daemon()
+
+    proc_fd = "/proc/987654/fd"
+    monkeypatch.setattr(os, "listdir", lambda path: ["7"] if path == proc_fd else [])
+
+    def permission_denied(fd_path: str) -> str:
+        raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), fd_path)
+
+    monkeypatch.setattr(os, "readlink", permission_denied)
+    with pytest.raises(AssertionError, match="無法讀取 daemon fd symlink"):
+        _daemon_tty_holders(_Rig(), "/dev/null")
+
+    def fd_disappeared(fd_path: str) -> str:
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), fd_path)
+
+    monkeypatch.setattr(os, "readlink", fd_disappeared)
+    assert _daemon_tty_holders(_Rig(), "/dev/null") == []
 
 
 def _attach_human_vtty(p7, label: str) -> tuple[int, dict]:
