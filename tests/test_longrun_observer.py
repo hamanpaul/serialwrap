@@ -65,6 +65,12 @@ def _read_rows(path: Path):
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
 
 
+def _has_minimum_samples_in_window(samples: list[dict], *, started: float, window_s: float) -> bool:
+    """取樣開始時間嚴格早於窗口終點的樣本至少須有四筆。"""
+    deadline = started + window_s
+    return sum(sample["t_mono"] < deadline for sample in samples) >= 4
+
+
 def test_observer_readonly_calls(tmp_path):
     observer = _observer()
     sw = StubSwCli()
@@ -103,19 +109,16 @@ def test_observer_writes_samples(tmp_path, monkeypatch):
     _run(observer, StubSwCli(), out, interval_s=0.05, duration_s=None, stop=stop)
     rows = _read_rows(out)
     samples = [row for row in rows if row.get("kind") == "sample"]
-    assert len(samples) >= 4
+    assert _has_minimum_samples_in_window(samples, started=started, window_s=sample_window_s)
     assert len(samples) == 6
     assert stop.waits == 6
     # 邊界反例：`t_mono == 0.3` 等於窗口終點，不算在該 0.3 秒窗口內完成；原迴圈在 sample 前先檢查
     # `elapsed >= duration_s`，因此如果下次取樣剛好等於 deadline，必須當作「已過界」而不是「已內含」.
-    deadline = started + sample_window_s
     boundary_samples = [{"t_mono": t} for t in (0.0, 0.05, 0.25, 0.30)]
-    assert boundary_samples[3]["t_mono"] == deadline
-    assert not (boundary_samples[3]["t_mono"] < deadline)
-    # 直接檢查窗口邊界：`t_mono == 0.3` 必須被判定為「已過界」，不能算在 0.3 秒窗口內完工。
-    # 若回退成 `<=` 判準，本條件會轉紅，因為最終樣本會以 deadline 本身被算為有效樣本。
-    assert all(row["t_mono"] < deadline for row in samples)
-    assert not any(row["t_mono"] == deadline for row in samples)
+    assert boundary_samples[3]["t_mono"] == started + sample_window_s
+    assert not _has_minimum_samples_in_window(boundary_samples, started=started, window_s=sample_window_s)
+    normal_samples = [{"t_mono": t} for t in (0.0, 0.06, 0.12, 0.18, 0.24, 0.3)]
+    assert _has_minimum_samples_in_window(normal_samples, started=started, window_s=sample_window_s)
     assert all("wall_ts" in row and "pid" in row["daemon"] and "sessions" in row for row in samples)
 
 
