@@ -1096,6 +1096,9 @@ impl RxShared {
         }
         let timeout_ns = timeout.as_nanos().min(u64::MAX as u128) as u64;
         let deadline = clock.mono_ns().saturating_add(timeout_ns);
+        if clock.mono_ns() >= deadline {
+            return WaitOutcome::TimedOut;
+        }
         let (wake_tx, wake_rx) = bounded(1);
         self.wakers
             .lock()
@@ -1106,10 +1109,19 @@ impl RxShared {
             if self.shutdown_waits_cancelled.load(Ordering::Acquire) {
                 return WaitOutcome::Cancelled;
             }
+            if clock.mono_ns() >= deadline {
+                return WaitOutcome::TimedOut;
+            }
             let (snapshot, revision) = {
                 let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
                 (window.text_from(from).to_string(), window.revision)
             };
+            if self.shutdown_waits_cancelled.load(Ordering::Acquire) {
+                return WaitOutcome::Cancelled;
+            }
+            if clock.mono_ns() >= deadline {
+                return WaitOutcome::TimedOut;
+            }
             if re.search(&snapshot).is_some() {
                 return if self.shutdown_waits_cancelled.load(Ordering::Acquire) {
                     WaitOutcome::Cancelled

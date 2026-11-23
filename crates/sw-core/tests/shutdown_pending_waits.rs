@@ -149,6 +149,50 @@ fn shutdown_cancels_self_test_nonce_and_prompt_waits() {
 }
 
 #[test]
+fn shutdown_wait_times_out_before_matching_expired_buffered_rx() {
+    let rx = RxShared::new(64, 0);
+    rx.append(b"ready", 0, 1, 1);
+    let regex = compile("ready", PyFlags::default()).unwrap();
+    let clock = FakeClock::new();
+
+    assert_eq!(
+        rx.wait_for_regex_from_shutdown_cancellable(
+            &regex,
+            0,
+            Duration::ZERO,
+            &*clock,
+        ),
+        WaitOutcome::TimedOut,
+        "deadline 已到時不得再以已緩衝 RX 命中成功"
+    );
+}
+
+#[test]
+fn self_test_negative_timeout_ignores_immediate_nonce_reply() {
+    let rig = ActorRig::new(SELF_TEST_PROFILE).ready();
+    let result = rig
+        .request_async(SessionRequest::SelfTest {
+            timeout_s: -1.0,
+            strict_human_lock: false,
+        })
+        .recv_timeout(Duration::from_secs(2))
+        .expect("self-test 應完成")
+        .expect("self-test 應回 RPC dict");
+
+    assert_eq!(
+        result
+            .get("classification")
+            .and_then(sw_proto::pyjson::PyValue::as_str),
+        Some("TARGET_UNRESPONSIVE"),
+        "負 timeout 應沿用逾期語意：{result:?}"
+    );
+    assert_eq!(
+        result.get("probe_ok"),
+        Some(&sw_proto::pyjson::PyValue::Bool(false))
+    );
+}
+
+#[test]
 fn shutdown_cancels_existing_rx_wait_without_clock_advance() {
     let rx = RxShared::new(64, 0);
     let regex = compile("ready", PyFlags::default()).unwrap();

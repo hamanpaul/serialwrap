@@ -2129,6 +2129,9 @@ impl SessionCore {
                 });
                 // P8 Task 5：與 fence 凍結同處喚醒檔案傳輸等待（不動 login run 的取消世代）。
                 self.deps.rx.cancel_transfer_runs();
+                if kind == StopKind::Shutdown {
+                    self.flush_shutdown_self_test_ops(&mut effects.0);
+                }
                 if !already_released && (kind != StopKind::Shutdown || self.state != SessionState::Released) {
                     self.set_state(SessionState::Recovering, now);
                 }
@@ -2216,11 +2219,17 @@ impl SessionCore {
                 });
                 return effects;
             }
-            return Effects(self.finish_stop_without_worker(
+            let mut stop_effects = Vec::new();
+            if kind == StopKind::Shutdown {
+                // 其他 drain 完成後再停機會走無 worker 分支；仍須凍結 Fence 並沖刷 self-test waiter。
+                self.flush_shutdown_self_test_ops(&mut stop_effects);
+            }
+            stop_effects.extend(self.finish_stop_without_worker(
                 kind,
                 waiter.into_iter().collect(),
                 now,
             ));
+            return Effects(stop_effects);
         };
 
         if kind == StopKind::IoError && self.last_error.is_none() {
@@ -2285,6 +2294,16 @@ impl SessionCore {
     /// Shutdown Phase 1：Fence 已凍結後才取消 self-test RX 等待、移除 op 登錄並回覆 RPC。
     /// 不等待 OpFinished；晚到事件因 pending／side 登錄已移除而無副作用。
     fn flush_shutdown_self_test_ops(&mut self, effects: &mut Vec<Effect>) {
+        if !self.deps.fence.with(|fence| fence.frozen) {
+            self.generations.owner_gen = self.generations.owner_gen.saturating_add(1);
+            self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
+        }
+        self.deps.fence.with(|fence| {
+            fence.frozen = true;
+            fence.active_epoch = None;
+            fence.owner_gen = self.generations.owner_gen;
+            fence.fsm_gen = self.generations.fsm_gen;
+        });
         self.deps.rx.cancel_shutdown_waits();
         let op_ids: Vec<OpId> = self
             .pending_ops

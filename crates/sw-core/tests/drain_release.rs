@@ -8,11 +8,11 @@ use crossbeam_channel::bounded;
 use support::*;
 use sw_core::drain::{StopId, WorkerStoppedReceipt};
 use sw_core::login_fsm::{LoginOutcome, LoginPlan};
-use sw_core::mailbox::{ControlEvent, DetachReason, OpenFailure, TimerEvent};
+use sw_core::mailbox::{ControlEvent, DetachReason, MailboxItem, OpenFailure, TimerEvent};
 use sw_core::op_runner::OpOutcome;
 use sw_core::session_core::{Effect, SessionRequest, SessionState};
 use sw_core::tx_writer::{EvidenceGap, OpId, TxLedger, TxOpLedger};
-use sw_pal::traits::{HolderReport, HolderScanStatus, PalError};
+use sw_pal::traits::{Clock, HolderReport, HolderScanStatus, PalError};
 use sw_proto::pyjson::{dumps, PyDict, PyValue, RPC_WIRE};
 
 fn release() -> SessionRequest {
@@ -1288,6 +1288,77 @@ fn shutdown_self_test_late_op_finished_is_ignored() {
         .unwrap());
     assert_ne!(h.core.state(), SessionState::Ready);
     assert!(h.core.shutdown_complete());
+}
+
+#[test]
+fn shutdown_after_completed_release_drain_flushes_self_test() {
+    use sw_proto::pydict;
+
+    let mut h = CoreHarness::new(SELF_TEST_PROFILE);
+    h.to_ready();
+    let (self_test, effects) = h.rpc_deferred(SessionRequest::SelfTest {
+        timeout_s: 60.0,
+        strict_human_lock: false,
+    });
+    let grant = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp { grant, .. } => Some(grant.clone()),
+            _ => None,
+        })
+        .expect("self-test 應產生 StartOp");
+
+    let release = h.rpc_deferred(release()).0;
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).feed();
+    assert!(release.try_recv().unwrap().unwrap()["ok"]
+        .as_bool()
+        .unwrap());
+    assert_eq!(h.core.state(), SessionState::Released);
+    assert!(self_test.try_recv().is_err(), "Release 不應改變 self-test 行為");
+
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    let effects = h.core.on_event(
+        MailboxItem::Control(ControlEvent::Shutdown { reply: shutdown_tx }),
+        h.clock.mono_ns(),
+    );
+    assert!(h.fence.with(|fence| fence.frozen), "Shutdown 回覆前 Fence 必須凍結");
+    let mut replies = effects.0.into_iter().filter_map(|effect| match effect {
+        Effect::Reply(reply, result) => Some((reply, result)),
+        _ => None,
+    });
+    let (reply, result) = replies.next().expect("Phase 1 先產生 self-test 回覆");
+    let _ = reply.try_send(result);
+    let result = self_test
+        .try_recv()
+        .expect("既有 Release drain 完成後，Shutdown 仍須回覆 self-test")
+        .expect("self-test 應收到 RPC dict");
+    assert_eq!(result.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(
+        result.get("error_code"),
+        Some(&PyValue::from("FLUSHED_BY_SHUTDOWN"))
+    );
+    assert!(shutdown_rx.try_recv().is_err(), "Shutdown waiter 須排在 self-test 回覆之後");
+    let (reply, result) = replies.next().expect("無 worker Shutdown 接著回覆 waiter");
+    let _ = reply.try_send(result);
+    assert!(shutdown_rx.try_recv().unwrap().unwrap()["ok"]
+        .as_bool()
+        .unwrap());
+    assert!(replies.next().is_none(), "不應產生多餘回覆");
+    assert!(h.core.shutdown_complete(), "無 worker 的 Shutdown 應可立即完成");
+
+    let late_effects = h.feed(ControlEvent::OpFinished {
+        op_id: grant.op_id,
+        epoch: grant.epoch,
+        outcome: OpOutcome::SelfTest(pydict! {
+            "probe_ok" => true,
+            "rx_bytes_last_10s" => 0,
+        }),
+        after_rx_seq: None,
+    });
+    assert!(late_effects.is_empty(), "晚到成功結果不得產生副作用");
+    assert_ne!(h.core.state(), SessionState::Ready);
+    assert!(self_test.try_recv().is_err(), "self-test 只可回覆一次");
 }
 
 #[test]
