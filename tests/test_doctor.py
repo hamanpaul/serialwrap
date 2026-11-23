@@ -50,6 +50,7 @@ LINUX_CHECKS = [
     "wal_dir",
     "wal_writable",
     "profile_bootloader_prompts",
+    "profile_template_fields",
     "devices",
     "wsl_systemd",
 ]
@@ -67,6 +68,7 @@ WINDOWS_CHECKS = [
     "wal_dir",
     "wal_writable",
     "profile_bootloader_prompts",
+    "profile_template_fields",
     "devices",
 ]
 
@@ -298,7 +300,7 @@ class TestCliAdvisorySets:
         assert cli._DOCTOR_ADVISORY_CHECKS == {
             "systemd", "wsl_systemd", "devices", "other_serialwrap_installs", "wal_dir",
             "serialwrap_minicom_on_path", "jq_on_path", "minicom_on_path",
-            "profile_bootloader_prompts", "daemon_code_current",
+            "profile_bootloader_prompts", "profile_template_fields", "daemon_code_current",
         }
 
 
@@ -518,3 +520,112 @@ class TestProfileBootloaderPromptsDrift:
                 fx=FakeEffects(systemd=False, in_groups=set()), platform="win32")}
         assert "profile_bootloader_prompts" in linux
         assert "profile_bootloader_prompts" in win
+
+
+class TestProfileTemplateFieldsDrift:
+    """線上 profile 的 template 缺出貨資產已有的欄位 → advisory WARN。
+
+    setup 不覆寫既有 profile，升級後新增的欄位（例如 #234 的 boot_done_regex）在舊
+    安裝的線上檔不會出現，功能靜默失效。profile_bootloader_prompts 只看單一欄位。
+    """
+
+    ASSET = (
+        "profiles:\n"
+        "  prpl-template:\n"
+        "    platform: prpl\n"
+        "    boot_done_regex: \"Please press Enter\"\n"
+        "    bootloader_prompts:\n"
+        "      - \"^=> $\"\n"
+        "    uart:\n"
+        "      baud: 115200\n"
+        "  brcm-template:\n"
+        "    platform: bcm\n"
+        "    timeout_s: 15\n"
+    )
+
+    def _drift(self, live: str):
+        from sw_core.doctor_cmd import _profile_templates_missing_fields
+
+        return _profile_templates_missing_fields(self.ASSET, live)
+
+    def test_lists_missing_keys_per_template_sorted(self):
+        live = (
+            "profiles:\n"
+            "  prpl-template:\n"
+            "    platform: prpl\n"
+            "    uart: {baud: 921600}\n"
+            "  brcm-template:\n"
+            "    platform: bcm\n"
+        )
+        assert self._drift(live) == [
+            ("brcm-template", ["timeout_s"]),
+            ("prpl-template", ["boot_done_regex", "bootloader_prompts"]),
+        ]
+
+    def test_present_but_empty_counts_as_set(self):
+        """值為空或 null 視為刻意覆寫，不算缺；也不比對值與巢狀欄位。"""
+        live = (
+            "profiles:\n"
+            "  prpl-template:\n"
+            "    platform: shell\n"
+            "    boot_done_regex: \"\"\n"
+            "    bootloader_prompts: null\n"
+            "    uart: {}\n"
+            "  brcm-template:\n"
+            "    platform: bcm\n"
+            "    timeout_s: 30\n"
+        )
+        assert self._drift(live) == []
+
+    def test_ignores_templates_absent_from_live_and_extra_live_keys(self):
+        live = (
+            "profiles:\n"
+            "  brcm-template:\n"
+            "    platform: bcm\n"
+            "    timeout_s: 15\n"
+            "    max_console_line_chars: 505\n"
+            "  my-board:\n"
+            "    platform: shell\n"
+        )
+        assert self._drift(live) == []
+
+    def test_malformed_or_non_mapping_returns_empty(self):
+        assert self._drift("profiles: [oops\n") == []
+        assert self._drift("- a\n- b\n") == []
+        assert self._drift("profiles:\n  - name: prpl-template\n") == []
+
+    def test_check_reports_detail_and_fix(self, tmp_path, monkeypatch):
+        from sw_core import constants
+        from sw_core.doctor_cmd import _check_profile_template_fields
+
+        monkeypatch.setattr(constants, "PROFILE_DIR", str(tmp_path))
+        missing = _check_profile_template_fields()
+        assert missing["ok"] is True and "未物化" in missing["detail"]
+
+        (tmp_path / "default.yaml").write_text(
+            "profiles:\n  prpl-template:\n    platform: prpl\n", encoding="utf-8")
+        item = _check_profile_template_fields()
+        assert item["check"] == "profile_template_fields"
+        assert item["ok"] is False
+        assert item["detail"].startswith(f"線上 {tmp_path / 'default.yaml'} 缺出貨資產已有的欄位：")
+        assert "prpl-template（" in item["detail"] and "boot_done_regex" in item["detail"]
+        assert "setup 不覆寫既有 profile" in item["fix"]
+
+    def test_shipped_asset_matches_itself(self, tmp_path, monkeypatch):
+        from pathlib import Path
+
+        from sw_core import constants
+        from sw_core.doctor_cmd import _check_profile_template_fields
+
+        asset = Path(__file__).resolve().parents[1] / "sw_core" / "assets" / "profiles" / "default.yaml"
+        (tmp_path / "default.yaml").write_text(asset.read_text(encoding="utf-8"), encoding="utf-8")
+        monkeypatch.setattr(constants, "PROFILE_DIR", str(tmp_path))
+        item = _check_profile_template_fields()
+        assert item == {"check": "profile_template_fields", "ok": True,
+                        "detail": "與出貨資產一致", "fix": ""}
+
+    def test_check_present_in_both_platform_lists_as_advisory(self):
+        from sw_core.doctor_cmd import DOCTOR_ADVISORY_CHECKS, DOCTOR_ADVISORY_CHECKS_WIN
+
+        assert "profile_template_fields" in DOCTOR_ADVISORY_CHECKS
+        assert "profile_template_fields" in DOCTOR_ADVISORY_CHECKS_WIN

@@ -678,6 +678,83 @@ def _check_profile_bootloader_prompts() -> dict:
     }
 
 
+def _profile_templates_missing_fields(asset_text: str, live_text: str) -> list[tuple[str, list[str]]]:
+    """純函式：出貨資產 template 有、線上同名 template 沒有的頂層欄位（依名稱排序）。
+
+    只比對兩邊都存在的 template，只看欄位是否存在（值為空或 null 算有設定，視為刻意
+    覆寫），不比對值也不看巢狀欄位（uart.*）。線上自行多加的欄位或 template 不算漂移。
+    YAML 解析失敗或結構不是 mapping 一律回空清單（doctor 不得因此失敗）。
+    """
+    try:
+        import yaml
+    except Exception:  # pragma: no cover - 環境相依
+        return []
+    try:
+        asset = yaml.safe_load(asset_text) or {}
+        live = yaml.safe_load(live_text) or {}
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(asset, dict) or not isinstance(live, dict):
+        return []
+    asset_profiles = asset.get("profiles") or {}
+    live_profiles = live.get("profiles") or {}
+    if not isinstance(asset_profiles, dict) or not isinstance(live_profiles, dict):
+        return []
+    drifted: list[tuple[str, list[str]]] = []
+    for name, tpl in asset_profiles.items():
+        live_tpl = live_profiles.get(name)
+        if not isinstance(tpl, dict) or not isinstance(live_tpl, dict):
+            continue
+        missing = sorted(k for k in tpl if isinstance(k, str) and k not in live_tpl)
+        if missing:
+            drifted.append((str(name), missing))
+    return sorted(drifted)
+
+
+def _check_profile_template_fields() -> dict:
+    """線上 profile 的 template 是否缺出貨資產已有的欄位（advisory WARN）。
+
+    ``serialwrap setup`` 不覆寫既有 profile，升級後新加的欄位（例如 #234 的
+    ``boot_done_regex``）不會出現在舊安裝的線上檔，功能就靜默地沒生效。
+    ``profile_bootloader_prompts`` 只看單一欄位，本項列出所有缺的頂層欄位。
+    """
+    from sw_core.constants import PROFILE_DIR
+
+    asset_path = os.path.join(os.path.dirname(__file__), "assets", "profiles", "default.yaml")
+    live_path = os.path.join(PROFILE_DIR, "default.yaml")
+    try:
+        with open(asset_path, encoding="utf-8") as fh:
+            asset_text = fh.read()
+    except Exception:  # noqa: BLE001 - 資產不可讀時本檢查無意義，不得拋出
+        return {"check": "profile_template_fields", "ok": True, "detail": "資產不可讀，略過", "fix": ""}
+    try:
+        with open(live_path, encoding="utf-8") as fh:
+            live_text = fh.read()
+    except Exception:  # noqa: BLE001 - 尚未 setup 物化過，非漂移
+        return {
+            "check": "profile_template_fields",
+            "ok": True,
+            "detail": f"線上 profile 未物化（{live_path}），略過",
+            "fix": "",
+        }
+
+    drifted = _profile_templates_missing_fields(asset_text, live_text)
+    if not drifted:
+        return {"check": "profile_template_fields", "ok": True, "detail": "與出貨資產一致", "fix": ""}
+    listed = "；".join(f"{name}（{'、'.join(keys)}）" for name, keys in drifted)
+    return {
+        "check": "profile_template_fields",
+        "ok": False,
+        "detail": f"線上 {live_path} 缺出貨資產已有的欄位：{listed}",
+        "fix": (
+            "setup 不覆寫既有 profile，升級後新增的欄位要手動補：備份線上檔後，參照出貨資產 "
+            "sw_core/assets/profiles/default.yaml 把缺的欄位補進對應 template，再 "
+            "serialwrap service restart（on-demand：daemon stop 後 daemon start）；"
+            "刻意不用的欄位可忽略本項"
+        ),
+    }
+
+
 # advisory 檢查名單（單一事實來源；sw_core/cli.py re-export 沿用）：這些項 ok=False
 # 僅屬 WARN 性質，不拉低 doctor 整體 ok；機器消費者（realhw/regression preflight 的
 # 「doctor 全綠」判定）依 run_doctor 蓋章的 per-check `advisory` 欄位識別，
@@ -685,12 +762,12 @@ def _check_profile_bootloader_prompts() -> dict:
 DOCTOR_ADVISORY_CHECKS = frozenset({
     "systemd", "wsl_systemd", "devices", "other_serialwrap_installs", "wal_dir",
     "serialwrap_minicom_on_path", "jq_on_path", "minicom_on_path",
-    "profile_bootloader_prompts", "daemon_code_current",
+    "profile_bootloader_prompts", "profile_template_fields", "daemon_code_current",
 })
 DOCTOR_ADVISORY_CHECKS_WIN = frozenset({
     "serialwrap_on_path", "serialwrapd_on_path", "daemon_endpoint",
     "devices", "other_serialwrap_installs", "wal_dir",
-    "profile_bootloader_prompts", "daemon_code_current",
+    "profile_bootloader_prompts", "profile_template_fields", "daemon_code_current",
 })
 
 
@@ -738,6 +815,7 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
             _check_wal_dir(),
             _check_wal_writable(),
             _check_profile_bootloader_prompts(),
+            _check_profile_template_fields(),
             _check_devices_windows(),
         ]
         _append_version_pairing(report)
@@ -770,6 +848,7 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
         _check_wal_dir(),
         _check_wal_writable(),
         _check_profile_bootloader_prompts(),
+        _check_profile_template_fields(),
         _check_devices(),
         _check_wsl_systemd(fx),
     ]
