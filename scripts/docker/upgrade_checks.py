@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import time
@@ -88,12 +89,19 @@ ATTACHED_LEGACY_MAX_SETUP_S = 120.0
 PIPX_UNINSTALL_HINT = "pipx uninstall serialwrap"
 
 # 容器內沒有序列硬體（OD-15／OD-16 禁止把真實裝置帶進容器），doctor 的 devices advisory 必然為 0。
-# profile_template_fields：升級保留舊版 setup 寫下的線上 profile（setup 不覆寫），舊版缺的出貨欄位
-# （0.3.2 的 prpl-template 缺 boot_done_regex）在升級後必然被這個 advisory 列出——這正是它要提醒的情境，
-# 不是升級失敗。其餘 advisory 須全綠。
-ALLOWED_ADVISORY_FAILURES = frozenset({"devices", "profile_template_fields"})
+# `profile_template_fields` 只在明確的 profile policy（固定情境資料）驗證，不能整類豁免；一般 advisory
+# allowlist 仍維持只有 devices，避免把未受控的 drift 視為正常。
+ALLOWED_ADVISORY_FAILURES = frozenset({"devices"})
 
 _DAEMON_NAMES = frozenset({"serialwrapd", "serialwrapd.exe", "serialwrapd.py"})
+PROFILE_EXPECTATIONS_PATH = Path(__file__).with_name("upgrade_profile_expectations.json")
+_PROFILE_POLICY_PHASES = frozenset({
+    "before_asset_addition",
+    "asset_added_not_migrated",
+    "migrated",
+    "materialized",
+})
+_PROFILE_UNSUPPORTED_MODES = frozenset({"legacy_0_3_2", "downgrade"})
 
 # 升級前寫入的使用者資料（driver phase_seed 建立）：基線必須真的含這些，相容比對才不會空轉。
 SEED_ALIASES = frozenset({"upgbench", "pinned"})
@@ -331,21 +339,238 @@ def judge_state_compatible(base: dict[str, Any], now: dict[str, Any], check_id: 
     return row(check_id, "PASS", None, **detail)
 
 
-def judge_doctor(check_id: str, doctor: dict[str, Any] | None, *, require_pairing: bool) -> dict[str, Any]:
+def _canonicalize_field_list(values: Any, *, label: str) -> list[str]:
+    if type(values) is not list:
+        raise ValueError(f"{label} 必須為 list[str]")
+    if any(type(item) is not str or not item for item in values):
+        raise ValueError(f"{label} 必須只含非空字串")
+    if len(values) != len(set(values)):
+        raise ValueError(f"{label} 含重複項目")
+    return sorted(values)
+
+
+def _validate_profile_expectation_entry(name: str, entry: Any, *, supported: bool) -> None:
+    if type(entry) is not dict:
+        raise ValueError(f"profile expectation {name} 必須為 object")
+    if entry.get("phase") != name or type(entry.get("supported")) is not bool:
+        raise ValueError(f"profile expectation {name} 的 phase/supported 無效")
+    if entry["supported"] is not supported:
+        raise ValueError(f"profile expectation {name} 的 supported 不符政策類別")
+    common = _canonicalize_field_list(entry.get("expected_common_templates"),
+                                      label=f"{name}.expected_common_templates")
+    missing = entry.get("expected_missing_fields")
+    if type(missing) is not dict or any(type(key) is not str for key in missing):
+        raise ValueError(f"{name}.expected_missing_fields 必須為 object[str, list[str]]")
+    normalized_missing = {
+        template: _canonicalize_field_list(fields, label=f"{name}.expected_missing_fields[{template!r}]")
+        for template, fields in missing.items()
+    }
+    if set(normalized_missing) != set(common):
+        raise ValueError(f"{name}.expected_missing_fields 的 template 集合必須等於 expected_common_templates")
+    _canonicalize_field_list(entry.get("allowed_migration_fields"), label=f"{name}.allowed_migration_fields")
+    if supported:
+        if not common or type(entry.get("target_asset_revision")) is not str:
+            raise ValueError(f"{name} 支援的政策必須指定共同 template 與資產 revision")
+    else:
+        if common or normalized_missing or entry["allowed_migration_fields"]:
+            raise ValueError(f"{name} 不支援模式不得含比較或遷移預期")
+        if type(entry.get("unsupported_reason")) is not str or not entry["unsupported_reason"]:
+            raise ValueError(f"{name} 不支援模式必須說明原因")
+
+
+def load_profile_expectations(path: str | Path | None = None) -> dict[str, Any]:
+    """讀取並驗證受版控的 OD-33 固定情境，不從 doctor 輸出推導政策。"""
+    policy_path = PROFILE_EXPECTATIONS_PATH if path is None else Path(path)
+    try:
+        document = json.loads(policy_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"無法讀取 profile expectation policy: {type(exc).__name__}") from exc
+    if type(document) is not dict or type(document.get("schema_version")) is not int or document["schema_version"] != 1:
+        raise ValueError("profile expectation schema_version 無效")
+    if type(document.get("policy_id")) is not str or not document["policy_id"]:
+        raise ValueError("profile expectation policy_id 無效")
+    source = document.get("source")
+    source_fields = ("fixture_id", "fixture_kind", "source_version", "source_ref", "source_path", "source_sha256")
+    if type(source) is not dict or any(type(source.get(key)) is not str or not source[key] for key in source_fields):
+        raise ValueError("profile expectation source provenance 不完整")
+    if source["fixture_kind"] != "tagged_release_asset" or len(source["source_sha256"]) != 64 \
+            or any(char not in "0123456789abcdef" for char in source["source_sha256"]):
+        raise ValueError("profile expectation source 必須指向可追溯的 tagged release asset")
+    target = document.get("target_asset")
+    target_fields = ("asset_id", "asset_path", "migration_policy_id")
+    if type(target) is not dict or any(type(target.get(key)) is not str or not target[key] for key in target_fields):
+        raise ValueError("profile expectation target_asset 不完整")
+    phases = document.get("phases")
+    unsupported_modes = document.get("unsupported_modes")
+    if type(phases) is not dict or set(phases) != _PROFILE_POLICY_PHASES:
+        raise ValueError("profile expectation phases 必須精確列出四個核准階段")
+    if type(unsupported_modes) is not dict or set(unsupported_modes) != _PROFILE_UNSUPPORTED_MODES:
+        raise ValueError("profile expectation unsupported_modes 必須明列舊版與降級")
+    for name, entry in phases.items():
+        _validate_profile_expectation_entry(name, entry, supported=True)
+    for name, entry in unsupported_modes.items():
+        _validate_profile_expectation_entry(name, entry, supported=False)
+    return document
+
+
+def select_profile_policy(phase: str) -> dict[str, Any]:
+    """依呼叫端明確提供的階段選出政策；未知階段不會退回較寬鬆預設值。"""
+    if type(phase) is not str:
+        raise ValueError("profile policy phase 必須為字串")
+    document = load_profile_expectations()
+    entry = document["phases"].get(phase)
+    if entry is None:
+        entry = document["unsupported_modes"].get(phase)
+    if entry is None:
+        raise ValueError(f"沒有登錄 profile policy phase: {phase}")
+    selected = dict(entry)
+    selected["policy_id"] = document["policy_id"]
+    selected["source"] = dict(document["source"])
+    selected["target_asset"] = dict(document["target_asset"])
+    selected["migration_policy_id"] = document["target_asset"]["migration_policy_id"]
+    return selected
+
+
+def _validate_profile_policy(profile_policy: Any) -> tuple[bool, list[str], dict[str, list[str]]]:
+    if type(profile_policy) is not dict:
+        raise ValueError("profile_policy 必須由 select_profile_policy() 明確選出")
+    if type(profile_policy.get("supported")) is not bool:
+        raise ValueError("profile_policy.supported 必須為真 boolean")
+    phase = profile_policy.get("phase")
+    if type(phase) is not str:
+        raise ValueError("profile_policy.phase 必須為字串")
+    expected_policy = select_profile_policy(phase)
+    if profile_policy != expected_policy:
+        raise ValueError("profile_policy 與受版控政策不一致")
+    supported = profile_policy["supported"]
+    common = _canonicalize_field_list(profile_policy["expected_common_templates"],
+                                      label="expected_common_templates")
+    missing = profile_policy["expected_missing_fields"]
+    normalized_missing = {
+        template: _canonicalize_field_list(fields, label=f"expected_missing_fields[{template!r}]")
+        for template, fields in missing.items()
+    }
+    if set(normalized_missing) != set(common):
+        raise ValueError("expected_missing_fields 必須完整列出每個共同 template")
+    _canonicalize_field_list(profile_policy["allowed_migration_fields"], label="allowed_migration_fields")
+    return supported, common, normalized_missing
+
+
+def _profile_check_payload_error(profile_check: dict[str, Any], *, expected_common: list[str],
+                                 expected_missing: dict[str, list[str]]) -> str | None:
+    extra = profile_check.get("extra")
+    if type(extra) is not dict:
+        return "profile_template_fields 缺少 extra payload"
+    required = ("comparison_status", "missing_fields", "compared_templates", "reason")
+    if any(key not in extra for key in required):
+        return "profile_template_fields payload 缺必要欄位"
+    status = extra["comparison_status"]
+    if type(status) is not str:
+        return "profile_template_fields.comparison_status 必須為字串"
+    if status not in {"matched", "missing_fields", "not_materialized", "unavailable", "no_common_templates"}:
+        return f"profile_template_fields.comparison_status 非法: {status!r}"
+    if status not in {"matched", "missing_fields"}:
+        return f"profile_template_fields 不可比較: {status}"
+    if type(profile_check.get("check")) is not str or profile_check["check"] != "profile_template_fields":
+        return "profile_template_fields check 名稱無效"
+    if type(profile_check.get("ok")) is not bool:
+        return "profile_template_fields.ok 必須為真 boolean"
+    if type(profile_check.get("advisory")) is not bool or profile_check["advisory"] is not True:
+        return "profile_template_fields.advisory 必須為 True"
+    if extra["reason"] is not None and type(extra["reason"]) is not str:
+        return "profile_template_fields.reason 必須為字串或 null"
+    if extra["reason"] is not None:
+        return "可比較的 profile_template_fields.reason 必須為 null"
+    try:
+        compared = _canonicalize_field_list(extra["compared_templates"],
+                                            label="profile_template_fields.compared_templates")
+    except ValueError as exc:
+        return str(exc)
+    if compared != expected_common:
+        return f"compared_templates 不符預期: got={compared}, expected={expected_common}"
+    missing = extra["missing_fields"]
+    if type(missing) is not dict or any(type(template) is not str for template in missing):
+        return "profile_template_fields.missing_fields 必須為 object[str, list[str]]"
+    try:
+        normalized_missing = {
+            template: _canonicalize_field_list(fields, label=f"missing_fields[{template!r}]")
+            for template, fields in missing.items()
+        }
+    except ValueError as exc:
+        return str(exc)
+    if normalized_missing != expected_missing:
+        return f"missing_fields 不符預期: got={normalized_missing}, expected={expected_missing}"
+    has_missing = any(normalized_missing.values())
+    expected_status = "missing_fields" if has_missing else "matched"
+    expected_ok = not has_missing
+    if status != expected_status or profile_check["ok"] is not expected_ok:
+        return "comparison_status、ok 與 missing_fields 集合不一致"
+    return None
+
+
+def judge_doctor(check_id: str, doctor: dict[str, Any] | None, *, require_pairing: bool,
+                 profile_policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    if profile_policy is None:
+        return row(check_id, "FAIL", "缺少明確的 profile_policy；不得退回寬鬆判定")
+    try:
+        policy_supported, expected_common, expected_missing = _validate_profile_policy(profile_policy)
+    except (ValueError, KeyError, TypeError) as exc:
+        return row(check_id, "FAIL", f"profile_policy 無效: {exc}")
     if not isinstance(doctor, dict) or not isinstance(doctor.get("checks"), list):
         return row(check_id, "FAIL", "doctor 輸出不可解析")
-    checks = [c for c in doctor["checks"] if isinstance(c, dict)]
-    hard = sorted(c.get("check") for c in checks if not c.get("ok") and not c.get("advisory"))
-    advisory = sorted(c.get("check") for c in checks if not c.get("ok") and c.get("advisory"))
-    extra_adv = sorted(set(advisory) - ALLOWED_ADVISORY_FAILURES)
-    pairing = next((c for c in checks if c.get("check") == "version_pairing"), None)
-    detail = {"ok": doctor.get("ok"), "failed": hard, "advisory_failed": advisory,
-              "version_pairing": None if pairing is None else pairing.get("ok")}
-    if hard or doctor.get("ok") is not True:
+    if type(doctor.get("ok")) is not bool:
+        return row(check_id, "FAIL", "doctor.ok 必須為 boolean")
+    checks = doctor["checks"]
+    if any(type(check) is not dict for check in checks):
+        return row(check_id, "FAIL", "doctor.checks 含非 object 項目")
+    for check in checks:
+        if type(check.get("check")) is not str or not check["check"] \
+                or type(check.get("ok")) is not bool or type(check.get("advisory")) is not bool:
+            return row(check_id, "FAIL", "doctor check 的名稱、ok、advisory 型別無效")
+    hard = sorted(c["check"] for c in checks if not c["ok"] and not c["advisory"])
+    advisory = sorted(c["check"] for c in checks if not c["ok"] and c["advisory"])
+    pairing = next((c for c in checks if c["check"] == "version_pairing"), None)
+    detail = {
+        "ok": doctor["ok"],
+        "failed": hard,
+        "advisory_failed": advisory,
+        "version_pairing": None if pairing is None else pairing["ok"],
+        "profile_policy": {
+            "policy_id": profile_policy["policy_id"],
+            "phase": profile_policy["phase"],
+            "migration_policy_id": profile_policy["migration_policy_id"],
+            "expected_common_templates": expected_common,
+            "expected_missing_fields": expected_missing,
+            "allowed_migration_fields": profile_policy["allowed_migration_fields"],
+        },
+    }
+    if hard or doctor["ok"] is not True:
         return row(check_id, "FAIL", "doctor 有非 advisory 檢查失敗", **detail)
+
+    profile_checks = [c for c in checks if c["check"] == "profile_template_fields"]
+    if policy_supported:
+        if len(profile_checks) != 1:
+            return row(check_id, "FAIL", "profile_template_fields 必須恰好出現一次",
+                       profile_check_count=len(profile_checks), **detail)
+        profile_check = profile_checks[0]
+        payload_error = _profile_check_payload_error(
+            profile_check,
+            expected_common=expected_common,
+            expected_missing=expected_missing,
+        )
+        if payload_error is not None:
+            return row(check_id, "FAIL", payload_error, profile_check=profile_check, **detail)
+        allowed = set(ALLOWED_ADVISORY_FAILURES) | {"profile_template_fields"}
+    else:
+        if profile_checks:
+            return row(check_id, "FAIL", "不支援此 check 的政策下，doctor 不得輸出 profile_template_fields",
+                       profile_check_count=len(profile_checks), **detail)
+        allowed = set(ALLOWED_ADVISORY_FAILURES)
+
+    extra_adv = sorted(set(advisory) - allowed)
     if extra_adv:
-        return row(check_id, "FAIL", f"doctor advisory 失敗超出容器允許集合 {sorted(ALLOWED_ADVISORY_FAILURES)}", **detail)
-    if require_pairing and (pairing is None or pairing.get("ok") is not True):
+        return row(check_id, "FAIL", f"doctor advisory 失敗超出允許集合 {sorted(allowed)}", **detail)
+    if require_pairing and (pairing is None or pairing["ok"] is not True):
         return row(check_id, "FAIL", "release 安裝的 doctor 缺 version_pairing 或未通過", **detail)
     return row(check_id, "PASS", None, **detail)
 

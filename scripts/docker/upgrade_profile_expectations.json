@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "policy_id": "od33-profile-template-fields-v1",
+  "description": "OD-33 固定 profile_template_fields 政策；僅由明確情境階段選擇，不依 doctor 輸出切換。",
+  "source": {
+    "fixture_id": "serialwrap-v0.3.2-default-profile-prpl-template",
+    "fixture_kind": "tagged_release_asset",
+    "source_version": "0.3.2",
+    "source_ref": "v0.3.2",
+    "source_path": "sw_core/assets/profiles/default.yaml",
+    "source_sha256": "0857ebf9c5de56aafc48b13f5c478d173eab9f0397fb0fda30181a9f01412bf0"
+  },
+  "target_asset": {
+    "asset_id": "serialwrap-default-profiles",
+    "asset_path": "sw_core/assets/profiles/default.yaml",
+    "migration_policy_id": "p290-template-migration-v1"
+  },
+  "phases": {
+    "before_asset_addition": {
+      "supported": true,
+      "phase": "before_asset_addition",
+      "target_asset_revision": "pre-p290",
+      "expected_common_templates": [
+        "prpl-template"
+      ],
+      "expected_missing_fields": {
+        "prpl-template": [
+          "boot_done_regex"
+        ]
+      },
+      "allowed_migration_fields": []
+    },
+    "asset_added_not_migrated": {
+      "supported": true,
+      "phase": "asset_added_not_migrated",
+      "target_asset_revision": "p290",
+      "expected_common_templates": [
+        "prpl-template"
+      ],
+      "expected_missing_fields": {
+        "prpl-template": [
+          "boot_done_regex",
+          "timeout_recovery_keys"
+        ]
+      },
+      "allowed_migration_fields": []
+    },
+    "migrated": {
+      "supported": true,
+      "phase": "migrated",
+      "target_asset_revision": "p290",
+      "expected_common_templates": [
+        "prpl-template"
+      ],
+      "expected_missing_fields": {
+        "prpl-template": [
+          "boot_done_regex"
+        ]
+      },
+      "allowed_migration_fields": [
+        "timeout_recovery_keys"
+      ]
+    },
+    "materialized": {
+      "supported": true,
+      "phase": "materialized",
+      "target_asset_revision": "p290",
+      "expected_common_templates": [
+        "prpl-template"
+      ],
+      "expected_missing_fields": {
+        "prpl-template": []
+      },
+      "allowed_migration_fields": []
+    }
+  },
+  "unsupported_modes": {
+    "legacy_0_3_2": {
+      "supported": false,
+      "phase": "legacy_0_3_2",
+      "unsupported_reason": "source_version_does_not_implement_profile_template_fields",
+      "expected_common_templates": [],
+      "expected_missing_fields": {},
+      "allowed_migration_fields": []
+    },
+    "downgrade": {
+      "supported": false,
+      "phase": "downgrade",
+      "unsupported_reason": "downgraded_version_does_not_implement_profile_template_fields",
+      "expected_common_templates": [],
+      "expected_missing_fields": {},
+      "allowed_migration_fields": []
+    }
+  }
+}

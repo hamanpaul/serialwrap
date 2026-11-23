@@ -769,28 +769,224 @@ def test_alias_binding_lost_fails():
 
 # ---------- doctor ----------
 
+def _doctor_with_profile_policy(policy: dict[str, Any], *, status: str | None = None,
+                                missing_fields: dict[str, list[str]] | None = None,
+                                profile_ok: bool | None = None) -> dict[str, Any]:
+    fields = json.loads(json.dumps(policy["expected_missing_fields"])) if missing_fields is None else missing_fields
+    has_missing = any(fields.values())
+    profile_status = status or ("missing_fields" if has_missing else "matched")
+    profile_result = (not has_missing) if profile_ok is None else profile_ok
+    return {"ok": True, "checks": [
+        {"check": "dialout", "ok": True, "advisory": False},
+        {"check": "version_pairing", "ok": True, "advisory": False},
+        {"check": "devices", "ok": False, "advisory": True},
+        {"check": "profile_template_fields", "ok": profile_result, "advisory": True,
+         "extra": {"comparison_status": profile_status,
+                   "missing_fields": fields,
+                   "compared_templates": list(policy["expected_common_templates"]),
+                   "reason": None}},
+    ]}
+
+
 @pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_doctor_green_requires_non_advisory_and_pairing():
-    ok = {"ok": True, "checks": [{"check": "dialout", "ok": True, "advisory": False},
-                                 {"check": "version_pairing", "ok": True, "advisory": False},
-                                 {"check": "devices", "ok": False, "advisory": True}]}
-    assert uc.judge_doctor("doctor_green_new", ok, require_pairing=True)["verdict"] == "PASS"
+    policy = uc.select_profile_policy("materialized")
+    ok = _doctor_with_profile_policy(policy)
+    assert uc.judge_doctor("doctor_green_new", ok, require_pairing=True,
+                           profile_policy=policy)["verdict"] == "PASS"
     bad = json.loads(json.dumps(ok))
     bad["checks"][0]["ok"] = False
-    assert uc.judge_doctor("doctor_green_new", bad, require_pairing=True)["verdict"] == "FAIL"
+    assert uc.judge_doctor("doctor_green_new", bad, require_pairing=True,
+                           profile_policy=policy)["verdict"] == "FAIL"
     nopair = {"ok": True, "checks": [c for c in ok["checks"] if c["check"] != "version_pairing"]}
-    assert uc.judge_doctor("doctor_green_new", nopair, require_pairing=True)["verdict"] == "FAIL"
-    assert uc.judge_doctor("doctor_green_old", nopair, require_pairing=False)["verdict"] == "PASS"
+    assert uc.judge_doctor("doctor_green_new", nopair, require_pairing=True,
+                           profile_policy=policy)["verdict"] == "FAIL"
+    old_policy = uc.select_profile_policy("legacy_0_3_2")
+    old = {"ok": True, "checks": [c for c in ok["checks"] if c["check"] not in
+                                    {"version_pairing", "profile_template_fields"}]}
+    assert uc.judge_doctor("doctor_green_old", old, require_pairing=False,
+                           profile_policy=old_policy)["verdict"] == "PASS"
     other_adv = json.loads(json.dumps(ok))
     other_adv["checks"].append({"check": "jq_on_path", "ok": False, "advisory": True})
-    assert uc.judge_doctor("doctor_green_new", other_adv, require_pairing=True)["verdict"] == "FAIL"
-    # 升級保留舊版線上 profile：缺出貨欄位的 advisory 是預期提醒，不算升級失敗；改成非 advisory 仍 FAIL。
-    stale_profile = json.loads(json.dumps(ok))
-    stale_profile["checks"].append({"check": "profile_template_fields", "ok": False, "advisory": True})
-    assert uc.judge_doctor("doctor_green_new", stale_profile, require_pairing=True)["verdict"] == "PASS"
-    stale_profile["checks"][-1]["advisory"] = False
-    assert uc.judge_doctor("doctor_green_new", stale_profile, require_pairing=True)["verdict"] == "FAIL"
+    assert uc.judge_doctor("doctor_green_new", other_adv, require_pairing=True,
+                           profile_policy=policy)["verdict"] == "FAIL"
+    stale_policy = uc.select_profile_policy("before_asset_addition")
+    stale = _doctor_with_profile_policy(stale_policy)
+    assert uc.judge_doctor("doctor_green_new", stale, require_pairing=True,
+                           profile_policy=stale_policy)["verdict"] == "PASS"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_doctor_profile_expected_missing_fields_exact():
+    policy = uc.select_profile_policy("asset_added_not_migrated")
+    doctor = _doctor_with_profile_policy(policy)
+    row = uc.judge_doctor("doctor_green_new", doctor, require_pairing=True, profile_policy=policy)
+    assert row["verdict"] == "PASS", row
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_doctor_profile_missing_fields_mismatch_fails():
+    policy = uc.select_profile_policy("migrated")
+    valid = _doctor_with_profile_policy(policy)
+    invalid_results = []
+    too_many = json.loads(json.dumps(valid))
+    too_many["checks"][-1]["extra"]["missing_fields"]["prpl-template"].append("timeout_recovery_keys")
+    invalid_results.append(too_many)
+    too_few = json.loads(json.dumps(valid))
+    too_few["checks"][-1]["extra"]["missing_fields"]["prpl-template"] = []
+    invalid_results.append(too_few)
+    wrong_template = json.loads(json.dumps(valid))
+    wrong_template["checks"][-1]["extra"]["missing_fields"] = {"other-template": ["boot_done_regex"]}
+    invalid_results.append(wrong_template)
+    wrong_common = json.loads(json.dumps(valid))
+    wrong_common["checks"][-1]["extra"]["compared_templates"] = ["other-template"]
+    invalid_results.append(wrong_common)
+    for doctor in invalid_results:
+        row = uc.judge_doctor("doctor_green_new", doctor, require_pairing=True, profile_policy=policy)
+        assert row["verdict"] == "FAIL", row
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_doctor_profile_unavailable_fails():
+    policy = uc.select_profile_policy("before_asset_addition")
+    for status in ("unavailable", "not_materialized", "no_common_templates"):
+        doctor = _doctor_with_profile_policy(policy, status=status, missing_fields=None, profile_ok=False)
+        extra = doctor["checks"][-1]["extra"]
+        extra["missing_fields"] = None
+        extra["compared_templates"] = list(policy["expected_common_templates"])
+        extra["reason"] = "live_structure"
+        row = uc.judge_doctor("doctor_green_new", doctor, require_pairing=True, profile_policy=policy)
+        assert row["verdict"] == "FAIL", (status, row)
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_doctor_profile_invalid_payload_fails():
+    policy = uc.select_profile_policy("before_asset_addition")
+    no_payload = {"ok": True, "checks": [{"check": "dialout", "ok": True, "advisory": False},
+                                          {"check": "version_pairing", "ok": True, "advisory": False},
+                                          {"check": "devices", "ok": False, "advisory": True},
+                                          {"check": "profile_template_fields", "ok": False, "advisory": True}]}
+    invalid_rows = [no_payload]
+    duplicate = _doctor_with_profile_policy(policy)
+    duplicate["checks"].append(json.loads(json.dumps(duplicate["checks"][-1])))
+    invalid_rows.append(duplicate)
+    wrong_ok_type = _doctor_with_profile_policy(policy)
+    wrong_ok_type["checks"][-1]["ok"] = 1
+    invalid_rows.append(wrong_ok_type)
+    missing_key = _doctor_with_profile_policy(policy)
+    del missing_key["checks"][-1]["extra"]["compared_templates"]
+    invalid_rows.append(missing_key)
+    missing_check = _doctor_with_profile_policy(policy)
+    missing_check["checks"] = missing_check["checks"][:-1]
+    invalid_rows.append(missing_check)
+    duplicate_field = _doctor_with_profile_policy(policy)
+    duplicate_field["checks"][-1]["extra"]["missing_fields"]["prpl-template"].append("boot_done_regex")
+    invalid_rows.append(duplicate_field)
+    wrong_advisory_type = _doctor_with_profile_policy(policy)
+    wrong_advisory_type["checks"][-1]["advisory"] = 1
+    invalid_rows.append(wrong_advisory_type)
+    wrong_status_type = _doctor_with_profile_policy(policy)
+    wrong_status_type["checks"][-1]["extra"]["comparison_status"] = True
+    invalid_rows.append(wrong_status_type)
+    wrong_missing_type = _doctor_with_profile_policy(policy)
+    wrong_missing_type["checks"][-1]["extra"]["missing_fields"] = None
+    invalid_rows.append(wrong_missing_type)
+    wrong_compared_type = _doctor_with_profile_policy(policy)
+    wrong_compared_type["checks"][-1]["extra"]["compared_templates"] = "prpl-template"
+    invalid_rows.append(wrong_compared_type)
+    wrong_reason_type = _doctor_with_profile_policy(policy)
+    wrong_reason_type["checks"][-1]["extra"]["reason"] = True
+    invalid_rows.append(wrong_reason_type)
+    inconsistent = _doctor_with_profile_policy(policy, status="matched", profile_ok=True)
+    invalid_rows.append(inconsistent)
+    for doctor in invalid_rows:
+        row = uc.judge_doctor("doctor_green_new", doctor, require_pairing=True, profile_policy=policy)
+        assert row["verdict"] == "FAIL", row
+    missing_policy = uc.judge_doctor("doctor_green_new", _doctor_with_profile_policy(policy),
+                                     require_pairing=True)
+    assert missing_policy["verdict"] == "FAIL", missing_policy
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_doctor_profile_expectation_policy_p290_phases():
+    document = uc.load_profile_expectations()
+    assert document["schema_version"] == 1
+    assert document["policy_id"] == "od33-profile-template-fields-v1"
+    assert document["source"] == {
+        "fixture_id": "serialwrap-v0.3.2-default-profile-prpl-template",
+        "fixture_kind": "tagged_release_asset",
+        "source_version": "0.3.2",
+        "source_ref": "v0.3.2",
+        "source_path": "sw_core/assets/profiles/default.yaml",
+        "source_sha256": "0857ebf9c5de56aafc48b13f5c478d173eab9f0397fb0fda30181a9f01412bf0",
+    }
+    assert document["target_asset"] == {
+        "asset_id": "serialwrap-default-profiles",
+        "asset_path": "sw_core/assets/profiles/default.yaml",
+        "migration_policy_id": "p290-template-migration-v1",
+    }
+    expected = {
+        "before_asset_addition": {"prpl-template": ["boot_done_regex"]},
+        "asset_added_not_migrated": {"prpl-template": ["boot_done_regex", "timeout_recovery_keys"]},
+        "migrated": {"prpl-template": ["boot_done_regex"]},
+        "materialized": {"prpl-template": []},
+    }
+    for phase, expected_missing in expected.items():
+        policy = uc.select_profile_policy(phase)
+        assert policy["expected_missing_fields"] == expected_missing
+        doctor = _doctor_with_profile_policy(policy)
+        row = uc.judge_doctor("doctor_green_new", doctor, require_pairing=True, profile_policy=policy)
+        assert row["verdict"] == "PASS", (phase, row)
+
+    assert document["phases"]["migrated"]["allowed_migration_fields"] == ["timeout_recovery_keys"]
+    assert document["phases"]["before_asset_addition"]["allowed_migration_fields"] == []
+    assert document["phases"]["asset_added_not_migrated"]["allowed_migration_fields"] == []
+    assert document["phases"]["materialized"]["allowed_migration_fields"] == []
+    migrated = uc.select_profile_policy("migrated")
+    doctor = _doctor_with_profile_policy(
+        migrated,
+        missing_fields={"prpl-template": ["timeout_recovery_keys"]},
+        profile_ok=False,
+    )
+    row = uc.judge_doctor("doctor_green_new", doctor, require_pairing=True, profile_policy=migrated)
+    assert row["verdict"] == "FAIL", row
+    forged = json.loads(json.dumps(migrated))
+    forged["expected_missing_fields"] = {"prpl-template": ["timeout_recovery_keys"]}
+    row = uc.judge_doctor("doctor_green_new", _doctor_with_profile_policy(forged),
+                           require_pairing=True, profile_policy=forged)
+    assert row["verdict"] == "FAIL", row
+
+    for mode in ("legacy_0_3_2", "downgrade"):
+        unsupported = uc.select_profile_policy(mode)
+        old_doctor = {"ok": True, "checks": [{"check": "dialout", "ok": True, "advisory": False},
+                                               {"check": "devices", "ok": False, "advisory": True}]}
+        row = uc.judge_doctor("doctor_green_old", old_doctor, require_pairing=False,
+                               profile_policy=unsupported)
+        assert row["verdict"] == "PASS", (mode, row)
+        unexpected_check = _doctor_with_profile_policy(uc.select_profile_policy("materialized"))["checks"][-1]
+        old_doctor["checks"].append(unexpected_check)
+        row = uc.judge_doctor("doctor_green_old", old_doctor, require_pairing=False,
+                               profile_policy=unsupported)
+        assert row["verdict"] == "FAIL", (mode, row)
+
+    with pytest.raises(ValueError, match="沒有登錄 profile policy phase"):
+        uc.select_profile_policy("unlisted_phase")
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_doctor_other_advisory_still_fails():
+    policy = uc.select_profile_policy("materialized")
+    doctor = _doctor_with_profile_policy(policy)
+    doctor["checks"].append({"check": "jq_on_path", "ok": False, "advisory": True})
+    row = uc.judge_doctor("doctor_green_new", doctor, require_pairing=True, profile_policy=policy)
+    assert row["verdict"] == "FAIL", row
 
 
 # ---------- 整體 verdict ----------
