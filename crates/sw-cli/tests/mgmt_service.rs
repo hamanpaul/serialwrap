@@ -514,3 +514,151 @@ fn supervision_mode_bad_yaml_summary_has_problem_line_and_column() {
     assert!(err.ends_with("(line 2, column 1)\n"), "{err}");
     assert_eq!(err.matches('\n').count(), 1);
 }
+
+#[test]
+fn p277_service_start_rechecks_journal_after_transaction_wait() {
+    let t = TestEnv::windows()
+        .with_install_root()
+        .with_config("supervision_mode: windows-task\n")
+        .with_real_service()
+        .with_install_lock_holder_creating_journal(3.0)
+        .with_command(
+            &["schtasks", "/Run", "/TN", "serialwrap"],
+            1,
+            "",
+            "ERROR: The task is disabled.\n",
+        );
+
+    let (rc, out, err) = t.run(&["service", "start"]);
+
+    assert_eq!(rc, 2, "journal hold 下沿用停用工作的 /Run 結果：{out}");
+    assert!(out.contains("\"ok\":false"), "{out}");
+    assert!(out.contains("\"action\":\"start\""), "{out}");
+    assert!(out.contains("\"rc\":1"), "{out}");
+    assert!(!out.contains("\"phase\""), "hold 路徑不得新增 phase：{out}");
+    assert_eq!(
+        t.calls(),
+        vec![vec!["schtasks", "/Run", "/TN", "serialwrap"]],
+        "取得安裝交易鎖後必須重查 journal，不得 /ENABLE"
+    );
+    assert!(
+        t.journal_bytes().is_some(),
+        "持鎖交易應在釋放前建立 journal"
+    );
+    assert!(err.contains("更新／回滾進行中"), "{err}");
+    assert!(err.contains("install-journal.json"), "{err}");
+    assert!(err.contains("請待 serialwrap setup 完成"), "{err}");
+}
+
+#[test]
+fn p277_start_serializes_hold_creation_after_check() {
+    let t = TestEnv::windows()
+        .with_config("supervision_mode: windows-task\n")
+        .with_real_service()
+        .with_install_lock_contender_during_start()
+        .with_command(
+            &["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"],
+            0,
+            "SUCCESS: Changed scheduled task \"serialwrap\".\n",
+            "",
+        )
+        .with_command(
+            &["schtasks", "/Run", "/TN", "serialwrap"],
+            0,
+            "SUCCESS: Attempted to run the scheduled task \"serialwrap\".\n",
+            "",
+        );
+
+    let (rc, out, _err) = t.run(&["service", "start"]);
+
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(
+        t.calls(),
+        vec![
+            vec!["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"],
+            vec!["schtasks", "/Run", "/TN", "serialwrap"],
+        ]
+    );
+    let hold_path = t.state_dir().join("autostart-hold.json");
+    assert!(
+        !hold_path.exists(),
+        "另一生命週期交易不得在 start 的 hold 檢查後插入 hold"
+    );
+
+    let before_enable = t.event_order();
+    let install_lock = before_enable.index_of("fs:install-lock:acquired");
+    let switch_hold_check = before_enable.index_of("fs:check:autostart-hold.json:absent");
+    let journal_check = before_enable.index_of("fs:check:install-journal.json:absent");
+    let enable_attempt = before_enable.index_of("transaction:attempt:before-enable");
+    let enable_blocked = before_enable.index_of("transaction:blocked:before-enable");
+    let enable_command = before_enable.index_of("run:schtasks /Change /TN serialwrap /ENABLE");
+    let run_attempt = before_enable.index_of("transaction:attempt:before-run");
+    let run_blocked = before_enable.index_of("transaction:blocked:before-run");
+    let run_command = before_enable.index_of("run:schtasks /Run /TN serialwrap");
+    assert!(
+        install_lock < switch_hold_check
+            && install_lock < journal_check
+            && switch_hold_check < enable_attempt
+            && journal_check < enable_attempt
+            && enable_attempt < enable_blocked
+            && enable_blocked < enable_command
+            && enable_command < run_attempt
+            && run_attempt < run_blocked
+            && run_blocked < run_command,
+        "鎖、hold 檢查與 supervisor 命令順序錯誤：{journal_check}, {enable_attempt}, {enable_blocked}, {enable_command}, {run_attempt}, {run_blocked}, {run_command}"
+    );
+
+    assert!(
+        t.contender_create_switch_hold_after_start(),
+        "ENABLE 與 Run 完成後，生命週期交易應能取得鎖並建立 hold"
+    );
+    assert!(hold_path.exists());
+    let after_start = t.event_order();
+    let run_completed = after_start.index_of("run:schtasks /Run /TN serialwrap");
+    let late_attempt = after_start.index_of("transaction:attempt:after-start");
+    let late_acquired = after_start.index_of("transaction:acquired:after-start:hold_written=true");
+    assert!(run_completed < late_attempt && late_attempt < late_acquired);
+}
+
+#[test]
+fn p277_start_install_lock_contention_skips_supervisor() {
+    let t = TestEnv::windows()
+        .with_config("supervision_mode: windows-task\n")
+        .with_real_service()
+        .with_install_lock_holder();
+
+    let (rc, out, err) = t.run(&["service", "start"]);
+
+    assert_eq!(rc, 2, "持有安裝鎖時 start 應逾時：{out}");
+    assert!(out.contains("\"error_code\":\"TIMEOUT\""), "{out}");
+    assert!(t.calls().is_empty(), "未取得安裝鎖不得呼叫 schtasks");
+    assert!(!t.install_lock_available(), "測試中的交易持有者仍須持鎖");
+    assert!(err.contains("TIMEOUT"), "{err}");
+}
+
+#[test]
+fn p277_enable_failure_releases_lifecycle_locks() {
+    let t = TestEnv::windows()
+        .with_config("supervision_mode: windows-task\n")
+        .with_real_service()
+        .with_command(
+            &["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"],
+            1,
+            "",
+            "ERROR: Access is denied.\n",
+        );
+
+    let (rc, out, _err) = t.run(&["service", "start"]);
+
+    assert_eq!(rc, 2);
+    assert!(out.contains("\"error_code\":\"INTERNAL_ERROR\""), "{out}");
+    assert!(out.contains("\"phase\":\"service_enable\""), "{out}");
+    assert_eq!(
+        t.calls(),
+        vec![vec!["schtasks", "/Change", "/TN", "serialwrap", "/ENABLE"]]
+    );
+    assert!(
+        t.lifecycle_locks_available(),
+        "ENABLE 失敗早退後 install.lock 與 autostart.lock 都須釋放"
+    );
+}

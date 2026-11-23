@@ -26,7 +26,8 @@ use sw_pal::fakes::{
 use sw_pal::fs_ops::{FileLockGuard, FsOps, LinkKind};
 pub use sw_pal::proc_scan::{DaemonProc, ProcIdentity};
 pub use sw_pal::service_ctl::{
-    CompositeServiceCtl, HoldState, ServiceAction, ServiceCtl, SystemdCtl, WindowsServiceCtl,
+    AutostartHoldRecord, CmdRecord, CompositeServiceCtl, EnabledQuery, HoldState, ServiceAction,
+    ServiceCtl, ServiceResult, SupervisorDefinition, SystemdCtl, TaskQuery, WindowsServiceCtl,
     WindowsTaskCtl,
 };
 pub use sw_pal::traits::{Clock, FsRead, PalResult, SupervisionMode, SysEnv};
@@ -124,11 +125,31 @@ impl EventFs {
                 .push((sw_pal::fakes::next_event_seq(), label));
         }
     }
+
+    fn record_event(&self, label: String) {
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((sw_pal::fakes::next_event_seq(), label));
+    }
 }
 
 impl FsRead for EventFs {
     fn read(&self, path: &Path) -> PalResult<Vec<u8>> { self.inner.read(path) }
-    fn exists(&self, path: &Path) -> bool { self.inner.exists(path) }
+    fn exists(&self, path: &Path) -> bool {
+        let exists = self.inner.exists(path);
+        match path.file_name().and_then(|name| name.to_str()) {
+            Some("autostart-hold.json") | Some("install-journal.json") => {
+                self.record_event(format!(
+                    "fs:check:{}:{}",
+                    path.file_name().unwrap().to_string_lossy(),
+                    if exists { "present" } else { "absent" }
+                ))
+            }
+            _ => {}
+        }
+        exists
+    }
     fn is_dir(&self, path: &Path) -> bool { self.inner.is_dir(path) }
     fn is_file(&self, path: &Path) -> bool { self.inner.is_file(path) }
     fn list_dir(&self, path: &Path) -> PalResult<Vec<String>> { self.inner.list_dir(path) }
@@ -167,7 +188,163 @@ impl FsOps for EventFs {
         self.inner.symlink_or_copy_dir(link, target)
     }
     fn file_lock_exclusive(&self, path: &Path, blocking: bool) -> PalResult<FileLockGuard> {
-        self.inner.file_lock_exclusive(path, blocking)
+        let result = self.inner.file_lock_exclusive(path, blocking);
+        if path.file_name().and_then(|name| name.to_str()) == Some(".install.lock") {
+            self.record_event(format!(
+                "fs:install-lock:{}",
+                if result.is_ok() { "acquired" } else { "busy" }
+            ));
+        }
+        result
+    }
+}
+
+/// 在顯式 start 的 `/ENABLE` 與 `/Run` 呼叫點模擬另一個生命週期交易。
+/// 若它能取得 `.install.lock`，就立即寫入 switch hold，讓測試捕捉未序列化的空窗。
+struct InstallLockContenderServiceCtl {
+    inner: Arc<dyn ServiceCtl>,
+    fs: Arc<dyn FsOps>,
+    install_lock: PathBuf,
+    switch_hold: PathBuf,
+    events: Arc<Mutex<Vec<(u64, String)>>>,
+}
+
+impl InstallLockContenderServiceCtl {
+    fn record(&self, label: String) {
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((sw_pal::fakes::next_event_seq(), label));
+    }
+
+    fn contend(&self, phase: &str) {
+        self.record(format!("transaction:attempt:{phase}"));
+        match self.fs.file_lock_exclusive(&self.install_lock, false) {
+            Ok(guard) => {
+                let write = self.fs.write_file(
+                    &self.switch_hold,
+                    br#"{"schema_version":1,"op":"supervision_set"}"#,
+                );
+                drop(guard);
+                self.record(format!(
+                    "transaction:acquired:{phase}:hold_written={}",
+                    write.is_ok()
+                ));
+            }
+            Err(_) => self.record(format!("transaction:blocked:{phase}")),
+        }
+    }
+}
+
+impl ServiceCtl for InstallLockContenderServiceCtl {
+    fn supported_modes(&self) -> Vec<SupervisionMode> {
+        self.inner.supported_modes()
+    }
+
+    fn action(
+        &self,
+        mode: &SupervisionMode,
+        action: ServiceAction,
+        with_sudo: bool,
+    ) -> ServiceResult {
+        if *mode == SupervisionMode::WindowsTask && action == ServiceAction::Start {
+            self.contend("before-run");
+        }
+        self.inner.action(mode, action, with_sudo)
+    }
+
+    fn action_named(
+        &self,
+        mode: &SupervisionMode,
+        name: &str,
+        action: ServiceAction,
+        with_sudo: bool,
+    ) -> ServiceResult {
+        self.inner.action_named(mode, name, action, with_sudo)
+    }
+
+    fn install(&self, def: &SupervisorDefinition, with_sudo: bool) -> Vec<CmdRecord> {
+        self.inner.install(def, with_sudo)
+    }
+
+    fn install_plan(&self, def: &SupervisorDefinition) -> Vec<Vec<String>> {
+        self.inner.install_plan(def)
+    }
+
+    fn uninstall(&self, mode: &SupervisionMode, with_sudo: bool) -> Vec<CmdRecord> {
+        self.inner.uninstall(mode, with_sudo)
+    }
+
+    fn uninstall_named(
+        &self,
+        mode: &SupervisionMode,
+        name: &str,
+        with_sudo: bool,
+    ) -> Vec<CmdRecord> {
+        self.inner.uninstall_named(mode, name, with_sudo)
+    }
+
+    fn set_enabled(
+        &self,
+        mode: &SupervisionMode,
+        enabled: bool,
+        with_sudo: bool,
+    ) -> Vec<CmdRecord> {
+        if *mode == SupervisionMode::WindowsTask && enabled {
+            self.contend("before-enable");
+        }
+        self.inner.set_enabled(mode, enabled, with_sudo)
+    }
+
+    fn query(&self, mode: &SupervisionMode) -> TaskQuery {
+        self.inner.query(mode)
+    }
+
+    fn query_named(&self, mode: &SupervisionMode, name: &str) -> TaskQuery {
+        self.inner.query_named(mode, name)
+    }
+
+    fn hard_stop(&self, mode: &SupervisionMode, with_sudo: bool) -> ServiceResult {
+        self.inner.hard_stop(mode, with_sudo)
+    }
+
+    fn hold_autostart(
+        &self,
+        mode: &SupervisionMode,
+        with_sudo: bool,
+    ) -> Result<AutostartHoldRecord, ServiceResult> {
+        self.inner.hold_autostart(mode, with_sudo)
+    }
+
+    fn release_autostart(
+        &self,
+        hold: &AutostartHoldRecord,
+        restore_enabled: Option<bool>,
+        with_sudo: bool,
+    ) -> Result<Vec<CmdRecord>, ServiceResult> {
+        self.inner
+            .release_autostart(hold, restore_enabled, with_sudo)
+    }
+
+    fn autostart_hold_state(&self, mode: &SupervisionMode) -> HoldState {
+        self.inner.autostart_hold_state(mode)
+    }
+
+    fn hold_autostart_named(
+        &self,
+        mode: &SupervisionMode,
+        name: &str,
+        with_sudo: bool,
+    ) -> Result<AutostartHoldRecord, ServiceResult> {
+        self.inner.hold_autostart_named(mode, name, with_sudo)
+    }
+
+    fn query_enabled(&self, mode: &SupervisionMode) -> EnabledQuery {
+        self.inner.query_enabled(mode)
+    }
+
+    fn main_pid(&self, mode: &SupervisionMode) -> Result<Option<u32>, String> {
+        self.inner.main_pid(mode)
     }
 }
 
@@ -187,6 +364,7 @@ pub struct TestEnv {
     registry: Option<Arc<FakeRegistry>>,
     crash_point: Option<String>,
     real_service: bool,
+    probe_install_lock_during_start: bool,
     retained_locks: Mutex<Vec<sw_pal::fs_ops::FileLockGuard>>,
     active_daemon_endpoint: Option<String>,
     active_daemon_pid: Option<u32>,
@@ -267,6 +445,7 @@ impl TestEnv {
             registry: windows.then(|| FakeRegistry::new(Vec::new(), &[])),
             crash_point: None,
             real_service: false,
+            probe_install_lock_during_start: false,
             retained_locks: Mutex::new(Vec::new()),
             active_daemon_endpoint: None,
             active_daemon_pid: None,
@@ -1210,6 +1389,79 @@ impl TestEnv {
         self
     }
 
+    /// 在顯式 start 進入 `/ENABLE`、`/Run` 時，讓另一生命週期交易同步競爭同一安裝鎖。
+    pub fn with_install_lock_contender_during_start(mut self) -> Self {
+        self.probe_install_lock_during_start = true;
+        self
+    }
+
+    /// start 結束後競爭安裝鎖；成功時在鎖內建立 switch hold，供交易排序回歸驗證。
+    pub fn contender_create_switch_hold_after_start(&self) -> bool {
+        self.fs_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((
+                sw_pal::fakes::next_event_seq(),
+                "transaction:attempt:after-start".into(),
+            ));
+        let lock_path = self.install_root().join(".install.lock");
+        let hold_path = self.state_dir().join("autostart-hold.json");
+        let guard = match self.fs.file_lock_exclusive(&lock_path, false) {
+            Ok(guard) => guard,
+            Err(_) => {
+                self.fs_events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((
+                        sw_pal::fakes::next_event_seq(),
+                        "transaction:blocked:after-start".into(),
+                    ));
+                return false;
+            }
+        };
+        let write = self.fs.write_file(
+            &hold_path,
+            br#"{"schema_version":1,"op":"supervision_set"}"#,
+        );
+        drop(guard);
+        self.fs_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((
+                sw_pal::fakes::next_event_seq(),
+                format!(
+                    "transaction:acquired:after-start:hold_written={}",
+                    write.is_ok()
+                ),
+            ));
+        write.is_ok()
+    }
+
+    /// 測試命令完成後，以實際檔案系統確認安裝鎖目前可取得。
+    pub fn install_lock_available(&self) -> bool {
+        let lock_path = self.install_root().join(".install.lock");
+        self.fs
+            .file_lock_exclusive(&lock_path, false)
+            .map(drop)
+            .is_ok()
+    }
+
+    /// 測試命令完成後確認 install 與 autostart 兩把生命週期鎖都已釋放。
+    pub fn lifecycle_locks_available(&self) -> bool {
+        let install_path = self.install_root().join(".install.lock");
+        let autostart_path = self.run_dir().join("autostart.lock");
+        let Ok(install_guard) = self.fs.file_lock_exclusive(&install_path, false) else {
+            return false;
+        };
+        let Ok(autostart_guard) = self.fs.file_lock_exclusive(&autostart_path, false) else {
+            drop(install_guard);
+            return false;
+        };
+        drop(autostart_guard);
+        drop(install_guard);
+        true
+    }
+
     /// 模擬安裝鎖競爭但鎖檔尚未建立，驗證呼叫端不能只靠 `.install.lock` 是否存在決定是否取鎖。
     pub fn with_install_lock_blocker_without_lock_file(
         mut self,
@@ -1864,7 +2116,18 @@ impl TestEnv {
         if let Some(s) = &self.service {
             b = b.service(s.clone());
         } else if self.real_service {
-            b = b.service(self.real_service_ctl());
+            let service = self.real_service_ctl();
+            if self.probe_install_lock_during_start {
+                b = b.service(Arc::new(InstallLockContenderServiceCtl {
+                    inner: service,
+                    fs: Arc::clone(&self.fs),
+                    install_lock: self.install_root().join(".install.lock"),
+                    switch_hold: self.state_dir().join("autostart-hold.json"),
+                    events: Arc::clone(&self.fs_events),
+                }));
+            } else {
+                b = b.service(service);
+            }
         }
         if let Some(p) = &self.process {
             b = b.process(p.clone());

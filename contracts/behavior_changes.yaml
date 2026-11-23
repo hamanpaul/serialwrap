@@ -7,7 +7,7 @@
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 11
+revision: 12
 changes:
   - id: "BC-01"
     kind: "BC"
@@ -144,6 +144,32 @@ changes:
     compatibility_impact: "Windows 上 remote -R／-L 由 REMOTE_NOT_SUPPORTED 改為可用（以非阻塞轉接實作；範圍以盤點 07 §8.6 的 POSIX-only 依賴清單為準：fcntl registry／bench 鎖、ControlMaster／ControlPath、setsid／killpg、os.kill(pid,0)、/proc starttime；基線實無 pipe（PLT-D-08））；remote 程序的停止與重啟納入生命週期管理。POSIX 行為不變。既有三種拓樸不變。"
     approval_conditions: "移除 POSIX-only pipe 依賴；驗證非阻塞轉接、程序生命週期、停止、重啟及既有三拓樸"
     related_decisions: ["OD-04"]
+  - id: "SC-40"
+    kind: "SC"
+    title: "Windows Task 顯式 start 在生命週期 hold 下保留停用狀態（Rust-only）"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-11-23"
+      decision_ref: "OD-111"
+      basis: "owner_decision"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 12
+    spec_refs: ["OD-111", "v051.md p277"]
+    reconciliation_refs: []
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P4"]
+    case_ids: ["p277-service-start-journal-after-wait", "p277-daemon-start-journal-after-wait", "p277-start-locks-through-enable-run", "p277-daemon-start-interrupted-update-journal", "p277-start-install-lock-contention", "p277-start-enable-failure-unlocks"]
+    compatibility_impact: "Rust windows-task 的 service start 與轉送的 daemon start，只有在 autostart-hold.json 與 install-journal.json 都不存在時才先 /ENABLE 再 /Run；任一 hold 存在時略過 /ENABLE，維持原本 /Run 回應與 exit code，並只在 stderr 說明。hold 檢查、/ENABLE 與 /Run 都在既有 .install.lock 和 autostart.lock 內序列化；錯誤碼與 phase 不變。Windows 原生 schtasks DISABLE→start 驗證尚待編排者安排。"
+    approval_conditions: "依 OD-111 只修 Rust 並保留 Python 基線；依 v051 p277 裁決，journal hold 與 switch hold 共用只 /Run 分支，新增 service／daemon 入口與鎖交錯測試；Windows 原生驗證不得預標 PASS。"
+    related_decisions: ["OD-111"]
   - id: "SC-01"
     kind: "SC"
     title: "RECOVERING 下 submit 與 open 回 SESSION_RECOVERING"

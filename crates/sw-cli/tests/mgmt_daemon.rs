@@ -1227,3 +1227,112 @@ fn autostart_waits_on_update_hold_lock() {
     assert!(t.process().spawns().is_empty());
     assert_eq!(rpc_count(&t, "session.list"), 1);
 }
+
+#[test]
+fn p277_daemon_start_rechecks_journal_after_transaction_wait() {
+    let t = TestEnv::windows()
+        .with_install_root()
+        .with_config("supervision_mode: windows-task\n")
+        .with_real_service()
+        .with_install_lock_holder_creating_journal(3.0)
+        .with_command(
+            &["schtasks", "/Run", "/TN", "serialwrap"],
+            1,
+            "",
+            "ERROR: The task is disabled.\n",
+        );
+
+    let (rc, out, err) = t.run(&["daemon", "start"]);
+    let response = json(&out);
+
+    assert_eq!(rc, 2, "journal hold 下沿用停用工作的 /Run 結果：{out}");
+    assert_eq!(fstr(&response, "_routed_to"), "service start");
+    assert_eq!(fstr(&response, "mode"), "windows-task");
+    assert_eq!(fstr(&response, "action"), "start");
+    assert_eq!(field(&response, "rc"), &PyValue::Int(PyInt::Small(1)));
+    assert!(!out.contains("\"phase\""), "hold 路徑不得新增 phase：{out}");
+    assert_eq!(
+        t.calls(),
+        vec![argv(&["schtasks", "/Run", "/TN", "serialwrap"])],
+        "daemon start 必須轉送共用 hold 分支，且不得 /ENABLE"
+    );
+    assert!(
+        t.journal_bytes().is_some(),
+        "持鎖交易應在釋放前建立 journal"
+    );
+    assert!(err.contains("更新／回滾進行中"), "{err}");
+    assert!(err.contains("install-journal.json"), "{err}");
+    assert!(err.contains("請待 serialwrap setup 完成"), "{err}");
+}
+
+#[test]
+fn p277_daemon_start_preserves_interrupted_update_hold() {
+    let mut t = TestEnv::windows()
+        .with_install_root()
+        .with_installed("0.4.0")
+        .with_current("0.4.0", None)
+        .with_bundle(CURRENT_VERSION)
+        .with_supervisor_state("windows-task", true, true)
+        .with_idle_daemon(TestEnv::win_endpoint(), 4242)
+        .with_new_daemon_reporting_version(CURRENT_VERSION)
+        .with_crash_at("stop_supervisor:after_hold")
+        .with_command(
+            &["schtasks", "/Run", "/TN", "serialwrap"],
+            1,
+            "",
+            "ERROR: The task is disabled.\n",
+        );
+
+    let (setup_rc, _, setup_err) = t.run_from_bundle(&["setup"]);
+    assert_eq!(
+        setup_rc, 137,
+        "setup 未在 hold 後的 crash point 中斷：{setup_err}"
+    );
+
+    let journal_before = t.journal_bytes().expect("setup 中斷後必須留下真實 journal");
+    assert_eq!(t.journal_json().unwrap()["step"], "stop_supervisor");
+    let hold_path = t.state_dir().join("autostart-hold.json");
+    assert!(
+        !hold_path.exists(),
+        "windows-task update hold 不使用 switch 檔"
+    );
+    let supervisor = std::sync::Arc::clone(t.service());
+    assert_eq!(supervisor.hold_state_now(), HoldState::Held);
+
+    let calls_before_start = t.calls().len();
+    t.clear_crash();
+    t.use_real_service();
+    let (rc, out, err) = t.run(&["daemon", "start"]);
+    let response = json(&out);
+
+    assert_eq!(rc, 2, "daemon start 必須沿用停用工作的 /Run 結果：{out}");
+    assert_eq!(fstr(&response, "_routed_to"), "service start");
+    assert_eq!(fstr(&response, "mode"), "windows-task");
+    assert_eq!(fstr(&response, "action"), "start");
+    assert_eq!(field(&response, "rc"), &PyValue::Int(PyInt::Small(1)));
+    assert!(!out.contains("\"phase\""), "不得新增 phase：{out}");
+    assert_eq!(
+        &t.calls()[calls_before_start..],
+        vec![argv(&["schtasks", "/Run", "/TN", "serialwrap"])],
+        "真實 journal hold 下 daemon start 只可 /Run，不得 /ENABLE"
+    );
+    assert!(err.contains("UNKNOWN_ERROR"), "沿用既有錯誤碼輸出：{err}");
+    assert!(err.contains("更新／回滾進行中"), "{err}");
+    assert!(err.contains("install-journal.json"), "{err}");
+    assert!(err.contains("請待 serialwrap setup 完成"), "{err}");
+    assert_eq!(
+        err.matches("install-journal.json").count(),
+        1,
+        "journal hold 提示應只輸出一次：{err}"
+    );
+    assert_eq!(
+        t.journal_bytes().as_deref(),
+        Some(journal_before.as_slice()),
+        "daemon start 不得改寫 journal"
+    );
+    assert_eq!(
+        supervisor.hold_state_now(),
+        HoldState::Held,
+        "daemon start 不得釋放停用 hold"
+    );
+}
