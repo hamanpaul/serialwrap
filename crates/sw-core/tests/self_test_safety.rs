@@ -86,7 +86,7 @@ fn agent_lease_busy_self_test_is_passive() {
 
     let r = h.request(self_test_req());
     assert_eq!(r["ok"], PyValue::Bool(true));
-    assert_eq!(r["classification"], PyValue::from("SESSION_BUSY"));
+    assert_eq!(r["classification"], PyValue::from("SESSION_INTERACTIVE_BUSY"));
     assert_eq!(r["recommended_action"], PyValue::from("wait"));
     assert!(r.get("probe_ok").is_none(), "agent lease 活動時不應有 probe_ok: {r:?}");
     assert_eq!(h.dev.write_calls(), before_tx, "agent lease 活動時不得新增 probe TX");

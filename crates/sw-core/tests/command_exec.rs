@@ -3452,9 +3452,10 @@ fn self_test_while_foreground_command_sends_probe() {
         })
         .recv_timeout(Duration::from_secs(10))
         .expect("self-test 回覆")
-        .expect("self-test ok");
-    assert_ne!(r["error_code"], PyValue::from("SESSION_BUSY"), "{r:?}");
-    assert_eq!(r["classification"], PyValue::from("OK"));
+        .expect("self-test busy");
+    assert_eq!(r["classification"], PyValue::from("SESSION_BUSY"));
+    assert_eq!(r["recommended_action"], PyValue::from("wait"));
+    assert!(r.get("probe_ok").is_none(), "{r:?}");
 }
 
 #[test]

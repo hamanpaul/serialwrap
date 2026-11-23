@@ -8880,6 +8880,7 @@ impl SessionCore {
             || self.pending_auto_login
             || self.replay_parked.is_some()
             || self.queue.has_accepted(&self.deps.registry)
+            || self.pending_ops.values().any(|op| matches!(op, PendingOp::Recover { .. }))
             || self
                 .background_cmd_ids
                 .iter()
@@ -8950,6 +8951,11 @@ impl SessionCore {
         }
         if !ctx.device_present {
             return Ok(simple("DEVICE_MISSING", "check_cable_or_bind", Vec::new()));
+        }
+        if let Some(lease) = self.lease.as_ref() {
+            if !lease.is_human() && !lease.expired(now) {
+                return Ok(simple("SESSION_INTERACTIVE_BUSY", "wait", Vec::new()));
+            }
         }
         if self.self_test_busy(now) {
             return Ok(simple("SESSION_BUSY", "wait", Vec::new()));
