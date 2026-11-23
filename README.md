@@ -595,6 +595,10 @@ RX was seen for 30s+ and the probe got no echo at all: a suspected
 USB/usbip read-endpoint stall (`urb stopped: -32` in host dmesg) that
 serialwrap cannot self-heal — follow `last_error_detail` for the host-side
 USB re-enumeration command, and check dmesg before power-cycling the DUT.
+A session that has never received any RX since attach stays
+`PROMPT_UNAVAILABLE` (it is not a stall), but when the probe also got zero RX
+its `last_error_detail` says so and lists what to check first: DUT power and
+port, the DUT TX → adapter RX wire and ground, and the host USB path.
 
 Use `recover` for unhealthy sessions:
 
@@ -2517,6 +2521,7 @@ WSL2＋usbip 環境偶發 USB read-endpoint stall：**TX 正常、RX 完全凍�
   3. usbip 環境亦可在 Windows 側 `usbipd detach`／`usbipd attach` 重掛。
   4. 裝置重新枚舉後 daemon 自動 re-attach；必要時 `serialwrap session attach --selector COM0`。
 - **誤判自癒**：TRANSPORT_STALL 不喪失自動重探資格——RX 一恢復，下一輪 probe 見到 echo 即回原分類或升 `READY`。
+- **自 attach 起從未有 RX**：不歸成 TRANSPORT_STALL（更常是線沒接、DUT 沒上電或埠不對），`last_error` 維持 `PROMPT_UNAVAILABLE`；probe 期間也零 RX 時，`last_error_detail` 附分收發方向的提示（DUT 電源與埠、DUT TX 到轉接器 RX 與 GND、host 端 USB 路徑）。baud 不符通常仍收得到亂碼位元組，不會是零 RX。
 
 ### 同機多開（two-reader）偵測（#101）
 

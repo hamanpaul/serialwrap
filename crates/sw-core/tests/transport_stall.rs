@@ -40,6 +40,50 @@ fn hint_text_is_byte_identical() {
 }
 
 #[test]
+fn never_rx_golden_table_and_hint_text() {
+    // Python `is_never_rx_probe_failure`／`never_rx_hint`（自 attach 起零 RX 的 probe 失敗）逐列對照。
+    let mut checked = 0;
+    for row in golden_rows("transport_stall") {
+        match row.str("kind") {
+            "never_rx" => {
+                let last = num(&row["last_rx_mono"]);
+                let last = (last > 0.0).then(|| t(last));
+                assert_eq!(
+                    is_never_rx_probe_failure(row.str("err"), row["rx_delta"].as_i64().unwrap() as u64, last),
+                    row.bool("never_rx"),
+                    "case {}",
+                    row.id()
+                );
+                checked += 1;
+            }
+            "never_rx_hint" => {
+                assert_eq!(never_rx_hint(row.opt_str("real_path")), row.str("text"), "case {}", row.id());
+                checked += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(checked, 10);
+}
+
+#[test]
+fn refine_attaches_never_rx_hint_only_for_prompt_unavailable_without_any_rx() {
+    let usb = FakeUsb(None);
+    let refine = |err: &str, rx: (u64, u64), last: Option<Mono>, path: Option<&str>| {
+        refine_probe_failure(err.into(), Some(rx.0), Some(rx.1), last, t(100.0), path, &usb, false, "tail", "COM0")
+    };
+    let never = refine(PU, (0, 0), None, Some("/dev/ttyUSB0"));
+    assert_eq!(never.err, PU, "last_error 不變");
+    assert_eq!(never.detail.as_deref(), Some(never_rx_hint(Some("/dev/ttyUSB0")).as_str()));
+    assert!(never.stall_warning.is_none(), "不寫 WAL META、不加 log");
+    // probe 期間有 RX、曾有 RX（未滿 30 s 不翻轉）：detail 仍為 None。
+    assert_eq!(refine(PU, (0, 3), None, None).detail, None);
+    assert_eq!(refine(PU, (0, 0), Some(t(90.0)), None).detail, None);
+    // login FSM 失敗碼維持 rx tail detail，不改寫成 never_rx 提示。
+    assert_eq!(refine("SHELL_PROMPT_TIMEOUT", (0, 0), None, None).detail.as_deref(), Some("tail"));
+}
+
+#[test]
 fn refinable_and_classify_golden_table() {
     for row in golden_rows("transport_stall") {
         match row.str("kind") {

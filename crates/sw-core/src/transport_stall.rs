@@ -1,4 +1,5 @@
 //! Transport stall 精煉（P7 Task 6；`transport_stall.py`、`_refine_probe_failure`，05 §8.4、10 G-09）。
+//! 另含自 attach 起零 RX 的 probe 失敗提示（`is_never_rx_probe_failure`／`never_rx_hint`）。
 
 use sw_pal::traits::UsbTopology;
 use sw_proto::pycompat::{clean_text, py_round};
@@ -34,6 +35,32 @@ pub fn classify_probe_failure(
         return (err.to_string(), false);
     }
     ("TRANSPORT_STALL".to_string(), true)
+}
+
+/// `is_never_rx_probe_failure`：probe 失敗時本 session 是否自 attach 起從未收到任何 RX。
+///
+/// 與 [`classify_probe_failure`] 互補：那邊以條件 3（`last_rx_mono` 為 `None`）排除「從未活過」的 session，
+/// 維持 `PROMPT_UNAVAILABLE`、不翻成 `TRANSPORT_STALL`；這裡只認出這一類，供呼叫端補 detail，last_error 不變。
+/// 條件：`err == "PROMPT_UNAVAILABLE"`（login FSM 的 `*_PROMPT_TIMEOUT` 家族已有 rx tail detail，#174）、
+/// probe 全程零 RX、`last_rx_mono` 為 `None`（Python `last_rx_mono <= 0.0`）。
+pub fn is_never_rx_probe_failure(err: &str, rx_delta: u64, last_rx_mono: Option<Mono>) -> bool {
+    err == "PROMPT_UNAVAILABLE" && rx_delta == 0 && last_rx_mono.is_none()
+}
+
+/// `never_rx_hint` 逐字：自 attach 起零 RX 的 probe 失敗 detail，提示先分收發方向再決定動哪一層。
+/// `real_path` 為空或 `None` 時不帶括號（Python `f"（{real_path}）" if real_path else ""`）。
+pub fn never_rx_hint(real_path: Option<&str>) -> String {
+    let place = match real_path.filter(|p| !p.is_empty()) {
+        Some(path) => format!("（{path}）"),
+        None => String::new(),
+    };
+    format!(
+        "自 attach 起未收到任何 RX{place}，probe 期間連 echo 都沒有：先分收發方向再動作，\
+         不要反覆 recover、換 profile 或重裝。常見原因：DUT 未上電或 console 不在這個埠；\
+         DUT TX 到轉接器 RX 的線或 GND 未接好；host 端 USB 路徑異常\
+         （dmesg 查 `urb stopped: -32` 或 usbip 斷線）。baud 不符時通常仍收得到亂碼位元組，\
+         不會是零 RX。"
+    )
 }
 
 /// 10 G-09 逐字（`transport_stall_hint`；busid 由呼叫端以 `UsbTopology` 解析）。
@@ -96,8 +123,12 @@ pub fn refine_probe_failure(
     let rx_delta = after.checked_sub(before).unwrap_or(1);
     let (refined, flipped) = classify_probe_failure(&err, rx_delta, last_rx_mono, now);
     if !flipped {
+        // Python `_refine_probe_failure` 未翻轉分支：login FSM 失敗碼帶 rx tail（#174）；自 attach 起零 RX 的
+        // PROMPT_UNAVAILABLE 帶 `never_rx_hint`（last_error 不變、不寫 WAL META、不加 log）；其餘 None。
         let detail = if LOGIN_FSM_DETAIL_ERRORS.contains(&err.as_str()) {
             rx_tail_detail(rx_tail_4096)
+        } else if is_never_rx_probe_failure(&err, rx_delta, last_rx_mono) {
+            Some(never_rx_hint(real_path))
         } else {
             None
         };

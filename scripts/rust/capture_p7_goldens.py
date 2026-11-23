@@ -310,6 +310,15 @@ def gen_transport_stall() -> list[dict[str, Any]]:
             with mock.patch.object(ts, "resolve_usb_busid", return_value=busid):
                 text = ts.transport_stall_hint("/dev/ttyUSB0", age)
             rows.append({"kind": "hint", "busid": busid, "rx_age_s": age, "text": text})
+    # 自 attach 起零 RX 的 probe 失敗（classify 條件 3 排除的那一類）：判定與 detail 文字。
+    for err, rx_delta, last in [
+        ("PROMPT_UNAVAILABLE", 0, 0.0), ("PROMPT_UNAVAILABLE", 0, -1.0), ("PROMPT_UNAVAILABLE", 1, 0.0),
+        ("PROMPT_UNAVAILABLE", 0, 5.0), ("SHELL_PROMPT_TIMEOUT", 0, 0.0), ("READY_NONCE_TIMEOUT", 0, 0.0), ("", 0, 0.0),
+    ]:
+        rows.append({"kind": "never_rx", "err": err, "rx_delta": rx_delta, "last_rx_mono": last,
+                     "never_rx": ts.is_never_rx_probe_failure(err, rx_delta=rx_delta, last_rx_mono=last)})
+    for real_path in ["/dev/ttyUSB0", "", None]:
+        rows.append({"kind": "never_rx_hint", "real_path": real_path, "text": ts.never_rx_hint(real_path)})
     return rows_with_ids("transport_stall", rows)
 
 
