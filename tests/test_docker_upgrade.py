@@ -201,6 +201,55 @@ def _load_driver():
     return module
 
 
+def _write_p290_profile_fixtures(driver: Any, target_asset: Path, live_profile: Path) -> None:
+    import yaml
+
+    target_document = yaml.safe_load((REPO / "sw_core" / "assets" / "profiles" / "default.yaml").read_text(
+        encoding="utf-8"))
+    target_document["profiles"]["prpl-template"]["timeout_recovery_keys"] = ["CTRL_C"]
+    target_asset.parent.mkdir(parents=True, exist_ok=True)
+    target_asset.write_text(yaml.safe_dump(target_document, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    live_profile.parent.mkdir(parents=True, exist_ok=True)
+    if driver.mode == "systemd-system":
+        live_document = target_document
+    else:
+        legacy_fixture = (REPO / "tests" / "fixtures" / "serialwrap-v0.3.2-default-profiles.yaml").read_bytes()
+        legacy_document = yaml.safe_load(legacy_fixture.split(b"\n\n", maxsplit=1)[1])
+        legacy_document["profiles"]["prpl-template"]["timeout_recovery_keys"] = ["CTRL_C"]
+        live_document = legacy_document
+    live_profile.write_text(yaml.safe_dump(live_document, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+
+def _profile_doctor_payload(target_asset: Path, live_profile: Path) -> dict[str, Any]:
+    import yaml
+
+    target_profiles = yaml.safe_load(target_asset.read_text(encoding="utf-8"))["profiles"]
+    live_profiles = yaml.safe_load(live_profile.read_text(encoding="utf-8"))["profiles"]
+    compared = sorted(set(target_profiles) & set(live_profiles))
+    missing = {}
+    for template in compared:
+        fields = sorted(set(target_profiles[template]) - set(live_profiles[template]))
+        if fields:
+            missing[template] = fields
+    has_missing = bool(missing)
+    return {"ok": True, "checks": [
+        {"check": "dialout", "ok": True, "advisory": False},
+        {"check": "version_pairing", "ok": True, "advisory": False},
+        {"check": "devices", "ok": False, "advisory": True},
+        {"check": "profile_template_fields", "ok": not has_missing, "advisory": True,
+         "comparison_status": "missing_fields" if has_missing else "matched",
+         "missing_fields": missing, "compared_templates": compared, "reason": None},
+    ]}
+
+
+def _remove_p290_timeout_recovery_key(profile_path: Path) -> None:
+    import yaml
+
+    document = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    del document["profiles"]["prpl-template"]["timeout_recovery_keys"]
+    profile_path.write_text(yaml.safe_dump(document, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+
 @pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_bundle_source_uses_proc_exe_for_symlinked_stage2_daemon(tmp_path, monkeypatch):
@@ -472,13 +521,14 @@ def fake_driver(tmp_path, monkeypatch):
         made.append(fake)
         monkeypatch.setattr(drv, "CONFIG", fake.config)
         monkeypatch.setattr(drv, "BIN", tmp_path / "bin")
+        monkeypatch.setattr(drv, "SYSTEM_PROFILE_DIR", tmp_path / "etc" / "serialwrap" / "profiles")
         # phase_seed 以 subprocess.run 執行 chown：只替換 driver 模組看到的 subprocess，不動全域
         monkeypatch.setattr(drv, "subprocess", types.SimpleNamespace(
             run=lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""), CompletedProcess=subprocess.CompletedProcess,
             TimeoutExpired=subprocess.TimeoutExpired, SubprocessError=subprocess.SubprocessError))
         out = tmp_path / "out"
         out.mkdir(exist_ok=True)
-        default_policies, policy_evidence = drv.select_upgrade_profile_policies()
+        default_policies, policy_evidence = drv.select_upgrade_profile_policies(mode=mode)
         selected_policies = profile_policies or default_policies
         driver = drv.Driver(mode, tmp_path / "w.whl", tmp_path / "bundle", out, scenario=scenario,
                             installer=tmp_path / "install.sh", bundle_tarball=tmp_path / "t.tar.gz",
@@ -488,6 +538,10 @@ def fake_driver(tmp_path, monkeypatch):
         driver._driver_module = drv
         driver.proc_root = fake.proc
         driver.stop_wait_s = stop_wait_s
+
+        target_asset = (tmp_path / "bundle" / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles"
+                        / "default.yaml")
+        _write_p290_profile_fixtures(driver, target_asset, driver.doctor_profile_dir / "default.yaml")
 
         def sw(*args, **kwargs):
             if args == ("doctor",):
@@ -524,16 +578,36 @@ def fake_driver(tmp_path, monkeypatch):
 @pytest.mark.parametrize(("phase", "mode", "scenario", "cli_version", "policy_key", "expected_phase"), [
     ("upgrade", "on-demand", "upgrade", NEW_VERSION, "new", "migrated"),
     ("upgrade-missing-timeout", "on-demand", "upgrade", NEW_VERSION, "new", "migrated"),
+    ("upgrade-asset-live-missing", "on-demand", "upgrade", NEW_VERSION, "new", "migrated"),
+    ("upgrade-live-missing", "on-demand", "upgrade", NEW_VERSION, "new", "migrated"),
+    ("upgrade-missing-check", "on-demand", "upgrade", NEW_VERSION, "new", "migrated"),
+    ("upgrade-wrong-policy", "on-demand", "upgrade", NEW_VERSION, "new", "migrated"),
+    ("upgrade-damaged-payload", "on-demand", "upgrade", NEW_VERSION, "new", "migrated"),
     ("install-sh", "on-demand", "install-sh", NEW_VERSION, "new", "migrated"),
-    ("system", "systemd-system", "upgrade", NEW_VERSION, "new", "migrated"),
+    ("system", "systemd-system", "upgrade", NEW_VERSION, "new", "materialized"),
     ("reupgrade", "on-demand", "upgrade", "0.3.2", "new", "migrated"),
     ("old", "on-demand", "upgrade", "0.3.2", "old", "legacy_0_3_2"),
     ("downgrade", "on-demand", "upgrade", NEW_VERSION, "downgrade", "downgrade"),
+], ids=[
+    "upgrade-on-demand-upgrade-0.5.0-new-migrated",
+    "upgrade-missing-timeout-on-demand-upgrade-0.5.0-new-migrated",
+    "upgrade-asset-live-missing-on-demand-upgrade-0.5.0-new-migrated",
+    "upgrade-live-missing-on-demand-upgrade-0.5.0-new-migrated",
+    "upgrade-missing-check-on-demand-upgrade-0.5.0-new-migrated",
+    "upgrade-wrong-policy-on-demand-upgrade-0.5.0-new-migrated",
+    "upgrade-damaged-payload-on-demand-upgrade-0.5.0-new-migrated",
+    "install-sh-on-demand-install-sh-0.5.0-new-migrated",
+    "system-systemd-system-upgrade-0.5.0-new-migrated",
+    "reupgrade-on-demand-upgrade-0.3.2-new-migrated",
+    "old-on-demand-upgrade-0.3.2-old-legacy_0_3_2",
+    "downgrade-on-demand-upgrade-0.5.0-downgrade-downgrade",
 ])
 def test_upgrade_driver_passes_profile_expectation_policy(
     fake_driver, monkeypatch, phase, mode, scenario, cli_version, policy_key, expected_phase,
 ):
-    policies, policy_evidence = _load_driver().select_upgrade_profile_policies()
+    policies, policy_evidence = _load_driver().select_upgrade_profile_policies(mode=mode)
+    if phase == "upgrade-wrong-policy":
+        policies[policy_key] = _load_driver().uc.select_profile_policy("asset_added_not_migrated")
     driver, _fake = fake_driver(
         cli_version=cli_version, mode=mode, scenario=scenario, profile_policies=policies,
     )
@@ -544,17 +618,32 @@ def test_upgrade_driver_passes_profile_expectation_policy(
         "policy_sha256": hashlib.sha256(policy_source).hexdigest(),
         "migration_policy_id": "p290-template-migration-v1",
         "selected_phases": {
-            "old": "legacy_0_3_2", "new": "migrated", "downgrade": "downgrade",
+            "old": "legacy_0_3_2", "new": expected_phase if mode == "systemd-system" else "migrated",
+            "downgrade": "downgrade",
         },
     }
     selected = policies[policy_key]
     if selected["supported"]:
-        missing_fields = {"prpl-template": ["timeout_recovery_keys"]} \
-            if phase == "upgrade-missing-timeout" else None
-        doctor_payload = _doctor_with_profile_policy(
-            selected, missing_fields=missing_fields,
-            profile_ok=False if missing_fields is not None else None,
-        )
+        target_asset = (driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles"
+                        / "default.yaml")
+        live_profile = driver.doctor_profile_dir / "default.yaml"
+        if phase == "upgrade-asset-live-missing":
+            _remove_p290_timeout_recovery_key(target_asset)
+            _remove_p290_timeout_recovery_key(live_profile)
+        elif phase == "upgrade-live-missing":
+            _remove_p290_timeout_recovery_key(live_profile)
+        doctor_payload = _profile_doctor_payload(target_asset, live_profile)
+        profile_check = doctor_payload["checks"][-1]
+        if phase in {"upgrade-missing-timeout", "upgrade-wrong-policy"}:
+            profile_check["missing_fields"]["prpl-template"].append("timeout_recovery_keys")
+            profile_check["missing_fields"]["prpl-template"].sort()
+            profile_check["comparison_status"] = "missing_fields"
+            profile_check["ok"] = False
+        if phase == "upgrade-missing-check":
+            doctor_payload["checks"] = [check for check in doctor_payload["checks"]
+                                         if check["check"] != "profile_template_fields"]
+        elif phase == "upgrade-damaged-payload":
+            doctor_payload["checks"][-1]["compared_templates"] = ["unexpected-template"]
     else:
         doctor_payload = {"ok": True, "checks": [
             {"check": "dialout", "ok": True, "advisory": False},
@@ -578,14 +667,18 @@ def test_upgrade_driver_passes_profile_expectation_policy(
         return real_judge(check_id, doctor, require_pairing=require_pairing, profile_policy=profile_policy)
 
     monkeypatch.setattr(driver._upgrade_checks, "judge_doctor", judge)
-    if phase in {"upgrade", "upgrade-missing-timeout", "install-sh", "system"}:
+    if phase in {"upgrade", "upgrade-missing-timeout", "upgrade-asset-live-missing", "upgrade-live-missing",
+                 "upgrade-missing-check", "upgrade-wrong-policy",
+                 "upgrade-damaged-payload", "install-sh", "system"}:
         monkeypatch.setattr(driver._upgrade_checks, "scan_daemon_instances", lambda _root: [4242])
         monkeypatch.setattr(driver._driver_module, "bundle_source_evidence", lambda *_a, **_k: {
             "from_bundle": True, "exe_path": "/tmp/serialwrap", "exe_read_method": "test",
             "exe_read_error": None, "argv_mentions_bundle": True,
         })
 
-    if phase in {"upgrade", "upgrade-missing-timeout", "install-sh"}:
+    if phase in {"upgrade", "upgrade-missing-timeout", "upgrade-asset-live-missing", "upgrade-live-missing",
+                 "upgrade-missing-check", "upgrade-wrong-policy",
+                 "upgrade-damaged-payload", "install-sh"}:
         driver.phase_new_running()
         expected_check = "doctor_green_new"
     elif phase == "system":
@@ -602,13 +695,35 @@ def test_upgrade_driver_passes_profile_expectation_policy(
         expected_check = "doctor_green_downgrade"
 
     assert calls == [(expected_check, selected)]
-    assert selected["phase"] == expected_phase
-    expected_profile_dir = "/etc/serialwrap/profiles" if mode == "systemd-system" \
+    selected_phase = "asset_added_not_migrated" if phase == "upgrade-wrong-policy" else expected_phase
+    assert selected["phase"] == selected_phase
+    expected_profile_dir = str(driver._driver_module.SYSTEM_PROFILE_DIR) if mode == "systemd-system" \
         else str(driver._driver_module.CONFIG / "profiles")
     assert driver.env["SERIALWRAP_PROFILE_DIR"] == expected_profile_dir
     assert driver.doctor_evidence[-1]["profile_path"] == expected_profile_dir
-    if phase == "upgrade-missing-timeout":
-        assert _row(driver, "doctor_green_new")["verdict"] == "FAIL"
+    if phase == "reupgrade":
+        result = _row(driver, "reupgrade")["detail"]["doctor"]
+    else:
+        result = _row(driver, expected_check)
+    expected_verdict = "FAIL" if phase in {
+        "upgrade-missing-timeout", "upgrade-asset-live-missing", "upgrade-live-missing", "upgrade-missing-check",
+        "upgrade-wrong-policy", "upgrade-damaged-payload",
+    } else "PASS"
+    assert result["verdict"] == expected_verdict, result
+    if phase == "upgrade-asset-live-missing":
+        migration = result["detail"]["p290_profile_migration"]
+        assert migration["verdict"] == "FAIL", migration
+        assert migration["detail"]["target_asset_has_field"] is False, migration
+        assert migration["detail"]["live_profile_has_field"] is False, migration
+    elif phase == "upgrade-live-missing":
+        migration = result["detail"]["p290_profile_migration"]
+        assert migration["verdict"] == "FAIL", migration
+        assert migration["detail"]["target_asset_has_field"] is True, migration
+        assert migration["detail"]["live_profile_has_field"] is False, migration
+    elif selected["supported"] and phase not in {"upgrade-missing-timeout", "upgrade-missing-check",
+                                                   "upgrade-wrong-policy", "upgrade-damaged-payload"}:
+        migration = result["detail"]["p290_profile_migration"]
+        assert migration["verdict"] == "PASS", migration
 
 
 def _row(driver: Any, check_id: str) -> dict[str, Any]:

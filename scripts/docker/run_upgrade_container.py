@@ -371,8 +371,41 @@ class Driver:
 
     def judge_doctor(self, check_id: str, label: str, *, require_pairing: bool,
                      profile_policy: dict[str, Any]) -> dict[str, Any]:
-        result = uc.judge_doctor(check_id, self.doctor(label, profile_policy),
-                                 require_pairing=require_pairing, profile_policy=profile_policy)
+        doctor = self.doctor(label, profile_policy)
+        judged = uc.judge_doctor(check_id, doctor, require_pairing=require_pairing, profile_policy=profile_policy)
+        if check_id in {"doctor_green_new", "reupgrade_doctor"}:
+            expected_phase = "materialized" if self.mode == "systemd-system" else "migrated"
+        else:
+            expected_phase = {
+                "doctor_green_old": "legacy_0_3_2",
+                "doctor_green_downgrade": "downgrade",
+            }.get(check_id)
+        if expected_phase is None or profile_policy.get("phase") != expected_phase:
+            result = uc.row(check_id, "FAIL", "driver phase 使用錯誤的 profile expectation policy",
+                            expected_policy_phase=expected_phase, selected_policy_phase=profile_policy.get("phase"),
+                            doctor_judgement=judged)
+        else:
+            result = judged
+        if expected_phase in {"migrated", "materialized"}:
+            expected_asset = pathlib.PurePosixPath("sw_core/assets/profiles/default.yaml")
+            target_metadata = profile_policy.get("target_asset")
+            configured_asset = pathlib.PurePosixPath(str(target_metadata.get("asset_path", ""))) \
+                if type(target_metadata) is dict else pathlib.PurePosixPath(".")
+            if type(target_metadata) is not dict or configured_asset != expected_asset:
+                migration = uc.row("p290_profile_migration", "FAIL", "p290 target asset 路徑不符受控資產",
+                                   target_asset_path=str(configured_asset), expected_asset_path=str(expected_asset))
+            else:
+                asset_path = self.bundle / "versions" / NEW_VERSION / "py" / pathlib.Path(*expected_asset.parts)
+                live_path = self.doctor_profile_dir / expected_asset.name
+                migration = uc.judge_p290_profile_migration(
+                    "p290_profile_migration", asset_path, live_path,
+                    migration_policy_id=str(profile_policy.get("migration_policy_id", "")),
+                )
+            result.setdefault("detail", {})["p290_profile_migration"] = migration
+            if migration["verdict"] != "PASS":
+                result["verdict"] = "FAIL"
+                prior_reason = result.get("reason")
+                result["reason"] = "; ".join(part for part in (prior_reason, migration["reason"]) if part)
         result.setdefault("detail", {})["doctor_profile_path"] = str(self.doctor_profile_dir)
         return result
 
@@ -872,18 +905,22 @@ def _sha256(path: pathlib.Path) -> str | None:
         return None
 
 
-def select_upgrade_profile_policies() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+def select_upgrade_profile_policies(*, mode: str) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     """在升級 phase 前，從受版控矩陣固定各入口政策並留下來源摘要。"""
-    phases = {"old": "legacy_0_3_2", "new": "migrated", "downgrade": "downgrade"}
+    if mode not in {"on-demand", "systemd-user", "systemd-system"}:
+        raise ValueError(f"不支援的升級驗收模式: {mode!r}")
+    new_phase = "materialized" if mode == "systemd-system" else "migrated"
+    phases = {"old": "legacy_0_3_2", "new": new_phase, "downgrade": "downgrade"}
     document = uc.load_profile_expectations()
     policies = {key: uc.select_profile_policy(phase) for key, phase in phases.items()}
     raw = uc.PROFILE_EXPECTATIONS_PATH.read_bytes()
     if json.loads(raw.decode("utf-8")) != document:
         raise ValueError("profile expectation policy 在載入與摘要期間改變")
-    if policies["new"]["phase"] != "migrated" \
+    expected_migration_fields = ["timeout_recovery_keys"] if new_phase == "migrated" else []
+    if policies["new"]["phase"] != new_phase \
             or "timeout_recovery_keys" in policies["new"]["expected_missing_fields"].get("prpl-template", []) \
-            or policies["new"]["allowed_migration_fields"] != ["timeout_recovery_keys"]:
-        raise ValueError("升級完成入口必須選用 p290 遷移後政策，且不得預期缺少 timeout_recovery_keys")
+            or policies["new"]["allowed_migration_fields"] != expected_migration_fields:
+        raise ValueError("升級完成入口必須選用正確 p290 政策，且不得預期缺少 timeout_recovery_keys")
     if policies["old"]["supported"] or policies["downgrade"]["supported"]:
         raise ValueError("舊版與降級入口不得要求新版 profile_template_fields")
     evidence = {
@@ -922,7 +959,7 @@ def main() -> int:
     except (OSError, ValueError):
         pass
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    profile_policies, profile_policy_evidence = select_upgrade_profile_policies()
+    profile_policies, profile_policy_evidence = select_upgrade_profile_policies(mode=args.mode)
     # 於執行 phase 前記錄容器實際載入的來源；只輸出檔名，避免洩露宿主掛載路徑。
     driver_sha256 = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                      for path in (pathlib.Path(__file__), pathlib.Path(uc.__file__))}

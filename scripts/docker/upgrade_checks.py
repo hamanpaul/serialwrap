@@ -431,6 +431,79 @@ def select_profile_policy(phase: str) -> dict[str, Any]:
     return selected
 
 
+def _profile_template_has_field(path: str | Path, *, template: str, platform: str, field: str) -> tuple[bool, str | None]:
+    """以 fail-closed 的區塊檢查確認受控 profile 檔中的 template 欄位。"""
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+    def block_end(start: int, minimum_indent: int) -> int:
+        for index in range(start + 1, len(lines)):
+            line = lines[index]
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(line) - len(line.lstrip(" "))
+            if indent <= minimum_indent:
+                return index
+        return len(lines)
+
+    profile_roots = [index for index, line in enumerate(lines)
+                      if re.fullmatch(r"profiles\s*:\s*(?:#.*)?", line)]
+    if len(profile_roots) != 1:
+        return False, "profiles mapping missing or duplicated"
+    root_start = profile_roots[0]
+    root_end = block_end(root_start, 0)
+    template_headers = [index for index in range(root_start + 1, root_end)
+                        if re.fullmatch(rf"  {re.escape(template)}\s*:\s*(?:#.*)?", lines[index])]
+    if len(template_headers) != 1:
+        return False, f"template {template!r} missing or duplicated"
+    template_start = template_headers[0]
+    template_end = block_end(template_start, 2)
+    body = lines[template_start + 1:template_end]
+    platform_pattern = re.compile(
+        rf"    platform:\s*(?:{re.escape(platform)}|'\s*{re.escape(platform)}\s*'|\"\s*{re.escape(platform)}\s*\")\s*(?:#.*)?"
+    )
+    field_pattern = re.compile(rf"    {re.escape(field)}\s*:")
+    has_platform = any(platform_pattern.fullmatch(line) for line in body)
+    has_field = any(field_pattern.match(line) for line in body)
+    if not has_platform:
+        return False, f"template {template!r} is not platform {platform!r}"
+    if not has_field:
+        return False, f"template {template!r} lacks field {field!r}"
+    return True, None
+
+
+def judge_p290_profile_migration(check_id: str, target_asset_path: str | Path, live_profile_path: str | Path,
+                                 *, migration_policy_id: str) -> dict[str, Any]:
+    """升級完成必須同時含 p290 欄位於候選資產與實際管理目錄。"""
+    field = "timeout_recovery_keys"
+    template = "prpl-template"
+    platform = "prpl"
+    if migration_policy_id != "p290-template-migration-v1":
+        return row(check_id, "FAIL", "不支援的 profile migration policy",
+                   migration_policy_id=migration_policy_id)
+    target_has, target_error = _profile_template_has_field(
+        target_asset_path, template=template, platform=platform, field=field,
+    )
+    live_has, live_error = _profile_template_has_field(
+        live_profile_path, template=template, platform=platform, field=field,
+    )
+    missing = []
+    if not target_has:
+        missing.append("target_asset")
+    if not live_has:
+        missing.append("live_profile")
+    verdict = "FAIL" if missing else "PASS"
+    reason = "p290 timeout_recovery_keys 缺於 " + ", ".join(missing) if missing else None
+    return row(check_id, verdict, reason,
+               migration_policy_id=migration_policy_id, template=template, platform=platform, field=field,
+               target_asset_path=str(target_asset_path), target_asset_has_field=target_has,
+               target_asset_error=target_error, live_profile_path=str(live_profile_path),
+               live_profile_has_field=live_has, live_profile_error=live_error)
+
+
 def _validate_profile_policy(profile_policy: Any) -> tuple[bool, list[str], dict[str, list[str]]]:
     if type(profile_policy) is not dict:
         raise ValueError("profile_policy 必須由 select_profile_policy() 明確選出")
