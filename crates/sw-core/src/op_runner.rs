@@ -14,33 +14,50 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, Sender};
 use sw_pal::traits::{Clock, TxOutcome};
 use sw_proto::config_types::{ProfileTemplate, SessionProfile};
-use sw_proto::pycompat::{PyErr, a2b_base64_lenient, clean_text, py_strip, splitlines};
+use sw_proto::pycompat::{a2b_base64_lenient, clean_text, py_strip, splitlines, PyErr};
 use sw_proto::pydict;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
-use sw_proto::pyre::{PyFlags, PyRegex, compile, valid_completion_regex};
+use sw_proto::pyre::{compile, valid_completion_regex, PyFlags, PyRegex};
 
 use crate::arbiter::QueuedCommand;
 use crate::file_transfer::{
-    pull_file, push_file, OpTransferPort, PullParams, PushParams, RejectReason, StdLocalFiles, TransferAbort,
-    TransferIds, TxRejection,
+    pull_file, push_file, OpTransferPort, PullParams, PushParams, RejectReason, StdLocalFiles,
+    TransferAbort, TransferIds, TxRejection,
 };
 use crate::login_fsm::LoginOutcome;
 use crate::mailbox::ControlEvent;
 use crate::quiet_gate::is_reboot_command;
 use crate::session_core::OpGrant;
 use crate::tx_writer::{FenceReject, TxClass, TxJob, TxPermit, TxReport, TxWriterHandle};
-use crate::uart_bridge::{RunCancel, RxShared, WaitOutcome};
+use crate::uart_bridge::{RunCancel, RxShared, WaitMatchOutcome, WaitOutcome};
 use crate::wal::{WalAppendReq, WalWriter};
 
 /// 前景 op 的種類（`Effect::StartOp` 內容）。
 pub enum OpSpec {
     Command(QueuedCommand),
-    Recover { timeout_s: f64, force: bool },
-    SelfTestProbe { timeout_s: f64, probe: String, nonce: String },
-    InteractiveOpenCmd { command: String, owner: String },
-    InteractiveSend { payload: Vec<u8>, owner: String },
-    RebootRecovery { hard_timeout_s: f64 },
-    DetectTemplate { templates: Vec<ProfileTemplate> },
+    Recover {
+        timeout_s: f64,
+        force: bool,
+    },
+    SelfTestProbe {
+        timeout_s: f64,
+        probe: String,
+        nonce: String,
+    },
+    InteractiveOpenCmd {
+        command: String,
+        owner: String,
+    },
+    InteractiveSend {
+        payload: Vec<u8>,
+        owner: String,
+    },
+    RebootRecovery {
+        hard_timeout_s: f64,
+    },
+    DetectTemplate {
+        templates: Vec<ProfileTemplate>,
+    },
     /// P8 Task 6：前景檔案傳輸（`file.push`／`file.pull`）；走前景 lane（不是 [`OpSpec::runs_beside_foreground`]）。
     FileTransfer(FileTransferPlan),
 }
@@ -59,10 +76,17 @@ pub enum OpOutcome {
     CommandResult(PyDict),
     SendFailed,
     /// 救援鍵（`CTRL_C`／`CTRL_D`）後 prompt 回來（`PROMPT_TIMEOUT_RECOVERED`）。
-    Recovered { key: &'static str, stdout: String },
+    Recovered {
+        key: &'static str,
+        stdout: String,
+    },
     /// 未完成且救援未成功（或 passthrough 無完成條件）；`stdout` 為 `clean_text(pre_offset 起 RX)`。
-    PromptTimeout { stdout: String },
-    ToAttached { reason: &'static str },
+    PromptTimeout {
+        stdout: String,
+    },
+    ToAttached {
+        reason: &'static str,
+    },
     /// reboot 命令已送出、2 s 內 prompt 未回（`EXPECT_REBOOT`）。
     RebootExpected,
     RebootRecoveryDone(LoginOutcome),
@@ -70,7 +94,9 @@ pub enum OpOutcome {
     SelfTest(PyDict),
     /// R5-F2：nonce probe 的 TxReport.reject == Some(Quiet)；不等 nonce，由 actor 組 AUTOBOOT_QUIET 回應。
     SelfTestRefused(FenceReject),
-    Sent { bytes: usize },
+    Sent {
+        bytes: usize,
+    },
     Detected(Option<String>),
     /// lease TX 在提交點被 fence 拒絕（#36 映射由 actor 套用）。
     SendRefused(FenceReject),
@@ -102,15 +128,15 @@ pub struct OpCtx {
 /// 前景 op 執行器（thread pool size 1 per session，ForegroundSlot；Task 14 Produces）。
 pub struct OpRunner {
     jobs: Sender<(OpGrant, OpSpec)>,
-    /// 並行 lane（READY recover、self-test probe）。
+    /// 並行 lane（READY recover）。
     side: Sender<(OpGrant, OpSpec)>,
 }
 
 impl OpSpec {
     /// 不是 Python 前景 operation、須與前景命令並行的 op（審查 F25）：READY recover（`recover_session` →
-    /// `_recover_after_failure`）與 self-test nonce probe 都不看 `foreground_busy`，照送救援鍵／probe。
+    /// `_recover_after_failure`）照舊可與前景操作並行；self-test 由 actor 保留前景槽。
     pub fn runs_beside_foreground(&self) -> bool {
-        matches!(self, OpSpec::Recover { .. } | OpSpec::SelfTestProbe { .. })
+        matches!(self, OpSpec::Recover { .. })
     }
 }
 
@@ -137,7 +163,7 @@ fn spawn_lane(ctx: OpCtx, lane: &str) -> Sender<(OpGrant, OpSpec)> {
 }
 
 impl OpRunner {
-    /// 前景 lane（命令、interactive）與並行 lane（[`OpSpec::runs_beside_foreground`]）各一條 thread；
+    /// 前景 lane（命令、interactive、self-test）與並行 lane（[`OpSpec::runs_beside_foreground`]）各一條 thread；
     /// 兩者的 TX 一律經同一 epoch 的 TxWriter（單一寫入者不變）。
     pub fn spawn(ctx: OpCtx) -> OpRunner {
         let side = spawn_lane(ctx.clone(), "-side");
@@ -193,7 +219,11 @@ pub fn extract_command_stdout(
 }
 
 /// `clean_text` 後依最後一個 prompt（completion 模式下只裁完成標記之後的尾 prompt）截斷並切行。
-fn prompt_cut_lines(raw: &str, prompt_regex: &PyRegex, completion: Option<&PyRegex>) -> Vec<String> {
+fn prompt_cut_lines(
+    raw: &str,
+    prompt_regex: &PyRegex,
+    completion: Option<&PyRegex>,
+) -> Vec<String> {
     let cleaned = clean_text(raw);
     let prompt_start = last_match_start(prompt_regex, &cleaned);
     let completion_end = completion
@@ -228,7 +258,12 @@ struct WrapEvidence {
 /// 修正 PR `_match_wrapped_echo`：從 `text[start]` 比對一段可能被折行的命令回顯，成功時回傳回顯結束位置。
 /// 命令的每個字元（含空白）都必須依序出現；只有換行或多出的空白（且原始串流有對應證據）可以跳過，
 /// 第一個命令字元前不得插入，插入點彼此至少相隔 [`WRAP_MIN_SEGMENT`] 個字元（第一個插入點以第一行欄位計，含殘留 prompt）。
-fn match_wrapped_echo(text: &[char], start: usize, command: &[char], wraps: WrapEvidence) -> Option<usize> {
+fn match_wrapped_echo(
+    text: &[char],
+    start: usize,
+    command: &[char],
+    wraps: WrapEvidence,
+) -> Option<usize> {
     let (mut i, mut j) = (start, 0usize);
     let mut last_wrap: Option<usize> = None;
     while j < command.len() {
@@ -254,7 +289,11 @@ fn match_wrapped_echo(text: &[char], start: usize, command: &[char], wraps: Wrap
 
 /// 修正 PR `_strip_wrapped_command_echo`：`lines` 已 `clean_text` 並切行；命令須從第一行開始（容許殘留 prompt），
 /// 完整結束在某一行的行尾，才把這幾行視為回顯。回傳要移除的行數。
-fn strip_wrapped_command_echo(lines: &[String], command: &str, wraps: WrapEvidence) -> Option<usize> {
+fn strip_wrapped_command_echo(
+    lines: &[String],
+    command: &str,
+    wraps: WrapEvidence,
+) -> Option<usize> {
     if command.is_empty() || lines.is_empty() {
         return None;
     }
@@ -344,9 +383,9 @@ pub fn reject_reason(reject: FenceReject) -> &'static str {
         FenceReject::FsmMismatch => "stale_login_gen",
         FenceReject::WalUnhealthy => "wal_unhealthy",
         // 07 D-03：只對 HumanRaw／HumanReplay 產生，op TX 不會遇到；取 Python human_raw 拒絕字串。
-        FenceReject::HumanAdmissionClosed | FenceReject::InputStale | FenceReject::ReplayRevoked => {
-            "stale_owner_gen"
-        }
+        FenceReject::HumanAdmissionClosed
+        | FenceReject::InputStale
+        | FenceReject::ReplayRevoked => "stale_owner_gen",
     }
 }
 
@@ -406,7 +445,14 @@ fn execute(ctx: &OpCtx, grant: &OpGrant, spec: OpSpec) -> OpOutcome {
         OpSpec::InteractiveOpenCmd { command, owner } => {
             let payload = command_payload(&command);
             // `command.submit {mode:"interactive"}` 的命令：TX 帶原 cmd_id，未完整送出依命令帳結算（sol-backfill p5 #1）。
-            lease_send(ctx, grant, payload, TxClass::InteractiveOpenCmd, &owner, grant.cmd_id.as_deref())
+            lease_send(
+                ctx,
+                grant,
+                payload,
+                TxClass::InteractiveOpenCmd,
+                &owner,
+                grant.cmd_id.as_deref(),
+            )
         }
         OpSpec::InteractiveSend { payload, owner } => {
             lease_send(ctx, grant, payload, TxClass::LeaseOwner, &owner, None)
@@ -428,7 +474,10 @@ impl TransferIds for RngIds<'_> {
     fn hex(&mut self, n: usize) -> String {
         let rng = self.rng;
         let mut fill = |bytes: &mut [u8]| rng(bytes);
-        sw_proto::pycompat::uuid4_hex(&mut fill).chars().take(n).collect()
+        sw_proto::pycompat::uuid4_hex(&mut fill)
+            .chars()
+            .take(n)
+            .collect()
     }
 }
 
@@ -452,7 +501,11 @@ fn run_file_transfer(ctx: &OpCtx, grant: &OpGrant, plan: FileTransferPlan) -> Op
     };
     let confirmed = port.confirmed_bytes();
     OpOutcome::FileTransfer(match result {
-        Err(TransferAbort::TxRejected { rej, chunks, transfer_cmd_id }) => {
+        Err(TransferAbort::TxRejected {
+            rej,
+            chunks,
+            transfer_cmd_id,
+        }) => {
             let cmd_id = if transfer_cmd_id.is_empty() {
                 format!("file:{}", grant.op_id.0)
             } else {
@@ -474,9 +527,16 @@ fn map_file_tx_rejected(
 ) -> Result<PyDict, TransferAbort> {
     let code = match rej.reason {
         RejectReason::Quiet if rej.rejected_confirmed == 0 => {
-            return Err(TransferAbort::TxRejected { rej, chunks, transfer_cmd_id });
+            return Err(TransferAbort::TxRejected {
+                rej,
+                chunks,
+                transfer_cmd_id,
+            });
         }
-        RejectReason::Quiet | RejectReason::Cancelled | RejectReason::StaleGeneration | RejectReason::Draining => {
+        RejectReason::Quiet
+        | RejectReason::Cancelled
+        | RejectReason::StaleGeneration
+        | RejectReason::Draining => {
             if confirmed > 0 {
                 append_transfer_aborted_meta(ctx, &transfer_cmd_id, confirmed, rej.unknown);
                 "COMMAND_ABORTED_IN_FLIGHT"
@@ -508,7 +568,10 @@ fn append_transfer_aborted_meta(ctx: &OpCtx, cmd_id: &str, confirmed: usize, unk
     let mut meta = PyDict::new();
     meta.insert("event", PyValue::from("command_aborted_in_flight"));
     meta.insert("confirmed_tx_bytes", py_int(confirmed as i128));
-    meta.insert("tx_outcome", PyValue::from(if unknown { "unknown" } else { "partial" }));
+    meta.insert(
+        "tx_outcome",
+        PyValue::from(if unknown { "unknown" } else { "partial" }),
+    );
     let _ = ctx.wal.append(WalAppendReq {
         com: &ctx.com,
         dir: "META",
@@ -526,6 +589,13 @@ fn command_payload(command: &str) -> Vec<u8> {
         payload.push(b'\n');
     }
     payload
+}
+
+/// self-test 專用 shell 框架；printf 的格式字串與 nonce 分開，TX 回顯不含完整預期標記。
+pub(crate) fn self_test_probe_payload(probe: &str, nonce: &str) -> Vec<u8> {
+    command_payload(&format!(
+        "( {probe} ) && printf '\\n__SW_ST_%s_OK__\\n' '{nonce}'"
+    ))
 }
 
 /// 經 TxWriter 送出一筆 TX 並等待 `TxReport`（writer 已停止時視為 `Frozen` 拒絕）。
@@ -593,12 +663,7 @@ fn wait_regex_from(ctx: &OpCtx, re: &PyRegex, from: u64, timeout_s: f64) -> bool
 }
 
 /// Python `_map_aborted_result`（非 drain 中止）：TX 未完整提交時的命令結果碼。
-fn map_send_failure(
-    ctx: &OpCtx,
-    report: &TxReport,
-    requested: usize,
-    cmd_id: &str,
-) -> PyDict {
+fn map_send_failure(ctx: &OpCtx, report: &TxReport, requested: usize, cmd_id: &str) -> PyDict {
     let confirmed = confirmed_of(report);
     let unknown = matches!(report.result.outcome, TxOutcome::Unknown { .. });
     if confirmed > 0 {
@@ -836,7 +901,10 @@ fn run_reboot(
 ) -> OpOutcome {
     let t = &ctx.profile.template;
     let command = q.req.command.as_str();
-    if t.console_unlock_env.as_deref().is_some_and(|s| !s.is_empty()) {
+    if t.console_unlock_env
+        .as_deref()
+        .is_some_and(|s| !s.is_empty())
+    {
         // G10（Python `session_manager.py:6421-6423`）：已重開的舊 root prompt 不可在 recovery 中被當成解鎖證據。
         ctx.rx.clear();
     }
@@ -852,12 +920,7 @@ fn run_reboot(
         true,
     );
     if !fully_sent(&report, payload.len()) {
-        return OpOutcome::CommandResult(map_send_failure(
-            ctx,
-            &report,
-            payload.len(),
-            &q.cmd_id,
-        ));
+        return OpOutcome::CommandResult(map_send_failure(ctx, &report, payload.len(), &q.cmd_id));
     }
     let prompt_re = compile_or_never(&t.prompt_regex);
     let prompt_wait = prompt_wait_s.unwrap_or(q.req.timeout_s.min(2.0));
@@ -926,11 +989,12 @@ fn recover_after_failure(
                     if let Some((cmd_id, confirmed)) = aborted.filter(|(_, n)| *n > 0) {
                         // Python：TxIncompleteError → `execute_command` → `_map_aborted_result(cmd_id, exc)`；
                         // `tx_account(cmd_id)` 含命令本身的 bytes，救援鍵結果非完整 → `partial`（Unknown → `unknown`）。
-                        let tx_outcome = if matches!(report.result.outcome, TxOutcome::Unknown { .. }) {
-                            "unknown"
-                        } else {
-                            "partial"
-                        };
+                        let tx_outcome =
+                            if matches!(report.result.outcome, TxOutcome::Unknown { .. }) {
+                                "unknown"
+                            } else {
+                                "partial"
+                            };
                         let mut meta = PyDict::new();
                         meta.insert("event", PyValue::from("command_aborted_in_flight"));
                         meta.insert("confirmed_tx_bytes", py_int(confirmed as i128));
@@ -950,9 +1014,7 @@ fn recover_after_failure(
                             pydict! { "ok" => false, "error_code" => "COMMAND_ABORTED_IN_FLIGHT" },
                         );
                     }
-                    return OpOutcome::Error(PyErr::value_error(tx_incomplete_message(
-                        &report, 1,
-                    )));
+                    return OpOutcome::Error(PyErr::value_error(tx_incomplete_message(&report, 1)));
                 }
             }
         }
@@ -985,7 +1047,7 @@ fn recover_after_failure(
     }
 }
 
-/// `_self_test_impl` 的 nonce probe 段（pre-check 由 actor 完成）。
+/// `_self_test_impl` 的 execution-marker probe 段（pre-check 與 reservation 由 actor 完成）。
 fn run_self_test_probe(
     ctx: &OpCtx,
     grant: &OpGrant,
@@ -994,7 +1056,12 @@ fn run_self_test_probe(
     nonce: &str,
 ) -> OpOutcome {
     let offset = ctx.rx.snapshot_len();
-    let payload = command_payload(probe);
+    let payload = self_test_probe_payload(probe, nonce);
+    let expected_marker = format!("__SW_ST_{nonce}_OK__");
+    if String::from_utf8_lossy(&payload).contains(&expected_marker) {
+        return OpOutcome::SelfTest(self_test_evidence_outcome(false, false, false, false, 0));
+    }
+    let marker_re = compile_or_never(&format!("(?m)^__SW_ST_{nonce}_OK__\\r?$"));
     let report = send(
         ctx,
         grant,
@@ -1004,9 +1071,10 @@ fn run_self_test_probe(
         None,
         true,
     );
-    if !fully_sent(&report, payload.len()) {
+    let tx_complete = fully_sent(&report, payload.len());
+    if !tx_complete {
         match report.reject {
-            // RPC-H-07 KEEP：flash 拒絕照等 nonce（逾時 → TARGET_UNRESPONSIVE）。
+            // RPC-H-07 KEEP：flash 拒絕照等 probe 證據（沒有本次 TX 不可能確認成功）。
             Some(FenceReject::Flash) => {}
             Some(reject) => return OpOutcome::SelfTestRefused(reject),
             None => {
@@ -1017,36 +1085,62 @@ fn run_self_test_probe(
             }
         }
     }
-    let nonce_re = compile_or_never(nonce);
-    match ctx.rx.wait_for_regex_from_shutdown_cancellable(
-        &nonce_re,
-        offset,
-        secs(timeout_s),
-        &*ctx.clock,
-    ) {
-        WaitOutcome::Matched => {}
-        WaitOutcome::TimedOut => {
-            let (flood, _) = ctx.rx.rx_stats(ctx.clock.mono_ns());
-            return OpOutcome::SelfTest(pydict! {
-                "probe_ok" => false,
-                "rx_bytes_last_10s" => py_int(flood as i128),
-            });
-        }
-        WaitOutcome::Cancelled => {
-            return OpOutcome::SelfTestRefused(FenceReject::Cancelled);
-        }
-    }
-    let prompt_re = compile_or_never(&ctx.profile.template.prompt_regex);
-    if ctx.rx.wait_for_regex_from_shutdown_cancellable(
-        &prompt_re,
-        offset,
-        secs(timeout_s),
-        &*ctx.clock,
-    ) == WaitOutcome::Cancelled
-    {
-        return OpOutcome::SelfTestRefused(FenceReject::Cancelled);
-    }
-    OpOutcome::SelfTest(pydict! { "probe_ok" => true })
+    let (execution_marker, probe_rc_zero, prompt_after_marker) =
+        match ctx.rx.wait_for_regex_end_from_shutdown_cancellable(
+            &marker_re,
+            offset,
+            secs(timeout_s),
+            &*ctx.clock,
+        ) {
+            WaitMatchOutcome::Matched { end } => {
+                let prompt_re = compile_or_never(&ctx.profile.template.prompt_regex);
+                let prompt = match ctx.rx.wait_for_regex_from_shutdown_cancellable(
+                    &prompt_re,
+                    end,
+                    secs(timeout_s),
+                    &*ctx.clock,
+                ) {
+                    WaitOutcome::Matched => true,
+                    WaitOutcome::TimedOut => false,
+                    WaitOutcome::Cancelled => {
+                        return OpOutcome::SelfTestRefused(FenceReject::Cancelled);
+                    }
+                };
+                (true, true, prompt)
+            }
+            WaitMatchOutcome::TimedOut => (false, false, false),
+            WaitMatchOutcome::Cancelled => {
+                return OpOutcome::SelfTestRefused(FenceReject::Cancelled);
+            }
+        };
+    OpOutcome::SelfTest(self_test_evidence_outcome(
+        tx_complete,
+        execution_marker,
+        probe_rc_zero,
+        prompt_after_marker,
+        ctx.rx.rx_stats(ctx.clock.mono_ns()).0,
+    ))
+}
+
+fn self_test_evidence_outcome(
+    tx_complete: bool,
+    execution_marker: bool,
+    probe_rc_zero: bool,
+    prompt_after_marker: bool,
+    rx_bytes_last_10s: u64,
+) -> PyDict {
+    let probe_ok = tx_complete && execution_marker && probe_rc_zero && prompt_after_marker;
+    let mut result = pydict! {
+        "probe_ok" => probe_ok,
+        "probe_evidence" => pydict! {
+            "tx_complete" => tx_complete,
+            "execution_marker" => execution_marker,
+            "probe_rc_zero" => probe_rc_zero,
+            "prompt_after_marker" => prompt_after_marker,
+        },
+    };
+    result.insert("rx_bytes_last_10s", py_int(rx_bytes_last_10s as i128));
+    result
 }
 
 /// lease 擁有者 TX（`interactive_send`／`interactive_open` 的 command）。

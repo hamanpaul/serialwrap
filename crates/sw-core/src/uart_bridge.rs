@@ -3,12 +3,12 @@
 //! T10 提供 reader thread、RX 視窗及哨兵 fan-out；IoWorker 的啟停與 TX 組裝由 T12 完成。
 
 use std::collections::VecDeque;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Sender, bounded};
+use crossbeam_channel::{bounded, Sender};
 use sw_pal::traits::{
     CancelToken, Clock, CloseToken, PalError, PalErrorKind, ReadError, ReadOutcome, SerialHandle,
     SerialReader, SerialWriter,
@@ -16,13 +16,13 @@ use sw_pal::traits::{
 use sw_proto::pycompat::decode_utf8_replace;
 use sw_proto::pyre::PyRegex;
 
-use crate::Mono;
 use crate::drain::StopId;
 use crate::mailbox::{ControlEvent, DataEvent};
 use crate::tx_writer::{
-    EvidenceGap, Fence, TxLedger, TxWriterHandle, TxWriterStop, spawn_tx_writer,
+    spawn_tx_writer, EvidenceGap, Fence, TxLedger, TxWriterHandle, TxWriterStop,
 };
 use crate::wal::{WalAppendReq, WalWriter};
+use crate::Mono;
 
 const IO_POLL: Duration = Duration::from_millis(200);
 const RX_RATE_WINDOW_NS: u64 = 10_000_000_000;
@@ -177,7 +177,10 @@ impl RxShared {
     /// 喚醒所有可取消的 regex 等待者（容量 1、滿則略過；已斷線者移除）。
     fn wake_all(&self) {
         self.changed.notify_all();
-        let mut wakers = self.wakers.lock().unwrap_or_else(|error| error.into_inner());
+        let mut wakers = self
+            .wakers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         wakers.retain(|tx| {
             !matches!(
                 tx.try_send(()),
@@ -765,7 +768,10 @@ impl IoWorker {
             fn is_alive(&self) -> bool {
                 false
             }
-            fn configure(&self, _cfg: &sw_pal::traits::SerialConfig) -> sw_pal::traits::PalResult<()> {
+            fn configure(
+                &self,
+                _cfg: &sw_pal::traits::SerialConfig,
+            ) -> sw_pal::traits::PalResult<()> {
                 Ok(())
             }
             fn close(self: Box<Self>) -> sw_pal::traits::CloseReceipt {
@@ -883,38 +889,39 @@ impl IoWorker {
             .spawn(move || {
                 let writer_result = writer.join();
                 let reader_result = reader.join();
-                let (ledger, reader_exit, reader_rx_seq, close_receipt) = match (writer_result, reader_result) {
-                    (Ok((writer, ledger)), Ok(reader_exit)) => {
-                        let ReaderExit {
-                            reader,
-                            sentinel,
-                            error: _,
-                            rx_seq,
-                            unrecorded,
-                        } = reader_exit;
-                        drop(sentinel);
-                        drop(sentinel_keepalive);
-                        let close_receipt = close.close(reader, writer);
-                        (ledger, Some(unrecorded), Some(rx_seq), Some(close_receipt))
-                    }
-                    _ => {
-                        let error = PalError::plain(
-                            PalErrorKind::Io,
-                            "UART worker thread panicked before returning its handle",
-                        );
-                        let receipt = crate::drain::WorkerStoppedReceipt {
-                            epoch,
-                            stop_id,
-                            ledger: TxLedger::default(),
-                            unrecorded: Vec::new(),
-                            wal_error: Some(error.clone()),
-                            handle_closed: false,
-                            close_error: Some(error),
-                        };
-                        let _ = control.send(ControlEvent::WorkerStopped(receipt));
-                        return;
-                    }
-                };
+                let (ledger, reader_exit, reader_rx_seq, close_receipt) =
+                    match (writer_result, reader_result) {
+                        (Ok((writer, ledger)), Ok(reader_exit)) => {
+                            let ReaderExit {
+                                reader,
+                                sentinel,
+                                error: _,
+                                rx_seq,
+                                unrecorded,
+                            } = reader_exit;
+                            drop(sentinel);
+                            drop(sentinel_keepalive);
+                            let close_receipt = close.close(reader, writer);
+                            (ledger, Some(unrecorded), Some(rx_seq), Some(close_receipt))
+                        }
+                        _ => {
+                            let error = PalError::plain(
+                                PalErrorKind::Io,
+                                "UART worker thread panicked before returning its handle",
+                            );
+                            let receipt = crate::drain::WorkerStoppedReceipt {
+                                epoch,
+                                stop_id,
+                                ledger: TxLedger::default(),
+                                unrecorded: Vec::new(),
+                                wal_error: Some(error.clone()),
+                                handle_closed: false,
+                                close_error: Some(error),
+                            };
+                            let _ = control.send(ControlEvent::WorkerStopped(receipt));
+                            return;
+                        }
+                    };
 
                 let mut unrecorded = reader_exit.unwrap_or_default();
                 for gap in &ledger.unresolved_gaps {
@@ -1034,6 +1041,14 @@ pub enum WaitOutcome {
     Cancelled,
 }
 
+/// shutdown-cancellable regex 等待結果，match 結束位置以絕對 Unicode 字元座標表示。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitMatchOutcome {
+    Matched { end: u64 },
+    TimedOut,
+    Cancelled,
+}
+
 impl RxShared {
     /// Python `wait_for_regex`（整窗或自絕對偏移 `from` 起）＋SC-30 取消：先比對、再看期限；未命中時以
     /// `Clock::wait_until_or_cancel` 等到期限或「RX／clear／取消」喚醒（P7 Task 3 先行實作）。
@@ -1058,7 +1073,10 @@ impl RxShared {
             }
             let (snapshot, revision) = {
                 let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-                (window.text_from(from.unwrap_or(0)).to_string(), window.revision)
+                (
+                    window.text_from(from.unwrap_or(0)).to_string(),
+                    window.revision,
+                )
             };
             if re.search(&snapshot).is_some() {
                 return WaitOutcome::Matched;
@@ -1089,15 +1107,30 @@ impl RxShared {
         timeout: Duration,
         clock: &dyn Clock,
     ) -> WaitOutcome {
+        match self.wait_for_regex_end_from_shutdown_cancellable(re, from, timeout, clock) {
+            WaitMatchOutcome::Matched { .. } => WaitOutcome::Matched,
+            WaitMatchOutcome::TimedOut => WaitOutcome::TimedOut,
+            WaitMatchOutcome::Cancelled => WaitOutcome::Cancelled,
+        }
+    }
+
+    /// 同 shutdown-cancellable 等待，但命中時回傳 match 結束的絕對 Unicode 字元位置。
+    pub fn wait_for_regex_end_from_shutdown_cancellable(
+        &self,
+        re: &PyRegex,
+        from: u64,
+        timeout: Duration,
+        clock: &dyn Clock,
+    ) -> WaitMatchOutcome {
         #[cfg(feature = "test-fakes")]
         self.regex_wait_starts.fetch_add(1, Ordering::AcqRel);
         if self.shutdown_waits_cancelled.load(Ordering::Acquire) {
-            return WaitOutcome::Cancelled;
+            return WaitMatchOutcome::Cancelled;
         }
         let timeout_ns = timeout.as_nanos().min(u64::MAX as u128) as u64;
         let deadline = clock.mono_ns().saturating_add(timeout_ns);
         if clock.mono_ns() >= deadline {
-            return WaitOutcome::TimedOut;
+            return WaitMatchOutcome::TimedOut;
         }
         let (wake_tx, wake_rx) = bounded(1);
         self.wakers
@@ -1107,33 +1140,39 @@ impl RxShared {
 
         loop {
             if self.shutdown_waits_cancelled.load(Ordering::Acquire) {
-                return WaitOutcome::Cancelled;
+                return WaitMatchOutcome::Cancelled;
             }
             if clock.mono_ns() >= deadline {
-                return WaitOutcome::TimedOut;
+                return WaitMatchOutcome::TimedOut;
             }
-            let (snapshot, revision) = {
+            let (snapshot, trimmed, revision) = {
                 let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-                (window.text_from(from).to_string(), window.revision)
+                (
+                    window.text_from(from).to_string(),
+                    window.trimmed,
+                    window.revision,
+                )
             };
             if self.shutdown_waits_cancelled.load(Ordering::Acquire) {
-                return WaitOutcome::Cancelled;
+                return WaitMatchOutcome::Cancelled;
             }
             if clock.mono_ns() >= deadline {
-                return WaitOutcome::TimedOut;
+                return WaitMatchOutcome::TimedOut;
             }
-            if re.search(&snapshot).is_some() {
+            if let Some(found) = re.search(&snapshot) {
                 return if self.shutdown_waits_cancelled.load(Ordering::Acquire) {
-                    WaitOutcome::Cancelled
+                    WaitMatchOutcome::Cancelled
                 } else {
-                    WaitOutcome::Matched
+                    WaitMatchOutcome::Matched {
+                        end: from.max(trimmed).saturating_add(found.end as u64),
+                    }
                 };
             }
             if self.shutdown_waits_cancelled.load(Ordering::Acquire) {
-                return WaitOutcome::Cancelled;
+                return WaitMatchOutcome::Cancelled;
             }
             if clock.mono_ns() >= deadline {
-                return WaitOutcome::TimedOut;
+                return WaitMatchOutcome::TimedOut;
             }
             while wake_rx.try_recv().is_ok() {}
             let changed = self
@@ -1186,17 +1225,15 @@ fn wait_for_rx_dispatch_with_timeout(
     let (reply, ack) = bounded(1);
     let expired = Arc::new(AtomicBool::new(false));
     let deadline = Instant::now() + timeout;
-    if let Err(error) = safety
-        .send_timeout(
-            ControlEvent::DrainDataBarrier {
-                epoch,
-                rx_seq,
-                reply,
-                expired: expired.clone(),
-            },
-            deadline.saturating_duration_since(Instant::now()),
-        )
-    {
+    if let Err(error) = safety.send_timeout(
+        ControlEvent::DrainDataBarrier {
+            epoch,
+            rx_seq,
+            reply,
+            expired: expired.clone(),
+        },
+        deadline.saturating_duration_since(Instant::now()),
+    ) {
         expired.store(true, Ordering::Release);
         return Err(PalError::plain(
             PalErrorKind::Io,
@@ -1216,7 +1253,8 @@ fn wait_for_rx_dispatch_with_timeout(
             expired.store(true, Ordering::Release);
             Err(PalError::plain(
                 PalErrorKind::Io,
-                "RX drain barrier 等待逾時，capture 順序未確認：timed out waiting on channel".to_string(),
+                "RX drain barrier 等待逾時，capture 順序未確認：timed out waiting on channel"
+                    .to_string(),
             ))
         }
     }

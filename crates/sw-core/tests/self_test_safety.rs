@@ -12,8 +12,11 @@ use sw_core::op_runner::OpOutcome;
 use sw_core::op_runner::OpSpec;
 use sw_core::self_test::SelfTestProbes;
 use sw_core::session_core::{Effect, SessionRequest};
+use sw_core::tx_writer::OpId;
 use sw_core::uart_bridge::WorkerSnapshot;
+use sw_pal::fakes::serial::FakeWriteStep;
 use sw_pal::traits::TxOutcome;
+use sw_proto::pydict;
 use sw_proto::pyjson::{PyDict, PyValue};
 
 fn tx_row_count(h: &ActorRig) -> usize {
@@ -21,6 +24,15 @@ fn tx_row_count(h: &ActorRig) -> usize {
         .iter()
         .filter(|row| row.get("dir").and_then(PyValue::as_str) == Some("TX"))
         .count()
+}
+
+fn wait_for_recover_tx_wal(h: &ActorRig) {
+    h.wait_for("Recover 救援鍵 WAL TX", |h| {
+        h.wal_rows().iter().any(|row| {
+            row.get("dir").and_then(PyValue::as_str) == Some("TX")
+                && row.get("source").and_then(PyValue::as_str) == Some("system:recover")
+        })
+    });
 }
 
 fn has_self_test_probe(effects: &[Effect]) -> bool {
@@ -32,6 +44,31 @@ fn has_self_test_probe(effects: &[Effect]) -> bool {
                 ..
             }
         )
+    })
+}
+
+fn self_test_op_id(effects: &[Effect]) -> (OpId, u64) {
+    effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp {
+                grant,
+                spec: OpSpec::SelfTestProbe { .. },
+            } => Some((grant.op_id, grant.epoch)),
+            _ => None,
+        })
+        .expect("SelfTestProbe StartOp")
+}
+
+fn verified_self_test_outcome() -> OpOutcome {
+    OpOutcome::SelfTest(pydict! {
+        "probe_ok" => true,
+        "probe_evidence" => pydict! {
+            "tx_complete" => true,
+            "execution_marker" => true,
+            "probe_rc_zero" => true,
+            "prompt_after_marker" => true,
+        },
     })
 }
 
@@ -60,6 +97,8 @@ fn self_test_req() -> SessionRequest {
     }
 }
 
+const FAILED_RC_PROFILE: &str = "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    ready_probe: 'echo __READY__${nonce}; false'\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: t, act_no: 1, alias: t+1, device_by_id: /s/by-id/usb-A}\n";
+
 fn open_interactive(owner: &str) -> SessionRequest {
     SessionRequest::InteractiveOpen {
         owner: owner.to_string(),
@@ -73,6 +112,55 @@ fn close_interactive(id: &str) -> SessionRequest {
     SessionRequest::InteractiveClose {
         interactive_id: id.to_string(),
     }
+}
+
+fn install_executing_shell_target(h: &ActorRig) {
+    h.dev.clear_replies();
+    h.dev.on_tx_match(
+        r"__READY__[0-9a-f]+",
+        Box::new(|line: &[u8]| {
+            let text = String::from_utf8_lossy(line).into_owned();
+            let token = text
+                .split("__READY__")
+                .nth(1)
+                .unwrap_or("")
+                .chars()
+                .take_while(|c| c.is_ascii_hexdigit())
+                .collect::<String>();
+            let expected =
+                format!("( echo __READY__{token} ) && printf '\\n__SW_ST_%s_OK__\\n' '{token}'");
+            if token.len() == 8 && text.contains(&expected) {
+                format!("__READY__{token}\r\n__SW_ST_{token}_OK__\r\nroot@t:/# ").into_bytes()
+            } else {
+                format!("__READY__{token}\r\nroot@t:/# ").into_bytes()
+            }
+        }),
+    );
+}
+
+fn read_self_test_probe(h: &ActorRig, tx_start: usize) -> (String, String) {
+    h.wait_for("self-test probe TX", |rig| rig.dev.tx_len() > tx_start);
+    let tx = String::from_utf8_lossy(&h.dev.tx_since(tx_start)).into_owned();
+    let nonce = tx
+        .split("__READY__")
+        .nth(1)
+        .unwrap_or("")
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .collect::<String>();
+    assert_eq!(nonce.len(), 8, "probe TX 應含完整 nonce：{tx:?}");
+    (tx, nonce)
+}
+
+fn receive_self_test_after_deadline(
+    h: &ActorRig,
+    pending: crossbeam_channel::Receiver<Result<PyDict, sw_proto::pycompat::PyErr>>,
+) -> PyDict {
+    h.advance(Duration::from_secs(3));
+    pending
+        .recv_timeout(Duration::from_secs(2))
+        .expect("self-test 應於兩階段期限內結束")
+        .expect("self-test RPC 應回字典")
 }
 
 #[test]
@@ -290,6 +378,7 @@ fn recover_waiter_remains_busy_after_human_console_attach() {
     h.wait_for("Recover 救援鍵 TX", |h| {
         h.dev.tx_since(tx_offset).contains(&0x03)
     });
+    wait_for_recover_tx_wal(&h);
 
     let _console = h.attach_pty_console("human-recover");
     assert!(
@@ -305,16 +394,35 @@ fn recover_waiter_remains_busy_after_human_console_attach() {
     let reply = h.request(self_test_req());
 
     assert_busy_reply(&reply, "SESSION_BUSY");
-    assert_eq!(h.dev.tx_len(), before_bytes, "有效 Recover 期間不得新增 UART bytes");
-    assert_eq!(h.dev.write_calls(), before_writes, "有效 Recover 期間不得新增 UART write");
-    assert_eq!(h.dev.os_submits(), before_submits, "有效 Recover 期間不得新增 OS submit");
-    assert_eq!(tx_row_count(&h), before_wal, "有效 Recover 期間不得新增 WAL TX");
+    assert_eq!(
+        h.dev.tx_len(),
+        before_bytes,
+        "有效 Recover 期間不得新增 UART bytes"
+    );
+    assert_eq!(
+        h.dev.write_calls(),
+        before_writes,
+        "有效 Recover 期間不得新增 UART write"
+    );
+    assert_eq!(
+        h.dev.os_submits(),
+        before_submits,
+        "有效 Recover 期間不得新增 OS submit"
+    );
+    assert_eq!(
+        tx_row_count(&h),
+        before_wal,
+        "有效 Recover 期間不得新增 WAL TX"
+    );
     assert_eq!(
         h.get_state()["last_probe_at"],
         before_state["last_probe_at"],
         "有效 Recover 期間不得更新 probe 時間"
     );
-    assert!(recover.try_recv().is_err(), "self-test 不得結束 Recover waiter");
+    assert!(
+        recover.try_recv().is_err(),
+        "self-test 不得結束 Recover waiter"
+    );
 }
 
 #[test]
@@ -344,7 +452,10 @@ fn agent_lease_does_not_override_quiet_classification() {
     let reply = reply.expect("quiet 分類");
     assert_eq!(reply["classification"], PyValue::from("AUTOBOOT_QUIET"));
     assert_eq!(reply["recommended_action"], PyValue::from("wait"));
-    assert!(!has_self_test_probe(&effects), "AUTOBOOT_QUIET 不得建立 probe");
+    assert!(
+        !has_self_test_probe(&effects),
+        "AUTOBOOT_QUIET 不得建立 probe"
+    );
 }
 
 #[test]
@@ -385,11 +496,18 @@ fn accepted_queue_blocks_self_test_without_foreground_slot() {
 
     let before = h.public()["last_probe_at"].clone();
     let (reply_rx, effects) = h.rpc_deferred(self_test_req());
-    assert!(!has_self_test_probe(&effects), "有效 queue 不得被 probe 插隊");
+    assert!(
+        !has_self_test_probe(&effects),
+        "有效 queue 不得被 probe 插隊"
+    );
     let reply = reply_rx.try_recv().expect("accepted queue busy").unwrap();
     assert_busy_reply(&reply, "SESSION_BUSY");
     assert_eq!(h.fake_device.tx_len(), 0, "有效 queue 期間不得新增 UART TX");
-    assert_eq!(h.public()["last_probe_at"], before, "有效 queue 不得更新 probe 時間");
+    assert_eq!(
+        h.public()["last_probe_at"],
+        before,
+        "有效 queue 不得更新 probe 時間"
+    );
 }
 
 #[test]
@@ -582,6 +700,7 @@ fn agent_lease_and_probe_operations_block_self_test() {
     h.wait_for("READY Recover 救援鍵 TX", |h| {
         h.dev.tx_since(tx_offset).contains(&0x03)
     });
+    wait_for_recover_tx_wal(&h);
     let before_bytes = h.dev.tx_len();
     let before_writes = h.dev.write_calls();
     let before_submits = h.dev.os_submits();
@@ -656,5 +775,413 @@ fn rebound_recover_waiter_does_not_keep_self_test_busy() {
     assert!(
         !has_self_test_probe(&effects),
         "bridge down 不得建立 SelfTestProbe"
+    );
+}
+
+#[test]
+fn idle_probe_reserves_slot_before_tx() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    install_executing_shell_target(&h);
+    h.dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+    let first_tx = h.dev.tx_len();
+    let first = h.request_async(self_test_req());
+    assert!(
+        h.dev.wait_paused(Duration::from_secs(2)),
+        "probe 應停在提交前"
+    );
+
+    let second = h.request_async(self_test_req());
+    let second_reply = second.recv_timeout(Duration::from_millis(100)).ok();
+    h.dev.on_tx_reply(b"i306-slot-command\n", b"root@t:/# ");
+    let cmd_id = h.submit_ok("i306-slot-command");
+    let command_started_while_probe_paused =
+        h.get_state()["foreground_busy"] == PyValue::Bool(true);
+    let tx_unchanged_before_release = h.dev.tx_len() == first_tx;
+
+    h.dev.release_pause();
+    let (probe_tx, _) = read_self_test_probe(&h, first_tx);
+    let first_reply = first
+        .recv_timeout(Duration::from_secs(5))
+        .expect("第一個 probe 應完成")
+        .expect("第一個 self-test 應回字典");
+    h.wait_done(&cmd_id);
+    let second_reply = second_reply.or_else(|| second.recv_timeout(Duration::from_secs(5)).ok());
+    let tx = String::from_utf8_lossy(&h.dev.tx_since(first_tx)).into_owned();
+    let command_after_probe = tx
+        .find("i306-slot-command\n")
+        .is_some_and(|command_at| command_at >= probe_tx.len());
+
+    let interactive_rig = ActorRig::new(SHELL_PROFILE).ready();
+    install_executing_shell_target(&interactive_rig);
+    interactive_rig
+        .dev
+        .script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+    let interactive_tx = interactive_rig.dev.tx_len();
+    let active_probe = interactive_rig.request_async(self_test_req());
+    assert!(
+        interactive_rig.dev.wait_paused(Duration::from_secs(2)),
+        "第二個 probe 應停在提交前"
+    );
+    let interactive = interactive_rig.request(open_interactive("agent:interleaver"));
+    let interactive_refused = interactive.get("error_code") == Some(&PyValue::from("SESSION_BUSY"));
+    interactive_rig.dev.release_pause();
+    let _ = read_self_test_probe(&interactive_rig, interactive_tx);
+    let _ = active_probe
+        .recv_timeout(Duration::from_secs(5))
+        .expect("interactive 交錯 probe 應完成")
+        .expect("interactive 交錯 self-test 應回字典");
+
+    let second_is_busy = second_reply
+        .and_then(Result::ok)
+        .is_some_and(|reply| reply["classification"].as_str() == Some("SESSION_BUSY"));
+    assert!(second_is_busy, "第二次 self-test 應被動回覆 busy");
+    assert!(
+        tx_unchanged_before_release,
+        "probe 提交前 UART 不應有額外 TX"
+    );
+    assert!(
+        !command_started_while_probe_paused,
+        "probe 保留前景槽時 command 必須等待"
+    );
+    assert!(
+        command_after_probe,
+        "command bytes 必須排在 probe payload 後"
+    );
+    assert!(
+        interactive_refused,
+        "probe 保留前景槽時 interactive open 必須回 SESSION_BUSY"
+    );
+    assert_eq!(first_reply["probe_ok"], PyValue::Bool(true));
+}
+
+#[test]
+fn echo_only_never_confirms_ready() {
+    for segmented in [false, true] {
+        for with_prompt in [false, true] {
+            let h = ActorRig::new(SHELL_PROFILE).ready();
+            h.dev.clear_replies();
+            let tx_start = h.dev.tx_len();
+            let pending = h.request_async(self_test_req());
+            let (_, nonce) = read_self_test_probe(&h, tx_start);
+            let echo = format!("__READY__{nonce}\r\n");
+            if segmented {
+                let split = echo.find(&nonce).unwrap() + nonce.len() / 2;
+                h.inject_rx(&echo.as_bytes()[..split]);
+                h.inject_rx(&echo.as_bytes()[split..]);
+            } else {
+                h.inject_rx(echo.as_bytes());
+            }
+            if with_prompt {
+                h.inject_rx(b"root@t:/# ");
+            }
+            let reply = receive_self_test_after_deadline(&h, pending);
+            assert_eq!(
+                reply["probe_ok"],
+                PyValue::Bool(false),
+                "segmented={segmented}, with_prompt={with_prompt}: {reply:?}"
+            );
+            let PyValue::Dict(evidence) = &reply["probe_evidence"] else {
+                panic!("probe_evidence 應為字典：{reply:?}");
+            };
+            assert_eq!(evidence["tx_complete"], PyValue::Bool(true));
+            assert_eq!(evidence["execution_marker"], PyValue::Bool(false));
+            assert_eq!(evidence["probe_rc_zero"], PyValue::Bool(false));
+            assert_eq!(evidence["prompt_after_marker"], PyValue::Bool(false));
+        }
+    }
+}
+
+#[test]
+fn execution_marker_requires_following_prompt() {
+    for response in [0, 1, 2, 3] {
+        let h = ActorRig::new(SHELL_PROFILE).ready();
+        h.dev.clear_replies();
+        let tx_start = h.dev.tx_len();
+        let pending = h.request_async(self_test_req());
+        let (_, nonce) = read_self_test_probe(&h, tx_start);
+        let marker = match response {
+            0 => format!("__SW_ST_{nonce}_OK__\r\n"),
+            1 => format!("root@t:/# __SW_ST_{nonce}_OK__\r\n"),
+            2 => "__SW_ST_00000000_OK__\r\nroot@t:/# ".to_string(),
+            _ => format!("__SW_ST_{nonce}_\r\nnoise_OK__\r\nroot@t:/# "),
+        };
+        h.inject_rx(marker.as_bytes());
+        let reply = receive_self_test_after_deadline(&h, pending);
+        assert_eq!(
+            reply["probe_ok"],
+            PyValue::Bool(false),
+            "response={response}: {reply:?}"
+        );
+        let PyValue::Dict(evidence) = &reply["probe_evidence"] else {
+            panic!("probe_evidence 應為字典：{reply:?}");
+        };
+        assert_eq!(evidence["tx_complete"], PyValue::Bool(true));
+        assert_eq!(evidence["execution_marker"], PyValue::Bool(response == 0));
+        assert_eq!(evidence["probe_rc_zero"], PyValue::Bool(response == 0));
+        assert_eq!(evidence["prompt_after_marker"], PyValue::Bool(false));
+    }
+}
+
+#[test]
+fn marker_and_prompt_in_same_chunk_confirm_ready() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    install_executing_shell_target(&h);
+    let tx_start = h.dev.tx_len();
+    let pending = h.request_async(self_test_req());
+    let (tx, nonce) = read_self_test_probe(&h, tx_start);
+    assert!(tx.contains("( echo __READY__"));
+    assert!(
+        !tx.contains(&format!("__SW_ST_{nonce}_OK__")),
+        "完整執行標記不得出現在 TX 回顯中"
+    );
+    let reply = pending
+        .recv_timeout(Duration::from_secs(2))
+        .expect("marker 與 prompt 同 chunk 應完成")
+        .expect("self-test 回應應為字典");
+    assert_eq!(reply["probe_ok"], PyValue::Bool(true), "{reply:?}");
+    assert_eq!(
+        reply["probe_evidence"],
+        PyValue::Dict(pydict! {
+            "tx_complete" => true,
+            "execution_marker" => true,
+            "probe_rc_zero" => true,
+            "prompt_after_marker" => true,
+        })
+    );
+}
+
+#[test]
+fn failed_probe_rc_never_confirms_ready() {
+    let h = ActorRig::new(FAILED_RC_PROFILE).ready();
+    h.dev.clear_replies();
+    h.dev.on_tx_match(
+        r"__READY__[0-9a-f]+",
+        Box::new(|line: &[u8]| {
+            let text = String::from_utf8_lossy(line).into_owned();
+            let token = text
+                .split("__READY__")
+                .nth(1)
+                .unwrap_or("")
+                .chars()
+                .take_while(|c| c.is_ascii_hexdigit())
+                .collect::<String>();
+            assert!(text.contains(&format!(
+                "( echo __READY__{token}; false ) && printf '\\n__SW_ST_%s_OK__\\n' '{token}'"
+            )));
+            format!("__READY__{token}\r\nroot@t:/# ").into_bytes()
+        }),
+    );
+    let tx_start = h.dev.tx_len();
+    let pending = h.request_async(self_test_req());
+    let (tx, nonce) = read_self_test_probe(&h, tx_start);
+    assert!(tx.contains(&format!("__READY__{nonce}; false")));
+    let reply = receive_self_test_after_deadline(&h, pending);
+    assert_eq!(reply["probe_ok"], PyValue::Bool(false), "{reply:?}");
+    assert_eq!(
+        reply["probe_evidence"]["execution_marker"],
+        PyValue::Bool(false)
+    );
+    assert_eq!(
+        reply["probe_evidence"]["probe_rc_zero"],
+        PyValue::Bool(false)
+    );
+}
+
+#[test]
+fn execution_marker_noise_around_complete_line_is_accepted() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.clear_replies();
+    let tx_start = h.dev.tx_len();
+    let pending = h.request_async(self_test_req());
+    let (_, nonce) = read_self_test_probe(&h, tx_start);
+    let output = format!("noise before\r\n__SW_ST_{nonce}_OK__\r\nnoise after\r\nroot@t:/# ");
+    h.inject_rx(output.as_bytes());
+    let reply = pending
+        .recv_timeout(Duration::from_secs(2))
+        .expect("完整 marker 後的 prompt 應完成")
+        .expect("self-test 回應應為字典");
+    assert_eq!(reply["probe_ok"], PyValue::Bool(true), "{reply:?}");
+    assert_eq!(
+        reply["probe_evidence"]["execution_marker"],
+        PyValue::Bool(true)
+    );
+    assert_eq!(
+        reply["probe_evidence"]["prompt_after_marker"],
+        PyValue::Bool(true)
+    );
+}
+
+#[test]
+fn stale_probe_cannot_confirm_new_generation() {
+    let mut boot = CoreHarness::new(SHELL_PROFILE);
+    boot.to_ready();
+    let (boot_reply, boot_effects) = boot.rpc_deferred(self_test_req());
+    let (boot_op, boot_epoch) = self_test_op_id(&boot_effects);
+    boot.rx(b"U-Boot 2026.01\r\n");
+    assert_eq!(
+        boot.public()["ready_reconfirm_pending"],
+        PyValue::Bool(true),
+        "boot banner 應建立新 readiness pending"
+    );
+    boot.feed(ControlEvent::OpFinished {
+        op_id: boot_op,
+        epoch: boot_epoch,
+        outcome: verified_self_test_outcome(),
+        after_rx_seq: None,
+    });
+    let boot_result = boot_reply.try_recv().unwrap().unwrap();
+    assert_eq!(boot_result["probe_ok"], PyValue::Bool(false));
+    assert_ne!(boot_result["classification"], PyValue::from("OK"));
+    assert_eq!(
+        boot.public()["ready_reconfirm_pending"],
+        PyValue::Bool(true)
+    );
+
+    let mut recover = CoreHarness::new(SHELL_PROFILE);
+    recover.to_ready();
+    recover.attach_pty_console("c1", true);
+    let (probe_reply, probe_effects) = recover.rpc_deferred(self_test_req());
+    let (probe_op, epoch) = self_test_op_id(&probe_effects);
+    assert_eq!(recover.core.human_console().ownership.suspend_depth, 1);
+    let (recover_reply, recover_effects) = recover.rpc_deferred(SessionRequest::Recover {
+        timeout_s: 30.0,
+        force: false,
+    });
+    let (recover_op, recover_epoch) = recover_effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp {
+                grant,
+                spec: OpSpec::Recover { .. },
+            } => Some((grant.op_id, grant.epoch)),
+            _ => None,
+        })
+        .expect("Recover 必須仍可介入進行中的 self-test");
+    assert_eq!(recover.core.human_console().ownership.suspend_depth, 1);
+    recover.feed(ControlEvent::OpFinished {
+        op_id: recover_op,
+        epoch: recover_epoch,
+        outcome: OpOutcome::Recovered {
+            key: "ready",
+            stdout: String::new(),
+        },
+        after_rx_seq: None,
+    });
+    assert!(recover_reply.try_recv().is_ok());
+    assert_eq!(
+        recover.core.human_console().ownership.suspend_depth,
+        1,
+        "Recover 自身完成不得代結算 probe suspend"
+    );
+    recover.feed(ControlEvent::OpFinished {
+        op_id: probe_op,
+        epoch,
+        outcome: verified_self_test_outcome(),
+        after_rx_seq: None,
+    });
+    let probe_result = probe_reply.try_recv().unwrap().unwrap();
+    assert_eq!(probe_result["probe_ok"], PyValue::Bool(false));
+    assert_ne!(probe_result["classification"], PyValue::from("OK"));
+    assert_eq!(recover.core.human_console().ownership.suspend_depth, 0);
+
+    let mut reconnect = CoreHarness::new(SHELL_PROFILE);
+    reconnect.to_ready();
+    let (old_reply, old_effects) = reconnect.rpc_deferred(self_test_req());
+    let (old_op, old_epoch) = self_test_op_id(&old_effects);
+    reconnect.feed(ControlEvent::DeviceDetached {
+        by_id: DEVICE_BY_ID.into(),
+        reason: DetachReason::Rebound,
+    });
+    let (drain_epoch, stop_id) = reconnect.pending_stop();
+    reconnect.receipt(drain_epoch, stop_id).feed();
+    reconnect.to_ready();
+    let new_epoch = reconnect.epoch();
+    assert_ne!(new_epoch, old_epoch, "重連必須使用新 connection epoch");
+    reconnect.feed(ControlEvent::LoginFinished {
+        epoch: new_epoch,
+        fsm_gen: reconnect.core.generations().fsm_gen,
+        result: sw_core::login_fsm::LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    reconnect.rx(b"U-Boot 2026.01\r\n");
+    assert_eq!(
+        reconnect.public()["ready_reconfirm_pending"],
+        PyValue::Bool(true)
+    );
+    reconnect.feed(ControlEvent::OpFinished {
+        op_id: old_op,
+        epoch: old_epoch,
+        outcome: verified_self_test_outcome(),
+        after_rx_seq: None,
+    });
+    let old_result = old_reply.try_recv().unwrap().unwrap();
+    assert_eq!(old_result["probe_ok"], PyValue::Bool(false));
+    assert_ne!(old_result["classification"], PyValue::from("OK"));
+    assert_eq!(
+        reconnect.public()["ready_reconfirm_pending"],
+        PyValue::Bool(true),
+        "舊 connection 的晚到結果不得清除新 pending"
+    );
+}
+
+#[test]
+fn self_test_terminal_paths_release_only_own_reservation() {
+    for outcome in [
+        OpOutcome::SelfTest(pydict! {
+            "probe_ok" => false,
+            "probe_evidence" => pydict! {
+                "tx_complete" => true,
+                "execution_marker" => false,
+                "probe_rc_zero" => false,
+                "prompt_after_marker" => false,
+            },
+        }),
+        OpOutcome::SelfTestRefused(sw_core::tx_writer::FenceReject::Quiet),
+        OpOutcome::Error(sw_proto::pycompat::PyErr::value_error(
+            "injected runner error",
+        )),
+    ] {
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.to_ready();
+        let (reply, effects) = h.rpc_deferred(self_test_req());
+        let (op_id, epoch) = self_test_op_id(&effects);
+        assert_eq!(
+            h.fence.with(|fence| fence.self_test_probe_owner),
+            Some(op_id),
+            "StartOp 前應已授權 probe owner"
+        );
+        h.feed(ControlEvent::OpFinished {
+            op_id,
+            epoch,
+            outcome,
+            after_rx_seq: None,
+        });
+        assert!(reply.try_recv().is_ok(), "每個終結路徑都應回覆一次");
+        assert!(reply.try_recv().is_err(), "self-test 不得重覆回覆");
+        assert_eq!(h.fence.with(|fence| fence.self_test_probe_owner), None);
+        let (_next_reply, next_effects) = h.rpc_deferred(self_test_req());
+        assert!(
+            has_self_test_probe(&next_effects),
+            "成功／拒絕／runner error 後都應可開始下一個操作"
+        );
+    }
+
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let (_reply, effects) = h.rpc_deferred(self_test_req());
+    let (op_id, epoch) = self_test_op_id(&effects);
+    let other_owner = OpId(u64::MAX);
+    h.fence
+        .with(|fence| fence.self_test_probe_owner = Some(other_owner));
+    h.feed(ControlEvent::OpFinished {
+        op_id,
+        epoch,
+        outcome: verified_self_test_outcome(),
+        after_rx_seq: None,
+    });
+    assert_eq!(
+        h.fence.with(|fence| fence.self_test_probe_owner),
+        Some(other_owner),
+        "晚到 op 只能釋放自己的 reservation"
     );
 }

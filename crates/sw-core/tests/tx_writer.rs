@@ -8,8 +8,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sw_core::{mailbox::ControlEvent, tx_writer::*, wal::*};
 use sw_core::uart_bridge::{RunCancel, RxShared};
+use sw_core::{mailbox::ControlEvent, tx_writer::*, wal::*};
 use sw_pal::{
     fakes::{clock::FakeClock, serial::*, wal_fs::FakeWalFs},
     *,
@@ -48,7 +48,10 @@ fn wait_gauge(r: &Rig, pred: impl Fn(&TxLedgerGauge) -> bool) -> TxLedgerGauge {
 fn wait_in_flight(r: &Rig, op: u64) {
     let t0 = Instant::now();
     while r.fence.with(|s| s.in_flight.as_ref().map(|f| f.op_id)) != Some(OpId(op)) {
-        assert!(t0.elapsed() < Duration::from_secs(2), "in_flight 未出現於 op {op}");
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "in_flight 未出現於 op {op}"
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
 }
@@ -65,7 +68,10 @@ fn rig() -> Rig {
     let (_r, w, waker, _c) = h.split();
     let wfs = FakeWalFs::new();
     let wal = Arc::new(WalWriter::open(
-        WalConfig { dir: "/w".into(), rotate_bytes: 1 << 26 },
+        WalConfig {
+            dir: "/w".into(),
+            rotate_bytes: 1 << 26,
+        },
         wfs.clone(),
         FakeClock::at(1, 1),
     ));
@@ -82,9 +88,26 @@ fn rig() -> Rig {
             }
         });
     }
-    let (h, stop, j) =
-        spawn_tx_writer("COM0".into(), w, cancel.clone(), fence.clone(), wal.clone(), 7, ctl_tx);
-    Rig { fence, wal, dev, h, wfs, cancel, stop: Some(stop), join: Some(j), ctl }
+    let (h, stop, j) = spawn_tx_writer(
+        "COM0".into(),
+        w,
+        cancel.clone(),
+        fence.clone(),
+        wal.clone(),
+        7,
+        ctl_tx,
+    );
+    Rig {
+        fence,
+        wal,
+        dev,
+        h,
+        wfs,
+        cancel,
+        stop: Some(stop),
+        join: Some(j),
+        ctl,
+    }
 }
 
 /// 建立一筆 TX job 與其回覆 receiver（epoch 固定 7、cmd_id 固定 "c"、source "agent:x"）。
@@ -196,6 +219,74 @@ fn shutdown_permit(op: u64, class: TxClass) -> TxPermit {
 }
 
 #[test]
+fn self_test_probe_requires_current_reservation() {
+    fn assert_rejected_before_submit(
+        mutate: impl FnOnce(&Fence),
+        expected: FenceReject,
+        label: &str,
+    ) {
+        let r = rig();
+        r.fence
+            .with(|state| state.self_test_probe_owner = Some(OpId(81)));
+        r.dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+        let pending = send_async(&r, TxClass::SelfTestProbe, 81, 0, b"probe\n");
+        assert!(
+            r.dev.wait_paused(Duration::from_secs(2)),
+            "{label} 應停在提交前"
+        );
+        mutate(&r.fence);
+        r.dev.release_pause();
+        let report = pending.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(report.reject, Some(expected), "{label}");
+        assert_eq!(r.dev.os_submits(), 0, "{label} 不得提交到 OS");
+        assert!(tx_lens(&r).is_empty(), "{label} 不得寫 WAL TX");
+    }
+
+    for (owner, op) in [(None, 81), (Some(OpId(82)), 81)] {
+        let r = rig();
+        r.fence.with(|state| state.self_test_probe_owner = owner);
+        let report = send(&r, TxClass::SelfTestProbe, op, 7, b"probe\n");
+        assert_eq!(report.reject, Some(FenceReject::OwnerMismatch));
+        assert_eq!(r.dev.os_submits(), 0, "無授權或錯 op 不得提交到 OS");
+        assert!(tx_lens(&r).is_empty(), "無授權或錯 op 不得寫 WAL TX");
+    }
+
+    assert_rejected_before_submit(
+        |fence| fence.with(|state| state.self_test_probe_owner = None),
+        FenceReject::OwnerMismatch,
+        "撤銷中的 probe owner",
+    );
+    assert_rejected_before_submit(
+        |fence| fence.with(|state| state.quiet_active = true),
+        FenceReject::Quiet,
+        "提交前 quiet 介入",
+    );
+    assert_rejected_before_submit(
+        |fence| {
+            fence.with(|state| {
+                state.frozen = true;
+                state.active_epoch = None;
+            });
+        },
+        FenceReject::Frozen,
+        "提交前 Shutdown 凍結",
+    );
+
+    let r = rig();
+    r.fence
+        .with(|state| state.self_test_probe_owner = Some(OpId(81)));
+    r.dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+    let pending = send_async(&r, TxClass::SelfTestProbe, 81, 0, b"probe\n");
+    assert!(r.dev.wait_paused(Duration::from_secs(2)));
+    r.dev.release_pause();
+    let report = pending.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(report.reject, None, "正確 owner 不得被自身前景槽擋住");
+    assert_eq!(report.result.outcome, TxOutcome::Completed(6));
+    assert_eq!(r.dev.os_submits(), 1);
+    assert_eq!(tx_lens(&r).len(), 1);
+}
+
+#[test]
 fn shutdown_freeze_without_line_freezes_immediately() {
     let fence = Fence::new();
 
@@ -211,7 +302,10 @@ fn shutdown_freeze_with_open_line_defers_and_wakes_holder() {
     let settle = RunCancel::new(&rx);
 
     assert!(fence.open_transfer_line(OpId(11), settle.clone()));
-    assert_eq!(fence.freeze_for_shutdown_settling(), ShutdownFreeze::PendingLine);
+    assert_eq!(
+        fence.freeze_for_shutdown_settling(),
+        ShutdownFreeze::PendingLine
+    );
     fence.with(|state| {
         assert!(!state.frozen);
         assert!(state.shutdown_freeze_pending);
@@ -227,10 +321,16 @@ fn pending_admits_only_line_holder() {
     fence.with(|state| state.active_epoch = Some(7));
     let rx = RxShared::new(1024, 0);
     assert!(fence.open_transfer_line(OpId(11), RunCancel::new(&rx)));
-    assert_eq!(fence.freeze_for_shutdown_settling(), ShutdownFreeze::PendingLine);
+    assert_eq!(
+        fence.freeze_for_shutdown_settling(),
+        ShutdownFreeze::PendingLine
+    );
 
     fence.with(|state| {
-        assert_eq!(Fence::admit(state, &shutdown_permit(11, TxClass::FileTransfer)), Ok(()));
+        assert_eq!(
+            Fence::admit(state, &shutdown_permit(11, TxClass::FileTransfer)),
+            Ok(())
+        );
         for (op, class) in [
             (12, TxClass::FileTransfer),
             (13, TxClass::Command),
@@ -253,7 +353,10 @@ fn close_line_while_pending_freezes_atomically() {
     let fence = Fence::new();
     let rx = RxShared::new(1024, 0);
     assert!(fence.open_transfer_line(OpId(11), RunCancel::new(&rx)));
-    assert_eq!(fence.freeze_for_shutdown_settling(), ShutdownFreeze::PendingLine);
+    assert_eq!(
+        fence.freeze_for_shutdown_settling(),
+        ShutdownFreeze::PendingLine
+    );
 
     fence.close_transfer_line(OpId(99));
     fence.with(|state| {
@@ -275,7 +378,10 @@ fn force_shutdown_freeze_clears_pending() {
     let fence = Fence::new();
     let rx = RxShared::new(1024, 0);
     assert!(fence.open_transfer_line(OpId(11), RunCancel::new(&rx)));
-    assert_eq!(fence.freeze_for_shutdown_settling(), ShutdownFreeze::PendingLine);
+    assert_eq!(
+        fence.freeze_for_shutdown_settling(),
+        ShutdownFreeze::PendingLine
+    );
 
     fence.force_shutdown_freeze();
     fence.with(|state| {
@@ -301,7 +407,10 @@ fn open_line_refused_when_frozen_or_pending() {
 
     let pending = Fence::new();
     assert!(pending.open_transfer_line(OpId(13), settle.clone()));
-    assert_eq!(pending.freeze_for_shutdown_settling(), ShutdownFreeze::PendingLine);
+    assert_eq!(
+        pending.freeze_for_shutdown_settling(),
+        ShutdownFreeze::PendingLine
+    );
     assert!(!pending.open_transfer_line(OpId(14), settle));
     pending.with(|state| assert_eq!(state.transfer_line, Some(OpId(13))));
 }
@@ -328,7 +437,11 @@ fn b64(bytes: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         for i in 0..4 {
             if i <= chunk.len() {
@@ -401,7 +514,10 @@ const PROBE_CLASSES: &[TxClass] = &[
 fn stale_epoch_is_not_submitted_and_never_calls_os_write() {
     let r = rig();
     let rep = send(&r, TxClass::Command, 1, 6, b"ls\n");
-    assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::NotSubmitted, Some(FenceReject::StaleEpoch)));
+    assert_eq!(
+        (rep.result.outcome, rep.reject),
+        (TxOutcome::NotSubmitted, Some(FenceReject::StaleEpoch))
+    );
     assert_eq!(r.dev.write_calls(), 0);
     assert!(tx_lens(&r).is_empty());
 }
@@ -409,7 +525,10 @@ fn stale_epoch_is_not_submitted_and_never_calls_os_write() {
 #[test]
 fn partial_write_records_only_confirmed_prefix() {
     let r = rig();
-    r.dev.script_write(vec![FakeWriteStep::AcceptThenError(3, PalError::io(5, "[Errno 5] Input/output error"))]);
+    r.dev.script_write(vec![FakeWriteStep::AcceptThenError(
+        3,
+        PalError::io(5, "[Errno 5] Input/output error"),
+    )]);
     let rep = send(&r, TxClass::Command, 1, 7, b"0123456789");
     assert_eq!(rep.result.outcome, TxOutcome::Completed(3));
     let lines = tx_lens(&r);
@@ -420,7 +539,9 @@ fn partial_write_records_only_confirmed_prefix() {
 #[test]
 fn freeze_during_in_flight_counts_as_committed_and_next_is_rejected() {
     let r = rig();
-    r.dev.script_write(vec![FakeWriteStep::BlockUntilCancel { accept_before_cancel: 2 }]);
+    r.dev.script_write(vec![FakeWriteStep::BlockUntilCancel {
+        accept_before_cancel: 2,
+    }]);
     let (j, rx) = job(1, TxClass::Command, 0, 0, true, b"abcdef");
     r.h.jobs.send(j).unwrap();
     wait_in_flight(&r, 1);
@@ -449,7 +570,10 @@ fn authorized_then_quiet_before_os_submit_is_zero_tx() {
     r.fence.with(|s| s.quiet_active = true); // 不得阻塞：writer 此時不持鎖
     r.dev.release_pause();
     let rep = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::NotSubmitted, Some(FenceReject::Quiet)));
+    assert_eq!(
+        (rep.result.outcome, rep.reject),
+        (TxOutcome::NotSubmitted, Some(FenceReject::Quiet))
+    );
     assert!(rep.result.error.is_none());
     assert_eq!(r.dev.os_submits(), 0);
     assert!(r.dev.take_tx().is_empty());
@@ -469,7 +593,10 @@ fn authorized_then_drain_freeze_before_os_submit_is_zero_tx() {
     }); // Phase 1（換手／release）
     r.dev.release_pause();
     let rep = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::NotSubmitted, Some(FenceReject::Frozen)));
+    assert_eq!(
+        (rep.result.outcome, rep.reject),
+        (TxOutcome::NotSubmitted, Some(FenceReject::Frozen))
+    );
     assert_eq!(r.dev.os_submits(), 0);
     assert!(r.dev.take_tx().is_empty() && tx_lens(&r).is_empty());
 }
@@ -485,7 +612,10 @@ fn authorized_then_lease_owner_gen_bump_before_os_submit_is_zero_tx() {
     r.fence.with(|s| s.owner_gen = 4); // lease close／expiry／換手
     r.dev.release_pause();
     let rep = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::NotSubmitted, Some(FenceReject::OwnerMismatch)));
+    assert_eq!(
+        (rep.result.outcome, rep.reject),
+        (TxOutcome::NotSubmitted, Some(FenceReject::OwnerMismatch))
+    );
     assert_eq!(r.dev.os_submits(), 0);
     assert!(r.dev.take_tx().is_empty() && tx_lens(&r).is_empty());
 }
@@ -502,24 +632,37 @@ fn quiet_during_os_submit_waits_for_submit_and_counts_committed() {
         f.with(|s| s.quiet_active = true);
         done_tx.send(()).unwrap();
     });
-    assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err(), "失效操作必須等到 OS 提交返回");
-    assert!(r.dev.take_tx().is_empty(), "暫停點在提交之前，bytes 尚未交 OS");
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "失效操作必須等到 OS 提交返回"
+    );
+    assert!(
+        r.dev.take_tx().is_empty(),
+        "暫停點在提交之前，bytes 尚未交 OS"
+    );
     r.dev.release_pause();
     inv.join().unwrap();
     assert!(done_rx.recv_timeout(Duration::from_secs(1)).is_ok());
     let rep = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::Completed(3), None));
+    assert_eq!(
+        (rep.result.outcome, rep.reject),
+        (TxOutcome::Completed(3), None)
+    );
     assert_eq!(r.dev.take_tx(), b"abc".to_vec());
     assert_eq!(tx_lens(&r).len(), 1);
     let rep2 = send(&r, TxClass::Command, 2, 7, b"x");
-    assert_eq!((rep2.result.outcome, rep2.reject), (TxOutcome::NotSubmitted, Some(FenceReject::Quiet)));
+    assert_eq!(
+        (rep2.result.outcome, rep2.reject),
+        (TxOutcome::NotSubmitted, Some(FenceReject::Quiet))
+    );
     assert_eq!(r.dev.os_submits(), 1);
 }
 
 #[test]
 fn quiet_between_partial_submits_stops_tail() {
     let r = rig();
-    r.dev.script_write(vec![FakeWriteStep::AcceptThenWouldBlock(2)]);
+    r.dev
+        .script_write(vec![FakeWriteStep::AcceptThenWouldBlock(2)]);
     let rx = send_async(&r, TxClass::Command, 1, 0, b"abcdef");
     assert!(r.dev.wait_paused(Duration::from_secs(2))); // 已提交 "ab"，於 gate 外等 POLLOUT
     r.fence.with(|s| {
@@ -528,8 +671,14 @@ fn quiet_between_partial_submits_stops_tail() {
     }); // 不得阻塞
     r.dev.release_pause();
     let rep = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::Completed(2), Some(FenceReject::Quiet)));
-    assert_eq!(rep.result.error.as_ref().unwrap().kind, PalErrorKind::Cancelled);
+    assert_eq!(
+        (rep.result.outcome, rep.reject),
+        (TxOutcome::Completed(2), Some(FenceReject::Quiet))
+    );
+    assert_eq!(
+        rep.result.error.as_ref().unwrap().kind,
+        PalErrorKind::Cancelled
+    );
     assert_eq!(r.dev.take_tx(), b"ab".to_vec()); // 尾段 "cdef" 永不交 OS
     assert_eq!(r.dev.os_submits(), 1);
     let lines = tx_lens(&r);
@@ -548,11 +697,18 @@ fn os_submit_always_inside_fence_critical_section() {
             u2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }));
-    r.dev.script_write(vec![FakeWriteStep::AcceptThenWouldBlock(1)]);
+    r.dev
+        .script_write(vec![FakeWriteStep::AcceptThenWouldBlock(1)]);
     let rx = send_async(&r, TxClass::Command, 1, 0, b"xyz");
     assert!(r.dev.wait_paused(Duration::from_secs(2)));
     r.dev.release_pause();
-    assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap().result.outcome, TxOutcome::Completed(3));
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .result
+            .outcome,
+        TxOutcome::Completed(3)
+    );
     for i in 0..20u64 {
         send(&r, TxClass::Command, 10 + i, 7, b"q");
     }
@@ -574,20 +730,43 @@ fn ledger_retires_completed_ops_without_reconnect() {
     let mut r = rig();
     for i in 0..600u64 {
         // 超過 CMD_HISTORY_MAX(512)：history 淘汰後帳本也不得殘留
-        assert_eq!(send(&r, TxClass::Command, 1000 + i, 7, b"ok\n").result.outcome, TxOutcome::Completed(3));
+        assert_eq!(
+            send(&r, TxClass::Command, 1000 + i, 7, b"ok\n")
+                .result
+                .outcome,
+            TxOutcome::Completed(3)
+        );
         assert!(r.h.settle(OpId(1000 + i))); // 等同 actor 終態處理點的 Effect::SettleTx
     }
     let g = wait_gauge(&r, |g| g.settled_total == 600);
     assert_eq!(
-        (g.live_ops, g.unresolved_gaps, g.gaps_overflow, g.settle_dropped, g.saturated),
+        (
+            g.live_ops,
+            g.unresolved_gaps,
+            g.gaps_overflow,
+            g.settle_dropped,
+            g.saturated
+        ),
         (0, 0, 0, 0, false)
     );
-    assert_eq!(send(&r, TxClass::Command, 5000, 7, b"tail").result.outcome, TxOutcome::Completed(4)); // 未結算 op
+    assert_eq!(
+        send(&r, TxClass::Command, 5000, 7, b"tail").result.outcome,
+        TxOutcome::Completed(4)
+    ); // 未結算 op
     wait_gauge(&r, |g| g.live_ops == 1);
     r.stop.as_ref().unwrap().send();
     let (_w, ledger) = r.join.take().unwrap().join().unwrap();
-    assert_eq!(ledger.ops.keys().copied().collect::<Vec<_>>(), vec![OpId(5000)]); // 只剩未結算者
-    assert_eq!((ledger.ops[&OpId(5000)].confirmed_bytes, ledger.settled_total), (4, 600));
+    assert_eq!(
+        ledger.ops.keys().copied().collect::<Vec<_>>(),
+        vec![OpId(5000)]
+    ); // 只剩未結算者
+    assert_eq!(
+        (
+            ledger.ops[&OpId(5000)].confirmed_bytes,
+            ledger.settled_total
+        ),
+        (4, 600)
+    );
     assert!(ledger.unresolved_gaps.is_empty() && ledger.gaps_overflow == GapOverflow::default());
     assert_eq!(tx_lens(&r).len(), 601); // 結算只動記憶體帳本，不動 WAL 證據
 }
@@ -597,8 +776,13 @@ fn ledger_retire_racing_drain_preserves_bc03() {
     // 結算與 drain 競速時，在途 op 的 BC-03 證據不得被淘汰
     for settle_after_stop in [false, true] {
         let mut r = rig();
-        assert_eq!(send(&r, TxClass::Command, 1, 7, b"done\n").result.outcome, TxOutcome::Completed(5)); // 已終態的舊命令
-        r.dev.script_write(vec![FakeWriteStep::BlockUntilCancel { accept_before_cancel: 2 }]);
+        assert_eq!(
+            send(&r, TxClass::Command, 1, 7, b"done\n").result.outcome,
+            TxOutcome::Completed(5)
+        ); // 已終態的舊命令
+        r.dev.script_write(vec![FakeWriteStep::BlockUntilCancel {
+            accept_before_cancel: 2,
+        }]);
         let rx2 = send_async(&r, TxClass::Command, 2, 0, b"abcdef"); // 前景在途＝aborted_op
         wait_in_flight(&r, 2);
         if !settle_after_stop {
@@ -613,12 +797,22 @@ fn ledger_retire_racing_drain_preserves_bc03() {
             let _ = r.h.settle(OpId(1)); // 可能被 stop 後的 settle 收尾套用，也可能 Disconnected
         }
         r.cancel.cancel();
-        assert_eq!(rx2.recv_timeout(Duration::from_secs(2)).unwrap().result.outcome, TxOutcome::Completed(2));
+        assert_eq!(
+            rx2.recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .result
+                .outcome,
+            TxOutcome::Completed(2)
+        );
         let (queued_job, queued_reply) = job(3, TxClass::Command, 0, 0, true, b"zz"); // stop 後才到：不得寫 OS
         let queued_sent = r.h.jobs.send(queued_job).is_ok();
         let (_w, ledger) = r.join.take().unwrap().join().unwrap();
         let op2 = &ledger.ops[&OpId(2)]; // aborted_op 永不被結算，帳本必有其證據
-        assert_eq!((op2.confirmed_bytes, op2.unknown), (2, false), "settle_after_stop={settle_after_stop}");
+        assert_eq!(
+            (op2.confirmed_bytes, op2.unknown),
+            (2, false),
+            "settle_after_stop={settle_after_stop}"
+        );
         if !settle_after_stop {
             assert!(!ledger.ops.contains_key(&OpId(1))); // stop 前已排隊的 settle 必在交帳前套用
         }
@@ -653,38 +847,76 @@ fn gate_row(
     setup: fn(&mut FenceState),
     expect: Result<(), FenceReject>,
 ) -> GateRow {
-    GateRow { name, classes, setup, permit_owner_gen: 0, permit_fsm_gen: 0, expect }
+    GateRow {
+        name,
+        classes,
+        setup,
+        permit_owner_gen: 0,
+        permit_fsm_gen: 0,
+        expect,
+    }
 }
 
 #[test]
 fn gate_rules() {
     // 每列以 `Fence::admit(&state, &permit)` 斷言；狀態預設 active_epoch=Some(7)、其餘欄位為初始值。
     let rows: Vec<GateRow> = vec![
-        gate_row("Command+quiet", &[TxClass::Command], |s| s.quiet_active = true, Err(FenceReject::Quiet)),
+        gate_row(
+            "Command+quiet",
+            &[TxClass::Command],
+            |s| s.quiet_active = true,
+            Err(FenceReject::Quiet),
+        ),
         gate_row(
             "Command+reconfirm",
             &[TxClass::Command],
             |s| s.reconfirm_pending = true,
             Err(FenceReject::ReconfirmPending),
         ),
-        gate_row("FileTransfer+quiet", &[TxClass::FileTransfer], |s| s.quiet_active = true, Err(FenceReject::Quiet)),
-        gate_row("probe 類+quiet", PROBE_CLASSES, |s| s.quiet_active = true, Err(FenceReject::Quiet)),
-        gate_row("probe 類+wal_unhealthy", PROBE_CLASSES, |s| s.wal_unhealthy = true, Err(FenceReject::WalUnhealthy)),
+        gate_row(
+            "FileTransfer+quiet",
+            &[TxClass::FileTransfer],
+            |s| s.quiet_active = true,
+            Err(FenceReject::Quiet),
+        ),
+        gate_row(
+            "probe 類+quiet",
+            PROBE_CLASSES,
+            |s| s.quiet_active = true,
+            Err(FenceReject::Quiet),
+        ),
+        gate_row(
+            "probe 類+wal_unhealthy",
+            PROBE_CLASSES,
+            |s| s.wal_unhealthy = true,
+            Err(FenceReject::WalUnhealthy),
+        ),
         gate_row(
             "SelfTestProbe+reconfirm（quiet=false）",
             &[TxClass::SelfTestProbe],
-            |s| s.reconfirm_pending = true,
+            |s| {
+                s.reconfirm_pending = true;
+                s.self_test_probe_owner = Some(OpId(1));
+            },
             Ok(()),
         ),
         GateRow {
             name: "SelfTestProbe+fsm 不一致（quiet=false）",
             classes: &[TxClass::SelfTestProbe],
-            setup: |s| s.fsm_gen = 2,
+            setup: |s| {
+                s.fsm_gen = 2;
+                s.self_test_probe_owner = Some(OpId(1));
+            },
             permit_owner_gen: 0,
             permit_fsm_gen: 1,
-            expect: Ok(()),
+            expect: Err(FenceReject::FsmMismatch),
         },
-        gate_row("Command+wal_unhealthy", &[TxClass::Command], |s| s.wal_unhealthy = true, Ok(())),
+        gate_row(
+            "Command+wal_unhealthy",
+            &[TxClass::Command],
+            |s| s.wal_unhealthy = true,
+            Ok(()),
+        ),
         gate_row(
             "LeaseOwner／InteractiveOpenCmd+quiet",
             &[TxClass::LeaseOwner, TxClass::InteractiveOpenCmd],
@@ -704,14 +936,44 @@ fn gate_rules() {
             |s| s.reconfirm_pending = true,
             Ok(()),
         ),
-        gate_row("非 Flash class+Flashing", NON_FLASH_CLASSES, |s| s.flash_mode = FlashMode::Flashing, Err(FenceReject::Flash)),
-        gate_row("Flash+Off", &[TxClass::Flash], |s| s.flash_mode = FlashMode::Off, Err(FenceReject::Flash)),
-        gate_row("任一+frozen", ALL_CLASSES, |s| s.frozen = true, Err(FenceReject::Frozen)),
-        gate_row("任一+epoch 不符", ALL_CLASSES, |s| s.active_epoch = Some(6), Err(FenceReject::StaleEpoch)),
-        gate_row("任一+active_epoch=None", ALL_CLASSES, |s| s.active_epoch = None, Err(FenceReject::StaleEpoch)),
-        gate_row("任一+op 已取消", ALL_CLASSES, |s| {
-            s.cancelled.insert(OpId(1));
-        }, Err(FenceReject::Cancelled)),
+        gate_row(
+            "非 Flash class+Flashing",
+            NON_FLASH_CLASSES,
+            |s| s.flash_mode = FlashMode::Flashing,
+            Err(FenceReject::Flash),
+        ),
+        gate_row(
+            "Flash+Off",
+            &[TxClass::Flash],
+            |s| s.flash_mode = FlashMode::Off,
+            Err(FenceReject::Flash),
+        ),
+        gate_row(
+            "任一+frozen",
+            ALL_CLASSES,
+            |s| s.frozen = true,
+            Err(FenceReject::Frozen),
+        ),
+        gate_row(
+            "任一+epoch 不符",
+            ALL_CLASSES,
+            |s| s.active_epoch = Some(6),
+            Err(FenceReject::StaleEpoch),
+        ),
+        gate_row(
+            "任一+active_epoch=None",
+            ALL_CLASSES,
+            |s| s.active_epoch = None,
+            Err(FenceReject::StaleEpoch),
+        ),
+        gate_row(
+            "任一+op 已取消",
+            ALL_CLASSES,
+            |s| {
+                s.cancelled.insert(OpId(1));
+            },
+            Err(FenceReject::Cancelled),
+        ),
     ];
     for row in rows {
         for &class in row.classes {
@@ -1207,26 +1469,47 @@ fn wp53_passthrough_tx_writer_submits_command_after_reboot_arm() {
     let (j, rx) = job(5, TxClass::Command, 0, 0, true, b"reset\n");
     r.h.jobs.send(j).unwrap();
     let rep = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::Completed(6), None));
+    assert_eq!(
+        (rep.result.outcome, rep.reject),
+        (TxOutcome::Completed(6), None)
+    );
     assert_eq!(r.dev.take_tx(), b"reset\n");
     r.fence.with(|s| {
         assert!(s.quiet_active, "passthrough reboot 提交後仍武裝 quiet");
-        assert!(s.reconfirm_pending, "passthrough reboot 提交後仍武裝 reconfirm");
+        assert!(
+            s.reconfirm_pending,
+            "passthrough reboot 提交後仍武裝 reconfirm"
+        );
         assert_eq!(s.reboot_arm_op, None);
     });
 
     let (j, rx) = job(6, TxClass::Command, 0, 0, true, b"printenv\n");
     r.h.jobs.send(j).unwrap();
     let rep = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::Completed(9), None));
+    assert_eq!(
+        (rep.result.outcome, rep.reject),
+        (TxOutcome::Completed(9), None)
+    );
     assert_eq!(r.dev.take_tx(), b"printenv\n");
     let lines = tx_lens(&r);
     assert_eq!(lines.len(), 2, "{lines:?}");
     assert_eq!(payload_b64(&lines[1]), b64(b"printenv\n"));
 
     let cases: [(u64, &str, TxClass, bool, FenceReject); 2] = [
-        (7, "passthrough FileTransfer", TxClass::FileTransfer, true, FenceReject::Quiet),
-        (8, "shell Command", TxClass::Command, false, FenceReject::Quiet),
+        (
+            7,
+            "passthrough FileTransfer",
+            TxClass::FileTransfer,
+            true,
+            FenceReject::Quiet,
+        ),
+        (
+            8,
+            "shell Command",
+            TxClass::Command,
+            false,
+            FenceReject::Quiet,
+        ),
     ];
     for (op, name, class, passthrough, reason) in cases {
         r.fence.with(|s| {
@@ -1257,7 +1540,10 @@ fn wp53_passthrough_tx_writer_submits_command_after_reboot_arm() {
 fn unknown_outcome_records_no_tx_and_reports_unknown() {
     let r = rig();
     let e = PalError::io(5, "[Errno 5] Input/output error");
-    r.dev.script_write(vec![FakeWriteStep::Unknown { confirmed: 0, error: e }]);
+    r.dev.script_write(vec![FakeWriteStep::Unknown {
+        confirmed: 0,
+        error: e,
+    }]);
     let rep = send(&r, TxClass::Command, 1, 7, b"abc");
     assert_eq!(rep.result.outcome, TxOutcome::Unknown { confirmed: 0 });
     assert!(rep.wal.is_none());
@@ -1269,8 +1555,14 @@ fn unknown_with_log_writes_tx_outcome_unknown_meta() {
     let r = rig();
     let error = PalError::io(5, "[Errno 5] Input/output error");
     r.dev.script_write(vec![
-        FakeWriteStep::Unknown { confirmed: 0, error: error.clone() },
-        FakeWriteStep::Unknown { confirmed: 2, error },
+        FakeWriteStep::Unknown {
+            confirmed: 0,
+            error: error.clone(),
+        },
+        FakeWriteStep::Unknown {
+            confirmed: 2,
+            error,
+        },
     ]);
 
     let zero = send(&r, TxClass::Command, 1, 7, b"abc");
@@ -1278,10 +1570,21 @@ fn unknown_with_log_writes_tx_outcome_unknown_meta() {
     assert!(zero.wal.is_none());
     let partial = send(&r, TxClass::Command, 2, 7, b"abcde");
     assert_eq!(partial.result.outcome, TxOutcome::Unknown { confirmed: 2 });
-    assert!(matches!(partial.wal, Some(WalAppend { ok: true, loss_flag: false, .. })));
+    assert!(matches!(
+        partial.wal,
+        Some(WalAppend {
+            ok: true,
+            loss_flag: false,
+            ..
+        })
+    ));
 
     let metas = meta_lens(&r);
-    assert_eq!(metas.len(), 2, "Unknown 的零確認與部分確認都要有 META：{metas:?}");
+    assert_eq!(
+        metas.len(),
+        2,
+        "Unknown 的零確認與部分確認都要有 META：{metas:?}"
+    );
     assert!(metas[0].contains("\"event\":\"tx_outcome_unknown\""));
     assert!(metas[0].contains("\"payload_b64\":\"\""));
     assert!(metas[0].contains("\"cmd_id\":\"c\""));
@@ -1370,7 +1673,10 @@ fn unknown_with_log_false_writes_no_meta() {
     let (j, rx) = job(1, TxClass::Command, 0, 0, false, b"secret");
     r.h.jobs.send(j).unwrap();
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(2)).unwrap().result.outcome,
+        rx.recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .result
+            .outcome,
         TxOutcome::Unknown { confirmed: 2 }
     );
     assert!(tx_lens(&r).is_empty());
@@ -1416,7 +1722,10 @@ fn flash_probe_does_not_reuse_op_id_as_probe_identity() {
         replay_hold: None,
         probe_id: None,
     };
-    assert_eq!(fence.with(|state| Fence::admit(state, &permit)), Err(FenceReject::Flash));
+    assert_eq!(
+        fence.with(|state| Fence::admit(state, &permit)),
+        Err(FenceReject::Flash)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1454,14 +1763,27 @@ fn send_flash(r: &Rig, op: u64, class: TxClass, probe_id: Option<u64>, payload: 
     let (tx, rx) = crossbeam_channel::bounded(1);
     let mut permit = flash_permit(class, probe_id);
     permit.op_id = OpId(op);
-    r.h.jobs.send(TxJob { permit, payload: payload.to_vec(), reply: tx, aggregate: None }).unwrap();
+    r.h.jobs
+        .send(TxJob {
+            permit,
+            payload: payload.to_vec(),
+            reply: tx,
+            aggregate: None,
+        })
+        .unwrap();
     rx.recv_timeout(Duration::from_secs(2)).unwrap()
 }
 
 #[test]
 fn probe_permit_with_matching_id_admitted_in_probe_mode() {
     // 表列 1：Probe(id)＋FlashProbe＋probe_id == Some(id) → Ok。
-    assert_eq!(admit_with(FlashMode::Probe(5), &flash_permit(TxClass::FlashProbe, Some(5))), Ok(()));
+    assert_eq!(
+        admit_with(
+            FlashMode::Probe(5),
+            &flash_permit(TxClass::FlashProbe, Some(5))
+        ),
+        Ok(())
+    );
     // 黑箱：真 TxWriter 送出、DUT 收到 bytes、WAL 記 TX source "flash"。
     let r = rig();
     r.fence.with(|s| s.flash_mode = FlashMode::Probe(5));
@@ -1477,8 +1799,20 @@ fn probe_permit_with_matching_id_admitted_in_probe_mode() {
 #[test]
 fn stale_probe_id_rejected() {
     // 表列 2：Probe(id)＋FlashProbe 但 probe_id 為 None 或不等於 id（上一個 probe 的 stale permit）→ Err(Flash)。
-    assert_eq!(admit_with(FlashMode::Probe(5), &flash_permit(TxClass::FlashProbe, Some(4))), Err(FenceReject::Flash));
-    assert_eq!(admit_with(FlashMode::Probe(5), &flash_permit(TxClass::FlashProbe, None)), Err(FenceReject::Flash));
+    assert_eq!(
+        admit_with(
+            FlashMode::Probe(5),
+            &flash_permit(TxClass::FlashProbe, Some(4))
+        ),
+        Err(FenceReject::Flash)
+    );
+    assert_eq!(
+        admit_with(
+            FlashMode::Probe(5),
+            &flash_permit(TxClass::FlashProbe, None)
+        ),
+        Err(FenceReject::Flash)
+    );
     // op_id 與 probe_id 數值相同也不得代替 probe 身分。
     let mut p = flash_permit(TxClass::FlashProbe, None);
     p.op_id = OpId(5);
@@ -1516,7 +1850,10 @@ fn flash_class_rejected_in_probe() {
 #[test]
 fn flash_admitted_when_flashing() {
     // 表列 4：Flashing＋Flash → Ok（P5 既有）。
-    assert_eq!(admit_with(FlashMode::Flashing, &flash_permit(TxClass::Flash, None)), Ok(()));
+    assert_eq!(
+        admit_with(FlashMode::Flashing, &flash_permit(TxClass::Flash, None)),
+        Ok(())
+    );
     let r = rig();
     r.fence.with(|s| s.flash_mode = FlashMode::Flashing);
     let rep = send_flash(&r, 1, TxClass::Flash, None, b"\x01\x02\x03");
@@ -1529,7 +1866,10 @@ fn flashprobe_rejected_when_flashing() {
     // 表列 5：Flashing＋非 Flash（含 FlashProbe，即使帶 probe_id）→ Err(Flash)。
     for probe_id in [None, Some(5)] {
         assert_eq!(
-            admit_with(FlashMode::Flashing, &flash_permit(TxClass::FlashProbe, probe_id)),
+            admit_with(
+                FlashMode::Flashing,
+                &flash_permit(TxClass::FlashProbe, probe_id)
+            ),
             Err(FenceReject::Flash),
             "probe_id={probe_id:?}"
         );
@@ -1576,7 +1916,12 @@ fn log_false_secret_not_in_wal() {
 fn wal_order_equals_write_order() {
     let mut r = rig();
     for i in 0..50u8 {
-        assert_eq!(send(&r, TxClass::Command, 1 + u64::from(i), 7, &[i]).result.outcome, TxOutcome::Completed(1));
+        assert_eq!(
+            send(&r, TxClass::Command, 1 + u64::from(i), 7, &[i])
+                .result
+                .outcome,
+            TxOutcome::Completed(1)
+        );
     }
     let want_bytes: Vec<u8> = (0..50u8).collect();
     assert_eq!(r.dev.take_tx(), want_bytes);
@@ -1605,7 +1950,10 @@ fn job_queue_bounded_64() {
     r.h.jobs.try_send(j0).unwrap();
     let t0 = Instant::now();
     while r.dev.write_calls() == 0 {
-        assert!(t0.elapsed() < Duration::from_secs(2), "writer 未取出在途 job");
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "writer 未取出在途 job"
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
     for op in 2..=65u64 {
@@ -1613,7 +1961,10 @@ fn job_queue_bounded_64() {
         r.h.jobs.try_send(j).unwrap();
     }
     let (j, _rx) = job(66, TxClass::Command, 0, 0, true, b"c");
-    assert!(matches!(r.h.jobs.try_send(j), Err(crossbeam_channel::TrySendError::Full(_))));
+    assert!(matches!(
+        r.h.jobs.try_send(j),
+        Err(crossbeam_channel::TrySendError::Full(_))
+    ));
     r.dev.release_block(); // 收尾：解除 D-state 模擬
     r.cancel.cancel();
 }
@@ -1654,7 +2005,9 @@ fn send_after_writer_join_is_disconnected() {
 #[test]
 fn queued_jobs_after_stop_are_not_submitted_in_ledger() {
     let mut r = rig();
-    r.dev.script_write(vec![FakeWriteStep::BlockUntilCancel { accept_before_cancel: 2 }]);
+    r.dev.script_write(vec![FakeWriteStep::BlockUntilCancel {
+        accept_before_cancel: 2,
+    }]);
     let rx1 = send_async(&r, TxClass::Command, 1, 0, b"abcdef");
     wait_in_flight(&r, 1);
     let rx2 = send_async(&r, TxClass::Command, 2, 0, b"gh");
@@ -1665,7 +2018,10 @@ fn queued_jobs_after_stop_are_not_submitted_in_ledger() {
     assert_eq!(rep1.result.outcome, TxOutcome::Completed(2));
     for rx in [rx2, rx3] {
         let rep = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::NotSubmitted, Some(FenceReject::Frozen)));
+        assert_eq!(
+            (rep.result.outcome, rep.reject),
+            (TxOutcome::NotSubmitted, Some(FenceReject::Frozen))
+        );
     }
     assert_eq!(r.dev.write_calls(), 1);
     let (_w, ledger) = r.join.take().unwrap().join().unwrap();
@@ -1679,10 +2035,19 @@ fn ledger_records_partial_and_unknown() {
     let mut r = rig();
     r.dev.script_write(vec![
         FakeWriteStep::AcceptThenError(3, PalError::io(5, "[Errno 5] Input/output error")),
-        FakeWriteStep::Unknown { confirmed: 0, error: PalError::io(5, "[Errno 5] Input/output error") },
+        FakeWriteStep::Unknown {
+            confirmed: 0,
+            error: PalError::io(5, "[Errno 5] Input/output error"),
+        },
     ]);
-    assert_eq!(send(&r, TxClass::Command, 1, 7, b"abcdef").result.outcome, TxOutcome::Completed(3));
-    assert_eq!(send(&r, TxClass::Command, 2, 7, b"ghi").result.outcome, TxOutcome::Unknown { confirmed: 0 });
+    assert_eq!(
+        send(&r, TxClass::Command, 1, 7, b"abcdef").result.outcome,
+        TxOutcome::Completed(3)
+    );
+    assert_eq!(
+        send(&r, TxClass::Command, 2, 7, b"ghi").result.outcome,
+        TxOutcome::Unknown { confirmed: 0 }
+    );
     r.stop.as_ref().unwrap().send();
     let (_w, ledger) = r.join.take().unwrap().join().unwrap();
     assert_eq!(ledger.ops[&OpId(1)].confirmed_bytes, 3);
@@ -1709,7 +2074,14 @@ fn tx_wal_failure_reported_and_gap_listed() {
     r.wfs.fail_next_writes(Path::new(WAL_PATH), 2, enospc());
     let rep = send(&r, TxClass::Command, 1, 7, b"abc");
     assert_eq!(rep.result.outcome, TxOutcome::Completed(3)); // bytes 已寫出
-    assert!(matches!(rep.wal, Some(WalAppend { ok: false, loss_flag: true, .. })));
+    assert!(matches!(
+        rep.wal,
+        Some(WalAppend {
+            ok: false,
+            loss_flag: true,
+            ..
+        })
+    ));
     r.stop.as_ref().unwrap().send();
     let (_w, ledger) = r.join.take().unwrap().join().unwrap();
     assert_eq!(ledger.ops[&OpId(1)].wal_gaps.len(), 1);
@@ -1719,7 +2091,10 @@ fn tx_wal_failure_reported_and_gap_listed() {
 fn settled_op_wal_gaps_move_to_unresolved_set() {
     let mut r = rig();
     r.wfs.fail_next_writes(Path::new(WAL_PATH), 2, enospc());
-    assert_eq!(send(&r, TxClass::Command, 9, 7, b"abc").result.outcome, TxOutcome::Completed(3));
+    assert_eq!(
+        send(&r, TxClass::Command, 9, 7, b"abc").result.outcome,
+        TxOutcome::Completed(3)
+    );
     assert!(r.h.settle(OpId(9)));
     wait_gauge(&r, |g| g.live_ops == 0 && g.unresolved_gaps == 1);
     r.stop.as_ref().unwrap().send();
@@ -1733,9 +2108,13 @@ fn settled_op_wal_gaps_move_to_unresolved_set() {
 #[test]
 fn unresolved_gaps_capped_with_overflow_summary() {
     let mut r = rig();
-    r.wfs.fail_next_writes(Path::new(WAL_PATH), 10_000, enospc()); // WAL 持續失敗
+    r.wfs
+        .fail_next_writes(Path::new(WAL_PATH), 10_000, enospc()); // WAL 持續失敗
     for i in 1..=300u64 {
-        assert_eq!(send(&r, TxClass::Command, i, 7, b"ab").result.outcome, TxOutcome::Completed(2));
+        assert_eq!(
+            send(&r, TxClass::Command, i, 7, b"ab").result.outcome,
+            TxOutcome::Completed(2)
+        );
         assert!(r.h.settle(OpId(i)));
     }
     let g = wait_gauge(&r, |g| g.settled_total == 300);
@@ -1745,19 +2124,31 @@ fn unresolved_gaps_capped_with_overflow_summary() {
     let (_w, ledger) = r.join.take().unwrap().join().unwrap();
     assert_eq!(ledger.unresolved_gaps.len(), TX_LEDGER_UNRESOLVED_GAPS_MAX);
     assert_eq!(TX_LEDGER_UNRESOLVED_GAPS_MAX, 256);
-    assert_eq!(ledger.unresolved_gaps.front().unwrap().op_id, Some(OpId(45))); // 保留最新 256 筆
+    assert_eq!(
+        ledger.unresolved_gaps.front().unwrap().op_id,
+        Some(OpId(45))
+    ); // 保留最新 256 筆
     assert_eq!(
         ledger.gaps_overflow,
-        GapOverflow { gaps: 44, bytes: 88, first_op: Some(OpId(1)), last_op: Some(OpId(44)) }
+        GapOverflow {
+            gaps: 44,
+            bytes: 88,
+            first_op: Some(OpId(1)),
+            last_op: Some(OpId(44))
+        }
     );
 }
 
 #[test]
 fn per_op_wal_gaps_capped() {
     let mut r = rig();
-    r.wfs.fail_next_writes(Path::new(WAL_PATH), 10_000, enospc()); // WAL 持續失敗
+    r.wfs
+        .fail_next_writes(Path::new(WAL_PATH), 10_000, enospc()); // WAL 持續失敗
     for _ in 0..40 {
-        assert_eq!(send(&r, TxClass::Command, 1, 7, b"x").result.outcome, TxOutcome::Completed(1));
+        assert_eq!(
+            send(&r, TxClass::Command, 1, 7, b"x").result.outcome,
+            TxOutcome::Completed(1)
+        );
     }
     r.stop.as_ref().unwrap().send();
     let (_w, ledger) = r.join.take().unwrap().join().unwrap();
@@ -1773,48 +2164,77 @@ fn per_op_wal_gaps_capped() {
 fn ledger_saturation_never_evicts_live_ops() {
     let mut r = rig();
     for op in 1..=256u64 {
-        assert_eq!(send(&r, TxClass::Command, op, 7, b"q").result.outcome, TxOutcome::Completed(1)); // 不 settle
+        assert_eq!(
+            send(&r, TxClass::Command, op, 7, b"q").result.outcome,
+            TxOutcome::Completed(1)
+        ); // 不 settle
     }
     assert_eq!(TX_LEDGER_LIVE_MAX, 256);
     // 第 257 個新 op：帳本已滿 → 不呼叫 PAL、不建項目
     let writes_before = r.dev.write_calls();
     let rep = send(&r, TxClass::Command, 257, 7, b"q");
-    assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::NotSubmitted, Some(FenceReject::Frozen)));
+    assert_eq!(
+        (rep.result.outcome, rep.reject),
+        (TxOutcome::NotSubmitted, Some(FenceReject::Frozen))
+    );
     assert_eq!(r.dev.write_calls(), writes_before);
     // 第 258 個新 op：不再重送 saturation 事件
     let rep = send(&r, TxClass::Command, 258, 7, b"q");
-    assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::NotSubmitted, Some(FenceReject::Frozen)));
+    assert_eq!(
+        (rep.result.outcome, rep.reject),
+        (TxOutcome::NotSubmitted, Some(FenceReject::Frozen))
+    );
     // 既有 op 1 仍照常提交（既有 op 不受限）
-    assert_eq!(send(&r, TxClass::Command, 1, 7, b"q").result.outcome, TxOutcome::Completed(1));
+    assert_eq!(
+        send(&r, TxClass::Command, 1, 7, b"q").result.outcome,
+        TxOutcome::Completed(1)
+    );
     let t0 = Instant::now();
     while count_saturated(&r) == 0 {
-        assert!(t0.elapsed() < Duration::from_secs(2), "未收到 TX_LEDGER_SATURATED");
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "未收到 TX_LEDGER_SATURATED"
+        );
         std::thread::sleep(Duration::from_millis(2));
     }
     r.stop.as_ref().unwrap().send();
     let (_w, ledger) = r.join.take().unwrap().join().unwrap();
     std::thread::sleep(Duration::from_millis(20)); // 讓 drainer 消化尾端事件
-    assert_eq!(count_saturated(&r), 1, "UartIoError{{TX_LEDGER_SATURATED}} 只能送一次");
+    assert_eq!(
+        count_saturated(&r),
+        1,
+        "UartIoError{{TX_LEDGER_SATURATED}} 只能送一次"
+    );
     assert_eq!(ledger.ops.len(), 256);
     assert!(ledger.saturated);
     assert!(!ledger.ops.contains_key(&OpId(257)));
     assert!(!ledger.ops.contains_key(&OpId(258)));
     for op in 1..=256u64 {
         let want = if op == 1 { 2 } else { 1 };
-        assert_eq!(ledger.ops[&OpId(op)].confirmed_bytes, want, "op {op} 證據必須保留");
+        assert_eq!(
+            ledger.ops[&OpId(op)].confirmed_bytes,
+            want,
+            "op {op} 證據必須保留"
+        );
     }
 }
 
 #[test]
 fn settle_unknown_or_already_settled_is_noop() {
     let mut r = rig();
-    assert_eq!(send(&r, TxClass::Command, 1, 7, b"a").result.outcome, TxOutcome::Completed(1));
+    assert_eq!(
+        send(&r, TxClass::Command, 1, 7, b"a").result.outcome,
+        TxOutcome::Completed(1)
+    );
     assert!(r.h.settle(OpId(1)));
     wait_gauge(&r, |g| g.settled_total == 1 && g.live_ops == 0);
     assert!(r.h.settle(OpId(77))); // 無 TX
     assert!(r.h.settle(OpId(1))); // 已結算
-    // barrier：settle 優先於 jobs，後續 job 完成時前面的 settle 必已套用
-    assert_eq!(send(&r, TxClass::Command, 2, 7, b"b").result.outcome, TxOutcome::Completed(1));
+                                  // barrier：settle 優先於 jobs，後續 job 完成時前面的 settle 必已套用
+    assert_eq!(
+        send(&r, TxClass::Command, 2, 7, b"b").result.outcome,
+        TxOutcome::Completed(1)
+    );
     let g = wait_gauge(&r, |g| g.live_ops == 1);
     assert_eq!((g.live_ops, g.unresolved_gaps, g.settled_total), (1, 0, 1));
     r.stop.as_ref().unwrap().send();
@@ -1824,18 +2244,32 @@ fn settle_unknown_or_already_settled_is_noop() {
 #[test]
 fn settle_queue_full_retains_entry() {
     let mut r = rig();
-    assert_eq!(send(&r, TxClass::Command, 1, 7, b"o").result.outcome, TxOutcome::Completed(1)); // op 1 先完成（不 settle）
-    r.dev.script_write(vec![FakeWriteStep::BlockUntilCancel { accept_before_cancel: 1 }]);
+    assert_eq!(
+        send(&r, TxClass::Command, 1, 7, b"o").result.outcome,
+        TxOutcome::Completed(1)
+    ); // op 1 先完成（不 settle）
+    r.dev.script_write(vec![FakeWriteStep::BlockUntilCancel {
+        accept_before_cancel: 1,
+    }]);
     let rx99 = send_async(&r, TxClass::Command, 99, 0, b"ab");
     wait_in_flight(&r, 99); // writer 卡在 op 99 的完成等待，佇列不被消費
     for i in 0..256u64 {
-        assert!(r.h.settle(OpId(1000 + i)), "settle 佇列未滿前必須接受 (i={i})");
+        assert!(
+            r.h.settle(OpId(1000 + i)),
+            "settle 佇列未滿前必須接受 (i={i})"
+        );
     }
     assert!(!r.h.settle(OpId(1))); // 佇列已滿 → 丟棄（過度保留、不失證據）
     assert_eq!(r.h.ledger_gauge().settle_dropped, 1);
     r.stop.as_ref().unwrap().send();
     r.cancel.cancel();
-    assert_eq!(rx99.recv_timeout(Duration::from_secs(2)).unwrap().result.outcome, TxOutcome::Completed(1));
+    assert_eq!(
+        rx99.recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .result
+            .outcome,
+        TxOutcome::Completed(1)
+    );
     let (_w, ledger) = r.join.take().unwrap().join().unwrap();
     assert_eq!(ledger.ops[&OpId(1)].confirmed_bytes, 1); // 仍保留
     assert_eq!(ledger.ops[&OpId(99)].confirmed_bytes, 1);
@@ -1847,8 +2281,13 @@ fn lease_owner_job_after_owner_gen_bump_rejected() {
     r.fence.with(|s| s.owner_gen = 3);
     r.fence.with(|s| s.owner_gen = 4); // lease close／expiry（送出前）
     let before = r.dev.write_calls();
-    let rep = send_async(&r, TxClass::LeaseOwner, 1, 3, b"\x03").recv_timeout(Duration::from_secs(2)).unwrap();
-    assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::NotSubmitted, Some(FenceReject::OwnerMismatch)));
+    let rep = send_async(&r, TxClass::LeaseOwner, 1, 3, b"\x03")
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(
+        (rep.result.outcome, rep.reject),
+        (TxOutcome::NotSubmitted, Some(FenceReject::OwnerMismatch))
+    );
     assert_eq!(r.dev.write_calls(), before);
 }
 
@@ -1858,9 +2297,13 @@ fn interactive_open_cmd_after_owner_gen_bump_rejected() {
     r.fence.with(|s| s.owner_gen = 3);
     r.fence.with(|s| s.owner_gen = 4); // lease close／expiry（送出前）
     let before = r.dev.write_calls();
-    let rep =
-        send_async(&r, TxClass::InteractiveOpenCmd, 1, 3, b"open\n").recv_timeout(Duration::from_secs(2)).unwrap();
-    assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::NotSubmitted, Some(FenceReject::OwnerMismatch)));
+    let rep = send_async(&r, TxClass::InteractiveOpenCmd, 1, 3, b"open\n")
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(
+        (rep.result.outcome, rep.reject),
+        (TxOutcome::NotSubmitted, Some(FenceReject::OwnerMismatch))
+    );
     assert_eq!(r.dev.write_calls(), before);
 }
 
@@ -1871,7 +2314,10 @@ fn login_probe_after_fsm_gen_bump_rejected() {
     let (j, rx) = job(1, TxClass::LoginProbe, 0, 1, true, b"root\n"); // permit fsm_gen=1
     r.h.jobs.send(j).unwrap();
     let rep = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::NotSubmitted, Some(FenceReject::FsmMismatch)));
+    assert_eq!(
+        (rep.result.outcome, rep.reject),
+        (TxOutcome::NotSubmitted, Some(FenceReject::FsmMismatch))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1911,7 +2357,11 @@ fn cancelled_ops_bounded_512_fifo() {
     fence.revoke_ops(&[OpId(600)]);
     fence.with(|s| {
         assert_eq!(s.cancelled_len(), 512);
-        assert_eq!(Fence::admit(s, &permit(2)), Err(FenceReject::Cancelled), "重新撤銷者保留");
+        assert_eq!(
+            Fence::admit(s, &permit(2)),
+            Err(FenceReject::Cancelled),
+            "重新撤銷者保留"
+        );
         assert_eq!(Fence::admit(s, &permit(3)), Ok(()), "下一個最舊者被淘汰");
     });
 }
@@ -1919,7 +2369,8 @@ fn cancelled_ops_bounded_512_fifo() {
 #[test]
 fn cancelled_inflight_command_later_tx_refused() {
     let r = rig();
-    r.dev.script_write(vec![FakeWriteStep::AcceptThenWouldBlock(2)]);
+    r.dev
+        .script_write(vec![FakeWriteStep::AcceptThenWouldBlock(2)]);
     let rx = send_async(&r, TxClass::Command, 5, 0, b"abcdef");
     assert!(r.dev.wait_paused(Duration::from_secs(2))); // 已提交 "ab"，於 gate 外等待
     r.fence.revoke_ops(&[OpId(5)]); // 不得阻塞
@@ -1946,7 +2397,8 @@ fn reboot_tx_arms_quiet_before_next_job() {
     // 不等 actor 處理 `UartTxCompleted`：緊接的 LoginProbe 必須被 `Quiet` 拒絕、零 TX。
     let r = rig();
     r.fence.with(|s| s.reboot_arm_op = Some(OpId(1)));
-    r.dev.script_write(vec![FakeWriteStep::AcceptThenWouldBlock(3)]);
+    r.dev
+        .script_write(vec![FakeWriteStep::AcceptThenWouldBlock(3)]);
     let (reboot, reboot_rx) = job(1, TxClass::Command, 0, 0, true, b"reboot\n");
     r.h.jobs.send(reboot).unwrap();
     assert!(r.dev.wait_paused(Duration::from_secs(2)));
@@ -1956,7 +2408,11 @@ fn reboot_tx_arms_quiet_before_next_job() {
     let rep = reboot_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(rep.result.outcome, TxOutcome::Completed(7));
     let rep = probe_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert_eq!(rep.reject, Some(FenceReject::Quiet), "reboot 後緊接的 probe 必須被 quiet 拒絕");
+    assert_eq!(
+        rep.reject,
+        Some(FenceReject::Quiet),
+        "reboot 後緊接的 probe 必須被 quiet 拒絕"
+    );
     assert_eq!(r.dev.take_tx(), b"reboot\n".to_vec());
     r.fence.with(|s| {
         assert!(s.quiet_active && s.reconfirm_pending);
@@ -1976,7 +2432,8 @@ fn reboot_tx_not_submitted_does_not_arm_quiet_in_writer() {
     r.h.jobs.send(reboot).unwrap();
     let rep = reboot_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(rep.result.outcome, TxOutcome::NotSubmitted);
-    r.fence.with(|s| assert!(!s.quiet_active && !s.reconfirm_pending));
+    r.fence
+        .with(|s| assert!(!s.quiet_active && !s.reconfirm_pending));
 }
 
 #[test]
@@ -1999,7 +2456,11 @@ fn zero_progress_cancel_after_freeze_is_not_submitted_draining() {
         error: Some(PalError::cancelled()),
     };
     let (result, reject) = reclassify_unsubmitted(partial, None, Err(FenceReject::Frozen));
-    assert_eq!(result.outcome, TxOutcome::Completed(2), "已有確認 bytes 者不改寫（BC-03）");
+    assert_eq!(
+        result.outcome,
+        TxOutcome::Completed(2),
+        "已有確認 bytes 者不改寫（BC-03）"
+    );
     assert_eq!(reject, None);
 }
 

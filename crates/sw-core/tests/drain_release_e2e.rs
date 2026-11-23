@@ -708,7 +708,7 @@ fn receipt_entry_with_dependency_backlog(backlog: u64, stop_event: ControlEvent)
     }
     let entry = handle.probe.entries("WorkerStopped")[0].clone();
     // 在途命令的 OpFinished 須在 receipt 之前被處理（Python 同序：reader join 後才有回條）。
-    assert_eq!(handle.probe.entries("Control").len(), 1, "OpFinished 應先於 receipt 被處理：{entry:?}");
+    assert_eq!(handle.probe.entries("OpFinished").len(), 1, "OpFinished 應先於 receipt 被處理：{entry:?}");
     entry
 }
 

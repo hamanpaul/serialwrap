@@ -330,9 +330,16 @@ pub fn install_shell_replies(dev: &FakeDevice) {
                 .split("__READY__")
                 .nth(1)
                 .unwrap_or("")
-                .trim()
-                .to_string();
-            format!("__READY__{token}\r\nroot@t:/# ").into_bytes()
+                .chars()
+                .take_while(|c| c.is_ascii_hexdigit())
+                .collect::<String>();
+            let expected =
+                format!("( echo __READY__{token} ) && printf '\\n__SW_ST_%s_OK__\\n' '{token}'");
+            if token.len() == 8 && text.contains(&expected) {
+                format!("__READY__{token}\r\n__SW_ST_{token}_OK__\r\nroot@t:/# ").into_bytes()
+            } else {
+                format!("__READY__{token}\r\nroot@t:/# ").into_bytes()
+            }
         }),
     );
 }

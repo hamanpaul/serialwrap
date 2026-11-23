@@ -558,7 +558,7 @@ ocp-mcu-upgrade -d "$XDG_RUNTIME_DIR/serialwrap/dev/ttyMCU" -b 115200 -t 8 -e -s
 
 ### Diagnostics and Recovery
 
-Start with:
+When the session state is uncertain, use these diagnostics:
 
 ```bash
 serialwrap session self-test --selector COM0
@@ -566,7 +566,17 @@ serialwrap doctor
 serialwrap daemon status
 ```
 
-Common classifications include `OK`, `DEVICE_MISSING`,
+`session self-test` is an optional, point-in-time diagnostic. It does not
+reserve the target for the next RPC. A busy response (`SESSION_BUSY` or
+`SESSION_INTERACTIVE_BUSY`) means no probe ran, not that the target is unhealthy.
+Wait for foreground work or a background capture to end, or let the next
+command end the capture under the existing rules. An executed Rust probe reports
+`probe_evidence` (`tx_complete`, `execution_marker`, `probe_rc_zero`, and
+`prompt_after_marker`); READY confirmation requires all four, including a prompt
+after the execution marker. See [Self-test behavior](docs/self-test.md).
+
+Common classifications include `OK`, `SESSION_BUSY`,
+`SESSION_INTERACTIVE_BUSY`, `DEVICE_MISSING`,
 `DEVICE_REBOUND_REQUIRED`, `BRIDGE_DOWN`, `VTTY_STALE`,
 `TARGET_UNRESPONSIVE`, `LOGIN_REQUIRED`, `ATTACHED_NOT_READY`,
 `REBOOTING`, `HUMAN_INTERACTIVE_ACTIVE`, `PASSTHROUGH`,
@@ -712,7 +722,7 @@ no caller action required:
   (`attach_session`'s `ATTACHED`-branch probe and `recover_session`'s
   `ATTACHED`-branch reprobe share one probe entry point, gated at that single
   point), the forced CTRL_C/CTRL_D keystrokes sent after a command timeout,
-  and `session self-test`'s READY-branch nonce probe (reported back as
+  and `session self-test`'s READY-branch verified execution probe (reported back as
   classification `AUTOBOOT_QUIET`). The daemon waits passively on RX instead.
   `session list` exposes the remaining time as `boot_quiet_remaining_s`.
 - **Released** immediately when RX matches the session's `login_regex` /
@@ -743,7 +753,7 @@ no caller action required:
   side effects (previously those bytes landed in the autoboot countdown and
   the command died 10 s later as `PROMPT_TIMEOUT`). **Since #162 the gate is
   cleared only by an actual READY re-confirmation** (attach probe / reboot
-  recovery / a successful self-test nonce — note the 2 s prompt-return after
+  recovery / a self-test with complete execution evidence — note the 2 s prompt-return after
   a `reboot` command is **not** a confirmation point: prpl/OpenWrt's `reboot`
   is asynchronous, the shell reprints its prompt within milliseconds while
   the board really is rebooting): window expiry or an RX prompt match alone no longer
@@ -2460,9 +2470,19 @@ serialwrap session console-detach --selector COM0 --client-id <client_id>
 serialwrap session self-test --selector COM0
 ```
 
+Self-test 是可選的當下診斷，不會替下一個 RPC 保留 session 操作權。忙碌回應
+（`SESSION_BUSY` 或 `SESSION_INTERACTIVE_BUSY`）代表**未探測**，不代表故障：不送 probe、
+不更新 `last_probe_at`，也不確認 READY。等待前景工作或 background capture 結束；
+也可依既有規則提交下一個命令，讓 capture 結束。Rust 實際執行 probe 時會回傳
+`probe_evidence` 四個布林值：`tx_complete`、`execution_marker`、`probe_rc_zero`、
+`prompt_after_marker`。只有四項全真且 op、連線 epoch、證據世代仍有效，才可確認 READY；
+prompt 必須出現在執行標記之後。詳見 [Self-test 行為](docs/self-test.md)，包括 POSIX shell
+相容限制。
+
 常見 `classification`：
 
 - `OK`
+- `SESSION_BUSY`／`SESSION_INTERACTIVE_BUSY`（BC-13）：忙碌時未探測，等待即可；不要因此 recover。
 - `DEVICE_MISSING`
 - `DEVICE_REBOUND_REQUIRED`
 - `BRIDGE_DOWN`
@@ -2586,10 +2606,10 @@ DUT 重開機時，U-Boot 的「`Hit any key to stop autoboot`」倒數窗只要
 - **觸發**：
   1. agent 送出 reboot 類指令**當下**即進入 quiet window（不等 banner——真板從 shutdown 訊息到 banner 可能間隔數秒，且 U-Boot 可能吃到 banner 前緩衝的 bytes）；
   2. RX 看到 boot banner（`U-Boot` 版本行、`Hit any key to stop autoboot` 倒數行）——涵蓋 **DUT 自行重開／斷電重開**的非計畫性情境。
-- **效果**：視窗內（預設 180s，`BOOT_QUIET_WINDOW_S`；實測目標板完整開機約 150s + 裕度）**gate 所有 `source=system` 的自動 probe TX**——reboot recovery 迴圈、readiness reprobe、attach probe（`attach_session` 的 ATTACHED 分支與 `recover_session` 的 ATTACHED 分支重探共用同一個 probe 入口，於此單點一起 gate）、命令逾時後的 CTRL_C/CTRL_D 強制按鍵、`session self-test` READY 分支的 nonce probe（回報 `AUTOBOOT_QUIET` 分類）全部改為純被動等 RX。`session list` 的 `boot_quiet_remaining_s` 欄位可觀測剩餘秒數。CTRL_C/CTRL_D 迴圈的 gate 是**逐 byte 重驗**的（兩個 byte 間隔最長 2s，恰好落在 autoboot 3s 倒數窗內，只在迴圈外評估一次會讓第二個 byte 打斷開機）；banner 偵測的比對窗為「舊 rolling tail 尾段＋**整個** RX chunk」，不截掉大 chunk 的開頭（實機 345/354 字元的 banner chunk 曾因截頭漏判）。
+- **效果**：視窗內（預設 180s，`BOOT_QUIET_WINDOW_S`；實測目標板完整開機約 150s + 裕度）**gate 所有 `source=system` 的自動 probe TX**——reboot recovery 迴圈、readiness reprobe、attach probe（`attach_session` 的 ATTACHED 分支與 `recover_session` 的 ATTACHED 分支重探共用同一個 probe 入口，於此單點一起 gate）、命令逾時後的 CTRL_C/CTRL_D 強制按鍵、`session self-test` READY 分支的驗證執行 probe（回報 `AUTOBOOT_QUIET` 分類）全部改為純被動等 RX。`session list` 的 `boot_quiet_remaining_s` 欄位可觀測剩餘秒數。CTRL_C/CTRL_D 迴圈的 gate 是**逐 byte 重驗**的（兩個 byte 間隔最長 2s，恰好落在 autoboot 3s 倒數窗內，只在迴圈外評估一次會讓第二個 byte 打斷開機）；banner 偵測的比對窗為「舊 rolling tail 尾段＋**整個** RX chunk」，不截掉大 chunk 的開頭（實機 345/354 字元的 banner chunk 曾因截頭漏判）。
 - **解除**：RX 匹配該 session 的 `login_regex` / `prompt_regex`，或 profile 選配的 `boot_done_regex`（開機完成訊號）**即刻解除**，recovery 立即恢復探測、自動回 `READY`；否則 180s 過期自動解除。出貨 `prpl-template` 把 `boot_done_regex` 設為 askconsole 的「`Please press Enter to activate this console`」——它不匹配前兩者，未設時只能等過期（實測 askconsole 在 U-Boot banner 後約 18s 出現，READY 卻要等滿 180s）。例外：若命中的尾行本身就是該 session 的 `bootloader_prompts`（如 U-Boot 自己的 `=> `），**不**視為開機完成、window 續留——避免寬鬆撰寫的 `prompt_regex`（如 `[>#]\s*$`）誤配 bootloader 自身 prompt，在板子仍卡在 bootloader 的最危險時刻誤解除。（#162：解除／過期只結束 **TX 靜默**維度；agent 顯式命令 gate 的解除另綁 READY 再確認，見下一點。）
 - **絕不 gate**：human console bytes、interactive lease TX。與 #114「刻意進 bootloader」的需求相容——human/lease 送鍵永遠放行。
-- **agent 顯式命令（#139 雙層 gate；#162 解除改綁 READY 再確認）**：本欄位仍**不會**降級 `session.state`，但 agent 顯式命令（`cmd submit`／`file push`／`file pull`）在「quiet 已 arm 且 session 尚未重新確認 `READY`」的過渡態（疑似板卡自發重開機、state 名義上停 `READY`）被 **`AUTOBOOT_QUIET`**（可重試）拒絕——submit-time 即時回錯（附 `retry_after_s`、不產生 cmd_id）、execute-time 第二層堵 queue race（`cmd status` 終態可觀測）；兩層皆零 UART 副作用（舊行為：bytes 落入 autoboot 倒數窗、10s 後以 `PROMPT_TIMEOUT` 吞掉）。**#162 起清空判定＝READY 再確認（nonce probe）**：任一 READY 確認點（attach probe／reboot recovery／self-test nonce 成功）落定才解除——**`reboot` 命令後 2s 內的 prompt 回顯不算確認點**（prpl/OpenWrt 的 `reboot` 非同步，shell 毫秒內就重印 prompt 但板子確實在重開，把它當 READY 實證會讓下一個 agent 命令落進正在 shutdown 的系統、逾時升級成 CTRL-C/CTRL-D 打在 autoboot 上）；quiet **過期或 RX prompt 解除不再直接放行**——prpl/OpenWrt askconsole 會停在「`Please press Enter to activate this console`」，既不匹配 `login_regex` 也不匹配 `prompt_regex`，若過期即放行，第一個 agent 命令的 `\n` 會觸發啟用、命令被 askfirst 吞掉、stdout 吃到啟用 banner（#162 根因）。quiet 結束後 reprobe 引擎會在 RX 靜默後自動補一輪確認 probe（`\n`＋nonce，**順帶消耗 askconsole 啟用 banner**），確認後 agent 命令永遠放行。過渡態可由 `session list` 的 `ready_reconfirm_pending` 欄位觀測；pending-only（quiet 已過期）拒絕的 `retry_after_s` 固定 `5.0`。**pending 有上限**（`READY_RECONFIRM_MAX_S`＝300s／`READY_RECONFIRM_MAX_ATTEMPTS`＝5，剩餘秒數見 `ready_reconfirm_remaining_s`）：逾越後四個 gate 一律改回**不可重試**的 `READY_UNCONFIRMED`（不帶 `retry_after_s`、帶 `recommended_action: "self_test"`，`ready_reconfirm_failed` 為 `true`）——避免呼叫端在一個永遠不可能成功的「可重試」錯誤上無界重試。刻意進 bootloader 請走 `interactive-open --allow-attached`（#114，不受 gate）。
+- **agent 顯式命令（#139 雙層 gate；#162 解除改綁 READY 再確認）**：本欄位仍**不會**降級 `session.state`，但 agent 顯式命令（`cmd submit`／`file push`／`file pull`）在「quiet 已 arm 且 session 尚未重新確認 `READY`」的過渡態（疑似板卡自發重開機、state 名義上停 `READY`）被 **`AUTOBOOT_QUIET`**（可重試）拒絕——submit-time 即時回錯（附 `retry_after_s`、不產生 cmd_id）、execute-time 第二層堵 queue race（`cmd status` 終態可觀測）；兩層皆零 UART 副作用（舊行為：bytes 落入 autoboot 倒數窗、10s 後以 `PROMPT_TIMEOUT` 吞掉）。**#162 起清空判定＝READY 再確認（nonce probe）**：任一 READY 確認點（attach probe／reboot recovery／self-test 的完整執行證據成立）落定才解除——**`reboot` 命令後 2s 內的 prompt 回顯不算確認點**（prpl/OpenWrt 的 `reboot` 非同步，shell 毫秒內就重印 prompt 但板子確實在重開，把它當 READY 實證會讓下一個 agent 命令落進正在 shutdown 的系統、逾時升級成 CTRL-C/CTRL-D 打在 autoboot 上）；quiet **過期或 RX prompt 解除不再直接放行**——prpl/OpenWrt askconsole 會停在「`Please press Enter to activate this console`」，既不匹配 `login_regex` 也不匹配 `prompt_regex`，若過期即放行，第一個 agent 命令的 `\n` 會觸發啟用、命令被 askfirst 吞掉、stdout 吃到啟用 banner（#162 根因）。quiet 結束後 reprobe 引擎會在 RX 靜默後自動補一輪確認 probe（`\n`＋nonce，**順帶消耗 askconsole 啟用 banner**），確認後 agent 命令永遠放行。過渡態可由 `session list` 的 `ready_reconfirm_pending` 欄位觀測；pending-only（quiet 已過期）拒絕的 `retry_after_s` 固定 `5.0`。**pending 有上限**（`READY_RECONFIRM_MAX_S`＝300s／`READY_RECONFIRM_MAX_ATTEMPTS`＝5，剩餘秒數見 `ready_reconfirm_remaining_s`）：逾越後四個 gate 一律改回**不可重試**的 `READY_UNCONFIRMED`（不帶 `retry_after_s`、帶 `recommended_action: "self_test"`，`ready_reconfirm_failed` 為 `true`）——避免呼叫端在一個永遠不可能成功的「可重試」錯誤上無界重試。刻意進 bootloader 請走 `interactive-open --allow-attached`（#114，不受 gate）。
 - 若板子仍卡在 bootloader（例如 human 手動打斷倒數），`prpl-template` 已補上 `bootloader_prompts`（`=> `、`U-Boot> `），可直接用 `interactive-open --allow-attached` 開 recovery lease 打 `boot` 脫困，不必再走 `device release` + 外部工具的迂迴流程。線上 `profiles/*.yaml` 若是舊版物化結果而缺此欄位（配置漂移），偵測會退回 `UBOOT_FALLBACK_PROMPTS`（`=> `／`U-Boot> `／`CFE> `）而非整條 no-op；漂移本身由 `serialwrap doctor` 的 advisory 檢查 `profile_bootloader_prompts` 指出。
 - **卡 bootloader 的可診斷終態（#162）**：readiness probe 失敗且 RX tail 尾行命中 bootloader prompt 時，session 的 `last_error` 改為 `BOOTLOADER_STUCK`、停止無效重探，`session self-test` 與 `session recover` 回 `classification: "BOOTLOADER"` ＋ `recommended_action: "recover_interactive"`——取代舊版「第 10 次靜默 exhausted、state/last_error 不變、不發事件」的無資訊放棄。
 

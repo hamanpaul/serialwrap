@@ -1,5 +1,5 @@
 # 行為變更登記（BC／SC／DF）。由 P0-T5 建立，對應 docs/rust-refactor/plans/01-stage0-contracts.md T5 與調和表 spec-reconciliation.md §1。
-# BC-01～BC-05 依 OD-04 核准；BC-06 依 OD-111（2026-11-22 方案 A）；SC-01～SC-37（SC-08 已依 OD-14 #3 撤回、SC-33 已依 OD-79 撤回；SC-37 依 OD-21）、SC-39（OD-48）、DF-01～DF-27 依定稿規格、調和表與相關 OD 推導；SC-30、DF-18 由 P7 Task 0 登記（08 §0.5）；DF-23 依 OD-57、DF-24 依 OD-73 由 P7 登記；DF-25 依 OD-77 登記；DF-26 依 OD-80 登記；DF-27 依 OD-81 登記；SC-32 由 P8 Task 1 登記（09 §0.4，Rust-only）。
+# BC-01～BC-05 依 OD-04 核准；BC-06、BC-13 依 OD-111（2026-11-22 Python 凍結）；SC-01～SC-37（SC-08 已依 OD-14 #3 撤回、SC-33 已依 OD-79 撤回；SC-37 依 OD-21）、SC-39（OD-48）、DF-01～DF-27 依定稿規格、調和表與相關 OD 推導；SC-30、DF-18 由 P7 Task 0 登記（08 §0.5）；DF-23 依 OD-57、DF-24 依 OD-73 由 P7 登記；DF-25 依 OD-77 登記；DF-26 依 OD-80 登記；DF-27 依 OD-81 登記；SC-32 由 P8 Task 1 登記（09 §0.4，Rust-only）。
 # SC-33 依擁有者 OD-79 撤回（傳輸中途被拒回 AUTOBOOT_QUIET／COMMAND_ABORTED_IN_FLIGHT），編號保留不重用，亦不新增 pending owner item 8（原列案例改列 SC-03）；DF-26 依 OD-80 登記，SC-38 未佔用。
 # SC-08 依 OD-14 #3 撤回（UDS 維持 0660），編號保留不重用。
 # SC-11 交接排空窗口依 OD-16 (3) 擁有者接受（2026-10-22）：related_decisions、spec_refs、approval_conditions 已載明；owner_confirmation 維持 not_required、owner_item 不指派（擁有者佇列編號未定，見 spec-reconciliation SC-11 列），故不改動 pending 佇列與 tests/test_p1oc_catalog.py 釘定的 confirmed 清單。
@@ -7,7 +7,7 @@
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 16
+revision: 17
 changes:
   - id: "BC-01"
     kind: "BC"
@@ -170,6 +170,32 @@ changes:
     compatibility_impact: "Rust 0.5.1 起，Shutdown Phase 1 凍結 Fence 後取消在途 session.self_test 的 nonce／prompt 等待、session.recover 的 READY 救援鍵／prompt、force clear／READY 輪詢與 reprobe waiter，以及 session.interactive_open command／session.interactive_send payload 的 TX 等待；所有操作均在 WorkerStopped 前立即以 FLUSHED_BY_SHUTDOWN 回覆，不等待操作收尾且不延長停機上限。Probe、救援鍵或 interactive bytes 若在 Phase 1 前已送出不回滾，Fence 凍結後不得新增 TX；回覆此碼不代表已送 bytes 可安全自動重送。interactive lease 沿用 Phase 1 既有清理，晚到 OpFinished 不得重建或 touch lease。Rust 回歸位置：crates/sw-core/tests/drain_release.rs::shutdown_interactive_open_reply_precedes_worker_receipt、::shutdown_interactive_send_reply_precedes_worker_receipt、::shutdown_interactive_late_completion_does_not_restore_lease。daemon E2E 參照：crates/sw-daemon/tests/shutdown_order.rs::shutdown_inflight_self_test_is_flushed_within_stop_cap。Python 0.4.x 的 self-test／recover 等待程式碼已對照：self_test 於 sw_core/session_manager.py:7866 擷取 RX offset、送 probe，並於 :7890 等 nonce；recover 於 :7938 路由 READY 救援、force 路徑於 :8042，ATTACHED 路徑呼叫 _probe_existing_bridge。Python interactive_open 於 sw_core/session_manager.py:7216 建 lease 後在 lock 外同步呼叫 _send_command_with_permit；interactive_send 於 :7473 在 lock 外同步呼叫 _send_bytes_with_permit，TX 成功後才 touch lease。Shutdown drain 於 sw_core/session_manager.py:2787-2794 清除 interactive lease，並於 :2810 呼叫 bridge.begin_drain；interactive_send 對 draining 等取消映射 SESSION_BUSY，interactive_open 僅將 lease 取消映射 INTERACTIVE_EXPIRED、其他 TxIncompleteError 會再拋出。Python 的 Shutdown／TX 競態未實跑，interactive_open 其他取消情境的 RPC framing 結果未對照。"
     approval_conditions: "依 OD-111 於 2026-11-22 核准的方案 A：Fence 凍結後取消指定等待，移除 PendingOp／side／force／recover waiter 登錄並立即回覆；不得等待操作收尾或延長停機上限。晚到 OpFinished／timer／reprobe 結果不得再 clear、attach、回覆第二次或發送下一個救援鍵；interactive open／send pending 必須在 WorkerStopped 前沖刷，沿用 Phase 1 清 lease，不呼叫會回放輸入的正常 close 路徑，晚到成功結果不得 touch／重建 lease。"
     related_decisions: ["OD-111"]
+  - id: "BC-13"
+    kind: "BC"
+    title: "Rust self-test 前景互斥與命令執行證據"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-11-22"
+      decision_ref: "OD-111"
+      basis: "owner_decision"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 17
+    spec_refs: ["issue-306", "issue-307"]
+    reconciliation_refs: ["issue-306", "issue-307"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P7"]
+    case_ids: ["bc13-busy-probe-zero-tx", "bc13-foreground-probe-reservation", "bc13-execution-evidence", "bc13-generation-and-shutdown-cleanup", "bc13-rpc-probe-evidence"]
+    compatibility_impact: "Rust 0.5.1 的 session.self_test 只在當下診斷，不保留後續 RPC 的操作權。前景槽、有效待執行命令、login／Recover、agent interactive lease、另一個 probe 或進行中的 background capture 會得到被動 SESSION_BUSY 或 SESSION_INTERACTIVE_BUSY（recommended_action=wait）：零 probe TX、不 suspend human、不更新 last_probe_at、不 confirm ready；busy 不代表故障。閒置 probe 在同一 actor 仲裁內取得 foreground、pending 與 Fence op-owner 授權，直到成功、失敗或 Shutdown 收尾；明示 Recover 仍可受理，但會使在途 probe 證據失效。執行回應逐項提供 tx_complete、execution_marker、probe_rc_zero、prompt_after_marker；只有完整 TX、TX 外獨立完整執行標記（由 configured ready_probe 成功後的 POSIX shell printf 發出）、零 RC、標記後 prompt，以及仍有效的 op／連線 epoch／FSM 證據世代全成立時才 probe_ok 並 confirm_ready。Rust 框架 TX 長度與拒絕回應長度可不同於凍結的 Python golden；Python 0.4.x 行為及 golden 不變。自訂 ready_probe 必須可在相容的 POSIX shell 框架中執行；不相容時失敗關閉，不退回 nonce 回顯判準。"
+    approval_conditions: "依 OD-111、OD-112 授權的 2026-11-23 i306 編排者定案：保持既有前置分類與 Recover/human lease 政策；忙碌零 TX；在同次仲裁保留 foreground；Fence 提交點驗證 SelfTestProbe op-owner；以 TX 外執行標記、configured probe 零 RC 與標記後 prompt 建立證據；probe 執行結果攜帶四個固定布林欄位；確認前驗證連線 epoch 與證據世代；Shutdown Phase 1 立即沖刷且晚到結果不再回覆、回放或確認；不改 Python golden，不新增錯誤碼。"
+    related_decisions: ["OD-111", "OD-112"]
   - id: "SC-01"
     kind: "SC"
     title: "RECOVERING 下 submit 與 open 回 SESSION_RECOVERING"

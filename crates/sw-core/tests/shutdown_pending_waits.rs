@@ -55,12 +55,25 @@ fn notifying_clock() -> (Arc<dyn Clock>, Arc<FakeClock>, Receiver<()>) {
 
 const SELF_TEST_PROFILE: &str = "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    ready_probe: 'echo __READY__${nonce}'\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: t, act_no: 1, alias: t+1, device_by_id: /s/by-id/usb-A}\n";
 
+fn wait_for_op_finished(rig: &ActorRig, before: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_millis(400);
+    while rig.actor_probe().entries("OpFinished").len() == before
+        && std::time::Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        rig.actor_probe().entries("OpFinished").len() > before,
+        "OpRunner 應以 OpFinished 收尾"
+    );
+}
+
 fn assert_shutdown_cancels_self_test_wait(prompt_wait: bool) {
     let rig = ActorRig::new(SELF_TEST_PROFILE).ready();
     rig.dev.clear_replies();
     let tx_start = rig.dev.tx_len();
     let wait_start = rig.rx.regex_wait_starts_for_test();
-    let controls_before = rig.actor_probe().entries("Control").len();
+    let op_finished_before = rig.actor_probe().entries("OpFinished").len();
     let self_test = rig.request_async(SessionRequest::SelfTest {
         timeout_s: 60.0,
         strict_human_lock: false,
@@ -83,10 +96,10 @@ fn assert_shutdown_cancels_self_test_wait(prompt_wait: bool) {
         actor.rx.regex_wait_starts_for_test() > wait_start
     });
     if prompt_wait {
-        let nonce_wait_count = rig.rx.regex_wait_starts_for_test();
-        rig.inject_rx(format!("__READY__{nonce}\r\n").as_bytes());
+        let marker_wait_count = rig.rx.regex_wait_starts_for_test();
+        rig.inject_rx(format!("__SW_ST_{nonce}_OK__\r\n").as_bytes());
         rig.wait_for("self-test prompt regex wait", |actor| {
-            actor.rx.regex_wait_starts_for_test() > nonce_wait_count
+            actor.rx.regex_wait_starts_for_test() > marker_wait_count
         });
     }
 
@@ -98,16 +111,7 @@ fn assert_shutdown_cancels_self_test_wait(prompt_wait: bool) {
     let self_test_reply = self_test.recv_timeout(Duration::from_millis(400)).ok();
     let close_paused = rig.dev.wait_paused(Duration::from_millis(400));
 
-    let deadline = std::time::Instant::now() + Duration::from_millis(400);
-    let mut runner_finished = false;
-    while std::time::Instant::now() < deadline {
-        // OpFinished 沿用 actor probe 既有的泛型 Control 標籤，不能改寫共用觀測契約。
-        if rig.actor_probe().entries("Control").len() > controls_before {
-            runner_finished = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(2));
-    }
+    wait_for_op_finished(&rig, op_finished_before);
     rig.dev.release_pause();
     let shutdown_reply = shutdown_rx.recv_timeout(Duration::from_secs(2)).ok();
 
@@ -130,10 +134,6 @@ fn assert_shutdown_cancels_self_test_wait(prompt_wait: bool) {
 
     assert!(close_paused, "停機 drain 應在 WorkerStopped 回條前暫停");
     assert!(flushed, "停機時 self-test 應立即回 FLUSHED_BY_SHUTDOWN");
-    assert!(
-        runner_finished,
-        "Shutdown 應取消 self-test 的 RX 等待並收尾 OpRunner"
-    );
     assert_eq!(
         rig.dev.tx_len(),
         tx_at_shutdown,
@@ -146,6 +146,140 @@ fn assert_shutdown_cancels_self_test_wait(prompt_wait: bool) {
 fn shutdown_cancels_self_test_nonce_and_prompt_waits() {
     assert_shutdown_cancels_self_test_wait(false);
     assert_shutdown_cancels_self_test_wait(true);
+}
+
+#[test]
+fn shutdown_cancels_verified_self_test_waits() {
+    let rig = ActorRig::new(SELF_TEST_PROFILE).ready();
+    rig.dev.clear_replies();
+    rig.dev.script_write(vec![
+        sw_pal::fakes::serial::FakeWriteStep::PauseBeforeSubmit,
+    ]);
+    let tx_before = rig.dev.tx_len();
+    let clock_before = rig.clock.elapsed();
+    let op_finished_before = rig.actor_probe().entries("OpFinished").len();
+    let self_test = rig.request_async(SessionRequest::SelfTest {
+        timeout_s: 60.0,
+        strict_human_lock: false,
+    });
+    assert!(
+        rig.dev.wait_paused(Duration::from_secs(2)),
+        "TX 應停在提交前"
+    );
+
+    rig.dev.pause_next_close();
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    rig.send_control(ControlEvent::Shutdown { reply: shutdown_tx });
+    let flushed = self_test
+        .recv_timeout(Duration::from_millis(400))
+        .expect("Phase 1 不得等待 runner 或 FakeClock")
+        .expect("self-test 回覆應為字典");
+    assert_eq!(
+        flushed["error_code"],
+        sw_proto::pyjson::PyValue::from("FLUSHED_BY_SHUTDOWN")
+    );
+    assert_eq!(
+        rig.clock.elapsed(),
+        clock_before,
+        "Shutdown 測試不得推進 FakeClock"
+    );
+    assert_eq!(rig.dev.tx_len(), tx_before, "提交前停機不得新增 UART TX");
+    assert_eq!(rig.fence.with(|fence| fence.self_test_probe_owner), None);
+
+    rig.dev.release_pause();
+    assert!(
+        rig.dev.wait_paused(Duration::from_millis(400)),
+        "runner 收尾後應進入 WorkerStopped 前的 close 暫停"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_millis(400);
+    while rig.actor_probe().entries("OpFinished").len() == op_finished_before
+        && std::time::Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        rig.actor_probe().entries("OpFinished").len() > op_finished_before,
+        "取消後 runner 應收尾並回報 OpFinished"
+    );
+    assert!(
+        self_test.try_recv().is_err(),
+        "late OpFinished 不得重覆回覆"
+    );
+    rig.dev.release_pause();
+    let shutdown = shutdown_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("Shutdown 應於 close 後收斂")
+        .expect("Shutdown 回覆應為字典");
+    assert_eq!(shutdown["ok"], sw_proto::pyjson::PyValue::Bool(true));
+    assert_eq!(rig.dev.tx_len(), tx_before, "凍結後不得回放或追加 TX");
+}
+
+#[test]
+fn shutdown_discards_suspended_self_test_human_bytes() {
+    let rig = ActorRig::new_with_hub(SELF_TEST_PROFILE).ready();
+    let console = rig.attach_pty_console("i306-human");
+    let consoles = rig.request(SessionRequest::ConsoleList);
+    let rows = match consoles.get("consoles") {
+        Some(sw_proto::pyjson::PyValue::List(rows)) => rows,
+        other => panic!("console_list 應含 console 清單：{other:?}"),
+    };
+    assert!(
+        rows.iter().any(|row| match row {
+            sw_proto::pyjson::PyValue::Dict(console) => {
+                console.get("client_id") == Some(&sw_proto::pyjson::PyValue::from("i306-human"))
+                    && console.get("interactive_owner")
+                        == Some(&sw_proto::pyjson::PyValue::Bool(true))
+            }
+            _ => false,
+        }),
+        "測試 console 必須先取得 raw interactive ownership"
+    );
+    rig.dev.clear_replies();
+    let tx_start = rig.dev.tx_len();
+    let wait_start = rig.rx.regex_wait_starts_for_test();
+    let self_test = rig.request_async(SessionRequest::SelfTest {
+        timeout_s: 60.0,
+        strict_human_lock: false,
+    });
+    rig.wait_for("self-test probe TX", |actor| actor.dev.tx_len() > tx_start);
+    rig.wait_for("execution marker wait", |actor| {
+        actor.rx.regex_wait_starts_for_test() > wait_start
+    });
+    console.push_input(b"k");
+    thread::sleep(Duration::from_millis(50));
+    let tx_at_shutdown = rig.dev.tx_len();
+    rig.dev.pause_next_close();
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    rig.send_control(ControlEvent::Shutdown { reply: shutdown_tx });
+    let flushed = self_test
+        .recv_timeout(Duration::from_millis(400))
+        .expect("Shutdown Phase 1 應立即回覆")
+        .expect("self-test 回覆應為字典");
+    assert_eq!(
+        flushed["error_code"],
+        sw_proto::pyjson::PyValue::from("FLUSHED_BY_SHUTDOWN")
+    );
+    assert!(
+        rig.dev.wait_paused(Duration::from_millis(400)),
+        "Shutdown drain 應在 WorkerStopped 前等待 close"
+    );
+    assert_eq!(
+        rig.dev.tx_len(),
+        tx_at_shutdown,
+        "停機不可回放 suspended human bytes"
+    );
+    assert!(!rig.dev.tx_since(tx_start).contains(&b'k'));
+    assert!(
+        self_test.try_recv().is_err(),
+        "late runner result 不得重覆回覆"
+    );
+    rig.dev.release_pause();
+    let shutdown = shutdown_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    assert_eq!(shutdown["ok"], sw_proto::pyjson::PyValue::Bool(true));
+    assert_eq!(rig.dev.tx_len(), tx_at_shutdown);
 }
 
 #[test]
@@ -173,23 +307,14 @@ fn shutdown_cancels_ready_recover_wait_without_second_key() {
 
     // 關閉動作暫停於回條前：此時可觀察 Phase 1 的 RPC 回覆與 OpRunner 等待是否已收斂。
     let tx_at_shutdown = rig.dev.tx_len();
-    let controls_before_shutdown = rig.actor_probe().entries("Control").len();
+    let op_finished_before = rig.actor_probe().entries("OpFinished").len();
     rig.dev.pause_next_close();
     let (shutdown_tx, shutdown_rx) = bounded(1);
     rig.send_control(ControlEvent::Shutdown { reply: shutdown_tx });
     let recover_reply = recover.recv_timeout(Duration::from_millis(400)).ok();
     let close_paused = rig.dev.wait_paused(Duration::from_millis(400));
 
-    let deadline = std::time::Instant::now() + Duration::from_millis(400);
-    let mut runner_finished = false;
-    while std::time::Instant::now() < deadline {
-        // OpFinished 使用 actor probe 的泛型 Control 標籤；Shutdown 與 WorkerStopped 各有專屬標籤。
-        if rig.actor_probe().entries("Control").len() > controls_before_shutdown {
-            runner_finished = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(2));
-    }
+    wait_for_op_finished(&rig, op_finished_before);
     rig.dev.release_pause();
     let shutdown_reply = shutdown_rx.recv_timeout(Duration::from_secs(2)).ok();
 
@@ -215,10 +340,6 @@ fn shutdown_cancels_ready_recover_wait_without_second_key() {
         flushed,
         "READY recover Phase 1 應立即回 FLUSHED_BY_SHUTDOWN"
     );
-    assert!(
-        runner_finished,
-        "Shutdown 應取消 READY recover 的 prompt 等待"
-    );
     assert_eq!(
         rig.dev.tx_len(),
         tx_at_shutdown,
@@ -235,12 +356,7 @@ fn shutdown_wait_times_out_before_matching_expired_buffered_rx() {
     let clock = FakeClock::new();
 
     assert_eq!(
-        rx.wait_for_regex_from_shutdown_cancellable(
-            &regex,
-            0,
-            Duration::ZERO,
-            &*clock,
-        ),
+        rx.wait_for_regex_from_shutdown_cancellable(&regex, 0, Duration::ZERO, &*clock,),
         WaitOutcome::TimedOut,
         "deadline 已到時不得再以已緩衝 RX 命中成功"
     );

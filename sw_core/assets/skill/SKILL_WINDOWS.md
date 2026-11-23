@@ -57,6 +57,8 @@ serialwrap session self-test --selector COM0
 serialwrap cmd submit --selector COM0 --cmd "cat /proc/version" --source agent:demo --mode line
 ```
 
+`session self-test` 僅在 session 狀態不明時用作診斷，不是每次命令前的必做步驟，也不會鎖定目標或替下一個 RPC 保留操作權。完成診斷後，其他操作仍依一般仲裁規則競爭前景槽；共通回應與 `probe_evidence` 說明見 [Self-test 行為](../../../docs/self-test.md)。
+
 > 注意 selector 的 `COM0`/`COM1` 是 serialwrap 的**邏輯 session 編號**，
 > 不是 Windows 裝置管理員的實體 `COM5`/`COM7`；對應關係看 `session list`
 > 的 `attached_real_path`（如 `\\.\COM5`）。
