@@ -936,12 +936,16 @@ def test_doctor_profile_expectation_policy_p290_phases():
         "migration_policy_id": "p290-template-migration-v1",
     }
     source = document["source"]
-    source_bytes = subprocess.run(
-        ["git", "show", f"{source['source_ref']}:{source['source_path']}"],
-        cwd=REPO,
-        check=True,
-        capture_output=True,
-    ).stdout
+    fixture_header = (
+        "# 來源：Git tag v0.3.2 的 sw_core/assets/profiles/default.yaml\n"
+        "# Git blob SHA-1：b34c354d5efe0d3a9aaede3e2b5844f81976d2df\n"
+        "# 原始內容 SHA-256：0857ebf9c5de56aafc48b13f5c478d173eab9f0397fb0fda30181a9f01412bf0\n"
+        "# 以下為原始資產位元組；雜湊驗證從本行之後開始。\n\n"
+    ).encode("utf-8")
+    fixture_path = REPO / "tests" / "fixtures" / "serialwrap-v0.3.2-default-profiles.yaml"
+    fixture_bytes = fixture_path.read_bytes()
+    assert fixture_bytes.startswith(fixture_header), fixture_path
+    source_bytes = fixture_bytes[len(fixture_header):]
     assert hashlib.sha256(source_bytes).hexdigest() == source["source_sha256"]
     import yaml
 
