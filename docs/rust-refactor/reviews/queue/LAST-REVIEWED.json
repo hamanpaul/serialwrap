@@ -37,6 +37,6 @@
   "fix/297-shutdown-pending-ops-flush": "4f631da",
   "fix/276-windows-task-start-hold": "006a6a4",
   "fix/ci-thin-timing-margins": "fa93094",
-  "fix/289-doctor-profile-template-fields": "557b625",
+  "fix/289-doctor-profile-template-fields": "ac793df",
   "fix/306-self-test-probe-safety": "423803a"
 }
