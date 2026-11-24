@@ -1354,6 +1354,7 @@ impl SessionCore {
             ev,
             MailboxItem::Control(ControlEvent::Request { .. })
                 | MailboxItem::Control(ControlEvent::ShutdownGate { .. })
+                | MailboxItem::Control(ControlEvent::ShutdownFlushWaiters)
                 | MailboxItem::Control(ControlEvent::Shutdown { .. })
                 // S2-PAR-wp510r R3（設計 §3.1.7）：`ClaimForStop` 的立即回饋，三種凍結狀態皆立即處理。
                 | MailboxItem::Control(ControlEvent::CustodyClaimed { .. })
@@ -1383,6 +1384,7 @@ impl SessionCore {
                     | ControlEvent::DrainDataBarrier { .. }
                     | ControlEvent::WorkerStopped(_)
                     | ControlEvent::WorkerDrainTimeout { .. }
+                    | ControlEvent::ShutdownFlushWaiters
                     // S2-PAR-wp510r R3（設計 §3.1.7）：帳本紀錄的關閉終態（Pending 延後、Permanent 處理）。
                     | ControlEvent::CustodyTerminal { .. }
                     // S2-PAR-wp510r R4（設計 §3.1.7）：W6 的 offer 通知（Pending 延後、Permanent 只關閉）。
@@ -1447,7 +1449,7 @@ impl SessionCore {
     /// (a) 抑制會開啟或推進新工作：Control::{Request, DeviceAttached, DeviceMissing, Tick, ConsoleConnected,
     ///     ConsoleScan}、Data::ConsoleInputBytes。Request 仍分派，但只能回唯讀資料或 admission 拒絕；不啟動新副作用。
     ///     Python 凍結 readiness／attach／lease／human TX：session_manager.py:1127-1137, 2488-2504, 2572-2579。
-    /// (b) 保留已受理操作的完成、逾時與收尾：Control::{Shutdown, DeviceDetached, EvictCapture,
+    /// (b) 保留已受理操作的完成、逾時與收尾：Control::{Shutdown, ShutdownFlushWaiters, DeviceDetached, EvictCapture,
     ///     ConsoleCountChanged, BridgeOpened, UartIoError, UartTxCompleted, DrainDataBarrier, WorkerStopped,
     ///     WorkerDrainTimeout, OpFinished, LoginFinished, StateCommitted, HumanTxCompleted, FlashSyncProbeStart,
     ///     FlashProbeReleased, FlashSyncMatched, FlashHolderGone}、Timer::{BootQuietExpired, LeaseExpiry,
@@ -1484,6 +1486,10 @@ impl SessionCore {
                     self.shutdown_complete = true;
                     effects.push(Effect::Reply(reply, Ok(pydict! { "ok" => true })));
                 }
+                MailboxItem::Control(ControlEvent::ShutdownFlushWaiters) => {
+                    self.shutdown_requested = true;
+                    self.flush_shutdown_phase1_waiters(&mut effects.0);
+                }
                 MailboxItem::Control(ControlEvent::ShutdownGate { reply }) => {
                     self.flush_shutdown_queue();
                     effects.push(Effect::Reply(reply, Ok(pydict! { "ok" => true })));
@@ -1499,6 +1505,10 @@ impl SessionCore {
             MailboxItem::Control(ControlEvent::ShutdownGate { reply }) => {
                 self.flush_shutdown_queue();
                 effects.push(Effect::Reply(reply, Ok(pydict! { "ok" => true })));
+            }
+            MailboxItem::Control(ControlEvent::ShutdownFlushWaiters) => {
+                self.shutdown_requested = true;
+                self.flush_shutdown_phase1_waiters(&mut effects.0);
             }
             MailboxItem::Control(ControlEvent::Shutdown { reply }) => {
                 effects

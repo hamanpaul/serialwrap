@@ -959,13 +959,13 @@
   ],
   "conflicts": [
     {
-      "id": "render-unit-duplicated",
+      "id": "supervisor-defs-doc-stale",
       "subject": "systemd unit 文字由哪個函式產生",
       "claims": [
-        "crates/sw-cli/src/supervisor_defs.rs:1-3 的模組註解說本檔目前只承接 mode_str 輔助函式，但同檔 7-19 行定義了 render_user_unit 與 render_system_unit。",
-        "crates/sw-cli/src/setup_cmd.rs:367-371 也定義了同名的 render_user_unit 與 render_system_unit，setup 的 start_new 在同模組內呼叫的是這一份（setup_cmd.rs:1386）。"
+        "crates/sw-cli/src/supervisor_defs.rs:1-3 的模組註解說本檔目前只承接 mode_str 輔助函式、監管定義的產生由其他工作項承接。",
+        "同檔 7-19 行實際定義了 render_user_unit 與 render_system_unit；crates/sw-cli/src/setup_cmd.rs:367-373 的同名函式只是轉呼這兩個函式，setup 的 start_new 經由它們取得 unit 文字（setup_cmd.rs:1386）。"
       ],
-      "resolution": "以實際呼叫點為準：安裝 systemd-user unit 時用的是 setup_cmd.rs 的版本。supervisor_defs.rs 的模組註解與內容不一致，本頁不引用它。"
+      "resolution": "以程式碼為準：unit 文字由 supervisor_defs.rs 產生，setup_cmd.rs 的同名函式是轉呼的包裝；supervisor_defs.rs 的模組註解是過期的說明。"
     }
   ]
 }
