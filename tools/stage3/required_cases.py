@@ -22,6 +22,7 @@ SEED_FILES = {
 }
 EVIDENCE_RELATIVE = Path("docs/rust-refactor/evidence")
 ACCEPTANCE_RELATIVE = Path("tests/acceptance")
+SOURCE_MANIFEST_REPO_PATH = "docs/rust-refactor/evidence/denominators/source-manifest.json"
 CASE_ATTR_KEYS = (
     "suite", "layer", "platforms", "expected", "necessity", "daemon_slice", "cli_stage", "stage0_required",
 )
@@ -45,6 +46,20 @@ _LOCK_OBJECT_SHAPES: dict[str, tuple[frozenset[str], frozenset[str]]] = {
         frozenset({"required_case_set", "layer", "case_ids"}),
     ),
 }
+_SOURCE_MANIFEST_OBJECT_SHAPES: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+    "": (
+        frozenset({"schema_version", "sources", "initial_exit_platforms"}),
+        frozenset({"schema_version", "sources", "initial_exit_platforms"}),
+    ),
+    "$defs.Source": (
+        frozenset({"attachment", "path", "revision", "sha256"}),
+        frozenset({"attachment", "path", "revision", "sha256"}),
+    ),
+    "$defs.InitialExitPlatform": (
+        frozenset({"item_id", "platform", "layer"}),
+        frozenset({"item_id", "platform", "layer"}),
+    ),
+}
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _EXIT_ITEM_ID = re.compile(r"^S3-[A-Z0-9-]+$")
 SourceReader = Callable[[str, str], bytes | None]
@@ -61,6 +76,64 @@ def _relative_path(value: object) -> str | None:
     if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
         return None
     return path.as_posix()
+
+
+def _source_manifest_schema_errors(manifest: Mapping[str, Any]) -> list[str]:
+    """精確檢查公開來源 manifest 的物件欄位與初始出口／平台基準。"""
+    errors: list[str] = []
+
+    def closed_object(value: Any, schema_path: str, label: str) -> bool:
+        if not isinstance(value, Mapping):
+            errors.append(f"{label} 必須是 schema 物件")
+            return False
+        properties, required = _SOURCE_MANIFEST_OBJECT_SHAPES[schema_path]
+        actual = set(value)
+        missing = required - actual
+        unknown = actual - properties
+        if missing or unknown:
+            details: list[str] = []
+            if missing:
+                details.append(f"缺少欄位：{', '.join(sorted(missing))}")
+            if unknown:
+                details.append(f"未知欄位：{', '.join(sorted(unknown))}")
+            errors.append(f"{label} 的 schema 欄位集合不符（{'；'.join(details)}）")
+        return True
+
+    if not closed_object(manifest, "", "來源 manifest"):
+        return errors
+    sources = manifest.get("sources")
+    if isinstance(sources, list):
+        for index, source in enumerate(sources):
+            closed_object(source, "$defs.Source", f"來源 manifest sources[{index}]")
+
+    initial = manifest.get("initial_exit_platforms")
+    if not isinstance(initial, list):
+        errors.append("來源 manifest initial_exit_platforms 必須是陣列")
+        return errors
+    if not initial:
+        errors.append("來源 manifest initial_exit_platforms 不得為空")
+        return errors
+
+    identities: list[tuple[str, str, str]] = []
+    for index, item in enumerate(initial):
+        if not closed_object(item, "$defs.InitialExitPlatform", f"來源 manifest initial_exit_platforms[{index}]"):
+            continue
+        item_id, platform, layer = item.get("item_id"), item.get("platform"), item.get("layer")
+        if not isinstance(item_id, str) or not _EXIT_ITEM_ID.fullmatch(item_id):
+            errors.append(f"來源 manifest initial_exit_platforms[{index}] 的 item_id 格式錯誤")
+            continue
+        if platform not in ("linux", "windows"):
+            errors.append(f"來源 manifest initial_exit_platforms[{index}] 的 platform 格式錯誤")
+            continue
+        if not isinstance(layer, str) or not layer:
+            errors.append(f"來源 manifest initial_exit_platforms[{index}] 的 layer 格式錯誤")
+            continue
+        identities.append((item_id, platform, layer))
+    if len(identities) != len(set(identities)):
+        errors.append("來源 manifest initial_exit_platforms 不得重複列出出口／平台／layer")
+    if identities != sorted(identities):
+        errors.append("來源 manifest initial_exit_platforms 必須依出口 ID、平台、layer 排序")
+    return errors
 
 
 def _git_show(repo_root: Path, revision: str, repo_path: str) -> bytes | None:
@@ -102,14 +175,18 @@ def verify_seed_sources(
     source_reader: SourceReader | None = None,
 ) -> list[str]:
     """核對指定靜態種子的 revision、來源路徑、附件與原始 Git blob SHA。"""
-    errors: list[str] = []
-    if not isinstance(manifest, Mapping) or manifest.get("schema_version") != 1:
+    if not isinstance(manifest, Mapping):
+        return ["來源 manifest 必須是物件"]
+    errors = _source_manifest_schema_errors(manifest)
+    if errors:
+        return errors
+    if manifest.get("schema_version") != 1:
         return ["來源 manifest 的 schema_version 必須為 1"]
     sources = manifest.get("sources")
     if not isinstance(sources, list):
         return ["來源 manifest 缺少 sources 陣列"]
     if len(sources) != len(SEED_FILES):
-        errors.append("來源 manifest 必須恰列出兩個指定靜態種子")
+        errors.append("來源 manifest 必須完整列出指定靜態種子")
     expected_by_path = {path: attachment for path, attachment in SEED_FILES.items()}
     seen: set[str] = set()
     root = Path(evidence_root)
@@ -308,6 +385,30 @@ def _validate_seed_floor(lock: Mapping[str, Any], seed_expected: Mapping[str, An
     return errors
 
 
+def _initial_exit_platform_errors(
+    initial_exit_platforms: list[Mapping[str, Any]],
+    expected: Mapping[str, Any],
+    candidate: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """要求目前目錄及候選鎖保留固定 manifest 的每個出口／平台／layer。"""
+    errors: list[str] = []
+    exits = candidate.get("exits") if isinstance(candidate, Mapping) else None
+    for baseline in initial_exit_platforms:
+        item_id = baseline["item_id"]
+        platform = baseline["platform"]
+        layer = baseline["layer"]
+        current_entry = expected.get(item_id, {}).get(platform)
+        if not isinstance(current_entry, Mapping) or current_entry.get("layer") != layer:
+            errors.append(f"目前 stage_exits.json 缺少固定初始出口／平台／layer：{item_id}/{platform}/{layer}")
+        if candidate is None:
+            continue
+        item_lock = exits.get(item_id) if isinstance(exits, Mapping) else None
+        locked_entry = item_lock.get(platform) if isinstance(item_lock, Mapping) else None
+        if not isinstance(locked_entry, Mapping) or locked_entry.get("layer") != layer:
+            errors.append(f"候選分母鎖缺少固定初始出口／平台／layer：{item_id}/{platform}/{layer}")
+    return errors
+
+
 def _case_family_errors(current_cases: Mapping[str, Any], previous_cases: Mapping[str, Any], *, source: str) -> list[str]:
     current = {case["case_id"]: case for case in current_cases.get("cases", []) if isinstance(case, dict)}
     previous = {case["case_id"]: case for case in previous_cases.get("cases", []) if isinstance(case, dict)}
@@ -457,9 +558,20 @@ def _base_errors(
     try:
         raw = source_reader(base, "tests/acceptance/stage3_required_cases.lock.json")
         base_cases_raw = source_reader(base, "tests/acceptance/cases.yaml")
+        base_manifest_raw = source_reader(base, SOURCE_MANIFEST_REPO_PATH)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         return [f"無法讀取 PR base 的分母鎖：{exc}"]
     errors: list[str] = []
+    if base_manifest_raw is not None:
+        try:
+            current_manifest_raw = (
+                repo_root / EVIDENCE_RELATIVE / "denominators" / "source-manifest.json"
+            ).read_bytes()
+        except OSError as exc:
+            errors.append(f"無法讀取目前來源 manifest：{exc}")
+        else:
+            if current_manifest_raw != base_manifest_raw:
+                errors.append("PR base 已有的來源 manifest 不可變更（位元組不相同）")
     if base_cases_raw is not None:
         try:
             base_cases = yaml.safe_load(base_cases_raw.decode("utf-8"))
@@ -575,7 +687,8 @@ def main(
         seed_expected = _seed_expected_exit_cases(catalog, root / EVIDENCE_RELATIVE)
         lock_path = root / ACCEPTANCE_RELATIVE / "stage3_required_cases.lock.json"
         if args.check:
-            check_errors = _validate_seed_floor(lock, seed_expected)
+            check_errors = _initial_exit_platform_errors(manifest["initial_exit_platforms"], expected, lock)
+            check_errors.extend(_validate_seed_floor(lock, seed_expected))
             check_errors.extend(_seed_family_errors(cases_doc, root / EVIDENCE_RELATIVE))
             check_errors.extend(_validate_lock(lock, expected))
             if args.base:
@@ -588,7 +701,8 @@ def main(
             return 0
 
         # 先核對舊鎖仍與目前目錄相容，並確認 PR base 的所有權分母未被刪改。
-        precheck_errors = _validate_lock(lock, expected, allow_missing=True)
+        precheck_errors = _initial_exit_platform_errors(manifest["initial_exit_platforms"], expected)
+        precheck_errors.extend(_validate_lock(lock, expected, allow_missing=True))
         if args.base:
             precheck_errors.extend(_base_errors(
                 lock, cases_doc, base=args.base, repo_root=root, source_reader=reader,
@@ -622,7 +736,8 @@ def main(
                     entry["case_ids"] = sorted(existing | desired)
                     changed = True
 
-        final_errors = _validate_seed_floor(updated, seed_expected)
+        final_errors = _initial_exit_platform_errors(manifest["initial_exit_platforms"], expected, updated)
+        final_errors.extend(_validate_seed_floor(updated, seed_expected))
         final_errors.extend(_validate_lock(updated, expected))
         if args.base:
             final_errors.extend(_base_errors(

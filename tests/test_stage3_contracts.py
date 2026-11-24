@@ -517,6 +517,19 @@ def _copy_seed_evidence(destination: Path) -> None:
         (target / name).write_bytes((DENOMINATORS / name).read_bytes())
 
 
+def _exit_platform_manifest(lock: dict, catalog: dict) -> list[dict[str, str]]:
+    catalog_by_id = {item["item_id"]: item for item in catalog["items"]}
+    entries = []
+    for item_id, platforms in lock["exits"].items():
+        item = catalog_by_id[item_id]
+        applicable = ("linux", "windows") if item["platform"] == "both" else (item["platform"],)
+        for platform, detail in platforms.items():
+            assert platform in applicable
+            assert detail["layer"] == item["layer"]
+            entries.append({"item_id": item_id, "platform": platform, "layer": detail["layer"]})
+    return sorted(entries, key=lambda entry: (entry["item_id"], entry["platform"], entry["layer"]))
+
+
 def test_public_seed_at_designated_revision_accepted():
     from tools.stage3 import required_cases
 
@@ -623,18 +636,25 @@ def _required_cases_repo(tmp_path: Path) -> tuple[Path, object]:
             "release_requirement": "required",
             "required_families": list(families) if families is not None else None,
         })
+    catalog = {"schema_version": 3, "items": items}
     (acceptance / "stage_exits.json").write_text(
-        json.dumps({"schema_version": 3, "items": items}, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        json.dumps(catalog, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
     )
     _copy_seed_evidence(root / "docs" / "rust-refactor" / "evidence")
+    manifest_path = root / "docs" / "rust-refactor" / "evidence" / "denominators" / "source-manifest.json"
+    manifest = _load(manifest_path)
+    manifest["initial_exit_platforms"] = _exit_platform_manifest(_load(acceptance / "stage3_required_cases.lock.json"), catalog)
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     original_sources = _seed_source_bytes()
     original_required_lock = initial_lock
 
-    def source_reader(revision: str, repo_path: str) -> bytes:
+    def source_reader(revision: str, repo_path: str) -> bytes | None:
         if repo_path == "tests/acceptance/stage3_required_cases.lock.json" and revision == "base-revision":
             return original_required_lock
-        return original_sources[repo_path]
+        if repo_path == "docs/rust-refactor/evidence/denominators/source-manifest.json":
+            return None
+        return original_sources.get(repo_path)
 
     return root, source_reader
 
@@ -657,7 +677,10 @@ def test_required_cases_seed_preserves_full_denominator():
     assert lock["seed"]["cases"]["sha256"] == hashlib.sha256((DENOMINATORS / "cases.yaml").read_bytes()).hexdigest()
     assert lock["seed"]["case_lock"]["path"] == "denominators/cases.lock.json"
     assert lock["seed"]["case_lock"]["sha256"] == hashlib.sha256((DENOMINATORS / "cases.lock.json").read_bytes()).hexdigest()
-    assert (DENOMINATORS / "source-manifest.json").is_file()
+    source_manifest = _load(DENOMINATORS / "source-manifest.json")
+    assert source_manifest["initial_exit_platforms"] == _exit_platform_manifest(
+        lock, _load(ACC / "stage_exits.json"),
+    )
     seed_exit_ids = {item_id for item_id, _, _, _ in STAGE3_REQUIRED_EXIT_SPECS}
     assert seed_exit_ids <= set(lock["exits"])
     for item_id, platform, layer, families in STAGE3_REQUIRED_EXIT_SPECS:
@@ -992,6 +1015,105 @@ def test_required_cases_add_only_registers_new_platform(tmp_path):
     assert result == 0
     updated = _load(acceptance / "stage3_required_cases.lock.json")
     assert "windows" in updated["exits"]["S3-L15-RELEASE-AB-LINUX"]
+
+
+@pytest.mark.parametrize("mode", ["--check", "--add-only"])
+@pytest.mark.parametrize("shrink", ["exit", "platform"])
+def test_required_cases_commands_reject_initial_exit_platform_shrink_without_base_lock(
+    tmp_path, capsys, mode, shrink,
+):
+    from tools.stage3 import required_cases
+
+    root, source_reader = _required_cases_repo(tmp_path)
+    acceptance = root / "tests" / "acceptance"
+    manifest_path = root / "docs" / "rust-refactor" / "evidence" / "denominators" / "source-manifest.json"
+    manifest = _load(manifest_path)
+    initial = manifest["initial_exit_platforms"][0]
+    catalog_path = acceptance / "stage_exits.json"
+    catalog = _load(catalog_path)
+    lock_path = acceptance / "stage3_required_cases.lock.json"
+    lock = _load(lock_path)
+
+    if shrink == "exit":
+        catalog["items"] = [item for item in catalog["items"] if item["item_id"] != initial["item_id"]]
+        del lock["exits"][initial["item_id"]]
+    else:
+        target = next(item for item in catalog["items"] if item["item_id"] == initial["item_id"])
+        replacement = "windows" if initial["platform"] == "linux" else "linux"
+        sibling = next(
+            entry for item_id, platforms in lock["exits"].items()
+            if item_id != initial["item_id"]
+            for platform, entry in platforms.items()
+            if platform == replacement and entry["layer"] == initial["layer"]
+        )
+        target["platform"] = replacement
+        lock["exits"][initial["item_id"]] = {replacement: copy.deepcopy(sibling)}
+
+    catalog_path.write_text(json.dumps(catalog, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    lock_path.write_text(json.dumps(lock, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    before = lock_path.read_bytes()
+
+    def first_pr_reader(revision: str, repo_path: str) -> bytes | None:
+        if revision == "base-revision" and repo_path in {
+            "tests/acceptance/stage3_required_cases.lock.json",
+            "docs/rust-refactor/evidence/denominators/source-manifest.json",
+        }:
+            return None
+        return source_reader(revision, repo_path)
+
+    result = required_cases.main([mode, "--base", "base-revision"], repo_root=root, source_reader=first_pr_reader)
+
+    assert result != 0, capsys.readouterr().out
+    assert lock_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("mode", ["--check", "--add-only"])
+def test_required_cases_rejects_changed_source_manifest_present_in_base(tmp_path, capsys, mode):
+    from tools.stage3 import required_cases
+
+    root, source_reader = _required_cases_repo(tmp_path)
+    manifest_path = root / "docs" / "rust-refactor" / "evidence" / "denominators" / "source-manifest.json"
+    base_manifest = manifest_path.read_bytes()
+    manifest = json.loads(base_manifest)
+    manifest["initial_exit_platforms"].pop()
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    lock_path = root / "tests" / "acceptance" / "stage3_required_cases.lock.json"
+    before = lock_path.read_bytes()
+
+    def existing_manifest_reader(revision: str, repo_path: str) -> bytes | None:
+        if revision == "base-revision" and repo_path == "docs/rust-refactor/evidence/denominators/source-manifest.json":
+            return base_manifest
+        return source_reader(revision, repo_path)
+
+    result = required_cases.main([mode, "--base", "base-revision"], repo_root=root,
+                                 source_reader=existing_manifest_reader)
+
+    assert result != 0, capsys.readouterr().out
+    assert lock_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("mutation", ["missing_initial_exit_platforms", "unknown_manifest_key",
+                                        "missing_exit_layer", "unknown_exit_key"])
+def test_public_seed_manifest_checks_initial_exit_platform_fields_exactly(tmp_path, mutation):
+    from tools.stage3 import required_cases
+
+    root, source_reader = _required_cases_repo(tmp_path)
+    manifest_path = root / "docs" / "rust-refactor" / "evidence" / "denominators" / "source-manifest.json"
+    manifest = _load(manifest_path)
+    if mutation == "missing_initial_exit_platforms":
+        del manifest["initial_exit_platforms"]
+    elif mutation == "unknown_manifest_key":
+        manifest["unexpected"] = True
+    elif mutation == "missing_exit_layer":
+        del manifest["initial_exit_platforms"][0]["layer"]
+    else:
+        manifest["initial_exit_platforms"][0]["unexpected"] = True
+
+    errors = required_cases.verify_seed_sources(manifest, evidence_root=root / "docs" / "rust-refactor" / "evidence",
+                                                source_reader=source_reader)
+
+    assert errors
+    assert any("schema 欄位" in error for error in errors)
 
 
 def test_required_cases_add_only_rejects_base_exit_shrink_without_writing(tmp_path, capsys):
