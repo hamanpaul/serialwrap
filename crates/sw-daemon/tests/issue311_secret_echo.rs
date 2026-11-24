@@ -1495,13 +1495,35 @@ fn issue311_login_echo_is_masked_when_crlf_is_buffered_at_secret_submit() {
     let baseline = controlled_output_baseline(&rig.service, &log_path, &console);
 
     let device = rig.device.clone();
-    rig.device
-        .on_os_submit(Box::new(move || device.push_rx(b"\r\n")));
+    let crlf_buffered = Arc::new(AtomicBool::new(false));
+    let crlf_buffered_in_submit = crlf_buffered.clone();
+    rig.device.on_os_submit(Box::new(move || {
+        if !crlf_buffered_in_submit.swap(true, Ordering::SeqCst) {
+            device.push_rx(b"\r\n");
+        }
+    }));
     let read_before = rig.device.rx_bytes_read();
+    rig.device.hold_rx_reads();
     rig.device.release_pause();
     rig.secret_seen
         .recv_timeout(Duration::from_secs(3))
         .expect("secret TX 已抵達 fake OS submit，CRLF 先前已放入 RX buffer");
+    assert_eq!(
+        rig.device.rx_bytes_read(),
+        read_before,
+        "secret submit 時，OS RX buffer 中的 CRLF 尚未被 reader 讀取"
+    );
+    assert_eq!(
+        rig.device.rx_bytes_pending(),
+        2,
+        "secret submit 時，CRLF 必須仍留在 fake OS RX buffer"
+    );
+    rig.device.release_rx_reads();
+    wait_controlled_rx(
+        &rig.device,
+        read_before + 2,
+        "reader 在 secret submit 後才消耗已緩衝 CRLF",
+    );
     let secret_echo = b"# secret\r\n";
     rig.echo_release
         .send(secret_echo.to_vec())

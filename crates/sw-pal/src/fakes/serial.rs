@@ -309,6 +309,7 @@ pub(crate) struct FakeDeviceInner {
     writes: AtomicUsize,
     os_submits: AtomicUsize,
     rx_bytes_read: AtomicUsize,
+    rx_reads_held: AtomicBool,
     blocked_release: AtomicBool,
     /// P6 Task 6：`BlockForever` 正在 gate 外阻塞（`wait_blocked` 讀取）。
     blocked_now: AtomicBool,
@@ -354,6 +355,7 @@ impl FakeDeviceInner {
             writes: AtomicUsize::new(0),
             os_submits: AtomicUsize::new(0),
             rx_bytes_read: AtomicUsize::new(0),
+            rx_reads_held: AtomicBool::new(false),
             blocked_release: AtomicBool::new(false),
             blocked_now: AtomicBool::new(false),
             loopback: Mutex::new(None),
@@ -616,6 +618,20 @@ impl FakeDevice {
         self.inner.cond.notify_all();
     }
 
+    /// 暫停 fake reader 消耗 RX queue 中的 bytes，供受控 buffer 交錯測試使用。
+    pub fn hold_rx_reads(&self) {
+        let _g = self.inner.cond_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        self.inner.rx_reads_held.store(true, Ordering::SeqCst);
+        self.inner.cond.notify_all();
+    }
+
+    /// 解除 RX read barrier，喚醒 fake reader。
+    pub fn release_rx_reads(&self) {
+        let _g = self.inner.cond_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        self.inner.rx_reads_held.store(false, Ordering::SeqCst);
+        self.inner.cond.notify_all();
+    }
+
     /// 模擬對端關閉（reader 讀完剩餘資料後回 `Ok(ReadOutcome::Eof)`）。
     pub fn close_peer(&self) {
         self.inner.peer_closed.store(true, Ordering::SeqCst);
@@ -631,6 +647,11 @@ impl FakeDevice {
     /// Fake reader 已從 RX queue 消耗的 byte 數，供測試逐次確認讀取邊界。
     pub fn rx_bytes_read(&self) -> usize {
         self.inner.rx_bytes_read.load(Ordering::SeqCst)
+    }
+
+    /// Fake reader 尚未消耗的 RX queue 長度，供受控 buffer 交錯測試使用。
+    pub fn rx_bytes_pending(&self) -> usize {
+        self.inner.rx.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Fake reader 已觀察到的讀取錯誤次數（供同步測試使用）。
@@ -998,6 +1019,17 @@ impl SerialReader for FakeSerialReader {
                     5,
                     "[Errno 5] Input/output error",
                 )));
+            }
+            if self.inner.rx_reads_held.load(Ordering::SeqCst) {
+                let remaining = timeout
+                    .map(|d| d.saturating_sub(start.elapsed()))
+                    .unwrap_or(Duration::from_millis(1));
+                let pause = remaining.min(Duration::from_millis(1));
+                drop(guard);
+                if !pause.is_zero() {
+                    std::thread::sleep(pause);
+                }
+                return Ok(ReadOutcome::TimedOut);
             }
             if self.inner.woken.swap(false, Ordering::SeqCst) {
                 return Ok(ReadOutcome::Woken);
