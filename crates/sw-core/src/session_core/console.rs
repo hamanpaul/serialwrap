@@ -109,7 +109,7 @@ impl SessionCore {
 
     /// drain Phase 1 時記下的 human lease owner（05 §3.1 第 1 步）。
     pub fn retained_human_owner(&self) -> Option<&str> {
-        self.retained_human.as_ref().map(|(owner, _)| owner.as_str())
+        self.retained_human.as_ref().map(|(owner, _, _)| owner.as_str())
     }
 
     /// Python `foreground_busy`：只有命令（含 mode=interactive 命令）與檔案傳輸（P8 Task 6，`kind="file"`）是前景
@@ -995,7 +995,7 @@ impl SessionCore {
         // `uart_io.py:1113-1115`：bridge 停止時關閉 listener、端點清為 None（executor 於 BeginDrain 停 hub listener）。
         self.human.console_endpoint = None;
         if let Some(lease) = self.lease.as_ref().filter(|l| l.is_human()) {
-            self.retained_human = Some((lease.owner.clone(), lease.timeout_s));
+            self.retained_human = Some((lease.owner.clone(), lease.timeout_s, lease.mirror_client_lifetime));
         }
         let before = self.human.ownership.interactive_owner.clone();
         self.human.ownership.reset_for_stop();

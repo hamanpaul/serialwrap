@@ -258,15 +258,7 @@ impl SessionCore {
         };
 
         // 新鏡像沿用既有的交接 admission 與 bridge／state／stop／flash guards；它不接觸 ownership。
-        if self.generations.conn_epoch.is_none()
-            || !matches!(self.state, SessionState::Ready | SessionState::Attached)
-            || self.stop.is_some()
-            || self.pending_open_stop.is_some()
-            || self.shutdown_requested
-            || self.shutdown_complete
-            || self.flash_busy()
-            || self.handoff_frozen()
-        {
+        if !self.tcp_mirror_guard_allows_new() {
             return;
         }
         let gate = self.deps.registry.admission_gate();
@@ -274,7 +266,7 @@ impl SessionCore {
             return;
         };
         let _admission = crate::admission::AdmissionTicket::new(gate, ticket);
-        if self.handoff_frozen() {
+        if !self.tcp_mirror_guard_allows_new() {
             return;
         }
 
@@ -307,6 +299,18 @@ impl SessionCore {
             // Agent／一般 human lease 與非 mirror stash 都是既有權威，不由 TCP mirror 覆蓋。
             _ => {}
         }
+    }
+
+    /// TCP self-heal 與 lease mirror 必須在同一組 lifecycle／flash／handoff 條件下才可授權或建帳。
+    fn tcp_mirror_guard_allows_new(&self) -> bool {
+        self.generations.conn_epoch.is_some()
+            && matches!(self.state, SessionState::Ready | SessionState::Attached)
+            && self.stop.is_none()
+            && self.pending_open_stop.is_none()
+            && !self.shutdown_requested
+            && !self.shutdown_complete
+            && !self.flash_busy()
+            && !self.handoff_frozen()
     }
 
     /// 自 EOF／owner 替換移除指定 client lifetime 的 mirror；不呼叫 human_set_owner。
@@ -432,6 +436,14 @@ impl SessionCore {
         let Some(primary) = self.human.primary_client_id.clone() else {
             return;
         };
+        let primary_is_tcp = self
+            .human
+            .consoles
+            .get(&primary)
+            .is_some_and(|console| console.kind == crate::human_console::ConsoleTransportKind::TcpTelnet);
+        if primary_is_tcp && !self.tcp_mirror_guard_allows_new() {
+            return;
+        }
         if !self.human_peer_present(&primary) {
             return;
         }
@@ -443,7 +455,7 @@ impl SessionCore {
             return;
         };
         let _admission = crate::admission::AdmissionTicket::new(gate, ticket);
-        if self.handoff_frozen() {
+        if self.handoff_frozen() || (primary_is_tcp && !self.tcp_mirror_guard_allows_new()) {
             return;
         }
         let owner = format!("human:{primary}");
@@ -664,7 +676,7 @@ impl SessionCore {
         {
             return;
         }
-        let Some((owner, timeout_s)) = self.retained_human.take() else {
+        let Some((owner, timeout_s, retained_tcp_lifetime)) = self.retained_human.take() else {
             return;
         };
         let Some(cid) = owner.strip_prefix("human:").filter(|c| !c.is_empty()) else {
@@ -673,9 +685,23 @@ impl SessionCore {
         if !self.human.consoles.contains_key(cid) {
             return;
         }
+        let mirror_lifetime = match retained_tcp_lifetime {
+            Some(lifetime)
+                if self.human.consoles.get(cid).is_some_and(|console| {
+                    console.kind == crate::human_console::ConsoleTransportKind::TcpTelnet
+                        && self.human.is_live(cid, lifetime)
+                        && console.client_lifetime == lifetime
+                        && self.human.peer_present.get(cid).copied().unwrap_or(true)
+                }) =>
+            {
+                Some(lifetime)
+            }
+            Some(_) => return,
+            None => None,
+        };
         self.refresh_lease_p6(now);
         if self.lease.is_none() {
-            self.open_lease(&owner, timeout_s, false, now);
+            self.open_lease_with_tcp_mirror(&owner, timeout_s, false, now, mirror_lifetime);
         }
     }
 

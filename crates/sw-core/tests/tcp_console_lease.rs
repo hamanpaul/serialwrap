@@ -119,6 +119,64 @@ fn tcp_mirror_lifecycle_and_guards() {
 }
 
 #[test]
+fn tcp_mirror_retained_recover_preserves_lifetime_on_eof() {
+    let mut h = tcp_ready(&["a"]);
+    let lifetime = h.lifetime("a");
+
+    h.begin_stop(sw_core::drain::StopKind::Recover);
+    let (epoch, stop_id) = h.pending_stop();
+    h.receipt(epoch, stop_id).feed();
+    h.bridge_ok();
+    let epoch = h.epoch();
+    let fsm_gen = h.core.generations().fsm_gen;
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: sw_core::login_fsm::LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+
+    let restored = h.core.active_lease().expect("retained TCP human lease");
+    assert_eq!(restored.owner, "human:a");
+    assert_eq!(restored.mirror_client_lifetime, Some(lifetime), "recover 還原必須保留 TCP lifetime");
+    assert!(h.lease_index_ops().iter().any(|op| matches!(op, LeaseIndexOp::InsertTcpMirror { interactive_id } if interactive_id == &restored.interactive_id)));
+
+    h.disconnect("a");
+    assert!(h.core.active_lease().is_none(), "TCP EOF 必須立即撤除 retained mirror");
+    h.connect_stream_console("b", ConsoleTransportKind::TcpTelnet);
+    let b_lifetime = h.lifetime("b");
+    let b_id = active_id(&h);
+    assert_eq!(h.core.active_lease().unwrap().mirror_client_lifetime, Some(b_lifetime));
+    h.data(DataEvent::ConsoleDisconnected {
+        client_id: "a".into(),
+        client_lifetime: lifetime,
+    });
+    assert_eq!(h.core.active_lease().map(|lease| lease.interactive_id.as_str()), Some(b_id.as_str()), "A 的舊 lifetime 不得移除 B");
+    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:b"));
+}
+
+#[test]
+fn tcp_mirror_self_heal_respects_flash_critical_window() {
+    let mut h = tcp_ready(&["c1"]);
+    close_mirror_publicly(&mut h, "c1");
+    assert!(h.core.active_lease().is_none());
+    assert!(h.core.human_console().ownership.interactive_owner.is_none());
+
+    // 模擬 manager 已標記 flash-critical、但 FlashSyncProbeStart 尚未進 actor 的窗口。
+    h.fence.with(|fence| fence.flash_critical = true);
+    h.scan(None);
+    assert!(h.core.active_lease().is_none(), "flash-critical 自癒不得建立 mirror");
+    assert!(h.core.human_console().ownership.interactive_owner.is_none(), "flash-critical 自癒不得授予 raw owner");
+
+    h.fence.with(|fence| fence.flash_critical = false);
+    h.scan(None);
+    let lease = h.core.active_lease().expect("解除 flash-critical 後 self-heal 建立 mirror");
+    assert_eq!(lease.owner, "human:c1");
+    assert_eq!(lease.mirror_client_lifetime, Some(h.lifetime("c1")));
+    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:c1"));
+}
+
+#[test]
 fn tcp_mirror_tracks_active_suspended_pending() {
     let mut h = tcp_ready(&["c1"]);
     h.input("c1", b"x");
@@ -307,6 +365,11 @@ fn tcp_mirror_secondary_line_respects_lease_busy() {
     let rejected = h.input("c2", b"ls\r");
     assert!(!rejected.iter().any(|effect| matches!(effect, Effect::StartOp { .. })));
     assert_eq!(h.tx_effect_count(), before, "第二 console 遇 mirror lease 零 UART TX");
+    let row = h.last_human_command().expect("第二 console 的 line command 應進 command registry");
+    assert_eq!(row.get("source"), Some(&PyValue::from("human:c2")), "命令來源");
+    assert_eq!(row.get("command"), Some(&PyValue::from("ls")), "命令內容");
+    assert_eq!(row.get("status"), Some(&PyValue::from("error")), "命令應以錯誤終態結束");
+    assert_eq!(row.get("error_code"), Some(&PyValue::from("SESSION_INTERACTIVE_BUSY")), "第二 console 必須得到精確 BUSY");
 
     close_mirror_publicly(&mut h, "c1");
     let accepted = h.input("c2", b"ls\r");

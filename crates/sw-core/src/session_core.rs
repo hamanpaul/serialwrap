@@ -742,7 +742,7 @@ pub struct SessionCore {
     /// P6：human console 狀態（ownership、line editor、DeferredBuffer、human TX lane、回放保留）。
     human: crate::human_console::HumanConsoleState,
     /// P6 增補 #11：drain Phase 1 時的 human lease owner 與 timeout（05 §3.1 第 1 步）。
-    retained_human: Option<(String, f64)>,
+    retained_human: Option<(String, f64, Option<u64>)>,
     /// P6 Task 6：目前前景命令的 admission（`fg_finish` 依此 resume）。
     fg_adm: Option<FgAdmission>,
     /// P6 增補 #12：self-test suspend 的世代（drain Phase 1 重設 ownership 時遞增）；各 probe 的 suspend 旗標
@@ -7130,8 +7130,20 @@ impl SessionCore {
 
     /// 開新 lease：owner_gen 遞增（舊 LeaseOwner job 由 fence `OwnerMismatch` 撤銷）。
     fn open_lease(&mut self, owner: &str, timeout_s: f64, recovery_mode: bool, now: Mono) -> String {
+        self.open_lease_with_tcp_mirror(owner, timeout_s, recovery_mode, now, None)
+    }
+
+    /// 開啟保留的 lease；TCP mirror 沿用原 client lifetime，LeaseIndex 仍在 Reply 前發布。
+    fn open_lease_with_tcp_mirror(
+        &mut self,
+        owner: &str,
+        timeout_s: f64,
+        recovery_mode: bool,
+        now: Mono,
+        mirror_client_lifetime: Option<u64>,
+    ) -> String {
         let id = self.next_uuid();
-        let lease = InteractiveLease::new(
+        let mut lease = InteractiveLease::new(
             id.clone(),
             owner.to_string(),
             self.wall_iso(),
@@ -7139,11 +7151,17 @@ impl SessionCore {
             now,
             recovery_mode,
         );
+        lease.mirror_client_lifetime = mirror_client_lifetime;
         self.lease = Some(lease);
         self.bump_owner_gen();
         // P6：`_open_interactive_locked` → `bridge.set_interactive_owner(owner)`；全域 LeaseIndex 先於 Reply（07 Task 7）。
         self.human_set_owner(Some(owner));
-        self.lease_index(LeaseIndexOp::Insert { interactive_id: id.clone() });
+        let index = if mirror_client_lifetime.is_some() {
+            LeaseIndexOp::InsertTcpMirror { interactive_id: id.clone() }
+        } else {
+            LeaseIndexOp::Insert { interactive_id: id.clone() }
+        };
+        self.lease_index(index);
         id
     }
 
