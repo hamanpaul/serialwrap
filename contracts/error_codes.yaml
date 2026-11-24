@@ -149,11 +149,11 @@ codes:
     reachable: true
     constant: ERROR_CMD_TOO_LONG
     scope: {interfaces: [rpc], methods: ["command.submit"], platforms: [posix, windows]}
-    meaning: "命令的 UTF-8 長度超過硬上限 16384 bytes，拒絕提交"
+    meaning: "命令的 UTF-8 長度超過硬上限 16384 bytes，或超過 session profile 的 max_console_line_chars（console 單行上限，不含結尾換行），拒絕提交；limit 為實際套用的上限"
     side_effect: "無（不入列）"
     retryable: "fix_args"
     uart_tx: none
-    agent_action: "縮短命令內容；超過 4096 bytes 的軟上限仍會成功，但會附 CMD_LENGTH_WARNING 警告（非錯誤碼）"
+    agent_action: "縮短命令內容；limit 是 profile 的 console 單行上限時，做不到就把內容寫成腳本，以 file push 傳到 target 後執行。超過 4096 bytes 的軟上限仍會成功，但會附 CMD_LENGTH_WARNING 警告（非錯誤碼）"
     extra_fields: ["cmd_length", "limit", "hint"]
     contract_tests: ["tests/test_issue27_newline_reject.py::TestNewlineReject::test_command_too_long_takes_priority"]
     behavior_change: []
