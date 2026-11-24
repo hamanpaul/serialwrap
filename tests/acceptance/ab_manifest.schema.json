@@ -1,0 +1,930 @@
+{
+  "$defs": {
+    "Authorization": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_destructive": {
+          "type": "boolean"
+        },
+        "boards": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "decision_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "allow_destructive",
+        "decision_ref",
+        "boards"
+      ],
+      "type": "object"
+    },
+    "Dut": {
+      "additionalProperties": false,
+      "properties": {
+        "boards": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "com_pair": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "bridge_side": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "daemon_side": {
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "daemon_side",
+                "bridge_side"
+              ],
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "expected_fingerprint": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "fingerprint_argv": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "image": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "image_digest": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "kind": {
+          "enum": [
+            "local-process",
+            "docker",
+            "physical-substitute",
+            "hardware"
+          ]
+        },
+        "reset_argv": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "transport": {
+          "enum": [
+            "posix-pty",
+            "com0com-pair",
+            "physical-usb-uart"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "transport",
+        "com_pair",
+        "image",
+        "image_digest",
+        "boards",
+        "reset_argv",
+        "fingerprint_argv",
+        "expected_fingerprint"
+      ],
+      "type": "object"
+    },
+    "FrozenFile": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "FrozenTree": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "tree_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "tree_sha256"
+      ],
+      "type": "object"
+    },
+    "Release": {
+      "additionalProperties": false,
+      "properties": {
+        "accept_unreadable_holders": {
+          "type": "boolean"
+        },
+        "device_open_probe": {
+          "type": "boolean"
+        },
+        "device_paths": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "endpoints": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "lock_paths": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "poll_s": {
+          "exclusiveMinimum": 0,
+          "type": "number"
+        },
+        "timeout_s": {
+          "exclusiveMinimum": 0,
+          "type": "number"
+        }
+      },
+      "required": [
+        "timeout_s",
+        "poll_s",
+        "endpoints",
+        "device_paths",
+        "lock_paths",
+        "device_open_probe",
+        "accept_unreadable_holders"
+      ],
+      "type": "object"
+    },
+    "Reverify": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "order": {
+          "items": {
+            "enum": [
+              "A",
+              "B"
+            ]
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "enabled",
+        "order"
+      ],
+      "type": "object"
+    },
+    "Side": {
+      "additionalProperties": false,
+      "properties": {
+        "activate_argv": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "bundle_dir": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "cli_exe": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "daemon_exe": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "deactivate_argv": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "label": {
+          "enum": [
+            "A",
+            "B"
+          ]
+        },
+        "release_manifest": {
+          "$ref": "#/$defs/FrozenFile"
+        },
+        "role": {
+          "enum": [
+            "baseline",
+            "candidate"
+          ]
+        }
+      },
+      "required": [
+        "label",
+        "role",
+        "bundle_dir",
+        "release_manifest",
+        "cli_exe",
+        "daemon_exe",
+        "activate_argv",
+        "deactivate_argv"
+      ],
+      "type": "object"
+    },
+    "Suite": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter": {
+          "enum": [
+            "l15_functest",
+            "l2_regression",
+            "l3_realhw"
+          ]
+        },
+        "extra_args": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "realhw_config_template": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FrozenFile"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "selftest_report": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FrozenFile"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "testbed_template": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FrozenFile"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tier": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "timeout_s": {
+          "exclusiveMinimum": 0,
+          "type": "number"
+        }
+      },
+      "required": [
+        "adapter",
+        "timeout_s",
+        "selftest_report",
+        "testbed_template",
+        "realhw_config_template",
+        "tier",
+        "extra_args"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://serialwrap.local/schemas/ab_manifest",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "properties": {
+        "tools": {
+          "contains": {
+            "properties": {
+              "path": {
+                "const": "tools/stage3"
+              }
+            },
+            "required": [
+              "path",
+              "tree_sha256"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "layer": {
+            "const": "l1.5"
+          }
+        },
+        "required": [
+          "layer"
+        ]
+      },
+      "then": {
+        "properties": {
+          "suite": {
+            "properties": {
+              "adapter": {
+                "const": "l15_functest"
+              }
+            }
+          },
+          "tools": {
+            "allOf": [
+              {
+                "contains": {
+                  "properties": {
+                    "path": {
+                      "const": "tools/uart_stdio_bridge"
+                    }
+                  },
+                  "required": [
+                    "path",
+                    "tree_sha256"
+                  ],
+                  "type": "object"
+                }
+              },
+              {
+                "contains": {
+                  "properties": {
+                    "path": {
+                      "const": "func-test"
+                    }
+                  },
+                  "required": [
+                    "path",
+                    "tree_sha256"
+                  ],
+                  "type": "object"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "layer": {
+            "const": "l2"
+          }
+        },
+        "required": [
+          "layer"
+        ]
+      },
+      "then": {
+        "properties": {
+          "suite": {
+            "properties": {
+              "adapter": {
+                "const": "l2_regression"
+              }
+            }
+          },
+          "tools": {
+            "contains": {
+              "properties": {
+                "path": {
+                  "const": "regression"
+                }
+              },
+              "required": [
+                "path",
+                "tree_sha256"
+              ],
+              "type": "object"
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "layer": {
+            "const": "l3"
+          }
+        },
+        "required": [
+          "layer"
+        ]
+      },
+      "then": {
+        "properties": {
+          "acceptance": {
+            "$ref": "#/$defs/FrozenFile"
+          },
+          "endpoint": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "failure_retention": {
+            "const": "on-demand"
+          },
+          "suite": {
+            "properties": {
+              "adapter": {
+                "const": "l3_realhw"
+              }
+            }
+          },
+          "tools": {
+            "contains": {
+              "properties": {
+                "path": {
+                  "const": "realhw"
+                }
+              },
+              "required": [
+                "path",
+                "tree_sha256"
+              ],
+              "type": "object"
+            }
+          }
+        },
+        "required": [
+          "acceptance",
+          "endpoint",
+          "failure_retention"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "stage": {
+            "const": "3"
+          }
+        },
+        "required": [
+          "stage"
+        ]
+      },
+      "then": {
+        "properties": {
+          "required_case_set": {
+            "const": "slice_2.4"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "platform": {
+            "const": "windows"
+          }
+        },
+        "required": [
+          "platform"
+        ]
+      },
+      "then": {
+        "if": {
+          "properties": {
+            "dut": {
+              "properties": {
+                "transport": {
+                  "const": "com0com-pair"
+                }
+              },
+              "required": [
+                "transport"
+              ]
+            }
+          },
+          "required": [
+            "dut"
+          ]
+        },
+        "then": {
+          "properties": {
+            "test_device_allowlist": {
+              "minItems": 1
+            }
+          },
+          "required": [
+            "test_device_allowlist"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "reverify": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            },
+            "required": [
+              "enabled"
+            ]
+          }
+        },
+        "required": [
+          "reverify"
+        ]
+      },
+      "then": {
+        "properties": {
+          "reverify": {
+            "properties": {
+              "order": {
+                "const": [
+                  "B",
+                  "A"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "else": {
+        "properties": {
+          "candidate_context": {
+            "type": "null"
+          },
+          "exit_catalog_sha256": {
+            "type": "null"
+          },
+          "exit_item_id": {
+            "type": "null"
+          },
+          "required_cases_lock": {
+            "type": "null"
+          },
+          "required_cases_sha256": {
+            "type": "null"
+          }
+        }
+      },
+      "if": {
+        "properties": {
+          "stage": {
+            "const": "3"
+          }
+        },
+        "required": [
+          "stage"
+        ]
+      },
+      "then": {
+        "properties": {
+          "candidate_context": {
+            "$ref": "#/$defs/FrozenFile"
+          },
+          "exit_catalog_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "exit_item_id": {
+            "pattern": "^S3-[A-Z0-9-]+$",
+            "type": "string"
+          },
+          "required_cases_lock": {
+            "$ref": "#/$defs/FrozenFile"
+          },
+          "required_cases_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "exit_item_id",
+          "exit_catalog_sha256",
+          "candidate_context",
+          "required_cases_lock",
+          "required_cases_sha256"
+        ]
+      }
+    }
+  ],
+  "properties": {
+    "acceptance": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/FrozenFile"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "allowed_differences": {
+      "$ref": "#/$defs/FrozenFile"
+    },
+    "authorization": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Authorization"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "candidate_context": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/FrozenFile"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "case_ids": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "case_list": {
+      "$ref": "#/$defs/FrozenFile"
+    },
+    "case_lock": {
+      "$ref": "#/$defs/FrozenFile"
+    },
+    "contract_revision": {
+      "pattern": "^[0-9a-f]{40}$",
+      "type": "string"
+    },
+    "dut": {
+      "$ref": "#/$defs/Dut"
+    },
+    "endpoint": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "exit_catalog_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "exit_item_id": {
+      "minLength": 1,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "failure_retention": {
+      "enum": [
+        "on-demand",
+        null
+      ]
+    },
+    "layer": {
+      "enum": [
+        "l1.5",
+        "l2",
+        "l3"
+      ]
+    },
+    "platform": {
+      "enum": [
+        "linux",
+        "windows"
+      ]
+    },
+    "platform_settings": {
+      "type": "object"
+    },
+    "profile_files": {
+      "items": {
+        "$ref": "#/$defs/FrozenFile"
+      },
+      "type": "array"
+    },
+    "release": {
+      "$ref": "#/$defs/Release"
+    },
+    "required_case_set": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "required_cases_lock": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/FrozenFile"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "required_cases_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reverify": {
+      "$ref": "#/$defs/Reverify"
+    },
+    "run_id": {
+      "pattern": "^[a-z0-9][a-z0-9._-]{2,63}$",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "seed": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "sides": {
+      "items": false,
+      "maxItems": 2,
+      "minItems": 2,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/Side",
+          "properties": {
+            "label": {
+              "const": "A"
+            },
+            "role": {
+              "const": "baseline"
+            }
+          }
+        },
+        {
+          "$ref": "#/$defs/Side",
+          "properties": {
+            "label": {
+              "const": "B"
+            },
+            "role": {
+              "const": "candidate"
+            }
+          }
+        }
+      ],
+      "type": "array"
+    },
+    "stage": {
+      "enum": [
+        "1A",
+        "1B",
+        "2.1",
+        "2.2",
+        "2.3",
+        "2.4",
+        "3"
+      ]
+    },
+    "suite": {
+      "$ref": "#/$defs/Suite"
+    },
+    "test_device_allowlist": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "tools": {
+      "items": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/FrozenFile"
+          },
+          {
+            "$ref": "#/$defs/FrozenTree"
+          }
+        ]
+      },
+      "minItems": 1,
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "run_id",
+    "layer",
+    "platform",
+    "stage",
+    "contract_revision",
+    "case_list",
+    "case_lock",
+    "required_case_set",
+    "case_ids",
+    "tools",
+    "allowed_differences",
+    "acceptance",
+    "profile_files",
+    "seed",
+    "platform_settings",
+    "dut",
+    "authorization",
+    "test_device_allowlist",
+    "sides",
+    "suite",
+    "endpoint",
+    "release",
+    "reverify",
+    "failure_retention"
+  ],
+  "title": "Stage 3 Sequential A/B 凍結 manifest",
+  "type": "object"
+}

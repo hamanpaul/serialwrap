@@ -1,0 +1,14 @@
+{
+  "approved_at": null,
+  "approved_by": null,
+  "decision_ref": null,
+  "effective_bundle_version": null,
+  "evidence_index": "docs/rust-refactor/evidence/index.json",
+  "evidence_index_sha256": null,
+  "retired": false,
+  "schema_version": 2,
+  "stage3_target_artifact_ids": {
+    "linux": null,
+    "windows": null
+  }
+}

@@ -216,15 +216,15 @@ def test_ledger_snapshot_verified_requires_tree_digests():
 def test_evidence_index_l1_set_and_stage3_tree_rules():
     v = _validator("stage3_evidence_index.schema.json")
     h = "a" * 64
-    entry = {"entry_id": "0" * 20, "exit_catalog_sha256": h, "candidate_round_id": "r" * 32,
+    entry = {"entry_id": "0" * 20, "exit_catalog_sha256": h, "candidate_round_id": "a" * 32,
              "archive_sha256": h, "item_id": "S3-L1-RELEASE-CONTRACT-LINUX", "platform": "linux", "result": "PASS",
              "artifact_id": h, "runtime_digest": h, "bundle_tree_sha256": h, "runtime_tree_sha256": h,
-             "contract_revision": "c" * 40, "tool_revision": "t" * 40, "case_list_sha256": h,
+             "contract_revision": "c" * 40, "tool_revision": "b" * 40, "case_list_sha256": h,
              "required_cases_sha256": h, "l1_set_sha256": h,
              "workload_sha256": None, "environment_id": h, "produced_at": "2026-11-02T00:00:00+00:00",
              "started_at": "2026-11-02T00:00:00+00:00", "producer": "ingest:junit", "files": [{"path": "a.json", "sha256": h}],
              "xfail_cases": [], "reuse_of": None, "note": "", "ledger_through": None, "ledger_records": None}
-    base = {"candidate_rounds": [], "current_candidate_round_id": "r" * 32, "entries": [entry],
+    base = {"candidate_rounds": [], "current_candidate_round_id": "a" * 32, "entries": [entry],
             "legacy_obligations": {"scope": None, "resolutions": None}, "schema_version": 2,
             "stage_targets": {}, "target_history": []}
     assert not list(v.iter_errors(base))
@@ -234,13 +234,13 @@ def test_evidence_index_l1_set_and_stage3_tree_rules():
     other_set = copy.deepcopy(base)
     other_set["entries"][0]["producer"] = "ingest:functest-report"
     assert list(v.iter_errors(other_set))               # 其他 producer 必為 null
-    target = {"artifact_id": h, "runtime_digest": h, "contract_revision": "c" * 40, "tool_revision": "t" * 40,
+    target = {"artifact_id": h, "runtime_digest": h, "contract_revision": "c" * 40, "tool_revision": "b" * 40,
               "case_list_sha256": h, "exit_catalog_sha256": h, "required_cases_sha256": h,
               "required_cases_lock": {"path": "denominators/stage3_required_cases.lock.json", "sha256": h},
-              "candidate_round_id": "r" * 32, "rc_tag": "v1.0.0-rc.1", "archive_sha256": h,
+              "candidate_round_id": "a" * 32, "rc_tag": "v1.0.0-rc.1", "archive_sha256": h,
               "legacy_scope_sha256": h, "set_by": "owner", "set_at": "2026-11-02T00:00:00+00:00"}
     other_stage_target = {"artifact_id": h, "runtime_digest": h, "contract_revision": "c" * 40,
-                          "tool_revision": "t" * 40, "case_list_sha256": h, "exit_catalog_sha256": h,
+                          "tool_revision": "b" * 40, "case_list_sha256": h, "exit_catalog_sha256": h,
                           "required_cases_sha256": None, "required_cases_lock": None,
                           "candidate_round_id": None, "rc_tag": None, "archive_sha256": None,
                           "legacy_scope_sha256": None, "set_by": "owner",
@@ -343,16 +343,16 @@ _STAGE3_TARGET_HASH = "a" * 64
 
 def _stage3_target() -> dict:
     h = _STAGE3_TARGET_HASH
-    return {"artifact_id": h, "runtime_digest": h, "contract_revision": "c" * 40, "tool_revision": "t" * 40,
+    return {"artifact_id": h, "runtime_digest": h, "contract_revision": "c" * 40, "tool_revision": "b" * 40,
             "case_list_sha256": h, "exit_catalog_sha256": h, "required_cases_sha256": h,
             "required_cases_lock": {"path": "denominators/stage3_required_cases.lock.json", "sha256": h},
-            "candidate_round_id": "r" * 32, "rc_tag": "v1.0.0-rc.1", "archive_sha256": h,
+            "candidate_round_id": "a" * 32, "rc_tag": "v1.0.0-rc.1", "archive_sha256": h,
             "legacy_scope_sha256": h, "set_by": "owner", "set_at": "2026-11-02T00:00:00+00:00",
             "bundle_tree_sha256": h, "runtime_tree_sha256": h}
 
 
 def _stage3_doc(stage: str, platform: str, target: object) -> dict:
-    return {"candidate_rounds": [], "current_candidate_round_id": "r" * 32, "entries": [],
+    return {"candidate_rounds": [], "current_candidate_round_id": "a" * 32, "entries": [],
             "legacy_obligations": {"scope": None, "resolutions": None}, "schema_version": 2,
             "target_history": [], "stage_targets": {stage: {platform: target}}}
 
@@ -390,16 +390,16 @@ def test_stage3_target_must_be_object(bad):
 
 def _evidence_base() -> dict:
     h = "a" * 64
-    entry = {"entry_id": "0" * 20, "exit_catalog_sha256": h, "candidate_round_id": "r" * 32,
+    entry = {"entry_id": "0" * 20, "exit_catalog_sha256": h, "candidate_round_id": "a" * 32,
              "archive_sha256": h, "item_id": "S3-L1-RELEASE-CONTRACT-LINUX", "platform": "linux", "result": "PASS",
              "artifact_id": h, "runtime_digest": h, "bundle_tree_sha256": h, "runtime_tree_sha256": h,
-             "contract_revision": "c" * 40, "tool_revision": "t" * 40, "case_list_sha256": h,
+             "contract_revision": "c" * 40, "tool_revision": "b" * 40, "case_list_sha256": h,
              "required_cases_sha256": h, "l1_set_sha256": h,
              "workload_sha256": None, "environment_id": h, "produced_at": "2026-11-02T00:00:00+00:00",
              "started_at": "2026-11-02T00:00:00+00:00", "producer": "ingest:junit",
              "files": [{"path": "a.json", "sha256": h}],
              "xfail_cases": [], "reuse_of": None, "note": "", "ledger_through": None, "ledger_records": None}
-    return {"candidate_rounds": [], "current_candidate_round_id": "r" * 32, "entries": [entry],
+    return {"candidate_rounds": [], "current_candidate_round_id": "a" * 32, "entries": [entry],
             "legacy_obligations": {"scope": None, "resolutions": None}, "schema_version": 2,
             "stage_targets": {}, "target_history": []}
 
@@ -428,7 +428,7 @@ def _restricted_fail_entry() -> dict:
         "artifact_id": h,
         "platform": "linux",
         "item_id": "S3-L1-RELEASE-CONTRACT-LINUX",
-        "candidate_round_id": "r" * 32,
+        "candidate_round_id": "a" * 32,
         "context_id": h,
         "private_source_sha256": h,
         "failure_summary": "已核實受測案例失敗。",
@@ -439,7 +439,7 @@ def _restricted_fail_entry() -> dict:
 
 def test_restricted_fail_index_entry_is_minimal_and_fail_only():
     v = _validator("stage3_evidence_index.schema.json")
-    doc = {"candidate_rounds": [], "current_candidate_round_id": "r" * 32,
+    doc = {"candidate_rounds": [], "current_candidate_round_id": "a" * 32,
            "entries": [_restricted_fail_entry()], "legacy_obligations": {"scope": None, "resolutions": None},
            "schema_version": 2, "stage_targets": {}, "target_history": []}
     assert not list(v.iter_errors(doc))
