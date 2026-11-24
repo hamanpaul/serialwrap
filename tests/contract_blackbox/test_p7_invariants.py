@@ -11,12 +11,8 @@ stdlib＋PyYAML＋PTY，不得 import sw_core／serialwrap／serialwrapd。
 """
 from __future__ import annotations
 
-import ast
 import base64
-import errno
-import inspect
 import os
-import sys
 import threading
 import time
 
@@ -61,234 +57,6 @@ def _daemon_fds_to(p7, path: str) -> int:
         except OSError:
             continue
     return n
-
-
-def _daemon_tty_holders(p7, path: str) -> list[str]:
-    pid = p7.daemon.proc.pid
-    try:
-        target = os.path.realpath(path, strict=True)
-    except OSError as exc:
-        raise AssertionError(f"無法解析目標 tty 路徑 {path}: {exc}") from exc
-    proc_fd = f"/proc/{pid}/fd"
-    try:
-        names = os.listdir(proc_fd)
-    except OSError as exc:
-        raise AssertionError(f"無法掃描 daemon fd 目錄 {proc_fd}: {exc}") from exc
-    holders = []
-    for name in names:
-        fd_path = f"{proc_fd}/{name}"
-        try:
-            linked = os.readlink(fd_path)
-        except OSError as exc:
-            if exc.errno == errno.ENOENT:
-                continue
-            raise AssertionError(f"無法讀取 daemon fd symlink {fd_path}: {exc}") from exc
-        try:
-            resolved = os.path.realpath(fd_path, strict=True)
-        except OSError as exc:
-            if exc.errno == errno.ENOENT:
-                continue
-            raise AssertionError(f"無法解析 daemon fd 路徑 {fd_path}: {exc}") from exc
-        if resolved == target:
-            holders.append(f"{name}->{linked}")
-    return holders
-
-
-def _holder_fd_numbers(holders: list[str]) -> set[str]:
-    return {holder.partition("->")[0] for holder in holders}
-
-
-def _assert_no_new_tty_holder_fds(
-    current_holders: list[str], baseline_fds: set[str], disappeared_fds: set[str]
-) -> None:
-    current_fds = _holder_fd_numbers(current_holders)
-    new_fds = current_fds - baseline_fds
-    assert not new_fds, f"觀察期出現 baseline 以外的 tty holder fd：{sorted(new_fds)}"
-    reappeared_fds = current_fds & disappeared_fds
-    assert not reappeared_fds, f"已消失的 baseline tty holder fd 再次出現：{sorted(reappeared_fds)}"
-    disappeared_fds.update(baseline_fds - current_fds)
-
-
-def test_daemon_tty_holder_scanner_fails_closed_on_unreadable_fd(monkeypatch) -> None:
-    """掃描期間 fd 消失可忽略；fd symlink 權限錯誤不可被當成無 holder。"""
-    class _Proc:
-        pid = 987654
-
-    class _Daemon:
-        proc = _Proc()
-
-    class _Rig:
-        daemon = _Daemon()
-
-    proc_fd = "/proc/987654/fd"
-    monkeypatch.setattr(os, "listdir", lambda path: ["7"] if path == proc_fd else [])
-
-    def permission_denied(fd_path: str) -> str:
-        raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), fd_path)
-
-    monkeypatch.setattr(os, "readlink", permission_denied)
-    with pytest.raises(AssertionError, match="無法讀取 daemon fd symlink"):
-        _daemon_tty_holders(_Rig(), "/dev/null")
-
-    def fd_disappeared(fd_path: str) -> str:
-        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), fd_path)
-
-    monkeypatch.setattr(os, "readlink", fd_disappeared)
-    assert _daemon_tty_holders(_Rig(), "/dev/null") == []
-
-
-def test_daemon_tty_holder_scanner_fails_closed_on_realpath_permission_race(monkeypatch) -> None:
-    """readlink 已成功後，fd 路徑解析遇到 EACCES 仍須失敗，不得回報為無 holder。"""
-    fd = os.open("/dev/null", os.O_RDONLY)
-    try:
-        pid = os.getpid()
-        proc_fd = f"/proc/{pid}/fd"
-        fd_path = f"{proc_fd}/{fd}"
-        events: list[str] = []
-
-        class _Proc:
-            pass
-
-        _Proc.pid = pid
-
-        class _Daemon:
-            proc = _Proc()
-
-        class _Rig:
-            daemon = _Daemon()
-
-        monkeypatch.setattr(os, "listdir", lambda path: [str(fd)] if path == proc_fd else [])
-
-        def readlink_succeeds(path: str) -> str:
-            assert path == fd_path
-            events.append("readlink")
-            return "/dev/null"
-
-        real_lstat = os.lstat
-
-        def deny_fd_resolution(path, *args, **kwargs):
-            if path == fd_path:
-                assert events == ["readlink"]
-                events.append("lstat:EACCES")
-                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
-            return real_lstat(path, *args, **kwargs)
-
-        monkeypatch.setattr(os, "readlink", readlink_succeeds)
-        monkeypatch.setattr(os, "lstat", deny_fd_resolution)
-        with pytest.raises(AssertionError, match="無法解析 daemon fd 路徑"):
-            _daemon_tty_holders(_Rig(), "/dev/null")
-        assert events == ["readlink", "lstat:EACCES"]
-    finally:
-        os.close(fd)
-
-
-def _df23_observer_snapshot() -> dict:
-    return {
-        "state": "DETACHED",
-        "last_error": "LOGIN_PROMPT_TIMEOUT",
-        "reprobe_attempts": 0,
-        "next_reprobe_at": None,
-        "reprobe_exhausted": False,
-        "bridge_generation": 1,
-        "last_state_change_at": "2026-11-23T08:05:24.654773+00:00",
-        "last_probe_at": None,
-        "last_tx_at": None,
-    }
-
-
-def test_python_tty_holder_guard_rejects_new_fd(monkeypatch) -> None:
-    """DF-23 正式觀察函式以真實 PTY 掃描出新增 fd，不能只驗模擬的 holder 字串。"""
-    master_fd, baseline_fd = os.openpty()
-    path = os.ttyname(baseline_fd)
-    opened_fds = [baseline_fd]
-
-    class _Proc:
-        pid = os.getpid()
-
-    class _Daemon:
-        proc = _Proc()
-
-    class _Rig:
-        daemon = _Daemon()
-
-    baseline = _df23_observer_snapshot()
-    calls = 0
-
-    def add_tty_fd(_p7):
-        nonlocal calls
-        if calls == 0:
-            opened_fds.append(os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK))
-        calls += 1
-        return dict(baseline)
-
-    monkeypatch.setattr(sys.modules[__name__], "_row", add_tty_fd)
-    try:
-        with pytest.raises(AssertionError, match="baseline 以外"):
-            _observe_python_df23_terminal(_Rig(), path, baseline, observe_s=1.1)
-        assert len(opened_fds) == 2 and opened_fds[0] != opened_fds[1]
-    finally:
-        for fd in opened_fds:
-            os.close(fd)
-        os.close(master_fd)
-
-
-def test_python_tty_holder_guard_rejects_reopened_baseline_fd(monkeypatch) -> None:
-    """DF-23 正式觀察函式須抓到真實 PTY fd 關閉後以同一 fd 編號重開。"""
-    master_fd, baseline_fd = os.openpty()
-    path = os.ttyname(baseline_fd)
-
-    class _Proc:
-        pid = os.getpid()
-
-    class _Daemon:
-        proc = _Proc()
-
-    class _Rig:
-        daemon = _Daemon()
-
-    baseline = _df23_observer_snapshot()
-    current_fd: int | None = baseline_fd
-    calls = 0
-
-    def close_then_reopen_tty(_p7):
-        nonlocal calls, current_fd
-        if calls == 0:
-            os.close(baseline_fd)
-            current_fd = None
-        elif calls == 1:
-            current_fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-            assert current_fd == baseline_fd, (current_fd, baseline_fd)
-        calls += 1
-        return dict(baseline)
-
-    monkeypatch.setattr(sys.modules[__name__], "_row", close_then_reopen_tty)
-    try:
-        with pytest.raises(AssertionError, match="已消失的 baseline"):
-            _observe_python_df23_terminal(_Rig(), path, baseline, observe_s=2.0)
-    finally:
-        if current_fd is not None:
-            os.close(current_fd)
-        os.close(master_fd)
-
-
-def test_df23_formal_python_branch_calls_terminal_observer() -> None:
-    """防止正式 DF-23 案例脫離 no-retry 與 holder 觀察路徑。"""
-    tree = ast.parse(inspect.getsource(test_release_during_login_waits_for_handle_close))
-    function = next(node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)))
-    rust_branch = next(
-        node for node in ast.walk(function)
-        if isinstance(node, ast.If)
-        and isinstance(node.test, ast.Call)
-        and isinstance(node.test.func, ast.Name)
-        and node.test.func.id == "is_rust"
-    )
-    python_calls = {
-        node.func.id
-        for statement in rust_branch.orelse
-        for node in ast.walk(statement)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-    }
-    assert "_observe_python_df23_terminal" in python_calls
 
 
 def _attach_human_vtty(p7, label: str) -> tuple[int, dict]:
@@ -443,121 +211,6 @@ def _reject_zero_tx(p7, tgt, want: str) -> None:
     assert _tx_count(p7) == tx_before, f"{want}：被拒請求 WAL 不得有 TX"
 
 
-def _assert_python_detached_terminal_state(state: dict, baseline: dict) -> None:
-    """DF-23 Python oracle：維持核准的 DETACHED 終態、重試欄位與 attach／probe／TX 事件時間戳。"""
-    accepted = {"ATTACH_FAILED:TxIncompleteError", "LOGIN_PROMPT_TIMEOUT"}
-    keys = (
-        "reprobe_attempts",
-        "next_reprobe_at",
-        "reprobe_exhausted",
-        "bridge_generation",
-        "last_state_change_at",
-        "last_probe_at",
-        "last_tx_at",
-    )
-    for snapshot in (baseline, state):
-        for key in keys:
-            assert key in snapshot, (key, snapshot)
-    for key in keys:
-        assert state[key] == baseline[key], (key, state, baseline)
-    for snapshot in (baseline, state):
-        assert snapshot.get("state") == "DETACHED", snapshot
-        assert snapshot.get("last_error") in accepted, snapshot
-
-
-def test_python_detached_terminal_state_oracle_accepts_the_two_observed_states() -> None:
-    """DF-23 oracle 僅接受兩種完整錯誤值；起始與觀察樣本均須維持 DETACHED 且不得重試。"""
-    fields = {
-        "reprobe_attempts": 0,
-        "next_reprobe_at": None,
-        "reprobe_exhausted": False,
-        "bridge_generation": 1,
-        "last_state_change_at": "2026-11-23T08:05:24.654773+00:00",
-        "last_probe_at": None,
-        "last_tx_at": None,
-    }
-    for error in ("ATTACH_FAILED:TxIncompleteError", "LOGIN_PROMPT_TIMEOUT"):
-        baseline = {"state": "DETACHED", "last_error": error, **fields}
-        _assert_python_detached_terminal_state(baseline, baseline)
-        _assert_python_detached_terminal_state(dict(baseline), baseline)
-
-        for bad in (
-            {**baseline, "last_error": "OTHER_ERROR"},
-            {**baseline, "last_error": "ATTACH_FAILED:TxIncompleteError:extra"},
-            {**baseline, "last_error": None},
-            {**baseline, "state": "ATTACHING"},
-            {**baseline, "state": "READY", "last_error": None},
-            {key: value for key, value in baseline.items() if key != "reprobe_attempts"},
-            {**baseline, "reprobe_attempts": 1},
-            {**baseline, "next_reprobe_at": 123.0},
-            {**baseline, "reprobe_exhausted": True},
-            {**baseline, "bridge_generation": 2},
-            # 兩次輪詢間 ATTACHING→DETACHED 失敗後，重試欄位與終態都可能復原；持久事件時間仍須揭露該次嘗試。
-            {**baseline, "last_state_change_at": "2026-11-23T08:05:25.000000+00:00"},
-            {**baseline, "last_probe_at": "2026-11-23T08:05:25.000000+00:00"},
-            {**baseline, "last_tx_at": "2026-11-23T08:05:25.000000+00:00"},
-        ):
-            with pytest.raises(AssertionError):
-                _assert_python_detached_terminal_state(bad, baseline)
-
-    for bad_baseline in (
-        {"state": "READY", "last_error": None, **fields},
-        {"state": "ATTACHING", "last_error": "LOGIN_PROMPT_TIMEOUT", **fields},
-        {"state": "DETACHED", "last_error": None, **fields},
-    ):
-        with pytest.raises(AssertionError):
-            _assert_python_detached_terminal_state(bad_baseline, bad_baseline)
-
-
-def _wait_stable_python_baseline(p7, timeout_s: float = 60.0) -> tuple[dict, dict]:
-    """手動 attach 收斂後建立 baseline，並帶上偵測取樣間 attach／probe／TX 的持久時間戳。"""
-    keys = (
-        "reprobe_attempts",
-        "next_reprobe_at",
-        "reprobe_exhausted",
-        "bridge_generation",
-        "last_state_change_at",
-        "last_probe_at",
-        "last_tx_at",
-    )
-    accepted = {"ATTACH_FAILED:TxIncompleteError", "LOGIN_PROMPT_TIMEOUT"}
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        row = _row(p7)
-        if row.get("state") != "DETACHED" or row.get("last_error") not in accepted:
-            time.sleep(0.2)
-            continue
-
-        _assert_python_detached_terminal_state(row, row)
-        baseline = {key: row[key] for key in ("state", "last_error", *keys)}
-        time.sleep(0.5)
-        stable = _row(p7)
-        _assert_python_detached_terminal_state(stable, baseline)
-        return stable, baseline
-    raise AssertionError("Python 分支未在觀察窗內穩定到 DF-23 的核准 DETACHED baseline")
-
-
-def _observe_python_df23_terminal(
-    p7, path: str, baseline: dict, *, observe_s: float = 10.0
-) -> None:
-    """執行 DF-23 Python 終態觀察窗，baseline holder 與逐次檢查共用此路徑。"""
-    has_proc = os.path.isdir("/proc")
-    baseline_holders = _daemon_tty_holders(p7, path) if has_proc else []
-    baseline_holder_fds = _holder_fd_numbers(baseline_holders)
-    disappeared_holder_fds: set[str] = set()
-    if has_proc:
-        print(f"DF-23 Python baseline tty holders: {baseline_holders!r}")
-
-    t_end = time.monotonic() + observe_s
-    while time.monotonic() < t_end:
-        row = _row(p7)
-        _assert_python_detached_terminal_state(row, baseline)
-        if has_proc:
-            holders = _daemon_tty_holders(p7, path)
-            _assert_no_new_tty_holder_fds(holders, baseline_holder_fds, disappeared_holder_fds)
-        time.sleep(0.5)
-
-
 def test_rejected_requests_zero_tx(p7, tmp_path):
     tgt = FakeTarget(tmp_path / "t0", prompt="root@prplOS:~# ", commands={"overrides": {"": {"response": "\r\n=> "}}})
     p7.start("prpl", [tgt])
@@ -589,18 +242,9 @@ def test_release_during_login_waits_for_handle_close(p7, tmp_path):
     """登入進行中 `device release`：回成功的當下 daemon 已無指向該 tty 的 fd；`device attach` 之前不重開；
     `session recover --force` 的 REATTACH 任何時刻至多持有一個 fd（舊 fd 關閉後才重開）。
 
-    OD-111 凍結的 Python 基線在核准的 DETACHED 終態仍持有目標 tty；ci-thin-i2-L2
-    實測 holder 為 `9->/dev/pts/12`。觀察期開始時記錄 baseline fd 集合（可為空）；之後每次取樣只允許
-    baseline fd，且 baseline fd 一旦消失不得再出現。無法分辨同一 fd 在兩次取樣之間關閉後以相同編號重開，
-    這是 holder 取樣的限制。
-
-    2026-11-23 編排者裁決（rulings/v051.md 補登，72334366）：Python 分支只接受 `DETACHED` +
-    `ATTACH_FAILED:TxIncompleteError` 或 `LOGIN_PROMPT_TIMEOUT`；baseline 與之後 10 s 的每個樣本都須維持
-    `DETACHED`，且 `reprobe_attempts`、`next_reprobe_at`、`reprobe_exhausted`、`bridge_generation` 不變；
-    `last_state_change_at`、`last_probe_at`、`last_tx_at` 也須存在且不變，以捕捉兩次輪詢間失敗後回到 DETACHED 的 attach 嘗試。
-    `READY`、`ATTACHING`、空錯誤、錯誤前綴匹配及首次 attach 失敗後重試均不核准。Rust 分支與 §11.3-4
-    的 handle 時序斷言不改。觀察期在有 `/proc` 的平台逐次檢查 daemon fd；沒有 `/proc` 的平台只保留既有欄位
-    判準，無法偵測尚未公開狀態的開埠嘗試，且不因此 skip。"""
+    DF-23（OD-57，2026-10-29）：Python 基線於本情境 `device attach` 後落 DETACHED＋`ATTACH_FAILED:TxIncompleteError`
+    且不再自動重試（擁有者視為 Python 缺陷），Rust 回到 READY；收斂結果依 DF-23 分別判定（`ab_participation: diff`），
+    §11.3-4 的 handle 時序兩邊同斷言。"""
     tgt = FakeTarget(tmp_path / "t0", delay_ms=1500)       # 每個回應延遲 1.5 s：login 進行中可插入 release
     p7.start("shell", [tgt])
     deadline = time.monotonic() + 20.0
@@ -625,25 +269,20 @@ def test_release_during_login_waits_for_handle_close(p7, tmp_path):
     while _daemon_fds_to(p7, slave) == 0:
         assert time.monotonic() < deadline, "device attach 後應重新開啟 tty"
         time.sleep(0.05)
-    # 先等到 attach 收斂到 DETACHED/ATTACHING，才解除 hold，讓舊 login prompt 以 stale 事件落在
-    # Python 的 detach 收斂窗口內，保證測試落在 DF-23 的兩個已觀測終態，而非被新 prompt 直接登入。 
-    deadline = time.monotonic() + 10.0
-    while True:
-        row = _row(p7)
-        if row.get("state") in {"DETACHED", "ATTACHING"}:
-            break
-        assert time.monotonic() < deadline, f"attach 後未進入 DETACHED/ATTACHING；最後狀態 {row!r}"
-        time.sleep(0.1)
     tgt.hold_reply(False)
-    # DF-23：attach 之後的收斂結果（Rust 回 READY；Python 落 DETACHED 且不自動重試，終態限
-    # `ATTACH_FAILED:TxIncompleteError` 或 `LOGIN_PROMPT_TIMEOUT` 兩種已觀察值）。
+    # DF-23：attach 之後的收斂結果（Rust 回 READY；Python 落 DETACHED＋ATTACH_FAILED:TxIncompleteError 且不自動重試）
     if is_rust():
         s = wait_state(p7.env, "COM0", "READY", timeout_s=60.0)
         assert s["last_error"] is None, s
     else:
-        s, baseline = _wait_stable_python_baseline(p7)
-        _assert_python_detached_terminal_state(s, baseline)
-        _observe_python_df23_terminal(p7, slave, baseline)
+        s = wait_state(p7.env, "COM0", "DETACHED", timeout_s=60.0)
+        assert str(s["last_error"]).startswith("ATTACH_FAILED:TxIncompleteError"), s
+        t_end = time.monotonic() + 10.0
+        while time.monotonic() < t_end:                     # 不自動重試：維持 DETACHED
+            _, j = p7.cli("session", "list")
+            row = [x for x in (j or {}).get("sessions", []) if x["com"] == "COM0"][0]
+            assert row["state"] == "DETACHED", row
+            time.sleep(0.5)
 
     # REATTACH：另一個 rig（READY 起手），RX 凍結下 recover --force，取樣 daemon 對 tty 的 fd 數峰值。
     rig = P7Rig(tmp_path / "p7-reattach")
