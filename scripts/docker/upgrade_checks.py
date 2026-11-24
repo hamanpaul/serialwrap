@@ -431,47 +431,182 @@ def select_profile_policy(phase: str) -> dict[str, Any]:
     return selected
 
 
+def _yaml_quoted_end(text: str, start: int, quote: str) -> int | None:
+    """回傳 YAML 單／雙引號 scalar 的結尾位置；未閉合時回傳 None。"""
+    index = start + 1
+    while index < len(text):
+        if quote == "'" and text[index:index + 2] == "''":
+            index += 2
+            continue
+        if quote == '"' and text[index] == "\\":
+            index += 2
+            continue
+        if text[index] == quote:
+            return index
+        index += 1
+    return None
+
+
+def _yaml_mapping_entry(line: str) -> tuple[int, str, str] | None:
+    """讀取一行 block mapping 的 key/value，支援 plain 與 quoted key。"""
+    indent = len(line) - len(line.lstrip(" "))
+    body = line[indent:]
+    if not body or body.startswith("#") or body.startswith(("- ", "? ")):
+        return None
+    if body[0] in "'\"":
+        end = _yaml_quoted_end(body, 0, body[0])
+        if end is None or body[end + 1:end + 2] != ":":
+            return None
+        key = body[1:end]
+        value = body[end + 2:].strip()
+        return indent, key, value
+    for index, char in enumerate(body):
+        if char == ":" and (index + 1 == len(body) or body[index + 1].isspace()):
+            key = body[:index].strip()
+            if not key:
+                return None
+            return indent, key, body[index + 1:].strip()
+    return None
+
+
+def _yaml_commentless(value: str) -> str:
+    """移除 scalar 外的 YAML 行尾註解。"""
+    quote: str | None = None
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if quote is None:
+            if char == "#" and (index == 0 or value[index - 1].isspace()):
+                return value[:index]
+            if char in "'\"" and (index == 0 or value[index - 1].isspace() or value[index - 1] in ":[,{?"):
+                quote = char
+        elif quote == "'" and char == "'":
+            if value[index:index + 2] == "''":
+                index += 1
+            else:
+                quote = None
+        elif quote == '"':
+            if char == "\\":
+                index += 1
+            elif char == '"':
+                quote = None
+        index += 1
+    return value
+
+
+def _yaml_mapping_value(value: str) -> bool:
+    """此受控檢查只接受 block mapping，無法確認的表示法一律關閉。"""
+    return _yaml_commentless(value).strip() in {"", "{}"}
+
+
+def _yaml_block_scalar(value: str, indent: int) -> tuple[bool, int | None]:
+    """辨識 literal/folded block scalar 及可選的明確縮排值。"""
+    text = _yaml_commentless(value).strip()
+    if not re.fullmatch(r"[|>](?:[1-9][+-]?|[+-][1-9]?)?", text):
+        return False, None
+    explicit = re.search(r"[1-9]", text)
+    return True, indent + int(explicit.group()) if explicit else None
+
+
+def _yaml_unquoted_text(line: str, quote: str | None) -> tuple[str, str | None]:
+    """略過引號 scalar 與註解，保留可用來追蹤 YAML flow nesting 的字元。"""
+    visible: list[str] = []
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote is None:
+            if char == "#" and (index == 0 or line[index - 1].isspace()):
+                break
+            if char in "'\"" and (index == 0 or line[index - 1].isspace() or line[index - 1] in ":[,{?"):
+                quote = char
+            else:
+                visible.append(char)
+        elif quote == "'" and char == "'":
+            if line[index:index + 2] == "''":
+                index += 1
+            else:
+                quote = None
+        elif quote == '"':
+            if char == "\\":
+                index += 1
+            elif char == '"':
+                quote = None
+        index += 1
+    return "".join(visible), quote
+
+
 def _profile_template_has_field(path: str | Path, *, template: str, platform: str, field: str) -> tuple[bool, str | None]:
-    """以 fail-closed 的區塊檢查確認受控 profile 檔中的 template 欄位。"""
+    """以標準函式庫辨識 YAML block mapping 的實際 key；不依賴容器未安裝的 YAML 套件。"""
     try:
         lines = Path(path).read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError) as exc:
         return False, f"{type(exc).__name__}: {exc}"
 
-    def block_end(start: int, minimum_indent: int) -> int:
-        for index in range(start + 1, len(lines)):
-            line = lines[index]
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
+    entries: list[tuple[int, int, str, str]] = []
+    quote: str | None = None
+    flow_depth = 0
+    block_base: int | None = None
+    block_minimum: int | None = None
+    for line_number, line in enumerate(lines):
+        indent = len(line) - len(line.lstrip(" "))
+        body = line[indent:]
+        if block_base is not None:
+            if not body.strip():
                 continue
-            indent = len(line) - len(line.lstrip(" "))
-            if indent <= minimum_indent:
-                return index
-        return len(lines)
+            if block_minimum is None and indent > block_base:
+                block_minimum = indent
+                continue
+            if block_minimum is not None and indent >= block_minimum:
+                continue
+            block_base = None
+            block_minimum = None
 
-    profile_roots = [index for index, line in enumerate(lines)
-                      if re.fullmatch(r"profiles\s*:\s*(?:#.*)?", line)]
+        was_in_quote = quote is not None
+        entry = _yaml_mapping_entry(line) if not was_in_quote and flow_depth == 0 else None
+        visible, quote = _yaml_unquoted_text(line, quote)
+        for char in visible:
+            if char in "[{":
+                flow_depth += 1
+            elif char in "]}":
+                flow_depth = max(0, flow_depth - 1)
+        if entry is None:
+            continue
+        entry_indent, key, value = entry
+        entries.append((line_number, entry_indent, key, value))
+        is_block, explicit_minimum = _yaml_block_scalar(value, entry_indent)
+        if is_block:
+            block_base = entry_indent
+            block_minimum = explicit_minimum
+
+    profile_roots = [entry for entry in entries if entry[1] == 0 and entry[2] == "profiles"]
     if len(profile_roots) != 1:
         return False, "profiles mapping missing or duplicated"
-    root_start = profile_roots[0]
-    root_end = block_end(root_start, 0)
-    template_headers = [index for index in range(root_start + 1, root_end)
-                        if re.fullmatch(rf"  {re.escape(template)}\s*:\s*(?:#.*)?", lines[index])]
+    root = profile_roots[0]
+    if not _yaml_mapping_value(root[3]):
+        return False, "profiles is not a supported block mapping"
+    root_end = next((entry[0] for entry in entries if entry[0] > root[0] and entry[1] == 0), len(lines))
+    template_headers = [entry for entry in entries
+                        if root[0] < entry[0] < root_end and entry[1] == 2 and entry[2] == template]
     if len(template_headers) != 1:
         return False, f"template {template!r} missing or duplicated"
-    template_start = template_headers[0]
-    template_end = block_end(template_start, 2)
-    body = lines[template_start + 1:template_end]
-    platform_pattern = re.compile(
-        rf"    platform:\s*(?:{re.escape(platform)}|'\s*{re.escape(platform)}\s*'|\"\s*{re.escape(platform)}\s*\")\s*(?:#.*)?"
-    )
-    field_pattern = re.compile(rf"    {re.escape(field)}\s*:")
-    has_platform = any(platform_pattern.fullmatch(line) for line in body)
-    has_field = any(field_pattern.match(line) for line in body)
-    if not has_platform:
+    header = template_headers[0]
+    if not _yaml_mapping_value(header[3]):
+        return False, f"template {template!r} is not a supported mapping"
+    template_end = next((entry[0] for entry in entries if entry[0] > header[0] and entry[1] <= 2), root_end)
+    body = [entry for entry in entries if header[0] < entry[0] < template_end and entry[1] == 4]
+    platform_values = [entry[3] for entry in body if entry[2] == "platform"]
+    if len(platform_values) != 1:
+        return False, f"template {template!r} platform missing or duplicated"
+    platform_value = _yaml_commentless(platform_values[0]).strip()
+    if platform_value[:1] in {"'", '"'} and platform_value[-1:] == platform_value[:1]:
+        platform_value = platform_value[1:-1].strip()
+    if platform_value != platform:
         return False, f"template {template!r} is not platform {platform!r}"
-    if not has_field:
+    matching_fields = [entry for entry in body if entry[2] == field]
+    if not matching_fields:
         return False, f"template {template!r} lacks field {field!r}"
+    if len(matching_fields) != 1:
+        return False, f"template {template!r} duplicates field {field!r}"
     return True, None
 
 

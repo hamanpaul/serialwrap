@@ -30,6 +30,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -224,6 +225,7 @@ class Driver:
         self.profile_policy_evidence = profile_policy_evidence
         self.doctor_profile_dir = SYSTEM_PROFILE_DIR if mode == "systemd-system" else CONFIG / "profiles"
         self.doctor_evidence: list[dict[str, Any]] = []
+        self.cli_asset_evidence: list[dict[str, Any]] = []
         self.flag = {"systemd-user": "--user", "systemd-system": "--system"}.get(mode, "--on-demand")
         self.setup_args = [self.flag, "--with-sudo"] if mode == "systemd-system" else [self.flag]
         self.wheel = wheel
@@ -369,6 +371,78 @@ class Driver:
         })
         return self.parse(self.sw("doctor", label=label))
 
+    def verify_candidate_p290_asset(self, target_asset: pathlib.Path) -> dict[str, Any]:
+        """用候選 CLI 的實際 doctor 輸出確認內嵌資產含 p290 key。"""
+        field = "timeout_recovery_keys"
+        candidate_cli = self.bundle / "versions" / NEW_VERSION / "bin" / "serialwrap"
+        active_cli = shutil.which("serialwrap", path=self.env.get("PATH", ""))
+        evidence: dict[str, Any] = {
+            "candidate_cli_path": str(candidate_cli),
+            "target_asset_path": str(target_asset),
+            "field": field,
+            "profile_check": None,
+            "reported_missing_field": False,
+        }
+
+        try:
+            candidate_real = candidate_cli.resolve(strict=True)
+            active_real = pathlib.Path(active_cli).resolve(strict=True) if active_cli else None
+            configured_real = self.new_cli.resolve(strict=True)
+        except OSError as exc:
+            return uc.row("candidate_cli_p290_asset", "FAIL", "無法確認候選 CLI 路徑",
+                          **evidence, path_error=type(exc).__name__)
+        evidence["candidate_cli_path"] = str(candidate_real)
+        evidence["active_cli_path"] = str(active_real) if active_real else None
+        if candidate_real != configured_real or candidate_real != active_real:
+            return uc.row("candidate_cli_p290_asset", "FAIL", "目前 CLI 並非本次候選版本",
+                          **evidence, configured_cli_path=str(configured_real))
+
+        temp_root: pathlib.Path | None = None
+        prior_profile_dir = self.env.get("SERIALWRAP_PROFILE_DIR")
+        try:
+            temp_root = pathlib.Path(tempfile.mkdtemp(prefix="sw-p290-cli-asset-", dir="/tmp"))
+            os.chmod(temp_root, 0o755)
+            profile_dir = temp_root / "profiles"
+            profile_dir.mkdir(mode=0o755)
+            (profile_dir / "default.yaml").write_text(
+                "profiles:\n  prpl-template: {}\n", encoding="utf-8",
+            )
+            self.env["SERIALWRAP_PROFILE_DIR"] = str(profile_dir)
+            proc = self.run([str(candidate_real), "doctor"], label="候選 CLI 內嵌 p290 profile 資產檢查",
+                            timeout=60.0)
+            doctor = self.parse(proc) if proc.returncode == 0 else None
+            checks = doctor.get("checks") if type(doctor) is dict else None
+            matches = [check for check in checks if type(check) is dict
+                       and check.get("check") == "profile_template_fields"] if type(checks) is list else []
+            profile_check = matches[0] if len(matches) == 1 else None
+            evidence["profile_check"] = profile_check
+            missing = profile_check.get("missing_fields") if type(profile_check) is dict else None
+            missing_for_template = missing.get("prpl-template") if type(missing) is dict else None
+            reports_field = type(missing_for_template) is list and field in missing_for_template
+            evidence["reported_missing_field"] = reports_field
+            valid_shape = type(profile_check) is dict \
+                and profile_check.get("comparison_status") == "missing_fields" \
+                and "prpl-template" in (profile_check.get("compared_templates") or []) \
+                and profile_check.get("ok") is False
+            if proc.returncode != 0 or not valid_shape or not reports_field:
+                reason = "候選 CLI 內嵌 profile 資產未確認包含 p290 欄位"
+                if proc.returncode != 0:
+                    reason = "候選 CLI doctor probe 失敗"
+                return uc.row("candidate_cli_p290_asset", "FAIL", reason,
+                              **evidence, doctor_rc=proc.returncode)
+            return uc.row("candidate_cli_p290_asset", "PASS", None, **evidence,
+                          doctor_rc=proc.returncode)
+        except (OSError, UnicodeError, subprocess.SubprocessError) as exc:
+            return uc.row("candidate_cli_p290_asset", "FAIL", "候選 CLI 內嵌資產 probe 無法完成",
+                          **evidence, probe_error=type(exc).__name__)
+        finally:
+            if prior_profile_dir is None:
+                self.env.pop("SERIALWRAP_PROFILE_DIR", None)
+            else:
+                self.env["SERIALWRAP_PROFILE_DIR"] = prior_profile_dir
+            if temp_root is not None:
+                shutil.rmtree(temp_root, ignore_errors=True)
+
     def judge_doctor(self, check_id: str, label: str, *, require_pairing: bool,
                      profile_policy: dict[str, Any]) -> dict[str, Any]:
         doctor = self.doctor(label, profile_policy)
@@ -397,6 +471,14 @@ class Driver:
             else:
                 asset_path = self.bundle / "versions" / NEW_VERSION / "py" / pathlib.Path(*expected_asset.parts)
                 live_path = self.doctor_profile_dir / expected_asset.name
+                candidate_asset = self.verify_candidate_p290_asset(asset_path)
+                result.setdefault("detail", {})["candidate_cli_p290_asset"] = candidate_asset
+                self.cli_asset_evidence.append({"check_id": check_id, **candidate_asset})
+                if candidate_asset["verdict"] != "PASS":
+                    result["verdict"] = "FAIL"
+                    prior_reason = result.get("reason")
+                    result["reason"] = "; ".join(part for part in
+                                                 (prior_reason, candidate_asset.get("reason")) if part)
                 migration = uc.judge_p290_profile_migration(
                     "p290_profile_migration", asset_path, live_path,
                     migration_policy_id=str(profile_policy.get("migration_policy_id", "")),
@@ -984,6 +1066,7 @@ def main() -> int:
         "driver_git_revision": os.environ.get("SW_UPGRADE_DRIVER_REVISION"),
         "profile_expectation_policy": driver.profile_policy_evidence,
         "doctor_profile_evidence": driver.doctor_evidence,
+        "candidate_cli_asset_evidence": driver.cli_asset_evidence,
         "old_version": OLD_VERSION,
         "new_version": NEW_VERSION,
         "wheel": wheel.name,

@@ -542,6 +542,32 @@ def fake_driver(tmp_path, monkeypatch):
         target_asset = (tmp_path / "bundle" / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles"
                         / "default.yaml")
         _write_p290_profile_fixtures(driver, target_asset, driver.doctor_profile_dir / "default.yaml")
+        candidate_cli = driver.bundle / "versions" / NEW_VERSION / "bin" / "serialwrap"
+        candidate_cli.parent.mkdir(parents=True, exist_ok=True)
+        candidate_cli.write_bytes(b"candidate CLI embedded profile asset\n" + target_asset.read_bytes())
+        candidate_cli.chmod(0o755)
+        driver.new_cli.parent.mkdir(parents=True, exist_ok=True)
+        driver.new_cli.symlink_to(candidate_cli)
+        active_bin = tmp_path / "active-bin"
+        active_bin.mkdir()
+        (active_bin / "serialwrap").symlink_to(candidate_cli)
+        driver.env["PATH"] = str(active_bin)
+
+        def run(argv, *, timeout=300.0, label=""):
+            if argv and Path(argv[0]).resolve() == candidate_cli.resolve() and argv[1:] == ["doctor"]:
+                reports_p290 = b"timeout_recovery_keys" in candidate_cli.read_bytes()
+                profile_check = {
+                    "check": "profile_template_fields",
+                    "ok": False,
+                    "advisory": True,
+                    "comparison_status": "missing_fields",
+                    "missing_fields": {"prpl-template": ["timeout_recovery_keys"] if reports_p290 else ["platform"]},
+                    "compared_templates": ["prpl-template"],
+                    "reason": None,
+                }
+                payload = {"ok": True, "checks": [profile_check]}
+                return subprocess.CompletedProcess(argv, 0, json.dumps(payload) + "\n", "")
+            return fake.run(argv, timeout=timeout, label=label)
 
         def sw(*args, **kwargs):
             if args == ("doctor",):
@@ -558,7 +584,7 @@ def fake_driver(tmp_path, monkeypatch):
             return fake.sw(*args, **kwargs)
 
         driver.sw = sw
-        driver.run = fake.run
+        driver.run = run
         orig_wait = driver.wait_daemon
         driver.wait_daemon = lambda *, version, timeout=60.0: orig_wait(version=version, timeout=min(timeout, 2.0))
         orig_gone = driver.wait_no_daemon
@@ -1249,6 +1275,96 @@ def test_doctor_profile_expectation_policy_p290_phases():
 
     with pytest.raises(ValueError, match="沒有登錄 profile policy phase"):
         uc.select_profile_policy("unlisted_phase")
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_profile_template_field_scanner_ignores_multiline_quoted_value(tmp_path):
+    """YAML 多行 scalar 內的欄位文字不可被當成 prpl-template 的實際 key。"""
+    import yaml
+
+    text = (
+        'profiles:\n'
+        '  prpl-template:\n'
+        '    platform: prpl\n'
+        '    login_regex: "prompt begins\n'
+        '    timeout_recovery_keys: [CTRL_C]\n'
+        '    prompt ends"\n'
+    )
+    parsed = yaml.safe_load(text)
+    assert "timeout_recovery_keys" not in parsed["profiles"]["prpl-template"]
+    path = tmp_path / "default.yaml"
+    path.write_text(text, encoding="utf-8")
+
+    found, error = uc._profile_template_has_field(
+        path, template="prpl-template", platform="prpl", field="timeout_recovery_keys",
+    )
+    assert found is False, (found, error)
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_profile_template_field_scanner_accepts_quoted_mapping_key(tmp_path):
+    """YAML quoted key 仍是 template 的實際頂層欄位。"""
+    import yaml
+
+    text = (
+        "profiles:\n"
+        "  prpl-template:\n"
+        "    platform: prpl\n"
+        '    "timeout_recovery_keys": [CTRL_C]\n'
+    )
+    parsed = yaml.safe_load(text)
+    assert parsed["profiles"]["prpl-template"]["timeout_recovery_keys"] == ["CTRL_C"]
+    path = tmp_path / "default.yaml"
+    path.write_text(text, encoding="utf-8")
+
+    found, error = uc._profile_template_has_field(
+        path, template="prpl-template", platform="prpl", field="timeout_recovery_keys",
+    )
+    assert found is True, error
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_upgrade_rejects_candidate_cli_without_embedded_p290_asset(fake_driver, tmp_path):
+    """bundle 副本和 live profile 有 p290 欄位，不可掩蓋候選 CLI 內嵌舊資產。"""
+    import yaml
+
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    target_asset = (driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles"
+                    / "default.yaml")
+    live_profile = driver.doctor_profile_dir / "default.yaml"
+    target_document = yaml.safe_load(target_asset.read_text(encoding="utf-8"))
+    live_document = yaml.safe_load(live_profile.read_text(encoding="utf-8"))
+    assert "timeout_recovery_keys" in target_document["profiles"]["prpl-template"]
+    assert "timeout_recovery_keys" in live_document["profiles"]["prpl-template"]
+
+    stale_document = yaml.safe_load(target_asset.read_text(encoding="utf-8"))
+    del stale_document["profiles"]["prpl-template"]["timeout_recovery_keys"]
+    stale_asset = yaml.safe_dump(stale_document, sort_keys=False, allow_unicode=True).encode("utf-8")
+    assert "boot_done_regex" in stale_document["profiles"]["prpl-template"]
+    candidate_cli = driver.bundle / "versions" / NEW_VERSION / "bin" / "serialwrap"
+    candidate_cli.write_bytes(b"candidate CLI with stale embedded asset\n" + stale_asset)
+    doctor_before_probe = driver.parse(driver.sw("doctor"))
+    profile_before_probe = next(check for check in doctor_before_probe["checks"]
+                                if check["check"] == "profile_template_fields")
+    assert profile_before_probe["missing_fields"] == {"prpl-template": ["boot_done_regex"]}
+    result = driver.judge_doctor(
+        "doctor_green_new", "候選 CLI 內嵌資產檢查", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+    assert result["verdict"] == "FAIL", result
+    embedded = result["detail"]["candidate_cli_p290_asset"]
+    assert embedded["verdict"] == "FAIL" and embedded["detail"]["reported_missing_field"] is False, embedded
+
+    (tmp_path / "active-bin" / "serialwrap").unlink()
+    unconfirmed = driver.judge_doctor(
+        "doctor_green_new", "候選 CLI 路徑無法確認", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+    assert unconfirmed["verdict"] == "FAIL", unconfirmed
+    assert unconfirmed["detail"]["candidate_cli_p290_asset"]["verdict"] == "FAIL"
 
 
 @pytest.mark.core_portable

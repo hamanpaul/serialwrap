@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import importlib
 import sys
@@ -1383,6 +1384,11 @@ def test_bc08_doctor_profile_template_fields_registered() -> None:
         assert type(catalog["revision"]) is int and catalog["revision"] > 0
         approved_at = bc08["approved_at_revision"]
         assert type(approved_at) is int and 0 < approved_at <= catalog["revision"]
+        # BC-08 的內容與最後變更核准 revision 綁定；變更 BC-08 時須同時更新此指紋與 revision。
+        assert approved_at == 12
+        content = {key: value for key, value in bc08.items() if key != "approved_at_revision"}
+        canonical = json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        assert hashlib.sha256(canonical).hexdigest() == "deed7e4e4a4cbf8d1133f23423782b438d73c6e0873715c693822f483dbe457c"
 
     assert_bc08_revision(behavior, change)
     advanced_behavior = json.loads(json.dumps(behavior))
@@ -1390,6 +1396,16 @@ def test_bc08_doctor_profile_template_fields_registered() -> None:
     advanced_change = next(item for item in advanced_behavior["changes"] if item["id"] == "BC-08")
     assert advanced_change == change
     assert_bc08_revision(advanced_behavior, advanced_change)
+    earlier_approval = json.loads(json.dumps(behavior))
+    earlier_change = next(item for item in earlier_approval["changes"] if item["id"] == "BC-08")
+    earlier_change["approved_at_revision"] = 1
+    with pytest.raises(AssertionError):
+        assert_bc08_revision(earlier_approval, earlier_change)
+    changed_content = json.loads(json.dumps(behavior))
+    changed_change = next(item for item in changed_content["changes"] if item["id"] == "BC-08")
+    changed_change["title"] += "（未同步核准 revision）"
+    with pytest.raises(AssertionError):
+        assert_bc08_revision(changed_content, changed_change)
     future_approval = json.loads(json.dumps(behavior))
     future_approval["revision"] = change["approved_at_revision"] - 1
     with pytest.raises(AssertionError):
