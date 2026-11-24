@@ -131,6 +131,19 @@ fn ready_newline_prompt_rig() -> ServiceRig {
     rig
 }
 
+fn ready_any_line_prompt_rig() -> ServiceRig {
+    let rig = ServiceRig::build(RigSpec {
+        yaml: "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^.*'\n    ready_probe: 'echo __READY__${nonce}'\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: t, device_by_id: /s/by-id/usb-A}\n".to_string(),
+        devices: vec![(BY_ID_A.into(), REAL_A.into())],
+        explicit_target_count: 1,
+        allowlist: None,
+        wait_ready: Vec::new(),
+    });
+    rig.device(REAL_A).push_rx(b"\r\nroot@t:/# ");
+    rig.wait_state("COM0", "READY");
+    rig
+}
+
 fn assert_busy(reply: &PyDict) {
     assert_eq!(reply["ok"], PyValue::Bool(true), "{reply:?}");
     assert!(
@@ -424,6 +437,56 @@ fn rpc_newline_prefixed_prompt_after_marker_confirms_ready() {
     if !handle.is_finished() {
         advance_clock_until(&rig, &handle, "newline-prefixed RPC prompt");
     }
+    let reply = handle.join().unwrap();
+    assert_eq!(reply["probe_ok"], PyValue::Bool(true), "{reply:?}");
+    assert_eq!(
+        reply["probe_evidence"],
+        PyValue::Dict(sw_proto::pydict! {
+            "tx_complete" => true,
+            "execution_marker" => true,
+            "probe_rc_zero" => true,
+            "prompt_after_marker" => true,
+        })
+    );
+}
+
+#[test]
+fn rpc_any_line_prompt_after_marker_confirms_ready() {
+    let rig = Arc::new(ready_any_line_prompt_rig());
+    let dev = rig.device(REAL_A);
+    dev.clear_replies();
+    let rx_before = rx_window_bytes(&rig);
+    let tx_start = dev.tx_len();
+    let rpc_rig = Arc::clone(&rig);
+    let handle = thread::spawn(move || {
+        rpc_rig.call(
+            "session.self_test",
+            r#"{"selector":"COM0","timeout_s":2.0}"#,
+        )
+    });
+    wait_for("any-line prompt RPC probe TX", || dev.tx_len() > tx_start);
+    let tx = dev.tx_since(tx_start);
+    let tx_text = String::from_utf8_lossy(&tx);
+    let nonce = tx_text
+        .split("__READY__")
+        .nth(1)
+        .unwrap_or("")
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect::<String>();
+    assert_eq!(nonce.len(), 8, "probe TX 應含完整 nonce：{tx_text:?}");
+
+    let response = format!("__SW_ST_{nonce}_OK__\r\nroot@t:/# ").into_bytes();
+    push_rpc_rx_and_wait(
+        &rig,
+        dev,
+        &response,
+        rx_before,
+        "RPC reader 已處理同 chunk marker 與 any-line prompt",
+    );
+    wait_for("any-line prompt RPC self-test 回覆", || {
+        handle.is_finished()
+    });
     let reply = handle.join().unwrap();
     assert_eq!(reply["probe_ok"], PyValue::Bool(true), "{reply:?}");
     assert_eq!(

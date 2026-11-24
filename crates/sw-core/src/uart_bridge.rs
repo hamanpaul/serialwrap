@@ -123,6 +123,9 @@ pub struct RxShared {
     /// 測試觀察：記錄 regex 等待入口，供 self-test nonce／prompt 等待的決定性同步。
     #[cfg(feature = "test-fakes")]
     regex_wait_starts: AtomicU64,
+    /// 測試觀察：regex 等待實際檢查 RX snapshot 的次數。
+    #[cfg(feature = "test-fakes")]
+    regex_wait_checks: AtomicU64,
     /// 測試觀察：regex 等待已檢查的最後一個 RX 絕對字元位置。
     #[cfg(feature = "test-fakes")]
     regex_wait_snapshot_end: AtomicU64,
@@ -146,6 +149,8 @@ impl RxShared {
             #[cfg(feature = "test-fakes")]
             regex_wait_starts: AtomicU64::new(0),
             #[cfg(feature = "test-fakes")]
+            regex_wait_checks: AtomicU64::new(0),
+            #[cfg(feature = "test-fakes")]
             regex_wait_snapshot_end: AtomicU64::new(0),
         })
     }
@@ -153,6 +158,11 @@ impl RxShared {
     #[cfg(feature = "test-fakes")]
     pub fn regex_wait_starts_for_test(&self) -> u64 {
         self.regex_wait_starts.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn regex_wait_checks_for_test(&self) -> u64 {
+        self.regex_wait_checks.load(Ordering::Acquire)
     }
 
     #[cfg(feature = "test-fakes")]
@@ -1132,6 +1142,38 @@ impl RxShared {
         timeout: Duration,
         clock: &dyn Clock,
     ) -> WaitMatchOutcome {
+        self.wait_for_regex_end_after_from_shutdown_cancellable_inner(
+            re, from, None, timeout, clock,
+        )
+    }
+
+    /// 從絕對偏移等待 regex，並略過結尾未超過 `after_end` 的命中。
+    /// 搜尋保留 `from` 的原始上下文，供 prompt pattern 需要 marker 行界、但命中須延伸到 marker 後的情況使用。
+    pub fn wait_for_regex_end_after_from_shutdown_cancellable(
+        &self,
+        re: &PyRegex,
+        from: u64,
+        after_end: u64,
+        timeout: Duration,
+        clock: &dyn Clock,
+    ) -> WaitMatchOutcome {
+        self.wait_for_regex_end_after_from_shutdown_cancellable_inner(
+            re,
+            from,
+            Some(after_end),
+            timeout,
+            clock,
+        )
+    }
+
+    fn wait_for_regex_end_after_from_shutdown_cancellable_inner(
+        &self,
+        re: &PyRegex,
+        from: u64,
+        after_end: Option<u64>,
+        timeout: Duration,
+        clock: &dyn Clock,
+    ) -> WaitMatchOutcome {
         #[cfg(feature = "test-fakes")]
         self.regex_wait_starts.fetch_add(1, Ordering::AcqRel);
         if self.shutdown_waits_cancelled.load(Ordering::Acquire) {
@@ -1169,11 +1211,33 @@ impl RxShared {
             if clock.mono_ns() >= deadline {
                 return WaitMatchOutcome::TimedOut;
             }
-            let found = re.search(&snapshot);
+            let base = from.max(trimmed);
+            let found = if let Some(after_end) = after_end {
+                let snapshot_len = snapshot.chars().count();
+                let mut search_from = 0usize;
+                loop {
+                    match re.search_from(&snapshot, search_from) {
+                        Some(found) if base.saturating_add(found.end as u64) > after_end => {
+                            break Some(found);
+                        }
+                        Some(found) => {
+                            let next = found.start.saturating_add(1);
+                            if next > snapshot_len {
+                                break None;
+                            }
+                            search_from = next;
+                        }
+                        None => break None,
+                    }
+                }
+            } else {
+                re.search(&snapshot)
+            };
+            #[cfg(feature = "test-fakes")]
+            self.regex_wait_checks.fetch_add(1, Ordering::AcqRel);
             #[cfg(feature = "test-fakes")]
             self.regex_wait_snapshot_end.store(
-                from.max(trimmed)
-                    .saturating_add(snapshot.chars().count() as u64),
+                base.saturating_add(snapshot.chars().count() as u64),
                 Ordering::Release,
             );
             if let Some(found) = found {
@@ -1181,7 +1245,7 @@ impl RxShared {
                     WaitMatchOutcome::Cancelled
                 } else {
                     WaitMatchOutcome::Matched {
-                        end: from.max(trimmed).saturating_add(found.end as u64),
+                        end: base.saturating_add(found.end as u64),
                     }
                 };
             }

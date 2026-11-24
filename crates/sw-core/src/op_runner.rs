@@ -1102,9 +1102,10 @@ fn run_self_test_probe(
                 } else {
                     end.saturating_sub(1)
                 };
-                let prompt = match ctx.rx.wait_for_regex_end_from_shutdown_cancellable(
+                let prompt = match ctx.rx.wait_for_regex_end_after_from_shutdown_cancellable(
                     &prompt_re,
                     prompt_from,
+                    end,
                     secs(timeout_s),
                     &*ctx.clock,
                 ) {

@@ -183,6 +183,16 @@ fn ready_newline_prompt_actor() -> ActorRig {
     h
 }
 
+const ANY_LINE_PROMPT_PROFILE: &str = r"profiles:
+  t:
+    platform: shell
+    prompt_regex: '(?m)^.*'
+    ready_probe: 'echo __READY__${nonce}'
+    timeout_s: 2.0
+targets:
+  - {com: COM0, profile: t, act_no: 1, alias: t+1, device_by_id: /s/by-id/usb-A}
+";
+
 fn receive_self_test_or_deadline(
     h: &ActorRig,
     pending: crossbeam_channel::Receiver<Result<PyDict, sw_proto::pycompat::PyErr>>,
@@ -1150,6 +1160,100 @@ fn newline_prefixed_prompt_after_marker_confirms_ready_same_chunk_and_split_chun
             PyValue::Bool(true)
         );
     }
+}
+
+#[test]
+fn any_line_prompt_after_marker_confirms_ready_same_chunk_split_chunk_and_requires_prompt() {
+    for split_prompt in [false, true] {
+        let h = ActorRig::new(ANY_LINE_PROMPT_PROFILE).ready();
+        h.dev.clear_replies();
+        let wait_start = h.rx.regex_wait_starts_for_test();
+        let checks_start = h.rx.regex_wait_checks_for_test();
+        let tx_start = h.dev.tx_len();
+        let pending = h.request_async(self_test_req());
+        let (_, nonce) = read_self_test_probe(&h, tx_start);
+        h.wait_for("any-line prompt marker regex wait", |rig| {
+            rig.rx.regex_wait_starts_for_test() > wait_start
+        });
+        h.wait_for("marker waiter 已檢查空 snapshot", |rig| {
+            rig.rx.regex_wait_checks_for_test() > checks_start
+        });
+
+        let marker = format!("__SW_ST_{nonce}_OK__\r\n");
+        if split_prompt {
+            let marker_end = h.rx.snapshot_len() + marker.chars().count() as u64;
+            h.dev.push_rx(marker.as_bytes());
+            h.wait_for("prompt waiter 已檢查只有 marker 的 snapshot", |rig| {
+                rig.rx.regex_wait_starts_for_test() >= wait_start + 2
+                    && rig.rx.regex_wait_checks_for_test() >= checks_start + 3
+                    && rig.rx.regex_wait_snapshot_end_for_test() >= marker_end
+            });
+            assert!(pending.is_empty(), "沒有 prompt 時不得完成 self-test");
+            push_rx_and_wait_probe_snapshot(&h, b"root@t:/# ", "runner 檢查分段 any-line prompt");
+        } else {
+            let response = format!("{marker}root@t:/# ");
+            push_rx_and_wait_probe_snapshot(
+                &h,
+                response.as_bytes(),
+                "runner 檢查同 chunk any-line marker 與 prompt",
+            );
+        }
+        let reply = receive_self_test_or_deadline(&h, pending);
+        assert_eq!(
+            reply["probe_ok"],
+            PyValue::Bool(true),
+            "split_prompt={split_prompt}: {reply:?}"
+        );
+        assert_eq!(
+            reply["probe_evidence"]["execution_marker"],
+            PyValue::Bool(true)
+        );
+        assert_eq!(
+            reply["probe_evidence"]["probe_rc_zero"],
+            PyValue::Bool(true)
+        );
+        assert_eq!(
+            reply["probe_evidence"]["prompt_after_marker"],
+            PyValue::Bool(true)
+        );
+    }
+
+    let h = ActorRig::new(ANY_LINE_PROMPT_PROFILE).ready();
+    h.dev.clear_replies();
+    let wait_start = h.rx.regex_wait_starts_for_test();
+    let checks_start = h.rx.regex_wait_checks_for_test();
+    let tx_start = h.dev.tx_len();
+    let pending = h.request_async(self_test_req());
+    let (_, nonce) = read_self_test_probe(&h, tx_start);
+    h.wait_for("no-prompt marker regex wait", |rig| {
+        rig.rx.regex_wait_starts_for_test() > wait_start
+    });
+    h.wait_for("no-prompt marker waiter 已檢查空 snapshot", |rig| {
+        rig.rx.regex_wait_checks_for_test() > checks_start
+    });
+    let marker = format!("__SW_ST_{nonce}_OK__\r\n");
+    let marker_end = h.rx.snapshot_len() + marker.chars().count() as u64;
+    h.dev.push_rx(marker.as_bytes());
+    h.wait_for("no-prompt prompt waiter 已檢查 marker snapshot", |rig| {
+        rig.rx.regex_wait_starts_for_test() >= wait_start + 2
+            && rig.rx.regex_wait_checks_for_test() >= checks_start + 3
+            && rig.rx.regex_wait_snapshot_end_for_test() >= marker_end
+    });
+
+    let reply = receive_self_test_after_deadline(&h, pending);
+    assert_eq!(reply["probe_ok"], PyValue::Bool(false), "{reply:?}");
+    assert_eq!(
+        reply["probe_evidence"]["execution_marker"],
+        PyValue::Bool(true)
+    );
+    assert_eq!(
+        reply["probe_evidence"]["probe_rc_zero"],
+        PyValue::Bool(true)
+    );
+    assert_eq!(
+        reply["probe_evidence"]["prompt_after_marker"],
+        PyValue::Bool(false)
+    );
 }
 
 #[test]
