@@ -111,7 +111,7 @@ impl SessionCore {
             needs_resume: true,
             ..PostClose::default()
         };
-        let stash = self.stashed_human.take();
+        let stash = self.stashed_human.as_ref().cloned();
         let live_tcp_owner = self.human.live_tcp_raw_owner();
         let mut restored = false;
         if let Some(stash) = stash.as_ref() {
@@ -127,17 +127,35 @@ impl SessionCore {
                 !stash.expired(now) && self.human_peer_present(&cid)
             };
             if stash_alive {
-                self.lease = Some(stash.clone());
-                self.insert_lease_index(stash);
-                self.human_set_owner(Some(&stash.owner));
-                restored = true;
+                if stash.mirror_client_lifetime.is_some() {
+                    let before_hold = self.human.replay_hold.as_ref().map(|hold| hold.hold_id);
+                    if !self.restore_stashed_tcp_mirror_if_allowed(true) {
+                        // agent 租約已關閉，但保留暫停中的 TCP 所有權，等共用 guard 開放。
+                        self.human_set_owner(None);
+                        return;
+                    }
+                    if tick {
+                        let after = self.human.replay_hold.as_ref().filter(|hold| !hold.revoked).map(|hold| hold.hold_id);
+                        if after.is_some() && after != before_hold {
+                            self.tick_close_hold = after;
+                        }
+                    }
+                    return;
+                } else {
+                    self.stashed_human.take();
+                    self.lease = Some(stash.clone());
+                    self.insert_lease_index(stash);
+                    self.human_set_owner(Some(&stash.owner));
+                    restored = true;
+                }
                 post.replay_allowed = true;
             }
         }
         if !restored {
-            // EOF／reconnect can replace the suspended TCP client while an agent owns the lease.
-            // Drop the stale stash and its deferred bytes, but leave the replacement's raw owner
-            // in place for resume. PTY and ordinary human lease close behavior remains unchanged.
+            self.stashed_human.take();
+            // agent 持有租約期間，EOF／重新連線可能已換成新的暫停中 TCP client。
+            // 清除失效 stash 與該 client 的延後輸入，但保留替換後的 raw 所有者以便恢復。
+            // PTY 與一般 human 租約的 close 行為維持原狀。
             let replacement_tcp_owner = preempted_tcp_mirror_lifetime.is_some()
                 && live_tcp_owner.as_ref().is_some_and(|(owner, lifetime)| {
                     !stash.as_ref().is_some_and(|old| {
@@ -145,7 +163,19 @@ impl SessionCore {
                     })
                 });
             if replacement_tcp_owner {
-                post.clear_owner_after_resume = false;
+                // 替換後的 TCP 所有者必須等 sync_tcp_console_lease 取得共用 guard 與 ticket，
+                // 建立鏡像後才解除暫停；否則 close／expiry 會先繞過 guard 重授 raw 所有權。
+                if let Some(cid) = post.dropped_stash_client.as_deref() {
+                    let dropped = self.human.deferred_mut().remove_client(cid);
+                    if dropped > 0 {
+                        self.fx_buf.push(Effect::Warn(format!(
+                            "deferred input 因 lease 上下文失效清空（com={} client_id={cid} reason=lease_dropped dropped={dropped}）",
+                            self.profile.com
+                        )));
+                    }
+                }
+                self.human_set_owner(None);
+                return;
             } else {
                 self.human_set_owner(None);
                 post.clear_owner_after_resume = true;
@@ -250,7 +280,14 @@ impl SessionCore {
         {
             self.forget_stashed_tcp_mirror();
         }
-        if active_matches || stashed_matches {
+        if active_matches {
+            return;
+        }
+        if stashed_matches {
+            // agent 租約關閉時若 guard 凍結，TCP 鏡像留在 stash；guard 開放後由下一次同步還原並恢復。
+            if self.lease.is_none() {
+                self.restore_stashed_tcp_mirror_if_allowed(true);
+            }
             return;
         }
         let Some((owner, lifetime)) = logical_owner else {
@@ -266,7 +303,11 @@ impl SessionCore {
             return;
         };
         let _admission = crate::admission::AdmissionTicket::new(gate, ticket);
-        if !self.tcp_mirror_guard_allows_new() {
+        if !self.tcp_mirror_guard_allows_new()
+            || !self.human.live_tcp_raw_owner().is_some_and(|(current_owner, current_lifetime)| {
+                current_owner == owner && current_lifetime == lifetime
+            })
+        {
             return;
         }
 
@@ -276,6 +317,10 @@ impl SessionCore {
             .template
             .hard_timeout_s
             .max(ATTACHED_CONSOLE_LEASE_TIMEOUT_S);
+        let resume_suspended_owner = self.lease.is_none()
+            && self.stashed_human.is_none()
+            && self.human.ownership.suspend_depth > 0
+            && self.human.ownership.suspended_owner.as_deref() == Some(owner.as_str());
         let mut mirror = InteractiveLease::new(
             id.clone(),
             owner,
@@ -290,6 +335,11 @@ impl SessionCore {
                 self.lease = Some(mirror);
                 let mirror = self.lease.as_ref().expect("剛建立 TCP mirror").clone();
                 self.insert_lease_index(&mirror);
+                if resume_suspended_owner {
+                    let mut effects = Effects(Vec::new());
+                    self.human_suspend_end(true, &mut effects);
+                    self.fx_buf.extend(effects.0);
+                }
             }
             Some(active) if !active.is_human() && active.suspended_human && self.stashed_human.is_none() => {
                 self.stashed_human = Some(mirror);
@@ -342,6 +392,58 @@ impl SessionCore {
                 interactive_id: lease.interactive_id,
             });
         }
+    }
+
+    /// 共用 TCP 鏡像 guard 與 admission ticket，還原仍存活的軟式搶占 stash。
+    fn restore_stashed_tcp_mirror_if_allowed(&mut self, resume: bool) -> bool {
+        let Some(stash) = self
+            .stashed_human
+            .as_ref()
+            .filter(|lease| lease.mirror_client_lifetime.is_some())
+            .cloned()
+        else {
+            return false;
+        };
+        if !self.tcp_mirror_guard_allows_new() {
+            return false;
+        }
+        let gate = self.deps.registry.admission_gate();
+        let Some(ticket) = gate.admit("session.interactive_open", Some(&self.profile.com)) else {
+            return false;
+        };
+        let _admission = crate::admission::AdmissionTicket::new(gate, ticket);
+        if !self.tcp_mirror_guard_allows_new()
+            || self.lease.is_some()
+            || !self.stashed_tcp_mirror_is_live(&stash)
+        {
+            return false;
+        }
+        let Some(stash) = self.stashed_human.take() else {
+            return false;
+        };
+        self.lease = Some(stash.clone());
+        self.insert_lease_index(&stash);
+        self.human_set_owner(Some(&stash.owner));
+        if resume {
+            let mut effects = Effects(Vec::new());
+            self.human_suspend_end(true, &mut effects);
+            self.fx_buf.extend(effects.0);
+        }
+        true
+    }
+
+    fn stashed_tcp_mirror_is_live(&self, stash: &InteractiveLease) -> bool {
+        let Some(lifetime) = stash.mirror_client_lifetime else {
+            return false;
+        };
+        self.stashed_human.as_ref().is_some_and(|current| {
+            current.interactive_id == stash.interactive_id
+                && current.owner == stash.owner
+                && current.mirror_client_lifetime == Some(lifetime)
+        }) && self
+            .human
+            .live_tcp_raw_owner()
+            .is_some_and(|(owner, live_lifetime)| owner == stash.owner && live_lifetime == lifetime)
     }
 
     /// `owner_check`：RPC 路徑比照 Python 檢查 `snapshot()["interactive_owner"] == lease.owner`；
@@ -676,33 +778,75 @@ impl SessionCore {
         {
             return;
         }
-        let Some((owner, timeout_s, retained_tcp_lifetime)) = self.retained_human.take() else {
+        let Some((owner, timeout_s, retained_tcp_lifetime)) = self.retained_human.as_ref().cloned() else {
             return;
         };
         let Some(cid) = owner.strip_prefix("human:").filter(|c| !c.is_empty()) else {
+            self.retained_human.take();
             return;
         };
         if !self.human.consoles.contains_key(cid) {
+            self.retained_human.take();
             return;
         }
         let mirror_lifetime = match retained_tcp_lifetime {
-            Some(lifetime)
-                if self.human.consoles.get(cid).is_some_and(|console| {
-                    console.kind == crate::human_console::ConsoleTransportKind::TcpTelnet
-                        && self.human.is_live(cid, lifetime)
-                        && console.client_lifetime == lifetime
-                        && self.human.peer_present.get(cid).copied().unwrap_or(true)
-                }) =>
-            {
-                Some(lifetime)
+            Some(lifetime) if self.retained_tcp_owner_is_live(&owner, cid, lifetime) => Some(lifetime),
+            Some(_) => {
+                self.retained_human.take();
+                return;
             }
-            Some(_) => return,
             None => None,
+        };
+
+        if let Some(lifetime) = mirror_lifetime {
+            // 保留中的 TCP 還原與一般鏡像／自癒共用同一完整 guard 及 admission ticket；
+            // guard 暫時關閉時不取出保留資料，留待後續 actor 事件重試。
+            if !self.tcp_mirror_guard_allows_new() {
+                return;
+            }
+            let gate = self.deps.registry.admission_gate();
+            let Some(ticket) = gate.admit("session.interactive_open", Some(&self.profile.com)) else {
+                return;
+            };
+            let _admission = crate::admission::AdmissionTicket::new(gate, ticket);
+            if !self.tcp_mirror_guard_allows_new()
+                || !self.retained_tcp_owner_is_live(&owner, cid, lifetime)
+            {
+                return;
+            }
+
+            self.refresh_lease_p6(now);
+            if !self.tcp_mirror_guard_allows_new()
+                || !self.retained_tcp_owner_is_live(&owner, cid, lifetime)
+            {
+                return;
+            }
+            self.retained_human.take();
+            if self.lease.is_none() {
+                self.open_lease_with_tcp_mirror(&owner, timeout_s, false, now, Some(lifetime));
+            }
+            return;
+        }
+
+        // PTY 還原維持原先的取出、更新與建立順序。
+        let Some((owner, timeout_s, _)) = self.retained_human.take() else {
+            return;
         };
         self.refresh_lease_p6(now);
         if self.lease.is_none() {
-            self.open_lease_with_tcp_mirror(&owner, timeout_s, false, now, mirror_lifetime);
+            self.open_lease_with_tcp_mirror(&owner, timeout_s, false, now, None);
         }
+    }
+
+    fn retained_tcp_owner_is_live(&self, owner: &str, client_id: &str, lifetime: u64) -> bool {
+        self.retained_human.as_ref().is_some_and(|(retained_owner, _, retained_lifetime)| {
+            retained_owner == owner && *retained_lifetime == Some(lifetime)
+        }) && self.human.consoles.get(client_id).is_some_and(|console| {
+            console.kind == crate::human_console::ConsoleTransportKind::TcpTelnet
+                && self.human.is_live(client_id, lifetime)
+                && console.client_lifetime == lifetime
+                && self.human.peer_present.get(client_id).copied().unwrap_or(true)
+        })
     }
 
     /// 目前前景命令是否為可信 human（OD-74、rulings s2 D5）：line editor 的 `HumanConsole` OR 請求的 `trusted_human`

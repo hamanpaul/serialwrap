@@ -156,6 +156,61 @@ fn tcp_mirror_retained_recover_preserves_lifetime_on_eof() {
 }
 
 #[test]
+fn tcp_mirror_retained_recover_respects_guards() {
+    // 交接凍結期間就緒完成事件留在 actor 暫存區；解凍後保留的 TCP 所有者正常還原。
+    let mut handoff = tcp_ready(&["handoff"]);
+    handoff.begin_stop(sw_core::drain::StopKind::Recover);
+    let (epoch, stop_id) = handoff.pending_stop();
+    handoff.receipt(epoch, stop_id).feed();
+    handoff.bridge_ok();
+    let lifetime = handoff.lifetime("handoff");
+    let freeze = handoff.reg.admission_gate().freeze_if_idle("p279-retained-restore");
+    let sw_core::admission::FreezeOutcome::Frozen { token, created: true } = freeze else {
+        panic!("handoff 測試需要新建立可撤銷的凍結：{freeze:?}");
+    };
+    let (epoch, fsm_gen) = (handoff.epoch(), handoff.core.generations().fsm_gen);
+    handoff.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: sw_core::login_fsm::LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    assert!(handoff.core.active_lease().is_none(), "handoff 暫存 readiness 時不得建立 mirror");
+    assert!(handoff.core.human_console().ownership.interactive_owner.is_none(), "handoff 暫存期間不得重授 raw owner");
+    assert_eq!(handoff.core.retained_human_owner(), Some("human:handoff"), "handoff 暫存期間保留 retained 資訊");
+    assert!(handoff.reg.admission_gate().thaw(&token));
+    handoff.rpc(SessionRequest::GetState).expect("解凍後重播 readiness");
+    let restored = handoff.core.active_lease().expect("解凍後還原 TCP mirror");
+    assert_eq!(restored.owner, "human:handoff");
+    assert_eq!(restored.mirror_client_lifetime, Some(lifetime));
+
+    // 燒錄關鍵狀態期間就緒收尾照常完成；鏡像還原必須等完整 guard 開放後重試。
+    let mut flash = tcp_ready(&["flash"]);
+    let lifetime = flash.lifetime("flash");
+    flash.begin_stop(sw_core::drain::StopKind::Recover);
+    let (epoch, stop_id) = flash.pending_stop();
+    flash.receipt(epoch, stop_id).feed();
+    flash.bridge_ok();
+    flash.fence.with(|fence| fence.flash_critical = true);
+    let (epoch, fsm_gen) = (flash.epoch(), flash.core.generations().fsm_gen);
+    flash.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: sw_core::login_fsm::LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    assert!(flash.core.active_lease().is_none(), "flash-critical 期間不得建立 retained TCP mirror");
+    assert!(flash.core.human_console().ownership.interactive_owner.is_none(), "flash-critical 期間不得重授 retained TCP owner");
+    assert_eq!(flash.core.retained_human_owner(), Some("human:flash"), "flash guard 暫時關閉時保留 retained 資訊");
+
+    flash.fence.with(|fence| fence.flash_critical = false);
+    flash.rpc(SessionRequest::GetState).expect("guard 開放後重試 retained restore");
+    let restored = flash.core.active_lease().expect("flash guard 解除後還原 TCP mirror");
+    assert_eq!(restored.owner, "human:flash");
+    assert_eq!(restored.mirror_client_lifetime, Some(lifetime));
+}
+
+#[test]
 fn tcp_mirror_self_heal_respects_flash_critical_window() {
     let mut h = tcp_ready(&["c1"]);
     close_mirror_publicly(&mut h, "c1");
@@ -317,6 +372,39 @@ fn tcp_mirror_preempt_reconnect_preserves_new_owner() {
     pty.rpc(close_req(&agent_id)).expect("agent close");
     assert!(pty.core.active_lease().is_none(), "PTY stash 沿用原有無條件清 owner 語意");
     assert!(pty.core.human_console().ownership.interactive_owner.is_none(), "TCP owner 不得改變 PTY stash close 語意");
+
+    // TCP stash 恢復也是 raw 所有權重新授予入口；守衛關閉時保留 stash 並延後恢復。
+    let mut guarded = tcp_ready(&["guarded"]);
+    let opened = guarded.rpc(open_req("agent:guarded", 60.0, "", false)).expect("guarded soft preempt");
+    let agent_id = opened.get("interactive_id").and_then(PyValue::as_str).unwrap().to_string();
+    guarded.fence.with(|fence| fence.flash_critical = true);
+    guarded.rpc(close_req(&agent_id)).expect("guarded agent close");
+    assert!(guarded.core.active_lease().is_none(), "flash-critical 期間不重授 TCP stash lease");
+    assert!(guarded.core.human_console().ownership.interactive_owner.is_none(), "flash-critical 期間不重授 TCP raw owner");
+    assert_eq!(guarded.core.stashed_human_lease().map(|lease| lease.owner.as_str()), Some("human:guarded"), "guard 關閉時保留 stash");
+
+    guarded.fence.with(|fence| fence.flash_critical = false);
+    guarded.scan(None);
+    assert_eq!(guarded.core.active_lease().map(|lease| lease.owner.as_str()), Some("human:guarded"));
+    assert_eq!(guarded.core.human_console().ownership.interactive_owner.as_deref(), Some("human:guarded"));
+
+    // A 斷線後 B 在燒錄守衛期間接手；agent 租約關閉不可透過無 stash 的恢復繞過守衛。
+    let mut replacement = tcp_ready(&["a"]);
+    let opened = replacement.rpc(open_req("agent:replacement", 60.0, "", false)).expect("replacement soft preempt");
+    let agent_id = opened.get("interactive_id").and_then(PyValue::as_str).unwrap().to_string();
+    replacement.fence.with(|fence| fence.flash_critical = true);
+    replacement.disconnect("a");
+    replacement.connect_stream_console("b", ConsoleTransportKind::TcpTelnet);
+    assert_eq!(replacement.core.human_console().ownership.suspended_owner.as_deref(), Some("human:b"));
+    replacement.rpc(close_req(&agent_id)).expect("replacement agent close");
+    assert!(replacement.core.active_lease().is_none(), "flash-critical 期間不建立替換 TCP mirror");
+    assert!(replacement.core.human_console().ownership.interactive_owner.is_none(), "flash-critical 期間不重授替換 TCP raw owner");
+    assert_eq!(replacement.core.human_console().ownership.suspended_owner.as_deref(), Some("human:b"), "guard 關閉時保留替換 owner 待恢復");
+
+    replacement.fence.with(|fence| fence.flash_critical = false);
+    replacement.scan(None);
+    assert_eq!(replacement.core.active_lease().map(|lease| lease.owner.as_str()), Some("human:b"));
+    assert_eq!(replacement.core.human_console().ownership.interactive_owner.as_deref(), Some("human:b"));
 }
 
 #[test]
