@@ -29,6 +29,14 @@ entries:
     - cargo:sw-cli::mgmt_remote::windows_argv_drops_control_master_but_identity_unchanged
     - cargo:sw-cli::mgmt_remote::windows_connect_ready_via_ping
     owner_phase: P4
+  bc:BC-06:
+    nodeids:
+    - cargo:sw-core::drain_release::shutdown_interactive_late_completion_does_not_restore_lease
+    - cargo:sw-core::drain_release::shutdown_interactive_open_reply_precedes_worker_receipt
+    - cargo:sw-core::drain_release::shutdown_interactive_send_reply_precedes_worker_receipt
+    - cargo:sw-core::drain_release::shutdown_ready_recover_reply_precedes_worker_receipt
+    - cargo:sw-core::drain_release::shutdown_self_test_reply_precedes_worker_receipt
+    owner_phase: P5
   bc:BC-07:
     nodeids:
     - cargo:sw-cli::mgmt_daemon::p277_daemon_start_preserves_interrupted_update_hold
@@ -2676,6 +2684,7 @@ l1_only_approvals:
   "bc:BC-03": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:BC-03 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:BC-04": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:BC-04 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:BC-05": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:BC-05 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:BC-06": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-06 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:BC-07": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-07 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:BC-10": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-10 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:DF-01": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-01 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}

@@ -249,7 +249,7 @@ serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wir
 - 長流命令（`logread -f`、`tcpdump`、kernel debug）：`--mode background` 不會讓命令脫離 `--cmd-timeout` 期限，到點（或靜默超過上限）一樣被 Ctrl-C 結束，期間也佔住該 session 的命令佇列。限時抓取可用 `--mode background` 並把 `--cmd-timeout` 設成想抓的時長；要長時間或可能靜默的，改在板上丟背景（見「`cmd submit` 的期限語意」）。
 - 每筆自動化命令必填 `--source`，不可省略，確保追蹤性。
 - 卡住時先 `serialwrap session self-test`，再決定是否 `serialwrap session recover`（可加 `--force`）。recover 成功恢復 prompt 時回 `ok: true`（附 `error_code: PROMPT_TIMEOUT_RECOVERED`, `partial: true`），表示 session 可繼續使用。
-- session 於命令排隊期間發生 recovery/re-attach（掉出 `READY`）時，尚未啟動的排隊命令會被終結為 `status=error`、`error_code=FLUSHED_BY_RECOVERY`（#128）——代表該命令**未執行**，等 session 回 `READY` 後重送即可；執行中的命令不受影響，仍以真實結果收尾。所有 detach 類路徑（含 clear/release/熱拔/re-attach）皆用 `FLUSHED_BY_RECOVERY`；daemon shutdown 則用 `FLUSHED_BY_SHUTDOWN`，語意相同＝命令未執行、可於 `READY` 後重送。
+- session 於命令排隊期間發生 recovery/re-attach（掉出 `READY`）時，尚未啟動的排隊命令會被終結為 `status=error`、`error_code=FLUSHED_BY_RECOVERY`（#128）——代表該命令**未執行**，等 session 回 `READY` 後重送即可；執行中的命令不受影響，仍以真實結果收尾。所有 detach 類路徑（含 clear/release/熱拔/re-attach）皆用 `FLUSHED_BY_RECOVERY`；daemon shutdown 則用 `FLUSHED_BY_SHUTDOWN`。Rust 0.5.1 起，排隊中、未送出的命令可在 `READY` 後重送；停機時在途的 `self_test`、`recover`、`interactive open`／`send` 也可能回此碼，bytes 可能已送出，須先確認副作用，不得只憑此碼自動重送（BC-06）。
 
 ## `--source` 的語意
 `--source`（`cmd submit`／`file push`／`file pull`／`device release`）與 `session interactive-open --owner` 的字串**不只是追蹤標籤**：daemon 用它的**前綴**決定命令逾時（沒等到 prompt）時怎麼處理。
@@ -396,7 +396,7 @@ PY
 | `FLASHING_BUSY` | rpc、rec、cli_local／posix、windows | 是 | session 處於 FLASHING 或 flash 臨界區，命令或操作被拒；Rust phase 包含 update_safety_check、supervision_set_safety_check | 等待燒錄結束（session 回到 ATTACHED 或 READY）後再重試 |
 | `FLASH_TARGET_IS_CONSOLE` | rpc／posix、windows | 修正參數後 | 燒錄目標是可下命令的 console 裝置，且未指定 force，拒絕執行 | 改選非 console 的燒錄目標；此碼目前 production 不可達，僅作為契約保留 |
 | `FLUSHED_BY_RECOVERY` | rpc、rec／posix、windows | 是 | 命令尚未執行即因 recovery 或 detach 被清空（未送出，可在 READY 後重送）；file.push／file.pull 為傳輸尚未寫出任何 byte 即因 drain、世代過期或取消而中止（OD-62） | 確認 session 已回到 READY 後才可重送 |
-| `FLUSHED_BY_SHUTDOWN` | rpc、rec／posix、windows | 是 | daemon 停止時，尚未執行的排隊命令被清空（未送出，可重送）；原子交接凍結後的有副作用 RPC 回 reason:"handoff_frozen" | daemon 重新啟動並確認 session 為 READY 後才可重送 |
+| `FLUSHED_BY_SHUTDOWN` | rpc、rec／posix、windows | 視情況 | daemon 停止時，尚未執行的排隊命令被清空（未送出）；在途的 session.self_test、session.recover、session.interactive_open 與 session.interactive_send 可能已送出 bytes，須依裝置狀態確認實際副作用；原子交接凍結後的有副作用 RPC 回 reason:"handoff_frozen" | 確認操作類型：排隊中且尚未送出的命令，待 daemon 重新啟動並確認 session 為 READY 後可重送；在途操作可能已送出 bytes，須先確認實際副作用，不得只憑此錯誤碼自動重送 |
 | `FORCE_RECOVER_TIMEOUT` | rpc／posix、windows | 視情況 | 強制 recover（clear 後重新 attach）在 10 次、每次 1 秒的窗口內未達 READY | 以 session get_state 確認目前狀態後，再決定重試 recover 或處理裝置 |
 | `INTERACTIVE_EXPIRED` | rpc／posix、windows | 否 | 互動 lease 已逾時失效 | 重新 interactive open 取得新的 lease 後再送出 |
 | `INTERACTIVE_NOT_FOUND` | rpc／posix、windows | 否 | interactive_id 不存在，或 lease 狀態已不是 active | 重新 interactive open 取得 interactive_id |

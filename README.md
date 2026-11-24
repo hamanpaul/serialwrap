@@ -627,9 +627,12 @@ daemon restart.
 
 All detach-class paths — recovery, `session clear`, device release, rebind,
 hot unplug, re-attach — terminate not-yet-started commands with
-`FLUSHED_BY_RECOVERY`; daemon shutdown uses `FLUSHED_BY_SHUTDOWN`. Both carry
-the same semantics: the command was never executed and can be resubmitted once
-the session is `READY` again.
+`FLUSHED_BY_RECOVERY`; daemon shutdown uses `FLUSHED_BY_SHUTDOWN`. For Rust
+0.5.1, queued but not-yet-sent commands may be retried after `READY`, but
+in-flight `self_test`/`recover`/`interactive_open`/`interactive_send`
+operations can also return this code after bytes may already have been sent;
+verify side effects before retrying, and do not auto-resubmit just because the
+code is `FLUSHED_BY_SHUTDOWN` (BC-06).
 
 #### Attach and recovery errors (SC-34)
 
@@ -2807,7 +2810,7 @@ recover 行為分成三種：
 
 recovery 把 session 降出 `READY`（或 session 重新 attach）時，佇列中**尚未啟動**的命令會以 `status=error`、`error_code: FLUSHED_BY_RECOVERY` 終結（#128）。此類命令**從未送進 UART**——client 收到即代表未執行，應於 session 回 `READY` 後重送；正在執行中（in-flight）的命令不受影響，仍由 worker 以真實結果終結。flush 同時立即釋放 per-session pending 額度，stale 佇列記錄不再永久佔額度、把 session 卡死在 `SESSION_QUEUE_FULL` 直到 daemon 重啟。
 
-所有 detach 類路徑（含 recovery、`session clear`、device release、rebind、熱拔、re-attach）皆以 `FLUSHED_BY_RECOVERY` 終結未啟動命令；daemon shutdown 則用 `FLUSHED_BY_SHUTDOWN`。兩者語意相同＝命令未執行、可於 session 回 `READY` 後重送。
+所有 detach 類路徑（含 recovery、`session clear`、device release、rebind、熱拔、re-attach）皆以 `FLUSHED_BY_RECOVERY` 終結未啟動命令；daemon shutdown 則用 `FLUSHED_BY_SHUTDOWN`。Rust 0.5.1 起，排隊中、未送出的命令可在 `READY` 後重送；停機時在途的 `self_test`、`recover`、`interactive open`／`send` 也可能回此碼，bytes 可能已送出，須先確認副作用，不得只憑此碼自動重送（BC-06）。
 
 只有 **agent 明確送出 reboot 類指令** 時，daemon 才會進入 `RECOVERING`，並在 target 回來後自動重新 login / 回到 `READY`。
 

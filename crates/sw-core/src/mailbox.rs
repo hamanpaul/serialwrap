@@ -122,6 +122,8 @@ pub enum ControlEvent {
     ShutdownGate {
         reply: Reply,
     },
+    /// 停機 Phase 1 只沖刷在途等待者，不結束 actor、不改寫 DETACHED／RELEASED 狀態。
+    ShutdownFlushWaiters,
     Shutdown {
         reply: Reply,
     },

@@ -6,7 +6,7 @@
 # extra_fields 不含共通欄位 ok、error_code、id、version（見盤點 03 §1.1）。
 # retryable：yes＝可在條件滿足後重送；no＝不可直接重送；conditional＝視條件；fix_args＝修正參數或設定後再送。
 schema_version: 1
-revision: 3
+revision: 6
 namespace: error_code
 codes:
   - code: ALIAS_NOT_FOUND
@@ -474,15 +474,15 @@ codes:
     status: EXISTING
     reachable: true
     scope: {interfaces: [rpc, rec], methods: ["alias.assign", "alias.set", "alias.unassign", "command.cancel", "command.get", "command.result_tail", "command.submit", "device.attach", "device.release", "event.com_disable", "event.com_enable", "event.reload", "event.reset", "event.rule_delete", "event.rule_set", "file.pull", "file.push", "result.tail", "session.attach", "session.bind", "session.clear", "session.console_attach", "session.console_detach", "session.interactive_close", "session.interactive_open", "session.interactive_send", "session.interactive_status", "session.log_start", "session.log_stop", "session.pin", "session.recover", "session.self_test", "session.unpin", "wal.reset"], platforms: [posix, windows]}
-    meaning: "daemon 停止時，尚未執行的排隊命令被清空（未送出，可重送）；原子交接凍結後的有副作用 RPC 回 reason:\"handoff_frozen\""
-    side_effect: "命令紀錄 status 為 error；未送出"
-    retryable: "yes"
-    uart_tx: none
-    agent_action: "daemon 重新啟動並確認 session 為 READY 後才可重送"
+    meaning: "daemon 停止時，尚未執行的排隊命令被清空（未送出）；在途的 session.self_test、session.recover、session.interactive_open 與 session.interactive_send 可能已送出 bytes，須依裝置狀態確認實際副作用；原子交接凍結後的有副作用 RPC 回 reason:\"handoff_frozen\""
+    side_effect: "排隊命令紀錄 status 為 error、未送出；self-test probe、recover 救援鍵及 interactive open／send bytes 若已送出不回滾；Shutdown Phase 1 凍結 Fence 後不再送後續 TX，並沿用既有清理移除 interactive lease，晚到 TX 完成不得 touch／重建 lease；交接凍結拒絕的 RPC 不執行操作"
+    retryable: "conditional"
+    uart_tx: possible
+    agent_action: "確認操作類型：排隊中且尚未送出的命令，待 daemon 重新啟動並確認 session 為 READY 後可重送；在途操作可能已送出 bytes，須先確認實際副作用，不得只憑此錯誤碼自動重送"
     extra_fields: ["reason"]
     contract_tests: ["tests/test_arbiter_flush_on_recovery.py::test_service_stop_flushes_with_shutdown_code", "tests/test_stage0_handoff_stop.py::test_push_after_freeze_rejected_zero_tx", "tests/test_stage0_handoff_stop.py::test_every_mutating_method_rejected_after_freeze"]
-    behavior_change: ["SC-11"]
-    sources: ["sw_core/service.py:532"]
+    behavior_change: ["SC-11", "BC-06"]
+    sources: ["sw_core/service.py:532", "crates/sw-core/src/session_core.rs:2318", "crates/sw-core/src/op_runner.rs:959"]
   - code: FORCE_RECOVER_TIMEOUT
     status: EXISTING
     reachable: true
