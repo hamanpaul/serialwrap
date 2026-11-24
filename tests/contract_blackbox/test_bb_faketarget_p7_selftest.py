@@ -294,3 +294,62 @@ def test_df27_profile_timeout_override_is_local(tmp_path):
     src_text_after = (PROFILE_DIR / "bcm.yaml").read_text(encoding="utf-8")
     assert src_text_after == src_text_before
 
+
+@pytest.mark.posix_pty
+def test_selftest_shell_framework_runs_supported_inner_and_marks_success(make_target, tmp_path):
+    ft = make_target(login=False)
+    s = _Slave(ft.start(tmp_path / "by-id-selftest-framework"))
+    prompt_b = b"root@fake:~# "
+    try:
+        s.wait_for(prompt_b)
+        start = len(s.buf)
+        command = "( echo __READY__ab ) && printf '\\n__SW_ST_%s_OK__\\n' 'deadbeef'"
+        s.write(command.encode("utf-8") + b"\n")
+        s.wait_for(b"__SW_ST_deadbeef_OK__\n" + prompt_b)
+
+        output = bytes(s.buf[start:])
+        assert output.startswith(command.encode("utf-8") + b"\r\n"), output
+        assert b"__READY__ab\r\n" in output, output
+        assert output.index(b"__READY__ab\r\n") < output.index(b"__SW_ST_deadbeef_OK__"), output
+        assert output.endswith(prompt_b), output
+        assert ft.rx_log() == command.encode("utf-8") + b"\n"
+    finally:
+        s.close()
+
+
+@pytest.mark.posix_pty
+def test_selftest_shell_framework_suppresses_unready_probe(make_target, tmp_path):
+    ft = make_target(login=False, ready=False)
+    s = _Slave(ft.start(tmp_path / "by-id-selftest-unready"))
+    prompt_b = b"root@fake:~# "
+    try:
+        s.wait_for(prompt_b)
+        start = len(s.buf)
+        command = "( echo __READY__ab ) && printf '\\n__SW_ST_%s_OK__\\n' 'deadbeef'"
+        s.write(command.encode("utf-8") + b"\n")
+        s.pump(0.3)
+
+        assert bytes(s.buf[start:]) == b"", bytes(s.buf[start:])
+        assert ft.rx_log() == command.encode("utf-8") + b"\n"
+    finally:
+        s.close()
+
+
+@pytest.mark.posix_pty
+def test_selftest_shell_framework_unknown_inner_keeps_legacy_response(make_target, tmp_path):
+    ft = make_target(login=False)
+    s = _Slave(ft.start(tmp_path / "by-id-selftest-unknown"))
+    prompt_b = b"root@fake:~# "
+    try:
+        s.wait_for(prompt_b)
+        start = len(s.buf)
+        command = "( unsupported_selftest_command ) && printf '\\n__SW_ST_%s_OK__\\n' 'deadbeef'"
+        s.write(command.encode("utf-8") + b"\n")
+        s.wait_for(command.encode("utf-8") + b"\r\n" + prompt_b)
+
+        output = bytes(s.buf[start:])
+        assert output == command.encode("utf-8") + b"\r\n" + prompt_b, output
+        assert b"__SW_ST_deadbeef_OK__" not in output, output
+    finally:
+        s.close()
+
