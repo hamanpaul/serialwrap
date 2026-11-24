@@ -25,7 +25,28 @@ ACCEPTANCE_RELATIVE = Path("tests/acceptance")
 CASE_ATTR_KEYS = (
     "suite", "layer", "platforms", "expected", "necessity", "daemon_slice", "cli_stage", "stage0_required",
 )
+# 僅 mirror schema 中 additionalProperties:false 的物件鍵集合；測試會逐一與
+# stage3_required_cases.schema.json 的 properties／required 對照，避免兩份契約漂移。
+_LOCK_OBJECT_SHAPES: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+    "": (
+        frozenset({"schema_version", "seed", "exits"}),
+        frozenset({"schema_version", "seed", "exits"}),
+    ),
+    "$defs.Seed": (
+        frozenset({"revision", "cases", "case_lock", "decision_ref", "excluded_case_ids"}),
+        frozenset({"revision", "cases", "case_lock", "decision_ref", "excluded_case_ids"}),
+    ),
+    "$defs.FrozenFile": (
+        frozenset({"path", "sha256"}),
+        frozenset({"path", "sha256"}),
+    ),
+    "$defs.ExitPlatform": (
+        frozenset({"required_case_set", "layer", "case_ids"}),
+        frozenset({"required_case_set", "layer", "case_ids"}),
+    ),
+}
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_EXIT_ITEM_ID = re.compile(r"^S3-[A-Z0-9-]+$")
 SourceReader = Callable[[str, str], bytes | None]
 
 
@@ -310,10 +331,62 @@ def _seed_family_errors(current_cases: Mapping[str, Any], evidence_root: Path) -
     return _case_family_errors(current_cases, seed_cases, source="固定 seed")
 
 
+def _lock_schema_errors(lock: Mapping[str, Any]) -> list[str]:
+    """以 stdlib 檢查分母鎖的 schema 物件鍵、required 與動態 map 約束。"""
+    errors: list[str] = []
+
+    def closed_object(value: Any, schema_path: str, label: str) -> bool:
+        if not isinstance(value, Mapping):
+            errors.append(f"{label} 必須是 schema 物件")
+            return False
+        properties, required = _LOCK_OBJECT_SHAPES[schema_path]
+        actual = set(value)
+        missing = required - actual
+        unknown = actual - properties
+        if missing or unknown:
+            details: list[str] = []
+            if missing:
+                details.append(f"缺少欄位：{', '.join(sorted(missing))}")
+            if unknown:
+                details.append(f"未知欄位：{', '.join(sorted(unknown))}")
+            errors.append(f"{label} 的 schema 欄位集合不符（{'；'.join(details)}）")
+        return True
+
+    closed_object(lock, "", "分母鎖根物件")
+    seed = lock.get("seed")
+    if "seed" in lock and closed_object(seed, "$defs.Seed", "分母鎖 seed"):
+        for name in ("cases", "case_lock"):
+            if name in seed:
+                closed_object(seed[name], "$defs.FrozenFile", f"分母鎖 seed.{name}")
+
+    exits = lock.get("exits")
+    if "exits" not in lock:
+        pass  # 根物件的 required 欄位診斷已涵蓋。
+    elif not isinstance(exits, Mapping):
+        errors.append("分母鎖 exits 必須是 schema 物件")
+    elif not exits:
+        errors.append("分母鎖 exits 違反 schema minProperties（至少一個出口）")
+    else:
+        for item_id, platforms in exits.items():
+            if not isinstance(item_id, str) or not _EXIT_ITEM_ID.fullmatch(item_id):
+                errors.append(f"分母鎖 exits 含不符合 schema propertyNames 的出口：{item_id!r}")
+            if not isinstance(platforms, Mapping):
+                errors.append(f"分母鎖出口 {item_id!r} 必須是 schema 物件")
+                continue
+            if not platforms:
+                errors.append(f"分母鎖出口 {item_id!r} 違反 schema minProperties（至少一個平台）")
+                continue
+            for platform, entry in platforms.items():
+                if platform not in ("linux", "windows"):
+                    errors.append(f"分母鎖出口 {item_id!r} 含不符合 schema propertyNames 的平台：{platform!r}")
+                closed_object(entry, "$defs.ExitPlatform", f"分母鎖出口 {item_id!r}/{platform}")
+    return errors
+
+
 def _validate_lock(
     lock: Mapping[str, Any], expected: Mapping[str, Any], *, allow_missing: bool = False,
 ) -> list[str]:
-    errors: list[str] = []
+    errors: list[str] = _lock_schema_errors(lock)
     if lock.get("schema_version") != 1:
         errors.append("分母鎖 schema_version 必須為 1")
     seed = lock.get("seed")
@@ -403,6 +476,7 @@ def _base_errors(
         return [f"PR base 的分母鎖不是有效 JSON：{exc}"]
     if not isinstance(previous, dict):
         return ["PR base 的分母鎖根節點必須是物件"]
+    errors.extend(_lock_schema_errors(previous))
     if previous.get("seed") != current.get("seed"):
         errors.append("分母鎖 seed 不可在 PR 中變更")
     before = previous.get("exits")
@@ -491,6 +565,9 @@ def main(
     reader = source_reader or (lambda revision, path: _git_show(root, revision, path))
     try:
         cases_doc, case_lock, catalog, lock, manifest = _load_inputs(root)
+        schema_errors = _lock_schema_errors(lock)
+        if schema_errors:
+            raise ValueError("；".join(schema_errors))
         errors = _seed_errors(manifest, root, reader)
         if errors:
             raise ValueError("；".join(errors))

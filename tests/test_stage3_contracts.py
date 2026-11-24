@@ -744,6 +744,134 @@ def test_required_cases_lock_matches_its_schema():
     assert list(jsonschema.Draft202012Validator(schema).iter_errors(duplicate))
 
 
+def _closed_object_schemas(schema):
+    found = {}
+
+    def visit(value, path):
+        if isinstance(value, dict):
+            if value.get("additionalProperties") is False:
+                found[path] = value
+            for key, child in value.items():
+                visit(child, f"{path}.{key}" if path else key)
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                visit(child, f"{path}[{index}]")
+
+    visit(schema, "")
+    return found
+
+
+def test_required_cases_validator_keys_match_schema():
+    from tools.stage3 import required_cases
+
+    schema = _load(ACC / "stage3_required_cases.schema.json")
+    schema_objects = _closed_object_schemas(schema)
+    assert set(required_cases._LOCK_OBJECT_SHAPES) == set(schema_objects)
+    for path, object_schema in schema_objects.items():
+        properties = frozenset(object_schema["properties"])
+        required = frozenset(object_schema["required"])
+        assert required_cases._LOCK_OBJECT_SHAPES[path] == (properties, required)
+
+
+def _mutate_closed_lock_object(lock, path, mutation):
+    if path == "":
+        target = lock
+    elif path == "$defs.Seed":
+        target = lock["seed"]
+    elif path == "$defs.FrozenFile":
+        target = lock["seed"]["cases"]
+    elif path == "$defs.ExitPlatform":
+        item_id = next(iter(lock["exits"]))
+        platform = next(iter(lock["exits"][item_id]))
+        target = lock["exits"][item_id][platform]
+    else:
+        raise AssertionError(f"test helper does not know schema object {path}")
+
+    if mutation == "unknown":
+        target["unexpected_stage3_key"] = True
+    else:
+        key = {
+            "": "schema_version",
+            "$defs.Seed": "excluded_case_ids",
+            "$defs.FrozenFile": "sha256",
+            "$defs.ExitPlatform": "case_ids",
+        }[path]
+        del target[key]
+
+
+@pytest.mark.parametrize("mode", ["--check", "--add-only"])
+@pytest.mark.parametrize("mutation", ["unknown", "missing"])
+@pytest.mark.parametrize("path", ["", "$defs.Seed", "$defs.FrozenFile", "$defs.ExitPlatform"])
+def test_required_cases_commands_reject_schema_key_drift(tmp_path, capsys, mode, mutation, path):
+    from tools.stage3 import required_cases
+
+    root, source_reader = _required_cases_repo(tmp_path)
+    lock_path = root / "tests" / "acceptance" / "stage3_required_cases.lock.json"
+    lock = _load(lock_path)
+    _mutate_closed_lock_object(lock, path, mutation)
+    lock_path.write_text(json.dumps(lock, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    before = lock_path.read_bytes()
+
+    result = required_cases.main([mode], repo_root=root, source_reader=source_reader)
+
+    assert result != 0
+    diagnostic = capsys.readouterr().err
+    assert "schema 欄位" in diagnostic
+    assert lock_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("mode", ["--check", "--add-only"])
+@pytest.mark.parametrize("empty_path", ["exits", "platforms"])
+def test_required_cases_commands_reject_empty_schema_maps(tmp_path, capsys, mode, empty_path):
+    from tools.stage3 import required_cases
+
+    root, source_reader = _required_cases_repo(tmp_path)
+    lock_path = root / "tests" / "acceptance" / "stage3_required_cases.lock.json"
+    lock = _load(lock_path)
+    if empty_path == "exits":
+        lock["exits"].clear()
+    else:
+        item_id = next(iter(lock["exits"]))
+        lock["exits"][item_id].clear()
+    lock_path.write_text(json.dumps(lock, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    before = lock_path.read_bytes()
+
+    result = required_cases.main([mode], repo_root=root, source_reader=source_reader)
+
+    assert result != 0
+    assert "schema minProperties" in capsys.readouterr().err
+    assert lock_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("mutation", ["unknown", "missing"])
+@pytest.mark.parametrize("path", ["", "$defs.Seed", "$defs.FrozenFile", "$defs.ExitPlatform"])
+def test_required_cases_add_only_rejects_invalid_candidate_shape(tmp_path, monkeypatch, capsys, mutation, path):
+    from tools.stage3 import required_cases
+
+    root, source_reader = _required_cases_repo(tmp_path)
+    lock_path = root / "tests" / "acceptance" / "stage3_required_cases.lock.json"
+    lock = _load(lock_path)
+    # 留出一個尚未登記的目錄出口，讓 add-only 會建立候選鎖並進入第二次驗證。
+    removed_item = next(iter(lock["exits"]))
+    del lock["exits"][removed_item]
+    lock_path.write_text(json.dumps(lock, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    before = lock_path.read_bytes()
+
+    validate_lock = required_cases._validate_lock
+
+    def corrupt_candidate(candidate, expected, *, allow_missing=False):
+        if not allow_missing:
+            _mutate_closed_lock_object(candidate, path, mutation)
+        return validate_lock(candidate, expected, allow_missing=allow_missing)
+
+    monkeypatch.setattr(required_cases, "_validate_lock", corrupt_candidate)
+    result = required_cases.main(["--add-only"], repo_root=root, source_reader=source_reader)
+
+    assert result != 0
+    assert "schema 欄位" in capsys.readouterr().err
+    assert lock_path.read_bytes() == before
+
+
 def test_required_cases_add_only_rejects_family_reclassification(tmp_path):
     from tools.stage3 import required_cases
     import yaml
