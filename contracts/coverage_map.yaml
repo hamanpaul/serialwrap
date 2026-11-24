@@ -49,9 +49,13 @@ entries:
     nodeids:
     - cargo:sw-core::login_fsm_full::refusal_and_partial_write_abort_without_further_tx
     - cargo:sw-core::sw_core::login_fsm::issue311_tests::issue311_secret_tx_failure_does_not_disclose_length
+    - cargo:sw-core::sw_core::login_fsm::issue311_tests::issue311_partial_and_unknown_secret_tx_keep_late_echo_guarded
+    - cargo:sw-core::rx_reader::reader_stop_with_secret_echo_prefix_records_an_evidence_gap
     - cargo:sw-daemon::issue311_secret_echo::issue311_login_echo_is_masked_at_rpc_and_every_rx_exit
+    - cargo:sw-daemon::issue311_secret_echo::issue311_login_prompt_prefix_overlapping_secret_does_not_timeout
     - cargo:sw-daemon::issue311_secret_echo::issue311_console_unlock_echo_is_masked_in_last_error_detail
     - cargo:sw-daemon::issue311_secret_echo::issue311_console_unlock_echo_is_masked_in_human_console
+    - cargo:sw-daemon::issue311_secret_echo::issue311_console_unlock_prompt_prefix_overlapping_secret_does_not_timeout
     - cargo:sw-daemon::issue311_secret_echo::issue311_secret_split_across_one_byte_rx_chunks_is_masked
     owner_phase: P5
   bc:DF-01:

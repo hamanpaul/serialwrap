@@ -502,8 +502,15 @@ fn send_command(io: &LoginIo, cmd: &str) -> Step<()> {
     send(io, cmd, "system", true)
 }
 
-fn send_secret<'a>(io: &LoginIo<'a>, secret: &str) -> Step<SecretEchoGuard<'a>> {
-    let guard = io.rx.arm_secret_echo(secret.as_bytes());
+fn send_secret<'a>(
+    io: &LoginIo<'a>,
+    secret: &str,
+    prompt_pattern: &str,
+    timeout: Duration,
+) -> Step<SecretEchoGuard<'a>> {
+    let guard = io
+        .rx
+        .arm_secret_echo_with_prompt(secret.as_bytes(), prompt_pattern);
     let secret_len = secret.as_bytes().len();
     if !(io.audit_secret_tx)(secret_len) {
         return Err(LoginOutcome::Raised {
@@ -516,12 +523,20 @@ fn send_secret<'a>(io: &LoginIo<'a>, secret: &str) -> Step<SecretEchoGuard<'a>> 
         bytes.push(b'\n');
     }
     let report = (io.tx)(&bytes, io.class, "system:secret", false);
+    let deadline = io
+        .clock
+        .mono_ns()
+        .saturating_add(timeout.as_nanos().min(u64::MAX as u128) as u64);
+    guard.set_deadline(deadline);
     match report.result.outcome {
         TxOutcome::Completed(n) if n >= bytes.len() => return Ok(guard),
         TxOutcome::NotSubmitted if report.reject.is_none() => {
             return Err(LoginOutcome::Aborted(LoginAbort::Cancelled));
         }
         _ => {}
+    }
+    if secret_tx_may_have_been_submitted(&report) {
+        guard.preserve_until(deadline);
     }
     Err(match classify_login_secret_tx_failure(&report) {
         TxFail::Refused => LoginOutcome::Aborted(LoginAbort::Refused(
@@ -532,6 +547,14 @@ fn send_secret<'a>(io: &LoginIo<'a>, secret: &str) -> Step<SecretEchoGuard<'a>> 
             message,
         },
     })
+}
+
+fn secret_tx_may_have_been_submitted(report: &TxReport) -> bool {
+    match &report.result.outcome {
+        TxOutcome::NotSubmitted => false,
+        TxOutcome::Completed(n) => *n > 0,
+        TxOutcome::Unknown { .. } => true,
+    }
 }
 
 fn classify_login_secret_tx_failure(report: &TxReport) -> TxFail {
@@ -690,7 +713,7 @@ fn maybe_login(
             Ok(password) => password,
             Err(code) => return Ok((false, Some(code.into()))),
         };
-        let guard = send_secret(io, &password)?;
+        let guard = send_secret(io, &password, &t.prompt_regex, timeout)?;
         let ok = wait_regex(io, &t.prompt_regex, timeout)?;
         drop(guard);
         io.rx.clear();
@@ -773,7 +796,7 @@ fn ensure_console_unlocked(
             return Ok(Some("CONSOLE_UNLOCK_IDLE_TIMEOUT".into()));
         }
         io.rx.clear();
-        let guard = send_secret(io, secret)?;
+        let guard = send_secret(io, secret, &t.prompt_regex, timeout)?;
         let prompt = wait_regex(io, &t.prompt_regex, timeout)?;
         drop(guard);
         if !prompt {
@@ -785,9 +808,14 @@ fn ensure_console_unlocked(
 
 #[cfg(test)]
 mod issue311_tests {
-    use super::{classify_login_secret_tx_failure, TxFail};
-    use crate::tx_writer::{OpId, TxReport};
-    use sw_pal::traits::{TxOutcome, TxResult};
+    use super::{
+        classify_login_secret_tx_failure, send_secret, LoginIo, LoginOutcome, TxFail,
+    };
+    use crate::tx_writer::{OpId, TxClass, TxReport};
+    use crate::uart_bridge::{RunCancel, RxShared};
+    use std::time::Duration;
+    use sw_pal::fakes::FakeClock;
+    use sw_pal::traits::{Clock, PalError, PalErrorKind, TxOutcome, TxResult};
 
     #[test]
     fn issue311_secret_tx_failure_does_not_disclose_length() {
@@ -807,5 +835,71 @@ mod issue311_tests {
         assert_eq!(exc, "TxIncompleteError");
         assert!(!message.contains("/11"), "secret TX 長度外洩：{message:?}");
         assert_eq!(message, "secret TX incomplete");
+    }
+
+    #[test]
+    fn issue311_partial_and_unknown_secret_tx_keep_late_echo_guarded() {
+        const SECRET: &str = "i311secret";
+        let reports = [TxOutcome::Completed(1), TxOutcome::Unknown { confirmed: 1 }];
+        for outcome in reports {
+            let rx = RxShared::new(128, 0);
+            let clock = FakeClock::new();
+            let cancel = RunCancel::new(&rx);
+            let report = TxReport {
+                op_id: OpId(1),
+                epoch: 1,
+                result: TxResult {
+                    outcome,
+                    error: Some(PalError::plain(PalErrorKind::Io, "injected partial TX")),
+                },
+                wal: None,
+                reject: None,
+            };
+            let tx = move |_bytes: &[u8], _class, _source: &str, _log: bool| report.clone();
+            let nonce = || "n".to_string();
+            let audit = |_length: usize| true;
+            let io = LoginIo {
+                rx: &rx,
+                tx: &tx,
+                clock: clock.as_ref() as &dyn Clock,
+                nonce: &nonce,
+                audit_secret_tx: &audit,
+                cancel: &cancel,
+                class: TxClass::LoginProbe,
+            };
+            let timeout = Duration::from_secs(2);
+
+            let result = send_secret(&io, SECRET, "(?m)^root@t:/# ", timeout);
+            assert!(
+                matches!(result, Err(LoginOutcome::Raised { .. })),
+                "possible partial submission keeps the original TX error"
+            );
+            let visible = rx.issue311_test_mask_secret_echo(SECRET.as_bytes(), clock.mono_ns());
+            assert_eq!(
+                visible,
+                vec![b'*'; SECRET.len()],
+                "遲到的 secret echo 必須在 partial/unknown TX 後仍受守衛保護"
+            );
+            let prompt = b"\r\nroot@t:/# ";
+            assert_eq!(
+                rx.issue311_test_mask_secret_echo(prompt, clock.mono_ns()),
+                prompt,
+                "prompt 本身保持原文"
+            );
+            assert_eq!(
+                rx.issue311_test_mask_secret_echo(SECRET.as_bytes(), clock.mono_ns()),
+                SECRET.as_bytes(),
+                "prompt 命中後窗口外的相同字串保持原文"
+            );
+
+            let result = send_secret(&io, SECRET, "(?m)^root@t:/# ", timeout);
+            assert!(matches!(result, Err(LoginOutcome::Raised { .. })));
+            clock.advance(timeout);
+            assert_eq!(
+                rx.issue311_test_mask_secret_echo(SECRET.as_bytes(), clock.mono_ns()),
+                SECRET.as_bytes(),
+                "期限到達後窗口外的相同字串保持原文"
+            );
+        }
     }
 }

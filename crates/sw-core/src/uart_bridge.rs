@@ -114,6 +114,8 @@ pub struct RxShared {
     capture: Mutex<Option<Arc<crate::capture::CaptureObserver>>>,
     /// OD-111：只在登入 FSM 明確武裝的窗口內遮罩 secret 回顯；reader 的所有出口共用此狀態。
     secret_echo: Mutex<SecretEchoWindow>,
+    /// secret 暫存改變時也喚醒 prompt waiter；RX 視窗本身不含尚未判定的 bytes。
+    secret_echo_revision: AtomicU64,
     /// P7 Task 7（SC-30）：login run 取消世代。`RunCancel` 建立時記下當時值，之後遞增即視為已取消
     /// （actor 在 quiet arm 的同一事件內呼叫 `cancel_login_runs`，不需新增 Effect 變體）。
     run_cancel_gen: AtomicU64,
@@ -126,13 +128,29 @@ pub struct RxShared {
 struct SecretEchoWindow {
     next_id: u64,
     armed: Option<ArmedSecretEcho>,
-    released: VecDeque<u8>,
+    released: VecDeque<ReleasedSecretByte>,
+}
+
+struct ReleasedSecretByte {
+    byte: u8,
+    include_in_rx_window: bool,
 }
 
 struct ArmedSecretEcho {
     id: u64,
     secret: Vec<u8>,
     pending: Vec<u8>,
+    start_from: u64,
+    prompt_pattern: Option<String>,
+    deadline: Option<Mono>,
+    preserve_on_drop: bool,
+    prompt_seen: bool,
+    suppress_pending_window: usize,
+}
+
+struct MaskedRxChunk {
+    bytes: Vec<u8>,
+    rx_window: Vec<u8>,
 }
 
 /// 自 `send_secret` 前武裝，於 prompt 命中、逾時或取消離開作用域時解除。
@@ -144,6 +162,18 @@ pub struct SecretEchoGuard<'a> {
 impl Drop for SecretEchoGuard<'_> {
     fn drop(&mut self) {
         self.rx.disarm_secret_echo(self.id);
+    }
+}
+
+impl SecretEchoGuard<'_> {
+    /// 設定此登入窗口的到期時間。
+    pub fn set_deadline(&self, deadline: Mono) {
+        self.rx.set_secret_echo_deadline(self.id, deadline, false);
+    }
+
+    /// 部分／不明 TX 可能已提交 secret；維持守衛至後續 prompt 或同一登入等待期限。
+    pub fn preserve_until(&self, deadline: Mono) {
+        self.rx.set_secret_echo_deadline(self.id, deadline, true);
     }
 }
 
@@ -160,6 +190,7 @@ impl RxShared {
             stats_override: AtomicU64::new(u64::MAX),
             capture: Mutex::new(None),
             secret_echo: Mutex::new(SecretEchoWindow::default()),
+            secret_echo_revision: AtomicU64::new(0),
             run_cancel_gen: AtomicU64::new(0),
             transfer_cancel_gen: AtomicU64::new(0),
         })
@@ -185,9 +216,28 @@ impl RxShared {
 
     /// 只遮罩此守衛存續期間、與 `secret` 完全相符的 byte 序列。
     pub fn arm_secret_echo(&self, secret: &[u8]) -> SecretEchoGuard<'_> {
+        self.arm_secret_echo_inner(secret, None, 0)
+    }
+
+    /// 登入 FSM 專用：reader 可用 prompt pattern 結算可能已提交的 secret，且 prompt shadow 不看舊 RX。
+    pub fn arm_secret_echo_with_prompt(
+        &self,
+        secret: &[u8],
+        prompt_pattern: &str,
+    ) -> SecretEchoGuard<'_> {
+        let start_from = self.snapshot_len();
+        self.arm_secret_echo_inner(secret, Some(prompt_pattern.to_string()), start_from)
+    }
+
+    fn arm_secret_echo_inner(
+        &self,
+        secret: &[u8],
+        prompt_pattern: Option<String>,
+        start_from: u64,
+    ) -> SecretEchoGuard<'_> {
         let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(mut previous) = window.armed.take() {
-            window.released.extend(previous.pending.drain(..));
+            Self::release_pending(&mut window, &mut previous);
             previous.secret.fill(0);
         }
         window.next_id = window.next_id.wrapping_add(1).max(1);
@@ -197,48 +247,233 @@ impl RxShared {
                 id,
                 secret: secret.to_vec(),
                 pending: Vec::with_capacity(secret.len().saturating_sub(1)),
+                start_from,
+                prompt_pattern,
+                deadline: None,
+                preserve_on_drop: false,
+                prompt_seen: false,
+                suppress_pending_window: 0,
             });
         }
         drop(window);
+        self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
         self.wake_all();
         SecretEchoGuard { rx: self, id }
     }
 
-    /// reader 專用：回傳現在可以安全發布的 RX bytes。armed 時最多保留 secret 長度減 1 byte。
-    fn mask_secret_echo(&self, data: &[u8]) -> Vec<u8> {
+    fn set_secret_echo_deadline(&self, id: u64, deadline: Mono, preserve_on_drop: bool) {
         let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
-        let mut visible = window.released.drain(..).collect::<Vec<_>>();
-        let Some(armed) = window.armed.as_mut() else {
-            visible.extend_from_slice(data);
-            return visible;
-        };
+        if let Some(armed) = window.armed.as_mut().filter(|armed| armed.id == id) {
+            armed.deadline = Some(deadline);
+            armed.preserve_on_drop = preserve_on_drop;
+        }
+        drop(window);
+        self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
+        self.wake_all();
+    }
 
-        for byte in data {
-            let split = armed.secret.len().saturating_sub(1);
-            if armed.pending.len() == split
-                && armed.pending.as_slice() == &armed.secret[..split]
-                && *byte == armed.secret[split]
-            {
-                visible.resize(visible.len().saturating_add(armed.secret.len()), b'*');
-                armed.pending.clear();
-                continue;
-            }
-            armed.pending.push(*byte);
-            while !armed.secret.starts_with(&armed.pending) {
-                visible.push(armed.pending.remove(0));
+    fn release_pending(window: &mut SecretEchoWindow, armed: &mut ArmedSecretEcho) {
+        for (index, byte) in armed.pending.drain(..).enumerate() {
+            window.released.push_back(ReleasedSecretByte {
+                byte,
+                include_in_rx_window: index >= armed.suppress_pending_window,
+            });
+        }
+        armed.suppress_pending_window = 0;
+    }
+
+    /// 到期時釋出未匹配前綴；完整 secret 在抵達時已被遮罩。
+    fn expire_secret_echo(window: &mut SecretEchoWindow, now: Mono) -> bool {
+        if !window
+            .armed
+            .as_ref()
+            .and_then(|armed| armed.deadline)
+            .is_some_and(|deadline| now >= deadline)
+        {
+            return false;
+        }
+        if let Some(mut armed) = window.armed.take() {
+            Self::release_pending(window, &mut armed);
+            armed.secret.fill(0);
+            return true;
+        }
+        false
+    }
+
+    /// reader 專用：回傳現在可以安全發布的 RX bytes。armed 時最多保留 secret 長度減 1 byte。
+    fn mask_secret_echo(&self, data: &[u8], now: Mono) -> MaskedRxChunk {
+        let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
+        let expired = Self::expire_secret_echo(&mut window, now);
+        let mut visible = Vec::new();
+        let mut rx_window = Vec::new();
+        for released in window.released.drain(..) {
+            visible.push(released.byte);
+            if released.include_in_rx_window {
+                rx_window.push(released.byte);
             }
         }
-        visible
+        if let Some(armed) = window.armed.as_mut() {
+            for (index, byte) in data.iter().enumerate() {
+                if armed.secret.is_empty() {
+                    visible.extend_from_slice(&data[index..]);
+                    rx_window.extend_from_slice(&data[index..]);
+                    break;
+                }
+                let split = armed.secret.len().saturating_sub(1);
+                if armed.pending.len() == split
+                    && armed.pending.as_slice() == &armed.secret[..split]
+                    && *byte == armed.secret[split]
+                {
+                    visible.resize(visible.len().saturating_add(armed.secret.len()), b'*');
+                    if armed.suppress_pending_window == 0 {
+                        rx_window.resize(rx_window.len().saturating_add(armed.secret.len()), b'*');
+                    }
+                    armed.suppress_pending_window = 0;
+                    armed.pending.clear();
+                    // prompt 前綴也可能是 secret echo 的開頭；完整匹配時以 echo 解讀並保留守衛。
+                    armed.prompt_seen = false;
+                    continue;
+                }
+                armed.pending.push(*byte);
+                while !armed.secret.starts_with(&armed.pending) {
+                    let released = armed.pending.remove(0);
+                    visible.push(released);
+                    if armed.suppress_pending_window > 0 {
+                        armed.suppress_pending_window -= 1;
+                    } else {
+                        rx_window.push(released);
+                    }
+                }
+                if armed.prompt_seen && armed.pending.is_empty() {
+                    visible.extend_from_slice(&data[index + 1..]);
+                    rx_window.extend_from_slice(&data[index + 1..]);
+                    break;
+                }
+            }
+            if window
+                .armed
+                .as_ref()
+                .is_some_and(|armed| armed.prompt_seen && armed.pending.is_empty())
+            {
+                if let Some(mut armed) = window.armed.take() {
+                    armed.secret.fill(0);
+                }
+            }
+        } else {
+            visible.extend_from_slice(data);
+            rx_window.extend_from_slice(data);
+        }
+
+        let changed = !data.is_empty() || expired;
+        drop(window);
+        if changed {
+            self.observe_secret_prompt(&visible);
+            self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
+            self.wake_all();
+        }
+        MaskedRxChunk {
+            bytes: visible,
+            rx_window,
+        }
+    }
+
+    fn observe_secret_prompt(&self, current_visible: &[u8]) {
+        let Some((id, start_from, pattern, pending)) = self.secret_echo_prompt_context() else {
+            return;
+        };
+        let mut snapshot = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .text_from(start_from)
+            .to_string();
+        snapshot.push_str(&decode_utf8_replace(current_visible));
+        snapshot.push_str(&decode_utf8_replace(&pending));
+        let Ok(re) = sw_proto::pyre::compile(&pattern, sw_proto::pyre::PyFlags(0)) else {
+            return;
+        };
+        if re.search(&snapshot).is_some() {
+            self.mark_secret_prompt_seen(id);
+        }
+    }
+
+    fn secret_echo_prompt_context(&self) -> Option<(u64, u64, String, Vec<u8>)> {
+        let window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
+        let armed = window.armed.as_ref()?;
+        Some((
+            armed.id,
+            armed.start_from,
+            armed.prompt_pattern.as_ref()?.clone(),
+            armed.pending.clone(),
+        ))
+    }
+
+    fn secret_echo_match_context(&self) -> Option<(u64, u64, Vec<u8>)> {
+        let window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
+        let armed = window.armed.as_ref()?;
+        Some((
+            armed.id,
+            armed.start_from,
+            armed.pending[armed.suppress_pending_window.min(armed.pending.len())..].to_vec(),
+        ))
+    }
+
+    fn mark_secret_prompt_seen(&self, id: u64) {
+        let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(armed) = window.armed.as_mut().filter(|armed| armed.id == id) {
+            armed.prompt_seen = true;
+            if armed.pending.is_empty() {
+                if let Some(mut completed) = window.armed.take() {
+                    completed.secret.fill(0);
+                }
+            }
+        }
+        drop(window);
+        self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
+        self.wake_all();
     }
 
     /// 守衛解除後由 reader 取出未匹配的前綴；active guard 的 pending bytes 不會由此洩漏。
-    fn take_ready_secret_echo(&self) -> Vec<u8> {
-        self.secret_echo
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .released
-            .drain(..)
-            .collect()
+    fn take_ready_secret_echo(&self, now: Mono) -> MaskedRxChunk {
+        let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
+        let expired = Self::expire_secret_echo(&mut window, now);
+        let mut bytes = Vec::new();
+        let mut rx_window = Vec::new();
+        for released in window.released.drain(..) {
+            bytes.push(released.byte);
+            if released.include_in_rx_window {
+                rx_window.push(released.byte);
+            }
+        }
+        drop(window);
+        if expired {
+            self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
+            self.wake_all();
+        }
+        MaskedRxChunk { bytes, rx_window }
+    }
+
+    /// reader exit 與 guard drop 共用同一把鎖：已解除的前綴由 reader 落盤，仍未決的前綴回報明確 RX evidence gap。
+    fn finish_secret_echo_for_reader_exit(&self) -> (MaskedRxChunk, bool) {
+        let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
+        let mut unresolved = false;
+        if let Some(mut armed) = window.armed.take() {
+            unresolved = !armed.pending.is_empty();
+            armed.secret.fill(0);
+            armed.pending.clear();
+        }
+        let mut bytes = Vec::new();
+        let mut rx_window = Vec::new();
+        for released in window.released.drain(..) {
+            bytes.push(released.byte);
+            if released.include_in_rx_window {
+                rx_window.push(released.byte);
+            }
+        }
+        drop(window);
+        self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
+        self.wake_all();
+        (MaskedRxChunk { bytes, rx_window }, unresolved)
     }
 
     fn disarm_secret_echo(&self, id: u64) {
@@ -246,14 +481,29 @@ impl RxShared {
             return;
         }
         let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
-        if window.armed.as_ref().is_some_and(|armed| armed.id == id) {
+        let keep_ambiguous_prompt = window.armed.as_ref().is_some_and(|armed| {
+            armed.id == id && armed.prompt_seen && !armed.pending.is_empty()
+        });
+        let keep_possible_submission = window.armed.as_ref().is_some_and(|armed| {
+            armed.id == id && armed.preserve_on_drop && !armed.prompt_seen
+        });
+        if !keep_ambiguous_prompt
+            && !keep_possible_submission
+            && window.armed.as_ref().is_some_and(|armed| armed.id == id)
+        {
             if let Some(mut armed) = window.armed.take() {
-                window.released.extend(armed.pending.drain(..));
+                Self::release_pending(&mut window, &mut armed);
                 armed.secret.fill(0);
             }
         }
         drop(window);
+        self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
         self.wake_all();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn issue311_test_mask_secret_echo(&self, data: &[u8], now: Mono) -> Vec<u8> {
+        self.mask_secret_echo(data, now).bytes
     }
 
     /// 喚醒所有 `wait_for_regex_cancellable` 等待者（容量 1、滿則略過；已斷線者移除）。
@@ -293,11 +543,22 @@ impl RxShared {
 
     /// 只把 reader 已通過 secret matcher 的 bytes 寫入可觀察 RX window 與 agent capture。
     fn append_sanitized(&self, data: &[u8], epoch: u64, rx_seq: u64) {
+        self.append_sanitized_with_window(data, data, epoch, rx_seq);
+    }
+
+    /// 各輸出與 capture 收到完整遮罩後 RX；登入 matcher 可略過 clear 前已消耗的 prompt bytes。
+    fn append_sanitized_with_window(
+        &self,
+        data: &[u8],
+        window_data: &[u8],
+        epoch: u64,
+        rx_seq: u64,
+    ) {
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         window.watermark = (epoch, rx_seq);
         window.revision = window.revision.saturating_add(1);
-        if !data.is_empty() {
-            window.text.push_str(&decode_utf8_replace(data));
+        if !window_data.is_empty() {
+            window.text.push_str(&decode_utf8_replace(window_data));
             window.trim_to_limit();
         }
         drop(window);
@@ -322,6 +583,15 @@ impl RxShared {
     }
 
     pub fn clear(&self) {
+        {
+            let mut echo = self
+                .secret_echo
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(armed) = echo.armed.as_mut().filter(|armed| armed.prompt_seen) {
+                armed.suppress_pending_window = armed.pending.len();
+            }
+        }
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         window.trimmed = window
             .trimmed
@@ -621,8 +891,9 @@ fn spawn_reader_inner(
                     }
                     Ok(ReadOutcome::Data(count)) => {
                         let raw = &buf[..count.min(buf.len())];
-                        ctx.rx.record_rx_activity(raw.len(), ctx.clock.mono_ns());
-                        let visible = ctx.rx.mask_secret_echo(raw);
+                        let now = ctx.clock.mono_ns();
+                        ctx.rx.record_rx_activity(raw.len(), now);
+                        let visible = ctx.rx.mask_secret_echo(raw, now);
                         if publisher.publish(&visible) {
                             break;
                         }
@@ -662,8 +933,22 @@ fn spawn_reader_inner(
                 }
             }
 
-            // Stop 與 disarm 可能交錯；只有 guard 已解除並釋出的前綴才會在 reader 結束前發布。
-            let _ = publisher.flush_secret_echo();
+            // 與 guard drop 原子結算：已解除前綴寫入 WAL；仍有歧義的前綴記成明確 evidence gap。
+            let (ready, unresolved) = ctx.rx.finish_secret_echo_for_reader_exit();
+            let _ = publisher.publish(&ready);
+            if unresolved
+                && publisher.unrecorded.len() < crate::tx_writer::TX_LEDGER_UNRESOLVED_GAPS_MAX
+            {
+                publisher.unrecorded.push(EvidenceGap {
+                    op_id: None,
+                    dir: "RX",
+                    len: 0,
+                    error: PalError::plain(
+                        PalErrorKind::Io,
+                        "secret echo prefix unresolved when RX reader stopped",
+                    ),
+                });
+            }
             let rx_seq = publisher.queued_rx_seq;
             let unrecorded = std::mem::take(&mut publisher.unrecorded);
             drop(publisher);
@@ -692,11 +977,11 @@ struct ReaderPublisher<'a> {
 }
 
 impl ReaderPublisher<'_> {
-    fn publish(&mut self, data: &[u8]) -> bool {
-        if data.is_empty() {
+    fn publish(&mut self, chunk: &MaskedRxChunk) -> bool {
+        if chunk.bytes.is_empty() {
             return false;
         }
-        match catch_unwind(AssertUnwindSafe(|| self.publish_inner(data))) {
+        match catch_unwind(AssertUnwindSafe(|| self.publish_inner(chunk))) {
             Ok(should_stop) => should_stop,
             Err(_) => {
                 warn_rx_handler_panic(&self.ctx.com, self.warning_sink);
@@ -705,7 +990,8 @@ impl ReaderPublisher<'_> {
         }
     }
 
-    fn publish_inner(&mut self, data: &[u8]) -> bool {
+    fn publish_inner(&mut self, chunk: &MaskedRxChunk) -> bool {
+        let data = chunk.bytes.as_slice();
         let wal_entry = self.ctx.wal.append(WalAppendReq {
             com: &self.ctx.com,
             dir: "RX",
@@ -738,9 +1024,12 @@ impl ReaderPublisher<'_> {
             }));
         }
         self.rx_seq = self.rx_seq.saturating_add(1);
-        self.ctx
-            .rx
-            .append_sanitized(data, self.ctx.epoch, self.rx_seq);
+        self.ctx.rx.append_sanitized_with_window(
+            data,
+            &chunk.rx_window,
+            self.ctx.epoch,
+            self.rx_seq,
+        );
         if let Some(hook) = self.after_rx_append {
             hook();
         }
@@ -778,7 +1067,7 @@ impl ReaderPublisher<'_> {
     }
 
     fn flush_secret_echo(&mut self) -> bool {
-        let ready = self.ctx.rx.take_ready_secret_echo();
+        let ready = self.ctx.rx.take_ready_secret_echo(self.ctx.clock.mono_ns());
         self.publish(&ready)
     }
 
@@ -1219,14 +1508,23 @@ impl RxShared {
             if cancel.is_triggered() {
                 return WaitOutcome::Cancelled;
             }
-            let (snapshot, revision) = {
+            let secret_revision = self.secret_echo_revision.load(Ordering::Acquire);
+            let echo_context = self.secret_echo_match_context();
+            let effective_from = echo_context
+                .as_ref()
+                .map(|(_, start_from, _)| from.map_or(*start_from, |offset| offset.max(*start_from)))
+                .unwrap_or_else(|| from.unwrap_or(0));
+            let (mut snapshot, revision) = {
                 let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-                (
-                    window.text_from(from.unwrap_or(0)).to_string(),
-                    window.revision,
-                )
+                (window.text_from(effective_from).to_string(), window.revision)
             };
+            if let Some((_, _, pending)) = echo_context.as_ref() {
+                snapshot.push_str(&decode_utf8_replace(pending));
+            }
             if re.search(&snapshot).is_some() {
+                if let Some((id, _, _)) = echo_context {
+                    self.mark_secret_prompt_seen(id);
+                }
                 return WaitOutcome::Matched;
             }
             if clock.mono_ns() >= deadline {
@@ -1239,7 +1537,10 @@ impl RxShared {
                 .unwrap_or_else(|error| error.into_inner())
                 .revision
                 != revision;
-            if changed || cancel.is_triggered() {
+            if changed
+                || self.secret_echo_revision.load(Ordering::Acquire) != secret_revision
+                || cancel.is_triggered()
+            {
                 continue;
             }
             clock.wait_until_or_cancel(deadline, &wake_rx);
