@@ -513,7 +513,11 @@ impl Service {
         if state == "FLASHING" || (!com.is_empty() && self.manager.flash_critical(com)) {
             flags.push(AdmissionFlag::Flashing);
         }
-        if session.get("interactive_session_id").is_some_and(|v| !v.is_null()) {
+        if session
+            .get("interactive_session_id")
+            .and_then(PyValue::as_str)
+            .is_some_and(|id| !self.manager.interactive_is_tcp_mirror(id))
+        {
             flags.push(AdmissionFlag::Lease);
         }
         if state == "RECOVERING" {

@@ -2832,6 +2832,7 @@ impl SessionCore {
             self.quiet_since = None;
         }
         self.state = state;
+        self.sync_tcp_console_lease(now);
     }
 
     fn set_last_error(&mut self, error: Option<String>, detail: Option<String>) {
@@ -6261,6 +6262,7 @@ impl SessionCore {
         {
             return Vec::new();
         }
+        self.sync_tcp_console_lease(now);
         // 手動 attach／recover（或其他 login run）持有 probe：Python `_prepare_reprobe_locked` 照常排程（前移
         // `next_reprobe_at`），worker 取不到 probe 鎖才跳過（審查 c11aa89_92e0223 L-3）。
         let probe_busy = self.login_run.is_some() || self.foreground.is_some();
@@ -9409,6 +9411,8 @@ pub struct PtyInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LeaseIndexOp {
     Insert { interactive_id: String },
+    /// p279：索引仍可解析一般 RPC，但供 daemon 交接摘要辨識不應發布 Lease admission flag 的 TCP mirror。
+    InsertTcpMirror { interactive_id: String },
     Remove { interactive_id: String },
 }
 

@@ -123,11 +123,15 @@ console listener 講 **Telnet**（server 主動協商 char-mode + 遠端回顯�
 - New-line Transmit：`CR` 或 `CR+LF` 皆可（telnet 層會把 Enter 正規化為單一 CR）。
 - **Local echo：不要勾**（遠端回顯已由 telnet 協商接手）。
 
-首個 Telnet console 會取得 raw 擁有權，session 層的待遇與 Linux 經 `console-attach` 的 minicom 相同（#275）：
+首個 Telnet console 會取得 raw 擁有權。Rust 0.5.1（BC-23）會在 session 層鏡像這筆 TCP owner lease，待遇與 Linux 經 `console-attach` 的 minicom 對齊：
 
 - `session self-test` 回報 `human_attached: true`；最後一次鍵入在 60 秒內時 `human_active: true`。agent 送命令前可據此判斷人類是否正在打字。
 - 人類閒置時，agent `interactive-open` 會 soft preempt；人類仍在打字時回 `SESSION_INTERACTIVE_BUSY`。
-- 連線期間以 bare `--source human` 送的 `cmd submit`／`file push`／`file pull` 回 `SESSION_INTERACTIVE_BUSY`：人類請直接在 Tera Term 裡打字。
+- agent interactive lease 會沿用 suspend／resume 與 deferred input 回放；TCP client EOF 只撤除該 client lifetime 的鏡像 lease。
+- 已有 human lease 時，預設 line mode 的 bare `--source human` `cmd submit` 在執行 gate 回 `SESSION_INTERACTIVE_BUSY` 且零 UART TX：人類請直接在 Tera Term 裡打字。
+- `file.push`／`file.pull` 仍走 agent 執行政策與既有傳輸 gate；不因 bare human `source` 而改成 human lease 命令。
+
+本包的接線證據為 Linux native TCP listener + fake UART/WAL；Windows 原生與 Tera Term smoke 另由編排者安排。
 
 ## 7. PuTTY／telnet.exe 連線
 

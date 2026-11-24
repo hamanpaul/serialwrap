@@ -3,4 +3,4 @@ type: fix
 scope: console
 ---
 
-修正 Windows TCP console（TeraTerm／PuTTY Telnet）連入後，session 層一直不知道有人類在用的問題。bridge 在 accept 時直接授予 raw 擁有權，不經 SessionManager，所以 session 沒有 lease，`self-test` 的 `human_attached`／`human_active` 恆為 false，人類打字時 reprobe 也不會暫緩。現在 session 層會補記一筆跟著 bridge 走的鏡像 lease：TCP console 斷線或換人時只撤鏡像、不清 bridge owner，避免清掉 grace 窗內新連線的 raw 擁有權。行為因此與 Linux 經 `console-attach` 的 minicom 一致：閒置 soft preempt、活躍時 `interactive-open` 回 `SESSION_INTERACTIVE_BUSY`；連線期間以 bare `--source human` 送的 `cmd submit`／`file push`／`file pull` 回 `SESSION_INTERACTIVE_BUSY`（#275）。
+Rust 0.5.1（BC-23）為 Windows TCP console 的 raw owner 在 session lease 層補上 lifetime 鏡像，使 `self-test`、reprobe 與 agent interactive 仲裁能看見 TCP human。EOF 僅撤除對應 client lifetime 的鏡像；A 斷線後 B 接手時，不會清除 B 的 raw owner 或 deferred input。閒置 human 可被 agent soft preempt，close／expiry 後恢復並回放；活躍 human 維持 `SESSION_INTERACTIVE_BUSY`。鏡像只記於內部 LeaseIndex，不產生 handoff 的 `AdmissionFlag::Lease`。已有 human lease 時，預設 line mode 的 bare `--source human` `command.submit` 在執行 gate 終結為 `SESSION_INTERACTIVE_BUSY` 且零 UART TX。`file.push`／`file.pull` 保留 agent 執行政策與既有傳輸 gate。Linux native TCP + fake UART/WAL 覆蓋本次接線；Windows 原生與 Tera Term smoke 待另行驗證。

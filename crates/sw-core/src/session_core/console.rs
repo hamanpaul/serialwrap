@@ -742,6 +742,7 @@ impl SessionCore {
         let before = self.human.ownership.interactive_owner.clone();
         self.human.ownership.on_stream_accept(&client_id);
         self.after_owner_change(before);
+        self.sync_tcp_console_lease(now);
         Vec::new()
     }
 
@@ -753,10 +754,12 @@ impl SessionCore {
         let before = self.human.ownership.interactive_owner.clone();
         self.human.ownership.on_drop(client_id);
         self.after_owner_change(before);
+        self.forget_tcp_console_mirror_for_client(client_id, lifetime);
         self.human.deferred_mut().remove_client(client_id);
         let removed = self.human.lane.remove_client(client_id);
         self.settle_removed_replays(&removed);
         self.human.remove_console(client_id);
+        self.sync_tcp_console_lease(self.now_cache);
         Vec::new()
     }
 

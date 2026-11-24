@@ -52,6 +52,16 @@ impl SessionCore {
         self.fx_buf.push(Effect::LeaseIndex(op));
     }
 
+    fn insert_lease_index(&mut self, lease: &InteractiveLease) {
+        let interactive_id = lease.interactive_id.clone();
+        let op = if lease.mirror_client_lifetime.is_some() {
+            LeaseIndexOp::InsertTcpMirror { interactive_id }
+        } else {
+            LeaseIndexOp::Insert { interactive_id }
+        };
+        self.lease_index(op);
+    }
+
     /// 併入本事件緩衝的效果：`LeaseIndex` 一律排在本批最前（必然先於 `Reply` 與 `StartOp`，07 Task 7 效果順序不變式），其餘附加在尾端。
     pub(super) fn drain_fx_buf(&mut self, effects: &mut Vec<Effect>) {
         if self.fx_buf.is_empty() {
@@ -68,16 +78,19 @@ impl SessionCore {
 
     pub(super) fn close_lease_tick(&mut self) {
         self.close_lease_inner(true, true);
+        self.sync_tcp_console_lease(self.now_cache);
     }
 
     pub(super) fn close_lease_p6(&mut self, expired: bool) {
         self.close_lease_inner(expired, false);
+        self.sync_tcp_console_lease(self.now_cache);
     }
 
     fn close_lease_inner(&mut self, expired: bool, tick: bool) {
         let Some(lease) = self.lease.take() else {
             return;
         };
+        let preempted_tcp_mirror_lifetime = lease.preempted_tcp_mirror_lifetime;
         let now = self.now_cache;
         self.bump_owner_gen();
         if expired {
@@ -99,22 +112,44 @@ impl SessionCore {
             ..PostClose::default()
         };
         let stash = self.stashed_human.take();
+        let live_tcp_owner = self.human.live_tcp_raw_owner();
         let mut restored = false;
         if let Some(stash) = stash.as_ref() {
             let cid = stash.human_client_id().unwrap_or("").to_string();
-            if !stash.expired(now) && self.human_peer_present(&cid) {
+            let mirror_still_owned = stash.mirror_client_lifetime.is_some_and(|lifetime| {
+                live_tcp_owner.as_ref().is_some_and(|(owner, live_lifetime)| {
+                    owner == &stash.owner && *live_lifetime == lifetime
+                })
+            });
+            let stash_alive = if stash.mirror_client_lifetime.is_some() {
+                mirror_still_owned
+            } else {
+                !stash.expired(now) && self.human_peer_present(&cid)
+            };
+            if stash_alive {
                 self.lease = Some(stash.clone());
-                self.lease_index(LeaseIndexOp::Insert {
-                    interactive_id: stash.interactive_id.clone(),
-                });
+                self.insert_lease_index(stash);
                 self.human_set_owner(Some(&stash.owner));
                 restored = true;
                 post.replay_allowed = true;
             }
         }
         if !restored {
-            self.human_set_owner(None);
-            post.clear_owner_after_resume = true;
+            // EOF／reconnect can replace the suspended TCP client while an agent owns the lease.
+            // Drop the stale stash and its deferred bytes, but leave the replacement's raw owner
+            // in place for resume. PTY and ordinary human lease close behavior remains unchanged.
+            let replacement_tcp_owner = preempted_tcp_mirror_lifetime.is_some()
+                && live_tcp_owner.as_ref().is_some_and(|(owner, lifetime)| {
+                    !stash.as_ref().is_some_and(|old| {
+                        old.owner == *owner && old.mirror_client_lifetime == Some(*lifetime)
+                    })
+                });
+            if replacement_tcp_owner {
+                post.clear_owner_after_resume = false;
+            } else {
+                self.human_set_owner(None);
+                post.clear_owner_after_resume = true;
+            }
             post.dropped_stash_client = stash.as_ref().and_then(|s| s.human_client_id()).map(str::to_string);
         }
         self.execute_post_close(post, tick);
@@ -185,7 +220,124 @@ impl SessionCore {
 
     /// RPC 路徑的完整 refresh。
     pub(super) fn refresh_lease_p6(&mut self, now: Mono) {
+        self.sync_tcp_console_lease(now);
         self.refresh_inner(now, true);
+        self.sync_tcp_console_lease(now);
+    }
+
+    /// TCP raw owner 的 session lease 鏡像。只更新 Lease／LeaseIndex，不授 raw owner、不改 owner_gen。
+    pub(super) fn sync_tcp_console_lease(&mut self, now: Mono) {
+        let logical_owner = self.human.live_tcp_raw_owner();
+        let active_matches = self.lease.as_ref().is_some_and(|lease| {
+            logical_owner.as_ref().is_some_and(|(owner, lifetime)| {
+                lease.mirror_client_lifetime == Some(*lifetime) && lease.owner == *owner
+            })
+        });
+        let stashed_matches = self.stashed_human.as_ref().is_some_and(|lease| {
+            logical_owner.as_ref().is_some_and(|(owner, lifetime)| {
+                lease.mirror_client_lifetime == Some(*lifetime) && lease.owner == *owner
+            })
+        });
+
+        if self.lease.as_ref().is_some_and(|lease| lease.mirror_client_lifetime.is_some()) && !active_matches {
+            self.forget_active_tcp_mirror();
+        }
+        if self
+            .stashed_human
+            .as_ref()
+            .is_some_and(|lease| lease.mirror_client_lifetime.is_some())
+            && !stashed_matches
+        {
+            self.forget_stashed_tcp_mirror();
+        }
+        if active_matches || stashed_matches {
+            return;
+        }
+        let Some((owner, lifetime)) = logical_owner else {
+            return;
+        };
+
+        // 新鏡像沿用既有的交接 admission 與 bridge／state／stop／flash guards；它不接觸 ownership。
+        if self.generations.conn_epoch.is_none()
+            || !matches!(self.state, SessionState::Ready | SessionState::Attached)
+            || self.stop.is_some()
+            || self.pending_open_stop.is_some()
+            || self.shutdown_requested
+            || self.shutdown_complete
+            || self.flash_busy()
+            || self.handoff_frozen()
+        {
+            return;
+        }
+        let gate = self.deps.registry.admission_gate();
+        let Some(ticket) = gate.admit("session.interactive_open", Some(&self.profile.com)) else {
+            return;
+        };
+        let _admission = crate::admission::AdmissionTicket::new(gate, ticket);
+        if self.handoff_frozen() {
+            return;
+        }
+
+        let id = self.next_uuid();
+        let timeout = self
+            .profile
+            .template
+            .hard_timeout_s
+            .max(ATTACHED_CONSOLE_LEASE_TIMEOUT_S);
+        let mut mirror = InteractiveLease::new(
+            id.clone(),
+            owner,
+            self.wall_iso(),
+            timeout,
+            now,
+            false,
+        );
+        mirror.mirror_client_lifetime = Some(lifetime);
+        match self.lease.as_ref() {
+            None if self.stashed_human.is_none() => {
+                self.lease = Some(mirror);
+                let mirror = self.lease.as_ref().expect("剛建立 TCP mirror").clone();
+                self.insert_lease_index(&mirror);
+            }
+            Some(active) if !active.is_human() && active.suspended_human && self.stashed_human.is_none() => {
+                self.stashed_human = Some(mirror);
+                let mirror = self.stashed_human.as_ref().expect("剛 stash TCP mirror").clone();
+                self.insert_lease_index(&mirror);
+            }
+            // Agent／一般 human lease 與非 mirror stash 都是既有權威，不由 TCP mirror 覆蓋。
+            _ => {}
+        }
+    }
+
+    /// 自 EOF／owner 替換移除指定 client lifetime 的 mirror；不呼叫 human_set_owner。
+    pub(super) fn forget_tcp_console_mirror_for_client(&mut self, client_id: &str, lifetime: u64) {
+        let owner = format!("human:{client_id}");
+        if self.lease.as_ref().is_some_and(|lease| {
+            lease.owner == owner && lease.mirror_client_lifetime == Some(lifetime)
+        }) {
+            self.forget_active_tcp_mirror();
+        }
+        if self.stashed_human.as_ref().is_some_and(|lease| {
+            lease.owner == owner && lease.mirror_client_lifetime == Some(lifetime)
+        }) {
+            self.forget_stashed_tcp_mirror();
+        }
+    }
+
+    fn forget_active_tcp_mirror(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            self.lease_index(LeaseIndexOp::Remove {
+                interactive_id: lease.interactive_id,
+            });
+        }
+    }
+
+    fn forget_stashed_tcp_mirror(&mut self) {
+        if let Some(lease) = self.stashed_human.take() {
+            self.lease_index(LeaseIndexOp::Remove {
+                interactive_id: lease.interactive_id,
+            });
+        }
     }
 
     /// `owner_check`：RPC 路徑比照 Python 檢查 `snapshot()["interactive_owner"] == lease.owner`；
@@ -194,6 +346,11 @@ impl SessionCore {
         let Some(lease) = self.lease.as_ref() else {
             return;
         };
+        if lease.mirror_client_lifetime.is_some() {
+            // TCP EOF／重連由 data lane 的 exact lifetime 與 sync_tcp_console_lease 結算；不可套
+            // PTY peer grace 或 active-owner-only 檢查，否則 agent 命令 suspend 期間會拆掉 mirror。
+            return;
+        }
         if !lease.is_human() {
             if lease.expired(now) {
                 self.close_lease_p6(true);
@@ -237,9 +394,17 @@ impl SessionCore {
         if !self.human.consoles.contains_key(client_id) {
             return false;
         }
+        let lifetime = self
+            .human
+            .consoles
+            .get(client_id)
+            .map(|record| record.client_lifetime);
         let before = self.human.ownership.interactive_owner.clone();
         self.human.ownership.on_detach(client_id);
         self.after_owner_change(before);
+        if let Some(lifetime) = lifetime {
+            self.forget_tcp_console_mirror_for_client(client_id, lifetime);
+        }
         self.human.deferred_mut().remove_client(client_id);
         let removed = self.human.lane.remove_client(client_id);
         self.settle_removed_replays(&removed);
@@ -252,8 +417,11 @@ impl SessionCore {
 
     /// hub 掃描後：human lease 的 peer grace（D-14 `ConsolePeerGraceExpired`）與 self-heal（`session_manager.py` reaper 段）。
     pub(super) fn after_console_scan(&mut self, now: Mono) {
+        self.sync_tcp_console_lease(now);
         self.refresh_inner(now, false);
+        self.sync_tcp_console_lease(now);
         self.self_heal(now);
+        self.sync_tcp_console_lease(now);
     }
 
     fn self_heal(&mut self, now: Mono) {
@@ -290,8 +458,19 @@ impl SessionCore {
             .template
             .hard_timeout_s
             .max(ATTACHED_CONSOLE_LEASE_TIMEOUT_S);
-        self.lease = Some(InteractiveLease::new(id.clone(), owner, self.wall_iso(), timeout, now, false));
-        self.lease_index(LeaseIndexOp::Insert { interactive_id: id });
+        let mut lease = InteractiveLease::new(id.clone(), owner.clone(), self.wall_iso(), timeout, now, false);
+        if let Some((_, lifetime)) = self
+            .human
+            .live_tcp_raw_owner()
+            .filter(|(live_owner, _)| live_owner == &owner)
+        {
+            lease.mirror_client_lifetime = Some(lifetime);
+            self.lease = Some(lease.clone());
+            self.insert_lease_index(&lease);
+        } else {
+            self.lease = Some(lease);
+            self.lease_index(LeaseIndexOp::Insert { interactive_id: id });
+        }
     }
 
     // ---------------- open（`interactive_open` 的 READY／ATTACHED 分支） ----------------
@@ -317,8 +496,10 @@ impl SessionCore {
     }
 
     /// 把目前 human lease 移入 stash 並 suspend human（#53／救援）。
-    fn stash_human_and_suspend(&mut self) {
+    fn stash_human_and_suspend(&mut self) -> Option<u64> {
+        let mut mirror_lifetime = None;
         if let Some(existing) = self.lease.take() {
+            mirror_lifetime = existing.mirror_client_lifetime;
             self.lease_index(LeaseIndexOp::Remove {
                 interactive_id: existing.interactive_id.clone(),
             });
@@ -327,6 +508,13 @@ impl SessionCore {
         let before = self.human.ownership.interactive_owner.clone();
         self.human.ownership.suspend();
         self.after_owner_change(before);
+        mirror_lifetime
+    }
+
+    fn mark_preempted_tcp_mirror(&mut self, lifetime: Option<u64>) {
+        if let (Some(lease), Some(lifetime)) = (self.lease.as_mut(), lifetime) {
+            lease.preempted_tcp_mirror_lifetime = Some(lifetime);
+        }
     }
 
     pub(super) fn interactive_open_branches(
@@ -364,8 +552,9 @@ impl SessionCore {
                     if existing.is_human() && !human_active && !owner.starts_with("human:") {
                         // #53 soft preempt：非破壞性降級，human 輸入進 deferred，close 後還原並回放。
                         self.revoke_replay();
-                        self.stash_human_and_suspend();
+                        let stashed_tcp_lifetime = self.stash_human_and_suspend();
                         let id = self.open_lease_full(owner, timeout_s, false, true, now);
+                        self.mark_preempted_tcp_mirror(stashed_tcp_lifetime);
                         result = pydict! {
                             "ok" => true,
                             "interactive_id" => id,
@@ -442,8 +631,10 @@ impl SessionCore {
                 if revoke {
                     self.revoke_replay();
                 }
-                self.stash_human_and_suspend();
-                self.open_lease_full(owner, clamped, true, true, now)
+                let stashed_tcp_lifetime = self.stash_human_and_suspend();
+                let id = self.open_lease_full(owner, clamped, true, true, now);
+                self.mark_preempted_tcp_mirror(stashed_tcp_lifetime);
+                id
             }
             Some(_) => return Err(self.busy_reply()),
         };

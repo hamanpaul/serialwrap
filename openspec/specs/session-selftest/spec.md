@@ -211,3 +211,29 @@ provenance 與唯讀偵測結果：
 - **WHEN** session 綁定的 profile `ready_probe` 非空
 - **THEN** result 含 `command_capable == True`
 
+### Requirement: Rust TCP raw ownership SHALL participate in self-test and reprobe through its lease mirror
+
+Rust 0.5.1（BC-23）中，存活的 TCP/Telnet raw owner SHALL 以 session-layer mirror lease 參與 `self-test` 的 `interactive_owner`、`human_attached` 與 `human_active` 計算。`human_active` 依最後一次真實 TCP raw input 的 60 秒視窗判定；鏡像 lifetime 為內部欄位，不改變 RPC schema。
+
+人類活動窗內，readiness reprobe SHALL 暫緩。self-test、lease refresh 或 agent command 在途期間不得因 raw owner 被 suspend 而拆除 mirror；agent 完成後 deferred input SHALL 只回放一次。
+
+#### Scenario: TCP raw owner appears in self-test context
+
+- **WHEN** READY 或 ATTACHED session 有存活 TCP/Telnet raw owner並已建立 mirror lease
+- **AND** 呼叫 `session.self_test`
+- **THEN** result 回報該 human 的 `interactive_owner` 與 `human_attached == true`
+- **AND** 最後一次真實鍵入在 60 秒內時 `human_active == true`
+
+#### Scenario: recent TCP input defers readiness reprobe
+
+- **WHEN** TCP raw owner 最近 60 秒內有真實輸入，session 處於允許 reprobe 的狀態
+- **THEN** 自動 reprobe 尊重 human activity window，不啟動 login probe
+- **AND** 超過活動窗後再依既有 reprobe 排程判定
+
+#### Scenario: self-test and refresh during an agent command preserve the mirror
+
+- **WHEN** agent command 已 suspend TCP raw owner，human bytes 正在 deferred buffer
+- **AND** 呼叫 `session.self_test` 或 interactive refresh
+- **THEN** TCP mirror lease 不被拆除，agent command 的 TX 仲裁不變
+- **AND** command 結束後 deferred bytes 恰回放一次
+

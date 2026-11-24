@@ -233,3 +233,41 @@ READY 路徑（`allow_attached=False` 或 `state == "READY"`）SHALL NOT 受此 
 - **WHEN** human lease 存在、peer 仍開著、但已閒置超過視窗
 - **THEN** 該 console SHALL NOT 被自動 detach（僅可被 soft preempt 降級）
 
+### Requirement: Rust TCP raw console ownership SHALL have a lifetime-bound session lease mirror
+
+Rust 0.5.1（BC-23）中，`ConsoleTransportKind::TcpTelnet` 的 raw owner SHALL 在 `SessionCore` 以內部 mirror `InteractiveLease` 表示，使 self-test、reprobe 與 interactive arbitration 看見同一位 human。鏡像只記錄既有 ownership，不得重新授予 raw owner、增加 `owner_gen`，或把 client lifetime 標記透出 RPC；內部 mirror kind SHALL NOT 產生 handoff 的 `AdmissionFlag::Lease`。
+
+mirror SHALL 隨目前存活的 TCP raw owner（active、suspended 或 pending）同步。它不得覆蓋 agent lease、一般 human lease 或非 mirror stash；建立 mirror 前 SHALL 遵守 bridge、READY／ATTACHED、stop、flash、handoff 與 admission guards。
+
+EOF 與 detach SHALL 依 `(client_id, client_lifetime)` 精確移除 mirror，不呼叫清 owner 的路徑。當 client A 離線、client B 已成為 raw owner時，A 的 EOF、舊 stash close 或 expiry SHALL NOT 清除 B 的 ownership；agent soft preempt 後 close／expiry SHALL 保留 B 並只清掉 A 的 deferred bytes。不得新增第二 console 即時接班；未被既有 ownership 指定的第二 console 仍沿用 self-heal。
+
+#### Scenario: TCP accept creates a mirror without changing raw ownership
+
+- **WHEN** READY 或 ATTACHED session 接受第一個 TCP/Telnet console
+- **THEN** raw owner 仍由既有 accept 路徑授予，session 同事件新增一筆 human mirror lease
+- **AND** mirror 不額外改變 `owner_gen`，內部 lifetime 標記不出現在 RPC 欄位
+
+#### Scenario: old EOF cannot remove a replacement client's mirror
+
+- **WHEN** TCP client A 的 mirror 已被 client B 的 raw ownership 取代
+- **AND** A 的舊 lifetime EOF 或 detach 事件到達
+- **THEN** B 的 mirror 與 raw owner 保留，且 B 的 deferred input 不被刪除
+
+#### Scenario: soft-preempt close restores the replacement TCP owner
+
+- **WHEN** agent soft-preempt 期間 A 離線、B 成為 suspended TCP raw owner並有對應 mirror stash
+- **AND** agent lease close 或 expiry
+- **THEN** B 的 mirror lease 還原、ownership resume，且僅回放 B 的 deferred bytes 一次
+
+#### Scenario: secondary line console follows the mirrored lease arbitration
+
+- **WHEN** TCP client A 持有 raw owner／mirror lease，client B 以 line mode 輸入命令
+- **THEN** B 的 line submission 回 `SESSION_INTERACTIVE_BUSY` 且零 UART TX
+- **AND** 經公開 `session.console_detach` 移除 A 後，B 原有 line submission 行為恢復
+
+#### Scenario: bare human command is busy while file transfer stays on agent policy
+
+- **WHEN** TCP human mirror lease 存在，RPC 以 bare `source: "human"` 提交預設 line `command.submit`
+- **THEN** 命令執行 gate 終結為 `SESSION_INTERACTIVE_BUSY` 且零 UART TX
+- **AND** `file.push`／`file.pull` 維持 RPC agent 執行政策與各自既有傳輸 gate
+
