@@ -79,7 +79,7 @@ fn build_login_rig(console_unlock: bool) -> LoginRig {
     let log_path = log_dir.path().join("agent-log");
     let profile = if console_unlock {
         format!(
-            "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:/# '\n    console_unlock_env: SW_I311_UNLOCK\n    console_unlock_idle_s: 0.01\n    timeout_s: 2.0\ndefaults:\n  log_dir: '{}'\ntargets:\n  - {{com: COM0, profile: t, device_by_id: {BY_ID_A}}}\n",
+            "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:/# '\n    login_regex: 'login:'\n    post_login_cmd: sh\n    console_unlock_env: SW_I311_UNLOCK\n    console_unlock_idle_s: 0.01\n    timeout_s: 2.0\ndefaults:\n  log_dir: '{}'\ntargets:\n  - {{com: COM0, profile: t, device_by_id: {BY_ID_A}}}\n",
             log_path.display()
         )
     } else {
@@ -149,6 +149,87 @@ fn build_login_rig(console_unlock: bool) -> LoginRig {
     if let Err(error) = secret_seen.recv_timeout(Duration::from_secs(10)) {
         panic!(
             "未觀察到自動 secret TX：{error}; tx={:?}; session={:?}",
+            String::from_utf8_lossy(&device.tx_since(0)),
+            service.session("COM0")
+        );
+    }
+    LoginRig {
+        service,
+        device,
+        echo_release,
+        _event: event,
+        _log_dir: log_dir,
+    }
+}
+
+fn build_prompt_prefix_overlap_rig(console_unlock: bool) -> LoginRig {
+    const OVERLAP_SECRET: &str = "# secret";
+    const OVERLAP_PROMPT: &str = "# ";
+
+    let event = event_rig();
+    let log_dir = tempfile::tempdir().expect("agent log 目錄位於 TMPDIR");
+    let profile = if console_unlock {
+        format!("profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^# '\n    console_unlock_env: SW_I311_OVERLAP_UNLOCK\n    console_unlock_idle_s: 0.01\n    timeout_s: 2.0\ntargets:\n  - {{com: COM0, profile: t, device_by_id: {BY_ID_A}}}\n")
+    } else {
+        format!("profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^# '\n    login_regex: 'login:'\n    password_regex: 'Password:'\n    user_env: SW_I311_OVERLAP_USER\n    pass_env: SW_I311_OVERLAP_PASS\n    timeout_s: 2.0\ntargets:\n  - {{com: COM0, profile: t, device_by_id: {BY_ID_A}}}\n")
+    };
+    let env = Arc::new(FakeEnv::default());
+    {
+        let mut vars = env.vars.lock().unwrap();
+        vars.insert("SW_I311_OVERLAP_USER".into(), "root".into());
+        vars.insert("SW_I311_OVERLAP_PASS".into(), OVERLAP_SECRET.into());
+        vars.insert("SW_I311_OVERLAP_UNLOCK".into(), OVERLAP_SECRET.into());
+    }
+
+    let serial = FakeSerialBackend::new();
+    let device = serial.add_device(REAL_A);
+    if console_unlock {
+        device.push_rx(b"locked console\r\n");
+    } else {
+        device.on_tx_match("^$", Box::new(|_| b"\r\nlogin: ".to_vec()));
+        device.on_tx_match("^root$", Box::new(|_| b"\r\nPassword: ".to_vec()));
+    }
+    let (secret_seen_tx, secret_seen) = crossbeam_channel::bounded(1);
+    let (echo_release, echo_release_rx) = crossbeam_channel::bounded(1);
+    device.on_tx_match(
+        OVERLAP_SECRET,
+        Box::new(move |_line| {
+            let _ = secret_seen_tx.send(());
+            echo_release_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("測試釋放 prompt 前綴回覆")
+        }),
+    );
+    device.on_tx_match(
+        r"__READY__[0-9a-f]+",
+        Box::new(|line: &[u8]| {
+            let text = String::from_utf8_lossy(line);
+            let token = text
+                .split("__READY__")
+                .nth(1)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            format!("__READY__{token}\r\n{OVERLAP_PROMPT}").into_bytes()
+        }),
+    );
+
+    let service = ServiceRig::build_with_env_serial_console_observers(
+        RigSpec {
+            yaml: profile,
+            devices: vec![(BY_ID_A.into(), REAL_A.into())],
+            explicit_target_count: 1,
+            allowlist: None,
+            wait_ready: Vec::new(),
+        },
+        env,
+        serial as Arc<dyn SerialBackend>,
+        vec![event.engine.clone()],
+    );
+    assert!(service.svc.attach_engine(event.engine.clone()));
+    if let Err(error) = secret_seen.recv_timeout(Duration::from_secs(10)) {
+        panic!(
+            "未觀察到 prompt 前綴 secret TX：{error}; tx={:?}; session={:?}",
             String::from_utf8_lossy(&device.tx_since(0)),
             service.session("COM0")
         );
@@ -451,7 +532,7 @@ fn issue311_console_unlock_echo_is_masked_in_last_error_detail() {
     set_event_rules(&rig.service);
 
     rig.echo_release
-        .send(format!("{SECRET}\r\n{PROMPT}").into_bytes())
+        .send(format!("{SECRET}\r\nlogin: \r\n{PROMPT}").into_bytes())
         .expect("釋放 console unlock echo");
     support::wait_until("console unlock attach 結算", || {
         rig.service
@@ -467,7 +548,7 @@ fn issue311_console_unlock_echo_is_masked_in_last_error_detail() {
     let session = rig.service.session("COM0").expect("session");
     assert_eq!(
         session.get("last_error").and_then(PyValue::as_str),
-        Some("READY_NONCE_TIMEOUT"),
+        Some("LOGIN_REQUIRED"),
         "state={:?}; last_error={:?}",
         session.get("state"),
         session.get("last_error")
@@ -480,7 +561,58 @@ fn issue311_console_unlock_echo_is_masked_in_last_error_detail() {
         !detail.contains(SECRET),
         "last_error_detail 外洩 secret：{detail:?}"
     );
+    assert!(
+        detail.contains(&"*".repeat(SECRET.len())),
+        "last_error_detail 沒有包含實際回顯的等長遮罩：{detail:?}"
+    );
     assert_echo_outputs_masked(&rig, &log_path, None);
+}
+
+#[test]
+fn issue311_login_prompt_prefix_overlapping_secret_does_not_timeout() {
+    let rig = build_prompt_prefix_overlap_rig(false);
+    rig.echo_release
+        .send(b"# ".to_vec())
+        .expect("回覆只含與 secret 前綴相同的 login prompt");
+    rig.service.wait_state("COM0", "READY");
+    assert_eq!(
+        rig.service
+            .session("COM0")
+            .and_then(|session| session.get("state").cloned()),
+        Some(PyValue::Str("READY".into()))
+    );
+}
+
+#[test]
+fn issue311_console_unlock_prompt_prefix_overlapping_secret_does_not_timeout() {
+    let rig = build_prompt_prefix_overlap_rig(true);
+    rig.echo_release
+        .send(b"# ".to_vec())
+        .expect("回覆只含與 secret 前綴相同的 console prompt");
+    support::wait_until("console unlock 離開 ATTACHING", || {
+        rig.service
+            .session("COM0")
+            .and_then(|session| {
+                session
+                    .get("state")
+                    .and_then(PyValue::as_str)
+                    .map(str::to_string)
+            })
+            .is_some_and(|state| state != "ATTACHING")
+    });
+    let session = rig.service.session("COM0").expect("console unlock session");
+    assert_eq!(
+        session.get("state").and_then(PyValue::as_str),
+        Some("READY"),
+        "console unlock session={session:?}; tx={:?}",
+        String::from_utf8_lossy(&rig.device.tx_since(0))
+    );
+    assert_eq!(
+        rig.service
+            .session("COM0")
+            .and_then(|session| session.get("state").cloned()),
+        Some(PyValue::Str("READY".into()))
+    );
 }
 
 #[test]
@@ -614,10 +746,20 @@ fn issue311_secret_split_across_one_byte_rx_chunks_is_masked() {
     rig.echo_release
         .send(Vec::new())
         .expect("先釋放 fake DUT 寫入");
+    let mut read_bytes = rig.device.rx_bytes_read();
     for byte in SECRET.as_bytes() {
-        // 逐次推入並留出 reader 一次讀取的排程空檔；guard 可暫存前綴，不以 WAL seq 當同步點。
+        // 只有在 fake reader 確認消耗前一 byte 後才送下一 byte，確定每次 SerialReader::read 都只收到一 byte。
         rig.device.push_rx(&[*byte]);
-        std::thread::sleep(Duration::from_millis(25));
+        let expected = read_bytes + 1;
+        support::wait_until("reader 確認消耗一個 secret byte", || {
+            rig.device.rx_bytes_read() >= expected
+        });
+        assert_eq!(
+            rig.device.rx_bytes_read(),
+            expected,
+            "下一個 secret byte 送出前，reader 必須恰好消耗一 byte"
+        );
+        read_bytes = expected;
     }
     rig.device.push_rx(format!("\r\n{PROMPT}").as_bytes());
     rig.service.wait_state("COM0", "READY");

@@ -97,6 +97,50 @@ fn stop_and_join(
     worker.join().expect("reader thread 應正常結束")
 }
 
+#[test]
+fn reader_stop_with_secret_echo_prefix_records_an_evidence_gap() {
+    let port = fake_port();
+    let clock = FakeClock::at(1, 0);
+    let (wal, _wfs) = fake_wal(Arc::clone(&clock) as Arc<dyn Clock>);
+    let rx = RxShared::new(64, 0);
+    let guard = rx.arm_secret_echo(b"abcdef");
+    let (data_tx, _data_rx) = bounded(16);
+    let (control_tx, _control_rx) = bounded(16);
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker = spawn_reader(
+        port.reader,
+        reader_ctx(
+            wal.clone(),
+            Arc::clone(&rx),
+            None,
+            data_tx,
+            control_tx,
+            clock,
+        ),
+        Arc::clone(&stop),
+    );
+
+    port.dev.push_rx(b"abc");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while rx.total_bytes() != 3 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(rx.total_bytes(), 3, "reader 已讀取 secret 的未決前綴");
+
+    let exit = stop_and_join(&stop, &port.waker, worker);
+    drop(guard);
+    assert!(
+        exit.unrecorded.iter().any(|gap| {
+            gap.dir == "RX"
+                && gap.len == 0
+                && format!("{:?}", gap.error).contains("secret echo prefix unresolved")
+        }),
+        "reader 停止必須回報未決 RX 證據缺口：{:?}",
+        exit.unrecorded
+    );
+    assert_eq!(wal.current_seq(), 0, "未決前綴不得以原文寫入 WAL");
+}
+
 #[derive(Default)]
 struct ConsoleState {
     input: VecDeque<u8>,

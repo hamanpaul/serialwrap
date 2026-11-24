@@ -308,6 +308,7 @@ pub(crate) struct FakeDeviceInner {
     closes: AtomicUsize,
     writes: AtomicUsize,
     os_submits: AtomicUsize,
+    rx_bytes_read: AtomicUsize,
     blocked_release: AtomicBool,
     /// P6 Task 6：`BlockForever` 正在 gate 外阻塞（`wait_blocked` 讀取）。
     blocked_now: AtomicBool,
@@ -352,6 +353,7 @@ impl FakeDeviceInner {
             closes: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
             os_submits: AtomicUsize::new(0),
+            rx_bytes_read: AtomicUsize::new(0),
             blocked_release: AtomicBool::new(false),
             blocked_now: AtomicBool::new(false),
             loopback: Mutex::new(None),
@@ -624,6 +626,11 @@ impl FakeDevice {
     /// Fake reader 已觀察到的 EOF 次數（供同步測試使用）。
     pub fn eof_reads(&self) -> usize {
         self.inner.eof_reads.load(Ordering::SeqCst)
+    }
+
+    /// Fake reader 已從 RX queue 消耗的 byte 數，供測試逐次確認讀取邊界。
+    pub fn rx_bytes_read(&self) -> usize {
+        self.inner.rx_bytes_read.load(Ordering::SeqCst)
     }
 
     /// Fake reader 已觀察到的讀取錯誤次數（供同步測試使用）。
@@ -1002,6 +1009,7 @@ impl SerialReader for FakeSerialReader {
                     for b in &mut buf[..n] {
                         *b = rx.pop_front().unwrap();
                     }
+                    self.inner.rx_bytes_read.fetch_add(n, Ordering::SeqCst);
                     return Ok(ReadOutcome::Data(n));
                 }
             }
