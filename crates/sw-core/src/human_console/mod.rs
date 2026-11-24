@@ -163,55 +163,6 @@ impl HumanConsoleState {
         })
     }
 
-    /// 最外層 resume 實際會恢復或提升的 TCP owner；用於 guard 延後 handback 的 admission 重驗。
-    pub(crate) fn resume_tcp_owner_candidate(&self) -> Option<(String, u64)> {
-        if self.ownership.suspend_depth != 1 {
-            return None;
-        }
-        let owner = self
-            .ownership
-            .suspended_owner
-            .as_deref()
-            .or(self.ownership.pending_owner.as_deref())?;
-        let client_id = owner.strip_prefix("human:").filter(|id| !id.is_empty())?;
-        let console = self.consoles.get(client_id)?;
-        (console.kind == ConsoleTransportKind::TcpTelnet)
-            .then(|| (owner.to_string(), console.client_lifetime))
-    }
-
-    /// 延後 handback 在同步點可還原的 owner，依 ownership 的優先順序取值。
-    pub(crate) fn deferred_tcp_handback_owner(&self) -> Option<(String, u64)> {
-        let owner = self
-            .ownership
-            .suspended_owner
-            .as_deref()
-            .or_else(|| {
-                if self.ownership.interactive_owner.is_none() {
-                    self.ownership.pending_owner.as_deref()
-                } else {
-                    self.ownership.interactive_owner.as_deref()
-                }
-            })?;
-        self.live_tcp_owner_for(owner)
-    }
-
-    /// owner 與 lifetime 相符且仍是有 peer 的 TCP Telnet client。
-    pub(crate) fn live_tcp_owner_for(&self, owner: &str) -> Option<(String, u64)> {
-        let client_id = owner.strip_prefix("human:").filter(|id| !id.is_empty())?;
-        let console = self.consoles.get(client_id)?;
-        (console.kind == ConsoleTransportKind::TcpTelnet
-            && self.is_live(client_id, console.client_lifetime)
-            && self.peer_present.get(client_id).copied().unwrap_or(true))
-            .then(|| (owner.to_string(), console.client_lifetime))
-    }
-
-    pub(crate) fn is_live_tcp_owner(&self, owner: &str, lifetime: u64) -> bool {
-        self.live_tcp_owner_for(owner)
-            .is_some_and(|(live_owner, live_lifetime)| {
-                live_owner == owner && live_lifetime == lifetime
-            })
-    }
-
     /// 配下一個 `client_lifetime`（同 id 重新連入亦不同）。
     pub fn alloc_lifetime(&mut self) -> u64 {
         self.next_lifetime = self.next_lifetime.saturating_add(1);

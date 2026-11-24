@@ -155,84 +155,27 @@ impl SessionCore {
 
     /// admission 切換只寫 `fence.human_admission_blocked`，不動 `owner_gen`（D-02）；回 true＝此刻回放。
     fn set_human_admission(&mut self, allowed: bool) -> bool {
-        let delayed_tcp_owner = self.tcp_handback_deferred
-            && self.human.deferred_tcp_handback_owner().is_some();
         let before = self.human.ownership.interactive_owner.clone();
         let crate::human_console::HumanConsoleState {
             consoles, ownership, ..
         } = &mut self.human;
-        let replay = if delayed_tcp_owner {
-            ownership.admission_blocked = !allowed;
-            false
-        } else {
-            ownership.set_admission(allowed, &|c| consoles.contains_key(c))
-        };
+        let replay = ownership.set_admission(allowed, &|c| consoles.contains_key(c));
         self.deps
             .fence
             .with(|f| f.human_admission_blocked = !allowed);
         // pending human promote 屬 human 之間的 owner 變更（不撤銷），仍依 §5.3 遞增 owner_gen。
         self.after_owner_change(before);
-        if delayed_tcp_owner && allowed {
-            // pending TCP owner 也須由 mirror sync 持 ticket 後提升；此處只打開 admission，不直接 promote 或回放。
-            self.sync_tcp_console_lease(self.now_cache);
-        }
         replay
     }
 
-    /// resume；TCP handback 延後時，最外層提升須先持 admission ticket 並重驗 lifetime。
+    /// resume；最外層時回放。
     fn resume_human(&mut self, fx: &mut Vec<Effect>) {
-        if self.tcp_handback_deferred {
-            if let Some((owner, lifetime)) = self.human.resume_tcp_owner_candidate() {
-                if let Some(_admission) = self.prepare_deferred_tcp_handback(
-                    &owner,
-                    lifetime,
-                    self.now_cache,
-                ) {
-                    let before = self.human.ownership.interactive_owner.clone();
-                    let crate::human_console::HumanConsoleState {
-                        consoles, ownership, ..
-                    } = &mut self.human;
-                    let outer = ownership.resume(&|c| consoles.contains_key(c));
-                    self.after_owner_change(before);
-                    let restored = self.human.ownership.interactive_owner.as_deref()
-                        == Some(owner.as_str())
-                        && self.lease.as_ref().is_some_and(|lease| {
-                            lease.owner == owner
-                                && lease.mirror_client_lifetime == Some(lifetime)
-                        });
-                    if outer && restored {
-                        self.tcp_handback_deferred = false;
-                        self.replay_point(fx);
-                    }
-                    return;
-                }
-
-                // 只結算這一層 suspend；保留 suspended／pending owner 和 session 延後狀態，待 guarded sync 收斂。
-                let before = self.human.ownership.interactive_owner.clone();
-                self.human.ownership.settle_suspend_without_owner();
-                self.after_owner_change(before);
-                if self.human.ownership.suspend_depth == 0
-                    && self.human.deferred_tcp_handback_owner().is_none()
-                {
-                    self.tcp_handback_deferred = false;
-                }
-                return;
-            }
-        }
-
         let before = self.human.ownership.interactive_owner.clone();
         let crate::human_console::HumanConsoleState {
             consoles, ownership, ..
         } = &mut self.human;
         let outer = ownership.resume(&|c| consoles.contains_key(c));
-        let suspend_depth = ownership.suspend_depth;
         self.after_owner_change(before);
-        if self.tcp_handback_deferred
-            && suspend_depth == 0
-            && self.human.deferred_tcp_handback_owner().is_none()
-        {
-            self.tcp_handback_deferred = false;
-        }
         if outer {
             self.replay_point(fx);
         }
@@ -778,23 +721,6 @@ impl SessionCore {
             // 必關閉此 client；不登記、不授 owner，並要求 hub 關閉（hub 處理 close-all 時多半已關，重送為 no-op）。
             return vec![Effect::ConsoleClose { client_id }];
         }
-        if kind == ConsoleTransportKind::TcpTelnet {
-            let owner = format!("human:{client_id}");
-            let previous_lifetime = self
-                .human
-                .consoles
-                .get(&client_id)
-                .filter(|console| console.kind == ConsoleTransportKind::TcpTelnet)
-                .map(|console| console.client_lifetime);
-            if let Some(previous_lifetime) = previous_lifetime {
-                if let Some(pending) = self.pending_tcp_suspend_settlement.as_mut().filter(|pending| {
-                    pending.owner == owner && pending.client_lifetime == previous_lifetime
-                }) {
-                    // 同一個 human owner 換了 TCP client lifetime，延後結算改綁新連線；mirror 仍須通過共用 guard。
-                    pending.client_lifetime = lifetime;
-                }
-            }
-        }
         self.human.next_lifetime = self.human.next_lifetime.max(lifetime);
         self.human.consoles.insert(
             client_id.clone(),
@@ -814,11 +740,7 @@ impl SessionCore {
         }
         self.human.peer_present.insert(client_id.clone(), true);
         let before = self.human.ownership.interactive_owner.clone();
-        if self.tcp_handback_deferred && kind == ConsoleTransportKind::TcpTelnet {
-            self.human.ownership.on_stream_accept_deferred(&client_id);
-        } else {
-            self.human.ownership.on_stream_accept(&client_id);
-        }
+        self.human.ownership.on_stream_accept(&client_id);
         self.after_owner_change(before);
         self.sync_tcp_console_lease(now);
         Vec::new()
@@ -1063,8 +985,6 @@ impl SessionCore {
         self.fg_source = None;
         // ownership 於下方 reset_for_stop 歸零；在途 probe 的 suspend 旗標隨世代失效，完成時不再 resume。
         self.self_test_suspend_gen = self.self_test_suspend_gen.wrapping_add(1);
-        self.pending_tcp_suspend_settlement = None;
-        self.tcp_handback_deferred = false;
         let reason = if *kind == StopKind::Release {
             InvalidateReason::Release
         } else {

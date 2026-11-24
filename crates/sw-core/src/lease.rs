@@ -13,17 +13,6 @@ use crate::Mono;
 /// `INTERACTIVE_TOMBSTONE_MAX`（constants.py）。
 pub const INTERACTIVE_TOMBSTONE_MAX: usize = 16;
 
-/// 已關閉的 agent lease 所持 TCP soft-preempt suspend，等待同一個 replacement owner 完成 handback。
-/// 這筆 actor 內部紀錄避免從任意非零 suspend depth 推定可以 resume。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TcpSuspendSettlement {
-    pub source_lease_id: String,
-    pub owner: String,
-    pub client_lifetime: u64,
-    /// 只有 agent lease 的 timer 到期 close 才設 true；明確 close 不得沿用 tick 收尾語意。
-    pub tick: bool,
-}
-
 /// agent 互動租約（`session.interactive_open` 建立；1 s tick 主動到期）。
 #[derive(Clone, Debug)]
 pub struct InteractiveLease {

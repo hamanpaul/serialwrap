@@ -186,10 +186,21 @@ fn tcp_mirror_retained_recover_preserves_lifetime_on_eof() {
         after_rx_seq: None,
     });
 
+    assert!(h.core.active_lease().is_none(), "retained TCP 快照不直接重授 mirror");
+    assert!(h.core.human_console().ownership.interactive_owner.is_none());
+    let insert_start = h.lease_index_ops().len();
+    h.scan(None);
     let restored = h.core.active_lease().expect("retained TCP human lease");
     assert_eq!(restored.owner, "human:a");
-    assert_eq!(restored.mirror_client_lifetime, Some(lifetime), "recover 還原必須保留 TCP lifetime");
-    assert!(h.lease_index_ops().iter().any(|op| matches!(op, LeaseIndexOp::InsertTcpMirror { interactive_id } if interactive_id == &restored.interactive_id)));
+    assert_eq!(restored.mirror_client_lifetime, Some(lifetime), "同步應依存活 TCP lifetime 重建 mirror");
+    assert_eq!(
+        h.lease_index_ops()[insert_start..]
+            .iter()
+            .filter(|op| matches!(op, LeaseIndexOp::InsertTcpMirror { interactive_id } if interactive_id == &restored.interactive_id))
+            .count(),
+        1,
+        "recover 後既有同步路徑只重建一次 mirror",
+    );
 
     h.disconnect("a");
     assert!(h.core.active_lease().is_none(), "TCP EOF 必須立即撤除 retained mirror");
@@ -207,7 +218,8 @@ fn tcp_mirror_retained_recover_preserves_lifetime_on_eof() {
 
 #[test]
 fn tcp_mirror_retained_recover_respects_guards() {
-    // 交接凍結期間就緒完成事件留在 actor 暫存區；解凍後保留的 TCP 所有者正常還原。
+    // 交接凍結期間就緒完成事件留在 actor 暫存區；解凍後 readiness 消費 retained 快照，
+    // 由下一次 console scan 依現有連線重建 TCP mirror。
     let mut handoff = tcp_ready(&["handoff"]);
     handoff.begin_stop(sw_core::drain::StopKind::Recover);
     let (epoch, stop_id) = handoff.pending_stop();
@@ -230,11 +242,24 @@ fn tcp_mirror_retained_recover_respects_guards() {
     assert_eq!(handoff.core.retained_human_owner(), Some("human:handoff"), "handoff 暫存期間保留 retained 資訊");
     assert!(handoff.reg.admission_gate().thaw(&token));
     handoff.rpc(SessionRequest::GetState).expect("解凍後重播 readiness");
-    let restored = handoff.core.active_lease().expect("解凍後還原 TCP mirror");
+    assert!(handoff.core.active_lease().is_none(), "retained TCP 快照不直接重授 mirror");
+    assert!(handoff.core.human_console().ownership.interactive_owner.is_none());
+    let handoff_insert_start = handoff.lease_index_ops().len();
+    handoff.scan(None);
+    let restored = handoff.core.active_lease().expect("同步依目前 TCP 連線建立 mirror");
     assert_eq!(restored.owner, "human:handoff");
     assert_eq!(restored.mirror_client_lifetime, Some(lifetime));
+    assert_eq!(
+        handoff.lease_index_ops()[handoff_insert_start..]
+            .iter()
+            .filter(|op| matches!(op, LeaseIndexOp::InsertTcpMirror { interactive_id } if interactive_id == &restored.interactive_id))
+            .count(),
+        1,
+        "handoff guard 開放後同步只建立一次 mirror",
+    );
 
-    // 燒錄關鍵狀態期間就緒收尾照常完成；鏡像還原必須等完整 guard 開放後重試。
+    // 燒錄關鍵狀態期間 readiness 收尾照常完成並丟棄 retained mirror 資訊；
+    // guard 開放後由既有 self-heal／sync 依 TCP 連線現況重建。
     let mut flash = tcp_ready(&["flash"]);
     let lifetime = flash.lifetime("flash");
     flash.begin_stop(sw_core::drain::StopKind::Recover);
@@ -251,13 +276,22 @@ fn tcp_mirror_retained_recover_respects_guards() {
     });
     assert!(flash.core.active_lease().is_none(), "flash-critical 期間不得建立 retained TCP mirror");
     assert!(flash.core.human_console().ownership.interactive_owner.is_none(), "flash-critical 期間不得重授 retained TCP owner");
-    assert_eq!(flash.core.retained_human_owner(), Some("human:flash"), "flash guard 暫時關閉時保留 retained 資訊");
+    assert_eq!(flash.core.retained_human_owner(), None, "flash guard 關閉時丟棄 retained TCP mirror 資訊");
 
     flash.fence.with(|fence| fence.flash_critical = false);
-    flash.rpc(SessionRequest::GetState).expect("guard 開放後重試 retained restore");
-    let restored = flash.core.active_lease().expect("flash guard 解除後還原 TCP mirror");
+    let flash_insert_start = flash.lease_index_ops().len();
+    flash.scan(None);
+    let restored = flash.core.active_lease().expect("flash guard 開放後由 sync 重建 TCP mirror");
     assert_eq!(restored.owner, "human:flash");
     assert_eq!(restored.mirror_client_lifetime, Some(lifetime));
+    assert_eq!(
+        flash.lease_index_ops()[flash_insert_start..]
+            .iter()
+            .filter(|op| matches!(op, LeaseIndexOp::InsertTcpMirror { interactive_id } if interactive_id == &restored.interactive_id))
+            .count(),
+        1,
+        "flash guard 開放後同步只建立一次 mirror",
+    );
 }
 
 #[test]
@@ -279,6 +313,47 @@ fn tcp_mirror_self_heal_respects_flash_critical_window() {
     assert_eq!(lease.owner, "human:c1");
     assert_eq!(lease.mirror_client_lifetime, Some(h.lifetime("c1")));
     assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:c1"));
+
+    // guard 關閉時撤除既有 mirror 簿記，但保留同一 TCP client 的 raw ownership 與路由。
+    let mut active = tcp_ready(&["active"]);
+    let active_mirror_id = active.core.active_lease().unwrap().interactive_id.clone();
+    let owner_gen = active.core.generations().owner_gen;
+    let insert_start = active.lease_index_ops().len();
+    active.fence.with(|fence| fence.flash_critical = true);
+    active.scan(None);
+    assert!(active.core.active_lease().is_none(), "guard 關閉時撤除 active mirror");
+    assert_eq!(active.core.human_console().ownership.interactive_owner.as_deref(), Some("human:active"));
+    assert_eq!(active.core.generations().owner_gen, owner_gen, "撤除 mirror 不得改變 owner generation");
+    let raw = active.input("active", b"raw-during-guard");
+    assert!(raw.iter().any(|effect| matches!(effect, Effect::HumanTx { permit, payload, .. } if permit.class == TxClass::HumanRaw && payload == b"raw-during-guard")));
+    assert_eq!(active.core.human_console().ownership.interactive_owner.as_deref(), Some("human:active"));
+
+    active.fence.with(|fence| fence.flash_critical = false);
+    let inserts_before_reopen = active.lease_index_ops().len();
+    active.scan(None);
+    let rebuilt = active.core.active_lease().expect("guard 開放後由既有 sync 重建 mirror").clone();
+    assert_eq!(rebuilt.owner, "human:active");
+    assert_eq!(active.core.human_console().ownership.interactive_owner.as_deref(), Some("human:active"));
+    assert_eq!(active.core.generations().owner_gen, owner_gen, "重建 mirror 不改變 owner generation");
+    assert_eq!(
+        active.lease_index_ops()[inserts_before_reopen..]
+            .iter()
+            .filter(|op| matches!(op, LeaseIndexOp::InsertTcpMirror { interactive_id } if interactive_id == &rebuilt.interactive_id))
+            .count(),
+        1,
+    );
+    active.scan(None);
+    assert_eq!(
+        active.lease_index_ops()[inserts_before_reopen..]
+            .iter()
+            .filter(|op| matches!(op, LeaseIndexOp::InsertTcpMirror { interactive_id } if interactive_id == &rebuilt.interactive_id))
+            .count(),
+        1,
+        "後續 refresh 不重複建立 mirror",
+    );
+    assert!(active.lease_index_ops()[insert_start..]
+        .iter()
+        .any(|op| matches!(op, LeaseIndexOp::Remove { interactive_id } if interactive_id == &active_mirror_id)));
 }
 
 #[test]
@@ -387,12 +462,16 @@ fn tcp_mirror_preempt_reconnect_preserves_new_owner() {
     assert_eq!(h.deferred_len("a"), 0, "EOF 立即清除 A 的 deferred bytes");
 
     h.connect_stream_console("b", ConsoleTransportKind::TcpTelnet);
-    h.input("b", b"new");
+    let deferred = h.input("b", b"new");
+    assert!(deferred.iter().all(|effect| !matches!(effect, Effect::HumanTx { .. })));
+    assert_eq!(h.deferred_len("b"), b"new".len(), "B 在既有 suspend 期間輸入進 deferred");
     let agent_id = opened.get("interactive_id").and_then(PyValue::as_str).unwrap().to_string();
     h.rpc(close_req(&agent_id)).expect("agent interactive-close");
+    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:b"));
     let replay: Vec<_> = h.human_tx().into_iter().filter(|(class, _, _)| *class == TxClass::HumanReplay).collect();
     assert_eq!(replay, vec![(TxClass::HumanReplay, "human:b".into(), b"new".to_vec())]);
     assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:b"));
+    assert_eq!(h.core.active_lease().map(|lease| lease.mirror_client_lifetime), Some(Some(h.lifetime("b"))));
 
     // expiry 與 explicit close 共用 lifetime 保護；A 的 stash 已 EOF，B 的 deferred 只回放一次。
     let mut expired = tcp_ready(&["a"]);
@@ -403,6 +482,7 @@ fn tcp_mirror_preempt_reconnect_preserves_new_owner() {
     expired.connect_stream_console("b", ConsoleTransportKind::TcpTelnet);
     let b_life = expired.lifetime("b");
     expired.input("b", b"new");
+    assert_eq!(expired.deferred_len("b"), b"new".len());
     expired.advance(Duration::from_secs(2));
     assert_eq!(expired.core.human_console().ownership.interactive_owner.as_deref(), Some("human:b"));
     assert_eq!(expired.core.active_lease().and_then(|lease| lease.mirror_client_lifetime), Some(b_life));
@@ -423,20 +503,23 @@ fn tcp_mirror_preempt_reconnect_preserves_new_owner() {
     assert!(pty.core.active_lease().is_none(), "PTY stash 沿用原有無條件清 owner 語意");
     assert!(pty.core.human_console().ownership.interactive_owner.is_none(), "TCP owner 不得改變 PTY stash close 語意");
 
-    // TCP stash 恢復也是 raw 所有權重新授予入口；守衛關閉時保留 stash 並延後恢復。
+    // TCP stash 只作鏡像簿記；guard 關閉時立即撤除，再沿原本 resume 路徑恢復 raw owner。
     let mut guarded = tcp_ready(&["guarded"]);
     let opened = guarded.rpc(open_req("agent:guarded", 60.0, "", false)).expect("guarded soft preempt");
     let agent_id = opened.get("interactive_id").and_then(PyValue::as_str).unwrap().to_string();
     guarded.fence.with(|fence| fence.flash_critical = true);
     guarded.rpc(close_req(&agent_id)).expect("guarded agent close");
+    let owner_gen = guarded.core.generations().owner_gen;
     assert!(guarded.core.active_lease().is_none(), "flash-critical 期間不重授 TCP stash lease");
-    assert!(guarded.core.human_console().ownership.interactive_owner.is_none(), "flash-critical 期間不重授 TCP raw owner");
-    assert_eq!(guarded.core.stashed_human_lease().map(|lease| lease.owner.as_str()), Some("human:guarded"), "guard 關閉時保留 stash");
+    assert_eq!(guarded.core.human_console().ownership.interactive_owner.as_deref(), Some("human:guarded"), "flash-critical 不改變既有 resume 的 raw owner");
+    assert!(guarded.core.stashed_human_lease().is_none(), "guard 關閉時撤除 TCP stash mirror 簿記");
+    assert_eq!(guarded.core.generations().owner_gen, owner_gen, "close 後 owner 已由 resume 路徑恢復，不由 mirror 簿記變更");
 
     guarded.fence.with(|fence| fence.flash_critical = false);
     guarded.scan(None);
     assert_eq!(guarded.core.active_lease().map(|lease| lease.owner.as_str()), Some("human:guarded"));
     assert_eq!(guarded.core.human_console().ownership.interactive_owner.as_deref(), Some("human:guarded"));
+    assert_eq!(guarded.core.generations().owner_gen, owner_gen, "guard 開放重建 mirror 不改變 owner generation");
 
     // A 斷線後 B 在燒錄守衛期間接手；agent 租約關閉不可透過無 stash 的恢復繞過守衛。
     let mut replacement = tcp_ready(&["a"]);
@@ -445,12 +528,14 @@ fn tcp_mirror_preempt_reconnect_preserves_new_owner() {
     replacement.fence.with(|fence| fence.flash_critical = true);
     replacement.disconnect("a");
     replacement.connect_stream_console("b", ConsoleTransportKind::TcpTelnet);
-    assert_eq!(replacement.core.human_console().ownership.suspended_owner.as_deref(), Some("human:b"));
+    assert_eq!(replacement.core.human_console().ownership.interactive_owner.as_deref(), Some("agent:replacement"), "agent 尚持有 raw ownership 時 B 不立即接班");
     replacement.rpc(close_req(&agent_id)).expect("replacement agent close");
     assert!(replacement.core.active_lease().is_none(), "flash-critical 期間不建立替換 TCP mirror");
-    assert!(replacement.core.human_console().ownership.interactive_owner.is_none(), "flash-critical 期間不重授替換 TCP raw owner");
-    assert_eq!(replacement.core.human_console().ownership.suspended_owner.as_deref(), Some("human:b"), "guard 關閉時保留替換 owner 待恢復");
+    assert_eq!(replacement.core.human_console().ownership.interactive_owner.as_deref(), Some("human:b"), "guard 關閉不延後既有 resume 對 B 的 raw owner 提升");
+    assert_eq!(replacement.core.human_console().ownership.suspended_owner, None);
 
+    replacement.connect_stream_console("c", ConsoleTransportKind::TcpTelnet);
+    assert_eq!(replacement.core.human_console().ownership.interactive_owner.as_deref(), Some("human:b"), "後續 stream accept 不改變既有 B raw owner");
     replacement.fence.with(|fence| fence.flash_critical = false);
     replacement.scan(None);
     assert_eq!(replacement.core.active_lease().map(|lease| lease.owner.as_str()), Some("human:b"));
@@ -514,17 +599,18 @@ fn tcp_mirror_delayed_soft_preempt_close_preserves_nested_self_test_suspend() {
     h.fence.with(|fence| fence.flash_critical = true);
     h.rpc(close_req(&agent_id)).expect("guard 關閉期間 close agent lease");
     assert!(h.core.active_lease().is_none());
-    assert_eq!(h.core.human_console().ownership.suspend_depth, 2, "guard 關閉時保留 agent lease 自己的 suspend");
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1, "agent close 立即依既有路徑結算自己的 suspend");
     assert!(h.input("a", b"nested").iter().all(|effect| !matches!(effect, Effect::HumanTx { .. })));
     assert_eq!(h.deferred_len("a"), b"nested".len());
 
-    let owner_gen_before_restore = h.core.generations().owner_gen;
+    let owner_gen_before_sync = h.core.generations().owner_gen;
     h.fence.with(|fence| fence.flash_critical = false);
     h.scan(None);
-    assert_eq!(h.core.active_lease().map(|lease| lease.owner.as_str()), Some("human:a"));
-    assert_eq!(h.core.human_console().ownership.suspend_depth, 1, "同步只結算 agent lease 的一層 suspend");
-    assert_eq!(h.core.human_console().ownership.interactive_owner, None, "self-test 尚在途時不得重授 raw owner");
-    assert_eq!(h.core.generations().owner_gen, owner_gen_before_restore, "guard 後建鏡不因簿記改變 owner generation");
+    let mirror = h.core.active_lease().expect("既有 sync 依仍存活的 A 建立 mirror");
+    assert_eq!(mirror.owner, "human:a");
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1, "同步不得結算 self-test suspend");
+    assert_eq!(h.core.human_console().ownership.interactive_owner, None, "self-test 尚在途時 raw owner 仍 suspended");
+    assert_eq!(h.core.generations().owner_gen, owner_gen_before_sync, "guard 後建鏡不因簿記改變 owner generation");
     assert!(h.input("a", b"still-deferred").iter().all(|effect| !matches!(effect, Effect::HumanTx { .. })));
     assert_eq!(h.deferred_len("a"), b"nestedstill-deferred".len());
 
@@ -547,7 +633,7 @@ fn tcp_mirror_delayed_soft_preempt_close_preserves_nested_self_test_suspend() {
     h.complete_human_tx(TxOutcome::Completed(b"nestedstill-deferred".len()), None);
 }
 
-fn guarded_nested_handback_after_eof(expire_agent_lease: bool) -> (CoreHarness, u64) {
+fn guarded_nested_handback_after_eof(expire_agent_lease: bool) -> (CoreHarness, u64, u64) {
     let mut h = tcp_ready(&["a"]);
     h.set_auto_complete_human_tx(false);
     let probe_op = start_non_strict_self_test_with_timeout(&mut h, 10.0);
@@ -571,55 +657,79 @@ fn guarded_nested_handback_after_eof(expire_agent_lease: bool) -> (CoreHarness, 
             .expect("guard 關閉期間明確 close agent lease");
         assert!(h.core.active_lease().is_none());
     }
-    assert_eq!(h.core.human_console().ownership.suspend_depth, 2);
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1, "close／expiry 立即結算 agent lease 的 suspend");
 
     h.disconnect("a");
-    assert_eq!(h.core.human_console().ownership.suspend_depth, 1, "EOF 僅結算 agent lease 的 suspend 層");
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1, "EOF 依既有 on_drop 保留 self-test suspend");
     h.connect_stream_console("b", ConsoleTransportKind::TcpTelnet);
     let b_lifetime = h.lifetime("b");
+    assert_eq!(h.core.human_console().ownership.interactive_owner, None);
     assert_eq!(h.core.human_console().ownership.suspended_owner.as_deref(), Some("human:b"));
-    assert!(h.core.active_lease().is_none(), "guard 關閉期間不得建立 B 的 mirror");
-    assert!(h.input("b", b"r5-deferred").iter().all(|effect| !matches!(effect, Effect::HumanTx { .. })));
-    assert_eq!(h.deferred_len("b"), b"r5-deferred".len());
+    assert!(h.core.active_lease().is_none(), "guard 關閉期間不得保留或建立 B 的 mirror");
+    let deferred = h.input("b", b"r5-deferred");
+    assert!(deferred.iter().all(|effect| !matches!(effect, Effect::HumanTx { .. })));
+    assert_eq!(h.deferred_len("b"), b"r5-deferred".len(), "self-test suspend 中 B 輸入依基線進 deferred");
 
     let owner_gen_before_resume = h.core.generations().owner_gen;
     let effects = finish_self_test(&mut h, probe_op);
-    assert!(
-        effects.iter().all(|effect| !matches!(effect, Effect::HumanTx { permit, .. } if permit.class == TxClass::HumanReplay)),
-        "guard 關閉期間 self-test 結束不得產生 HumanReplay effect",
+    let replay: Vec<_> = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::HumanTx { permit, payload, .. } if permit.class == TxClass::HumanReplay => {
+                Some((permit.source.clone(), payload.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replay, vec![("human:b".into(), b"r5-deferred".to_vec())], "guard 關閉時 self-test resume 沿基線回放一次");
+    assert_eq!(
+        h.human_tx()
+            .iter()
+            .filter(|(class, source, payload)| *class == TxClass::HumanReplay && source == "human:b" && payload == b"r5-deferred")
+            .count(),
+        1,
+        "B 的 deferred bytes 恰回放一次",
     );
-    assert!(h.human_tx().is_empty(), "guard 開放前不得有任何 human TX");
-    assert!(h.human_tx().iter().all(|(class, _, _)| *class != TxClass::HumanReplay));
-    assert_eq!(h.core.human_console().ownership.interactive_owner, None, "guard 關閉期間 B 不得成為 active raw owner");
-    assert_eq!(h.core.human_console().ownership.suspended_owner.as_deref(), Some("human:b"), "延後 handback 須保留 B owner");
-    assert_eq!(h.core.human_console().ownership.suspend_depth, 0, "self-test 只結算自己的 suspend 層");
-    assert_eq!(h.core.generations().owner_gen, owner_gen_before_resume, "guard 關閉期間不得改變 owner_gen");
-    (h, b_lifetime)
+    assert_eq!(h.deferred_len("b"), 0);
+    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:b"), "self-test resume 依基線提升 B raw owner");
+    assert_eq!(h.core.human_console().ownership.suspended_owner, None);
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 0);
+    assert_eq!(h.core.generations().owner_gen, owner_gen_before_resume + 1, "owner 只在既有 resume 提升時變更");
+    h.complete_human_tx(TxOutcome::Completed(b"r5-deferred".len()), None);
+
+    let raw = h.input("b", b"r5-raw\r");
+    assert!(raw.iter().any(|effect| matches!(effect, Effect::HumanTx { permit, payload, .. } if permit.class == TxClass::HumanRaw && payload == b"r5-raw\r")), "guard 尚關閉時 B 後續輸入沿基線 raw 路徑送出");
+    assert!(!raw.iter().any(|effect| matches!(effect, Effect::StartOp { .. })), "含換行 bytes 不進 line command");
+    assert_eq!(h.deferred_len("b"), 0);
+    (h, b_lifetime, owner_gen_before_resume + 1)
 }
 
-fn assert_guarded_nested_handback_completes_once(mut h: CoreHarness, b_lifetime: u64) {
-    let owner_gen_before_handback = h.core.generations().owner_gen;
+fn assert_guarded_nested_handback_completes_once(
+    mut h: CoreHarness,
+    b_lifetime: u64,
+    owner_gen_before_b: u64,
+) {
     let lease_index_start = h.lease_index_ops().len();
     h.fence.with(|fence| fence.flash_critical = false);
     let effects = h.scan(None);
 
-    let mirror = h.core.active_lease().expect("guard 開放後 B 應建立 TCP mirror");
+    let mirror = h.core.active_lease().expect("guard 開放後既有 sync 依 B 的 live ownership 建立 mirror");
     let mirror_id = mirror.interactive_id.clone();
     assert_eq!(mirror.owner, "human:b");
     assert_eq!(mirror.mirror_client_lifetime, Some(b_lifetime));
     assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:b"));
     assert_eq!(h.core.human_console().ownership.suspended_owner, None);
     assert_eq!(h.core.human_console().ownership.suspend_depth, 0);
-    assert_eq!(h.core.generations().owner_gen, owner_gen_before_handback + 1, "owner 恢復只增加一次 generation");
+    assert_eq!(h.core.generations().owner_gen, owner_gen_before_b, "重建 mirror 不得額外提升 owner generation");
     assert_eq!(
         h.lease_index_ops()[lease_index_start..]
             .iter()
             .filter(|op| matches!(op, LeaseIndexOp::InsertTcpMirror { interactive_id } if interactive_id == &mirror_id))
             .count(),
         1,
-        "guarded handback 只登記一次 mirror index",
+        "guard 開放後只重建一次 mirror index",
     );
-    assert_eq!(h.reg.admission_gate().live_tickets(), 0, "短暫 handback admission ticket 必須結算");
+    assert_eq!(h.reg.admission_gate().live_tickets(), 0, "同步 admission ticket 必須結算");
 
     let replay_effects: Vec<_> = effects
         .iter()
@@ -630,42 +740,40 @@ fn assert_guarded_nested_handback_completes_once(mut h: CoreHarness, b_lifetime:
             _ => None,
         })
         .collect();
-    assert_eq!(replay_effects, vec![("human:b".into(), b"r5-deferred".to_vec())]);
+    assert!(replay_effects.is_empty(), "guard 開放的同步不得重播 guard 關閉期間已回放的 bytes");
     assert_eq!(
         h.human_tx()
             .iter()
-            .filter(|(class, source, payload)| {
-                *class == TxClass::HumanReplay && source == "human:b" && payload == b"r5-deferred"
-            })
+            .filter(|(class, source, payload)| *class == TxClass::HumanReplay && source == "human:b" && payload == b"r5-deferred")
             .count(),
         1,
-        "deferred bytes 必須恰回放一次",
+        "guard 開放後不得重播，歷史 deferred replay 仍恰一次",
     );
 
     let subsequent = h.scan(None);
     assert!(subsequent.iter().all(|effect| !matches!(effect, Effect::HumanTx { permit, .. } if permit.class == TxClass::HumanReplay)));
-    assert_eq!(h.core.generations().owner_gen, owner_gen_before_handback + 1);
+    assert_eq!(h.core.generations().owner_gen, owner_gen_before_b);
     assert_eq!(h.reg.admission_gate().live_tickets(), 0);
 }
 
 #[test]
 fn tcp_mirror_nested_guarded_handback_after_eof_and_agent_close() {
-    let (h, b_lifetime) = guarded_nested_handback_after_eof(false);
-    assert_guarded_nested_handback_completes_once(h, b_lifetime);
+    let (h, b_lifetime, owner_gen_before_b) = guarded_nested_handback_after_eof(false);
+    assert_guarded_nested_handback_completes_once(h, b_lifetime, owner_gen_before_b);
 }
 
 #[test]
 fn tcp_mirror_nested_guarded_handback_after_eof_and_agent_expiry() {
-    let (h, b_lifetime) = guarded_nested_handback_after_eof(true);
-    assert_guarded_nested_handback_completes_once(h, b_lifetime);
+    let (h, b_lifetime, owner_gen_before_b) = guarded_nested_handback_after_eof(true);
+    assert_guarded_nested_handback_completes_once(h, b_lifetime, owner_gen_before_b);
 }
 
 #[test]
 fn tcp_mirror_nested_guarded_handback_detach_clears_pending_owner() {
-    let (mut h, _b_lifetime) = guarded_nested_handback_after_eof(false);
+    let (mut h, _b_lifetime, _) = guarded_nested_handback_after_eof(false);
     let detached = h
         .rpc(SessionRequest::ConsoleDetach { client_id: "b".into() })
-        .expect("detach 延後 handback 的 B");
+        .expect("detach 已恢復 raw ownership 的 B");
     assert_eq!(detached.get("ok"), Some(&PyValue::Bool(true)));
     assert_eq!(h.core.human_console().ownership.suspend_depth, 0, "detach 不得洩漏 suspend depth");
     assert!(h.core.human_console().ownership.interactive_owner.is_none());
@@ -675,7 +783,14 @@ fn tcp_mirror_nested_guarded_handback_detach_clears_pending_owner() {
     assert!(h.core.active_lease().is_none(), "已 detach 的 B 不得建立 mirror");
     assert!(h.core.human_console().ownership.interactive_owner.is_none());
     assert!(effects.iter().all(|effect| !matches!(effect, Effect::HumanTx { permit, .. } if permit.class == TxClass::HumanReplay)));
-    assert!(h.human_tx().iter().all(|(class, _, _)| *class != TxClass::HumanReplay));
+    assert_eq!(
+        h.human_tx()
+            .iter()
+            .filter(|(class, source, payload)| *class == TxClass::HumanReplay && source == "human:b" && payload == b"r5-deferred")
+            .count(),
+        1,
+        "detach 不撤銷 guard 關閉期間已由基線 resume 回放的 deferred bytes",
+    );
     assert_eq!(h.reg.admission_gate().live_tickets(), 0);
 }
 
@@ -689,16 +804,18 @@ fn tcp_mirror_tick_close_guard_delayed_restoration_preserves_busy_semantics() {
     assert!(h.human_tx().is_empty(), "soft-preempt 期間輸入須先留在 deferred");
 
     h.fence.with(|fence| fence.flash_critical = true);
-    h.advance_s(2.0); // timer 到期；guard 關閉時保留 TCP stash 與待結算 suspend。
+    h.advance_s(2.0); // timer 到期；立即沿 execute_post_close resume 並開始 replay。
     assert!(h.core.active_lease().is_none(), "到期 agent lease 已關閉");
-    assert_eq!(h.core.human_console().ownership.suspend_depth, 1);
-    assert!(h.human_tx().is_empty(), "guard 關閉時不得回放 deferred");
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 0);
+    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:a"));
+    assert!(h.core.stashed_human_lease().is_none(), "guard 關閉時撤除 TCP stash mirror 簿記");
+    assert_eq!(h.human_tx().len(), 1, "guard 關閉不延後修前 execute_post_close 的 replay");
+    assert!(h.replay_hold().is_some_and(|hold| !hold.revoked));
 
     h.fence.with(|fence| fence.flash_critical = false);
-    h.scan(None); // guarded sync 還原 stash 並開始 deferred replay。
-    let mirror_id = h.core.active_lease().expect("stash 還原後的 TCP mirror").interactive_id.clone();
-    assert_eq!(h.human_tx().len(), 1, "回放已開始但尚未完成");
-    assert!(h.replay_hold().is_some_and(|hold| !hold.revoked));
+    h.scan(None); // guard 開放後只依 raw owner 重建 mirror，不重播已開始的 bytes。
+    let mirror_id = h.core.active_lease().expect("既有同步路徑重建 TCP mirror").interactive_id.clone();
+    assert_eq!(h.human_tx().len(), 1, "guard 開放不重複開始 replay");
 
     let opened = h.rpc(open_req("agent:while-replay", 60.0, "", false)).unwrap();
     assert_eq!(
@@ -738,27 +855,49 @@ fn tcp_mirror_delayed_replacement_eof_settles_suspend_without_grant() {
 
     h.disconnect("a");
     h.connect_stream_console("b", ConsoleTransportKind::TcpTelnet);
-    h.rpc(close_req(&agent_id)).expect("guard 關閉期間 close replacement");
-    assert_eq!(h.core.human_console().ownership.suspend_depth, 1);
-    assert!(h.core.active_lease().is_none());
-    assert!(h.core.stashed_human_lease().is_none(), "replacement owner 由既有 sync 延後建鏡，不放入 stash");
-
-    // C 在延後還原期間接入，但既有規則不會立即授予第二個 client raw ownership。
-    h.connect_stream_console("c", ConsoleTransportKind::TcpTelnet);
+    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("agent:replace"), "agent 仍 active 時既有規則不讓 B 立即接班");
     assert_eq!(h.core.human_console().ownership.suspended_owner.as_deref(), Some("human:b"));
+    let deferred = h.input("b", b"replacement\r");
+    assert!(deferred.iter().all(|effect| !matches!(effect, Effect::HumanTx { .. })));
+    assert_eq!(h.deferred_len("b"), b"replacement\r".len());
+    h.rpc(close_req(&agent_id)).expect("guard 關閉期間 close replacement");
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 0);
+    assert!(h.core.active_lease().is_none());
+    assert!(h.core.stashed_human_lease().is_none(), "replacement owner 不保留 mirror stash");
+    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:b"), "既有 resume 路徑提升 replacement owner");
+    assert_eq!(
+        h.human_tx()
+            .iter()
+            .filter(|(class, source, payload)| *class == TxClass::HumanReplay && source == "human:b" && payload == b"replacement\r")
+            .count(),
+        1,
+        "guard 關閉時沿基線回放 B deferred 一次",
+    );
+
+    // B 已恢復 raw ownership 時，C 沿既有第二 console 規則等待 B 讓位。
+    h.connect_stream_console("c", ConsoleTransportKind::TcpTelnet);
+    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:b"));
     h.disconnect("b");
-    assert_eq!(h.core.human_console().ownership.suspend_depth, 0, "失效的 replacement 結束時結算其 lease suspend，不能洩漏 depth");
-    assert!(!h.core.human_console().ownership.agent_active);
-    assert_eq!(h.core.human_console().ownership.interactive_owner, None, "沒有 guard 授權前不把 C 提升為 raw owner");
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 0);
+    assert_eq!(h.core.human_console().ownership.interactive_owner, None, "B EOF 沿既有 on_drop 清除 raw owner");
     assert!(h.core.active_lease().is_none());
     assert!(h.core.stashed_human_lease().is_none());
 
     h.scan(None);
-    assert_eq!(h.core.human_console().ownership.interactive_owner, None, "flash guard 關閉時不授予仍存活的 C");
+    assert_eq!(h.core.human_console().ownership.interactive_owner, None, "guard 關閉時不自動提升 C");
     h.fence.with(|fence| fence.flash_critical = false);
+    let inserts_before_sync = h.lease_index_ops().len();
     h.scan(None);
-    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:c"), "guard 開放後由既有 self-heal 正常接班");
+    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:c"), "guard 開放後 self-heal 依 live primary 接班");
     assert_eq!(h.core.active_lease().map(|lease| lease.owner.as_str()), Some("human:c"));
+    assert_eq!(
+        h.lease_index_ops()[inserts_before_sync..]
+            .iter()
+            .filter(|op| matches!(op, LeaseIndexOp::InsertTcpMirror { .. }))
+            .count(),
+        1,
+        "guard 開放後依 live connection 只建立一次 mirror",
+    );
 }
 
 #[test]
@@ -769,16 +908,18 @@ fn tcp_mirror_delayed_same_id_replacement_eof_settles_suspend() {
     h.fence.with(|fence| fence.flash_critical = true);
 
     h.rpc(close_req(&agent_id)).expect("guard 關閉期間 close agent lease");
-    assert_eq!(h.core.human_console().ownership.suspend_depth, 1);
-    assert!(h.core.stashed_human_lease().is_some());
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 0);
+    assert!(h.core.stashed_human_lease().is_none(), "TCP stash mirror guard 關閉時立即撤除");
+    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:a"));
 
-    // 同一個 human owner 以新 lifetime 取代仍在 stash 的 TCP client。
+    // 同一個 human owner 以新 lifetime 取代 TCP client；guard 關閉時只保留既有 raw 路由。
     let replacement_lifetime = h.connect_stream_console("a", ConsoleTransportKind::TcpTelnet);
     assert_eq!(h.core.human_console().consoles["a"].client_lifetime, replacement_lifetime);
     assert!(h.core.active_lease().is_none(), "flash guard 關閉時不建立替換 client mirror");
+    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:a"));
 
     h.disconnect("a");
-    assert_eq!(h.core.human_console().ownership.suspend_depth, 0, "替換 client EOF 必須結算原 lease suspend");
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 0);
     assert_eq!(h.core.human_console().ownership.interactive_owner, None, "EOF 不重授已失效的 owner");
     assert!(h.core.stashed_human_lease().is_none());
 }
@@ -800,7 +941,8 @@ fn tcp_mirror_invalid_stash_replacement_drops_deferred_before_resume() {
 
     h.fence.with(|fence| fence.flash_critical = true);
     h.rpc(close_req(&agent_id)).expect("關閉 agent lease 並同步替換 owner");
-    assert!(h.core.active_lease().is_none(), "guard 關閉時替換 mirror 等待 guarded sync");
+    assert!(h.core.active_lease().is_none(), "guard 關閉時不建立替換 mirror");
+    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:a"), "close 仍經既有 resume 路徑恢復 live raw owner");
     assert_eq!(h.deferred_len("a"), 0, "即使 mirror 受 guard 延後，失效 stash deferred 也須立即清除");
     assert!(
         h.warns().iter().any(|warning| warning.contains("client_id=a reason=lease_dropped dropped=17")),
@@ -809,10 +951,19 @@ fn tcp_mirror_invalid_stash_replacement_drops_deferred_before_resume() {
     );
 
     h.fence.with(|fence| fence.flash_critical = false);
+    let inserts_before_sync = h.lease_index_ops().len();
     h.scan(None);
     assert_eq!(h.core.active_lease().map(|lease| lease.owner.as_str()), Some("human:a"));
     assert_eq!(h.core.active_lease().and_then(|lease| lease.mirror_client_lifetime), Some(new_lifetime));
     assert!(h.human_tx().is_empty(), "失效 stash 的位元組不可被回放到新 lifetime");
+    assert_eq!(
+        h.lease_index_ops()[inserts_before_sync..]
+            .iter()
+            .filter(|op| matches!(op, LeaseIndexOp::InsertTcpMirror { .. }))
+            .count(),
+        1,
+        "同步依新的 live lifetime 只重建一次 mirror",
+    );
 }
 
 #[test]

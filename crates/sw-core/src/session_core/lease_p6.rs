@@ -126,67 +126,54 @@ impl SessionCore {
             } else {
                 !stash.expired(now) && self.human_peer_present(&cid)
             };
-            if stash_alive {
-                if let Some(client_lifetime) = stash.mirror_client_lifetime {
-                    self.pending_tcp_suspend_settlement = Some(TcpSuspendSettlement {
-                        source_lease_id: lease.interactive_id.clone(),
-                        owner: stash.owner.clone(),
-                        client_lifetime,
-                        tick,
-                    });
-                    if !self.restore_stashed_tcp_mirror_if_allowed() {
-                        // agent 租約已關閉，但保留暫停中的 TCP 所有權，等共用 guard 開放。
-                        self.tcp_handback_deferred = true;
-                        self.human_set_owner(None);
-                        return;
-                    }
-                    return;
-                } else {
-                    self.stashed_human.take();
-                    self.lease = Some(stash.clone());
-                    self.insert_lease_index(stash);
-                    self.human_set_owner(Some(&stash.owner));
-                    restored = true;
-                }
+            if stash_alive && stash.mirror_client_lifetime.is_some() {
+                // TCP mirror 只作簿記；raw handback 與回放沿既有 PostClose／resume 路徑。
+                // resume 後的 sync 依當下存活 client 重建鏡像，guard 關閉時則只撤簿記。
+                self.forget_stashed_tcp_mirror();
+            } else if stash_alive {
+                self.stashed_human.take();
+                self.lease = Some(stash.clone());
+                self.insert_lease_index(stash);
+                self.human_set_owner(Some(&stash.owner));
+                restored = true;
                 post.replay_allowed = true;
             }
         }
         if !restored {
-            self.stashed_human.take();
-            post.dropped_stash_client = stash.as_ref().and_then(|s| s.human_client_id()).map(str::to_string);
-            // agent 持有租約期間，EOF／重新連線可能已換成新的暫停中 TCP client。
-            // 清除失效 stash 與該 client 的延後輸入，但保留替換後的 raw 所有者以便恢復。
-            // PTY 與一般 human 租約的 close 行為維持原狀。
-            let replacement_tcp_owner = preempted_tcp_mirror_lifetime.is_some()
-                && live_tcp_owner.as_ref().is_some_and(|(owner, lifetime)| {
-                    !stash.as_ref().is_some_and(|old| {
+            let live_tcp_preempted_owner = preempted_tcp_mirror_lifetime.is_some()
+                && live_tcp_owner.is_some();
+            let live_stashed_tcp_owner = stash.as_ref().is_some_and(|old| {
+                old.mirror_client_lifetime.is_some()
+                    && live_tcp_owner.as_ref().is_some_and(|(owner, lifetime)| {
                         old.owner == *owner && old.mirror_client_lifetime == Some(*lifetime)
                     })
-                });
-            if replacement_tcp_owner {
-                if let Some((owner, client_lifetime)) = live_tcp_owner.as_ref() {
-                    self.pending_tcp_suspend_settlement = Some(TcpSuspendSettlement {
-                        source_lease_id: lease.interactive_id.clone(),
-                        owner: owner.clone(),
-                        client_lifetime: *client_lifetime,
-                        tick,
-                    });
+            });
+            if live_tcp_preempted_owner {
+                // 有效 TCP stash 保留 deferred；失效 stash 才清除舊 client 的輸入。
+                if !live_stashed_tcp_owner {
+                    post.dropped_stash_client = stash
+                        .as_ref()
+                        .and_then(|old| old.human_client_id())
+                        .map(str::to_string);
                 }
-                // 替換後的 TCP 所有者必須等 sync_tcp_console_lease 取得共用 guard 與 ticket，
-                // 建立鏡像後才解除暫停；否則 close／expiry 會先繞過 guard 重授 raw 所有權。
-                self.tcp_handback_deferred = true;
-                if let Some(cid) = post.dropped_stash_client.as_deref() {
-                    if let Some(warning) = self.drop_stashed_deferred(cid) {
-                        self.fx_buf.push(warning);
-                    }
+                // 巢狀 suspend 尚有其他 operation 時，先移除已關閉 agent 的 raw owner；
+                // 最外層 owner 仍只能由 resume_human 恢復。
+                if self.human.ownership.suspend_depth > 1 {
+                    self.human_set_owner(None);
                 }
-                self.human_set_owner(None);
-                return;
+                post.clear_owner_after_resume = false;
             } else {
+                if let Some(stash) = stash.as_ref() {
+                    if stash.mirror_client_lifetime.is_some() {
+                        self.forget_stashed_tcp_mirror();
+                    } else {
+                        self.stashed_human.take();
+                    }
+                    post.dropped_stash_client = stash.human_client_id().map(str::to_string);
+                }
                 self.human_set_owner(None);
                 post.clear_owner_after_resume = true;
             }
-            post.dropped_stash_client = stash.as_ref().and_then(|s| s.human_client_id()).map(str::to_string);
         }
         self.execute_post_close(post, tick);
     }
@@ -198,8 +185,12 @@ impl SessionCore {
         }
         let mut fx = Vec::new();
         if let Some(cid) = post.dropped_stash_client.as_deref() {
-            if let Some(warning) = self.drop_stashed_deferred(cid) {
-                fx.push(warning);
+            let dropped = self.human.deferred_mut().remove_client(cid);
+            if dropped > 0 {
+                fx.push(Effect::Warn(format!(
+                    "deferred input 因 lease 上下文失效清空（com={} client_id={cid} reason=lease_dropped dropped={dropped}）",
+                    self.profile.com
+                )));
             }
         }
         let before_hold = self.human.replay_hold.as_ref().map(|h| h.hold_id);
@@ -216,17 +207,6 @@ impl SessionCore {
             self.human_set_owner(None);
         }
         self.fx_buf.extend(fx);
-    }
-
-    /// 清除已丟棄 stash client 的 deferred，並產生與立即 PostClose 相同的 Warn 效果。
-    fn drop_stashed_deferred(&mut self, client_id: &str) -> Option<Effect> {
-        let dropped = self.human.deferred_mut().remove_client(client_id);
-        (dropped > 0).then(|| {
-            Effect::Warn(format!(
-                "deferred input 因 lease 上下文失效清空（com={} client_id={client_id} reason=lease_dropped dropped={dropped}）",
-                self.profile.com
-            ))
-        })
     }
 
     /// DF-20（OD-37 範圍，rulings/p6.md round4-cont OWNER-BATCH #4）：`session recover` 受理與重新開機 banner 時，
@@ -252,8 +232,6 @@ impl SessionCore {
                 interactive_id: stash.interactive_id,
             });
         }
-        self.pending_tcp_suspend_settlement = None;
-        self.tcp_handback_deferred = false;
     }
 
     // ---------------- refresh（`_refresh_interactive_locked`） ----------------
@@ -272,6 +250,20 @@ impl SessionCore {
 
     /// TCP raw owner 的 session lease 鏡像。只更新 Lease／LeaseIndex，不授 raw owner、不改 owner_gen。
     pub(super) fn sync_tcp_console_lease(&mut self, now: Mono) {
+        if !self.tcp_mirror_guard_allows_new() {
+            if self.lease.as_ref().is_some_and(|lease| lease.mirror_client_lifetime.is_some()) {
+                self.forget_active_tcp_mirror();
+            }
+            if self
+                .stashed_human
+                .as_ref()
+                .is_some_and(|lease| lease.mirror_client_lifetime.is_some())
+            {
+                self.forget_stashed_tcp_mirror();
+            }
+            return;
+        }
+
         let logical_owner = self.human.live_tcp_raw_owner();
         let active_matches = self.lease.as_ref().is_some_and(|lease| {
             logical_owner.as_ref().is_some_and(|(owner, lifetime)| {
@@ -295,33 +287,10 @@ impl SessionCore {
         {
             self.forget_stashed_tcp_mirror();
         }
-        if active_matches {
-            if self.tcp_handback_deferred && self.human.ownership.suspend_depth == 0 {
-                if let Some((owner, lifetime)) = self.human.deferred_tcp_handback_owner() {
-                    self.complete_deferred_tcp_handback_with_ticket(&owner, lifetime);
-                }
-            }
-            return;
-        }
-        if stashed_matches {
-            // agent 租約關閉時若 guard 凍結，TCP 鏡像留在 stash；guard 開放後由下一次同步還原並恢復。
-            if self.lease.is_none() {
-                let restored = self.restore_stashed_tcp_mirror_if_allowed();
-                if restored && self.tcp_handback_deferred && self.human.ownership.suspend_depth == 0 {
-                    if let Some((owner, lifetime)) = self.human.deferred_tcp_handback_owner() {
-                        self.complete_deferred_tcp_handback_with_ticket(&owner, lifetime);
-                    }
-                }
-            }
+        if active_matches || stashed_matches {
             return;
         }
         let Some((owner, lifetime)) = logical_owner else {
-            if self.tcp_handback_deferred
-                && self.human.ownership.suspend_depth == 0
-                && self.tcp_mirror_guard_allows_new()
-            {
-                self.tcp_handback_deferred = false;
-            }
             return;
         };
 
@@ -342,15 +311,6 @@ impl SessionCore {
             return;
         }
 
-        if !self.insert_tcp_mirror(owner.clone(), lifetime, now, true) {
-            return;
-        }
-        if self.tcp_handback_deferred && self.human.ownership.suspend_depth == 0 {
-            self.complete_deferred_tcp_handback_under_ticket(&owner, lifetime);
-        }
-    }
-
-    fn insert_tcp_mirror(&mut self, owner: String, lifetime: u64, now: Mono, settle_pending: bool) -> bool {
         let id = self.next_uuid();
         let timeout = self
             .profile
@@ -371,19 +331,14 @@ impl SessionCore {
                 self.lease = Some(mirror);
                 let mirror = self.lease.as_ref().expect("剛建立 TCP mirror").clone();
                 self.insert_lease_index(&mirror);
-                if settle_pending {
-                    self.settle_pending_tcp_suspend_for(&mirror.owner, lifetime);
-                }
-                true
             }
             Some(active) if !active.is_human() && active.suspended_human && self.stashed_human.is_none() => {
                 self.stashed_human = Some(mirror);
                 let mirror = self.stashed_human.as_ref().expect("剛 stash TCP mirror").clone();
                 self.insert_lease_index(&mirror);
-                true
             }
             // Agent／一般 human lease 與非 mirror stash 都是既有權威，不由 TCP mirror 覆蓋。
-            _ => false,
+            _ => {}
         }
     }
 
@@ -399,115 +354,6 @@ impl SessionCore {
             && !self.handoff_frozen()
     }
 
-    /// 最外層 resume 的 TCP handback 共用 guard、ticket 與 ticket 後 owner/lifetime 重驗。
-    pub(super) fn prepare_deferred_tcp_handback(
-        &mut self,
-        owner: &str,
-        lifetime: u64,
-        now: Mono,
-    ) -> Option<crate::admission::AdmissionTicket> {
-        if !self.tcp_handback_deferred || !self.tcp_mirror_guard_allows_new() {
-            return None;
-        }
-        let gate = self.deps.registry.admission_gate();
-        let ticket = gate.admit("session.interactive_open", Some(&self.profile.com))?;
-        let admission = crate::admission::AdmissionTicket::new(gate, ticket);
-        let expected = Some((owner.to_string(), lifetime));
-        if !self.tcp_mirror_guard_allows_new()
-            || !self.human.is_live_tcp_owner(owner, lifetime)
-            || self.human.resume_tcp_owner_candidate() != expected
-        {
-            return None;
-        }
-
-        let active_matches = self.lease.as_ref().is_some_and(|lease| {
-            lease.owner == owner && lease.mirror_client_lifetime == Some(lifetime)
-        });
-        if !active_matches {
-            let stashed_matches = self.stashed_human.as_ref().is_some_and(|lease| {
-                lease.owner == owner && lease.mirror_client_lifetime == Some(lifetime)
-            });
-            if stashed_matches && self.lease.is_none() {
-                let stash = self.stashed_human.take().expect("已確認相符的 TCP stash");
-                self.lease = Some(stash.clone());
-                self.insert_lease_index(&stash);
-            } else if self.lease.is_none()
-                && self.stashed_human.is_none()
-                && !self.pending_tcp_suspend_matches(owner, lifetime)
-            {
-                if !self.insert_tcp_mirror(owner.to_string(), lifetime, now, false) {
-                    return None;
-                }
-            } else {
-                return None;
-            }
-        }
-
-        let mirror_matches = self.lease.as_ref().is_some_and(|lease| {
-            lease.owner == owner && lease.mirror_client_lifetime == Some(lifetime)
-        });
-        (self.tcp_mirror_guard_allows_new()
-            && self.human.is_live_tcp_owner(owner, lifetime)
-            && self.human.resume_tcp_owner_candidate() == expected
-            && mirror_matches)
-            .then_some(admission)
-    }
-
-    /// sync 已持有建立／確認 mirror 的 ticket；只有此處能在 suspend depth 已結算後提升 delayed owner。
-    fn complete_deferred_tcp_handback_under_ticket(&mut self, owner: &str, lifetime: u64) -> bool {
-        let mirror_matches = self.lease.as_ref().is_some_and(|lease| {
-            lease.owner == owner && lease.mirror_client_lifetime == Some(lifetime)
-        });
-        if !self.tcp_handback_deferred
-            || self.human.ownership.suspend_depth != 0
-            || !self.tcp_mirror_guard_allows_new()
-            || !self.human.is_live_tcp_owner(owner, lifetime)
-            || !mirror_matches
-        {
-            return false;
-        }
-        let before = self.human.ownership.interactive_owner.clone();
-        let already_active = before.as_deref() == Some(owner);
-        let promoted = self
-            .human
-            .ownership
-            .promote_deferred_owner(owner, &|client_id| self.human.consoles.contains_key(client_id));
-        if !already_active && !promoted {
-            return false;
-        }
-        self.after_owner_change(before);
-        self.tcp_handback_deferred = false;
-        let mut effects = Vec::new();
-        self.replay_point(&mut effects);
-        self.fx_buf.extend(effects);
-        true
-    }
-
-    /// 對既有 mirror 的延後 owner handback 取得短暫 admission ticket，並在 ticket 後重驗。
-    fn complete_deferred_tcp_handback_with_ticket(&mut self, owner: &str, lifetime: u64) -> bool {
-        if !self.tcp_handback_deferred
-            || self.human.ownership.suspend_depth != 0
-            || !self.tcp_mirror_guard_allows_new()
-        {
-            return false;
-        }
-        let gate = self.deps.registry.admission_gate();
-        let Some(ticket) = gate.admit("session.interactive_open", Some(&self.profile.com)) else {
-            return false;
-        };
-        let _admission = crate::admission::AdmissionTicket::new(gate, ticket);
-        self.complete_deferred_tcp_handback_under_ticket(owner, lifetime)
-    }
-
-    fn clear_unrestorable_tcp_handback(&mut self) {
-        if self.tcp_handback_deferred
-            && self.human.ownership.suspend_depth == 0
-            && self.human.live_tcp_raw_owner().is_none()
-        {
-            self.tcp_handback_deferred = false;
-        }
-    }
-
     /// 自 EOF／owner 替換移除指定 client lifetime 的 mirror；不呼叫 human_set_owner。
     pub(super) fn forget_tcp_console_mirror_for_client(&mut self, client_id: &str, lifetime: u64) {
         let owner = format!("human:{client_id}");
@@ -520,13 +366,6 @@ impl SessionCore {
             lease.owner == owner && lease.mirror_client_lifetime == Some(lifetime)
         }) {
             self.forget_stashed_tcp_mirror();
-        }
-        let pending_matches = self.pending_tcp_suspend_matches(&owner, lifetime);
-        if pending_matches {
-            self.pending_tcp_suspend_settlement = None;
-            self.human.ownership.settle_suspend_without_owner();
-        } else {
-            self.clear_unrestorable_tcp_handback();
         }
     }
 
@@ -544,105 +383,6 @@ impl SessionCore {
                 interactive_id: lease.interactive_id,
             });
         }
-    }
-
-    /// 共用 TCP 鏡像 guard 與 admission ticket，還原仍存活的軟式搶占 stash。
-    fn restore_stashed_tcp_mirror_if_allowed(&mut self) -> bool {
-        let Some(stash) = self
-            .stashed_human
-            .as_ref()
-            .filter(|lease| lease.mirror_client_lifetime.is_some())
-            .cloned()
-        else {
-            return false;
-        };
-        if !self.tcp_mirror_guard_allows_new() {
-            self.tcp_handback_deferred = true;
-            return false;
-        }
-        let gate = self.deps.registry.admission_gate();
-        let Some(ticket) = gate.admit("session.interactive_open", Some(&self.profile.com)) else {
-            self.tcp_handback_deferred = true;
-            return false;
-        };
-        let _admission = crate::admission::AdmissionTicket::new(gate, ticket);
-        if !self.tcp_mirror_guard_allows_new()
-            || self.lease.is_some()
-            || !self.stashed_tcp_mirror_is_live(&stash)
-        {
-            return false;
-        }
-        let Some(stash) = self.stashed_human.take() else {
-            return false;
-        };
-        self.lease = Some(stash.clone());
-        self.insert_lease_index(&stash);
-        self.settle_pending_tcp_suspend_for(
-            &stash.owner,
-            stash.mirror_client_lifetime.expect("TCP stash lifetime"),
-        );
-        if self.tcp_handback_deferred && self.human.ownership.suspend_depth == 0 {
-            self.complete_deferred_tcp_handback_under_ticket(
-                &stash.owner,
-                stash.mirror_client_lifetime.expect("TCP stash lifetime"),
-            );
-        }
-        true
-    }
-
-    /// 只結算明確記錄且 owner/lifetime 相符的 agent soft-preempt suspend。
-    fn settle_pending_tcp_suspend_for(&mut self, owner: &str, client_lifetime: u64) -> bool {
-        let Some(pending) = self
-            .pending_tcp_suspend_settlement
-            .as_ref()
-            .filter(|pending| {
-                !pending.source_lease_id.is_empty()
-                    && pending.owner == owner
-                    && pending.client_lifetime == client_lifetime
-            })
-            .cloned()
-        else {
-            return false;
-        };
-        self.pending_tcp_suspend_settlement = None;
-        let before_hold = self.human.replay_hold.as_ref().map(|hold| hold.hold_id);
-        let mut effects = Effects(Vec::new());
-        self.human_suspend_end(true, &mut effects);
-        if pending.tick {
-            let after_hold = self
-                .human
-                .replay_hold
-                .as_ref()
-                .filter(|hold| !hold.revoked)
-                .map(|hold| hold.hold_id);
-            if after_hold.is_some() && after_hold != before_hold {
-                self.tick_close_hold = after_hold;
-            }
-        }
-        self.fx_buf.extend(effects.0);
-        true
-    }
-
-    fn pending_tcp_suspend_matches(&self, owner: &str, client_lifetime: u64) -> bool {
-        self.pending_tcp_suspend_settlement.as_ref().is_some_and(|pending| {
-            !pending.source_lease_id.is_empty()
-                && pending.owner == owner
-                && pending.client_lifetime == client_lifetime
-        })
-    }
-
-    fn stashed_tcp_mirror_is_live(&self, stash: &InteractiveLease) -> bool {
-        let Some(lifetime) = stash.mirror_client_lifetime else {
-            return false;
-        };
-        self.stashed_human.as_ref().is_some_and(|current| {
-            current.interactive_id == stash.interactive_id
-                && current.owner == stash.owner
-                && current.mirror_client_lifetime == Some(lifetime)
-        }) && self
-            .human
-            .live_tcp_raw_owner()
-            .is_some_and(|(owner, live_lifetime)| owner == stash.owner && live_lifetime == lifetime)
     }
 
     /// `owner_check`：RPC 路徑比照 Python 檢查 `snapshot()["interactive_owner"] == lease.owner`；
@@ -977,75 +717,25 @@ impl SessionCore {
         {
             return;
         }
-        let Some((owner, timeout_s, retained_tcp_lifetime)) = self.retained_human.as_ref().cloned() else {
+        let Some((owner, timeout_s, retained_tcp_lifetime)) = self.retained_human.take() else {
             return;
         };
+        if retained_tcp_lifetime.is_some() {
+            // Recover 後依 live TCP ownership 同步建鏡；不以 retained 快照在 guard 關閉時重授。
+            self.sync_tcp_console_lease(now);
+            return;
+        }
         let Some(cid) = owner.strip_prefix("human:").filter(|c| !c.is_empty()) else {
-            self.retained_human.take();
             return;
         };
         if !self.human.consoles.contains_key(cid) {
-            self.retained_human.take();
             return;
         }
-        let mirror_lifetime = match retained_tcp_lifetime {
-            Some(lifetime) if self.retained_tcp_owner_is_live(&owner, cid, lifetime) => Some(lifetime),
-            Some(_) => {
-                self.retained_human.take();
-                return;
-            }
-            None => None,
-        };
-
-        if let Some(lifetime) = mirror_lifetime {
-            // 保留中的 TCP 還原與一般鏡像／自癒共用同一完整 guard 及 admission ticket；
-            // guard 暫時關閉時不取出保留資料，留待後續 actor 事件重試。
-            if !self.tcp_mirror_guard_allows_new() {
-                return;
-            }
-            let gate = self.deps.registry.admission_gate();
-            let Some(ticket) = gate.admit("session.interactive_open", Some(&self.profile.com)) else {
-                return;
-            };
-            let _admission = crate::admission::AdmissionTicket::new(gate, ticket);
-            if !self.tcp_mirror_guard_allows_new()
-                || !self.retained_tcp_owner_is_live(&owner, cid, lifetime)
-            {
-                return;
-            }
-
-            self.refresh_lease_p6(now);
-            if !self.tcp_mirror_guard_allows_new()
-                || !self.retained_tcp_owner_is_live(&owner, cid, lifetime)
-            {
-                return;
-            }
-            self.retained_human.take();
-            if self.lease.is_none() {
-                self.open_lease_with_tcp_mirror(&owner, timeout_s, false, now, Some(lifetime));
-            }
-            return;
-        }
-
-        // PTY 還原維持原先的取出、更新與建立順序。
-        let Some((owner, timeout_s, _)) = self.retained_human.take() else {
-            return;
-        };
+        let mirror_lifetime = None;
         self.refresh_lease_p6(now);
         if self.lease.is_none() {
-            self.open_lease_with_tcp_mirror(&owner, timeout_s, false, now, None);
+            self.open_lease_with_tcp_mirror(&owner, timeout_s, false, now, mirror_lifetime);
         }
-    }
-
-    fn retained_tcp_owner_is_live(&self, owner: &str, client_id: &str, lifetime: u64) -> bool {
-        self.retained_human.as_ref().is_some_and(|(retained_owner, _, retained_lifetime)| {
-            retained_owner == owner && *retained_lifetime == Some(lifetime)
-        }) && self.human.consoles.get(client_id).is_some_and(|console| {
-            console.kind == crate::human_console::ConsoleTransportKind::TcpTelnet
-                && self.human.is_live(client_id, lifetime)
-                && console.client_lifetime == lifetime
-                && self.human.peer_present.get(client_id).copied().unwrap_or(true)
-        })
     }
 
     /// 目前前景命令是否為可信 human（OD-74、rulings s2 D5）：line editor 的 `HumanConsole` OR 請求的 `trusted_human`
