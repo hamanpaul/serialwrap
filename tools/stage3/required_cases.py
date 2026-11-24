@@ -43,19 +43,35 @@ def _relative_path(value: object) -> str | None:
 
 
 def _git_show(repo_root: Path, revision: str, repo_path: str) -> bytes | None:
-    """讀 Git blob；只有已確認的「該路徑不在 revision」回傳 None。"""
-    result = subprocess.run(
-        ["git", "show", f"{revision}:{repo_path}"],
-        cwd=repo_root,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode == 0:
-        return result.stdout
-    error = result.stderr.decode("utf-8", errors="replace")
-    if "exists on disk, but not in" in error or "does not exist in" in error:
+    """讀 Git blob；只有已確認的「該路徑不在 revision」回傳 None。
+
+    不解析 git 的錯誤訊息（會隨 locale 翻譯）：先把 revision 解析成 commit，
+    再以 `ls-tree` 判斷路徑是否存在，最後讀 blob。revision 無法解析、路徑不是
+    blob 或讀取失敗一律拋 ValueError，不當成「不存在」。
+    """
+
+    def _run(argv: list[str]) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(["git", *argv], cwd=repo_root, capture_output=True, check=False)
+
+    def _err(result: subprocess.CompletedProcess[bytes]) -> str:
+        return result.stderr.decode("utf-8", errors="replace").strip()
+
+    resolved = _run(["rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"])
+    if resolved.returncode != 0:
+        raise ValueError(f"無法解析 Git revision {revision}：{_err(resolved)}")
+    commit = resolved.stdout.decode("ascii", errors="replace").strip()
+    listing = _run(["ls-tree", "-z", commit, "--", repo_path])
+    if listing.returncode != 0:
+        raise ValueError(f"無法列出 Git 來源 {revision}:{repo_path}：{_err(listing)}")
+    if not listing.stdout:
         return None
-    raise ValueError(f"無法讀取 Git 來源 {revision}:{repo_path}: {error.strip()}")
+    meta = listing.stdout.split(b"\0", 1)[0].split(b"\t", 1)[0].split()
+    if len(meta) < 2 or meta[1] != b"blob":
+        raise ValueError(f"Git 來源 {revision}:{repo_path} 不是檔案")
+    blob = _run(["cat-file", "blob", f"{commit}:{repo_path}"])
+    if blob.returncode != 0:
+        raise ValueError(f"無法讀取 Git 來源 {revision}:{repo_path}：{_err(blob)}")
+    return blob.stdout
 
 
 def verify_seed_sources(
@@ -216,7 +232,8 @@ def _expected_exit_cases(
                 and case_map[case_id].get("layer") == layer
                 and case_map[case_id].get("necessity") == "required"
                 and platform in case_map[case_id].get("platforms", [])
-                and (families is None or case_map[case_id].get("family") in families)
+                # L3 的 required_families 僅是目錄資訊；完整分母涵蓋該平台全部適用必要 L3 案例。
+                and (layer == "L3" or families is None or case_map[case_id].get("family") in families)
             }
             item_platforms[platform] = {
                 "required_case_set": "slice_2.4",
@@ -225,6 +242,72 @@ def _expected_exit_cases(
             }
         expected[item_id] = item_platforms
     return expected
+
+
+def _seed_expected_exit_cases(catalog: Mapping[str, Any], evidence_root: Path) -> dict[str, dict[str, dict[str, Any]]]:
+    """只用經核實的固定附件展開初始基準，避免目前 cases／case lock 同時縮減基準。"""
+    try:
+        cases_doc = yaml.safe_load((evidence_root / SEED_FILES["tests/acceptance/cases.yaml"]).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise ValueError(f"無法讀取固定 seed 基準 cases.yaml：{exc}") from exc
+    if not isinstance(cases_doc, dict):
+        raise ValueError("固定 seed 基準 cases.yaml 根節點必須是物件")
+    case_lock = _read_json(evidence_root / SEED_FILES["tests/acceptance/cases.lock.json"])
+    return _expected_exit_cases(catalog, cases_doc, case_lock)
+
+
+def _validate_seed_floor(lock: Mapping[str, Any], seed_expected: Mapping[str, Any]) -> list[str]:
+    """確認目前鎖保留 seed 展開的每個初始出口／平台必要 ID。"""
+    errors: list[str] = []
+    exits = lock.get("exits")
+    if not isinstance(exits, dict):
+        return ["分母鎖缺少 exits，無法核對固定 seed 基準"]
+    for item_id, platforms in seed_expected.items():
+        actual_platforms = exits.get(item_id)
+        if not isinstance(actual_platforms, dict):
+            errors.append(f"分母鎖缺少固定 seed 基準出口：{item_id}")
+            continue
+        for platform, baseline in platforms.items():
+            actual = actual_platforms.get(platform)
+            if not isinstance(actual, dict):
+                errors.append(f"分母鎖缺少固定 seed 基準平台：{item_id}/{platform}")
+                continue
+            for key in ("required_case_set", "layer"):
+                if actual.get(key) != baseline[key]:
+                    errors.append(f"固定 seed 基準出口屬性不符：{item_id}/{platform}/{key}")
+            ids = actual.get("case_ids")
+            if not isinstance(ids, list) or not all(isinstance(case_id, str) for case_id in ids):
+                errors.append(f"固定 seed 基準的 case_ids 格式錯誤：{item_id}/{platform}")
+                continue
+            missing = set(baseline["case_ids"]) - set(ids)
+            if missing:
+                errors.append(
+                    f"分母鎖小於固定 seed 基準 {item_id}/{platform}：{', '.join(sorted(missing))}"
+                )
+    return errors
+
+
+def _case_family_errors(current_cases: Mapping[str, Any], previous_cases: Mapping[str, Any], *, source: str) -> list[str]:
+    current = {case["case_id"]: case for case in current_cases.get("cases", []) if isinstance(case, dict)}
+    previous = {case["case_id"]: case for case in previous_cases.get("cases", []) if isinstance(case, dict)}
+    errors: list[str] = []
+    for case_id in sorted(set(current) & set(previous)):
+        if current[case_id].get("family") != previous[case_id].get("family"):
+            errors.append(f"案例 family 不可重分類（{source}）：{case_id}")
+    return errors
+
+
+def _seed_family_errors(current_cases: Mapping[str, Any], evidence_root: Path) -> list[str]:
+    """固定 seed 中既有案例的 family 標籤不可藉重新分類改寫。"""
+    try:
+        seed_cases = yaml.safe_load(
+            (evidence_root / SEED_FILES["tests/acceptance/cases.yaml"]).read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise ValueError(f"無法讀取固定 seed 案例 family：{exc}") from exc
+    if not isinstance(seed_cases, dict):
+        raise ValueError("固定 seed 案例 family 根節點必須是物件")
+    return _case_family_errors(current_cases, seed_cases, source="固定 seed")
 
 
 def _validate_lock(
@@ -295,21 +378,31 @@ def _validate_lock(
 
 
 def _base_errors(
-    current: Mapping[str, Any], *, base: str, repo_root: Path, source_reader: SourceReader,
+    current: Mapping[str, Any], current_cases: Mapping[str, Any], *,
+    base: str, repo_root: Path, source_reader: SourceReader,
 ) -> list[str]:
     try:
         raw = source_reader(base, "tests/acceptance/stage3_required_cases.lock.json")
+        base_cases_raw = source_reader(base, "tests/acceptance/cases.yaml")
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         return [f"無法讀取 PR base 的分母鎖：{exc}"]
+    errors: list[str] = []
+    if base_cases_raw is not None:
+        try:
+            base_cases = yaml.safe_load(base_cases_raw.decode("utf-8"))
+        except (UnicodeDecodeError, yaml.YAMLError, RecursionError) as exc:
+            return [f"PR base 的 cases.yaml 不是有效 YAML：{exc}"]
+        if not isinstance(base_cases, dict):
+            return ["PR base 的 cases.yaml 根節點必須是物件"]
+        errors.extend(_case_family_errors(current_cases, base_cases, source="PR base"))
     if raw is None:
-        return []
+        return errors
     try:
         previous = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         return [f"PR base 的分母鎖不是有效 JSON：{exc}"]
     if not isinstance(previous, dict):
         return ["PR base 的分母鎖根節點必須是物件"]
-    errors: list[str] = []
     if previous.get("seed") != current.get("seed"):
         errors.append("分母鎖 seed 不可在 PR 中變更")
     before = previous.get("exits")
@@ -402,9 +495,18 @@ def main(
         if errors:
             raise ValueError("；".join(errors))
         expected = _expected_exit_cases(catalog, cases_doc, case_lock)
+        seed_expected = _seed_expected_exit_cases(catalog, root / EVIDENCE_RELATIVE)
+        seed_errors = _validate_seed_floor(lock, seed_expected)
+        if seed_errors:
+            raise ValueError("；".join(seed_errors))
+        family_errors = _seed_family_errors(cases_doc, root / EVIDENCE_RELATIVE)
+        if family_errors:
+            raise ValueError("；".join(family_errors))
         structure_errors = _validate_lock(lock, expected, allow_missing=args.add_only)
         if args.base:
-            structure_errors.extend(_base_errors(lock, base=args.base, repo_root=root, source_reader=reader))
+            structure_errors.extend(_base_errors(
+                lock, cases_doc, base=args.base, repo_root=root, source_reader=reader,
+            ))
         if structure_errors:
             raise ValueError("；".join(structure_errors))
 

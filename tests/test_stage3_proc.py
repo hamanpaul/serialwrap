@@ -63,3 +63,38 @@ def test_public_seed_git_show_matches_manifest_and_attachments():
         return result.stdout
 
     assert required_cases.verify_seed_sources(manifest, evidence_root=evidence_root, source_reader=git_show) == []
+
+
+def _init_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git = ["git", "-c", "user.name=stage3-test", "-c", "user.email=stage3-test@example.invalid",
+           "-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"]
+    subprocess.run(git + ["init", "-q"], cwd=repo, check=True)
+    (repo / "present.txt").write_bytes(b"a\nb\n")
+    subprocess.run(git + ["add", "present.txt"], cwd=repo, check=True)
+    subprocess.run(git + ["commit", "-q", "-m", "init"], cwd=repo, check=True)
+    return repo
+
+
+def test_git_show_missing_path_is_locale_independent(tmp_path, monkeypatch):
+    # 「路徑不在 revision」的判定不得依賴 git 英文訊息；非英文 locale（例如 zh_TW）下首個 PR 的 base 無鎖仍須回 None
+    from tools.stage3.required_cases import _git_show
+
+    repo = _init_repo(tmp_path)
+    for key, value in (("LANGUAGE", "zh_TW"), ("LC_ALL", "zh_TW.UTF-8"), ("LANG", "zh_TW.UTF-8")):
+        monkeypatch.setenv(key, value)
+    assert _git_show(repo, "HEAD", "present.txt") == b"a\nb\n"
+    assert _git_show(repo, "HEAD", "tests/acceptance/missing.json") is None
+    (repo / "untracked.json").write_text("{}", encoding="utf-8")       # 磁碟上有、revision 沒有
+    assert _git_show(repo, "HEAD", "untracked.json") is None
+
+
+def test_git_show_unknown_revision_raises(tmp_path):
+    from tools.stage3.required_cases import _git_show
+
+    repo = _init_repo(tmp_path)
+    with pytest.raises(ValueError):
+        _git_show(repo, "0" * 40, "present.txt")
+    with pytest.raises(ValueError):
+        _git_show(repo, "no-such-ref", "present.txt")

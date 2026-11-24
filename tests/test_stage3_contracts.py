@@ -196,6 +196,15 @@ def test_ab_manifest_sides_and_reverify_order_fixed():
     assert not list(v.iter_errors(no_auth))
 
 
+def test_canary_example_record_ids_match_content():
+    # plan 10 Task 1 Step 3：範例每行的 record_id 必須以 jsonio.record_id 由內容計算，改內容須同步重算
+    from tools.stage3 import jsonio
+    lines = (ACC / "examples" / "canary_records.example.ndjson").read_text(encoding="utf-8").splitlines()
+    for no, line in enumerate(lines, 1):
+        rec = json.loads(line)
+        assert rec["record_id"] == jsonio.record_id(rec), f"第 {no} 行 record_id 與內容不符"
+
+
 def test_ledger_snapshot_verified_requires_tree_digests():
     v = _validator("canary_ledger_record.schema.json")
     recs = [json.loads(x) for x in (ACC / "examples" / "canary_records.example.ndjson").read_text(encoding="utf-8").splitlines()]
@@ -576,9 +585,11 @@ def _seed_required_case_ids(case_doc: dict, case_lock: dict, layer: str, platfor
     selected = set()
     for case_id in case_lock["sets"]["slice_2.4"]:
         case = by_id[case_id]
+        if case_id == "lr-mixed":
+            continue
         if case["layer"] != layer or case["necessity"] != "required" or platform not in case["platforms"]:
             continue
-        if required_families is not None and case.get("family") not in required_families:
+        if layer != "L3" and required_families is not None and case.get("family") not in required_families:
             continue
         selected.add(case_id)
     return selected
@@ -635,6 +646,9 @@ def test_required_cases_seed_preserves_full_denominator():
     lock = _load(ACC / "stage3_required_cases.lock.json")
     cases = yaml.safe_load((DENOMINATORS / "cases.yaml").read_text(encoding="utf-8"))
     case_lock = _load(DENOMINATORS / "cases.lock.json")
+    current_cases = yaml.safe_load((ACC / "cases.yaml").read_text(encoding="utf-8"))
+    current_case_lock = _load(ACC / "cases.lock.json")
+    catalog = _load(ACC / "stage_exits.json")
     assert lock["schema_version"] == 1
     assert lock["seed"]["revision"] == SEED_REVISION
     assert lock["seed"]["decision_ref"] == "OD-113"
@@ -648,9 +662,72 @@ def test_required_cases_seed_preserves_full_denominator():
     for item_id, platform, layer, families in STAGE3_REQUIRED_EXIT_SPECS:
         expected = _seed_required_case_ids(cases, case_lock, layer, platform, families)
         actual = required_cases.required_for_exit(lock, item_id, platform)
-        assert actual == expected
+        assert expected <= actual
         assert "lr-mixed" not in actual
         assert actual
+    current_expected = required_cases._expected_exit_cases(catalog, current_cases, current_case_lock)
+    assert {
+        item_id: {platform: set(entry["case_ids"]) for platform, entry in platforms.items()}
+        for item_id, platforms in lock["exits"].items()
+    } == {
+        item_id: {platform: set(entry["case_ids"]) for platform, entry in platforms.items()}
+        for item_id, platforms in current_expected.items()
+    }
+
+
+def _append_required_case(root: Path, case_id: str, *, family: str) -> dict:
+    import yaml
+
+    acceptance = root / "tests" / "acceptance"
+    cases_path = acceptance / "cases.yaml"
+    cases = yaml.safe_load(cases_path.read_text(encoding="utf-8"))
+    template = next(case for case in cases["cases"] if case["case_id"] == "win-task-logon-trigger")
+    new_case = copy.deepcopy(template)
+    new_case["case_id"] = case_id
+    new_case["title"] = "新增 Windows 原生必要案例"
+    new_case["family"] = family
+    cases["cases"].append(new_case)
+    cases_path.write_text(yaml.safe_dump(cases, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    case_lock_path = acceptance / "cases.lock.json"
+    case_lock = _load(case_lock_path)
+    for set_name in ("cli_1B", "slice_2.1", "slice_2.2", "slice_2.3", "slice_2.4"):
+        case_lock["sets"][set_name].append(case_id)
+        case_lock["sets"][set_name].sort()
+    attr_keys = ("suite", "layer", "platforms", "expected", "necessity", "daemon_slice", "cli_stage", "stage0_required")
+    case_lock["case_attrs"][case_id] = {key: new_case[key] for key in attr_keys}
+    case_lock_path.write_text(json.dumps(case_lock, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    return new_case
+
+
+def test_required_cases_seed_floor_accepts_formal_growth(tmp_path):
+    from tools.stage3 import required_cases
+    import yaml
+
+    root, source_reader = _required_cases_repo(tmp_path)
+    acceptance = root / "tests" / "acceptance"
+    new_case_id = "win-task-logon-trigger-legal-growth-fixture"
+    _append_required_case(root, new_case_id, family="WIN")
+    lock_path = acceptance / "stage3_required_cases.lock.json"
+    lock = _load(lock_path)
+    ids = lock["exits"]["S3-L3-P0P1-REMOTE-WINDOWS"]["windows"]["case_ids"]
+    ids.append(new_case_id)
+    ids.sort()
+    lock_path.write_text(json.dumps(lock, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+    seed_cases = yaml.safe_load((DENOMINATORS / "cases.yaml").read_text(encoding="utf-8"))
+    seed_case_lock = _load(DENOMINATORS / "cases.lock.json")
+    seed_floor = _seed_required_case_ids(seed_cases, seed_case_lock, "L3", "windows", None)
+    seed_floor.discard("lr-mixed")
+    actual = required_cases.required_for_exit(lock, "S3-L3-P0P1-REMOTE-WINDOWS", "windows")
+    assert seed_floor <= actual
+
+    current_cases = yaml.safe_load((acceptance / "cases.yaml").read_text(encoding="utf-8"))
+    current_case_lock = _load(acceptance / "cases.lock.json")
+    expected = required_cases._expected_exit_cases(_load(acceptance / "stage_exits.json"), current_cases, current_case_lock)
+    assert actual == set(expected["S3-L3-P0P1-REMOTE-WINDOWS"]["windows"]["case_ids"])
+    assert required_cases.main(["--check", "--base", "base-revision"], repo_root=root,
+                               source_reader=source_reader) == 0
 
 
 def test_required_cases_lock_matches_its_schema():
@@ -729,6 +806,134 @@ def test_required_cases_lock_registers_new_case(tmp_path):
     assert result == 0
     updated = _load(acceptance / "stage3_required_cases.lock.json")
     assert new_case_id in required_cases.required_for_exit(updated, "S3-L3-P0P1-REMOTE-WINDOWS", "windows")
+
+
+def test_required_cases_l3_new_family_is_required_and_add_only_registers_it(tmp_path):
+    from tools.stage3 import required_cases
+
+    root, source_reader = _required_cases_repo(tmp_path)
+    acceptance = root / "tests" / "acceptance"
+    new_case_id = "win-task-logon-trigger-new-family-fixture"
+    _append_required_case(root, new_case_id, family="F1")
+
+    assert required_cases.main(["--check"], repo_root=root, source_reader=source_reader) != 0
+    assert required_cases.main(["--add-only"], repo_root=root, source_reader=source_reader) == 0
+    updated = _load(acceptance / "stage3_required_cases.lock.json")
+    assert new_case_id in required_cases.required_for_exit(updated, "S3-L3-P0P1-REMOTE-WINDOWS", "windows")
+
+
+def test_required_cases_base_rejects_reclassification_of_existing_l3_case(tmp_path):
+    from tools.stage3 import required_cases
+    import yaml
+
+    root, source_reader = _required_cases_repo(tmp_path)
+    acceptance = root / "tests" / "acceptance"
+    new_case_id = "win-task-logon-trigger-base-family-fixture"
+    _append_required_case(root, new_case_id, family="WIN")
+    assert required_cases.main(["--add-only"], repo_root=root, source_reader=source_reader) == 0
+    base_blobs = {
+        "tests/acceptance/cases.yaml": (acceptance / "cases.yaml").read_bytes(),
+        "tests/acceptance/stage3_required_cases.lock.json":
+            (acceptance / "stage3_required_cases.lock.json").read_bytes(),
+    }
+
+    cases_path = acceptance / "cases.yaml"
+    cases = yaml.safe_load(cases_path.read_text(encoding="utf-8"))
+    target = next(case for case in cases["cases"] if case["case_id"] == new_case_id)
+    target["family"] = "F1"
+    cases_path.write_text(yaml.safe_dump(cases, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    def base_reader(revision: str, repo_path: str) -> bytes | None:
+        if revision == "base-revision" and repo_path in base_blobs:
+            return base_blobs[repo_path]
+        return source_reader(revision, repo_path)
+
+    assert required_cases.main(["--check", "--base", "base-revision"], repo_root=root,
+                               source_reader=base_reader) != 0
+
+
+def test_required_cases_check_rejects_seed_shrink_when_base_has_no_lock(tmp_path, capsys):
+    from tools.stage3 import required_cases
+    import yaml
+
+    root, source_reader = _required_cases_repo(tmp_path)
+    cases_path = root / "tests" / "acceptance" / "cases.yaml"
+    cases = yaml.safe_load(cases_path.read_text(encoding="utf-8"))
+    target = next(case for case in cases["cases"] if case["case_id"] == "win-task-logon-trigger")
+    target["family"] = "F1"
+    cases_path.write_text(yaml.safe_dump(cases, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    lock_path = root / "tests" / "acceptance" / "stage3_required_cases.lock.json"
+    lock = _load(lock_path)
+    ids = lock["exits"]["S3-L3-P0P1-REMOTE-WINDOWS"]["windows"]["case_ids"]
+    ids.remove("win-task-logon-trigger")
+    lock_path.write_text(json.dumps(lock, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+    def no_base_lock(revision: str, repo_path: str) -> bytes | None:
+        if revision == "base-revision" and repo_path == "tests/acceptance/stage3_required_cases.lock.json":
+            return None
+        return source_reader(revision, repo_path)
+
+    assert required_cases.main(["--check", "--base", "base-revision"], repo_root=root,
+                               source_reader=no_base_lock) != 0
+    assert "固定 seed 基準" in capsys.readouterr().err
+
+
+_S3_L1_PLAN_SELECTORS = {
+    "linux": {
+        "argv": ["-q", "tests/contract_blackbox", "-m", "core_portable or posix_only"],
+        "paths": ["tests/contract_blackbox"],
+        "markexpr": "core_portable or posix_only",
+    },
+    "windows": {
+        "argv": ["-q", "tests/contract_blackbox", "-m", "core_portable or windows_native"],
+        "paths": ["tests/contract_blackbox"],
+        "markexpr": "core_portable or windows_native",
+    },
+}
+
+
+def test_s3_release_contract_manifest_matches_frozen_nodeids_and_plan_selector():
+    manifest = _load(EVIDENCE / "l1-collect" / "s3_release_contract" / "source-manifest.json")
+    lock = _load(ACC / "l1_required.lock.json")
+    assert "本 repo 指定 revision 的測試原始碼" in manifest["source_note"]
+    assert "與 L1 鎖等值" in manifest["source_note"]
+    assert "原始輸出不公開" in manifest["source_note"]
+    expected_fields = {
+        "collector", "os", "python", "checkout", "collection_argv", "selector", "return_code", "summary",
+        "raw_sha256", "raw_bytes", "raw_lines", "nodeid_count", "nodeids_sha256",
+    }
+    for platform, selector in _S3_L1_PLAN_SELECTORS.items():
+        frozen = lock["sets"]["s3_release_contract"][platform]
+        entry = manifest["platforms"][platform]
+        assert set(entry) == expected_fields
+        nodeids = frozen["nodeids"]
+        digest_input = ("\n".join(sorted(nodeids)) + "\n").encode("utf-8")
+        assert entry["nodeid_count"] == len(nodeids)
+        assert entry["nodeids_sha256"] == hashlib.sha256(digest_input).hexdigest()
+        assert frozen["selector"] == entry["selector"] == selector
+
+
+def test_s3_release_contract_manifest_has_no_derived_files_or_local_paths():
+    manifest_path = EVIDENCE / "l1-collect" / "s3_release_contract" / "source-manifest.json"
+    manifest = _load(manifest_path)
+    assert not (manifest_path.parent / "linux.collect.json").exists()
+    assert not (manifest_path.parent / "windows.collect.json").exists()
+
+    local_path = re.compile(r"(?i)(?:/(?:home|tmp|mnt|users)/|[a-z]:\\(?:users|temp)\\|\\\\[^\\]+\\)")
+
+    def strings(value):
+        if isinstance(value, str):
+            yield value
+        elif isinstance(value, dict):
+            for key, child in value.items():
+                yield from strings(key)
+                yield from strings(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from strings(child)
+
+    assert not any(key in {"derived_file", "derived_sha256"} for key in strings(manifest))
+    assert not any(local_path.search(value) for value in strings(manifest))
 
 
 def _valid_run_context() -> dict:
