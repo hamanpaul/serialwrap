@@ -8732,6 +8732,15 @@ impl SessionManager {
             }
             let retired_pending = fence.with(|f| f.retired_drains_pending);
             if matches!(state.as_deref(), Some("DETACHED" | "RELEASED")) && !retired_pending {
+                // 這些 actor 不加入 drain／exit 結果；只沖刷仍存活的 Phase 1 waiter。
+                // 後續 GetState 走相同 control lane，作為此控制事件已處理的屏障。
+                let sent = actor
+                    .control
+                    .send_timeout(ControlEvent::ShutdownFlushWaiters, remaining)
+                    .is_ok();
+                if sent {
+                    barriers.push(actor.clone());
+                }
                 continue;
             }
             let (reply, rx) = crossbeam_channel::bounded(1);

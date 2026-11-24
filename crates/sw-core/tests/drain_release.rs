@@ -8,11 +8,11 @@ use crossbeam_channel::bounded;
 use support::*;
 use sw_core::drain::{StopId, WorkerStoppedReceipt};
 use sw_core::login_fsm::{LoginOutcome, LoginPlan};
-use sw_core::mailbox::{ControlEvent, DetachReason, OpenFailure, TimerEvent};
+use sw_core::mailbox::{ControlEvent, DetachReason, MailboxItem, OpenFailure, TimerEvent};
 use sw_core::op_runner::OpOutcome;
-use sw_core::session_core::{Effect, SessionRequest};
+use sw_core::session_core::{Effect, SessionRequest, SessionState};
 use sw_core::tx_writer::{EvidenceGap, OpId, TxLedger, TxOpLedger};
-use sw_pal::traits::{HolderReport, HolderScanStatus, PalError};
+use sw_pal::traits::{Clock, HolderReport, HolderScanStatus, PalError};
 use sw_proto::pyjson::{dumps, PyDict, PyValue, RPC_WIRE};
 
 fn release() -> SessionRequest {
@@ -21,6 +21,8 @@ fn release() -> SessionRequest {
         reason: PyValue::Null,
     }
 }
+
+const SELF_TEST_PROFILE: &str = "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    ready_probe: 'echo __READY__${nonce}'\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: t, act_no: 1, alias: t+1, device_by_id: /s/by-id/usb-A}\n";
 
 fn wp510r_i24_barrier(phase: sw_core::custody::CustodyPhaseSnapshot) -> sw_core::custody::CustodyBarrier {
     sw_core::custody::CustodyBarrier::Pending(sw_core::custody::CustodySnapshot {
@@ -1177,6 +1179,648 @@ fn shutdown_flushes_with_flushed_by_shutdown() {
     h.receipt(epoch, stop).confirmed(running.op_id, 0).feed();
     assert!(rx.try_recv().unwrap().unwrap()["ok"].as_bool().unwrap());
     assert!(h.core.shutdown_complete());
+}
+
+/// i297：SelfTest waiter 在 WorkerStopped 前先由 Shutdown Phase 1 沖刷；actor 仍須等待原 drain 回條。
+#[test]
+fn shutdown_self_test_reply_precedes_worker_receipt() {
+    let mut h = CoreHarness::new(SELF_TEST_PROFILE);
+    h.to_ready();
+    let (self_test, effects) = h.rpc_deferred(SessionRequest::SelfTest {
+        timeout_s: 60.0,
+        strict_human_lock: false,
+    });
+    let grant = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp { grant, .. } => Some(grant.clone()),
+            _ => None,
+        })
+        .expect("self-test 應產生 StartOp");
+
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    h.feed(ControlEvent::Shutdown { reply: shutdown_tx });
+    assert!(
+        h.fence.with(|fence| fence.frozen),
+        "回覆前 Fence 必須已凍結"
+    );
+    assert!(
+        shutdown_rx.try_recv().is_err(),
+        "Shutdown waiter 仍須等 WorkerStopped 回條"
+    );
+    assert!(
+        !h.core.shutdown_complete(),
+        "WorkerStopped 前 actor 不得結束"
+    );
+
+    let result = self_test
+        .try_recv()
+        .expect("Phase 1 必須在 WorkerStopped 前回覆 self-test")
+        .expect("self-test 應收到 RPC dict，而不是 framing EXCEPTION");
+    assert_eq!(result.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(
+        result.get("error_code"),
+        Some(&PyValue::from("FLUSHED_BY_SHUTDOWN"))
+    );
+    assert!(
+        result.get("reason").is_none(),
+        "一般 Shutdown 不得偽稱 handoff_frozen"
+    );
+
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).feed();
+    assert!(shutdown_rx.try_recv().unwrap().unwrap()["ok"]
+        .as_bool()
+        .unwrap());
+    assert!(h.core.shutdown_complete(), "回覆送出後 actor 可於回條收斂");
+    let _ = grant;
+}
+
+#[test]
+fn shutdown_ready_recover_reply_precedes_worker_receipt() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let (recover, effects) = h.rpc_deferred(SessionRequest::Recover {
+        timeout_s: 60.0,
+        force: false,
+    });
+    let grant = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp {
+                grant,
+                spec: sw_core::op_runner::OpSpec::Recover { .. },
+            } => Some(grant.clone()),
+            _ => None,
+        })
+        .expect("READY recover 應產生獨立 Recover op");
+
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    h.feed(ControlEvent::Shutdown { reply: shutdown_tx });
+    assert!(
+        h.fence.with(|fence| fence.frozen),
+        "Shutdown Phase 1 必須先凍結 Fence"
+    );
+    assert!(
+        !h.core.shutdown_complete(),
+        "WorkerStopped 前 actor 尚未結束"
+    );
+    let result = recover
+        .try_recv()
+        .expect("Phase 1 必須在 WorkerStopped 前回覆 READY recover")
+        .expect("recover 應收到 RPC dict，而不是 framing EXCEPTION");
+    assert_eq!(result.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(
+        result.get("error_code"),
+        Some(&PyValue::from("FLUSHED_BY_SHUTDOWN"))
+    );
+
+    // safety lane 的 WorkerStopped 先於 control lane 的 OpFinished；recover RPC 已由 Phase 1 結清。
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).feed();
+    assert!(shutdown_rx.try_recv().unwrap().unwrap()["ok"]
+        .as_bool()
+        .unwrap());
+    assert!(h.core.shutdown_complete());
+    let late = h.feed(ControlEvent::OpFinished {
+        op_id: grant.op_id,
+        epoch: grant.epoch,
+        outcome: OpOutcome::PromptTimeout {
+            stdout: String::new(),
+        },
+        after_rx_seq: None,
+    });
+    assert!(late.is_empty(), "晚到 recover 結果不得再 clear 或回覆");
+    assert!(recover.try_recv().is_err(), "recover 只能回覆一次");
+}
+
+#[test]
+fn shutdown_interactive_open_reply_precedes_worker_receipt() {
+    use sw_core::op_runner::OpSpec;
+
+    let mut h = CoreHarness::new(SELF_TEST_PROFILE);
+    h.to_ready();
+    let (interactive, effects) = h.rpc_deferred(SessionRequest::InteractiveOpen {
+        owner: "agent:i297-open".into(),
+        timeout_s: 60.0,
+        command: "echo __I297_OPEN__".into(),
+        allow_attached: false,
+    });
+    let grant = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp {
+                grant,
+                spec: OpSpec::InteractiveOpenCmd { .. },
+            } => Some(grant.clone()),
+            _ => None,
+        })
+        .expect("interactive open 的非空 command 應建立 pending op");
+    assert!(interactive.try_recv().is_err(), "open 要等 TX 結果");
+    assert!(h.core.active_lease().is_some(), "pending open 已先建立 lease");
+    let tx_before_shutdown = h.tx_effect_count();
+
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    h.feed(ControlEvent::Shutdown { reply: shutdown_tx });
+    assert!(h.fence.with(|fence| fence.frozen), "Phase 1 必須先凍結 Fence");
+    assert_eq!(h.tx_effect_count(), tx_before_shutdown, "Fence 凍結後不可新增 TX");
+    assert!(!h.core.shutdown_complete(), "WorkerStopped 前 actor 不得結束");
+    assert!(shutdown_rx.try_recv().is_err(), "Shutdown waiter 仍須等待 worker 回條");
+    let result = interactive
+        .try_recv()
+        .expect("Phase 1 必須在 WorkerStopped 前回覆 interactive open")
+        .expect("open 應收到 RPC dict，而不是 framing EXCEPTION");
+    assert_eq!(
+        h.wire(&result),
+        r#"{"ok":false,"error_code":"FLUSHED_BY_SHUTDOWN"}"#
+    );
+    assert!(!h.core.shutdown_complete(), "回覆送出後仍須等 worker 回條");
+    assert!(h.core.active_lease().is_none(), "Phase 1 清除 open 建立的 lease");
+
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).feed();
+    assert!(shutdown_rx.try_recv().unwrap().unwrap()["ok"]
+        .as_bool()
+        .unwrap());
+    assert!(h.core.shutdown_complete(), "回條後 actor 可結束");
+
+    let late = h.feed(ControlEvent::OpFinished {
+        op_id: grant.op_id,
+        epoch: grant.epoch,
+        outcome: OpOutcome::Sent { bytes: 18 },
+        after_rx_seq: None,
+    });
+    assert!(late.is_empty(), "晚到 open 成功不得再回覆或重建 lease");
+    assert!(interactive.try_recv().is_err(), "open 只能回覆一次");
+    assert!(h.core.active_lease().is_none(), "晚到 open 不得重建 lease");
+}
+
+#[test]
+fn shutdown_interactive_send_reply_precedes_worker_receipt() {
+    use sw_core::op_runner::OpSpec;
+
+    let mut h = CoreHarness::new(SELF_TEST_PROFILE);
+    h.to_ready();
+    let opened = h
+        .rpc(SessionRequest::InteractiveOpen {
+            owner: "agent:i297-send".into(),
+            timeout_s: 60.0,
+            command: String::new(),
+            allow_attached: false,
+        })
+        .expect("interactive open 應同步建立有效 lease");
+    assert_eq!(opened.get("ok"), Some(&PyValue::Bool(true)));
+    let interactive_id = h
+        .core
+        .active_lease()
+        .expect("send 前應有有效 lease")
+        .interactive_id
+        .clone();
+    let (interactive, effects) = h.rpc_deferred(SessionRequest::InteractiveSend {
+        interactive_id,
+        data: "payload".into(),
+        encoding: "plain".into(),
+    });
+    let grant = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp {
+                grant,
+                spec: OpSpec::InteractiveSend { .. },
+            } => Some(grant.clone()),
+            _ => None,
+        })
+        .expect("send 應建立 pending op");
+    assert!(interactive.try_recv().is_err(), "send 要等 TX 結果");
+    let tx_before_shutdown = h.tx_effect_count();
+
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    h.feed(ControlEvent::Shutdown { reply: shutdown_tx });
+    assert!(h.fence.with(|fence| fence.frozen), "Phase 1 必須先凍結 Fence");
+    assert_eq!(h.tx_effect_count(), tx_before_shutdown, "Fence 凍結後不可新增 TX");
+    assert!(!h.core.shutdown_complete(), "WorkerStopped 前 actor 不得結束");
+    assert!(shutdown_rx.try_recv().is_err(), "Shutdown waiter 仍須等待 worker 回條");
+    let result = interactive
+        .try_recv()
+        .expect("Phase 1 必須在 WorkerStopped 前回覆 interactive send")
+        .expect("send 應收到 RPC dict，而不是 framing EXCEPTION");
+    assert_eq!(
+        h.wire(&result),
+        r#"{"ok":false,"error_code":"FLUSHED_BY_SHUTDOWN"}"#
+    );
+    assert!(!h.core.shutdown_complete(), "回覆送出後仍須等 worker 回條");
+    assert!(h.core.active_lease().is_none(), "Phase 1 清除 send 使用的 lease");
+
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).feed();
+    assert!(shutdown_rx.try_recv().unwrap().unwrap()["ok"]
+        .as_bool()
+        .unwrap());
+    assert!(h.core.shutdown_complete(), "回條後 actor 可結束");
+
+    let late = h.feed(ControlEvent::OpFinished {
+        op_id: grant.op_id,
+        epoch: grant.epoch,
+        outcome: OpOutcome::Sent { bytes: 7 },
+        after_rx_seq: None,
+    });
+    assert!(late.is_empty(), "晚到 send 成功不得再回覆或 touch lease");
+    assert!(interactive.try_recv().is_err(), "send 只能回覆一次");
+    assert!(h.core.active_lease().is_none(), "晚到 send 不得重建 lease");
+}
+
+#[test]
+fn shutdown_interactive_late_completion_does_not_restore_lease() {
+    use sw_core::op_runner::OpSpec;
+
+    let mut h = CoreHarness::new(SELF_TEST_PROFILE);
+    h.to_ready();
+    h.rpc(SessionRequest::InteractiveOpen {
+        owner: "agent:i297-late".into(),
+        timeout_s: 60.0,
+        command: String::new(),
+        allow_attached: false,
+    })
+    .expect("interactive open 應同步建立有效 lease");
+    let lease = h.core.active_lease().expect("send 前應有有效 lease");
+    let interactive_id = lease.interactive_id.clone();
+    let activity_before_send = lease.last_activity;
+    let (interactive, effects) = h.rpc_deferred(SessionRequest::InteractiveSend {
+        interactive_id,
+        data: "late".into(),
+        encoding: "plain".into(),
+    });
+    let grant = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp {
+                grant,
+                spec: OpSpec::InteractiveSend { .. },
+            } => Some(grant.clone()),
+            _ => None,
+        })
+        .expect("send 應建立 pending op");
+    assert!(interactive.try_recv().is_err());
+    let tx_before_shutdown = h.tx_effect_count();
+
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    h.feed(ControlEvent::Shutdown { reply: shutdown_tx });
+    assert!(h.fence.with(|fence| fence.frozen), "Phase 1 必須先凍結 Fence");
+    assert_eq!(h.tx_effect_count(), tx_before_shutdown, "Fence 凍結後不可新增 TX");
+    let result = interactive
+        .try_recv()
+        .expect("Phase 1 必須在回條前沖刷 send")
+        .expect("send 應收到 RPC dict");
+    assert_eq!(
+        h.wire(&result),
+        r#"{"ok":false,"error_code":"FLUSHED_BY_SHUTDOWN"}"#
+    );
+    assert!(h.core.active_lease().is_none(), "Phase 1 既有清理已移除 lease");
+    assert_eq!(activity_before_send, h.clock.mono_ns());
+
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).feed();
+    assert!(shutdown_rx.try_recv().unwrap().unwrap()["ok"]
+        .as_bool()
+        .unwrap());
+    h.clock.advance(Duration::from_secs(5));
+    let lease_ops_before_late = h.lease_index_ops();
+    let late = h.feed(ControlEvent::OpFinished {
+        op_id: grant.op_id,
+        epoch: grant.epoch,
+        outcome: OpOutcome::Sent { bytes: 4 },
+        after_rx_seq: None,
+    });
+    assert!(late.is_empty(), "晚到成功只可忽略，不得再產生副作用");
+    assert!(interactive.try_recv().is_err(), "Phase 1 已唯一回覆 send");
+    assert!(h.core.active_lease().is_none(), "晚到成功不得重建或 touch lease");
+    assert_eq!(h.lease_index_ops(), lease_ops_before_late, "晚到成功不得重插 lease 索引");
+    assert!(h.core.shutdown_complete());
+}
+
+#[test]
+fn shutdown_force_recover_waiter_is_flushed() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_attached(Some("READY_NONCE_TIMEOUT"));
+    let (recover, effects) = h.rpc_deferred(SessionRequest::Recover {
+        timeout_s: 60.0,
+        force: true,
+    });
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::BeginDrain { .. })),
+        "ATTACHED force recover 應先 clear drain"
+    );
+    let (clear_epoch, clear_stop) = h.pending_stop();
+    h.receipt(clear_epoch, clear_stop).feed();
+    assert!(recover.try_recv().is_err(), "force recover 等待 READY 輪詢");
+
+    // 先讓第一個 ForceRecoverPoll 發生並排下一個 timer，再於輪詢等待中停機。
+    let first_poll = h.advance(Duration::from_secs(1));
+    assert!(
+        first_poll.iter().all(|effect| !matches!(
+            effect,
+            Effect::BeginDrain { .. } | Effect::StartLogin { .. } | Effect::OpenBridge { .. }
+        )),
+        "force timer 輪詢不得重開或重新 clear"
+    );
+    assert!(
+        recover.try_recv().is_err(),
+        "force timer 未達上限前仍在等待"
+    );
+
+    let (shutdown_tx, _shutdown_rx) = bounded(1);
+    h.feed(ControlEvent::Shutdown { reply: shutdown_tx });
+    let result = recover
+        .try_recv()
+        .expect("Shutdown Phase 1 必須取走 force_recover waiter")
+        .expect("force recover 應收到 RPC dict");
+    assert_eq!(result.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(
+        result.get("error_code"),
+        Some(&PyValue::from("FLUSHED_BY_SHUTDOWN"))
+    );
+
+    let late_poll = h.advance(Duration::from_secs(1));
+    assert!(
+        late_poll.iter().all(|effect| !matches!(
+            effect,
+            Effect::BeginDrain { .. } | Effect::StartLogin { .. } | Effect::OpenBridge { .. }
+        )),
+        "被沖刷的 force timer 不得重新 clear／attach"
+    );
+    assert!(recover.try_recv().is_err(), "晚到 force timer 不得重複回覆");
+}
+
+#[test]
+fn shutdown_reprobe_recover_waiter_is_flushed() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_attached(Some("READY_NONCE_TIMEOUT"));
+    let (attach, attach_effects) = h.rpc_deferred(SessionRequest::SessionAttach);
+    let (login_epoch, login_fsm_gen) = attach_effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartLogin { epoch, fsm_gen, .. } => Some((*epoch, *fsm_gen)),
+            _ => None,
+        })
+        .expect("attach 應啟動 reprobe login run");
+    let (recover, recover_effects) = h.rpc_deferred(SessionRequest::Recover {
+        timeout_s: 60.0,
+        force: false,
+    });
+    assert!(
+        recover_effects.is_empty(),
+        "recover 應加入現有 reprobe waiter"
+    );
+
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    h.feed(ControlEvent::Shutdown { reply: shutdown_tx });
+    let recover_result = recover
+        .try_recv()
+        .expect("Shutdown Phase 1 必須取走 ReprobeWaiter::Recover")
+        .expect("recover 應收到 RPC dict");
+    assert_eq!(recover_result.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(
+        recover_result.get("error_code"),
+        Some(&PyValue::from("FLUSHED_BY_SHUTDOWN"))
+    );
+    let attach_result = attach
+        .try_recv()
+        .expect("Attach waiter 應保留既有 drain 回覆")
+        .expect("attach 應收到 RPC dict");
+    assert_eq!(
+        attach_result.get("error_code"),
+        Some(&PyValue::from("SESSION_RECOVERING"))
+    );
+    assert!(
+        !h.core.shutdown_complete(),
+        "WorkerStopped 前 actor 尚未結束"
+    );
+
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).feed();
+    assert!(shutdown_rx.try_recv().unwrap().unwrap()["ok"]
+        .as_bool()
+        .unwrap());
+    let late = h.feed(ControlEvent::LoginFinished {
+        epoch: login_epoch,
+        fsm_gen: login_fsm_gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    assert!(late.is_empty(), "晚到 reprobe 不得重新 attach");
+    assert_ne!(h.core.state(), SessionState::Ready);
+    assert!(recover.try_recv().is_err(), "reprobe recover 只能回覆一次");
+}
+
+#[test]
+fn shutdown_self_test_late_op_finished_is_ignored() {
+    use sw_proto::pydict;
+
+    let mut h = CoreHarness::new(SELF_TEST_PROFILE);
+    h.to_ready();
+    let (self_test, effects) = h.rpc_deferred(SessionRequest::SelfTest {
+        timeout_s: 60.0,
+        strict_human_lock: false,
+    });
+    let grant = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp { grant, .. } => Some(grant.clone()),
+            _ => None,
+        })
+        .expect("self-test 應產生 StartOp");
+
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    h.feed(ControlEvent::Shutdown { reply: shutdown_tx });
+    let late_effects = h.feed(ControlEvent::OpFinished {
+        op_id: grant.op_id,
+        epoch: grant.epoch,
+        outcome: OpOutcome::SelfTest(pydict! {
+            "probe_ok" => true,
+            "rx_bytes_last_10s" => 0,
+        }),
+        after_rx_seq: None,
+    });
+    assert!(late_effects.is_empty(), "晚到成功結果不得套用 op 副作用");
+    assert_ne!(h.core.state(), SessionState::Ready);
+    let result = self_test
+        .try_recv()
+        .expect("Phase 1 必須在 WorkerStopped 前送出 RPC 回覆")
+        .expect("回覆為 dict");
+    assert_eq!(result.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(
+        result.get("error_code"),
+        Some(&PyValue::from("FLUSHED_BY_SHUTDOWN"))
+    );
+
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).feed();
+    assert!(self_test.try_recv().is_err(), "晚到結果不得再次回覆 RPC");
+    assert!(shutdown_rx.try_recv().unwrap().unwrap()["ok"]
+        .as_bool()
+        .unwrap());
+    assert_ne!(h.core.state(), SessionState::Ready);
+    assert!(h.core.shutdown_complete());
+}
+
+#[test]
+fn shutdown_after_completed_release_drain_flushes_self_test() {
+    use sw_proto::pydict;
+
+    let mut h = CoreHarness::new(SELF_TEST_PROFILE);
+    h.to_ready();
+    let (self_test, effects) = h.rpc_deferred(SessionRequest::SelfTest {
+        timeout_s: 60.0,
+        strict_human_lock: false,
+    });
+    let grant = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp { grant, .. } => Some(grant.clone()),
+            _ => None,
+        })
+        .expect("self-test 應產生 StartOp");
+
+    let release = h.rpc_deferred(release()).0;
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).feed();
+    assert!(release.try_recv().unwrap().unwrap()["ok"]
+        .as_bool()
+        .unwrap());
+    assert_eq!(h.core.state(), SessionState::Released);
+    assert!(self_test.try_recv().is_err(), "Release 不應改變 self-test 行為");
+
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    let effects = h.core.on_event(
+        MailboxItem::Control(ControlEvent::Shutdown { reply: shutdown_tx }),
+        h.clock.mono_ns(),
+    );
+    assert!(h.fence.with(|fence| fence.frozen), "Shutdown 回覆前 Fence 必須凍結");
+    let mut replies = effects.0.into_iter().filter_map(|effect| match effect {
+        Effect::Reply(reply, result) => Some((reply, result)),
+        _ => None,
+    });
+    let (reply, result) = replies.next().expect("Phase 1 先產生 self-test 回覆");
+    let _ = reply.try_send(result);
+    let result = self_test
+        .try_recv()
+        .expect("既有 Release drain 完成後，Shutdown 仍須回覆 self-test")
+        .expect("self-test 應收到 RPC dict");
+    assert_eq!(result.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(
+        result.get("error_code"),
+        Some(&PyValue::from("FLUSHED_BY_SHUTDOWN"))
+    );
+    assert!(shutdown_rx.try_recv().is_err(), "Shutdown waiter 須排在 self-test 回覆之後");
+    let (reply, result) = replies.next().expect("無 worker Shutdown 接著回覆 waiter");
+    let _ = reply.try_send(result);
+    assert!(shutdown_rx.try_recv().unwrap().unwrap()["ok"]
+        .as_bool()
+        .unwrap());
+    assert!(replies.next().is_none(), "不應產生多餘回覆");
+    assert!(h.core.shutdown_complete(), "無 worker 的 Shutdown 應可立即完成");
+
+    let late_effects = h.feed(ControlEvent::OpFinished {
+        op_id: grant.op_id,
+        epoch: grant.epoch,
+        outcome: OpOutcome::SelfTest(pydict! {
+            "probe_ok" => true,
+            "rx_bytes_last_10s" => 0,
+        }),
+        after_rx_seq: None,
+    });
+    assert!(late_effects.is_empty(), "晚到成功結果不得產生副作用");
+    assert_ne!(h.core.state(), SessionState::Ready);
+    assert!(self_test.try_recv().is_err(), "self-test 只可回覆一次");
+}
+
+/// Release drain 尚未收到 WorkerStopped 時，Shutdown 仍須先沖刷在途 self-test；晚到 OpFinished 不得再回覆或改狀態。
+#[test]
+fn shutdown_arriving_before_release_receipt_flushes_self_test() {
+    use sw_proto::pydict;
+
+    let mut h = CoreHarness::new(SELF_TEST_PROFILE);
+    h.to_ready();
+    let (self_test, effects) = h.rpc_deferred(SessionRequest::SelfTest {
+        timeout_s: 60.0,
+        strict_human_lock: false,
+    });
+    let grant = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp { grant, .. } => Some(grant.clone()),
+            _ => None,
+        })
+        .expect("self-test 應產生 StartOp");
+
+    let (release, _) = h.rpc_deferred(release());
+    assert!(h.core.drain_in_progress(), "Release drain 應仍在途");
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    h.feed(ControlEvent::Shutdown { reply: shutdown_tx });
+
+    let result = self_test
+        .try_recv()
+        .expect("WorkerStopped 前應收到 self-test 回覆")
+        .expect("self-test 應收到 RPC dict");
+    assert_eq!(result.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(
+        result.get("error_code"),
+        Some(&PyValue::from("FLUSHED_BY_SHUTDOWN"))
+    );
+    assert!(release.try_recv().is_err(), "Release waiter 仍須等 WorkerStopped");
+    assert!(shutdown_rx.try_recv().is_err(), "Shutdown waiter 仍須等 WorkerStopped");
+    assert!(!h.core.shutdown_complete(), "WorkerStopped 前 actor 不得結束");
+
+    let late = h.feed(ControlEvent::OpFinished {
+        op_id: grant.op_id,
+        epoch: grant.epoch,
+        outcome: OpOutcome::SelfTest(pydict! {
+            "probe_ok" => true,
+            "rx_bytes_last_10s" => 0,
+        }),
+        after_rx_seq: None,
+    });
+    assert!(late.is_empty(), "晚到 self-test 不得產生副作用");
+    assert!(self_test.try_recv().is_err(), "self-test 只能回覆一次");
+    assert_ne!(h.core.state(), SessionState::Ready);
+}
+
+/// force recover 的 Clear drain 尚未收到 WorkerStopped 時，Shutdown 須沖刷 Recover waiter 並忽略晚到輪詢。
+#[test]
+fn shutdown_arriving_before_clear_receipt_flushes_force_recover() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_attached(Some("READY_NONCE_TIMEOUT"));
+    let (recover, effects) = h.rpc_deferred(SessionRequest::Recover {
+        timeout_s: 60.0,
+        force: true,
+    });
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::BeginDrain { .. })),
+        "force recover 應發起 Clear drain"
+    );
+    assert!(h.core.drain_in_progress(), "Clear drain 應仍在途");
+
+    let (shutdown_tx, shutdown_rx) = bounded(1);
+    h.feed(ControlEvent::Shutdown { reply: shutdown_tx });
+    let result = recover
+        .try_recv()
+        .expect("WorkerStopped 前應收到 force recover 回覆")
+        .expect("force recover 應收到 RPC dict");
+    assert_eq!(result.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(
+        result.get("error_code"),
+        Some(&PyValue::from("FLUSHED_BY_SHUTDOWN"))
+    );
+    assert!(shutdown_rx.try_recv().is_err(), "Shutdown waiter 仍須等 WorkerStopped");
+    assert!(!h.core.shutdown_complete(), "WorkerStopped 前 actor 不得結束");
+
+    let late = h.feed(ControlEvent::Timer(TimerEvent::ForceRecoverPoll { id: 1, n: 1 }));
+    assert!(late.is_empty(), "已沖刷的 force-recover 輪詢不得產生副作用");
+    assert!(recover.try_recv().is_err(), "force recover 只能回覆一次");
 }
 
 /// CI 293（`shutdown_order::long_file_push_does_not_block_stop` 偶發 `EXCEPTION: session actor stopped`）的交錯：

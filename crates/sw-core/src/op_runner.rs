@@ -29,7 +29,7 @@ use crate::mailbox::ControlEvent;
 use crate::quiet_gate::is_reboot_command;
 use crate::session_core::OpGrant;
 use crate::tx_writer::{FenceReject, TxClass, TxJob, TxPermit, TxReport, TxWriterHandle};
-use crate::uart_bridge::{RunCancel, RxShared};
+use crate::uart_bridge::{RunCancel, RxShared, WaitOutcome};
 use crate::wal::{WalAppendReq, WalWriter};
 
 /// 前景 op 的種類（`Effect::StartOp` 內容）。
@@ -395,6 +395,7 @@ fn execute(ctx: &OpCtx, grant: &OpGrant, spec: OpSpec) -> OpOutcome {
                 pre_offset,
                 t.platform == "passthrough",
                 None,
+                true,
             )
         }
         OpSpec::SelfTestProbe {
@@ -788,6 +789,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
             pre_offset,
             passthrough,
             Some((cmd_id, confirmed_of(&report))),
+            false,
         );
     }
     let raw = ctx.rx.text_from(pre_offset);
@@ -893,6 +895,7 @@ fn recover_after_failure(
     pre_offset: u64,
     passthrough: bool,
     aborted: Option<(&str, usize)>,
+    shutdown_cancellable: bool,
 ) -> OpOutcome {
     if passthrough {
         return OpOutcome::PromptTimeout {
@@ -953,7 +956,25 @@ fn recover_after_failure(
                 }
             }
         }
-        if wait_regex_from(ctx, &prompt_re, offset, timeout_s.min(2.0)) {
+        let matched = if shutdown_cancellable {
+            match ctx.rx.wait_for_regex_from_shutdown_cancellable(
+                &prompt_re,
+                offset,
+                secs(timeout_s.min(2.0)),
+                &*ctx.clock,
+            ) {
+                WaitOutcome::Matched => true,
+                WaitOutcome::TimedOut => false,
+                WaitOutcome::Cancelled => {
+                    return OpOutcome::CommandResult(
+                        pydict! { "ok" => false, "error_code" => "FLUSHED_BY_SHUTDOWN" },
+                    );
+                }
+            }
+        } else {
+            wait_regex_from(ctx, &prompt_re, offset, timeout_s.min(2.0))
+        };
+        if matched {
             let raw = ctx.rx.text_from(pre_offset);
             let stdout = extract_command_stdout(&raw, command, &prompt_re, None);
             return OpOutcome::Recovered { key: name, stdout };
@@ -997,15 +1018,34 @@ fn run_self_test_probe(
         }
     }
     let nonce_re = compile_or_never(nonce);
-    if !wait_regex_from(ctx, &nonce_re, offset, timeout_s) {
-        let (flood, _) = ctx.rx.rx_stats(ctx.clock.mono_ns());
-        return OpOutcome::SelfTest(pydict! {
-            "probe_ok" => false,
-            "rx_bytes_last_10s" => py_int(flood as i128),
-        });
+    match ctx.rx.wait_for_regex_from_shutdown_cancellable(
+        &nonce_re,
+        offset,
+        secs(timeout_s),
+        &*ctx.clock,
+    ) {
+        WaitOutcome::Matched => {}
+        WaitOutcome::TimedOut => {
+            let (flood, _) = ctx.rx.rx_stats(ctx.clock.mono_ns());
+            return OpOutcome::SelfTest(pydict! {
+                "probe_ok" => false,
+                "rx_bytes_last_10s" => py_int(flood as i128),
+            });
+        }
+        WaitOutcome::Cancelled => {
+            return OpOutcome::SelfTestRefused(FenceReject::Cancelled);
+        }
     }
     let prompt_re = compile_or_never(&ctx.profile.template.prompt_regex);
-    let _ = wait_regex_from(ctx, &prompt_re, offset, timeout_s);
+    if ctx.rx.wait_for_regex_from_shutdown_cancellable(
+        &prompt_re,
+        offset,
+        secs(timeout_s),
+        &*ctx.clock,
+    ) == WaitOutcome::Cancelled
+    {
+        return OpOutcome::SelfTestRefused(FenceReject::Cancelled);
+    }
     OpOutcome::SelfTest(pydict! { "probe_ok" => true })
 }
 
