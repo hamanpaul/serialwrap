@@ -538,6 +538,11 @@ def fake_driver(tmp_path, monkeypatch):
         driver._driver_module = drv
         driver.proc_root = fake.proc
         driver.stop_wait_s = stop_wait_s
+        test_home = tmp_path / "test-home"
+        legacy_python = test_home / ".local" / "share" / "pipx" / "venvs" / "serialwrap" / "bin" / "python"
+        legacy_python.parent.mkdir(parents=True)
+        legacy_python.symlink_to(sys.executable)
+        driver.env["HOME"] = str(test_home)
 
         target_asset = (tmp_path / "bundle" / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles"
                         / "default.yaml")
@@ -1283,10 +1288,9 @@ def test_doctor_profile_expectation_policy_p290_phases():
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
-def test_profile_template_field_scanner_ignores_multiline_quoted_value(tmp_path):
+def test_profile_template_field_scanner_ignores_multiline_quoted_value(fake_driver):
     """YAML 多行 scalar 內的欄位文字不可被當成 prpl-template 的實際 key。"""
-    import yaml
-
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
     text = (
         'profiles:\n'
         '  prpl-template:\n'
@@ -1295,38 +1299,45 @@ def test_profile_template_field_scanner_ignores_multiline_quoted_value(tmp_path)
         '    timeout_recovery_keys: [CTRL_C]\n'
         '    prompt ends"\n'
     )
-    parsed = yaml.safe_load(text)
-    assert "timeout_recovery_keys" not in parsed["profiles"]["prpl-template"]
-    path = tmp_path / "default.yaml"
-    path.write_text(text, encoding="utf-8")
+    target = driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
+    live = driver.doctor_profile_dir / "default.yaml"
+    target.write_text(text, encoding="utf-8")
+    live.write_text(text, encoding="utf-8")
 
-    found, error = uc._profile_template_has_field(
-        path, template="prpl-template", platform="prpl", field="timeout_recovery_keys",
+    result = driver.judge_doctor(
+        "doctor_green_new", "多行 quoted scalar 反例", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
     )
-    assert found is False, (found, error)
+    migration = result["detail"]["p290_profile_migration"]
+    assert result["verdict"] == "FAIL", result
+    assert migration["detail"]["target_asset_has_field"] is False, migration
+    assert migration["detail"]["live_profile_has_field"] is False, migration
 
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
-def test_profile_template_field_scanner_accepts_quoted_mapping_key(tmp_path):
+def test_profile_template_field_scanner_accepts_quoted_mapping_key(fake_driver):
     """YAML quoted key 仍是 template 的實際頂層欄位。"""
-    import yaml
-
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
     text = (
         "profiles:\n"
         "  prpl-template:\n"
         "    platform: prpl\n"
         '    "timeout_recovery_keys": [CTRL_C]\n'
     )
-    parsed = yaml.safe_load(text)
-    assert parsed["profiles"]["prpl-template"]["timeout_recovery_keys"] == ["CTRL_C"]
-    path = tmp_path / "default.yaml"
-    path.write_text(text, encoding="utf-8")
+    target = driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
+    live = driver.doctor_profile_dir / "default.yaml"
+    target.write_text(text, encoding="utf-8")
+    live.write_text(text, encoding="utf-8")
 
-    found, error = uc._profile_template_has_field(
-        path, template="prpl-template", platform="prpl", field="timeout_recovery_keys",
+    result = driver.judge_doctor(
+        "doctor_green_new", "quoted key 反例", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
     )
-    assert found is True, error
+    migration = result["detail"]["p290_profile_migration"]
+    assert result["verdict"] == "PASS", result
+    assert migration["detail"]["target_asset_has_field"] is True, migration
+    assert migration["detail"]["live_profile_has_field"] is True, migration
 
 
 @pytest.mark.core_portable
@@ -1380,7 +1391,7 @@ def test_upgrade_rejects_candidate_cli_without_embedded_p290_asset(fake_driver, 
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
-def test_upgrade_rejects_nested_flow_sequence_as_candidate_profile_field(fake_driver, monkeypatch):
+def test_upgrade_rejects_nested_flow_sequence_as_candidate_profile_field(fake_driver):
     """候選 YAML 的巢狀 flow key 不得掩蓋候選 CLI 與 live profile 的版本差異。"""
     driver, _fake = fake_driver(cli_version=NEW_VERSION)
     target = driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
@@ -1414,6 +1425,11 @@ def test_upgrade_rejects_nested_flow_sequence_as_candidate_profile_field(fake_dr
     assert migration["verdict"] == "FAIL", migration
     assert migration["detail"]["target_asset_has_field"] is False, migration
     assert migration["detail"]["live_profile_has_field"] is True, migration
+    yaml_evidence = migration["detail"]["target_asset_yaml"]
+    assert yaml_evidence["interpreter_path"] == str(
+        Path(driver.env["HOME"]) / ".local" / "share" / "pipx" / "venvs" / "serialwrap" / "bin" / "python"
+    ), yaml_evidence
+    assert yaml_evidence["pyyaml_version"], yaml_evidence
 
 
 @pytest.mark.core_portable
@@ -1469,6 +1485,107 @@ def test_candidate_cli_path_mismatch_returns_structured_fail(fake_driver, tmp_pa
     assert result["verdict"] == "FAIL", result
     assert result["id"] == "candidate_cli_p290_asset", result
     assert result["detail"]["configured_cli_path"] == str(configured_cli.resolve()), result
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_upgrade_prefers_candidate_runtime_for_profile_yaml_probe(fake_driver):
+    """候選 bundle runtime 有 PyYAML 時，profile gate 應使用並記錄該直譯器。"""
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    candidate_python = driver.bundle / "versions" / NEW_VERSION / "py" / "bin" / "python3"
+    candidate_python.parent.mkdir(parents=True)
+    candidate_python.symlink_to(sys.executable)
+
+    result = driver.judge_doctor(
+        "doctor_green_new", "候選 runtime YAML 解析", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+
+    migration = result["detail"]["p290_profile_migration"]
+    yaml_evidence = migration["detail"]["target_asset_yaml"]
+    assert result["verdict"] == "PASS", result
+    assert yaml_evidence["interpreter_path"] == str(candidate_python), yaml_evidence
+    assert yaml_evidence["pyyaml_version"], yaml_evidence
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_upgrade_falls_back_when_candidate_runtime_lacks_pyyaml(fake_driver):
+    """候選 runtime 缺 PyYAML 時改用舊版 venv，並記錄兩次解析器選擇。"""
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    candidate_python = driver.bundle / "versions" / NEW_VERSION / "py" / "bin" / "python3"
+    candidate_python.parent.mkdir(parents=True)
+    candidate_python.write_text("#!/bin/sh\nexec /usr/bin/python3 -S \"$@\"\n", encoding="utf-8")
+    candidate_python.chmod(0o755)
+
+    result = driver.judge_doctor(
+        "doctor_green_new", "候選 runtime 缺 PyYAML 時回退", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+
+    migration = result["detail"]["p290_profile_migration"]
+    yaml_evidence = migration["detail"]["target_asset_yaml"]
+    fallback_python = (Path(driver.env["HOME"]) / ".local" / "share" / "pipx" / "venvs"
+                       / "serialwrap" / "bin" / "python")
+    assert result["verdict"] == "PASS", result
+    assert yaml_evidence["interpreter_path"] == str(fallback_python), yaml_evidence
+    assert yaml_evidence["pyyaml_version"], yaml_evidence
+    assert yaml_evidence["parser_attempts"][0]["status"] == "missing_pyyaml", yaml_evidence
+    assert yaml_evidence["parser_attempts"][1]["status"] == "ok", yaml_evidence
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_profile_yaml_probe_fails_closed_on_invalid_input_or_missing_parser(fake_driver):
+    """YAML 解析錯誤、非 mapping、template 不存在及缺解析器都必須回結構化 FAIL。"""
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    target = driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
+    live = driver.doctor_profile_dir / "default.yaml"
+    live.write_text(
+        "profiles:\n"
+        "  prpl-template:\n"
+        "    platform: prpl\n"
+        "    timeout_recovery_keys: [CTRL_C]\n",
+        encoding="utf-8",
+    )
+    invalid_profiles = (
+        "profiles: [unterminated\n",
+        "- not-a-mapping\n",
+        "profiles: {}\n",
+        "profiles:\n  prpl-template: []\n",
+    )
+    for text in invalid_profiles:
+        target.write_text(text, encoding="utf-8")
+        result = driver.judge_doctor(
+            "doctor_green_new", "YAML 解析失敗關閉", require_pairing=True,
+            profile_policy=driver.profile_policies["new"],
+        )
+        migration = result["detail"]["p290_profile_migration"]
+        assert result["verdict"] == "FAIL", result
+        assert result["detail"]["candidate_cli_p290_asset"]["verdict"] == "PASS", result
+        assert migration["verdict"] == "FAIL", migration
+        assert migration["detail"]["target_asset_has_field"] is False, migration
+        assert migration["detail"]["target_asset_yaml"]["pyyaml_version"], migration
+
+    legacy_python = (Path(driver.env["HOME"]) / ".local" / "share" / "pipx" / "venvs"
+                     / "serialwrap" / "bin" / "python")
+    legacy_python.unlink()
+    target.write_text(
+        "profiles:\n"
+        "  prpl-template:\n"
+        "    platform: prpl\n"
+        "    timeout_recovery_keys: [CTRL_C]\n",
+        encoding="utf-8",
+    )
+    result = driver.judge_doctor(
+        "doctor_green_new", "缺少 YAML 解析器", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+    migration = result["detail"]["p290_profile_migration"]
+    assert result["verdict"] == "FAIL", result
+    assert migration["verdict"] == "FAIL", migration
+    assert migration["detail"]["target_asset_has_field"] is False, migration
+    assert migration["detail"]["target_asset_yaml"]["interpreter_path"] is None, migration
 
 
 @pytest.mark.core_portable

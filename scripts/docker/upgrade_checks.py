@@ -1,6 +1,6 @@
 """OD-33 R2(b)：0.3.2 → 新版（driver 的 NEW_VERSION）升級驗證的判定純函式（容器內 driver 與 pytest 共用）。
 
-只用標準函式庫：容器內 driver 以系統 python3 執行，不依賴 repo 套件。
+driver 僅依賴標準函式庫並以系統 python3 執行；profile YAML 解析由 subprocess 呼叫 bundle 或舊版 venv 的 PyYAML。
 每個檢查列為 {"id", "verdict": PASS|FAIL|INSUFFICIENT, "reason", "detail"}；整體 verdict 規則見 overall_verdict。
 """
 from __future__ import annotations
@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Iterable
@@ -431,235 +432,133 @@ def select_profile_policy(phase: str) -> dict[str, Any]:
     return selected
 
 
-def _yaml_quoted_end(text: str, start: int, quote: str) -> int | None:
-    """回傳 YAML 單／雙引號 scalar 的結尾位置；未閉合時回傳 None。"""
-    index = start + 1
-    while index < len(text):
-        if quote == "'" and text[index:index + 2] == "''":
-            index += 2
-            continue
-        if quote == '"' and text[index] == "\\":
-            index += 2
-            continue
-        if text[index] == quote:
-            return index
-        index += 1
-    return None
+_PROFILE_YAML_PROBE = r"""
+import json
+import sys
+
+try:
+    import yaml
+except ModuleNotFoundError as exc:
+    if exc.name == "yaml":
+        print(json.dumps({"status": "missing_pyyaml"}))
+        raise SystemExit(0)
+    raise
+
+path, template_name, expected_platform, field_name = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as stream:
+        document = yaml.safe_load(stream)
+except (OSError, UnicodeError, yaml.YAMLError) as exc:
+    result = {"status": "invalid_yaml", "error_type": type(exc).__name__}
+else:
+    if not isinstance(document, dict):
+        result = {"status": "not_mapping"}
+    elif not isinstance(document.get("profiles"), dict):
+        result = {"status": "profiles_not_mapping"}
+    elif template_name not in document["profiles"]:
+        result = {"status": "template_missing"}
+    elif not isinstance(document["profiles"][template_name], dict):
+        result = {"status": "template_not_mapping"}
+    else:
+        profile = document["profiles"][template_name]
+        if profile.get("platform") != expected_platform:
+            result = {"status": "platform_mismatch"}
+        elif field_name not in profile:
+            result = {"status": "field_missing"}
+        else:
+            result = {"status": "ok", "has_field": True}
+result["pyyaml_version"] = getattr(yaml, "__version__", None)
+print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+"""
 
 
-def _yaml_quoted_key(text: str, quote: str) -> str | None:
-    """解碼 YAML 單／雙引號 key；不支援的 escape 會 fail closed。"""
-    if quote == "'":
-        return text.replace("''", "'")
+def _profile_template_field_probe(path: str | Path, *, template: str, platform: str, field: str,
+                                  candidate_python: str | Path | None,
+                                  fallback_python: str | Path | None) -> dict[str, Any]:
+    """以候選 bundle 或舊版 venv 的 PyYAML 解析 profile，不依賴容器系統套件。"""
+    attempts: list[dict[str, Any]] = []
+    selected: dict[str, Any] | None = None
+    selected_path: str | None = None
 
-    escapes = {
-        "0": "\0", "a": "\a", "b": "\b", "t": "\t", "\t": "\t",
-        "n": "\n", "v": "\v", "f": "\f", "r": "\r", "e": "\x1b",
-        " ": " ", '"': '"', "/": "/", "\\": "\\", "N": "\u0085",
-        "_": "\u00a0", "L": "\u2028", "P": "\u2029",
-    }
-    decoded: list[str] = []
-    index = 0
-    while index < len(text):
-        if text[index] != "\\":
-            decoded.append(text[index])
-            index += 1
+    for python_path in (candidate_python, fallback_python):
+        if python_path is None:
             continue
-        index += 1
-        if index >= len(text):
-            return None
-        marker = text[index]
-        if marker in escapes:
-            decoded.append(escapes[marker])
-            index += 1
-            continue
-        width = {"x": 2, "u": 4, "U": 8}.get(marker)
-        if width is None or index + width >= len(text):
-            return None
-        digits = text[index + 1:index + width + 1]
+        interpreter = str(python_path)
         try:
-            codepoint = int(digits, 16)
-            decoded.append(chr(codepoint))
-        except (ValueError, OverflowError):
-            return None
-        index += width + 1
-    return "".join(decoded)
-
-
-def _yaml_mapping_entry(line: str) -> tuple[int, str, str] | None:
-    """讀取一行 block mapping 的 key/value，支援 plain 與 quoted key。"""
-    indent = len(line) - len(line.lstrip(" "))
-    body = line[indent:]
-    if not body or body.startswith("#") or body.startswith(("- ", "? ")):
-        return None
-    if body[0] in "'\"":
-        quote = body[0]
-        end = _yaml_quoted_end(body, 0, quote)
-        if end is None or body[end + 1:end + 2] != ":":
-            return None
-        key = _yaml_quoted_key(body[1:end], quote)
-        if key is None:
-            return None
-        value = body[end + 2:].strip()
-        return indent, key, value
-    for index, char in enumerate(body):
-        if char == ":" and (index + 1 == len(body) or body[index + 1].isspace()):
-            key = body[:index].strip()
-            if not key:
-                return None
-            return indent, key, body[index + 1:].strip()
-    return None
-
-
-def _yaml_commentless(value: str) -> str:
-    """移除 scalar 外的 YAML 行尾註解。"""
-    quote: str | None = None
-    index = 0
-    while index < len(value):
-        char = value[index]
-        if quote is None:
-            if char == "#" and (index == 0 or value[index - 1].isspace()):
-                return value[:index]
-            if char in "'\"" and (index == 0 or value[index - 1].isspace() or value[index - 1] in ":[,{?"):
-                quote = char
-        elif quote == "'" and char == "'":
-            if value[index:index + 2] == "''":
-                index += 1
-            else:
-                quote = None
-        elif quote == '"':
-            if char == "\\":
-                index += 1
-            elif char == '"':
-                quote = None
-        index += 1
-    return value
-
-
-def _yaml_mapping_value(value: str) -> bool:
-    """此受控檢查只接受 block mapping，無法確認的表示法一律關閉。"""
-    return _yaml_commentless(value).strip() in {"", "{}"}
-
-
-def _yaml_block_scalar(value: str, indent: int) -> tuple[bool, int | None]:
-    """辨識 literal/folded block scalar 及可選的明確縮排值。"""
-    text = _yaml_commentless(value).strip()
-    if not re.fullmatch(r"[|>](?:[1-9][+-]?|[+-][1-9]?)?", text):
-        return False, None
-    explicit = re.search(r"[1-9]", text)
-    return True, indent + int(explicit.group()) if explicit else None
-
-
-def _yaml_unquoted_text(line: str, quote: str | None) -> tuple[str, str | None]:
-    """略過引號 scalar 與註解，保留可用來追蹤 YAML flow nesting 的字元。"""
-    visible: list[str] = []
-    index = 0
-    while index < len(line):
-        char = line[index]
-        if quote is None:
-            if char == "#" and (index == 0 or line[index - 1].isspace()):
-                break
-            if char in "'\"" and (index == 0 or line[index - 1].isspace() or line[index - 1] in ":[,{?"):
-                quote = char
-            else:
-                visible.append(char)
-        elif quote == "'" and char == "'":
-            if line[index:index + 2] == "''":
-                index += 1
-            else:
-                quote = None
-        elif quote == '"':
-            if char == "\\":
-                index += 1
-            elif char == '"':
-                quote = None
-        index += 1
-    return "".join(visible), quote
-
-
-def _profile_template_has_field(path: str | Path, *, template: str, platform: str, field: str) -> tuple[bool, str | None]:
-    """以標準函式庫辨識 YAML block mapping 的實際 key；不依賴容器未安裝的 YAML 套件。"""
-    try:
-        lines = Path(path).read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError) as exc:
-        return False, f"{type(exc).__name__}: {exc}"
-
-    entries: list[tuple[int, int, str, str]] = []
-    quote: str | None = None
-    flow_depth = 0
-    block_base: int | None = None
-    block_minimum: int | None = None
-    for line_number, line in enumerate(lines):
-        indent = len(line) - len(line.lstrip(" "))
-        body = line[indent:]
-        if block_base is not None:
-            if not body.strip():
-                continue
-            if block_minimum is None and indent > block_base:
-                block_minimum = indent
-                continue
-            if block_minimum is not None and indent >= block_minimum:
-                continue
-            block_base = None
-            block_minimum = None
-
-        was_in_quote = quote is not None
-        entry = _yaml_mapping_entry(line) if not was_in_quote and flow_depth == 0 else None
-        visible, quote = _yaml_unquoted_text(line, quote)
-        flow_text: str | None = None
-        if flow_depth:
-            flow_text = visible
-        elif entry is not None and _yaml_commentless(entry[2]).lstrip().startswith(("[", "{")):
-            flow_text, _ = _yaml_unquoted_text(entry[2], None)
-        if flow_text is not None:
-            for char in flow_text:
-                if char in "[{":
-                    flow_depth += 1
-                elif char in "]}":
-                    flow_depth = max(0, flow_depth - 1)
-        if entry is None:
+            process = subprocess.run(
+                [interpreter, "-I", "-c", _PROFILE_YAML_PROBE,
+                 str(path), template, platform, field],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            attempts.append({"interpreter_path": interpreter, "status": "timeout"})
+            return {"has_field": False, "error": "YAML parser subprocess timed out",
+                    "evidence": {"interpreter_path": interpreter, "pyyaml_version": None,
+                                 "parser_attempts": attempts}}
+        except UnicodeError as exc:
+            attempts.append({"interpreter_path": interpreter, "status": "invalid_parser_output",
+                             "error_type": type(exc).__name__})
+            return {"has_field": False, "error": "YAML parser returned invalid output",
+                    "evidence": {"interpreter_path": interpreter, "pyyaml_version": None,
+                                 "parser_attempts": attempts}}
+        except OSError as exc:
+            attempts.append({"interpreter_path": interpreter, "status": "unavailable",
+                             "error_type": type(exc).__name__})
             continue
-        entry_indent, key, value = entry
-        entries.append((line_number, entry_indent, key, value))
-        is_block, explicit_minimum = _yaml_block_scalar(value, entry_indent)
-        if is_block:
-            block_base = entry_indent
-            block_minimum = explicit_minimum
 
-    profile_roots = [entry for entry in entries if entry[1] == 0 and entry[2] == "profiles"]
-    if len(profile_roots) != 1:
-        return False, "profiles mapping missing or duplicated"
-    root = profile_roots[0]
-    if not _yaml_mapping_value(root[3]):
-        return False, "profiles is not a supported block mapping"
-    root_end = next((entry[0] for entry in entries if entry[0] > root[0] and entry[1] == 0), len(lines))
-    template_headers = [entry for entry in entries
-                        if root[0] < entry[0] < root_end and entry[1] == 2 and entry[2] == template]
-    if len(template_headers) != 1:
-        return False, f"template {template!r} missing or duplicated"
-    header = template_headers[0]
-    if not _yaml_mapping_value(header[3]):
-        return False, f"template {template!r} is not a supported mapping"
-    template_end = next((entry[0] for entry in entries if entry[0] > header[0] and entry[1] <= 2), root_end)
-    body = [entry for entry in entries if header[0] < entry[0] < template_end and entry[1] == 4]
-    platform_values = [entry[3] for entry in body if entry[2] == "platform"]
-    if len(platform_values) != 1:
-        return False, f"template {template!r} platform missing or duplicated"
-    platform_value = _yaml_commentless(platform_values[0]).strip()
-    if platform_value[:1] in {"'", '"'} and platform_value[-1:] == platform_value[:1]:
-        platform_value = platform_value[1:-1].strip()
-    if platform_value != platform:
-        return False, f"template {template!r} is not platform {platform!r}"
-    matching_fields = [entry for entry in body if entry[2] == field]
-    if not matching_fields:
-        return False, f"template {template!r} lacks field {field!r}"
-    if len(matching_fields) != 1:
-        return False, f"template {template!r} duplicates field {field!r}"
-    return True, None
+        if process.returncode != 0:
+            attempts.append({"interpreter_path": interpreter, "status": "parser_exit",
+                             "returncode": process.returncode})
+            return {"has_field": False, "error": "YAML parser subprocess failed",
+                    "evidence": {"interpreter_path": interpreter, "pyyaml_version": None,
+                                 "parser_attempts": attempts}}
+        try:
+            result = json.loads(process.stdout)
+        except (TypeError, json.JSONDecodeError):
+            attempts.append({"interpreter_path": interpreter, "status": "invalid_parser_output"})
+            return {"has_field": False, "error": "YAML parser returned invalid output",
+                    "evidence": {"interpreter_path": interpreter, "pyyaml_version": None,
+                                 "parser_attempts": attempts}}
+        if type(result) is not dict or type(result.get("status")) is not str:
+            attempts.append({"interpreter_path": interpreter, "status": "invalid_parser_result"})
+            return {"has_field": False, "error": "YAML parser returned an invalid result",
+                    "evidence": {"interpreter_path": interpreter, "pyyaml_version": None,
+                                 "parser_attempts": attempts}}
+
+        attempts.append({"interpreter_path": interpreter, "status": result["status"],
+                         "pyyaml_version": result.get("pyyaml_version")})
+        if result["status"] == "missing_pyyaml":
+            continue
+        selected = result
+        selected_path = interpreter
+        break
+
+    evidence = {"interpreter_path": selected_path,
+                "pyyaml_version": selected.get("pyyaml_version") if selected else None,
+                "parser_attempts": attempts}
+    if selected is None:
+        return {"has_field": False, "error": "PyYAML parser unavailable", "evidence": evidence}
+
+    status = selected["status"]
+    if status == "ok":
+        return {"has_field": selected.get("has_field") is True, "error": None, "evidence": evidence}
+    errors = {
+        "invalid_yaml": "YAML parse failed: " + str(selected.get("error_type", "unknown")),
+        "not_mapping": "YAML document is not a mapping",
+        "profiles_not_mapping": "profiles is not a mapping",
+        "template_missing": f"template {template!r} is missing",
+        "template_not_mapping": f"template {template!r} is not a mapping",
+        "platform_mismatch": f"template {template!r} is not platform {platform!r}",
+        "field_missing": f"template {template!r} lacks field {field!r}",
+    }
+    return {"has_field": False, "error": errors.get(status, "YAML parser returned an unsupported result"),
+            "evidence": evidence}
 
 
 def judge_p290_profile_migration(check_id: str, target_asset_path: str | Path, live_profile_path: str | Path,
-                                 *, migration_policy_id: str) -> dict[str, Any]:
+                                 *, migration_policy_id: str,
+                                 candidate_python: str | Path | None = None,
+                                 fallback_python: str | Path | None = None) -> dict[str, Any]:
     """升級完成必須同時含 p290 欄位於候選資產與實際管理目錄。"""
     field = "timeout_recovery_keys"
     template = "prpl-template"
@@ -667,24 +566,27 @@ def judge_p290_profile_migration(check_id: str, target_asset_path: str | Path, l
     if migration_policy_id != "p290-template-migration-v1":
         return row(check_id, "FAIL", "不支援的 profile migration policy",
                    migration_policy_id=migration_policy_id)
-    target_has, target_error = _profile_template_has_field(
+    target = _profile_template_field_probe(
         target_asset_path, template=template, platform=platform, field=field,
+        candidate_python=candidate_python, fallback_python=fallback_python,
     )
-    live_has, live_error = _profile_template_has_field(
+    live = _profile_template_field_probe(
         live_profile_path, template=template, platform=platform, field=field,
+        candidate_python=candidate_python, fallback_python=fallback_python,
     )
     missing = []
-    if not target_has:
+    if not target["has_field"]:
         missing.append("target_asset")
-    if not live_has:
+    if not live["has_field"]:
         missing.append("live_profile")
     verdict = "FAIL" if missing else "PASS"
     reason = "p290 timeout_recovery_keys 缺於 " + ", ".join(missing) if missing else None
     return row(check_id, verdict, reason,
                migration_policy_id=migration_policy_id, template=template, platform=platform, field=field,
-               target_asset_path=str(target_asset_path), target_asset_has_field=target_has,
-               target_asset_error=target_error, live_profile_path=str(live_profile_path),
-               live_profile_has_field=live_has, live_profile_error=live_error)
+               target_asset_path=str(target_asset_path), target_asset_has_field=target["has_field"],
+               target_asset_error=target["error"], target_asset_yaml=target["evidence"],
+               live_profile_path=str(live_profile_path), live_profile_has_field=live["has_field"],
+               live_profile_error=live["error"], live_profile_yaml=live["evidence"])
 
 
 def _validate_profile_policy(profile_policy: Any) -> tuple[bool, list[str], dict[str, list[str]]]:

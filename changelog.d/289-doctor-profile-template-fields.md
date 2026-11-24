@@ -7,4 +7,4 @@ Rust CLI 的 `serialwrap doctor` 新增 Rust-only advisory 檢查 `profile_templ
 
 OD-33 升級 driver 依執行模式選擇 `migrated` 或 `materialized` 政策，並在升級完成時分別核對 p290 候選資產與實際管理目錄的 `prpl-template.timeout_recovery_keys`。
 
-issue 289 升級 gate 以結構狀態辨識 block mapping key，忽略 plain scalar 內的 flow 字元並解碼 quoted key；安裝完成後比對實際 CLI 與 bundle 候選的 SHA-256，再對安裝副本執行內嵌資產檢查。路徑、摘要或欄位無法確認時維持 FAIL。
+issue 289 升級 gate 以候選 bundle runtime 的 PyYAML 解析 profile；候選 runtime 缺 PyYAML 時回退舊版安裝 venv，並在 evidence 記錄直譯器路徑與 PyYAML 版本。解析失敗、結果非 mapping、template 不存在或候選／live 欄位缺漏一律 FAIL。安裝完成後比對實際 CLI 與 bundle 候選的 SHA-256，再對安裝副本執行內嵌資產檢查；候選 CLI 路徑不符也回結構化 FAIL。

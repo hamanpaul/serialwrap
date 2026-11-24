@@ -412,7 +412,7 @@ class Driver:
         evidence["installed_version_dir"] = str(installed_version_real) if installed_version_real else None
         if candidate_real != configured_real:
             return uc.row("candidate_cli_p290_asset", "FAIL", "目前 CLI 並非本次候選版本",
-                          **evidence, configured_cli_path=str(configured_real))
+                          **evidence)
         if active_real is None or installed_version_real is None \
                 or active_real != installed_version_real / "bin" / "serialwrap" \
                 or installed_version_real.name != NEW_VERSION \
@@ -520,9 +520,13 @@ class Driver:
                     prior_reason = result.get("reason")
                     result["reason"] = "; ".join(part for part in
                                                  (prior_reason, candidate_asset.get("reason")) if part)
+                candidate_python = self.bundle / "versions" / NEW_VERSION / "py" / "bin" / "python3"
+                fallback_python = pathlib.Path(self.env.get("HOME", str(HOME))) / ".local" / "share" / "pipx" \
+                    / "venvs" / "serialwrap" / "bin" / "python"
                 migration = uc.judge_p290_profile_migration(
                     "p290_profile_migration", asset_path, live_path,
                     migration_policy_id=str(profile_policy.get("migration_policy_id", "")),
+                    candidate_python=candidate_python, fallback_python=fallback_python,
                 )
             result.setdefault("detail", {})["p290_profile_migration"] = migration
             if migration["verdict"] != "PASS":
