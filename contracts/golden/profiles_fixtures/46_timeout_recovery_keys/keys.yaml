@@ -1,0 +1,39 @@
+# timeout_recovery_keys：template 未設／null 取預設（CTRL_C、CTRL_D），list 照順序保留，[] 合法（不送）；
+# target 未設或 null 繼承 template，有設就整份覆寫（含 []）
+profiles:
+  tpl-default:
+    platform: prpl
+  tpl-null:
+    platform: shell
+    timeout_recovery_keys: null
+  tpl-c:
+    platform: prpl
+    timeout_recovery_keys: [CTRL_C]
+  tpl-dc:
+    platform: shell
+    timeout_recovery_keys: [CTRL_D, CTRL_C]
+  tpl-none:
+    platform: shell
+    timeout_recovery_keys: []
+
+targets:
+  - profile: tpl-default
+    device_by_id: dev-default-inherit
+  - profile: tpl-c
+    device_by_id: dev-c-inherit
+  - profile: tpl-c
+    device_by_id: dev-c-null
+    timeout_recovery_keys: null
+  - profile: tpl-c
+    device_by_id: dev-c-override-d
+    timeout_recovery_keys: [CTRL_D]
+  - profile: tpl-c
+    device_by_id: dev-c-override-empty
+    timeout_recovery_keys: []
+  - profile: tpl-none
+    device_by_id: dev-none-override-both
+    timeout_recovery_keys: [CTRL_C, CTRL_D]
+  - profile: tpl-dc
+    device_by_id: dev-dc-inherit
+  - profile: tpl-null
+    device_by_id: dev-null-inherit

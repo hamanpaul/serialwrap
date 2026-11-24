@@ -181,6 +181,20 @@ pub fn profile_from_json(v: &PyValue) -> sw_proto::config_types::SessionProfile 
             },
             // #234：舊 golden 無此欄（擷取早於 boot_done_regex）＝ dataclass 預設 ""。
             boot_done_regex: opt_string(d.get("boot_done_regex")).unwrap_or_default(),
+            // 舊 golden 無此欄（擷取早於 timeout_recovery_keys）＝ dataclass 預設（CTRL_C、CTRL_D）。
+            timeout_recovery_keys: match d.get("timeout_recovery_keys") {
+                None => sw_proto::config_types::DEFAULT_TIMEOUT_RECOVERY_KEYS.to_vec(),
+                Some(keys) => keys
+                    .as_array()
+                    .expect("timeout_recovery_keys")
+                    .iter()
+                    .map(|k| {
+                        let name = k.as_str().expect("timeout_recovery_keys 項目須為字串");
+                        sw_proto::config_types::TimeoutRecoveryKey::from_name(name)
+                            .unwrap_or_else(|| panic!("未知的恢復按鍵 {name}"))
+                    })
+                    .collect(),
+            },
         },
     }
 }

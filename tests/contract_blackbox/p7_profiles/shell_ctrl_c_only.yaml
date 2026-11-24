@@ -1,0 +1,23 @@
+# timeout_recovery_keys 黑箱：與 shell.yaml 相同，只多 `timeout_recovery_keys: [CTRL_C]`（只送 CTRL_C）。
+profiles:
+  p7-shell-ctrl-c-only:
+    platform: shell
+    prompt_regex: ".*[$#] $"
+    login_regex: "(?mi)^.*login:\\s*$"
+    password_regex: "(?mi)^password:\\s*$"
+    user_env: SW_P7_USER
+    pass_env: SW_P7_PASS
+    env_file: "${ENV_FILE}"
+    timeout_s: 10
+    timeout_recovery_keys: [CTRL_C]
+    uart:
+      baud: 115200
+      data_bits: 8
+      parity: N
+      stop_bits: 1
+      flow_control: none
+      xonxoff: false
+targets:
+  - profile: p7-shell-ctrl-c-only
+    com: COM0
+    device_by_id: "${BY_ID}"

@@ -78,6 +78,15 @@ pub fn load_result_json(res: &sw_proto::config_types::LoadResult) -> String {
                     None => PyValue::Null,
                 },
             ),
+            (
+                "timeout_recovery_keys".into(),
+                PyValue::List(
+                    t.timeout_recovery_keys
+                        .iter()
+                        .map(|k| PyValue::Str(k.name().to_string()))
+                        .collect(),
+                ),
+            ),
         ]
     }
 

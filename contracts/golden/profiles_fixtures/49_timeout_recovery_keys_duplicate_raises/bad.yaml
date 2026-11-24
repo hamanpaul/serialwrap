@@ -1,0 +1,7 @@
+# 重複項目拒絕
+profiles:
+  p:
+    platform: prpl
+    timeout_recovery_keys: [CTRL_C, CTRL_C]
+targets:
+  - {profile: p, device_by_id: d1}
