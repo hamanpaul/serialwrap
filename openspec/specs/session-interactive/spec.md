@@ -239,13 +239,23 @@ Rust 0.5.1（BC-23）中，`ConsoleTransportKind::TcpTelnet` 的 raw owner SHALL
 
 mirror SHALL 隨目前存活的 TCP raw owner（active、suspended 或 pending）同步。它不得覆蓋 agent lease、一般 human lease 或非 mirror stash；建立 mirror 前 SHALL 遵守 bridge、READY／ATTACHED、stop、flash、handoff 與 admission guards。
 
+上述 mirror 行為適用於 guard 開放期間。flash、handoff、release 等 guard 關閉期間不建立、不回放、不提升 TCP mirror lease；既有 mirror 簿記會在同步路徑撤除。guard 剛開放至下一次 sync 之間，TCP human 可能暫時沒有 mirror lease，agent command 依既有仲裁執行。此例外期間 raw ownership、admission、suspend／resume、deferred input、回放與 raw／line 輸入路由 SHALL 維持修前 Rust 基線；guard 開放時仍適用上述 mirror 驗收。
+
 EOF 與 detach SHALL 依 `(client_id, client_lifetime)` 精確移除 mirror，不呼叫清 owner 的路徑。當 client A 離線、client B 已成為 raw owner時，A 的 EOF、舊 stash close 或 expiry SHALL NOT 清除 B 的 ownership；agent soft preempt 後 close／expiry SHALL 保留 B 並只清掉 A 的 deferred bytes。不得新增第二 console 即時接班；未被既有 ownership 指定的第二 console 仍沿用 self-heal。
 
 #### Scenario: TCP accept creates a mirror without changing raw ownership
 
 - **WHEN** READY 或 ATTACHED session 接受第一個 TCP/Telnet console
+- **AND** mirror guard 開放且其他建立條件成立
 - **THEN** raw owner 仍由既有 accept 路徑授予，session 同事件新增一筆 human mirror lease
 - **AND** mirror 不額外改變 `owner_gen`，內部 lifetime 標記不出現在 RPC 欄位
+
+#### Scenario: mirror guard closes and later reopens
+
+- **WHEN** guard 關閉期間有存活的 TCP raw owner
+- **THEN** 同步路徑撤除 mirror 簿記，raw ownership 與輸入路由沿修前 Rust 基線
+- **AND** guard 剛開放至下一次 sync 之間，TCP human 可能暫時沒有 mirror lease，agent command 依既有仲裁執行
+- **AND** guard 開放後仍由既有同步路徑依存活 owner 建立 mirror
 
 #### Scenario: old EOF cannot remove a replacement client's mirror
 
@@ -257,6 +267,7 @@ EOF 與 detach SHALL 依 `(client_id, client_lifetime)` 精確移除 mirror，�
 
 - **WHEN** agent soft-preempt 期間 A 離線、B 成為 suspended TCP raw owner並有對應 mirror stash
 - **AND** agent lease close 或 expiry
+- **AND** mirror guard 在 close／expiry 前維持開放
 - **THEN** B 的 mirror lease 還原、ownership resume，且僅回放 B 的 deferred bytes 一次
 
 #### Scenario: secondary line console follows the mirrored lease arbitration
