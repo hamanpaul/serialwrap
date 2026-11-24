@@ -1454,7 +1454,33 @@ def test_bc08_doctor_profile_template_fields_registered() -> None:
         "compared_templates and each missing_fields key list are sorted",
     ]
 
-    coverage = yaml.safe_load((ROOT / "contracts" / "coverage_map.yaml").read_text(encoding="utf-8"))
+    class UniqueKeyLoader(yaml.SafeLoader):
+        """拒絕一般 PyYAML 會靜默採後值的重複 mapping key。"""
+
+        def construct_mapping(self, node, deep=False):
+            self.flatten_mapping(node)
+            mapping = {}
+            for key_node, value_node in node.value:
+                key = self.construct_object(key_node, deep=deep)
+                try:
+                    duplicate = key in mapping
+                except TypeError as exc:
+                    raise yaml.constructor.ConstructorError(
+                        "while constructing a mapping", node.start_mark,
+                        "found an unhashable key", key_node.start_mark,
+                    ) from exc
+                if duplicate:
+                    raise yaml.constructor.ConstructorError(
+                        "while constructing a mapping", node.start_mark,
+                        f"found duplicate key {key!r}", key_node.start_mark,
+                    )
+                mapping[key] = self.construct_object(value_node, deep=deep)
+            return mapping
+
+    coverage = yaml.load(
+        (ROOT / "contracts" / "coverage_map.yaml").read_text(encoding="utf-8"),
+        Loader=UniqueKeyLoader,
+    )
     coverage_entry = coverage["entries"]["bc:BC-08"]
     assert coverage_entry["owner_phase"] == "P4"
     assert coverage_entry["nodeids"]

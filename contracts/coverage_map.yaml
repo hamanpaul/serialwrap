@@ -54,7 +54,6 @@ entries:
     - cargo:sw-cli::mgmt_supervision_switch::p277_windows_task_switch_waits_for_install_transaction
     owner_phase: P4
   bc:BC-08:
-  bc:BC-08:
     nodeids:
     - cargo:sw-cli::mgmt_doctor::profile_template_asset_errors_are_unavailable
     - cargo:sw-cli::mgmt_doctor::profile_template_fields_custom_templates_and_no_common
