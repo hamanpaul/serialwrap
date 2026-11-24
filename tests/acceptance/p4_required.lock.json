@@ -6,9 +6,10 @@
     "640e8386528f5ab0184bad8f891b2129cacc83ba",
     "313d792863ab380c7dc10c43d756aac0debf2f19",
     "4baca8c3d922ec210ee2cc25cae2a8121560c7ae",
-    "654c6b263aeffc19cca1cb0f7e087e3fcc64dc8b"
+    "654c6b263aeffc19cca1cb0f7e087e3fcc64dc8b",
+    "ddd642aa99b32f9f96d79084bf19252c7bf81186"
   ],
-  "case_set_sha256": "eb609051bc65e5aaa5fa6b083b2c823f74a635e1b3e5e30324d1248e46b9c989",
+  "case_set_sha256": "c7fe7ce2a9b9bf961bca46879b8b96a450793f10f435997fdba634c19284ae7c",
   "cases": [
     {
       "case_id": "bc05-process-lifecycle-stop-restart",
@@ -37,6 +38,48 @@
       "sha256": "aa07c27e46e8df0eed571bd768d8256ac13035e36e8e7752b6339a4843e79b1e",
       "tests": [
         "sw-cli::mgmt_remote::windows_expose_probe_before_forward_ready_retries"
+      ]
+    },
+    {
+      "case_id": "bc07-daemon-start-interrupted-update-journal",
+      "sha256": "06028fb9ad1603bf9b05e991c2d56c3010791b6041fb94b79443d50b081bcfef",
+      "tests": [
+        "sw-cli::mgmt_daemon::p277_daemon_start_preserves_interrupted_update_hold"
+      ]
+    },
+    {
+      "case_id": "bc07-daemon-start-journal-after-wait",
+      "sha256": "90eb14519e86512876c00ef3df21c209b356d0015e8fe27846763c38ce4d04e0",
+      "tests": [
+        "sw-cli::mgmt_daemon::p277_daemon_start_rechecks_journal_after_transaction_wait"
+      ]
+    },
+    {
+      "case_id": "bc07-service-start-journal-after-wait",
+      "sha256": "e143f17adc70138cfd2a634cfff5dd4163008ed2c2be14832553236db515397b",
+      "tests": [
+        "sw-cli::mgmt_service::p277_service_start_rechecks_journal_after_transaction_wait"
+      ]
+    },
+    {
+      "case_id": "bc07-start-enable-failure-unlocks",
+      "sha256": "9d797bef77523885bb4ee15fd6d063a105ca04b3a17e8c4c31ee6a2f1e13d785",
+      "tests": [
+        "sw-cli::mgmt_service::p277_enable_failure_releases_lifecycle_locks"
+      ]
+    },
+    {
+      "case_id": "bc07-start-install-lock-contention",
+      "sha256": "0f4313f4f2dadb3be3e25d61691a6923e9fc5c0e95c336a8a690f093947131cf",
+      "tests": [
+        "sw-cli::mgmt_service::p277_start_install_lock_contention_skips_supervisor"
+      ]
+    },
+    {
+      "case_id": "bc07-start-locks-through-enable-run",
+      "sha256": "1c3cb301daa2b74988d672458527ab702135c91f5ab63542412af08133284423",
+      "tests": [
+        "sw-cli::mgmt_service::p277_start_serializes_hold_creation_after_check"
       ]
     },
     {

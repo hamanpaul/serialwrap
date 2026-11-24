@@ -698,3 +698,89 @@ cases:
     python: rust-only 契約（behavior_changes 已登記）
   evidence: target/p4-evidence/sc36-win-installer-com0com-optional.json
   necessity: required
+- case_id: bc07-service-start-journal-after-wait
+  invariants:
+  - no_reopen_before_handoff
+  - no_forbidden_interleave
+  layer: L1
+  platforms:
+  - linux
+  capabilities: []
+  artifact: rust-cli-bundle
+  tests:
+  - sw-cli::mgmt_service::p277_service_start_rechecks_journal_after_transaction_wait
+  evidence: target/p4-evidence/bc07-service-start-journal-after-wait.json
+  necessity: required
+  skip_registered:
+    python: Rust-only 契約（behavior_changes 已登記，OD-111／rulings v051 p277）
+- case_id: bc07-daemon-start-journal-after-wait
+  invariants:
+  - no_reopen_before_handoff
+  - no_forbidden_interleave
+  layer: L1
+  platforms:
+  - linux
+  capabilities: []
+  artifact: rust-cli-bundle
+  tests:
+  - sw-cli::mgmt_daemon::p277_daemon_start_rechecks_journal_after_transaction_wait
+  evidence: target/p4-evidence/bc07-daemon-start-journal-after-wait.json
+  necessity: required
+  skip_registered:
+    python: Rust-only 契約（behavior_changes 已登記，OD-111／rulings v051 p277）
+- case_id: bc07-start-locks-through-enable-run
+  invariants:
+  - no_forbidden_interleave
+  layer: L1
+  platforms:
+  - linux
+  capabilities: []
+  artifact: rust-cli-bundle
+  tests:
+  - sw-cli::mgmt_service::p277_start_serializes_hold_creation_after_check
+  evidence: target/p4-evidence/bc07-start-locks-through-enable-run.json
+  necessity: required
+  skip_registered:
+    python: Rust-only 契約（behavior_changes 已登記，OD-111／rulings v051 p277）
+- case_id: bc07-daemon-start-interrupted-update-journal
+  invariants:
+  - no_reopen_before_handoff
+  layer: L1
+  platforms:
+  - linux
+  capabilities: []
+  artifact: rust-cli-bundle
+  tests:
+  - sw-cli::mgmt_daemon::p277_daemon_start_preserves_interrupted_update_hold
+  evidence: target/p4-evidence/bc07-daemon-start-interrupted-update-journal.json
+  necessity: required
+  skip_registered:
+    python: Rust-only 契約（behavior_changes 已登記，OD-111／rulings v051 p277）
+- case_id: bc07-start-install-lock-contention
+  invariants:
+  - no_forbidden_interleave
+  layer: L1
+  platforms:
+  - linux
+  capabilities: []
+  artifact: rust-cli-bundle
+  tests:
+  - sw-cli::mgmt_service::p277_start_install_lock_contention_skips_supervisor
+  evidence: target/p4-evidence/bc07-start-install-lock-contention.json
+  necessity: required
+  skip_registered:
+    python: Rust-only 契約（behavior_changes 已登記，OD-111／rulings v051 p277）
+- case_id: bc07-start-enable-failure-unlocks
+  invariants:
+  - no_forbidden_interleave
+  layer: L1
+  platforms:
+  - linux
+  capabilities: []
+  artifact: rust-cli-bundle
+  tests:
+  - sw-cli::mgmt_service::p277_enable_failure_releases_lifecycle_locks
+  evidence: target/p4-evidence/bc07-start-enable-failure-unlocks.json
+  necessity: required
+  skip_registered:
+    python: Rust-only 契約（behavior_changes 已登記，OD-111／rulings v051 p277）
