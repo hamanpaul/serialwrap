@@ -527,9 +527,11 @@ fn send_secret<'a>(
         .clock
         .mono_ns()
         .saturating_add(timeout.as_nanos().min(u64::MAX as u128) as u64);
-    guard.set_deadline(deadline);
     match report.result.outcome {
-        TxOutcome::Completed(n) if n >= bytes.len() => return Ok(guard),
+        TxOutcome::Completed(n) if n >= bytes.len() => {
+            guard.set_deadline(deadline);
+            return Ok(guard);
+        }
         TxOutcome::NotSubmitted if report.reject.is_none() => {
             return Err(LoginOutcome::Aborted(LoginAbort::Cancelled));
         }

@@ -169,9 +169,13 @@ fn build_prompt_prefix_overlap_rig(console_unlock: bool) -> LoginRig {
     let event = event_rig();
     let log_dir = tempfile::tempdir().expect("agent log 目錄位於 TMPDIR");
     let profile = if console_unlock {
-        format!("profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^# '\n    console_unlock_env: SW_I311_OVERLAP_UNLOCK\n    console_unlock_idle_s: 0.01\n    timeout_s: 2.0\ntargets:\n  - {{com: COM0, profile: t, device_by_id: {BY_ID_A}}}\n")
+        format!(
+            "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^# '\n    console_unlock_env: SW_I311_OVERLAP_UNLOCK\n    console_unlock_idle_s: 0.01\n    timeout_s: 2.0\ntargets:\n  - {{com: COM0, profile: t, device_by_id: {BY_ID_A}}}\n"
+        )
     } else {
-        format!("profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^# '\n    login_regex: 'login:'\n    password_regex: 'Password:'\n    user_env: SW_I311_OVERLAP_USER\n    pass_env: SW_I311_OVERLAP_PASS\n    timeout_s: 2.0\ntargets:\n  - {{com: COM0, profile: t, device_by_id: {BY_ID_A}}}\n")
+        format!(
+            "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^# '\n    login_regex: 'login:'\n    password_regex: 'Password:'\n    user_env: SW_I311_OVERLAP_USER\n    pass_env: SW_I311_OVERLAP_PASS\n    timeout_s: 2.0\ntargets:\n  - {{com: COM0, profile: t, device_by_id: {BY_ID_A}}}\n"
+        )
     };
     let env = Arc::new(FakeEnv::default());
     {
@@ -243,6 +247,94 @@ fn build_prompt_prefix_overlap_rig(console_unlock: bool) -> LoginRig {
     }
 }
 
+struct ControlledLoginRig {
+    service: ServiceRig,
+    device: sw_pal::fakes::serial::FakeDevice,
+    echo_release: crossbeam_channel::Sender<Vec<u8>>,
+    ready_probe_seen: crossbeam_channel::Receiver<()>,
+    _event: EventRig,
+    _log_dir: tempfile::TempDir,
+}
+
+fn build_controlled_login_rig(secret: &str, prompt: &str) -> ControlledLoginRig {
+    let event = event_rig();
+    let log_dir = tempfile::tempdir().expect("agent log 目錄位於 TMPDIR");
+    let log_path = log_dir.path().join("agent-log");
+    let profile = format!(
+        "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^{}'\n    login_regex: 'login:'\n    password_regex: 'Password:'\n    user_env: SW_I311_USER\n    pass_env: SW_I311_PASS\n    timeout_s: 2.0\ndefaults:\n  log_dir: '{}'\ntargets:\n  - {{com: COM0, profile: t, device_by_id: {BY_ID_A}}}\n",
+        prompt,
+        log_path.display()
+    );
+    let env = Arc::new(FakeEnv::default());
+    {
+        let mut vars = env.vars.lock().unwrap();
+        vars.insert("SW_I311_USER".into(), "root".into());
+        vars.insert("SW_I311_PASS".into(), secret.into());
+    }
+
+    let serial = FakeSerialBackend::new();
+    let device = serial.add_device(REAL_A);
+    device.on_tx_match("^$", Box::new(|_| b"\r\nlogin: ".to_vec()));
+    device.on_tx_match("^root$", Box::new(|_| b"\r\nPassword: ".to_vec()));
+    let (secret_seen_tx, secret_seen) = crossbeam_channel::bounded(1);
+    let (echo_release, echo_release_rx) = crossbeam_channel::bounded(1);
+    let secret_pattern = format!("^{secret}$");
+    device.on_tx_match(
+        &secret_pattern,
+        Box::new(move |_| {
+            let _ = secret_seen_tx.send(());
+            echo_release_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("測試釋放分段登入 secret 回顯")
+        }),
+    );
+    let (ready_probe_seen_tx, ready_probe_seen) = crossbeam_channel::bounded(1);
+    let prompt = prompt.to_string();
+    device.on_tx_match(
+        r"__READY__[0-9a-f]+",
+        Box::new(move |line: &[u8]| {
+            let text = String::from_utf8_lossy(line);
+            let token = text
+                .split("__READY__")
+                .nth(1)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let _ = ready_probe_seen_tx.send(());
+            format!("__READY__{token}\r\n{prompt}").into_bytes()
+        }),
+    );
+
+    let service = ServiceRig::build_with_env_serial_console_observers(
+        RigSpec {
+            yaml: profile,
+            devices: vec![(BY_ID_A.into(), REAL_A.into())],
+            explicit_target_count: 1,
+            allowlist: None,
+            wait_ready: Vec::new(),
+        },
+        env,
+        serial as Arc<dyn SerialBackend>,
+        vec![event.engine.clone()],
+    );
+    assert!(service.svc.attach_engine(event.engine.clone()));
+    if let Err(error) = secret_seen.recv_timeout(Duration::from_secs(10)) {
+        panic!(
+            "未觀察到受控登入 secret TX：{error}; tx={:?}; session={:?}",
+            String::from_utf8_lossy(&device.tx_since(0)),
+            service.session("COM0")
+        );
+    }
+    ControlledLoginRig {
+        service,
+        device,
+        echo_release,
+        ready_probe_seen,
+        _event: event,
+        _log_dir: log_dir,
+    }
+}
+
 struct ConsoleUnlockRig {
     service: ServiceRig,
     device: sw_pal::fakes::serial::FakeDevice,
@@ -250,6 +342,103 @@ struct ConsoleUnlockRig {
     echo_release: crossbeam_channel::Sender<Vec<u8>>,
     _event: EventRig,
     _log_dir: tempfile::TempDir,
+}
+
+struct ControlledConsoleUnlockRig {
+    service: ServiceRig,
+    device: sw_pal::fakes::serial::FakeDevice,
+    secret_seen: crossbeam_channel::Receiver<()>,
+    echo_release: crossbeam_channel::Sender<Vec<u8>>,
+    ready_probe_seen: crossbeam_channel::Receiver<()>,
+    _event: EventRig,
+    _log_dir: tempfile::TempDir,
+}
+
+fn build_controlled_console_unlock_rig(secret: &str, prompt: &str) -> ControlledConsoleUnlockRig {
+    let event = event_rig();
+    let log_dir = tempfile::tempdir().expect("agent log 目錄位於 TMPDIR");
+    let log_path = log_dir.path().join("agent-log");
+    let profile = format!(
+        "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^{}'\n    console_unlock_env: SW_I311_UNLOCK\n    console_unlock_idle_s: 0.01\n    timeout_s: 2.0\ndefaults:\n  log_dir: '{}'\ntargets:\n  - {{com: COM0, profile: t, device_by_id: {BY_ID_A}}}\n",
+        prompt,
+        log_path.display()
+    );
+    let env = Arc::new(FakeEnv::default());
+    env.vars
+        .lock()
+        .unwrap()
+        .insert("SW_I311_UNLOCK".into(), secret.into());
+    let serial = FakeSerialBackend::new();
+    let device = serial.add_device(REAL_A);
+    device.on_tx_reply(b"\n", prompt.as_bytes());
+    let initial_prompt = prompt.to_string();
+    device.on_tx_match(
+        r"__READY__[0-9a-f]+",
+        Box::new(move |line: &[u8]| {
+            let text = String::from_utf8_lossy(line);
+            let token = text
+                .split("__READY__")
+                .nth(1)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            format!("__READY__{token}\r\n{initial_prompt}").into_bytes()
+        }),
+    );
+    let service = ServiceRig::build_with_env_serial_console_observers(
+        RigSpec {
+            yaml: profile,
+            devices: vec![(BY_ID_A.into(), REAL_A.into())],
+            explicit_target_count: 1,
+            allowlist: None,
+            wait_ready: vec!["COM0".into()],
+        },
+        env,
+        serial as Arc<dyn SerialBackend>,
+        vec![event.engine.clone()],
+    );
+    assert!(service.svc.attach_engine(event.engine.clone()));
+
+    let (secret_seen_tx, secret_seen) = crossbeam_channel::bounded(1);
+    let (echo_release, echo_release_rx) = crossbeam_channel::bounded(1);
+    let (ready_probe_seen_tx, ready_probe_seen) = crossbeam_channel::bounded(1);
+    device.clear_replies();
+    device.on_tx_match("^reboot$", Box::new(|_| b"rebooting\r\n".to_vec()));
+    device.on_tx_match("^$", Box::new(|_| b"locked console\r\n".to_vec()));
+    let secret_pattern = format!("^{secret}$");
+    device.on_tx_match(
+        &secret_pattern,
+        Box::new(move |_| {
+            let _ = secret_seen_tx.send(());
+            echo_release_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("測試釋放分段 console unlock 回顯")
+        }),
+    );
+    let prompt = prompt.to_string();
+    device.on_tx_match(
+        r"__READY__[0-9a-f]+",
+        Box::new(move |line: &[u8]| {
+            let text = String::from_utf8_lossy(line);
+            let token = text
+                .split("__READY__")
+                .nth(1)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let _ = ready_probe_seen_tx.send(());
+            format!("__READY__{token}\r\n{prompt}").into_bytes()
+        }),
+    );
+    ControlledConsoleUnlockRig {
+        service,
+        device,
+        secret_seen,
+        echo_release,
+        ready_probe_seen,
+        _event: event,
+        _log_dir: log_dir,
+    }
 }
 
 fn build_console_unlock_recovery_rig() -> ConsoleUnlockRig {
@@ -495,6 +684,484 @@ fn assert_echo_outputs_masked(
     }
 }
 
+fn set_event_rules_for_secret(rig: &ServiceRig, secret: &str, include_plaintext: bool) {
+    let mut rules = vec![("masked", "*".repeat(secret.len()))];
+    if include_plaintext {
+        rules.push(("plaintext", secret.to_string()));
+    }
+    for (name, needle) in rules {
+        let rule = format!(
+            r#"{{"schema_version":1,"owner":"o","name":"{name}","kind":"tool","selectors":["COM0"],"pattern":{{"kind":"contains","value":"{needle}"}},"handler":{{"exec":["true"]}}}}"#
+        );
+        assert_eq!(
+            rig.call("event.rule_set", &rule).get("ok"),
+            Some(&PyValue::Bool(true)),
+            "安裝 {name} event rule"
+        );
+    }
+}
+
+fn login_sentinel_console(rig: &ServiceRig) -> sw_pal::fakes::console::FakeConsoleRef {
+    support::wait_until("登入期間 sentinel console 建立", || {
+        rig.console
+            .as_ref()
+            .is_some_and(|console| !console.created().is_empty())
+    });
+    rig.console
+        .as_ref()
+        .expect("fake PTY console factory")
+        .created()
+        .into_iter()
+        .next()
+        .expect("登入期間 sentinel console")
+        .1
+}
+
+fn wait_controlled_rx(
+    device: &sw_pal::fakes::serial::FakeDevice,
+    expected_read: usize,
+    label: &str,
+) {
+    support::wait_until_within(label, Duration::from_secs(2), || {
+        device.rx_bytes_read() >= expected_read
+    });
+}
+
+fn assert_no_followup_tx(
+    device: &sw_pal::fakes::serial::FakeDevice,
+    ready_probe_seen: &crossbeam_channel::Receiver<()>,
+    tx_before: usize,
+    phase: &str,
+) {
+    assert!(
+        ready_probe_seen
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "真正 prompt 前已送出 ready probe（phase={phase}）；tx={:?}",
+        String::from_utf8_lossy(&device.tx_since(tx_before))
+    );
+    assert_eq!(
+        device.tx_len(),
+        tx_before,
+        "真正 prompt 前不得有後續 TX（phase={phase}）；tx={:?}",
+        String::from_utf8_lossy(&device.tx_since(tx_before))
+    );
+}
+
+fn assert_ready_probe_seen(ready_probe_seen: &crossbeam_channel::Receiver<()>, phase: &str) {
+    ready_probe_seen
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap_or_else(|error| {
+            panic!("真正 prompt 後未送出 ready probe（phase={phase}）：{error}")
+        });
+}
+
+fn assert_secret_tx_meta_for(wal: &str, secret: &str) {
+    let records = wal
+        .lines()
+        .filter_map(|line| sw_proto::pyjson::loads(line).ok())
+        .filter(|row| {
+            row.get("meta")
+                .and_then(|meta| meta.get("event"))
+                .and_then(PyValue::as_str)
+                == Some("secret_tx")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 1, "secret TX 應只有一筆 META：{records:?}");
+    let meta = records[0]
+        .get("meta")
+        .and_then(|value| match value {
+            PyValue::Dict(dict) => Some(dict),
+            _ => None,
+        })
+        .expect("secret_tx meta");
+    assert_eq!(meta.0.len(), 2, "META 不得包含 secret 以外資訊：{meta:?}");
+    assert_eq!(
+        meta.get("secret_len").and_then(PyValue::as_i64),
+        Some(secret.len() as i64)
+    );
+    assert_eq!(
+        records[0].get("dir").and_then(PyValue::as_str),
+        Some("META")
+    );
+    assert_eq!(
+        records[0].get("source").and_then(PyValue::as_str),
+        Some("system:secret")
+    );
+    assert_eq!(
+        records[0].get("payload_b64").and_then(PyValue::as_str),
+        Some("")
+    );
+}
+
+struct ControlledOutputBaseline {
+    wal_payload_len: usize,
+    mirror_len: usize,
+    agent_log_len: usize,
+    console_len: usize,
+}
+
+fn controlled_output_baseline(
+    service: &ServiceRig,
+    log_path: &str,
+    console: &sw_pal::fakes::console::FakeConsoleRef,
+) -> ControlledOutputBaseline {
+    let wal = String::from_utf8(
+        service
+            .wfs
+            .contents(&service.wal.wal_path())
+            .expect("raw.wal.ndjson"),
+    )
+    .expect("WAL UTF-8");
+    let mirror = service
+        .wfs
+        .contents(&service.wal.mirror_path())
+        .expect("raw.mirror.log");
+    let agent_log = std::fs::read(Path::new(log_path)).expect("agent log");
+    ControlledOutputBaseline {
+        wal_payload_len: decode_wal_payloads(&wal).len(),
+        mirror_len: mirror.len(),
+        agent_log_len: agent_log.len(),
+        console_len: console.written_len(),
+    }
+}
+
+fn assert_controlled_outputs(
+    service: &ServiceRig,
+    log_path: &str,
+    console: &sw_pal::fakes::console::FakeConsoleRef,
+    secret: &str,
+    echo_expected: bool,
+    prompt_equals_secret: bool,
+    baseline: &ControlledOutputBaseline,
+) {
+    let wal_text = String::from_utf8(
+        service
+            .wfs
+            .contents(&service.wal.wal_path())
+            .expect("raw.wal.ndjson"),
+    )
+    .expect("WAL UTF-8");
+    assert!(
+        !wal_text.contains(secret),
+        "WAL JSON 外洩 secret：{wal_text:?}"
+    );
+    assert_secret_tx_meta_for(&wal_text, secret);
+    let wal_payload = String::from_utf8(decode_wal_payloads(&wal_text)).expect("WAL payload UTF-8");
+    let mirror = String::from_utf8(
+        service
+            .wfs
+            .contents(&service.wal.mirror_path())
+            .expect("raw.mirror.log"),
+    )
+    .expect("mirror UTF-8");
+    let agent_log = std::fs::read_to_string(Path::new(log_path)).expect("agent log");
+    let console_text = String::from_utf8_lossy(&console.written()).into_owned();
+    let tail = service.call("event.tail", r#"{"n":-1}"#);
+    let rows = match tail.get("entries") {
+        Some(PyValue::List(rows)) => rows,
+        other => panic!("event.tail entries: {other:?}"),
+    };
+    let event_text = format!("{rows:?}");
+
+    if prompt_equals_secret {
+        // 相同 bytes 同時是 public prompt；比較 secret TX 後的新增輸出，要求兩個 prompt
+        // 都位於 CRLF 後（fake DUT prompt 與 ready probe 回覆），排除換行前的 secret echo。
+        let prompt_line = format!("\n{secret}");
+        let outputs = [
+            (
+                "WAL payload",
+                String::from_utf8_lossy(&wal_payload.as_bytes()[baseline.wal_payload_len..])
+                    .into_owned(),
+            ),
+            (
+                "mirror",
+                String::from_utf8_lossy(&mirror.as_bytes()[baseline.mirror_len..]).into_owned(),
+            ),
+            (
+                "agent log",
+                String::from_utf8_lossy(&agent_log.as_bytes()[baseline.agent_log_len..])
+                    .into_owned(),
+            ),
+            (
+                "console",
+                String::from_utf8_lossy(&console_text.as_bytes()[baseline.console_len..])
+                    .into_owned(),
+            ),
+        ];
+        for (sink, text) in outputs {
+            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+            assert_eq!(
+                text.matches(secret).count(),
+                2,
+                "{sink} 應只有行終止符後 fake prompt 與 probe prompt 的同值 bytes：{text:?}"
+            );
+            assert_eq!(
+                normalized.matches(&prompt_line).count(),
+                2,
+                "{sink} 的同值 prompt 必須位於行終止符後：{text:?}"
+            );
+        }
+        assert!(
+            !event_text.contains(secret),
+            "event 外洩 secret：{event_text:?}"
+        );
+    } else {
+        for (sink, text) in [
+            ("WAL payload", wal_payload.as_str()),
+            ("mirror", mirror.as_str()),
+            ("agent log", agent_log.as_str()),
+            ("console", console_text.as_str()),
+            ("event", event_text.as_str()),
+        ] {
+            assert!(!text.contains(secret), "{sink} 外洩 secret：{text:?}");
+        }
+    }
+
+    if echo_expected {
+        let masked = "*".repeat(secret.len());
+        for (sink, text) in [
+            ("WAL payload", wal_payload.as_str()),
+            ("mirror", mirror.as_str()),
+            ("agent log", agent_log.as_str()),
+            ("console", console_text.as_str()),
+            ("event", event_text.as_str()),
+        ] {
+            assert!(text.contains(&masked), "{sink} 未保留等長遮罩：{text:?}");
+        }
+    } else if !prompt_equals_secret {
+        assert!(
+            !wal_payload.contains(&"*".repeat(secret.len())),
+            "DUT 不回顯時 WAL 不應製造遮罩：{wal_payload:?}"
+        );
+    }
+}
+
+fn run_controlled_login_case(
+    secret: &str,
+    prompt: &str,
+    first_rx: &[u8],
+    second_rx: &[u8],
+    echo_expected: bool,
+) {
+    let rig = build_controlled_login_rig(secret, prompt);
+    let log_path = start_log(&rig.service);
+    let console = login_sentinel_console(&rig.service);
+    set_event_rules_for_secret(&rig.service, secret, secret != prompt);
+    rig.echo_release
+        .send(Vec::new())
+        .expect("完成登入 secret TX 的 fake DUT barrier");
+    let tx_before = rig.device.tx_len();
+    let baseline = controlled_output_baseline(&rig.service, &log_path, &console);
+
+    let read_before = rig.device.rx_bytes_read();
+    rig.device.push_rx(first_rx);
+    wait_controlled_rx(
+        &rig.device,
+        read_before + first_rx.len(),
+        "reader 收到第一段登入 RX",
+    );
+    assert_no_followup_tx(
+        &rig.device,
+        &rig.ready_probe_seen,
+        tx_before,
+        "第一段登入 RX",
+    );
+
+    if !second_rx.is_empty() {
+        let read_before = rig.device.rx_bytes_read();
+        rig.device.push_rx(second_rx);
+        wait_controlled_rx(
+            &rig.device,
+            read_before + second_rx.len(),
+            "reader 收到第二段登入 RX",
+        );
+        assert_no_followup_tx(
+            &rig.device,
+            &rig.ready_probe_seen,
+            tx_before,
+            "第二段登入 RX",
+        );
+    }
+
+    let read_before = rig.device.rx_bytes_read();
+    rig.device.push_rx(prompt.as_bytes());
+    wait_controlled_rx(
+        &rig.device,
+        read_before + prompt.len(),
+        "reader 收到真正登入 prompt",
+    );
+    assert_ready_probe_seen(&rig.ready_probe_seen, "一般登入");
+    rig.service.wait_state("COM0", "READY");
+    assert_controlled_outputs(
+        &rig.service,
+        &log_path,
+        &console,
+        secret,
+        echo_expected,
+        secret == prompt,
+        &baseline,
+    );
+}
+
+fn run_controlled_console_unlock_case(
+    secret: &str,
+    prompt: &str,
+    first_rx: &[u8],
+    second_rx: &[u8],
+    echo_expected: bool,
+) {
+    let rig = build_controlled_console_unlock_rig(secret, prompt);
+    let log_path = start_log(&rig.service);
+    let attach = rig
+        .service
+        .call("session.console_attach", r#"{"selector":"COM0"}"#);
+    assert_eq!(attach.get("ok"), Some(&PyValue::Bool(true)), "{attach:?}");
+    let console = rig
+        .service
+        .console
+        .as_ref()
+        .expect("fake PTY console")
+        .created()
+        .into_iter()
+        .last()
+        .expect("human console 已建立")
+        .1;
+    set_event_rules_for_secret(&rig.service, secret, secret != prompt);
+
+    let stop_clock = Arc::new(AtomicBool::new(false));
+    let driver_clock = rig.service.clock.clone();
+    let driver_manager = rig.service.mgr.clone();
+    let driver_stop = stop_clock.clone();
+    let clock_driver = std::thread::spawn(move || {
+        while !driver_stop.load(Ordering::SeqCst) {
+            driver_clock.advance(Duration::from_millis(10));
+            driver_manager.on_tick();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    });
+    let reboot = rig.service.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"reboot","timeout_s":1.0}"#,
+    );
+    let secret_result = rig.secret_seen.recv_timeout(Duration::from_secs(10));
+    stop_clock.store(true, Ordering::SeqCst);
+    clock_driver.join().expect("停止測試時鐘推進器");
+    assert_eq!(reboot.get("ok"), Some(&PyValue::Bool(true)), "{reboot:?}");
+    secret_result.unwrap_or_else(|error| {
+        panic!(
+            "reboot recovery 未送出受控 console unlock secret：{error}; tx={:?}; session={:?}",
+            String::from_utf8_lossy(&rig.device.tx_since(0)),
+            rig.service.session("COM0")
+        )
+    });
+    rig.echo_release
+        .send(Vec::new())
+        .expect("完成 console unlock secret TX 的 fake DUT barrier");
+    let tx_before = rig.device.tx_len();
+    let baseline = controlled_output_baseline(&rig.service, &log_path, &console);
+
+    let read_before = rig.device.rx_bytes_read();
+    rig.device.push_rx(first_rx);
+    wait_controlled_rx(
+        &rig.device,
+        read_before + first_rx.len(),
+        "reader 收到第一段 console RX",
+    );
+    assert_no_followup_tx(
+        &rig.device,
+        &rig.ready_probe_seen,
+        tx_before,
+        "第一段 console unlock RX",
+    );
+
+    if !second_rx.is_empty() {
+        let read_before = rig.device.rx_bytes_read();
+        rig.device.push_rx(second_rx);
+        wait_controlled_rx(
+            &rig.device,
+            read_before + second_rx.len(),
+            "reader 收到第二段 console RX",
+        );
+        assert_no_followup_tx(
+            &rig.device,
+            &rig.ready_probe_seen,
+            tx_before,
+            "第二段 console unlock RX",
+        );
+    }
+
+    let read_before = rig.device.rx_bytes_read();
+    rig.device.push_rx(prompt.as_bytes());
+    wait_controlled_rx(
+        &rig.device,
+        read_before + prompt.len(),
+        "reader 收到真正 console prompt",
+    );
+    assert_ready_probe_seen(&rig.ready_probe_seen, "console unlock");
+    support::wait_until("console unlock recovery 完成", || {
+        rig.service
+            .session("COM0")
+            .and_then(|session| {
+                session
+                    .get("state")
+                    .and_then(PyValue::as_str)
+                    .map(str::to_string)
+            })
+            .as_deref()
+            == Some("READY")
+    });
+    assert_controlled_outputs(
+        &rig.service,
+        &log_path,
+        &console,
+        secret,
+        echo_expected,
+        secret == prompt,
+        &baseline,
+    );
+}
+
+#[test]
+fn issue311_login_secret_equals_prompt_without_echo_waits_for_line_boundary() {
+    run_controlled_login_case("# ", "# ", b"\r\n", b"", false);
+}
+
+#[test]
+fn issue311_login_prompt_prefix_secret_echo_does_not_advance_early() {
+    run_controlled_login_case("# secret", "# ", b"# ", b"secret\r\n", true);
+}
+
+#[test]
+fn issue311_login_split_secret_echo_is_masked_until_line_end() {
+    run_controlled_login_case(SECRET, PROMPT, b"i311", b"secret\r\n", true);
+}
+
+#[test]
+fn issue311_login_prompt_after_line_boundary_without_echo_is_visible() {
+    run_controlled_login_case(SECRET, PROMPT, b"\r\n", b"", false);
+}
+
+#[test]
+fn issue311_console_unlock_secret_equals_prompt_without_echo_waits_for_line_boundary() {
+    run_controlled_console_unlock_case("# ", "# ", b"\r\n", b"", false);
+}
+
+#[test]
+fn issue311_console_unlock_prompt_prefix_secret_echo_does_not_advance_early() {
+    run_controlled_console_unlock_case("# secret", "# ", b"# ", b"secret\r\n", true);
+}
+
+#[test]
+fn issue311_console_unlock_split_secret_echo_is_masked_until_line_end() {
+    run_controlled_console_unlock_case(SECRET, PROMPT, b"i311", b"secret\r\n", true);
+}
+
+#[test]
+fn issue311_console_unlock_prompt_after_line_boundary_without_echo_is_visible() {
+    run_controlled_console_unlock_case(SECRET, PROMPT, b"\r\n", b"", false);
+}
+
 #[test]
 fn issue311_login_echo_is_masked_at_rpc_and_every_rx_exit() {
     let rig = build_login_rig(false);
@@ -520,9 +1187,11 @@ fn issue311_login_echo_is_masked_at_rpc_and_every_rx_exit() {
         .unwrap();
     let wal_text = String::from_utf8(wal).unwrap();
     let decoded = decode_wal_payloads(&wal_text);
-    assert!(decoded
-        .windows(SECRET.len())
-        .any(|window| window == SECRET.as_bytes()));
+    assert!(
+        decoded
+            .windows(SECRET.len())
+            .any(|window| window == SECRET.as_bytes())
+    );
 }
 
 #[test]
@@ -572,8 +1241,8 @@ fn issue311_console_unlock_echo_is_masked_in_last_error_detail() {
 fn issue311_login_prompt_prefix_overlapping_secret_does_not_timeout() {
     let rig = build_prompt_prefix_overlap_rig(false);
     rig.echo_release
-        .send(b"# ".to_vec())
-        .expect("回覆只含與 secret 前綴相同的 login prompt");
+        .send(b"\r\n# ".to_vec())
+        .expect("先結束 secret line 再回覆 login prompt");
     rig.service.wait_state("COM0", "READY");
     assert_eq!(
         rig.service
@@ -587,8 +1256,8 @@ fn issue311_login_prompt_prefix_overlapping_secret_does_not_timeout() {
 fn issue311_console_unlock_prompt_prefix_overlapping_secret_does_not_timeout() {
     let rig = build_prompt_prefix_overlap_rig(true);
     rig.echo_release
-        .send(b"# ".to_vec())
-        .expect("回覆只含與 secret 前綴相同的 console prompt");
+        .send(b"\r\n# ".to_vec())
+        .expect("先結束 secret line 再回覆 console prompt");
     support::wait_until("console unlock 離開 ATTACHING", || {
         rig.service
             .session("COM0")

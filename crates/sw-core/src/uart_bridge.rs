@@ -141,11 +141,10 @@ struct ArmedSecretEcho {
     secret: Vec<u8>,
     pending: Vec<u8>,
     start_from: u64,
-    prompt_pattern: Option<String>,
     deadline: Option<Mono>,
     preserve_on_drop: bool,
-    prompt_seen: bool,
-    suppress_pending_window: usize,
+    line_open: bool,
+    guard_dropped: bool,
 }
 
 struct MaskedRxChunk {
@@ -166,9 +165,9 @@ impl Drop for SecretEchoGuard<'_> {
 }
 
 impl SecretEchoGuard<'_> {
-    /// 設定此登入窗口的到期時間。
+    /// secret 可能已送出：保留同一行遮罩窗口到行終止符或期限。
     pub fn set_deadline(&self, deadline: Mono) {
-        self.rx.set_secret_echo_deadline(self.id, deadline, false);
+        self.rx.set_secret_echo_deadline(self.id, deadline, true);
     }
 
     /// 部分／不明 TX 可能已提交 secret；維持守衛至後續 prompt 或同一登入等待期限。
@@ -216,25 +215,20 @@ impl RxShared {
 
     /// 只遮罩此守衛存續期間、與 `secret` 完全相符的 byte 序列。
     pub fn arm_secret_echo(&self, secret: &[u8]) -> SecretEchoGuard<'_> {
-        self.arm_secret_echo_inner(secret, None, 0)
+        self.arm_secret_echo_inner(secret, 0)
     }
 
-    /// 登入 FSM 專用：reader 可用 prompt pattern 結算可能已提交的 secret，且 prompt shadow 不看舊 RX。
+    /// 登入 FSM 專用：從武裝時的 RX 偏移等待 prompt；未決 secret 前綴不參與 prompt 比對。
     pub fn arm_secret_echo_with_prompt(
         &self,
         secret: &[u8],
-        prompt_pattern: &str,
+        _prompt_pattern: &str,
     ) -> SecretEchoGuard<'_> {
         let start_from = self.snapshot_len();
-        self.arm_secret_echo_inner(secret, Some(prompt_pattern.to_string()), start_from)
+        self.arm_secret_echo_inner(secret, start_from)
     }
 
-    fn arm_secret_echo_inner(
-        &self,
-        secret: &[u8],
-        prompt_pattern: Option<String>,
-        start_from: u64,
-    ) -> SecretEchoGuard<'_> {
+    fn arm_secret_echo_inner(&self, secret: &[u8], start_from: u64) -> SecretEchoGuard<'_> {
         let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(mut previous) = window.armed.take() {
             Self::release_pending(&mut window, &mut previous);
@@ -248,11 +242,10 @@ impl RxShared {
                 secret: secret.to_vec(),
                 pending: Vec::with_capacity(secret.len().saturating_sub(1)),
                 start_from,
-                prompt_pattern,
                 deadline: None,
                 preserve_on_drop: false,
-                prompt_seen: false,
-                suppress_pending_window: 0,
+                line_open: true,
+                guard_dropped: false,
             });
         }
         drop(window);
@@ -273,13 +266,12 @@ impl RxShared {
     }
 
     fn release_pending(window: &mut SecretEchoWindow, armed: &mut ArmedSecretEcho) {
-        for (index, byte) in armed.pending.drain(..).enumerate() {
+        for byte in armed.pending.drain(..) {
             window.released.push_back(ReleasedSecretByte {
                 byte,
-                include_in_rx_window: index >= armed.suppress_pending_window,
+                include_in_rx_window: true,
             });
         }
-        armed.suppress_pending_window = 0;
     }
 
     /// 到期時釋出未匹配前綴；完整 secret 在抵達時已被遮罩。
@@ -300,7 +292,7 @@ impl RxShared {
         false
     }
 
-    /// reader 專用：回傳現在可以安全發布的 RX bytes。armed 時最多保留 secret 長度減 1 byte。
+    /// reader 專用：只在 secret TX 後的第一行內保留未決前綴；行終止符後原樣發布。
     fn mask_secret_echo(&self, data: &[u8], now: Mono) -> MaskedRxChunk {
         let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
         let expired = Self::expire_secret_echo(&mut window, now);
@@ -312,62 +304,67 @@ impl RxShared {
                 rx_window.push(released.byte);
             }
         }
-        if let Some(armed) = window.armed.as_mut() {
-            for (index, byte) in data.iter().enumerate() {
-                if armed.secret.is_empty() {
-                    visible.extend_from_slice(&data[index..]);
-                    rx_window.extend_from_slice(&data[index..]);
-                    break;
-                }
-                let split = armed.secret.len().saturating_sub(1);
-                if armed.pending.len() == split
-                    && armed.pending.as_slice() == &armed.secret[..split]
-                    && *byte == armed.secret[split]
-                {
-                    visible.resize(visible.len().saturating_add(armed.secret.len()), b'*');
-                    if armed.suppress_pending_window == 0 {
-                        rx_window.resize(rx_window.len().saturating_add(armed.secret.len()), b'*');
+        let line_ended = if let Some(armed) = window.armed.as_mut() {
+            if !armed.line_open {
+                visible.extend_from_slice(data);
+                rx_window.extend_from_slice(data);
+                false
+            } else {
+                let mut ended = false;
+                for (index, byte) in data.iter().enumerate() {
+                    if *byte == b'\r' || *byte == b'\n' {
+                        for pending in std::mem::take(&mut armed.pending) {
+                            visible.push(pending);
+                            rx_window.push(pending);
+                        }
+                        visible.push(*byte);
+                        rx_window.push(*byte);
+                        visible.extend_from_slice(&data[index + 1..]);
+                        rx_window.extend_from_slice(&data[index + 1..]);
+                        armed.line_open = false;
+                        ended = true;
+                        break;
                     }
-                    armed.suppress_pending_window = 0;
-                    armed.pending.clear();
-                    // prompt 前綴也可能是 secret echo 的開頭；完整匹配時以 echo 解讀並保留守衛。
-                    armed.prompt_seen = false;
-                    continue;
-                }
-                armed.pending.push(*byte);
-                while !armed.secret.starts_with(&armed.pending) {
-                    let released = armed.pending.remove(0);
-                    visible.push(released);
-                    if armed.suppress_pending_window > 0 {
-                        armed.suppress_pending_window -= 1;
-                    } else {
+
+                    let split = armed.secret.len().saturating_sub(1);
+                    if armed.pending.len() == split
+                        && armed.pending.as_slice() == &armed.secret[..split]
+                        && *byte == armed.secret[split]
+                    {
+                        visible.resize(visible.len().saturating_add(armed.secret.len()), b'*');
+                        rx_window.resize(rx_window.len().saturating_add(armed.secret.len()), b'*');
+                        armed.pending.clear();
+                        continue;
+                    }
+
+                    armed.pending.push(*byte);
+                    while !armed.secret.starts_with(&armed.pending) {
+                        let released = armed.pending.remove(0);
+                        visible.push(released);
                         rx_window.push(released);
                     }
                 }
-                if armed.prompt_seen && armed.pending.is_empty() {
-                    visible.extend_from_slice(&data[index + 1..]);
-                    rx_window.extend_from_slice(&data[index + 1..]);
-                    break;
-                }
-            }
-            if window
-                .armed
-                .as_ref()
-                .is_some_and(|armed| armed.prompt_seen && armed.pending.is_empty())
-            {
-                if let Some(mut armed) = window.armed.take() {
-                    armed.secret.fill(0);
-                }
+                ended
             }
         } else {
             visible.extend_from_slice(data);
             rx_window.extend_from_slice(data);
+            false
+        };
+        if line_ended
+            && window
+                .armed
+                .as_ref()
+                .is_some_and(|armed| armed.guard_dropped)
+        {
+            if let Some(mut armed) = window.armed.take() {
+                armed.secret.fill(0);
+            }
         }
 
         let changed = !data.is_empty() || expired;
         drop(window);
         if changed {
-            self.observe_secret_prompt(&visible);
             self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
             self.wake_all();
         }
@@ -377,60 +374,9 @@ impl RxShared {
         }
     }
 
-    fn observe_secret_prompt(&self, current_visible: &[u8]) {
-        let Some((id, start_from, pattern, pending)) = self.secret_echo_prompt_context() else {
-            return;
-        };
-        let mut snapshot = self
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .text_from(start_from)
-            .to_string();
-        snapshot.push_str(&decode_utf8_replace(current_visible));
-        snapshot.push_str(&decode_utf8_replace(&pending));
-        let Ok(re) = sw_proto::pyre::compile(&pattern, sw_proto::pyre::PyFlags(0)) else {
-            return;
-        };
-        if re.search(&snapshot).is_some() {
-            self.mark_secret_prompt_seen(id);
-        }
-    }
-
-    fn secret_echo_prompt_context(&self) -> Option<(u64, u64, String, Vec<u8>)> {
+    fn secret_echo_start_from(&self) -> Option<u64> {
         let window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
-        let armed = window.armed.as_ref()?;
-        Some((
-            armed.id,
-            armed.start_from,
-            armed.prompt_pattern.as_ref()?.clone(),
-            armed.pending.clone(),
-        ))
-    }
-
-    fn secret_echo_match_context(&self) -> Option<(u64, u64, Vec<u8>)> {
-        let window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
-        let armed = window.armed.as_ref()?;
-        Some((
-            armed.id,
-            armed.start_from,
-            armed.pending[armed.suppress_pending_window.min(armed.pending.len())..].to_vec(),
-        ))
-    }
-
-    fn mark_secret_prompt_seen(&self, id: u64) {
-        let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(armed) = window.armed.as_mut().filter(|armed| armed.id == id) {
-            armed.prompt_seen = true;
-            if armed.pending.is_empty() {
-                if let Some(mut completed) = window.armed.take() {
-                    completed.secret.fill(0);
-                }
-            }
-        }
-        drop(window);
-        self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
-        self.wake_all();
+        window.armed.as_ref().map(|armed| armed.start_from)
     }
 
     /// 守衛解除後由 reader 取出未匹配的前綴；active guard 的 pending bytes 不會由此洩漏。
@@ -481,16 +427,15 @@ impl RxShared {
             return;
         }
         let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
-        let keep_ambiguous_prompt = window.armed.as_ref().is_some_and(|armed| {
-            armed.id == id && armed.prompt_seen && !armed.pending.is_empty()
-        });
-        let keep_possible_submission = window.armed.as_ref().is_some_and(|armed| {
-            armed.id == id && armed.preserve_on_drop && !armed.prompt_seen
-        });
-        if !keep_ambiguous_prompt
-            && !keep_possible_submission
-            && window.armed.as_ref().is_some_and(|armed| armed.id == id)
-        {
+        let keep_until_line_end = window
+            .armed
+            .as_ref()
+            .is_some_and(|armed| armed.id == id && armed.preserve_on_drop && armed.line_open);
+        if keep_until_line_end {
+            if let Some(armed) = window.armed.as_mut().filter(|armed| armed.id == id) {
+                armed.guard_dropped = true;
+            }
+        } else if window.armed.as_ref().is_some_and(|armed| armed.id == id) {
             if let Some(mut armed) = window.armed.take() {
                 Self::release_pending(&mut window, &mut armed);
                 armed.secret.fill(0);
@@ -583,15 +528,6 @@ impl RxShared {
     }
 
     pub fn clear(&self) {
-        {
-            let mut echo = self
-                .secret_echo
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if let Some(armed) = echo.armed.as_mut().filter(|armed| armed.prompt_seen) {
-                armed.suppress_pending_window = armed.pending.len();
-            }
-        }
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         window.trimmed = window
             .trimmed
@@ -1509,22 +1445,18 @@ impl RxShared {
                 return WaitOutcome::Cancelled;
             }
             let secret_revision = self.secret_echo_revision.load(Ordering::Acquire);
-            let echo_context = self.secret_echo_match_context();
-            let effective_from = echo_context
-                .as_ref()
-                .map(|(_, start_from, _)| from.map_or(*start_from, |offset| offset.max(*start_from)))
+            let secret_start = self.secret_echo_start_from();
+            let effective_from = secret_start
+                .map(|start_from| from.map_or(start_from, |offset| offset.max(start_from)))
                 .unwrap_or_else(|| from.unwrap_or(0));
-            let (mut snapshot, revision) = {
+            let (snapshot, revision) = {
                 let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-                (window.text_from(effective_from).to_string(), window.revision)
+                (
+                    window.text_from(effective_from).to_string(),
+                    window.revision,
+                )
             };
-            if let Some((_, _, pending)) = echo_context.as_ref() {
-                snapshot.push_str(&decode_utf8_replace(pending));
-            }
             if re.search(&snapshot).is_some() {
-                if let Some((id, _, _)) = echo_context {
-                    self.mark_secret_prompt_seen(id);
-                }
                 return WaitOutcome::Matched;
             }
             if clock.mono_ns() >= deadline {
