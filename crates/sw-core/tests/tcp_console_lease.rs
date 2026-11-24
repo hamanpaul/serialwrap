@@ -61,6 +61,26 @@ fn finish_self_test(h: &mut CoreHarness, op_id: sw_core::drain::OpId) -> Vec<Eff
     })
 }
 
+fn start_non_strict_self_test_with_timeout(
+    h: &mut CoreHarness,
+    timeout_s: f64,
+) -> sw_core::drain::OpId {
+    let (_reply, effects) = h.rpc_deferred(SessionRequest::SelfTest {
+        timeout_s,
+        strict_human_lock: false,
+    });
+    effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp {
+                grant,
+                spec: sw_core::op_runner::OpSpec::SelfTestProbe { .. },
+            } => Some(grant.op_id),
+            _ => None,
+        })
+        .expect("非 strict self-test 應啟動 probe")
+}
+
 fn close_mirror_publicly(h: &mut CoreHarness, client_id: &str) {
     let lease = h.core.active_lease().expect("TCP raw owner mirror lease");
     assert_eq!(lease.owner, format!("human:{client_id}"));
@@ -525,6 +545,138 @@ fn tcp_mirror_delayed_soft_preempt_close_preserves_nested_self_test_suspend() {
     let opened = h.rpc(open_req("agent:explicit-close-replay", 60.0, "", false)).unwrap();
     assert_eq!(opened.get("error_code"), Some(&PyValue::from("SESSION_BUSY")), "明確 close 後的巢狀 self-test replay 不得被標成 tick close");
     h.complete_human_tx(TxOutcome::Completed(b"nestedstill-deferred".len()), None);
+}
+
+fn guarded_nested_handback_after_eof(expire_agent_lease: bool) -> (CoreHarness, u64) {
+    let mut h = tcp_ready(&["a"]);
+    h.set_auto_complete_human_tx(false);
+    let probe_op = start_non_strict_self_test_with_timeout(&mut h, 10.0);
+    let opened = h
+        .rpc(open_req("agent:r5-nested", 1.0, "", false))
+        .expect("agent soft preempt");
+    assert_eq!(opened.get("soft_preempted"), Some(&PyValue::Bool(true)));
+    let agent_id = opened
+        .get("interactive_id")
+        .and_then(PyValue::as_str)
+        .unwrap()
+        .to_string();
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 2);
+
+    h.fence.with(|fence| fence.flash_critical = true);
+    if expire_agent_lease {
+        h.advance(Duration::from_secs(2));
+        assert!(h.core.active_lease().is_none(), "agent lease timer 應已到期");
+    } else {
+        h.rpc(close_req(&agent_id))
+            .expect("guard 關閉期間明確 close agent lease");
+        assert!(h.core.active_lease().is_none());
+    }
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 2);
+
+    h.disconnect("a");
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1, "EOF 僅結算 agent lease 的 suspend 層");
+    h.connect_stream_console("b", ConsoleTransportKind::TcpTelnet);
+    let b_lifetime = h.lifetime("b");
+    assert_eq!(h.core.human_console().ownership.suspended_owner.as_deref(), Some("human:b"));
+    assert!(h.core.active_lease().is_none(), "guard 關閉期間不得建立 B 的 mirror");
+    assert!(h.input("b", b"r5-deferred").iter().all(|effect| !matches!(effect, Effect::HumanTx { .. })));
+    assert_eq!(h.deferred_len("b"), b"r5-deferred".len());
+
+    let owner_gen_before_resume = h.core.generations().owner_gen;
+    let effects = finish_self_test(&mut h, probe_op);
+    assert!(
+        effects.iter().all(|effect| !matches!(effect, Effect::HumanTx { permit, .. } if permit.class == TxClass::HumanReplay)),
+        "guard 關閉期間 self-test 結束不得產生 HumanReplay effect",
+    );
+    assert!(h.human_tx().is_empty(), "guard 開放前不得有任何 human TX");
+    assert!(h.human_tx().iter().all(|(class, _, _)| *class != TxClass::HumanReplay));
+    assert_eq!(h.core.human_console().ownership.interactive_owner, None, "guard 關閉期間 B 不得成為 active raw owner");
+    assert_eq!(h.core.human_console().ownership.suspended_owner.as_deref(), Some("human:b"), "延後 handback 須保留 B owner");
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 0, "self-test 只結算自己的 suspend 層");
+    assert_eq!(h.core.generations().owner_gen, owner_gen_before_resume, "guard 關閉期間不得改變 owner_gen");
+    (h, b_lifetime)
+}
+
+fn assert_guarded_nested_handback_completes_once(mut h: CoreHarness, b_lifetime: u64) {
+    let owner_gen_before_handback = h.core.generations().owner_gen;
+    let lease_index_start = h.lease_index_ops().len();
+    h.fence.with(|fence| fence.flash_critical = false);
+    let effects = h.scan(None);
+
+    let mirror = h.core.active_lease().expect("guard 開放後 B 應建立 TCP mirror");
+    let mirror_id = mirror.interactive_id.clone();
+    assert_eq!(mirror.owner, "human:b");
+    assert_eq!(mirror.mirror_client_lifetime, Some(b_lifetime));
+    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:b"));
+    assert_eq!(h.core.human_console().ownership.suspended_owner, None);
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 0);
+    assert_eq!(h.core.generations().owner_gen, owner_gen_before_handback + 1, "owner 恢復只增加一次 generation");
+    assert_eq!(
+        h.lease_index_ops()[lease_index_start..]
+            .iter()
+            .filter(|op| matches!(op, LeaseIndexOp::InsertTcpMirror { interactive_id } if interactive_id == &mirror_id))
+            .count(),
+        1,
+        "guarded handback 只登記一次 mirror index",
+    );
+    assert_eq!(h.reg.admission_gate().live_tickets(), 0, "短暫 handback admission ticket 必須結算");
+
+    let replay_effects: Vec<_> = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::HumanTx { permit, payload, .. } if permit.class == TxClass::HumanReplay => {
+                Some((permit.source.clone(), payload.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replay_effects, vec![("human:b".into(), b"r5-deferred".to_vec())]);
+    assert_eq!(
+        h.human_tx()
+            .iter()
+            .filter(|(class, source, payload)| {
+                *class == TxClass::HumanReplay && source == "human:b" && payload == b"r5-deferred"
+            })
+            .count(),
+        1,
+        "deferred bytes 必須恰回放一次",
+    );
+
+    let subsequent = h.scan(None);
+    assert!(subsequent.iter().all(|effect| !matches!(effect, Effect::HumanTx { permit, .. } if permit.class == TxClass::HumanReplay)));
+    assert_eq!(h.core.generations().owner_gen, owner_gen_before_handback + 1);
+    assert_eq!(h.reg.admission_gate().live_tickets(), 0);
+}
+
+#[test]
+fn tcp_mirror_nested_guarded_handback_after_eof_and_agent_close() {
+    let (h, b_lifetime) = guarded_nested_handback_after_eof(false);
+    assert_guarded_nested_handback_completes_once(h, b_lifetime);
+}
+
+#[test]
+fn tcp_mirror_nested_guarded_handback_after_eof_and_agent_expiry() {
+    let (h, b_lifetime) = guarded_nested_handback_after_eof(true);
+    assert_guarded_nested_handback_completes_once(h, b_lifetime);
+}
+
+#[test]
+fn tcp_mirror_nested_guarded_handback_detach_clears_pending_owner() {
+    let (mut h, _b_lifetime) = guarded_nested_handback_after_eof(false);
+    let detached = h
+        .rpc(SessionRequest::ConsoleDetach { client_id: "b".into() })
+        .expect("detach 延後 handback 的 B");
+    assert_eq!(detached.get("ok"), Some(&PyValue::Bool(true)));
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 0, "detach 不得洩漏 suspend depth");
+    assert!(h.core.human_console().ownership.interactive_owner.is_none());
+
+    h.fence.with(|fence| fence.flash_critical = false);
+    let effects = h.scan(None);
+    assert!(h.core.active_lease().is_none(), "已 detach 的 B 不得建立 mirror");
+    assert!(h.core.human_console().ownership.interactive_owner.is_none());
+    assert!(effects.iter().all(|effect| !matches!(effect, Effect::HumanTx { permit, .. } if permit.class == TxClass::HumanReplay)));
+    assert!(h.human_tx().iter().all(|(class, _, _)| *class != TxClass::HumanReplay));
+    assert_eq!(h.reg.admission_gate().live_tickets(), 0);
 }
 
 #[test]

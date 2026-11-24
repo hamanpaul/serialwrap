@@ -756,6 +756,8 @@ pub struct SessionCore {
     stashed_human: Option<InteractiveLease>,
     /// 已關閉 soft-preempt agent lease 尚未結算的 TCP suspend；只可由相符 owner/lifetime handback 消費。
     pending_tcp_suspend_settlement: Option<TcpSuspendSettlement>,
+    /// guard 延後的 TCP handback 尚未完成；不綁定舊 client lifetime，EOF 後的替換 owner 仍須經 guarded sync。
+    tcp_handback_deferred: bool,
     /// P6 Task 7：worker `snapshot()` 的 running／serial_alive（executor 注入；`None` 視為健康）。
     worker_health: Option<Arc<dyn Fn() -> crate::uart_bridge::WorkerSnapshot + Send + Sync>>,
     /// P6 Task 7（#56）：tick 到期還原所建立的回放 hold（結算前 lease 類操作回 SESSION_INTERACTIVE_BUSY）。
@@ -1097,6 +1099,7 @@ impl SessionCore {
             path_flavor: sw_pal::PalPathFlavor::Posix,
             stashed_human: None,
             pending_tcp_suspend_settlement: None,
+            tcp_handback_deferred: false,
             worker_health: None,
             tick_close_hold: None,
             hold_release_kick: false,

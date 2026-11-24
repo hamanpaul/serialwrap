@@ -143,6 +143,44 @@ impl OwnershipState {
         }
     }
 
+    /// 延後 handback 尚未收斂時記錄新連線，不讓它越過保留中的 owner 直接成為 active。
+    pub fn on_stream_accept_deferred(&mut self, client_id: &str) {
+        let owner = format!("human:{client_id}");
+        if self.suspend_depth > 0 && self.suspended_owner.is_none() {
+            self.suspended_owner = Some(owner);
+        } else if self.suspend_depth == 0
+            && self.interactive_owner.is_none()
+            && self.suspended_owner.is_none()
+            && self.pending_owner.is_none()
+        {
+            self.pending_owner = Some(owner);
+        }
+    }
+
+    /// guard 延後 handback 已把 suspend depth 結算至零後，由已通過 session guard 的同步點恢復指定 TCP owner。
+    pub fn promote_deferred_owner(&mut self, owner: &str, has_client: &dyn Fn(&str) -> bool) -> bool {
+        if self.suspend_depth != 0 || self.admission_blocked {
+            return false;
+        }
+        let client_id = owner.strip_prefix("human:").unwrap_or("");
+        if client_id.is_empty() || !has_client(client_id) {
+            return false;
+        }
+        if self.suspended_owner.as_deref() == Some(owner) {
+            self.suspended_owner = None;
+            self.interactive_owner = Some(owner.to_string());
+            self.agent_active = false;
+            return true;
+        }
+        if self.interactive_owner.is_none() && self.pending_owner.as_deref() == Some(owner) {
+            self.pending_owner = None;
+            self.interactive_owner = Some(owner.to_string());
+            self.agent_active = false;
+            return true;
+        }
+        false
+    }
+
     /// `detach_console`（#78）：被 suspend 的 owner 斷線時放棄整個 suspend 簿記。
     pub fn on_detach(&mut self, client_id: &str) {
         let me = format!("human:{client_id}");
