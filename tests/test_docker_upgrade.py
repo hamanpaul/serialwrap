@@ -541,7 +541,7 @@ def fake_driver(tmp_path, monkeypatch):
         test_home = tmp_path / "test-home"
         legacy_python = test_home / ".local" / "share" / "pipx" / "venvs" / "serialwrap" / "bin" / "python"
         legacy_python.parent.mkdir(parents=True)
-        legacy_python.symlink_to(sys.executable)
+        legacy_python.write_text("legacy runtime is supplied by the test subprocess stub\n", encoding="utf-8")
         driver.env["HOME"] = str(test_home)
 
         target_asset = (tmp_path / "bundle" / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles"
@@ -551,15 +551,24 @@ def fake_driver(tmp_path, monkeypatch):
         candidate_cli.parent.mkdir(parents=True, exist_ok=True)
         candidate_cli.write_bytes(b"candidate CLI embedded profile asset\n" + target_asset.read_bytes())
         candidate_cli.chmod(0o755)
-        driver.new_cli.parent.mkdir(parents=True, exist_ok=True)
-        driver.new_cli.symlink_to(candidate_cli)
+        driver.new_cli = candidate_cli
         installed_version = tmp_path / f"installed-{len(made)}" / "versions" / NEW_VERSION
         shutil.copytree(candidate_cli.parent.parent, installed_version)
         installed_cli = installed_version / "bin" / "serialwrap"
-        active_bin = tmp_path / "active-bin"
-        active_bin.mkdir()
-        (active_bin / "serialwrap").symlink_to(installed_cli)
-        driver.env["PATH"] = str(active_bin)
+        driver.env["PATH"] = str(installed_cli.parent)
+
+        candidate_python = driver.bundle / "versions" / NEW_VERSION / "py" / "bin" / "python3"
+        real_probe_run = subprocess.run
+
+        def run_profile_probe(argv, **kwargs):
+            if argv and str(argv[0]) in (str(candidate_python), str(legacy_python)):
+                interpreter = Path(argv[0])
+                if not interpreter.is_file():
+                    raise FileNotFoundError(2, "No such file or directory", str(interpreter))
+                argv = [sys.executable, *argv[1:]]
+            return real_probe_run(argv, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", run_profile_probe)
 
         def run(argv, *, timeout=300.0, label=""):
             if argv and Path(argv[0]).name == "serialwrap" and argv[1:] == ["doctor"]:
@@ -606,6 +615,22 @@ def fake_driver(tmp_path, monkeypatch):
     yield make
     for fake in made:
         fake.close()
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_fake_driver_setup_without_symlink_permission(request, monkeypatch):
+    """測試替身建置不得依賴測試執行帳號建立符號連結的權限。"""
+    def deny_symlink(src, dst, *args, **kwargs):
+        raise PermissionError("symbolic link creation is unavailable")
+
+    monkeypatch.setattr(os, "symlink", deny_symlink)
+    make_driver = request.getfixturevalue("fake_driver")
+    driver, fake = make_driver(cli_version=NEW_VERSION)
+
+    assert driver.new_cli.is_file()
+    assert (Path(driver.env["PATH"]) / "serialwrap").is_file()
+    assert fake.proc.is_dir()
 
 
 @pytest.mark.posix_only
@@ -1419,9 +1444,7 @@ def test_upgrade_rejects_candidate_cli_without_embedded_p290_asset(fake_driver, 
     installed_version = tmp_path / "installed" / "versions" / NEW_VERSION
     shutil.copytree(candidate_cli.parent.parent, installed_version)
     installed_cli = installed_version / "bin" / "serialwrap"
-    active = tmp_path / "active-bin" / "serialwrap"
-    active.unlink()
-    active.symlink_to(installed_cli)
+    driver.env["PATH"] = str(installed_cli.parent)
     doctor_before_probe = driver.parse(driver.sw("doctor"))
     profile_before_probe = next(check for check in doctor_before_probe["checks"]
                                 if check["check"] == "profile_template_fields")
@@ -1434,7 +1457,7 @@ def test_upgrade_rejects_candidate_cli_without_embedded_p290_asset(fake_driver, 
     embedded = result["detail"]["candidate_cli_p290_asset"]
     assert embedded["verdict"] == "FAIL" and embedded["detail"]["reported_missing_field"] is False, embedded
 
-    (tmp_path / "active-bin" / "serialwrap").unlink()
+    driver.env["PATH"] = str(tmp_path / "active-bin")
     unconfirmed = driver.judge_doctor(
         "doctor_green_new", "候選 CLI 路徑無法確認", require_pairing=True,
         profile_policy=driver.profile_policies["new"],
@@ -1548,7 +1571,7 @@ def test_upgrade_prefers_candidate_runtime_for_profile_yaml_probe(fake_driver):
     driver, _fake = fake_driver(cli_version=NEW_VERSION)
     candidate_python = driver.bundle / "versions" / NEW_VERSION / "py" / "bin" / "python3"
     candidate_python.parent.mkdir(parents=True)
-    candidate_python.symlink_to(sys.executable)
+    candidate_python.write_text("candidate runtime is supplied by the test subprocess stub\n", encoding="utf-8")
 
     result = driver.judge_doctor(
         "doctor_green_new", "候選 runtime YAML 解析", require_pairing=True,
@@ -1725,9 +1748,7 @@ def test_upgrade_accepts_installed_copy_of_candidate_cli(fake_driver, tmp_path):
     installed_version = tmp_path / "installed" / "versions" / NEW_VERSION
     shutil.copytree(source_version, installed_version)
     installed_cli = installed_version / "bin" / "serialwrap"
-    active = tmp_path / "active-bin" / "serialwrap"
-    active.unlink()
-    active.symlink_to(installed_cli)
+    driver.env["PATH"] = str(installed_cli.parent)
 
     result = driver.judge_doctor(
         "doctor_green_new", "不同路徑的安裝候選 CLI", require_pairing=True,
@@ -1758,9 +1779,7 @@ def test_upgrade_rejects_stale_embedded_asset_in_installed_copy(fake_driver, tmp
     stale_asset = yaml.safe_dump(parsed, sort_keys=False, allow_unicode=True).encode("utf-8")
     stale_cli = b"candidate CLI with stale embedded asset\n" + stale_asset
     installed_cli.write_bytes(stale_cli)
-    active = tmp_path / "active-bin" / "serialwrap"
-    active.unlink()
-    active.symlink_to(installed_cli)
+    driver.env["PATH"] = str(installed_cli.parent)
 
     result = driver.judge_doctor(
         "doctor_green_new", "舊內嵌資產安裝副本", require_pairing=True,
