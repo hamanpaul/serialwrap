@@ -39,5 +39,5 @@
   "fix/ci-thin-timing-margins": "1ec1992",
   "fix/289-doctor-profile-template-fields": "653b9e1",
   "fix/306-self-test-probe-safety": "9fc109f",
-  "fix/311-secret-echo-masking": "e066458"
+  "fix/311-secret-echo-masking": "a59eeb9"
 }
