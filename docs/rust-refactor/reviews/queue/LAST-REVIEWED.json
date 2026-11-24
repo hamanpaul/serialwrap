@@ -40,5 +40,5 @@
   "fix/289-doctor-profile-template-fields": "39a0ad3",
   "fix/306-self-test-probe-safety": "9fc109f",
   "fix/311-secret-echo-masking": "b319c0e",
-  "fix/288-submit-console-line-limit": "ced13a3"
+  "fix/288-submit-console-line-limit": "48b519b"
 }
