@@ -1265,7 +1265,7 @@ fn issue311_login_newline_before_secret_submit_does_not_end_echo_guard() {
     rig.secret_seen
         .recv_timeout(Duration::from_secs(3))
         .expect("secret 已越過 OS 提交點");
-    let tx_before_echo = rig.device.tx_len();
+    let tx_before_echo = tx_before_secret + SECRET.len() + 1;
     let echo = b"# secret\r\n";
     let read_before = rig.device.rx_bytes_read();
     rig.echo_release
@@ -1382,7 +1382,7 @@ fn issue311_console_unlock_newline_before_secret_submit_does_not_end_echo_guard(
     rig.secret_seen
         .recv_timeout(Duration::from_secs(3))
         .expect("console unlock secret 已越過 OS 提交點");
-    let tx_before_echo = rig.device.tx_len();
+    let tx_before_echo = tx_before_secret + SECRET.len() + 1;
     let echo = b"# secret\r\n";
     let read_before = rig.device.rx_bytes_read();
     rig.echo_release
