@@ -721,6 +721,23 @@ impl SessionCore {
             // 必關閉此 client；不登記、不授 owner，並要求 hub 關閉（hub 處理 close-all 時多半已關，重送為 no-op）。
             return vec![Effect::ConsoleClose { client_id }];
         }
+        if kind == ConsoleTransportKind::TcpTelnet {
+            let owner = format!("human:{client_id}");
+            let previous_lifetime = self
+                .human
+                .consoles
+                .get(&client_id)
+                .filter(|console| console.kind == ConsoleTransportKind::TcpTelnet)
+                .map(|console| console.client_lifetime);
+            if let Some(previous_lifetime) = previous_lifetime {
+                if let Some(pending) = self.pending_tcp_suspend_settlement.as_mut().filter(|pending| {
+                    pending.owner == owner && pending.client_lifetime == previous_lifetime
+                }) {
+                    // 同一個 human owner 換了 TCP client lifetime，延後結算改綁新連線；mirror 仍須通過共用 guard。
+                    pending.client_lifetime = lifetime;
+                }
+            }
+        }
         self.human.next_lifetime = self.human.next_lifetime.max(lifetime);
         self.human.consoles.insert(
             client_id.clone(),
@@ -985,6 +1002,7 @@ impl SessionCore {
         self.fg_source = None;
         // ownership 於下方 reset_for_stop 歸零；在途 probe 的 suspend 旗標隨世代失效，完成時不再 resume。
         self.self_test_suspend_gen = self.self_test_suspend_gen.wrapping_add(1);
+        self.pending_tcp_suspend_settlement = None;
         let reason = if *kind == StopKind::Release {
             InvalidateReason::Release
         } else {

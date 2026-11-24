@@ -127,9 +127,14 @@ impl SessionCore {
                 !stash.expired(now) && self.human_peer_present(&cid)
             };
             if stash_alive {
-                if stash.mirror_client_lifetime.is_some() {
+                if let Some(client_lifetime) = stash.mirror_client_lifetime {
+                    self.pending_tcp_suspend_settlement = Some(TcpSuspendSettlement {
+                        source_lease_id: lease.interactive_id.clone(),
+                        owner: stash.owner.clone(),
+                        client_lifetime,
+                    });
                     let before_hold = self.human.replay_hold.as_ref().map(|hold| hold.hold_id);
-                    if !self.restore_stashed_tcp_mirror_if_allowed(true) {
+                    if !self.restore_stashed_tcp_mirror_if_allowed() {
                         // agent 租約已關閉，但保留暫停中的 TCP 所有權，等共用 guard 開放。
                         self.human_set_owner(None);
                         return;
@@ -163,6 +168,13 @@ impl SessionCore {
                     })
                 });
             if replacement_tcp_owner {
+                if let Some((owner, client_lifetime)) = live_tcp_owner.as_ref() {
+                    self.pending_tcp_suspend_settlement = Some(TcpSuspendSettlement {
+                        source_lease_id: lease.interactive_id.clone(),
+                        owner: owner.clone(),
+                        client_lifetime: *client_lifetime,
+                    });
+                }
                 // 替換後的 TCP 所有者必須等 sync_tcp_console_lease 取得共用 guard 與 ticket，
                 // 建立鏡像後才解除暫停；否則 close／expiry 會先繞過 guard 重授 raw 所有權。
                 if let Some(cid) = post.dropped_stash_client.as_deref() {
@@ -239,6 +251,7 @@ impl SessionCore {
                 interactive_id: stash.interactive_id,
             });
         }
+        self.pending_tcp_suspend_settlement = None;
     }
 
     // ---------------- refresh（`_refresh_interactive_locked`） ----------------
@@ -286,7 +299,7 @@ impl SessionCore {
         if stashed_matches {
             // agent 租約關閉時若 guard 凍結，TCP 鏡像留在 stash；guard 開放後由下一次同步還原並恢復。
             if self.lease.is_none() {
-                self.restore_stashed_tcp_mirror_if_allowed(true);
+                self.restore_stashed_tcp_mirror_if_allowed();
             }
             return;
         }
@@ -317,10 +330,6 @@ impl SessionCore {
             .template
             .hard_timeout_s
             .max(ATTACHED_CONSOLE_LEASE_TIMEOUT_S);
-        let resume_suspended_owner = self.lease.is_none()
-            && self.stashed_human.is_none()
-            && self.human.ownership.suspend_depth > 0
-            && self.human.ownership.suspended_owner.as_deref() == Some(owner.as_str());
         let mut mirror = InteractiveLease::new(
             id.clone(),
             owner,
@@ -335,11 +344,7 @@ impl SessionCore {
                 self.lease = Some(mirror);
                 let mirror = self.lease.as_ref().expect("剛建立 TCP mirror").clone();
                 self.insert_lease_index(&mirror);
-                if resume_suspended_owner {
-                    let mut effects = Effects(Vec::new());
-                    self.human_suspend_end(true, &mut effects);
-                    self.fx_buf.extend(effects.0);
-                }
+                self.settle_pending_tcp_suspend_for(&mirror.owner, lifetime);
             }
             Some(active) if !active.is_human() && active.suspended_human && self.stashed_human.is_none() => {
                 self.stashed_human = Some(mirror);
@@ -376,6 +381,11 @@ impl SessionCore {
         }) {
             self.forget_stashed_tcp_mirror();
         }
+        let pending_matches = self.pending_tcp_suspend_matches(&owner, lifetime);
+        if pending_matches {
+            self.pending_tcp_suspend_settlement = None;
+            self.human.ownership.settle_suspend_without_owner();
+        }
     }
 
     fn forget_active_tcp_mirror(&mut self) {
@@ -395,7 +405,7 @@ impl SessionCore {
     }
 
     /// 共用 TCP 鏡像 guard 與 admission ticket，還原仍存活的軟式搶占 stash。
-    fn restore_stashed_tcp_mirror_if_allowed(&mut self, resume: bool) -> bool {
+    fn restore_stashed_tcp_mirror_if_allowed(&mut self) -> bool {
         let Some(stash) = self
             .stashed_human
             .as_ref()
@@ -423,13 +433,31 @@ impl SessionCore {
         };
         self.lease = Some(stash.clone());
         self.insert_lease_index(&stash);
-        self.human_set_owner(Some(&stash.owner));
-        if resume {
-            let mut effects = Effects(Vec::new());
-            self.human_suspend_end(true, &mut effects);
-            self.fx_buf.extend(effects.0);
-        }
+        self.settle_pending_tcp_suspend_for(
+            &stash.owner,
+            stash.mirror_client_lifetime.expect("TCP stash lifetime"),
+        );
         true
+    }
+
+    /// 只結算明確記錄且 owner/lifetime 相符的 agent soft-preempt suspend。
+    fn settle_pending_tcp_suspend_for(&mut self, owner: &str, client_lifetime: u64) -> bool {
+        if !self.pending_tcp_suspend_matches(owner, client_lifetime) {
+            return false;
+        }
+        self.pending_tcp_suspend_settlement = None;
+        let mut effects = Effects(Vec::new());
+        self.human_suspend_end(true, &mut effects);
+        self.fx_buf.extend(effects.0);
+        true
+    }
+
+    fn pending_tcp_suspend_matches(&self, owner: &str, client_lifetime: u64) -> bool {
+        self.pending_tcp_suspend_settlement.as_ref().is_some_and(|pending| {
+            !pending.source_lease_id.is_empty()
+                && pending.owner == owner
+                && pending.client_lifetime == client_lifetime
+        })
     }
 
     fn stashed_tcp_mirror_is_live(&self, stash: &InteractiveLease) -> bool {

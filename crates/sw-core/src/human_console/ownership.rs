@@ -85,6 +85,18 @@ impl OwnershipState {
         true
     }
 
+    /// 結算已失去 owner 的一層 suspend，不恢復 owner、不提升 pending owner，也不觸發回放。
+    pub fn settle_suspend_without_owner(&mut self) -> bool {
+        if self.suspend_depth == 0 {
+            return false;
+        }
+        self.suspend_depth -= 1;
+        if self.suspend_depth == 0 {
+            self.agent_active = false;
+        }
+        true
+    }
+
     /// `_set_interactive_admission`；true＝此刻回放（admission 開放且未 suspend）。
     pub fn set_admission(&mut self, allowed: bool, has_client: &dyn Fn(&str) -> bool) -> bool {
         self.admission_blocked = !allowed;

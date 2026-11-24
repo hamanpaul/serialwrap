@@ -31,6 +31,35 @@ fn active_id(h: &CoreHarness) -> String {
         .clone()
 }
 
+fn start_non_strict_self_test(h: &mut CoreHarness) -> sw_core::drain::OpId {
+    let (_reply, effects) = h.rpc_deferred(SessionRequest::SelfTest {
+        timeout_s: 2.0,
+        strict_human_lock: false,
+    });
+    effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp {
+                grant,
+                spec: sw_core::op_runner::OpSpec::SelfTestProbe { .. },
+            } => Some(grant.op_id),
+            _ => None,
+        })
+        .expect("非 strict self-test 應啟動 probe")
+}
+
+fn finish_self_test(h: &mut CoreHarness, op_id: sw_core::drain::OpId) -> Vec<Effect> {
+    h.feed(ControlEvent::OpFinished {
+        op_id,
+        epoch: h.epoch(),
+        outcome: OpOutcome::SelfTest(pydict! {
+            "probe_ok" => true,
+            "rx_bytes_last_10s" => 0,
+        }),
+        after_rx_seq: None,
+    })
+}
+
 fn close_mirror_publicly(h: &mut CoreHarness, client_id: &str) {
     let lease = h.core.active_lease().expect("TCP raw owner mirror lease");
     assert_eq!(lease.owner, format!("human:{client_id}"));
@@ -405,6 +434,137 @@ fn tcp_mirror_preempt_reconnect_preserves_new_owner() {
     replacement.scan(None);
     assert_eq!(replacement.core.active_lease().map(|lease| lease.owner.as_str()), Some("human:b"));
     assert_eq!(replacement.core.human_console().ownership.interactive_owner.as_deref(), Some("human:b"));
+}
+
+#[test]
+fn tcp_mirror_reconnect_does_not_resume_self_test_suspend() {
+    let mut h = tcp_ready(&["a"]);
+    let probe_op = start_non_strict_self_test(&mut h);
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1);
+    assert!(h.input("a", b"before-eof").iter().all(|effect| !matches!(effect, Effect::HumanTx { .. })));
+
+    h.disconnect("a");
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1, "EOF 不結算在途 probe 的 suspend");
+    let owner_gen_before_b = h.core.generations().owner_gen;
+    h.connect_stream_console("b", ConsoleTransportKind::TcpTelnet);
+    assert_eq!(h.core.active_lease().map(|lease| lease.owner.as_str()), Some("human:b"));
+
+    let during_probe = h.input("b", b"deferred");
+    assert!(during_probe.iter().all(|effect| !matches!(effect, Effect::HumanTx { .. })), "probe 完成前 B 不得送出 HumanTx");
+    assert_eq!(h.deferred_len("b"), b"deferred".len(), "B 輸入留在 deferred");
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1);
+    assert_eq!(h.core.generations().owner_gen, owner_gen_before_b, "鏡像建帳不得改變 owner generation");
+
+    let finished = finish_self_test(&mut h, probe_op);
+    let replay: Vec<_> = finished
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::HumanTx { permit, payload, .. } if permit.class == TxClass::HumanReplay => {
+                Some((permit.class, permit.source.clone(), payload.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replay, vec![(TxClass::HumanReplay, "human:b".into(), b"deferred".to_vec())]);
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 0);
+    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:b"));
+    assert_eq!(h.core.generations().owner_gen, owner_gen_before_b + 1, "probe 結束只因實際 raw owner 恢復增加一次 generation");
+    assert_eq!(h.human_tx().iter().filter(|(class, source, payload)| *class == TxClass::HumanReplay && source == "human:b" && payload == b"deferred").count(), 1);
+}
+
+#[test]
+fn tcp_mirror_delayed_soft_preempt_close_preserves_nested_self_test_suspend() {
+    let mut h = tcp_ready(&["a"]);
+    let probe_op = start_non_strict_self_test(&mut h);
+    let opened = h.rpc(open_req("agent:nested", 60.0, "", false)).expect("agent soft preempt");
+    assert_eq!(opened.get("soft_preempted"), Some(&PyValue::Bool(true)));
+    let agent_id = opened.get("interactive_id").and_then(PyValue::as_str).unwrap().to_string();
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 2, "probe 與 agent lease 各持有一層 suspend");
+
+    h.fence.with(|fence| fence.flash_critical = true);
+    h.rpc(close_req(&agent_id)).expect("guard 關閉期間 close agent lease");
+    assert!(h.core.active_lease().is_none());
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 2, "guard 關閉時保留 agent lease 自己的 suspend");
+    assert!(h.input("a", b"nested").iter().all(|effect| !matches!(effect, Effect::HumanTx { .. })));
+    assert_eq!(h.deferred_len("a"), b"nested".len());
+
+    let owner_gen_before_restore = h.core.generations().owner_gen;
+    h.fence.with(|fence| fence.flash_critical = false);
+    h.scan(None);
+    assert_eq!(h.core.active_lease().map(|lease| lease.owner.as_str()), Some("human:a"));
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1, "同步只結算 agent lease 的一層 suspend");
+    assert_eq!(h.core.human_console().ownership.interactive_owner, None, "self-test 尚在途時不得重授 raw owner");
+    assert_eq!(h.core.generations().owner_gen, owner_gen_before_restore, "guard 後建鏡不因簿記改變 owner generation");
+    assert!(h.input("a", b"still-deferred").iter().all(|effect| !matches!(effect, Effect::HumanTx { .. })));
+    assert_eq!(h.deferred_len("a"), b"nestedstill-deferred".len());
+
+    let finished = finish_self_test(&mut h, probe_op);
+    let replay: Vec<_> = finished
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::HumanTx { permit, payload, .. } if permit.class == TxClass::HumanReplay => {
+                Some((permit.class, permit.source.clone(), payload.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replay, vec![(TxClass::HumanReplay, "human:a".into(), b"nestedstill-deferred".to_vec())]);
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 0);
+    assert_eq!(h.human_tx().iter().filter(|(class, source, payload)| *class == TxClass::HumanReplay && source == "human:a" && payload == b"nestedstill-deferred").count(), 1);
+}
+
+#[test]
+fn tcp_mirror_delayed_replacement_eof_settles_suspend_without_grant() {
+    let mut h = tcp_ready(&["a"]);
+    let opened = h.rpc(open_req("agent:replace", 60.0, "", false)).expect("agent soft preempt");
+    let agent_id = opened.get("interactive_id").and_then(PyValue::as_str).unwrap().to_string();
+    h.fence.with(|fence| fence.flash_critical = true);
+
+    h.disconnect("a");
+    h.connect_stream_console("b", ConsoleTransportKind::TcpTelnet);
+    h.rpc(close_req(&agent_id)).expect("guard 關閉期間 close replacement");
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1);
+    assert!(h.core.active_lease().is_none());
+    assert!(h.core.stashed_human_lease().is_none(), "replacement owner 由既有 sync 延後建鏡，不放入 stash");
+
+    // C 在延後還原期間接入，但既有規則不會立即授予第二個 client raw ownership。
+    h.connect_stream_console("c", ConsoleTransportKind::TcpTelnet);
+    assert_eq!(h.core.human_console().ownership.suspended_owner.as_deref(), Some("human:b"));
+    h.disconnect("b");
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 0, "失效的 replacement 結束時結算其 lease suspend，不能洩漏 depth");
+    assert!(!h.core.human_console().ownership.agent_active);
+    assert_eq!(h.core.human_console().ownership.interactive_owner, None, "沒有 guard 授權前不把 C 提升為 raw owner");
+    assert!(h.core.active_lease().is_none());
+    assert!(h.core.stashed_human_lease().is_none());
+
+    h.scan(None);
+    assert_eq!(h.core.human_console().ownership.interactive_owner, None, "flash guard 關閉時不授予仍存活的 C");
+    h.fence.with(|fence| fence.flash_critical = false);
+    h.scan(None);
+    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:c"), "guard 開放後由既有 self-heal 正常接班");
+    assert_eq!(h.core.active_lease().map(|lease| lease.owner.as_str()), Some("human:c"));
+}
+
+#[test]
+fn tcp_mirror_delayed_same_id_replacement_eof_settles_suspend() {
+    let mut h = tcp_ready(&["a"]);
+    let opened = h.rpc(open_req("agent:same-id-replace", 60.0, "", false)).expect("agent soft preempt");
+    let agent_id = opened.get("interactive_id").and_then(PyValue::as_str).unwrap().to_string();
+    h.fence.with(|fence| fence.flash_critical = true);
+
+    h.rpc(close_req(&agent_id)).expect("guard 關閉期間 close agent lease");
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1);
+    assert!(h.core.stashed_human_lease().is_some());
+
+    // 同一個 human owner 以新 lifetime 取代仍在 stash 的 TCP client。
+    let replacement_lifetime = h.connect_stream_console("a", ConsoleTransportKind::TcpTelnet);
+    assert_eq!(h.core.human_console().consoles["a"].client_lifetime, replacement_lifetime);
+    assert!(h.core.active_lease().is_none(), "flash guard 關閉時不建立替換 client mirror");
+
+    h.disconnect("a");
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 0, "替換 client EOF 必須結算原 lease suspend");
+    assert_eq!(h.core.human_console().ownership.interactive_owner, None, "EOF 不重授已失效的 owner");
+    assert!(h.core.stashed_human_lease().is_none());
 }
 
 #[test]
