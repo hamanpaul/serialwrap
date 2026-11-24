@@ -437,17 +437,17 @@ fn build_controlled_console_unlock_rig_with_pause(
     let (echo_release, echo_release_rx) = crossbeam_channel::bounded(1);
     let (ready_probe_seen_tx, ready_probe_seen) = crossbeam_channel::bounded(1);
     device.clear_replies();
-    let reboot_device = device.clone();
+    device.on_tx_match("^reboot$", Box::new(|_| b"rebooting\r\n".to_vec()));
+    let locked_prompt_device = device.clone();
     device.on_tx_match(
-        "^reboot$",
+        "^$",
         Box::new(move |_| {
             if pause_secret_tx {
-                reboot_device.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+                locked_prompt_device.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
             }
-            b"rebooting\r\n".to_vec()
+            b"locked console\r\n".to_vec()
         }),
     );
-    device.on_tx_match("^$", Box::new(|_| b"locked console\r\n".to_vec()));
     let secret_pattern = format!("^{secret}$");
     device.on_tx_match(
         &secret_pattern,
