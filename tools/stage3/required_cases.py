@@ -484,7 +484,7 @@ def main(
     parser = argparse.ArgumentParser(description="核對 Stage 3 逐出口案例分母與指定靜態種子")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true", help="只讀核對目前分母鎖")
-    mode.add_argument("--add-only", action="store_true", help="只新增目前鎖缺少的出口／案例 ID")
+    mode.add_argument("--add-only", action="store_true", help="只新增目前鎖缺少的出口／平台／案例 ID")
     parser.add_argument("--base", help="PR base revision；檢查其既有鎖只增")
     args = parser.parse_args(argv)
     root = Path(repo_root or Path(__file__).resolve().parents[2]).resolve()
@@ -496,26 +496,33 @@ def main(
             raise ValueError("；".join(errors))
         expected = _expected_exit_cases(catalog, cases_doc, case_lock)
         seed_expected = _seed_expected_exit_cases(catalog, root / EVIDENCE_RELATIVE)
-        seed_errors = _validate_seed_floor(lock, seed_expected)
-        if seed_errors:
-            raise ValueError("；".join(seed_errors))
-        family_errors = _seed_family_errors(cases_doc, root / EVIDENCE_RELATIVE)
-        if family_errors:
-            raise ValueError("；".join(family_errors))
-        structure_errors = _validate_lock(lock, expected, allow_missing=args.add_only)
-        if args.base:
-            structure_errors.extend(_base_errors(
-                lock, cases_doc, base=args.base, repo_root=root, source_reader=reader,
-            ))
-        if structure_errors:
-            raise ValueError("；".join(structure_errors))
-
         lock_path = root / ACCEPTANCE_RELATIVE / "stage3_required_cases.lock.json"
         if args.check:
+            check_errors = _validate_seed_floor(lock, seed_expected)
+            check_errors.extend(_seed_family_errors(cases_doc, root / EVIDENCE_RELATIVE))
+            check_errors.extend(_validate_lock(lock, expected))
+            if args.base:
+                check_errors.extend(_base_errors(
+                    lock, cases_doc, base=args.base, repo_root=root, source_reader=reader,
+                ))
+            if check_errors:
+                raise ValueError("；".join(check_errors))
             print("Stage 3 分母鎖、指定 Git 種子與 PR base 只增檢查通過。")
             return 0
 
-        # 先拒絕任何既有三元組或出口屬性變更，再追加目前資料要求的新 ID。
+        # 先核對舊鎖仍與目前目錄相容，並確認 PR base 的所有權分母未被刪改。
+        precheck_errors = _validate_lock(lock, expected, allow_missing=True)
+        if args.base:
+            precheck_errors.extend(_base_errors(
+                lock, cases_doc, base=args.base, repo_root=root, source_reader=reader,
+            ))
+        if precheck_errors:
+            raise ValueError("；".join(precheck_errors))
+        family_errors = _seed_family_errors(cases_doc, root / EVIDENCE_RELATIVE)
+        if family_errors:
+            raise ValueError("；".join(family_errors))
+
+        # 在記憶體中追加目錄的新出口／平台與案例 ID，再完整核對候選鎖。
         updated = json.loads(json.dumps(lock))
         changed = False
         for item_id, platforms in expected.items():
@@ -537,12 +544,19 @@ def main(
                 if new_ids:
                     entry["case_ids"] = sorted(existing | desired)
                     changed = True
+
+        final_errors = _validate_seed_floor(updated, seed_expected)
+        final_errors.extend(_validate_lock(updated, expected))
+        if args.base:
+            final_errors.extend(_base_errors(
+                updated, cases_doc, base=args.base, repo_root=root, source_reader=reader,
+            ))
+        if final_errors:
+            raise ValueError("；".join(final_errors))
+
         if changed:
-            final_errors = _validate_lock(updated, expected)
-            if final_errors:
-                raise ValueError("；".join(final_errors))
             _write_lock(lock_path, updated)
-            print("Stage 3 分母鎖只新增了目前必要的出口或案例 ID。")
+            print("Stage 3 分母鎖只新增了目前必要的出口、平台或案例 ID。")
         else:
             print("Stage 3 分母鎖已完整，無需更新。")
         return 0

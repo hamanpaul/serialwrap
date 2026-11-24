@@ -658,8 +658,10 @@ def test_required_cases_seed_preserves_full_denominator():
     assert lock["seed"]["case_lock"]["path"] == "denominators/cases.lock.json"
     assert lock["seed"]["case_lock"]["sha256"] == hashlib.sha256((DENOMINATORS / "cases.lock.json").read_bytes()).hexdigest()
     assert (DENOMINATORS / "source-manifest.json").is_file()
-    assert set(lock["exits"]) == {item_id for item_id, _, _, _ in STAGE3_REQUIRED_EXIT_SPECS}
+    seed_exit_ids = {item_id for item_id, _, _, _ in STAGE3_REQUIRED_EXIT_SPECS}
+    assert seed_exit_ids <= set(lock["exits"])
     for item_id, platform, layer, families in STAGE3_REQUIRED_EXIT_SPECS:
+        assert platform in lock["exits"][item_id]
         expected = _seed_required_case_ids(cases, case_lock, layer, platform, families)
         actual = required_cases.required_for_exit(lock, item_id, platform)
         assert expected <= actual
@@ -820,6 +822,81 @@ def test_required_cases_l3_new_family_is_required_and_add_only_registers_it(tmp_
     assert required_cases.main(["--add-only"], repo_root=root, source_reader=source_reader) == 0
     updated = _load(acceptance / "stage3_required_cases.lock.json")
     assert new_case_id in required_cases.required_for_exit(updated, "S3-L3-P0P1-REMOTE-WINDOWS", "windows")
+
+
+def test_required_cases_add_only_registers_new_exit(tmp_path):
+    from tools.stage3 import required_cases
+
+    root, source_reader = _required_cases_repo(tmp_path)
+    acceptance = root / "tests" / "acceptance"
+    catalog_path = acceptance / "stage_exits.json"
+    catalog = _load(catalog_path)
+    new_exit = copy.deepcopy(next(
+        item for item in catalog["items"] if item["item_id"] == "S3-L3-P0P1-REMOTE-WINDOWS"
+    ))
+    new_exit["item_id"] = "S3-L3-P0P1-REMOTE-WINDOWS-ADDED-FIXTURE"
+    new_exit["title"] = "新增 Stage 3 出口測試 fixture"
+    catalog["items"].append(new_exit)
+    catalog_path.write_text(json.dumps(catalog, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                            encoding="utf-8")
+
+    result = required_cases.main(["--add-only", "--base", "base-revision"], repo_root=root,
+                                 source_reader=source_reader)
+    assert result == 0
+    updated = _load(acceptance / "stage3_required_cases.lock.json")
+    assert "S3-L3-P0P1-REMOTE-WINDOWS-ADDED-FIXTURE" in updated["exits"]
+
+
+def test_required_cases_add_only_registers_new_platform(tmp_path):
+    from tools.stage3 import required_cases
+
+    root, source_reader = _required_cases_repo(tmp_path)
+    acceptance = root / "tests" / "acceptance"
+    catalog_path = acceptance / "stage_exits.json"
+    catalog = _load(catalog_path)
+    item = next(item for item in catalog["items"] if item["item_id"] == "S3-L15-RELEASE-AB-LINUX")
+    item["platform"] = "both"
+    catalog_path.write_text(json.dumps(catalog, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                            encoding="utf-8")
+
+    result = required_cases.main(["--add-only", "--base", "base-revision"], repo_root=root,
+                                 source_reader=source_reader)
+    assert result == 0
+    updated = _load(acceptance / "stage3_required_cases.lock.json")
+    assert "windows" in updated["exits"]["S3-L15-RELEASE-AB-LINUX"]
+
+
+def test_required_cases_add_only_rejects_base_exit_shrink_without_writing(tmp_path, capsys):
+    from tools.stage3 import required_cases
+
+    root, source_reader = _required_cases_repo(tmp_path)
+    acceptance = root / "tests" / "acceptance"
+    catalog_path = acceptance / "stage_exits.json"
+    catalog = _load(catalog_path)
+    new_exit = copy.deepcopy(next(
+        item for item in catalog["items"] if item["item_id"] == "S3-L3-P0P1-REMOTE-WINDOWS"
+    ))
+    new_exit["item_id"] = "S3-L3-P0P1-REMOTE-WINDOWS-ADDED-FIXTURE"
+    new_exit["title"] = "新增 Stage 3 出口測試 fixture"
+    catalog["items"] = [
+        item for item in catalog["items"] if item["item_id"] != "S3-L3-P0P1-REMOTE-LINUX"
+    ]
+    catalog["items"].append(new_exit)
+    catalog_path.write_text(json.dumps(catalog, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                            encoding="utf-8")
+
+    lock_path = acceptance / "stage3_required_cases.lock.json"
+    lock = _load(lock_path)
+    del lock["exits"]["S3-L3-P0P1-REMOTE-LINUX"]
+    lock_path.write_text(json.dumps(lock, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                         encoding="utf-8")
+    before = lock_path.read_bytes()
+
+    result = required_cases.main(["--add-only", "--base", "base-revision"], repo_root=root,
+                                 source_reader=source_reader)
+    assert result != 0
+    assert "既有出口不可刪除：S3-L3-P0P1-REMOTE-LINUX" in capsys.readouterr().err
+    assert lock_path.read_bytes() == before
 
 
 def test_required_cases_base_rejects_reclassification_of_existing_l3_case(tmp_path):
