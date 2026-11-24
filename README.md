@@ -855,6 +855,10 @@ own resolved default regardless. Run `serialwrap daemon status`
 warns on shell/daemon mismatch) to see the path the *live* daemon actually
 uses.
 
+Automatic-login password echoes and console-unlock secret echoes are replaced
+with the same number of `*` characters in the WAL and downstream RX views while
+the secret-echo guard is active.
+
 ### Windows Support
 
 Windows uses pyserial for `COMx` access and a loopback TCP RPC endpoint instead
@@ -2848,6 +2852,7 @@ retry，也不等於 daemon 檔案日誌。詳見 [CLI trace 契約](docs/refine
 
 `~/b-log` **不是** WAL——它只存放 agent 觸發式的 on-demand session capture。權威
 WAL 一律落在 `SERIALWRAP_WAL_DIR`（預設 `~/.local/state/serialwrap/wal/`）。
+自動登入密碼與 console unlock secret 在守衛時間窗內若被 DUT 回顯，WAL 中的回顯會以等長 `*` 呈現，下游 RX 輸出亦相同。
 在 shell 裡（例如 `.bashrc`）匯出的 `SERIALWRAP_WAL_DIR` 只對從該 shell 啟動的
 行程有效；systemd 託管的 daemon **不會**繼承它（產生的 unit 預設不含對應的
 `Environment=` 那一行），仍會照自己解析出的預設路徑寫下去。要看 *live* daemon

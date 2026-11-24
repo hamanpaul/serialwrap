@@ -22,7 +22,7 @@ use sw_proto::pyre::{PyFlags, PyRegex, compile, escape};
 
 use crate::session_auth::{AuthResolution, SessionAuth, credentials_declared_but_unresolved};
 use crate::tx_writer::{FenceReject, OpId, TxClass, TxJob, TxPermit, TxReport, TxWriterHandle};
-use crate::uart_bridge::{RunCancel, RxShared, WaitOutcome};
+use crate::uart_bridge::{RunCancel, RxShared, SecretEchoGuard, WaitOutcome};
 
 pub use crate::quiet_gate::detect_boot_banner;
 
@@ -75,6 +75,8 @@ pub struct LoginIo<'a> {
     pub tx: &'a dyn Fn(&[u8], TxClass, &str, bool) -> TxReport,
     pub clock: &'a dyn Clock,
     pub nonce: &'a dyn Fn() -> String,
+    /// secret TX 前寫入只含 byte 長度的 WAL META；失敗時 fail closed，不送出憑證。
+    pub audit_secret_tx: &'a dyn Fn(usize) -> bool,
     /// P7 Task 3：SC-30 取消。
     pub cancel: &'a RunCancel,
     /// P7 Task 3：`LoginProbe`｜`ReadyReconfirm`（呼叫端決定）。
@@ -500,8 +502,56 @@ fn send_command(io: &LoginIo, cmd: &str) -> Step<()> {
     send(io, cmd, "system", true)
 }
 
-fn send_secret(io: &LoginIo, secret: &str) -> Step<()> {
-    send(io, secret, "system:secret", false)
+fn send_secret<'a>(io: &LoginIo<'a>, secret: &str) -> Step<SecretEchoGuard<'a>> {
+    let guard = io.rx.arm_secret_echo(secret.as_bytes());
+    let secret_len = secret.as_bytes().len();
+    if !(io.audit_secret_tx)(secret_len) {
+        return Err(LoginOutcome::Raised {
+            exc: "WalUnavailableError".to_string(),
+            message: "secret TX audit unavailable".to_string(),
+        });
+    }
+    let mut bytes = secret.as_bytes().to_vec();
+    if !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    let report = (io.tx)(&bytes, io.class, "system:secret", false);
+    match report.result.outcome {
+        TxOutcome::Completed(n) if n >= bytes.len() => return Ok(guard),
+        TxOutcome::NotSubmitted if report.reject.is_none() => {
+            return Err(LoginOutcome::Aborted(LoginAbort::Cancelled));
+        }
+        _ => {}
+    }
+    Err(match classify_login_secret_tx_failure(&report) {
+        TxFail::Refused => LoginOutcome::Aborted(LoginAbort::Refused(
+            report.reject.unwrap_or(FenceReject::Quiet),
+        )),
+        TxFail::Raised { exc, message } => LoginOutcome::Raised {
+            exc: exc.to_string(),
+            message,
+        },
+    })
+}
+
+fn classify_login_secret_tx_failure(report: &TxReport) -> TxFail {
+    match report.reject {
+        Some(FenceReject::Quiet | FenceReject::ReconfirmPending | FenceReject::FsmMismatch) => {
+            TxFail::Refused
+        }
+        Some(FenceReject::WalUnhealthy) => TxFail::Raised {
+            exc: "WalUnavailableError",
+            message: "secret TX incomplete: WAL_UNHEALTHY".to_string(),
+        },
+        _ if matches!(report.result.outcome, TxOutcome::Unknown { .. }) => TxFail::Raised {
+            exc: "TxUnknownError",
+            message: "secret TX outcome unknown".to_string(),
+        },
+        _ => TxFail::Raised {
+            exc: "TxIncompleteError",
+            message: "secret TX incomplete".to_string(),
+        },
+    }
 }
 
 /// `bridge.wait_for_regex(pattern, timeout_s)`：regex 先編譯（失敗 → `Raised`），再以整個 RX 視窗等待。
@@ -640,8 +690,9 @@ fn maybe_login(
             Ok(password) => password,
             Err(code) => return Ok((false, Some(code.into()))),
         };
-        send_secret(io, &password)?;
+        let guard = send_secret(io, &password)?;
         let ok = wait_regex(io, &t.prompt_regex, timeout)?;
+        drop(guard);
         io.rx.clear();
         return Ok((ok, (!ok).then(|| timeout_code.into())));
     }
@@ -722,10 +773,39 @@ fn ensure_console_unlocked(
             return Ok(Some("CONSOLE_UNLOCK_IDLE_TIMEOUT".into()));
         }
         io.rx.clear();
-        send_secret(io, secret)?;
-        if !wait_regex(io, &t.prompt_regex, timeout)? {
+        let guard = send_secret(io, secret)?;
+        let prompt = wait_regex(io, &t.prompt_regex, timeout)?;
+        drop(guard);
+        if !prompt {
             return Ok(Some("CONSOLE_UNLOCK_PROMPT_TIMEOUT".into()));
         }
     }
     finalize_ready(io, p)
+}
+
+#[cfg(test)]
+mod issue311_tests {
+    use super::{classify_login_secret_tx_failure, TxFail};
+    use crate::tx_writer::{OpId, TxReport};
+    use sw_pal::traits::{TxOutcome, TxResult};
+
+    #[test]
+    fn issue311_secret_tx_failure_does_not_disclose_length() {
+        let report = TxReport {
+            op_id: OpId(1),
+            epoch: 1,
+            result: TxResult {
+                outcome: TxOutcome::Completed(1),
+                error: None,
+            },
+            wal: None,
+            reject: None,
+        };
+        let TxFail::Raised { exc, message } = classify_login_secret_tx_failure(&report) else {
+            panic!("部分 secret TX 應回 Raised");
+        };
+        assert_eq!(exc, "TxIncompleteError");
+        assert!(!message.contains("/11"), "secret TX 長度外洩：{message:?}");
+        assert_eq!(message, "secret TX incomplete");
+    }
 }

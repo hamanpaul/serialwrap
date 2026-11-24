@@ -187,12 +187,14 @@ impl LoginRig {
             tx_ok(b.len())
         };
         let nonce = || NONCE.to_string();
+        let audit_secret_tx = |_secret_len: usize| true;
         let cancel = sw_core::uart_bridge::RunCancel::new(&self.rx);
         let io = LoginIo {
             rx: &self.rx,
             tx: &tx,
             clock: &*self.clock,
             nonce: &nonce,
+            audit_secret_tx: &audit_secret_tx,
             cancel: &cancel,
             class: TxClass::LoginProbe,
         };

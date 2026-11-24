@@ -3,12 +3,12 @@
 //! T10 提供 reader thread、RX 視窗及哨兵 fan-out；IoWorker 的啟停與 TX 組裝由 T12 完成。
 
 use std::collections::VecDeque;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Sender, bounded};
+use crossbeam_channel::{bounded, Sender};
 use sw_pal::traits::{
     CancelToken, Clock, CloseToken, PalError, PalErrorKind, ReadError, ReadOutcome, SerialHandle,
     SerialReader, SerialWriter,
@@ -16,13 +16,13 @@ use sw_pal::traits::{
 use sw_proto::pycompat::decode_utf8_replace;
 use sw_proto::pyre::PyRegex;
 
-use crate::Mono;
 use crate::drain::StopId;
 use crate::mailbox::{ControlEvent, DataEvent};
 use crate::tx_writer::{
-    EvidenceGap, Fence, TxLedger, TxWriterHandle, TxWriterStop, spawn_tx_writer,
+    spawn_tx_writer, EvidenceGap, Fence, TxLedger, TxWriterHandle, TxWriterStop,
 };
 use crate::wal::{WalAppendReq, WalWriter};
+use crate::Mono;
 
 const IO_POLL: Duration = Duration::from_millis(200);
 const RX_RATE_WINDOW_NS: u64 = 10_000_000_000;
@@ -112,12 +112,39 @@ pub struct RxShared {
     stats_override: AtomicU64,
     /// P7 Task 10：agent log 的 reader 端寫入者（`append` 內同步呼叫；Python `_on_bridge_rx` 於 reader 執行緒寫檔）。
     capture: Mutex<Option<Arc<crate::capture::CaptureObserver>>>,
+    /// OD-111：只在登入 FSM 明確武裝的窗口內遮罩 secret 回顯；reader 的所有出口共用此狀態。
+    secret_echo: Mutex<SecretEchoWindow>,
     /// P7 Task 7（SC-30）：login run 取消世代。`RunCancel` 建立時記下當時值，之後遞增即視為已取消
     /// （actor 在 quiet arm 的同一事件內呼叫 `cancel_login_runs`，不需新增 Effect 變體）。
     run_cancel_gen: AtomicU64,
     /// P8 Task 5：檔案傳輸等待的取消世代。drain Phase 1（`SessionCore::begin_stop`，所有 `StopKind`）遞增；
     /// 只影響以 [`RunCancel::watching_transfers`] 建立的取消旗標，login run（SC-30）不受影響。
     transfer_cancel_gen: AtomicU64,
+}
+
+#[derive(Default)]
+struct SecretEchoWindow {
+    next_id: u64,
+    armed: Option<ArmedSecretEcho>,
+    released: VecDeque<u8>,
+}
+
+struct ArmedSecretEcho {
+    id: u64,
+    secret: Vec<u8>,
+    pending: Vec<u8>,
+}
+
+/// 自 `send_secret` 前武裝，於 prompt 命中、逾時或取消離開作用域時解除。
+pub struct SecretEchoGuard<'a> {
+    rx: &'a RxShared,
+    id: u64,
+}
+
+impl Drop for SecretEchoGuard<'_> {
+    fn drop(&mut self) {
+        self.rx.disarm_secret_echo(self.id);
+    }
 }
 
 impl RxShared {
@@ -132,6 +159,7 @@ impl RxShared {
             wakers: Mutex::new(Vec::new()),
             stats_override: AtomicU64::new(u64::MAX),
             capture: Mutex::new(None),
+            secret_echo: Mutex::new(SecretEchoWindow::default()),
             run_cancel_gen: AtomicU64::new(0),
             transfer_cancel_gen: AtomicU64::new(0),
         })
@@ -155,10 +183,86 @@ impl RxShared {
         *self.capture.lock().unwrap_or_else(|e| e.into_inner()) = capture;
     }
 
+    /// 只遮罩此守衛存續期間、與 `secret` 完全相符的 byte 序列。
+    pub fn arm_secret_echo(&self, secret: &[u8]) -> SecretEchoGuard<'_> {
+        let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mut previous) = window.armed.take() {
+            window.released.extend(previous.pending.drain(..));
+            previous.secret.fill(0);
+        }
+        window.next_id = window.next_id.wrapping_add(1).max(1);
+        let id = window.next_id;
+        if !secret.is_empty() {
+            window.armed = Some(ArmedSecretEcho {
+                id,
+                secret: secret.to_vec(),
+                pending: Vec::with_capacity(secret.len().saturating_sub(1)),
+            });
+        }
+        drop(window);
+        self.wake_all();
+        SecretEchoGuard { rx: self, id }
+    }
+
+    /// reader 專用：回傳現在可以安全發布的 RX bytes。armed 時最多保留 secret 長度減 1 byte。
+    fn mask_secret_echo(&self, data: &[u8]) -> Vec<u8> {
+        let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
+        let mut visible = window.released.drain(..).collect::<Vec<_>>();
+        let Some(armed) = window.armed.as_mut() else {
+            visible.extend_from_slice(data);
+            return visible;
+        };
+
+        for byte in data {
+            let split = armed.secret.len().saturating_sub(1);
+            if armed.pending.len() == split
+                && armed.pending.as_slice() == &armed.secret[..split]
+                && *byte == armed.secret[split]
+            {
+                visible.resize(visible.len().saturating_add(armed.secret.len()), b'*');
+                armed.pending.clear();
+                continue;
+            }
+            armed.pending.push(*byte);
+            while !armed.secret.starts_with(&armed.pending) {
+                visible.push(armed.pending.remove(0));
+            }
+        }
+        visible
+    }
+
+    /// 守衛解除後由 reader 取出未匹配的前綴；active guard 的 pending bytes 不會由此洩漏。
+    fn take_ready_secret_echo(&self) -> Vec<u8> {
+        self.secret_echo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .released
+            .drain(..)
+            .collect()
+    }
+
+    fn disarm_secret_echo(&self, id: u64) {
+        if id == 0 {
+            return;
+        }
+        let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
+        if window.armed.as_ref().is_some_and(|armed| armed.id == id) {
+            if let Some(mut armed) = window.armed.take() {
+                window.released.extend(armed.pending.drain(..));
+                armed.secret.fill(0);
+            }
+        }
+        drop(window);
+        self.wake_all();
+    }
+
     /// 喚醒所有 `wait_for_regex_cancellable` 等待者（容量 1、滿則略過；已斷線者移除）。
     fn wake_all(&self) {
         self.changed.notify_all();
-        let mut wakers = self.wakers.lock().unwrap_or_else(|error| error.into_inner());
+        let mut wakers = self
+            .wakers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         wakers.retain(|tx| {
             !matches!(
                 tx.try_send(()),
@@ -168,15 +272,31 @@ impl RxShared {
     }
 
     pub fn append(&self, data: &[u8], now: Mono, epoch: u64, rx_seq: u64) {
+        self.record_rx_activity(data.len(), now);
+        self.append_sanitized(data, epoch, rx_seq);
+    }
+
+    /// raw RX 活動統計保留原始 byte 數與到達時間，即使 secret 前綴仍在 matcher 暫存中。
+    fn record_rx_activity(&self, count: usize, now: Mono) {
+        if count == 0 {
+            return;
+        }
+        let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        window.total_bytes = window.total_bytes.saturating_add(count as u64);
+        window.last_rx_mono = now;
+        window.prune_rate(now);
+        window.rate.push_back((now, count as u64));
+        window.cap_rate();
+        drop(window);
+        self.wake_all();
+    }
+
+    /// 只把 reader 已通過 secret matcher 的 bytes 寫入可觀察 RX window 與 agent capture。
+    fn append_sanitized(&self, data: &[u8], epoch: u64, rx_seq: u64) {
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         window.watermark = (epoch, rx_seq);
         window.revision = window.revision.saturating_add(1);
         if !data.is_empty() {
-            window.total_bytes = window.total_bytes.saturating_add(data.len() as u64);
-            window.last_rx_mono = now;
-            window.prune_rate(now);
-            window.rate.push_back((now, data.len() as u64));
-            window.cap_rate();
             window.text.push_str(&decode_utf8_replace(data));
             window.trim_to_limit();
         }
@@ -463,7 +583,7 @@ pub fn spawn_reader_with_test_hooks(
 
 fn spawn_reader_inner(
     mut reader: Box<dyn SerialReader>,
-    ctx: ReaderCtx,
+    mut ctx: ReaderCtx,
     stop: Arc<AtomicBool>,
     after_rx_append: Option<Arc<dyn Fn() + Send + Sync>>,
     warning_sink: Arc<dyn Fn(&str) + Send + Sync>,
@@ -472,12 +592,20 @@ fn spawn_reader_inner(
     std::thread::Builder::new()
         .name(format!("serialwrap-rx-{}-{}", ctx.com, ctx.epoch))
         .spawn(move || {
-            let mut sentinel = ctx.sentinel;
-            let mut rx_seq = 0u64;
-            let mut queued_rx_seq = 0u64;
+            let mut sentinel = std::mem::take(&mut ctx.sentinel);
             let mut buf = [0u8; 8192];
             let mut error = None;
-            let mut unrecorded = Vec::new();
+            let mut publisher = ReaderPublisher {
+                ctx: &ctx,
+                stop: &stop,
+                after_rx_append: after_rx_append.as_ref(),
+                warning_sink: warning_sink.as_ref(),
+                observers: &observers,
+                sentinel: &mut sentinel,
+                rx_seq: 0,
+                queued_rx_seq: 0,
+                unrecorded: Vec::new(),
+            };
 
             loop {
                 if stop.load(Ordering::Acquire) {
@@ -485,96 +613,34 @@ fn spawn_reader_inner(
                 }
                 match reader.read(&mut buf, Some(IO_POLL)) {
                     Ok(ReadOutcome::Data(0)) => {
+                        if publisher.flush_secret_echo() {
+                            break;
+                        }
                         ctx.clock.sleep(IO_POLL);
-                        drain_sentinel_input(&mut sentinel);
+                        publisher.drain_sentinel_input();
                     }
                     Ok(ReadOutcome::Data(count)) => {
-                        let data = &buf[..count.min(buf.len())];
-                        let should_stop = catch_unwind(AssertUnwindSafe(|| {
-                            let wal_entry = ctx.wal.append(WalAppendReq {
-                                com: &ctx.com,
-                                dir: "RX",
-                                source: "device",
-                                payload: data,
-                                cmd_id: None,
-                                loss_flag: false,
-                                meta: None,
-                            });
-                            if wal_entry.loss_flag {
-                                let message = ctx
-                                    .wal
-                                    .health()
-                                    .last_write_error
-                                    .unwrap_or_else(|| "RX WAL append failed".to_string());
-                                if unrecorded.len()
-                                    < crate::tx_writer::TX_LEDGER_UNRESOLVED_GAPS_MAX
-                                {
-                                    unrecorded.push(EvidenceGap {
-                                        op_id: None,
-                                        dir: "RX",
-                                        len: data.len(),
-                                        error: PalError::plain(PalErrorKind::Io, message),
-                                    });
-                                }
-                            }
-                            // DF-15：WAL append 之後依序通知觀察者（Python `_on_bridge_rx`：例外一律吞掉）。
-                            for obs in &observers {
-                                let _ = catch_unwind(AssertUnwindSafe(|| {
-                                    obs.on_rx(&ctx.com, data, wal_entry.seq)
-                                }));
-                            }
-                            let now = ctx.clock.mono_ns();
-                            rx_seq = rx_seq.saturating_add(1);
-                            ctx.rx.append(data, now, ctx.epoch, rx_seq);
-                            if let Some(hook) = after_rx_append.as_ref() {
-                                hook();
-                            }
-
-                            // 增補 #21（07 Task 9 Step 3 第 7 點）：WAL → hub `try_send`（滿載只計數）→ data lane。
-                            if let Some(tap) = ctx.hub.as_ref() {
-                                tap.push(data, warning_sink.as_ref());
-                            }
-
-                            if let Some(console) = sentinel.as_mut() {
-                                if catch_unwind(AssertUnwindSafe(|| console.try_write(data)))
-                                    .is_err()
-                                {
-                                    warn_rx_handler_panic(&ctx.com, warning_sink.as_ref());
-                                }
-                            }
-
-                            let mut event = DataEvent::UartRxChunk {
-                                epoch: ctx.epoch,
-                                rx_seq,
-                                wal_seq: wal_entry.seq,
-                                bytes: data.to_vec(),
-                            };
-                            loop {
-                                if stop.load(Ordering::Acquire) {
-                                    return true;
-                                }
-                                match ctx.data.send_timeout(event, DATA_SEND_POLL) {
-                                    Ok(()) => return false,
-                                    Err(crossbeam_channel::SendTimeoutError::Timeout(retry)) => {
-                                        event = retry;
-                                    }
-                                    Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
-                                        return true;
-                                    }
-                                }
-                            }
-                        }));
-                        match should_stop {
-                            Ok(true) => break,
-                            Ok(false) => queued_rx_seq = rx_seq,
-                            Err(_) => warn_rx_handler_panic(&ctx.com, warning_sink.as_ref()),
+                        let raw = &buf[..count.min(buf.len())];
+                        ctx.rx.record_rx_activity(raw.len(), ctx.clock.mono_ns());
+                        let visible = ctx.rx.mask_secret_echo(raw);
+                        if publisher.publish(&visible) {
+                            break;
                         }
                     }
-                    Ok(ReadOutcome::Eof) => ctx.clock.sleep(IO_POLL),
+                    Ok(ReadOutcome::Eof) => {
+                        if publisher.flush_secret_echo() {
+                            break;
+                        }
+                        ctx.clock.sleep(IO_POLL);
+                    }
                     Ok(ReadOutcome::Woken | ReadOutcome::TimedOut) => {
-                        drain_sentinel_input(&mut sentinel);
+                        if publisher.flush_secret_echo() {
+                            break;
+                        }
+                        publisher.drain_sentinel_input();
                     }
                     Err(read_error) => {
+                        let _ = publisher.flush_secret_echo();
                         let (prefix, pal_error) = match read_error {
                             ReadError::Wait(error) => ("SELECT", error),
                             ReadError::Read(error) => ("SERIAL_READ", error),
@@ -596,15 +662,129 @@ fn spawn_reader_inner(
                 }
             }
 
+            // Stop 與 disarm 可能交錯；只有 guard 已解除並釋出的前綴才會在 reader 結束前發布。
+            let _ = publisher.flush_secret_echo();
+            let rx_seq = publisher.queued_rx_seq;
+            let unrecorded = std::mem::take(&mut publisher.unrecorded);
+            drop(publisher);
+
             ReaderExit {
                 reader,
                 sentinel,
                 error,
-                rx_seq: queued_rx_seq,
+                rx_seq,
                 unrecorded,
             }
         })
         .expect("建立 UART reader thread")
+}
+
+struct ReaderPublisher<'a> {
+    ctx: &'a ReaderCtx,
+    stop: &'a AtomicBool,
+    after_rx_append: Option<&'a Arc<dyn Fn() + Send + Sync>>,
+    warning_sink: &'a (dyn Fn(&str) + Send + Sync),
+    observers: &'a [Arc<dyn RxObserver>],
+    sentinel: &'a mut Option<Box<dyn ConsoleIo>>,
+    rx_seq: u64,
+    queued_rx_seq: u64,
+    unrecorded: Vec<EvidenceGap>,
+}
+
+impl ReaderPublisher<'_> {
+    fn publish(&mut self, data: &[u8]) -> bool {
+        if data.is_empty() {
+            return false;
+        }
+        match catch_unwind(AssertUnwindSafe(|| self.publish_inner(data))) {
+            Ok(should_stop) => should_stop,
+            Err(_) => {
+                warn_rx_handler_panic(&self.ctx.com, self.warning_sink);
+                false
+            }
+        }
+    }
+
+    fn publish_inner(&mut self, data: &[u8]) -> bool {
+        let wal_entry = self.ctx.wal.append(WalAppendReq {
+            com: &self.ctx.com,
+            dir: "RX",
+            source: "device",
+            payload: data,
+            cmd_id: None,
+            loss_flag: false,
+            meta: None,
+        });
+        if wal_entry.loss_flag {
+            let message = self
+                .ctx
+                .wal
+                .health()
+                .last_write_error
+                .unwrap_or_else(|| "RX WAL append failed".to_string());
+            if self.unrecorded.len() < crate::tx_writer::TX_LEDGER_UNRESOLVED_GAPS_MAX {
+                self.unrecorded.push(EvidenceGap {
+                    op_id: None,
+                    dir: "RX",
+                    len: data.len(),
+                    error: PalError::plain(PalErrorKind::Io, message),
+                });
+            }
+        }
+        // DF-15：WAL append 之後依序通知觀察者（Python `_on_bridge_rx`：例外一律吞掉）。
+        for obs in self.observers {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                obs.on_rx(&self.ctx.com, data, wal_entry.seq)
+            }));
+        }
+        self.rx_seq = self.rx_seq.saturating_add(1);
+        self.ctx
+            .rx
+            .append_sanitized(data, self.ctx.epoch, self.rx_seq);
+        if let Some(hook) = self.after_rx_append {
+            hook();
+        }
+
+        // 增補 #21（07 Task 9 Step 3 第 7 點）：WAL → hub `try_send`（滿載只計數）→ data lane。
+        if let Some(tap) = self.ctx.hub.as_ref() {
+            tap.push(data, self.warning_sink);
+        }
+
+        if let Some(console) = self.sentinel.as_mut() {
+            if catch_unwind(AssertUnwindSafe(|| console.try_write(data))).is_err() {
+                warn_rx_handler_panic(&self.ctx.com, self.warning_sink);
+            }
+        }
+
+        let mut event = DataEvent::UartRxChunk {
+            epoch: self.ctx.epoch,
+            rx_seq: self.rx_seq,
+            wal_seq: wal_entry.seq,
+            bytes: data.to_vec(),
+        };
+        loop {
+            if self.stop.load(Ordering::Acquire) {
+                return true;
+            }
+            match self.ctx.data.send_timeout(event, DATA_SEND_POLL) {
+                Ok(()) => {
+                    self.queued_rx_seq = self.rx_seq;
+                    return false;
+                }
+                Err(crossbeam_channel::SendTimeoutError::Timeout(retry)) => event = retry,
+                Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => return true,
+            }
+        }
+    }
+
+    fn flush_secret_echo(&mut self) -> bool {
+        let ready = self.ctx.rx.take_ready_secret_echo();
+        self.publish(&ready)
+    }
+
+    fn drain_sentinel_input(&mut self) {
+        drain_sentinel_input(self.sentinel);
+    }
 }
 
 fn drain_sentinel_input(sentinel: &mut Option<Box<dyn ConsoleIo>>) {
@@ -744,7 +924,10 @@ impl IoWorker {
             fn is_alive(&self) -> bool {
                 false
             }
-            fn configure(&self, _cfg: &sw_pal::traits::SerialConfig) -> sw_pal::traits::PalResult<()> {
+            fn configure(
+                &self,
+                _cfg: &sw_pal::traits::SerialConfig,
+            ) -> sw_pal::traits::PalResult<()> {
                 Ok(())
             }
             fn close(self: Box<Self>) -> sw_pal::traits::CloseReceipt {
@@ -862,38 +1045,39 @@ impl IoWorker {
             .spawn(move || {
                 let writer_result = writer.join();
                 let reader_result = reader.join();
-                let (ledger, reader_exit, reader_rx_seq, close_receipt) = match (writer_result, reader_result) {
-                    (Ok((writer, ledger)), Ok(reader_exit)) => {
-                        let ReaderExit {
-                            reader,
-                            sentinel,
-                            error: _,
-                            rx_seq,
-                            unrecorded,
-                        } = reader_exit;
-                        drop(sentinel);
-                        drop(sentinel_keepalive);
-                        let close_receipt = close.close(reader, writer);
-                        (ledger, Some(unrecorded), Some(rx_seq), Some(close_receipt))
-                    }
-                    _ => {
-                        let error = PalError::plain(
-                            PalErrorKind::Io,
-                            "UART worker thread panicked before returning its handle",
-                        );
-                        let receipt = crate::drain::WorkerStoppedReceipt {
-                            epoch,
-                            stop_id,
-                            ledger: TxLedger::default(),
-                            unrecorded: Vec::new(),
-                            wal_error: Some(error.clone()),
-                            handle_closed: false,
-                            close_error: Some(error),
-                        };
-                        let _ = control.send(ControlEvent::WorkerStopped(receipt));
-                        return;
-                    }
-                };
+                let (ledger, reader_exit, reader_rx_seq, close_receipt) =
+                    match (writer_result, reader_result) {
+                        (Ok((writer, ledger)), Ok(reader_exit)) => {
+                            let ReaderExit {
+                                reader,
+                                sentinel,
+                                error: _,
+                                rx_seq,
+                                unrecorded,
+                            } = reader_exit;
+                            drop(sentinel);
+                            drop(sentinel_keepalive);
+                            let close_receipt = close.close(reader, writer);
+                            (ledger, Some(unrecorded), Some(rx_seq), Some(close_receipt))
+                        }
+                        _ => {
+                            let error = PalError::plain(
+                                PalErrorKind::Io,
+                                "UART worker thread panicked before returning its handle",
+                            );
+                            let receipt = crate::drain::WorkerStoppedReceipt {
+                                epoch,
+                                stop_id,
+                                ledger: TxLedger::default(),
+                                unrecorded: Vec::new(),
+                                wal_error: Some(error.clone()),
+                                handle_closed: false,
+                                close_error: Some(error),
+                            };
+                            let _ = control.send(ControlEvent::WorkerStopped(receipt));
+                            return;
+                        }
+                    };
 
                 let mut unrecorded = reader_exit.unwrap_or_default();
                 for gap in &ledger.unresolved_gaps {
@@ -1037,7 +1221,10 @@ impl RxShared {
             }
             let (snapshot, revision) = {
                 let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-                (window.text_from(from.unwrap_or(0)).to_string(), window.revision)
+                (
+                    window.text_from(from.unwrap_or(0)).to_string(),
+                    window.revision,
+                )
             };
             if re.search(&snapshot).is_some() {
                 return WaitOutcome::Matched;
@@ -1096,17 +1283,15 @@ fn wait_for_rx_dispatch_with_timeout(
     let (reply, ack) = bounded(1);
     let expired = Arc::new(AtomicBool::new(false));
     let deadline = Instant::now() + timeout;
-    if let Err(error) = safety
-        .send_timeout(
-            ControlEvent::DrainDataBarrier {
-                epoch,
-                rx_seq,
-                reply,
-                expired: expired.clone(),
-            },
-            deadline.saturating_duration_since(Instant::now()),
-        )
-    {
+    if let Err(error) = safety.send_timeout(
+        ControlEvent::DrainDataBarrier {
+            epoch,
+            rx_seq,
+            reply,
+            expired: expired.clone(),
+        },
+        deadline.saturating_duration_since(Instant::now()),
+    ) {
         expired.store(true, Ordering::Release);
         return Err(PalError::plain(
             PalErrorKind::Io,
@@ -1126,7 +1311,8 @@ fn wait_for_rx_dispatch_with_timeout(
             expired.store(true, Ordering::Release);
             Err(PalError::plain(
                 PalErrorKind::Io,
-                "RX drain barrier 等待逾時，capture 順序未確認：timed out waiting on channel".to_string(),
+                "RX drain barrier 等待逾時，capture 順序未確認：timed out waiting on channel"
+                    .to_string(),
             ))
         }
     }

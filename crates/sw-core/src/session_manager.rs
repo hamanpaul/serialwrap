@@ -5385,12 +5385,29 @@ impl ManagerExec {
         let clock = self.shared.clock.clone();
         let profile = lock(&self.io.profile).clone();
         let env = self.shared.env.clone();
+        let wal = self.shared.wal.clone();
         let control = control.clone();
         let _ = std::thread::Builder::new()
             .name(format!("serialwrap-login-{}", profile.com))
             .spawn(move || {
                 let send = crate::login_fsm::login_tx_sender(handle, epoch, 0, fsm_gen);
                 let nonce = nonce_hex8;
+                let com = profile.com.clone();
+                let audit_secret_tx = move |secret_len: usize| {
+                    let mut meta = PyDict::new();
+                    meta.insert("event", PyValue::from("secret_tx"));
+                    meta.insert("secret_len", PyValue::Int(PyInt::Small(secret_len as i128)));
+                    let append = wal.append(WalAppendReq {
+                        com: &com,
+                        dir: "META",
+                        source: "system:secret",
+                        payload: b"",
+                        cmd_id: None,
+                        loss_flag: false,
+                        meta: Some(meta),
+                    });
+                    append.ok && !append.loss_flag
+                };
                 // merge P7（Task 3）：LoginIo 增 cancel／class（Task 7 起由 OpRunner 依 run 種類決定 class）。
                 let cancel = crate::uart_bridge::RunCancel::new(&rx);
                 let io = crate::login_fsm::LoginIo {
@@ -5398,6 +5415,7 @@ impl ManagerExec {
                     tx: &send,
                     clock: &*clock,
                     nonce: &nonce,
+                    audit_secret_tx: &audit_secret_tx,
                     cancel: &cancel,
                     class: crate::tx_writer::TxClass::LoginProbe,
                 };

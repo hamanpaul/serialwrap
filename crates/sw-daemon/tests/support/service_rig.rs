@@ -408,6 +408,33 @@ impl ServiceRig {
         )
     }
 
+    /// 以自訂 UART、環境、PTY console 與 RX observer 建構 rig；observer 會在 bootstrap attach 前註冊。
+    pub fn build_with_env_serial_console_observers(
+        spec: RigSpec,
+        env: Arc<FakeEnv>,
+        serial_backend: Arc<dyn SerialBackend>,
+        observers: Vec<Arc<dyn sw_core::uart_bridge::RxObserver>>,
+    ) -> ServiceRig {
+        let console = Arc::new(RigPtyFactory {
+            fake: sw_pal::fakes::console::FakeConsoleFactory::new(ConsoleKind::Pty),
+            created: Mutex::new(Vec::new()),
+            native_tcp: false,
+            native_com0com: false,
+            serial_console: None,
+            opened_serial_consoles: Mutex::new(Vec::new()),
+        });
+        ServiceRig::build_with_code_identity_and_observers(
+            spec,
+            Some(console),
+            None,
+            Some("/fake/bundle".to_string()),
+            Some(serial_backend),
+            LoadedState::default(),
+            Some(env),
+            observers,
+        )
+    }
+
     /// 以指定的載入狀態建構 rig；不需在 `RigSpec` 增加跨既有測試的必填欄位。
     pub fn build_with_loaded_state(spec: RigSpec, loaded: LoadedState) -> ServiceRig {
         ServiceRig::build_with_code_identity(
@@ -618,6 +645,28 @@ impl ServiceRig {
         loaded: LoadedState,
         env: Option<Arc<FakeEnv>>,
     ) -> ServiceRig {
+        ServiceRig::build_with_code_identity_and_observers(
+            spec,
+            console,
+            code_fingerprint,
+            code_path,
+            serial_backend,
+            loaded,
+            env,
+            Vec::new(),
+        )
+    }
+
+    fn build_with_code_identity_and_observers(
+        spec: RigSpec,
+        console: Option<Arc<RigPtyFactory>>,
+        code_fingerprint: Option<String>,
+        code_path: Option<String>,
+        serial_backend: Option<Arc<dyn SerialBackend>>,
+        loaded: LoadedState,
+        env: Option<Arc<FakeEnv>>,
+        observers: Vec<Arc<dyn sw_core::uart_bridge::RxObserver>>,
+    ) -> ServiceRig {
         let env = env.unwrap_or_else(|| Arc::new(FakeEnv::default()));
         let serial = FakeSerialBackend::new();
         let mut devices = BTreeMap::new();
@@ -677,6 +726,9 @@ impl ServiceRig {
             warn: Arc::new(|_msg: String| {}),
         });
         let procs = FakeProcScan::new(Vec::new());
+        for observer in observers {
+            mgr.add_rx_observer(observer);
+        }
         mgr.update_devices(&snapshot);
         mgr.bootstrap_attach();
         let svc = Arc::new(Service::new(ServiceDeps {

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "serialwrap WAL META events contract",
-  "x-catalog-revision": 6,
+  "x-catalog-revision": 7,
   "type": "object",
   "oneOf": [
     {
@@ -318,6 +318,34 @@
             "partial",
             "unknown"
           ]
+        }
+      }
+    },
+    {
+      "title": "secret_tx",
+      "description": "自動登入密碼或 console unlock secret 的 TX 長度稽核；不得包含 secret 值",
+      "x-status": "IMPLEMENTED",
+      "x-behavior-change": "BC-14",
+      "x-outer-record": {
+        "dir": "META",
+        "source": "system:secret",
+        "cmd_id": null,
+        "payload_b64": ""
+      },
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event",
+        "secret_len"
+      ],
+      "properties": {
+        "event": {
+          "const": "secret_tx"
+        },
+        "secret_len": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "secret UTF-8 byte length; secret value is never included"
         }
       }
     }

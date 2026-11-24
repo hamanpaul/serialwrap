@@ -23,6 +23,10 @@ use sw_proto::pyjson::PyValue;
 /// 虛擬時鐘原點（ns）；保留空間給 `idle_s`（開始前的靜默）。
 pub const BASE: u64 = 1_000_000_000_000;
 
+fn no_secret_audit(_secret_len: usize) -> bool {
+    true
+}
+
 #[derive(Clone, Debug)]
 enum On {
     Eq,
@@ -466,6 +470,7 @@ impl LoginRig {
             tx: &*self.tx,
             clock: &*self.clock,
             nonce: &*self.nonce,
+            audit_secret_tx: &no_secret_audit,
             cancel: &self.cancel,
             class: self.class,
         }

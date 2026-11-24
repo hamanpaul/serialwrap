@@ -292,12 +292,12 @@ fn refusal_and_partial_write_abort_without_further_tx() {
         .on_eq("admin", "Password: ")
         .partial_on(3)
         .build();
-    // merge P5 F16：部分寫出 → Python `TxIncompleteError`（`str(exc)`；outcome 字面值 `completed`）。
+    // OD-111：secret 部分寫出仍保留錯誤類別，但訊息不得洩漏 TX 長度。
     assert_eq!(
         ensure_ready(&rig2.io(), &sp, &admin_pw(), &empty_env()),
         LoginOutcome::Raised {
             exc: "TxIncompleteError".into(),
-            message: "tx incomplete: completed 1/3 None".into(),
+            message: "secret TX incomplete".into(),
         }
     );
     assert_eq!(rig2.sent_triples().len(), 3, "secret 部分寫出後不重送、不再等 prompt");
