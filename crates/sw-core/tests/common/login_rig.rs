@@ -265,7 +265,7 @@ impl Inner {
     }
 }
 
-type TxFn = dyn Fn(&[u8], TxClass, &str, bool) -> TxReport + Send + Sync;
+type TxFn = dyn Fn(&[u8], TxClass, &str, bool, Option<u64>) -> TxReport + Send + Sync;
 type NonceFn = dyn Fn() -> String + Send + Sync;
 
 /// 建構器（`LoginRig::new()…build()` 或 `LoginRig::from_dsl`）。
@@ -393,7 +393,7 @@ impl LoginRigBuilder {
             clock,
             cancel,
             class: self.class.unwrap_or(TxClass::LoginProbe),
-            tx: Box::new(move |p, c, s, l| tx_inner.tx(p, c, s, l)),
+            tx: Box::new(move |p, c, s, l, _secret_echo_id| tx_inner.tx(p, c, s, l)),
             nonce: Box::new(move || nonce_inner.nonce()),
             inner,
         }

@@ -167,7 +167,13 @@ impl LoginRig {
         let clock = Arc::clone(&self.clock);
         let written = Arc::clone(&self.written);
         let seq = Arc::new(AtomicU64::new(100));
-        let tx = move |b: &[u8], class: TxClass, source: &str, log: bool| -> TxReport {
+        let tx = move |
+            b: &[u8],
+            class: TxClass,
+            source: &str,
+            log: bool,
+            _secret_echo_id: Option<u64>,
+        | -> TxReport {
             written
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

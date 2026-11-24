@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{bounded, Sender};
 use sw_pal::traits::{
     CancelToken, Clock, CloseToken, PalError, PalErrorKind, ReadError, ReadOutcome, SerialHandle,
-    SerialReader, SerialWriter,
+    SerialReader, SerialWriter, SubmitStep,
 };
 use sw_proto::pycompat::decode_utf8_replace;
 use sw_proto::pyre::PyRegex;
@@ -105,6 +105,9 @@ impl RxWindow {
 /// RX 視窗（絕對偏移；跨 epoch 的 watermark 以 `(epoch, rx_seq)` 表示）。
 pub struct RxShared {
     inner: Mutex<RxWindow>,
+    /// 將 reader 的 RX 讀取／發布與 secret PAL submit 排序。
+    rx_ingest: Mutex<RxIngestState>,
+    rx_ingest_changed: Condvar,
     changed: Condvar,
     /// P7 Task 3：`wait_for_regex_cancellable` 的喚醒通道（append／clear／`RunCancel::trigger` 時 `try_send`）。
     wakers: Mutex<Vec<Sender<()>>>,
@@ -143,8 +146,45 @@ struct ArmedSecretEcho {
     start_from: u64,
     deadline: Option<Mono>,
     preserve_on_drop: bool,
+    /// 只有 PAL 已接受 secret 的至少一個 byte 後，RX 才屬於 echo 守衛行。
+    tx_submitted: bool,
     line_open: bool,
     guard_dropped: bool,
+}
+
+#[derive(Default)]
+struct RxIngestState {
+    active_readers: usize,
+    submit_waiters: usize,
+    submit_active: bool,
+}
+
+/// 表示一個 UART read 及其 RX 發布尚未完成。
+struct RxIngestGuard<'a> {
+    rx: &'a RxShared,
+}
+
+impl Drop for RxIngestGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.rx.rx_ingest.lock().unwrap_or_else(|e| e.into_inner());
+        state.active_readers = state.active_readers.saturating_sub(1);
+        drop(state);
+        self.rx.rx_ingest_changed.notify_all();
+    }
+}
+
+/// 阻止新的 UART read，直到 secret PAL submit 和守衛起點更新完成。
+struct SecretSubmitGuard<'a> {
+    rx: &'a RxShared,
+}
+
+impl Drop for SecretSubmitGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.rx.rx_ingest.lock().unwrap_or_else(|e| e.into_inner());
+        state.submit_active = false;
+        drop(state);
+        self.rx.rx_ingest_changed.notify_all();
+    }
 }
 
 struct MaskedRxChunk {
@@ -165,6 +205,10 @@ impl Drop for SecretEchoGuard<'_> {
 }
 
 impl SecretEchoGuard<'_> {
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     /// secret 可能已送出：保留同一行遮罩窗口到行終止符或期限。
     pub fn set_deadline(&self, deadline: Mono) {
         self.rx.set_secret_echo_deadline(self.id, deadline, true);
@@ -184,6 +228,8 @@ impl RxShared {
                 last_rx_mono: created_mono,
                 ..RxWindow::default()
             }),
+            rx_ingest: Mutex::new(RxIngestState::default()),
+            rx_ingest_changed: Condvar::new(),
             changed: Condvar::new(),
             wakers: Mutex::new(Vec::new()),
             stats_override: AtomicU64::new(u64::MAX),
@@ -215,7 +261,7 @@ impl RxShared {
 
     /// 只遮罩此守衛存續期間、與 `secret` 完全相符的 byte 序列。
     pub fn arm_secret_echo(&self, secret: &[u8]) -> SecretEchoGuard<'_> {
-        self.arm_secret_echo_inner(secret, 0)
+        self.arm_secret_echo_inner(secret, 0, true)
     }
 
     /// 登入 FSM 專用：從武裝時的 RX 偏移等待 prompt；未決 secret 前綴不參與 prompt 比對。
@@ -225,10 +271,15 @@ impl RxShared {
         _prompt_pattern: &str,
     ) -> SecretEchoGuard<'_> {
         let start_from = self.snapshot_len();
-        self.arm_secret_echo_inner(secret, start_from)
+        self.arm_secret_echo_inner(secret, start_from, false)
     }
 
-    fn arm_secret_echo_inner(&self, secret: &[u8], start_from: u64) -> SecretEchoGuard<'_> {
+    fn arm_secret_echo_inner(
+        &self,
+        secret: &[u8],
+        start_from: u64,
+        tx_submitted: bool,
+    ) -> SecretEchoGuard<'_> {
         let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(mut previous) = window.armed.take() {
             Self::release_pending(&mut window, &mut previous);
@@ -244,6 +295,7 @@ impl RxShared {
                 start_from,
                 deadline: None,
                 preserve_on_drop: false,
+                tx_submitted,
                 line_open: true,
                 guard_dropped: false,
             });
@@ -263,6 +315,61 @@ impl RxShared {
         drop(window);
         self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
         self.wake_all();
+    }
+
+    /// 在 PAL submit 的序列化區間啟動遮罩窗口，避免 reader 把 submit 前的換行當成 echo 行終點。
+    pub(crate) fn submit_secret_echo(
+        &self,
+        id: u64,
+        os_submit: &mut dyn FnMut() -> SubmitStep,
+    ) -> SubmitStep {
+        let _submit = self.begin_secret_submit();
+        let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
+        let step = os_submit();
+        if matches!(&step, SubmitStep::Accepted(len) if *len > 0)
+            || matches!(&step, SubmitStep::Pending)
+        {
+            let start_from = self.snapshot_len();
+            if let Some(armed) = window
+                .armed
+                .as_mut()
+                .filter(|armed| armed.id == id && !armed.tx_submitted)
+            {
+                armed.tx_submitted = true;
+                armed.line_open = true;
+                armed.start_from = start_from;
+            }
+        }
+        drop(window);
+        self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
+        self.wake_all();
+        step
+    }
+
+    fn begin_rx_ingest(&self) -> RxIngestGuard<'_> {
+        let mut state = self.rx_ingest.lock().unwrap_or_else(|e| e.into_inner());
+        while state.submit_active || state.submit_waiters > 0 {
+            state = self
+                .rx_ingest_changed
+                .wait(state)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        state.active_readers += 1;
+        RxIngestGuard { rx: self }
+    }
+
+    fn begin_secret_submit(&self) -> SecretSubmitGuard<'_> {
+        let mut state = self.rx_ingest.lock().unwrap_or_else(|e| e.into_inner());
+        state.submit_waiters += 1;
+        while state.submit_active || state.active_readers > 0 {
+            state = self
+                .rx_ingest_changed
+                .wait(state)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        state.submit_waiters = state.submit_waiters.saturating_sub(1);
+        state.submit_active = true;
+        SecretSubmitGuard { rx: self }
     }
 
     fn release_pending(window: &mut SecretEchoWindow, armed: &mut ArmedSecretEcho) {
@@ -305,7 +412,7 @@ impl RxShared {
             }
         }
         let line_ended = if let Some(armed) = window.armed.as_mut() {
-            if !armed.line_open {
+            if !armed.tx_submitted || !armed.line_open {
                 visible.extend_from_slice(data);
                 rx_window.extend_from_slice(data);
                 false
@@ -817,11 +924,15 @@ fn spawn_reader_inner(
                 if stop.load(Ordering::Acquire) {
                     break;
                 }
+                // 將 read() 與 RX 發布記為一個未完成區間；secret submit 會等待它收斂，
+                // 但不長時間持鎖阻塞 UART read。
+                let rx_ingest = ctx.rx.begin_rx_ingest();
                 match reader.read(&mut buf, Some(IO_POLL)) {
                     Ok(ReadOutcome::Data(0)) => {
                         if publisher.flush_secret_echo() {
                             break;
                         }
+                        drop(rx_ingest);
                         ctx.clock.sleep(IO_POLL);
                         publisher.drain_sentinel_input();
                     }
@@ -838,6 +949,7 @@ fn spawn_reader_inner(
                         if publisher.flush_secret_echo() {
                             break;
                         }
+                        drop(rx_ingest);
                         ctx.clock.sleep(IO_POLL);
                     }
                     Ok(ReadOutcome::Woken | ReadOutcome::TimedOut) => {

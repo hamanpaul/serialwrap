@@ -72,7 +72,8 @@ pub enum LoginAbort {
 pub struct LoginIo<'a> {
     pub rx: &'a RxShared,
     /// P7 Task 3：回 06 T9 `TxReport`（取得 fence 拒絕原因）。
-    pub tx: &'a dyn Fn(&[u8], TxClass, &str, bool) -> TxReport,
+    /// 最後一個參數只在 secret TX 時帶入守衛 id，供 PAL submit 啟用回顯遮罩。
+    pub tx: &'a dyn Fn(&[u8], TxClass, &str, bool, Option<u64>) -> TxReport,
     pub clock: &'a dyn Clock,
     pub nonce: &'a dyn Fn() -> String,
     /// secret TX 前寫入只含 byte 長度的 WAL META；失敗時 fail closed，不送出憑證。
@@ -323,12 +324,17 @@ pub fn login_error_detail(rx: &RxShared, code: &str) -> Option<String> {
 /// 每筆 TX 取得 `TxReport` 後立即 settle（登入 op 不參與 BC-03 映射）；TxWriter 已結束時回 `NotSubmitted`。
 pub fn login_tx_sender(
     handle: TxWriterHandle,
+    rx: Arc<RxShared>,
     epoch: u64,
     owner_gen: u64,
     fsm_gen: u64,
-) -> impl Fn(&[u8], TxClass, &str, bool) -> TxReport + Send + Sync {
+) -> impl Fn(&[u8], TxClass, &str, bool, Option<u64>) -> TxReport + Send + Sync {
     let handle = Arc::new(handle);
-    move |payload: &[u8], class: TxClass, source: &str, log: bool| -> TxReport {
+    move |payload: &[u8],
+          class: TxClass,
+          source: &str,
+          log: bool,
+          secret_echo_id: Option<u64>| -> TxReport {
         let op_id = OpId(LOGIN_OP_ID_BASE | NEXT_LOGIN_OP.fetch_add(1, Ordering::Relaxed));
         let (reply, report) = crossbeam_channel::bounded(1);
         let job = TxJob {
@@ -360,10 +366,19 @@ pub fn login_tx_sender(
             wal: None,
             reject: Some(FenceReject::Frozen),
         };
+        if let Some(id) = secret_echo_id {
+            let submit_rx = rx.clone();
+            handle.register_submit_hook(
+                op_id,
+                Arc::new(move |os_submit| submit_rx.submit_secret_echo(id, os_submit)),
+            );
+        }
         if handle.jobs.send(job).is_err() {
+            handle.remove_submit_hook(op_id);
             return not_submitted;
         }
         let result = handle.wait_report(&report).unwrap_or(not_submitted);
+        handle.remove_submit_hook(op_id);
         let _ = handle.settle(op_id);
         result
     }
@@ -478,7 +493,7 @@ fn send(io: &LoginIo, payload: &str, source: &str, log: bool) -> Step<()> {
     if !bytes.ends_with(b"\n") {
         bytes.push(b'\n');
     }
-    let report = (io.tx)(&bytes, io.class, source, log);
+    let report = (io.tx)(&bytes, io.class, source, log, None);
     match report.result.outcome {
         TxOutcome::Completed(n) if n >= bytes.len() => return Ok(()),
         // 未提交且無 fence 原因：run 被取消（SC-30 RunCancel）。
@@ -522,7 +537,13 @@ fn send_secret<'a>(
     if !bytes.ends_with(b"\n") {
         bytes.push(b'\n');
     }
-    let report = (io.tx)(&bytes, io.class, "system:secret", false);
+    let report = (io.tx)(
+        &bytes,
+        io.class,
+        "system:secret",
+        false,
+        Some(guard.id()),
+    );
     let deadline = io
         .clock
         .mono_ns()
@@ -815,9 +836,10 @@ mod issue311_tests {
     };
     use crate::tx_writer::{OpId, TxClass, TxReport};
     use crate::uart_bridge::{RunCancel, RxShared};
+    use std::sync::Arc;
     use std::time::Duration;
     use sw_pal::fakes::FakeClock;
-    use sw_pal::traits::{Clock, PalError, PalErrorKind, TxOutcome, TxResult};
+    use sw_pal::traits::{Clock, PalError, PalErrorKind, SubmitStep, TxOutcome, TxResult};
 
     #[test]
     fn issue311_secret_tx_failure_does_not_disclose_length() {
@@ -857,9 +879,24 @@ mod issue311_tests {
                 wal: None,
                 reject: None,
             };
-            let tx = move |_bytes: &[u8], _class, _source: &str, _log: bool| report.clone();
+            let tx_rx = Arc::clone(&rx);
+            let tx = move |_bytes: &[u8], _class, _source: &str, _log: bool, secret_echo_id| {
+                if let Some(id) = secret_echo_id {
+                    let mut submit = || SubmitStep::Accepted(1);
+                    let _ = tx_rx.submit_secret_echo(id, &mut submit);
+                }
+                report.clone()
+            };
             let nonce = || "n".to_string();
-            let audit = |_length: usize| true;
+            let audit_rx = Arc::clone(&rx);
+            let audit = |_length: usize| {
+                assert_eq!(
+                    audit_rx.issue311_test_mask_secret_echo(b"\r\n", 0),
+                    b"\r\n".to_vec(),
+                    "secret submit 前的換行不得關閉回顯遮罩窗口"
+                );
+                true
+            };
             let io = LoginIo {
                 rx: &rx,
                 tx: &tx,

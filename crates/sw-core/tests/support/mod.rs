@@ -1192,7 +1192,13 @@ impl EffectExecutor for RigExec {
                 let env = self.env.clone();
                 let control = tx.clone();
                 std::thread::spawn(move || {
-                    let send = sw_core::login_fsm::login_tx_sender(handle, epoch, 0, fsm_gen);
+                    let send = sw_core::login_fsm::login_tx_sender(
+                        handle,
+                        rx.clone(),
+                        epoch,
+                        0,
+                        fsm_gen,
+                    );
                     let nonce = rig_nonce;
                     let audit_secret_tx = |_secret_len: usize| true;
                     // P7 Task 3：LoginIo 增 cancel／class（Task 7 起由 OpRunner 依 run 種類決定 class）。

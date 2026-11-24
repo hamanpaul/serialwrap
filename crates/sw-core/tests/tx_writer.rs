@@ -2019,6 +2019,7 @@ fn submit_gate_allows_pending_line_holder() {
         fence: &fence,
         permit: &permit,
         last_reject: std::cell::Cell::new(None),
+        submit_hook: None,
     };
     let mut submits = 0;
     let result = gate.submit(&mut || {
@@ -2046,6 +2047,7 @@ fn submit_gate_rejects_non_holder_while_line_pending() {
         fence: &fence,
         permit: &permit,
         last_reject: std::cell::Cell::new(None),
+        submit_hook: None,
     };
     let mut submits = 0;
     assert!(gate
@@ -2080,6 +2082,7 @@ fn submit_gate_rejects_original_holder_after_close_or_force_freeze() {
             fence: &fence,
             permit: &permit,
             last_reject: std::cell::Cell::new(None),
+            submit_hook: None,
         };
         let mut submits = 0;
         assert!(gate
@@ -2111,6 +2114,7 @@ fn submit_gate_rejects_every_class_when_shutdown_has_no_open_line() {
             fence: &fence,
             permit: &permit,
             last_reject: std::cell::Cell::new(None),
+            submit_hook: None,
         };
         let mut submits = 0;
         assert!(gate

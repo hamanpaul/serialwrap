@@ -5390,7 +5390,13 @@ impl ManagerExec {
         let _ = std::thread::Builder::new()
             .name(format!("serialwrap-login-{}", profile.com))
             .spawn(move || {
-                let send = crate::login_fsm::login_tx_sender(handle, epoch, 0, fsm_gen);
+                let send = crate::login_fsm::login_tx_sender(
+                    handle,
+                    rx.clone(),
+                    epoch,
+                    0,
+                    fsm_gen,
+                );
                 let nonce = nonce_hex8;
                 let com = profile.com.clone();
                 let audit_secret_tx = move |secret_len: usize| {
