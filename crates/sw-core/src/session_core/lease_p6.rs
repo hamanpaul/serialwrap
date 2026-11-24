@@ -132,18 +132,12 @@ impl SessionCore {
                         source_lease_id: lease.interactive_id.clone(),
                         owner: stash.owner.clone(),
                         client_lifetime,
+                        tick,
                     });
-                    let before_hold = self.human.replay_hold.as_ref().map(|hold| hold.hold_id);
                     if !self.restore_stashed_tcp_mirror_if_allowed() {
                         // agent 租約已關閉，但保留暫停中的 TCP 所有權，等共用 guard 開放。
                         self.human_set_owner(None);
                         return;
-                    }
-                    if tick {
-                        let after = self.human.replay_hold.as_ref().filter(|hold| !hold.revoked).map(|hold| hold.hold_id);
-                        if after.is_some() && after != before_hold {
-                            self.tick_close_hold = after;
-                        }
                     }
                     return;
                 } else {
@@ -158,6 +152,7 @@ impl SessionCore {
         }
         if !restored {
             self.stashed_human.take();
+            post.dropped_stash_client = stash.as_ref().and_then(|s| s.human_client_id()).map(str::to_string);
             // agent 持有租約期間，EOF／重新連線可能已換成新的暫停中 TCP client。
             // 清除失效 stash 與該 client 的延後輸入，但保留替換後的 raw 所有者以便恢復。
             // PTY 與一般 human 租約的 close 行為維持原狀。
@@ -173,17 +168,14 @@ impl SessionCore {
                         source_lease_id: lease.interactive_id.clone(),
                         owner: owner.clone(),
                         client_lifetime: *client_lifetime,
+                        tick,
                     });
                 }
                 // 替換後的 TCP 所有者必須等 sync_tcp_console_lease 取得共用 guard 與 ticket，
                 // 建立鏡像後才解除暫停；否則 close／expiry 會先繞過 guard 重授 raw 所有權。
                 if let Some(cid) = post.dropped_stash_client.as_deref() {
-                    let dropped = self.human.deferred_mut().remove_client(cid);
-                    if dropped > 0 {
-                        self.fx_buf.push(Effect::Warn(format!(
-                            "deferred input 因 lease 上下文失效清空（com={} client_id={cid} reason=lease_dropped dropped={dropped}）",
-                            self.profile.com
-                        )));
+                    if let Some(warning) = self.drop_stashed_deferred(cid) {
+                        self.fx_buf.push(warning);
                     }
                 }
                 self.human_set_owner(None);
@@ -204,12 +196,8 @@ impl SessionCore {
         }
         let mut fx = Vec::new();
         if let Some(cid) = post.dropped_stash_client.as_deref() {
-            let dropped = self.human.deferred_mut().remove_client(cid);
-            if dropped > 0 {
-                fx.push(Effect::Warn(format!(
-                    "deferred input 因 lease 上下文失效清空（com={} client_id={cid} reason=lease_dropped dropped={dropped}）",
-                    self.profile.com
-                )));
+            if let Some(warning) = self.drop_stashed_deferred(cid) {
+                fx.push(warning);
             }
         }
         let before_hold = self.human.replay_hold.as_ref().map(|h| h.hold_id);
@@ -226,6 +214,17 @@ impl SessionCore {
             self.human_set_owner(None);
         }
         self.fx_buf.extend(fx);
+    }
+
+    /// 清除已丟棄 stash client 的 deferred，並產生與立即 PostClose 相同的 Warn 效果。
+    fn drop_stashed_deferred(&mut self, client_id: &str) -> Option<Effect> {
+        let dropped = self.human.deferred_mut().remove_client(client_id);
+        (dropped > 0).then(|| {
+            Effect::Warn(format!(
+                "deferred input 因 lease 上下文失效清空（com={} client_id={client_id} reason=lease_dropped dropped={dropped}）",
+                self.profile.com
+            ))
+        })
     }
 
     /// DF-20（OD-37 範圍，rulings/p6.md round4-cont OWNER-BATCH #4）：`session recover` 受理與重新開機 banner 時，
@@ -442,12 +441,33 @@ impl SessionCore {
 
     /// 只結算明確記錄且 owner/lifetime 相符的 agent soft-preempt suspend。
     fn settle_pending_tcp_suspend_for(&mut self, owner: &str, client_lifetime: u64) -> bool {
-        if !self.pending_tcp_suspend_matches(owner, client_lifetime) {
+        let Some(pending) = self
+            .pending_tcp_suspend_settlement
+            .as_ref()
+            .filter(|pending| {
+                !pending.source_lease_id.is_empty()
+                    && pending.owner == owner
+                    && pending.client_lifetime == client_lifetime
+            })
+            .cloned()
+        else {
             return false;
-        }
+        };
         self.pending_tcp_suspend_settlement = None;
+        let before_hold = self.human.replay_hold.as_ref().map(|hold| hold.hold_id);
         let mut effects = Effects(Vec::new());
         self.human_suspend_end(true, &mut effects);
+        if pending.tick {
+            let after_hold = self
+                .human
+                .replay_hold
+                .as_ref()
+                .filter(|hold| !hold.revoked)
+                .map(|hold| hold.hold_id);
+            if after_hold.is_some() && after_hold != before_hold {
+                self.tick_close_hold = after_hold;
+            }
+        }
         self.fx_buf.extend(effects.0);
         true
     }

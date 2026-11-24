@@ -10,6 +10,7 @@ use sw_core::mailbox::{ControlEvent, DataEvent};
 use sw_core::op_runner::OpOutcome;
 use sw_core::session_core::{Effect, Effects, LeaseIndexOp, SessionRequest, SessionState};
 use sw_core::tx_writer::{FlashMode, TxClass};
+use sw_pal::traits::TxOutcome;
 use sw_proto::pydict;
 use sw_proto::pyjson::PyValue;
 use sw_pal::traits::Clock;
@@ -439,6 +440,8 @@ fn tcp_mirror_preempt_reconnect_preserves_new_owner() {
 #[test]
 fn tcp_mirror_reconnect_does_not_resume_self_test_suspend() {
     let mut h = tcp_ready(&["a"]);
+    h.set_auto_complete_human_tx(false);
+    h.core.set_tcp_console(true);
     let probe_op = start_non_strict_self_test(&mut h);
     assert_eq!(h.core.human_console().ownership.suspend_depth, 1);
     assert!(h.input("a", b"before-eof").iter().all(|effect| !matches!(effect, Effect::HumanTx { .. })));
@@ -470,11 +473,18 @@ fn tcp_mirror_reconnect_does_not_resume_self_test_suspend() {
     assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:b"));
     assert_eq!(h.core.generations().owner_gen, owner_gen_before_b + 1, "probe 結束只因實際 raw owner 恢復增加一次 generation");
     assert_eq!(h.human_tx().iter().filter(|(class, source, payload)| *class == TxClass::HumanReplay && source == "human:b" && payload == b"deferred").count(), 1);
+    assert!(h.replay_hold().is_some_and(|hold| !hold.revoked));
+    let opened = h.rpc(open_req("agent:ordinary-self-test-replay", 60.0, "", false)).unwrap();
+    assert_eq!(opened.get("error_code"), Some(&PyValue::from("SESSION_BUSY")), "一般 self-test replay 不得被標成 tick close");
+    let attached = h.rpc(SessionRequest::ConsoleAttach { label: None, pty: None }).unwrap();
+    assert_eq!(attached.get("ok"), Some(&PyValue::Bool(true)), "一般 self-test replay 不得套用 tick close 的 console attach BUSY");
+    h.complete_human_tx(TxOutcome::Completed(b"deferred".len()), None);
 }
 
 #[test]
 fn tcp_mirror_delayed_soft_preempt_close_preserves_nested_self_test_suspend() {
     let mut h = tcp_ready(&["a"]);
+    h.set_auto_complete_human_tx(false);
     let probe_op = start_non_strict_self_test(&mut h);
     let opened = h.rpc(open_req("agent:nested", 60.0, "", false)).expect("agent soft preempt");
     assert_eq!(opened.get("soft_preempted"), Some(&PyValue::Bool(true)));
@@ -511,6 +521,60 @@ fn tcp_mirror_delayed_soft_preempt_close_preserves_nested_self_test_suspend() {
     assert_eq!(replay, vec![(TxClass::HumanReplay, "human:a".into(), b"nestedstill-deferred".to_vec())]);
     assert_eq!(h.core.human_console().ownership.suspend_depth, 0);
     assert_eq!(h.human_tx().iter().filter(|(class, source, payload)| *class == TxClass::HumanReplay && source == "human:a" && payload == b"nestedstill-deferred").count(), 1);
+    assert!(h.replay_hold().is_some_and(|hold| !hold.revoked));
+    let opened = h.rpc(open_req("agent:explicit-close-replay", 60.0, "", false)).unwrap();
+    assert_eq!(opened.get("error_code"), Some(&PyValue::from("SESSION_BUSY")), "明確 close 後的巢狀 self-test replay 不得被標成 tick close");
+    h.complete_human_tx(TxOutcome::Completed(b"nestedstill-deferred".len()), None);
+}
+
+#[test]
+fn tcp_mirror_tick_close_guard_delayed_restoration_preserves_busy_semantics() {
+    let mut h = tcp_ready(&["a"]);
+    h.core.set_tcp_console(true);
+    h.set_auto_complete_human_tx(false);
+    h.rpc(open_req("agent:tick", 1.0, "", false)).expect("agent soft preempt");
+    h.input("a", b"tick-deferred");
+    assert!(h.human_tx().is_empty(), "soft-preempt 期間輸入須先留在 deferred");
+
+    h.fence.with(|fence| fence.flash_critical = true);
+    h.advance_s(2.0); // timer 到期；guard 關閉時保留 TCP stash 與待結算 suspend。
+    assert!(h.core.active_lease().is_none(), "到期 agent lease 已關閉");
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1);
+    assert!(h.human_tx().is_empty(), "guard 關閉時不得回放 deferred");
+
+    h.fence.with(|fence| fence.flash_critical = false);
+    h.scan(None); // guarded sync 還原 stash 並開始 deferred replay。
+    let mirror_id = h.core.active_lease().expect("stash 還原後的 TCP mirror").interactive_id.clone();
+    assert_eq!(h.human_tx().len(), 1, "回放已開始但尚未完成");
+    assert!(h.replay_hold().is_some_and(|hold| !hold.revoked));
+
+    let opened = h.rpc(open_req("agent:while-replay", 60.0, "", false)).unwrap();
+    assert_eq!(
+        h.wire(&opened),
+        format!(r#"{{"ok":false,"error_code":"SESSION_INTERACTIVE_BUSY","interactive_session_id":"{mirror_id}"}}"#),
+        "tick close 的 replay hold 期間 interactive-open 必須保留精確 BUSY 語意",
+    );
+    let attached = h
+        .rpc(SessionRequest::ConsoleAttach { label: None, pty: None })
+        .unwrap();
+    assert_eq!(
+        h.wire(&attached),
+        r#"{"ok":false,"error_code":"SESSION_INTERACTIVE_BUSY","selector":"COM0"}"#,
+        "tick close 的 replay hold 期間 TCP console attach 必須回精確 BUSY",
+    );
+
+    let tx_before_command = h.tx_effect_count();
+    let mut req = agent_submit("must-not-run");
+    req.mode = "interactive".into();
+    let submitted = h.rpc(SessionRequest::Submit(req)).unwrap();
+    let cmd_id = submitted["cmd_id"].as_str().unwrap().to_string();
+    assert_eq!(h.tx_effect_count(), tx_before_command, "回放未完成時不得送 command TX");
+
+    h.complete_human_tx(TxOutcome::Completed(b"tick-deferred".len()), None);
+    let row = h.reg.get(&cmd_id).expect("interactive command 終態");
+    assert_eq!(row["error_code"], PyValue::from("SESSION_INTERACTIVE_BUSY"), "{row:?}");
+    assert_eq!(h.tx_effect_count(), tx_before_command, "tick close 的 interactive command 必須零 command TX");
+    assert_eq!(h.core.active_lease().map(|lease| lease.owner.as_str()), Some("human:a"));
 }
 
 #[test]
@@ -565,6 +629,38 @@ fn tcp_mirror_delayed_same_id_replacement_eof_settles_suspend() {
     assert_eq!(h.core.human_console().ownership.suspend_depth, 0, "替換 client EOF 必須結算原 lease suspend");
     assert_eq!(h.core.human_console().ownership.interactive_owner, None, "EOF 不重授已失效的 owner");
     assert!(h.core.stashed_human_lease().is_none());
+}
+
+#[test]
+fn tcp_mirror_invalid_stash_replacement_drops_deferred_before_resume() {
+    let mut h = tcp_ready(&["a"]);
+    let opened = h.rpc(open_req("agent:replacement", 60.0, "", false)).expect("agent soft preempt");
+    let agent_id = opened.get("interactive_id").and_then(PyValue::as_str).unwrap().to_string();
+    h.seed_deferred("a", b"stale-stash-input");
+    let old_lifetime = h.lifetime("a");
+
+    // 模擬 replacement record 已更新、agent close 先於下一輪 sync 結算的交錯，
+    // 讓 close_lease_inner 同時看到舊 stash 與新 TCP lifetime。
+    let new_lifetime = old_lifetime + 1;
+    h.core.human_console_mut().consoles.get_mut("a").unwrap().client_lifetime = new_lifetime;
+    assert_ne!(new_lifetime, old_lifetime);
+    assert_eq!(h.deferred_len("a"), b"stale-stash-input".len());
+
+    h.fence.with(|fence| fence.flash_critical = true);
+    h.rpc(close_req(&agent_id)).expect("關閉 agent lease 並同步替換 owner");
+    assert!(h.core.active_lease().is_none(), "guard 關閉時替換 mirror 等待 guarded sync");
+    assert_eq!(h.deferred_len("a"), 0, "即使 mirror 受 guard 延後，失效 stash deferred 也須立即清除");
+    assert!(
+        h.warns().iter().any(|warning| warning.contains("client_id=a reason=lease_dropped dropped=17")),
+        "清除有內容的失效 stash 時須保留 PostClose Warn 效果：{:?}",
+        h.warns(),
+    );
+
+    h.fence.with(|fence| fence.flash_critical = false);
+    h.scan(None);
+    assert_eq!(h.core.active_lease().map(|lease| lease.owner.as_str()), Some("human:a"));
+    assert_eq!(h.core.active_lease().and_then(|lease| lease.mirror_client_lifetime), Some(new_lifetime));
+    assert!(h.human_tx().is_empty(), "失效 stash 的位元組不可被回放到新 lifetime");
 }
 
 #[test]
