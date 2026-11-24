@@ -1,5 +1,5 @@
     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
-     Running tests/self_test_safety.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/self_test_safety-1efb440c1034d32c)
+     Running tests/self_test_safety.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/self_test_safety-1efb440c1034d32c)
 
 running 6 tests
 UART_TX="( echo __READY__26047fa0 ) && printf '\\n__SW_ST_%s_OK__\\n' '26047fa0'\n"

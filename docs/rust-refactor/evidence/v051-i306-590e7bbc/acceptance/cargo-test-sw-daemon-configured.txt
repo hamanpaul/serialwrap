@@ -1,5 +1,5 @@
     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
-     Running unittests src/lib.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/sw_daemon-f350d875330397e4)
+     Running unittests src/lib.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/sw_daemon-f350d875330397e4)
 
 running 12 tests
 test code_identity::tests::absent_executable_or_manifest_has_no_fingerprint_or_path ... ok
@@ -17,13 +17,13 @@ test launcher::tests::current_release_resolves_manifest_from_memfs ... ok
 
 test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running unittests src/main.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/serialwrapd-da4479a6510194de)
+     Running unittests src/main.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/serialwrapd-da4479a6510194de)
 
 running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/cap_windows_com_p7.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/cap_windows_com_p7-082ba6b7b4232afa)
+     Running tests/cap_windows_com_p7.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/cap_windows_com_p7-082ba6b7b4232afa)
 
 running 5 tests
 test cap_windows_com__p7_event_fire ... ignored, cap:windows_com
@@ -34,7 +34,7 @@ test zero_tx_window_starts_before_banner ... ok
 
 test result: ok. 2 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/daemon_process.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/daemon_process-f67a98972d39615e)
+     Running tests/daemon_process.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/daemon_process-f67a98972d39615e)
 
 running 44 tests
 test cap_interactive_desktop__windows_console_ctrl_triggers_orderly_stop ... ignored, 需要 Windows Terminal 互動桌面；由 win-interactive-l1.ps1 執行
@@ -84,7 +84,7 @@ test release_pause_hook_env_isolated_only ... ok
 
 test result: ok. 43 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 31.12s
 
-     Running tests/deferred_methods.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/deferred_methods-e6c7cf199b755ea0)
+     Running tests/deferred_methods.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/deferred_methods-e6c7cf199b755ea0)
 
 running 2 tests
 test deferred_methods_excludes_delivered_slices ... ok
@@ -92,7 +92,7 @@ test deferred_methods_only_reads_deferred_section ... ok
 
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/dispatch.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/dispatch-5699d6686b3add0d)
+     Running tests/dispatch.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/dispatch-5699d6686b3add0d)
 
 running 211 tests
 test cap_posix_pty__wp59_attach_health_shape ... ignored, cap:posix_pty
@@ -309,7 +309,7 @@ test wp52_end_to_end_flag_does_not_bypass_submit_gates ... ok
 
 test result: ok. 210 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 11.44s
 
-     Running tests/event_lifecycle.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/event_lifecycle-19756a5cca0d2807)
+     Running tests/event_lifecycle.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/event_lifecycle-19756a5cca0d2807)
 
 running 4 tests
 test engine_started_before_bootstrap_attach ... ok
@@ -319,7 +319,7 @@ test shutdown_closes_event_intake_before_drain_behavior ... ok
 
 test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.34s
 
-     Running tests/event_rpc.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/event_rpc-b8f60ae9e86e9820)
+     Running tests/event_rpc.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/event_rpc-b8f60ae9e86e9820)
 
 running 7 tests
 test event_methods_without_engine_are_method_not_found ... ok
@@ -332,7 +332,7 @@ test event_rpc_does_not_block_other_sessions ... ok
 
 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s
 
-     Running tests/file_transfer_rpc.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/file_transfer_rpc-46c2bedacb4b394d)
+     Running tests/file_transfer_rpc.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/file_transfer_rpc-46c2bedacb4b394d)
 
 running 6 tests
 test file_rpc_rejected_during_boot_quiet_returns_autoboot_quiet_zero_tx ... ok
@@ -344,7 +344,7 @@ test file_pull_over_rx_window_succeeds_od80_df26 ... ok
 
 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.48s
 
-     Running tests/framing.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/framing-978ba9daa8d317d1)
+     Running tests/framing.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/framing-978ba9daa8d317d1)
 
 running 20 tests
 test deep_json_closes_connection ... ok
@@ -370,7 +370,7 @@ test slow_reader_large_response_is_not_truncated ... ok
 
 test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.64s
 
-     Running tests/handoff_stop.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/handoff_stop-c11190ddf88ce066)
+     Running tests/handoff_stop.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/handoff_stop-c11190ddf88ce066)
 
 running 23 tests
 test handoff_stop_freezes_custody_deliverer_gate ... ok
@@ -399,14 +399,14 @@ test handoff_flash_races_prepare ... ok
 
 test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 39.28s
 
-     Running tests/health_multi_open_p7.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/health_multi_open_p7-3bd6a0184cbf373a)
+     Running tests/health_multi_open_p7.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/health_multi_open_p7-3bd6a0184cbf373a)
 
 running 1 test
 test health_status_vanished_tty_holders_status_ok_like_detect_multi_open ... ok
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
 
-     Running tests/launcher.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/launcher-652e2b77b103381d)
+     Running tests/launcher.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/launcher-652e2b77b103381d)
 
 running 18 tests
 test cap_windows_native__launcher_gui_subsystem ... ignored, 原生 Windows 專用（PE Subsystem 與無 console 啟動）；由 windows_native capability gate 執行
@@ -430,7 +430,7 @@ test launcher_exit_code_passthrough ... ok
 
 test result: ok. 16 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.18s
 
-     Running tests/mcu_rpc.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/mcu_rpc-c0ca3f188d40b5e2)
+     Running tests/mcu_rpc.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/mcu_rpc-c0ca3f188d40b5e2)
 
 running 10 tests
 test daemon_start_failure_of_flash_endpoint_exits_1 ... ok
@@ -446,7 +446,7 @@ test mcu_status_flashing_true_during_probe ... ok
 
 test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
 
-     Running tests/restart_after_commit.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/restart_after_commit-202d27e76a901a18)
+     Running tests/restart_after_commit.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/restart_after_commit-202d27e76a901a18)
 
 running 2 tests
 
@@ -460,7 +460,7 @@ test kill_between_commit_and_reply_keeps_released_after_restart ... ok
 
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.76s
 
-     Running tests/rpc_console.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/rpc_console-1b5fee9701c75994)
+     Running tests/rpc_console.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/rpc_console-1b5fee9701c75994)
 
 running 48 tests
 test attach_invalid_args ... ok
@@ -514,7 +514,7 @@ test od37_send_with_pre_release_id_after_reattach_not_found_zero_tx ... ok
 
 test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s
 
-     Running tests/self_test_safety.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/self_test_safety-1efb440c1034d32c)
+     Running tests/self_test_safety.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/self_test_safety-1efb440c1034d32c)
 
 running 6 tests
 test rpc_newline_prefixed_prompt_after_marker_confirms_ready ... ok
@@ -526,7 +526,7 @@ test rpc_self_test_busy_has_zero_probe_tx ... ok
 
 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.36s
 
-     Running tests/serial_console_excludes.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/serial_console_excludes-8c7d8157eb7bcff1)
+     Running tests/serial_console_excludes.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/serial_console_excludes-8c7d8157eb7bcff1)
 
 running 3 tests
 test serial_console_ignored_on_posix ... ok
@@ -535,7 +535,7 @@ test serial_console_bad_shape_ignored ... ok
 
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/session_rpc_p7.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/session_rpc_p7-0be081ab4bebbb97)
+     Running tests/session_rpc_p7.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/session_rpc_p7-0be081ab4bebbb97)
 
 running 9 tests
 test attach_passthrough_attached_ok_no_probe ... ok
@@ -550,7 +550,7 @@ test recover_force_string_false_is_true ... ok
 
 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.85s
 
-     Running tests/shutdown_order.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/shutdown_order-6027a46500e11dd5)
+     Running tests/shutdown_order.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/shutdown_order-6027a46500e11dd5)
 
 running 15 tests
 test second_sigterm_changes_nothing ... ok
@@ -571,7 +571,7 @@ test second_sigterm_real_signal_exits_0 ... ok
 
 test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.28s
 
-     Running tests/windows_console_native.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/windows_console_native-4ab733f50ee6bc2f)
+     Running tests/windows_console_native.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/windows_console_native-4ab733f50ee6bc2f)
 
 running 7 tests
 test cap_windows_com__serial_console_end_to_end ... ignored, cap:windows_com
@@ -584,7 +584,7 @@ test telnet_slow_client_bounded ... ok
 
 test result: ok. 6 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 3.17s
 
-     Running tests/wintask_staging_isolation.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/wintask_staging_isolation-c310d09680564b6b)
+     Running tests/wintask_staging_isolation.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/wintask_staging_isolation-c310d09680564b6b)
 
 running 5 tests
 test t13_staging_wal_hook_writes_verifiable_record_without_uart ... ok

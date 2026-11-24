@@ -1,5 +1,5 @@
     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
-     Running unittests src/lib.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/sw_core-67387a6d783f17f2)
+     Running unittests src/lib.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/sw_core-67387a6d783f17f2)
 
 running 7 tests
 test event_engine::schema::tests::float_to_int_matches_python_exact_digits ... ok
@@ -12,7 +12,7 @@ test session_manager::shutdown_line_settle_tests::line_settle_wait_shares_one_de
 
 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.25s
 
-     Running tests/actor_liveness.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/actor_liveness-fa89396bb17c5636)
+     Running tests/actor_liveness.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/actor_liveness-fa89396bb17c5636)
 
 running 2 tests
 test release_reaches_recovering_while_uart_blocked ... ok
@@ -20,7 +20,7 @@ test blocked_uart_does_not_freeze_actor ... ok
 
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
 
-     Running tests/admission.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/admission-8ffae38cba0debba)
+     Running tests/admission.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/admission-8ffae38cba0debba)
 
 running 14 tests
 test flash_ticket_or_flag_reports_flashing ... ok
@@ -40,7 +40,7 @@ test gate_admit_vs_freeze_linearizable ... ok
 
 test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.91s
 
-     Running tests/arbiter.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/arbiter-74d72108aa28f6f1)
+     Running tests/arbiter.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/arbiter-74d72108aa28f6f1)
 
 running 34 tests
 test accepted_response_shape ... ok
@@ -80,7 +80,7 @@ test submit_cancel_loop_keeps_queue_bounded ... ok
 
 test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.38s
 
-     Running tests/capture_p7.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/capture_p7-012ad28cc722d468)
+     Running tests/capture_p7.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/capture_p7-012ad28cc722d468)
 
 running 15 tests
 test log_path_uses_local_time ... ok
@@ -101,7 +101,7 @@ test foreground_rx_is_not_captured_and_counts_match_python_rules ... ok
 
 test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
 
-     Running tests/command_exec.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/command_exec-8cab5d853e85ea03)
+     Running tests/command_exec.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/command_exec-8cab5d853e85ea03)
 
 running 118 tests
 test background_capture_truncates_head_keeps_one ... ok
@@ -225,7 +225,7 @@ test tx_ledger_bounded_over_long_session_without_reconnect ... ok
 
 test result: ok. 118 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.06s
 
-     Running tests/console_echo_latency.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/console_echo_latency-33583e0a879f2d42)
+     Running tests/console_echo_latency.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/console_echo_latency-33583e0a879f2d42)
 
 running 3 tests
 test console_echo_sample_rejects_local_echo ... ok
@@ -234,7 +234,7 @@ test console_keystroke_echo_p99_under_10ms ... ok
 
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.98s
 
-     Running tests/console_hub.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/console_hub-0b2f74cba76dec6f)
+     Running tests/console_hub.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/console_hub-0b2f74cba76dec6f)
 
 running 27 tests
 test close_all_on_release ... ok
@@ -267,7 +267,7 @@ test scan_does_not_grow_pending_beyond_cap ... ok
 
 test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s
 
-     Running tests/custody.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/custody-114c8e453d3a7046)
+     Running tests/custody.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/custody-114c8e453d3a7046)
 
 running 76 tests
 test test_claim_for_release_non_held_phase_leaves_record_unchanged ... ok
@@ -349,7 +349,7 @@ test wp510r_r2_delayed_target_actor_exit_does_not_reclaim_rekeyed_actor ... ok
 
 test result: ok. 76 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 53.45s
 
-     Running tests/deferred_bc02.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/deferred_bc02-92b5826c040ac14e)
+     Running tests/deferred_bc02.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/deferred_bc02-92b5826c040ac14e)
 
 running 18 tests
 test empty_append_noop ... ok
@@ -373,7 +373,7 @@ test take_replay_for_only_that_client ... ok
 
 test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/drain_release.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/drain_release-ecbccbbae0a25092)
+     Running tests/drain_release.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/drain_release-ecbccbbae0a25092)
 
 running 208 tests
 test auto_attach_plain_external_holder_no_io ... ok
@@ -587,7 +587,7 @@ test wp510r_r3_p8_7bb9935_clear_then_release_deadline_not_inherited ... ok
 
 test result: ok. 208 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
 
-     Running tests/drain_release_e2e.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/drain_release_e2e-f39963085084153f)
+     Running tests/drain_release_e2e.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/drain_release_e2e-f39963085084153f)
 
 running 15 tests
 test close_failure_keeps_recovering_and_no_success ... ok
@@ -608,7 +608,7 @@ test release_handled_within_one_data_item_under_flood ... ok
 
 test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.89s
 
-     Running tests/echo_paced.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/echo_paced-d745281489d29d12)
+     Running tests/echo_paced.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/echo_paced-d745281489d29d12)
 
 running 38 tests
 test cancel_input_line_bytes_and_wal ... ok
@@ -652,7 +652,7 @@ test shutdown_publication_race_never_leaves_half_line ... ok
 
 test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.34s
 
-     Running tests/event_dispatcher.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/event_dispatcher-74385498950d824b)
+     Running tests/event_dispatcher.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/event_dispatcher-74385498950d824b)
 
 running 21 tests
 test matched_text_env_truncation_chars ... ok
@@ -679,7 +679,7 @@ test stop_reports_unreaped_when_run_ignores_abort ... ok
 
 test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.30s
 
-     Running tests/event_engine.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/event_engine-7c150a28959f8ef6)
+     Running tests/event_engine.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/event_engine-7c150a28959f8ef6)
 
 running 8 tests
 test exhausted_set_before_dispatch_keep_e1 ... ok
@@ -693,7 +693,7 @@ test completion_log_write_failure_skips_counter_and_cooldown ... ok
 
 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
 
-     Running tests/event_line_buffer.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/event_line_buffer-205a4571a99cf3ba)
+     Running tests/event_line_buffer.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/event_line_buffer-205a4571a99cf3ba)
 
 running 3 tests
 test oversized_without_newline_cuts_one_chunk_per_feed ... ok
@@ -702,7 +702,7 @@ test line_buffer_matches_python_golden ... ok
 
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 
-     Running tests/event_matcher.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/event_matcher-1ce29159eb3c56d0)
+     Running tests/event_matcher.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/event_matcher-1ce29159eb3c56d0)
 
 running 18 tests
 test cooldown_from_last_fire ... ok
@@ -726,7 +726,7 @@ test stop_join_2s_warning ... ok
 
 test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.00s
 
-     Running tests/event_schema.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/event_schema-e8a217990f15cb64)
+     Running tests/event_schema.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/event_schema-e8a217990f15cb64)
 
 running 15 tests
 test contains_with_bad_flag_is_rejected_df08 ... ok
@@ -747,7 +747,7 @@ test every_python_validation_outcome_matches ... ok
 
 test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 
-     Running tests/event_scope_p7.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/event_scope_p7-e59926792b32b80a)
+     Running tests/event_scope_p7.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/event_scope_p7-e59926792b32b80a)
 
 running 2 tests
 test interactive_send_tx_in_flight_is_not_foreground_for_events ... ok
@@ -755,7 +755,7 @@ test foreground_command_in_flight_is_foreground_for_events ... ok
 
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/event_store.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/event_store-402e496a6b1bdc78)
+     Running tests/event_store.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/event_store-402e496a6b1bdc78)
 
 running 27 tests
 test reset_with_invalid_rule_id_counts_zero_df01 ... ok
@@ -788,14 +788,14 @@ test tail_n_semantics_match_python_slicing ... ok
 
 test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
 
-     Running tests/expect_reboot_chained.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/expect_reboot_chained-a1c68de1a2752e30)
+     Running tests/expect_reboot_chained.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/expect_reboot_chained-a1c68de1a2752e30)
 
 running 1 test
 test chained_reboot_segment_matches_python_for_40_commands ... ok
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
 
-     Running tests/fence_human_raw.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/fence_human_raw-a96814c28cbc1e63)
+     Running tests/fence_human_raw.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/fence_human_raw-a96814c28cbc1e63)
 
 running 11 tests
 test human_raw_owner_gen_mismatch ... ok
@@ -812,7 +812,7 @@ test invalidate_linearizes_with_queued_replay ... ok
 
 test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 
-     Running tests/file_transfer_engine.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/file_transfer_engine-7d59dbf29deb8c3e)
+     Running tests/file_transfer_engine.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/file_transfer_engine-7d59dbf29deb8c3e)
 
 running 56 tests
 test pull_budget_pull_cmd ... ok
@@ -874,7 +874,7 @@ test pull_one_mebibyte_succeeds_od80 ... ok
 
 test result: ok. 56 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
 
-     Running tests/file_transfer_golden.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/file_transfer_golden-f161ea43d64eaba1)
+     Running tests/file_transfer_golden.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/file_transfer_golden-f161ea43d64eaba1)
 
 running 4 tests
 test b64encode_has_no_trailing_newline ... ok
@@ -884,7 +884,7 @@ test every_golden_row_matches_python ... ok
 
 test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
 
-     Running tests/file_transfer_session.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/file_transfer_session-d3775d7956fc1bb3)
+     Running tests/file_transfer_session.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/file_transfer_session-d3775d7956fc1bb3)
 
 running 23 tests
 test rpc_overflow_is_exception_not_invalid_args ... ok
@@ -913,7 +913,7 @@ test shutdown_settle_midline_stall_kills_line_and_aborts ... ok
 
 test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.49s
 
-     Running tests/flash_coordinator.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/flash_coordinator-17fe564bec6f4ca3)
+     Running tests/flash_coordinator.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/flash_coordinator-17fe564bec6f4ca3)
 
 running 38 tests
 test cap_posix_pty__endpoint_slave_never_exclusive ... ignored, cap:posix_pty
@@ -957,7 +957,7 @@ test rx_observer_non_blocking ... ok
 
 test result: ok. 37 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 3.11s
 
-     Running tests/flash_session_core.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/flash_session_core-144b92cf841543a8)
+     Running tests/flash_session_core.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/flash_session_core-144b92cf841543a8)
 
 running 56 tests
 test flashing_recover_clear_bind_busy ... ok
@@ -1019,7 +1019,7 @@ test flashing_console_bytes_dropped_blackbox ... ok
 
 test result: ok. 56 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
 
-     Running tests/handoff.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/handoff-90c6f5ff94e8ecb7)
+     Running tests/handoff.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/handoff-90c6f5ff94e8ecb7)
 
 running 6 tests
 test release_flash_interaction_probe_window ... ok
@@ -1031,7 +1031,7 @@ test release_during_push_aborted_cmd_true ... ok
 
 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
 
-     Running tests/human_line_mode.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/human_line_mode-0905df56870f5e67)
+     Running tests/human_line_mode.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/human_line_mode-0905df56870f5e67)
 
 running 18 tests
 test as_str_matches_python ... ok
@@ -1055,7 +1055,7 @@ test golden_windows_matches_python_ntpath ... ok
 
 test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/human_tx_lane.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/human_tx_lane-e1b4a5793a37311a)
+     Running tests/human_tx_lane.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/human_tx_lane-e1b4a5793a37311a)
 
 running 18 tests
 test revoked_replay_completed_before_revoke_is_kept ... ok
@@ -1079,7 +1079,7 @@ test human_tx_ledger_drains_after_1000_keys ... ok
 
 test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
 
-     Running tests/io_worker.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/io_worker-7e60804b13ce56d5)
+     Running tests/io_worker.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/io_worker-7e60804b13ce56d5)
 
 running 9 tests
 test snapshot_serial_alive_and_running_semantics ... ok
@@ -1094,7 +1094,7 @@ test blocked_forever_writer_never_sends_receipt ... ok
 
 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.01s
 
-     Running tests/lease_p6.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/lease_p6-f44029302e32c473)
+     Running tests/lease_p6.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/lease_p6-f44029302e32c473)
 
 running 7 tests
 test human_client_id_strips_prefix ... ok
@@ -1107,7 +1107,7 @@ test post_close_defaults ... ok
 
 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/lease_selftest.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/lease_selftest-c357b20444cec9d8)
+     Running tests/lease_selftest.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/lease_selftest-c357b20444cec9d8)
 
 running 34 tests
 test base64_non_ascii_message_matches_python_unicode_encode_error ... ok
@@ -1147,7 +1147,7 @@ test selftest_probe_drain_race_golden ... ok
 
 test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.93s
 
-     Running tests/line_editor.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/line_editor-e603308ba447c605)
+     Running tests/line_editor.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/line_editor-e603308ba447c605)
 
 running 20 tests
 test backspace_deletes_one_utf8_char_and_echoes ... ok
@@ -1173,7 +1173,7 @@ test golden_matches_python ... ok
 
 test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
 
-     Running tests/login_fsm_full.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/login_fsm_full-7f0a8215720aae21)
+     Running tests/login_fsm_full.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/login_fsm_full-7f0a8215720aae21)
 
 running 31 tests
 test detect_boot_banner_cases ... ok
@@ -1210,7 +1210,7 @@ test every_python_scenario_produces_identical_tx_and_result ... ok
 
 test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
 
-     Running tests/login_quiet.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/login_quiet-26959b814cb827fe)
+     Running tests/login_quiet.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/login_quiet-26959b814cb827fe)
 
 running 39 tests
 test login_tx_failure_classified_like_login_tx_refused ... ok
@@ -1255,7 +1255,7 @@ test login_failure_code_table ... ok
 
 test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.56s
 
-     Running tests/mailbox.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/mailbox-331f8396cbd1fd02)
+     Running tests/mailbox.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/mailbox-331f8396cbd1fd02)
 
 running 22 tests
 test control_waits_for_dependent_rx ... ok
@@ -1283,7 +1283,7 @@ test request_timeout_returns_internal_timeout ... ok
 
 test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
 
-     Running tests/mcu_patterns_golden.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/mcu_patterns_golden-1534943c70c209ab)
+     Running tests/mcu_patterns_golden.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/mcu_patterns_golden-1534943c70c209ab)
 
 running 2 tests
 test default_registry_matches_python_default ... ok
@@ -1291,7 +1291,7 @@ test golden_rows_match_python ... ok
 
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/out_ring.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/out_ring-39084ab8185ea8c3)
+     Running tests/out_ring.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/out_ring-39084ab8185ea8c3)
 
 running 13 tests
 test clear_display_keeps_control ... ok
@@ -1310,7 +1310,7 @@ test one_mib_flood_bounded ... ok
 
 test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/ownership.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/ownership-b62db1e4e5ab2ffc)
+     Running tests/ownership.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/ownership-b62db1e4e5ab2ffc)
 
 running 23 tests
 test deep_nesting_balanced ... ok
@@ -1339,7 +1339,7 @@ test try_grant_refuses_when_pending_or_flash ... ok
 
 test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/p7_skeleton.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/p7_skeleton-2af88ac13a4d63e9)
+     Running tests/p7_skeleton.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/p7_skeleton-2af88ac13a4d63e9)
 
 running 3 tests
 test mono_secs_round_trip ... ok
@@ -1348,14 +1348,14 @@ test p7_public_items_are_reachable ... ok
 
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/p8_upstream_interfaces.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/p8_upstream_interfaces-19af2afa4b5aced8)
+     Running tests/p8_upstream_interfaces.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/p8_upstream_interfaces-19af2afa4b5aced8)
 
 running 1 test
 test compiles ... ok
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/quiet_gate_p7.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/quiet_gate_p7-8633768c07a0832d)
+     Running tests/quiet_gate_p7.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/quiet_gate_p7-8633768c07a0832d)
 
 running 10 tests
 test agent_gate_active_expires_first ... ok
@@ -1371,7 +1371,7 @@ test rx_sequences_match_python_golden ... ok
 
 test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
 
-     Running tests/recover_p7.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/recover_p7-cf5d064da6b97f10)
+     Running tests/recover_p7.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/recover_p7-cf5d064da6b97f10)
 
 running 13 tests
 test plan_resets_progress_only_after_flash_gate ... ok
@@ -1390,14 +1390,14 @@ test recover_resets_credentials_warned ... ok
 
 test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 
-     Running tests/repo_path.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/repo_path-8a38e87eac9ae7df)
+     Running tests/repo_path.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/repo_path-8a38e87eac9ae7df)
 
 running 1 test
 test repo_path_prefers_sw_test_data_dir ... ok
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/reprobe.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/reprobe-8b1d2e6a0ffe997e)
+     Running tests/reprobe.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/reprobe-8b1d2e6a0ffe997e)
 
 running 11 tests
 test backoff_schedule_2_4_8_15_15_until_exhausted_at_10 ... ok
@@ -1414,7 +1414,7 @@ test prepare_decisions_match_python_golden ... ok
 
 test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
 
-     Running tests/rescue.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/rescue-7686720f400cda8b)
+     Running tests/rescue.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/rescue-7686720f400cda8b)
 
 running 11 tests
 test bootloader_prompt_empty_input_none ... ok
@@ -1431,7 +1431,7 @@ test classify_not_bootloader ... ok
 
 test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 
-     Running tests/rx_observer_wiring.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/rx_observer_wiring-c309f8aa2e114772)
+     Running tests/rx_observer_wiring.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/rx_observer_wiring-c309f8aa2e114772)
 
 running 3 tests
 test observer_called_after_wal_append ... ok
@@ -1440,7 +1440,7 @@ test observer_receives_exact_wal_seq_per_chunk ... ok
 
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/rx_reader.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/rx_reader-62fe70f581d3201b)
+     Running tests/rx_reader.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/rx_reader-62fe70f581d3201b)
 
 running 27 tests
 test idle_counts_from_creation ... ok
@@ -1473,7 +1473,7 @@ test sentinel_input_discarded ... ok
 
 test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
 
-     Running tests/self_test_safety.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/self_test_safety-9ea7f8391a1b6845)
+     Running tests/self_test_safety.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/self_test_safety-9ea7f8391a1b6845)
 
 running 25 tests
 test agent_lease_does_not_override_quiet_classification ... ok
@@ -1504,7 +1504,7 @@ test execution_marker_requires_following_prompt ... ok
 
 test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.11s
 
-     Running tests/session_auth_golden.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/session_auth_golden-602c947d1a438450)
+     Running tests/session_auth_golden.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/session_auth_golden-602c947d1a438450)
 
 running 3 tests
 test debug_output_redacts_secrets ... ok
@@ -1513,7 +1513,7 @@ test resolve_session_auth_matches_python_golden_including_warnings ... ok
 
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/session_core.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/session_core-056c762cebe5f813)
+     Running tests/session_core.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/session_core-056c762cebe5f813)
 
 running 90 tests
 test clear_without_bridge_without_device_stays_detached_cleared ... ok
@@ -1609,7 +1609,7 @@ test wall_clock_jump_param ... ok
 
 test result: ok. 90 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
 
-     Running tests/session_core_console.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/session_core_console-6899e4aeda3ffd10)
+     Running tests/session_core_console.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/session_core_console-6899e4aeda3ffd10)
 
 running 35 tests
 test phase1_in_flight_human_tx_still_settles_ledger ... ok
@@ -1650,7 +1650,7 @@ test self_test_probe_suspends_human_without_admission ... ok
 
 test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
 
-     Running tests/session_core_lease.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/session_core_lease-6ebbb0aada6967b3)
+     Running tests/session_core_lease.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/session_core_lease-6ebbb0aada6967b3)
 
 running 78 tests
 test console_ops_without_bridge_not_ready ... ok
@@ -1734,7 +1734,7 @@ test human_line_timeout_sends_no_rescue_keys ... ok
 
 test result: ok. 78 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.41s
 
-     Running tests/session_core_login.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/session_core_login-273cf4f3a2a84a54)
+     Running tests/session_core_login.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/session_core_login-273cf4f3a2a84a54)
 
 running 9 tests
 test attach_login_banner_cancels_run_and_adopts_bridge_sc30 ... ok
@@ -1749,7 +1749,7 @@ test rx_cancel_login_runs_wakes_waiter_and_spares_later_runs ... ok
 
 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
 
-     Running tests/session_core_login_exc_p7.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/session_core_login_exc_p7-33774596c777db3a)
+     Running tests/session_core_login_exc_p7.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/session_core_login_exc_p7-33774596c777db3a)
 
 running 8 tests
 test auto_reprobe_tx_incomplete_records_reprobe_failed ... ok
@@ -1763,7 +1763,7 @@ test reboot_recovery_raised_records_recovery_error ... ok
 
 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 
-     Running tests/session_core_quiet_p7.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/session_core_quiet_p7-335786c43ffd1027)
+     Running tests/session_core_quiet_p7.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/session_core_quiet_p7-335786c43ffd1027)
 
 running 21 tests
 test banner_arm_bumps_fsm_gen_once ... ok
@@ -1790,7 +1790,7 @@ test reattach_within_quiet_fence_expires_with_window ... ok
 
 test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.73s
 
-     Running tests/session_core_reprobe_p7.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/session_core_reprobe_p7-0163f7de8254b04f)
+     Running tests/session_core_reprobe_p7.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/session_core_reprobe_p7-0163f7de8254b04f)
 
 running 19 tests
 test credentials_unresolved_never_reprobes ... ok
@@ -1815,7 +1815,7 @@ test wp56_self_test_during_wait_returns_autoboot_quiet ... ok
 
 test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
 
-     Running tests/session_manager.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/session_manager-604ae885a264d08d)
+     Running tests/session_manager.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/session_manager-604ae885a264d08d)
 
 running 149 tests
 test device_not_bound_synthetic_profile_returns_device_not_bound ... ok
@@ -1970,7 +1970,7 @@ test wp510_review_open_failure_after_release_clears_drain_stall ... ok
 
 test result: ok. 149 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.24s
 
-     Running tests/shutdown_pending_waits.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/shutdown_pending_waits-9051a6a22390dfec)
+     Running tests/shutdown_pending_waits.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/shutdown_pending_waits-9051a6a22390dfec)
 
 running 9 tests
 test rx_wait_started_after_shutdown_is_already_cancelled ... ok
@@ -1985,14 +1985,14 @@ test shutdown_cancel_does_not_cancel_ordinary_rx_wait ... ok
 
 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
 
-     Running tests/slice21_prereqs.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/slice21_prereqs-5c95ffcba058f48b)
+     Running tests/slice21_prereqs.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/slice21_prereqs-5c95ffcba058f48b)
 
 running 1 test
 test prereq_symbols_exist ... ok
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/state_store.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/state_store-6bfe843111556fb1)
+     Running tests/state_store.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/state_store-6bfe843111556fb1)
 
 running 31 tests
 test alias_set_overwrites_in_place ... ok
@@ -2029,7 +2029,7 @@ test p4_atomic_write_semantics ... ok
 
 test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
 
-     Running tests/telnet_filter.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/telnet_filter-7025d2d62acd1852)
+     Running tests/telnet_filter.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/telnet_filter-7025d2d62acd1852)
 
 running 42 tests
 test bare_lf_passthrough ... ok
@@ -2077,7 +2077,7 @@ test golden_matches_python_byte_for_byte ... ok
 
 test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
 
-     Running tests/transport_stall.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/transport_stall-7f24f5f2e33e7c12)
+     Running tests/transport_stall.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/transport_stall-7f24f5f2e33e7c12)
 
 running 9 tests
 test flood_value_not_in_detail_set_and_never_rx_is_not_stall ... ok
@@ -2092,7 +2092,7 @@ test wal_meta_rx_age_rounded ... ok
 
 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
-     Running tests/transport_stall_wiring_p7.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/transport_stall_wiring_p7-ba80e9eb31b8b8d5)
+     Running tests/transport_stall_wiring_p7.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/transport_stall_wiring_p7-ba80e9eb31b8b8d5)
 
 running 4 tests
 test probe_with_rx_delta_is_not_stall ... ok
@@ -2102,7 +2102,7 @@ test repeated_stall_warns_once_until_rx_resumes ... ok
 
 test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 
-     Running tests/tx_writer.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/tx_writer-96cb076233ac548b)
+     Running tests/tx_writer.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/tx_writer-96cb076233ac548b)
 
 running 67 tests
 test close_line_while_pending_freezes_atomically ... ok
@@ -2175,7 +2175,7 @@ test ledger_retires_completed_ops_without_reconnect ... ok
 
 test result: ok. 67 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
 
-     Running tests/wal_writer.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/wal_writer-2760d5c8da87d10e)
+     Running tests/wal_writer.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/wal_writer-2760d5c8da87d10e)
 
 running 54 tests
 test directory_identity_recovers_after_transient_startup_error ... ok

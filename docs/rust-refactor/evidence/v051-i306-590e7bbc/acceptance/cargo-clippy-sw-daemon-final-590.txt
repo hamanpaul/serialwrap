@@ -1118,7 +1118,7 @@ warning: this expression creates a reference which is immediately dereferenced b
      = note: `#[warn(clippy::needless_borrow)]` on by default
 
 warning: `sw-core` (lib) generated 44 warnings (run `cargo clippy --fix --lib -p sw-core -- --cap-lints warn` to apply 8 suggestions)
-    Checking sw-daemon v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-daemon)
+    Checking sw-daemon v0.5.0 (<home>/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-daemon)
 warning: items after a test module
     --> crates/sw-daemon/src/daemon_main.rs:1877:1
      |

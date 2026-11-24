@@ -6,7 +6,11 @@
 - 最終程式候選：`590e7bbc1447d5e863f7388701c167daa68a2369`
 - 實作提交：`ddf7ef9b305ed94749319d8a1d508fc5c798bbc6` — `fix: 修正 self-test prompt 行界與驗收同步（issue 306）`
 - clippy 比較修正：`590e7bbc1447d5e863f7388701c167daa68a2369` — `style: 調整 self-test readiness 比較（issue 306）`
-- 驗收命令都以前景執行並留存 stdout／stderr；Cargo 只使用 `/home/paul_chen/.cache/serialwrap-cargo/v051-i306` 及其 `no-fakes/` 子目錄。此報告與完整日誌一併存檔，摘要及逐檔 SHA-256 見 `SHA256SUMS`。
+- 驗收命令都以前景執行並留存 stdout／stderr；Cargo 只使用 `<home>/.cache/serialwrap-cargo/v051-i306` 及其 `no-fakes/` 子目錄。此報告與完整日誌一併存檔，摘要及逐檔 SHA-256 見 `SHA256SUMS`。
+
+## 證據文字減敏
+
+為符合 R-21 的 shareable 檢查，封存 stdout／stderr 與本報告中的本機 home 前綴以 `<home>` 代替；其餘輸出、命令結果、順序與退出碼均保留。
 
 ## Finding 對照
 

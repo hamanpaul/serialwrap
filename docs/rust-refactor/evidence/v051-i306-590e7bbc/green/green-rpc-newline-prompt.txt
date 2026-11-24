@@ -1,6 +1,6 @@
-   Compiling sw-daemon v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-daemon)
+   Compiling sw-daemon v0.5.0 (<home>/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-daemon)
     Finished `test` profile [unoptimized + debuginfo] target(s) in 1.54s
-     Running tests/self_test_safety.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/self_test_safety-1efb440c1034d32c)
+     Running tests/self_test_safety.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/self_test_safety-1efb440c1034d32c)
 
 running 1 test
 test rpc_newline_prefixed_prompt_after_marker_confirms_ready ... ok

@@ -24,7 +24,7 @@
    Compiling crossbeam-channel v0.5.15
    Compiling sha2 v0.10.9
    Compiling indexmap v2.11.4
-   Compiling sw-pal v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-pal)
+   Compiling sw-pal v0.5.0 (<home>/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-pal)
    Compiling regex-automata v0.4.18
    Compiling md-5 v0.10.6
    Compiling rustix v1.1.5
@@ -35,11 +35,11 @@
    Compiling once_cell v1.21.4
    Compiling tempfile v3.23.0
    Compiling fancy-regex v0.16.2
-   Compiling sw-proto v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-proto)
-   Compiling sw-core v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-core)
-   Compiling sw-daemon v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-daemon)
+   Compiling sw-proto v0.5.0 (<home>/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-proto)
+   Compiling sw-core v0.5.0 (<home>/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-core)
+   Compiling sw-daemon v0.5.0 (<home>/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-daemon)
     Finished `test` profile [unoptimized + debuginfo] target(s) in 9.54s
-     Running tests/self_test_safety.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/self_test_safety-1efb440c1034d32c)
+     Running tests/self_test_safety.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/self_test_safety-1efb440c1034d32c)
 
 running 1 test
 

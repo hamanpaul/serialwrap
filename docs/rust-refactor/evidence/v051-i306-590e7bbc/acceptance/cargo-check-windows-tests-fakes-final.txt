@@ -276,7 +276,7 @@ warning: unused imports: `HoldState` and `ServiceAction`
 warning: `sw-cli` (test "mgmt_setup") generated 4 warnings (3 duplicates) (run `cargo fix --test "mgmt_setup" -p sw-cli` to apply 1 suggestion)
 warning: `sw-cli` (test "wintask_scoped_stop") generated 4 warnings (4 duplicates)
 warning: `sw-cli` (test "mgmt_service") generated 4 warnings (4 duplicates)
-    Checking sw-core v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-core)
+    Checking sw-core v0.5.0 (<home>/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-core)
 warning: unused imports: `ServiceAction` and `ServiceCtl`
   --> crates/sw-cli/tests/support/mod.rs:29:37
    |

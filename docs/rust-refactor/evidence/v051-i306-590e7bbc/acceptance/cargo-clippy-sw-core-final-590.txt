@@ -572,7 +572,7 @@ help: remove `return`
 
 warning: `sw-proto` (lib) generated 11 warnings (run `cargo clippy --fix --lib -p sw-proto -- --cap-lints warn` to apply 5 suggestions)
 warning: `sw-pal` (lib) generated 40 warnings (run `cargo clippy --fix --lib -p sw-pal -- --cap-lints warn` to apply 17 suggestions)
-    Checking sw-core v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-core)
+    Checking sw-core v0.5.0 (<home>/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-core)
 warning: struct `CommandRegistry` has a public `len` method, but no `is_empty` method
    --> crates/sw-core/src/arbiter.rs:538:5
     |

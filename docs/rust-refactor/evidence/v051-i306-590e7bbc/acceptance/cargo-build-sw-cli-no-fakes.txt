@@ -25,8 +25,8 @@
    Compiling indexmap v2.11.4
    Compiling sha2 v0.10.9
    Compiling regex-automata v0.4.18
-   Compiling sw-pal v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-pal)
+   Compiling sw-pal v0.5.0 (<home>/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-pal)
    Compiling fancy-regex v0.16.2
-   Compiling sw-proto v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-proto)
-   Compiling sw-cli v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-cli)
+   Compiling sw-proto v0.5.0 (<home>/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-proto)
+   Compiling sw-cli v0.5.0 (<home>/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-cli)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.35s
