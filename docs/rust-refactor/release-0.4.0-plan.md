@@ -107,7 +107,7 @@ scripts/docker/run-upgrade.sh --mode systemd-user --bundle <release bundle 目�
 - Python 0.4.x doctor 維持原 19 項。Rust doctor 僅新增一項 `profile_template_fields` advisory，緊接 `profile_bootloader_prompts`；其餘 19 項仍逐項比對。
 - 新 check 比較出貨與線上單一 `default.yaml` 的共同 template 頂層 key 是否存在，並輸出五種 `comparison_status`、`missing_fields`、`compared_templates`、`reason`。不可比較時 check 自身 `ok=false`，但不改整體 doctor 結果或 exit code；這不證明 daemon 已載入或重讀 profile。
 - OD-33 執行前從受版控的 `upgrade_profile_expectations.json` 選擇固定階段政策。一般 advisory 豁免仍只有 `devices`；新 check 必須唯一、可比較、payload 正確，且缺漏映射與固定預期完整相等，否則 FAIL。不得由 doctor 結果選政策。
-- p290 遷移政策識別為 `p290-template-migration-v1`：只在管理目錄中 `platform: prpl` 且缺 `timeout_recovery_keys` 時精確補 `[CTRL_C]`。遷移後政策預期不再缺該欄；其他 profile 內容保存仍由 p290 驗證。
+- p290 遷移政策識別為 `p290-template-migration-v1`：只在管理目錄中缺欄位的 `platform: prpl` template（含改名者）精確插入 `timeout_recovery_keys: [CTRL_C]`；不改 target、其他平台、既有值（含 `null`）或任何其他位元組。一般與 `--force` setup 都保護此鍵；systemd-system 先遷移 `/etc/serialwrap/profiles` 再以 no-clobber 複製套件檔。失敗檔保持原位元組、setup 整體失敗並列出已成功遷移的檔案，重跑可續行；成功觀察寫 stderr，JSON 回應形狀不變。OD-33 只核准此欄位缺→指定值的精確插入，其他內容仍逐位元組保存。降級時保留新欄位，降級保存驗證以遷移後 profiles 為基準，另留原始快照供核對。遷移後政策預期不再缺該欄；其他 profile 內容保存仍由 p290 驗證。
 - 實作驗收涵蓋 Rust-only 黑箱的精確 payload、無效 YAML、未物化；`test_doctor_ab_version_pairing_in_bundle` 保留其 nodeid 與 version pairing，並只容許上述單一 Rust 差分。正式 OD-33 容器、整合與 Windows 原生收集另列待辦，不以歷史 release 報告替代。
 
 ### 4.2 Windows（LOCAL-WINDOWS-TODO）

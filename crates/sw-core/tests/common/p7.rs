@@ -181,9 +181,12 @@ pub fn profile_from_json(v: &PyValue) -> sw_proto::config_types::SessionProfile 
             },
             // #234：舊 golden 無此欄（擷取早於 boot_done_regex）＝ dataclass 預設 ""。
             boot_done_regex: opt_string(d.get("boot_done_regex")).unwrap_or_default(),
-            // 舊 golden 無此欄（擷取早於 timeout_recovery_keys）＝ dataclass 預設（CTRL_C、CTRL_D）。
+            // 凍結的 Python golden 無此欄；重建舊基線時固定用當年的 CTRL_C、CTRL_D，不套用新 Rust 預設。
             timeout_recovery_keys: match d.get("timeout_recovery_keys") {
-                None => sw_proto::config_types::DEFAULT_TIMEOUT_RECOVERY_KEYS.to_vec(),
+                None => vec![
+                    sw_proto::config_types::TimeoutRecoveryKey::CtrlC,
+                    sw_proto::config_types::TimeoutRecoveryKey::CtrlD,
+                ],
                 Some(keys) => keys
                     .as_array()
                     .expect("timeout_recovery_keys")

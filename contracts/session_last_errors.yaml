@@ -14,7 +14,7 @@
 # logging、detail 等描述欄位之模板字串逐字取自程式 format 字串；T16 以 contracts/daemon_logging.yaml 核對。
 # states 含 RECOVERING 者：值由 reboot 恢復迴圈（sw_core/session_manager.py:3441、3466、3432）經 ensure_ready 寫入時，state 仍為 RECOVERING；該迴圈成功收斂（:3454）的清除記為 operator:command.submit。
 schema_version: 1
-revision: 1
+revision: 2
 namespace: session_last_error
 values:
   - value: "ATTACH_FAILED:*"
@@ -344,8 +344,8 @@ values:
     kind: named
     reason_forms: []
     reachable: true
-    meaning: "命令送出後等不到 prompt，且 CTRL_C／CTRL_D 皆未恢復（或 boot quiet 期間跳過強制按鍵）時，由 _transition_to_attached 轉為 ATTACHED"
-    agent_action: "此值具自動重探資格；逾期未恢復時以 session recover 或 console attach 檢查 target 狀態"
+    meaning: "Rust 0.5.1：命令逾時未達完成條件，設定的 timeout_recovery_keys 未恢復 prompt、清單為空，或 boot quiet 期間略過救援鍵時，session 轉為 ATTACHED；passthrough 仍維持 READY"
+    agent_action: "依 profile 的 timeout_recovery_keys 檢查救援鍵設定；逾期未恢復時以 session recover 或 console attach 檢查 target 狀態"
     manual_recovery: "通常由 daemon 自動重探；逾期未恢復時以 session recover 手動重試"
     logging: "無"
     detail: "null（無附帶 detail）"

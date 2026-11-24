@@ -1358,8 +1358,8 @@ def _bc_by_id():
 
 # 0.5.1 依 OD-111 新增的 Rust-only BC（rulings/v051.md「0.5.1 行為差異登錄規則」第 1、8 點；
 # 編號由編排者指派，各工作包只把自己的編號加進這個集合）。
-_V051_BC_IDS: frozenset[str] = frozenset({"BC-06", "BC-07", "BC-08"})
-_V051_BC_APPROVAL_DATES: dict[str, str] = {"BC-06": "2026-11-22", "BC-07": "2026-11-23", "BC-08": "2026-11-23"}
+_V051_BC_IDS: frozenset[str] = frozenset({"BC-06", "BC-07", "BC-08", "BC-09"})
+_V051_BC_APPROVAL_DATES: dict[str, str] = {"BC-06": "2026-11-22", "BC-07": "2026-11-23", "BC-08": "2026-11-23", "BC-09": "2026-11-25"}
 
 
 def test_bc_real_five_bcs_registered() -> None:
@@ -1447,6 +1447,8 @@ def test_bc08_doctor_profile_template_fields_registered() -> None:
         "compared_templates",
         "reason",
     }
+
+
     assert doctor_check["invariants"] == [
         "matched: ok=true, missing_fields={}",
         "missing_fields: ok=false, missing_fields is non-empty",
@@ -1502,6 +1504,44 @@ def test_bc08_doctor_profile_template_fields_registered() -> None:
     mapped_case_ids = {item["case_id"] for item in p4_cases["cases"]}
     assert expected_case_ids <= mapped_case_ids
 
+
+def test_bc09_timeout_recovery_keys_registered() -> None:
+    """BC-09 記錄 p290 的 Rust-only profile、recovery 與 setup 遷移契約。"""
+    behavior = yaml.safe_load((ROOT / "contracts" / "behavior_changes.yaml").read_text(encoding="utf-8"))
+    change = next(item for item in behavior["changes"] if item["id"] == "BC-09")
+    assert behavior["revision"] == 19
+    assert change["kind"] == "BC"
+    assert change["status"] == "IMPLEMENTED"
+    assert change["approval"] == {
+        "owner": "hamanpaul",
+        "date": "2026-11-25",
+        "decision_ref": "OD-111",
+        "basis": "owner_decision",
+    }
+    assert change["approved_at_revision"] == 19
+    assert change["scope"] == "rust_only"
+    assert change["ab_participation"] == "absolute_only"
+    assert change["applies_to"]["python"] is None
+    assert change["phases"] == ["P7"]
+    assert change["case_ids"] == ["bc09-timeout-recovery-keys"]
+    assert change["related_decisions"] == ["OD-111"]
+    coverage = yaml.safe_load((ROOT / "contracts" / "coverage_map.yaml").read_text(encoding="utf-8"))
+    entry = coverage["entries"]["bc:BC-09"]
+    assert entry["owner_phase"] == "P7"
+    assert "cargo:sw-daemon::dispatch::p290_rpc_timeout_uses_effective_profile_keys_for_uart_and_wal" in entry["nodeids"]
+    assert "cargo:sw-proto::timeout_recovery_keys::rust_only_contract_matrix_matches_generated_golden" in entry["nodeids"]
+    l1_lock = json.loads((ROOT / "tests" / "acceptance" / "l1_required.lock.json").read_text(encoding="utf-8"))
+    locked_cargo_nodeids = {
+        nodeid
+        for set_id in ("p7_gate:cargo-test-workspace", "s21_core", "s22_gate:cargo_workspace")
+        for nodeid in l1_lock["sets"][set_id]["linux"]["nodeids"]
+    }
+    assert set(entry["nodeids"]) <= locked_cargo_nodeids
+    approval = coverage["l1_only_approvals"]["bc:BC-09"]
+    assert approval == {
+        "l1_only": True,
+        "reason": "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-09 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。",
+    }
 
 def test_bc_real_approval_owner_by_basis() -> None:
     """每筆變更之 approval.owner 符合 basis 映射，SC-19 為 OD-11，DF 均為 reconciliation。"""

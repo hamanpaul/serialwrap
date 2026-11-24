@@ -28,6 +28,13 @@ use sw_proto::pyre::{PyFlags, compile};
 
 const BANNER: &[u8] = b"\r\nU-Boot 2024.04 (Oct 01 2024)\r\n";
 
+fn shell_profile_with_two_recovery_keys() -> String {
+    SHELL_PROFILE.replace(
+        "    timeout_s: 2.0\n",
+        "    timeout_s: 2.0\n    timeout_recovery_keys: [CTRL_C, CTRL_D]\n",
+    )
+}
+
 fn pget(d: &PyDict, k: &str) -> PyValue {
     d.get(k).cloned().unwrap_or(PyValue::Null)
 }
@@ -238,7 +245,15 @@ struct Wp61Case {
 /// `recovery_action` 與 lease owner。
 fn wp61_runner_timeout_case(c: &Wp61Case) {
     let label = c.label;
-    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let two_key_profile;
+    let profile = match c.reply {
+        Wp61KeyReply::CtrlC => SHELL_PROFILE,
+        Wp61KeyReply::CtrlDOnly => {
+            two_key_profile = shell_profile_with_two_recovery_keys();
+            two_key_profile.as_str()
+        }
+    };
+    let h = ActorRig::new(profile).ready();
     match c.reply {
         Wp61KeyReply::CtrlC => h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# "),
         Wp61KeyReply::CtrlDOnly => h.dev.on_tx_reply(b"\x04", b"\r\nroot@t:/# "),
@@ -532,7 +547,8 @@ fn rx_keeps_waiting_until_timeout() {
 
 #[test]
 fn ctrl_d_after_ctrl_c_fails() {
-    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let profile = shell_profile_with_two_recovery_keys();
+    let h = ActorRig::new(&profile).ready();
     h.dev.on_tx_reply(b"\x04", b"\r\nroot@t:/# ");
     let id = h.submit_with("cat", |r| r.timeout_s = 1.0);
     wait_tx(&h, b"cat\n");
@@ -2800,7 +2816,8 @@ fn recover_ready_path_returns_prompt_timeout_recovered() {
 
 #[test]
 fn recover_keys_wal_source_system_recover() {
-    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let profile = shell_profile_with_two_recovery_keys();
+    let h = ActorRig::new(&profile).ready();
     h.dev.on_tx_reply(b"\x04", b"\r\nroot@t:/# ");
     let r = request_advancing(
         &h,
@@ -3019,7 +3036,8 @@ fn recover_attached_reprobe_bootloader_classification() {
 #[test]
 fn recover_ready_path_force_fallbacks() {
     // (a) 救援鍵皆失敗 → ATTACHED → force clear＋reattach → READY → PROMPT_TIMEOUT_FORCE_RECOVERED。
-    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let profile = shell_profile_with_two_recovery_keys();
+    let h = ActorRig::new(&profile).ready();
     let _ = h.dev.take_tx();
     let rx = h.request_async(SessionRequest::Recover {
         timeout_s: 1.0,

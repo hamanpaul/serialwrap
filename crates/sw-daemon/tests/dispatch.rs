@@ -418,6 +418,62 @@ fn gpb_command_submit_reaches_uart_and_wal() {
     );
 }
 
+/// p290 BC-09：正式 `command.submit/get` RPC 經 target 覆寫選鍵，驗證救援鍵實際到 UART 與 WAL。
+#[test]
+fn p290_rpc_timeout_uses_effective_profile_keys_for_uart_and_wal() {
+    let r = ServiceRig::build(RigSpec {
+        yaml: format!(
+            "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\n    timeout_recovery_keys: []\ntargets:\n  - {{com: COM0, profile: t, device_by_id: {BY_ID_A}, timeout_recovery_keys: [CTRL_C]}}\n"
+        ),
+        devices: vec![(BY_ID_A.into(), REAL_A.into())],
+        explicit_target_count: 1,
+        allowlist: None,
+        wait_ready: vec!["COM0".into()],
+    });
+    let dev = r.device(REAL_A);
+    dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    r.settle();
+    let tx_mark = dev.tx_len();
+    let wal_mark = r.wal.current_seq();
+    let submitted = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"sleep 20","timeout_s":1}"#,
+    );
+    assert_eq!(
+        submitted.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&submitted)
+    );
+    let cmd_id = s(&submitted, "cmd_id").to_string();
+    let mut record = PyDict::default();
+    wait_until("p290 命令逾時完成", || {
+        r.clock.advance(Duration::from_millis(100));
+        record = sub(
+            &r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#)),
+            "command",
+        );
+        !matches!(record.get("done_at"), None | Some(PyValue::Null))
+    });
+    assert_eq!(s(&record, "status"), "done", "{}", j(&record));
+    assert_eq!(s(&record, "recovery_action"), "CTRL_C", "{}", j(&record));
+    assert_eq!(
+        record.get("error_code"),
+        Some(&PyValue::Null),
+        "{}",
+        j(&record)
+    );
+    assert_eq!(dev.tx_since(tx_mark), b"sleep 20\n\x03");
+    assert_eq!(
+        wp61_wal_tx_since(&r, wal_mark),
+        vec![
+            ("agent".into(), b"sleep 20\n".to_vec()),
+            ("system:recover".into(), b"\x03".to_vec()),
+        ],
+        "RPC 結果須與 UART 實際 TX 對齊"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Step 1 計畫列
 // ---------------------------------------------------------------------------

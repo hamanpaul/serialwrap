@@ -6,7 +6,7 @@
 # extra_fields 不含共通欄位 ok、error_code、id、version（見盤點 03 §1.1）。
 # retryable：yes＝可在條件滿足後重送；no＝不可直接重送；conditional＝視條件；fix_args＝修正參數或設定後再送。
 schema_version: 1
-revision: 5
+revision: 6
 namespace: error_code
 codes:
   - code: ALIAS_NOT_FOUND
@@ -852,20 +852,20 @@ codes:
     status: EXISTING
     reachable: true
     scope: {interfaces: [rpc, rec], methods: ["command.get", "command.result_tail", "result.tail", "session.recover"], platforms: [posix, windows]}
-    meaning: "命令逾時且未達完成條件；一般 profile 可能以 CTRL-C／CTRL-D 救援，passthrough 維持 READY 且不送救援按鍵"
-    side_effect: "命令本身已送出；一般 profile 可能再送 CTRL-C／CTRL-D 並轉為 ATTACHED，passthrough 不送救援按鍵且維持 READY；background capture 以 status=error 結束"
+    meaning: "命令逾時且未達完成條件；Rust 依有效 profile timeout_recovery_keys 救援，語言層預設只送 CTRL-C，passthrough 維持 READY 且不送救援按鍵"
+    side_effect: "命令本身已送出；Rust 一般 profile 依 timeout_recovery_keys 順序送鍵，空清單不送鍵；無 prompt 時轉為 ATTACHED。passthrough 不送救援按鍵且維持 READY；background capture 以 status=error 結束"
     retryable: "no"
     uart_tx: confirmed
     agent_action: "命令結果不明：先以 session self-test 與 session get_state 確認狀態，再由操作者決定是否重送"
     extra_fields: ["partial", "recovery_action"]
     contract_tests: ["tests/test_bad_command_recovery.py::TestBadCommandRecovery::test_timeout_without_recovery_demotes_then_re_ready", "tests/test_bad_command_recovery.py::TestBadCommandRecovery::test_timeout_without_recovery_does_not_double_flush", "tests/test_p1oc_sc35_commands.py::test_unusable_prompt_times_out_without_recovery_keys", "tests/test_p1oc_sc35_commands.py::test_completion_miss_no_demote", "tests/test_p1oc_sc35_commands.py::test_reboot_command_not_special_on_passthrough", "tests/test_p1oc_sc35_commands.py::test_background_mode_same_completion_rules"]
-    behavior_change: ["SC-35"]
+    behavior_change: ["SC-35", "BC-09"]
     sources: ["sw_core/session_manager.py:3927", "sw_core/session_manager.py:3911"]
   - code: PROMPT_TIMEOUT_FORCE_RECOVERED
     status: EXISTING
     reachable: true
     scope: {interfaces: [rpc], methods: ["session.recover"], platforms: [posix, windows]}
-    meaning: "命令逾時後，經 force clear 與重新 attach 成功（ok:true 回應，非失敗）"
+    meaning: "session.recover 的設定救援鍵未恢復 prompt 後，經 force clear 與重新 attach 成功（ok:true 回應，非失敗）；空清單時直接進入此路徑"
     side_effect: "已執行 clear 與重新 attach；命令可能已部分執行"
     retryable: "no"
     uart_tx: confirmed
@@ -873,21 +873,21 @@ codes:
     agent_action: "命令已執行，勿重送；以 session get_state 確認當前狀態"
     extra_fields: ["partial", "recovery_action", "session"]
     contract_tests: ["tests/test_contracts_gap_codes.py::TestGapMemory::test_prompt_timeout_force_recovered"]
-    behavior_change: []
+    behavior_change: ["BC-09"]
     sources: ["sw_core/session_manager.py:3919"]
   - code: PROMPT_TIMEOUT_RECOVERED
     status: EXISTING
     reachable: true
     scope: {interfaces: [rpc, rec], methods: ["command.result_tail", "result.tail", "session.recover"], platforms: [posix, windows]}
-    meaning: "命令逾時後 CTRL-C 或 CTRL-D 救回 prompt（ok:true 回應）；命令紀錄不寫入此碼，僅 capture 保留"
-    side_effect: "已送出 CTRL-C 或 CTRL-D；排隊命令以 FLUSHED_BY_RECOVERY 終結"
+    meaning: "命令逾時後由有效 profile 設定的救援鍵救回 prompt（Rust 預設只送 CTRL-C；ok:true 回應）；命令紀錄不寫入此碼，僅 capture 保留"
+    side_effect: "已送出設定清單中成功恢復 prompt 的救援鍵；排隊命令以 FLUSHED_BY_RECOVERY 終結"
     retryable: "no"
     uart_tx: confirmed
     ok_response: true
     agent_action: "命令已中止且不會自動重送；依 stdout 判斷結果，必要時由操作者決定是否重送"
     extra_fields: ["stdout", "partial", "recovery_action"]
     contract_tests: ["tests/test_bad_command_recovery.py::TestBadCommandRecovery::test_bad_command_timeout_then_ctrl_c_recover", "tests/test_bad_command_recovery.py::TestBadCommandRecovery::test_ctrl_c_recovery_invokes_flush_callback"]
-    behavior_change: []
+    behavior_change: ["BC-09"]
     sources: ["sw_core/session_manager.py:3897", "sw_core/session_manager.py:3887"]
   - code: PULL_PARSE_FAILED
     status: EXISTING

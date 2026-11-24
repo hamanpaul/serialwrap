@@ -70,9 +70,8 @@ impl TimeoutRecoveryKey {
     }
 }
 
-/// `config.py` 的 `DEFAULT_TIMEOUT_RECOVERY_KEYS`：未設定時與既有行為相同（先 CTRL_C 再 CTRL_D）。
-pub const DEFAULT_TIMEOUT_RECOVERY_KEYS: [TimeoutRecoveryKey; 2] =
-    [TimeoutRecoveryKey::CtrlC, TimeoutRecoveryKey::CtrlD];
+/// Rust 0.5.1 語言層預設：只送 CTRL_C。需要 CTRL_D 時由 profile 明確設定。
+pub const DEFAULT_TIMEOUT_RECOVERY_KEYS: [TimeoutRecoveryKey; 1] = [TimeoutRecoveryKey::CtrlC];
 
 /// `ProfileTemplate`（09 §2.1）。欄位順序與 Python dataclass 相同。
 #[derive(Clone, Debug, PartialEq)]

@@ -2283,17 +2283,67 @@ fn install_supervisor_held(
         ctx.p.fs.atomic_write(path, body.as_bytes(), None).map_err(|error| service_result_failure(mode, "install", error.py_message))?;
     } else if *mode == SupervisionMode::SystemdSystem {
         let home = crate::setup_cmd::home_dir(ctx);
-        let unit = crate::setup_cmd::stage_system_unit(ctx, &home)
-            .map_err(|error| service_result_failure(mode, "install", format!("system unit staging 失敗：{error:?}")))?;
-        let profiles = crate::setup_cmd::stage_system_profiles(ctx, &home)
-            .map_err(|error| service_result_failure(mode, "install", format!("system profile staging 失敗：{error:?}")))?;
-        let commands = [
-            vec!["sudo".into(), "install".into(), "-m".into(), "0644".into(), unit.to_string_lossy().into_owned(), "/etc/systemd/system/serialwrap.service".into()],
-            vec!["sudo".into(), "mkdir".into(), "-p".into(), "/etc/serialwrap/profiles".into()],
-            vec!["sudo".into(), "cp".into(), "-r".into(), format!("{}/.", profiles.display()), "/etc/serialwrap/profiles".into()],
+        let unit = crate::setup_cmd::stage_system_unit(ctx, &home).map_err(|error| {
+            service_result_failure(
+                mode,
+                "install",
+                format!("system unit staging 失敗：{error:?}"),
+            )
+        })?;
+        let profiles = crate::setup_cmd::stage_system_profiles(ctx, &home).map_err(|error| {
+            service_result_failure(
+                mode,
+                "install",
+                format!("system profile staging 失敗：{error:?}"),
+            )
+        })?;
+        let mut commands = vec![
+            vec![
+                "sudo".into(),
+                "install".into(),
+                "-m".into(),
+                "0644".into(),
+                unit.to_string_lossy().into_owned(),
+                "/etc/systemd/system/serialwrap.service".into(),
+            ],
+            vec![
+                "sudo".into(),
+                "mkdir".into(),
+                "-p".into(),
+                "/etc/serialwrap/profiles".into(),
+            ],
         ];
+        commands.push(
+            crate::setup_cmd::system_profile_migration_argv().map_err(|error| {
+                service_result_failure(
+                    mode,
+                    "install",
+                    format!("system profile 遷移命令建立失敗：{error:?}"),
+                )
+            })?,
+        );
+        commands.push(vec![
+            "sudo".into(),
+            "cp".into(),
+            "-r".into(),
+            "-n".into(),
+            format!("{}/.", profiles.display()),
+            "/etc/serialwrap/profiles".into(),
+        ]);
         for argv in commands {
             let result = ctx.p.env.run(&argv, Some(Duration::from_secs(30)));
+            if argv.iter().any(|arg| {
+                arg == &format!(
+                    "{}=1",
+                    crate::setup_cmd::INTERNAL_SYSTEM_PROFILE_MIGRATION_ENV
+                )
+            }) {
+                if let Ok(output) = &result {
+                    if !output.stderr.is_empty() {
+                        let _ = ctx.io.err_str(&output.stderr);
+                    }
+                }
+            }
             if !result.is_ok_and(|output| output.rc == 0) {
                 return Err(service_result_failure(mode, "install", format!("system unit 安裝失敗：{argv:?}")));
             }

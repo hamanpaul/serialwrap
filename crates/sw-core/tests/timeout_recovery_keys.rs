@@ -1,8 +1,7 @@
 //! profile `timeout_recovery_keys`：命令逾時與 READY 時 `session recover` 依設定送救援鍵。
 //!
-//! 斷言值以 Python 基線為準（`sw_core/config.py` 的 `_as_timeout_recovery_keys`、
-//! `sw_core/session_manager.py` 的 `_recover_after_failure`；Python 測試 `tests/test_timeout_recovery_keys.py`）：
-//! - 未設定＝先 CTRL_C 再 CTRL_D（既有行為）；
+//! 本測試只驗證 Rust-only BC-09；Python 0.4.x 基線維持凍結。
+//! - 未設定＝只送 CTRL_C；
 //! - `[CTRL_C]` 永不送 CTRL_D，CTRL_C 救不回即 PROMPT_TIMEOUT、session 轉 ATTACHED；
 //! - `[]` 一個鍵都不送，直接落到 PROMPT_TIMEOUT 收尾；
 //! - 清單順序即送出順序；target 覆寫 template。
@@ -15,8 +14,11 @@ mod support;
 use std::cell::RefCell;
 use std::time::Duration;
 
+use crossbeam_channel::bounded;
 use support::*;
+use sw_core::mailbox::ControlEvent;
 use sw_core::session_core::SessionRequest;
+use sw_core::tx_writer::OpId;
 use sw_proto::pycompat::PyErr;
 use sw_proto::pyjson::{PyDict, PyValue};
 
@@ -77,6 +79,17 @@ fn timed_out_command(h: &ActorRig) -> PyDict {
 #[test]
 fn default_keys_still_send_ctrl_d_after_ctrl_c_fails() {
     let h = ActorRig::new(&shell_profile(None, None)).ready();
+    h.dev.on_tx_reply(b"\x04", b"\r\nroot@t:/# ");
+    let rec = timed_out_command(&h);
+    assert_eq!(rec["error_code"], PyValue::from("PROMPT_TIMEOUT"));
+    assert_eq!(rec["recovery_action"], PyValue::from("NONE"));
+    assert_eq!(recovery_keys_sent(&h), vec![0x03]);
+    assert_eq!(state_of(&h), "ATTACHED");
+}
+
+#[test]
+fn explicit_two_key_profile_can_still_send_ctrl_d() {
+    let h = ActorRig::new(&shell_profile(Some("[CTRL_C, CTRL_D]"), None)).ready();
     h.dev.on_tx_reply(b"\x04", b"\r\nroot@t:/# ");
     let rec = timed_out_command(&h);
     assert_eq!(rec["recovery_action"], PyValue::from("CTRL_D"));
@@ -217,4 +230,214 @@ fn shipped_prpl_template_sends_ctrl_c_only() {
         }
     }
     assert!(seen_prpl, "出貨 profile 缺 prpl-template");
+}
+
+fn timeout_drops_human_input_deferred_during_command(keys: &str, recovery_reply: bool) {
+    let h = ActorRig::new_with_hub(&shell_profile(Some(keys), None)).ready();
+    let console = h.attach_pty_console("human");
+    let wait_start = h.rx.regex_wait_starts_for_test();
+    if recovery_reply {
+        h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    }
+    let id = h.submit_with("cat", |req| req.timeout_s = 1.0);
+    h.wait_for("命令送出", |h| wal_tx_has(h, b"cat\n"));
+    h.wait_for("命令進入 prompt 等待", |h| {
+        h.rx.regex_wait_starts_for_test() > wait_start
+    });
+    console.push_input(b"stale-human-input");
+    // FakeConsole 的讀取由 hub 執行緒完成；先讓它把輸入排入 actor data lane，再推進 fake clock。
+    std::thread::sleep(Duration::from_millis(30));
+    h.advance(Duration::from_secs(2));
+    advance_until(&h, "命令逾時收尾", |h| is_done(h, &id));
+
+    let uart = h.dev.take_tx();
+    assert!(
+        !uart
+            .windows(b"stale-human-input".len())
+            .any(|w| w == b"stale-human-input"),
+        "recovery 開始時已 deferred 的 human bytes 不得回放：{uart:?}"
+    );
+    assert!(
+        !h.wal_tx_payloads()
+            .iter()
+            .any(|payload| payload == b"stale-human-input"),
+        "WAL 不得記錄已失效的 deferred human bytes"
+    );
+}
+
+#[test]
+fn empty_key_recovery_invalidates_deferred_input_before_resume() {
+    timeout_drops_human_input_deferred_during_command("[]", false);
+}
+
+#[test]
+fn successful_key_recovery_invalidates_deferred_input_before_resume() {
+    timeout_drops_human_input_deferred_during_command("[CTRL_C]", true);
+}
+
+#[test]
+fn stale_mailbox_input_after_recovery_is_not_replayed() {
+    let h = ActorRig::new_with_hub(&shell_profile(Some("[]"), None)).ready();
+    let console = h.attach_pty_console("human");
+    let wait_start = h.rx.regex_wait_starts_for_test();
+    let id = h.submit_with("cat", |req| req.timeout_s = 1.0);
+    h.wait_for("命令送出", |h| wal_tx_has(h, b"cat\n"));
+    h.wait_for("命令進入 prompt 等待", |h| {
+        h.rx.regex_wait_starts_for_test() > wait_start
+    });
+    let pause = h.pause_before_event("RecoveryStart");
+    h.advance(Duration::from_secs(2));
+    pause
+        .entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("RecoveryStart 應進入 actor 屏障");
+
+    let data_items = h.actor_probe().data_items();
+    console.push_input(b"stale-mailbox-input");
+    let backlog_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while h.data_backlog() == 0 {
+        assert!(
+            std::time::Instant::now() < backlog_deadline,
+            "舊 epoch human input 未進 data lane"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    pause.resume.send(()).unwrap();
+    h.wait_for("RecoveryStart 後 dispatch 舊 epoch input", |h| {
+        h.actor_probe().data_items() > data_items
+    });
+    advance_until(&h, "命令逾時收尾", |h| is_done(h, &id));
+
+    let uart = h.dev.take_tx();
+    assert!(
+        !uart
+            .windows(b"stale-mailbox-input".len())
+            .any(|w| w == b"stale-mailbox-input"),
+        "RecoveryStart 後才 dispatch 的舊 epoch input 不得回放：{uart:?}"
+    );
+    assert!(!h
+        .wal_tx_payloads()
+        .iter()
+        .any(|payload| payload == b"stale-mailbox-input"));
+}
+
+#[test]
+fn recovery_start_keeps_new_epoch_input_after_successful_key() {
+    let h = ActorRig::new_with_hub(&shell_profile(Some("[CTRL_C]"), None)).ready();
+    let console = h.attach_pty_console("human");
+    let wait_start = h.rx.regex_wait_starts_for_test();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let id = h.submit_with("cat", |req| req.timeout_s = 1.0);
+    h.wait_for("命令送出", |h| wal_tx_has(h, b"cat\n"));
+    h.wait_for("命令進入 prompt 等待", |h| {
+        h.rx.regex_wait_starts_for_test() > wait_start
+    });
+    h.advance(Duration::from_secs(2));
+    advance_until(&h, "成功救援收尾", |h| is_done(h, &id));
+    assert_eq!(
+        h.command_get(&id)["recovery_action"],
+        PyValue::from("CTRL_C")
+    );
+
+    console.push_input(b"fresh-epoch-input");
+    h.wait_for("新 epoch human input 實際 TX", |h| {
+        h.dev
+            .tx_since(0)
+            .windows(b"fresh-epoch-input".len())
+            .any(|w| w == b"fresh-epoch-input")
+    });
+    h.wait_for("新 epoch human input WAL", |h| {
+        h.wal_tx_payloads()
+            .iter()
+            .any(|payload| payload == b"fresh-epoch-input")
+    });
+
+    let uart = h.dev.take_tx();
+    let rescue = uart
+        .iter()
+        .position(|byte| *byte == 0x03)
+        .expect("CTRL_C 實際 TX");
+    let fresh = uart
+        .windows(b"fresh-epoch-input".len())
+        .position(|w| w == b"fresh-epoch-input")
+        .expect("新 epoch input 實際 TX");
+    assert!(
+        rescue < fresh,
+        "新 epoch deferred input 須在救援鍵後回放：{uart:?}"
+    );
+    assert!(h
+        .wal_tx_payloads()
+        .iter()
+        .any(|payload| payload == b"fresh-epoch-input"));
+}
+
+#[test]
+fn quiet_between_keys_blocks_second_key() {
+    let h = ActorRig::new(&shell_profile(Some("[CTRL_C, CTRL_D]"), None)).ready();
+    h.dev.on_tx_reply(b"\x03", b"U-Boot 2025.01\r\n");
+    let rec = timed_out_command(&h);
+
+    assert_eq!(rec["error_code"], PyValue::from("PROMPT_TIMEOUT"));
+    assert_eq!(recovery_keys_sent(&h), vec![0x03]);
+    assert_eq!(state_of(&h), "ATTACHED");
+}
+
+#[test]
+fn cancel_after_first_key_blocks_remaining_keys() {
+    let h = ActorRig::new(&shell_profile(Some("[CTRL_C, CTRL_D]"), None)).ready();
+    let id = h.submit_with("cat", |req| req.timeout_s = 1.0);
+    h.wait_for("命令 TX 寫出", |h| wal_tx_has(h, b"cat\n"));
+    h.advance(Duration::from_secs(1));
+    h.wait_for("第一個救援鍵 TX", |h| {
+        recovery_keys_sent(h) == vec![0x03]
+    });
+
+    let cancelled = h.request(SessionRequest::CancelQueued { cmd_id: id.clone() });
+    assert_eq!(cancelled["ok"], PyValue::Bool(true));
+    advance_until(&h, "取消後命令收尾", |h| is_done(h, &id));
+    assert_eq!(recovery_keys_sent(&h), vec![0x03]);
+}
+
+#[test]
+fn stale_recovery_start_does_not_invalidate_new_connection_input() {
+    let h = ActorRig::new_with_hub(&shell_profile(Some("[]"), None)).ready();
+    let console = h.attach_pty_console("human");
+    let pause = h.pause_before_event("RecoveryStart");
+    let (reply, ack) = bounded(1);
+    h.send_control(ControlEvent::RecoveryStart {
+        op_id: OpId(0),
+        epoch: 0,
+        reply,
+    });
+    pause
+        .entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("RecoveryStart 應進入 actor 屏障");
+
+    console.push_input(b"new-connection-input");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while h.data_backlog() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "新連線 human input 未進 data lane"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    pause.resume.send(()).unwrap();
+    assert!(!ack.recv_timeout(Duration::from_secs(5)).unwrap());
+    h.wait_for("新連線 human input TX", |h| {
+        h.dev
+            .tx_since(0)
+            .windows(b"new-connection-input".len())
+            .any(|w| w == b"new-connection-input")
+    });
+    h.wait_for("新連線 human input WAL", |h| {
+        h.wal_tx_payloads()
+            .iter()
+            .any(|payload| payload == b"new-connection-input")
+    });
+    assert!(h
+        .wal_tx_payloads()
+        .iter()
+        .any(|payload| payload == b"new-connection-input"));
 }

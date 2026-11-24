@@ -40,9 +40,6 @@ class TestRecoverOkTrue(unittest.TestCase):
         # 成「quiet window 進行中」而整段跳過，與本測試「驗證 CTRL_C 成功恢復」的
         # 意圖無關，須顯式釘死為 False（非 quiet 中）才能重現原本要測的路徑。
         session.boot_quiet_active.return_value = False
-        # 逾時恢復按鍵改由 profile.timeout_recovery_keys 決定；MagicMock 屬性迭代為空，
-        # 會被當成「不送按鍵」，須比照上一行顯式給預設值。
-        session.profile.timeout_recovery_keys = ("CTRL_C", "CTRL_D")
 
         result = SessionManager._recover_after_failure(
             mgr,

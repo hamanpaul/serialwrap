@@ -715,6 +715,7 @@ fn profile_template_fields_drift() {
             PyValue::List(vec![
                 PyValue::Str("boot_done_regex".into()),
                 PyValue::Str("bootloader_prompts".into()),
+                PyValue::Str("timeout_recovery_keys".into()),
             ]),
         )])))
     );
@@ -727,7 +728,7 @@ fn profile_template_fields_drift() {
     assert_eq!(
         detail,
         format!(
-            "線上 {} 的共同 template 缺出貨資產已有的頂層欄位：prpl-template（boot_done_regex、bootloader_prompts）",
+            "線上 {} 的共同 template 缺出貨資產已有的頂層欄位：prpl-template（boot_done_regex、bootloader_prompts、timeout_recovery_keys）",
             posix_flavor_profile_path(&t)
         )
     );
@@ -893,7 +894,7 @@ fn profile_template_fields_presence_only() {
     let live_path = t.config_dir().join("profiles").join("default.yaml");
     t.write_file(
         &live_path,
-        b"profiles:\n  prpl-template:\n    platform: null\n    prompt_regex: \"x\"\n    login_regex: \"\"\n    password_regex: null\n    ready_probe: []\n    bootloader_prompts: []\n    boot_done_regex: \"\"\n    uart:\n      baud: 115200\n      data_bits: 8\n      parity: N\n      stop_bits: 1\n      flow_control: none\n      xonxoff: false\n",
+        b"profiles:\n  prpl-template:\n    platform: null\n    prompt_regex: \"x\"\n    login_regex: \"\"\n    password_regex: null\n    ready_probe: []\n    bootloader_prompts: []\n    boot_done_regex: \"\"\n    timeout_recovery_keys: null\n    uart:\n      baud: 115200\n      data_bits: 8\n      parity: N\n      stop_bits: 1\n      flow_control: none\n      xonxoff: false\n",
     );
     let (rc, out, _) = t.run(&["doctor"]);
     assert_eq!(rc, 0);
@@ -1049,6 +1050,7 @@ fn profile_template_fields_windows_payload() {
             PyValue::List(vec![
                 PyValue::Str("boot_done_regex".into()),
                 PyValue::Str("bootloader_prompts".into()),
+                PyValue::Str("timeout_recovery_keys".into()),
             ]),
         )])))
     );

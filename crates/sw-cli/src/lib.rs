@@ -16,6 +16,7 @@ pub mod ctx;
 pub mod delegate;
 pub mod endpoint_resolve;
 pub mod output;
+pub(crate) mod profile_migration;
 pub mod remote_tunnel;
 pub mod source_policy;
 // P4-T1 空殼：以下模組的實作由 Stage 1B 各 Task 承接（見 docs/rust-refactor/plans/05-stage1b-rust-cli-mgmt.md）。
@@ -145,6 +146,16 @@ pub fn run(
         cli_version: CLI_VERSION,
         autostart_lock: None,
     };
+
+    // systemd-system 的 setup 子程序由 sudo 重新執行目前這份 Rust CLI；此內部環境標記
+    // 只讓它遷移固定的 /etc/serialwrap/profiles，隨後立即結束，不進入一般命令分派。
+    if ctx
+        .env
+        .get(setup_cmd::INTERNAL_SYSTEM_PROFILE_MIGRATION_ENV)
+        == Some("1")
+    {
+        return setup_cmd::migrate_system_profiles(&mut ctx);
+    }
 
     let tail: &[OsString] = argv.get(1..).unwrap_or(&[]);
     // 環境變數鉤子只在 test-fakes 建置讀取。凍結 selector 的整合測試改走行程內 override，

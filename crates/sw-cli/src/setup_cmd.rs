@@ -31,6 +31,8 @@ pub struct UserDirs {
 }
 
 const DEFAULT_COM0COM_PAIR: (&str, &str) = sw_pal::com0com::DEFAULT_PAIR;
+pub(crate) const INTERNAL_SYSTEM_PROFILE_MIGRATION_ENV: &str =
+    "SW_INTERNAL_P290_MIGRATE_SYSTEM_PROFILES";
 
 fn env_path(env: &EnvSnapshot, key: &str, fallback: PathBuf) -> PathBuf {
     env.get(key)
@@ -100,8 +102,144 @@ fn asset_tail<'a>(rel: &'a str, prefix: &str) -> Option<&'a str> {
     rel.strip_prefix(prefix)
 }
 
-pub fn materialize_assets(
+fn atomic_replace_profile(
     ctx: &CliCtx<'_>,
+    path: &Path,
+    original: &[u8],
+    updated: &[u8],
+) -> Result<(), SetupError> {
+    let current = ctx.p.fs.read(path).map_err(|error| {
+        SetupError::Io(format!(
+            "重讀 profile {} 失敗：{}",
+            path.display(),
+            error.py_message
+        ))
+    })?;
+    if current != original {
+        return Err(SetupError::Io(format!(
+            "profile {} 在遷移期間已變更，拒絕覆寫",
+            path.display()
+        )));
+    }
+    if let Err(error) = ctx.p.fs.atomic_write(path, updated, None) {
+        let message = if ctx.p.fs.read(path).is_ok_and(|bytes| bytes != original) {
+            match ctx.p.fs.atomic_write(path, original, None) {
+                Ok(()) => format!("{}；原檔已回復", error.py_message),
+                Err(restore) => {
+                    format!("{}；原檔回復失敗：{}", error.py_message, restore.py_message)
+                }
+            }
+        } else {
+            error.py_message
+        };
+        return Err(SetupError::Io(format!(
+            "原子寫入 profile {} 失敗：{message}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn migrate_managed_profiles(ctx: &mut CliCtx<'_>, directory: &Path) -> Result<(), SetupError> {
+    let mut names = match ctx.p.fs.list_dir(directory) {
+        Ok(names) => names,
+        Err(error) => {
+            let message = format!(
+                "列舉 managed profiles {} 失敗：{}",
+                directory.display(),
+                error.py_message
+            );
+            let _ = ctx.io.err_str(&format!(
+                "serialwrap setup: profile 遷移失敗：{message}；已成功處理：無\n"
+            ));
+            return Err(SetupError::Io(message));
+        }
+    };
+    names.sort();
+    let mut migrated = Vec::new();
+    for name in names {
+        let path = directory.join(&name);
+        if !ctx.p.fs.is_file(&path)
+            || !matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("yaml" | "yml")
+            )
+        {
+            continue;
+        }
+        let result = (|| {
+            let original =
+                ctx.p.fs.read(&path).map_err(|error| {
+                    format!("讀取 {} 失敗：{}", path.display(), error.py_message)
+                })?;
+            let Some((updated, labels)) = crate::profile_migration::migrate_bytes(&original)?
+            else {
+                return Ok(None);
+            };
+            atomic_replace_profile(ctx, &path, &original, &updated)
+                .map_err(|error| format!("{error:?}"))?;
+            Ok::<_, String>(Some(labels))
+        })();
+        match result {
+            Ok(Some(labels)) => {
+                migrated.push(path.display().to_string());
+                let detail = format!(
+                    "serialwrap setup: 已補入 profile {} 的 timeout_recovery_keys=[CTRL_C]（{}）\n",
+                    path.display(),
+                    labels.join(", ")
+                );
+                ctx.io
+                    .err_str(&detail)
+                    .map_err(|error| SetupError::Io(format!("寫入 setup 遷移診斷失敗：{error}")))?;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let completed = if migrated.is_empty() {
+                    "無".to_string()
+                } else {
+                    migrated.join(", ")
+                };
+                let detail = format!(
+                    "serialwrap setup: profile 遷移失敗：{error}；已成功處理：{completed}\n"
+                );
+                let _ = ctx.io.err_str(&detail);
+                return Err(SetupError::Io(detail.trim().to_string()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// systemd-system 的提權階段只呼叫本函式；只觸及 serialwrap 管理的 system profile 目錄。
+pub(crate) fn migrate_system_profiles(ctx: &mut CliCtx<'_>) -> i32 {
+    if ctx.p.caps.path_flavor != PalPathFlavor::Posix {
+        let _ = ctx
+            .io
+            .err_str("serialwrap setup: system profile 遷移只支援 POSIX\n");
+        return 1;
+    }
+    match migrate_managed_profiles(ctx, Path::new("/etc/serialwrap/profiles")) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+pub(crate) fn system_profile_migration_argv() -> Result<Vec<String>, SetupError> {
+    let executable = std::env::current_exe().map_err(|error| {
+        SetupError::Io(format!(
+            "無法定位目前的 serialwrap 執行檔以遷移 system profiles：{error}"
+        ))
+    })?;
+    Ok(vec![
+        "sudo".to_string(),
+        "env".to_string(),
+        format!("{}=1", INTERNAL_SYSTEM_PROFILE_MIGRATION_ENV),
+        executable.to_string_lossy().into_owned(),
+    ])
+}
+
+pub fn materialize_assets(
+    ctx: &mut CliCtx<'_>,
     dirs: &UserDirs,
     force: bool,
 ) -> Result<MaterializeReport, SetupError> {
@@ -118,11 +256,30 @@ pub fn materialize_assets(
             continue;
         };
         let dest = profiles.join(name);
-        if ctx.p.fs.exists(&dest) && !force {
-            continue;
+        if ctx.p.fs.exists(&dest) {
+            if !force {
+                continue;
+            }
+            let current = ctx.p.fs.read(&dest).map_err(|error| {
+                SetupError::Io(format!(
+                    "讀取既有 profile {} 失敗：{}",
+                    dest.display(),
+                    error.py_message
+                ))
+            })?;
+            if crate::profile_migration::contains_timeout_key(&current).map_err(|error| {
+                SetupError::Io(format!(
+                    "檢查既有 profile {} 失敗：{}",
+                    dest.display(),
+                    error
+                ))
+            })? {
+                continue;
+            }
         }
         write_asset(ctx, &dest, asset.bytes)?;
     }
+    migrate_managed_profiles(ctx, &profiles)?;
 
     let skill_dir = dirs.data.join("skill");
     ctx.p.fs.mkdirs(&skill_dir).map_err(|error| {
@@ -811,20 +968,56 @@ pub(crate) fn stage_system_unit(ctx: &CliCtx<'_>, home: &Path) -> Result<PathBuf
     Ok(staging)
 }
 
-pub(crate) fn stage_system_profiles(ctx: &CliCtx<'_>, home: &Path) -> Result<PathBuf, SetupError> {
+pub(crate) fn stage_system_profiles(
+    ctx: &mut CliCtx<'_>,
+    home: &Path,
+) -> Result<PathBuf, SetupError> {
     let staging = home.join(".local/share/serialwrap/system-profiles");
     ctx.p.fs.mkdirs(&staging).map_err(io_error)?;
     for asset in crate::assets::PROFILE_ASSETS {
         let Some(name) = asset_tail(asset.rel, "profiles/") else {
             continue;
         };
-        write_asset(ctx, &staging.join(name), asset.bytes)?;
+        let dest = staging.join(name);
+        if ctx.p.fs.exists(&dest) {
+            let current = ctx.p.fs.read(&dest).map_err(|error| {
+                SetupError::Io(format!(
+                    "讀取既有 system profile {} 失敗：{}",
+                    dest.display(),
+                    error.py_message
+                ))
+            })?;
+            if crate::profile_migration::contains_timeout_key(&current).map_err(|error| {
+                SetupError::Io(format!(
+                    "檢查既有 system profile {} 失敗：{}",
+                    dest.display(),
+                    error
+                ))
+            })? {
+                continue;
+            }
+            if let Some((updated, labels)) = crate::profile_migration::migrate_bytes(&current)
+                .map_err(|error| {
+                    SetupError::Io(format!(
+                        "遷移 system profile {} 失敗：{}",
+                        dest.display(),
+                        error
+                    ))
+                })?
+            {
+                atomic_replace_profile(ctx, &dest, &current, &updated)?;
+                let _ = ctx.io.err_str(&format!("serialwrap setup: 已補入 system profile {} 的 timeout_recovery_keys=[CTRL_C]（{}）\n", dest.display(), labels.join(", ")));
+                continue;
+            }
+        }
+        write_asset(ctx, &dest, asset.bytes)?;
     }
+    migrate_managed_profiles(ctx, &staging)?;
     Ok(staging)
 }
 
 fn system_install_plan(
-    ctx: &CliCtx<'_>,
+    ctx: &mut CliCtx<'_>,
     home: &Path,
     include_start: bool,
 ) -> Result<Vec<Vec<String>>, SetupError> {
@@ -845,10 +1038,12 @@ fn system_install_plan(
             "-p".to_string(),
             "/etc/serialwrap/profiles".to_string(),
         ],
+        system_profile_migration_argv()?,
         vec![
             "sudo".to_string(),
             "cp".to_string(),
             "-r".to_string(),
+            "-n".to_string(),
             format!("{}/.", profiles.display()),
             "/etc/serialwrap/profiles".to_string(),
         ],
@@ -886,6 +1081,31 @@ fn run_command(ctx: &CliCtx<'_>, argv: &[String]) -> CmdRecord {
         argv: argv.to_vec(),
         rc,
     }
+}
+
+fn run_system_file_commands(ctx: &mut CliCtx<'_>, argvs: &[Vec<String>]) -> Vec<CmdRecord> {
+    argvs
+        .iter()
+        .map(|argv| {
+            let result = ctx.p.env.run(argv, None);
+            let is_migration = argv
+                .iter()
+                .any(|arg| arg == &format!("{}=1", INTERNAL_SYSTEM_PROFILE_MIGRATION_ENV));
+            let rc = match result {
+                Ok(output) => {
+                    if is_migration && !output.stderr.is_empty() {
+                        let _ = ctx.io.err_str(&output.stderr);
+                    }
+                    output.rc
+                }
+                Err(_) => -1,
+            };
+            CmdRecord {
+                argv: argv.clone(),
+                rc,
+            }
+        })
+        .collect()
 }
 
 fn run_records(ctx: &CliCtx<'_>, argvs: &[Vec<String>]) -> Vec<CmdRecord> {
@@ -1169,7 +1389,7 @@ fn windows_task_definition(ctx: &CliCtx<'_>, socket: &str) -> SupervisorDefiniti
 }
 
 fn pending_privileged(
-    ctx: &CliCtx<'_>,
+    ctx: &mut CliCtx<'_>,
     req: &ReconcileRequest,
 ) -> Result<Option<PyDict>, ReconcileError> {
     let mut pending = Vec::new();
@@ -1419,8 +1639,8 @@ fn start_new(
                 .map_err(|error| {
                     ReconcileError::Config(format!("system unit staging 失敗：{error:?}"))
                 })?;
-            let file_commands = &commands[..3];
-            let file_records = run_records(ctx, file_commands);
+            let file_commands = &commands[..4];
+            let file_records = run_system_file_commands(ctx, file_commands);
             extend_records(ran, &file_records);
             let root = install_layout::resolve_install_root(ctx);
             let unit = req.home.join(".local/share/serialwrap/serialwrap.service");

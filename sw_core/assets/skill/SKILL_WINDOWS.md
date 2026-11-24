@@ -38,8 +38,12 @@ Rust 0.5.1 的 `profile_template_fields` 是 Rust-only advisory：比較出貨�
 `matched`、`missing_fields`、`not_materialized`、`unavailable` 或 `no_common_templates`；
 不可比較時 check 為 `ok=false`，但不改 doctor 整體 `ok` 或 exit code，也不表示 daemon
 已載入／重讀 profile。OD-33 升級 gate 依事前選定的受版控政策精確比對缺漏，任何不可比較或集合差異均 FAIL。
-p290 的 `p290-template-migration-v1` 僅在管理目錄的 `platform: prpl` template 缺
-`timeout_recovery_keys` 時補 `[CTRL_C]`；其他欄位依既有 setup 行為處理。
+p290（BC-09）的 Rust timeout recovery 預設只送 `[CTRL_C]`；template 的欄位省略或為
+`null` 時採此預設，target 省略或為 `null` 時繼承 template。明確 `[]` 不送救援鍵，
+`CTRL_D` 只有在清單明列時才送；一般 recovery 會使 deferred human 輸入失效。setup 的
+`p290-template-migration-v1` 只為管理目錄中缺欄位的 `platform: prpl` template（包含改名
+template）精確插入 `[CTRL_C]`，不覆寫已有值，也不改其他位元組。成功訊息在 stderr，
+降級保留欄位；細節見 `SKILL.md` 與 `docs/serialwrap-spec.md`。
 
 ## 2. 啟動 daemon
 
@@ -281,9 +285,9 @@ serialwrap device attach --selector COM0
 | `NO_SYSTEMD` | cli_local／posix、windows | 修正參數後 | on-demand 或未知的監管模式下呼叫 service 管理動作 | 依 supervision_mode 改用正確的 daemon 管理方式（on-demand 使用 daemon start 與 daemon stop） |
 | `PROFILE_IS_EXPLICIT` | rpc／posix、windows | 修正參數後 | session 的 profile 來源為 yaml-target，不可 pin 或 unpin | 改為修改 YAML target 設定，而非使用 pin 或 unpin |
 | `PROFILE_NOT_COMMAND_CAPABLE` | rpc／posix、windows | 否 | session 為 ATTACHED 且非 passthrough 的 profile 不支援命令（command_capable 為 false），或 file.push／file.pull 的目標為 passthrough（任何狀態） | 命令使用 command-capable profile；passthrough 檔案傳輸改用互動 console |
-| `PROMPT_TIMEOUT` | rpc、rec／posix、windows | 否 | 命令逾時且未達完成條件；一般 profile 可能以 CTRL-C／CTRL-D 救援，passthrough 維持 READY 且不送救援按鍵 | 命令結果不明：先以 session self-test 與 session get_state 確認狀態，再由操作者決定是否重送 |
-| `PROMPT_TIMEOUT_FORCE_RECOVERED` | rpc／posix、windows | 否 | 命令逾時後，經 force clear 與重新 attach 成功（ok:true 回應，非失敗） | 命令已執行，勿重送；以 session get_state 確認當前狀態 |
-| `PROMPT_TIMEOUT_RECOVERED` | rpc、rec／posix、windows | 否 | 命令逾時後 CTRL-C 或 CTRL-D 救回 prompt（ok:true 回應）；命令紀錄不寫入此碼，僅 capture 保留 | 命令已中止且不會自動重送；依 stdout 判斷結果，必要時由操作者決定是否重送 |
+| `PROMPT_TIMEOUT` | rpc、rec／posix、windows | 否 | 命令逾時且未達完成條件；Rust 依有效 profile timeout_recovery_keys 救援，語言層預設只送 CTRL-C，passthrough 維持 READY 且不送救援按鍵 | 命令結果不明：先以 session self-test 與 session get_state 確認狀態，再由操作者決定是否重送 |
+| `PROMPT_TIMEOUT_FORCE_RECOVERED` | rpc／posix、windows | 否 | session.recover 的設定救援鍵未恢復 prompt 後，經 force clear 與重新 attach 成功（ok:true 回應，非失敗）；空清單時直接進入此路徑 | 命令已執行，勿重送；以 session get_state 確認當前狀態 |
+| `PROMPT_TIMEOUT_RECOVERED` | rpc、rec／posix、windows | 否 | 命令逾時後由有效 profile 設定的救援鍵救回 prompt（Rust 預設只送 CTRL-C；ok:true 回應）；命令紀錄不寫入此碼，僅 capture 保留 | 命令已中止且不會自動重送；依 stdout 判斷結果，必要時由操作者決定是否重送 |
 | `PULL_PARSE_FAILED` | rpc／posix、windows | 視情況 | 擷取輸出中找不到 sentinel 區段，且無 encoder 失敗 sentinel | 確認目標端 encoder 輸出正常後重試 |
 | `READY_UNCONFIRMED` | rpc、rec／posix、windows | 否 | READY 再確認逾 300 秒或已達 5 次仍未確認，拒絕 agent 命令 | 勿重送；執行 serialwrap session self-test 取分類，再依分類處理 |
 | `REMOTE_BIND_UNVERIFIED` | cli_local／posix、windows | 視情況 | expose tcp 模式下 relay 的 ss 驗證失敗，或綁定位址非 loopback | 確認 relay 僅綁定 loopback 位址後重試 |
@@ -345,7 +349,7 @@ serialwrap device attach --selector COM0
 | `PASS_ENV_MISSING` | 終態 | 不自動重探 | login 提示需要密碼，但 pass_env 指向的環境變數為空 | 補齊 profile 的 pass_env 對應環境變數（或 env_file 內的 key）後，以 session attach 重試 |
 | `PASS_ENV_REQUIRED` | 終態 | 不自動重探 | profile 設定了 user_env 但缺 pass_env，login 與 password 提示皆出現 | 在 profile 補上 pass_env 設定後，以 session attach 重試 |
 | `POST_LOGIN_CMD_TIMEOUT` | 終態 | 不自動重探 | 登入成功後執行 post_login_cmd 逾時 | 檢查 profile 的 post_login_cmd 與 timeout_s（bcm 切換 shell 的情境建議加大）後，以 session attach 重試 |
-| `PROMPT_TIMEOUT` | 非終態 | ATTACHED／DETACHED 自動重探 | 命令送出後等不到 prompt，且 CTRL_C／CTRL_D 皆未恢復（或 boot quiet 期間跳過強制按鍵）時，由 _transition_to_attached 轉為 ATTACHED | 此值具自動重探資格；逾期未恢復時以 session recover 或 console attach 檢查 target 狀態 |
+| `PROMPT_TIMEOUT` | 非終態 | ATTACHED／DETACHED 自動重探 | Rust 0.5.1：命令逾時未達完成條件，設定的 timeout_recovery_keys 未恢復 prompt、清單為空，或 boot quiet 期間略過救援鍵時，session 轉為 ATTACHED；passthrough 仍維持 READY | 依 profile 的 timeout_recovery_keys 檢查救援鍵設定；逾期未恢復時以 session recover 或 console attach 檢查 target 狀態 |
 | `PROMPT_UNAVAILABLE` | 非終態 | 僅 ATTACHED 自動重探 | attach 後 prompt 不可用（開機窗或 probe 未見 prompt） | attach 撞上 DUT 開機窗時屬暫態，daemon 會等 RX 閒置後自動重探；逾期未恢復時以 console attach 觀察 |
 | `PRPL_PROMPT_TIMEOUT` | 非終態 | ATTACHED／DETACHED 自動重探 | platform 為 prpl（其餘未指定者一律歸此）時等待 prompt 逾時 | 此值具自動重探資格；逾期未恢復時檢查 profile 的 prompt_regex 與 timeout_s，並以 session attach 重試 |
 | `READY_NONCE_TIMEOUT` | 終態 | 不自動重探 | READY 確認 nonce 逾時（ready_probe 的回聲未出現） | 檢查 profile 的 ready_probe 設定與 target 是否可執行命令，修正後以 session attach 重試 |
