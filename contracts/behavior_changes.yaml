@@ -7,7 +7,7 @@
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 11
+revision: 12
 changes:
   - id: "BC-01"
     kind: "BC"
@@ -1707,20 +1707,19 @@ changes:
     owner_item: null
     default_if_pending: null
     applies_to:
-      python:
-        min_version: "0.4.0"
+      python: null
       rust:
         stage: "slice-2.3"
     approved_at_revision: 6
     spec_refs: ["§11.3"]
     reconciliation_refs: []
-    scope: "both"
-    ab_participation: "diff"
+    scope: "rust_only"
+    ab_participation: "absolute_only"
     phases: ["P7"]
     case_ids: ["p7-invariants-release-during-login-waits-for-handle-close"]
-    compatibility_impact: "Python 基線（2026-10-29 實測，CPython 3.12）：login 進行中 `device release` 後 `device attach`，session 落 DETACHED＋`last_error: ATTACH_FAILED:TxIncompleteError` 且不再自動重試（擁有者 OD-57 視為 Python 缺陷）；Rust 重新 attach 並回到 READY。對外差異：同一操作序列後 session.state／last_error 不同。"
-    approval_conditions: "只限「login 進行中 device release → device attach」的收斂結果；§11.3-4 handle 時序（release 回成功即無 fd、attach 前不重開）兩邊相同照常判定。S1X-a 修正合入 feature/rust-refactor 後重測 Python，若 Python 也回 READY，本 DF 改為 parity 結案。"
-    related_decisions: ["OD-57"]
+    compatibility_impact: "Python 0.4.x 實測（2026-11-23，OD-115）：login 進行中 `device release` 後 `device attach` 的終態受時序影響，可能為 `ATTACH_FAILED:TxIncompleteError` 或 `LOGIN_PROMPT_TIMEOUT`，且偶爾會自動重試一次（`reprobe_attempts` 0→1）；此 Python 缺陷行為只作文字記錄。Rust 重新 attach 並回到 READY。依擁有者 OD-115，DF-23 黑箱測試只在 Rust 執行，Python 不參與 A/B 判定。"
+    approval_conditions: "只限「login 進行中 device release → device attach」的收斂結果；Rust 應重新 attach 並回到 READY。§11.3-4 handle 時序（release 回成功即無 fd、attach 前不重開）斷言照舊保留於 Rust 黑箱測試。Python 實測差異依 OD-115 只作文字記錄，不執行 DF-23 黑箱測試。"
+    related_decisions: ["OD-57", "OD-115"]
   - id: "DF-24"
     kind: "DF"
     title: "force recover 期間 session list 的 lock 等待差異"
