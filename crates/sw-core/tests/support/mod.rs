@@ -1194,7 +1194,6 @@ impl EffectExecutor for RigExec {
                 std::thread::spawn(move || {
                     let send = sw_core::login_fsm::login_tx_sender(
                         handle,
-                        rx.clone(),
                         epoch,
                         0,
                         fsm_gen,

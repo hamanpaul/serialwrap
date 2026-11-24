@@ -172,7 +172,6 @@ impl LoginRig {
             class: TxClass,
             source: &str,
             log: bool,
-            _secret_echo_id: Option<u64>,
         | -> TxReport {
             written
                 .lock()

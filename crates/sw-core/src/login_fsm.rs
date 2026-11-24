@@ -72,8 +72,7 @@ pub enum LoginAbort {
 pub struct LoginIo<'a> {
     pub rx: &'a RxShared,
     /// P7 Task 3：回 06 T9 `TxReport`（取得 fence 拒絕原因）。
-    /// 最後一個參數只在 secret TX 時帶入守衛 id，供 PAL submit 啟用回顯遮罩。
-    pub tx: &'a dyn Fn(&[u8], TxClass, &str, bool, Option<u64>) -> TxReport,
+    pub tx: &'a dyn Fn(&[u8], TxClass, &str, bool) -> TxReport,
     pub clock: &'a dyn Clock,
     pub nonce: &'a dyn Fn() -> String,
     /// secret TX 前寫入只含 byte 長度的 WAL META；失敗時 fail closed，不送出憑證。
@@ -251,7 +250,16 @@ pub fn ensure_ready(
     auth: &SessionAuth,
     env: &dyn SysEnv,
 ) -> LoginOutcome {
+    let _secret_cleanup = SecretEchoFlowCleanup(io.rx);
     finish(ensure_ready_inner(io, p, auth, env), true)
+}
+
+struct SecretEchoFlowCleanup<'a>(&'a RxShared);
+
+impl Drop for SecretEchoFlowCleanup<'_> {
+    fn drop(&mut self) {
+        self.0.disarm_secret_echo_for_login_end();
+    }
 }
 
 fn ensure_ready_inner(
@@ -324,17 +332,12 @@ pub fn login_error_detail(rx: &RxShared, code: &str) -> Option<String> {
 /// 每筆 TX 取得 `TxReport` 後立即 settle（登入 op 不參與 BC-03 映射）；TxWriter 已結束時回 `NotSubmitted`。
 pub fn login_tx_sender(
     handle: TxWriterHandle,
-    rx: Arc<RxShared>,
     epoch: u64,
     owner_gen: u64,
     fsm_gen: u64,
-) -> impl Fn(&[u8], TxClass, &str, bool, Option<u64>) -> TxReport + Send + Sync {
+) -> impl Fn(&[u8], TxClass, &str, bool) -> TxReport + Send + Sync {
     let handle = Arc::new(handle);
-    move |payload: &[u8],
-          class: TxClass,
-          source: &str,
-          log: bool,
-          secret_echo_id: Option<u64>| -> TxReport {
+    move |payload: &[u8], class: TxClass, source: &str, log: bool| -> TxReport {
         let op_id = OpId(LOGIN_OP_ID_BASE | NEXT_LOGIN_OP.fetch_add(1, Ordering::Relaxed));
         let (reply, report) = crossbeam_channel::bounded(1);
         let job = TxJob {
@@ -366,19 +369,10 @@ pub fn login_tx_sender(
             wal: None,
             reject: Some(FenceReject::Frozen),
         };
-        if let Some(id) = secret_echo_id {
-            let submit_rx = rx.clone();
-            handle.register_submit_hook(
-                op_id,
-                Arc::new(move |os_submit| submit_rx.submit_secret_echo(id, os_submit)),
-            );
-        }
         if handle.jobs.send(job).is_err() {
-            handle.remove_submit_hook(op_id);
             return not_submitted;
         }
         let result = handle.wait_report(&report).unwrap_or(not_submitted);
-        handle.remove_submit_hook(op_id);
         let _ = handle.settle(op_id);
         result
     }
@@ -493,7 +487,7 @@ fn send(io: &LoginIo, payload: &str, source: &str, log: bool) -> Step<()> {
     if !bytes.ends_with(b"\n") {
         bytes.push(b'\n');
     }
-    let report = (io.tx)(&bytes, io.class, source, log, None);
+    let report = (io.tx)(&bytes, io.class, source, log);
     match report.result.outcome {
         TxOutcome::Completed(n) if n >= bytes.len() => return Ok(()),
         // 未提交且無 fence 原因：run 被取消（SC-30 RunCancel）。
@@ -517,15 +511,8 @@ fn send_command(io: &LoginIo, cmd: &str) -> Step<()> {
     send(io, cmd, "system", true)
 }
 
-fn send_secret<'a>(
-    io: &LoginIo<'a>,
-    secret: &str,
-    prompt_pattern: &str,
-    timeout: Duration,
-) -> Step<SecretEchoGuard<'a>> {
-    let guard = io
-        .rx
-        .arm_secret_echo_with_prompt(secret.as_bytes(), prompt_pattern);
+fn send_secret(io: &LoginIo<'_>, secret: &str) -> Step<SecretEchoGuard> {
+    let guard = io.rx.arm_secret_echo(secret.as_bytes());
     let secret_len = secret.as_bytes().len();
     if !(io.audit_secret_tx)(secret_len) {
         return Err(LoginOutcome::Raised {
@@ -537,29 +524,15 @@ fn send_secret<'a>(
     if !bytes.ends_with(b"\n") {
         bytes.push(b'\n');
     }
-    let report = (io.tx)(
-        &bytes,
-        io.class,
-        "system:secret",
-        false,
-        Some(guard.id()),
-    );
-    let deadline = io
-        .clock
-        .mono_ns()
-        .saturating_add(timeout.as_nanos().min(u64::MAX as u128) as u64);
+    let report = (io.tx)(&bytes, io.class, "system:secret", false);
     match report.result.outcome {
         TxOutcome::Completed(n) if n >= bytes.len() => {
-            guard.set_deadline(deadline);
             return Ok(guard);
         }
         TxOutcome::NotSubmitted if report.reject.is_none() => {
             return Err(LoginOutcome::Aborted(LoginAbort::Cancelled));
         }
         _ => {}
-    }
-    if secret_tx_may_have_been_submitted(&report) {
-        guard.preserve_until(deadline);
     }
     Err(match classify_login_secret_tx_failure(&report) {
         TxFail::Refused => LoginOutcome::Aborted(LoginAbort::Refused(
@@ -570,14 +543,6 @@ fn send_secret<'a>(
             message,
         },
     })
-}
-
-fn secret_tx_may_have_been_submitted(report: &TxReport) -> bool {
-    match &report.result.outcome {
-        TxOutcome::NotSubmitted => false,
-        TxOutcome::Completed(n) => *n > 0,
-        TxOutcome::Unknown { .. } => true,
-    }
 }
 
 fn classify_login_secret_tx_failure(report: &TxReport) -> TxFail {
@@ -602,10 +567,19 @@ fn classify_login_secret_tx_failure(report: &TxReport) -> TxFail {
 
 /// `bridge.wait_for_regex(pattern, timeout_s)`：regex 先編譯（失敗 → `Raised`），再以整個 RX 視窗等待。
 fn wait_regex(io: &LoginIo, pattern: &str, timeout: Duration) -> Step<bool> {
+    wait_regex_from(io, pattern, None, timeout)
+}
+
+fn wait_regex_from(
+    io: &LoginIo,
+    pattern: &str,
+    from: Option<u64>,
+    timeout: Duration,
+) -> Step<bool> {
     let re = compile_or_raise(pattern)?;
     match io
         .rx
-        .wait_for_regex_cancellable(&re, None, timeout, io.clock, io.cancel)
+        .wait_for_regex_cancellable(&re, from, timeout, io.clock, io.cancel)
     {
         WaitOutcome::Matched => Ok(true),
         WaitOutcome::TimedOut => Ok(false),
@@ -736,9 +710,8 @@ fn maybe_login(
             Ok(password) => password,
             Err(code) => return Ok((false, Some(code.into()))),
         };
-        let guard = send_secret(io, &password, &t.prompt_regex, timeout)?;
-        let ok = wait_regex(io, &t.prompt_regex, timeout)?;
-        drop(guard);
+        let guard = send_secret(io, &password)?;
+        let ok = wait_regex_from(io, &t.prompt_regex, Some(guard.start_from()), timeout)?;
         io.rx.clear();
         return Ok((ok, (!ok).then(|| timeout_code.into())));
     }
@@ -819,9 +792,8 @@ fn ensure_console_unlocked(
             return Ok(Some("CONSOLE_UNLOCK_IDLE_TIMEOUT".into()));
         }
         io.rx.clear();
-        let guard = send_secret(io, secret, &t.prompt_regex, timeout)?;
-        let prompt = wait_regex(io, &t.prompt_regex, timeout)?;
-        drop(guard);
+        let guard = send_secret(io, secret)?;
+        let prompt = wait_regex_from(io, &t.prompt_regex, Some(guard.start_from()), timeout)?;
         if !prompt {
             return Ok(Some("CONSOLE_UNLOCK_PROMPT_TIMEOUT".into()));
         }
@@ -834,12 +806,20 @@ mod issue311_tests {
     use super::{
         classify_login_secret_tx_failure, send_secret, LoginIo, LoginOutcome, TxFail,
     };
-    use crate::tx_writer::{OpId, TxClass, TxReport};
-    use crate::uart_bridge::{RunCancel, RxShared};
+    use crate::mailbox::{ControlEvent, DataEvent};
+    use crate::tx_writer::{Fence, OpId, TxClass, TxReport};
+    use crate::uart_bridge::{IoWorker, IoWorkerArgs, RunCancel, RxShared};
+    use crate::wal::{WalConfig, WalWriter};
+    use std::path::PathBuf;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use sw_pal::fakes::FakeClock;
-    use sw_pal::traits::{Clock, PalError, PalErrorKind, SubmitStep, TxOutcome, TxResult};
+    use sw_pal::fakes::serial::{FakeSerialBackend, FakeWriteStep};
+    use sw_pal::fakes::wal_fs::FakeWalFs;
+    use sw_pal::traits::{
+        Clock, DevicePath, PalError, PalErrorKind, SerialBackend, SerialConfig, TxOutcome,
+        TxResult,
+    };
 
     #[test]
     fn issue311_secret_tx_failure_does_not_disclose_length() {
@@ -879,21 +859,14 @@ mod issue311_tests {
                 wal: None,
                 reject: None,
             };
-            let tx_rx = Arc::clone(&rx);
-            let tx = move |_bytes: &[u8], _class, _source: &str, _log: bool, secret_echo_id| {
-                if let Some(id) = secret_echo_id {
-                    let mut submit = || SubmitStep::Accepted(1);
-                    let _ = tx_rx.submit_secret_echo(id, &mut submit);
-                }
-                report.clone()
-            };
+            let tx = move |_bytes: &[u8], _class, _source: &str, _log: bool| report.clone();
             let nonce = || "n".to_string();
             let audit_rx = Arc::clone(&rx);
             let audit = |_length: usize| {
                 assert_eq!(
-                    audit_rx.issue311_test_mask_secret_echo(b"\r\n", 0),
+                    audit_rx.issue311_test_mask_secret_echo(b"\r\n"),
                     b"\r\n".to_vec(),
-                    "secret submit 前的換行不得關閉回顯遮罩窗口"
+                    "內容遮罩在 secret TX 前已啟用，不受前置換行影響"
                 );
                 true
             };
@@ -906,39 +879,193 @@ mod issue311_tests {
                 cancel: &cancel,
                 class: TxClass::LoginProbe,
             };
-            let timeout = Duration::from_secs(2);
-
-            let result = send_secret(&io, SECRET, "(?m)^root@t:/# ", timeout);
+            let result = send_secret(&io, SECRET);
             assert!(
                 matches!(result, Err(LoginOutcome::Raised { .. })),
                 "possible partial submission keeps the original TX error"
             );
-            let visible = rx.issue311_test_mask_secret_echo(SECRET.as_bytes(), clock.mono_ns());
+            let visible = rx.issue311_test_mask_secret_echo(SECRET.as_bytes());
             assert_eq!(
                 visible,
                 vec![b'*'; SECRET.len()],
-                "遲到的 secret echo 必須在 partial/unknown TX 後仍受守衛保護"
+                "登入流程結束前遲到的 secret echo 必須遮罩"
             );
             let prompt = b"\r\nroot@t:/# ";
             assert_eq!(
-                rx.issue311_test_mask_secret_echo(prompt, clock.mono_ns()),
+                rx.issue311_test_mask_secret_echo(prompt),
                 prompt,
                 "prompt 本身保持原文"
             );
             assert_eq!(
-                rx.issue311_test_mask_secret_echo(SECRET.as_bytes(), clock.mono_ns()),
+                rx.issue311_test_mask_secret_echo(SECRET.as_bytes()),
                 SECRET.as_bytes(),
-                "prompt 命中後窗口外的相同字串保持原文"
+                "第一個完整命中後停用內容遮罩"
             );
 
-            let result = send_secret(&io, SECRET, "(?m)^root@t:/# ", timeout);
+            let result = send_secret(&io, SECRET);
             assert!(matches!(result, Err(LoginOutcome::Raised { .. })));
-            clock.advance(timeout);
+            rx.disarm_secret_echo_for_login_end();
             assert_eq!(
-                rx.issue311_test_mask_secret_echo(SECRET.as_bytes(), clock.mono_ns()),
+                rx.issue311_test_mask_secret_echo(SECRET.as_bytes()),
                 SECRET.as_bytes(),
-                "期限到達後窗口外的相同字串保持原文"
+                "login flow failure 結束時停用內容遮罩"
             );
         }
+    }
+
+    #[test]
+    fn issue311_secret_submit_with_full_data_lane_allows_shutdown_to_finish() {
+        const SECRET: &str = "i311secret";
+        const EPOCH: u64 = 3;
+        let serial = FakeSerialBackend::new();
+        let device = serial.add_device("/dev/issue311");
+        let handle = serial
+            .open_exclusive(
+                &DevicePath("/dev/issue311".into()),
+                &SerialConfig::from_uart_profile(115_200, 8, "N", 1, "none", false),
+            )
+            .expect("開啟 fake UART");
+        let rx = RxShared::new(128, 0);
+        let clock = FakeClock::new();
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        let wal = Arc::new(WalWriter::open(
+            WalConfig {
+                dir: PathBuf::from("/w"),
+                rotate_bytes: 1 << 20,
+            },
+            FakeWalFs::new(),
+            clock_dyn.clone(),
+        ));
+        let fence = Fence::new();
+        fence.with(|state| state.active_epoch = Some(EPOCH));
+        let (data_tx, data_rx) = crossbeam_channel::bounded(1);
+        data_tx
+            .send(DataEvent::UartRxChunk {
+                epoch: EPOCH,
+                rx_seq: 0,
+                wal_seq: 0,
+                bytes: vec![0],
+            })
+            .expect("先填滿 data lane");
+        let (control_tx, control_rx) = crossbeam_channel::bounded::<ControlEvent>(16);
+        let worker = IoWorker::start(
+            handle,
+            IoWorkerArgs {
+                com: "COM0".into(),
+                epoch: EPOCH,
+                wal,
+                rx: rx.clone(),
+                fence: fence.clone(),
+                sentinel: None,
+                sentinel_keepalive: None,
+                data: data_tx,
+                control: control_tx.clone(),
+                clock: clock_dyn.clone(),
+                hub: None,
+            },
+        );
+        let input = b"reader is backpressured by a full data lane";
+        device.push_rx(input);
+        let read_deadline = Instant::now() + Duration::from_secs(2);
+        while device.rx_bytes_read() < input.len() || rx.text_from(0).len() < input.len() {
+            assert!(Instant::now() < read_deadline, "reader 未填滿 data lane");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(data_rx.len(), 1, "reader 發布前 data lane 必須仍滿載");
+
+        device.script_write(vec![FakeWriteStep::PauseInsideSubmit]);
+        let tx_sender = super::login_tx_sender(worker.tx().clone(), EPOCH, 0, 0);
+        let rx_for_secret = rx.clone();
+        let clock_for_secret = clock_dyn.clone();
+        let (secret_done_tx, secret_done_rx) = crossbeam_channel::bounded(1);
+        let (actor_done_tx, actor_done_rx) = crossbeam_channel::bounded(1);
+        let (actor_started_tx, actor_started_rx) = crossbeam_channel::bounded(1);
+        let at_os_submit = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let tx = move |bytes: &[u8], class, source: &str, log| {
+                    tx_sender(bytes, class, source, log)
+                };
+                let nonce = || "n".to_string();
+                let audit = |_length: usize| true;
+                let cancel = RunCancel::new(&rx_for_secret);
+                let io = LoginIo {
+                    rx: &rx_for_secret,
+                    tx: &tx,
+                    clock: clock_for_secret.as_ref(),
+                    nonce: &nonce,
+                    audit_secret_tx: &audit,
+                    cancel: &cancel,
+                    class: TxClass::LoginProbe,
+                };
+                let result = send_secret(&io, SECRET);
+                let _ = secret_done_tx.send(result.map(drop).is_ok());
+            });
+
+            let reached_submit = device.wait_paused(Duration::from_secs(1));
+            let shutdown_fence = fence.clone();
+            scope.spawn(move || {
+                let _ = actor_started_tx.send(());
+                shutdown_fence.with(|state| {
+                    state.frozen = true;
+                    state.active_epoch = None;
+                });
+                let _ = actor_done_tx.send(());
+            });
+            actor_started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("shutdown actor 已開始取得 fence");
+            let actor_blocked_before_cleanup = if reached_submit {
+                std::thread::sleep(Duration::from_millis(10));
+                device.release_pause();
+                false
+            } else {
+                let blocked = actor_done_rx
+                    .recv_timeout(Duration::from_millis(100))
+                    .is_err();
+                // 舊提交 hook 可能卡在 reader 的滿載發布；開始停止讓基準重現可收尾。
+                worker.begin_stop();
+                if device.wait_paused(Duration::from_secs(1)) {
+                    device.release_pause();
+                }
+                blocked
+            };
+            let actor_done = actor_done_rx.recv_timeout(Duration::from_secs(2));
+            let secret_done = secret_done_rx.recv_timeout(Duration::from_secs(2));
+            worker.begin_stop();
+            (
+                reached_submit,
+                actor_blocked_before_cleanup,
+                secret_done,
+                actor_done,
+            )
+        });
+
+        worker.finish_async(crate::drain::StopId(311), control_tx);
+        let stop_deadline = Instant::now() + Duration::from_secs(2);
+        let mut worker_stopped = false;
+        while Instant::now() < stop_deadline {
+            match control_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(ControlEvent::WorkerStopped(receipt)) => {
+                    assert!(receipt.handle_closed, "fake UART handle 應已關閉");
+                    worker_stopped = true;
+                    break;
+                }
+                Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        assert!(
+            at_os_submit.0
+                && !at_os_submit.1
+                && at_os_submit.2.as_ref().is_ok_and(|completed| *completed)
+                && at_os_submit.3.is_ok()
+                && worker_stopped,
+            "滿 data lane 下 secret submit 與 shutdown 必須在期限內完成；\n             os_submit={}; actor_blocked_before_cleanup={}; secret={:?}; shutdown={:?}; worker_stopped={worker_stopped}",
+            at_os_submit.0,
+            at_os_submit.1,
+            at_os_submit.2,
+            at_os_submit.3
+        );
     }
 }

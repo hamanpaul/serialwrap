@@ -5392,7 +5392,6 @@ impl ManagerExec {
             .spawn(move || {
                 let send = crate::login_fsm::login_tx_sender(
                     handle,
-                    rx.clone(),
                     epoch,
                     0,
                     fsm_gen,

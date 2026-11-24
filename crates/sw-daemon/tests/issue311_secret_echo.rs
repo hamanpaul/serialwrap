@@ -838,10 +838,12 @@ fn assert_secret_tx_meta_for(wal: &str, secret: &str) {
 }
 
 struct ControlledOutputBaseline {
+    wal_json_len: usize,
     wal_payload_len: usize,
     mirror_len: usize,
     agent_log_len: usize,
     console_len: usize,
+    event_count: usize,
 }
 
 fn controlled_output_baseline(
@@ -861,11 +863,121 @@ fn controlled_output_baseline(
         .contents(&service.wal.mirror_path())
         .expect("raw.mirror.log");
     let agent_log = std::fs::read(Path::new(log_path)).expect("agent log");
+    let event_tail = service.call("event.tail", r#"{"n":-1}"#);
+    let event_count = match event_tail.get("entries") {
+        Some(PyValue::List(rows)) => rows.len(),
+        other => panic!("event.tail entries: {other:?}"),
+    };
     ControlledOutputBaseline {
+        wal_json_len: wal.len(),
         wal_payload_len: decode_wal_payloads(&wal).len(),
         mirror_len: mirror.len(),
         agent_log_len: agent_log.len(),
         console_len: console.written_len(),
+        event_count,
+    }
+}
+
+struct FakeClockDriver {
+    stop: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FakeClockDriver {
+    fn start(service: &ServiceRig) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let clock = service.clock.clone();
+        let manager = service.mgr.clone();
+        let thread_stop = stop.clone();
+        let join = std::thread::spawn(move || {
+            while !thread_stop.load(Ordering::SeqCst) {
+                clock.advance(Duration::from_millis(10));
+                manager.on_tick();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+        Self {
+            stop,
+            join: Some(join),
+        }
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(join) = self.join.take() {
+            join.join().expect("停止測試時鐘推進器");
+        }
+    }
+}
+
+impl Drop for FakeClockDriver {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn wait_for_session_error(service: &ServiceRig, expected: &str, label: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if service.session("COM0").is_some_and(|session| {
+            session.get("last_error").and_then(PyValue::as_str) == Some(expected)
+        }) {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "{label}: 未取得預期錯誤碼 {expected}; session={:?}",
+                service.session("COM0")
+            );
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn assert_no_secret_leak_since(
+    service: &ServiceRig,
+    log_path: &str,
+    console: &sw_pal::fakes::console::FakeConsoleRef,
+    secret: &str,
+    baseline: &ControlledOutputBaseline,
+) {
+    let wal = String::from_utf8(
+        service
+            .wfs
+            .contents(&service.wal.wal_path())
+            .expect("raw.wal.ndjson"),
+    )
+    .expect("WAL UTF-8");
+    let payload = decode_wal_payloads(&wal);
+    let mirror = service
+        .wfs
+        .contents(&service.wal.mirror_path())
+        .expect("raw.mirror.log");
+    let agent_log = std::fs::read(Path::new(log_path)).expect("agent log");
+    let console_bytes = console.written();
+    for (sink, bytes) in [
+        ("WAL JSON", &wal.as_bytes()[baseline.wal_json_len..]),
+        ("WAL payload", &payload[baseline.wal_payload_len..]),
+        ("mirror", &mirror[baseline.mirror_len..]),
+        ("agent log", &agent_log[baseline.agent_log_len..]),
+        ("human console", &console_bytes[baseline.console_len..]),
+    ] {
+        assert!(
+            !bytes.windows(secret.len()).any(|window| window == secret.as_bytes()),
+            "{sink} 在 secret TX 後新增明文，bytes={}",
+            bytes.len()
+        );
+    }
+    let event_tail = service.call("event.tail", r#"{"n":-1}"#);
+    let rows = match event_tail.get("entries") {
+        Some(PyValue::List(rows)) => rows,
+        other => panic!("event.tail entries: {other:?}"),
+    };
+    for row in rows.iter().skip(baseline.event_count) {
+        assert!(
+            !format!("{row:?}").contains(secret),
+            "event 在 secret TX 後新增明文 matched_text"
+        );
     }
 }
 
@@ -1203,7 +1315,33 @@ fn run_controlled_console_unlock_case(
 
 #[test]
 fn issue311_login_secret_equals_prompt_without_echo_waits_for_line_boundary() {
-    run_controlled_login_case("# ", "# ", b"\r\n", b"", false);
+    const SECRET: &str = "# ";
+    let rig = build_controlled_login_rig(SECRET, SECRET);
+    let log_path = start_log(&rig.service);
+    let console = login_sentinel_console(&rig.service);
+    set_event_rules_for_secret(&rig.service, SECRET, true);
+    let baseline = controlled_output_baseline(&rig.service, &log_path, &console);
+
+    rig.echo_release.send(Vec::new()).expect("DUT 不回顯 secret");
+    let read_before = rig.device.rx_bytes_read();
+    rig.device.push_rx(b"\r\n");
+    wait_controlled_rx(&rig.device, read_before + 2, "等於 prompt 的 secret 前行終止符");
+    let read_before = rig.device.rx_bytes_read();
+    rig.device.push_rx(SECRET.as_bytes());
+    wait_controlled_rx(
+        &rig.device,
+        read_before + SECRET.len(),
+        "不回顯 secret 時的同值 prompt",
+    );
+
+    let mut clock_driver = FakeClockDriver::start(&rig.service);
+    wait_for_session_error(
+        &rig.service,
+        "SHELL_PROMPT_TIMEOUT",
+        "等於 prompt 的 secret 應 fail-safe 逾時",
+    );
+    clock_driver.stop();
+    assert_no_secret_leak_since(&rig.service, &log_path, &console, SECRET, &baseline);
 }
 
 #[test]
@@ -1223,7 +1361,45 @@ fn issue311_login_prompt_after_line_boundary_without_echo_is_visible() {
 
 #[test]
 fn issue311_console_unlock_secret_equals_prompt_without_echo_waits_for_line_boundary() {
-    run_controlled_console_unlock_case("# ", "# ", b"\r\n", b"", false);
+    const SECRET: &str = "# ";
+    let rig = build_controlled_console_unlock_rig(SECRET, SECRET);
+    let log_path = start_log(&rig.service);
+    let attach = rig
+        .service
+        .call("session.console_attach", r#"{"selector":"COM0"}"#);
+    assert_eq!(attach.get("ok"), Some(&PyValue::Bool(true)), "{attach:?}");
+    let console = rig
+        .service
+        .console
+        .as_ref()
+        .expect("fake PTY console")
+        .created()
+        .into_iter()
+        .last()
+        .expect("human console 已建立")
+        .1;
+    set_event_rules_for_secret(&rig.service, SECRET, true);
+
+    let mut clock_driver = FakeClockDriver::start(&rig.service);
+    let reboot = rig.service.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"reboot","timeout_s":1.0}"#,
+    );
+    assert_eq!(reboot.get("ok"), Some(&PyValue::Bool(true)), "{reboot:?}");
+    rig.secret_seen
+        .recv_timeout(Duration::from_secs(10))
+        .expect("console unlock secret 已送出");
+    let baseline = controlled_output_baseline(&rig.service, &log_path, &console);
+    rig.echo_release
+        .send(b"\r\n# ".to_vec())
+        .expect("DUT 不回顯 secret，只回傳同值 prompt");
+    wait_for_session_error(
+        &rig.service,
+        "CONSOLE_UNLOCK_PROMPT_TIMEOUT",
+        "等於 prompt 的 console unlock secret 應 fail-safe 逾時",
+    );
+    clock_driver.stop();
+    assert_no_secret_leak_since(&rig.service, &log_path, &console, SECRET, &baseline);
 }
 
 #[test]
@@ -1305,6 +1481,60 @@ fn issue311_login_newline_before_secret_submit_does_not_end_echo_guard() {
         !early_probe && early_tx == tx_before_echo && leaks.is_empty(),
         "提交前換行後的 secret echo 必須保持遮罩，且真 prompt 前零後續 TX；early_probe={early_probe}; tx={:?}; leaks={leaks:?}",
         String::from_utf8_lossy(&rig.device.tx_since(tx_before_echo))
+    );
+}
+
+#[test]
+fn issue311_login_echo_is_masked_when_crlf_is_buffered_at_secret_submit() {
+    const SECRET: &str = "# secret";
+    const PROMPT: &str = "# ";
+    let rig = build_controlled_login_rig_with_pause(SECRET, PROMPT, true);
+    let log_path = start_log(&rig.service);
+    let console = login_sentinel_console(&rig.service);
+    set_event_rules_for_secret(&rig.service, SECRET, true);
+    let baseline = controlled_output_baseline(&rig.service, &log_path, &console);
+
+    let device = rig.device.clone();
+    rig.device
+        .on_os_submit(Box::new(move || device.push_rx(b"\r\n")));
+    let read_before = rig.device.rx_bytes_read();
+    rig.device.release_pause();
+    rig.secret_seen
+        .recv_timeout(Duration::from_secs(3))
+        .expect("secret TX 已抵達 fake OS submit，CRLF 先前已放入 RX buffer");
+    let secret_echo = b"# secret\r\n";
+    rig.echo_release
+        .send(secret_echo.to_vec())
+        .expect("釋放受控 secret echo");
+    wait_controlled_rx(
+        &rig.device,
+        read_before + 2 + secret_echo.len(),
+        "reader 消耗 submit 前已緩衝的 CRLF 與 secret echo",
+    );
+    let leaks = controlled_output_leaks(&rig.service, &log_path, &console, SECRET);
+    assert!(
+        leaks.is_empty(),
+        "OS submit 前已緩衝的 CRLF 不得讓 secret echo 明文發布：{leaks:?}"
+    );
+
+    let prompt_before = rig.device.rx_bytes_read();
+    rig.device.push_rx(PROMPT.as_bytes());
+    wait_controlled_rx(
+        &rig.device,
+        prompt_before + PROMPT.len(),
+        "reader 收到真正登入 prompt",
+    );
+    assert_ready_probe_seen(&rig.ready_probe_seen, "CRLF buffer 交錯登入");
+    rig.service.wait_state("COM0", "READY");
+    assert_no_secret_leak_since(&rig.service, &log_path, &console, SECRET, &baseline);
+    assert_controlled_outputs(
+        &rig.service,
+        &log_path,
+        &console,
+        SECRET,
+        true,
+        false,
+        &baseline,
     );
 }
 
@@ -1523,48 +1753,65 @@ fn issue311_console_unlock_echo_is_masked_in_last_error_detail() {
 #[test]
 fn issue311_login_prompt_prefix_overlapping_secret_does_not_timeout() {
     let rig = build_prompt_prefix_overlap_rig(false);
+    let log_path = start_log(&rig.service);
+    let console = login_sentinel_console(&rig.service);
+    const SECRET: &str = "# secret";
+    set_event_rules_for_secret(&rig.service, SECRET, true);
+    let baseline = controlled_output_baseline(&rig.service, &log_path, &console);
+    let mut clock_driver = FakeClockDriver::start(&rig.service);
     rig.echo_release
         .send(b"\r\n# ".to_vec())
-        .expect("先結束 secret line 再回覆 login prompt");
-    rig.service.wait_state("COM0", "READY");
-    assert_eq!(
-        rig.service
-            .session("COM0")
-            .and_then(|session| session.get("state").cloned()),
-        Some(PyValue::Str("READY".into()))
+        .expect("DUT 不回顯 secret，只回傳以 secret 開頭的 prompt");
+    wait_for_session_error(
+        &rig.service,
+        "SHELL_PROMPT_TIMEOUT",
+        "secret 以 prompt 開頭且 DUT 不回顯時應 fail-safe 逾時",
     );
+    clock_driver.stop();
+    assert_no_secret_leak_since(&rig.service, &log_path, &console, SECRET, &baseline);
 }
 
 #[test]
 fn issue311_console_unlock_prompt_prefix_overlapping_secret_does_not_timeout() {
-    let rig = build_prompt_prefix_overlap_rig(true);
+    const SECRET: &str = "# secret";
+    const PROMPT: &str = "# ";
+    let rig = build_controlled_console_unlock_rig(SECRET, PROMPT);
+    let log_path = start_log(&rig.service);
+    let attach = rig
+        .service
+        .call("session.console_attach", r#"{"selector":"COM0"}"#);
+    assert_eq!(attach.get("ok"), Some(&PyValue::Bool(true)), "{attach:?}");
+    let console = rig
+        .service
+        .console
+        .as_ref()
+        .expect("fake PTY console")
+        .created()
+        .into_iter()
+        .last()
+        .expect("human console 已建立")
+        .1;
+    set_event_rules_for_secret(&rig.service, SECRET, true);
+    let mut clock_driver = FakeClockDriver::start(&rig.service);
+    let reboot = rig.service.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"reboot","timeout_s":1.0}"#,
+    );
+    assert_eq!(reboot.get("ok"), Some(&PyValue::Bool(true)), "{reboot:?}");
+    rig.secret_seen
+        .recv_timeout(Duration::from_secs(10))
+        .expect("console unlock secret 已送出");
+    let baseline = controlled_output_baseline(&rig.service, &log_path, &console);
     rig.echo_release
         .send(b"\r\n# ".to_vec())
-        .expect("先結束 secret line 再回覆 console prompt");
-    support::wait_until("console unlock 離開 ATTACHING", || {
-        rig.service
-            .session("COM0")
-            .and_then(|session| {
-                session
-                    .get("state")
-                    .and_then(PyValue::as_str)
-                    .map(str::to_string)
-            })
-            .is_some_and(|state| state != "ATTACHING")
-    });
-    let session = rig.service.session("COM0").expect("console unlock session");
-    assert_eq!(
-        session.get("state").and_then(PyValue::as_str),
-        Some("READY"),
-        "console unlock session={session:?}; tx={:?}",
-        String::from_utf8_lossy(&rig.device.tx_since(0))
+        .expect("DUT 不回顯 secret，只回傳以 secret 開頭的 console prompt");
+    wait_for_session_error(
+        &rig.service,
+        "CONSOLE_UNLOCK_PROMPT_TIMEOUT",
+        "secret 以 console prompt 開頭且 DUT 不回顯時應 fail-safe 逾時",
     );
-    assert_eq!(
-        rig.service
-            .session("COM0")
-            .and_then(|session| session.get("state").cloned()),
-        Some(PyValue::Str("READY".into()))
-    );
+    clock_driver.stop();
+    assert_no_secret_leak_since(&rig.service, &log_path, &console, SECRET, &baseline);
 }
 
 #[test]

@@ -3,7 +3,7 @@
 //! `EvidenceGap` 為 Task 12 的型別，因 `TxOpLedger` 先需要而定義於此。
 
 use std::cell::Cell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
@@ -590,12 +590,7 @@ pub struct FenceSubmitGate<'a> {
     pub fence: &'a Fence,
     pub permit: &'a TxPermit,
     pub last_reject: Cell<Option<FenceReject>>,
-    /// secret TX 使用的 PAL submit 同步 hook。
-    pub submit_hook: Option<&'a TxSubmitHook>,
 }
-
-/// OS 提交時包住 PAL submit closure 的同步點。
-pub type TxSubmitHook = dyn Fn(&mut dyn FnMut() -> SubmitStep) -> SubmitStep + Send + Sync;
 
 impl SubmitGate for FenceSubmitGate<'_> {
     fn submit(
@@ -619,10 +614,7 @@ impl SubmitGate for FenceSubmitGate<'_> {
             return Err(SubmitRevoked);
         }
 
-        let step = match self.submit_hook {
-            Some(hook) => hook(os_submit),
-            None => os_submit(),
-        };
+        let step = os_submit();
         let in_flight_len = match &step {
             SubmitStep::Accepted(len) if *len > 0 => Some(*len),
             // PAL 的 Pending 表示 OS 已接手；提交 API 不回報其長度。
@@ -782,7 +774,6 @@ pub struct TxWriterHandle {
     gauge: Arc<LedgerGaugeCells>,
     /// P8 Task 5：本 writer 的 Fence（只供 [`TxWriterHandle::fence_verdict`] 分類拒絕原因，不作授權）。
     fence: Arc<Fence>,
-    submit_hooks: Arc<Mutex<HashMap<OpId, Arc<TxSubmitHook>>>>,
 }
 
 impl TxWriterHandle {
@@ -797,22 +788,7 @@ impl TxWriterHandle {
             settle,
             gauge,
             fence,
-            submit_hooks: Arc::new(Mutex::new(HashMap::new())),
         }
-    }
-
-    pub(crate) fn register_submit_hook(&self, op_id: OpId, hook: Arc<TxSubmitHook>) {
-        self.submit_hooks
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(op_id, hook);
-    }
-
-    pub(crate) fn remove_submit_hook(&self, op_id: OpId) {
-        self.submit_hooks
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(&op_id);
     }
     /// P8 Task 5（brief 不符 #2）：以本 writer 的 Fence 做一次零 TX 的 `Fence::admit` 判定。等待被取消後用來
     /// 分類「此刻送出會被拒的原因」；不是授權——真正的授權仍在每次 OS 提交的 gate 內重驗。
@@ -883,7 +859,6 @@ struct TxWriter {
     settle: Receiver<OpId>,
     stop: Receiver<()>,
     gauge: Arc<LedgerGaugeCells>,
-    submit_hooks: Arc<Mutex<HashMap<OpId, Arc<TxSubmitHook>>>>,
     /// P8 Task 5：echo-ACK 節流的未結聚合緩衝（插入序；≤ [`TX_AGGREGATE_OPEN_MAX`] 個鍵、每鍵 ≤ `max_bytes`）。
     aggregates: IndexMap<AggregateKey, Vec<u8>>,
 }
@@ -1041,12 +1016,6 @@ impl TxWriter {
                     Err(_) => break,
                 },
             };
-            let submit_hook = self
-                .submit_hooks
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .remove(&job.permit.op_id);
-
             if matches!(job.aggregate, Some(AggregateOp::Finish(_))) {
                 self.finish_aggregate(job, &mut ledger);
                 self.publish_gauge(&ledger);
@@ -1111,7 +1080,6 @@ impl TxWriter {
                         fence: &self.fence,
                         permit: &job.permit,
                         last_reject: Cell::new(None),
-                        submit_hook: submit_hook.as_deref(),
                     };
                     let result = self.writer.write_gated(&job.payload, &self.cancel, &gate);
                     // 0 byte 即被 cancel（drain 先凍結 fence 再 cancel）時，重驗授權並以 fence 原因收斂。
@@ -1418,13 +1386,11 @@ pub fn spawn_tx_writer(
     let (settle_tx, settle_rx) = crossbeam_channel::bounded(TX_SETTLE_QUEUE_MAX);
     let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
     let gauge = Arc::new(LedgerGaugeCells::default());
-    let submit_hooks = Arc::new(Mutex::new(HashMap::new()));
     let handle = TxWriterHandle {
         jobs: job_tx,
         settle: settle_tx,
         gauge: gauge.clone(),
         fence: fence.clone(),
-        submit_hooks: submit_hooks.clone(),
     };
     let stop = TxWriterStop(stop_tx);
     let worker = TxWriter {
@@ -1439,7 +1405,6 @@ pub fn spawn_tx_writer(
         settle: settle_rx,
         stop: stop_rx,
         gauge,
-        submit_hooks,
         aggregates: IndexMap::new(),
     };
     let join = std::thread::spawn(move || worker.run());

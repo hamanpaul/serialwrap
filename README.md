@@ -855,9 +855,17 @@ own resolved default regardless. Run `serialwrap daemon status`
 warns on shell/daemon mismatch) to see the path the *live* daemon actually
 uses.
 
-Automatic-login password echoes and console-unlock secret echoes are replaced
-with the same number of `*` characters in the WAL and downstream RX views while
-the secret-echo guard is active.
+Before each automatic-login or console-unlock secret is sent, the reader starts
+content-based echo masking. An exact secret match is replaced with the same
+number of `*` characters before WAL and downstream RX publication. A trailing
+byte sequence that may still be the beginning of the secret is held back from
+publication and prompt matching until later bytes prove a mismatch; it is never
+released just because time passed. If the login flow ends while such a prefix
+is unresolved, it is released as `*` characters. The first complete secret
+match stops masking. If the secret equals the prompt, or the secret begins with
+the prompt and the DUT does not echo it, the prompt can be masked or held, so
+login ends with the existing prompt-timeout error. Echoed overlapping prompts
+continue to work. WAL metadata records only the secret byte length.
 
 ### Windows Support
 
@@ -2852,7 +2860,7 @@ retry，也不等於 daemon 檔案日誌。詳見 [CLI trace 契約](docs/refine
 
 `~/b-log` **不是** WAL——它只存放 agent 觸發式的 on-demand session capture。權威
 WAL 一律落在 `SERIALWRAP_WAL_DIR`（預設 `~/.local/state/serialwrap/wal/`）。
-自動登入密碼與 console unlock secret 在守衛時間窗內若被 DUT 回顯，WAL 中的回顯會以等長 `*` 呈現，下游 RX 輸出亦相同。
+每次自動登入密碼或 console unlock secret 送出前，reader 會啟用內容遮罩。RX 中完整符合 secret 的位元組序列會在寫入 WAL 前換成等長 `*`，下游 RX 出口也會看到相同結果。仍可能是 secret 開頭的尾段會先扣住，不發布也不作為 prompt 候選；後續位元組證明不匹配時才原樣放行，絕不因逾時放行。登入流程結束時若仍有未決前綴，會以 `*` 釋出；首次完整命中後停止遮罩。若 secret 等於 prompt，或 secret 以 prompt 開頭且 DUT 不回顯，prompt 可能被遮罩或扣住，登入會回既有的 prompt timeout 錯誤；有回顯的重疊情境仍可正常登入。WAL META 只記 secret 位元組長度。
 在 shell 裡（例如 `.bashrc`）匯出的 `SERIALWRAP_WAL_DIR` 只對從該 shell 啟動的
 行程有效；systemd 託管的 daemon **不會**繼承它（產生的 unit 預設不含對應的
 `Environment=` 那一行），仍會照自己解析出的預設路徑寫下去。要看 *live* daemon

@@ -187,14 +187,14 @@ changes:
       rust:
         stage: "stage-1b"
     approved_at_revision: 14
-    spec_refs: ["OD-111", "v051.md issue 311"]
+    spec_refs: ["OD-111", "OD-112", "v051.md issue 311"]
     reconciliation_refs: []
     scope: "rust_only"
     ab_participation: "absolute_only"
     phases: ["P5"]
     case_ids: ["bc14-login-secret-echo-mask", "bc14-console-unlock-echo-mask", "bc14-secret-echo-one-byte-chunks", "bc14-secret-tx-failure-length-redacted"]
-    compatibility_impact: "自動登入密碼與 console unlock secret 只在送出至 prompt 命中或逾時的守衛窗口內，對 RX 中完全相符的 byte 序列以等長 * 遮罩；reader 在寫 WAL 前套用，因此 WAL、mirror、event、RxShared、agent log、background capture 與 human console 看到相同遮罩。窗口外 RX 不變。每次 secret TX 先寫只含 secret byte 長度的 secret_tx META；secret TX 失敗訊息不輸出已送或要求長度。Python 基線維持不變。"
-    approval_conditions: "依 OD-111 只改 Rust；守衛僅覆蓋 secret TX 後至 prompt 命中或逾時，跨 chunk 暫存最多為 secret 長度減 1 byte；不保留明文 RX 到任何下游。"
+    compatibility_impact: "自動登入密碼與 console unlock secret 在各自 secret TX 前啟用內容遮罩；reader 在寫 WAL 前將 RX 中與 secret 完全相同的 byte 序列替換為等長 *，並在判斷仍可能是 secret 開頭時扣住尾段，不發布也不作 prompt 候選。後續 byte 不匹配時，扣住部分原樣釋出；不以逾時釋出。首次完整命中後停止遮罩；登入流程結束時若仍有未決前綴，則以等長 * 釋出以避免洩漏。遮罩先於 WAL，因此 WAL、mirror、event、RxShared、agent log、background capture 與 human console 看到相同結果。若 secret 等於 prompt，或 secret 以 prompt 開頭且 DUT 不回顯，prompt 可能被遮罩或扣住，登入會以既有 timeout error code 逾時；有回顯的重疊情境仍可完成登入。每次 secret TX 先寫只含 secret byte 長度的 secret_tx META；secret TX 失敗訊息不輸出已送或要求長度。Python 基線維持不變。"
+    approval_conditions: "依 OD-111 只改 Rust；依 OD-112 與最新 v051 編排者裁決，以內容比對取代行終止符窗口及 TX／reader ingest 等待；啟用在 secret TX 前，不等待 reader，保留 OS submit 時的 fence 重驗。未決前綴不得超時放行；登入流程結束時以遮罩釋出。"
     related_decisions: ["OD-111"]
   - id: "SC-01"
     kind: "SC"
