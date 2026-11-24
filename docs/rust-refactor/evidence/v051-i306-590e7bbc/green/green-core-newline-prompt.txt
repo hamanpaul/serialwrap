@@ -6,4 +6,3 @@ running 1 test
 test newline_prefixed_prompt_after_marker_confirms_ready_same_chunk_and_split_chunk ... ok
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.02s
-

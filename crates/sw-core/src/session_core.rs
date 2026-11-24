@@ -9365,12 +9365,13 @@ impl SessionCore {
                     }
                 };
                 let nonce: String = uuid4_hex(&mut fill).chars().take(8).collect();
+                let marker_nonce = uuid4_hex(&mut fill);
                 let probe = self
                     .profile
                     .template
                     .ready_probe
                     .replace("${nonce}", &nonce);
-                let probe_len = self_test_probe_payload(&probe, &nonce).len();
+                let probe_len = self_test_probe_payload(&probe, &marker_nonce).len();
                 self.last_probe_at = Some(self.wall_iso());
                 // 增補 #12：有 human lease 時只 suspend、不動 admission（`session_manager.py:7430,7454`）。
                 // 旗標隨本 op 保存（Python 為 `self_test` 的區域變數），完成時只結算自己的 suspend。
@@ -9399,7 +9400,7 @@ impl SessionCore {
                     spec: OpSpec::SelfTestProbe {
                         timeout_s,
                         probe,
-                        nonce,
+                        marker_nonce,
                     },
                 }]
             }

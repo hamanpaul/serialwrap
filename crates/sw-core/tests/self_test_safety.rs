@@ -99,6 +99,17 @@ fn self_test_req() -> SessionRequest {
 
 const FAILED_RC_PROFILE: &str = "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    ready_probe: 'echo __READY__${nonce}; false'\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: t, act_no: 1, alias: t+1, device_by_id: /s/by-id/usb-A}\n";
 
+const PROBE_PRINTS_MARKER_THEN_FAIL_PROFILE: &str = r#"profiles:
+  t:
+    platform: shell
+    prompt_regex: '(?m)^root@t:.*# '
+    ready_probe: >-
+      printf '__SW_ST_%s_OK__\n' '${nonce}'; false
+    timeout_s: 2.0
+targets:
+  - {com: COM0, profile: t, act_no: 1, alias: t+1, device_by_id: /s/by-id/usb-A}
+"#;
+
 fn open_interactive(owner: &str) -> SessionRequest {
     SessionRequest::InteractiveOpen {
         owner: owner.to_string(),
@@ -127,13 +138,18 @@ fn install_executing_shell_target(h: &ActorRig) {
                 .chars()
                 .take_while(|c| c.is_ascii_hexdigit())
                 .collect::<String>();
-            let expected =
-                format!("( echo __READY__{token} ) && printf '\\n__SW_ST_%s_OK__\\n' '{token}'");
-            if token.len() == 8 && text.contains(&expected) {
-                format!("__READY__{token}\r\n__SW_ST_{token}_OK__\r\nroot@t:/# ").into_bytes()
-            } else {
-                format!("__READY__{token}\r\nroot@t:/# ").into_bytes()
+            if let Some(marker_nonce) = maybe_framework_marker_nonce_from_tx(&text) {
+                let expected = format!(
+                    "( echo __READY__{token} ) && printf '\\n__SW_ST_%s_OK__\\n' '{marker_nonce}'"
+                );
+                if token.len() == 8 && marker_nonce.len() == 32 && text.contains(&expected) {
+                    return format!(
+                        "__READY__{token}\r\n__SW_ST_{marker_nonce}_OK__\r\nroot@t:/# "
+                    )
+                    .into_bytes();
+                }
             }
+            format!("__READY__{token}\r\nroot@t:/# ").into_bytes()
         }),
     );
 }
@@ -150,6 +166,50 @@ fn read_self_test_probe(h: &ActorRig, tx_start: usize) -> (String, String) {
         .collect::<String>();
     assert_eq!(nonce.len(), 8, "probe TX 應含完整 nonce：{tx:?}");
     (tx, nonce)
+}
+
+fn framework_marker_nonce_from_tx(tx: &str) -> String {
+    maybe_framework_marker_nonce_from_tx(tx).expect("TX 應含框架 execution marker nonce")
+}
+
+fn maybe_framework_marker_nonce_from_tx(tx: &str) -> Option<String> {
+    tx.split_once("&& printf '\\n__SW_ST_%s_OK__\\n' '")
+        .and_then(|(_, rest)| rest.split('\'').next())
+        .map(str::to_string)
+}
+
+fn probe_marker_arguments(tx: &str) -> (String, String) {
+    let probe_nonce = probe_nonce_from_printf(tx);
+    let marker_prefix = "&& printf '\\n__SW_ST_%s_OK__\\n' '";
+    let marker_nonce = tx
+        .split_once(marker_prefix)
+        .and_then(|(_, rest)| rest.split('\'').next())
+        .expect("TX 應含框架 execution marker nonce")
+        .to_string();
+    (probe_nonce, marker_nonce)
+}
+
+fn probe_nonce_from_printf(tx: &str) -> String {
+    tx.split_once("printf '__SW_ST_%s_OK__\\n' '")
+        .and_then(|(_, rest)| rest.split('\'').next())
+        .expect("TX 應含自訂 ready_probe 的 marker nonce")
+        .to_string()
+}
+
+fn ready_with_probe_printing_its_marker() -> ActorRig {
+    let h = ActorRig::new(PROBE_PRINTS_MARKER_THEN_FAIL_PROFILE);
+    h.dev.on_tx_reply(b"\n", b"root@t:/# ");
+    h.dev.on_tx_match(
+        r"printf '__SW_ST_%s_OK__",
+        Box::new(|line: &[u8]| {
+            let tx = String::from_utf8_lossy(line).into_owned();
+            let probe_nonce = probe_nonce_from_printf(&tx);
+            format!("__SW_ST_{probe_nonce}_OK__\r\nroot@t:/# ").into_bytes()
+        }),
+    );
+    let h = h.attach();
+    h.wait_state("READY");
+    h
 }
 
 fn push_rx_and_wait_probe_snapshot(h: &ActorRig, bytes: &[u8], what: &str) {
@@ -965,9 +1025,10 @@ fn echo_of_complete_probe_payload_never_confirms_ready() {
             let tx_start = h.dev.tx_len();
             let pending = h.request_async(self_test_req());
             let (payload, nonce) = read_self_test_probe(&h, tx_start);
+            let marker_nonce = framework_marker_nonce_from_tx(&payload);
             assert!(payload.ends_with('\n'));
             assert!(payload.contains(&format!("__READY__{nonce}")));
-            assert!(!payload.contains(&format!("__SW_ST_{nonce}_OK__")));
+            assert!(!payload.contains(&format!("__SW_ST_{marker_nonce}_OK__")));
 
             if segmented {
                 let split = payload.len() / 2;
@@ -1018,7 +1079,8 @@ fn execution_marker_requires_following_prompt() {
         h.dev.clear_replies();
         let tx_start = h.dev.tx_len();
         let pending = h.request_async(self_test_req());
-        let (_, nonce) = read_self_test_probe(&h, tx_start);
+        let (tx, _) = read_self_test_probe(&h, tx_start);
+        let nonce = framework_marker_nonce_from_tx(&tx);
         let marker = match response {
             0 => format!("__SW_ST_{nonce}_OK__\r\n"),
             1 => format!("root@t:/# __SW_ST_{nonce}_OK__\r\n"),
@@ -1049,7 +1111,8 @@ fn execution_marker_requires_terminated_line_before_prompt() {
     let wait_start = h.rx.regex_wait_starts_for_test();
     let tx_start = h.dev.tx_len();
     let pending = h.request_async(self_test_req());
-    let (_, nonce) = read_self_test_probe(&h, tx_start);
+    let (tx, _) = read_self_test_probe(&h, tx_start);
+    let nonce = framework_marker_nonce_from_tx(&tx);
     h.wait_for("marker regex wait", |rig| {
         rig.rx.regex_wait_starts_for_test() > wait_start
     });
@@ -1092,7 +1155,8 @@ fn marker_and_prompt_in_same_chunk_confirm_ready() {
     install_executing_shell_target(&h);
     let tx_start = h.dev.tx_len();
     let pending = h.request_async(self_test_req());
-    let (tx, nonce) = read_self_test_probe(&h, tx_start);
+    let (tx, _) = read_self_test_probe(&h, tx_start);
+    let nonce = framework_marker_nonce_from_tx(&tx);
     assert!(tx.contains("( echo __READY__"));
     assert!(
         !tx.contains(&format!("__SW_ST_{nonce}_OK__")),
@@ -1122,7 +1186,8 @@ fn newline_prefixed_prompt_after_marker_confirms_ready_same_chunk_and_split_chun
         let wait_start = h.rx.regex_wait_starts_for_test();
         let tx_start = h.dev.tx_len();
         let pending = h.request_async(self_test_req());
-        let (_, nonce) = read_self_test_probe(&h, tx_start);
+        let (tx, _) = read_self_test_probe(&h, tx_start);
+        let nonce = framework_marker_nonce_from_tx(&tx);
         h.wait_for("帶換行前綴 prompt 的 marker wait", |rig| {
             rig.rx.regex_wait_starts_for_test() > wait_start
         });
@@ -1171,7 +1236,8 @@ fn any_line_prompt_after_marker_confirms_ready_same_chunk_split_chunk_and_requir
         let checks_start = h.rx.regex_wait_checks_for_test();
         let tx_start = h.dev.tx_len();
         let pending = h.request_async(self_test_req());
-        let (_, nonce) = read_self_test_probe(&h, tx_start);
+        let (tx, _) = read_self_test_probe(&h, tx_start);
+        let nonce = framework_marker_nonce_from_tx(&tx);
         h.wait_for("any-line prompt marker regex wait", |rig| {
             rig.rx.regex_wait_starts_for_test() > wait_start
         });
@@ -1224,7 +1290,8 @@ fn any_line_prompt_after_marker_confirms_ready_same_chunk_split_chunk_and_requir
     let checks_start = h.rx.regex_wait_checks_for_test();
     let tx_start = h.dev.tx_len();
     let pending = h.request_async(self_test_req());
-    let (_, nonce) = read_self_test_probe(&h, tx_start);
+    let (tx, _) = read_self_test_probe(&h, tx_start);
+    let nonce = framework_marker_nonce_from_tx(&tx);
     h.wait_for("no-prompt marker regex wait", |rig| {
         rig.rx.regex_wait_starts_for_test() > wait_start
     });
@@ -1276,7 +1343,8 @@ fn marker_and_prompt_split_after_unicode_trim_confirm_ready() {
     let tx_start = h.dev.tx_len();
     let probe_offset = h.rx.snapshot_len();
     let pending = h.request_async(self_test_req());
-    let (_, nonce) = read_self_test_probe(&h, tx_start);
+    let (tx, _) = read_self_test_probe(&h, tx_start);
+    let nonce = framework_marker_nonce_from_tx(&tx);
     assert!(
         h.rx.trimmed() > 0 && probe_offset > h.rx.trimmed(),
         "probe 應從已裁切的 Unicode RX 視窗之後開始：trimmed={}, probe_offset={probe_offset}",
@@ -1326,8 +1394,9 @@ fn failed_probe_rc_never_confirms_ready() {
                 .chars()
                 .take_while(|c| c.is_ascii_hexdigit())
                 .collect::<String>();
+            let marker_nonce = framework_marker_nonce_from_tx(&text);
             assert!(text.contains(&format!(
-                "( echo __READY__{token}; false ) && printf '\\n__SW_ST_%s_OK__\\n' '{token}'"
+                "( echo __READY__{token}; false ) && printf '\\n__SW_ST_%s_OK__\\n' '{marker_nonce}'"
             )));
             format!("__READY__{token}\r\nroot@t:/# ").into_bytes()
         }),
@@ -1349,12 +1418,56 @@ fn failed_probe_rc_never_confirms_ready() {
 }
 
 #[test]
+fn probe_printed_marker_then_nonzero_rc_never_confirms_ready() {
+    let h = ready_with_probe_printing_its_marker();
+    h.dev.clear_replies();
+    let tx_start = h.dev.tx_len();
+    let pending = h.request_async(self_test_req());
+    h.wait_for("非零 marker probe TX", |rig| rig.dev.tx_len() > tx_start);
+    let tx = String::from_utf8_lossy(&h.dev.tx_since(tx_start)).into_owned();
+    let (probe_nonce, marker_nonce) = probe_marker_arguments(&tx);
+    assert_eq!(
+        probe_nonce.len(),
+        8,
+        "probe nonce 應沿用 ready_probe 格式：{tx:?}"
+    );
+
+    // 自訂 probe 的 printf 已輸出自己的完整 marker，接著以 false 結束；外層 && 不會執行。
+    let response = format!("__SW_ST_{probe_nonce}_OK__\r\nroot@t:/# ");
+    push_rx_and_wait_probe_snapshot(
+        &h,
+        response.as_bytes(),
+        "runner 檢查自訂 probe marker 與非零返回",
+    );
+    let reply = receive_self_test_after_deadline(&h, pending);
+    assert_eq!(reply["probe_ok"], PyValue::Bool(false), "{reply:?}");
+    assert_eq!(reply["probe_evidence"]["tx_complete"], PyValue::Bool(true));
+    assert_eq!(
+        reply["probe_evidence"]["execution_marker"],
+        PyValue::Bool(false)
+    );
+    assert_eq!(
+        reply["probe_evidence"]["probe_rc_zero"],
+        PyValue::Bool(false)
+    );
+    assert_eq!(
+        reply["probe_evidence"]["prompt_after_marker"],
+        PyValue::Bool(false)
+    );
+    assert_ne!(
+        probe_nonce, marker_nonce,
+        "框架 marker nonce 必須獨立於 ready_probe nonce"
+    );
+}
+
+#[test]
 fn execution_marker_noise_around_complete_line_is_accepted() {
     let h = ActorRig::new(SHELL_PROFILE).ready();
     h.dev.clear_replies();
     let tx_start = h.dev.tx_len();
     let pending = h.request_async(self_test_req());
-    let (_, nonce) = read_self_test_probe(&h, tx_start);
+    let (tx, _) = read_self_test_probe(&h, tx_start);
+    let nonce = framework_marker_nonce_from_tx(&tx);
     let output = format!("noise before\r\n__SW_ST_{nonce}_OK__\r\nnoise after\r\nroot@t:/# ");
     push_rx_and_wait_probe_snapshot(
         &h,

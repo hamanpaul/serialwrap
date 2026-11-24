@@ -90,14 +90,23 @@ fn assert_shutdown_cancels_self_test_wait(prompt_wait: bool) {
         .chars()
         .take_while(char::is_ascii_hexdigit)
         .collect::<String>();
-    assert_eq!(nonce.len(), 8, "self-test nonce 應為 8 位十六進位");
+    assert_eq!(nonce.len(), 8, "ready_probe nonce 應為 8 位十六進位");
+    let marker_nonce = probe
+        .split_once("&& printf '\\n__SW_ST_%s_OK__\\n' '")
+        .and_then(|(_, rest)| rest.split('\'').next())
+        .expect("框架 execution marker 應使用獨立 nonce");
+    assert_eq!(
+        marker_nonce.len(),
+        32,
+        "框架 marker nonce 應為 32 位十六進位"
+    );
 
     rig.wait_for("self-test nonce regex wait", |actor| {
         actor.rx.regex_wait_starts_for_test() > wait_start
     });
     if prompt_wait {
         let marker_wait_count = rig.rx.regex_wait_starts_for_test();
-        rig.inject_rx(format!("__SW_ST_{nonce}_OK__\r\n").as_bytes());
+        rig.inject_rx(format!("__SW_ST_{marker_nonce}_OK__\r\n").as_bytes());
         rig.wait_for("self-test prompt regex wait", |actor| {
             actor.rx.regex_wait_starts_for_test() > marker_wait_count
         });

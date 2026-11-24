@@ -1750,14 +1750,21 @@ impl ActorRig {
                     .chars()
                     .take_while(|c| c.is_ascii_hexdigit())
                     .collect::<String>();
-                let expected = format!(
-                    "( echo __READY__{token} ) && printf '\\n__SW_ST_%s_OK__\\n' '{token}'"
-                );
-                if token.len() == 8 && text.contains(&expected) {
-                    format!("__READY__{token}\r\n__SW_ST_{token}_OK__\r\nroot@t:/# ").into_bytes()
-                } else {
-                    format!("__READY__{token}\r\nroot@t:/# ").into_bytes()
+                if let Some(marker_nonce) = text
+                    .split_once("&& printf '\\n__SW_ST_%s_OK__\\n' '")
+                    .and_then(|(_, rest)| rest.split('\'').next())
+                {
+                    let expected = format!(
+                        "( echo __READY__{token} ) && printf '\\n__SW_ST_%s_OK__\\n' '{marker_nonce}'"
+                    );
+                    if token.len() == 8 && marker_nonce.len() == 32 && text.contains(&expected) {
+                        return format!(
+                            "__READY__{token}\r\n__SW_ST_{marker_nonce}_OK__\r\nroot@t:/# "
+                        )
+                        .into_bytes();
+                    }
                 }
+                format!("__READY__{token}\r\nroot@t:/# ").into_bytes()
             }),
         );
         let rig = self.attach();
@@ -2002,10 +2009,16 @@ pub fn install_shell_replies(dev: &FakeDevice) {
                 .chars()
                 .take_while(|c| c.is_ascii_hexdigit())
                 .collect::<String>();
-            let expected =
-                format!("( echo __READY__{token} ) && printf '\\n__SW_ST_%s_OK__\\n' '{token}'");
-            if token.len() == 8 && text.contains(&expected) {
-                format!("__READY__{token}\r\n__SW_ST_{token}_OK__\r\nroot@t:/# ").into_bytes()
+            let marker_nonce = text
+                .split_once("&& printf '\\n__SW_ST_%s_OK__\\n' '")
+                .and_then(|(_, rest)| rest.split('\'').next())
+                .unwrap_or("");
+            let expected = format!(
+                "( echo __READY__{token} ) && printf '\\n__SW_ST_%s_OK__\\n' '{marker_nonce}'"
+            );
+            if token.len() == 8 && marker_nonce.len() == 32 && text.contains(&expected) {
+                format!("__READY__{token}\r\n__SW_ST_{marker_nonce}_OK__\r\nroot@t:/# ")
+                    .into_bytes()
             } else {
                 format!("__READY__{token}\r\nroot@t:/# ").into_bytes()
             }

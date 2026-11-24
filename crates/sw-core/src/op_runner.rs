@@ -42,7 +42,7 @@ pub enum OpSpec {
     SelfTestProbe {
         timeout_s: f64,
         probe: String,
-        nonce: String,
+        marker_nonce: String,
     },
     InteractiveOpenCmd {
         command: String,
@@ -440,8 +440,8 @@ fn execute(ctx: &OpCtx, grant: &OpGrant, spec: OpSpec) -> OpOutcome {
         OpSpec::SelfTestProbe {
             timeout_s,
             probe,
-            nonce,
-        } => run_self_test_probe(ctx, grant, timeout_s, &probe, &nonce),
+            marker_nonce,
+        } => run_self_test_probe(ctx, grant, timeout_s, &probe, &marker_nonce),
         OpSpec::InteractiveOpenCmd { command, owner } => {
             let payload = command_payload(&command);
             // `command.submit {mode:"interactive"}` 的命令：TX 帶原 cmd_id，未完整送出依命令帳結算（sol-backfill p5 #1）。
@@ -591,10 +591,10 @@ fn command_payload(command: &str) -> Vec<u8> {
     payload
 }
 
-/// self-test 專用 shell 框架；printf 的格式字串與 nonce 分開，TX 回顯不含完整預期標記。
-pub(crate) fn self_test_probe_payload(probe: &str, nonce: &str) -> Vec<u8> {
+/// self-test 專用 shell 框架；printf 的格式字串與隨機 marker nonce 分開，TX 回顯不含完整預期標記。
+pub(crate) fn self_test_probe_payload(probe: &str, marker_nonce: &str) -> Vec<u8> {
     command_payload(&format!(
-        "( {probe} ) && printf '\\n__SW_ST_%s_OK__\\n' '{nonce}'"
+        "( {probe} ) && printf '\\n__SW_ST_%s_OK__\\n' '{marker_nonce}'"
     ))
 }
 
@@ -1053,15 +1053,15 @@ fn run_self_test_probe(
     grant: &OpGrant,
     timeout_s: f64,
     probe: &str,
-    nonce: &str,
+    marker_nonce: &str,
 ) -> OpOutcome {
     let offset = ctx.rx.snapshot_len();
-    let payload = self_test_probe_payload(probe, nonce);
-    let expected_marker = format!("__SW_ST_{nonce}_OK__");
+    let payload = self_test_probe_payload(probe, marker_nonce);
+    let expected_marker = format!("__SW_ST_{marker_nonce}_OK__");
     if String::from_utf8_lossy(&payload).contains(&expected_marker) {
         return OpOutcome::SelfTest(self_test_evidence_outcome(false, false, false, false, 0));
     }
-    let marker_re = compile_or_never(&format!(r"(?m)^__SW_ST_{nonce}_OK__\r?\n"));
+    let marker_re = compile_or_never(&format!(r"(?m)^__SW_ST_{marker_nonce}_OK__\r?\n"));
     let report = send(
         ctx,
         grant,

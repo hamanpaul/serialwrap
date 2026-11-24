@@ -2244,4 +2244,3 @@ test crates/sw-core/src/flash_endpoint/holder_watch.rs - flash_endpoint::holder_
 test crates/sw-core/src/flash_endpoint/holder_watch.rs - flash_endpoint::holder_watch (line 30) - compile fail ... ok
 
 test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
-

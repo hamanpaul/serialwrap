@@ -118,6 +118,57 @@ fn ready_reconfirm_pending_rig() -> ServiceRig {
     rig
 }
 
+fn ready_reconfirm_pending_nonzero_probe_rig() -> ServiceRig {
+    let rig = ServiceRig::build(RigSpec {
+        yaml: r#"profiles:
+  t:
+    platform: shell
+    prompt_regex: '(?m)^root@t:.*# '
+    ready_probe: >-
+      printf '__SW_ST_%s_OK__\n' '${nonce}'; false
+    boot_done_regex: 'BOOT_DONE'
+    timeout_s: 2.0
+targets:
+  - {com: COM0, profile: t, device_by_id: /s/by-id/usb-A}
+"#
+        .to_string(),
+        devices: vec![(BY_ID_A.into(), REAL_A.into())],
+        explicit_target_count: 1,
+        allowlist: None,
+        wait_ready: vec!["COM0".into()],
+    });
+    let dev = rig.device(REAL_A);
+    dev.push_rx(b"\r\nU-Boot 2024.01 (Jan 01)\r\n");
+    wait_for("boot banner 建立 reconfirm pending", || {
+        rig.session("COM0").is_some_and(|session| {
+            session["ready_reconfirm_pending"] == PyValue::Bool(true)
+                && !session["boot_quiet_remaining_s"].is_null()
+        })
+    });
+    dev.push_rx(b"\r\nBOOT_DONE\r\n");
+    wait_for("boot_done_regex 清 quiet 並保留 reconfirm pending", || {
+        rig.session("COM0").is_some_and(|session| {
+            session["ready_reconfirm_pending"] == PyValue::Bool(true)
+                && session["boot_quiet_remaining_s"].is_null()
+        })
+    });
+    rig
+}
+
+fn probe_nonce_from_printf(tx: &str) -> String {
+    tx.split_once("printf '__SW_ST_%s_OK__\\n' '")
+        .and_then(|(_, rest)| rest.split('\'').next())
+        .expect("TX 應含 ready_probe marker nonce")
+        .to_string()
+}
+
+fn framework_marker_nonce_from_tx(tx: &str) -> String {
+    tx.split_once("&& printf '\\n__SW_ST_%s_OK__\\n' '")
+        .and_then(|(_, rest)| rest.split('\'').next())
+        .expect("TX 應含框架 execution marker nonce")
+        .to_string()
+}
+
 fn ready_newline_prompt_rig() -> ServiceRig {
     let rig = ServiceRig::build(RigSpec {
         yaml: "profiles:\n  t:\n    platform: shell\n    prompt_regex: '\\r?\\nroot@t:/# '\n    ready_probe: 'echo __READY__${nonce}'\n    timeout_s: 5.0\ntargets:\n  - {com: COM0, profile: t, device_by_id: /s/by-id/usb-A}\n".to_string(),
@@ -256,9 +307,11 @@ fn rpc_probe_evidence_preserves_each_boolean() {
         .chars()
         .take_while(char::is_ascii_hexdigit)
         .collect::<String>();
+    let marker_nonce = framework_marker_nonce_from_tx(&tx);
     assert_eq!(nonce.len(), 8);
+    assert_eq!(marker_nonce.len(), 32);
     assert!(
-        !tx.contains(&format!("__SW_ST_{nonce}_OK__")),
+        !tx.contains(&format!("__SW_ST_{marker_nonce}_OK__")),
         "預期執行標記不得出現在 UART TX：{tx:?}"
     );
     println!("UART_TX={tx:?}");
@@ -296,6 +349,66 @@ fn rpc_echo_only_target_remains_unconfirmed() {
 }
 
 #[test]
+fn rpc_probe_printed_marker_then_nonzero_rc_does_not_confirm_ready() {
+    let rig = Arc::new(ready_reconfirm_pending_nonzero_probe_rig());
+    let dev = rig.device(REAL_A);
+    assert_eq!(
+        rig.session("COM0").unwrap()["ready_reconfirm_pending"],
+        PyValue::Bool(true),
+        "測試前置必須保留 reconfirm pending"
+    );
+    dev.clear_replies();
+
+    let tx_start = dev.tx_len();
+    let rpc_rig = Arc::clone(&rig);
+    let handle = thread::spawn(move || {
+        rpc_rig.call(
+            "session.self_test",
+            r#"{"selector":"COM0","timeout_s":0.5}"#,
+        )
+    });
+    wait_for("非零 marker RPC probe TX", || dev.tx_len() > tx_start);
+    let tx = String::from_utf8_lossy(&dev.tx_since(tx_start)).into_owned();
+    let probe_nonce = probe_nonce_from_printf(&tx);
+    let marker_nonce = framework_marker_nonce_from_tx(&tx);
+    let response = format!("__SW_ST_{probe_nonce}_OK__\r\nroot@t:/# ");
+    let rx_before = rx_window_bytes(&rig);
+    push_rpc_rx_and_wait(
+        &rig,
+        dev,
+        response.as_bytes(),
+        rx_before,
+        "RPC reader 已收到自訂 probe marker 與 prompt",
+    );
+    advance_clock_until(&rig, &handle, "自訂非零 marker RPC self-test");
+
+    let reply = handle.join().unwrap();
+    assert_eq!(reply["probe_ok"], PyValue::Bool(false), "{reply:?}");
+    assert_eq!(reply["probe_evidence"]["tx_complete"], PyValue::Bool(true));
+    assert_eq!(
+        reply["probe_evidence"]["execution_marker"],
+        PyValue::Bool(false)
+    );
+    assert_eq!(
+        reply["probe_evidence"]["probe_rc_zero"],
+        PyValue::Bool(false)
+    );
+    assert_eq!(
+        reply["probe_evidence"]["prompt_after_marker"],
+        PyValue::Bool(false)
+    );
+    assert_ne!(
+        probe_nonce, marker_nonce,
+        "框架 marker nonce 必須獨立於 ready_probe nonce"
+    );
+    assert_eq!(
+        rig.session("COM0").unwrap()["ready_reconfirm_pending"],
+        PyValue::Bool(true),
+        "失敗的 probe 不得呼叫 confirm_ready"
+    );
+}
+
+#[test]
 fn rpc_probe_evidence_reports_failure_scenarios_and_pending_state() {
     for scenario in [0, 1, 2, 3] {
         let rig = Arc::new(ready_reconfirm_pending_rig());
@@ -325,23 +438,32 @@ fn rpc_probe_evidence_reports_failure_scenarios_and_pending_state() {
             .chars()
             .take_while(char::is_ascii_hexdigit)
             .collect::<String>();
+        let marker_nonce = framework_marker_nonce_from_tx(&tx_text);
         assert_eq!(nonce.len(), 8, "probe TX 應含完整 nonce：{tx_text:?}");
-        let expected_tx =
-            format!("( echo __READY__{nonce} ) && printf '\\n__SW_ST_%s_OK__\\n' '{nonce}'\n");
+        assert_eq!(
+            marker_nonce.len(),
+            32,
+            "框架 marker nonce 應獨立產生：{tx_text:?}"
+        );
+        let expected_tx = format!(
+            "( echo __READY__{nonce} ) && printf '\\n__SW_ST_%s_OK__\\n' '{marker_nonce}'\n"
+        );
         assert_eq!(tx_text, expected_tx, "測試 DUT 只依完整 shell 框架回覆");
-        assert!(!tx_text.contains(&format!("__SW_ST_{nonce}_OK__")));
+        assert!(!tx_text.contains(&format!("__SW_ST_{marker_nonce}_OK__")));
 
         let response = match scenario {
             // 完整實際 TX 回顯不能把 printf 格式字串當執行標記。
             0 => tx.clone(),
             // marker 有完整行界，但 marker 後沒有 prompt。
-            1 => format!("__SW_ST_{nonce}_OK__\r\n").into_bytes(),
+            1 => format!("__SW_ST_{marker_nonce}_OK__\r\n").into_bytes(),
             // nonce 回顯後，執行標記被其他輸出插斷，並帶有 prompt。
-            2 => format!("__READY__{nonce}\r\n__SW_ST_{nonce}_\r\nnoise_OK__\r\nroot@t:/# ")
+            2 => format!("__READY__{nonce}\r\n__SW_ST_{marker_nonce}_\r\nnoise_OK__\r\nroot@t:/# ")
                 .into_bytes(),
             // marker 前後雜訊不影響完整 marker 與後續 prompt。
-            _ => format!("noise before\r\n__SW_ST_{nonce}_OK__\r\nnoise after\r\nroot@t:/# ")
-                .into_bytes(),
+            _ => {
+                format!("noise before\r\n__SW_ST_{marker_nonce}_OK__\r\nnoise after\r\nroot@t:/# ")
+                    .into_bytes()
+            }
         };
         let rx_before = rx_window_bytes(&rig);
         push_rpc_rx_and_wait(
@@ -424,9 +546,15 @@ fn rpc_newline_prefixed_prompt_after_marker_confirms_ready() {
         .chars()
         .take_while(char::is_ascii_hexdigit)
         .collect::<String>();
+    let marker_nonce = framework_marker_nonce_from_tx(&tx_text);
     assert_eq!(nonce.len(), 8, "probe TX 應含完整 nonce：{tx_text:?}");
+    assert_eq!(
+        marker_nonce.len(),
+        32,
+        "框架 marker nonce 應獨立產生：{tx_text:?}"
+    );
 
-    let response = format!("__SW_ST_{nonce}_OK__\r\nroot@t:/# ").into_bytes();
+    let response = format!("__SW_ST_{marker_nonce}_OK__\r\nroot@t:/# ").into_bytes();
     push_rpc_rx_and_wait(
         &rig,
         dev,
@@ -474,9 +602,15 @@ fn rpc_any_line_prompt_after_marker_confirms_ready() {
         .chars()
         .take_while(char::is_ascii_hexdigit)
         .collect::<String>();
+    let marker_nonce = framework_marker_nonce_from_tx(&tx_text);
     assert_eq!(nonce.len(), 8, "probe TX 應含完整 nonce：{tx_text:?}");
+    assert_eq!(
+        marker_nonce.len(),
+        32,
+        "框架 marker nonce 應獨立產生：{tx_text:?}"
+    );
 
-    let response = format!("__SW_ST_{nonce}_OK__\r\nroot@t:/# ").into_bytes();
+    let response = format!("__SW_ST_{marker_nonce}_OK__\r\nroot@t:/# ").into_bytes();
     push_rpc_rx_and_wait(
         &rig,
         dev,

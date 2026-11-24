@@ -30,4 +30,3 @@ test marker_and_prompt_split_after_unicode_trim_confirm_ready ... ok
 test execution_marker_requires_following_prompt ... ok
 
 test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.12s
-

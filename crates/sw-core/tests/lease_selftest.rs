@@ -943,8 +943,11 @@ fn selftest_probe_other_reject_zero_tx_matches_python() {
     let PyValue::Dict(golden) = loads(&golden_text).expect("json") else {
         panic!()
     };
-    let framed_probe_len =
-        "( echo __READY__00000000 ) && printf '\\n__SW_ST_%s_OK__\\n' '00000000'\n".len();
+    let framed_probe_len = format!(
+        "( echo __READY__00000000 ) && printf '\\n__SW_ST_%s_OK__\\n' '{}'\n",
+        "0".repeat(32)
+    )
+    .len();
     type Inject = fn(&mut sw_core::tx_writer::FenceState);
     let cases: [(&str, Inject); 4] = [
         ("drain", |f| f.frozen = true),
@@ -1284,8 +1287,11 @@ fn selftest_probe_drain_race_golden() {
     let PyValue::Dict(mut drain) = golden["drain"].clone() else {
         panic!()
     };
-    let framed_probe_len =
-        "( echo __READY__00000000 ) && printf '\\n__SW_ST_%s_OK__\\n' '00000000'\n".len();
+    let framed_probe_len = format!(
+        "( echo __READY__00000000 ) && printf '\\n__SW_ST_%s_OK__\\n' '{}'\n",
+        "0".repeat(32)
+    )
+    .len();
     let message = drain["message"]
         .as_str()
         .expect("golden message")

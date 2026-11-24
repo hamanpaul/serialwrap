@@ -11,4 +11,3 @@ test rpc_probe_evidence_reports_failure_scenarios_and_pending_state ... ok
 test rpc_self_test_busy_has_zero_probe_tx ... ok
 
 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.36s
-
