@@ -74,6 +74,63 @@ fn tx_snapshot(rig: &ServiceRig, dev: &FakeDevice) -> TxSnapshot {
     }
 }
 
+fn rx_window_bytes(rig: &ServiceRig) -> u64 {
+    rig.session("COM0")
+        .expect("COM0 session")
+        .get("rx_bytes_last_10s")
+        .and_then(PyValue::as_i64)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .expect("READY session 應回報 RX bytes")
+}
+
+fn push_rpc_rx_and_wait(rig: &ServiceRig, dev: &FakeDevice, bytes: &[u8], before: u64, what: &str) {
+    let expected = before + bytes.len() as u64;
+    dev.push_rx(bytes);
+    wait_for(what, || rx_window_bytes(rig) >= expected);
+}
+
+fn ready_reconfirm_pending_rig() -> ServiceRig {
+    let rig = ServiceRig::build(RigSpec {
+        yaml: "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    ready_probe: 'echo __READY__${nonce}'\n    boot_done_regex: 'BOOT_DONE'\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: t, device_by_id: /s/by-id/usb-A}\n".to_string(),
+        devices: vec![(BY_ID_A.into(), REAL_A.into())],
+        explicit_target_count: 1,
+        allowlist: None,
+        wait_ready: vec!["COM0".into()],
+    });
+    let dev = rig.device(REAL_A);
+    dev.push_rx(b"\r\nU-Boot 2024.01 (Jan 01)\r\n");
+    wait_for("boot banner 建立 reconfirm pending", || {
+        rig.session("COM0").is_some_and(|session| {
+            session["ready_reconfirm_pending"] == PyValue::Bool(true)
+                && !session["boot_quiet_remaining_s"].is_null()
+        })
+    });
+    dev.push_rx(b"\r\nBOOT_DONE\r\n");
+    wait_for(
+        "boot_done_regex 清 quiet 並保留 reconfirm pending",
+        || {
+            rig.session("COM0").is_some_and(|session| {
+                session["ready_reconfirm_pending"] == PyValue::Bool(true)
+                    && session["boot_quiet_remaining_s"].is_null()
+            })
+        },
+    );
+    rig
+}
+
+fn ready_newline_prompt_rig() -> ServiceRig {
+    let rig = ServiceRig::build(RigSpec {
+        yaml: "profiles:\n  t:\n    platform: shell\n    prompt_regex: '\\r?\\nroot@t:/# '\n    ready_probe: 'echo __READY__${nonce}'\n    timeout_s: 5.0\ntargets:\n  - {com: COM0, profile: t, device_by_id: /s/by-id/usb-A}\n".to_string(),
+        devices: vec![(BY_ID_A.into(), REAL_A.into())],
+        explicit_target_count: 1,
+        allowlist: None,
+        wait_ready: Vec::new(),
+    });
+    rig.device(REAL_A).push_rx(b"\r\nroot@t:/# ");
+    rig.wait_state("COM0", "READY");
+    rig
+}
+
 fn assert_busy(reply: &PyDict) {
     assert_eq!(reply["ok"], PyValue::Bool(true), "{reply:?}");
     assert!(
@@ -228,10 +285,15 @@ fn rpc_echo_only_target_remains_unconfirmed() {
 #[test]
 fn rpc_probe_evidence_reports_failure_scenarios_and_pending_state() {
     for scenario in [0, 1, 2, 3] {
-        let rig = Arc::new(ServiceRig::ready_shell());
+        let rig = Arc::new(ready_reconfirm_pending_rig());
         let dev = rig.device(REAL_A);
         dev.clear_replies();
         let pending_before = rig.session("COM0").unwrap()["ready_reconfirm_pending"].clone();
+        assert_eq!(
+            pending_before,
+            PyValue::Bool(true),
+            "驗收前置必須是 READY reconfirm pending，而不是只記錄 READY 初值"
+        );
         let tx_start = dev.tx_len();
         let rpc_rig = Arc::clone(&rig);
         let handle = thread::spawn(move || {
@@ -251,36 +313,31 @@ fn rpc_probe_evidence_reports_failure_scenarios_and_pending_state() {
             .take_while(char::is_ascii_hexdigit)
             .collect::<String>();
         assert_eq!(nonce.len(), 8, "probe TX 應含完整 nonce：{tx_text:?}");
-        let expected_tx = format!(
-            "( echo __READY__{nonce} ) && printf '\\n__SW_ST_%s_OK__\\n' '{nonce}'\n"
-        );
+        let expected_tx =
+            format!("( echo __READY__{nonce} ) && printf '\\n__SW_ST_%s_OK__\\n' '{nonce}'\n");
         assert_eq!(tx_text, expected_tx, "測試 DUT 只依完整 shell 框架回覆");
         assert!(!tx_text.contains(&format!("__SW_ST_{nonce}_OK__")));
 
         let response = match scenario {
-            // 完整實際 TX 回顯、分兩段抵達，不能把 printf 格式字串當執行標記。
+            // 完整實際 TX 回顯不能把 printf 格式字串當執行標記。
             0 => tx.clone(),
             // marker 有完整行界，但 marker 後沒有 prompt。
             1 => format!("__SW_ST_{nonce}_OK__\r\n").into_bytes(),
             // nonce 回顯後，執行標記被其他輸出插斷，並帶有 prompt。
-            2 => format!(
-                "__READY__{nonce}\r\n__SW_ST_{nonce}_\r\nnoise_OK__\r\nroot@t:/# "
-            )
-            .into_bytes(),
+            2 => format!("__READY__{nonce}\r\n__SW_ST_{nonce}_\r\nnoise_OK__\r\nroot@t:/# ")
+                .into_bytes(),
             // marker 前後雜訊不影響完整 marker 與後續 prompt。
-            _ => format!(
-                "noise before\r\n__SW_ST_{nonce}_OK__\r\nnoise after\r\nroot@t:/# "
-            )
-            .into_bytes(),
+            _ => format!("noise before\r\n__SW_ST_{nonce}_OK__\r\nnoise after\r\nroot@t:/# ")
+                .into_bytes(),
         };
-        if scenario == 0 {
-            let split = response.len() / 2;
-            dev.push_rx(&response[..split]);
-            dev.push_rx(&response[split..]);
-        } else {
-            dev.push_rx(&response);
-        }
-        thread::sleep(Duration::from_millis(30));
+        let rx_before = rx_window_bytes(&rig);
+        push_rpc_rx_and_wait(
+            &rig,
+            dev,
+            &response,
+            rx_before,
+            "RPC reader 已把完整情境回應寫入 RX snapshot",
+        );
 
         let expected = match scenario {
             0 | 2 => [true, false, false, false],
@@ -288,7 +345,9 @@ fn rpc_probe_evidence_reports_failure_scenarios_and_pending_state() {
             _ => [true, true, true, true],
         };
         if expected.iter().all(|value| *value) {
-            assert!(handle.is_finished(), "完整 marker 與後續 prompt 應完成 RPC");
+            wait_for("完整 marker 與後續 prompt 完成 RPC", || {
+                handle.is_finished()
+            });
         } else {
             advance_clock_until(&rig, &handle, "RPC self-test evidence scenario");
         }
@@ -317,12 +376,65 @@ fn rpc_probe_evidence_reports_failure_scenarios_and_pending_state() {
                 "scenario={scenario}, field={name}: {reply:?}"
             );
         }
+        let expected_pending = PyValue::Bool(!expected.iter().all(|value| *value));
         assert_eq!(
             rig.session("COM0").unwrap()["ready_reconfirm_pending"],
-            pending_before,
-            "scenario={scenario} 不得錯誤清除或建立 readiness pending"
+            expected_pending,
+            "scenario={scenario}：失敗須保留 pending，完整成功才可清除"
         );
     }
+}
+
+#[test]
+fn rpc_newline_prefixed_prompt_after_marker_confirms_ready() {
+    let rig = Arc::new(ready_newline_prompt_rig());
+    let dev = rig.device(REAL_A);
+    dev.clear_replies();
+    let rx_before = rx_window_bytes(&rig);
+    let tx_start = dev.tx_len();
+    let rpc_rig = Arc::clone(&rig);
+    let handle = thread::spawn(move || {
+        rpc_rig.call(
+            "session.self_test",
+            r#"{"selector":"COM0","timeout_s":0.5}"#,
+        )
+    });
+    wait_for("自訂換行 prompt 的 RPC probe TX", || {
+        dev.tx_len() > tx_start
+    });
+    let tx = dev.tx_since(tx_start);
+    let tx_text = String::from_utf8_lossy(&tx);
+    let nonce = tx_text
+        .split("__READY__")
+        .nth(1)
+        .unwrap_or("")
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect::<String>();
+    assert_eq!(nonce.len(), 8, "probe TX 應含完整 nonce：{tx_text:?}");
+
+    let response = format!("__SW_ST_{nonce}_OK__\r\nroot@t:/# ").into_bytes();
+    push_rpc_rx_and_wait(
+        &rig,
+        dev,
+        &response,
+        rx_before,
+        "RPC reader 已處理 marker 與 newline-prefixed prompt",
+    );
+    if !handle.is_finished() {
+        advance_clock_until(&rig, &handle, "newline-prefixed RPC prompt");
+    }
+    let reply = handle.join().unwrap();
+    assert_eq!(reply["probe_ok"], PyValue::Bool(true), "{reply:?}");
+    assert_eq!(
+        reply["probe_evidence"],
+        PyValue::Dict(sw_proto::pydict! {
+            "tx_complete" => true,
+            "execution_marker" => true,
+            "probe_rc_zero" => true,
+            "prompt_after_marker" => true,
+        })
+    );
 }
 
 #[test]

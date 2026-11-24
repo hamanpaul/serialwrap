@@ -152,6 +152,53 @@ fn read_self_test_probe(h: &ActorRig, tx_start: usize) -> (String, String) {
     (tx, nonce)
 }
 
+fn push_rx_and_wait_probe_snapshot(h: &ActorRig, bytes: &[u8], what: &str) {
+    let text = std::str::from_utf8(bytes).expect("self-test RX fixture 應為 UTF-8");
+    let expected_end = h.rx.snapshot_len() + text.chars().count() as u64;
+    h.dev.push_rx(bytes);
+    h.wait_for(what, |rig| {
+        rig.rx.snapshot_len() >= expected_end
+            && rig.rx.regex_wait_snapshot_end_for_test() >= expected_end
+    });
+}
+
+const NEWLINE_PROMPT_PROFILE: &str = r"profiles:
+  t:
+    platform: shell
+    prompt_regex: '\r?\nroot@t:/# '
+    ready_probe: 'echo __READY__${nonce}'
+    timeout_s: 2.0
+targets:
+  - {com: COM0, profile: t, act_no: 1, alias: t+1, device_by_id: /s/by-id/usb-A}
+";
+
+fn ready_newline_prompt_actor() -> ActorRig {
+    let h = ActorRig::new(NEWLINE_PROMPT_PROFILE);
+    install_executing_shell_target(&h);
+    h.dev.on_tx_reply(b"\n", b"\r\nroot@t:/# ");
+    let h = h.attach();
+    h.wait_for("帶換行前綴 prompt 的 actor READY", |rig| {
+        rig.get_state()["state"] == PyValue::from("READY")
+    });
+    h
+}
+
+fn receive_self_test_or_deadline(
+    h: &ActorRig,
+    pending: crossbeam_channel::Receiver<Result<PyDict, sw_proto::pycompat::PyErr>>,
+) -> PyDict {
+    match pending.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(error)) => panic!("self-test RPC 應回字典：{}", error.message),
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+            receive_self_test_after_deadline(h, pending)
+        }
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+            panic!("self-test actor 提前關閉回覆 channel")
+        }
+    }
+}
+
 fn receive_self_test_after_deadline(
     h: &ActorRig,
     pending: crossbeam_channel::Receiver<Result<PyDict, sw_proto::pycompat::PyErr>>,
@@ -866,13 +913,21 @@ fn echo_only_never_confirms_ready() {
             let echo = format!("__READY__{nonce}\r\n");
             if segmented {
                 let split = echo.find(&nonce).unwrap() + nonce.len() / 2;
-                h.inject_rx(&echo.as_bytes()[..split]);
-                h.inject_rx(&echo.as_bytes()[split..]);
+                push_rx_and_wait_probe_snapshot(
+                    &h,
+                    &echo.as_bytes()[..split],
+                    "runner 檢查分段 nonce 回顯第一段",
+                );
+                push_rx_and_wait_probe_snapshot(
+                    &h,
+                    &echo.as_bytes()[split..],
+                    "runner 檢查分段 nonce 回顯第二段",
+                );
             } else {
-                h.inject_rx(echo.as_bytes());
+                push_rx_and_wait_probe_snapshot(&h, echo.as_bytes(), "runner 檢查 nonce 回顯");
             }
             if with_prompt {
-                h.inject_rx(b"root@t:/# ");
+                push_rx_and_wait_probe_snapshot(&h, b"root@t:/# ", "runner 檢查 nonce 後 prompt");
             }
             let reply = receive_self_test_after_deadline(&h, pending);
             assert_eq!(
@@ -906,13 +961,21 @@ fn echo_of_complete_probe_payload_never_confirms_ready() {
 
             if segmented {
                 let split = payload.len() / 2;
-                h.inject_rx(&payload.as_bytes()[..split]);
-                h.inject_rx(&payload.as_bytes()[split..]);
+                push_rx_and_wait_probe_snapshot(
+                    &h,
+                    &payload.as_bytes()[..split],
+                    "runner 檢查完整 TX 回顯第一段",
+                );
+                push_rx_and_wait_probe_snapshot(
+                    &h,
+                    &payload.as_bytes()[split..],
+                    "runner 檢查完整 TX 回顯第二段",
+                );
             } else {
-                h.inject_rx(payload.as_bytes());
+                push_rx_and_wait_probe_snapshot(&h, payload.as_bytes(), "runner 檢查完整 TX 回顯");
             }
             if with_prompt {
-                h.inject_rx(b"root@t:/# ");
+                push_rx_and_wait_probe_snapshot(&h, b"root@t:/# ", "runner 檢查回顯後 prompt");
             }
 
             let reply = receive_self_test_after_deadline(&h, pending);
@@ -952,7 +1015,7 @@ fn execution_marker_requires_following_prompt() {
             2 => "__SW_ST_00000000_OK__\r\nroot@t:/# ".to_string(),
             _ => format!("__SW_ST_{nonce}_\r\nnoise_OK__\r\nroot@t:/# "),
         };
-        h.inject_rx(marker.as_bytes());
+        push_rx_and_wait_probe_snapshot(&h, marker.as_bytes(), "runner 檢查 marker 情境");
         let reply = receive_self_test_after_deadline(&h, pending);
         assert_eq!(
             reply["probe_ok"],
@@ -983,14 +1046,18 @@ fn execution_marker_requires_terminated_line_before_prompt() {
 
     // 分兩次交付：marker 暫時位於 RX snapshot 尾端，接著同一行直接出現 prompt。
     // 未收到換行以前，marker 還不是一個獨立完整輸出行。
-    h.inject_rx(format!("__SW_ST_{nonce}_OK__").as_bytes());
-    let prompt_wait_deadline = std::time::Instant::now() + Duration::from_millis(100);
-    while h.rx.regex_wait_starts_for_test() < wait_start + 2
-        && std::time::Instant::now() < prompt_wait_deadline
-    {
-        std::thread::yield_now();
-    }
-    h.inject_rx(b"root@t:/# ");
+    let marker = format!("__SW_ST_{nonce}_OK__");
+    let marker_end = h.rx.snapshot_len() + marker.chars().count() as u64;
+    h.dev.push_rx(marker.as_bytes());
+    h.wait_for("RX reader 收到未終止 marker", |rig| {
+        rig.rx.snapshot_len() >= marker_end
+    });
+    h.wait_for(
+        "runner 已用未終止 marker snapshot 判定行界",
+        |rig| rig.rx.regex_wait_snapshot_end_for_test() >= marker_end,
+    );
+    assert!(pending.is_empty(), "沒有換行時 runner 不得完成 self-test");
+    push_rx_and_wait_probe_snapshot(&h, b"root@t:/# ", "runner 檢查 marker 同行的 prompt");
 
     let reply = receive_self_test_after_deadline(&h, pending);
     assert_eq!(reply["probe_ok"], PyValue::Bool(false), "{reply:?}");
@@ -1038,12 +1105,63 @@ fn marker_and_prompt_in_same_chunk_confirm_ready() {
 }
 
 #[test]
+fn newline_prefixed_prompt_after_marker_confirms_ready_same_chunk_and_split_chunk() {
+    for split_prompt in [false, true] {
+        let h = ready_newline_prompt_actor();
+        h.dev.clear_replies();
+        let wait_start = h.rx.regex_wait_starts_for_test();
+        let tx_start = h.dev.tx_len();
+        let pending = h.request_async(self_test_req());
+        let (_, nonce) = read_self_test_probe(&h, tx_start);
+        h.wait_for("帶換行前綴 prompt 的 marker wait", |rig| {
+            rig.rx.regex_wait_starts_for_test() > wait_start
+        });
+
+        let marker = format!("__SW_ST_{nonce}_OK__\r\n");
+        if split_prompt {
+            push_rx_and_wait_probe_snapshot(&h, marker.as_bytes(), "runner 檢查分段 marker 行");
+            assert!(pending.is_empty(), "只收到 marker 時 prompt 尚未到達");
+            push_rx_and_wait_probe_snapshot(&h, b"root@t:/# ", "runner 檢查分段 prompt");
+        } else {
+            let response = format!("{marker}root@t:/# ");
+            push_rx_and_wait_probe_snapshot(
+                &h,
+                response.as_bytes(),
+                "runner 檢查同 chunk marker 與 prompt",
+            );
+        }
+
+        let reply = receive_self_test_or_deadline(&h, pending);
+        assert_eq!(
+            reply["probe_ok"],
+            PyValue::Bool(true),
+            "split_prompt={split_prompt}: {reply:?}"
+        );
+        assert_eq!(
+            reply["probe_evidence"]["execution_marker"],
+            PyValue::Bool(true)
+        );
+        assert_eq!(
+            reply["probe_evidence"]["probe_rc_zero"],
+            PyValue::Bool(true)
+        );
+        assert_eq!(
+            reply["probe_evidence"]["prompt_after_marker"],
+            PyValue::Bool(true)
+        );
+    }
+}
+
+#[test]
 fn marker_and_prompt_split_after_unicode_trim_confirm_ready() {
     let h = ActorRig::new(SHELL_PROFILE).ready();
     h.dev.clear_replies();
-    let prefix = format!("root@t:/#\r\n{}noise before probe\r\n", "甲".repeat(131_400));
+    let prefix = format!(
+        "root@t:/#\r\n{}noise before probe\r\n",
+        "甲".repeat(131_400)
+    );
     let prefix_end = h.rx.snapshot_len() + prefix.chars().count() as u64;
-    h.inject_rx(prefix.as_bytes());
+    h.dev.push_rx(prefix.as_bytes());
     h.wait_for("Unicode RX 填滿並裁切視窗", |rig| {
         rig.rx.snapshot_len() >= prefix_end
     });
@@ -1061,19 +1179,32 @@ fn marker_and_prompt_split_after_unicode_trim_confirm_ready() {
         h.rx.trimmed()
     );
 
-    h.inject_rx(format!("__SW_ST_{nonce}_").as_bytes());
-    h.inject_rx(b"OK__\r");
-    h.inject_rx(b"\nroot@t:/");
-    h.inject_rx(b"# ");
+    push_rx_and_wait_probe_snapshot(
+        &h,
+        format!("__SW_ST_{nonce}_").as_bytes(),
+        "runner 檢查 marker 第一段",
+    );
+    push_rx_and_wait_probe_snapshot(&h, b"OK__\r", "runner 檢查 marker 第二段");
+    push_rx_and_wait_probe_snapshot(&h, b"\nroot@t:/", "runner 檢查 marker 結尾與 prompt 前綴");
+    push_rx_and_wait_probe_snapshot(&h, b"# ", "runner 檢查 prompt 最後一段");
 
     let reply = pending
         .recv_timeout(Duration::from_secs(2))
         .expect("跨 chunk marker／prompt 應完成")
         .expect("self-test RPC 應回字典");
     assert_eq!(reply["probe_ok"], PyValue::Bool(true), "{reply:?}");
-    assert_eq!(reply["probe_evidence"]["execution_marker"], PyValue::Bool(true));
-    assert_eq!(reply["probe_evidence"]["probe_rc_zero"], PyValue::Bool(true));
-    assert_eq!(reply["probe_evidence"]["prompt_after_marker"], PyValue::Bool(true));
+    assert_eq!(
+        reply["probe_evidence"]["execution_marker"],
+        PyValue::Bool(true)
+    );
+    assert_eq!(
+        reply["probe_evidence"]["probe_rc_zero"],
+        PyValue::Bool(true)
+    );
+    assert_eq!(
+        reply["probe_evidence"]["prompt_after_marker"],
+        PyValue::Bool(true)
+    );
 }
 
 #[test]
@@ -1121,7 +1252,11 @@ fn execution_marker_noise_around_complete_line_is_accepted() {
     let pending = h.request_async(self_test_req());
     let (_, nonce) = read_self_test_probe(&h, tx_start);
     let output = format!("noise before\r\n__SW_ST_{nonce}_OK__\r\nnoise after\r\nroot@t:/# ");
-    h.inject_rx(output.as_bytes());
+    push_rx_and_wait_probe_snapshot(
+        &h,
+        output.as_bytes(),
+        "runner 檢查 marker 周邊雜訊與 prompt",
+    );
     let reply = pending
         .recv_timeout(Duration::from_secs(2))
         .expect("完整 marker 後的 prompt 應完成")

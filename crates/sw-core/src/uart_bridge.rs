@@ -123,6 +123,9 @@ pub struct RxShared {
     /// 測試觀察：記錄 regex 等待入口，供 self-test nonce／prompt 等待的決定性同步。
     #[cfg(feature = "test-fakes")]
     regex_wait_starts: AtomicU64,
+    /// 測試觀察：regex 等待已檢查的最後一個 RX 絕對字元位置。
+    #[cfg(feature = "test-fakes")]
+    regex_wait_snapshot_end: AtomicU64,
 }
 
 impl RxShared {
@@ -142,12 +145,19 @@ impl RxShared {
             shutdown_waits_cancelled: AtomicBool::new(false),
             #[cfg(feature = "test-fakes")]
             regex_wait_starts: AtomicU64::new(0),
+            #[cfg(feature = "test-fakes")]
+            regex_wait_snapshot_end: AtomicU64::new(0),
         })
     }
 
     #[cfg(feature = "test-fakes")]
     pub fn regex_wait_starts_for_test(&self) -> u64 {
         self.regex_wait_starts.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "test-fakes")]
+    pub fn regex_wait_snapshot_end_for_test(&self) -> u64 {
+        self.regex_wait_snapshot_end.load(Ordering::Acquire)
     }
 
     /// P8 Task 5：取消本 bridge 上進行中的檔案傳輸等待（watching_transfers 的 `RunCancel` 轉真）並喚醒等待者。
@@ -1159,7 +1169,14 @@ impl RxShared {
             if clock.mono_ns() >= deadline {
                 return WaitMatchOutcome::TimedOut;
             }
-            if let Some(found) = re.search(&snapshot) {
+            let found = re.search(&snapshot);
+            #[cfg(feature = "test-fakes")]
+            self.regex_wait_snapshot_end.store(
+                from.max(trimmed)
+                    .saturating_add(snapshot.chars().count() as u64),
+                Ordering::Release,
+            );
+            if let Some(found) = found {
                 return if self.shutdown_waits_cancelled.load(Ordering::Acquire) {
                     WaitMatchOutcome::Cancelled
                 } else {

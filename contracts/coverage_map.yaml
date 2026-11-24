@@ -41,12 +41,16 @@ entries:
     nodeids:
     - cargo:sw-core::rx_reader::shutdown_wait_match_reports_timeout_and_cancellation
     - cargo:sw-core::rx_reader::shutdown_wait_match_returns_absolute_unicode_end_after_trim
+    - cargo:sw-core::self_test_safety::echo_of_complete_probe_payload_never_confirms_ready
     - cargo:sw-core::self_test_safety::echo_only_never_confirms_ready
     - cargo:sw-core::self_test_safety::execution_marker_noise_around_complete_line_is_accepted
     - cargo:sw-core::self_test_safety::execution_marker_requires_following_prompt
+    - cargo:sw-core::self_test_safety::execution_marker_requires_terminated_line_before_prompt
     - cargo:sw-core::self_test_safety::failed_probe_rc_never_confirms_ready
     - cargo:sw-core::self_test_safety::idle_probe_reserves_slot_before_tx
     - cargo:sw-core::self_test_safety::marker_and_prompt_in_same_chunk_confirm_ready
+    - cargo:sw-core::self_test_safety::marker_and_prompt_split_after_unicode_trim_confirm_ready
+    - cargo:sw-core::self_test_safety::newline_prefixed_prompt_after_marker_confirms_ready_same_chunk_and_split_chunk
     - cargo:sw-core::self_test_safety::self_test_terminal_paths_release_only_own_reservation
     - cargo:sw-core::self_test_safety::stale_probe_cannot_confirm_new_generation
     - cargo:sw-core::shutdown_pending_waits::shutdown_cancels_verified_self_test_waits
@@ -55,6 +59,8 @@ entries:
     - cargo:sw-daemon::self_test_safety::rpc_echo_only_target_remains_unconfirmed
     - cargo:sw-daemon::self_test_safety::rpc_probe_and_submit_have_deterministic_order
     - cargo:sw-daemon::self_test_safety::rpc_probe_evidence_preserves_each_boolean
+    - cargo:sw-daemon::self_test_safety::rpc_probe_evidence_reports_failure_scenarios_and_pending_state
+    - cargo:sw-daemon::self_test_safety::rpc_newline_prefixed_prompt_after_marker_confirms_ready
     - cargo:sw-daemon::self_test_safety::rpc_self_test_busy_has_zero_probe_tx
     owner_phase: P7
   bc:DF-01:

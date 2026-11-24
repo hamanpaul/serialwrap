@@ -1094,15 +1094,23 @@ fn run_self_test_probe(
         ) {
             WaitMatchOutcome::Matched { end } => {
                 let prompt_re = compile_or_never(&ctx.profile.template.prompt_regex);
-                let prompt = match ctx.rx.wait_for_regex_from_shutdown_cancellable(
+                // marker regex 已消耗結尾 LF；回退到該行終止符起點，保留自訂 prompt regex 所需的 CRLF／LF 行界。
+                // prompt match 必須延伸到 marker 結尾之後，避免只匹配 marker 的行終止符就算確認成功。
+                let marker_tail = ctx.rx.text_from(end.saturating_sub(2));
+                let prompt_from = if marker_tail.starts_with("\r\n") {
+                    end.saturating_sub(2)
+                } else {
+                    end.saturating_sub(1)
+                };
+                let prompt = match ctx.rx.wait_for_regex_end_from_shutdown_cancellable(
                     &prompt_re,
-                    end,
+                    prompt_from,
                     secs(timeout_s),
                     &*ctx.clock,
                 ) {
-                    WaitOutcome::Matched => true,
-                    WaitOutcome::TimedOut => false,
-                    WaitOutcome::Cancelled => {
+                    WaitMatchOutcome::Matched { end: prompt_end } => prompt_end > end,
+                    WaitMatchOutcome::TimedOut => false,
+                    WaitMatchOutcome::Cancelled => {
                         return OpOutcome::SelfTestRefused(FenceReject::Cancelled);
                     }
                 };
