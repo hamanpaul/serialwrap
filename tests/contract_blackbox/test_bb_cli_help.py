@@ -71,7 +71,7 @@ def test_platform_oracle_exists_and_boundary_values_are_native():
 def _expected_rust_version_bytes(golden_stdout: str, fingerprint: str) -> bytes:
     """只替換版本輸出中的指紋；其餘位元組仍必須符合 Python golden。"""
     golden = golden_stdout.replace("\n", NL.decode()).encode("utf-8")
-    marker = b"(code bcb9ce2d5eb9)"
+    marker = b"(code dde486cbcbb5)"
     assert golden.count(marker) == 1, f"Python version golden 指紋格式錯誤：{golden!r}"
     return golden.replace(marker, f"(code {fingerprint})".encode("ascii"), 1)
 

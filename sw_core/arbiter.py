@@ -192,7 +192,6 @@ class CommandArbiter:
         admission_exempt: bool = False,
         trusted_human: bool = False,
         expect_reboot: bool | None = False,
-        max_console_line_chars: int | None = None,
     ) -> dict[str, Any]:
         if not valid_completion_regex(completion_regex):
             return {"ok": False, "error_code": ERROR_INVALID_COMPLETION_REGEX}
@@ -210,20 +209,6 @@ class CommandArbiter:
                 "cmd_length": cmd_len,
                 "limit": CMD_REJECT_BYTES,
                 "hint": "Command exceeds 16 KB hard limit. Use file-based injection or split into smaller commands.",
-            }
-        # profile 有量測過的 console 單行上限（max_console_line_chars）時，超過的命令送出後會被
-        # target 截斷、等不到 prompt，逾時又會送 CTRL_C／CTRL_D，改在提交時拒絕。沿用 CMD_TOO_LONG
-        # （Stage 1B 凍結錯誤碼集合），limit 帶 profile 的值。計法與 file transfer 的單行預算相同：
-        # 完整命令的 UTF-8 bytes，不含結尾換行。None＝profile 未設，不檢查（預設行為不變）。
-        if max_console_line_chars is not None and cmd_len > max_console_line_chars:
-            return {
-                "ok": False,
-                "error_code": ERROR_CMD_TOO_LONG,
-                "cmd_length": cmd_len,
-                "limit": max_console_line_chars,
-                "hint": "Command exceeds this console's line limit (profile max_console_line_chars) "
-                        "and would be truncated by the target. Shorten it, or push a script with "
-                        "file push and run that instead.",
             }
         cmd_warning = None
         if cmd_len > CMD_WARN_BYTES:

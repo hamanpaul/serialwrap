@@ -103,7 +103,7 @@ fn zero_or_negative_line_limit_rejects_nonempty_command() {
         let (reply, fx) = h.rpc_full(SessionRequest::Submit(agent_submit("A")));
         let r = reply.expect("submit 回覆");
         assert_eq!(r["error_code"], PyValue::from("CMD_TOO_LONG"), "limit={limit}");
-        assert_eq!(r["limit"], PyValue::from(limit), "limit={limit}");
+        assert_eq!(r["limit"], PyValue::from(limit as i64), "limit={limit}");
         assert!(started_commands(&fx).is_empty(), "limit={limit}: 不得入列");
         assert_eq!(h.tx_effect_count(), before, "limit={limit}: 零 TX");
     }
