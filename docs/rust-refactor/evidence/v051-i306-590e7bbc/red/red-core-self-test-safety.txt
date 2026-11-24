@@ -1,0 +1,45 @@
+   Compiling sw-core v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.94s
+     Running tests/self_test_safety.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/self_test_safety-9ea7f8391a1b6845)
+
+running 25 tests
+test agent_lease_does_not_override_quiet_classification ... ok
+test agent_lease_does_not_override_passthrough_classification ... ok
+test accepted_queue_blocks_self_test_without_foreground_slot ... ok
+test queued_command_is_not_overtaken_by_self_test ... ok
+test agent_lease_does_not_override_bridge_down_classification ... ok
+test replay_hold_blocks_self_test_until_settled ... ok
+test rebound_recover_waiter_does_not_keep_self_test_busy ... ok
+test file_transfer_and_interactive_send_block_self_test ... ok
+test self_test_terminal_paths_release_only_own_reservation ... ok
+test stale_probe_cannot_confirm_new_generation ... ok
+test foreground_command_busy_self_test_is_passive ... ok
+test agent_lease_busy_self_test_is_passive ... ok
+test execution_marker_noise_around_complete_line_is_accepted ... ok
+test failed_probe_rc_never_confirms_ready ... ok
+test marker_and_prompt_in_same_chunk_confirm_ready ... ok
+test agent_lease_and_probe_operations_block_self_test ... ok
+test recover_waiter_remains_busy_after_human_console_attach ... ok
+test execution_marker_requires_terminated_line_before_prompt ... ok
+test background_capture_busy_self_test_is_passive ... ok
+test idle_probe_reserves_slot_before_tx ... ok
+test marker_and_prompt_split_after_unicode_trim_confirm_ready ... ok
+test echo_of_complete_probe_payload_never_confirms_ready ... ok
+test echo_only_never_confirms_ready ... ok
+
+thread 'newline_prefixed_prompt_after_marker_confirms_ready_same_chunk_and_split_chunk' (96012) panicked at crates/sw-core/tests/self_test_safety.rs:1138:9:
+assertion `left == right` failed: split_prompt=false: PyDict({"ok": Bool(true), "classification": Str("TARGET_UNRESPONSIVE"), "session": Dict(PyDict({"session_id": Str("t:COM0"), "profile": Str("t"), "com": Str("COM0"), "alias": Str("t+1"), "act_no": Int(Small(1)), "device_by_id": Str("/s/by-id/usb-A"), "platform": Str("shell"), "profile_source": Str("yaml-target"), "command_capable": Bool(true), "state": Str("READY"), "last_error": Null, "last_error_detail": Null, "detached_at": Null, "last_ready_at": Str("wall-rig"), "vtty": Null, "attached_real_path": Str("/fake/tty-A"), "bridge_generation": Int(Small(1)), "recovering": Bool(false), "interactive_session_id": Null, "foreground_busy": Bool(false), "fg_cmd_expected_duration_s": Null, "console_count": Int(Small(0)), "last_state_change_at": Str("wall-rig"), "last_rx_at": Str("wall-rig"), "last_tx_at": Str("wall-rig"), "last_probe_at": Str("wall-rig"), "reprobe_attempts": Int(Small(0)), "next_reprobe_at": Null, "reprobe_exhausted": Bool(false), "boot_quiet_remaining_s": Null, "ready_reconfirm_pending": Bool(false), "ready_reconfirm_failed": Bool(false), "ready_reconfirm_remaining_s": Null, "boot_evidence_wait_remaining_s": Null, "idle_for_ms": Null, "last_rx_age_s": Null, "last_tx_age_s": Null, "rx_bytes_last_10s": Int(Small(74)), "rx_rate_bps": Int(Small(7)), "outstanding_commands": Int(Small(0)), "activity_classification": Str("newly-attached"), "released_by": Null, "released_at": Null, "released_reason": Null, "capture": Null, "drain_stalled": Bool(false), "drain_timeout_epoch": Null})), "attached_real_path": Str("/fake/tty-A"), "current_real_path": Str("/fake/tty-A"), "probe_ok": Bool(false), "recommended_action": Str("recover"), "probe_evidence": Dict(PyDict({"tx_complete": Bool(true), "execution_marker": Bool(true), "probe_rc_zero": Bool(true), "prompt_after_marker": Bool(false)})), "interactive_owner": Null, "human_attached": Bool(false), "human_active": Bool(false), "recovery_mode": Bool(false), "command_capable": Bool(true)})
+  left: Bool(false)
+ right: Bool(true)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test newline_prefixed_prompt_after_marker_confirms_ready_same_chunk_and_split_chunk ... FAILED
+test execution_marker_requires_following_prompt ... ok
+
+failures:
+
+failures:
+    newline_prefixed_prompt_after_marker_confirms_ready_same_chunk_and_split_chunk
+
+test result: FAILED. 24 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.11s
+
+error: test failed, to rerun pass `-p sw-core --test self_test_safety`

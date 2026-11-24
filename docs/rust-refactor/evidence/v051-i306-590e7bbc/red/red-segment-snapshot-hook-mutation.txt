@@ -1,0 +1,19 @@
+   Compiling sw-core v0.5.0 (/home/paul_chen/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.46s
+     Running tests/self_test_safety.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/self_test_safety-9ea7f8391a1b6845)
+
+running 1 test
+
+thread 'echo_of_complete_probe_payload_never_confirms_ready' (937832) panicked at crates/sw-core/tests/support/mod.rs:1725:13:
+等待逾時：runner 檢查完整 TX 回顯
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test echo_of_complete_probe_payload_never_confirms_ready ... FAILED
+
+failures:
+
+failures:
+    echo_of_complete_probe_payload_never_confirms_ready
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 24 filtered out; finished in 5.01s
+
+error: test failed, to rerun pass `-p sw-core --test self_test_safety`

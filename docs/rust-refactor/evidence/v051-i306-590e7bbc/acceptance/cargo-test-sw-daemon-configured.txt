@@ -1,0 +1,603 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running unittests src/lib.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/sw_daemon-f350d875330397e4)
+
+running 12 tests
+test code_identity::tests::absent_executable_or_manifest_has_no_fingerprint_or_path ... ok
+test code_identity::tests::manifest_fingerprint_is_captured_once_with_bundle_root ... ok
+test code_identity::tests::unreadable_manifest_keeps_fingerprint_unknown ... ok
+test code_identity::tests::missing_manifest_fingerprint_stays_unknown_without_fallback ... ok
+test daemon_main::tests::help_matches_argparse_at_default_width ... ok
+test daemon_main::tests::negative_numbers_are_values_not_options ... ok
+test daemon_main::tests::usage_wraps_like_argparse ... ok
+test daemon_main::tests::yaml_exception_names_follow_pyyaml_classes ... ok
+test framing::tests::send_timeout_retry_follows_pal_retryability ... ok
+test framing::tests::trim_matches_python_strip ... ok
+test launcher::tests::current_release_rejects_parent_traversal ... ok
+test launcher::tests::current_release_resolves_manifest_from_memfs ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/serialwrapd-da4479a6510194de)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cap_windows_com_p7.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/cap_windows_com_p7-082ba6b7b4232afa)
+
+running 5 tests
+test cap_windows_com__p7_event_fire ... ignored, cap:windows_com
+test cap_windows_com__p7_login_ready ... ignored, cap:windows_com
+test cap_windows_com__p7_quiet_banner_zero_tx ... ignored, cap:windows_com
+test peer_wal_oracle_compares_raw_bytes ... ok
+test zero_tx_window_starts_before_banner ... ok
+
+test result: ok. 2 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/daemon_process.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/daemon_process-f67a98972d39615e)
+
+running 44 tests
+test cap_interactive_desktop__windows_console_ctrl_triggers_orderly_stop ... ignored, 需要 Windows Terminal 互動桌面；由 win-interactive-l1.ps1 執行
+test backend_env_invalid_exit_1 ... ok
+test allowlist_rejected_before_runtime_dirs_and_lock ... ok
+test daemon_stop_reply_rejects_new_health_ping ... ok
+test in_process_client_panic_requests_daemon_stop ... ok
+test shutdown_wal_sync_failure_exits_1 ... ok
+test allowlist_rejected_reasons_exact ... ok
+test endpoint_is_written_after_bind ... ok
+test handler_panic_does_not_kill_daemon ... ok
+test no_profiles_message_and_continue ... ok
+test backend_env_checked_where_python_selects_it ... ok
+test allowlist_env_overrides_config ... ok
+test serial_backend_env_warning_is_emitted_once ... ok
+test no_args_uses_env_paths ... ok
+test endpoint_written_after_bind ... ok
+test uncaught_panic_exit_1 ... ok
+test bare_double_dash_is_unrecognized_exit_2 ... ok
+test windows_caps_daemon_launch_refuses_empty_allowlist ... ok
+test windows_caps_allowlist_that_normalizes_empty_is_rejected ... ok
+test windows_caps_support_env_allowlist_is_com250 ... ok
+test windows_caps_explicit_missing_config_does_not_fall_back_to_allowlist ... ok
+test unknown_arg_exit_2_usage ... ok
+test second_daemon_same_lock_exits_2_with_stderr ... ok
+test unreadable_state_json_exits_3_and_releases_lock ... ok
+test unreadable_config_env_allowlist_wins ... ok
+test unreadable_config_non_isolated_unchanged ... ok
+test serialwrap_config_env_read_and_write_target ... ok
+test windows_caps_isolated_env_uses_unique_loopback_tcp_endpoints ... ok
+test windows_default_allowlist_health_has_no_dynamic_sessions ... ok
+test sigterm_graceful_exit_0_and_flushes_queue ... ok
+test unwritable_state_dir_startup_save_exits_1_before_attach ... ok
+test unreadable_config_isolated_fail_closed ... ok
+test wal_dir_readonly_at_start_blocks_login_probe ... ok
+test shutdown_with_stalled_drain_exits_1_with_diagnostic ... ok
+test startup_order_scan_rank_watch ... ok
+test daemon_stop_from_second_connection_during_force_recover ... ok
+test shutdown_releases_tty_before_exit ... ok
+test non_root_holder_scan_permission_does_not_block_open ... ok
+test wal_fault_after_ready_splits_agent_and_auto_tx ... ok
+test real_sigterm_to_started_daemon_exits_0_after_flush ... ok
+test daemon_stop_during_force_recover_with_client_gone ... ok
+test release_kill_hook_env_isolated_only ... ok
+test sigterm_sigint_orderly_stop ... ok
+test release_pause_hook_env_isolated_only ... ok
+
+test result: ok. 43 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 31.12s
+
+     Running tests/deferred_methods.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/deferred_methods-e6c7cf199b755ea0)
+
+running 2 tests
+test deferred_methods_excludes_delivered_slices ... ok
+test deferred_methods_only_reads_deferred_section ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/dispatch.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/dispatch-5699d6686b3add0d)
+
+running 211 tests
+test cap_posix_pty__wp59_attach_health_shape ... ignored, cap:posix_pty
+test activity_selector_chain_session_id ... ok
+test deferred_methods_return_method_not_found_without_side_effects ... ok
+test alias_assign_shape ... ok
+test alias_set_empty_alias_allowed ... ok
+test device_release_and_attach_require_selector ... ok
+test command_cancel_queued_command ... ok
+test activity_without_selector_invalid_args ... ok
+test command_result_tail_unknown_and_invalid ... ok
+test df23_rpc_release_during_login_then_attach_returns_ready ... ok
+test get_state_empty_selector_session_not_found ... ok
+test device_list_sorted_by_by_id ... ok
+test device_release_reason_is_raw_json ... ok
+test gpx_rpc_clear_during_birth_takeover_reattaches_after_close ... ok
+test command_submit_line_mode_wrapped_echo_end_to_end ... ok
+test gpx_rpc_device_attach_during_reboot_recovery_already_attached ... ok
+test device_attach_force_string_false_is_truthy ... ok
+test gpx_rpc_session_attach_during_attach_inflight_returns_ok_session ... ok
+test gpb_command_submit_reaches_uart_and_wal ... ok
+test gpx_rpc_recover_huge_timeout_keeps_side_lane ... ok
+test gpx_rpc_self_test_huge_timeout_keeps_side_lane ... ok
+test health_status_key_order_and_limits ... ok
+test health_ping_pong ... ok
+test contract_coverage_alias_unassign_pin_unpin_rpc_routes ... ok
+test health_status_foreign_holders_holder_unknown_object ... ok
+test health_status_templates_only_with_device_warns_no_profiles ... ok
+test interactive_open_unknown_selector_session_not_ready ... ok
+test df25_interactive_cancel_preserves_lease ... ok
+test df25_cancel_queued_interactive_zero_tx ... ok
+test log_tail_raw_empty_from_seq_invalid_args ... ok
+test health_status_allowlist_after_multi_open_detail ... ok
+test log_tail_raw_latest_mode_keys ... ok
+test interactive_status_routes_by_interactive_id ... ok
+test log_tail_text_limit_zero_means_200 ... ok
+test health_status_no_devices_warnings_order ... ok
+test mcu_patterns_exact ... ok
+test log_tail_unknown_selector_returns_state_error ... ok
+test log_tail_raw_wal_missing_shape ... ok
+test health_status_holders_status_permission ... ok
+test mcu_status_shape ... ok
+test ready_unconfirmed_response_has_session_field ... ok
+test result_tail_without_cmd_id_is_legacy_wal_tail ... ok
+test result_tail_stale_owner_finds_capture_in_other_session ... ok
+test df24_rpc_session_list_completes_during_force_recover ... ok
+test submit_bad_timeout_raises_before_selector_check ... ok
+test submit_empty_completion_regex_rejected_before_selector ... ok
+test self_test_strict_human_lock_yes_is_coerced_true ... ok
+test self_test_unknown_selector_has_lease_context_and_command_capable ... ok
+test session_list_sorted_by_session_id ... ok
+test submit_unknown_selector_session_not_found ... ok
+test submit_without_selector_invalid_args ... ok
+test wal_current_seq_shape ... ok
+test submit_expected_duration_zero_is_float_not_none ... ok
+test submit_priority_zero_becomes_ten ... ok
+test health_status_multi_open_two_daemons ... ok
+test wal_range_keys_without_truncated ... ok
+test unknown_method_not_found ... ok
+test wal_range_non_int_from_seq_raises ... ok
+test wal_reset_shape ... ok
+test wp510_b_bind_placeholder_precedes_inflight_cancellation ... ok
+test wp510_review4_rpc_attach_from_released_stamps_last_state_change_at ... ok
+test health_status_scan_failure_shape ... ok
+test wp510_review4_rpc_release_cancel_persist_enospc_returns_error_then_retries ... ok
+test wp510_review5_rpc_handoff_worker_spawn_failure_returns_exception ... ok
+test wp510_review4_rpc_release_cancel_fills_null_release_metadata_and_persists ... ok
+test wp510_review7_hotplug_after_retirement_enospc_closes_preopened_handle ... ok
+test health_status_unsupported_process_scan_matches_python_windows_shape ... ok
+test wp510_review7_rpc_bind_after_retirement_enospc_adopts_preopened_handle ... ok
+test wp510_review7_rpc_confirmed_close_allows_reopen ... ok
+test wp510_review7_rpc_retirement_enospc_next_save_persists_retirement ... ok
+test wp510_b_bind_placeholder_has_no_side_effects ... ok
+test wp510_review10_rpc_release_after_revoked_bridge_open_reported_completes ... ok
+test wp510_review7_rpc_spawn_after_retirement_enospc_adopts_preopened_handle ... ok
+test wp510_review7_rpc_oserror_handoff_retirement_enospc_does_not_roll_back ... ok
+test gpx_device_attach_open_failures_match_python_wire ... ok
+test wp510_review7_shutdown_after_retirement_enospc_closes_preopened_handle ... ok
+test watcher_delta_rebind_is_visible_through_service_rpc ... ok
+test wp510_review8_rpc_bind_retry_after_double_enospc_closes_parked_handle ... ok
+test wp510_review8_rpc_bind_retry_after_double_enospc_from_ready_closes_parked_handle ... ok
+test wp510_review7_hotplug_after_unconfirmed_close_does_not_reopen ... ok
+test wp510_review10_rpc_second_release_waits_handoff_close_in_progress ... ok
+test wp510_review7_rpc_device_attach_after_unconfirmed_close_returns_session_recovering ... ok
+test wp510_review9_rpc_rebind_before_bind_device_online_closes_adopted_handle ... ok
+test wp510_review9_rpc_release_before_bind_device_online_closes_adopted_handle ... ok
+test wp510_review9_rpc_shutdown_before_bind_device_online_close_unconfirmed_reports_stalled ... ok
+test wp510_review7_rpc_session_attach_after_unconfirmed_close_does_not_reopen ... ok
+test wp510_review7_rpc_session_clear_after_unconfirmed_close_does_not_reopen ... ok
+test wp510_review7_rpc_bind_to_unconfirmed_close_by_id_does_not_reopen ... ok
+test wp510_review7_rpc_session_recover_after_unconfirmed_close_does_not_reopen ... ok
+test wp510_rpc_alias_set_racing_placeholder_retirement_returns_session_not_found ... ok
+test wp510_review8_rpc_bind_retry_parked_close_unconfirmed_keeps_block ... ok
+test wp510_review9_rpc_release_before_bridge_takes_dynamic_handoff_closes_without_reopen ... ok
+test wp510_review9_rpc_release_with_parked_handle_of_bound_session_closes_it ... ok
+test wp510_rpc_bind_then_device_attach_replaces_placeholder ... ok
+test wp510_review9_rpc_shutdown_before_bind_device_online_closes_adopted_handle ... ok
+test wp510_rpc_shutdown_before_placeholder_probe_submit_sends_zero_tx ... ok
+test wp510_rpc_placeholder_retirement_enospc_stops_handoff ... ok
+test wp510r_i20_rpc_query_and_release_while_reaper_held_close_paused ... ok
+test wp510_rpc_general_oserror_handoff_with_and_without_fallback ... ok
+test wp510_rpc_release_cancels_inflight_placeholder_attach ... ok
+test wp510r_i20_r2_rpc_release_waits_for_unoffered_close_receipt ... ok
+test gpx_rpc_reprobe_skipped_while_human_types ... ok
+test wp510_review5_rpc_shutdown_before_bridge_takes_preopened_fail_close_reports_stalled ... ok
+test wp510r_i21_rpc_bind_release_bridged_before_deadlines ... ok
+test wp510r_i21_rpc_bind_bridged_waits_close_then_applies ... ok
+test wp510r_i22_rpc_shutdown_token_epoch_window_waits_successful_close ... ok
+test wp510r_i23_rpc_offline_invalid_retire_terminal_full_poll_completes_attach ... ok
+test wp510r_i24_rpc_observer_duplicate_attach_keeps_hotplug_bridge ... ok
+test wp510r_i24_rpc_observer_hotplug_without_duplicate_keeps_bridge ... ok
+test wp510r_i24_rpc_observer_then_release_still_waits_close_receipt ... ok
+test wp510r_i24_rpc_plain_bridged_release_waits_receipt ... ok
+test wp510_rpc_placeholder_offline_and_held_remain_blocked ... ok
+test wp510r_i24_rpc_watcher_closing_retire_release_waits_success ... ok
+test wp510r_m16_device_attach_claims_parked_custody_token ... ok
+test df27_rpc_post_login_timeout_rejects_zero_tx_then_reprobes_ready ... ok
+test wp510r_r3_rpc_bind_retired_close_failure_reports_recovering_stalled ... ok
+test wp510_review10_rpc_release_timeout_then_late_redetect_finish_completes_release ... ok
+test wp510r_r3_rpc_g3_release_waiting_custody_sets_recovering ... ok
+test wp510_review10_rpc_releases_drain_stalled_while_handoff_close_blocked ... ok
+test wp510r_r3_rpc_bind_waits_retired_receipt_then_rebinds ... ok
+test wp510r_r3_rpc_dr4_retired_drain_blocks_attach_and_shutdown_until_receipt ... ok
+test wp510r_i22_rpc_shutdown_token_epoch_window_reports_blocked_close ... ok
+test wp510_review11_rpc_release_timeout_keeps_revoke_until_bridge_open_reports ... ok
+test wp510_review11_rpc_release_timeout_late_close_before_bridge_open_keeps_revoke ... ok
+test wp510r_r3_rpc_p8_7bb9935_recover_before_bind_device_online_uses_held_handle ... ok
+test wp510_review6_rpc_finish_attach_op_race_keeps_unconfirmed_close_blocking ... ok
+test wp510_review12_rpc_release_waits_retired_bridge_close_after_bind_stall ... ok
+test wp510_review9_rpc_release_before_bind_device_online_close_unconfirmed_drain_stalled ... ok
+test wp510_rpc_failed_close_keeps_placeholder_drain_stalled ... ok
+test wp510_rpc_open_error_after_release_settles_without_handle ... ok
+test wp510r_r5_rpc_p8_19df186_1_release_after_retirement_returns_not_found ... ok
+test wp510r_i21_rpc_bind_bridged_timeout_cancels_late_login ... ok
+test wp510r_i21_rpc_bind_release_bridged_after_both_deadlines ... ok
+test wp510r_r5_rpc_p8_3786805_1_force_open_held_echoes_original_selector ... ok
+test wp510r_i21_rpc_own_custody_terminal_full_poll_completes_release ... ok
+test wp510r_i15_rpc_release_triggered_parked_close_failure_waits_first_deadline ... ok
+test wp510r_r5_rpc_p8_a07fdfb_1_device_cancel_then_oserror_keeps_placeholder ... ok
+test wp510r_r5_rpc_p8_a07fdfb_1_retarget_and_back_before_oserror_retire_keeps_placeholder ... ok
+test wp510r_r5_rpc_wp1_1_release_during_placeholder_open_waits_ledger_close ... ok
+test wp510r_r6_rpc_dr5_c_release_rejected_under_handoff_freeze_parked_closed_by_shutdown ... ok
+test wp510r_i24_rpc_watcher_closing_retire_release_failure_keeps_first_deadline ... ok
+test wp510r_i24_rpc_watcher_closing_retire_release_times_out_then_converges ... ok
+test wp510r_r3_rpc_wp5_1_shutdown_pre_take_close_failure_not_drained ... ok
+test wp51_submit_failure_has_no_source_annotations ... ok
+test wp51_interactive_owner_policy ... ok
+test wp51_submit_normalized_source_reaches_registry ... ok
+test wp51_release_source_policy ... ok
+test wp51_submit_reserved_source_rejected_before_queue ... ok
+test wp510_review12_rpc_release_retired_bridge_close_failure_reports_drain_stalled ... ok
+test wp51_submit_success_source_annotations ... ok
+test wp51_source_policy_end_to_end ... ok
+test wp52_default_expect_reboot_flows_through_rpc_record_and_get ... ok
+test wp52_rpc_expect_reboot_interactive_rejected ... ok
+test wp52_rpc_expect_reboot_false_interactive_allowed ... ok
+test wp510r_r3_rpc_release_retired_failure_waits_first_deadline ... ok
+test wp510r_r3_rpc_p8_fdc1413_configure_close_failure_release_t1 ... ok
+test wp510r_i15_rpc_p8_990a04b_1_releases_queued_during_actor_pause_after_parked_close ... ok
+test wp510r_r4_rpc_p8_e25b69c_2_redetect_release_stall_ledger_then_released ... ok
+test wp510r_r3_rpc_p8_14fe592_commit_cancel_release_close_ok ... ok
+test wp510r_i25_rpc_late_delivery_registration_cannot_revert_current_path ... ok
+test wp510r_r3_rpc_p8_8463b22_release_stall_then_close_first ... ok
+test wp510r_r3_rpc_p8_8463b22_release_stall_then_open_job_first ... ok
+test wp54_chained_warning_is_omitted_for_interactive_mode ... ok
+test wp52_end_to_end_flag_record_and_echo ... ok
+test wp54_chained_warning_is_nonfatal_and_reaches_uart ... ok
+test wp54_chained_warning_is_omitted_when_flagged ... ok
+test wp510r_r6_rpc_late_release_completion_survives_shutdown_freeze ... ok
+test gpx_rpc_bind_timeout_then_replug_persists_binding ... ok
+test wp54_chained_warning_keeps_length_warning_first ... ok
+test wp53_rpc_passthrough_flag_followup_tx_not_gated ... ok
+test wp53_rpc_passthrough_flag_route_and_followup_tx ... ok
+test wp510r_r6_rpc_snapshot_query_timeout_preserves_late_release_completion ... ok
+test wp53_rpc_flag_routes_chained_command_to_reboot ... ok
+test wp510r_r6_rpc_late_release_retry_wait_uses_first_deadline ... ok
+test wp510r_r6_rpc_late_release_uses_snapshot_when_first_stall_reply_pending ... ok
+test wp57_every_rpc_response_carries_available_fingerprint ... ok
+test wp57_rpc_reuses_startup_fingerprint_without_recomputing ... ok
+test wp57_status_carries_fingerprint_and_code_path ... ok
+test wp510r_r6_rpc_p8_add3ca0_1_release_stalled_on_parked_unplug_close_completes_late ... ok
+test wp57_unknown_fingerprint_is_null_in_status_and_omitted_from_rpc ... ok
+test wp510r_r6_rpc_late_release_snapshot_is_invalidated_by_bind ... ok
+test wp55_rpc_bare_human_bypasses_quiet ... ok
+test wp52_end_to_end_falsy_flag_not_echoed ... ok
+test wp58_rpc_device_attach_during_clear_drain_returns_session_recovering ... ok
+test wp52_rpc_expect_reboot_validation_order ... ok
+test wp58_rpc_device_attach_during_release_returns_session_recovering ... ok
+test wp510r_r6_rpc_p8_add3ca0_1_release_late_close_retries_when_safety_lane_full ... ok
+test wp58_g13_rpc_device_attach_during_login_returns_ok_session ... ok
+test wp58_g14_rpc_clear_ready_with_device_returns_null_last_error ... ok
+test wp58_g11_rpc_failed_interactive_submit_releases_lease ... ok
+test wp58_g12_cancel_before_interactive_submit_zero_tx ... ok
+test wp58_g12_original_cancel_does_not_poison_lease_sends ... ok
+test wp52_rpc_expect_reboot_invalid_type_zero_tx ... ok
+test wp61_rpc_system_recover_rejected_without_effects ... ok
+test wp73_rpc_reboot_clears_rx_for_console_unlock_service_rig ... ok
+test wp53_rpc_flag_route_wal_and_followup_gate ... ok
+test wp53_rpc_flag_arms_reconfirm_and_gates_next_command ... ok
+test wp510r_r3_rpc_p8_14fe592_commit_cancel_release_close_failure_t1 ... ok
+test wp58_g15_rpc_release_refreshes_detached_at_and_resets_reprobe ... ok
+test wp61_rpc_unknown_prefix_timeout_uses_agent_recovery ... ok
+test wp53_rpc_flag_prompt_wait_uses_timeout_and_expected_duration ... ok
+test wp56_rpc_async_reboot_evidence_wait ... ok
+test wp55_rpc_queued_source_trust ... ok
+test wp55_rpc_explicit_human_and_agent_are_gated ... ok
+test wp510r_i25_rpc_timed_out_bind_late_completion_allows_replug ... ok
+test wp510r_i25_rpc_timed_out_bind_late_completion_allows_retry ... ok
+test wp56_rpc_async_reboot_holds_confirm_until_grace ... ok
+test wp61_rpc_bare_human_timeout_promotes_without_keys ... ok
+test wp61_rpc_explicit_human_cli_timeout_uses_agent_recovery ... ok
+test wp61_rpc_injected_trusted_human_param_cannot_authorize_explicit_human ... ok
+test wp52_end_to_end_flag_does_not_bypass_submit_gates ... ok
+
+test result: ok. 210 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 11.44s
+
+     Running tests/event_lifecycle.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/event_lifecycle-19756a5cca0d2807)
+
+running 4 tests
+test engine_started_before_bootstrap_attach ... ok
+test bridge_queries_reflect_manager_state ... ok
+test shutdown_aborts_long_handler_within_budget ... ok
+test shutdown_closes_event_intake_before_drain_behavior ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.34s
+
+     Running tests/event_rpc.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/event_rpc-b8f60ae9e86e9820)
+
+running 7 tests
+test event_methods_without_engine_are_method_not_found ... ok
+test event_methods_served_not_method_not_found_and_not_retryable ... ok
+test rule_set_invalid_schema_and_type_error ... ok
+test rule_set_response_spreads_raw_with_ok_first ... ok
+test rule_delete_get_list_and_not_found ... ok
+test com_toggle_status_reset_reload_tail ... ok
+test event_rpc_does_not_block_other_sessions ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s
+
+     Running tests/file_transfer_rpc.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/file_transfer_rpc-46c2bedacb4b394d)
+
+running 6 tests
+test file_rpc_rejected_during_boot_quiet_returns_autoboot_quiet_zero_tx ... ok
+test file_rpc_rejections_have_no_side_effects ... ok
+test session_log_dir_create_error_matches_python_via_rpc ... ok
+test file_pull_local_write_error_matches_python_via_rpc ... ok
+test file_push_and_pull_rpc_end_to_end ... ok
+test file_pull_over_rx_window_succeeds_od80_df26 ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.48s
+
+     Running tests/framing.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/framing-978ba9daa8d317d1)
+
+running 20 tests
+test deep_json_closes_connection ... ok
+test handler_panic_is_exception ... ok
+test daemon_stop_calls_request_stop_and_continues_reading ... ok
+test pipelined_requests_answer_in_order ... ok
+test crlf_line_limit_counts_carriage_return ... ok
+test trailing_line_without_newline_at_eof_is_processed ... ok
+test over_limit_partial_line_closes_before_newline ... ok
+test over_limit_line_closes_without_reply ... ok
+test framing_byte_table ... ok
+test stop_accept_does_not_wait_for_handlers ... ok
+test client_disconnect_does_not_cancel_handler ... ok
+test idle_connection_does_not_block_stop ... ok
+test join_handlers_returns_running_methods_at_deadline ... ok
+test connection_cap_128_pauses_accept ... ok
+test pipelined_stop_after_long_call ... ok
+test stop_waits_for_in_handler_connection ... ok
+test rpc_accept_paused_at_128_connections ... ok
+test half_line_and_unread_response_do_not_block_stop ... ok
+test stop_bounds_total_write_time_with_trickle_reader ... ok
+test slow_reader_large_response_is_not_truncated ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.64s
+
+     Running tests/handoff_stop.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/handoff_stop-c11190ddf88ce066)
+
+running 23 tests
+test handoff_stop_freezes_custody_deliverer_gate ... ok
+test handoff_flash_races_prepare_probe_first ... ok
+test handoff_frozen_response_carries_startup_fingerprint ... ok
+test handoff_service_push_ticket_blocks_until_done ... ok
+test handoff_frozen_rejects_mutating_methods ... ok
+test handoff_busy_while_rpc_command_outstanding ... ok
+test handoff_file_push_ticket_survives_rpc_timeout ... ok
+test handoff_session_query_timeout_preserves_lease_ticket ... ok
+test handoff_flash_races_prepare_handoff_first ... ok
+test handoff_rollback_preserves_shutdown_freeze ... ok
+test handoff_busy_lease_and_recovering ... ok
+test handoff_file_push_ticket_survives_human_replay ... ok
+test frozen_submit_validation_errors_precede_admission ... ok
+test handoff_tx_fence_timeout_thaws_without_stop ... ok
+test auto_reprobe_ready_result_survives_failed_handoff_tx_fence ... ok
+test handoff_reason_supervision_set_same_semantics ... ok
+test default_cli_update_scope_cannot_bypass_foreign_daemon ... ok
+test handoff_ok_then_sc11_stop_order ... ok
+test handoff_file_push_after_last_probe ... ok
+test handoff_drain_window_background_triggers_zero_tx ... ok
+test handoff_then_successor_never_double_held ... ok
+test shutdown_during_force_recover_poll_finishes_handler_and_exits_zero ... ok
+test handoff_flash_races_prepare ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 39.28s
+
+     Running tests/health_multi_open_p7.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/health_multi_open_p7-3bd6a0184cbf373a)
+
+running 1 test
+test health_status_vanished_tty_holders_status_ok_like_detect_multi_open ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests/launcher.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/launcher-652e2b77b103381d)
+
+running 18 tests
+test cap_windows_native__launcher_gui_subsystem ... ignored, 原生 Windows 專用（PE Subsystem 與無 console 啟動）；由 windows_native capability gate 執行
+test cap_windows_native__launcher_parent_kill_kills_child ... ignored, 原生 Windows 專用（Job Object kill-on-close）；由 windows_native capability gate 執行
+test launcher_argv_matches_multi_open_rule2 ... ok
+test launcher_argv_preserves_shell_argument_containing_slash ... ok
+test launcher_argv_python_entry_absolute_and_tail_preserved ... ok
+test launcher_rejects_bare_program_that_would_search_path ... ok
+test manifest_absent_false_when_manifest_unreadable ... ok
+test manifest_absent_false_when_pointer_exists_but_target_missing ... ok
+test manifest_absent_true_only_for_dev_build_without_pointer_or_manifest ... ok
+test manifest_absent_false_when_manifest_present_for_python_and_rust ... ok
+test dispatch_to_rust_daemon_for_dev_build_and_rust_manifest ... ok
+test executable_file_busy_retries_until_spawn_succeeds ... ok
+test launcher_manifest_errors_do_not_expose_debug_variant ... ok
+test launcher_posix_exec_replaces_process ... ok
+test launcher_rejects_rust_implementation_in_stage1 ... ok
+test launcher_current_release_pointer_selects_version_manifest ... ok
+test launcher_process_start_error_names_program_without_manifest_label ... ok
+test launcher_exit_code_passthrough ... ok
+
+test result: ok. 16 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests/mcu_rpc.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/mcu_rpc-c0ca3f188d40b5e2)
+
+running 10 tests
+test daemon_start_failure_of_flash_endpoint_exits_1 ... ok
+test daemon_ttymcu_path_env_override ... ok
+test daemon_starts_ttymcu_after_bootstrap ... ok
+test mcu_status_idle_no_sessions ... ok
+test mcu_patterns_matches_python_golden ... ok
+test mcu_status_candidates_order_and_read_only ... ok
+test mcu_status_last_detect_shape_after_matched ... ok
+test mcu_status_flashing_false_without_endpoint ... ok
+test ttymcu_unlinked_after_daemon_exit_all_paths ... ok
+test mcu_status_flashing_true_during_probe ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running tests/restart_after_commit.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/restart_after_commit-202d27e76a901a18)
+
+running 2 tests
+
+running 1 test
+
+running 1 test
+serialwrap: 無法確認 /dev/pts/21 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥serialwrap: 無法確認 /dev/pts/20 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+
+test kill_before_commit_restores_previous_state ... ok
+test kill_between_commit_and_reply_keeps_released_after_restart ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.76s
+
+     Running tests/rpc_console.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/rpc_console-1b5fee9701c75994)
+
+running 48 tests
+test attach_invalid_args ... ok
+test attach_selector_alias_chain ... ok
+test attach_request_timeout_closes_pty ... ok
+test attach_rejected_discards_pty ... ok
+test attach_tcp_shape ... ok
+test attach_selector_com_chain ... ok
+test detach_ok_closes_own_lease ... ok
+test detach_missing_client_id ... ok
+test attach_not_ready_states ... ok
+test attach_not_ready_detached_and_released ... ok
+test attach_pty_shape_second ... ok
+test attach_interactive_owner_false_when_fg_busy ... ok
+test attach_then_status_has_no_false_not_found ... ok
+test detach_unknown_client ... ok
+test bridge_creates_internal_primary_sentinel ... ok
+test attach_pty_shape_first ... ok
+test console_methods_no_longer_deferred ... ok
+test attach_label_falsy_uses_client_id ... ok
+test attach_label_coerced ... ok
+test console_input_reaches_uart_and_rx_fans_out ... ok
+test detach_unknown_client_still_closes_own_lease ... ok
+test status_not_in_retry_whitelist ... ok
+test consoles_survive_bridge_rebuild ... ok
+test interactive_open_not_ready_keeps_raw_selector ... ok
+test interactive_open_scans_peers_before_refresh ... ok
+test list_and_detach_without_bridge ... ok
+test list_prunes_stale_without_peer ... ok
+test list_sorted_by_label_then_id ... ok
+test open_allow_attached_string_false_is_truthy ... ok
+test open_timeout_zero_uses_default ... ok
+test open_coercion_float_error_before_invalid_args ... ok
+test session_public_console_fields_tcp ... ok
+test send_routes_by_lease_index ... ok
+test session_public_console_fields_pty ... ok
+test session_public_vtty_is_cached ... ok
+test tcp_client_accept_gets_raw_owner_and_greeting ... ok
+test tcp_release_clears_console_endpoint ... ok
+test status_screen_chars_coerced_and_negative ... ok
+test console_attach_rescans_peers_before_refresh ... ok
+test tcp_listener_ephemeral_per_bridge ... ok
+test second_console_local_echo_reaches_its_console ... ok
+test attach_interactive_owner_false_during_replay_hold ... ok
+test unknown_selector_shapes ... ok
+test soft_preempt_replays_when_peer_appears_later ... ok
+test overlapping_self_tests_replay_human_input_end_to_end ... ok
+test tcp_release_stops_listener_accepting ... ok
+test df20_send_with_pre_recover_or_reboot_id_not_found_zero_tx ... ok
+test od37_send_with_pre_release_id_after_reattach_not_found_zero_tx ... ok
+
+test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s
+
+     Running tests/self_test_safety.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/self_test_safety-1efb440c1034d32c)
+
+running 6 tests
+test rpc_newline_prefixed_prompt_after_marker_confirms_ready ... ok
+test rpc_probe_evidence_preserves_each_boolean ... ok
+test rpc_echo_only_target_remains_unconfirmed ... ok
+test rpc_probe_and_submit_have_deterministic_order ... ok
+test rpc_probe_evidence_reports_failure_scenarios_and_pending_state ... ok
+test rpc_self_test_busy_has_zero_probe_tx ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.36s
+
+     Running tests/serial_console_excludes.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/serial_console_excludes-8c7d8157eb7bcff1)
+
+running 3 tests
+test serial_console_ignored_on_posix ... ok
+test serial_console_ports_excluded ... ok
+test serial_console_bad_shape_ignored ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/session_rpc_p7.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/session_rpc_p7-0be081ab4bebbb97)
+
+running 9 tests
+test attach_passthrough_attached_ok_no_probe ... ok
+test attach_credentials_unresolved_last_error_field ... ok
+test session_public_fields_p7 ... ok
+test self_test_invalid_args_has_no_command_capable ... ok
+test attach_resets_credentials_warned ... ok
+test log_rpcs_shapes ... ok
+test self_test_not_found_has_lease_ctx_and_command_capable_false ... ok
+test self_test_bad_timeout_before_selector_is_exception ... ok
+test recover_force_string_false_is_true ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.85s
+
+     Running tests/shutdown_order.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/shutdown_order-6027a46500e11dd5)
+
+running 15 tests
+test second_sigterm_changes_nothing ... ok
+test engine_stop_before_wal_close ... ok
+test order_is_exactly_1_to_7 ... ok
+test shutdown_inflight_self_test_is_flushed_within_stop_cap ... ok
+test long_file_push_does_not_block_stop ... ok
+test shutdown_gate_waits_for_open_transfer_line ... ok
+test shutdown_hotplug_after_phase1_never_opens_uart ... ok
+test shutdown_inflight_attach_drained_before_wal_close ... ok
+test shutdown_gate_forces_freeze_after_line_settle_budget ... ok
+test flash_endpoint_stall_goes_to_incomplete_and_exit_1 ... ok
+test gpx_shutdown_window_starts_no_new_command_zero_tx ... ok
+test stopping_gate_before_watcher_stop ... ok
+test handlers_not_converged_lists_methods ... ok
+test multiple_failures_accumulate_in_stop_order ... ok
+test second_sigterm_real_signal_exits_0 ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.28s
+
+     Running tests/windows_console_native.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/windows_console_native-4ab733f50ee6bc2f)
+
+running 7 tests
+test cap_windows_com__serial_console_end_to_end ... ignored, cap:windows_com
+test gpx_release_then_reattach_reopens_com0com_console_exactly_once ... ok
+test telnet_second_client_line_mode ... ok
+test telnet_listener_ephemeral_per_bridge ... ok
+test telnet_hub_end_to_end_with_fake_serial ... ok
+test recover_queued_com0com_open_is_discarded_after_release ... ok
+test telnet_slow_client_bounded ... ok
+
+test result: ok. 6 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 3.17s
+
+     Running tests/wintask_staging_isolation.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/wintask_staging_isolation-c310d09680564b6b)
+
+running 5 tests
+test t13_staging_wal_hook_writes_verifiable_record_without_uart ... ok
+test staging_batch_env_makes_daemon_isolation_hold_and_allowlist_effective ... ok
+test without_staging_batch_daemon_rejects_allowlist ... ok
+test every_isolation_var_comes_from_the_batch ... ok
+test staging_config_parsed_by_daemon_excludes_registry_coms ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests sw_daemon
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

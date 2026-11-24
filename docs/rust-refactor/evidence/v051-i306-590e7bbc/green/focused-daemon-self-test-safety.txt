@@ -1,0 +1,14 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running tests/self_test_safety.rs (/home/paul_chen/.cache/serialwrap-cargo/v051-i306/debug/deps/self_test_safety-1efb440c1034d32c)
+
+running 6 tests
+UART_TX="( echo __READY__367ed2c0 ) && printf '\\n__SW_ST_%s_OK__\\n' '367ed2c0'\n"
+test rpc_echo_only_target_remains_unconfirmed ... ok
+test rpc_probe_evidence_preserves_each_boolean ... ok
+test rpc_newline_prefixed_prompt_after_marker_confirms_ready ... ok
+test rpc_probe_and_submit_have_deterministic_order ... ok
+test rpc_probe_evidence_reports_failure_scenarios_and_pending_state ... ok
+test rpc_self_test_busy_has_zero_probe_tx ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.36s
+
