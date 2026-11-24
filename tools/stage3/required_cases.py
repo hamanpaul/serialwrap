@@ -410,8 +410,11 @@ def _validate_initial_exit_catalog(catalog: Mapping[str, Any]) -> list[str]:
             platforms = _applicable_platforms(item)
         except ValueError:
             platforms = ()
+        # 核定平台是下限：既有初始出口可擴充平台（例如 linux→both），但不得刪除或替換原平台。
+        missing_platforms = sorted(set(attributes["platforms"]) - set(platforms))
+        if missing_platforms:
+            errors.append(f"核定初始出口不得移除平台：{item_id}/{','.join(missing_platforms)}")
         checks = {
-            "platforms": platforms,
             "layer": item.get("layer"),
             "required_case_set": item.get("required_case_set"),
             "required_families": (
