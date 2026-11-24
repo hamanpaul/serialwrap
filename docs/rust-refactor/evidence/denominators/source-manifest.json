@@ -1,36 +1,4 @@
 {
-  "initial_exit_platforms": [
-    {
-      "item_id": "S3-L15-RELEASE-AB-LINUX",
-      "layer": "L1.5",
-      "platform": "linux"
-    },
-    {
-      "item_id": "S3-L15-RELEASE-AB-WINDOWS",
-      "layer": "L1.5",
-      "platform": "windows"
-    },
-    {
-      "item_id": "S3-L2-AB-WINDOWS",
-      "layer": "L2",
-      "platform": "windows"
-    },
-    {
-      "item_id": "S3-L2-FULL-AB-LINUX",
-      "layer": "L2",
-      "platform": "linux"
-    },
-    {
-      "item_id": "S3-L3-P0P1-REMOTE-LINUX",
-      "layer": "L3",
-      "platform": "linux"
-    },
-    {
-      "item_id": "S3-L3-P0P1-REMOTE-WINDOWS",
-      "layer": "L3",
-      "platform": "windows"
-    }
-  ],
   "schema_version": 1,
   "sources": [
     {

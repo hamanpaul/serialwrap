@@ -517,19 +517,6 @@ def _copy_seed_evidence(destination: Path) -> None:
         (target / name).write_bytes((DENOMINATORS / name).read_bytes())
 
 
-def _exit_platform_manifest(lock: dict, catalog: dict) -> list[dict[str, str]]:
-    catalog_by_id = {item["item_id"]: item for item in catalog["items"]}
-    entries = []
-    for item_id, platforms in lock["exits"].items():
-        item = catalog_by_id[item_id]
-        applicable = ("linux", "windows") if item["platform"] == "both" else (item["platform"],)
-        for platform, detail in platforms.items():
-            assert platform in applicable
-            assert detail["layer"] == item["layer"]
-            entries.append({"item_id": item_id, "platform": platform, "layer": detail["layer"]})
-    return sorted(entries, key=lambda entry: (entry["item_id"], entry["platform"], entry["layer"]))
-
-
 def test_public_seed_at_designated_revision_accepted():
     from tools.stage3 import required_cases
 
@@ -582,16 +569,6 @@ def test_public_seed_rejects_disguised_runtime_data(tmp_path):
     assert errors
 
 
-STAGE3_REQUIRED_EXIT_SPECS = (
-    ("S3-L15-RELEASE-AB-LINUX", "linux", "L1.5", None),
-    ("S3-L15-RELEASE-AB-WINDOWS", "windows", "L1.5", None),
-    ("S3-L2-FULL-AB-LINUX", "linux", "L2", None),
-    ("S3-L2-AB-WINDOWS", "windows", "L2", None),
-    ("S3-L3-P0P1-REMOTE-LINUX", "linux", "L3", ("P0", "P1", "remote", "WIN")),
-    ("S3-L3-P0P1-REMOTE-WINDOWS", "windows", "L3", ("P0", "P1", "remote", "WIN")),
-)
-
-
 def _seed_required_case_ids(case_doc: dict, case_lock: dict, layer: str, platform: str,
                             required_families: tuple[str, ...] | None) -> set[str]:
     by_id = {case["case_id"]: case for case in case_doc["cases"]}
@@ -609,43 +586,15 @@ def _seed_required_case_ids(case_doc: dict, case_lock: dict, layer: str, platfor
 
 
 def _required_cases_repo(tmp_path: Path) -> tuple[Path, object]:
-    import yaml
-
     root = tmp_path / "checkout"
     acceptance = root / "tests" / "acceptance"
     acceptance.mkdir(parents=True)
     (acceptance / "cases.yaml").write_bytes((DENOMINATORS / "cases.yaml").read_bytes())
     (acceptance / "cases.lock.json").write_bytes((DENOMINATORS / "cases.lock.json").read_bytes())
+    (acceptance / "stage_exits.json").write_bytes((ACC / "stage_exits.json").read_bytes())
     initial_lock = (ACC / "stage3_required_cases.lock.json").read_bytes()
     (acceptance / "stage3_required_cases.lock.json").write_bytes(initial_lock)
-
-    items = []
-    for item_id, platform, layer, families in STAGE3_REQUIRED_EXIT_SPECS:
-        items.append({
-            "item_id": item_id,
-            "stage": "3",
-            "platform": platform,
-            "layer": layer,
-            "title": item_id,
-            "spec_ref": "§11.6",
-            "owner_blocked": layer != "L1.5",
-            "candidate_longrun": False,
-            "evidence_kind": "realhw-report" if layer == "L3" else "ab-report",
-            "required_case_set": "slice_2.4",
-            "required_l1_set": None,
-            "release_requirement": "required",
-            "required_families": list(families) if families is not None else None,
-        })
-    catalog = {"schema_version": 3, "items": items}
-    (acceptance / "stage_exits.json").write_text(
-        json.dumps(catalog, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
-        encoding="utf-8",
-    )
     _copy_seed_evidence(root / "docs" / "rust-refactor" / "evidence")
-    manifest_path = root / "docs" / "rust-refactor" / "evidence" / "denominators" / "source-manifest.json"
-    manifest = _load(manifest_path)
-    manifest["initial_exit_platforms"] = _exit_platform_manifest(_load(acceptance / "stage3_required_cases.lock.json"), catalog)
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     original_sources = _seed_source_bytes()
     original_required_lock = initial_lock
 
@@ -659,37 +608,55 @@ def _required_cases_repo(tmp_path: Path) -> tuple[Path, object]:
     return root, source_reader
 
 
-def test_required_cases_seed_preserves_full_denominator():
+def _assert_required_cases_seed_preserves_full_denominator(root: Path, source_reader):
     from tools.stage3 import required_cases
     import yaml
 
-    lock = _load(ACC / "stage3_required_cases.lock.json")
-    cases = yaml.safe_load((DENOMINATORS / "cases.yaml").read_text(encoding="utf-8"))
-    case_lock = _load(DENOMINATORS / "cases.lock.json")
-    current_cases = yaml.safe_load((ACC / "cases.yaml").read_text(encoding="utf-8"))
-    current_case_lock = _load(ACC / "cases.lock.json")
-    catalog = _load(ACC / "stage_exits.json")
+    acceptance = root / "tests" / "acceptance"
+    evidence = root / "docs" / "rust-refactor" / "evidence"
+    denominators = evidence / "denominators"
+    lock = _load(acceptance / "stage3_required_cases.lock.json")
+    cases = yaml.safe_load((denominators / "cases.yaml").read_text(encoding="utf-8"))
+    case_lock = _load(denominators / "cases.lock.json")
+    current_cases = yaml.safe_load((acceptance / "cases.yaml").read_text(encoding="utf-8"))
+    current_case_lock = _load(acceptance / "cases.lock.json")
+    catalog = _load(acceptance / "stage_exits.json")
     assert lock["schema_version"] == 1
     assert lock["seed"]["revision"] == SEED_REVISION
     assert lock["seed"]["decision_ref"] == "OD-113"
     assert lock["seed"]["excluded_case_ids"] == ["lr-mixed"]
     assert lock["seed"]["cases"]["path"] == "denominators/cases.yaml"
-    assert lock["seed"]["cases"]["sha256"] == hashlib.sha256((DENOMINATORS / "cases.yaml").read_bytes()).hexdigest()
+    assert lock["seed"]["cases"]["sha256"] == hashlib.sha256((denominators / "cases.yaml").read_bytes()).hexdigest()
     assert lock["seed"]["case_lock"]["path"] == "denominators/cases.lock.json"
-    assert lock["seed"]["case_lock"]["sha256"] == hashlib.sha256((DENOMINATORS / "cases.lock.json").read_bytes()).hexdigest()
-    source_manifest = _load(DENOMINATORS / "source-manifest.json")
-    assert source_manifest["initial_exit_platforms"] == _exit_platform_manifest(
-        lock, _load(ACC / "stage_exits.json"),
-    )
-    seed_exit_ids = {item_id for item_id, _, _, _ in STAGE3_REQUIRED_EXIT_SPECS}
-    assert seed_exit_ids <= set(lock["exits"])
-    for item_id, platform, layer, families in STAGE3_REQUIRED_EXIT_SPECS:
-        assert platform in lock["exits"][item_id]
-        expected = _seed_required_case_ids(cases, case_lock, layer, platform, families)
-        actual = required_cases.required_for_exit(lock, item_id, platform)
-        assert expected <= actual
-        assert "lr-mixed" not in actual
-        assert actual
+    assert lock["seed"]["case_lock"]["sha256"] == hashlib.sha256((denominators / "cases.lock.json").read_bytes()).hexdigest()
+    source_manifest = _load(denominators / "source-manifest.json")
+    assert "initial_exit_platforms" not in source_manifest
+    assert required_cases.verify_seed_sources(source_manifest, evidence_root=evidence,
+                                              source_reader=source_reader) == []
+    assert required_cases._seed_family_errors(current_cases, evidence) == []
+
+    for layer in required_cases.STAGE3_CASE_EXIT_LAYERS:
+        for platform in ("linux", "windows"):
+            seed_ids = _seed_required_case_ids(cases, case_lock, layer, platform, None)
+            if not seed_ids:
+                continue
+            directory_items = [
+                item for item in catalog["items"]
+                if item.get("stage") == "3"
+                and item.get("release_requirement") == "required"
+                and item.get("required_case_set") == "slice_2.4"
+                and item.get("layer") == layer
+                and platform in (("linux", "windows") if item.get("platform") == "both"
+                                 else (item.get("platform"),))
+            ]
+            assert directory_items
+            actual = set()
+            for item in directory_items:
+                entry = lock["exits"].get(item["item_id"], {}).get(platform, {})
+                actual.update(entry.get("case_ids", []))
+            assert seed_ids <= actual
+            assert "lr-mixed" not in actual
+
     current_expected = required_cases._expected_exit_cases(catalog, current_cases, current_case_lock)
     assert {
         item_id: {platform: set(entry["case_ids"]) for platform, entry in platforms.items()}
@@ -698,6 +665,10 @@ def test_required_cases_seed_preserves_full_denominator():
         item_id: {platform: set(entry["case_ids"]) for platform, entry in platforms.items()}
         for item_id, platforms in current_expected.items()
     }
+
+
+def test_required_cases_seed_preserves_full_denominator():
+    _assert_required_cases_seed_preserves_full_denominator(ROOT, _injected_seed_reader)
 
 
 def _append_required_case(root: Path, case_id: str, *, family: str) -> dict:
@@ -872,12 +843,18 @@ def test_required_cases_add_only_rejects_invalid_candidate_shape(tmp_path, monke
     from tools.stage3 import required_cases
 
     root, source_reader = _required_cases_repo(tmp_path)
-    lock_path = root / "tests" / "acceptance" / "stage3_required_cases.lock.json"
-    lock = _load(lock_path)
-    # 留出一個尚未登記的目錄出口，讓 add-only 會建立候選鎖並進入第二次驗證。
-    removed_item = next(iter(lock["exits"]))
-    del lock["exits"][removed_item]
-    lock_path.write_text(json.dumps(lock, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    acceptance = root / "tests" / "acceptance"
+    lock_path = acceptance / "stage3_required_cases.lock.json"
+    # 新增不影響既有 seed 聯集的出口，讓 add-only 建立候選鎖並進入第二次驗證。
+    catalog_path = acceptance / "stage_exits.json"
+    catalog = _load(catalog_path)
+    added_exit = copy.deepcopy(next(
+        item for item in catalog["items"] if item["item_id"] == "S3-L3-P0P1-REMOTE-WINDOWS"
+    ))
+    added_exit["item_id"] = "S3-L3-P0P1-REMOTE-WINDOWS-SCHEMA-FIXTURE"
+    catalog["items"].append(added_exit)
+    catalog_path.write_text(json.dumps(catalog, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                            encoding="utf-8")
     before = lock_path.read_bytes()
 
     validate_lock = required_cases._validate_lock
@@ -1018,65 +995,13 @@ def test_required_cases_add_only_registers_new_platform(tmp_path):
 
 
 @pytest.mark.parametrize("mode", ["--check", "--add-only"])
-@pytest.mark.parametrize("shrink", ["exit", "platform"])
-def test_required_cases_commands_reject_initial_exit_platform_shrink_without_base_lock(
-    tmp_path, capsys, mode, shrink,
-):
-    from tools.stage3 import required_cases
-
-    root, source_reader = _required_cases_repo(tmp_path)
-    acceptance = root / "tests" / "acceptance"
-    manifest_path = root / "docs" / "rust-refactor" / "evidence" / "denominators" / "source-manifest.json"
-    manifest = _load(manifest_path)
-    initial = manifest["initial_exit_platforms"][0]
-    catalog_path = acceptance / "stage_exits.json"
-    catalog = _load(catalog_path)
-    lock_path = acceptance / "stage3_required_cases.lock.json"
-    lock = _load(lock_path)
-
-    if shrink == "exit":
-        catalog["items"] = [item for item in catalog["items"] if item["item_id"] != initial["item_id"]]
-        del lock["exits"][initial["item_id"]]
-    else:
-        target = next(item for item in catalog["items"] if item["item_id"] == initial["item_id"])
-        replacement = "windows" if initial["platform"] == "linux" else "linux"
-        sibling = next(
-            entry for item_id, platforms in lock["exits"].items()
-            if item_id != initial["item_id"]
-            for platform, entry in platforms.items()
-            if platform == replacement and entry["layer"] == initial["layer"]
-        )
-        target["platform"] = replacement
-        lock["exits"][initial["item_id"]] = {replacement: copy.deepcopy(sibling)}
-
-    catalog_path.write_text(json.dumps(catalog, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-    lock_path.write_text(json.dumps(lock, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-    before = lock_path.read_bytes()
-
-    def first_pr_reader(revision: str, repo_path: str) -> bytes | None:
-        if revision == "base-revision" and repo_path in {
-            "tests/acceptance/stage3_required_cases.lock.json",
-            "docs/rust-refactor/evidence/denominators/source-manifest.json",
-        }:
-            return None
-        return source_reader(revision, repo_path)
-
-    result = required_cases.main([mode, "--base", "base-revision"], repo_root=root, source_reader=first_pr_reader)
-
-    assert result != 0, capsys.readouterr().out
-    assert lock_path.read_bytes() == before
-
-
-@pytest.mark.parametrize("mode", ["--check", "--add-only"])
 def test_required_cases_rejects_changed_source_manifest_present_in_base(tmp_path, capsys, mode):
     from tools.stage3 import required_cases
 
     root, source_reader = _required_cases_repo(tmp_path)
     manifest_path = root / "docs" / "rust-refactor" / "evidence" / "denominators" / "source-manifest.json"
     base_manifest = manifest_path.read_bytes()
-    manifest = json.loads(base_manifest)
-    manifest["initial_exit_platforms"].pop()
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    manifest_path.write_bytes(base_manifest + b"\n")
     lock_path = root / "tests" / "acceptance" / "stage3_required_cases.lock.json"
     before = lock_path.read_bytes()
 
@@ -1092,22 +1017,22 @@ def test_required_cases_rejects_changed_source_manifest_present_in_base(tmp_path
     assert lock_path.read_bytes() == before
 
 
-@pytest.mark.parametrize("mutation", ["missing_initial_exit_platforms", "unknown_manifest_key",
-                                        "missing_exit_layer", "unknown_exit_key"])
-def test_public_seed_manifest_checks_initial_exit_platform_fields_exactly(tmp_path, mutation):
+@pytest.mark.parametrize("mutation", ["missing_sources", "unknown_manifest_key",
+                                        "missing_source_sha", "unknown_source_key"])
+def test_public_seed_manifest_checks_source_fields_exactly(tmp_path, mutation):
     from tools.stage3 import required_cases
 
     root, source_reader = _required_cases_repo(tmp_path)
     manifest_path = root / "docs" / "rust-refactor" / "evidence" / "denominators" / "source-manifest.json"
     manifest = _load(manifest_path)
-    if mutation == "missing_initial_exit_platforms":
-        del manifest["initial_exit_platforms"]
+    if mutation == "missing_sources":
+        del manifest["sources"]
     elif mutation == "unknown_manifest_key":
         manifest["unexpected"] = True
-    elif mutation == "missing_exit_layer":
-        del manifest["initial_exit_platforms"][0]["layer"]
+    elif mutation == "missing_source_sha":
+        del manifest["sources"][0]["sha256"]
     else:
-        manifest["initial_exit_platforms"][0]["unexpected"] = True
+        manifest["sources"][0]["unexpected"] = True
 
     errors = required_cases.verify_seed_sources(manifest, evidence_root=root / "docs" / "rust-refactor" / "evidence",
                                                 source_reader=source_reader)
@@ -1203,6 +1128,120 @@ def test_required_cases_check_rejects_seed_shrink_when_base_has_no_lock(tmp_path
     assert required_cases.main(["--check", "--base", "base-revision"], repo_root=root,
                                source_reader=no_base_lock) != 0
     assert "固定 seed 基準" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("mode", ["--check", "--add-only"])
+@pytest.mark.parametrize("shrink", ["exit", "platform", "seed_case"])
+def test_first_pr_seed_floor_rejects_catalog_and_lock_shrink(tmp_path, capsys, mode, shrink):
+    """首個 PR 無舊鎖／manifest 時，固定附件仍須守住出口、平台與 seed 案例。"""
+    from tools.stage3 import required_cases
+    import yaml
+
+    root, source_reader = _required_cases_repo(tmp_path)
+    acceptance = root / "tests" / "acceptance"
+    catalog_path = acceptance / "stage_exits.json"
+    lock_path = acceptance / "stage3_required_cases.lock.json"
+    catalog = _load(catalog_path)
+    lock = _load(lock_path)
+    target_id = "S3-L3-P0P1-REMOTE-WINDOWS"
+    target = next(item for item in catalog["items"] if item["item_id"] == target_id)
+
+    if shrink == "exit":
+        catalog["items"] = [item for item in catalog["items"] if item["item_id"] != target_id]
+        del lock["exits"][target_id]
+    elif shrink == "platform":
+        # 先在候選目錄／鎖宣告此出口涵蓋雙平台，再由首個 PR 一併刪掉 Windows。
+        target["platform"] = "both"
+        current_cases = yaml.safe_load((acceptance / "cases.yaml").read_text(encoding="utf-8"))
+        current_case_lock = _load(acceptance / "cases.lock.json")
+        both_expected = required_cases._expected_exit_cases(catalog, current_cases, current_case_lock)
+        lock["exits"][target_id] = both_expected[target_id]
+        target["platform"] = "linux"
+        del lock["exits"][target_id]["windows"]
+    else:
+        seed_cases = yaml.safe_load((DENOMINATORS / "cases.yaml").read_text(encoding="utf-8"))
+        seed_case_lock = _load(DENOMINATORS / "cases.lock.json")
+        target_id = "S3-L15-RELEASE-AB-WINDOWS"
+        target = next(item for item in catalog["items"] if item["item_id"] == target_id)
+        seed_by_id = {item["case_id"]: item for item in seed_cases["cases"]}
+        removed_ids = {
+            case_id for case_id in seed_case_lock["sets"]["slice_2.4"]
+            if case_id != "lr-mixed"
+            and seed_by_id[case_id]["layer"] == target["layer"]
+            and seed_by_id[case_id]["necessity"] == "required"
+            and "windows" in seed_by_id[case_id]["platforms"]
+            and seed_by_id[case_id].get("family") == "WIN"
+        }
+        assert removed_ids
+        for item in catalog["items"]:
+            if item.get("stage") != "3" or item.get("layer") != target["layer"]:
+                continue
+            platforms = ("linux", "windows") if item.get("platform") == "both" else (item.get("platform"),)
+            if "windows" not in platforms or item.get("required_case_set") != "slice_2.4":
+                continue
+            item["required_families"] = ["L15", "S24"]
+            entry = lock["exits"].get(item["item_id"], {}).get("windows")
+            if isinstance(entry, dict):
+                entry["case_ids"] = [case_id for case_id in entry["case_ids"] if case_id not in removed_ids]
+
+    catalog_path.write_text(json.dumps(catalog, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                            encoding="utf-8")
+    lock_path.write_text(json.dumps(lock, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                         encoding="utf-8")
+    before = lock_path.read_bytes()
+
+    def first_pr_reader(revision: str, repo_path: str) -> bytes | None:
+        if revision == "base-revision" and repo_path in {
+            "tests/acceptance/stage3_required_cases.lock.json",
+            "docs/rust-refactor/evidence/denominators/source-manifest.json",
+        }:
+            return None
+        return source_reader(revision, repo_path)
+
+    result = required_cases.main([mode, "--base", "base-revision"], repo_root=root,
+                                 source_reader=first_pr_reader)
+
+    assert result != 0, capsys.readouterr().out
+    assert lock_path.read_bytes() == before
+
+
+def test_required_cases_formal_seed_assertion_allows_exit_and_platform_growth(tmp_path):
+    """已存在 seed manifest／鎖的 base，仍可只增出口與平台且正式 seed 核對通過。"""
+    from tools.stage3 import required_cases
+
+    root, source_reader = _required_cases_repo(tmp_path)
+    acceptance = root / "tests" / "acceptance"
+    catalog_path = acceptance / "stage_exits.json"
+    lock_path = acceptance / "stage3_required_cases.lock.json"
+    manifest_path = root / "docs" / "rust-refactor" / "evidence" / "denominators" / "source-manifest.json"
+    base_lock = lock_path.read_bytes()
+    base_manifest = manifest_path.read_bytes()
+    catalog = _load(catalog_path)
+    added_exit = copy.deepcopy(next(
+        item for item in catalog["items"] if item["item_id"] == "S3-L3-P0P1-REMOTE-WINDOWS"
+    ))
+    added_exit["item_id"] = "S3-L3-P0P1-REMOTE-WINDOWS-ADDED-INTEGRATION"
+    added_exit["title"] = "合法新增 Stage 3 出口整合 fixture"
+    catalog["items"].append(added_exit)
+    dual_platform = next(item for item in catalog["items"] if item["item_id"] == "S3-L15-RELEASE-AB-LINUX")
+    dual_platform["platform"] = "both"
+    catalog_path.write_text(json.dumps(catalog, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                            encoding="utf-8")
+
+    def base_reader(revision: str, repo_path: str) -> bytes | None:
+        if revision == "base-revision":
+            if repo_path == "tests/acceptance/stage3_required_cases.lock.json":
+                return base_lock
+            if repo_path == "docs/rust-refactor/evidence/denominators/source-manifest.json":
+                return base_manifest
+        return source_reader(revision, repo_path)
+
+    assert required_cases.main(["--add-only", "--base", "base-revision"], repo_root=root,
+                               source_reader=base_reader) == 0
+    assert required_cases.main(["--check", "--base", "base-revision"], repo_root=root,
+                               source_reader=base_reader) == 0
+
+    _assert_required_cases_seed_preserves_full_denominator(root, base_reader)
 
 
 _S3_L1_PLAN_SELECTORS = {
