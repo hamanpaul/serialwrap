@@ -1380,6 +1380,99 @@ def test_upgrade_rejects_candidate_cli_without_embedded_p290_asset(fake_driver, 
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
+def test_upgrade_rejects_nested_flow_sequence_as_candidate_profile_field(fake_driver, monkeypatch):
+    """候選 YAML 的巢狀 flow key 不得掩蓋候選 CLI 與 live profile 的版本差異。"""
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    target = driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
+    live = driver.doctor_profile_dir / "default.yaml"
+    target.write_text(
+        "profiles:\n"
+        "  prpl-template:\n"
+        "    platform: prpl\n"
+        "    other:\n"
+        "      - [one,\n"
+        "    timeout_recovery_keys: [CTRL_C]\n"
+        "      ]\n",
+        encoding="utf-8",
+    )
+    live.write_text(
+        "profiles:\n"
+        "  prpl-template:\n"
+        "    platform: prpl\n"
+        "    timeout_recovery_keys: [CTRL_C]\n",
+        encoding="utf-8",
+    )
+
+    result = driver.judge_doctor(
+        "doctor_green_new", "巢狀 flow 欄位反例", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+
+    migration = result["detail"]["p290_profile_migration"]
+    assert result["detail"]["candidate_cli_p290_asset"]["verdict"] == "PASS", result
+    assert result["verdict"] == "FAIL", result
+    assert migration["verdict"] == "FAIL", migration
+    assert migration["detail"]["target_asset_has_field"] is False, migration
+    assert migration["detail"]["live_profile_has_field"] is True, migration
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_upgrade_rejects_alternate_nested_flow_layout_as_candidate_profile_field(fake_driver):
+    """另一種合法的 flow sequence 換行也不能把巢狀文字當成 template 欄位。"""
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    target = driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
+    live = driver.doctor_profile_dir / "default.yaml"
+    target.write_text(
+        "profiles:\n"
+        "  prpl-template:\n"
+        "    platform: prpl\n"
+        "    other:\n"
+        "      - [\n"
+        "          one,\n"
+        "    timeout_recovery_keys: [CTRL_C]\n"
+        "        ]\n",
+        encoding="utf-8",
+    )
+    live.write_text(
+        "profiles:\n"
+        "  prpl-template:\n"
+        "    platform: prpl\n"
+        "    timeout_recovery_keys: [CTRL_C]\n",
+        encoding="utf-8",
+    )
+
+    result = driver.judge_doctor(
+        "doctor_green_new", "另一種巢狀 flow 排版", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+
+    migration = result["detail"]["p290_profile_migration"]
+    assert result["verdict"] == "FAIL", result
+    assert migration["detail"]["target_asset_has_field"] is False, migration
+    assert migration["detail"]["live_profile_has_field"] is True, migration
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_candidate_cli_path_mismatch_returns_structured_fail(fake_driver, tmp_path):
+    """目前 CLI 與 bundle 候選路徑不一致時應回傳 FAIL 列，不得拋例外。"""
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    target = driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
+    configured_cli = tmp_path / "configured-copy" / "bin" / "serialwrap"
+    configured_cli.parent.mkdir(parents=True)
+    configured_cli.write_text("not the bundle candidate", encoding="utf-8")
+    driver.new_cli = configured_cli
+
+    result = driver.verify_candidate_p290_asset(target)
+
+    assert result["verdict"] == "FAIL", result
+    assert result["id"] == "candidate_cli_p290_asset", result
+    assert result["detail"]["configured_cli_path"] == str(configured_cli.resolve()), result
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_profile_template_migration_accepts_bracket_in_plain_scalar(fake_driver, monkeypatch):
     """正式 driver 的遷移判定不可讓 plain scalar 內的 bracket 遮蔽真實欄位。"""
     import yaml
