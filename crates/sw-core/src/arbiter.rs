@@ -158,9 +158,9 @@ impl CommandRegistry {
         self.admit_with_line_limit(req, None, queue_registered, cmd_id, now_iso)
     }
 
-    /// 同 [`CommandRegistry::admit`]，另依 session profile 的 `max_console_line_chars`（console 單行上限）檢查命令長度
-    /// （Python `arbiter.submit(max_console_line_chars=…)`；service 只在 RPC `command.submit` 帶入 profile 的值，
-    /// human console 的整行輸入不套用）。`None`＝profile 未設，不檢查。
+    /// 同 [`CommandRegistry::admit`]，另依 session profile 的 `max_console_line_chars`（console 單行上限）檢查命令長度。
+    /// 依 OD-111，這是 Rust-only 行為：RPC `command.submit` 會帶入 profile 的值；human console 的整行輸入不套用。
+    /// `None`＝profile 未設，不檢查。
     pub fn admit_with_line_limit(
         &self,
         req: SubmitReq,

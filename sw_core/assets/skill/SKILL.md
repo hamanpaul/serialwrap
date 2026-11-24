@@ -269,7 +269,7 @@ serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wir
 
 ## 短命令原則（Best Practice）
 - **避免 heredoc**：heredoc 經 UART 傳輸時容易遺失字元或打亂 prompt，改用 `echo ... > file` 分步寫入。
-- **單行盡量短**：每條命令控制在 2 KB 以內；UTF-8 位元組 > 4 KB 會 warning、> 16 KB 會被 reject（`CMD_TOO_LONG`）。命令不得含 `\n` 換行字元，否則回 `CMD_CONTAINS_NEWLINE`。broker 不截斷；但 broker 上限與 target 端 tty line buffer（常見 4096 bytes）的物理單行限制是兩回事，過長單行仍可能在 target 端被截斷。profile 設了 `max_console_line_chars` 的 session，超過的命令在提交時就回 `CMD_TOO_LONG`（零 TX，`limit` 為該 profile 的值）；收到時縮短命令，或把內容寫成腳本 `file push` 上去再執行。上限可由 `serialwrap daemon status` 的 `limits` 欄位執行期查詢，不需硬編碼。
+- **單行盡量短**：每條命令控制在 2 KB 以內；UTF-8 位元組 > 4 KB 會 warning、> 16 KB 會被 reject（`CMD_TOO_LONG`）。命令不得含 `\n` 換行字元，否則回 `CMD_CONTAINS_NEWLINE`。broker 不截斷；但 broker 上限與 target 端 tty line buffer（常見 4096 bytes）的物理單行限制是兩回事，過長單行仍可能在 target 端被截斷。Rust daemon 中，profile 設了 `max_console_line_chars` 的 session，超過的 `cmd submit` 在提交時就回 `CMD_TOO_LONG`（零 TX，`limit` 為該 profile 的值）；收到時縮短命令，或把內容寫成腳本 `file push` 上去再執行。上限可由 `serialwrap daemon status` 的 `limits` 欄位執行期查詢，不需硬編碼。
 - **避免 base64 inline**：不要將整個檔案 base64 編碼塞進 `cmd submit`。小檔（數十 KB 內）改用 `serialwrap file push`；firmware image 這類大檔在 DUT 有網路通道時一律走 SCP／TFTP，不要交給 `file push`（界線見「透過 UART 推送／拉取檔案」）。
 - **長命令拆分**：管線命令過長時，先寫成 script 檔再 `source` 或 `sh /tmp/script.sh`。
 - **長命令**：`--expected-duration <秒>` 只延長總期限、不延長靜默上限（見「`cmd submit` 的期限語意」）；會靜默的長命令在板上 `setsid … &` 丟背景再用短命令輪詢，不要靠它硬撐。

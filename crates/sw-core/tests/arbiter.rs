@@ -894,7 +894,7 @@ fn pending_excludes_interactive() {
 }
 
 // ---------------------------------------------------------------------------
-// #4：profile 的 console 單行上限（`max_console_line_chars`）；對照 Python `tests/test_submit_console_line_limit.py`
+// OD-111：Rust-only profile console 單行上限（`max_console_line_chars`）；Python 基線不含此行為。
 // ---------------------------------------------------------------------------
 
 fn admit_limited(

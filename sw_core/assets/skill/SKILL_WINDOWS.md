@@ -61,6 +61,8 @@ serialwrap cmd submit --selector COM0 --cmd "cat /proc/version" --source agent:d
 > 不是 Windows 裝置管理員的實體 `COM5`/`COM7`；對應關係看 `session list`
 > 的 `attached_real_path`（如 `\\.\COM5`）。
 
+Rust daemon 中，profile 設了 `max_console_line_chars` 的 session，`cmd submit` 會以命令 UTF-8 位元組數檢查單行上限；超過時回 `CMD_TOO_LONG`，`limit` 為 profile 值，命令不入列且不送 UART。此限制套用所有 `cmd submit` mode；human console 的整行輸入不套用。未設定上限時行為不變。
+
 ## 4. Profile 設定
 
 profile 與 Linux 版同一套規則，路徑在家目錄的 `.config`：

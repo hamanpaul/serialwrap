@@ -1,7 +1,5 @@
-//! #4：`command.submit` 遵守 session profile 的 `max_console_line_chars`（console 單行上限）。
-//!
-//! 斷言值以 Python 基線為準（`sw_core/arbiter.py` 的 `submit(max_console_line_chars=…)`、`sw_core/service.py`
-//! 從 session profile 取上限；Python 測試 `tests/test_submit_console_line_limit.py::TestServiceUsesProfileLimit`）：
+//! OD-111：Rust-only 行為，`command.submit` 遵守 session profile 的 `max_console_line_chars`（console 單行上限）；
+//! Python 基線不實作此限制，以下斷言只驗證 Rust 契約：
 //! - RPC 路徑超過上限回 `CMD_TOO_LONG`（`limit` 為 profile 的值），零 TX、不入列；
 //! - 等於上限照常執行；profile 未設時行為不變；
 //! - human console 的整行輸入不經 service，不套用。

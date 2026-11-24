@@ -6,7 +6,7 @@
 # extra_fields 不含共通欄位 ok、error_code、id、version（見盤點 03 §1.1）。
 # retryable：yes＝可在條件滿足後重送；no＝不可直接重送；conditional＝視條件；fix_args＝修正參數或設定後再送。
 schema_version: 1
-revision: 2
+revision: 3
 namespace: error_code
 codes:
   - code: ALIAS_NOT_FOUND

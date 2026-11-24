@@ -3486,7 +3486,7 @@ impl SessionCore {
 
         req.session_id = self.sid.clone();
         let cmd_id = self.next_uuid();
-        // Python service `command.submit`：取 session 現行 profile 的 `max_console_line_chars` 交給 arbiter（#4）；
+        // Rust-only（OD-111）：command.submit 取 session 現行 profile 的 `max_console_line_chars` 交給 arbiter；
         // human console 的整行輸入走 `console.rs` 的 `admit`，不套用。
         let line_limit = self.profile.template.max_console_line_chars.clone();
         let admitted =
