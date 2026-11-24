@@ -178,7 +178,7 @@ fn ready_newline_prompt_actor() -> ActorRig {
     h.dev.on_tx_reply(b"\n", b"\r\nroot@t:/# ");
     let h = h.attach();
     h.wait_for("帶換行前綴 prompt 的 actor READY", |rig| {
-        rig.get_state()["state"] == PyValue::from("READY")
+        rig.get_state()["state"] == "READY"
     });
     h
 }
