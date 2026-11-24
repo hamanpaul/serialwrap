@@ -943,6 +943,8 @@ pub enum Fixture {
     ReadyShell,
     /// READY 的 shell 目標；前景命令 BlockUntilCancel，另有排隊命令。
     ReadyShellBlockingWithQueue,
+    /// shell 假 DUT 只回應 bootstrap ready nonce，之後的 self-test nonce 保持無回應。
+    ReadyShellBootNonceOnly,
     /// READY 的 shell 目標；session writer 以 BlockForever 卡住（drain 收斂不了）。
     BlockForeverWriter,
     /// WAL sync 每次失敗（FakeWalFs 故障注入）。
@@ -1004,10 +1006,17 @@ pub fn in_process_platform_with_handles(
     fs::create_dir_all(&profile_dir).expect("建立 profiles 目錄");
     let yaml = match fixture {
         Fixture::None => "profiles:\n  p:\n    platform: passthrough\n    ready_probe: ''\n".to_string(),
-        _ => format!(
-            "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\ntargets:\n  - {{com: COM0, profile: t, device_by_id: {}}}\n",
-            devices.first().map(|(k, _)| k.clone()).unwrap_or_default()
-        ),
+        _ => {
+            let ready_probe = if fixture == Fixture::ReadyShellBootNonceOnly {
+                "    ready_probe: 'echo __READY__${nonce}'\n"
+            } else {
+                ""
+            };
+            format!(
+                "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\n{ready_probe}targets:\n  - {{com: COM0, profile: t, device_by_id: {}}}\n",
+                devices.first().map(|(k, _)| k.clone()).unwrap_or_default()
+            )
+        }
     };
     fs::write(profile_dir.join("inproc.yaml"), yaml).expect("寫入 in-process profile");
 
@@ -1018,7 +1027,11 @@ pub fn in_process_platform_with_handles(
         let dev = serial.add_device(&info.real_path);
         all_devs.push(dev.clone());
         if fixture != Fixture::None {
-            install_shell_replies(&dev);
+            if fixture == Fixture::ReadyShellBootNonceOnly {
+                install_shell_boot_nonce_reply_only(&dev);
+            } else {
+                install_shell_replies(&dev);
+            }
             if first_dev.is_none() {
                 first_dev = Some(dev.clone());
             }
@@ -1121,6 +1134,23 @@ fn wait_state_in_process(socket: &Path, com: &str, want: &str) {
 /// shell 假 DUT（FakeSerial）：`\n` → prompt；`__READY__<nonce>` → nonce＋prompt（與 `ServiceRig` 相同）。
 pub fn install_shell_replies(dev: &sw_pal::fakes::FakeDevice) {
     service_rig::install_shell_replies(dev);
+}
+
+/// 假 DUT 只回應第一次 ready nonce（bootstrap），供 shutdown self-test 測試維持第二次 nonce 等待。
+fn install_shell_boot_nonce_reply_only(dev: &sw_pal::fakes::FakeDevice) {
+    dev.on_tx_reply(b"\n", b"root@t:/# ");
+    let replied = std::sync::atomic::AtomicBool::new(false);
+    dev.on_tx_match(
+        r"__READY__[0-9a-f]+",
+        Box::new(move |line: &[u8]| {
+            if replied.swap(true, Ordering::SeqCst) {
+                return Vec::new();
+            }
+            let text = String::from_utf8_lossy(line).into_owned();
+            let token = text.split("__READY__").nth(1).unwrap_or("").trim();
+            format!("__READY__{token}\r\nroot@t:/# ").into_bytes()
+        }),
+    );
 }
 
 /// WAL 檔案層：委派原生實作，但每個檔案的 `sync` 一律回 EIO（`shutdown_wal_sync_failure_exits_1`）。

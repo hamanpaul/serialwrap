@@ -736,6 +736,92 @@ fn long_file_push_does_not_block_stop() {
 }
 
 #[test]
+fn shutdown_inflight_self_test_is_flushed_within_stop_cap() {
+    // 透過真實 RPC handler 啟動長 timeout self-test；只有 bootstrap ready nonce 有回應，
+    // 確認 self-test probe 已送出後才送 daemon.stop，鎖定 Phase 1 立即回覆與停止上限。
+    let env = isolated_env();
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    let (platform, handles) = in_process_platform_with_handles(
+        &env.vars,
+        vec![device("usb-SER-A-if00", "/fake/serial-i297-self-test-shutdown")],
+        Fixture::ReadyShellBootNonceOnly,
+    );
+    let dev = handles.devices[0].clone();
+    let tx_at_phase1 = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+    let tx_at_phase1_for_hook = tx_at_phase1.clone();
+    let dev_for_hook = dev.clone();
+    let trace_for_hook = sink.clone();
+    let hooks = DaemonHooks {
+        trace: Some(Box::new(move |event| {
+            if event == TraceEvent::DrainPhase1 {
+                tx_at_phase1_for_hook.store(dev_for_hook.tx_len(), Ordering::SeqCst);
+            }
+            trace_for_hook.lock().unwrap().push(event);
+        })),
+        ..DaemonHooks::default()
+    };
+
+    let socket = env.socket.clone();
+    let dev_for_client = dev.clone();
+    let client = spawn_stop_guarded_client(socket.clone(), move || {
+        wait_socket(&socket, SHORT);
+        wait_state(&socket, "COM0", "READY");
+        let tx_before_self_test = dev_for_client.tx_len();
+        let self_test_socket = socket.clone();
+        let self_test = thread::spawn(move || {
+            rpc_once(
+                &self_test_socket,
+                r#"{"id":41,"method":"session.self_test","params":{"selector":"COM0","timeout_s":600}}"#,
+            )
+        });
+        let probe_started = poll(SHORT, || {
+            dev_for_client
+                .tx_since(tx_before_self_test)
+                .windows(b"__READY__".len())
+                .any(|window| window == b"__READY__")
+        });
+        assert!(probe_started, "停機前必須觀察到在途 self-test nonce probe TX");
+
+        let stop_started = Instant::now();
+        let stop_reply = rpc_once(&socket, STOP);
+        let self_test_reply = self_test.join().expect("self-test RPC thread");
+        (stop_started, stop_reply, self_test_reply)
+    });
+
+    let code = run_with_hooks(vec!["serialwrapd".to_string()], platform, hooks);
+    let returned = Instant::now();
+    let (stop_started, stop_reply, self_test_reply) = client.join().expect("client thread");
+    let took = returned.duration_since(stop_started);
+    assert!(took <= STOP_CAP, "self-test 等待不得延長停止序：{took:?}，stop={stop_reply:?}");
+    assert_eq!(code, 0, "乾淨夾具應以 exit 0 收斂；stop={stop_reply:?}");
+
+    let trace = sink.lock().unwrap().clone();
+    assert_eq!(steps(&trace), STEPS.to_vec(), "{trace:?}");
+    assert!(
+        trace.contains(&TraceEvent::HandlersJoined { pending: vec![] }),
+        "self-test RPC handler 應在 join 前完成：{trace:?}"
+    );
+    let phase1_tx = tx_at_phase1.load(Ordering::SeqCst);
+    assert_ne!(phase1_tx, usize::MAX, "trace 應觀察到 drain.phase1");
+    assert!(
+        dev.tx_since(phase1_tx).is_empty(),
+        "Phase 1 凍結後 Fake UART TX 不得增加：{}",
+        String::from_utf8_lossy(&dev.tx_since(phase1_tx))
+    );
+
+    let reply = match pyjson::loads(&self_test_reply) {
+        Ok(PyValue::Dict(dict)) => dict,
+        other => panic!("self-test 必須收到結構化 RPC 回覆：{self_test_reply:?} → {other:?}"),
+    };
+    assert_eq!(reply.get("ok"), Some(&PyValue::Bool(false)), "{reply:?}");
+    assert_eq!(
+        reply.get("error_code"),
+        Some(&PyValue::from("FLUSHED_BY_SHUTDOWN")),
+        "在途 self-test 停機時須回 FLUSHED_BY_SHUTDOWN：{reply:?}"
+    );
+}
+
+#[test]
 fn shutdown_gate_waits_for_open_transfer_line() {
     let env = isolated_env();
     let (platform, handles) = in_process_platform_with_handles(
