@@ -245,7 +245,7 @@ sequenceDiagram
 
 #### 命令限制
 
-- 命令字串不得含有 `\n` 換行字元。Rust daemon 會在 RPC 入口檢查，若偵測到換行則拒絕並回傳 `error_code: CMD_CONTAINS_NEWLINE`。
+- 命令字串不得含有 `\n` 換行字元。Rust daemon 在命令 admission 檢查（`command.submit` 與 human console 的整行輸入走同一個 admission），若偵測到換行則拒絕並回傳 `error_code: CMD_CONTAINS_NEWLINE`。
 - 命令長度（UTF-8 位元組）> 4 KB 回 warning（`CMD_LENGTH_WARNING`），> 16 KB 拒絕（`CMD_TOO_LONG`）。broker 對接受的命令**不做截斷**，全量寫出到 UART。
 - 上述為 **broker 對單一 command 參數的上限**；**target 端 tty line buffer（常見 4096 bytes）的物理單行限制**是另一回事——即使 broker 接受，過長單行仍可能在 target 端被截斷，兩者需分開考量。target 端單行上限為 target-dependent（依 target 的 OS／tty 驅動而異，例如 Linux N_TTY 常見 4096），broker 無從權威得知，故**不經 `limits` 欄位暴露**，僅於文件提示常見值。已量測的板可在 profile 設 `max_console_line_chars`：Rust daemon 的 `command.submit` 在 16 KB 硬上限之後、換行檢查之前比對命令 UTF-8 位元組數（不含結尾換行），超過即回 `CMD_TOO_LONG`，`limit` 為該 profile 的值（`cmd_length`、`hint` 同硬上限），不入列、零 TX；未設則不檢查。錯誤碼沿用 `CMD_TOO_LONG` 是因為 Stage 1B 凍結了錯誤碼集合。human console 的整行輸入不套用。
 - broker 送出時會補尾端 `\n`（`uart_io` 的 `send_command`；含換行的命令已在入口被拒，故必補），on-wire 單行位元組數 = 命令 UTF-8 位元組數 + 1。
