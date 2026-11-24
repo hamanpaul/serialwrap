@@ -1631,6 +1631,113 @@ fn shutdown_includes_inflight_attach() {
     );
 }
 
+fn start_manager_self_test(
+    m: &ManagerRig,
+    sid: &str,
+) -> std::sync::mpsc::Receiver<Result<PyDict, PyErr>> {
+    m.dev.clear_replies();
+    let tx_start = m.dev.tx_len();
+    let mgr = m.mgr.clone();
+    let sid = sid.to_string();
+    let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+    let _ = std::thread::spawn(move || {
+        let result = mgr.route(
+            &sid,
+            SessionRequest::SelfTest {
+                timeout_s: 60.0,
+                strict_human_lock: false,
+            },
+            RPC,
+        );
+        let _ = reply_tx.send(result);
+    });
+    wait_until("self-test nonce probe TX", || m.dev.tx_len() > tx_start);
+    reply_rx
+}
+
+fn assert_shutdown_flushed_manager_self_test(reply: Result<PyDict, PyErr>, context: &str) {
+    let response = reply.unwrap_or_else(|error| {
+        panic!("{context} 應收到結構化 RPC 回覆：{}", error.message)
+    });
+    assert_eq!(
+        response.get("ok"),
+        Some(&PyValue::Bool(false)),
+        "{context}: {response:?}"
+    );
+    assert_eq!(
+        code_of(&response).as_deref(),
+        Some("FLUSHED_BY_SHUTDOWN"),
+        "{context}: {response:?}"
+    );
+}
+
+#[test]
+fn shutdown_phase1_flushes_self_test_after_release() {
+    // ManagerRig 覆蓋 release 已完成、session 為 RELEASED 時 manager 仍須送只沖刷控制事件的路徑。
+    let m = ManagerRig::single_target(SHELL_PROFILE).ready();
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let reply = start_manager_self_test(&m, &sid);
+
+    rpc(m.mgr.route(
+        &sid,
+        SessionRequest::Release {
+            source: "agent".to_string(),
+            reason: PyValue::Null,
+        },
+        RPC,
+    ));
+    m.wait_state("COM0", "RELEASED");
+    assert!(
+        reply.try_recv().is_err(),
+        "Release 不應取代停機的 FLUSHED_BY_SHUTDOWN 回覆"
+    );
+
+    let drain = m
+        .mgr
+        .shutdown_phase1(Instant::now() + Duration::from_secs(1));
+    assert!(
+        m.mgr.shutdown_phase2(drain).is_empty(),
+        "只沖刷的 RELEASED actor 不得加入 waits 或 drain 結果集合"
+    );
+    assert_shutdown_flushed_manager_self_test(
+        reply
+            .recv_timeout(Duration::from_millis(500))
+            .expect("manager Phase 1 後應收到 self-test 回覆"),
+        "release 後停機",
+    );
+    assert_eq!(m.state_of("COM0").as_deref(), Some("RELEASED"));
+}
+
+#[test]
+fn shutdown_phase1_flushes_self_test_after_device_removed() {
+    // 拔除 drain 已完成後 session 為 DETACHED；manager 也必須沖刷等待者而不送完整 Shutdown。
+    let m = ManagerRig::single_target(SHELL_PROFILE).ready();
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let reply = start_manager_self_test(&m, &sid);
+
+    m.mgr.update_devices(&[]);
+    m.wait_state("COM0", "DETACHED");
+    assert!(
+        reply.try_recv().is_err(),
+        "拔除不應取代停機的 FLUSHED_BY_SHUTDOWN 回覆"
+    );
+
+    let drain = m
+        .mgr
+        .shutdown_phase1(Instant::now() + Duration::from_secs(1));
+    assert!(
+        m.mgr.shutdown_phase2(drain).is_empty(),
+        "只沖刷的 DETACHED actor 不得加入 waits 或 drain 結果集合"
+    );
+    assert_shutdown_flushed_manager_self_test(
+        reply
+            .recv_timeout(Duration::from_millis(500))
+            .expect("manager Phase 1 後應收到 self-test 回覆"),
+        "拔除後停機",
+    );
+    assert_eq!(m.state_of("COM0").as_deref(), Some("DETACHED"));
+}
+
 #[test]
 fn released_survives_two_restarts_dynamic() {
     // DF-04：動態 session release 後，以同一 state.json 重建兩次，都是 RELEASED 且不 open 裝置。

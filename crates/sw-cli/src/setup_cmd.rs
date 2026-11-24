@@ -1785,7 +1785,11 @@ pub fn run_setup(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
         ));
     let needs_install_lock = install_request
         || ctx.p.fs.exists(&install_root.root.join(".install.lock"))
-        || ctx.p.fs.exists(&install_root.root.join("install-journal.json"));
+        || ctx
+            .p
+            .fs
+            .exists(&install_root.root.join("install-journal.json"))
+        || crate::rollback::autostart_hold_involves_windows_task(ctx);
     let mut install_lock = if needs_install_lock {
         match install_layout::install_lock(ctx, &install_root) {
             Ok(lock) => Some(lock),

@@ -339,7 +339,7 @@ session 因 recovery/re-attach 離開 `READY`（`_on_detached` → `arbiter.unre
 
 語意：該命令**未被執行**（從未送進 UART），client 對這些 `cmd_id` 的 `command.get` 收到此終端態即應於 session 回 `READY` 後重送。in-flight（`running`/`interactive`）命令不重複標記，由 worker 以真實結果終結。flush 使記錄轉為可淘汰並即刻釋放 `CMD_PENDING_MAX` pending 額度——修掉 stale accepted 記錄永久佔額度、導致該 session 直到 daemon 重啟前一律 `SESSION_QUEUE_FULL` 的洩漏。
 
-所有 detach 類路徑（含 recovery、`session clear`、device release、rebind、熱拔、re-attach 等 `_on_detached` 上游）皆以 `FLUSHED_BY_RECOVERY` 終結未啟動命令；daemon shutdown（`service.stop()`）則用 `FLUSHED_BY_SHUTDOWN`。兩者語意相同＝命令未執行、可於 session 回 `READY` 後重送。
+所有 detach 類路徑（含 recovery、`session clear`、device release、rebind、熱拔、re-attach 等 `_on_detached` 上游）皆以 `FLUSHED_BY_RECOVERY` 終結未啟動命令；daemon shutdown（`service.stop()`）則用 `FLUSHED_BY_SHUTDOWN`。Rust 0.5.1 起，排隊中、未送出的命令可在 `READY` 後重送；停機時在途的 `self_test`、`recover`、`interactive open`／`send` 也可能回此碼，bytes 可能已送出，須先確認副作用，不得只憑此碼自動重送（BC-06）。
 
 ### 6.5 長命令 keepalive hint
 

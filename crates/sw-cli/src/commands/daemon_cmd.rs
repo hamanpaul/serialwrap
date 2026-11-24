@@ -62,28 +62,57 @@ pub fn run_daemon_start(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
         .map(py_str_of)
         .unwrap_or_else(|| "on-demand".to_string());
     let mode = SupervisionMode::parse(&mode_name);
-    if mode_name != "on-demand" {
-        let raw_mode = match cfg.mode().filter(|value| py_truthy_of(value)) {
-            Some(value) => match service_cmd::yvalue_to_pyvalue(value) {
-                Ok(raw) => raw,
-                Err(message) => {
-                    let _ = ctx.io.err_str(&format!("{message}\n"));
-                    return 1;
-                }
-            },
-            None => PyValue::Str("on-demand".to_string()),
-        };
-        return service_cmd::run_service_action_with_mode_value(
-            ctx,
-            &mode,
-            ServiceAction::Start,
-            flag(ns, "with_sudo"),
-            "daemon start",
-            Some("service start"),
-            Some(raw_mode),
-        );
+    if matches!(mode, SupervisionMode::OnDemand) {
+        return run_daemon_start_on_demand(ns, ctx);
     }
 
+    let raw_mode = match cfg.mode().filter(|value| py_truthy_of(value)) {
+        Some(value) => match service_cmd::yvalue_to_pyvalue(value) {
+            Ok(raw) => raw,
+            Err(message) => {
+                let _ = ctx.io.err_str(&format!("{message}\n"));
+                return 1;
+            }
+        },
+        None => PyValue::Str("on-demand".to_string()),
+    };
+    run_daemon_start_with_mode(ns, ctx, mode, Some(raw_mode))
+}
+
+fn run_daemon_start_with_mode(
+    ns: &Namespace,
+    ctx: &mut CliCtx<'_>,
+    mode: SupervisionMode,
+    raw_mode: Option<PyValue>,
+) -> i32 {
+    if matches!(mode, SupervisionMode::OnDemand) {
+        return run_daemon_start_on_demand(ns, ctx);
+    }
+    service_cmd::run_service_action_with_mode_value_and_on_demand_fallback(
+        ctx,
+        &mode,
+        flag(ns, "with_sudo"),
+        raw_mode,
+        |ctx, rerouted_mode, rerouted_raw_mode, serialization_error| {
+            if let Some(message) = serialization_error {
+                let _ = ctx.io.err_str(&format!("{message}\n"));
+                return Some(1);
+            }
+            let Some(mode) = rerouted_mode else {
+                return Some(1);
+            };
+            Some(run_daemon_start_with_mode(
+                ns,
+                ctx,
+                mode.clone(),
+                rerouted_raw_mode.cloned(),
+            ))
+        },
+    )
+}
+
+fn run_daemon_start_on_demand(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
+    let is_win = crate::endpoint_resolve::rpc_backend_is_win(ctx);
     let resolved = match resolve_local(ns, ctx) {
         Ok(value) => value,
         Err(error) => return report_resolve_failure(ctx, error, "daemon start"),
@@ -494,7 +523,7 @@ pub fn run_daemon_restart(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
     start_ns
         .vals
         .insert("force_spawn".to_string(), ArgValue::Bool(false));
-    let (_start_rc, start_resp, start_stderr) = capture_start(ctx, &start_ns);
+    let (_start_rc, start_resp, start_stderr) = capture_start(ctx, &start_ns, None);
     if !start_stderr.is_empty() {
         let text = String::from_utf8_lossy(&start_stderr).replace("\r\n", "\n");
         let _ = ctx.io.err_str(&text);
@@ -510,7 +539,11 @@ pub fn run_daemon_restart(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
     code
 }
 
-fn capture_start(ctx: &mut CliCtx<'_>, ns: &Namespace) -> (i32, PyDict, Vec<u8>) {
+fn capture_start(
+    ctx: &mut CliCtx<'_>,
+    ns: &Namespace,
+    autostart_lock: Option<sw_pal::fs_ops::FileLockGuard>,
+) -> (i32, PyDict, Vec<u8>) {
     let mut out = Vec::new();
     let mut err = Vec::new();
     let newline = ctx.p.caps.text_newline;
@@ -521,7 +554,7 @@ fn capture_start(ctx: &mut CliCtx<'_>, ns: &Namespace) -> (i32, PyDict, Vec<u8>)
         io: crate::ctx::TextIo::new(&mut out, &mut err, newline),
         verbose: ctx.verbose,
         cli_version: ctx.cli_version,
-        autostart_lock: None,
+        autostart_lock,
     };
     let rc = run_daemon_start(ns, &mut nested);
     drop(nested);
@@ -788,18 +821,18 @@ pub fn maybe_autostart_on_demand(
     start_ns
         .vals
         .insert("foreground".to_string(), ArgValue::Bool(false));
-    let (start_rc, start_resp, _) = capture_start(ctx, &start_ns);
-    drop(lock);
+    let (start_rc, start_resp, _) = capture_start(ctx, &start_ns, Some(lock));
     if start_resp.get_truthy("already_running") {
         return AutostartDecision::AlreadyUp;
     }
     if start_resp.get_truthy("ok") {
-        let pid = start_resp
-            .get("pid")
-            .and_then(int_as_i64)
-            .unwrap_or_default()
-            .max(0) as u32;
-        return AutostartDecision::Started { pid };
+        if let Some(pid) = positive_pid(&start_resp) {
+            return AutostartDecision::Started { pid: Some(pid) };
+        }
+        if let Some(pid) = wait_for_daemon_ready(ctx, resolved) {
+            return AutostartDecision::Started { pid };
+        }
+        return AutostartDecision::Failed(output::error_resp(ErrorCode::DaemonNotReady, None));
     }
     if ping(ctx, &resolved.endpoint, 0.5) {
         return AutostartDecision::AlreadyUp;
@@ -817,10 +850,77 @@ pub fn maybe_autostart_on_demand(
     AutostartDecision::Failed(failure)
 }
 
+/// 排程 `/Run` 回成功只代表工作已接受；等待正式 health.ping 的 ok/pong，再由 health.status 讀取 PID。
+/// 外層 `None` 代表期限內未就緒；`Some(None)` 代表已就緒，但 status 未提供可用 PID。
+fn wait_for_daemon_ready(ctx: &mut CliCtx<'_>, resolved: &ResolvedEndpoint) -> Option<Option<u32>> {
+    const WAIT_LIMIT: Duration = Duration::from_secs(10);
+    const POLL_INTERVAL: Duration = Duration::from_millis(200);
+    let started_ns = ctx.p.clock.mono_ns();
+    loop {
+        let elapsed_ns = ctx.p.clock.mono_ns().saturating_sub(started_ns);
+        if elapsed_ns >= WAIT_LIMIT.as_nanos() as u64 {
+            return None;
+        }
+        if let Some(outcome) = rpc(
+            ctx,
+            resolved,
+            "health.ping",
+            0.5,
+            &PyValue::Dict(PyDict::new()),
+        ) {
+            trace(
+                ctx,
+                resolved,
+                "health.ping",
+                0.5,
+                &outcome.resp,
+                &outcome.meta,
+            );
+            if outcome.resp.get_truthy("ok") && outcome.resp.get_truthy("pong") {
+                return Some(daemon_status_pid(ctx, resolved));
+            }
+        }
+        let elapsed_ns = ctx.p.clock.mono_ns().saturating_sub(started_ns);
+        if elapsed_ns >= WAIT_LIMIT.as_nanos() as u64 {
+            return None;
+        }
+        let remaining = Duration::from_nanos(WAIT_LIMIT.as_nanos() as u64 - elapsed_ns);
+        ctx.p.clock.sleep(POLL_INTERVAL.min(remaining));
+    }
+}
+
+fn daemon_status_pid(ctx: &mut CliCtx<'_>, resolved: &ResolvedEndpoint) -> Option<u32> {
+    let outcome = rpc(
+        ctx,
+        resolved,
+        "health.status",
+        0.5,
+        &PyValue::Dict(PyDict::new()),
+    )?;
+    trace(
+        ctx,
+        resolved,
+        "health.status",
+        0.5,
+        &outcome.resp,
+        &outcome.meta,
+    );
+    outcome
+        .resp
+        .get_truthy("ok")
+        .then(|| positive_pid(&outcome.resp))
+        .flatten()
+}
+
+fn positive_pid(response: &PyDict) -> Option<u32> {
+    let pid = response.get("pid").and_then(int_as_i64)?;
+    u32::try_from(pid).ok().filter(|pid| *pid > 0)
+}
+
 #[derive(Debug)]
 pub enum AutostartDecision {
     NotApplicable,
-    Started { pid: u32 },
+    Started { pid: Option<u32> },
     AlreadyUp,
     Failed(PyDict),
 }

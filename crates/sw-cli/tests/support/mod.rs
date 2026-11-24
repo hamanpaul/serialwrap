@@ -26,7 +26,8 @@ use sw_pal::fakes::{
 use sw_pal::fs_ops::{FileLockGuard, FsOps, LinkKind};
 pub use sw_pal::proc_scan::{DaemonProc, ProcIdentity};
 pub use sw_pal::service_ctl::{
-    CompositeServiceCtl, HoldState, ServiceAction, ServiceCtl, SystemdCtl, WindowsServiceCtl,
+    AutostartHoldRecord, CmdRecord, CompositeServiceCtl, EnabledQuery, HoldState, ServiceAction,
+    ServiceCtl, ServiceResult, SupervisorDefinition, SystemdCtl, TaskQuery, WindowsServiceCtl,
     WindowsTaskCtl,
 };
 pub use sw_pal::traits::{Clock, FsRead, PalResult, SupervisionMode, SysEnv};
@@ -43,7 +44,8 @@ type EnvOp = Box<dyn Fn(FakeSysEnvBuilder) -> FakeSysEnvBuilder>;
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// `health.ping` 的成功回應（與 P3 client 的 JSON 形狀一致）。
-const OK_PING: &str = r#"{"ok":true,"pid":1234,"version":"test"}"#;
+const OK_PING: &str = r#"{"ok":true,"pong":true}"#;
+const OK_HEALTH_STATUS: &str = r#"{"ok":true,"pid":1234,"version":"test"}"#;
 /// `session.list` 的成功回應（空清單）。
 const OK_SESSION_LIST: &str = r#"{"ok":true,"sessions":[]}"#;
 /// 通用成功回應。
@@ -91,31 +93,50 @@ pub const LEGACY_CRASH_POINTS: &[&str] = &[
 type FsEventLog = Arc<Mutex<Vec<(u64, String)>>>;
 type FsMutationLog = Arc<Mutex<Vec<String>>>;
 type FsReadFault = Arc<Mutex<Option<(String, PalErrorKind)>>>;
-type EventFsParts = (Arc<dyn FsOps>, FsEventLog, FsMutationLog, FsReadFault);
+
+struct ConfigRewriteOnRead {
+    path: PathBuf,
+    read_number: usize,
+    read_count: usize,
+    contents: Vec<u8>,
+    applied: bool,
+}
 
 struct EventFs {
     inner: Arc<dyn FsOps>,
     events: FsEventLog,
     mutations: FsMutationLog,
     read_fault: FsReadFault,
+    config_rewrite_on_read: Arc<Mutex<Option<ConfigRewriteOnRead>>>,
+}
+
+struct EventFsHarness {
+    fs: Arc<dyn FsOps>,
+    events: FsEventLog,
+    mutations: FsMutationLog,
+    read_fault: FsReadFault,
+    config_rewrite_on_read: Arc<Mutex<Option<ConfigRewriteOnRead>>>,
 }
 
 impl EventFs {
-    fn wrap(inner: Arc<dyn FsOps>) -> EventFsParts {
+    fn wrap(inner: Arc<dyn FsOps>) -> EventFsHarness {
         let events = Arc::new(Mutex::new(Vec::new()));
         let mutations = Arc::new(Mutex::new(Vec::new()));
         let read_fault = Arc::new(Mutex::new(None));
-        (
-            Arc::new(Self {
+        let config_rewrite_on_read = Arc::new(Mutex::new(None));
+        EventFsHarness {
+            fs: Arc::new(Self {
                 inner,
                 events: Arc::clone(&events),
                 mutations: Arc::clone(&mutations),
                 read_fault: Arc::clone(&read_fault),
+                config_rewrite_on_read: Arc::clone(&config_rewrite_on_read),
             }),
             events,
             mutations,
             read_fault,
-        )
+            config_rewrite_on_read,
+        }
     }
 
     fn record_mutation(&self, operation: &str, path: &Path) {
@@ -147,6 +168,13 @@ impl EventFs {
                 .push((sw_pal::fakes::next_event_seq(), label));
         }
     }
+
+    fn record_event(&self, label: String) {
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((sw_pal::fakes::next_event_seq(), label));
+    }
 }
 
 impl FsRead for EventFs {
@@ -161,9 +189,45 @@ impl FsRead for EventFs {
                 return Err(sw_pal::traits::PalError::plain(kind, "fake read fault"));
             }
         }
+        let rewrite = {
+            let mut script = self
+                .config_rewrite_on_read
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            script.as_mut().and_then(|script| {
+                if script.path != path {
+                    return None;
+                }
+                script.read_count += 1;
+                if script.read_count == script.read_number && !script.applied {
+                    script.applied = true;
+                    Some(script.contents.clone())
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(contents) = rewrite {
+            self.inner.write_file(path, &contents)?;
+        }
         self.inner.read(path)
     }
-    fn exists(&self, path: &Path) -> bool { self.inner.exists(path) }
+
+    fn exists(&self, path: &Path) -> bool {
+        let exists = self.inner.exists(path);
+        match path.file_name().and_then(|name| name.to_str()) {
+            Some("autostart-hold.json") | Some("install-journal.json") => {
+                self.record_event(format!(
+                    "fs:check:{}:{}",
+                    path.file_name().unwrap().to_string_lossy(),
+                    if exists { "present" } else { "absent" }
+                ))
+            }
+            _ => {}
+        }
+        exists
+    }
+
     fn is_dir(&self, path: &Path) -> bool { self.inner.is_dir(path) }
     fn is_file(&self, path: &Path) -> bool { self.inner.is_file(path) }
     fn list_dir(&self, path: &Path) -> PalResult<Vec<String>> { self.inner.list_dir(path) }
@@ -233,7 +297,163 @@ impl FsOps for EventFs {
         self.inner.symlink_or_copy_dir(link, target)
     }
     fn file_lock_exclusive(&self, path: &Path, blocking: bool) -> PalResult<FileLockGuard> {
-        self.inner.file_lock_exclusive(path, blocking)
+        let result = self.inner.file_lock_exclusive(path, blocking);
+        if path.file_name().and_then(|name| name.to_str()) == Some(".install.lock") {
+            self.record_event(format!(
+                "fs:install-lock:{}",
+                if result.is_ok() { "acquired" } else { "busy" }
+            ));
+        }
+        result
+    }
+}
+
+/// 在顯式 start 的 `/ENABLE` 與 `/Run` 呼叫點模擬另一個生命週期交易。
+/// 若它能取得 `.install.lock`，就立即寫入 switch hold，讓測試捕捉未序列化的空窗。
+struct InstallLockContenderServiceCtl {
+    inner: Arc<dyn ServiceCtl>,
+    fs: Arc<dyn FsOps>,
+    install_lock: PathBuf,
+    switch_hold: PathBuf,
+    events: Arc<Mutex<Vec<(u64, String)>>>,
+}
+
+impl InstallLockContenderServiceCtl {
+    fn record(&self, label: String) {
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((sw_pal::fakes::next_event_seq(), label));
+    }
+
+    fn contend(&self, phase: &str) {
+        self.record(format!("transaction:attempt:{phase}"));
+        match self.fs.file_lock_exclusive(&self.install_lock, false) {
+            Ok(guard) => {
+                let write = self.fs.write_file(
+                    &self.switch_hold,
+                    br#"{"schema_version":1,"op":"supervision_set"}"#,
+                );
+                drop(guard);
+                self.record(format!(
+                    "transaction:acquired:{phase}:hold_written={}",
+                    write.is_ok()
+                ));
+            }
+            Err(_) => self.record(format!("transaction:blocked:{phase}")),
+        }
+    }
+}
+
+impl ServiceCtl for InstallLockContenderServiceCtl {
+    fn supported_modes(&self) -> Vec<SupervisionMode> {
+        self.inner.supported_modes()
+    }
+
+    fn action(
+        &self,
+        mode: &SupervisionMode,
+        action: ServiceAction,
+        with_sudo: bool,
+    ) -> ServiceResult {
+        if *mode == SupervisionMode::WindowsTask && action == ServiceAction::Start {
+            self.contend("before-run");
+        }
+        self.inner.action(mode, action, with_sudo)
+    }
+
+    fn action_named(
+        &self,
+        mode: &SupervisionMode,
+        name: &str,
+        action: ServiceAction,
+        with_sudo: bool,
+    ) -> ServiceResult {
+        self.inner.action_named(mode, name, action, with_sudo)
+    }
+
+    fn install(&self, def: &SupervisorDefinition, with_sudo: bool) -> Vec<CmdRecord> {
+        self.inner.install(def, with_sudo)
+    }
+
+    fn install_plan(&self, def: &SupervisorDefinition) -> Vec<Vec<String>> {
+        self.inner.install_plan(def)
+    }
+
+    fn uninstall(&self, mode: &SupervisionMode, with_sudo: bool) -> Vec<CmdRecord> {
+        self.inner.uninstall(mode, with_sudo)
+    }
+
+    fn uninstall_named(
+        &self,
+        mode: &SupervisionMode,
+        name: &str,
+        with_sudo: bool,
+    ) -> Vec<CmdRecord> {
+        self.inner.uninstall_named(mode, name, with_sudo)
+    }
+
+    fn set_enabled(
+        &self,
+        mode: &SupervisionMode,
+        enabled: bool,
+        with_sudo: bool,
+    ) -> Vec<CmdRecord> {
+        if *mode == SupervisionMode::WindowsTask && enabled {
+            self.contend("before-enable");
+        }
+        self.inner.set_enabled(mode, enabled, with_sudo)
+    }
+
+    fn query(&self, mode: &SupervisionMode) -> TaskQuery {
+        self.inner.query(mode)
+    }
+
+    fn query_named(&self, mode: &SupervisionMode, name: &str) -> TaskQuery {
+        self.inner.query_named(mode, name)
+    }
+
+    fn hard_stop(&self, mode: &SupervisionMode, with_sudo: bool) -> ServiceResult {
+        self.inner.hard_stop(mode, with_sudo)
+    }
+
+    fn hold_autostart(
+        &self,
+        mode: &SupervisionMode,
+        with_sudo: bool,
+    ) -> Result<AutostartHoldRecord, ServiceResult> {
+        self.inner.hold_autostart(mode, with_sudo)
+    }
+
+    fn release_autostart(
+        &self,
+        hold: &AutostartHoldRecord,
+        restore_enabled: Option<bool>,
+        with_sudo: bool,
+    ) -> Result<Vec<CmdRecord>, ServiceResult> {
+        self.inner
+            .release_autostart(hold, restore_enabled, with_sudo)
+    }
+
+    fn autostart_hold_state(&self, mode: &SupervisionMode) -> HoldState {
+        self.inner.autostart_hold_state(mode)
+    }
+
+    fn hold_autostart_named(
+        &self,
+        mode: &SupervisionMode,
+        name: &str,
+        with_sudo: bool,
+    ) -> Result<AutostartHoldRecord, ServiceResult> {
+        self.inner.hold_autostart_named(mode, name, with_sudo)
+    }
+
+    fn query_enabled(&self, mode: &SupervisionMode) -> EnabledQuery {
+        self.inner.query_enabled(mode)
+    }
+
+    fn main_pid(&self, mode: &SupervisionMode) -> Result<Option<u32>, String> {
+        self.inner.main_pid(mode)
     }
 }
 
@@ -263,6 +483,7 @@ pub struct TestEnv {
     fs_mutations: FsMutationLog,
     read_fault: FsReadFault,
     uart_operations: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    config_rewrite_on_read: Arc<Mutex<Option<ConfigRewriteOnRead>>>,
     clock: Arc<FakeClock>,
     rpc: Arc<FakeRpcConnector>,
     procs: Arc<FakeProcScan>,
@@ -272,6 +493,7 @@ pub struct TestEnv {
     registry: Option<Arc<FakeRegistry>>,
     crash_point: Option<String>,
     real_service: bool,
+    probe_install_lock_during_start: bool,
     retained_locks: Mutex<Vec<sw_pal::fs_ops::FileLockGuard>>,
     active_daemon_endpoint: Option<String>,
     active_daemon_pid: Option<u32>,
@@ -342,17 +564,18 @@ impl TestEnv {
 
     fn new(windows: bool) -> Self {
         let tmp_dir = tempfile::tempdir().expect("tempdir 建立失敗");
-        let (fs, fs_events, fs_mutations, read_fault) = EventFs::wrap(real_fs());
+        let event_fs = EventFs::wrap(real_fs());
         let mut t = Self {
             tmp_dir,
             windows,
             ops: Vec::new(),
             env: FakeSysEnv::builder().build(),
-            fs,
-            fs_events,
-            fs_mutations,
-            read_fault,
+            fs: event_fs.fs,
+            fs_events: event_fs.events,
+            fs_mutations: event_fs.mutations,
+            read_fault: event_fs.read_fault,
             uart_operations: None,
+            config_rewrite_on_read: event_fs.config_rewrite_on_read,
             clock: FakeClock::new(),
             rpc: FakeRpcConnector::new(),
             procs: FakeProcScan::new(Vec::new()),
@@ -362,6 +585,7 @@ impl TestEnv {
             registry: windows.then(|| FakeRegistry::new(Vec::new(), &[])),
             crash_point: None,
             real_service: false,
+            probe_install_lock_during_start: false,
             retained_locks: Mutex::new(Vec::new()),
             active_daemon_endpoint: None,
             active_daemon_pid: None,
@@ -492,6 +716,29 @@ impl TestEnv {
     pub fn with_config(self, s: &str) -> Self {
         std::fs::write(self.config_path(), s).expect("config.yaml 寫入失敗");
         self
+    }
+
+    /// 在指定次 config.yaml 讀取前套用新內容，模擬重讀競態中的設定切換。
+    pub fn with_config_rewritten_on_nth_read(self, read_number: usize, contents: &[u8]) -> Self {
+        *self
+            .config_rewrite_on_read
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(ConfigRewriteOnRead {
+            path: self.config_path(),
+            read_number,
+            read_count: 0,
+            contents: contents.to_vec(),
+            applied: false,
+        });
+        self
+    }
+
+    pub fn config_rewrite_applied(&self) -> bool {
+        self.config_rewrite_on_read
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .is_some_and(|script| script.applied)
     }
 
     pub fn with_var(self, k: &str, v: &str) -> Self {
@@ -691,6 +938,7 @@ impl TestEnv {
         for method in methods {
             let line = match *method {
                 "health.ping" => OK_PING,
+                "health.status" => OK_HEALTH_STATUS,
                 "session.list" => OK_SESSION_LIST,
                 _ => OK_EMPTY,
             };
@@ -733,7 +981,7 @@ impl TestEnv {
     /// 綁定同一計數器，故 `pid_alive` 與 ping 在同一次輪詢轉為不存活。
     pub fn with_daemon_alive_then_gone(mut self, ep: &str, pid: u32, n: usize) -> Self {
         let ep = self.isolated_endpoint(ep);
-        self.rpc.respond(&ep, "health.ping", &health_response(pid));
+        self.rpc.respond(&ep, "health.ping", OK_PING);
         self.rpc
             .respond(&ep, "health.status", &health_response(pid));
         self.rpc.respond(&ep, "session.list", OK_SESSION_LIST);
@@ -748,7 +996,7 @@ impl TestEnv {
 
     pub fn with_daemon_alive_forever(mut self, ep: &str, pid: u32) -> Self {
         let ep = self.isolated_endpoint(ep);
-        self.rpc.respond(&ep, "health.ping", &health_response(pid));
+        self.rpc.respond(&ep, "health.ping", OK_PING);
         self.rpc
             .respond(&ep, "health.status", &health_response(pid));
         let token = &sha256_hex(&format!("handoff-{pid}"))[..32];
@@ -774,7 +1022,7 @@ impl TestEnv {
         self.ensure_process();
         self.ensure_test_service(false);
         let ep = self.isolated_endpoint(ep);
-        self.rpc.respond(&ep, "health.ping", &health_response(pid));
+        self.rpc.respond(&ep, "health.ping", OK_PING);
         self.rpc
             .respond(&ep, "health.status", &health_response(pid));
         self.rpc.respond(&ep, "session.list", OK_SESSION_LIST);
@@ -1305,6 +1553,176 @@ impl TestEnv {
         self
     }
 
+    /// 在顯式 start 進入 `/ENABLE`、`/Run` 時，讓另一生命週期交易同步競爭同一安裝鎖。
+    pub fn with_install_lock_contender_during_start(mut self) -> Self {
+        self.probe_install_lock_during_start = true;
+        self
+    }
+
+    /// start 結束後競爭安裝鎖；成功時在鎖內建立 switch hold，供交易排序回歸驗證。
+    pub fn contender_create_switch_hold_after_start(&self) -> bool {
+        self.fs_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((
+                sw_pal::fakes::next_event_seq(),
+                "transaction:attempt:after-start".into(),
+            ));
+        let lock_path = self.install_root().join(".install.lock");
+        let hold_path = self.state_dir().join("autostart-hold.json");
+        let guard = match self.fs.file_lock_exclusive(&lock_path, false) {
+            Ok(guard) => guard,
+            Err(_) => {
+                self.fs_events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((
+                        sw_pal::fakes::next_event_seq(),
+                        "transaction:blocked:after-start".into(),
+                    ));
+                return false;
+            }
+        };
+        let write = self.fs.write_file(
+            &hold_path,
+            br#"{"schema_version":1,"op":"supervision_set"}"#,
+        );
+        drop(guard);
+        self.fs_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((
+                sw_pal::fakes::next_event_seq(),
+                format!(
+                    "transaction:acquired:after-start:hold_written={}",
+                    write.is_ok()
+                ),
+            ));
+        write.is_ok()
+    }
+
+    /// 測試命令完成後，以實際檔案系統確認安裝鎖目前可取得。
+    pub fn install_lock_available(&self) -> bool {
+        let lock_path = self.install_root().join(".install.lock");
+        self.fs
+            .file_lock_exclusive(&lock_path, false)
+            .map(drop)
+            .is_ok()
+    }
+
+    /// 測試命令完成後確認 install 與 autostart 兩把生命週期鎖都已釋放。
+    pub fn lifecycle_locks_available(&self) -> bool {
+        let install_path = self.install_root().join(".install.lock");
+        let autostart_path = self.run_dir().join("autostart.lock");
+        let Ok(install_guard) = self.fs.file_lock_exclusive(&install_path, false) else {
+            return false;
+        };
+        let Ok(autostart_guard) = self.fs.file_lock_exclusive(&autostart_path, false) else {
+            drop(install_guard);
+            return false;
+        };
+        drop(autostart_guard);
+        drop(install_guard);
+        true
+    }
+
+    /// 模擬安裝鎖競爭但鎖檔尚未建立，驗證呼叫端不能只靠 `.install.lock` 是否存在決定是否取鎖。
+    pub fn with_install_lock_blocker_without_lock_file(
+        mut self,
+        release_at_s: Option<f64>,
+    ) -> Self {
+        let lock_path = self.install_root().join(".install.lock");
+        let release_at_ns = release_at_s.map(|seconds| {
+            (seconds.max(0.0) * 1_000_000_000.0)
+                .ceil()
+                .min(u64::MAX as f64) as u64
+        });
+        let gate = FaultFs::wrap(Arc::clone(&self.fs));
+        gate.block_lock_until(&lock_path, Arc::clone(&self.clock), release_at_ns);
+        self.fs = gate;
+        self
+    }
+
+    /// 持有安裝交易鎖，於釋放時建立 journal，模擬 update／rollback 先取得鎖再記錄交易狀態。
+    pub fn with_install_lock_holder_creating_journal(mut self, release_at_s: f64) -> Self {
+        let lock_path = self.install_root().join(".install.lock");
+        let journal_path = self.install_root().join("install-journal.json");
+        let release_at_ns = (release_at_s.max(0.0) * 1_000_000_000.0)
+            .ceil()
+            .min(u64::MAX as f64) as u64;
+        let gate = FaultFs::wrap(Arc::clone(&self.fs));
+        gate.block_lock_until_and_create_file(
+            &lock_path,
+            Arc::clone(&self.clock),
+            release_at_ns,
+            &journal_path,
+            br#"{"step":"stop_supervisor"}"#,
+        );
+        self.fs = gate;
+        self
+    }
+
+    /// 持有安裝交易鎖，於釋放時將監管模式切為 on-demand。
+    pub fn with_install_lock_holder_switching_to_on_demand(mut self, release_at_s: f64) -> Self {
+        let lock_path = self.install_root().join(".install.lock");
+        let config_path = self.config_path();
+        let release_at_ns = (release_at_s.max(0.0) * 1_000_000_000.0)
+            .ceil()
+            .min(u64::MAX as f64) as u64;
+        let gate = FaultFs::wrap(Arc::clone(&self.fs));
+        gate.block_lock_until_and_create_file(
+            &lock_path,
+            Arc::clone(&self.clock),
+            release_at_ns,
+            &config_path,
+            b"supervision_mode: on-demand\n",
+        );
+        self.fs = gate;
+        self
+    }
+
+    /// 持有安裝交易鎖，於釋放時以指定內容取代 config.yaml。
+    pub fn with_install_lock_holder_writing_config(
+        mut self,
+        release_at_s: f64,
+        contents: &[u8],
+    ) -> Self {
+        let lock_path = self.install_root().join(".install.lock");
+        let config_path = self.config_path();
+        let release_at_ns = (release_at_s.max(0.0) * 1_000_000_000.0)
+            .ceil()
+            .min(u64::MAX as f64) as u64;
+        let gate = FaultFs::wrap(Arc::clone(&self.fs));
+        gate.block_lock_until_and_create_file(
+            &lock_path,
+            Arc::clone(&self.clock),
+            release_at_ns,
+            &config_path,
+            contents,
+        );
+        self.fs = gate;
+        self
+    }
+
+    /// 持有安裝交易鎖，於釋放時建立切換 hold，模擬監管模式交易先完成 hold 再讓 start 繼續。
+    pub fn with_install_lock_holder_creating_switch_hold(mut self, release_at_s: f64) -> Self {
+        let lock_path = self.install_root().join(".install.lock");
+        let hold_path = self.state_dir().join("autostart-hold.json");
+        let release_at_ns = (release_at_s.max(0.0) * 1_000_000_000.0)
+            .ceil()
+            .min(u64::MAX as f64) as u64;
+        let gate = FaultFs::wrap(Arc::clone(&self.fs));
+        gate.block_lock_until_and_create_file(
+            &lock_path,
+            Arc::clone(&self.clock),
+            release_at_ns,
+            &hold_path,
+            br#"{"schema_version":1,"op":"supervision_set"}"#,
+        );
+        self.fs = gate;
+        self
+    }
+
     pub fn acquire_install_lock(&mut self) {
         let lock_path = self.install_root().join(".install.lock");
         let guard = self.fs.file_lock_exclusive(&lock_path, false).expect("測試安裝鎖取得失敗");
@@ -1422,6 +1840,12 @@ impl TestEnv {
         self
     }
 
+    /// 將目前的 fake supervisor 替換為實際 PAL 控制器，保留同一個測試檔案系統與命令替身。
+    pub fn use_real_service(&mut self) {
+        self.service = None;
+        self.real_service = true;
+    }
+
     fn real_service_ctl(&self) -> Arc<dyn sw_pal::service_ctl::ServiceCtl> {
         let env: Arc<dyn SysEnv> = self.env.clone();
         let fs: Arc<dyn FsOps> = self.fs.clone();
@@ -1522,6 +1946,28 @@ impl TestEnv {
         self
     }
 
+    /// 持有自動啟動鎖，於釋放時將監管模式切為 windows-task。
+    pub fn with_autostart_lock_holder_switching_to_windows_task(
+        mut self,
+        release_at_s: f64,
+    ) -> Self {
+        let lock_path = self.run_dir().join("autostart.lock");
+        let config_path = self.config_path();
+        let release_at_ns = (release_at_s.max(0.0) * 1_000_000_000.0)
+            .ceil()
+            .min(u64::MAX as f64) as u64;
+        let gate = FaultFs::wrap(Arc::clone(&self.fs));
+        gate.block_lock_until_and_create_file(
+            &lock_path,
+            Arc::clone(&self.clock),
+            release_at_ns,
+            &config_path,
+            b"supervision_mode: windows-task\n",
+        );
+        self.fs = gate;
+        self
+    }
+
     /// `benches.state.json.lock` 被另一行程持有且不釋放：`bench_state::remember`／`forget` 取鎖失敗（P4-T9，SC-27）。
     pub fn with_bench_state_lock_holder(mut self) -> Self {
         let lock_path = self
@@ -1562,7 +2008,7 @@ impl TestEnv {
     pub fn with_restart_cycle(mut self, ep: &str, old_pid: u32, new_pid: u32) -> Self {
         let ep = self.isolated_endpoint(ep);
         self.rpc
-            .respond(&ep, "health.ping", &health_response(old_pid));
+            .respond(&ep, "health.ping", OK_PING);
         self.rpc
             .respond(&ep, "health.status", &health_response(old_pid));
         self.rpc
@@ -1921,7 +2367,18 @@ impl TestEnv {
         if let Some(s) = &self.service {
             b = b.service(s.clone());
         } else if self.real_service {
-            b = b.service(self.real_service_ctl());
+            let service = self.real_service_ctl();
+            if self.probe_install_lock_during_start {
+                b = b.service(Arc::new(InstallLockContenderServiceCtl {
+                    inner: service,
+                    fs: Arc::clone(&self.fs),
+                    install_lock: self.install_root().join(".install.lock"),
+                    switch_hold: self.state_dir().join("autostart-hold.json"),
+                    events: Arc::clone(&self.fs_events),
+                }));
+            } else {
+                b = b.service(service);
+            }
         }
         if let Some(p) = &self.process {
             b = b.process(p.clone());
