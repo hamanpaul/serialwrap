@@ -671,6 +671,97 @@ def test_required_cases_seed_preserves_full_denominator():
     _assert_required_cases_seed_preserves_full_denominator(ROOT, _injected_seed_reader)
 
 
+def test_required_cases_initial_exit_constants_match_catalog():
+    from tools.stage3 import required_cases
+
+    catalog = _load(ACC / "stage_exits.json")
+    by_id = {item["item_id"]: item for item in catalog["items"]}
+    assert required_cases.INITIAL_REQUIRED_CASE_EXITS
+    for item_id, initial in required_cases.INITIAL_REQUIRED_CASE_EXITS.items():
+        item = by_id[item_id]
+        assert item["stage"] == "3"
+        assert item["release_requirement"] == "required"
+        assert required_cases._applicable_platforms(item) == initial["platforms"]
+        assert item["layer"] == initial["layer"]
+        assert item["required_case_set"] == initial["required_case_set"]
+        families = item["required_families"]
+        assert (tuple(families) if isinstance(families, list) else families) == initial["required_families"]
+
+
+def _first_pr_reader_without_stage3_lock(source_reader):
+    def read(revision: str, repo_path: str) -> bytes | None:
+        if revision == "base-revision" and repo_path in {
+            "tests/acceptance/stage3_required_cases.lock.json",
+            "docs/rust-refactor/evidence/denominators/source-manifest.json",
+        }:
+            return None
+        return source_reader(revision, repo_path)
+
+    return read
+
+
+def _prepare_first_pr_initial_exit_attack(root: Path, attack: str) -> None:
+    from tools.stage3 import required_cases
+    import yaml
+
+    acceptance = root / "tests" / "acceptance"
+    catalog_path = acceptance / "stage_exits.json"
+    lock_path = acceptance / "stage3_required_cases.lock.json"
+    catalog = _load(catalog_path)
+    lock = _load(lock_path)
+    target_id = "S3-L15-RELEASE-AB-WINDOWS"
+    target = next(item for item in catalog["items"] if item["item_id"] == target_id)
+
+    if attack == "added_exit_shrinks_original":
+        added = copy.deepcopy(target)
+        added["item_id"] = "S3-L15-RELEASE-AB-WINDOWS-ADDED-FIXTURE"
+        added["title"] = "新增同層 Windows 出口 fixture"
+        catalog["items"].append(added)
+        target["required_families"] = ["L15"]
+        cases = yaml.safe_load((acceptance / "cases.yaml").read_text(encoding="utf-8"))
+        case_lock = _load(acceptance / "cases.lock.json")
+        expected = required_cases._expected_exit_cases(catalog, cases, case_lock)
+        lock["exits"][target_id] = expected[target_id]
+        lock["exits"][added["item_id"]] = expected[added["item_id"]]
+    elif attack == "rename_initial_exit":
+        renamed_id = f"{target_id}-RENAMED"
+        target["item_id"] = renamed_id
+        lock["exits"][renamed_id] = lock["exits"].pop(target_id)
+    elif attack == "change_l3_required_families":
+        target = next(
+            item for item in catalog["items"] if item["item_id"] == "S3-L3-P0P1-REMOTE-WINDOWS"
+        )
+        target["required_families"] = ["P0", "P1", "remote"]
+    else:
+        raise AssertionError(f"未知反例：{attack}")
+
+    catalog_path.write_text(json.dumps(catalog, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                            encoding="utf-8")
+    lock_path.write_text(json.dumps(lock, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                         encoding="utf-8")
+
+
+@pytest.mark.parametrize("mode", ["--check", "--add-only"])
+@pytest.mark.parametrize("attack", [
+    "added_exit_shrinks_original",
+    "rename_initial_exit",
+    "change_l3_required_families",
+])
+def test_first_pr_rejects_initial_exit_identity_and_attribute_changes(tmp_path, capsys, mode, attack):
+    from tools.stage3 import required_cases
+
+    root, source_reader = _required_cases_repo(tmp_path)
+    _prepare_first_pr_initial_exit_attack(root, attack)
+    lock_path = root / "tests" / "acceptance" / "stage3_required_cases.lock.json"
+    before = lock_path.read_bytes()
+
+    result = required_cases.main([mode, "--base", "base-revision"], repo_root=root,
+                                 source_reader=_first_pr_reader_without_stage3_lock(source_reader))
+
+    assert result != 0, capsys.readouterr().out
+    assert lock_path.read_bytes() == before
+
+
 def _append_required_case(root: Path, case_id: str, *, family: str) -> dict:
     import yaml
 
@@ -982,8 +1073,13 @@ def test_required_cases_add_only_registers_new_platform(tmp_path):
     acceptance = root / "tests" / "acceptance"
     catalog_path = acceptance / "stage_exits.json"
     catalog = _load(catalog_path)
-    item = next(item for item in catalog["items"] if item["item_id"] == "S3-L15-RELEASE-AB-LINUX")
+    item = copy.deepcopy(next(
+        item for item in catalog["items"] if item["item_id"] == "S3-L3-P0P1-REMOTE-WINDOWS"
+    ))
+    item["item_id"] = "S3-L3-P0P1-REMOTE-WINDOWS-ADDED-BOTH-FIXTURE"
     item["platform"] = "both"
+    item["title"] = "新增雙平台 Stage 3 出口 fixture"
+    catalog["items"].append(item)
     catalog_path.write_text(json.dumps(catalog, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
                             encoding="utf-8")
 
@@ -991,7 +1087,7 @@ def test_required_cases_add_only_registers_new_platform(tmp_path):
                                  source_reader=source_reader)
     assert result == 0
     updated = _load(acceptance / "stage3_required_cases.lock.json")
-    assert "windows" in updated["exits"]["S3-L15-RELEASE-AB-LINUX"]
+    assert set(updated["exits"][item["item_id"]]) == {"linux", "windows"}
 
 
 @pytest.mark.parametrize("mode", ["--check", "--add-only"])
@@ -1220,11 +1316,10 @@ def test_required_cases_formal_seed_assertion_allows_exit_and_platform_growth(tm
     added_exit = copy.deepcopy(next(
         item for item in catalog["items"] if item["item_id"] == "S3-L3-P0P1-REMOTE-WINDOWS"
     ))
-    added_exit["item_id"] = "S3-L3-P0P1-REMOTE-WINDOWS-ADDED-INTEGRATION"
-    added_exit["title"] = "合法新增 Stage 3 出口整合 fixture"
+    added_exit["item_id"] = "S3-L3-P0P1-REMOTE-BOTH-ADDED-INTEGRATION"
+    added_exit["platform"] = "both"
+    added_exit["title"] = "合法新增雙平台 Stage 3 出口整合 fixture"
     catalog["items"].append(added_exit)
-    dual_platform = next(item for item in catalog["items"] if item["item_id"] == "S3-L15-RELEASE-AB-LINUX")
-    dual_platform["platform"] = "both"
     catalog_path.write_text(json.dumps(catalog, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
                             encoding="utf-8")
 
@@ -1240,6 +1335,8 @@ def test_required_cases_formal_seed_assertion_allows_exit_and_platform_growth(tm
                                source_reader=base_reader) == 0
     assert required_cases.main(["--check", "--base", "base-revision"], repo_root=root,
                                source_reader=base_reader) == 0
+    grown_lock = _load(lock_path)
+    assert set(grown_lock["exits"][added_exit["item_id"]]) == {"linux", "windows"}
 
     _assert_required_cases_seed_preserves_full_denominator(root, base_reader)
 

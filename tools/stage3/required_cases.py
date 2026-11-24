@@ -17,6 +17,52 @@ SEED_REVISION = "59d8c7f1eb7de1ae2a90cefd6df21ce945d695d2"
 SEED_DECISION = "OD-113"
 SEED_EXCLUDED = ["lr-mixed"]
 STAGE3_CASE_EXIT_LAYERS = ("L1.5", "L2", "L3")
+# plan10 Task 1 R4-01 核定的首版案例出口身分與屬性。後續出口／平台可新增；
+# 這些既有 ID 及其屬性、各自分母不得由目錄或候選鎖改寫。
+INITIAL_REQUIRED_CASE_EXITS: dict[str, dict[str, Any]] = {
+    "S3-L15-RELEASE-AB-LINUX": {
+        "platforms": ("linux",),
+        "layer": "L1.5",
+        "required_case_set": "slice_2.4",
+        "required_families": None,
+        "release_requirement": "required",
+    },
+    "S3-L15-RELEASE-AB-WINDOWS": {
+        "platforms": ("windows",),
+        "layer": "L1.5",
+        "required_case_set": "slice_2.4",
+        "required_families": None,
+        "release_requirement": "required",
+    },
+    "S3-L2-FULL-AB-LINUX": {
+        "platforms": ("linux",),
+        "layer": "L2",
+        "required_case_set": "slice_2.4",
+        "required_families": None,
+        "release_requirement": "required",
+    },
+    "S3-L2-AB-WINDOWS": {
+        "platforms": ("windows",),
+        "layer": "L2",
+        "required_case_set": "slice_2.4",
+        "required_families": None,
+        "release_requirement": "required",
+    },
+    "S3-L3-P0P1-REMOTE-LINUX": {
+        "platforms": ("linux",),
+        "layer": "L3",
+        "required_case_set": "slice_2.4",
+        "required_families": ("P0", "P1", "remote", "WIN"),
+        "release_requirement": "required",
+    },
+    "S3-L3-P0P1-REMOTE-WINDOWS": {
+        "platforms": ("windows",),
+        "layer": "L3",
+        "required_case_set": "slice_2.4",
+        "required_families": ("P0", "P1", "remote", "WIN"),
+        "release_requirement": "required",
+    },
+}
 SEED_FILES = {
     "tests/acceptance/cases.yaml": "denominators/cases.yaml",
     "tests/acceptance/cases.lock.json": "denominators/cases.lock.json",
@@ -311,8 +357,8 @@ def _expected_exit_cases(
     return expected
 
 
-def _seed_required_cases_by_layer_platform(evidence_root: Path) -> dict[tuple[str, str], set[str]]:
-    """只用經核實的固定附件展開各層級／平台的 seed 必要案例下限。"""
+def _seed_required_cases_by_initial_exit(evidence_root: Path) -> dict[tuple[str, str], set[str]]:
+    """只用固定附件，依核定初始出口各自展開 seed 必要案例下限。"""
     try:
         cases_doc = yaml.safe_load((evidence_root / SEED_FILES["tests/acceptance/cases.yaml"]).read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
@@ -322,56 +368,81 @@ def _seed_required_cases_by_layer_platform(evidence_root: Path) -> dict[tuple[st
     case_lock = _read_json(evidence_root / SEED_FILES["tests/acceptance/cases.lock.json"])
     case_map, slice_ids = _case_maps(cases_doc, case_lock)
     required: dict[tuple[str, str], set[str]] = {}
-    for layer in STAGE3_CASE_EXIT_LAYERS:
-        for platform in ("linux", "windows"):
+    for item_id, attributes in INITIAL_REQUIRED_CASE_EXITS.items():
+        case_set = case_lock.get("sets", {}).get(attributes["required_case_set"])
+        if not isinstance(case_set, list):
+            raise ValueError(f"固定 seed 缺少案例集合：{attributes['required_case_set']}")
+        eligible_ids = set(case_set)
+        for platform in attributes["platforms"]:
             case_ids = {
-                case_id for case_id in slice_ids
+                case_id for case_id in eligible_ids
                 if case_id not in SEED_EXCLUDED
-                and case_map[case_id].get("layer") == layer
+                and case_id in case_map
+                and case_map[case_id].get("layer") == attributes["layer"]
                 and case_map[case_id].get("necessity") == "required"
                 and platform in case_map[case_id].get("platforms", [])
+                # L3 families 僅為目錄資訊；L1.5／L2 僅在核定值非 null 時篩選。
+                and (
+                    attributes["layer"] == "L3"
+                    or attributes["required_families"] is None
+                    or case_map[case_id].get("family") in attributes["required_families"]
+                )
             }
-            if case_ids:
-                required[(layer, platform)] = case_ids
+            required[(item_id, platform)] = case_ids
     return required
 
 
+def _validate_initial_exit_catalog(catalog: Mapping[str, Any]) -> list[str]:
+    """核對首版出口仍以核定 ID、平台及目錄屬性出現。"""
+    items = catalog.get("items")
+    if not isinstance(items, list):
+        return ["stage_exits.json 缺少 items，無法核對核定初始出口"]
+    errors: list[str] = []
+    for item_id, attributes in INITIAL_REQUIRED_CASE_EXITS.items():
+        matches = [item for item in items if isinstance(item, Mapping) and item.get("item_id") == item_id]
+        if len(matches) != 1:
+            errors.append(f"stage_exits.json 必須恰有核定初始出口：{item_id}")
+            continue
+        item = matches[0]
+        if item.get("stage") != "3":
+            errors.append(f"核定初始出口 stage 不可變更：{item_id}")
+        try:
+            platforms = _applicable_platforms(item)
+        except ValueError:
+            platforms = ()
+        checks = {
+            "platforms": platforms,
+            "layer": item.get("layer"),
+            "required_case_set": item.get("required_case_set"),
+            "required_families": (
+                tuple(item["required_families"])
+                if isinstance(item.get("required_families"), list) else item.get("required_families")
+            ),
+            "release_requirement": item.get("release_requirement"),
+        }
+        for key, actual in checks.items():
+            if actual != attributes[key]:
+                errors.append(f"核定初始出口屬性不可變更：{item_id}/{key}")
+    return errors
+
+
 def _validate_seed_floor(
-    lock: Mapping[str, Any], catalog: Mapping[str, Any], seed_required: Mapping[tuple[str, str], set[str]],
+    lock: Mapping[str, Any], seed_required: Mapping[tuple[str, str], set[str]],
 ) -> list[str]:
-    """確認目錄出口及候選鎖聯集至少保留 seed 的層級／平台案例。"""
+    """確認每個核定初始出口／平台各自保留完整固定 seed 案例。"""
     errors: list[str] = []
     exits = lock.get("exits")
     if not isinstance(exits, dict):
         return ["分母鎖缺少 exits，無法核對固定 seed 基準"]
-    items = catalog.get("items")
-    if not isinstance(items, list):
-        return ["stage_exits.json 缺少 items，無法核對固定 seed 基準"]
-    for (layer, platform), seed_ids in seed_required.items():
-        matching = []
-        for item in items:
-            if not isinstance(item, Mapping):
-                continue
-            if (item.get("stage") != "3" or item.get("layer") != layer
-                    or item.get("release_requirement") != "required"
-                    or item.get("required_case_set") != "slice_2.4"):
-                continue
-            if platform in _applicable_platforms(item):
-                matching.append(item)
-        if not matching:
-            errors.append(f"stage_exits.json 缺少固定 seed 基準案例出口：{layer}/{platform}")
-            continue
-        locked_ids: set[str] = set()
-        for item in matching:
-            item_lock = exits.get(item.get("item_id"))
-            entry = item_lock.get(platform) if isinstance(item_lock, Mapping) else None
-            case_ids = entry.get("case_ids") if isinstance(entry, Mapping) else None
-            if isinstance(case_ids, list):
-                locked_ids.update(case_id for case_id in case_ids if isinstance(case_id, str))
+    for (item_id, platform), seed_ids in seed_required.items():
+        item_lock = exits.get(item_id)
+        entry = item_lock.get(platform) if isinstance(item_lock, Mapping) else None
+        case_ids = entry.get("case_ids") if isinstance(entry, Mapping) else None
+        locked_ids = {case_id for case_id in case_ids if isinstance(case_id, str)} if isinstance(case_ids, list) else set()
         missing = seed_ids - locked_ids
         if missing:
             errors.append(
-                f"分母鎖小於固定 seed 基準 {layer}/{platform}：{', '.join(sorted(missing))}"
+                f"分母鎖小於固定 seed 基準 {item_id}/{platform}：{', '.join(sorted(missing))}"
             )
     return errors
 
@@ -651,10 +722,11 @@ def main(
         if errors:
             raise ValueError("；".join(errors))
         expected = _expected_exit_cases(catalog, cases_doc, case_lock)
-        seed_required = _seed_required_cases_by_layer_platform(root / EVIDENCE_RELATIVE)
+        seed_required = _seed_required_cases_by_initial_exit(root / EVIDENCE_RELATIVE)
         lock_path = root / ACCEPTANCE_RELATIVE / "stage3_required_cases.lock.json"
         if args.check:
-            check_errors = _validate_seed_floor(lock, catalog, seed_required)
+            check_errors = _validate_initial_exit_catalog(catalog)
+            check_errors.extend(_validate_seed_floor(lock, seed_required))
             check_errors.extend(_seed_family_errors(cases_doc, root / EVIDENCE_RELATIVE))
             check_errors.extend(_validate_lock(lock, expected))
             if args.base:
@@ -667,7 +739,8 @@ def main(
             return 0
 
         # 先核對舊鎖仍與目前目錄相容，並確認 PR base 的所有權分母未被刪改。
-        precheck_errors = _validate_seed_floor(lock, catalog, seed_required)
+        precheck_errors = _validate_initial_exit_catalog(catalog)
+        precheck_errors.extend(_validate_seed_floor(lock, seed_required))
         precheck_errors.extend(_validate_lock(lock, expected, allow_missing=True))
         if args.base:
             precheck_errors.extend(_base_errors(
@@ -702,7 +775,8 @@ def main(
                     entry["case_ids"] = sorted(existing | desired)
                     changed = True
 
-        final_errors = _validate_seed_floor(updated, catalog, seed_required)
+        final_errors = _validate_initial_exit_catalog(catalog)
+        final_errors.extend(_validate_seed_floor(updated, seed_required))
         final_errors.extend(_validate_lock(updated, expected))
         if args.base:
             final_errors.extend(_base_errors(
