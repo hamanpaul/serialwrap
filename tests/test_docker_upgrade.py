@@ -1290,6 +1290,8 @@ def test_doctor_profile_expectation_policy_p290_phases():
 @pytest.mark.memory_only
 def test_profile_template_field_scanner_ignores_multiline_quoted_value(fake_driver):
     """YAML 多行 scalar 內的欄位文字不可被當成 prpl-template 的實際 key。"""
+    import yaml
+
     driver, _fake = fake_driver(cli_version=NEW_VERSION)
     text = (
         'profiles:\n'
@@ -1299,6 +1301,8 @@ def test_profile_template_field_scanner_ignores_multiline_quoted_value(fake_driv
         '    timeout_recovery_keys: [CTRL_C]\n'
         '    prompt ends"\n'
     )
+    parsed = yaml.safe_load(text)
+    assert "timeout_recovery_keys" not in parsed["profiles"]["prpl-template"]
     target = driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
     live = driver.doctor_profile_dir / "default.yaml"
     target.write_text(text, encoding="utf-8")
@@ -1312,12 +1316,18 @@ def test_profile_template_field_scanner_ignores_multiline_quoted_value(fake_driv
     assert result["verdict"] == "FAIL", result
     assert migration["detail"]["target_asset_has_field"] is False, migration
     assert migration["detail"]["live_profile_has_field"] is False, migration
+    for source in ("target_asset_yaml", "live_profile_yaml"):
+        evidence = migration["detail"][source]
+        assert evidence["pyyaml_version"], evidence
+        assert evidence["parser_attempts"][-1]["status"] == "field_missing", evidence
 
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_profile_template_field_scanner_accepts_quoted_mapping_key(fake_driver):
     """YAML quoted key 仍是 template 的實際頂層欄位。"""
+    import yaml
+
     driver, _fake = fake_driver(cli_version=NEW_VERSION)
     text = (
         "profiles:\n"
@@ -1325,6 +1335,8 @@ def test_profile_template_field_scanner_accepts_quoted_mapping_key(fake_driver):
         "    platform: prpl\n"
         '    "timeout_recovery_keys": [CTRL_C]\n'
     )
+    parsed = yaml.safe_load(text)
+    assert parsed["profiles"]["prpl-template"]["timeout_recovery_keys"] == ["CTRL_C"]
     target = driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
     live = driver.doctor_profile_dir / "default.yaml"
     target.write_text(text, encoding="utf-8")
@@ -1338,6 +1350,48 @@ def test_profile_template_field_scanner_accepts_quoted_mapping_key(fake_driver):
     assert result["verdict"] == "PASS", result
     assert migration["detail"]["target_asset_has_field"] is True, migration
     assert migration["detail"]["live_profile_has_field"] is True, migration
+    for source in ("target_asset_yaml", "live_profile_yaml"):
+        evidence = migration["detail"][source]
+        assert evidence["pyyaml_version"], evidence
+        assert evidence["parser_attempts"][-1]["status"] == "ok", evidence
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_profile_template_migration_accepts_merged_mapping_key(fake_driver):
+    """YAML merge key 合併出的 template 欄位須由解析器正確辨識。"""
+    import yaml
+
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    text = (
+        "common_profile: &common_profile\n"
+        "  timeout_recovery_keys: [CTRL_C]\n"
+        "profiles:\n"
+        "  prpl-template:\n"
+        "    platform: prpl\n"
+        "    <<: *common_profile\n"
+    )
+    parsed = yaml.safe_load(text)
+    assert parsed["profiles"]["prpl-template"]["timeout_recovery_keys"] == ["CTRL_C"]
+
+    target = driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
+    live = driver.doctor_profile_dir / "default.yaml"
+    target.write_text(text, encoding="utf-8")
+    live.write_text(text, encoding="utf-8")
+
+    result = driver.judge_doctor(
+        "doctor_green_new", "YAML merge key 欄位反例", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+
+    migration = result["detail"]["p290_profile_migration"]
+    assert result["verdict"] == "PASS", result
+    assert migration["detail"]["target_asset_has_field"] is True, migration
+    assert migration["detail"]["live_profile_has_field"] is True, migration
+    for source in ("target_asset_yaml", "live_profile_yaml"):
+        evidence = migration["detail"][source]
+        assert evidence["pyyaml_version"], evidence
+        assert evidence["parser_attempts"][-1]["status"] == "ok", evidence
 
 
 @pytest.mark.core_portable
@@ -1510,13 +1564,24 @@ def test_upgrade_prefers_candidate_runtime_for_profile_yaml_probe(fake_driver):
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
-def test_upgrade_falls_back_when_candidate_runtime_lacks_pyyaml(fake_driver):
+def test_upgrade_falls_back_when_candidate_runtime_lacks_pyyaml(fake_driver, monkeypatch):
     """候選 runtime 缺 PyYAML 時改用舊版 venv，並記錄兩次解析器選擇。"""
     driver, _fake = fake_driver(cli_version=NEW_VERSION)
     candidate_python = driver.bundle / "versions" / NEW_VERSION / "py" / "bin" / "python3"
     candidate_python.parent.mkdir(parents=True)
-    candidate_python.write_text("#!/bin/sh\nexec /usr/bin/python3 -S \"$@\"\n", encoding="utf-8")
-    candidate_python.chmod(0o755)
+    candidate_python.write_text("candidate runtime is stubbed by this test\n", encoding="utf-8")
+    fallback_python = (Path(driver.env["HOME"]) / ".local" / "share" / "pipx" / "venvs"
+                       / "serialwrap" / "bin" / "python")
+    real_run = uc.subprocess.run
+    attempted_interpreters = []
+
+    def run_candidate_probe(argv, **kwargs):
+        attempted_interpreters.append(str(argv[0]))
+        if str(argv[0]) == str(candidate_python):
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"status": "missing_pyyaml"}), "")
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(uc.subprocess, "run", run_candidate_probe)
 
     result = driver.judge_doctor(
         "doctor_green_new", "候選 runtime 缺 PyYAML 時回退", require_pairing=True,
@@ -1525,13 +1590,12 @@ def test_upgrade_falls_back_when_candidate_runtime_lacks_pyyaml(fake_driver):
 
     migration = result["detail"]["p290_profile_migration"]
     yaml_evidence = migration["detail"]["target_asset_yaml"]
-    fallback_python = (Path(driver.env["HOME"]) / ".local" / "share" / "pipx" / "venvs"
-                       / "serialwrap" / "bin" / "python")
     assert result["verdict"] == "PASS", result
     assert yaml_evidence["interpreter_path"] == str(fallback_python), yaml_evidence
     assert yaml_evidence["pyyaml_version"], yaml_evidence
     assert yaml_evidence["parser_attempts"][0]["status"] == "missing_pyyaml", yaml_evidence
     assert yaml_evidence["parser_attempts"][1]["status"] == "ok", yaml_evidence
+    assert attempted_interpreters == [str(candidate_python), str(fallback_python)] * 2, attempted_interpreters
 
 
 @pytest.mark.core_portable
