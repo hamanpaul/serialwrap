@@ -807,6 +807,97 @@ class TestUARTBridgeTcpConsole(unittest.TestCase):
         finally:
             s.close()
 
+    def test_tcp_console_owner_tracks_raw_owner(self) -> None:
+        # #275：session 層靠 tcp_console_owner() 鏡像 bridge 直接授予的擁有權。agent 命令期間
+        # （owner 暫存於 _suspended_owner）仍回同一位人類；斷線後回 None。
+        self.assertIsNone(self._bridge.tcp_console_owner())
+        s = self._connect()
+        try:
+            owner = self._bridge.snapshot()["interactive_owner"]
+            self.assertTrue(owner and owner.startswith("human:"))
+            self.assertEqual(self._bridge.tcp_console_owner(), owner)
+            self._bridge.suspend_interactive()
+            try:
+                self.assertIsNone(self._bridge.snapshot()["interactive_owner"])
+                self.assertEqual(self._bridge.tcp_console_owner(), owner)
+            finally:
+                self._bridge.resume_interactive()
+        finally:
+            s.close()
+        for _ in range(40):
+            if self._bridge.tcp_console_owner() is None:
+                break
+            time.sleep(0.05)
+        self.assertIsNone(self._bridge.tcp_console_owner())
+
+    def _wait_tcp_owner(self, expect_none: bool) -> None:
+        for _ in range(40):
+            if (self._bridge.tcp_console_owner() is None) == expect_none:
+                return
+            time.sleep(0.05)
+
+    def test_session_mirrors_tcp_console_owner_across_reconnect(self) -> None:
+        # #275 端到端：真 TCP console＋SessionManager。A 打字後 human_attached／human_active
+        # 為 true；A 斷線、B 連入後鏡像 lease 跟著換成 B，且 B 的 raw 擁有權不被清掉。
+        import sw_core.session_manager as sm_mod
+        from sw_core.config import SessionProfile
+        from sw_core.session_manager import SessionManager
+        from sw_core.wal import WalWriter
+
+        with mock.patch.object(sm_mod, "STATE_PATH", os.path.join(self._tmp.name, "state.json")):
+            mgr = SessionManager(
+                [
+                    SessionProfile(
+                        profile_name="tcp-test",
+                        com="COM9",
+                        act_no=0,
+                        alias="tcp",
+                        platform="passthrough",
+                        device_by_id="COM9",
+                        uart=UartProfile(),
+                        prompt_regex=r"(?m)^# ",
+                    )
+                ],
+                WalWriter(wal_dir=self._tmp.name),
+                on_ready=lambda _: None,
+                on_detached=lambda _: None,
+            )
+            session = mgr.get_session("COM9")
+            assert session is not None
+            session.bridge = self._bridge
+            session.state = "READY"
+
+            a = self._connect()
+            try:
+                _drain_sock(a)
+                a.sendall(b"x")
+                time.sleep(0.2)
+                owner_a = self._bridge.tcp_console_owner()
+                self.assertIsNotNone(owner_a)
+                with mgr._lock:
+                    lease_a, _ = mgr._refresh_interactive_locked(session)
+                    ctx = mgr._lease_context(lease_a, bridge=self._bridge)
+                assert lease_a is not None
+                self.assertEqual(lease_a.owner, owner_a)
+                self.assertTrue(ctx["human_attached"])
+                self.assertTrue(ctx["human_active"])
+            finally:
+                a.close()
+            self._wait_tcp_owner(expect_none=True)
+
+            b = self._connect()
+            try:
+                owner_b = self._bridge.tcp_console_owner()
+                self.assertIsNotNone(owner_b)
+                self.assertNotEqual(owner_b, owner_a)
+                with mgr._lock:
+                    lease_b, _ = mgr._refresh_interactive_locked(session)
+                assert lease_b is not None
+                self.assertEqual(lease_b.owner, owner_b)
+                self.assertEqual(self._bridge.snapshot()["interactive_owner"], owner_b)
+            finally:
+                b.close()
+
     def test_vtty_alive_true_for_tcp_console(self) -> None:
         # TCP console（#84 review）：vtty 是 "host:port"，os.path.exists 永遠 False；snapshot 應改以
         # listener 是否在監聽判定 vtty_alive，避免 SessionManager 誤判 VTTY_STALE/SESSION_NOT_READY。

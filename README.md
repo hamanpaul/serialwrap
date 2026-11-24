@@ -866,7 +866,11 @@ automatically, no `--endpoint` needed, #131). Each session exposes a human
 console as a loopback TCP listener that speaks **Telnet** — connect with
 TeraTerm (Service: Telnet) or PuTTY (Telnet) for char-at-a-time interaction
 with remote echo; the `host:port` is shown as `console_endpoint` in
-`session list`.
+`session list`. The first Telnet console holds raw ownership just like a
+`console-attach`ed minicom on Linux: `self-test` reports `human_attached` /
+`human_active` for it, idle soft-preempt and reprobe deferral apply, and CLI
+commands with a bare `--source human` get `SESSION_INTERACTIVE_BUSY` while it
+is connected (#275).
 
 ```powershell
 serialwrap.exe daemon start        # spawns serialwrapd.exe detached, binds tcp loopback
@@ -2957,7 +2961,7 @@ serialwrap wal current-seq
   - 後端自動依平台選擇，`SERIALWRAP_SERIAL_BACKEND`（`auto`／`posix`／`pyserial`）可覆寫；`pyserial` 為 Windows 後端執行期依賴（`pyproject` `sys_platform=='win32'`）。
 - **human console（PORT-2）**
   - **Linux/WSL**：PTY（minicom 開 `/dev/pts/N`），行為不變。
-  - **Windows**：無 PTY → `UARTBridge` 開 `127.0.0.1` TCP listener，且 listener 講 **Telnet**（#131：accept 即主動協商 WILL ECHO／WILL SGA／DO SGA／WILL BINARY，入向吞協商並把 NVT 的 CR NUL／CR LF 摺疊為單一 CR、出向逸出 0xFF）——**TeraTerm（TCP/IP, Service=Telnet）或 PuTTY（Telnet）**連入即得逐字元互動與遠端回顯（體驗同 ssh），沿用 raw ownership / suspend-resume coexistence / RX fan-out（agent 下命令期間連線不中斷）。raw（Service=Other／PuTTY Raw）仍可連作備援，惟連線瞬間會見到 12 bytes 協商 greeting、且 0xFF 依 telnet 語意處理。連線端點見 `session list` 每個 session 的 `console_endpoint` 欄位（#131），或 `session console-attach` 回傳的 `endpoint`（`protocol: "telnet"`）。
+  - **Windows**：無 PTY → `UARTBridge` 開 `127.0.0.1` TCP listener，且 listener 講 **Telnet**（#131：accept 即主動協商 WILL ECHO／WILL SGA／DO SGA／WILL BINARY，入向吞協商並把 NVT 的 CR NUL／CR LF 摺疊為單一 CR、出向逸出 0xFF）——**TeraTerm（TCP/IP, Service=Telnet）或 PuTTY（Telnet）**連入即得逐字元互動與遠端回顯（體驗同 ssh），沿用 raw ownership / suspend-resume coexistence / RX fan-out（agent 下命令期間連線不中斷）。raw（Service=Other／PuTTY Raw）仍可連作備援，惟連線瞬間會見到 12 bytes 協商 greeting、且 0xFF 依 telnet 語意處理。連線端點見 `session list` 每個 session 的 `console_endpoint` 欄位（#131），或 `session console-attach` 回傳的 `endpoint`（`protocol: "telnet"`）。首個 Telnet console 持有 raw 擁有權時，session 層的待遇與 Linux 上經 `console-attach` 的 minicom 相同：`self-test` 會回報 `human_attached`／`human_active`，閒置 soft preempt 與 reprobe 暫緩都適用；連線期間以 bare `--source human` 送的 CLI 命令會回 `SESSION_INTERACTIVE_BUSY`（#275）。
 - 真機驗證：Windows 對 CH340（`COM8`，TxRx 短接 loopback）實測序列埠 start/RX/TX/WAL/clean-stop 與 TCP console raw/雙向/agent coexistence/斷線偵測全數通過。
 - **Rust daemon 的 console 後端（Slice 2.2）**：依平台選擇——Linux/WSL 為 PTY、Windows 為 loopback Telnet listener；`SERIALWRAP_CONSOLE_BACKEND`（`auto`／`pty`／`tcp`，不分大小寫）可覆寫，Linux 上設 `tcp` 即走與 Windows 相同的 Telnet listener（每個 bridge 一個 `127.0.0.1` ephemeral port，recover／clear 後重新綁定），`session console-attach` 回 `{"client_id": null, "endpoint": "127.0.0.1:<port>", "transport": "tcp", "protocol": "telnet"}` 且不開 lease（OD-85），`session list` 每列都有 `console_endpoint`。listener 只綁 `127.0.0.1`：**同機任何本機使用者都能連線**（OD-12 信任範圍），請部署在單人工作站。選配 com0com Serial console 於 `config.yaml` 的 `windows.serial_console`（`{<DUT COM>: {console_port, peer_port}}`）設定；對應 DUT bridge 與 TCP listener 建立後，daemon 開啟 `console_port`，外接終端連接 `peer_port`。兩端埠自動排除於裝置列舉，格式錯誤時整個鍵忽略並寫一筆 WARNING。
 

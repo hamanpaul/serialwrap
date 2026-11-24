@@ -2722,6 +2722,26 @@ class UARTBridge:
                 return False
             return self._client_has_external_peer_locked(client)
 
+    def tcp_console_owner(self) -> str | None:
+        """持有 raw 擁有權的 TCP console（#84 PORT-2）owner，形如 ``human:<cid>``；沒有則 None。
+
+        TCP console 的擁有權由 bridge 在 accept／斷線時直接管理，不經 session 層（#275）。
+        agent 命令期間暫存在 ``_suspended_owner``、或 foreground admission 擋住時暫存在
+        ``_pending_interactive_owner`` 的也算同一位人類。PTY console 一律回 None。
+        """
+        with self._state_lock:
+            for owner in (
+                self._interactive_owner,
+                self._suspended_owner,
+                getattr(self, "_pending_interactive_owner", None),
+            ):
+                if isinstance(owner, str) and owner.startswith("human:"):
+                    client = self._clients.get(owner.split(":", 1)[1])
+                    if client is not None and client.sock is not None:
+                        return owner
+                    return None
+            return None
+
     def has_console(self, client_id: str) -> bool:
         with self._state_lock:
             return client_id in self._clients
