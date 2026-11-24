@@ -70,6 +70,46 @@ fn profile_without_limit_unchanged() {
 }
 
 #[test]
+fn rpc_submit_uses_profile_after_set_profile() {
+    // rematerialize 以 SetProfile 更新 actor 後，後續 RPC 必須使用現行 profile 的上限。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let reply = h
+        .rpc(SessionRequest::SetProfile {
+            profile: profile_of(LIMITED_PROFILE),
+            profile_source: "yaml-target".into(),
+        })
+        .expect("SetProfile 回覆");
+    assert_eq!(reply["ok"], PyValue::Bool(true));
+
+    h.to_ready();
+    let before = h.tx_effect_count();
+    let (reply, fx) = h.rpc_full(SessionRequest::Submit(agent_submit(&"A".repeat(21))));
+    let r = reply.expect("submit 回覆");
+    assert_eq!(r["error_code"], PyValue::from("CMD_TOO_LONG"));
+    assert_eq!(r["limit"], PyValue::from(20i64));
+    assert!(started_commands(&fx).is_empty(), "上限須在入列前使用現行 profile 判定");
+    assert_eq!(h.tx_effect_count(), before, "拒絕後零 TX");
+}
+
+#[test]
+fn zero_or_negative_line_limit_rejects_nonempty_command() {
+    // 正常 YAML loader 僅接受正整數；這裡鎖住 arbiter 防線，避免非正值被當成未設上限。
+    for limit in [0, -1] {
+        let mut profile = profile_of(LIMITED_PROFILE);
+        profile.template.max_console_line_chars = Some(sw_proto::pyjson::PyInt::Small(limit));
+        let mut h = CoreHarness::new_with_profile(profile);
+        h.to_ready();
+        let before = h.tx_effect_count();
+        let (reply, fx) = h.rpc_full(SessionRequest::Submit(agent_submit("A")));
+        let r = reply.expect("submit 回覆");
+        assert_eq!(r["error_code"], PyValue::from("CMD_TOO_LONG"), "limit={limit}");
+        assert_eq!(r["limit"], PyValue::from(limit), "limit={limit}");
+        assert!(started_commands(&fx).is_empty(), "limit={limit}: 不得入列");
+        assert_eq!(h.tx_effect_count(), before, "limit={limit}: 零 TX");
+    }
+}
+
+#[test]
 fn human_console_line_is_not_limited() {
     // human console 的整行輸入走 line editor → `CommandRegistry::admit`（不帶 profile 上限），照常提交。
     let mut h = CoreHarness::new(LIMITED_PROFILE);

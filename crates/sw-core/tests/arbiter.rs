@@ -924,6 +924,9 @@ fn console_line_limit_rejects_with_exact_response_and_no_enqueue() {
 fn console_line_limit_boundaries_and_utf8_bytes() {
     let r = CommandRegistry::new();
     assert!(admit_limited(&r, req(&"A".repeat(20)), Some(20), "at").is_ok(), "等於上限應接受");
+    let utf8_at_limit = format!("{}{}", "中".repeat(6), "A".repeat(2));
+    assert_eq!(utf8_at_limit.len(), 20);
+    assert!(admit_limited(&r, req(&utf8_at_limit), Some(20), "utf8-at").is_ok(), "UTF-8 bytes 等於上限應接受");
     // 與 file transfer 的單行預算相同，以 UTF-8 bytes 計（「中」為 3 bytes）。
     let e = admit_limited(&r, req(&"中".repeat(7)), Some(20), "utf8").err().expect("21 bytes 應被拒絕");
     assert_eq!((field(&e, "cmd_length"), field(&e, "limit")), (PyValue::from(21i64), PyValue::from(20i64)));

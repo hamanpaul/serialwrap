@@ -1,6 +1,6 @@
 """`cmd submit` 遵守 profile 的 `max_console_line_chars`（console 單行上限）。
 
-外部 CLI＋FakeTarget 觀測；Python 基線與 Rust（`SERIALWRAP_AB_LABEL=rust-*`）皆須通過（同一組斷言即 A/B）。
+外部 CLI＋FakeTarget 觀測；此行為僅由 Rust daemon 實作（OD-111），Python 基線不套用。
 超過上限回 `CMD_TOO_LONG`（`limit` 為 profile 的值、`cmd_length` 為 UTF-8 bytes），DUT 零 TX；等於上限照常執行。
 stdlib＋PyYAML＋PTY，不得 import sw_core／serialwrap／serialwrapd。
 """
@@ -13,7 +13,7 @@ import pytest
 from bb_faketarget import FakeTarget
 from bb_p7 import wait_state
 
-pytestmark = [pytest.mark.posix_only, pytest.mark.posix_pty, pytest.mark.process_rpc]
+pytestmark = [pytest.mark.rust_only, pytest.mark.posix_only, pytest.mark.posix_pty, pytest.mark.process_rpc]
 
 HINT = ("Command exceeds this console's line limit (profile max_console_line_chars) and would be truncated by the "
         "target. Shorten it, or push a script with file push and run that instead.")
