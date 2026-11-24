@@ -548,14 +548,18 @@ def fake_driver(tmp_path, monkeypatch):
         candidate_cli.chmod(0o755)
         driver.new_cli.parent.mkdir(parents=True, exist_ok=True)
         driver.new_cli.symlink_to(candidate_cli)
+        installed_version = tmp_path / f"installed-{len(made)}" / "versions" / NEW_VERSION
+        shutil.copytree(candidate_cli.parent.parent, installed_version)
+        installed_cli = installed_version / "bin" / "serialwrap"
         active_bin = tmp_path / "active-bin"
         active_bin.mkdir()
-        (active_bin / "serialwrap").symlink_to(candidate_cli)
+        (active_bin / "serialwrap").symlink_to(installed_cli)
         driver.env["PATH"] = str(active_bin)
 
         def run(argv, *, timeout=300.0, label=""):
-            if argv and Path(argv[0]).resolve() == candidate_cli.resolve() and argv[1:] == ["doctor"]:
-                reports_p290 = b"timeout_recovery_keys" in candidate_cli.read_bytes()
+            if argv and Path(argv[0]).name == "serialwrap" and argv[1:] == ["doctor"]:
+                probed_cli = Path(argv[0]).resolve()
+                reports_p290 = b"timeout_recovery_keys" in probed_cli.read_bytes()
                 profile_check = {
                     "check": "profile_template_fields",
                     "ok": False,
@@ -1329,6 +1333,7 @@ def test_profile_template_field_scanner_accepts_quoted_mapping_key(tmp_path):
 @pytest.mark.memory_only
 def test_upgrade_rejects_candidate_cli_without_embedded_p290_asset(fake_driver, tmp_path):
     """bundle 副本和 live profile 有 p290 欄位，不可掩蓋候選 CLI 內嵌舊資產。"""
+    import shutil
     import yaml
 
     driver, _fake = fake_driver(cli_version=NEW_VERSION)
@@ -1346,6 +1351,12 @@ def test_upgrade_rejects_candidate_cli_without_embedded_p290_asset(fake_driver, 
     assert "boot_done_regex" in stale_document["profiles"]["prpl-template"]
     candidate_cli = driver.bundle / "versions" / NEW_VERSION / "bin" / "serialwrap"
     candidate_cli.write_bytes(b"candidate CLI with stale embedded asset\n" + stale_asset)
+    installed_version = tmp_path / "installed" / "versions" / NEW_VERSION
+    shutil.copytree(candidate_cli.parent.parent, installed_version)
+    installed_cli = installed_version / "bin" / "serialwrap"
+    active = tmp_path / "active-bin" / "serialwrap"
+    active.unlink()
+    active.symlink_to(installed_cli)
     doctor_before_probe = driver.parse(driver.sw("doctor"))
     profile_before_probe = next(check for check in doctor_before_probe["checks"]
                                 if check["check"] == "profile_template_fields")
@@ -1365,6 +1376,127 @@ def test_upgrade_rejects_candidate_cli_without_embedded_p290_asset(fake_driver, 
     )
     assert unconfirmed["verdict"] == "FAIL", unconfirmed
     assert unconfirmed["detail"]["candidate_cli_p290_asset"]["verdict"] == "FAIL"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_profile_template_migration_accepts_bracket_in_plain_scalar(fake_driver, monkeypatch):
+    """正式 driver 的遷移判定不可讓 plain scalar 內的 bracket 遮蔽真實欄位。"""
+    import yaml
+
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    live_text = (
+        "profiles:\n"
+        "  prpl-template:\n"
+        "    platform: prpl\n"
+        "    prompt_regex: ^\\[\n"
+        "    timeout_recovery_keys: [CTRL_C]\n"
+    )
+    parsed = yaml.safe_load(live_text)
+    assert parsed["profiles"]["prpl-template"]["prompt_regex"] == r"^\["
+    assert parsed["profiles"]["prpl-template"]["timeout_recovery_keys"] == ["CTRL_C"]
+
+    target = driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
+    live = driver.doctor_profile_dir / "default.yaml"
+    target.write_text(live_text, encoding="utf-8")
+    live.write_text(live_text, encoding="utf-8")
+    monkeypatch.setattr(driver, "verify_candidate_p290_asset", lambda _asset: {
+        "id": "candidate_cli_p290_asset", "verdict": "PASS", "reason": None, "detail": {},
+    })
+    result = driver.judge_doctor(
+        "doctor_green_new", "plain scalar bracket migration", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+    assert result["verdict"] == "PASS", result
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_profile_template_migration_decodes_escaped_quoted_key(fake_driver, monkeypatch):
+    """正式 driver 依 YAML 解碼後的 quoted key 判定目標欄位。"""
+    import yaml
+
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    live_text = (
+        "profiles:\n"
+        "  prpl-template:\n"
+        "    platform: prpl\n"
+        '    "timeout_recovery_\\x6beys": [CTRL_C]\n'
+    )
+    parsed = yaml.safe_load(live_text)
+    assert parsed["profiles"]["prpl-template"]["timeout_recovery_keys"] == ["CTRL_C"]
+
+    target = driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
+    live = driver.doctor_profile_dir / "default.yaml"
+    target.write_text(live_text, encoding="utf-8")
+    live.write_text(live_text, encoding="utf-8")
+    monkeypatch.setattr(driver, "verify_candidate_p290_asset", lambda _asset: {
+        "id": "candidate_cli_p290_asset", "verdict": "PASS", "reason": None, "detail": {},
+    })
+    result = driver.judge_doctor(
+        "doctor_green_new", "escaped quoted key migration", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+    assert result["verdict"] == "PASS", result
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_upgrade_accepts_installed_copy_of_candidate_cli(fake_driver, tmp_path):
+    """安裝後 CLI 位於版本目錄副本時，須驗證副本後再執行內嵌資產 probe。"""
+    import shutil
+
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    source_version = driver.bundle / "versions" / NEW_VERSION
+    installed_version = tmp_path / "installed" / "versions" / NEW_VERSION
+    shutil.copytree(source_version, installed_version)
+    installed_cli = installed_version / "bin" / "serialwrap"
+    active = tmp_path / "active-bin" / "serialwrap"
+    active.unlink()
+    active.symlink_to(installed_cli)
+
+    result = driver.judge_doctor(
+        "doctor_green_new", "不同路徑的安裝候選 CLI", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+    assert result["verdict"] == "PASS", result
+    embedded = result["detail"]["candidate_cli_p290_asset"]
+    assert embedded["verdict"] == "PASS", embedded
+    assert embedded["detail"]["active_cli_path"] == str(installed_cli.resolve())
+    assert embedded["detail"]["candidate_cli_sha256"] == embedded["detail"]["active_cli_sha256"]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_upgrade_rejects_stale_embedded_asset_in_installed_copy(fake_driver, tmp_path):
+    """bundle 副本雖新，安裝中的候選 CLI 若是舊內嵌資產仍須 FAIL。"""
+    import shutil
+    import yaml
+
+    driver, _fake = fake_driver(cli_version=NEW_VERSION)
+    source_version = driver.bundle / "versions" / NEW_VERSION
+    installed_version = tmp_path / "installed" / "versions" / NEW_VERSION
+    shutil.copytree(source_version, installed_version)
+    installed_cli = installed_version / "bin" / "serialwrap"
+    target_asset = source_version / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
+    parsed = yaml.safe_load(target_asset.read_text(encoding="utf-8"))
+    del parsed["profiles"]["prpl-template"]["timeout_recovery_keys"]
+    stale_asset = yaml.safe_dump(parsed, sort_keys=False, allow_unicode=True).encode("utf-8")
+    stale_cli = b"candidate CLI with stale embedded asset\n" + stale_asset
+    installed_cli.write_bytes(stale_cli)
+    active = tmp_path / "active-bin" / "serialwrap"
+    active.unlink()
+    active.symlink_to(installed_cli)
+
+    result = driver.judge_doctor(
+        "doctor_green_new", "舊內嵌資產安裝副本", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+    assert result["verdict"] == "FAIL", result
+    embedded = result["detail"]["candidate_cli_p290_asset"]
+    assert embedded["verdict"] == "FAIL", embedded
+    assert embedded["reason"] == "已安裝候選版本與 bundle 候選內容不一致"
+    assert embedded["detail"]["candidate_cli_sha256"] != embedded["detail"]["active_cli_sha256"]
 
 
 @pytest.mark.core_portable

@@ -447,6 +447,45 @@ def _yaml_quoted_end(text: str, start: int, quote: str) -> int | None:
     return None
 
 
+def _yaml_quoted_key(text: str, quote: str) -> str | None:
+    """解碼 YAML 單／雙引號 key；不支援的 escape 會 fail closed。"""
+    if quote == "'":
+        return text.replace("''", "'")
+
+    escapes = {
+        "0": "\0", "a": "\a", "b": "\b", "t": "\t", "\t": "\t",
+        "n": "\n", "v": "\v", "f": "\f", "r": "\r", "e": "\x1b",
+        " ": " ", '"': '"', "/": "/", "\\": "\\", "N": "\u0085",
+        "_": "\u00a0", "L": "\u2028", "P": "\u2029",
+    }
+    decoded: list[str] = []
+    index = 0
+    while index < len(text):
+        if text[index] != "\\":
+            decoded.append(text[index])
+            index += 1
+            continue
+        index += 1
+        if index >= len(text):
+            return None
+        marker = text[index]
+        if marker in escapes:
+            decoded.append(escapes[marker])
+            index += 1
+            continue
+        width = {"x": 2, "u": 4, "U": 8}.get(marker)
+        if width is None or index + width >= len(text):
+            return None
+        digits = text[index + 1:index + width + 1]
+        try:
+            codepoint = int(digits, 16)
+            decoded.append(chr(codepoint))
+        except (ValueError, OverflowError):
+            return None
+        index += width + 1
+    return "".join(decoded)
+
+
 def _yaml_mapping_entry(line: str) -> tuple[int, str, str] | None:
     """讀取一行 block mapping 的 key/value，支援 plain 與 quoted key。"""
     indent = len(line) - len(line.lstrip(" "))
@@ -454,10 +493,13 @@ def _yaml_mapping_entry(line: str) -> tuple[int, str, str] | None:
     if not body or body.startswith("#") or body.startswith(("- ", "? ")):
         return None
     if body[0] in "'\"":
-        end = _yaml_quoted_end(body, 0, body[0])
+        quote = body[0]
+        end = _yaml_quoted_end(body, 0, quote)
         if end is None or body[end + 1:end + 2] != ":":
             return None
-        key = body[1:end]
+        key = _yaml_quoted_key(body[1:end], quote)
+        if key is None:
+            return None
         value = body[end + 2:].strip()
         return indent, key, value
     for index, char in enumerate(body):
@@ -564,11 +606,17 @@ def _profile_template_has_field(path: str | Path, *, template: str, platform: st
         was_in_quote = quote is not None
         entry = _yaml_mapping_entry(line) if not was_in_quote and flow_depth == 0 else None
         visible, quote = _yaml_unquoted_text(line, quote)
-        for char in visible:
-            if char in "[{":
-                flow_depth += 1
-            elif char in "]}":
-                flow_depth = max(0, flow_depth - 1)
+        flow_text: str | None = None
+        if flow_depth:
+            flow_text = visible
+        elif entry is not None and _yaml_commentless(entry[2]).lstrip().startswith(("[", "{")):
+            flow_text, _ = _yaml_unquoted_text(entry[2], None)
+        if flow_text is not None:
+            for char in flow_text:
+                if char in "[{":
+                    flow_depth += 1
+                elif char in "]}":
+                    flow_depth = max(0, flow_depth - 1)
         if entry is None:
             continue
         entry_indent, key, value = entry

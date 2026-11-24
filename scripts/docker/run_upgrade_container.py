@@ -78,6 +78,15 @@ def parse_proc_cmdline(data: bytes) -> list[str]:
     return [part.decode("utf-8", "replace") for part in payload.split(b"\0")]
 
 
+def sha256_file(path: pathlib.Path) -> str:
+    """以串流方式計算 CLI 位元組摘要，證明安裝副本與 bundle 候選一致。"""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _read_proc_exe_as_user(proc_exe: pathlib.Path, user: str) -> str:
     """以 daemon 所屬使用者讀 /proc/<pid>/exe，處理容器內缺少 CAP_SYS_PTRACE 的情況。"""
     proc = subprocess.run(
@@ -372,9 +381,10 @@ class Driver:
         return self.parse(self.sw("doctor", label=label))
 
     def verify_candidate_p290_asset(self, target_asset: pathlib.Path) -> dict[str, Any]:
-        """用候選 CLI 的實際 doctor 輸出確認內嵌資產含 p290 key。"""
+        """驗證安裝中的 CLI 與 bundle 候選位元組一致，再用該 CLI 確認內嵌 p290 key。"""
         field = "timeout_recovery_keys"
-        candidate_cli = self.bundle / "versions" / NEW_VERSION / "bin" / "serialwrap"
+        candidate_version = self.bundle / "versions" / NEW_VERSION
+        candidate_cli = candidate_version / "bin" / "serialwrap"
         active_cli = shutil.which("serialwrap", path=self.env.get("PATH", ""))
         evidence: dict[str, Any] = {
             "candidate_cli_path": str(candidate_cli),
@@ -382,20 +392,51 @@ class Driver:
             "field": field,
             "profile_check": None,
             "reported_missing_field": False,
+            "candidate_cli_sha256": None,
+            "active_cli_sha256": None,
         }
 
         try:
             candidate_real = candidate_cli.resolve(strict=True)
             active_real = pathlib.Path(active_cli).resolve(strict=True) if active_cli else None
             configured_real = self.new_cli.resolve(strict=True)
+            candidate_version_real = candidate_version.resolve(strict=True)
+            installed_version_real = active_real.parent.parent.resolve(strict=True) if active_real else None
+            bundle_real = self.bundle.resolve(strict=True)
         except OSError as exc:
             return uc.row("candidate_cli_p290_asset", "FAIL", "無法確認候選 CLI 路徑",
                           **evidence, path_error=type(exc).__name__)
         evidence["candidate_cli_path"] = str(candidate_real)
         evidence["active_cli_path"] = str(active_real) if active_real else None
-        if candidate_real != configured_real or candidate_real != active_real:
+        evidence["configured_cli_path"] = str(configured_real)
+        evidence["installed_version_dir"] = str(installed_version_real) if installed_version_real else None
+        if candidate_real != configured_real:
             return uc.row("candidate_cli_p290_asset", "FAIL", "目前 CLI 並非本次候選版本",
                           **evidence, configured_cli_path=str(configured_real))
+        if active_real is None or installed_version_real is None \
+                or active_real != installed_version_real / "bin" / "serialwrap" \
+                or installed_version_real.name != NEW_VERSION \
+                or installed_version_real == candidate_version_real:
+            return uc.row("candidate_cli_p290_asset", "FAIL", "目前 CLI 並非本次安裝的候選版本",
+                          **evidence)
+        try:
+            installed_version_real.relative_to(bundle_real)
+        except ValueError:
+            pass
+        else:
+            return uc.row("candidate_cli_p290_asset", "FAIL", "目前 CLI 仍位於唯讀 bundle 來源",
+                          **evidence)
+        try:
+            candidate_digest = sha256_file(candidate_real)
+            active_digest = sha256_file(active_real)
+        except OSError as exc:
+            return uc.row("candidate_cli_p290_asset", "FAIL", "無法讀取候選 CLI 位元組",
+                          **evidence, path_error=type(exc).__name__)
+        evidence["candidate_cli_sha256"] = candidate_digest
+        evidence["active_cli_sha256"] = active_digest
+        if candidate_digest != active_digest:
+            return uc.row("candidate_cli_p290_asset", "FAIL", "已安裝候選版本與 bundle 候選內容不一致",
+                          **evidence)
 
         temp_root: pathlib.Path | None = None
         prior_profile_dir = self.env.get("SERIALWRAP_PROFILE_DIR")
@@ -408,7 +449,7 @@ class Driver:
                 "profiles:\n  prpl-template: {}\n", encoding="utf-8",
             )
             self.env["SERIALWRAP_PROFILE_DIR"] = str(profile_dir)
-            proc = self.run([str(candidate_real), "doctor"], label="候選 CLI 內嵌 p290 profile 資產檢查",
+            proc = self.run([str(active_real), "doctor"], label="安裝候選 CLI 內嵌 p290 profile 資產檢查",
                             timeout=60.0)
             doctor = self.parse(proc) if proc.returncode == 0 else None
             checks = doctor.get("checks") if type(doctor) is dict else None
