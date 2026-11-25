@@ -492,6 +492,13 @@ A target inherits an omitted value from its template; an explicit target `null`
 clears that limit. A measured limit is still required on affected boards;
 upgrading does not set every prpl console to 505.
 
+In the Rust daemon, the same limit also applies to `cmd submit`: a command
+whose UTF-8 length exceeds the session's `max_console_line_chars` is rejected
+before anything is queued or transmitted, with `CMD_TOO_LONG` whose `limit` is
+the profile value (the 16 KB broker limit reports `limit: 16384`). Without the
+check such a command is truncated by the target, never reaches the prompt and
+times out. Profiles that leave the value unset keep the old behaviour.
+
 **Scope — small files only.** `file push` is meant for config files, scripts and
 probes (tens of KB). A UART at 115200 baud tops out around 11 KB/s raw, and the
 echo-ACK pacing below lowers that further, so an 81 MB firmware image would take
@@ -2501,7 +2508,7 @@ broker 只認單獨一條的 reboot（`reboot`、`systemctl reboot`、`shutdown 
 `AUTOBOOT_QUIET`。`--cmd-timeout` 要涵蓋 reboot 之前那一段的耗時。submit 回應回聲 `expect_reboot: true`，
 `command.get` 回報此設定。詳見[明示 reboot](docs/expect-reboot.md)。
 
-**命令限制**：命令字串不得含有 `\n` 換行字元，否則回傳 `CMD_CONTAINS_NEWLINE`。命令長度（UTF-8 位元組）> 4 KB 回 warning（`CMD_LENGTH_WARNING`），> 16 KB 拒絕（`CMD_TOO_LONG`）；broker 對命令內容不做截斷。注意這是 **broker 對單一 `--cmd` 參數的上限**，與 **target 端 tty line buffer（常見 4096 bytes）的物理單行限制**是兩回事——即使 broker 接受，過長單行仍可能在 target 端被截斷。上限可由 `serialwrap daemon status` 回應的 `limits` 欄位執行期查詢（`max_submit_cmd_bytes`／`warn_submit_cmd_bytes`／`reject_error_code`／`newline_error_code`／`warning_code`／`newline_forbidden`），client 不需硬編碼（#129）。
+**命令限制**：命令字串不得含有 `\n` 換行字元，否則回傳 `CMD_CONTAINS_NEWLINE`。命令長度（UTF-8 位元組）> 4 KB 回 warning（`CMD_LENGTH_WARNING`），> 16 KB 拒絕（`CMD_TOO_LONG`）；broker 對命令內容不做截斷。注意這是 **broker 對單一 `--cmd` 參數的上限**，與 **target 端 tty line buffer（常見 4096 bytes）的物理單行限制**是兩回事——即使 broker 接受，過長單行仍可能在 target 端被截斷；Rust daemon 的 session profile 設了 `max_console_line_chars` 時，超過的 `cmd submit` 改在提交時回 `CMD_TOO_LONG`（`limit` 為該 profile 的值；這個上限以 profile 設定為準，不在 `limits` 欄位中）。broker 的全域上限可由 `serialwrap daemon status` 回應的 `limits` 欄位執行期查詢（`max_submit_cmd_bytes`／`warn_submit_cmd_bytes`／`reject_error_code`／`newline_error_code`／`warning_code`／`newline_forbidden`），client 不需硬編碼（#129）。
 
 **長命令與期限**：`--cmd-timeout`（預設 10 秒）是命令在 broker 內的總期限，即使命令一直有輸出，到點仍進恢復流程（先送 Ctrl-C，比不到 prompt 再送 Ctrl-D；Ctrl-D 打在已登入的 shell 等於登出）。另有靜默上限 `min(--cmd-timeout, 30 秒)`：一個等待窗內完全沒有新 RX 即視為靜默，同樣進恢復流程。`--expected-duration` 只把總期限延長為 `max(--cmd-timeout, --expected-duration)`，**不延長靜默上限**，適合 `make`、`python -m unittest` 這類持續有輸出的長命令：
 
@@ -2606,6 +2613,8 @@ serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wir
 傳輸完成後自動進行 md5 校驗。Session 必須處於 `READY` 狀態，target 需有 `md5sum` 及可用的 `base64` 或 OpenSSL 編解碼器。傳輸前以實際輸出驗證工具，優先 `base64`、不可用時 fallback 至 OpenSSL；命令回顯不算工具可用的證據。全部不可用時，push 回 `TARGET_DECODER_MISSING`，pull 回 `TARGET_ENCODER_MISSING`。
 
 已量測 console 行長限制時，可在 profile template 或 target 設定，例如 `max_console_line_chars: 505`。值須為正整數，計算完整命令的 UTF-8 bytes（不含結尾換行），不是字元個數，也不是平台預設。Push 扣除 Base64 膨脹及 shell 開銷後限制要求的 chunk 大小；雙向傳輸也檢查各自的 probe、checksum、move、cleanup 等控制命令。預算容不下必要命令時，在任何 TX 前回 `CONSOLE_LINE_LIMIT_TOO_SMALL`。Template 省略或設 `null` 則不限制既有 chunk 設定（預設 512 raw bytes）；target 省略會繼承 template，明設 `null` 才清除該限制。受影響的板仍須依量測設定，升級不會把所有 prpl console 自動設成 505。
+
+Rust daemon 的 `cmd submit` 也套用同一個上限：命令的 UTF-8 長度超過 session 的 `max_console_line_chars` 時，在入列與任何 TX 之前回 `CMD_TOO_LONG`，`limit` 為該 profile 的值（broker 16 KB 硬上限則是 `limit: 16384`）。沒有這道檢查時，這種命令會被 target 截斷、等不到 prompt 而逾時。未設此欄位的 profile 行為不變。
 
 **適用範圍＝小檔**。`file push` 針對設定檔、腳本、探針這類數十 KB 內的檔案。UART 115200 baud 的原始上限約 11 KB/s，再加上下述 echo-ACK 節流會更低——一顆 81 MB 的 firmware image 即使通道完全穩定也要數小時。只要 DUT 有 SSH／TFTP／HTTP 可達，大檔一律走 SCP／TFTP，serialwrap 只負責控制面（以 `cmd submit` 觸發板端的 `scp`／`tftp`／`wget` 並觀察結果）。大檔用 `file push` 只能是**確認 DUT 無任何網路通道後**的明確 fallback，並在紀錄裡說明原因。
 

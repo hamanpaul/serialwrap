@@ -812,6 +812,10 @@
           "cargo:sw-core::arbiter::complete_ok_false",
           "cargo:sw-core::arbiter::complete_ok_true_drops_error_code",
           "cargo:sw-core::arbiter::complete_on_canceled_keeps_canceled",
+          "cargo:sw-core::arbiter::console_line_limit_applies_to_every_submit_mode",
+          "cargo:sw-core::arbiter::console_line_limit_boundaries_and_utf8_bytes",
+          "cargo:sw-core::arbiter::console_line_limit_order_matches_contract",
+          "cargo:sw-core::arbiter::console_line_limit_rejects_with_exact_response_and_no_enqueue",
           "cargo:sw-core::arbiter::execution_mode_alias",
           "cargo:sw-core::arbiter::flush_only_accepted",
           "cargo:sw-core::arbiter::history_evicts_oldest_done_by_done_at_string",
@@ -997,6 +1001,12 @@
           "cargo:sw-core::console_hub::telnet_input_filtered_before_lane",
           "cargo:sw-core::console_hub::telnet_reply_sent_even_in_flash",
           "cargo:sw-core::console_hub::vtty_alive_semantics",
+          "cargo:sw-core::console_line_limit::human_console_line_is_not_limited",
+          "cargo:sw-core::console_line_limit::profile_without_limit_unchanged",
+          "cargo:sw-core::console_line_limit::rpc_submit_over_profile_limit_rejected_with_zero_tx",
+          "cargo:sw-core::console_line_limit::rpc_submit_uses_profile_after_set_profile",
+          "cargo:sw-core::console_line_limit::rpc_submit_within_profile_limit_runs",
+          "cargo:sw-core::console_line_limit::zero_or_negative_line_limit_rejects_nonempty_command",
           "cargo:sw-core::custody::gpx_bound_parked_unplug_close_replug_not_overwritten",
           "cargo:sw-core::custody::test_actor_repeated_panic_stops_and_settles_custody",
           "cargo:sw-core::custody::test_birth_takeover_handoff_from_ledger_unplug_settles_claimed_close",
@@ -7983,6 +7993,7 @@
           "tests/test_p7_gate_collection.py::test_od72_slice21_nodes_keep_their_assigned_owner",
           "tests/test_p7_gate_collection.py::test_od78_replacement_preserves_continue_on_error_coverage",
           "tests/test_p7_gate_collection.py::test_p7_gate_frozen_nodes_are_collectable",
+          "tests/test_p7_gate_collection.py::test_rust_only_console_line_limit_is_owned_by_rust_p7_set",
           "tests/test_p7_gate_report.py::test_com_row_with_pair_judged_by_run_not_blocked",
           "tests/test_p7_gate_report.py::test_duplicate_or_unfinished_is_not_pass",
           "tests/test_p7_gate_report.py::test_full_pytest_row_needs_whole_frozen_set",
@@ -11360,6 +11371,27 @@
           "markexpr": "",
           "paths": [
             "tests/"
+          ]
+        }
+      }
+    },
+    "p7_gate:rust-only-console-line-limit": {
+      "linux": {
+        "nodeids": [
+          "tests/contract_blackbox/test_bb_console_line_limit.py::test_submit_over_profile_line_limit_rejected_zero_tx"
+        ],
+        "selector": {
+          "argv": [
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "-m",
+            "rust_only",
+            "tests/contract_blackbox/test_bb_console_line_limit.py"
+          ],
+          "markexpr": "rust_only",
+          "paths": [
+            "tests/contract_blackbox/test_bb_console_line_limit.py"
           ]
         }
       }
@@ -24442,6 +24474,10 @@
           "cargo:sw-core::arbiter::complete_ok_false",
           "cargo:sw-core::arbiter::complete_ok_true_drops_error_code",
           "cargo:sw-core::arbiter::complete_on_canceled_keeps_canceled",
+          "cargo:sw-core::arbiter::console_line_limit_applies_to_every_submit_mode",
+          "cargo:sw-core::arbiter::console_line_limit_boundaries_and_utf8_bytes",
+          "cargo:sw-core::arbiter::console_line_limit_order_matches_contract",
+          "cargo:sw-core::arbiter::console_line_limit_rejects_with_exact_response_and_no_enqueue",
           "cargo:sw-core::arbiter::execution_mode_alias",
           "cargo:sw-core::arbiter::flush_only_accepted",
           "cargo:sw-core::arbiter::history_evicts_oldest_done_by_done_at_string",
@@ -24627,6 +24663,12 @@
           "cargo:sw-core::console_hub::telnet_input_filtered_before_lane",
           "cargo:sw-core::console_hub::telnet_reply_sent_even_in_flash",
           "cargo:sw-core::console_hub::vtty_alive_semantics",
+          "cargo:sw-core::console_line_limit::human_console_line_is_not_limited",
+          "cargo:sw-core::console_line_limit::profile_without_limit_unchanged",
+          "cargo:sw-core::console_line_limit::rpc_submit_over_profile_limit_rejected_with_zero_tx",
+          "cargo:sw-core::console_line_limit::rpc_submit_uses_profile_after_set_profile",
+          "cargo:sw-core::console_line_limit::rpc_submit_within_profile_limit_runs",
+          "cargo:sw-core::console_line_limit::zero_or_negative_line_limit_rejects_nonempty_command",
           "cargo:sw-core::custody::gpx_bound_parked_unplug_close_replug_not_overwritten",
           "cargo:sw-core::custody::test_actor_repeated_panic_stops_and_settles_custody",
           "cargo:sw-core::custody::test_birth_takeover_handoff_from_ledger_unplug_settles_claimed_close",
@@ -34784,6 +34826,7 @@
           "tests/test_p7_gate_collection.py::test_od72_slice21_nodes_keep_their_assigned_owner",
           "tests/test_p7_gate_collection.py::test_od78_replacement_preserves_continue_on_error_coverage",
           "tests/test_p7_gate_collection.py::test_p7_gate_frozen_nodes_are_collectable",
+          "tests/test_p7_gate_collection.py::test_rust_only_console_line_limit_is_owned_by_rust_p7_set",
           "tests/test_p7_gate_report.py::test_com_row_with_pair_judged_by_run_not_blocked",
           "tests/test_p7_gate_report.py::test_duplicate_or_unfinished_is_not_pass",
           "tests/test_p7_gate_report.py::test_full_pytest_row_needs_whole_frozen_set",
@@ -39070,6 +39113,10 @@
           "cargo:sw-core::arbiter::complete_ok_false",
           "cargo:sw-core::arbiter::complete_ok_true_drops_error_code",
           "cargo:sw-core::arbiter::complete_on_canceled_keeps_canceled",
+          "cargo:sw-core::arbiter::console_line_limit_applies_to_every_submit_mode",
+          "cargo:sw-core::arbiter::console_line_limit_boundaries_and_utf8_bytes",
+          "cargo:sw-core::arbiter::console_line_limit_order_matches_contract",
+          "cargo:sw-core::arbiter::console_line_limit_rejects_with_exact_response_and_no_enqueue",
           "cargo:sw-core::arbiter::execution_mode_alias",
           "cargo:sw-core::arbiter::flush_only_accepted",
           "cargo:sw-core::arbiter::history_evicts_oldest_done_by_done_at_string",
@@ -39255,6 +39302,12 @@
           "cargo:sw-core::console_hub::telnet_input_filtered_before_lane",
           "cargo:sw-core::console_hub::telnet_reply_sent_even_in_flash",
           "cargo:sw-core::console_hub::vtty_alive_semantics",
+          "cargo:sw-core::console_line_limit::human_console_line_is_not_limited",
+          "cargo:sw-core::console_line_limit::profile_without_limit_unchanged",
+          "cargo:sw-core::console_line_limit::rpc_submit_over_profile_limit_rejected_with_zero_tx",
+          "cargo:sw-core::console_line_limit::rpc_submit_uses_profile_after_set_profile",
+          "cargo:sw-core::console_line_limit::rpc_submit_within_profile_limit_runs",
+          "cargo:sw-core::console_line_limit::zero_or_negative_line_limit_rejects_nonempty_command",
           "cargo:sw-core::custody::gpx_bound_parked_unplug_close_replug_not_overwritten",
           "cargo:sw-core::custody::test_actor_repeated_panic_stops_and_settles_custody",
           "cargo:sw-core::custody::test_birth_takeover_handoff_from_ledger_unplug_settles_claimed_close",
