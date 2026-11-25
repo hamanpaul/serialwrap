@@ -912,14 +912,12 @@ def test_runtime_tree_sha256_ignores_only_root_manifest_metadata(tmp_path):
 
 
 def _native_com_required(case_id: str, row: dict) -> bool:
-    return (
-        row.get("suite") == "windows-native"
-        and (
-            case_id.startswith("win-com-")
-            or case_id.startswith("cap-windows-com--")
-            or case_id == "sc29-com0com-serial-console"
-        )
-    )
+    """僅供測試，不是權威規則：合成映射依 cases.yaml 的 capabilities 是否含 windows_com 判定。
+
+    權威映射由後續 Task 依同一來源建立，不得以案例 ID 前綴推斷是否需要 COM。
+    """
+    del case_id
+    return "windows_com" in (row.get("capabilities") or ())
 
 
 def _windows_l15_transport_fixture(root: Path, *, transport: str = "windows-native-com") -> Path:
