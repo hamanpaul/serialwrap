@@ -1,6 +1,7 @@
 """Slice 2.2 PTY console 黑箱契約（07 Task 11；Python 基線與 Rust artifact 雙邊執行）。"""
 from __future__ import annotations
 
+import json
 import os
 import re
 
@@ -235,8 +236,13 @@ def test_line_overflow_warning(console_daemon) -> None:
         fd2 = open_vtty(a2["vtty"])
         detached = d.rpc("session.console_detach", {"selector": "COM0", "client_id": a1["client_id"]})
         assert detached["ok"] is True, detached
+        precondition = _consoles(d)
+        assert any(row["client_id"] == a2["client_id"] for row in precondition), precondition
+        assert not any(row["interactive_owner"] for row in precondition), precondition
+        target_before = len(target.written(0.2))
         payload = b"a" * 16390 + b"\r"
         view = memoryview(payload)
+        ownership_trace = []
         while view:
             try:
                 n = os.write(fd2, view[:4096])
@@ -245,8 +251,31 @@ def test_line_overflow_warning(console_daemon) -> None:
                 continue
             view = view[n:]
             read_until(fd2, b"\x00", 0.01)
-        assert not wait_rx_contains(target, b"aaaa", 2.0)
-        assert wait_for(lambda: a2["client_id"] in d._stderr_tail(20000), 3.0), d._stderr_tail()
+            ownership_trace.append(_consoles(d))
+            assert not any(
+                row["interactive_owner"] for row in ownership_trace[-1]
+            ), ownership_trace
+        sent = wait_rx_contains(target, b"aaaa", 2.0)
+        tx_delta = target.written(0.2)[target_before:]
+        diagnostic = {
+            "h1_client_id": a1["client_id"],
+            "h2_client_id": a2["client_id"],
+            "detached_client_id": a1["client_id"],
+            "initial_consoles": precondition,
+            "ownership_trace": ownership_trace,
+            "stderr": d._stderr_tail(),
+            "tx_delta_len": len(tx_delta),
+            "tx_delta_hex": tx_delta.hex(),
+            "wal_tx": [
+                row for row in d.wal_records()
+                if row.get("dir") == "TX" and row.get("source") == f"human:{a2['client_id']}"
+            ],
+        }
+        warning_seen = wait_for(lambda: a2["client_id"] in d._stderr_tail(20000), 3.0)
+        diagnostic["warning_seen"] = warning_seen
+        print(json.dumps(diagnostic, ensure_ascii=False, sort_keys=True))
+        assert not sent, diagnostic
+        assert warning_seen, diagnostic
     finally:
         if fd2 is not None:
             os.close(fd2)

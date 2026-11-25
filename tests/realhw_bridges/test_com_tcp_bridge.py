@@ -60,8 +60,11 @@ class FakeSerial:
 def _wait_for(predicate, *, timeout: float = 2.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if predicate():
-            return
+        try:
+            if predicate():
+                return
+        except PermissionError:
+            pass
         time.sleep(0.01)
     assert predicate(), "等待橋接器狀態逾時"
 
@@ -81,7 +84,9 @@ def _recv_exact(sock: socket.socket, size: int) -> bytes:
     return bytes(data)
 
 
-def test_tcp_bridge_transfers_bytes_rejects_second_client_and_reconnects(tmp_path: Path) -> None:
+def test_tcp_bridge_transfers_bytes_rejects_second_client_and_reconnects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     module = _bridge_module()
     serial_port = FakeSerial()
     status_path = tmp_path / "bridge-status.json"
@@ -94,6 +99,17 @@ def test_tcp_bridge_transfers_bytes_rejects_second_client_and_reconnects(tmp_pat
     host, port = bridge.start()
     server_thread = threading.Thread(target=bridge.serve_forever, daemon=True)
     server_thread.start()
+    original_read_text = Path.read_text
+    permission_errors = 0
+
+    def flaky_read_text(path: Path, *args, **kwargs):
+        nonlocal permission_errors
+        if path == status_path and permission_errors == 0:
+            permission_errors += 1
+            raise PermissionError(13, "原子替換窗口", str(path))
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky_read_text)
 
     first = socket.create_connection((host, port), timeout=1)
     first.settimeout(0.1)
@@ -142,6 +158,7 @@ def test_tcp_bridge_transfers_bytes_rejects_second_client_and_reconnects(tmp_pat
     assert report["accepted_connections"] == 2
     assert report["rejected_connections"] == 1
     assert "serialwrapd" not in report["process_name"].lower()
+    assert permission_errors == 1
 
 
 def test_tcp_bridge_refuses_non_loopback_listener(tmp_path: Path) -> None:

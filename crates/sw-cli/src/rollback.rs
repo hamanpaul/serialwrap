@@ -58,6 +58,32 @@ pub(crate) fn legacy_crash_if(point: &str) {
 
 /// 開發 bundle 的環境變數屏障；正式 bundle 會編譯成無操作。
 #[cfg(feature = "test-fakes")]
+fn test_mono_ns() -> u64 {
+    sw_pal::native().clock.mono_ns()
+}
+
+#[cfg(feature = "test-fakes")]
+fn write_test_pause_mono_ns(point: &str, phase: &str) -> std::path::PathBuf {
+    let dir = std::env::var_os("SW_TEST_UPDATE_PAUSE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| panic!("SW_TEST_UPDATE_PAUSE_DIR 必須與 SW_TEST_UPDATE_PAUSE_AFTER 一起設定"));
+    let name = point.replace(['/', ':'], "_");
+    let path = dir.join(format!("{name}.{phase}_mono_ns"));
+    std::fs::create_dir_all(&dir).unwrap_or_else(|error| panic!("建立 update hook 目錄失敗：{error}"));
+    std::fs::write(&path, format!("{}\n", test_mono_ns()))
+        .unwrap_or_else(|error| panic!("寫入 update hook monotonic 時間失敗：{error}"));
+    path
+}
+
+#[cfg(feature = "test-fakes")]
+pub(crate) fn test_record_pause_request(point: &str) {
+    if std::env::var("SW_TEST_UPDATE_PAUSE_AFTER").ok().as_deref() != Some(point) {
+        return;
+    }
+    let _ = write_test_pause_mono_ns(point, "request");
+}
+
+#[cfg(feature = "test-fakes")]
 pub(crate) fn test_pause_after(point: &str) {
     if std::env::var("SW_TEST_UPDATE_PAUSE_AFTER").ok().as_deref() != Some(point) {
         return;
@@ -65,10 +91,18 @@ pub(crate) fn test_pause_after(point: &str) {
     let dir = std::env::var_os("SW_TEST_UPDATE_PAUSE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| panic!("SW_TEST_UPDATE_PAUSE_DIR 必須與 SW_TEST_UPDATE_PAUSE_AFTER 一起設定"));
-    let name = point.replace('/', "_").replace(':', "_");
+    let name = point.replace(['/', ':'], "_");
     let reached = dir.join(format!("{name}.reached"));
     let resume = dir.join(format!("{name}.resume"));
+    let _ = write_test_pause_mono_ns(point, "reply");
+    if let Ok(raw_ms) = std::env::var("SW_TEST_UPDATE_PAUSE_REPLY_DELAY_MS") {
+        let ms = raw_ms
+            .parse::<u64>()
+            .unwrap_or_else(|error| panic!("SW_TEST_UPDATE_PAUSE_REPLY_DELAY_MS 無效：{error}"));
+        std::thread::sleep(Duration::from_millis(ms));
+    }
     std::fs::create_dir_all(&dir).unwrap_or_else(|error| panic!("建立 update hook 目錄失敗：{error}"));
+    let _ = write_test_pause_mono_ns(point, "reached");
     std::fs::write(&reached, point).unwrap_or_else(|error| panic!("寫入 update hook reached 失敗：{error}"));
     let deadline = std::time::Instant::now() + Duration::from_secs(180);
     while !resume.is_file() {

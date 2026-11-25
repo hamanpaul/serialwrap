@@ -534,6 +534,7 @@ def _startup_failure_diagnostics(
 def start_python_daemon(
     env: dict[str, str], profile_dir: Path, *, state: str = "READY",
     bridge: "BridgeTarget | None" = None,
+    daemon_command: list[str] | None = None,
 ):
     from bb_daemon import PyDaemon
 
@@ -545,6 +546,7 @@ def start_python_daemon(
         profile_dir=profile_dir,
         socket=str(run_dir / "serialwrapd.sock"),
         lock=run_dir / "serialwrapd.lock",
+        daemon_command=daemon_command,
     )
     daemon_start_ns = time.monotonic_ns()
     try:

@@ -12,6 +12,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -62,9 +63,87 @@ BUSY_CHUNK_TIMEOUT_S = BUSY_FIRST_ACK_DELAY_MS / 1000 + 40
 # 交接排空窗口長度（sw_core/daemon.py `HANDOFF_DRAIN_GRACE_S`）；黑箱不得 import sw_core，故於此重述。
 HANDOFF_DRAIN_GRACE_S = 3.0
 
+_BY_ID_SCAN_PRELOAD_C = r"""
+#define _GNU_SOURCE
+#include <dirent.h>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+
+static __thread DIR *tracked_dir;
+static __thread int tracked_link_present;
+
+static void trace_event(const char *phase, int link_present) {
+    const char *path = getenv("SW_TEST_BY_ID_SCAN_TRACE");
+    if (!path) {
+        return;
+    }
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return;
+    }
+    uint64_t mono_ns = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+    char row[256];
+    int length = snprintf(
+        row,
+        sizeof(row),
+        "%s\t%ld\t%ld\t%llu\t%d\n",
+        phase,
+        (long)getpid(),
+        (long)syscall(SYS_gettid),
+        (unsigned long long)mono_ns,
+        link_present
+    );
+    if (length <= 0 || length >= (int)sizeof(row)) {
+        return;
+    }
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    if (fd >= 0) {
+        (void)syscall(SYS_write, fd, row, (size_t)length);
+        (void)syscall(SYS_close, fd);
+    }
+}
+
+DIR *opendir(const char *name) {
+    static DIR *(*real_opendir)(const char *);
+    if (!real_opendir) {
+        real_opendir = (DIR *(*)(const char *))dlsym(RTLD_NEXT, "opendir");
+    }
+    DIR *result = real_opendir(name);
+    const char *watched = getenv("SW_TEST_BY_ID_SCAN_DIR");
+    if (result && watched && strcmp(name, watched) == 0) {
+        const char *link = getenv("SW_TEST_BY_ID_SCAN_LINK");
+        struct stat stat_result;
+        tracked_dir = result;
+        tracked_link_present = link && lstat(link, &stat_result) == 0;
+        trace_event("open", tracked_link_present);
+    }
+    return result;
+}
+
+int closedir(DIR *directory) {
+    static int (*real_closedir)(DIR *);
+    if (!real_closedir) {
+        real_closedir = (int (*)(DIR *))dlsym(RTLD_NEXT, "closedir");
+    }
+    if (tracked_dir == directory) {
+        trace_event("close", tracked_link_present);
+        tracked_dir = NULL;
+    }
+    return real_closedir(directory);
+}
+"""
+
 
 class _ByIdScanObserver:
-    """只觀察本測試 rig 的 by-id 目錄變更與目錄本身的 open/close。"""
+    """由 test preload 的 daemon-local trace 辨識特定 PID／TID 的 by-id 目錄掃描。"""
 
     _EVENT = struct.Struct("iIII")
     _IN_OPEN = 0x00000020
@@ -76,10 +155,31 @@ class _ByIdScanObserver:
     _IN_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
     _IN_Q_OVERFLOW = 0x00004000
 
-    def __init__(self, directory: Path, link_name: str) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        link_name: str,
+        *,
+        process_pid: int | None = None,
+        thread_name: str | None = None,
+        scan_trace: Path | None = None,
+    ) -> None:
         self.directory = Path(directory)
         self.link_name = link_name
-        self.events: list[dict[str, int | str]] = []
+        self.process_pid = process_pid if process_pid is not None else os.getpid()
+        self.thread_name = thread_name
+        self.scan_trace = Path(scan_trace) if scan_trace is not None else None
+        self._trace_offset = 0
+        self._trace_pending = b""
+        self._process_task: Path | None = None
+        self.events: list[dict[str, int | str | bool | None]] = []
+        self._condition = threading.Condition()
+        self._stop_event = threading.Event()
+        self._barriers_requested = 0
+        self._barriers_handled = 0
+        self._sampler_barriers_handled = 0
+        self._sampler_holds_directory = False
+        self._reader_error: BaseException | None = None
         self._libc = ctypes.CDLL(None, use_errno=True)
         self._libc.inotify_init1.argtypes = [ctypes.c_int]
         self._libc.inotify_init1.restype = ctypes.c_int
@@ -95,13 +195,74 @@ class _ByIdScanObserver:
             error = ctypes.get_errno()
             os.close(self._fd)
             raise OSError(error, os.strerror(error), str(self.directory))
+        self._control_read, self._control_write = os.pipe2(self._IN_CLOEXEC | self._IN_NONBLOCK)
+        self._directory_stat = self.directory.stat()
+        self._reader = threading.Thread(target=self._read_loop, name="by-id-scan-observer", daemon=True)
+        self._sampler = threading.Thread(
+            target=self._sample_process_fds, name="by-id-scan-pid-observer", daemon=True,
+        )
+        self._reader.start()
+        self._sampler.start()
 
     def close(self) -> None:
-        if self._fd >= 0:
+        self._stop_event.set()
+        if getattr(self, "_reader", None) is not None and self._reader.is_alive():
+            try:
+                os.write(self._control_write, b"x")
+            except OSError:
+                pass
+        for thread in (getattr(self, "_reader", None), getattr(self, "_sampler", None)):
+            if thread is not None:
+                thread.join(timeout=2.0)
+                if thread.is_alive():
+                    raise RuntimeError(f"{thread.name} 未停止")
+        for fd_name in ("_control_read", "_control_write"):
+            fd = getattr(self, fd_name, -1)
+            if fd >= 0:
+                os.close(fd)
+                setattr(self, fd_name, -1)
+        if getattr(self, "_fd", -1) >= 0:
             os.close(self._fd)
             self._fd = -1
 
-    def _drain(self) -> None:
+    def _process_holds_directory(self) -> bool:
+        task = self._process_task
+        if self.thread_name is not None and task is None:
+            tasks = Path(f"/proc/{self.process_pid}/task")
+            try:
+                for candidate in tasks.iterdir():
+                    comm = (candidate / "comm").read_text(encoding="utf-8").strip()
+                    if comm == self.thread_name[:15]:
+                        self._process_task = candidate
+                        task = candidate
+                        break
+            except OSError:
+                return False
+        if self.thread_name is not None:
+            task_rows = [task] if task is not None else []
+        else:
+            tasks = Path(f"/proc/{self.process_pid}/task")
+            try:
+                task_rows = list(tasks.iterdir())
+            except OSError:
+                return False
+        for task in task_rows:
+            if task is None:
+                continue
+            try:
+                fds = list((task / "fd").iterdir())
+            except OSError:
+                continue
+            for fd in fds:
+                try:
+                    stat = fd.stat()
+                except OSError:
+                    continue
+                if (stat.st_dev, stat.st_ino) == (self._directory_stat.st_dev, self._directory_stat.st_ino):
+                    return True
+        return False
+
+    def _drain_inotify(self) -> None:
         while select.select([self._fd], [], [], 0)[0]:
             data = os.read(self._fd, 65536)
             offset = 0
@@ -113,33 +274,158 @@ class _ByIdScanObserver:
                 if mask & self._IN_Q_OVERFLOW:
                     raise AssertionError("by-id 目錄 inotify queue overflow")
                 name = os.fsdecode(raw_name.split(b"\0", 1)[0]) if raw_name else ""
-                self.events.append({
-                    "sequence": len(self.events) + 1,
-                    "mask": mask,
-                    "name": name,
-                    "observed_ns": time.monotonic_ns(),
-                })
+                with self._condition:
+                    self.events.append({
+                        "sequence": len(self.events) + 1,
+                        "mask": mask,
+                        "name": name,
+                        "observed_ns": time.monotonic_ns(),
+                        "process_pid": None,
+                        "source": "inotify",
+                    })
+                    self._condition.notify_all()
+
+    def _append_process_event(self, mask: int) -> None:
+        with self._condition:
+            self.events.append({
+                "sequence": len(self.events) + 1,
+                "mask": mask,
+                "name": "",
+                "observed_ns": time.monotonic_ns(),
+                "process_pid": self.process_pid,
+                "source": "proc_fd",
+            })
+            self._condition.notify_all()
+
+    def _drain_scan_trace(self) -> None:
+        if self.scan_trace is None:
+            return
+        try:
+            with self.scan_trace.open("rb") as stream:
+                stream.seek(self._trace_offset)
+                chunk = stream.read()
+        except FileNotFoundError:
+            return
+        self._trace_offset += len(chunk)
+        data = self._trace_pending + chunk
+        lines = data.splitlines(keepends=True)
+        if lines and not lines[-1].endswith(b"\n"):
+            self._trace_pending = lines.pop()
+        else:
+            self._trace_pending = b""
+        for raw in lines:
+            try:
+                phase, pid, tid, mono_ns, link_present = raw.decode(
+                    "ascii",
+                ).strip().split("\t")
+                pid_int = int(pid)
+                if phase not in {"open", "close"} or pid_int != self.process_pid:
+                    continue
+                event = {
+                    "sequence": 0,
+                    "mask": self._IN_OPEN if phase == "open" else self._IN_CLOSE_NOWRITE,
+                    "name": "",
+                    "observed_ns": int(mono_ns),
+                    "process_pid": pid_int,
+                    "thread_id": int(tid),
+                    "link_present": int(link_present) == 1,
+                    "source": "scan_trace",
+                }
+            except (UnicodeDecodeError, ValueError):
+                raise AssertionError(f"無效 by-id 掃描 trace：{raw!r}") from None
+            with self._condition:
+                event["sequence"] = len(self.events) + 1
+                self.events.append(event)
+                self._condition.notify_all()
+
+    def _read_loop(self) -> None:
+        try:
+            while not self._stop_event.is_set():
+                ready, _, _ = select.select(
+                    [self._fd, self._control_read], [], [], 0.05,
+                )
+                if self._fd in ready:
+                    self._drain_inotify()
+                if self._control_read in ready:
+                    payload = os.read(self._control_read, 4096)
+                    self._drain_inotify()
+                    if payload:
+                        with self._condition:
+                            self._barriers_handled += payload.count(b"m")
+                            self._condition.notify_all()
+        except BaseException as exc:
+            with self._condition:
+                self._reader_error = exc
+                self._condition.notify_all()
+
+    def _sample_process_fds(self) -> None:
+        try:
+            while not self._stop_event.is_set():
+                with self._condition:
+                    sampled_generation = self._barriers_requested
+                if self.scan_trace is not None:
+                    self._drain_scan_trace()
+                    time.sleep(0.001)
+                else:
+                    holds = self._process_holds_directory()
+                    if holds != self._sampler_holds_directory:
+                        self._sampler_holds_directory = holds
+                        self._append_process_event(
+                            self._IN_OPEN if holds else self._IN_CLOSE_NOWRITE
+                        )
+                    os.sched_yield()
+                with self._condition:
+                    self._sampler_barriers_handled = max(
+                        self._sampler_barriers_handled, sampled_generation,
+                    )
+                    self._condition.notify_all()
+        except BaseException as exc:
+            with self._condition:
+                self._reader_error = exc
+                self._condition.notify_all()
 
     def mark(self) -> int:
-        """先排空先前事件，再回傳本次 bridge action 的序列基準。"""
-        self._drain()
-        return len(self.events)
+        """等待 reader 排空此刻前事件，再回傳 bridge action 的序列基準。"""
+        with self._condition:
+            self._barriers_requested += 1
+            wanted = self._barriers_requested
+        os.write(self._control_write, b"m")
+        with self._condition:
+            while (
+                (
+                    self._barriers_handled < wanted
+                    or self._sampler_barriers_handled < wanted
+                )
+                and self._reader_error is None
+            ):
+                self._condition.wait(timeout=0.1)
+            if self._reader_error is not None:
+                raise RuntimeError("by-id 掃描觀測器 reader 失敗") from self._reader_error
+            return len(self.events)
 
     def _wait_for(self, predicate, *, timeout_s: float, deadline_ns: int | None, label: str):
-        local_deadline = time.monotonic() + timeout_s
-        while True:
-            self._drain()
-            result = predicate()
-            if result is not None:
-                if deadline_ns is None or all(event["observed_ns"] <= deadline_ns for event in result):
-                    return result
-                raise TimeoutError(f"{label} 事件在 handoff 排空窗口截止後才被觀察到：{result!r}")
-            remaining = local_deadline - time.monotonic()
-            if deadline_ns is not None:
-                remaining = min(remaining, (deadline_ns - time.monotonic_ns()) / 1_000_000_000)
-            if remaining <= 0:
-                raise TimeoutError(f"等待 {label} 逾時；events={self.events!r}")
-            select.select([self._fd], [], [], remaining)
+        local_deadline = time.monotonic_ns() + int(timeout_s * 1_000_000_000)
+        effective_deadline = min(
+            local_deadline,
+            deadline_ns if deadline_ns is not None else local_deadline,
+        )
+        with self._condition:
+            while True:
+                if self._reader_error is not None:
+                    raise RuntimeError("by-id 掃描觀測器 reader 失敗") from self._reader_error
+                result = predicate()
+                if result is not None:
+                    if deadline_ns is None or all(
+                        event["observed_ns"] <= deadline_ns for event in result
+                    ):
+                        return result
+                    raise TimeoutError(
+                        f"{label} 事件在 handoff 排空窗口截止後才被觀察到：{result!r}"
+                    )
+                remaining_ns = effective_deadline - time.monotonic_ns()
+                if remaining_ns <= 0:
+                    raise TimeoutError(f"等待 {label} 逾時；events={self.events!r}")
+                self._condition.wait(timeout=min(remaining_ns / 1_000_000_000, 0.1))
 
     def wait_link_event(
         self, *, after_seq: int, action: str, timeout_s: float, deadline_ns: int | None = None,
@@ -157,16 +443,36 @@ class _ByIdScanObserver:
         )[0]
 
     def wait_scan_after(
-        self, *, after_seq: int, timeout_s: float, deadline_ns: int | None = None,
+        self,
+        *,
+        after_seq: int,
+        timeout_s: float,
+        deadline_ns: int | None = None,
+        link_present: bool | None = None,
     ) -> tuple[dict[str, int | str], dict[str, int | str]]:
         def find():
             opened = None
             for event in self.events:
                 if event["sequence"] <= after_seq or event["name"]:
                     continue
-                if int(event["mask"]) & self._IN_OPEN:
+                source = event.get("source")
+                if source not in {"scan_trace", "proc_fd"}:
+                    continue
+                if (
+                    link_present is not None
+                    and event.get("link_present") is not link_present
+                ):
+                    continue
+                if (
+                    int(event["mask"]) & self._IN_OPEN
+                    and event.get("process_pid") == self.process_pid
+                ):
                     opened = event
-                elif opened is not None and int(event["mask"]) & self._IN_CLOSE_NOWRITE:
+                elif (
+                    opened is not None
+                    and int(event["mask"]) & self._IN_CLOSE_NOWRITE
+                    and event.get("process_pid") == self.process_pid
+                ):
                     return opened, event
             return None
 
@@ -175,9 +481,55 @@ class _ByIdScanObserver:
         )
 
 
-def _scan_by_id_directory(directory: Path) -> None:
+def _scan_by_id_directory(directory: Path, *, hold_s: float = 0.05) -> None:
     with os.scandir(directory) as entries:
-        list(entries)
+        next(entries, None)
+        if hold_s:
+            time.sleep(hold_s)
+
+
+def _prepare_by_id_scan_trace(tmp_path: Path, env: dict[str, str]) -> Path:
+    compiler = shutil.which("cc")
+    assert compiler is not None, "LD_PRELOAD 掃描觀測器需要 cc"
+    preload = tmp_path / "by-id-scan-trace.so"
+    result = subprocess.run(
+        [
+            compiler,
+            "-shared",
+            "-fPIC",
+            "-O2",
+            "-x",
+            "c",
+            "-",
+            "-ldl",
+            "-o",
+            str(preload),
+        ],
+        input=_BY_ID_SCAN_PRELOAD_C,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    trace = tmp_path / "by-id-scan.trace"
+    env["LD_PRELOAD"] = os.pathsep.join(
+        part for part in (str(preload), env.get("LD_PRELOAD", "")) if part
+    )
+    env["SW_TEST_BY_ID_SCAN_TRACE"] = str(trace)
+    env["SW_TEST_BY_ID_SCAN_DIR"] = env["SERIALWRAP_BY_ID_DIR"]
+    env["SW_TEST_BY_ID_SCAN_LINK"] = str(
+        Path(env["SERIALWRAP_BY_ID_DIR"]) / "usb-FAKE_TARGET_0-if00"
+    )
+    return trace
+
+
+def _pause_mono_ns(pause_dir: Path, point: str, phase: str) -> int:
+    name = point.replace("/", "_").replace(":", "_")
+    path = pause_dir / f"{name}.{phase}_mono_ns"
+    value = int(path.read_text(encoding="utf-8").strip())
+    assert value > 0, (path, value)
+    return value
 
 
 def _install_old(tmp_path: Path, env: dict[str, str], bundle: Path) -> tuple[Path, Path]:
@@ -192,8 +544,19 @@ def _install_old(tmp_path: Path, env: dict[str, str], bundle: Path) -> tuple[Pat
 def _start_rig(tmp_path: Path, env: dict[str, str], *, delay_ms: int = 1):
     profile_dir = prepare_profile(env)
     bridge = BridgeTarget.start(tmp_path / "bridge", env, delay_ms=delay_ms)
+    installed_daemon = (
+        Path(env["SERIALWRAP_INSTALL_ROOT"]) / "bin" / "serialwrapd"
+    )
+    assert installed_daemon.is_file() and os.access(installed_daemon, os.X_OK), (
+        installed_daemon
+    )
     try:
-        daemon = start_python_daemon(env, profile_dir, bridge=bridge)
+        daemon = start_python_daemon(
+            env,
+            profile_dir,
+            bridge=bridge,
+            daemon_command=[str(installed_daemon)],
+        )
     except BaseException:
         bridge.stop()
         raise
@@ -204,7 +567,7 @@ def _stop_rig(bridge: BridgeTarget, daemon, cli: Path, env: dict[str, str]) -> N
     finish_test_rig(bridge, daemon, cli, env)
 
 
-@pytest.mark.memory_only
+@pytest.mark.process_rpc
 def test_by_id_scan_observer_rejects_a_pre_change_scan_and_times_out_without_new_scan(tmp_path: Path) -> None:
     directory = tmp_path / "by-id"
     directory.mkdir()
@@ -212,6 +575,7 @@ def test_by_id_scan_observer_rejects_a_pre_change_scan_and_times_out_without_new
     target.touch()
     link = directory / "usb-FAKE_TARGET_0-if00"
     link.symlink_to(target)
+    (directory / "padding").touch()
     observer = _ByIdScanObserver(directory, link.name)
     try:
         before_change = observer.mark()
@@ -222,6 +586,22 @@ def test_by_id_scan_observer_rejects_a_pre_change_scan_and_times_out_without_new
         link.unlink()
         removed = observer.wait_link_event(after_seq=before_remove, action="remove", timeout_s=1.0)
         assert old_scan[1]["sequence"] < removed["sequence"]
+        foreign_scan = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os, sys, time; "
+                    "entries=os.scandir(sys.argv[1]); next(entries, None); "
+                    "time.sleep(0.05); entries.close()"
+                ),
+                str(directory),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        assert foreign_scan.returncode == 0, foreign_scan.stderr
         with pytest.raises(TimeoutError, match="等待 symlink 變更後的 by-id 目錄掃描 逾時"):
             observer.wait_scan_after(after_seq=int(removed["sequence"]), timeout_s=0.05)
     finally:
@@ -236,6 +616,7 @@ def test_by_id_scan_observer_requires_a_separate_scan_after_link_restore(tmp_pat
     target.touch()
     link = directory / "usb-FAKE_TARGET_0-if00"
     link.symlink_to(target)
+    (directory / "padding").touch()
     observer = _ByIdScanObserver(directory, link.name)
     try:
         before_remove = observer.mark()
@@ -564,11 +945,12 @@ def test_update_background_triggers_zero_tx_in_drain_window_l15(tmp_path: Path, 
 
     與 `test_update_push_after_freeze_zero_tx_l15`（只驗 file.push 路徑）不同：本案例窗口內不送任何 RPC，
     觸發全部來自背景引擎，依序為既有 console 輸入一行、DeviceWatcher 在 by-id 連結移除與復原後各自重探。
-    inotify 以該私有 by-id 目錄的 symlink 事件分隔兩階段，再等待事件之後的目錄 open/close；不使用 device.list
-    代替掃描完成訊號。
+    inotify 以該私有 by-id 目錄的 symlink 事件分隔兩階段，再以 daemon PID 的 /proc fd 證據等待事件之後的
+    目錄 open/close；不使用 device.list 代替掃描完成訊號，其他行程單獨讀目錄不得滿足判準。
 
-    時序與窗口邊界：窗口自 daemon 寫出 `handoff_stop` 回覆起算，長度為 HANDOFF_DRAIN_GRACE_S；CLI 於收到回覆後
-    才寫出暫停點，故暫停點觀察到的時刻不早於窗口起點。斷言分兩段：
+    時序與窗口邊界：CLI 在送出 `handoff_stop` 前記錄 monotonic 下界；該值不晚於 daemon 建立窗口的實際起點，
+    故加上 HANDOFF_DRAIN_GRACE_S 的截止點保守。回覆後另受控延遲 150 ms 才寫 reached marker，避免 marker 延遲
+    未量測。斷言分兩段：
     1) 窗口仍開啟的證明：觸發後舊 daemon 尚未停止、`health.ping` 成功，且此時 TX 仍與凍結時一致；
     2) 整段零 TX：舊 daemon 停止（即窗口結束）後，以 bridge mark 作為擷取排空的屏障，TX 須與凍結時一致，
        且 console marker 不得出現於 TX（`assert_no_tx_after`）。
@@ -580,14 +962,31 @@ def test_update_background_triggers_zero_tx_in_drain_window_l15(tmp_path: Path, 
     使 handoff 回 `SESSION_BUSY`，故不作為觸發來源。
     """
     old, new = update_bundles()
-    old_cli, _root = _install_old(tmp_path, env, old)
+    old_cli, root = _install_old(tmp_path, env, old)
+    scan_trace = _prepare_by_id_scan_trace(tmp_path, env)
     bridge, daemon = _start_rig(tmp_path, env)
     new_cli = select_bundle(env, new)
     pause_dir = tmp_path / "pause-drain-window"
     scan_observer = _ByIdScanObserver(
-        Path(env["SERIALWRAP_BY_ID_DIR"]), "usb-FAKE_TARGET_0-if00",
+        Path(env["SERIALWRAP_BY_ID_DIR"]),
+        "usb-FAKE_TARGET_0-if00",
+        process_pid=daemon.proc.pid,
+        scan_trace=scan_trace,
     )
-    env.update({"SW_TEST_UPDATE_PAUSE_AFTER": "handoff_stop:replied", "SW_TEST_UPDATE_PAUSE_DIR": str(pause_dir)})
+    old_daemon = root / "bin" / "serialwrapd"
+    old_status = rpc(env, "health.status")
+    assert old_daemon.is_file() and os.access(old_daemon, os.X_OK), old_daemon
+    assert old_status.get("version") == OLD_BUNDLE_VERSION, old_status
+    assert Path(os.readlink(f"/proc/{daemon.proc.pid}/exe")).resolve() == old_daemon.resolve(), {
+        "actual_exe": os.readlink(f"/proc/{daemon.proc.pid}/exe"),
+        "expected_exe": str(old_daemon),
+        "status": old_status,
+    }
+    env.update({
+        "SW_TEST_UPDATE_PAUSE_AFTER": "handoff_stop:replied",
+        "SW_TEST_UPDATE_PAUSE_DIR": str(pause_dir),
+        "SW_TEST_UPDATE_PAUSE_REPLY_DELAY_MS": "150",
+    })
     update_rows = []
     update_thread = RaisingThread(
         lambda: update_rows.append(run_cli(new_cli, ["setup", "--on-demand"], env, timeout_s=240.0)),
@@ -600,11 +999,35 @@ def test_update_background_triggers_zero_tx_in_drain_window_l15(tmp_path: Path, 
         vtty = primary["vtty"]
         marker = f"DRAIN_WINDOW_{time.time_ns()}"
         update_thread.start()
-        pause_marker = wait_pause(pause_dir, "handoff_stop:replied")
-        # pause marker 寫在 handoff_stop 回覆之後；以檔案時間還原 monotonic 時刻並往前留 50 ms，
-        # 避免把 hook 回覆到 marker 建立之間的時間誤算成窗口餘裕。
-        window_started_ns = pause_marker.stat().st_mtime_ns + (time.monotonic_ns() - time.time_ns()) - 50_000_000
-        window_deadline_ns = window_started_ns + int(HANDOFF_DRAIN_GRACE_S * 1_000_000_000)
+        wait_pause(pause_dir, "handoff_stop:replied")
+        request_started_ns = _pause_mono_ns(
+            pause_dir, "handoff_stop:replied", "request",
+        )
+        reply_observed_ns = _pause_mono_ns(
+            pause_dir, "handoff_stop:replied", "reply",
+        )
+        marker_created_ns = _pause_mono_ns(
+            pause_dir, "handoff_stop:replied", "reached",
+        )
+        assert reply_observed_ns >= request_started_ns, (
+            request_started_ns, reply_observed_ns,
+        )
+        assert marker_created_ns - reply_observed_ns >= 150_000_000, (
+            reply_observed_ns, marker_created_ns,
+        )
+        marker_based_start_ns = marker_created_ns - 50_000_000
+        # request_started_ns 取在 CLI 發出 daemon.handoff_stop 前；因此必不晚於 daemon 成立排空窗口，
+        # 以它加上固定窗口長度所得截止點只會比實際截止點更早，屬保守上界。
+        window_started_upper_bound_ns = request_started_ns
+        assert request_started_ns < marker_based_start_ns, (
+            request_started_ns, marker_based_start_ns, marker_created_ns,
+        )
+        assert window_started_upper_bound_ns <= request_started_ns < marker_based_start_ns, (
+            window_started_upper_bound_ns, request_started_ns, marker_based_start_ns,
+        )
+        window_deadline_ns = window_started_upper_bound_ns + int(
+            HANDOFF_DRAIN_GRACE_S * 1_000_000_000
+        )
         bridge.mark("handoff-frozen", os.getpid())
         tx_at_freeze = tx_bytes(bridge.evidence_dir)
         frozen_pid = daemon.proc.pid
@@ -626,9 +1049,10 @@ def test_update_background_triggers_zero_tx_in_drain_window_l15(tmp_path: Path, 
                 deadline_ns=window_deadline_ns,
             )
             scan_open, scan_close = scan_observer.wait_scan_after(
-                after_seq=int(link_event["sequence"]),
+                after_seq=action_mark,
                 timeout_s=HANDOFF_DRAIN_GRACE_S,
                 deadline_ns=window_deadline_ns,
+                link_present=change == "restore",
             )
             scan_trace.append({
                 "action": action,
@@ -638,6 +1062,9 @@ def test_update_background_triggers_zero_tx_in_drain_window_l15(tmp_path: Path, 
                 "link_event_observed_ns": link_event["observed_ns"],
                 "scan_open_sequence": scan_open["sequence"],
                 "scan_open_observed_ns": scan_open["observed_ns"],
+                "scan_process_pid": scan_open["process_pid"],
+                "scan_thread_id": scan_open["thread_id"],
+                "scan_link_present": scan_open["link_present"],
                 "scan_close_sequence": scan_close["sequence"],
                 "scan_close_observed_ns": scan_close["observed_ns"],
             })
@@ -660,13 +1087,22 @@ def test_update_background_triggers_zero_tx_in_drain_window_l15(tmp_path: Path, 
         assert scan_trace[1]["action"] == "by_id_link_add"
         assert int(scan_trace[0]["scan_close_sequence"]) < int(scan_trace[1]["link_event_sequence"]), scan_trace
         assert int(scan_trace[1]["scan_close_observed_ns"]) <= ping_started_ns, scan_trace
-        print(json.dumps({
-            "window_started_ns": window_started_ns,
+        window_evidence = {
+            "window_started_upper_bound_ns": window_started_upper_bound_ns,
             "window_deadline_ns": window_deadline_ns,
+            "daemon_pid": daemon.proc.pid,
+            "reply_observed_ns": reply_observed_ns,
+            "marker_created_ns": marker_created_ns,
             "scan_trace": scan_trace,
             "ping_started_ns": ping_started_ns,
             "ping_completed_ns": ping_completed_ns,
-        }, sort_keys=True))
+        }
+        diagnostic_path = os.environ.get("SW_CI_THIN_DIAG_PATH")
+        if diagnostic_path:
+            Path(diagnostic_path).write_text(
+                json.dumps(window_evidence, sort_keys=True) + "\n", encoding="utf-8",
+            )
+        print(json.dumps(window_evidence, sort_keys=True))
         # 4) 整段窗口：舊 daemon 停止即窗口結束；以 bridge mark 作為擷取排空屏障後，全段 TX 須零增量。
         deadline = time.monotonic() + HANDOFF_DRAIN_GRACE_S + 10.0
         while daemon.proc.poll() is None and time.monotonic() < deadline:
@@ -690,6 +1126,7 @@ def test_update_background_triggers_zero_tx_in_drain_window_l15(tmp_path: Path, 
             update_thread.join(15.0)
         env.pop("SW_TEST_UPDATE_PAUSE_AFTER", None)
         env.pop("SW_TEST_UPDATE_PAUSE_DIR", None)
+        env.pop("SW_TEST_UPDATE_PAUSE_REPLY_DELAY_MS", None)
         _stop_rig(bridge, daemon, new_cli, env)
 
 

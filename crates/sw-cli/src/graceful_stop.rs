@@ -804,6 +804,8 @@ fn request_handoff(ctx: &CliCtx<'_>, endpoint: &str, reason: &str) -> Result<Str
         "reason".to_string(),
         PyValue::Str(reason.to_string()),
     )]));
+    #[cfg(feature = "test-fakes")]
+    crate::rollback::test_record_pause_request("handoff_stop:replied");
     let (outcome, failure) = client::call_with_failure(
         ctx,
         endpoint,

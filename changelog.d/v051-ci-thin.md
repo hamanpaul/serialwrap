@@ -8,3 +8,7 @@ scope: tests
 
 依擁有者 OD-115，DF-23 黑箱測試改為只在 Rust 執行，並記錄 Python 0.4.x 的時序相依終態與偶發一次自動重試。
 P7 coverage 在 Python A 輪的 rust-only 節點已由 selector 精確 deselect 時，仍要求 A JUnit 可解析；缺檔或 XML 損壞會回報明確的證據缺失 GAP，不再讓診斷程式中止。
+
+補強 update 黑箱證據：僅掛入拋棄式 daemon 的 `opendir/closedir` trace 以 PID、TID、monotonic 與 link 狀態將掃描歸因到受測 daemon，排空窗口改用 CLI 發出 handoff RPC 前的 monotonic 下界，並注入超過 50 ms 的回覆至 marker 延遲；舊版與新版 bundle 的 daemon 皆套用 build-time 版本，rig 同時核對版本與 executable。
+
+console overflow 測試持續保留 16390-byte payload、2 秒零 RX 與 warning 斷言，並記錄 line-buffered ownership、DUT TX 與 WAL；hosted Windows bridge 測試容忍狀態檔原子替換瞬間的 `PermissionError` 後重試同一等待上限。
