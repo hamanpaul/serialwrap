@@ -765,8 +765,12 @@ pub struct OriginalSnapshot {
     /// config 在原交易開始前是否存在；不可由復原時的環境重新推導。
     pub config_existed: Option<bool>,
     pub config_sha256: Option<String>,
-    /// 原本不存在的 config 由交易建立後，記錄最後一次交易寫入內容以確認復原可安全移除。
+    /// 原始 config 的 POSIX owner/group/mode/mtime；不含 ctime，因還原會建立新 inode。
+    pub config_original_metadata: Option<String>,
+    /// 記錄交易目前預期的 config 內容，供復原確認檔案仍處於交易狀態。
     pub config_written_sha256: Option<String>,
+    /// 最後一次交易寫入時的 POSIX owner/group/mode，供中斷復原確認檔案仍處於交易狀態。
+    pub config_written_metadata: Option<String>,
     pub supervisor: SupervisorSnapshot,
     pub daemon: Option<DaemonSnapshot>,
     pub daemon_start: &'static str,
@@ -844,24 +848,60 @@ fn journal_config_path(ctx: &CliCtx<'_>, original: &OriginalSnapshot) -> Result<
     if config_existed != original.config_sha256.is_some() {
         return Err(("config_state_unknown", "journal 的 config 存在狀態與原始 SHA-256 不一致；保留 journal，未修改檔案".into()));
     }
-    if !config_existed && ctx.p.fs.exists(&recorded) {
-        let Some(expected) = original.config_written_sha256.as_deref() else {
+    Ok(recorded)
+}
+
+fn config_metadata_fingerprint(path: &Path, include_ctime: bool) -> Result<Option<String>, LayoutError> {
+    sw_pal::fs_ops::file_metadata_fingerprint(path, include_ctime)
+        .map_err(|error| layout_io(path, error.py_message))
+}
+
+fn verify_transaction_config(
+    ctx: &CliCtx<'_>,
+    original: &OriginalSnapshot,
+    recorded: &Path,
+) -> Result<(), (&'static str, String)> {
+    let exists = ctx.p.fs.exists(recorded);
+    if !exists {
+        if original.config_existed == Some(true) {
             return Err(("config_ownership_unknown", format!(
-                "原交易前 config 不存在，但目前檔案沒有交易寫入 SHA-256 可供確認：{}；保留 journal，未修改檔案",
-                recorded.display()
-            )));
-        };
-        let actual = hash_path(ctx, &recorded).map_err(|error| {
-            ("config_ownership_unknown", format!("無法確認交易建立的 config：{error}"))
-        })?;
-        if actual != expected {
-            return Err(("config_ownership_unknown", format!(
-                "目前 config 內容與交易寫入記錄不一致：{}；保留 journal，未修改檔案",
+                "原交易前 config 存在，但目前檔案已不存在：{}；保留 journal，未修改檔案",
                 recorded.display()
             )));
         }
+        return Ok(());
     }
-    Ok(recorded)
+    let Some(expected) = original.config_written_sha256.as_deref() else {
+        return Err(("config_ownership_unknown", format!(
+            "目前 config 沒有交易寫入 SHA-256 可供確認：{}；保留 journal，未修改檔案",
+            recorded.display()
+        )));
+    };
+    let actual = hash_path(ctx, recorded).map_err(|error| {
+        ("config_ownership_unknown", format!("無法確認交易 config：{error}；保留 journal，未修改檔案"))
+    })?;
+    let actual_metadata = config_metadata_fingerprint(recorded, true).map_err(|error| {
+        ("config_ownership_unknown", format!("無法確認 config owner/group/mode：{error}；保留 journal，未修改檔案"))
+    })?;
+    if actual == expected && actual_metadata == original.config_written_metadata {
+        return Ok(());
+    }
+    // 第一次復原可能已把 config 還原，但在後續步驟中再次中斷。接受原始內容及存取 metadata
+    // 相符的狀態，避免讓重試覆寫中斷後才修改的其他 config。
+    if original.config_existed == Some(true) && original.config_sha256.as_deref() == Some(actual.as_str()) {
+        let original_metadata = config_metadata_fingerprint(recorded, false).map_err(|error| {
+            ("config_ownership_unknown", format!("無法確認原始 config owner/group/mode：{error}；保留 journal，未修改檔案"))
+        })?;
+        if original_metadata == original.config_original_metadata {
+            return Ok(());
+        }
+    }
+    let detail = if actual != expected {
+        "目前 config 內容或 owner/group/mode 與交易記錄不一致"
+    } else {
+        "目前 config owner/group/mode 與交易記錄不一致"
+    };
+    Err(("config_ownership_unknown", format!("{detail}：{}；保留 journal，未修改檔案", recorded.display())))
 }
 
 fn record_transaction_config(ctx: &CliCtx<'_>, root: &InstallRoot, journal: &mut Journal) -> Result<(), LayoutError> {
@@ -875,6 +915,11 @@ fn record_transaction_config(ctx: &CliCtx<'_>, root: &InstallRoot, journal: &mut
     original.config_written_sha256 = if ctx.p.fs.exists(&recorded) {
         let bytes = ctx.p.fs.read(&recorded).map_err(|error| layout_io(&recorded, error.py_message))?;
         Some(sha256_hex(&bytes))
+    } else {
+        None
+    };
+    original.config_written_metadata = if ctx.p.fs.exists(&recorded) {
+        config_metadata_fingerprint(&recorded, true)?
     } else {
         None
     };
@@ -904,9 +949,19 @@ pub fn persist_original_snapshot(
     let config_sha256 = if ctx.p.fs.exists(&config_path) {
         let bytes = ctx.p.fs.read(&config_path).map_err(|error| layout_io(&config_path, error.py_message))?;
         let path = dir.join("config.yaml");
-        copy_file(ctx, &config_path, &path)?;
+        copy_file_owner_group(ctx, &config_path, &path)?;
         Some(sha256_hex(&bytes))
     } else { None };
+    let config_original_metadata = if config_existed {
+        config_metadata_fingerprint(&config_path, false)?
+    } else {
+        None
+    };
+    let config_written_metadata = if config_existed {
+        config_metadata_fingerprint(&config_path, true)?
+    } else {
+        None
+    };
     let current_bytes = if ctx.p.fs.exists(&root.current_file) {
         let bytes = ctx.p.fs.read(&root.current_file).map_err(|error| layout_io(&root.current_file, error.py_message))?;
         let path = dir.join("current-release.json");
@@ -951,8 +1006,10 @@ pub fn persist_original_snapshot(
         entries,
         config_path: Some(config_path.to_string_lossy().into_owned()),
         config_existed: Some(config_existed),
-        config_sha256,
-        config_written_sha256: None,
+        config_sha256: config_sha256.clone(),
+        config_original_metadata,
+        config_written_sha256: config_sha256,
+        config_written_metadata,
         supervisor: sup.clone(),
         daemon: daemon.clone(),
         daemon_start,
@@ -1011,6 +1068,13 @@ pub fn recover_journal(ctx: &mut CliCtx, root: &InstallRoot) -> Option<RecoveryR
         Some(original) => original,
         None => return Some(recovery_error(&from_step, ErrorCode::InternalError.as_str(), "journal_corrupt", "snapshot_taken 之後的 journal 缺少 original")),
     };
+    let recorded_config = match journal_config_path(ctx, original) {
+        Ok(path) => path,
+        Err((reason, message)) => return Some(recovery_error(&from_step, ErrorCode::InternalError.as_str(), reason, message)),
+    };
+    if let Err((reason, message)) = verify_transaction_config(ctx, original, &recorded_config) {
+        return Some(recovery_error(&from_step, ErrorCode::InternalError.as_str(), reason, message));
+    }
     if let Err(message) = configured_mode_checked(ctx) {
         return Some(recovery_error(&from_step, ErrorCode::InternalError.as_str(), "config_read_failed", message));
     }
@@ -3465,7 +3529,9 @@ fn parse_original(value: &PyDict) -> Result<OriginalSnapshot, String> {
         config_path: optional_string_field(value, "config_path")?,
         config_existed: optional_bool_field(value, "config_existed")?,
         config_sha256: optional_string_field(value, "config_sha256")?,
+        config_original_metadata: optional_string_field(value, "config_original_metadata")?,
         config_written_sha256: optional_string_field(value, "config_written_sha256")?,
+        config_written_metadata: optional_string_field(value, "config_written_metadata")?,
         supervisor,
         daemon: match value.get("daemon") {
             None | Some(PyValue::Null) => None,
@@ -3645,6 +3711,15 @@ fn verify_snapshot(ctx: &CliCtx<'_>, journal: &Journal) -> Result<(), (&'static 
     if !ctx.p.fs.is_dir(&dir) { return Err(("snapshot_missing", "原始快照目錄不存在".into())); }
     let actual = snapshot_hashes(ctx, &dir).map_err(|error| ("snapshot_mismatch", error.to_string()))?;
     if actual != *expected { return Err(("snapshot_mismatch", "原始快照檔案清單或 SHA-256 不一致".into())); }
+    if let Some(original) = journal.original.as_ref().filter(|original| original.config_existed == Some(true)) {
+        let config_snapshot = dir.join("config.yaml");
+        let snapshot_metadata = config_metadata_fingerprint(&config_snapshot, false).map_err(|error| {
+            ("snapshot_mismatch", format!("無法確認原始 config snapshot metadata：{error}"))
+        })?;
+        if snapshot_metadata != original.config_original_metadata {
+            return Err(("snapshot_mismatch", "原始 config snapshot owner/group/mode 與 journal 不一致".into()));
+        }
+    }
     Ok(())
 }
 
@@ -3769,6 +3844,7 @@ fn restore_original(ctx: &mut CliCtx<'_>, root: &InstallRoot, journal: &Journal,
     let original = journal.original.as_ref().ok_or("journal 缺少 original snapshot")?;
     let snapshot = journal.snapshot_dir.as_deref().map(PathBuf::from).ok_or("journal 缺少 snapshot_dir")?;
     let config_path = journal_config_path(ctx, original).map_err(|(_, message)| message)?;
+    verify_transaction_config(ctx, original, &config_path).map_err(|(_, message)| message)?;
     let source = backup.unwrap_or(&snapshot);
     // state.json 與 benches.state.json 可能在新版運作期間更新（例如 RELEASED）；
     // 回退只還原設定，不可用舊備份覆蓋目前的持久化狀態。
@@ -3782,10 +3858,20 @@ fn restore_original(ctx: &mut CliCtx<'_>, root: &InstallRoot, journal: &Journal,
             if sha256_hex(&original_bytes) != expected {
                 return Err("原始 config.yaml 還原來源與 journal SHA-256 不一致".into());
             }
-            copy_replace(ctx, &original_config, &config_path).map_err(|error| error.to_string())?;
+            let snapshot_metadata = config_metadata_fingerprint(&original_config, false)
+                .map_err(|error| error.to_string())?;
+            if snapshot_metadata != original.config_original_metadata {
+                return Err("原始 config snapshot owner/group/mode 與 journal 不一致".into());
+            }
+            copy_replace_owner_group(ctx, &original_config, &config_path).map_err(|error| error.to_string())?;
             let restored = ctx.p.fs.read(&config_path).map_err(|error| error.py_message)?;
             if sha256_hex(&restored) != expected {
                 return Err("還原後的 config.yaml 與原始快照不一致".into());
+            }
+            let restored_metadata = config_metadata_fingerprint(&config_path, false)
+                .map_err(|error| error.to_string())?;
+            if restored_metadata != original.config_original_metadata {
+                return Err("還原後 config owner/group/mode 與 journal 不一致".into());
             }
         }
         (Some(false), None) => {
@@ -4106,6 +4192,18 @@ fn copy_file(ctx: &CliCtx<'_>, from: &Path, to: &Path) -> Result<(), LayoutError
     Ok(())
 }
 
+fn copy_file_owner_group(ctx: &CliCtx<'_>, from: &Path, to: &Path) -> Result<(), LayoutError> {
+    if let Some(parent) = to.parent() {
+        ctx.p.fs.mkdirs(parent).map_err(|error| layout_io(parent, error.py_message))?;
+    }
+    ctx.p.fs.copy_preserving_owner_group(from, to).map_err(|error| layout_io(to, error.py_message))?;
+    ctx.p.fs.sync_file(to).map_err(|error| layout_io(to, error.py_message))?;
+    if let Some(parent) = to.parent() {
+        ctx.p.fs.sync_dir(parent).map_err(|error| layout_io(parent, error.py_message))?;
+    }
+    Ok(())
+}
+
 fn copy_optional(ctx: &CliCtx<'_>, from: &Path, to: &Path, files: &mut Vec<(String, PathBuf)>) -> Result<(), LayoutError> {
     if ctx.p.fs.exists(from) {
         copy_file(ctx, from, to)?;
@@ -4121,6 +4219,20 @@ fn copy_replace(ctx: &CliCtx<'_>, from: &Path, to: &Path) -> Result<(), LayoutEr
     let temp = to.with_extension("restore.tmp");
     if ctx.p.fs.exists(&temp) { ctx.p.fs.remove_file(&temp).map_err(|error| layout_io(&temp, error.py_message))?; }
     copy_file(ctx, from, &temp)?;
+    ctx.p.fs.replace(&temp, to).map_err(|error| layout_io(to, error.py_message))?;
+    if let Some(parent) = to.parent() {
+        ctx.p.fs.sync_dir(parent).map_err(|error| layout_io(parent, error.py_message))?;
+    }
+    Ok(())
+}
+
+fn copy_replace_owner_group(ctx: &CliCtx<'_>, from: &Path, to: &Path) -> Result<(), LayoutError> {
+    if let Some(parent) = to.parent() {
+        ctx.p.fs.mkdirs(parent).map_err(|error| layout_io(parent, error.py_message))?;
+    }
+    let temp = to.with_extension("restore.tmp");
+    if ctx.p.fs.exists(&temp) { ctx.p.fs.remove_file(&temp).map_err(|error| layout_io(&temp, error.py_message))?; }
+    copy_file_owner_group(ctx, from, &temp)?;
     ctx.p.fs.replace(&temp, to).map_err(|error| layout_io(to, error.py_message))?;
     if let Some(parent) = to.parent() {
         ctx.p.fs.sync_dir(parent).map_err(|error| layout_io(parent, error.py_message))?;
@@ -4390,7 +4502,9 @@ fn original_value(original: &OriginalSnapshot) -> PyValue {
         ("config_existed".into(), original.config_existed.map(PyValue::Bool).unwrap_or(PyValue::Null)),
         ("config_path".into(), opt_str(original.config_path.as_deref())),
         ("config_sha256".into(), opt_str(original.config_sha256.as_deref())),
+        ("config_original_metadata".into(), opt_str(original.config_original_metadata.as_deref())),
         ("config_written_sha256".into(), opt_str(original.config_written_sha256.as_deref())),
+        ("config_written_metadata".into(), opt_str(original.config_written_metadata.as_deref())),
         ("current".into(), current_value(original.current.as_ref())),
         ("daemon".into(), daemon_value(original.daemon.as_ref())),
         ("daemon_start".into(), str_value(original.daemon_start)),

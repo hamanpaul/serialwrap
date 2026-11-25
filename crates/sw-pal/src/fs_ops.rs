@@ -47,6 +47,35 @@ pub fn map_file_error(error: std::io::Error) -> PalError {
     }
 }
 
+/// 回傳供復原交易核對的檔案 metadata 指紋；只含 POSIX owner、group、mode 與時間欄位。
+/// 非 POSIX 平台回傳 `None`，平台細節留在 PAL 邊界內。
+pub fn file_metadata_fingerprint(path: &Path, include_ctime: bool) -> PalResult<Option<String>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).map_err(map_file_error)?;
+        let base = format!(
+            "uid={};gid={};mode={:04o};mtime={}.{}",
+            metadata.uid(),
+            metadata.gid(),
+            metadata.mode() & 0o7777,
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+        );
+        let fingerprint = if include_ctime {
+            format!("{base};ctime={}.{}", metadata.ctime(), metadata.ctime_nsec())
+        } else {
+            base
+        };
+        Ok(Some(fingerprint))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, include_ctime);
+        Ok(None)
+    }
+}
+
 /// 將建立目錄錯誤轉成 Python `os.makedirs` 相容的 PAL 錯誤。
 ///
 /// Windows `os.makedirs` 保留 Win32 錯誤碼（例如 `[WinError 183]`），與 `open` 的 CRT errno 不同。
@@ -207,9 +236,13 @@ pub trait FsOps: FsRead {
     fn remove_dir(&self, p: &Path) -> PalResult<()> {
         Err(PalError::plain(PalErrorKind::Unsupported, "remove_dir 未實作"))
     }
-    /// 複製單一檔案並保留 mode。
+    /// 複製單一檔案並保留一般平台支援的 metadata（POSIX mode 與時間）。
     fn copy_preserving(&self, from: &Path, to: &Path) -> PalResult<()> {
         unimplemented!("P4-T5")
+    }
+    /// 複製單一檔案並保留 owner、group、mode 與時間；平台不支援 owner/group 時退回一般複製。
+    fn copy_preserving_owner_group(&self, from: &Path, to: &Path) -> PalResult<()> {
+        self.copy_preserving(from, to)
     }
     /// 將已寫入的檔案內容與中繼資料同步至穩定儲存。
     fn sync_file(&self, p: &Path) -> PalResult<()> {

@@ -7,7 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -16,6 +16,58 @@ pub struct NativeFsRead;
 /// POSIX 寫入面與跨行程鎖。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeFsOps;
+
+/// 讀取目前測試行程的 primary 與 supplementary group；僅供 POSIX test-fakes fixture 使用。
+#[cfg(feature = "test-fakes")]
+#[allow(clippy::useless_conversion)] // 某些 POSIX 的 gid_t 可能寬於 u32；測試介面固定 u32 並在轉換失敗時停止。
+pub fn test_process_groups() -> PalResult<(u32, Vec<u32>)> {
+    // SAFETY: getegid 不接收指標；getgroups(0, null) 只查詢 supplementary group 數量。
+    let primary = u32::try_from(unsafe { libc::getegid() }).map_err(|_| {
+        PalError::plain(PalErrorKind::InvalidInput, "POSIX primary group 超出測試支援範圍")
+    })?;
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count < 0 {
+        return Err(posix_io_error(io::Error::last_os_error()));
+    }
+    let mut groups = vec![0 as libc::gid_t; count as usize];
+    if count > 0 {
+        // SAFETY: groups 有 count 個可寫 gid_t；count 是 getgroups 回傳的容量。
+        let written = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+        if written < 0 {
+            return Err(posix_io_error(io::Error::last_os_error()));
+        }
+        groups.truncate(written as usize);
+    }
+    let groups = groups
+        .into_iter()
+        .map(|group| {
+            u32::try_from(group).map_err(|_| {
+                PalError::plain(PalErrorKind::InvalidInput, "POSIX supplementary group 超出測試支援範圍")
+            })
+        })
+        .collect::<PalResult<Vec<_>>>()?;
+    Ok((primary, groups))
+}
+
+/// 設定測試暫存檔案的 group；僅供 POSIX test-fakes fixture 使用。
+#[cfg(feature = "test-fakes")]
+pub fn test_set_path_group(path: &Path, group: u32) -> PalResult<()> {
+    let metadata = fs::metadata(path).map_err(posix_io_error)?;
+    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        PalError::plain(PalErrorKind::InvalidInput, "測試路徑包含 NUL")
+    })?;
+    // SAFETY: c_path 是 NUL 結尾路徑；保留目前 owner，只設定測試所需的 group。
+    if unsafe { libc::chown(c_path.as_ptr(), metadata.uid(), group as libc::gid_t) } == -1 {
+        return Err(posix_io_error(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// 設定測試暫存路徑的 mode；僅供 POSIX test-fakes fixture 使用。
+#[cfg(feature = "test-fakes")]
+pub fn test_set_path_mode(path: &Path, mode: u32) -> PalResult<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777)).map_err(posix_io_error)
+}
 
 impl FsRead for NativeFsOps {
     fn read(&self, path: &Path) -> PalResult<Vec<u8>> {
@@ -78,6 +130,11 @@ impl FsOps for NativeFsOps {
     fn copy_preserving(&self, from: &Path, to: &Path) -> PalResult<()> {
         fs::copy(from, to).map_err(posix_io_error)?;
         copy_file_metadata(from, to)
+    }
+
+    fn copy_preserving_owner_group(&self, from: &Path, to: &Path) -> PalResult<()> {
+        fs::copy(from, to).map_err(posix_io_error)?;
+        copy_file_metadata_owner_group(from, to)
     }
 
     fn sync_file(&self, path: &Path) -> PalResult<()> {
@@ -324,6 +381,23 @@ fn copy_tree(from: &Path, to: &Path) -> PalResult<()> {
 
 fn copy_file_metadata(from: &Path, to: &Path) -> PalResult<()> {
     let metadata = fs::metadata(from).map_err(posix_io_error)?;
+    copy_file_timestamps_and_mode(&metadata, to)
+}
+
+fn copy_file_metadata_owner_group(from: &Path, to: &Path) -> PalResult<()> {
+    let metadata = fs::metadata(from).map_err(posix_io_error)?;
+    let destination = CString::new(to.as_os_str().as_bytes()).map_err(|_| {
+        PalError::plain(PalErrorKind::InvalidInput, "copy_preserving 目標路徑包含 NUL")
+    })?;
+    // SAFETY: destination 是 NUL 結尾路徑；來源與目標都是 copy_preserving 建立的普通檔案。
+    // chown 失敗時不能宣稱 metadata 已保留，直接回報讓呼叫端保留復原證據。
+    if unsafe { libc::chown(destination.as_ptr(), metadata.uid(), metadata.gid()) } == -1 {
+        return Err(posix_io_error(io::Error::last_os_error()));
+    }
+    copy_file_timestamps_and_mode(&metadata, to)
+}
+
+fn copy_file_timestamps_and_mode(metadata: &fs::Metadata, to: &Path) -> PalResult<()> {
     let mut times = fs::FileTimes::new();
     if let Ok(accessed) = metadata.accessed() {
         times = times.set_accessed(accessed);

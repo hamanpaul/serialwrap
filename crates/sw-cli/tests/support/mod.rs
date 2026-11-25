@@ -223,6 +223,9 @@ impl FsOps for EventFs {
         Ok(())
     }
     fn copy_preserving(&self, from: &Path, to: &Path) -> PalResult<()> { self.inner.copy_preserving(from, to) }
+    fn copy_preserving_owner_group(&self, from: &Path, to: &Path) -> PalResult<()> {
+        self.inner.copy_preserving_owner_group(from, to)
+    }
     fn sync_file(&self, path: &Path) -> PalResult<()> { self.inner.sync_file(path) }
     fn copy_tree(&self, from: &Path, to: &Path) -> PalResult<()> { self.inner.copy_tree(from, to) }
     fn remove_tree(&self, path: &Path) -> PalResult<()> { self.inner.remove_tree(path) }

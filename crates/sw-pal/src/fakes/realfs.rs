@@ -1,7 +1,8 @@
 //! 真實檔案系統替身（feature `test-fakes`；只供 tempdir 內的測試使用，不是產品路徑）。
 //!
-//! 所有 `FsRead`／`FsOps` 方法皆以 `std::fs` 實作（測試用，非原子保證、非產品鎖語意）；跨行程鎖以 `flock`（Unix）
-//! 取得，Windows 測試替身沿用 P4-T5 原生 `LockFileEx`。產品路徑請勿引用本模組。
+//! `FsRead`／`FsOps` 以 `std::fs` 實作（測試用，非原子保證、非產品鎖語意）；POSIX 檔案複製委派原生實作，讓 tempdir
+//! 測試覆蓋實際 metadata 行為。跨行程鎖以 `flock`（Unix）取得，Windows 測試替身沿用 P4-T5 原生 `LockFileEx`。
+//! 產品路徑請勿引用本模組。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -138,6 +139,17 @@ impl FsOps for RealFs {
     fn remove_dir(&self, p: &Path) -> PalResult<()> {
         std::fs::remove_dir(p).map_err(io_error)
     }
+    #[cfg(unix)]
+    fn copy_preserving(&self, from: &Path, to: &Path) -> PalResult<()> {
+        crate::fs_ops::posix::NativeFsOps.copy_preserving(from, to)
+    }
+
+    #[cfg(unix)]
+    fn copy_preserving_owner_group(&self, from: &Path, to: &Path) -> PalResult<()> {
+        crate::fs_ops::posix::NativeFsOps.copy_preserving_owner_group(from, to)
+    }
+
+    #[cfg(windows)]
     fn copy_preserving(&self, from: &Path, to: &Path) -> PalResult<()> {
         std::fs::copy(from, to).map(|_| ()).map_err(io_error)
     }

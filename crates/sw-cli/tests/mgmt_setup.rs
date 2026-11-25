@@ -3307,22 +3307,48 @@ fn bundle_setup_auto_port_interrupted_recovery_without_config_reselects_port() {
     assert!(t.journal_json().is_none(), "交易回復成功後應清除 journal");
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn posix_file_mode(path: &std::path::Path) -> u32 {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
+    let metadata = sw_pal::fs_ops::file_metadata_fingerprint(path, false)
         .expect("讀取檔案 metadata")
-        .permissions()
-        .mode()
-        & 0o777
+        .expect("POSIX metadata 應可用");
+    let mode = metadata.split(';').find_map(|field| field.strip_prefix("mode=")).expect("metadata 應包含 mode");
+    u32::from_str_radix(mode, 8).expect("mode 八進位")
+}
+
+#[cfg(all(test, unix))]
+fn posix_file_owner_group(path: &std::path::Path) -> (u32, u32) {
+    let metadata = sw_pal::fs_ops::file_metadata_fingerprint(path, false)
+        .expect("讀取檔案 owner/group")
+        .expect("POSIX metadata 應可用");
+    let field = |name| metadata.split(';').find_map(|field| field.strip_prefix(name)).expect("metadata 欄位存在").parse().expect("metadata 整數");
+    (field("uid="), field("gid="))
+}
+
+#[cfg(all(test, unix))]
+fn posix_set_file_mode(path: &std::path::Path, mode: u32) {
+    sw_pal::fs_ops::posix::test_set_path_mode(path, mode).expect("設定測試檔案 mode");
+}
+
+#[cfg(all(test, unix))]
+fn posix_secondary_group() -> u32 {
+    let (primary, groups) = sw_pal::fs_ops::posix::test_process_groups().expect("讀取 POSIX 測試行程 groups");
+    groups
+        .into_iter()
+        .find(|group| *group != primary)
+        .expect("POSIX owner/group 測試需要一個不同於 primary group 的 supplementary group")
+}
+
+#[cfg(all(test, unix))]
+fn posix_setgid_directory(path: &std::path::Path, group: u32) {
+    sw_pal::fs_ops::posix::test_set_path_group(path, group).expect("設定測試目錄 group");
+    posix_set_file_mode(path, posix_file_mode(path) | 0o2000);
 }
 
 /// inst4-f2 V051-a0b00f2-1：journal 綁定原交易 config；切換環境路徑時 fail closed。
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 #[test]
 fn inst4_f2_interrupted_setup_refuses_changed_config_path() {
-    use std::os::unix::fs::PermissionsExt;
-
     let t = TestEnv::posix().with_bundle(CURRENT_VERSION).with_process();
     let config_a = t.config_dir().join("transaction-a.yaml");
     let config_b = t.config_dir().join("user-b.yaml");
@@ -3339,11 +3365,7 @@ fn inst4_f2_interrupted_setup_refuses_changed_config_path() {
     let journal_before = t.journal_bytes().expect("交易中斷後必須留下 journal");
 
     std::fs::write(&config_b, config_b_original).expect("建立使用者設定 B");
-    std::fs::set_permissions(
-        &config_b,
-        std::fs::Permissions::from_mode(0o640),
-    )
-    .expect("設定 B 權限");
+    posix_set_file_mode(&config_b, 0o640);
     let config_b_mode = posix_file_mode(&config_b);
     let config_b_text = config_b.display().to_string();
     t.clear_crash();
@@ -3360,12 +3382,46 @@ fn inst4_f2_interrupted_setup_refuses_changed_config_path() {
     assert_eq!(t.journal_bytes().as_deref(), Some(journal_before.as_slice()), "拒絕復原時 journal 必須保留且不改寫");
 }
 
+/// inst4-f2 V051-774ad4a-1：既有 config 在中斷後被修改時，setup 不得以舊快照覆寫。
+#[cfg(all(test, unix))]
+#[test]
+fn inst4_f2_interrupted_recovery_refuses_modified_existing_config() {
+    let original = b"supervision_mode: on-demand\nsocket_path: /run/serialwrap/original.sock\n";
+    let mut t = TestEnv::posix()
+        .with_config(std::str::from_utf8(original).expect("config UTF-8"))
+        .with_installed("0.4.0")
+        .with_current("0.4.0", None)
+        .with_bundle(CURRENT_VERSION)
+        .with_crash_at("entries_switching:after_effect");
+    posix_set_file_mode(&t.config_path(), 0o640);
+
+    let (crash_rc, _out, _err) = t.run_from_bundle(&["setup", "--on-demand"]);
+    assert_eq!(crash_rc, 137, "注入的交易中斷應留下待復原 journal");
+    let journal_before = t.journal_bytes().expect("交易中斷後必須留下 journal");
+
+    let user_edit = "# 中斷後的使用者修改\nsupervision_mode: on-demand\nsocket_path: /run/serialwrap/user-edit.sock\n".as_bytes();
+    std::fs::write(t.config_path(), user_edit).expect("模擬中斷後使用者修改 config");
+    posix_set_file_mode(&t.config_path(), 0o600);
+    let edited_bytes = std::fs::read(t.config_path()).expect("讀取使用者修改後的 config");
+    let edited_mode = posix_file_mode(&t.config_path());
+    let edited_owner_group = posix_file_owner_group(&t.config_path());
+
+    t.clear_crash();
+    let (rc, out, err) = t.run_from_bundle(&["setup", "--on-demand"]);
+
+    assert_eq!(rc, 2, "無法確認 config 屬於交易時 setup 必須安全停止：{out} {err}");
+    assert!(out.contains("config_ownership_unknown"), "應回報 config 歸屬無法確認：{out}");
+    assert!(err.contains("config") && err.contains("journal"), "stderr 應說明 config 與 journal 保留狀態：{err}");
+    assert_eq!(std::fs::read(t.config_path()).expect("安全停止不得改寫 config"), edited_bytes);
+    assert_eq!(posix_file_mode(&t.config_path()), edited_mode, "安全停止不得改寫使用者 mode");
+    assert_eq!(posix_file_owner_group(&t.config_path()), edited_owner_group, "安全停止不得改寫使用者 owner/group");
+    assert_eq!(t.journal_bytes().as_deref(), Some(journal_before.as_slice()), "安全停止時 journal 必須原樣保留");
+}
+
 /// inst4-f2 V051-a0b00f2-2：切換失敗後回復既有 POSIX config 的內容與 mode。
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 #[test]
 fn inst4_f2_switch_failure_restores_existing_config_mode() {
-    use std::os::unix::fs::PermissionsExt;
-
     let original = b"supervision_mode: on-demand\nsocket_path: /run/serialwrap/test.sock\n";
     let t = TestEnv::posix()
         .with_config(std::str::from_utf8(original).expect("config UTF-8"))
@@ -3373,11 +3429,10 @@ fn inst4_f2_switch_failure_restores_existing_config_mode() {
         .with_current("0.4.0", None)
         .with_bundle(CURRENT_VERSION)
         .with_fs_fault_replace_suffix(".new");
-    std::fs::set_permissions(
-        t.config_path(),
-        std::fs::Permissions::from_mode(0o640),
-    )
-    .expect("設定原始 config 權限");
+    posix_set_file_mode(&t.config_path(), 0o640);
+    let original_owner_group = posix_file_owner_group(&t.config_path());
+    let config_dir = t.config_path().parent().expect("config parent").to_path_buf();
+    posix_setgid_directory(&config_dir, posix_secondary_group());
 
     let (rc, out, _err) = t.run_from_bundle(&["setup", "--on-demand"]);
 
@@ -3385,14 +3440,13 @@ fn inst4_f2_switch_failure_restores_existing_config_mode() {
     assert!(out.contains("\"reverted\":true"), "切換失敗必須完成回復：{out}");
     assert_eq!(std::fs::read(t.config_path()).expect("config 必須存在"), original);
     assert_eq!(posix_file_mode(&t.config_path()), 0o640, "回復必須保留原始 0640 mode");
+    assert_eq!(posix_file_owner_group(&t.config_path()), original_owner_group, "切換失敗回復必須保留原始 owner/group");
 }
 
 /// inst4-f2 V051-a0b00f2-2：journal 中斷復原後回復既有 POSIX config 的內容與 mode。
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 #[test]
 fn inst4_f2_interrupted_recovery_restores_existing_config_mode() {
-    use std::os::unix::fs::PermissionsExt;
-
     let original = b"supervision_mode: on-demand\nsocket_path: /run/serialwrap/test.sock\n";
     let mut t = TestEnv::posix()
         .with_config(std::str::from_utf8(original).expect("config UTF-8"))
@@ -3400,11 +3454,10 @@ fn inst4_f2_interrupted_recovery_restores_existing_config_mode() {
         .with_current("0.4.0", None)
         .with_bundle(CURRENT_VERSION)
         .with_crash_at("entries_switching:after_effect");
-    std::fs::set_permissions(
-        t.config_path(),
-        std::fs::Permissions::from_mode(0o640),
-    )
-    .expect("設定原始 config 權限");
+    posix_set_file_mode(&t.config_path(), 0o640);
+    let original_owner_group = posix_file_owner_group(&t.config_path());
+    let config_dir = t.config_path().parent().expect("config parent").to_path_buf();
+    posix_setgid_directory(&config_dir, posix_secondary_group());
 
     let (crash_rc, _out, _err) = t.run_from_bundle(&["setup", "--on-demand"]);
     assert_eq!(crash_rc, 137, "注入的交易中斷應留下待復原 journal");
@@ -3416,6 +3469,7 @@ fn inst4_f2_interrupted_recovery_restores_existing_config_mode() {
     assert!(recovery.ok, "中斷復原必須成功：{recovery:?}");
     assert_eq!(std::fs::read(t.config_path()).expect("config 必須存在"), original);
     assert_eq!(posix_file_mode(&t.config_path()), 0o640, "journal 復原必須保留原始 0640 mode");
+    assert_eq!(posix_file_owner_group(&t.config_path()), original_owner_group, "中斷復原必須保留原始 owner/group");
 }
 
 #[test]

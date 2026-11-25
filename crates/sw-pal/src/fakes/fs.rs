@@ -252,6 +252,9 @@ impl crate::fs_ops::FsOps for FaultFs {
     fn copy_preserving(&self, from: &Path, to: &Path) -> PalResult<()> {
         self.inner.copy_preserving(from, to)
     }
+    fn copy_preserving_owner_group(&self, from: &Path, to: &Path) -> PalResult<()> {
+        self.inner.copy_preserving_owner_group(from, to)
+    }
     fn sync_file(&self, p: &Path) -> PalResult<()> {
         self.inner.sync_file(p)
     }
