@@ -301,6 +301,27 @@ fn start_endpoint_loopback_allowed_windows() {
 }
 
 #[test]
+fn start_uses_configured_windows_endpoint_for_spawn_and_health_check() {
+    const CONFIGURED_EP: &str = "tcp://127.0.0.1:49001";
+    let t = TestEnv::windows()
+        .with_config("socket_path: tcp://127.0.0.1:49001\n")
+        .with_manifest_launcher()
+        .with_rpc_after_spawn(CONFIGURED_EP, &["health.ping", "health.status"]);
+
+    let (rc, out, _) = t.run(&["daemon", "start"]);
+    assert_eq!(rc, 0, "{out}");
+    let cmd = first_spawn_argv(&t);
+    let pos = cmd.iter().position(|arg| arg == "--socket").expect("cmd 須含 --socket");
+    assert_eq!(cmd[pos + 1], CONFIGURED_EP);
+    assert!(
+        t.rpc().requests().iter().all(|(endpoint, _, _)| {
+            endpoint == &t.isolated_endpoint(CONFIGURED_EP)
+        }),
+        "daemon start 的連線與 spawn endpoint 必須符合 config.yaml socket_path"
+    );
+}
+
+#[test]
 fn start_endpoint_socket_mismatch_invalid_args() {
     // Windows loopback endpoint 可達到 mismatch 檢查；POSIX 會先拒絕 endpoint。
     let t = TestEnv::windows();

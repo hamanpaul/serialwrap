@@ -7,9 +7,10 @@
     "313d792863ab380c7dc10c43d756aac0debf2f19",
     "4baca8c3d922ec210ee2cc25cae2a8121560c7ae",
     "654c6b263aeffc19cca1cb0f7e087e3fcc64dc8b",
-    "ddd642aa99b32f9f96d79084bf19252c7bf81186"
+    "ddd642aa99b32f9f96d79084bf19252c7bf81186",
+    "042dde505abe6cd289f036a10834838e7e268b29"
   ],
-  "case_set_sha256": "c7fe7ce2a9b9bf961bca46879b8b96a450793f10f435997fdba634c19284ae7c",
+  "case_set_sha256": "a52682ea5c49c64fd35734fe5210f2441dbcbf82e18eb31d706609098c55422a",
   "cases": [
     {
       "case_id": "bc05-process-lifecycle-stop-restart",
@@ -80,6 +81,61 @@
       "sha256": "1c3cb301daa2b74988d672458527ab702135c91f5ab63542412af08133284423",
       "tests": [
         "sw-cli::mgmt_service::p277_start_serializes_hold_creation_after_check"
+      ]
+    },
+    {
+      "case_id": "bc24-config-writeback-preserves-yaml",
+      "sha256": "7583b221cdcf5d60efe5ab40bc142e21dddc8a2185b54bd7c1d996462b99d53a",
+      "tests": [
+        "sw-cli::endpoint_resolve::socket_path_yaml_patch_updates_quoted_root_key_without_duplicate"
+      ]
+    },
+    {
+      "case_id": "bc24-daemon-start-endpoint",
+      "sha256": "d93882f3a3a67e8c967a3a27a0f5f54286177f4c341da9cf8d08bdda1988048a",
+      "tests": [
+        "sw-cli::mgmt_daemon::start_uses_configured_windows_endpoint_for_spawn_and_health_check"
+      ]
+    },
+    {
+      "case_id": "bc24-local-management-endpoint",
+      "sha256": "2f6ddc070a44fe609684ec3f5f668bc3fde69c8969b28afac881b1fc0d3beb6e",
+      "tests": [
+        "sw-cli::endpoint_resolve::local_management_endpoint_accepts_loopback_only_for_tcp",
+        "sw-cli::endpoint_resolve::management_endpoint_environment_precedes_config",
+        "sw-cli::endpoint_resolve::management_endpoint_explicit_precedes_environment_and_config",
+        "sw-cli::endpoint_resolve::management_endpoint_rejects_non_loopback_config",
+        "sw-cli::endpoint_resolve::management_endpoint_uses_config_when_environment_is_absent",
+        "sw-cli::endpoint_resolve::socket_path_yaml_patch_preserves_every_other_byte",
+        "sw-cli::endpoint_resolve::windows_target_on_demand_uses_configured_socket_path",
+        "sw-cli::mgmt_service::service_stop_uses_configured_loopback_endpoint",
+        "sw-cli::mgmt_supervision_switch::supervision_set_preserves_configured_windows_endpoint"
+      ]
+    },
+    {
+      "case_id": "bc24-setup-daemon-presence",
+      "sha256": "e14109875a574fff07c5d1f1ead0cdcd2e40ff5048edbc780db3d0b07d6c6f1a",
+      "tests": [
+        "sw-cli::mgmt_setup::inst4_setup_ping_timeout_with_held_lock_prevents_second_daemon",
+        "sw-cli::mgmt_setup::inst4_setup_ping_timeout_with_released_lock_allows_setup",
+        "sw-cli::mgmt_setup::inst4_setup_ping_timeout_with_unknown_lock_fails_closed",
+        "sw-daemon::windows_bind_error::windows_loopback_bind_failure_has_actionable_reserved_port_hint"
+      ]
+    },
+    {
+      "case_id": "bc24-windows-bind-probe",
+      "sha256": "b85b4fffb03f1c078ca119d46933e467d9ba2528c638c5acd709b252068789b1",
+      "tests": [
+        "sw-pal::windows_bind_probe::windows_loopback_bind_probe_accepts_ephemeral_port"
+      ]
+    },
+    {
+      "case_id": "bc24-windows-port-selection",
+      "sha256": "3b53bb46b67273a86bca9464855e1cf78e7577b10f4e40ef295507a74a12a763",
+      "tests": [
+        "sw-cli::mgmt_setup::inst4_windows_default_port_selects_first_bindable_port",
+        "sw-cli::mgmt_setup::inst4_windows_explicit_port_bind_failure_does_not_fall_back",
+        "sw-cli::mgmt_setup::inst4_windows_port_probe_uses_configured_loopback_host"
       ]
     },
     {

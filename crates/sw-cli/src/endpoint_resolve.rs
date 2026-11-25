@@ -1,5 +1,6 @@
 //! endpoint 解析（#108、`cli.py:658-835`）。
 
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -84,68 +85,160 @@ pub fn local_default_endpoint(ctx: &CliCtx) -> String {
     }
 }
 
+/// 判斷 endpoint 是否可作為本機管理目標；TCP 僅接受 loopback 位址。
+pub fn is_local_management_endpoint(endpoint: &str) -> bool {
+    match parse_endpoint(endpoint) {
+        Ok(Endpoint::Unix(_)) => true,
+        Ok(Endpoint::Tcp { host, .. }) => {
+            host == "localhost"
+                || host
+                    .parse::<Ipv4Addr>()
+                    .is_ok_and(|address| address.is_loopback())
+                || host
+                    .parse::<Ipv6Addr>()
+                    .is_ok_and(|address| address.is_loopback())
+        }
+        Err(_) => false,
+    }
+}
+
+fn local_endpoint_error(endpoint: &str) -> Option<EndpointResolutionError> {
+    match parse_endpoint(endpoint) {
+        Err(error) => Some(EndpointResolutionError {
+            code: ErrorCode::InvalidArgs,
+            message: format!("本機管理 endpoint 無效：{}", error.0),
+        }),
+        Ok(Endpoint::Tcp { .. }) if !is_local_management_endpoint(endpoint) => {
+            Some(EndpointResolutionError {
+                code: ErrorCode::RemoteNotSupported,
+                message: format!("本機管理不支援非 loopback TCP endpoint：{endpoint}"),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// 本機管理動作共用解析：`--endpoint`／`--socket` > 環境變數 > config.yaml > 內建預設。
+/// `default_endpoint` 供 systemd-system 等固定本機模式指定最後一層預設值。
+pub fn resolve_local_management_endpoint(
+    ctx: &CliCtx<'_>,
+    endpoint: Option<&str>,
+    socket: Option<&str>,
+    default_endpoint: Option<&str>,
+) -> Result<ResolvedEndpoint, EndpointResolutionError> {
+    let explicit = endpoint
+        .filter(|value| !value.is_empty())
+        .map(|value| (value, "--endpoint"))
+        .or_else(|| socket.filter(|value| !value.is_empty()).map(|value| (value, "--socket")));
+    let configured = if let Some((value, source)) = explicit {
+        Some((value.to_string(), source))
+    } else if let Some(value) = ctx.env.get("SERIALWRAP_ENDPOINT").filter(|v| !v.is_empty()) {
+        Some((value.to_string(), "SERIALWRAP_ENDPOINT"))
+    } else if rpc_backend_is_win(ctx) && ctx.env.get("SERIALWRAP_TCP_PORT").is_some() {
+        Some((local_default_endpoint(ctx), "SERIALWRAP_TCP_PORT"))
+    } else {
+        let config = load_runtime_config(ctx).map_err(|error| EndpointResolutionError {
+            code: ErrorCode::InternalError,
+            message: format!("config.yaml 讀取失敗：{error}"),
+        })?;
+        match config.socket_path() {
+            Some(value) if py_truthy_of(value) => match value {
+                YValue::Str(value) => Some((value.clone(), "config.yaml")),
+                _ => {
+                    return Err(EndpointResolutionError {
+                        code: ErrorCode::InvalidArgs,
+                        message: "config.yaml socket_path 必須是字串".to_string(),
+                    });
+                }
+            },
+            _ => None,
+        }
+    };
+    let (endpoint, source) = configured.unwrap_or_else(|| {
+        (
+            default_endpoint
+                .map(str::to_string)
+                .unwrap_or_else(|| local_default_endpoint(ctx)),
+            "default",
+        )
+    });
+    if let Some(error) = local_endpoint_error(&endpoint) {
+        return Err(error);
+    }
+    Ok(ResolvedEndpoint { endpoint, source })
+}
+
+/// Windows ping 逾時後以 daemon 共用 singleton lock 確認實例狀態。
+pub fn probe_instance_lock_held(ctx: &CliCtx<'_>, endpoint: &str) -> Result<bool, String> {
+    let Endpoint::Tcp { host, port } = parse_endpoint(endpoint).map_err(|error| error.0)? else {
+        return Err("Windows singleton lock probe 需要 TCP endpoint".to_string());
+    };
+    if !is_local_management_endpoint(endpoint) {
+        return Err("singleton lock probe 拒絕非 loopback endpoint".to_string());
+    }
+    if ctx.p.caps.native_backend != sw_pal::BackendKind::Win {
+        return Err("原生 Windows singleton lock probe 不適用於此平台".to_string());
+    }
+    let spec = sw_pal::EndpointSpec::Tcp { host, port };
+    match ctx
+        .p
+        .instance_lock
+        .acquire(Path::new(&ctx.paths.lock_path), &spec)
+    {
+        Ok(guard) => {
+            guard.release();
+            Ok(false)
+        }
+        Err(sw_pal::lock::InstanceLockError::AlreadyRunning) => Ok(true),
+        Err(sw_pal::lock::InstanceLockError::SocketUnavailable) => {
+            Err("Windows singleton lock 無法確認 endpoint 狀態".to_string())
+        }
+        Err(sw_pal::lock::InstanceLockError::Io(error)) => Err(error.py_message),
+    }
+}
+
 /// systemd-system unit 固定的 daemon socket（0.3.2 與 0.4.0 相同）。
 pub const SYSTEMD_SYSTEM_SOCKET: &str = "/run/serialwrap/serialwrapd.sock";
 
-/// OD-48 D3.1／S1X-c-1：某監管模式下 daemon instance 的 endpoint（安裝／更新／監管切換用，不經 `--endpoint`）。
-/// systemd-system → 固定 socket；Windows 模式（或 Win RPC 後端）→ `local_default_endpoint`；其餘依序取
-/// config 的 unix `socket_path`（可連者優先，對齊 #108 #2），再退回 `local_default_endpoint`。
-/// TCP `socket_path` 代表遠端 daemon，不視為本機 instance。
-pub fn instance_endpoint(ctx: &CliCtx, mode: &sw_pal::service_ctl::SupervisionMode) -> String {
+/// 安裝／更新／監管切換定位本機 daemon 的 endpoint；非 loopback TCP 不視為本機 instance。
+/// 解析優先序與一般本機管理命令相同，systemd-system 只以固定 socket 作為最終預設。
+pub fn instance_endpoint(
+    ctx: &CliCtx<'_>,
+    mode: &sw_pal::service_ctl::SupervisionMode,
+) -> Result<String, EndpointResolutionError> {
     use sw_pal::service_ctl::SupervisionMode;
-    match mode {
-        SupervisionMode::SystemdSystem => return SYSTEMD_SYSTEM_SOCKET.to_string(),
-        SupervisionMode::WindowsTask | SupervisionMode::WindowsService => {
-            return local_default_endpoint(ctx);
-        }
-        _ => {}
-    }
-    let fallback = local_default_endpoint(ctx);
-    if rpc_backend_is_win(ctx) {
-        return fallback;
-    }
-    let configured = load_runtime_config(ctx).ok().and_then(|config| match config.socket_path() {
-        Some(YValue::Str(socket)) if !socket.is_empty() => match parse_endpoint(socket) {
-            Ok(Endpoint::Unix(_)) => Some(socket.clone()),
-            _ => None,
-        },
-        _ => None,
-    });
-    match configured {
-        Some(socket) if socket != fallback && endpoint_answers_ping(ctx, &socket) => socket,
-        _ => fallback,
-    }
+    let fallback = (mode == &SupervisionMode::SystemdSystem).then_some(SYSTEMD_SYSTEM_SOCKET);
+    resolve_local_management_endpoint(ctx, None, None, fallback)
+        .map(|resolved| resolved.endpoint)
 }
 
 /// 目標模式的 instance endpoint（啟新／驗證用）：與舊模式相同時沿用舊端點；否則依模式取固定值，
 /// 不探測 config（新 daemon 尚未啟動，探測沒有意義）。
 pub fn target_instance_endpoint(
-    ctx: &CliCtx,
+    ctx: &CliCtx<'_>,
     target: &sw_pal::service_ctl::SupervisionMode,
     old: &sw_pal::service_ctl::SupervisionMode,
     old_endpoint: &str,
-) -> String {
+) -> Result<String, EndpointResolutionError> {
     use sw_pal::service_ctl::SupervisionMode;
     if target == old {
-        return old_endpoint.to_string();
+        if let Some(error) = local_endpoint_error(old_endpoint) {
+            return Err(error);
+        }
+        return Ok(old_endpoint.to_string());
     }
     match target {
-        SupervisionMode::SystemdSystem => SYSTEMD_SYSTEM_SOCKET.to_string(),
-        _ => local_default_endpoint(ctx),
+        SupervisionMode::SystemdSystem => Ok(SYSTEMD_SYSTEM_SOCKET.to_string()),
+        SupervisionMode::WindowsTask | SupervisionMode::WindowsService => {
+            resolve_local_management_endpoint(ctx, None, None, None)
+                .map(|resolved| resolved.endpoint)
+        }
+        _ if rpc_backend_is_win(ctx) => {
+            resolve_local_management_endpoint(ctx, None, None, None)
+                .map(|resolved| resolved.endpoint)
+        }
+        _ => Ok(local_default_endpoint(ctx)),
     }
-}
-
-fn endpoint_answers_ping(ctx: &CliCtx, endpoint: &str) -> bool {
-    crate::client::call(
-        ctx,
-        endpoint,
-        "health.ping",
-        &sw_proto::pyjson::PyValue::Dict(sw_proto::pyjson::PyDict::new()),
-        0.5,
-        &sw_proto::pyjson::PyInt::Small(0),
-    )
-    .ok()
-    .is_some_and(|outcome| outcome.resp.get_truthy("ok"))
 }
 
 /// 01 §4.4，探測 0.2 s。
@@ -391,6 +484,169 @@ pub fn save_runtime_config(ctx: &CliCtx, cfg: &RuntimeConfig) -> Result<(), Conf
             .map_err(|pal_err| config_os_error(&path_text, pal_err))?;
     }
     let text = cfg.to_yaml().replace('\n', ctx.p.caps.text_newline);
+    ctx.p
+        .fs
+        .write_file(&path, text.as_bytes())
+        .map_err(|pal_err| config_os_error(&path_text, pal_err))
+}
+
+fn yaml_comment_start(value: &str) -> Option<usize> {
+    let bytes = value.as_bytes();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match quote {
+            Some(b'"') => {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    quote = None;
+                }
+            }
+            Some(b'\'') => {
+                if byte == b'\'' {
+                    if bytes.get(index + 1) == Some(&b'\'') {
+                        index += 1;
+                    } else {
+                        quote = None;
+                    }
+                }
+            }
+            _ => match byte {
+                b'"' | b'\'' => quote = Some(byte),
+                b'#' if index == 0 || bytes[index - 1].is_ascii_whitespace() => {
+                    return Some(index);
+                }
+                _ => {}
+            },
+        }
+        index += 1;
+    }
+    None
+}
+
+fn replace_scalar_style(old: &str, value: &str) -> String {
+    match old.trim_start().as_bytes().first() {
+        Some(b'\'') => format!("'{}'", value.replace('\'', "''")),
+        Some(b'"') => format!(
+            "\"{}\"",
+            value.replace('\\', "\\\\").replace('"', "\\\"")
+        ),
+        _ => value.to_string(),
+    }
+}
+
+fn root_yaml_key_matches(raw_key: &str, key: &str) -> bool {
+    let raw_key = raw_key.trim();
+    raw_key == key
+        || (raw_key.len() >= 2
+            && ((raw_key.starts_with('\'') && raw_key.ends_with('\''))
+                || (raw_key.starts_with('"') && raw_key.ends_with('"')))
+            && &raw_key[1..raw_key.len() - 1] == key)
+}
+
+/// 只更新根層純量鍵的值，保留其他行、註解、空白與換行位元組。
+pub fn replace_root_yaml_scalar_value(text: &str, key: &str, value: &str) -> String {
+    let mut output = String::with_capacity(text.len() + key.len() + value.len());
+    let mut found = false;
+    for line in text.split_inclusive('\n') {
+        let (body, ending) = if let Some(body) = line.strip_suffix('\n') {
+            (body, "\n")
+        } else {
+            (line, "")
+        };
+        let (body, carriage_return) = body
+            .strip_suffix('\r')
+            .map_or((body, ""), |body| (body, "\r"));
+        let replacement = if !body.chars().next().is_some_and(char::is_whitespace)
+            && !body.starts_with('#')
+        {
+            body.find(':').and_then(|colon| {
+                root_yaml_key_matches(&body[..colon], key).then(|| {
+                    found = true;
+                    let value_start = colon + 1;
+                    let rest = &body[value_start..];
+                    let leading = rest.len()
+                        - rest
+                        .trim_start_matches([' ', '\t'])
+                            .len();
+                    let comment = yaml_comment_start(rest).unwrap_or(rest.len());
+                    let without_comment = &rest[..comment];
+                    let value_end = without_comment
+                        .trim_end_matches([' ', '\t'])
+                        .len();
+                    let old_value = &rest[leading..value_end];
+                    let scalar = replace_scalar_style(old_value, value);
+                    format!(
+                        "{}{}{}{}{}{}{}",
+                        &body[..value_start],
+                        &rest[..leading],
+                        scalar,
+                        &rest[value_end..comment],
+                        &rest[comment..],
+                        carriage_return,
+                        ending
+                    )
+                })
+            })
+        } else {
+            None
+        };
+        match replacement {
+            Some(replacement) => output.push_str(&replacement),
+            None => output.push_str(line),
+        }
+    }
+    if !found {
+        let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push_str(newline);
+        }
+        output.push_str(key);
+        output.push_str(": '");
+        output.push_str(&value.replace('\'', "''"));
+        output.push('\'');
+        output.push_str(newline);
+    }
+    output
+}
+
+/// 更新 config 指定鍵時保留原始 YAML 文字；`None` 欄位完全不動。
+pub fn save_runtime_config_preserving(
+    ctx: &CliCtx<'_>,
+    mode: Option<&str>,
+    socket_path: Option<&str>,
+) -> Result<(), ConfigError> {
+    let path = config_write_path(ctx);
+    let path_text = path.display().to_string();
+    let bytes = if ctx.p.fs.exists(&path) {
+        ctx.p
+            .fs
+            .read(&path)
+            .map_err(|pal_err| config_os_error(&path_text, pal_err))?
+    } else {
+        Vec::new()
+    };
+    let mut text = decode_utf8_strict(&bytes)?;
+    if let Some(mode) = mode {
+        text = replace_root_yaml_scalar_value(&text, "supervision_mode", mode);
+    }
+    if let Some(socket_path) = socket_path {
+        text = replace_root_yaml_scalar_value(&text, "socket_path", socket_path);
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        ctx.p
+            .fs
+            .mkdirs(parent)
+            .map_err(|pal_err| config_os_error(&path_text, pal_err))?;
+    }
     ctx.p
         .fs
         .write_file(&path, text.as_bytes())

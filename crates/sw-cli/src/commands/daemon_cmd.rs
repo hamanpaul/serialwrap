@@ -141,13 +141,7 @@ fn run_daemon_start_on_demand(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
         }
     }
 
-    let socket = match ns.str("socket") {
-        Some(value) => value.to_string(),
-        None => match ns.str("endpoint").filter(|value| !value.is_empty()) {
-            Some(value) => value.to_string(),
-            None => local_default_endpoint(ctx),
-        },
-    };
+    let socket = resolved.endpoint.clone();
     if !flag(ns, "force_spawn") {
         if let Ok(daemons) = ctx.p.procs.serialwrapd_instances() {
             let cwd = process_cwd();
@@ -360,7 +354,7 @@ pub fn run_daemon_stop(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
         );
         return routed;
     }
-    let resolved = match resolve(ns, ctx) {
+    let resolved = match resolve_local(ns, ctx) {
         Ok(value) => value,
         Err(error) => return report_resolve_failure(ctx, error, "daemon.stop"),
     };
@@ -394,7 +388,7 @@ pub fn run_daemon_stop(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
 
 /// `health.status` 查詢不經 SC-18，避免唯讀查詢啟動 daemon。
 pub fn run_daemon_status(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
-    let resolved = match resolve(ns, ctx) {
+    let resolved = match resolve_local(ns, ctx) {
         Ok(value) => value,
         Err(error) => return report_resolve_failure(ctx, error, "health.status"),
     };
@@ -439,26 +433,28 @@ pub fn run_daemon_restart(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
         .unwrap_or_else(|| "on-demand".to_string());
     let mode = SupervisionMode::parse(&mode_name);
     if mode_name.starts_with("systemd") {
-        return service_cmd::run_service_action(
+        return service_cmd::run_service_action_with_endpoint(
             ctx,
             &mode,
             ServiceAction::Restart,
             flag(ns, "with_sudo"),
             "service restart",
             None,
+            ns.str("endpoint").or(ns.str("socket")),
         );
     }
     if matches!(
         mode,
         SupervisionMode::WindowsTask | SupervisionMode::WindowsService
     ) {
-        return service_cmd::run_service_action(
+        return service_cmd::run_service_action_with_endpoint(
             ctx,
             &mode,
             ServiceAction::Restart,
             flag(ns, "with_sudo"),
             "service restart",
             None,
+            ns.str("endpoint").or(ns.str("socket")),
         );
     }
     if ns.str("bench").is_some_and(|value| !value.is_empty())
@@ -1226,26 +1222,36 @@ pub(crate) fn capture_reconcile_daemon_identity(
     Ok(identity)
 }
 
-fn resolve(ns: &Namespace, ctx: &mut CliCtx<'_>) -> Result<ResolvedEndpoint, ResolveFailure> {
-    resolve_endpoint_info(
-        ctx,
-        &EndpointArgs {
-            endpoint: ns.str("endpoint"),
-            socket: ns.str("socket"),
-            bench: ns.str("bench"),
-        },
-    )
-}
-
 fn resolve_local(ns: &Namespace, ctx: &mut CliCtx<'_>) -> Result<ResolvedEndpoint, ResolveFailure> {
-    resolve_endpoint_info(
+    if ns.str("bench").is_some_and(|value| !value.is_empty()) {
+        let resolved = resolve_endpoint_info(
+            ctx,
+            &EndpointArgs {
+                endpoint: ns.str("endpoint"),
+                socket: ns.str("socket"),
+                bench: ns.str("bench"),
+            },
+        )?;
+        if crate::endpoint_resolve::is_local_management_endpoint(&resolved.endpoint) {
+            return Ok(resolved);
+        }
+        return Err(ResolveFailure::Resolution(
+            crate::endpoint_resolve::EndpointResolutionError {
+                code: ErrorCode::RemoteNotSupported,
+                message: format!(
+                    "本機管理不支援非 loopback TCP endpoint：{}",
+                    resolved.endpoint
+                ),
+            },
+        ));
+    }
+    crate::endpoint_resolve::resolve_local_management_endpoint(
         ctx,
-        &EndpointArgs {
-            endpoint: ns.str("endpoint"),
-            socket: ns.str("socket"),
-            bench: None,
-        },
+        ns.str("endpoint"),
+        ns.str("socket"),
+        None,
     )
+    .map_err(ResolveFailure::Resolution)
 }
 
 fn report_resolve_failure(ctx: &mut CliCtx<'_>, error: ResolveFailure, context: &str) -> i32 {

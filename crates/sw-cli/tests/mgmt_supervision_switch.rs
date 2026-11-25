@@ -868,6 +868,31 @@ fn supervision_set_force_idle_same_result_as_without() {
 }
 
 #[test]
+fn supervision_set_preserves_configured_windows_endpoint() {
+    const CONFIGURED_EP: &str = "tcp://127.0.0.1:49001";
+    let t = TestEnv::windows()
+        .with_config("supervision_mode: windows-task\nsocket_path: tcp://127.0.0.1:49001\n")
+        .with_supervisor_state("windows-task", true, true)
+        .with_idle_daemon(CONFIGURED_EP, 4242);
+
+    let (rc, out, _) = t.run(&["supervision-mode", "set", "on-demand"]);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(json(&out)["setup"]["mode"], "on-demand", "{out}");
+    assert!(
+        t.config_bytes()
+            .windows(CONFIGURED_EP.len())
+            .any(|window| window == CONFIGURED_EP.as_bytes()),
+        "supervision-mode set 必須保留 config.yaml 的 Windows RPC endpoint"
+    );
+    assert!(
+        t.rpc().requests().iter().any(|(endpoint, method, _)| {
+            endpoint == &t.isolated_endpoint(CONFIGURED_EP) && method == "health.ping"
+        }),
+        "本機安全檢查必須連到 config.yaml 指定的 endpoint"
+    );
+}
+
+#[test]
 fn supervision_set_systemd_exit1_after_handoff_not_relaunched() {
     let base = TestEnv::posix()
         .with_systemd(true)

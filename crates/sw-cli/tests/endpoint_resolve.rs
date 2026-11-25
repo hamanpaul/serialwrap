@@ -15,9 +15,11 @@ use std::sync::Arc;
 
 use sw_cli::ctx::{CliCtx, TextIo};
 use sw_cli::endpoint_resolve::{
-    endpoint_alive, local_default_endpoint, print_endpoint_resolution_error,
-    resolve_endpoint_info, rpc_backend_is_win, EndpointArgs, EndpointResolutionError, ResolveFailure,
-    ResolvedEndpoint,
+    endpoint_alive, is_local_management_endpoint, local_default_endpoint,
+    print_endpoint_resolution_error, replace_root_yaml_scalar_value,
+    resolve_endpoint_info, resolve_local_management_endpoint, rpc_backend_is_win,
+    target_instance_endpoint, EndpointArgs,
+    EndpointResolutionError, ResolveFailure, ResolvedEndpoint,
 };
 use sw_pal::fakes::{fake_platform, FakeConn, ScriptedConnector};
 use sw_pal::{
@@ -648,6 +650,102 @@ fn win_backend_custom_port() {
         .env("SERIALWRAP_TCP_PORT", "49001");
     let r = run(w, |ctx| local_default_endpoint(ctx));
     assert_eq!(r.value, "tcp://127.0.0.1:49001");
+}
+
+#[test]
+fn management_endpoint_explicit_precedes_environment_and_config() {
+    let w = World::new()
+        .env("SERIALWRAP_RPC_BACKEND", "win")
+        .env("SERIALWRAP_TCP_PORT", "49002")
+        .file(USER_CFG, "socket_path: tcp://127.0.0.1:49001\n");
+    let r = run(w, |ctx| {
+        resolve_local_management_endpoint(
+            ctx,
+            Some("tcp://127.0.0.1:49003"),
+            None,
+            None,
+        )
+    });
+    assert_eq!(r.value.unwrap().endpoint, "tcp://127.0.0.1:49003");
+}
+
+#[test]
+fn management_endpoint_environment_precedes_config() {
+    let w = World::new()
+        .env("SERIALWRAP_RPC_BACKEND", "win")
+        .env("SERIALWRAP_TCP_PORT", "49002")
+        .file(USER_CFG, "socket_path: tcp://127.0.0.1:49001\n");
+    let r = run(w, |ctx| resolve_local_management_endpoint(ctx, None, None, None));
+    assert_eq!(r.value.unwrap().endpoint, "tcp://127.0.0.1:49002");
+}
+
+#[test]
+fn management_endpoint_uses_config_when_environment_is_absent() {
+    let w = World::new()
+        .env("SERIALWRAP_RPC_BACKEND", "win")
+        .file(USER_CFG, "socket_path: tcp://127.0.0.1:49001\n");
+    let r = run(w, |ctx| resolve_local_management_endpoint(ctx, None, None, None));
+    assert_eq!(r.value.unwrap().endpoint, "tcp://127.0.0.1:49001");
+}
+
+#[test]
+fn windows_target_on_demand_uses_configured_socket_path() {
+    let w = World::new()
+        .env("SERIALWRAP_RPC_BACKEND", "win")
+        .file(USER_CFG, "socket_path: tcp://127.0.0.1:49001\n");
+    let r = run(w, |ctx| {
+        target_instance_endpoint(
+            ctx,
+            &sw_pal::SupervisionMode::OnDemand,
+            &sw_pal::SupervisionMode::WindowsTask,
+            "tcp://127.0.0.1:49001",
+        )
+    });
+    assert_eq!(r.value.unwrap(), "tcp://127.0.0.1:49001");
+}
+
+#[test]
+fn management_endpoint_rejects_non_loopback_config() {
+    let w = World::new()
+        .env("SERIALWRAP_RPC_BACKEND", "win")
+        .file(USER_CFG, "socket_path: tcp://10.1.1.8:49001\n");
+    let r = run(w, |ctx| resolve_local_management_endpoint(ctx, None, None, None));
+    assert!(matches!(
+        r.value,
+        Err(error) if error.code == ErrorCode::RemoteNotSupported
+    ));
+}
+
+#[test]
+fn local_management_endpoint_accepts_loopback_only_for_tcp() {
+    assert!(is_local_management_endpoint("tcp://127.200.1.2:49001"));
+    assert!(is_local_management_endpoint("tcp://[::1]:49001"));
+    assert!(is_local_management_endpoint("/run/serialwrapd.sock"));
+    assert!(!is_local_management_endpoint("tcp://10.1.1.8:49001"));
+    assert!(!is_local_management_endpoint("udp://127.0.0.1:49001"));
+}
+
+#[test]
+fn socket_path_yaml_patch_preserves_every_other_byte() {
+    let original = "# 註解\r\nsupervision_mode: windows-task\r\nsocket_path: tcp://127.0.0.1:48700  # keep\r\nwindows:\r\n  exclude_coms: [COM5]\r\n";
+    let updated = replace_root_yaml_scalar_value(
+        original,
+        "socket_path",
+        "tcp://127.0.0.1:48703",
+    );
+    assert_eq!(
+        updated,
+        "# 註解\r\nsupervision_mode: windows-task\r\nsocket_path: tcp://127.0.0.1:48703  # keep\r\nwindows:\r\n  exclude_coms: [COM5]\r\n"
+    );
+}
+
+#[test]
+fn socket_path_yaml_patch_updates_quoted_root_key_without_duplicate() {
+    let original = "\"socket_path\": \"tcp://127.0.0.1:48700\"\nnotes: keep\n";
+    assert_eq!(
+        replace_root_yaml_scalar_value(original, "socket_path", "tcp://127.0.0.1:48703"),
+        "\"socket_path\": \"tcp://127.0.0.1:48703\"\nnotes: keep\n"
+    );
 }
 
 #[test]

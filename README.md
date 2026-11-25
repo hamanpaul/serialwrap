@@ -934,6 +934,23 @@ stable entry. `setup --windows-task` selects Task Scheduler supervision. The PyI
 users. A past tag can be backfilled with the release workflow's
 `workflow_dispatch` (input: tag).
 
+Windows `setup` and upgrades probe the selected local RPC port before daemon
+startup. Local management resolves the endpoint in this order: explicit
+`--endpoint` / `--socket`, `SERIALWRAP_ENDPOINT` / `SERIALWRAP_TCP_PORT`,
+`config.yaml` `socket_path`, then the built-in default; TCP endpoints must use
+loopback. If the built-in port `48700` cannot bind, setup checks `48701` through
+`49151` from low to high, saves the selected endpoint to `socket_path`, and uses
+that same port for the scheduled task and daemon. A port explicitly set in the
+environment or config is never changed automatically; setup fails with a
+recovery hint. Check Windows excluded ranges with
+`netsh int ipv4 show excludedportrange protocol=tcp`. A daemon bind failure at
+runtime also prints this diagnostic and points to `socket_path` or
+`SERIALWRAP_TCP_PORT`, without changing ports. If setup's health ping times out,
+it checks the singleton lock: a held lock prevents a second daemon from being
+started, while an acquired and released lock confirms the daemon is stopped.
+Update, rollback, and supervision-mode changes preserve the selected
+`socket_path`.
+
 #### Optional com0com component
 
 A Windows bundle can include the signed com0com 3.0.0.0 virtual serial driver as
@@ -2999,6 +3016,8 @@ serialwrap.exe --version; serialwrap.exe doctor
 ```
 
 `setup` 必須由 `versions\<版本>\bin\serialwrap.exe` 執行（只有這份與 `release-manifest.json` 同層）；zip 頂層 `bin\` 的副本只是穩定入口。要用工作排程器監管改下 `setup --windows-task`。PyInstaller 的 `serialwrap.exe`／`serialwrapd.exe` 仍照發供既有使用者。要對既有 tag 補傳 zip，手動觸發 release workflow 的 `workflow_dispatch`（輸入 tag）。
+
+Windows 的 `setup` 與升級會在啟動 daemon 前探測本機 RPC 埠。管理動作的 endpoint 優先序是明確 `--endpoint`／`--socket`、`SERIALWRAP_ENDPOINT`／`SERIALWRAP_TCP_PORT`、`config.yaml` 的 `socket_path`，最後才是內建預設；TCP endpoint 只接受 loopback。只有內建埠 `48700` 無法 bind 時，setup 才由低到高檢查 `48701` 至 `49151`，並把選到的 endpoint 寫回 `socket_path`，讓排程工作與 daemon 使用同一埠。環境變數或 config 明確指定的埠失敗時不會自動更換，setup 會回報檢查提示。可用 `netsh int ipv4 show excludedportrange protocol=tcp` 查詢 Windows 保留區間。daemon 執行期 bind 失敗也會提示檢查保留埠及修改 `socket_path`／`SERIALWRAP_TCP_PORT`，但不會自行換埠。setup 的 health ping 逾時時會檢查 singleton lock；鎖仍持有就不啟動第二個 daemon，鎖可取得並釋放才會判定 daemon 未執行。update、rollback 與監管模式切換都保留已選定的 `socket_path`。
 
 ### Windows 選用元件：com0com
 

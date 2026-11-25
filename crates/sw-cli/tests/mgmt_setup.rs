@@ -141,6 +141,81 @@ fn s1m241_setup_assessment_matrix() {
     );
 }
 
+#[test]
+fn inst4_windows_default_port_selects_first_bindable_port() {
+    let mut attempts = Vec::new();
+    let selection = sw_cli::setup_cmd::select_windows_setup_endpoint(
+        "tcp://127.0.0.1:48700",
+        true,
+        |_, port| {
+            attempts.push(port);
+            port == 48703
+        },
+    )
+    .expect("應找到第一個可 bind 埠");
+
+    assert_eq!(selection.endpoint, "tcp://127.0.0.1:48703");
+    assert!(selection.auto_selected);
+    assert_eq!(attempts, vec![48700, 48701, 48702, 48703]);
+}
+
+#[test]
+fn inst4_windows_explicit_port_bind_failure_does_not_fall_back() {
+    let mut attempts = Vec::new();
+    let result = sw_cli::setup_cmd::select_windows_setup_endpoint(
+        "tcp://127.0.0.1:49001",
+        false,
+        |_, port| {
+            attempts.push(port);
+            false
+        },
+    );
+
+    assert!(result.is_err());
+    assert_eq!(attempts, vec![49001]);
+}
+
+#[test]
+fn inst4_windows_port_probe_uses_configured_loopback_host() {
+    let mut attempts = Vec::new();
+    let selection = sw_cli::setup_cmd::select_windows_setup_endpoint(
+        "tcp://[::1]:49001",
+        false,
+        |host, port| {
+            attempts.push((host.to_string(), port));
+            true
+        },
+    )
+    .expect("loopback 埠可 bind");
+
+    assert_eq!(selection.endpoint, "tcp://[::1]:49001");
+    assert_eq!(attempts, vec![("::1".to_string(), 49001)]);
+}
+
+#[test]
+fn inst4_setup_ping_timeout_with_released_lock_allows_setup() {
+    assert_eq!(
+        sw_cli::setup_cmd::setup_daemon_presence_after_ping(false, || Ok(false)),
+        sw_cli::setup_cmd::SetupDaemonPresence::StoppedByInstanceLock
+    );
+}
+
+#[test]
+fn inst4_setup_ping_timeout_with_held_lock_prevents_second_daemon() {
+    assert_eq!(
+        sw_cli::setup_cmd::setup_daemon_presence_after_ping(false, || Ok(true)),
+        sw_cli::setup_cmd::SetupDaemonPresence::RunningByInstanceLock
+    );
+}
+
+#[test]
+fn inst4_setup_ping_timeout_with_unknown_lock_fails_closed() {
+    assert_eq!(
+        sw_cli::setup_cmd::setup_daemon_presence_after_ping(false, || Err(())),
+        sw_cli::setup_cmd::SetupDaemonPresence::Unknown
+    );
+}
+
 /// 建立真正的安裝目錄形狀，讓 `setup` 由正式 reconcile 路徑讀取 manifest。
 fn s1m241_installed_setup_env(installed_fingerprint: Option<&str>) -> TestEnv {
     let version = sw_cli::CLI_VERSION;
@@ -2296,6 +2371,7 @@ fn reconcile_handed_off_never_sends_daemon_stop() {
                 ]],
             },
             restart_daemon: false,
+            preserve_config_format: false,
         };
         t.with_cli_ctx(|ctx| {
             let res = sw_cli::setup_cmd::reconcile(ctx, &req).unwrap();
@@ -2353,6 +2429,7 @@ fn reconcile_handed_off_never_sends_daemon_stop() {
             ]],
         },
         restart_daemon: false,
+        preserve_config_format: false,
     };
     t2.with_cli_ctx(|ctx| {
         let err = sw_cli::setup_cmd::reconcile(ctx, &req2).unwrap_err();
@@ -2393,6 +2470,7 @@ fn reconcile_stops_old_matrix() {
             config_path: t.config_path(),
             old_stop: sw_cli::setup_cmd::OldStop::Reconcile,
             restart_daemon: false,
+            preserve_config_format: false,
         };
         assert!(!sw_cli::setup_cmd::reconcile_stops_old(ctx, &req));
 
@@ -2540,6 +2618,7 @@ fn restart_request(
         config_path: t.config_path(),
         old_stop: sw_cli::setup_cmd::OldStop::Reconcile,
         restart_daemon,
+        preserve_config_format: false,
     }
 }
 

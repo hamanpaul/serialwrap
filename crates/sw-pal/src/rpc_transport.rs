@@ -52,6 +52,49 @@ impl crate::traits::RpcListenerFactory for NativeRpcListenerFactory {
     }
 }
 
+/// 以目前平台的 RPC listener 暫時探測 loopback TCP 位址與埠是否可 bind。
+/// 成功時立即關閉 listener；此探測不啟動 RPC accept loop。
+pub fn probe_loopback_tcp_bind(
+    factory: &dyn crate::traits::RpcListenerFactory,
+    host: &str,
+    port: u16,
+) -> bool {
+    use crate::traits::{EndpointSpec, ListenOptions};
+
+    if check_loopback_host(host).is_err() {
+        return false;
+    }
+    let endpoint = EndpointSpec::Tcp {
+        host: host.to_string(),
+        port,
+    };
+    let options = ListenOptions {
+        mode: 0,
+        group: None,
+        ensure_dir_mode: None,
+    };
+    match factory.bind(&endpoint, &options) {
+        Ok(listener) => {
+            listener.close();
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// 以原生 RPC listener 探測 loopback TCP bind；非 Windows host 只提供模擬成功值。
+pub fn native_loopback_tcp_bind_available(host: &str, port: u16) -> bool {
+    #[cfg(windows)]
+    {
+        probe_loopback_tcp_bind(&NativeRpcListenerFactory, host, port)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (host, port);
+        true
+    }
+}
+
 /// 檢查 TCP bind host 是否為 loopback；訊息逐字照 `sw_core/rpc_win.py::_parse_tcp`（Python `ValueError`）。
 pub(crate) fn check_loopback_host(host: &str) -> PalResult<()> {
     if LOOPBACK_TCP_HOSTS.contains(&host) {

@@ -884,6 +884,31 @@ fn listen_options(env: &dyn SysEnv) -> ListenOptions {
     }
 }
 
+/// Windows loopback bind 失敗時提供可行動的埠診斷；daemon 執行期不自動換埠。
+#[doc(hidden)]
+pub fn rpc_bind_error_with_windows_hint(
+    original: &str,
+    endpoint: &EndpointSpec,
+    backend: BackendKind,
+) -> String {
+    let EndpointSpec::Tcp { host, port } = endpoint else {
+        return original.to_string();
+    };
+    let loopback = host == "localhost"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|address| address.is_loopback())
+        || host
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|address| address.is_loopback());
+    if backend != BackendKind::Win || !loopback {
+        return original.to_string();
+    }
+    format!(
+        "{original}\n{PROG}: Windows 無法 bind 本機 TCP 埠 {port}；埠可能位於系統保留區間或已被占用。可執行 `netsh int ipv4 show excludedportrange protocol=tcp` 檢查保留區間，再修改 config.yaml 的 socket_path 或 SERIALWRAP_TCP_PORT。daemon 執行期不會自動換埠。"
+    )
+}
+
 /// sw-proto → sw-pal 的唯一端點轉換點（sw-pal 不依賴 sw-proto）。
 fn to_endpoint_spec(e: &Endpoint) -> EndpointSpec {
     match e {
@@ -1428,7 +1453,10 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
     let listener = match p.rpc_listen.bind(&ep, &listen_options(&*p.env)) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("{}", e.py_message);
+            eprintln!(
+                "{}",
+                rpc_bind_error_with_windows_hint(&e.py_message, &ep, p.caps.native_backend)
+            );
             manager.begin_shutdown();
             watcher.stop();
             engine.close_intake();
@@ -1876,6 +1904,20 @@ mod stall {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_loopback_bind_failure_has_actionable_reserved_port_hint() {
+        let endpoint = EndpointSpec::Tcp {
+            host: "127.0.0.1".to_string(),
+            port: 48_700,
+        };
+        let message = rpc_bind_error_with_windows_hint("bind failed", &endpoint, BackendKind::Win);
+        assert!(message.contains("bind failed"));
+        assert!(message.contains("netsh int ipv4 show excludedportrange protocol=tcp"));
+        assert!(message.contains("config.yaml 的 socket_path"));
+        assert!(message.contains("SERIALWRAP_TCP_PORT"));
+        assert!(message.contains("daemon 執行期不會自動換埠"));
+    }
 
     #[test]
     fn usage_wraps_like_argparse() {

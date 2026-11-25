@@ -26,6 +26,13 @@ description: 透過 serialwrap broker + CLI 進行多 agent UART 存取，提供
 - 目標 session 必須是 `READY`（或對 console-only profile 為 `ATTACHED`，見下方 command_capable）。
 - profile 與 target 已綁定（`session bind` + `session attach` 至少完成一次）。
 
+## Windows 安裝、升級與本機 endpoint
+- Windows 上 `setup` 與升級在啟動 daemon 前先確認 RPC 埠可 bind。管理動作依序使用明確 `--endpoint`／`--socket`、`SERIALWRAP_ENDPOINT`／`SERIALWRAP_TCP_PORT`、`config.yaml` 的 `socket_path`、內建預設；TCP endpoint 必須是 loopback。
+- 只有內建預設 `48700` 無法 bind 時，setup 才由低到高試 `48701` 至 `49151`，並將選中的 endpoint 寫回 `socket_path`，使排程工作與 daemon 共用同一埠。config 或環境變數指定的埠不會被自動更換；setup 會失敗並提供修正提示。
+- update、rollback 與 supervision-mode set 會保留已選定的 `socket_path`。
+- 查 Windows 保留埠：`netsh int ipv4 show excludedportrange protocol=tcp`。daemon 執行期 bind 失敗不會自動換埠；依提示調整 `socket_path` 或 `SERIALWRAP_TCP_PORT` 後再啟動。
+- setup 的 health ping 若逾時，會檢查 singleton lock；鎖仍持有時視為 daemon 執行中並阻止啟動第二個 daemon，鎖可取得並釋放才視為未執行。
+
 ## 標準執行順序（Agent 必須遵守）
 1. 健康檢查：`serialwrap daemon status`。
 2. 探測資源：`serialwrap session list`、`serialwrap device list`。

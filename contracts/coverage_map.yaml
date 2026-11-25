@@ -66,6 +66,27 @@ entries:
     - cargo:sw-core::console_line_limit::rpc_submit_uses_profile_after_set_profile
     - cargo:sw-core::console_line_limit::zero_or_negative_line_limit_rejects_nonempty_command
     owner_phase: P5
+  bc:BC-24:
+    nodeids:
+    - cargo:sw-cli::endpoint_resolve::local_management_endpoint_accepts_loopback_only_for_tcp
+    - cargo:sw-cli::endpoint_resolve::management_endpoint_environment_precedes_config
+    - cargo:sw-cli::endpoint_resolve::management_endpoint_explicit_precedes_environment_and_config
+    - cargo:sw-cli::endpoint_resolve::management_endpoint_rejects_non_loopback_config
+    - cargo:sw-cli::endpoint_resolve::management_endpoint_uses_config_when_environment_is_absent
+    - cargo:sw-cli::endpoint_resolve::socket_path_yaml_patch_preserves_every_other_byte
+    - cargo:sw-cli::endpoint_resolve::windows_target_on_demand_uses_configured_socket_path
+    - cargo:sw-cli::mgmt_service::service_stop_uses_configured_loopback_endpoint
+    - cargo:sw-cli::mgmt_supervision_switch::supervision_set_preserves_configured_windows_endpoint
+    - cargo:sw-cli::mgmt_daemon::start_uses_configured_windows_endpoint_for_spawn_and_health_check
+    - cargo:sw-cli::endpoint_resolve::socket_path_yaml_patch_updates_quoted_root_key_without_duplicate
+    - cargo:sw-cli::mgmt_setup::inst4_windows_default_port_selects_first_bindable_port
+    - cargo:sw-cli::mgmt_setup::inst4_windows_explicit_port_bind_failure_does_not_fall_back
+    - cargo:sw-cli::mgmt_setup::inst4_setup_ping_timeout_with_held_lock_prevents_second_daemon
+    - cargo:sw-cli::mgmt_setup::inst4_setup_ping_timeout_with_released_lock_allows_setup
+    - cargo:sw-cli::mgmt_setup::inst4_setup_ping_timeout_with_unknown_lock_fails_closed
+    - cargo:sw-cli::mgmt_setup::inst4_windows_port_probe_uses_configured_loopback_host
+    - cargo:sw-daemon::windows_bind_error::windows_loopback_bind_failure_has_actionable_reserved_port_hint
+    owner_phase: P4
   bc:DF-01:
     nodeids:
     - cargo:sw-core::event_store::reset_with_invalid_rule_id_counts_zero_df01
@@ -2687,6 +2708,7 @@ l1_only_approvals:
   "bc:BC-06": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-06 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:BC-07": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-07 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:BC-10": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-10 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
+  "bc:BC-24": {l1_only: true, reason: "OD-99 準則（OD-111，2026-11-22 Python 凍結）：bc:BC-24 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:DF-01": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-01 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:DF-02": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-02 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}
   "bc:DF-03": {l1_only: true, reason: "OD-99（2026-11-17）裁決：bc:DF-03 只有 Rust Cargo L1 節點，沒有 Python 黑箱或 contract_tests；明列 l1_only，不宣稱 Python 等價。"}

@@ -1,5 +1,5 @@
 # 行為變更登記（BC／SC／DF）。由 P0-T5 建立，對應 docs/rust-refactor/plans/01-stage0-contracts.md T5 與調和表 spec-reconciliation.md §1。
-# BC-01～BC-05 依 OD-04 核准；BC-06 依 OD-111（2026-11-22 方案 A）；BC-07 依 OD-111／rulings v051（p277）；BC-10 依 OD-111（p288）；SC-01～SC-37（SC-08 已依 OD-14 #3 撤回、SC-33 已依 OD-79 撤回；SC-37 依 OD-21）、SC-39（OD-48）、DF-01～DF-27 依定稿規格、調和表與相關 OD 推導；SC-30、DF-18 由 P7 Task 0 登記（08 §0.5）；DF-23 依 OD-57、DF-24 依 OD-73 由 P7 登記；DF-25 依 OD-77 登記；DF-26 依 OD-80 登記；DF-27 依 OD-81 登記；SC-32 由 P8 Task 1 登記（09 §0.4，Rust-only）。
+# BC-01～BC-05 依 OD-04 核准；BC-06 依 OD-111（2026-11-22 方案 A）；BC-07 依 OD-111／rulings v051（p277）；BC-10 依 OD-111（p288）；BC-24 依 OD-111／OD-112（inst4）；SC-01～SC-37（SC-08 已依 OD-14 #3 撤回、SC-33 已依 OD-79 撤回；SC-37 依 OD-21）、SC-39（OD-48）、DF-01～DF-27 依定稿規格、調和表與相關 OD 推導；SC-30、DF-18 由 P7 Task 0 登記（08 §0.5）；DF-23 依 OD-57、DF-24 依 OD-73 由 P7 登記；DF-25 依 OD-77 登記；DF-26 依 OD-80 登記；DF-27 依 OD-81 登記；SC-32 由 P8 Task 1 登記（09 §0.4，Rust-only）。
 # SC-33 依擁有者 OD-79 撤回（傳輸中途被拒回 AUTOBOOT_QUIET／COMMAND_ABORTED_IN_FLIGHT），編號保留不重用，亦不新增 pending owner item 8（原列案例改列 SC-03）；DF-26 依 OD-80 登記，SC-38 未佔用。
 # SC-08 依 OD-14 #3 撤回（UDS 維持 0660），編號保留不重用。
 # SC-11 交接排空窗口依 OD-16 (3) 擁有者接受（2026-10-22）：related_decisions、spec_refs、approval_conditions 已載明；owner_confirmation 維持 not_required、owner_item 不指派（擁有者佇列編號未定，見 spec-reconciliation SC-11 列），故不改動 pending 佇列與 tests/test_p1oc_catalog.py 釘定的 confirmed 清單。
@@ -7,7 +7,7 @@
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 18
+revision: 19
 changes:
   - id: "BC-01"
     kind: "BC"
@@ -222,6 +222,32 @@ changes:
     compatibility_impact: "Rust daemon 的 RPC command.submit 會以解析後 session 現行 profile 的 max_console_line_chars 檢查所有 submit mode（line、background、interactive，含 fg／bg 別名）。命令 UTF-8 位元組數超過上限時，在入列前回 CMD_TOO_LONG，limit 為 profile 值，且不建紀錄、不送 UART；檢查位於 16 KB 硬上限之後、換行檢查之前。等於上限可送出，未設定上限時不檢查。human console 的整行輸入不套用。凍結的 Python daemon 不具此行為。"
     approval_conditions: "依 OD-111 不修改 Python 基線；沿用凍結錯誤碼 CMD_TOO_LONG，套用全部 command.submit mode，保留 human console 與未設定上限 profile 的既有行為；出貨 template 不新增預設值。"
     related_decisions: ["OD-111"]
+  - id: "BC-24"
+    kind: "BC"
+    title: "本機管理 endpoint 一致、Windows setup 選埠與 daemon 存在判斷"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-11-25"
+      decision_ref: "OD-111"
+      basis: "owner_decision"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 19
+    spec_refs: ["OD-111", "OD-112", "rulings/v051.md inst4"]
+    reconciliation_refs: ["issue-274", "issue-265", "rc.1-install-report-b", "rc.1-install-report-c"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P4"]
+    case_ids: ["bc24-local-management-endpoint", "bc24-windows-port-selection", "bc24-setup-daemon-presence", "bc24-daemon-start-endpoint", "bc24-windows-bind-probe", "bc24-config-writeback-preserves-yaml"]
+    compatibility_impact: "Rust 本機管理動作共用 endpoint 優先序：明確 --endpoint／--socket > SERIALWRAP_ENDPOINT／SERIALWRAP_TCP_PORT 等環境變數 > config.yaml 的 socket_path > 內建預設；TCP endpoint 只接受 loopback，非 loopback 沿用既有錯誤。Windows setup 啟動 daemon 前先 bind 解析出的埠；僅內建預設 48700 不可 bind 時，依序探測 48701–49151，選到後寫回 config.yaml 的 socket_path，排程工作與 daemon 啟動參數使用同一埠。使用者由 config 或環境變數指定的埠失敗時不自動換埠；update、rollback、supervision-mode set 保留所選 socket_path。Windows daemon 執行期 bind 失敗不自動換埠，改提供 netsh 保留埠查詢與修改 socket_path／SERIALWRAP_TCP_PORT 的提示。Windows setup 的 health.ping 逾時後改以 singleton lock 判斷：鎖仍持有視為 daemon 執行中、鎖可取得並釋放視為未執行、狀態不明則 fail-closed，避免誤啟第二個 daemon。"
+    approval_conditions: "只修改 Rust；保留 p277 生命週期鎖、hold 與 graceful_stop 強停策略；不新增錯誤碼、不自動更換使用者明確指定的埠；Windows 原生 bind 與 lock 行為須由編排者另行安排驗證。"
+    related_decisions: ["OD-111", "OD-112"]
   - id: "SC-01"
     kind: "SC"
     title: "RECOVERING 下 submit 與 open 回 SESSION_RECOVERING"

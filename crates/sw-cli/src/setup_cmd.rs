@@ -30,6 +30,86 @@ pub struct UserDirs {
     pub bin: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetupDaemonPresence {
+    RunningByHealthPing,
+    RunningByInstanceLock,
+    StoppedByInstanceLock,
+    Unknown,
+}
+
+/// ping 逾時時以注入的鎖探測結果判斷 daemon；鎖狀態未知時不得假設 daemon 已停止。
+pub fn setup_daemon_presence_after_ping(
+    ping_ok: bool,
+    probe_lock_held: impl FnOnce() -> Result<bool, ()>,
+) -> SetupDaemonPresence {
+    if ping_ok {
+        return SetupDaemonPresence::RunningByHealthPing;
+    }
+    match probe_lock_held() {
+        Ok(true) => SetupDaemonPresence::RunningByInstanceLock,
+        Ok(false) => SetupDaemonPresence::StoppedByInstanceLock,
+        Err(()) => SetupDaemonPresence::Unknown,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowsSetupEndpointSelection {
+    pub endpoint: String,
+    pub auto_selected: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowsSetupEndpointError {
+    InvalidLoopbackEndpoint,
+    ExplicitPortUnavailable,
+    NoAvailableDefaultPort,
+}
+
+/// setup 的 Windows 埠選用邏輯；bind 探測由呼叫端注入，純演算法可在 Linux 測試。
+pub fn select_windows_setup_endpoint(
+    endpoint: &str,
+    builtin_default: bool,
+    mut can_bind: impl FnMut(&str, u16) -> bool,
+) -> Result<WindowsSetupEndpointSelection, WindowsSetupEndpointError> {
+    let sw_proto::endpoint::Endpoint::Tcp { host, port } = parse_endpoint(endpoint)
+        .map_err(|_| WindowsSetupEndpointError::InvalidLoopbackEndpoint)?
+    else {
+        return Err(WindowsSetupEndpointError::InvalidLoopbackEndpoint);
+    };
+    if !endpoint_resolve::is_local_management_endpoint(endpoint) {
+        return Err(WindowsSetupEndpointError::InvalidLoopbackEndpoint);
+    }
+    if can_bind(&host, port) {
+        return Ok(WindowsSetupEndpointSelection {
+            endpoint: endpoint.to_string(),
+            auto_selected: false,
+        });
+    }
+    if !builtin_default || port != 48_700 {
+        return Err(WindowsSetupEndpointError::ExplicitPortUnavailable);
+    }
+    for candidate in 48_701..=49_151 {
+        if can_bind(&host, candidate) {
+            let host = if host.contains(':') {
+                format!("[{host}]")
+            } else {
+                host
+            };
+            return Ok(WindowsSetupEndpointSelection {
+                endpoint: format!("tcp://{host}:{candidate}"),
+                auto_selected: true,
+            });
+        }
+    }
+    Err(WindowsSetupEndpointError::NoAvailableDefaultPort)
+}
+
+/// Windows 原生 loopback bind 探測；非 Windows 的模擬環境不開啟任何主機 socket。
+pub fn windows_loopback_bind_probe(host: &str, port: u16) -> bool {
+    sw_pal::rpc_transport::native_loopback_tcp_bind_available(host, port)
+}
+
 const DEFAULT_COM0COM_PAIR: (&str, &str) = sw_pal::com0com::DEFAULT_PAIR;
 
 fn env_path(env: &EnvSnapshot, key: &str, fallback: PathBuf) -> PathBuf {
@@ -1090,6 +1170,8 @@ pub struct ReconcileRequest {
     pub old_stop: OldStop,
     /// 僅由上層在同模式 systemd 刷新後明確要求時執行 daemon restart。
     pub restart_daemon: bool,
+    /// 自動選 Windows 埠時以原始 YAML 文字寫回設定，避免改動其他內容。
+    pub preserve_config_format: bool,
 }
 
 #[derive(Debug)]
@@ -1608,11 +1690,21 @@ pub fn reconcile(ctx: &mut CliCtx<'_>, req: &ReconcileRequest) -> Result<PyDict,
         None
     };
 
-    let mut config = endpoint_resolve::load_runtime_config(ctx)
+    if req.preserve_config_format {
+        let mode = (req.old_mode != req.target_mode).then_some(req.target_mode.as_str());
+        endpoint_resolve::save_runtime_config_preserving(
+            ctx,
+            mode,
+            req.socket_path.as_deref(),
+        )
         .map_err(|error| ReconcileError::Config(error.to_string()))?;
-    config.set_mode(req.target_mode.as_str(), req.socket_path.as_deref());
-    endpoint_resolve::save_runtime_config(ctx, &config)
-        .map_err(|error| ReconcileError::Config(error.to_string()))?;
+    } else {
+        let mut config = endpoint_resolve::load_runtime_config(ctx)
+            .map_err(|error| ReconcileError::Config(error.to_string()))?;
+        config.set_mode(req.target_mode.as_str(), req.socket_path.as_deref());
+        endpoint_resolve::save_runtime_config(ctx, &config)
+            .map_err(|error| ReconcileError::Config(error.to_string()))?;
+    }
 
     let mut result = result_base(req, &req.target_mode, &ran, &[]);
     result.insert("transitioned", PyValue::Bool(!same_mode));
@@ -1928,22 +2020,72 @@ pub fn run_setup(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
     };
     let old_mode = mode_for_config(Some(&old_config));
 
-    let endpoint_result = endpoint_resolve::resolve_endpoint_info(
+    let endpoint_result = match endpoint_resolve::resolve_local_management_endpoint(
         ctx,
-        &EndpointArgs {
-            endpoint: ns.str("endpoint"),
-            socket: ns.str("socket"),
-            bench: None,
-        },
-    );
-    let old_endpoint = endpoint_result
+        ns.str("endpoint"),
+        ns.str("socket"),
+        None,
+    ) {
+        Ok(endpoint) => endpoint,
+        Err(error) => return endpoint_resolve::print_endpoint_resolution_error(ctx, &error, "setup"),
+    };
+    let old_endpoint = endpoint_result.endpoint;
+    let ping_probe = crate::client::call_with_failure(
+        ctx,
+        &old_endpoint,
+        "health.ping",
+        &PyValue::Dict(PyDict::new()),
+        0.5,
+        &PyInt::Small(0),
+    )
+    .ok();
+    let ping = ping_probe.as_ref().map(|(outcome, _)| &outcome.resp);
+    let ping_timed_out = ping_probe
         .as_ref()
-        .map(|resolved| resolved.endpoint.clone())
-        .unwrap_or_else(|_| endpoint_resolve::local_default_endpoint(ctx));
-    let ping = rpc_response(ctx, &old_endpoint, "health.ping", 0.5);
-    let daemon_running = ping
-        .as_ref()
-        .is_some_and(|response| response.get_truthy("ok"));
+        .and_then(|(_, failure)| failure.as_ref())
+        .is_some_and(|failure| failure.pal_kind == Some(sw_pal::PalErrorKind::TimedOut));
+    let ping_ok = ping.is_some_and(|response| response.get_truthy("ok"));
+    let (daemon_running, daemon_detection) = if endpoint_resolve::rpc_backend_is_win(ctx)
+        && ping_timed_out
+    {
+        let lock_probe = endpoint_resolve::probe_instance_lock_held(ctx, &old_endpoint);
+        let presence = setup_daemon_presence_after_ping(false, || {
+            lock_probe.as_ref().map(|held| *held).map_err(|_| ())
+        });
+        match presence {
+            SetupDaemonPresence::RunningByInstanceLock => {
+                (true, Some("health.ping timed out; singleton lock is held"))
+            }
+            SetupDaemonPresence::StoppedByInstanceLock => {
+                let basis = if ctx.p.caps.native_backend == sw_pal::BackendKind::Win {
+                    "health.ping timed out; singleton lock was acquired and released"
+                } else {
+                    "health.ping timed out; native Windows lock probing is unavailable on this host"
+                };
+                (false, Some(basis))
+            }
+            SetupDaemonPresence::Unknown => {
+                let reason = lock_probe
+                    .err()
+                    .unwrap_or_else(|| "singleton lock probe returned unknown state".to_string());
+                let response = output::error_resp(
+                    ErrorCode::Timeout,
+                    Some(&format!(
+                        "health.ping 逾時，且無法確認 daemon singleton lock：{reason}；拒絕啟動第二個 daemon"
+                    )),
+                );
+                return emit_error(ctx, &response, "setup", 2);
+            }
+            SetupDaemonPresence::RunningByHealthPing => unreachable!("已走 ping timeout 分支"),
+        }
+    } else {
+        (ping_ok, None)
+    };
+    if let Some(daemon_detection) = daemon_detection {
+        let _ = ctx.io.err_str(&format!(
+            "serialwrap: setup daemon detection: {daemon_detection}\n"
+        ));
+    }
     let daemon_fingerprint = ping
         .as_ref()
         .and_then(|response| response.get("code_fingerprint"))
@@ -1996,32 +2138,94 @@ pub fn run_setup(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
         return 0;
     }
 
-    let mut preserved_remote_socket = None;
-    if old_mode == SupervisionMode::OnDemand
+    let preserved_loopback_socket = if old_mode == SupervisionMode::OnDemand
         && target == SupervisionMode::OnDemand
         && !endpoint_resolve::rpc_backend_is_win(ctx)
         && ns.str("socket").is_none()
         && ns.str("endpoint").is_none()
     {
-        if let Some(YValue::Str(socket)) = old_config.socket_path() {
-            if matches!(parse_endpoint(socket), Ok(Endpoint::Tcp { .. })) {
-                preserved_remote_socket = Some(socket.clone());
+        old_config.socket_path().and_then(|value| match value {
+            YValue::Str(socket)
+                if matches!(parse_endpoint(socket), Ok(Endpoint::Tcp { .. }))
+                    && endpoint_resolve::is_local_management_endpoint(socket) =>
+            {
+                Some(socket.clone())
             }
-        }
-    }
-    let socket_path = if target == SupervisionMode::SystemdSystem {
-        "/run/serialwrap/serialwrapd.sock".to_string()
+            _ => None,
+        })
+    } else {
+        None
+    };
+    let (mut socket_path, target_source) = if target == SupervisionMode::SystemdSystem {
+        (
+            endpoint_resolve::SYSTEMD_SYSTEM_SOCKET.to_string(),
+            "default",
+        )
     } else if matches!(
         target,
         SupervisionMode::WindowsTask | SupervisionMode::WindowsService
     ) || endpoint_resolve::rpc_backend_is_win(ctx)
     {
-        endpoint_resolve::local_default_endpoint(ctx)
-    } else if let Some(socket) = preserved_remote_socket {
-        socket
+        let target_endpoint = match endpoint_resolve::resolve_local_management_endpoint(
+            ctx,
+            ns.str("endpoint"),
+            ns.str("socket"),
+            None,
+        ) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                return endpoint_resolve::print_endpoint_resolution_error(ctx, &error, "setup");
+            }
+        };
+        (target_endpoint.endpoint, target_endpoint.source)
     } else {
-        ctx.paths.socket_path.clone()
+        (
+            preserved_loopback_socket.unwrap_or_else(|| ctx.paths.socket_path.clone()),
+            "default",
+        )
     };
+    let mut auto_selected_port = false;
+    if endpoint_resolve::rpc_backend_is_win(ctx) && !daemon_running {
+        let builtin_default = target_source == "default"
+            && socket_path == "tcp://127.0.0.1:48700";
+        match select_windows_setup_endpoint(
+            &socket_path,
+            builtin_default,
+            windows_loopback_bind_probe,
+        ) {
+            Ok(selection) => {
+                if selection.auto_selected {
+                    socket_path = selection.endpoint;
+                    auto_selected_port = true;
+                    let _ = ctx.io.err_str(&format!(
+                        "serialwrap: setup could not bind built-in TCP port 48700 (reserved or unavailable); selected port {} and will save socket_path\n",
+                        socket_path.rsplit(':').next().unwrap_or_default()
+                    ));
+                }
+            }
+            Err(WindowsSetupEndpointError::InvalidLoopbackEndpoint) => {
+                let response = output::error_resp(
+                    ErrorCode::InvalidArgs,
+                    Some("Windows setup 需要本機 loopback TCP socket_path"),
+                );
+                return emit_error(ctx, &response, "setup", 2);
+            }
+            Err(WindowsSetupEndpointError::ExplicitPortUnavailable) => {
+                let response = output::error_resp(
+                    ErrorCode::InvalidArgs,
+                    Some("指定的 TCP 埠無法 bind；請用 `netsh int ipv4 show excludedportrange protocol=tcp` 檢查保留區間，或修改 config.yaml 的 socket_path／SERIALWRAP_TCP_PORT"),
+                );
+                return emit_error(ctx, &response, "setup", 2);
+            }
+            Err(WindowsSetupEndpointError::NoAvailableDefaultPort) => {
+                let response = output::error_resp(
+                    ErrorCode::InvalidArgs,
+                    Some("TCP 埠 48700–49151 都無法 bind；請用 `netsh int ipv4 show excludedportrange protocol=tcp` 檢查保留區間，或修改 config.yaml 的 socket_path"),
+                );
+                return emit_error(ctx, &response, "setup", 2);
+            }
+        }
+    }
 
     let installed_fingerprint = install_layout::code_fingerprint(ctx).ok().flatten();
     let assessment = daemon_code_assessment(
@@ -2054,6 +2258,7 @@ pub fn run_setup(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
         config_path: endpoint_resolve::config_write_path(ctx),
         old_stop: OldStop::Reconcile,
         restart_daemon: restart_action == DaemonRestartAction::Restart,
+        preserve_config_format: auto_selected_port,
     };
     let mut setup = match reconcile(ctx, &req) {
         Ok(result) => result,

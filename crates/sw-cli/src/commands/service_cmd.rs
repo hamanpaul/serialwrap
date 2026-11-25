@@ -29,6 +29,7 @@ struct ServiceActionRequest<'a> {
     context: &'a str,
     routed_to: Option<&'a str>,
     raw_mode: Option<PyValue>,
+    endpoint: Option<String>,
 }
 
 /// 執行 `service <action> [--with-sudo]`；exit `0`（ok）／`2`（監管動作失敗）／`1`（config 解析失敗，DF-07）。
@@ -66,6 +67,23 @@ pub fn run_service(ns: &Namespace, ctx: &mut CliCtx) -> i32 {
         },
     };
     let mode = SupervisionMode::parse(&mode_name);
+    let local_endpoint = if matches!(action, ServiceAction::Stop | ServiceAction::Restart) {
+        match crate::endpoint_resolve::resolve_local_management_endpoint(
+            ctx,
+            ns.str("endpoint"),
+            ns.str("socket"),
+            None,
+        ) {
+            Ok(resolved) => Some(resolved.endpoint),
+            Err(error) => {
+                return crate::endpoint_resolve::print_endpoint_resolution_error(
+                    ctx, &error, &context,
+                );
+            }
+        }
+    } else {
+        None
+    };
     // windows-task 的 Start 也走 service_action_response：先恢復啟用再 /Run（#276），與 daemon start 轉送一致。
     if (matches!(
         mode,
@@ -80,6 +98,7 @@ pub fn run_service(ns: &Namespace, ctx: &mut CliCtx) -> i32 {
             context: &context,
             routed_to: None,
             raw_mode: raw_mode_json,
+            endpoint: local_endpoint,
         };
         let response = service_action_response(
             ctx,
@@ -87,6 +106,7 @@ pub fn run_service(ns: &Namespace, ctx: &mut CliCtx) -> i32 {
             request.action,
             request.with_sudo,
             request.context,
+            request.endpoint.as_deref(),
         );
         return finish_service_action_response(ctx, response, request, |_, _, _, _| None);
     }
@@ -116,7 +136,31 @@ pub fn run_service_action(
     context: &str,
     routed_to: Option<&str>,
 ) -> i32 {
-    run_service_action_with_mode_value(ctx, mode, action, with_sudo, context, routed_to, None)
+    run_service_action_with_endpoint(ctx, mode, action, with_sudo, context, routed_to, None)
+}
+
+pub fn run_service_action_with_endpoint(
+    ctx: &mut CliCtx<'_>,
+    mode: &SupervisionMode,
+    action: ServiceAction,
+    with_sudo: bool,
+    context: &str,
+    routed_to: Option<&str>,
+    endpoint: Option<&str>,
+) -> i32 {
+    run_service_action_with_request(
+        ctx,
+        ServiceActionRequest {
+            mode,
+            action,
+            with_sudo,
+            context,
+            routed_to,
+            raw_mode: None,
+            endpoint: endpoint.map(str::to_string),
+        },
+        |_, _, _, _| None,
+    )
 }
 
 pub fn run_service_action_with_mode_value(
@@ -137,6 +181,7 @@ pub fn run_service_action_with_mode_value(
             context,
             routed_to,
             raw_mode,
+            endpoint: None,
         },
         |_, _, _, _| None,
     )
@@ -167,6 +212,7 @@ where
             context: "daemon start",
             routed_to: Some("service start"),
             raw_mode,
+            endpoint: None,
         },
         fallback,
     )
@@ -174,7 +220,7 @@ where
 
 fn run_service_action_with_request<F>(
     ctx: &mut CliCtx<'_>,
-    request: ServiceActionRequest<'_>,
+    mut request: ServiceActionRequest<'_>,
     fallback: F,
 ) -> i32
 where
@@ -185,12 +231,34 @@ where
         Option<&str>,
     ) -> Option<i32>,
 {
+    if matches!(request.action, ServiceAction::Stop | ServiceAction::Restart) {
+        match crate::endpoint_resolve::resolve_local_management_endpoint(
+            ctx,
+            request.endpoint.as_deref(),
+            None,
+            None,
+        ) {
+            Ok(resolved) => request.endpoint = Some(resolved.endpoint),
+            Err(error) => {
+                let mut response = output::error_resp(error.code, Some(&error.message));
+                response.insert("mode", PyValue::Str(request.mode.as_str().to_string()));
+                response.insert("action", PyValue::Str(request.action.as_str().to_string()));
+                return finish_service_action_response(
+                    ctx,
+                    ServiceActionResponse::Response(response, 2),
+                    request,
+                    fallback,
+                );
+            }
+        }
+    }
     let response = service_action_response(
         ctx,
         request.mode,
         request.action,
         request.with_sudo,
         request.context,
+        request.endpoint.as_deref(),
     );
     finish_service_action_response(ctx, response, request, fallback)
 }
@@ -201,11 +269,13 @@ fn service_action_response(
     action: ServiceAction,
     with_sudo: bool,
     context: &str,
+    endpoint: Option<&str>,
 ) -> ServiceActionResponse {
     if matches!(mode, SupervisionMode::WindowsTask) && action == ServiceAction::Start {
         return service_action_response_with_lifecycle_locks(ctx, mode, action, with_sudo, context);
     }
-    let (response, code) = service_action_response_unlocked(ctx, mode, action, with_sudo, context);
+    let (response, code) =
+        service_action_response_unlocked(ctx, mode, action, with_sudo, context, endpoint);
     ServiceActionResponse::Response(response, code)
 }
 
@@ -281,7 +351,7 @@ fn service_action_response_with_lifecycle_locks(
         };
     }
 
-    let result = service_action_response_unlocked(ctx, mode, action, with_sudo, context);
+    let result = service_action_response_unlocked(ctx, mode, action, with_sudo, context, None);
     if !already_had_autostart_lock {
         ctx.autostart_lock.take();
     }
@@ -335,6 +405,7 @@ where
                 request.action,
                 request.with_sudo,
                 request.context,
+                request.endpoint.as_deref(),
             );
             emit_service_action_response(
                 ctx,
@@ -398,6 +469,7 @@ fn service_action_response_unlocked(
     action: ServiceAction,
     with_sudo: bool,
     context: &str,
+    endpoint: Option<&str>,
 ) -> (PyDict, i32) {
     if matches!(
         mode,
@@ -410,10 +482,11 @@ fn service_action_response_unlocked(
         } else {
             "service_stop_wait_stop"
         };
+        let default_endpoint = crate::endpoint_resolve::local_default_endpoint(ctx);
         match crate::graceful_stop::graceful_stop(
             ctx,
             mode,
-            &crate::endpoint_resolve::local_default_endpoint(ctx),
+            endpoint.unwrap_or(&default_endpoint),
             with_sudo,
             keep_disabled,
             phase,

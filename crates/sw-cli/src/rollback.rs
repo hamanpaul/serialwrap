@@ -602,8 +602,7 @@ pub fn safety_check(
         PingHealth::Healthy => {}
         PingHealth::Unknown(code, detail) => return Err((code, detail)),
         PingHealth::ConnectTimedOut(mut detail) => {
-            // Windows 的未監聽 loopback TCP connect 依 Python 基線回 TimeoutError；若行程掃描找到 daemon，
-            // 用同一個 fail-closed 拒絕補上 PID；掃描空白或失敗仍回原本的 TIMEOUT。
+            // 健康 ping 逾時時，沿用既有行程掃描辨識 loopback TCP daemon；鎖策略不在本項變更範圍。
             if sw_proto::endpoint::is_loopback_tcp(endpoint) {
                 if let Ok(daemons) = scan_update_daemons(ctx, endpoint) {
                     if let Some(held_detail) = process_alive_refusal_detail(ctx, endpoint, &daemons) {
@@ -1588,8 +1587,41 @@ fn execute_change_with_restore(
         return report;
     }
     // S1X-c-1／OD-48 D3.1：停舊用舊模式的 instance endpoint，啟新／驗證用目標模式的 endpoint。
-    let endpoint = crate::endpoint_resolve::instance_endpoint(ctx, &old_mode);
-    let target_endpoint = crate::endpoint_resolve::target_instance_endpoint(ctx, target_mode, &old_mode, &endpoint);
+    let endpoint = match crate::endpoint_resolve::instance_endpoint(ctx, &old_mode) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            fail_report(&mut report, StepName::SafetyCheck, OpFailure {
+                code: error.code.as_str(),
+                phase: "update_safety_check",
+                reason: Some("endpoint_not_local"),
+                message: Some(error.message),
+                detail: PyDict::new(),
+            });
+            clear_journal(ctx, &root, &journal);
+            drop(lock);
+            return report;
+        }
+    };
+    let target_endpoint = match crate::endpoint_resolve::target_instance_endpoint(
+        ctx,
+        target_mode,
+        &old_mode,
+        &endpoint,
+    ) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            fail_report(&mut report, StepName::SafetyCheck, OpFailure {
+                code: error.code.as_str(),
+                phase: "update_safety_check",
+                reason: Some("target_endpoint_not_local"),
+                message: Some(error.message),
+                detail: PyDict::new(),
+            });
+            clear_journal(ctx, &root, &journal);
+            drop(lock);
+            return report;
+        }
+    };
     let daemon = match safety_check(ctx, &endpoint) {
         Ok(snapshot) => snapshot,
         Err((code, detail)) => {
@@ -1850,6 +1882,7 @@ fn execute_change_with_restore(
             config_path: endpoint_resolve::config_write_path(ctx),
             old_stop: if legacy_stopped.is_some() { crate::setup_cmd::OldStop::AlreadyStopped } else { crate::setup_cmd::OldStop::Reconcile },
             restart_daemon: false,
+            preserve_config_format: false,
         };
         let setup_result = match crate::setup_cmd::reconcile(ctx, &setup_req) {
             Ok(result) => result,
@@ -2529,7 +2562,21 @@ fn revert_after_failure(
         && ctx.p.service.autostart_hold_state(target_mode) == HoldState::Held)
         .then(|| held.record.clone());
     // S1X-c-1：新 daemon 在目標模式的 endpoint；回退先停它，再確認原 endpoint 也已釋放。
-    let revert_endpoint = crate::endpoint_resolve::target_instance_endpoint(ctx, target_mode, &original.supervisor.mode, &original.supervisor.endpoint);
+    let revert_endpoint = journal
+        .target
+        .as_ref()
+        .map(|target| target.endpoint.clone())
+        .or_else(|| {
+            crate::endpoint_resolve::target_instance_endpoint(
+                ctx,
+                target_mode,
+                &original.supervisor.mode,
+                &original.supervisor.endpoint,
+            )
+            .ok()
+        })
+        .filter(|endpoint| crate::endpoint_resolve::is_local_management_endpoint(endpoint))
+        .unwrap_or_else(|| original.supervisor.endpoint.clone());
     // OD-48 修訂：legacy daemon 已被停止 → 還原安裝狀態但不重啟任何 daemon，報告附啟動指令。
     let legacy_argv = journal.legacy.is_some().then(|| read_legacy_capture(ctx, &root, &journal).ok().flatten()
         .map(|capture| crate::legacy_handoff::captured_argv(&capture)).unwrap_or_default());
@@ -4239,7 +4286,14 @@ fn run_supervision_switch_unlocked(
         }
     };
     // S1X-c-1：以舊模式的 instance endpoint 探測舊 daemon；新 socket 依目標模式決定。
-    let endpoint = crate::endpoint_resolve::instance_endpoint(ctx, &old);
+    let endpoint = match crate::endpoint_resolve::instance_endpoint(ctx, &old) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            let mut detail = PyDict::new();
+            detail.insert("message", PyValue::Str(error.message));
+            return emit_switch_refusal(ctx, &old, error.code.as_str(), detail, force_requested);
+        }
+    };
     let snapshot = match safety_check(ctx, &endpoint) {
         Ok(snapshot) => snapshot,
         Err((code, mut detail)) => {
@@ -4252,7 +4306,15 @@ fn run_supervision_switch_unlocked(
     crash_if("supervision_set:after_safety_check");
     let root = install_layout::resolve_install_root(ctx);
     let home = crate::setup_cmd::home_dir(ctx);
-    let socket = switch_socket(ctx, target, &crate::endpoint_resolve::target_instance_endpoint(ctx, target, &old, &endpoint));
+    let target_endpoint = match crate::endpoint_resolve::target_instance_endpoint(ctx, target, &old, &endpoint) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            let mut detail = PyDict::new();
+            detail.insert("message", PyValue::Str(error.message));
+            return emit_switch_refusal(ctx, &old, error.code.as_str(), detail, force_requested);
+        }
+    };
+    let socket = switch_socket(ctx, target, &target_endpoint);
     let mut request = crate::setup_cmd::ReconcileRequest {
         old_mode: old.clone(),
         target_mode: target.clone(),
@@ -4268,6 +4330,7 @@ fn run_supervision_switch_unlocked(
         config_path: crate::endpoint_resolve::config_write_path(ctx),
         old_stop: crate::setup_cmd::OldStop::Reconcile,
         restart_daemon: false,
+        preserve_config_format: false,
     };
     let must_handoff = old != *target && crate::setup_cmd::reconcile_stops_old(ctx, &request);
     if !must_handoff {
@@ -4463,13 +4526,9 @@ fn systemd_user_unit_path(ctx: &CliCtx<'_>) -> PathBuf {
     crate::setup_cmd::systemd_user_unit_path(&crate::setup_cmd::home_dir(ctx))
 }
 
-fn switch_socket(ctx: &CliCtx<'_>, target: &SupervisionMode, endpoint: &str) -> String {
+fn switch_socket(_ctx: &CliCtx<'_>, target: &SupervisionMode, endpoint: &str) -> String {
     if *target == SupervisionMode::SystemdSystem {
         "/run/serialwrap/serialwrapd.sock".into()
-    } else if matches!(target, SupervisionMode::WindowsTask | SupervisionMode::WindowsService)
-        || crate::endpoint_resolve::rpc_backend_is_win(ctx)
-    {
-        crate::endpoint_resolve::local_default_endpoint(ctx)
     } else {
         endpoint.to_string()
     }

@@ -33,6 +33,18 @@ Windows 版 doctor 檢查：`python`／`pyyaml`／`pyserial`／exe 是否在 PAT
 `supervision_mode`／daemon endpoint 是否可連／SERIALCOMM COM 裝置列舉
 （藍牙 COM 自動排除）。
 
+安裝新版本或升級時，從該版 bundle 的 `versions\<版本>\bin\serialwrap.exe`
+執行 `setup`。setup 會先確認 RPC 埠可 bind，再寫入設定與監管工作。
+本機管理 endpoint 優先序為明確 `--endpoint`／`--socket`、
+`SERIALWRAP_ENDPOINT`／`SERIALWRAP_TCP_PORT`、`config.yaml` 的
+`socket_path`、內建預設；TCP endpoint 僅接受 loopback。若只有內建預設
+`48700` 無法 bind，setup 會由低到高搜尋 `48701` 至 `49151`，將找到的埠
+寫回 `socket_path`，並讓 daemon 與工作排程器使用該 endpoint。明確指定的
+埠無法 bind 時不會自動改埠。以
+`netsh int ipv4 show excludedportrange protocol=tcp` 查詢保留區間；依 setup
+提示修改 `socket_path` 或 `SERIALWRAP_TCP_PORT` 後重試。update、rollback 與
+supervision-mode set 會保留已選定的 `socket_path`。
+
 ## 2. 啟動 daemon
 
 ```powershell
@@ -41,6 +53,8 @@ serialwrap daemon start
 
 - 預設 bind `tcp://127.0.0.1:48700`（loopback RPC；可用環境變數
   `SERIALWRAP_TCP_PORT` 或 `SERIALWRAP_ENDPOINT` 覆寫）。
+- `setup`／`service stop`／`restart` 與 daemon 管理命令會依共用 endpoint 優先序讀取 config；非 loopback TCP 不作為本機停機目標。
+- setup 的 health ping 逾時會再檢查 singleton lock：鎖持有時不會啟動第二個 daemon，鎖可取得並釋放時才按 daemon 未執行處理。daemon 執行期埠 bind 失敗會提示查詢 Windows 保留區間並修改設定，不會自動換埠。
 - 冪等：已有健康 daemon 時回 `already_running`，不會多開。
 - daemon 以 detached 模式啟動，關閉目前的終端機視窗不會殺掉它。
 - 停止：`serialwrap daemon stop`；狀態：`serialwrap daemon status`。

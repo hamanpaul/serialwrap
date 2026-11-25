@@ -100,6 +100,27 @@ fn service_windows_task_start_runs_schtasks() {
 }
 
 #[test]
+fn service_stop_uses_configured_loopback_endpoint() {
+    let endpoint = "tcp://127.0.0.1:49001";
+    let t = TestEnv::windows()
+        .with_config(&format!(
+            "supervision_mode: windows-task\nsocket_path: {endpoint}\n"
+        ))
+        .with_idle_daemon(endpoint, 4242);
+
+    let (rc, out, err) = t.run(&["service", "stop"]);
+    let requests = t.rpc().requests();
+
+    assert_eq!(rc, 0, "service stop 未成功：out={out:?} err={err:?}");
+    assert!(
+        !requests.is_empty() && requests.iter().all(|(requested_endpoint, _, _)| {
+            requested_endpoint == endpoint
+        }),
+        "service stop 必須全程使用 config.yaml socket_path，且不得退回內建預設：{requests:?}"
+    );
+}
+
+#[test]
 fn service_windows_task_start_keeps_disabled_under_autostart_hold() {
     // #276：更新／監管切換的 hold 存在時，停用狀態屬於 hold，start 不得自行恢復啟用。
     let t = TestEnv::windows()
