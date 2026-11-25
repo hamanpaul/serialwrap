@@ -1,0 +1,146 @@
+{
+  "acceptance": {
+    "path": "realhw/acceptance/longrun_acceptance.yaml",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "allowed_differences": {
+    "path": "contracts/behavior_changes.yaml",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "authorization": {
+    "allow_destructive": false,
+    "boards": [],
+    "decision_ref": null
+  },
+  "candidate_context": {
+    "path": "run-context.json",
+    "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "case_ids": [
+    "p0-doctor",
+    "p0-cmd-async"
+  ],
+  "case_list": {
+    "path": "tests/acceptance/cases.yaml",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "case_lock": {
+    "path": "tests/acceptance/cases.lock.json",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "contract_revision": "0000000000000000000000000000000000000000",
+  "dut": {
+    "boards": [
+      "board-a"
+    ],
+    "com_pair": null,
+    "expected_fingerprint": {},
+    "fingerprint_argv": [],
+    "image": null,
+    "image_digest": null,
+    "kind": "hardware",
+    "reset_argv": [],
+    "transport": "physical-usb-uart"
+  },
+  "endpoint": "explicit-endpoint-placeholder",
+  "exit_catalog_sha256": "e8a63131f2560455b558865dd6f37c526712d5561a4e3d5652a0308de894b73b",
+  "exit_item_id": "S3-L3-P0P1-REMOTE-LINUX",
+  "failure_retention": "on-demand",
+  "layer": "l3",
+  "platform": "linux",
+  "platform_settings": {
+    "example_only": true
+  },
+  "profile_files": [],
+  "release": {
+    "accept_unreadable_holders": false,
+    "device_open_probe": true,
+    "device_paths": [],
+    "endpoints": [],
+    "lock_paths": [],
+    "poll_s": 1,
+    "timeout_s": 120
+  },
+  "required_case_set": "slice_2.4",
+  "required_cases_lock": {
+    "path": "tests/acceptance/stage3_required_cases.lock.json",
+    "sha256": "34330d99973be4bcdcdb0ca6cab2728351df53b81a3599c025d7e1a5ca83d8a6"
+  },
+  "required_cases_sha256": "34330d99973be4bcdcdb0ca6cab2728351df53b81a3599c025d7e1a5ca83d8a6",
+  "reverify": {
+    "enabled": true,
+    "order": [
+      "B",
+      "A"
+    ]
+  },
+  "run_id": "example-l3-linux",
+  "schema_version": 1,
+  "seed": 0,
+  "sides": [
+    {
+      "activate_argv": [
+        "bundles/A/bin/serialwrap",
+        "setup"
+      ],
+      "bundle_dir": "bundles/A",
+      "cli_exe": "bundles/A/bin/serialwrap",
+      "daemon_exe": "bundles/A/bin/serialwrapd",
+      "deactivate_argv": [
+        "bundles/A/bin/serialwrap",
+        "setup",
+        "--rollback"
+      ],
+      "label": "A",
+      "release_manifest": {
+        "path": "bundles/A/release-manifest.json",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "role": "baseline"
+    },
+    {
+      "activate_argv": [
+        "bundles/B/bin/serialwrap",
+        "setup"
+      ],
+      "bundle_dir": "bundles/B",
+      "cli_exe": "bundles/B/bin/serialwrap",
+      "daemon_exe": "bundles/B/bin/serialwrapd",
+      "deactivate_argv": [
+        "bundles/B/bin/serialwrap",
+        "setup",
+        "--rollback"
+      ],
+      "label": "B",
+      "release_manifest": {
+        "path": "bundles/B/release-manifest.json",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "role": "candidate"
+    }
+  ],
+  "stage": "3",
+  "suite": {
+    "adapter": "l3_realhw",
+    "extra_args": [],
+    "realhw_config_template": {
+      "path": "realhw/config.json",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "selftest_report": null,
+    "testbed_template": null,
+    "tier": "longrun",
+    "timeout_s": 180000
+  },
+  "test_device_allowlist": [],
+  "tools": [
+    {
+      "path": "tools/stage3",
+      "tree_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "path": "realhw",
+      "tree_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ]
+}

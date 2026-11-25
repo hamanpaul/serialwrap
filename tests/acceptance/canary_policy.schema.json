@@ -1,0 +1,404 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serialwrap.local/schemas/canary_policy",
+  "title": "Canary policy（OD-10）",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "active_day",
+    "collector",
+    "cycles",
+    "decision_ref",
+    "frozen_at",
+    "frozen_by",
+    "incidents",
+    "platforms",
+    "safety",
+    "schema_version",
+    "status",
+    "submit_counting"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "status": {
+      "enum": [
+        "draft",
+        "frozen"
+      ]
+    },
+    "decision_ref": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "frozen_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "frozen_by": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "active_day": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "min_distinct_submits",
+        "min_snapshot_coverage_s"
+      ],
+      "properties": {
+        "min_distinct_submits": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "min_snapshot_coverage_s": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "collector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "episode_max_gap_factor",
+        "gap_incident_s",
+        "interval_s",
+        "post_boot_grace_s",
+        "reboot_corroboration_s",
+        "result_poll_max_per_cycle",
+        "unreachable_incident_polls"
+      ],
+      "properties": {
+        "episode_max_gap_factor": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "gap_incident_s": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "interval_s": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "post_boot_grace_s": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reboot_corroboration_s": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "result_poll_max_per_cycle": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "unreachable_incident_polls": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "cycles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "coexist_bucket_s",
+        "coexist_cap_per_day",
+        "recover_cluster_s"
+      ],
+      "properties": {
+        "coexist_bucket_s": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "coexist_cap_per_day": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "recover_cluster_s": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "incidents": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stuck_incident_s"
+      ],
+      "properties": {
+        "stuck_incident_s": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "safety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "allowed_tx_source_regex",
+        "human_replay_min_len",
+        "resend_window_s"
+      ],
+      "properties": {
+        "allowed_tx_source_regex": {
+          "type": "string",
+          "minLength": 1
+        },
+        "human_replay_min_len": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "resend_window_s": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "submit_counting": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cmd_id_regex",
+        "dedup_key",
+        "exclude_source_prefixes",
+        "require_terminal_result",
+        "source"
+      ],
+      "properties": {
+        "cmd_id_regex": {
+          "const": "^[0-9a-f]{32}$"
+        },
+        "dedup_key": {
+          "const": [
+            "host_id",
+            "cmd_id"
+          ]
+        },
+        "exclude_source_prefixes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "require_terminal_result": {
+          "const": true
+        },
+        "source": {
+          "const": "wal_tx_cmd_id"
+        }
+      }
+    },
+    "platforms": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "linux",
+        "windows"
+      ],
+      "properties": {
+        "linux": {
+          "$ref": "#/$defs/Platform"
+        },
+        "windows": {
+          "$ref": "#/$defs/Platform"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "frozen"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "frozen_by": {
+            "type": "string",
+            "minLength": 1
+          },
+          "frozen_at": {
+            "type": "string",
+            "minLength": 1
+          },
+          "decision_ref": {
+            "type": "string",
+            "minLength": 1
+          },
+          "platforms": {
+            "properties": {
+              "linux": {
+                "properties": {
+                  "evidence_owner": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              },
+              "windows": {
+                "properties": {
+                  "evidence_owner": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "platforms": {
+          "properties": {
+            "windows": {
+              "properties": {
+                "quotas": {
+                  "properties": {
+                    "cycles_min_per_type": {
+                      "properties": {
+                        "flash": {
+                          "const": 0
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "Platform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_owner",
+        "quotas",
+        "utc_offset_changes",
+        "utc_offset_minutes"
+      ],
+      "properties": {
+        "evidence_owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "quotas": {
+          "$ref": "#/$defs/Quotas"
+        },
+        "utc_offset_changes": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "integer",
+                "minimum": -720,
+                "maximum": 840
+              }
+            ],
+            "minItems": 2,
+            "maxItems": 2
+          }
+        },
+        "utc_offset_minutes": {
+          "type": "integer",
+          "minimum": -720,
+          "maximum": 840
+        }
+      }
+    },
+    "Quotas": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "active_days",
+        "cycles_max_type_share",
+        "cycles_min_per_type",
+        "cycles_total",
+        "submits"
+      ],
+      "properties": {
+        "active_days": {
+          "type": "integer",
+          "minimum": 14
+        },
+        "submits": {
+          "type": "integer",
+          "minimum": 5000
+        },
+        "cycles_total": {
+          "type": "integer",
+          "minimum": 50
+        },
+        "cycles_max_type_share": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 0.5
+        },
+        "cycles_min_per_type": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "handoff_release_attach": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "hotplug_reattach": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "dut_reboot": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "recovery": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "human_agent_coexist": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "flash": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "planned_restart": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -630,6 +630,10 @@ jobs:
           's21_core:windows:cargo:sw-daemon::handoff_stop::handoff_then_successor_never_double_held'
           's21_core:windows:cargo:sw-daemon::shutdown_order::second_sigterm_real_signal_exits_0'
 
+      - name: Stage 3 逐出口案例分母鎖只增檢查（對 PR base）
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        run: python3 -m tools.stage3.required_cases --check --base "${{ github.event.pull_request.base.sha }}"
+
   bridge-tools:
     if: github.event.action != 'labeled'
     runs-on: ubuntu-latest
