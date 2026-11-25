@@ -86,6 +86,13 @@ entries:
     - cargo:sw-cli::mgmt_setup::inst4_setup_ping_timeout_with_unknown_lock_fails_closed
     - cargo:sw-cli::mgmt_setup::inst4_windows_port_probe_uses_configured_loopback_host
     - cargo:sw-daemon::windows_bind_error::windows_loopback_bind_failure_has_actionable_reserved_port_hint
+    - cargo:sw-cli::mgmt_setup::bundle_setup_auto_selects_port_when_default_port_is_unavailable
+    - cargo:sw-cli::mgmt_setup::bundle_setup_explicit_port_bind_failure_does_not_auto_select
+    - cargo:sw-cli::mgmt_setup::bundle_setup_ping_timeout_with_released_lock_proceeds
+    - cargo:sw-cli::mgmt_setup::bundle_setup_uses_explicit_endpoint_over_config
+    - cargo:sw-cli::endpoint_resolve::socket_path_yaml_patch_handles_empty_value_with_comment_without_panic
+    - cargo:sw-cli::endpoint_resolve::socket_path_yaml_patch_handles_flow_mapping_without_invalid_yaml
+    - cargo:sw-pal::rpc_listener::tcp_loopback_accepts_127_0_0_2
     owner_phase: P4
   bc:DF-01:
     nodeids:

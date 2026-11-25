@@ -593,7 +593,7 @@ pub struct DaemonSnapshot {
 }
 
 pub fn safety_check(
-    ctx: &CliCtx<'_>,
+    ctx: &mut CliCtx<'_>,
     endpoint: &str,
 ) -> Result<Option<DaemonSnapshot>, (&'static str, PyDict)> {
     // P8 Task 14：daemon 健康三態。只有「連線被拒或端點不存在」且 ProcScan 確認沒有 serialwrapd 才算確認不存在；
@@ -602,12 +602,28 @@ pub fn safety_check(
         PingHealth::Healthy => {}
         PingHealth::Unknown(code, detail) => return Err((code, detail)),
         PingHealth::ConnectTimedOut(mut detail) => {
-            // 健康 ping 逾時時，沿用既有行程掃描辨識 loopback TCP daemon；鎖策略不在本項變更範圍。
             if sw_proto::endpoint::is_loopback_tcp(endpoint) {
                 if let Ok(daemons) = scan_update_daemons(ctx, endpoint) {
                     if let Some(held_detail) = process_alive_refusal_detail(ctx, endpoint, &daemons) {
                         return Err((ErrorCode::DeviceStillHeld.as_str(), held_detail));
                     }
+                }
+                match crate::endpoint_resolve::probe_instance_lock_held(ctx, endpoint) {
+                    Ok(false) => {
+                        let _ = ctx.io.err_str(
+                            "serialwrap: setup daemon detection: health.ping timed out; daemon singleton lock is free, continuing as not running\n",
+                        );
+                        return Ok(None);
+                    }
+                    Ok(true) => {
+                        let mut held_detail = PyDict::new();
+                        held_detail.insert("holder_unknown", PyValue::Bool(false));
+                        held_detail.insert("health", PyValue::Str("unknown".into()));
+                        held_detail.insert("reason", PyValue::Str("daemon_lock_held".into()));
+                        held_detail.insert("message", PyValue::Str("health.ping 逾時但 daemon singleton lock 仍被持有；拒絕啟動第二個 daemon".into()));
+                        return Err((ErrorCode::DeviceStillHeld.as_str(), held_detail));
+                    }
+                    Err(_) => {}
                 }
             }
             detail.insert("probe", PyValue::Str("health.ping".into()));
@@ -1234,16 +1250,16 @@ pub fn run_update(
 ) -> UpdateReport {
     let root = install_layout::resolve_install_root(ctx);
     match install_layout::install_lock(ctx, &root) {
-        Ok(lock) => run_update_locked(ctx, bundle_dir, target_mode, with_sudo, force_requested, lock),
+        Ok(lock) => run_update_locked(ctx, bundle_dir, target_mode, with_sudo, force_requested, None, lock),
         Err(detail) => lock_failure_report("update", detail),
     }
 }
 
 pub(crate) fn run_update_locked(
     ctx: &mut CliCtx<'_>, bundle_dir: &Path, target_mode: &SupervisionMode,
-    with_sudo: bool, force_requested: bool, lock: FileLockGuard,
+    with_sudo: bool, force_requested: bool, explicit_endpoint: Option<&str>, lock: FileLockGuard,
 ) -> UpdateReport {
-    execute_change(ctx, bundle_dir, target_mode, with_sudo, force_requested, "update", lock)
+    execute_change(ctx, bundle_dir, target_mode, with_sudo, force_requested, "update", explicit_endpoint, lock)
 }
 
 pub fn run_rollback(
@@ -1389,7 +1405,8 @@ fn execute_install(ctx: &mut CliCtx<'_>, bundle_dir: &Path, ns: &Namespace, lock
         Ok(mode) => mode,
         Err(error) => return report_from_dict("install", error),
     };
-    execute_change(ctx, bundle_dir, &target, matches!(ns.get("with_sudo"), crate::argparse::ArgValue::Bool(true)), matches!(ns.get("force"), crate::argparse::ArgValue::Bool(true)), "install", lock)
+    let explicit_endpoint = ns.str("endpoint").or_else(|| ns.str("socket"));
+    execute_change(ctx, bundle_dir, &target, matches!(ns.get("with_sudo"), crate::argparse::ArgValue::Bool(true)), matches!(ns.get("force"), crate::argparse::ArgValue::Bool(true)), "install", explicit_endpoint, lock)
 }
 
 fn report_from_dict(op: &'static str, detail: PyDict) -> UpdateReport {
@@ -1458,7 +1475,7 @@ fn execute_rollback(ctx: &mut CliCtx<'_>, with_sudo: bool, force_requested: bool
         }
     }
     let target_mode = previous_backup.supervisor.mode.clone();
-    execute_change_with_restore(ctx, &target_dir, &target_mode, with_sudo, force_requested, "rollback", Some(&previous_backup), lock)
+    execute_change_with_restore(ctx, &target_dir, &target_mode, with_sudo, force_requested, "rollback", None, Some(&previous_backup), lock)
 }
 
 fn rollback_unavailable(from: Option<String>, reason: &str) -> UpdateReport {
@@ -1481,9 +1498,10 @@ fn execute_change(
     with_sudo: bool,
     force_requested: bool,
     op: &'static str,
+    explicit_endpoint: Option<&str>,
     lock: FileLockGuard,
 ) -> UpdateReport {
-    execute_change_with_restore(ctx, bundle_dir, target_mode, with_sudo, force_requested, op, None, lock)
+    execute_change_with_restore(ctx, bundle_dir, target_mode, with_sudo, force_requested, op, explicit_endpoint, None, lock)
 }
 
 fn execute_change_with_restore(
@@ -1493,6 +1511,7 @@ fn execute_change_with_restore(
     with_sudo: bool,
     force_requested: bool,
     op: &'static str,
+    explicit_endpoint: Option<&str>,
     restore_previous: Option<&BackupSet>,
     lock: FileLockGuard,
 ) -> UpdateReport {
@@ -1511,10 +1530,10 @@ fn execute_change_with_restore(
         }
     };
     if op == "install" && current.is_some() {
-        return execute_change(ctx, bundle_dir, target_mode, with_sudo, force_requested, "update", lock);
+        return execute_change(ctx, bundle_dir, target_mode, with_sudo, force_requested, "update", explicit_endpoint, lock);
     }
     if op == "update" && current.is_none() {
-        return execute_change(ctx, bundle_dir, target_mode, with_sudo, force_requested, "install", lock);
+        return execute_change(ctx, bundle_dir, target_mode, with_sudo, force_requested, "install", explicit_endpoint, lock);
     }
     let from = current.as_ref().map(|current| current.bundle_version.clone());
     let (manifest_path, manifest) = match load_bundle_manifest(ctx, bundle_dir) {
@@ -1587,7 +1606,7 @@ fn execute_change_with_restore(
         return report;
     }
     // S1X-c-1／OD-48 D3.1：停舊用舊模式的 instance endpoint，啟新／驗證用目標模式的 endpoint。
-    let endpoint = match crate::endpoint_resolve::instance_endpoint(ctx, &old_mode) {
+    let endpoint = match crate::endpoint_resolve::instance_endpoint_with_explicit(ctx, &old_mode, explicit_endpoint) {
         Ok(endpoint) => endpoint,
         Err(error) => {
             fail_report(&mut report, StepName::SafetyCheck, OpFailure {
@@ -1602,24 +1621,28 @@ fn execute_change_with_restore(
             return report;
         }
     };
-    let target_endpoint = match crate::endpoint_resolve::target_instance_endpoint(
-        ctx,
-        target_mode,
-        &old_mode,
-        &endpoint,
-    ) {
-        Ok(endpoint) => endpoint,
-        Err(error) => {
-            fail_report(&mut report, StepName::SafetyCheck, OpFailure {
-                code: error.code.as_str(),
-                phase: "update_safety_check",
-                reason: Some("target_endpoint_not_local"),
-                message: Some(error.message),
-                detail: PyDict::new(),
-            });
-            clear_journal(ctx, &root, &journal);
-            drop(lock);
-            return report;
+    let mut target_endpoint = if let Some(explicit) = explicit_endpoint {
+        explicit.to_string()
+    } else {
+        match crate::endpoint_resolve::target_instance_endpoint(
+            ctx,
+            target_mode,
+            &old_mode,
+            &endpoint,
+        ) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                fail_report(&mut report, StepName::SafetyCheck, OpFailure {
+                    code: error.code.as_str(),
+                    phase: "update_safety_check",
+                    reason: Some("target_endpoint_not_local"),
+                    message: Some(error.message),
+                    detail: PyDict::new(),
+                });
+                clear_journal(ctx, &root, &journal);
+                drop(lock);
+                return report;
+            }
         }
     };
     let daemon = match safety_check(ctx, &endpoint) {
@@ -1633,6 +1656,72 @@ fn execute_change_with_restore(
             return report;
         }
     };
+    if daemon.is_none() && (endpoint_resolve::rpc_backend_is_win(ctx) || matches!(target_mode, SupervisionMode::WindowsTask | SupervisionMode::WindowsService)) {
+        let (resolved, source) = match endpoint_resolve::resolve_local_management_endpoint(ctx, explicit_endpoint, None, None) {
+            Ok(r) => (r.endpoint, r.source),
+            Err(_) => (target_endpoint.clone(), "default"),
+        };
+        let builtin_default = source == "default" && resolved == "tcp://127.0.0.1:48700";
+        match crate::setup_cmd::resolve_and_bind_windows_setup_endpoint(ctx, &target_endpoint, builtin_default) {
+            Ok(selection) => {
+                if selection.auto_selected {
+                    target_endpoint = selection.endpoint;
+                    let _ = ctx.io.err_str(&format!(
+                        "serialwrap: setup could not bind built-in TCP port 48700 (reserved or unavailable); selected port {} and will save socket_path\n",
+                        target_endpoint.rsplit(':').next().unwrap_or_default()
+                    ));
+                    if let Err(error) = endpoint_resolve::save_runtime_config_preserving(ctx, None, Some(&target_endpoint)) {
+                        fail_report(&mut report, StepName::SafetyCheck, OpFailure {
+                            code: ErrorCode::InternalError.as_str(),
+                            phase: "update_safety_check",
+                            reason: Some("config_update_failed"),
+                            message: Some(error.to_string()),
+                            detail: PyDict::new(),
+                        });
+                        clear_journal(ctx, &root, &journal);
+                        drop(lock);
+                        return report;
+                    }
+                }
+            }
+            Err(crate::setup_cmd::WindowsSetupEndpointError::InvalidLoopbackEndpoint) => {
+                fail_report(&mut report, StepName::SafetyCheck, OpFailure {
+                    code: ErrorCode::InvalidArgs.as_str(),
+                    phase: "update_safety_check",
+                    reason: Some("invalid_loopback_endpoint"),
+                    message: Some("Windows setup 需要本機 loopback TCP socket_path".into()),
+                    detail: PyDict::new(),
+                });
+                clear_journal(ctx, &root, &journal);
+                drop(lock);
+                return report;
+            }
+            Err(crate::setup_cmd::WindowsSetupEndpointError::ExplicitPortUnavailable) => {
+                fail_report(&mut report, StepName::SafetyCheck, OpFailure {
+                    code: ErrorCode::InvalidArgs.as_str(),
+                    phase: "update_safety_check",
+                    reason: Some("explicit_port_unavailable"),
+                    message: Some("指定的 TCP 埠無法 bind；請用 `netsh int ipv4 show excludedportrange protocol=tcp` 檢查保留區間，或修改 config.yaml 的 socket_path／SERIALWRAP_TCP_PORT".into()),
+                    detail: PyDict::new(),
+                });
+                clear_journal(ctx, &root, &journal);
+                drop(lock);
+                return report;
+            }
+            Err(crate::setup_cmd::WindowsSetupEndpointError::NoAvailableDefaultPort) => {
+                fail_report(&mut report, StepName::SafetyCheck, OpFailure {
+                    code: ErrorCode::InvalidArgs.as_str(),
+                    phase: "update_safety_check",
+                    reason: Some("no_available_default_port"),
+                    message: Some("TCP 埠 48700–49151 都無法 bind；請用 `netsh int ipv4 show excludedportrange protocol=tcp` 檢查保留區間，或修改 config.yaml 的 socket_path".into()),
+                    detail: PyDict::new(),
+                });
+                clear_journal(ctx, &root, &journal);
+                drop(lock);
+                return report;
+            }
+        }
+    }
     let sup = match query_supervisor(ctx, &old_mode, &endpoint, daemon.is_some()) {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -1845,18 +1934,16 @@ fn execute_change_with_restore(
                 return revert_after_failure(ctx, root, journal, original, backup, report, StepName::BackupAndSwitch, failure, &mut held, with_sudo, target_mode);
             }
         };
-        let explicit_endpoint: Option<String> = None;
-        let explicit_socket: Option<String> = None;
         let socket_path = if *target_mode == SupervisionMode::SystemdSystem {
             "/run/serialwrap/serialwrapd.sock".to_string()
-        } else if matches!(target_mode, SupervisionMode::WindowsTask | SupervisionMode::WindowsService)
+        } else if explicit_endpoint.is_some()
+            || matches!(target_mode, SupervisionMode::WindowsTask | SupervisionMode::WindowsService)
             || endpoint_resolve::rpc_backend_is_win(ctx)
         {
             target_endpoint.clone()
         } else if old_mode == SupervisionMode::OnDemand
             && target_mode == &SupervisionMode::OnDemand
             && explicit_endpoint.is_none()
-            && explicit_socket.is_none()
         {
             config.socket_path().and_then(|value| match value {
                 sw_proto::yaml11::YValue::Str(socket)

@@ -206,9 +206,18 @@ pub fn instance_endpoint(
     ctx: &CliCtx<'_>,
     mode: &sw_pal::service_ctl::SupervisionMode,
 ) -> Result<String, EndpointResolutionError> {
+    instance_endpoint_with_explicit(ctx, mode, None)
+}
+
+/// 支援命令列指定 `--endpoint` / `--socket` 的 instance endpoint 解析。
+pub fn instance_endpoint_with_explicit(
+    ctx: &CliCtx<'_>,
+    mode: &sw_pal::service_ctl::SupervisionMode,
+    explicit: Option<&str>,
+) -> Result<String, EndpointResolutionError> {
     use sw_pal::service_ctl::SupervisionMode;
     let fallback = (mode == &SupervisionMode::SystemdSystem).then_some(SYSTEMD_SYSTEM_SOCKET);
-    resolve_local_management_endpoint(ctx, None, None, fallback)
+    resolve_local_management_endpoint(ctx, explicit, None, fallback)
         .map(|resolved| resolved.endpoint)
 }
 
@@ -553,7 +562,20 @@ fn root_yaml_key_matches(raw_key: &str, key: &str) -> bool {
 pub fn replace_root_yaml_scalar_value(text: &str, key: &str, value: &str) -> String {
     let mut output = String::with_capacity(text.len() + key.len() + value.len());
     let mut found = false;
-    for line in text.split_inclusive('\n') {
+    let mut empty_flow_mapping_line = None;
+
+    // 先檢查是否有單獨一行的空 flow mapping "{}"
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed == "{}" {
+            empty_flow_mapping_line = Some(idx);
+            break;
+        }
+    }
+
+    for (idx, line) in lines.iter().enumerate() {
+        let line = *line;
         let (body, ending) = if let Some(body) = line.strip_suffix('\n') {
             (body, "\n")
         } else {
@@ -562,6 +584,19 @@ pub fn replace_root_yaml_scalar_value(text: &str, key: &str, value: &str) -> Str
         let (body, carriage_return) = body
             .strip_suffix('\r')
             .map_or((body, ""), |body| (body, "\r"));
+
+        if Some(idx) == empty_flow_mapping_line && !found {
+            // 如果原本是空 flow mapping "{}"，替換為乾淨的根純量鍵
+            found = true;
+            output.push_str(key);
+            output.push_str(": '");
+            output.push_str(&value.replace('\'', "''"));
+            output.push('\'');
+            output.push_str(carriage_return);
+            output.push_str(ending);
+            continue;
+        }
+
         let replacement = if !body.chars().next().is_some_and(char::is_whitespace)
             && !body.starts_with('#')
         {
@@ -572,25 +607,40 @@ pub fn replace_root_yaml_scalar_value(text: &str, key: &str, value: &str) -> Str
                     let rest = &body[value_start..];
                     let leading = rest.len()
                         - rest
-                        .trim_start_matches([' ', '\t'])
+                            .trim_start_matches([' ', '\t'])
                             .len();
                     let comment = yaml_comment_start(rest).unwrap_or(rest.len());
                     let without_comment = &rest[..comment];
                     let value_end = without_comment
                         .trim_end_matches([' ', '\t'])
                         .len();
-                    let old_value = &rest[leading..value_end];
-                    let scalar = replace_scalar_style(old_value, value);
-                    format!(
-                        "{}{}{}{}{}{}{}",
-                        &body[..value_start],
-                        &rest[..leading],
-                        scalar,
-                        &rest[value_end..comment],
-                        &rest[comment..],
-                        carriage_return,
-                        ending
-                    )
+
+                    if value_end <= leading {
+                        // 空值或只有空白與註解（如 `socket_path:   # optional` 或 `socket_path:`）
+                        let scalar = format!("'{}'", value.replace('\'', "''"));
+                        format!(
+                            "{} {}{}{}{}{}",
+                            &body[..value_start],
+                            scalar,
+                            &rest[..comment],
+                            &rest[comment..],
+                            carriage_return,
+                            ending
+                        )
+                    } else {
+                        let old_value = &rest[leading..value_end];
+                        let scalar = replace_scalar_style(old_value, value);
+                        format!(
+                            "{}{}{}{}{}{}{}",
+                            &body[..value_start],
+                            &rest[..leading],
+                            scalar,
+                            &rest[value_end..comment],
+                            &rest[comment..],
+                            carriage_return,
+                            ending
+                        )
+                    }
                 })
             })
         } else {
@@ -638,6 +688,7 @@ pub fn save_runtime_config_preserving(
     if let Some(socket_path) = socket_path {
         text = replace_root_yaml_scalar_value(&text, "socket_path", socket_path);
     }
+    sw_proto::yaml11::safe_load(&text).map_err(ConfigError::from)?;
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

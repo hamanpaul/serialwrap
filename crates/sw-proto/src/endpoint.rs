@@ -6,7 +6,6 @@
 //!
 //! 錯誤訊息為 Python `str(ValueError)`：包含 endpoint 的部分以 `repr` 格式輸出（見 [`crate::pyfmt::py_repr_argv`]）。
 
-use crate::constants::LOOPBACK_TCP_HOSTS;
 use crate::pycompat::INT_MAX_STR_DIGITS;
 use crate::pyfmt::py_repr_argv;
 
@@ -366,10 +365,25 @@ pub fn parse_endpoint(s: &str) -> Result<Endpoint, EndpointError> {
     }
 }
 
+/// 判斷主機名稱或位址是否為 loopback（支援 IPv4 127.0.0.0/8、IPv6 ::1 與 localhost）。
+pub fn is_loopback_host(host: &str) -> bool {
+    let clean = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    clean.eq_ignore_ascii_case("localhost")
+        || clean
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|addr| addr.is_loopback())
+        || clean
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|addr| addr.is_loopback())
+}
+
 /// 是否為 loopback TCP endpoint（`cli._is_loopback_tcp`：解析失敗或非 tcp 皆為 false）。
 pub fn is_loopback_tcp(s: &str) -> bool {
     match parse_endpoint(s) {
-        Ok(Endpoint::Tcp { host, .. }) => LOOPBACK_TCP_HOSTS.contains(&host.as_str()),
+        Ok(Endpoint::Tcp { host, .. }) => is_loopback_host(&host),
         _ => false,
     }
 }

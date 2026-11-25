@@ -749,6 +749,31 @@ fn socket_path_yaml_patch_updates_quoted_root_key_without_duplicate() {
 }
 
 #[test]
+fn socket_path_yaml_patch_handles_empty_value_with_comment_without_panic() {
+    let original = "socket_path:   # optional\nother: 1\n";
+    let updated = replace_root_yaml_scalar_value(original, "socket_path", "tcp://127.0.0.1:48716");
+    assert_eq!(
+        updated,
+        "socket_path: 'tcp://127.0.0.1:48716'   # optional\nother: 1\n"
+    );
+}
+
+#[test]
+fn socket_path_yaml_patch_handles_flow_mapping_without_invalid_yaml() {
+    let original = "{}\n";
+    let updated = replace_root_yaml_scalar_value(original, "socket_path", "tcp://127.0.0.1:48716");
+    assert!(
+        !updated.starts_with("{}\nsocket_path"),
+        "更新 flow mapping 不得產生非法 YAML 結構，實際：{updated}"
+    );
+    assert!(
+        sw_proto::yaml11::safe_load(&updated).is_ok(),
+        "寫回結果必須可被 YAML 解析器解析，實際：{updated}"
+    );
+}
+
+
+#[test]
 fn posix_ignores_serialwrap_endpoint() {
     let w = World::new().env("SERIALWRAP_ENDPOINT", "tcp://x:1");
     let r = run(w, |ctx| local_default_endpoint(ctx));

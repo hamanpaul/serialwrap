@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use sw_cli::ctx::{CliCtx, TextIo};
 use sw_pal::fakes::fs::FaultFs;
+#[allow(unused_imports)]
 pub use sw_pal::fakes::service::ServiceModelState;
 use sw_pal::fakes::{
     platform, posix_caps, real_fs, windows_caps, FakeClock, FakeProcScan, FakeProcessCtl,
@@ -393,6 +394,58 @@ impl ServiceCtl for InstallLockContenderServiceCtl {
     }
 }
 
+/// 測試用 RPC Listener 工廠替身：可過濾指定 TCP 埠是否能成功 bind。
+#[derive(Clone)]
+pub struct MockRpcListenerFactory {
+    filter: Arc<dyn Fn(u16) -> bool + Send + Sync>,
+}
+
+impl MockRpcListenerFactory {
+    pub fn allow_all() -> Self {
+        Self {
+            filter: Arc::new(|_| true),
+        }
+    }
+
+    pub fn with_filter<F: Fn(u16) -> bool + Send + Sync + 'static>(filter: F) -> Self {
+        Self {
+            filter: Arc::new(filter),
+        }
+    }
+}
+
+struct MockRpcListener;
+
+impl sw_pal::traits::RpcListener for MockRpcListener {
+    fn accept(
+        &mut self,
+        _timeout: std::time::Duration,
+    ) -> PalResult<Option<Box<dyn sw_pal::traits::RpcServerStream>>> {
+        Ok(None)
+    }
+
+    fn close(self: Box<Self>) {}
+}
+
+impl sw_pal::traits::RpcListenerFactory for MockRpcListenerFactory {
+    fn bind(
+        &self,
+        ep: &sw_pal::traits::EndpointSpec,
+        _opts: &sw_pal::traits::ListenOptions,
+    ) -> PalResult<Box<dyn sw_pal::traits::RpcListener>> {
+        match ep {
+            sw_pal::traits::EndpointSpec::Tcp { port, .. } => {
+                if (self.filter)(*port) {
+                    Ok(Box::new(MockRpcListener))
+                } else {
+                    Err(sw_pal::traits::PalError::from_errno(13))
+                }
+            }
+            sw_pal::traits::EndpointSpec::Unix { .. } => Ok(Box::new(MockRpcListener)),
+        }
+    }
+}
+
 pub struct TestEnv {
     tmp_dir: tempfile::TempDir,
     windows: bool,
@@ -423,6 +476,7 @@ pub struct TestEnv {
     groups: Vec<String>,
     /// OD-48：0.3.x daemon 替身在停止後仍存活的時間（`u64::MAX`＝永不結束）。
     legacy_linger_ns: Option<Arc<std::sync::atomic::AtomicU64>>,
+    pub rpc_listen: Option<Arc<dyn sw_pal::traits::RpcListenerFactory>>,
 }
 
 pub trait IntoSupervisionMode {
@@ -503,6 +557,11 @@ impl TestEnv {
             instance_appears: None,
             groups: Vec::new(),
             legacy_linger_ns: None,
+            rpc_listen: if windows {
+                Some(Arc::new(MockRpcListenerFactory::allow_all()))
+            } else {
+                None
+            },
         };
         for dir in [
             t.home(),
@@ -741,6 +800,11 @@ impl TestEnv {
     /// 配置 `process` 替身（spawn 記錄與 spawn 計數；未配置時 `spawn` 相關 gate 無法使用）。
     pub fn with_process(mut self) -> Self {
         self.ensure_process();
+        self
+    }
+
+    pub fn with_rpc_listen(mut self, factory: Arc<dyn sw_pal::traits::RpcListenerFactory>) -> Self {
+        self.rpc_listen = Some(factory);
         self
     }
 
@@ -2244,6 +2308,7 @@ impl TestEnv {
             .clock(self.clock.clone())
             .rpc(self.rpc.clone())
             .procs(self.procs.clone())
+            .instance_lock(sw_pal::lock::native_instance_lock())
             .caps(caps);
         if let Some(t) = &self.tunnel {
             b = b.tunnel(t.clone());
@@ -2269,6 +2334,9 @@ impl TestEnv {
         }
         if let Some(r) = &self.registry {
             b = b.registry(r.clone());
+        }
+        if let Some(l) = &self.rpc_listen {
+            b = b.rpc_listen(l.clone());
         }
         b.build()
     }
@@ -2633,6 +2701,7 @@ macro_rules! json_val {
 }
 
 pub mod serde_json {
+    #[allow(unused_imports)]
     use super::*;
     pub use sw_proto::pyjson::PyValue as Value;
 
@@ -2641,6 +2710,7 @@ pub mod serde_json {
         sw_proto::pyjson::loads(s).map_err(|e| e.to_string())
     }
 
+    #[allow(unused_imports)]
     pub use crate::json_val as json;
 }
 

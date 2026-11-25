@@ -254,3 +254,25 @@ fn uds_accept_is_bounded() {
     );
     l.close();
 }
+
+#[test]
+fn tcp_loopback_accepts_127_0_0_2() {
+    let ep = EndpointSpec::Tcp {
+        host: "127.0.0.2".into(),
+        port: 0,
+    };
+    let l = sw_pal::native()
+        .rpc_listen
+        .bind(&ep, &baseline(None))
+        .expect("bind 127.0.0.2 必須成功");
+    l.close();
+    assert!(
+        sw_pal::rpc_transport::probe_loopback_tcp_bind(
+            sw_pal::native().rpc_listen.as_ref(),
+            "127.0.0.2",
+            0,
+        ),
+        "127.0.0.2 的 bind probe 必須成功"
+    );
+}
+

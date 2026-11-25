@@ -95,9 +95,24 @@ pub fn native_loopback_tcp_bind_available(host: &str, port: u16) -> bool {
     }
 }
 
+/// 判斷 TCP 主機是否為 loopback（支援 IPv4 127.0.0.0/8、IPv6 ::1 與 localhost）。
+pub fn is_loopback_host(host: &str) -> bool {
+    let clean = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    clean.eq_ignore_ascii_case("localhost")
+        || clean
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|addr| addr.is_loopback())
+        || clean
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|addr| addr.is_loopback())
+}
+
 /// 檢查 TCP bind host 是否為 loopback；訊息逐字照 `sw_core/rpc_win.py::_parse_tcp`（Python `ValueError`）。
 pub(crate) fn check_loopback_host(host: &str) -> PalResult<()> {
-    if LOOPBACK_TCP_HOSTS.contains(&host) {
+    if is_loopback_host(host) {
         return Ok(());
     }
     Err(PalError::plain(

@@ -105,6 +105,21 @@ pub fn select_windows_setup_endpoint(
     Err(WindowsSetupEndpointError::NoAvailableDefaultPort)
 }
 
+/// 透過 `ctx.p.rpc_listen` 探測並選取可用 loopback 端點。
+pub fn resolve_and_bind_windows_setup_endpoint(
+    ctx: &CliCtx<'_>,
+    socket_path: &str,
+    builtin_default: bool,
+) -> Result<WindowsSetupEndpointSelection, WindowsSetupEndpointError> {
+    select_windows_setup_endpoint(
+        socket_path,
+        builtin_default,
+        |host, port| {
+            sw_pal::rpc_transport::probe_loopback_tcp_bind(ctx.p.rpc_listen.as_ref(), host, port)
+        },
+    )
+}
+
 /// Windows 原生 loopback bind 探測；非 Windows 的模擬環境不開啟任何主機 socket。
 pub fn windows_loopback_bind_probe(host: &str, port: u16) -> bool {
     sw_pal::rpc_transport::native_loopback_tcp_bind_available(host, port)
@@ -1967,6 +1982,7 @@ pub fn run_setup(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
                 let Some(lock) = install_lock.take() else {
                     return missing_install_lock(ctx);
                 };
+                let explicit_endpoint = ns.str("endpoint").or_else(|| ns.str("socket"));
                 let mut report = if current.is_some() {
                     let target = match resolve_target_mode(ns, ctx) {
                         Ok(target) => target,
@@ -1978,6 +1994,7 @@ pub fn run_setup(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
                         &target,
                         flag(ns, "with_sudo"),
                         flag(ns, "force"),
+                        explicit_endpoint,
                         lock,
                     )
                 } else {
@@ -2188,10 +2205,10 @@ pub fn run_setup(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
     if endpoint_resolve::rpc_backend_is_win(ctx) && !daemon_running {
         let builtin_default = target_source == "default"
             && socket_path == "tcp://127.0.0.1:48700";
-        match select_windows_setup_endpoint(
+        match resolve_and_bind_windows_setup_endpoint(
+            ctx,
             &socket_path,
             builtin_default,
-            windows_loopback_bind_probe,
         ) {
             Ok(selection) => {
                 if selection.auto_selected {

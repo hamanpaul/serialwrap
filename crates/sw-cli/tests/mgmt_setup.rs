@@ -2997,3 +2997,95 @@ fn s1m_c1_setup_verify_polls_reconciled_socket() {
     assert_eq!(t.rpc().request_count(&canonical, "health.ping"), 1);
     assert_eq!(t.rpc().request_count(&old_endpoint, "health.ping"), 1);
 }
+
+#[test]
+fn bundle_setup_uses_explicit_endpoint_over_config() {
+    let t = TestEnv::windows()
+        .with_process()
+        .with_bundle("0.5.1")
+        .with_config("socket_path: tcp://127.0.0.1:49001\n")
+        .with_rpc_refused("tcp://127.0.0.1:49003");
+    let (rc, out, err) = t.run_from_bundle(&["--endpoint", "tcp://127.0.0.1:49003", "setup"]);
+    assert_eq!(rc, 0, "bundle setup 應使用命令列指定的 49003；stdout={out} stderr={err}");
+    assert!(
+        t.rpc().connect_count("tcp://127.0.0.1:49003") >= 1,
+        "safety_check 與安裝流程必須向命令列指定的 49003 發起連線"
+    );
+    assert_eq!(
+        t.rpc().connect_count("tcp://127.0.0.1:49001"),
+        0,
+        "safety_check 不得向 config 的 49001 發起連線"
+    );
+}
+
+#[test]
+fn bundle_setup_ping_timeout_with_released_lock_proceeds() {
+    let t = TestEnv::windows()
+        .with_bundle("0.5.1")
+        .with_rpc_refused_kind("tcp://127.0.0.1:48700", sw_pal::PalErrorKind::TimedOut);
+    let (rc, out, err) = t.run_from_bundle(&["setup"]);
+    assert_eq!(rc, 0, "ping 逾時但鎖未被持有時應視為未執行並繼續安裝；stdout={out} stderr={err}");
+}
+
+#[test]
+fn bundle_setup_auto_selects_port_when_default_port_is_unavailable() {
+    let mock_listen = std::sync::Arc::new(MockRpcListenerFactory::with_filter(|port| port >= 48716));
+    let t = TestEnv::windows()
+        .with_real_service()
+        .with_process()
+        .with_bundle("0.5.1")
+        .with_rpc_listen(mock_listen);
+    let (rc, _out, err) = t.run_from_bundle(&["setup"]);
+    assert_eq!(rc, 0, "bundle setup 應成功完成；stdout={_out} stderr={err}");
+    assert!(
+        err.contains("selected port 48716"),
+        "stderr 應輸出選用 48716 的說明：{err}"
+    );
+
+    // 1. 核對 config.yaml 寫回的新埠
+    let config = std::fs::read_to_string(t.config_path()).expect("讀取 config.yaml");
+    assert!(
+        config.contains("socket_path: tcp://127.0.0.1:48716"),
+        "config.yaml 應保存選用的 socket_path：{config}"
+    );
+
+    // 2. 核對 Windows 排程工作啟動參數同步改用該埠
+    let calls = t.calls();
+    let schtasks_create = calls
+        .iter()
+        .find(|argv| argv.len() >= 4 && argv[0] == "schtasks" && argv[1] == "/Create" && argv[2] == "/XML")
+        .unwrap_or_else(|| panic!("找不到 schtasks /Create 呼叫：{calls:?}"));
+    let xml_path = &schtasks_create[3];
+    let xml_bytes = std::fs::read(xml_path)
+        .unwrap_or_else(|e| panic!("找不到 task XML {xml_path}: {e}"));
+    let xml_units = xml_bytes[2..]
+        .chunks_exact(2)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+        .collect::<Vec<_>>();
+    let xml_content = String::from_utf16(&xml_units).unwrap();
+    assert!(
+        xml_content.contains(r#"<Arguments>--socket tcp://127.0.0.1:48716</Arguments>"#),
+        "Task XML Arguments 應包含 --socket tcp://127.0.0.1:48716：{xml_content}"
+    );
+}
+
+#[test]
+fn bundle_setup_explicit_port_bind_failure_does_not_auto_select() {
+    let mock_listen = std::sync::Arc::new(MockRpcListenerFactory::with_filter(|port| port >= 48716));
+    let t = TestEnv::windows()
+        .with_process()
+        .with_bundle("0.5.1")
+        .with_real_service()
+        .with_rpc_listen(mock_listen);
+    // 明確指定無法 bind 的 48705（非預設埠或明確指定）
+    let (rc, _out, _err) = t.run_from_bundle(&["--endpoint", "tcp://127.0.0.1:48705", "setup"]);
+    assert_ne!(rc, 0, "明確指定的埠無法 bind 時不得自動換埠");
+    let config = std::fs::read_to_string(t.config_path()).unwrap_or_default();
+    assert!(
+        !config.contains("48716"),
+        "明確指定失敗時不得寫入自動選取的埠：{config}"
+    );
+}
+
+
+
