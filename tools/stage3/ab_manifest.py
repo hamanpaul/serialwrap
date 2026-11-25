@@ -1640,6 +1640,14 @@ def verify_case_coverage(
     m: AbManifest, *, repo_root: Path, base_revision: str | None = None, source_reader: Any = None,
     read_bytes: ReadBytes | None = None,
 ) -> list[str]:
+    """驗證案例分母、invariant 涵蓋與已選 destructive 案例授權。
+
+    invariant 的「已選案例是否涵蓋」與「本出口是否原有案例引用」兩側都套用相同
+    的 layer 與 manifest platform 條件。這是協調者對 plan Task 3 文字的明確化：其他
+    平台專屬案例不會在本平台執行，因此不影響本平台的涵蓋判定；本函式不另行拒收
+    不符合 layer 或 platform 的已選案例。destructive 授權則依 plan 欄位表檢查
+    case_ids 中所有能在案例目錄找到且標為 destructive 的案例，不受 layer／platform 篩選。
+    """
     root = Path(repo_root).resolve()
     if root != m.repo_root:
         raise _invalid(f"manifest repo_root mismatch: loaded {m.repo_root} supplied {root}")
@@ -1655,19 +1663,26 @@ def verify_case_coverage(
     violations.extend(f"unknown case: {case_id}" for case_id in sorted(selected - by_id.keys()))
 
     declared = case_doc.get("invariant_ids", []) if isinstance(case_doc, dict) else []
+
+    def applies_to_target(row: Mapping[str, Any]) -> bool:
+        platforms = row.get("platforms")
+        return (
+            _case_layer_matches(row, m.layer)
+            and isinstance(platforms, list)
+            and m.platform in platforms
+        )
+
     for invariant in _INVARIANTS:
         if invariant not in declared:
             continue
         covered = any(
             case_id in by_id
-            and _case_layer_matches(by_id[case_id], m.layer)
-            and isinstance(by_id[case_id].get("platforms"), list)
-            and m.platform in by_id[case_id]["platforms"]
+            and applies_to_target(by_id[case_id])
             and invariant in (by_id[case_id].get("invariants") or [])
             for case_id in selected
         )
         exists_for_layer = any(
-            isinstance(row, dict) and _case_layer_matches(row, m.layer)
+            isinstance(row, dict) and applies_to_target(row)
             and invariant in (row.get("invariants") or [])
             for row in rows
         )
@@ -1677,9 +1692,7 @@ def verify_case_coverage(
     auth = m.authorization
     for case_id in sorted(selected):
         row = by_id.get(case_id)
-        if (not isinstance(row, dict) or not _case_layer_matches(row, m.layer)
-                or not isinstance(row.get("platforms"), list) or m.platform not in row["platforms"]
-                or row.get("destructive") is not True):
+        if not isinstance(row, dict) or row.get("destructive") is not True:
             continue
         if auth is None or not auth.allow_destructive or not auth.decision_ref:
             violations.append(f"destructive case without authorization: {case_id}")

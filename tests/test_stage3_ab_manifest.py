@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import builtins
 import copy
 import contextlib
@@ -10,6 +11,7 @@ import io
 import json
 import os
 import threading
+from collections import Counter
 from dataclasses import FrozenInstanceError, is_dataclass, replace
 from pathlib import Path, PureWindowsPath
 from typing import Mapping
@@ -3197,3 +3199,383 @@ def test_required_cases_entry_reads_each_path_at_most_once(tmp_path, monkeypatch
     _assert_open_read_audit(
         [], counts, required_paths=_case_coverage_read_audit_paths(manifest, tmp_path),
     )
+
+
+def _write_case_catalog(path: Path, catalog: dict) -> None:
+    cases_path = path.parent / "tests" / "acceptance" / "cases.yaml"
+    cases_path.write_text(
+        yaml.safe_dump(catalog, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+        newline="\n",
+    )
+    manifest_doc = _read_json(path)
+    manifest_doc["case_list"]["sha256"] = fakes.sha256_file(cases_path)
+    _write_json(path, manifest_doc)
+
+
+def test_r9_selected_cross_layer_destructive_case_requires_authorization(tmp_path):
+    target = "f7-push-stop-midline-clean-restart"
+    path = fakes.write_ab_manifest(
+        tmp_path, platform="linux", layer="l1.5", stage="3", authorization=None,
+    )
+    cases, _ = _case_catalog(tmp_path)
+    row = next(case for case in cases["cases"] if case["case_id"] == target)
+    assert row["layer"].casefold() == "l2"
+    assert row["destructive"] is True
+    assert "linux" in row["platforms"]
+    doc = _read_json(path)
+    assert target not in doc["case_ids"]
+    doc["case_ids"].append(target)
+    _write_json(path, doc)
+
+    manifest = _load(path)
+    violations = _verify(manifest, tmp_path)
+
+    assert f"destructive case without authorization: {target}" in violations
+
+
+def test_r9_selected_cross_platform_destructive_case_requires_authorization(tmp_path):
+    target = "f7-push-stop-midline-clean-restart"
+    path = fakes.write_ab_manifest(
+        tmp_path, platform="windows", layer="l2", stage="2.1", authorization=None,
+    )
+    cases, _ = _case_catalog(tmp_path)
+    row = next(case for case in cases["cases"] if case["case_id"] == target)
+    assert row["layer"].casefold() == "l2"
+    assert row["destructive"] is True
+    assert "windows" not in row["platforms"]
+    doc = _read_json(path)
+    doc["case_ids"] = [target]
+    _write_json(path, doc)
+
+    manifest = _load(path)
+    violations = _verify(manifest, tmp_path)
+
+    assert f"destructive case without authorization: {target}" in violations
+
+
+def test_r9_selected_cross_layer_destructive_case_with_authorization_passes(tmp_path):
+    target = "f7-push-stop-midline-clean-restart"
+    path = fakes.write_ab_manifest(
+        tmp_path, platform="linux", layer="l1.5", stage="3", authorization=None,
+    )
+    doc = _read_json(path)
+    doc["case_ids"].append(target)
+    doc["authorization"] = {
+        "allow_destructive": True,
+        "decision_ref": "R9-APPROVED-DECISION",
+        "boards": [],
+    }
+    _write_json(path, doc)
+
+    manifest = _load(path)
+    violations = _verify(manifest, tmp_path)
+
+    assert f"destructive case without authorization: {target}" not in violations
+    assert not any(item.startswith("destructive case without authorization:") for item in violations)
+
+
+def test_r9_windows_l2_invariant_without_windows_cases_is_not_required(tmp_path):
+    invariant = "no_auto_resend"
+    path = fakes.write_ab_manifest(
+        tmp_path, platform="windows", layer="l2", stage="2.1",
+    )
+    cases_path = tmp_path / "tests" / "acceptance" / "cases.yaml"
+    catalog = yaml.safe_load(cases_path.read_bytes())
+    changed = []
+    for row in catalog["cases"]:
+        if (str(row.get("layer", "")).casefold() == "l2"
+                and invariant in (row.get("invariants") or ())):
+            row["platforms"] = ["linux"]
+            changed.append(row["case_id"])
+    assert changed
+    assert all(
+        "linux" in row["platforms"] and "windows" not in row["platforms"]
+        for row in catalog["cases"] if row.get("case_id") in changed
+    )
+    _write_case_catalog(path, catalog)
+
+    manifest = _load(path)
+    violations = _coverage(manifest, tmp_path)
+
+    assert f"invariant not covered: {invariant}" not in violations
+
+
+def test_r9_windows_l2_invariant_referenced_but_only_linux_case_selected_is_uncovered(tmp_path):
+    invariant = "no_reopen_before_handoff"
+    linux_case = "f8-legacy-attached-upgrade"
+    path = fakes.write_ab_manifest(
+        tmp_path, platform="windows", layer="l2", stage="2.1",
+    )
+    doc = _read_json(path)
+    doc["case_ids"] = [linux_case]
+    _write_json(path, doc)
+    cases, _ = _case_catalog(tmp_path)
+    assert "linux" in next(row for row in cases["cases"] if row["case_id"] == linux_case)["platforms"]
+    assert any(
+        "windows" in row.get("platforms", [])
+        and invariant in (row.get("invariants") or ())
+        and str(row.get("layer", "")).casefold() == "l2"
+        for row in cases["cases"]
+    )
+
+    manifest = _load(path)
+    violations = _coverage(manifest, tmp_path)
+
+    assert f"invariant not covered: {invariant}" in violations
+
+
+def test_r9_windows_l2_invariant_selected_for_matching_platform_is_covered(tmp_path):
+    invariant = "no_reopen_before_handoff"
+    windows_case = "f8-tty-holders-reported"
+    path = fakes.write_ab_manifest(
+        tmp_path, platform="windows", layer="l2", stage="2.1",
+    )
+    doc = _read_json(path)
+    doc["case_ids"] = [windows_case]
+    _write_json(path, doc)
+    cases, _ = _case_catalog(tmp_path)
+    row = next(row for row in cases["cases"] if row["case_id"] == windows_case)
+    assert "windows" in row["platforms"]
+    assert invariant in row["invariants"]
+
+    manifest = _load(path)
+    violations = _coverage(manifest, tmp_path)
+
+    assert f"invariant not covered: {invariant}" not in violations
+
+
+_STATIC_READ_ALLOWLIST = {
+    "ab_manifest:_InputSnapshot.read_bytes": {
+        "apis": {"snapshot-reader:call": 1},
+        "reason": "同一 resolved path 的唯一快照讀取點，負責快取原始位元組或讀取錯誤。",
+    },
+    "ab_manifest:_InputSnapshot.__init__": {
+        "apis": {"Path.read_bytes:reference": 1},
+        "reason": "只把 Path.read_bytes 設為快照的預設底層 reader；實際呼叫仍經 read_bytes 的單路徑快取。",
+    },
+    "ab_manifest:_read_bytes": {
+        "apis": {"Path.read_bytes:reference": 1},
+        "reason": "供獨立 helper 保留預設讀檔行為；load_manifest、verify_frozen 與 coverage 入口會注入快照 reader。",
+    },
+    "required_cases:_read_bytes": {
+        "apis": {"Path.read_bytes:reference": 1},
+        "reason": "供 T1 CLI 與獨立公開函式保留預設讀檔行為；T3 驗證呼叫鏈會注入同一份輸入快照。",
+    },
+    "candidate_context:load_run_context": {
+        "apis": {"Path.read_bytes:call": 1},
+        "reason": "獨立檔案 API；A/B loader 使用 load_run_context_bytes 解析快照已讀取的位元組，不呼叫此讀檔入口。",
+    },
+    "reason_codes:_load_registry": {
+        "apis": {"resource.read_text:call": 1},
+        "reason": "載入套件內固定的 HARNESS 原因碼資源供例外驗證，並非 manifest 凍結輸入。",
+    },
+}
+_STATIC_READ_API_NAMES = {
+    "open", "FileIO", "read_bytes", "read_text", "fdopen", "read",
+}
+
+
+def _static_read_inventory(
+    source: str, module: str, *, functions: set[str] | None = None,
+) -> tuple[Counter, list[str]]:
+    tree = ast.parse(source)
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    function_names: dict[ast.AST, str] = {}
+    import_aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                local = alias.asname or alias.name.split(".", 1)[0]
+                import_aliases[local] = alias.name
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                local = alias.asname or alias.name
+                import_aliases[local] = f"{node.module}.{alias.name}" if node.module else alias.name
+
+    class _FunctionOwners(ast.NodeVisitor):
+        def __init__(self):
+            self.scopes: list[str] = []
+
+        def visit_ClassDef(self, node):
+            self.scopes.append(node.name)
+            self.generic_visit(node)
+            self.scopes.pop()
+
+        def visit_FunctionDef(self, node):
+            self.scopes.append(node.name)
+            function_names[node] = ".".join(self.scopes)
+            self.generic_visit(node)
+            self.scopes.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+    _FunctionOwners().visit(tree)
+
+    def owner(node: ast.AST) -> str:
+        current = node
+        while current in parents:
+            current = parents[current]
+            if current in function_names:
+                return f"{module}:{function_names[current]}"
+        return f"{module}:<module>"
+
+    def dotted(node: ast.AST) -> str:
+        if isinstance(node, ast.Name):
+            return import_aliases.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            prefix = dotted(node.value)
+            return f"{prefix}.{node.attr}" if prefix else node.attr
+        if isinstance(node, ast.Call):
+            return dotted(node.func)
+        return ""
+
+    observations: Counter = Counter()
+    violations: list[str] = []
+    called_functions = {
+        node.func for node in ast.walk(tree) if isinstance(node, ast.Call)
+    }
+    for node in ast.walk(tree):
+        current_owner = owner(node)
+        if functions is not None:
+            function_owner = current_owner.split(":", 1)[-1]
+            if not any(
+                function_owner == name or function_owner.startswith(name + ".")
+                for name in functions
+            ):
+                continue
+        api = None
+        if isinstance(node, ast.Call):
+            name = dotted(node.func)
+            if name in {
+                "open", "builtins.open", "io.open", "io.FileIO", "os.open", "os.read",
+                "os.fdopen", "codecs.open", "mmap", "mmap.mmap",
+            }:
+                api = f"{name}:call"
+            elif isinstance(node.func, ast.Attribute) and node.func.attr in _STATIC_READ_API_NAMES:
+                if node.func.attr == "open":
+                    api = "Path.open:call"
+                elif node.func.attr in {"read_bytes", "read_text"}:
+                    receiver = dotted(node.func.value)
+                    receiver_is_path = receiver in {"Path", "pathlib.Path"} or (
+                        isinstance(node.func.value, ast.Call)
+                        and dotted(node.func.value.func) in {"Path", "pathlib.Path"}
+                    )
+                    if receiver_is_path:
+                        api = f"Path.{node.func.attr}:call"
+                    elif "resources.files" in name and node.func.attr == "read_text":
+                        api = "resource.read_text:call"
+                    elif receiver == "self._reader":
+                        api = "snapshot-reader:call"
+                    elif receiver in {"snapshot", "reader"} or (
+                        receiver == "self" and owner(node).startswith(f"{module}:_InputSnapshot.")
+                    ):
+                        # 這些名稱只代表快照方法或由入口注入的讀取器，不是直接開檔 API。
+                        api = None
+                    else:
+                        api = f"object.{node.func.attr}:call"
+                elif node.func.attr == "read_text":
+                    api = "resource.read_text:call"
+                elif node.func.attr == "read":
+                    api = "file.read:call"
+            if name == "json.load" or name.endswith(".yaml.safe_load"):
+                argument = node.args[0] if node.args else None
+                parsed_content = (
+                    isinstance(argument, ast.Constant)
+                    and isinstance(argument.value, (str, bytes))
+                ) or (
+                    isinstance(argument, ast.Call)
+                    and isinstance(argument.func, ast.Attribute)
+                    and argument.func.attr == "decode"
+                )
+                if not parsed_content:
+                    api = f"{name}:path-or-file-input"
+            if (isinstance(node.func, ast.Attribute) and node.func.attr == "_reader"
+                    and dotted(node.func) == "self._reader"):
+                api = "snapshot-reader:call"
+        elif isinstance(node, ast.Attribute) and node.attr in _STATIC_READ_API_NAMES and node not in called_functions:
+            if node.attr in {"read_bytes", "read_text"}:
+                receiver = dotted(node.value)
+                if receiver in {"Path", "pathlib.Path"}:
+                    api = f"Path.{node.attr}:reference"
+                elif receiver not in {"snapshot", "reader"}:
+                    api = f"object.{node.attr}:reference"
+            elif node.attr == "open":
+                api = "Path.open:reference"
+        if api is None:
+            continue
+        observations[(current_owner, api)] += 1
+
+    expected_by_owner: dict[str, Counter] = {}
+    for entry, definition in _STATIC_READ_ALLOWLIST.items():
+        if entry.startswith(f"{module}:"):
+            expected_by_owner[entry] = Counter(definition["apis"])
+    for (current_owner, api), count in observations.items():
+        expected = expected_by_owner.get(current_owner)
+        if expected is None or expected.get(api, 0) < count:
+            violations.append(f"{current_owner}: unapproved {api} x{count}")
+    for current_owner, expected in expected_by_owner.items():
+        actual = Counter({api: count for (site, api), count in observations.items() if site == current_owner})
+        if actual != expected:
+            violations.append(f"{current_owner}: expected {dict(expected)}, observed {dict(actual)}")
+    return observations, violations
+
+
+def _assert_static_read_policy(source: str, module: str) -> None:
+    _observations, violations = _static_read_inventory(source, module)
+    assert not violations, "\n".join(violations)
+
+
+def test_frozen_input_read_apis_are_static_allowlisted():
+    stage3_root = Path(ab_manifest.__file__).resolve().parent
+    audited = {
+        "ab_manifest": (stage3_root / "ab_manifest.py", None),
+        "required_cases": (stage3_root / "required_cases.py", None),
+        "candidate_context": (stage3_root / "candidate_context.py", None),
+        "reason_codes": (stage3_root / "reason_codes.py", {"_load_registry"}),
+        "jsonio": (stage3_root / "jsonio.py", {"dumps_compact"}),
+        "proc": (stage3_root / "proc.py", {"run_cmd"}),
+    }
+    manifest_source = audited["ab_manifest"][0].read_text(encoding="utf-8")
+    manifest_tree = ast.parse(manifest_source)
+    dependencies = set()
+    for node in ast.walk(manifest_tree):
+        if not isinstance(node, ast.ImportFrom) or not node.module:
+            continue
+        if node.module == "tools.stage3":
+            dependencies.update(alias.name for alias in node.names)
+        elif node.module.startswith("tools.stage3."):
+            dependencies.add(node.module.rsplit(".", 1)[-1])
+    assert dependencies == {
+        "candidate_context", "jsonio", "proc", "reason_codes", "required_cases",
+    }
+
+    violations = []
+    for module, (path, functions) in audited.items():
+        _observations, module_violations = _static_read_inventory(
+            path.read_text(encoding="utf-8"), module, functions=functions,
+        )
+        violations.extend(module_violations)
+    assert not violations, "\n".join(violations)
+
+
+@pytest.mark.parametrize(
+    "injected",
+    [
+        "def injected_reader(path):\n    fd = os.open(path, os.O_RDONLY)\n    return fd\n",
+        "def injected_reader(fd):\n    return os.read(fd, 1)\n",
+        "def injected_reader(path):\n    from os import open as fd_open\n    return fd_open(path, os.O_RDONLY)\n",
+        "def injected_reader(fd):\n    from os import read as fd_read\n    return fd_read(fd, 1)\n",
+    ],
+    ids=["os-open", "os-read", "os-open-alias", "os-read-alias"],
+)
+def test_static_read_audit_rejects_temporary_os_reader(tmp_path, injected):
+    source_path = Path(ab_manifest.__file__)
+    temporary_copy = tmp_path / source_path.name
+    temporary_copy.write_text(
+        source_path.read_text(encoding="utf-8") + "\n" + injected,
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AssertionError, match="unapproved os\\."):
+        _assert_static_read_policy(temporary_copy.read_text(encoding="utf-8"), "ab_manifest")
