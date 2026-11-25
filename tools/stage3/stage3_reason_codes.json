@@ -1,0 +1,117 @@
+{
+  "codes": {
+    "HARNESS_ABORTED": {
+      "action": "重新執行完整 run，不拼接中斷前後結果",
+      "meaning": "執行遭中斷，結果不完整"
+    },
+    "HARNESS_ARTIFACT_MISMATCH": {
+      "action": "確認部署內容及 manifest 後重建或重跑",
+      "meaning": "實際受測 artifact 與指定 artifact 不一致"
+    },
+    "HARNESS_AUTHORIZATION_MISSING": {
+      "action": "補上有效授權與適用 DUT 清單後再執行",
+      "meaning": "破壞性操作缺少明確授權"
+    },
+    "HARNESS_BASELINE_INVALID": {
+      "action": "重新執行基線側，不以舊報告替代",
+      "meaning": "A/B 基線側證據無效或不完整"
+    },
+    "HARNESS_CANARY_POLICY_CHANGED": {
+      "action": "還原凍結 policy 並依原始 SHA 核對",
+      "meaning": "凍結後 Canary policy 位元組已改變"
+    },
+    "HARNESS_CANARY_POLICY_INVALID": {
+      "action": "修正 policy；OD-10 配額下限不可下修",
+      "meaning": "Canary policy 違反配額下限或資料契約"
+    },
+    "HARNESS_CANARY_POLICY_NOT_FROZEN": {
+      "action": "先凍結 policy，且凍結時間不得晚於首筆計數",
+      "meaning": "Canary policy 未凍結或凍結晚於計數起點"
+    },
+    "HARNESS_CASE_SET_INCOMPLETE": {
+      "action": "補齊完整必要案例集合後重跑",
+      "meaning": "必要案例缺漏、重複或未執行"
+    },
+    "HARNESS_COMPARATOR_ERROR": {
+      "action": "檢查比較器輸入與版本後重新比較",
+      "meaning": "比較器無法可靠判定 A/B 結果"
+    },
+    "HARNESS_DRILL_INCOMPLETE": {
+      "action": "完成整套演練，不以部分步驟判定通過",
+      "meaning": "回滾演練未完成所有必要步驟"
+    },
+    "HARNESS_DRILL_PRECONDITION": {
+      "action": "滿足演練前置條件後從頭開始",
+      "meaning": "回滾演練的裝置或安裝前置條件不符"
+    },
+    "HARNESS_DRILL_STEP_FAILED": {
+      "action": "保留失敗現場並依程序復原後重新演練",
+      "meaning": "回滾演練步驟未成功"
+    },
+    "HARNESS_DUT_NOT_CLEAN": {
+      "action": "清理 DUT 與殘留程序後從乾淨狀態重跑",
+      "meaning": "DUT 或測試環境殘留前次狀態"
+    },
+    "HARNESS_EVIDENCE_DUPLICATE": {
+      "action": "檢查既有索引並避免重複追加",
+      "meaning": "同一證據識別碼已登錄"
+    },
+    "HARNESS_EVIDENCE_INGEST_INVALID": {
+      "action": "由產生工具重新產出報告後再匯入",
+      "meaning": "證據來源、身分或凍結內容核對失敗"
+    },
+    "HARNESS_EVIDENCE_UNKNOWN_ITEM": {
+      "action": "使用既有 item_id，或先完成獨立目錄裁決",
+      "meaning": "證據項目不在核准的出口目錄中"
+    },
+    "HARNESS_FAILURE_RETENTION_UNVERIFIED": {
+      "action": "先驗證失敗保留流程再執行受控測試",
+      "meaning": "失敗現場保留方式尚未驗證"
+    },
+    "HARNESS_INCIDENT_INVALID_CLOSE": {
+      "action": "補齊核實後的結案欄位再更新帳本",
+      "meaning": "事故結案欄位不完整或不合法"
+    },
+    "HARNESS_LEDGER_CORRUPT": {
+      "action": "保留原始帳本並調查，不得靜默丟棄紀錄",
+      "meaning": "Canary 帳本含無法解析或不一致的紀錄"
+    },
+    "HARNESS_MANIFEST_DRIFT": {
+      "action": "重新凍結工具或重建受測 bundle，舊證據不可沿用",
+      "meaning": "執行期 manifest 與凍結內容不同"
+    },
+    "HARNESS_MANIFEST_INVALID": {
+      "action": "修正 manifest 並重新驗證後再執行",
+      "meaning": "A/B manifest 或必要欄位不符合契約"
+    },
+    "HARNESS_OD09_BASELINE_INVALID": {
+      "action": "重新取得合格基線並重做凍結核對",
+      "meaning": "OD-09 凍結依據的基線證據無效"
+    },
+    "HARNESS_OD09_NOT_FROZEN": {
+      "action": "先完成 P2 OD-09 凍結程序並核對時序",
+      "meaning": "OD-09 延後門檻未在必要時間前凍結"
+    },
+    "HARNESS_OD09_TOO_LATE": {
+      "action": "依擁有者程序核對歷史，不得回填凍結時間",
+      "meaning": "凍結時間晚於既有候選執行起點"
+    },
+    "HARNESS_RELEASE_UNCONFIRMED": {
+      "action": "確認 holder 已離開並重新執行釋放驗證",
+      "meaning": "尚未確認前一側已釋放裝置與資源"
+    },
+    "HARNESS_RETIREMENT_INCONSISTENT": {
+      "action": "核對索引、原 RC archive 與核准 metadata",
+      "meaning": "退役核准、出口狀態或封存來源互相不一致"
+    },
+    "HARNESS_RETIREMENT_NOT_APPROVED": {
+      "action": "保持候選形狀並等待正式退役核准",
+      "meaning": "擁有者尚未核准 Python daemon 退役"
+    },
+    "HARNESS_SUITE_INFRA_ERROR": {
+      "action": "修復 runner 或環境問題後完整重跑",
+      "meaning": "測試套件未能產生可判定結果"
+    }
+  },
+  "schema_version": 1
+}

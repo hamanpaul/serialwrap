@@ -1,0 +1,1085 @@
+{
+  "$id": "https://serialwrap.local/schemas/stage3_evidence_index",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "candidate_rounds": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "candidate_round_id": {
+            "pattern": "^[0-9a-f]{32}$",
+            "type": "string"
+          },
+          "created_at": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "rc_tag": {
+            "pattern": "^v1\\.0\\.0-rc\\.[1-9][0-9]*$",
+            "type": "string"
+          },
+          "set_by": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "candidate_round_id",
+          "rc_tag",
+          "set_by",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "current_candidate_round_id": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{32}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "entries": {
+      "items": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "result": {
+                      "enum": [
+                        "PASS",
+                        "XFAIL"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "result"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "files": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "path": {
+                            "minLength": 1,
+                            "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!\\.{1,2}(?:/|$))(?!.*\\/\\.{1,2}(?:\\/|$)).+$",
+                            "type": "string"
+                          },
+                          "sha256": {
+                            "pattern": "^[0-9a-f]{64}$",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "path",
+                          "sha256"
+                        ],
+                        "type": "object"
+                      },
+                      "minItems": 1,
+                      "type": "array"
+                    }
+                  }
+                }
+              },
+              {
+                "else": {
+                  "properties": {
+                    "l1_set_sha256": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "if": {
+                  "properties": {
+                    "producer": {
+                      "const": "ingest:junit"
+                    }
+                  },
+                  "required": [
+                    "producer"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "l1_set_sha256": {
+                      "pattern": "^[0-9a-f]{64}$",
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              {
+                "else": {
+                  "properties": {
+                    "ledger_records": {
+                      "type": "null"
+                    },
+                    "ledger_through": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "if": {
+                  "properties": {
+                    "producer": {
+                      "const": "ingest:canary-report"
+                    }
+                  },
+                  "required": [
+                    "producer"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "ledger_through",
+                    "ledger_records"
+                  ]
+                }
+              },
+              {
+                "properties": {
+                  "bundle_tree_sha256": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "runtime_tree_sha256": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                }
+              }
+            ],
+            "properties": {
+              "archive_sha256": {
+                "anyOf": [
+                  {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "artifact_id": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "bundle_tree_sha256": {
+                "anyOf": [
+                  {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "candidate_round_id": {
+                "anyOf": [
+                  {
+                    "pattern": "^[0-9a-f]{32}$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "case_list_sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "contract_revision": {
+                "pattern": "^[0-9a-f]{40}$",
+                "type": "string"
+              },
+              "entry_id": {
+                "pattern": "^[0-9a-f]{20}$",
+                "type": "string"
+              },
+              "environment_id": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "exit_catalog_sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "files": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "path": {
+                      "minLength": 1,
+                      "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!\\.{1,2}(?:/|$))(?!.*\\/\\.{1,2}(?:\\/|$)).+$",
+                      "type": "string"
+                    },
+                    "sha256": {
+                      "pattern": "^[0-9a-f]{64}$",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "path",
+                    "sha256"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "item_id": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "l1_set_sha256": {
+                "anyOf": [
+                  {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "ledger_records": {
+                "anyOf": [
+                  {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "ledger_through": {
+                "anyOf": [
+                  {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "note": {
+                "type": "string"
+              },
+              "platform": {
+                "enum": [
+                  "linux",
+                  "windows"
+                ]
+              },
+              "produced_at": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "producer": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "required_cases_sha256": {
+                "anyOf": [
+                  {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "result": {
+                "enum": [
+                  "PASS",
+                  "FAIL",
+                  "XFAIL",
+                  "SKIP",
+                  "INFRA_ERROR",
+                  "INSUFFICIENT",
+                  "XPASS"
+                ]
+              },
+              "reuse_of": {
+                "anyOf": [
+                  {
+                    "pattern": "^[0-9a-f]{20}$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "runtime_digest": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "runtime_tree_sha256": {
+                "anyOf": [
+                  {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "started_at": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "tool_revision": {
+                "pattern": "^[0-9a-f]{40}$",
+                "type": "string"
+              },
+              "workload_sha256": {
+                "anyOf": [
+                  {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "xfail_cases": {
+                "items": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "type": "array",
+                "uniqueItems": true
+              }
+            },
+            "required": [
+              "entry_id",
+              "exit_catalog_sha256",
+              "candidate_round_id",
+              "archive_sha256",
+              "item_id",
+              "platform",
+              "result",
+              "artifact_id",
+              "runtime_digest",
+              "bundle_tree_sha256",
+              "runtime_tree_sha256",
+              "contract_revision",
+              "tool_revision",
+              "case_list_sha256",
+              "required_cases_sha256",
+              "l1_set_sha256",
+              "workload_sha256",
+              "environment_id",
+              "produced_at",
+              "started_at",
+              "producer",
+              "files",
+              "xfail_cases",
+              "reuse_of",
+              "note",
+              "ledger_through",
+              "ledger_records"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "artifact_id": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "candidate_round_id": {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              "context_id": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "entry_id": {
+                "pattern": "^[0-9a-f]{20}$",
+                "type": "string"
+              },
+              "failure_summary": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "item_id": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "platform": {
+                "enum": [
+                  "linux",
+                  "windows"
+                ]
+              },
+              "private_source_sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "result": {
+                "const": "FAIL"
+              },
+              "source_visibility": {
+                "const": "restricted"
+              },
+              "verified_at": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "verified_by": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "entry_id",
+              "result",
+              "source_visibility",
+              "artifact_id",
+              "platform",
+              "item_id",
+              "candidate_round_id",
+              "context_id",
+              "private_source_sha256",
+              "failure_summary",
+              "verified_by",
+              "verified_at"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "type": "array"
+    },
+    "legacy_obligations": {
+      "additionalProperties": false,
+      "properties": {
+        "resolutions": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "path": {
+                  "minLength": 1,
+                  "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!\\.{1,2}(?:/|$))(?!.*\\/\\.{1,2}(?:\\/|$)).+$",
+                  "type": "string"
+                },
+                "sha256": {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "sha256"
+              ],
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "scope": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "path": {
+                  "minLength": 1,
+                  "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!\\.{1,2}(?:/|$))(?!.*\\/\\.{1,2}(?:\\/|$)).+$",
+                  "type": "string"
+                },
+                "sha256": {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "sha256"
+              ],
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "scope",
+        "resolutions"
+      ],
+      "type": "object"
+    },
+    "schema_version": {
+      "const": 2
+    },
+    "stage_targets": {
+      "additionalProperties": false,
+      "patternProperties": {
+        "^(?:0|1A|1B|2\\.[1-4])$": {
+          "additionalProperties": {
+            "additionalProperties": false,
+            "dependentRequired": {
+              "bundle_tree_sha256": [
+                "runtime_tree_sha256"
+              ],
+              "runtime_tree_sha256": [
+                "bundle_tree_sha256"
+              ]
+            },
+            "properties": {
+              "archive_sha256": {
+                "anyOf": [
+                  {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "artifact_id": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "bundle_tree_sha256": {
+                "anyOf": [
+                  {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "candidate_round_id": {
+                "anyOf": [
+                  {
+                    "pattern": "^[0-9a-f]{32}$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "case_list_sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "contract_revision": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "exit_catalog_sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "legacy_scope_sha256": {
+                "anyOf": [
+                  {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "rc_tag": {
+                "anyOf": [
+                  {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "required_cases_lock": {
+                "anyOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "path": {
+                        "minLength": 1,
+                        "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!\\.{1,2}(?:/|$))(?!.*\\/\\.{1,2}(?:\\/|$)).+$",
+                        "type": "string"
+                      },
+                      "sha256": {
+                        "pattern": "^[0-9a-f]{64}$",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "path",
+                      "sha256"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "required_cases_sha256": {
+                "anyOf": [
+                  {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "runtime_digest": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "runtime_tree_sha256": {
+                "anyOf": [
+                  {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "set_at": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "set_by": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "tool_revision": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "artifact_id",
+              "runtime_digest",
+              "contract_revision",
+              "tool_revision",
+              "case_list_sha256",
+              "exit_catalog_sha256",
+              "required_cases_sha256",
+              "required_cases_lock",
+              "candidate_round_id",
+              "rc_tag",
+              "archive_sha256",
+              "legacy_scope_sha256",
+              "set_by",
+              "set_at"
+            ],
+            "type": "object"
+          },
+          "propertyNames": {
+            "enum": [
+              "linux",
+              "windows"
+            ]
+          },
+          "type": "object"
+        },
+        "^3$": {
+          "additionalProperties": {
+            "additionalProperties": false,
+            "dependentRequired": {
+              "bundle_tree_sha256": [
+                "runtime_tree_sha256"
+              ],
+              "runtime_tree_sha256": [
+                "bundle_tree_sha256"
+              ]
+            },
+            "properties": {
+              "archive_sha256": {
+                "anyOf": [
+                  {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "artifact_id": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "bundle_tree_sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "candidate_round_id": {
+                "anyOf": [
+                  {
+                    "pattern": "^[0-9a-f]{32}$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "case_list_sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "contract_revision": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "exit_catalog_sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "legacy_scope_sha256": {
+                "anyOf": [
+                  {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "rc_tag": {
+                "anyOf": [
+                  {
+                    "pattern": "^v1\\.0\\.0-rc\\.[1-9][0-9]*$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "required_cases_lock": {
+                "anyOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "path": {
+                        "minLength": 1,
+                        "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!\\.{1,2}(?:/|$))(?!.*\\/\\.{1,2}(?:\\/|$)).+$",
+                        "type": "string"
+                      },
+                      "sha256": {
+                        "pattern": "^[0-9a-f]{64}$",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "path",
+                      "sha256"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "required_cases_sha256": {
+                "anyOf": [
+                  {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "runtime_digest": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "runtime_tree_sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "set_at": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "set_by": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "tool_revision": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "artifact_id",
+              "runtime_digest",
+              "contract_revision",
+              "tool_revision",
+              "case_list_sha256",
+              "exit_catalog_sha256",
+              "required_cases_sha256",
+              "required_cases_lock",
+              "candidate_round_id",
+              "rc_tag",
+              "archive_sha256",
+              "legacy_scope_sha256",
+              "set_by",
+              "set_at",
+              "bundle_tree_sha256",
+              "runtime_tree_sha256"
+            ],
+            "type": "object"
+          },
+          "propertyNames": {
+            "enum": [
+              "linux",
+              "windows"
+            ]
+          },
+          "type": "object"
+        }
+      },
+      "propertyNames": {
+        "enum": [
+          "0",
+          "1A",
+          "1B",
+          "2.1",
+          "2.2",
+          "2.3",
+          "2.4",
+          "3"
+        ]
+      },
+      "type": "object"
+    },
+    "target_history": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "archive_sha256": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "artifact_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "bundle_tree_sha256": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "candidate_round_id": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "case_list_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "contract_revision": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "exit_catalog_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "legacy_scope_sha256": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "platform": {
+            "enum": [
+              "linux",
+              "windows"
+            ]
+          },
+          "rc_tag": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "required_cases_lock": {
+            "anyOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "path": {
+                    "minLength": 1,
+                    "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!\\.{1,2}(?:/|$))(?!.*\\/\\.{1,2}(?:\\/|$)).+$",
+                    "type": "string"
+                  },
+                  "sha256": {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path",
+                  "sha256"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "required_cases_sha256": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "runtime_digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "runtime_tree_sha256": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "set_at": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "set_by": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "stage": {
+            "enum": [
+              "0",
+              "1A",
+              "1B",
+              "2.1",
+              "2.2",
+              "2.3",
+              "2.4",
+              "3"
+            ]
+          },
+          "tool_revision": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "artifact_id",
+          "contract_revision",
+          "tool_revision",
+          "case_list_sha256",
+          "exit_catalog_sha256",
+          "set_by",
+          "set_at",
+          "stage",
+          "platform"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "candidate_rounds",
+    "current_candidate_round_id",
+    "entries",
+    "legacy_obligations",
+    "schema_version",
+    "stage_targets",
+    "target_history"
+  ],
+  "title": "Stage 0～3 公開證據索引",
+  "type": "object"
+}

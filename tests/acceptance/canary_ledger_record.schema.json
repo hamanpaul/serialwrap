@@ -1,0 +1,1334 @@
+{
+  "$comment": "每個分支 additionalProperties=false；以 type const 互斥。",
+  "$id": "https://serialwrap.local/schemas/canary_ledger_record",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "artifact_check": {
+                "const": "verified"
+              }
+            },
+            "required": [
+              "artifact_check"
+            ]
+          },
+          "then": {
+            "properties": {
+              "bundle_tree_sha256": {
+                "type": "string"
+              },
+              "runtime_tree_sha256": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "archive_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "artifact_check": {
+          "enum": [
+            "verified",
+            "cli_mismatch",
+            "daemon_mismatch",
+            "version_mismatch",
+            "tree_invalid",
+            "unresolved"
+          ]
+        },
+        "artifact_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "boot_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "bundle_tree_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "bundle_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "candidate_round_id": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{32}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "context_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "daemon_exe_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "daemon_implementation": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "daemon_ok": {
+          "type": "boolean"
+        },
+        "daemon_pid": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "daemon_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "error": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "host_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "multi_open": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "platform": {
+          "enum": [
+            "linux",
+            "windows"
+          ]
+        },
+        "record_id": {
+          "pattern": "^[0-9a-f]{20}$",
+          "type": "string"
+        },
+        "runtime_tree_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sessions": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "boot_quiet_remaining_s": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "bridge_generation": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "com": {
+                "type": "string"
+              },
+              "command_capable": {
+                "anyOf": [
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "last_error": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "last_ready_at": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "platform": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "profile": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "ready_reconfirm_failed": {
+                "anyOf": [
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "ready_reconfirm_pending": {
+                "anyOf": [
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "state": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "com",
+              "state",
+              "bridge_generation",
+              "boot_quiet_remaining_s",
+              "ready_reconfirm_pending",
+              "ready_reconfirm_failed",
+              "command_capable",
+              "platform",
+              "profile",
+              "last_error",
+              "last_ready_at"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "t_wall": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "snapshot"
+        },
+        "wal_dir": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "wal_healthy": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "host_id",
+        "platform",
+        "record_id",
+        "t_wall",
+        "boot_id",
+        "daemon_ok",
+        "daemon_pid",
+        "daemon_version",
+        "daemon_exe_sha256",
+        "artifact_id",
+        "artifact_check",
+        "bundle_tree_sha256",
+        "runtime_tree_sha256",
+        "bundle_version",
+        "daemon_implementation",
+        "wal_dir",
+        "wal_healthy",
+        "multi_open",
+        "sessions",
+        "error",
+        "candidate_round_id",
+        "archive_sha256",
+        "context_sha256"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "archive_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "candidate_round_id": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{32}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cmd_id": {
+          "pattern": "^[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "com": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "context_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "host_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "platform": {
+          "enum": [
+            "linux",
+            "windows"
+          ]
+        },
+        "record_id": {
+          "pattern": "^[0-9a-f]{20}$",
+          "type": "string"
+        },
+        "seq": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source": {
+          "type": "string"
+        },
+        "type": {
+          "const": "submit"
+        },
+        "wal_file": {
+          "type": "string"
+        },
+        "wall_ts": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "host_id",
+        "platform",
+        "record_id",
+        "cmd_id",
+        "com",
+        "source",
+        "wall_ts",
+        "seq",
+        "wal_file",
+        "candidate_round_id",
+        "archive_sha256",
+        "context_sha256"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "archive_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "candidate_round_id": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{32}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cmd_id": {
+          "pattern": "^[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "context_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "error_code": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "host_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "platform": {
+          "enum": [
+            "linux",
+            "windows"
+          ]
+        },
+        "reason": {
+          "enum": [
+            "CMD_NOT_FOUND",
+            "STALE_NON_TERMINAL"
+          ]
+        },
+        "record_id": {
+          "pattern": "^[0-9a-f]{20}$",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "done",
+            "error",
+            "timeout",
+            "unknown"
+          ]
+        },
+        "t_wall": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "submit_result"
+        }
+      },
+      "required": [
+        "type",
+        "host_id",
+        "platform",
+        "record_id",
+        "cmd_id",
+        "status",
+        "error_code",
+        "t_wall",
+        "candidate_round_id",
+        "archive_sha256",
+        "context_sha256"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "archive_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "candidate_round_id": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{32}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "com": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "context_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "detail": {
+          "type": "object"
+        },
+        "host_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "human_tx",
+            "recover_tx",
+            "flash_tx",
+            "wal_loss",
+            "wal_recreated",
+            "credentials_unresolved",
+            "transport_stall",
+            "unauthorized_tx",
+            "resend_suspect",
+            "human_replay_suspect"
+          ]
+        },
+        "platform": {
+          "enum": [
+            "linux",
+            "windows"
+          ]
+        },
+        "record_id": {
+          "pattern": "^[0-9a-f]{20}$",
+          "type": "string"
+        },
+        "seq": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source": {
+          "type": "string"
+        },
+        "type": {
+          "const": "wal_signal"
+        },
+        "wall_ts": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "host_id",
+        "platform",
+        "record_id",
+        "kind",
+        "com",
+        "wall_ts",
+        "seq",
+        "source",
+        "detail",
+        "candidate_round_id",
+        "archive_sha256",
+        "context_sha256"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "cmd_id"
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "cmd_id"
+            ]
+          },
+          "then": {
+            "required": [
+              "kind"
+            ]
+          }
+        }
+      ],
+      "properties": {
+        "archive_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "candidate_round_id": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{32}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cmd_id": {
+          "pattern": "^[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "context_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "detail": {
+          "type": "string"
+        },
+        "host_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "const": "result_evicted"
+        },
+        "platform": {
+          "enum": [
+            "linux",
+            "windows"
+          ]
+        },
+        "record_id": {
+          "pattern": "^[0-9a-f]{20}$",
+          "type": "string"
+        },
+        "t_wall": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "harvest_anomaly"
+        }
+      },
+      "required": [
+        "type",
+        "host_id",
+        "platform",
+        "record_id",
+        "detail",
+        "t_wall",
+        "candidate_round_id",
+        "archive_sha256",
+        "context_sha256"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "archive_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "author": {
+          "type": "string"
+        },
+        "candidate_round_id": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{32}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "context_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "from": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "host_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "planned_restart",
+            "planned_downtime"
+          ]
+        },
+        "platform": {
+          "enum": [
+            "linux",
+            "windows"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "record_id": {
+          "pattern": "^[0-9a-f]{20}$",
+          "type": "string"
+        },
+        "t_wall": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "to": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "note"
+        }
+      },
+      "required": [
+        "type",
+        "host_id",
+        "platform",
+        "record_id",
+        "kind",
+        "from",
+        "to",
+        "reason",
+        "author",
+        "t_wall",
+        "candidate_round_id",
+        "archive_sha256",
+        "context_sha256"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "archive_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "artifact_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "candidate_round_id": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{32}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "context_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "detected_by": {
+          "const": "manual"
+        },
+        "evidence": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "host_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "incident_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "opened_at": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "platform": {
+          "enum": [
+            "linux",
+            "windows"
+          ]
+        },
+        "record_id": {
+          "pattern": "^[0-9a-f]{20}$",
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "type": {
+          "const": "incident_open"
+        }
+      },
+      "required": [
+        "type",
+        "host_id",
+        "platform",
+        "record_id",
+        "incident_id",
+        "kind",
+        "artifact_id",
+        "opened_at",
+        "detected_by",
+        "summary",
+        "evidence",
+        "candidate_round_id",
+        "archive_sha256",
+        "context_sha256"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "archive_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "candidate_round_id": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{32}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "closed_at": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "closed_by": {
+          "type": "string"
+        },
+        "context_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "host_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "incident_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "issue_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "note": {
+          "type": "string"
+        },
+        "platform": {
+          "enum": [
+            "linux",
+            "windows"
+          ]
+        },
+        "record_id": {
+          "pattern": "^[0-9a-f]{20}$",
+          "type": "string"
+        },
+        "resolution": {
+          "type": "string"
+        },
+        "type": {
+          "const": "incident_close"
+        }
+      },
+      "required": [
+        "type",
+        "host_id",
+        "platform",
+        "record_id",
+        "incident_id",
+        "resolution",
+        "issue_ref",
+        "note",
+        "closed_by",
+        "closed_at",
+        "candidate_round_id",
+        "archive_sha256",
+        "context_sha256"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "approved_at": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "approved_by": {
+          "type": "string"
+        },
+        "archive_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "candidate_round_id": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{32}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "context_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "counters": {
+          "items": {
+            "enum": [
+              "submits",
+              "cycles"
+            ]
+          },
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "decision_ref": {
+          "type": "string"
+        },
+        "from_artifact": {
+          "type": "string"
+        },
+        "from_bundle_tree_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "from_runtime_tree_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "host_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "platform": {
+          "enum": [
+            "linux",
+            "windows"
+          ]
+        },
+        "record_id": {
+          "pattern": "^[0-9a-f]{20}$",
+          "type": "string"
+        },
+        "to_artifact": {
+          "type": "string"
+        },
+        "type": {
+          "const": "carryover"
+        }
+      },
+      "required": [
+        "type",
+        "host_id",
+        "platform",
+        "record_id",
+        "from_artifact",
+        "to_artifact",
+        "counters",
+        "approved_by",
+        "decision_ref",
+        "approved_at",
+        "candidate_round_id",
+        "archive_sha256",
+        "context_sha256"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "archive_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "candidate_round_id": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{32}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "collector_revision": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "context_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "decision_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "frozen_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "host_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "platform": {
+          "enum": [
+            "linux",
+            "windows"
+          ]
+        },
+        "policy_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "record_id": {
+          "pattern": "^[0-9a-f]{20}$",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "frozen"
+          ]
+        },
+        "t_wall": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "policy_ref"
+        }
+      },
+      "required": [
+        "type",
+        "host_id",
+        "platform",
+        "record_id",
+        "policy_sha256",
+        "status",
+        "frozen_at",
+        "decision_ref",
+        "collector_revision",
+        "t_wall",
+        "candidate_round_id",
+        "archive_sha256",
+        "context_sha256"
+      ],
+      "type": "object"
+    }
+  ],
+  "properties": {
+    "type": {
+      "enum": [
+        "snapshot",
+        "submit",
+        "submit_result",
+        "wal_signal",
+        "harvest_anomaly",
+        "note",
+        "incident_open",
+        "incident_close",
+        "carryover",
+        "policy_ref"
+      ]
+    }
+  },
+  "required": [
+    "type",
+    "record_id",
+    "host_id",
+    "platform"
+  ],
+  "title": "Canary 帳本紀錄（以 type 區分）",
+  "type": "object"
+}
