@@ -93,7 +93,9 @@ def test_make_bundle_hashes_real(tmp_path):
 
     py = fakes.make_bundle(tmp_path / "py", daemon_impl="python")
     py_manifest = json.loads((py / "release-manifest.json").read_text(encoding="utf-8"))
-    assert py_manifest["components"]["daemon"]["package"]["tree_sha256"] == fakes.tree_sha256(py / "py")
+    expected_package_tree = _independent_package_tree_sha256(py / "py")
+    assert fakes.tree_sha256(py / "py") == _independent_tree_sha256(py / "py")
+    assert py_manifest["components"]["daemon"]["package"]["tree_sha256"] == expected_package_tree
 
 
 def test_make_bundle_stage3_marker(tmp_path):
@@ -279,6 +281,25 @@ def _independent_tree_sha256(root: Path) -> str:
     return hashlib.sha256("".join(rows).encode("utf-8")).hexdigest()
 
 
+def _independent_package_tree_sha256(py_dir: Path) -> str:
+    """依 release_manifest.package_tree_sha256 契約獨立重算 sw_core 子樹。"""
+    package_root = Path(py_dir) / "sw_core"
+    rows = []
+    paths = sorted(
+        package_root.rglob("*"),
+        key=lambda item: ("sw_core/" + item.relative_to(package_root).as_posix()).encode("utf-8"),
+    )
+    for path in paths:
+        relative = path.relative_to(package_root)
+        if "__pycache__" in relative.parts or path.suffix == ".pyc":
+            continue
+        assert not path.is_symlink(), relative.as_posix()
+        if path.is_file():
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            rows.append(f"sw_core/{relative.as_posix()}\0{digest}\n")
+    return hashlib.sha256("".join(rows).encode("utf-8")).hexdigest()
+
+
 def test_make_bundle_python_delegate_tree_is_real_before_retirement(tmp_path):
     fakes = _fakes()
     bundle = fakes.make_bundle(tmp_path / "rust-stage-24", stage="2.4", daemon_impl="rust")
@@ -287,12 +308,51 @@ def test_make_bundle_python_delegate_tree_is_real_before_retirement(tmp_path):
     runtime = bundle / "py"
     assert runtime.is_dir()
     assert (bundle / delegate["entry"][0]).is_file()
-    assert delegate["tree_sha256"] == _independent_tree_sha256(runtime)
+    assert delegate["tree_sha256"] == _independent_package_tree_sha256(runtime)
 
     retired = fakes.make_bundle(tmp_path / "rust-stage-3", stage="3", daemon_impl="rust")
     retired_manifest = json.loads((retired / "release-manifest.json").read_text(encoding="utf-8"))
     assert retired_manifest["retirement"] == {"python_daemon": "removed"}
     assert "python_cli_delegate" not in retired_manifest["components"]
+
+
+def test_python_package_tree_hash_covers_only_sw_core(tmp_path):
+    fakes = _fakes()
+    bundle = fakes.make_bundle(tmp_path / "python-package", stage="2.4", daemon_impl="python")
+    manifest = json.loads((bundle / "release-manifest.json").read_text(encoding="utf-8"))
+    runtime = bundle / "py"
+    interpreter = runtime / "bin" / "python3"
+    daemon_entry = runtime / "serialwrapd.py"
+    package = runtime / "sw_core"
+    assert interpreter.is_file()
+    assert daemon_entry.is_file()
+    assert package.is_dir()
+    assert manifest["components"]["daemon"]["entry"] == [
+        "py/bin/python3", "-I", "-B", "py/serialwrapd.py"
+    ]
+    assert manifest["components"]["daemon"]["runtime"]["path"] == "py/bin/python3"
+
+    expected_before = _independent_package_tree_sha256(runtime)
+    daemon_tree = manifest["components"]["daemon"]["package"]["tree_sha256"]
+    delegate_tree = manifest["components"]["python_cli_delegate"]["tree_sha256"]
+    assert daemon_tree == delegate_tree == expected_before
+    assert fakes.package_tree_sha256(runtime) == expected_before
+
+    package_file = package / "cli.py"
+    package_file.write_text("# sw_core tree changed\n", encoding="utf-8", newline="\n")
+    expected_after_package_change = _independent_package_tree_sha256(runtime)
+    assert expected_after_package_change != expected_before
+    assert fakes.package_tree_sha256(runtime) == expected_after_package_change
+    assert expected_after_package_change != daemon_tree
+    assert expected_after_package_change != delegate_tree
+
+    interpreter.write_bytes(b"changed interpreter bytes\n")
+    runtime_sha_before = manifest["components"]["daemon"]["runtime"]["sha256"]
+    assert hashlib.sha256(interpreter.read_bytes()).hexdigest() != runtime_sha_before
+    assert fakes.package_tree_sha256(runtime) == expected_after_package_change
+
+    daemon_entry.write_text("# changed daemon entry\n", encoding="utf-8", newline="\n")
+    assert fakes.package_tree_sha256(runtime) == expected_after_package_change
 
 
 @pytest.mark.parametrize("stage", ["1A", "1B", "2.1", "2.2", "2.3", "2.4", "3"])
@@ -345,6 +405,53 @@ def test_write_ab_manifest_uses_stage_case_lock_and_side_identities(tmp_path, st
         assert a_components["cli"]["sha256"] == b_components["cli"]["sha256"]
         assert a_components["daemon"]["implementation"] == "python"
         assert b_components["daemon"]["implementation"] == "rust"
+        if stage == "3":
+            assert release_manifests[0]["stage"] == "2.4"
+            assert release_manifests[1]["stage"] == "3"
+            assert release_manifests[0]["bundle_version"] == release_manifests[1]["bundle_version"] == "1.0.0"
+            assert release_manifests[1]["retirement"] == {"python_daemon": "removed"}
+            assert "python_cli_delegate" not in b_components
+            a_cli_path = repo / manifest["sides"][0]["bundle_dir"] / a_components["cli"]["path"]
+            b_cli_path = repo / manifest["sides"][1]["bundle_dir"] / b_components["cli"]["path"]
+            assert a_cli_path.read_bytes() == b_cli_path.read_bytes()
+
+
+def test_stage3_pair_release_manifests_follow_pairing_and_retirement_rules(tmp_path):
+    """A 配對包通過現行 release manifest schema；B 依 Task 16 退役規則檢查結構。
+
+    現行 contracts/release_manifest.schema.json 還沒有 Stage 3 退役分支（由 Task 16 新增），
+    仍強制 python_cli_delegate 與 Python daemon 欄位，因此本 Task 不以該 schema 驗 B，
+    也不預先堆放 Task 16 的紅燈；B 的 schema 驗證隨 Task 16 加入。
+    """
+    import jsonschema
+
+    fakes = _fakes()
+    manifest_path = fakes.write_ab_manifest(tmp_path / "stage3-schema-pair", stage="3", platform="linux")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    repo = manifest_path.parent
+    schema = json.loads((REPO_ROOT / "contracts/release_manifest.schema.json").read_text(encoding="utf-8"))
+    validator = jsonschema.Draft202012Validator(schema)
+    release_manifests = [
+        json.loads((repo / side["release_manifest"]["path"]).read_text(encoding="utf-8"))
+        for side in manifest["sides"]
+    ]
+    a_manifest, b_manifest = release_manifests
+    assert a_manifest["stage"] == "2.4"
+    assert a_manifest["bundle_version"] == b_manifest["bundle_version"] == "1.0.0"
+    assert list(validator.iter_errors(a_manifest)) == []
+
+    assert a_manifest["components"]["daemon"]["implementation"] == "python"
+    assert b_manifest["stage"] == "3"
+    assert b_manifest["retirement"]["python_daemon"] == "removed"
+    assert b_manifest["components"]["daemon"]["implementation"] == "rust"
+    assert "python_cli_delegate" not in b_manifest["components"]
+
+    a_cli = a_manifest["components"]["cli"]
+    b_cli = b_manifest["components"]["cli"]
+    a_cli_path = repo / manifest["sides"][0]["bundle_dir"] / a_cli["path"]
+    b_cli_path = repo / manifest["sides"][1]["bundle_dir"] / b_cli["path"]
+    assert a_cli["sha256"] == b_cli["sha256"]
+    assert a_cli_path.read_bytes() == b_cli_path.read_bytes()
 
 
 def test_write_ab_manifest_cli_sha_override_changes_only_b_artifact(tmp_path):
@@ -431,6 +538,40 @@ def test_recording_runner_script_uses_exact_command_key():
         runner(["git", "rev-parse", "HEAD:contracts"])
 
 
+def test_recording_runner_uses_only_declared_value_flags_and_cli_program(tmp_path):
+    fakes = _fakes()
+    runner = fakes.RecordingRunner(
+        script={
+            "git:status": [{"rc": 1, "stdout": "listed flag"}],
+            "git:30 status": [{"rc": 2, "stdout": "timeout remains positional"}],
+            "git:2 status": [{"rc": 3, "stdout": "retries remains positional"}],
+            "cli:daemon status": [{"rc": 5, "stdout": "serialwrap.exe is cli"}],
+            "other:daemon status": [{"rc": 4, "stdout": "serialwrapd is other"}],
+        }
+    )
+
+    listed_flag = runner(["git", "--selector", "COM4", "status"])
+    timeout_flag = runner(["git", "--timeout", "30", "status"])
+    retries_flag = runner(["git", "--retries", "2", "status"])
+    cli_program = runner([r"C:\tools\serialwrap.exe", "daemon", "status"])
+    daemon_program = runner(["serialwrapd", "daemon", "status"])
+
+    assert [(result.rc, result.stdout) for result in (listed_flag, timeout_flag, retries_flag, cli_program, daemon_program)] == [
+        (1, "listed flag"),
+        (2, "timeout remains positional"),
+        (3, "retries remains positional"),
+        (5, "serialwrap.exe is cli"),
+        (4, "serialwrapd is other"),
+    ]
+    assert [(call["kind"], call["sub"]) for call in runner.calls] == [
+        ("git", "status"),
+        ("git", "30 status"),
+        ("git", "2 status"),
+        ("cli", "daemon status"),
+        ("other", "daemon status"),
+    ]
+
+
 def test_rc_archive_is_reproducible(tmp_path):
     fakes = _fakes()
     bundle = fakes.make_bundle(tmp_path / "bundle")
@@ -509,7 +650,7 @@ def test_rc_archive_layout_matches_bundle_bytes_and_fixed_metadata(tmp_path, pla
                 assert member.isfile()
                 stream = tar.extractfile(member)
                 assert stream is not None and stream.read() == data
-                expected_mode = 0o755 if name.startswith("bin/") or name in {"py/python", "py/python.exe"} else 0o644
+                expected_mode = 0o755 if name.startswith("bin/") or name == "py/bin/python3" else 0o644
                 assert member.mode == expected_mode
             for name in bundle_dirs:
                 assert by_name[f"{version_root}/{name}/"].isdir()

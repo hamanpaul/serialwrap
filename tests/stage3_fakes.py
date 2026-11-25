@@ -226,6 +226,26 @@ def tree_sha256(root: Path) -> str:
     return hashlib.sha256("".join(rows).encode("utf-8")).hexdigest()
 
 
+def package_tree_sha256(py_dir: Path) -> str:
+    """依 release manifest 契約計算 py/sw_core 子樹，relpath 以 sw_core/ 起頭。"""
+    root = Path(py_dir)
+    package_root = root / "sw_core"
+    rows: list[str] = []
+    paths = sorted(
+        package_root.rglob("*"),
+        key=lambda item: ("sw_core/" + item.relative_to(package_root).as_posix()).encode("utf-8"),
+    )
+    for path in paths:
+        relative = path.relative_to(package_root)
+        if "__pycache__" in relative.parts or path.suffix == ".pyc":
+            continue
+        if path.is_symlink():
+            raise ValueError(f"不接受 Python 套件樹中的 symlink：sw_core/{relative.as_posix()}")
+        if path.is_file():
+            rows.append(f"sw_core/{relative.as_posix()}\0{sha256_file(path)}\n")
+    return hashlib.sha256("".join(rows).encode("utf-8")).hexdigest()
+
+
 def _write_json(path: Path, value: Any) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(jsonio.dumps_report(value), encoding="utf-8", newline="\n")
@@ -267,8 +287,13 @@ def make_bundle(
     include_retirement = stage == "3" if retirement_marker is None else retirement_marker
     runtime = root / "py"
     if daemon_impl == "python" or not include_retirement:
+        runtime_bin = runtime / "bin"
+        runtime_bin.mkdir(parents=True, exist_ok=True)
+        python_runtime = runtime_bin / "python3"
         (runtime / "sw_core").mkdir(parents=True, exist_ok=True)
-        (runtime / "python").write_text("#!/usr/bin/env python3\n", encoding="utf-8", newline="\n")
+        python_runtime.write_text("#!/usr/bin/env python3\n", encoding="utf-8", newline="\n")
+        if os.name != "nt":
+            python_runtime.chmod(0o755)
         (runtime / "serialwrapd.py").write_text("# 測試用 Python daemon\n", encoding="utf-8", newline="\n")
         (runtime / "sw_core" / "__init__.py").write_text("\"\"\"測試用套件。\"\"\"\n", encoding="utf-8", newline="\n")
         (runtime / "sw_core" / "cli.py").write_text("# 測試用 Python CLI\n", encoding="utf-8", newline="\n")
@@ -293,13 +318,17 @@ def make_bundle(
     if daemon_impl == "python":
         daemon_component.update(
             {
-                "entry": ["py/python", "-I", "-B", "py/serialwrapd.py"],
-                "runtime": {"path": "py/python", "python_version": "3.12.0", "sha256": sha256_file(runtime / "python")},
+                "entry": ["py/bin/python3", "-I", "-B", "py/serialwrapd.py"],
+                "runtime": {
+                    "path": "py/bin/python3",
+                    "python_version": "3.12.0",
+                    "sha256": sha256_file(runtime / "bin" / "python3"),
+                },
                 "package": {
                     "name": "serialwrap",
                     "version": version,
                     "wheel_sha256": sha256_text("fixture wheel"),
-                    "tree_sha256": tree_sha256(runtime),
+                    "tree_sha256": package_tree_sha256(runtime),
                 },
             }
         )
@@ -321,8 +350,8 @@ def make_bundle(
     }
     if not include_retirement:
         components["python_cli_delegate"] = {
-            "entry": ["py/python", "-I", "-B", "-m", "sw_core.cli"],
-            "tree_sha256": tree_sha256(runtime),
+            "entry": ["py/bin/python3", "-I", "-B", "-m", "sw_core.cli"],
+            "tree_sha256": package_tree_sha256(runtime),
         }
 
     manifest: dict[str, Any] = {
@@ -358,7 +387,7 @@ def _archive_file_mode(bundle: Path, path: Path, platform_name: str) -> int:
     if platform_name == "windows":
         return 0o644
     relative = path.relative_to(bundle).as_posix()
-    return 0o755 if relative.startswith("bin/") or relative in {"py/python", "py/python.exe"} else 0o644
+    return 0o755 if relative.startswith("bin/") or relative == "py/bin/python3" else 0o644
 
 
 def _archive_entries(bundle: Path) -> tuple[str, str, list[tuple[str, Path | None, str, bytes | None]]]:
@@ -724,10 +753,10 @@ def write_ab_manifest(
     else:
         side_specs = (("A", "baseline", "rust", "python"), ("B", "candidate", "rust", "rust"))
     for label, role, cli_impl, daemon_impl in side_specs:
-        bundle = make_bundle(root / "bundles" / label, version=bundle_version, stage=stage,
+        side_stage = "2.4" if stage == "3" and label == "A" else stage
+        bundle = make_bundle(root / "bundles" / label, version=bundle_version, stage=side_stage,
                              cli_impl=cli_impl,
                              daemon_impl=daemon_impl,
-                             retirement_marker=(False if stage == "3" and label == "A" else None),
                              target=("x86_64-pc-windows-gnu" if platform == "windows" else "x86_64-unknown-linux-gnu"))
         if label == "B" and cli_sha_override is not None:
             release_manifest_path = bundle / "release-manifest.json"
@@ -968,7 +997,7 @@ class RecordingRunner:
         "--selector", "--cmd", "--cmd-id", "--cmd-timeout", "--instance", "--report-dir",
         "--seed", "--side", "--round", "--source", "--reason", "--a", "--b", "--out",
         "--tier", "--mode", "--dut-mode", "--selftest-report", "--endpoint", "--socket",
-        "--case-dir", "--acceptance", "--platform", "--timeout", "--retries", "-C",
+        "--case-dir", "--acceptance", "--platform", "-C",
     }
 
     def __init__(self, script: Mapping[str, list[dict[str, Any]]] | None = None) -> None:
@@ -1001,7 +1030,7 @@ class RecordingRunner:
             index += 2
         else:
             base = program.removesuffix(".exe")
-            if base in {"serialwrap", "serialwrapd"}:
+            if base == "serialwrap":
                 kind = "cli"
             elif base in {"schtasks", "systemctl", "git", "docker", "testpilot"}:
                 kind = base
