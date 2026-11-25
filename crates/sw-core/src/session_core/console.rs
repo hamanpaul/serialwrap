@@ -721,6 +721,7 @@ impl SessionCore {
             // 必關閉此 client；不登記、不授 owner，並要求 hub 關閉（hub 處理 close-all 時多半已關，重送為 no-op）。
             return vec![Effect::ConsoleClose { client_id }];
         }
+        self.clear_tcp_mirror_revocations_for_client(&client_id);
         self.human.next_lifetime = self.human.next_lifetime.max(lifetime);
         self.human.consoles.insert(
             client_id.clone(),
@@ -748,6 +749,7 @@ impl SessionCore {
 
     /// `DataEvent::ConsoleDisconnected`（`_drop_console_client`，#136；與同 client 輸入同一條 data lane）。
     pub(super) fn console_disconnected(&mut self, client_id: &str, lifetime: u64) -> Vec<Effect> {
+        self.clear_tcp_mirror_revocation_for_client_lifetime(client_id, lifetime);
         if !self.human.is_live(client_id, lifetime) {
             return Vec::new();
         }

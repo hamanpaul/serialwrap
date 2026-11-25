@@ -10,9 +10,12 @@ use std::time::Duration;
 use support::*;
 use sw_core::human_console::ownership::InputRoute;
 use sw_core::human_console::ConsoleTransportKind;
-use sw_core::session_core::Effect;
+use sw_core::mailbox::ControlEvent;
+use sw_core::op_runner::OpOutcome;
+use sw_core::session_core::{Effect, SessionRequest};
 use sw_core::tx_writer::TxClass;
-use sw_proto::pyjson::PyValue;
+use sw_pal::traits::TxOutcome;
+use sw_proto::{pydict, pyjson::PyValue};
 
 /// cc1746d8 的 TCP accept 不建立 lease；用一般 human lease 配出與 HEAD 相同的
 /// agent soft-preempt 前置。HEAD 已有 TCP mirror 時保留該 mirror，差異只屬套件層簿記。
@@ -186,10 +189,107 @@ fn handoff_freezes_before_close_eof_and_replacement_accept() {
     trace_common("handoff-b-input-under-freeze", &h);
 }
 
+fn start_self_test(h: &mut CoreHarness) -> sw_core::drain::OpId {
+    let (_reply, effects) = h.rpc_deferred(SessionRequest::SelfTest {
+        timeout_s: 2.0,
+        strict_human_lock: false,
+    });
+    effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp {
+                grant,
+                spec: sw_core::op_runner::OpSpec::SelfTestProbe { .. },
+            } => Some(grant.op_id),
+            _ => None,
+        })
+        .expect("非 strict self-test 應啟動 probe")
+}
+
+fn finish_self_test(h: &mut CoreHarness, op_id: sw_core::drain::OpId) -> Vec<Effect> {
+    h.feed(ControlEvent::OpFinished {
+        op_id,
+        epoch: h.epoch(),
+        outcome: OpOutcome::SelfTest(pydict! {
+            "probe_ok" => true,
+            "rx_bytes_last_10s" => 0,
+        }),
+        after_rx_seq: None,
+    })
+}
+
+fn explicit_close_during_self_test() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.connect_stream_console("a", ConsoleTransportKind::TcpTelnet);
+    align_human_lease_precondition(&mut h);
+    h.set_auto_complete_human_tx(false);
+    let id = h.core.active_lease().expect("共同 human lease").interactive_id.clone();
+    let probe = start_self_test(&mut h);
+    let deferred = h.input("a", b"explicit-close-deferred");
+    assert_no_start_op(&deferred);
+    assert_eq!(h.deferred_len("a"), b"explicit-close-deferred".len());
+    trace_common("explicit-close-self-test-suspended", &h);
+
+    let closed = h.rpc(close_req(&id)).expect("明確 interactive close");
+    assert_eq!(closed.get("ok"), Some(&PyValue::Bool(true)));
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1);
+    trace_common("explicit-close-after-close", &h);
+
+    let refreshed = h.scan(None);
+    assert_no_start_op(&refreshed);
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1);
+    trace_common("explicit-close-after-refresh", &h);
+
+    let resumed = finish_self_test(&mut h, probe);
+    assert_eq!(
+        resumed.iter().filter(|effect| matches!(effect, Effect::HumanTx { permit, payload, .. } if permit.class == TxClass::HumanReplay && payload == b"explicit-close-deferred")).count(),
+        1,
+        "self-test completion follows existing deferred replay path once",
+    );
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 0);
+    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:a"));
+    trace_common("explicit-close-after-resume", &h);
+    h.complete_human_tx(TxOutcome::Completed(b"explicit-close-deferred".len()), None);
+
+    let raw = h.input("a", b"explicit-close-raw");
+    assert_no_start_op(&raw);
+    assert!(raw.iter().any(|effect| matches!(effect, Effect::HumanTx { permit, payload, .. } if permit.class == TxClass::HumanRaw && payload == b"explicit-close-raw")));
+    trace_common("explicit-close-raw-input", &h);
+}
+
+fn explicit_console_detach_during_self_test() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.connect_stream_console("a", ConsoleTransportKind::TcpTelnet);
+    align_human_lease_precondition(&mut h);
+    let probe = start_self_test(&mut h);
+    let deferred = h.input("a", b"detach-deferred");
+    assert_no_start_op(&deferred);
+    assert_eq!(h.deferred_len("a"), b"detach-deferred".len());
+    trace_common("console-detach-self-test-suspended", &h);
+
+    let detached = h
+        .rpc(SessionRequest::ConsoleDetach { client_id: "a".into() })
+        .expect("明確 console detach");
+    assert_eq!(detached.get("ok"), Some(&PyValue::Bool(true)));
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 0);
+    assert_eq!(h.deferred_len("a"), 0);
+    trace_common("console-detach-after-detach", &h);
+
+    let resumed = finish_self_test(&mut h, probe);
+    assert!(resumed.iter().all(|effect| !matches!(effect, Effect::HumanTx { .. })));
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 0);
+    assert!(h.core.human_console().ownership.interactive_owner.is_none());
+    trace_common("console-detach-after-probe-complete", &h);
+}
+
 #[test]
 fn guard_off_tcp_raw_matches_pre_package_baseline() {
     // mirror 簿記的套件專屬斷言位於 tcp_console_lease.rs；以下共同觀測必須在 cc1746d8 與 HEAD 逐行相同。
     expiry_while_flash_guard_is_closed();
     eof_before_agent_close();
     handoff_freezes_before_close_eof_and_replacement_accept();
+    explicit_close_during_self_test();
+    explicit_console_detach_during_self_test();
 }

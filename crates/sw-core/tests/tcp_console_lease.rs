@@ -296,16 +296,20 @@ fn tcp_mirror_retained_recover_respects_guards() {
 
 #[test]
 fn tcp_mirror_self_heal_respects_flash_critical_window() {
-    let mut h = tcp_ready(&["c1"]);
-    close_mirror_publicly(&mut h, "c1");
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    // accept 發生在 flash guard 關閉期間；raw owner 依既有路徑建立，但 mirror 暫不建帳。
+    h.fence.with(|fence| fence.flash_critical = true);
+    h.connect_stream_console("c1", ConsoleTransportKind::TcpTelnet);
     assert!(h.core.active_lease().is_none());
-    assert!(h.core.human_console().ownership.interactive_owner.is_none());
+    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:c1"));
+    // 將 raw owner 清空以走自癒分支；guard 期間自癒不能先授權或建 mirror。
+    h.core.human_console_mut().ownership.interactive_owner = None;
 
     // 模擬 manager 已標記 flash-critical、但 FlashSyncProbeStart 尚未進 actor 的窗口。
-    h.fence.with(|fence| fence.flash_critical = true);
     h.scan(None);
     assert!(h.core.active_lease().is_none(), "flash-critical 自癒不得建立 mirror");
-    assert!(h.core.human_console().ownership.interactive_owner.is_none(), "flash-critical 自癒不得授予 raw owner");
+    assert!(h.core.human_console().ownership.interactive_owner.is_none(), "flash-critical 期間自癒不得授予 raw owner");
 
     h.fence.with(|fence| fence.flash_critical = false);
     h.scan(None);
@@ -354,6 +358,140 @@ fn tcp_mirror_self_heal_respects_flash_critical_window() {
     assert!(active.lease_index_ops()[insert_start..]
         .iter()
         .any(|op| matches!(op, LeaseIndexOp::Remove { interactive_id } if interactive_id == &active_mirror_id)));
+}
+
+#[test]
+fn tcp_mirror_explicit_close_revokes_through_self_test_resume() {
+    let mut h = tcp_ready(&["a"]);
+    h.set_auto_complete_human_tx(false);
+    let original_id = active_id(&h);
+    let probe_op = start_non_strict_self_test(&mut h);
+    assert_eq!(h.core.human_console().ownership.suspended_owner.as_deref(), Some("human:a"));
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1);
+
+    let deferred = h.input("a", b"explicit-close-deferred");
+    assert!(deferred.iter().all(|effect| !matches!(effect, Effect::HumanTx { .. })));
+    assert_eq!(h.deferred_len("a"), b"explicit-close-deferred".len());
+
+    let closed = h.rpc(close_req(&original_id)).expect("明確關閉 mirror");
+    assert_eq!(closed.get("ok"), Some(&PyValue::Bool(true)));
+    assert!(h.core.active_lease().is_none(), "明確 close 不得從 self-test suspended owner 立即重建 mirror");
+    let stale = h
+        .rpc(status_req(&original_id, 80))
+        .expect("舊 interactive id 查詢");
+    assert_eq!(stale.get("error_code"), Some(&PyValue::from("INTERACTIVE_NOT_FOUND")));
+
+    h.scan(None);
+    assert!(h.core.active_lease().is_none(), "refresh 不得撤銷同一 lifetime 的明確 close");
+    let still_deferred = h.input("a", b"-before-resume");
+    assert!(still_deferred.iter().all(|effect| !matches!(effect, Effect::HumanTx { .. })));
+    assert_eq!(h.deferred_len("a"), b"explicit-close-deferred-before-resume".len());
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1, "refresh 不得結算 self-test suspend");
+
+    let resumed = finish_self_test(&mut h, probe_op);
+    let replay: Vec<_> = resumed
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::HumanTx { permit, payload, .. } if permit.class == TxClass::HumanReplay => {
+                Some((permit.source.clone(), payload.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replay, vec![("human:a".into(), b"explicit-close-deferred-before-resume".to_vec())]);
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 0);
+    assert_eq!(h.core.human_console().ownership.interactive_owner.as_deref(), Some("human:a"));
+    assert!(h.core.active_lease().is_none(), "self-test resume 後仍尊重明確撤權");
+    assert_eq!(
+        h.human_tx()
+            .iter()
+            .filter(|(class, source, payload)| {
+                *class == TxClass::HumanReplay
+                    && source == "human:a"
+                    && payload == b"explicit-close-deferred-before-resume"
+            })
+            .count(),
+        1,
+        "deferred bytes 在既有 resume 路徑恰回放一次",
+    );
+    h.complete_human_tx(TxOutcome::Completed(b"explicit-close-deferred-before-resume".len()), None);
+
+    let raw = h.input("a", b"raw-after-resume");
+    assert!(raw.iter().any(|effect| matches!(
+        effect,
+        Effect::HumanTx { permit, payload, .. }
+            if permit.class == TxClass::HumanRaw && payload == b"raw-after-resume"
+    )));
+    assert_eq!(
+        h.core.human_console().ownership.peek_route("a"),
+        sw_core::human_console::ownership::InputRoute::Raw {
+            owner: "human:a".into()
+        }
+    );
+}
+
+#[test]
+fn tcp_mirror_console_detach_revokes_through_self_test_resume() {
+    let mut h = tcp_ready(&["a"]);
+    let original_id = active_id(&h);
+    let probe_op = start_non_strict_self_test(&mut h);
+    let deferred = h.input("a", b"detach-deferred");
+    assert!(deferred.iter().all(|effect| !matches!(effect, Effect::HumanTx { .. })));
+
+    let detached = h
+        .rpc(SessionRequest::ConsoleDetach { client_id: "a".into() })
+        .expect("console_detach");
+    assert_eq!(detached.get("ok"), Some(&PyValue::Bool(true)));
+    assert!(h.core.active_lease().is_none(), "console_detach 不得留下或重建已撤除的 mirror");
+    let stale = h.rpc(status_req(&original_id, 80)).expect("舊 interactive id 查詢");
+    assert_eq!(stale.get("error_code"), Some(&PyValue::from("INTERACTIVE_NOT_FOUND")));
+    h.scan(None);
+    assert!(h.core.active_lease().is_none(), "detach 後同步不得重建該 client 的 mirror");
+
+    let resumed = finish_self_test(&mut h, probe_op);
+    assert!(resumed.iter().all(|effect| !matches!(effect, Effect::HumanTx { .. })), "detach 已清除此 client 的 deferred 輸入");
+    assert!(h.core.active_lease().is_none());
+    assert!(h.core.human_console().ownership.interactive_owner.is_none());
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 0);
+    assert_eq!(h.deferred_len("a"), 0);
+}
+
+#[test]
+fn tcp_mirror_new_lifetime_clears_explicit_revocation() {
+    let mut h = tcp_ready(&["a"]);
+    let original_id = active_id(&h);
+    let old_lifetime = h.lifetime("a");
+    let probe_op = start_non_strict_self_test(&mut h);
+    let closed = h.rpc(close_req(&original_id)).expect("明確關閉舊 lifetime mirror");
+    assert_eq!(closed.get("ok"), Some(&PyValue::Bool(true)));
+
+    h.disconnect("a");
+    assert!(h.core.active_lease().is_none(), "舊 lifetime 斷線後立即撤除 mirror");
+    h.connect_stream_console("a", ConsoleTransportKind::TcpTelnet);
+    let new_lifetime = h.lifetime("a");
+    assert_ne!(new_lifetime, old_lifetime, "同一 client id 的 accept 仍建立新的 lifetime");
+    let new_id = active_id(&h);
+    assert_ne!(new_id, original_id, "新 lifetime 應有新的 mirror interactive id");
+    assert_eq!(h.core.active_lease().unwrap().mirror_client_lifetime, Some(new_lifetime));
+    let stale = h.rpc(status_req(&original_id, 80)).expect("舊 interactive id 查詢");
+    assert_eq!(stale.get("error_code"), Some(&PyValue::from("INTERACTIVE_NOT_FOUND")));
+
+    let deferred = h.input("a", b"new-lifetime-deferred");
+    assert!(deferred.iter().all(|effect| !matches!(effect, Effect::HumanTx { .. })));
+    assert_eq!(h.deferred_len("a"), b"new-lifetime-deferred".len());
+    let resumed = finish_self_test(&mut h, probe_op);
+    let replay: Vec<_> = resumed
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::HumanTx { permit, payload, .. } if permit.class == TxClass::HumanReplay => {
+                Some((permit.source.clone(), payload.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replay, vec![("human:a".into(), b"new-lifetime-deferred".to_vec())]);
+    assert_eq!(h.core.active_lease().map(|lease| lease.interactive_id.as_str()), Some(new_id.as_str()));
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 0);
 }
 
 #[test]

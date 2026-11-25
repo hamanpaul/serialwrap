@@ -264,6 +264,23 @@ impl SessionCore {
             return;
         }
 
+        let active_was_explicitly_revoked = self.lease.as_ref().is_some_and(|lease| {
+            lease.mirror_client_lifetime.is_some_and(|lifetime| {
+                self.tcp_mirror_is_revoked(&lease.owner, lifetime)
+            })
+        });
+        if active_was_explicitly_revoked {
+            self.forget_active_tcp_mirror();
+        }
+        let stashed_was_explicitly_revoked = self.stashed_human.as_ref().is_some_and(|lease| {
+            lease.mirror_client_lifetime.is_some_and(|lifetime| {
+                self.tcp_mirror_is_revoked(&lease.owner, lifetime)
+            })
+        });
+        if stashed_was_explicitly_revoked {
+            self.forget_stashed_tcp_mirror();
+        }
+
         let logical_owner = self.human.live_tcp_raw_owner();
         let active_matches = self.lease.as_ref().is_some_and(|lease| {
             logical_owner.as_ref().is_some_and(|(owner, lifetime)| {
@@ -293,6 +310,9 @@ impl SessionCore {
         let Some((owner, lifetime)) = logical_owner else {
             return;
         };
+        if self.tcp_mirror_is_revoked(&owner, lifetime) {
+            return;
+        }
 
         // 新鏡像沿用既有的交接 admission 與 bridge／state／stop／flash guards；它不接觸 ownership。
         if !self.tcp_mirror_guard_allows_new() {
@@ -352,6 +372,43 @@ impl SessionCore {
             && !self.shutdown_complete
             && !self.flash_busy()
             && !self.handoff_frozen()
+    }
+
+    fn tcp_mirror_is_revoked(&self, owner: &str, lifetime: u64) -> bool {
+        owner
+            .strip_prefix("human:")
+            .is_some_and(|client_id| self.tcp_mirror_revocations.contains(&(client_id.to_string(), lifetime)))
+    }
+
+    /// 記錄明確 close／detach 對應的 TCP client lifetime；不動 raw ownership、admission 或輸入佇列。
+    pub(super) fn mark_tcp_mirror_revoked_for_client(&mut self, client_id: &str, lifetime: u64) {
+        self.tcp_mirror_revocations
+            .insert((client_id.to_string(), lifetime));
+    }
+
+    pub(super) fn mark_tcp_mirror_revoked_for_lease(&mut self, lease: &InteractiveLease) {
+        let (Some(lifetime), Some(client_id)) =
+            (lease.mirror_client_lifetime, lease.human_client_id())
+        else {
+            return;
+        };
+        self.mark_tcp_mirror_revoked_for_client(client_id, lifetime);
+    }
+
+    /// 新 accept 代表同一 client id 已進入新的 lifetime，舊撤權不延伸至新連線。
+    pub(super) fn clear_tcp_mirror_revocations_for_client(&mut self, client_id: &str) {
+        self.tcp_mirror_revocations
+            .retain(|(revoked_client, _)| revoked_client != client_id);
+    }
+
+    /// EOF 只清除完全相符的 client lifetime，遲到的舊 EOF 不會碰新連線的記錄。
+    pub(super) fn clear_tcp_mirror_revocation_for_client_lifetime(
+        &mut self,
+        client_id: &str,
+        lifetime: u64,
+    ) {
+        self.tcp_mirror_revocations
+            .remove(&(client_id.to_string(), lifetime));
     }
 
     /// 自 EOF／owner 替換移除指定 client lifetime 的 mirror；不呼叫 human_set_owner。
@@ -505,6 +562,16 @@ impl SessionCore {
         }
         // grant 屬 owner 變更（arch §5.3）；lease 只補記錄，不再 set_interactive_owner（`_record_self_heal_lease_locked`）。
         self.bump_owner_gen();
+        if self
+            .human
+            .live_tcp_raw_owner()
+            .is_some_and(|(live_owner, lifetime)| {
+                live_owner == owner && self.tcp_mirror_is_revoked(&live_owner, lifetime)
+            })
+        {
+            // 自癒仍依原路徑補 raw owner；明確撤權只阻止該 lifetime 的 mirror lease 簿記。
+            return;
+        }
         let id = self.next_uuid();
         let timeout = self
             .profile
@@ -824,6 +891,15 @@ impl SessionCore {
     pub(super) fn console_detach_request(&mut self, client_id: &str, now: Mono) -> PyDict {
         if self.generations.conn_epoch.is_none() {
             return self.selector_error("SESSION_NOT_READY");
+        }
+        let tcp_lifetime = self
+            .human
+            .consoles
+            .get(client_id)
+            .filter(|console| console.kind == crate::human_console::ConsoleTransportKind::TcpTelnet)
+            .map(|console| console.client_lifetime);
+        if let Some(lifetime) = tcp_lifetime {
+            self.mark_tcp_mirror_revoked_for_client(client_id, lifetime);
         }
         let human_owner = format!("human:{client_id}");
         self.refresh_lease_p6(now);

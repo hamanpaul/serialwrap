@@ -702,6 +702,9 @@ pub struct SessionCore {
     released_reason: PyValue,
     /// agent Interactive Lease（P5-T14；`interactive_session_id` 由此導出）。
     lease: Option<InteractiveLease>,
+    /// p279：明確 close／detach 撤權的 TCP client lifetime；只供 mirror lease 簿記判斷。
+    /// Recovery／Clear 等保留既有 client lifetime 的 drain 不清此集合；EOF 或新 accept 才結算。
+    tcp_mirror_revocations: HashSet<(String, u64)>,
     /// 已到期 lease 的 tombstone（每 session FIFO 16，#54）。
     tombstones: Tombstones,
     /// 前景 op 的待辦（以 op_id 索引；回覆與狀態副作用於 `OpFinished` 套用）。
@@ -1064,6 +1067,7 @@ impl SessionCore {
             released_at: None,
             released_reason: PyValue::Null,
             lease: None,
+            tcp_mirror_revocations: HashSet::new(),
             tombstones: Tombstones::new(),
             pending_ops: HashMap::new(),
             background: IndexMap::new(),
@@ -7379,6 +7383,14 @@ impl SessionCore {
     fn interactive_close(&mut self, interactive_id: &str) -> PyDict {
         if !self.lease_matches(interactive_id) {
             return self.lease_lookup_error(interactive_id);
+        }
+        if let Some(lease) = self
+            .lease
+            .as_ref()
+            .filter(|lease| lease.mirror_client_lifetime.is_some())
+            .cloned()
+        {
+            self.mark_tcp_mirror_revoked_for_lease(&lease);
         }
         self.close_lease(false);
         pydict! { "ok" => true, "interactive_id" => interactive_id }
