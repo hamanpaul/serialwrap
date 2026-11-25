@@ -87,6 +87,17 @@ def sha256_file(path: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
+def find_exact_path_file(file_name: str, path_value: str) -> pathlib.Path | None:
+    """依 PATH 順序找第一個名稱完全相同的檔案，不套用平台可執行副檔名規則。"""
+    if not path_value:
+        return None
+    for raw_entry in path_value.split(os.pathsep):
+        candidate = pathlib.Path(raw_entry or os.curdir) / file_name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def _read_proc_exe_as_user(proc_exe: pathlib.Path, user: str) -> str:
     """以 daemon 所屬使用者讀 /proc/<pid>/exe，處理容器內缺少 CAP_SYS_PTRACE 的情況。"""
     proc = subprocess.run(
@@ -387,11 +398,13 @@ class Driver:
         field = "timeout_recovery_keys"
         candidate_version = self.bundle / "versions" / NEW_VERSION
         cli_name = self.new_cli.name
-        cli_command = pathlib.Path(cli_name).stem
         candidate_cli = candidate_version / "bin" / cli_name
-        active_cli = shutil.which(cli_command, path=self.env.get("PATH", ""))
+        active_cli = find_exact_path_file(cli_name, self.env.get("PATH", ""))
         evidence: dict[str, Any] = {
             "candidate_cli_path": str(candidate_cli),
+            "configured_cli_path": str(self.new_cli),
+            "active_cli_path": str(active_cli) if active_cli else None,
+            "installed_version_dir": None,
             "target_asset_path": str(target_asset),
             "field": field,
             "profile_check": None,
@@ -400,20 +413,38 @@ class Driver:
             "active_cli_sha256": None,
         }
 
-        try:
-            candidate_real = candidate_cli.resolve(strict=True)
-            active_real = pathlib.Path(active_cli).resolve(strict=True) if active_cli else None
-            configured_real = self.new_cli.resolve(strict=True)
-            candidate_version_real = candidate_version.resolve(strict=True)
-            installed_version_real = active_real.parent.parent.resolve(strict=True) if active_real else None
-            bundle_real = self.bundle.resolve(strict=True)
-        except OSError as exc:
+        resolution_errors: dict[str, dict[str, str]] = {}
+
+        def resolve_evidence(
+            label: str,
+            path: pathlib.Path,
+            evidence_key: str,
+        ) -> pathlib.Path | None:
+            try:
+                resolved = path.resolve(strict=True)
+            except OSError as exc:
+                resolution_errors[label] = {"path": str(path), "error": type(exc).__name__}
+                return None
+            evidence[evidence_key] = str(resolved)
+            return resolved
+
+        configured_real = resolve_evidence("configured_cli", self.new_cli, "configured_cli_path")
+        candidate_real = resolve_evidence("candidate_cli", candidate_cli, "candidate_cli_path")
+        candidate_version_real = resolve_evidence(
+            "candidate_version_dir", candidate_version, "candidate_version_dir",
+        )
+        bundle_real = resolve_evidence("bundle_dir", self.bundle, "bundle_dir")
+        active_real = resolve_evidence("active_cli", active_cli, "active_cli_path") if active_cli else None
+        installed_version_real = None
+        if active_real is not None:
+            installed_version_real = resolve_evidence(
+                "installed_version_dir", active_real.parent.parent, "installed_version_dir",
+            )
+        if resolution_errors:
+            first_error = next(iter(resolution_errors.values()))["error"]
             return uc.row("candidate_cli_p290_asset", "FAIL", "無法確認候選 CLI 路徑",
-                          **evidence, path_error=type(exc).__name__)
-        evidence["candidate_cli_path"] = str(candidate_real)
-        evidence["active_cli_path"] = str(active_real) if active_real else None
-        evidence["configured_cli_path"] = str(configured_real)
-        evidence["installed_version_dir"] = str(installed_version_real) if installed_version_real else None
+                          **evidence, path_error=first_error,
+                          path_resolution_errors=resolution_errors)
         if candidate_real != configured_real:
             return uc.row("candidate_cli_p290_asset", "FAIL", "目前 CLI 並非本次候選版本",
                           **evidence)
@@ -445,7 +476,7 @@ class Driver:
         temp_root: pathlib.Path | None = None
         prior_profile_dir = self.env.get("SERIALWRAP_PROFILE_DIR")
         try:
-            temp_root = pathlib.Path(tempfile.mkdtemp(prefix="sw-p290-cli-asset-", dir="/tmp"))
+            temp_root = pathlib.Path(tempfile.mkdtemp(prefix="sw-p290-cli-asset-"))
             os.chmod(temp_root, 0o755)
             profile_dir = temp_root / "profiles"
             profile_dir.mkdir(mode=0o755)

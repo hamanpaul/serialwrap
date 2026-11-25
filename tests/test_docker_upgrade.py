@@ -1560,6 +1560,7 @@ def test_candidate_cli_path_mismatch_returns_structured_fail(fake_driver, tmp_pa
     configured_cli = tmp_path / "configured-copy" / "bin" / "serialwrap"
     configured_cli.parent.mkdir(parents=True)
     configured_cli.write_text("not the bundle candidate", encoding="utf-8")
+    (driver.bundle / "versions" / NEW_VERSION / "bin" / configured_cli.name).unlink(missing_ok=True)
     driver.new_cli = configured_cli
 
     result = driver.verify_candidate_p290_asset(target)
@@ -1769,32 +1770,55 @@ def test_upgrade_accepts_installed_copy_of_candidate_cli(fake_driver, tmp_path, 
     windows_bundle = tmp_path / "windows-bundle"
     windows_version = windows_bundle / "versions" / NEW_VERSION
     shutil.copytree(source_version, windows_version)
-    windows_candidate = windows_version / "bin" / "serialwrap.exe"
+    windows_candidate = windows_version / "bin" / "serialwrap"
     windows_candidate.write_bytes(driver.new_cli.read_bytes())
     windows_installed_version = tmp_path / "windows-installed" / "versions" / NEW_VERSION
     shutil.copytree(windows_version, windows_installed_version)
-    windows_installed_cli = windows_installed_version / "bin" / "serialwrap.exe"
+    windows_installed_cli = windows_installed_version / "bin" / "serialwrap"
     driver.bundle = windows_bundle
     driver.new_cli = windows_candidate
-    driver.env["PATH"] = str(windows_installed_cli.parent)
+    driver.env["PATH"] = os.pathsep.join((
+        str(tmp_path / "missing-active-bin"),
+        str(windows_installed_cli.parent),
+    ))
     driver_module = driver._driver_module
-    original_which = driver_module.shutil.which
 
-    def windows_which(command, mode=os.F_OK | os.X_OK, path=None):
-        if command == "serialwrap":
-            candidate = Path(path) / "serialwrap.exe"
-            return str(candidate) if candidate.is_file() else None
-        return original_which(command, mode=mode, path=path)
-
-    monkeypatch.setattr(driver_module.shutil, "which", windows_which)
-    windows_result = driver.judge_doctor(
-        "doctor_green_new", "Windows .exe 安裝副本", require_pairing=True,
+    monkeypatch.setattr(driver_module.shutil, "which", lambda *_args, **_kwargs: None)
+    lookup_result = driver.judge_doctor(
+        "doctor_green_new", "Windows 精確檔名 PATH 查找", require_pairing=True,
         profile_policy=driver.profile_policies["new"],
     )
-    assert windows_result["verdict"] == "PASS", windows_result
-    windows_embedded = windows_result["detail"]["candidate_cli_p290_asset"]
-    assert windows_embedded["verdict"] == "PASS", windows_embedded
-    assert windows_embedded["detail"]["active_cli_path"] == str(windows_installed_cli.resolve())
+
+    real_mkdtemp = driver_module.tempfile.mkdtemp
+    temp_dirs: list[str | None] = []
+
+    def tracked_mkdtemp(*args, **kwargs):
+        temp_dirs.append(kwargs.get("dir"))
+        return real_mkdtemp(*args, **kwargs)
+
+    monkeypatch.setattr(driver_module, "tempfile", types.SimpleNamespace(mkdtemp=tracked_mkdtemp))
+    monkeypatch.setattr(
+        driver_module.shutil,
+        "which",
+        lambda command, **_kwargs: str(windows_installed_cli) if command == "serialwrap" else None,
+    )
+    temp_result = driver.judge_doctor(
+        "doctor_green_new", "Windows 平台預設暫存根", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+    assert (
+        lookup_result["verdict"],
+        temp_result["verdict"],
+        temp_dirs,
+    ) == ("PASS", "PASS", [None]), {
+        "lookup_result": lookup_result,
+        "temp_result": temp_result,
+        "temp_dirs": temp_dirs,
+    }
+    for probe_result in (lookup_result, temp_result):
+        embedded = probe_result["detail"]["candidate_cli_p290_asset"]
+        assert embedded["verdict"] == "PASS", embedded
+        assert embedded["detail"]["active_cli_path"] == str(windows_installed_cli.resolve())
 
 
 @pytest.mark.core_portable
