@@ -260,15 +260,22 @@ def _schema_errors(value: Any, schema: Mapping[str, Any], root_schema: Mapping[s
     return errors
 
 
-def _validate_manifest_schema(value: Any) -> None:
-    schema_path = Path(__file__).resolve().parents[2] / "tests" / "acceptance" / "ab_manifest.schema.json"
+def _validate_schema_document(value: Any, schema_path: Path, *, label: str) -> None:
     try:
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise _invalid(f"cannot read A/B manifest schema: {exc}") from exc
+        raise _invalid(f"cannot read {label} schema: {exc}") from exc
+    if not isinstance(schema, Mapping):
+        raise _invalid(f"{label} schema must be an object")
     errors = _schema_errors(value, schema, schema)
     if errors:
-        raise _invalid("schema validation failed: " + "; ".join(errors[:8]))
+        raise _invalid(f"{label} schema validation failed: " + "; ".join(errors[:8]))
+
+
+def _validate_manifest_schema(value: Any, *, repo_root: Path) -> None:
+    """只從明確的 repo_root 載入 schema；該檔由 tool_revision 統一核對。"""
+    schema_path = Path(repo_root) / "tests" / "acceptance" / "ab_manifest.schema.json"
+    _validate_schema_document(value, schema_path, label="A/B manifest")
 
 
 def _deep_freeze(value: Any) -> Any:
@@ -379,6 +386,11 @@ def load_manifest(
 ) -> AbManifest:
     """讀取並驗證 A/B manifest。
 
+    Schema 一律從呼叫端的 ``repo_root/tests/acceptance`` 讀取，不從本模組所在 checkout 取用；
+    ``verify_frozen`` 再以相同 repo_root 和 ``tool_revision`` 核對實際讀取的 schema bytes。
+    因此程式 checkout 與目標 repo 不同時，讀取與版本比對仍指向同一檔案。即使 schema 被弱化，
+    ``tools`` 必須包含 ``tools/stage3`` 的信任邊界仍由 loader 程式獨立強制。
+
     Windows L1.5 的可信 pair 對照由呼叫端私下提供；不把實際 COM 名稱寫入
     manifest 或公開映射。正式對照由編排者在 T5B 依原生 COM 實機盤點後建立，
     公開證據只包含去識別端點 ID 與對照檔 SHA-256；T3 測試僅用合成資料。
@@ -390,7 +402,7 @@ def load_manifest(
         doc = json.loads(source_bytes.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
         raise _invalid(f"cannot read manifest: {exc}") from exc
-    _validate_manifest_schema(doc)
+    _validate_manifest_schema(doc, repo_root=root_path)
     root = _mapping(doc, "manifest")
     run_id = _string(root.get("run_id"), "run_id")
     layer = _string(root.get("layer"), "layer")
@@ -434,11 +446,20 @@ def load_manifest(
     if not isinstance(raw_tools, list) or not raw_tools:
         raise _invalid("tools must be a non-empty array")
     tools = tuple(_frozen(item, f"tools[{i}]", tree_ok=True) for i, item in enumerate(raw_tools))
+    if not any(isinstance(item, FrozenTree) and item.path == "tools/stage3" for item in tools):
+        raise _invalid("tools must include the tools/stage3 frozen tree")
     acceptance_value = root.get("acceptance")
     acceptance = None if acceptance_value is None else _frozen(acceptance_value, "acceptance")
     if isinstance(acceptance, FrozenTree):
         raise _invalid("acceptance must be a frozen file")
     profile_files = tuple(_frozen(item, f"profile_files[{i}]") for i, item in enumerate(root.get("profile_files", [])))
+    for i, item in enumerate(profile_files):
+        try:
+            actual = sha256_file(_path(root_path, item.path))
+        except OSError as exc:
+            raise _invalid(f"profile file missing: profile_files[{i}] {item.path}") from exc
+        if actual != item.sha256:
+            raise _invalid(f"profile sha256 mismatch: {item.path}")
 
     dut_doc = _mapping(root.get("dut"), "dut")
     pair = dut_doc.get("com_pair")
@@ -878,8 +899,13 @@ def _com_pair_allowlist_matches(manifest: AbManifest, actual_pair: Mapping[str, 
     )
 
 
-def _trusted_pair_map(value: Mapping[str, Any]) -> Mapping[str, Any]:
-    """驗證呼叫端私下提供、含實際埠名的合成或受控 pair 對照。"""
+def _trusted_pair_map(
+    value: Mapping[str, Any], *, repo_root: Path | None = None,
+) -> Mapping[str, Any]:
+    """驗證呼叫端私下提供的 pair 對照，schema 從同一 repo_root 讀取並凍結。"""
+    if repo_root is not None:
+        schema_path = Path(repo_root) / "tests" / "acceptance" / "stage3_trusted_pair_map.schema.json"
+        _validate_schema_document(value, schema_path, label="trusted pair map")
     root = _closed_object(value, _TRUSTED_PAIR_MAP_FIELDS, set(), "trusted_pair_map")
     if (root.get("schema_version") != 1 or isinstance(root.get("schema_version"), bool)
             or root.get("exit_item_id") != "S3-L15-RELEASE-AB-WINDOWS"
@@ -953,7 +979,7 @@ def _validate_windows_l15_transport(
     case_rows = {item.get("case_id"): item for item in rows if isinstance(item, Mapping)}
     approved_pairs = mapping["approved_pairs"]
     physical_substitutes = mapping["physical_substitutes"]
-    trusted = _trusted_pair_map(trusted_pair_map) if trusted_pair_map is not None else None
+    trusted = _trusted_pair_map(trusted_pair_map, repo_root=repo_root) if trusted_pair_map is not None else None
     selected_pair_id = trusted.get("selected_pair_id") if trusted is not None else None
     trusted_pair = trusted["pairs"].get(selected_pair_id) if trusted is not None else None
     if trusted is not None:
@@ -1427,17 +1453,60 @@ def verify_case_coverage(
     return violations
 
 
-def _repo_relative_path(root: Path, value: str) -> str | None:
-    """將真正位於 repo 內的 POSIX manifest 路徑轉成相對路徑。"""
-    if not isinstance(value, str) or not value or "\\" in value:
+def _repo_relative_path(
+    root: Path | PureWindowsPath, value: str, *, windows: bool | None = None,
+) -> str | None:
+    """完成平台原生邊界／symlink 檢查，再回傳 Git 使用的 POSIX 相對路徑。
+
+    ``windows`` 僅供純路徑測試在非 Windows 主機模擬原生語意；正式呼叫依執行平台選擇。
+    """
+    if not isinstance(value, str) or not value:
         return None
-    windows_path = PureWindowsPath(value)
-    if windows_path.is_absolute() and not Path(value).is_absolute():
+    use_windows = os.name == "nt" if windows is None else windows
+    windows_value = PureWindowsPath(value)
+    windows_parts = windows_value.parts
+    raw_parts = re.split(r"[\\/]", value)
+    if any(part in (".", "..") for part in raw_parts) or any(part in (".", "..") for part in windows_parts) or any(
+        part in (".", "..") for part in PurePosixPath(value).parts
+    ):
         return None
-    path_parts = value.split("/")
-    if any(part in (".", "..") for part in path_parts):
+
+    if use_windows:
+        # 純路徑模擬只驗證 Windows 的磁碟、分隔符及詞法邊界；原生執行另做 realpath/symlink 檢查。
+        if isinstance(root, PureWindowsPath) or (windows is True and os.name != "nt"):
+            root_windows = PureWindowsPath(str(root))
+            if (not root_windows.is_absolute() or (windows_value.drive and not windows_value.is_absolute())
+                    or (windows_value.root and not windows_value.drive)):
+                return None
+            candidate_windows = windows_value if windows_value.is_absolute() else root_windows / windows_value
+            try:
+                relative_windows = candidate_windows.relative_to(root_windows)
+            except ValueError:
+                return None
+            if any(part in ("", ".", "..") for part in relative_windows.parts):
+                return None
+            return PurePosixPath(*relative_windows.parts).as_posix()
+
+        root_path = Path(root)
+        if windows_value.drive and not windows_value.is_absolute():
+            return None
+        candidate = Path(value) if Path(value).is_absolute() else root_path / Path(value)
+        try:
+            root_absolute = Path(os.path.abspath(root_path))
+            absolute = Path(os.path.abspath(candidate))
+            relative = absolute.relative_to(root_absolute)
+            absolute.resolve().relative_to(root_absolute.resolve())
+        except (OSError, ValueError):
+            return None
+        pure = PurePosixPath(relative.as_posix())
+        if pure.is_absolute() or any(part in ("", ".", "..") for part in pure.parts):
+            return None
+        return pure.as_posix()
+
+    # POSIX 上將 Windows drive/UNC/根路徑視為跨平台偽造；一般反斜線不會單獨造成拒絕。
+    if windows_value.drive or (windows_value.root and not Path(value).is_absolute()):
         return None
-    candidate = _path(root, value)
+    candidate = _path(Path(root), value)
     try:
         root_absolute = Path(os.path.abspath(root))
         absolute = Path(os.path.abspath(candidate))
@@ -1489,6 +1558,12 @@ def _frozen_repo_paths(
             return
         trees.add(relative)
 
+    # 即使呼叫端弱化 manifest schema，也必須錨定 loader 的程式樹與實際 schema。
+    trees.add("tools/stage3")
+    files.add("tests/acceptance/ab_manifest.schema.json")
+    if m.exit_item_id == "S3-L15-RELEASE-AB-WINDOWS":
+        files.add("tests/acceptance/stage3_trusted_pair_map.schema.json")
+
     add_required_file(m.case_list, "case_list")
     add_required_file(m.case_lock, "case_lock")
     add_execution_file(FrozenFile(str(m.source_path), m.source_sha256))
@@ -1497,7 +1572,14 @@ def _frozen_repo_paths(
     add_required_file(m.allowed_differences, "allowed_differences")
     add_required_file(m.acceptance, "acceptance")
     for item in m.profile_files:
-        add_required_file(item, "profile")
+        relative = _repo_relative_path(repo_root, item.path)
+        if relative is not None:
+            files.add(relative)
+        else:
+            candidate = _path(repo_root, item.path)
+            is_absolute = candidate.is_absolute() or PureWindowsPath(item.path).is_absolute()
+            if not is_absolute or _inside(repo_root, candidate):
+                path_errors.append(f"tool revision path outside repo: profile {item.path}")
     for item in (m.suite.selftest_report, m.suite.testbed_template, m.suite.realhw_config_template):
         add_execution_file(item)
     for item in m.tools:
@@ -1582,20 +1664,30 @@ def _tool_revision_input_errors(
     prefix = "case transport map tool revision" if relative == map_path else "tool revision"
     tracked_in_index = True
     if execution_artifact:
+        query = f":(icase,literal){relative}"
         try:
-            tracked = run([
-                "git", "-C", str(repo_root), "ls-files", "--error-unmatch", "-z", "--", f":(literal){relative}",
+            indexed = run(["git", "-C", str(repo_root), "ls-files", "-z", "--", query])
+            revision_paths = run([
+                "git", "-C", str(repo_root), "ls-tree", "-r", "--name-only", "-z", revision,
             ])
         except OSError:
             return [f"tool revision unavailable: {relative}"]
-        if tracked.timed_out:
+        if any(result.rc != 0 or result.timed_out for result in (indexed, revision_paths)):
             return [f"tool revision unavailable: {relative}"]
-        if tracked.rc == 0:
-            tracked_in_index = True
-        elif tracked.rc == 1 and not tracked.stdout:
-            tracked_in_index = False
-        else:
-            return [f"tool revision unavailable: {relative}"]
+        index_matches = {item for item in indexed.stdout.split("\0") if item}
+        requested_identity = relative.replace("\\", "/").casefold()
+        revision_matches = {
+            item for item in revision_paths.stdout.split("\0") if item
+            and item.replace("\\", "/").casefold() == requested_identity
+        }
+        matches = index_matches | revision_matches
+        if len(matches) > 1:
+            return [f"tool revision path case ambiguous: {relative}"]
+        if matches:
+            tracked_path = next(iter(matches))
+            if tracked_path != relative:
+                return [f"tool revision path case mismatch: {relative} (tracked as {tracked_path})"]
+        tracked_in_index = relative in index_matches
     try:
         mode = path.lstat().st_mode
     except OSError:
@@ -1749,13 +1841,17 @@ def verify_frozen(
 
     | 輸入 | 類別與依據 | 路徑規則 | 比對方式／測試 |
     |---|---|---|---|
+    | A/B manifest schema | 版本受控；Task 3 loader 契約 | 固定為 repo_root 下 `tests/acceptance/ab_manifest.schema.json` | loader 從此路徑讀取；tool_revision 同路徑原始 blob；`test_manifest_and_trusted_pair_schemas_are_checked_against_tool_revision` |
+    | trusted pair map schema | 版本受控；R12-01、BO-P9-01 注入介面 | Windows L1.5 固定為 repo_root 下 `tests/acceptance/stage3_trusted_pair_map.schema.json` | 注入時從此路徑讀取；tool_revision 同路徑原始 blob；同上 |
     | case_list、case_lock | 版本受控；Task 3 案例涵蓋 | 固定為 canonical repo 路徑 | 同路徑原始 blob；`test_tool_revision_rejects_self_hashed_canonical_case_attribute_changes` |
     | required_cases_lock、required_case_set、case_ids、seed | 版本受控；Task 3、R4-01 | 鎖與 seed 附件只能位於 repo_root | 同路徑 blob；case_ids／family／seed 與鎖交叉綁定 |
     | stage_exits、Stage 3 lock schema、seed source-manifest／附件 | 版本受控；Task 3、R4-01 | repo 內相對路徑，不得逃出 repo_root | 同路徑原始 blob；`test_tool_revision_rejects_deleted_contract_tree_file` |
     | Windows L1.5 case_transport_map | 版本受控；R12-01、§0.4 | 必須是 repo_root 內的 regular-file 路徑 | 同路徑原始 blob；`test_windows_l15_mapping_outside_repo_is_rejected_even_with_refreshed_hashes` |
-    | tools FrozenFile／FrozenTree、contracts 樹 | 版本受控；Task 3、§0.4 | repo 內路徑，不接受外部或逃逸路徑 | 單檔 blob；樹完整集合雙向比較後逐檔比 bytes；`test_tool_revision_rejects_deleted_file_from_frozen_tool_tree` |
-    | allowed_differences、acceptance、profile_files 與其他 repo 內已追蹤輸入 | 版本受控；Task 3 凍結宣告 | repo 內路徑 | 同路徑原始 blob |
-    | manifest source bytes、candidate_context、sidecar／bundle、suite selftest／testbed／realhw 樣板 | 執行產物；Task 3、§0.4 | 可在 repo 外；repo 內執行產物要查 Git index | 載入 SHA 與 manifest／side 交叉綁定；`test_tool_revision_rejects_staged_new_file_used_as_frozen_selftest_report` |
+    | tools FrozenFile／FrozenTree、contracts 樹 | 版本受控；Task 3、§0.4 | repo 內路徑；loader 獨立要求 `tools/stage3` 樹 | 單檔 blob；樹完整集合雙向比較後逐檔比 bytes；`test_loader_independently_requires_the_stage3_tools_tree_after_schema_weakening` |
+    | allowed_differences、acceptance | 版本受控；Task 3 凍結宣告 | 必須在 repo_root 內，外部絕對路徑也拒絕 | 同路徑原始 blob；canonical cases 維持固定路徑 |
+    | repo 內 profile_files | 版本受控；Task 3 profile 凍結 | repo_root 內；index／revision 必須有相同拼字 | 載入 SHA、統一 tool_revision blob 比對；`test_repo_profile_staged_new_file_remains_tool_revision_controlled` |
+    | repo 外 profile_files | 私有執行產物；Task 3 FrozenFile 絕對路徑 | 僅允許 repo 外絕對路徑；相對逃逸拒絕 | 載入時 SHA 凍結，執行前重驗；`test_absolute_external_profile_is_sha_frozen_and_rechecked` |
+    | manifest source bytes、candidate_context、sidecar／bundle、suite selftest／testbed／realhw 樣板 | 執行產物；Task 3、§0.4 | 可在 repo 外；repo 內路徑需查 index 與 revision 的大小寫不敏感等價拼字 | 載入 SHA／交叉綁定與執行前重驗；只有確定未追蹤才豁免；`test_casefold_alias_of_staged_execution_file_is_rejected` |
     | Docker image name／digest | 執行產物；Task 3 DUT 驗證 | 不使用 repo 檔案路徑 | 以 image inspect 比對核准 digest |
 
     ``tool_revision`` 是唯一可信版本錨點；省略時由 Git 讀取執行時 HEAD，Task 6 可固定傳入。

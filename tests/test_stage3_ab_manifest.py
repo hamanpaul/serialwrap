@@ -8,7 +8,7 @@ import hashlib
 import io
 import json
 from dataclasses import FrozenInstanceError, is_dataclass, replace
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Mapping
 
 import pytest
@@ -51,6 +51,16 @@ def _read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _install_test_schemas(root: Path) -> None:
+    """將本 checkout 的 schema 複製到隔離 repo，模擬受控版本檔。"""
+    source_root = Path(__file__).resolve().parent / "acceptance"
+    for name in ("ab_manifest.schema.json", "stage3_trusted_pair_map.schema.json"):
+        target = root / "tests" / "acceptance" / name
+        if not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes((source_root / name).read_bytes())
+
+
 def _edit_manifest(path: Path, mutate) -> dict:
     doc = _read_json(path)
     mutate(doc)
@@ -68,8 +78,10 @@ def _runner(revision: str, docker_id: str | None = None):
 def _load(
     path: Path, *, repo_root: Path | None = None, trusted_pair_map: Mapping | None = None,
 ):
+    root = Path(repo_root or Path(path).parent)
+    _install_test_schemas(root)
     return ab_manifest.load_manifest(
-        path, repo_root=repo_root or Path(path).parent, trusted_pair_map=trusted_pair_map,
+        path, repo_root=root, trusted_pair_map=trusted_pair_map,
     )
 
 
@@ -1658,6 +1670,7 @@ def _git_blob_oid(data: bytes) -> str:
 
 
 def _repo_snapshot(root: Path) -> dict[str, bytes]:
+    _install_test_schemas(root)
     schema = root / "tests" / "acceptance" / "stage3_required_cases.schema.json"
     if not schema.exists():
         schema.parent.mkdir(parents=True, exist_ok=True)
@@ -1701,10 +1714,13 @@ class _ToolRevisionRecordingRunner(fakes.RecordingRunner):
                 stdout, rc = (_git_blob_oid(data) + "\n", 0) if data is not None else ("", 1)
             elif "ls-tree" in args:
                 revision = args[args.index("-z") + 1]
-                tree = args[-1].removeprefix(":(literal)").rstrip("/")
                 if revision != self.tool_revision:
                     stdout, rc = "", 1
+                elif "--" not in args:
+                    members = sorted(self.blobs)
+                    stdout, rc = ("\0".join(members) + ("\0" if members else ""), 0)
                 else:
+                    tree = args[-1].removeprefix(":(literal)").rstrip("/")
                     members = sorted(
                         relative for relative in self.blobs
                         if relative.startswith(tree + "/")
@@ -1713,11 +1729,14 @@ class _ToolRevisionRecordingRunner(fakes.RecordingRunner):
                     )
                     stdout, rc = ("\0".join(members) + ("\0" if members else ""), 0)
             elif "ls-files" in args:
-                relative = args[-1].removeprefix(":(literal)")
-                if relative in self.blobs:
-                    stdout, rc = (relative + "\0", 0) if "-z" in args else (relative + "\n", 0)
+                if args[-1].startswith(":(icase,literal)"):
+                    requested = args[-1].removeprefix(":(icase,literal)")
+                    matches = sorted(relative for relative in self.blobs
+                                     if relative.casefold() == requested.casefold())
                 else:
-                    stdout, rc = "", 1
+                    relative = args[-1].removeprefix(":(literal)")
+                    matches = [relative] if relative in self.blobs else []
+                stdout, rc = ("\0".join(matches) + ("\0" if matches else ""), 0)
             elif "hash-object" in args:
                 candidate = Path(args[-1])
                 if not candidate.is_absolute():
@@ -1974,7 +1993,7 @@ def test_windows_l15_verify_frozen_requires_injected_trusted_pair_map(tmp_path):
 def test_windows_l15_trusted_pair_map_accepts_exact_pair_and_rejects_untrusted_changes(tmp_path):
     path = _windows_l15_transport_fixture(tmp_path)
     trusted = _synthetic_trusted_pair_map(tmp_path, include_alternate=True)
-    manifest = ab_manifest.load_manifest(path, repo_root=tmp_path, trusted_pair_map=trusted)
+    manifest = _load(path, repo_root=tmp_path, trusted_pair_map=trusted)
     runner = _ToolRevisionRecordingRunner(tmp_path, _repo_snapshot(tmp_path))
     assert ab_manifest.verify_frozen(
         manifest,
@@ -1992,7 +2011,7 @@ def test_windows_l15_trusted_pair_map_accepts_exact_pair_and_rejects_untrusted_c
     changed_doc["test_device_allowlist"] = ["COM400", "COM401"]
     _write_json(changed_path, changed_doc)
     with pytest.raises(HarnessError) as caught:
-        ab_manifest.load_manifest(changed_path, repo_root=changed_path.parent, trusted_pair_map=trusted)
+        _load(changed_path, repo_root=changed_path.parent, trusted_pair_map=trusted)
     assert caught.value.code == "HARNESS_MANIFEST_INVALID"
 
     swapped_path = _windows_l15_transport_fixture(tmp_path / "swapped")
@@ -2000,7 +2019,7 @@ def test_windows_l15_trusted_pair_map_accepts_exact_pair_and_rejects_untrusted_c
     swapped_doc["dut"]["com_pair"] = {"daemon_side": "COM20", "bridge_side": "COM21"}
     _write_json(swapped_path, swapped_doc)
     with pytest.raises(HarnessError):
-        ab_manifest.load_manifest(swapped_path, repo_root=swapped_path.parent, trusted_pair_map=trusted)
+        _load(swapped_path, repo_root=swapped_path.parent, trusted_pair_map=trusted)
 
     alternate_path = _windows_l15_transport_fixture(tmp_path / "alternate")
     alternate_doc = _read_json(alternate_path)
@@ -2022,7 +2041,7 @@ def test_windows_l15_trusted_pair_map_accepts_exact_pair_and_rejects_untrusted_c
     alternate_doc["platform_settings"]["case_transports"][native_id]["decision_ref"] = "T3-OTHER-PAIR-AUTH"
     _write_json(alternate_path, alternate_doc)
     with pytest.raises(HarnessError):
-        ab_manifest.load_manifest(alternate_path, repo_root=alternate_path.parent, trusted_pair_map=trusted)
+        _load(alternate_path, repo_root=alternate_path.parent, trusted_pair_map=trusted)
 
 
 def test_windows_l15_trusted_pair_map_schema_is_closed_and_validates_synthetic_pair():
@@ -2236,7 +2255,7 @@ def test_windows_l15_trusted_pair_requires_distinct_endpoint_names_and_ids(tmp_p
     doc["test_device_allowlist"] = list(manifest_ports)
     _write_json(path, doc)
     with pytest.raises(HarnessError) as caught:
-        ab_manifest.load_manifest(path, repo_root=tmp_path, trusted_pair_map=trusted)
+        _load(path, repo_root=tmp_path, trusted_pair_map=trusted)
     assert caught.value.code == "HARNESS_MANIFEST_INVALID"
 
 
@@ -2346,3 +2365,128 @@ def test_required_cases_check_preserves_4b71d2db_complete_output_and_exit_code(t
     assert stdout.getvalue() == ""
     assert stderr.getvalue() == expected_stderr
 
+
+def test_load_manifest_reads_schema_from_the_supplied_repo_root(tmp_path):
+    path = fakes.write_ab_manifest(tmp_path)
+    _install_test_schemas(tmp_path)
+    schema_path = tmp_path / "tests" / "acceptance" / "ab_manifest.schema.json"
+    schema = _read_json(schema_path)
+    schema["properties"]["run_id"]["minLength"] = 1000
+    _write_json(schema_path, schema)
+
+    with pytest.raises(HarnessError) as caught:
+        _load(path, repo_root=tmp_path)
+    assert caught.value.code == "HARNESS_MANIFEST_INVALID"
+    assert "schema validation failed" in caught.value.detail
+
+
+def test_loader_independently_requires_the_stage3_tools_tree_after_schema_weakening(tmp_path):
+    path = fakes.write_ab_manifest(tmp_path)
+    _install_test_schemas(tmp_path)
+    schema_path = tmp_path / "tests" / "acceptance" / "ab_manifest.schema.json"
+    schema = _read_json(schema_path)
+    schema["allOf"] = []
+    schema["properties"]["tools"]["minItems"] = 1
+    _write_json(schema_path, schema)
+
+    attacker_tree = tmp_path / "tools" / "attacker"
+    attacker_tree.mkdir(parents=True)
+    (attacker_tree / "replacement.py").write_text("# forged tool tree\n", encoding="utf-8")
+    (tmp_path / "tools" / "stage3" / "__init__.py").write_text("# modified required tools\n", encoding="utf-8")
+    doc = _read_json(path)
+    doc["tools"] = [{"path": "tools/attacker", "tree_sha256": ab_manifest._tree_sha256(attacker_tree)}]
+    _write_json(path, doc)
+
+    with pytest.raises(HarnessError) as caught:
+        _load(path, repo_root=tmp_path)
+    assert caught.value.code == "HARNESS_MANIFEST_INVALID"
+    assert "tools/stage3" in caught.value.detail
+
+
+def test_manifest_and_trusted_pair_schemas_are_checked_against_tool_revision(tmp_path):
+    path = _windows_l15_transport_fixture(tmp_path)
+    trusted = _synthetic_trusted_pair_map(tmp_path)
+    manifest = _load(path, repo_root=tmp_path, trusted_pair_map=trusted)
+    revision_blobs = _repo_snapshot(tmp_path)
+    schema_paths = (
+        "tests/acceptance/ab_manifest.schema.json",
+        "tests/acceptance/stage3_trusted_pair_map.schema.json",
+    )
+    for relative in schema_paths:
+        schema_path = tmp_path / relative
+        schema_path.write_bytes(schema_path.read_bytes() + b"\n")
+
+    runner = _ToolRevisionRecordingRunner(
+        tmp_path, revision_blobs, contract_revision=manifest.contract_revision,
+    )
+    violations = ab_manifest.verify_frozen(
+        manifest, repo_root=tmp_path, run=runner, tool_revision="1" * 40,
+        trusted_pair_map=trusted, source_reader=_trusted_source_reader(tmp_path),
+    )
+    for relative in schema_paths:
+        assert f"tool revision mismatch: {relative}" in violations
+
+
+def test_absolute_external_profile_is_sha_frozen_and_rechecked(tmp_path):
+    path = fakes.write_ab_manifest(tmp_path)
+    private_profile = tmp_path.parent / f"{tmp_path.name}-private-profile.yaml"
+    private_profile.write_text("profile: private\n", encoding="utf-8")
+    doc = _read_json(path)
+    doc["profile_files"] = [{"path": str(private_profile), "sha256": fakes.sha256_file(private_profile)}]
+    _write_json(path, doc)
+
+    manifest = _load(path, repo_root=tmp_path)
+    assert _verify(manifest, tmp_path) == []
+    private_profile.write_text("profile: changed\n", encoding="utf-8")
+    assert f"profile sha256 mismatch: {private_profile}" in _verify(manifest, tmp_path)
+
+
+def test_external_profile_with_stale_declared_sha_is_rejected_during_load(tmp_path):
+    path = fakes.write_ab_manifest(tmp_path)
+    private_profile = tmp_path.parent / f"{tmp_path.name}-stale-profile.yaml"
+    private_profile.write_text("profile: changed\n", encoding="utf-8")
+    doc = _read_json(path)
+    doc["profile_files"] = [{"path": str(private_profile), "sha256": "0" * 64}]
+    _write_json(path, doc)
+
+    with pytest.raises(HarnessError) as caught:
+        _load(path, repo_root=tmp_path)
+    assert caught.value.code == "HARNESS_MANIFEST_INVALID"
+    assert "profile sha256 mismatch" in caught.value.detail
+
+
+@pytest.mark.parametrize(
+    ("platform", "layer", "suite_field"),
+    [
+        ("linux", "l1.5", "selftest_report"),
+        ("linux", "l2", "testbed_template"),
+        ("linux", "l3", "realhw_config_template"),
+    ],
+    ids=["selftest", "testbed", "realhw-config"],
+)
+def test_external_suite_inputs_remain_sha_frozen_execution_artifacts(tmp_path, platform, layer, suite_field):
+    path = fakes.write_ab_manifest(tmp_path, platform=platform, layer=layer)
+    private_input = tmp_path.parent / f"{tmp_path.name}-{suite_field}.json"
+    private_input.write_text("private suite input\n", encoding="utf-8")
+    doc = _read_json(path)
+    doc["suite"][suite_field] = {"path": str(private_input), "sha256": fakes.sha256_file(private_input)}
+    _write_json(path, doc)
+
+    manifest = _load(path, repo_root=tmp_path)
+    violations = _verify(manifest, tmp_path)
+    assert not any(suite_field in item or "outside repo" in item for item in violations)
+
+
+@pytest.mark.parametrize(
+    ("value", "windows", "expected"),
+    [
+        (r"C:\repo\tests\acceptance\cases.yaml", True, "tests/acceptance/cases.yaml"),
+        ("C:/repo/tests/acceptance/cases.yaml", True, "tests/acceptance/cases.yaml"),
+        (r"D:\outside\cases.yaml", True, None),
+        (r"C:\repo\..\outside\cases.yaml", True, None),
+    ],
+    ids=["windows-backslash-absolute", "windows-forward-slash-absolute", "windows-outside", "windows-dotdot-escape"],
+)
+def test_repo_relative_path_normalizes_windows_absolute_paths_on_any_host(value, windows, expected):
+    root = PureWindowsPath("C:/repo") if windows else Path("/repo")
+    assert ab_manifest._repo_relative_path(root, value, windows=windows) == expected

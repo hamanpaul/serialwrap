@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import subprocess
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 
 import stage3_fakes as fakes
 from test_stage3_ab_manifest import (
+    _install_test_schemas,
     _read_json,
     _trusted_source_reader,
     _windows_l15_transport_fixture,
@@ -33,6 +35,7 @@ def _git(root: Path, *args: str) -> str:
 
 def test_tool_revision_mapping_check_compares_raw_bytes_under_autocrlf(tmp_path):
     manifest_path = _windows_l15_transport_fixture(tmp_path)
+    _install_test_schemas(tmp_path)
     manifest = ab_manifest.load_manifest(manifest_path, repo_root=tmp_path)
     map_ref = manifest.platform_settings["case_transport_map"]
     map_path = tmp_path / map_ref["path"]
@@ -65,6 +68,7 @@ def _write_json(path: Path, value: object) -> None:
 
 def _make_committed_fake_repo(root: Path) -> tuple[Path, str]:
     manifest_path = fakes.write_ab_manifest(root, platform="linux", layer="l1.5", stage="3")
+    _install_test_schemas(root)
     schema_source = Path(__file__).resolve().parent / "acceptance" / "stage3_required_cases.schema.json"
     schema_target = root / "tests" / "acceptance" / schema_source.name
     schema_target.parent.mkdir(parents=True, exist_ok=True)
@@ -83,6 +87,7 @@ def _make_committed_fake_repo(root: Path) -> tuple[Path, str]:
 
 
 def _verify_with_revision(path: Path, root: Path, revision: str, *, runner=run_cmd) -> list[str]:
+    _install_test_schemas(root)
     manifest = ab_manifest.load_manifest(path, repo_root=root)
     return ab_manifest.verify_frozen(
         manifest,
@@ -158,3 +163,73 @@ def test_tool_revision_allows_genuinely_untracked_candidate_context_artifact(tmp
     assert relative not in _git(tmp_path, "ls-files")
     violations = _verify_with_revision(manifest_path, tmp_path, revision)
     assert not any("tool revision" in item and relative in item for item in violations)
+
+
+def _execution_path_errors(root: Path, relative: str, revision: str) -> list[str]:
+    return ab_manifest._tool_revision_input_errors(
+        repo_root=root, relative=relative, revision=revision, run=run_cmd, execution_artifact=True,
+    )
+
+
+def test_casefold_alias_of_staged_execution_file_is_rejected(tmp_path):
+    _manifest_path, revision = _make_committed_fake_repo(tmp_path)
+    tracked = tmp_path / "reports" / "Tracked.json"
+    tracked.write_text("{}\n", encoding="utf-8")
+    _git(tmp_path, "add", "--", "reports/Tracked.json")
+
+    assert _execution_path_errors(tmp_path, "reports/tracked.json", revision) == [
+        "tool revision path case mismatch: reports/tracked.json (tracked as reports/Tracked.json)"
+    ]
+
+
+def test_casefold_alias_of_committed_execution_file_is_rejected(tmp_path):
+    _manifest_path, _old_revision = _make_committed_fake_repo(tmp_path)
+    tracked = tmp_path / "reports" / "Tracked.json"
+    tracked.write_text("{}\n", encoding="utf-8")
+    _git(tmp_path, "add", "--", "reports/Tracked.json")
+    _git(tmp_path, "commit", "-q", "-m", "add case-sensitive report")
+    revision = _git(tmp_path, "rev-parse", "HEAD")
+
+    assert _execution_path_errors(tmp_path, "reports/tracked.json", revision) == [
+        "tool revision path case mismatch: reports/tracked.json (tracked as reports/Tracked.json)"
+    ]
+
+
+def test_ambiguous_casefold_execution_paths_fail_closed(tmp_path):
+    _manifest_path, _old_revision = _make_committed_fake_repo(tmp_path)
+    _git(tmp_path, "config", "core.ignorecase", "false")
+    for name in ("Tracked.json", "tracked.JSON"):
+        (tmp_path / "reports" / name).write_text(name + "\n", encoding="utf-8")
+    _git(tmp_path, "add", "--", "reports/Tracked.json", "reports/tracked.JSON")
+    _git(tmp_path, "commit", "-q", "-m", "add ambiguous case aliases")
+    revision = _git(tmp_path, "rev-parse", "HEAD")
+
+    assert _execution_path_errors(tmp_path, "reports/tracked.json", revision) == [
+        "tool revision path case ambiguous: reports/tracked.json"
+    ]
+
+
+def test_correct_case_and_genuinely_untracked_execution_paths_remain_legal(tmp_path):
+    _manifest_path, revision = _make_committed_fake_repo(tmp_path)
+    assert _execution_path_errors(tmp_path, "reports/bridge-selftest.json", revision) == []
+
+    untracked = tmp_path / "reports" / "untracked-report.json"
+    untracked.write_text("{}\n", encoding="utf-8")
+    assert _execution_path_errors(tmp_path, "reports/untracked-report.json", revision) == []
+
+
+def test_repo_profile_staged_new_file_remains_tool_revision_controlled(tmp_path):
+    manifest_path, revision = _make_committed_fake_repo(tmp_path)
+    profile = tmp_path / "profiles" / "Private.yaml"
+    profile.write_text("profile: staged\n", encoding="utf-8")
+    _git(tmp_path, "add", "--", "profiles/Private.yaml")
+    doc = _read_json(manifest_path)
+    doc["profile_files"] = [{
+        "path": "profiles/Private.yaml",
+        "sha256": hashlib.sha256(profile.read_bytes()).hexdigest(),
+    }]
+    _write_json(manifest_path, doc)
+
+    assert f"tool revision mismatch: profiles/Private.yaml" in _verify_with_revision(
+        manifest_path, tmp_path, revision,
+    )
