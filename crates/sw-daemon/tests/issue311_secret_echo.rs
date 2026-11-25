@@ -2511,16 +2511,7 @@ fn issue312_assert_sinks_do_not_contain(
         }),
         "event sink 必須實際記錄受控 echo：{event_tail:?}"
     );
-    let wal_rows = wal
-        .lines()
-        .filter_map(|line| sw_proto::pyjson::loads(line).ok())
-        .collect::<Vec<_>>();
-    let decoded_wal = wal_rows
-        .iter()
-        .filter_map(|row| row.get("payload_b64").and_then(PyValue::as_str))
-        .flat_map(|payload| a2b_base64_lenient(payload.as_bytes()).expect("WAL payload base64"))
-        .collect::<Vec<_>>();
-    let decoded_wal = String::from_utf8_lossy(&decoded_wal);
+    let decoded_wal = issue312_decode_wal_payloads(&wal);
     let console_texts = consoles
         .iter()
         .map(|console| String::from_utf8_lossy(&console.written()).into_owned())
@@ -2535,6 +2526,19 @@ fn issue312_assert_sinks_do_not_contain(
         needles,
     );
     assert!(leaks.is_empty(), "human password sink 外洩：{leaks:?}");
+}
+
+fn issue312_decode_wal_payloads(wal_json: &str) -> String {
+    let wal_rows = wal_json
+        .lines()
+        .filter_map(|line| sw_proto::pyjson::loads(line).ok())
+        .collect::<Vec<_>>();
+    let decoded = wal_rows
+        .iter()
+        .filter_map(|row| row.get("payload_b64").and_then(PyValue::as_str))
+        .flat_map(|payload| a2b_base64_lenient(payload.as_bytes()).expect("WAL payload base64"))
+        .collect::<Vec<_>>();
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 fn issue312_find_sink_leaks(
@@ -2575,32 +2579,29 @@ fn issue312_sink_guard_detects_plaintext_mutations_in_every_sink() {
     let secret = "manual-password-312";
     let encoded = sw_proto::pycompat::b2a_base64(secret.as_bytes());
     let encoded_wal = format!(r#"{{"payload_b64":"{encoded}"}}"#);
+    let decoded_wal = issue312_decode_wal_payloads(&encoded_wal);
+    assert_eq!(decoded_wal, secret, "WAL fixture must decode the payload bytes");
     let mutations = [
-        ("WAL JSON", secret, "", "", "", vec![]),
-        ("WAL payload", &encoded_wal, secret, "", "", vec![]),
-        ("mirror", "", "", secret, "", vec![]),
-        ("event", "", "", "", secret, vec![]),
-        ("agent log", "", "", "", "", vec![secret.to_string()]),
-        ("console", "", "", "", "", vec![secret.to_string()]),
+        ("WAL JSON", secret, "", "", "", "", vec![]),
+        ("WAL payload", &encoded_wal, &decoded_wal, "", "", "", vec![]),
+        ("mirror", "", "", secret, "", "", vec![]),
+        ("event", "", "", "", secret, "", vec![]),
+        ("agent log", "", "", "", "", secret, vec![]),
+        ("console", "", "", "", "", "", vec![secret.to_string()]),
     ];
-    for (expected_sink, wal, decoded, mirror, event, console_texts) in mutations {
+    for (expected_sink, wal, decoded, mirror, event, agent_log, console_texts) in mutations {
         let leaks = issue312_find_sink_leaks(
             wal,
             decoded,
             mirror,
             event,
-            "",
+            agent_log,
             &console_texts,
             &[secret],
         );
-        let actual = if expected_sink == "agent log" {
-            issue312_find_sink_leaks(wal, decoded, mirror, event, secret, &[], &[secret])
-        } else {
-            leaks
-        };
         assert!(
-            actual.iter().any(|leak| leak.starts_with(expected_sink)),
-            "{expected_sink} 洩漏突變未被 sink guard 偵測：{actual:?}"
+            leaks.iter().any(|leak| leak.starts_with(expected_sink)),
+            "{expected_sink} 洩漏突變未被 sink guard 偵測：{leaks:?}"
         );
     }
 }

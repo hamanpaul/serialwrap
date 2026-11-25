@@ -42,12 +42,22 @@ pub struct ConsoleRecord {
     pub internal: bool,
     pub attached_at: Mono,
     pub line: LineEditor,
+    /// raw console 目前未結束行中，已確認送到 UART 的內容 bytes。
+    pub raw_line: Vec<u8>,
+    /// raw console 目前未結束行中，已確認 TX chunk；完成分類後保留原 WAL chunk 邊界。
+    pub raw_line_chunks: Vec<Vec<u8>>,
+    /// raw console 已開始一行輸入，即使目前只送出行終止符亦保持到 TX 結算。
+    pub raw_line_open: bool,
+    /// 目前輸入行開始時 reader 的 prompt generation；用來捕捉提示後又清除的交錯。
+    pub secret_line_start_generation: u64,
     /// reader 曾在目前尚未結束的輸入行期間辨識到密碼提示。
     pub secret_line_latched: bool,
     /// 目前尚未送出換行的 secret bytes 長度，與 client lifetime 一起結算。
     pub secret_line_len: usize,
     /// 令該行進入 secret 狀態的 reader prompt generation。
     pub secret_line_generation: u64,
+    /// raw secret 行是否已在 TxWriter 建立 echo matcher。
+    pub secret_echo_started: bool,
 }
 
 /// 07 D-22：回放保留；`remaining`＝本 hold 尚未結算的 HumanReplay 數。

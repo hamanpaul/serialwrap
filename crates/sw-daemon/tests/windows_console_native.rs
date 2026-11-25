@@ -180,6 +180,12 @@ fn telnet_hub_end_to_end_with_fake_serial() {
         uart_tx.extend(device.take_tx());
         uart_tx.windows(2).any(|window| window == b"ab")
     });
+    // prompt-safe raw WAL 要等整行分類；UART bytes 仍即時送出，CR 後保留原始 `ab` WAL chunk。
+    socket.write_all(b"\r").expect("結束 Telnet client 輸入行");
+    wait_for("CR 送到 FakeSerial", || {
+        uart_tx.extend(device.take_tx());
+        uart_tx.windows(3).any(|window| window == b"ab\r")
+    });
     wait_for("WAL 記錄 human TX", || wal_has_human_tx(&r, "YWI="));
     device.push_rx(b"uart-rx-from-fake-serial");
     let mut console_rx = Vec::new();

@@ -466,13 +466,9 @@ impl RxShared {
                     rx_window.resize(rx_window.len().saturating_add(pending_len), b'*');
                     armed.pending.fill(0);
                     armed.pending.clear();
-                    armed.secret.fill(0);
                     visible.push(*byte);
                     rx_window.push(*byte);
-                    visible.extend_from_slice(&data[index + 1..]);
-                    rx_window.extend_from_slice(&data[index + 1..]);
-                    matched = true;
-                    break;
+                    continue;
                 }
                 visible.push(*byte);
                 rx_window.push(*byte);

@@ -95,7 +95,7 @@ fn issue312_stale_actor_rx_does_not_rewind_reader_prompt_for_raw_or_line_input()
     });
     let raw_effects = raw.input("raw", b"part");
     let raw_secret = raw_effects.iter().find_map(|effect| match effect {
-        Effect::HumanTx { permit, .. } => permit.secret_tx,
+        Effect::HumanTx { permit, .. } => permit.secret_tx.clone(),
         _ => None,
     });
 
@@ -116,7 +116,7 @@ fn issue312_stale_actor_rx_does_not_rewind_reader_prompt_for_raw_or_line_input()
     let line_secret = start_ops(&line_effects)
         .into_iter()
         .find_map(|spec| match spec {
-            OpSpec::Command(command) => command.req.secret_tx,
+            OpSpec::Command(command) => command.req.secret_tx.clone(),
             _ => None,
         });
     assert!(

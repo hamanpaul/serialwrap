@@ -73,7 +73,7 @@ pub struct TxPermit {
 }
 
 /// human console 密碼輸入在 TxWriter 的稽核與回顯遮罩指示。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SecretTx {
     /// TX WAL 從此 byte 起記錄；UART 寫入仍使用完整 payload。
     pub log_skip_prefix: usize,
@@ -83,6 +83,8 @@ pub struct SecretTx {
     pub echo_start: bool,
     /// 本 job 前 matcher 已收到的 secret 長度，供部分 TX 回滾期望內容。
     pub echo_prior_len: usize,
+    /// 開始 matcher 時，前一個已確認 TX job 的同一輸入行內容。
+    pub echo_seed: Vec<u8>,
     /// 本行已結束，停止擴充 matcher。
     pub echo_finish: bool,
 }
@@ -1094,9 +1096,10 @@ impl TxWriter {
                     Some(reason),
                 ),
                 Precheck::Admitted => {
-                    if let (Some(rx), Some(secret)) = (&self.rx, job.permit.secret_tx) {
+                    if let (Some(rx), Some(secret)) = (&self.rx, job.permit.secret_tx.as_ref()) {
                         if secret.echo_start {
                             rx.begin_human_secret_echo();
+                            rx.extend_human_secret_echo(&secret.echo_seed);
                         }
                         let secret_len = secret.log_skip_prefix.min(job.payload.len());
                         if secret_len > 0 {
@@ -1109,7 +1112,7 @@ impl TxWriter {
                         last_reject: Cell::new(None),
                     };
                     let result = self.writer.write_gated(&job.payload, &self.cancel, &gate);
-                    if let (Some(rx), Some(secret)) = (&self.rx, job.permit.secret_tx) {
+                    if let (Some(rx), Some(secret)) = (&self.rx, job.permit.secret_tx.as_ref()) {
                         let requested_secret_len = secret.log_skip_prefix.min(job.payload.len());
                         let is_unknown = matches!(result.outcome, TxOutcome::Unknown { .. });
                         if !is_unknown {
@@ -1147,7 +1150,7 @@ impl TxWriter {
             };
 
             let confirmed = confirmed_bytes(&result.outcome);
-            let secret_meta_wal = if let Some(len) = job.permit.secret_tx.and_then(|secret| secret.meta_len) {
+            let secret_meta_wal = if let Some(len) = job.permit.secret_tx.as_ref().and_then(|secret| secret.meta_len) {
                 let mut meta = PyDict::new();
                 meta.insert("event", PyValue::from("secret_tx"));
                 meta.insert("secret_len", PyValue::Int(PyInt::Small(len as i128)));
@@ -1163,8 +1166,8 @@ impl TxWriter {
             } else {
                 None
             };
-            if let (Some(rx), Some(secret)) = (&self.rx, job.permit.secret_tx) {
-                if secret.echo_finish {
+            if let (Some(rx), Some(secret)) = (&self.rx, job.permit.secret_tx.as_ref()) {
+                if secret.echo_finish && confirmed >= job.payload.len() {
                     rx.finish_human_secret_echo();
                 }
             }
@@ -1178,11 +1181,18 @@ impl TxWriter {
                         .extend_from_slice(&job.payload[..confirmed_payload_len]);
                 }
             }
-            let tx_wal = if job.permit.log && append_key.is_none() && confirmed > 0 {
+            // 配置了密碼提示來源的 raw console 要等行界線決定整行分類；`log` 仍保留
+            // permit 的既有語意，payload 由 SessionCore 完成行結算後寫入 WAL。
+            let tx_wal = if job.permit.log
+                && !(job.permit.class == TxClass::HumanRaw && job.permit.secret_tx.is_some())
+                && append_key.is_none()
+                && confirmed > 0
+            {
                 let confirmed_payload_len = confirmed.min(job.payload.len());
                 let log_start = job
                     .permit
                     .secret_tx
+                    .as_ref()
                     .map(|secret| secret.log_skip_prefix.min(confirmed_payload_len))
                     .unwrap_or_default();
                 (confirmed_payload_len > log_start).then(|| {
@@ -1200,7 +1210,8 @@ impl TxWriter {
                 None
             };
             // 結果不明的 META 照 SC-07 寫（`Append` 亦然：Python 節流在例外分支先寫 META、finally 再記 TX）。
-            let unknown_meta_wal = if job.permit.log || append_key.is_some() {
+            let unknown_meta_wal =
+                if job.permit.log || append_key.is_some() || job.permit.class == TxClass::HumanRaw {
                 if let TxOutcome::Unknown { confirmed } = &result.outcome {
                     let requested = job.payload.len();
                     let confirmed = (*confirmed).min(requested);

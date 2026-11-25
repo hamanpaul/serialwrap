@@ -750,7 +750,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
         &q.req.source,
         Some(cmd_id),
         true,
-        q.req.secret_tx,
+        q.req.secret_tx.clone(),
     );
     if !fully_sent(&report, payload.len()) {
         return OpOutcome::CommandResult(map_send_failure(ctx, &report, payload.len(), cmd_id));
@@ -863,7 +863,7 @@ fn run_reboot(
         &q.req.source,
         Some(&q.cmd_id),
         true,
-        q.req.secret_tx,
+        q.req.secret_tx.clone(),
     );
     if !fully_sent(&report, payload.len()) {
         return OpOutcome::CommandResult(map_send_failure(

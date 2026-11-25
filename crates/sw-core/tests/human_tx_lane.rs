@@ -375,6 +375,16 @@ fn human_tx_ledger_drains_after_1000_keys() {
             })
             .unwrap();
     }
+    // raw 行要完整分類後才寫回 WAL；先結束該行，再核對 1000 筆 TX 記錄。
+    let epoch = rig.fence.with(|f| f.input_epoch);
+    rig.data_sender()
+        .send(DataEvent::ConsoleInputBytes {
+            client_id: "c1".into(),
+            client_lifetime: 1,
+            input_epoch: epoch,
+            bytes: b"\r".to_vec(),
+        })
+        .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while rig.wal_tx_payloads().iter().filter(|p| p.as_slice() == b"k").count() < 1000 {
         assert!(Instant::now() < deadline, "1000 個按鍵未全部寫出");
