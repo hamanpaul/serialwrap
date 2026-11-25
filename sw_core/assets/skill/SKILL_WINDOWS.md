@@ -69,9 +69,13 @@ serialwrap session self-test --selector COM0
 serialwrap cmd submit --selector COM0 --cmd "cat /proc/version" --source agent:demo --mode line
 ```
 
+`session self-test` 僅在 session 狀態不明時用作診斷，不是每次命令前的必做步驟，也不會鎖定目標或替下一個 RPC 保留操作權。完成診斷後，其他操作仍依一般仲裁規則競爭前景槽；共通回應與 `probe_evidence` 說明見 [Self-test 行為](../../../docs/self-test.md)。
+
 > 注意 selector 的 `COM0`/`COM1` 是 serialwrap 的**邏輯 session 編號**，
 > 不是 Windows 裝置管理員的實體 `COM5`/`COM7`；對應關係看 `session list`
 > 的 `attached_real_path`（如 `\\.\COM5`）。
+
+> `session self-test` 在忙碌狀態時會被動回覆：一般前景操作、有效 queue、login／recover 或進行中的 background capture 回 `SESSION_BUSY`；有效 agent interactive lease 回 `SESSION_INTERACTIVE_BUSY`。回應的 `recommended_action` 為 `wait`，不送 probe、不新增 UART TX、不 suspend human、不確認 ready，也不清除 readiness pending。忙碌不代表故障。等前景工作或 capture 結束後重跑即可；也可依既有規則由下一個命令終結 capture。
 
 Rust daemon 中，profile 設了 `max_console_line_chars` 的 session，`cmd submit` 會以命令 UTF-8 位元組數檢查單行上限；超過時回 `CMD_TOO_LONG`，`limit` 為 profile 值，命令不入列且不送 UART。此限制套用所有 `cmd submit` mode；human console 的整行輸入不套用。未設定上限時行為不變。
 

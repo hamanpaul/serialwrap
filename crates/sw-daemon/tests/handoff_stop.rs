@@ -657,9 +657,9 @@ fn handoff_session_query_timeout_preserves_lease_ticket() {
     assert!(!r.svc.admission().frozen(), "查詢不完整不得凍結 admission");
 }
 
-/// 背景 TX（不經 admission、不持 lease；Python `bridge.send_bytes(b"probe\n", source="system:probe")` 的對應）：
-/// 經 COM 目前 bridge 的 TxWriter 以 `SelfTestProbe` 類別送出（epoch 取 Fence 的 `active_epoch`，permit 由 Fence 重驗）。
-/// 回傳 TxWriter 的回條通道。
+/// 以 TxWriter 直接安排一筆在途的背景命令 TX（不經 admission、不持 lease）。
+/// BC-13 的 SelfTestProbe 必須先有 actor reservation；此處測交接的通用在途 TX，使用 Command permit。
+/// epoch 取 Fence 的 `active_epoch`，permit 仍由 Fence 重驗；回傳 TxWriter 的回條通道。
 fn inject_background_tx(r: &ServiceRig, payload: &[u8], op: u64) -> crossbeam_channel::Receiver<TxReport> {
     inject_background_tx_on(r, "COM0", payload, op)
 }
@@ -683,9 +683,9 @@ fn inject_background_tx_on(
             epoch,
             owner_gen: 0,
             fsm_gen: 0,
-            class: TxClass::SelfTestProbe,
-            source: "system:probe".to_string(),
-            cmd_id: None,
+            class: TxClass::Command,
+            source: "agent".to_string(),
+            cmd_id: Some(format!("handoff-bg-{op}")),
             log: true,
             input_epoch: None,
             replay_hold: None,

@@ -22,12 +22,12 @@ use sw_core::op_runner::encode_interactive_payload;
 use sw_core::self_test::SelfTestProbes;
 use sw_core::session_core::SessionRequest;
 use sw_core::tx_writer::{FlashMode, OpId};
-use sw_pal::fs_ops::TEXT_NEWLINE_STR;
 use sw_pal::fakes::serial::{FakeUartExclusive, FakeWriteStep};
+use sw_pal::fs_ops::TEXT_NEWLINE_STR;
 use sw_pal::traits::{Clock, PalError};
-use sw_proto::pycompat::{PyErr, clean_text};
+use sw_proto::pycompat::{clean_text, PyErr};
 use sw_proto::pyfmt::py_repr_str;
-use sw_proto::pyjson::{PyDict, PyInt, PyValue, loads};
+use sw_proto::pyjson::{loads, PyDict, PyInt, PyValue};
 
 const BANNER: &[u8] = b"\r\nU-Boot 2024.04 (Oct 01 2024)\r\n";
 const AUTOBOOT: &[u8] = b"\r\nHit any key to stop autoboot:  3 ";
@@ -819,6 +819,7 @@ fn selftest_ok_confirms_ready() {
             "bridge_generation",
             "probe_ok",
             "recommended_action",
+            "probe_evidence",
             "interactive_owner",
             "human_attached",
             "human_active",
@@ -871,11 +872,9 @@ fn selftest_quiet_armed_after_precheck_before_submit_zero_tx() {
     assert_eq!(h.dev.write_calls(), calls + 1, "probe job 已進 PAL");
     assert_eq!(h.dev.os_submits(), submits, "FenceSubmitGate 以 Quiet 拒絕");
     assert!(h.dev.take_tx().is_empty());
-    assert!(
-        !tx_rows(&h)
-            .iter()
-            .any(|r| r["source"] == PyValue::from("system:self_test"))
-    );
+    assert!(!tx_rows(&h)
+        .iter()
+        .any(|r| r["source"] == PyValue::from("system:self_test")));
     let s = h.get_state();
     assert_eq!(s["ready_reconfirm_pending"], PyValue::Bool(true));
     assert_eq!(s["state"], PyValue::from("READY"));
@@ -940,10 +939,15 @@ fn selftest_quiet_armed_during_submit_counts_committed() {
 #[test]
 fn selftest_probe_other_reject_zero_tx_matches_python() {
     let golden_text = std::fs::read_to_string(repo_path("contracts/golden/selftest_refused.json"))
-    .expect("golden");
+        .expect("golden");
     let PyValue::Dict(golden) = loads(&golden_text).expect("json") else {
         panic!()
     };
+    let framed_probe_len = format!(
+        "( echo __READY__00000000 ) && printf '\\n__SW_ST_%s_OK__\\n' '{}'\n",
+        "0".repeat(32)
+    )
+    .len();
     type Inject = fn(&mut sw_core::tx_writer::FenceState);
     let cases: [(&str, Inject); 4] = [
         ("drain", |f| f.frozen = true),
@@ -972,11 +976,9 @@ fn selftest_probe_other_reject_zero_tx_matches_python() {
             panic!()
         };
         assert_eq!(expected["error_code"], PyValue::from("EXCEPTION"));
-        assert_eq!(
-            PyValue::from(err.message.clone()),
-            expected["message"],
-            "{name}"
-        );
+        let golden_message = expected["message"].as_str().expect("golden message");
+        let message = golden_message.replace("0/23", &format!("0/{framed_probe_len}"));
+        assert_eq!(err.message, message, "{name}");
         assert!(
             h.clock.elapsed() - clock_before < Duration::from_secs(2),
             "{name}：不等 nonce"
@@ -1276,15 +1278,25 @@ fn log_capture_dir_not_creatable_is_exception() {
 #[test]
 fn selftest_probe_drain_race_golden() {
     // R5 審查後續：drain（release）與 probe 提交競態——結果只有「probe 已提交（回 nonce 結果）」或
-    // 「零 TX＋golden 碼（drain → EXCEPTION `tx incomplete: not_submitted 0/23 draining`）」兩種。
+    // 「零 TX＋golden 碼（拒絕訊息使用實際 shell frame 長度）」兩種。
     let golden_text = std::fs::read_to_string(repo_path("contracts/golden/selftest_refused.json"))
-    .expect("golden");
+        .expect("golden");
     let PyValue::Dict(golden) = loads(&golden_text).expect("json") else {
         panic!()
     };
-    let PyValue::Dict(drain) = golden["drain"].clone() else {
+    let PyValue::Dict(mut drain) = golden["drain"].clone() else {
         panic!()
     };
+    let framed_probe_len = format!(
+        "( echo __READY__00000000 ) && printf '\\n__SW_ST_%s_OK__\\n' '{}'\n",
+        "0".repeat(32)
+    )
+    .len();
+    let message = drain["message"]
+        .as_str()
+        .expect("golden message")
+        .replace("0/23", &format!("0/{framed_probe_len}"));
+    drain.insert("message", PyValue::from(message));
     let iterations: usize = std::env::var("SW_T14_RACE_ITERS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1369,7 +1381,6 @@ fn selftest_probe_drain_race_golden() {
     );
 }
 
-
 // ---------------------------------------------------------------------------
 // 審查 F32（8b8a40f）：bridge epoch 仍在、但 IoWorker 快照 running／serial_alive 為假 → Python
 // `BRIDGE_DOWN`＋`recommended_action:"recover"`，零 probe。
@@ -1416,7 +1427,10 @@ fn lease_expiry_timer_is_strictly_after_deadline() {
         "恰在期限：仍 active"
     );
     h.advance(Duration::from_millis(1));
-    assert!(pget(&h.public(), "interactive_session_id").is_null(), "超過期限即收回");
+    assert!(
+        pget(&h.public(), "interactive_session_id").is_null(),
+        "超過期限即收回"
+    );
 }
 
 /// 審查 F38：base64 payload 含非 ASCII → Python `data.encode("ascii")` 的 `UnicodeEncodeError` 訊息

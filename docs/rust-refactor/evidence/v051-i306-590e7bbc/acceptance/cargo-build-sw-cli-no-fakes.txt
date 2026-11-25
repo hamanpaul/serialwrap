@@ -1,0 +1,32 @@
+   Compiling version_check v0.9.5
+   Compiling typenum v1.20.1
+   Compiling memchr v2.8.3
+   Compiling foldhash v0.1.5
+   Compiling crossbeam-utils v0.8.23
+   Compiling regex-syntax v0.8.11
+   Compiling hashbrown v0.15.5
+   Compiling generic-array v0.14.7
+   Compiling libc v0.2.186
+   Compiling aho-corasick v1.1.5
+   Compiling crc32fast v1.5.0
+   Compiling cfg-if v1.0.5
+   Compiling bit-vec v0.8.0
+   Compiling hashlink v0.10.0
+   Compiling bit-set v0.8.0
+   Compiling hashbrown v0.16.1
+   Compiling arraydeque v0.5.1
+   Compiling equivalent v1.0.2
+   Compiling cpufeatures v0.2.17
+   Compiling crossbeam-channel v0.5.15
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling yaml-rust2 v0.10.4
+   Compiling digest v0.10.7
+   Compiling indexmap v2.11.4
+   Compiling sha2 v0.10.9
+   Compiling regex-automata v0.4.18
+   Compiling sw-pal v0.5.0 (<home>/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-pal)
+   Compiling fancy-regex v0.16.2
+   Compiling sw-proto v0.5.0 (<home>/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-proto)
+   Compiling sw-cli v0.5.0 (<home>/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.35s

@@ -1,0 +1,60 @@
+   Compiling version_check v0.9.5
+   Compiling typenum v1.20.1
+   Compiling cfg-if v1.0.5
+   Compiling libc v0.2.186
+   Compiling memchr v2.8.3
+   Compiling crossbeam-utils v0.8.23
+   Compiling foldhash v0.1.5
+   Compiling hashbrown v0.15.5
+   Compiling generic-array v0.14.7
+   Compiling bit-vec v0.8.0
+   Compiling aho-corasick v1.1.5
+   Compiling crc32fast v1.5.0
+   Compiling regex-syntax v0.8.11
+   Compiling hashlink v0.10.0
+   Compiling bit-set v0.8.0
+   Compiling equivalent v1.0.2
+   Compiling cpufeatures v0.2.17
+   Compiling arraydeque v0.5.1
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling hashbrown v0.16.1
+   Compiling digest v0.10.7
+   Compiling yaml-rust2 v0.10.4
+   Compiling crossbeam-channel v0.5.15
+   Compiling sha2 v0.10.9
+   Compiling indexmap v2.11.4
+   Compiling sw-pal v0.5.0 (<home>/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-pal)
+   Compiling regex-automata v0.4.18
+   Compiling md-5 v0.10.6
+   Compiling rustix v1.1.5
+   Compiling getrandom v0.3.4
+   Compiling linux-raw-sys v0.12.1
+   Compiling bitflags v2.13.2
+   Compiling fastrand v2.5.0
+   Compiling once_cell v1.21.4
+   Compiling tempfile v3.23.0
+   Compiling fancy-regex v0.16.2
+   Compiling sw-proto v0.5.0 (<home>/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-proto)
+   Compiling sw-core v0.5.0 (<home>/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-core)
+   Compiling sw-daemon v0.5.0 (<home>/prj_pri/serialwrap-worktrees/v051-i306/crates/sw-daemon)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.54s
+     Running tests/self_test_safety.rs (<home>/.cache/serialwrap-cargo/v051-i306/debug/deps/self_test_safety-1efb440c1034d32c)
+
+running 1 test
+
+thread 'rpc_probe_evidence_reports_failure_scenarios_and_pending_state' (88652) panicked at crates/sw-daemon/tests/self_test_safety.rs:235:9:
+assertion `left == right` failed: 驗收前置必須是 READY reconfirm pending，而不是只記錄 READY 初值
+  left: Bool(false)
+ right: Bool(true)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test rpc_probe_evidence_reports_failure_scenarios_and_pending_state ... FAILED
+
+failures:
+
+failures:
+    rpc_probe_evidence_reports_failure_scenarios_and_pending_state
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.16s
+
+error: test failed, to rerun pass `-p sw-daemon --test self_test_safety`

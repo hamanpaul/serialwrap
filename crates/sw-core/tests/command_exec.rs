@@ -3423,8 +3423,44 @@ fn command_cancel_running_revokes_tx_op() {
 // ---------------------------------------------------------------------------
 // 審查 F25（High，8b8a40f）／F27（Medium）：Python `recover_session`／`self_test` 不看 `foreground_busy`——
 // READY 且前景命令仍在等 prompt 時，recover 照送 `\x03`／`\x04`、self-test 照送 nonce probe；兩者都不是
-// Python 的前景 operation，不設 `foreground_busy`、不擋 agent log RX。
+// Python 的前景 operation，不設 `foreground_busy`、不擋 agent log RX。Rust 0.5.1 起 self-test 依 BC-13
+// 在前景忙碌時被動回報；recover 仍照 F25 行為送救援鍵。
 // ---------------------------------------------------------------------------
+
+const PRPL_BOOT_DONE_PROFILE: &str = "profiles:\n  r:\n    platform: prpl\n    prompt_regex: '(?m)^root@prplOS:.*# '\n    boot_done_regex: 'Please press Enter to activate this console'\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: r, act_no: 1, alias: r+1, device_by_id: /s/by-id/usb-A}\n";
+
+fn ready_prpl_with_boot_done() -> ActorRig {
+    ready_prpl_with_boot_done_profile(PRPL_BOOT_DONE_PROFILE)
+}
+
+/// issue 308（BC-09）把逾時救援的語言層預設改為 `[CTRL_C]`；需要沿用舊的 Ctrl-C→Ctrl-D 情境時明列兩鍵。
+fn ready_prpl_with_boot_done_two_recovery_keys() -> ActorRig {
+    ready_prpl_with_boot_done_profile(&PRPL_BOOT_DONE_PROFILE.replace(
+        "    timeout_s: 2.0\n",
+        "    timeout_s: 2.0\n    timeout_recovery_keys: [CTRL_C, CTRL_D]\n",
+    ))
+}
+
+fn ready_prpl_with_boot_done_profile(profile: &str) -> ActorRig {
+    let h = ActorRig::new(profile);
+    h.dev.on_tx_reply(b"\n", b"root@prplOS:~# ");
+    h.dev.on_tx_match(
+        r"__READY__[0-9a-f]+",
+        Box::new(|line: &[u8]| {
+            let text = String::from_utf8_lossy(line).into_owned();
+            let token = text
+                .split("__READY__")
+                .nth(1)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            format!("__READY__{token}\r\nroot@prplOS:~# ").into_bytes()
+        }),
+    );
+    let h = h.attach();
+    h.wait_state("READY");
+    h
+}
 
 fn ready_with_hung_command() -> (ActorRig, String) {
     let h = ActorRig::new(SHELL_PROFILE).ready();
@@ -3454,7 +3490,15 @@ fn recover_while_foreground_command_sends_recover_keys() {
 
 #[test]
 fn self_test_while_foreground_command_sends_probe() {
+    // `sends_probe` 是歷史名稱；依 BC-13，這個忙碌情境現在必須被動回覆。
     let (h, _id) = ready_with_hung_command();
+    h.wait_for("前景命令 TX 完整提交", |h| {
+        h.dev.os_submits() > 0 && h.dev.tx_since(0).ends_with(b"sleep 20\n")
+    });
+    let before_bytes = h.dev.tx_len();
+    let before_writes = h.dev.write_calls();
+    let before_submits = h.dev.os_submits();
+    let before_wal_tx = tx_rows(&h).len();
     h.dev.on_tx_match(
         r"__READY__[0-9a-f]+",
         Box::new(|line: &[u8]| {
@@ -3470,15 +3514,284 @@ fn self_test_while_foreground_command_sends_probe() {
         })
         .recv_timeout(Duration::from_secs(10))
         .expect("self-test 回覆")
+        .expect("self-test busy");
+    assert_eq!(r["classification"], PyValue::from("SESSION_BUSY"));
+    assert_eq!(r["recommended_action"], PyValue::from("wait"));
+    assert!(r.get("probe_ok").is_none(), "{r:?}");
+    assert_eq!(h.dev.tx_len(), before_bytes, "前景命令在途時不得新增 UART bytes");
+    assert_eq!(h.dev.write_calls(), before_writes, "前景命令在途時不得新增 UART write");
+    assert_eq!(h.dev.os_submits(), before_submits, "前景命令在途時不得新增 OS submit");
+    assert_eq!(tx_rows(&h).len(), before_wal_tx, "前景命令在途時不得新增 WAL TX");
+}
+
+#[test]
+fn self_test_during_recover_after_boot_done_is_passive() {
+    let h = ready_prpl_with_boot_done_two_recovery_keys();
+    h.dev.on_tx_reply(b"\x03", BANNER);
+    h.dev.on_tx_reply(b"\x04", b"\r\nroot@prplOS:~# ");
+
+    let recover = h.request_async(SessionRequest::Recover {
+        timeout_s: 2.0,
+        force: false,
+    });
+    h.wait_for("Recover Ctrl-C 後 U-Boot quiet 已 arm", |h| {
+        tx_rows(h)
+            .iter()
+            .any(|row| b64(row) == b"\x03" && row["source"] == "system:recover")
+            && h.get_state()
+                .get("boot_quiet_remaining_s")
+                .is_some_and(|remaining| !remaining.is_null())
+    });
+
+    h.inject_rx(b"\r\nPlease press Enter to activate this console\r\n");
+    h.wait_for(
+        "boot_done_regex 解除 quiet 且仍等待 READY 再確認",
+        |h| {
+            let session = h.get_state();
+            session.get("boot_quiet_remaining_s") == Some(&PyValue::Null)
+                && session.get("ready_reconfirm_pending") == Some(&PyValue::Bool(true))
+        },
+    );
+
+    let before_bytes = h.dev.tx_len();
+    let before_writes = h.dev.write_calls();
+    let before_submits = h.dev.os_submits();
+    let before_wal_tx = tx_rows(&h).len();
+    let self_test = h.request_async(SessionRequest::SelfTest {
+        timeout_s: 2.0,
+        strict_human_lock: false,
+    });
+    let passive_reply = self_test.recv_timeout(Duration::from_secs(1));
+    let after_self_test = (
+        h.dev.tx_len(),
+        h.dev.write_calls(),
+        h.dev.os_submits(),
+        tx_rows(&h).len(),
+    );
+
+    // FakeClock 仍停在原時刻時，Recover 的首鍵等待不會自行逾時；推進後須照常送 Ctrl-D。
+    h.advance(Duration::from_secs(2));
+    let recovered = recover
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Recover 回覆")
+        .expect("Recover ok");
+    assert_eq!(
+        recovered["error_code"],
+        PyValue::from("PROMPT_TIMEOUT_RECOVERED")
+    );
+    assert_eq!(recovered["recovery_action"], PyValue::from("CTRL_D"));
+    assert!(wal_tx_has(&h, b"\x04"), "Recover 後續鍵 Ctrl-D 應照常送出");
+
+    assert!(
+        passive_reply.is_ok(),
+        "self-test 必須在 Recover 後續鍵送出前被動回覆，實際為 {passive_reply:?}"
+    );
+    let result = passive_reply
+        .expect("已收到被動 self-test 回覆")
         .expect("self-test ok");
-    assert_ne!(r["error_code"], PyValue::from("SESSION_BUSY"), "{r:?}");
-    assert_eq!(r["classification"], PyValue::from("OK"));
+    assert_eq!(result["classification"], PyValue::from("SESSION_BUSY"));
+    assert_eq!(result["recommended_action"], PyValue::from("wait"));
+    assert!(result.get("probe_ok").is_none(), "{result:?}");
+    assert_eq!(
+        after_self_test.0, before_bytes,
+        "Recover 等待中 self-test 不得新增 UART bytes"
+    );
+    assert_eq!(
+        after_self_test.1, before_writes,
+        "Recover 等待中 self-test 不得新增 UART write"
+    );
+    assert_eq!(
+        after_self_test.2, before_submits,
+        "Recover 等待中 self-test 不得新增 OS submit"
+    );
+    assert_eq!(
+        after_self_test.3, before_wal_tx,
+        "Recover 等待中 self-test 不得新增 WAL TX"
+    );
+}
+
+#[test]
+fn self_test_during_recover_stays_busy_when_wal_health_recovers() {
+    // WAL 暫時故障不撤銷仍有效的 Recover side-op；恢復寫入後不得讓既有 probe 競爭救援鍵。
+    let h = ActorRig::new(&shell_profile_with_two_recovery_keys()).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\n");
+    h.dev.on_tx_reply(b"\x04", b"^D\r\nroot@t:/# ");
+
+    let recover = h.request_async(SessionRequest::Recover {
+        timeout_s: 2.0,
+        force: false,
+    });
+    h.wait_for("Recover 已送 Ctrl-C 並等待 prompt", |h| {
+        tx_rows(h)
+            .iter()
+            .any(|row| b64(row) == b"\x03" && row["source"] == "system:recover")
+    });
+
+    h.fail_next_wal_write(PalError::io(28, "injected temporary WAL write failure"));
+    assert!(
+        !h.append_wal_for_test("RX", "test:wal-health", b"temporary failure"),
+        "受控的 WAL append 必須失敗"
+    );
+    assert!(!h.wal_health().healthy, "失敗 append 應發布 WAL unhealthy");
+    assert!(h.fence.with(|fence| fence.wal_unhealthy));
+
+    h.dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+    h.dev.on_tx_match(
+        r"__READY__[0-9a-f]+",
+        Box::new(|line: &[u8]| {
+            let text = String::from_utf8_lossy(line).into_owned();
+            let token = text
+                .split("__READY__")
+                .nth(1)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            format!("__READY__{token}\r\n").into_bytes()
+        }),
+    );
+    let before = (
+        h.dev.tx_len(),
+        h.dev.write_calls(),
+        h.dev.os_submits(),
+        tx_rows(&h)
+            .iter()
+            .filter(|row| row["source"] == "system:self_test")
+            .count(),
+    );
+    let self_test = h.request_async(SessionRequest::SelfTest {
+        timeout_s: 2.0,
+        strict_human_lock: false,
+    });
+
+    let passive_before_recovery = self_test.recv_timeout(Duration::from_millis(100)).ok();
+    let probe_paused_before_recovery = h.dev.wait_paused(Duration::from_millis(100));
+    assert!(
+        h.append_wal_for_test("RX", "test:wal-health", b"recovered WAL"),
+        "後續成功 append 應恢復 WAL health"
+    );
+    assert!(h.wal_health().healthy);
+    assert!(!h.fence.with(|fence| fence.wal_unhealthy));
+    h.dev.release_pause();
+
+    let result = passive_before_recovery.unwrap_or_else(|| {
+        self_test
+            .recv_timeout(Duration::from_secs(5))
+            .expect("self-test 回覆")
+    });
+    let result = result.expect("self-test RPC 成功");
+    let after = (
+        h.dev.tx_len(),
+        h.dev.write_calls(),
+        h.dev.os_submits(),
+        tx_rows(&h)
+            .iter()
+            .filter(|row| row["source"] == "system:self_test")
+            .count(),
+    );
+
+    h.advance(Duration::from_secs(2));
+    let recovered = recover
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Recover 回覆")
+        .expect("Recover RPC 成功");
+
+    assert!(
+        !probe_paused_before_recovery,
+        "仍有效 Recover 等待中，self-test 不得啟動 probe"
+    );
+    assert_eq!(result["classification"], PyValue::from("SESSION_BUSY"));
+    assert_eq!(result["recommended_action"], PyValue::from("wait"));
+    assert_eq!(after, before, "WAL health 恢復前後不得多送 self-test probe");
+    assert_eq!(recovered["error_code"], PyValue::from("PROMPT_TIMEOUT_RECOVERED"));
+    assert_eq!(recovered["recovery_action"], PyValue::from("CTRL_D"));
+    assert!(wal_tx_has(&h, b"\x04"), "Recover 後續 Ctrl-D 應照常送出");
+}
+
+#[test]
+fn self_test_and_get_state_do_not_wait_for_recover_tx_fence() {
+    // PauseInsideSubmit 持有 TX fence；self-test 與 actor 查詢都必須在 OS submit 返回前回覆。
+    let h = ActorRig::new(&shell_profile_with_two_recovery_keys()).ready();
+    h.dev.script_write(vec![FakeWriteStep::PauseInsideSubmit]);
+    h.dev.on_tx_reply(b"\x03", b"^C\r\n");
+    h.dev.on_tx_reply(b"\x04", b"^D\r\nroot@t:/# ");
+
+    let recover = h.request_async(SessionRequest::Recover {
+        timeout_s: 2.0,
+        force: false,
+    });
+    assert!(
+        h.dev.wait_paused(Duration::from_secs(2)),
+        "Recover 救援鍵應在持有 fence 的 OS 提交內暫停"
+    );
+
+    let before_self_test_tx = tx_rows(&h)
+        .iter()
+        .filter(|row| row["source"] == "system:self_test")
+        .count();
+    let self_test = h.request_async(SessionRequest::SelfTest {
+        timeout_s: 2.0,
+        strict_human_lock: false,
+    });
+    let query = h.request_async(SessionRequest::GetState);
+    let self_test_before_release = self_test.recv_timeout(Duration::from_millis(250)).ok();
+    let query_before_release = query.recv_timeout(Duration::from_millis(250)).ok();
+    let self_test_replied_before_release = self_test_before_release.is_some();
+    let query_replied_before_release = query_before_release.is_some();
+
+    h.dev.release_pause();
+    let self_test_reply = self_test_before_release.unwrap_or_else(|| {
+        self_test
+            .recv_timeout(Duration::from_secs(5))
+            .expect("self-test 回覆")
+    });
+    let query_reply = query_before_release.unwrap_or_else(|| {
+        query
+            .recv_timeout(Duration::from_secs(5))
+            .expect("GetState 回覆")
+    });
+    let result = self_test_reply.expect("self-test RPC 成功");
+    let query_result = query_reply.expect("GetState RPC 成功");
+
+    h.wait_for("Recover Ctrl-C 提交完成", |h| {
+        tx_rows(h)
+            .iter()
+            .any(|row| b64(row) == b"\x03" && row["source"] == "system:recover")
+    });
+    assert_eq!(
+        result["classification"],
+        PyValue::from("SESSION_BUSY"),
+        "Recover 等待期間 self-test 應被動回覆：{result:?}"
+    );
+    assert!(
+        self_test_replied_before_release && query_replied_before_release,
+        "self-test 與 GetState 應在 fence 解鎖前回覆"
+    );
+    assert_eq!(result["recommended_action"], PyValue::from("wait"));
+    assert!(query_result.get("session").is_some(), "GetState 應正常回覆");
+    assert_eq!(
+        tx_rows(&h)
+            .iter()
+            .filter(|row| row["source"] == "system:self_test")
+            .count(),
+        before_self_test_tx,
+        "Recover 提交持鎖期間 self-test 不得新增 probe TX"
+    );
+
+    h.advance(Duration::from_secs(2));
+    let recovered = recover
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Recover 回覆")
+        .expect("Recover RPC 成功");
+    assert_eq!(recovered["error_code"], PyValue::from("PROMPT_TIMEOUT_RECOVERED"));
+    assert_eq!(recovered["recovery_action"], PyValue::from("CTRL_D"));
 }
 
 #[test]
 fn self_test_probe_in_flight_is_not_foreground_busy() {
-    // F27：nonce probe 等待中（裝置不回 nonce）：`foreground_busy` 為 false、`outstanding_commands` 為 0。
+    // F27：完整執行 probe 未獲回應時，仍在途且不計入 foreground_busy／outstanding_commands。
     let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.clear_replies();
+    let wait_start = h.rx.regex_wait_starts_for_test();
     let rx = h.request_async(SessionRequest::SelfTest {
         timeout_s: 2.0,
         strict_human_lock: false,
@@ -3488,6 +3801,10 @@ fn self_test_probe_in_flight_is_not_foreground_busy() {
             .iter()
             .any(|r| String::from_utf8_lossy(&b64(r)).contains("__READY__"))
     });
+    h.wait_for("self-test 等待 marker", |h| {
+        h.rx.regex_wait_starts_for_test() > wait_start
+    });
+    assert!(rx.is_empty(), "probe 等待執行證據時 RPC 必須尚未完成");
     let s = h.get_state();
     assert_eq!(s["foreground_busy"], PyValue::Bool(false));
     assert_eq!(s["outstanding_commands"], PyValue::from(0));
