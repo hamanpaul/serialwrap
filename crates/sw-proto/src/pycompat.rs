@@ -868,6 +868,71 @@ mod tests {
         assert_eq!(py_repr_str("\u{ad}"), "'\\xad'");
         assert_eq!(py_repr_str("é"), "'é'");
     }
+
+    #[test]
+    fn clean_text_with_source_ranges_matches_text_and_byte_ranges_systematically() {
+        let explicit: &[(&str, &str, &[std::ops::Range<usize>])] = &[
+            ("A\x1b[31mB", "AB", &[0..1, 6..7]),
+            ("A\x07é", "Aé", &[0..1, 2..4]),
+            ("ab\x08c", "ac", &[0..1, 3..4]),
+            ("ab\x7fc", "ac", &[0..1, 3..4]),
+            ("a\rb", "ab", &[0..1, 2..3]),
+            ("a\r\nb", "a\nb", &[0..1, 1..3, 3..4]),
+            ("é😀z", "é😀z", &[0..2, 2..6, 6..7]),
+            (
+                "é\x1b[31mA\x07b\x08😀\x7fC\rD\r\nE\rZ",
+                "éACD\nEZ",
+                &[0..2, 7..8, 16..17, 18..19, 19..21, 21..22, 23..24],
+            ),
+            ("x\x1b]0;title\x07y", "xy", &[0..1, 11..12]),
+        ];
+
+        fn verify(raw: &str) {
+            let (actual, sources) = clean_text_with_source_ranges(raw);
+            assert_eq!(actual, clean_text(raw), "cleaned text differs for {raw:?}");
+            let chars: Vec<char> = actual.chars().collect();
+            assert_eq!(chars.len(), sources.len(), "range count for {raw:?}");
+            let mut previous_end = 0;
+            for (ch, source) in chars.iter().zip(&sources) {
+                assert!(source.start >= previous_end, "overlapping source ranges for {raw:?}: {sources:?}");
+                assert!(source.start < source.end && source.end <= raw.len(), "invalid source range for {raw:?}: {source:?}");
+                assert!(raw.is_char_boundary(source.start) && raw.is_char_boundary(source.end), "range splits UTF-8 for {raw:?}: {source:?}");
+                let original = &raw[source.clone()];
+                assert!(
+                    original == ch.to_string() || (*ch == '\n' && matches!(original, "\n" | "\r\n")),
+                    "output {ch:?} maps to unexpected original bytes {original:?} at {source:?} in {raw:?}"
+                );
+                previous_end = source.end;
+            }
+        }
+
+        for (raw, expected, ranges) in explicit {
+            let (actual, actual_ranges) = clean_text_with_source_ranges(raw);
+            assert_eq!(&actual, expected, "cleaned text for {raw:?}");
+            assert_eq!(&actual, &clean_text(raw), "clean_text equivalence for {raw:?}");
+            assert_eq!(&actual_ranges, ranges, "source byte ranges for {raw:?}");
+            verify(raw);
+        }
+
+        // 有界組合交錯 ANSI、BEL、BS、DEL、CR、LF、CRLF 與多位元組字元，避免只覆蓋手選排列。
+        fn enumerate(atoms: &[&str], remaining: usize, current: &mut String) {
+            verify(current);
+            if remaining == 0 {
+                return;
+            }
+            for atom in atoms {
+                let previous_len = current.len();
+                current.push_str(atom);
+                enumerate(atoms, remaining - 1, current);
+                current.truncate(previous_len);
+            }
+        }
+        let atoms = [
+            "A", "é", "😀", "\x07", "\x08", "\x7f", "\r", "\n", "\r\n", "\x1b[31m",
+            "\x1b]0;t\x07",
+        ];
+        enumerate(&atoms, 3, &mut String::new());
+    }
 }
 
 /// Python 例外的 RPC 邊界表示（Slice 2.1 Task 0c；紅燈階段骨架）。

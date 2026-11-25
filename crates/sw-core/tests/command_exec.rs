@@ -761,6 +761,37 @@ fn i294_fragmented_wrapped_echo_waits_for_complete_command() {
 }
 
 #[test]
+fn i294_busybox_wrap_after_command_space_keeps_actor_completion_anchored() {
+    let h = ActorRig::new_with_hub(SHELL_PROFILE).ready();
+    let console = h.attach_pty_console("i294-wrap-command-space");
+    console.push_input(b"echo HUMAN\n");
+    wait_tx(&h, b"echo HUMAN\n");
+
+    let command = format!("echo {} {}", "x".repeat(40), "y".repeat(40));
+    let cut = 5 + 40 + 1;
+    let tx_count = h.wal_tx_payloads().len();
+    let id = h.submit_with(&command, |r| r.timeout_s = 0.2);
+    wait_tx(&h, format!("{command}\n").as_bytes());
+
+    let raw = format!(
+        "{}\r\r\n{}\r\nOUT\r\nroot@t:/# ",
+        &command[..cut],
+        &command[cut..]
+    );
+    h.inject_rx_processed(raw.as_bytes());
+    h.advance(Duration::from_millis(200));
+    let result = h.wait_done(&id);
+    assert_eq!(result["status"], PyValue::from("done"));
+    assert_eq!(result["stdout"], PyValue::from("OUT"));
+    assert_eq!(result["partial"], PyValue::Bool(false));
+    assert_eq!(
+        wal_tx_bytes_since(&h, tx_count),
+        format!("{command}\n").as_bytes(),
+        "折行 echo 不增加或重送 TX"
+    );
+}
+
+#[test]
 fn i294_documented_repeated_echo_compatibility_drops_command_equal_stdout_line() {
     let h = ActorRig::new(SHELL_PROFILE).ready();
     let tx_count = h.wal_tx_payloads().len();
@@ -4983,6 +5014,68 @@ fn wrapped_echo_busybox_newline_replacing_command_space_is_kept() {
     assert_eq!(&c[55..56], " ");
     let raw = format!("{}\r\r\n{}\r\nOUT\r\n{WRAP_PROMPT}", &c[..55], &c[56..]);
     assert_eq!(wrap_extract(&raw, &c), format!("{}\n{}\nOUT", &c[..55], &c[56..]));
+}
+
+#[test]
+fn wrapped_echo_whitespace_boundary_matrix() {
+    let prompt = WRAP_PROMPT;
+    let check = |raw: String, command: &str, expected: String| {
+        assert_eq!(wrap_extract(&raw, command), expected, "command={command:?} raw={raw:?}");
+    };
+
+    // R4-01：命令原有空白緊接 BusyBox 折行；該空白既像 readline 標記，也必須保留為命令字元。
+    let command = format!("echo {} {}", "x".repeat(40), "y".repeat(40));
+    let cut = 5 + 40 + 1;
+    check(
+        format!("{}\r\r\n{}\r\nOUT\r\n{prompt}", &command[..cut], &command[cut..]),
+        &command,
+        "OUT".into(),
+    );
+
+    // readline 插入空白位於命令空白前後，以及連續兩個命令空白之間。
+    let command = format!("echo {} {}", "x".repeat(74), "y".repeat(20));
+    for cut in [5 + 74, 5 + 74 + 1] {
+        let echo = readline_wrapped(&command, &[cut]);
+        check(format!("{echo}\r\nOUT\r\n{prompt}"), &command, "OUT".into());
+    }
+    let command = format!("echo {}  {}", "x".repeat(40), "y".repeat(40));
+    let echo = readline_wrapped(&command, &[5 + 40 + 1]);
+    check(format!("{echo}\r\nOUT\r\n{prompt}"), &command, "OUT".into());
+
+    // 同一 echo 內多次折行並混用 BusyBox 與 readline 標記。
+    let command = format!("echo {} {} {}", "a".repeat(30), "b".repeat(35), "c".repeat(40));
+    let echo = format!(
+        "{}\r\r\n{} \r{}",
+        &command[..25],
+        &command[25..60],
+        &command[60..]
+    );
+    check(format!("{echo}\r\nOUT\r\n{prompt}"), &command, "OUT".into());
+
+    // 折行標記不得出現在第一個命令字元之前，亦不得出現在命令完成後。
+    let command = format!("echo {}", "z".repeat(40));
+    check(
+        format!(" \r{command}\r\nOUT\r\n{prompt}"),
+        &command,
+        format!(" {command}\nOUT"),
+    );
+    check(
+        format!("\r\r\n{command}\r\nOUT\r\n{prompt}"),
+        &command,
+        format!("{command}\nOUT"),
+    );
+    check(
+        format!("{command} \r\r\nOUT\r\n{prompt}"),
+        &command,
+        format!("{command} \nOUT"),
+    );
+
+    // BusyBox 的換行緊接完整命令，可作為 echo 的行尾。
+    check(
+        format!("{command}\r\r\nOUT\r\n{prompt}"),
+        &command,
+        "OUT".into(),
+    );
 }
 
 // ---------------------------------------------------------------------------

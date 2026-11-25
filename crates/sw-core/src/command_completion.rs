@@ -109,6 +109,17 @@ fn find_command_echo(
             .position(|c| *c == '\n')
             .map_or(chars.len(), |n| line_start + n);
         for candidate in line_start..line_end {
+            if candidate == line_start && line_start > 0 && chars[line_start - 1] == '\n' {
+                let previous_line_start = chars[..line_start - 1]
+                    .iter()
+                    .rposition(|ch| *ch == '\n')
+                    .map_or(0, |index| index + 1);
+                if previous_line_start == line_start - 1
+                    && wraps.is_wrap_at(line_start - 1, '\n')
+                {
+                    continue;
+                }
+            }
             if chars[candidate] != first {
                 continue;
             }
@@ -123,16 +134,15 @@ fn find_command_echo(
                 &command_chars,
                 wraps,
                 line_start,
+                |local_end| chars.get(line_start + local_end) == Some(&'\n'),
             ) else {
                 continue;
             };
             let command_end = line_start + local_end;
-            if chars.get(command_end) == Some(&'\n') {
-                return Some(EchoRange {
-                    _command: candidate..command_end,
-                    after_line: command_end + 1,
-                });
-            }
+            return Some(EchoRange {
+                _command: candidate..command_end,
+                after_line: command_end + 1,
+            });
         }
         if line_end == chars.len() {
             break;
@@ -279,6 +289,67 @@ mod tests {
             ),
             Evaluation::Complete { stdout: "next".into() }
         );
+    }
+
+    #[test]
+    fn wrapped_echo_matching_handles_whitespace_ambiguities() {
+        let prompt = r"(?m)^root@t:.*# ";
+        let check = |command: &str, echo: &str, expected: Evaluation| {
+            let evaluator = evaluator(command, prompt);
+            let raw = format!("{echo}\r\nOUT\r\nroot@t:/# ");
+            assert_eq!(evaluator.evaluate(&raw, true, false), expected, "{raw:?}");
+        };
+        let complete = Evaluation::Complete {
+            stdout: "OUT".into(),
+        };
+        let uncertain = |stdout: String| Evaluation::Uncertain { stdout };
+
+        // 命令原有空白正好位於 BusyBox 折行前；原始 ` \r\r\n` 同時符合空白與換行標記。
+        let command = format!("echo {} {}", "x".repeat(40), "y".repeat(40));
+        let cut = 5 + 40 + 1;
+        let echo = format!("{}\r\r\n{}", &command[..cut], &command[cut..]);
+        check(&command, &echo, complete.clone());
+
+        // readline 插入空白分別位於命令空白之前、之後。
+        let command = format!("echo {} {}", "x".repeat(74), "y".repeat(20));
+        let before = 5 + 74;
+        for cut in [before, before + 1] {
+            let echo = format!("{} \r{}", &command[..cut], &command[cut..]);
+            check(&command, &echo, complete.clone());
+        }
+
+        // 連續兩個命令空白之間有 readline 插入空白。
+        let command = format!("echo {}  {}", "x".repeat(40), "y".repeat(40));
+        let cut = 5 + 40 + 1;
+        let echo = format!("{} \r{}", &command[..cut], &command[cut..]);
+        check(&command, &echo, complete.clone());
+
+        // 同一 echo 混用 BusyBox 與 readline 標記，且有多次折行。
+        let command = format!("echo {} {} {}", "a".repeat(30), "b".repeat(35), "c".repeat(40));
+        let echo = format!(
+            "{}\r\r\n{} \r{}",
+            &command[..25],
+            &command[25..60],
+            &command[60..]
+        );
+        check(&command, &echo, complete.clone());
+
+        // 命令第一個字元之前的 readline 標記不是 echo 內折行；最後字元之後的插入空白也不能完成 echo。
+        let command = format!("echo {}", "z".repeat(40));
+        let leading = format!(" \r{command}");
+        check(&command, &leading, uncertain(format!(" {command}\nOUT")));
+        let leading_busybox = format!("\r\r\n{command}");
+        check(&command, &leading_busybox, uncertain(format!("{command}\nOUT")));
+        let trailing_readline = format!("{command} \r");
+        check(
+            &command,
+            &trailing_readline,
+            uncertain(format!("{command} \nOUT")),
+        );
+
+        // BusyBox 換行在命令最後一個字元之後是完整 echo 的行界線。
+        let trailing_busybox = format!("{command}\r\r\n");
+        check(&command, &trailing_busybox, complete);
     }
 
     #[test]
