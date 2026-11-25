@@ -1551,26 +1551,50 @@ def test_upgrade_rejects_alternate_nested_flow_layout_as_candidate_profile_field
     assert migration["detail"]["live_profile_has_field"] is True, migration
 
 
+def _simulate_windows_candidate_cli(driver, tmp_path):
+    """建立只有 `.exe` 候選檔的 bundle，於 POSIX 測試 Windows 檔名語意。"""
+    import shutil
+
+    source_version = driver.bundle / "versions" / NEW_VERSION
+    windows_bundle = tmp_path / "windows-bundle"
+    windows_version = windows_bundle / "versions" / NEW_VERSION
+    shutil.copytree(source_version, windows_version)
+    source_cli = windows_version / "bin" / driver.new_cli.name
+    windows_candidate = windows_version / "bin" / "serialwrap.exe"
+    candidate_bytes = source_cli.read_bytes()
+    if source_cli != windows_candidate:
+        source_cli.unlink()
+    windows_candidate.write_bytes(candidate_bytes)
+    driver.bundle = windows_bundle
+    driver.new_cli = windows_candidate
+    target = windows_version / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
+    return target, windows_candidate
+
+
 @pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_candidate_cli_path_mismatch_returns_structured_fail(fake_driver, tmp_path):
     """目前 CLI 與 bundle 候選路徑不一致時應回傳 FAIL 列，不得拋例外。"""
     driver, _fake = fake_driver(cli_version=NEW_VERSION)
-    target = driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
-    configured_cli = tmp_path / "configured-copy" / "bin" / "serialwrap"
+    target, windows_candidate = _simulate_windows_candidate_cli(driver, tmp_path)
+    cli_name = driver.new_cli.name
+    candidate_cli = driver.bundle / "versions" / NEW_VERSION / "bin" / cli_name
+    configured_cli = tmp_path / "configured-copy" / "bin" / cli_name
     configured_cli.parent.mkdir(parents=True)
     configured_cli.write_text("not the bundle candidate", encoding="utf-8")
     driver.new_cli = configured_cli
 
+    assert candidate_cli == windows_candidate
+    assert candidate_cli.is_file()
+    assert windows_candidate.is_file()
+    assert configured_cli.is_file()
     result = driver.verify_candidate_p290_asset(target)
 
     assert result["verdict"] == "FAIL", result
     assert result["id"] == "candidate_cli_p290_asset", result
     assert result["reason"] == "目前 CLI 並非本次候選版本", result
     assert result["detail"]["configured_cli_path"] == str(configured_cli.resolve()), result
-    assert result["detail"]["candidate_cli_path"] == str(
-        (driver.bundle / "versions" / NEW_VERSION / "bin" / configured_cli.name).resolve()
-    ), result
+    assert result["detail"]["candidate_cli_path"] == str(candidate_cli.resolve()), result
 
 
 @pytest.mark.core_portable
@@ -1578,12 +1602,16 @@ def test_candidate_cli_path_mismatch_returns_structured_fail(fake_driver, tmp_pa
 def test_candidate_cli_missing_path_returns_configured_path_evidence(fake_driver, tmp_path):
     """bundle 候選 CLI 缺失時，FAIL 列仍須帶回設定 CLI 路徑與解析錯誤。"""
     driver, _fake = fake_driver(cli_version=NEW_VERSION)
-    target = driver.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles" / "default.yaml"
-    configured_cli = tmp_path / "configured-copy" / "bin" / "serialwrap"
+    target, windows_candidate = _simulate_windows_candidate_cli(driver, tmp_path)
+    cli_name = driver.new_cli.name
+    configured_cli = tmp_path / "configured-copy" / "bin" / cli_name
     configured_cli.parent.mkdir(parents=True)
     configured_cli.write_text("configured CLI", encoding="utf-8")
-    candidate_cli = driver.bundle / "versions" / NEW_VERSION / "bin" / configured_cli.name
+    candidate_cli = driver.bundle / "versions" / NEW_VERSION / "bin" / cli_name
+    assert candidate_cli == windows_candidate
+    assert candidate_cli.is_file()
     candidate_cli.unlink()
+    assert not candidate_cli.exists()
     driver.new_cli = configured_cli
 
     result = driver.verify_candidate_p290_asset(target)
@@ -1778,6 +1806,7 @@ def test_upgrade_accepts_installed_copy_of_candidate_cli(fake_driver, tmp_path, 
 
     driver, _fake = fake_driver(cli_version=NEW_VERSION)
     source_version = driver.bundle / "versions" / NEW_VERSION
+    source_cli_name = driver.new_cli.name
     installed_version = tmp_path / "installed" / "versions" / NEW_VERSION
     shutil.copytree(source_version, installed_version)
     installed_cli = installed_version / "bin" / driver.new_cli.name
@@ -1846,6 +1875,37 @@ def test_upgrade_accepts_installed_copy_of_candidate_cli(fake_driver, tmp_path, 
         embedded = probe_result["detail"]["candidate_cli_p290_asset"]
         assert embedded["verdict"] == "PASS", embedded
         assert embedded["detail"]["active_cli_path"] == str(windows_installed_cli.resolve())
+
+    # Windows 模擬也保留無副檔名 CLI；即使 shutil.which 找不到，精確 PATH 查找仍須定位安裝副本。
+    extensionless_bundle = tmp_path / "windows-extensionless-bundle"
+    extensionless_version = extensionless_bundle / "versions" / NEW_VERSION
+    shutil.copytree(source_version, extensionless_version)
+    extensionless_source_cli = extensionless_version / "bin" / source_cli_name
+    extensionless_candidate = extensionless_version / "bin" / "serialwrap"
+    extensionless_candidate_bytes = extensionless_source_cli.read_bytes()
+    if extensionless_source_cli != extensionless_candidate:
+        extensionless_source_cli.unlink()
+    extensionless_candidate.write_bytes(extensionless_candidate_bytes)
+    extensionless_installed_version = tmp_path / "windows-extensionless-installed" / "versions" / NEW_VERSION
+    shutil.copytree(extensionless_version, extensionless_installed_version)
+    extensionless_installed_cli = extensionless_installed_version / "bin" / "serialwrap"
+    driver.bundle = extensionless_bundle
+    driver.new_cli = extensionless_candidate
+    driver.env["PATH"] = os.pathsep.join((
+        str(tmp_path / "missing-extensionless-active-bin"),
+        str(extensionless_installed_cli.parent),
+    ))
+    extensionless_result = driver.judge_doctor(
+        "doctor_green_new", "Windows 無副檔名 CLI 精確 PATH 查找", require_pairing=True,
+        profile_policy=driver.profile_policies["new"],
+    )
+    assert extensionless_result["verdict"] == "PASS", extensionless_result
+    extensionless_embedded = extensionless_result["detail"]["candidate_cli_p290_asset"]
+    assert extensionless_embedded["verdict"] == "PASS", extensionless_embedded
+    assert extensionless_embedded["detail"]["active_cli_path"] == str(extensionless_installed_cli.resolve())
+    assert extensionless_embedded["detail"]["candidate_cli_sha256"] == extensionless_embedded["detail"][
+        "active_cli_sha256"
+    ]
 
 
 @pytest.mark.core_portable
