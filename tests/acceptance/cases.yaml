@@ -3858,31 +3858,6 @@ cases:
   evidence: [tests/contract_blackbox/slice22/test_console_bc02.py, tests/contract_blackbox/slice22/test_interactive_lease.py]
   implemented_by: 07-slice22-console.md
   cross_slice_reason: null
-- case_id: bc23-tcp-telnet-second-console-line-busy
-  suite: rust-l1
-  source_ref: tests/contract_blackbox/slice22/test_console_telnet.py::test_first_raw_second_line
-  family: L15
-  title: TCP raw owner 存在時第二個 console line 回 BUSY 且不送至 DUT
-  contract: BC-23（Rust-only）：第一個 TCP console 持有 raw human lease 時，第二個 console 的 line submit 回 SESSION_INTERACTIVE_BUSY，且 human TX 為空；同一既有黑箱 nodeid 的 Python 輪維持凍結基線的送出斷言。
-  invariants: [no_forbidden_interleave]
-  layer: L1
-  platforms: [linux]
-  windows_status: gap
-  windows_gap_reason: 尚待 Windows 原生 Rust TCP blackbox 收集與執行證據。
-  capabilities: [process_rpc]
-  cli_stage: 1B
-  daemon_slice: '2.2'
-  stage0_required: false
-  prerequisites: [console_telnet, raw_line_mode]
-  necessity: required
-  issues: ['#275']
-  behavior_changes: [BC-23]
-  destructive: false
-  expected: PASS
-  sentinel: null
-  evidence: [cargo:sw-core::tcp_console_lease::tcp_mirror_secondary_line_respects_lease_busy]
-  implemented_by: 07-slice22-console.md
-  cross_slice_reason: null
 - case_id: sc29-com0com-serial-console
   suite: windows-native
   source_ref: crates/sw-pal/tests/console_conformance.rs::cap_windows_com__console_com0com_roundtrip

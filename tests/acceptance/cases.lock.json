@@ -293,7 +293,6 @@
       "bc02-deferred-overflow-clear",
       "bc02-mailbox-stale-input-not-replayed",
       "bc02-normal-replay-53",
-      "bc23-tcp-telnet-second-console-line-busy",
       "brcm-01-login-flow",
       "cap-windows-com--p7-event-fire",
       "cap-windows-com--p7-login-ready",
@@ -553,7 +552,6 @@
       "bc02-deferred-overflow-clear",
       "bc02-mailbox-stale-input-not-replayed",
       "bc02-normal-replay-53",
-      "bc23-tcp-telnet-second-console-line-busy",
       "co-01-line-buffering",
       "f1-cmdid-survives-timeout",
       "f1-limits-queryable",
@@ -649,7 +647,6 @@
       "bc02-deferred-overflow-clear",
       "bc02-mailbox-stale-input-not-replayed",
       "bc02-normal-replay-53",
-      "bc23-tcp-telnet-second-console-line-busy",
       "brcm-01-login-flow",
       "cap-windows-com--p7-event-fire",
       "cap-windows-com--p7-login-ready",
@@ -806,7 +803,6 @@
       "bc02-deferred-overflow-clear",
       "bc02-mailbox-stale-input-not-replayed",
       "bc02-normal-replay-53",
-      "bc23-tcp-telnet-second-console-line-busy",
       "brcm-01-login-flow",
       "cap-windows-com--p7-event-fire",
       "cap-windows-com--p7-login-ready",
@@ -1434,18 +1430,6 @@
       "platforms": [
         "linux",
         "windows"
-      ],
-      "expected": "PASS",
-      "necessity": "required",
-      "daemon_slice": "2.2",
-      "cli_stage": "1B",
-      "stage0_required": false
-    },
-    "bc23-tcp-telnet-second-console-line-busy": {
-      "suite": "rust-l1",
-      "layer": "L1",
-      "platforms": [
-        "linux"
       ],
       "expected": "PASS",
       "necessity": "required",

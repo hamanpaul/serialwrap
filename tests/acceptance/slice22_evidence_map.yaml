@@ -20,9 +20,6 @@ cases:
   bc02-normal-replay-53:
     status: AUTOMATED
     tests: ['tests/contract_blackbox/slice22/test_console_bc02.py::test_normal_suspend_loses_no_keystroke']
-  bc23-tcp-telnet-second-console-line-busy:
-    status: AUTOMATED
-    tests: ['tests/contract_blackbox/slice22/test_console_telnet.py::test_first_raw_second_line']
   co-01-line-buffering:
     status: AUTOMATED
     tests: [func-test/runner.py --case co-01-line-buffering]

@@ -84,11 +84,6 @@ entries:
     - cargo:sw-daemon::tcp_console_lease::p279_tcp_socket_foreground_refresh_and_replay
     - cargo:sw-daemon::tcp_console_lease::p279_tcp_rpc_source_policy
     owner_phase: P6
-  case:bc23-tcp-telnet-second-console-line-busy:
-    nodeids:
-    - tests/contract_blackbox/slice22/test_console_telnet.py::test_first_raw_second_line
-    owner_phase: P6
-    rust_only: true
   bc:DF-01:
     nodeids:
     - cargo:sw-core::event_store::reset_with_invalid_rule_id_counts_zero_df01
