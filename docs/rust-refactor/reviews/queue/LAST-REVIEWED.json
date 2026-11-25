@@ -45,5 +45,5 @@
   "fix/290-timeout-recovery-keys": "b1fb7e6",
   "fix/inst4-install-upgrade": "230b138",
   "fix/281-alias-persistence": "af95cf2",
-  "feature/304-config-wal-dir": "95ad179"
+  "feature/304-config-wal-dir": "d0b341a"
 }
