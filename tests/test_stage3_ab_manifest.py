@@ -3417,12 +3417,12 @@ _STATIC_DYNAMIC_NAMES = {"__import__", "importlib", "exec", "eval", "compile"}
 _STATIC_PARSER_NAMES = {"yaml.safe_load", "yaml.load", "json.load"}
 
 
-def _static_from_module(module: str, node: ast.ImportFrom) -> str | None:
-    """將相對匯入解析成完整模組名稱。"""
+def _static_from_module(module: str, node: ast.ImportFrom, *, is_package: bool = False) -> str | None:
+    """將相對匯入解析成完整模組名稱；套件 `__init__.py` 的相對匯入以套件本身為基準。"""
     if node.level == 0:
         return node.module
     parts = module.split(".")
-    package_parts = parts if module == "tools.stage3" else parts[:-1]
+    package_parts = parts if is_package or module == "tools.stage3" else parts[:-1]
     remove = max(node.level - 1, 0)
     if remove > len(package_parts):
         return None
@@ -3596,25 +3596,63 @@ def _static_read_inventory(
         return None
 
     # 收集函式參數與可直接判定的局部指派型別；未能判定者不會被推定為安全文字。
-    for node in ast.walk(tree):
-        current_owner = owner(node)
-        if not selected(current_owner):
-            continue
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            for argument in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs):
-                kind = annotation_kind(argument.annotation)
-                if kind:
-                    variable_kinds[(f"{module}:{node.name}", argument.arg)] = kind
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            kind = annotation_kind(node.annotation) or expression_kind(node.value, current_owner)
-            if kind:
-                variable_kinds[(current_owner, node.target.id)] = kind
-        elif isinstance(node, ast.Assign):
-            kind = expression_kind(node.value, current_owner)
-            if kind:
+    # 同一變數的每一次綁定（參數註記、指派、增量指派、for／with／walrus 目標、解構）都要記錄；
+    # 只要有一次綁定的來源無法判定，或各次綁定的型別不一致，就不採信該變數的型別。
+    def bound_names(target: ast.AST) -> list[str]:
+        if isinstance(target, ast.Name):
+            return [target.id]
+        if isinstance(target, (ast.Tuple, ast.List)):
+            return [name for element in target.elts for name in bound_names(element)]
+        if isinstance(target, ast.Starred):
+            return bound_names(target.value)
+        return []
+
+    for _ in range(10):
+        bindings: dict[tuple[str, str], set[str | None]] = {}
+
+        def bind(key: tuple[str, str], kind: str | None) -> None:
+            bindings.setdefault(key, set()).add(kind)
+
+        for node in ast.walk(tree):
+            current_owner = owner(node)
+            if not selected(current_owner):
+                continue
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for argument in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs):
+                    bind((f"{module}:{node.name}", argument.arg), annotation_kind(argument.annotation))
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                if node.value is None:
+                    kind = annotation_kind(node.annotation)
+                else:
+                    kind = expression_kind(node.value, current_owner)
+                bind((current_owner, node.target.id), kind)
+            elif isinstance(node, ast.Assign):
                 for target in node.targets:
-                    if isinstance(target, ast.Name):
-                        variable_kinds[(current_owner, target.id)] = kind
+                    kind = expression_kind(node.value, current_owner) if isinstance(target, ast.Name) else None
+                    for name in bound_names(target):
+                        bind((current_owner, name), kind)
+            elif isinstance(node, ast.AugAssign):
+                for name in bound_names(node.target):
+                    bind((current_owner, name), None)
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                for name in bound_names(node.target):
+                    bind((current_owner, name), None)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    if item.optional_vars is not None:
+                        for name in bound_names(item.optional_vars):
+                            bind((current_owner, name), None)
+            elif isinstance(node, ast.NamedExpr):
+                bind((current_owner, node.target.id), expression_kind(node.value, current_owner))
+
+        resolved_kinds = {
+            key: next(iter(kinds)) for key, kinds in bindings.items()
+            if len(kinds) == 1 and None not in kinds
+        }
+        if resolved_kinds == variable_kinds:
+            break
+        variable_kinds.clear()
+        variable_kinds.update(resolved_kinds)
 
     observations: Counter = Counter()
     violations: list[str] = []
@@ -3632,6 +3670,10 @@ def _static_read_inventory(
             if isinstance(node, ast.ImportFrom):
                 imported_from = _static_from_module(module, node) or ""
                 for item in node.names:
+                    if item.name == "*":
+                        # 萬用匯入可能帶入任何禁止的讀取 API，無法靜態列舉，一律保守拒絕。
+                        add(current_owner, "dynamic:wildcard-import")
+                        continue
                     imported_api = f"{imported_from}.{item.name}" if imported_from else item.name
                     if imported_api in _STATIC_FORBIDDEN_READS or imported_api == "mmap.mmap":
                         api = "builtins.open" if imported_api == "open" else imported_api
@@ -3824,7 +3866,7 @@ def _stage3_dependency_closure(repo_root: Path, entry_module: str) -> dict[str, 
                     if alias.name == "tools.stage3" or alias.name.startswith("tools.stage3.")
                 )
             elif isinstance(node, ast.ImportFrom):
-                base = _static_from_module(module, node)
+                base = _static_from_module(module, node, is_package=path.name == "__init__.py")
                 if base and (base == "tools.stage3" or base.startswith("tools.stage3.")):
                     found.add(base)
                     for alias in node.names:
@@ -3895,10 +3937,19 @@ def test_frozen_input_read_apis_are_static_allowlisted():
             "import yaml\\ndef injected_parser(path: str):\\n    return yaml.safe_load(path)\\n",
             "yaml.safe_load input is not a statically known bytes/str snapshot value",
         ),
+        (
+            "import yaml\\ndef injected_parser(payload: bytes, stream):\\n    payload = stream\\n    return yaml.safe_load(payload)\\n",
+            "yaml.safe_load input is not a statically known bytes/str snapshot value",
+        ),
+        (
+            "import yaml\\ndef injected_parser(payload: bytes, streams):\\n    for payload in streams:\\n        pass\\n    return yaml.safe_load(payload)\\n",
+            "yaml.safe_load input is not a statically known bytes/str snapshot value",
+        ),
     ],
     ids=[
         "assigned-open-alias", "getattr-open-literal", "getattr-variable", "yaml-file-object",
         "yaml-safe-load-alias", "yaml-load-alias", "json-load-alias", "yaml-path-string",
+        "parser-arg-reassigned-unknown", "parser-arg-rebound-by-for",
     ],
 )
 def test_static_read_audit_rejects_temporary_reader_patterns(tmp_path, injected, message):
@@ -3989,8 +4040,9 @@ def test_static_read_audit_rejects_temporary_os_reader(tmp_path, injected):
         "def injected(code):\\n    exec(code)\\n",
         "def injected(name):\\n    return __import__(name)\\n",
         "import importlib\\n",
+        "from os import *\\ndef injected(fd):\\n    return read(fd, 100)\\n",
     ],
-    ids=["compile", "eval", "exec", "dunder-import", "importlib-import"],
+    ids=["compile", "eval", "exec", "dunder-import", "importlib-import", "wildcard-import"],
 )
 def test_static_read_audit_rejects_dynamic_execution_apis(tmp_path, injected):
     source_path = Path(ab_manifest.__file__)
@@ -4017,6 +4069,31 @@ def test_static_read_audit_follows_imported_stage3_module_into_temporary_copy(tm
     )
 
     with pytest.raises(AssertionError, match="injected_reader:read_external: unapproved builtins.open"):
+        _assert_stage3_dependency_read_policy(repo_root)
+
+
+@pytest.mark.parametrize(
+    "init_source",
+    ["from . import reader\n", "from .reader import read_external\n"],
+    ids=["from-dot-import-module", "from-dot-module-import-name"],
+)
+def test_stage3_dependency_scan_follows_relative_imports_inside_nested_package(tmp_path, init_source):
+    repo_root = tmp_path / "repo"
+    stage3_copy = repo_root / "tools" / "stage3"
+    shutil.copytree(Path(ab_manifest.__file__).resolve().parent, stage3_copy, ignore=shutil.ignore_patterns("__pycache__"))
+    with (stage3_copy / "ab_manifest.py").open("a", encoding="utf-8") as stream:
+        stream.write("\nimport tools.stage3.subpkg\n")
+    subpkg = stage3_copy / "subpkg"
+    subpkg.mkdir()
+    (subpkg / "__init__.py").write_text(init_source, encoding="utf-8")
+    (subpkg / "reader.py").write_text(
+        "def read_external(path):\n    return open(path, 'rb').read()\n",
+        encoding="utf-8",
+    )
+
+    modules = _stage3_dependency_closure(repo_root, "tools.stage3.ab_manifest")
+    assert {"tools.stage3.subpkg", "tools.stage3.subpkg.reader"} <= set(modules)
+    with pytest.raises(AssertionError, match="reader:read_external: unapproved builtins.open"):
         _assert_stage3_dependency_read_policy(repo_root)
 
 
