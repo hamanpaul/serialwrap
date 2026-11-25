@@ -66,6 +66,52 @@ fn rejected_then_new_input_keeps_order() {
 }
 
 #[test]
+fn revoked_deferred_replay_preserves_each_classified_input() {
+    const PASSWORD_PROFILE: &str = "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    password_regex: 'Password:'\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: t, act_no: 1, alias: t+1, device_by_id: /s/by-id/usb-A}\n";
+
+    let mut h = CoreHarness::new(PASSWORD_PROFILE);
+    h.to_ready();
+    h.set_auto_complete_human_tx(false);
+    h.attach_pty_console("c1", true);
+    h.rx.observe_password_prompt_bytes(b"Password: ");
+    let (adm, _) = h.fg_begin(true);
+    h.input("c1", b"first-secret\r");
+    h.input("c1", b"second-secret");
+    let first_replay = h.fg_finish(adm);
+    assert!(!human_txs(&first_replay).is_empty(), "前景結束必須開始 deferred replay");
+
+    let (second_adm, _) = h.fg_begin(true);
+    let revoked = h.complete_human_tx(
+        TxOutcome::NotSubmitted,
+        Some(FenceReject::ReplayRevoked),
+    );
+    assert!(human_txs(&revoked).is_empty(), "撤銷的 replay 不得在新前景期間送出");
+
+    let retry = h.fg_finish(second_adm);
+    let mut replayed = human_txs(&retry);
+    if let Some((_, _, payload)) = replayed.first() {
+        let next = h.complete_human_tx(TxOutcome::Completed(payload.len()), None);
+        replayed.extend(human_txs(&next));
+    }
+    assert_eq!(
+        replayed,
+        vec![
+            (
+                TxClass::HumanReplay,
+                "human:c1".to_string(),
+                b"first-secret\r".to_vec(),
+            ),
+            (
+                TxClass::HumanReplay,
+                "human:c1".to_string(),
+                b"second-secret".to_vec(),
+            ),
+        ],
+        "同一 secret snapshot 的各筆 actor 輸入，在撤銷後重放也必須保留原邊界"
+    );
+}
+
+#[test]
 fn late_rejection_after_finish_is_replayed() {
     let mut h = manual(&["c1"]);
     h.input("c1", b"a");

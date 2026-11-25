@@ -130,9 +130,13 @@ pub struct RxShared {
 #[derive(Default)]
 struct SecretEchoWindow {
     armed: Option<ArmedSecretEcho>,
+    /// 已確認 actor 邊界的後續 secret 行，等目前 RX 行結束或下一段前綴失配後啟用。
+    queued_human: VecDeque<ArmedSecretEcho>,
     released: VecDeque<ReleasedSecretByte>,
     human_generation: Option<u64>,
     human_writes_in_flight: usize,
+    /// 最近一筆 TX matcher 尚未確認該 actor 輸入的行尾。
+    human_line_open: bool,
     overflow_mask_line: bool,
 }
 
@@ -147,6 +151,18 @@ struct ArmedSecretEcho {
     pending: Vec<u8>,
     dynamic: bool,
     after_cr: bool,
+    /// reader 已先看到行尾；下一筆 actor secret 到達時允許切到 queued matcher。
+    rx_line_ended: bool,
+}
+
+fn empty_human_secret_echo() -> ArmedSecretEcho {
+    ArmedSecretEcho {
+        secret: Vec::new(),
+        pending: Vec::new(),
+        dynamic: true,
+        after_cr: false,
+        rx_line_ended: false,
+    }
 }
 
 #[derive(Default)]
@@ -344,8 +360,13 @@ impl RxShared {
             Self::mask_pending(&mut window, &mut previous);
             previous.secret.fill(0);
         }
+        while let Some(mut queued) = window.queued_human.pop_front() {
+            Self::mask_pending(&mut window, &mut queued);
+            queued.secret.fill(0);
+        }
         window.human_generation = None;
         window.human_writes_in_flight = 0;
+        window.human_line_open = false;
         window.overflow_mask_line = false;
         if !secret.is_empty() {
             window.armed = Some(ArmedSecretEcho {
@@ -353,6 +374,7 @@ impl RxShared {
                 pending: Vec::with_capacity(secret.len().saturating_sub(1)),
                 dynamic: false,
                 after_cr: false,
+                rx_line_ended: false,
             });
         }
         drop(window);
@@ -406,10 +428,13 @@ impl RxShared {
                 self.truncate_human_secret_echo(generation, prior_len + confirmed);
             }
         }
+        let line_finished = line_end.is_some_and(|end| end < confirmed);
         if prior_echo_len.is_some() {
-            self.finish_human_secret_echo_write();
+            self.finish_human_secret_echo_write(generation, line_finished);
+        } else if generation > 0 && line_finished {
+            self.finish_human_secret_echo_line(generation);
         }
-        if generation > 0 && line_end.is_some_and(|end| end < confirmed) {
+        if generation > 0 && line_finished {
             let mut tracker = self.password_prompt.lock().unwrap_or_else(|e| e.into_inner());
             tracker.tx_consumed_generation = tracker.tx_consumed_generation.max(generation);
         }
@@ -423,41 +448,63 @@ impl RxShared {
                 Self::mask_pending(&mut window, &mut previous);
                 previous.secret.fill(0);
             }
-            window.human_generation = Some(generation);
-            if !window.overflow_mask_line {
-                window.armed = Some(ArmedSecretEcho {
-                    secret: Vec::new(),
-                    pending: Vec::new(),
-                    dynamic: true,
-                    after_cr: false,
-                });
+            while let Some(mut queued) = window.queued_human.pop_front() {
+                Self::mask_pending(&mut window, &mut queued);
+                queued.secret.fill(0);
             }
+            window.human_generation = Some(generation);
+            window.human_line_open = false;
         }
         window.human_writes_in_flight = window.human_writes_in_flight.saturating_add(1);
         if window.overflow_mask_line {
             return 0;
         }
-        let Some(prior_len) = window
+        if !window.human_line_open {
+            let next = empty_human_secret_echo();
+            if window.armed.is_none() {
+                window.armed = Some(next);
+            } else {
+                window.queued_human.push_back(next);
+            }
+            window.human_line_open = true;
+        }
+        let prior_len = window
+            .queued_human
+            .back()
+            .or(window.armed.as_ref())
+            .filter(|armed| armed.dynamic)
+            .map_or(0, |armed| armed.secret.len());
+        let stored_len = window
             .armed
             .as_ref()
-            .filter(|armed| armed.dynamic)
-            .map(|armed| armed.secret.len())
-        else {
-            return 0;
-        };
-        if prior_len.saturating_add(bytes.len()) > HUMAN_SECRET_ECHO_MAX_BYTES {
-            let mut armed = window.armed.take().expect("dynamic matcher exists");
-            Self::mask_pending(&mut window, &mut armed);
-            armed.secret.fill(0);
-            armed.secret.clear();
-            window.armed = Some(armed);
+            .map_or(0, |armed| armed.secret.len())
+            .saturating_add(
+                window
+                    .queued_human
+                    .iter()
+                    .map(|armed| armed.secret.len())
+                    .sum::<usize>(),
+            );
+        if stored_len.saturating_add(bytes.len()) > HUMAN_SECRET_ECHO_MAX_BYTES {
+            if let Some(mut armed) = window.armed.take() {
+                Self::mask_pending(&mut window, &mut armed);
+                armed.secret.fill(0);
+                window.armed = Some(empty_human_secret_echo());
+            }
+            while let Some(mut queued) = window.queued_human.pop_front() {
+                Self::mask_pending(&mut window, &mut queued);
+                queued.secret.fill(0);
+            }
             window.overflow_mask_line = true;
         } else {
-            let armed = window
-                .armed
-                .as_mut()
-                .expect("dynamic matcher remains registered");
-            armed.secret.extend_from_slice(bytes);
+            let target = if window.queued_human.is_empty() {
+                window.armed.as_mut()
+            } else {
+                window.queued_human.back_mut()
+            };
+            if let Some(armed) = target.filter(|armed| armed.dynamic) {
+                armed.secret.extend_from_slice(bytes);
+            }
         }
         drop(window);
         self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
@@ -465,15 +512,30 @@ impl RxShared {
         prior_len
     }
 
-    fn finish_human_secret_echo_write(&self) {
+    fn finish_human_secret_echo_write(&self, generation: u64, line_finished: bool) {
         let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
         window.human_writes_in_flight = window.human_writes_in_flight.saturating_sub(1);
+        if line_finished && window.human_generation == Some(generation) {
+            window.human_line_open = false;
+        }
+    }
+
+    fn finish_human_secret_echo_line(&self, generation: u64) {
+        let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
+        if window.human_generation == Some(generation) {
+            window.human_line_open = false;
+        }
     }
 
     fn truncate_human_secret_echo(&self, generation: u64, len: usize) {
         let mut window = self.secret_echo.lock().unwrap_or_else(|e| e.into_inner());
         if window.human_generation == Some(generation) && !window.overflow_mask_line {
-            if let Some(armed) = window.armed.as_mut().filter(|armed| armed.dynamic) {
+            let target = if window.queued_human.is_empty() {
+                window.armed.as_mut()
+            } else {
+                window.queued_human.back_mut()
+            };
+            if let Some(armed) = target.filter(|armed| armed.dynamic) {
                 armed.secret.truncate(len);
             }
         }
@@ -525,10 +587,12 @@ impl RxShared {
                     if window.human_writes_in_flight == 0 {
                         window.overflow_mask_line = false;
                         window.human_generation = None;
+                        window.human_line_open = false;
                         if let Some(mut armed) = window.armed.take() {
                             armed.secret.fill(0);
                             armed.pending.fill(0);
                         }
+                        window.queued_human.clear();
                     }
                 } else {
                     visible.push(b'*');
@@ -567,6 +631,13 @@ impl RxShared {
                 } else {
                     index
                 };
+                if let Some(mut next) = window.queued_human.pop_front() {
+                    armed.secret.fill(0);
+                    armed.pending.fill(0);
+                    next.after_cr = byte == b'\r';
+                    window.armed = Some(next);
+                    continue;
+                }
                 let next_line = &data[next_line_start..];
                 let next_prefix_len = next_line.len().min(armed.secret.len());
                 let next_line_has_secret_prefix = next_prefix_len > 0
@@ -578,6 +649,7 @@ impl RxShared {
                 {
                     armed.secret.fill(0);
                     window.human_generation = None;
+                    window.human_line_open = false;
                     if index < data.len() {
                         visible.extend_from_slice(&data[index..]);
                         rx_window.extend_from_slice(&data[index..]);
@@ -587,12 +659,31 @@ impl RxShared {
                 // 未決前綴跨 CR/LF 時保留 matcher；CRLF 是一個行尾，第二個 byte 不得再次清除。
                 // 若同一讀取 chunk 的下一行已以 secret 前綴開始，也要略過此前緩衝的舊行尾。
                 armed.after_cr = byte == b'\r';
+                armed.rx_line_ended = true;
                 window.armed = Some(armed);
                 continue;
             }
 
             let mut prior_prefix_len = armed.pending.len();
             armed.pending.push(byte);
+            if armed.rx_line_ended
+                && !armed.secret.starts_with(&armed.pending)
+                && window
+                    .queued_human
+                    .front()
+                    .is_some_and(|next| next.secret.starts_with(&armed.pending))
+            {
+                let pending = std::mem::take(&mut armed.pending);
+                armed.secret.fill(0);
+                let mut next = window
+                    .queued_human
+                    .pop_front()
+                    .expect("queued human matcher exists");
+                next.pending = pending;
+                window.armed = Some(next);
+                index += 1;
+                continue;
+            }
             while !armed.secret.starts_with(&armed.pending) {
                 let released = armed.pending.remove(0);
                 if prior_prefix_len > 0 {
@@ -656,8 +747,14 @@ impl RxShared {
             armed.secret.fill(0);
             armed.pending.clear();
         }
+        while let Some(mut queued) = window.queued_human.pop_front() {
+            unresolved |= !queued.pending.is_empty();
+            queued.secret.fill(0);
+            queued.pending.clear();
+        }
         window.human_generation = None;
         window.human_writes_in_flight = 0;
+        window.human_line_open = false;
         window.overflow_mask_line = false;
         let mut bytes = Vec::new();
         let mut rx_window = Vec::new();
@@ -677,8 +774,13 @@ impl RxShared {
             Self::mask_pending(&mut window, &mut armed);
             armed.secret.fill(0);
         }
+        while let Some(mut queued) = window.queued_human.pop_front() {
+            Self::mask_pending(&mut window, &mut queued);
+            queued.secret.fill(0);
+        }
         window.human_generation = None;
         window.human_writes_in_flight = 0;
+        window.human_line_open = false;
         window.overflow_mask_line = false;
         drop(window);
         self.secret_echo_revision.fetch_add(1, Ordering::AcqRel);
@@ -698,7 +800,16 @@ impl RxShared {
             .as_ref()
             .map(|armed| armed.secret.len().saturating_add(armed.pending.len()))
             .unwrap_or_default();
-        window.released.len().saturating_add(armed)
+        let queued = window
+            .queued_human
+            .iter()
+            .map(|armed| armed.secret.len().saturating_add(armed.pending.len()))
+            .sum::<usize>();
+        window
+            .released
+            .len()
+            .saturating_add(armed)
+            .saturating_add(queued)
     }
 
     /// 喚醒所有 `wait_for_regex_cancellable` 等待者（容量 1、滿則略過；已斷線者移除）。

@@ -211,6 +211,15 @@ fn decode_wal(wal: &str) -> Vec<u8> {
         .collect()
 }
 
+fn decode_rx_wal(wal: &str) -> Vec<u8> {
+    wal.lines()
+        .filter_map(|line| sw_proto::pyjson::loads(line).ok())
+        .filter(|row| row.get("dir").and_then(PyValue::as_str) == Some("RX"))
+        .filter_map(|row| row.get("payload_b64").and_then(PyValue::as_str).map(str::to_owned))
+        .flat_map(|payload| a2b_base64_lenient(payload.as_bytes()).expect("WAL RX base64"))
+        .collect()
+}
+
 fn human_tx_payload(rig: &WindowRig, client_id: &str) -> Vec<u8> {
     let source = format!("human:{client_id}");
     read_wal(rig)
@@ -534,6 +543,234 @@ fn issue312_line_buffer_loopback_masks_each_secret_echo_byte() {
         !String::from_utf8_lossy(&raw_console.written()).contains(RAW_SECRET),
         "其他 console 也不得收到 line-buffer 密碼明文"
     );
+}
+
+#[test]
+fn issue312_f7_deferred_replay_preserves_each_secret_input_at_all_sinks() {
+    const FIRST: &[u8] = b"alpha-deferred-secret";
+    const SECOND: &[u8] = b"bravo-deferred-secret";
+
+    let rig = build_window_rig_ready();
+    let (client_id, console) = attach_console(&rig);
+    let log = rig.service.call("session.log_start", r#"{"selector":"COM0"}"#);
+    assert_eq!(log.get("ok"), Some(&PyValue::Bool(true)), "{log:?}");
+    let log_path = log
+        .get("log_path")
+        .and_then(PyValue::as_str)
+        .expect("log_path")
+        .to_string();
+    install_event_probe(
+        &rig,
+        "deferred-first-leak",
+        std::str::from_utf8(FIRST).unwrap(),
+    );
+    install_event_probe(
+        &rig,
+        "deferred-second-leak",
+        std::str::from_utf8(SECOND).unwrap(),
+    );
+    install_event_probe(&rig, "deferred-masked-output", "***");
+    let enabled = rig
+        .service
+        .call("event.com_enable", r#"{"selector":"COM0"}"#);
+    assert_eq!(enabled.get("ok"), Some(&PyValue::Bool(true)), "{enabled:?}");
+    rig.device.clear_replies();
+    rig.device.set_loopback(false);
+
+    let rx_start = rig.device.rx_bytes_read();
+    rig.device.push_rx(b"Password: ");
+    wait_controlled_rx(
+        &rig.device,
+        rx_start + b"Password: ".len(),
+        "reader 在 deferred 輸入前開啟密碼窗口",
+    );
+    wait_console_contains(
+        &console,
+        b"Password: ",
+        "console 在 deferred 輸入前收到密碼提示",
+    );
+
+    let tx_start = rig.device.tx_len();
+    let submitted = rig.service.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"hold","source":"agent:deferred-test","timeout_s":30}"#,
+    );
+    let cmd_id = submitted
+        .get("cmd_id")
+        .and_then(PyValue::as_str)
+        .expect("前景命令 cmd_id");
+    support::wait_until_within("前景命令佔住 human admission", Duration::from_secs(3), || {
+        let state = rig
+            .service
+            .call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+        matches!(
+            state.get("command").and_then(|row| row.get("status")).and_then(PyValue::as_str),
+            Some("running")
+        )
+    });
+    wait_tx(&rig, tx_start + b"hold\n".len(), "前景命令先送出 UART");
+
+    console.push_input(FIRST);
+    thread::sleep(Duration::from_millis(100));
+    console.push_input(b"\r");
+    thread::sleep(Duration::from_millis(100));
+    console.push_input(SECOND);
+    thread::sleep(Duration::from_millis(100));
+    rig.device
+        .script_write(vec![FakeWriteStep::BlockForever]);
+    rig.device.push_rx(b"root@t:/# ");
+    rig.device.wait_blocked();
+    wait_console_contains(
+        &console,
+        b"root@t:/# ",
+        "前景完成 prompt 在第一段 replay 阻塞前已送達 console",
+    );
+
+    let echo_start = rig.device.rx_bytes_read();
+    let console_echo_start = console.written().len();
+    let wal_echo_start = decode_rx_wal(&read_wal(&rig)).len();
+    let mirror_echo_start = rig
+        .service
+        .wfs
+        .contents(&rig.service.wal.mirror_path())
+        .expect("raw.mirror.log")
+        .len();
+    let log_echo_start = std::fs::read_to_string(Path::new(&log_path))
+        .unwrap_or_default()
+        .len();
+    let partial = &FIRST[..3];
+    rig.device.push_rx(&[partial, b"\r\n"].concat());
+    wait_controlled_rx(
+        &rig.device,
+        echo_start + partial.len() + 2,
+        "writer 阻塞時 reader 先收第一段 secret 前綴與行尾",
+    );
+    rig.device.release_block();
+    let expected_tx = [b"hold\n".as_slice(), FIRST, b"\r", SECOND].concat();
+    wait_tx(
+        &rig,
+        tx_start + expected_tx.len(),
+        "deferred 兩筆 secret 依 actor 邊界回放",
+    );
+    support::wait_until_within("前景命令完成", Duration::from_secs(3), || {
+        let state = rig
+            .service
+            .call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+        matches!(
+            state.get("command").and_then(|row| row.get("status")).and_then(PyValue::as_str),
+            Some("done")
+        )
+    });
+    rig.service.settle();
+    wait_secret_meta_count(&rig, &client_id, 2);
+
+    let second_echo = [SECOND, b"\r\n"].concat();
+    rig.device.push_rx(&second_echo);
+    wait_controlled_rx(
+        &rig.device,
+        echo_start + partial.len() + 2 + second_echo.len(),
+        "writer 解除後 reader 收到第二筆 deferred secret 的 DUT echo",
+    );
+    rig.service.settle();
+
+    let expected_masked = [
+        vec![b'*'; partial.len()],
+        b"\r\n".to_vec(),
+        vec![b'*'; SECOND.len()],
+        b"\r\n".to_vec(),
+    ]
+    .concat();
+    let expected_mirror = [
+        vec![b'*'; partial.len()],
+        b"\r\n".to_vec(),
+        b"\r".to_vec(),
+        vec![b'*'; SECOND.len()],
+        b"\r\n".to_vec(),
+    ]
+    .concat();
+    let expected_log = [
+        vec![b'*'; SECOND.len()],
+        b"\n".to_vec(),
+    ]
+    .concat();
+    assert_eq!(
+        rig.device.tx_since(tx_start),
+        expected_tx,
+        "兩筆 secret 原文仍須完整送往 UART"
+    );
+    assert_eq!(
+        human_tx_payload(&rig, &client_id),
+        b"\r",
+        "TX WAL 不得釋出任一 deferred secret；只保留真正非 secret 的行尾"
+    );
+    let meta_lengths = secret_meta_rows_for(&rig, &client_id)
+        .iter()
+        .map(|row| {
+            row.get("meta")
+                .and_then(|meta| meta.get("secret_len"))
+                .and_then(PyValue::as_i64)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        meta_lengths,
+        vec![Some(FIRST.len() as i64), Some(SECOND.len() as i64)],
+        "每筆 actor 輸入必須各有一筆 secret META"
+    );
+    assert_eq!(
+        decode_rx_wal(&read_wal(&rig))[wal_echo_start..],
+        expected_masked,
+        "RX WAL 必須依 actor 輸入邊界遮罩兩段 secret"
+    );
+    assert_eq!(
+        &rig
+            .service
+            .wfs
+            .contents(&rig.service.wal.mirror_path())
+            .expect("raw.mirror.log")[mirror_echo_start..],
+        expected_mirror,
+        "RX mirror 必須依 actor 輸入邊界遮罩兩段 secret"
+    );
+    assert_eq!(
+        console.written()[console_echo_start..],
+        expected_masked,
+        "human console 必須依 actor 輸入邊界遮罩兩段 secret"
+    );
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&log_path))
+            .expect("agent log")
+            .as_bytes()[log_echo_start..],
+        expected_log,
+        "foreground 期間不記錄 partial；hold 解除後的 agent log 必須遮罩第二段 secret"
+    );
+    let event_tail = rig.service.call("event.tail", r#"{"n":-1}"#);
+    let events = match event_tail.get("entries") {
+        Some(PyValue::List(events)) => events,
+        other => panic!("event.tail entries: {other:?}"),
+    };
+    assert!(
+        !events.iter().any(|event| {
+            event.get("type").and_then(PyValue::as_str) == Some("match_recorded")
+                && matches!(
+                    event.get("rule_id").and_then(PyValue::as_str),
+                    Some("o.deferred-first-leak" | "o.deferred-second-leak")
+                )
+        }),
+        "event sink 不得收到任一 deferred secret：{events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.get("type").and_then(PyValue::as_str) == Some("match_recorded")
+                    && event.get("rule_id").and_then(PyValue::as_str)
+                        == Some("o.deferred-masked-output")
+            })
+            .count(),
+        2,
+        "event sink 必須收到兩行遮罩輸出：{events:?}"
+    );
+    assert_secret_sinks_clear(&rig, &console, &log_path, FIRST);
+    assert_secret_sinks_clear(&rig, &console, &log_path, SECOND);
 }
 
 #[test]

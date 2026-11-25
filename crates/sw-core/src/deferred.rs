@@ -22,6 +22,7 @@ pub struct DeferredEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DeferredSpan {
+    /// active secret 的每次 append 各自保留 actor 邊界；相同 secret snapshot 不得跨行合併。
     start: usize,
     len: usize,
     secret_tx: Option<SecretTx>,
@@ -110,6 +111,18 @@ fn classified_replay_of(client_id: String, e: DeferredEntry) -> Vec<ClassifiedRe
         .collect()
 }
 
+fn classified_spans_can_merge(
+    previous: &Option<SecretTx>,
+    incoming: &Option<SecretTx>,
+) -> bool {
+    previous == incoming
+        && !incoming.as_ref().is_some_and(|secret| {
+            secret
+                .window_snapshot
+                .is_some_and(|snapshot| snapshot.generation().is_some())
+        })
+}
+
 impl DeferredBuffer {
     pub fn new(cap: usize) -> Self {
         DeferredBuffer { entries: IndexMap::new(), cap }
@@ -172,7 +185,11 @@ impl DeferredBuffer {
         if bytes.is_empty() {
             return DeferOutcome::Appended { len: e.bytes.len() };
         }
-        if let Some(last) = e.spans.last_mut().filter(|span| span.secret_tx == secret_tx) {
+        if let Some(last) = e
+            .spans
+            .last_mut()
+            .filter(|span| classified_spans_can_merge(&span.secret_tx, &secret_tx))
+        {
             last.len = last.len.saturating_add(bytes.len());
         } else {
             e.spans.push(DeferredSpan {
@@ -303,7 +320,7 @@ impl DeferredBuffer {
             if let Some(last) = e
                 .spans
                 .last_mut()
-                .filter(|span| span.secret_tx == secret_tx)
+                .filter(|span| classified_spans_can_merge(&span.secret_tx, &secret_tx))
             {
                 last.len = last.len.saturating_add(r.bytes.len());
             } else {
@@ -321,11 +338,9 @@ impl DeferredBuffer {
                 if old.client_lifetime == e.client_lifetime && old.input_epoch == current_epoch {
                     let offset = e.bytes.len();
                     for span in old.spans {
-                        if let Some(last) = e
-                            .spans
-                            .last_mut()
-                            .filter(|current| current.secret_tx == span.secret_tx)
-                        {
+                        if let Some(last) = e.spans.last_mut().filter(|current| {
+                            classified_spans_can_merge(&current.secret_tx, &span.secret_tx)
+                        }) {
                             last.len = last.len.saturating_add(span.len);
                         } else {
                             e.spans.push(DeferredSpan {
